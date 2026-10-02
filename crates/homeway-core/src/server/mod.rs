@@ -7,3 +7,5 @@
 
 pub mod bind;
 pub mod device;
+pub mod state;
+pub mod table;
