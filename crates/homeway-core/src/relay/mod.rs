@@ -73,6 +73,10 @@ pub struct Config {
     pub max_ctl_conns: u16,
     /// 探测应答里回报的构建标记（空 = "relay-dev"）。
     pub build: String,
+    /// 【测试形态】不递送 hint（两端都不推）——同机拓扑里 hint→盲打→采纳会把
+    /// 客户端翻成直连，中继驻留/升级条纹的前提不成立；真机的等价形态 = NAT 把
+    /// 打洞响应全丢（正是中继存在的理由）。生产恒 false。
+    pub no_hints: bool,
     pub logf: Logf,
 }
 
@@ -91,6 +95,7 @@ impl Config {
             max_legs: DEFAULT_MAX_LEGS,
             max_ctl_conns: DEFAULT_MAX_CTL_CONNS,
             build: String::new(),
+            no_hints: false,
             logf,
         }
     }
@@ -190,6 +195,29 @@ enum Msg {
     Stop,
 }
 
+
+/// 大收发缓冲（4MB 尽力而为——内核钳制；突发场景防整包丢弃，R3 出口同款）。
+fn bump_sock_bufs(sock: &UdpSocket) {
+    use std::os::fd::AsRawFd as _;
+    unsafe {
+        let sz: libc::c_int = 4 * 1024 * 1024;
+        let _ = libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &sz as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as u32,
+        );
+        let _ = libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &sz as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as u32,
+        );
+    }
+}
+
 /// 中继实例（`run` = 驱动线程本体，阻塞到 stop）。
 pub struct Relay {
     cfg: Config,
@@ -257,6 +285,7 @@ impl Relay {
     /// 确定后生成——Go RunWithReady 同义）。
     pub fn run(mut self, stop_fd: i32, on_ready: impl FnOnce(u16)) -> io::Result<()> {
         let udp = Self::listen_with_fallback(self.cfg.listen, &self.cfg.logf)?;
+        bump_sock_bufs(&udp);
         udp.set_nonblocking(true)?;
         let actual_port = udp.local_addr()?.port();
         on_ready(actual_port);
@@ -742,6 +771,7 @@ impl Relay {
                 }
             };
             let _ = sock.set_nonblocking(true);
+            bump_sock_bufs(&sock);
             let mut cookie = [0u8; 16];
             if getrandom::getrandom(&mut cookie).is_err() {
                 // 不退化全零 cookie 的假认证：拆会话让客户端重试
@@ -776,12 +806,14 @@ impl Relay {
             self.assocs.insert(key, a);
             self.stats.assigned += 1;
             self.poll_dirty = true; // 会话 socket 入 poll 集
-            // hint（唯一推送点 = 建会话，两端各一次）
-            if let Some(addr) = leg_addr {
-                let _ = udp.send_to(&frame::hint_bytes(&addr.to_string()), client);
-            }
-            if let Some(b) = self.assocs.get(&key).and_then(|a| a.backend) {
-                let _ = self.assocs.get(&key).unwrap().sock.send_to(&frame::hint_bytes(&client.to_string()), b);
+            // hint（唯一推送点 = 建会话，两端各一次；测试形态可关）
+            if !self.cfg.no_hints {
+                if let Some(addr) = leg_addr {
+                    let _ = udp.send_to(&frame::hint_bytes(&addr.to_string()), client);
+                }
+                if let Some(b) = self.assocs.get(&key).and_then(|a| a.backend) {
+                    let _ = self.assocs.get(&key).unwrap().sock.send_to(&frame::hint_bytes(&client.to_string()), b);
+                }
             }
             if has_ctl {
                 let (sid, port, ck) = {

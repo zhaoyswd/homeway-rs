@@ -48,11 +48,12 @@ struct RelayFlags {
     listen: Option<String>,
     advertise: Option<String>,
     open: bool,
+    no_hints: bool,
     extra: Vec<String>,
 }
 
 fn parse_flags(args: &[String]) -> RelayFlags {
-    let mut f = RelayFlags { state: None, listen: None, advertise: None, open: false, extra: Vec::new() };
+    let mut f = RelayFlags { state: None, listen: None, advertise: None, open: false, no_hints: false, extra: Vec::new() };
     let mut i = 0;
     while i < args.len() {
         let stripped = args[i].strip_prefix("--").or_else(|| args[i].strip_prefix('-'));
@@ -79,6 +80,8 @@ fn parse_flags(args: &[String]) -> RelayFlags {
             "advertise" => f.advertise = take_val(&mut j),
             // 测试形态开关（不进生产命令面文档——FIX-89 同款「显式开放」哲学）
             "open" => f.open = true,
+            // 测试形态：不递送 hint（升级条纹的中继驻留前提；见 Config::no_hints 注释）
+            "no-hints" => f.no_hints = true,
             other => {
                 eprintln!("未知参数：--{other}");
                 std::process::exit(2);
@@ -180,7 +183,8 @@ pub fn cmd_relay(args: &[String]) {
     // 鉴权形态：--open（测试）= 显式开放；生产恒 token 模式
     let auth = if f.open { None } else { Some(secret) };
 
-    let cfg = Config::new(listen, auth, log.logf_fn());
+    let mut cfg = Config::new(listen, auth, log.logf_fn());
+    cfg.no_hints = f.no_hints;
     let relay = Relay::new(cfg);
     let log2 = Arc::clone(&log);
     let adv = advertise;
