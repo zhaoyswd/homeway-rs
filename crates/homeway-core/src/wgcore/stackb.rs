@@ -216,8 +216,11 @@ impl StackB {
         let local = self.alloc_local_port();
         let cx = self.iface.context();
         let s = self.sockets.get_mut::<TcpSocket>(handle);
-        s.connect(cx, dst, local)
-            .map_err(|e| DialError::Stack(format!("{e:?}")))?;
+        if let Err(e) = s.connect(cx, dst, local) {
+            // 失败回收槽位与 256KB 缓冲（评审中-8：Unaddressable 是用户输入可触发面）
+            self.sockets.remove(handle);
+            return Err(DialError::Stack(format!("{e:?}")));
+        }
         Ok(handle)
     }
 

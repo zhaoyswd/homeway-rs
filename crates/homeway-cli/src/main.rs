@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 use homeway_core::identity::{self, IdentitySource};
 use homeway_core::speedtest::{self, Params};
 use homeway_core::token::{self, EndpointKind};
-use homeway_core::wgcore::{Client, CoreConfig, SERVER_TUNNEL_IP};
+use homeway_core::wgcore::{Client, CoreConfig};
 use homeway_core::wtransport::Candidate;
 
 fn main() {
@@ -116,12 +116,6 @@ fn cmd_connect(args: &[String]) {
             relay: false,
         })
         .collect();
-    println!(
-        "服务会话: 新栈会话已建立（token 端点 {} 个，后端隧道地址 {}）",
-        t.endpoints.len(),
-        SERVER_TUNNEL_IP
-    );
-
     // ---- 身份（C1 判据行；默认目录 <cwd>/identity）----
     let dir = identity_dir.unwrap_or_else(|| PathBuf::from("identity"));
     let (identity, src, warn) = identity::load_or_create(Some(&dir), &t.peer_id).expect("身份装配失败");
@@ -163,6 +157,12 @@ fn cmd_connect(args: &[String]) {
             std::process::exit(1);
         }
     };
+    // C3 判据行（session.go:237：第二字段 = 本设备派生隧道地址，非出口隧道 IP——评审中-4）
+    println!(
+        "服务会话: 新栈会话已建立（token 端点 {} 个，后端隧道地址 {}）",
+        t.endpoints.len(),
+        client.tunnel_ip
+    );
 
     // ---- warmup（C8：拨 :1 判 RST = 隧道通）----
     let warm_start = Instant::now();
@@ -228,9 +228,17 @@ fn cmd_connect(args: &[String]) {
         }
         // 保持期结束时再打一拍巡检（保活腿证据）
         client.refresh_reg();
+        let p0 = Instant::now();
         if client.path_probe().is_ok() {
-            if let Some(ep) = client.snapshot().ep {
-                println!("link: via=direct ep={ep} rtt=0ms（服务会话巡检）");
+            let snap = client.snapshot();
+            let rtt = p0.elapsed().as_millis();
+            if let Some(ep) = snap.ep {
+                println!(
+                    "link: via={} ep={} rtt={}ms（服务会话巡检）",
+                    snap.via.as_str(),
+                    ep,
+                    rtt
+                );
             }
         }
     }

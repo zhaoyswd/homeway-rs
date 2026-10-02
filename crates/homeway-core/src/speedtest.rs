@@ -152,6 +152,8 @@ impl Frame {
     }
 
     fn header(&mut self, typ: u8, seq: u32, payload_len: usize, crc: u32) {
+        // seq 由调用方决定（控制帧恒 0 不推进；data 帧前置自增——Go WriteControl/
+        // writeData 同义；评审高-1：此处不得自增，否则 data seq 变 1,3,5…）
         self.buf.clear();
         self.buf.reserve(HEADER + payload_len);
         self.buf.extend_from_slice(&MAGIC);
@@ -159,7 +161,6 @@ impl Frame {
         self.buf.extend_from_slice(&seq.to_le_bytes());
         self.buf.extend_from_slice(&(payload_len as u16).to_le_bytes());
         self.buf.extend_from_slice(&crc.to_le_bytes());
-        self.seq += 1;
     }
 
     /// 控制帧（request/start/finish；载荷进 crc；**seq 恒 0**——Go WriteControl 同义）。
@@ -331,20 +332,70 @@ fn parse_report(payload: &[u8]) -> Result<Report, SpeedtestError> {
     Ok(r)
 }
 
+/// 轮内连接守卫：任何退出路径（含 `?` 提前返回）关闭全部已拨连接（Go closeAll 同义，
+/// 评审高-2/中-12——`Cmd::Read` 的待决读在 close 后由引擎结算为 Closed，scope join 可返回）。
+struct ConnGuard<'a> {
+    client: &'a Client,
+    ids: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+}
+
+impl Drop for ConnGuard<'_> {
+    fn drop(&mut self) {
+        let ids = self.ids.lock().expect("连接表锁中毒").clone();
+        for id in ids {
+            let _ = self.client.close(id);
+        }
+    }
+}
+
+/// 总预算看门狗（Go watchdogFix 口径）：到点关全部连接——把可能卡死的读/泵线程
+/// 从待决 RPC 里解出来（close ⇒ 引擎结算 EOF/Closed）。
+fn watchdog(client: &Client, ids: std::sync::Arc<std::sync::Mutex<Vec<u64>>>, budget: Duration, done: std::sync::mpsc::Receiver<()>) {
+    if done.recv_timeout(budget).is_err() {
+        let ids = ids.lock().expect("连接表锁中毒").clone();
+        for id in ids {
+            let _ = client.close(id);
+        }
+    }
+}
+
 /// 跑完整一轮（下行 → 上行；读数由服务端 report 报）。拨号目标恒隧道 IP:7803。
 pub fn run(client: &Client, params: Params, logf: &dyn Fn(&str)) -> Result<SpeedtestResult, SpeedtestError> {
     let p = params.normalized().map_err(SpeedtestError::InvalidArg)?;
+    let ids = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
+    let _guard = ConnGuard { client, ids: std::sync::Arc::clone(&ids) };
+    let (wd_tx, wd_rx) = std::sync::mpsc::channel::<()>();
+    let budget = Duration::from_secs(60) + p.warmup + p.down + p.up;
+    let wd_ids = std::sync::Arc::clone(&ids);
+    let body = std::thread::scope(|scope| {
+        scope.spawn(move || watchdog(client, wd_ids, budget, wd_rx));
+        run_phases(client, &p, logf, &ids)
+    });
+    let _ = wd_tx.send(()); // 看门狗收工（scope 已 join 线程，此处只解阻塞 recv）
+    body
+}
+
+fn run_phases(
+    client: &Client,
+    p: &Params,
+    logf: &dyn Fn(&str),
+    ids: &std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+) -> Result<SpeedtestResult, SpeedtestError> {
     let dst = SocketAddrV4::new(crate::wgcore::SERVER_TUNNEL_IP, SPEEDTEST_PORT);
     let t0 = Instant::now();
     logf(&format!(
-        "speedtest: 开跑（down {}流 warmup={:?} window={:?}）",
-        p.streams, p.warmup, p.down
+        "speedtest: 开跑（down {}流 warmup={} window={}）",
+        p.streams,
+        crate::go_fmt::fmt_duration_go_ms(p.warmup),
+        crate::go_fmt::fmt_duration_go_ms(p.down)
     ));
 
     // ---- 下行：拨齐全部连接 → 统一发请求（各流窗口对齐，design D3）----
     let mut down_ids = Vec::with_capacity(p.streams);
     for _ in 0..p.streams {
-        down_ids.push(client.connect(dst)?);
+        let id = client.connect(dst)?;
+        ids.lock().expect("连接表锁中毒").push(id);
+        down_ids.push(id);
     }
     let mut w = Frame::new();
     for &id in &down_ids {
@@ -368,7 +419,8 @@ pub fn run(client: &Client, params: Params, logf: &dyn Fn(&str)) -> Result<Speed
                     loop {
                         match fr.read_frame(client, id)? {
                             FrameIn::Data { payload_len } => {
-                                if Instant::now() >= window_start {
+                                let now = Instant::now();
+                                if now >= window_start && now < window_start + p.down {
                                     got += payload_len as i64;
                                 } else {
                                     used += payload_len as i64;
@@ -412,7 +464,9 @@ pub fn run(client: &Client, params: Params, logf: &dyn Fn(&str)) -> Result<Speed
     // ---- 上行：新连接（每流一角色不复用）；每流一线程泵送 ----
     let mut up_ids = Vec::with_capacity(p.streams);
     for _ in 0..p.streams {
-        up_ids.push(client.connect(dst)?);
+        let id = client.connect(dst)?;
+        ids.lock().expect("连接表锁中毒").push(id);
+        up_ids.push(id);
     }
     for &id in &up_ids {
         let payload = request_payload("send", p.warmup.as_millis() as u64, p.up.as_millis() as u64);
@@ -530,12 +584,15 @@ mod tests {
         // data 帧：全零载荷 crc 按长度缓存（与逐位计算一致）
         assert_eq!(zero_crc(16), crc32_ieee(&[0u8; 16]));
         assert_eq!(zero_crc(BLOCK), crc32_ieee(&vec![0u8; BLOCK]));
-        // data 整帧形状：载荷区全零；seq 从 1 起递增
+        // data 帧 seq 从 1 起逐帧 +1；控制帧不推进计数（评审高-1 断言）
         let mut f2 = Frame::new();
-        let d = f2.data(8).to_vec();
-        assert_eq!(u32::from_le_bytes(d[5..9].try_into().unwrap()), 1);
-        assert_eq!(d.len(), HEADER + 8);
-        assert_eq!(&d[HEADER..], &[0u8; 8]);
+        let d1 = f2.data(8).to_vec();
+        assert_eq!(u32::from_le_bytes(d1[5..9].try_into().unwrap()), 1);
+        let _ = f2.control(TYPE_START, &[]);
+        let d2 = f2.data(8).to_vec();
+        assert_eq!(u32::from_le_bytes(d2[5..9].try_into().unwrap()), 2, "控制帧不得推进 seq");
+        assert_eq!(d2.len(), HEADER + 8);
+        assert_eq!(&d2[HEADER..], &[0u8; 8]);
     }
 
     #[test]

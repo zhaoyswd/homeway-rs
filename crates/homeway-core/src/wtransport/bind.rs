@@ -147,15 +147,17 @@ impl Bind {
             if let Err(e) = self.sock.send_to(&self.scratch, addr) {
                 self.send_errs += 1;
                 if self.send_errs < 10 {
-                    (self.logf)(&format!("wtransport: 发送失败 {addr}: {e}"));
+                    (self.logf)(&format!("发送失败：{e}（{addr}；本地错误=该候选在本机就发不出去，与对端无响应是两回事）"));
                 }
+            } else {
+                self.tx_bytes += wg.len() as u64; // 成功才计（Go bind.go:644-651 同口径）
             }
-            self.tx_bytes += wg.len() as u64;
             return;
         }
-        // 未采纳：镜像到全部直连候选；首个数据报搭 [reg][data] 容器（每份各带）。
+        // 未采纳：镜像到全部直连候选；搭车 reg 在**首个真正写出的数据报**上（每份各带
+        // ——评审中-1：零候选/全失败不得消费 arm，否则丢了首包就永久失注册）。
         self.mirrored += 1;
-        let reg_pkt = self.take_reg();
+        let reg_pkt = self.peek_reg();
         match &reg_pkt {
             Some(r) => {
                 self.scratch.clear();
@@ -169,14 +171,27 @@ impl Bind {
                 frame::encode_frame(FrameKind::Data, wg, &mut self.scratch);
             }
         }
-        let mut sent = 0;
+        let mut sent = 0; // 尝试数（Go writeCandidate 后无条件 sent++——本地不可达候选
+                          // 也计入，C4 判据行与 Go 同数字；评审中-2）
+        let mut sent_ok = 0;
         for c in &self.candidates {
-            if self.sock.send_to(&self.scratch, *c).is_ok() {
-                sent += 1;
+            match self.sock.send_to(&self.scratch, *c) {
+                Ok(_) => sent_ok += 1,
+                Err(e) => {
+                    self.send_errs += 1;
+                    if self.send_errs < 10 {
+                        (self.logf)(&format!("发送失败：{e}（{c}；本地错误=该候选在本机就发不出去，与对端无响应是两回事）"));
+                    }
+                }
             }
+            sent += 1;
         }
-        // 一条逻辑出站包按包记一次（Go 同口径）。
-        self.tx_bytes += wg.len() as u64;
+        if sent_ok > 0 {
+            if reg_pkt.is_some() {
+                self.reg_armed = false; // 真正写出才消费（评审中-1）
+            }
+            self.tx_bytes += wg.len() as u64; // 一条逻辑出站包按包记一次（成功；Go 同口径）
+        }
         // C4 判据行（双条件节流：≤3 行/轮 且 间隔 ≥1s）
         let now = Instant::now();
         let loggable =
@@ -191,8 +206,8 @@ impl Bind {
         }
     }
 
-    /// 取走（消费）本轮赛跑的搭车 reg——一次性（arm 收紧语义见模块注释）。
-    fn take_reg(&mut self) -> Option<Vec<u8>> {
+    /// 预取本轮搭车 reg（不消费 arm——消费点在「真正写出」之后，见 send_wg）。
+    fn peek_reg(&mut self) -> Option<Vec<u8>> {
         if !self.reg_armed {
             return None;
         }
@@ -203,7 +218,6 @@ impl Bind {
             .unwrap_or(0);
         let mut pkt = Vec::with_capacity(reg::REG_LEN);
         reg::encode_reg_parts(&ctx.secret, &ctx.pubkey, &ctx.dev_tag, now, &mut pkt);
-        self.reg_armed = false;
         Some(pkt)
     }
 

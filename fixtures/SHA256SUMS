@@ -40,6 +40,7 @@ b27aa456af228e8a4ceac74f0dd431c33b21473b69314fc672a7fba474e2a7fe  ./term-manifes
 688c69bafbbfb4eba14f46da4ef8c22fbc93f77318e95b4ce5449723c32a59b3  ./term-vt/session-git-log.bin
 c60ffb2e49a6cd09ca565e0de14817ad963801975fb9ca603c51b640fb12d07e  ./term-vt/session-hexdump.bin
 558cc64a0fdc23dde0f8b7c01a306e904e3631e96d8e4cb7691cd1bc947ba662  ./term/frames.v1.jsonl
-61c40cf6ac5b55f5903d7656a1f4733c5f947f92780d75afcde65a7fd0b7cb4a  ./vectors/identity.json
+0e65b56d3c92672456d74bd9e761c420b11e5e896b3f2c4df43e16bb64fdc1e3  ./vectors/identity.json
+48928dd4256c3f8cfcfffac66e01fd7161c5b0de0c7d11d2ea5f1f31ff052edf  ./vectors/psk.json
 9ce2f9f3c69d7c4b7f656179ab57fde79973c8ecc8229c7063b99951efcd3193  ./vectors/token.json
 d065823d92a23c917b7afbe76623a1f196eb72a81e610c7943b09d77dfed049b  ./vectors/tunnel_addr.json

@@ -176,8 +176,17 @@ impl Engine {
         }
         self.expired_pending = true;
         self.tunn = make_tunn(&self.identity_key, &self.secret, self.peer_id.as_bytes());
-        (self.logf)("wgcore: 会话过期已重建（丢会话保采纳）—— 补注册");
-        self.bind.refresh_reg();
+        if self.bind.adopted().is_some() {
+            (self.logf)("wgcore: 会话过期已重建（丢会话保采纳）—— 补注册");
+            self.bind.refresh_reg();
+        } else {
+            // 未采纳（无路径）：RREG 需要 adopted 会静默 no-op——改走 rearm 重武装 reg
+            // 并主动触发一次出站（空载荷 encapsulate 无会话 ⇒ 产握手 init + 搭 reg，
+            // Go 恢复阶梯 R1 档在「无路径」时刻的同义动作；评审中-1）
+            (self.logf)("wgcore: 会话过期已重建（无采纳路径）—— 重赛跑 + 补注册");
+            self.bind.rearm();
+            self.encap_send(&[]);
+        }
     }
 
     /// 单轮驱动：命令 → UDP 批量收 → 栈 poll → TX 出队封装 → 定时器 → 待决结算。
@@ -485,7 +494,7 @@ impl Engine {
 /// 客户端句柄（主线程面）：命令投递 + 状态轮询 + 收工。
 pub struct Client {
     cmd_tx: mpsc::Sender<Cmd>,
-    wake_wr: i32,
+    wake_wr: Option<i32>,
     handle: Option<JoinHandle<()>>,
     snapshot: Arc<Mutex<Snapshot>>,
     stop: Arc<AtomicBool>,
@@ -555,7 +564,7 @@ impl Client {
 
         Ok(Self {
             cmd_tx,
-            wake_wr: wake_w,
+            wake_wr: Some(wake_w),
             handle: Some(handle),
             snapshot,
             stop,
@@ -570,8 +579,10 @@ impl Client {
 
     fn send(&self, cmd: Cmd) {
         if self.cmd_tx.send(cmd).is_ok() {
-            unsafe {
-                libc::write(self.wake_wr, b"x".as_ptr().cast(), 1);
+            if let Some(fd) = self.wake_wr {
+                unsafe {
+                    libc::write(fd, b"x".as_ptr().cast(), 1);
+                }
             }
         }
     }
@@ -629,15 +640,26 @@ impl Client {
         self.send(Cmd::RefreshReg);
     }
 
+    /// 收工（幂等；Drop 同义——不显式 stop 也能停线程关 fd，评审中-11）。
     pub fn stop(&mut self) {
-        self.stop.store(true, Ordering::SeqCst);
+        if self.stop.swap(true, Ordering::SeqCst) {
+            return; // 已收工（幂等，防 double-close fd）
+        }
         self.send(Cmd::Stop);
         if let Some(h) = self.handle.take() {
             let _ = h.join();
         }
-        unsafe {
-            libc::close(self.wake_wr);
+        if let Some(fd) = self.wake_wr.take() {
+            unsafe {
+                libc::close(fd);
+            }
         }
+    }
+}
+
+impl Drop for Client {
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 

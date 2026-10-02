@@ -168,6 +168,11 @@ pub fn load_or_create(
     let Some(dir) = dir else {
         return ephemeral_fallback("identity: 未配置身份目录".to_owned());
     };
+    if dir.as_os_str().is_empty() {
+        // 空串与未配置同义（Go 对 dir=="" 显式报错走临时身份；create_dir_all("") 是
+        // Ok(()) 且 join 得相对路径——身份会随 CWD 漂移，评审中-6）
+        return ephemeral_fallback("identity: 未配置身份目录".to_owned());
+    }
     let (master, src) = match load_or_create_master(dir) {
         Ok(v) => v,
         Err(err) => return ephemeral_fallback(err.to_string()),
@@ -207,7 +212,13 @@ fn derive_dev_tag(master: &[u8; 32]) -> DevTag {
 
 /// 读主密钥；缺失则创建、损坏则归档重建（Go `loadOrCreateMaster`）。
 fn load_or_create_master(dir: &Path) -> Result<([u8; 32], IdentitySource), IdentityError> {
-    fs::create_dir_all(dir).map_err(|e| IdentityError::StoreUnavailable(format!("建目录 {dir:?}: {e}")))?;
+    // 目录 0700（Go MkdirAll(dir, 0o700)；create_dir_all 默认 0777&~umask——评审中-5）
+    let mut db = std::fs::DirBuilder::new();
+    db.recursive(true);
+    use std::os::unix::fs::DirBuilderExt;
+    db.mode(0o700)
+        .create(dir)
+        .map_err(|e| IdentityError::StoreUnavailable(format!("建目录 {dir:?}: {e}")))?;
     let path = dir.join(MASTER_KEY_FILE);
     match fs::read(&path) {
         Ok(b) => {

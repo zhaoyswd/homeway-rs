@@ -51,7 +51,7 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 | 期 | 内容 | 状态 | 进度 |
 |---|---|---|---|
 | **R0** | 基线锚定 + 互操作基建 + 仓库骨架 | **完成**（2026-10-02） | 6/6 |
-| **R1** | 客户端垂直切片（直连数据面 ↔ Go 出口） | 未开始 | — |
+| **R1** | 客户端垂直切片（直连数据面 ↔ Go 出口） | **完成**（2026-10-02） | 7/7 |
 | **R2** | 客户端全量（行为对齐 + 中继腿 + files/portfwd + facade 预留） | 未开始 | — |
 | **R3** | 出口（多 peer WG device + 拦截层 + files/DNS/STUN/UPnP + servercore） | 未开始 | — |
 | **R4** | 中继（信封 + 准入 + 升级条纹） | 未开始 | — |
@@ -60,10 +60,11 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 | **R7** | APP 接入（napi-rs 或 C-ABI 胶水 + OHOS 交叉 + 20 导出面 + hostsession） | 未开始 | — |
 | **R8** | 终测收官（包体/性能终测 + 共存定案 + 文档指针补录） | 未开始 | — |
 
-**下一步（当前指针）**：R1 客户端垂直切片（技术评审先行：ring 垫片 vendor 策略、
-boringtun 握手时序 vs wireguard-go 差异表、栈 B 会话语义；退出口见 R1 小节）。
-R0 期间用户新增全程要求：**地道 Rust 不做 Go 直译**（AGENTS「工程原则」节）。
-R0 评审带出的补采项（E9/E12/E22/E23、C11/C17 故障注入样例）归 R1/R2 顺手做。
+**下一步（当前指针）**：R2 客户端全量（连接行为逐常量对齐 + 恢复阶梯 R1–R3 + 中继腿 +
+files/portfwd + 端点缓存落盘/接线 + facade 预留；含 R1 遗留的 WG 重连语义专项，见
+R1 小节完成证据）。R0 期间用户新增全程要求：**地道 Rust 不做 Go 直译**（AGENTS「工程
+原则」节）。R1 补采完成：E10-transit/E22/E23/C8/C17 已采；E9/C11 归 R2（故障注入）、
+E12 归 R2（UDP 拨号面）。
 
 依赖：R0→R1→R2→{R3, R4 可并行}→R5→R6→R7（**需发版会话收官 + 用户点头**）→R8。
 R4 最小可提前（不依赖 R1，只需 R0 夹具），但优先保 R1 主线。
@@ -120,6 +121,24 @@ UDP socket + smoltcp 栈 B + speedtest/probe 客户端）→ CLI：`homeway-cli 
 技术评审要点：ring 垫片 vendor 策略、boringtun 双向握手时序 vs wireguard-go 差异表、
 栈 B 装配的会话语义。
 **退出口**：boringtun 握手兼容性问题 → 记录现象，退到「先做 R4 中继（最小）」，主会话重排。
+
+**完成证据（2026-10-02，fresh pairing = local-exit wipe 后首连）**：
+- 判据四条全采：出口 `peer: + dev=88d6c8ca pub=f7d1232a ip=100.64.213.172 n=1/32`
+  （三指纹与客户端 identity 派生逐项一致）；客户端 `warmup pong: 就绪（判据=wg）` →
+  `link: via=direct ep=127.0.0.1:42641 rtt=0ms（服务会话巡检）`；speedtest 双向
+  **down 291–779Mbps / up 223–488Mbps**（多轮；Go 客户端同时刻 A/B 232/249Mbps、
+  R0 峰值口径 690/760Mbps——±50% 界内，最好轮超 Go 峰值），下行对账偏差 0.14–0.52%；
+  出口 `intercept: tcp transit 192.168.3.12:9999 ← 100.64.213.172:34321（dialok）`；
+- 顺手补采：E10-transit/E22/E23/C8（Rust 同串）/C17 入 INTEROP-CRITERIA；
+- 两道门：技术评审 8 高/21 中/15 低全处置（R1-design v2）；代码评审 2 高/12 中/
+  15 低，必修面全整改 + 复验（`docs/reviews/R1.md`）；
+- 实测抓出并修复：make_tunn peer 位真公钥 bug、TCP 流跨帧读丢字节（FrameReader）、
+  send_slice Ok(0) 语义、CloseWait EOF 判据、确定性四元组撞出口半开连接（端口随机化）；
+- **R2 专项移交（差异分析已记录）**：同身份对「含旧 peer 会话状态的出口」快速重连，
+  WG 数据包在出口侧静默丢弃（握手可完成、先到的包解密成功、后续消失；客户端侧
+  decap 零错、发包零错）——wipe 配对即愈。嫌疑面 = wireguard-go 同 pubkey 快速重连的
+  keypair/时戳窗 × boringtun 时戳戳记；Go 客户端同场景走恢复阶梯（ResetPeerSession+
+  RefreshReg，正是 R2 范围）。R1 测试纪律 = 每测量批 wipe 出口（fresh pairing）。
 
 ## R2 客户端全量（估 6–10 会话日）
 

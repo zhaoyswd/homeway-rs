@@ -10,6 +10,7 @@
 | `vectors/token.json` | hmw1 token 编解码 + 三类错误（corrupted/unsupported_version/malformed） | `tools/gen-vectors.sh`（模板 `tools/vector-gen/`，克隆内 `pkg/proto` 真源产出） |
 | `vectors/tunnel_addr.json` | DeriveTunnelIP / DeriveTunIP（含守卫命中样本钉死 hw-app.N 再散列路径） | 同上 |
 | `vectors/identity.json` | master+peerID → WG 私钥/公钥；master → devTag（含 LoadOrCreateIdentity 全路径交叉验证） | 同上（克隆内直调 `clientcore/internal/wtransport` 未导出派生函数） |
+| `vectors/psk.json` | token secret → WG PSK（HKDF 域分离 `homeway/wg-psk`；R1 技术评审 S1 补——握手热路径派生错 = AEAD tag 失败难归因） | 同上（克隆内 `pkg/proto.DerivePSK` 真源产出） |
 
 ## control 控制面契约夹具（拷贝，R0.6 评审 M9 补拷）
 
