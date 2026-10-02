@@ -1,0 +1,282 @@
+//! `homeway-cli relay` 命令面（R4-4a4；语义真源 `cmd/homeway` 的 relay 子命令 +
+//! `internal/relay/{role,cli}.go`——裁剪面：无 daemon 期望态/instance lock/status 面）。
+//!
+//! 前台单角色：不改期望态，flag 为一次性覆盖（覆盖序 flag > config.toml [relay] 节 >
+//! 内置默认）。`--state` 即统一 state 根：relay.key = `<state>/relay/`、
+//! relay.log = `<state>/cache/`。
+
+use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::path::PathBuf;
+use std::sync::Arc;
+use homeway_core::relay::logfile::RelayLog;
+use homeway_core::relay::rltoken;
+use homeway_core::relay::{Config, Relay};
+
+/// config.toml 的 [relay] 节（与 serve_cli 同 schema；deny_unknown 同口径）。
+#[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileRelay {
+    #[serde(default)]
+    #[allow(dead_code)]
+    enabled: bool,
+    #[serde(default)]
+    listen: Option<String>,
+    #[serde(default)]
+    advertise: Option<String>,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileConfig {
+    #[serde(default)]
+    _serve: FileServeIgnore,
+    #[serde(default)]
+    relay: FileRelay,
+}
+
+/// serve 节整节忽略（本命令只读 [relay]；serve 的键表由 serve 命令自己校验）。
+#[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileServeIgnore {
+    #[serde(default)]
+    #[serde(rename = "*")]
+    _rest: (),
+}
+
+struct RelayFlags {
+    state: Option<PathBuf>,
+    listen: Option<String>,
+    advertise: Option<String>,
+    open: bool,
+    extra: Vec<String>,
+}
+
+fn parse_flags(args: &[String]) -> RelayFlags {
+    let mut f = RelayFlags { state: None, listen: None, advertise: None, open: false, extra: Vec::new() };
+    let mut i = 0;
+    while i < args.len() {
+        let stripped = args[i].strip_prefix("--").or_else(|| args[i].strip_prefix('-'));
+        let Some(body) = stripped else {
+            f.extra.push(args[i].clone());
+            i += 1;
+            continue;
+        };
+        let (name, inline) = match body.split_once('=') {
+            Some((k, v)) => (k.to_owned(), Some(v.to_owned())),
+            None => (body.to_owned(), None),
+        };
+        let take_val = |i: &mut usize| -> Option<String> {
+            if let Some(v) = inline.clone() {
+                return Some(v);
+            }
+            *i += 1;
+            args.get(*i).cloned()
+        };
+        let mut j = i;
+        match name.as_str() {
+            "state" => f.state = take_val(&mut j).map(PathBuf::from),
+            "listen" => f.listen = take_val(&mut j),
+            "advertise" => f.advertise = take_val(&mut j),
+            // 测试形态开关（不进生产命令面文档——FIX-89 同款「显式开放」哲学）
+            "open" => f.open = true,
+            other => {
+                eprintln!("未知参数：--{other}");
+                std::process::exit(2);
+            }
+        }
+        i = j + 1;
+    }
+    f
+}
+
+/// 解析监听地址（":41741"/"127.0.0.1:41741"——缺 host = 全卡 v4）。
+fn parse_listen(v: &str) -> Option<SocketAddr> {
+    let v = v.trim();
+    if let Some(port) = v.strip_prefix(':') {
+        let p: u16 = port.parse().ok()?;
+        return Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), p));
+    }
+    v.parse().ok()
+}
+
+/// `homeway-cli relay [...]`：前台中继（Ctrl-C / SIGTERM 收工——确定性 closeAll）。
+pub fn cmd_relay(args: &[String]) {
+    let f = parse_flags(args);
+    if !f.extra.is_empty() {
+        eprintln!("relay 不接受位置参数（得 {:?}）——启停/查询命令组不在本 CLI 裁剪面", f.extra);
+        std::process::exit(2);
+    }
+    let state_dir = f.state.unwrap_or_else(|| PathBuf::from("."));
+    let relay_dir = state_dir.join("relay");
+    let cache_dir = state_dir.join("cache");
+    if let Err(e) = std::fs::create_dir_all(&relay_dir).and_then(|_| std::fs::create_dir_all(&cache_dir)) {
+        eprintln!("state 目录建不起来（{}）：{e}", state_dir.display());
+        std::process::exit(1);
+    }
+
+    // config.toml（存在即解析 [relay] 节；缺失 = 内置默认）
+    let mut listen_str = ":41741".to_owned();
+    let mut advertise = String::new();
+    let cfg_path = state_dir.join("config.toml");
+    if cfg_path.exists() {
+        let body = match std::fs::read_to_string(&cfg_path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("{}: 读取失败：{e}", cfg_path.display());
+                std::process::exit(1);
+            }
+        };
+        // 只取 [relay] 节（serve 节键表不归本命令校验——手工切片避免整表 deny_unknown 拒启）
+        let fc: FileConfig = match parse_relay_section(&body) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("{}: {e}", cfg_path.display());
+                std::process::exit(1);
+            }
+        };
+        if let Some(v) = fc.relay.listen {
+            listen_str = v;
+        }
+        if let Some(v) = fc.relay.advertise {
+            advertise = v;
+        }
+    }
+    // flag 覆盖
+    if let Some(v) = &f.listen {
+        listen_str = v.clone();
+    }
+    if let Some(v) = &f.advertise {
+        advertise = v.clone();
+    }
+    let listen = match parse_listen(&listen_str) {
+        Some(a) => a,
+        None => {
+            eprintln!("--listen {listen_str:?} 不是合法监听地址（:port / ip:port）");
+            std::process::exit(2);
+        }
+    };
+
+    // 两级日志（终端只出 token 与端点变化；全量进 cache/relay.log）
+    let log = Arc::new(RelayLog::open(&cache_dir, Arc::new(|s: &str| println!("{s}"))));
+
+    // 鉴权密钥：加载/生成（重启不变 ⇒ token 稳定）
+    let (secret, created) = match rltoken::load_or_create_secret(&relay_dir) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("relay.key 管理失败（{}）：{e}", relay_dir.display());
+            std::process::exit(1);
+        }
+    };
+    if created {
+        log.logf(&format!(
+            "已生成中继鉴权密钥（{}/relay.key，0600）—— 重启不变，token 因此稳定",
+            relay_dir.display()
+        ));
+    }
+    if let Some(p) = log.log_path() {
+        log.ulogf(&format!("日志：{p} —— 终端只出 token 与端点变化"));
+    }
+
+    // 鉴权形态：--open（测试）= 显式开放；生产恒 token 模式
+    let auth = if f.open { None } else { Some(secret) };
+
+    let cfg = Config::new(listen, auth, log.logf_fn());
+    let relay = Relay::new(cfg);
+    let log2 = Arc::clone(&log);
+    let adv = advertise;
+    let on_ready = move |port: u16| {
+        match rltoken::build_token(
+            &secret,
+            &adv,
+            port,
+            &|s: &str| log2.ulogf(s),
+            &|_s: &str| {},
+        ) {
+            Ok(b) => {
+                log2.ulogf(&format!("中继 token：{}", b.token));
+                log2.ulogf(&format!("端点：{}", b.endpoints.join("、")));
+                if rltoken::all_private(&b.endpoints) {
+                    log2.ulogf("⚠️ 公布的地址都在内网：公网中继请加 --advertise <公网IP:端口>");
+                }
+                log2.logf(&format!("后端这样用：homeway serve --relay '{}'", b.token));
+            }
+            Err(e) => {
+                log2.logf(&format!("⚠️ token 生成失败（{e}）—— 后端可用裸地址走开放模式"));
+            }
+        }
+    };
+
+    // SIGTERM/SIGINT → stop 管道（与 serve 同款 async-signal-safe 面）
+    let (stop_r, stop_w) = stop_pipe();
+    let join = std::thread::Builder::new()
+        .name("homeway-relay".into())
+        .stack_size(1024 * 1024)
+        .spawn(move || {
+            if let Err(e) = relay.run(stop_r, on_ready) {
+                eprintln!("relay 运行失败：{e}");
+                std::process::exit(1);
+            }
+        })
+        .expect("spawn relay");
+
+    println!("（relay 前台运行中——Ctrl-C 收工）");
+    wait_pipe_readable();
+    unsafe { libc::write(stop_w, b"x".as_ptr().cast(), 1) };
+    let _ = join.join();
+    unsafe { libc::close(stop_w) };
+}
+
+/// 手工抽 [relay] 节（避免整文件反序列化时被 serve 节的键表拒启——serve 键归 serve 校验）。
+fn parse_relay_section(body: &str) -> Result<FileConfig, String> {
+    let mut in_relay = false;
+    let mut section = String::from("[relay]\n");
+    for line in body.lines() {
+        let t = line.trim();
+        if t.starts_with('[') {
+            in_relay = t == "[relay]";
+            continue;
+        }
+        if in_relay && !t.is_empty() && !t.starts_with('#') {
+            section.push_str(line);
+            section.push('\n');
+        }
+    }
+    toml::from_str(&section).map_err(|e| format!("[relay] 节解析失败：{e}"))
+}
+
+// ---------- stop 管道（与 serve_cli 同款形态） ----------
+
+static STOP_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+extern "C" fn on_stop_signal(_sig: i32) {
+    let fd = STOP_FD.load(std::sync::atomic::Ordering::SeqCst);
+    if fd >= 0 {
+        unsafe {
+            let b = b"x";
+            libc::write(fd, b.as_ptr().cast(), 1);
+        }
+    }
+}
+
+static STOP_PIPE: std::sync::OnceLock<(i32, i32)> = std::sync::OnceLock::new();
+
+fn stop_pipe() -> (i32, i32) {
+    let (r, w) = *STOP_PIPE.get_or_init(|| unsafe {
+        let mut fds = [0i32; 2];
+        libc::pipe(fds.as_mut_ptr());
+        (fds[0], fds[1])
+    });
+    STOP_FD.store(w, std::sync::atomic::Ordering::SeqCst);
+    unsafe {
+        let h = on_stop_signal as extern "C" fn(i32) as libc::sighandler_t;
+        libc::signal(libc::SIGTERM, h);
+        libc::signal(libc::SIGINT, h);
+    }
+    (r, w)
+}
+
+fn wait_pipe_readable() -> bool {
+    let (r, _) = *STOP_PIPE.get_or_init(|| (0, 0));
+    let mut b = [0u8; 1];
+    unsafe { libc::read(r, b.as_mut_ptr().cast(), 1) >= 0 }
+}

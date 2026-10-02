@@ -17,6 +17,7 @@ use homeway_core::speedtest::{self, Params};
 use homeway_core::token;
 use homeway_core::wgcore::ConnErr;
 
+mod relay_cli;
 mod serve_cli;
 
 fn main() {
@@ -30,6 +31,7 @@ fn main() {
                 serve_cli::cmd_serve(&args[2..]);
             }
         }
+        Some("relay") => relay_cli::cmd_relay(&args[2..]),
         Some("connect") => cmd_connect(&args[2..]),
         Some("files") => cmd_files(&args[2..]),
         Some("dnstest") => cmd_dnstest(&args[2..]),
