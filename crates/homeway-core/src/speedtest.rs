@@ -86,6 +86,15 @@ impl Params {
     }
 }
 
+/// 归因词表（Go engine.go:52-63 Reason* 同串；手机 SpeedTestRules.ets 短因分派依赖取值）。
+pub const REASON_BUSY: &str = "busy";
+pub const REASON_LINK_DOWN: &str = "link_down";
+pub const REASON_NOT_SUPPORTED: &str = "not_supported";
+pub const REASON_INTERRUPTED: &str = "interrupted";
+pub const REASON_TIMEOUT: &str = "timeout";
+pub const REASON_CANCELLED: &str = "cancelled";
+pub const REASON_INVALID_ARG: &str = "invalid_arg";
+
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SpeedtestError {
@@ -97,6 +106,31 @@ pub enum SpeedtestError {
     Report(String),
     #[error("参数非法：{0}")]
     InvalidArg(String),
+    /// 出口没有测速服务（首帧前 EOF/复位——Go :625-643 的 not_supported 判据）。
+    #[error("not_supported: 出口没有测速服务")]
+    NotSupported,
+}
+
+impl SpeedtestError {
+    /// 归因码（App 短因分派面；Go Result.Reason 同串）。
+    pub fn reason(&self) -> &'static str {
+        match self {
+            SpeedtestError::Report(m) => {
+                if m.contains("满员") {
+                    REASON_BUSY
+                } else if m.contains("链路正在恢复") {
+                    REASON_LINK_DOWN
+                } else {
+                    REASON_INTERRUPTED
+                }
+            }
+            SpeedtestError::NotSupported => REASON_NOT_SUPPORTED,
+            SpeedtestError::Frame(_) => REASON_INTERRUPTED,
+            SpeedtestError::Conn(ConnErr::Timeout) => REASON_TIMEOUT,
+            SpeedtestError::Conn(_) => REASON_INTERRUPTED,
+            SpeedtestError::InvalidArg(_) => REASON_INVALID_ARG,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default)]
@@ -171,13 +205,20 @@ impl Frame {
     }
 
     /// data 帧（载荷全零，整帧拼好——单次写全，避免头/载荷拆包；seq 从 1 起递增，
-    /// Go writeData 的 `*seq+1` 前置自增同义）。
-    fn data(&mut self, payload_len: usize) -> &[u8] {
+    /// Go writeData 的 `*seq+1` 前置自增同义）。载荷必须 ≤ u16 上限（Go writeData
+    /// 对超限报错而非静默截断——低-12）。
+    fn data(&mut self, payload_len: usize) -> Result<&[u8], SpeedtestError> {
+        if payload_len > u16::MAX as usize {
+            return Err(SpeedtestError::Frame(format!(
+                "data 帧载荷 {payload_len} 超过 u16 上限 {}",
+                u16::MAX
+            )));
+        }
         self.seq += 1;
         self.header(TYPE_DATA, self.seq, payload_len, zero_crc(payload_len));
         let start = self.buf.len();
         self.buf.resize(start + payload_len, 0);
-        &self.buf
+        Ok(&self.buf)
     }
 }
 
@@ -416,9 +457,20 @@ fn run_phases(
                     let (mut got, mut used) = (0i64, 0i64);
                     let (sb, sw): (i64, i64);
                     let mut fr = FrameReader::new();
+                    let mut first_frame = true;
                     loop {
-                        match fr.read_frame(client, id)? {
+                        match fr.read_frame(client, id).or_else(|e| {
+                            // 首帧前 EOF/通道关 = 出口没有测速服务（连接被出口侧立即收流）
+                            if first_frame
+                                && matches!(e, SpeedtestError::Conn(ConnErr::Closed) | SpeedtestError::Frame(_))
+                            {
+                                Err(SpeedtestError::NotSupported)
+                            } else {
+                                Err(e)
+                            }
+                        })? {
                             FrameIn::Data { payload_len } => {
+                                first_frame = false;
                                 let now = Instant::now();
                                 if now >= window_start && now < window_start + p.down {
                                     got += payload_len as i64;
@@ -427,6 +479,7 @@ fn run_phases(
                                 }
                             }
                             FrameIn::Other { typ, payload } if typ == TYPE_REPORT => {
+                                first_frame = false;
                                 let rep = parse_report(&payload)?;
                                 sb = rep.bytes;
                                 sw = rep.warmup_bytes;
@@ -551,7 +604,7 @@ fn pump(client: &Client, id: u64, f: &mut Frame, dur: Duration) -> Result<i64, S
     let deadline = Instant::now() + dur;
     let mut total: i64 = 0;
     while Instant::now() < deadline {
-        write_all(client, id, f.data(BLOCK))?;
+        write_all(client, id, f.data(BLOCK)?)?;
         total += BLOCK as i64;
     }
     Ok(total)
@@ -586,13 +639,20 @@ mod tests {
         assert_eq!(zero_crc(BLOCK), crc32_ieee(&vec![0u8; BLOCK]));
         // data 帧 seq 从 1 起逐帧 +1；控制帧不推进计数（评审高-1 断言）
         let mut f2 = Frame::new();
-        let d1 = f2.data(8).to_vec();
+        let d1 = f2.data(8).unwrap().to_vec();
         assert_eq!(u32::from_le_bytes(d1[5..9].try_into().unwrap()), 1);
         let _ = f2.control(TYPE_START, &[]);
-        let d2 = f2.data(8).to_vec();
+        let d2 = f2.data(8).unwrap().to_vec();
         assert_eq!(u32::from_le_bytes(d2[5..9].try_into().unwrap()), 2, "控制帧不得推进 seq");
         assert_eq!(d2.len(), HEADER + 8);
         assert_eq!(&d2[HEADER..], &[0u8; 8]);
+    }
+
+    #[test]
+    fn data_payload_over_u16_rejected() {
+        let mut f = Frame::new();
+        assert!(f.data(70_000).is_err(), "超 u16 上限必须报错（低-12）");
+        assert!(f.data(BLOCK).is_ok(), "常量块（64KB-1）必须可发");
     }
 
     #[test]

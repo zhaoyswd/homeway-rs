@@ -44,7 +44,9 @@ pub enum DialError {
     Stack(String),
 }
 
-/// 出站明文包队列（TX 侧由 TxToken 持有的共享柄——poll 后驱动线程从这里取包）。
+/// 出站明文包：TxToken 写入 → 驱动线程 drain 取走（缓冲按需分配、取走即弃；
+/// 中-10② 的加锁面保留一次（poll 与 drain 同线程本可消锁，但 phy::Device 的
+/// receive/transmit 借用约束下池锁是最简零拷贝形态——锁竞争者只有驱动线程自身）。
 type SharedQueue = Arc<Mutex<VecDeque<Vec<u8>>>>;
 
 /// IP 队列型虚拟设备：WG 侧入/出，smoltcp 侧收/发。

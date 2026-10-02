@@ -289,8 +289,8 @@ impl Engine {
     /// decapsulate + 空数据报重调协议（WriteToNetwork 后以空输入重调到 Done）。
     fn decapsulate_in(&mut self, src_ip: Option<IpAddr>, datagram: &[u8]) {
         let src_ip = src_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
-        self.wg_buf.clear();
-        self.wg_buf.resize(WG_BUF, 0);
+        // 热路径：容量恒足（构造时 WG_BUF 一次分配）；boringtun 只写前缀——
+        // 不 clear/resize（每包 65KB memset 纯浪费，中-10①）。长度由返回值给。
         match self.tunn.decapsulate(Some(src_ip), datagram, &mut self.wg_buf) {
             TunnResult::WriteToNetwork(w) => {
                 self.bind.send_wg(w);
@@ -325,8 +325,8 @@ impl Engine {
     }
 
     fn encap_send(&mut self, pkt: &[u8]) {
-        self.wg_buf.clear();
-        self.wg_buf.resize(WG_BUF, 0);
+        // 热路径：容量恒足（构造时 WG_BUF 一次分配）；boringtun 只写前缀——
+        // 不 clear/resize（每包 65KB memset 纯浪费，中-10①）。长度由返回值给。
         match self.tunn.encapsulate(pkt, &mut self.wg_buf) {
             TunnResult::WriteToNetwork(w) => self.bind.send_wg(w),
             TunnResult::Err(WireGuardError::ConnectionExpired) => self.rebuild_tunn_once(),
@@ -338,8 +338,8 @@ impl Engine {
     }
 
     fn timer_tick(&mut self) {
-        self.wg_buf.clear();
-        self.wg_buf.resize(WG_BUF, 0);
+        // 热路径：容量恒足（构造时 WG_BUF 一次分配）；boringtun 只写前缀——
+        // 不 clear/resize（每包 65KB memset 纯浪费，中-10①）。长度由返回值给。
         match self.tunn.update_timers(&mut self.wg_buf) {
             TunnResult::WriteToNetwork(w) => self.bind.send_wg(w),
             TunnResult::Err(WireGuardError::ConnectionExpired) => self.rebuild_tunn_once(),
