@@ -105,6 +105,14 @@ pub enum Cmd {
     Rearm {
         reply: Sender<Result<(), ConnErr>>,
     },
+    /// 软赛跑（Go RearmSoft：中继立即参与——升直连/hint 打洞用，不停在用路径）。
+    RearmSoft {
+        reply: Sender<Result<(), ConnErr>>,
+    },
+    /// 装 hint 回调（回调在**驱动线程**执行——只允许内存操作/通道投递，严禁 RPC 回引擎）。
+    SetOnHint {
+        h: crate::wtransport::bind::OnHint,
+    },
     /// 丢弃本地 WG 会话（Go ResetPeerSession 同义：peer 移除再写回 ≙ 重建 Tunn；
     /// **保采纳**）——下一发出站包全新握手。
     ResetPeerSession {
@@ -236,6 +244,7 @@ impl Engine {
                 return false;
             }
         }
+        self.bind.tick_unlock();
         self.drain_udp(udp_buf);
         let now = self.now_smol();
         self.stack
@@ -408,6 +417,16 @@ impl Engine {
                     let _ = tx.send(sent);
                 }
             }
+            Cmd::RearmSoft { reply } => {
+                self.bind.rearm_soft();
+                if self.bind.adopted().is_none() {
+                    self.encap_send(&[]);
+                }
+                let _ = reply.send(Ok(()));
+            }
+            Cmd::SetOnHint { h } => {
+                self.bind.set_on_hint(h);
+            }
             Cmd::Rearm { reply } => {
                 self.bind.rearm();
                 // 无采纳路径的出站触发：空载荷 encapsulate 无会话 ⇒ 产握手 init + 搭 reg
@@ -434,8 +453,7 @@ impl Engine {
                 let _ = reply.send(r);
             }
             Cmd::SetCandidates { cands } => {
-                let addrs = cands.iter().map(|c| c.addr).collect();
-                self.bind.set_candidates(addrs);
+                self.bind.set_candidates(cands);
             }
             #[cfg(feature = "test-seams")]
             Cmd::DebugPoisonSocket => {
@@ -595,6 +613,8 @@ impl Client {
                 pubkey,
                 dev_tag: *cfg.identity.dev_tag().as_bytes(),
             }),
+            Some(Duration::ZERO), // 直连优先窗口取缺省 2s（Go directFirst 0→2s 同义）
+            cfg.peer_id.as_bytes(),
             Arc::clone(&cfg.logf),
         )?;
 
@@ -736,6 +756,18 @@ impl Client {
         rx.recv().map_err(|_| ConnErr::EngineGone)?
     }
 
+    /// 软赛跑（中继立即参与；升直连/hint 打洞用）。
+    pub fn rearm_soft(&self) -> Result<(), ConnErr> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::RearmSoft { reply: tx });
+        rx.recv().map_err(|_| ConnErr::EngineGone)?
+    }
+
+    /// 装 hint 回调（回调在驱动线程执行——只做内存操作/通道投递）。
+    pub fn set_on_hint(&self, h: crate::wtransport::bind::OnHint) {
+        self.send(Cmd::SetOnHint { h });
+    }
+
     /// 档位动作的**有界** RPC（阶梯动作预算 2s：引擎卡住时按超时收轮，不让阶梯
     /// 无限等——Go runBoundedAction 的 Rust 对应；引擎正常时节拍 ≤250ms 即回）。
     pub fn reset_peer_session_bounded(&self, d: Duration) -> Result<(), ConnErr> {
@@ -831,7 +863,12 @@ fn driver(mut engine: Engine, wake_r: i32, stop: Arc<AtomicBool>) {
                 .poll_delay(now, &engine.stack.sockets)
                 .unwrap_or(smoltcp::time::Duration::from_millis(POLL_CAP as u64))
                 .min(smoltcp::time::Duration::from_millis(POLL_CAP as u64));
-            delay.total_millis().clamp(1, POLL_CAP as u64) as i32
+            let mut ms = delay.total_millis().clamp(1, POLL_CAP as u64);
+            // 读退避余量参与超时（持续 POLLERR 形态不空转——评审低-20）
+            if let Some(r) = engine.bind.recv_backoff_remain() {
+                ms = ms.min(r.as_millis().max(1) as u64);
+            }
+            ms as i32
         };
         let mut fds = [
             libc::pollfd {

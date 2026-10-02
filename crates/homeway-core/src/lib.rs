@@ -13,6 +13,7 @@ pub type Logf = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
 pub mod go_fmt;
 pub mod identity;
+pub mod probe;
 pub mod psk;
 pub mod session;
 pub mod speedtest;

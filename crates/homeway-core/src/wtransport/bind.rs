@@ -1,21 +1,20 @@
-//! wtransport 直连 Bind（R1 子集）——自管 UDP socket + 候选镜像 + 首回包采纳 +
-//! reg 搭车（唯一 `send_wg` 收口）。
+//! wtransport Bind：自管 UDP socket + 候选镜像 + 首回包采纳 + reg 搭车（唯一
+//! `send_wg` 收口）+ 中继腿 + 直连优先窗口 + 漫游双发。
 //!
-//! 语义真源 `baseline:clientcore/internal/wtransport/bind.go`（本期裁剪面见模块注释）：
-//! - **未采纳时**出站 WG 包镜像到全部直连候选，首包搭容器帧 `[reg][data]` 保 1 RTT
-//!   （每个镜像数据报各带一份 reg——任一路径都能完成注册）；
-//! - **收到任何来源的包即采纳**该来源（采纳先于帧解码，Go 同序），之后单发；
-//! - 判据行：C4 MIRROR（每轮 ≤3 行且间隔 ≥1s 的双条件节流）、C5 赛跑结算（本轮首次
-//!   采纳时一次）、C6 路径确立（地址变化 + 3s 节流）；
-//! - **R1 明确不做**：漫游/换网（Rebind）、中继腿（relay 候选构造期过滤）、
-//!   直连优先窗口（无中继候选即无门控）、恢复阶梯（R2 期）。
+//! 语义真源 `baseline:clientcore/internal/wtransport/bind.go`（R2 全量）：
+//! - **未采纳时**出站 WG 包镜像到候选（直连优先窗口内只打直连）；首包搭容器帧
+//!   `[reg][data]` 保 1 RTT（每个镜像数据报各带一份 reg）；
+//! - **DirectFirst 解锁补发**（评审高-1/中-6）：窗口内首个未采纳出站包 + 该发搭车
+//!   reg 被**捕获**；窗口到点仍无采纳 → 解锁中继候选并以容器帧 `[reg][pkt]` 重投
+//!   （裸 data 帧的握手 init 会被出口按未知 pubkey 丢弃，且 reg_armed 已消费 ⇒
+//!   不捕获就永久失注册——中继唯一可达时永远建不起来）；
+//! - **收到任何来源的包即采纳**（先于帧解码），`relay_eps` 判定中继腿（via=relay +
+//!   ⚠️ 告警行）；切到未知来源（非候选/非中继）→ 旧路径 10s 双发宽限（FIX-09）；
+//! - **R1 已登记差异**：reg 搭车收口 = 「真正写出 UDP 数据报的那一次」（收紧语义）；
+//!   UDP socket 绑 v4（Go 双栈承载 v6 端点）——本地实例端点恒 v4，v6 承载挂真机前补。
 //!
-//! 与 Go 的**已登记差异**：
-//! 1. reg 搭车收口 = 「真正写出 UDP 数据报的那一次」（Go 在 `Send` 入口消费 arm，
-//!    走到已采纳分支会把 reg 丢掉——其注释自认；Rust 收紧为「首个写出的数据报才
-//!    消费」，评审 ④-2 登记为有意收紧，单轮场景两者等价）；
-//! 2. UDP socket 绑 v4（Go 绑双栈以支持 v6 承载端点）——R1 判据出口为 v4 回环/LAN；
-//!    v6 承载与双栈属 R2 换网面。
+//! 判据行：C4 MIRROR（双条件节流）、C5 赛跑结算、C6 路径确立/切换、RARM 家族、
+//! REBIND、解锁补发行、中继告警行、发送失败限流行、接收读错误行、HINT 行。
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -29,7 +28,7 @@ use super::frame::{self, FrameKind};
 use crate::go_fmt::fmt_duration_go_ms;
 use super::reg;
 
-/// 一条候选路径。
+/// 一条候选路径（relay 位参与候选集比较与镜像分派）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Candidate {
     pub addr: SocketAddr,
@@ -75,30 +74,63 @@ const MIRROR_LOG_MAX: u32 = 3;
 const MIRROR_LOG_GAP: Duration = Duration::from_secs(1);
 /// 路径确立/切换行节流（3s）。
 const PATH_LOG_GAP: Duration = Duration::from_secs(3);
+/// 过渡双发宽限（FIX-09）：切到未知来源后旧路径保活时长。
+const HANDOVER_GRACE: Duration = Duration::from_secs(10);
+/// 接收读错误退避（Go bind.go:491：300ms 原地慢转 + 每 5s 一行）。
+const RECV_BACKOFF: Duration = Duration::from_millis(300);
+const RECV_ERR_LOG_GAP: Duration = Duration::from_secs(5);
+/// 发送失败限流（每目标 5s 一条）。
+const SEND_ERR_LOG_GAP: Duration = Duration::from_secs(5);
+
+/// 直连优先窗口缺省（Go directFirst 0→2s 同义）。
+pub const DIRECT_FIRST_DEFAULT: Duration = Duration::from_secs(2);
+
+/// 中继路由键（Go proto.RelayID：peer 公钥的 8 字节压缩 = SHA-256(pubkey)[..8]）。
+pub fn relay_id(peer_pub: &[u8; 32]) -> [u8; 8] {
+    use sha2::{Digest, Sha256};
+    let sum = Sha256::digest(peer_pub);
+    let mut id = [0u8; 8];
+    id.copy_from_slice(&sum[..8]);
+    id
+}
+
+/// hint 回调（中继观察到的地址线索；回调里不得阻塞——磁盘落盘走去抖线程）。
+pub type OnHint = Arc<dyn Fn(&str) + Send + Sync>;
 
 pub struct Bind {
     sock: UdpSocket,
-    candidates: Vec<SocketAddr>,
+    candidates: Vec<Candidate>,
+    /// 中继端点表（与候选集同临界区重建——FIX-10：收包路径的 relay 判定不吃旧表）。
+    relay_eps: HashSet<SocketAddr>,
+    relay_id: [u8; 8],
+    /// 直连优先窗口（None = 关：全部候选同时打）。
+    direct_first: Option<Duration>,
     reg: Option<RegCtx>,
     reg_armed: bool,
     adopted: Option<SocketAddr>,
+    adopted_is_relay: bool,
     mirrored: u64,
     race_start: Instant,
+    relay_unlocked: bool,
+    /// DirectFirst 解锁补发的捕获对（本轮首个未采纳出站包 + 该发搭车 reg；
+    /// unlock_once 语义：捕获一次后不再覆盖，采纳/重 arm 清空）。
+    unlock_captured: Option<(Vec<u8>, Option<Vec<u8>>)>,
     race_seen: HashSet<SocketAddr>,
     mirror_log_n: u32,
     mirror_log_at: Option<Instant>,
-    /// 发送失败限流（每目标 5s 一条；Go lastSendErrAt——本地错误是粘性的，不限流会每包刷屏）。
-    send_err_log_at: HashMap<SocketAddr, Instant>,
     last_path_log_at: Option<Instant>,
+    /// 过渡双发（FIX-09）：旧路径 + 是否中继 + 宽限期。
+    handover: Option<(SocketAddr, bool, Instant)>,
     rx_bytes: u64,
     tx_bytes: u64,
     send_errs: u64,
-    /// 最近一次**采纳路径**本地类发送错误时刻（Go lastLocalSendErrAt——巡检证据
-    /// 分类的数据源；镜像候选的错误不刷此位）。
     last_local_send_err: Option<Instant>,
-    logf: Arc<dyn Fn(&str) + Send + Sync>,
-    /// 发送 scratch（容器帧/腿帧拼装，热路径零分配——吞吐设计位）。
-    scratch: Vec<u8>,
+    send_err_log_at: HashMap<SocketAddr, Instant>,
+    /// 接收读错误退避（到点前跳过收包；poll 超时参与——持续 POLLERR 不空转）。
+    recv_backoff_until: Option<Instant>,
+    recv_err_log_at: Option<Instant>,
+    logf: crate::Logf,
+    on_hint: Option<OnHint>,
     /// 收包缓冲（UDP 数据报上界 64KB，构造时一次分配）。
     recv_buf: Box<[u8; 65536]>,
     /// 测试缝位：模拟「socket 被 OS 作废」（冻结唤醒形态）——置位后收/发全部报
@@ -110,50 +142,75 @@ pub struct Bind {
 
 impl Bind {
     /// 装配并打开 UDP socket（v4 随机端口，非阻塞——驱动线程经 poll 唤醒）。
-    /// `candidates` 的 relay 条目被过滤（R1 不做中继腿，见模块注释）。
+    /// `direct_first`：`Some(0)` = 取缺省 2s；`None` = 显式关（全部候选同时打）。
     pub fn open(
         candidates: &[Candidate],
         reg: Option<RegCtx>,
-        logf: Arc<dyn Fn(&str) + Send + Sync>,
+        direct_first: Option<Duration>,
+        peer_pub: &[u8; 32],
+        logf: crate::Logf,
     ) -> io::Result<Self> {
         let sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?;
         sock.set_nonblocking(true)?;
-        let b = Self {
+        let mut b = Self {
             sock,
-            candidates: candidates.iter().filter(|c| !c.relay).map(|c| c.addr).collect(),
+            candidates: candidates.to_vec(),
+            relay_eps: candidates.iter().filter(|c| c.relay).map(|c| c.addr).collect(),
+            relay_id: relay_id(peer_pub),
+            direct_first: Some(direct_first.unwrap_or(DIRECT_FIRST_DEFAULT)),
             reg,
             reg_armed: true,
             adopted: None,
+            adopted_is_relay: false,
             mirrored: 0,
             race_start: Instant::now(),
+            relay_unlocked: false,
+            unlock_captured: None,
             race_seen: HashSet::new(),
             mirror_log_n: 0,
             mirror_log_at: None,
-            send_err_log_at: HashMap::new(),
             last_path_log_at: None,
+            handover: None,
             rx_bytes: 0,
             tx_bytes: 0,
             send_errs: 0,
             last_local_send_err: None,
+            send_err_log_at: HashMap::new(),
+            recv_backoff_until: None,
+            recv_err_log_at: None,
             logf,
-            scratch: Vec::with_capacity(2048),
+            on_hint: None,
             recv_buf: Box::new([0u8; 65536]),
             #[cfg(feature = "test-seams")]
             poisoned: false,
         };
+        b.relay_unlocked = b.direct_candidates().is_empty(); // 没有直连候选就没什么可等的
         if b.candidates.is_empty() {
-            (b.logf)("wtransport: 无直连候选（R1 不做中继腿——token 只有 relay 端点时无法建连）");
+            (b.logf)("wtransport: 无任何候选（token 端点为空——无法建连）");
         }
         Ok(b)
+    }
+
+    fn direct_candidates(&self) -> Vec<Candidate> {
+        self.candidates.iter().copied().filter(|c| !c.relay).collect()
     }
 
     pub fn local_port(&self) -> u16 {
         self.sock.local_addr().map(|a| a.port()).unwrap_or(0)
     }
 
+    pub fn set_on_hint(&mut self, h: OnHint) {
+        self.on_hint = Some(h);
+    }
+
+    /// 接收读错误退避余量（驱动线程 poll 超时参与——持续错误下不空转）。
+    pub fn recv_backoff_remain(&self) -> Option<Duration> {
+        self.recv_backoff_until.map(|t| t.saturating_duration_since(Instant::now()))
+    }
+
     /// 唯一出站收口：所有要写上网络的 WG 包都经这里（封装腿帧 + reg 搭车 + 镜像/采纳
-    /// 分派）。**reg 只在首个真正写出的数据报上搭车**（不论这个包由哪个 TunnResult
-    /// 分支产出——encapsulate/update_timers/decapsulate/send_queued 四来源全覆盖）。
+    /// 分派 + 中继路由头）。**reg 只在首个真正写出的数据报上搭车**（不论这个包由哪个
+    /// TunnResult 分支产出——encapsulate/update_timers/decapsulate/send_queued 四来源全覆盖）。
     pub fn send_wg(&mut self, wg: &[u8]) {
         #[cfg(feature = "test-seams")]
         if self.poisoned {
@@ -164,69 +221,141 @@ impl Bind {
             return;
         }
         if let Some(addr) = self.adopted {
-            self.scratch.clear();
-            frame::encode_frame(FrameKind::Data, wg, &mut self.scratch);
-            if let Err(e) = self.sock.send_to(&self.scratch, addr) {
-                self.send_errs += 1;
-                self.last_local_send_err = Some(Instant::now());
-                self.log_send_err_throttled(addr, &e);
-            } else {
-                self.tx_bytes += wg.len() as u64; // 成功才计（Go bind.go:644-651 同口径）
+            let mut wire = Vec::with_capacity(wg.len() + 16);
+            wire.clear();
+            frame::encode_frame(FrameKind::Data, wg, &mut wire);
+            let wire = self.tag_relay(self.adopted_is_relay, wire);
+            match self.sock.send_to(&wire, addr) {
+                Ok(_) => self.tx_bytes += wg.len() as u64, // 成功才计（Go bind.go:644-651）
+                Err(e) => {
+                    self.send_errs += 1;
+                    self.last_local_send_err = Some(Instant::now());
+                    self.log_send_err_throttled(addr, &e);
+                }
+            }
+            // 过渡双发（FIX-09）：尽力语义，不进发送计数
+            if let Some((old, old_relay, until)) = self.handover {
+                if Instant::now() < until && old != addr {
+                    let mut wire2 = Vec::with_capacity(wg.len() + 16);
+                    frame::encode_frame(FrameKind::Data, wg, &mut wire2);
+                    let wire2 = self.tag_relay(old_relay, wire2);
+                    let _ = self.sock.send_to(&wire2, old);
+                }
             }
             return;
         }
-        // 未采纳：镜像到全部直连候选；搭车 reg 在**首个真正写出的数据报**上（每份各带
-        // ——评审中-1：零候选/全失败不得消费 arm，否则丢了首包就永久失注册）。
+        // ---- 未采纳：镜像到候选（直连优先窗口） ----
         self.mirrored += 1;
+        let now = Instant::now();
+        let relay_ok = self.relay_unlocked
+            || self.direct_candidates().is_empty()
+            || self.direct_first.is_none_or(|d| d.is_zero() || now.duration_since(self.race_start) >= d);
+        if relay_ok && !self.relay_unlocked {
+            self.relay_unlocked = true;
+        }
+        // 捕获（unlock_once）：窗口锁定期的首个未采纳出站包 + 该发搭车 reg
+        let need_capture = !relay_ok && self.unlock_captured.is_none();
         let reg_pkt = self.peek_reg();
+        let mut frame_bytes = Vec::with_capacity(wg.len() + reg_pkt.as_ref().map_or(0, |r| r.len()) + 16);
         match &reg_pkt {
             Some(r) => {
-                self.scratch.clear();
                 frame::encode_batch(
                     &[(FrameKind::Reg.to_wire(), r), (FrameKind::Data.to_wire(), wg)],
-                    &mut self.scratch,
+                    &mut frame_bytes,
                 );
             }
-            None => {
-                self.scratch.clear();
-                frame::encode_frame(FrameKind::Data, wg, &mut self.scratch);
-            }
+            None => frame::encode_frame(FrameKind::Data, wg, &mut frame_bytes),
         }
-        let mut sent = 0; // 尝试数（Go writeCandidate 后无条件 sent++——本地不可达候选
-                          // 也计入，C4 判据行与 Go 同数字；评审中-2）
-        let mut sent_ok = 0;
-        let mut send_errs: Vec<(SocketAddr, std::io::Error)> = Vec::new();
+        let mut sent = 0usize;
+        let mut relay_sent = 0usize;
+        let mut send_errs: Vec<(SocketAddr, io::Error)> = Vec::new();
         for c in &self.candidates {
-            match self.sock.send_to(&self.scratch, *c) {
-                Ok(_) => sent_ok += 1,
+            if c.relay && !relay_ok {
+                continue;
+            }
+            let wire: Vec<u8> = if c.relay { self.tag_relay(true, frame_bytes.clone()) } else { frame_bytes.clone() };
+            match self.sock.send_to(&wire, c.addr) {
+                Ok(_) => {}
                 Err(e) => {
                     self.send_errs += 1;
-                    send_errs.push((*c, e));
+                    send_errs.push((c.addr, e));
                 }
             }
-            sent += 1;
+            sent += 1; // 尝试数（Go writeCandidate 后无条件 sent++——本地不可达也计入，C4 同数字）
+            if c.relay {
+                relay_sent += 1;
+            }
         }
         for (addr, e) in &send_errs {
             self.log_send_err_throttled(*addr, e);
         }
-        if sent_ok > 0 {
-            if reg_pkt.is_some() {
-                self.reg_armed = false; // 真正写出才消费（评审中-1）
-            }
-            self.tx_bytes += wg.len() as u64; // 一条逻辑出站包按包记一次（成功；Go 同口径）
+        if sent > 0 && reg_pkt.is_some() {
+            self.reg_armed = false; // 真正写出才消费（评审中-1）
+            self.tx_bytes += wg.len() as u64; // 一条逻辑出站包按包记一次（成功）
+        }
+        if need_capture {
+            self.unlock_captured = Some((wg.to_vec(), reg_pkt));
         }
         // C4 判据行（双条件节流：≤3 行/轮 且 间隔 ≥1s）
-        let now = Instant::now();
-        let loggable =
-            self.mirror_log_n < MIRROR_LOG_MAX && self.mirror_log_at.is_none_or(|t| now.duration_since(t) >= MIRROR_LOG_GAP);
+        let loggable = self.mirror_log_n < MIRROR_LOG_MAX
+            && self.mirror_log_at.is_none_or(|t| now.duration_since(t) >= MIRROR_LOG_GAP);
         if loggable {
             self.mirror_log_n += 1;
             self.mirror_log_at = Some(now);
             (self.logf)(&format!(
-                "MIRROR 镜像包#{} → {} 候选（直连优先：本次直连 {} / 中继 0；本行每轮限 3 条）",
-                self.mirrored, sent, sent
+                "MIRROR 镜像包#{} → {} 候选（直连优先：本次直连 {} / 中继 {}；本行每轮限 3 条）",
+                self.mirrored, sent, sent - relay_sent, relay_sent
             ));
         }
+    }
+
+    /// 中继腿封装：`[0xAA][relayID(8B)] ‖ 已编码腿帧`（容器帧在内、路由头在外——
+    /// Go EncodeTaggedFrame 包已编码帧，bind.go:733-746 同序）。
+    fn tag_relay(&self, is_relay: bool, mut frame_bytes: Vec<u8>) -> Vec<u8> {
+        if !is_relay {
+            return frame_bytes;
+        }
+        let mut out = Vec::with_capacity(9 + frame_bytes.len());
+        out.push(0xAA);
+        out.extend_from_slice(&self.relay_id);
+        out.append(&mut frame_bytes);
+        out
+    }
+
+    /// DirectFirst 解锁检查（驱动线程每拍调）：窗口到点仍无采纳 → 解锁中继 + 以捕获对
+    /// 重投（`[0xAA]‖[容器帧[reg][pkt]]`——reg 必须随补发重投，评审高-1）。
+    pub fn tick_unlock(&mut self) {
+        if self.adopted.is_some() || self.relay_unlocked {
+            return;
+        }
+        let Some(window) = self.direct_first.filter(|d| !d.is_zero()) else { return };
+        if Instant::now().duration_since(self.race_start) < window {
+            return;
+        }
+        self.relay_unlocked = true;
+        let Some((pkt, reg)) = self.unlock_captured.take() else { return };
+        let relay_cands: Vec<SocketAddr> =
+            self.candidates.iter().filter(|c| c.relay).map(|c| c.addr).collect();
+        if relay_cands.is_empty() {
+            return;
+        }
+        let mut frame_bytes = Vec::with_capacity(pkt.len() + reg.as_ref().map_or(0, |r| r.len()) + 16);
+        match &reg {
+            Some(r) => frame::encode_batch(
+                &[(FrameKind::Reg.to_wire(), r), (FrameKind::Data.to_wire(), &pkt)],
+                &mut frame_bytes,
+            ),
+            None => frame::encode_frame(FrameKind::Data, &pkt, &mut frame_bytes),
+        }
+        let wire = self.tag_relay(true, frame_bytes);
+        for c in &relay_cands {
+            let _ = self.sock.send_to(&wire, c);
+        }
+        (self.logf)(&format!(
+            "MIRROR 直连窗口 {} 内无响应 → 解锁中继候选 {} 个并补发一次",
+            fmt_duration_go_ms(window),
+            relay_cands.len(),
+        ));
     }
 
     /// 预取本轮搭车 reg（不消费 arm——消费点在「真正写出」之后，见 send_wg）。
@@ -244,17 +373,30 @@ impl Bind {
         Some(pkt)
     }
 
-    /// 收一个数据报：采纳（先于帧解码，Go 同序）→ 腿帧解码。
-    /// `Ok(Some(n))` = 数据帧载荷已拷入 buf（喂 WG decapsulate）；`Ok(None)` = 本包被
-    /// 内部消费（非数据帧/非帧包，丢弃继续）；`Err(WouldBlock|TimedOut)` = 本轮无包
-    /// （驱动循环据此结束 drain）；其它 `Err` = 读错误上抛（驱动循环计数限流处理，
-    /// 不再在 Bind 内吞——避免驱动层「错误→继续→错误」的紧循环不可见）。
+    /// 收一个数据报：退避检查 → 采纳（先于帧解码）→ 腿帧解码。
+    /// **返回契约**（驱动循环的 drain 语义）：`Ok(Some(n))` = 数据帧载荷已拷入 buf；
+    /// `Ok(None)` = 本包被内部消费（继续收）；`Err(WouldBlock|TimedOut)` = 本轮无包
+    /// （结束 drain）；其它 `Err` = 读错误（驱动循环记退避 + 限流日志，原地慢转等
+    /// 换源/收工——Go bind.go:474-492）。
     pub fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
         #[cfg(feature = "test-seams")]
         if self.poisoned {
+            self.note_recv_err(&io::Error::from_raw_os_error(libc::EBADF));
             return Err(io::Error::from_raw_os_error(libc::EBADF));
         }
-        let (n, src) = self.sock.recv_from(&mut self.recv_buf[..])?;
+        if self.recv_backoff_until.is_some_and(|t| Instant::now() < t) {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "读退避中"));
+        }
+        let (n, src) = match self.sock.recv_from(&mut self.recv_buf[..]) {
+            Ok(v) => v,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+                return Err(e)
+            }
+            Err(e) => {
+                self.note_recv_err(&e);
+                return Err(e);
+            }
+        };
         self.rx_bytes += n as u64;
         self.adopt(src);
         let Some((kind, payload)) = frame::decode_frame(&self.recv_buf[..n]) else {
@@ -267,9 +409,21 @@ impl Bind {
                 Ok(Some(len))
             }
             k if k == FrameKind::Control.to_wire() => {
-                // hint 线索（R1 学习缓存内存版：会话层接线 Observe，不触发盲打）
+                // hint 线索（学习缓存接线：回调只改内存 + 投递落盘信号，不阻塞收包热路径）
                 if let Some(addr) = frame::decode_hint_payload(payload) {
-                    (self.logf)(&format!("HINT 收到对端地址线索 {addr}（来自 {src}）"));
+                    match &self.on_hint {
+                        Some(_) => {
+                            (self.logf)(&format!("HINT 收到对端地址线索 {addr}（来自 {src}）"));
+                        }
+                        None => {
+                            (self.logf)(&format!(
+                                "HINT 收到对端地址线索 {addr}，但没有处理器（缓存未接？）"
+                            ));
+                        }
+                    }
+                    if let Some(h) = &self.on_hint {
+                        h(addr);
+                    }
                 }
                 Ok(None)
             }
@@ -277,11 +431,26 @@ impl Bind {
         }
     }
 
-    /// 采纳来源 + 判据行（C5 赛跑结算一次 / C6 路径确立 3s 节流）。
+    fn note_recv_err(&mut self, e: &io::Error) {
+        self.recv_backoff_until = Some(Instant::now() + RECV_BACKOFF);
+        let now = Instant::now();
+        if self.recv_err_log_at.is_none_or(|t| now.duration_since(t) >= RECV_ERR_LOG_GAP) {
+            self.recv_err_log_at = Some(now);
+            (self.logf)(&format!(
+                "接收读错误（{e}）：原地重试等换源/收工（不交回 wg-go——读 goroutine 死亡=永久失聪）"
+            ));
+        }
+    }
+
+    /// 采纳来源 + 判据行（C5 赛跑结算一次 / C6 路径确立·切换 3s 节流 / 中继告警 /
+    /// handover 登记）。
     fn adopt(&mut self, src: SocketAddr) {
         let was_valid = self.adopted.is_some();
         let prev = self.adopted;
+        let prev_was_relay = self.adopted_is_relay;
+        let is_relay = self.relay_eps.contains(&src);
         self.adopted = Some(src);
+        self.adopted_is_relay = is_relay;
         self.race_seen.insert(src);
         let now = Instant::now();
         if !was_valid {
@@ -289,34 +458,61 @@ impl Bind {
             let mut ok_list = Vec::new();
             let mut miss_list = Vec::new();
             for c in &self.candidates {
-                if self.race_seen.contains(c) {
-                    ok_list.push(c.to_string());
+                if self.race_seen.contains(&c.addr) {
+                    ok_list.push(c.addr.to_string());
                 } else {
-                    miss_list.push(format!("{} {c}", candidate_tag(*c)));
+                    miss_list.push(format!("{} {}", candidate_tag(c.addr, c.relay), c.addr));
                 }
             }
-            let elapsed = now.duration_since(self.race_start);
             (self.logf)(&format!(
-                "赛跑结算：胜出 直连 {src}（镜像 {} 包，耗时 {}）；响应过={}；未响应={}",
+                "赛跑结算：胜出 {} {}（镜像 {} 包，耗时 {}）；响应过={}；未响应={}",
+                path_kind(is_relay),
+                src,
                 self.mirrored,
-                fmt_duration_go_ms(elapsed),
+                fmt_duration_go_ms(now.duration_since(self.race_start)),
                 ok_list.join("、"),
-                miss_list.join("、")
+                miss_list.join("、"),
             ));
         }
-        let path_changed = prev.is_none_or(|p| p != src);
-        if path_changed && self.last_path_log_at.is_none_or(|t| now.duration_since(t) >= PATH_LOG_GAP) {
+        // 过渡双发登记（FIX-09）：稳态下切到「未知来源」= 保留旧路径宽限双发；
+        // 切到候选/中继（hint/probe 学习路径）或首次采纳 = 清过渡。
+        if was_valid && prev != Some(src) {
+            let known = is_relay || self.candidates.iter().any(|c| c.addr == src);
+            if !known {
+                self.handover = Some((prev.unwrap(), prev_was_relay, now + HANDOVER_GRACE));
+            } else {
+                self.handover = None;
+            }
+        }
+        let path_changed = prev != Some(src);
+        if path_changed
+            && self.last_path_log_at.is_none_or(|t| now.duration_since(t) >= PATH_LOG_GAP)
+        {
             self.last_path_log_at = Some(now);
             if !was_valid {
-                (self.logf)(&format!("路径确立：直连 {src}（首个回包来源）"));
+                (self.logf)(&format!("路径确立：{} {}（首个回包来源）", path_kind(is_relay), src));
             } else if let Some(p) = prev {
-                (self.logf)(&format!("路径切换：直连 {p} → 直连 {src}"));
+                (self.logf)(&format!(
+                    "路径切换：{} {} → {} {}",
+                    path_kind(prev_was_relay),
+                    p,
+                    path_kind(is_relay),
+                    src
+                ));
             }
+        }
+        // 「走中继」= 需要排查的 bug（口径 2026-09-19）：在采纳点记（100% 看到每次跳变）
+        if is_relay && !prev_was_relay {
+            (self.logf)(&format!(
+                "⚠️ 链路走了中继（本应直连，属需排查的 bug）：ep={}，直连候选 {} 个全未响应（可能原因：直连地址不可达 / 出口公网映射失效 / 打洞失败）",
+                src,
+                self.direct_candidates().len(),
+            ));
         }
     }
 
-    /// 独立补发一条注册报文（C15：出口重启/设备记录被回收后保活；不依赖 WG 会话、
-    /// 不改采纳状态）。未采纳时返回 false（首次建连的注册由 send_wg 搭车负责）。
+    /// 独立补发一条注册报文（出口重启/设备记录被回收后保活；不依赖 WG 会话、
+    /// 不改采纳状态）。中继腿 = 带路由头的 reg 腿帧（Go RefreshReg 同构）。
     pub fn refresh_reg(&mut self) -> bool {
         let Some(addr) = self.adopted else { return false };
         let Some(ctx) = self.reg.as_ref() else { return false };
@@ -326,22 +522,29 @@ impl Bind {
             .unwrap_or(0);
         let mut pkt = Vec::with_capacity(reg::REG_LEN);
         reg::encode_reg_parts(&ctx.secret, &ctx.pubkey, &ctx.dev_tag, now, &mut pkt);
-        self.scratch.clear();
-        frame::encode_frame(FrameKind::Reg, &pkt, &mut self.scratch);
-        if let Err(e) = self.sock.send_to(&self.scratch, addr) {
+        let mut wire = Vec::with_capacity(pkt.len() + 16);
+        frame::encode_frame(FrameKind::Reg, &pkt, &mut wire);
+        let wire = self.tag_relay(self.adopted_is_relay, wire);
+        if let Err(e) = self.sock.send_to(&wire, addr) {
             (self.logf)(&format!("RREG 注册刷新发送失败（{e}）"));
             return false;
         }
         (self.logf)(&format!(
-            "RREG 注册刷新 → {addr}（dev={}，中继=false）",
-            crate::identity::DevTag(ctx.dev_tag).short()
+            "RREG 注册刷新 → {}（dev={}，中继={}）",
+            addr,
+            crate::identity::DevTag(ctx.dev_tag).short(),
+            self.adopted_is_relay,
         ));
         true
     }
 
     pub fn status(&self) -> Status {
         Status {
-            via: if self.adopted.is_some() { Via::Direct } else { Via::None },
+            via: match (self.adopted, self.adopted_is_relay) {
+                (None, _) => Via::None,
+                (Some(_), false) => Via::Direct,
+                (Some(_), true) => Via::Relay,
+            },
             ep: self.adopted,
             mirrored: self.mirrored,
         }
@@ -351,48 +554,25 @@ impl Bind {
         self.adopted
     }
 
+    pub fn adopted_is_relay(&self) -> bool {
+        self.adopted_is_relay
+    }
+
     pub fn rx_tx(&self) -> (u64, u64) {
         (self.rx_bytes, self.tx_bytes)
-    }
-
-    /// 最近 d 内是否发生过**采纳路径**本地类发送错误（Go LocalSendErrWithin——
-    /// 巡检失败拍按环境噪声处理的判定数据源）。
-    pub fn local_send_err_within(&self, d: Duration) -> bool {
-        self.last_local_send_err.is_some_and(|t| t.elapsed() < d)
-    }
-
-    pub fn last_local_send_err_at(&self) -> Option<Instant> {
-        self.last_local_send_err
-    }
-
-    /// 发送失败一行（每目标 5s 条；Go logSendErr 同串同节流）。
-    fn log_send_err_throttled(&mut self, addr: SocketAddr, e: &io::Error) {
-        let now = Instant::now();
-        let due = self
-            .send_err_log_at
-            .get(&addr)
-            .is_none_or(|t| now.duration_since(*t) >= Duration::from_secs(5));
-        if due {
-            self.send_err_log_at.insert(addr, now);
-            (self.logf)(&format!(
-                "发送失败：{e}（{addr}；本地错误=该候选在本机就发不出去，与对端无响应是两回事）"
-            ));
-        }
     }
 
     pub fn socket(&self) -> &UdpSocket {
         &self.sock
     }
 
-    /// 重启一轮赛跑（R1 仅供整会话重建时复用；Go 的 Rearm 家族含直连优先窗口，本期
-    /// 无中继候选即无门控面）。
-    pub fn rearm(&mut self) {
-        self.adopted = None;
-        self.reg_armed = true;
-        self.race_start = Instant::now();
-        self.race_seen.clear();
-        self.mirror_log_n = 0;
-        self.mirror_log_at = None;
+    /// 最近 d 内是否发生过**采纳路径**本地类发送错误（Go LocalSendErrWithin）。
+    pub fn local_send_err_within(&self, d: Duration) -> bool {
+        self.last_local_send_err.is_some_and(|t| t.elapsed() < d)
+    }
+
+    pub fn last_local_send_err_at(&self) -> Option<Instant> {
+        self.last_local_send_err
     }
 
     /// 换本地 socket（Go Rebind 同义：不换 Identity、不动采纳——漫游 = 同钥换源地址，
@@ -402,15 +582,78 @@ impl Bind {
         sock.set_nonblocking(true)?;
         let old = std::mem::replace(&mut self.sock, sock);
         let port = self.sock.local_addr().map(|a| a.port()).unwrap_or(0);
-        // 旧 socket 关闭：R1 无接收 goroutine 常驻（驱动线程按 fd 重取），无 ErrClosed
-        // 收口语义需要——直接 drop 即关。
         drop(old);
         #[cfg(feature = "test-seams")]
         {
             self.poisoned = false;
         }
+        self.recv_backoff_until = None; // 新 socket 的首个错误要能立刻打出日志
         (self.logf)(&format!("REBIND 本地端口 → {port}（Identity 不变）"));
         Ok(port)
+    }
+
+    /// 更新候选集（Go SetCandidates 同义）：忽略序比较（relay 位参与——FIX-14：腿类型
+    /// 变化也是「集合变了」）；变化打一行；relay_eps 同临界区重建（FIX-10）。
+    pub fn set_candidates(&mut self, cands: Vec<Candidate>) {
+        let changed = !same_candidates(&self.candidates, &cands);
+        self.candidates = cands;
+        self.relay_eps = self.candidates.iter().filter(|c| c.relay).map(|c| c.addr).collect();
+        if changed {
+            let parts: Vec<String> = self
+                .candidates
+                .iter()
+                .map(|c| format!("{}（{}）", c.addr, candidate_tag(c.addr, c.relay)))
+                .collect();
+            (self.logf)(&format!("候选集更新：{} 条（{}）", self.candidates.len(), parts.join("、")));
+        }
+    }
+
+    /// 重启一轮**新鲜赛跑**（Go Rearm：直连优先，窗口内只打直连）。
+    pub fn rearm(&mut self) {
+        self.adopted = None;
+        self.adopted_is_relay = false;
+        self.reg_armed = true;
+        self.race_start = Instant::now();
+        self.relay_unlocked = self.direct_candidates().is_empty();
+        self.unlock_captured = None;
+        self.race_seen.clear();
+        self.mirror_log_n = 0;
+        self.mirror_log_at = None;
+        self.handover = None;
+        (self.logf)(&format!(
+            "RARM 候选赛跑重启（直连优先：中继在 {} 后才解锁）",
+            fmt_duration_go_ms(self.direct_first.unwrap_or(DIRECT_FIRST_DEFAULT)),
+        ));
+    }
+
+    /// 软赛跑（Go RearmSoft：中继立即参与——「已在用中继、只想试着升直连」的时刻，
+    /// 不能因等直连把在用的中继路径停掉）。
+    pub fn rearm_soft(&mut self) {
+        self.adopted = None;
+        self.adopted_is_relay = false;
+        self.reg_armed = true;
+        self.race_start = Instant::now();
+        self.relay_unlocked = true;
+        self.unlock_captured = None;
+        self.race_seen.clear();
+        self.mirror_log_n = 0;
+        self.mirror_log_at = None;
+        (self.logf)("RARM 软赛跑（中继立即参与，同时试直连）");
+    }
+
+    /// 发送失败一行（每目标 5s 条；Go logSendErr 同串同节流）。
+    fn log_send_err_throttled(&mut self, addr: SocketAddr, e: &io::Error) {
+        let now = Instant::now();
+        let due = self
+            .send_err_log_at
+            .get(&addr)
+            .is_none_or(|t| now.duration_since(*t) >= SEND_ERR_LOG_GAP);
+        if due {
+            self.send_err_log_at.insert(addr, now);
+            (self.logf)(&format!(
+                "发送失败：{e}（{addr}；本地错误=该候选在本机就发不出去，与对端无响应是两回事）"
+            ));
+        }
     }
 
     /// 测试缝：模拟 socket 失效（见字段注释；`rebind` 解除）。
@@ -419,28 +662,29 @@ impl Bind {
         self.poisoned = true;
         (self.logf)("[test-seam] UDP socket 已置为失效形态（EBADF 模拟）");
     }
+}
 
-    /// 更新候选集（Go SetCandidates 同义；R1 形态：集合变化打一行）。
-    pub fn set_candidates(&mut self, cands: Vec<SocketAddr>) {
-        let mut changed = self.candidates.len() != cands.len();
-        if !changed {
-            for (a, b) in self.candidates.iter().zip(cands.iter()) {
-                if a != b {
-                    changed = true;
-                    break;
-                }
-            }
-        }
-        self.candidates = cands;
-        if changed {
-            let list: Vec<String> = self.candidates.iter().map(|c| format!("{c}（LAN）")).collect();
-            (self.logf)(&format!("候选集更新：{} 条（{}）", self.candidates.len(), list.join("、")));
-        }
+fn path_kind(relay: bool) -> &'static str {
+    if relay { "中继" } else { "直连" }
+}
+
+/// 集合比较（忽略顺序；relay 位参与）。
+fn same_candidates(a: &[Candidate], b: &[Candidate]) -> bool {
+    if a.len() != b.len() {
+        return false;
     }
+    let mut sa: Vec<(SocketAddr, bool)> = a.iter().map(|c| (c.addr, c.relay)).collect();
+    let mut sb: Vec<(SocketAddr, bool)> = b.iter().map(|c| (c.addr, c.relay)).collect();
+    sa.sort();
+    sb.sort();
+    sa == sb
 }
 
 /// 候选一行标签（C5 未响应列表的 tag：中继/IPv6/LAN/公网v4；Go candidateTag 同义）。
-fn candidate_tag(ap: SocketAddr) -> &'static str {
+fn candidate_tag(ap: SocketAddr, relay: bool) -> &'static str {
+    if relay {
+        return "中继";
+    }
     match ap {
         SocketAddr::V6(_) => "IPv6",
         SocketAddr::V4(v4) => {
@@ -459,14 +703,15 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
-    /// 收集型 logf（断言判据行文案）。
-    type LogSink = (Arc<dyn Fn(&str) + Send + Sync>, mpsc::Receiver<String>);
-    fn log_sink() -> LogSink {
+    /// 收集型 logf。
+    fn log_sink() -> (crate::Logf, mpsc::Receiver<String>) {
         let (tx, rx) = mpsc::channel();
-        let f: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |s: &str| {
-            let _ = tx.send(s.to_owned());
-        });
-        (f, rx)
+        (
+            Arc::new(move |s: &str| {
+                let _ = tx.send(s.to_owned());
+            }),
+            rx,
+        )
     }
 
     fn reg_ctx() -> RegCtx {
@@ -477,111 +722,273 @@ mod tests {
         }
     }
 
-    /// 内存 UDP 对：对端 socket 扮演出口。镜像 → 首包搭 reg 容器 → 回包采纳 → 单发。
+    fn bind(cands: &[Candidate], reg: Option<RegCtx>, logf: &crate::Logf) -> Bind {
+        let b = Bind::open(cands, reg, Some(Duration::from_secs(2)), &[1u8; 32], Arc::clone(logf)).unwrap();
+        b.sock.set_nonblocking(false).unwrap();
+        b.sock.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        b
+    }
+
+    /// 内存 UDP 对：镜像 → 首包搭 reg 容器 → 回包采纳 → 单发（R1 基线回归）。
     #[test]
     fn mirror_then_adopt_then_single_send() {
         let exit = UdpSocket::bind("127.0.0.1:0").unwrap();
         let exit_addr = exit.local_addr().unwrap();
         let (logf, logs) = log_sink();
-
-        let mut bind = Bind::open(
-            &[Candidate { addr: exit_addr, relay: false }, Candidate { addr: "127.0.0.1:1".parse().unwrap(), relay: false }],
+        let mut b = bind(
+            &[
+                Candidate { addr: exit_addr, relay: false },
+                Candidate { addr: "127.0.0.1:1".parse().unwrap(), relay: false },
+            ],
             Some(reg_ctx()),
-            logf,
-        )
-        .unwrap();
-        bind.sock.set_nonblocking(false).unwrap();
-        bind.sock.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
-
-        // 未采纳：首包 = 容器帧 [reg][data]，两个候选各一份（127.0.0.1:1 发不出去也计数镜像）
-        bind.send_wg(b"handshake-init");
+            &logf,
+        );
+        b.send_wg(b"handshake-init");
         let mut buf = [0u8; 2048];
         let (n, from) = exit.recv_from(&mut buf).unwrap();
-        assert_eq!(from.port(), bind.local_port());
+        assert_eq!(from.port(), b.local_port());
         let (kind, payload) = frame::decode_frame(&buf[..n]).unwrap();
         assert_eq!(kind, FrameKind::Batch.to_wire());
         let msgs = frame::decode_batch(payload).unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].0, FrameKind::Reg.to_wire());
-        assert_eq!(msgs[0].1.len(), reg::REG_LEN);
         assert_eq!(msgs[1], (FrameKind::Data.to_wire(), &b"handshake-init"[..]));
-        // 第二包不再搭 reg（arm 已消费——收紧语义）
-        bind.send_wg(b"second");
+        // 第二包不再搭 reg
+        b.send_wg(b"second");
         let (n2, _) = exit.recv_from(&mut buf).unwrap();
         let (k2, p2) = frame::decode_frame(&buf[..n2]).unwrap();
         assert_eq!((k2, p2), (FrameKind::Data.to_wire(), &b"second"[..]));
-
-        // 出口回一帧数据 → 客户端采纳 + C5/C6 判据行
+        // 回包采纳 + C5/C6
         let mut resp = Vec::new();
         frame::encode_frame(FrameKind::Data, b"handshake-response", &mut resp);
-        exit.send_to(&resp, format!("127.0.0.1:{}", bind.local_port())).unwrap();
+        exit.send_to(&resp, format!("127.0.0.1:{}", b.local_port())).unwrap();
         let mut rbuf = [0u8; 2048];
-        let got = bind.recv_from(&mut rbuf).unwrap();
-        assert_eq!(got, Some(b"handshake-response".len()));
-        assert_eq!(&rbuf[..18], b"handshake-response");
-        assert_eq!(bind.adopted(), Some(exit_addr));
-
+        assert_eq!(b.recv_from(&mut rbuf).unwrap(), Some(b"handshake-response".len()));
+        assert_eq!(b.adopted(), Some(exit_addr));
+        assert_eq!(b.status().via, Via::Direct);
         let all: Vec<String> = logs.try_iter().collect();
         assert!(
-            all.iter().any(|l| l.contains("赛跑结算：胜出 直连 ") && l.contains("（镜像 2 包，耗时 ")),
-            "C5 判据行缺失：{all:?}"
+            all.iter().any(|l| l.contains("赛跑结算：胜出 直连 ") && l.contains("未响应=LAN 127.0.0.1:1")),
+            "{all:?}"
         );
-        assert!(all.iter().any(|l| l.starts_with("路径确立：直连 ")), "C6 判据行缺失：{all:?}");
-        // 未响应列表带 tag（LAN + 空格 + 地址）；响应列表裸地址
-        let settle = all.iter().find(|l| l.contains("赛跑结算")).unwrap();
-        assert!(settle.contains(&format!("响应过={exit_addr}")), "{settle}");
-        assert!(settle.contains("未响应=LAN 127.0.0.1:1"), "{settle}");
-
-        // 已采纳：单发采纳端点（纯数据腿帧）
-        bind.send_wg(b"after-adopt");
-        let (n3, from3) = exit.recv_from(&mut buf).unwrap();
+        assert!(all.iter().any(|l| l.starts_with("路径确立：直连 ")), "{all:?}");
+        // 已采纳：单发纯数据腿帧
+        b.send_wg(b"after-adopt");
+        let (n3, _) = exit.recv_from(&mut buf).unwrap();
         let (k3, p3) = frame::decode_frame(&buf[..n3]).unwrap();
         assert_eq!((k3, p3), (FrameKind::Data.to_wire(), &b"after-adopt"[..]));
-        assert_eq!(from3.port(), bind.local_port());
-
-        // refresh_reg：独立 reg 帧（不搭数据）
-        assert!(bind.refresh_reg());
+        // refresh_reg：独立 reg 帧
+        assert!(b.refresh_reg());
         let (n4, _) = exit.recv_from(&mut buf).unwrap();
         let (k4, p4) = frame::decode_frame(&buf[..n4]).unwrap();
         assert_eq!(k4, FrameKind::Reg.to_wire());
         assert_eq!(p4.len(), reg::REG_LEN);
-        assert!(logs.try_iter().any(|l| l.starts_with("RREG 注册刷新 → ")));
     }
 
-    /// 非帧包/控制帧：采纳但零数据面投递。
+    /// 中继腿：信封字节（[0xAA][relayID]‖容器帧[reg][data]）+ via=relay + 告警行。
     #[test]
-    fn non_data_frames_are_consumed_silently() {
-        let exit = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let exit_addr = exit.local_addr().unwrap();
-        let (logf, _logs) = log_sink();
-        let mut bind = Bind::open(&[Candidate { addr: exit_addr, relay: false }], None, logf).unwrap();
-        bind.sock.set_nonblocking(false).unwrap();
-        bind.sock.set_read_timeout(Some(Duration::from_millis(500))).unwrap();
-
-        // hint 控制帧
-        exit.send_to(&frame::hint_bytes("1.2.3.4:999"), format!("127.0.0.1:{}", bind.local_port())).unwrap();
-        let mut buf = [0u8; 512];
-        assert_eq!(bind.recv_from(&mut buf).unwrap(), None);
-        assert_eq!(bind.adopted(), Some(exit_addr));
-
-        // 裸非帧包（垃圾）：同样采纳（Go 同序），不投数据
-        exit.send_to(b"garbage", format!("127.0.0.1:{}", bind.local_port())).unwrap();
-        assert_eq!(bind.recv_from(&mut buf).unwrap(), None);
-    }
-
-    /// relay 候选构造期过滤（R1 不做中继腿）。
-    #[test]
-    fn relay_candidates_filtered() {
-        let (logf, _logs) = log_sink();
-        let bind = Bind::open(
-            &[
-                Candidate { addr: "127.0.0.1:1".parse().unwrap(), relay: false },
-                Candidate { addr: "127.0.0.1:2".parse().unwrap(), relay: true },
-            ],
-            None,
-            logf,
+    fn relay_envelope_and_adoption() {
+        let relay = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let (logf, logs) = log_sink();
+        let peer_pub = [3u8; 32];
+        let mut b = Bind::open(
+            &[Candidate { addr: relay_addr, relay: true }],
+            Some(reg_ctx()),
+            None, // 显式关直连优先窗口：中继立即参与
+            &peer_pub,
+            Arc::clone(&logf),
         )
         .unwrap();
-        assert_eq!(bind.candidates.len(), 1);
+        b.sock.set_nonblocking(false).unwrap();
+        b.sock.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+
+        b.send_wg(b"init");
+        let mut buf = [0u8; 2048];
+        let (n, _) = relay.recv_from(&mut buf).unwrap();
+        // [0xAA][relayID(8)]‖[腿帧]
+        assert_eq!(buf[0], 0xAA);
+        assert_eq!(&buf[1..9], &relay_id(&peer_pub));
+        let (kind, payload) = frame::decode_frame(&buf[9..n]).unwrap();
+        assert_eq!(kind, FrameKind::Batch.to_wire());
+        let msgs = frame::decode_batch(payload).unwrap();
+        assert_eq!(msgs[0].0, FrameKind::Reg.to_wire());
+        assert_eq!(msgs[1], (FrameKind::Data.to_wire(), &b"init"[..]));
+
+        // 中继回数据帧（裸腿帧——FIX-91 统一线格式）→ 采纳为 relay
+        let mut resp = Vec::new();
+        frame::encode_frame(FrameKind::Data, b"resp", &mut resp);
+        relay.send_to(&resp, format!("127.0.0.1:{}", b.local_port())).unwrap();
+        let mut rbuf = [0u8; 64];
+        assert_eq!(b.recv_from(&mut rbuf).unwrap(), Some(4));
+        assert_eq!(b.status().via, Via::Relay);
+        let all: Vec<String> = logs.try_iter().collect();
+        assert!(all.iter().any(|l| l.starts_with("赛跑结算：胜出 中继 ")), "{all:?}");
+        assert!(all.iter().any(|l| l.contains("⚠️ 链路走了中继（本应直连，属需排查的 bug）")), "{all:?}");
+        assert!(all.iter().any(|l| l.starts_with("路径确立：中继 ")), "{all:?}");
+
+        // 已采纳中继：出站带路由头
+        b.send_wg(b"data2");
+        let (n2, _) = relay.recv_from(&mut buf).unwrap();
+        assert_eq!(buf[0], 0xAA);
+        let (k, p) = frame::decode_frame(&buf[9..n2]).unwrap();
+        assert_eq!((k, p), (FrameKind::Data.to_wire(), &b"data2"[..]));
+        // RREG：带路由头的 reg 腿帧
+        assert!(b.refresh_reg());
+        let (n3, _) = relay.recv_from(&mut buf).unwrap();
+        assert_eq!(buf[0], 0xAA);
+        let (k3, _) = frame::decode_frame(&buf[9..n3]).unwrap();
+        assert_eq!(k3, FrameKind::Reg.to_wire());
+    }
+
+    /// DirectFirst 解锁补发：窗口内只打直连 → 到点解锁 → 捕获对（pkt+reg）以容器帧
+    /// 重投中继（评审高-1 验收形态：只有中继可达 + DirectFirst 开启）。
+    #[test]
+    fn direct_first_unlock_resends_with_reg() {
+        let relay = UdpSocket::bind("127.0.0.1:0").unwrap();
+        relay.set_read_timeout(Some(Duration::from_millis(60))).unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let (logf, logs) = log_sink();
+        let mut b = Bind::open(
+            &[
+                Candidate { addr: "203.0.113.1:41641".parse().unwrap(), relay: false }, // 死直连
+                Candidate { addr: relay_addr, relay: true },
+            ],
+            Some(reg_ctx()),
+            Some(Duration::from_millis(150)), // 短窗口加速测试
+            &[1u8; 32],
+            Arc::clone(&logf),
+        )
+        .unwrap();
+        b.sock.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
+
+        // 窗口内：只打直连（中继不收包）；捕获对就位
+        b.send_wg(b"pkt-A");
+        let mut buf = [0u8; 2048];
+        assert!(
+            matches!(relay.recv_from(&mut buf).err().map(|e| e.kind()), Some(io::ErrorKind::WouldBlock)),
+            "窗口内中继不得收到包"
+        );
+        assert!(b.unlock_captured.is_some(), "窗口锁定期的首包被捕获");
+        // tick 未到点不解锁
+        b.tick_unlock();
+        assert!(!b.relay_unlocked);
+
+        std::thread::sleep(Duration::from_millis(160));
+        b.tick_unlock();
+        assert!(b.relay_unlocked, "窗口到点解锁");
+        // 中继收到补发：[0xAA][id]‖[容器帧[reg][pkt-A]]
+        let (n, _) = relay.recv_from(&mut buf).unwrap();
+        assert_eq!(buf[0], 0xAA);
+        let (kind, payload) = frame::decode_frame(&buf[9..n]).unwrap();
+        assert_eq!(kind, FrameKind::Batch.to_wire());
+        let msgs = frame::decode_batch(payload).unwrap();
+        assert_eq!(msgs[0].0, FrameKind::Reg.to_wire(), "reg 必须随补发重投（高-1）");
+        assert_eq!(msgs[1], (FrameKind::Data.to_wire(), &b"pkt-A"[..]), "补发的是捕获首包");
+        let all: Vec<String> = logs.try_iter().collect();
+        assert!(
+            all.iter()
+                .any(|l| l.starts_with("MIRROR 直连窗口 150ms 内无响应 → 解锁中继候选 1 个并补发一次")),
+            "{all:?}"
+        );
+        // 解锁后常规镜像：中继参与（带路由头）
+        b.send_wg(b"pkt-B");
+        let (n2, _) = relay.recv_from(&mut buf).unwrap();
+        assert_eq!(buf[0], 0xAA);
+        assert!(n2 > 9);
+    }
+
+    /// handover 双发（FIX-09）：稳态切未知来源 → 旧路径 10s 内尽力双发。
+    #[test]
+    fn handover_dual_send_on_unknown_source() {
+        let exit = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let exit_addr = exit.local_addr().unwrap();
+        let intruder = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let intruder_addr = intruder.local_addr().unwrap();
+        let (logf, _logs) = log_sink();
+        let mut b = bind(&[Candidate { addr: exit_addr, relay: false }], None, &logf);
+
+        // 初始采纳 exit
+        let mut resp = Vec::new();
+        frame::encode_frame(FrameKind::Data, b"hello", &mut resp);
+        exit.send_to(&resp, format!("127.0.0.1:{}", b.local_port())).unwrap();
+        let mut rbuf = [0u8; 64];
+        let _ = b.recv_from(&mut rbuf).unwrap();
+        assert_eq!(b.adopted(), Some(exit_addr));
+
+        // 未知来源包（伪造/错投）→ 采纳切换 + handover 登记
+        intruder.send_to(&resp, format!("127.0.0.1:{}", b.local_port())).unwrap();
+        let _ = b.recv_from(&mut rbuf).unwrap();
+        assert_eq!(b.adopted(), Some(intruder_addr));
+        assert!(b.handover.is_some(), "未知来源切换登记双发宽限");
+
+        // 出站双发：intruder（采纳）+ exit（宽限）
+        b.send_wg(b"dual");
+        let mut buf = [0u8; 128];
+        let (n1, _) = intruder.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[2..n1], b"dual");
+        let (n2, _) = exit.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[2..n2], b"dual", "宽限期内旧路径收到双发");
+    }
+
+    /// 接收读错误：退避 + 限流行（纯逻辑面——错误注入经 note_recv_err 直驱）。
+    #[test]
+    fn recv_error_backoff_and_throttle() {
+        let exit = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let exit_addr = exit.local_addr().unwrap();
+        let (logf, logs) = log_sink();
+        let mut b = bind(&[Candidate { addr: exit_addr, relay: false }], None, &logf);
+        b.note_recv_err(&io::Error::from_raw_os_error(9));
+        assert!(b.recv_backoff_until.is_some(), "读错误置退避");
+        assert!(b.recv_backoff_remain().is_some());
+        // 退避期内 recv_from 直接 WouldBlock（不触 socket）
+        let mut buf = [0u8; 16];
+        assert_eq!(
+            b.recv_from(&mut buf).err().map(|e| e.kind()),
+            Some(io::ErrorKind::WouldBlock)
+        );
+        // 5s 限流：限流窗内连打两发只出一行
+        b.recv_backoff_until = None;
+        b.note_recv_err(&io::Error::from_raw_os_error(9));
+        b.note_recv_err(&io::Error::from_raw_os_error(9));
+        let all: Vec<String> = logs.try_iter().collect();
+        assert_eq!(
+            all.iter().filter(|l| l.starts_with("接收读错误（")).count(),
+            1,
+            "限流窗内只出一行：{all:?}"
+        );
+    }
+
+    /// 候选集更新：relay 位参与比较；变化打一行。
+    #[test]
+    fn set_candidates_relay_bit_semantics() {
+        let a1: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let (logf, logs) = log_sink();
+        let mut b = bind(&[Candidate { addr: a1, relay: false }], None, &logf);
+        // 同集：不刷
+        b.set_candidates(vec![Candidate { addr: a1, relay: false }]);
+        assert_eq!(logs.try_iter().count(), 0);
+        // relay 位变化 = 集合变了
+        b.set_candidates(vec![Candidate { addr: a1, relay: true }]);
+        let all: Vec<String> = logs.try_iter().collect();
+        assert_eq!(all.len(), 1, "{all:?}");
+        assert!(all[0].starts_with("候选集更新：1 条（127.0.0.1:1（中继））"), "{all:?}");
+        assert!(b.relay_eps.contains(&a1));
+    }
+
+    /// rearm 家族：RARM 行 + 硬/软窗口状态。
+    #[test]
+    fn rearm_family_lines_and_state() {
+        let a: SocketAddr = "127.0.0.1:9".parse().unwrap();
+        let (logf, logs) = log_sink();
+        let mut b = bind(&[Candidate { addr: a, relay: false }], None, &logf);
+        b.rearm();
+        b.rearm_soft();
+        let all: Vec<String> = logs.try_iter().collect();
+        assert!(
+            all.iter().any(|l| l.starts_with("RARM 候选赛跑重启（直连优先：中继在 ")),
+            "{all:?}"
+        );
+        assert!(all.iter().any(|l| l == "RARM 软赛跑（中继立即参与，同时试直连）"), "{all:?}");
     }
 }

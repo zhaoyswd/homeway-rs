@@ -53,7 +53,7 @@ pub fn snapshot_json(s: &SessionSnapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::LinkSnapshot;
+    use crate::session::{LinkSnapshot, SessState};
     use std::time::Instant;
 
     /// 键序 = 字典序（Go json.Marshal(map) 同序）；identity 随 link 出现。
@@ -67,7 +67,7 @@ mod tests {
                 via: "direct".into(),
                 ep: "127.0.0.1:42641".into(),
                 rtt_ms: 0,
-                at_ms: 1700000000_000,
+                at_ms: 1_700_000_000_000,
             }),
             identity: Some(("dfc1b0e2".into(), "60115c03".into())),
             stats: Some((1024, 2048)),

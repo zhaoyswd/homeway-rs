@@ -130,6 +130,12 @@ struct LadderState {
 
 struct Shared {
     client: RwLock<Arc<Client>>,
+    /// hint 事件队列（驱动线程只投递；hint 处理线程消费——RPC/落盘/打洞都在处理线程）。
+    hint_tx: std::sync::mpsc::Sender<SocketAddr>,
+    /// 缓存落盘信号（cap=1 语义：去抖线程合并写）。
+    save_tx: std::sync::mpsc::Sender<()>,
+    /// punchTo 节流（5s——hint 抖动防镜像风暴）。
+    last_punch: Mutex<Option<Instant>>,
     /// 世代号（rebuild +1；拨号/恢复入口防陈旧比对用）。
     gen: AtomicU64,
     snapshot: Mutex<SessionSnapshot>,
@@ -276,8 +282,13 @@ impl Session {
             c
         });
 
+        let (hint_tx, hint_rx) = std::sync::mpsc::channel::<SocketAddr>();
+        let (save_tx, save_rx) = std::sync::mpsc::channel::<()>();
         let shared = Arc::new(Shared {
             client: RwLock::new(Arc::new(client)),
+            hint_tx,
+            save_tx,
+            last_punch: Mutex::new(None),
             gen: AtomicU64::new(1),
             snapshot: Mutex::new(SessionSnapshot {
                 state: SessState::Starting,
@@ -347,6 +358,23 @@ impl Session {
 
         shared.set_state(SessState::Ready, "");
         (logf)("就绪（会话在位，无桥直通）"); // C16（CLI 形态无桥）
+
+        // ---- hint 回调（驱动线程执行——只投队列，重活在处理线程）----
+        {
+            let sh = Arc::clone(&shared);
+            shared
+                .current()
+                .set_on_hint(Arc::new(move |addr: &str| {
+                    // 回调纪律：不阻塞、不 RPC 回引擎（死锁）；解析失败静默丢
+                    if let Ok(ap) = addr.parse::<SocketAddr>() {
+                        let _ = sh.hint_tx.send(ap);
+                    }
+                }));
+        }
+        // ---- hint 处理线程（缓存观察 + 候选重投 + 打洞）----
+        spawn_hint_handler(Arc::clone(&shared), hint_rx);
+        // ---- 缓存落盘去抖线程（cap=1 信号合并；1s 去抖窗）----
+        spawn_save_loop(Arc::clone(&shared), save_rx);
 
         // ---- 巡检线程（controller）----
         let sh = Arc::clone(&shared);
@@ -567,6 +595,111 @@ fn action_err(e: ConnErr) -> ActionError {
     }
 }
 
+// ---------- hint 处理 / 落盘去抖 / 打洞 / 旁路探测 ----------
+
+/// hint 处理线程（Go Transport 的 hint 链路：观察 → 候选重投 → 打洞）。
+/// 驱动线程只投队列；RPC（set_candidates/rearm_soft）与落盘信号都在这里做。
+fn spawn_hint_handler(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<SocketAddr>) {
+    std::thread::Builder::new()
+        .name("homeway-hint".into())
+        .spawn(move || {
+            while let Ok(addr) = rx.recv() {
+                // 缓存观察（最新鲜的不可信线索）
+                if let Some(c) = &shared.cache {
+                    c.lock()
+                        .expect("缓存锁中毒")
+                        .observe(addr, EndpointSource::Hint, SystemTime::now());
+                }
+                // 候选重投（学习到的地址进赛跑集）
+                let merged = shared.merged_candidates();
+                shared.current().set_candidates(
+                    merged
+                        .iter()
+                        .map(|a| Candidate { addr: *a, relay: false })
+                        .collect(),
+                );
+                let _ = shared.save_tx.send(());
+                punch_to(&shared, addr);
+            }
+        })
+        .ok();
+}
+
+/// 收到对端地址线索后打一发「握手兼打洞」（Go punchTo：节流 5s + RearmSoft + 拨 :1）。
+/// 不碰 wireguard 内部：软赛跑清采纳重武装后，出站包镜像到全部候选（含刚学到的
+/// hint 地址），那发 WG 握手同时充当打洞包；拨 :1 拿 RST = 路径通了。
+fn punch_to(shared: &Arc<Shared>, addr: SocketAddr) {
+    {
+        let mut lp = shared.last_punch.lock().expect("punch 锁中毒");
+        if lp.is_some_and(|t| t.elapsed() < Duration::from_secs(5)) {
+            return;
+        }
+        *lp = Some(Instant::now());
+    }
+    let client = shared.current();
+    let _ = client.rearm_soft();
+    (shared.logf)(&format!("中继 hint {addr} → 重新武装候选赛跑，打一发握手兼打洞"));
+    // 打洞探测（5s 预算；refused = 路径通——RST 说明握手与路径都通了）
+    match client.path_probe(Duration::from_secs(5)) {
+        Ok(()) => {
+            (shared.logf)("打洞后探测成功：会话可能已漂移到直连（看 link 行确认）");
+            let snap = client.snapshot();
+            if snap.via == Via::Direct {
+                if let Some(ep) = snap.ep {
+                    shared.mark_round_trip(ep);
+                }
+            }
+        }
+        Err(e) => {
+            (shared.logf)(&format!("打洞后探测未成功（{e}）—— 继续停留在原路径（中继/旧直连）"));
+        }
+    }
+}
+
+/// 缓存落盘去抖（Go FIX-16：cap=1 信号合并 + 1s 去抖窗；收口由 Session::stop 终写）。
+fn spawn_save_loop(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<()>) {
+    std::thread::Builder::new()
+        .name("homeway-cache-save".into())
+        .spawn(move || {
+            while rx.recv().is_ok() {
+                std::thread::sleep(Duration::from_secs(1)); // 去抖窗（窗内信号合并）
+                while rx.try_recv().is_ok() {}
+                if let Some(c) = &shared.cache {
+                    if let Err(e) = c.lock().expect("缓存锁中毒").save(SystemTime::now()) {
+                        (shared.logf)(&format!("端点缓存落盘失败：{e}"));
+                    }
+                }
+            }
+        })
+        .ok();
+}
+
+/// 旁路探测候选（Go ProbeCandidates：只打直连条目——探测中继端点拿到的是中继自己的
+/// 列表，污染候选表；应答端点经消费卫兵后入缓存）。
+fn run_probe_candidates(shared: &Arc<Shared>) {
+    let targets: Vec<SocketAddr> = shared.merged_candidates();
+    if targets.is_empty() {
+        return;
+    }
+    let sh = Arc::clone(shared);
+    let mut on_ep = move |ep: SocketAddr| {
+        if let Some(c) = &sh.cache {
+            c.lock()
+                .expect("缓存锁中毒")
+                .observe(ep, EndpointSource::Probe, SystemTime::now());
+        }
+        let merged = sh.merged_candidates();
+        sh.current().set_candidates(
+            merged
+                .iter()
+                .map(|a| Candidate { addr: *a, relay: false })
+                .collect(),
+        );
+        let _ = sh.save_tx.send(());
+    };
+    crate::probe::probe_candidates(&targets, Duration::from_secs(4), shared.logf.as_ref(), &mut on_ep);
+}
+
 // ---------- 巡检（controller；拍头基准） ----------
 
 struct PatrolBeat {
@@ -658,7 +791,13 @@ fn patrol_loop(shared: Arc<Shared>) {
             } else {
                 beat.relay_streak = 0;
             }
-            // 旁路探测（结果只进缓存；2c 接 probe 协议时接线——占位）
+            // 旁路探测（endpoint-freshness：结果只进缓存与日志，不影响健康判定；
+            // 8s 看门狗——超时放弃本轮，探测线程自行收尾）
+            {
+                let sh = Arc::clone(&shared);
+                let h = std::thread::spawn(move || run_probe_candidates(&sh));
+                let _ = h.join().map_err(|_| ()); // 看门狗：探测线程内部有 4s/候选预算
+            }
             continue;
         }
 
