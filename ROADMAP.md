@@ -227,3 +227,7 @@ R7 8–12+真机；R8 2–3。全量 47–72。Rust 新增代码估 38–42k 行
 - 记忆（跨会话自动加载）：`tier-rust-port-poc-2026-10-01`、`tier-terminal-rust-port-gap`、
   `tier-rust-homeway-parallel-impl-cost`。
 - 发现的 Go 侧问题（登记不修）：本节随推进追加。
+  1. **G1（R0.4，2026-10-02）**：`pkg/proto.DecodeToken("hmw")` 对恰 3 字节 hmw 前缀串
+     panic（`token.go:105` 的 `s[:4]` 越界，实测 `slice bounds out of range [:4] with length 3`）。
+     对抗性输入面（用户粘贴残串可触）；Rust 侧已按安全语义返回 UnsupportedVersion
+     （`crates/homeway-core/src/token.rs` 头注记）。修在 Go 仓自己的流程。
