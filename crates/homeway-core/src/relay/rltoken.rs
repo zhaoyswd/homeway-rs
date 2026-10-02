@@ -72,7 +72,12 @@ pub fn load_or_create_secret(state_dir: &std::path::Path) -> std::io::Result<([u
     #[cfg(unix)]
     {
         use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
-        std::fs::DirBuilder::new().mode(0o700).create(state_dir)?;
+        // 目录已存在（relay_cli 的 create_dir_all 先建过）不算错——mode 只在新建时生效
+        if let Err(e) = std::fs::DirBuilder::new().mode(0o700).create(state_dir) {
+            if e.kind() != std::io::ErrorKind::AlreadyExists {
+                return Err(e);
+            }
+        }
         // create_new 一次成型 0600（无 0644 窗口——Go cli.go:152-160 同义）
         let mut secret = [0u8; 32];
         getrandom::getrandom(&mut secret).map_err(std::io::Error::other)?;

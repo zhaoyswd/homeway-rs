@@ -29,3 +29,26 @@ pub mod token;
 pub mod tunnel_addr;
 pub mod wgcore;
 pub mod wtransport;
+
+/// 端口转发失败码（portfwd/err 词表——tier 台账 422 单元之一；Display = 线上词面）。
+/// bind_failed = 本地监听建不起来（映射不可用但隧道不受影响）；dial_failed /
+/// invalid_target 为登记保留值（本核形态尚不产出——词汇门允许缺席表在册）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PortfwdErr {
+    BindFailed,
+}
+
+impl PortfwdErr {
+    /// 线上词面（napi-payload `code=` 同串——Go portfwd 包同源）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PortfwdErr::BindFailed => "bind_failed",
+        }
+    }
+}
+
+impl std::fmt::Display for PortfwdErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}

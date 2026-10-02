@@ -33,12 +33,13 @@ fn main() {
         }
         Some("relay") => relay_cli::cmd_relay(&args[2..]),
         Some("connect") => cmd_connect(&args[2..]),
+        Some("speedtest") => cmd_speedtest(&args[2..]),
         Some("files") => cmd_files(&args[2..]),
         Some("dnstest") => cmd_dnstest(&args[2..]),
         Some("portfwd") => cmd_portfwd(&args[2..]),
         _ => {
             eprintln!(
-                "homeway-cli——可用：\n  token <hmw1…>\n  connect --token <hmw1…> [--identity-dir <dir>] [--endpoint-cache-dir <dir>]\n      [--speedtest] [--dial <ip:port>] [--hold <secs>] [--probe N] [--status-json]\n      [--recover-from <1|2|3> [--recover-cause <s>]] [--inject poison-socket|relay-lock]（注入需 test-seams 构建）"
+"homeway-cli——可用：\n  token <hmw1…> [--dead-direct]（改写输出：Direct 端点 → 死端口——矩阵中继段注入缝）\n  connect --token <hmw1…> [--identity-dir <dir>] [--endpoint-cache-dir <dir>]\n      [--speedtest] [--dial <ip:port>] [--hold <secs>] [--probe N] [--status-json]\n      [--recover-from <1|2|3> [--recover-cause <s>]] [--inject poison-socket|relay-lock]（注入需 test-seams 构建）\n  speedtest --token <hmw1…> [--identity-dir D] [--endpoint-cache-dir D] [--rounds N] [--hold]（同会话 N 轮——A/B 轮次口径）"
             );
             std::process::exit(2);
         }
@@ -46,23 +47,53 @@ fn main() {
 }
 
 fn cmd_token(args: &[String]) {
-    match args.first() {
-        Some(s) => match token::decode(s) {
-            Ok(t) => {
-                println!("peer_id  = {}", hex_str(t.peer_id.as_bytes()));
-                println!("secret   = {}", hex_str(t.secret.as_bytes()));
-                for e in &t.endpoints {
-                    println!("endpoint = {} ({:?})", e.addr, e.kind);
-                }
-            }
+    // `token <hmw1…> --dead-direct`：解析后把 Direct 端点改指 127.0.0.1:1 重编码输出
+    //（矩阵中继段的 Go 客户端注入缝——Go host add 无 dead-direct flag；crc4 无密钥
+    // 重算即被两侧接受，评审确认可行）。与 --token 的注入语义一致（connect 侧）。
+    let dead_direct = args.iter().any(|a| a == "--dead-direct");
+    let input = args.iter().find(|a| !a.starts_with("--")).cloned();
+    let Some(s) = input else {
+        eprintln!("用法：homeway-cli token <hmw1…> [--dead-direct]");
+        std::process::exit(2);
+    };
+    if dead_direct {
+        let mut t = match token::decode(&s) {
+            Ok(t) => t,
             Err(e) => {
                 eprintln!("解析失败：{e}");
                 std::process::exit(1);
             }
-        },
-        None => {
-            eprintln!("用法：homeway-cli token <hmw1…>");
-            std::process::exit(2);
+        };
+        for e in &mut t.endpoints {
+            if e.kind == token::EndpointKind::Direct {
+                e.addr = "127.0.0.1:1".to_owned();
+            }
+        }
+        let eps: Vec<token::EndpointRef<'_>> =
+            t.endpoints.iter().map(|e| token::EndpointRef::new(&e.addr, e.kind)).collect();
+        let spec = token::TokenSpec { peer_id: &t.peer_id, secret: &t.secret, endpoints: &eps };
+        match token::encode(&spec) {
+            Ok(out) => {
+                println!("{out}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("重编码失败：{e}");
+                std::process::exit(1);
+            }
+        }
+    }
+    match token::decode(&s) {
+        Ok(t) => {
+            println!("peer_id  = {}", hex_str(t.peer_id.as_bytes()));
+            println!("secret   = {}", hex_str(t.secret.as_bytes()));
+            for e in &t.endpoints {
+                println!("endpoint = {} ({:?})", e.addr, e.kind);
+            }
+        }
+        Err(e) => {
+            eprintln!("解析失败：{e}");
+            std::process::exit(1);
         }
     }
 }
@@ -342,6 +373,92 @@ fn transit_dial(session: &Session, dst: SocketAddrV4) -> Result<usize, ConnErr> 
     }
     let _ = session.client().close(id);
     Ok(got)
+}
+
+// ---------- speedtest 独立动词（A/B 轮次口径：轮 = 同一会话内一次 run；评审 ③-1） ----------
+
+/// `homeway-cli speedtest --token <hmw1…> [--identity-dir D] [--endpoint-cache-dir D]
+///  [--rounds N] [--hold]`——建一次会话跑 N 轮（每轮自带 2s warmup，与 Go daemon
+/// `speedtest --state -host` 常驻同会话口径一致）。`--hold` = 跑完保持会话（RSS 采样）。
+fn cmd_speedtest(args: &[String]) {
+    let mut tok: Option<String> = None;
+    let mut identity_dir: Option<PathBuf> = None;
+    let mut cache_dir: Option<PathBuf> = None;
+    let mut rounds: u32 = 3;
+    let mut hold = false;
+    let mut dead_direct = false;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--token" => { i += 1; tok = args.get(i).cloned(); }
+            "--identity-dir" => { i += 1; identity_dir = args.get(i).map(PathBuf::from); }
+            "--endpoint-cache-dir" => { i += 1; cache_dir = args.get(i).map(PathBuf::from); }
+            "--rounds" => { i += 1; rounds = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(3); }
+            "--hold" => hold = true,
+            "--dead-direct" => dead_direct = true,
+            other => { eprintln!("未知参数：{other}"); std::process::exit(2); }
+        }
+        i += 1;
+    }
+    let Some(tok) = tok else {
+        eprintln!("用法：homeway-cli speedtest --token <hmw1…> [--identity-dir D] [--endpoint-cache-dir D] [--rounds N] [--hold]");
+        std::process::exit(2);
+    };
+    let mut t = match token::decode(&tok) {
+        Ok(t) => t,
+        Err(e) => { eprintln!("token 解析失败：{e}"); std::process::exit(1); }
+    };
+    if dead_direct {
+        for e in &mut t.endpoints {
+            if e.kind == token::EndpointKind::Direct {
+                e.addr = "127.0.0.1:1".to_owned();
+            }
+        }
+        println!("inject: token 直连端点已改指死端口（127.0.0.1:1）——只有中继可达");
+    }
+    let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
+    let mut session = match Session::start(SessionConfig {
+        token: t,
+        identity_dir: identity_dir.or_else(|| Some(PathBuf::from("identity"))),
+        endpoint_cache_dir: cache_dir,
+        logf: Arc::clone(&logf),
+        relay_only: false,
+    }) {
+        Ok(s) => s,
+        Err(e) => { eprintln!("会话建立失败：{e}"); std::process::exit(1); }
+    };
+    if session.snapshot().state == SessState::Failed {
+        eprintln!("会话失败收工");
+        std::process::exit(1);
+    }
+    println!("warmup pong: 就绪（判据=wg）");
+    let client = session.client();
+    for r in 1..=rounds {
+        match speedtest::run(client.as_ref(), Params::default(), &|s| println!("{s}")) {
+            Ok(res) => {
+                println!(
+                    "round {}/{}: down={:.0}Mbps up={:.0}Mbps",
+                    r, rounds,
+                    res.down_bps * 8.0 / 1e6,
+                    res.up_bps * 8.0 / 1e6
+                );
+            }
+            Err(e) => {
+                eprintln!("round {r} 失败（reason={}）：{e}", e.reason());
+                session.stop();
+                std::process::exit(1);
+            }
+        }
+    }
+    if hold {
+        println!("speedtest: 会话保持中（Ctrl-C 收工）");
+        loop {
+            std::thread::sleep(Duration::from_secs(3600));
+        }
+    }
+    let e = session.client().snapshot();
+    println!("收工：WG 传输层累计 rx={}B tx={}B", e.rx, e.tx);
+    session.stop();
 }
 
 // ---------- files 动词（每命令一条流；拨号走 healing） ----------
@@ -770,7 +887,7 @@ fn cmd_portfwd(args: &[String]) {
         let listener = match std::net::TcpListener::bind(("127.0.0.1", listen)) {
             Ok(l) => l,
             Err(e) => {
-                println!("port-forward: 监听 127.0.0.1:{listen} 失败（{e}）——该条映射不可用，不影响隧道 [code=bind_failed]");
+                println!("port-forward: 监听 127.0.0.1:{listen} 失败（{e}）——该条映射不可用，不影响隧道 [code={}]", homeway_core::PortfwdErr::BindFailed);
                 continue;
             }
         };
