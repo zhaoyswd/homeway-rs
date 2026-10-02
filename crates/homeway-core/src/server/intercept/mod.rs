@@ -11,6 +11,7 @@
 //! 产生）；失败构造 RST 回客户端。三态（建立时点/失败可见性/黑洞 10s）与 Go
 //! （Forwarder 先拨号后 CreateEndpoint）等价。
 
+pub mod dnsface;
 pub mod nat;
 pub mod pool;
 
@@ -29,8 +30,10 @@ use smoltcp::wire::{HardwareAddress, IpCidr, IpEndpoint, Ipv4Address};
 use crate::wgcore::stackb::TunDevice;
 use crate::Logf;
 
+use self::dnsface::{DnsFaces, DnsRoute};
 use self::nat::Ipv4View;
 use self::pool::{PoolCmd, PoolEvent, Upstream, WorkerPool};
+use crate::server::dnsproxy::{DnsProxy, DnsReply};
 
 /// TCP 并发上限（serve 装配层覆盖包内默认 4096——FIX-63 生产值）。
 pub const MAX_CONNS: usize = 1024;
@@ -102,19 +105,17 @@ impl Stats {
     }
 }
 
-/// DNS 进程内代答腿（3d 实装；拦截层只认这个接口——不依赖 dnsproxy 具体形态）。
-pub trait DnsAnswerer: Send + Sync {
-    /// 处理一条 UDP DNS 查询报文，返回应答（None = 不回包）。
-    fn answer(&self, query: &[u8]) -> Option<Vec<u8>>;
-}
-
 /// 拦截层配置（装配层注入）。
 pub struct Config {
     pub tunnel_ip: Ipv4Addr,
     /// 豁免端口 → Unix socket 路径（LocalServices；UDP 不查——Go 同口径）。
     pub local_services: HashMap<u16, String>,
-    /// :53 进程内代答腿（None = 关闭兜底，:53 按原目标过境重拨）。
-    pub dns: Option<Arc<dyn DnsAnswerer>>,
+    /// :53 进程内代答腿 + 隧道栈内 DNS 面（None = 关闭代答，:53 按原目标过境重拨）。
+    pub dns: Option<Arc<DnsProxy>>,
+    /// DNS worker 的应答回投通道（与 dns 同生共死）。
+    pub dns_events: Option<std::sync::mpsc::Receiver<DnsReply>>,
+    /// 客户端远程解析腿端口（隧道 IP:<它> TCP；0 = 不建该面）。
+    pub dns_resolve_port: u16,
     pub logf: Logf,
 }
 
@@ -185,6 +186,10 @@ pub struct Interceptor {
     served_ports: std::collections::HashSet<u16>,
     /// 出站明文包队列（TX 反重写后待 encap——pump 返回给引擎）。
     tx_out: Vec<Vec<u8>>,
+    /// DNS 的隧道栈内监听面（:53 UDP/TCP + 解析腿 TCP；dns 开才建）。
+    dns_faces: Option<DnsFaces>,
+    /// DNS worker 应答回投通道（pump 拍内 drain）。
+    dns_rx: Option<std::sync::mpsc::Receiver<DnsReply>>,
     /// UDP 会话号（判据行 #N——进程级递增，对齐旧 udp relay 口径）。
     udp_seq: u64,
     time0: Instant,
@@ -193,7 +198,7 @@ pub struct Interceptor {
 
 impl Interceptor {
     /// 装配：拦截栈（地址 = 隧道 IP）+ worker 池。E5 判据行在此打出。
-    pub fn attach(cfg: Config, stats: Arc<Stats>) -> Self {
+    pub fn attach(mut cfg: Config, stats: Arc<Stats>) -> Self {
         let mut device = TunDevice::new();
         let mut iface = Interface::new(
             IfaceConfig::new(HardwareAddress::Ip),
@@ -215,6 +220,7 @@ impl Interceptor {
             "intercept: 过境拦截就绪（隧道IP {}；豁免=转投本机同端口；TCP 并发上限 {}）",
             cfg.tunnel_ip, MAX_CONNS
         ));
+        let dns_rx = cfg.dns_events.take();
         Self {
             cfg,
             stats,
@@ -231,10 +237,28 @@ impl Interceptor {
             halted: false,
             served_ports: std::collections::HashSet::new(),
             tx_out: Vec::new(),
+            dns_faces: None,
+            dns_rx,
             udp_seq: 0,
             time0: Instant::now(),
             smol_now: SmolInstant::from_millis(0),
         }
+    }
+
+    /// DNS 面装配（attach 后单独调——监听 socket 要落在本拦截栈的 SocketSet 里）。
+    /// 对应 Go `listenTunnelDNS`（FIX-60：监听面在隧道栈内，不占 host 端口）。
+    pub fn attach_dns(&mut self) {
+        if self.cfg.dns.is_none() {
+            return;
+        }
+        let mut served = std::mem::take(&mut self.served_ports);
+        self.dns_faces = Some(DnsFaces::attach(
+            self.cfg.tunnel_ip,
+            self.cfg.dns_resolve_port,
+            &mut self.sockets,
+            &mut served,
+        ));
+        self.served_ports = served;
     }
 
     fn now_smol(&mut self) -> SmolInstant {
@@ -440,25 +464,37 @@ impl Interceptor {
 
     /// UDP 会话就绪（DialOk 或 DNS 腿）：重放 first+pending（upstream 直投，不注栈）。
     fn udp_ready(&mut self, flow: u64) {
-        let Some(f) = self.flows.get_mut(&flow) else { return };
-        let Phase::Dialing { cache } = &f.phase else { return };
-        let replays: Vec<Vec<u8>> = cache.clone();
-        f.phase = Phase::Established;
+        let (replays, kind, orig_dst, client) = {
+            let Some(f) = self.flows.get_mut(&flow) else { return };
+            let Phase::Dialing { cache } = &f.phase else { return };
+            let snap = (cache.clone(), f.kind, f.orig_dst, f.client);
+            f.phase = Phase::Established;
+            snap
+        };
+        // 栈内 udp socket 就位（DNS 进程内腿不经 worker——on_dial_ok 之外也要建；
+        // ensure 幂等，DialOk 路径重复调用无害）
+        self.ensure_udp_socket(flow);
         // 会话号 + 判据行（E12 建立）
         self.udp_seq += 1;
         let seq = self.udp_seq;
-        let (kind, orig_dst, client) = (f.kind, f.orig_dst, f.client);
         self.stats.incr_flow();
         (self.cfg.logf)(&format!(
             "udp intercept: 会话 #{seq} {} 建立（{}:{} ← {}:{}）",
             kind.as_str(), orig_dst.0, orig_dst.1, client.0, client.1
         ));
         if kind == Kind::Dns {
-            // DNS 腿：逐包进程内应答（应答回栈）
+            // DNS 腿：逐包投进程内代答（**异步**——H3 整改：阻塞面全长 2.5s/查询，
+            // 不得占驱动线程；应答经回投通道在 pump 拍内路由回该 flow）。
+            // Go `Answer()` 直调口径：不计 q 计数（q 只在隧道栈 UDP listener 面计）。
             let dns = self.cfg.dns.clone().expect("kind=Dns 必有腿");
             for q in replays {
-                if let Some(resp) = dns.answer(&q) {
-                    self.udp_send_to_client(flow, &resp);
+                let tag = self
+                    .dns_faces
+                    .as_mut()
+                    .map(|f| f.route_tag(DnsRoute::UdpFlow(flow)))
+                    .unwrap_or(0);
+                if tag != 0 {
+                    dns.submit_leg(tag, q);
                 }
             }
             return;
@@ -480,12 +516,15 @@ impl Interceptor {
         }
     }
 
-    /// 驱动拍：事件处理 → 栈 poll → TX 反重写 → idle/水位 → 返回出站明文包（引擎 encap）。
+    /// 驱动拍：事件处理 → DNS 应答回投 → 栈 poll → TX 反重写 → idle/水位 → DNS 面
+    /// 服务 → 返回出站明文包（引擎 encap）。
     pub fn pump(&mut self) -> Vec<Vec<u8>> {
         // ① worker 事件
         while let Ok(ev) = self.events.try_recv() {
             self.on_event(ev);
         }
+        // ①' DNS 应答回投（worker 池异步产出；H3——驱动线程只做路由写回）
+        self.drain_dns();
         // ② 栈 poll
         let now = self.now_smol();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
@@ -495,8 +534,9 @@ impl Interceptor {
         for pkt in raw {
             self.on_tx(pkt);
         }
-        // ④ 栈内 socket 数据面（读→Out / 关闭推进）+ idle 看门狗
+        // ④ 栈内 socket 数据面（读→Out / 关闭推进）+ DNS 面服务 + idle 看门狗
         self.service_sockets();
+        self.service_dns();
         self.reap_idle();
         // ⑤ 再 poll 一轮（③④ 产生的状态变化让 ACK/数据尽早在本拍出站）
         let now = self.now_smol();
@@ -507,6 +547,36 @@ impl Interceptor {
             self.on_tx(pkt);
         }
         std::mem::take(&mut self.tx_out)
+    }
+
+    /// DNS 应答路由（回投通道 → 栈内 socket / 拦截腿 flow）。
+    fn drain_dns(&mut self) {
+        loop {
+            let reply = match self.dns_rx.as_ref() {
+                Some(rx) => match rx.try_recv() {
+                    Ok(r) => r,
+                    Err(_) => return,
+                },
+                None => return,
+            };
+            let Some(faces) = self.dns_faces.as_mut() else { continue };
+            let Some(route) = faces.take_route(reply.tag) else { continue };
+            let Some(resp) = reply.resp else { continue }; // 畸形不回包
+            match route {
+                DnsRoute::UdpFlow(flow) => self.udp_send_to_client(flow, &resp),
+                DnsRoute::Udp53(from) => faces.deliver_udp53(&mut self.sockets, from, &resp),
+                DnsRoute::Tcp(h) => faces.deliver_tcp(&mut self.sockets, h, &resp),
+            }
+        }
+    }
+
+    /// DNS 面服务拍（读查询 → submit worker；监听池推进）。
+    fn service_dns(&mut self) {
+        let Some(dns) = self.cfg.dns.clone() else { return };
+        if let Some(faces) = self.dns_faces.as_mut() {
+            faces.service(&dns, &mut self.sockets);
+            faces.reap(&mut self.sockets);
+        }
     }
 
     fn on_tx(&mut self, mut pkt: Vec<u8>) {
@@ -901,6 +971,9 @@ impl Interceptor {
         for flow in flows {
             self.teardown_flow(flow, false);
         }
+        if let Some(faces) = self.dns_faces.as_mut() {
+            faces.close_all(&mut self.sockets);
+        }
     }
 }
 
@@ -956,6 +1029,8 @@ mod tests {
             tunnel_ip,
             local_services: HashMap::new(),
             dns: None,
+            dns_events: None,
+            dns_resolve_port: 0,
             logf: noop_logf(),
         }
     }
@@ -1081,6 +1156,133 @@ mod tests {
         }
         assert!(refused, "拨号失败应回 RST（PathProbe :1 同款语义）");
         assert!(stats.snapshot()[1].1 >= 1, "dialfail 应计数");
+    }
+
+    /// DNS 代答端到端：:53 隧道面（UDP demux → 栈内 listener → DNS worker → 回投
+    /// 原源端点）+ 进程内腿（非隧道 IP :53 的拦截兜底）。fake 上游代答。
+    #[test]
+    fn dns_faces_end_to_end() {
+        use crate::server::dnsproxy::{DnsConfig, DnsProxy};
+        use smoltcp::socket::udp::Socket as CUdp;
+        use smoltcp::time::Instant as SI;
+
+        // fake 上游（A 应答固定 127.0.0.1）
+        let up = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let up_addr = format!("127.0.0.1:{}", up.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            loop {
+                let Ok((n, from)) = up.recv_from(&mut buf) else { return };
+                let mut r = Vec::new();
+                r.extend_from_slice(&buf[..2]); // ID 回显
+                r.extend_from_slice(&[0x80 | 0x01, 0x80, 0x00, 0x01]);
+                r.extend_from_slice(&1u16.to_be_bytes()); // AN=1
+                r.extend_from_slice(&[0, 0, 0, 0]); // NS/AR
+                r.extend_from_slice(&buf[12..n]); // question 回显
+                r.extend_from_slice(&[0xC0, 0x0C]);
+                r.extend_from_slice(&1u16.to_be_bytes());
+                r.extend_from_slice(&1u16.to_be_bytes());
+                r.extend_from_slice(&60u32.to_be_bytes());
+                r.extend_from_slice(&4u16.to_be_bytes());
+                r.extend_from_slice(&[127, 0, 0, 1]);
+                let _ = up.send_to(&r, from);
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("homeway-rs-itcdns-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("resolv.conf"), format!("nameserver {up_addr}\n")).unwrap();
+
+        let (proxy, events) = DnsProxy::spawn(
+            DnsConfig { resolv_path: dir.join("resolv.conf").to_string_lossy().into_owned(), ..Default::default() },
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+        );
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let stats = Arc::new(Stats::default());
+        let cfg = Config {
+            tunnel_ip: tunnel,
+            local_services: HashMap::new(),
+            dns: Some(std::sync::Arc::clone(&proxy)),
+            dns_events: Some(events),
+            dns_resolve_port: 5300,
+            logf: noop_logf(),
+        };
+        let mut itc = Interceptor::attach(cfg, Arc::clone(&stats));
+        itc.attach_dns();
+        assert!(itc.served_ports.contains(&53), "demux 面应登记 :53");
+        assert!(itc.served_ports.contains(&5300), "解析腿端口应登记");
+
+        // 一条 A 查询（id=0x3344，example.com）
+        let mut q = Vec::new();
+        q.extend_from_slice(&0x3344u16.to_be_bytes());
+        q.extend_from_slice(&[0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+        for label in ["example", "com"] {
+            q.push(label.len() as u8);
+            q.extend_from_slice(label.as_bytes());
+        }
+        q.push(0);
+        q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+
+        // ① 隧道 IP:53 UDP 面：手搓 UDP 包 → on_plain → demux 投栈 → worker → 回投
+        let pkt = nat::build_udp(Ipv4Addr::new(100, 64, 10, 9), 52000, tunnel, 53, &q);
+        itc.on_plain(pkt);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut resp53 = None;
+        while Instant::now() < deadline {
+            for p in itc.pump() {
+                if let Some(v) = Ipv4View::parse(&p) {
+                    if v.proto == 17 && v.dst == Ipv4Addr::new(100, 64, 10, 9) && v.src == tunnel {
+                        resp53 = Some(v.payload.to_vec());
+                    }
+                }
+            }
+            if resp53.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let resp = resp53.expect(":53 面应答到达");
+        assert_eq!(&resp[..2], &0x3344u16.to_be_bytes(), "ID 回显");
+        assert_eq!(resp[3] & 0x0F, 0, "RCODE=0");
+        assert!(resp.windows(4).any(|w| w == [127, 0, 0, 1]), "A 记录 127.0.0.1 在应答里");
+        assert!(proxy.stats_line().contains("q=1"), "隧道 UDP 面计 q：{}", proxy.stats_line());
+        assert!(proxy.stats_line().contains("resp=1"));
+
+        // ② 进程内腿：dst=8.8.8.8:53（非隧道 IP 的 :53）→ 拦截 dns 会话 → submit_leg
+        let pkt2 = nat::build_udp(
+            Ipv4Addr::new(100, 64, 10, 9),
+            52001,
+            Ipv4Addr::new(8, 8, 8, 8),
+            53,
+            &q,
+        );
+        itc.on_plain(pkt2);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut resp_leg = None;
+        while Instant::now() < deadline {
+            for p in itc.pump() {
+                if let Some(v) = Ipv4View::parse(&p) {
+                    if v.proto == 17 && v.dst == Ipv4Addr::new(100, 64, 10, 9) && v.src == Ipv4Addr::new(8, 8, 8, 8) {
+                        resp_leg = Some(v.payload.to_vec());
+                    }
+                }
+            }
+            if resp_leg.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let resp = resp_leg.expect("拦截腿应答到达（源反重写为 8.8.8.8）");
+        assert_eq!(&resp[..2], &0x3344u16.to_be_bytes());
+        // submit_leg 不计 q（Go Answer 口径）；resp 计数 +1
+        assert!(proxy.stats_line().contains("q=1"), "腿不计 q：{}", proxy.stats_line());
+        assert!(proxy.stats_line().contains("resp=2"));
+        let _ = SI::from_millis(0i64);
+        let _ = CUdp::new(
+            smoltcp::socket::udp::PacketBuffer::new(vec![], vec![]),
+            smoltcp::socket::udp::PacketBuffer::new(vec![], vec![]),
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// UDP 会话端到端：客户端栈（udp socket 手搓包形式）→ transit → 回环 UDP echo →
