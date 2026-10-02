@@ -52,7 +52,7 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 |---|---|---|---|
 | **R0** | 基线锚定 + 互操作基建 + 仓库骨架 | **完成**（2026-10-02） | 6/6 |
 | **R1** | 客户端垂直切片（直连数据面 ↔ Go 出口） | **完成**（2026-10-02） | 7/7 |
-| **R2** | 客户端全量（行为对齐 + 中继腿 + files/portfwd + facade 预留） | 未开始 | — |
+| **R2** | 客户端全量（行为对齐 + 中继腿 + files/portfwd + facade 预留） | **完成**（2026-10-02） | 7/7 |
 | **R3** | 出口（多 peer WG device + 拦截层 + files/DNS/STUN/UPnP + servercore） | 未开始 | — |
 | **R4** | 中继（信封 + 准入 + 升级条纹） | 未开始 | — |
 | **R5** | 互操作矩阵全量 + fuzz + 性能 A/B + 台账三方门 | 未开始 | — |
@@ -60,11 +60,11 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 | **R7** | APP 接入（napi-rs 或 C-ABI 胶水 + OHOS 交叉 + 20 导出面 + hostsession） | 未开始 | — |
 | **R8** | 终测收官（包体/性能终测 + 共存定案 + 文档指针补录） | 未开始 | — |
 
-**下一步（当前指针）**：R2 客户端全量（连接行为逐常量对齐 + 恢复阶梯 R1–R3 + 中继腿 +
-files/portfwd + 端点缓存落盘/接线 + facade 预留；含 R1 遗留的 WG 重连语义专项，见
-R1 小节完成证据）。R0 期间用户新增全程要求：**地道 Rust 不做 Go 直译**（AGENTS「工程
-原则」节）。R1 补采完成：E10-transit/E22/E23/C8/C17 已采；E9/C11 归 R2（故障注入）、
-E12 归 R2（UDP 拨号面）。
+**下一步（当前指针）**：R3 出口（多 peer WG device + 拦截层 + files/DNS/STUN/UPnP +
+servercore；技术评审先行——多 peer device 是全程序唯一剩余中风险技术点）。R2 完成判据
+证据见 R2 小节；R2 登记：tunStatusJSON 完整键面归 R7（无 TUN 形态产不出，对照面 =
+serviceSnapshotJSON——JSON 对照已 PASS）、E9 stale/revoked 形态与 E12 归 R3、
+低-4/低-7 残余/低-10 精确形态/中-10③ 挂账归属期见 docs/reviews/R2.md 豁免表。
 
 依赖：R0→R1→R2→{R3, R4 可并行}→R5→R6→R7（**需发版会话收官 + 用户点头**）→R8。
 R4 最小可提前（不依赖 R1，只需 R0 夹具），但优先保 R1 主线。
@@ -153,6 +153,44 @@ Go 快照测试）、hostsession 的非 APP 部分留接口桩。
 判据：R1/R2/R3 命中时间窗（≤4s/≈16s/≈29s）在注入故障下实测吻合；files 上传下载字节对账；
 tunStatusJSON 与 Go 版快照 diff 为空（去除时间戳类字段）。
 **退出口**：行为对齐超支 → 允许先把「直连+巡检+files」闭环交付，恢复阶梯细节挂账到 R5 补。
+
+## R2 客户端全量（估 6–10 会话日）
+
+**目标**：连接行为逐常量对齐（`tier:docs/agents/connection-lifecycle.md` 是单一真源，改任何
+常量必须双向同步它——但本程序不改 Go 侧，只对齐）。
+
+范围：恢复阶梯 R1–R3 全档位（节拍/阈值/门控/起跑点/时延记账逐常量移植 + 判据行同串）、
+漫游/换源、端点缓存三层来源+落盘格式、60s 巡检 keepalive、**中继腿**（对本地 Go relay 实例测，
+不必等 R4）、files 客户端（每命令一流+问候+4B 帧+write 关流即取消，golden 对齐）、portfwd、
+facade trait 预留（tun prepare/attach 两阶段语义 + `tunStatusJSON` 契约产出——JSON 逐字段对
+Go 快照测试）、hostsession 的非 APP 部分留接口桩。
+判据：R1/R2/R3 命中时间窗（≤4s/≈16s/≈29s）在注入故障下实测吻合；files 上传下载字节对账；
+tunStatusJSON 与 Go 版快照 diff 为空（去除时间戳类字段）。
+**退出口**：行为对齐超支 → 允许先把「直连+巡检+files」闭环交付，恢复阶梯细节挂账到 R5 补。
+
+**完成证据（2026-10-02，全部 release 构建实测；设计/评审/判据细节 = `docs/reviews/R2.md`）**：
+- 恢复阶梯四档时间窗实测（注入：出口重启 / poison-socket 测试缝【test-seams】/
+  出口换端口+中继兜底 / 停机）：**R1 命中 3.126s（≤4s ✓）/ R2 命中 18.4s（≈16s ✓）/
+  R3 命中 38.7s（≈29s 带，含 DirectFirst 2s 窗+握手重传——首发丢包形态，Go 口径已登记）/
+  最坏 39.8s（≈45s 带，纯预算满烧 3×13s）**；RECOVER 全族判据行同串（评审脚本机械对拍）；
+- 2a WG 重连专项：五轮注入（clean stop/SIGKILL/背靠背×3）**零复现**——R1 现象未再现，
+  登记未能复现（判定三条件全绿），恢复语义已由阶梯实装覆盖（ResetPeerSession = 统一
+  rebuild_tunn 唯一重建点，与 expired 兜底共用）；
+- 中继腿全链：`link: via=relay ep=127.0.0.1:42741` + `MIRROR 直连窗口 2s 内无响应 →
+  解锁中继候选 1 个并补发一次`（(pkt,reg) 捕获对重投）+ 赛跑结算胜出中继 + ⚠️ 告警行 +
+  RREG 中继=true + 经中继 speedtest 跑通（local-relay.sh 本地 Go 中继拓扑）；
+- files 100MB 上传 3.4s / 下载 2.96s **字节对账偏差 0**（sha256 双侧一致）；实测抓出并修
+  critical bug：帧解析 drain 边界混入 4B 前缀（合成流单测 5 种切块 + 真实对账双证）；
+- 状态 JSON 对照 **PASS**（Go `host status --json` vs Rust `--status-json`：link/identity/
+  state/stats 键集与取值一致、键序字典序）；tunStatusJSON 完整键面归 R7（登记）；
+- portfwd 烟囱（监听行同串 + 经转发收到载荷）；E9 已采（`--peer-ttl 15s` 注入：
+  `peer: - dev=… reason=ttl (idle=7m47s)`）；E12 归 R3（客户端无 UDP 拨号面）；
+- vecgen 三族新向量（reg 报文/端点缓存 JSON 字节/files 帧含 70KB 跨 u16 样本）+ Rust
+  对照测试逐字节绿；吞吐锚 release speedtest down 393–404Mbps / up 265–359Mbps（R1 界内；
+  debug 构建假回归 25Mbps 的排查记录在案——判据测量一律 release）；
+- 两道门：技术评审（dsh，1 高/15 中/20 低全处置——高-1 解锁补发 reg 搭车/前缀口径 R1
+  实错修正等）；代码评审（dsh，0 高/9 中/16 低——必修面全整改 + 复验，豁免逐条登记）；
+- 单测 68 全绿（59 lib + 9 向量/集成），clippy 0 warning（基线清零）。
 
 ## R3 出口（估 10–15 会话日）
 
