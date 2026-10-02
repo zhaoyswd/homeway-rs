@@ -74,6 +74,9 @@ pub enum Cmd {
     Connect {
         id: u64,
         dst: SocketAddrV4,
+        /// 建立期限（引擎侧到点 abort——探测预算必须下沉引擎，caller 弃等会留残留 SYN
+        /// 污染阶梯归因；R2 评审中-13）。
+        deadline: Duration,
         reply: Sender<Result<(), ConnErr>>,
     },
     Write {
@@ -94,7 +97,31 @@ pub enum Cmd {
         id: u64,
         reply: Sender<Result<(), ConnErr>>,
     },
-    RefreshReg,
+    /// 补注册（回执 = 是否真发出：false = bind 已收工或无采纳地址）。
+    RefreshReg {
+        reply: Option<Sender<bool>>,
+    },
+    /// 清采纳、重启赛跑（Go Rearm 家族的硬赛跑形态；候选重投由调用方经 SetCandidates 跟进）。
+    Rearm {
+        reply: Sender<Result<(), ConnErr>>,
+    },
+    /// 丢弃本地 WG 会话（Go ResetPeerSession 同义：peer 移除再写回 ≙ 重建 Tunn；
+    /// **保采纳**）——下一发出站包全新握手。
+    ResetPeerSession {
+        reply: Sender<Result<(), ConnErr>>,
+    },
+    /// 换本地 UDP socket（Go Rebind 同义：不换 Identity、不动采纳）。
+    Rebind {
+        reply: Sender<Result<(), ConnErr>>,
+    },
+    /// 更新候选集（学习缓存刷新后）。
+    SetCandidates {
+        cands: Vec<Candidate>,
+    },
+    /// 测试缝：把当前 UDP socket 置为已关形态（模拟冻结唤醒后 OS 作废 socket——
+    /// R2 阶梯 R2 档注入；Go 集成测试注入假 transport 同义）。
+    #[cfg(feature = "test-seams")]
+    DebugPoisonSocket,
     Stop,
 }
 
@@ -106,6 +133,9 @@ pub struct Snapshot {
     pub mirrored: u64,
     pub rx: u64,
     pub tx: u64,
+    /// 最近一次**采纳路径**本地类发送错误时刻（巡检失败拍的噪声判定数据源；
+    /// Go Bind.lastLocalSendErrAt 同义——镜像候选的本地错误不刷此位）。
+    pub last_local_send_err: Option<Instant>,
 }
 
 pub struct CoreConfig {
@@ -168,14 +198,23 @@ impl Engine {
         SmolInstant::from_millis(self.time0.elapsed().as_millis() as i64)
     }
 
-    /// ConnectionExpired 的**一次性**重建：新随机 index 前缀 + 新 Tunn + 补注册，
-    /// 保采纳（对齐 Go 恢复阶梯 R1 档的最小兜底；见模块注释）。
+    /// 重建 Tunn（**唯一重建点**——expired 兜底与阶梯 ResetPeerSession 共用）：
+    /// 同身份/同 secret/同 peer 的全新会话状态（新随机 index 前缀），**保采纳**
+    /// （采纳/reg 都在 Bind，不受影响）。Go「peer 移除再写回」（core.go:228-246）的
+    /// 单体等价物；排队内层包随旧 Tunn 丢弃（= Go flushStagedPackets）。
+    fn rebuild_tunn(&mut self) {
+        self.tunn = make_tunn(&self.identity_key, &self.secret, self.peer_id.as_bytes());
+    }
+
+    /// ConnectionExpired 的**一次性**重建（引擎兜底：boringtun 特有义务，wireguard-go
+    /// 自管 rekey、Go 侧无对应物；**不产 RECOVER 行**，打自己的行）。置位防每拍重建
+    /// （update_timers 过期后每 tick 回错）；明文包到达复位。
     fn rebuild_tunn_once(&mut self) {
         if self.expired_pending {
             return;
         }
         self.expired_pending = true;
-        self.tunn = make_tunn(&self.identity_key, &self.secret, self.peer_id.as_bytes());
+        self.rebuild_tunn();
         if self.bind.adopted().is_some() {
             (self.logf)("wgcore: 会话过期已重建（丢会话保采纳）—— 补注册");
             self.bind.refresh_reg();
@@ -305,8 +344,8 @@ impl Engine {
     /// 返回 false = 收到 Stop。
     fn handle_cmd(&mut self, cmd: Cmd) -> bool {
         match cmd {
-            Cmd::Connect { id, dst, reply } => {
-                match self.start_conn(id, dst) {
+            Cmd::Connect { id, dst, deadline, reply } => {
+                match self.start_conn(id, dst, deadline) {
                     Ok(()) => {
                         if let Some(c) = self.conns.get_mut(&id) {
                             c.wait_est = Some(reply);
@@ -363,15 +402,51 @@ impl Engine {
                 };
                 let _ = reply.send(r);
             }
-            Cmd::RefreshReg => {
-                self.bind.refresh_reg();
+            Cmd::RefreshReg { reply } => {
+                let sent = self.bind.refresh_reg();
+                if let Some(tx) = reply {
+                    let _ = tx.send(sent);
+                }
+            }
+            Cmd::Rearm { reply } => {
+                self.bind.rearm();
+                // 无采纳路径的出站触发：空载荷 encapsulate 无会话 ⇒ 产握手 init + 搭 reg
+                // （评审中-1 的 rearm 语义；有采纳时 rearmed reg 由下一出站包搭车/独立补发）
+                if self.bind.adopted().is_none() {
+                    self.encap_send(&[]);
+                }
+                let _ = reply.send(Ok(()));
+            }
+            Cmd::ResetPeerSession { reply } => {
+                // 阶梯 R1 档动作：重建会话（保采纳）+ 清 expired 位（重建即消化过期事实，
+                // 引擎兜底路径复位）+ 判据行同串（core.go:244）。
+                self.rebuild_tunn();
+                self.expired_pending = false;
+                (self.logf)("wgcore: 已丢弃本地会话（peer 移除并写回）—— 下一发出站包将全新握手");
+                let _ = reply.send(Ok(()));
+            }
+            Cmd::Rebind { reply } => {
+                let r = self
+                    .bind
+                    .rebind()
+                    .map(|_| ())
+                    .map_err(|e| ConnErr::Dial(DialError::Stack(e.to_string())));
+                let _ = reply.send(r);
+            }
+            Cmd::SetCandidates { cands } => {
+                let addrs = cands.iter().map(|c| c.addr).collect();
+                self.bind.set_candidates(addrs);
+            }
+            #[cfg(feature = "test-seams")]
+            Cmd::DebugPoisonSocket => {
+                self.bind.poison_socket_for_test();
             }
             Cmd::Stop => return false,
         }
         true
     }
 
-    fn start_conn(&mut self, id: u64, dst: SocketAddrV4) -> Result<(), ConnErr> {
+    fn start_conn(&mut self, id: u64, dst: SocketAddrV4, deadline: Duration) -> Result<(), ConnErr> {
         let handle = self.stack.connect(dst)?;
         self.conns.insert(
             id,
@@ -380,7 +455,7 @@ impl Engine {
                 syn_sent: false,
                 local_aborted: false,
                 established: false,
-                deadline: Instant::now() + CONNECT_DEADLINE,
+                deadline: Instant::now() + deadline,
                 wait_est: None,
                 wait_read: None,
             },
@@ -488,14 +563,16 @@ impl Engine {
         s.mirrored = st.mirrored;
         s.rx = rx;
         s.tx = tx;
+        s.last_local_send_err = self.bind.last_local_send_err_at();
     }
 }
 
-/// 客户端句柄（主线程面）：命令投递 + 状态轮询 + 收工。
+/// 客户端句柄（主线程/拨号线程共享面）：命令投递 + 状态轮询 + 收工（幂等，`&self`——
+/// 经 `Arc<Client>` 共享时也能收口）。
 pub struct Client {
     cmd_tx: mpsc::Sender<Cmd>,
-    wake_wr: Option<i32>,
-    handle: Option<JoinHandle<()>>,
+    wake_wr: Mutex<Option<i32>>,
+    handle: Mutex<Option<JoinHandle<()>>>,
     snapshot: Arc<Mutex<Snapshot>>,
     stop: Arc<AtomicBool>,
     next_id: Arc<AtomicU64>,
@@ -520,7 +597,6 @@ impl Client {
             }),
             Arc::clone(&cfg.logf),
         )?;
-        let udp_fd = bind.socket().as_raw_fd();
 
         let mut fds = [0i32; 2];
         if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
@@ -560,12 +636,12 @@ impl Client {
         let stop2 = Arc::clone(&stop);
         let handle = thread::Builder::new()
             .name("homeway-wg".into())
-            .spawn(move || driver(engine, wake_r, udp_fd, stop2))?;
+            .spawn(move || driver(engine, wake_r, stop2))?;
 
         Ok(Self {
             cmd_tx,
-            wake_wr: Some(wake_w),
-            handle: Some(handle),
+            wake_wr: Mutex::new(Some(wake_w)),
+            handle: Mutex::new(Some(handle)),
             snapshot,
             stop,
             next_id,
@@ -579,7 +655,7 @@ impl Client {
 
     fn send(&self, cmd: Cmd) {
         if self.cmd_tx.send(cmd).is_ok() {
-            if let Some(fd) = self.wake_wr {
+            if let Some(fd) = *self.wake_wr.lock().expect("wake 锁中毒") {
                 unsafe {
                     libc::write(fd, b"x".as_ptr().cast(), 1);
                 }
@@ -591,19 +667,24 @@ impl Client {
         self.snapshot.lock().expect("快照锁中毒").clone()
     }
 
-    /// 建连（阻塞到 Established / refused / 超时）。
+    /// 建连（阻塞到 Established / refused / 超时；默认期限）。
     pub fn connect(&self, dst: SocketAddrV4) -> Result<u64, ConnErr> {
+        self.connect_deadline(dst, CONNECT_DEADLINE)
+    }
+
+    /// 建连（显式期限——阶梯探测/PathProbe 预算用；引擎侧到点 abort）。
+    pub fn connect_deadline(&self, dst: SocketAddrV4, deadline: Duration) -> Result<u64, ConnErr> {
         let id = self.alloc_id();
         let (tx, rx) = mpsc::channel();
-        self.send(Cmd::Connect { id, dst, reply: tx });
+        self.send(Cmd::Connect { id, dst, deadline, reply: tx });
         rx.recv().map_err(|_| ConnErr::EngineGone)??;
         Ok(id)
     }
 
     /// PathProbe：拨出口必然拒绝的端口（主入口恒 :1），拿到 RST = 隧道通、出口在、
-    /// 拦截层可用（C8 `判据=wg` 的依据；超时/不可达才算死）。
-    pub fn path_probe(&self) -> Result<(), ConnErr> {
-        self.connect(SocketAddrV4::new(SERVER_TUNNEL_IP, 1))
+    /// 拦截层可用（C8 `判据=wg` 的依据；超时/不可达才算死）。预算下沉引擎。
+    pub fn path_probe(&self, timeout: Duration) -> Result<(), ConnErr> {
+        self.connect_deadline(SocketAddrV4::new(SERVER_TUNNEL_IP, 1), timeout)
             .map(|_| ())
             // 对端 :1 若真有服务（连接成功）也说明会话活着
             .or_else(|e| match e {
@@ -636,20 +717,90 @@ impl Client {
         rx.recv().map_err(|_| ConnErr::EngineGone)?
     }
 
+    /// 补注册（fire-and-forget：patrol 暖机/周期刷新用）。
     pub fn refresh_reg(&self) {
-        self.send(Cmd::RefreshReg);
+        self.send(Cmd::RefreshReg { reply: None });
+    }
+
+    /// 补注册并回执（阶梯 R1 档要区分「发出/未发出」）。
+    pub fn refresh_reg_result(&self) -> Result<bool, ConnErr> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::RefreshReg { reply: Some(tx) });
+        rx.recv().map_err(|_| ConnErr::EngineGone)
+    }
+
+    /// 清采纳、重启赛跑（阶梯 R3 档动作）。
+    pub fn rearm(&self) -> Result<(), ConnErr> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::Rearm { reply: tx });
+        rx.recv().map_err(|_| ConnErr::EngineGone)?
+    }
+
+    /// 档位动作的**有界** RPC（阶梯动作预算 2s：引擎卡住时按超时收轮，不让阶梯
+    /// 无限等——Go runBoundedAction 的 Rust 对应；引擎正常时节拍 ≤250ms 即回）。
+    pub fn reset_peer_session_bounded(&self, d: Duration) -> Result<(), ConnErr> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::ResetPeerSession { reply: tx });
+        rx.recv_timeout(d).map_err(|_| ConnErr::Timeout)?
+    }
+
+    pub fn rebind_bounded(&self, d: Duration) -> Result<(), ConnErr> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::Rebind { reply: tx });
+        rx.recv_timeout(d).map_err(|_| ConnErr::Timeout)?
+    }
+
+    pub fn rearm_bounded(&self, d: Duration) -> Result<(), ConnErr> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::Rearm { reply: tx });
+        rx.recv_timeout(d).map_err(|_| ConnErr::Timeout)?
+    }
+
+    pub fn refresh_reg_bounded(&self, d: Duration) -> Result<bool, ConnErr> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::RefreshReg { reply: Some(tx) });
+        match rx.recv_timeout(d) {
+            Ok(v) => Ok(v),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ConnErr::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ConnErr::EngineGone),
+        }
+    }
+
+    /// 丢弃本地 WG 会话（阶梯 R1 档动作；保采纳）。
+    pub fn reset_peer_session(&self) -> Result<(), ConnErr> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::ResetPeerSession { reply: tx });
+        rx.recv().map_err(|_| ConnErr::EngineGone)?
+    }
+
+    /// 换本地 socket（阶梯 R2 档动作；保采纳）。
+    pub fn rebind(&self) -> Result<(), ConnErr> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::Rebind { reply: tx });
+        rx.recv().map_err(|_| ConnErr::EngineGone)?
+    }
+
+    /// 更新候选集（学习缓存刷新后；R2 形态：直连地址集）。
+    pub fn set_candidates(&self, cands: Vec<Candidate>) {
+        self.send(Cmd::SetCandidates { cands });
+    }
+
+    /// 测试缝：模拟冻结唤醒后 OS 作废 socket（阶梯 R2 档注入）。
+    #[cfg(feature = "test-seams")]
+    pub fn debug_poison_socket(&self) {
+        self.send(Cmd::DebugPoisonSocket);
     }
 
     /// 收工（幂等；Drop 同义——不显式 stop 也能停线程关 fd，评审中-11）。
-    pub fn stop(&mut self) {
+    pub fn stop(&self) {
         if self.stop.swap(true, Ordering::SeqCst) {
             return; // 已收工（幂等，防 double-close fd）
         }
         self.send(Cmd::Stop);
-        if let Some(h) = self.handle.take() {
+        if let Some(h) = self.handle.lock().expect("join 锁中毒").take() {
             let _ = h.join();
         }
-        if let Some(fd) = self.wake_wr.take() {
+        if let Some(fd) = self.wake_wr.lock().expect("wake 锁中毒").take() {
             unsafe {
                 libc::close(fd);
             }
@@ -663,13 +814,15 @@ impl Drop for Client {
     }
 }
 
-/// 驱动循环：poll(2) 三唤醒源（UDP fd / self-pipe / 定时）。
-fn driver(mut engine: Engine, wake_r: i32, udp_fd: i32, stop: Arc<AtomicBool>) {
+/// 驱动循环：poll(2) 三唤醒源（UDP fd / self-pipe / 定时）。**UDP fd 每轮重取**
+/// （Rebind 换 socket 后自动跟随——Go 接收循环「陈旧 socket 换新重试」的等价物）。
+fn driver(mut engine: Engine, wake_r: i32, stop: Arc<AtomicBool>) {
     let mut udp_buf = Box::new([0u8; 65536]);
     loop {
         if stop.load(Ordering::SeqCst) {
             break;
         }
+        let udp_fd = engine.bind.socket().as_raw_fd();
         let timeout = {
             let now = engine.now_smol();
             let delay = engine
@@ -805,7 +958,7 @@ mod tests {
     fn engine_probe_blackhole_times_out() {
         let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|_| {});
         let identity = Identity::ephemeral().unwrap();
-        let mut client = Client::start(CoreConfig {
+        let client = Client::start(CoreConfig {
             peer_id: PeerId::from([1; 32]),
             secret: Secret::from([2; 32]),
             identity,
@@ -818,7 +971,7 @@ mod tests {
         })
         .unwrap();
         let t0 = Instant::now();
-        let r = client.path_probe();
+        let r = client.path_probe(Duration::from_millis(1500));
         assert!(
             matches!(r, Err(ConnErr::Timeout)),
             "blackhole 应 Timeout，实得 {r:?}"

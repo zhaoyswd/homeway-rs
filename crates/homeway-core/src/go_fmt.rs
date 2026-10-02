@@ -16,6 +16,14 @@ pub fn fmt_duration_go_ms(d: Duration) -> String {
     fmt_duration_go_ns(rounded as u64)
 }
 
+/// Go `d.Round(time.Second)` + `String()`（巡检空窗行 `巡检空窗 %v` 的口径——
+/// service.go:604 `gap.Round(time.Second)`）。
+pub fn fmt_duration_go_secs(d: Duration) -> String {
+    let ns = d.as_nanos();
+    let rounded = ((ns + 500_000_000) / 1_000_000_000) * 1_000_000_000;
+    fmt_duration_go_ns(rounded as u64)
+}
+
 /// Go `Duration::String()`（输入已取整的纳秒数）。
 fn fmt_duration_go_ns(ns: u64) -> String {
     if ns == 0 {

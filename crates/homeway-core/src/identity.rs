@@ -101,6 +101,9 @@ impl fmt::Debug for DevTag {
 }
 
 /// 设备 WG 身份：私钥不外泄（Debug 脱敏）、公钥进 reg 报文/日志短指纹。
+/// Clone = 密钥复制（会话重建要同身份再装配一代——R2 rebuild；dalek StaticSecret
+/// 本身可克隆）。
+#[derive(Clone)]
 pub struct Identity {
     key: StaticSecret,
     dev_tag: DevTag,

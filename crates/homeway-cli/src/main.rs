@@ -166,7 +166,7 @@ fn cmd_connect(args: &[String]) {
 
     // ---- warmup（C8：拨 :1 判 RST = 隧道通）----
     let warm_start = Instant::now();
-    match client.path_probe() {
+    match client.path_probe(Duration::from_secs(12)) {
         Ok(()) => {
             // APP 核形态判据（tunmode.go:751），按 ROADMAP 判据移植；一次会话只打一次
             println!("warmup pong: 就绪（判据=wg）");
@@ -182,7 +182,7 @@ fn cmd_connect(args: &[String]) {
     // ---- 一次性巡检（C10 巡检形态；60s 周期属 R2）----
     client.refresh_reg();
     let patrol_start = Instant::now();
-    let patrol_ok = client.path_probe().is_ok();
+    let patrol_ok = client.path_probe(Duration::from_secs(10)).is_ok();
     let snap = client.snapshot();
     let rtt_ms = patrol_start.elapsed().as_millis();
     if patrol_ok {
@@ -229,7 +229,7 @@ fn cmd_connect(args: &[String]) {
         // 保持期结束时再打一拍巡检（保活腿证据）
         client.refresh_reg();
         let p0 = Instant::now();
-        if client.path_probe().is_ok() {
+        if client.path_probe(Duration::from_secs(10)).is_ok() {
             let snap = client.snapshot();
             let rtt = p0.elapsed().as_millis();
             if let Some(ep) = snap.ep {

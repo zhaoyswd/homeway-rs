@@ -8,9 +8,13 @@
 //! - `token`：hmw1 凭证（R0，pkg/proto/token.go 语义）
 //! - 后续：`identity`（R1）、`wtransport`/`wgcore`（R1–R2）、`intercept`（R3）…
 
+/// 日志面（跨线程共享的判据行输出；Session 在其上加前缀）。
+pub type Logf = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
+
 pub mod go_fmt;
 pub mod identity;
 pub mod psk;
+pub mod session;
 pub mod speedtest;
 pub mod token;
 pub mod tunnel_addr;

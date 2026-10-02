@@ -61,11 +61,16 @@ impl LearnedEndpoint {
     }
 }
 
-/// 一个后端一份的端点缓存（内存）。单会话生命周期内使用（无跨线程共享面，R1）。
-#[derive(Debug, Default)]
+/// 一个后端一份的端点缓存。`dir` 非空 = 落盘形态（`<dir>/<peerID hex>.json`，
+/// 原子写 + 内容未变不写 + 写前重读合并——Go endpointcache.go:256-322）。
 pub struct EndpointCache {
     entries: HashMap<SocketAddr, LearnedEndpoint>,
     ttl: Option<Duration>,
+    dir: Option<std::path::PathBuf>,
+    peer_hex: String,
+    /// 上次写盘内容（节流：内容未变不写）。
+    last_raw: String,
+    logf: Option<crate::Logf>,
 }
 
 fn now_ms(t: SystemTime) -> i64 {
@@ -74,9 +79,138 @@ fn now_ms(t: SystemTime) -> i64 {
         .unwrap_or(0)
 }
 
+impl Default for EndpointCache {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl EndpointCache {
+    /// 内存形态（无落盘）。
     pub fn new() -> Self {
-        Self::default()
+        Self {
+            entries: HashMap::new(),
+            ttl: None,
+            dir: None,
+            peer_hex: String::new(),
+            last_raw: String::new(),
+            logf: None,
+        }
+    }
+
+    /// 打开（不存在则空）某后端的端点缓存；读盘失败安全降级为空（缓存坏了不该
+    /// 影响建连——Go OpenEndpointCache 同义）。
+    pub fn open(dir: &std::path::Path, peer_id: crate::token::PeerId) -> Self {
+        let mut c = Self::new();
+        c.dir = Some(dir.to_path_buf());
+        c.peer_hex = hex_encode(peer_id.as_bytes());
+        c.load();
+        c
+    }
+
+    pub fn set_logger(&mut self, logf: crate::Logf) {
+        self.logf = Some(logf);
+    }
+
+    fn path(&self) -> Option<std::path::PathBuf> {
+        self.dir.as_ref().map(|d| d.join(format!("{}.json", self.peer_hex)))
+    }
+
+    fn load(&mut self) {
+        let Some(p) = self.path() else { return };
+        let raw = match std::fs::read(&p) {
+            Ok(r) => r,
+            Err(_) => return, // 文件缺失/不可读：空缓存
+        };
+        let f: CacheFile = match serde_json::from_slice(&raw) {
+            Ok(f) => f,
+            Err(e) => {
+                if let Some(l) = &self.logf {
+                    l(&format!("ENDPOINTCACHE 读盘失败（忽略，用空缓存）：{e}"));
+                }
+                return;
+            }
+        };
+        for e in f.entries {
+            if let Ok(ap) = e.endpoint.parse::<SocketAddr>() {
+                self.entries.insert(
+                    ap,
+                    LearnedEndpoint {
+                        addr: ap,
+                        source: e.source.into(),
+                        learned_at: e.learned_at,
+                        verified_at: e.verified_at.unwrap_or(0),
+                    },
+                );
+            }
+        }
+    }
+
+    /// 落盘（内容未变不写；原子写 tmp+rename；**写前重读合并**——同一 peerID 的两份
+    /// 缓存实例各持内存表，整文件覆盖会抹掉对方学到的条目：磁盘上本实例没有的条目
+    /// 先并入，同址以内存为准）。
+    pub fn save(&mut self, now: SystemTime) -> std::io::Result<()> {
+        let Some(_dir) = &self.dir else { return Ok(()) };
+        self.merge_disk();
+        let file = CacheFile {
+            peer: if self.peer_hex.is_empty() { None } else { Some(self.peer_hex.clone()) },
+            entries: self
+                .entries(now)
+                .into_iter()
+                .map(|e| CacheEntry {
+                    endpoint: e.addr.to_string(),
+                    source: e.source.into(),
+                    learned_at: e.learned_at,
+                    verified_at: (e.verified_at > 0).then_some(e.verified_at),
+                })
+                .collect(),
+        };
+        // 键序 = Go 结构体声明序（endpoint/source/learnedAt/verifiedAt omitempty）——
+        // 同数据与 Go 字节相同（serde 无 map 参与键排序，struct 字段序即声明序）。
+        let raw = serde_json::to_vec(&file).map_err(std::io::Error::other)?;
+        if raw == self.last_raw.as_bytes() {
+            return Ok(());
+        }
+        let p = self.path().expect("dir 已判在");
+        std::fs::create_dir_all(p.parent().expect("路径必有父"))?;
+        let tmp = p.with_file_name(format!(
+            "{}.tmp.{}.{}",
+            p.file_name().expect("有名").to_string_lossy(),
+            std::process::id(),
+            now.duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0),
+        ));
+        std::fs::write(&tmp, &raw)?;
+        match std::fs::rename(&tmp, &p) {
+            Ok(()) => {
+                self.last_raw = String::from_utf8_lossy(&raw).into_owned();
+                Ok(())
+            }
+            Err(e) => {
+                let _ = std::fs::remove_file(&tmp); // 只删自己的 tmp（名字唯一）
+                Err(e)
+            }
+        }
+    }
+
+    /// 写前重读合并：磁盘上本实例没有的条目并入内存（读盘失败静默跳过——合并是
+    /// 保护性的）。
+    fn merge_disk(&mut self) {
+        let Some(p) = self.path() else { return };
+        let raw = match std::fs::read(&p) {
+            Ok(r) => r,
+            Err(_) => return,
+        };
+        let Ok(f) = serde_json::from_slice::<CacheFile>(&raw) else { return };
+        for e in f.entries {
+            if let Ok(ap) = e.endpoint.parse::<SocketAddr>() {
+                self.entries.entry(ap).or_insert(LearnedEndpoint {
+                    addr: ap,
+                    source: e.source.into(),
+                    learned_at: e.learned_at,
+                    verified_at: e.verified_at.unwrap_or(0),
+                });
+            }
+        }
     }
 
     /// 记录一条学习到的地址（hint/inband/token）：刷新时间；来源按强度升级。
@@ -145,6 +279,64 @@ impl EndpointCache {
         }
         out
     }
+}
+
+// ---------- 落盘形态（Go endpointFile：Peer/Entries 均 omitempty；键序 = 声明序） ----------
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct CacheEntry {
+    endpoint: String,
+    source: EndpointSourceSerde,
+    learned_at: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    verified_at: Option<i64>,
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct CacheFile {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    peer: Option<String>,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    entries: Vec<CacheEntry>,
+}
+
+/// wire 形态的来源串（Go EndpointSource 字符串族；Rust enum 的 serde 面）。
+#[derive(Debug, serde::Serialize, serde::Deserialize, Clone, Copy, PartialEq)]
+enum EndpointSourceSerde {
+    #[serde(rename = "token")]
+    Token,
+    #[serde(rename = "inband")]
+    Inband,
+    #[serde(rename = "hint")]
+    Hint,
+    #[serde(rename = "probe")]
+    Probe,
+}
+
+impl From<EndpointSourceSerde> for EndpointSource {
+    fn from(s: EndpointSourceSerde) -> Self {
+        match s {
+            EndpointSourceSerde::Token => EndpointSource::Token,
+            EndpointSourceSerde::Inband => EndpointSource::Inband,
+            EndpointSourceSerde::Hint => EndpointSource::Hint,
+            EndpointSourceSerde::Probe => EndpointSource::Probe,
+        }
+    }
+}
+
+impl From<EndpointSource> for EndpointSourceSerde {
+    fn from(s: EndpointSource) -> Self {
+        match s {
+            EndpointSource::Token => EndpointSourceSerde::Token,
+            EndpointSource::Inband => EndpointSourceSerde::Inband,
+            EndpointSource::Hint => EndpointSourceSerde::Hint,
+            EndpointSource::Probe => EndpointSourceSerde::Probe,
+        }
+    }
+}
+
+fn hex_encode(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
 #[cfg(test)]

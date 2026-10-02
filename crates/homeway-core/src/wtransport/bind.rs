@@ -17,7 +17,7 @@
 //! 2. UDP socket 绑 v4（Go 绑双栈以支持 v6 承载端点）——R1 判据出口为 v4 回环/LAN；
 //!    v6 承载与双栈属 R2 换网面。
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::Arc;
@@ -87,15 +87,25 @@ pub struct Bind {
     race_seen: HashSet<SocketAddr>,
     mirror_log_n: u32,
     mirror_log_at: Option<Instant>,
+    /// 发送失败限流（每目标 5s 一条；Go lastSendErrAt——本地错误是粘性的，不限流会每包刷屏）。
+    send_err_log_at: HashMap<SocketAddr, Instant>,
     last_path_log_at: Option<Instant>,
     rx_bytes: u64,
     tx_bytes: u64,
     send_errs: u64,
+    /// 最近一次**采纳路径**本地类发送错误时刻（Go lastLocalSendErrAt——巡检证据
+    /// 分类的数据源；镜像候选的错误不刷此位）。
+    last_local_send_err: Option<Instant>,
     logf: Arc<dyn Fn(&str) + Send + Sync>,
     /// 发送 scratch（容器帧/腿帧拼装，热路径零分配——吞吐设计位）。
     scratch: Vec<u8>,
     /// 收包缓冲（UDP 数据报上界 64KB，构造时一次分配）。
     recv_buf: Box<[u8; 65536]>,
+    /// 测试缝位：模拟「socket 被 OS 作废」（冻结唤醒形态）——置位后收/发全部报
+    /// EBADF 类错误，`rebind` 换新 socket 即清除（阶梯 R2 档的注入面；
+    /// Bind 层模拟而非真关 fd——避免 fd 复用双关的误伤面）。
+    #[cfg(feature = "test-seams")]
+    poisoned: bool,
 }
 
 impl Bind {
@@ -119,13 +129,17 @@ impl Bind {
             race_seen: HashSet::new(),
             mirror_log_n: 0,
             mirror_log_at: None,
+            send_err_log_at: HashMap::new(),
             last_path_log_at: None,
             rx_bytes: 0,
             tx_bytes: 0,
             send_errs: 0,
+            last_local_send_err: None,
             logf,
             scratch: Vec::with_capacity(2048),
             recv_buf: Box::new([0u8; 65536]),
+            #[cfg(feature = "test-seams")]
+            poisoned: false,
         };
         if b.candidates.is_empty() {
             (b.logf)("wtransport: 无直连候选（R1 不做中继腿——token 只有 relay 端点时无法建连）");
@@ -141,14 +155,21 @@ impl Bind {
     /// 分派）。**reg 只在首个真正写出的数据报上搭车**（不论这个包由哪个 TunnResult
     /// 分支产出——encapsulate/update_timers/decapsulate/send_queued 四来源全覆盖）。
     pub fn send_wg(&mut self, wg: &[u8]) {
+        #[cfg(feature = "test-seams")]
+        if self.poisoned {
+            self.send_errs += 1;
+            if self.send_errs < 10 {
+                (self.logf)("[test-seam] 发送失败：socket 已置为失效形态（EBADF 模拟）");
+            }
+            return;
+        }
         if let Some(addr) = self.adopted {
             self.scratch.clear();
             frame::encode_frame(FrameKind::Data, wg, &mut self.scratch);
             if let Err(e) = self.sock.send_to(&self.scratch, addr) {
                 self.send_errs += 1;
-                if self.send_errs < 10 {
-                    (self.logf)(&format!("发送失败：{e}（{addr}；本地错误=该候选在本机就发不出去，与对端无响应是两回事）"));
-                }
+                self.last_local_send_err = Some(Instant::now());
+                self.log_send_err_throttled(addr, &e);
             } else {
                 self.tx_bytes += wg.len() as u64; // 成功才计（Go bind.go:644-651 同口径）
             }
@@ -174,17 +195,19 @@ impl Bind {
         let mut sent = 0; // 尝试数（Go writeCandidate 后无条件 sent++——本地不可达候选
                           // 也计入，C4 判据行与 Go 同数字；评审中-2）
         let mut sent_ok = 0;
+        let mut send_errs: Vec<(SocketAddr, std::io::Error)> = Vec::new();
         for c in &self.candidates {
             match self.sock.send_to(&self.scratch, *c) {
                 Ok(_) => sent_ok += 1,
                 Err(e) => {
                     self.send_errs += 1;
-                    if self.send_errs < 10 {
-                        (self.logf)(&format!("发送失败：{e}（{c}；本地错误=该候选在本机就发不出去，与对端无响应是两回事）"));
-                    }
+                    send_errs.push((*c, e));
                 }
             }
             sent += 1;
+        }
+        for (addr, e) in &send_errs {
+            self.log_send_err_throttled(*addr, e);
         }
         if sent_ok > 0 {
             if reg_pkt.is_some() {
@@ -227,6 +250,10 @@ impl Bind {
     /// （驱动循环据此结束 drain）；其它 `Err` = 读错误上抛（驱动循环计数限流处理，
     /// 不再在 Bind 内吞——避免驱动层「错误→继续→错误」的紧循环不可见）。
     pub fn recv_from(&mut self, buf: &mut [u8]) -> io::Result<Option<usize>> {
+        #[cfg(feature = "test-seams")]
+        if self.poisoned {
+            return Err(io::Error::from_raw_os_error(libc::EBADF));
+        }
         let (n, src) = self.sock.recv_from(&mut self.recv_buf[..])?;
         self.rx_bytes += n as u64;
         self.adopt(src);
@@ -328,6 +355,31 @@ impl Bind {
         (self.rx_bytes, self.tx_bytes)
     }
 
+    /// 最近 d 内是否发生过**采纳路径**本地类发送错误（Go LocalSendErrWithin——
+    /// 巡检失败拍按环境噪声处理的判定数据源）。
+    pub fn local_send_err_within(&self, d: Duration) -> bool {
+        self.last_local_send_err.is_some_and(|t| t.elapsed() < d)
+    }
+
+    pub fn last_local_send_err_at(&self) -> Option<Instant> {
+        self.last_local_send_err
+    }
+
+    /// 发送失败一行（每目标 5s 条；Go logSendErr 同串同节流）。
+    fn log_send_err_throttled(&mut self, addr: SocketAddr, e: &io::Error) {
+        let now = Instant::now();
+        let due = self
+            .send_err_log_at
+            .get(&addr)
+            .is_none_or(|t| now.duration_since(*t) >= Duration::from_secs(5));
+        if due {
+            self.send_err_log_at.insert(addr, now);
+            (self.logf)(&format!(
+                "发送失败：{e}（{addr}；本地错误=该候选在本机就发不出去，与对端无响应是两回事）"
+            ));
+        }
+    }
+
     pub fn socket(&self) -> &UdpSocket {
         &self.sock
     }
@@ -341,6 +393,49 @@ impl Bind {
         self.race_seen.clear();
         self.mirror_log_n = 0;
         self.mirror_log_at = None;
+    }
+
+    /// 换本地 socket（Go Rebind 同义：不换 Identity、不动采纳——漫游 = 同钥换源地址，
+    /// 会话保持）。新 socket 非阻塞；旧 socket 关闭（驱动线程 poll 的 fd 由每轮重取跟随）。
+    pub fn rebind(&mut self) -> io::Result<u16> {
+        let sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?;
+        sock.set_nonblocking(true)?;
+        let old = std::mem::replace(&mut self.sock, sock);
+        let port = self.sock.local_addr().map(|a| a.port()).unwrap_or(0);
+        // 旧 socket 关闭：R1 无接收 goroutine 常驻（驱动线程按 fd 重取），无 ErrClosed
+        // 收口语义需要——直接 drop 即关。
+        drop(old);
+        #[cfg(feature = "test-seams")]
+        {
+            self.poisoned = false;
+        }
+        (self.logf)(&format!("REBIND 本地端口 → {port}（Identity 不变）"));
+        Ok(port)
+    }
+
+    /// 测试缝：模拟 socket 失效（见字段注释；`rebind` 解除）。
+    #[cfg(feature = "test-seams")]
+    pub fn poison_socket_for_test(&mut self) {
+        self.poisoned = true;
+        (self.logf)("[test-seam] UDP socket 已置为失效形态（EBADF 模拟）");
+    }
+
+    /// 更新候选集（Go SetCandidates 同义；R1 形态：集合变化打一行）。
+    pub fn set_candidates(&mut self, cands: Vec<SocketAddr>) {
+        let mut changed = self.candidates.len() != cands.len();
+        if !changed {
+            for (a, b) in self.candidates.iter().zip(cands.iter()) {
+                if a != b {
+                    changed = true;
+                    break;
+                }
+            }
+        }
+        self.candidates = cands;
+        if changed {
+            let list: Vec<String> = self.candidates.iter().map(|c| format!("{c}（LAN）")).collect();
+            (self.logf)(&format!("候选集更新：{} 条（{}）", self.candidates.len(), list.join("、")));
+        }
     }
 }
 
