@@ -95,9 +95,12 @@ impl Default for ServeConfig {
     }
 }
 
+/// 停机宽限（Go StopGrace 同值——「stop 后还能通最多 10s」的显式语义）。
+pub const STOP_GRACE: Duration = Duration::from_secs(10);
+
 /// 观测线程 → 驱动线程的命令。
 pub enum EngineCmd {
-    Stop,
+    Stop { grace: Duration },
     /// 同监听 socket 的 STUN 观测（应答经 reply 回执——None = 无应答/不合法）。
     StunQuery { server: SocketAddr, reply: Sender<Option<SocketAddr>> },
     StunAbort,
@@ -195,7 +198,24 @@ impl ServeEngine {
                         resolved = Some(i);
                     }
                     None => {
-                        (logf)(&format!("绑卡：网卡 {name:?} 不存在—— 本轮不绑，走系统默认路由"));
+                        // Go cli.go 语义：名字不存在 → 告警后退回 auto（TUN 代理机器上
+                        // 「不绑」恰恰是最危险的形态——评审 M18）
+                        (logf)(&format!("绑卡：网卡 {name:?} 不存在—— 退回自动挑卡"));
+                        let cands = egress::physical_candidates();
+                        let d2 = Arc::clone(&dlogf);
+                        match egress::select_best(&cands, &[], Duration::from_secs(2), &move |s: &str| {
+                            (d2)(s);
+                        }) {
+                            Ok(best) => {
+                                (logf)(&format!("绑卡：自动挑到 {}（{}）", best.name, iface_state_str(&best)));
+                                resolved = Some(best);
+                            }
+                            Err(e) => {
+                                (logf)(&format!(
+                                    "绑卡：自动挑卡失败（{e}）—— 本轮不绑，走系统默认路由（TUN 型代理机器上请用 --bind-interface <网卡>）"
+                                ));
+                            }
+                        }
                     }
                 }
             }
@@ -432,11 +452,10 @@ impl ServeEngine {
 
     /// 有序收工（D5 序）。grace = 过境 TCP 存量连接的有界宽限。
     pub fn shutdown(&self, grace: Duration) {
-        let _ = grace;
         for f in &self.stop_flags {
             f.store(true, Ordering::SeqCst); // ② UDS listeners（accept 循环下一拍退出）
         }
-        let _ = self.cmd_tx.send(EngineCmd::Stop); // ①③④ 驱动线程内按序执行
+        let _ = self.cmd_tx.send(EngineCmd::Stop { grace }); // ①③④ 驱动线程内按序执行
         // ⑤ sock 文件清理（身份比对——只删自己 bind 出来的那个）
         let handle = self.driver.lock().expect("驱动句柄锁中毒").take();
         if let Some(h) = handle {
@@ -517,7 +536,13 @@ fn backend_label(priv_key: &x25519_dalek::StaticSecret) -> [u8; 8] {
 }
 
 fn iface_state_str(i: &IfaceInfo) -> String {
-    format!("index={} {} addrs=[{}]", i.index, if i.up { "up" } else { "down" }, i.addrs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(","))
+    // Go stateOf 形态：`index=%d up addrs=[ip/prefix,…]`（排序——评审 M5）
+    let mut addrs = i.cidrs.clone();
+    if addrs.is_empty() {
+        addrs = i.addrs.iter().map(|a| a.to_string()).collect();
+    }
+    addrs.sort();
+    format!("index={} {} addrs=[{}]", i.index, if i.up { "up" } else { "down" }, addrs.join(","))
 }
 
 fn sock_identity(p: &std::path::Path) -> (u64, u64) {
@@ -576,11 +601,15 @@ fn driver_loop(
     let mut last_dns_stats = Instant::now();
     let mut out = InboundOut::default();
     let mut stop = false;
+    let mut stop_grace = STOP_GRACE;
     while !stop {
         // ① 命令
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
-                EngineCmd::Stop => stop = true,
+                EngineCmd::Stop { grace } => {
+                    stop_grace = grace;
+                    stop = true;
+                }
                 EngineCmd::StunQuery { server, reply } => {
                     if bind.stun_query(server, reply).is_err() {
                         // 已有查询在等：直接回 None（观测周期分钟级，冲突即失败）
@@ -662,9 +691,22 @@ fn driver_loop(
             }
         }
     }
-    // ---- 收工（D5：① 已由 Stop 置位；这里 ③④；⑤ 的 UPnP 缩租在 shutdown 侧面）----
+    // ---- 收工（D5：① 已由 Stop 置位；这里 ③④——drain 的出站包照走 encap 链
+    //      （评审 M2：宽限窗口的 FIN/ACK/尾数据丢弃 = 存量连接无法自然收销账）；
+    //      ⑤ 的 UPnP 缩租在 shutdown 侧面）----
     intercept.halt_new();
-    intercept.drain(Duration::from_secs(2));
+    let deadline = Instant::now() + stop_grace;
+    loop {
+        let tx = intercept.pump_grace(deadline);
+        let mut out2 = InboundOut::default();
+        route_encap(&tx, device, &mut bind, &mut out2);
+        out2.wire.clear();
+        if intercept.flow_count() == 0 || Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    }
+    // 到期：teardown（在途 TCP 立即拆——close 内逐条 teardown + 判据行）
     intercept.close();
 }
 
@@ -852,9 +894,12 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
             (ctx.logf)("公网端点：用路由器自报 WAN 地址 + UPnP 外口公布（没有同 socket STUN 证据）");
             Some(built)
         }
-        (Some(ap), _, _) if public_v4(ap) => {
+        (Some(ap), ext, _) if public_v4(ap) => {
+            // 逐字对齐 Go publicendpoint.go:193-196（半角逗号 + 括号明细——评审 M6）
             (ctx.logf)(&format!(
-                "公网端点：暂不公布 —— STUN 观测到 {ap}，但外部端口与监听/UPnP 不一致，说明路由器改写端口或有代理抢路由"
+                "公网端点：暂不公布 —— STUN 观测到 {ap}，但外部端口与监听/UPnP 不一致（{} vs upnp={}）, 说明路由器改写端口或有代理抢路由",
+                ap.port(),
+                ext
             ));
             None
         }
@@ -896,7 +941,9 @@ fn public_v4(ap: SocketAddr) -> bool {
 
 fn resolve_stun(server: &str) -> Option<SocketAddr> {
     use std::net::ToSocketAddrs as _;
-    server.to_socket_addrs().ok()?.next()
+    // 只取 v4（Go `network="ip4"` 同义——评审 M22：AAAA 优先的主机名会让 v4 socket
+    // 恒发送失败，把可公布的判成不可用）
+    server.to_socket_addrs().ok()?.find(|a| a.is_ipv4())
 }
 
 fn stun_query_sync(cmd_tx: &Sender<EngineCmd>, server: SocketAddr, timeout: Duration) -> Option<SocketAddr> {
@@ -915,10 +962,7 @@ fn set_probe_endpoints_cmd(cmd_tx: &Sender<EngineCmd>, lines: &[String]) {
     let eps: Vec<SocketAddr> = lines
         .iter()
         .filter_map(|l| l.parse().ok())
-        .filter(|ap: &SocketAddr| match ap.ip() {
-            IpAddr::V4(v4) => egress::is_public_addr(IpAddr::V4(v4)),
-            IpAddr::V6(_) => true,
-        })
+        .filter(|ap: &SocketAddr| ap.port() != 0 && egress::is_public_addr(ap.ip()))
         .take(crate::probe::MAX_ENDPOINTS)
         .collect();
     let _ = cmd_tx.send(EngineCmd::SetProbeEndpoints(eps));

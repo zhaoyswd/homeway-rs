@@ -41,6 +41,19 @@ struct FileServe {
     dns_port: Option<u16>,
     #[serde(default)]
     files_root: Option<String>,
+    /// Go 键表含 `[[serve.ddns]]`（serve ddns add 写出）——R3 不实现自检，但**必须
+    /// 接受**该键：同 state 目录被 Go 配过 DDNS 后拒绝启动是兼容性破坏（评审 M17）。
+    #[serde(default)]
+    #[allow(dead_code)]
+    ddns: Option<Vec<FileDdns>>,
+}
+
+#[derive(serde::Deserialize, Default)]
+#[serde(deny_unknown_fields)]
+struct FileDdns {
+    #[serde(default)]
+    #[allow(dead_code)]
+    domain: String,
 }
 
 #[derive(serde::Deserialize, Default)]

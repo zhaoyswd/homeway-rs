@@ -435,8 +435,13 @@ impl WorkerPool {
 
     /// 按流发命令（流的 fd 表是 per-worker 的——必须回到归属 worker；投后唤醒）。
     /// 未知流（已被收）静默丢弃（与 Go「对已断连接写 = 无操作」同义）。
+    /// Close 命令同时收口流属主表（防只增不减的泄漏，评审 H1——worker 侧 fd 随
+    /// Closed 回执路径收；DialFailed 后未 Adopt 的流也在此清）。
     pub fn send_for(&mut self, flow: u64, cmd: PoolCmd) {
         let Some(i) = self.flow_owner.get(&flow).copied() else { return };
+        if matches!(cmd, PoolCmd::Close { .. }) {
+            self.flow_owner.remove(&flow); // 收口属主（H1）——但先取归属再清（命令仍要送达）
+        }
         if self.txs[i].send(cmd).is_ok() {
             unsafe {
                 libc::write(self.wakes[i], b"x".as_ptr().cast(), 1);
@@ -446,6 +451,11 @@ impl WorkerPool {
 
     pub fn workers(&self) -> usize {
         self.txs.len()
+    }
+
+    /// 拨号失败的流收口（无 fd 可关，但 flow_owner 条目要清——H1 同族：表只增不减）。
+    pub fn forget_flow(&mut self, flow: u64) {
+        self.flow_owner.remove(&flow);
     }
 
     /// 生成「拨号 + 移交」的短命线程（拨号阻塞面最长 10s，不占池）。

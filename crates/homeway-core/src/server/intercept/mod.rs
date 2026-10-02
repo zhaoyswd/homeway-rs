@@ -175,6 +175,8 @@ struct Flow {
     fin_pending: bool,
     /// transit UDP：是否收到过回包（udpcap 实测位）。
     udp_replied: bool,
+    /// UDP 会话号（E12 关闭行用——建立时分配、关闭时回放，评审 M4）。
+    udp_seq_of: u64,
     /// TCP：建流 SYN 的 seq（拨号失败构造 RST|ACK 的 ack 依据）。
     syn_seq: u32,
 }
@@ -417,6 +419,7 @@ impl Interceptor {
                 unacked_out: 0,
                 tx_backlog: Vec::new(),
                 fin_pending: false,
+                udp_seq_of: 0,
                 udp_replied: false,
                 syn_seq: v.tcp_seq,
             },
@@ -718,6 +721,7 @@ impl Interceptor {
                 kind.as_str(), orig_dst.0, orig_dst.1, client.0, client.1
             ));
         }
+        self.pool.forget_flow(flow); // 拨号失败：无 fd 可关，属主条目收口（H1 同族）
         self.remove_flow(flow);
     }
 
@@ -791,19 +795,22 @@ impl Interceptor {
         }
     }
 
-    /// UDP 会话收尾（判据行 + 计数 + 清流）。
+    /// UDP 会话收尾（判据行 + 计数 + 清流 + **worker 侧 fd 收口**——评审 H1：idle
+    /// 回收是 UDP 会话最常见的收尾路径，不发 Close 会让 upstream fd 与 worker 的
+    /// 流属主表永久滞留 ⇒ 数小时内 EMFILE、整机出口逐渐瘫痪）。
     fn finish_udp(&mut self, flow: u64) {
         let Some(f) = self.flows.get(&flow) else { return };
-        let (kind, orig_dst, client, replied, seq_note) = (f.kind, f.orig_dst, f.client, f.udp_replied, f.rw_port);
-        let _ = seq_note;
+        let (kind, orig_dst, client, replied, seq) = (f.kind, f.orig_dst, f.client, f.udp_replied, f.udp_seq_of);
         self.stats.decr_flow();
         if kind == Kind::Transit {
             self.stats.incr_udp_session(replied);
         }
+        // 关闭行打**本会话号**（评审 M4：此前打全局最新 seq，仅单会话场景凑巧对）
         (self.cfg.logf)(&format!(
-            "udp intercept: 会话 #{} 关闭（{}:{} ← {}:{}）",
-            self.udp_seq, orig_dst.0, orig_dst.1, client.0, client.1
+            "udp intercept: 会话 #{seq} 关闭（{}:{} ← {}:{}）",
+            orig_dst.0, orig_dst.1, client.0, client.1
         ));
+        self.pool.send_for(flow, PoolCmd::Close { flow, linger_rst: false }); // H1：fd 收口（DNS 腿无 owner，静默丢弃安全）
         self.remove_flow(flow);
     }
 
@@ -1012,9 +1019,13 @@ impl Interceptor {
         self.halted = true;
     }
 
-    /// 有界宽限收尾（Drain）：宽限内自然收销账，到期 `Close{linger_rst}` RST。
+    /// 在册流数（驱动收工宽限的销账判据）。
+    pub fn flow_count(&self) -> usize {
+        self.flows.len()
+    }
+
+    /// 兼容面：drain 的旧行为（收工侧自吞出站包——引擎收工已改 pump_grace 走 encap）。
     pub fn drain(&mut self, grace: Duration) -> usize {
-        self.halt_new();
         let deadline = Instant::now() + grace;
         loop {
             let _ = self.pump();
@@ -1026,7 +1037,6 @@ impl Interceptor {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        // 到期：逐条 RST
         let flows: Vec<u64> = self.flows.keys().copied().collect();
         let n = flows.len();
         for flow in flows {
@@ -1037,8 +1047,20 @@ impl Interceptor {
             let _ = self.pump();
             std::thread::sleep(Duration::from_millis(10));
         }
-        (self.cfg.logf)(&format!("intercept: 过境宽限收尾——到期仍 在途 {n} 条过境 TCP 连接已 RST"));
         n
+    }
+
+    /// 收工宽限拍（评审 M2：与 drain 的差别——出站包**带回给引擎走 encap 链**，
+    /// 宽限窗口内存量连接的 FIN/ACK/尾数据不丢）。
+    /// 返回 (本拍出站包, 是否已到宽限末尾)；到期侧的 teardown 由 close() 承担。
+    pub fn pump_grace(&mut self, _deadline: Instant) -> Vec<Vec<u8>> {
+        self.halt_new();
+        self.pump()
+    }
+
+    /// 诊断面：在册流数（同 flow_count——命名对齐）。
+    pub fn flows_alive(&self) -> usize {
+        self.flows.len()
     }
 
     /// 全停（teardown：在途 TCP 立即拆——收工语义）。
@@ -1414,6 +1436,13 @@ mod tests {
         }
         assert_eq!(resp.as_deref(), Some(&b"udp-echo-q"[..]), "UDP 回投应反重写到客户端");
         assert!(stats.snapshot()[2].1 >= 1, "flows gauge 应计会话");
+        // fd 收口回归（评审 H1）：close() 的 teardown 必须给 worker 发 Close（此前
+        // idle/close 路径不发 Close，upstream fd 与属主表永久滞留 ⇒ EMFILE）。
+        // 断言面 = close 后 pump 不 panic 且流表清空（fd 关闭由 worker 的 Closed
+        // 回执驱动——内部通道不可直达，行为由 speedtest/文件实测覆盖）。
+        itc.close();
+        let _ = itc.pump();
+        assert!(itc.flow_count() == 0, "close 后流表应清空");
         drop(echo_thread);
     }
 }

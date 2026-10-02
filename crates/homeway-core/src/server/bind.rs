@@ -377,7 +377,7 @@ fn wg_msg_name(b: u8) -> &'static str {
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::{Arc, Mutex};
+    use std::sync::Arc;
 
     fn noop_logf() -> crate::Logf {
         Arc::new(|_| {})

@@ -230,8 +230,13 @@ impl DnsFaces {
         }
     }
 
-    /// TCP 连接的 RFC1035 分帧写回。
+    /// TCP 连接的 RFC1035 分帧写回。**先判在册**（评审 H2：应答最长 2.5s 后才回，
+    /// 窗口内连接可能已被 reap 摘除——smoltcp 的 SocketHandle 无版本号，remove 后
+    /// 槽位复用会让 get_mut panic 或写进无关连接）。
     pub fn deliver_tcp(&self, sockets: &mut SocketSet, h: SocketHandle, resp: &[u8]) {
+        if !self.tcp_conn_live(h) {
+            return; // 连接已收线：应答丢弃（客户端会按超时重试）
+        }
         let sock = sockets.get_mut::<TcpSocket>(h);
         if sock.can_send() {
             let _ = sock.send_slice(&(resp.len() as u16).to_be_bytes());
@@ -239,18 +244,32 @@ impl DnsFaces {
         }
     }
 
-    /// TCP 连接空闲回收（单消息 30s）与已关连接清理。
+    /// handle 是否仍在册（两 face 的连接表任一命中即可——同号不同 face 的碰撞由
+    /// reap_face 的 pending 清理兜底）。
+    fn tcp_conn_live(&self, h: SocketHandle) -> bool {
+        self.tcp53.conns.contains_key(&h)
+            || self.resolve.as_ref().map(|f| f.conns.contains_key(&h)).unwrap_or(false)
+    }
+
+    /// TCP 连接空闲回收（单消息 30s）与已关连接清理；在途 DNS 路由同步清障（H2）。
     pub fn reap(&mut self, sockets: &mut SocketSet) {
         let mut tcp53 = std::mem::take(&mut self.tcp53);
-        Self::reap_face(&mut tcp53, sockets);
+        let v1 = Self::reap_face(&mut tcp53, sockets);
         self.tcp53 = tcp53;
+        for h in v1 {
+            self.pending.retain(|_, r| !matches!(r, DnsRoute::Tcp(x) if *x == h));
+        }
         if let Some(mut resolve) = self.resolve.take() {
-            Self::reap_face(&mut resolve, sockets);
+            let v2 = Self::reap_face(&mut resolve, sockets);
+            for h in v2 {
+                self.pending.retain(|_, r| !matches!(r, DnsRoute::Tcp(x) if *x == h));
+            }
             self.resolve = Some(resolve);
         }
     }
 
-    fn reap_face(face: &mut TcpFace, sockets: &mut SocketSet) {
+    /// 返回被收线的连接句柄（调用方负责清在途 DNS 路由——评审 H2）。
+    fn reap_face(face: &mut TcpFace, sockets: &mut SocketSet) -> Vec<SocketHandle> {
         let victims: Vec<SocketHandle> = face
             .conns
             .iter()
@@ -262,10 +281,11 @@ impl DnsFaces {
             })
             .map(|(h, _)| *h)
             .collect();
-        for h in victims {
-            face.conns.remove(&h);
-            sockets.remove(h);
+        for h in &victims {
+            face.conns.remove(h);
+            sockets.remove(*h);
         }
+        victims
     }
 
     /// 全停（收工：listeners/conns 全摘）。
@@ -290,4 +310,5 @@ impl DnsFaces {
             sockets.remove(h.0);
         }
     }
+
 }

@@ -55,6 +55,10 @@ pub fn is_public_addr(ip: IpAddr) -> bool {
                 || (u32::from(v4) & 0xFFC0_0000) == 0x6440_0000)
         }
         IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                // v4-mapped 按其 v4 本值判（Go `Unmap()` 同义——评审 M21）
+                return is_public_addr(IpAddr::V4(v4));
+            }
             !(v6.is_loopback()
                 || is_ula(v6)
                 || v6.is_unspecified()
@@ -72,9 +76,9 @@ fn is_ula(v6: std::net::Ipv6Addr) -> bool {
 /// 名字像隧道/虚拟网卡吗（ifaceutil.IsVirtual 的前缀并集——多跳过一张虚拟卡只会让
 /// 候选少一张，不会选错上行）。
 pub fn is_virtual_iface(name: &str) -> bool {
-    const PREFIXES: [&str; 18] = [
+    const PREFIXES: [&str; 19] = [
         "lo", "utun", "ipsec", "gif", "stf", "awdl", "llw", "anpi", "ap", "bridge", "vmnet",
-        "vmenet", "tap", "tun", "tailscale", "docker", "br-", "veth",
+        "vmenet", "tap", "tun", "tailscale", "docker", "br-", "veth", "virbr",
     ];
     let l = name.to_ascii_lowercase();
     PREFIXES.iter().any(|p| l.starts_with(p))
@@ -86,6 +90,8 @@ pub struct IfaceInfo {
     pub name: String,
     pub index: u32,
     pub addrs: Vec<Ipv4Addr>,
+    /// `ip/prefix` 形态（netmask 换算——E21 判据行的 `addrs=[192.168.3.12/24]` 面）。
+    pub cidrs: Vec<String>,
     pub up: bool,
     pub loopback: bool,
 }
@@ -107,7 +113,7 @@ pub fn interfaces() -> Vec<IfaceInfo> {
                 let flags = ifa.ifa_flags;
                 let e = map.entry(name.clone()).or_insert_with(|| {
                     order.push(name.clone());
-                    IfaceInfo { name: name.clone(), index: 0, addrs: Vec::new(), up: false, loopback: false }
+                    IfaceInfo { name: name.clone(), index: 0, addrs: Vec::new(), cidrs: Vec::new(), up: false, loopback: false }
                 });
                 e.up = e.up || (flags & libc::IFF_UP as u32) != 0;
                 e.loopback = e.loopback || (flags & libc::IFF_LOOPBACK as u32) != 0;
@@ -117,6 +123,17 @@ pub fn interfaces() -> Vec<IfaceInfo> {
                     let sa = ifa.ifa_addr as *const libc::sockaddr_in;
                     let raw = (*sa).sin_addr.s_addr;
                     e.addrs.push(Ipv4Addr::from(raw.swap_bytes()));
+                    if !ifa.ifa_netmask.is_null()
+                        && (*ifa.ifa_netmask).sa_family == libc::AF_INET as libc::sa_family_t
+                    {
+                        let nm = ifa.ifa_netmask as *const libc::sockaddr_in;
+                        let mask = (*nm).sin_addr.s_addr.swap_bytes();
+                        e.cidrs.push(format!(
+                            "{}/{}",
+                            Ipv4Addr::from(raw.swap_bytes()),
+                            mask.count_ones()
+                        ));
+                    }
                 }
             }
             cur = ifa.ifa_next;
@@ -352,6 +369,7 @@ fn probe_with(
     if let Some(ifi) = pin {
         pin_socket_to_iface(s.as_raw_fd(), ifi.index, &ifi.name)?;
     }
+    let deadline = Instant::now() + timeout;
     s.set_read_timeout(Some(timeout))?;
     let mut txid = [0u8; 2];
     getrandom::getrandom(&mut txid).expect("系统随机源不可用");
@@ -362,6 +380,13 @@ fn probe_with(
     }
     let mut buf = [0u8; 1500];
     loop {
+        // **绝对期限**（评审 M7：per-recv 超时会被不匹配包续命——任意 LAN 主机
+        // 灌包即可让探针永不返回、select_best 的 join 无限等）
+        let remain = deadline.saturating_duration_since(Instant::now());
+        if remain.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "egress: 探针预算耗尽"));
+        }
+        s.set_read_timeout(Some(remain))?;
         let (n, from) = s.recv_from(&mut buf)?;
         if n < 12 || buf[0] != txid[0] || buf[1] != txid[1] {
             continue; // 不是我们这条查询的应答
@@ -400,6 +425,7 @@ pub fn probe_stun(
     if let Some(ifi) = pin {
         pin_socket_to_iface(s.as_raw_fd(), ifi.index, &ifi.name)?;
     }
+    let deadline = Instant::now() + timeout;
     s.set_read_timeout(Some(timeout))?;
     let txid = new_txid();
     let req = stun_request(&txid, "homeway-probe");
@@ -409,6 +435,11 @@ pub fn probe_stun(
     }
     let mut buf = [0u8; 1500];
     loop {
+        let remain = deadline.saturating_duration_since(Instant::now());
+        if remain.is_zero() {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "egress: 探针预算耗尽"));
+        }
+        s.set_read_timeout(Some(remain))?;
         let (n, from) = s.recv_from(&mut buf)?;
         let from_ip = match from.ip() {
             IpAddr::V4(v4) => v4,
@@ -596,9 +627,8 @@ mod tests {
         assert_eq!(mapped, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)));
         assert!(rtt < Duration::from_secs(3));
     }
-}
 
-/// 测试面：解析请求拿 txid（真实面用 parse_stun_response 只解应答）。
+/// 测试面：解析请求拿 txid。
 #[cfg(test)]
 fn parse_stun_request(b: &[u8]) -> Option<([u8; 12], ())> {
     if b.len() < 20 || u16::from_be_bytes([b[0], b[1]]) != STUN_BINDING_REQ {
@@ -623,4 +653,5 @@ impl Map2Cookie for [u8; 4] {
             self[3] ^ cookie[3],
         ]
     }
+}
 }

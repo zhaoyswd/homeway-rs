@@ -35,11 +35,14 @@ const MAX_WINDOW: Duration = Duration::from_secs(15);
 /// data 载荷上限（u16 长度场）+ 服务端发送块（Go SendBlock）。
 const MAX_BLOCK: usize = 65535;
 
-/// 会话计数（受理/拒绝——验收对账面；total 只在登记成功时 +1）。
+/// 会话计数（受理/拒绝——验收对账面；total 只在登记成功时 +1）。`next` = 会话号
+/// 分配器（**单调自增、可 >MAX_CONNS**——Go connreg.Add 语义，评审 H3：此前用
+/// 「当前在册数」冒充会话号，串行两轮都打 #1，判据行错位）。
 #[derive(Default)]
 pub struct SessStats {
     pub total: AtomicU64,
     pub rejected: AtomicU64,
+    next: AtomicU64,
 }
 
 /// 测速服务（UDS 承载；Serve 由装配层在 listener 上拉起——照 files 的形状）。
@@ -52,13 +55,43 @@ pub struct SpeedtestServer {
 
 struct CountingRegistry {
     live: usize,
+    /// 在册会话句柄（收工 CloseAll——Go speedSrv.Close() 语义，评审 M12）。
+    conns: Vec<UnixStream>,
+}
+
+impl CountingRegistry {
+    /// 受理：满员 None；否则在册 +1 并返回**单调会话号**（评审 H3——Go connreg
+    /// 单调自增语义，可 >MAX_CONNS）。
+    fn admit(&mut self, id_alloc: &AtomicU64, conn: &UnixStream) -> Option<u64> {
+        if self.live >= MAX_CONNS {
+            return None;
+        }
+        self.live += 1;
+        if let Ok(c) = conn.try_clone() {
+            self.conns.push(c);
+        }
+        Some(id_alloc.fetch_add(1, Ordering::Relaxed) + 1)
+    }
+
+    fn release(&mut self) {
+        self.live = self.live.saturating_sub(1);
+        self.conns.clear(); // 会话收线由各线程自行收（守卫侧只做簿记）
+    }
+
+    /// 收工：断开全部在跑会话（Go connreg.CloseAll 同义，评审 M12）。
+    fn close_all(&mut self) {
+        for c in self.conns.drain(..) {
+            let _ = c.shutdown(std::net::Shutdown::Both);
+        }
+        self.live = 0;
+    }
 }
 
 impl SpeedtestServer {
     pub fn new(logf: crate::Logf) -> Self {
         Self {
             logf,
-            conns: Arc::new(Mutex::new(CountingRegistry { live: 0 })),
+            conns: Arc::new(Mutex::new(CountingRegistry { live: 0, conns: Vec::new() })),
             stats: Arc::new(SessStats::default()),
         }
     }
@@ -77,12 +110,15 @@ impl SpeedtestServer {
         Ok(())
     }
 
-    /// 可停形态（引擎收工面——files::serve_stoppable 同构）。
+    /// 可停形态（引擎收工面——files::serve_stoppable 同构；停时断开在跑会话，M12）。
     pub fn serve_stoppable(self: &Arc<Self>, ln: UnixListener, stop: Arc<std::sync::atomic::AtomicBool>) -> std::io::Result<()> {
         use std::sync::atomic::Ordering as OD;
         ln.set_nonblocking(true)?;
         loop {
             if stop.load(OD::Relaxed) {
+                if let Ok(mut reg) = self.conns.lock() {
+                    reg.close_all();
+                }
                 return Ok(());
             }
             match ln.accept() {
@@ -113,23 +149,26 @@ impl SpeedtestServer {
         // 立刻关会走 RST 路径、已发出的 report 可能被对端丢弃）。
         let conn_id = {
             let mut reg = self.conns.lock().expect("会话表锁中毒");
-            reg.live += 1;
-            if reg.live > MAX_CONNS {
-                reg.live -= 1;
-                drop(reg);
-                self.stats.rejected.fetch_add(1, Ordering::Relaxed);
-                (self.logf)(&format!("speedtest: 会话拒绝（并发上限 {MAX_CONNS}）"));
-                reply_then_close(conn, &report_json(0, 0, 0, Some("busy")));
-                return;
+            match reg.admit(&self.stats.next, &conn) {
+                Some(id) => {
+                    self.stats.total.fetch_add(1, Ordering::Relaxed);
+                    id
+                }
+                None => {
+                    drop(reg);
+                    self.stats.rejected.fetch_add(1, Ordering::Relaxed);
+                    (self.logf)(&format!("speedtest: 会话拒绝（并发上限 {MAX_CONNS}）"));
+                    reply_then_close(conn, &report_json(0, 0, 0, Some("busy")));
+                    return;
+                }
             }
-            self.stats.total.fetch_add(1, Ordering::Relaxed);
-            reg.live as u64
         };
         let _guard = ConnGuard { conns: Arc::clone(&self.conns) };
 
-        // 单连接硬超时
-        let _ = conn.set_read_timeout(Some(CONN_TIMEOUT));
-        let _ = conn.set_write_timeout(Some(CONN_TIMEOUT));
+        // 单连接硬超时（**绝对期限**——评审 M13：set_read_timeout 是 per-syscall，
+        // 慢滴客户端每次成功读都续命 30s；每次读写前按剩余时间收敛设置）
+        let deadline = Instant::now() + CONN_TIMEOUT;
+        set_io_deadline(&conn, deadline);
         let w = match conn.try_clone() {
             Ok(c) => c,
             Err(_) => return,
@@ -208,7 +247,7 @@ impl SpeedtestServer {
             return;
         }
         let rep = report_json(window_bytes, warmup_bytes, t0.elapsed().as_millis() as i64, None);
-        if write_control(&mut bw, TYPE_REPORT, rep.as_bytes()).is_err() {
+        if write_control(&mut bw, TYPE_REPORT, rep.as_bytes()).is_err() || bw.flush().is_err() {
             (self.logf)(&format!("speedtest: 会话 #{id} 异常（回报告：写失败）"));
             return;
         }
@@ -276,7 +315,7 @@ impl SpeedtestServer {
                         None,
                     );
                     let mut bw = BufWriter::new(w);
-                    if write_control(&mut bw, TYPE_REPORT, rep.as_bytes()).is_err() {
+                    if write_control(&mut bw, TYPE_REPORT, rep.as_bytes()).is_err() || bw.flush().is_err() {
                         (self.logf)(&format!("speedtest: 会话 #{id} 异常（回报告：写失败）"));
                         return;
                     }
@@ -296,6 +335,18 @@ impl SpeedtestServer {
     }
 }
 
+/// 按绝对期限收敛设置读写超时（评审 M13）。
+fn set_io_deadline(conn: &UnixStream, deadline: Instant) {
+    let remain = deadline.saturating_duration_since(Instant::now());
+    if remain.is_zero() {
+        let _ = conn.set_read_timeout(Some(Duration::from_millis(1)));
+        let _ = conn.set_write_timeout(Some(Duration::from_millis(1)));
+        return;
+    }
+    let _ = conn.set_read_timeout(Some(remain));
+    let _ = conn.set_write_timeout(Some(remain));
+}
+
 /// 受理计数守卫（任何退出路径摘除在册）。
 struct ConnGuard {
     conns: Arc<Mutex<CountingRegistry>>,
@@ -304,7 +355,7 @@ struct ConnGuard {
 impl Drop for ConnGuard {
     fn drop(&mut self) {
         if let Ok(mut c) = self.conns.lock() {
-            c.live = c.live.saturating_sub(1);
+            c.release();
         }
     }
 }
@@ -337,13 +388,34 @@ fn parse_request(payload: &[u8]) -> Option<RequestJson> {
     Some(RequestJson { role, warmup_ms: warmup, window_ms: window })
 }
 
-/// report 帧载荷（含逗号禁忌面：error 文案不含逗号——同 Go Report）。
+/// report 帧载荷（error 文案经最小 JSON 转义——评审 M15：`未知角色 "xyz"` 的引号
+/// 不转义会产出非法 JSON，对端解析歧义）。
 fn report_json(bytes: i64, warmup: i64, wall_ms: i64, error: Option<&str>) -> String {
     // Go json.Marshal 字段序：bytes/warmup_bytes/wall_ms/error(omitempty)
     match error {
-        Some(e) => format!(r#"{{"bytes":{bytes},"warmup_bytes":{warmup},"wall_ms":{wall_ms},"error":"{e}"}}"#),
+        Some(e) => format!(
+            r#"{{"bytes":{bytes},"warmup_bytes":{warmup},"wall_ms":{wall_ms},"error":"{}"}}"#,
+            json_escape(e)
+        ),
         None => format!(r#"{{"bytes":{bytes},"warmup_bytes":{warmup},"wall_ms":{wall_ms}}}"#),
     }
+}
+
+/// 最小 JSON 字符串转义（`"`/`\`/控制字符——判据面文案不含其余特殊字符）。
+fn json_escape(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for c in s.chars() {
+        match c {
+            '"' => out.push_str("\\\""),
+            '\\' => out.push_str("\\\\"),
+            '\n' => out.push_str("\\n"),
+            '\r' => out.push_str("\\r"),
+            '\t' => out.push_str("\\t"),
+            c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// 失败收场：回 report（error 形态）后冲刷。
@@ -606,6 +678,46 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 会话号单调回归（评审 H3）：串行两轮会话的受理行号必须递增（此前用「当前
+    /// 在册数」冒充会话号——两轮都打 #1）。
+    #[test]
+    fn session_ids_monotonic_across_rounds() {
+        let dir = std::env::temp_dir().join(format!("homeway-rs-spid-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("speedtest.sock");
+        let _ = std::fs::remove_file(&sock);
+        let ln = UnixListener::bind(&sock).unwrap();
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let l2 = Arc::clone(&lines);
+        let logf: crate::Logf = Arc::new(move |s: &str| {
+            l2.lock().unwrap().push(s.to_owned());
+        });
+        let srv = Arc::new(SpeedtestServer::new(Arc::clone(&logf)));
+        let srv2 = Arc::clone(&srv);
+        std::thread::spawn(move || {
+            let _ = srv2.serve(ln);
+        });
+        // 两轮 role=send（收口即退——每轮一个号）
+        for _ in 0..2 {
+            let mut c = UnixStream::connect(&sock).unwrap();
+            write_control(&mut c, TYPE_REQUEST, br#"{"role":"send","warmup_ms":10,"window_ms":100}"#).unwrap();
+            write_control(&mut c, TYPE_START, &[]).unwrap();
+            write_control(&mut c, TYPE_FINISH, &[]).unwrap();
+            let mut r = BufReader::new(c);
+            let _ = read_frame(&mut r);
+        }
+        let lines = lines.lock().unwrap();
+        let ids: Vec<u64> = lines
+            .iter()
+            .filter_map(|l| l.strip_prefix("speedtest: 会话 #"))
+            .filter_map(|r| r.split(' ').next().and_then(|n| n.parse().ok()))
+            .collect();
+        assert!(ids.len() >= 4, "两轮应各有受理+结算行：{lines:?}");
+        assert!(ids[0] < ids[2], "第二轮会话号必须大于第一轮（单调）：{ids:?}");
+        assert_eq!(ids[0], ids[1], "同会话受理/结算同号：{ids:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// busy 路径：占满并发后新连接回 error=busy（reply_then_close 形态）。
     #[test]
     fn busy_rejection() {
@@ -632,18 +744,9 @@ mod tests {
         let mut c = UnixStream::connect(&sock).unwrap();
         write_control(&mut c, TYPE_REQUEST, br#"{"role":"recv","warmup_ms":100,"window_ms":200}"#).unwrap();
         let mut r = BufReader::new(c);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut rep = None;
-        while Instant::now() < deadline {
-            match read_frame(&mut r) {
-                Ok((TYPE_REPORT, payload)) => {
-                    rep = Some(String::from_utf8(payload).unwrap());
-                    break;
-                }
-                _ => panic!("期望 report"),
-            }
-        }
-        assert_eq!(rep.as_deref(), Some(r#"{"bytes":0,"warmup_bytes":0,"wall_ms":0,"error":"busy"}"#));
+        let rep = read_frame(&mut r).expect("busy report 应到达");
+        assert_eq!(rep.0, TYPE_REPORT);
+        assert_eq!(String::from_utf8(rep.1).unwrap(), r#"{"bytes":0,"warmup_bytes":0,"wall_ms":0,"error":"busy"}"#);
         assert_eq!(srv.stats.rejected.load(Ordering::Relaxed), 1);
         drop(holders);
         let _ = std::fs::remove_dir_all(&dir);

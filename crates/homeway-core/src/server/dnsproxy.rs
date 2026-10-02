@@ -858,7 +858,7 @@ mod tests {
         std::thread::spawn(move || {
             let mut buf = [0u8; 1500];
             loop {
-                let Ok((n, from)) = up.recv_from(&mut buf) else { return };
+                let Ok((_n, from)) = up.recv_from(&mut buf) else { return };
                 let mut r = a_response("fake.test", 0, 300, &[0x7f00_0001]);
                 r[0..2].copy_from_slice(&buf[..2]);
                 let _ = up.send_to(&r, from);
@@ -900,7 +900,7 @@ mod tests {
         std::thread::spawn(move || {
             let mut buf = [0u8; 1500];
             loop {
-                let Ok((n, from)) = fb.recv_from(&mut buf) else { return };
+                let Ok((_n, from)) = fb.recv_from(&mut buf) else { return };
                 let mut r = a_response("fb.test", 0, 10, &[0x7f00_0001]);
                 r[0..2].copy_from_slice(&buf[..2]);
                 let _ = fb.send_to(&r, from);
@@ -948,7 +948,7 @@ mod tests {
         std::thread::spawn(move || {
             let mut buf = [0u8; 1500];
             loop {
-                let Ok((n, from)) = up.recv_from(&mut buf) else { return };
+                let Ok((_n, from)) = up.recv_from(&mut buf) else { return };
                 let mut r = a_response("wr.test", 0, 5, &[0x7f00_0001]);
                 r[0..2].copy_from_slice(&buf[..2]);
                 let _ = up.send_to(&r, from);

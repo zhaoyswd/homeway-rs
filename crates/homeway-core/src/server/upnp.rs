@@ -72,7 +72,13 @@ pub fn classify_mapping(m: &UpnpMapping, desc_prefix: &str, client: Ipv4Addr, li
     }
     // 有些路由器把 NewInternalClient 报成主机名/空/带端口：归属不明——调用方不得
     // 当 foreign 让位（否则自己的映射每轮 +1 漂移到让尽），也不得当 ours 误删别人的。
-    let Some(c) = m.internal_client.parse::<Ipv4Addr>().ok() else {
+    // ::ffff:a.b.c.d 的 v4-mapped 形态按其 v4 本值判（Go `Unmap()` 同义，评审 M10）。
+    let parsed: Option<Ipv4Addr> = m
+        .internal_client
+        .parse::<Ipv4Addr>()
+        .ok()
+        .or_else(|| m.internal_client.parse::<std::net::Ipv6Addr>().ok().and_then(|v6| v6.to_ipv4_mapped()));
+    let Some(c) = parsed else {
         return MappingOwner::Unknown;
     };
     if c != client {
@@ -117,7 +123,13 @@ pub fn ssdp_location(local_ip: Option<Ipv4Addr>) -> std::io::Result<String> {
     let mut attempt = 0;
     while attempt < 3 && std::time::Instant::now() < deadline {
         attempt += 1;
-        conn.send_to(msg.as_bytes(), SSDP_ADDR)?;
+        if let Err(e) = conn.send_to(msg.as_bytes(), SSDP_ADDR) {
+            // 发送失败重试（Go upnp.go:150-154——IGMP 收敛抖动下 sendto 偶发
+            // no route to host，重发一次通常就通）
+            last_err = format!("发送 M-SEARCH: {e}");
+            std::thread::sleep(Duration::from_millis(500));
+            continue;
+        }
         loop {
             if std::time::Instant::now() >= deadline {
                 break;
@@ -145,10 +157,14 @@ pub fn ssdp_location(local_ip: Option<Ipv4Addr>) -> std::io::Result<String> {
 fn header_value(resp: &str, key: &str) -> Option<String> {
     for line in resp.split('\n') {
         let line = line.trim();
-        if line.len() > key.len() + 1
-            && line[..key.len()].eq_ignore_ascii_case(key)
-            && line.as_bytes()[key.len()] == b':'
+        // **按字节比较**（评审 H4：`line[..key.len()]` 在多字节字符中间 panic——
+        // LAN 内任何能发 UDP 到源端口的乱码报文都可远程打崩公网端点线程）
+        let lb = line.as_bytes();
+        if lb.len() > key.len() + 1
+            && lb[..key.len()].eq_ignore_ascii_case(key.as_bytes())
+            && lb[key.len()] == b':'
         {
+            // 切值侧从字节界安全转回（trim 后的 ASCII 头域面恒为字节安全）
             return Some(line[key.len() + 1..].trim().to_owned());
         }
     }
@@ -352,8 +368,11 @@ impl Igd {
         for i in 0..LIST_MAX {
             match self.soap("GetGenericPortMappingEntry", &[("NewPortMappingIndex", i.to_string())]) {
                 Err(e) => {
+                    // 表尾标记只认**结构化形态**（评审 M9：错误串含整个 body——
+                    // 裸 contains("713") 会把端口号 1713/序列号误判成表尾，破坏
+                    // 「清单残缺 ⇒ fail-open」的保守防线）
                     let msg = e.to_string();
-                    if msg.contains("713") || msg.contains("SpecifiedArrayIndexInvalid") || msg.contains(">713<") {
+                    if msg.contains(">713<") || msg.contains("SpecifiedArrayIndexInvalid") {
                         return (out, true); // 表尾标记
                     }
                     return (out, false);
@@ -720,11 +739,8 @@ mod tests {
                     } else {
                         let m = &e[idx];
                         let body = format!(
-                            "<m>{}</m>",
-                            format!(
-                                "<NewExternalPort>{}</NewExternalPort><NewProtocol>{}</NewProtocol><NewInternalPort>{}</NewInternalPort><NewInternalClient>{}</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>{}</NewPortMappingDescription><NewLeaseDuration>{}</NewLeaseDuration>",
-                                m.external_port, m.protocol, m.internal_port, m.internal_client, m.description, m.lease_duration
-                            )
+                            "<m><NewExternalPort>{}</NewExternalPort><NewProtocol>{}</NewProtocol><NewInternalPort>{}</NewInternalPort><NewInternalClient>{}</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>{}</NewPortMappingDescription><NewLeaseDuration>{}</NewLeaseDuration></m>",
+                            m.external_port, m.protocol, m.internal_port, m.internal_client, m.description, m.lease_duration
                         );
                         let _ = c.write_all(format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{}", body.len(), body).as_bytes());
                     }
