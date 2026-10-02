@@ -56,15 +56,11 @@ if (( PERF )); then LINKS+=(GGG RRR); fi
 [[ -x "$RUST_BIN" ]] || { echo "==> cargo build --release -p homeway-cli" >&2; (cd "$REPO_ROOT" && cargo build --release -p homeway-cli) || exit 1; }
 [[ -x "$GO_BIN" ]] || { echo "!! $GO_BIN 不在（先 tools/local-exit.sh start 1 触发构建）" >&2; exit 1; }
 
-# 矩阵互斥锁（①-5；双防线：.lock 目录 + 进程扫——实测曾出现绕过 lock 的双起互踩）
+# 矩阵互斥锁（①-5）：mkdir 原子性足够（此前「双起」是调用侧两次显式 nohup 的
+# 失误、非 lock 失效；pgrep 进程扫在 wrapper shell 场景必假阳性——命令行含脚本路径
+# 文本即中，弃用）
 if ! mkdir -p "$MATRIX/.lock" 2>/dev/null; then
   echo "!! 矩阵已在跑（$MATRIX/.lock 占用）——并发运行会互踩端口/state" >&2
-  exit 1
-fi
-if pgrep -f "tools/matrix.sh" | grep -v "^$$$" | grep -qv "$$"; then
-  echo "!! 检测到另一 matrix.sh 进程在跑（pgrep）——先清理再跑" >&2
-  pgrep -f "tools/matrix.sh" | grep -v "^$$$" >&2
-  rmdir "$MATRIX/.lock" 2>/dev/null
   exit 1
 fi
 trap 'rmdir "$MATRIX/.lock" 2>/dev/null' EXIT
