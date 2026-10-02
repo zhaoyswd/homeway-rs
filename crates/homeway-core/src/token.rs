@@ -11,15 +11,16 @@
 //! - 解析先 `trim`（Go `strings.TrimSpace` 同义：Unicode White_Space）。
 //!
 //! 与 Go 的**已登记差异**（均为对抗性输入面，正常铸造的 token 不受影响）：
-//! 1. Go `DecodeToken("hmw")` 会 panic（`s[:4]` 越界，已登记 Go 侧问题清单）；本实现
+//! 1. Go `DecodeToken("hmw")` 会 panic（`s[:4]` 越界，已登记 Go 侧问题清单 G1）；本实现
 //!    返回 [`TokenError::UnsupportedVersion`]。
 //! 2. 端点地址字节须为 UTF-8（Go 接受任意字节串）；非 UTF-8 → [`TokenError::Malformed`]。
+//! 3. `Malformed` 的 reason 文案与 Go 各打点不逐字对齐（App 按错误**类别**归因，reason
+//!    仅诊断用；R7 若需逐字对齐再按打点补）。
 //!
 //! 解析形态：`parse_body` 对**已解码的载荷字节**借用解析（端点地址零拷贝 `&str`）；
-//! `decode` 为便捷入口（解码 base64 + 解析 + 转移交所有权）。
+//! `decode` 为便捷入口（剥离换行 → 解码 base64 → 解析 → 转移交所有权）。
 
 use core::fmt;
-use std::sync::LazyLock;
 
 use base64::alphabet::URL_SAFE;
 use base64::engine::GeneralPurpose;
@@ -35,51 +36,71 @@ const MIN_BODY_LEN: usize = 32 + 32 + 1 + 4;
 
 /// base64url 引擎：与 Go `base64.RawURLEncoding` 同严格度——URL 字母表、**无填充**
 /// （编码不带 `=`、解码遇 `=` 即拒，FIX-89），且**容忍非规范尾位**（Go 默认不查尾位；
-/// base64 crate 默认查，须显式放开才能逐字节同判）。
-static B64: LazyLock<GeneralPurpose> = LazyLock::new(|| {
-    GeneralPurpose::new(
-        &URL_SAFE,
-        base64::engine::GeneralPurposeConfig::new()
-            .with_decode_padding_mode(base64::engine::DecodePaddingMode::RequireNone)
-            .with_decode_allow_trailing_bits(true)
-            .with_encode_padding(false),
-    )
-});
+/// base64 crate 默认查，须显式放开才能逐字节同判）。Go 解码器还会跳过输入中任意位置的
+/// `\r`/`\n`（终端折行常态），crate 不做——由 [`decode`] 先行剥离对齐。
+/// （构造全为 const fn ⇒ 无需 LazyLock。）
+static B64: GeneralPurpose = GeneralPurpose::new(
+    &URL_SAFE,
+    base64::engine::GeneralPurposeConfig::new()
+        .with_decode_padding_mode(base64::engine::DecodePaddingMode::RequireNone)
+        .with_decode_allow_trailing_bits(true)
+        .with_encode_padding(false),
+);
 
-/// 三类可区分失败，与 Go 哨兵错误（token.go:33-37）一一对应；
-/// `Malformed` 的 `reason` 供诊断，不参与与 Go 的对齐面。
+/// 三类可区分失败，与 Go 哨兵错误（token.go:33-37）一一对应；Display 前缀段与 Go 哨兵
+/// 逐字一致（该文案经 NAPI 直达 App，R7 前必须钉死）。`Malformed` 的 `reason` 仅供诊断。
 #[derive(Debug, Error, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum TokenError {
-    /// `homeway/token: 不支持的 token 版本`
-    #[error("homeway/token: 不支持的 token 版本")]
-    UnsupportedVersion,
+    /// `homeway/token: 不支持的 token 版本: <所见前缀>`
+    #[error("homeway/token: 不支持的 token 版本: {seen}")]
+    UnsupportedVersion { seen: String },
     /// `homeway/token: 校验失败（串被截断或损坏）`
     #[error("homeway/token: 校验失败（串被截断或损坏）")]
     Corrupted,
-    /// `homeway/token: 格式非法`
-    #[error("homeway/token: 格式非法：{reason}")]
+    /// `homeway/token: 格式非法: <原因>`（ASCII 冒号空格，同 Go `fmt.Errorf("%w: …")`）
+    #[error("homeway/token: 格式非法: {reason}")]
     Malformed { reason: &'static str },
 }
 
-/// 端点类型字节（载荷里的 `type`）。
-pub mod endpoint_type {
-    pub const DIRECT: u8 = 0;
-    pub const RELAY: u8 = 1;
+/// 端点类别（载荷 `type` 字节的语义化形态）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum EndpointKind {
+    Direct,
+    Relay,
+}
+
+impl EndpointKind {
+    /// 线上字节：Direct=0、Relay=1。
+    pub fn to_wire(self) -> u8 {
+        match self {
+            EndpointKind::Direct => 0,
+            EndpointKind::Relay => 1,
+        }
+    }
+    /// 线上字节→类别。Go 同义宽松语义：**非 1 一律按 Direct 收**（不报错）。
+    pub fn from_wire(b: u8) -> Self {
+        if b == 1 {
+            EndpointKind::Relay
+        } else {
+            EndpointKind::Direct
+        }
+    }
 }
 
 macro_rules! byte_array_newtype {
-    ($(#[$doc:meta])* $name:ident) => {
+    ($(#[$doc:meta])* $name:ident, $redacted:expr) => {
         $(#[$doc])*
-        ///
-        /// Debug 面只出 4B 短指纹 hex（同 Go 日志纪律，敏感/大材料不进 `%{:#?}`）。
         #[derive(Clone, Copy, PartialEq, Eq, Hash)]
         pub struct $name([u8; 32]);
 
-        impl $name {
-            pub(crate) fn from_array(v: [u8; 32]) -> Self {
+        impl From<[u8; 32]> for $name {
+            fn from(v: [u8; 32]) -> Self {
                 Self(v)
             }
+        }
+
+        impl $name {
             /// 借视图（不拷贝）。
             pub fn as_bytes(&self) -> &[u8; 32] {
                 &self.0
@@ -88,8 +109,15 @@ macro_rules! byte_array_newtype {
 
         impl fmt::Debug for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-                let short: String = self.0.iter().take(4).map(|b| format!("{b:02x}")).collect();
-                write!(f, "{}({short}…)", stringify!($name))
+                if $redacted {
+                    // 敏感材料：不落任何指纹（连前缀都不出——跨实例可关联）
+                    write!(f, concat!(stringify!($name), "(<redacted>)"))
+                } else {
+                    // 公钥：日志短指纹纪律（4B hex，同 Go 侧）
+                    let short: String =
+                        self.0.iter().take(4).map(|b| format!("{b:02x}")).collect();
+                    write!(f, "{}({short}…)", stringify!($name))
+                }
             }
         }
     };
@@ -97,25 +125,29 @@ macro_rules! byte_array_newtype {
 
 byte_array_newtype!(
     /// 后端静态 WG 公钥（token 载荷首 32B；设备身份按它派生）。
-    PeerId
+    PeerId,
+    false
 );
 byte_array_newtype!(
     /// 凭证种子（注册 HMAC / WG PSK / 隧道地址派生输入）。
     ///
-    /// 敏感材料：R2 接入 zeroize（Drop 擦除）——R0 阶段保持 Copy 便于向量对账。
-    Secret
+    /// 敏感材料：Debug 全脱敏；R2 接入 zeroize（Drop 擦除）——R0 阶段保持 Copy 便于向量对账。
+    Secret,
+    true
 );
 
 /// 借用形态端点：地址直接来自载荷字节，零拷贝。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct EndpointRef<'a> {
-    /// `host:port`——host 可为 IP 或域名。
+    /// `host:port`——host 可为 IP（含 `[v6]` 括号形）或域名。
     pub addr: &'a str,
-    pub relay: bool,
+    pub kind: EndpointKind,
 }
 
 /// 借用形态 token：对**已 base64 解码的载荷**借用解析（端点地址零拷贝）。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct TokenRef<'a> {
     peer_id: [u8; 32],
     secret: [u8; 32],
@@ -124,33 +156,41 @@ pub struct TokenRef<'a> {
 
 impl<'a> TokenRef<'a> {
     pub fn peer_id(&self) -> PeerId {
-        PeerId::from_array(self.peer_id)
+        PeerId::from(self.peer_id)
     }
     pub fn secret(&self) -> Secret {
-        Secret::from_array(self.secret)
+        Secret::from(self.secret)
     }
     pub fn endpoints(&self) -> &[EndpointRef<'a>] {
         &self.endpoints
     }
     /// 直连端点（Go `DirectEndpoints`）。
     pub fn direct_endpoints(&self) -> impl Iterator<Item = EndpointRef<'a>> + '_ {
-        self.endpoints.iter().copied().filter(|e| !e.relay)
+        self.endpoints
+            .iter()
+            .copied()
+            .filter(|e| e.kind == EndpointKind::Direct)
     }
     /// 中继端点（Go `RelayEndpoints`）。
     pub fn relay_endpoints(&self) -> impl Iterator<Item = EndpointRef<'a>> + '_ {
-        self.endpoints.iter().copied().filter(|e| e.relay)
+        self.endpoints
+            .iter()
+            .copied()
+            .filter(|e| e.kind == EndpointKind::Relay)
     }
 }
 
 /// 所有权形态端点（会话/配置持有面）。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Endpoint {
     pub addr: String,
-    pub relay: bool,
+    pub kind: EndpointKind,
 }
 
 /// 所有权形态 token（对应 Go `proto.Token`）。
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[non_exhaustive]
 pub struct Token {
     pub peer_id: PeerId,
     pub secret: Secret,
@@ -164,30 +204,35 @@ impl<'a> From<TokenRef<'a>> for Token {
             secret: t.secret(),
             endpoints: t
                 .endpoints
-                .iter()
+                .into_iter()
                 .map(|e| Endpoint {
                     addr: e.addr.to_owned(),
-                    relay: e.relay,
+                    kind: e.kind,
                 })
                 .collect(),
         }
     }
 }
 
-/// 解析整串 token：trim → 版本前缀 → base64url 解码 → [`parse_body`]。
+/// 解析整串 token：trim → 版本前缀 → 剥离内嵌 `\r`/`\n`（Go base64 解码器行为）→
+/// base64url 解码 → [`parse_body`]。
 pub fn decode(input: &str) -> Result<Token, TokenError> {
     let s = input.trim();
     if s.starts_with("hmw") && !s.starts_with(PREFIX) {
-        // Go 侧此处 s[:4] 对恰 "hmw" 长度会 panic（已登记 Go 侧问题清单）；本实现安全返回
-        return Err(TokenError::UnsupportedVersion);
+        // Go 侧此处 s[:4] 对恰 "hmw" 长度会 panic（已登记 Go 侧问题 G1）；本实现安全返回。
+        // seen 取前 4 字符（不足则全取），对齐 Go 错误文案后缀。
+        let seen: String = s.chars().take(4).collect();
+        return Err(TokenError::UnsupportedVersion { seen });
     }
     if !s.starts_with(PREFIX) {
         return Err(TokenError::Malformed {
             reason: "缺少 hmw1 前缀",
         });
     }
+    // Go base64 解码器跳过任意位置的 \r\n（终端/聊天工具折行）；crate 引擎不做，先剥离对齐
+    let body_b64 = s[PREFIX.len()..].replace(['\r', '\n'], "");
     let raw = B64
-        .decode(s[PREFIX.len()..].as_bytes())
+        .decode(body_b64.as_bytes())
         .map_err(|_| TokenError::Malformed {
             reason: "base64url 解码失败",
         })?;
@@ -209,15 +254,13 @@ pub fn parse_body(raw: &[u8]) -> Result<TokenRef<'_>, TokenError> {
     let peer_id: [u8; 32] = peer_id.try_into().expect("split_at(32) 保证");
     let (secret, rest) = rest.split_at(32);
     let secret: [u8; 32] = secret.try_into().expect("split_at(32) 保证");
-    let (&ep_count, mut rest) = rest
-        .split_first()
-        .ok_or(TokenError::Corrupted)?; // 不可达（MIN_BODY_LEN 已含 1B）；防御性收口
+    let (&ep_count, mut rest) = rest.split_first().ok_or(TokenError::Corrupted)?; // 不可达（MIN_BODY_LEN 已含 1B）
 
     let mut endpoints = Vec::with_capacity(usize::from(ep_count));
     for _ in 0..ep_count {
         if rest.len() < 2 {
             return Err(TokenError::Malformed {
-                reason: "端点头不足（type+len）",
+                reason: "端点数量声明与载荷不符（端点头不足）",
             });
         }
         let (&typ, &addr_len) = (&rest[0], &rest[1]);
@@ -235,8 +278,7 @@ pub fn parse_body(raw: &[u8]) -> Result<TokenRef<'_>, TokenError> {
         validate_host_port(addr)?;
         endpoints.push(EndpointRef {
             addr,
-            // Go 同义：typ==RELAY 才是中继，其余值一律按 direct 收（不报错）
-            relay: typ == endpoint_type::RELAY,
+            kind: EndpointKind::from_wire(typ),
         });
     }
     if !rest.is_empty() {
@@ -331,11 +373,7 @@ pub fn encode(spec: &TokenSpec<'_>) -> Result<String, TokenError> {
     buf.extend_from_slice(spec.secret.as_bytes());
     buf.push(spec.endpoints.len() as u8);
     for e in spec.endpoints {
-        buf.push(if e.relay {
-            endpoint_type::RELAY
-        } else {
-            endpoint_type::DIRECT
-        });
+        buf.push(e.kind.to_wire());
         buf.push(e.addr.len() as u8);
         buf.extend_from_slice(e.addr.as_bytes());
     }
@@ -376,7 +414,13 @@ mod tests {
         for s in ["hmw1", "hmw1AAAA"] {
             assert_eq!(decode(s), Err(TokenError::Corrupted), "{s}");
         }
-        assert_eq!(decode("hmw"), Err(TokenError::UnsupportedVersion)); // Go 侧此串 panic（已登记差异）
+        // Go 侧此串 panic（已登记差异 G1）；seen 取不足 4 字符的全量
+        assert_eq!(
+            decode("hmw"),
+            Err(TokenError::UnsupportedVersion {
+                seen: "hmw".into()
+            })
+        );
         assert_eq!(
             decode("rl1AAAA"),
             Err(TokenError::Malformed {
@@ -385,25 +429,85 @@ mod tests {
         );
     }
 
+    /// M3：Go base64 解码器跳过任意位置 \r/\n（实测 baseline 克隆）——Rust 剥离后同判。
+    #[test]
+    fn decode_skips_embedded_newlines_like_go() {
+        let spec = TokenSpec {
+            peer_id: &PeerId::from([7u8; 32]),
+            secret: &Secret::from([9u8; 32]),
+            endpoints: &[EndpointRef {
+                addr: "127.0.0.1:42641",
+                kind: EndpointKind::Direct,
+            }],
+        };
+        let tok = encode(&spec).unwrap();
+        for sep in ["\n", "\r\n", "\n\r"] {
+            let mid = tok.len() / 2;
+            let folded = format!("{}{}{}", &tok[..mid], sep, &tok[mid..]);
+            let t = decode(&folded)
+                .unwrap_or_else(|e| panic!("折行串（{sep:?}）应可解析：{e:?}"));
+            assert_eq!(t.endpoints.len(), 1);
+            assert_eq!(t.endpoints[0].addr, "127.0.0.1:42641");
+        }
+        // 尾缀 '=' 仍拒（FIX-89，与换行剥离无关）
+        assert!(decode(&format!("{tok}=")).is_err());
+    }
+
+    /// M4：哨兵 Display 前缀段与 Go 逐字一致（文案经 NAPI 直达 App）。
+    #[test]
+    fn error_display_prefixes_match_go_sentinels() {
+        assert_eq!(
+            TokenError::Corrupted.to_string(),
+            "homeway/token: 校验失败（串被截断或损坏）"
+        );
+        assert_eq!(
+            TokenError::UnsupportedVersion {
+                seen: "hmw2".into()
+            }
+            .to_string(),
+            "homeway/token: 不支持的 token 版本: hmw2"
+        );
+        let m = TokenError::Malformed {
+            reason: "缺少 hmw1 前缀",
+        }
+        .to_string();
+        assert!(m.starts_with("homeway/token: 格式非法: "), "{m}"); // ASCII 冒号空格
+    }
+
+    /// L2：Secret 的 Debug 全脱敏（不含任何字节片段）。
+    #[test]
+    fn secret_debug_is_redacted() {
+        let s = Secret::from([0xab; 32]);
+        let d = format!("{s:?}");
+        assert_eq!(d, "Secret(<redacted>)");
+        assert!(!d.contains("abab"));
+    }
+
     #[test]
     fn encode_decode_roundtrip_is_byte_stable() {
-        let mut peer = [0u8; 32];
-        peer[0] = 0x11;
-        let mut secret = [0u8; 32];
-        secret[31] = 1;
+        let peer = {
+            let mut p = [0u8; 32];
+            p[0] = 0x11;
+            p
+        };
+        let secret = {
+            let mut s = [0u8; 32];
+            s[31] = 1;
+            s
+        };
         let eps = [
             EndpointRef {
                 addr: "127.0.0.1:42641",
-                relay: false,
+                kind: EndpointKind::Direct,
             },
             EndpointRef {
                 addr: "198.51.100.212:41741",
-                relay: true,
+                kind: EndpointKind::Relay,
             },
         ];
         let spec = TokenSpec {
-            peer_id: &PeerId::from_array(peer),
-            secret: &Secret::from_array(secret),
+            peer_id: &PeerId::from(peer),
+            secret: &Secret::from(secret),
             endpoints: &eps,
         };
         let tok = encode(&spec).unwrap();
@@ -412,9 +516,9 @@ mod tests {
         assert_eq!(decoded.secret.as_bytes(), &secret);
         assert_eq!(decoded.endpoints.len(), 2);
         assert_eq!(decoded.endpoints[0].addr, "127.0.0.1:42641");
-        assert!(!decoded.endpoints[0].relay);
+        assert_eq!(decoded.endpoints[0].kind, EndpointKind::Direct);
         assert_eq!(decoded.endpoints[1].addr, "198.51.100.212:41741");
-        assert!(decoded.endpoints[1].relay);
+        assert_eq!(decoded.endpoints[1].kind, EndpointKind::Relay);
         // 借用面再编码 → 与原串逐字节一致
         let raw = B64.decode(tok[PREFIX.len()..].as_bytes()).unwrap();
         let parsed = parse_body(&raw).unwrap();
@@ -424,8 +528,17 @@ mod tests {
             endpoints: parsed.endpoints(),
         };
         assert_eq!(encode(&spec2).unwrap(), tok);
-        // direct/relay 过滤器
         assert_eq!(parsed.direct_endpoints().count(), 1);
         assert_eq!(parsed.relay_endpoints().count(), 1);
+    }
+
+    /// L3：线字节宽松语义——非 1 的 type 字节一律按 Direct（Go 同义）。
+    #[test]
+    fn endpoint_kind_from_wire_is_lenient_like_go() {
+        assert_eq!(EndpointKind::from_wire(0), EndpointKind::Direct);
+        assert_eq!(EndpointKind::from_wire(1), EndpointKind::Relay);
+        for odd in [2, 7, 0xff] {
+            assert_eq!(EndpointKind::from_wire(odd), EndpointKind::Direct);
+        }
     }
 }

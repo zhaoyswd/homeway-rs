@@ -14,11 +14,7 @@ fn main() {
                     println!("peer_id  = {}", hex_str(t.peer_id.as_bytes()));
                     println!("secret   = {}", hex_str(t.secret.as_bytes()));
                     for e in &t.endpoints {
-                        println!(
-                            "endpoint = {} ({})",
-                            e.addr,
-                            if e.relay { "relay" } else { "direct" }
-                        );
+                        println!("endpoint = {} ({:?})", e.addr, e.kind);
                     }
                 }
                 Err(e) => {

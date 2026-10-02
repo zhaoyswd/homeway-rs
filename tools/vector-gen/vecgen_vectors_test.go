@@ -111,6 +111,7 @@ func genTokenCases(t *testing.T) (cases []vecTokenCase, errs []vecTokenErrorCase
 		{"three-mixed-with-domain", vecPeerID2, vecSecret2, []proto.Endpoint{
 			{"192.168.3.12:41641", false}, {"home.example.com:41641", false}, {"198.51.100.212:41741", true},
 		}, "直连+域名直连+中继混合（域名端点合法）"},
+		{"ipv6-bracket", vecPeerID1, vecSecret2, []proto.Endpoint{{"[::1]:53", false}}, "IPv6 括号形端点（SplitHostPort 括号分支）"},
 	}
 	// 上界：255B 端点地址（encode 上限 len(e.Addr) <= 255，SplitHostPort 须可过）
 	longHost := make([]byte, 0, 251)
@@ -143,8 +144,8 @@ func genTokenCases(t *testing.T) (cases []vecTokenCase, errs []vecTokenErrorCase
 			Note:    sp.note,
 		})
 	}
-	// TrimSpace 契约（正向）：首尾空白被剥离后照常解析
-	trimmed := "  " + cases[0].Token + "\n"
+	// TrimSpace 契约（正向）：首尾空白被剥离后照常解析（含 Unicode 全角空格 U+3000）
+	trimmed := "\u3000  " + cases[0].Token + "\n\u3000"
 	d, derr := proto.DecodeToken(trimmed)
 	if derr != nil || len(d.Endpoints) != 0 || d.PeerID != vecH32(vecPeerID1) {
 		t.Fatalf("TrimSpace 案例解析异常：err=%v", derr)
@@ -152,8 +153,24 @@ func genTokenCases(t *testing.T) (cases []vecTokenCase, errs []vecTokenErrorCase
 	cases = append(cases, vecTokenCase{
 		Name: "whitespace-trimmed", Input: cases[0].Input, Token: trimmed,
 		Decoded: cases[0].Decoded, BodyB64: cases[0].BodyB64, BodyHex: cases[0].BodyHex, CrcHex: cases[0].CrcHex,
-		Note: "DecodeToken 先 TrimSpace——首尾空白剥离后照常解析",
+		Note: "DecodeToken 先 TrimSpace（Unicode White_Space，含 U+3000）——剥离后照常解析",
 	})
+	// 内嵌换行契约（正向）：Go base64 解码器跳过任意位置 \r/\n（终端折行；实测 nil）
+	folded1 := cases[1].Token[:40] + "\n" + cases[1].Token[40:]
+	folded2 := cases[1].Token[:40] + "\r\n" + cases[1].Token[40:]
+	for _, f := range []string{folded1, folded2} {
+		if _, err := proto.DecodeToken(f); err != nil {
+			t.Fatalf("折行串应可解析：%v", err)
+		}
+	}
+	cases = append(cases,
+		vecTokenCase{Input: cases[1].Input, Token: folded1, Decoded: cases[1].Decoded,
+			BodyB64: cases[1].BodyB64, BodyHex: cases[1].BodyHex, CrcHex: cases[1].CrcHex,
+			Name: "embedded-lf-folded", Note: "base64 段内嵌 \\n——Go 解码器跳过（Rust 侧 decode 先剥离）"},
+		vecTokenCase{Input: cases[1].Input, Token: folded2, Decoded: cases[1].Decoded,
+			BodyB64: cases[1].BodyB64, BodyHex: cases[1].BodyHex, CrcHex: cases[1].CrcHex,
+			Name: "embedded-crlf-folded", Note: "base64 段内嵌 \\r\\n——同上"},
+	)
 
 	// 错误向量：错误类别与 token.go 三哨兵一一对应；Rust 侧映射 enum 变体。
 	good := proto.Token{PeerID: vecH32(vecPeerID1), Secret: vecH32(vecSecret1), Endpoints: []proto.Endpoint{{"127.0.0.1:42641", false}}}
@@ -169,6 +186,21 @@ func genTokenCases(t *testing.T) (cases []vecTokenCase, errs []vecTokenErrorCase
 	trailBody = append(trailBody, 0, 0x41) // epCount=0 + 多余 0x41
 	trailSum := sha256.Sum256(trailBody)
 	trailBody = append(trailBody, trailSum[:4]...)
+	// epCount=2 只带 1 个端点（第二枚端点头越界 → malformed，token.go:143-145 分支）
+	shortEpBody := append(append([]byte(nil), vecPeerID1...), vecSecret1...)
+	shortEpBody = append(shortEpBody, 2, 0, 15, '1', '2', '7', '.', '0', '.', '0', '.', '1', ':', '4', '2', '6', '0')
+	shortEpSum := sha256.Sum256(shortEpBody)
+	shortEpBody = append(shortEpBody, shortEpSum[:4]...)
+	// addrLen 声明 200、实际只 10 字节（token.go:149-151 分支）
+	overflowBody := append(append([]byte(nil), vecPeerID1...), vecSecret1...)
+	overflowBody = append(overflowBody, 1, 200, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+	overflowSum := sha256.Sum256(overflowBody)
+	overflowBody = append(overflowBody, overflowSum[:4]...)
+	// 端点结构合法但 host:port 校验不过（token.go:154-156 分支：SplitHostPort 拒 "noport"）
+	noportBody := append(append([]byte(nil), vecPeerID1...), vecSecret1...)
+	noportBody = append(noportBody, 1, 6, 'n', 'o', 'p', 'o', 'r', 't')
+	noportSum := sha256.Sum256(noportBody)
+	noportBody = append(noportBody, noportSum[:4]...)
 	errs = append(errs,
 		vecTokenErrorCase{"unsupported-version-hmw2", "hmw2" + goodTok[4:], "unsupported_version"},
 		vecTokenErrorCase{"missing-prefix", goodTok[4:], "malformed"},
@@ -177,6 +209,9 @@ func genTokenCases(t *testing.T) (cases []vecTokenCase, errs []vecTokenErrorCase
 		vecTokenErrorCase{"base64-padding-rejected", "hmw1" + goodTok[4:] + "=", "malformed"}, // FIX-89：严格 RawURLEncoding，'=' 尾缀不容忍
 		vecTokenErrorCase{"zero-addr-len-selfconsistent", "hmw1" + base64.RawURLEncoding.EncodeToString(badBody), "malformed"},
 		vecTokenErrorCase{"trailing-byte", "hmw1" + base64.RawURLEncoding.EncodeToString(trailBody), "malformed"},
+		vecTokenErrorCase{"ep-head-insufficient", "hmw1" + base64.RawURLEncoding.EncodeToString(shortEpBody), "malformed"},
+		vecTokenErrorCase{"addr-len-overflow", "hmw1" + base64.RawURLEncoding.EncodeToString(overflowBody), "malformed"},
+		vecTokenErrorCase{"hostport-reject-noport", "hmw1" + base64.RawURLEncoding.EncodeToString(noportBody), "malformed"},
 	)
 	// 逐条校验错误类别（防向量本身写错类别）
 	kind := func(err error) string {
@@ -241,7 +276,9 @@ func genAddrCases(t *testing.T) []vecAddrCase {
 	}
 	// 守卫命中样本：搜 (secret, pubkey) 使 hw-app 的 v == hw-tun 的 v ⇒ DeriveTunIP 进再散列循环。
 	// v 域 1..65534，碰撞期望 ~65k 次尝试；上限 1<<20 兜底（miss 概率 ~e^-15）。
-	for i := 0; i < 1<<20; i++ {
+	// 搜不到 = 向量集失去守卫路径覆盖 ⇒ 直接判失败（不静默降级）。
+	guardFound := false
+	for i := 0; i < 1<<20 && !guardFound; i++ {
 		pub := make([]byte, 32)
 		pub[0], pub[1], pub[2], pub[3] = byte(i>>24), byte(i>>16), byte(i>>8), byte(i)
 		if vecHmacV(vecSecret1, "hw-tun", pub, 0) == vecHmacV(vecSecret1, "hw-app", pub, 2) {
@@ -251,8 +288,11 @@ func genAddrCases(t *testing.T) []vecAddrCase {
 				pub  []byte
 				note string
 			}{"guard-collision-rehash", vecSecret1, pub, "hw-app 与 hw-tun 撞 v ⇒ DeriveTunIP 走 hw-app.N 再散列（守卫路径）"})
-			break
+			guardFound = true
 		}
+	}
+	if !guardFound {
+		t.Fatal("守卫命中样本未找到（1<<20 次内未撞 v）——向量集不完整，拒绝生成")
 	}
 	out := make([]vecAddrCase, 0, len(pairs))
 	for _, p := range pairs {
@@ -358,9 +398,17 @@ func TestVecgenVectors(t *testing.T) {
 	fmt.Println("==> 生成对照向量：")
 	tokCases, tokErrs := genTokenCases(t)
 	vecWriteJSON(t, filepath.Join(out, "token.json"), map[string]any{
-		"comment": "hmw1 编解码向量。布局：hmw1 ‖ base64url-raw( peerId(32) ‖ secret(32) ‖ epCount(1) ‖ [type(1)+len(1)+addr]* ‖ crc(4)=SHA256(body)[:4] )；type 0=direct 1=relay；DecodeToken 先 TrimSpace。语义真源 baseline pkg/proto/token.go。",
-		"cases":   tokCases,
-		"errors":  tokErrs,
+		"comment": "hmw1 编解码向量。布局：hmw1 ‖ base64url-raw( peerId(32) ‖ secret(32) ‖ epCount(1) ‖ [type(1)+len(1)+addr]* ‖ crc(4)=SHA256(body)[:4] )；type 0=direct 1=relay；DecodeToken 先 TrimSpace、base64 解码跳过内嵌 \\r\\n。语义真源 baseline pkg/proto/token.go。",
+		"sentinels": map[string]string{
+			"comment":              "三类哨兵错误的 Go Error() 原文（Display 文案经 NAPI 直达 App，Rust 侧须逐字对齐前缀段；malformed 的 reason 段按打点各异、Rust 侧仅对齐「homeway/token: 格式非法: 」前缀）",
+			"corrupted":            proto.ErrCorrupted.Error(),
+			"unsupported_version":  proto.ErrUnsupportedVersion.Error(),
+			"unsupported_wrapped":  fmt.Errorf("%w: hmw2", proto.ErrUnsupportedVersion).Error(),
+			"malformed":            proto.ErrMalformed.Error(),
+			"malformed_no_prefix":  fmt.Errorf("%w: 缺少 %s 前缀", proto.ErrMalformed, "hmw1").Error(),
+		},
+		"cases":  tokCases,
+		"errors": tokErrs,
 	})
 	vecWriteJSON(t, filepath.Join(out, "tunnel_addr.json"), map[string]any{
 		"comment": "隧道地址派生向量。tunnel_ip=HMAC-SHA256(secret,\"hw-tun\"‖pub) 取 sum[0:2] 映射 v∈[1,65534]；tun_ip 同型用 \"hw-app\" 取 sum[2:4]，与 tunnel_ip 撞车时按 hw-app.2..8 标签再散列。地址恒 100.64.(v>>8).v。语义真源 baseline pkg/proto/tunneladdr.go。",
