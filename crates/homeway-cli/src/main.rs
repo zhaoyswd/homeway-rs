@@ -66,6 +66,9 @@ struct ConnectArgs {
     recover_cause: String,
     recover_delay: u64,
     inject: Option<String>,
+    /// 测试注入：token 的直连端点改指死端口（127.0.0.1:1）——压出「只有中继可达」
+    /// 形态（DirectFirst 解锁 + via=relay）。
+    dead_direct: bool,
 }
 
 fn parse_connect(args: &[String]) -> ConnectArgs {
@@ -82,6 +85,7 @@ fn parse_connect(args: &[String]) -> ConnectArgs {
         recover_cause: "测试注入".to_owned(),
         recover_delay: 0,
         inject: None,
+        dead_direct: false,
     };
     let mut i = 0;
     while i < args.len() {
@@ -128,6 +132,7 @@ fn parse_connect(args: &[String]) -> ConnectArgs {
                 i += 1;
                 a.recover_cause = args.get(i).cloned().unwrap_or_else(|| "测试注入".into());
             }
+            "--dead-direct" => a.dead_direct = true,
             "--inject" => {
                 i += 1;
                 a.inject = args.get(i).cloned();
@@ -148,13 +153,21 @@ fn cmd_connect(args: &[String]) {
         eprintln!("用法：homeway-cli connect --token <hmw1…> […]");
         std::process::exit(2);
     };
-    let t = match token::decode(&tok) {
+    let mut t = match token::decode(&tok) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("token 解析失败：{e}");
             std::process::exit(1);
         }
     };
+    if a.dead_direct {
+        for e in &mut t.endpoints {
+            if e.kind == token::EndpointKind::Direct {
+                e.addr = "127.0.0.1:1".to_owned();
+            }
+        }
+        println!("inject: token 直连端点已改指死端口（127.0.0.1:1）——只有中继可达");
+    }
 
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
     let mut session = match Session::start(SessionConfig {

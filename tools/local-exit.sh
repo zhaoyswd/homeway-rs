@@ -12,6 +12,10 @@
 #
 # 命令：
 #   start [n]        起出口（serve 前台单角色形态，一次性 flag 不写期望态：
+#                    环境变量 EXIT_EXTRA_FLAGS 可追加 flag——如中继拓扑
+#                    `EXIT_EXTRA_FLAGS='--relay rl1…' tools/local-exit.sh start`、
+#                    R3 注入 `EXIT_EXTRA_FLAGS='--listen 42699'`（同 state 换端口）、
+#                    E9 注入 `EXIT_EXTRA_FLAGS='--peer-ttl 30s'`；
 #                    --listen、--bind-interface none（不钉物理卡，只回环可达）、
 #                    --upnp=false、--stun/--stun6 关、--public-endpoint 127.0.0.1:P。
 #                    就绪判定含**端口退让检查**：listen_port.txt ≠ 配置端口即失败退出）
@@ -90,8 +94,11 @@ start)
   mkdir -p "$EXIT_STATE" || exit 1
   LOG0=$(log_lines "$EXIT_LOG")
   echo "==> 起出口 #$n：state=$EXIT_STATE wg=127.0.0.1:$EXIT_PORT（本轮日志从第 $((LOG0 + 1)) 行起）"
+  # EXIT_EXTRA_FLAGS：追加 flag 的测试入口（R2 评审低-12——--relay/--peer-ttl/换端口注入共用；
+  # 词切分进命令行，调用方自负其值）
   nohup "$BIN" serve --state "$EXIT_STATE" --listen "$EXIT_PORT" --bind-interface none \
     --upnp=false --stun= --stun6= --public-endpoint "127.0.0.1:$EXIT_PORT" --verbose \
+    ${=EXIT_EXTRA_FLAGS} \
     >> "$EXIT_LOG" 2>&1 &
   echo $! > "$EXIT_PIDFILE"
   if ready=$(wait_line_from "$EXIT_LOG" 'serve 就绪' "$LOG0" 25); then

@@ -13,6 +13,8 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+
+use super::bind::Candidate;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// 学习地址的有效期（Go `LearnedEndpointTTL`）。
@@ -261,19 +263,22 @@ impl EndpointCache {
         out
     }
 
-    /// 组装建连候选：学习到的在前，静态 token 候选去重接上；学习地址一律按 direct
-    /// 处理（中继腿由 token 给——R1 无中继腿，`relay` 恒 false，签名保留 bool 对齐
-    /// Go 的 Merge 形状、R2 落盘接线时扩展）。
-    pub fn merge(&self, static_cands: &[SocketAddr], now: SystemTime) -> Vec<SocketAddr> {
-        let mut out = Vec::with_capacity(self.entries.len() + static_cands.len());
+    /// 组装建连候选：学习到的在前（按已验证/新鲜排序），静态 token 候选去重接上。
+    /// 学习地址一律按 direct 处理；**但**同一地址在 static 里是中继条目时沿用 Relay
+    /// 标记（按地址去重把类型位吃掉正是 token relay 腿失效那类事故的同源形态——
+    /// Go endpointcache.go:236-256 逐条）。
+    pub fn merge(&self, static_cands: &[Candidate], now: SystemTime) -> Vec<Candidate> {
+        let relay_addrs: std::collections::HashSet<SocketAddr> =
+            static_cands.iter().filter(|c| c.relay).map(|c| c.addr).collect();
+        let mut out: Vec<Candidate> = Vec::with_capacity(self.entries.len() + static_cands.len());
         let mut seen = std::collections::HashSet::new();
         for e in self.entries(now) {
             if seen.insert(e.addr) {
-                out.push(e.addr);
+                out.push(Candidate { addr: e.addr, relay: relay_addrs.contains(&e.addr) });
             }
         }
         for s in static_cands {
-            if seen.insert(*s) {
+            if seen.insert(s.addr) {
                 out.push(*s);
             }
         }
@@ -383,8 +388,22 @@ mod tests {
         c.observe(addr(1), EndpointSource::Token, t0); // 弱源不降级
         assert_eq!(c.entries(t0)[0].source, EndpointSource::Inband);
 
-        // Merge：学习在前、静态去重接上
-        let merged = c.merge(&[addr(1), addr(2)], t0);
-        assert_eq!(merged, vec![addr(1), addr(2)]);
+        // Merge：学习在前、静态去重接上（relay 位沿用）
+        let merged = c.merge(
+            &[Candidate { addr: addr(1), relay: false }, Candidate { addr: addr(2), relay: true }],
+            t0,
+        );
+        assert_eq!(
+            merged,
+            vec![
+                Candidate { addr: addr(1), relay: false },
+                Candidate { addr: addr(2), relay: true },
+            ]
+        );
+        // 学习地址撞上 static 的中继条目：沿用 Relay 标记
+        let mut c2 = EndpointCache::new();
+        c2.observe(addr(5), EndpointSource::Probe, t0);
+        let m2 = c2.merge(&[Candidate { addr: addr(5), relay: true }], t0);
+        assert_eq!(m2, vec![Candidate { addr: addr(5), relay: true }]);
     }
 }

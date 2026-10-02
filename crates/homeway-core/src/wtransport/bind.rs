@@ -157,7 +157,9 @@ impl Bind {
             candidates: candidates.to_vec(),
             relay_eps: candidates.iter().filter(|c| c.relay).map(|c| c.addr).collect(),
             relay_id: relay_id(peer_pub),
-            direct_first: Some(direct_first.unwrap_or(DIRECT_FIRST_DEFAULT)),
+            direct_first: direct_first.map_or(Some(DIRECT_FIRST_DEFAULT), |d| {
+                if d.is_zero() { Some(DIRECT_FIRST_DEFAULT) } else { Some(d) }
+            }),
             reg,
             reg_armed: true,
             adopted: None,

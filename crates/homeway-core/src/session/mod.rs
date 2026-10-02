@@ -142,7 +142,7 @@ struct Shared {
     gate: recover::RecoverGate,
     ladder: Mutex<LadderState>,
     cache: Option<Mutex<EndpointCache>>,
-    static_cands: Vec<SocketAddr>,
+    static_cands: Vec<Candidate>,
     logf: Arc<dyn Fn(&str) + Send + Sync>,
     stop: AtomicBool,
     /// 重建用的装配材料（token 的端点展开 = static_cands；Token 本体不存——
@@ -179,7 +179,7 @@ impl Shared {
         });
     }
 
-    fn merged_candidates(&self) -> Vec<SocketAddr> {
+    fn merged_candidates(&self) -> Vec<Candidate> {
         match &self.cache {
             Some(c) => {
                 let c = c.lock().expect("缓存锁中毒");
@@ -192,7 +192,7 @@ impl Shared {
     /// 真实往返落已验证（同址 1h 去重由调用方节流；来源 = static 内 → Token 否则 Hint）。
     fn mark_round_trip(&self, addr: SocketAddr) {
         if let Some(c) = &self.cache {
-            let src = if self.static_cands.contains(&addr) {
+            let src = if self.static_cands.iter().any(|c| c.addr == addr) {
                 EndpointSource::Token
             } else {
                 EndpointSource::Hint
@@ -225,16 +225,24 @@ impl Session {
         };
         (logf)("启动（无 TUN 服务会话）"); // C12
 
-        let candidates: Vec<SocketAddr> = cfg
+        // 端点解析：直连 + 中继（type=1）都进候选——中继是直连的后备（DirectFirst 窗口）
+        let candidates: Vec<Candidate> = cfg
             .token
             .endpoints
             .iter()
-            .filter(|e| e.kind == crate::token::EndpointKind::Direct)
-            .filter_map(|e| e.addr.parse().ok())
+            .filter_map(|e| {
+                e.addr.parse().ok().map(|addr| Candidate {
+                    addr,
+                    relay: e.kind == crate::token::EndpointKind::Relay,
+                })
+            })
             .collect();
         if candidates.is_empty() {
             return Err(SessionErr::NoCandidates);
         }
+        #[allow(unused_variables)]
+        let direct_cands: Vec<SocketAddr> =
+            candidates.iter().filter(|c| !c.relay).map(|c| c.addr).collect();
         // ---- 身份（C1 全支文案同串，R1 低-13 整改）----
         let (ident, src, warn) =
             identity::load_or_create(cfg.identity_dir.as_deref(), &cfg.token.peer_id)
@@ -321,9 +329,17 @@ impl Session {
             let merged = shared.merged_candidates();
             let parts: Vec<String> = merged
                 .iter()
-                .map(|a| {
-                    let learned = if shared.static_cands.contains(a) { "" } else { "·学习" };
-                    format!("{a}（LAN{learned}）")
+                .map(|c| {
+                    let known = shared.static_cands.iter().any(|s| s.addr == c.addr);
+                    let learned = if known { "" } else { "·学习" };
+                    let tag = if c.relay {
+                        "中继"
+                    } else if is_lan_addr(c.addr) {
+                        "LAN"
+                    } else {
+                        "公网v4"
+                    };
+                    format!("{}（{tag}{learned}）", c.addr)
                 })
                 .collect();
             (logf)(&format!(
@@ -522,17 +538,14 @@ impl Drop for Session {
 fn build_client(
     token: &Token,
     ident: &Identity,
-    candidates: &[SocketAddr],
+    candidates: &[Candidate],
     logf: &Arc<dyn Fn(&str) + Send + Sync>,
 ) -> Result<Client, SessionErr> {
     Client::start(CoreConfig {
         peer_id: token.peer_id,
         secret: token.secret,
         identity: ident.clone(),
-        candidates: candidates
-            .iter()
-            .map(|a| Candidate { addr: *a, relay: false })
-            .collect(),
+        candidates: candidates.to_vec(),
         logf: Arc::clone(logf),
     })
     .map_err(SessionErr::DataPlane)
@@ -558,12 +571,7 @@ impl recover::LadderTransport for EngineTransport<'_> {
                     .rearm_bounded(recover::ACTION)
                     .map_err(action_err)?;
                 let cands = self.shared.merged_candidates();
-                self.client.set_candidates(
-                    cands
-                        .iter()
-                        .map(|a| Candidate { addr: *a, relay: false })
-                        .collect(),
-                );
+                self.client.set_candidates(cands);
                 Ok(())
             }
         }
@@ -612,12 +620,7 @@ fn spawn_hint_handler(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<SocketA
                 }
                 // 候选重投（学习到的地址进赛跑集）
                 let merged = shared.merged_candidates();
-                shared.current().set_candidates(
-                    merged
-                        .iter()
-                        .map(|a| Candidate { addr: *a, relay: false })
-                        .collect(),
-                );
+                shared.current().set_candidates(merged);
                 let _ = shared.save_tx.send(());
                 punch_to(&shared, addr);
             }
@@ -677,7 +680,13 @@ fn spawn_save_loop(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<()>) {
 /// 旁路探测候选（Go ProbeCandidates：只打直连条目——探测中继端点拿到的是中继自己的
 /// 列表，污染候选表；应答端点经消费卫兵后入缓存）。
 fn run_probe_candidates(shared: &Arc<Shared>) {
-    let targets: Vec<SocketAddr> = shared.merged_candidates();
+    // 只打直连条目（探测中继端点拿到的是中继自己的列表，污染候选表）
+    let targets: Vec<SocketAddr> = shared
+        .merged_candidates()
+        .into_iter()
+        .filter(|c| !c.relay)
+        .map(|c| c.addr)
+        .collect();
     if targets.is_empty() {
         return;
     }
@@ -689,12 +698,7 @@ fn run_probe_candidates(shared: &Arc<Shared>) {
                 .observe(ep, EndpointSource::Probe, SystemTime::now());
         }
         let merged = sh.merged_candidates();
-        sh.current().set_candidates(
-            merged
-                .iter()
-                .map(|a| Candidate { addr: *a, relay: false })
-                .collect(),
-        );
+        sh.current().set_candidates(merged);
         let _ = sh.save_tx.send(());
     };
     crate::probe::probe_candidates(&targets, Duration::from_secs(4), shared.logf.as_ref(), &mut on_ep);
@@ -931,6 +935,19 @@ fn token_of(sh: &Shared) -> Token {
         secret: crate::token::Secret::from(sh.secret),
         endpoints: vec![],
     }
+}
+
+/// LAN 判定（C13 标签面：回环/RFC1918）。
+fn is_lan_addr(ap: SocketAddr) -> bool {
+    let ip = ap.ip();
+    if ip.is_loopback() {
+        return true;
+    }
+    if let std::net::IpAddr::V4(v4) = ip {
+        let o = v4.octets();
+        return o[0] == 10 || o[0] == 172 && (16..=31).contains(&o[1]) || o[0] == 192 && o[1] == 168;
+    }
+    false
 }
 
 // ---------- 纯决策函数（Go patrolrule.go / PatrolEvidenceGate 同串语义） ----------
