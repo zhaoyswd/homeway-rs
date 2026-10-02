@@ -292,8 +292,9 @@ impl EndpointCache {
 struct CacheEntry {
     endpoint: String,
     source: EndpointSourceSerde,
+    #[serde(rename = "learnedAt")]
     learned_at: i64,
-    #[serde(skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "verifiedAt", skip_serializing_if = "Option::is_none")]
     verified_at: Option<i64>,
 }
 
@@ -338,6 +339,25 @@ impl From<EndpointSource> for EndpointSourceSerde {
             EndpointSource::Probe => EndpointSourceSerde::Probe,
         }
     }
+}
+
+/// 测试面：按 Go endpointFile 序列化形状拼 JSON（与 save 的 CacheFile 同形；
+/// entries 按 Go validLocked 排序——已验证优先、新鲜优先）。
+pub fn debug_wire_json(c: &EndpointCache, peer_hex: &str, now: SystemTime) -> String {
+    let entries = c.entries(now);
+    let file = CacheFile {
+        peer: Some(peer_hex.to_owned()),
+        entries: entries
+            .iter()
+            .map(|e| CacheEntry {
+                endpoint: e.addr.to_string(),
+                source: e.source.into(),
+                learned_at: e.learned_at,
+                verified_at: (e.verified_at > 0).then_some(e.verified_at),
+            })
+            .collect(),
+    };
+    serde_json::to_string(&file).unwrap()
 }
 
 fn hex_encode(b: &[u8]) -> String {

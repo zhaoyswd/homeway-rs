@@ -15,6 +15,8 @@
 package wtransport
 
 import (
+	"bytes"
+	"time"
 	"crypto/hmac"
 	"crypto/sha256"
 	"encoding/base64"
@@ -26,6 +28,7 @@ import (
 	"path/filepath"
 	"testing"
 
+	"github.com/zhaoyswd/homeway/pkg/files"
 	"github.com/zhaoyswd/homeway/pkg/proto"
 )
 
@@ -457,5 +460,101 @@ func TestVecgenVectors(t *testing.T) {
 		"comment": "WG PSK 派生向量。psk=HKDF-SHA256(ikm=token.secret, salt=nil, info=\"homeway/wg-psk\", 32B)；客户端 peer 配置与出口 peer 登记共用本派生（握手 psk2 混入）。语义真源 baseline pkg/proto/psk.go。",
 		"cases":   genPskCases(t),
 	})
+	genR2Families(t, out)
 	fmt.Println("==> 完成。")
 }
+
+// genR2Families：R2 增族——reg 报文字节、端点缓存落盘 JSON（与 Go 字节对齐的钉子）、
+// files 帧字节（WriteFrame/EncodeBatch 真源产出）。Rust 侧对照测试吃这些向量。
+func genR2Families(t *testing.T, out string) {
+	// ---- reg 报文（pkg/proto/reg.go 真源；Rust wtransport/reg.rs 对拍）----
+	type regCase struct {
+		Name   string `json:"name"`
+		Secret string `json:"secret"`
+		Pubkey string `json:"pubkey"`
+		DevTag string `json:"devtag"`
+		TS     int64  `json:"ts"`
+		Wire   string `json:"wire"`
+	}
+	var regCases []regCase
+	for i, mat := range [][]string{
+		{hex.EncodeToString(vecSecret1[:]), hex.EncodeToString(vecPeerID1[:]), "a1b2c3d4e5f6a7b8"},
+		{hex.EncodeToString(vecMasterA[:]), hex.EncodeToString(vecPeerID2[:]), "0000000000000001"},
+	} {
+		var secret [32]byte
+		var pubkey [32]byte
+		var dev proto.DevTag
+		_, _ = hex.Decode(secret[:], []byte(mat[0]))
+		_, _ = hex.Decode(pubkey[:], []byte(mat[1]))
+		_, _ = hex.Decode(dev[:], []byte(mat[2]))
+		ts := time.Unix(1700000000+int64(i), 0).UTC()
+		wire := proto.EncodeReg(secret, pubkey, dev, ts)
+		regCases = append(regCases, regCase{
+			Name:   fmt.Sprintf("reg-%d", i+1),
+			Secret: mat[0], Pubkey: mat[1], DevTag: mat[2], TS: ts.Unix(),
+			Wire: hex.EncodeToString(wire),
+		})
+	}
+	vecWriteJSON(t, filepath.Join(out, "reg.json"), map[string]any{
+		"comment": "reg v2 报文字节（H2 前缀 + hr-reg2 MAC 域）。语义真源 baseline pkg/proto/reg.go EncodeReg；Rust 侧 wtransport/reg.rs 对拍逐字节。",
+		"cases":   regCases,
+	})
+
+	// ---- 端点缓存落盘 JSON（字节对齐钉子：键序=声明序、omitempty、i64 毫秒）----
+	ts1 := int64(1700000000123)
+	ts2 := int64(1700000099876)
+	cacheFile := struct {
+		Peer    string `json:"peer,omitempty"`
+		Entries []struct {
+			Endpoint   string `json:"endpoint"`
+			Source     string `json:"source"`
+			LearnedAt  int64  `json:"learnedAt"`
+			VerifiedAt int64  `json:"verifiedAt,omitempty"`
+		} `json:"entries,omitempty"`
+	}{
+		Peer: hex.EncodeToString(vecPeerID1[:]),
+		Entries: []struct {
+			Endpoint   string `json:"endpoint"`
+			Source     string `json:"source"`
+			LearnedAt  int64  `json:"learnedAt"`
+			VerifiedAt int64  `json:"verifiedAt,omitempty"`
+		}{
+			{"203.0.113.9:41641", "hint", ts1, ts2},
+			{"[2001:db8::1]:41641", "probe", ts2, 0},
+		},
+	}
+	raw, err := json.Marshal(cacheFile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	vecWriteJSON(t, filepath.Join(out, "endpointcache.json"), map[string]any{
+		"comment": "端点缓存落盘 JSON 字节钉子（与 Go endpointFile 序列化逐字节一致：键序=声明序、verifiedAt omitempty、i64 毫秒）。语义真源 baseline clientcore/internal/wtransport/endpointcache.go。",
+		"json":    string(raw),
+	})
+
+	// ---- files 帧（4B BE len + payload；容器帧 [reg][data]）----
+	type frCase struct {
+		Name string `json:"name"`
+		Wire string `json:"wire"`
+	}
+	var frCases []frCase
+	mk := func(payload []byte) string {
+		var w bytes.Buffer
+		if err := files.WriteFrame(&w, payload); err != nil {
+			t.Fatal(err)
+		}
+		return hex.EncodeToString(w.Bytes())
+	}
+	frCases = append(frCases, frCase{"terminator", mk(nil)})
+	frCases = append(frCases, frCase{"small", mk([]byte("hello"))})
+	big := make([]byte, 70000)
+	for i := range big {
+		big[i] = byte(i % 251)
+	}
+	frCases = append(frCases, frCase{"70k", mk(big)})
+	vecWriteJSON(t, filepath.Join(out, "files_frames.json"), map[string]any{
+		"comment": "files 4B BE 长度前缀帧字节（含终止帧与跨 u16 边界样本）。语义真源 baseline pkg/files/proto.go WriteFrame。",
+		"cases":   frCases,
+	})
+}
+
