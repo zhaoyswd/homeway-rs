@@ -56,6 +56,12 @@ pub struct TunDevice {
     rx_dropped: u64,
 }
 
+impl Default for TunDevice {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl TunDevice {
     pub fn new() -> Self {
         Self {
@@ -78,6 +84,12 @@ impl TunDevice {
     #[cfg(test)]
     pub fn rx_queue_len(&self) -> usize {
         self.rx_queue.len()
+    }
+
+    /// 测试面：TX 出站队列长度（拦截层排障用）。
+    #[cfg(test)]
+    pub fn tx_out_len_for_test(&self) -> usize {
+        self.tx_out.lock().map(|q| q.len()).unwrap_or(0)
     }
 
     /// 取 poll 产出的全部出站明文包（驱动线程逐个 encapsulate）。

@@ -45,11 +45,14 @@ impl<'a> Ipv4View<'a> {
         let src = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
         let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
         let body = &pkt[ihl..total_len];
+        let mut payload_off = 0usize;
         let (src_port, dst_port, tcp_flags, tcp_seq, tcp_ack) = match proto {
             6 => {
                 if body.len() < 20 {
                     return None;
                 }
+                // TCP 载荷起点按 data offset（options 不算载荷——RST 的 seq 推进语义）
+                payload_off = ((body[12] >> 4) as usize).max(5) * 4;
                 (
                     u16::from_be_bytes([body[0], body[1]]),
                     u16::from_be_bytes([body[2], body[3]]),
@@ -66,6 +69,13 @@ impl<'a> Ipv4View<'a> {
             }
             _ => (0, 0, 0, 0, 0),
         };
+        let l4_hdr = if proto == 6 {
+            payload_off
+        } else if proto == 17 {
+            8
+        } else {
+            0
+        };
         Some(Self {
             src,
             dst,
@@ -74,7 +84,7 @@ impl<'a> Ipv4View<'a> {
             dst_port,
             header_len: ihl,
             total_len,
-            payload: &body[if proto == 6 { 20 } else if proto == 17 { 8 } else { 0 }..],
+            payload: &body[l4_hdr.min(body.len())..],
             tcp_flags,
             tcp_seq,
             tcp_ack,
@@ -91,8 +101,8 @@ impl<'a> Ipv4View<'a> {
     }
 }
 
-/// Internet 校验和（RFC1071）。
-fn checksum(data: &[u8], mut sum: u32) -> u16 {
+/// Internet 校验和的**未取反**折叠和（RFC1071；多段联用：各段结果相加再折叠一次）。
+fn checksum_raw(data: &[u8], mut sum: u32) -> u32 {
     let mut i = 0;
     while i + 1 < data.len() {
         sum = sum.wrapping_add(u16::from_be_bytes([data[i], data[i + 1]]) as u32);
@@ -104,7 +114,12 @@ fn checksum(data: &[u8], mut sum: u32) -> u16 {
     while sum >> 16 != 0 {
         sum = (sum & 0xffff) + (sum >> 16);
     }
-    !sum as u16
+    sum
+}
+
+/// 单段 Internet 校验和（取反一次——RFC1071 终值）。
+fn checksum(data: &[u8], sum: u32) -> u16 {
+    !(checksum_raw(data, sum) as u16)
 }
 
 /// IPv4 头校验和重算（原地：清零 [10..12] 后算）。
@@ -139,21 +154,22 @@ fn fix_l4_checksum(pkt: &mut [u8]) {
         (l4_len >> 8) as u8,
         l4_len as u8,
     ];
-    let mut sum = checksum(&pseudo, 0) as u32;
+    let mut sum = checksum_raw(&pseudo, 0);
     let l4 = &mut pkt[ihl..];
     match proto {
         6 if l4.len() >= 18 => {
             l4[16] = 0;
             l4[17] = 0;
-            sum = checksum(l4, sum) as u32;
-            let c = sum as u16;
+            sum = checksum_raw(l4, sum);
+            let c = !(sum as u16); // 伪头部 + 段联合折叠后取反一次
             l4[16..18].copy_from_slice(&c.to_be_bytes());
         }
         17 if l4.len() >= 6 => {
             l4[6] = 0;
             l4[7] = 0;
-            sum = checksum(l4, sum) as u32;
-            let c = if (sum as u16) == 0 { 0xFFFF } else { sum as u16 };
+            sum = checksum_raw(l4, sum);
+            let c0 = !(sum as u16);
+            let c = if c0 == 0 { 0xFFFF } else { c0 }; // UDP 0 表示无校验
             l4[6..8].copy_from_slice(&c.to_be_bytes());
         }
         _ => {}
@@ -190,10 +206,18 @@ pub fn rewrite_src(pkt: &mut [u8], new_ip: Ipv4Addr, new_port: u16) {
 /// HandleUnknownDestinationPacket 的 RST）。seq 取输入包的 ack（有 ACK）或
 /// seq+payload 长（无 ACK），标准 RST 构造。
 pub fn build_tcp_rst(input: &Ipv4View<'_>) -> Vec<u8> {
+    // 形态对齐 smoltcp `rst_reply`（SYN-SENT 侧只认 RST|ACK 且 ack = iss+1）：
+    // seq = 输入的 ack（无则 0）；对 SYN 输入补 ack = seq + SEG.LEN（载荷 + SYN/FIN 位）。
+    let syn_fin = (input.tcp_flags & TCP_SYN != 0) as u32 + (input.tcp_flags & TCP_FIN != 0) as u32;
     let seq = if input.tcp_flags & TCP_ACK != 0 {
         input.tcp_ack
     } else {
-        input.tcp_seq.wrapping_add(input.payload.len() as u32)
+        0
+    };
+    let ack = if input.tcp_flags & TCP_SYN != 0 {
+        input.tcp_seq.wrapping_add(input.payload.len() as u32 + syn_fin)
+    } else {
+        input.tcp_ack
     };
     let mut pkt = Vec::with_capacity(40);
     // IPv4 头（20B）：ver/ihl、tos、total 占位、id/flags、ttl、proto=6、校验和占位
@@ -207,7 +231,7 @@ pub fn build_tcp_rst(input: &Ipv4View<'_>) -> Vec<u8> {
     pkt.extend_from_slice(&input.dst_port.to_be_bytes());
     pkt.extend_from_slice(&input.src_port.to_be_bytes());
     pkt.extend_from_slice(&seq.to_be_bytes());
-    pkt.extend_from_slice(&0u32.to_be_bytes()); // ack = 0
+    pkt.extend_from_slice(&ack.to_be_bytes());
     pkt.extend_from_slice(&[(5 << 4), TCP_RST | TCP_ACK]);
     pkt.extend_from_slice(&0u16.to_be_bytes()); // window
     pkt.extend_from_slice(&0u16.to_be_bytes()); // checksum 占位
@@ -247,11 +271,12 @@ pub fn build_icmp_unreachable(orig: &[u8]) -> Option<Vec<u8>> {
     Some(pkt)
 }
 
-/// 构造最小 TCP SYN 假包（测试面：驱动 RX 路径的输入形态）。
+/// 构造最小 TCP SYN 假包（测试面：驱动 RX 路径的输入形态——**带 MSS option**，
+/// smoltcp 服务端要求 SYN 携带 MSS 才接受；形态对齐真栈产 SYN：IP20 + TCP24）。
 pub fn build_tcp_syn(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, seq: u32) -> Vec<u8> {
-    let mut pkt = Vec::with_capacity(40);
+    let mut pkt = Vec::with_capacity(44);
     pkt.extend_from_slice(&[0x45, 0]);
-    pkt.extend_from_slice(&40u16.to_be_bytes());
+    pkt.extend_from_slice(&44u16.to_be_bytes());
     pkt.extend_from_slice(&[0, 0, 0, 0, 64, 6, 0, 0]);
     pkt.extend_from_slice(&src.octets());
     pkt.extend_from_slice(&dst.octets());
@@ -260,11 +285,12 @@ pub fn build_tcp_syn(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, seq: 
     pkt.extend_from_slice(&dport.to_be_bytes());
     pkt.extend_from_slice(&seq.to_be_bytes());
     pkt.extend_from_slice(&0u32.to_be_bytes());
-    pkt.extend_from_slice(&[(5 << 4), TCP_SYN]);
+    pkt.extend_from_slice(&[(6 << 4), TCP_SYN]); // data offset 6（24B 头）
     pkt.extend_from_slice(&0xFFFFu16.to_be_bytes()); // window
     pkt.extend_from_slice(&0u16.to_be_bytes()); // checksum 占位
     pkt.extend_from_slice(&0u16.to_be_bytes()); // urgent
-    debug_assert_eq!(pkt.len(), 40);
+    pkt.extend_from_slice(&[0x02, 0x04, 0x04, 0xD8]); // MSS = 1240（MTU1280-40，对齐真栈）
+    debug_assert_eq!(pkt.len(), 44);
     fix_ip_checksum(&mut pkt);
     fix_l4_checksum(&mut pkt);
     pkt
@@ -338,8 +364,11 @@ mod tests {
             ((pkt.len() - ihl) >> 8) as u8,
             (pkt.len() - ihl) as u8,
         ];
-        let s = checksum(&pkt[ihl..], checksum(&pseudo, 0) as u32);
-        assert_eq!(s, 0, "TCP 校验和应自洽");
+        assert_eq!(
+            checksum_raw(&pseudo, checksum_raw(&pkt[20..], 0)),
+            0xFFFF,
+            "TCP 校验和应自洽（标准形）"
+        );
     }
 
     /// UDP 重写 + 校验和（含 0xFFFF 规范形态的健壮性——非零路径）。
@@ -361,8 +390,11 @@ mod tests {
             ((pkt.len() - 20) >> 8) as u8,
             (pkt.len() - 20) as u8,
         ];
-        let s = checksum(&pkt[20..], checksum(&pseudo, 0) as u32);
-        assert_eq!(s, 0, "UDP 校验和应自洽");
+        assert_eq!(
+            checksum_raw(&pseudo, checksum_raw(&pkt[20..], 0)),
+            0xFFFF,
+            "UDP 校验和应自洽（标准形）"
+        );
     }
 
     /// RST 构造：源 = 原目的；校验和自洽；可直接进 encap 出站。
@@ -382,14 +414,15 @@ mod tests {
         assert_eq!(rv.src_port, 443);
         assert_eq!(rv.dst_port, 40000);
         assert_eq!(rv.tcp_flags & TCP_RST, TCP_RST);
-        // seq = 输入 seq + 0（SYN 无载荷）
-        assert_eq!(rv.tcp_seq, 100);
+        // 对 SYN 输入：ack = seq + SEG.LEN（无载荷 SYN ⇒ +1）；seq = 输入 ack（无 ⇒ 0）
+        assert_eq!(rv.tcp_ack, 101);
+        assert_eq!(rv.tcp_seq, 0);
         let pseudo = [
             rst[12], rst[13], rst[14], rst[15], rst[16], rst[17], rst[18], rst[19], 0, 6,
             ((rst.len() - 20) >> 8) as u8,
             (rst.len() - 20) as u8,
         ];
-        assert_eq!(checksum(&rst[20..], checksum(&pseudo, 0) as u32), 0);
+        assert_eq!(checksum_raw(&pseudo, checksum_raw(&rst[20..], 0)), 0xFFFF);
     }
 
     /// ICMP 构造：type3/code3、载荷 = 原 IP 头 + 8B、校验和自洽。
@@ -407,7 +440,7 @@ mod tests {
         assert_eq!(icmp[21], 3);
         assert_eq!(&icmp[28..28 + 8], &orig[..8], "载荷含原 IP 头前 8B");
         // ICMP 校验和
-        assert_eq!(checksum(&icmp[20..], 0), 0);
+        assert_eq!(checksum_raw(&icmp[20..], 0), 0xFFFF);
         // TCP 输入不产 ICMP（对齐 gVisor——TCP 无监听回 RST 不是 ICMP）
         let syn = build_tcp_syn(Ipv4Addr::new(1, 1, 1, 1), 1, Ipv4Addr::new(2, 2, 2, 2), 2, 1);
         assert!(build_icmp_unreachable(&syn).is_none());

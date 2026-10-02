@@ -38,7 +38,7 @@ use crate::token::{PeerId, Secret};
 use crate::tunnel_addr;
 use crate::wtransport::{Bind, Candidate, RegCtx, Via};
 
-mod stackb;
+pub mod stackb;
 
 use self::stackb::{DialError, StackB};
 
