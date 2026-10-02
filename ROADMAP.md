@@ -53,18 +53,23 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 | **R0** | 基线锚定 + 互操作基建 + 仓库骨架 | **完成**（2026-10-02） | 6/6 |
 | **R1** | 客户端垂直切片（直连数据面 ↔ Go 出口） | **完成**（2026-10-02） | 7/7 |
 | **R2** | 客户端全量（行为对齐 + 中继腿 + files/portfwd + facade 预留） | **完成**（2026-10-02） | 7/7 |
-| **R3** | 出口（多 peer WG device + 拦截层 + files/DNS/STUN/UPnP + servercore） | 未开始 | — |
+| **R3** | 出口（多 peer WG device + 拦截层 + files/DNS/STUN/UPnP + servercore） | **进行中**（2026-10-02 第 1 会话：技术评审 v2 定稿 + 3a/3b/3c/3d-files 完成） | 4/6 步 |
 | **R4** | 中继（信封 + 准入 + 升级条纹） | 未开始 | — |
 | **R5** | 互操作矩阵全量 + fuzz + 性能 A/B + 台账三方门 | 未开始 | — |
 | **R6** | term 服务面（协议/surface 产出/检测引擎 + 自建编码器/应答器） | 未开始 | — |
 | **R7** | APP 接入（napi-rs 或 C-ABI 胶水 + OHOS 交叉 + 20 导出面 + hostsession） | 未开始 | — |
 | **R8** | 终测收官（包体/性能终测 + 共存定案 + 文档指针补录） | 未开始 | — |
 
-**下一步（当前指针）**：R3 出口（多 peer WG device + 拦截层 + files/DNS/STUN/UPnP +
-servercore；技术评审先行——多 peer device 是全程序唯一剩余中风险技术点）。R2 完成判据
-证据见 R2 小节；R2 登记：tunStatusJSON 完整键面归 R7（无 TUN 形态产不出，对照面 =
-serviceSnapshotJSON——JSON 对照已 PASS）、E9 stale/revoked 形态与 E12 归 R3、
-低-4/低-7 残余/低-10 精确形态/中-10③ 挂账归属期见 docs/reviews/R2.md 豁免表。
+**下一步（当前指针）**：R3 续接（第 2 会话起）——**已完成**：技术评审第一道门
+（dsh，4 高/15 中/11 低，v2 定稿 = `docs/reviews/R3-design.md`）+ 3a 多 peer device
+（两表分发/base 不变量钉死/漫游/容器帧）+ 3b 设备表与台账（DevOp 序列消 opCh）+
+3c 拦截层全量（NAT 重写/拨号先行/UDP 会话/worker 池/Stats 判据行；85 测试绿 +
+clippy 0）+ 3d 的 files 服务端（六动词/沙箱/UDS）。**待做**：3d 剩余（DNS 代答 +
+speedtest 服务端）、3e（STUN/UPnP）、3f（serve 装配 + Go/Rust 双侧判据实测 +
+多 peer 混跑 + TTL/吊销注入）、R2 移交微项、第二道门（代码评审）。
+进度细节与遗留见 `docs/reviews/R3.md` 的「进度注记」节。R2 登记：tunStatusJSON 完整
+键面归 R7（对照面 = serviceSnapshotJSON——JSON 对照已 PASS）、E9 stale/revoked 形态
+与 E12 归 R3、低-4/低-7 残余/低-10 精确形态/中-10③ 挂账归属期见 docs/reviews/R2.md 豁免表。
 
 依赖：R0→R1→R2→{R3, R4 可并行}→R5→R6→R7（**需发版会话收官 + 用户点头**）→R8。
 R4 最小可提前（不依赖 R1，只需 R0 夹具），但优先保 R1 主线。
@@ -207,6 +212,34 @@ servercore 装配（config.toml 同 schema、serve.enabled 期望态）。
 Rust exit 全判据绿；Rust exit ↔ Rust client 闭环；`intercept: …（dialok）` 计数语义一致。
 **退出口**：多 peer device 自建受阻 → 用「Go exit + Rust 拦截层以外部件」分片验证，device 层
 单独攻坚（允许 R3 拆成 3a/3b）。
+
+**进度注记（2026-10-02，第 1 会话末）**：
+- 技术评审第一道门完成（dsh `r3d.3hsyns` 轮次；4 高/15 中/11 低全处置，v2 定稿）。
+  高危整改全部落地：H1 容器帧（bind.rs handle_batch）、H2 拨号先行（SYN 缓存 +
+  DialOk 后 listen 注入 + DialFailed RST|ACK）、H3 DNS 专用线程（设计落位，dnsproxy
+  待 3d 剩余实装）、H4 固定 worker 池（8×poll(2)，含 Written/Ack 背压闭环）。
+- 3a：`server/device.rs`（两表分发——M1 删 pending-init 表落地；base 跨握手稳定
+  单测钉死；漫游「先更新后应答」；expired 不重建）+ `server/bind.rs`（腿帧分发含
+  容器、probe 应答防放大约束、端口退让、E23 新源日志）。
+- 3b：`server/table.rs`（register 返回 DevOp 序列——数据与副作用分离，天然消 Go 的
+  opCh FIFO 队列；stale/ttl/rotate/拒绝归因全语义 + 判据行）+ `server/state.rs`
+  （key/tokens/revoked 台账，JSON 键序与 Go 字节对齐单测）。
+- 3c：`server/intercept/`——nat.rs（校验和族 + RST|ACK/ICMP responder + MSS 形态
+  SYN 构造）、pool.rs（worker 池）、mod.rs（Interceptor 主体：RX 分流 served-port
+  demux 优先/未登记走 NAT、UDP pending 纯载荷 ≤16 丢最新、TX 反重写、水位背压、
+  idle 看门狗、Drain/HaltNew、Stats 与 E5/E10/E11/E12/拒绝判据行）。实测抓出并修
+  三个关键 bug：L4 校验和双取反（标准形独立算法钉死）、CloseWait 推进误关 Listen
+  socket（未连接态 may_recv 恒 false）、worker 池 pollfd 构建把 flow id 误当 fd。
+  端到端测试：豁免流建连+数据往返 / 拨号失败 RST / UDP 会话回投反重写。
+- 3d-files：`files_server.rs` 六动词全实现（每命令一流/沙箱/tierpart/UDS 死活判别
+  chmod0600），R2 客户端同协议对拍测试绿。
+- 测试面：85 lib 全绿 + clippy 0（连续多轮）。
+- **遗留给第 2 会话**：3d 剩余（dnsproxy.rs——上游跟随/ID 重写/TC→TCP/过滤类，
+  设计 H3 的 DNS 专用线程待接；speedtest_server.rs——SPED 帧受理/结算判据行 E13，
+  顺手修 L10 客户端 first_frame bug）、3e（egress.rs/upnp.rs）、3f（serve 装配 +
+  判据实测：Go client ↔ Rust exit 全判据/Rust 闭环/多 peer 混跑 n=2/32/TTL+吊销
+  注入/DNS 代答实测）、R2 移交微项（低-7 载荷收窄在 3b 错误面已就位可顺手、低-10
+  set_timeout 已在 3c 落地、低-5/6/8/12/16）、第二道门代码评审。
 
 ## R4 中继（估 3–4 会话日）
 
