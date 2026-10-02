@@ -1,9 +1,9 @@
 //! 拦截 worker 池（R3；固定小池 + poll(2) 多路复用——设计 §1.1 / 评审 H4/H4a 整改）。
 //!
 //! Go 的「每流 goroutine」在 Rust 不是近零成本（上限 1024 TCP + 4096 UDP 会话）——
-//! 固定池（N 条线程）事件驱动所有 upstream fd（TCP/UDS/UDP socket），与 R1「自管线程
-//! + poll(2)」同一习惯。拨号（阻塞面最长 10s）不占池：每流 spawn 短命拨号线程，
-//! 完成后 fd 移交池（暂态线程量级 = 并发建连数，远小于稳态连接数）。
+//! 固定池（N 条线程）事件驱动所有 upstream fd（TCP/UDS/UDP socket），与 R1 的
+//! 「自管线程 + poll(2)」同一习惯。拨号（阻塞面最长 10s）不占池：每流 spawn 短命
+//! 拨号线程，完成后 fd 移交池（暂态线程量级 = 并发建连数，远小于稳态连接数）。
 //!
 //! 消息面（显式枚举，评审 H4b）——TCP 桥语义对齐 Go `bridgeConns`「任一方 EOF/错误
 //! 即双向拆、无半关」；upstream 侧 EOF = `UpstreamEof`（驱动关栈内 socket 发 FIN）。
@@ -13,8 +13,10 @@
 
 use std::collections::HashMap;
 use std::io;
+#[cfg(test)]
+use std::io::{Read as _, Write as _};
 use std::net::{TcpStream, UdpSocket};
-use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::fd::{FromRawFd, RawFd};
 use std::os::unix::net::UnixStream;
 use std::sync::mpsc::{self, Sender};
 use std::time::Duration;
@@ -24,7 +26,7 @@ pub const WATERMARK: usize = 256 * 1024;
 /// 每次读块大小（Go bufSize 同值）。
 const READ_CHUNK: usize = 64 * 1024;
 /// upstream 的种类（豁免/过境/DNS 的建流决策面）。
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub enum Upstream {
     /// 本机 TCP（transit；exempt 未命中 LocalServices 时的回环同端口）。
     Tcp(std::net::SocketAddr),
@@ -35,6 +37,7 @@ pub enum Upstream {
 }
 
 /// 驱动 → worker 的命令。
+#[derive(Debug)]
 pub enum PoolCmd {
     /// 写 upstream（TCP/UDS 流写；UDP 数据报发）。
     Out { flow: u64, data: Vec<u8> },
@@ -47,6 +50,7 @@ pub enum PoolCmd {
 }
 
 /// worker → 驱动的事件。
+#[derive(Debug)]
 pub enum PoolEvent {
     DialOk { flow: u64 },
     DialFailed { flow: u64 },
@@ -126,7 +130,7 @@ impl Worker {
             // ② poll 名下 fd + 管道
             pollfds.clear();
             pollfds.push(libc::pollfd { fd: wake_r, events: libc::POLLIN, revents: 0 });
-            for (fd, io) in &self.flows {
+            for io in self.flows.values() {
                 if io.dead {
                     continue;
                 }
@@ -134,7 +138,7 @@ impl Worker {
                 if !io.out_buf.remaining().is_empty() || io.want_write {
                     ev |= libc::POLLOUT;
                 }
-                pollfds.push(libc::pollfd { fd: *fd, events: ev, revents: 0 });
+                pollfds.push(libc::pollfd { fd: io.fd, events: ev, revents: 0 });
             }
             let n = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as u32, 1000) };
             if n < 0 && std::io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
@@ -363,7 +367,8 @@ pub struct WorkerPool {
     txs: Vec<Sender<PoolCmd>>,
     wakes: Vec<RawFd>,
     event_tx: Sender<PoolEvent>,
-    rr: usize,
+    /// 流 → 归属 worker（Adopt/命令必须回同一条——fd 表是 per-worker 的）。
+    flow_owner: HashMap<u64, usize>,
 }
 
 impl WorkerPool {
@@ -396,31 +401,18 @@ impl WorkerPool {
             wakes.push(wake_w);
         }
         (
-            Self { txs, wakes, event_tx, rr: 0 },
+            Self { txs, wakes, event_tx, flow_owner: HashMap::new() },
             event_rx,
         )
     }
 
-    fn next(&mut self) -> usize {
-        self.rr = (self.rr + 1) % self.txs.len();
-        self.rr
-    }
-
-    /// 发命令到轮转 worker（投后唤醒）。
-    pub fn send(&mut self, cmd: PoolCmd) {
-        let i = self.next();
+    /// 按流发命令（流的 fd 表是 per-worker 的——必须回到归属 worker；投后唤醒）。
+    /// 未知流（已被收）静默丢弃（与 Go「对已断连接写 = 无操作」同义）。
+    pub fn send_for(&mut self, flow: u64, cmd: PoolCmd) {
+        let Some(i) = self.flow_owner.get(&flow).copied() else { return };
         if self.txs[i].send(cmd).is_ok() {
             unsafe {
                 libc::write(self.wakes[i], b"x".as_ptr().cast(), 1);
-            }
-        }
-    }
-
-    /// 发命令到指定 worker（fd 移交要找同一条——记录流归属）。
-    pub fn send_to(&mut self, worker: usize, cmd: PoolCmd) {
-        if self.txs.get(worker).map(|t| t.send(cmd).is_ok()).unwrap_or(false) {
-            unsafe {
-                libc::write(self.wakes[worker], b"x".as_ptr().cast(), 1);
             }
         }
     }
@@ -435,6 +427,7 @@ impl WorkerPool {
         let wake = self.wakes[worker_index];
         let tx2 = self.txs[worker_index].clone();
         let event_tx = self.event_tx.clone();
+        self.flow_owner.insert(flow, worker_index);
         std::thread::Builder::new()
             .name("homeway-dial".into())
             .stack_size(256 * 1024)
@@ -531,8 +524,7 @@ mod tests {
         let listener = std::os::unix::net::UnixListener::bind(&sock_path).unwrap();
         // 服务端回显
         let echo = std::thread::spawn(move || {
-            for conn in listener.incoming() {
-                let Ok(mut c) = conn else { break };
+            if let Ok((mut c, _)) = listener.accept() {
                 let mut buf = [0u8; 1024];
                 loop {
                     match c.read(&mut buf) {
@@ -544,7 +536,6 @@ mod tests {
                         }
                     }
                 }
-                break; // 一条连接即可
             }
         });
 
@@ -558,7 +549,7 @@ mod tests {
                 match ev {
                     PoolEvent::DialOk { flow } => {
                         assert_eq!(flow, 7);
-                        pool.send(PoolCmd::Out { flow: 7, data: b"ping".to_vec() });
+                        pool.send_for(7, PoolCmd::Out { flow: 7, data: b"ping".to_vec() });
                     }
                     PoolEvent::UpstreamData { flow, data } => {
                         assert_eq!((flow, data.as_slice()), (7, &b"ping"[..]));
@@ -571,7 +562,7 @@ mod tests {
         }
         assert!(got_data, "回显未到达");
         // 关闭 → Closed 回执
-        pool.send(PoolCmd::Close { flow: 7, linger_rst: false });
+        pool.send_for(7, PoolCmd::Close { flow: 7, linger_rst: false });
         let closed = events
             .recv_timeout(Duration::from_secs(3))
             .map(|e| matches!(e, PoolEvent::Closed { flow: 7 }))

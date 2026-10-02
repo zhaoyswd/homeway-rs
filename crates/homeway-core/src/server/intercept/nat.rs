@@ -54,8 +54,8 @@ impl<'a> Ipv4View<'a> {
                     u16::from_be_bytes([body[0], body[1]]),
                     u16::from_be_bytes([body[2], body[3]]),
                     body[13],
-                    u32::from_be_bytes([body[4..8].try_into().unwrap()]),
-                    u32::from_be_bytes([body[8..12].try_into().unwrap()]),
+                    u32::from_be_bytes(body[4..8].try_into().unwrap()),
+                    u32::from_be_bytes(body[8..12].try_into().unwrap()),
                 )
             }
             17 => {
@@ -127,25 +127,27 @@ fn fix_l4_checksum(pkt: &mut [u8]) {
     }
     let ihl = (pkt[0] & 0x0f) as usize * 4;
     let proto = pkt[9];
-    let l4 = match pkt.get_mut(ihl..) {
-        Some(s) => s,
-        None => return,
-    };
+    if pkt.len() <= ihl {
+        return;
+    }
+    let l4_len = pkt.len() - ihl;
     let pseudo = [
         pkt[12], pkt[13], pkt[14], pkt[15], // src
         pkt[16], pkt[17], pkt[18], pkt[19], // dst
         0,
         proto,
-        (l4.len() >> 8) as u8,
-        l4.len() as u8,
+        (l4_len >> 8) as u8,
+        l4_len as u8,
     ];
     let mut sum = checksum(&pseudo, 0) as u32;
+    let l4 = &mut pkt[ihl..];
     match proto {
         6 if l4.len() >= 18 => {
             l4[16] = 0;
             l4[17] = 0;
             sum = checksum(l4, sum) as u32;
-            l4[16..18].copy_from_slice(&(sum as u16).to_be_bytes());
+            let c = sum as u16;
+            l4[16..18].copy_from_slice(&c.to_be_bytes());
         }
         17 if l4.len() >= 6 => {
             l4[6] = 0;
@@ -159,7 +161,7 @@ fn fix_l4_checksum(pkt: &mut [u8]) {
 }
 
 /// 重写目的地址（NAT 正向：dst → (拦截栈地址, rw_port)）。返回可变整包。
-pub fn rewrite_dst(pkt: &mut Vec<u8>, new_ip: Ipv4Addr, new_port: u16) {
+pub fn rewrite_dst(pkt: &mut [u8], new_ip: Ipv4Addr, new_port: u16) {
     let ihl = (pkt[0] & 0x0f) as usize * 4;
     pkt[16..20].copy_from_slice(&new_ip.octets());
     match pkt[9] {
@@ -172,7 +174,7 @@ pub fn rewrite_dst(pkt: &mut Vec<u8>, new_ip: Ipv4Addr, new_port: u16) {
 }
 
 /// 重写源地址（NAT 反向：src → (orig_dst_ip, orig_dst_port)）。
-pub fn rewrite_src(pkt: &mut Vec<u8>, new_ip: Ipv4Addr, new_port: u16) {
+pub fn rewrite_src(pkt: &mut [u8], new_ip: Ipv4Addr, new_port: u16) {
     let ihl = (pkt[0] & 0x0f) as usize * 4;
     pkt[12..16].copy_from_slice(&new_ip.octets());
     match pkt[9] {
@@ -194,21 +196,23 @@ pub fn build_tcp_rst(input: &Ipv4View<'_>) -> Vec<u8> {
         input.tcp_seq.wrapping_add(input.payload.len() as u32)
     };
     let mut pkt = Vec::with_capacity(40);
-    // IPv4 头
-    pkt.extend_from_slice(&[0x45, 0, 0, 0]);
+    // IPv4 头（20B）：ver/ihl、tos、total 占位、id/flags、ttl、proto=6、校验和占位
+    pkt.extend_from_slice(&[0x45, 0]);
     pkt.extend_from_slice(&40u16.to_be_bytes());
-    pkt.extend_from_slice(&[0, 0, 64, 6, 0, 0]);
+    pkt.extend_from_slice(&[0, 0, 0, 0, 64, 6, 0, 0]);
     pkt.extend_from_slice(&input.dst.octets());
     pkt.extend_from_slice(&input.src.octets());
+    debug_assert_eq!(pkt.len(), 20);
     // TCP 头（20B）：sport=原 dst_port，dport=原 src_port
     pkt.extend_from_slice(&input.dst_port.to_be_bytes());
     pkt.extend_from_slice(&input.src_port.to_be_bytes());
     pkt.extend_from_slice(&seq.to_be_bytes());
     pkt.extend_from_slice(&0u32.to_be_bytes()); // ack = 0
-    pkt.extend_from_slice(&[(5 << 4) as u8, TCP_RST | TCP_ACK]);
+    pkt.extend_from_slice(&[(5 << 4), TCP_RST | TCP_ACK]);
     pkt.extend_from_slice(&0u16.to_be_bytes()); // window
-    pkt[2..4].copy_from_slice(&(pkt.len() as u16).to_be_bytes());
-    // 校验和（借用 rewrite 的算法定义——直接就地算）
+    pkt.extend_from_slice(&0u16.to_be_bytes()); // checksum 占位
+    pkt.extend_from_slice(&0u16.to_be_bytes()); // urgent
+    debug_assert_eq!(pkt.len(), 40);
     fix_ip_checksum(&mut pkt);
     fix_l4_checksum(&mut pkt);
     pkt
@@ -246,17 +250,21 @@ pub fn build_icmp_unreachable(orig: &[u8]) -> Option<Vec<u8>> {
 /// 构造最小 TCP SYN 假包（测试面：驱动 RX 路径的输入形态）。
 pub fn build_tcp_syn(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, seq: u32) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(40);
-    pkt.extend_from_slice(&[0x45, 0, 0, 0]);
+    pkt.extend_from_slice(&[0x45, 0]);
     pkt.extend_from_slice(&40u16.to_be_bytes());
-    pkt.extend_from_slice(&[0, 0, 64, 6, 0, 0]);
+    pkt.extend_from_slice(&[0, 0, 0, 0, 64, 6, 0, 0]);
     pkt.extend_from_slice(&src.octets());
     pkt.extend_from_slice(&dst.octets());
+    debug_assert_eq!(pkt.len(), 20);
     pkt.extend_from_slice(&sport.to_be_bytes());
     pkt.extend_from_slice(&dport.to_be_bytes());
     pkt.extend_from_slice(&seq.to_be_bytes());
     pkt.extend_from_slice(&0u32.to_be_bytes());
-    pkt.extend_from_slice(&[(5 << 4) as u8, TCP_SYN]);
-    pkt.extend_from_slice(&0xFFFFu16.to_be_bytes());
+    pkt.extend_from_slice(&[(5 << 4), TCP_SYN]);
+    pkt.extend_from_slice(&0xFFFFu16.to_be_bytes()); // window
+    pkt.extend_from_slice(&0u16.to_be_bytes()); // checksum 占位
+    pkt.extend_from_slice(&0u16.to_be_bytes()); // urgent
+    debug_assert_eq!(pkt.len(), 40);
     fix_ip_checksum(&mut pkt);
     fix_l4_checksum(&mut pkt);
     pkt
@@ -265,16 +273,18 @@ pub fn build_tcp_syn(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, seq: 
 /// 构造最小 UDP 包（测试面）。
 pub fn build_udp(src: Ipv4Addr, sport: u16, dst: Ipv4Addr, dport: u16, payload: &[u8]) -> Vec<u8> {
     let mut pkt = Vec::with_capacity(28 + payload.len());
-    pkt.extend_from_slice(&[0x45, 0, 0, 0]);
+    pkt.extend_from_slice(&[0x45, 0]);
     pkt.extend_from_slice(&((28 + payload.len()) as u16).to_be_bytes());
-    pkt.extend_from_slice(&[0, 0, 64, 17, 0, 0]);
+    pkt.extend_from_slice(&[0, 0, 0, 0, 64, 17, 0, 0]);
     pkt.extend_from_slice(&src.octets());
     pkt.extend_from_slice(&dst.octets());
+    debug_assert_eq!(pkt.len(), 20);
     pkt.extend_from_slice(&sport.to_be_bytes());
     pkt.extend_from_slice(&dport.to_be_bytes());
     pkt.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
-    pkt.extend_from_slice(&0u16.to_be_bytes());
+    pkt.extend_from_slice(&0u16.to_be_bytes()); // checksum 占位
     pkt.extend_from_slice(payload);
+    debug_assert_eq!(pkt.len(), 28 + payload.len());
     fix_ip_checksum(&mut pkt);
     fix_l4_checksum(&mut pkt);
     pkt
@@ -303,13 +313,20 @@ mod tests {
         assert_eq!(v2.dst, Ipv4Addr::new(100, 64, 255, 1));
         assert_eq!(v2.dst_port, 20001);
         assert_eq!(v2.src_port, 40000);
-        // 反向重写
-        rewrite_src(&mut pkt, Ipv4Addr::new(1, 2, 3, 4), 443);
-        let v3 = Ipv4View::parse(&pkt).unwrap();
+        // 反向重写的对象是**应答包**（src=栈:rw_port）——src 还原为原始目的
+        let mut resp = build_tcp_syn(
+            Ipv4Addr::new(100, 64, 255, 1),
+            20001,
+            Ipv4Addr::new(100, 64, 10, 1),
+            40000,
+            1,
+        );
+        rewrite_src(&mut resp, Ipv4Addr::new(1, 2, 3, 4), 443);
+        let v3 = Ipv4View::parse(&resp).unwrap();
         assert_eq!(
             v3.five_tuple(),
-            (Ipv4Addr::new(100, 64, 10, 1), 40000, Ipv4Addr::new(1, 2, 3, 4), 443),
-            "往返应还原"
+            (Ipv4Addr::new(1, 2, 3, 4), 443, Ipv4Addr::new(100, 64, 10, 1), 40000),
+            "应答的源应还原为原始目的（客户端看到的 src）"
         );
         // IP 头校验和验证（对头部求和应为 0xFFFF 补码后为 0）
         let ihl = 20;
@@ -318,7 +335,7 @@ mod tests {
         // TCP 校验和验证（伪头部 + 段求和为 0）
         let pseudo = [
             pkt[12], pkt[13], pkt[14], pkt[15], pkt[16], pkt[17], pkt[18], pkt[19], 0, 6,
-            (pkt.len() - ihl >> 8) as u8,
+            ((pkt.len() - ihl) >> 8) as u8,
             (pkt.len() - ihl) as u8,
         ];
         let s = checksum(&pkt[ihl..], checksum(&pseudo, 0) as u32);
