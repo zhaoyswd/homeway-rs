@@ -8,11 +8,15 @@ edition.workspace = true
 thiserror.workspace = true
 base64.workspace = true
 sha2.workspace = true
-# R1 数据面消费（noise 握手/TUN 栈）；R0 先就位以验 ring 垫片 [patch] 组装
+hmac.workspace = true
+hkdf.workspace = true
+x25519-dalek.workspace = true
+getrandom.workspace = true
+smoltcp.workspace = true
+# R1 数据面消费（noise 握手）；R0 先就位以验 ring 垫片 [patch] 组装
 boringtun.workspace = true
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
-base64.workspace = true

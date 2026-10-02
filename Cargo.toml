@@ -11,10 +11,15 @@ homeway-core = { path = "crates/homeway-core" }
 thiserror = "2"
 base64 = "0.22"
 sha2 = "0.10"
+hmac = "0.12"
+hkdf = "0.12"
+x25519-dalek = "2.0.0-rc.3"
+getrandom = { version = "0.2", features = ["std"] }
 # boringtun 0.6 钉 ring 0.16（无 OHOS 支持）⇒ 下方 [patch] 换同算法垫片
 # （R0 就位、R1 数据面消费；垫片源码 tools/ring-shim/，配方源自
 #  tier:tools/spikes/rust-ohos-poc/ring-shim/，**依赖组合勿改**——PoC 已实测）
 boringtun = "0.6"
+smoltcp = "0.11"
 
 [patch.crates-io]
 ring = { path = "tools/ring-shim" }

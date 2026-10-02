@@ -8,4 +8,7 @@
 //! - `token`：hmw1 凭证（R0，pkg/proto/token.go 语义）
 //! - 后续：`identity`（R1）、`wtransport`/`wgcore`（R1–R2）、`intercept`（R3）…
 
+pub mod identity;
+pub mod psk;
 pub mod token;
+pub mod tunnel_addr;
