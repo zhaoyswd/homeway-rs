@@ -460,6 +460,10 @@ fn cmd_portfwd(args: &[String]) {
                         let ip = format!("{ip1}.{ip2}.{ip3}").parse().ok();
                         (l.parse().ok(), ip.zip(tport.parse().ok()).map(|(a, p)| SocketAddrV4::new(a, p)))
                     }
+                    [l, ip, tport] => (
+                        l.parse().ok(),
+                        ip.parse().ok().zip(tport.parse().ok()).map(|(a, p)| SocketAddrV4::new(a, p)),
+                    ),
                     _ => (None, None),
                 };
                 match parsed {
