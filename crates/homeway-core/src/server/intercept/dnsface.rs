@@ -35,6 +35,20 @@ const CONN_BUF: usize = 128 * 1024;
 /// UDP 查询面缓冲（代答栈内 socket 的收包粒度）。
 const UDP_RX: usize = 64 * 1024;
 
+/// DNS-over-TCP 的 2B BE 长度前缀纯解析（无 IO；pub = fuzz 可达面）。
+/// `Ok(None)` = 帧未到齐；`mlen == 0` = 空 TCP 消息（Go 判异常收线——返回
+/// `Some(vec![])` 由调用方收线）。
+pub fn decode_tcp_frame(buf: &[u8]) -> Option<Vec<u8>> {
+    if buf.len() < 2 {
+        return None;
+    }
+    let mlen = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+    if buf.len() < 2 + mlen {
+        return None;
+    }
+    Some(buf[2..2 + mlen].to_vec())
+}
+
 /// 应答路由键（tag → 归宿；提交时登记、应答时取走）。
 #[derive(Clone, Copy)]
 pub enum DnsRoute {
@@ -204,21 +218,19 @@ impl DnsFaces {
             loop {
                 let msg = {
                     let Some(c) = face.conns.get_mut(&h) else { break };
-                    if c.rx.len() < 2 {
-                        break;
+                    match decode_tcp_frame(&c.rx) {
+                        None => break,           // 帧未到齐（含 <2B）
+                        Some(m) if m.is_empty() => {
+                            // len=0：Go「空 TCP 消息」判异常收线
+                            sockets.remove(h);
+                            face.conns.remove(&h);
+                            break;
+                        }
+                        Some(m) => {
+                            c.rx.drain(..2 + m.len());
+                            m
+                        }
                     }
-                    let mlen = u16::from_be_bytes([c.rx[0], c.rx[1]]) as usize;
-                    if mlen == 0 {
-                        sockets.remove(h);
-                        face.conns.remove(&h);
-                        break;
-                    }
-                    if c.rx.len() < 2 + mlen {
-                        break;
-                    }
-                    let msg = c.rx[2..2 + mlen].to_vec();
-                    c.rx.drain(..2 + mlen);
-                    msg
                 };
                 let tag = self.route_tag(DnsRoute::Tcp(h));
                 dns.submit_tcp(tag, msg);

@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = ["crates/homeway-core", "crates/homeway-cli"]
+exclude = ["fuzz"]  # fuzz 独立 workspace（nightly + cargo-fuzz；不进 cargo test --workspace——G-10）
 
 [workspace.package]
 version = "0.1.0"

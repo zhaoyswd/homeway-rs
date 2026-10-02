@@ -340,10 +340,10 @@ fn request_payload(role: &str, warmup_ms: u64, window_ms: u64) -> Vec<u8> {
 }
 
 #[derive(Default, Clone, Copy, Debug)]
-struct Report {
-    bytes: i64,
-    warmup_bytes: i64,
-    wall_ms: i64,
+pub struct Report {
+    pub bytes: i64,
+    pub warmup_bytes: i64,
+    pub wall_ms: i64,
 }
 
 /// 顶层逗号切分（引号感知，R2 低-4 补修）：只在双引号外把 `,` 当分隔符——字符串值
@@ -396,7 +396,9 @@ pub(crate) fn unescape_minimal(s: &str) -> String {
     out
 }
 
-fn parse_report(payload: &[u8]) -> Result<Report, SpeedtestError> {    // 极小 JSON 面（三数字 + 可选 error 串）——手解避免 serde_json 进 core（依赖纪律）。
+/// report 帧载荷的手解（pub = fuzz 可达面——服务端回包的自由 JSON 文本面）。
+pub fn parse_report(payload: &[u8]) -> Result<Report, SpeedtestError> {
+    // 极小 JSON 面（三数字 + 可选 error 串）——手解避免 serde_json 进 core（依赖纪律）。
     let s = std::str::from_utf8(payload)
         .map_err(|_| SpeedtestError::Frame("report 非 UTF-8".into()))?;
     let mut r = Report::default();

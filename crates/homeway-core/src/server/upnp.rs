@@ -251,7 +251,9 @@ pub fn ssdp_location(local_ip: Option<Ipv4Addr>) -> Result<String, UpnpError> {
     Err(UpnpError::NoIgdResponse(last_err))
 }
 
-fn header_value(resp: &str, key: &str) -> Option<String> {
+/// HTTP 头域取值（大小写不敏感；pub = fuzz 可达面——SSDP/HTTP 应答的自由文本面，
+/// R3-H4 字节比较整改所在）。
+pub fn header_value(resp: &str, key: &str) -> Option<String> {
     for line in resp.split('\n') {
         let line = line.trim();
         // **按字节比较**（评审 H4：`line[..key.len()]` 在多字节字符中间 panic——
@@ -323,7 +325,8 @@ fn http_call(
     })
 }
 
-fn parse_http_url(url: &str) -> Result<(String, u16, String), UpnpError> {
+/// `http://host[:port]/path` 解析（pub = fuzz 可达面——LOCATION 头的自由文本面）。
+pub fn parse_http_url(url: &str) -> Result<(String, u16, String), UpnpError> {
     let rest = url
         .strip_prefix("http://")
         .ok_or_else(|| UpnpError::BadUrl(url.to_owned()))?;
@@ -376,7 +379,8 @@ fn join_url(base: &str, path: &str) -> String {
     }
 }
 
-fn xml_tag(body: &str, tag: &str) -> Option<String> {
+/// XML 最小取值（`<tag>…</tag>`；pub = fuzz 可达面——描述文件/SOAP body 的自由文本面）。
+pub fn xml_tag(body: &str, tag: &str) -> Option<String> {
     let open = format!("<{tag}>");
     let close = format!("</{tag}>");
     let i = body.find(&open)?;

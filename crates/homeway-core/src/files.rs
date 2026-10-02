@@ -33,6 +33,7 @@ pub const FILES_PORT: u16 = 7802;
 /// 请求行上限（一行 JSON）。
 pub const MAX_REQUEST_LINE: usize = 64 * 1024;
 /// 单帧载荷上限（客户端应遵守）。
+/// 流式帧载荷上限（pub = fuzz 断言可达面）。
 pub const MAX_CHUNK: usize = 256 * 1024;
 /// 协议版本（问候帧 ver）。
 pub const VERSION: i32 = 1;
@@ -296,14 +297,14 @@ impl<'a> Stream<'a> {
             let chunk = self.next_chunk()?;
             self.buf.extend_from_slice(&chunk);
         }
-        let n = u32::from_be_bytes([self.buf[0], self.buf[1], self.buf[2], self.buf[3]]) as usize;
-        if n == 0 {
-            self.buf.drain(..4);
-            return Ok(None);
-        }
-        if n > MAX_CHUNK {
-            return Err(transport(format!("帧长 {n} 超过上限 {MAX_CHUNK}")));
-        }
+        let pre = decode_prefix(&self.buf)?;
+        let n = match pre {
+            Prefix::Terminated => {
+                self.buf.drain(..4);
+                return Ok(None);
+            }
+            Prefix::Frame { len } => len,
+        };
         while self.buf.len() < 4 + n {
             let chunk = self.next_chunk()?;
             self.buf.extend_from_slice(&chunk);
@@ -320,6 +321,31 @@ impl<'a> Stream<'a> {
         frame.extend_from_slice(payload);
         self.write_all(&frame)
     }
+}
+
+/// 4B 前缀帧的纯解析产物（无 IO；fuzz/测试可达面，IO 留在 Stream::read_frame）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum Prefix {
+    /// len=0 终止帧。
+    Terminated,
+    /// 数据帧的载荷长度（到齐判定 = `buf.len() >= 4 + len`）。
+    Frame { len: usize },
+}
+
+/// 解析 4B BE 前缀：`<4B` 报错（调用方补读）；超 `MAX_CHUNK` 报错（Go files 协议
+/// 同上限——对端异常长度的防御面）。
+pub fn decode_prefix(buf: &[u8]) -> Result<Prefix, FilesError> {
+    if buf.len() < 4 {
+        return Err(transport("前缀未到齐（<4B）"));
+    }
+    let n = u32::from_be_bytes([buf[0], buf[1], buf[2], buf[3]]) as usize;
+    if n == 0 {
+        return Ok(Prefix::Terminated);
+    }
+    if n > MAX_CHUNK {
+        return Err(transport(format!("帧长 {n} 超过上限 {MAX_CHUNK}")));
+    }
+    Ok(Prefix::Frame { len: n })
 }
 
 // ---------- 动词（每命令一条流；Client 形态 = 拨号闭包由调用方给） ----------

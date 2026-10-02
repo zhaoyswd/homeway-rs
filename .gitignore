@@ -7,3 +7,11 @@
 *.a
 .DS_Store
 /identity
+
+# fuzz 产物（corpus/artifacts 运行期生成；种子经 gen-fuzz-seeds.sh 展开）
+fuzz/corpus/
+fuzz/corpus.seeds/
+fuzz/artifacts/
+fuzz/target/
+fuzz/coverage/
+fuzz/rust-toolchain.toml.tmpl

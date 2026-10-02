@@ -127,7 +127,9 @@ pub fn respond_ex(req: &[u8], build: &str, flags: u8, endpoints: &[SocketAddr]) 
 }
 
 /// 解析响应（magic/ver/type/nonce 全验；不符返回错误，调用方丢弃）。
-fn decode_response(b: &[u8], nonce: &[u8; 8]) -> io::Result<PingResult> {
+/// 参照点探测应答的纯解析（无 IO；pub = fuzz/向量可达面——unconnected recv_from
+/// 的任意源可喂，flags 字节是自由面）。
+pub fn decode_response(b: &[u8], nonce: &[u8; 8]) -> io::Result<PingResult> {
     if b.len() < 13 || b[0..3] != RESP_MAGIC {
         return Err(io::Error::new(io::ErrorKind::InvalidData, "probe: 不是探测响应"));
     }

@@ -1,0 +1,75 @@
+[package]
+name = "homeway-rs-fuzz"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[package.metadata]
+cargo-fuzz = true
+
+# 独立 workspace（根 Cargo.toml exclude）——fuzz 目标只在 nightly + cargo-fuzz 下构建，
+# 不进 cargo test --workspace（G-10）。[patch.crates-io] 与根一致（依赖组合不漂）。
+[workspace]
+members = ["."]
+
+[dependencies]
+libfuzzer-sys = "0.4"
+homeway-core = { path = "../crates/homeway-core" }
+
+[patch.crates-io]
+ring = { path = "../tools/ring-shim" }
+
+
+[[bin]]
+name = "fuzz_leg_frame"
+path = "fuzz_targets/fuzz_leg_frame.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_relay_ctl"
+path = "fuzz_targets/fuzz_relay_ctl.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_token"
+path = "fuzz_targets/fuzz_token.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_speedtest"
+path = "fuzz_targets/fuzz_speedtest.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_files"
+path = "fuzz_targets/fuzz_files.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_dns"
+path = "fuzz_targets/fuzz_dns.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_inner_pkt"
+path = "fuzz_targets/fuzz_inner_pkt.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_probe"
+path = "fuzz_targets/fuzz_probe.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_upnp"
+path = "fuzz_targets/fuzz_upnp.rs"
+test = false
+doc = false
