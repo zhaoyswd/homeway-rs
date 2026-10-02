@@ -1,0 +1,51 @@
+{
+  "cases": [
+    {
+      "name": "a-backend1",
+      "master": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "peer_id": "1111111111111111111111111111111111111111111111111111111111111111",
+      "private_key": "1ebf5701e608af93bc66b1c50c26b3683e8fc120251fef02bce7b52c07c3ae34",
+      "public_key": "3c98c9c07bf119c8ea650053f532639010563aa1993e85f12073ba1422296f17",
+      "note": "同 master 同后端 = 稳定身份（复用路径）"
+    },
+    {
+      "name": "a-backend2",
+      "master": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "peer_id": "2222222222222222222222222222222222222222222222222222222222222222",
+      "private_key": "db4a1b4800130b2fd2ca8ff5c3a1ae8d9994b88280aeaef14017c80e168583ac",
+      "public_key": "ab9bca523d26e4dd94783c5627e651cdd61f7e6d2d1688f48666091cac60e911",
+      "note": "同 master 换后端 = 换身份（跨出口不可关联）"
+    },
+    {
+      "name": "b-backend1",
+      "master": "f1e2d3c4b5a6978869584a3b2c1d0e0f00112233445566778899aabbccddeeff",
+      "peer_id": "1111111111111111111111111111111111111111111111111111111111111111",
+      "private_key": "48c0537f9a0d82f6f5c7a83eae3bd41bda48482eca1dc7b4ef3e0123d2018366",
+      "public_key": "aeb760ae073a3f07229a23ac7c257cc273c9974703358fa7e5bda859c8efcc52",
+      "note": "换 master（重置身份）换钥匙，后端看到新公钥"
+    },
+    {
+      "name": "smoke-exit-peer",
+      "master": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "peer_id": "7bab5077e7ea7012143e4756372741f341ebb31e5cd4404a81b43324fd511849",
+      "private_key": "5489e07bc3014b202cc066cbd57a4010f3977f2e1156b1d7c3488ef4b35d6efb",
+      "public_key": "bebf2c0041d9f94bd59eac319dcb81f2601cb4be2e635769e14e9f93ed4bdc32",
+      "note": "后端 = 烟囱出口真钥"
+    }
+  ],
+  "comment": "设备身份派生向量。private_key=HKDF-SHA256(master, salt=nil, info=\"tier/dev-id/v1\"‖peerID, 32B)（未钳位）；public_key=curve25519.ScalarBaseMult（钳位在标量乘内部，Rust 侧 x25519 同义）；devTag=HKDF(master, info=\"tier/dev-tag/v1\", 8B)。已交叉验证：LoadOrCreateIdentity 全路径产出与直调一致。语义真源 baseline clientcore/internal/wtransport/identity_store.go。",
+  "devtags": [
+    {
+      "name": "master-00",
+      "master": "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
+      "dev_tag": "1273adaf45f0a411",
+      "short_dev": "1273adaf"
+    },
+    {
+      "name": "master-f1",
+      "master": "f1e2d3c4b5a6978869584a3b2c1d0e0f00112233445566778899aabbccddeeff",
+      "dev_tag": "1f33e66a917ee2ad",
+      "short_dev": "1f33e66a"
+    }
+  ]
+}

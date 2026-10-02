@@ -1,0 +1,43 @@
+# fixtures — golden 夹具与对照向量清单（R0.4）
+
+> **来源纪律**：一切 golden 拷自 baseline 克隆（基线 `621fe0e`，见 `docs/BASELINE.md`）。
+> 升级基线后重拷 + 重跑 `tools/gen-vectors.sh`，diff 非空即语义漂移，必须复核 Rust 侧与判据文档。
+
+## vectors/（生成物，确定性——重跑 diff 应为空）
+
+| 文件 | 族 | 生成方式 |
+|---|---|---|
+| `vectors/token.json` | hmw1 token 编解码 + 三类错误（corrupted/unsupported_version/malformed） | `tools/gen-vectors.sh`（模板 `tools/vector-gen/`，克隆内 `pkg/proto` 真源产出） |
+| `vectors/tunnel_addr.json` | DeriveTunnelIP / DeriveTunIP（含守卫命中样本钉死 hw-app.N 再散列路径） | 同上 |
+| `vectors/identity.json` | master+peerID → WG 私钥/公钥；master → devTag（含 LoadOrCreateIdentity 全路径交叉验证） | 同上（克隆内直调 `clientcore/internal/wtransport` 未导出派生函数） |
+
+## term golden（拷贝，来源 hash 锚定）
+
+| 本仓路径 | 来源（baseline 克隆内） | 用途（R6） | sha256 |
+|---|---|---|---|
+| `term/frames.v1.jsonl` | `pkg/term/testdata/frames.v1.jsonl` | term 协议帧解析 golden（13 案：greeting/hello/…） | `558cc64a0fdc23dde0f8b7c01a306e904e3631e96d8e4cb7691cd1bc947ba662` |
+| `term-vt/session-cjk.bin` | `pkg/term/vt/testdata/session-cjk.bin` | vt 会话回放（CJK） | `5a60ceb2cfaafc566efd595f2835aa772159503364c692e3e179bb9a7e3d6ff8` |
+| `term-vt/session-git-log.bin` | `pkg/term/vt/testdata/session-git-log.bin` | vt 会话回放（git log） | `688c69bafbbfb4eba14f46da4ef8c22fbc93f77318e95b4ce5449723c32a59b3` |
+| `term-vt/session-hexdump.bin` | `pkg/term/vt/testdata/session-hexdump.bin` | vt 会话回放（hexdump） | `c60ffb2e49a6cd09ca565e0de14817ad963801975fb9ca603c51b640fb12d07e` |
+| `term-manifest/codex-startup.txt` | `pkg/term/manifest/testdata/codex-startup.txt` | agent 检测规则证据样本 | `0ca1ff83a06dac22167f05f3ee43443d2c4c3ac2f5fe8ecb071fe5c52d4a31f0` |
+| `term-manifest/opencode-startup.txt` | `pkg/term/manifest/testdata/opencode-startup.txt` | 同上 | `7199a7e94161b4f0e5aa4e1469b29605637778617c85a468947c8b1c15fc61bf` |
+
+## surface golden（拷贝，R6 surface v4 产出端钉字节）
+
+`surface/test/golden/`（C++ 测试的静态 golden：快照 + 差分 + 样式向量）与
+`surface/test/host/surface_input_cases.tsv`（上行输入用例表）整体拷入 `surface-golden/`：
+
+| 本仓路径 | 来源（baseline 克隆内） | sha256 |
+|---|---|---|
+| `surface-golden/manifest.tsv` | `surface/test/golden/manifest.tsv` | `6ec8e50a7926bec06b28033e4385b192d31f4f954af47e9d6a827c97b87278fc` |
+| `surface-golden/session-cjk.bin` / `-diff.bin` | 同名 | `e6af9617a25ca866f71ea5602752f23a59cd1f749b26438b51a61938a5f43bda` / `4279fc1c9c94577963b1e8648bf84dccb67731b24b1cae9b912b99489c48fd46` |
+| `surface-golden/session-git-log.bin` / `-diff.bin` | 同名 | `ed2dc7a2cc53cf18dca19c07abaa3e89ba17e7bbc9753fb1ecb5527a186c04b4` / `9b2b96619a8ebc96a9b4e2c5624c06036a73a75b9db528e75108e6f5c957cafd` |
+| `surface-golden/session-hexdump.bin` / `-diff.bin` | 同名 | `ddc4c098dacd159273cdcdac86bc40c0a75bd9fefb1000a5325dee4cdd2c6745` / `2685218575526e0d838bb8f007be004b9d064a4eef21fbd6540bbc3f282a688c` |
+| `surface-golden/session-styles.bin` / `-diff.bin` | 同名（**样式向量**） | `e2378260132a886f510aca9d6902246775edf2ba5e351294d60cbbb727c029ad` / `3a1b9938073bab46044e0299757413a54d882416d2f59753fb4b9d67fc334510` |
+| `surface-golden/surface_input_cases.tsv` | `surface/test/host/surface_input_cases.tsv`（**上行字节表**用例） | `4a50078f74dd98fb159c6ac537b3254c7b3ee927c6e7010e4593a79c8f964f3b` |
+
+**说明**：`pkg/proto/gen_golden.go` 是 token 向量的一次性生成器（输出钉进 token_test.go），
+与本清单 vectors/ 的持续生成器是两回事。files 帧无静态 testdata（Go 侧 files 契约在测试
+内联断言）；R2 files 客户端对齐时用 `fixtures/vectors` 的 token 族 + 克隆内 Go 测试同款字节构造。
+
+**采集日期**：2026-10-02（R0.4）。

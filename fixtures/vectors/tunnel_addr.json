@@ -1,0 +1,29 @@
+{
+  "cases": [
+    {
+      "name": "secret1-pub-mixed",
+      "secret": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+      "pubkey": "d5cae8cf000000000000000000000000000000000000000000000000000000ff",
+      "tunnel_ip": "100.64.132.190",
+      "tun_ip": "100.64.181.212",
+      "note": "pub 为任意 32B（首 4B 取自烟囱客户端真钥）"
+    },
+    {
+      "name": "secret2-peer1",
+      "secret": "deadbeefcafebabe000000000000000000000000000000000000000000000001",
+      "pubkey": "1111111111111111111111111111111111111111111111111111111111111111",
+      "tunnel_ip": "100.64.216.183",
+      "tun_ip": "100.64.32.62",
+      "note": "secret 与 pubkey 均换"
+    },
+    {
+      "name": "guard-collision-rehash",
+      "secret": "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
+      "pubkey": "0000807800000000000000000000000000000000000000000000000000000000",
+      "tunnel_ip": "100.64.140.211",
+      "tun_ip": "100.64.187.180",
+      "note": "hw-app 与 hw-tun 撞 v ⇒ DeriveTunIP 走 hw-app.N 再散列（守卫路径）"
+    }
+  ],
+  "comment": "隧道地址派生向量。tunnel_ip=HMAC-SHA256(secret,\"hw-tun\"‖pub) 取 sum[0:2] 映射 v∈[1,65534]；tun_ip 同型用 \"hw-app\" 取 sum[2:4]，与 tunnel_ip 撞车时按 hw-app.2..8 标签再散列。地址恒 100.64.(v\u003e\u003e8).v。语义真源 baseline pkg/proto/tunneladdr.go。"
+}
