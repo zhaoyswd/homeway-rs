@@ -1,6 +1,8 @@
 /target
 /baseline
 /bin
+# ⚠️ 下面两条是防大产物误入库的粗门——若将来要把某个 .so/.a 当夹具入库，
+# 须显式 `git add -f` 并同步 fixtures/SHA256SUMS（R0.6 评审 L12 注记）。
 *.so
 *.a
 .DS_Store

@@ -3,6 +3,9 @@
 #
 # ⚠️ 本脚本是隔离条款（ROADMAP）第 2/3 条的**唯一执行面**：客户端/出口 state 全在 /tmp、
 # 端口错开现役 41641、UPnP/STUN 全关、绝不触碰 launchd 与生产 state。改本脚本须复核这四点。
+# 形态注记（R0.6 评审 L10）：出口按本机网卡自报端点 ⇒ token 里带 LAN 端点（如
+# 192.168.3.x:4264n）属**预期**（--bind-interface 只控 WG socket 钉卡，不控端点公布）；
+# 本实例的隔离靠 /tmp state + 错开端口，同机客户端会话竞速择优（通常选中回环端点）。
 #
 # 用法：tools/local-exit.sh <命令> [实例号]
 #   实例号 n 缺省 1；出口 state = /tmp/homeway-rs-exit-n，WG UDP 端口 = 42640+n。
