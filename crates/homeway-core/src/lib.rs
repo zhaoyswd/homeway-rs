@@ -11,6 +11,7 @@
 pub mod go_fmt;
 pub mod identity;
 pub mod psk;
+pub mod speedtest;
 pub mod token;
 pub mod tunnel_addr;
 pub mod wgcore;
