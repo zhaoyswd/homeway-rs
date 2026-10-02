@@ -90,6 +90,7 @@ pub struct Bind {
     last_path_log_at: Option<Instant>,
     rx_bytes: u64,
     tx_bytes: u64,
+    send_errs: u64,
     logf: Arc<dyn Fn(&str) + Send + Sync>,
     /// 发送 scratch（容器帧/腿帧拼装，热路径零分配——吞吐设计位）。
     scratch: Vec<u8>,
@@ -121,6 +122,7 @@ impl Bind {
             last_path_log_at: None,
             rx_bytes: 0,
             tx_bytes: 0,
+            send_errs: 0,
             logf,
             scratch: Vec::with_capacity(2048),
             recv_buf: Box::new([0u8; 65536]),
@@ -142,7 +144,12 @@ impl Bind {
         if let Some(addr) = self.adopted {
             self.scratch.clear();
             frame::encode_frame(FrameKind::Data, wg, &mut self.scratch);
-            self.sock.send_to(&self.scratch, addr).ok();
+            if let Err(e) = self.sock.send_to(&self.scratch, addr) {
+                self.send_errs += 1;
+                if self.send_errs < 10 {
+                    (self.logf)(&format!("wtransport: 发送失败 {addr}: {e}"));
+                }
+            }
             self.tx_bytes += wg.len() as u64;
             return;
         }

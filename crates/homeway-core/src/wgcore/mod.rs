@@ -310,12 +310,19 @@ impl Engine {
             }
             Cmd::Write { id, data, reply } => {
                 let r = match self.conns.get(&id) {
-                    Some(c) => self
-                        .stack
-                        .sockets
-                        .get_mut::<TcpSocket>(c.handle)
-                        .send_slice(&data)
-                        .map_err(|_| ConnErr::Closed),
+                    Some(c) => {
+                        let sock = self.stack.sockets.get_mut::<TcpSocket>(c.handle);
+                        let r = sock.send_slice(&data).map_err(|_| ConnErr::Closed);
+                        if r.is_err() && std::env::var_os("HOMEWAY_WG_DEBUG").is_some() {
+                            eprintln!(
+                                "[wr-debug] write 失败 id={id} state={:?} may_send={} local={:?}",
+                                sock.state(),
+                                sock.may_send(),
+                                sock.local_endpoint()
+                            );
+                        }
+                        r
+                    }
                     None => Err(ConnErr::Closed),
                 };
                 let _ = reply.send(r);
@@ -384,9 +391,9 @@ impl Engine {
 
         for id in ids {
             let Some(c) = self.conns.get_mut(&id) else { continue };
-            let (state, can_recv, is_active) = {
+            let (state, can_recv, may_recv, is_active) = {
                 let s = self.stack.sockets.get_mut::<TcpSocket>(c.handle);
-                (s.state(), s.can_recv(), s.is_active())
+                (s.state(), s.can_recv(), s.may_recv(), s.is_active())
             };
             if state == tcp::State::SynSent || state == tcp::State::SynReceived {
                 c.syn_sent = true;
@@ -430,12 +437,21 @@ impl Engine {
                         buf.truncate(n);
                         reads.push((c.wait_read.take().unwrap(), Ok(buf)));
                     }
-                } else if !is_active {
+                } else if !may_recv || !is_active {
+                    // EOF：对端已关写半（FIN ⇒ may_recv=false，socket 停在 CloseWait 但
+                    // is_active 仍真——只看 is_active 会把 EOF 判成永久等待）或整连接已关
                     reads.push((c.wait_read.take().unwrap(), Err(ConnErr::Closed)));
                 }
             }
-            // 彻底关且无待决：回收槽位（TIME_WAIT 由 poll 推进至 Closed 后回收，评审 ③-8）
-            if state == tcp::State::Closed && c.wait_est.is_none() && c.wait_read.is_none() {
+            // 对端半关、缓冲已排空且无待决读：本地补 FIN 推进到 Closed（槽位回收前提；
+            // smoltcp 语义——CloseWait 不会自发迁移，应用层看到 EOF 后须 close。
+            // **必须等缓冲排空**：数据+FIN 先于读命令到达时，缓冲里的数据尚未消费）
+            if !may_recv && !can_recv && state == tcp::State::CloseWait && c.wait_read.is_none() {
+                self.stack.sockets.get_mut::<TcpSocket>(c.handle).close();
+            }
+            // 彻底关、缓冲排空且无待决：回收槽位（TIME_WAIT 由 poll 推进至 Closed 后
+            // 回收，评审 ③-8；can_recv 兜「Closed 但缓冲还有数据」的窗口）
+            if state == tcp::State::Closed && !can_recv && c.wait_est.is_none() && c.wait_read.is_none() {
                 reap.push(c.handle);
             }
         }

@@ -178,13 +178,19 @@ impl StackB {
             .routes_mut()
             .add_default_ipv4_route(Ipv4Address::from_bytes(&server_tunnel_ip.octets()))
             .expect("路由表默认空，必成功");
+        // ephemeral 端口基址**每次装配随机**（对齐内核随机端口语义）：确定性起点会让
+        // 同身份跨进程重连复用同四元组，撞上出口 gVisor 拦截层尚在 idle 等待的半开
+        // 连接（它用旧 seq 回 SYN-ACK，新 socket 判非法丢弃 ⇒ 建连超时；2026-10-02
+        // 实测定位——同身份第二次连接必现、换身份即愈）
+        let mut rnd = [0u8; 2];
+        getrandom::getrandom(&mut rnd).expect("系统随机源不可用");
         Self {
             iface,
             sockets: SocketSet::new(vec![]),
             device,
             tunnel_ip,
             dropped_not_for_b: 0,
-            next_local_port: 32768 + (tunnel_ip.octets()[3] as u16) % 16384,
+            next_local_port: 32768 + u16::from_le_bytes(rnd) % 16384,
         }
     }
 

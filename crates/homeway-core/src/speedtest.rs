@@ -182,11 +182,20 @@ impl Frame {
 
 fn write_all(client: &Client, id: u64, data: &[u8]) -> Result<(), SpeedtestError> {
     let mut off = 0;
+    let mut zero_streak = 0u32;
     while off < data.len() {
         let n = client.write(id, data[off..].to_vec())?;
         if n == 0 {
-            return Err(SpeedtestError::Frame("写通道关闭".into()));
+            // Ok(0) = 发送缓冲满（部分写语义）：立即重试——RPC 往返（引擎 poll 驱动 ACK
+            // 排空）本身就是背压节拍；百万次零进展（≈数十秒无 ACK）才判死
+            zero_streak += 1;
+            if zero_streak > 1_000_000 {
+                return Err(SpeedtestError::Frame("写通道长时间无进展".into()));
+            }
+            std::thread::yield_now();
+            continue;
         }
+        zero_streak = 0;
         off += n;
     }
     Ok(())
@@ -198,60 +207,69 @@ enum FrameIn {
     Other { typ: u8, payload: Vec<u8> },
 }
 
-/// 读一帧（按头分派：data 载荷零消耗丢弃；其它帧载荷带回并校验 crc）。
-fn read_frame(client: &Client, id: u64) -> Result<FrameIn, SpeedtestError> {
-    let header = read_exact::<HEADER>(client, id)?;
-    if header[..4] != MAGIC {
-        return Err(SpeedtestError::Frame(
-            "帧魔数不符（流已错位或非 speedtest 服务）".into(),
-        ));
-    }
-    let typ = header[4];
-    let len = u16::from_le_bytes([header[9], header[10]]) as usize;
-    let crc = u32::from_le_bytes([header[11], header[12], header[13], header[14]]);
-    if typ == TYPE_DATA {
-        let mut remain = len;
-        while remain > 0 {
-            let chunk = client.read(id)?;
-            if chunk.is_empty() {
-                return Err(SpeedtestError::Frame("data 载荷被截断".into()));
-            }
-            remain = remain.saturating_sub(chunk.len());
-        }
-        if crc != zero_crc(len) {
-            return Err(SpeedtestError::Frame("data 帧 crc 不符".into()));
-        }
-        return Ok(FrameIn::Data { payload_len: len });
-    }
-    let mut payload = Vec::with_capacity(len);
-    let mut remain = len;
-    while remain > 0 {
-        let chunk = client.read(id)?;
-        if chunk.is_empty() {
-            return Err(SpeedtestError::Frame("控制帧载荷被截断".into()));
-        }
-        remain -= chunk.len().min(remain);
-        payload.extend_from_slice(&chunk);
-    }
-    if crc != crc32_ieee(&payload) {
-        return Err(SpeedtestError::Frame("帧 crc 不符".into()));
-    }
-    Ok(FrameIn::Other { typ, payload })
+
+
+/// 流式帧读取器（TCP 是字节流：块边界 ≠ 帧边界——读进内部缓冲后按帧解析；
+/// data 帧载荷不拷出（下行计数按头长度），控制帧载荷带回）。
+struct FrameReader {
+    buf: Vec<u8>,
 }
 
-fn read_exact<const N: usize>(client: &Client, id: u64) -> Result<[u8; N], SpeedtestError> {
-    let mut out = [0u8; N];
-    let mut off = 0;
-    while off < N {
-        let chunk = client.read(id)?;
-        if chunk.is_empty() {
-            return Err(SpeedtestError::Frame("流在帧中途关闭".into()));
-        }
-        let n = chunk.len().min(N - off);
-        out[off..off + n].copy_from_slice(&chunk[..n]);
-        off += n;
+impl FrameReader {
+    fn new() -> Self {
+        Self { buf: Vec::with_capacity(128 * 1024) }
     }
-    Ok(out)
+
+    /// 读一帧：内部缓冲不足时从连接补读。
+    fn read_frame(&mut self, client: &Client, id: u64) -> Result<FrameIn, SpeedtestError> {
+        loop {
+            if let Some(f) = self.try_parse()? {
+                return Ok(f);
+            }
+            let chunk = client.read(id)?;
+            if chunk.is_empty() {
+                return Err(SpeedtestError::Frame("流在帧中途关闭".into()));
+            }
+            self.buf.extend_from_slice(&chunk);
+        }
+    }
+
+    /// 缓冲够一帧则解析并消费；否则 None。
+    fn try_parse(&mut self) -> Result<Option<FrameIn>, SpeedtestError> {
+        if self.buf.len() < HEADER {
+            return Ok(None);
+        }
+        if self.buf[..4] != MAGIC {
+            return Err(SpeedtestError::Frame(
+                "帧魔数不符（流已错位或非 speedtest 服务）".into(),
+            ));
+        }
+        let typ = self.buf[4];
+        let len = u16::from_le_bytes([self.buf[9], self.buf[10]]) as usize;
+        let crc = u32::from_le_bytes([
+            self.buf[11],
+            self.buf[12],
+            self.buf[13],
+            self.buf[14],
+        ]);
+        if self.buf.len() < HEADER + len {
+            return Ok(None); // 帧未到齐
+        }
+        if typ == TYPE_DATA {
+            // crc 盖全零载荷（按长度缓存）；载荷原地丢弃（缓冲前移由 drain 完成）
+            if crc != zero_crc(len) {
+                return Err(SpeedtestError::Frame("data 帧 crc 不符".into()));
+            }
+            self.buf.drain(..HEADER + len);
+            return Ok(Some(FrameIn::Data { payload_len: len }));
+        }
+        let payload = self.buf[HEADER..HEADER + len].to_vec();
+        if crc != crc32_ieee(&payload) {
+            return Err(SpeedtestError::Frame("帧 crc 不符".into()));
+        }
+        self.buf.drain(..HEADER + len);
+        Ok(Some(FrameIn::Other { typ, payload }))
+    }
 }
 
 /// 请求帧载荷（JSON，Go requestJSON 同形）。
@@ -346,8 +364,9 @@ pub fn run(client: &Client, params: Params, logf: &dyn Fn(&str)) -> Result<Speed
                 s.spawn(move || -> Result<(i64, i64, i64, i64), SpeedtestError> {
                     let (mut got, mut used) = (0i64, 0i64);
                     let (sb, sw): (i64, i64);
+                    let mut fr = FrameReader::new();
                     loop {
-                        match read_frame(client, id)? {
+                        match fr.read_frame(client, id)? {
                             FrameIn::Data { payload_len } => {
                                 if Instant::now() >= window_start {
                                     got += payload_len as i64;
@@ -413,7 +432,9 @@ pub fn run(client: &Client, params: Params, logf: &dyn Fn(&str)) -> Result<Speed
                     write_all(client, id, f.control(TYPE_START, &[]))?;
                     let win = pump(client, id, &mut f, p.up)?;
                     write_all(client, id, f.control(TYPE_FINISH, &[]))?;
-                    let (used, bytes, wall) = match read_frame(client, id)? {
+                    let (used, bytes, wall) = {
+                        let mut fr = FrameReader::new();
+                        match fr.read_frame(client, id)? {
                         FrameIn::Other { typ, payload } if typ == TYPE_REPORT => {
                             let rep = parse_report(&payload)?;
                             (warm + win, rep.bytes, rep.wall_ms)
@@ -421,8 +442,9 @@ pub fn run(client: &Client, params: Params, logf: &dyn Fn(&str)) -> Result<Speed
                         FrameIn::Other { typ, .. } => {
                             return Err(SpeedtestError::Frame(format!("窗口期收到类型 {typ}")))
                         }
-                        FrameIn::Data { .. } => {
-                            return Err(SpeedtestError::Frame("收口期收到 data 帧".into()))
+                            FrameIn::Data { .. } => {
+                                return Err(SpeedtestError::Frame("收口期收到 data 帧".into()))
+                            }
                         }
                     };
                     Ok((used, bytes, wall))

@@ -247,7 +247,7 @@ fn cmd_connect(args: &[String]) {
 
 /// 经隧道拨任意 v4 目标（transit 判据产出步骤）：建连 → 读到对端数据或 EOF 即证通。
 fn transit_dial(client: &Client, dst: SocketAddrV4) -> Result<usize, String> {
-    let id = client.connect(dst).map_err(|e| format!("{e}"))?;
+    let id = client.connect(dst).map_err(|e| format!("connect: {e}"))?;
     let mut got = 0usize;
     // 读循环：拿到字节或对端关闭即收（nc 之类回声/静默服务都兼容）
     for _ in 0..16 {
@@ -263,7 +263,7 @@ fn transit_dial(client: &Client, dst: SocketAddrV4) -> Result<usize, String> {
             }
             Err(e) => {
                 let _ = client.close(id);
-                return Err(format!("{e}"));
+                return Err(format!("read: {e}"));
             }
         }
     }
