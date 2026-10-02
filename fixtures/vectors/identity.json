@@ -33,7 +33,7 @@
       "note": "后端 = 烟囱出口真钥"
     }
   ],
-  "comment": "设备身份派生向量。private_key=HKDF-SHA256(master, salt=nil, info=\"tier/dev-id/v1\"‖peerID, 32B)（未钳位）；public_key=curve25519.ScalarBaseMult（钳位在标量乘内部，Rust 侧 x25519 同义）；devTag=HKDF(master, info=\"tier/dev-tag/v1\", 8B)。已交叉验证：LoadOrCreateIdentity 全路径产出与直调一致。语义真源 baseline clientcore/internal/wtransport/identity_store.go。",
+  "comment": "设备身份派生向量。private_key=HKDF-SHA256(master, salt=nil, info=\"tier/dev-id/v1\"‖peerID, 32B)（未钳位）；public_key=curve25519.ScalarBaseMult（钳位在标量乘内部，Rust 侧 x25519 同义）；devTag=HKDF(master, info=\"tier/dev-tag/v1\", 8B)。已交叉验证：LoadOrCreateIdentity 全路径产出与直调派生一致。语义真源 baseline clientcore/internal/wtransport/identity_store.go。",
   "devtags": [
     {
       "name": "master-00",

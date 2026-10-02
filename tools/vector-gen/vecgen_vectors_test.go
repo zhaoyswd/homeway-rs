@@ -372,6 +372,39 @@ func genIdentityCases(t *testing.T) (ids []vecIdentityCase, tags []vecDevTagCase
 	return ids, tags
 }
 
+// ---- psk 族（R1 技术评审 S1：PSK 在 WG 握手热路径，派生错 = AEAD tag 失败，须向量钉死）----
+
+type vecPskCase struct {
+	Name   string `json:"name"`
+	Secret string `json:"secret"` // hex 32B（token 的 Secret）
+	Psk    string `json:"psk"`    // hex 32B = HKDF-SHA256(ikm=secret, salt=nil, info="homeway/wg-psk", 32)
+	Note   string `json:"note,omitempty"`
+}
+
+func genPskCases(t *testing.T) []vecPskCase {
+	specs := []struct {
+		name string
+		sec  []byte
+		note string
+	}{
+		{"secret1-sequential", vecSecret1, "顺序字节 secret（与隧道地址族共用材料，便于交叉核对）"},
+		{"secret2-patterned", vecSecret2, "图案 secret"},
+		{"all-zero-not-applicable-guard", nil, ""}, // 占位剔除：全零 secret 不合法（token 层已拒），不产向量
+	}
+	out := make([]vecPskCase, 0, len(specs))
+	for _, sp := range specs {
+		if sp.sec == nil {
+			continue
+		}
+		psk := proto.DerivePSK(vecH32(sp.sec))
+		out = append(out, vecPskCase{sp.name, hex.EncodeToString(sp.sec), hex.EncodeToString(psk[:]), sp.note})
+	}
+	if len(out) == 0 {
+		t.Fatal("psk 向量为空")
+	}
+	return out
+}
+
 // ---- 输出 ----
 
 func vecWriteJSON(t *testing.T, path string, v any) {
@@ -416,9 +449,13 @@ func TestVecgenVectors(t *testing.T) {
 	})
 	ids, tags := genIdentityCases(t)
 	vecWriteJSON(t, filepath.Join(out, "identity.json"), map[string]any{
-		"comment": "设备身份派生向量。private_key=HKDF-SHA256(master, salt=nil, info=\"tier/dev-id/v1\"‖peerID, 32B)（未钳位）；public_key=curve25519.ScalarBaseMult（钳位在标量乘内部，Rust 侧 x25519 同义）；devTag=HKDF(master, info=\"tier/dev-tag/v1\", 8B)。已交叉验证：LoadOrCreateIdentity 全路径产出与直调一致。语义真源 baseline clientcore/internal/wtransport/identity_store.go。",
+		"comment": "设备身份派生向量。private_key=HKDF-SHA256(master, salt=nil, info=\"tier/dev-id/v1\"‖peerID, 32B)（未钳位）；public_key=curve25519.ScalarBaseMult（钳位在标量乘内部，Rust 侧 x25519 同义）；devTag=HKDF(master, info=\"tier/dev-tag/v1\", 8B)。已交叉验证：LoadOrCreateIdentity 全路径产出与直调派生一致。语义真源 baseline clientcore/internal/wtransport/identity_store.go。",
 		"cases":   ids,
 		"devtags": tags,
+	})
+	vecWriteJSON(t, filepath.Join(out, "psk.json"), map[string]any{
+		"comment": "WG PSK 派生向量。psk=HKDF-SHA256(ikm=token.secret, salt=nil, info=\"homeway/wg-psk\", 32B)；客户端 peer 配置与出口 peer 登记共用本派生（握手 psk2 混入）。语义真源 baseline pkg/proto/psk.go。",
+		"cases":   genPskCases(t),
 	})
 	fmt.Println("==> 完成。")
 }
