@@ -1,0 +1,791 @@
+//! wgcore：WG 数据面引擎（boringtun noise + 栈 B + wtransport Bind 的装配与驱动）。
+//!
+//! 对齐 Go 侧 `clientcore/internal/wgcore`（core.go + hub.go）的 R1 子集（设计文档
+//! §1/§3/§4）：
+//! - **单驱动线程**独占 Tunn + Interface + UDP socket（无锁热路径）；主线程经
+//!   unbounded 命令通道投递请求、经各自 reply 通道收结果（三条死锁纪律：命令通道
+//!   unbounded / WG 线程不阻塞在 channel / 不持锁跨等待）；
+//! - **三唤醒源**：`poll(2)` on {UDP fd, self-pipe}，超时 = `min(poll_delay, 250ms)`
+//!   （延迟 ACK 10ms 等栈定时器不迟到）；
+//! - reg 搭车收口 = `Bind::send_wg`（四来源全覆盖）；expired → **一次性**重建 Tunn
+//!   （新随机 index 前缀 <2^24）+ 补注册，**保采纳**（= Go 恢复阶梯 R1 档「补注册 +
+//!   丢会话保采纳」的最小兜底——比设计文档 v2 登记的「丢采纳」更贴 Go，按实现修正；
+//!   阶梯档位/节拍整体属 R2）；
+//! - 静默丢包类 `WireGuardError` 计数继续，`ConnectionExpired` 才重建（评审 ②-9）；
+//! - `decapsulate` 返回 `WriteToNetwork` 后以**空数据报重调**到 Done（冲掉握手期排队
+//!   的内层包与握手响应 keepalive——评审 ③-7）。
+
+use std::collections::HashMap;
+use std::io::{self, Write as _};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+use std::os::fd::AsRawFd;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::mpsc::{self, Sender};
+use std::sync::{Arc, Mutex};
+use std::thread::{self, JoinHandle};
+use std::time::{Duration, Instant};
+
+use boringtun::noise::errors::WireGuardError;
+use boringtun::noise::{Tunn, TunnResult};
+use boringtun::x25519::StaticSecret;
+use smoltcp::socket::tcp::{self, Socket as TcpSocket};
+use smoltcp::iface::SocketHandle;
+use smoltcp::time::Instant as SmolInstant;
+
+use crate::identity::Identity;
+use crate::psk::Psk;
+use crate::token::{PeerId, Secret};
+use crate::tunnel_addr;
+use crate::wtransport::{Bind, Candidate, RegCtx, Via};
+
+mod stackb;
+
+use self::stackb::{DialError, StackB};
+
+/// 出口隧道 IP 的契约常量（两端共同，dns-host-resolver 起钉死；非 token 派生）。
+pub const SERVER_TUNNEL_IP: Ipv4Addr = Ipv4Addr::new(100, 64, 255, 1);
+/// poll 等待上限（smoltcp poll_delay 的封顶；延迟 ACK 10ms 一类栈定时器的到点保障）。
+const POLL_CAP: i32 = 250;
+/// WG 网络包缓冲上界（握手 148 / 数据 = 明文 + 32B 开销）。
+const WG_BUF: usize = 65536 + 148;
+/// 连接的建立期限（engine 侧；主线程另有自己的 RPC 超时）。
+#[cfg(not(test))]
+const CONNECT_DEADLINE: Duration = Duration::from_secs(10);
+#[cfg(test)]
+const CONNECT_DEADLINE: Duration = Duration::from_millis(400);
+
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum ConnErr {
+    #[error("连接被拒（对端 RST）")]
+    Refused,
+    #[error("连接超时")]
+    Timeout,
+    #[error("连接已关闭")]
+    Closed,
+    #[error("通道已断（引擎收工）")]
+    EngineGone,
+    #[error(transparent)]
+    Dial(#[from] DialError),
+}
+
+/// 主线程 → 驱动线程的命令（全部非阻塞投递；带 reply 的由驱动线程在事件到点时应答）。
+pub enum Cmd {
+    Connect {
+        id: u64,
+        dst: SocketAddrV4,
+        reply: Sender<Result<(), ConnErr>>,
+    },
+    Write {
+        id: u64,
+        data: Vec<u8>,
+        reply: Sender<Result<usize, ConnErr>>,
+    },
+    Read {
+        id: u64,
+        reply: Sender<Result<Vec<u8>, ConnErr>>,
+    },
+    /// 半关（FIN；对端仍可发）。
+    Shutdown {
+        id: u64,
+        reply: Sender<Result<(), ConnErr>>,
+    },
+    Close {
+        id: u64,
+        reply: Sender<Result<(), ConnErr>>,
+    },
+    RefreshReg,
+    Stop,
+}
+
+/// 引擎状态快照（主线程轮询；驱动线程独占写）。
+#[derive(Debug, Clone, Default)]
+pub struct Snapshot {
+    pub via: Via,
+    pub ep: Option<SocketAddr>,
+    pub mirrored: u64,
+    pub rx: u64,
+    pub tx: u64,
+}
+
+pub struct CoreConfig {
+    pub peer_id: PeerId,
+    pub secret: Secret,
+    pub identity: Identity,
+    pub candidates: Vec<Candidate>,
+    pub logf: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+struct Conn {
+    handle: SocketHandle,
+    syn_sent: bool,
+    local_aborted: bool,
+    established: bool,
+    deadline: Instant,
+    wait_est: Option<Sender<Result<(), ConnErr>>>,
+    wait_read: Option<Sender<Result<Vec<u8>, ConnErr>>>,
+}
+
+fn make_tunn(identity_key: &StaticSecret, secret: &Secret, peer_pub: &[u8; 32]) -> Tunn {
+    Tunn::new(
+        identity_key.clone(),
+        boringtun::x25519::PublicKey::from(*peer_pub),
+        Some(*Psk::from(*secret).as_bytes()),
+        None, // persistent_keepalive：对齐 Go 客户端（不设；保活 = probe 拍）
+        rand_index(),
+        None, // rate_limiter 勿改——Some 会让客户端对出口握手应答回 cookie（§2 勿改清单）
+    )
+    .expect("参数恒合法（dalek 钥/PSK 构造期已验）")
+}
+
+fn rand_index() -> u32 {
+    let mut b = [0u8; 4];
+    getrandom::getrandom(&mut b).expect("系统随机源不可用");
+    u32::from_le_bytes(b) & 0x00ff_ffff // < 2^24：Tunn 内部 <<8 丢高位（评审 ②-2）
+}
+
+/// 引擎主体（驱动线程内独占）。
+struct Engine {
+    bind: Bind,
+    tunn: Tunn,
+    stack: StackB,
+    conns: HashMap<u64, Conn>,
+    wg_buf: Vec<u8>,
+    cmd_rx: mpsc::Receiver<Cmd>,
+    snapshot: Arc<Mutex<Snapshot>>,
+    logf: Arc<dyn Fn(&str) + Send + Sync>,
+    identity_key: StaticSecret,
+    secret: Secret,
+    peer_id: PeerId,
+    /// expired 重建执行位（一次性；避免每拍重建——update_timers 过期后每 tick 回错）。
+    expired_pending: bool,
+    silent_drops: u64,
+    time0: Instant,
+}
+
+impl Engine {
+    fn now_smol(&self) -> SmolInstant {
+        SmolInstant::from_millis(self.time0.elapsed().as_millis() as i64)
+    }
+
+    /// ConnectionExpired 的**一次性**重建：新随机 index 前缀 + 新 Tunn + 补注册，
+    /// 保采纳（对齐 Go 恢复阶梯 R1 档的最小兜底；见模块注释）。
+    fn rebuild_tunn_once(&mut self) {
+        if self.expired_pending {
+            return;
+        }
+        self.expired_pending = true;
+        self.tunn = make_tunn(&self.identity_key, &self.secret, self.peer_id.as_bytes());
+        (self.logf)("wgcore: 会话过期已重建（丢会话保采纳）—— 补注册");
+        self.bind.refresh_reg();
+    }
+
+    /// 单轮驱动：命令 → UDP 批量收 → 栈 poll → TX 出队封装 → 定时器 → 待决结算。
+    /// 返回 false = 收到 Stop。
+    fn pump_once(&mut self, udp_buf: &mut [u8]) -> bool {
+        while let Ok(cmd) = self.cmd_rx.try_recv() {
+            if !self.handle_cmd(cmd) {
+                return false;
+            }
+        }
+        self.drain_udp(udp_buf);
+        let now = self.now_smol();
+        self.stack
+            .iface
+            .poll(now, &mut self.stack.device, &mut self.stack.sockets);
+        let mut tx: Vec<Vec<u8>> = Vec::new();
+        self.stack.device.drain_tx(&mut tx);
+        for pkt in &tx {
+            self.encap_send(pkt);
+        }
+        self.timer_tick();
+        self.resolve_pending();
+        self.update_snapshot();
+        true
+    }
+
+    fn drain_udp(&mut self, buf: &mut [u8]) {
+        loop {
+            match self.bind.recv_from(buf) {
+                Ok(Some(n)) => {
+                    let src_ip = self.bind.adopted().map(|a| match a {
+                        SocketAddr::V4(v4) => IpAddr::V4(*v4.ip()),
+                        SocketAddr::V6(v6) => IpAddr::V6(*v6.ip()),
+                    });
+                    self.decapsulate_in(src_ip, &buf[..n]);
+                }
+                Ok(None) => continue,
+                Err(e)
+                    if e.kind() == io::ErrorKind::WouldBlock
+                        || e.kind() == io::ErrorKind::TimedOut =>
+                {
+                    return;
+                }
+                Err(_) => {
+                    self.silent_drops += 1;
+                    return;
+                }
+            }
+        }
+    }
+
+    /// decapsulate + 空数据报重调协议（WriteToNetwork 后以空输入重调到 Done）。
+    fn decapsulate_in(&mut self, src_ip: Option<IpAddr>, datagram: &[u8]) {
+        let src_ip = src_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
+        self.wg_buf.clear();
+        self.wg_buf.resize(WG_BUF, 0);
+        match self.tunn.decapsulate(Some(src_ip), datagram, &mut self.wg_buf) {
+            TunnResult::WriteToNetwork(w) => {
+                self.bind.send_wg(w);
+                loop {
+                    self.wg_buf.clear();
+                    self.wg_buf.resize(WG_BUF, 0);
+                    match self.tunn.decapsulate(Some(src_ip), &[], &mut self.wg_buf) {
+                        TunnResult::WriteToNetwork(w2) => self.bind.send_wg(w2),
+                        TunnResult::Err(WireGuardError::ConnectionExpired) => {
+                            self.rebuild_tunn_once();
+                            break;
+                        }
+                        TunnResult::Err(_) => {
+                            self.silent_drops += 1;
+                            break;
+                        }
+                        _ => break,
+                    }
+                }
+            }
+            TunnResult::WriteToTunnelV4(pkt, _) => {
+                self.expired_pending = false; // 明文包到达 = 会话活着
+                self.stack.inject(pkt);
+            }
+            TunnResult::WriteToTunnelV6(_, _) => {} // 内层只承载 IPv4（D4）
+            TunnResult::Done => {}
+            TunnResult::Err(WireGuardError::ConnectionExpired) => self.rebuild_tunn_once(),
+            TunnResult::Err(_) => {
+                self.silent_drops += 1; // 静默丢包类：计数继续（评审 ②-9）
+            }
+        }
+    }
+
+    fn encap_send(&mut self, pkt: &[u8]) {
+        self.wg_buf.clear();
+        self.wg_buf.resize(WG_BUF, 0);
+        match self.tunn.encapsulate(pkt, &mut self.wg_buf) {
+            TunnResult::WriteToNetwork(w) => self.bind.send_wg(w),
+            TunnResult::Err(WireGuardError::ConnectionExpired) => self.rebuild_tunn_once(),
+            TunnResult::Err(_) => {
+                self.silent_drops += 1;
+            }
+            _ => {}
+        }
+    }
+
+    fn timer_tick(&mut self) {
+        self.wg_buf.clear();
+        self.wg_buf.resize(WG_BUF, 0);
+        match self.tunn.update_timers(&mut self.wg_buf) {
+            TunnResult::WriteToNetwork(w) => self.bind.send_wg(w),
+            TunnResult::Err(WireGuardError::ConnectionExpired) => self.rebuild_tunn_once(),
+            TunnResult::Err(_) => {
+                self.silent_drops += 1;
+            }
+            _ => {}
+        }
+    }
+
+    /// 返回 false = 收到 Stop。
+    fn handle_cmd(&mut self, cmd: Cmd) -> bool {
+        match cmd {
+            Cmd::Connect { id, dst, reply } => {
+                match self.start_conn(id, dst) {
+                    Ok(()) => {
+                        if let Some(c) = self.conns.get_mut(&id) {
+                            c.wait_est = Some(reply);
+                        }
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                }
+            }
+            Cmd::Write { id, data, reply } => {
+                let r = match self.conns.get(&id) {
+                    Some(c) => self
+                        .stack
+                        .sockets
+                        .get_mut::<TcpSocket>(c.handle)
+                        .send_slice(&data)
+                        .map_err(|_| ConnErr::Closed),
+                    None => Err(ConnErr::Closed),
+                };
+                let _ = reply.send(r);
+            }
+            Cmd::Read { id, reply } => match self.conns.get_mut(&id) {
+                Some(c) => c.wait_read = Some(reply),
+                None => {
+                    let _ = reply.send(Err(ConnErr::Closed));
+                }
+            },
+            Cmd::Shutdown { id, reply } => {
+                let r = match self.conns.get(&id) {
+                    Some(c) => {
+                        self.stack.sockets.get_mut::<TcpSocket>(c.handle).close();
+                        Ok(())
+                    }
+                    None => Err(ConnErr::Closed),
+                };
+                let _ = reply.send(r);
+            }
+            Cmd::Close { id, reply } => {
+                let r = match self.conns.get_mut(&id) {
+                    Some(c) => {
+                        self.stack.sockets.get_mut::<TcpSocket>(c.handle).abort();
+                        c.local_aborted = true;
+                        Ok(())
+                    }
+                    None => Err(ConnErr::Closed),
+                };
+                let _ = reply.send(r);
+            }
+            Cmd::RefreshReg => {
+                self.bind.refresh_reg();
+            }
+            Cmd::Stop => return false,
+        }
+        true
+    }
+
+    fn start_conn(&mut self, id: u64, dst: SocketAddrV4) -> Result<(), ConnErr> {
+        let handle = self.stack.connect(dst)?;
+        self.conns.insert(
+            id,
+            Conn {
+                handle,
+                syn_sent: false,
+                local_aborted: false,
+                established: false,
+                deadline: Instant::now() + CONNECT_DEADLINE,
+                wait_est: None,
+                wait_read: None,
+            },
+        );
+        Ok(())
+    }
+
+    /// 每轮结算：建立/超时/refused/读数据/EOF + Closed 槽位回收。
+    fn resolve_pending(&mut self) {
+        let now = Instant::now();
+        let ids: Vec<u64> = self.conns.keys().copied().collect();
+        type EstReply = (Sender<Result<(), ConnErr>>, Result<(), ConnErr>);
+        type ReadReply = (Sender<Result<Vec<u8>, ConnErr>>, Result<Vec<u8>, ConnErr>);
+        let mut est: Vec<EstReply> = Vec::new();
+        let mut reads: Vec<ReadReply> = Vec::new();
+        let mut reap: Vec<SocketHandle> = Vec::new();
+
+        for id in ids {
+            let Some(c) = self.conns.get_mut(&id) else { continue };
+            let (state, can_recv, is_active) = {
+                let s = self.stack.sockets.get_mut::<TcpSocket>(c.handle);
+                (s.state(), s.can_recv(), s.is_active())
+            };
+            if state == tcp::State::SynSent || state == tcp::State::SynReceived {
+                c.syn_sent = true;
+            }
+            // 建立
+            if !c.established && state == tcp::State::Established {
+                c.established = true;
+                if let Some(tx) = c.wait_est.take() {
+                    est.push((tx, Ok(())));
+                }
+            }
+            // 超时（未建立且过期限）：本地 abort（断 SYN 重传）+ Timeout
+            if !c.established && now > c.deadline {
+                self.stack.sockets.get_mut::<TcpSocket>(c.handle).abort();
+                c.local_aborted = true;
+                if let Some(tx) = c.wait_est.take() {
+                    est.push((tx, Err(ConnErr::Timeout)));
+                }
+            }
+            // refused：SynSent→Closed 且非本地 abort/超时打断 = 对端 RST（会话活着）
+            if !c.established
+                && c.syn_sent
+                && state == tcp::State::Closed
+                && !c.local_aborted
+                && c.wait_est.is_some()
+            {
+                let tx = c.wait_est.take().unwrap();
+                est.push((tx, Err(ConnErr::Refused)));
+            }
+            // 读结算
+            if c.wait_read.is_some() {
+                if can_recv {
+                    let mut buf = vec![0u8; 64 * 1024];
+                    let n = self
+                        .stack
+                        .sockets
+                        .get_mut::<TcpSocket>(c.handle)
+                        .recv_slice(&mut buf)
+                        .unwrap_or(0);
+                    if n > 0 {
+                        buf.truncate(n);
+                        reads.push((c.wait_read.take().unwrap(), Ok(buf)));
+                    }
+                } else if !is_active {
+                    reads.push((c.wait_read.take().unwrap(), Err(ConnErr::Closed)));
+                }
+            }
+            // 彻底关且无待决：回收槽位（TIME_WAIT 由 poll 推进至 Closed 后回收，评审 ③-8）
+            if state == tcp::State::Closed && c.wait_est.is_none() && c.wait_read.is_none() {
+                reap.push(c.handle);
+            }
+        }
+
+        for (tx, r) in est {
+            let _ = tx.send(r);
+        }
+        for (tx, r) in reads {
+            let _ = tx.send(r);
+        }
+        if !reap.is_empty() {
+            for h in &reap {
+                self.stack.sockets.remove(*h);
+            }
+            self.conns.retain(|_, c| !reap.contains(&c.handle));
+        }
+    }
+
+    fn update_snapshot(&self) {
+        let st = self.bind.status();
+        let (rx, tx) = self.bind.rx_tx();
+        let mut s = self.snapshot.lock().expect("快照锁中毒");
+        s.via = st.via;
+        s.ep = st.ep;
+        s.mirrored = st.mirrored;
+        s.rx = rx;
+        s.tx = tx;
+    }
+}
+
+/// 客户端句柄（主线程面）：命令投递 + 状态轮询 + 收工。
+pub struct Client {
+    cmd_tx: mpsc::Sender<Cmd>,
+    wake_wr: i32,
+    handle: Option<JoinHandle<()>>,
+    snapshot: Arc<Mutex<Snapshot>>,
+    stop: Arc<AtomicBool>,
+    next_id: Arc<AtomicU64>,
+    pub tunnel_ip: Ipv4Addr,
+}
+
+impl Client {
+    /// 装配 + 起驱动线程（C2 判据行在此打出）。
+    pub fn start(cfg: CoreConfig) -> io::Result<Self> {
+        let pubkey = cfg.identity.public_key();
+        let tunnel_ip = tunnel_addr::derive_tunnel_ip(&cfg.secret, &pubkey);
+        (cfg.logf)(&format!(
+            "wgcore: 隧道侧就绪（L3 直通；隧道地址 {tunnel_ip}，后端隧道 IP {SERVER_TUNNEL_IP}，核心自连经 B 拨隧道 IP）"
+        ));
+
+        let bind = Bind::open(
+            &cfg.candidates,
+            Some(RegCtx {
+                secret: cfg.secret,
+                pubkey,
+                dev_tag: *cfg.identity.dev_tag().as_bytes(),
+            }),
+            Arc::clone(&cfg.logf),
+        )?;
+        let udp_fd = bind.socket().as_raw_fd();
+
+        let mut fds = [0i32; 2];
+        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+        let (wake_r, wake_w) = (fds[0], fds[1]);
+        unsafe {
+            libc::fcntl(wake_r, libc::F_SETFL, libc::O_NONBLOCK);
+            libc::fcntl(wake_w, libc::F_SETFL, libc::O_NONBLOCK);
+        }
+
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
+        let snapshot = Arc::new(Mutex::new(Snapshot::default()));
+        let stop = Arc::new(AtomicBool::new(false));
+        let next_id = Arc::new(AtomicU64::new(1));
+
+        let identity_key = cfg.identity.private_key().clone();
+        let secret = cfg.secret;
+        let tunn = make_tunn(&identity_key, &secret, cfg.peer_id.as_bytes());
+        let engine = Engine {
+            bind,
+            tunn,
+            stack: StackB::new(tunnel_ip, SERVER_TUNNEL_IP, SmolInstant::from_millis(0)),
+            conns: HashMap::new(),
+            wg_buf: vec![0u8; WG_BUF],
+            cmd_rx,
+            snapshot: Arc::clone(&snapshot),
+            logf: cfg.logf,
+            identity_key,
+            secret,
+            peer_id: cfg.peer_id,
+            expired_pending: false,
+            silent_drops: 0,
+            time0: Instant::now(),
+        };
+
+        let stop2 = Arc::clone(&stop);
+        let handle = thread::Builder::new()
+            .name("homeway-wg".into())
+            .spawn(move || driver(engine, wake_r, udp_fd, stop2))?;
+
+        Ok(Self {
+            cmd_tx,
+            wake_wr: wake_w,
+            handle: Some(handle),
+            snapshot,
+            stop,
+            next_id,
+            tunnel_ip,
+        })
+    }
+
+    fn alloc_id(&self) -> u64 {
+        self.next_id.fetch_add(1, Ordering::Relaxed)
+    }
+
+    fn send(&self, cmd: Cmd) {
+        if self.cmd_tx.send(cmd).is_ok() {
+            unsafe {
+                libc::write(self.wake_wr, b"x".as_ptr().cast(), 1);
+            }
+        }
+    }
+
+    pub fn snapshot(&self) -> Snapshot {
+        self.snapshot.lock().expect("快照锁中毒").clone()
+    }
+
+    /// 建连（阻塞到 Established / refused / 超时）。
+    pub fn connect(&self, dst: SocketAddrV4) -> Result<u64, ConnErr> {
+        let id = self.alloc_id();
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::Connect { id, dst, reply: tx });
+        rx.recv().map_err(|_| ConnErr::EngineGone)??;
+        Ok(id)
+    }
+
+    /// PathProbe：拨出口必然拒绝的端口（主入口恒 :1），拿到 RST = 隧道通、出口在、
+    /// 拦截层可用（C8 `判据=wg` 的依据；超时/不可达才算死）。
+    pub fn path_probe(&self) -> Result<(), ConnErr> {
+        self.connect(SocketAddrV4::new(SERVER_TUNNEL_IP, 1))
+            .map(|_| ())
+            // 对端 :1 若真有服务（连接成功）也说明会话活着
+            .or_else(|e| match e {
+                ConnErr::Refused => Ok(()),
+                other => Err(other),
+            })
+    }
+
+    pub fn write(&self, id: u64, data: Vec<u8>) -> Result<usize, ConnErr> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::Write { id, data, reply: tx });
+        rx.recv().map_err(|_| ConnErr::EngineGone)?
+    }
+
+    pub fn read(&self, id: u64) -> Result<Vec<u8>, ConnErr> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::Read { id, reply: tx });
+        rx.recv().map_err(|_| ConnErr::EngineGone)?
+    }
+
+    pub fn shutdown(&self, id: u64) -> Result<(), ConnErr> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::Shutdown { id, reply: tx });
+        rx.recv().map_err(|_| ConnErr::EngineGone)?
+    }
+
+    pub fn close(&self, id: u64) -> Result<(), ConnErr> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::Close { id, reply: tx });
+        rx.recv().map_err(|_| ConnErr::EngineGone)?
+    }
+
+    pub fn refresh_reg(&self) {
+        self.send(Cmd::RefreshReg);
+    }
+
+    pub fn stop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        self.send(Cmd::Stop);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+        unsafe {
+            libc::close(self.wake_wr);
+        }
+    }
+}
+
+/// 驱动循环：poll(2) 三唤醒源（UDP fd / self-pipe / 定时）。
+fn driver(mut engine: Engine, wake_r: i32, udp_fd: i32, stop: Arc<AtomicBool>) {
+    let mut udp_buf = Box::new([0u8; 65536]);
+    loop {
+        if stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let timeout = {
+            let now = engine.now_smol();
+            let delay = engine
+                .stack
+                .iface
+                .poll_delay(now, &engine.stack.sockets)
+                .unwrap_or(smoltcp::time::Duration::from_millis(POLL_CAP as u64))
+                .min(smoltcp::time::Duration::from_millis(POLL_CAP as u64));
+            delay.total_millis().clamp(1, POLL_CAP as u64) as i32
+        };
+        let mut fds = [
+            libc::pollfd {
+                fd: udp_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: wake_r,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        unsafe {
+            libc::poll(fds.as_mut_ptr(), 2, timeout);
+        }
+        if fds[1].revents & libc::POLLIN != 0 {
+            let mut b = [0u8; 64];
+            unsafe {
+                while libc::read(wake_r, b.as_mut_ptr().cast(), 64) > 0 {}
+            }
+        }
+        if !engine.pump_once(&mut udp_buf[..]) {
+            break;
+        }
+    }
+    unsafe {
+        libc::close(wake_r);
+    }
+    let _ = io::stdout().flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use boringtun::x25519::StaticSecret;
+
+    fn random_key() -> StaticSecret {
+        let mut b = [0u8; 32];
+        getrandom::getrandom(&mut b).unwrap();
+        StaticSecret::from(b)
+    }
+
+    /// 双 Tunn 自环（noise 层互通钉死）：客户端发起 → 出口应答 → 排队内层包冲出 →
+    /// 出口收到明文。PSK 混入与 x25519 面一并有假（派生错 = AEAD tag 失败此处即红）。
+    #[test]
+    fn two_tunn_handshake_then_queued_data() {
+        let client_key = random_key();
+        let server_key = random_key();
+        let psk = *Psk::from(Secret::from([0x42; 32])).as_bytes();
+        let mut client = Tunn::new(
+            client_key.clone(),
+            boringtun::x25519::PublicKey::from(&server_key),
+            Some(psk),
+            None,
+            1,
+            None,
+        )
+        .unwrap();
+        let mut server = Tunn::new(
+            server_key,
+            boringtun::x25519::PublicKey::from(&client_key),
+            Some(psk),
+            None,
+            2,
+            None,
+        )
+        .unwrap();
+
+        // 一个最小 IPv4 包当「内层明文」（首个出站包触发握手 + 排队）；
+        // 总长字段必须正确——boringtun 按它截断（computed_len）后才回 WriteToTunnelV4。
+        let mut inner = vec![0u8; 20 + 8];
+        inner[0] = 0x45;
+        let total = (inner.len() + 8) as u16;
+        inner[2..4].copy_from_slice(&total.to_be_bytes());
+        inner.extend_from_slice(b"payload!");
+
+        let mut buf = [0u8; 65536];
+        // ① 客户端 encapsulate：无会话 ⇒ 排队 + 握手 init
+        let init = match client.encapsulate(&inner, &mut buf) {
+            TunnResult::WriteToNetwork(w) => w.to_vec(),
+            other => panic!("期望握手 init，实得 {other:?}"),
+        };
+        // ② 出口 decapsulate：产握手应答
+        let mut buf2 = [0u8; 65536];
+        let resp = match server.decapsulate(None, &init, &mut buf2) {
+            TunnResult::WriteToNetwork(w) => w.to_vec(),
+            other => panic!("期望握手应答，实得 {other:?}"),
+        };
+        // ③ 客户端收应答：keepalive + 建会话
+        let mut buf3 = [0u8; 65536];
+        match client.decapsulate(None, &resp, &mut buf3) {
+            TunnResult::WriteToNetwork(_) => {} // 会话建立后的确认 keepalive
+            other => panic!("期望 keepalive，实得 {other:?}"),
+        }
+        // ④ 空数据报重调：冲出排队的内层包
+        let data = match client.decapsulate(None, &[], &mut buf3) {
+            TunnResult::WriteToNetwork(w) => w.to_vec(),
+            other => panic!("期望排队数据冲出，实得 {other:?}"),
+        };
+        // ⑤ 出口解出明文
+        let mut buf4 = [0u8; 65536];
+        match server.decapsulate(None, &data, &mut buf4) {
+            TunnResult::WriteToTunnelV4(pkt, _) => {
+                assert_eq!(&pkt[inner.len() - 8..], b"payload!");
+            }
+            other => panic!("期望明文包，实得 {other:?}"),
+        }
+        // ⑥ 反向：出口 → 客户端一条数据
+        let back = match server.encapsulate(&inner, &mut buf) {
+            TunnResult::WriteToNetwork(w) => w.to_vec(),
+            other => panic!("期望数据包，实得 {other:?}"),
+        };
+        match client.decapsulate(None, &back, &mut buf4) {
+            TunnResult::WriteToTunnelV4(pkt, _) => {
+                assert_eq!(&pkt[inner.len() - 8..], b"payload!");
+            }
+            other => panic!("期望明文包，实得 {other:?}"),
+        }
+    }
+
+    /// blackhole 反例（评审 ③-4 验收）：不可达出口 ⇒ probe 不得判通（Timeout，非 refused）。
+    #[test]
+    fn engine_probe_blackhole_times_out() {
+        let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|_| {});
+        let identity = Identity::ephemeral().unwrap();
+        let mut client = Client::start(CoreConfig {
+            peer_id: PeerId::from([1; 32]),
+            secret: Secret::from([2; 32]),
+            identity,
+            candidates: vec![Candidate {
+                // TEST-NET-3 不可达地址：镜像包无人应答 ⇒ WG 永不建会话 ⇒ probe 超时
+                addr: "203.0.113.1:41641".parse().unwrap(),
+                relay: false,
+            }],
+            logf,
+        })
+        .unwrap();
+        let t0 = Instant::now();
+        let r = client.path_probe();
+        assert!(
+            matches!(r, Err(ConnErr::Timeout)),
+            "blackhole 应 Timeout，实得 {r:?}"
+        );
+        assert!(t0.elapsed() < Duration::from_secs(3), "测试期限超支");
+        client.stop();
+    }
+}

@@ -20,6 +20,7 @@ getrandom = { version = "0.2", features = ["std"] }
 #  tier:tools/spikes/rust-ohos-poc/ring-shim/，**依赖组合勿改**——PoC 已实测）
 boringtun = "0.6"
 smoltcp = "0.11"
+libc = "0.2"
 
 [patch.crates-io]
 ring = { path = "tools/ring-shim" }

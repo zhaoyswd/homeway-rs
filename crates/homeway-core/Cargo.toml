@@ -13,6 +13,7 @@ hkdf.workspace = true
 x25519-dalek.workspace = true
 getrandom.workspace = true
 smoltcp.workspace = true
+libc.workspace = true
 # R1 数据面消费（noise 握手）；R0 先就位以验 ring 垫片 [patch] 组装
 boringtun.workspace = true
 
@@ -20,3 +21,4 @@ boringtun.workspace = true
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 hex = "0.4"
+libc = "0.2"

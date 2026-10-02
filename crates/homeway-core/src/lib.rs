@@ -13,4 +13,5 @@ pub mod identity;
 pub mod psk;
 pub mod token;
 pub mod tunnel_addr;
+pub mod wgcore;
 pub mod wtransport;

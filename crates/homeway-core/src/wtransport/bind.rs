@@ -44,8 +44,9 @@ pub struct RegCtx {
 }
 
 /// 链路形态三态（`tunStatusJSON` link 段 via 词表：direct|relay|none）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Via {
+    #[default]
     None,
     Direct,
     Relay,
@@ -172,7 +173,7 @@ impl Bind {
         // C4 判据行（双条件节流：≤3 行/轮 且 间隔 ≥1s）
         let now = Instant::now();
         let loggable =
-            self.mirror_log_n < MIRROR_LOG_MAX && self.mirror_log_at.map_or(true, |t| now.duration_since(t) >= MIRROR_LOG_GAP);
+            self.mirror_log_n < MIRROR_LOG_MAX && self.mirror_log_at.is_none_or(|t| now.duration_since(t) >= MIRROR_LOG_GAP);
         if loggable {
             self.mirror_log_n += 1;
             self.mirror_log_at = Some(now);
@@ -255,8 +256,8 @@ impl Bind {
                 miss_list.join("、")
             ));
         }
-        let path_changed = prev.map_or(true, |p| p != src);
-        if path_changed && self.last_path_log_at.map_or(true, |t| now.duration_since(t) >= PATH_LOG_GAP) {
+        let path_changed = prev.is_none_or(|p| p != src);
+        if path_changed && self.last_path_log_at.is_none_or(|t| now.duration_since(t) >= PATH_LOG_GAP) {
             self.last_path_log_at = Some(now);
             if !was_valid {
                 (self.logf)(&format!("路径确立：直连 {src}（首个回包来源）"));
@@ -343,7 +344,8 @@ mod tests {
     use std::sync::mpsc;
 
     /// 收集型 logf（断言判据行文案）。
-    fn log_sink() -> (Arc<dyn Fn(&str) + Send + Sync>, mpsc::Receiver<String>) {
+    type LogSink = (Arc<dyn Fn(&str) + Send + Sync>, mpsc::Receiver<String>);
+    fn log_sink() -> LogSink {
         let (tx, rx) = mpsc::channel();
         let f: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |s: &str| {
             let _ = tx.send(s.to_owned());
@@ -405,14 +407,14 @@ mod tests {
 
         let all: Vec<String> = logs.try_iter().collect();
         assert!(
-            all.iter().any(|l| l.contains("赛跑结算：胜出 直连 ") && l.contains(&format!("（镜像 2 包，耗时 "))),
+            all.iter().any(|l| l.contains("赛跑结算：胜出 直连 ") && l.contains("（镜像 2 包，耗时 ")),
             "C5 判据行缺失：{all:?}"
         );
         assert!(all.iter().any(|l| l.starts_with("路径确立：直连 ")), "C6 判据行缺失：{all:?}");
         // 未响应列表带 tag（LAN + 空格 + 地址）；响应列表裸地址
         let settle = all.iter().find(|l| l.contains("赛跑结算")).unwrap();
         assert!(settle.contains(&format!("响应过={exit_addr}")), "{settle}");
-        assert!(settle.contains(&format!("未响应=LAN 127.0.0.1:1")), "{settle}");
+        assert!(settle.contains("未响应=LAN 127.0.0.1:1"), "{settle}");
 
         // 已采纳：单发采纳端点（纯数据腿帧）
         bind.send_wg(b"after-adopt");
