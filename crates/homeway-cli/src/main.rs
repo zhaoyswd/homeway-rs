@@ -64,6 +64,7 @@ struct ConnectArgs {
     status_json: bool,
     recover_from: Option<i64>,
     recover_cause: String,
+    recover_delay: u64,
     inject: Option<String>,
 }
 
@@ -79,6 +80,7 @@ fn parse_connect(args: &[String]) -> ConnectArgs {
         status_json: false,
         recover_from: None,
         recover_cause: "测试注入".to_owned(),
+        recover_delay: 0,
         inject: None,
     };
     let mut i = 0;
@@ -117,6 +119,10 @@ fn parse_connect(args: &[String]) -> ConnectArgs {
             "--recover-from" => {
                 i += 1;
                 a.recover_from = args.get(i).and_then(|s| s.parse().ok());
+            }
+            "--recover-delay" => {
+                i += 1;
+                a.recover_delay = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
             }
             "--recover-cause" => {
                 i += 1;
@@ -176,8 +182,12 @@ fn cmd_connect(args: &[String]) {
         inject(&session, what);
     }
 
-    // ---- 恢复钩子（时间窗实测：阶梯直测面）----
+    // ---- 恢复钩子（时间窗实测：阶梯直测面；delay = 先给外部注入留窗口）----
     if let Some(from) = a.recover_from {
+        if a.recover_delay > 0 {
+            println!("recover: 等待 {}s 后起跑（注入窗口）", a.recover_delay);
+            std::thread::sleep(Duration::from_secs(a.recover_delay));
+        }
         let lvl = Level::clamp(from);
         let t0 = Instant::now();
         let rc = session.recover(lvl, &a.recover_cause);
