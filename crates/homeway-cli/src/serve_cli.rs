@@ -127,59 +127,60 @@ fn parse_serve_flags(args: &[String]) -> ServeFlags {
     };
     let mut i = 0;
     while i < args.len() {
-        // Go flag 靃格：--flag value / --flag=value / 布尔 --flag=false
-        let (name, inline_val) = match args[i].strip_prefix("--").or_else(|| args[i].strip_prefix('-')) {
-            Some(n) => match n.split_once('=') {
-                Some((k, v)) => (k.to_owned(), Some(v.to_owned())),
-                None => (n.to_owned(), None),
-            },
-            None => {
-                f.extra.push(args[i].clone());
-                i += 1;
-                continue;
-            }
+        // Go flag 风格：--flag value / --flag=value；布尔 flag 可 --flag=false
+        let stripped = args[i].strip_prefix("--").or_else(|| args[i].strip_prefix('-'));
+        let Some(body) = stripped else {
+            f.extra.push(args[i].clone());
+            i += 1;
+            continue;
         };
-        match name.as_str() {
-            "state" => f.state = args.get(i + 1).map(PathBuf::from),
-            "listen" => f.listen = args.get(i + 1).and_then(|v| v.parse().ok()),
-            "bind-interface" => f.bind_interface = args.get(i + 1).cloned(),
-            "upnp" => {
-                f.upnp = match inline_val.as_deref().or_else(|| args.get(i + 1).map(|s| s.as_str())) {
-                    Some("false") | Some("0") => Some(false),
-                    Some("true") | Some("1") => Some(true),
-                    // 裸布尔 flag（--upnp）：Go flag 的 bool 形态不吞下一参
-                    _ => Some(true),
-                };
-                if inline_val.is_some() {
-                    i -= 1; // 已内联取值：回退外层 +=1 的双步进
-                }
+        let (name, inline) = match body.split_once('=') {
+            Some((k, v)) => (k.to_owned(), Some(v.to_owned())),
+            None => (body.to_owned(), None),
+        };
+        // 值形 flag：内联取值（--flag=value）或吞下一参；布尔 flag 可 --flag=false
+        // （裸布尔不吞下一参——Go flag 同形）。
+        let take_val = |i: &mut usize| -> Option<String> {
+            if let Some(v) = inline.clone() {
+                return Some(v);
             }
-            "stun" => f.stun = Some(inline_val.clone().unwrap_or_else(|| args.get(i + 1).cloned().unwrap_or_default())),
-            "stun6" => f.stun6 = Some(inline_val.clone().unwrap_or_else(|| args.get(i + 1).cloned().unwrap_or_default())),
+            *i += 1;
+            args.get(*i).cloned()
+        };
+        let mut j = i;
+        match name.as_str() {
+            "state" => f.state = take_val(&mut j).map(PathBuf::from),
+            "listen" => f.listen = take_val(&mut j).and_then(|v| v.parse().ok()),
+            "bind-interface" => f.bind_interface = take_val(&mut j),
+            "upnp" => {
+                f.upnp = match inline.as_deref() {
+                    Some("false") | Some("0") => Some(false),
+                    Some("true") | Some("1") | None => Some(true), // 裸布尔 flag
+                    Some(_) => Some(true),
+                };
+            }
+            "stun" => f.stun = take_val(&mut j),
+            "stun6" => f.stun6 = take_val(&mut j),
             "peer-ttl" => {
-                let v = inline_val.clone().or_else(|| args.get(i + 1).cloned());
-                if let Some(v) = v {
+                if let Some(v) = take_val(&mut j) {
                     f.peer_ttl = parse_go_duration(&v);
                     if f.peer_ttl.is_none() {
                         eprintln!("--peer-ttl 非法（{v:?}——时长串，如 15s / 168h；0 = 关闭）");
                         std::process::exit(2);
                     }
                 }
-                if inline_val.is_some() {
-                    i -= 1;
-                }
             }
-            "max-peers" => f.max_peers = args.get(i + 1).and_then(|v| v.parse().ok()),
-            "public-endpoint" => f.public_endpoint = Some(inline_val.clone().unwrap_or_else(|| args.get(i + 1).cloned().unwrap_or_default())),
-            "dns-port" => f.dns_port = args.get(i + 1).and_then(|v| v.parse().ok()),
-            "files-root" => f.files_root = Some(inline_val.clone().unwrap_or_else(|| args.get(i + 1).cloned().unwrap_or_default())),
+            "max-peers" => f.max_peers = take_val(&mut j).and_then(|v| v.parse().ok()),
+            "public-endpoint" => f.public_endpoint = take_val(&mut j),
+            "dns-port" => f.dns_port = take_val(&mut j).and_then(|v| v.parse().ok()),
+            "files-root" => f.files_root = take_val(&mut j),
             "verbose" => f.verbose = true,
             other => {
                 eprintln!("未知参数：--{other}");
                 std::process::exit(2);
             }
         }
-        i += 1;
+        i = j + 1;
     }
     f
 }
