@@ -98,7 +98,7 @@ start)
   # 词切分进命令行，调用方自负其值）
   nohup "$BIN" serve --state "$EXIT_STATE" --listen "$EXIT_PORT" --bind-interface none \
     --upnp=false --stun= --stun6= --public-endpoint "127.0.0.1:$EXIT_PORT" --verbose \
-    ${=EXIT_EXTRA_FLAGS} \
+    ${=EXIT_EXTRA_FLAGS:-} \
     >> "$EXIT_LOG" 2>&1 &
   echo $! > "$EXIT_PIDFILE"
   if ready=$(wait_line_from "$EXIT_LOG" 'serve 就绪' "$LOG0" 25); then
