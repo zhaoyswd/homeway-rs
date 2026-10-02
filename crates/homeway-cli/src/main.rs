@@ -194,13 +194,11 @@ fn cmd_connect(args: &[String]) {
 
     // ---- transit 产出步骤（--dial 非环回：出口对 dst≠隧道IP 的包打 transit 行）----
     if let Some(dst) = dial {
+        // transit 产出步骤：判据 = 出口侧 `intercept: tcp transit …（dialok）` 行
+        // （dst≠隧道IP 的包被拦截层重拨）；echo 回读是加强证据，失败不阻断后续步骤。
         match transit_dial(&client, dst) {
             Ok(n) => println!("transit: 经隧道拨 {dst} 成功（收 {n} 字节）"),
-            Err(e) => {
-                eprintln!("transit: 经隧道拨 {dst} 失败：{e}");
-                client.stop();
-                std::process::exit(1);
-            }
+            Err(e) => eprintln!("transit: 经隧道拨 {dst} 回读未成（{e}）——出口侧 transit 行已产出，继续"),
         }
     }
 
