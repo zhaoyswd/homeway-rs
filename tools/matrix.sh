@@ -146,7 +146,7 @@ start_relay() { # start_relay <链路> <go|rust> [nohints]
     # 常开 no-hints 会把偶发落中继的会话钉死——L1 首两轮 C-via 失败根因）。
     # 中继段的驻留注入在 relay_segment 里重启 relay 加 --no-hints（段注入做实）。
     nohup "$RUST_BIN" relay --state "$st" --listen "127.0.0.1:$port" --advertise "127.0.0.1:$port" \
-      >> "$st/stdout.log" 2>&1 &
+      ${NOHINT:+--no-hints} >> "$st/stdout.log" 2>&1 &
   else
     nohup "$GO_BIN" relay --state "$st" --listen "127.0.0.1:$port" --advertise "127.0.0.1:$port" \
       >> "$st/stdout.log" 2>&1 &
@@ -475,7 +475,7 @@ base_segment() {
   # E10/E11 transit（Rust --dial / Go forward；echo 服务回显）
   local EL1=$(log_lines "$st/exit/stdout.log")
   if [[ "$C" == go ]]; then
-    "$GO_BIN" forward add --state "$st/c-main" -host "m$link" --listen "$(fwd_port "$link")" --target "127.0.0.1:$(echo_port "$link")" >/dev/null 2>&1
+    "$GO_BIN" forward add --state "$st/c-main" --host "m$link" --listen "$(fwd_port "$link")" --target "$(lan_ip):$(echo_port "$link")" 2>&1 | tail -1 >> "$st/c-main/forward.log"
     sleep 1
     printf 'transit-payload-%s' "$link" | nc -w 3 127.0.0.1 "$(fwd_port "$link")" >/dev/null 2>&1
   else
