@@ -8,6 +8,8 @@
 pub mod bind;
 pub mod device;
 pub mod dnsproxy;
+pub mod egress;
+pub mod upnp;
 pub mod state;
 pub mod table;
 pub mod intercept;

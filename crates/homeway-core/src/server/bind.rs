@@ -32,13 +32,15 @@ const SRC_SEEN_MAX: usize = 4096;
 pub struct WireOut(pub Vec<(SocketAddr, Vec<u8>)>);
 
 /// 入站消费结果（recv_packet 的返回契约——驱动循环 drain 语义同客户端 bind）。
-pub enum Inbound {
-    /// 数据帧载荷（含容器解出的首条 data）：要进 device 的 WG 包。
-    Data { src: SocketAddr, wg: Vec<u8> },
+/// **reg 先于 data 应用**：容器帧 `[reg][init]`（Go 客户端首包形态）里 reg 登记设备表
+/// 后 init 才进 device——字段序即应用序（Go handleBatch 同序；评审 H1）。
+pub struct Inbound {
+    /// 要进 device 的 WG 包（容器帧取首条 data）。
+    pub data: Option<(SocketAddr, Vec<u8>)>,
+    /// reg 帧载荷（驱动线程先于 data 应用到设备表）。
+    pub regs: Vec<(Vec<u8>, SocketAddr)>,
 }
 
-/// reg 帧回调（设备表 Register 的接线点；3b 接真表）。
-pub type OnReg = Box<dyn FnMut(&[u8], SocketAddr) + Send>;
 /// hint 帧回调（装配层接；Go OnHint 语义——src 校验归接线方，R3 无中继腿不装）。
 pub type OnHint = Box<dyn FnMut(&str, SocketAddr) + Send>;
 
@@ -51,11 +53,11 @@ pub struct ServerBind {
     /// 探测应答端点列表段来源（公网端点公布面；3f 接——现在恒空）。
     probe_endpoints: Vec<SocketAddr>,
     logf: crate::Logf,
-    on_reg: Option<OnReg>,
     on_hint: Option<OnHint>,
     src_seen: HashMap<SocketAddr, ()>,
-    /// STUN 观测等待者（事务 ID；3e 完整接——现在只做「像不像应答」的让路判定）。
+    /// STUN 观测等待者（事务 ID + 应答回执通道——同 socket 观测「监听端口的 NAT 映射」）。
     stun_wait_txid: Option<[u8; 12]>,
+    stun_wait_result: Option<std::sync::mpsc::Sender<Option<SocketAddr>>>,
     pub rx_bytes: u64,
     pub tx_bytes: u64,
     recv_buf: Box<[u8; 65536]>,
@@ -79,10 +81,10 @@ impl ServerBind {
             caps: 0,
             probe_endpoints: Vec::new(),
             logf,
-            on_reg: None,
             on_hint: None,
             src_seen: HashMap::new(),
             stun_wait_txid: None,
+            stun_wait_result: None,
             rx_bytes: 0,
             tx_bytes: 0,
             recv_buf: Box::new([0u8; 65536]),
@@ -91,10 +93,6 @@ impl ServerBind {
 
     pub fn local_port(&self) -> u16 {
         self.sock.local_addr().map(|a| a.port()).unwrap_or(0)
-    }
-
-    pub fn set_on_reg(&mut self, f: OnReg) {
-        self.on_reg = Some(f);
     }
 
     pub fn set_on_hint(&mut self, f: OnHint) {
@@ -110,10 +108,10 @@ impl ServerBind {
         self.probe_endpoints = eps;
     }
 
-    /// 收一个数据报（非阻塞）。返回契约（与客户端 `wtransport::bind::recv_from` 同构）：
-    /// `Ok(Some(Inbound))` = 有数据帧载荷要进 device；`Ok(None)` = 本包被内部消费
-    /// （reg/hint/probe/STUN/畸形），继续收；`Err(WouldBlock|TimedOut)` = 本轮无包；
-    /// 其它 Err = 读错误（驱动循环限流记一行原地慢转——绝不退出，防永久失聪）。
+    /// 收一个数据报（非阻塞）。返回契约：`Ok(Some(Inbound))` = 有 reg 待应用或数据帧
+    /// 待进 device；`Ok(None)` = 本包被内部消费（hint/probe/STUN/畸形），继续收；
+    /// `Err(WouldBlock|TimedOut)` = 本轮无包；其它 Err = 读错误（驱动循环限流记一行
+    /// 原地慢转——绝不退出，防永久失聪）。
     pub fn recv_packet(&mut self) -> io::Result<Option<Inbound>> {
         let (n, src) = match self.sock.recv_from(&mut self.recv_buf[..]) {
             Ok(v) => v,
@@ -131,12 +129,17 @@ impl ServerBind {
 
     /// 一个入站 UDP 包的完整解析（Go processPacket 同序：STUN → probe → 腿帧 → 丢弃）。
     fn process_packet(&mut self, buf: &[u8], src: SocketAddr) -> Option<Inbound> {
-        // STUN 应答：只认事务 ID 匹配的应答（3e 前无等待者 ⇒ 让路判定恒 false，照 Go
-        // 「事务 ID 不匹配的包照常交给 device」——但 STUN 应答不是腿帧，最终走非帧丢弃）。
+        // STUN 应答：只认事务 ID 匹配的应答（观测等待者消费——映射地址回执后清位；
+        // 不匹配的照常走后续判定，但 STUN 应答不是腿帧，最终走非帧丢弃）。
         if stun_looks_like_response(buf) {
             if let Some(txid) = self.stun_wait_txid {
                 if buf.get(8..20) == Some(&txid[..]) {
                     self.note_new_src(src, "STUN应答", buf.len());
+                    let mapped = super::egress::parse_stun_response(buf).map(|(_, ap)| ap);
+                    if let Some(tx) = self.stun_wait_result.take() {
+                        let _ = tx.send(mapped);
+                    }
+                    self.stun_wait_txid = None;
                     return None; // 已消耗
                 }
             }
@@ -157,14 +160,14 @@ impl ServerBind {
             match kind {
                 k if k == FrameKind::Data.to_wire() => {
                     self.note_new_src(src, "腿帧数据", buf.len());
-                    return Some(Inbound::Data { src, wg: payload.to_vec() });
+                    return Some(Inbound {
+                        data: Some((src, payload.to_vec())),
+                        regs: Vec::new(),
+                    });
                 }
                 k if k == FrameKind::Reg.to_wire() => {
                     self.note_new_src(src, "腿帧注册", buf.len());
-                    if let Some(f) = &mut self.on_reg {
-                        f(payload, src);
-                    }
-                    return None;
+                    return Some(Inbound { data: None, regs: vec![(payload.to_vec(), src)] });
                 }
                 k if k == FrameKind::Control.to_wire() => {
                     self.note_new_src(src, "腿帧控制", buf.len());
@@ -191,20 +194,19 @@ impl ServerBind {
         None
     }
 
-    /// 容器帧（Go handleBatch 同序）：reg 先登记 → data 只取首条投 device → control 交 hint；
-    /// 未知消息类型忽略；无 data = 内部消费。
+    /// 容器帧（Go handleBatch 同序）：reg 收集（**先于 data 应用**）→ data 只取首条投
+    /// device → control 交 hint；未知消息类型忽略；无 data 且无 reg = 内部消费。
     fn handle_batch(&mut self, raw: &[u8], payload: &[u8], src: SocketAddr) -> Option<Inbound> {
         let Some(msgs) = frame::decode_batch(payload) else {
             self.note_new_src(src, "畸形容器", raw.len());
             return None;
         };
         let mut data: Option<&[u8]> = None;
+        let mut regs: Vec<(Vec<u8>, SocketAddr)> = Vec::new();
         for (kind, mpayload) in msgs {
             match kind {
                 k if k == FrameKind::Reg.to_wire() => {
-                    if let Some(f) = &mut self.on_reg {
-                        f(mpayload, src);
-                    }
+                    regs.push((mpayload.to_vec(), src));
                 }
                 k if k == FrameKind::Data.to_wire() => {
                     if data.is_none() {
@@ -219,12 +221,39 @@ impl ServerBind {
                 _ => {} // 未知消息类型：忽略（前向兼容）
             }
         }
-        let Some(d) = data else {
+        let d = data.map(|d| (src, d.to_vec()));
+        if d.is_none() && regs.is_empty() {
             self.note_new_src(src, "容器（无数据）", raw.len());
             return None;
-        };
+        }
         self.note_new_src(src, "容器数据", raw.len());
-        Some(Inbound::Data { src, wg: d.to_vec() })
+        Some(Inbound { data: d, regs })
+    }
+
+    /// STUN 观测（**在本 Bind 的 UDP socket 上**问一次——监听端口那个 socket 的 NAT
+    /// 映射；从临时 socket 问出来的是默认路由的映射，两者在 TUN 代理机器上完全不同）。
+    /// 应答经 result 通道回执（None = 应答未到/不合法——调用方按超时收场）；同一时刻
+    /// 只允许一次查询（观测周期都是分钟级——Go stunPending 同义）。
+    pub fn stun_query(
+        &mut self,
+        server: SocketAddr,
+        result: std::sync::mpsc::Sender<Option<SocketAddr>>,
+    ) -> io::Result<()> {
+        if self.stun_wait_txid.is_some() {
+            return Err(io::Error::new(io::ErrorKind::WouldBlock, "server: 已有一次 STUN 查询在等"));
+        }
+        let txid = super::egress::new_txid();
+        let req = super::egress::stun_request(&txid, ""); // servercore 形态：20B 无属性
+        self.stun_wait_txid = Some(txid);
+        self.stun_wait_result = Some(result);
+        self.sock.send_to(&req, server)?;
+        Ok(())
+    }
+
+    /// 观测超时收位（调用方超时后清——防下一次查询被占位挡住）。
+    pub fn stun_query_abort(&mut self) {
+        self.stun_wait_txid = None;
+        self.stun_wait_result = None;
     }
 
     /// 出站收口：把 device 产出的 wire 批封装腿帧发出（Send 恒发腿帧——Go 同义）。
@@ -305,43 +334,26 @@ mod tests {
     }
 
     /// 收发对拍：容器帧 [reg][data] 的 Go 客户端形态首包（评审 H1 验收）——reg 先于
-    /// data 被消费、data 进 Inbound。
+    /// data 被消费（返回形态的字段序即应用序）、data 进 Inbound。
     #[test]
     fn batch_frame_reg_then_data() {
-        let bind = ServerBind::open(0, "test", noop_logf()).unwrap();
-        let out = Arc::new(Mutex::new(Vec::<(&[u8], SocketAddr)>::new()));
-        let mut b = bind;
-        let o2 = Arc::clone(&out);
-        b.set_on_reg(Box::new(move |reg, src| {
-            o2.lock().unwrap().push((Box::leak(reg.to_vec().into_boxed_slice()), src));
-        }));
-        drop(b);
-
-        // 重新构一个带回执的 bind，走 process_packet 直接验（内存面，不开真 socket 对）
         let mut b2 = ServerBind::open(0, "test", noop_logf()).unwrap();
-        let regs = Arc::new(AtomicUsize::new(0));
-        let r2 = Arc::clone(&regs);
-        b2.set_on_reg(Box::new(move |_, _| {
-            r2.fetch_add(1, Ordering::SeqCst);
-        }));
 
         let reg = vec![0x41u8; 66];
         let wg = vec![1u8, 0, 0, 0, 2, 0, 0, 0]; // 假 init 形状
         let batch = frame::batch_bytes(&[(FrameKind::Reg.to_wire(), &reg), (FrameKind::Data.to_wire(), &wg)]);
         let src: SocketAddr = "127.0.0.1:5001".parse().unwrap();
-        let r = b2.process_packet(&batch, src);
-        match r {
-            Some(Inbound::Data { src: s, wg: w }) => {
-                assert_eq!(s, src);
-                assert_eq!(w, wg);
-            }
-            _ => panic!("容器帧应投出 data"),
-        }
-        assert_eq!(regs.load(Ordering::SeqCst), 1, "reg 应被消费恰好一次");
+        let r = b2.process_packet(&batch, src).expect("容器帧应投出");
+        assert_eq!(r.regs.len(), 1, "reg 应被收集恰好一次");
+        assert_eq!(r.regs[0].0, reg);
+        let (dsrc, dwg) = r.data.expect("data 应在");
+        assert_eq!(dsrc, src);
+        assert_eq!(dwg, wg);
 
         // 同一源的第二包不再记新源（测试日志面：检查不 panic 即可——判据在 3f 实测）
         let r2 = b2.process_packet(&frame::frame_bytes(FrameKind::Data, &wg), src);
-        assert!(matches!(r2, Some(Inbound::Data { .. })));
+        assert!(matches!(r2, Some(i) if i.data.is_some()));
+        let _ = (AtomicUsize::new(0), Ordering::SeqCst); // 原计数断言面由形态断言替代
     }
 
     /// probe 应答路径：HWQ → HWR（同 nonce/build/flags）；列表段受 pad 契约约束。
