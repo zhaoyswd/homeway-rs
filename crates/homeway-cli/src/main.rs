@@ -368,28 +368,16 @@ fn transit_dial(session: &Session, dst: SocketAddrV4) -> Result<usize, ConnErr> 
             }
         }
     }
-    let mut got = 0usize;
-    loop {
-        match session.client().read(id) {
-            Ok(chunk) => {
-                if chunk.is_empty() {
-                    break; // EOF（对端关）——连接本身已证通
-                }
-                got += chunk.len();
-                // 证通即收：echo 类目标不主动 EOF（读到首块回显就关——原「读到 16MB
-                // 或 EOF」形态在 echo 目标上会阻塞到会话收工，E11 关闭行拖 5 分钟）
-                break;
-            }
-            Err(ConnErr::Closed) => {
-                // 对端 FIN（CloseWait EOF）——干净收尾：已收字节即结果
-                break;
-            }
-            Err(e) => {
-                let _ = session.client().close(id);
-                return Err(e);
-            }
+    // 证通即收：echo 类目标不主动 EOF——读到首块回显（或对端 FIN）就关（原「读到
+    // 16MB 或 EOF」形态在 echo 目标上会阻塞到会话收工，E11 关闭行拖 5 分钟）
+    let got = match session.client().read(id) {
+        Ok(chunk) => chunk.len(),
+        Err(ConnErr::Closed) => 0, // 对端 FIN——连接本身已证通
+        Err(e) => {
+            let _ = session.client().close(id);
+            return Err(e);
         }
-    }
+    };
     let _ = session.client().close(id);
     Ok(got)
 }

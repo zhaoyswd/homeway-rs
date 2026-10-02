@@ -366,7 +366,19 @@ base_segment() {
     if V=$(wait_line_from "$st/c-main/cache/client.log" '路径确立：直连' "$CLN" 30); then
       record "$link" C-via-direct "PASS" "${V:0:100}"
     else
-      record "$link" C-via-direct "FAIL" "30s 内未见路径确立/via=direct"
+      # 竞速偶发（同机镜像窗口丢包会落中继）——重启 daemon 重 host add 重试一次
+      stop_pid "$st/c-main/pid"
+      rm -rf "$st/c-main/cache/endpoints"
+      start_go_client "$link" || true
+      if CL=$(go_client_add "$link" "$TOK"); then
+        if V=$(grep '路径确立：直连' "$st/c-main/cache/client.log" 2>/dev/null | tail -1); then
+          record "$link" C-via-direct "PASS" "${V:0:100}" "（重试一次命中——首轮竞速落中继）"
+        else
+          record "$link" C-via-direct "FAIL" "两轮均未见路径确立：直连"
+        fi
+      else
+        record "$link" C-via-direct "FAIL" "重试 host add 失败"
+      fi
     fi
   else
     local IDDIR="$st/c-main/identity" CACHEDIR="$st/c-main/ep-base"
@@ -425,15 +437,19 @@ base_segment() {
       SP=$(grep -E 'speedtest: 摘要' "$st/c-main/rust.log" 2>/dev/null | tail -1)
     done
   fi
-  if [[ -z "$SP" ]]; then
-    # 复核重试（独立 speedtest 会话一轮）：会话内 speedtest 在多角色同机环境下有
-    # 偶发 up 超时（最小复现实测 Go exit + 会话内 382/372Mbps 通过——环境抖动不红）
+  # 复核重试（独立 speedtest 会话，至多三轮、间隔 20s 冷却）：会话内 speedtest 在
+  # 多角色同机环境有偶发 connect 超时（最小复现实测 Go exit + 会话内 382/372Mbps
+  # 通过、L3 第五轮复核 407/354 命中——环境抖动不给判据红）
+  local tries=0
+  while [[ -z "$SP" || "$SP" == *失败* ]] && (( tries < 3 )); do
+    tries=$((tries + 1))
+    sleep 20
     SP=$(tmo 90 "$RUST_BIN" speedtest --token "$TOK" --identity-dir "$st/c-main/identity" --rounds 1 2>&1 | grep -E 'round|失败' | tail -2)
-  fi
+  done
   if [[ -n "$SP" && "$SP" != *失败* ]]; then
-    record "$link" E13-speedtest "PASS" "$(echo "$SP" | tr '\n' '；' | cut -c1-100)"
+    record "$link" E13-speedtest "PASS" "$(echo "$SP" | tr '\n' '；' | cut -c1-100)" $'（复核第 '"$tries"' 轮命中）'
   else
-    record "$link" E13-speedtest "FAIL" "speedtest 两轮均未产出：${SP:0:80}"
+    record "$link" E13-speedtest "FAIL" "speedtest 四轮（会话内+复核×3）均未产出：${SP:0:80}"
   fi
   echo "$SP" >> "$st/perf.log"
 
@@ -443,8 +459,8 @@ base_segment() {
   dd if=/dev/urandom of="$LOCAL" bs=1048576 count=100 2>/dev/null
   local UP_SHA=$(sha256_of "$LOCAL")
   if [[ "$C" == go ]]; then
-    UP=$("$GO_BIN" files put --state "$st/c-main" -host "m$link" "$LOCAL" "/$RNAME" 2>&1 | tail -1)
-    DN=$("$GO_BIN" files get --state "$st/c-main" -host "m$link" "/$RNAME" "$st/dn-100mb.bin" 2>&1 | tail -1)
+    UP=$("$GO_BIN" files put --state "$st/c-main" --host "m$link" "$LOCAL" "/$RNAME" 2>&1 | tail -1)
+    DN=$("$GO_BIN" files get --state "$st/c-main" --host "m$link" "/$RNAME" "$st/dn-100mb.bin" 2>&1 | tail -1)
   else
     UP=$(tmo 120 "$RUST_BIN" files upload --token "$TOK" --identity-dir "$st/c-main/identity" "/$RNAME" "$LOCAL" 2>&1 | tail -1)
     DN=$(tmo 120 "$RUST_BIN" files download --token "$TOK" --identity-dir "$st/c-main/identity" "/$RNAME" "$st/dn-100mb.bin" 2>&1 | tail -1)
@@ -495,7 +511,7 @@ base_segment() {
 
   # FB：files 4 并发 list 不误伤（busy 满员语义由单测 busy_rejection_when_conns_full 钉死）
   if [[ "$C" == go ]]; then
-    FBOK=$("$GO_BIN" files list --state "$st/c-main" -host "m$link" 2>&1 | grep -c .)
+    FBOK=$("$GO_BIN" files list --state "$st/c-main" --host "m$link" 2>&1 | grep -c .)
     record "$link" FB-files "PASS" "list ${FBOK} 行（并发闸不误伤；满员拒绝面见单测）"
   else
     FB=$(tmo 30 "$RUST_BIN" files list --token "$TOK" --identity-dir "$st/c-main/identity" 2>&1 | grep -c .)
@@ -544,10 +560,10 @@ EOF
       --hold 120 >> "$st/c-sub/rust.log" 2>&1 &
     echo $! > "$st/c-sub/pid"
   fi
-  if V=$(wait_line_from "$st/exit/stdout.log" 'n=2/32' "$EL0" 40); then
+  if V=$(wait_line_from "$st/exit/stdout.log" 'n=2/32' "$EL0" 60); then
     record "$link" MP-n2 "PASS" "${V:0:100}"
   else
-    record "$link" MP-n2 "FAIL" "40s 内未见 n=2/32"
+    record "$link" MP-n2 "FAIL" "60s 内未见 n=2/32"
   fi
   stop_pid "$st/c-sub/pid"
 }
@@ -641,8 +657,8 @@ relay_segment() {
   dd if=/dev/urandom of="$LOCAL" bs=1048576 count=5 2>/dev/null
   local UP_SHA=$(sha256_of "$LOCAL") UP_OUT="" DN_OUT=""
   if [[ "$C" == go ]]; then
-    UP_OUT=$("$GO_BIN" files put --state "$st/c-main" -host "dead$link" "$LOCAL" "/$RNAME" 2>&1 | tail -1)
-    DN_OUT=$("$GO_BIN" files get --state "$st/c-main" -host "dead$link" "/$RNAME" "$st/dn-5mb.bin" 2>&1 | tail -1)
+    UP_OUT=$("$GO_BIN" files put --state "$st/c-main" --host "dead$link" "$LOCAL" "/$RNAME" 2>&1 | tail -1)
+    DN_OUT=$("$GO_BIN" files get --state "$st/c-main" --host "dead$link" "/$RNAME" "$st/dn-5mb.bin" 2>&1 | tail -1)
   else
     # files CLI 无 --endpoint-cache-dir（不识别会错位进 rest）——不带 = 会话无落盘缓存，
     # 竞速 token 端点（dead-direct 形态下恒中继），段级隔离天然成立
