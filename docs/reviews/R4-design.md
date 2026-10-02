@@ -426,6 +426,16 @@ exit 侧：`中继：注册腿开跑（中继 %v，%s）`、`中继：注册成�
    `is_public_addr`）+ 同 /64 去重（v6 面虽不承载，去重逻辑就位待 R5 启用）。
 6. **exit 腿非阻塞 send WouldBlock = 丢包**（与主 socket send_to 同形态；Go 为阻塞写——
    UDP 内核缓冲满的瞬时突发场景，登记）。
+7. **测试缝登记（代码评审 低-8 补录）**：三层注入——`homeway-cli relay --no-hints`
+   （中继不递送两端 hint；模拟真机 NAT 丢打洞响应——同机回环上 hint→盲打→任意源
+   采纳会把客户端翻成直连，中继驻留/升级条纹的前提不成立）、客户端 `--dead-direct`
+   （token 直连端点指死端口）、`--inject relay-lock`（test-seams 构建，SessionConfig.
+   relay_only 装配期生效：非中继源按从未到达处理）。三者默认全关、生产形态不可达
+   （relay 恒 token 模式/no_hints=false/relay_only=false）；`--open` 同为测试形态。
+   完整口径见 INTEROP-CRITERIA「测试形态口径」节。
+8. **`secret: Option` 的 None = 开放注册仍是隐式形态**（代码评审 低-14）：Go 用显式
+   `Open bool` + 构造期 panic 消灭「静默开放」（FIX-89）。Rust 侧由 CLI 层纪律保证
+   只有 `--open` 显式传 None；enum Auth 的类型化改形登记 R5 打磨批（无行为差异）。
 
 ---
 

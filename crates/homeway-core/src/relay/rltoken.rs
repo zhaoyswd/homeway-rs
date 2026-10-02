@@ -69,16 +69,30 @@ pub fn load_or_create_secret(state_dir: &std::path::Path) -> std::io::Result<([u
             return Ok((s, false));
         }
     }
-    std::fs::create_dir_all(state_dir)?;
-    let mut secret = [0u8; 32];
-    getrandom::getrandom(&mut secret).map_err(std::io::Error::other)?;
-    std::fs::write(&path, secret)?;
     #[cfg(unix)]
     {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600));
+        use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _};
+        std::fs::DirBuilder::new().mode(0o700).create(state_dir)?;
+        // create_new 一次成型 0600（无 0644 窗口——Go cli.go:152-160 同义）
+        let mut secret = [0u8; 32];
+        getrandom::getrandom(&mut secret).map_err(std::io::Error::other)?;
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(&path)?;
+        use std::io::Write as _;
+        f.write_all(&secret)?;
+        Ok((secret, true))
     }
-    Ok((secret, true))
+    #[cfg(not(unix))]
+    {
+        std::fs::create_dir_all(state_dir)?;
+        let mut secret = [0u8; 32];
+        getrandom::getrandom(&mut secret).map_err(std::io::Error::other)?;
+        std::fs::write(&path, secret)?;
+        Ok((secret, true))
+    }
 }
 
 /// 只读 relay.key（不生成——离线推算路径不得有「顺手造新钥」副作用）。

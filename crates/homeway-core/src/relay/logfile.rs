@@ -25,9 +25,28 @@ pub struct RotatingLog {
 
 impl RotatingLog {
     pub fn open(dir: &Path, name: &str) -> std::io::Result<Self> {
-        std::fs::create_dir_all(dir)?;
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            std::fs::DirBuilder::new().mode(0o700).create(dir)
+        }
+        .or_else(|e| {
+            if e.kind() == std::io::ErrorKind::AlreadyExists {
+                Ok(())
+            } else {
+                Err(e)
+            }
+        })?;
         let path = dir.join(name);
-        let file = OpenOptions::new().create(true).append(true).open(&path)?;
+        #[cfg(unix)]
+        let mut opts = OpenOptions::new();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            opts.mode(0o600);
+        }
+        #[cfg(not(unix))]
+        let mut opts = OpenOptions::new();
+        let file = opts.create(true).append(true).open(&path)?;
         let written = file.metadata().map(|m| m.len()).unwrap_or(0);
         Ok(Self { path, file: Some(file), written })
     }
@@ -69,12 +88,24 @@ fn rotate_path(base: &Path, i: usize) -> PathBuf {
     PathBuf::from(s)
 }
 
-/// 时间戳（Go 布局 `2006-01-02 15:04:05.000` 的本地时区等价形态）。
+/// 时间戳（Go 布局 `2006-01-02 15:04:05.000 [relay] ` 的**本地时区**等价形态：
+/// localtime_r 取本地偏移——epoch civil 换算仍是 UTC 基）。
 fn stamp() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
-    let secs = now.as_secs() as i64;
+    let secs_utc = now.as_secs() as i64;
+    // 本地时区偏移（libc::localtime_r；失败按 UTC）
+    let local_offset: i64 = unsafe {
+        let t: libc::time_t = secs_utc as libc::time_t;
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            0
+        } else {
+            tm.tm_gmtoff as i64
+        }
+    };
+    let secs = secs_utc + local_offset;
     let millis = now.subsec_millis();
     // days since epoch → y/m/d（civil_from_days 算法）
     let days = secs.div_euclid(86400);
@@ -90,7 +121,7 @@ fn stamp() -> String {
     let d = doy - (153 * mp + 2) / 5 + 1;
     let mth = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if mth <= 2 { y + 1 } else { y };
-    format!("{y:04}-{mth:02}-{d:02} {h:02}:{m:02}:{s:02}.{millis:03}")
+    format!("{y:04}-{mth:02}-{d:02} {h:02}:{m:02}:{s:02}.{millis:03} ")
 }
 
 /// 两级日志句柄：ulogf（终端 + 抄文件）/ logf（只文件）。

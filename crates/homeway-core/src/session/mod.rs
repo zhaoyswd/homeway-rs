@@ -775,6 +775,21 @@ fn run_probe_candidates(shared: &Arc<Shared>) {
 
 // ---------- 巡检（controller；拍头基准） ----------
 
+/// relayUpgradeStreak：连续停留中继的拍数（一旦不是中继就清零）。
+/// 纯函数（Go tunmode.go:139-141 同义——「纯函数，单测覆盖」）。
+fn relay_upgrade_streak(via: Via, streak: u32) -> u32 {
+    if via == Via::Relay {
+        streak + 1
+    } else {
+        0
+    }
+}
+
+/// relayUpgradeDue：该不该做这一轮升级尝试（via=="relay" && streak >= 5）。
+fn relay_upgrade_due(via: Via, streak: u32) -> bool {
+    via == Via::Relay && streak >= RELAY_UPGRADE_EVERY
+}
+
 struct PatrolBeat {
     streak: u32,
     last_counted: Option<Instant>,
@@ -852,9 +867,9 @@ fn patrol_loop(shared: Arc<Shared>) {
             // 候选重投（cache.Merge(static)，Go Transport.RearmSoft 复合）+ 一发
             // PathProbe 载体 + 成功且 via 变化打升级成功行并刷 link；Rust 无域名候选
             // ⇒ 无 refreshDomain 对应面〔登记〕）
-            if snap.via == Via::Relay {
-                beat.relay_streak += 1;
-                if beat.relay_streak >= RELAY_UPGRADE_EVERY {
+            beat.relay_streak = relay_upgrade_streak(snap.via, beat.relay_streak);
+            if relay_upgrade_due(snap.via, beat.relay_streak) {
+                {
                     beat.relay_streak = 0;
                     (shared.logf)(&format!(
                         "RELAY-UPGRADE：已在中继停留 {}，重新武装赛跑试直连（下一发出站包镜像到全部候选）",
@@ -1140,5 +1155,26 @@ mod tests {
         assert!(should_refresh_reg(None, base), "无基线首拍即补");
         assert!(!should_refresh_reg(Some(base), base + REG_REFRESH_EVERY - Duration::from_secs(1)));
         assert!(should_refresh_reg(Some(base), base + REG_REFRESH_EVERY));
+    }
+}
+
+#[cfg(test)]
+mod upgrade_streak_tests {
+    use super::*;
+
+    /// Go tunmode.go:139-150 纯函数语义：成功拍推进 / 非 relay 清零 / 触发归零 /
+    /// due 双条件。
+    #[test]
+    fn streak_and_due_semantics() {
+        // 推进：relay 拍 +1
+        assert_eq!(relay_upgrade_streak(Via::Relay, 0), 1);
+        assert_eq!(relay_upgrade_streak(Via::Relay, 4), 5);
+        // 非 relay 清零（direct/none 都清）
+        assert_eq!(relay_upgrade_streak(Via::Direct, 4), 0);
+        assert_eq!(relay_upgrade_streak(Via::None, 4), 0);
+        // due：relay 且 streak >= 5
+        assert!(!relay_upgrade_due(Via::Relay, 4));
+        assert!(relay_upgrade_due(Via::Relay, 5));
+        assert!(!relay_upgrade_due(Via::Direct, 100));
     }
 }

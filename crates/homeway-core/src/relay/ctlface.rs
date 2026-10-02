@@ -15,7 +15,7 @@ use std::io::{Read, Write};
 use std::net::{SocketAddr, TcpStream};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use x25519_dalek::PublicKey;
 
@@ -129,8 +129,19 @@ pub fn run_handshake(
         Err(_) => return Err(HsError::Io),
     };
     let _ = stream.set_nonblocking(false);
-    let _ = stream.set_read_timeout(Some(HANDSHAKE_DEADLINE));
-    let _ = stream.set_write_timeout(Some(HANDSHAKE_DEADLINE));
+    // 绝对期限（Go SetDeadline 同义）：socket 级超时是**每次 read** 的超时——
+    // 慢滴对端每 9s 滴 1 字节可无限续命；此处每次读前收紧剩余量（评审 高-1）
+    let deadline = Instant::now() + HANDSHAKE_DEADLINE;
+    let tighten = |s: &mut TcpStream| -> bool {
+        let remain = deadline.saturating_duration_since(Instant::now());
+        if remain.is_zero() {
+            return false;
+        }
+        s.set_read_timeout(Some(remain)).is_ok() && s.set_write_timeout(Some(remain)).is_ok()
+    };
+    if !tighten(&mut stream) {
+        return Err(HsError::Io);
+    }
 
     // ① HELLO（版本不在 HELLO 自报——CHALLENGE 形状对老解码器必须不变）
     let hello = read_msg(&mut stream).map_err(|_| HsError::Io)?;
@@ -140,6 +151,9 @@ pub fn run_handshake(
     let pub_: [u8; 32] = rw::decode_hello(&hello).ok_or(HsError::Io)?;
     let label = relay_id(&pub_);
 
+    if !tighten(&mut stream) {
+        return Err(HsError::Io);
+    }
     // ② CHALLENGE（临时密钥 + nonce；与 UDP 注册同款）
     let mut eph_bytes = [0u8; 32];
     getrandom::getrandom(&mut eph_bytes).map_err(|_| HsError::Io)?;
@@ -149,6 +163,9 @@ pub fn run_handshake(
     getrandom::getrandom(&mut nonce).map_err(|_| HsError::Io)?;
     write_msg(&mut stream, &rw::encode_challenge(eph_pub.as_bytes(), &nonce)).map_err(|_| HsError::Io)?;
 
+    if !tighten(&mut stream) {
+        return Err(HsError::Io);
+    }
     // ③ PROOF（**DH 恒校** + token 模式叠加 PSK；版本自报必须 =2）
     let proof = read_msg(&mut stream).map_err(|_| HsError::Io)?;
     if proof.first() != Some(&rw::sub::PROOF) {
@@ -179,6 +196,9 @@ pub fn run_handshake(
     }
 
     // ⑤ OK（恒 v2 形状：token 模式带中继身份 MAC；开放模式零 MAC 占位）
+    if !tighten(&mut stream) {
+        return Err(HsError::Io);
+    }
     let ok_mac = secret.map_or(vec![0u8; 16], |sec| rw::ok_auth_mac(&sec, &nonce).to_vec());
     write_msg(&mut stream, &rw::encode_ok_auth(&ok_mac)).map_err(|_| {
         established.fetch_sub(1, Ordering::SeqCst);
@@ -370,6 +390,41 @@ mod tests {
         let r = srv.join().unwrap();
         assert!(matches!(r, Err(HsError::EstablishedFull(1))));
         assert_eq!(established.load(Ordering::SeqCst), 1, "满员拒绝后计数回退到原值");
+    }
+
+    /// 慢滴攻击面（评审 高-1）：对端每 500ms 滴 1 字节（单次 read 远未超时），
+    /// 但总时长远超 10s 绝对期限——握手必须在期限内断（不得占住槽位 ~5 分钟）。
+    #[test]
+    fn handshake_absolute_deadline_beats_slow_drip() {
+        let ln = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = ln.local_addr().unwrap();
+        let established = Arc::new(AtomicI32::new(0));
+        let slot_ctr = Arc::new(AtomicI32::new(0));
+        let srv = {
+            let established = Arc::clone(&established);
+            let slot_ctr = Arc::clone(&slot_ctr);
+            std::thread::spawn(move || {
+                let (s, _) = ln.accept().unwrap();
+                let mut slot = HandshakeSlot::acquire(&slot_ctr).unwrap();
+                let r = run_handshake(s, Some([9u8; 32]), &established, 64, &mut slot, &noop_logf());
+                assert!(matches!(r, Err(HsError::Io)), "绝对期限内必须断");
+            })
+        };
+        let mut c = TcpStream::connect(addr).unwrap();
+        let drip_start = std::time::Instant::now();
+        let mut i = 0u32;
+        while std::time::Instant::now() - drip_start < Duration::from_secs(13) {
+            // 每次只滴 1 字节（间隔远小于 10s 的单次读超时）
+            let b = [(0x41 + (i % 26)) as u8];
+            if c.write_all(&b).is_err() {
+                break; // 服务端按期限断连
+            }
+            i += 1;
+            std::thread::sleep(Duration::from_millis(500));
+        }
+        let _ = srv.join();
+        assert_eq!(slot_ctr.load(Ordering::SeqCst), 0, "槽位随断连释放");
+        assert_eq!(established.load(Ordering::SeqCst), 0);
     }
 
     /// 已建立连接的非阻塞读写往返（read_available/write_msg_nonblocking）。

@@ -6,3 +6,4 @@
 *.so
 *.a
 .DS_Store
+/identity

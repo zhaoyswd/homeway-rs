@@ -26,6 +26,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::sync::Arc;
 use std::os::fd::AsRawFd as _;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::time::{Duration, Instant};
@@ -86,6 +87,8 @@ pub struct ServerBind {
     /// 探测应答端点列表段来源（公网端点公布面；3f 接——现在恒空）。
     probe_endpoints: Vec<SocketAddr>,
     logf: crate::Logf,
+    /// 细节日志面（#17 丢弃行——Go logfD 对应）。
+    dlogf: crate::Logf,
     on_hint: Option<OnHint>,
     on_leg_frame: Option<OnLegFrame>,
     src_seen: HashMap<SocketAddr, ()>,
@@ -160,7 +163,8 @@ impl ServerBind {
             build: build.to_string(),
             caps: 0,
             probe_endpoints: Vec::new(),
-            logf,
+            logf: Arc::clone(&logf),
+            dlogf: logf,
             on_hint: None,
             on_leg_frame: None,
             src_seen: HashMap::new(),
@@ -341,13 +345,13 @@ impl ServerBind {
     /// 向中继数据口拨一条腿：连接 socket + 发认证标记（v2 = LEGUP‖cookie‖MAC）+
     /// 入双表。同 id 或同远端重复注册 = 先拆旧再建（中继侧会话重建的语义）。
     /// 上限只拦新 id（C3：重放替换不拦）。
-    pub fn register_leg(&mut self, id: u64, remote: SocketAddr, marker: &[u8]) -> Result<(), String> {
-        let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| e.to_string())?;
-        sock.connect(remote).map_err(|e| e.to_string())?;
+    pub fn register_leg(&mut self, id: u64, remote: SocketAddr, marker: &[u8]) -> Result<(), super::relayleg::LegError> {
+        let sock = UdpSocket::bind("0.0.0.0:0")?;
+        sock.connect(remote)?;
         sock.set_nonblocking(true).ok();
-        sock.send(marker).map_err(|e| e.to_string())?;
+        sock.send(marker)?;
         if !self.leg_by_id.contains_key(&id) && self.leg_by_id.len() >= RELAY_LEG_MAX {
-            return Err(format!("腿数已达上限 {RELAY_LEG_MAX}"));
+            return Err(crate::server::relayleg::LegError::LegCap(RELAY_LEG_MAX));
         }
         if let Some(old) = self.leg_by_id.get(&id) {
             let old_remote = old.remote;
@@ -520,12 +524,14 @@ impl ServerBind {
             let recent = self.leg_recent.contains_key(ep);
             let ever_leg = self.leg_ports.contains(ep);
             if recent || ever_leg {
-                // #17：丢弃 + 节流计数（等控制面重放重建腿，或下一入站包重学 endpoint）
+                // #17：丢弃 + 节流计数（等控制面重放重建腿，或下一入站包重学 endpoint）。
+                // 计数口径 = 每次 Send 派发 +1（Go bind.go:975 同义；非逐包），
+                // 包数取本 endpoint 批内包数（len(bufs)），通道 = 细节日志（logfD）。
                 self.leg_dropped += 1;
+                let ep_pkgs = out.wire.iter().filter(|(e2, _)| e2 == ep).count();
                 if self.leg_dropped <= 3 || self.leg_dropped.is_multiple_of(1000) {
-                    (self.logf)(&format!(
-                        "腿已摘或非现任（{ep}）丢弃出站 {} 包（等控制面重放重建腿）",
-                        out.wire.len()
+                    (self.dlogf)(&format!(
+                        "腿已摘或非现任（{ep}）丢弃出站 {ep_pkgs} 包（等控制面重放重建腿）"
                     ));
                 }
                 continue;
@@ -676,6 +682,91 @@ mod tests {
         // hint 帧消费
         let hint = frame::hint_bytes("1.2.3.4:9");
         assert!(b.process_packet(&hint, src).is_none());
+    }
+
+
+    // ---------- 腿表（R4；评审 中-4 补测） ----------
+
+    /// 同 id 重注册 = 先拆后建（中继重放语义）；同远端替换；上限只拦新 id（C3）。
+    #[test]
+    fn leg_table_register_replace_and_cap() {
+        let mut b = ServerBind::open(0, "t", noop_logf()).unwrap();
+        let r1: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+        let r2: SocketAddr = "127.0.0.1:5002".parse().unwrap();
+        assert!(b.register_leg(1, r1, b"marker").is_ok());
+        assert_eq!(b.leg_fds().len(), 1);
+        // 同 id 重注册（重放）= 替换：远端换成 r2，仍是 1 条
+        assert!(b.register_leg(1, r2, b"marker").is_ok());
+        assert_eq!(b.leg_fds().len(), 1);
+        // 同远端不同 id = 顶掉旧 id
+        assert!(b.register_leg(2, r2, b"marker").is_ok());
+        assert_eq!(b.leg_fds().len(), 1);
+        // 上限只拦新 id：填满后，已有 id 的替换仍过、新 id 拒（C3）
+        // 表内此刻 = {2@r2}（id 1 被同远端顶掉）→ 补 RELAY_LEG_MAX-1 条新 id 恰满
+        for i in 3..=(RELAY_LEG_MAX as u64 + 1) {
+            let r: SocketAddr = format!("127.0.0.1:{}", 6000 + i).parse().unwrap();
+            assert!(b.register_leg(i, r, b"m").is_ok(), "id={i} 应入表");
+        }
+        assert_eq!(b.leg_fds().len(), RELAY_LEG_MAX, "应恰好满表（id2 + 62 新 id）");
+        let extra: SocketAddr = "127.0.0.1:6999".parse().unwrap();
+        assert!(matches!(
+            b.register_leg(999, extra, b"m"),
+            Err(crate::server::relayleg::LegError::LegCap(RELAY_LEG_MAX))
+        ));
+        // 已有 id 的替换（重放语义）不受上限拦——id 1 已被顶掉，用仍在表内的 id 5
+        assert!(b.register_leg(5, r1, b"m").is_ok(), "已有 id 替换不受上限拦");
+        b.clear_legs();
+        assert_eq!(b.leg_fds().len(), 0);
+    }
+
+    /// #17 丢弃语义：腿在 = 走腿（tx 计数）；腿摘 = 丢弃（不回落主 socket）；
+    /// leg_ports 记忆不受 5min 窗限。
+    #[test]
+    fn leg_send_dispatch_and_drop() {
+        let mut b = ServerBind::open(0, "t", noop_logf()).unwrap();
+        // 腿远端要有真监听者（macOS 连接 UDP：对无人监听口的 ICMP 回来后
+        // send=ECONNREFUSED——腿会被误判死亡）
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let r1: SocketAddr = sink.local_addr().unwrap();
+        assert!(b.register_leg(7, r1, b"m").is_ok());
+        let mut out = InboundOut::default();
+        out.wire.push((r1, vec![1u8; 32]));
+        let tx0 = b.tx_bytes;
+        b.send_wire(&out);
+        assert!(b.tx_bytes > tx0, "命中腿：经腿 socket 发（计数推进）");
+        // 摘腿后同 endpoint → #17 丢弃（不回落主 socket——tx 不动）
+        b.remove_leg(7);
+        out.wire.clear();
+        out.wire.push((r1, vec![2u8; 32]));
+        let tx1 = b.tx_bytes;
+        b.send_wire(&out);
+        assert_eq!(b.tx_bytes, tx1, "#17：腿已摘的 endpoint 丢弃出站");
+    }
+
+    /// LEGUP 标记吞包防御（5B/37B）与正常帧入 device 的分派。
+    #[test]
+    fn leg_readable_swallows_legup_markers() {
+        let mut b = ServerBind::open(0, "t", noop_logf()).unwrap();
+        // 用一个真监听口当腿远端（连接 socket 能建）
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let r: SocketAddr = sink.local_addr().unwrap();
+        assert!(b.register_leg(9, r, b"LEGUP").is_ok());
+        let fd = b.leg_fds()[0];
+        // 5B v1 标记：吞
+        assert!(sink.send_to(b"LEGUP", r).is_ok());
+        std::thread::sleep(Duration::from_millis(50));
+        let (alive, inbound) = b.leg_readable(fd);
+        assert!(alive);
+        assert!(inbound.is_none(), "5B LEGUP 标记应吞包");
+        // 37B v2 标记：吞
+        let cookie = [3u8; 16];
+        let marker = crate::relaywire::legup_payload(9, &cookie, &[0u8; 32]);
+        assert_eq!(marker.len(), 37);
+        assert!(sink.send_to(&marker, r).is_ok());
+        std::thread::sleep(Duration::from_millis(50));
+        let (alive, inbound) = b.leg_readable(fd);
+        assert!(alive);
+        assert!(inbound.is_none(), "37B LEGUP 认证标记应吞包");
     }
 
     /// 端口退让：占用后 +1（真实 socket 面）。

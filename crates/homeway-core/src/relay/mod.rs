@@ -53,8 +53,6 @@ const DEFAULT_MAX_LEGS: usize = 256; // 注册腿总数上限（匿名洪水兜�
 const DEFAULT_MAX_CTL_CONNS: u16 = 64; // 已建立控制连接总数上限
 const CTL_PEND_MAX: usize = 16; // 等腿窗的客户端包缓冲上限
 const RATE_BUCKET_TTL: Duration = Duration::from_secs(2); // 限流桶清理窗
-/// 等腿窗的客户端包缓冲上限（Go ctlPendMax）。
-pub const CTL_PEND_MAX_PUB: usize = CTL_PEND_MAX;
 
 /// 中继参数（CLI/装配层构造）。
 #[derive(Clone)]
@@ -123,11 +121,8 @@ struct AssocKey {
     client: SocketAddr,
 }
 
-/// 一条注册腿（后端身份 = label；relayID 分配/回收见 R4-design §1.2）。
-/// label 与 HashMap 键同值（表项身份自文档；删表路径经键打日志）。
-#[expect(dead_code)]
+/// 一条注册腿（后端身份 = label = HashMap 键；relayID 分配/回收见 R4-design §1.2）。
 struct Leg {
-    label: [u8; 8],
     pubkey: [u8; 32],
     /// 注册腿源地址（后端公网映射，也是给客户端的 hint）；None = 纯控制腿。
     addr: Option<SocketAddr>,
@@ -271,6 +266,9 @@ impl Relay {
             return Ok(s);
         }
         logf(&format!("⚠️ 监听端口 {} 被占用 —— 自动往后找", want.port()));
+        if want.port() == 0 {
+            return UdpSocket::bind(SocketAddr::new(want.ip(), 0));
+        }
         for p in want.port().saturating_add(1)..=want.port().saturating_add(9) {
             if let Ok(c) = UdpSocket::bind(SocketAddr::new(want.ip(), p)) {
                 logf(&format!("中继改用端口 {p}（token 里写的就是它）"));
@@ -453,15 +451,19 @@ impl Relay {
                         let read: Result<[u8; 8], ()> = match self.ctl_conns.get_mut(&id) {
                             Some(conn) => conn
                                 .read_available(&mut msgs)
-                                .map(|()| {
-                                    conn.last_read = Instant::now();
-                                    conn.label
-                                })
+                                .map(|()| conn.label)
                                 .map_err(|_| ()),
                             None => continue,
                         };
                         match read {
                             Ok(label) => {
+                                if !msgs.is_empty() {
+                                    // 活性只认**完整消息**（半帧涓流不算——Go 每条
+                                    // 消息前重置绝对读期限的同义实现）
+                                    if let Some(c) = self.ctl_conns.get_mut(&id) {
+                                        c.last_read = Instant::now();
+                                    }
+                                }
                                 for (sub, body) in msgs.drain(..) {
                                     self.ctl_message(id, label, sub, &body);
                                 }
@@ -503,8 +505,12 @@ impl Relay {
         for (label, sid) in release_list {
             self.release_session(label, sid);
         }
-        unsafe { libc::close(wake_fds[1]); }
-        let _ = wake_fds[0];
+        // 收工关两端（评审 低-13：只关写端会泄读端 fd + 在飞握手线程可能写到
+        // 已复用的 fd 号上）
+        unsafe {
+            libc::close(wake_fds[1]);
+            libc::close(wake_fds[0]);
+        }
         Ok(())
     }
 
@@ -555,12 +561,15 @@ impl Relay {
                 self.stats.forged += 1;
                 return;
             }
-            // 出题：临时密钥 + nonce（复用/建腿——**绝不替换**对象，只覆写挑战字段）
+            // 出题：临时密钥 + nonce（复用/建腿——**绝不替换**对象，只覆写挑战字段；
+            // 随机源异常静默放弃本轮（Go leg.go 同义——不 panic 掉驱动线程）
             let mut eph_bytes = [0u8; 32];
-            getrandom::getrandom(&mut eph_bytes).expect("系统随机源不可用");
+            let mut nonce_out = [0u8; 16];
+            if getrandom::getrandom(&mut eph_bytes).is_err() || getrandom::getrandom(&mut nonce_out).is_err() {
+                return;
+            }
+            let nonce = nonce_out;
             let eph = x25519_dalek::StaticSecret::from(eph_bytes);
-            let mut nonce = [0u8; 16];
-            getrandom::getrandom(&mut nonce).expect("系统随机源不可用");
             let entry = if let Some(lg) = self.legs.get_mut(&label) {
                 lg
             } else {
@@ -575,7 +584,6 @@ impl Relay {
                 self.legs.insert(
                     label,
                     Leg {
-                        label,
                         pubkey: pub_,
                         addr: None,
                         last: Instant::now(), // 未验证腿的注册窗口起点
@@ -1004,7 +1012,6 @@ impl Relay {
                 let remote = conn.remote;
                 self.ctl_conns.insert(id, conn);
                 let leg = self.legs.entry(label).or_insert_with(|| Leg {
-                    label,
                     pubkey: [0; 32], // 控制面建腿拿不到 pubkey——保留占位（准入靠 ctl_verified）
                     addr: None,
                     last: Instant::now(),
@@ -1101,6 +1108,8 @@ impl Relay {
         struct Pending {
             key: AssocKey,
             msg: Vec<u8>,
+            /// 提升过（本轮从 sid==0 拨上来）——回滚判据按 Go dialUp && sid!=0
+            /// （失败点之后**原本就在拨腿态**的会话也一并降级回 fallback）。
             promoted: bool,
         }
         let mut out: Vec<Pending> = Vec::new();
@@ -1267,6 +1276,11 @@ impl Relay {
                     hex(&label),
                     fmt_duration_go_secs(idle)
                 ));
+                // 挂着的控制连接一并关（Go reap.go:101-103 同义——否则连接占着
+                // established 名额直到读超时，半帧涓流可无限续命）
+                if let Some(ctl_id) = lg.ctl {
+                    self.close_ctl(ctl_id);
+                }
             }
             self.legs.remove(&label);
             let keys: Vec<AssocKey> = self.assocs.keys().filter(|k| k.label == label).copied().collect();
@@ -1328,15 +1342,6 @@ impl Relay {
         }
     }
 
-    /// 测试/诊断面：当前计数快照。
-    pub fn stats(&self) -> Stats {
-        self.stats
-    }
-}
-
-/// 中继密钥的公开标识（日志用）：SHA-256(secret)。
-pub fn relay_secret_id_hex(secret: &[u8; 32]) -> String {
-    hex(&rltoken::relay_secret_id(secret)[..6])
 }
 
 fn hex(b: &[u8]) -> String {

@@ -24,6 +24,15 @@ use crate::wtransport::frame::{self, relay_id};
 use super::engine::EngineCmd;
 use crate::Logf;
 
+/// 注册腿/控制面错误（typed——AGENTS「错误一律 thiserror」；日志侧 Display）。
+#[derive(Debug, thiserror::Error)]
+pub enum LegError {
+    #[error("IO: {0}")]
+    Io(#[from] std::io::Error),
+    #[error("腿数已达上限 {0}")]
+    LegCap(usize),
+}
+
 // ---------- 常量（relayclient.go:26-31 + relayctl.go:28-32） ----------
 
 /// 注册腿保活（中继侧 90s 过期 ⇒ 3 次容错）。
@@ -58,6 +67,7 @@ pub struct RelayArg {
 /// `ParseRelayArg`（serve.go:753-779 同义）：rl1 token（地址 + 鉴权密钥）或裸
 /// host:port（开放模式）。Direct 端点优先、无 Direct 用全端点；端点非 IP:port 报错。
 pub fn parse_relay_arg(v: &str) -> Result<RelayArg, String> {
+    // （装配期一次性解析，错误文案直接面向 CLI 用户——保留 String 形态；运行期错误走 LegError）
     let v = v.trim();
     if v.starts_with(crate::relay::rltoken::PREFIX) {
         let tok = crate::relay::rltoken::decode_relay_token(v)
@@ -149,9 +159,14 @@ fn run_relay_leg(
     let mode = if secret.is_some() { "token 模式（rl1 凭据）" } else { "开放模式（无 token）" };
     (logf)(&format!("中继：注册腿开跑（中继 {relay}，{mode}）"));
 
+    // 收工贯通（评审 中-2）：**任何** return 路径都要停 punch worker——
+    // 通道断开（驱动线程先退）也走这里，防 worker 100% 空转 + socket 副本泄漏
+    let shutdown = |punch_stop: &AtomicBool| {
+        punch_stop.store(true, Ordering::SeqCst);
+    };
     loop {
         if stop.load(Ordering::SeqCst) {
-            punch_stop.store(true, Ordering::SeqCst);
+            shutdown(&punch_stop);
             return;
         }
         // 5s 节拍（事件驱动的睡法：事件随时唤醒本线程）
@@ -171,7 +186,10 @@ fn run_relay_leg(
                 }
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                shutdown(&punch_stop);
+                return;
+            }
         }
         if !verified {
             send_hello(&sock, relay, label, pub_key.as_bytes(), logf);
@@ -272,13 +290,15 @@ fn run_punch_worker(
     stop: &AtomicBool,
     logf: &Logf,
 ) {
-    let mut last_punch: std::collections::HashMap<SocketAddr, Instant> = std::collections::HashMap::new();
+    // 节流键 = IP（Go 同义；端口动态——按地址键可被换端口绕过）
+    let mut last_punch: std::collections::HashMap<std::net::IpAddr, Instant> = std::collections::HashMap::new();
     while !stop.load(Ordering::SeqCst) {
         let client = match rx.recv_timeout(Duration::from_millis(500)) {
             Ok(c) => c,
-            Err(_) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
         };
-        if let Some(t) = last_punch.get(&client) {
+        if let Some(t) = last_punch.get(&client.ip()) {
             if t.elapsed() < PUNCH_MIN_INTERVAL {
                 continue;
             }
@@ -286,7 +306,7 @@ fn run_punch_worker(
         if last_punch.len() > PUNCH_TABLE_MAX {
             last_punch.clear(); // 防无界增长：清了重来（都是消耗品）
         }
-        last_punch.insert(client, Instant::now());
+        last_punch.insert(client.ip(), Instant::now());
         // 判据行（每地址 3s 节流，量可控——摘要级）
         (logf)(&format!(
             "中继：收到对端地址线索 {client} → 盲打 {PUNCH_BURST} 包（开自己 NAT 过滤；能否直连仍由 WG 握手决定）"
@@ -547,7 +567,13 @@ enum ReadOutcome {
 /// 中继 90s 判死循环重连）。
 fn read_ctl_once(dec: &mut rw::CtlDecoder, conn: &mut TcpStream, out: &mut Vec<(u8, Vec<u8>)>) -> Result<ReadOutcome, String> {
     let mut buf = [0u8; 1024];
+    // 涓流自检（评审 低-13）：有字节就不停地喂——对端每 <1s 滴字节可把本函数
+    // 钉死在外层之外；上界后按静默拍返回（外层仍会再进来——活性/期限由调用方管）
+    let entry = Instant::now();
     loop {
+        if entry.elapsed() > Duration::from_secs(2) {
+            return Ok(ReadOutcome::Quiet);
+        }
         if !out.is_empty() {
             // （feed 已把全部完整消息按序入列；取首条，其余留给后续调用）
             let m = out.remove(0);
