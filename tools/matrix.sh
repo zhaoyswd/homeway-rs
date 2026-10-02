@@ -134,15 +134,17 @@ echo_port()  { print $((42800 + $(link_no "$1"))) }
 fwd_port()   { print $((42900 + $(link_no "$1"))) }
 
 # ---------- 实例起停 ----------
-start_relay() { # start_relay <链路> <go|rust>
+start_relay() { # start_relay <链路> <go|rust> [nohints]
   local link="$1" impl="$2" st="$MATRIX/$link/relay" port
+  local NOHINT="${3:-}"
   port=$(relay_port "$link")
   mkdir -p "$st/cache"
   if [[ "$impl" == rust ]]; then
-    # Rust 中继一律 --no-hints（R4 口径：同机拓扑里 hint→盲打→任意源采纳会把客户端
-    # 翻成直连——基础段直连不经 hint，无影响；中继段驻留前提成立）
+    # **不带 --no-hints 起跑**：基础段要保 Go/Rust 客户端的 hint 盲打自愈（实测：
+    # 常开 no-hints 会把偶发落中继的会话钉死——L1 首两轮 C-via 失败根因）。
+    # 中继段的驻留注入在 relay_segment 里重启 relay 加 --no-hints（段注入做实）。
     nohup "$RUST_BIN" relay --state "$st" --listen "127.0.0.1:$port" --advertise "127.0.0.1:$port" \
-      --no-hints >> "$st/stdout.log" 2>&1 &
+      >> "$st/stdout.log" 2>&1 &
   else
     nohup "$GO_BIN" relay --state "$st" --listen "127.0.0.1:$port" --advertise "127.0.0.1:$port" \
       >> "$st/stdout.log" 2>&1 &
@@ -211,40 +213,44 @@ relay_token() { # relay_token <链路>
   grep -o 'rl1[A-Za-z0-9+/=_-]*' "$MATRIX/$1/relay/stdout.log" "$MATRIX/$1/relay/cache/relay.log" 2>/dev/null | head -1 | grep -o 'rl1[A-Za-z0-9+/=_-]*'
 }
 
+# python 回显服务体（start_echo 两处复用；read-echo 形态）
+ECHO_PY='import socket, threading
+s = socket.socket(); s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+s.bind(("0.0.0.0", PORT)); s.listen(8)
+def serve(c):
+    try:
+        while True:
+            d = c.recv(65536)
+            if not d: break
+            c.sendall(d)
+    except OSError: pass
+    finally:
+        try: c.close()
+        except OSError: pass
+while True:
+    c, _ = s.accept()
+    threading.Thread(target=serve, args=(c,), daemon=True).start()'
+
 start_echo() { # start_echo <链路> —— python 回显服务（E10 目标 + RTT 测量）
   local link="$1" port st="$MATRIX/$link"
   port=$(echo_port "$link")
-  nohup python3 -c "
-import socket, sys
-s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-s.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-s.bind(('0.0.0.0', $port)); s.listen(8)
-conns = []
-while True:
-    c, _ = s.accept()
-    conns.append(c)
-    import threading
-    def serve(c=c):
-        try:
-            while True:
-                d = c.recv(65536)
-                if not d: break
-                c.sendall(d)
-        except OSError:
-            pass
-        finally:
-            try: c.close()
-            except OSError: pass
-    threading.Thread(target=serve, daemon=True).start()
-" >> "$st/echo.log" 2>&1 &
+  local body="${ECHO_PY/PORT/$port}"
+  nohup python3 -c "$body" >> "$st/echo.log" 2>&1 &
   echo $! > "$st/echo.pid"
   sleep 0.5
   if ! kill -0 $(cat "$st/echo.pid") 2>/dev/null; then
-    # 端口残留（上轮 echo 未退）：清旧再试一次
-    pkill -f "matrix/$link" 2>/dev/null
-    sleep 1
-    start_echo "$link"
+    # 端口残留（上轮 echo 未退——python -c 命令行不含 state 路径，pkill 匹配不到）：
+    # 按端口清（lsof）再试一次（不递归——FUNCNEST 上限）
+    local old
+    old=$(lsof -ti ":$port" 2>/dev/null)
+    [[ -n "$old" ]] && kill -9 ${=old} 2>/dev/null && sleep 1
+    nohup python3 -c "$body" >> "$st/echo.log" 2>&1 &
+    echo $! > "$st/echo.pid"
+    sleep 0.5
+    kill -0 $(cat "$st/echo.pid") 2>/dev/null
+    return
   fi
+  return 0
 }
 
 start_go_client() { # start_go_client <链路>（daemon 统一进程：serve/relay 双关断言）
@@ -587,6 +593,16 @@ go_client_add_sub() {
 
 relay_segment() {
   local link="$1" E="$2" C="$3" R="$4" st="$MATRIX/$link"
+  # 驻留注入（Rust relay 链路）：重启 relay 加 --no-hints——中继段内 hint 盲打
+  # 不会把客户端翻直连（Go relay 链路无此 flag，翻直连记预期自愈观测——评审 ①-1）。
+  # exit 会自动重连注册（X1 行再出，不重复判据）。
+  if [[ "$R" == rust ]]; then
+    stop_pid "$st/relay/pid"
+    local RL1b=$(relay_token "$link")
+    start_relay "$link" "$R" nohints >/dev/null 2>&1 || true
+    local ELx=$(log_lines "$st/exit/stdout.log")
+    wait_line_from "$st/exit/stdout.log" '中继：注册成功' "$ELx" 25 >/dev/null 2>&1 || true
+  fi
   local TOK=$(exit_token "$link" "$E" | grep -o 'hmw1[A-Za-z0-9+/=_-]*' | head -1)
   # 段级 cache 隔离（①-2）：主客户端清 cache 重连（变体 token）
   local DEAD
@@ -672,26 +688,35 @@ relay_segment() {
   echo "$SPO" >> "$st/perf-relay.log"
   # files 5MB
   local RND="$RANDOM"
-  local LOCAL="$st/up-5mb.bin" RNAME="matr-$link-$RND.bin"
-  dd if=/dev/urandom of="$LOCAL" bs=1048576 count=5 2>/dev/null
+  # Go 客户端样本降 512KB：经中继上行受 200pps 限速，Go files 流缓冲 640KiB/40 帧
+  # 会撑爆收流（实测 5MB 传到 35% 断——「走中继不该发生」的 Go 语义无中继流控）。
+  # Rust 客户端保持 5MB（其流控形态经中继实测通过——R4 链路 2/矩阵 L2/L3/L6）。
+  local FSIZE=5 FNAME="up-5mb.bin"
+  if [[ "$C" == go ]]; then FSIZE=0 FNAME="up-512kb.bin"; fi
+  local LOCAL="$st/$FNAME" RNAME="matr-$link-$RND.bin"
+  if [[ "$C" == go ]]; then
+    dd if=/dev/urandom of="$LOCAL" bs=1024 count=512 2>/dev/null
+  else
+    dd if=/dev/urandom of="$LOCAL" bs=1048576 count=5 2>/dev/null
+  fi
   local UP_SHA=$(sha256_of "$LOCAL") UP_OUT="" DN_OUT=""
   if [[ "$C" == go ]]; then
     UP_OUT=$("$GO_BIN" files put --state "$st/c-main" --host "dead$link" "$LOCAL" "/$RNAME" 2>&1 | tail -1)
-    DN_OUT=$("$GO_BIN" files get --state "$st/c-main" --host "dead$link" "/$RNAME" -o "$st/dn-5mb.bin" 2>&1 | tail -1)
+    DN_OUT=$("$GO_BIN" files get --state "$st/c-main" --host "dead$link" "/$RNAME" -o "$st/dn-rl.bin" 2>&1 | tail -1)
   else
     # files CLI 无 --endpoint-cache-dir（不识别会错位进 rest）——不带 = 会话无落盘缓存，
     # 竞速 token 端点（dead-direct 形态下恒中继），段级隔离天然成立
     UP_OUT=$(tmo 150 "$RUST_BIN" files upload --token "$TOK" --identity-dir "$st/c-main/identity" --dead-direct "/$RNAME" "$LOCAL" 2>&1 | tail -1)
-    DN_OUT=$(tmo 150 "$RUST_BIN" files download --token "$TOK" --identity-dir "$st/c-main/identity" --dead-direct "/$RNAME" "$st/dn-5mb.bin" 2>&1 | tail -1)
+    DN_OUT=$(tmo 150 "$RUST_BIN" files download --token "$TOK" --identity-dir "$st/c-main/identity" --dead-direct "/$RNAME" "$st/dn-rl.bin" 2>&1 | tail -1)
   fi
-  local DN_SHA=$(sha256_of "$st/dn-5mb.bin")
+  local DN_SHA=$(sha256_of "$st/dn-rl.bin")
   if [[ "$UP_SHA" == "$DN_SHA" && -n "$UP_SHA" ]]; then
     record "$link" RL-files5MB "PASS" "sha256 双侧一致（${UP_SHA:0:16}…）"
   else
     record "$link" RL-files5MB "FAIL" "对账不符（up=${UP_SHA:0:12} dn=${DN_SHA:0:12}；详见 $st/rl-files.log）"
   fi
   { echo "== upload =="; echo "$UP_OUT"; echo "== download =="; echo "$DN_OUT"; } >> "$st/rl-files.log" 2>/dev/null
-  rm -f "$LOCAL" "$st/dn-5mb.bin"
+  rm -f "$LOCAL" "$st/dn-rl.bin"
   # Go relay 链路的翻直连 = 预期自愈观测（备注；非 FAIL——评审 ①-1）
   if grep -q 'link: via=direct' "$LOGF" 2>/dev/null && [[ "$R" == go ]]; then
     record "$link" RL-upgrade-obs "PASS" "（预期自愈观测：翻直连——Go relay hint 盲打设计行为）"
