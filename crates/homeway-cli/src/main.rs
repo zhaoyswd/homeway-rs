@@ -349,6 +349,25 @@ fn inject(session: &Session, what: &str) {
 /// 经隧道拨任意 v4 目标（transit 判据产出步骤）：建连 → 读到对端数据或 EOF 即证通。
 fn transit_dial(session: &Session, dst: SocketAddrV4) -> Result<usize, ConnErr> {
     let id = session.client().connect(dst)?;
+    // 先写一段载荷：echo 类目标只在收到数据后回显（只 connect+read 会一直阻塞——
+    // R1 旧形态的目标是主动发横幅的服务）；写完读首块回显即证通收工
+    let probe = b"transit-probe-payload-64b-0123456789abcdef0123456789abcdef";
+    let mut off = 0usize;
+    let mut zero = 0u32;
+    while off < probe.len() {
+        match session.client().write(id, probe[off..].to_vec()) {
+            Ok(w) if w > 0 => off += w,
+            _ => {
+                zero += 1;
+                if zero > 100_000 {
+                    eprintln!("transit: 写探测载荷无进展");
+                    let _ = session.client().close(id);
+                    return Err(ConnErr::Timeout);
+                }
+                std::thread::yield_now();
+            }
+        }
+    }
     let mut got = 0usize;
     loop {
         match session.client().read(id) {
@@ -357,9 +376,9 @@ fn transit_dial(session: &Session, dst: SocketAddrV4) -> Result<usize, ConnErr> 
                     break; // EOF（对端关）——连接本身已证通
                 }
                 got += chunk.len();
-                if got > 16 * 1024 * 1024 {
-                    break; // 测试面护栏：16MB 足够证通
-                }
+                // 证通即收：echo 类目标不主动 EOF（读到首块回显就关——原「读到 16MB
+                // 或 EOF」形态在 echo 目标上会阻塞到会话收工，E11 关闭行拖 5 分钟）
+                break;
             }
             Err(ConnErr::Closed) => {
                 // 对端 FIN（CloseWait EOF）——干净收尾：已收字节即结果

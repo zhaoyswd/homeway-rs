@@ -327,6 +327,22 @@ Rust exit 全判据绿；Rust exit ↔ Rust client 闭环；`intercept: …（di
 为共用真源，Rust 侧值集由它生成对账——只读消费 tier 资产）；本地 CI 脚本（无远端）。
 判据：矩阵全绿脚本化可重跑；fuzz 无新破口；A/B 报告入库 `docs/PERF-AB.md`。
 
+**进度注记（2026-10-03，第 1 会话末）**：
+- 第一道门完成（dsh 7高/12中/7低全处置，v2 定稿；记录 `docs/reviews/R5.md`）。
+- 5-d1/5-d2/5-b/5-e 已提交：低-4 双侧/M24/enum Auth/M23（8f5a24c）；M3 TCP DNS 腿
+  /M8 SSDP/M11 UPnP deadline/files busy 闸/M20 STUN-SPED golden/出口侧 Go 对照/
+  SUMS 修复（04bfcb3）；fuzz 双轨九目标 ≥100k 全绿（54f43c2）；词表三方门 PASS
+  （9da485e）。
+- 5-a matrix.sh 六链路在跑（判据集 19 项/链路；调试五轮抓出并修：rltoken 目录
+  AlreadyExists（R4 低-7 整改引入的 latent bug）、Go exit 无 --files-root flag（走
+  config）、判据行号起点晚于判据行、files CLI 参数错位、transit_dial 环回不进隧道
+  +echo 不回显、E13 环境抖动复核重试）。**KNOWN-GAP 实证登记**：Go exit × Rust
+  relay × speedtest 经中继并发形态不成立（exit 侧完整/客户端 connect 超时/relay 丢弃
+  572 包每分钟；files 5MB 同拓扑对账通过——缺口限定 speedtest 突发形态；R4 链路 3
+  「未跑满」的前身；深挖归 R6 前置批）。
+- 5-c/5-f 脚本就位待跑（perf-ab.sh + echo-rtt.py + ci-local.sh）。
+- **接棒指针**：全量矩阵两轮收口 → PERF-AB 数据 → 第二道门 → ROADMAP 勾选。
+
 ## R6 term 服务面（估 12–18 会话日，最大单项）
 
 范围：alacritty_terminal 接入（Term + Damage + 模式位）→ **自建应答器**（DA1/DSR-CPR/DECRQM/

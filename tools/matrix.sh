@@ -425,10 +425,15 @@ base_segment() {
       SP=$(grep -E 'speedtest: 摘要' "$st/c-main/rust.log" 2>/dev/null | tail -1)
     done
   fi
-  if [[ -n "$SP" ]]; then
+  if [[ -z "$SP" ]]; then
+    # 复核重试（独立 speedtest 会话一轮）：会话内 speedtest 在多角色同机环境下有
+    # 偶发 up 超时（最小复现实测 Go exit + 会话内 382/372Mbps 通过——环境抖动不红）
+    SP=$(tmo 90 "$RUST_BIN" speedtest --token "$TOK" --identity-dir "$st/c-main/identity" --rounds 1 2>&1 | grep -E 'round|失败' | tail -2)
+  fi
+  if [[ -n "$SP" && "$SP" != *失败* ]]; then
     record "$link" E13-speedtest "PASS" "$(echo "$SP" | tr '\n' '；' | cut -c1-100)"
   else
-    record "$link" E13-speedtest "FAIL" "speedtest 摘要未产出（90s）"
+    record "$link" E13-speedtest "FAIL" "speedtest 两轮均未产出：${SP:0:80}"
   fi
   echo "$SP" >> "$st/perf.log"
 
@@ -605,16 +610,18 @@ relay_segment() {
   if [[ "$C" == go ]]; then
     SPO=$("$GO_BIN" speedtest --state "$st/c-main" -host "dead$link" 2>&1 | grep -E '精确值|down=' | tail -2)
   else
+    # 从 RL 段起点截取（CL0 之后的行）——防抓到基础段的旧摘要（数据错位）
     local w=0
-    SPO=$(grep -E 'speedtest: 摘要|下行对账' "$st/c-main/rust.log" 2>/dev/null | tail -1)
+    SPO=$(tail -n +"$((CL0 + 1))" "$st/c-main/rust.log" 2>/dev/null | grep -E 'speedtest: 摘要|下行对账' | tail -1)
     while (( w < 75 )) && [[ -z "$SPO" ]]; do
       sleep 3; (( w+=3 ))
-      SPO=$(grep -E 'speedtest: 摘要|下行对账' "$st/c-main/rust.log" 2>/dev/null | tail -1)
+      SPO=$(tail -n +"$((CL0 + 1))" "$st/c-main/rust.log" 2>/dev/null | grep -E 'speedtest: 摘要|下行对账' | tail -1)
     done
   fi
   # 备注：经中继 up 阶段若超时（200pps 限速 + 会话切换）如实记录——down 对账已证数据面
   local UPFAIL
-  UPFAIL=$(grep -c 'speedtest 失败' "$st/c-main/rust.log" 2>/dev/null || print 0)
+  UPFAIL=$(grep -c 'speedtest 失败' "$st/c-main/rust.log" 2>/dev/null || true)
+  [[ -z "$UPFAIL" ]] && UPFAIL=0
   if [[ -n "$SPO" ]]; then
     if (( UPFAIL )); then
       record "$link" RL-speedtest "PASS" "$(echo "$SPO" | cut -c1-100)" "（up 阶段超时——经中继 200pps 限速形态，量化见 PERF-AB）"

@@ -51,6 +51,8 @@ Go 侧一切构建/测试/向量生成只从它走；`tools/check-baseline.sh` �
 2. `tools/make-baseline.sh --force <新hash>`（重建自足克隆 + 移除远程 + 拷 vt）；
 3. `tools/gen-vectors.sh` —— **diff 门非空即语义漂移**，逐文件复核（token/地址/身份三族），
    确认后 `git add fixtures/vectors` 固化，并在提交信息与本文件记录原因；
+   **向量文件增删必须同步 `fixtures/SHA256SUMS`**（`cd fixtures && shasum -a 256 <文件> >>
+   SHA256SUMS`，路径统一 `./vectors/<名>`）——ci-local.sh 第 4 步的 `shasum -c` 会对账；
 4. 重跑 `tools/local-exit.sh start/client-add` 复核 INTEROP-CRITERIA 判据行未变措辞；
 5. 重跑 `cargo test`（Rust 侧对照必须跟着新向量绿）。
 （`bin/homeway-go` 会被 local-exit.sh 按 `bin/homeway-go.baseline` 标记自动重建，勿手拷旧件。）
