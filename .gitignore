@@ -1,0 +1,6 @@
+/target
+/baseline
+/bin
+*.so
+*.a
+.DS_Store
