@@ -54,22 +54,24 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 | **R1** | 客户端垂直切片（直连数据面 ↔ Go 出口） | **完成**（2026-10-02） | 7/7 |
 | **R2** | 客户端全量（行为对齐 + 中继腿 + files/portfwd + facade 预留） | **完成**（2026-10-02） | 7/7 |
 | **R3** | 出口（多 peer WG device + 拦截层 + files/DNS/STUN/UPnP + servercore） | **完成**（2026-10-02：两道门全过 + 判据全量实测入册） | 6/6 步 |
-| **R4** | 中继（信封 + 准入 + 升级条纹） | 未开始 | — |
+| **R4** | 中继（信封 + 准入 + 升级条纹） | **完成**（2026-10-03：两道门全过 + 三链路判据实测 + 升级条纹实测） | 4/4 步 |
 | **R5** | 互操作矩阵全量 + fuzz + 性能 A/B + 台账三方门 | 未开始 | — |
 | **R6** | term 服务面（协议/surface 产出/检测引擎 + 自建编码器/应答器） | 未开始 | — |
 | **R7** | APP 接入（napi-rs 或 C-ABI 胶水 + OHOS 交叉 + 20 导出面 + hostsession） | 未开始 | — |
 | **R8** | 终测收官（包体/性能终测 + 共存定案 + 文档指针补录） | 未开始 | — |
 
-**下一步（当前指针）**：**R4 中继**（信封 + 准入 + 升级条纹；R0 夹具即可起步，
-`tools/local-relay.sh` 本地 Go 中继拓扑已就绪）。R3 已收官（2026-10-02 两道门全过）：
-第 1 会话完成技术评审 v2 定稿 + 3a/3b/3c/3d-files；第 2 会话完成 3d 剩余（DNS 代答
-线程池/隧道栈监听面 + speedtest 服务端 + L10）、3e（egress/STUN/UPnP）、3f（serve
-引擎/CLI/config.toml/判据全量实测：Go↔Rust 与 Rust 闭环 + 多 peer + TTL/吊销/DNS）、
-两道门与四连修吞吐整改。完成证据见下方 R3 节；评审记录 = `docs/reviews/R3.md`。
-R5 批登记（评审豁免）：M3 TCP DNS 腿、M8 残余（SSDP 组播三件套）、M11 UPnP ctx、
-M20 STUN/SPED golden、M23 错误类型化、M24 客户端 speedtest 归因。R2 登记：tunStatusJSON
-完整键面归 R7（对照面 = serviceSnapshotJSON——JSON 对照已 PASS）、低-4/低-7 残余/
-低-10 精确形态/中-10③ 挂账归属期见 docs/reviews/R2.md 豁免表。
+**下一步（当前指针）**：**R5 互操作矩阵 + 治理收口**（matrix.sh 全组合编排 + fuzz +
+性能 A/B + 台账三方门；R4 顺带的登记项一并入批：enum Auth 类型化、出口侧测试扩展到
+Go 对照面全套、中继吞吐量化——同机 200pps 防放大限速为 Go 同值的固有锚）。R4 已收官
+（2026-10-03 两道门全过）：第 1 会话完成技术评审 v2（1 高/6 阻塞全整改）+ 4a 全量
+（relaywire golden 向量族/relay 本体单驱动线程/TCP 控制面/rl1 CLI）+ 4b 条纹两处实错
+修正 + 4c exit 注册腿全量接线 + 4d 三链路实测（联调修三个实测 bug：leg_readable 丢弃
+Inbound/控制面读循环阻塞保活/cookie 认证借用）+ 升级条纹实测 + 判据入册 + 第二道门
+（1 高/4 中/10 低全处置）。完成证据见下方 R4 节；评审记录 = `docs/reviews/R4.md`。
+R5 批登记（R4 豁免/顺带）：M3 TCP DNS 腿、M8 残余（SSDP 组播三件套）、M11 UPnP ctx、
+M20 STUN/SPED golden、M23 错误类型化、M24 客户端 speedtest 归因、R4-§7.8 enum Auth、
+中继吞吐量化。R2 登记：tunStatusJSON 完整键面归 R7、低-4/低-7 残余/低-10 精确形态/
+中-10③ 挂账归属期见 docs/reviews/R2.md 豁免表。
 
 依赖：R0→R1→R2→{R3, R4 可并行}→R5→R6→R7（**需发版会话收官 + 用户点头**）→R8。
 R4 最小可提前（不依赖 R1，只需 R0 夹具），但优先保 R1 主线。
@@ -280,6 +282,42 @@ Rust exit 全判据绿；Rust exit ↔ Rust client 闭环；`intercept: …（di
 判据：**全 Go 链路（Go exit ↔ Go client）只把 relay 换成 Rust 版**，手机式客户端测试腿仍
 `via=relay` 全判据绿；这是最干净的单变量互操作证明。
 **退出口**：无（范围小；若准入协议细节缺失，回 baseline 克隆源码补读）。
+
+**完成证据（2026-10-03，两道门全过；实采行全量 = `docs/INTEROP-CRITERIA.md`「Rust 中继侧实采」节）**：
+- **链路 1（全 Go 只换 relay——单变量互操作证明）**：Go exit 向 Rust relay 双路注册
+  （UDP 腿 `中继：后端 … 注册成功（腿 127.0.0.1:42645）` + TCP 控制面
+  `中继：后端 … 控制面就绪（…；SESSION 通告启用拨腿模式）`；exit 侧 OK-MAC 双向认证行
+  `中继控制面：中继身份已认证（OK-MAC 通过）`）；Go client 经 Rust relay 达
+  `赛跑结算：胜出 中继 127.0.0.1:42781` + `路径确立：中继 127.0.0.1:42781` + WG 握手
+  经中继往返（转发 上/下 计数）+ `暖机就绪`；随后 hint→盲打自愈回直连（Go 设计行为，
+  真机 NAT 下不会发生——测试形态口径已注记）。出口换端口注入的
+  `中继：后端 … 注册腿地址变化 → …（旧分配 0 条已作废…）` 与
+  `中继：客户端 … 起会话 #1（拨腿模式）→ …（数据口 …）` 全串打出。
+- **链路 2（Rust 全栈）**：`link: via=relay ep=127.0.0.1:42781 rtt=7ms（服务会话巡检）` +
+  `RREG 注册刷新 → …（中继=true）` + 经中继 speedtest 下行 23.7MB 偏差 **-0.28%** +
+  files 5MB 上传/下载经中继 **sha256 双侧一致**（952e76af…）。上行为中继 200pps
+  防放大限速所囿（**Go 同值**——R2 经中继上行 2.7Mbps 即此上限实测锚）。
+- **链路 3（Go exit + Rust relay + Rust client）**：via=relay + RREG 中继=true + 经中继
+  数据（Go 出口 speedtest 服务端收上行 3.2MB `speedtest: 会话 #8 role=recv bytes=3211215`）；
+  speedtest 全窗跑满受混合链路吞吐限制（量化归 R5）。
+- **升级条纹（4b 两处实错修正的实证）**：5 拍 via=relay 驻留 →
+  `RELAY-UPGRADE：已在中继停留 5m0s，重新武装赛跑试直连（下一发出站包镜像到全部候选）` →
+  `RARM 软赛跑（中继立即参与，同时试直连）`（修正①：此前误用硬 rearm）→
+  `RELAY-UPGRADE：升级成功 → via=direct ep=192.168.3.12:42811 rtt=6ms`（修正②：此前缺失）→
+  `link: via=direct`（直连恢复 = 出口搬回 token 原端口；中继 --no-hints 测试形态）。
+- **测试面**：136 单测全绿（relay 27：注册状态机/转发闭环/拨腿端到端/回收/握手
+  DH 恒校负例/慢滴绝对期限/保活回显 + bind 腿表 3 + 条纹纯函数）+ relay 向量族
+  golden（vecgen 产自 baseline 真源，含 DH 定值/256B 分帧边界）+ clippy all-targets 0。
+- **交付件**：`homeway-cli relay`（前台单角色/两级日志 2MB×3/rl1 铸出）+ exit 侧
+  `--relay`（flag>config/relay_ep 四块语义/token 中继端点恒标 relay）+ `relaywire`
+  中立模块 + `tools/local-rust-relay.sh`。
+- **实测抓出并修**：leg_readable 丢弃 process_packet 的 Inbound（腿上 WG 载荷进不了
+  device——有握手无数据根因）、exit 控制面读循环无期限预算阻塞保活（90s 判死循环
+  重连）、出口 hint 盲打与客户端采纳的同机耦合（relay-lock/no-hints 测试缝的依据）。
+- **两道门**：技术评审 v2（1 高/6 阻塞 + 中低全处置——TCP DH 恒校/读侧四件套/
+  try_clone 窗口/rearm 复合/MaxLegs 断连形态/token 四块语义）；代码评审
+  （1 高/4 中/10 低——慢滴握手期限/punch 空转/控制连接回收/出口侧测试/身份私钥入库
+  + 低危清账，全处置表 = `docs/reviews/R4.md` 第二道门节）。
 
 ## R5 互操作矩阵 + 治理收口（估 5–8 会话日）
 
