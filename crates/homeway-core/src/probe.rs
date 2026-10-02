@@ -56,6 +56,76 @@ pub fn is_probe_request(b: &[u8]) -> bool {
     b.len() >= 3 && b[0..3] == REQ_MAGIC
 }
 
+// ---- 服务端应答面（R3；语义真源 pkg/probe/probe.go 的 RespondEx）----
+
+/// 解析探测请求（服务端侧）：非探测包返回 None（调用方放行给数据面）；
+/// 是探测但短/版本不符返回 Some(Err)（应忽略不回包——前向兼容）。
+pub fn decode_request(b: &[u8]) -> Option<io::Result<(u8, [u8; 8])>> {
+    if b.len() < 3 || b[0..3] != REQ_MAGIC {
+        return None;
+    }
+    if b.len() < 16 {
+        return Some(Err(io::Error::new(io::ErrorKind::InvalidData, "probe: 包太短")));
+    }
+    if b[3] != VERSION {
+        return Some(Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("probe: 版本 {} 不支持", b[3]),
+        )));
+    }
+    let mut nonce = [0u8; 8];
+    nonce.copy_from_slice(&b[5..13]);
+    Some(Ok((b[4], nonce)))
+}
+
+/// 出口对探测请求的应答（RespondEx 同义）。None = 不回包（非探测/未知 type/版本不符）。
+///
+/// 防放大约束（MUST）：只有「带列表的应答总长 ≤ 请求长度」才附列表——请求方以 pad
+/// 后的长度声明可收上限（老请求方 pad 16 自然拿不到列表段）。endpoints 超上限截断
+/// 到 MAX_ENDPOINTS；非法条目（零端口）跳过。
+pub fn respond_ex(req: &[u8], build: &str, flags: u8, endpoints: &[SocketAddr]) -> Option<Vec<u8>> {
+    let (typ, nonce) = decode_request(req)?.ok()?;
+    let mut base = Vec::with_capacity(48);
+    base.extend_from_slice(&RESP_MAGIC);
+    base.push(VERSION);
+    base.push(typ);
+    base.extend_from_slice(&nonce);
+    match typ {
+        TYPE_PING => {
+            let build = if build.len() > 32 { &build[..32] } else { build };
+            base.push(build.len() as u8);
+            base.extend_from_slice(build.as_bytes());
+            base.push(flags);
+        }
+        _ => return None, // 未知类型：忽略（前向兼容）
+    }
+    if endpoints.is_empty() {
+        return Some(base);
+    }
+    let mut list: Vec<&SocketAddr> = endpoints
+        .iter()
+        .filter(|ep| ep.port() != 0)
+        .take(MAX_ENDPOINTS)
+        .collect();
+    if list.is_empty() {
+        return Some(base);
+    }
+    let mut with_list = base.clone();
+    with_list.push(list.len() as u8);
+    for ep in list.drain(..) {
+        let a16 = match ep.ip() {
+            std::net::IpAddr::V4(v4) => v4.to_ipv6_mapped().octets(), // 4in6：与 hint 同一 18B 范式
+            std::net::IpAddr::V6(v6) => v6.octets(),
+        };
+        with_list.extend_from_slice(&a16);
+        with_list.extend_from_slice(&ep.port().to_be_bytes());
+    }
+    if with_list.len() > req.len() {
+        return Some(base); // 请求没 pad 够：不带列表（老客户端形态），防放大约束优先
+    }
+    Some(with_list)
+}
+
 /// 解析响应（magic/ver/type/nonce 全验；不符返回错误，调用方丢弃）。
 fn decode_response(b: &[u8], nonce: &[u8; 8]) -> io::Result<PingResult> {
     if b.len() < 13 || b[0..3] != RESP_MAGIC {

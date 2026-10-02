@@ -17,6 +17,7 @@ pub mod go_fmt;
 pub mod identity;
 pub mod probe;
 pub mod psk;
+pub mod server;
 pub mod session;
 pub mod speedtest;
 pub mod status_json;
