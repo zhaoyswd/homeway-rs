@@ -145,6 +145,31 @@ impl FilesServer {
         Ok(())
     }
 
+    /// 可停形态（引擎收工：非阻塞 accept + stop 轮询——② 关 UDS listeners 的执行面）。
+    pub fn serve_stoppable(&self, ln: UnixListener, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> std::io::Result<()> {
+        use std::sync::atomic::Ordering as OD;
+        ln.set_nonblocking(true)?;
+        loop {
+            if stop.load(OD::Relaxed) {
+                return Ok(());
+            }
+            match ln.accept() {
+                Ok((conn, _)) => {
+                    let _ = conn.set_nonblocking(false);
+                    let server = FilesServer { root: self.root.clone(), logf: self.logf.clone() };
+                    std::thread::Builder::new()
+                        .name("homeway-files".into())
+                        .spawn(move || server.serve_conn(conn))
+                        .ok();
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                Err(_) => return Ok(()), // listener 已关/异常：摘监听退出
+            }
+        }
+    }
+
     fn serve_conn(self, conn: UnixStream) {
         let _ = conn.set_read_timeout(Some(IDLE_TIMEOUT));
         let _ = conn.set_write_timeout(Some(IDLE_TIMEOUT));

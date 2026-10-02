@@ -19,7 +19,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 
 use crate::wtransport::frame::{self, FrameKind};
 
@@ -67,7 +67,24 @@ impl ServerBind {
     /// 监听固定端口（被占退让 +1…+9 → 随机；Go listenWithFallback 同序）。
     /// 返回 Err = 全失败（出口起不来——占端口硬失败，R0.6 评审 M13 同口径）。
     pub fn open(port: u16, build: &str, logf: crate::Logf) -> io::Result<Self> {
-        let sock = listen_with_fallback(port)?;
+        Self::open_bound(port, build, None, None, logf)
+    }
+
+    /// 绑定形态：`bind_ip`（钉卡的源地址；None = 0.0.0.0）+ 可选的整 socket 钉卡
+    /// （index + 名——IP_BOUND_IF/SO_BINDTODEVICE；Go ServerBind BindIface 双栈钉卡
+    /// 的 v4 单栈面，v6 面登记 R5）。
+    pub fn open_bound(
+        port: u16,
+        build: &str,
+        bind_ip: Option<Ipv4Addr>,
+        pin: Option<(u32, String)>,
+        logf: crate::Logf,
+    ) -> io::Result<Self> {
+        use std::os::fd::AsRawFd as _;
+        let sock = listen_with_fallback_addr(port, bind_ip)?;
+        if let Some((index, name)) = pin {
+            let _ = super::egress::pin_socket_to_iface(sock.as_raw_fd(), index, &name);
+        }
         if sock.local_addr()?.port() != port {
             (logf)(&format!(
                 "⚠️ 监听端口 {port} 被占用 —— 改用 {}；token 里的端口以公布/签发为准",
@@ -273,6 +290,12 @@ impl ServerBind {
         }
     }
 
+    /// 底层 UDP fd（驱动线程 poll(2) 用）。
+    pub fn udp_fd(&self) -> std::os::fd::RawFd {
+        use std::os::fd::AsRawFd as _;
+        self.sock.as_raw_fd()
+    }
+
     /// 从本 socket 直接发裸载荷（STUN 请求等 3e 面；SendRawTo 同义——与数据面同端口）。
     pub fn send_raw_to(&self, addr: SocketAddr, payload: &[u8]) -> io::Result<()> {
         self.sock.send_to(payload, addr).map(|_| ())
@@ -293,16 +316,22 @@ impl ServerBind {
 }
 
 /// 监听口被占用时的退让顺序：+1…+9，最后随机（Go listenWithFallback 同序）。
+#[cfg(test)]
 fn listen_with_fallback(port: u16) -> io::Result<UdpSocket> {
-    if let Ok(s) = UdpSocket::bind(("0.0.0.0", port)) {
+    listen_with_fallback_addr(port, None)
+}
+
+fn listen_with_fallback_addr(port: u16, ip: Option<Ipv4Addr>) -> io::Result<UdpSocket> {
+    let base = ip.unwrap_or(Ipv4Addr::UNSPECIFIED);
+    if let Ok(s) = UdpSocket::bind((base, port)) {
         return Ok(s);
     }
     for p in port + 1..=port + 9 {
-        if let Ok(s) = UdpSocket::bind(("0.0.0.0", p)) {
+        if let Ok(s) = UdpSocket::bind((base, p)) {
             return Ok(s);
         }
     }
-    UdpSocket::bind(("0.0.0.0", 0))
+    UdpSocket::bind((base, 0))
 }
 
 /// STUN 应答快速判别（servercore/stun.go 同义：类型 0x0101 + magic cookie）。

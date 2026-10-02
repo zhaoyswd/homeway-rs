@@ -1002,6 +1002,11 @@ impl View5 {
     }
 }
 
+/// 取一个明文 IPv4 包的目的地址（引擎路由 encap 用；畸形 = None）。
+pub fn nat_view_dst(pkt: &[u8]) -> Option<Ipv4Addr> {
+    Ipv4View::parse(pkt).map(|v| v.dst)
+}
+
 /// 按视图构造 RST（源 = 视图的目的）。
 fn build_rst_for(v: &View5) -> Vec<u8> {
     let syn = nat::build_tcp_syn(v.src, v.src_port, v.dst, v.dst_port, v.tcp_seq);

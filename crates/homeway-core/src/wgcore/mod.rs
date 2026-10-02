@@ -126,6 +126,26 @@ pub enum Cmd {
     SetCandidates {
         cands: Vec<Candidate>,
     },
+    /// UDP 拨号面（R3-3f：E12 出口 UDP 判据采样 + DNS 代答实测——Go 栈内 udp 的
+    /// 最小客户端面）：Open = 栈内 bind（ephemeral 端口自管）；Send/Recv/Close。
+    UdpOpen {
+        id: u64,
+        reply: Sender<Result<u16, ConnErr>>,
+    },
+    UdpSend {
+        id: u64,
+        dst: SocketAddrV4,
+        data: Vec<u8>,
+        reply: Sender<Result<(), ConnErr>>,
+    },
+    UdpRecv {
+        id: u64,
+        reply: Sender<Result<(Vec<u8>, SocketAddrV4), ConnErr>>,
+    },
+    UdpClose {
+        id: u64,
+        reply: Sender<Result<(), ConnErr>>,
+    },
     /// 测试缝：把当前 UDP socket 置为已关形态（模拟冻结唤醒后 OS 作废 socket——
     /// R2 阶梯 R2 档注入；Go 集成测试注入假 transport 同义）。
     #[cfg(feature = "test-seams")]
@@ -152,6 +172,11 @@ pub struct CoreConfig {
     pub identity: Identity,
     pub candidates: Vec<Candidate>,
     pub logf: Arc<dyn Fn(&str) + Send + Sync>,
+}
+
+struct UdpConn {
+    handle: SocketHandle,
+    wait_recv: Option<Sender<Result<(Vec<u8>, SocketAddrV4), ConnErr>>>,
 }
 
 struct Conn {
@@ -188,6 +213,8 @@ struct Engine {
     tunn: Tunn,
     stack: StackB,
     conns: HashMap<u64, Conn>,
+    /// UDP 面：id → 栈内 socket + 待决读。
+    udp: HashMap<u64, UdpConn>,
     wg_buf: Vec<u8>,
     cmd_rx: mpsc::Receiver<Cmd>,
     snapshot: Arc<Mutex<Snapshot>>,
@@ -257,6 +284,7 @@ impl Engine {
         }
         self.timer_tick();
         self.resolve_pending();
+        self.resolve_udp();
         self.update_snapshot();
         true
     }
@@ -350,6 +378,68 @@ impl Engine {
         }
     }
 
+    /// UDP 面：栈内 bind（ephemeral；回环拒绝——环回不进隧道与 TCP 同口径）。
+    fn start_udp(&mut self, id: u64) -> Result<u16, ConnErr> {
+        use smoltcp::socket::udp;
+        let port = self.stack.alloc_udp_port();
+        let rx_meta: Vec<udp::PacketMetadata> = (0..16).map(|_| udp::PacketMetadata::EMPTY).collect();
+        let tx_meta: Vec<udp::PacketMetadata> = (0..16).map(|_| udp::PacketMetadata::EMPTY).collect();
+        let mut sock = udp::Socket::new(
+            udp::PacketBuffer::new(rx_meta, vec![0u8; 64 * 1024]),
+            udp::PacketBuffer::new(tx_meta, vec![0u8; 64 * 1024]),
+        );
+        let ep = smoltcp::wire::IpEndpoint::new(self.stack.tunnel_ip.into(), port);
+        sock.bind(ep).map_err(|e| ConnErr::Dial(DialError::Stack(format!("{e:?}"))))?;
+        let h = self.stack.sockets.add(sock);
+        self.udp.insert(id, UdpConn { handle: h, wait_recv: None });
+        Ok(port)
+    }
+
+    fn udp_send(&mut self, id: u64, dst: SocketAddrV4, data: &[u8]) -> Result<(), ConnErr> {
+        if dst.ip().is_loopback() {
+            return Err(ConnErr::Dial(DialError::LoopbackRejected));
+        }
+        let Some(u) = self.udp.get(&id) else {
+            return Err(ConnErr::Closed);
+        };
+        let ep = smoltcp::wire::IpEndpoint::new((*dst.ip()).into(), dst.port());
+        let sock = self.stack.sockets.get_mut::<smoltcp::socket::udp::Socket>(u.handle);
+        sock.send_slice(data, ep).map_err(|_| ConnErr::Closed)?;
+        Ok(())
+    }
+
+    /// UDP 读结算（resolve_pending 的伙伴面）。
+    fn resolve_udp(&mut self) {
+        let ids: Vec<u64> = self.udp.keys().copied().collect();
+        for id in ids {
+            let Some(u) = self.udp.get_mut(&id) else { continue };
+            if u.wait_recv.is_none() {
+                continue;
+            }
+            let handle = u.handle;
+            let mut buf = vec![0u8; 65535];
+            let got = self
+                .stack
+                .sockets
+                .get_mut::<smoltcp::socket::udp::Socket>(handle)
+                .recv_slice(&mut buf);
+            match got {
+                Ok((n, meta)) if n > 0 => {
+                    buf.truncate(n);
+                    let from = match meta.endpoint.addr {
+                        smoltcp::wire::IpAddress::Ipv4(a) => Ipv4Addr::from(a.0),
+                        _ => continue,
+                    };
+                    let tx = self.udp.get_mut(&id).and_then(|u| u.wait_recv.take());
+                    if let Some(tx) = tx {
+                        let _ = tx.send(Ok((buf, SocketAddrV4::new(from, meta.endpoint.port))));
+                    }
+                }
+                _ => {} // 无包：继续等
+            }
+        }
+    }
+
     /// 返回 false = 收到 Stop。
     fn handle_cmd(&mut self, cmd: Cmd) -> bool {
         match cmd {
@@ -410,6 +500,26 @@ impl Engine {
                     None => Err(ConnErr::Closed),
                 };
                 let _ = reply.send(r);
+            }
+            Cmd::UdpOpen { id, reply } => {
+                let r = self.start_udp(id).map(|p| p);
+                let _ = reply.send(r);
+            }
+            Cmd::UdpSend { id, dst, data, reply } => {
+                let r = self.udp_send(id, dst, &data);
+                let _ = reply.send(r);
+            }
+            Cmd::UdpRecv { id, reply } => match self.udp.get_mut(&id) {
+                Some(u) => u.wait_recv = Some(reply),
+                None => {
+                    let _ = reply.send(Err(ConnErr::Closed));
+                }
+            },
+            Cmd::UdpClose { id, reply } => {
+                if let Some(u) = self.udp.remove(&id) {
+                    self.stack.sockets.remove(u.handle);
+                }
+                let _ = reply.send(Ok(()));
             }
             Cmd::RefreshReg { reply } => {
                 let sent = self.bind.refresh_reg();
@@ -641,6 +751,7 @@ impl Client {
             tunn,
             stack: StackB::new(tunnel_ip, SERVER_TUNNEL_IP, SmolInstant::from_millis(0)),
             conns: HashMap::new(),
+            udp: HashMap::new(),
             wg_buf: vec![0u8; WG_BUF],
             cmd_rx,
             snapshot: Arc::clone(&snapshot),
@@ -703,6 +814,34 @@ impl Client {
 
     /// PathProbe：拨出口必然拒绝的端口（主入口恒 :1），拿到 RST = 隧道通、出口在、
     /// 拦截层可用（C8 `判据=wg` 的依据；超时/不可达才算死）。预算下沉引擎。
+    /// UDP 面（R3-3f 测试判据用）：栈内 bind，返回 (id, 本地端口)。
+    pub fn udp_open(&self) -> Result<(u64, u16), ConnErr> {
+        let id = self.alloc_id();
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::UdpOpen { id, reply: tx });
+        rx.recv().map_err(|_| ConnErr::EngineGone)?
+            .map(|port| (id, port))
+    }
+
+    pub fn udp_send(&self, id: u64, dst: SocketAddrV4, data: Vec<u8>) -> Result<(), ConnErr> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::UdpSend { id, dst, data, reply: tx });
+        rx.recv().map_err(|_| ConnErr::EngineGone)?
+    }
+
+    /// 阻塞收一包（无超时——调用方自管整体预算；会话收工 = Closed）。
+    pub fn udp_recv(&self, id: u64) -> Result<(Vec<u8>, SocketAddrV4), ConnErr> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::UdpRecv { id, reply: tx });
+        rx.recv().map_err(|_| ConnErr::EngineGone)?
+    }
+
+    pub fn udp_close(&self, id: u64) -> Result<(), ConnErr> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::UdpClose { id, reply: tx });
+        rx.recv().map_err(|_| ConnErr::EngineGone)?
+    }
+
     pub fn path_probe(&self, timeout: Duration) -> Result<(), ConnErr> {
         self.connect_deadline(SocketAddrV4::new(SERVER_TUNNEL_IP, 1), timeout)
             .map(|_| ())

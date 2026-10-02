@@ -77,6 +77,32 @@ impl SpeedtestServer {
         Ok(())
     }
 
+    /// 可停形态（引擎收工面——files::serve_stoppable 同构）。
+    pub fn serve_stoppable(self: &Arc<Self>, ln: UnixListener, stop: Arc<std::sync::atomic::AtomicBool>) -> std::io::Result<()> {
+        use std::sync::atomic::Ordering as OD;
+        ln.set_nonblocking(true)?;
+        loop {
+            if stop.load(OD::Relaxed) {
+                return Ok(());
+            }
+            match ln.accept() {
+                Ok((conn, _)) => {
+                    let _ = conn.set_nonblocking(false);
+                    let srv = Arc::clone(self);
+                    std::thread::Builder::new()
+                        .name("homeway-speedtest".into())
+                        .stack_size(512 * 1024)
+                        .spawn(move || srv.serve_conn(conn))
+                        .ok();
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                Err(_) => return Ok(()),
+            }
+        }
+    }
+
     /// 在册会话数（诊断面）。
     pub fn live(&self) -> usize {
         self.conns.lock().map(|c| c.live).unwrap_or(0)

@@ -17,12 +17,22 @@ use homeway_core::speedtest::{self, Params};
 use homeway_core::token;
 use homeway_core::wgcore::ConnErr;
 
+mod serve_cli;
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
         Some("token") => cmd_token(&args[2..]),
+        Some("serve") => {
+            if args.get(2).map(String::as_str) == Some("token") {
+                serve_cli::cmd_serve_token(&args[3..]);
+            } else {
+                serve_cli::cmd_serve(&args[2..]);
+            }
+        }
         Some("connect") => cmd_connect(&args[2..]),
         Some("files") => cmd_files(&args[2..]),
+        Some("dnstest") => cmd_dnstest(&args[2..]),
         Some("portfwd") => cmd_portfwd(&args[2..]),
         _ => {
             eprintln!(
@@ -426,6 +436,194 @@ fn cmd_files(args: &[String]) {
     if let Err(e) = r {
         eprintln!("files {verb} 失败：{e}");
     }
+}
+
+// ---------- dnstest（DNS 代答实测 + E12 出口 UDP 面采样；R3-3f 判据产出步骤） ----------
+
+/// `homeway-cli dnstest --token <hmw1> [--identity-dir D] [--mode tcp5300|udp53|leg] <域名>`
+///   tcp5300：隧道 IP:<解析腿端口> TCP（客户端远程解析腿——qtcp 计数面）
+///   udp53：隧道 IP:53 UDP（手机声明的 DNS——栈内 listener 面，q 计数）
+///   leg：8.8.8.8:53 UDP（非隧道 IP 的 :53——拦截层进程内腿 + E12 dns 会话行）
+fn cmd_dnstest(args: &[String]) {
+    let mut tok: Option<String> = None;
+    let mut identity_dir: Option<PathBuf> = None;
+    let mut mode = "tcp5300".to_owned();
+    let mut name = String::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--token" => {
+                i += 1;
+                tok = args.get(i).cloned();
+            }
+            "--identity-dir" => {
+                i += 1;
+                identity_dir = args.get(i).map(PathBuf::from);
+            }
+            "--mode" => {
+                i += 1;
+                mode = args.get(i).cloned().unwrap_or_else(|| "tcp5300".into());
+            }
+            other if !other.starts_with('-') => name = other.to_owned(),
+            other => {
+                eprintln!("未知参数：{other}");
+                std::process::exit(2);
+            }
+        }
+        i += 1;
+    }
+    let Some(tok) = tok else {
+        eprintln!("用法：homeway-cli dnstest --token <hmw1…> [--mode tcp5300|udp53|leg] <域名>");
+        std::process::exit(2);
+    };
+    if name.is_empty() {
+        eprintln!("dnstest 需要 <域名>（如 example.com）");
+        std::process::exit(2);
+    }
+    let t = match token::decode(&tok) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("token 解析失败：{e}");
+            std::process::exit(1);
+        }
+    };
+    let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
+    let mut session = match homeway_core::session::Session::start(homeway_core::session::SessionConfig {
+        token: t,
+        identity_dir: identity_dir.or_else(|| Some(PathBuf::from("identity"))),
+        endpoint_cache_dir: None,
+        logf: Arc::clone(&logf),
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("会话建立失败：{e}");
+            std::process::exit(1);
+        }
+    };
+    if session.snapshot().state == SessState::Failed {
+        eprintln!("会话失败收工");
+        std::process::exit(1);
+    }
+    // 构造 A 查询
+    let mut q = Vec::new();
+    q.extend_from_slice(&0x1234u16.to_be_bytes());
+    q.extend_from_slice(&[0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+    for label in name.split('.') {
+        q.push(label.len() as u8);
+        q.extend_from_slice(label.as_bytes());
+    }
+    q.push(0);
+    q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+
+    let client = session.client();
+    let r = match mode.as_str() {
+        "tcp5300" => dns_tcp(&client, &q),
+        "udp53" => dns_udp(&client, &q, homeway_core::wgcore::SERVER_TUNNEL_IP, 53),
+        "leg" => dns_udp(&client, &q, std::net::Ipv4Addr::new(8, 8, 8, 8), 53),
+        other => {
+            eprintln!("未知 --mode {other:?}（可用：tcp5300 / udp53 / leg）");
+            session.stop();
+            std::process::exit(2);
+        }
+    };
+    session.stop();
+    match r {
+        Ok(resp) => {
+            let rcode = resp.get(3).map(|b| b & 0x0F).unwrap_or(9);
+            let anc = resp.get(6).and_then(|h| resp.get(7).map(|l| (u16::from(*h) << 8) | u16::from(*l))).unwrap_or(0);
+            println!("dnstest[{mode}] {name}: rcode={rcode} answers={anc} bytes={}", resp.len());
+            if rcode == 0 && anc > 0 {
+                println!("（出口侧应见 dns: 计数行——E22 判据）");
+            }
+        }
+        Err(e) => {
+            eprintln!("dnstest[{mode}] 失败：{e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+fn dns_tcp(client: &homeway_core::wgcore::Client, q: &[u8]) -> Result<Vec<u8>, String> {
+    let dst = SocketAddrV4::new(homeway_core::wgcore::SERVER_TUNNEL_IP, 5300);
+    let id = client.connect(dst).map_err(|e| e.to_string())?;
+    let mut frame = Vec::with_capacity(2 + q.len());
+    frame.extend_from_slice(&(q.len() as u16).to_be_bytes());
+    frame.extend_from_slice(q);
+    // 写
+    let mut off = 0;
+    while off < frame.len() {
+        let n = client.write(id, frame[off..].to_vec()).map_err(|e| e.to_string())?;
+        if n == 0 {
+            std::thread::yield_now();
+            continue;
+        }
+        off += n;
+    }
+    // 读：2B 长度 + 报文
+    let mut buf = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(6);
+    while buf.len() < 2 && Instant::now() < deadline {
+        match client.read(id) {
+            Ok(chunk) if !chunk.is_empty() => buf.extend_from_slice(&chunk),
+            Err(homeway_core::wgcore::ConnErr::Closed) => break,
+            _ => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    if buf.len() < 2 {
+        let _ = client.close(id);
+        return Err("6s 内未读到响应长度前缀".into());
+    }
+    let mlen = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+    while buf.len() < 2 + mlen && Instant::now() < deadline {
+        match client.read(id) {
+            Ok(chunk) if !chunk.is_empty() => buf.extend_from_slice(&chunk),
+            Err(homeway_core::wgcore::ConnErr::Closed) => break,
+            _ => std::thread::sleep(Duration::from_millis(20)),
+        }
+    }
+    let _ = client.close(id);
+    if buf.len() < 2 + mlen {
+        return Err(format!("响应不完整（{}/{}）", buf.len() - 2, mlen));
+    }
+    Ok(buf[2..2 + mlen].to_vec())
+}
+
+fn dns_udp(
+    client: &homeway_core::wgcore::Client,
+    q: &[u8],
+    ip: std::net::Ipv4Addr,
+    port: u16,
+) -> Result<Vec<u8>, String> {
+    let (id, local_port) = client.udp_open().map_err(|e| e.to_string())?;
+    println!("dnstest: UDP 源端口 {local_port} → {ip}:{port}");
+    client
+        .udp_send(id, SocketAddrV4::new(ip, port), q.to_vec())
+        .map_err(|e| e.to_string())?;
+    // 收（整体预算 6s——recv 阻塞面由看门狗线程兜）
+    let (tx, rx) = std::sync::mpsc::channel();
+    let c2 = unsafe_client(client);
+    std::thread::spawn(move || {
+        let r = c2.udp_recv(id).map_err(|e| e.to_string());
+        let _ = tx.send(r);
+    });
+    match rx.recv_timeout(Duration::from_secs(6)) {
+        Ok(Ok((data, from))) => {
+            let _ = client.udp_close(id);
+            println!("dnstest: 应答来自 {from}（{} 字节）", data.len());
+            Ok(data)
+        }
+        Ok(Err(e)) => Err(e),
+        Err(_) => {
+            let _ = client.udp_close(id);
+            Err("6s 内无应答".into())
+        }
+    }
+}
+
+/// udp_recv 的跨线程调用面（Client 是 & 引用——Send 边界用原始指针横传；调用方
+/// 保证生命周期（session 活到函数尾）——测试动词专用，不进 core）。
+fn unsafe_client(c: &homeway_core::wgcore::Client) -> &'static homeway_core::wgcore::Client {
+    unsafe { &*(c as *const _) }
 }
 
 // ---------- portfwd（本地 127.0.0.1 监听 → 经隧道拨目标；CLI 测试动词） ----------

@@ -145,6 +145,13 @@ pub struct EndpointRef<'a> {
     pub kind: EndpointKind,
 }
 
+impl<'a> EndpointRef<'a> {
+    /// 跨 crate 构造面（`#[non_exhaustive]` 不挡构造——编码侧 CLI/引擎用）。
+    pub fn new(addr: &'a str, kind: EndpointKind) -> Self {
+        Self { addr, kind }
+    }
+}
+
 /// 借用形态 token：对**已 base64 解码的载荷**借用解析（端点地址零拷贝）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]

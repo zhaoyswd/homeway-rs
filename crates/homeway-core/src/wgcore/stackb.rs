@@ -238,6 +238,11 @@ impl StackB {
         Ok(handle)
     }
 
+    /// UDP 面的 ephemeral 端口（与 TCP 同一分配器——共用「在用查重」）。
+    pub fn alloc_udp_port(&mut self) -> u16 {
+        self.alloc_local_port()
+    }
+
     fn alloc_local_port(&mut self) -> u16 {
         loop {
             let p = self.next_local_port;
