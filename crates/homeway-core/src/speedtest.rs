@@ -599,13 +599,20 @@ fn run_phases(
     })
 }
 
-/// 泵一段 data（整帧单次写全；返回本段 payload 字节数）。
+/// 泵一段 data（250ms 分片节奏——Go PumpDataChunk 形态：分片边界 = live 字节更新点
+/// 与取消检查点；整帧单次写全；返回本段 payload 字节数）。
 fn pump(client: &Client, id: u64, f: &mut Frame, dur: Duration) -> Result<i64, SpeedtestError> {
+    const SLICE: Duration = Duration::from_millis(250);
     let deadline = Instant::now() + dur;
     let mut total: i64 = 0;
     while Instant::now() < deadline {
-        write_all(client, id, f.data(BLOCK)?)?;
-        total += BLOCK as i64;
+        let slice_end = Instant::now() + SLICE.min(deadline.saturating_duration_since(Instant::now()));
+        while Instant::now() < slice_end {
+            write_all(client, id, f.data(BLOCK)?)?;
+            total += BLOCK as i64;
+        }
+        // 分片边界：live 字节与取消检查点（客户端当前无外部取消面——conn 关闭由
+        // 看门狗负责；此处保留节拍形态与 Go 对齐）
     }
     Ok(total)
 }
