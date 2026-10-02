@@ -380,27 +380,12 @@ base_segment() {
     fi
     # via=direct（巡检行）
     local CLN=$(log_lines "$st/c-main/cache/client.log")
-    if V=$(wait_line_from "$st/c-main/cache/client.log" '路径确立：直连' "$CLN" 30); then
+    # 等「路径确立：直连」或巡检 via=direct（90s 窗——竞速偶发落中继时 hint 盲打
+    # 自愈会翻直连，巡检行 60s 一拍必然报到；重启重试机制实测故障面大于收益，弃）
+    if V=$(wait_line_from "$st/c-main/cache/client.log" '路径确立：直连|link: via=direct' "$CLN" 90); then
       record "$link" C-via-direct "PASS" "${V:0:100}"
     else
-      # 竞速偶发（同机镜像窗口丢包会落中继）——重启 daemon 重 host add 重试一次
-      stop_pid "$st/c-main/pid"
-      rm -rf "$st/c-main/cache/endpoints"
-      start_go_client "$link" || true
-      # daemon 控制面就绪再 add（host add 走控制面——刚起 1s 内可能没就绪，实测失败点）
-      local wsock=0
-      while (( wsock < 8 )) && [[ ! -S "$st/c-main/control.sock" ]]; do
-        sleep 1; (( wsock+=1 ))
-      done
-      if CL=$(go_client_add "$link" "$TOK" "m${link}r"); then
-        if V=$(grep '路径确立：直连' "$st/c-main/cache/client.log" 2>/dev/null | tail -1); then
-          record "$link" C-via-direct "PASS" "${V:0:100}" "（重试一次命中——首轮竞速落中继）"
-        else
-          record "$link" C-via-direct "FAIL" "两轮均未见路径确立：直连"
-        fi
-      else
-        record "$link" C-via-direct "FAIL" "重试 host add 失败"
-      fi
+      record "$link" C-via-direct "FAIL" "90s 内未见路径确立/巡检 via=direct"
     fi
   else
     local IDDIR="$st/c-main/identity" CACHEDIR="$st/c-main/ep-base"
@@ -415,20 +400,10 @@ base_segment() {
       record "$link" C-ready "FAIL" "25s 内未见 warmup pong"
       return 1
     fi
-    if V=$(wait_line_from "$st/c-main/rust.log" '路径确立：直连' "$CL0" 30); then
+    if V=$(wait_line_from "$st/c-main/rust.log" '路径确立：直连|link: via=direct' "$CL0" 90); then
       record "$link" C-via-direct "PASS" "${V:0:100}"
     else
-      # 竞速偶发（同机镜像窗口丢包会落中继）——重启会话重试一次
-      stop_pid "$st/c-main/pid"
-      local CL0r=$(log_lines "$st/c-main/rust.log")
-      nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$IDDIR" --endpoint-cache-dir "$CACHEDIR" \
-        --speedtest --hold 600 >> "$st/c-main/rust.log" 2>&1 &
-      echo $! > "$st/c-main/pid"
-      if V=$(wait_line_from "$st/c-main/rust.log" '路径确立：直连' "$CL0r" 30); then
-        record "$link" C-via-direct "PASS" "${V:0:100}" "（重试一次命中——首轮竞速落中继）"
-      else
-        record "$link" C-via-direct "FAIL" "两轮 30s 均未见路径确立：直连"
-      fi
+      record "$link" C-via-direct "FAIL" "90s 内未见路径确立/巡检 via=direct"
     fi
   fi
 
