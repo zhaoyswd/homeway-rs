@@ -394,37 +394,39 @@ impl ServerBind {
     }
 
     /// 腿 fd 可读：recv（连接 socket，源恒为腿远端）→ LEGUP 标记吞包防御 →
-    /// 同一条 process_packet 解析。`false` = 腿死亡（recv 错误——摘除 + 判据行）。
-    pub fn leg_readable(&mut self, fd: std::os::fd::RawFd) -> bool {
+    /// 同一条 process_packet 解析（产出 Inbound 交驱动线程——**与主 socket 同一
+    /// 消费管线**：data 进 device / reg 进设备表 / hint 回调）。
+    /// 返回 (存活, Inbound)。
+    pub fn leg_readable(&mut self, fd: std::os::fd::RawFd) -> (bool, Option<Inbound>) {
         // 按 fd 找腿（驱动线程 poll 回指）
         let Some((id, remote)) = self
             .leg_by_id
             .values()
             .find(|lg| lg.sock.as_raw_fd() == fd)
             .map(|lg| (lg.id, lg.remote))
-        else { return false };
-        let Some(lg) = self.leg_by_id.get_mut(&id) else { return false };
+        else { return (false, None) };
+        let Some(lg) = self.leg_by_id.get_mut(&id) else { return (false, None) };
         let mut buf = [0u8; 65536];
         match lg.sock.recv(&mut buf) {
             Ok(0) => {
                 self.leg_read_exit(id, remote);
-                false
+                (false, None)
             }
             Ok(n) => {
                 lg.last = Instant::now();
                 let pkt = buf[..n].to_vec();
                 // LEGUP 标记防御（中继侧已吞，正常到不了这里）
                 if pkt == b"LEGUP" || crate::relaywire::legup_cookie(&pkt).is_some() {
-                    return true;
+                    return (true, None);
                 }
-                self.process_packet(&pkt, remote);
-                true
+                let inbound = self.process_packet(&pkt, remote);
+                (true, inbound)
             }
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => true,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => (true, None),
             Err(_) => {
                 // 读错误（ICMP 拒绝等）= 腿死亡：摘除（Go 读循环退出的等价物）
                 self.leg_read_exit(id, remote);
-                false
+                (false, None)
             }
         }
     }

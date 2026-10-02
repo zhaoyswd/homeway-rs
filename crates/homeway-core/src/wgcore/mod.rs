@@ -110,6 +110,8 @@ pub enum Cmd {
         reply: Sender<Result<(), ConnErr>>,
     },
     /// 装 hint 回调（回调在**驱动线程**执行——只允许内存操作/通道投递，严禁 RPC 回引擎）。
+    /// 【测试缝】中继锁定（relay-lock 注入——见 wtransport::Bind::relay_only）。
+    SetRelayOnly,
     SetOnHint {
         h: crate::wtransport::bind::OnHint,
     },
@@ -536,6 +538,7 @@ impl Engine {
                 }
                 let _ = reply.send(Ok(()));
             }
+            Cmd::SetRelayOnly => self.bind.set_relay_only(),
             Cmd::SetOnHint { h } => {
                 self.bind.set_on_hint(h);
             }
@@ -907,6 +910,11 @@ impl Client {
     /// 装 hint 回调（回调在驱动线程执行——只做内存操作/通道投递）。
     pub fn set_on_hint(&self, h: crate::wtransport::bind::OnHint) {
         self.send(Cmd::SetOnHint { h });
+    }
+
+    /// 【测试缝】中继锁定（relay-lock 注入）——须在首包发出前设置（连接前的装配窗口）。
+    pub fn set_relay_only(&self) {
+        self.send(Cmd::SetRelayOnly);
     }
 
     /// 档位动作的**有界** RPC（阶梯动作预算 2s：引擎卡住时按超时收轮，不让阶梯

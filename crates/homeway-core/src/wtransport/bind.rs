@@ -109,6 +109,11 @@ pub struct Bind {
     reg_armed: bool,
     adopted: Option<SocketAddr>,
     adopted_is_relay: bool,
+    /// 【测试缝】中继锁定（relay-lock 注入）：模拟「直连路径全被 NAT 丢弃」的真机
+    /// 中继形态——非中继源的包按「从未到达」处理（不采纳不学习）。同机回环上
+    /// 直连永远通（连出口的盲打都能把客户端采纳翻成直连），中继驻留/升级条纹
+    /// 不注入就测不出来。
+    pub(crate) relay_only: bool,
     mirrored: u64,
     race_start: Instant,
     relay_unlocked: bool,
@@ -165,6 +170,7 @@ impl Bind {
             reg_armed: true,
             adopted: None,
             adopted_is_relay: false,
+            relay_only: false,
             mirrored: 0,
             race_start: Instant::now(),
             relay_unlocked: false,
@@ -204,6 +210,11 @@ impl Bind {
 
     pub fn set_on_hint(&mut self, h: OnHint) {
         self.on_hint = Some(h);
+    }
+
+    /// 【测试缝】中继锁定（relay-lock——见 Bind::relay_only 注释）。
+    pub fn set_relay_only(&mut self) {
+        self.relay_only = true;
     }
 
     /// 接收读错误退避余量（驱动线程 poll 超时参与——持续错误下不空转）。
@@ -452,6 +463,9 @@ impl Bind {
     /// 采纳来源 + 判据行（C5 赛跑结算一次 / C6 路径确立·切换 3s 节流 / 中继告警 /
     /// handover 登记）。
     fn adopt(&mut self, src: SocketAddr) {
+        if self.relay_only && !self.relay_eps.contains(&src) {
+            return; // 测试缝：直连形态按「从未到达」处理（见字段注释）
+        }
         let was_valid = self.adopted.is_some();
         let prev = self.adopted;
         let prev_was_relay = self.adopted_is_relay;

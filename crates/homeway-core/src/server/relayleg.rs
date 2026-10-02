@@ -394,11 +394,22 @@ fn run_control_conn(
     if let Err(e) = write_ctl(&mut conn, &rw::encode_hello(pub_key.as_bytes())) {
         return (false, Some(format!("发 HELLO: {e}")));
     }
-    // ② CHALLENGE
-    let msg = match read_ctl(&mut conn, stop, Some(CTL_DIAL_TIMEOUT)) {
-        Ok(Some(m)) => m,
-        Ok(None) => return (false, None), // stop
-        Err(e) => return (false, Some(format!("读 CHALLENGE: {e}"))),
+    // ② CHALLENGE（5s 硬期限；静默拍轮 stop）
+    let mut dec = rw::CtlDecoder::new();
+    let mut pending: Vec<(u8, Vec<u8>)> = Vec::new();
+    let deadline = Instant::now() + CTL_DIAL_TIMEOUT;
+    let msg = loop {
+        if stop.load(Ordering::SeqCst) {
+            return (false, None);
+        }
+        if Instant::now() > deadline {
+            return (false, Some("读 CHALLENGE: 超时".to_owned()));
+        }
+        match read_ctl_once(&mut dec, &mut conn, &mut pending) {
+            Ok(ReadOutcome::Msg(m)) => break m,
+            Ok(ReadOutcome::Quiet) => continue,
+            Err(e) => return (false, Some(format!("读 CHALLENGE: {e}"))),
+        }
     };
     if msg.first() != Some(&rw::sub::CHALLENGE) {
         return (false, Some("控制面握手不是 CHALLENGE".to_owned()));
@@ -414,10 +425,19 @@ fn run_control_conn(
         return (false, Some(format!("发 PROOF: {e}")));
     }
     // ④ OK（恒 17B；token 模式必须验中继身份 MAC——#29）
-    let msg = match read_ctl(&mut conn, stop, Some(CTL_DIAL_TIMEOUT)) {
-        Ok(Some(m)) => m,
-        Ok(None) => return (false, None),
-        Err(e) => return (false, Some(format!("读 OK: {e}"))),
+    let deadline = Instant::now() + CTL_DIAL_TIMEOUT;
+    let msg = loop {
+        if stop.load(Ordering::SeqCst) {
+            return (false, None);
+        }
+        if Instant::now() > deadline {
+            return (false, Some("读 OK: 超时".to_owned()));
+        }
+        match read_ctl_once(&mut dec, &mut conn, &mut pending) {
+            Ok(ReadOutcome::Msg(m)) => break m,
+            Ok(ReadOutcome::Quiet) => continue,
+            Err(e) => return (false, Some(format!("读 OK: {e}"))),
+        }
     };
     if msg.first() != Some(&rw::sub::OK) {
         return (false, Some(format!("控制面握手被拒（type=0x{:02x}）", msg.first().copied().unwrap_or(0))));
@@ -440,7 +460,7 @@ fn run_control_conn(
     let _ = cmd_tx.send(EngineCmd::LegsClear);
     (logf)(&format!("中继控制面已连（{relay}）—— 已清腿表，等待会话重放"));
 
-    // 读循环（保活 25s 发、读超时 1s 粒度轮 stop；90s 无消息断）
+    // 读循环（每 1s 静默拍发保活/轮 stop/90s 判死——保活在**外层**，不藏在阻塞读里）
     let mut last_keepalive = Instant::now();
     let mut last_msg = Instant::now();
     let mut refused_sessions = 0u32;
@@ -454,15 +474,15 @@ fn run_control_conn(
             }
             last_keepalive = Instant::now();
         }
-        match read_ctl(&mut conn, stop, None) {
-            Ok(None) => {
+        match read_ctl_once(&mut dec, &mut conn, &mut pending) {
+            Ok(ReadOutcome::Quiet) => {
                 if last_msg.elapsed() > CTL_READ_TIMEOUT {
                     return (true, Some("控制面读: 超时（90s 无消息）".to_owned()));
                 }
                 continue;
             }
             Err(e) => return (true, Some(format!("控制面读: {e}"))),
-            Ok(Some(msg)) => {
+            Ok(ReadOutcome::Msg(msg)) => {
                 last_msg = Instant::now();
                 let sub = msg.first().copied().unwrap_or(0);
                 if sub == rw::sub::SESSION {
@@ -515,39 +535,40 @@ fn run_control_conn(
     }
 }
 
-/// 读一条控制消息。`budget = Some(d)` = 握手期硬期限（超时 Err）；`None` = 读循环
-/// 形态（socket 级 1s 读超时只为轮 stop——无消息不视为失败，90s 判死由调用方
-/// `last_msg` 承担，Go 滚动 deadline 的等价物）。
-fn read_ctl(
-    conn: &mut TcpStream,
-    stop: &AtomicBool,
-    budget: Option<Duration>,
-) -> Result<Option<Vec<u8>>, String> {
-    let deadline = budget.map(|d| Instant::now() + d);
-    let mut hdr = [0u8; 2];
+/// 读侧产物：一条完整消息 / 本拍静默（1s 无数据——外层借机发保活与轮 stop）。
+enum ReadOutcome {
+    Msg(Vec<u8>),
+    Quiet,
+}
+
+/// 块读 + 半帧状态机（`rw::CtlDecoder`）：`read()` 不越权填缓冲（部分帧安全），
+/// socket 级 1s 读超时把控制权还给调用方——**保活发送在外层循环**，绝不藏在
+/// 阻塞读里（实测教训：read_exact(None 预算) 在静默期不返回 ⇒ 保活永发不出 ⇒
+/// 中继 90s 判死循环重连）。
+fn read_ctl_once(dec: &mut rw::CtlDecoder, conn: &mut TcpStream, out: &mut Vec<(u8, Vec<u8>)>) -> Result<ReadOutcome, String> {
+    let mut buf = [0u8; 1024];
     loop {
-        match conn.read_exact(&mut hdr) {
-            Ok(()) => break,
+        if !out.is_empty() {
+            // （feed 已把全部完整消息按序入列；取首条，其余留给后续调用）
+            let m = out.remove(0);
+            let mut whole = vec![m.0];
+            whole.extend_from_slice(&m.1);
+            return Ok(ReadOutcome::Msg(whole));
+        }
+        match conn.read(&mut buf) {
+            Ok(0) => return Err("EOF".to_owned()),
+            Ok(n) => {
+                if dec.feed(&buf[..n], out).is_err() {
+                    return Err("长度行非法".to_owned());
+                }
+            }
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
-                if stop.load(Ordering::SeqCst) {
-                    return Ok(None);
-                }
-                if deadline.is_some_and(|d| Instant::now() > d) {
-                    return Err("超时".to_owned());
-                }
-                continue;
+                return Ok(ReadOutcome::Quiet);
             }
             Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
             Err(e) => return Err(e.to_string()),
         }
     }
-    let n = usize::from(u16::from_be_bytes(hdr));
-    if n == 0 || n > rw::CTL_MAX {
-        return Err("长度行非法".to_owned());
-    }
-    let mut msg = vec![0u8; n];
-    conn.read_exact(&mut msg).map_err(|e| e.to_string())?;
-    Ok(Some(msg))
 }
 
 fn write_ctl(conn: &mut TcpStream, msg: &[u8]) -> Result<(), String> {

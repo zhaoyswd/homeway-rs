@@ -713,10 +713,13 @@ fn driver_loop(
                 (dlogf)(&format!("serve: poll 错误（{e}）—— 继续循环"));
             }
         }
-        // 腿 fd 可读（主 socket 的收包循环照旧在下面 drain）
+        // 腿 fd 可读（与主 socket 同一消费管线——data 进 device / reg 进设备表）
         for pf in &pollfds[1..] {
             if pf.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
-                bind.leg_readable(pf.fd);
+                let (_alive, inbound) = bind.leg_readable(pf.fd);
+                if let Some(inbound) = inbound {
+                    handle_inbound(inbound, device, table, intercept, &mut bind, &mut out, &cfg);
+                }
             }
         }
         let mut got_packet = false;

@@ -108,6 +108,11 @@ pub struct SessionConfig {
     pub endpoint_cache_dir: Option<PathBuf>,
     /// 原始日志面（Session 在其上加 `服务会话: ` 前缀）。
     pub logf: Arc<dyn Fn(&str) + Send + Sync>,
+    /// 【test-seams】中继锁定（relay-lock 注入，连接开始前生效）：模拟「直连路径
+    /// 全被 NAT 丢弃」的真机中继形态——非中继源按从未到达处理。同机回环上直连
+    /// 永远通（连出口的盲打都能把客户端采纳翻成直连），中继驻留/升级条纹不注入
+    /// 就测不出来。含 hint 抑制（直连不可达时 hint 无意义）。
+    pub relay_only: bool,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -151,6 +156,11 @@ struct Shared {
     peer_pub: [u8; 32],
     identity: Identity,
     tunnel_ip: std::net::Ipv4Addr,
+    /// 【test-seams】hint 抑制（relay-lock 的一部分——直连不可达时 hint 无意义）。
+    #[cfg(feature = "test-seams")]
+    suppress_hints: std::sync::atomic::AtomicBool,
+    /// 【test-seams】中继锁定（relay-lock）——重建世代要重装 bind 锁定。
+    relay_lock: bool,
 }
 
 impl Shared {
@@ -319,6 +329,9 @@ impl Session {
             peer_pub: *cfg.token.peer_id.as_bytes(),
             identity: ident,
             tunnel_ip,
+            #[cfg(feature = "test-seams")]
+            suppress_hints: std::sync::atomic::AtomicBool::new(cfg.relay_only),
+            relay_lock: cfg.relay_only,
         });
 
         // C3（第二字段 = 本设备派生隧道地址——评审中-4）
@@ -354,6 +367,10 @@ impl Session {
 
         // ---- hint 回调（驱动线程执行——只投队列，重活在处理线程）+ 两个后台线程 ----
         install_hint_callback(&shared);
+        // 测试缝（relay-lock）：直连形态按从未到达处理——须在首包前生效
+        if cfg.relay_only {
+            shared.current().set_relay_only();
+        }
         let hint_handle = spawn_hint_handler(Arc::clone(&shared), hint_rx);
         let save_handle = spawn_save_loop(Arc::clone(&shared), save_rx);
 
@@ -408,6 +425,12 @@ impl Session {
 
     /// 当前世代的数据面句柄（speedtest 等**非**恢复感知的直连面；恢复感知拨号走
     /// healing_dial_*）。
+    /// 【test-seams】hint 抑制注入（no-hint——见 Shared::suppress_hints 注释）。
+    #[cfg(feature = "test-seams")]
+    pub fn debug_suppress_hints(&self) {
+        self.shared.suppress_hints.store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     pub fn client(&self) -> Arc<Client> {
         self.shared.current()
     }
@@ -630,6 +653,10 @@ fn install_hint_callback(shared: &Arc<Shared>) {
         .current()
         .set_on_hint(Arc::new(move |addr: &str| {
             // 回调纪律：不阻塞、不 RPC 回引擎（死锁）；解析失败静默丢
+            #[cfg(feature = "test-seams")]
+            if sh.suppress_hints.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
             if let Ok(ap) = addr.parse::<SocketAddr>() {
                 let _ = sh.hint_tx.send(ap);
             }
@@ -994,6 +1021,9 @@ fn rebuild_session(shared: &Arc<Shared>, reason: &str) {
                 old
             };
             install_hint_callback(shared); // 新世代重装 hint 回调（评审中-5）
+            if shared.relay_lock {
+                shared.current().set_relay_only(); // 测试缝随世代重装
+            }
             old.stop();
             (logf)("REBUILD 新会话已换入（首个出站包将重新注册+赛跑）");
         }

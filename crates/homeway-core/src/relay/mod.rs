@@ -1603,6 +1603,54 @@ mod tests {
         assert_eq!(&buf[..n], &down[..]);
     }
 
+    /// 控制面保活回显：后端 KEEPALIVE → 中继必答（B3）——90s 读超时靠它续命。
+    #[test]
+    fn ctl_keepalive_echo() {
+        let tr = TestRelay::start(Config::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            Some([0x44u8; 32]),
+            noop_logf(),
+        ));
+        let relay_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), tr.port);
+        let secret = [0x44u8; 32];
+        let priv_ = rand_secret();
+        let pub_ = PublicKey::from(&priv_);
+
+        let mut ctl = std::net::TcpStream::connect(relay_addr).unwrap();
+        ctl.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let _ = ctl.set_write_timeout(Some(Duration::from_secs(5)));
+        use std::io::{Read as _, Write as _};
+        let mut wire = Vec::new();
+        rw::ctl_frame_into(&rw::encode_hello(pub_.as_bytes()), &mut wire);
+        ctl.write_all(&wire).unwrap();
+        let mut hdr = [0u8; 2];
+        ctl.read_exact(&mut hdr).unwrap();
+        let mut msg = vec![0u8; u16::from_be_bytes(hdr) as usize];
+        ctl.read_exact(&mut msg).unwrap();
+        let (eph_pub, nonce) = rw::decode_challenge(&msg).unwrap();
+        let dh = priv_.diffie_hellman(&PublicKey::from(eph_pub));
+        let psk = rw::auth_mac(&secret, &nonce, pub_.as_bytes());
+        let mut w2 = Vec::new();
+        rw::ctl_frame_into(&rw::encode_proof(&nonce, dh.as_bytes(), pub_.as_bytes(), Some(&psk)), &mut w2);
+        ctl.write_all(&w2).unwrap();
+        ctl.read_exact(&mut hdr).unwrap();
+        let mut okmsg = vec![0u8; u16::from_be_bytes(hdr) as usize];
+        ctl.read_exact(&mut okmsg).unwrap();
+        assert!(rw::decode_ok_auth(&okmsg).is_some());
+        std::thread::sleep(Duration::from_millis(400)); // 等驱动线程 attach
+
+        // 连发 3 个 KEEPALIVE（间隔 300ms）——每个都应收到回显
+        for i in 0..3 {
+            let mut w = Vec::new();
+            rw::ctl_frame_into(&rw::keepalive_bytes(), &mut w);
+            ctl.write_all(&w).unwrap();
+            ctl.read_exact(&mut hdr).unwrap();
+            let mut echo = vec![0u8; u16::from_be_bytes(hdr) as usize];
+            ctl.read_exact(&mut echo).unwrap();
+            assert_eq!(echo[0], rw::sub::KEEPALIVE, "第 {} 个保活应被回显", i + 1);
+        }
+    }
+
     /// 空闲回收（注入短窗）：会话被摘 + 聚合计数。
     #[test]
     fn reap_idle_sessions() {

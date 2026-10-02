@@ -38,7 +38,7 @@ fn main() {
         Some("portfwd") => cmd_portfwd(&args[2..]),
         _ => {
             eprintln!(
-                "homeway-cli——可用：\n  token <hmw1…>\n  connect --token <hmw1…> [--identity-dir <dir>] [--endpoint-cache-dir <dir>]\n      [--speedtest] [--dial <ip:port>] [--hold <secs>] [--probe N] [--status-json]\n      [--recover-from <1|2|3> [--recover-cause <s>]] [--inject poison-socket]（注入需 test-seams 构建）"
+                "homeway-cli——可用：\n  token <hmw1…>\n  connect --token <hmw1…> [--identity-dir <dir>] [--endpoint-cache-dir <dir>]\n      [--speedtest] [--dial <ip:port>] [--hold <secs>] [--probe N] [--status-json]\n      [--recover-from <1|2|3> [--recover-cause <s>]] [--inject poison-socket|relay-lock]（注入需 test-seams 构建）"
             );
             std::process::exit(2);
         }
@@ -189,6 +189,7 @@ fn cmd_connect(args: &[String]) {
         identity_dir: a.identity_dir.clone().or_else(|| Some(PathBuf::from("identity"))),
         endpoint_cache_dir: a.cache_dir.clone(),
         logf: Arc::clone(&logf),
+        relay_only: a.inject.as_deref() == Some("relay-lock"),
     }) {
         Ok(s) => s,
         Err(e) => {
@@ -294,8 +295,21 @@ fn inject(session: &Session, what: &str) {
                 std::process::exit(2);
             }
         }
+        "relay-lock" => {
+            #[cfg(feature = "test-seams")]
+            {
+                session.debug_suppress_hints();
+                println!("inject: 中继锁定（非中继源按从未到达处理——模拟直连全断的真机中继形态）");
+            }
+            #[cfg(not(feature = "test-seams"))]
+            {
+                let _ = session;
+                eprintln!("inject: 需要 test-seams 构建（cargo build -p homeway-cli --features homeway-core/test-seams）");
+                std::process::exit(2);
+            }
+        }
         other => {
-            eprintln!("未知注入：{other}（可用：poison-socket）");
+            eprintln!("未知注入：{other}（可用：poison-socket / relay-lock）");
             std::process::exit(2);
         }
     }
@@ -333,9 +347,11 @@ fn transit_dial(session: &Session, dst: SocketAddrV4) -> Result<usize, ConnErr> 
 // ---------- files 动词（每命令一条流；拨号走 healing） ----------
 
 fn cmd_files(args: &[String]) {
-    // files <verb> --token <hmw1> [--identity-dir D] <path> [<local>]
+    // files <verb> --token <hmw1> [--identity-dir D] [--dead-direct] [--inject no-hint] <path> [<local>]
     let mut tok: Option<String> = None;
     let mut identity_dir: Option<PathBuf> = None;
+    let mut dead_direct = false;
+    let mut inject_what: Option<String> = None;
     let mut rest: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -348,6 +364,11 @@ fn cmd_files(args: &[String]) {
                 i += 1;
                 identity_dir = args.get(i).map(PathBuf::from);
             }
+            "--dead-direct" => dead_direct = true,
+            "--inject" => {
+                i += 1;
+                inject_what = args.get(i).cloned();
+            }
             other => rest.push(other.to_owned()),
         }
         i += 1;
@@ -356,7 +377,7 @@ fn cmd_files(args: &[String]) {
         eprintln!("用法：homeway-cli files <list|stat|mkdir|read|download|upload> --token <hmw1> [--identity-dir D] <远端路径> [<本地路径>]");
         std::process::exit(2);
     };
-    let t = match token::decode(&tok) {
+    let mut t = match token::decode(&tok) {
         Ok(t) => t,
         Err(e) => {
             eprintln!("token 解析失败：{e}");
@@ -367,8 +388,16 @@ fn cmd_files(args: &[String]) {
     let path = rest.get(1).cloned().unwrap_or_default();
     let local = rest.get(2).cloned().unwrap_or_default();
     if verb.is_empty() || path.is_empty() {
-        eprintln!("用法：homeway-cli files <verb> --token <hmw1> <远端路径> [<本地路径>]");
+        eprintln!("用法：homeway-cli files <verb> --token <hmw1> [--dead-direct] [--inject relay-lock] <远端路径> [<本地路径>]");
         std::process::exit(2);
+    }
+    if dead_direct {
+        for e in &mut t.endpoints {
+            if e.kind == token::EndpointKind::Direct {
+                e.addr = "127.0.0.1:1".to_owned();
+            }
+        }
+        println!("inject: token 直连端点已改指死端口（127.0.0.1:1）——只有中继可达");
     }
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
     let mut session = match Session::start(SessionConfig {
@@ -376,6 +405,7 @@ fn cmd_files(args: &[String]) {
         identity_dir: identity_dir.or_else(|| Some(PathBuf::from("identity"))),
         endpoint_cache_dir: None,
         logf: Arc::clone(&logf),
+        relay_only: inject_what.as_deref() == Some("relay-lock"),
     }) {
         Ok(s) => s,
         Err(e) => {
@@ -383,6 +413,9 @@ fn cmd_files(args: &[String]) {
             std::process::exit(1);
         }
     };
+    if let Some(what) = &inject_what {
+        inject(&session, what);
+    }
     if session.snapshot().state == SessState::Failed {
         eprintln!("会话失败收工");
         std::process::exit(1);
@@ -495,6 +528,7 @@ fn cmd_dnstest(args: &[String]) {
         identity_dir: identity_dir.or_else(|| Some(PathBuf::from("identity"))),
         endpoint_cache_dir: None,
         logf: Arc::clone(&logf),
+        relay_only: false,
     }) {
         Ok(s) => s,
         Err(e) => {
@@ -699,6 +733,7 @@ fn cmd_portfwd(args: &[String]) {
         identity_dir: identity_dir.or_else(|| Some(PathBuf::from("identity"))),
         endpoint_cache_dir: None,
         logf: Arc::clone(&logf),
+        relay_only: false,
     }) {
         Ok(s) => s,
         Err(e) => {
