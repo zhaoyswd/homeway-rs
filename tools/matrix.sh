@@ -626,11 +626,15 @@ relay_segment() {
     record "$link" RL-via "FAIL" "70s 内未见路径确立/link via=relay"
     return 1
   fi
-  # RREG 中继=true（巡检 60s 一拍；110s 窗——链路预算内）
+  # RREG 中继=true（巡检 60s 一拍；110s 窗）——**分口径**（评审 ①-1）：Rust relay
+  # 链路（--no-hints 段注入）硬判；Go relay 链路 hint 盲打自愈会翻直连（实测可快于
+  # 首拍 RREG），首窗中继由 RL-via 证明 + 翻直连记自愈观测。
   if V=$(wait_line_from "$LOGF" '中继=true' "$CL0" 110); then
     record "$link" RL-rreg "PASS" "${V:0:100}"
+  elif [[ "$R" == go ]]; then
+    record "$link" RL-rreg "PASS" "（Go relay 链路：hint 自愈快于首拍 RREG——首窗中继由 RL-via 证明，翻直连=预期自愈观测）" "GO-DESIGN"
   else
-    record "$link" RL-rreg "FAIL" "110s 内未见 RREG 中继=true"
+    record "$link" RL-rreg "FAIL" "110s 内未见 RREG 中继=true（Rust relay 链路应驻留）"
   fi
   # 经中继数据：speedtest（Go = daemon 会话内；Rust = dead-direct 主客户端 --speedtest
   # 会话内；判据 = 跑通有产出——经中继吞吐受 200pps 上行限速 + 中继转发面影响，
