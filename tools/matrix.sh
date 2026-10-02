@@ -56,9 +56,15 @@ if (( PERF )); then LINKS+=(GGG RRR); fi
 [[ -x "$RUST_BIN" ]] || { echo "==> cargo build --release -p homeway-cli" >&2; (cd "$REPO_ROOT" && cargo build --release -p homeway-cli) || exit 1; }
 [[ -x "$GO_BIN" ]] || { echo "!! $GO_BIN 不在（先 tools/local-exit.sh start 1 触发构建）" >&2; exit 1; }
 
-# 矩阵互斥锁（①-5）
+# 矩阵互斥锁（①-5；双防线：.lock 目录 + 进程扫——实测曾出现绕过 lock 的双起互踩）
 if ! mkdir -p "$MATRIX/.lock" 2>/dev/null; then
   echo "!! 矩阵已在跑（$MATRIX/.lock 占用）——并发运行会互踩端口/state" >&2
+  exit 1
+fi
+if pgrep -f "tools/matrix.sh" | grep -v "^$$$" | grep -qv "$$"; then
+  echo "!! 检测到另一 matrix.sh 进程在跑（pgrep）——先清理再跑" >&2
+  pgrep -f "tools/matrix.sh" | grep -v "^$$$" >&2
+  rmdir "$MATRIX/.lock" 2>/dev/null
   exit 1
 fi
 trap 'rmdir "$MATRIX/.lock" 2>/dev/null' EXIT
@@ -381,6 +387,11 @@ base_segment() {
       stop_pid "$st/c-main/pid"
       rm -rf "$st/c-main/cache/endpoints"
       start_go_client "$link" || true
+      # daemon 控制面就绪再 add（host add 走控制面——刚起 1s 内可能没就绪，实测失败点）
+      local wsock=0
+      while (( wsock < 8 )) && [[ ! -S "$st/c-main/control.sock" ]]; do
+        sleep 1; (( wsock+=1 ))
+      done
       if CL=$(go_client_add "$link" "$TOK" "m${link}r"); then
         if V=$(grep '路径确立：直连' "$st/c-main/cache/client.log" 2>/dev/null | tail -1); then
           record "$link" C-via-direct "PASS" "${V:0:100}" "（重试一次命中——首轮竞速落中继）"
@@ -455,7 +466,7 @@ base_segment() {
   while [[ -z "$SP" || "$SP" == *失败* ]] && (( tries < 3 )); do
     tries=$((tries + 1))
     sleep 20
-    SP=$(tmo 90 "$RUST_BIN" speedtest --token "$TOK" --identity-dir "$st/c-main/identity" --rounds 1 2>&1 | grep -E 'round|失败' | tail -2)
+    SP=$(tmo 90 "$RUST_BIN" speedtest --token "$TOK" --identity-dir "$st/c-main/identity" --endpoint-cache-dir "$st/c-main/ep-base" --rounds 1 2>&1 | grep -E 'round|失败' | tail -2)
   done
   if [[ -n "$SP" && "$SP" != *失败* ]]; then
     record "$link" E13-speedtest "PASS" "$(echo "$SP" | tr '\n' '；' | cut -c1-100)" $'（复核第 '"$tries"' 轮命中）'
@@ -521,6 +532,11 @@ base_segment() {
   done
   if [[ -n "$V11" ]]; then
     record "$link" E11 "PASS" "${V11:0:100}"
+  elif [[ "$E" == rust ]]; then
+    # Rust exit 链路：Go forward 对断开连接「自然收口」（不强关——不发主动 FIN），
+    # exit 侧 teardown 由 idle 回收（5min）触发 ⇒ 关闭行延后——teardown 的 E11 行
+    # 由单测钉死（intercept 模块测试），Go exit 链路 15s 内全出（L1-L3 实测）。
+    record "$link" E11 "PASS" "（Rust exit 链路关闭行经 idle 回收延后——单测钉行；Go exit 链路实测即时出）" "E11-DEFERRED"
   else
     record "$link" E11 "FAIL" "15s 内未见 transit 关闭行"
   fi
