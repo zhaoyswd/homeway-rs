@@ -821,8 +821,10 @@ fn patrol_loop(shared: Arc<Shared>) {
                 snap.ep.map(|a| a.to_string()).unwrap_or_default(),
                 rtt.as_millis()
             ));
-            // 中继升直连（服务域新增，设计 §6：rearm + 一发 PathProbe 载体——只 rearm
-            // 不发包 = 升级动作空转）
+            // 中继升直连（Go tunmode.go:987-1002：**软赛跑组合动作**——RearmSoft +
+            // 候选重投（cache.Merge(static)，Go Transport.RearmSoft 复合）+ 一发
+            // PathProbe 载体 + 成功且 via 变化打升级成功行并刷 link；Rust 无域名候选
+            // ⇒ 无 refreshDomain 对应面〔登记〕）
             if snap.via == Via::Relay {
                 beat.relay_streak += 1;
                 if beat.relay_streak >= RELAY_UPGRADE_EVERY {
@@ -831,8 +833,25 @@ fn patrol_loop(shared: Arc<Shared>) {
                         "RELAY-UPGRADE：已在中继停留 {}，重新武装赛跑试直连（下一发出站包镜像到全部候选）",
                         fmt_duration_go_secs(RELAY_UPGRADE_EVERY * PATROL_INTERVAL)
                     ));
-                    let _ = client.rearm();
-                    let _ = client.path_probe(PROBE_TIMEOUT);
+                    let _ = client.rearm_soft();
+                    let merged = shared.merged_candidates();
+                    shared.current().set_candidates(merged);
+                    let _ = shared.save_tx.send(());
+                    // 这一发探测包就是「镜像出去试直连」的出站包（perTry 10s 窗）
+                    let ustarted = Instant::now();
+                    if client.path_probe(PROBE_TIMEOUT).is_ok() {
+                        let st2 = client.snapshot();
+                        if st2.via != snap.via {
+                            let urtt = ustarted.elapsed();
+                            (shared.logf)(&format!(
+                                "RELAY-UPGRADE：升级成功 → via={} ep={} rtt={}ms",
+                                st2.via.as_str(),
+                                st2.ep.map(|a| a.to_string()).unwrap_or_default(),
+                                urtt.as_millis()
+                            ));
+                            shared.set_link(st2.via, st2.ep, urtt);
+                        }
+                    }
                 }
             } else {
                 beat.relay_streak = 0;
