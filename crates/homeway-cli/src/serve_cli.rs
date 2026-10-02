@@ -118,6 +118,7 @@ struct ServeFlags {
     dns_port: Option<u16>,
     files_root: Option<String>,
     verbose: bool,
+    relay: Option<String>,
     /// 位置参数（serve 不接受）。
     extra: Vec<String>,
 }
@@ -136,6 +137,7 @@ fn parse_serve_flags(args: &[String]) -> ServeFlags {
         dns_port: None,
         files_root: None,
         verbose: false,
+        relay: None,
         extra: Vec::new(),
     };
     let mut i = 0;
@@ -187,6 +189,7 @@ fn parse_serve_flags(args: &[String]) -> ServeFlags {
             "public-endpoint" => f.public_endpoint = take_val(&mut j),
             "dns-port" => f.dns_port = take_val(&mut j).and_then(|v| v.parse().ok()),
             "files-root" => f.files_root = take_val(&mut j),
+            "relay" => f.relay = take_val(&mut j),
             "verbose" => f.verbose = true,
             other => {
                 eprintln!("未知参数：--{other}");
@@ -261,12 +264,16 @@ pub fn assemble(args: &[String]) -> ServeConfig {
         if let Some(v) = &fc.serve.files_root {
             cfg.files_root = Some(PathBuf::from(v));
         }
-        // relay 节：R4 接线——本期解析后拒绝并打一行（设计 §0 裁剪面）
-        if fc.serve.relay.as_deref().map(|r| !r.is_empty()).unwrap_or(false) {
-            println!("serve.relay 已配置但 R4（中继）未接线——注册腿不起");
+        // serve.relay：注册腿端点（rl1 token / 裸 host:port——R4-4c 接线）
+        if let Some(v) = fc.serve.relay {
+            if !v.is_empty() {
+                cfg.relay = Some(v);
+            }
         }
+        // [relay] enabled=true：中继角色期望态（统一进程面不在本 CLI 裁剪面——
+        // 单角色经 `homeway-cli relay` 起；此处不装也不拒启）
         if fc.relay.enabled {
-            println!("[relay] enabled=true 但 R4（中继）未接线——中继角色不起");
+            println!("[relay] enabled=true：中继角色请用 `homeway-cli relay` 前台起（本 CLI 无统一进程形态）");
         }
     }
     // flag 覆盖
@@ -301,6 +308,14 @@ pub fn assemble(args: &[String]) -> ServeConfig {
     }
     if let Some(v) = &f.files_root {
         cfg.files_root = Some(PathBuf::from(v));
+    }
+    if let Some(v) = &f.relay {
+        if v.is_empty() {
+            // 显式空值 = 显式关掉注册腿（--relay=）
+            cfg.relay = None;
+        } else {
+            cfg.relay = Some(v.clone());
+        }
     }
     cfg
 }

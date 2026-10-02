@@ -70,6 +70,8 @@ pub struct ServeConfig {
     pub files_root: Option<PathBuf>,
     pub verbose: bool,
     pub build: String,
+    /// serve --relay / config serve.relay：rl1 token 或裸 host:port（None = 不起注册腿）。
+    pub relay: Option<String>,
 }
 
 impl Default for ServeConfig {
@@ -91,6 +93,7 @@ impl Default for ServeConfig {
             files_root: None,
             verbose: false,
             build: "homeway-rs-dev".to_owned(),
+            relay: None,
         }
     }
 }
@@ -110,6 +113,12 @@ pub enum EngineCmd {
     SetProbeEndpoints(Vec<SocketAddr>),
     /// 公网端点立即重测（换网事件——R3 无看护循环，预留）。
     KickPublicEndpoint,
+    /// 控制面 SESSION 通告 → 向中继数据口拨腿（R4）。
+    LegRegister { id: u64, remote: SocketAddr, marker: Vec<u8> },
+    /// 控制面 RELEASE → 拆腿。
+    LegRemove { id: u64 },
+    /// 控制面重连对账 → 拆全部腿（等重放重建）。
+    LegsClear,
 }
 
 /// udpcap 能力位（与 Go/tier 核同源）。
@@ -286,7 +295,7 @@ impl ServeEngine {
 
         // ---- ServerBind（端口退让；实际端口落盘）----
         let bind_addr = resolved.as_ref().and_then(|i| i.addrs.first().copied());
-        let bind = ServerBind::open_bound(cfg.listen_port, &cfg.build, bind_addr, resolved.as_ref().map(|i| (i.index, i.name.clone())), Arc::clone(&logf))?;
+        let mut bind = ServerBind::open_bound(cfg.listen_port, &cfg.build, bind_addr, resolved.as_ref().map(|i| (i.index, i.name.clone())), Arc::clone(&logf))?;
         let local_port = bind.local_port();
         std::fs::write(cache_dir.join("listen_port.txt"), format!("{local_port}\n"))?;
 
@@ -351,9 +360,64 @@ impl ServeEngine {
             }
         }
 
-        // ---- 驱动线程 ----
+        // ---- 命令通道（驱动线程收；观测/udpcap/中继控制面都经它交互） ----
         let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCmd>();
         let (pub_kick_tx, pub_kick_rx) = mpsc::channel::<()>();
+
+        // ---- 中继注册腿（--relay；R4）：必须在 TokenCtx 构造前把 relay_ep 配好
+        //      （token 首轮打印要带中继端点——Go serve.go:406-409 用户口径），
+        //      socket clone 窗口 = bind move 进驱动线程前 ----
+        let mut relay_ep: Option<Endpoint> = None;
+        let mut relay_wanted = false;
+        if let Some(spec) = &cfg.relay {
+            match super::relayleg::parse_relay_arg(spec) {
+                Ok(arg) => {
+                    relay_ep = Some(Endpoint { addr: arg.addr.to_string(), kind: EndpointKind::Relay });
+                    relay_wanted = true;
+                }
+                Err(e) => {
+                    (logf)(&format!("⚠️ --relay 解析失败（{e}）—— 跳过中继注册"));
+                }
+            }
+        }
+        // 重新解析一次拿完整 RelayArg（addr + secret；上面的 relay_ep 只端点面）
+        let relay_arg = relay_ep.as_ref().and_then(|_| super::relayleg::parse_relay_arg(cfg.relay.as_deref().unwrap_or_default()).ok());
+        if let Some(arg) = relay_arg {
+            let relay_sock = bind
+                .try_clone_socket()
+                .expect("clone WG socket（注册腿与数据面同端口的硬约束）");
+            // 驱动线程 → relay-leg 线程事件通道（type=3 控制帧 + hint；try_send 不阻塞驱动线程）
+            let (leg_tx, leg_rx) = mpsc::sync_channel::<super::relayleg::LegEvent>(64);
+            let leg_tx_frame = leg_tx.clone();
+            bind.set_on_leg_frame(Box::new(move |payload, src| {
+                let _ = leg_tx_frame.try_send(super::relayleg::LegEvent::Frame(payload.to_vec(), src));
+            }));
+            let leg_tx_hint = leg_tx.clone();
+            bind.set_on_hint(Box::new(move |addr, src| {
+                let _ = leg_tx_hint.try_send(super::relayleg::LegEvent::Hint(addr.to_string(), src));
+            }));
+            let stop = spawn_service_stop_flag(&mut stop_flags);
+            super::relayleg::spawn_relay_leg(
+                relay_sock,
+                arg.addr,
+                priv_key.clone(),
+                arg.secret,
+                leg_rx,
+                Arc::clone(&stop),
+                Arc::clone(&logf),
+            );
+            // 控制面（TCP，同号端口）：SESSION/RELEASE 经 EngineCmd 交驱动线程拨/拆腿
+            super::relayleg::spawn_relay_ctl(
+                arg.addr,
+                priv_key.clone(),
+                arg.secret,
+                cmd_tx.clone(),
+                Arc::clone(&stop),
+                Arc::clone(&logf),
+            );
+        }
+
+        // ---- 驱动线程 ----
         let driver = std::thread::Builder::new()
             .name("homeway-serve-drv".into())
             .stack_size(1024 * 1024)
@@ -388,6 +452,9 @@ impl ServeEngine {
             logf: Arc::clone(&logf),
             revoked: Arc::clone(&revoked_set),
             inner: Mutex::new(TokenPrintState::default()),
+            relay_ep,
+            relay_wanted,
+            dlogf: Arc::clone(&dlogf),
         });
         let pub_enabled = cfg.upnp || !cfg.stun.is_empty() || !cfg.public_endpoint.is_empty();
         if pub_enabled {
@@ -586,7 +653,6 @@ fn driver_loop(
     pub_kick_tx: Sender<()>,
 ) {
     let udp_fd = bind.udp_fd();
-    let mut pollfds = [libc::pollfd { fd: udp_fd, events: libc::POLLIN, revents: 0 }];
     // GC 节拍（10min ±10% 抖动）与吊销跟随（1s mtime）/DNS 统计（60s）
     let mut rng = [0u8; 8];
     getrandom::getrandom(&mut rng).expect("系统随机源不可用");
@@ -596,6 +662,7 @@ fn driver_loop(
         next_gc = Instant::now() + Duration::from_secs(3600 * 24); // TTL 关：不跑 GC
     }
     let mut last_revoked_check = Instant::now();
+    let mut last_leg_sweep = Instant::now();
     let revoked_path = cfg.state_dir.join("serve").join("revoked.jsonl");
     let mut revoked_mtime = std::fs::metadata(&revoked_path).and_then(|m| m.modified()).ok();
     let mut last_dns_stats = Instant::now();
@@ -621,14 +688,35 @@ fn driver_loop(
                 EngineCmd::KickPublicEndpoint => {
                     let _ = pub_kick_tx.send(()); // 转发到观测线程（换网重测）
                 }
+                EngineCmd::LegRegister { id, remote, marker } => {
+                    // SESSION 通告 → 拨腿（连接 socket + LEGUP 标记 + 入表）
+                    if let Err(e) = bind.register_leg(id, remote, &marker) {
+                        (dlogf)(&format!("中继控制面：会话 #{id} 拨腿失败（→ {remote}）：{e}"));
+                    }
+                }
+                EngineCmd::LegRemove { id } => bind.remove_leg(id),
+                EngineCmd::LegsClear => bind.clear_legs(),
             }
         }
-        // ② UDP 收包（poll 5ms——worker 事件/DNS 应答的拍内服务延迟上界）
-        let n = unsafe { libc::poll(pollfds.as_mut_ptr(), 1, 5) };
+        // ② UDP 收包（poll 5ms——worker 事件/DNS 应答的拍内服务延迟上界；
+        //    腿 fd 同轮 poll——R4：控制面通告建立的腿与主 socket 同构收包）
+        let leg_fds = bind.leg_fds();
+        let mut pollfds = Vec::with_capacity(1 + leg_fds.len());
+        pollfds.push(libc::pollfd { fd: udp_fd, events: libc::POLLIN, revents: 0 });
+        for fd in &leg_fds {
+            pollfds.push(libc::pollfd { fd: *fd, events: libc::POLLIN, revents: 0 });
+        }
+        let n = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as u32, 5) };
         if n < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() != std::io::ErrorKind::Interrupted {
                 (dlogf)(&format!("serve: poll 错误（{e}）—— 继续循环"));
+            }
+        }
+        // 腿 fd 可读（主 socket 的收包循环照旧在下面 drain）
+        for pf in &pollfds[1..] {
+            if pf.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
+                bind.leg_readable(pf.fd);
             }
         }
         let mut got_packet = false;
@@ -669,6 +757,10 @@ fn driver_loop(
             let jitter = (std::process::id() as u64 * 7919) % 60;
             next_gc = now + cfg.peer_ttl + Duration::from_secs(jitter);
         }
+        if now.duration_since(last_leg_sweep) > crate::server::bind::RELAY_LEG_SWEEP_PUB {
+            last_leg_sweep = now;
+            bind.sweep_legs();
+        }
         if now.duration_since(last_revoked_check) > Duration::from_secs(1) {
             last_revoked_check = now;
             let m = std::fs::metadata(&revoked_path).and_then(|m| m.modified()).ok();
@@ -694,6 +786,7 @@ fn driver_loop(
     // ---- 收工（D5：① 已由 Stop 置位；这里 ③④——drain 的出站包照走 encap 链
     //      （评审 M2：宽限窗口的 FIN/ACK/尾数据丢弃 = 存量连接无法自然收销账）；
     //      ⑤ 的 UPnP 缩租在 shutdown 侧面）----
+    bind.shutdown_legs();
     intercept.halt_new();
     let deadline = Instant::now() + stop_grace;
     loop {
@@ -783,6 +876,13 @@ struct TokenCtx {
     logf: Logf,
     revoked: Arc<Mutex<HashSet<[u8; 32]>>>,
     inner: Mutex<TokenPrintState>,
+    /// --relay 的中继端点（解析产物；None = 未配）。token 打印按四块语义并入
+    /// （R4-design §4.3：kind 结构流动 / 去重降级 / 顺序 / relayWanted 闸门）。
+    relay_ep: Option<Endpoint>,
+    /// --relay 解析成功（闸门判据——按地址 fail-open）。
+    relay_wanted: bool,
+    /// 细节日志（降级行等）。
+    dlogf: Logf,
 }
 
 /// 公网端点循环：成功 10min / 失败 2min 一轮；显式端点配置覆盖最高优先（FIX-61）。
@@ -982,28 +1082,51 @@ fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
         }
         return;
     }
-    // LAN 端点（物理网卡 IPv4 + 实际监听端口）+ 已公布公网
+    // 端点组装（四块语义——R4-design §4.3，评审 ⑥-8）：
+    // ① add 收**整个 Endpoint（含 kind）**——relay 标记靠结构流动（57012ad 防线）；
+    // ② 去重先到先得：中继地址与直连端点重合（退化形态）按直连保留 + 降级行；
+    // ③ 顺序：LAN → 已公布公网 → 中继（叠加不踢除）；
+    // ④ relayWanted 闸门（按地址 fail-open）：中继端点没并入前不打 token。
     let mut eps: Vec<Endpoint> = Vec::new();
     let mut labels: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
-    let mut add = |addr: String, kind: &str| {
-        if addr.is_empty() || seen.contains(&addr) {
+    let dlogf = &ctx.dlogf;
+    let mut add = |e: Endpoint, kind: &str| {
+        if e.addr.is_empty() || seen.contains(&e.addr) {
+            // 中继地址与已有直连端点相同（--relay 指向出口自己地址的退化形态）：
+            // 按先到的直连形态保留——那个地址物理上就是出口的 WG socket，标 relay 反而必坏
+            if e.kind == EndpointKind::Relay && seen.contains(&e.addr) {
+                (dlogf)(&format!("中继端点 {} 与已有直连端点相同，按直连处理（中继腿不生效）", e.addr));
+            }
             return;
         }
-        seen.insert(addr.clone());
-        eps.push(Endpoint { addr: addr.clone(), kind: EndpointKind::Direct });
-        labels.push(format!("{addr}（{kind}）"));
+        seen.insert(e.addr.clone());
+        labels.push(format!("{}（{kind}）", e.addr));
+        eps.push(e);
     };
     for ifi in egress::physical_candidates() {
         for a in ifi.addrs {
-            add(format!("{a}:{}", ctx.local_port), "内网");
+            add(Endpoint { addr: format!("{a}:{}", ctx.local_port), kind: EndpointKind::Direct }, "内网");
         }
     }
     for p in published {
-        add(p.clone(), "公网");
+        add(Endpoint { addr: p.clone(), kind: EndpointKind::Direct }, "公网");
+    }
+    if let Some(r) = &ctx.relay_ep {
+        add(r.clone(), "中继");
     }
     if eps.is_empty() {
         return;
+    }
+    // ④ 闸门（按地址比对、fail-open：退化形态去重后仍能命中已并地址 ⇒ 放行）
+    if ctx.relay_wanted {
+        let has_relay = ctx
+            .relay_ep
+            .as_ref()
+            .is_some_and(|r| eps.iter().any(|e| e.addr == r.addr));
+        if !has_relay {
+            return; // 指定了 --relay：中继端点没并入前不打（先打一版不带中继的只会误导）
+        }
     }
     let peer_id = crate::token::PeerId::from(x25519_dalek::PublicKey::from(&ctx.backend_priv).to_bytes());
     let secret = crate::token::Secret::from(ctx.secret);
