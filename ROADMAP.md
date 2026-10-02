@@ -53,23 +53,23 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 | **R0** | 基线锚定 + 互操作基建 + 仓库骨架 | **完成**（2026-10-02） | 6/6 |
 | **R1** | 客户端垂直切片（直连数据面 ↔ Go 出口） | **完成**（2026-10-02） | 7/7 |
 | **R2** | 客户端全量（行为对齐 + 中继腿 + files/portfwd + facade 预留） | **完成**（2026-10-02） | 7/7 |
-| **R3** | 出口（多 peer WG device + 拦截层 + files/DNS/STUN/UPnP + servercore） | **进行中**（2026-10-02 第 1 会话：技术评审 v2 定稿 + 3a/3b/3c/3d-files 完成） | 4/6 步 |
+| **R3** | 出口（多 peer WG device + 拦截层 + files/DNS/STUN/UPnP + servercore） | **完成**（2026-10-02：两道门全过 + 判据全量实测入册） | 6/6 步 |
 | **R4** | 中继（信封 + 准入 + 升级条纹） | 未开始 | — |
 | **R5** | 互操作矩阵全量 + fuzz + 性能 A/B + 台账三方门 | 未开始 | — |
 | **R6** | term 服务面（协议/surface 产出/检测引擎 + 自建编码器/应答器） | 未开始 | — |
 | **R7** | APP 接入（napi-rs 或 C-ABI 胶水 + OHOS 交叉 + 20 导出面 + hostsession） | 未开始 | — |
 | **R8** | 终测收官（包体/性能终测 + 共存定案 + 文档指针补录） | 未开始 | — |
 
-**下一步（当前指针）**：R3 续接（第 2 会话起）——**已完成**：技术评审第一道门
-（dsh，4 高/15 中/11 低，v2 定稿 = `docs/reviews/R3-design.md`）+ 3a 多 peer device
-（两表分发/base 不变量钉死/漫游/容器帧）+ 3b 设备表与台账（DevOp 序列消 opCh）+
-3c 拦截层全量（NAT 重写/拨号先行/UDP 会话/worker 池/Stats 判据行；85 测试绿 +
-clippy 0）+ 3d 的 files 服务端（六动词/沙箱/UDS）。**待做**：3d 剩余（DNS 代答 +
-speedtest 服务端）、3e（STUN/UPnP）、3f（serve 装配 + Go/Rust 双侧判据实测 +
-多 peer 混跑 + TTL/吊销注入）、R2 移交微项、第二道门（代码评审）。
-进度细节与遗留见 `docs/reviews/R3.md` 的「进度注记」节。R2 登记：tunStatusJSON 完整
-键面归 R7（对照面 = serviceSnapshotJSON——JSON 对照已 PASS）、E9 stale/revoked 形态
-与 E12 归 R3、低-4/低-7 残余/低-10 精确形态/中-10③ 挂账归属期见 docs/reviews/R2.md 豁免表。
+**下一步（当前指针）**：**R4 中继**（信封 + 准入 + 升级条纹；R0 夹具即可起步，
+`tools/local-relay.sh` 本地 Go 中继拓扑已就绪）。R3 已收官（2026-10-02 两道门全过）：
+第 1 会话完成技术评审 v2 定稿 + 3a/3b/3c/3d-files；第 2 会话完成 3d 剩余（DNS 代答
+线程池/隧道栈监听面 + speedtest 服务端 + L10）、3e（egress/STUN/UPnP）、3f（serve
+引擎/CLI/config.toml/判据全量实测：Go↔Rust 与 Rust 闭环 + 多 peer + TTL/吊销/DNS）、
+两道门与四连修吞吐整改。完成证据见下方 R3 节；评审记录 = `docs/reviews/R3.md`。
+R5 批登记（评审豁免）：M3 TCP DNS 腿、M8 残余（SSDP 组播三件套）、M11 UPnP ctx、
+M20 STUN/SPED golden、M23 错误类型化、M24 客户端 speedtest 归因。R2 登记：tunStatusJSON
+完整键面归 R7（对照面 = serviceSnapshotJSON——JSON 对照已 PASS）、低-4/低-7 残余/
+低-10 精确形态/中-10③ 挂账归属期见 docs/reviews/R2.md 豁免表。
 
 依赖：R0→R1→R2→{R3, R4 可并行}→R5→R6→R7（**需发版会话收官 + 用户点头**）→R8。
 R4 最小可提前（不依赖 R1，只需 R0 夹具），但优先保 R1 主线。
@@ -212,6 +212,37 @@ servercore 装配（config.toml 同 schema、serve.enabled 期望态）。
 Rust exit 全判据绿；Rust exit ↔ Rust client 闭环；`intercept: …（dialok）` 计数语义一致。
 **退出口**：多 peer device 自建受阻 → 用「Go exit + Rust 拦截层以外部件」分片验证，device 层
 单独攻坚（允许 R3 拆成 3a/3b）。
+
+**完成证据（2026-10-02，两道门全过；判据实采行全量 = `docs/INTEROP-CRITERIA.md`「Rust 出口侧实采」节）**：
+- 判据全量实测（fresh state、release 构建、`tools/local-rust-exit.sh` 端口 42651）：
+  E1-E14/E17-E20/E22/E23 全串打出（含 `--peer-ttl 15s` 注入的 `ttl=15s` 与
+  `peer: - reason=ttl (idle=20s)`、revoked 拒绝族 `peer: ! reject reason=revoked`+
+  首大声、多 peer 混跑 `n=2/32`（Go+Rust 客户端并发）、E12 `udp intercept: 会话 #1
+  dns 建立（8.8.8.8:53 ← …）`、E22 三面计数 `q=1 qtcp=1 resp=3`、同 socket STUN
+  真观测 `STUN：监听 socket（本地 42697）在 162.159.207.1:3478 眼里是
+  203.175.12.191:29397` + 「暂不公布」保守分支同串）；E21 绑卡指纹行本地形态未采
+  （`--bind-interface none`）——CIDR/排序面已按 Go 修正。
+- 吞吐 A/B（同一时刻）：Rust↔Rust speedtest **down 250-263Mbps / up 398-408Mbps**
+  （对账偏差 0.42-1.83%）；Rust↔Go 同时刻 down 406/up 367（down 为 Go 的 ~62%，
+  ±50% 界内）；Go↔Rust down 210/up 460。files 100MB 双向 **对账偏差 0**（sha256
+  双侧一致；Rust 上传 2.6s）；Go 客户端 put/get 100MB 同样偏差 0。
+- DNS 代答实测：dnstest 三面全通（tcp5300 解析腿 rcode=0 / udp53 隧道栈 listener /
+  leg 拦截进程内腿 8.8.8.8:53——应答源反重写正确）。
+- 拦截层四连修（实测抓出，commit d5bfbe1）：① `send_slice` 部分写静默丢字节→
+  tx_backlog 回补；② FIN 先于 backlog 排队挤丢尾数据→fin_pending；③ worker
+  `Written` 只在立即写尽才回执→flush_and_report 差额补报（上行卡死根因）；④ `Ack`
+  只认进栈内 socket 的字节——端到端背压重建（UDS 拥塞 → 服务端 write_all 墙钟限速，
+  Go gVisor 端点缓冲反压等价物；此前 2s 预热被 0.2s 泵完、窗口计数全废）；另
+  WG socket SO_SNDBUF/RCVBUF 4MB + 流发送缓冲 1MB。
+- 两道门：技术评审 v2（第 1 会话，dsh 4高/15中/11低）；代码评审（第 2 会话，dsh
+  4高/24中/低择要——**高危 4 条全修**：UDP fd 泄漏 EMFILE/DNS TCP 槽位复用
+  panic/speedtest 会话号错位/SSDP 字节切 panic；中危 18 修 6 登记豁免归 R5，
+  逐条表 = `docs/reviews/R3.md` 第二道门节）。
+- 测试面：107 单测全绿 + clippy all-targets 0（连续多轮）。
+- 交付件：`homeway-cli serve`（config.toml 同 schema deny_unknown + flag>config>默认
+  覆盖序 + SIGTERM D5 有序收工）+ `serve token [list|revoke]`（reveal 一轮制/台账/
+  吊销秒级跟随）+ `dnstest`（E12/DNS 判据产出步骤）+ 客户端 UDP 拨号面 +
+  `tools/local-rust-exit.sh`（端口 4265x 隔离 + Go 客户端通道）。
 
 **进度注记（2026-10-02，第 1 会话末）**：
 - 技术评审第一道门完成（dsh `r3d.3hsyns` 轮次；4 高/15 中/11 低全处置，v2 定稿）。
