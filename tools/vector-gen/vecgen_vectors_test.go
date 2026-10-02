@@ -30,6 +30,7 @@ import (
 
 	"github.com/zhaoyswd/homeway/pkg/files"
 	"github.com/zhaoyswd/homeway/pkg/proto"
+	"golang.org/x/crypto/curve25519"
 )
 
 // ---- 固定材料（字节稳定的确定性输入；hex 便于三方核对）----
@@ -555,6 +556,81 @@ func genR2Families(t *testing.T, out string) {
 	vecWriteJSON(t, filepath.Join(out, "files_frames.json"), map[string]any{
 		"comment": "files 4B BE 长度前缀帧字节（含终止帧与跨 u16 边界样本）。语义真源 baseline pkg/files/proto.go WriteFrame。",
 		"cases":   frCases,
+	})
+
+	// ---- R4：中继控制子协议 + MAC 四族 + TCP 分帧边界 ----
+	rlPub := vecH32(vecPeerID1)
+	rlSecret := vecH32(vecSecret1)
+
+	type rwCase struct {
+		Name string `json:"name"`
+		Wire string `json:"wire"`
+	}
+	var rwCases []rwCase
+	rlNonce := [16]byte{}
+	for i := range rlNonce {
+		rlNonce[i] = byte(0x30 + i)
+	}
+	rlCookie := [16]byte{}
+	for i := range rlCookie {
+		rlCookie[i] = byte(0x70 + i)
+	}
+	// DH：X25519(后端静态私钥, 中继临时公钥)——后端侧视角（同 relayclient.go 算法）
+	backendPriv := vecHex("1112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30")
+	ephPub, err := curve25519.X25519(vecHex("a0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebf"), curve25519.Basepoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var ephPubArr [32]byte
+	copy(ephPubArr[:], ephPub)
+	dh, err := curve25519.X25519(backendPriv, ephPubArr[:])
+	if err != nil {
+		t.Fatal(err)
+	}
+	rwCases = append(rwCases, rwCase{"hello", hex.EncodeToString(proto.EncodeRelayHello(rlPub))})
+	rwCases = append(rwCases, rwCase{"challenge", hex.EncodeToString(proto.EncodeRelayChallenge(ephPubArr, rlNonce))})
+	pskMAC := proto.RelayAuthMAC(rlSecret, rlNonce, rlPub)
+	proof := proto.EncodeRelayProof(rlNonce, dh, rlPub, pskMAC[:], proto.RelayCtlVer)
+	rwCases = append(rwCases, rwCase{"proof-v2", hex.EncodeToString(proof)})
+	proofOpen := proto.EncodeRelayProof(rlNonce, dh, rlPub, nil, proto.RelayCtlVer)
+	rwCases = append(rwCases, rwCase{"proof-open-psk-zero", hex.EncodeToString(proofOpen)})
+	rwCases = append(rwCases, rwCase{"ok-udp", hex.EncodeToString(proto.EncodeRelayOK())})
+	rwCases = append(rwCases, rwCase{"again", hex.EncodeToString(proto.EncodeRelayAgain())})
+	rwCases = append(rwCases, rwCase{"keepalive", hex.EncodeToString(proto.EncodeRelayKeepalive())})
+	okMAC := proto.RelayOKAuthMAC(rlSecret, rlNonce)
+	rwCases = append(rwCases, rwCase{"ok-tcp17", hex.EncodeToString(proto.EncodeRelayOKAuth(okMAC[:]))})
+	sess := proto.CtlSession{ID: 42, DataPort: 51000, Cookie: rlCookie}
+	rwCases = append(rwCases, rwCase{"session27", hex.EncodeToString(proto.EncodeCtlSession(sess))})
+	rwCases = append(rwCases, rwCase{"release9", hex.EncodeToString(proto.EncodeCtlRelease(99))})
+	rwCases = append(rwCases, rwCase{"legup37", hex.EncodeToString(proto.LegupAuthPayload(7, rlCookie, rlSecret))})
+	// 腿帧封装（[0xBB][3]）
+	rwCases = append(rwCases, rwCase{"relay-reg-frame", hex.EncodeToString(proto.EncodeFrame(proto.FrameTypeRelayReg, proto.EncodeRelayHello(rlPub)))})
+	// TCP 分帧边界：0/256/257 不入栈（0 非法、>256 非法），合法样本 = keepalive 与 256B 满
+	var ctlWire bytes.Buffer
+	if err := proto.CtlWriteMsg(&ctlWire, proto.EncodeRelayKeepalive()); err != nil {
+		t.Fatal(err)
+	}
+	pad256 := make([]byte, 256)
+	for i := range pad256 {
+		pad256[i] = byte(i)
+	}
+	pad256[0] = proto.RelaySubKeepalive
+	if err := proto.CtlWriteMsg(&ctlWire, pad256); err != nil {
+		t.Fatal(err)
+	}
+	rwCases = append(rwCases, rwCase{"ctl-stream-keepalive+256", hex.EncodeToString(ctlWire.Bytes())})
+	vecWriteJSON(t, filepath.Join(out, "relay.json"), map[string]any{
+		"comment": "R4 中继控制子协议字节（Hello/Challenge/Proof50 v2/OK17/SESSION27/RELEASE9/LEGUP37 + 腿帧封装 + TCP 分帧边界）。语义真源 baseline pkg/proto/{relay,relayctl}.go；Rust 侧 relaywire.rs 对拍逐字节。",
+		"dh":      hex.EncodeToString(dh),
+		"nonce":   hex.EncodeToString(rlNonce[:]),
+		"cookie":  hex.EncodeToString(rlCookie[:]),
+		"pskMac":  hex.EncodeToString(pskMAC[:]),
+		"okMac":   hex.EncodeToString(okMAC[:]),
+		"proofMac": hex.EncodeToString(proto.RelayProofMAC(dh, rlNonce, rlPub)),
+		"legupMac": hex.EncodeToString(proto.LegupMAC(7, rlCookie, rlSecret)),
+		"ephPub":  hex.EncodeToString(ephPubArr[:]),
+		"backendPriv": hex.EncodeToString(backendPriv),
+		"cases":   rwCases,
 	})
 }
 

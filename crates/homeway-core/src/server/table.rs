@@ -82,7 +82,8 @@ pub fn verify_reg(
 }
 
 /// 16 字节常量时间比较（Go hmac.Equal 同义——防时序侧信道）。
-fn const_time_eq_16(a: &[u8], b: &[u8]) -> bool {
+/// `pub(crate)`：relaywire 的 MAC 校验共用（R4-design §1.1）。
+pub(crate) fn const_time_eq_16(a: &[u8], b: &[u8]) -> bool {
     if a.len() != 16 || b.len() != 16 {
         return false;
     }

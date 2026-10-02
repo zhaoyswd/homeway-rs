@@ -1,0 +1,66 @@
+{
+  "backendPriv": "1112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30",
+  "cases": [
+    {
+      "name": "hello",
+      "wire": "011111111111111111111111111111111111111111111111111111111111111111"
+    },
+    {
+      "name": "challenge",
+      "wire": "02605a725d2a4adfeeb1a29e17edd621c1b7593ee8cdbc44ac6c4ab6e2f805d23c303132333435363738393a3b3c3d3e3f"
+    },
+    {
+      "name": "proof-v2",
+      "wire": "03303132333435363738393a3b3c3d3e3f47c8dc9124ded6ef460c055a34e4196d3cebc3d9975341fa5fe5be8393440bc802"
+    },
+    {
+      "name": "proof-open-psk-zero",
+      "wire": "03303132333435363738393a3b3c3d3e3f47c8dc9124ded6ef460c055a34e4196d0000000000000000000000000000000002"
+    },
+    {
+      "name": "ok-udp",
+      "wire": "04"
+    },
+    {
+      "name": "again",
+      "wire": "06"
+    },
+    {
+      "name": "keepalive",
+      "wire": "05"
+    },
+    {
+      "name": "ok-tcp17",
+      "wire": "0413e0161e660690f2047f4df8764bc337"
+    },
+    {
+      "name": "session27",
+      "wire": "10000000000000002ac738707172737475767778797a7b7c7d7e7f"
+    },
+    {
+      "name": "release9",
+      "wire": "110000000000000063"
+    },
+    {
+      "name": "legup37",
+      "wire": "4c45475550707172737475767778797a7b7c7d7e7f01b342ba85e165a541b8a22c53849368"
+    },
+    {
+      "name": "relay-reg-frame",
+      "wire": "bb03011111111111111111111111111111111111111111111111111111111111111111"
+    },
+    {
+      "name": "ctl-stream-keepalive+256",
+      "wire": "0001050100050102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8b9babbbcbdbebfc0c1c2c3c4c5c6c7c8c9cacbcccdcecfd0d1d2d3d4d5d6d7d8d9dadbdcdddedfe0e1e2e3e4e5e6e7e8e9eaebecedeeeff0f1f2f3f4f5f6f7f8f9fafbfcfdfeff"
+    }
+  ],
+  "comment": "R4 中继控制子协议字节（Hello/Challenge/Proof50 v2/OK17/SESSION27/RELEASE9/LEGUP37 + 腿帧封装 + TCP 分帧边界）。语义真源 baseline pkg/proto/{relay,relayctl}.go；Rust 侧 relaywire.rs 对拍逐字节。",
+  "cookie": "707172737475767778797a7b7c7d7e7f",
+  "dh": "87f5f913b5dcc7b142ee2d91079b0f0faed1f7929e9dfbc767f19db682d7cd6e",
+  "ephPub": "605a725d2a4adfeeb1a29e17edd621c1b7593ee8cdbc44ac6c4ab6e2f805d23c",
+  "legupMac": "01b342ba85e165a541b8a22c53849368",
+  "nonce": "303132333435363738393a3b3c3d3e3f",
+  "okMac": "13e0161e660690f2047f4df8764bc337",
+  "proofMac": "47c8dc9124ded6ef460c055a34e4196d",
+  "pskMac": "3cebc3d9975341fa5fe5be8393440bc8"
+}
