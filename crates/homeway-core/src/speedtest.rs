@@ -319,20 +319,69 @@ fn request_payload(role: &str, warmup_ms: u64, window_ms: u64) -> Vec<u8> {
     format!(r#"{{"role":"{role}","warmup_ms":{warmup_ms},"window_ms":{window_ms}}}"#).into_bytes()
 }
 
-#[derive(Default, Clone, Copy)]
+#[derive(Default, Clone, Copy, Debug)]
 struct Report {
     bytes: i64,
     warmup_bytes: i64,
     wall_ms: i64,
 }
 
-fn parse_report(payload: &[u8]) -> Result<Report, SpeedtestError> {
-    // 极小 JSON 面（三数字 + 可选 error 串）——手解避免 serde_json 进 core（依赖纪律）。
+/// 顶层逗号切分（引号感知，R2 低-4 补修）：只在双引号外把 `,` 当分隔符——字符串值
+/// 内的逗号/`}` 不再错分（error 值是自由文案面：窗口期已知不含 ASCII 逗号，但 fuzz
+/// 对抗输入与后续文案演进不能依赖这一点）。`\"` 转义连下一字节跳过防提前闭合。
+pub(crate) fn split_top_level(s: &str) -> Vec<&str> {
+    let mut out = Vec::new();
+    let mut start = 0usize;
+    let mut in_str = false;
+    let bytes = s.as_bytes();
+    let mut i = 0usize;
+    while i < bytes.len() {
+        match bytes[i] {
+            b'\\' if in_str => {
+                i += 1; // 转义：跳过下一个字节（`\,`/`\"` 都不参与分隔/闭合判定）
+            }
+            b'"' => in_str = !in_str,
+            b',' if !in_str => {
+                out.push(&s[start..i]);
+                start = i + 1;
+            }
+            _ => {}
+        }
+        i += 1;
+    }
+    out.push(&s[start..]);
+    out
+}
+
+/// 极小 JSON unescape（error 值保真）：`\"`→`"`、`\\`→`\`；其余转义序列原样保留
+///（error 值下游只做码匹配与展示，码值不含转义面——够用且不扩大手解面）。
+pub(crate) fn unescape_minimal(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut it = s.chars();
+    while let Some(c) = it.next() {
+        if c == '\\' {
+            match it.next() {
+                Some('"') => out.push('"'),
+                Some('\\') => out.push('\\'),
+                Some(other) => {
+                    out.push('\\');
+                    out.push(other);
+                }
+                None => out.push('\\'),
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+fn parse_report(payload: &[u8]) -> Result<Report, SpeedtestError> {    // 极小 JSON 面（三数字 + 可选 error 串）——手解避免 serde_json 进 core（依赖纪律）。
     let s = std::str::from_utf8(payload)
         .map_err(|_| SpeedtestError::Frame("report 非 UTF-8".into()))?;
     let mut r = Report::default();
     let mut error: Option<String> = None;
-    for kv in s.trim_matches(['{', '}']).split(',') {
+    for kv in split_top_level(s.trim_matches(['{', '}'])) {
         let Some((k, v)) = kv.split_once(':') else {
             continue;
         };
@@ -355,9 +404,9 @@ fn parse_report(payload: &[u8]) -> Result<Report, SpeedtestError> {
                     .map_err(|_| SpeedtestError::Frame("report wall_ms 非法".into()))?
             }
             "error" => {
-                let e = v.trim_matches('"');
+                let e = unescape_minimal(v.trim_matches('"'));
                 if !e.is_empty() && v != "null" {
-                    error = Some(e.to_owned());
+                    error = Some(e);
                 }
             }
             _ => {}
@@ -390,9 +439,18 @@ impl Drop for ConnGuard<'_> {
 }
 
 /// 总预算看门狗（Go watchdogFix 口径）：到点关全部连接——把可能卡死的读/泵线程
-/// 从待决 RPC 里解出来（close ⇒ 引擎结算 EOF/Closed）。
-fn watchdog(client: &Client, ids: std::sync::Arc<std::sync::Mutex<Vec<u64>>>, budget: Duration, done: std::sync::mpsc::Receiver<()>) {
+/// 从待决 RPC 里解出来（close ⇒ 引擎结算 EOF/Closed）。到点先置 timed_out 旗标
+/// （R3-M24：后续读线程收到的 Closed/Frame 错误统一归因 timeout——「窗口没跑完」
+/// 与「链路死」是同一个根因面，不应报 interrupted）。
+fn watchdog(
+    client: &Client,
+    ids: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    budget: Duration,
+    done: std::sync::mpsc::Receiver<()>,
+    timed_out: &std::sync::atomic::AtomicBool,
+) {
     if done.recv_timeout(budget).is_err() {
+        timed_out.store(true, std::sync::atomic::Ordering::Release);
         let ids = ids.lock().expect("连接表锁中毒").clone();
         for id in ids {
             let _ = client.close(id);
@@ -408,11 +466,26 @@ pub fn run(client: &Client, params: Params, logf: &dyn Fn(&str)) -> Result<Speed
     let (wd_tx, wd_rx) = std::sync::mpsc::channel::<()>();
     let budget = Duration::from_secs(60) + p.warmup + p.down + p.up;
     let wd_ids = std::sync::Arc::clone(&ids);
+    let timed_out = std::sync::atomic::AtomicBool::new(false);
+    let wd_flag = &timed_out;
     let body = std::thread::scope(|scope| {
-        scope.spawn(move || watchdog(client, wd_ids, budget, wd_rx));
+        scope.spawn(move || watchdog(client, wd_ids, budget, wd_rx, wd_flag));
         run_phases(client, &p, logf, &ids)
     });
     let _ = wd_tx.send(()); // 看门狗收工（scope 已 join 线程，此处只解阻塞 recv）
+    // M24：看门狗触发（预算烧满）时，读/泵线程带出的连接级错误统一归因 timeout
+    //（窗口没跑完 = 链路死/服务端卡，不是 interrupted）。Report/InvalidArg/NotSupported
+    // 等服务端语义错误不改写。
+    if timed_out.load(std::sync::atomic::Ordering::Acquire) {
+        if let Err(e) = &body {
+            if matches!(
+                e,
+                SpeedtestError::Conn(_) | SpeedtestError::Frame(_)
+            ) {
+                return Err(SpeedtestError::Conn(ConnErr::Timeout));
+            }
+        }
+    }
     body
 }
 
@@ -701,5 +774,35 @@ mod tests {
         assert!(matches!(r, Err(SpeedtestError::Report(m)) if m.contains("满员")));
         let r = parse_report(br#"{"bytes":1,"warmup_bytes":0,"wall_ms":9,"error":"link_down"}"#);
         assert!(matches!(r, Err(SpeedtestError::Report(m)) if m.contains("链路")));
+    }
+
+    #[test]
+    fn report_parse_quote_aware() {
+        // 低-4：error 文案含 ASCII 逗号/引号/`}`/转义时不再错分（引号感知顶层切分）
+        let r = parse_report(
+            br#"{"bytes":7,"warmup_bytes":2,"wall_ms":33,"error":"a,b \"x\", c}d"}"#,
+        );
+        assert!(
+            matches!(&r, Err(SpeedtestError::Report(m)) if m == "a,b \"x\", c}d"),
+            "含逗号/引号/大括号的 error 值必须整段保真，得 {r:?}"
+        );
+        // error 在前、数字在后的键序形态（切分不依赖键序）
+        let r = parse_report(
+            br#"{"error":"x,y","bytes":8,"warmup_bytes":1,"wall_ms":5}"#,
+        );
+        assert!(matches!(&r, Err(SpeedtestError::Report(m)) if m == "x,y"));
+        // 值内 `\,`（转义逗号）不切分
+        let r = parse_report(br#"{"bytes":1,"warmup_bytes":0,"wall_ms":1,"error":"a\,b"}"#);
+        assert!(matches!(&r, Err(SpeedtestError::Report(m)) if m == "a\\,b"));
+    }
+
+    #[test]
+    fn split_top_level_edges() {
+        assert_eq!(split_top_level(""), vec![""]);
+        assert_eq!(split_top_level("a,b"), vec!["a", "b"]);
+        assert_eq!(split_top_level(r#""a,b",c"#), vec![r#""a,b""#, "c"]);
+        assert_eq!(split_top_level(r#""a\"b""#), vec![r#""a\"b""#]);
+        // 不平衡引号 = 对抗输入：按扫描尾态整体返回（解析侧后续步骤自然报错/忽略）
+        assert_eq!(split_top_level(r#""a,b"#), vec![r#""a,b"#]);
     }
 }

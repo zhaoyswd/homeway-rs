@@ -467,15 +467,26 @@ fn run_control_conn(
     };
     // relayAuthed := secret == 零——开放模式即视为已认证（测试用途放行）；
     // token 模式必须 OK-MAC 过（能应答 TCP 的一方若算不出 MAC 就绕不过这层）。
-    let mut relay_authed = secret.is_none();
-    if !relay_authed {
-        let want = rw::ok_auth_mac(&secret.expect("token 模式密钥在"), &nonce);
-        if !rw::ct_eq_16(&want, mac) {
-            return (false, Some("控制面 OK 的中继身份校验不过（MAC 不匹配：对端不持有本 token 的密钥）".to_owned()));
-        }
-        relay_authed = true;
-        (logf)("中继控制面：中继身份已认证（OK-MAC 通过）");
+    //（R4-§7.8 整改：认证状态用 enum 承载——Open / TokenVerified，bool 不再可半程混用；
+    // token 模式 MAC 不过 = 握手路径直接断，未认证态不落地。）
+    #[derive(Clone, Copy, PartialEq)]
+    enum Auth {
+        /// 开放模式（relay 无密钥）：连接建立即等价已认证。
+        Open,
+        /// token 模式：OK-MAC 已通过。
+        TokenVerified,
     }
+    let auth = match &secret {
+        None => Auth::Open,
+        Some(key) => {
+            let want = rw::ok_auth_mac(key, &nonce);
+            if !rw::ct_eq_16(&want, mac) {
+                return (false, Some("控制面 OK 的中继身份校验不过（MAC 不匹配：对端不持有本 token 的密钥）".to_owned()));
+            }
+            (logf)("中继控制面：中继身份已认证（OK-MAC 通过）");
+            Auth::TokenVerified
+        }
+    };
     // 重连对账（B1）：旧腿全部作废——中继会立刻重放活跃会话，按重放重建
     let _ = cmd_tx.send(EngineCmd::LegsClear);
     (logf)(&format!("中继控制面已连（{relay}）—— 已清腿表，等待会话重放"));
@@ -506,9 +517,9 @@ fn run_control_conn(
                 last_msg = Instant::now();
                 let sub = msg.first().copied().unwrap_or(0);
                 if sub == rw::sub::SESSION {
-                    if !relay_authed {
-                        // 未认证通道不得指挥拨腿（结构性守卫——token 模式验 MAC 已挡；
-                        // 走到这里的只可能是伪造/降级）
+                    if secret.is_some() && auth != Auth::TokenVerified {
+                        // 未认证通道不得指挥拨腿（结构性守卫：token 模式 MAC 不过
+                        // 在握手路径已断——走到这里的只可能是未来改动引入的降级路径）
                         refused_sessions += 1;
                         if refused_sessions <= 3 || refused_sessions.is_multiple_of(50) {
                             (logf)(&format!(

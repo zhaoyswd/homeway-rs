@@ -373,10 +373,12 @@ fn parse_request(payload: &[u8]) -> Option<RequestJson> {
     let mut role = String::new();
     let mut warmup = 0u64;
     let mut window = 0u64;
-    for kv in inner.split(',') {
+    // 引号感知切分（低-4 同款，服务端面）：role 值是客户端自由串，含 `,`/`"` 时
+    // 裸 split 会错分——与客户端 parse_report 共用同一切分/反转义语义。
+    for kv in crate::speedtest::split_top_level(inner) {
         let Some((k, v)) = kv.split_once(':') else { continue };
         match k.trim().trim_matches('"') {
-            "role" => role = v.trim().trim_matches('"').to_owned(),
+            "role" => role = crate::speedtest::unescape_minimal(v.trim().trim_matches('"')),
             "warmup_ms" => warmup = v.trim().parse().ok()?,
             "window_ms" => window = v.trim().parse().ok()?,
             _ => {}

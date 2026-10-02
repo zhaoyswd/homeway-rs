@@ -27,6 +27,42 @@ const UPNP_TIMEOUT: Duration = Duration::from_secs(5);
 /// 映射表枚举上限（listMappings 的 max）。
 const LIST_MAX: usize = 200;
 
+/// upnp 错误面（R3-M23 类型化）：Display 文案与既有日志行**同串**（消费面 `{e}`
+/// 透传；soap 错误串保留 body——list_mappings 的 713 表尾判定靠它）。
+#[derive(Debug, thiserror::Error)]
+pub enum UpnpError {
+    /// 底层 IO / HTTP 非 2xx（body 上下文随 io::Error 文案保留）。
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    /// URL 非 http:// 形态。
+    #[error("解析 URL {0:?}")]
+    BadUrl(String),
+    /// SSDP 三重试后无 IGD 响应（附最后一次错误串）。
+    #[error("没有 IGD 响应（路由器未开 UPnP，或组播出不去）: {0}")]
+    NoIgdResponse(String),
+    /// 描述文件拉取失败（附底层错误串）。
+    #[error("取描述文件: {0}")]
+    DescFetch(String),
+    /// 描述文件里没有 WAN 连接服务。
+    #[error("描述文件里没有 WANIPConnection/WANPPPConnection 服务")]
+    NoWanService,
+    /// SOAP 调用失败（action + 底层错误串——保留 body 上下文）。
+    #[error("{action}: {msg}")]
+    Soap { action: String, msg: String },
+    /// 候选本机地址全都没找到 IGD。
+    #[error("没有可用的 IGD（候选 {candidates:?}）：{last}")]
+    NoIgd { candidates: String, last: String },
+    /// 路由器返回空的外部地址。
+    #[error("路由器返回空的外部地址")]
+    EmptyExternalIp,
+    /// 外部地址非法（原文保留）。
+    #[error("外部地址 {0:?} 非法")]
+    BadExternalIp(String),
+    /// 外部端口候选全部不可用（占用/拒绝计数）。
+    #[error("外部端口候选均不可用（{occupied} 个被其它映射占用、{refused} 个被路由器拒绝）")]
+    NoPortAvailable { occupied: usize, refused: usize },
+}
+
 /// M-SEARCH 报文（形状真源——ssdpLocation；`MX: 2` + IGD ST）。
 pub fn msearch_message() -> String {
     format!("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: {SSDP_ST}\r\n\r\n")
@@ -109,7 +145,7 @@ pub fn udp_port_in_use(port: u16) -> bool {
 
 /// 发一次 SSDP M-SEARCH，取第一个 IGD 的 LOCATION（重试 3 次：家用路由器/交换机的
 /// IGMP 收敛有几秒抖动）。local_ip 用于绑源地址（多网卡机器只有与路由器同网段的那张能用）。
-pub fn ssdp_location(local_ip: Option<Ipv4Addr>) -> std::io::Result<String> {
+pub fn ssdp_location(local_ip: Option<Ipv4Addr>) -> Result<String, UpnpError> {
     let bind: std::net::SocketAddr = match local_ip {
         Some(ip) => SocketAddrV4::new(ip, 0).into(),
         None => "0.0.0.0:0".parse().expect("合法字面量"),
@@ -148,10 +184,7 @@ pub fn ssdp_location(local_ip: Option<Ipv4Addr>) -> std::io::Result<String> {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::TimedOut,
-        format!("没有 IGD 响应（路由器未开 UPnP，或组播出不去）: {last_err}"),
-    ))
+    Err(UpnpError::NoIgdResponse(last_err))
 }
 
 fn header_value(resp: &str, key: &str) -> Option<String> {
@@ -174,7 +207,7 @@ fn header_value(resp: &str, key: &str) -> Option<String> {
 // ---------- 最小 HTTP 客户端（家用路由器的嵌入式 HTTP 服务很挑：显式
 // Connection: close + UA + Accept-Encoding: identity——keep-alive/gzip 会被直接关连接） ----------
 
-fn http_call(url: &str, method: &str, content_type: Option<&str>, soap_action: Option<&str>, body: Option<&str>) -> std::io::Result<String> {
+fn http_call(url: &str, method: &str, content_type: Option<&str>, soap_action: Option<&str>, body: Option<&str>) -> Result<String, UpnpError> {
     let (host, port, path) = parse_http_url(url)?;
     let mut stream = TcpStream::connect((host.as_str(), port))?;
     stream.set_read_timeout(Some(UPNP_TIMEOUT))?;
@@ -202,7 +235,7 @@ fn http_call(url: &str, method: &str, content_type: Option<&str>, soap_action: O
             None => text.clone(),
         };
         let first = text.lines().next().unwrap_or("").to_owned();
-        return Err(std::io::Error::other(format!("HTTP 非 2xx：{first} body={body}")));
+        return Err(UpnpError::Io(std::io::Error::other(format!("HTTP 非 2xx：{first} body={body}"))));
     }
     // 去头
     Ok(match text.find("\r\n\r\n") {
@@ -211,10 +244,10 @@ fn http_call(url: &str, method: &str, content_type: Option<&str>, soap_action: O
     })
 }
 
-fn parse_http_url(url: &str) -> std::io::Result<(String, u16, String)> {
+fn parse_http_url(url: &str) -> Result<(String, u16, String), UpnpError> {
     let rest = url
         .strip_prefix("http://")
-        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("解析 URL {url:?}")))?;
+        .ok_or_else(|| UpnpError::BadUrl(url.to_owned()))?;
     let (hostport, path) = match rest.find('/') {
         Some(i) => (&rest[..i], &rest[i..]),
         None => (rest, "/"),
@@ -273,18 +306,15 @@ fn xml_tag(body: &str, tag: &str) -> Option<String> {
 }
 
 /// SSDP 找到网关的 UPnP 描述并解析出 WAN 连接服务的控制地址（discoverIGD）。
-pub fn discover_igd(local_ip: Ipv4Addr) -> std::io::Result<Igd> {
+pub fn discover_igd(local_ip: Ipv4Addr) -> Result<Igd, UpnpError> {
     let loc = ssdp_location(Some(local_ip))?;
     igd_from_location(&loc)
 }
 
 /// 已知 LOCATION 直取（mock 测试与 discover 共用）。
-pub fn igd_from_location(loc: &str) -> std::io::Result<Igd> {
-    let body = http_call(loc, "GET", None, None, None)
-        .map_err(|e| std::io::Error::new(e.kind(), format!("取描述文件: {e}")))?;
-    find_wan_service(&body, loc).ok_or_else(|| {
-        std::io::Error::new(std::io::ErrorKind::NotFound, "描述文件里没有 WANIPConnection/WANPPPConnection 服务")
-    })
+pub fn igd_from_location(loc: &str) -> Result<Igd, UpnpError> {
+    let body = http_call(loc, "GET", None, None, None).map_err(|e| UpnpError::DescFetch(e.to_string()))?;
+    find_wan_service(&body, loc).ok_or(UpnpError::NoWanService)
 }
 
 impl Igd {
@@ -293,7 +323,7 @@ impl Igd {
     }
 
     /// SOAP 调用（Envelope 形态对齐 Go soap()）。
-    pub fn soap(&self, action: &str, args: &[(&str, String)]) -> std::io::Result<String> {
+    pub fn soap(&self, action: &str, args: &[(&str, String)]) -> Result<String, UpnpError> {
         let mut b = String::new();
         b.push_str(r#"<?xml version="1.0"?><s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/""#);
         b.push_str(r#" s:encodingStyle="http://schemas.xmlsoap.org/soap/encoding/"><s:Body><u:"#);
@@ -306,16 +336,16 @@ impl Igd {
         }
         b.push_str(&format!("</u:{action}></s:Body></s:Envelope>"));
         let sa = format!("{}#{}", self.service_type, action);
-        http_call(&self.control_url, "POST", Some(r#"text/xml; charset="utf-8""#), Some(&sa), Some(&b))
-            .map_err(|e| {
-                // 保留 body 上下文（list_mappings 的「到表尾」判定要读 713 形态）
-                std::io::Error::new(e.kind(), format!("{action}: {e}"))
-            })
+        http_call(&self.control_url, "POST", Some(r#"text/xml; charset="utf-8""#), Some(&sa), Some(&b)).map_err(|e| {
+            // 保留 body 上下文（list_mappings 的「到表尾」判定要读 713 形态——Display
+            // 链 "{action}: {source}" 与原 format! 同串）
+            UpnpError::Soap { action: action.to_owned(), msg: e.to_string() }
+        })
     }
 
     /// 加映射（先删同名保证幂等——多数路由器重复添加回 718；租期优先 1 小时，
     /// 只接受 0 的机型退永久并**出声**）。
-    pub fn add_port_mapping(&self, external_port: u16, internal_ip: Ipv4Addr, internal_port: u16, logf: &dyn Fn(&str)) -> std::io::Result<()> {
+    pub fn add_port_mapping(&self, external_port: u16, internal_ip: Ipv4Addr, internal_port: u16, logf: &dyn Fn(&str)) -> Result<(), UpnpError> {
         let _ = self.delete_mapping(external_port, "UDP");
         match self.add_with_lease(external_port, internal_ip, internal_port, 3600) {
             Ok(()) => Ok(()),
@@ -331,7 +361,7 @@ impl Igd {
         }
     }
 
-    fn add_with_lease(&self, external_port: u16, internal_ip: Ipv4Addr, internal_port: u16, lease: u32) -> std::io::Result<()> {
+    fn add_with_lease(&self, external_port: u16, internal_ip: Ipv4Addr, internal_port: u16, lease: u32) -> Result<(), UpnpError> {
         self.soap(
             "AddPortMapping",
             &[
@@ -349,7 +379,7 @@ impl Igd {
     }
 
     /// 删一条（不存在时路由器报 714——忽略语义由调用方按 body 判定）。
-    pub fn delete_mapping(&self, external_port: u16, proto: &str) -> std::io::Result<()> {
+    pub fn delete_mapping(&self, external_port: u16, proto: &str) -> Result<(), UpnpError> {
         self.soap(
             "DeletePortMapping",
             &[
@@ -397,14 +427,13 @@ impl Igd {
     }
 
     /// GetExternalIPAddress（部分路由器返回空——调用方自己兜底）。
-    pub fn external_ip(&self) -> std::io::Result<Ipv4Addr> {
+    pub fn external_ip(&self) -> Result<Ipv4Addr, UpnpError> {
         let body = self.soap("GetExternalIPAddress", &[])?;
         let raw = xml_tag(&body, "NewExternalIPAddress").unwrap_or_default();
         if raw.is_empty() {
-            return Err(std::io::Error::new(std::io::ErrorKind::NotFound, "路由器返回空的外部地址"));
+            return Err(UpnpError::EmptyExternalIp);
         }
-        raw.parse()
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidData, format!("外部地址 {raw:?} 非法")))
+        raw.parse().map_err(|_| UpnpError::BadExternalIp(raw))
     }
 
     /// 表里找「我们自己的」映射（同描述前缀 + 同内网客户端；内网端口指着别的活实例的
@@ -452,7 +481,7 @@ impl Igd {
 
     /// 用很短的租期重建同一条映射（退出时缩租——快速重启能沿用同一个公网端口，
     /// 出口真退休了映射自动过期）。
-    pub fn re_add_short_lease(&self, ext_port: u16, internal_ip: Ipv4Addr, internal_port: u16, lease: u32) -> std::io::Result<()> {
+    pub fn re_add_short_lease(&self, ext_port: u16, internal_ip: Ipv4Addr, internal_port: u16, lease: u32) -> Result<(), UpnpError> {
         let _ = self.delete_mapping(ext_port, "UDP");
         self.add_with_lease(ext_port, internal_ip, internal_port, lease)?;
         Ok(())
@@ -467,7 +496,7 @@ pub fn ensure_port_mapping(
     internal_port: u16,
     logf: &dyn Fn(&str),
     dlogf: &dyn Fn(&str),
-) -> std::io::Result<(u16, Ipv4Addr)> {
+) -> Result<(u16, Ipv4Addr), UpnpError> {
     let mut igd = None;
     let mut local_ip = Ipv4Addr::UNSPECIFIED;
     let mut last_err = String::new();
@@ -482,10 +511,7 @@ pub fn ensure_port_mapping(
         }
     }
     let Some(g) = igd else {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::NotFound,
-            format!("没有可用的 IGD（候选 {candidates:?}）：{last_err}"),
-        ));
+        return Err(UpnpError::NoIgd { candidates: format!("{candidates:?}"), last: last_err });
     };
     let (prefer, prev_internal) = match g.find_our_mapping(UPNP_MAP_DESC, local_ip, internal_port) {
         Some((ext, int)) => {
@@ -509,7 +535,7 @@ pub fn ensure_port_mapping(
 
 /// 候选端口逐个申请（所有权核验 + 让位语义；映射表枚举失败/残缺/含归属不明条目时
 /// fail-open 直接申请——把它当 foreign 会让自己的映射每轮 +1 漂移直到候选让尽）。
-pub fn select_external_port(g: &Igd, internal_port: u16, prefer: u16, local_ip: Ipv4Addr, logf: &dyn Fn(&str)) -> std::io::Result<u16> {
+pub fn select_external_port(g: &Igd, internal_port: u16, prefer: u16, local_ip: Ipv4Addr, logf: &dyn Fn(&str)) -> Result<u16, UpnpError> {
     let (list, complete) = g.list_mappings();
     let mut verify = complete;
     if !verify {
@@ -593,10 +619,7 @@ pub fn select_external_port(g: &Igd, internal_port: u16, prefer: u16, local_ip: 
             }
         }
     }
-    Err(std::io::Error::new(
-        std::io::ErrorKind::ConnectionRefused,
-        format!("外部端口候选均不可用（{occupied} 个被其它映射占用、{refused} 个被路由器拒绝）"),
-    ))
+    Err(UpnpError::NoPortAvailable { occupied, refused })
 }
 
 /// 本机可能用于 UPnP 的内网 IPv4 候选（过滤回环/虚拟网卡与公网地址——真正判据仍是

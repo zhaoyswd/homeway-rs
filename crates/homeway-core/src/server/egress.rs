@@ -16,6 +16,27 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::os::fd::AsRawFd as _;
 use std::time::{Duration, Instant};
 
+/// egress 错误面（R3-M23 类型化）：Display 文案与既有日志/判据行**同串**（消费面
+/// `{e}` 透传打印，文案即契约——重构不给文案漂移留口子）。
+#[derive(Debug, thiserror::Error)]
+pub enum EgressError {
+    /// 底层 IO（bind/setsockopt/读写）——errno 上下文透传。
+    #[error(transparent)]
+    Io(#[from] io::Error),
+    /// 网卡名含 NUL（setsockopt 的 C 串边界）。
+    #[error("网卡名含 NUL")]
+    IfaceNameNul,
+    /// 探针绝对期限烧完（per-recv 续命已封——probe_with 的 M7 注记）。
+    #[error("egress: 探针预算耗尽")]
+    ProbeBudget,
+    /// 无候选物理网卡（up/非虚拟/有 IPv4 的前置全不满足）。
+    #[error("egress: 没有候选物理网卡（都 up/非虚拟/有 IPv4？）")]
+    NoCandidates,
+    /// 候选全探不通（明细以「；」连接——E21 失败形态行素材）。
+    #[error("egress: 所有候选网卡都探不通：{0}")]
+    AllUnreachable(String),
+}
+
 /// STUN magic cookie（RFC 5389）。
 const STUN_MAGIC_COOKIE: u32 = 0x2112_A442;
 const STUN_BINDING_REQ: u16 = 0x0001;
@@ -179,7 +200,7 @@ pub fn pin_socket_to_iface(fd: std::os::fd::RawFd, index: u32, name: &str) -> io
         }
         #[cfg(target_os = "linux")]
         {
-            let cname = std::ffi::CString::new(name).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "网卡名含 NUL"))?;
+            let cname = std::ffi::CString::new(name).map_err(|_| EgressError::IfaceNameNul)?;
             let r = libc::setsockopt(
                 fd,
                 libc::SOL_SOCKET,
@@ -363,7 +384,7 @@ fn probe_with(
     pin: Option<&IfaceInfo>,
     targets: &[SocketAddrV4],
     timeout: Duration,
-) -> io::Result<Duration> {
+) -> Result<Duration, EgressError> {
     let targets = if targets.is_empty() { &default_probe_targets()[..] } else { targets };
     let s = UdpSocket::bind("0.0.0.0:0")?;
     if let Some(ifi) = pin {
@@ -384,7 +405,7 @@ fn probe_with(
         // 灌包即可让探针永不返回、select_best 的 join 无限等）
         let remain = deadline.saturating_duration_since(Instant::now());
         if remain.is_zero() {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "egress: 探针预算耗尽"));
+            return Err(EgressError::ProbeBudget);
         }
         s.set_read_timeout(Some(remain))?;
         let (n, from) = s.recv_from(&mut buf)?;
@@ -404,12 +425,12 @@ fn probe_with(
 
 /// 从系统默认路由发一次 DNS 探针（不绑卡）——判定「经默认路径转发出去的 UDP 到底
 /// 能不能回来」（udpcap 的 DNS:53 位）。
-pub fn probe_default(targets: &[SocketAddrV4], timeout: Duration) -> io::Result<Duration> {
+pub fn probe_default(targets: &[SocketAddrV4], timeout: Duration) -> Result<Duration, EgressError> {
     probe_with(None, targets, timeout)
 }
 
 /// 从指定网卡发一次 DNS 探针（绑卡后发——select_best 的判据）。
-pub fn probe_iface(ifi: &IfaceInfo, targets: &[SocketAddrV4], timeout: Duration) -> io::Result<Duration> {
+pub fn probe_iface(ifi: &IfaceInfo, targets: &[SocketAddrV4], timeout: Duration) -> Result<Duration, EgressError> {
     probe_with(Some(ifi), targets, timeout)
 }
 
@@ -419,7 +440,7 @@ pub fn probe_stun(
     pin: Option<&IfaceInfo>,
     targets: &[SocketAddrV4],
     timeout: Duration,
-) -> io::Result<(SocketAddr, Duration)> {
+) -> Result<(SocketAddr, Duration), EgressError> {
     let targets = if targets.is_empty() { &default_stun_targets()[..] } else { targets };
     let s = UdpSocket::bind("0.0.0.0:0")?;
     if let Some(ifi) = pin {
@@ -437,7 +458,7 @@ pub fn probe_stun(
     loop {
         let remain = deadline.saturating_duration_since(Instant::now());
         if remain.is_zero() {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "egress: 探针预算耗尽"));
+            return Err(EgressError::ProbeBudget);
         }
         s.set_read_timeout(Some(remain))?;
         let (n, from) = s.recv_from(&mut buf)?;
@@ -464,12 +485,12 @@ pub fn select_best(
     targets: &[SocketAddrV4],
     timeout: Duration,
     logf: &dyn Fn(&str),
-) -> io::Result<IfaceInfo> {
+) -> Result<IfaceInfo, EgressError> {
     if cands.is_empty() {
-        return Err(io::Error::new(io::ErrorKind::NotFound, "egress: 没有候选物理网卡（都 up/非虚拟/有 IPv4？）"));
+        return Err(EgressError::NoCandidates);
     }
     let prefer = preferred_iface();
-    let mut results: Vec<(IfaceInfo, io::Result<Duration>)> = Vec::new();
+    let mut results: Vec<(IfaceInfo, Result<Duration, EgressError>)> = Vec::new();
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
         for c in cands {
@@ -506,10 +527,7 @@ pub fn select_best(
     let mut best = match best {
         Some(b) => b,
         None => {
-            return Err(io::Error::new(
-                io::ErrorKind::TimedOut,
-                format!("egress: 所有候选网卡都探不通：{}", details.join("；")),
-            ))
+            return Err(EgressError::AllUnreachable(details.join("；")))
         }
     };
     if let Some(p) = prefer_hit {
