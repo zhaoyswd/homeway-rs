@@ -524,8 +524,14 @@ fn token_revoke(args: &[String]) {
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
-            "--state" => state = args.get(i + 1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from(".")),
-            "--reason" => reason = args.get(i + 1).cloned().unwrap_or_else(|| "manual".into()),
+            "--state" => {
+                state = args.get(i + 1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+                i += 1; // 值参跳过
+            }
+            "--reason" => {
+                reason = args.get(i + 1).cloned().unwrap_or_else(|| "manual".into());
+                i += 1;
+            }
             other if !other.starts_with('-') => id = other.to_owned(),
             _ => {}
         }
