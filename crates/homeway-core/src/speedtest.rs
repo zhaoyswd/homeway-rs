@@ -21,13 +21,13 @@ use crate::wgcore::{Client, ConnErr};
 
 /// speedtest 服务端口（隧道 IP 上；出口按 LocalServices 转投）。
 pub const SPEEDTEST_PORT: u16 = 7803;
-const MAGIC: [u8; 4] = *b"SPED";
-const HEADER: usize = 15;
-const TYPE_REQUEST: u8 = 1;
-const TYPE_START: u8 = 2;
-const TYPE_FINISH: u8 = 3;
-const TYPE_DATA: u8 = 4;
-const TYPE_REPORT: u8 = 5;
+pub(crate) const MAGIC: [u8; 4] = *b"SPED";
+pub(crate) const HEADER: usize = 15;
+pub(crate) const TYPE_REQUEST: u8 = 1;
+pub(crate) const TYPE_START: u8 = 2;
+pub(crate) const TYPE_FINISH: u8 = 3;
+pub(crate) const TYPE_DATA: u8 = 4;
+pub(crate) const TYPE_REPORT: u8 = 5;
 /// 发送块（= Go blockBytes：u16 长度场硬顶 64KB-1）。
 const BLOCK: usize = 64 * 1024 - 1;
 /// 客户端窗口起点对服务端的滞后余量（phaseSlack）。
@@ -144,7 +144,7 @@ pub struct SpeedtestResult {
 
 /// crc32（IEEE，反射式）——Go `crc32.ChecksumIEEE` 同义（逐位小实现；data 帧载荷全零
 /// 按长度缓存，热路径零重复计算）。
-fn crc32_ieee(buf: &[u8]) -> u32 {
+pub(crate) fn crc32_ieee(buf: &[u8]) -> u32 {
     let mut crc = !0u32;
     for &b in buf {
         crc ^= b as u32;
@@ -159,7 +159,7 @@ fn crc32_ieee(buf: &[u8]) -> u32 {
     !crc
 }
 
-fn zero_crc(n: usize) -> u32 {
+pub(crate) fn zero_crc(n: usize) -> u32 {
     std::thread_local! {
         static CACHE: std::cell::RefCell<HashMap<usize, u32>> =
             std::cell::RefCell::new(HashMap::new());
@@ -457,9 +457,11 @@ fn run_phases(
                     let (mut got, mut used) = (0i64, 0i64);
                     let (sb, sw): (i64, i64);
                     let mut fr = FrameReader::new();
-                    let first_frame = true; // 首帧标记（map_err 闭包判定 not_supported 用）
+                    // L10 修复（R3-design §6 风险表）：first_frame 此前恒 true ⇒ 窗口期
+                    // 任何帧错误都被降级 not_supported——成功读到首帧后必须复位。
+                    let mut first_frame = true;
                     loop {
-                        match fr.read_frame(client, id).map_err(|e| {
+                        let fin = match fr.read_frame(client, id).map_err(|e| {
                             // 首帧前 EOF/通道关 = 出口没有测速服务（连接被出口侧立即收流）
                             if first_frame
                                 && matches!(e, SpeedtestError::Conn(ConnErr::Closed) | SpeedtestError::Frame(_))
@@ -468,7 +470,12 @@ fn run_phases(
                             } else {
                                 e
                             }
-                        })? {
+                        }) {
+                            Ok(f) => f,
+                            Err(e) => return Err(e),
+                        };
+                        first_frame = false;
+                        match fin {
                             FrameIn::Data { payload_len } => {
                                 let now = Instant::now();
                                 if now >= window_start && now < window_start + p.down {

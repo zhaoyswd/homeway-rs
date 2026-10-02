@@ -21,6 +21,7 @@ pub mod psk;
 pub mod server;
 pub mod session;
 pub mod speedtest;
+pub mod speedtest_server;
 pub mod status_json;
 pub mod token;
 pub mod tunnel_addr;
