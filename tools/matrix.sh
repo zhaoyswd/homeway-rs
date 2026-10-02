@@ -239,7 +239,12 @@ while True:
 " >> "$st/echo.log" 2>&1 &
   echo $! > "$st/echo.pid"
   sleep 0.5
-  kill -0 $(cat "$st/echo.pid") 2>/dev/null
+  if ! kill -0 $(cat "$st/echo.pid") 2>/dev/null; then
+    # 端口残留（上轮 echo 未退）：清旧再试一次
+    pkill -f "matrix/$link" 2>/dev/null
+    sleep 1
+    start_echo "$link"
+  fi
 }
 
 start_go_client() { # start_go_client <链路>（daemon 统一进程：serve/relay 双关断言）
@@ -370,7 +375,7 @@ base_segment() {
       stop_pid "$st/c-main/pid"
       rm -rf "$st/c-main/cache/endpoints"
       start_go_client "$link" || true
-      if CL=$(go_client_add "$link" "$TOK"); then
+      if CL=$(go_client_add "$link" "$TOK" "m${link}r"); then
         if V=$(grep '路径确立：直连' "$st/c-main/cache/client.log" 2>/dev/null | tail -1); then
           record "$link" C-via-direct "PASS" "${V:0:100}" "（重试一次命中——首轮竞速落中继）"
         else
@@ -460,7 +465,7 @@ base_segment() {
   local UP_SHA=$(sha256_of "$LOCAL")
   if [[ "$C" == go ]]; then
     UP=$("$GO_BIN" files put --state "$st/c-main" --host "m$link" "$LOCAL" "/$RNAME" 2>&1 | tail -1)
-    DN=$("$GO_BIN" files get --state "$st/c-main" --host "m$link" "/$RNAME" "$st/dn-100mb.bin" 2>&1 | tail -1)
+    DN=$("$GO_BIN" files get --state "$st/c-main" --host "m$link" "/$RNAME" -o "$st/dn-100mb.bin" 2>&1 | tail -1)
   else
     UP=$(tmo 120 "$RUST_BIN" files upload --token "$TOK" --identity-dir "$st/c-main/identity" "/$RNAME" "$LOCAL" 2>&1 | tail -1)
     DN=$(tmo 120 "$RUST_BIN" files download --token "$TOK" --identity-dir "$st/c-main/identity" "/$RNAME" "$st/dn-100mb.bin" 2>&1 | tail -1)
@@ -501,12 +506,17 @@ base_segment() {
   else
     record "$link" E10 "FAIL" "25s 内未见 transit dialok"
   fi
-  # E11 关闭行（transit 流关后）
-  sleep 2
-  if grep -q 'intercept: tcp transit.*关闭' "$st/exit/stdout.log" 2>/dev/null; then
-    record "$link" E11 "PASS" "$(grep 'intercept: tcp transit.*关闭' "$st/exit/stdout.log" | tail -1 | cut -c1-100)"
+  # E11 关闭行（transit 流关后；Rust exit 的关闭行时序可达数秒——15s 轮询窗）
+  local wi=0 V11=""
+  while (( wi < 15 )); do
+    V11=$(grep 'intercept: tcp transit.*关闭' "$st/exit/stdout.log" 2>/dev/null | tail -1)
+    [[ -n "$V11" ]] && break
+    sleep 3; (( wi+=3 ))
+  done
+  if [[ -n "$V11" ]]; then
+    record "$link" E11 "PASS" "${V11:0:100}"
   else
-    record "$link" E11 "FAIL" "未见 transit 关闭行"
+    record "$link" E11 "FAIL" "15s 内未见 transit 关闭行"
   fi
 
   # FB：files 4 并发 list 不误伤（busy 满员语义由单测 busy_rejection_when_conns_full 钉死）
@@ -645,6 +655,15 @@ relay_segment() {
   # R4 链路 3「speedtest 预算内未跑满」即此缺口前身。深挖归 R6 前置批。
   if [[ -n "$SPO" && "$SPO" != *失败* ]]; then
     record "$link" RL-speedtest "PASS" "$(echo "$SPO" | cut -c1-100)"
+  elif [[ "$C" == go ]]; then
+    # Go 客户端**设计上拒绝**在中继路径跑 speedtest（「走中继=需排查的 bug」用户口径
+    # ——CLI 见 via=relay 即 ⚠️ 告警退出）。告警行即「经中继形态成立」的证据；
+    # 数据面吞吐证据 = RL-files5MB 对账。
+    if grep -q '链路走了中继' "$st/c-main/cache/client.log" 2>/dev/null; then
+      record "$link" RL-speedtest "PASS" "（Go 客户端设计拒绝中继 speedtest——⚠️ 告警行在册；数据面证据=RL-files5MB）" "GO-DESIGN"
+    else
+      record "$link" RL-speedtest "FAIL" "Go 客户端经中继 speedtest 无产出且无告警行"
+    fi
   elif [[ "$E" == go ]]; then
     record "$link" RL-speedtest "PASS" "（KNOWN-GAP：Go exit × 中继 speedtest 并发形态——数据面证据=RL-files5MB 对账；登记见矩阵头注/ROADMAP）" "KNOWN-GAP"
   else
@@ -658,7 +677,7 @@ relay_segment() {
   local UP_SHA=$(sha256_of "$LOCAL") UP_OUT="" DN_OUT=""
   if [[ "$C" == go ]]; then
     UP_OUT=$("$GO_BIN" files put --state "$st/c-main" --host "dead$link" "$LOCAL" "/$RNAME" 2>&1 | tail -1)
-    DN_OUT=$("$GO_BIN" files get --state "$st/c-main" --host "dead$link" "/$RNAME" "$st/dn-5mb.bin" 2>&1 | tail -1)
+    DN_OUT=$("$GO_BIN" files get --state "$st/c-main" --host "dead$link" "/$RNAME" -o "$st/dn-5mb.bin" 2>&1 | tail -1)
   else
     # files CLI 无 --endpoint-cache-dir（不识别会错位进 rest）——不带 = 会话无落盘缓存，
     # 竞速 token 端点（dead-direct 形态下恒中继），段级隔离天然成立
