@@ -1,0 +1,6 @@
+# OHOS 交叉链接（**R7 才用**；本机/host 构建不受影响——target 作用域配置）。
+# 配方源自 tier:tools/spikes/rust-ohos-poc/rust/.cargo/config.toml（PoC 实测一次过）：
+# DevEco NDK 自带的目标包装 clang，自带 sysroot。
+# 首次构建：rustup target add aarch64-unknown-linux-ohos && cargo build --target aarch64-unknown-linux-ohos
+[target.aarch64-unknown-linux-ohos]
+linker = "/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native/llvm/bin/aarch64-unknown-linux-ohos-clang"

@@ -1,0 +1,13 @@
+# ring 0.16 的本地垫片：仅实现 boringtun 0.6 实际用到的 API 面。
+# 为什么存在：真 ring 0.16 的 asm 管线没有 aarch64-unknown-linux-ohos 支持
+# （ring 0.17.9 才加 OHOS，boringtun 0.6 钉死 0.16）。
+# 算法一致：ChaCha20-Poly1305 走 RustCrypto（比 ring 的手写 asm 慢 ⇒ 实测数字偏保守），
+# 常量时间比较走 subtle。boringtun 本体零改动。
+[package]
+name = "ring"
+version = "0.16.20"
+edition = "2021"
+
+[dependencies]
+chacha20poly1305 = "0.10"
+subtle = "2"

@@ -1,0 +1,3 @@
+[toolchain]
+# 钉 1.99.0（2026-10-02 时点 stable；PoC 全依赖面在此版本实测过 OHOS 交叉）
+channel = "1.99.0"
