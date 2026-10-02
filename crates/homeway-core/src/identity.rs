@@ -82,7 +82,7 @@ pub enum IdentityError {
 
 /// 设备标签（出口设备表的键）：8B，Debug 只出 4B hex 短指纹（日志纪律）。
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub struct DevTag([u8; DEV_TAG_LEN]);
+pub struct DevTag(pub(crate) [u8; DEV_TAG_LEN]);
 
 impl DevTag {
     pub fn as_bytes(&self) -> &[u8; 8] {
