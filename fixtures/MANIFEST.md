@@ -11,6 +11,29 @@
 | `vectors/tunnel_addr.json` | DeriveTunnelIP / DeriveTunIP（含守卫命中样本钉死 hw-app.N 再散列路径） | 同上 |
 | `vectors/identity.json` | master+peerID → WG 私钥/公钥；master → devTag（含 LoadOrCreateIdentity 全路径交叉验证） | 同上（克隆内直调 `clientcore/internal/wtransport` 未导出派生函数） |
 
+## control 控制面契约夹具（拷贝，R0.6 评审 M9 补拷）
+
+Go 侧**明确冻结的跨语言线协议夹具**（`internal/control/testdata/fixtures/v1/`）——43 条
+daemon 控制面帧向量 + `decode_check.py`（**语言无关**的解码对拍器：不依赖任何 Go 代码、
+仅凭 spec 实现解码即可自证）。Rust 侧落 daemon 面时**必须跑 `python3 decode_check.py` 自证**。
+
+| 本仓路径 | 来源（baseline 克隆内） | 说明 |
+|---|---|---|
+| `control-cp-v1/frames.jsonl` | `internal/control/testdata/fixtures/v1/frames.jsonl` | 43 条帧向量（含 expect 语义断言） |
+| `control-cp-v1/decode_check.py` | 同目录 | 跨语言解码对拍器（独立实现参照） |
+| `control-cp-v1/README.md` | 同目录 | 冻结契约说明 |
+
+## term 检测规则本体（拷贝，R0.6 评审 M10 补拷）
+
+`pkg/term/manifest/manifests/` 整目录（24 文件 = **22 份 agent 规则 toml** + `index.toml` +
+`README.md`）——E15 判据「检测规则已加载 22 份」的**计数与内容真源**（Go 侧 `go:embed`
+内嵌随二进制分发）；R6 检测引擎必须吃同一份规则数据。`index.toml` 的 id 集合 = 22 份计数真源。
+
+## 机器校验
+
+`SHA256SUMS` 覆盖本目录全部文件（45 项，向量 JSON 亦入册）；`shasum -c SHA256SUMS`（在
+`fixtures/` 下执行）应全 OK——升级基线重拷/重生成后必须重跑并重写（R5 本地 CI 挂门）。
+
 ## term golden（拷贝，来源 hash 锚定）
 
 | 本仓路径 | 来源（baseline 克隆内） | 用途（R6） | sha256 |
@@ -39,5 +62,9 @@
 **说明**：`pkg/proto/gen_golden.go` 是 token 向量的一次性生成器（输出钉进 token_test.go），
 与本清单 vectors/ 的持续生成器是两回事。files 帧无静态 testdata（Go 侧 files 契约在测试
 内联断言）；R2 files 客户端对齐时用 `fixtures/vectors` 的 token 族 + 克隆内 Go 测试同款字节构造。
+**有意不拷**：`third_party/libghostty-vt/**/snapshot/testdata`（20 个 `.hex`）——那是
+libghostty-vt 自身的快照格式测试数据，Rust 侧走 alacritty_terminal、不实现 ghostty 快照
+格式，拷来无用（R0.6 评审注记，免得 R6 反复讨论）；`facade/golden_test.go` 是行为脚本
+测试非字节 golden，同样无拷贝物。
 
 **采集日期**：2026-10-02（R0.4）。
