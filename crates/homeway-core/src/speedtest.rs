@@ -457,20 +457,19 @@ fn run_phases(
                     let (mut got, mut used) = (0i64, 0i64);
                     let (sb, sw): (i64, i64);
                     let mut fr = FrameReader::new();
-                    let mut first_frame = true;
+                    let first_frame = true; // 首帧标记（map_err 闭包判定 not_supported 用）
                     loop {
-                        match fr.read_frame(client, id).or_else(|e| {
+                        match fr.read_frame(client, id).map_err(|e| {
                             // 首帧前 EOF/通道关 = 出口没有测速服务（连接被出口侧立即收流）
                             if first_frame
                                 && matches!(e, SpeedtestError::Conn(ConnErr::Closed) | SpeedtestError::Frame(_))
                             {
-                                Err(SpeedtestError::NotSupported)
+                                SpeedtestError::NotSupported
                             } else {
-                                Err(e)
+                                e
                             }
                         })? {
                             FrameIn::Data { payload_len } => {
-                                first_frame = false;
                                 let now = Instant::now();
                                 if now >= window_start && now < window_start + p.down {
                                     got += payload_len as i64;
@@ -479,7 +478,6 @@ fn run_phases(
                                 }
                             }
                             FrameIn::Other { typ, payload } if typ == TYPE_REPORT => {
-                                first_frame = false;
                                 let rep = parse_report(&payload)?;
                                 sb = rep.bytes;
                                 sw = rep.warmup_bytes;

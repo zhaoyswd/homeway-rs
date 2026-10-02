@@ -456,10 +456,7 @@ fn cmd_portfwd(args: &[String]) {
                             SocketAddrV4::new(homeway_core::wgcore::SERVER_TUNNEL_IP, p)
                         }),
                     ),
-                    [l, ip1, ip2, ip3, tport] => {
-                        let ip = format!("{ip1}.{ip2}.{ip3}").parse().ok();
-                        (l.parse().ok(), ip.zip(tport.parse().ok()).map(|(a, p)| SocketAddrV4::new(a, p)))
-                    }
+                    // v6 形态暂不支持（本地实例恒 v4 字面量；`ip:port` 已由 3 段分支覆盖）
                     [l, ip, tport] => (
                         l.parse().ok(),
                         ip.parse().ok().zip(tport.parse().ok()).map(|(a, p)| SocketAddrV4::new(a, p)),

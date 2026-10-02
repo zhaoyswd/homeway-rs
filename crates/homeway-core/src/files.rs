@@ -133,6 +133,8 @@ struct Response {
     #[serde(default)]
     size: i64,
     #[serde(default)]
+    truncated: bool,
+    #[serde(default)]
     text: String,
     #[serde(default)]
     base64: String,
@@ -191,8 +193,20 @@ impl<'a> Stream<'a> {
         std::thread::Builder::new()
             .name("homeway-files-rd".into())
             .spawn(move || {
-                while tx.send(client.read(id)).is_ok() {
-                    // 通道断开（消费侧 drop）即退出；读错误也交付后由消费面判
+                loop {
+                    match client.read(id) {
+                        Ok(chunk) if !chunk.is_empty() => {
+                            if tx.send(Ok(chunk)).is_err() {
+                                break; // 消费侧 drop
+                            }
+                        }
+                        r => {
+                            // EOF/错误：交付一次后退出（评审中-7——连接已被引擎回收，
+                            // 继续循环只会紧转 + 无界通道堆积）
+                            let _ = tx.send(r);
+                            break;
+                        }
+                    }
                 }
             })
             .ok();
@@ -331,7 +345,8 @@ pub fn mkdir(sess: &Session, budget: Duration, path: &str) -> Result<(), FilesEr
     Ok(())
 }
 
-/// 内联读取（mode="" 文本、mode="image" 回 base64）。
+/// 内联读取（mode="" 文本、mode="image" 回 base64；`truncated` = 服务端按 maxBytes
+/// 截断的标记——Go Response.Truncated 透传，App 侧据此提示）。
 pub struct ReadResult {
     pub text: String,
     pub base64: String,
@@ -341,7 +356,7 @@ pub struct ReadResult {
 pub fn read(sess: &Session, budget: Duration, path: &str, mode: &str, max_bytes: i64) -> Result<ReadResult, FilesError> {
     let mut s = Stream::open(sess, budget)?;
     let resp = s.call(&Request { op: "read", path, max_bytes, mode: Some(mode), size: 0 })?;
-    Ok(ReadResult { text: resp.text, base64: resp.base64, truncated: false })
+    Ok(ReadResult { text: resp.text, base64: resp.base64, truncated: resp.truncated })
 }
 
 /// 大文件下载：载荷帧原样写进 `w`，返回总字节数。`on_size` 收到响应行声明的

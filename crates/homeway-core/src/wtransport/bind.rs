@@ -291,9 +291,13 @@ impl Bind {
         for (addr, e) in &send_errs {
             self.log_send_err_throttled(*addr, e);
         }
-        if sent > 0 && reg_pkt.is_some() {
-            self.reg_armed = false; // 真正写出才消费（评审中-1）
-            self.tx_bytes += wg.len() as u64; // 一条逻辑出站包按包记一次（成功）
+        if sent > 0 {
+            // 一条逻辑出站包按包记一次（Go bind.go:686-687 无条件计数——reg 是否搭车
+            // 不参与计数条件；评审中-6）
+            self.tx_bytes += wg.len() as u64;
+            if reg_pkt.is_some() {
+                self.reg_armed = false; // 真正写出才消费（R1 评审中-1 的收紧语义）
+            }
         }
         if need_capture {
             self.unlock_captured = Some((wg.to_vec(), reg_pkt));

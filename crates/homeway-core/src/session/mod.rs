@@ -213,6 +213,9 @@ fn now_unix_ms() -> i64 {
 pub struct Session {
     shared: Arc<Shared>,
     patrol: Option<JoinHandle<()>>,
+    /// 后台线程柄（stop 时 join 收口——中-4：不泄漏）。
+    hint: Option<JoinHandle<()>>,
+    save: Option<JoinHandle<()>>,
 }
 
 impl Session {
@@ -349,6 +352,11 @@ impl Session {
             ));
         }
 
+        // ---- hint 回调（驱动线程执行——只投队列，重活在处理线程）+ 两个后台线程 ----
+        install_hint_callback(&shared);
+        let hint_handle = spawn_hint_handler(Arc::clone(&shared), hint_rx);
+        let save_handle = spawn_save_loop(Arc::clone(&shared), save_rx);
+
         // ---- 暖机：一发出口可达探测（12s；超时软失败，硬错收工）----
         let client = shared.current();
         let warm_started = Instant::now();
@@ -368,29 +376,12 @@ impl Session {
             Err(e) => {
                 (logf)(&format!("暖机硬失败：{e}"));
                 shared.set_state(SessState::Failed, &format!("出口不可达：{e}"));
-                return Ok(Session { shared, patrol: None });
+                return Ok(Session { shared, patrol: None, hint: hint_handle, save: save_handle });
             }
         }
 
         shared.set_state(SessState::Ready, "");
         (logf)("就绪（会话在位，无桥直通）"); // C16（CLI 形态无桥）
-
-        // ---- hint 回调（驱动线程执行——只投队列，重活在处理线程）----
-        {
-            let sh = Arc::clone(&shared);
-            shared
-                .current()
-                .set_on_hint(Arc::new(move |addr: &str| {
-                    // 回调纪律：不阻塞、不 RPC 回引擎（死锁）；解析失败静默丢
-                    if let Ok(ap) = addr.parse::<SocketAddr>() {
-                        let _ = sh.hint_tx.send(ap);
-                    }
-                }));
-        }
-        // ---- hint 处理线程（缓存观察 + 候选重投 + 打洞）----
-        spawn_hint_handler(Arc::clone(&shared), hint_rx);
-        // ---- 缓存落盘去抖线程（cap=1 信号合并；1s 去抖窗）----
-        spawn_save_loop(Arc::clone(&shared), save_rx);
 
         // ---- 巡检线程（controller）----
         let sh = Arc::clone(&shared);
@@ -399,7 +390,7 @@ impl Session {
             .spawn(move || patrol_loop(sh))
             .ok();
 
-        Ok(Session { shared, patrol })
+        Ok(Session { shared, patrol, hint: hint_handle, save: save_handle })
     }
 
     pub fn snapshot(&self) -> SessionSnapshot {
@@ -422,9 +413,14 @@ impl Session {
     }
 
     /// 公开恢复面（隧道域入口语义：`ClientCoreTunRecover(from)` 同义；CLI 测试钩子）。
+    /// 耗尽记账在 gate 的 run 回调内（每轮恰好一次——被合并的等待者不重复记账，
+    /// Go noteLadderResult 同位；评审中-1）；重建决策在 merge 之后（临界区外）。
     pub fn recover(&self, from: Level, cause: &str) -> LadderRc {
-        let rc = self.shared.gate.merge(from, |lvl| self.recover_round(lvl, cause));
-        self.note_ladder_result(&rc);
+        let rc = self.shared.gate.merge(from, |lvl| {
+            let rc = self.recover_round(lvl, cause);
+            self.note_ladder_result(&rc);
+            rc
+        });
         self.maybe_rebuild_if_exhausted();
         rc
     }
@@ -459,8 +455,7 @@ impl Session {
             if st.exhausted < LADDER_EXHAUST_REBUILD {
                 return;
             }
-            st.exhausted = 0;
-            st.exhausted
+            std::mem::take(&mut st.exhausted) // 先取后清（评审中-2：归零前取值）
         };
         rebuild_session(&self.shared, &format!("恢复阶梯连续 {n} 轮走完仍未恢复"));
     }
@@ -511,21 +506,43 @@ impl Session {
         }
     }
 
-    /// 收工（幂等）：停巡检 → 缓存终写 → 停当前世代 → Idle。
+    /// 收工（幂等）：置 stop → join 三线程（patrol 有界 STOP_WAIT——中-3）→
+    /// 缓存终写 → 停当前世代 → Idle（failed 终态保留——低-15：失败原因在状态面不丢）。
     pub fn stop(&mut self) {
         if self.shared.stop.swap(true, Ordering::SeqCst) {
             return;
         }
         self.shared.set_state(SessState::Stopping, "");
         if let Some(h) = self.patrol.take() {
+            let deadline = Instant::now() + STOP_WAIT;
+            while !h.is_finished() && Instant::now() < deadline {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            if h.is_finished() {
+                let _ = h.join();
+            } else {
+                // 有界等待放弃（patrol 卡在长阶梯/探测里——Go serviceStopWait 同义；
+                // 线程随后自行退出，JoinHandle 析构即分离）
+                (self.shared.logf)("收工等待巡检线程超时（STOP_WAIT）——放行自退");
+            }
+        }
+        if let Some(h) = self.hint.take() {
+            let _ = h.join();
+        }
+        if let Some(h) = self.save.take() {
             let _ = h.join();
         }
         if let Some(c) = &self.shared.cache {
             let _ = c.lock().expect("缓存锁中毒").save(SystemTime::now());
         }
         self.shared.current().stop();
-        self.shared.set_state(SessState::Idle, "已收工");
-        (self.shared.logf)(&format!("已收工（state={}）", SessState::Idle.as_str()));
+        let was_failed = self.shared.snapshot.lock().expect("快照锁中毒").state == SessState::Failed;
+        if !was_failed {
+            self.shared.set_state(SessState::Idle, "已收工");
+            (self.shared.logf)(&format!("已收工（state={}）", SessState::Idle.as_str()));
+        } else {
+            (self.shared.logf)("已收工（state=failed 终态保留）");
+        }
     }
 }
 
@@ -605,13 +622,31 @@ fn action_err(e: ConnErr) -> ActionError {
 
 // ---------- hint 处理 / 落盘去抖 / 打洞 / 旁路探测 ----------
 
+/// hint 回调安装（start 与 rebuild_session 共用——评审中-5：重建换入的新世代必须
+/// 重装，否则 HINT 通路静默失效）。
+fn install_hint_callback(shared: &Arc<Shared>) {
+    let sh = Arc::clone(shared);
+    shared
+        .current()
+        .set_on_hint(Arc::new(move |addr: &str| {
+            // 回调纪律：不阻塞、不 RPC 回引擎（死锁）；解析失败静默丢
+            if let Ok(ap) = addr.parse::<SocketAddr>() {
+                let _ = sh.hint_tx.send(ap);
+            }
+        }));
+}
+
 /// hint 处理线程（Go Transport 的 hint 链路：观察 → 候选重投 → 打洞）。
 /// 驱动线程只投队列；RPC（set_candidates/rearm_soft）与落盘信号都在这里做。
-fn spawn_hint_handler(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<SocketAddr>) {
+/// 退出 = stop 标志（recv_timeout 轮询——中-4：通道因 Shared 环引用不会自然关闭）。
+fn spawn_hint_handler(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<SocketAddr>) -> Option<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("homeway-hint".into())
         .spawn(move || {
-            while let Ok(addr) = rx.recv() {
+            while !shared.stop.load(Ordering::SeqCst) {
+                let Ok(addr) = rx.recv_timeout(Duration::from_millis(500)) else {
+                    continue;
+                };
                 // 缓存观察（最新鲜的不可信线索）
                 if let Some(c) = &shared.cache {
                     c.lock()
@@ -625,7 +660,7 @@ fn spawn_hint_handler(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<SocketA
                 punch_to(&shared, addr);
             }
         })
-        .ok();
+        .ok()
 }
 
 /// 收到对端地址线索后打一发「握手兼打洞」（Go punchTo：节流 5s + RearmSoft + 拨 :1）。
@@ -659,12 +694,19 @@ fn punch_to(shared: &Arc<Shared>, addr: SocketAddr) {
     }
 }
 
-/// 缓存落盘去抖（Go FIX-16：cap=1 信号合并 + 1s 去抖窗；收口由 Session::stop 终写）。
-fn spawn_save_loop(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<()>) {
+/// 缓存落盘去抖（Go FIX-16：信号合并 + 1s 去抖窗；收口由 Session::stop 终写）。
+/// 退出 = stop 标志（中-4）。
+fn spawn_save_loop(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<()>) -> Option<JoinHandle<()>> {
     std::thread::Builder::new()
         .name("homeway-cache-save".into())
         .spawn(move || {
-            while rx.recv().is_ok() {
+            loop {
+                if shared.stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                let Ok(()) = rx.recv_timeout(Duration::from_millis(500)) else {
+                    continue;
+                };
                 std::thread::sleep(Duration::from_secs(1)); // 去抖窗（窗内信号合并）
                 while rx.try_recv().is_ok() {}
                 if let Some(c) = &shared.cache {
@@ -674,7 +716,7 @@ fn spawn_save_loop(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<()>) {
                 }
             }
         })
-        .ok();
+        .ok()
 }
 
 /// 旁路探测候选（Go ProbeCandidates：只打直连条目——探测中继端点拿到的是中继自己的
@@ -854,21 +896,28 @@ fn patrol_loop(shared: Arc<Shared>) {
 
 fn session_recover(shared: &Arc<Shared>, gen: u64, cause: &str) -> LadderRc {
     if shared.gen_now() != gen {
-        return LadderRc::Recovered(Level::R2);
+        return LadderRc::Stale;
     }
-    let rc = shared
-        .gate
-        .merge(Level::R2, |lvl| session_recover_round(shared, lvl, cause));
-    let mut st = shared.ladder.lock().expect("阶梯锁中毒");
-    match rc {
-        LadderRc::Recovered(_) => st.exhausted = 0,
-        _ => st.exhausted += 1,
-    }
-    if st.exhausted >= LADDER_EXHAUST_REBUILD {
-        let n = st.exhausted;
-        st.exhausted = 0;
-        drop(st);
-        rebuild_session(shared, &format!("恢复阶梯连续 {n} 轮走完仍未恢复"));
+    let rc = shared.gate.merge(Level::R2, |lvl| {
+        let rc = session_recover_round(shared, lvl, cause);
+        // 记账在 run 回调内（每轮恰好一次——合并等待者不重复 +1；评审中-1）
+        let mut st = shared.ladder.lock().expect("阶梯锁中毒");
+        match rc {
+            LadderRc::Recovered(_) => st.exhausted = 0,
+            _ => st.exhausted += 1,
+        }
+        rc
+    });
+    let rebuild = {
+        let mut st = shared.ladder.lock().expect("阶梯锁中毒");
+        if st.exhausted >= LADDER_EXHAUST_REBUILD {
+            (true, std::mem::take(&mut st.exhausted))
+        } else {
+            (false, 0)
+        }
+    };
+    if rebuild.0 {
+        rebuild_session(shared, &format!("恢复阶梯连续 {} 轮走完仍未恢复", rebuild.1));
     }
     rc
 }
@@ -912,12 +961,20 @@ fn rebuild_session(shared: &Arc<Shared>, reason: &str) {
     }
     match build_client(&token_of(sh), &sh.identity, &sh.static_cands, logf) {
         Ok(new) => {
+            let new = Arc::new(new);
+            // 孤儿守卫（Go FIX-04 同义；评审低-14）：构建窗口内收工 ⇒ 新会话弃用
+            if sh.stop.load(Ordering::SeqCst) {
+                new.stop();
+                (logf)("REBUILD 会话已在构建窗口内收工——新会话弃用（防孤儿）");
+                return;
+            }
             let old = {
                 let mut w = sh.client.write().expect("世代锁中毒");
-                let old = std::mem::replace(&mut *w, Arc::new(new));
+                let old = std::mem::replace(&mut *w, Arc::clone(&new));
                 sh.gen.fetch_add(1, Ordering::Release);
                 old
             };
+            install_hint_callback(shared); // 新世代重装 hint 回调（评审中-5）
             old.stop();
             (logf)("REBUILD 新会话已换入（首个出站包将重新注册+赛跑）");
         }

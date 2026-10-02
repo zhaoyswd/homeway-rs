@@ -64,6 +64,9 @@ impl Level {
 pub enum LadderRc {
     /// 某档探测通过（Go 0；携带命中档）。
     Recovered(Level),
+    /// 入口防陈旧命中（世代已换代，本轮没跑——Go 的「直接 return 0」形态；
+    /// 不做记账、不打判据行。评审低-4）。
+    Stale,
     /// 走完 R3 仍有界探测失败——交上层整会话重建（Go -1）。
     Exhausted,
     /// 本地动作超时（挂起期/低功耗/路由表空；Go -3）。
@@ -76,7 +79,7 @@ impl LadderRc {
     /// CLI/NAPI 边界的 int 返回码（Go 返回码契约）。
     pub fn as_rc(&self) -> i32 {
         match self {
-            LadderRc::Recovered(_) => 0,
+            LadderRc::Recovered(_) | LadderRc::Stale => 0,
             LadderRc::Exhausted => -1,
             LadderRc::ActionTimeout => -3,
             LadderRc::ActionFailed(_) => -4,
@@ -348,8 +351,9 @@ struct RunGuard<'a> {
 
 impl RunGuard<'_> {
     fn complete(&mut self, rc: LadderRc) {
-        self.round.publish(rc);
+        // 先清闸再发布（Go 同一临界区语义：夹缝里进来的新触发起新轮，不会吞——评审低-3）
         self.gate.leave(&self.round);
+        self.round.publish(rc);
         self.completed = true;
     }
 }

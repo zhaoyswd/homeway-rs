@@ -105,7 +105,7 @@ fn decode_response(b: &[u8], nonce: &[u8; 8]) -> io::Result<PingResult> {
         let addr = decode_4in6(&e[..16]);
         let port = u16::from_be_bytes([e[16], e[17]]);
         if port == 0 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "probe: 包太短"));
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "probe: 端点端口为零"));
         }
         resp.endpoints.push(SocketAddr::new(addr, port));
     }
@@ -186,7 +186,7 @@ pub fn probe_candidates(
                 ping_ex(*t, PROBE_PAD, budget).ok().map(|r| r.endpoints)
             }));
         }
-        for (i, h) in handles.into_iter().enumerate() {
+        for h in handles {
             if let Ok(Some(eps)) = h.join() {
                 for ep in eps {
                     if probe_addr_acceptable(&ep) {
@@ -194,7 +194,6 @@ pub fn probe_candidates(
                         learned += 1;
                     }
                 }
-                let _ = i;
             }
         }
     });

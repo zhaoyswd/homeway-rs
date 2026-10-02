@@ -520,7 +520,7 @@ mod tests {
         assert_eq!(decoded.endpoints[1].addr, "198.51.100.212:41741");
         assert_eq!(decoded.endpoints[1].kind, EndpointKind::Relay);
         // 借用面再编码 → 与原串逐字节一致
-        let raw = B64.decode(tok[PREFIX.len()..].as_bytes()).unwrap();
+        let raw = B64.decode(&tok.as_bytes()[PREFIX.len()..]).unwrap();
         let parsed = parse_body(&raw).unwrap();
         let spec2 = TokenSpec {
             peer_id: &parsed.peer_id(),
