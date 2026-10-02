@@ -23,9 +23,11 @@ token/隧道地址族经公开包 `pkg/proto`（同模块内直接 import）。
 ## 重跑
 
 ```bash
-tools/gen-vectors.sh
-git -C .. diff --stat fixtures/vectors/   # 应为空（字节确定）
+tools/gen-vectors.sh        # 内含：基线门（克隆 HEAD == BASELINE.md）+ 确定性 diff 门
 ```
 
-升级基线后必须重跑并 diff——**diff 非空即语义漂移**（Go 侧改了派生/编码），Rust 侧与
-INTEROP-CRITERIA 都要跟着复核。
+脚本自身已断言「重跑后 `git diff --quiet -- fixtures/vectors/` 为空」（在仓根执行）；
+手工核对用 `git diff --exit-code -- fixtures/vectors/`。
+
+升级基线后必须重跑——**diff 非空即语义漂移**（Go 侧改了派生/编码），Rust 侧与
+INTEROP-CRITERIA 都要跟着复核，核对后 git add 固化并在 BASELINE.md 记录原因。

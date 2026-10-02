@@ -1,10 +1,12 @@
 #!/bin/zsh
 # make-baseline.sh — 重建 baseline/homeway 快照克隆（R0.2；克隆 gitignore 不入库，本脚本可重跑）
 #
-# 用法：tools/make-baseline.sh [hash]
+# 用法：tools/make-baseline.sh [--force] [hash]
 #   hash 缺省 = docs/BASELINE.md 锚定的 621fe0e（升级基线时显式传新 hash 并更新 BASELINE.md）
 #
-# 步骤：clone --shared（不复制对象，省盘）→ checkout 基线 hash → 补 vt 静态库
+# 步骤：本地 clone（**不用 --shared**：alternates 借 dev 仓对象库，发版会话一旦 repack/gc
+#   快照即损坏——本地 clone 默认硬链接对象，自足且省盘）→ **移除 origin 远程**（push URL
+#   指向 dev 仓，留着就是误 push 事故面）→ checkout 基线 hash → 补 vt 静态库
 # （克隆不含未跟踪文件 ⇒ prebuilt/ 空；来源优先级 = homeway dev 仓 → tier submodule 检出
 #   → 都没有则在克隆里跑 tools/build-vt.sh darwin-arm64，需 zig 0.16.0 在 ~/zig-0.16.0）
 set -euo pipefail
@@ -22,9 +24,10 @@ if [[ -d "$CLONE" && "$ARG1" != "--force" ]]; then
 fi
 [[ "$ARG1" == "--force" ]] && rm -rf "$CLONE"
 
-echo "==> clone --shared $DEV_HOMEWAY -> $CLONE"
+echo "==> 本地克隆（自足对象库）$DEV_HOMEWAY -> $CLONE"
 mkdir -p "$REPO_ROOT/baseline"
-git clone --shared "$DEV_HOMEWAY" "$CLONE"
+git clone "$DEV_HOMEWAY" "$CLONE"
+git -C "$CLONE" remote remove origin   # 隔离条款：快照只读，杜绝任何 push 面
 git -C "$CLONE" checkout "$HASH"
 echo "==> 已钉基线：$(git -C "$CLONE" rev-parse HEAD)"
 

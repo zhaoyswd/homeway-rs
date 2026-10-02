@@ -14,6 +14,7 @@
 | **Go 版本** | go.mod：`go 1.24.0` + `toolchain go1.24.5`；本机构建一律 `GOTOOLCHAIN=go1.24.5`（离线 toolchain 已在 `~/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.5.darwin-arm64`） | `/usr/local/go` 基底 1.21.6，不带 GOTOOLCHAIN 必失败 |
 | **契约台账** | `contracts/ledger.jsonl` **422 行 = 422 单元**（每行一个词表单元，字段 family/unit/value/faces/status/spec） | ROADMAP 附录 A 写 349 为立项盘点时旧值，**以本表 422 为准**；spec 字段为台账内逻辑分组名（如 `daemon-control-plane`），不是文件路径 |
 | **term golden** | `pkg/term/testdata/frames.v1.jsonl`（唯一 testdata 文件） | 拷贝入 `fixtures/` 时记来源 hash |
+| **关键输入 sha256** | `contracts/ledger.jsonl` = `0ae1d104ec1eeb546d61d7352052fccb062d654232e17f0b03adbe4323c2469f`；`third_party/libghostty-vt/prebuilt/darwin-arm64/lib/libghostty-vt.a` = `7202ac3bf6bff5259493fffd54e964c9e27feedf4d06d445f477ef7c3517ad21` | 升级基线时核对（vt 库换了 = 需重验构建） |
 | **vt 静态库来源** | dev 仓 `third_party/libghostty-vt/prebuilt/darwin-arm64/`（2026-10-01 构建，存在）⇒ 直接拷入 baseline 克隆 | tier submodule 检出里同款也在，互为备份 |
 
 ## tier 侧在途 openspec change 清单（11 个，2026-10-02）
@@ -38,5 +39,18 @@
 
 ## 快照克隆
 
-`baseline/homeway`（gitignore 不入库）：`git clone --shared` 自 dev 仓 + checkout `621fe0e`。
-Go 侧一切构建/测试/向量生成只从它走。
+`baseline/homeway`（gitignore 不入库）：**本地 clone（非 `--shared`）** 自 dev 仓 +
+`remote remove origin`（快照只读、无 push 面）+ checkout `621fe0e`。对象库必须**自足**
+（`--shared` 的 alternates 借 dev 仓对象，发版会话 repack/gc 会损坏快照——R0.6 评审 M7 整改）。
+Go 侧一切构建/测试/向量生成只从它走；`tools/check-baseline.sh` 是基线门（克隆 HEAD ==
+本文件锚定 hash + 无远程 + vt 在位），`tools/gen-vectors.sh` 与 R5 CI 都先过它。
+
+## 升级基线流程（dev 仓前移后）
+
+1. `git -C ~/Documents/projects/homeway rev-parse HEAD` 记新值 → 更新本文件锚定行与关键输入 sha256；
+2. `tools/make-baseline.sh --force <新hash>`（重建自足克隆 + 移除远程 + 拷 vt）；
+3. `tools/gen-vectors.sh` —— **diff 门非空即语义漂移**，逐文件复核（token/地址/身份三族），
+   确认后 `git add fixtures/vectors` 固化，并在提交信息与本文件记录原因；
+4. 重跑 `tools/local-exit.sh start/client-add` 复核 INTEROP-CRITERIA 判据行未变措辞；
+5. 重跑 `cargo test`（Rust 侧对照必须跟着新向量绿）。
+（`bin/homeway-go` 会被 local-exit.sh 按 `bin/homeway-go.baseline` 标记自动重建，勿手拷旧件。）
