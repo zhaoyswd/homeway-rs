@@ -15,6 +15,7 @@
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream, UdpSocket};
+use std::os::fd::AsRawFd as _;
 use std::time::Duration;
 
 use super::egress::{interfaces, is_virtual_iface};
@@ -24,6 +25,11 @@ const SSDP_ST: &str = "urn:schemas-upnp-org:device:InternetGatewayDevice:1";
 /// 映射描述前缀（路由器表里「我们的映射」的认领判据）。
 pub const UPNP_MAP_DESC: &str = "homeway-exit";
 const UPNP_TIMEOUT: Duration = Duration::from_secs(5);
+/// 公网端点路径的 UPnP 总预算（Go publicendpoint.go:141 的 40s ctx——SOAP/描述文件
+/// 只受它约束，Go 无 per-SOAP 超时；M-SEARCH 内部 5s 与它取小）。
+pub const UPNP_TOTAL_BUDGET: Duration = Duration::from_secs(40);
+/// 退出缩租路径的独立预算（Go serve.go:728-739 的 8s ctx——收工不被慢网关拖死）。
+pub const UPNP_SHRINK_BUDGET: Duration = Duration::from_secs(8);
 /// 映射表枚举上限（listMappings 的 max）。
 const LIST_MAX: usize = 200;
 
@@ -71,6 +77,9 @@ pub fn msearch_message() -> String {
 /// 一个可用的 WAN 连接服务（WANIPConnection / WANPPPConnection）。
 #[derive(Clone)]
 pub struct Igd {
+    /// 本实例的操作截止（M11：soap/描述文件的 http_call 以剩余量收紧读/写超时；
+    /// 缩租路径构造时传 8s，推断路径 40s——对齐 Go 两类 ctx）。
+    deadline: std::time::Instant,
     control_url: String,
     service_type: String,
 }
@@ -143,6 +152,49 @@ pub fn udp_port_in_use(port: u16) -> bool {
 
 // ---------- SSDP 发现 ----------
 
+/// SSDP socket 的组播三件套（M8）：IP_MULTICAST_IF + TTL=2 + IP_BOUND_IF 钉卡。
+/// 网卡定位 = 源地址所在的物理卡（egress::interfaces 按 IP 反查）。
+fn pin_multicast(conn: &UdpSocket, local_ip: Ipv4Addr) -> Result<(), UpnpError> {
+    let ifi = crate::server::egress::interfaces()
+        .into_iter()
+        .find(|i| i.addrs.contains(&local_ip));
+    let fd = conn.as_raw_fd();
+    // ① IP_MULTICAST_IF：值 = 本地接口地址（struct in_addr，网络序）
+    let in_addr = libc::in_addr { s_addr: u32::from(local_ip).to_be() };
+    let r = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_MULTICAST_IF,
+            &in_addr as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::in_addr>() as u32,
+        )
+    };
+    if r != 0 {
+        return Err(UpnpError::Io(std::io::Error::last_os_error()));
+    }
+    // ② IP_MULTICAST_TTL = 2
+    let ttl: libc::c_int = 2;
+    let r = unsafe {
+        libc::setsockopt(
+            fd,
+            libc::IPPROTO_IP,
+            libc::IP_MULTICAST_TTL,
+            &ttl as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as u32,
+        )
+    };
+    if r != 0 {
+        return Err(UpnpError::Io(std::io::Error::last_os_error()));
+    }
+    // ③ 钉卡（网卡在系统表里找得到才钉——Go ifaceForIP 同义找不到就跳过）
+    if let Some(ifi) = ifi {
+        crate::server::egress::pin_socket_to_iface(fd, ifi.index, &ifi.name)
+            .map_err(UpnpError::from)?;
+    }
+    Ok(())
+}
+
 /// 发一次 SSDP M-SEARCH，取第一个 IGD 的 LOCATION（重试 3 次：家用路由器/交换机的
 /// IGMP 收敛有几秒抖动）。local_ip 用于绑源地址（多网卡机器只有与路由器同网段的那张能用）。
 pub fn ssdp_location(local_ip: Option<Ipv4Addr>) -> Result<String, UpnpError> {
@@ -151,6 +203,18 @@ pub fn ssdp_location(local_ip: Option<Ipv4Addr>) -> Result<String, UpnpError> {
         None => "0.0.0.0:0".parse().expect("合法字面量"),
     };
     let conn = UdpSocket::bind(bind)?;
+    // M8 三件套（Go upnp.go:122-127 同义）：指定 local_ip 时——
+    // ① IP_MULTICAST_IF（组播出口钉在源地址所在网卡）
+    // ② IP_MULTICAST_TTL=2（组播 TTL，默认 1 出不了本网段）
+    // ③ IP_BOUND_IF/SO_BINDTODEVICE（整条 socket 钉卡——macOS 上光设
+    //    IP_MULTICAST_IF 不够，默认路由被 TUN 型代理抢走时组播按默认路由选路
+    //    直接 no route to host，实测 2026-09-19）。
+    // 本地不可实测（SSDP 组播被 macOS 本地网络隐私拒——与现役出口 launchd 形态
+    // 同款已知问题）：单测只证 setsockopt 调用成功，真机判据留 R7（登记进
+    // INTEROP-CRITERIA）。
+    if let Some(ip) = local_ip {
+        pin_multicast(&conn, ip)?;
+    }
     conn.set_read_timeout(Some(Duration::from_millis(1200)))?;
     let msg = msearch_message();
     let deadline = std::time::Instant::now() + UPNP_TIMEOUT;
@@ -207,11 +271,26 @@ fn header_value(resp: &str, key: &str) -> Option<String> {
 // ---------- 最小 HTTP 客户端（家用路由器的嵌入式 HTTP 服务很挑：显式
 // Connection: close + UA + Accept-Encoding: identity——keep-alive/gzip 会被直接关连接） ----------
 
-fn http_call(url: &str, method: &str, content_type: Option<&str>, soap_action: Option<&str>, body: Option<&str>) -> Result<String, UpnpError> {
+fn http_call(
+    url: &str,
+    method: &str,
+    content_type: Option<&str>,
+    soap_action: Option<&str>,
+    body: Option<&str>,
+    deadline: Option<std::time::Instant>,
+) -> Result<String, UpnpError> {
     let (host, port, path) = parse_http_url(url)?;
     let mut stream = TcpStream::connect((host.as_str(), port))?;
-    stream.set_read_timeout(Some(UPNP_TIMEOUT))?;
-    stream.set_write_timeout(Some(UPNP_TIMEOUT))?;
+    // M11：读/写超时 = 剩余预算（Go 无 per-SOAP 超时、只受 ctx deadline——SOAP/描述
+    // 文件给足 40s；M-SEARCH 的 5s 在 ssdp_location 自己的 deadline 里）。
+    let remain = deadline
+        .map(|d| d.saturating_duration_since(std::time::Instant::now()))
+        .unwrap_or(UPNP_TOTAL_BUDGET);
+    if remain.is_zero() {
+        return Err(UpnpError::Io(std::io::Error::new(std::io::ErrorKind::TimedOut, "UPnP 总预算耗尽")));
+    }
+    stream.set_read_timeout(Some(remain))?;
+    stream.set_write_timeout(Some(remain))?;
     let mut req = format!("{method} {path} HTTP/1.1\r\nHOST: {host}:{port}\r\n");
     req.push_str("Connection: close\r\nUser-Agent: homeway/upnp\r\nAccept-Encoding: identity\r\n");
     if let Some(ct) = content_type {
@@ -261,7 +340,7 @@ fn parse_http_url(url: &str) -> Result<(String, u16, String), UpnpError> {
 
 /// 解析 IGD 描述：找 WANIPConnection/WANPPPConnection 服务的 controlURL（device 树
 /// 嵌套——按 `<service>` 块扫描：块内 serviceType 含 WAN 连接字样即命中）。
-pub fn find_wan_service(desc: &str, base_url: &str) -> Option<Igd> {
+pub fn find_wan_service(desc: &str, base_url: &str, deadline: std::time::Instant) -> Option<Igd> {
     let mut off = 0usize;
     while let Some(start) = desc[start_off(off)..].find("<service>") {
         let abs_start = start_off(off) + start;
@@ -270,7 +349,7 @@ pub fn find_wan_service(desc: &str, base_url: &str) -> Option<Igd> {
         if let (Some(st), Some(cu)) = (xml_tag(block, "serviceType"), xml_tag(block, "controlURL")) {
             if st.contains("WANIPConnection") || st.contains("WANPPPConnection") {
                 let control_url = join_url(base_url, &cu);
-                return Some(Igd { control_url, service_type: st });
+                return Some(Igd { deadline, control_url, service_type: st });
             }
         }
         off = end;
@@ -306,15 +385,17 @@ fn xml_tag(body: &str, tag: &str) -> Option<String> {
 }
 
 /// SSDP 找到网关的 UPnP 描述并解析出 WAN 连接服务的控制地址（discoverIGD）。
-pub fn discover_igd(local_ip: Ipv4Addr) -> Result<Igd, UpnpError> {
+pub fn discover_igd(local_ip: Ipv4Addr, budget: Duration) -> Result<Igd, UpnpError> {
     let loc = ssdp_location(Some(local_ip))?;
-    igd_from_location(&loc)
+    igd_from_location(&loc, budget)
 }
 
 /// 已知 LOCATION 直取（mock 测试与 discover 共用）。
-pub fn igd_from_location(loc: &str) -> Result<Igd, UpnpError> {
-    let body = http_call(loc, "GET", None, None, None).map_err(|e| UpnpError::DescFetch(e.to_string()))?;
-    find_wan_service(&body, loc).ok_or(UpnpError::NoWanService)
+pub fn igd_from_location(loc: &str, budget: Duration) -> Result<Igd, UpnpError> {
+    let deadline = std::time::Instant::now() + budget;
+    let body = http_call(loc, "GET", None, None, None, Some(deadline))
+        .map_err(|e| UpnpError::DescFetch(e.to_string()))?;
+    find_wan_service(&body, loc, deadline).ok_or(UpnpError::NoWanService)
 }
 
 impl Igd {
@@ -336,7 +417,7 @@ impl Igd {
         }
         b.push_str(&format!("</u:{action}></s:Body></s:Envelope>"));
         let sa = format!("{}#{}", self.service_type, action);
-        http_call(&self.control_url, "POST", Some(r#"text/xml; charset="utf-8""#), Some(&sa), Some(&b)).map_err(|e| {
+        http_call(&self.control_url, "POST", Some(r#"text/xml; charset="utf-8""#), Some(&sa), Some(&b), Some(self.deadline)).map_err(|e| {
             // 保留 body 上下文（list_mappings 的「到表尾」判定要读 713 形态——Display
             // 链 "{action}: {source}" 与原 format! 同串）
             UpnpError::Soap { action: action.to_owned(), msg: e.to_string() }
@@ -501,7 +582,7 @@ pub fn ensure_port_mapping(
     let mut local_ip = Ipv4Addr::UNSPECIFIED;
     let mut last_err = String::new();
     for cand in candidates {
-        match discover_igd(*cand) {
+        match discover_igd(*cand, UPNP_TOTAL_BUDGET) {
             Ok(g) => {
                 igd = Some(g);
                 local_ip = *cand;
@@ -658,6 +739,20 @@ mod tests {
         assert!(m.ends_with("\r\n\r\n"));
     }
 
+    /// M8 三件套：组播 socket option 在真实网卡 IP 上调用成功（只证 setsockopt
+    /// 返回值——组播收发面不可本地测，真机判据见 INTEROP-CRITERIA 登记条目）。
+    /// 机器无物理 IPv4 卡（纯离线 CI 形态）时跳过。
+    #[test]
+    fn multicast_pin_options_apply() {
+        let Some(ifi) = crate::server::egress::physical_candidates().into_iter().find(|i| !i.addrs.is_empty()) else {
+            eprintln!("（无物理 IPv4 网卡——M8 单测跳过 setsockopt 断言）");
+            return;
+        };
+        let ip = ifi.addrs[0];
+        let conn = UdpSocket::bind(SocketAddrV4::new(ip, 0)).expect("绑源地址");
+        pin_multicast(&conn, ip).expect("三件套 setsockopt 应全部成功（真实网卡 IP）");
+    }
+
     /// headerValue（大小写不敏感 + 冒号后取值）。
     #[test]
     fn header_value_parse() {
@@ -677,13 +772,13 @@ mod tests {
 <serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType>
 <controlURL>/ctrlu/wanip</controlURL>
 </service></serviceList></device></root>"#;
-        let g = find_wan_service(desc, "http://192.168.3.1:49152/root.xml").expect("应命中");
+        let g = find_wan_service(desc, "http://192.168.3.1:49152/root.xml", std::time::Instant::now() + UPNP_TOTAL_BUDGET).expect("应命中");
         assert_eq!(g.control_url(), "http://192.168.3.1:49152/ctrlu/wanip");
         // 绝对 URL 原样
-        let g2 = find_wan_service(desc.replace("/ctrlu/wanip", "http://10.0.0.2:80/ctrlu").as_str(), "http://192.168.3.1/root.xml").unwrap();
+        let g2 = find_wan_service(desc.replace("/ctrlu/wanip", "http://10.0.0.2:80/ctrlu").as_str(), "http://192.168.3.1/root.xml", std::time::Instant::now() + UPNP_TOTAL_BUDGET).unwrap();
         assert_eq!(g2.control_url(), "http://10.0.0.2:80/ctrlu");
         // 无 WAN 服务
-        assert!(find_wan_service("<root/>", "http://1.2.3.4/").is_none());
+        assert!(find_wan_service("<root/>", "http://1.2.3.4/", std::time::Instant::now() + UPNP_TOTAL_BUDGET).is_none());
     }
 
     /// mock IGD：AddPortMapping/DeletePortMapping/GetGenericPortMappingEntry 生命周期 +
@@ -773,7 +868,7 @@ mod tests {
             }
         });
         let base = format!("http://127.0.0.1:{port}/root.xml");
-        let g = igd_from_location(&base).expect("mock IGD 应可发现");
+        let g = igd_from_location(&base, UPNP_TOTAL_BUDGET).expect("mock IGD 应可发现");
         let client: Ipv4Addr = "192.168.3.12".parse().unwrap();
         let logf = |_: &str| {};
 

@@ -110,6 +110,8 @@ fn ok_response() -> Response {
 pub struct FilesServer {
     root: PathBuf,
     logf: crate::Logf,
+    /// 并发在册闸（FIX-36 语义：满 16 条回 busy——R3-G3 实装；跨 accept 副本共享）。
+    conns: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl FilesServer {
@@ -125,7 +127,7 @@ impl FilesServer {
         if !abs.is_dir() {
             return Err(std::io::Error::new(std::io::ErrorKind::NotFound, format!("{} 不是目录", abs.display())));
         }
-        Ok(Self { root: abs, logf })
+        Ok(Self { root: abs, logf, conns: std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0)) })
     }
 
     pub fn root_dir(&self) -> &Path {
@@ -136,11 +138,7 @@ impl FilesServer {
     pub fn serve(&self, ln: UnixListener) -> std::io::Result<()> {
         for conn in ln.incoming() {
             let conn = conn?;
-            let server = FilesServer { root: self.root.clone(), logf: self.logf.clone() };
-            std::thread::Builder::new()
-                .name("homeway-files".into())
-                .spawn(move || server.serve_conn(conn))
-                .ok();
+            self.spawn_conn(conn);
         }
         Ok(())
     }
@@ -156,11 +154,7 @@ impl FilesServer {
             match ln.accept() {
                 Ok((conn, _)) => {
                     let _ = conn.set_nonblocking(false);
-                    let server = FilesServer { root: self.root.clone(), logf: self.logf.clone() };
-                    std::thread::Builder::new()
-                        .name("homeway-files".into())
-                        .spawn(move || server.serve_conn(conn))
-                        .ok();
+                    self.spawn_conn(conn);
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(200));
@@ -168,6 +162,63 @@ impl FilesServer {
                 Err(_) => return Ok(()), // listener 已关/异常：摘监听退出
             }
         }
+    }
+
+    /// accept 后派发：在册 <16 走正常服务（结束时 release）；满则 busy 拒入
+    ///（Go sem 同义——先发 greeting、吞掉一条请求再回 busy，客户端拿到的仍是
+    ///「有根目录的服务端拒绝了我」，不是连接层失败）。
+    fn spawn_conn(&self, conn: UnixStream) {
+        use std::sync::atomic::Ordering as OD;
+        if self.conns.fetch_add(1, OD::AcqRel) < MAX_CONNS {
+            let server = FilesServer {
+                root: self.root.clone(),
+                logf: self.logf.clone(),
+                conns: std::sync::Arc::clone(&self.conns),
+            };
+            std::thread::Builder::new()
+                .name("homeway-files".into())
+                .spawn(move || {
+                    let conns = std::sync::Arc::clone(&server.conns);
+                    server.serve_conn(conn);
+                    conns.fetch_sub(1, OD::AcqRel);
+                })
+                .ok();
+        } else {
+            self.conns.fetch_sub(1, OD::AcqRel);
+            let server = FilesServer {
+                root: self.root.clone(),
+                logf: self.logf.clone(),
+                conns: std::sync::Arc::clone(&self.conns),
+            };
+            std::thread::Builder::new()
+                .name("homeway-files-busy".into())
+                .spawn(move || server.serve_busy(conn))
+                .ok();
+        }
+    }
+
+    /// 满员拒入路径（Go server.go:141-156 同序）。
+    fn serve_busy(self, conn: UnixStream) {
+        let _ = conn.set_read_timeout(Some(IDLE_TIMEOUT));
+        let _ = conn.set_write_timeout(Some(IDLE_TIMEOUT));
+        let mut reader = BufReader::new(match conn.try_clone() {
+            Ok(c) => c,
+            Err(_) => return,
+        });
+        let mut writer = conn;
+        let greeting = Response { ok: true, root: self.root.display().to_string(), ver: crate::files::VERSION as i64, ..Default::default() };
+        if write_line(&mut writer, &greeting).is_err() {
+            return;
+        }
+        // 吞掉请求行（客户端按「问候 → 请求 → 响应」节拍走——直接关会让它误判传输层错）
+        if read_line(&mut reader).is_err() {
+            return;
+        }
+        let _ = write_line(
+            &mut writer,
+            &err_response(crate::files::CODE_SERVER_BUSY, format!("服务端并发流已满（{MAX_CONNS}），请稍后重试")),
+        );
+        (self.logf)(&format!("files: 并发流已满（{MAX_CONNS}）——回 busy 拒入"));
     }
 
     fn serve_conn(self, conn: UnixStream) {
@@ -559,18 +610,41 @@ mod tests {
         std::sync::Arc::new(|_| {})
     }
 
+    /// G3：满员拒入（Go server.go:140-156 同序）——在册置满后第 17 条流拿到
+    /// greeting → 回 server_busy 错误响应（不是连接层失败）。
+    #[test]
+    fn busy_rejection_when_conns_full() {
+        let dir = tmpdir("busy");
+        let srv = FilesServer { root: dir.canonicalize().unwrap(), logf: noop_logf(), conns: Default::default() };
+        srv.conns.store(MAX_CONNS, std::sync::atomic::Ordering::Release);
+
+        let (a, b) = UnixStream::pair().unwrap();
+        let s2 = FilesServer { root: srv.root.clone(), logf: noop_logf(), conns: std::sync::Arc::clone(&srv.conns) };
+        std::thread::spawn(move || s2.serve_busy(a));
+        let mut r = BufReader::new(b.try_clone().unwrap());
+        let mut w = b;
+        // 问候行照发（客户端先拿到 root/ver）
+        let g: serde_json::Value = serde_json::from_slice(&read_line(&mut r).unwrap()).unwrap();
+        assert_eq!(g["ok"], serde_json::json!(true));
+        // 发一条请求 → busy 响应
+        writeln!(w, "{}", serde_json::json!({"op":"list","path":""})).unwrap();
+        let resp: serde_json::Value = serde_json::from_slice(&read_line(&mut r).unwrap()).unwrap();
+        assert_eq!(resp["code"], serde_json::json!("server_busy"));
+        assert!(resp["msg"].as_str().unwrap().contains("并发流已满"));
+    }
+
     /// 内存对拍：客户端请求（R2 同协议形态）→ 服务端响应。**每命令一对 pair**
     /// （协议即「每命令一流」——Go serveConn 同义）。
     #[test]
     fn six_verbs_over_ud_pair() {
         let dir = tmpdir("verbs");
-        let srv = FilesServer { root: dir.canonicalize().unwrap(), logf: noop_logf() };
+        let srv = FilesServer { root: dir.canonicalize().unwrap(), logf: noop_logf(), conns: Default::default() };
         std::fs::write(dir.join("hello.txt"), b"hello-files").unwrap();
 
         // 一条命令 = 起 pair + 服务端线程；返回（读半, 写半）
         fn call(srv: &FilesServer) -> (BufReader<UnixStream>, UnixStream) {
             let (a, b) = UnixStream::pair().unwrap();
-            let s2 = FilesServer { root: srv.root.clone(), logf: noop_logf() };
+            let s2 = FilesServer { root: srv.root.clone(), logf: noop_logf(), conns: std::sync::Arc::clone(&srv.conns) };
             std::thread::spawn(move || s2.serve_conn(a));
             let w = b.try_clone().unwrap();
             (BufReader::new(b), w)

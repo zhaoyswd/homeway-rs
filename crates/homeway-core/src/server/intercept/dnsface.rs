@@ -40,6 +40,9 @@ const UDP_RX: usize = 64 * 1024;
 pub enum DnsRoute {
     /// 拦截层进程内腿（非隧道 IP :53 的兜底会话）——由 Interceptor 经 flow 表回投。
     UdpFlow(u64),
+    /// 拦截层 **TCP** 进程内腿（非隧道 IP :53 的 TCP 兜底会话，M3）——RFC1035
+    /// 帧化后经 flow 的 tx_backlog 回投。
+    TcpFlow(u64),
     /// 隧道 IP:53 的栈内 UDP listener——回投原源端点。
     Udp53(IpEndpoint),
     /// 栈内 TCP 连接——RFC1035 分帧写回。

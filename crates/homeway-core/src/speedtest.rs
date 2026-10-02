@@ -278,40 +278,60 @@ impl FrameReader {
 
     /// 缓冲够一帧则解析并消费；否则 None。
     fn try_parse(&mut self) -> Result<Option<FrameIn>, SpeedtestError> {
-        if self.buf.len() < HEADER {
-            return Ok(None);
-        }
-        if self.buf[..4] != MAGIC {
-            return Err(SpeedtestError::Frame(
-                "帧魔数不符（流已错位或非 speedtest 服务）".into(),
-            ));
-        }
-        let typ = self.buf[4];
-        let len = u16::from_le_bytes([self.buf[9], self.buf[10]]) as usize;
-        let crc = u32::from_le_bytes([
-            self.buf[11],
-            self.buf[12],
-            self.buf[13],
-            self.buf[14],
-        ]);
-        if self.buf.len() < HEADER + len {
+        let Some((head, payload)) = decode_frame(&self.buf)? else {
             return Ok(None); // 帧未到齐
+        };
+        let n = HEADER + head.len;
+        if head.typ == TYPE_DATA {
+            self.buf.drain(..n);
+            return Ok(Some(FrameIn::Data { payload_len: head.len }));
         }
-        if typ == TYPE_DATA {
-            // crc 盖全零载荷（按长度缓存）；载荷原地丢弃（缓冲前移由 drain 完成）
-            if crc != zero_crc(len) {
-                return Err(SpeedtestError::Frame("data 帧 crc 不符".into()));
-            }
-            self.buf.drain(..HEADER + len);
-            return Ok(Some(FrameIn::Data { payload_len: len }));
-        }
-        let payload = self.buf[HEADER..HEADER + len].to_vec();
-        if crc != crc32_ieee(&payload) {
-            return Err(SpeedtestError::Frame("帧 crc 不符".into()));
-        }
-        self.buf.drain(..HEADER + len);
-        Ok(Some(FrameIn::Other { typ, payload }))
+        let payload = payload.to_vec();
+        self.buf.drain(..n);
+        Ok(Some(FrameIn::Other { typ: head.typ, payload }))
     }
+}
+
+/// 帧头（纯数据视图——`decode_frame` 的产物；fuzz/向量对照的公共面）。
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FrameHead {
+    pub typ: u8,
+    pub seq: u32,
+    pub len: usize,
+    pub crc: u32,
+}
+
+/// 纯解析（无 IO/无消费）：缓冲里的帧头 + 载荷切片。`Ok(None)` = 帧未到齐。
+/// 魔数/crc 校验在此层（与 Go readFrame 同判位）。**pub 是测试/fuzz 可达面**
+///（R5 评审 ②-1 前置：IO 留在 FrameReader 薄封装）。
+pub fn decode_frame(buf: &[u8]) -> Result<Option<(FrameHead, &[u8])>, SpeedtestError> {
+    if buf.len() < HEADER {
+        return Ok(None);
+    }
+    if buf[..4] != MAGIC {
+        return Err(SpeedtestError::Frame(
+            "帧魔数不符（流已错位或非 speedtest 服务）".into(),
+        ));
+    }
+    let head = FrameHead {
+        typ: buf[4],
+        seq: u32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]),
+        len: u16::from_le_bytes([buf[9], buf[10]]) as usize,
+        crc: u32::from_le_bytes([buf[11], buf[12], buf[13], buf[14]]),
+    };
+    if buf.len() < HEADER + head.len {
+        return Ok(None); // 帧未到齐
+    }
+    let payload = &buf[HEADER..HEADER + head.len];
+    if head.typ == TYPE_DATA {
+        // crc 盖全零载荷（按长度缓存）
+        if head.crc != zero_crc(head.len) {
+            return Err(SpeedtestError::Frame("data 帧 crc 不符".into()));
+        }
+    } else if head.crc != crc32_ieee(payload) {
+        return Err(SpeedtestError::Frame("帧 crc 不符".into()));
+    }
+    Ok(Some((head, payload)))
 }
 
 /// 请求帧载荷（JSON，Go requestJSON 同形）。

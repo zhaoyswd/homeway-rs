@@ -11,12 +11,16 @@ REPO_ROOT="${0:h:A:h}"
 CLONE="$REPO_ROOT/baseline/homeway"
 TPL="$REPO_ROOT/tools/vector-gen/vecgen_vectors_test.go"
 TARGET="$CLONE/clientcore/internal/wtransport/vecgen_vectors_test.go"
+# R5-M20：STUN/SPED golden 第二落点（pkg/egress——STUN 本包真源 + import pkg/speedtest）
+TPL2="$REPO_ROOT/tools/vector-gen/stun_sped/vecgen_stun_sped_test.go"
+TARGET2="$CLONE/pkg/egress/vecgen_stun_sped_test.go"
 OUT="$REPO_ROOT/fixtures/vectors"
 
 "$REPO_ROOT/tools/check-baseline.sh"
 
 cp "$TPL" "$TARGET"
-cleanup() { rm -f "$TARGET"; }
+cp "$TPL2" "$TARGET2"
+cleanup() { rm -f "$TARGET" "$TARGET2"; }
 trap cleanup EXIT
 
 cd "$CLONE"
@@ -25,6 +29,10 @@ echo "==> 克隆内运行向量生成（GOTOOLCHAIN=go1.24.5 go test -run TestVe
 HOMEWAY_VECGEN_OUT="$OUT" GOTOOLCHAIN=go1.24.5 \
   go test ./clientcore/internal/wtransport/ -run 'TestVecgenVectors' -count=1 -v > /tmp/vecgen-test.log 2>&1
 grep -E '^(=== RUN|--- |ok|FAIL|PASS)' /tmp/vecgen-test.log | head -5
+echo "==> 克隆内运行 STUN/SPED 向量生成（go test -run TestVecgenStunSped）"
+HOMEWAY_VECGEN_OUT="$OUT" GOTOOLCHAIN=go1.24.5 \
+  go test ./pkg/egress/ -run 'TestVecgenStunSped' -count=1 -v > /tmp/vecgen-stunsped.log 2>&1
+grep -E '^(=== RUN|--- |ok|FAIL|PASS)' /tmp/vecgen-stunsped.log | head -5
 
 cd "$REPO_ROOT"
 echo "==> 产物："; find "$OUT" -type f -name '*.json' -exec stat -f '    %N (%z 字节)' {} \;

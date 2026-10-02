@@ -644,6 +644,45 @@ mod tests {
         let _ = (AtomicUsize::new(0), Ordering::SeqCst); // 原计数断言面由形态断言替代
     }
 
+    /// R5-5d2（R4 遗留「出口侧测试扩展到 Go 对照面」）：Go 生产真源产的 relay
+    /// 控制帧字节（fixtures/vectors/relay.json——vecgen 产自 baseline EncodeFrame/
+    /// Hello/Challenge/Proof/OK/Again/Keepalive 真源）喂出口 process_packet——
+    /// type=3 分派到 on_leg_frame 钩子（字节原样透传给 relay-leg 线程，不在驱动
+    /// 线程解析）+ 形态行不 panic。
+    #[test]
+    fn leg_frames_dispatch_go_wire_bytes() {
+        let v: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/vectors/relay.json")).unwrap(),
+        )
+        .unwrap();
+        let unhex = |s: &str| -> Vec<u8> {
+            (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+        };
+        use std::sync::Mutex;
+        let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut b = ServerBind::open(0, "t", noop_logf()).unwrap();
+        let sink = Arc::clone(&seen);
+        b.set_on_leg_frame(Box::new(move |payload: &[u8], _src: SocketAddr| {
+            sink.lock().unwrap().push(payload.to_vec());
+        }));
+        let src: SocketAddr = "127.0.0.1:5001".parse().unwrap();
+        let mut n_ctl = 0usize;
+        for c in v["cases"].as_array().unwrap() {
+            // 向量 wire = [subtype][body] 载荷；出口腿上收到的是腿帧壳
+            // （relay_reg_frame = [0xBB][3][len][payload]——Go EncodeFrame 同构）
+            let payload = unhex(c["wire"].as_str().unwrap());
+            let wire = crate::relaywire::relay_reg_frame(&payload);
+            let r = b.process_packet(&wire, src);
+            n_ctl += 1;
+            assert!(r.is_none(), "type=3 帧 = 内部消费（不产 Inbound）");
+        }
+        let got = seen.lock().unwrap().clone();
+        assert_eq!(got.len(), n_ctl, "钩子收到的 type=3 载数应与分派数一致");
+        // hello 帧（首 case）载荷应原样到达钩子（透传语义——relay-leg 线程负责解析）
+        let hello_payload = unhex(v["cases"][0]["wire"].as_str().unwrap());
+        assert_eq!(got[0], hello_payload, "hello 载荷应字节原样透传");
+    }
+
     /// probe 应答路径：HWQ → HWR（同 nonce/build/flags）；列表段受 pad 契约约束。
     #[test]
     fn probe_responds_on_socket_path() {

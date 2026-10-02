@@ -569,7 +569,8 @@ pub fn shrink_upnp_lease(engine: &ServeEngine, logf: &Logf) {
     let port = engine.local_port;
     let cands = crate::server::upnp::local_ipv4_candidates();
     for cand in cands {
-        let Ok(g) = crate::server::upnp::discover_igd(cand) else { continue };
+        // 缩租路径独立 8s 预算（Go serve.go:728-739 ctx——收工不被慢网关拖死）
+        let Ok(g) = crate::server::upnp::discover_igd(cand, crate::server::upnp::UPNP_SHRINK_BUDGET) else { continue };
         if let Some((ext, internal)) = g.find_our_mapping(crate::server::upnp::UPNP_MAP_DESC, cand, port) {
             if g.re_add_short_lease(ext, cand, internal, 300).is_ok() {
                 (logf)(&format!("UPnP：退出前把映射 外部 {ext} 的租期缩到 5 分钟（快速重启仍会沿用这个端口）"));
@@ -947,7 +948,7 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
                         "UPnP：已建立端口映射 外部 UDP {ext} → {used}:{}（重启时从路由器表认领，不需本地文件）",
                         ctx.local_port
                     ));
-                    if let Ok(g) = crate::server::upnp::discover_igd(used) {
+                    if let Ok(g) = crate::server::upnp::discover_igd(used, crate::server::upnp::UPNP_TOTAL_BUDGET) {
                         if let Ok(ip) = g.external_ip() {
                             if egress::is_public_addr(IpAddr::V4(ip)) {
                                 wan_ip = Some(ip);
