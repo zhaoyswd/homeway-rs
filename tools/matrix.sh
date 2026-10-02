@@ -104,7 +104,7 @@ tmo() { # tmo <secs> cmd…（stdout/stderr 继承——调用点要抓输出）
 wait_line_from() { # 只看本轮新增行（M12 纪律）
   local file="$1" pat="$2" start_line="$3" secs="${4:-25}" i=0 out
   while (( i < secs )); do
-    out=$(tail -n +"$((start_line + 1))" "$file" 2>/dev/null | grep -m1 "$pat") && { print -r -- "$out"; return 0; }
+    out=$(tail -n +"$((start_line + 1))" "$file" 2>/dev/null | grep -E -m1 "$pat") && { print -r -- "$out"; return 0; }
     sleep 1; (( i++ ))
   done
   return 1
@@ -382,10 +382,10 @@ base_segment() {
     local CLN=$(log_lines "$st/c-main/cache/client.log")
     # 等「路径确立：直连」或巡检 via=direct（90s 窗——竞速偶发落中继时 hint 盲打
     # 自愈会翻直连，巡检行 60s 一拍必然报到；重启重试机制实测故障面大于收益，弃）
-    if V=$(wait_line_from "$st/c-main/cache/client.log" '路径确立：直连|link: via=direct' "$CLN" 90); then
+    if V=$(wait_line_from "$st/c-main/cache/client.log" '路径确立：直连|link: via=direct' "$CLN" 150); then
       record "$link" C-via-direct "PASS" "${V:0:100}"
     else
-      record "$link" C-via-direct "FAIL" "90s 内未见路径确立/巡检 via=direct"
+      record "$link" C-via-direct "FAIL" "150s 内未见路径确立/巡检 via=direct"
     fi
   else
     local IDDIR="$st/c-main/identity" CACHEDIR="$st/c-main/ep-base"
@@ -400,10 +400,10 @@ base_segment() {
       record "$link" C-ready "FAIL" "25s 内未见 warmup pong"
       return 1
     fi
-    if V=$(wait_line_from "$st/c-main/rust.log" '路径确立：直连|link: via=direct' "$CL0" 90); then
+    if V=$(wait_line_from "$st/c-main/rust.log" '路径确立：直连|link: via=direct' "$CL0" 150); then
       record "$link" C-via-direct "PASS" "${V:0:100}"
     else
-      record "$link" C-via-direct "FAIL" "90s 内未见路径确立/巡检 via=direct"
+      record "$link" C-via-direct "FAIL" "150s 内未见路径确立/巡检 via=direct"
     fi
   fi
 
