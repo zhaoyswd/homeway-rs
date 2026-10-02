@@ -28,8 +28,8 @@ use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address};
 
 /// 隧道 MTU（两端契约常量，坑 4/23）。
 pub const MTU: usize = 1280;
-/// 每方向每连接 TCP 缓冲（speedtest 块 64KB-1 + 余量）。
-const TCP_BUF: usize = 128 * 1024;
+/// 每方向每连接 TCP 缓冲（Go netstack 同量级：files 帧 256KB 不触发零窗）。
+const TCP_BUF: usize = 1024 * 1024;
 /// Device RX/TX 队列深度（包数；满则丢 + 计数——burst 吞吐位）。
 const QUEUE_CAP: usize = 1024;
 

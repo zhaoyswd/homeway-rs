@@ -22,6 +22,8 @@ fn main() {
     match args.get(1).map(String::as_str) {
         Some("token") => cmd_token(&args[2..]),
         Some("connect") => cmd_connect(&args[2..]),
+        Some("files") => cmd_files(&args[2..]),
+        Some("portfwd") => cmd_portfwd(&args[2..]),
         _ => {
             eprintln!(
                 "homeway-cli——可用：\n  token <hmw1…>\n  connect --token <hmw1…> [--identity-dir <dir>] [--endpoint-cache-dir <dir>]\n      [--speedtest] [--dial <ip:port>] [--hold <secs>] [--probe N] [--status-json]\n      [--recover-from <1|2|3> [--recover-cause <s>]] [--inject poison-socket]（注入需 test-seams 构建）"
@@ -291,16 +293,20 @@ fn inject(session: &Session, what: &str) {
 fn transit_dial(session: &Session, dst: SocketAddrV4) -> Result<usize, ConnErr> {
     let id = session.client().connect(dst)?;
     let mut got = 0usize;
-    for _ in 0..16 {
+    loop {
         match session.client().read(id) {
             Ok(chunk) => {
                 if chunk.is_empty() {
                     break; // EOF（对端关）——连接本身已证通
                 }
                 got += chunk.len();
-                if got > 64 * 1024 {
-                    break;
+                if got > 16 * 1024 * 1024 {
+                    break; // 测试面护栏：16MB 足够证通
                 }
+            }
+            Err(ConnErr::Closed) => {
+                // 对端 FIN（CloseWait EOF）——干净收尾：已收字节即结果
+                break;
             }
             Err(e) => {
                 let _ = session.client().close(id);
@@ -310,6 +316,303 @@ fn transit_dial(session: &Session, dst: SocketAddrV4) -> Result<usize, ConnErr> 
     }
     let _ = session.client().close(id);
     Ok(got)
+}
+
+// ---------- files 动词（每命令一条流；拨号走 healing） ----------
+
+fn cmd_files(args: &[String]) {
+    // files <verb> --token <hmw1> [--identity-dir D] <path> [<local>]
+    let mut tok: Option<String> = None;
+    let mut identity_dir: Option<PathBuf> = None;
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--token" => {
+                i += 1;
+                tok = args.get(i).cloned();
+            }
+            "--identity-dir" => {
+                i += 1;
+                identity_dir = args.get(i).map(PathBuf::from);
+            }
+            other => rest.push(other.to_owned()),
+        }
+        i += 1;
+    }
+    let Some(tok) = tok else {
+        eprintln!("用法：homeway-cli files <list|stat|mkdir|read|download|upload> --token <hmw1> [--identity-dir D] <远端路径> [<本地路径>]");
+        std::process::exit(2);
+    };
+    let t = match token::decode(&tok) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("token 解析失败：{e}");
+            std::process::exit(1);
+        }
+    };
+    let verb = rest.first().cloned().unwrap_or_default();
+    let path = rest.get(1).cloned().unwrap_or_default();
+    let local = rest.get(2).cloned().unwrap_or_default();
+    if verb.is_empty() || path.is_empty() {
+        eprintln!("用法：homeway-cli files <verb> --token <hmw1> <远端路径> [<本地路径>]");
+        std::process::exit(2);
+    }
+    let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
+    let mut session = match Session::start(SessionConfig {
+        token: t,
+        identity_dir: identity_dir.or_else(|| Some(PathBuf::from("identity"))),
+        endpoint_cache_dir: None,
+        logf: Arc::clone(&logf),
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("会话建立失败：{e}");
+            std::process::exit(1);
+        }
+    };
+    if session.snapshot().state == SessState::Failed {
+        eprintln!("会话失败收工");
+        std::process::exit(1);
+    }
+    let budget = Duration::from_secs(30);
+    let r: Result<(), homeway_core::files::FilesError> = match verb.as_str() {
+        "list" => homeway_core::files::list(&session, budget, &path).map(|entries| {
+            for e in entries {
+                let kind = if e.is_dir { "dir " } else { "file" };
+                println!("{kind} {:>12}  {}", e.size, e.name);
+            }
+        }),
+        "stat" => homeway_core::files::stat(&session, budget, &path).map(|e| {
+            println!("{} {} size={} mtimeMs={} mode={}", if e.is_dir { "dir" } else { "file" }, e.name, e.size, e.mtime_ms, e.mode);
+        }),
+        "mkdir" => homeway_core::files::mkdir(&session, budget, &path).map(|_| println!("已建目录 {path}")),
+        "read" => homeway_core::files::read(&session, budget, &path, "", 1 << 20).map(|r| {
+            print!("{}", r.text);
+        }),
+        "download" => {
+            let mut out: Box<dyn std::io::Write> = if local == "-" {
+                Box::new(std::io::stdout())
+            } else {
+                Box::new(std::fs::File::create(&local).unwrap_or_else(|e| {
+                    eprintln!("本地文件建不了（{local}）：{e}");
+                    std::process::exit(1);
+                }))
+            };
+            homeway_core::files::download(&session, budget, &path, &mut out, |size| {
+                eprintln!("服务端声明 {size} 字节");
+            })
+            .map(|n| println!("下载完成 {n} 字节 → {local}"))
+        }
+        "upload" => {
+            let mut f = std::fs::File::open(&local).unwrap_or_else(|e| {
+                eprintln!("本地文件打不开（{local}）：{e}");
+                std::process::exit(1);
+            });
+            let size = f.metadata().map(|m| m.len() as i64).unwrap_or(0);
+            homeway_core::files::upload(&session, budget, &path, &mut f, size, |done| {
+                if done % (64 << 20) == 0 {
+                    eprintln!("上传进度 {done}/{size}");
+                }
+            })
+            .map(|n| println!("上传完成 {n} 字节 → {path}"))
+        }
+        other => {
+            eprintln!("未知动词：{other}");
+            std::process::exit(2);
+        }
+    };
+    session.stop();
+    if let Err(e) = r {
+        eprintln!("files {verb} 失败：{e}");
+    }
+}
+
+// ---------- portfwd（本地 127.0.0.1 监听 → 经隧道拨目标；CLI 测试动词） ----------
+
+fn cmd_portfwd(args: &[String]) {
+    let mut tok: Option<String> = None;
+    let mut identity_dir: Option<PathBuf> = None;
+    let mut maps: Vec<(u16, Option<SocketAddrV4>)> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--token" => {
+                i += 1;
+                tok = args.get(i).cloned();
+            }
+            "--identity-dir" => {
+                i += 1;
+                identity_dir = args.get(i).map(PathBuf::from);
+            }
+            "--map" => {
+                i += 1;
+                let spec = args.get(i).cloned().unwrap_or_default();
+                let parts: Vec<&str> = spec.split(':').collect();
+                let parsed = match parts.as_slice() {
+                    [l, tport] => (
+                        l.parse().ok(),
+                        tport.parse().ok().map(|p: u16| {
+                            SocketAddrV4::new(homeway_core::wgcore::SERVER_TUNNEL_IP, p)
+                        }),
+                    ),
+                    [l, ip1, ip2, ip3, tport] => {
+                        let ip = format!("{ip1}.{ip2}.{ip3}").parse().ok();
+                        (l.parse().ok(), ip.zip(tport.parse().ok()).map(|(a, p)| SocketAddrV4::new(a, p)))
+                    }
+                    _ => (None, None),
+                };
+                match parsed {
+                    (Some(listen), target) if listen > 0 => maps.push((listen, target)),
+                    _ => {
+                        eprintln!("--map 需要 <listen>:<ip:port|port> 形态（得 {spec}）");
+                        std::process::exit(2);
+                    }
+                }
+            }
+            other => {
+                eprintln!("未知参数：{other}");
+                std::process::exit(2);
+            }
+        }
+        i += 1;
+    }
+    let Some(tok) = tok else {
+        eprintln!("用法：homeway-cli portfwd --token <hmw1> --map 15432:5432 [--map 15433:1.2.3.4:5432]");
+        std::process::exit(2);
+    };
+    if maps.is_empty() {
+        eprintln!("至少一条 --map");
+        std::process::exit(2);
+    }
+    let t = match token::decode(&tok) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("token 解析失败：{e}");
+            std::process::exit(1);
+        }
+    };
+    let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
+    let session = match Session::start(SessionConfig {
+        token: t,
+        identity_dir: identity_dir.or_else(|| Some(PathBuf::from("identity"))),
+        endpoint_cache_dir: None,
+        logf: Arc::clone(&logf),
+    }) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!("会话建立失败：{e}");
+            std::process::exit(1);
+        }
+    };
+    if session.snapshot().state == SessState::Failed {
+        eprintln!("会话失败收工");
+        std::process::exit(1);
+    }
+    // CLI 测试动词形态：Session 泄漏成 'static（本命令永不返回；单条失败只记
+    // 状态、不阻断其它映射——Go setPortForwards 同义）
+    let sess: &'static Session = Box::leak(Box::new(session));
+    for (listen, target) in maps {
+        let target = target.map(|t| {
+            if t.ip() == &homeway_core::wgcore::SERVER_TUNNEL_IP && t.port() == 0 {
+                SocketAddrV4::new(homeway_core::wgcore::SERVER_TUNNEL_IP, listen)
+            } else {
+                t
+            }
+        });
+        let target_text = match target {
+            Some(t) if t.ip() != &homeway_core::wgcore::SERVER_TUNNEL_IP => format!("{}:{}", t.ip(), t.port()),
+            Some(t) => {
+                if t.port() == listen {
+                    "主机（同端口）".to_owned()
+                } else {
+                    format!("主机:{}", t.port())
+                }
+            }
+            None => "主机（同端口）".to_owned(),
+        };
+        let listener = match std::net::TcpListener::bind(("127.0.0.1", listen)) {
+            Ok(l) => l,
+            Err(e) => {
+                println!("port-forward: 监听 127.0.0.1:{listen} 失败（{e}）——该条映射不可用，不影响隧道 [code=bind_failed]");
+                continue;
+            }
+        };
+        println!("port-forward: 127.0.0.1:{listen} -> {target_text} 监听中");
+        let dst = target.expect("解析期已保证 Some");
+        std::thread::spawn(move || {
+            for conn in std::iter::repeat_with(|| listener.accept().map(|(c, _)| c)) {
+                let local_conn = match conn {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                // 拨远端（恢复感知；15s = Go portfwd dialTimeout）
+                let Ok(remote_id) = sess.healing_dial_addr(dst, Duration::from_secs(15)) else {
+                    continue;
+                };
+                let w_conn = match local_conn.try_clone() {
+                    Ok(c) => c,
+                    Err(_) => {
+                        let _ = sess.client().close(remote_id);
+                        continue;
+                    }
+                };
+                // 上行：本地 → 隧道
+                std::thread::spawn(move || {
+                    let mut lc = local_conn;
+                    let mut buf = [0u8; 16 * 1024];
+                    loop {
+                        match std::io::Read::read(&mut lc, &mut buf) {
+                            Ok(0) | Err(_) => {
+                                let _ = sess.client().shutdown(remote_id);
+                                return;
+                            }
+                            Ok(n) => {
+                                let mut off = 0;
+                                while off < n {
+                                    match sess.client().write(remote_id, buf[off..n].to_vec()) {
+                                        Ok(w) if w > 0 => off += w,
+                                        _ => {
+                                            let _ = lc.shutdown(std::net::Shutdown::Both);
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                });
+                // 下行：隧道 → 本地
+                std::thread::spawn(move || {
+                    let mut wc = w_conn;
+                    loop {
+                        match sess.client().read(remote_id) {
+                            Ok(chunk) if !chunk.is_empty() => {
+                                let mut off = 0;
+                                while off < chunk.len() {
+                                    match std::io::Write::write(&mut wc, &chunk[off..]) {
+                                        Ok(w) if w > 0 => off += w,
+                                        _ => {
+                                            let _ = sess.client().close(remote_id);
+                                            return;
+                                        }
+                                    }
+                                }
+                            }
+                            _ => {
+                                let _ = wc.shutdown(std::net::Shutdown::Both);
+                                return;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+    }
+    println!("portfwd: 全部映射已起（Ctrl-C 收工）");
+    loop {
+        std::thread::sleep(Duration::from_secs(3600));
+    }
 }
 
 fn hex_str(b: &[u8]) -> String {

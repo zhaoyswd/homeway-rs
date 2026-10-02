@@ -11,6 +11,7 @@
 /// 日志面（跨线程共享的判据行输出；Session 在其上加前缀）。
 pub type Logf = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
+pub mod files;
 pub mod go_fmt;
 pub mod identity;
 pub mod probe;
