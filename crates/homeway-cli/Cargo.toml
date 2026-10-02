@@ -6,3 +6,7 @@ edition.workspace = true
 
 [dependencies]
 homeway-core.workspace = true
+
+[features]
+# 透传 homeway-core 的故障注入缝（阶梯时间窗实测用）
+test-seams = ["homeway-core/test-seams"]

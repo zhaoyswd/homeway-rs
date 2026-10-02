@@ -371,6 +371,12 @@ impl Session {
         self.shared.gen_now()
     }
 
+    /// 当前世代的数据面句柄（speedtest 等**非**恢复感知的直连面；恢复感知拨号走
+    /// healing_dial_*）。
+    pub fn client(&self) -> Arc<Client> {
+        self.shared.current()
+    }
+
     /// 公开恢复面（隧道域入口语义：`ClientCoreTunRecover(from)` 同义；CLI 测试钩子）。
     pub fn recover(&self, from: Level, cause: &str) -> LadderRc {
         let rc = self.shared.gate.merge(from, |lvl| self.recover_round(lvl, cause));

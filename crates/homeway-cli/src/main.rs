@@ -1,22 +1,21 @@
 //! homeway-cli —— 测试/运维命令面。
 //!
-//! R1 实装 `connect --token <hmw1…>`（垂直切片）：与 Go 出口建 WG 隧道 → warmup →
-//! 一次性巡检（C10）→ 可选 speedtest / `--dial`（transit 产出步骤）。
+//! R2 实装 `connect`（Session 服务会话形态：暖机/巡检/恢复阶梯/整会话重建都在
+//! Session 内）+ 故障注入与时间窗测试钩子（`--inject`/`--recover-from`，test-seams）。
 //!
-//! 判据行输出对齐 `docs/INTEROP-CRITERIA.md`（模板逐串）：C1（服务会话: 前缀）、C2、
-//! C3、C8（`warmup pong: 就绪（判据=wg）`，APP 核形态文案按判据移植、一次会话一次）、
-//! C10（一次性巡检，频率偏离登记 R2 归 60s）；bind/wgcore 域行无前缀（同 Go 形态）。
+//! 判据行输出对齐 `docs/INTEROP-CRITERIA.md`（模板逐串）；**Session 的一切行带
+//! `服务会话: ` 前缀**（R2 前缀口径硬规则——与 Go 客户端真日志逐字一致）；C8
+//! （`warmup pong: 就绪（判据=wg）`）是 APP 核形态文案，按 R1 登记在 CLI 层打出。
 
 use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use homeway_core::identity::{self, IdentitySource};
+use homeway_core::session::{Level, Session, SessionConfig, SessState};
 use homeway_core::speedtest::{self, Params};
-use homeway_core::token::{self, EndpointKind};
-use homeway_core::wgcore::{Client, CoreConfig};
-use homeway_core::wtransport::Candidate;
+use homeway_core::token;
+use homeway_core::wgcore::ConnErr;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -25,7 +24,7 @@ fn main() {
         Some("connect") => cmd_connect(&args[2..]),
         _ => {
             eprintln!(
-                "homeway-cli——可用：\n  token <hmw1…>\n  connect --token <hmw1…> [--identity-dir <dir>] [--speedtest] [--dial <ip:port>] [--hold <secs>]"
+                "homeway-cli——可用：\n  token <hmw1…>\n  connect --token <hmw1…> [--identity-dir <dir>] [--endpoint-cache-dir <dir>]\n      [--speedtest] [--dial <ip:port>] [--hold <secs>] [--probe N] [--status-json]\n      [--recover-from <1|2|3> [--recover-cause <s>]] [--inject poison-socket]（注入需 test-seams 构建）"
             );
             std::process::exit(2);
         }
@@ -54,35 +53,78 @@ fn cmd_token(args: &[String]) {
     }
 }
 
-fn cmd_connect(args: &[String]) {
-    let mut tok = None;
-    let mut identity_dir: Option<PathBuf> = None;
-    let mut do_speedtest = false;
-    let mut dial: Option<SocketAddrV4> = None;
-    let mut hold = 0u64;
+struct ConnectArgs {
+    tok: Option<String>,
+    identity_dir: Option<PathBuf>,
+    cache_dir: Option<PathBuf>,
+    do_speedtest: bool,
+    dial: Option<SocketAddrV4>,
+    hold: u64,
+    probe: u32,
+    status_json: bool,
+    recover_from: Option<i64>,
+    recover_cause: String,
+    inject: Option<String>,
+}
+
+fn parse_connect(args: &[String]) -> ConnectArgs {
+    let mut a = ConnectArgs {
+        tok: None,
+        identity_dir: None,
+        cache_dir: None,
+        do_speedtest: false,
+        dial: None,
+        hold: 0,
+        probe: 0,
+        status_json: false,
+        recover_from: None,
+        recover_cause: "测试注入".to_owned(),
+        inject: None,
+    };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--token" => {
                 i += 1;
-                tok = args.get(i).cloned();
+                a.tok = args.get(i).cloned();
             }
             "--identity-dir" => {
                 i += 1;
-                identity_dir = args.get(i).map(PathBuf::from);
+                a.identity_dir = args.get(i).map(PathBuf::from);
             }
-            "--speedtest" => do_speedtest = true,
+            "--endpoint-cache-dir" => {
+                i += 1;
+                a.cache_dir = args.get(i).map(PathBuf::from);
+            }
+            "--speedtest" => a.do_speedtest = true,
             "--dial" => {
                 i += 1;
-                dial = args.get(i).and_then(|s| s.parse().ok());
-                if dial.is_none() {
+                a.dial = args.get(i).and_then(|s| s.parse().ok());
+                if a.dial.is_none() {
                     eprintln!("--dial 需要 <ipv4:port>（如 192.168.3.12:9999）");
                     std::process::exit(2);
                 }
             }
             "--hold" => {
                 i += 1;
-                hold = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+                a.hold = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+            "--probe" => {
+                i += 1;
+                a.probe = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            }
+            "--status-json" => a.status_json = true,
+            "--recover-from" => {
+                i += 1;
+                a.recover_from = args.get(i).and_then(|s| s.parse().ok());
+            }
+            "--recover-cause" => {
+                i += 1;
+                a.recover_cause = args.get(i).cloned().unwrap_or_else(|| "测试注入".into());
+            }
+            "--inject" => {
+                i += 1;
+                a.inject = args.get(i).cloned();
             }
             other => {
                 eprintln!("未知参数：{other}");
@@ -91,12 +133,15 @@ fn cmd_connect(args: &[String]) {
         }
         i += 1;
     }
-    let Some(tok) = tok else {
-        eprintln!("用法：homeway-cli connect --token <hmw1…> [--identity-dir <dir>] [--speedtest] [--dial <ip:port>] [--hold <secs>]");
+    a
+}
+
+fn cmd_connect(args: &[String]) {
+    let a = parse_connect(args);
+    let Some(tok) = a.tok.clone() else {
+        eprintln!("用法：homeway-cli connect --token <hmw1…> […]");
         std::process::exit(2);
     };
-
-    // ---- token（入口 decode 一次落结构）----
     let t = match token::decode(&tok) {
         Ok(t) => t,
         Err(e) => {
@@ -104,107 +149,71 @@ fn cmd_connect(args: &[String]) {
             std::process::exit(1);
         }
     };
-    let candidates: Vec<Candidate> = t
-        .endpoints
-        .iter()
-        .filter(|e| e.kind == EndpointKind::Direct)
-        .map(|e| Candidate {
-            addr: e.addr.parse().unwrap_or_else(|_| {
-                eprintln!("端点地址不可达形：{}", e.addr);
-                std::process::exit(1);
-            }),
-            relay: false,
-        })
-        .collect();
-    // ---- 身份（C1 判据行；默认目录 <cwd>/identity）----
-    let dir = identity_dir.unwrap_or_else(|| PathBuf::from("identity"));
-    let (identity, src, warn) = identity::load_or_create(Some(&dir), &t.peer_id).expect("身份装配失败");
-    match src {
-        IdentitySource::Created => println!(
-            "服务会话: 身份：新建（dev={} pub={}，目录 {}）",
-            identity.short_dev(),
-            identity.short_pub(),
-            dir.display()
-        ),
-        IdentitySource::Reused => println!(
-            "服务会话: 身份：复用（dev={} pub={}）",
-            identity.short_dev(),
-            identity.short_pub()
-        ),
-        other => println!(
-            "服务会话: 身份：{}（dev={} pub={}）",
-            other.zh(),
-            identity.short_dev(),
-            identity.short_pub()
-        ),
-    }
-    if let Some(w) = warn {
-        eprintln!("服务会话: ⚠️ 身份存储不可用（{w}）——本次临时身份，重连会换钥匙");
-    }
 
-    // ---- 数据面（C2 由 Client::start 打出）----
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
-    let mut client = match Client::start(CoreConfig {
-        peer_id: t.peer_id,
-        secret: t.secret,
-        identity,
-        candidates,
+    let mut session = match Session::start(SessionConfig {
+        token: t,
+        identity_dir: a.identity_dir.clone().or_else(|| Some(PathBuf::from("identity"))),
+        endpoint_cache_dir: a.cache_dir.clone(),
         logf: Arc::clone(&logf),
     }) {
-        Ok(c) => c,
+        Ok(s) => s,
         Err(e) => {
-            eprintln!("数据面装配失败：{e}");
+            eprintln!("会话建立失败：{e}");
             std::process::exit(1);
         }
     };
-    // C3 判据行（session.go:237：第二字段 = 本设备派生隧道地址，非出口隧道 IP——评审中-4）
-    println!(
-        "服务会话: 新栈会话已建立（token 端点 {} 个，后端隧道地址 {}）",
-        t.endpoints.len(),
-        client.tunnel_ip
-    );
+    let snap = session.snapshot();
+    if snap.state == SessState::Failed {
+        eprintln!("会话失败收工：{}", snap.reason);
+        std::process::exit(1);
+    }
+    // C8（APP 核形态判据，按 R1 登记在 CLI 层打出、一次会话一次）
+    println!("warmup pong: 就绪（判据=wg）");
 
-    // ---- warmup（C8：拨 :1 判 RST = 隧道通）----
-    let warm_start = Instant::now();
-    match client.path_probe(Duration::from_secs(12)) {
-        Ok(()) => {
-            // APP 核形态判据（tunmode.go:751），按 ROADMAP 判据移植；一次会话只打一次
-            println!("warmup pong: 就绪（判据=wg）");
-        }
-        Err(e) => {
-            eprintln!("warmup ping: 失败（{e}）——出口未应答");
-            let _ = warm_start;
-            client.stop();
-            std::process::exit(1);
+    // ---- 故障注入（test-seams 构建；普通构建给出可判定错误）----
+    if let Some(what) = &a.inject {
+        inject(&session, what);
+    }
+
+    // ---- 恢复钩子（时间窗实测：阶梯直测面）----
+    if let Some(from) = a.recover_from {
+        let lvl = Level::clamp(from);
+        let t0 = Instant::now();
+        let rc = session.recover(lvl, &a.recover_cause);
+        println!(
+            "recover: from={} rc={} 耗时={}ms（ladder 判据行见上）",
+            from,
+            rc.as_rc(),
+            t0.elapsed().as_millis()
+        );
+    }
+
+    // ---- status-json（2f 契约面）----
+    if a.status_json {
+        println!("{}", homeway_core::status_json::snapshot_json(&session.snapshot()));
+    }
+
+    // ---- 手动探测拍（恢复性验证用）----
+    for _ in 0..a.probe {
+        match session.client().path_probe(Duration::from_secs(10)) {
+            Ok(()) => println!("probe: ok"),
+            Err(e) => println!("probe: 失败（{e}）"),
         }
     }
 
-    // ---- 一次性巡检（C10 巡检形态；60s 周期属 R2）----
-    client.refresh_reg();
-    let patrol_start = Instant::now();
-    let patrol_ok = client.path_probe(Duration::from_secs(10)).is_ok();
-    let snap = client.snapshot();
-    let rtt_ms = patrol_start.elapsed().as_millis();
-    if patrol_ok {
-        match snap.ep {
-            Some(ep) => println!("link: via={} ep={} rtt={}ms（服务会话巡检）", snap.via.as_str(), ep, rtt_ms),
-            None => println!("link: via={} ep= rtt={}ms（服务会话巡检）", snap.via.as_str(), rtt_ms),
-        }
-    }
-
-    // ---- transit 产出步骤（--dial 非环回：出口对 dst≠隧道IP 的包打 transit 行）----
-    if let Some(dst) = dial {
-        // transit 产出步骤：判据 = 出口侧 `intercept: tcp transit …（dialok）` 行
-        // （dst≠隧道IP 的包被拦截层重拨）；echo 回读是加强证据，失败不阻断后续步骤。
-        match transit_dial(&client, dst) {
+    // ---- transit 产出步骤（--dial 非环回）----
+    if let Some(dst) = a.dial {
+        match transit_dial(&session, dst) {
             Ok(n) => println!("transit: 经隧道拨 {dst} 成功（收 {n} 字节）"),
             Err(e) => eprintln!("transit: 经隧道拨 {dst} 回读未成（{e}）——出口侧 transit 行已产出，继续"),
         }
     }
 
-    // ---- speedtest（可选）----
-    if do_speedtest {
-        match speedtest::run(&client, Params::default(), &|s| println!("{s}")) {
+    // ---- speedtest（可选；直连面，不走 healing）----
+    if a.do_speedtest {
+        let client = session.client();
+        match speedtest::run(client.as_ref(), Params::default(), &|s| println!("{s}")) {
             Ok(r) => {
                 println!(
                     "speedtest: 摘要 down={:.0}Mbps up={:.0}Mbps",
@@ -214,50 +223,53 @@ fn cmd_connect(args: &[String]) {
             }
             Err(e) => {
                 eprintln!("speedtest 失败：{e}");
-                client.stop();
+                session.stop();
                 std::process::exit(1);
             }
         }
     }
 
-    // ---- 保持（采样窗口；缺省 0 = 立即收工）----
-    if hold > 0 {
-        let deadline = Instant::now() + Duration::from_secs(hold);
+    // ---- 保持（巡检在 Session 内跑；缺省 0 = 立即收工）----
+    if a.hold > 0 {
+        let deadline = Instant::now() + Duration::from_secs(a.hold);
         while Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(500));
         }
-        // 保持期结束时再打一拍巡检（保活腿证据）
-        client.refresh_reg();
-        let p0 = Instant::now();
-        if client.path_probe(Duration::from_secs(10)).is_ok() {
-            let snap = client.snapshot();
-            let rtt = p0.elapsed().as_millis();
-            if let Some(ep) = snap.ep {
-                println!(
-                    "link: via={} ep={} rtt={}ms（服务会话巡检）",
-                    snap.via.as_str(),
-                    ep,
-                    rtt
-                );
-            }
-        }
     }
 
-    let (rx, tx) = {
-        let s = client.snapshot();
-        (s.rx, s.tx)
-    };
-    println!("收工：WG 传输层累计 rx={rx}B tx={tx}B");
-    client.stop();
+    let e = session.client().snapshot();
+    println!("收工：WG 传输层累计 rx={}B tx={}B", e.rx, e.tx);
+    session.stop();
+}
+
+fn inject(session: &Session, what: &str) {
+    match what {
+        "poison-socket" => {
+            #[cfg(feature = "test-seams")]
+            {
+                session.client().debug_poison_socket();
+                println!("inject: UDP socket 已置为失效形态（EBADF 模拟）");
+            }
+            #[cfg(not(feature = "test-seams"))]
+            {
+                let _ = session;
+                eprintln!("inject: 需要 test-seams 构建（cargo build -p homeway-cli --features homeway-core/test-seams）");
+                std::process::exit(2);
+            }
+        }
+        other => {
+            eprintln!("未知注入：{other}（可用：poison-socket）");
+            std::process::exit(2);
+        }
+    }
 }
 
 /// 经隧道拨任意 v4 目标（transit 判据产出步骤）：建连 → 读到对端数据或 EOF 即证通。
-fn transit_dial(client: &Client, dst: SocketAddrV4) -> Result<usize, String> {
-    let id = client.connect(dst).map_err(|e| format!("connect: {e}"))?;
+fn transit_dial(session: &Session, dst: SocketAddrV4) -> Result<usize, ConnErr> {
+    let id = session.client().connect(dst)?;
     let mut got = 0usize;
-    // 读循环：拿到字节或对端关闭即收（nc 之类回声/静默服务都兼容）
     for _ in 0..16 {
-        match client.read(id) {
+        match session.client().read(id) {
             Ok(chunk) => {
                 if chunk.is_empty() {
                     break; // EOF（对端关）——连接本身已证通
@@ -268,12 +280,12 @@ fn transit_dial(client: &Client, dst: SocketAddrV4) -> Result<usize, String> {
                 }
             }
             Err(e) => {
-                let _ = client.close(id);
-                return Err(format!("read: {e}"));
+                let _ = session.client().close(id);
+                return Err(e);
             }
         }
     }
-    let _ = client.close(id);
+    let _ = session.client().close(id);
     Ok(got)
 }
 
