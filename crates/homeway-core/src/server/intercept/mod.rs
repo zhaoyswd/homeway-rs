@@ -47,8 +47,12 @@ pub const DNS_IDLE: Duration = Duration::from_secs(10);
 pub const MAX_UDP_SESSIONS: usize = 4096;
 /// 每五元组建会话窗口的缓冲上限（超出丢最新）。
 const UDP_PENDING_MAX: usize = 16;
-/// 栈内 socket 缓冲（过境 TCP：通告窗口面——有意放宽 vs Go rcvWnd=4096，登记差异表）。
+/// 栈内 socket 接收缓冲（过境 TCP：通告窗口面——有意放宽 vs Go rcvWnd=4096，登记差异表）。
 const FLOW_BUF: usize = 256 * 1024;
+/// 栈内 socket 发送缓冲（吞吐面：发端每 RTT 能维持的在途字节——对端（客户端）
+/// smoltcp 延迟 ACK ~25ms ⇒ 256KB 只能维持 ~80Mbps；1MB 对齐客户端通告窗
+/// （Go gVisor 无此上限）【2026-10-02 实测：20MB 下载 41.7s→2.6s】。
+const FLOW_TX_BUF: usize = 1024 * 1024;
 /// 背压高水位（per-flow 未确认字节；双向）。
 const WATERMARK: usize = 256 * 1024;
 /// 建连窗口的 SYN/重复包缓存上限。
@@ -161,6 +165,14 @@ struct Flow {
     last_active: Instant,
     /// 栈→upstream 在途字节（Written 清账；水位门控 drain）。
     unacked_out: usize,
+    /// upstream→栈内 socket 写不下的余量（**部分写回补**——send_slice 只写前缀时
+    /// 余量必须留住：静默丢字节 = 下游流错位【2026-10-02 实测抓出：speedtest 下行
+    /// 大流量下帧错位】；poll 开窗后在 service_sockets 续写）。
+    tx_backlog: Vec<u8>,
+    /// upstream EOF 后待补的 FIN（**backlog 排空后才 close**：close 会把 FIN 排进
+    /// socket 发送队列——backlog 里的数据若在 FIN 之后才写就永远出不去，客户端看到
+    /// 「数据 + FIN + 丢尾」的流错位【2026-10-02 实测抓出：speedtest report 帧丢失】）。
+    fin_pending: bool,
     /// transit UDP：是否收到过回包（udpcap 实测位）。
     udp_replied: bool,
     /// TCP：建流 SYN 的 seq（拨号失败构造 RST|ACK 的 ack 依据）。
@@ -403,6 +415,8 @@ impl Interceptor {
                 phase: Phase::Dialing { cache },
                 last_active: Instant::now(),
                 unacked_out: 0,
+                tx_backlog: Vec::new(),
+                fin_pending: false,
                 udp_replied: false,
                 syn_seq: v.tcp_seq,
             },
@@ -549,6 +563,7 @@ impl Interceptor {
         std::mem::take(&mut self.tx_out)
     }
 
+
     /// DNS 应答路由（回投通道 → 栈内 socket / 拦截腿 flow）。
     fn drain_dns(&mut self) {
         loop {
@@ -630,7 +645,7 @@ impl Interceptor {
                 let rw = f.rw_port;
                 let mut sock = TcpSocket::new(
                     tcp::SocketBuffer::new(vec![0u8; FLOW_BUF]),
-                    tcp::SocketBuffer::new(vec![0u8; FLOW_BUF]),
+                    tcp::SocketBuffer::new(vec![0u8; FLOW_TX_BUF]),
                 );
                 sock.set_nagle_enabled(false); // Go SetDelayOption(false) 同口径
                 sock.set_timeout(Some(smoltcp::time::Duration::from_secs(TCP_IDLE.as_secs()))); // R2 低-10：精确 idle 回收
@@ -712,10 +727,30 @@ impl Interceptor {
         match f.proto {
             Proto::Tcp => {
                 let Some(h) = f.sock else { return };
-                // 写入栈内 socket（客户端方向）；缓冲满则丢——水位门控下不应常发
-                let sock = self.sockets.get_mut::<TcpSocket>(h);
-                if sock.can_send() {
-                    let _ = sock.send_slice(&data);
+                // 写入栈内 socket（客户端方向）——**部分写必须留住余量**（tx_backlog）。
+                let mut rest: Vec<u8> = data;
+                if !f.tx_backlog.is_empty() {
+                    f.tx_backlog.extend_from_slice(&rest);
+                    rest = std::mem::take(&mut f.tx_backlog);
+                }
+                let accepted = {
+                    let sock = self.sockets.get_mut::<TcpSocket>(h);
+                    match sock.send_slice(&rest) {
+                        Ok(w) if w < rest.len() => w,
+                        Ok(_) => rest.len(),
+                        Err(_) => 0,
+                    }
+                };
+                if accepted < rest.len() {
+                    let f = self.flows.get_mut(&flow).expect("刚判存在");
+                    f.tx_backlog = rest[accepted..].to_vec();
+                }
+                // 背压清账：**只认进 socket 的字节**——backlog 滞留部分不清账，worker
+                // 的 unacked 涨过水位即停读 UDS ⇒ UDS 拥塞 ⇒ 服务端 write_all 阻塞
+                // ⇒ 泵送按墙钟限速（Go gVisor 端点缓冲反压的等价物；此前「收到即
+                // Ack」让 worker 无限读、服务端 2s 预热 0.2s 泵完——窗口计数全作废）。
+                if accepted > 0 {
+                    self.pool.send_for(flow, PoolCmd::Ack { flow, n: accepted });
                 }
             }
             Proto::Udp => {
@@ -728,16 +763,24 @@ impl Interceptor {
         if let Some(f) = self.flows.get_mut(&flow) {
             f.last_active = Instant::now();
         }
-        // 背压清账
-        self.pool.send_for(flow, PoolCmd::Ack { flow, n });
+        // TCP 的 Ack 已在写 socket 处按「实际进入量」发出；UDP 面（数据报整包）在此清账
+        if n > 0 {
+            let proto_udp = self.flows.get(&flow).map(|f| f.proto == Proto::Udp).unwrap_or(false);
+            if proto_udp {
+                self.pool.send_for(flow, PoolCmd::Ack { flow, n });
+            }
+        }
     }
 
     fn on_upstream_eof(&mut self, flow: u64) {
         let Some(f) = self.flows.get_mut(&flow) else { return };
         match f.proto {
             Proto::Tcp => {
-                // 「任一方 EOF 即双向拆」的 upstream 半边：栈内 socket 发 FIN
-                if let Some(h) = f.sock {
+                // 「任一方 EOF 即双向拆」的 upstream 半边：栈内 socket 发 FIN——
+                // **backlog 非空时先挂起**（FIN 排队先于 backlog 会把尾数据挤丢）
+                if !f.tx_backlog.is_empty() {
+                    f.fin_pending = true;
+                } else if let Some(h) = f.sock {
                     self.sockets.get_mut::<TcpSocket>(h).close();
                 }
             }
@@ -781,6 +824,40 @@ impl Interceptor {
                         let s = self.sockets.get_mut::<TcpSocket>(h);
                         (s.can_recv(), s.may_recv(), s.state(), s.can_send())
                     };
+                    let _ = can_send;
+                    // backlog 续写（开窗即写尽——send_slice 部分写的余量在此消化；
+                    // 按量 Ack——续写进 socket 的字节才算已消化）
+                    let mut flushed = 0usize;
+                    if let Some(f) = self.flows.get_mut(&flow) {
+                        if !f.tx_backlog.is_empty() {
+                            let Some(h) = f.sock else { continue };
+                            let mut wrote_all = false;
+                            {
+                                let sock = self.sockets.get_mut::<TcpSocket>(h);
+                                match sock.send_slice(&f.tx_backlog) {
+                                    Ok(w) if w < f.tx_backlog.len() => {
+                                        f.tx_backlog.drain(..w);
+                                        flushed = w;
+                                    }
+                                    Ok(_) => wrote_all = true,
+                                    Err(_) => {}
+                                }
+                            }
+                            if wrote_all {
+                                let n = f.tx_backlog.len();
+                                f.tx_backlog.clear();
+                                flushed = n;
+                                if f.fin_pending {
+                                    if let Some(h) = f.sock {
+                                        self.sockets.get_mut::<TcpSocket>(h).close();
+                                    }
+                                }
+                            }
+                        }
+                        if flushed > 0 {
+                            self.pool.send_for(flow, PoolCmd::Ack { flow, n: flushed });
+                        }
+                    }
                     if can_recv && !gated {
                         // 读尽 → Out
                         let mut total = 0usize;

@@ -367,10 +367,44 @@ fn wait_stop_pipe() -> bool {
 // ---------- serve token [list|revoke]（纯读/纯文件操作） ----------
 
 pub fn cmd_serve_token(args: &[String]) {
-    match args.first().map(String::as_str) {
-        None => token_reveal(&args[..]),
-        Some("list") => token_list(&args[1..]),
-        Some("revoke") => token_revoke(&args[1..]),
+    // flag 之后的第一个非 flag 位置参数 = 动词（list / revoke <id>；无动词 = reveal）
+    let mut verb: Option<String> = None;
+    let mut rest: Vec<String> = Vec::new();
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--state" {
+            rest.push(a.clone());
+            if let Some(v) = args.get(i + 1) {
+                rest.push(v.clone());
+            }
+            i += 2;
+            continue;
+        }
+        if a == "--reason" {
+            rest.push(a.clone());
+            if let Some(v) = args.get(i + 1) {
+                rest.push(v.clone());
+            }
+            i += 2;
+            continue;
+        }
+        if a.starts_with('-') {
+            rest.push(a.clone());
+            i += 1;
+            continue;
+        }
+        if verb.is_none() {
+            verb = Some(a.clone());
+        } else {
+            rest.push(a.clone());
+        }
+        i += 1;
+    }
+    match verb.as_deref() {
+        None => token_reveal(&rest),
+        Some("list") => token_list(&rest),
+        Some("revoke") => token_revoke(&rest),
         Some(other) => {
             eprintln!("serve token 不认识的动词 {other:?}（可用：list / revoke <id>）");
             std::process::exit(2);
@@ -448,7 +482,7 @@ fn token_list(args: &[String]) {
         println!("台账为空（出口从未铸出 token）：先 `homeway-cli serve`，等首轮端点探测后重试");
         return;
     }
-    println!("{:<8}  {:<20}  {:<14}  {}", "id", "签发", "状态", "端点/凭证（掩码）");
+    println!("{:<8}  {:<20}  {:<14}  端点/凭证（掩码）", "id", "签发", "状态");
     let mut creds = std::collections::HashSet::new();
     for (i, e) in ledger.iter().enumerate() {
         creds.insert(e.id.clone());

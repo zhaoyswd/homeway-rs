@@ -151,6 +151,7 @@ impl Bind {
         logf: crate::Logf,
     ) -> io::Result<Self> {
         let sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?;
+        enlarge_udp_bufs(&sock);
         sock.set_nonblocking(true)?;
         let mut b = Self {
             sock,
@@ -585,6 +586,7 @@ impl Bind {
     /// 会话保持）。新 socket 非阻塞；旧 socket 关闭（驱动线程 poll 的 fd 由每轮重取跟随）。
     pub fn rebind(&mut self) -> io::Result<u16> {
         let sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?;
+        enlarge_udp_bufs(&sock);
         sock.set_nonblocking(true)?;
         let old = std::mem::replace(&mut self.sock, sock);
         let port = self.sock.local_addr().map(|a| a.port()).unwrap_or(0);
@@ -701,6 +703,29 @@ fn candidate_tag(ap: SocketAddr, relay: bool) -> &'static str {
                 "公网v4"
             }
         }
+    }
+}
+
+/// 大收发缓冲（出口侧拦截栈每拍可产 ~1MB 突发——内核默认 SO_RCVBUF 会整包丢
+/// WG 数据报 ⇒ TCP 层 RTO 重传；尽力而为抬高，超上限由内核钳制/忽略）。
+fn enlarge_udp_bufs(sock: &UdpSocket) {
+    use std::os::fd::AsRawFd as _;
+    unsafe {
+        let sz: libc::c_int = 4 * 1024 * 1024;
+        let _ = libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_SNDBUF,
+            &sz as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as u32,
+        );
+        let _ = libc::setsockopt(
+            sock.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_RCVBUF,
+            &sz as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as u32,
+        );
     }
 }
 

@@ -174,9 +174,11 @@ pub struct CoreConfig {
     pub logf: Arc<dyn Fn(&str) + Send + Sync>,
 }
 
+type UdpRecvReply = Result<(Vec<u8>, SocketAddrV4), ConnErr>;
+
 struct UdpConn {
     handle: SocketHandle,
-    wait_recv: Option<Sender<Result<(Vec<u8>, SocketAddrV4), ConnErr>>>,
+    wait_recv: Option<Sender<UdpRecvReply>>,
 }
 
 struct Conn {
@@ -502,7 +504,7 @@ impl Engine {
                 let _ = reply.send(r);
             }
             Cmd::UdpOpen { id, reply } => {
-                let r = self.start_udp(id).map(|p| p);
+                let r = self.start_udp(id);
                 let _ = reply.send(r);
             }
             Cmd::UdpSend { id, dst, data, reply } => {

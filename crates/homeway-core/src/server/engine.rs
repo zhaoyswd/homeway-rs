@@ -545,6 +545,7 @@ fn spawn_service_stop_flag(flags: &mut Vec<Arc<AtomicBool>>) -> Arc<AtomicBool> 
 
 // ---------- 驱动循环（WG 驱动线程独占：device/拦截栈/设备表/ServerBind） ----------
 
+#[allow(clippy::too_many_arguments)] // 装配线程一次性移交全驱动状态（线程起点单参化无收益）
 fn driver_loop(
     cfg: ServeConfig,
     mut bind: ServerBind,
@@ -680,9 +681,8 @@ fn handle_inbound(
     let _ = cfg;
     for (reg, _src) in inbound.regs {
         let now = SystemTime::now();
-        match table.register(&reg, now) {
-            Ok((_action, ops)) => apply_dev_ops(ops, device),
-            Err(_) => {} // 拒绝归因行由表内打出
+        if let Ok((_action, ops)) = table.register(&reg, now) {
+            apply_dev_ops(ops, device); // 拒绝归因行由表内打出
         }
     }
     if let Some((src, wg)) = inbound.data {
@@ -723,17 +723,14 @@ fn route_encap(tx: &[Vec<u8>], device: &mut Device, bind: &mut ServerBind, out: 
 
 // ---------- 公网端点观测 + token 打印 ----------
 
+#[derive(Default)]
 struct TokenPrintState {
     last_token: String,
     revoked_logged: bool,
     last_published: Vec<String>,
 }
 
-impl Default for TokenPrintState {
-    fn default() -> Self {
-        Self { last_token: String::new(), revoked_logged: false, last_published: Vec::new() }
-    }
-}
+
 
 struct TokenCtx {
     cfg: ServeConfig,
@@ -852,7 +849,7 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
         (Some(ap), 0, _) if ap.port() == ctx.local_port && public_v4(ap) => Some(ap),
         (None, ext, Some(w)) if ext != 0 => {
             let built = SocketAddr::new(IpAddr::V4(w), ext);
-            (ctx.logf)(&format!("公网端点：用路由器自报 WAN 地址 + UPnP 外口公布（没有同 socket STUN 证据）"));
+            (ctx.logf)("公网端点：用路由器自报 WAN 地址 + UPnP 外口公布（没有同 socket STUN 证据）");
             Some(built)
         }
         (Some(ap), _, _) if public_v4(ap) => {

@@ -38,11 +38,12 @@ build_bin() {
 }
 
 our_pid() {
-  local pf="$1" p
+  # pattern 缺省 homeway-cli（Rust 出口）；go 客户端侧传 homeway-go 形态
+  local pf="$1" p pat="${2:-homeway-cli}"
   [[ -f "$pf" ]] || return 1
   p=$(cat "$pf" 2>/dev/null) || return 1
   kill -0 "$p" 2>/dev/null || return 1
-  [[ "$(ps -p "$p" -o comm= 2>/dev/null)" == *homeway-cli* ]] || return 1
+  [[ "$(ps -p "$p" -o comm= 2>/dev/null)" == *"${pat}"* ]] || return 1
   REPLY_PID=$p
 }
 
@@ -108,7 +109,7 @@ wipe) "$0" stop "$n"; rm -rf "$EXIT_STATE"; echo "==> 已删 $EXIT_STATE" ;;
 go-client-add)
   # Go 客户端统一进程（serve/relay 双关——同 local-exit.sh client-start 的断言纪律）
   [[ -x "$GO_BIN" ]] || { echo "!! $GO_BIN 不在（先 tools/local-exit.sh start 1 触发构建或手工构建）" >&2; exit 1; }
-  if ! our_pid "$CLIENT_PIDFILE"; then
+  if ! our_pid "$CLIENT_PIDFILE" homeway; then
     mkdir -p "$CLIENT_STATE" || exit 1
     cat > "$CLIENT_STATE/config.toml" <<EOF
 [serve]
@@ -137,7 +138,7 @@ EOF
   fi
   ;;
 go-client-stop)
-  if our_pid "$CLIENT_PIDFILE"; then
+  if our_pid "$CLIENT_PIDFILE" homeway; then
     local_pid=$REPLY_PID
     kill -TERM "$local_pid" 2>/dev/null
     for i in {1..10}; do kill -0 "$local_pid" 2>/dev/null || break; sleep 1; done

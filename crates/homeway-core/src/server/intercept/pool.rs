@@ -72,6 +72,11 @@ struct FlowIo {
     unacked: usize,
     want_write: bool,
     dead: bool,
+    /// 累计已写出 fd 的字节数 / 已向驱动上报的部分（差额补报——**部分写后 POLLOUT
+    /// 续写也必须上报**，否则驱动的 unacked_out 只增不减 ⇒ 水位门控误停读 ⇒ 上行
+    /// 整流卡死【2026-10-02 实测抓出：files 上传「写通道长时间无进展」】）。
+    written_total: usize,
+    written_reported: usize,
 }
 
 /// 简洁起见用 Vec 做写缓冲（块级追加；头部消费）。
@@ -167,7 +172,7 @@ impl Worker {
                     self.read_flow(flow);
                 }
                 if pf.revents & libc::POLLOUT != 0 {
-                    self.flush_flow(flow);
+                    self.flush_and_report(flow);
                 }
             }
         }
@@ -178,15 +183,10 @@ impl Worker {
     fn handle_cmd(&mut self, cmd: PoolCmd, stop: &mut bool) -> bool {
         match cmd {
             PoolCmd::Out { flow, data } => {
-                let n = data.len();
                 if let Some(io) = self.flows.get_mut(&flow) {
                     io.out_buf.push(&data);
-                    let written = self.flush_flow(flow);
-                    if written >= n {
-                        // 全部写完才回执（部分写在 POLLOUT 续写后补——简化：按已消费量回执）
-                        let _ = self.event_tx.send(PoolEvent::Written { flow, n: written });
-                    }
                 }
+                self.flush_and_report(flow);
             }
             PoolCmd::Close { flow, linger_rst } => {
                 if let Some(io) = self.flows.remove(&flow) {
@@ -223,6 +223,8 @@ impl Worker {
                         unacked: 0,
                         want_write: false,
                         dead: false,
+                        written_total: 0,
+                        written_reported: 0,
                     },
                 );
                 self.fd_index.insert(fd, flow);
@@ -301,6 +303,7 @@ impl Worker {
             if n >= 0 {
                 let sent = remaining.len();
                 io.out_buf.consume(sent);
+                io.written_total += sent;
                 return sent;
             }
             let e = std::io::Error::last_os_error();
@@ -314,6 +317,7 @@ impl Worker {
         if n > 0 {
             io.out_buf.consume(n as usize);
             written = n as usize;
+            io.written_total += written;
             // 全写完 + 曾经 EOF 标记：可以真正关 fd
             if io.out_buf.remaining().is_empty() && io.dead {
                 let io = self.flows.remove(&flow).expect("刚判存在");
@@ -327,6 +331,18 @@ impl Worker {
             }
         }
         written
+    }
+
+    /// 写 fd + **差额补报 Written**（立即写尽与 POLLOUT 续写同一面——驱动的
+    /// unacked_out 靠它清账，漏报 = 水位门控永不解除）。
+    fn flush_and_report(&mut self, flow: u64) {
+        self.flush_flow(flow);
+        let Some(io) = self.flows.get(&flow) else { return };
+        if io.written_total > io.written_reported {
+            let delta = io.written_total - io.written_reported;
+            self.flows.get_mut(&flow).expect("刚判存在").written_reported = io.written_total;
+            let _ = self.event_tx.send(PoolEvent::Written { flow, n: delta });
+        }
     }
 
     /// upstream EOF/错误：上报驱动（TCP 桥「双向拆」的 upstream 半边；剩余写缓冲

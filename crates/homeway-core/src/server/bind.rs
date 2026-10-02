@@ -85,6 +85,27 @@ impl ServerBind {
         if let Some((index, name)) = pin {
             let _ = super::egress::pin_socket_to_iface(sock.as_raw_fd(), index, &name);
         }
+        // 大收发缓冲：拦截栈每拍可产 ~1MB 突发（MTU 1280 × 数百段），内核默认
+        // SO_SNDBUF/SO_RCVBUF（~128-9216B）会整包丢弃 WG 数据报 ⇒ TCP 层 RTO
+        // 重传、吞吐塌到 ~8MB/s【2026-10-02 实测抓出】。尽力而为抬高（超过系统
+        // 上限的值由内核自动钳制/报错忽略——macOS kern.ipc.maxsockbuf 缺省 4MB）。
+        unsafe {
+            let sz: libc::c_int = 4 * 1024 * 1024;
+            let _ = libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &sz as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as u32,
+            );
+            let _ = libc::setsockopt(
+                sock.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &sz as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as u32,
+            );
+        }
         if sock.local_addr()?.port() != port {
             (logf)(&format!(
                 "⚠️ 监听端口 {port} 被占用 —— 改用 {}；token 里的端口以公布/签发为准",
