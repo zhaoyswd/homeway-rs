@@ -18,6 +18,7 @@ pub mod go_fmt;
 pub mod identity;
 pub mod probe;
 pub mod psk;
+pub mod relay;
 pub mod relaywire;
 pub mod server;
 pub mod session;
