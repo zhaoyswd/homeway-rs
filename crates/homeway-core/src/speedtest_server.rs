@@ -654,18 +654,9 @@ mod tests {
         write_control(&mut c, TYPE_FINISH, &[]).unwrap();
         // report
         let mut r = BufReader::new(c);
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut rep = None;
-        while Instant::now() < deadline {
-            match read_frame(&mut r) {
-                Ok((TYPE_REPORT, payload)) => {
-                    rep = Some(String::from_utf8(payload).unwrap());
-                    break;
-                }
-                _ => panic!("期望 report"),
-            }
-        }
-        let rep = rep.expect("report");
+        let (rt, payload) = read_frame(&mut r).expect("report 应到达");
+        assert_eq!(rt, TYPE_REPORT);
+        let rep = String::from_utf8(payload).unwrap();
         assert!(rep.contains("\"bytes\":20480"), "窗口 5×4096（实得 {rep}）");
         assert!(rep.contains("\"warmup_bytes\":12288"), "预热 3×4096");
         // E13 判据行（受理 + 结算）
