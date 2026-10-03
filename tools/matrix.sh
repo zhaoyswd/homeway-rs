@@ -725,13 +725,20 @@ relay_segment() {
     dd if=/dev/urandom of="$LOCAL" bs=1048576 count=5 2>/dev/null
   fi
   local UP_SHA=$(sha256_of "$LOCAL") UP_OUT="" DN_OUT=""
+  # --rate-limit 250000（判据批十六，2026-10-03 轮 2 实证 L3+L6 双命中）：中继腿
+  # 200pps 准入闸 ≈ 280KB/s 有效上行容量——发送端速率义务按腿标定是 Go 的设计用法
+  #（files-cli 1.4：缺省 2MiB/s 是直腿保守值，「按最慢腿一半以下修订」）。Rust 侧
+  # 缺发送端限速曾致 bulk 冲闸塌速（upload「写通道长时间无进展」中止——Go relay
+  # 同命中，非 relay 实现问题；UploadLimiter 已移植，批十六两侧统一切到标定值）。
+  # 5MB @250KB/s ≈ 20s（tmo 150 界内、看门狗恒有进展不触发）。
+  local RLIM="--rate-limit 250000"
   if [[ "$C" == go ]]; then
-    UP_OUT=$(tmo 150 "$GO_BIN" files put --state "$st/c-main" --host "dead$link" "$LOCAL" "/$RNAME" 2>&1 | tail -1)
+    UP_OUT=$(tmo 150 "$GO_BIN" files put --state "$st/c-main" --host "dead$link" $RLIM "$LOCAL" "/$RNAME" 2>&1 | tail -1)
     DN_OUT=$(tmo 150 "$GO_BIN" files get --state "$st/c-main" --host "dead$link" "/$RNAME" -o "$st/dn-rl.bin" 2>&1 | tail -1)
   else
     # files CLI 无 --endpoint-cache-dir（不识别会错位进 rest）——不带 = 会话无落盘缓存，
     # 竞速 token 端点（dead-direct 形态下恒中继），段级隔离天然成立
-    UP_OUT=$(tmo 150 "$RUST_BIN" files upload --token "$TOK" --identity-dir "$st/c-main/identity" --dead-direct "/$RNAME" "$LOCAL" 2>&1 | tail -1)
+    UP_OUT=$(tmo 150 "$RUST_BIN" files upload --token "$TOK" --identity-dir "$st/c-main/identity" --dead-direct $RLIM "/$RNAME" "$LOCAL" 2>&1 | tail -1)
     DN_OUT=$(tmo 150 "$RUST_BIN" files download --token "$TOK" --identity-dir "$st/c-main/identity" --dead-direct "/$RNAME" "$st/dn-rl.bin" 2>&1 | tail -1)
   fi
   local DN_SHA=$(sha256_of "$st/dn-rl.bin")

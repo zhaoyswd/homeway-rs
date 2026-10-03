@@ -561,16 +561,17 @@ fn write_frame(w: &mut UnixStream, payload: &[u8]) -> std::io::Result<()> {
 fn read_frame(r: &mut BufReader<UnixStream>) -> std::io::Result<Option<Vec<u8>>> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len)?;
-    let n = u32::from_be_bytes(len) as usize;
-    if n == 0 {
-        return Ok(None);
+    // 前缀判定与客户端共用单一真源（files::decode_prefix——R5 第二道门 高-4 整改：
+    // 原为同语义重实现，fuzz 抽取面只盖了客户端半边）
+    match crate::files::decode_prefix(&len) {
+        Ok(crate::files::Prefix::Terminated) => Ok(None),
+        Ok(crate::files::Prefix::Frame { len: n }) => {
+            let mut buf = vec![0u8; n];
+            r.read_exact(&mut buf)?;
+            Ok(Some(buf))
+        }
+        Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
     }
-    if n > MAX_CHUNK {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "帧超长"));
-    }
-    let mut buf = vec![0u8; n];
-    r.read_exact(&mut buf)?;
-    Ok(Some(buf))
 }
 
 /// UDS 监听（exit-service-uds：死/活判别 + chmod 0600；路径 ≥100B 拒绝）。

@@ -301,6 +301,25 @@ pub struct FrameHead {
     pub crc: u32,
 }
 
+/// 纯头解析（魔数 + 字段视图，无 IO/无消费）。**服务端读循环与 `decode_frame`
+/// 共用的单一真源**（R5 第二道门 高-4 整改：服务端 reader 原为同语义重实现）。
+pub fn decode_head(hdr: &[u8]) -> Result<FrameHead, SpeedtestError> {
+    if hdr.len() < HEADER {
+        return Err(SpeedtestError::Frame("帧头未到齐（<15B）".into()));
+    }
+    if hdr[..4] != MAGIC {
+        return Err(SpeedtestError::Frame(
+            "帧魔数不符（流已错位或非 speedtest 服务）".into(),
+        ));
+    }
+    Ok(FrameHead {
+        typ: hdr[4],
+        seq: u32::from_le_bytes([hdr[5], hdr[6], hdr[7], hdr[8]]),
+        len: u16::from_le_bytes([hdr[9], hdr[10]]) as usize,
+        crc: u32::from_le_bytes(hdr[11..15].try_into().expect("定长")),
+    })
+}
+
 /// 纯解析（无 IO/无消费）：缓冲里的帧头 + 载荷切片。`Ok(None)` = 帧未到齐。
 /// 魔数/crc 校验在此层（与 Go readFrame 同判位）。**pub 是测试/fuzz 可达面**
 ///（R5 评审 ②-1 前置：IO 留在 FrameReader 薄封装）。
@@ -308,17 +327,7 @@ pub fn decode_frame(buf: &[u8]) -> Result<Option<(FrameHead, &[u8])>, SpeedtestE
     if buf.len() < HEADER {
         return Ok(None);
     }
-    if buf[..4] != MAGIC {
-        return Err(SpeedtestError::Frame(
-            "帧魔数不符（流已错位或非 speedtest 服务）".into(),
-        ));
-    }
-    let head = FrameHead {
-        typ: buf[4],
-        seq: u32::from_le_bytes([buf[5], buf[6], buf[7], buf[8]]),
-        len: u16::from_le_bytes([buf[9], buf[10]]) as usize,
-        crc: u32::from_le_bytes([buf[11], buf[12], buf[13], buf[14]]),
-    };
+    let head = decode_head(buf)?;
     if buf.len() < HEADER + head.len {
         return Ok(None); // 帧未到齐
     }

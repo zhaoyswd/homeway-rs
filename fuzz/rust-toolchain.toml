@@ -1,2 +1,6 @@
+# 浮动 nightly 是刻意口径（第二道门 低-19 注记）：cargo-fuzz 依赖 nightly 的
+# -Zsanitizer，钉死日期会让「本机恰好装了哪个 nightly」变成硬门；降级规则 =
+# rustup toolchain list | grep nightly && command -v cargo-fuzz 都在才跑深挖轨，
+# 否则只跑 replay 轨（tests/fuzz_replay.rs --ignored）+ 登记——见 docs/reviews/R5.md。
 [toolchain]
 channel = "nightly"

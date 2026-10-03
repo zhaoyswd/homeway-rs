@@ -113,7 +113,9 @@ fn sped_frame_roundtrip_stable() {
 }
 
 fn crc32_ieee_local(data: &[u8]) -> u32 {
-    // IEEE crc32（与 core 内部同算法——测试侧独立实现防同源盲区）
+    // IEEE crc32——**同源副本**（与 core 内 speedtest.rs 的 crc32_ieee 是同一算法的
+    // 逐行重写，非真正独立实现；编码器私有 ⇒ 本轨是 decode-only 往返，抓不到
+    // 「编码器与解码器口径互不一致」形态——R5 第二道门 低-17 注记）
     let mut crc = !0u32;
     for &b in data {
         crc ^= b as u32;

@@ -37,6 +37,11 @@ echo "==> [4/7] 向量确定性门（gen-vectors + SUMS + git diff）"
 (cd "$REPO_ROOT/fixtures" && shasum -c SHA256SUMS >/dev/null) || fail 4 "SHA256SUMS 校验"
 git -C "$REPO_ROOT" diff --quiet -- fixtures/vectors/ || fail 4 "向量 diff 非空（语义漂移）"
 
+echo "==> [4.5/7] fuzz 种子展开门（gen-fuzz-seeds + 摘要对账——第二道门 中-13 整改）"
+SEEDS_DIGEST=$("$REPO_ROOT/tools/gen-fuzz-seeds.sh" 2>/dev/null | tail -1) || fail 4 "种子生成"
+WANT_DIGEST=$(cat "$REPO_ROOT/fuzz/corpus.seeds.sha256" 2>/dev/null) || fail 4 "摘要基准文件缺失（fuzz/corpus.seeds.sha256）"
+[[ "$SEEDS_DIGEST" == "$WANT_DIGEST" ]] || fail 4 "种子展开摘要漂移（得 $SEEDS_DIGEST 想要 $WANT_DIGEST——fixtures 变更须同批更新基准文件）"
+
 echo "==> [5/7] 词表三方门（check-vocab.sh）"
 "$REPO_ROOT/tools/check-vocab.sh" || fail 5 "词表漂移"
 

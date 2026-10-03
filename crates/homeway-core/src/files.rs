@@ -419,9 +419,99 @@ where
     }
 }
 
+/// 上行限速缺省（bytes/s；Go files-cli 1.4「发送端速率义务」同值：保守起步 2MiB/s，
+/// design D5「不可判定时取保守值」）。0 = 不限、风险自担（越界被对端收流属可预期
+/// 边界）。
+pub const DEFAULT_RATE_LIMIT: i64 = 2 << 20;
+
+/// 令牌桶补充上限（停顿后削峰）：独立于 rate 的常量，取对端每流窗口
+/// （640KiB = 40 帧 × 16KiB）的一半以下——「任意时刻可立即灌入的增量 ≤ burstCap」
+/// 恒真，稳态吞吐不受影响（稳态 tokens≈0，只在读发停顿后削峰）。Go tokenBurstCap
+/// 同值同理由。
+const TOKEN_BURST_CAP: i64 = 256 << 10;
+
+/// 发送端速率义务的载体：**无 ack/credit 下的盲节流**（协议 write 方向无回压信号；
+/// 对端每流窗口有限，越界即时收流）。安全条件 = 发送速率 ≤ 隧道+远端的排空速率；
+/// 固定默认值必须取最慢预期腿之下（快腿绿不能当安全速率证据）。
+///
+/// 与 Go tokenBucket 逐语义对齐（files-cli 1.4 + exec-r1 F2/v0.12.1 空桶起步 +
+/// exec-r2 N1 整块放行）：
+///   - **空桶起步**（tokens = 0）：满桶起步的首秒突刺远超对端窗口（真机实测
+///     100MiB put 对慢腿 0.04s 内 gone）；首帧只多等 MAX_CHUNK/rate（默认 ~128ms）；
+///   - 补充上限 = min(rate, 256KiB)——小速率下不超过 rate 本身（否则节拍失真）；
+///   - 单块配额 > burst（0 < rate < 块大小）时**不走高水位攒额**：按 n/rate 等满
+///     整块配额后清零放行（否则 tokens 恒被截在 burst 以下、永攒不够一块）。
+///
+/// sleep 按 ≤250ms 分片（CLI 进程粒度的可打断性；Go 侧走 ctx 取消——本侧无 ctx
+/// 面，进程信号即取消）。
+pub struct UploadLimiter {
+    rate: i64,
+    burst: i64,
+    tokens: f64,
+}
+
+impl UploadLimiter {
+    /// rate ≤ 0 = 不限（调用方以 None 语义处理）。tokens 空桶起步。
+    pub fn new(rate: i64) -> Option<Self> {
+        if rate <= 0 {
+            return None;
+        }
+        Some(Self { rate, burst: rate.min(TOKEN_BURST_CAP), tokens: 0.0 })
+    }
+
+    /// 一次配额结算的纯计算（测试可达面）：给定距上次结算的秒数与本次需发字节数，
+    /// 返回（结算后的 tokens 余量, 需等待的秒数）。不改时钟状态。
+    fn settle(elapsed_s: f64, tokens: f64, rate: i64, burst: i64, n: usize) -> (f64, f64) {
+        let mut t = tokens + elapsed_s * rate as f64;
+        let n = n as f64;
+        if n > burst as f64 {
+            // 整块配额放行 = 积累作废（等待时间已花在上一块上，不得凭积累立刻放行
+            // 整块；burst 仍约束可立即灌入的增量）
+            return (0.0, n / rate as f64);
+        }
+        if t > burst as f64 {
+            t = burst as f64; // 停顿后削峰
+        }
+        if n <= t {
+            (t - n, 0.0)
+        } else {
+            (t, (n - t) / rate as f64)
+        }
+    }
+
+    /// 为 n 字节的发送配额等待（上传循环按本地读块调用，配额单位 = 读块
+    /// （≤ MAX_CHUNK），不是 16KiB 线帧）。
+    pub fn await_quota(&mut self, n: usize) {
+        let mut last = std::time::Instant::now();
+        loop {
+            let now = std::time::Instant::now();
+            let (tokens, wait_s) = Self::settle(
+                now.duration_since(last).as_secs_f64(),
+                self.tokens,
+                self.rate,
+                self.burst,
+                n,
+            );
+            last = now;
+            self.tokens = tokens;
+            if wait_s <= 0.0 {
+                return;
+            }
+            // ≤250ms 分片：小速率下单块等待可达秒级，长睡会拖住进程收尾
+            let mut remain = wait_s;
+            while remain > 0.0 {
+                let slice = remain.min(0.25);
+                std::thread::sleep(std::time::Duration::from_secs_f64(slice));
+                remain -= slice;
+            }
+        }
+    }
+}
+
 /// 大文件上传：请求 → 服务端 ready → 帧 → 终止帧（提交）→ 读提交结果。
 /// **错误/提前 drop = 关流不发终止帧 ⇒ 服务端删 .tierpart**（目标不变）。
-pub fn upload<R, F>(sess: &Session, budget: Duration, path: &str, r: &mut R, size: i64, on_progress: F) -> Result<u64, FilesError>
+/// `limiter` = 发送端速率义务（None = 不限；CLI 缺省 2MiB/s——对齐 Go files-cli）。
+pub fn upload<R, F>(sess: &Session, budget: Duration, path: &str, r: &mut R, size: i64, on_progress: F, mut limiter: Option<&mut UploadLimiter>) -> Result<u64, FilesError>
 where
     R: io::Read + ?Sized,
     F: FnMut(u64),
@@ -438,6 +528,9 @@ where
         })?;
         if n == 0 {
             break;
+        }
+        if let Some(l) = limiter.as_deref_mut() {
+            l.await_quota(n);
         }
         s.write_frame(&buf[..n])?;
         total += n as u64;
@@ -529,5 +622,60 @@ mod tests {
         assert_eq!(r.entries[0].name, "a");
         assert_eq!(r.entries[0].mtime_ms, 1700000000000);
         assert_eq!(r.entries[0].mode, 420);
+    }
+
+    // ---------- UploadLimiter（发送端速率义务；Go files-cli tokenBucket 同语义） ----------
+
+    #[test]
+    fn upload_limiter_bounds() {
+        assert!(UploadLimiter::new(0).is_none(), "0 = 不限");
+        assert!(UploadLimiter::new(-1).is_none(), "负值 = 不限");
+        let l = UploadLimiter::new(DEFAULT_RATE_LIMIT).unwrap();
+        // 缺省 2MiB/s：burst = min(rate, 256KiB) = 256KiB（对端窗口一半以下）
+        assert_eq!(l.burst, 256 << 10);
+        // 小速率：补充上限不超过 rate 本身（否则节拍失真）
+        let small = UploadLimiter::new(1024).unwrap();
+        assert_eq!(small.burst, 1024);
+        assert_eq!(small.rate, 1024);
+        // 空桶起步（v0.12.1 形态：满桶首秒突刺会打爆对端窗口）
+        assert_eq!(l.tokens, 0.0);
+    }
+
+    #[test]
+    fn upload_limiter_settle_three_regimes() {
+        let rate = 1000i64;
+        let burst = 1000i64; // rate < TOKEN_BURST_CAP ⇒ burst = rate
+        // ① 令牌足够：立即放行，扣除 n
+        let (t, w) = UploadLimiter::settle(1.0, 500.0, rate, burst, 300);
+        assert_eq!(w, 0.0);
+        assert_eq!(t, 700.0);
+        // ② 停顿后削峰：tokens 高水位恒 ≤ burst（补充 10000 → 截在 1000）
+        let (t, w) = UploadLimiter::settle(10.0, 0.0, rate, burst, 0);
+        assert_eq!(t, 1000.0, "停顿后补充上限 = burst");
+        assert_eq!(w, 0.0);
+        // ③ 令牌不足：等待 = 差额/rate，tokens 不动
+        let (t, w) = UploadLimiter::settle(0.0, 100.0, rate, burst, 300);
+        assert_eq!(t, 100.0);
+        assert!((w - 0.2).abs() < 1e-9, "等待 = (300-100)/1000 = 0.2s（得 {w}）");
+        // ④ 整块配额 > burst：积累作废、按 n/rate 等满（exec-r2 N1 形态）
+        let (t, w) = UploadLimiter::settle(100.0, 900.0, 1_000_000, 256 << 10, 300_000);
+        assert_eq!(t, 0.0, "整块放行 = 积累作废");
+        assert!((w - 0.3).abs() < 1e-9, "等待 = 300000/1000000 = 0.3s（得 {w}）");
+    }
+
+    #[test]
+    fn upload_limiter_pacing_shapes() {
+        // 节拍不快于 rate：连续结算 10 块（每块 100B，rate=1000）在零 elapsed 下
+        // 第 2 块起必产生等待（空桶起步——首块也没有白给的令牌）
+        let rate = 1000i64;
+        let burst = 1000i64;
+        let mut tokens = 0.0f64;
+        let mut total_wait = 0.0f64;
+        for _ in 0..10 {
+            let (t, w) = UploadLimiter::settle(0.0, tokens, rate, burst, 100);
+            tokens = t;
+            total_wait += w;
+        }
+        assert!(total_wait >= 0.9, "10×100B @1000B/s 至少要 ~1s 配额（得 {total_wait}）");
     }
 }

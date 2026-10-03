@@ -361,13 +361,14 @@ impl Drop for ConnGuard {
 }
 
 /// 请求帧载荷（`{"role":"recv","warmup_ms":2000,"window_ms":10000}`——手解极小 JSON 面）。
-struct RequestJson {
-    role: String,
-    warmup_ms: u64,
-    window_ms: u64,
+/// **pub 纯函数 = fuzz/测试可达面**（R5 第二道门 高-4 整改：服务端半边原不可达）。
+pub struct RequestJson {
+    pub role: String,
+    pub warmup_ms: u64,
+    pub window_ms: u64,
 }
 
-fn parse_request(payload: &[u8]) -> Option<RequestJson> {
+pub fn parse_request(payload: &[u8]) -> Option<RequestJson> {
     let s = std::str::from_utf8(payload).ok()?;
     let inner = s.trim_start_matches('{').trim_end_matches('}');
     let mut role = String::new();
@@ -464,47 +465,34 @@ fn read_frame_bounded(r: &mut BufReader<UnixStream>, buf: &mut [u8]) -> std::io:
     r.read_exact(&mut buf[..n])
 }
 
-// ---------- 帧编解码（BufReader 面；与 speedtest.rs 客户端同一线协议真源） ----------
+// ---------- 帧编解码（BufReader 面；头解析复用 speedtest::decode_head 单一真源——
+// R5 第二道门 高-4 整改：原为客户端 decode_frame 的同语义重实现） ----------
 
 /// 读一帧（控制帧路径：连同 crc 一起校验，载荷带回）。
 fn read_frame(r: &mut impl Read) -> std::io::Result<(u8, Vec<u8>)> {
     let mut hdr = [0u8; HEADER];
     r.read_exact(&mut hdr)?;
-    if hdr[..4] != MAGIC {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "帧魔数不符（流已错位或非 speedtest 服务）",
-        ));
-    }
-    let typ = hdr[4];
-    let n = u16::from_le_bytes([hdr[9], hdr[10]]) as usize;
-    let crc = u32::from_le_bytes(hdr[11..15].try_into().expect("定长"));
-    let mut payload = vec![0u8; n];
+    let head = crate::speedtest::decode_head(&hdr)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    let mut payload = vec![0u8; head.len];
     r.read_exact(&mut payload)?;
-    let want = if typ == TYPE_DATA { zero_crc(n) } else { crc32_ieee(&payload) };
-    if crc != want {
+    let want = if head.typ == TYPE_DATA { zero_crc(head.len) } else { crc32_ieee(&payload) };
+    if head.crc != want {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "帧 crc 不符"));
     }
-    Ok((typ, payload))
+    Ok((head.typ, payload))
 }
 
 /// 只读帧头不进载荷（data 计数路径：payload 是零填充，只需长度）。
 fn read_frame_header(r: &mut impl Read) -> std::io::Result<(u8, usize)> {
     let mut hdr = [0u8; HEADER];
     r.read_exact(&mut hdr)?;
-    if hdr[..4] != MAGIC {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidData,
-            "帧魔数不符（流已错位或非 speedtest 服务）",
-        ));
-    }
-    let typ = hdr[4];
-    let n = u16::from_le_bytes([hdr[9], hdr[10]]) as usize;
-    let crc = u32::from_le_bytes(hdr[11..15].try_into().expect("定长"));
-    if typ == TYPE_DATA && crc != zero_crc(n) {
+    let head = crate::speedtest::decode_head(&hdr)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    if head.typ == TYPE_DATA && head.crc != zero_crc(head.len) {
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "data 帧 crc 不符"));
     }
-    Ok((typ, n))
+    Ok((head.typ, head.len))
 }
 
 /// 载荷丢弃（64KB 整块读——热路径每 64KB 帧降到 ~2-3 次系统调用）。

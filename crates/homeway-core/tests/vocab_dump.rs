@@ -61,4 +61,22 @@ fn vocab_dump() {
         out.push_str(&format!("files-proto/code\t{v}\n"));
     }
     print!("{out}");
+    // 自检（第二道门 低-20 整改：dump 测试本身零断言 ⇒ 格式/族数漂移只会静默丢行）：
+    // 五族各在、总行数 = 7+1+3+5+10 = 26、行格式恒 `<family>/<unit>\t<value>`。
+    const FAMILY_COUNT: usize = 5;
+    const TOTAL_VALUES: usize = 26;
+    let mut families: Vec<&str> = Vec::new();
+    for line in out.lines() {
+        let (unit, value) = line
+            .split_once('\t')
+            .unwrap_or_else(|| panic!("行缺 TAB 分隔（格式漂移）：{line:?}"));
+        assert!(!unit.is_empty() && !value.is_empty(), "空字段：{line:?}");
+        assert!(unit.contains('/'), "unit 形态应为 family/name：{unit:?}");
+        if families.last() != Some(&unit) && !families.contains(&unit) {
+            families.push(unit);
+        }
+    }
+    assert_eq!(families.len(), FAMILY_COUNT, "族数漂移：{families:?}");
+    let total: usize = out.lines().count();
+    assert_eq!(total, TOTAL_VALUES, "值总数漂移（改词表须同批更新此门与 check-vocab）");
 }

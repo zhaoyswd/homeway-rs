@@ -471,11 +471,14 @@ fn cmd_speedtest(args: &[String]) {
 // ---------- files 动词（每命令一条流；拨号走 healing） ----------
 
 fn cmd_files(args: &[String]) {
-    // files <verb> --token <hmw1> [--identity-dir D] [--dead-direct] [--inject no-hint] <path> [<local>]
+    // files <verb> --token <hmw1> [--identity-dir D] [--dead-direct] [--inject no-hint]
+    //   [--rate-limit <bytes/s>] <path> [<local>]（--rate-limit 缺省 2MiB/s 发送端速率
+    //   义务；0 = 不限、风险自担——对齐 Go files-cli 1.4）
     let mut tok: Option<String> = None;
     let mut identity_dir: Option<PathBuf> = None;
     let mut dead_direct = false;
     let mut inject_what: Option<String> = None;
+    let mut rate_limit: Option<i64> = None;
     let mut rest: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -493,12 +496,20 @@ fn cmd_files(args: &[String]) {
                 i += 1;
                 inject_what = args.get(i).cloned();
             }
+            "--rate-limit" => {
+                i += 1;
+                rate_limit = args.get(i).and_then(|v| v.parse::<i64>().ok());
+                if rate_limit.is_none() {
+                    eprintln!("--rate-limit 需要整数 bytes/s（如 250000；0 = 不限）");
+                    std::process::exit(2);
+                }
+            }
             other => rest.push(other.to_owned()),
         }
         i += 1;
     }
     let Some(tok) = tok else {
-        eprintln!("用法：homeway-cli files <list|stat|mkdir|read|download|upload> --token <hmw1> [--identity-dir D] <远端路径> [<本地路径>]");
+        eprintln!("用法：homeway-cli files <list|stat|mkdir|read|download|upload> --token <hmw1> [--identity-dir D] [--rate-limit B/s（缺省 2MiB/s；0 不限）] <远端路径> [<本地路径>]");
         std::process::exit(2);
     };
     let mut t = match token::decode(&tok) {
@@ -512,7 +523,7 @@ fn cmd_files(args: &[String]) {
     let path = rest.get(1).cloned().unwrap_or_default();
     let local = rest.get(2).cloned().unwrap_or_default();
     if verb.is_empty() || path.is_empty() {
-        eprintln!("用法：homeway-cli files <verb> --token <hmw1> [--dead-direct] [--inject relay-lock] <远端路径> [<本地路径>]");
+        eprintln!("用法：homeway-cli files <verb> --token <hmw1> [--dead-direct] [--inject relay-lock] [--rate-limit B/s] <远端路径> [<本地路径>]");
         std::process::exit(2);
     }
     if dead_direct {
@@ -579,11 +590,14 @@ fn cmd_files(args: &[String]) {
                 std::process::exit(1);
             });
             let size = f.metadata().map(|m| m.len() as i64).unwrap_or(0);
+            // 发送端速率义务：缺省 2MiB/s（对齐 Go files-cli；--rate-limit 可改/0 不限）
+            let rate = rate_limit.unwrap_or(homeway_core::files::DEFAULT_RATE_LIMIT);
+            let mut limiter = homeway_core::files::UploadLimiter::new(rate);
             homeway_core::files::upload(&session, budget, &path, &mut f, size, |done| {
                 if done % (64 << 20) == 0 {
                     eprintln!("上传进度 {done}/{size}");
                 }
-            })
+            }, limiter.as_mut())
             .map(|n| println!("上传完成 {n} 字节 → {path}"))
         }
         other => {

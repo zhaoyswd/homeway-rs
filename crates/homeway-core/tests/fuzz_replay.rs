@@ -1,14 +1,20 @@
 //! R5-5b 结构化随机重放（回归轨；设计 §2.2 轨 2）。
 //!
-//! 目标 = 全部网络可达解析器的 **pub 纯函数面**（纯解析抽取是硬前置——评审 ②-1）。
-//! oracle 四断言（评审 ②-3）：
+//! 目标 = 全部网络可达解析器的 **pub 纯函数面**（纯解析抽取是硬前置——评审 ②-1；
+//! 服务端半边 speedtest_server::parse_request 同入面——第二道门 高-4 整改）。
+//! oracle 形态（②-3 + 第二道门中-14/中-15 整改）：
 //!   (a) 不 panic（panic = 测试失败——所有目标共用）；
-//!   (b) **分块等价**：状态机类目标（CtlDecoder）同一字节流按不同切块喂入结果一致；
-//!   (c) **往返一致**：合法输入 encode→decode→encode 字节稳定；
-//!   (d) **夹具期望**：向量族样本的解析结果与 fixtures 期望一致（token/relay/stun_sped）。
-//! 生成器 = xorshift64 固定 seed（确定性；`HER_SEED` 可复现指定轮）；
+//!   (b) **分块等价**：状态机类目标（CtlDecoder）同一字节流按不同切块喂入结果一致
+//!       （种子含两消息首尾相接 + 尾部半条的流骨架——drain 边界形态钉住）；
+//!   (c) **往返一致**：合法输入手搓 wire → decode → 字段/载荷逐比对（编码器私有，
+//!       非真 encode→decode→encode——见 r5_vectors.rs 同源副本注记）；
+//!   (d) **夹具期望**：token 逐字段（peer_id/secret/端点三元组）+ 负例哨兵码 +
+//!       STUN 首样本字节；
+//!   (e) **输出上界**：empty_response/truncate/TCP 分帧/header_value/xml_tag/
+//!       parse_http_url/probe 端点数等「输出 ≤ 已知上界」断言（独立于实现内 cap）。
+//! 生成器 = xorshift64 固定 seed（确定性；`HER_SEED` 可复现指定轮，非法值即 panic）；
 //! 配比 70% 种子骨架变异 + 30% 全随机。每目标 ≥100k 次迭代（`#[ignore]`：
-//! CI quick 档跳过、全量档 `--ignored` 显式开——G-10）。
+//! CI quick 档跳过、全量档 `--ignored` 显式开——G-10；量级门见 fuzz_iteration_budget）。
 
 use homeway_core::probe;
 use homeway_core::server::intercept::dnsface;
@@ -41,7 +47,9 @@ impl Rng {
 
 fn seed() -> u64 {
     match std::env::var("HER_SEED") {
-        Ok(s) => s.parse().unwrap_or(0x5eed_1234_abcd_ef01),
+        Ok(s) => s.parse().unwrap_or_else(|_| {
+            panic!("HER_SEED 非法（{s:?}）——须为 u64 十进制；缺省不设即用固定 seed")
+        }),
         Err(_) => 0x5eed_1234_abcd_ef01,
     }
 }
@@ -73,6 +81,36 @@ fn seeds() -> Vec<Vec<u8>> {
     v.push(homeway_core::relaywire::encode_hello(&[7u8; 32]));
     v.push(homeway_core::relaywire::ok_bytes());
     v.push(homeway_core::relaywire::keepalive_bytes());
+    // CtlDecoder 流骨架：两消息首尾相接 + 尾部半条（drain 边界形态——第二道门 中-10：
+    // 随机/变异输入过「长度行 ≤256」闸的概率 ~2e-3，不用骨架钉住则 100k 轮几乎观测不到）
+    {
+        let m1 = homeway_core::relaywire::ok_bytes();
+        let m2 = homeway_core::relaywire::keepalive_bytes();
+        let mut flow = Vec::new();
+        homeway_core::relaywire::ctl_frame_into(&m1, &mut flow);
+        homeway_core::relaywire::ctl_frame_into(&m2, &mut flow);
+        flow.extend_from_slice(&[0x00, 0x08, 0x02, 0xAB]); // 半条（长度行 8 只到 2B 体）
+        v.push(flow);
+    }
+    // 真探测响应骨架（第二道门 高-3：nonce 门在载荷解析之前，固定 nonce 的变异
+    // 打不进深层——respond_ex 产真形 + harness 侧 nonce 自取双保险）
+    {
+        let req = probe::encode_request(probe::TYPE_PING, &[0x0A; 8], 200);
+        let resp = probe::respond_ex(
+            &req,
+            "homeway-rs-fuzz",
+            0b11,
+            &["127.0.0.1:41641".parse().unwrap(), "192.168.3.12:42661".parse().unwrap()],
+        )
+        .expect("真探测响应构造");
+        v.push(resp);
+        // 不带端点列表的老出口形态
+        let resp_old = probe::respond_ex(&req, "old", 0b01, &[]).unwrap();
+        v.push(resp_old);
+    }
+    // speedtest 服务端请求 JSON 骨架（第二道门 高-4：parse_request 服务端半边接线）
+    v.push(br#"{"role":"recv","warmup_ms":2000,"window_ms":10000}"#.to_vec());
+    v.push(br#"{"role":"a,b \"x\"","warmup_ms":1,"window_ms":2}"#.to_vec());
     // STUN 骨架
     v.push(homeway_core::server::egress::stun_request(&[3u8; 12], "fuzz"));
     // token 串
@@ -144,9 +182,14 @@ fn fuzz_leg_frame() {
         let _ = frame::decode_frame(&b);
         let _ = frame::decode_tagged(&b);
         let _ = frame::decode_batch(&b);
-        if let Ok(s) = String::from_utf8(b.clone()) {
-            let _ = frame::decode_hint_payload(s.as_bytes());
+        // 真实调用形态（第二道门 低-23）：decode_batch 的消费者拿的是 decode_frame
+        // 剥壳后的 payload（type=4 容器），不是整帧——两形态都打
+        if let Some((kind, payload)) = frame::decode_frame(&b) {
+            if kind == 4 {
+                let _ = frame::decode_batch(payload);
+            }
         }
+        let _ = frame::decode_hint_payload(&b);
         let _ = homeway_core::relaywire::decode_relay_reg_frame(&b);
     }
 }
@@ -233,6 +276,11 @@ fn fuzz_speedtest() {
         let b = gen_input(&mut rng, &sd);
         let _ = speedtest::decode_frame(&b);
         let _ = speedtest::parse_report(&b);
+        // 服务端半边（第二道门 高-4：请求 JSON 手解面——引号感知切分的服务端形态）
+        if let Some(req) = homeway_core::speedtest_server::parse_request(&b) {
+            assert!(!req.role.is_empty(), "parse_request 不变量：role 空即 None");
+            assert!(req.role.len() <= b.len(), "role 长度不可能超过输入（输出上界）");
+        }
     }
     // 往返一致（oracle-c）：合法帧 encode→decode→字段重组 encode 字节稳定
     // （控制帧头 + 载荷 crc——借 r5_vectors 的手搓形态，抽 1k 轮）
@@ -300,12 +348,18 @@ fn fuzz_dns() {
     for _ in 0..ITER {
         let b = gen_input(&mut rng, &sd);
         let _ = dp::qtype(&b);
-        let _ = dp::empty_response(&b);
+        if let Some(resp) = dp::empty_response(&b) {
+            assert!(resp.len() <= b.len(), "empty_response = 12B 头 + question 回显（输出上界）");
+        }
         let mut m = b.clone();
         dp::clamp_ttl(&mut m, 60);
+        assert!(m.len() == b.len(), "clamp_ttl 原地改写不增字节");
         let _ = dp::count_aaaa(&m);
-        let _ = dp::truncate(&m, 1232);
-        let _ = dnsface::decode_tcp_frame(&b);
+        let t = dp::truncate(&m, 1232);
+        assert!(t.len() <= 1232, "truncate 输出不超过闸值（输出上界）");
+        if let Some(f) = dnsface::decode_tcp_frame(&b) {
+            assert!(f.len() <= 65535 && f.len() + 2 <= b.len(), "TCP 分帧载荷上界");
+        }
     }
 }
 
@@ -319,9 +373,12 @@ fn fuzz_inner_pkt() {
     for _ in 0..ITER {
         let b = gen_input(&mut rng, &sd);
         if let Some(v) = Ipv4View::parse(&b) {
-            // 解析成功 ⇒ 头部字段自洽（头长 ≥20 且不越界、载荷切片在界内）
-            assert!(v.header_len >= 20, "ihl 荒值：{}", v.header_len);
-            assert!(v.header_len <= b.len(), "头长越界：{} > {}", v.header_len, b.len());
+            // 解析成功 ⇒ 字段与载荷切片自洽（第二道门 低-16：只重复 parse 的守卫是
+            // 恒真断言——这里钉「载荷是 total_len 段的后缀、头+L4+载荷不越 total_len」）
+            assert!(v.header_len >= 20 && v.header_len <= b.len(), "头长越界");
+            assert!(v.total_len <= b.len(), "总长越界：{} > {}", v.total_len, b.len());
+            assert!(v.header_len + v.payload.len() <= v.total_len, "头+L4+载荷越出 total_len");
+            assert!(b[..v.total_len].ends_with(v.payload), "载荷切片必须是 total_len 段的后缀");
         }
     }
 }
@@ -335,8 +392,19 @@ fn fuzz_probe() {
     let sd = seeds();
     for _ in 0..ITER {
         let b = gen_input(&mut rng, &sd);
+        // 第二道门 高-3：nonce 门在载荷解析**之前**（probe.rs:142），固定 nonce 的
+        // 输入过不了闸 ⇒ 深层（端点计数/flags/列表段）等于没 fuzz。两条腿：
+        // ①固定 nonce（nonce 不匹配拒绝分支）；②nonce 从输入自身取（b ≥13B 时
+        // b[5..13]——服务端攻击面本来就是任意源全控字节，nonce 只是语义层校验）。
         let _ = probe::decode_response(&b, &[0x11; 8]);
-        let _ = probe::decode_response(&b, &[0; 8]);
+        if b.len() >= 13 {
+            let nonce: [u8; 8] = b[5..13].try_into().expect("已判 13B");
+            if let Ok(r) = probe::decode_response(&b, &nonce) {
+                assert!(r.endpoints.len() <= probe::MAX_ENDPOINTS, "端点列表超上限");
+                // from_utf8_lossy 的替换字符 1B→3B，上界按 3× 载荷段算（输出上界）
+                assert!(r.build.len() <= 3 * b.len().saturating_sub(13), "build 串超 lossy 上界");
+            }
+        }
     }
 }
 
@@ -350,9 +418,17 @@ fn fuzz_upnp() {
     for _ in 0..ITER {
         let b = gen_input(&mut rng, &sd);
         let s = String::from_utf8_lossy(&b).into_owned();
-        let _ = upnp::header_value(&s, "LOCATION");
+        if let Some(v) = upnp::header_value(&s, "LOCATION") {
+            assert!(v.len() <= s.len(), "header_value 输出不可能超过输入（输出上界）");
+        }
+        if let Some(v) = upnp::xml_tag(&s, "controlURL") {
+            assert!(v.len() <= s.len(), "xml_tag 输出不可能超过输入（输出上界）");
+        }
+        if let Ok((host, port, path)) = upnp::parse_http_url(&s) {
+            assert!(host.len() + path.len() + 6 <= s.len(), "URL 三段不可能超过输入（输出上界）");
+            assert!(port > 0, "URL 端口为 0");
+        }
         let _ = upnp::header_value(&s, "ST");
-        let _ = upnp::xml_tag(&s, "controlURL");
         let _ = upnp::xml_tag(&s, "NewExternalPort");
         let _ = upnp::parse_http_url(&s);
     }
@@ -368,30 +444,72 @@ fn fuzz_upnp() {
 #[test]
 #[ignore = "fuzz 全量档"]
 fn fuzz_fixture_expectations() {
-    // token 正样本（真 token 经 decode 成功）
+    let hex = |s: &str| -> Vec<u8> {
+        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+    };
+    let hex_str = |b: &[u8]| -> String { b.iter().map(|x| format!("{x:02x}")).collect() };
+    // token 正样本：逐字段比对（第二道门 中-11 整改——只数 n_ok 会被「什么都接受」
+    // 的解析器骗过；peer_id/secret/endpoints 全对 + 哨兵负例按码拒）
     let p = format!("{}/../../fixtures/vectors/token.json", env!("CARGO_MANIFEST_DIR"));
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
-    let mut n_ok = 0;
     for c in v["cases"].as_array().unwrap() {
-        if let Some(tok) = c["token"].as_str() {
-            if token::decode(tok).is_ok() {
-                n_ok += 1;
-            }
+        let tok = c["token"].as_str().unwrap();
+        let t = token::decode(tok)
+            .unwrap_or_else(|e| panic!("正样本应可解（{}）：{e}", c["name"]));
+        let want = &c["decoded"];
+        assert_eq!(
+            hex_str(t.peer_id.as_bytes()),
+            want["peer_id"].as_str().unwrap(),
+            "peer_id 逐字段（case={}",
+            c["name"]
+        );
+        assert_eq!(
+            hex_str(t.secret.as_bytes()),
+            want["secret"].as_str().unwrap(),
+            "secret 逐字段（case={}",
+            c["name"]
+        );
+        let weps = want["endpoints"].as_array().unwrap();
+        assert_eq!(t.endpoints.len(), weps.len(), "端点数（case={}", c["name"]);
+        for (ep, we) in t.endpoints.iter().zip(weps) {
+            assert_eq!(ep.addr, we["addr"].as_str().unwrap(), "端点地址（case={}", c["name"]);
+            let relay_want = we["relay"].as_bool().unwrap();
+            let relay_got = matches!(ep.kind, homeway_core::token::EndpointKind::Relay);
+            assert_eq!(relay_got, relay_want, "端点中继位（case={}", c["name"]);
         }
     }
-    assert!(n_ok >= 5, "token 正样本至少 5 例可解（得 {n_ok}）");
+    // token 负例：按期望哨兵码拒绝（unsupported_version/corrupted/malformed 三类）
+    for c in v["errors"].as_array().unwrap() {
+        let tok = c["input"].as_str().unwrap();
+        let err = token::decode(tok)
+            .err()
+            .unwrap_or_else(|| panic!("负例必须被拒（{}）：{tok}", c["name"]));
+        let got = match err {
+            token::TokenError::UnsupportedVersion { .. } => "unsupported_version",
+            token::TokenError::Corrupted => "corrupted",
+            token::TokenError::Malformed { .. } => "malformed",
+            _ => "other",
+        };
+        assert_eq!(got, c["error"].as_str().unwrap(), "负例哨兵码（case={}", c["name"]);
+    }
     // STUN 请求骨架往返（stun_sped 向量的首样本）
     let p2 = format!("{}/../../fixtures/vectors/stun_sped.json", env!("CARGO_MANIFEST_DIR"));
     let v2: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(p2).unwrap()).unwrap();
     let c = &v2["stun"]["requests"][0];
     let mut tx = [0u8; 12];
-    let unhex = |s: &str| -> Vec<u8> {
-        (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
-    };
-    tx.copy_from_slice(&unhex(c["txid"].as_str().unwrap()));
+    tx.copy_from_slice(&hex(c["txid"].as_str().unwrap()));
     assert_eq!(
         homeway_core::server::egress::stun_request(&tx, c["software"].as_str().unwrap()),
-        unhex(c["wire"].as_str().unwrap()),
+        hex(c["wire"].as_str().unwrap()),
         "骨架往返稳定"
     );
+}
+
+// ---------- ⑪ 迭代预算（quick 档可见——第二道门 低-15：≥100k 的量级在仓库内可断言） ----------
+
+#[test]
+fn fuzz_iteration_budget() {
+    // 九个重放目标的量级门（编译期断言——ITER 是常量；下调预算必须显式改这里）：
+    // cargo test --ignored 跑的就是这个 ITER，R5 判据口径 ≥100k。
+    const _: () = assert!(ITER >= 100_000, "fuzz 重放轨预算 < 100k（R5 判据口径）");
 }
