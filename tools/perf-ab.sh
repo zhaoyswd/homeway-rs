@@ -109,11 +109,16 @@ EOF
 }
 
 # Rust 客户端的 connect 需要 token——先占位起会被拒；改为拿 token 后再起。
+# 【R6 前置批 ⑤ 整改】token 一律铸 --loopback-only 变体：同机部署的出口按网卡自报
+# 端点（token 含 LAN IP），客户端赛跑随机采纳 LAN IP 时每包 UDP sendto 走 en0 环回
+# 路径（实测 18.3µs/包 vs lo0 5.5µs/包 = 3.3 倍——R5 轮的 down 0.42× 主因即此 artifact，
+# 不是实现栈差距）。A/B 公平口径 = 两侧同走 lo0（真机形态无此路径，跨网络物理直达）。
 setup_stack_rust_client() { # <side> <ep>
   local side="$1" ep="$2"
   local st="$BASE/$side"
   local TOK
   TOK=$("$RUST_BIN" serve token --state "$st/exit" | grep -o 'hmw1[A-Za-z0-9+/=_-]*' | head -1)
+  TOK=$("$RUST_BIN" token "$TOK" --loopback-only)
   nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$st/client/identity" --hold 3600 >> "$st/client.log" 2>&1 &
   echo $! > "$st/client.pid"
   echo "$TOK" > "$st/token"
@@ -126,8 +131,9 @@ sleep 3
 setup_stack_rust_client rrr 42667
 sleep 2
 
-# Go 客户端 host add
+# Go 客户端 host add（token 同铸 loopback-only——两侧同走 lo0 的公平对照，见上）
 GGG_TOK=$("$GO_BIN" serve token --state "$BASE/ggg/exit" | grep -o 'hmw1[A-Za-z0-9+/=_-]*' | head -1)
+GGG_TOK=$("$RUST_BIN" token "$GGG_TOK" --loopback-only)
 "$GO_BIN" host add --state "$BASE/ggg/client" --name perf "$GGG_TOK" || { echo "!! GGG host add 失败" >&2; }
 sleep 3
 
@@ -145,15 +151,60 @@ done) &
 RSS_POLLER=$!
 
 # ---------- 交替轮 ----------
-echo "==> 交替 3+3 轮（G,R,G,R,G,R；每轮 = 同会话一次 run，自带 warmup）"
+# 中-7 整改（R6 前置批 ④）：每轮跑完断言直连路径（非直连轮作废重跑，至多一次重试；
+# 两次仍中继即硬失败——200pps 中继限速混进 A/B 会让对照失真）。Go 侧判 daemon 会话
+# 日志的最新路径行；Rust 侧判 speedtest 会话自己的「路径确立」行。
+# 中-6 整改（R6 前置批 ④）：Rust 轮的 speedtest 是独立 CLI 进程——跑动期 1Hz 采其
+# RSS 以 rrr-client-cli 行入 rss.tsv（峰值口径，非常驻——报告列名区分）。
+assert_direct_gg() { # Go：speedtest 轮输出的「via=…（开跑时冻结）」行 = 该轮路径的权威口径
+  # （实测首拍赛跑可落中继、随后自愈回直连——daemon 日志的残留路径行会误判，弃用）
+  grep -m1 -E 'via=(direct|relay)' "$1" 2>/dev/null | grep -q 'via=direct'
+}
+assert_direct_rr() { # Rust：本轮输出文件里的会话路径行
+  grep -E '路径确立：|link: via=' "$1" 2>/dev/null | grep -m1 -qE '直连|via=direct'
+}
+echo "==> 交替 3+3 轮（G,R,G,R,G,R；每轮 = 同会话一次 run，自带 warmup；直连断言）"
 for i in 1 2 3; do
-  # Go 轮
-  G_OUT=$("$GO_BIN" speedtest --state "$BASE/ggg/client" -host perf 2>&1 | grep -E '精确值' | tail -1)
+  # Go 轮（≤2 次尝试）
+  G_OUT="" G_TRY=0
+  while (( G_TRY < 2 )); do
+    G_TRY=$(( G_TRY + 1 ))
+    "$GO_BIN" speedtest --state "$BASE/ggg/client" -host perf > "$BASE/ggg/round-$i.log" 2>&1
+    if assert_direct_gg "$BASE/ggg/round-$i.log"; then
+      G_OUT=$(grep -E '精确值' "$BASE/ggg/round-$i.log" | tail -1)
+      break
+    fi
+    echo "  G$i 第${G_TRY}次落中继——作废重跑" >&2
+  done
+  if [[ -z "$G_OUT" ]]; then
+    echo "!! G$i 两轮均非直连——A/B 失真，中止（先排查 hint/端点）" >&2; exit 1
+  fi
   echo "G$i|$G_OUT" >> "$BASE/rounds.tsv"
   echo "  G$i: $G_OUT"
-  # Rust 轮
+  # Rust 轮（≤2 次尝试；CLI 进程 RSS 并入采样）
   RRR_TOK=$(cat "$BASE/rrr/token")
-  R_OUT=$(cd "$BASE/rrr" && "$RUST_BIN" speedtest --token "$RRR_TOK" --identity-dir "$BASE/rrr/client/identity" --rounds 1 2>&1 | grep -E 'round 1' | tail -1)
+  R_OUT="" R_TRY=0
+  while (( R_TRY < 2 )); do
+    R_TRY=$(( R_TRY + 1 ))
+    (cd "$BASE/rrr" && "$RUST_BIN" speedtest --token "$RRR_TOK" --identity-dir "$BASE/rrr/client/identity" --rounds 1 > "$BASE/rrr/round-$i.log" 2>&1) &
+    local_cli=$!
+    (while kill -0 $local_cli 2>/dev/null; do
+      rss=$(ps -o rss= -p $local_cli 2>/dev/null | tr -d ' ')
+      [[ -n "$rss" ]] && printf '%s\t%s\t%s\t%s\n' "$(date +%s)" "rrr-client-cli" "$rss" "run" >> "$BASE/rss.tsv"
+      sleep 1
+    done) &
+    local_poll=$!
+    wait $local_cli
+    kill $local_poll 2>/dev/null
+    if assert_direct_rr "$BASE/rrr/round-$i.log"; then
+      R_OUT=$(grep -E 'round 1' "$BASE/rrr/round-$i.log" | tail -1)
+      break
+    fi
+    echo "  R$i 第${R_TRY}次落中继——作废重跑" >&2
+  done
+  if [[ -z "$R_OUT" ]]; then
+    echo "!! R$i 两轮均非直连——A/B 失真，中止" >&2; exit 1
+  fi
   echo "R$i|$R_OUT" >> "$BASE/rounds.tsv"
   echo "  R$i: $R_OUT"
 done
@@ -165,9 +216,13 @@ echo "==> echo RTT（经隧道 200 次回显往返）"
 sleep 1
 python3 "$REPO_ROOT/tools/echo-rtt.py" 127.0.0.1 42900 200 > "$BASE/rtt-ggg.json"
 echo "  GGG: $(cat "$BASE/rtt-ggg.json")"
-# Rust 侧 portfwd（独立会话——RTT 面单连接，与会话竞速无关）
+# Rust 侧 portfwd（独立会话——RTT 面单连接，与会话竞速无关；直连断言同中-7：
+# 中继腿 RTT 会混入 200pps 排队，A/B 失真）
 (cd "$BASE/rrr" && nohup "$RUST_BIN" portfwd --token "$RRR_TOK" --identity-dir "$BASE/rrr/client/identity" --map 42901:$(lan_ip):42807 > "$BASE/rrr/portfwd.log" 2>&1 &)
 sleep 4
+if ! grep -E '路径确立：|link: via=' "$BASE/rrr/portfwd.log" 2>/dev/null | grep -m1 -qE '直连|via=direct'; then
+  echo "!! RTT 腿 portfwd 会话非直连——中止（RTT 对照失真）" >&2; exit 1
+fi
 python3 "$REPO_ROOT/tools/echo-rtt.py" 127.0.0.1 42901 200 > "$BASE/rtt-rrr.json"
 echo "  RRR: $(cat "$BASE/rtt-rrr.json")"
 
