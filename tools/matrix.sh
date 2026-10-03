@@ -480,8 +480,8 @@ base_segment() {
   dd if=/dev/urandom of="$LOCAL" bs=1048576 count=100 2>/dev/null
   local UP_SHA=$(sha256_of "$LOCAL")
   if [[ "$C" == go ]]; then
-    UP=$("$GO_BIN" files put --state "$st/c-main" --host "m$link" "$LOCAL" "/$RNAME" 2>&1 | tail -1)
-    DN=$("$GO_BIN" files get --state "$st/c-main" --host "m$link" "/$RNAME" -o "$st/dn-100mb.bin" 2>&1 | tail -1)
+    UP=$(tmo 150 "$GO_BIN" files put --state "$st/c-main" --host "m$link" "$LOCAL" "/$RNAME" 2>&1 | tail -1)
+    DN=$(tmo 150 "$GO_BIN" files get --state "$st/c-main" --host "m$link" "/$RNAME" -o "$st/dn-100mb.bin" 2>&1 | tail -1)
   else
     UP=$(tmo 120 "$RUST_BIN" files upload --token "$TOK" --identity-dir "$st/c-main/identity" "/$RNAME" "$LOCAL" 2>&1 | tail -1)
     DN=$(tmo 120 "$RUST_BIN" files download --token "$TOK" --identity-dir "$st/c-main/identity" "/$RNAME" "$st/dn-100mb.bin" 2>&1 | tail -1)
@@ -720,8 +720,8 @@ relay_segment() {
   fi
   local UP_SHA=$(sha256_of "$LOCAL") UP_OUT="" DN_OUT=""
   if [[ "$C" == go ]]; then
-    UP_OUT=$("$GO_BIN" files put --state "$st/c-main" --host "dead$link" "$LOCAL" "/$RNAME" 2>&1 | tail -1)
-    DN_OUT=$("$GO_BIN" files get --state "$st/c-main" --host "dead$link" "/$RNAME" -o "$st/dn-rl.bin" 2>&1 | tail -1)
+    UP_OUT=$(tmo 150 "$GO_BIN" files put --state "$st/c-main" --host "dead$link" "$LOCAL" "/$RNAME" 2>&1 | tail -1)
+    DN_OUT=$(tmo 150 "$GO_BIN" files get --state "$st/c-main" --host "dead$link" "/$RNAME" -o "$st/dn-rl.bin" 2>&1 | tail -1)
   else
     # files CLI 无 --endpoint-cache-dir（不识别会错位进 rest）——不带 = 会话无落盘缓存，
     # 竞速 token 端点（dead-direct 形态下恒中继），段级隔离天然成立
