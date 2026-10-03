@@ -71,16 +71,33 @@ RESULTS=()
 declare -a TABLE_ROWS=()
 FAILED=0
 
-record() { # record <链路> <判据> <PASS|FAIL> [摘录] [备注]
+# 第三态（R6 前置批 ③，R5 二轮 中-4 整改）：WARN = 降档但有独立功能证据绑定（同轮
+# 硬对账/单测钉行/在册最小复现），SKIP = 本轮形态不适用（设计行为/同机拓扑特有）。
+# 两者不进 FAILED（退出码仍只由 FAIL 决定），但不再伪装成 PASS——真回归会被第三态
+# 显式暴露出来（表尾带豁免计数）。
+EXEMPT_WARNS=0
+EXEMPT_SKIPS=0
+record() { # record <链路> <判据> <PASS|WARN|SKIP|FAIL> [摘录] [备注]
   local link="$1" crit="$2" st="$3" ex="${4:-}" note="${5:-}"
   TABLE_ROWS+=("$link|$crit|$st|$ex|$note")
-  if [[ "$st" == "FAIL" ]]; then
-    FAILED=1
-    echo "[$link] ✗ $crit —— $ex"
-    [[ -n "$ex" ]] && echo "$crit: $ex" >> "$MATRIX/$link/failures.log" 2>/dev/null
-  else
-    echo "[$link] ✓ $crit ${ex:+— ${ex:0:80}}"
-  fi
+  case "$st" in
+    FAIL)
+      FAILED=1
+      echo "[$link] ✗ $crit —— $ex"
+      [[ -n "$ex" ]] && echo "$crit: $ex" >> "$MATRIX/$link/failures.log" 2>/dev/null
+      ;;
+    WARN)
+      (( EXEMPT_WARNS++ ))
+      echo "[$link] ⚠ $crit（豁免·独立证据）— ${ex:0:80}"
+      ;;
+    SKIP)
+      (( EXEMPT_SKIPS++ ))
+      echo "[$link] - $crit（跳过·形态不适用）— ${ex:0:80}"
+      ;;
+    *)
+      echo "[$link] ✓ $crit ${ex:+— ${ex:0:80}}"
+      ;;
+  esac
   if (( FAIL_FAST )) && [[ "$st" == "FAIL" ]]; then
     echo "!! --fail-fast：停" >&2; finish_and_exit
   fi
@@ -491,8 +508,17 @@ base_segment() {
     done
   fi
   # 复核重试（独立 speedtest 会话，至多三轮、间隔 20s 冷却）：会话内 speedtest 在
-  # 多角色同机环境有偶发 connect 超时（最小复现实测 Go exit + 会话内 382/372Mbps
-  # 通过、L3 第五轮复核 407/354 命中——环境抖动不给判据红）
+  # 多角色同机环境有偶发 connect 超时（最小复现实证 Go exit + 会话内 382/372Mbps
+  # 通过、L3 第五轮复核 407/354 命中——环境抖动不给判据红）。
+  # 【R6 前置批 ① 根因修复】复核是独立 WG 会话，与常驻 c-main 同 identity 并发 =
+  # WG 单 peer keypair 链互踢（后到握手顶掉 current → 被踢方 15s 自愈 rekey 反踢；
+  # 轮 4/复跑 1 的 L3-F-100MB 双红 = 同族形态「写通道长时间无进展」，实验 A 复现
+  # 在册 docs/reviews/R6-pre.md）。Go 客户端 daemon 单会话无并发面；Rust 复核前停
+  # c-main，之后不重启（E10/E11 的 Rust 分支本就以 --dial 形态重启 c-main；F-100MB
+  # 的独立 files 会话在无并发窗口跑——双红根因消除）。
+  if [[ "$C" == rust && ( -z "$SP" || "$SP" == *失败* ) ]] && our_pid "$st/c-main/pid"; then
+    stop_pid "$st/c-main/pid"
+  fi
   local tries=0
   while [[ -z "$SP" || "$SP" == *失败* ]] && (( tries < 3 )); do
     tries=$((tries + 1))
@@ -505,11 +531,18 @@ base_segment() {
     # 同机多角色环境抖动降档：功能面由最小复现实证（Go exit + Rust 会话内 382/372Mbps
     # 与 L1 641/767 —— docs/reviews/R5.md 登记），定量面归 PERF-AB 多轮中位；矩阵内
     # connect 突发抖动（形式恒为「测速连接失败：连接超时」）不给判据红。
-    record "$link" E13-speedtest "PASS" "（环境抖动降档：四轮 timeout——功能面最小复现实证 + PERF-AB 量化；详见 R5.md 登记）" "E13-JITTER"
+    record "$link" E13-speedtest "WARN" "（环境抖动降档：四轮 timeout——独立证据 = 同轮 F-100MB/RL-files5MB sha256 硬对账行 + R5.md 在册最小复现 + PERF-AB 多轮中位）" "E13-JITTER"
   fi
   echo "$SP" >> "$st/perf.log"
 
   # files 100MB 对账（随机后缀——跨轮残留不可能掩盖失败）
+  # 【R6 前置批 ① 根因修复续】E13 会话内成功未走复核停 c-main 的链路在此补停——
+  # F-100MB 的独立 files 会话必须独占出口 peer 的 keypair 链（双会话同 identity
+  # 并发互踢 = 轮 4/复跑 1 的 L3 双红根因；单会话跨 rekey 健康度由
+  # tools/rekey-check.sh 钉死）。Go 客户端 daemon 单会话形态不受影响。
+  if [[ "$C" == rust ]]; then
+    stop_pid "$st/c-main/pid"
+  fi
   local RND="$RANDOM$RANDOM"
   local LOCAL="$st/up-100mb.bin" RNAME="mat-$link-$RND.bin"
   dd if=/dev/urandom of="$LOCAL" bs=1048576 count=100 2>/dev/null
@@ -577,7 +610,7 @@ base_segment() {
     # Rust exit 链路：Go forward 对断开连接「自然收口」（不强关——不发主动 FIN），
     # exit 侧 teardown 由 idle 回收（5min）触发 ⇒ 关闭行延后——teardown 的 E11 行
     # 由单测钉死（intercept 模块测试），Go exit 链路 15s 内全出（L1-L3 实测）。
-    record "$link" E11 "PASS" "（Rust exit 链路关闭行经 idle 回收延后——单测钉行；Go exit 链路实测即时出）" "E11-DEFERRED"
+    record "$link" E11 "WARN" "（Rust exit 链路关闭行经 idle 回收延后——独立证据 = intercept 模块单测钉死 teardown 行；Go exit 链路实测即时出）" "E11-DEFERRED"
   else
     record "$link" E11 "FAIL" "15s 内未见 transit 关闭行"
   fi
@@ -702,7 +735,7 @@ relay_segment() {
   if V=$(wait_line_from "$LOGF" '中继=true' "$CL0" 110); then
     record "$link" RL-rreg "PASS" "${V:0:100}"
   elif [[ "$R" == go ]]; then
-    record "$link" RL-rreg "PASS" "（Go relay 链路：hint 自愈快于首拍 RREG——首窗中继由 RL-via 证明，翻直连=预期自愈观测）" "GO-DESIGN"
+    record "$link" RL-rreg "SKIP" "（Go relay 链路：hint 自愈快于首拍 RREG——首窗中继由 RL-via 硬判证明，翻直连=预期自愈观测）" "GO-DESIGN"
   else
     record "$link" RL-rreg "FAIL" "110s 内未见 RREG 中继=true（Rust relay 链路应驻留）"
   fi
@@ -737,12 +770,12 @@ relay_segment() {
     # ——CLI 见 via=relay 即 ⚠️ 告警退出）。告警行即「经中继形态成立」的证据；
     # 数据面吞吐证据 = RL-files5MB 对账。
     if grep -q '链路走了中继' "$st/c-main/cache/client.log" 2>/dev/null; then
-      record "$link" RL-speedtest "PASS" "（Go 客户端设计拒绝中继 speedtest——⚠️ 告警行在册；数据面证据=RL-files5MB）" "GO-DESIGN"
+      record "$link" RL-speedtest "SKIP" "（Go 客户端设计拒绝中继 speedtest——⚠️ 告警行在册；数据面证据=RL-files5MB）" "GO-DESIGN"
     else
       record "$link" RL-speedtest "FAIL" "Go 客户端经中继 speedtest 无产出且无告警行"
     fi
   elif [[ "$E" == go ]]; then
-    record "$link" RL-speedtest "PASS" "（KNOWN-GAP：Go exit × 中继 speedtest 并发形态——数据面证据=RL-files5MB 对账；登记见矩阵头注/ROADMAP）" "KNOWN-GAP"
+    record "$link" RL-speedtest "SKIP" "（KNOWN-GAP：Go exit × 中继 speedtest 并发形态——数据面证据=RL-files5MB 对账；登记见矩阵头注/ROADMAP）" "KNOWN-GAP"
   else
     record "$link" RL-speedtest "FAIL" "经中继 speedtest 无产出（Rust exit 链路不应失败）"
   fi
@@ -790,7 +823,16 @@ relay_segment() {
     # 中断、服务端按取消语义清理 ⇒ download not_found。真机形态下 exit 打洞包到不了
     # NAT 后客户端（同机必达是测试拓扑特有），中继驻留稳定、此形态不发生；中继段
     # files 数据面证据 = L2/L3/L6 同判据 sha256 对账 + L5 upload 100%。
-    record "$link" RL-files5MB "PASS" "（SAMEHOST-LIMIT：exit 盲打致会话震荡中断流——upload 100% 在册；同判据经中继对账见本结果表；真机 NAT 下不发生）" "SAMEHOST-LIMIT"
+    # 降档签名（中-3 收紧）：upload 100% + download not_found + **当轮本表内同判据
+    # 存在 sha256 对账 PASS 行**（其它链路的经中继 files 数据面证据）——三者齐才 WARN，
+    # 否则 FAIL（真回归不吞）。
+    local XREF=""
+    XREF=$(printf '%s\n' "${TABLE_ROWS[@]}" | grep -E '^L[1-6]\|RL-files5MB\|PASS\|sha256' | head -1 | cut -d'|' -f1,3 | tr '|' ' ')
+    if [[ -n "$XREF" ]]; then
+      record "$link" RL-files5MB "WARN" "（SAMEHOST-LIMIT：exit 盲打致会话震荡中断流——upload 100% 签名在册；独立证据 = 本表同判据对账 [$XREF]；真机 NAT 下不发生）" "SAMEHOST-LIMIT"
+    else
+      record "$link" RL-files5MB "FAIL" "对账不符且无同判据交叉证据（up=${UP_SHA:0:12} dn=${DN_SHA:0:12}；详见 $st/rl-files.log）"
+    fi
   else
     record "$link" RL-files5MB "FAIL" "对账不符（up=${UP_SHA:0:12} dn=${DN_SHA:0:12}；详见 $st/rl-files.log）"
   fi
@@ -832,7 +874,11 @@ finish_and_exit() {
       echo "| $l | $c | $st | ${ex:-} | ${note:-} |"
     done
     echo
-    if (( FAILED )); then echo "**结论：FAIL**（失败详情 /tmp/homeway-rs-matrix/<链路>/failures.log）"; else echo "**结论：全绿**"; fi
+    if (( FAILED )); then
+      echo "**结论：FAIL**（失败详情 /tmp/homeway-rs-matrix/<链路>/failures.log；豁免未计入红：WARN $EXEMPT_WARNS / SKIP $EXEMPT_SKIPS）"
+    else
+      echo "**结论：全绿**（豁免：WARN $EXEMPT_WARNS / SKIP $EXEMPT_SKIPS——各降档的独立证据绑定见备注列）"
+    fi
   } > "$OUT_MD"
   echo "==> 结果表：$OUT_MD"
   (( FAILED )) && exit 1
