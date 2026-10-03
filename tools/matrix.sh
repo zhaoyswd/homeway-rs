@@ -514,11 +514,18 @@ base_segment() {
   local LOCAL="$st/up-100mb.bin" RNAME="mat-$link-$RND.bin"
   dd if=/dev/urandom of="$LOCAL" bs=1048576 count=100 2>/dev/null
   local UP_SHA=$(sha256_of "$LOCAL")
+  # --rate-limit 0（判据批十八，轮 4+复跑 L3 双红实证）：本判据 = 直连腿 100MB
+  # 完整性对账，不是节拍口径——直连腿是全拓扑最快腿，按腿标定即不限速（Go 缺省
+  # 2MiB/s 是「最慢预期腿之下」的保守值，回环直连无此约束）。且限速把 100MB 拉长
+  # 到 ~51s 会**横跨 WG rekey 窗口**——轮 4/复跑的 L3 均在 rekey 邻域断流（102/386
+  # 块两死亡点、形态同「写通道长时间无进展」；L2 同客户端同出口过 = 形态非确定），
+  # mid-transfer rekey stall（R1 族）登记 R6 前置批 P0。不限速形态 = 轮 1/2/3' 全绿
+  #（1-2s 传完不跨 rekey）。
   if [[ "$C" == go ]]; then
-    UP=$(tmo 150 "$GO_BIN" files put --state "$st/c-main" --host "m$link" "$LOCAL" "/$RNAME" 2>&1 | tail -1)
+    UP=$(tmo 150 "$GO_BIN" files put --state "$st/c-main" --host "m$link" --rate-limit 0 "$LOCAL" "/$RNAME" 2>&1 | tail -1)
     DN=$(tmo 150 "$GO_BIN" files get --state "$st/c-main" --host "m$link" "/$RNAME" -o "$st/dn-100mb.bin" 2>&1 | tail -1)
   else
-    UP=$(tmo 120 "$RUST_BIN" files upload --token "$TOK" --identity-dir "$st/c-main/identity" "/$RNAME" "$LOCAL" 2>&1 | tail -1)
+    UP=$(tmo 120 "$RUST_BIN" files upload --token "$TOK" --identity-dir "$st/c-main/identity" --rate-limit 0 "/$RNAME" "$LOCAL" 2>&1 | tail -1)
     DN=$(tmo 120 "$RUST_BIN" files download --token "$TOK" --identity-dir "$st/c-main/identity" "/$RNAME" "$st/dn-100mb.bin" 2>&1 | tail -1)
   fi
   local DN_SHA=$(sha256_of "$st/dn-100mb.bin")
