@@ -512,6 +512,16 @@ impl UploadLimiter {
     }
 }
 
+impl UploadLimiter {
+    /// 读块粒度建议（发送平滑用）：`rate/8` 钳在 [16KiB, MAX_CHUNK]——缺省 2MiB/s
+    /// 恰为 MAX_CHUNK（Go 同读块形态，零行为差异）；低速率下自动细化为包级平滑
+    /// （R5 终验轮 3' 实证：250KB/s × 256KiB 整块放行在 200pps 准入闸同机拓扑下
+    /// 瞬时突发贴闸——每秒 8 个小块把突发压到 ~13 包/次）。
+    pub fn block_hint(&self) -> usize {
+        (self.rate as usize / 8).clamp(16 << 10, MAX_CHUNK)
+    }
+}
+
 /// ≤250ms 分片的 sleep（见 UploadLimiter 文档）。
 fn sleep_sliced(mut secs: f64) {
     while secs > 0.0 {
@@ -531,7 +541,9 @@ where
 {
     let mut s = Stream::open(sess, budget)?;
     s.call(&Request { op: "write", path, max_bytes: 0, mode: None, size })?;
-    let mut buf = vec![0u8; MAX_CHUNK];
+    // 读块粒度：无限速 = MAX_CHUNK（Go 同形）；有限速按 block_hint 细化（见其文档）
+    let block = limiter.as_ref().map_or(MAX_CHUNK, |l| l.block_hint());
+    let mut buf = vec![0u8; block];
     let mut total: u64 = 0;
     let mut on_progress = on_progress;
     loop {
@@ -690,6 +702,18 @@ mod tests {
             total_wait += w;
         }
         assert!(total_wait >= 0.9, "10×100B @1000B/s 至少要 ~1s 配额（得 {total_wait}）");
+    }
+
+    #[test]
+    fn upload_limiter_block_hint() {
+        // 缺省 2MiB/s：rate/8 = 256KiB = MAX_CHUNK（Go 同读块形态，零差异）
+        assert_eq!(UploadLimiter::new(DEFAULT_RATE_LIMIT).unwrap().block_hint(), MAX_CHUNK);
+        // 低速率：钳到 16KiB 下限（包级平滑——终验轮 3' 的贴闸形态整改）
+        assert_eq!(UploadLimiter::new(120_000).unwrap().block_hint(), 16 << 10);
+        // 250KB/s：rate/8 = 31250B（高于下限，原值通过——~25 包/块的平滑度）
+        assert_eq!(UploadLimiter::new(250_000).unwrap().block_hint(), 31_250);
+        // 中间速率：rate/8 原值（如 2MiB/s 的 1/4 → 64KiB）
+        assert_eq!(UploadLimiter::new(512 << 10).unwrap().block_hint(), 64 << 10);
     }
 
     #[test]

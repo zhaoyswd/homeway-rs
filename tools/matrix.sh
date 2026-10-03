@@ -754,16 +754,16 @@ relay_segment() {
     dd if=/dev/urandom of="$LOCAL" bs=1048576 count=5 2>/dev/null
   fi
   local UP_SHA=$(sha256_of "$LOCAL") UP_OUT="" DN_OUT=""
-  # --rate-limit 250000（判据批十六，2026-10-03 轮 2 实证 L3+L6 双命中）：中继腿
-  # 200pps 准入闸 ≈ 280KB/s 有效上行容量——发送端速率义务按腿标定是 Go 的设计用法
-  #（files-cli 1.4：缺省 2MiB/s 是直腿保守值，「按最慢腿一半以下修订」）。Rust 侧
-  # 缺发送端限速曾致 bulk 冲闸塌速（upload「写通道长时间无进展」中止——Go relay
-  # 同命中，非 relay 实现问题；UploadLimiter 已移植，批十六两侧统一切到标定值）。
-  # 5MB @250KB/s ≈ 20s（tmo 150 界内、看门狗恒有进展不触发）。
+  # --rate-limit 120000（判据批十七，轮 3' 实证 250000 仍贴闸）：中继 200pps 准入闸
+  # 按 MSS≈1220B 折算 ≈ 244KB/s——250KB/s 标定恰在闸上方（轮 3' 的 L3+L6 均在此
+  # 塌速：开局即持续丢包进重传螺旋，出口侧只收到 6 整块）。120KB/s ≈ 98pps 留双倍
+  # 余量；配合 UploadLimiter::block_hint（低速率自动细化读块到 16KiB = 包级平滑）
+  # 5MB @120KB/s ≈ 43s（tmo 150 界内、看门狗恒有进展不触发）。发送端速率义务按腿
+  # 标定是 Go 的设计用法（files-cli 1.4：缺省 2MiB/s 是直腿保守值，「按最慢腿一半
+  # 以下修订」）。
   # 数组形态（第二道门 高-2：zsh 对无引号 $SCALAR 不做词分割——裸 $RLIM 会作为
-  # 单个 argv "--rate-limit 250000" 传下去，Go 报未知 flag、Rust 错位进位置参数，
-  # 全链路 RL-files5MB 必红）。
-  local -a RLIM=(--rate-limit 250000)
+  # 单个 argv 传下去，Go 报未知 flag、Rust 错位进位置参数，全链路必红）。
+  local -a RLIM=(--rate-limit 120000)
   if [[ "$C" == go ]]; then
     UP_OUT=$(tmo 150 "$GO_BIN" files put --state "$st/c-main" --host "dead$link" "${RLIM[@]}" "$LOCAL" "/$RNAME" 2>&1 | tail -1)
     DN_OUT=$(tmo 150 "$GO_BIN" files get --state "$st/c-main" --host "dead$link" "/$RNAME" -o "$st/dn-rl.bin" 2>&1 | tail -1)
@@ -783,7 +783,7 @@ relay_segment() {
     # 中断、服务端按取消语义清理 ⇒ download not_found。真机形态下 exit 打洞包到不了
     # NAT 后客户端（同机必达是测试拓扑特有），中继驻留稳定、此形态不发生；中继段
     # files 数据面证据 = L2/L3/L6 同判据 sha256 对账 + L5 upload 100%。
-    record "$link" RL-files5MB "PASS" "（SAMEHOST-LIMIT：exit 盲打致会话震荡中断流——upload 100% 在册；同判据 L2/L3/L6 对账通过；真机 NAT 下不发生）" "SAMEHOST-LIMIT"
+    record "$link" RL-files5MB "PASS" "（SAMEHOST-LIMIT：exit 盲打致会话震荡中断流——upload 100% 在册；同判据经中继对账见本结果表；真机 NAT 下不发生）" "SAMEHOST-LIMIT"
   else
     record "$link" RL-files5MB "FAIL" "对账不符（up=${UP_SHA:0:12} dn=${DN_SHA:0:12}；详见 $st/rl-files.log）"
   fi
