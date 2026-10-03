@@ -60,24 +60,26 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 | **R7** | APP 接入（napi-rs 或 C-ABI 胶水 + OHOS 交叉 + 20 导出面 + hostsession） | 未开始 | — |
 | **R8** | 终测收官（包体/性能终测 + 共存定案 + 文档指针补录） | 未开始 | — |
 
-**下一步（当前指针）**：**R6 term 服务面（先清前置批）**。R5 已收官（2026-10-03，
-两道门全过）：第 1 会话完成技术评审 v2（7高/12中/7低）+ 5d1/5d2/5b/5e + 5a 调试
-五轮；第 2 会话判据批六至十五；第 3 会话（收口）完成矩阵终验（轮 4 六链路 +
-L3 最小复跑全绿——批十六/十七/十八三迭代：UploadLimiter 移植 + 贴闸标定
-120KB/s + 直连腿按腿标定）+ PERF-AB 四维入库 + ci-local 一键门修通全绿 +
-第二道门两轮（4高/15中/18低全处置）。评审记录 = `docs/reviews/R5.md`；
-性能报告 = `docs/PERF-AB.md`。**R6 前置批清单（R5 登记/留档项，先清再进 term
-主体）**：①mid-transfer rekey stall（**P0**：>30s 上传必跨 WG rekey 窗口、
-轮 4+复跑两次断流实证——R7 APP 前必须查清）；②KNOWN-GAP：Go exit × Rust
-relay × speedtest 经中继并发形态（缺口限定 4 流突发）；③矩阵判据第三态
-SKIP/WARN + 降档与独立功能证据绑定（中-3/4：SAMEHOST-LIMIT 收紧、E13-JITTER/
-E11-DEFERRED 不再无条件 PASS）；④perf-ab 采样纳入 CLI 进程 + 轮次路径断言
-（中-6/7）；⑤下行吞吐 0.42× 挂账深挖（PERF-AB §6.1：Rust 出口 bulk 发送路径）
-+ echo RTT +6.3ms 优化候选（§6.2，可归 R8）；⑥check-vocab 低危清账（死分支/
-tier 路径硬编码）；⑦RRR 全链路 RL-files5MB 复验（令牌桶后形态闭环——批十七
-参数下未单独复跑，L2/L3/L6 已覆盖同款客户端面）。R2 登记残余：tunStatusJSON
-完整键面归 R7、低-4/低-7 残余/低-10 精确形态/中-10③ 挂账归属期见
-docs/reviews/R2.md 豁免表。
+**下一步（当前指针）**：**R6 term 服务面主体**（前置批已清，见下方处置表；接棒从
+本节「R6 前置批处置」读起，然后进 R6 期小节）。R5 已收官（2026-10-03，两道门全过，
+评审记录 = `docs/reviews/R5.md`、性能报告 = `docs/PERF-AB.md`）。
+
+**R6 前置批处置（2026-10-04 收口，评审记录 = `docs/reviews/R6-pre.md`）**：
+| # | 项 | 处置 | 判据证据 |
+|---|---|---|---|
+| ① | rekey stall **P0** | **根因收口（非 boringtun/wireguard-go 缺陷，R5 假设推翻）**：断流 = 测试形态**双会话互踢**——矩阵常驻 connect 与独立 files CLI 同 identity 并发，wireguard-go 单 peer 一条 keypair 链（current/previous/next），后到握手经 ReceivedWithKeypair 顶掉 current ⇒ 被踢方出口→客户端方向黑洞 ⇒ 15s 自愈 rekey 反踢 ⇒「写通道长时间无进展」。产品形态（单进程常驻会话）无此问题，R7 无阻塞。实验 A 复现互踢（日志逐字对齐轮 4 双红）；实验 C 单会话 400MB@2MiB/s=205s 跨 120s rekey 精确触发零断流对账 0 | `tools/rekey-check.sh`（常跑判据：peer 过滤 + rekey 时间窗断言 + sha256 对账；run3 PASS 400MB/215s）；matrix.sh 消除双会话并发窗口；L3 修复后连续三轮 F-100MB 过闸 |
+| ⑤ | down 0.42× | **挂账关闭**：根因 = 同机拓扑 endpoint 采纳 artifact（LAN IP 的 en0 环回 sendto 18.3µs/包 vs lo0 5.5µs/包，微基准实证）；公平口径（两侧 --loopback-only token）重测 **down 0.79× / up 1.39× 全部界内**；PERF-AB §8 入库 | `tools/perf-ab.sh` v2（loopback-only + 每轮直连断言 + CLI RSS 采样）；次因（单驱动线程串行 76% sendto）登记 R8（真机 Linux/OHOS 有 sendmmsg） |
+| ② | KNOWN-GAP speedtest 并发 | **转正为两侧共有形态限制**：干净最小拓扑实测 Rust「连接超时」/Go「通道错误 interrupted」同样失败、exit 侧受理完整；机制 = 200pps 每源防放大闸 × 4 流突发；非 Rust relay 缺陷 | 矩阵判据 SKIP 态 + 头注机制注记；files ≤120KB/s 闸内形态对账通过 |
+| ③ | 判据第三态 | record() 四态化（WARN=降档带独立证据绑定 / SKIP=形态不适用），五处降档改第三态；SAMEHOST-LIMIT 签名收紧（三条件 + 当轮动态交叉引用） | 全六链路轮实际生效（RL-rreg/RL-speedtest 走 SKIP、豁免计数入表尾） |
+| ④ | perf-ab 口径 | CLI 进程 RSS 纳入采样 + 每轮/RTT 腿直连断言（非直连作废重跑、两仍中继即中止） | v2 实跑（断言拦下过一轮中继 Go 轮并重跑命中） |
+| ⑥ | check-vocab 低危 | 死分支删除 + tier 路径去硬编码（兄弟仓相对 + 环境变量覆盖） | 词表门复跑 PASS |
+| ⑦ | RRR 复验 | 全六链路验收轮 + ci-local 七步全绿 + rekey-check 实跑；**顺带修**：Go 客户端 F-100MB 回缺省 2MiB/s（--rate-limit 0 冲爆 daemon 收流缓冲，L1/L4/L5 全红实证；L1 重验全绿 886s） | ci-local 全绿（02:08:01）；六链路 = Rust 三链全绿 + Go 三链修正后 L1 重验绿 |
+
+R2 登记残余：tunStatusJSON 完整键面归 R7、低-4/低-7 残余/低-10 精确形态/中-10③
+挂账归属期见 docs/reviews/R2.md 豁免表。**评审新增遗留**：Rust CLI 的
+files/speedtest 动词与常驻 connect 同 identity 并发的产品面 foot-gun（CLI 无
+检测/警告，Go daemon 结构上无此面）——归 R7 CLI 面治理（与 hostsession/常驻会话
+设计一并定）。
 
 依赖：R0→R1→R2→{R3, R4 可并行}→R5→R6→R7（**需发版会话收官 + 用户点头**）→R8。
 R4 最小可提前（不依赖 R1，只需 R0 夹具），但优先保 R1 主线。
