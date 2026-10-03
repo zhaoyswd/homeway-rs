@@ -50,13 +50,18 @@ fn cmd_token(args: &[String]) {
     // `token <hmw1…> --dead-direct`：解析后把 Direct 端点改指 127.0.0.1:1 重编码输出
     //（矩阵中继段的 Go 客户端注入缝——Go host add 无 dead-direct flag；crc4 无密钥
     // 重算即被两侧接受，评审确认可行）。与 --token 的注入语义一致（connect 侧）。
+    // `--loopback-only`：Direct 端点的非回环 IPv4 换 127.0.0.1 同端口（R6 前置批 ⑤
+    // 对照实验缝：同机拓扑里客户端赛跑可能采纳本机 LAN IP，出口发往它的 UDP 走
+    // en0 环回路径——实测 18.3µs/包 vs lo0 5.5µs/包（3.3 倍），强制回环可分离
+    //「endpoint 路径成本」与「实现栈成本」）。
     let dead_direct = args.iter().any(|a| a == "--dead-direct");
+    let loopback_only = args.iter().any(|a| a == "--loopback-only");
     let input = args.iter().find(|a| !a.starts_with("--")).cloned();
     let Some(s) = input else {
-        eprintln!("用法：homeway-cli token <hmw1…> [--dead-direct]");
+        eprintln!("用法：homeway-cli token <hmw1…> [--dead-direct] [--loopback-only]");
         std::process::exit(2);
     };
-    if dead_direct {
+    if dead_direct || loopback_only {
         let mut t = match token::decode(&s) {
             Ok(t) => t,
             Err(e) => {
@@ -66,7 +71,15 @@ fn cmd_token(args: &[String]) {
         };
         for e in &mut t.endpoints {
             if e.kind == token::EndpointKind::Direct {
-                e.addr = "127.0.0.1:1".to_owned();
+                if dead_direct {
+                    e.addr = "127.0.0.1:1".to_owned();
+                } else if let Some((_, port)) = e.addr.rsplit_once(':') {
+                    // 非回环 IPv4 → 127.0.0.1 同端口；IPv6 端点（含 ':'）不动——本缝
+                    // 只针对同机 LAN 形态
+                    if e.addr.split('.').count() == 4 && !e.addr.starts_with("127.0.0.1:") {
+                        e.addr = format!("127.0.0.1:{port}");
+                    }
+                }
             }
         }
         let eps: Vec<token::EndpointRef<'_>> =
