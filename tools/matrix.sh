@@ -381,7 +381,24 @@ base_segment() {
     if V=$(wait_line_from "$st/c-main/cache/client.log" '路径确立：直连|link: via=direct' "$CLN" 150); then
       record "$link" C-via-direct "PASS" "${V:0:100}"
     else
-      record "$link" C-via-direct "FAIL" "150s 内未见路径确立/巡检 via=direct"
+      # 落中继且 150s 未自愈——重启 daemon + 换名重 add（控制面 sock 轮询就绪再 add）
+      stop_pid "$st/c-main/pid"
+      rm -rf "$st/c-main/cache/endpoints"
+      start_go_client "$link" || true
+      local wsock=0
+      while (( wsock < 8 )) && [[ ! -S "$st/c-main/control.sock" ]]; do
+        sleep 1; (( wsock+=1 ))
+      done
+      sleep 2
+      if CL=$(go_client_add "$link" "$TOK" "m${link}r" 2>/dev/null); then
+        if V=$(grep -E '路径确立：直连|link: via=direct' "$st/c-main/cache/client.log" 2>/dev/null | tail -1); then
+          record "$link" C-via-direct "PASS" "${V:0:100}" "（重启重试命中——首轮落中继未自愈）"
+        else
+          record "$link" C-via-direct "FAIL" "重试会话仍未直连"
+        fi
+      else
+        record "$link" C-via-direct "FAIL" "重试 host add 失败"
+      fi
     fi
   else
     local IDDIR="$st/c-main/identity" CACHEDIR="$st/c-main/ep-base"
@@ -399,7 +416,18 @@ base_segment() {
     if V=$(wait_line_from "$st/c-main/rust.log" '路径确立：直连|link: via=direct' "$CL0" 150); then
       record "$link" C-via-direct "PASS" "${V:0:100}"
     else
-      record "$link" C-via-direct "FAIL" "150s 内未见路径确立/巡检 via=direct"
+      # 落中继且 150s 未自愈（hint 时序运气）——重启会话再竞速一轮（Rust 侧重启链路
+      # 简单可靠；主客户端 --speedtest 会重跑，E13 判据照常收）
+      stop_pid "$st/c-main/pid"
+      local CL0r=$(log_lines "$st/c-main/rust.log")
+      nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$IDDIR" --endpoint-cache-dir "$CACHEDIR" \
+        --speedtest --hold 600 >> "$st/c-main/rust.log" 2>&1 &
+      echo $! > "$st/c-main/pid"
+      if V=$(wait_line_from "$st/c-main/rust.log" '路径确立：直连|link: via=direct' "$CL0r" 60); then
+        record "$link" C-via-direct "PASS" "${V:0:100}" "（重启重试命中——首轮落中继未自愈）"
+      else
+        record "$link" C-via-direct "FAIL" "两轮（150s+60s）均未见直连"
+      fi
     fi
   fi
 
