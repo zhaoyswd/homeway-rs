@@ -19,7 +19,10 @@ set -uo pipefail
 
 REPO_ROOT="${0:h:A:h}"
 LEDGER="$REPO_ROOT/baseline/homeway/contracts/ledger.jsonl"
-MANIFEST="/Users/zhaozhe/Documents/projects/tier/tools/gen/vocab-manifest.json"
+# tier manifest（只读）：兄弟仓相对推导 + 环境变量覆盖口（R5 二轮 低-10 整改——原为
+# 本机绝对路径硬编码，换机即取不到；缺位仍由下方 [[ -f ]] fail-closed 拦截）
+TIER_ROOT="${HOMEWAY_TIER_ROOT:-$REPO_ROOT/../tier}"
+MANIFEST="$TIER_ROOT/tools/gen/vocab-manifest.json"
 BASELINE_MD="$REPO_ROOT/docs/BASELINE.md"
 
 [[ -f "$LEDGER" ]] || { echo "!! ledger 不在（baseline 克隆缺失）" >&2; exit 1; }
@@ -107,13 +110,9 @@ for unit, values in sorted(rust.items()):
     for v in sorted(values):
         if v in lv:
             continue
-        key = (unit, v)
-        if key in ALLOWED_ABSENT:
-            # Rust **声明了**该值但 ledger 按面过滤后没有——缺席表是给「ledger 有
-            # Rust 无」的方向用的；这里反向：Rust 产出了一个 ledger 不认识的值 = 红
-            errors.append(f"{unit}: Rust 值 {v!r} 不在 ledger 过滤后值集（ledger 全态：{sorted(lv)}）")
-        else:
-            errors.append(f"{unit}: Rust 值 {v!r} 不在 ledger 过滤后值集（ledger 全态：{sorted(lv)}）")
+        # 反向不豁免（R5 二轮 低-9 整改：原 if/else 两臂同一 append 是死分支）——
+        # 缺席表只服务「ledger 有 Rust 无」的方向；Rust 产出 ledger 不认识的值恒红
+        errors.append(f"{unit}: Rust 值 {v!r} 不在 ledger 过滤后值集（ledger 全态：{sorted(lv)}）")
     # ③ legacy-unreachable 相交 = 空（按全 ledger 查——不看 faces 过滤，防面掩蔽）
     fam, _, uname = unit.partition('/')
     legacy = {r.get('value') for r in recs
