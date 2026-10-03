@@ -55,23 +55,29 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 | **R2** | 客户端全量（行为对齐 + 中继腿 + files/portfwd + facade 预留） | **完成**（2026-10-02） | 7/7 |
 | **R3** | 出口（多 peer WG device + 拦截层 + files/DNS/STUN/UPnP + servercore） | **完成**（2026-10-02：两道门全过 + 判据全量实测入册） | 6/6 步 |
 | **R4** | 中继（信封 + 准入 + 升级条纹） | **完成**（2026-10-03：两道门全过 + 三链路判据实测 + 升级条纹实测） | 4/4 步 |
-| **R5** | 互操作矩阵全量 + fuzz + 性能 A/B + 台账三方门 | 未开始 | — |
-| **R6** | term 服务面（协议/surface 产出/检测引擎 + 自建编码器/应答器） | 未开始 | — |
+| **R5** | 互操作矩阵全量 + fuzz + 性能 A/B + 台账三方门 | **完成**（2026-10-03：两道门全过〔两轮代码评审 4高/15中/18低全处置〕+ 终验轮 4 六链路 + L3 复跑全绿 + PERF-AB 入库 + ci-local 一键门全绿） | 6/6 步 |
+| **R6** | term 服务面（协议/surface 产出/检测引擎 + 自建编码器/应答器） | 未开始（有前置批，见 R6 节） | — |
 | **R7** | APP 接入（napi-rs 或 C-ABI 胶水 + OHOS 交叉 + 20 导出面 + hostsession） | 未开始 | — |
 | **R8** | 终测收官（包体/性能终测 + 共存定案 + 文档指针补录） | 未开始 | — |
 
-**下一步（当前指针）**：**R5 互操作矩阵 + 治理收口**（matrix.sh 全组合编排 + fuzz +
-性能 A/B + 台账三方门；R4 顺带的登记项一并入批：enum Auth 类型化、出口侧测试扩展到
-Go 对照面全套、中继吞吐量化——同机 200pps 防放大限速为 Go 同值的固有锚）。R4 已收官
-（2026-10-03 两道门全过）：第 1 会话完成技术评审 v2（1 高/6 阻塞全整改）+ 4a 全量
-（relaywire golden 向量族/relay 本体单驱动线程/TCP 控制面/rl1 CLI）+ 4b 条纹两处实错
-修正 + 4c exit 注册腿全量接线 + 4d 三链路实测（联调修三个实测 bug：leg_readable 丢弃
-Inbound/控制面读循环阻塞保活/cookie 认证借用）+ 升级条纹实测 + 判据入册 + 第二道门
-（1 高/4 中/10 低全处置）。完成证据见下方 R4 节；评审记录 = `docs/reviews/R4.md`。
-R5 批登记（R4 豁免/顺带）：M3 TCP DNS 腿、M8 残余（SSDP 组播三件套）、M11 UPnP ctx、
-M20 STUN/SPED golden、M23 错误类型化、M24 客户端 speedtest 归因、R4-§7.8 enum Auth、
-中继吞吐量化。R2 登记：tunStatusJSON 完整键面归 R7、低-4/低-7 残余/低-10 精确形态/
-中-10③ 挂账归属期见 docs/reviews/R2.md 豁免表。
+**下一步（当前指针）**：**R6 term 服务面（先清前置批）**。R5 已收官（2026-10-03，
+两道门全过）：第 1 会话完成技术评审 v2（7高/12中/7低）+ 5d1/5d2/5b/5e + 5a 调试
+五轮；第 2 会话判据批六至十五；第 3 会话（收口）完成矩阵终验（轮 4 六链路 +
+L3 最小复跑全绿——批十六/十七/十八三迭代：UploadLimiter 移植 + 贴闸标定
+120KB/s + 直连腿按腿标定）+ PERF-AB 四维入库 + ci-local 一键门修通全绿 +
+第二道门两轮（4高/15中/18低全处置）。评审记录 = `docs/reviews/R5.md`；
+性能报告 = `docs/PERF-AB.md`。**R6 前置批清单（R5 登记/留档项，先清再进 term
+主体）**：①mid-transfer rekey stall（**P0**：>30s 上传必跨 WG rekey 窗口、
+轮 4+复跑两次断流实证——R7 APP 前必须查清）；②KNOWN-GAP：Go exit × Rust
+relay × speedtest 经中继并发形态（缺口限定 4 流突发）；③矩阵判据第三态
+SKIP/WARN + 降档与独立功能证据绑定（中-3/4：SAMEHOST-LIMIT 收紧、E13-JITTER/
+E11-DEFERRED 不再无条件 PASS）；④perf-ab 采样纳入 CLI 进程 + 轮次路径断言
+（中-6/7）；⑤下行吞吐 0.42× 挂账深挖（PERF-AB §6.1：Rust 出口 bulk 发送路径）
++ echo RTT +6.3ms 优化候选（§6.2，可归 R8）；⑥check-vocab 低危清账（死分支/
+tier 路径硬编码）；⑦RRR 全链路 RL-files5MB 复验（令牌桶后形态闭环——批十七
+参数下未单独复跑，L2/L3/L6 已覆盖同款客户端面）。R2 登记残余：tunStatusJSON
+完整键面归 R7、低-4/低-7 残余/低-10 精确形态/中-10③ 挂账归属期见
+docs/reviews/R2.md 豁免表。
 
 依赖：R0→R1→R2→{R3, R4 可并行}→R5→R6→R7（**需发版会话收官 + 用户点头**）→R8。
 R4 最小可提前（不依赖 R1，只需 R0 夹具），但优先保 R1 主线。
@@ -343,7 +349,43 @@ Rust exit 全判据绿；Rust exit ↔ Rust client 闭环；`intercept: …（di
 - 5-c/5-f 脚本就位待跑（perf-ab.sh + echo-rtt.py + ci-local.sh）。
 - **接棒指针**：全量矩阵两轮收口 → PERF-AB 数据 → 第二道门 → ROADMAP 勾选。
 
+**完成证据（2026-10-03，两道门全过）**：
+- **5-a 矩阵终验**（判据批十六/十七/十八三迭代收口）：终验轮 4（批十七口径，
+  20:21–21:58 全六链路）L1/L2/L4/L5/L6 TOTAL 全绿 + **轮 2/3' 连红的 L3/L6 的
+  RL-files5MB 均过闸**（sha256 硬对账）；唯一红项 L3-F-100MB = mid-transfer
+  rekey stall（根因证据 + 批十八直连腿按腿标定 + L3 复跑 2 **TOTAL 全绿** 842s）。
+  **贴闸标定数学**：200pps 闸 @MSS≈1220B ≈ 244KB/s——250KB/s=205pps 恰在闸上
+  （轮 3' L3/L6 塌速）、120KB/s=98pps 双倍余量 + block_hint 16KiB 平滑全过。
+  完整轮次审计与在册形态清单 = `docs/reviews/R5.md`「5-a 终验完成证据」节。
+- **5-b fuzz**：双轨九目标 ≥100k（replay 全量档 + cargo-fuzz ASAN）；第二道门
+  两轮整改后高-3/高-4 复核通过（probe 深层可达/服务端半边接线）、两改目标
+  ASAN 100k 复跑零 crash 零 artifact；种子 79 个九目标全覆盖（含手工样本）。
+- **5-c PERF-AB**：`docs/PERF-AB.md` 四维入库——吞吐 GGG/RRR 两轮×3 交替
+  （down 0.42× 超阈挂账归因 = Rust 出口 bulk 发送路径；up 0.53× 界内）、echo
+  RTT p50 0.13/6.5ms（恒定粒度挂账 §6.2）、RSS 三角色 0.02–0.20×（PASS）、
+  体积 3.5MB vs 22.3MB（0.16×；dylib 口径归 R7 复测）。
+- **5-d1/5-d2**：低-4 双侧/M24/enum Auth/M23；M3 TCP DNS 腿/M8 SSDP/M11 UPnP
+  deadline/files busy 闸/M20 golden/出口侧 Go 对照/SUMS 修复。
+- **5-e 词表门**：`tools/check-vocab.sh` PASS（5 单元/26 值；ledger sha 锚定
+  fail-closed 化）。
+- **5-f ci-local**：一键门修通（第 7 步引号 bug 从未跑通 + 冒烟档收窄回设计
+  基础段）+ 4.5 种子摘要门（基准 `7db8ab4b…`）；**全绿实跑记录**（147 lib +
+  20 集成、clippy all-targets 0、向量确定性、词表、release、矩阵冒烟）。
+- **第二道门**：两轮 dsh 外部评审（4高/15中/18低）全处置——必修面全修含
+  本会话自引入两高（await_quota 死循环/批十六 zsh 拆词）；4 中危 + 2 低危
+  登记留档进 R6 前置批。逐条处置表 = `docs/reviews/R5.md` 第二道门节。
+- 交付件：`tools/matrix.sh`（19 判据/链路 + 三口径备注族 + 互斥锁）、
+  `tools/perf-ab.sh` + `tools/echo-rtt.py`、`tools/ci-local.sh`、
+  `tools/check-vocab.sh`、`tools/gen-fuzz-seeds.sh` + `fuzz/corpus.seeds.sha256`、
+  `fuzz/` 九目标、`docs/PERF-AB.md`、`docs/matrix-latest.md`。
+- **R6 前置批移交**：见「下一步（当前指针）」七项（rekey stall 为 P0）。
+
 ## R6 term 服务面（估 12–18 会话日，最大单项）
+
+> **前置批（R5 移交，先清再进主体；清单见「下一步（当前指针）」）**：①rekey
+> stall P0（>30s 上传跨 WG rekey 窗口断流——真机 R7 前必须查清）；②KNOWN-GAP
+> speedtest 并发形态深挖；③矩阵判据第三态与降档绑定；④perf-ab 口径补全；
+> ⑤下行吞吐 0.42× 深挖；⑥check-vocab 低危清账；⑦RRR 全链路复验。
 
 范围：alacritty_terminal 接入（Term + Damage + 模式位）→ **自建应答器**（DA1/DSR-CPR/DECRQM/
 OSC 10/11，~200 行）→ **自建键编码器**（kitty protocol 全编码/modifyOtherKeys/legacy 键表，
@@ -422,6 +464,17 @@ R7 8–12+真机；R8 2–3。全量 47–72。Rust 新增代码估 38–42k 行
 - 记忆（跨会话自动加载）：`tier-rust-port-poc-2026-10-01`、`tier-terminal-rust-port-gap`、
   `tier-rust-homeway-parallel-impl-cost`。
 - 发现的 Go 侧问题（登记不修）：本节随推进追加。
+
+## 附录 D：判据标定教训（随推进追加）
+
+1. **贴闸标定（R5 批十六→十七，2026-10-03）**：凡涉 **pps 闸**的判据标定（限速、
+   发送速率、突发），必须先把 bytes/s 标定值**除以 MSS 折算成每秒包数**再与闸比——
+   中继准入闸 200pps @MSS≈1220B ≈ 244KB/s，250KB/s「看起来很小」实为 205pps、
+   恰在闸上方（轮 3' 的 L3/L6 连续塌速：TCP 重传螺旋、看门狗中止）。正确口径 =
+   目标包速 ≤ 闸的一半（120KB/s ≈ 98pps 双倍余量），且发送侧用小块平滑
+   （UploadLimiter::block_hint）防整块放行的瞬时突发贴闸。同族提醒：跨窗形态
+   也要算——>~30s 的持续传输必然横跨 WG rekey 窗口（批十八教训，见 R6 前置批
+   rekey stall P0）。
   1. **G1（R0.4，2026-10-02）**：`pkg/proto.DecodeToken("hmw")` 对恰 3 字节 hmw 前缀串
      panic（`token.go:105` 的 `s[:4]` 越界，实测 `slice bounds out of range [:4] with length 3`）。
      对抗性输入面（用户粘贴残串可触）；Rust 侧已按安全语义返回 UnsupportedVersion
