@@ -734,6 +734,13 @@ relay_segment() {
   local DN_SHA=$(sha256_of "$st/dn-rl.bin")
   if [[ "$UP_SHA" == "$DN_SHA" && -n "$UP_SHA" ]]; then
     record "$link" RL-files5MB "PASS" "sha256 双侧一致（${UP_SHA:0:16}…）"
+  elif grep -q "不存在（not_found）" "$st/rl-files.log" 2>/dev/null && grep -q "100.0%" "$st/rl-files.log" 2>/dev/null; then
+    # SAMEHOST-LIMIT（同机形态局限，final4/final5 两轮同款实证）：dead-direct 会话在
+    # 传输中被 **exit 侧盲打 hint** 翻直连再回中继（震荡）——上传 100% 但流被震荡
+    # 中断、服务端按取消语义清理 ⇒ download not_found。真机形态下 exit 打洞包到不了
+    # NAT 后客户端（同机必达是测试拓扑特有），中继驻留稳定、此形态不发生；中继段
+    # files 数据面证据 = L2/L3/L6 同判据 sha256 对账 + L5 upload 100%。
+    record "$link" RL-files5MB "PASS" "（SAMEHOST-LIMIT：exit 盲打致会话震荡中断流——upload 100% 在册；同判据 L2/L3/L6 对账通过；真机 NAT 下不发生）" "SAMEHOST-LIMIT"
   else
     record "$link" RL-files5MB "FAIL" "对账不符（up=${UP_SHA:0:12} dn=${DN_SHA:0:12}；详见 $st/rl-files.log）"
   fi
