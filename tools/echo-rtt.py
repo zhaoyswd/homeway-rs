@@ -21,9 +21,10 @@ def main() -> None:
 
     lat = []
     fails = 0
-    s = socket.create_connection((host, port), timeout=10)
-    s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+    s = None
     try:
+        s = socket.create_connection((host, port), timeout=10)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         # 预热 5 次不在样本里（建连后首往返含调度冷启动）
         for _ in range(5):
             s.sendall(payload)
@@ -41,7 +42,8 @@ def main() -> None:
     except (OSError, ConnectionError):
         fails += 1
     finally:
-        s.close()
+        if s is not None:
+            s.close()
 
     lat.sort()
 

@@ -10,7 +10,9 @@
 #   6. cargo build --release -p homeway-cli           smoke 前置（G-10）
 #   7. tools/matrix.sh --smoke            RRR 基础段冒烟
 # 全量档：--full 加 cargo test --ignored（fuzz_replay 9 目标 × 100k）。
-# 预算：quick 热 target ≈3–5 分钟（smoke ≈2 分钟）；冷构建首轮显著更长。
+# 预算：quick 热 target ≈12–15 分钟（冒烟档实测 399s——R5-5f 收口实测值；冷构建首轮
+# 显著更长）。另：第 7 步依赖 bin/homeway-go（gitignore）——干净 clone 先
+# tools/local-exit.sh start 1 触发构建。
 set -uo pipefail
 
 REPO_ROOT="${0:h:A:h}"

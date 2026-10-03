@@ -56,10 +56,11 @@ if (( PERF )); then LINKS+=(GGG RRR); fi
 [[ -x "$RUST_BIN" ]] || { echo "==> cargo build --release -p homeway-cli" >&2; (cd "$REPO_ROOT" && cargo build --release -p homeway-cli) || exit 1; }
 [[ -x "$GO_BIN" ]] || { echo "!! $GO_BIN 不在（先 tools/local-exit.sh start 1 触发构建）" >&2; exit 1; }
 
-# 矩阵互斥锁（①-5）：mkdir 原子性足够（此前「双起」是调用侧两次显式 nohup 的
-# 失误、非 lock 失效；pgrep 进程扫在 wrapper shell 场景必假阳性——命令行含脚本路径
-# 文本即中，弃用）
-if ! mkdir -p "$MATRIX/.lock" 2>/dev/null; then
+# 矩阵互斥锁（①-5；第二道门 中-5 整改：`mkdir -p` 对已存在目录恒成功——锁形同
+# 虚设。改「先 -p 建父目录、再裸 mkdir 抢锁」——裸 mkdir 对已存在路径返回非 0，
+# 原子性足够；pgrep 进程扫在 wrapper shell 场景必假阳性，弃用）
+mkdir -p "$MATRIX"
+if ! mkdir "$MATRIX/.lock" 2>/dev/null; then
   echo "!! 矩阵已在跑（$MATRIX/.lock 占用）——并发运行会互踩端口/state" >&2
   exit 1
 fi
@@ -326,12 +327,31 @@ run_link() {
   # 注册腿（X1 两行 + L4/L5 首次方向加 OK-MAC/控制面已连）。grep 全文件：state 全新
   # （每链路 wipe），且注册行可能在「serve 就绪」等待窗内已打出（实测同秒）——
   # 行号起点法会漏。免陈旧行干扰由 wipe 保证。
-  if grep -q '中继：注册成功' "$st/exit/stdout.log" 2>/dev/null; then
-    record "$link" X1-reg "PASS" "$(grep '注册成功' "$st/exit/stdout.log" | tail -1 | cut -c1-100)"
-    grep -q '中继：后端.*注册成功' "$st/relay/cache/relay.log" 2>/dev/null || grep -q '注册成功' "$st/relay/stdout.log" 2>/dev/null \
-      && record "$link" R3-backend "PASS" || record "$link" R3-backend "PASS" "（中继侧行在 relay.log）"
+  # 第二道门低项：立即 grep 改 10s 等待窗（注册行稍晚几百毫秒就会假 FAIL）
+  local X1LINE=""
+  for _ in $(seq 1 20); do
+    X1LINE=$(grep '注册成功' "$st/exit/stdout.log" 2>/dev/null | tail -1)
+    [[ -n "$X1LINE" ]] && break
+    sleep 0.5
+  done
+  if [[ -n "$X1LINE" ]]; then
+    record "$link" X1-reg "PASS" "$(echo "$X1LINE" | cut -c1-100)"
+    # 中继侧行（第二道门 中-2 整改：原「grep A || grep B && PASS || PASS」两分支都记
+    # PASS——结构性恒真、判据信息量为零。改 10s 等待窗硬判；Rust relay 行在
+    # relay/cache/relay.log、Go relay 行在 stdout.log）
+    local R3LINE=""
+    for _ in $(seq 1 20); do
+      R3LINE=$(grep -h '注册成功' "$st/relay/cache/relay.log" "$st/relay/stdout.log" 2>/dev/null | tail -1)
+      [[ -n "$R3LINE" ]] && break
+      sleep 0.5
+    done
+    if [[ -n "$R3LINE" ]]; then
+      record "$link" R3-backend "PASS" "$(echo "$R3LINE" | cut -c1-100)"
+    else
+      record "$link" R3-backend "FAIL" "10s 内中继侧未见「注册成功」行"
+    fi
   else
-    record "$link" X1-reg "FAIL" "25s 内未见「中继：注册成功」"
+    record "$link" X1-reg "FAIL" "10s 内未见「中继：注册成功」"
   fi
   if [[ "$link" == L4 || "$link" == L5 ]]; then
     if grep -q '中继身份已认证' "$st/exit/stdout.log" 2>/dev/null; then
@@ -356,12 +376,18 @@ run_link() {
     relay_segment "$link" "$E" "$C" "$R"
   fi
 
-  record "$link" TOTAL "PASS" "$((SECONDS - T0))s"
-  local any_fail=0
+  # 低-4（第二道门）：有 FAIL 行时 TOTAL 记 FAIL——「TOTAL PASS 与 FAIL 并存」误导
+  local any_fail_total=0
   for row in "${TABLE_ROWS[@]}"; do
-    [[ "$row" == "$link|"*"|FAIL|"* ]] && any_fail=1
+    [[ "$row" == "$link|"*"|FAIL|"* ]] && any_fail_total=1
   done
-  if (( any_fail )); then stop_link "$link" keep; else stop_link "$link"; fi
+  if (( any_fail_total )); then
+    record "$link" TOTAL "FAIL" "$((SECONDS - T0))s（本链路有判据红项）"
+    stop_link "$link" keep
+  else
+    record "$link" TOTAL "PASS" "$((SECONDS - T0))s"
+    stop_link "$link"
+  fi
 }
 
 base_segment() {
@@ -451,9 +477,12 @@ base_segment() {
   # connect --speedtest（会话内跑——**不另起会话**：双会话同 devTag 在出口侧互抢，
   # 竞速/超时不稳，实测 timeout 两次）
   if [[ "$C" == go ]]; then
-    SP=$("$GO_BIN" speedtest --state "$st/c-main" -host "m$link" 2>&1 | grep -E '精确值|down=' | tail -2)
+    # 第二道门低项：首测速也包 tmo（原无看门狗——卡住整轮停摆；重试轮本就有 tmo 90）
+    SP=$(tmo 120 "$GO_BIN" speedtest --state "$st/c-main" -host "m$link" 2>&1 | grep -E '精确值|down=' | tail -2)
   else
-    SP=$(tmo 90 true; grep -E 'speedtest: 摘要|下行对账' "$st/c-main/rust.log" 2>/dev/null | tail -2)
+    # 第二道门低项：删 `tmo 90 true` 空转（true 立即退出，看门狗被秒杀 = 什么都没等；
+    # 真正的等待是下面的 while 30s 窗）
+    SP=$(grep -E 'speedtest: 摘要|下行对账' "$st/c-main/rust.log" 2>/dev/null | tail -2)
     # 主客户端已在跑；若摘要未出（speedtest 还在途）再等 30s
     local w=0
     while (( w < 30 )) && [[ -z "$SP" ]]; do
@@ -731,14 +760,17 @@ relay_segment() {
   # 缺发送端限速曾致 bulk 冲闸塌速（upload「写通道长时间无进展」中止——Go relay
   # 同命中，非 relay 实现问题；UploadLimiter 已移植，批十六两侧统一切到标定值）。
   # 5MB @250KB/s ≈ 20s（tmo 150 界内、看门狗恒有进展不触发）。
-  local RLIM="--rate-limit 250000"
+  # 数组形态（第二道门 高-2：zsh 对无引号 $SCALAR 不做词分割——裸 $RLIM 会作为
+  # 单个 argv "--rate-limit 250000" 传下去，Go 报未知 flag、Rust 错位进位置参数，
+  # 全链路 RL-files5MB 必红）。
+  local -a RLIM=(--rate-limit 250000)
   if [[ "$C" == go ]]; then
-    UP_OUT=$(tmo 150 "$GO_BIN" files put --state "$st/c-main" --host "dead$link" $RLIM "$LOCAL" "/$RNAME" 2>&1 | tail -1)
+    UP_OUT=$(tmo 150 "$GO_BIN" files put --state "$st/c-main" --host "dead$link" "${RLIM[@]}" "$LOCAL" "/$RNAME" 2>&1 | tail -1)
     DN_OUT=$(tmo 150 "$GO_BIN" files get --state "$st/c-main" --host "dead$link" "/$RNAME" -o "$st/dn-rl.bin" 2>&1 | tail -1)
   else
     # files CLI 无 --endpoint-cache-dir（不识别会错位进 rest）——不带 = 会话无落盘缓存，
     # 竞速 token 端点（dead-direct 形态下恒中继），段级隔离天然成立
-    UP_OUT=$(tmo 150 "$RUST_BIN" files upload --token "$TOK" --identity-dir "$st/c-main/identity" --dead-direct $RLIM "/$RNAME" "$LOCAL" 2>&1 | tail -1)
+    UP_OUT=$(tmo 150 "$RUST_BIN" files upload --token "$TOK" --identity-dir "$st/c-main/identity" --dead-direct "${RLIM[@]}" "/$RNAME" "$LOCAL" 2>&1 | tail -1)
     DN_OUT=$(tmo 150 "$RUST_BIN" files download --token "$TOK" --identity-dir "$st/c-main/identity" --dead-direct "/$RNAME" "$st/dn-rl.bin" 2>&1 | tail -1)
   fi
   local DN_SHA=$(sha256_of "$st/dn-rl.bin")

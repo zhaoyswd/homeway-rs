@@ -25,10 +25,15 @@ BASELINE_MD="$REPO_ROOT/docs/BASELINE.md"
 [[ -f "$LEDGER" ]] || { echo "!! ledger 不在（baseline 克隆缺失）" >&2; exit 1; }
 [[ -f "$MANIFEST" ]] || { echo "!! tier manifest 不在（只读路径）" >&2; exit 1; }
 
-# ① ledger sha256 与 BASELINE.md 锚定值一致
+# ① ledger sha256 与 BASELINE.md 锚定值一致（fail-closed：锚定值取不到即红——
+# 第二道门 中-9 整改，原 [[ -n && != ]] 形态在锚定缺失时静默跳过）
 WANT_SHA=$(grep -m1 -oE 'ledger\.jsonl` = `[0-9a-f]{64}' "$BASELINE_MD" | grep -oE '[0-9a-f]{64}')
+if [[ -z "$WANT_SHA" ]]; then
+  echo "!! BASELINE.md 里取不到 ledger sha256 锚定值（措辞改动破坏了正则？）——fail-closed 拒跑" >&2
+  exit 1
+fi
 GOT_SHA=$(shasum -a 256 "$LEDGER" | cut -d' ' -f1)
-if [[ -n "$WANT_SHA" && "$WANT_SHA" != "$GOT_SHA" ]]; then
+if [[ "$WANT_SHA" != "$GOT_SHA" ]]; then
   echo "!! ledger sha256 漂移：锚定 $WANT_SHA ≠ 实际 $GOT_SHA——升级基线未更新 BASELINE.md？" >&2
   exit 1
 fi

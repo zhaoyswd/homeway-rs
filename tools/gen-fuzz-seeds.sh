@@ -23,6 +23,10 @@ set -euo pipefail
 REPO_ROOT="${0:h:A:h}"
 OUT="$REPO_ROOT/fuzz/corpus.seeds"
 
+# 纯种子区先清空再展开（第二道门 中-8 整改：write() 只 makedirs 不清理——上一轮
+# 的陈旧文件会混进摘要，脏目录算出的基准在干净 clone 上必红）
+rm -rf "$OUT"
+
 python3 - "$REPO_ROOT" "$OUT" <<'PY'
 import json, os, sys, hashlib, struct
 

@@ -442,12 +442,15 @@ const TOKEN_BURST_CAP: i64 = 256 << 10;
 ///   - 单块配额 > burst（0 < rate < 块大小）时**不走高水位攒额**：按 n/rate 等满
 ///     整块配额后清零放行（否则 tokens 恒被截在 burst 以下、永攒不够一块）。
 ///
-/// sleep 按 ≤250ms 分片（CLI 进程粒度的可打断性；Go 侧走 ctx 取消——本侧无 ctx
-/// 面，进程信号即取消）。
+/// sleep 按 ≤250ms 分片（小速率下单块等待可达秒级——分片让进程收尾/信号响应
+/// 不被单次长睡拖住；Go 侧走 ctx 取消，本侧无 ctx 面，进程信号即取消）。
 pub struct UploadLimiter {
     rate: i64,
     burst: i64,
     tokens: f64,
+    /// 上次结算时刻（**字段而非调用局部**——跨调用计息：写 socket/读本地的耗时
+    /// 都在攒令牌，稳态严格 ≈ rate；Go tokenBucket.last 同义）。
+    last: std::time::Instant,
 }
 
 impl UploadLimiter {
@@ -456,7 +459,7 @@ impl UploadLimiter {
         if rate <= 0 {
             return None;
         }
-        Some(Self { rate, burst: rate.min(TOKEN_BURST_CAP), tokens: 0.0 })
+        Some(Self { rate, burst: rate.min(TOKEN_BURST_CAP), tokens: 0.0, last: std::time::Instant::now() })
     }
 
     /// 一次配额结算的纯计算（测试可达面）：给定距上次结算的秒数与本次需发字节数，
@@ -480,31 +483,41 @@ impl UploadLimiter {
     }
 
     /// 为 n 字节的发送配额等待（上传循环按本地读块调用，配额单位 = 读块
-    /// （≤ MAX_CHUNK），不是 16KiB 线帧）。
+    /// （≤ MAX_CHUNK），不是 16KiB 线帧）。**整块配额 > burst（0 < rate < 块大小）
+    /// 时睡 n/rate 一次即返**（Go sleepCtx 单次语义——放进循环会因该分支恒成立
+    /// 而永不返回，第二道门 高-1 钉死的形态）；普通差额睡完回环重结算（睡眠期
+    /// 计息）。
     pub fn await_quota(&mut self, n: usize) {
-        let mut last = std::time::Instant::now();
+        if n as f64 > self.burst as f64 {
+            self.tokens = 0.0; // 积累作废；last 不动（Go 同形：睡眠期下次调用计息）
+            sleep_sliced(n as f64 / self.rate as f64);
+            return;
+        }
         loop {
             let now = std::time::Instant::now();
             let (tokens, wait_s) = Self::settle(
-                now.duration_since(last).as_secs_f64(),
+                now.duration_since(self.last).as_secs_f64(),
                 self.tokens,
                 self.rate,
                 self.burst,
                 n,
             );
-            last = now;
+            self.last = now;
             self.tokens = tokens;
             if wait_s <= 0.0 {
                 return;
             }
-            // ≤250ms 分片：小速率下单块等待可达秒级，长睡会拖住进程收尾
-            let mut remain = wait_s;
-            while remain > 0.0 {
-                let slice = remain.min(0.25);
-                std::thread::sleep(std::time::Duration::from_secs_f64(slice));
-                remain -= slice;
-            }
+            sleep_sliced(wait_s);
         }
+    }
+}
+
+/// ≤250ms 分片的 sleep（见 UploadLimiter 文档）。
+fn sleep_sliced(mut secs: f64) {
+    while secs > 0.0 {
+        let slice = secs.min(0.25);
+        std::thread::sleep(std::time::Duration::from_secs_f64(slice));
+        secs -= slice;
     }
 }
 
@@ -677,5 +690,25 @@ mod tests {
             total_wait += w;
         }
         assert!(total_wait >= 0.9, "10×100B @1000B/s 至少要 ~1s 配额（得 {total_wait}）");
+    }
+
+    #[test]
+    fn upload_limiter_await_quota_no_hang() {
+        // 真调有状态循环体的看门狗测试（第二道门 高-1：整块配额 > burst 分支曾
+        // 死循环——settle 恒返回正等待、loop 永不退出；矩阵 --rate-limit 250000 的
+        // 5MB 首块 100% 命中）。节拍 = n/rate，睡一次即返。
+        let mut l = UploadLimiter::new(250_000).unwrap(); // burst=250000 < MAX_CHUNK
+        let t0 = std::time::Instant::now();
+        l.await_quota(MAX_CHUNK); // 262144B 首块：n > burst ⇒ 整块路径
+        let dt = t0.elapsed();
+        assert!(
+            dt >= std::time::Duration::from_millis(1000) && dt < std::time::Duration::from_secs(5),
+            "整块路径应按 n/rate ≈ 1.05s 返回（得 {dt:?}）"
+        );
+        assert_eq!(l.tokens, 0.0, "整块放行后积累作废");
+        // 普通差额路径也必须能返回（第二块小块走 settle 循环）
+        let t1 = std::time::Instant::now();
+        l.await_quota(1000);
+        assert!(t1.elapsed() < std::time::Duration::from_secs(3), "差额路径不应久等");
     }
 }

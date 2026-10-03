@@ -11,7 +11,8 @@
 //!   (d) **夹具期望**：token 逐字段（peer_id/secret/端点三元组）+ 负例哨兵码 +
 //!       STUN 首样本字节；
 //!   (e) **输出上界**：empty_response/truncate/TCP 分帧/header_value/xml_tag/
-//!       parse_http_url/probe 端点数等「输出 ≤ 已知上界」断言（独立于实现内 cap）。
+//!       parse_http_url 等「输出 ≤ 已知上界」断言（独立于实现内 cap；probe 端点数
+//!       与 build 长度两条与解析器自身守卫同谓词——回归哨兵，不算独立上界）。
 //! 生成器 = xorshift64 固定 seed（确定性；`HER_SEED` 可复现指定轮，非法值即 panic）；
 //! 配比 70% 种子骨架变异 + 30% 全随机。每目标 ≥100k 次迭代（`#[ignore]`：
 //! CI quick 档跳过、全量档 `--ignored` 显式开——G-10；量级门见 fuzz_iteration_budget）。

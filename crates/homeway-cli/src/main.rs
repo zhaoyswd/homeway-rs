@@ -498,10 +498,17 @@ fn cmd_files(args: &[String]) {
             }
             "--rate-limit" => {
                 i += 1;
-                rate_limit = args.get(i).and_then(|v| v.parse::<i64>().ok());
-                if rate_limit.is_none() {
-                    eprintln!("--rate-limit 需要整数 bytes/s（如 250000；0 = 不限）");
-                    std::process::exit(2);
+                let v = args.get(i).and_then(|v| v.parse::<i64>().ok());
+                match v {
+                    Some(n) if n >= 0 => rate_limit = Some(n),
+                    Some(_) => {
+                        eprintln!("--rate-limit 不接受负值（Go 同款拒绝）——0 = 不限、正数 = bytes/s");
+                        std::process::exit(2);
+                    }
+                    None => {
+                        eprintln!("--rate-limit 需要非负整数 bytes/s（如 250000；0 = 不限）");
+                        std::process::exit(2);
+                    }
                 }
             }
             other => rest.push(other.to_owned()),

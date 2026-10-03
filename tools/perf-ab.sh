@@ -20,9 +20,22 @@ RUST_BIN="$REPO_ROOT/target/release/homeway-cli"
 GO_BIN="${HOMEWAY_GO:-$REPO_ROOT/bin/homeway-go}"
 BASE="/tmp/homeway-rs-matrix-perf"
 
+# 本机内网 IP（第二道门 低-6：原硬编码 192.168.3.12——换机/换网卡即错；与
+# tools/matrix.sh lan_ip 同探测形态）
+lan_ip() {
+  local out
+  out=$(ipconfig getifaddr en0 2>/dev/null) || out=$(ipconfig getifaddr en1 2>/dev/null) || out="127.0.0.1"
+  echo "$out"
+}
+
 [[ -x "$RUST_BIN" ]] || { (cd "$REPO_ROOT" && cargo build --release -p homeway-cli) || exit 1; }
-mkdir -p "$BASE/.lock" 2>/dev/null || { echo "!! perf-ab 已在跑" >&2; exit 1; }
-trap 'rmdir "$BASE/.lock" 2>/dev/null' EXIT
+# 互斥锁（第二道门 中-5 整改：裸 mkdir 抢锁——`mkdir -p` 对已存在目录恒成功拦不住
+# 并发；且锁须在 $BASE **之外**——下面的清场 rm -rf $BASE 会把建在里面的锁一起删掉）
+if ! mkdir /tmp/homeway-rs-matrix-perf.lock 2>/dev/null; then
+  echo "!! perf-ab 已在跑（/tmp/homeway-rs-matrix-perf.lock 占用）" >&2
+  exit 1
+fi
+trap 'rmdir /tmp/homeway-rs-matrix-perf.lock 2>/dev/null' EXIT
 
 # 清场（复用矩阵的纪律）
 pkill -f "homeway-rs-matrix-perf" 2>/dev/null
@@ -97,7 +110,8 @@ EOF
 
 # Rust 客户端的 connect 需要 token——先占位起会被拒；改为拿 token 后再起。
 setup_stack_rust_client() { # <side> <ep>
-  local side="$1" ep="$2" st="$BASE/$side"
+  local side="$1" ep="$2"
+  local st="$BASE/$side"
   local TOK
   TOK=$("$RUST_BIN" serve token --state "$st/exit" | grep -o 'hmw1[A-Za-z0-9+/=_-]*' | head -1)
   nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$st/client/identity" --hold 3600 >> "$st/client.log" 2>&1 &
@@ -147,12 +161,12 @@ done
 # ---------- echo RTT ----------
 echo "==> echo RTT（经隧道 200 次回显往返）"
 # Go 侧 forward
-"$GO_BIN" forward add --state "$BASE/ggg/client" -host perf --listen 42900 --target "192.168.3.12:42800" >/dev/null 2>&1
+"$GO_BIN" forward add --state "$BASE/ggg/client" -host perf --listen 42900 --target "$(lan_ip):42800" >/dev/null 2>&1
 sleep 1
 python3 "$REPO_ROOT/tools/echo-rtt.py" 127.0.0.1 42900 200 > "$BASE/rtt-ggg.json"
 echo "  GGG: $(cat "$BASE/rtt-ggg.json")"
 # Rust 侧 portfwd（独立会话——RTT 面单连接，与会话竞速无关）
-(cd "$BASE/rrr" && nohup "$RUST_BIN" portfwd --token "$RRR_TOK" --identity-dir "$BASE/rrr/client/identity" --map 42901:192.168.3.12:42807 > "$BASE/rrr/portfwd.log" 2>&1 &)
+(cd "$BASE/rrr" && nohup "$RUST_BIN" portfwd --token "$RRR_TOK" --identity-dir "$BASE/rrr/client/identity" --map 42901:$(lan_ip):42807 > "$BASE/rrr/portfwd.log" 2>&1 &)
 sleep 4
 python3 "$REPO_ROOT/tools/echo-rtt.py" 127.0.0.1 42901 200 > "$BASE/rtt-rrr.json"
 echo "  RRR: $(cat "$BASE/rtt-rrr.json")"
