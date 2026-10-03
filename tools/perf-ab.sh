@@ -124,6 +124,16 @@ setup_stack_rust_client() { # <side> <ep>
   echo "$TOK" > "$st/token"
 }
 
+# 收口保障（dsh 评审整改）：任何退出路径清 RSS 轮询进程——此前 v1 中止轮的 poller
+# 存活混入下一轮（rss.tsv 行率翻倍污染口径）
+PERF_AB_CLEANED=0
+perf_ab_cleanup() {
+  if (( PERF_AB_CLEANED )); then return; fi
+  PERF_AB_CLEANED=1
+  [[ -n "${RSS_POLLER:-}" ]] && kill $RSS_POLLER 2>/dev/null
+}
+trap perf_ab_cleanup EXIT INT TERM
+
 echo "==> 起 GGG（42660/42750/42800）与 RRR（42667/42757/42807）"
 setup_stack ggg 42660 42750 42800
 setup_stack rrr 42667 42757 42807
