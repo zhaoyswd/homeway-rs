@@ -44,7 +44,7 @@ echo "==> [6/7] release 构建（smoke 前置）"
 (cd "$REPO_ROOT" && cargo build --release -p homeway-cli) || fail 6 "release 构建"
 
 echo "==> [7/7] 矩阵冒烟档（RRR 基础段）"
-"$REPO_ROOT/tools/matrix.sh --smoke" || fail 7 "矩阵冒烟"
+"$REPO_ROOT/tools/matrix.sh" --smoke || fail 7 "矩阵冒烟"
 
 echo ""
-echo "本地 CI 全绿（$(date '+%Y-%m-%d %H:%M:%S')；档位：$(( FULL )) ? full : quick）"
+echo "本地 CI 全绿（$(date '+%Y-%m-%d %H:%M:%S')；档位：$([[ $FULL -eq 1 ]] && echo full || echo quick)）"

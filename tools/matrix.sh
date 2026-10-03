@@ -18,7 +18,7 @@
 #   Go relay 链路只判首窗 via=relay + 数据，翻直连 = 预期自愈观测（备注列，非 FAIL）。
 #
 # 用法：tools/matrix.sh [--link L1..L6] [--perf] [--smoke] [--fail-fast]
-#   --smoke = RRR 基础段前 4 判据（ci-local 冒烟档）
+#   --smoke = RRR 基础段冒烟（直连段判据；多 peer/中继段只在验收轮与 --perf 档跑）
 # 结果：stdout 进度 + docs/matrix-latest.md（链路 × 判据 → PASS/FAIL + 摘录 ≤100 字符
 #   + 备注 + 耗时）；失败行全文在 /tmp/homeway-rs-matrix/<链路>/failures.log。
 # 退出码：全绿 0；任一 FAIL 非零。
@@ -347,11 +347,14 @@ run_link() {
   # ---- 基础段（主客户端直连） ----
   base_segment "$link" "$E" "$C"
 
-  # ---- 多 peer 段（副客户端 = 异实现） ----
-  multi_peer_segment "$link" "$E" "$C"
-
-  # ---- 中继段（dead-direct 变体 token 第二会话） ----
-  relay_segment "$link" "$E" "$C" "$R"
+  # ---- 多 peer 段（副客户端 = 异实现）／中继段（dead-direct 变体 token 第二会话） ----
+  # --smoke 只跑基础段（设计 §7「RRR 基础段冒烟」）：多 peer/中继段属验收轮与
+  # --perf 档的覆盖面；且 Rust relay × 上行文件流有在册 KNOWN-GAP 族形态
+  # （RRR 全链路实测 RL-files5MB upload 失速，见 R5.md 5-f 注记），冒烟档不判它。
+  if (( ! SMOKE )); then
+    multi_peer_segment "$link" "$E" "$C"
+    relay_segment "$link" "$E" "$C" "$R"
+  fi
 
   record "$link" TOTAL "PASS" "$((SECONDS - T0))s"
   local any_fail=0
