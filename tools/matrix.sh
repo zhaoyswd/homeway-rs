@@ -758,11 +758,15 @@ relay_segment() {
   local UPFAIL
   UPFAIL=$(grep -c 'speedtest 失败' "$st/c-main/rust.log" 2>/dev/null || true)
   [[ -z "$UPFAIL" ]] && UPFAIL=0
-  # KNOWN-GAP（2026-10-03 实证，独立最小拓扑复现）：Go exit × Rust relay × speedtest
-  # 经中继并发形态不成立——exit 侧受理+关闭完整（dialok/会话/关闭行都在），客户端侧
-  # connect 超时（SYN-ACK 回程经中继丢失；relay 丢弃计数 572/周期）。files 5MB 经
-  # 中继 TCP 双向对账通过（同拓扑）——缺口限定 speedtest 4 流并发突发形态。
-  # R4 链路 3「speedtest 预算内未跑满」即此缺口前身。深挖归 R6 前置批。
+  # KNOWN-GAP（R6 前置批 ② 深挖收口，2026-10-03）：speedtest 经中继的 4 流并发突发
+  # 形态**两侧客户端共有不成立**——干净最小拓扑（Go exit + Rust relay + dead-direct）
+  # 实测：Rust 客户端「测速连接失败：连接超时」、Go 客户端「通道错误（interrupted）」
+  # 同样失败；exit 侧受理完整（dialok + role=send 会话受理 + 30s 读超时——exit 侧无恙）。
+  # 机制 = 中继 200pps 每源准入闸（防放大设计，两侧 relay 与 baseline reap.go 逐字一致）
+  # 的等效容量 ~244KB/s << speedtest 4 流突发需求 ⇒ 建连/数据包被闸 + 重传螺旋。
+  # 非 Rust relay/客户端缺陷（Go 同形态同样不成立）；闸内形态（files ≤120KB/s）
+  # 双向对账通过。产品语义：中继是兜底腿（「走中继=需排查的 bug」口径），speedtest
+  # 本应在直连腿跑。判据形态 = SKIP（数据面证据 RL-files5MB 对账）。
   if [[ -n "$SPO" && "$SPO" != *失败* ]]; then
     record "$link" RL-speedtest "PASS" "$(echo "$SPO" | cut -c1-100)"
   elif [[ "$C" == go ]]; then
