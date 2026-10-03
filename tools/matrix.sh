@@ -555,7 +555,11 @@ base_segment() {
   # mid-transfer rekey stall（R1 族）登记 R6 前置批 P0。不限速形态 = 轮 1/2/3' 全绿
   #（1-2s 传完不跨 rekey）。
   if [[ "$C" == go ]]; then
-    UP=$(tmo 150 "$GO_BIN" files put --state "$st/c-main" --host "m$link" --rate-limit 0 "$LOCAL" "/$RNAME" 2>&1 | tail -1)
+    # Go 客户端用缺省 2MiB/s（**不加 --rate-limit 0**）：不限速实测冲爆 daemon 收流
+    # 保护（40 帧/640KiB 上行过快 ⇒「流被守护进程收流」——L1/L4/L5 三 Go 链路
+    # 2026-10-04 验收轮全红实证）；Go daemon 单会话无互踢面，2MiB/s×51s 跨 rekey
+    # 健康（轮 1/2/3' 六链路全过 + 单会话跨 rekey 由 rekey-check.sh 钉死）。
+    UP=$(tmo 150 "$GO_BIN" files put --state "$st/c-main" --host "m$link" "$LOCAL" "/$RNAME" 2>&1 | tail -1)
     DN=$(tmo 150 "$GO_BIN" files get --state "$st/c-main" --host "m$link" "/$RNAME" -o "$st/dn-100mb.bin" 2>&1 | tail -1)
   else
     UP=$(tmo 120 "$RUST_BIN" files upload --token "$TOK" --identity-dir "$st/c-main/identity" --rate-limit 0 "/$RNAME" "$LOCAL" 2>&1 | tail -1)
