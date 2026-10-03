@@ -732,6 +732,7 @@ relay_segment() {
     DN_OUT=$(tmo 150 "$RUST_BIN" files download --token "$TOK" --identity-dir "$st/c-main/identity" --dead-direct "/$RNAME" "$st/dn-rl.bin" 2>&1 | tail -1)
   fi
   local DN_SHA=$(sha256_of "$st/dn-rl.bin")
+  { echo "== upload =="; echo "$UP_OUT"; echo "== download =="; echo "$DN_OUT"; } >> "$st/rl-files.log" 2>/dev/null
   if [[ "$UP_SHA" == "$DN_SHA" && -n "$UP_SHA" ]]; then
     record "$link" RL-files5MB "PASS" "sha256 双侧一致（${UP_SHA:0:16}…）"
   elif grep -q "不存在（not_found）" "$st/rl-files.log" 2>/dev/null && grep -q "100.0%" "$st/rl-files.log" 2>/dev/null; then
@@ -744,7 +745,6 @@ relay_segment() {
   else
     record "$link" RL-files5MB "FAIL" "对账不符（up=${UP_SHA:0:12} dn=${DN_SHA:0:12}；详见 $st/rl-files.log）"
   fi
-  { echo "== upload =="; echo "$UP_OUT"; echo "== download =="; echo "$DN_OUT"; } >> "$st/rl-files.log" 2>/dev/null
   rm -f "$LOCAL" "$st/dn-rl.bin"
   # Go relay 链路的翻直连 = 预期自愈观测（备注；非 FAIL——评审 ①-1）
   if grep -q 'link: via=direct' "$LOGF" 2>/dev/null && [[ "$R" == go ]]; then
