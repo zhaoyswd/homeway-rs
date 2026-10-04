@@ -248,11 +248,13 @@ mod tests {
     use super::*;
     use crate::term::vt::SessionVt;
 
-    /// 单案：name / setup / query / themed / 期望应答 hex。
-    type ResponderCase = (String, Vec<u8>, Vec<u8>, bool, String);
+    /// 单案（含分片序列）：name / setup / query / themed / 期望应答 hex / chunks。
+    type ResponderCaseFull = (String, Vec<u8>, Vec<u8>, bool, String, Vec<Vec<u8>>);
 
-    /// 读应答向量：name -> (setup, query, themed, response_hex)。
-    fn responder_cases() -> Vec<ResponderCase> {
+    /// 读应答向量：name / setup / query / themed / 期望应答 hex / 期望分片序列。
+    /// `chunks` 是「每个应答一片、顺序与流中触发一致」的判据（r1-低11：只比拼接
+    /// 字节抓不到分片边界错）。
+    fn responder_cases() -> Vec<ResponderCaseFull> {
         let raw = include_str!("../../../../fixtures/vectors/term_responder.json");
         let v: serde_json::Value = serde_json::from_str(raw).expect("term_responder.json invalid");
         v.get("cases")
@@ -273,35 +275,89 @@ mod tests {
                     hex("query_hex"),
                     c.get("themed").and_then(|x| x.as_bool()).unwrap_or(false),
                     c.get("response_hex").and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                    c.get("chunks")
+                        .and_then(|x| x.as_array())
+                        .map(|a| a.iter().map(|x| hex_of(x.as_str().unwrap_or(""))).collect())
+                        .unwrap_or_default(),
                 )
             })
             .collect()
     }
 
-    /// 6c 判据：全部应答向量逐案对拍（喂 SessionVt → write_collecting → 比对字节）。
-    /// F2/F3（?998n 与 DECRQSS 三态）已由旁路扫描器实装——四案从豁免名单移除、
-    /// 进入对拍（含跨块续接的补充测试见 vt.rs）。
+    fn hex_of(h: &str) -> Vec<u8> {
+        (0..h.len()).step_by(2).map(|i| u8::from_str_radix(&h[i..i + 2], 16).expect("hex")).collect()
+    }
+
+    /// 6c 判据：全部应答向量逐案对拍（喂 SessionVt → write_collecting → 比对字节
+    /// **与分片序列**）+ 按 chunks 切点拆投喂的跨块续接轮。F2/F3（?998n 与 DECRQSS
+    /// 三态）已由旁路扫描器实装，四案入对拍。
     #[test]
     fn responder_parity_with_go_vectors() {
         let cases = responder_cases();
-        assert!(cases.len() >= 51, "vector cases {}", cases.len());
+        assert!(cases.len() >= 57, "vector cases {}", cases.len());
         let mut failures = Vec::new();
-        for (name, setup, query, themed, expect) in cases {
+        for (name, setup, query, themed, expect, chunks) in &cases {
             let mut vt = SessionVt::new(100, 32, 1000).expect("vt");
-            if themed {
+            if *themed {
                 vt.set_default_colors([0x11, 0x22, 0x33], [0xaa, 0xbb, 0xcc]);
             }
             if !setup.is_empty() {
-                vt.write(&setup);
+                vt.write(setup);
             }
-            let mut collected: Vec<u8> = Vec::new();
-            vt.write_collecting(&query, &mut |p| collected.extend_from_slice(p));
-            let got = collected.iter().map(|b| format!("{b:02x}")).collect::<String>();
-            if got != expect {
+            // 逐片收集：分片边界/片数也是契约（r1-低11）
+            let mut pieces: Vec<Vec<u8>> = Vec::new();
+            vt.write_collecting(query, &mut |p| pieces.push(p.to_vec()));
+            let joined = pieces.concat();
+            let got = joined.iter().map(|b| format!("{b:02x}")).collect::<String>();
+            if got != expect.as_str() {
                 failures.push(format!("{name}: expect {expect} got {got}"));
             }
+            // 分片契约：piece 边界只允许比 chunks 更细（vte 对多索引 OSC 4 逐参分发，
+            // ghostty 合成一条应答——拼接字节才是 wire 契约，r1-低11 的放宽形态）：
+            // 每片必须完整落在某个期望 chunk 内（顺序 + 不跨界）。
+            if !chunks.is_empty() && !pieces_cover_chunks(&pieces, chunks) {
+                failures.push(format!("{name}: 分片序列不符（片序/跨界，chunks 契约）"));
+            }
+            // 跨块轮：按每个 chunks 边界与固定切点 1/2/3 拆投喂，拼接字节必须同
+            if query.len() >= 2 {
+                for split in [1usize, 2, 3, query.len() / 2].into_iter().filter(|s| *s < query.len()) {
+                    let mut vt2 = SessionVt::new(100, 32, 1000).expect("vt");
+                    if *themed {
+                        vt2.set_default_colors([0x11, 0x22, 0x33], [0xaa, 0xbb, 0xcc]);
+                    }
+                    if !setup.is_empty() {
+                        vt2.write(setup);
+                    }
+                    let mut got2: Vec<u8> = Vec::new();
+                    vt2.write_collecting(&query[..split], &mut |p| got2.extend_from_slice(p));
+                    vt2.write_collecting(&query[split..], &mut |p| got2.extend_from_slice(p));
+                    if got2 != joined {
+                        failures.push(format!("{name}: 跨块切点 {split} 应答漂移"));
+                    }
+                }
+            }
         }
-        assert!(failures.is_empty(), "parity failed {} cases:\n{}", failures.len(), failures.join("\n"));
+        assert!(failures.is_empty(), "parity failed {}:\n{}", failures.len(), failures.join("\n"));
+    }
+
+    /// pieces 逐片完整落在 chunks 的分段内（允许一片 chunk 被切成多 piece，
+    /// 不允许一片 piece 横跨两个 chunk 或乱序）。
+    fn pieces_cover_chunks(pieces: &[Vec<u8>], chunks: &[Vec<u8>]) -> bool {
+        let (mut ci, mut off) = (0usize, 0usize);
+        for p in pieces {
+            let cur = chunks.get(ci).map(|c| &c[off.min(c.len())..]).unwrap_or(&[]);
+            if cur.len() < p.len() || cur[..p.len()] != p[..] {
+                return false;
+            }
+            off += p.len();
+            if let Some(c) = chunks.get(ci) {
+                if off >= c.len() {
+                    ci += 1;
+                    off = 0;
+                }
+            }
+        }
+        ci == chunks.len() && off == 0
     }
 
     #[test]

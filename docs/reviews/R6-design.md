@@ -495,7 +495,20 @@ region = 规则的**判定范围选择器**（旧提示残留不误判的锚定�
 Validate 耦合 = `skip_state_update ⇒ state=unknown`；`top_non_empty_lines ≥3 行`约束。
 判据：region 逐函数产向量（`term_manifest_eval.json` 按 region+matched 对拍，见 9.5）。
 
-### 9.7 A9/A6/A7 顺手修正
+### 9.7 已知残余差异登记（编码评审 r1 收口，随实现更新）
+
+- **DECSLRM（DECRQSS 载荷 `s`）恒答 `0$r`**：alacritty 不跟踪左右边距（DECLRMM 的
+  模式位 69 有记账、边距值无从取）；ghostty 在 69 开启时答 `1$r{left+1};{right+1}s`。
+  真应用不开 69——残余差异只在该形态（代码注记 + 本表双登记）。
+- **解码面的非法 UTF-8 → U+FFFD**：Go 一律 `string(bytes)` 原样字节进 string；Rust
+  解码面（name/title/clientID/msg 等）用 `from_utf8_lossy` 替换非法字节（长度与字节
+  都可能不同）。name 有 `[A-Za-z0-9._-]` 词法校验兜底；title/client_id 非法字节属
+  病态输入面。真源对齐优先级低于 panic 安全（见 r1-高① 的字节级截断整改）。
+- **OSC 4 多索引的分片粒度**：vte 对 `4;1;?;2;?` 逐参分发（每参一片应答）、ghostty
+  合成一条；拼接字节一致（wire 契约不受影响），harness 的 chunks 契约按「piece 只
+  允许更细分」放宽对拍（r1-低11）。
+
+### 9.8 A9/A6/A7 顺手修正
 
 - 「24 文件内嵌」改述：**23 个 toml**（22 agent + index）+ README（`load.go` 的
   `//go:embed manifests/*.toml`）；

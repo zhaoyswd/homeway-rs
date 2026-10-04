@@ -473,11 +473,11 @@ pub fn dec_replay_done(p: &[u8]) -> Result<(u32, u8), FrameError> {
 
 /// ENDED：`[code:4LE][reasonLen:1][reason≤200]`（reason 超 200 截断）。
 pub fn enc_ended(code: i32, reason: &str) -> Vec<u8> {
-    let reason = &reason[..reason.len().min(MAX_REASON_LEN)];
+    let reason = truncate_bytes(reason, MAX_REASON_LEN);
     let mut p = Vec::with_capacity(5 + reason.len());
     p.extend_from_slice(&code.to_le_bytes());
     p.push(reason.len() as u8);
-    p.extend_from_slice(reason.as_bytes());
+    p.extend_from_slice(reason);
     p
 }
 
@@ -486,17 +486,19 @@ pub fn dec_ended(p: &[u8]) -> (i32, String) {
         return (0, String::new());
     }
     let code = i32::from_le_bytes([p[0], p[1], p[2], p[3]]);
-    (code, String::from_utf8_lossy(&p[5..5 + p[4] as usize]).into_owned())
+    // 长度守卫（Go decEndedParts 同款：声明越界 ⇒ 空 reason，不 panic——评审整改 r1-中②）
+    let n = (p[4] as usize).min(p.len() - 5);
+    (code, String::from_utf8_lossy(&p[5..5 + n]).into_owned())
 }
 
 /// STATE：`[agent:1][state:1][titleLen:2LE][title≤512]`。
 pub fn enc_state(agent: u8, state: u8, title: &str) -> Vec<u8> {
-    let title = &title[..title.len().min(512)];
+    let title = truncate_bytes(title, 512);
     let mut p = Vec::with_capacity(4 + title.len());
     p.push(agent);
     p.push(state);
     p.extend_from_slice(&(title.len() as u16).to_le_bytes());
-    p.extend_from_slice(title.as_bytes());
+    p.extend_from_slice(title);
     p
 }
 
@@ -514,13 +516,13 @@ pub fn dec_state(p: &[u8]) -> (u8, u8, String) {
 
 /// ERROR：`[codeLen:1][code≤255][msgLen:2LE][msg≤4096]`。
 pub fn enc_error(code: &str, msg: &str) -> Vec<u8> {
-    let code = &code[..code.len().min(255)];
-    let msg = &msg[..msg.len().min(4096)];
+    let code = truncate_bytes(code, 255);
+    let msg = truncate_bytes(msg, 4096);
     let mut p = Vec::with_capacity(3 + code.len() + msg.len());
     p.push(code.len() as u8);
-    p.extend_from_slice(code.as_bytes());
+    p.extend_from_slice(code);
     p.extend_from_slice(&(msg.len() as u16).to_le_bytes());
-    p.extend_from_slice(msg.as_bytes());
+    p.extend_from_slice(msg);
     p
 }
 
@@ -540,12 +542,18 @@ pub fn dec_error(p: &[u8]) -> Result<(String, String), FrameError> {
     Ok((code, String::from_utf8_lossy(&p[3 + n..3 + n + ml]).into_owned()))
 }
 
+/// 字节级截断（Go 语义：`s[:N]` 按字节切、可切进多字节字符中间；载荷是字节串
+/// 无 UTF-8 约束——绝不因截点非字符边界 panic）。评审整改 r1-高①。
+fn truncate_bytes(s: &str, max: usize) -> &[u8] {
+    &s.as_bytes()[..s.len().min(max)]
+}
+
 /// KILL 等的「nameLen + name」载荷（name > 64 截断——同 Go encName）。
 pub fn enc_name(name: &str) -> Vec<u8> {
-    let name = &name[..name.len().min(MAX_NAME_LEN)];
+    let name = truncate_bytes(name, MAX_NAME_LEN);
     let mut out = Vec::with_capacity(1 + name.len());
     out.push(name.len() as u8);
-    out.extend_from_slice(name.as_bytes());
+    out.extend_from_slice(name);
     out
 }
 
@@ -656,7 +664,12 @@ pub fn dec_input(p: &[u8]) -> Result<InputEvent, FrameError> {
                 y: u16::from_le_bytes([p[7], p[8]]),
             })
         }
-        input_kind::FOCUS => Ok(InputEvent::Focus { gained: p.get(1).is_some_and(|v| *v != 0) }),
+        input_kind::FOCUS => {
+            if p.len() < 2 {
+                return Err(FrameError::InputLen { len: p.len() });
+            }
+            Ok(InputEvent::Focus { gained: p[1] != 0 })
+        }
         k => Err(FrameError::InputKind { kind: k }),
     }
 }
@@ -680,14 +693,30 @@ mod tests {
         let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/term");
         let raw = std::fs::read_to_string(format!("{base}/frames.v1.jsonl")).unwrap();
         let mut count = 0;
+        let mut negatives = 0;
         for line in raw.lines().filter(|l| !l.trim().is_empty()) {
             let v: serde_json::Value = serde_json::from_str(line).unwrap();
             let name = v["name"].as_str().unwrap();
             let op = u8::from_str_radix(v["op"].as_str().unwrap().trim_start_matches("0x"), 16).unwrap();
             let payload = unhex(v["payloadHex"].as_str().unwrap_or(""));
             let expect = &v["expect"];
-            if name.starts_with("negative.") {
-                // 负例：read_frame 流层错误（短头/截断），载荷层不适用
+            if let Some(err) = expect.get("error").and_then(|e| e.as_str()) {
+                // 负例（wire 字段 = `hex`）：流层错误走 read_frame、坏载荷走 dec_hello
+                let wire = unhex(v["hex"].as_str().unwrap_or(""));
+                match err {
+                    "short_header" | "truncated" => {
+                        let mut rd = wire.as_slice();
+                        assert!(read_frame(&mut rd).is_err(), "{name}: 流层短读必须报错");
+                    }
+                    "bad_payload" => {
+                        // 合法帧 + 坏载荷：解出帧后载荷层报 HelloLen
+                        let mut rd = wire.as_slice();
+                        let f = read_frame(&mut rd).unwrap();
+                        assert!(matches!(dec_hello(&f.payload), Err(FrameError::HelloLen { .. })), "{name}");
+                    }
+                    other => panic!("{name}: 未知负例种类 {other}"),
+                }
+                negatives += 1;
                 continue;
             }
             count += 1;
@@ -752,7 +781,7 @@ mod tests {
                 assert_eq!(dec_name(&payload).unwrap(), k["name"].as_str().unwrap(), "{name}");
             }
         }
-        assert_eq!(count, 10, "fixture 正例数（greeting/hello/resize/data/replay-done/ended/state/error/ok/kill）");
+        assert_eq!((count, negatives), (10, 3), "fixture 正例 10 + 负例 3 全数消费");
     }
 
     /// 帧读写：滴流读不丢帧不串帧（FrameReader 教训——read_exact 的续读语义）。
@@ -876,13 +905,25 @@ mod tests {
         assert!(matches!(dec_create(&[0]), Err(FrameError::CreateLen { len: 1 })));
     }
 
-    /// 截断上限族（name 64 / reason 200 / title 512 / error 255+4096）。
+    /// 截断上限族（name 64 / reason 200 / title 512 / error 255+4096）——含 CJK
+    /// 截点（评审整改 r1-高①：字节级截断不 panic、长度精确到上限）。
     #[test]
     fn truncation_limits() {
         assert_eq!(enc_name(&"x".repeat(100)).len(), 1 + MAX_NAME_LEN);
         assert_eq!(enc_ended(1, &"r".repeat(300)).len(), 5 + MAX_REASON_LEN);
         assert_eq!(enc_state(agent::SHELL, state_v2::IDLE, &"t".repeat(600)).len(), 4 + 512);
         assert_eq!(enc_error(&"c".repeat(300), &"m".repeat(5000)).len(), 3 + 255 + 4096);
+        // CJK：截点落进多字节字符（Go 按字节切不 panic；此处同长度、字节级）
+        let cjk_title = "标".repeat(200); // 600B > 512
+        let p = enc_state(agent::SHELL, state_v2::IDLE, &cjk_title);
+        assert_eq!(p.len(), 4 + 512);
+        let cjk_name = "会".repeat(40); // 120B > 64
+        assert_eq!(enc_name(&cjk_name).len(), 1 + MAX_NAME_LEN);
+        let cjk_reason = "由".repeat(100); // 300B > 200
+        assert_eq!(enc_ended(1, &cjk_reason).len(), 5 + MAX_REASON_LEN);
+        // dec_ended 声明越界 ⇒ 空 reason 不 panic（评审整改 r1-中②）
+        let (code, reason) = dec_ended(&[0, 0, 0, 0, 200]);
+        assert_eq!((code, reason.as_str()), (0, ""));
     }
 
     /// INPUT 上行四类往返 + 粘贴语义位。

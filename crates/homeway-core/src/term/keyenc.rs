@@ -352,14 +352,13 @@ fn function_keys() -> &'static [(u16, Vec<Rule>)] {
     use std::sync::OnceLock;
     static TABLE: OnceLock<Vec<(u16, Vec<Rule>)>> = OnceLock::new();
     TABLE.get_or_init(|| {
-        fn kpd(suffix: &'static str) -> Rule {
-            // kpDefault：mods 空、精确（empty_any=false）、keypad=application
-            let seq: &'static str = leak_concat("\x1bO", suffix);
+        // kpDefault：mods 空、精确（empty_any=false）、keypad=application（完整 SS3 串）
+        fn kpd(seq: &'static str) -> Rule {
             Lit { mods: 0, empty_any: false, cursor: Cm::Any, keypad: Km::Application, mok: Mk::Any, seq, decbkm: None }
         }
-        fn kp(suffix: &'static str, normal: &'static str) -> Vec<Rule> {
+        fn kp(seq: &'static str, suffix: &'static str, normal: &'static str) -> Vec<Rule> {
             vec![
-                kpd(suffix),
+                kpd(seq),
                 PcMods { prefix: "\x1bO", fin: suffix, keypad: Km::Application },
                 Lit { mods: 0, empty_any: true, cursor: Cm::Any, keypad: Km::Normal, mok: Mk::Any, seq: normal, decbkm: None },
             ]
@@ -415,22 +414,22 @@ fn function_keys() -> &'static [(u16, Vec<Rule>)] {
             (143, pc_lit("\x1b[44;", "~", "\x1b[44~")),        // f23
             (144, pc_lit("\x1b[45;", "~", "\x1b[45~")),        // f24
             (145, pc_lit("\x1b[46;", "~", "\x1b[46~")),        // f25
-            (80, kp("p", "0")),   // numpad_0
-            (81, kp("q", "1")),   // numpad_1
-            (82, kp("r", "2")),   // numpad_2
-            (83, kp("s", "3")),   // numpad_3
-            (84, kp("t", "4")),   // numpad_4
-            (85, kp("u", "5")),   // numpad_5
-            (86, kp("v", "6")),   // numpad_6
-            (87, kp("w", "7")),   // numpad_7
-            (88, kp("x", "8")),   // numpad_8
-            (89, kp("y", "9")),   // numpad_9
-            (95, kp("n", ".")),   // numpad_decimal
-            (96, kp("o", "/")),   // numpad_divide
-            (104, kp("j", "*")),  // numpad_multiply
-            (107, kp("m", "-")),  // numpad_subtract
-            (90, kp("k", "+")),   // numpad_add
-            (97, kp("M", "\r")),  // numpad_enter
+            (80, kp("\x1bOp", "p", "0")),   // numpad_0
+            (81, kp("\x1bOq", "q", "1")),   // numpad_1
+            (82, kp("\x1bOr", "r", "2")),   // numpad_2
+            (83, kp("\x1bOs", "s", "3")),   // numpad_3
+            (84, kp("\x1bOt", "t", "4")),   // numpad_4
+            (85, kp("\x1bOu", "u", "5")),   // numpad_5
+            (86, kp("\x1bOv", "v", "6")),   // numpad_6
+            (87, kp("\x1bOw", "w", "7")),   // numpad_7
+            (88, kp("\x1bOx", "x", "8")),   // numpad_8
+            (89, kp("\x1bOy", "y", "9")),   // numpad_9
+            (95, kp("\x1bOn", "n", ".")),   // numpad_decimal
+            (96, kp("\x1bOo", "o", "/")),   // numpad_divide
+            (104, kp("\x1bOj", "j", "*")),  // numpad_multiply
+            (107, kp("\x1bOm", "m", "-")),  // numpad_subtract
+            (90, kp("\x1bOk", "k", "+")),   // numpad_add
+            (97, kp("\x1bOM", "M", "\r")),  // numpad_enter
             (109, arrows("\x1b[1;", "A", "\x1b[A", "\x1bOA")), // numpad_up
             (110, arrows("\x1b[1;", "B", "\x1b[B", "\x1bOB")), // numpad_down
             (111, arrows("\x1b[1;", "C", "\x1b[C", "\x1bOC")), // numpad_right
@@ -542,21 +541,13 @@ fn function_keys() -> &'static [(u16, Vec<Rule>)] {
     })
 }
 
-/// 一次性拼接泄漏（kpDefault 的 `\x1bO{sx}`；表只建一次，静态生命周期）。
-fn leak_concat(a: &'static str, b: &'static str) -> &'static str {
-    let mut s = String::with_capacity(a.len() + b.len());
-    s.push_str(a);
-    s.push_str(b);
-    Box::leak(s.into_boxed_str())
-}
-
 /// PC 功能键匹配（key_encode.zig `pcStyleFunctionKey`）：按表序找首个通过
 /// cursor/keypad/mok/mods 四道门的项。命中返回完整序列（PcMods 即时格式化）。
 fn pc_style_function_key(
     key: Key,
     binding: Mods,
     opts: &KeyOptions,
-) -> Option<Vec<u8>> {
+) -> Option<std::borrow::Cow<'static, [u8]>> {
     let mods_int = binding.0 as u8;
     // 1035（默认 on）⇒ 小键盘恒数值模式（ghostty 的 numlock 隐式判定）
     let keypad_app = !opts.ignore_keypad_with_numlock && opts.keypad_key_application;
@@ -577,7 +568,7 @@ fn pc_style_function_key(
                     out.extend_from_slice(prefix.as_bytes());
                     // 矩阵码 = 序号 + 2（前缀已含 num; 或 \x1bO）
                     let _ = write!(out, "{}{}", i + 2, fin);
-                    return Some(out);
+                    return Some(std::borrow::Cow::Owned(out));
                 }
                 Rule::Lit { mods, empty_any, cursor, keypad, mok, seq, decbkm } => {
                     if !cursor_gate(*cursor, opts.cursor_key_application) {
@@ -598,10 +589,10 @@ fn pc_style_function_key(
                     }
                     if opts.backarrow_key_mode {
                         if let Some(d) = decbkm {
-                            return Some(d.as_bytes().to_vec());
+                            return Some(std::borrow::Cow::Borrowed(d.as_bytes()));
                         }
                     }
-                    return Some(seq.as_bytes().to_vec());
+                    return Some(std::borrow::Cow::Borrowed(seq.as_bytes()));
                 }
             }
         }
