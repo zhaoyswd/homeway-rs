@@ -315,14 +315,33 @@ impl PtySession {
 
     /// 阻塞收尸（pump 退出路径用），返回退出码。
     ///
-    /// ⚠️ 已知差异登记（D-19）：Go 对**信号致死**回 -1（`ProcessState.ExitCode()`），
-    /// portable-pty 的 ExitStatus 对信号形态固定 1——信号死形态的 ENDED code 与 Go 差
-    /// 一个值；正常退出码（0..255）两侧一致。
+    /// D-19 处置（2026-10-04 收口）：Go 对**信号致死**回 -1（`ProcessState.ExitCode()`），
+    /// portable-pty 的 `exit_code()` 对信号形态固定 1——这里按 Go -1 语义映射
+    /// （`ExitStatus::signal()` 可辨信号死），ENDED code 与 Go 出口逐值一致；
+    /// 正常退出码（0..255）两侧本就一致。差异注记：portable-pty 不暴露具体信号值
+    /// 的数值面（只给词面），而 EXIT 面只需要数值——Go 也只给数值。
     pub fn wait(&mut self) -> i32 {
         match self.child.wait() {
+            Ok(status) if status.signal().is_some() => -1,
             Ok(status) => status.exit_code() as i32,
             Err(_) => 0,
         }
+    }
+
+    /// 有界收尸（Go `finish` 的 2s 宽限同义）：宽限内 `try_wait` 轮询，超时
+    /// SIGKILL 兜底再阻塞收尸。返回退出码（信号死 ⇒ -1，D-19 映射同 [`Self::wait`]）。
+    pub fn wait_bounded(&mut self, grace: std::time::Duration) -> i32 {
+        let deadline = std::time::Instant::now() + grace;
+        while std::time::Instant::now() < deadline {
+            if let Some(st) = self.try_wait() {
+                return if st.signal().is_some() { -1 } else { st.exit_code() as i32 };
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        if self.try_wait().is_none() {
+            self.kill_force();
+        }
+        self.wait()
     }
 
     /// 读一批 PTY 输出（阻塞语义由调用方的 fd 超时/线程模型决定）。

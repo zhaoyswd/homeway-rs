@@ -29,6 +29,7 @@
 pub mod agent;
 pub mod codec;
 pub mod frames;
+pub mod legout;
 pub mod manifest;
 pub mod session;
 pub mod keyenc;
@@ -36,7 +37,9 @@ pub mod pty;
 pub mod responder;
 pub mod ring;
 pub mod scan;
+pub mod service;
 pub mod vt;
+pub mod wire;
 
 /// 跨模块共享的测试件：golden 夹具读取与 digest 口径（只在测试构建编译）。
 ///

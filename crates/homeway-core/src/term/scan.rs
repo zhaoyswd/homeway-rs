@@ -50,6 +50,8 @@ pub struct TermScan {
     progress: Progress,
     osc_status: String,
     notify: String,
+    /// OSC 7 上报的工作目录原始值（`file://<host><path>`；LIST 的 cwd 来源）。
+    pwd: String,
     /// 当前标题**早于**本代前景 agent（切换 agent 时置位）：显示照旧用，
     /// 检测不得把上一进程的标题算进本进程判定。
     title_stale: bool,
@@ -186,9 +188,18 @@ impl TermScan {
         };
         match code {
             b"0" | b"1" | b"2" => self.set_title(String::from_utf8_lossy(rest).as_ref()),
+            b"7" => self.set_pwd(String::from_utf8_lossy(rest).as_ref()),
             b"9" => self.finish_osc9(&String::from_utf8_lossy(rest)),
             b"21337" => self.finish_osc21337(&String::from_utf8_lossy(rest)),
             _ => {}
+        }
+    }
+
+    /// OSC 7：工作目录上报（原始值原样存；剥路径在 [`pwd_path`]——Go vtPwdPath 同款）。
+    fn set_pwd(&mut self, raw: &str) {
+        let v = sanitize_value(raw, 4096);
+        if v != self.pwd {
+            self.pwd = v;
         }
     }
 
@@ -295,6 +306,32 @@ impl TermScan {
         &self.notify
     }
 
+    /// OSC 7 原始值（`file://…`；未上报 = 空）。
+    pub fn pwd(&self) -> &str {
+        &self.pwd
+    }
+
+    /// 剥成文件系统路径（Go `vtPwdPath` 同款）：`file://<host>/<path>` 取 host 后
+    /// 第一个 '/' 起；百分号转义按 URI 解码；非 file:// / 无路径 = 空。
+    pub fn pwd_path(&self) -> String {
+        let Some(rest) = self.pwd.strip_prefix("file://") else {
+            return String::new();
+        };
+        let Some(i) = rest.find('/') else {
+            return String::new();
+        };
+        let path = &rest[i..];
+        if path.is_empty() {
+            return String::new();
+        }
+        if path.contains('%') {
+            if let Some(d) = percent_decode(path) {
+                return d;
+            }
+        }
+        path.to_string()
+    }
+
     /// legacy 模式位掩码。
     pub fn modes(&self) -> u32 {
         self.modes
@@ -320,6 +357,37 @@ fn sanitize_value(v: &str, max: usize) -> String {
         }
     }
     String::from_utf8_lossy(&out).into_owned()
+}
+
+/// URI 百分号解码（Go `url.PathUnescape` 的路径面近似：`%HH` 两位十六进制；
+/// '+' 不当空格——那是 query 面语义）。非法转义返回 None（调用方回落原串）。
+fn percent_decode(v: &str) -> Option<String> {
+    let bytes = v.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'%' {
+            if i + 2 >= bytes.len() {
+                return None; // 残缺转义
+            }
+            let hex = |b: u8| -> Option<u8> {
+                match b {
+                    b'0'..=b'9' => Some(b - b'0'),
+                    b'a'..=b'f' => Some(b - b'a' + 10),
+                    b'A'..=b'F' => Some(b - b'A' + 10),
+                    _ => None,
+                }
+            };
+            let h = hex(bytes[i + 1])?;
+            let l = hex(bytes[i + 2])?;
+            out.push(h << 4 | l);
+            i += 3;
+        } else {
+            out.push(bytes[i]);
+            i += 1;
+        }
+    }
+    Some(String::from_utf8_lossy(&out).into_owned())
 }
 
 fn sanitize_title(t: &str) -> String {

@@ -67,7 +67,7 @@ pub struct TermError {
 }
 
 impl TermError {
-    fn new(code: TermErrorCode, msg: impl Into<String>) -> Self {
+    pub(crate) fn new(code: TermErrorCode, msg: impl Into<String>) -> Self {
         TermError { code, msg: msg.into() }
     }
 }

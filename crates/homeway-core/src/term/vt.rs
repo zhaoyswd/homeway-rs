@@ -15,7 +15,8 @@
 //!
 //! 并发：本类型不带锁——由会话层的会话锁串行（同 Go 的 sessionVT 纪律）。
 
-use alacritty_terminal::event::{EventListener, VoidListener};
+use alacritty_terminal::event::Event;
+use alacritty_terminal::event::EventListener;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::{Cell as AlacCell, Flags as AlacFlags};
@@ -23,6 +24,7 @@ use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
 use alacritty_terminal::vte::ansi::{
     self as alac_ansi, Color as AlacColor, CursorShape as AlacCursorShape, NamedColor,
 };
+use std::sync::Arc;
 
 use super::keyenc;
 use super::responder;
@@ -195,7 +197,7 @@ pub enum Dirty {
 
 /// 一个会话的服务端仿真器。
 pub struct SessionVt {
-    term: Term<VoidListener>,
+    term: Term<ClipSink>,
     processor: alac_ansi::Processor,
     cols: usize,
     rows: usize,
@@ -230,6 +232,48 @@ pub struct SessionVt {
     /// hook/put/unhook ⇒ 这两族在解析器里被静默丢弃；扫描器在喂入前按字节流识别，
     /// 尾巴 = 上一批结尾处「可能是模式前缀」的未决字节）。
     scan_tail: Vec<u8>,
+    /// OSC 52 事件积压（`write_collecting` 内同步产生；会话层在喂入后取走处理）。
+    clip_events: Arc<std::sync::Mutex<Vec<ClipEvt>>>,
+}
+
+/// OSC 52 双向事件（alacritty 经 EventListener 上抛；Go 侧 = ghostty 的
+/// clipboard write/read 回调面，任务 2.7）。**只收集 Clipboard**——primary
+/// selection 没有客户端数据源（Go `clipboardReadRouter` 的 location≠0 拒绝同义）。
+pub enum ClipEvt {
+    /// 程序写剪贴板（会话层转 CLIPBOARD 帧发 surface 腿）。
+    Store(String),
+    /// 程序读剪贴板（会话层用 active 腿上报的缓存调 `answer` 产应答字节写 PTY）。
+    Load(std::sync::Arc<dyn Fn(&str) -> String + Send + Sync>),
+}
+
+/// 会话级事件接收方（EventListener 面）：OSC 52 双向 + 其余丢弃
+/// （alacritty 的 PtyWrite 类应答已被 [`SessionVt`] 的拦截面接管，不走事件）。
+#[derive(Clone, Default)]
+struct ClipSink {
+    events: Arc<std::sync::Mutex<Vec<ClipEvt>>>,
+}
+
+impl EventListener for ClipSink {
+    fn send_event(&self, event: Event) {
+        use alacritty_terminal::term::ClipboardType;
+        match event {
+            Event::ClipboardStore(ClipboardType::Clipboard, text) => {
+                if let Ok(mut ev) = self.events.lock() {
+                    if ev.len() < 64 {
+                        ev.push(ClipEvt::Store(text));
+                    }
+                }
+            }
+            Event::ClipboardLoad(ClipboardType::Clipboard, answer) => {
+                if let Ok(mut ev) = self.events.lock() {
+                    if ev.len() < 64 {
+                        ev.push(ClipEvt::Load(answer));
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 impl Default for SessionVt {
@@ -238,15 +282,8 @@ impl Default for SessionVt {
     }
 }
 
-/// 会话级事件接收方（EventListener 面）。term 服务的剪贴板/写回应答事件由 6c/6f 接线；
-/// 底座阶段用空实现（VoidListener 同义，但保留类型以便后续替换）。
-#[derive(Default)]
-pub struct Sink;
-
-impl EventListener for Sink {
-    fn send_event(&self, _event: alacritty_terminal::event::Event) {}
-}
-
+/// 会话级事件接收方（EventListener 面）。term 服务的剪贴板/写回应答事件由 6f 接线；
+/// 应答字节不经事件（TermProbe 拦截面直接产进 `responses`）。
 impl SessionVt {
     /// 建 cols×rows 终端，回滚行数上限 scrollback（0 ⇒ 默认 10000）。
     pub fn new(cols: u16, rows: u16, scrollback: usize) -> Result<Self, String> {
@@ -264,8 +301,10 @@ impl SessionVt {
         };
         let (cols, rows) = (cols as usize, rows as usize);
         let dims = SimpleDims { cols, rows };
+        let sink = ClipSink::default();
+        let clip_events = sink.events.clone();
         Ok(SessionVt {
-            term: Term::new(config, &dims, VoidListener),
+            term: Term::new(config, &dims, sink),
             processor: alac_ansi::Processor::new(),
             cols,
             rows,
@@ -282,7 +321,14 @@ impl SessionVt {
             scroll_top: 0,
             scroll_bottom: rows as i32 - 1,
             scan_tail: Vec::new(),
+            clip_events,
         })
+    }
+
+    /// 取走积压的 OSC 52 事件（喂入后由会话层处理：Store → CLIPBOARD 帧、
+    /// Load → 用 active 腿缓存产应答字节）。
+    pub fn take_clip_events(&mut self) -> Vec<ClipEvt> {
+        std::mem::take(&mut *self.clip_events.lock().unwrap_or_else(|e| e.into_inner()))
     }
 
     /// 设置客户端上报的主题色（Go `SetDefaultColors` 面；THEME 帧后由会话层调）。

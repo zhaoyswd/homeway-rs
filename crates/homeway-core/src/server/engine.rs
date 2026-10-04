@@ -134,6 +134,7 @@ pub struct ServeEngine {
     driver: Mutex<Option<std::thread::JoinHandle<()>>>,
     pub local_port: u16,
     stop_flags: Vec<Arc<AtomicBool>>,
+    term_srv: Option<Arc<crate::term::service::TermService>>,
     pub state_dir: PathBuf,
     pub serve_dir: PathBuf,
     socks: Vec<(PathBuf, (u64, u64))>,
@@ -299,10 +300,10 @@ impl ServeEngine {
         let local_port = bind.local_port();
         std::fs::write(cache_dir.join("listen_port.txt"), format!("{local_port}\n"))?;
 
-        // ---- files / speedtest UDS 服务（E14/E17；term 不起不建 sock——LocalServices
-        //      条目保留，拨号 ENOENT 快速失败回 RST）----
+        // ---- files / speedtest / term UDS 服务（E14/E15/E16/E17）----
         let mut stop_flags = Vec::new();
         let mut socks = Vec::new();
+        let mut term_srv: Option<Arc<crate::term::service::TermService>> = None;
         let files_srv = crate::files_server::FilesServer::open(cfg.files_root.as_deref(), Arc::clone(&dlogf)).ok();
         if let Some(fsrv) = files_srv {
             match crate::files_server::listen_local_service(&serve_dir, "files.sock", &dlogf) {
@@ -357,6 +358,46 @@ impl ServeEngine {
                     "⚠️ speedtest 监听 {} 失败（{e}）—— 测速功能会报错（state 目录异常/被其它实例占用），其余功能不受影响",
                     serve_dir.join("speedtest.sock").display()
                 ));
+            }
+        }
+
+        // ---- 终端会话 / agent gateway（exit-service-uds：UDS 承载 <serve>/term.sock）。
+        //      客户端拨隧道 IP:<term_port>，拦截层按 LocalServices 映射转投；会话由
+        //      出口持有（客户端断开只摘泵，不杀进程）；开关 HOMEWAY_TERM=off，调参
+        //      HOMEWAY_TERM_*（6f-3b）。----
+        if crate::term::service::disabled_by_env() {
+            (logf)("term 服务被 HOMEWAY_TERM=off 关闭");
+        } else {
+            // stateDir 参数 = manifest 覆盖目录基（<dir>/agent-detection/）
+            let tsrv = crate::term::service::TermService::new(Arc::clone(&dlogf), Some(&serve_dir));
+            match crate::files_server::listen_local_service(&serve_dir, "term.sock", &dlogf) {
+                Ok(ln) => {
+                    let own = sock_identity(&serve_dir.join("term.sock"));
+                    socks.push((serve_dir.join("term.sock"), own));
+                    // 就绪行（判据 E16）：socket + shell + 历史窗口 + 能力位 + vt 现状
+                    (logf)(&format!(
+                        "# Serving terminal sessions on sock={} (shell={}, history={}, features={}, vt={})",
+                        serve_dir.join("term.sock").display(),
+                        tsrv.shell_text(),
+                        tsrv.history_text(),
+                        tsrv.features_text(),
+                        tsrv.vt_text()
+                    ));
+                    let t = Arc::clone(&tsrv);
+                    std::thread::Builder::new()
+                        .name("homeway-term".into())
+                        .spawn(move || t.serve(ln))
+                        .ok();
+                    term_srv = Some(tsrv);
+                }
+                Err(e) => {
+                    // 与 files 同一取舍：可选服务起不来不影响隧道/转发
+                    (logf)(&format!(
+                        "⚠️ term 监听 {} 失败（{e}）—— 终端功能会报错（state 目录异常/被其它实例占用），其余功能不受影响",
+                        serve_dir.join("term.sock").display()
+                    ));
+                    tsrv.close();
+                }
             }
         }
 
@@ -511,6 +552,7 @@ impl ServeEngine {
             driver: Mutex::new(Some(driver)),
             local_port,
             stop_flags,
+            term_srv,
             state_dir: cfg.state_dir.clone(),
             serve_dir,
             socks,
@@ -521,6 +563,10 @@ impl ServeEngine {
     pub fn shutdown(&self, grace: Duration) {
         for f in &self.stop_flags {
             f.store(true, Ordering::SeqCst); // ② UDS listeners（accept 循环下一拍退出）
+        }
+        // term：全部会话 ENDED(service_stopped) + 子进程收尸（UDS listener 由 stop_flags 收）
+        if let Some(t) = &self.term_srv {
+            t.close();
         }
         let _ = self.cmd_tx.send(EngineCmd::Stop { grace }); // ①③④ 驱动线程内按序执行
         // ⑤ sock 文件清理（身份比对——只删自己 bind 出来的那个）
