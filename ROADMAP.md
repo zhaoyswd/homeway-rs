@@ -56,54 +56,61 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 | **R3** | 出口（多 peer WG device + 拦截层 + files/DNS/STUN/UPnP + servercore） | **完成**（2026-10-02：两道门全过 + 判据全量实测入册） | 6/6 步 |
 | **R4** | 中继（信封 + 准入 + 升级条纹） | **完成**（2026-10-03：两道门全过 + 三链路判据实测 + 升级条纹实测） | 4/4 步 |
 | **R5** | 互操作矩阵全量 + fuzz + 性能 A/B + 台账三方门 | **完成**（2026-10-03：两道门全过〔两轮代码评审 4高/15中/18低全处置〕+ 终验轮 4 六链路 + L3 复跑全绿 + PERF-AB 入库 + ci-local 一键门全绿） | 6/6 步 |
-| **R6** | term 服务面（协议/surface 产出/检测引擎 + 自建编码器/应答器） | **进行中**（2026-10-04 会话 1+2：6a 设计 + 6b vt 底座 + 门一评审〔4高全修〕+ 6c 应答器〔47/47 向量全绿〕；详见 R6 节进度注记） | 6a/6b ✅ 门一 ✅ 6c ◐ |
+| **R6** | term 服务面（协议/surface 产出/检测引擎 + 自建编码器/应答器） | **进行中**（2026-10-04 会话 1+2+3：6a 设计 + 6b vt 底座 + 门一评审〔4高全修〕+ 6c 编码器/应答器全量〔键 387/鼠 160/应答 57 向量逐字节全绿 + 编码器评审 1高3中11低全处置〕+ 门一中危清账 A1/A2/A5/A3/A4 + 6d 帧族/词表面/会话注册表；详见 R6 节进度注记） | 6a/6b ✅ 门一 ✅ 6c ✅ 6d ◐ |
 | **R7** | APP 接入（napi-rs 或 C-ABI 胶水 + OHOS 交叉 + 20 导出面 + hostsession） | 未开始 | — |
 | **R8** | 终测收官（包体/性能终测 + 共存定案 + 文档指针补录） | 未开始 | — |
 
-**下一步（当前指针）**：**R6 6c 键/鼠标编码器**（应答器已完成，接棒从 R6 节
-「R6 进度注记」读起——真源/向量/已定调规则都在那里）。R5 已收官（2026-10-03，两道门
+**下一步（当前指针）**：**R6 6e surface 产出端**（编码器 codec.rs——cell 编码/
+SNAPSHOT/DIFF 体；接棒从本节「R6 进度注记」读起）。R5 已收官（2026-10-03，两道门
 全过，评审记录 = `docs/reviews/R5.md`、性能报告 = `docs/PERF-AB.md`）。
 
 **R6 进度注记（2026-10-04，接棒真源）**：
 
-- **6a 设计 ✅**（`docs/reviews/R6-design.md`，已按实测向量两轮回写校正）；**门一评审 ✅**
-  （`docs/reviews/R6-gate1.md`：4 高危 B1-B4 已修 + B5 已修 + F1 机制口径已并入实现；
-  **中危未清账**：A1 region 层设计缺口〔6f 前必须补——pkg/term/manifest/region.go 448 行
-  的判定范围选择器面设计全文只字未提〕、A2 regex 方言垫片〔`\p{Alphabetic}` 在 3 份
-  manifest 真用，Rust regex 原生语义不同，「编译通过即证」不成立〕、A5 帧表九种布局 +
-  截断上限〔6d 前补〕、A6 env 面 15 项〔6f 补〕、A10/D-4 X10 wire 位〔已部分自管〕、
-  A10/D-10 darwin/Linux alt 分支〔向量是 darwin 宿主产的，linux 分支无判据——6g 补〕、
-  B6 47/1047 备用屏〔已记账、屏内容面无公开 API 登记残余〕、C4 带样式空格 golden 零
-  覆盖、低危 12 条见 gate1 记录）。
+- **6a 设计 ✅**（`docs/reviews/R6-design.md`，已按实测向量两轮回写校正 + **§九增量节**
+  〔门一中危清账：A5 帧总表 23 op 全表/截断上限单表、HELLO 尾随块规格、A3 ENDED/
+  stateV2/agent 冻结词表、A4 光标块 6B、A2 regex 垫片定案、A1 region 层全集、§9.7
+  残余差异登记表〕）；**门一评审 ✅**（`docs/reviews/R6-gate1.md`：4 高危 B1-B4 已修
+  + B5 已修 + F1 机制口径已并入实现；中危 A1/A2/A5/A3/A4 已于 §九清账；**未清**：
+  A6 env 面 15 项〔6f 补〕、A10/D-10 linux 分支〔向量是 darwin 宿主产的，linux 无
+  判据——6g 补：CI 加 x86_64-linux cargo check + linux 宿主向量〕、B6 47/1047 备用屏
+  〔已记账、屏内容面无公开 API 登记残余〕、C4 带样式空格 golden 零覆盖、低危 12 条见
+  gate1 记录）。
 - **6b vt 底座 ✅**：`term/vt.rs`（SessionVt + TermProbe 双面分发器 + B1-B4 修复 +
-  B3 行指纹过滤），8 测试绿（golden digest/光标/回滚/模式位对拍 + ED2 Full + 空闲差分空
-  + rows_at + 1049l 复位 + RIS）。
-- **6c 应答器 ✅**：`term/responder.rs` + vt.rs 集成（DecModes 38 位全模式表 + CPR DECOM
-  折算 + OSC 颜色三分量/镜像/基表 + kitty query + write_collecting）；**47/47 向量全绿**
-  （`term_responder.json` 47 案 + palette 256 项）。**判据已扩展待实现面**：DECRQSS 三态
-  （`DCS $q` → `DCS 1 $ r … ST`——F3，向量已采）与 `CSI ? 998 n` 可见性（→ `[?999;1n`
-  ——F2，已采）都还没在 Rust 实现（vte 表外形态，需旁路扫描或 DCS hook 拦截）。
-- **6c 键/鼠标编码器 ◐ 未开工**（下一棒主体）：向量已全产（`term_keyenc.json` 349 案 +
-  `term_mouseenc.json` 160 案）。实现路径：
-  ① 键码表 = 向量 keys 节 47 键 + libghostty-vt `src/input/kitty.zig` raw_entries 81 条
-  （`{key, code, final, modifier}`，kitty spec 值）；
-  ② legacy 表 = `function_keys.zig`：pcStyle 生成器（15 修饰位矩阵 × `\x1b[1;{}A` 形模板，
-  modcode=索引+2）+ cursorKey（DECCKM 分 CSI/SS3）+ kpKeys（DECKPAM 分流）+ tab/backspace
-  全修饰矩阵（mok normal/other 双列）；
-  ③ ctrl 白名单（Kitty 同款 `ctrlSeq` 表：c/space/数字/符号 → C0；i/m/[/\` 故意除外 →
-  CSI u）——**已实测钉死两条路径**：text 可打印 + ctrl-only + 表内 → C0；text 是控制
-  字符 → CSI u（codepoint=text 码点）；
-  ④ kitty 路径决策树 = key_encode.zig kitty()：无表项且无 unshifted ⇒ 纯文本直发/丢弃、
-  binding_mods 空 ⇒ enter/tab/backspace 裸字节、可打印直发、release 无 EVENT_TYPES 丢弃、
-  alternates/associated text 位、`:1` press 显式（**~ 终止符族不带**——实测 f5 ctrl 无 :1
-  而字母族有）、darwin alt 分支（向量 = darwin 形态）；
-  ⑤ 鼠标 = mouse_encode.zig + **B5 单值语义**（vt.rs 已有 mouse_tracking/mouse_format
-  last-set 字段可直接消费）：坐标 ≥222 不报（先于格式选择）、1000 模式 release 报 `#`、
-  X10 只报 press、修饰位 shift4/meta8/ctrl16、wheel=64/65；
-  ⑥ 对拍测试形态照 `responder_parity_with_go_vectors`（喂 SessionVt 模式序列 + encode）。
+  B3 行指纹过滤），golden digest/光标/回滚/模式位对拍全绿。
+- **6c 编码器/应答器 ✅ 全量**（2026-10-04 会话 3 收口，commit cb7ebe8/bdd6cb3）：
+  - `term/responder.rs` + vt 集成：47 案向量全绿 + **补全面实装**（旁路扫描器——
+    vte 0.15 语义层不转发 `CSI ? 998n` 与 DCS hook/put/unhook ⇒ `write_collecting`
+    按字节流扫描、命中应答按流内位置与解析器应答交错、scan_tail 跨块续接；
+    `?998n`→`?999;1n`、DECRQSS 三态〔SGR printAttributes 形态/DECSCUSR/DECSTBM/
+    DECSLRM 恒 invalid 登记〕）；**57 案全绿**（含 chunks 分片契约 + 每案 4 切点
+    跨块轮；PARITY_PENDING 豁免名单已清空）。
+  - `term/keyenc.rs`：键/鼠标/焦点/粘贴编码器（libghostty-vt key_encode/
+    mouse_encode/function_keys/kitty.zig 决策树直译；**键 387 案 + 鼠标 160 案
+    逐字节全绿**）。已定调细则：wire mods 位序 shift1|ctrl2|alt4|super8 与 ghostty
+    结构体位序**不同**（矩阵表/手写表/CsiUMods 位序各用各的——初版全踩过，复审确认
+    无混用）；CSIu 位序 = shift1|alt2|ctrl4；u/~ 终止符族 press 不带 `:1` 而字母族带；
+    darwin 口径 = super 抑制文本 + option-as-alt 恒 false（alt 前缀无、mok2 剥 alt 位、
+    kitty 关联文本 alt 不阻）；B5 编码面单值 reset = **无条件覆盖**（评审 r1-中3 整改
+    + 交错回归）。
+  - **编码器评审 ✅**（`docs/reviews/R6-encoder.md`，dsh r1.NpLX0n：1 高/3 中/11 低
+    全处置——高危〔CJK 截断 panic〕/中危〔dec_ended 越界、B5 reset、热路径拷贝〕全修，
+    低危 9 修 2 登记〔§9.7：DECSLRM 恒 invalid、lossy 替换〕）。
+- **6d 协议栈 ◐**（commit 5c9d4fc/eeaec00）：`term/frames.rs`（23 op 全表 + 词表面
+  〔ENDED/stateV2/agent/features/caps/hello_flags/create_flags/replay_flags/
+  input_kind/text_bits〕+ 帧读写 + 载荷族〔greeting/hello+尾随块/create/resize/
+  attached/replay-done/ended/state/error/name + INPUT 四类〕；fixtures/term/
+  frames.v1.jsonl 13 案〔含 3 负例〕全绿）+ `term/session.rs`（**会话注册表纯状态机**：
+  attach_or_create 四象限/create_only 极性/register_leg 全序〔同实例替换 self_reconnect
+  → 接管 replaced → 腾位〔恒有受害者 ⇒ too_many_clients 是防御性死支〕→ 入表即活动〕/
+  活动选举 tie-break/finish 三收尾原因/错误码词表；ENDED 全走 frames 冻结词表、
+  判据行生成）。**未做**（6e/6f 范围）：surface 体编码（codec.rs——cell 三标记流/
+  SNAPSHOT/DIFF/FETCH-ROWS，`surface_codec.json` 向量待产）、LIST JSON 字段序、
+  会话装配（PTY spawn/ring/腿写者/回放握手）、`tools/vector-gen/term/` 的
+  surface_codec 与 manifest_eval 向量生成器。
 - **向量生成器**：`tools/vector-gen/term/`（vecgen_term_test.go + vecgen_term_aux.go 伴随
   包文件——test 不能用 cgo）+ `tools/gen-vectors.sh` 第三段；产物 5 件在 `fixtures/vectors/`。
-  **升级基线后必须重跑**（`tools/gen-vectors.sh` 确定性 diff 门）。
+  **升级基线后必须重跑**（`tools/gen-vectors.sh` 确定性 diff 门）。评审建议待采：向量补
+  交错 set/unset 鼠标与 >32B DCS 参数案（Rust 侧回归已先行）。
 
 **R6 前置批处置（2026-10-04 收口，评审记录 = `docs/reviews/R6-pre.md`）**：
 | # | 项 | 处置 | 判据证据 |
