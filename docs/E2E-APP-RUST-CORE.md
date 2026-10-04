@@ -5,6 +5,9 @@
 > （1.98MB vs Go 版 9.7MB），tier `CORE_IMPL=rust` 档构建（51036b4）。
 > 判据口径：全部真凭据（核日志行 / 出口日志行 / 系统计数器 / UI dumpLayout 文本）。
 > 现役出口（~/bin/homeway v0.16.0，launchd）全程只读（取 token 一次、读日志），未动。
+>
+> **第 3 轮（7l 整改批复验 + 7m 补验）见 §6——2026-10-04 19:53–20:21，核 =
+> `ea00b2c4e781-rust`（整改批 0baca9f + 微修，tier rust 档新脏检出闸/钉定门首跑通过）。**
 
 ## 0. 形态
 
@@ -83,6 +86,10 @@
 `界面状态 → connected（…系统VPN=up，心跳时间戳=…）`。字节级 diff 归第 3 棒
 （如需可加 App 侧诊断 dump 面）。
 
+> **第 3 棒收口（§6.A4）**：上述折衷已由「对账快照」面收口——attached 后 1.5s
+> 每世代产一行与 `ClientCoreTunStatus` 同源（同纯函数 + 同组装件 runner_of/
+> transport_of）的真机字节快照，键面/键序/值域逐项过账，见 §6。
+
 ## 4. 问题分级清单
 
 **P1（本轮修复）**
@@ -102,3 +109,69 @@
   `~/bin/homeway`（PID 52279）全程未动。
 - 真机铁律遵守：无锁屏/息屏操作（仅 wakeup/timeout 只读查询）；hdc 一律 `-t`；
   tier 仓跟踪文件改动仅 build-core.sh（CORE_IMPL 开关）。
+
+## 6. 第 3 轮（7l 整改批复验 + 7m 补验四项；2026-10-04 19:53–20:21）
+
+核 = `ea00b2c4e781-rust`（整改批 0baca9f + SpeedHost 相位微修；2055944B ≈ 1.9MB）。
+tier rust 档**新脏检出闸 + HEAD 钉定门首跑通过**（4b8a0a1：核源干净检出、
+产物标记 SHA == HEAD）。轮 3 拓扑 = 轮 1 同款本地 Rust exit（42670）+ relay（42770），
+token 经 `serve token` 取、`aa start --ps host_token` 注入。
+
+### A. 判据逐项
+
+| # | 项 | 结果 | 证据 |
+|---|---|---|---|
+| A1 | 版本/身份/数据面装配 | ✓ | `身份：复用（dev=7dc61647 pub=0e6dc129）`（与轮 1/2 同 devTag 跨核稳定）；`隧道侧就绪（L3 直通…）`；`新栈会话已建立（token 端点 2 个…）` |
+| A1 | 候选/赛跑/warmup/attach/桥 | ✓ | `候选端点（2 条…LAN、中继）`→`赛跑结算：胜出 直连 192.168.3.12:42670（镜像 1 包，耗时 24ms）`→`warmup pong: 就绪（判据=wg）`→`running (mtu=1280 tunIp=100.64.248.46)`→`attached（数据面已接管 fd=90，L3 直通）`→三座桥监听行 |
+| A1 | link/RREG/peer 表 | ✓ | `link: via=direct ep=192.168.3.12:42670 rtt=25ms`；`RREG 注册刷新 → …（中继=false）`；exit `peer: + dev=7dc61647 pub=0e6dc129 ip=100.64.34.94 n=1/32`（三指纹逐字段一致）→ `peer: ~ refresh` |
+| A4' | **tunStatusJSON 真机对账快照**（7m-④ 收口） | ✓ | attached 后 1.5s 产出完整 JSON（§6.B 逐项过账）；与 `ClientCoreTunStatus` 同源同字节面（同纯函数 + runner_of/transport_of 同组装）；轮 3 两世代各产一行（本地 exit 轮 + 现役出口轮），键面/键序/值域全符合 |
+| A5' | **测速相位 UI**（M-7 真机验证） | ✓ | 卡片副标题实测 `下行测速中` → `上行测速中` 两相位切换（整改前恒「连接中」的 UI 死相消除）；再点卡片 = 取消 → UI 回 idle 并恢复旧结果副标题（M-8 取消面真机无 hang） |
+| A5' | **测速 EOF 归因**（7m-①） | △ 定位收口 | 下行 4 会话全成（各 ~12s、109–142MB ≈ 94Mbps——桥/WG/服务/代答回执全通）；上行 4 连接建立 + 请求送达 + **数据帧头已到**（exit EOF 落在帧载荷中途 ⇒ 有真实数据流入），但窗口内未跑完 → 客户端轮挂到 82s 看门狗 kill（App 终态 `失败（timeout）测速连接失败：连接超时` = 看门狗重写面）→ 双侧 EOF。**归因 = phone→exit 的 WG 上行 bulk 吞吐退化**（同引擎 host 侧 up=411Mbps、同签名第 2 棒旧核即存在 ⇒ 非本批引入；与 R6.6 登记的真机 encap/UDP 发送路径瓶颈同族——CC 垫片只覆盖下行）。修复归 R8 性能终测（smoltcp 0.14 + 发送路径 profile 判据已在 R6.6 §三立项） |
+| A4' | **term 键盘输入**（7m-② 收口，超出预期） | ✓ 机器采证完整 | ① 回显视觉证据：surface 上 `zhaozhe@MacBook-Pro ~ %` + `echo R7KEYTEST` 回显行（`uitest uiInput text` 能进 native surface——第 2 棒登记的「HID 不进 surface」对 `uiInput text/keyEvent` 不成立）；② 副作用硬证据：`touch /tmp/R7KEY_OK` + Enter(2054) → 文件真实出现在 exit 主机 `/tmp/`（键盘→INPUT 帧→隧道→term 服务→PTY→zsh 执行全链闭环）；③ 退出自灭：`exit` + Enter → `term: 会话 … 腿断开（kind=app 原因=finish）` + App `长时任务来源全部释放（-term）`；期间检测状态机 `shell/working（依据=output）`→`shell/idle` 转变。**无需真手指复测** |
+| A3' | **files 上传**（7m-③） | △ 维持登记 | 系统 picker（DocumentViewPicker）对自动化不稳定：dumpLayout 时隐时现、行选择 tap 无法稳定注册（「已选 0/1」不翻），无法机器完成「选文件→完成」步；picker 关闭后无任何上传日志行（`beginUpload` 未到或选择为空——两态不可区分）。**归因维持 E2E P2-4**：picker→copy→beginUpload 是 App（ArkTS）侧已知静默问题面，非 Rust 核新增面（轮 2 已证 files 桥/list/下载本体）。真手指复测清单保留 |
+| A6' | 整改批回归 | ✓ | 建连全链（M-2 早期登记/M-3 attach 时序无回归——首次 attach 即 0）；巡检/旁路探测（8s 窗）/stats 正常节拍；挂起位/健康位无异常行；hint/缓存接线在跑（`旁路探测：…已入学习缓存` 每拍） |
+
+### B. tunStatusJSON 对账快照过账（7m-④）
+
+真机快照（attached 形态，节选）：`{"bridgeAuth":"5449…（96 hex，TIERBRIDGEAUTH01 前缀）","bridgeFilesSock":…,"bridgeSpeedSock":…,"bridgeTermSock":…,"code":"","demand":{"active":false,"at":…,"fg":false,"localErrAdopted":0,"localErrTotal":0,"outboundAt":…,"reason":"熄屏（位陈旧）"},"elapsedMs":1502,"exitIp":"100.64.255.1","identity":{"dev":"7dc61647","pub":"0e6dc129"},"link":{"at":…,"ep":"192.168.3.12:42670","rttMs":11,"via":"direct"},"meowed":true,"portForwards":[],"readyBy":"wg","reason":"","running":1,"state":"attached","stats":{…},"tunIp":"100.64.248.46"}`
+
+- **键序**：顶层 18 键严格字典序（Go `json.Marshal(map)` 同序）；demand 7 键字典序 ✓
+- **键面**：与 Go `TestServiceSnapshotJSONReadyWithBridgeKeys` 守卫集合一致 +
+  **`localErrAdopted/localErrTotal` 两键真机在位**（拍板① bind 发送统计面的消费端）
+- **值域对账**：identity 与同刻 `身份：复用` 行逐字段一致；tunIp 与 `running (…tunIp=…)` 行一致；link 与同秒 `link:` 行一致；portForwards 空表 = `[]`（Go make 同形）
+
+### C. 第 3 轮收尾确认
+
+- 手机最终态：连现役 Go 出口（`link: via=direct ep=192.168.3.12:41641`、RREG 刷新）；
+  活跃主机已恢复（hmw1GiFSJ…izJ5tQ）。
+- 本地实例（exit 42670 / relay 42770）已 kill + state 清除；`pgrep homeway-cli` 空；
+  现役 `~/bin/homeway`（PID 52279）全程未动。
+- 真机铁律遵守：无锁屏/息屏；hdc 一律 `-t`。
+
+## 7. 三轮判据总表（R7 真机全量合并）
+
+| 域 | 判据 | 轮 1（Rust exit） | 轮 2（现役 Go 出口） | 轮 3（整改批复验） |
+|---|---|---|---|---|
+| 建连 | 身份/候选/赛跑/warmup/attach/桥/link/RREG/peer | ✓ | ✓（RREG v2 被现役接受） | ✓ |
+| 数据面 | L3 真负载（vpn-tun 双向 + 核 stats 对表） | ✓ | ✓（+109KB） | ✓（stats 节拍 + 计数对齐） |
+| 数据面 | TCP 过境拦截 transit（dialok） | ✓（38 条） | ✓（15 条） | ✓（7803 exempt dialok ×N） |
+| 数据面 | DNS 代答 | ✓ | ✓ | ✓（轮 3 有 dns 查询流量） |
+| files | 浏览/list | ✓ | — | ✓ |
+| files | 下载 10MB 本体 | ✓ | — | — |
+| files | 上传 | ✗ 受限 | — | △ picker 自动化受限（App 侧 P2-4 维持登记） |
+| term | 新建/接入/stateV2 | ✓ | — | ✓ |
+| term | 键盘输入回显/退出自灭 | △ HID 受限 | — | **✓（机器采证完整：回显+touch 副作用+exit 自灭）** |
+| 测速 | 桥腿 dialok（7803） | ✓ ×4 | — | ✓ ×8 |
+| 测速 | 相位 UI（down→up 切换） | — | — | **✓（M-7 真机验证）** |
+| 测速 | 完整轮（done 信封） | △ EOF 未定位 | — | △ 归因收口：上行 bulk 吞吐退化（R8 修复；下行 ~94Mbps 全成） |
+| 测速 | 取消（cancelled 归因） | — | — | ✓（再点取消 → idle 恢复，无 hang） |
+| 恢复 | 杀 exit 阶梯 R1→R3 同串/最坏带 | ✓ | — | —（整改批 M-4 外层硬超时单测面覆盖） |
+| 恢复 | exit 回来 R1 命中 3.1s/中继腿兜底 | ✓ | — | — |
+| 恢复 | 中继驻留 via=relay | ✓ | — | — |
+| 挂起 | 后台 90s 存活 | ✓ | — | — |
+| 契约 | tunStatusJSON 字节对账 | △ 构造守卫替代 | — | **✓（对账快照：键面/键序/值域过账）** |
+| 集成 | 版本注入/体积 | ✓ 1.98MB | — | ✓ 1.9MB（ea00b2c4e781-rust，钉定门首跑过） |
+
+**R7 收口口径**：全量判据里剩两处非阻断残留——① 测速上行吞吐（归 R8 性能批，
+判据已立项）；② files 上传 picker 自动化（App 侧已知问题，真手指复测清单）。
+均按项目惯例登记不阻塞 R7 收口。
