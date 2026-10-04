@@ -1533,6 +1533,15 @@ impl Interceptor {
         self.flows.len()
     }
 
+    /// 整形滞留是否非空（R8-3 8i：驱动循环 poll 超时自适应面）。真机实测（2026-10-05
+    /// B 臂）：bulk 期 ACK 按团到达 ≈190Hz，驱动拍被 5ms poll 钉死 ⇒ 每拍只放得下
+    /// 一个突发额度（160KB/5.3ms ≈ 30MB/s）——**突发额度退化成了速率上限**。滞留
+    /// 非空时驱动循环应缩短 poll 超时（1ms：续水 64KB/拍 = 64MiB/s 直通面上限，
+    /// 且线上团块随之细化到 ~64KB）。
+    pub fn tx_pacing_pending(&self) -> bool {
+        self.cfg.tx_shape.is_some() && !self.tx_deferred.is_empty()
+    }
+
     /// 全停（teardown：在途 TCP 立即拆——收工语义）。
     pub fn close(&mut self) {
         self.halt_new();

@@ -751,14 +751,21 @@ fn driver_loop(
             }
         }
         // ② UDP 收包（poll 5ms——worker 事件/DNS 应答的拍内服务延迟上界；
-        //    腿 fd 同轮 poll——R4：控制面通告建立的腿与主 socket 同构收包）
+        //    腿 fd 同轮 poll——R4：控制面通告建立的腿与主 socket 同构收包）。
+        //    R8-3 8i：整形滞留非空时缩短到 1ms——bulk 期 ACK 按团到达（实测 ≈190Hz），
+        //    5ms 拍下突发额度退化成速率上限（160KB/5.3ms ≈ 30MB/s）；1ms 拍下续水
+        //    64KB/拍 = 64MiB/s 直通面上限，且线上团块细化到 ~64KB（冷空口更友好）。
+        //    空闲（无滞留）时保持 5ms——不加空转唤醒成本。
+        let poll_ms: libc::c_int = if intercept.tx_pacing_pending() { 1 } else { 5 };
         let leg_fds = bind.leg_fds();
         let mut pollfds = Vec::with_capacity(1 + leg_fds.len());
         pollfds.push(libc::pollfd { fd: udp_fd, events: libc::POLLIN, revents: 0 });
         for fd in &leg_fds {
             pollfds.push(libc::pollfd { fd: *fd, events: libc::POLLIN, revents: 0 });
         }
-        let n = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 5) };
+        let n = unsafe {
+            libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, poll_ms)
+        };
         if n < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() != std::io::ErrorKind::Interrupted {
