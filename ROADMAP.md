@@ -56,12 +56,13 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 | **R3** | 出口（多 peer WG device + 拦截层 + files/DNS/STUN/UPnP + servercore） | **完成**（2026-10-02：两道门全过 + 判据全量实测入册） | 6/6 步 |
 | **R4** | 中继（信封 + 准入 + 升级条纹） | **完成**（2026-10-03：两道门全过 + 三链路判据实测 + 升级条纹实测） | 4/4 步 |
 | **R5** | 互操作矩阵全量 + fuzz + 性能 A/B + 台账三方门 | **完成**（2026-10-03：两道门全过〔两轮代码评审 4高/15中/18低全处置〕+ 终验轮 4 六链路 + L3 复跑全绿 + PERF-AB 入库 + ci-local 一键门全绿） | 6/6 步 |
-| **R6** | term 服务面（协议/surface 产出/检测引擎 + 自建编码器/应答器） | **进行中**（2026-10-04 会话 1+2+3：6a 设计 + 6b vt 底座 + 门一评审〔4高全修〕+ 6c 编码器/应答器全量〔键 387/鼠 160/应答 57 向量逐字节全绿 + 编码器评审 1高3中11低全处置〕+ 门一中危清账 A1/A2/A5/A3/A4 + 6d 帧族/词表面/会话注册表；详见 R6 节进度注记） | 6a/6b ✅ 门一 ✅ 6c ✅ 6d ◐ |
+| **R6** | term 服务面（协议/surface 产出/检测引擎 + 自建编码器/应答器） | **进行中**（2026-10-04 会话 1-4：6a 设计 + 6b vt 底座 + 门一评审〔4高全修〕+ 6c 编码器/应答器全量〔键 387+/鼠 245/应答 64 向量逐字节全绿 + 编码器评审 1高3中11低全处置〕+ 6d 帧族/词表面/会话注册表 + 6e surface 体编码〔surface_codec 向量逐字节 + golden 两向全绿〕+ 6f-1 manifest 引擎〔region 40 + 求值 44 逐规则对拍全绿〕+ 6f-2 检测融合/扫描器/卫生 + 6f-3a PTY/环；**待做 = 6f-3b 会话装配与引擎接线 + 6g**；详见 R6 节进度注记） | 6a/6b/6c/6e ✅ 门一 ✅ 6d ✅ 6f ◐ |
 | **R7** | APP 接入（napi-rs 或 C-ABI 胶水 + OHOS 交叉 + 20 导出面 + hostsession） | 未开始 | — |
 | **R8** | 终测收官（包体/性能终测 + 共存定案 + 文档指针补录） | 未开始 | — |
 
-**下一步（当前指针）**：**R6 6e surface 产出端**（编码器 codec.rs——cell 编码/
-SNAPSHOT/DIFF 体；接棒从本节「R6 进度注记」读起）。R5 已收官（2026-10-03，两道门
+**下一步（当前指针）**：**R6 6f-3b 会话装配 + 引擎接线**（term/service.rs——把
+frames/session/codec/manifest/scan/agent/pty/ring 八模块装成 TermService，挂 engine.rs
+UDS；接棒从本节「R6 进度注记」第 4 棒段读起）。R5 已收官（2026-10-03，两道门
 全过，评审记录 = `docs/reviews/R5.md`、性能报告 = `docs/PERF-AB.md`）。
 
 **R6 进度注记（2026-10-04，接棒真源）**：
@@ -107,10 +108,67 @@ SNAPSHOT/DIFF 体；接棒从本节「R6 进度注记」读起）。R5 已收官
   SNAPSHOT/DIFF/FETCH-ROWS，`surface_codec.json` 向量待产）、LIST JSON 字段序、
   会话装配（PTY spawn/ring/腿写者/回放握手）、`tools/vector-gen/term/` 的
   surface_codec 与 manifest_eval 向量生成器。
-- **向量生成器**：`tools/vector-gen/term/`（vecgen_term_test.go + vecgen_term_aux.go 伴随
-  包文件——test 不能用 cgo）+ `tools/gen-vectors.sh` 第三段；产物 5 件在 `fixtures/vectors/`。
-  **升级基线后必须重跑**（`tools/gen-vectors.sh` 确定性 diff 门）。评审建议待采：向量补
-  交错 set/unset 鼠标与 >32B DCS 参数案（Rust 侧回归已先行）。
+- **向量生成器**：`tools/vector-gen/term/` 五件（vecgen_term_test.go + vecgen_term_aux.go
+  伴随包文件〔vt 包，cgo 面〕+ vecgen_surface_test.go〔pkg/term 包内直调未导出体编码〕+
+  vecgen_manifest_test.go〔pkg/term/manifest 包〕）+ `tools/gen-vectors.sh` 第三/四/五段；
+  产物 8 件在 `fixtures/vectors/`。**升级基线后必须重跑**（确定性 diff 门）。
+
+**R6 第 4 棒注记（2026-10-04，6e + 6f-1/2/3a；接棒真源）**：
+
+- **6e ✅**：`term/codec.rs`（cellcodec 三标记流/decode 严格互逆/SNAPSHOT/DIFF/FETCH-ROWS
+  体〔光标块 6B〕/分片层+攒片器/gzip〔flate2 头域对齐 Go，D-12 契约=解压后字节〕/THEME·
+  CLIPBOARD·NOTIFY 上行件/单一映射 surface_cursor_of·surface_modes_of）。判据全绿：
+  `surface_codec.json` 逐字节（encode 15 案 + 负例 7 + 体族 11 + 分片 2）+ **golden 两向**
+  ——消费向（攒片+解压+解码吃 Go 产的 8 个 .bin，digest/光标/回滚/模式位列全等）与
+  产出向（4 夹具喂 SessionVt 自产体回流，快照+差分应用后 digest 全等 manifest）。测试件
+  共享面 = `term/mod.rs::testutil`（golden .bin 块格式/manifest/digest 口径单一实现）。
+- **编码器向量补案已采**（前棒评审建议落地）：鼠标交错 set/unset 5 新模式 ×17 事件 = 85 案
+  （钉死 B5「set 无条件覆盖、unset 一律归零/回落」ghostty 实跑：1000h+1002h 后 unset1000 全
+  归零、1006h+1005l 格式回落 Default X10）；DCS 参数门探针实测三规则：单参数不限字节长
+  （40B/1000B 同答）、分号参数 ≤24 答 25 起静默丢、冒号子参数出现即丢——vt.rs 扫描器补
+  `semis<24 && !colon` 门（此前 25+ 参数/冒号形态 Rust 答而 ghostty 丢，逐案对拍红后整改）。
+- **6f-1 ✅**：`term/manifest/`（dialect.rs——**反向方言垫片**：Rust 原生语义收窄到 Go 出口
+  实跑行为，\p{Alphabetic}→\p{L} 近似 + Perl 类 ASCII 展开〔Go \s 不含 \v〕+ \b→(?-u:\b)
+  + 类内嵌套类形态 + 幂等护栏；region.rs——12 具名+3 参数化逐函数；mod.rs——TOML
+  deny_unknown_fields/复杂度门/求值仲裁/加载器〔内嵌 23 文件 include_str! fixtures 单真源 +
+  覆盖优先 + 坏覆盖回落〕）。判据：`term_manifest_eval.json` region 40 案逐案 + 2 夹具 × 22
+  manifest 逐规则 44 案（A2 口径：region+matched+region_bytes 逐规则，不只对终局）。
+  实现期抓出的真 bug 两枚：方言垫片逐字节 `as char` 把 › 拆成 latin-1 乱码（letta
+  composer_input 对拍红）；TOML FG 字段 []byte 被 json 序列化成 base64 串（生成器侧改 []int）。
+- **6f-2 ✅**：`term/scan.rs`（旁路扫描器：标题单一来源+stale 证据语义/OSC 9 双语义/
+  21337 直报/legacy 模式位/跨 read 切断/byte 级 sanitize）+ `term/agent.rs`（classify_agent
+  纯函数〔取最深命中/shell CPU 腿刻度 1=10ms/quiet 磁滞〕+ fuse_state 五路权威序〔直报 >
+  blocked 屏幕证据 > 输出腿 > idle 屏幕证据 > 回落〕+ directReportState 词面族 +
+  agent_of_command 保守识别 + foregroundAgentName〔known 闭包喂规则表〕+ Hygiene 三机制
+  〔确认窗 3 拍/700ms、空闲零开销短路、blocked 800ms 重发〕+ 平台面 read_procs
+  〔linux /proc、darwin ps〕/foreground_pgid/signal_pgid）。16 测试（含真 PTY 烟囱外的全
+  纯函数面 + ps time 形态 + 平台烟囱）。
+- **6f-3a ✅**：`term/pty.rs`（登录 shell 解析链〔dscl//etc/passwd > $SHELL > 平台默认〕+
+  env 白名单 + spawn〔portable-pty env_clear、shell -l/-lc、丢从端保 EOF〕+ resize/尺寸哨兵
+  〔cols=1 边界〕/kill 两段/foreground_pgid=master.process_group_leader）+ `term/ring.rs`
+  （定长环/绝对偏移/回放起点三优先级〔尾部→行边界→ESC i>0→原样〕/epoch=last 策略/epoch
+  64 截旧）。**D-19 登记**：portable-pty 信号死形态退出码恒 1 vs Go -1（正常退出码一致）。
+  真 PTY 端到端烟囱（printf 回显 + exit 7 退出码）绿。
+- **测试面**：237 lib 全绿 + clippy all-targets 0（连续多轮）。
+- **6f-3b 待做（下一棒范围）**：`term/service.rs`（+`leg.rs`/`surface.rs`）——把八模块装成
+  TermService：会话表/`attach_or_create` 接 session.rs 注册表/`ServeConn` 状态机〔greeting→
+  hello〔caps/版本门/surface·raw 分流〕→list/kill/create/explain 一锤子 + stream 读循环〕/
+  raw 腿握手〔ATTACHED→清屏→回放〔ring.replay_start 16KiB 分片 2s 预算〕→REPLAY-DONE
+  〔truncated|sizeChange flags〕→首腿 focus-in〕/腿写者〔有界队列+写超时退避+停滞 60s 断腿〕/
+  surface 投递循环〔合并窗 16-33ms、flushSurface 全腿遍历、needSnapshot 兜底、背压 4MiB/
+  8MiB、revision/基线在腿上〕/pump〔PTY 读→ring.append→vt.write_collecting→scan.write→
+  wakeSurface→respChan 应答写者〕/sample 循环〔1s tick、hygiene、pushState〕/LIST JSON
+  〔字段序 = Go struct 序：name,createdMs,lastActiveMs,attached,agent,stateV2,title,cwd?,
+  cols,rows,pid,clients[]；clientEntry: kind,cols,rows,sinceMs,active〕/kill〔SIGHUP→500ms
+  →SIGKILL〕/EXPLAIN explainJSON/应答抑制〔capsRawTerminal 腿在场 SetResponseSink(nil) 面〕/
+  `HOMEWAY_TERM=off` 总开关；engine.rs 挂 `listen_local_service(serve_dir, "term.sock")` +
+  判据行「term: 检测规则已加载 22 份（覆盖目录 …）」/「term: 新建会话 …」「term: 会话 X
+  状态 agent/state（fg=… procs=… 依据=…）」。配置常量真源 = service.go 头部 termConfig
+  〔maxSessions/maxClients/history 1MiB/replay 256KiB/replayEpoch/writeTimeoutMs/
+  rawStallLimitMs/pendingCapBytes/queueBytes/samplePeriod/termHelloTimeout 15s〕。
+- **6g 待做（6f-3b 后）**：local-rust-exit + Go term CLI 全流程判据 / 检测三态判据 /
+  surface 快照+差分真实腿对账 / linux 分支〔CI cargo check + linux 向量〕/ 门二评审
+  〔dsh，checklist 含 Go 直译痕迹〕/ ROADMAP 收口。
 
 **R6 前置批处置（2026-10-04 收口，评审记录 = `docs/reviews/R6-pre.md`）**：
 | # | 项 | 处置 | 判据证据 |
