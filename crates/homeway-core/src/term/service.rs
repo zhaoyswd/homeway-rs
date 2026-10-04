@@ -323,6 +323,7 @@ struct SurfStats {
     fetch_hits: u64,
     fetch_miss: u64,
     trims: u64,
+    shifts: u64,
     write_timeout: u64,
 }
 
@@ -334,8 +335,10 @@ struct SurfaceLeg {
     has_base: bool,
     base: SurfState,
     last_write_cost: Duration,
-    has_snap_total: bool,
-    last_snap_total: u64,
+    /// 回滚条基线 = **上一帧已告知客户端**的回滚条（随成功入队的帧推进，快照与差分都算）；
+    /// 非「快照时刻的 total」——输出增长期的回落会漏判（基线 8167cb7）。
+    has_last_sent: bool,
+    last_sent: ScrollbarWire,
     stats: SurfStats,
 }
 
@@ -376,14 +379,26 @@ impl SurfaceLeg {
             && st.len == self.base.len
     }
 
-    /// 回滚裁剪检测：total 比上次快照时小 ⇒ 绝对行号滑动 ⇒ 强制全量。
-    fn note_scrollbar(&mut self, total: u64) -> bool {
-        let trimmed = self.has_snap_total && total < self.last_snap_total;
-        if trimmed {
-            self.need_snapshot = true;
-            self.stats.trims += 1;
+    /// 回滚回落检测（基线 8167cb7 平移判据）：total 回落分两类——
+    /// 平移型（len 不变且距底 total-offset 不变：真裁剪/清回滚/erase 前缀）不再强制
+    /// 全量，客户端自己平移缓存，差分照发；非平移（距底/len 变化，行号语义不再纯平移）
+    /// ⇒ 强制全量重建。返回 true = 触发了非平移回落。
+    fn note_scrollbar(&mut self, sb: ScrollbarWire) -> bool {
+        if !self.has_last_sent {
+            return false; // 还没告知过客户端任何回滚条：首次 attach 本来就走全量
         }
-        trimmed
+        let prev = self.last_sent;
+        if sb.total >= prev.total {
+            return false; // 增长/持平 = 输出推进，不是回落
+        }
+        let pure_shift = sb.len == prev.len && (prev.total - prev.offset) == (sb.total - sb.offset);
+        if pure_shift {
+            self.stats.shifts += 1;
+            return false;
+        }
+        self.need_snapshot = true;
+        self.stats.trims += 1;
+        true
     }
 }
 
@@ -1887,13 +1902,13 @@ impl TermService {
             let Some(vt) = rt.vt.as_mut() else { return };
             let (cols, rows) = geom;
             let title = rt.scan.title().to_string();
-            // 回滚裁剪检测（noteScrollbar 在 takeSnapshotFlag 之前——本拍消费）
-            let total = vt.scrollbar().total;
+            // 回滚回落检测（noteScrollbar 在 takeSnapshotFlag 之前——本拍消费）
+            let cur_sb = ScrollbarWire::from(vt.scrollbar());
             for l in &mut rt.legs {
                 if let Some(s) = l.surface.as_mut() {
-                    if s.note_scrollbar(total) {
+                    if s.note_scrollbar(cur_sb) {
                         self.logf(&format!(
-                            "term: 会话 {} 回滚裁剪 ⇒ 强制全量重建（绝对行号已滑动）",
+                            "term: 会话 {} 回滚条非平移回落 ⇒ 强制全量重建（行号语义已变）",
                             rt.name
                         ));
                     }
@@ -1935,8 +1950,8 @@ impl TermService {
                         (grid, mirror)
                     });
                     let rev = s.next_revision();
-                    s.last_snap_total = st_tick.total;
-                    s.has_snap_total = true;
+                    // 回滚条基线不在这里记（基线 8167cb7 起）：noteSentScrollbar 在入队
+                    // 成功后统一推进（本函数只建体；入队失败时基线不能前移，否则回落检测漏判）。
                     let body = super::codec::enc_snapshot_body(&SnapshotBody {
                         revision: rev,
                         cols,
@@ -2019,6 +2034,14 @@ impl TermService {
                         s.stats.bytes_out += bytes as u64;
                         s.base = p.st;
                         s.has_base = true;
+                        // 回滚条基线随**成功入队的帧**推进（快照与差分都算）——noteScrollbar
+                        // 的回落判据与客户端「上一帧已知的回滚条」对齐（基线 8167cb7）。
+                        s.last_sent = ScrollbarWire {
+                            total: p.st.total,
+                            offset: p.st.offset,
+                            len: p.st.len,
+                        };
+                        s.has_last_sent = true;
                     }
                 }
             }
@@ -3681,6 +3704,39 @@ mod tests {
 
     fn ended_code_killed() -> i32 {
         frames::ended_code::KILLED
+    }
+
+    /// note_scrollbar 平移/非平移分流（基线 8167cb7 重锚对齐；Go
+    /// TestSurfaceLegNoteScrollbarTrimRule 的平移/非平移两路 + 首帧/增长边界）。
+    #[test]
+    fn surface_leg_note_scrollbar_translation_split() {
+        let sb = |total: u64, offset: u64, len: u16| ScrollbarWire { total, offset, len };
+        let mut leg = SurfaceLeg::new();
+        // 首帧（从未告知过客户端）：恒 false——首次 attach 本来就走全量
+        assert!(!leg.note_scrollbar(sb(100, 90, 10)));
+        // 消费掉 new() 置位的首帧全量标志，后续断言才只受 note_scrollbar 影响
+        assert!(leg.take_snapshot_flag());
+        // 建基线：len=10、距底 = 100-90 = 10
+        leg.last_sent = sb(100, 90, 10);
+        leg.has_last_sent = true;
+        // 增长/持平：不触发
+        assert!(!leg.note_scrollbar(sb(110, 100, 10)));
+        assert!(!leg.note_scrollbar(sb(100, 90, 10)));
+        assert_eq!(leg.stats.trims, 0);
+        // 平移型回落（len 不变 + 距底不变：erase 前缀/真裁剪）：差分继续、计 shifts
+        assert!(!leg.note_scrollbar(sb(90, 80, 10)));
+        assert_eq!(leg.stats.shifts, 1);
+        assert!(!leg.need_snapshot);
+        assert_eq!(leg.stats.trims, 0);
+        // 非平移回落（len 变化）：强制全量
+        assert!(leg.note_scrollbar(sb(80, 70, 9)));
+        assert_eq!(leg.stats.trims, 1);
+        assert!(leg.need_snapshot);
+        leg.need_snapshot = false;
+        // 非平移回落（距底变化）：强制全量
+        assert!(leg.note_scrollbar(sb(70, 55, 10))); // 距底 15 ≠ 10
+        assert_eq!(leg.stats.trims, 2);
+        assert!(leg.need_snapshot);
     }
 
     /// 找子串的窗口（回放流里 PTY 字节可能跨 DATA 帧分片——拼接后再找）。
