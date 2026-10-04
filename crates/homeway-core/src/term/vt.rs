@@ -174,9 +174,19 @@ pub struct SessionVt {
     cols: usize,
     rows: usize,
     modify_other_keys: bool,
-    /// 鼠标上报模式独立记账（ghostty 语义：1000/1002/1003 各自独立置/复位；
-    /// alacritty 把三者做成互斥单值——对齐 golden 模式位列在此自管）。
+    /// 鼠标上报模式独立记账（wire 位语义：ghostty 各自独立置/复位；alacritty 把三者做成
+    /// 互斥单值——对齐 golden 模式位列在此自管）。
     mouse_flags: u8,
+    /// 强制全量脏（门一评审 B1）：拦截 ED2 等替代 `mark_fully_damaged`（alacritty 私有
+    /// API）的自管位——置位后 `update()=Full`，`clean()` 清零。
+    force_full: bool,
+    /// 每视口行「上拍已下发内容」的 FNV 指纹（门一评审 B3）：damage_cursor 无条件标脏
+    /// 光标行 ⇒ 脏集恒非空；本表过滤「内容未变」的行，使空闲/纯光标移动的差分行为与
+    /// Go（空闲 count=0）一致。消费即更新（乐观，同 Go SurfaceClean；背压兜底归 6e 的
+    /// needSnapshot）。
+    flushed: Vec<u64>,
+    /// resize 后行数变化 ⇒ 指纹表整体失效，强制全量重建。
+    flushed_cols: usize,
 }
 
 impl Default for SessionVt {
@@ -218,6 +228,9 @@ impl SessionVt {
             rows,
             modify_other_keys: false,
             mouse_flags: 0,
+            force_full: false,
+            flushed: vec![0; rows],
+            flushed_cols: cols,
         })
     }
 
@@ -231,12 +244,14 @@ impl SessionVt {
             term: &mut self.term,
             modify_other_keys: &mut self.modify_other_keys,
             mouse_flags: &mut self.mouse_flags,
+            force_full: &mut self.force_full,
         };
         self.processor.advance(&mut probe, p);
     }
 
     /// 改尺寸（含主屏回滚重排；备用屏不重排——alacritty 语义与 ghostty 一致）。
-    /// 尺寸未变时空操作。
+    /// 尺寸未变时空操作。行列变化 ⇒ 指纹表失效（下拍 `update()` 仍会 Full——resize 走
+    /// 全量路径），此处重置。
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String> {
         if cols == 0 || rows == 0 {
             return Err(format!("vt: 尺寸非法 {cols}x{rows}"));
@@ -248,6 +263,8 @@ impl SessionVt {
         self.term.resize(SimpleDims { cols, rows });
         self.cols = cols;
         self.rows = rows;
+        self.flushed = vec![u64::MAX; rows];
+        self.flushed_cols = cols;
         Ok(())
     }
 
@@ -309,8 +326,12 @@ impl SessionVt {
         }
     }
 
-    /// 消费脏状态并返回全局脏度（`Full` = 滚动/清屏等常态，视口全行脏）。
+    /// 消费脏状态并返回全局脏度（`Full` = 滚动/清屏/resize 等常态，视口全行脏）。
+    /// force_full（B1 拦截位）等价 `mark_fully_damaged`（alacritty 私有 API 的自管替身）。
     pub fn update(&mut self) -> Dirty {
+        if self.force_full {
+            return Dirty::Full;
+        }
         match self.term.damage() {
             TermDamage::Full => Dirty::Full,
             TermDamage::Partial(iter) => {
@@ -325,25 +346,43 @@ impl SessionVt {
 
     /// 取本拍需要重绘的视口行（`Full` 时 = 全视口行）。**必须先 [`SessionVt::update`]**。
     /// 只在「构建载荷」时调用；下发成功后 [`SessionVt::clean`]。
+    /// Partial 路径按指纹过滤「内容未变」的行（B3：damage_cursor 会无条件标脏光标行，
+    /// 空闲/纯光标移动的差分因此与 Go 的 count=0 对齐）。
     pub fn dirty_rows(&mut self) -> Vec<Row> {
-        match self.term.damage() {
-            TermDamage::Full => self.rows(),
-            TermDamage::Partial(iter) => {
-                let damaged: std::collections::HashSet<usize> =
-                    iter.into_iter().map(|l| l.line).collect();
-                self.rows_in(|y| damaged.contains(&y))
+        if self.force_full || matches!(self.term.damage(), TermDamage::Full) {
+            return self.rows();
+        }
+        let damaged: std::collections::HashSet<usize> = match self.term.damage() {
+            TermDamage::Partial(iter) => iter.into_iter().map(|l| l.line).collect(),
+            _ => unreachable!("上分支已处理"),
+        };
+        let mut out = Vec::new();
+        for y in (0..self.rows).filter(|y| damaged.contains(y)) {
+            let row = self.row_at(y);
+            let fp = row_fingerprint(&row);
+            if self.flushed[y] != fp {
+                self.flushed[y] = fp;
+                out.push(row);
             }
         }
+        out
     }
 
     /// 全部视口行（快照路径；隐含消费脏状态——调用方随后本就要发全量并 clean）。
     pub fn rows(&mut self) -> Vec<Row> {
         let _ = self.term.damage(); // 拉到最新（同 Go Rows 的隐含 Update）
-        self.rows_in(|_| true)
+        let mut out = Vec::with_capacity(self.rows);
+        for y in 0..self.rows {
+            let row = self.row_at(y);
+            self.flushed[y] = row_fingerprint(&row);
+            out.push(row);
+        }
+        out
     }
 
     /// 在载荷成功下发后消费脏标记。
     pub fn clean(&mut self) {
+        self.force_full = false;
         self.term.reset_damage();
     }
 
@@ -354,15 +393,24 @@ impl SessionVt {
             if !keep(y) {
                 continue;
             }
-            let line = Line(y as i32);
-            let row = &grid[line];
-            let mut cells = Vec::with_capacity(self.cols);
-            for x in 0..self.cols {
-                cells.push(cell_of(&row[Column(x)]));
-            }
-            out.push(Row { y: y as u16, dirty: false, cells });
+            out.push(self.read_row(grid, y));
         }
         out
+    }
+
+    fn read_row(&self, grid: &alacritty_terminal::grid::Grid<AlacCell>, y: usize) -> Row {
+        let line = Line(y as i32);
+        let row = &grid[line];
+        let mut cells = Vec::with_capacity(self.cols);
+        for x in 0..self.cols {
+            cells.push(cell_of(&row[Column(x)]));
+        }
+        Row { y: y as u16, dirty: false, cells }
+    }
+
+    fn row_at(&self, y: usize) -> Row {
+        let grid = self.term.grid();
+        self.read_row(&grid, y)
     }
 
     /// 光标快照（视口坐标）。
@@ -447,8 +495,10 @@ impl SessionVt {
             if abs >= total {
                 break;
             }
-            // 绝对行 a ⇔ Line(a - total)：0 = 最旧回滚行，total-1 = 视口底行。
-            let line = Line(abs as i32 - total as i32);
+            // 绝对行 a ⇔ Line(a - (total - rows))：Line(0)=视口顶、负数进回滚
+            // （门一评审 B2：原 `a - total` 整体偏移 rows 行，debug panic / release 错行）。
+            let top = total - self.rows;
+            let line = Line(abs as i32 - top as i32);
             let row = &grid[line];
             let mut cells = Vec::with_capacity(cols);
             for x in 0..cols {
@@ -483,6 +533,30 @@ impl SessionVt {
             .collect();
         lines.join("\n")
     }
+}
+
+/// 行内容指纹（B3 的过滤依据）：对全格逐字段 FNV-1a——symbol/width/skip/颜色/属性任一
+/// 变化即不同；同内容行（如 damage_cursor 误标的光标行）指纹稳定。
+fn row_fingerprint(row: &Row) -> u64 {
+    use std::hash::Hasher;
+    let mut h = fnv::FnvHasher::default();
+    for c in &row.cells {
+        h.write(c.symbol.as_bytes());
+        h.write_u8(c.width);
+        h.write_u8(u8::from(c.skip));
+        h.write_u16(match c.fg {
+            Color::None => 0,
+            Color::Palette(i) => 1 + i as u16,
+            Color::Rgb(r, g, b) => 2 + ((r as u16) << 8) ^ ((g as u16) << 4) ^ (b as u16),
+        });
+        h.write_u16(match c.bg {
+            Color::None => 0,
+            Color::Palette(i) => 1 + i as u16,
+            Color::Rgb(r, g, b) => 2 + ((r as u16) << 8) ^ ((g as u16) << 4) ^ (b as u16),
+        });
+        h.write_u16(c.attr);
+    }
+    h.finish()
 }
 
 /// alacritty cell → wire cell（归一化见模块头）。
@@ -610,6 +684,7 @@ struct TermProbe<'a, T> {
     term: &'a mut Term<T>,
     modify_other_keys: &'a mut bool,
     mouse_flags: &'a mut u8,
+    force_full: &'a mut bool,
 }
 
 impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, T> {
@@ -729,8 +804,13 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
         self.term.set_private_mode(mode);
     }
 
+    /// ghostty 兼容位（D-15，门一评审 B4 补全）：未配对 `CSI ? 1049 l`（不在备用屏时收到
+    /// 1049 退出）ghostty 按 DECRC 的「从未保存 ⇒ 恢复初始态」处理——复位 SGR 样式、清
+    /// DECOM、光标归 (0,0)（golden session-styles 夹具的光标形态钉住）。alacritty 对此
+    /// no-op；真实 TUI 的 1049h/l 成对，两者无差——本分支只钉未配对形态。
+    /// charset G0/G1 与 protected аттр 的复位无公开 API，残余差异登记（门一评审 B4）。
     fn unset_private_mode(&mut self, mode: alac_ansi::PrivateMode) {
-        use alac_ansi::{NamedPrivateMode, PrivateMode};
+        use alac_ansi::{Attr, NamedPrivateMode, PrivateMode};
         if let PrivateMode::Named(m) = mode {
             match m {
                 NamedPrivateMode::ReportMouseClicks => {
@@ -745,12 +825,15 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
                     *self.mouse_flags &= !4;
                     return;
                 }
+                NamedPrivateMode::SwapScreenAndSetRestoreCursor
+                    if !self.term.mode().contains(TermMode::ALT_SCREEN) =>
+                {
+                    self.term.terminal_attribute(Attr::Reset);
+                    self.term.unset_private_mode(PrivateMode::Named(NamedPrivateMode::Origin));
+                    self.term.goto(0, 0);
+                    // 落到末尾继续 unset 1049（no-op，但保持序列语义完整）
+                }
                 _ => {}
-            }
-        }
-        if let PrivateMode::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor) = mode {
-            if !self.term.mode().contains(TermMode::ALT_SCREEN) {
-                self.term.goto(0, 0);
             }
         }
         self.term.unset_private_mode(mode);
@@ -807,20 +890,18 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
     /// ghostty 兼容位（D-16）：`CSI 2J`（ED2）在主屏上 alacritty 走 `clear_viewport`
     /// ——把当前视口推入回滚（xterm 形态）；ghostty 只清视口、不增回滚（golden
     /// session-styles 的回滚 total=32 即此语义）。Go 出口的回滚条/镜像语义跟 ghostty，
-    /// 此处对齐：主屏 ED2 = 重置视口区（不进历史）。
+    /// 此处对齐：主屏 ED2 = 重置视口区（不进历史）。**置 force_full**（门一评审 B1）：
+    /// `reset_region` 不碰 damage，若不置位则 update()=Partial 且脏集只有光标行 ⇒
+    /// 服务端屏已清空而差分只送一行。
     fn clear_screen(&mut self, mode: alac_ansi::ClearMode) {
         use alac_ansi::ClearMode;
         if matches!(mode, ClearMode::All) && !self.term.mode().contains(TermMode::ALT_SCREEN) {
             self.term.grid_mut().reset_region(..);
+            *self.force_full = true;
             return;
         }
         self.term.clear_screen(mode);
     }
-
-    // ghostty 兼容位（D-15）：未配对的 `CSI ? 1049 l`（不在备用屏时收到 1049 退出）
-    // ghostty 按 DECRC 的「从未保存 ⇒ 恢复到初始位 (0,0)」处理（golden session-styles
-    // 夹具的光标/覆写形态即此语义）；alacritty 对此 no-op。真实 TUI 的 1049h/l 成对，
-    // 两者无差——上面 unset_private_mode 的 SwapScreenAndSetRestoreCursor 分支只钉未配对形态。
 
     /// modifyOtherKeys 记账（alacritty 的 Term 不落状态）：mode 2（EnableAll）置位、
     /// 其余（Reset/EnableExceptWellDefined）清零——ghostty 只认「other_keys_numeric」。
@@ -976,6 +1057,93 @@ mod tests {
         assert!(!m.mouse_normal && !m.mouse_button && !m.mouse_sgr, "RIS 须清 mouse_flags");
         assert!(!m.modify_other_keys, "RIS 须清 modifyOtherKeys");
         assert!(!m.bracketed_paste && m.cursor_visible, "RIS 须复位常规模式");
+    }
+
+    /// 门一评审 B2：绝对行号拉取的正确性（原实现整体偏移 rows 行）。
+    /// 10×3 视口写 6 行：回滚 3 行（绝对 0-2）+ 视口 3 行（绝对 3-5）。
+    #[test]
+    fn vt_rows_at_absolute_lines() {
+        fn text_of(row: &Row) -> String {
+            row.cells.iter().map(|c| c.symbol.as_str()).collect::<String>()
+        }
+        let mut vt = SessionVt::new(10, 3, 100).unwrap();
+        vt.write(b"line0\r\nline1\r\nline2\r\nline3\r\nline4\r\nline5");
+        let sb = vt.scrollbar();
+        assert_eq!((sb.total, sb.len, sb.offset), (6, 3, 3), "6 行进 3 视口 ⇒ 回滚 3");
+        // rows_at(0,3) = 最旧三行（回滚区）
+        let rows = vt.rows_at(0, 3);
+        assert_eq!(rows.len(), 3);
+        assert!(text_of(&rows[0]).starts_with("line0"), "绝对行 0 = 最旧回滚行");
+        assert!(text_of(&rows[2]).starts_with("line2"));
+        // rows_at(3,3) = 视口三行
+        let rows = vt.rows_at(3, 3);
+        assert!(text_of(&rows[0]).starts_with("line3"), "绝对行 3 = 视口顶");
+        assert!(text_of(&rows[2]).starts_with("line5"), "绝对行 5 = 视口底");
+        // 跨界 + 越界截断
+        let rows = vt.rows_at(4, 99);
+        assert_eq!(rows.len(), 2, "越界截断到 total");
+        let rows = vt.rows_at(99, 2);
+        assert!(rows.is_empty(), "from ≥ total 返回空");
+        // 镜像窗口：offset 之上最多 above 行
+        let mirror = vt.mirror_rows(2);
+        assert_eq!(mirror.len(), 2);
+        assert!(text_of(&mirror[0]).starts_with("line1"), "镜像最旧在前");
+    }
+
+    /// 门一评审 B1：主屏 ED2 后本拍必须全视口脏（reset_region 不碰 damage 的补偿）。
+    #[test]
+    fn vt_ed2_forces_full_damage() {
+        let mut vt = SessionVt::new(20, 5, 100).unwrap();
+        vt.write(b"full\r\nfull\r\nfull\r\nfull\r\nfull");
+        let _ = vt.rows(); // 建立指纹基线并消费
+        vt.clean();
+        vt.write(b"\x1b[H\x1b[2J"); // 主屏 ED2
+        assert_eq!(vt.update(), Dirty::Full, "ED2 后必须 Full（B1）");
+        let rows = vt.dirty_rows();
+        assert_eq!(rows.len(), 5, "Full = 全视口行");
+        assert!(vt.screen_text().trim().is_empty(), "屏已清空");
+        vt.clean();
+        // clean 后 alacritty 侧仍恒 Partial（B3 机制），但差分集必须空
+        let _ = vt.update();
+        assert!(vt.dirty_rows().is_empty(), "clean 后差分空（update 的 Partial 由内容过滤兜住）");
+    }
+
+    /// 门一评审 B3：空闲拍差分为空（damage_cursor 误标光标行被指纹过滤）。
+    #[test]
+    fn vt_idle_dirty_rows_empty() {
+        let mut vt = SessionVt::new(20, 5, 100).unwrap();
+        vt.write(b"hello world");
+        let _ = vt.update();
+        let first = vt.dirty_rows();
+        assert!(!first.is_empty(), "首拍有真脏行");
+        vt.clean();
+        // 空闲：无新字节 ⇒ damage_cursor 仍标脏光标行，但内容未变 ⇒ 差分空
+        assert_eq!(vt.update(), Dirty::Partial, "alacritty 侧恒 Partial（damage_cursor）");
+        assert!(vt.dirty_rows().is_empty(), "内容未变的行必须被过滤（B3）");
+        // 纯光标移动：行内容不变 ⇒ 差分仍空（光标走 DIFF 的 cursor 字段，6e 编码）
+        vt.write(b"\x1b[2;3H");
+        let _ = vt.update();
+        assert!(vt.dirty_rows().is_empty(), "纯光标移动无行差分（B3）");
+        // 真实输出恢复差分
+        vt.write(b"X");
+        let _ = vt.update();
+        assert_eq!(vt.dirty_rows().len(), 1, "新输出 ⇒ 对应行脏");
+    }
+
+    /// 门一评审 B4：未配对 1049l 的完整复位（样式/origin/光标）。
+    #[test]
+    fn vt_unpaired_1049l_resets_state() {
+        let mut vt = SessionVt::new(20, 5, 100).unwrap();
+        // 反色 + origin + 定位到滚动区内 ⇒ 未配对 1049l 后全复位
+        vt.write(b"\x1b[7m\x1b[2;4r\x1b[?6h\x1b[2;3H");
+        let cur = vt.cursor();
+        assert_eq!((cur.x, cur.y), (2, 2), "origin 态光标（滚动区顶 1 + 行 2 - 1）");
+        vt.write(b"\x1b[?1049l");
+        let cur = vt.cursor();
+        assert_eq!((cur.x, cur.y), (0, 0), "未配对 1049l ⇒ 光标归 (0,0)");
+        assert!(!vt.modes().origin, "DECOM 一并复位（B4）");
+        let rows = vt.rows();
+        assert_eq!(rows[0].cells[0].attr & attr::INVERSE, 0, "SGR 反相须复位（B4）");
     }
 
     /// 光标/回滚条/模式位列对拍（快照语义的另一半）。
