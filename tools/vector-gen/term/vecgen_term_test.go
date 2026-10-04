@@ -20,6 +20,8 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 	"testing"
 )
 
@@ -31,6 +33,14 @@ func (c *vecTermCollector) sink(p []byte) {
 	cp := make([]byte, len(p))
 	copy(cp, p)
 	c.chunks = append(c.chunks, cp)
+}
+
+func (c *vecTermCollector) all() string {
+	var sb strings.Builder
+	for _, ch := range c.chunks {
+		sb.Write(ch)
+	}
+	return sb.String()
 }
 
 func vecHexStr(b []byte) string { return hex.EncodeToString(b) }
@@ -182,7 +192,54 @@ func TestVecgenTermResponder(t *testing.T) {
 		})
 	}
 	vecWriteJSON(t, "term_responder.json", map[string]any{"cases": out})
+
+	// OSC 4 内置调色板全表（未 set 索引的应答值 = ghostty 默认 256 色表——Rust 内嵌同表用）。
+	// 分批问（每批 16 索引，OSC 串不超长）；单独落 term_palette.json。
+	var pal [256]string
+	term, err := New(100, 32, 1000)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer term.Close()
+	col := &vecTermCollector{}
+	term.SetResponseSink(col.sink)
+	for base := 0; base < 256; base += 16 {
+		q := "\x1b]4;"
+		for i := 0; i < 16; i++ {
+			if i > 0 {
+				q += ";"
+			}
+			q += itoa(base+i) + ";?"
+		}
+		col.chunks = nil
+		term.Write([]byte(q + "\x07"))
+		all := col.all()
+		// 每索引应答形如 \x1b]4;<idx>;rgb:rrrr/gggg/bbbb\x07（BEL 终止）——逐段拆
+		for _, seg := range strings.Split(all, "\x1b]") {
+			if !strings.HasPrefix(seg, "4;") {
+				continue
+			}
+			body := strings.TrimSuffix(seg, "\x07")
+			parts := strings.SplitN(body, ";", 3)
+			if len(parts) != 3 {
+				t.Fatalf("OSC4 应答形态意外：%q", seg)
+			}
+			idx, err := strconv.Atoi(parts[1])
+			if err != nil || idx < 0 || idx > 255 {
+				t.Fatalf("OSC4 索引解析失败：%q", seg)
+			}
+			pal[idx] = parts[2]
+		}
+	}
+	for i, v := range pal {
+		if v == "" {
+			t.Fatalf("OSC4 调色板索引 %d 未采到", i)
+		}
+	}
+	vecWriteJSON(t, "term_palette.json", map[string]any{"osc4_unset": pal[:]})
 }
+
+func itoa(i int) string { return fmt.Sprintf("%d", i) }
 
 // ---- ② 键编码 ----
 
