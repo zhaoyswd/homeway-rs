@@ -857,13 +857,23 @@ fn driver_loop(
                 let dbytes = txb - last_tx_bytes;
                 let avg = dpkgs as f64 / dcalls as f64;
                 let bpp = (dbytes as f64 / dpkgs.max(1) as f64) as u64;
-                // 批分布直方图紧凑打印（R8-3 8i；非零桶）：桶 i 的上界 = 2^(i+1) 包。
+                // 批分布直方图紧凑打印（R8-3 8i；非零桶）：桶 i = 批大小
+                // [2^i, 2^(i+1))（评审 r2-5.2：标签按区间标——「≤2^(i+1)」的松上界
+                // 会让「≤8」被读成 8 包以内，实际装 4-7 包）。
                 let hist: Vec<String> = s
                     .4
                     .iter()
                     .enumerate()
                     .filter(|(_, c)| **c > 0)
-                    .map(|(i, c)| format!("≤{}:{}", 1usize << (i + 1), c))
+                    .map(|(i, c)| {
+                        let lo = 1usize << i;
+                        let hi = 1usize << (i + 1);
+                        if i + 1 == s.4.len() {
+                            format!("≥{lo}:{c}")
+                        } else {
+                            format!("{lo}-{}:{c}", hi - 1)
+                        }
+                    })
                     .collect();
                 if s.3 > last_tx_stats_snap.3 {
                     (dlogf)(&format!(
@@ -896,7 +906,11 @@ fn driver_loop(
         let mut out2 = InboundOut::default();
         route_encap(&tx, device, &mut bind, &mut out2);
         out2.wire.clear();
-        if intercept.flow_count() == 0 || Instant::now() >= deadline {
+        // 评审 r2-1.1 兜底：滞留未清空不提前收摊（流表空但尾数据还在整形队列——
+        // 主修在 pump_grace 的全量释放面，这里是宽限循环侧的第二道闸）。
+        if (intercept.flow_count() == 0 && !intercept.tx_pacing_pending())
+            || Instant::now() >= deadline
+        {
             break;
         }
         std::thread::sleep(Duration::from_millis(10));

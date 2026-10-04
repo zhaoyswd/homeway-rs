@@ -400,7 +400,9 @@ fn transit_dial(session: &Session, dst: SocketAddrV4) -> Result<usize, ConnErr> 
     while off < probe.len() {
         match session.client().write(id, probe[off..].to_vec()) {
             Ok(w) if w.n > 0 => off += w.n,
-            _ => {
+            // Err 不重试直接失败（评审 r2-自补2：回执超时的那笔可能仍在引擎队列里
+            // 并最终执行——重试会双投；零接纳（Ok(0)）才重试）。
+            Ok(_) => {
                 zero += 1;
                 if zero > 100_000 {
                     eprintln!("transit: 写探测载荷无进展");
@@ -408,6 +410,11 @@ fn transit_dial(session: &Session, dst: SocketAddrV4) -> Result<usize, ConnErr> 
                     return Err(ConnErr::Timeout);
                 }
                 std::thread::yield_now();
+            }
+            Err(e) => {
+                eprintln!("transit: 写探测载荷失败（{e}）");
+                let _ = session.client().close(id);
+                return Err(e);
             }
         }
     }

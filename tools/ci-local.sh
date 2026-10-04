@@ -27,8 +27,9 @@ echo "==> [1/7] 基线门（check-baseline.sh）"
 echo "==> [2/7] 单测 + 集成测试（fuzz_replay 全量档跳过）"
 (cd "$REPO_ROOT" && cargo test --workspace) || fail 2 "cargo test"
 if (( FULL )); then
-  echo "  --full：fuzz_replay 全量档（9 目标 × 100k）"
-  (cd "$REPO_ROOT" && cargo test --workspace --ignored) || fail 2 "fuzz_replay"
+  echo "  --full：fuzz_replay 全量档（9 目标 × 100k）+ 性能 harness（串行——R8-3 r2-5.1："
+  echo "        ignored 面含墙钟令牌续水的性能臂，并行跑互相拖拍频会把批形态打歪、硬门随机红）"
+  (cd "$REPO_ROOT" && cargo test --workspace --ignored -- --test-threads=1) || fail 2 "fuzz_replay"
 fi
 
 echo "==> [3/7] clippy（-D warnings）+ OHOS 交叉面（评审 r1-F18：macOS 编译不到 sendmmsg 支——交叉 check 补覆盖）"

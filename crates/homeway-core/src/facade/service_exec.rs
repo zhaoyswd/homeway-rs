@@ -342,16 +342,6 @@ fn clear_slot_if_same(slot: &Arc<Mutex<Option<Arc<ServiceRun>>>>, expect: &Arc<S
     }
 }
 
-/// 经运行态会话拨出口虚拟端口（服务会话形态的桥 dial：流 id 适配成 BridgeStream）。
-/// 会话句柄从锁里克隆出来再拨（评审 r2-M-10②：此前持 `run.session` 锁做 15s 拨号
-/// ⇒ status() 同锁被同步阻塞——App 轮询面卡住）。
-/// 桥拨号闭包工厂（R8-3 F16 可测面）：闭包持 **Weak**——ServiceRun.bridge →
-/// BridgeHost → 闭包 → Arc<ServiceRun> 的引用环每 start/stop 周期泄漏一套对象
-/// （R8-8c F15 整改的原始动机）；降 Weak 后强引用只剩 run 槽 + 会话线程（stop
-/// 清槽 + 线程退出即整组释放）。upgrade 失败（正在收工）= 桥拨号「服务会话未
-/// 就绪」同语义。泛型 `T` + 函数指针只为单测能以轻量替身钉死两点：闭包不抬
-/// 强计数 / 收工后拨号报未就绪（见 tests::bridge_dial_closure_weak_only）。
-/// 桥拨号闭包的产出类型（set_dial 形参同形——type_complexity 收口）。
 type BridgeDialFn =
     Box<dyn Fn(u16, Duration) -> io::Result<Box<dyn crate::facade::bridge_host::BridgeStream>> + Send + Sync>;
 /// 闭包工厂的拨号实现面（dial_via_run 同形——T = ServiceRun）。
@@ -368,6 +358,16 @@ fn bridge_dial_closure<T: Send + Sync + 'static>(run: Arc<T>, dial: BridgeDialIm
     })
 }
 
+/// 经运行态会话拨出口虚拟端口（服务会话形态的桥 dial：流 id 适配成 BridgeStream）。
+/// 会话句柄从锁里克隆出来再拨（评审 r2-M-10②：此前持 `run.session` 锁做 15s 拨号
+/// ⇒ status() 同锁被同步阻塞——App 轮询面卡住）。
+/// 桥拨号闭包工厂（R8-3 F16 可测面）：闭包持 **Weak**——ServiceRun.bridge →
+/// BridgeHost → 闭包 → Arc<ServiceRun> 的引用环每 start/stop 周期泄漏一套对象
+/// （R8-8c F15 整改的原始动机）；降 Weak 后强引用只剩 run 槽 + 会话线程（stop
+/// 清槽 + 线程退出即整组释放）。upgrade 失败（正在收工）= 桥拨号「服务会话未
+/// 就绪」同语义。泛型 `T` + 函数指针只为单测能以轻量替身钉死两点：闭包不抬
+/// 强计数 / 收工后拨号报未就绪（见 tests::bridge_dial_closure_weak_only）。
+/// 桥拨号闭包的产出类型（set_dial 形参同形——type_complexity 收口）。
 fn dial_via_run(
     run: &Arc<ServiceRun>,
     port: u16,
