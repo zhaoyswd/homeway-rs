@@ -1413,82 +1413,11 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::term::testutil::{fnv_hex, golden_manifest, style_of, text_of};
 
     fn fixture(p: &str) -> Vec<u8> {
         let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures");
         std::fs::read(format!("{base}/{p}")).unwrap_or_else(|e| panic!("夹具 {p}: {e}"))
-    }
-
-    /// Go goldenDigest 同款：FNV-1a 64 → 16 位小写 hex。
-    fn fnv_hex(data: &[u8]) -> String {
-        let mut h = fnv::FnvHasher::default();
-        use std::hash::Hasher;
-        h.write(data);
-        format!("{:016x}", h.finish())
-    }
-
-    /// Go gridTextLines 口径：占位格跳过、空符号补空格、行尾 TrimRight(" ")、\n 连接。
-    fn text_of(rows: &[Row]) -> String {
-        rows.iter()
-            .map(|r| {
-                let mut s = String::new();
-                for c in &r.cells {
-                    if c.skip {
-                        continue;
-                    }
-                    if c.symbol.is_empty() {
-                        s.push(' ');
-                    } else {
-                        s.push_str(&c.symbol);
-                    }
-                }
-                s.trim_end_matches(' ').to_string()
-            })
-            .collect::<Vec<_>>()
-            .join("\n")
-    }
-
-    /// Go goldenStyleText 口径：逐行逐格 26 个 hex（fg 5B · bg 5B · attr 2B · flags 1B）。
-    /// 缺格按空白格（Width=1）；flags = skip(bit0) | width<<1。
-    fn style_of(rows: &[Row], cols: usize) -> String {
-        fn color_hex(c: Color) -> [u8; 5] {
-            match c {
-                Color::None => [0, 0, 0, 0, 0],
-                Color::Palette(i) => [1, i, 0, 0, 0],
-                Color::Rgb(r, g, b) => [2, 0, r, g, b],
-            }
-        }
-        let mut out = String::new();
-        for r in rows {
-            for x in 0..cols {
-                let blank = Cell { width: 1, ..Cell::default() };
-                let c = r.cells.get(x).unwrap_or(&blank);
-                let mut flags = 0u8;
-                if c.skip {
-                    flags |= 1;
-                }
-                flags |= c.width << 1;
-                let fg = color_hex(c.fg);
-                let bg = color_hex(c.bg);
-                for b in fg.iter().chain(bg.iter()) {
-                    out.push_str(&format!("{b:02x}"));
-                }
-                out.push_str(&format!("{:04x}{:02x}", c.attr, flags));
-            }
-            out.push('\n');
-        }
-        out
-    }
-
-    /// 读 surface-golden/manifest.tsv：name → 列向量。
-    fn golden_manifest() -> Vec<Vec<String>> {
-        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures");
-        let raw = std::fs::read_to_string(format!("{base}/surface-golden/manifest.tsv"))
-            .expect("golden manifest");
-        raw.lines()
-            .filter(|l| !l.is_empty())
-            .map(|l| l.split('\t').map(|s| s.to_string()).collect())
-            .collect()
     }
 
     /// 6b 自检①：三个会话夹具喂底座——damage 有值、screen_text 非空且含语义锚点。

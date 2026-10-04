@@ -34,8 +34,8 @@ type vecCell struct {
 	Sym  string   `json:"sym,omitempty"`
 	Width uint8   `json:"width,omitempty"`
 	Skip bool     `json:"skip,omitempty"`
-	FG   []byte   `json:"fg,omitempty"` // 空/缺 = none；[1,idx] = palette；[2,r,g,b] = rgb
-	BG   []byte   `json:"bg,omitempty"`
+	FG   []int    `json:"fg,omitempty"` // 空/缺 = none；[1,idx] = palette；[2,r,g,b] = rgb
+	BG   []int    `json:"bg,omitempty"`
 	Attr *uint16  `json:"attr,omitempty"`
 }
 
@@ -91,7 +91,7 @@ type vecSurfaceCodecFile struct {
 
 // ---- cell 构造小件 ----
 
-func vecC(sym string, fg, bg []byte, attr uint16) vt.Cell {
+func vecC(sym string, fg, bg []int, attr uint16) vt.Cell {
 	c := vt.Cell{Symbol: sym, Width: 1, FG: vecColor(fg), BG: vecColor(bg), Attr: attr}
 	if sym == "" {
 		c.Width = 0
@@ -99,12 +99,12 @@ func vecC(sym string, fg, bg []byte, attr uint16) vt.Cell {
 	return c
 }
 
-func vecColor(k []byte) vt.Color {
+func vecColor(k []int) vt.Color {
 	if len(k) >= 2 && k[0] == 1 {
-		return vt.Color{Kind: vt.ColorPalette, Index: k[1]}
+		return vt.Color{Kind: vt.ColorPalette, Index: uint8(k[1])}
 	}
 	if len(k) >= 4 && k[0] == 2 {
-		return vt.Color{Kind: vt.ColorRGB, R: k[1], G: k[2], B: k[3]}
+		return vt.Color{Kind: vt.ColorRGB, R: uint8(k[1]), G: uint8(k[2]), B: uint8(k[3])}
 	}
 	return vt.Color{}
 }
@@ -130,7 +130,7 @@ func TestVecgenSurface(t *testing.T) {
 		t.Skip("HOMEWAY_VECGEN_OUT 未设")
 	}
 
-	box := vecC("─", []byte{1, 4}, nil, 0) // 调色板 4 前景的框线（repeatRun 形态）
+	box := vecC("─", []int{1, 4}, nil, 0) // 调色板 4 前景的框线（repeatRun 形态）
 
 	cases := []struct {
 		name string
@@ -143,7 +143,7 @@ func TestVecgenSurface(t *testing.T) {
 		{"blank_128", 128, []vt.Row{{Y: 0, Cells: vecBlank(128)}}, "varint 双字节起"},
 		{"blank_300", 300, []vt.Row{{Y: 0, Cells: vecBlank(300)}}, "varint 多字节"},
 		{"repeat_box", 10, []vt.Row{{Y: 0, Cells: vecRep(10, box)}}, "全重复行 → 首格 cell + repeatRun"},
-		{"cell_blank_cell", 6, []vt.Row{{Y: 0, Cells: append(append(
+		{"cell_blank_cell", 5, []vt.Row{{Y: 0, Cells: append(append(
 			[]vt.Cell{vecC("A", nil, nil, 0)}, vecBlank(3)...), vecC("B", nil, nil, 0))}},
 			"cell→blank→cell：flush 顺序"},
 		{"repeat_blank_repeat", 8, []vt.Row{{Y: 0, Cells: append(vecRep(3, box), append(
@@ -156,9 +156,9 @@ func TestVecgenSurface(t *testing.T) {
 			"宽字符 + 占位格（skipBit）+ 尾部空白"},
 		{"colors", 4, []vt.Row{{Y: 0, Cells: []vt.Cell{
 			vecC("a", nil, nil, 0),
-			vecC("b", []byte{1, 196}, []byte{1, 17}, 0),
-			vecC("c", []byte{2, 10, 20, 30}, []byte{2, 1, 2, 3}, 0),
-			vecC("d", nil, []byte{1, 0}, 0),
+			vecC("b", []int{1, 196}, []int{1, 17}, 0),
+			vecC("c", []int{2, 10, 20, 30}, []int{2, 1, 2, 3}, 0),
+			vecC("d", nil, []int{1, 0}, 0),
 		}}}, "none/palette/rgb 三 kind 的 fg×bg 组合"},
 		{"attr_bits", 9, []vt.Row{{Y: 0, Cells: []vt.Cell{
 			vecC("x", nil, nil, 1<<0), vecC("x", nil, nil, 1<<1), vecC("x", nil, nil, 1<<2),
@@ -166,7 +166,7 @@ func TestVecgenSurface(t *testing.T) {
 			vecC("x", nil, nil, 1<<6), vecC("x", nil, nil, 1<<7), vecC("x", nil, nil, 1<<8|2),
 		}}}, "attr 各位 + 下划线样式位（bit8..11）"},
 		{"styled_space", 3, []vt.Row{{Y: 0, Cells: []vt.Cell{
-			vecC("", nil, []byte{2, 9, 9, 9}, 1<<4), {Width: 1}, vecC("Z", nil, nil, 0),
+			vecC("", nil, []int{2, 9, 9, 9}, 1<<4), {Width: 1}, vecC("Z", nil, nil, 0),
 		}}}, "带样式空格（sym 空但 attr/bg 非零 → 非 blank，编完整格）+ 中间无样式空白格"},
 		{"multi_row_nonseq", 4, []vt.Row{
 			{Y: 5, Cells: vecRep(4, box)},
@@ -188,14 +188,14 @@ func TestVecgenSurface(t *testing.T) {
 			for _, cell := range r.Cells {
 				vc := vecCell{Sym: cell.Symbol, Width: cell.Width, Skip: cell.Skip}
 				if cell.FG.Kind == vt.ColorPalette {
-					vc.FG = []byte{1, cell.FG.Index}
+					vc.FG = []int{1, int(cell.FG.Index)}
 				} else if cell.FG.Kind == vt.ColorRGB {
-					vc.FG = []byte{2, cell.FG.R, cell.FG.G, cell.FG.B}
+					vc.FG = []int{2, int(cell.FG.R), int(cell.FG.G), int(cell.FG.B)}
 				}
 				if cell.BG.Kind == vt.ColorPalette {
-					vc.BG = []byte{1, cell.BG.Index}
+					vc.BG = []int{1, int(cell.BG.Index)}
 				} else if cell.BG.Kind == vt.ColorRGB {
-					vc.BG = []byte{2, cell.BG.R, cell.BG.G, cell.BG.B}
+					vc.BG = []int{2, int(cell.BG.R), int(cell.BG.G), int(cell.BG.B)}
 				}
 				if cell.Attr != 0 {
 					a := cell.Attr
@@ -220,19 +220,23 @@ func TestVecgenSurface(t *testing.T) {
 	mut := func(base []byte, f func(b []byte) []byte) string {
 		return hex.EncodeToString(f(append([]byte(nil), base...)))
 	}
+	// rowsSeqGood = EncodeRows 形态（无头行序列：y=0 + blankRun + varint10 = 4 字节）
+	rowsSeqGood := vt.EncodeRows([]vt.Row{{Y: 0, Cells: vecBlank(10)}})
 	file.CellsBad = []vecDecodeBad{
+		// DecodeGrid 面（Count=0）
 		{Name: "bad_version", InHex: mut(blankGood, func(b []byte) []byte { b[0] = 2; return b }), Note: "版本字节 ≠ 1"},
 		{Name: "truncated_header", InHex: hex.EncodeToString(blankGood[:4]), Note: "头都不全"},
-		{Name: "bad_marker", InHex: mut(blankGood, func(b []byte) []byte { b[7] = 0x03; return b }), Cols: 10, Count: 1,
+		{Name: "bad_marker", InHex: mut(blankGood, func(b []byte) []byte { b[7] = 0x03; return b }),
 			Note: "格流标记 0x03（表外值）"},
-		{Name: "bad_color_kind", InHex: mut(cellGood, func(b []byte) []byte { b[10] = 0x03; return b }), Cols: 1, Count: 1,
+		{Name: "bad_color_kind", InHex: mut(cellGood, func(b []byte) []byte { b[10] = 0x03; return b }),
 			Note: "完整格的颜色 kind 0x03"},
-		{Name: "repeat_first", InHex: mut(blankGood, func(b []byte) []byte { b[7] = 0x02; return b }), Cols: 10, Count: 1,
+		{Name: "repeat_first", InHex: mut(blankGood, func(b []byte) []byte { b[7] = 0x02; return b }),
 			Note: "行首 repeat（无上一格）"},
 		{Name: "varint_unterminated", InHex: mut(blankGood, func(b []byte) []byte {
 			return append(b[:8], 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80, 0x80)
-		}), Cols: 10, Count: 1, Note: "varint 10 字节未终止"},
-		{Name: "row_short", InHex: hex.EncodeToString(blankGood), Cols: 10, Count: 2,
+		}), Note: "varint 10 字节未终止"},
+		// DecodeRows 面（Count>0：InHex 是无头行序列）
+		{Name: "row_short", InHex: hex.EncodeToString(rowsSeqGood), Cols: 10, Count: 2,
 			Note: "DecodeRows 行数声明 > 实有"},
 	}
 
