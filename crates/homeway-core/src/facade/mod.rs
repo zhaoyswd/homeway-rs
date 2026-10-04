@@ -22,7 +22,9 @@
 //! tun 域的数据面执行体经 [`TunExecutor`] 注入——第 2 棒接真 wgcore hub（TUN fd →
 //! L3 直通）；本棒以 trait 契约 + 状态机全路径单测钉语义（两阶段/世代/单飞/停等）。
 
+pub mod bridge_host;
 pub mod demand;
+pub mod events;
 pub mod files_op;
 pub mod portfwd;
 pub mod probe_json;
@@ -176,8 +178,13 @@ pub struct ClientCore {
     pub demand: DemandSignals,
     pub files: files_op::FilesOps,
     executor: Mutex<Arc<dyn TunExecutor>>,
-    /// 服务会话域（7d 实装桥接；rc 门与状态面已在 service_op）。
+    /// 服务会话域（rc 门与状态面在 service_op；真 Session/桥挂接在 7d 装配位）。
     pub service: service_op::ServiceDomain,
+    /// 状态推送的最小等价面（可轮询事件队列 + 冷启动快照；真 IPC 推送在 ArkTS 侧）。
+    pub events: events::EventHub,
+    /// 服务桥宿主（`<filesDir>/bridge/*.sock` 三座；None = 未装配——第 2 棒随真
+    /// Session 注入，本棒接口 + 单测已齐）。
+    pub service_bridge: Mutex<Option<Arc<bridge_host::BridgeHost>>>,
 }
 
 impl Default for ClientCore {
@@ -194,7 +201,25 @@ impl ClientCore {
             files: files_op::FilesOps::new(),
             executor: Mutex::new(executor),
             service: service_op::ServiceDomain::new(),
+            events: events::EventHub::new(),
+            service_bridge: Mutex::new(None),
         }
+    }
+
+    /// 装配服务桥（7d：服务会话宿主形态——`service_start` 受理后由装配方注入；
+    /// 桥状态经 `bridge_status` 并入 serviceStatusJSON 的 bridge 四键）。
+    pub fn attach_service_bridge(&self, host: Option<Arc<bridge_host::BridgeHost>>) {
+        *self.service_bridge.lock().expect("服务桥锁中毒") = host;
+    }
+
+    /// 桥状态快照（bridge 四键源；未装配 = 全空——serviceStatusJSON 的缺省形态）。
+    pub fn bridge_status(&self) -> bridge_host::BridgeStatus {
+        self.service_bridge
+            .lock()
+            .expect("服务桥锁中毒")
+            .as_ref()
+            .map(|h| h.status())
+            .unwrap_or_default()
     }
 
     /// 替换执行体（第 2 棒装配真 hub 用；测试注入受控实现用）。
