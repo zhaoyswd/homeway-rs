@@ -763,28 +763,40 @@ impl SessionVt {
         out
     }
 
+    /// 整屏 + 回滚的纯文本（Go `PlainText` 口径——explain 的输入面；region 求值
+    /// 自尾部切「最近约一屏」，回滚在前不改变判定，但 region_bytes/screenBytes 与
+    /// Go 逐字节可比——评审 M2）。
+    pub fn plain_text(&mut self) -> String {
+        let total = self.term.total_lines() as u64;
+        let rows = self.rows_at(0, total as usize);
+        text_of_rows(&rows)
+    }
+
     /// 当前视口纯文本（检测引擎输入口径：跳占位格、空符号补空格、行尾裁空白）。
     pub fn screen_text(&mut self) -> String {
-        let rows = self.rows();
-        let lines: Vec<String> = rows
-            .iter()
-            .map(|r| {
-                let mut s = String::with_capacity(r.cells.len());
-                for c in &r.cells {
-                    if c.skip {
-                        continue;
-                    }
-                    if c.symbol.is_empty() {
-                        s.push(' ');
-                    } else {
-                        s.push_str(&c.symbol);
-                    }
-                }
-                s.trim_end_matches([' ', '\t', '\u{a0}']).to_string()
-            })
-            .collect();
-        lines.join("\n")
+        text_of_rows(&self.rows())
     }
+}
+
+/// 行序列 → 纯文本（视口/整屏两个口径共用同一字符串化——Go format 同义）。
+fn text_of_rows(rows: &[Row]) -> String {
+    rows.iter()
+        .map(|r| {
+            let mut s = String::with_capacity(r.cells.len());
+            for c in &r.cells {
+                if c.skip {
+                    continue;
+                }
+                if c.symbol.is_empty() {
+                    s.push(' ');
+                } else {
+                    s.push_str(&c.symbol);
+                }
+            }
+            s.trim_end_matches([' ', '\t', '\u{a0}']).to_string()
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 /// TermMode → kitty 协议五位（1/2/4/8/16；快照与查询应答共用一处拼装）。

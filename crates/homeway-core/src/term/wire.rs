@@ -100,8 +100,14 @@ impl FrameIo {
                     self.torn_whole.clear();
                 }
                 PollWrite::Partial(rem) => {
-                    // 部分进展：立刻续写剩余（deadline 已按本帧重置）
+                    // 部分进展：立刻续写剩余（deadline 已按本帧重置）；
+                    // **零进展超时上抛**（Go `isWriteTimeout(err) && n > 0 → continue`
+                    // 的另一支）——不上抛会在这条循环里无限重 poll，写者挂死、
+                    // 停滞上限判定（note_stall 的超限断腿）永远不可达（评审 H1）
                     let used = self.torn.len() - rem.len();
+                    if used == 0 {
+                        return Err(WriteFail::Timeout);
+                    }
                     self.torn.drain(..used);
                 }
             }
@@ -176,7 +182,7 @@ fn poll_write<'a>(stream: &UnixStream, mut buf: &'a [u8], deadline: Instant) -> 
             return Ok(PollWrite::Partial(buf));
         }
         let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
-        let ms = (deadline - now).as_millis().min(u32::MAX as u128) as i32;
+        let ms = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
         let r = unsafe { libc::poll(&mut pfd, 1, ms) };
         if r < 0 {
             let err = io::Error::last_os_error();
@@ -218,7 +224,7 @@ fn poll_read(stream: &UnixStream, deadline: Instant) -> Result<i32, ReadFail> {
             return Ok(0);
         }
         let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-        let ms = (deadline - now).as_millis().min(u32::MAX as u128) as i32;
+        let ms = (deadline - now).as_millis().min(i32::MAX as u128) as i32;
         let r = unsafe { libc::poll(&mut pfd, 1, ms) };
         if r < 0 {
             let err = io::Error::last_os_error();
@@ -267,6 +273,38 @@ mod tests {
         let (mut io_a, _io_b) = pair();
         let r = io_a.read_frame_deadline(Duration::from_millis(50));
         assert!(matches!(r, Err(ReadFail::Timeout)));
+    }
+
+    /// 评审 H1 回归：断尾在身 + 对端持续不读 ⇒ 同帧重试必须**上抛零进展超时**
+    /// （而非无限续 poll——修前这条调用永不返回，停滞上限判定不可达）。
+    #[test]
+    fn torn_zero_progress_times_out() {
+        let (mut io_a, _io_b) = pair();
+        let big = vec![0x3au8; 2 << 20];
+        let mut timed_out = false;
+        for _ in 0..16 {
+            match io_a.write_frame(Op::DATA, &big, Duration::from_millis(120)) {
+                Ok(()) => continue,
+                Err(WriteFail::Timeout) => {
+                    timed_out = true;
+                    break;
+                }
+                Err(e) => panic!("意外错误 {e}"),
+            }
+        }
+        if !timed_out {
+            return; // 本机缓冲吞下全部帧——无断尾面可测
+        }
+        assert!(io_a.has_torn());
+        // 关键断言：同帧重试在 timeout 窗口内**返回**（零进展超时上抛），不挂死
+        let started = Instant::now();
+        match io_a.write_frame(Op::DATA, &big, Duration::from_millis(200)) {
+            Err(WriteFail::Timeout) => {
+                assert!(started.elapsed() < Duration::from_secs(2), "零进展必须按时上抛");
+            }
+            other => panic!("断尾+对端不读的重试必须零进展超时：{other:?}"),
+        }
+        assert!(io_a.has_torn(), "断尾保留");
     }
 
     /// 停滞写超时：对端不读、灌满发送缓冲后 write_frame 报 Timeout 且断尾保留。

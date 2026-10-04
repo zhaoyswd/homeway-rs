@@ -383,10 +383,11 @@ impl ServeEngine {
                         tsrv.features_text(),
                         tsrv.vt_text()
                     ));
+                    let stop = spawn_service_stop_flag(&mut stop_flags);
                     let t = Arc::clone(&tsrv);
                     std::thread::Builder::new()
                         .name("homeway-term".into())
-                        .spawn(move || t.serve(ln))
+                        .spawn(move || t.serve_stoppable(ln, stop))
                         .ok();
                     term_srv = Some(tsrv);
                 }

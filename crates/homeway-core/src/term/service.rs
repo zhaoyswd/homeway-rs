@@ -14,9 +14,10 @@
 //!   （查询应答独占写 PTY，FIX-25）+ surface 投递线程（合并窗 16–33ms）；
 //!   服务级 sample 线程 1s 一拍；
 //! - **锁纪律**（Go「每会话一把锁 × 服务锁」的收敛）：全部会话/腿状态在**一把服务锁**
-//!   （[`State`]）内。锁内只做入队/唤醒/取快照/建体，**绝不碰 socket 与 PTY I/O**——
-//!   gzip/分片/写帧/PTY 读写全在锁外（PTY 写经 [`PtyShared`] 的独立小锁，只包
-//!   write/resize 本身；PTY 读归 pump 线程独占——reader 在 spawn 时被移走）。
+//!   （[`State`]）内。锁内**不做阻塞 I/O**——socket 写帧/PTY 读/gzip/分片/`ps` 全在
+//!   锁外（PTY 写经 [`PtyShared`] 的独立小锁，只包 write 本身；PTY 读归 pump 线程
+//!   独占——reader 在 spawn 时被移走）。刻意的例外（微秒级、Go 会话锁内同款）：
+//!   PTY setsize（ioctl）、日志行、manifest 求值与 `screen_text`（正则/文本切片）。
 //!
 //! # HOMEWAY_TERM=off
 //!
@@ -70,8 +71,6 @@ use super::wire::FrameIo;
 use super::wire::WriteFail;
 use crate::Logf;
 
-/// term 端口默认值（拦截层 LocalServices 映射用；UDS 才是承载）。
-pub const DEFAULT_PORT: u16 = 7724;
 const DEFAULT_HISTORY: usize = 1 << 20;
 const DEFAULT_REPLAY: usize = 256 << 10;
 const REPLAY_BUDGET: Duration = Duration::from_secs(2);
@@ -102,6 +101,14 @@ fn valid_name(name: &str) -> bool {
     !name.is_empty()
         && name.len() <= 64
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
+}
+
+/// 服务端 vt 逃生口（HOMEWAY_TERM_VT=off：本会话全部退化为 legacy-only——
+/// surface 腿得 surface_unavailable；Go `vtGloballyDisabled` 同款）。
+pub fn vt_disabled_by_env() -> bool {
+    std::env::var("HOMEWAY_TERM_VT")
+        .map(|v| v.trim().eq_ignore_ascii_case("off"))
+        .unwrap_or(false)
 }
 
 /// HOMEWAY_TERM=off 是唯一关闭方式（刻意不做 CLI 旗标）。
@@ -399,6 +406,9 @@ struct RawHandshake {
 struct LegRt {
     key: LegKey,
     kind: LegKind,
+    /// HELLO 尾随声明了 capsRawTerminal（应答让位判据——与 surface 位无关，
+    /// surface+rawCapable 组合同样让位；Go rawTermLegs 计数器同义，评审 M4）。
+    raw_capable: bool,
     out: Arc<LegOut>,
     surface: Option<SurfaceLeg>,
     theme_known: bool,
@@ -416,6 +426,8 @@ struct OutBucket {
 /// 会话运行态。
 struct SessRt {
     name: String,
+    /// 会话代数（同名重建 +1；旧线程回查的身份面，见 [`rt_of`]）。
+    gen: u64,
     created_ms: u64,
     pty: Arc<PtyShared>,
     ring: OutputRing,
@@ -498,6 +510,19 @@ struct State {
     registry: SessionRegistry,
     sessions: HashMap<String, SessRt>,
     manifests: Option<manifest::Loader>,
+    /// 会话代数发号器：同名会话重建后旧线程（pump/写者/投递）按（名字, 代）回查，
+    /// 代不符即视为 Gone——等价 Go `remove(name, who)` 的身份比对（评审 N1）。
+    next_sess_gen: u64,
+}
+
+/// 按身份（名字 + 代数）取会话运行态；代不符 = 已被同名重建顶掉（None）。
+fn rt_of<'a>(st: &'a State, name: &str, gen: u64) -> Option<&'a SessRt> {
+    st.sessions.get(name).filter(|rt| rt.gen == gen)
+}
+
+/// 同 [`rt_of`] 的可变版。
+fn rt_of_mut<'a>(st: &'a mut State, name: &str, gen: u64) -> Option<&'a mut SessRt> {
+    st.sessions.get_mut(name).filter(|rt| rt.gen == gen)
 }
 
 // ---------------------------------------------------------------------------
@@ -540,6 +565,7 @@ impl TermService {
                 registry,
                 sessions: HashMap::new(),
                 manifests,
+            next_sess_gen: 1,
             }),
             stop: Arc::new(AtomicBool::new(false)),
         });
@@ -567,12 +593,17 @@ impl TermService {
         "list,replay,modes,agent,title,surface"
     }
 
-    /// 服务端 vt 现状文本（就绪行用；本实现无 HOMEWAY_TERM_VT 逃生口 ⇒ 恒 on）。
+    /// 服务端 vt 现状文本（就绪行用；HOMEWAY_TERM_VT 逃生口的判据面）。
     pub fn vt_text(&self) -> &'static str {
-        "on"
+        if vt_disabled_by_env() {
+            "off（HOMEWAY_TERM_VT）"
+        } else {
+            "on"
+        }
     }
 
-    /// UDS 监听循环（每连接一线程；engine 挂在 term.sock 上）。
+    /// UDS 监听循环（每连接一线程；engine 挂在 term.sock 上；阻塞 accept 形态——
+    /// 测试面用；engine 用 [`Self::serve_stoppable`] 纳入 stop_flags 收口）。
     pub fn serve(self: &Arc<Self>, ln: UnixListener) {
         for conn in ln.incoming() {
             if self.stop.load(Ordering::Relaxed) {
@@ -591,16 +622,45 @@ impl TermService {
         }
     }
 
+    /// 同 [`Self::serve`]，但 accept 走非阻塞 + 停止位轮询——服务收工时监听线程
+    /// 可退出（不陪跑到进程结束；Go Shutdown 里的 `s.termLn.Close()` 同效）。
+    pub fn serve_stoppable(self: &Arc<Self>, ln: UnixListener, stop: Arc<AtomicBool>) {
+        let _ = ln.set_nonblocking(true);
+        loop {
+            if stop.load(Ordering::Relaxed) || self.stop.load(Ordering::Relaxed) {
+                return;
+            }
+            match ln.accept() {
+                Ok((stream, _)) => {
+                    let _ = stream.set_nonblocking(false);
+                    let svc = Arc::clone(self);
+                    std::thread::Builder::new()
+                        .name("term-conn".into())
+                        .spawn(move || svc.serve_conn(stream))
+                        .ok();
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+                Err(_) => return,
+            }
+        }
+    }
+
     /// 关停服务：全部会话 ENDED(service_stopped) + 收尸（不影响其它服务）。
     pub fn close(&self) {
         self.stop.store(true, Ordering::Relaxed);
         let names: Vec<String> = {
-            let st = self.state.lock().expect("term state");
+            let st = self.lock_state();
             st.registry.session_names().into_iter().map(String::from).collect()
         };
-        for name in names {
-            self.finish_session(&name, FinishReason::ServiceStopped);
-        }
+        // 并发收工（Go FIX-33：finish 每条会话最多等子进程 2s，串行收 16 条最坏 32s——
+        // 关停路径不该被线性放大）
+        std::thread::scope(|scope| {
+            for name in &names {
+                scope.spawn(|| self.finish_session(name, FinishReason::ServiceStopped));
+            }
+        });
     }
 
     // ---- 连接处理（Go ServeConn）----
@@ -746,7 +806,7 @@ impl TermService {
         // surface 腿门：本会话无 vt ⇒ 明确报错（不静默降级）
         if surface {
             let has_vt = {
-                let st = self.state.lock().expect("term state");
+                let st = self.lock_state();
                 st.sessions.get(&name).is_some_and(|s| s.vt.is_some())
             };
             if !has_vt {
@@ -761,6 +821,8 @@ impl TermService {
                 return;
             }
         }
+        // 尺寸归一（Go spawnLocked 的 80/24 缺省；HELLO 0x0 不产生退化几何——评审 L8）
+        let (cols, rows) = (cols_or_default(cols), rows_or_default(rows));
         // 注册腿（全序：同实例替换 → 接管 → 腾位 → 入表即活动）
         let desc = LegDescriptor {
             client_id: ht.client_id.clone(),
@@ -769,10 +831,13 @@ impl TermService {
             cols,
             rows,
         };
-        let (out, hs, reg, prev_size) = {
-            let mut st = self.state.lock().expect("term state");
+        let (out, hs, reg, sess_gen) = {
+            let mut st = self.lock_state();
             // ATTACHED/回放计划用**选举前**的会话尺寸（Go registerLegLocked 同序）
             let prev_size = st.registry.session(&name).map(|s| (s.cols, s.rows)).unwrap_or((cols, rows));
+            let Some(sess_gen) = st.sessions.get(&name).map(|rt| rt.gen) else {
+                return;
+            };
             let regres = st.registry.register_leg(&name, desc, takeover, now_ms());
             let reg = match regres {
                 Ok(o) => o,
@@ -794,14 +859,19 @@ impl TermService {
             rt.legs.push(LegRt {
                 key: reg.key,
                 kind: LegKind::of(surface, raw_capable),
+                raw_capable,
                 out: Arc::clone(&out),
                 surface: surface.then(SurfaceLeg::new),
                 theme_known: false,
                 theme: ([0, 0, 0], [0, 0, 0]),
                 clip_cache: None,
             });
-            rt.writers += 1;
             self.logf(&reg.log);
+            // 接入即活动的尺寸应用（H2：注册表只改记账，PTY/vt/环 epoch 在这里跟上；
+            // 哨兵不在注册路径注入——stream 统一一次）
+            if let Some((c, r)) = reg.size_applied {
+                apply_size_locked(rt, c, r);
+            }
             // ATTACHED/握手计划（锁内构建；ATTACHED 先入队——此刻腿已在表内且锁在手）
             let attached =
                 frames::enc_attached(prev_size.0, prev_size.1, rt.scan.modes(), rt.agent, rt.state_v2, &rt.name);
@@ -823,19 +893,20 @@ impl TermService {
                     nudge_focus: reg.first,
                 })
             };
-            (out, hs, reg, prev_size)
+            (out, hs, reg, sess_gen)
         };
-        let _ = prev_size;
-        // 写者线程（conn 的写半归它；读半留在本线程）
+        // 写者线程（conn 的写半归它；读半留在本线程）。起不来 ⇒ 摘腿收线
+        // （writers 计数只在 spawn 成功后 +1——评审 L6：失败的写者永不回收）。
         let wstream = match io.try_clone_stream() {
             Ok(s) => s,
             Err(_) => {
+                self.logf(&format!("term: 会话 {name} 写者流克隆失败，腿收线"));
                 self.end_leg(&name, reg.key, i32::MIN, "", "client_closed");
                 return;
             }
         };
         let wio = FrameIo::new(wstream);
-        {
+        let spawned = {
             let svc = Arc::clone(self);
             let tname = name.clone();
             let tkey = reg.key;
@@ -844,30 +915,49 @@ impl TermService {
                 .name("term-leg-writer".into())
                 .spawn(move || {
                     if let Some(hs) = hs {
-                        svc.run_raw_writer(&tname, tkey, wio, tout, hs);
+                        svc.run_raw_writer(&tname, sess_gen, tkey, wio, tout, hs);
                     } else {
-                        svc.run_surface_writer(&tname, tkey, wio, tout);
+                        svc.run_surface_writer(&tname, sess_gen, tkey, wio, tout);
                     }
                 })
-                .ok();
+        };
+        match spawned {
+            Ok(_) => {
+                let mut st = self.lock_state();
+                if let Some(rt) = rt_of_mut(&mut st, &name, sess_gen) {
+                    rt.writers += 1;
+                }
+            }
+            Err(e) => {
+                self.logf(&format!("term: 会话 {name} 写者线程起不来（{e}）——腿收线"));
+                self.end_leg(&name, reg.key, i32::MIN, "", "client_closed");
+                return;
+            }
         }
         // 尺寸哨兵：raw 腿在回放之后（写者按握手计划执行）；surface 腿在快照下发前
         // （投递循环还在合并窗里，快照取到的已是按最终尺寸重绘过的屏）。
         self.sentinel_repaint(&name);
         if surface {
-            let st = self.state.lock().expect("term state");
-            if let Some(rt) = st.sessions.get(&name) {
+            let st = self.lock_state();
+            if let Some(rt) = rt_of(&st, &name, sess_gen) {
                 rt.wake_surface();
             }
         }
         // 读循环（连接存续期间）
-        self.stream_read_loop(&name, reg.key, io, Arc::clone(&out));
+        self.stream_read_loop(&name, sess_gen, reg.key, io, Arc::clone(&out));
         // 正常断开：摘腿（裸断——客户端已关）
         self.end_leg(&name, reg.key, i32::MIN, "", "client_closed");
     }
 
     /// 腿读循环（Go stream 的读半）：输入/尺寸/上行帧 → 会话面。
-    fn stream_read_loop(self: &Arc<Self>, name: &str, key: LegKey, mut io: FrameIo, out: Arc<LegOut>) {
+    fn stream_read_loop(
+        self: &Arc<Self>,
+        name: &str,
+        sess_gen: u64,
+        key: LegKey,
+        mut io: FrameIo,
+        out: Arc<LegOut>,
+    ) {
         loop {
             let f = match io.read_frame() {
                 Ok(f) => f,
@@ -875,22 +965,23 @@ impl TermService {
             };
             match f.op {
                 Op::DATA => {
-                    let (pty, sz) = {
-                        let mut st = self.state.lock().expect("term state");
+                    let pty = {
+                        let mut st = self.lock_state();
                         let sz = st.registry.note_activity(name, key, now_ms());
-                        let rt = st.sessions.get_mut(name);
-                        match rt {
-                            None => return,
-                            Some(rt) => {
-                                if let Some(sz) = sz {
-                                    apply_size_locked(rt, sz.0, sz.1);
-                                    self.sentinel_repaint_locked(rt);
-                                }
-                                (Arc::clone(&rt.pty), sz)
-                            }
+                        let active = st.registry.session(name).and_then(|s| s.active);
+                        let Some(rt) = rt_of_mut(&mut st, name, sess_gen) else { return };
+                        // 已被收尾/腾位的腿不得再向 PTY 注入（评审 H3：写者收线后
+                        // 读循环可能还有在途帧）
+                        if !rt.legs.iter().any(|l| l.key == key) {
+                            return;
                         }
+                        apply_active_theme_locked(rt, active);
+                        if let Some(sz) = sz {
+                            apply_size_locked(rt, sz.0, sz.1);
+                            self.sentinel_repaint_locked(rt);
+                        }
+                        Arc::clone(&rt.pty)
                     };
-                    let _ = sz;
                     if !f.payload.is_empty() && !pty.write_input(&f.payload) {
                         return; // PTY 写失败：收尾走 client_closed 同款摘腿
                     }
@@ -903,31 +994,39 @@ impl TermService {
                             continue;
                         }
                     };
-                    let mut wake = false;
-                    {
-                        let mut st = self.state.lock().expect("term state");
-                        let _ = st.registry.leg_resize(name, key, cols, rows);
-                        let sz = st.registry.note_activity(name, key, now_ms());
-                        if let Some(rt) = st.sessions.get_mut(name) {
-                            if let Some(sz) = sz {
-                                apply_size_locked(rt, sz.0, sz.1);
-                                self.sentinel_repaint_locked(rt);
-                            }
-                            wake = rt.any_surface();
-                        }
-                    }
-                    if wake {
-                        let st = self.state.lock().expect("term state");
-                        if let Some(rt) = st.sessions.get(name) {
-                            rt.wake_surface();
+                    let mut st = self.lock_state();
+                    let _ = st.registry.leg_resize(name, key, cols, rows);
+                    let sz = st.registry.note_activity(name, key, now_ms());
+                    let active = st.registry.session(name).and_then(|s| s.active);
+                    if let Some(rt) = rt_of_mut(&mut st, name, sess_gen) {
+                        apply_active_theme_locked(rt, active);
+                        if let Some(sz) = sz {
+                            apply_size_locked(rt, sz.0, sz.1);
+                            self.sentinel_repaint_locked(rt);
                         }
                     }
                 }
-                Op::INPUT => self.handle_input(name, key, &f.payload, &out),
-                Op::THEME => self.handle_theme(name, key, &f.payload),
-                Op::CLIPBOARD => self.handle_clipboard_answer(name, key, &f.payload),
-                Op::FETCH_ROWS => self.handle_fetch_rows(name, key, &f.payload, &out),
-                Op::FETCH_SNAPSHOT => self.handle_fetch_snapshot(name, key),
+                // surface 族上行帧只认 surface 腿（Go 同款 `if client.surface` 门——
+                // raw 腿可注入按键/抢占 FETCH 应答，评审 A4）
+                Op::INPUT if self.leg_is_surface(name, key) => {
+                    self.handle_input(name, sess_gen, key, &f.payload, &out)
+                }
+                Op::THEME if self.leg_is_surface(name, key) => self.handle_theme(name, key, &f.payload),
+                Op::CLIPBOARD if self.leg_is_surface(name, key) => {
+                    self.handle_clipboard_answer(name, key, &f.payload)
+                }
+                Op::FETCH_ROWS if self.leg_is_surface(name, key) => {
+                    self.handle_fetch_rows(name, key, &f.payload, &out)
+                }
+                Op::FETCH_SNAPSHOT if self.leg_is_surface(name, key) => {
+                    self.handle_fetch_snapshot(name, key)
+                }
+                Op::INPUT | Op::THEME | Op::CLIPBOARD | Op::FETCH_ROWS | Op::FETCH_SNAPSHOT => {
+                    out.enqueue(
+                        WriteItem::new(Op::ERROR, frames::enc_error("bad_op", "该帧只对 surface 腿合法")),
+                        0,
+                    );
+                }
                 Op::KILL => {
                     let name_k = match frames::dec_name(&f.payload) {
                         Ok(n) => n,
@@ -980,7 +1079,7 @@ impl TermService {
     // ---- 上行帧处理（surface 族）----
 
     /// 抽象输入：按 vt 真实模式编码写 PTY（任务 2.7；输入 = 活动，不注入哨兵）。
-    fn handle_input(self: &Arc<Self>, name: &str, key: LegKey, payload: &[u8], out: &Arc<LegOut>) {
+    fn handle_input(self: &Arc<Self>, name: &str, sess_gen: u64, key: LegKey, payload: &[u8], out: &Arc<LegOut>) {
         let ev = match frames::dec_input(payload) {
             Ok(e) => e,
             Err(e) => {
@@ -989,9 +1088,11 @@ impl TermService {
             }
         };
         let (pty, encoded) = {
-            let mut st = self.state.lock().expect("term state");
+            let mut st = self.lock_state();
             let sz = st.registry.note_activity(name, key, now_ms());
-            let Some(rt) = st.sessions.get_mut(name) else { return };
+            let active = st.registry.session(name).and_then(|s| s.active);
+            let Some(rt) = rt_of_mut(&mut st, name, sess_gen) else { return };
+            apply_active_theme_locked(rt, active);
             if let Some(sz) = sz {
                 // 输入也可能改会话尺寸（另一条不同尺寸的腿刚改过——FIX-26），但不注入哨兵
                 apply_size_locked(rt, sz.0, sz.1);
@@ -1057,7 +1158,7 @@ impl TermService {
         let Ok((fg, bg, _dark)) = super::codec::dec_theme(payload) else {
             return; // 主题是尽力而为的通道：坏帧不报错
         };
-        let mut st = self.state.lock().expect("term state");
+        let mut st = self.lock_state();
         let is_active = st.registry.session(name).is_some_and(|s| s.active == Some(key));
         let Some(rt) = st.sessions.get_mut(name) else { return };
         if let Some(l) = rt.legs.iter_mut().find(|l| l.key == key) {
@@ -1077,7 +1178,7 @@ impl TermService {
             return;
         };
         let text = String::from_utf8_lossy(&text[..text.len().min(CLIP_MAX_BYTES)]).into_owned();
-        let mut st = self.state.lock().expect("term state");
+        let mut st = self.lock_state();
         let is_active = st.registry.session(name).is_some_and(|s| s.active == Some(key));
         let Some(rt) = st.sessions.get_mut(name) else { return };
         if let Some(l) = rt.legs.iter_mut().find(|l| l.key == key) {
@@ -1101,7 +1202,7 @@ impl TermService {
             req.count = FETCH_ROWS_MAX;
         }
         let built = {
-            let mut guard = self.state.lock().expect("term state");
+            let mut guard = self.lock_state();
             let st = &mut *guard;
             let Some(rt) = st.sessions.get_mut(name) else { return };
             if rt.stopped.load(Ordering::Relaxed) {
@@ -1141,16 +1242,16 @@ impl TermService {
             .into_iter()
             .map(|frag| WriteItem::new(Op::FETCH_ROWS, frag))
             .collect();
-        let hit = items.iter().any(|i| !i.payload.is_empty());
+        let hit = !reply.row_bytes.is_empty(); // Go noteFetchRows(len(enc)>0)：判行字节非空
         let cap = self.cfg.queue_bytes;
         let ok = {
-            let st = self.state.lock().expect("term state");
+            let st = self.lock_state();
             match st.sessions.get(name).and_then(|rt| rt.legs.iter().find(|l| l.key == key)) {
                 Some(l) => l.out.enqueue_group(items, cap),
                 None => false,
             }
         };
-        let mut st = self.state.lock().expect("term state");
+        let mut st = self.lock_state();
         if let Some(rt) = st.sessions.get_mut(name) {
             if let Some(l) = rt.legs.iter_mut().find(|l| l.key == key) {
                 if let Some(s) = l.surface.as_mut() {
@@ -1170,7 +1271,7 @@ impl TermService {
 
     /// FETCH-SNAPSHOT：revision 断档/病态补丁被拒后客户端要全量。
     fn handle_fetch_snapshot(&self, name: &str, key: LegKey) {
-        let mut st = self.state.lock().expect("term state");
+        let mut st = self.lock_state();
         let Some(rt) = st.sessions.get_mut(name) else { return };
         if let Some(l) = rt.legs.iter_mut().find(|l| l.key == key) {
             if let Some(s) = l.surface.as_mut() {
@@ -1192,7 +1293,8 @@ impl TermService {
         create: bool,
         only_if_absent: bool,
     ) -> Result<(), TermError> {
-        let mut st = self.state.lock().expect("term state");
+        let (cols, rows) = (cols_or_default(cols), rows_or_default(rows));
+        let mut st = self.lock_state();
         if st.registry.session(name).is_none() && create {
             if st.registry.session_names().len() >= self.cfg.max_sessions {
                 return Err(TermError::new(
@@ -1202,17 +1304,14 @@ impl TermService {
             }
             self.spawn_session_locked(&mut st, name, cols, rows)?;
             // 注册表建立（80x24 归一——Go spawnLocked 同款；此后腿接入尺寸归选举）
-            return st
-                .registry
-                .attach_or_create(name, cols.max(1), rows.max(1), true, false)
-                .map(|_| ());
+            return st.registry.attach_or_create(name, cols, rows, true, false).map(|_| ());
         }
         st.registry.attach_or_create(name, cols, rows, create, only_if_absent).map(|_| ())
     }
 
     /// `CREATE` 不接入（Go createOnly，`new -d`）：不动尺寸、不产生腿、不触发哨兵/焦点。
     fn create_only(self: &Arc<Self>, name: &str, reuse_if_exists: bool) -> Result<(), TermError> {
-        let mut st = self.state.lock().expect("term state");
+        let mut st = self.lock_state();
         if st.registry.session(name).is_some() {
             return st.registry.create_only(name, reuse_if_exists);
         }
@@ -1248,15 +1347,23 @@ impl TermService {
 
         let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel(RESP_QUEUE_LEN);
         let (clip_tx, clip_rx) = std::sync::mpsc::sync_channel::<String>(8);
-        let vt = match SessionVt::new(cols, rows, self.cfg.scrollback_lines) {
-            Ok(v) => Some(v),
-            Err(e) => {
-                self.logf(&format!("term: 会话 {name} 无服务端 vt（{e}）→ 该会话仅 legacy 原始字节模式"));
-                None
+        let vt = if vt_disabled_by_env() {
+            self.logf(&format!("term: 会话 {name} 无服务端 vt（HOMEWAY_TERM_VT=off）→ 该会话仅 legacy 原始字节模式"));
+            None
+        } else {
+            match SessionVt::new(cols, rows, self.cfg.scrollback_lines) {
+                Ok(v) => Some(v),
+                Err(e) => {
+                    self.logf(&format!("term: 会话 {name} 无服务端 vt（{e}）→ 该会话仅 legacy 原始字节模式"));
+                    None
+                }
             }
         };
+        let sess_gen = st.next_sess_gen;
+        st.next_sess_gen += 1;
         let mut rt = SessRt {
             name: name.to_string(),
+            gen: sess_gen,
             created_ms: now_ms(),
             pty: Arc::clone(&pty),
             ring: OutputRing::new(self.cfg.history),
@@ -1289,31 +1396,48 @@ impl TermService {
         st.sessions.insert(name.to_string(), rt);
         self.logf(&format!("term: 新建会话 {name}（pid={pid} {cols}x{rows} shell={shell}）"));
 
-        // 会话线程：pump（PTY 读）/ 应答写者 / surface 投递
+        // 会话线程：pump（PTY 读）/ 应答写者 / surface 投递。
+        // pump 起不来 = 无 reader（会话必死）——立即回收；另两条失败只降功能不致命
+        //（应答尽力、surface 腿会被 surface_unavailable 门挡住），打告警行（评审 L6）。
         let svc = Arc::clone(self);
         let tname = name.to_string();
-        std::thread::Builder::new()
+        let pump_spawn = std::thread::Builder::new()
             .name("term-pump".into())
-            .spawn(move || svc.pump_loop(&tname, reader))
-            .ok();
+            .spawn(move || svc.pump_loop(&tname, sess_gen, reader));
+        if pump_spawn.is_err() {
+            self.logf(&format!("term: 会话 {name} pump 线程起不来——立即回收"));
+            pty.kill_start();
+            let _ = pty.wait_bounded(Duration::from_secs(2));
+            st.sessions.remove(name);
+            return Err(TermError::new(
+                super::session::TermErrorCode::SpawnFailed,
+                format!("会话 {name} 的读泵线程起不来"),
+            ));
+        }
         let resp_pty = Arc::clone(&pty);
         let resp_stopped = Arc::clone(&stopped);
-        std::thread::Builder::new()
+        if std::thread::Builder::new()
             .name("term-resp".into())
             .spawn(move || Self::response_writer_loop(resp_rx, resp_pty, resp_stopped))
-            .ok();
+            .is_err()
+        {
+            self.logf(&format!("term: 会话 {name} 应答写者线程起不来（查询应答将不代答）"));
+        }
         let svc = Arc::clone(self);
         let tname = name.to_string();
-        std::thread::Builder::new()
+        if std::thread::Builder::new()
             .name("term-surface".into())
-            .spawn(move || svc.surface_loop(&tname, clip_rx, surf_wake, stopped))
-            .ok();
+            .spawn(move || svc.surface_loop(&tname, sess_gen, clip_rx, surf_wake, stopped))
+            .is_err()
+        {
+            self.logf(&format!("term: 会话 {name} surface 投递线程起不来（surface 腿不可用）"));
+        }
         Ok(())
     }
 
     /// 尺寸哨兵（外部入口）：sentinel → 真实尺寸，两次 SIGWINCH 逼 TUI 重绘。
     fn sentinel_repaint(&self, name: &str) {
-        let mut guard = self.state.lock().expect("term state");
+        let mut guard = self.lock_state();
         let st = &mut *guard;
         let Some(rt) = st.sessions.get_mut(name) else { return };
         if st.registry.session(name).is_none_or(|s| s.done) {
@@ -1336,7 +1460,7 @@ impl TermService {
 
     /// 摘腿（幂等「只摘一次」）：注册表 + 运行态 + 派生（重选举/末腿 focus-out）+ 日志。
     fn end_leg(&self, name: &str, key: LegKey, code: i32, reason: &str, why: &'static str) {
-        let mut st = self.state.lock().expect("term state");
+        let mut st = self.lock_state();
         let Some(outcome) = st.registry.end_leg(name, key, code, reason, why, now_ms()) else {
             return;
         };
@@ -1390,7 +1514,7 @@ impl TermService {
     /// kill 主动结束（SIGHUP → 宽限 → SIGKILL）；ENDED 由 pump 收尾路径发。
     fn kill(&self, name: &str) -> Result<(), TermError> {
         let pty = {
-            let mut st = self.state.lock().expect("term state");
+            let mut st = self.lock_state();
             st.registry.kill_mark(name)?;
             match st.sessions.get(name) {
                 Some(rt) => Arc::clone(&rt.pty),
@@ -1405,8 +1529,18 @@ impl TermService {
         };
         pty.kill_start();
         let grace_pty = Arc::clone(&pty);
+        let grace_stopped = {
+            let st = self.lock_state();
+            st.sessions.get(name).map(|rt| Arc::clone(&rt.stopped))
+        };
         std::thread::spawn(move || {
             std::thread::sleep(KILL_GRACE);
+            // 会话已收工（子进程已死、宽限内自然退出）则不补发——pid 回收误伤面（D1）
+            if let Some(stopped) = &grace_stopped {
+                if stopped.load(Ordering::Relaxed) {
+                    return;
+                }
+            }
             grace_pty.kill_force();
         });
         self.logf(&format!("term: 关闭会话 {name}（pid={}）", pty.pid()));
@@ -1416,7 +1550,7 @@ impl TermService {
     /// 会话收尾（ENDED 送达 + 资源回收四步：等子进程 → 关 master → 删注册表 → 释放历史）。
     fn finish_session(&self, name: &str, reason: FinishReason) {
         let (pty, remove_now) = {
-            let mut st = self.state.lock().expect("term state");
+            let mut st = self.lock_state();
             let ends = st.registry.finish(name, reason);
             if ends.is_empty() {
                 // 幂等守卫之外的形态：已收尾过——只确保唤醒，不动回收面
@@ -1434,14 +1568,15 @@ impl TermService {
             }
             (Some(Arc::clone(&rt.pty)), rt.writers == 0)
         };
-        // 子进程收尸（有界 + SIGKILL 兜底）——锁外；master 随 PtyShared 释放
+        // 子进程收尸（有界 + SIGKILL 兜底）——锁外；master 随 PtyShared 释放。
+        // wait_bounded 内部只在超时才 kill_force——成功收尸后**不再补发**
+        //（pid/pgid 可能已被系统回收，组信号会误伤无关进程——评审 D1）
         if let Some(pty) = pty {
             pty.kill_start();
             let _ = pty.wait_bounded(Duration::from_secs(2));
-            pty.kill_force();
         }
         // 注册面回收；运行态在最后一个写者退出时移除（无写者则即刻——r5 M1）
-        let mut st = self.state.lock().expect("term state");
+        let mut st = self.lock_state();
         st.registry.remove_session(name);
         if remove_now && st.sessions.get(name).is_none_or(|rt| rt.writers == 0) {
             st.sessions.remove(name);
@@ -1451,7 +1586,7 @@ impl TermService {
     /// pump 的自然退出收尾（子进程已死）：ENDED = 退出码 / killed ⇒ -2。
     fn finalize_exit(self: &Arc<Self>, name: &str, code: i32) {
         let killed = {
-            let st = self.state.lock().expect("term state");
+            let st = self.lock_state();
             st.registry.session(name).is_some_and(|s| s.killed)
         };
         let reason = if killed { FinishReason::Killed } else { FinishReason::Exit(code) };
@@ -1460,10 +1595,10 @@ impl TermService {
 
     /// 写者退出计数；会话已收尾且这是最后一个写者 ⇒ 释放运行态（r5 M1：ENDED 前排干
     /// 窗口里环还在）。
-    fn writer_exited(&self, name: &str) {
-        let mut st = self.state.lock().expect("term state");
-        let stopped = st.sessions.get(name).is_some_and(|rt| rt.stopped.load(Ordering::Relaxed));
-        if let Some(rt) = st.sessions.get_mut(name) {
+    fn writer_exited(&self, name: &str, sess_gen: u64) {
+        let mut st = self.lock_state();
+        let stopped = rt_of(&st, name, sess_gen).is_some_and(|rt| rt.stopped.load(Ordering::Relaxed));
+        if let Some(rt) = rt_of_mut(&mut st, name, sess_gen) {
             rt.writers = rt.writers.saturating_sub(1);
             if stopped && rt.writers == 0 {
                 st.sessions.remove(name);
@@ -1475,7 +1610,7 @@ impl TermService {
 
     /// pump 常驻读 PTY：写历史、喂扫描器与 vt（收集应答/剪贴板事件）、唤醒各腿写者。
     /// 锁内只做入队/唤醒（design D5/B'）。
-    fn pump_loop(self: &Arc<Self>, name: &str, mut reader: Box<dyn Read + Send>) {
+    fn pump_loop(self: &Arc<Self>, name: &str, sess_gen: u64, mut reader: Box<dyn Read + Send>) {
         let mut buf = vec![0u8; 32 << 10];
         loop {
             let n = match reader.read(&mut buf) {
@@ -1490,20 +1625,18 @@ impl TermService {
             #[allow(unused_assignments)]
             let mut clip_cache: Option<String> = None;
             let (clip_tx, resp_tx, resp_dropped): (SyncSender<String>, SyncSender<Vec<u8>>, Arc<AtomicU64>) = {
-                let mut guard = self.state.lock().expect("term state");
+                let mut guard = self.lock_state();
                 let st = &mut *guard;
-                let Some(rt) = st.sessions.get_mut(name) else { break };
+                let Some(rt) = rt_of_mut(st, name, sess_gen) else { break };
                 if rt.stopped.load(Ordering::Relaxed) {
                     break;
                 }
                 rt.ring.append(&buf[..n]);
                 rt.scan.write(&buf[..n]);
                 // 应答让位（任务 5.1 窄规则）：capsRawTerminal 腿在场 ⇒ 服务端不代答
-                let suppress = st
-                    .registry
-                    .session(name)
-                    .map(|s| s.legs().iter().any(|l| l.kind == LegKind::Host))
-                    .unwrap_or(false);
+                //（按腿上的 caps 位计数——surface+rawCapable 组合同样让位，Go
+                // rawTermLegs 计数器同义；评审 M4）
+                let suppress = rt.legs.iter().any(|l| l.raw_capable);
                 if let Some(vt) = rt.vt.as_mut() {
                     let mut resp: Vec<Vec<u8>> = Vec::new();
                     vt.write_collecting(&buf[..n], &mut |r| {
@@ -1575,10 +1708,10 @@ impl TermService {
         }
         // 子进程退出 / PTY 关闭：收尸 → 统一收尾（ENDED + 回收四步）
         let code = {
-            let st = self.state.lock().expect("term state");
-            match st.sessions.get(name) {
+            let st = self.lock_state();
+            match rt_of(&st, name, sess_gen) {
                 Some(rt) => Arc::clone(&rt.pty),
-                None => return, // 会话已被服务关停路径收走
+                None => return, // 会话已被服务关停路径收走（或同名重建——身份不符）
             }
         };
         let code = code.wait_bounded(Duration::from_secs(2));
@@ -1614,6 +1747,7 @@ impl TermService {
     fn surface_loop(
         self: &Arc<Self>,
         name: &str,
+        sess_gen: u64,
         clip_rx: Receiver<String>,
         surf_wake: Arc<(Mutex<u32>, Condvar)>,
         stopped: Arc<AtomicBool>,
@@ -1643,7 +1777,7 @@ impl TermService {
                     }
                 };
                 while let Ok(text) = clip_rx.try_recv() {
-                    self.forward_clipboard(name, &text);
+                    self.forward_clipboard(name, sess_gen, &text);
                 }
                 if woke {
                     break;
@@ -1673,21 +1807,21 @@ impl TermService {
                 let woke = *g2 != g0;
                 drop(g2);
                 while let Ok(text) = clip_rx.try_recv() {
-                    self.forward_clipboard(name, &text);
+                    self.forward_clipboard(name, sess_gen, &text);
                 }
                 if !woke {
                     break; // MIN 窗内无新唤醒 ⇒ flush
                 }
                 last = Instant::now();
             }
-            self.flush_surface(name);
+            self.flush_surface(name, sess_gen);
         }
     }
 
     /// 剪贴板写（OSC 52）：立即下发，只发 surface 腿（raw 腿字节流自带该序列）。
-    fn forward_clipboard(&self, name: &str, text: &str) {
-        let st = self.state.lock().expect("term state");
-        let Some(rt) = st.sessions.get(name) else { return };
+    fn forward_clipboard(&self, name: &str, sess_gen: u64, text: &str) {
+        let mut st = self.lock_state();
+        let Some(rt) = rt_of_mut(&mut st, name, sess_gen) else { return };
         let cap = self.cfg.queue_bytes;
         for l in &rt.legs {
             if l.surface.is_some() {
@@ -1700,19 +1834,20 @@ impl TermService {
     }
 
     /// surface 一拍（Go flushSurface）：锁内取快照/建体、锁外压缩入队。
-    fn flush_surface(self: &Arc<Self>, name: &str) {
+    fn flush_surface(self: &Arc<Self>, name: &str, sess_gen: u64) {
         let pendings: Vec<Pending> = {
-            let mut guard = self.state.lock().expect("term state");
+            let mut guard = self.lock_state();
             let st = &mut *guard;
             if st.registry.session(name).is_none_or(|s| s.done) {
                 return;
             }
-            let Some(rt) = st.sessions.get_mut(name) else { return };
+            let geom = st.registry.session(name).map(|s| (s.cols, s.rows)).unwrap_or((80, 24));
+            let Some(rt) = rt_of_mut(st, name, sess_gen) else { return };
             if !rt.any_surface() {
                 return;
             }
             let Some(vt) = rt.vt.as_mut() else { return };
-            let (cols, rows) = st.registry.session(name).map(|s| (s.cols, s.rows)).unwrap_or((80, 24));
+            let (cols, rows) = geom;
             let title = rt.scan.title().to_string();
             // 回滚裁剪检测（noteScrollbar 在 takeSnapshotFlag 之前——本拍消费）
             let total = vt.scrollbar().total;
@@ -1833,7 +1968,7 @@ impl TermService {
                 continue;
             }
             // 观测计数 + 基线提交（入队成功后）
-            let mut st = self.state.lock().expect("term state");
+            let mut st = self.lock_state();
             if let Some(rt) = st.sessions.get_mut(name) {
                 if let Some(l) = rt.legs.iter_mut().find(|l| l.key == p.key) {
                     if let Some(s) = l.surface.as_mut() {
@@ -1854,7 +1989,7 @@ impl TermService {
 
     /// 服务锁内对一条腿的 surface 状态做一次变更。
     fn mark_leg_surface(&self, name: &str, key: LegKey, f: impl FnOnce(&mut SurfaceLeg)) {
-        let mut st = self.state.lock().expect("term state");
+        let mut st = self.lock_state();
         if let Some(rt) = st.sessions.get_mut(name) {
             if let Some(l) = rt.legs.iter_mut().find(|l| l.key == key) {
                 if let Some(s) = l.surface.as_mut() {
@@ -1866,7 +2001,7 @@ impl TermService {
 
     /// 服务锁内取腿队列引用执行一次操作。
     fn with_leg_out(&self, name: &str, key: LegKey, f: impl FnOnce(&LegOut) -> bool) -> bool {
-        let st = self.state.lock().expect("term state");
+        let st = self.lock_state();
         match st.sessions.get(name).and_then(|rt| rt.legs.iter().find(|l| l.key == key)) {
             Some(l) => f(&l.out),
             None => false,
@@ -1882,17 +2017,18 @@ impl TermService {
     fn run_raw_writer(
         self: &Arc<Self>,
         name: &str,
+        sess_gen: u64,
         key: LegKey,
         mut io: FrameIo,
         out: Arc<LegOut>,
         hs: RawHandshake,
     ) {
-        if !self.raw_write_frame(name, key, &mut io, &out, Op::ATTACHED, &hs.attached) {
-            self.writer_exited(name);
+        if !self.raw_write_frame(name, sess_gen, key, &mut io, &out, Op::ATTACHED, &hs.attached) {
+            self.writer_exited(name, sess_gen);
             return;
         }
-        if !self.raw_write_frame(name, key, &mut io, &out, Op::DATA, b"\x1b[3J\x1b[2J\x1b[H") {
-            self.writer_exited(name);
+        if !self.raw_write_frame(name, sess_gen, key, &mut io, &out, Op::DATA, b"\x1b[3J\x1b[2J\x1b[H") {
+            self.writer_exited(name, sess_gen);
             return; // 换屏前序：客户端 vt 是新建的，回放起点要确定
         }
         // 回放：锁内读环、锁外写；时间预算用尽就跳到实时（丢头部保尾部）。
@@ -1902,7 +2038,7 @@ impl TermService {
         let mut cut_by_done = false;
         let deadline = Instant::now() + hs.budget;
         while sent < hs.end {
-            match self.next_ring_chunk(name, key, &mut sent) {
+            match self.next_ring_chunk(name, sess_gen, key, &mut sent) {
                 NextChunk::Gone => {
                     cut_by_done = true;
                     break;
@@ -1912,8 +2048,8 @@ impl TermService {
                     if chunk.is_empty() {
                         break;
                     }
-                    if !self.raw_write_frame(name, key, &mut io, &out, Op::DATA, &chunk) {
-                        self.writer_exited(name);
+                    if !self.raw_write_frame(name, sess_gen, key, &mut io, &out, Op::DATA, &chunk) {
+                        self.writer_exited(name, sess_gen);
                         return;
                     }
                     replayed = replayed.saturating_add(chunk.len() as u32);
@@ -1933,13 +2069,14 @@ impl TermService {
         }
         if !self.raw_write_frame(
             name,
+            sess_gen,
             key,
             &mut io,
             &out,
             Op::REPLAY_DONE,
             &frames::enc_replay_done(replayed, flags),
         ) {
-            self.writer_exited(name);
+            self.writer_exited(name, sess_gen);
             return;
         }
         let mut off = hs.end;
@@ -1948,8 +2085,8 @@ impl TermService {
         }
         if hs.nudge_focus {
             // 首腿：回放完成后注入 focus-in，逼 TUI 立即全屏重绘
-            let mut st = self.state.lock().expect("term state");
-            if let Some(rt) = st.sessions.get_mut(name) {
+            let mut st = self.lock_state();
+            if let Some(rt) = rt_of_mut(&mut st, name, sess_gen) {
                 self.focus_nudge_locked(rt, true);
             }
         }
@@ -1957,25 +2094,25 @@ impl TermService {
         loop {
             let (items, ended, quit) = out.take();
             for it in &items {
-                if !self.raw_write_frame(name, key, &mut io, &out, it.op, &it.payload) {
-                    self.writer_exited(name);
+                if !self.raw_write_frame(name, sess_gen, key, &mut io, &out, it.op, &it.payload) {
+                    self.writer_exited(name, sess_gen);
                     return;
                 }
             }
             if let Some(ended_payload) = ended {
                 // ENDED 前必须把 [off, written) 排干（r5 M1：env 截断竞态的根因修复）
-                if !self.drain_ring_before_end(name, key, &mut io, &out, &mut off) {
-                    self.writer_exited(name);
+                if !self.drain_ring_before_end(name, sess_gen, key, &mut io, &out, &mut off) {
+                    self.writer_exited(name, sess_gen);
                     return;
                 }
-                self.send_ended_stalled(name, key, &mut io, &out, &ended_payload);
+                self.send_ended_stalled(name, sess_gen, key, &mut io, &out, &ended_payload);
                 drop_stream(io);
-                self.writer_exited(name);
+                self.writer_exited(name, sess_gen);
                 return;
             }
             if quit {
                 drop_stream(io);
-                self.writer_exited(name);
+                self.writer_exited(name, sess_gen);
                 return;
             }
             if !items.is_empty() {
@@ -1984,25 +2121,25 @@ impl TermService {
             if out.is_stalled() {
                 std::thread::sleep(self.stall_retry_backoff()); // 退避放写前：停一拍再试
             }
-            match self.peek_ring_chunk(name, key, &mut off) {
+            match self.peek_ring_chunk(name, sess_gen, key, &mut off) {
                 Peek::Gone => {
                     // 腿已被会话侧收尾：控制队列里可能还压着 ENDED——排空再退出
                     let (items, ended, _) = out.take();
                     for it in &items {
-                        if !self.raw_write_frame(name, key, &mut io, &out, it.op, &it.payload) {
-                            self.writer_exited(name);
+                        if !self.raw_write_frame(name, sess_gen, key, &mut io, &out, it.op, &it.payload) {
+                            self.writer_exited(name, sess_gen);
                             return;
                         }
                     }
                     if let Some(ended_payload) = ended {
-                        if !self.drain_ring_before_end(name, key, &mut io, &out, &mut off) {
-                            self.writer_exited(name);
+                        if !self.drain_ring_before_end(name, sess_gen, key, &mut io, &out, &mut off) {
+                            self.writer_exited(name, sess_gen);
                             return;
                         }
-                        self.send_ended_stalled(name, key, &mut io, &out, &ended_payload);
+                        self.send_ended_stalled(name, sess_gen, key, &mut io, &out, &ended_payload);
                     }
                     drop_stream(io);
-                    self.writer_exited(name);
+                    self.writer_exited(name, sess_gen);
                     return;
                 }
                 Peek::CaughtUp => {
@@ -2013,11 +2150,11 @@ impl TermService {
                 }
                 Peek::Data(chunk) => {
                     if !chunk.is_empty()
-                        && self.raw_write_frame(name, key, &mut io, &out, Op::DATA, &chunk)
+                        && self.raw_write_frame(name, sess_gen, key, &mut io, &out, Op::DATA, &chunk)
                     {
                         off += chunk.len() as u64; // 写成功才推进（停滞重试重写同一片）
                     } else if !chunk.is_empty() {
-                        self.writer_exited(name);
+                        self.writer_exited(name, sess_gen);
                         return;
                     }
                 }
@@ -2036,9 +2173,11 @@ impl TermService {
     }
 
     /// 写一帧到 raw 腿（停滞感知）；false = 写者收工。
+    #[allow(clippy::too_many_arguments)] // 写者路径的固定参数组（Go rawWriteFrame 同构）
     fn raw_write_frame(
         &self,
         name: &str,
+        _sess_gen: u64,
         key: LegKey,
         io: &mut FrameIo,
         out: &Arc<LegOut>,
@@ -2058,7 +2197,10 @@ impl TermService {
                     self.break_leg(name, key, "stalled_over_limit");
                     return false;
                 }
-                self.logf(&format!("term: 会话 {name} raw 腿写停滞，退避重试（不断腿）"));
+                let kind = self.leg_kind_of(name, key);
+                self.logf(&format!(
+                    "term: 会话 {name} raw 腿（{kind}）写停滞，退避重试（不断腿）"
+                ));
                 true // 外层循环负责退避与续投
             }
             Err(e) => {
@@ -2070,7 +2212,7 @@ impl TermService {
     }
 
     /// ENDED 帧的停滞感知续投（「ENDED 先于 close」是任务 4.1 的硬要求，不吞错）。
-    fn send_ended_stalled(&self, name: &str, key: LegKey, io: &mut FrameIo, out: &Arc<LegOut>, ended: &[u8]) {
+    fn send_ended_stalled(&self, name: &str, _sess_gen: u64, key: LegKey, io: &mut FrameIo, out: &Arc<LegOut>, ended: &[u8]) {
         loop {
             match io.write_frame(Op::ENDED, ended, self.cfg.write_timeout) {
                 Ok(()) => return,
@@ -2090,13 +2232,14 @@ impl TermService {
     fn drain_ring_before_end(
         &self,
         name: &str,
+        sess_gen: u64,
         key: LegKey,
         io: &mut FrameIo,
         out: &Arc<LegOut>,
         off: &mut u64,
     ) -> bool {
         loop {
-            match self.peek_ring_chunk_final(name, off) {
+            match self.peek_ring_chunk_final(name, sess_gen, off) {
                 PeekFinal::Drained => return true,
                 PeekFinal::Data(chunk) => match io.write_frame(Op::DATA, &chunk, self.cfg.write_timeout) {
                     Ok(()) => {
@@ -2116,9 +2259,9 @@ impl TermService {
     }
 
     /// 回放读环（推进 off；Gone = 腿已摘/会话已收工）。
-    fn next_ring_chunk(&self, name: &str, key: LegKey, off: &mut u64) -> NextChunk {
-        let st = self.state.lock().expect("term state");
-        let Some(rt) = st.sessions.get(name) else { return NextChunk::Gone };
+    fn next_ring_chunk(&self, name: &str, sess_gen: u64, key: LegKey, off: &mut u64) -> NextChunk {
+        let st = self.lock_state();
+        let Some(rt) = rt_of(&st, name, sess_gen) else { return NextChunk::Gone };
         if st.registry.session(name).is_none_or(|s| s.done)
             || !rt.legs.iter().any(|l| l.key == key)
         {
@@ -2137,9 +2280,9 @@ impl TermService {
 
     /// 实时读环（**不推进 off**——写出成功才由调用方推进；停滞重试要重写同一片）。
     /// 有界追赶：落后超过一个回放窗口就跳到 written-replay（跳头部保尾部，D5）。
-    fn peek_ring_chunk(&self, name: &str, key: LegKey, off: &mut u64) -> Peek {
-        let st = self.state.lock().expect("term state");
-        let Some(rt) = st.sessions.get(name) else { return Peek::Gone };
+    fn peek_ring_chunk(&self, name: &str, sess_gen: u64, key: LegKey, off: &mut u64) -> Peek {
+        let st = self.lock_state();
+        let Some(rt) = rt_of(&st, name, sess_gen) else { return Peek::Gone };
         if st.registry.session(name).is_none_or(|s| s.done)
             || !rt.legs.iter().any(|l| l.key == key)
         {
@@ -2158,9 +2301,9 @@ impl TermService {
     }
 
     /// 终局读环（r5 M1）：不因 removed/done 拒绝——排干 [off, written)。
-    fn peek_ring_chunk_final(&self, name: &str, off: &mut u64) -> PeekFinal {
-        let st = self.state.lock().expect("term state");
-        let Some(rt) = st.sessions.get(name) else { return PeekFinal::Drained };
+    fn peek_ring_chunk_final(&self, name: &str, sess_gen: u64, off: &mut u64) -> PeekFinal {
+        let st = self.lock_state();
+        let Some(rt) = rt_of(&st, name, sess_gen) else { return PeekFinal::Drained };
         if self.cfg.replay > 0 && rt.ring.written().saturating_sub(*off) > self.cfg.replay as u64 {
             *off = rt.ring.written() - self.cfg.replay as u64;
         }
@@ -2175,7 +2318,7 @@ impl TermService {
 
     /// 写失败（硬错误）= 断腿：摘除（幂等）+ 关连接；**不发 ENDED**（裸 EOF）。surface/raw 共用。
     fn leg_write_failed(&self, name: &str, key: LegKey, why: &'static str) {
-        let st = self.state.lock().expect("term state");
+        let st = self.lock_state();
         if let Some(rt) = st.sessions.get(name) {
             if let Some(l) = rt.legs.iter().find(|l| l.key == key) {
                 l.out.finish_quit();
@@ -2191,7 +2334,7 @@ impl TermService {
     }
 
     /// surface 腿写者：出队 → 写 → 收尾（写失败/超时 = 断腿，任务 4.3 只对 raw 引入停滞语义）。
-    fn run_surface_writer(self: &Arc<Self>, name: &str, key: LegKey, mut io: FrameIo, out: Arc<LegOut>) {
+    fn run_surface_writer(self: &Arc<Self>, name: &str, sess_gen: u64, key: LegKey, mut io: FrameIo, out: Arc<LegOut>) {
         loop {
             let (items, ended, quit) = out.take();
             for it in &items {
@@ -2209,7 +2352,7 @@ impl TermService {
                         });
                         self.leg_write_failed(name, key, "write_timeout");
                         drop_stream(io);
-                        self.writer_exited(name);
+                        self.writer_exited(name, sess_gen);
                         return;
                     }
                     Err(e) => {
@@ -2217,7 +2360,7 @@ impl TermService {
                         self.mark_leg_surface(name, key, |s| s.stats.write_timeout += 1);
                         self.leg_write_failed(name, key, "write_failed");
                         drop_stream(io);
-                        self.writer_exited(name);
+                        self.writer_exited(name, sess_gen);
                         return;
                     }
                 }
@@ -2225,12 +2368,12 @@ impl TermService {
             if let Some(ended_payload) = ended {
                 let _ = io.write_frame(Op::ENDED, &ended_payload, WRITE_TIMEOUT);
                 drop_stream(io);
-                self.writer_exited(name);
+                self.writer_exited(name, sess_gen);
                 return;
             }
             if quit {
                 drop_stream(io);
-                self.writer_exited(name);
+                self.writer_exited(name, sess_gen);
                 return;
             }
             if !items.is_empty() {
@@ -2242,83 +2385,121 @@ impl TermService {
 
     // ---- LIST / EXPLAIN ----
 
-    /// LIST-REPLY 的 JSON（Go listJSON；字段序 = Go struct 序——消费方按序呈现）。
+    /// LIST-REPLY 的 JSON（Go listJSON；derive 结构体的**声明序** = Go struct 序——
+    /// `serde_json::Map` 默认 BTreeMap 会把键排成字典序，对象字面量手插也不行，
+    /// 评审 M3）。
     fn list_json(&self) -> String {
-        let st = self.state.lock().expect("term state");
-        let mut out: Vec<serde_json::Value> = Vec::new();
+        let st = self.lock_state();
+        let mut out: Vec<SessionEntryJson> = Vec::new();
         for name in st.registry.session_names() {
             let Some(reg) = st.registry.session(name) else { continue };
             if reg.done {
                 continue;
             }
             let Some(rt) = st.sessions.get(name) else { continue };
-            let clients: Vec<serde_json::Value> = reg
+            let clients: Vec<ClientEntryJson> = reg
                 .legs()
                 .into_iter()
-                .map(|l: LegView| {
-                    serde_json::json!({
-                        "kind": l.kind.as_str(),
-                        "cols": l.cols,
-                        "rows": l.rows,
-                        "sinceMs": l.since_ms as i64,
-                        "active": reg.active == Some(l.key),
-                    })
+                .map(|l: LegView| ClientEntryJson {
+                    kind: l.kind.as_str(),
+                    cols: l.cols,
+                    rows: l.rows,
+                    since_ms: l.since_ms as i64,
+                    active: reg.active == Some(l.key),
                 })
                 .collect();
-            let mut entry = serde_json::Map::new();
-            entry.insert("name".into(), serde_json::json!(rt.name));
-            entry.insert("createdMs".into(), serde_json::json!(rt.created_ms as i64));
-            entry.insert("lastActiveMs".into(), serde_json::json!(rt.last_active_ms as i64));
-            entry.insert("attached".into(), serde_json::json!(!clients.is_empty()));
-            entry.insert("agent".into(), serde_json::json!(agent::agent_name(rt.agent)));
-            entry.insert("stateV2".into(), serde_json::json!(frames::state_v2::name(rt.state_v2)));
-            entry.insert("title".into(), serde_json::json!(rt.scan.title()));
-            let cwd = rt.scan.pwd_path();
-            if !cwd.is_empty() {
-                entry.insert("cwd".into(), serde_json::json!(cwd));
-            }
-            entry.insert("cols".into(), serde_json::json!(reg.cols));
-            entry.insert("rows".into(), serde_json::json!(reg.rows));
-            entry.insert("pid".into(), serde_json::json!(rt.pty.pid()));
-            entry.insert("clients".into(), serde_json::json!(clients));
-            out.push(serde_json::Value::Object(entry));
+            // legacy-only 会话（无服务端 vt）恒无 cwd——Go cwdLocked 同款（评审 L9）
+            let cwd = rt
+                .vt
+                .is_some()
+                .then(|| rt.scan.pwd_path())
+                .filter(|c| !c.is_empty());
+            out.push(SessionEntryJson {
+                name: rt.name.clone(),
+                created_ms: rt.created_ms as i64,
+                last_active_ms: rt.last_active_ms as i64,
+                attached: !clients.is_empty(),
+                agent: agent::agent_name(rt.agent),
+                state_v2: frames::state_v2::name(rt.state_v2),
+                title: rt.scan.title().to_string(),
+                cwd,
+                cols: reg.cols,
+                rows: reg.rows,
+                pid: rt.pty.pid(),
+                clients,
+            });
         }
-        serde_json::json!({ "sessions": out }).to_string()
+        #[derive(serde::Serialize)]
+        struct Reply<'a> {
+            sessions: &'a [SessionEntryJson],
+        }
+        match serde_json::to_string(&Reply { sessions: &out }) {
+            Ok(json) => json,
+            Err(_) => "{\"sessions\":[]}".to_string(),
+        }
     }
 
-    /// explain 的在线模式（任务 4.8）：对运行中会话取实时快照跑一次判定——依据链
-    /// 与列表同一套（`run_explain`），两边结论一致。
     fn explain_json(&self, name: &str) -> Result<String, TermError> {
-        let mut guard = self.state.lock().expect("term state");
-        let st = &mut *guard;
-        let Some(l) = &st.manifests else {
-            return Err(TermError::new(
-                super::session::TermErrorCode::DetectOff,
-                "本出口的检测被 HOMEWAY_TERM_DETECT=off 关闭",
-            ));
+        // 两段式：ps（10~50ms）在服务锁**外**取——锁内不做阻塞 I/O（评审 M1；
+        // Go 持的是单会话锁，收敛成服务锁后爆炸半径是全服务）
+        let pty = {
+            let mut st = self.lock_state();
+            let Some(l) = &st.manifests else {
+                return Err(TermError::new(
+                    super::session::TermErrorCode::DetectOff,
+                    "本出口的检测被 HOMEWAY_TERM_DETECT=off 关闭",
+                ));
+            };
+            let _ = l;
+            let Some(rt) = st.sessions.get_mut(name) else {
+                return Err(TermError::new(
+                    super::session::TermErrorCode::NoSession,
+                    format!("会话 {name} 不存在"),
+                ));
+            };
+            if rt.vt.is_none() {
+                return Err(TermError::new(
+                    super::session::TermErrorCode::NoVt,
+                    format!("会话 {name} 没有服务端 vt（legacy-only），没有屏幕证据可判"),
+                ));
+            }
+            Arc::clone(&rt.pty)
         };
-        let Some(rt) = st.sessions.get_mut(name) else {
-            return Err(TermError::new(
-                super::session::TermErrorCode::NoSession,
-                format!("会话 {name} 不存在"),
-            ));
-        };
-        if rt.vt.is_none() {
-            return Err(TermError::new(
-                super::session::TermErrorCode::NoVt,
-                format!("会话 {name} 没有服务端 vt（legacy-only），没有屏幕证据可判"),
-            ));
-        }
         let procs = agent::read_procs();
-        let fg = rt.pty.foreground_pgid();
-        let agent_name = agent::foreground_agent_name(&procs, fg, |n| l.for_process(n).is_some());
+        let fg = pty.foreground_pgid();
+        let mut guard = self.lock_state();
+        let st = &mut *guard;
+        let agent_name = {
+            let l = st.manifests.as_ref();
+            let screen_probe = st.sessions.get(name).map(|rt| rt.vt.is_some());
+            if screen_probe.is_none() {
+                return Err(TermError::new(
+                    super::session::TermErrorCode::NoSession,
+                    format!("会话 {name} 不存在"),
+                ));
+            }
+            let Some(l) = l else {
+                return Err(TermError::new(
+                    super::session::TermErrorCode::DetectOff,
+                    "本出口的检测被 HOMEWAY_TERM_DETECT=off 关闭",
+                ));
+            };
+            agent::foreground_agent_name(&procs, fg, |n| l.for_process(n).is_some())
+        };
         if agent_name.is_empty() {
             return Err(TermError::new(
                 super::session::TermErrorCode::NoAgent,
                 format!("会话 {name} 前台不是已知 agent，没有规则可跑"),
             ));
         }
-        let screen = rt.vt.as_mut().expect("上则判过").screen_text();
+        // 整屏 + 回滚的纯文本（Go PlainText 口径——M2；定检路径仍用视口 ScreenText）
+        let screen = st
+            .sessions
+            .get_mut(name)
+            .and_then(|rt| rt.vt.as_mut())
+            .expect("上则判过 vt")
+            .plain_text();
+        let Some(l) = st.manifests.as_ref() else { unreachable!("上则判过") };
         let out = run_explain(l, &agent_name, &screen, name);
         serde_json::to_string(&out).map_err(|e| {
             TermError::new(
@@ -2328,8 +2509,33 @@ impl TermService {
         })
     }
 
+    /// 腿的呈现分类（日志用）。
+    fn leg_kind_of(&self, name: &str, key: LegKey) -> &'static str {
+        let st = self.lock_state();
+        st.sessions
+            .get(name)
+            .and_then(|rt| rt.legs.iter().find(|l| l.key == key))
+            .map(|l| l.kind.as_str())
+            .unwrap_or("legacy")
+    }
+
+    /// 腿是否声明了 surface 能力（上行帧的门面）。
+    fn leg_is_surface(&self, name: &str, key: LegKey) -> bool {
+        let st = self.lock_state();
+        st.sessions
+            .get(name)
+            .and_then(|rt| rt.legs.iter().find(|l| l.key == key))
+            .is_some_and(|l| l.surface.is_some())
+    }
+
     fn logf(&self, msg: &str) {
         (self.logf)(msg);
+    }
+
+    /// 服务锁获取（中毒恢复口径统一：任一持锁线程 panic 不该让整个 term 面殉葬——
+    /// 数据可能不一致，但 term 是可选服务，锁内无跨调用不变量，恢复优于级联崩溃）。
+    fn lock_state(&self) -> std::sync::MutexGuard<'_, State> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     // ---- 采样：agent / 任务状态（Go sampleLoop/sampleOnce/sample）----
@@ -2345,7 +2551,7 @@ impl TermService {
             }
             let procs = agent::read_procs();
             let names: Vec<String> = {
-                let st = self.state.lock().expect("term state");
+                let st = self.lock_state();
                 st.registry.session_names().into_iter().map(String::from).collect()
             };
             for name in names {
@@ -2356,7 +2562,7 @@ impl TermService {
 
     fn sample_once(&self, name: &str, procs: &[ProcInfo]) {
         let now = now_ms();
-        let mut guard = self.state.lock().expect("term state");
+        let mut guard = self.lock_state();
         let st = &mut *guard;
         if st.registry.session(name).is_none_or(|s| s.done) {
             return;
@@ -2481,6 +2687,20 @@ fn apply_end_to_leg_rt(logf: &Logf, rt: &mut SessRt, e: &LegEnd) {
     }
 }
 
+/// 活动腿的主题/剪贴板回落（Go applyActiveThemeLocked，任务 3.3）：活动切换后
+/// 新 active 腿的主题落到会话 vt（OSC 10/11 查询按它应答）、剪贴板读缓存发布。
+fn apply_active_theme_locked(rt: &mut SessRt, active: Option<LegKey>) {
+    let Some(active) = active else { return };
+    let Some(l) = rt.legs.iter().find(|l| l.key == active) else { return };
+    let (theme_known, theme, clip) = (l.theme_known, l.theme, l.clip_cache.clone());
+    if theme_known {
+        if let Some(vt) = rt.vt.as_mut() {
+            vt.set_default_colors(theme.0, theme.1);
+        }
+    }
+    rt.clip_cache = clip;
+}
+
 /// 尺寸应用（applySizeLocked）：PTY setsize + epoch + vt 重排 + 全 surface 腿标记全量
 /// （被动腿会拒收几何不符的差分，任务 3.1 的连带义务）。
 fn apply_size_locked(rt: &mut SessRt, cols: u16, rows: u16) {
@@ -2564,12 +2784,26 @@ fn state_v2_from_manifest(s: manifest::State) -> u8 {
     }
 }
 
+/// HELLO 尺寸归一（Go spawnLocked 的 80/24 缺省——0x0 不产生退化几何）。
+fn cols_or_default(c: u16) -> u16 {
+    if c == 0 { 80 } else { c }
+}
+
+fn rows_or_default(r: u16) -> u16 {
+    if r == 0 { 24 } else { r }
+}
+
 fn dec_name_or(f: &Frame) -> Result<String, Vec<u8>> {
     frames::dec_name(&f.payload).map_err(|e| frames::enc_error("bad_name", &e.to_string()))
 }
 
 fn drop_stream(io: FrameIo) {
-    drop(io.into_stream()); // drop 关闭连接
+    // 写半是 dup 出来的 fd——drop 只关一个引用、**不打 FIN**（客户端看不到断）。
+    // shutdown(Both) 作用于 socket 本体（两半共享）：裸断腿的客户端立即见 EOF、
+    // 留在本线程的读半也随之退出（评审 H3，Go `c.conn.Close()` 同效）。
+    let st = io.into_stream();
+    let _ = st.shutdown(std::net::Shutdown::Both);
+    drop(st);
 }
 
 struct Pending {
@@ -2595,6 +2829,50 @@ enum PeekFinal {
     Data(Vec<u8>),
     Drained,
 }
+
+// ---------------------------------------------------------------------------
+// LIST JSON（Go listJSON 的字段序/omitempty 同款——声明序即 wire 序）
+// ---------------------------------------------------------------------------
+
+mod list_json_shape {
+    use serde::Serialize;
+
+    /// 在场腿信息（term-host-cli 任务 2.5，design D8：字段只增不改）。
+    #[derive(Serialize)]
+    pub struct ClientEntryJson {
+        pub kind: &'static str, // app / host / legacy
+        pub cols: u16,
+        pub rows: u16,
+        #[serde(rename = "sinceMs")]
+        pub since_ms: i64,
+        pub active: bool,
+    }
+
+    #[derive(Serialize)]
+    pub struct SessionEntryJson {
+        pub name: String,
+        #[serde(rename = "createdMs")]
+        pub created_ms: i64,
+        #[serde(rename = "lastActiveMs")]
+        pub last_active_ms: i64,
+        pub attached: bool,
+        pub agent: &'static str,
+        /// 状态唯一字段（旧 `state` 键已随状态单轨化退役，term-remote 3.3）。
+        #[serde(rename = "stateV2")]
+        pub state_v2: &'static str,
+        pub title: String,
+        /// OSC 7 上报的工作目录（缺省不显示）。
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pub cwd: Option<String>,
+        pub cols: u16,
+        pub rows: u16,
+        pub pid: i32,
+        pub clients: Vec<ClientEntryJson>,
+    }
+}
+
+use list_json_shape::ClientEntryJson;
+use list_json_shape::SessionEntryJson;
 
 // ---------------------------------------------------------------------------
 // explain JSON（Go explainOutput 的字段序/omitempty 同款）
@@ -2722,13 +3000,17 @@ fn run_explain(
 mod tests {
     use super::*;
 
-    /// 测试面构造：注入配置（env 面在进程级——并行测试会互踩）。
+    /// 测试面构造：注入配置与 manifest（env 面在进程级——并行测试会互踩）。
     fn svc_with(cfg: TermConfig, lines: Arc<Mutex<Vec<String>>>) -> Arc<TermService> {
+        svc_with_manifests(cfg, lines, false)
+    }
+
+    fn svc_with_manifests(cfg: TermConfig, lines: Arc<Mutex<Vec<String>>>, with_manifests: bool) -> Arc<TermService> {
         let logf: Logf = Arc::new(move |m: &str| {
             lines.lock().unwrap().push(m.to_string());
         });
         let _dir = std::env::temp_dir().join(tmp_name("hwterm-state"));
-        // svc_with 不落盘（manifests=None、无覆盖目录）——只需占位不建
+        // svc_with 不落盘（manifests 由调用方给、无覆盖目录）——只需占位不建
         let mut cfg = cfg;
         if cfg.history == DEFAULT_HISTORY {
             cfg.history = 64 << 10; // 测试环小一点
@@ -2740,7 +3022,8 @@ mod tests {
             state: Mutex::new(State {
                 registry: SessionRegistry::new(16, 8),
                 sessions: HashMap::new(),
-                manifests: None,
+                manifests: with_manifests.then(|| manifest::Loader::new(None)),
+                next_sess_gen: 1,
             }),
             stop: Arc::new(AtomicBool::new(false)),
         });
@@ -2831,7 +3114,7 @@ mod tests {
                             return all;
                         }
                     }
-                    Op::STATE | Op::NOTIFY => continue,
+                    Op::STATE | Op::NOTIFY | Op::REPLAY_DONE => continue,
                     other => panic!("意外帧 0x{:02x}", other.0),
                 }
             }
@@ -3109,6 +3392,151 @@ mod tests {
         assert_eq!(code, "no_session");
         assert!(msg.contains("会话 nope 不存在"), "{msg}");
         svc.close();
+    }
+
+    /// H2 回归：createOnly 80x24 → 异尺寸 attach（100x30）⇒ PTY/vt/注册表三方几何
+    /// 一致（修前 registry 100x30 而 PTY/vt 停在 80x24——真实 shell 的 stty 实证）。
+    #[test]
+    fn attach_size_applies_to_pty() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let cfg = TermConfig { shell: None, ..TermConfig::default() }; // 真登录 shell
+        let svc = svc_with(cfg, Arc::clone(&lines));
+        let (ln, path) = start_listener();
+        {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || svc.serve(ln));
+        }
+        let mut c0 = Client::connect(&path);
+        c0.send(Op::CREATE, &frames::enc_create(0, "t-h2"));
+        c0.expect(Op::OK, 5);
+        drop(c0);
+        std::thread::sleep(Duration::from_millis(800)); // 等 shell 就绪
+        let mut c = Client::connect(&path);
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "h2");
+        c.send(Op::HELLO, &frames::enc_hello(100, 30, 0, "t-h2", &tail));
+        c.expect(Op::ATTACHED, 5);
+        c.expect(Op::REPLAY_DONE, 5);
+        // shell 里跑 stty size：PTY 几何真变 100x30 ⇒ "30 100"
+        c.send(Op::DATA, b"stty size\r");
+        let got = c.drain_data_until(|d| has_bytes(d, b"30 100"), 10);
+        assert!(has_bytes(&got, b"30 100"), "PTY 尺寸未随 attach 跟进：{:?}", String::from_utf8_lossy(&got));
+        svc.close();
+    }
+
+    /// H3 回归：上限腾位（裸断无 ENDED）的旧腿必须**立即见 EOF**——修前 dup fd 的
+    /// drop 不打 FIN，客户端双挂、输入还能继续注进 PTY。
+    #[test]
+    fn evicted_leg_gets_eof() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let cfg = TermConfig { shell: Some("cat".into()), ..TermConfig::default() };
+        let svc = svc_with(cfg, Arc::clone(&lines));
+        let (ln, path) = start_listener();
+        {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || svc.serve(ln));
+        }
+        let mut first: Option<Client> = None;
+        for i in 0..8 {
+            let mut c = Client::connect(&path);
+            let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, &format!("ev-{i}"));
+            c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, "t-h3", &tail));
+            c.expect(Op::ATTACHED, 5);
+            c.expect(Op::REPLAY_DONE, 5);
+            if i == 0 {
+                first = Some(c);
+            } else {
+                std::mem::forget(c); // 保持连接在场（腿满 8 条）
+            }
+        }
+        let mut first = first.expect("首腿在");
+        // 第 9 条 ⇒ 腾位（最久空闲 = 首腿，裸断无 ENDED）
+        let mut c9 = Client::connect(&path);
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "ev-9");
+        c9.send(Op::HELLO, &frames::enc_hello(80, 24, 0, "t-h3", &tail));
+        c9.expect(Op::ATTACHED, 5);
+        // 被腾位的首腿在窗口内读到 EOF（Err Hard UnexpectedEof），而非永远挂着
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let left = deadline.saturating_duration_since(Instant::now());
+        match first.io.read_frame_deadline(left.max(Duration::from_millis(50))) {
+            Err(_) => {} // EOF/硬错误 = 收线（裸断不给 ENDED——这就是判据）
+            Ok(f) => panic!("被腾位的腿应见 EOF，却收到 op 0x{:02x}", f.op.0),
+        }
+        svc.close();
+    }
+
+    /// 自然退出端到端（评审 D7 补钉）：shell 自己退出 → pump EOF → ENDED 带退出码。
+    #[test]
+    fn natural_exit_ended_end_to_end() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let cfg = TermConfig { shell: Some("printf BYE; exit 7".into()), ..TermConfig::default() };
+        let svc = svc_with(cfg, Arc::clone(&lines));
+        let (ln, path) = start_listener();
+        {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || svc.serve(ln));
+        }
+        let mut c = Client::connect(&path);
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "nx");
+        c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, "t-nx", &tail));
+        c.expect(Op::ATTACHED, 5);
+        let got = c.drain_data_until(|d| has_bytes(d, b"BYE"), 8);
+        assert!(has_bytes(&got, b"BYE"), "回放含 BYE");
+        let f = c.expect(Op::ENDED, 10);
+        let (code, reason) = frames::dec_ended(&f.payload);
+        assert_eq!((code, reason.as_str()), (7, ""), "自然退出码 7 直传、reason 空");
+        svc.close();
+    }
+
+    /// M3 回归：LIST JSON 的 wire 键序 = Go struct 序（serde 声明序）。
+    #[test]
+    fn list_json_key_order_matches_go_struct() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let cfg = TermConfig { shell: Some("sleep 30".into()), ..TermConfig::default() };
+        let svc = svc_with(cfg, lines);
+        let (ln, path) = start_listener();
+        {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || svc.serve(ln));
+        }
+        let mut c = Client::connect(&path);
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "ord");
+        c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, "t-ord", &tail));
+        c.expect(Op::ATTACHED, 5);
+        drop(c);
+        let mut c2 = Client::connect(&path);
+        c2.send(Op::LIST, &[]);
+        let f = c2.expect(Op::LIST, 5);
+        let json = String::from_utf8_lossy(&f.payload).into_owned();
+        let want_prefix = "{\"sessions\":[{\"name\":\"t-ord\",\"createdMs\":";
+        assert!(json.starts_with(want_prefix), "LIST JSON 首键序（name→createdMs→…）：{json}");
+        let idx = |k: &str| json.find(&format!("\"{k}\":")).expect(k);
+        let i_name = idx("name");
+        let i_created = idx("createdMs");
+        let i_active = idx("lastActiveMs");
+        let i_attached = idx("attached");
+        let i_agent = idx("agent");
+        let i_state = idx("stateV2");
+        let i_title = idx("title");
+        let i_cols = idx("cols");
+        let i_pid = idx("pid");
+        let i_clients = idx("clients");
+        assert!(i_name < i_created && i_created < i_active && i_active < i_attached);
+        assert!(i_attached < i_agent && i_agent < i_state && i_state < i_title);
+        assert!(i_title < i_cols && i_cols < i_pid && i_pid < i_clients, "Go struct 序：{json}");
+        svc.close();
+    }
+
+    /// run_explain 的 wire 字段序（explainOutput 声明序 = Go struct 序）。
+    #[test]
+    fn explain_json_wire_order() {
+        let l = manifest::Loader::new(None);
+        let out = run_explain(&l, "codex", "some screen", "s1");
+        let json = serde_json::to_string(&out).unwrap();
+        assert!(
+            json.starts_with("{\"agent\":\"codex\",\"session\":\"s1\",\"manifestSource\":"),
+            "explain 首键序（agent→session→manifestSource→…）：{json}"
+        );
+        assert!(json.contains("\"screenBytes\":11"), "screenBytes= 屏幕字节数");
     }
 
     fn ended_code_killed() -> i32 {
