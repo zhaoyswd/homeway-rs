@@ -152,6 +152,9 @@ func TestVecgenTermResponder(t *testing.T) {
 		{name: "osc4_mirror", setup: "\x1b]4;5;rgb:12/34/56\x07", query: "\x1b]4;5;?\x07"},
 		{name: "osc4_unset", query: "\x1b]4;5;?\x07"},
 		{name: "osc4_multi", query: "\x1b]4;1;?;2;?\x07"},
+		// ST 终止形态（未设主题 = 不答；ST 采样）
+		{name: "osc10_st_default", query: "\x1b]10;?\x1b\\"},
+		{name: "osc4_st_mirror", setup: "\x1b]4;7;rgb:ab/cd/ef\x1b\\", query: "\x1b]4;7;?\x1b\\"},
 		// 尺寸上报（New(100,32) + nominalCellPx=8：14t=4;H*rows;W*cols、16t=6;H;W、18t=8;rows;cols）
 		{name: "csi14t", query: "\x1b[14t"},
 		{name: "csi16t", query: "\x1b[16t"},
@@ -175,7 +178,7 @@ func TestVecgenTermResponder(t *testing.T) {
 			ResponseHex: all, Chunks: chunks,
 		})
 	}
-	// 主题上报后的 OSC 10/11/12（design D4 唯一例外：应答值回传）
+	// 主题上报后的 OSC 10/11/12（design D4 唯一例外：应答值回传）+ ST 终止形态
 	for _, q := range []struct {
 		name  string
 		query string
@@ -183,6 +186,8 @@ func TestVecgenTermResponder(t *testing.T) {
 		{"osc10_theme", "\x1b]10;?\x07"},
 		{"osc11_theme", "\x1b]11;?\x07"},
 		{"osc12_theme", "\x1b]12;?\x07"},
+		{"osc10_st_theme", "\x1b]10;?\x1b\\"},
+		{"osc11_st_theme", "\x1b]11;?\x1b\\"},
 	} {
 		c := vecTermCase{name: q.name, query: q.query}
 		all, chunks := vecRunResponder(t, c, true)

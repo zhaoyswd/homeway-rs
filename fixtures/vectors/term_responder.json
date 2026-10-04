@@ -252,6 +252,20 @@
       ]
     },
     {
+      "name": "osc10_st_default",
+      "query_hex": "1b5d31303b3f1b5c",
+      "response_hex": ""
+    },
+    {
+      "name": "osc4_st_mirror",
+      "setup_hex": "1b5d343b373b7267623a61622f63642f65661b5c",
+      "query_hex": "1b5d343b373b3f1b5c",
+      "response_hex": "1b5d343b373b7267623a616261622f636463642f656665661b5c",
+      "chunks": [
+        "1b5d343b373b7267623a616261622f636463642f656665661b5c"
+      ]
+    },
+    {
       "name": "csi14t",
       "query_hex": "1b5b313474",
       "response_hex": ""
@@ -326,6 +340,24 @@
       "response_hex": "1b5d31323b7267623a313131312f323232322f3333333307",
       "chunks": [
         "1b5d31323b7267623a313131312f323232322f3333333307"
+      ],
+      "themed": true
+    },
+    {
+      "name": "osc10_st_theme",
+      "query_hex": "1b5d31303b3f1b5c",
+      "response_hex": "1b5d31303b7267623a313131312f323232322f333333331b5c",
+      "chunks": [
+        "1b5d31303b7267623a313131312f323232322f333333331b5c"
+      ],
+      "themed": true
+    },
+    {
+      "name": "osc11_st_theme",
+      "query_hex": "1b5d31313b3f1b5c",
+      "response_hex": "1b5d31313b7267623a616161612f626262622f636363631b5c",
+      "chunks": [
+        "1b5d31313b7267623a616161612f626262622f636363631b5c"
       ],
       "themed": true
     }
