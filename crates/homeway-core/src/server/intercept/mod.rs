@@ -288,6 +288,8 @@ pub struct Interceptor {
     dns_rx: Option<std::sync::mpsc::Receiver<DnsReply>>,
     /// UDP 会话号（判据行 #N——进程级递增，对齐旧 udp relay 口径）。
     udp_seq: u64,
+    /// 拨号失败日志的降噪表（形态 → (累计次数, 是否已记过首行)；R6.6 P2）。
+    dial_fail_seen: HashMap<(&'static str, (Ipv4Addr, u16), (Ipv4Addr, u16)), (u64, bool)>,
     time0: Instant,
     smol_now: SmolInstant,
 }
@@ -336,6 +338,7 @@ impl Interceptor {
             dns_faces: None,
             dns_rx,
             udp_seq: 0,
+            dial_fail_seen: HashMap::new(),
             time0: Instant::now(),
             smol_now: SmolInstant::from_millis(0),
         }
@@ -919,10 +922,27 @@ impl Interceptor {
             let syn = nat::build_tcp_syn(client.0, client.1, orig_dst.0, orig_dst.1, f_syn_seq);
             let v = Ipv4View::parse(&syn).expect("构造包恒可解析");
             self.tx_out.push(nat::build_tcp_rst(&v));
-            (self.cfg.logf)(&format!(
-                "intercept: tcp {} {}:{} ← {}:{} 拨号失败：连接失败",
-                kind.as_str(), orig_dst.0, orig_dst.1, client.0, client.1
-            ));
+            // 日志降噪（R6.5 E2E P2-6）：手机核自连探测拨隧道 IP:1，逐次记行会刷屏
+            // （dialfail 计数不受影响——判据面是计数器不是日志行）。同形态首行即记、
+            // 之后每 100 次记一行汇总。
+            let key = (kind.as_str(), orig_dst, client);
+            let (log, seen) = {
+                let e = self.dial_fail_seen.entry(key).or_insert((0u64, false));
+                e.0 += 1;
+                let log = !e.1 || e.0 % 100 == 0;
+                e.1 = true;
+                (log, e.0)
+            };
+            if self.dial_fail_seen.len() > 1024 {
+                self.dial_fail_seen.clear(); // 排障级记忆，满表清空重记（同 src_seen 口径）
+            }
+            if log {
+                (self.cfg.logf)(&format!(
+                    "intercept: tcp {} {}:{} ← {}:{} 拨号失败：连接失败{}",
+                    kind.as_str(), orig_dst.0, orig_dst.1, client.0, client.1,
+                    if seen > 1 { format!("（该形态累计 {seen} 次，此后每 100 次记一行）") } else { String::new() }
+                ));
+            }
         } else {
             (self.cfg.logf)(&format!(
                 "intercept: udp {} {}:{} ← {}:{} 开 socket 失败：连接失败",

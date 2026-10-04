@@ -165,7 +165,19 @@ fn parse_serve_flags(args: &[String]) -> ServeFlags {
         let mut j = i;
         match name.as_str() {
             "state" => f.state = take_val(&mut j).map(PathBuf::from),
-            "listen" => f.listen = take_val(&mut j).and_then(|v| v.parse().ok()),
+            // 数值 flag 非法即报错退出（Go flag 包同语义）——静默回退默认值会让
+            // 「--listen 127.0.0.1:42671」这类形态占到非预期端口（R6.5 E2E P2-3 实录）
+            "listen" => {
+                if let Some(v) = take_val(&mut j) {
+                    match v.parse::<u16>() {
+                        Ok(p) => f.listen = Some(p),
+                        Err(_) => {
+                            eprintln!("--listen 非法（{v:?}——仅收端口数字，如 41641；不收 ip:port）");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+            }
             "bind-interface" => f.bind_interface = take_val(&mut j),
             "upnp" => {
                 f.upnp = match inline.as_deref() {
@@ -185,9 +197,29 @@ fn parse_serve_flags(args: &[String]) -> ServeFlags {
                     }
                 }
             }
-            "max-peers" => f.max_peers = take_val(&mut j).and_then(|v| v.parse().ok()),
+            "max-peers" => {
+                if let Some(v) = take_val(&mut j) {
+                    match v.parse::<usize>() {
+                        Ok(n) => f.max_peers = Some(n),
+                        Err(_) => {
+                            eprintln!("--max-peers 非法（{v:?}——非负整数，如 32）");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+            }
             "public-endpoint" => f.public_endpoint = take_val(&mut j),
-            "dns-port" => f.dns_port = take_val(&mut j).and_then(|v| v.parse().ok()),
+            "dns-port" => {
+                if let Some(v) = take_val(&mut j) {
+                    match v.parse::<u16>() {
+                        Ok(p) => f.dns_port = Some(p),
+                        Err(_) => {
+                            eprintln!("--dns-port 非法（{v:?}——端口数字，0 = 关闭代答）");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+            }
             "files-root" => f.files_root = take_val(&mut j),
             "relay" => f.relay = take_val(&mut j),
             "verbose" => f.verbose = true,
