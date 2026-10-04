@@ -143,3 +143,62 @@ tun_recover 未钳位等 12 项）——**登记第 2 棒顺手批**，不阻塞
 - bind 全候选发送统计面（localErrAdopted/localErrTotal + sendTries 全败判据）未实现——tunStatusJSON 该二键缺省（可选键）、巡检噪声判定只用采纳路径粘性信号；
 - fd: 快照行（fdSnapshot）不打——OHOS 沙箱 /proc/self/fd 面受限（Go 侧该行同样受限）；
 - 隧道域无 REBUILD（对齐 Go：阶梯失败 markUnhealthy 交扩展重建整条 VPN——与服务域的 rebuild_session 语义分流）。
+
+## §四 第 2 棒评审记录（dsh r2.JCkfJb，2026-10-04）
+
+**结论**：集成面总体成立（评审明确「看过没发现问题」的面：世代线程退出路径无漏调
+finish_generation、decap 分流键与 Go hub.isForB 逐条件等价、fd 所有权、EAGAIN-poll
+修复、巡检语义与全部常量、attach 60s 死线逐字文案、桥宿主四项整改、Cancel kill 链、
+capi 20 符号与 malloc 契约、E2E 判据行逐条可溯、tier 51036b4 无破坏）；**3 高危 +
+11 中危 + 12 低危 + 评审者补充 8 条**，其中「接线即坏」类 4 项（H-1/H-2/H-3/我-1）
+**当棒已整改**（见下表），其余登记第 3 棒工单。评审原文全量 =
+`/tmp/dsh-review/r2.JCkfJb/output.md`（含里层 dsh 落盘原文路径与评审者自己的
+可执行复现：H-2 的 done/attach 污染四信号实测）。
+
+### P0 整改表（当棒，commit 见 git log "R7-7k 评审 r2 P0 整改"）
+
+| # | 项 | 定级 | 处置 |
+|---|---|---|---|
+| H-2 | finish_generation 的 done/attach 通道无世代守卫（旧世代迟到收尾污染新世代：attach 恒 -1 → 60s 死线；done 假 0 → request_stop 永不执行 → prepare 恒 -1 只有进程重启能解） | 高 | **已修**：close_attach/done 写入过 gen 守卫（单例槽形态下以 gen 比对等价 Go 的 per-run 通道）；把 bug 钉成预期的单测改向（stale 收尾不得发 done/关 attach） |
+| H-3 | 收工路径恒超 STOP_WAIT(3s)（stats 整段 sleep 60s tick + join 每线程 2s×3）⇒ tun_stop 常态化 -2，放大 H-2 窗口 | 高 | **已修**：stats/pusher 改 100ms 分片等待（片界查 stop）；join 总预算 2s（与 STOP_WAIT 留 1s 给桥/client 收尾） |
+| H-1 | D4 待发包下推恒不触发：last_outbound 存 unix epoch ns 却当 Instant 时长减 ⇒ should_push 恒 false（静默错值不 panic） | 高 | **已修**：TunCounters 双轨（unix ns 留 JSON 面 + 单调相对读数 last_outbound_mono_ns 给下推器；process_mono_start 基准） |
+| 我-1 | M-11 的真实后果：暖机软失败期 runner 整块消失 ⇒ exitIp/bridgeAuth 缺 ⇒ 扩展「拒绝建接口（DNS 将无处可去）」——Go 的软失败自愈路径在 Rust 变启动失败（E2E 两轮 meowed 成功未暴露） | 高 | **已修**：runner 的 link 兜底 via="none"（runner 块只要求世代在场，link 键恒在） |
+
+### 第 3 棒工单（登记，按评审建议顺序）
+
+**P1（中危批）**：M-1 mark_unhealthy 世代守卫（两个生产调用点都没过 gen——Go
+markUnhealthy 内有 isCurrent）→ M-5/M-9/M-8 接缝类型化（connect_budget 未覆盖
+connect 本身；is_refused_like/Report 归因的字符串嗅探 contains("refused"/"满员")；
+取消被归因 interrupted 且 REASON_CANCELLED 死常量 + 取消打不断在途拨号）→
+M-2 GenRun 登记过晚（identity/Client::start 之后——叠加 -2 出现同身份双 Client
+窗口）→ M-3 attach_receiver 晚于 Ready 发布（tier 侧 rc≠0 直接 throw 不重试——
+一行改）→ M-4 path_probe 无外层硬超时（引擎卡死 ⇒ 暖机永久 preparing/巡检卡死）→
+M-6 begin_generation 不清 ready_by + **修正 R7-design §二/eb3e6fa 的两条失实
+登记**（「已修」但 diff 无此行）→ M-7 SpeedHost 的 live/dir 恒缺（UI 恒「连接中」
+——评审倾向本棒补最小相位出口，时间不足登记）→ M-10 service stop 超时提前 take
+（同钥双会话窗口）+ dial_via_run 持锁拨号阻塞 status 轮询 → M-11 已由 P0 我-1
+收其大半（link 兜底），runner 条件语义完全对齐留第 3 棒 → 我-2 隧道域端点缓存
+三缺（set_candidates 未喂/set_on_hint 未接/save 未调——进程退出端点全丢）→
+我-4 TunPacket 不写 wake 管道（上行每串包最长排队 250ms）。
+
+**P2（低危批）**：L-1（-2 分支补健康位）/L-2（-2 日志预检提前）/L-3（三派生线程
+catch_unwind + facade 存量 expect 收敛——工单⑥口径修正为「本棒新增面已做、存量
+待批」）/L-4（packet-info 探测剥离缺失登记）/L-5（旁路探测 4s vs Go 8s、mtu clamp、
+dial_ms 死字段三处常量对齐）/L-6（cause 文案用档位名）/L-7（下推器噪声窗 15s→5s）/
+L-8（Cmd::TunStats/orphan_alive/BridgeSock.listener 三处死件）/L-9（ProbeReach
+父预算 3.5s + 并行解析 + 去重——spec MUST）/L-11（starting 形态缺 elapsedMs、
+failed 后 run 槽回收）/L-12（finish 不关本世代 stop）+ 我-3（capi guard fallback
+立即求值 ⇒ 每次成功调用 malloc(1) 泄漏——改闭包一行）/我-5（write_fd_all 在
+driver 线程对 POLLOUT 无界重试不查 stop）/我-7（R1 动作立即失败时 Go 继续验证、
+Rust 直接收轮）/我-8（fd 读 n==0 静默 return vs Go continue）+ 我-6（**tier 侧
+build-core.sh rust 档缺脏检出闸与钉定**——未提交代码可走正式出包路径；与「仓的
+归属 R8 定」无关，闸门应先行——第 3 棒动 tier 时补）。
+
+**驳回**：L-10（option_env! 增量失效疑虑）——cargo/rustc 的 env-dep 机制会跟踪
+编译期 env 写入 dep-info，HOMEWAY_CORE_VERSION 变即重编（评审者与里层 dsh 双重
+实测确认），不需要 build.rs。
+
+**需拍板项（留给用户/第 3 棒）**：① bind 全候选发送统计留桩的边界——它在 Go 里
+同时是巡检噪声门控的输入（sendTries 全败 ⇒ 环境噪声不计证据），Rust 只剩采纳
+路径粘性信号 ⇒ 挂起禁发期（EPERM 事故形态）可能被计成质量失败、每拍烧 R1；是否
+提前补 bind 统计面由用户定。② M-7 speedtest live/dir 最小相位出口 vs 登记受限。
