@@ -57,18 +57,19 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 | **R4** | 中继（信封 + 准入 + 升级条纹） | **完成**（2026-10-03：两道门全过 + 三链路判据实测 + 升级条纹实测） | 4/4 步 |
 | **R5** | 互操作矩阵全量 + fuzz + 性能 A/B + 台账三方门 | **完成**（2026-10-03：两道门全过〔两轮代码评审 4高/15中/18低全处置〕+ 终验轮 4 六链路 + L3 复跑全绿 + PERF-AB 入库 + ci-local 一键门全绿） | 6/6 步 |
 | **R6** | term 服务面（协议/surface 产出/检测引擎 + 自建编码器/应答器） | **完成**（2026-10-04 五棒收官：6a 设计 + 6b vt 底座 + 门一〔4高全修〕+ 6c 编码器/应答器全量〔键 387+/鼠 245/应答 64 向量全绿〕+ 6d 帧族/会话注册表 + 6e surface 体编码〔golden 两向全绿〕+ 6f-1/2 manifest 引擎+检测融合 + 6f-3a PTY/环 + 6f-3b 会话装配/引擎接线〔八模块装成 TermService：ServeConn/raw 腿握手与停滞写者/surface 投递/pump/sample/LIST/EXPLAIN/HOMEWAY_TERM=off；D-19 信号死 -1 映射〕+ 6g 判据实测〔Go term CLI 消费 Rust term 服务全流程 + 检测三态 + linux 交叉面清账 + 判据行入册〕+ 门二两轮〔高3+2/中4+3/低9+10 全处置，评审记录 docs/reviews/R6.md〕+ ci-local 七步全绿） | 6a-6g ✅ 门一/门二 ✅ |
-| **R7** | APP 接入（C-ABI 胶水 + OHOS 交叉 + 20 导出面 + HSP 集成 + 真机判据） | **进行中**（第 1 棒 7a–7f + 第 2 棒 7g–7k 完成 2026-10-04：真机两轮全量判据过 + dsh r2 评审 P0 四项当棒整改；**第 3 棒 = 评审 r2 的 P1/P2 整改批**〔工单表 = R7-design §四〕） | 8/9 步 |
+| **R7** | APP 接入（C-ABI 胶水 + OHOS 交叉 + 20 导出面 + HSP 集成 + 真机判据） | **完成**（2026-10-04 三棒收官：第 1 棒 7a–7f + 第 2 棒 7g–7k〔真机两轮全量判据 + P0 整改〕+ 第 3 棒 7l–7n〔P1/P2 29 项全处置 + 两条拍板落地 + 7m 补验四项收口 + dsh r3 复核〔F1 回归修复 + F2-F16 处置〕；真机三轮判据总表 + ci-local 全绿 21:06〕） | 9/9 步 |
 | **R8** | 终测收官（包体/性能终测 + 共存定案 + 文档指针补录） | 未开始 | — |
 
-**下一步（当前指针）**：**R7 第 3 棒 = 评审 r2 整改批**（工单表全量 =
-`docs/reviews/R7-design.md` §四：P1 中危批〔M-1 世代守卫/M-2 GenRun 登记时序/M-3
-attach_receiver 提前/M-4 探测外层硬超时/M-5·M-9·M-8 接缝类型化与取消归因/M-6
-ready_by+两条失实登记修正/M-7 speedtest live/M-10 service 双会话窗口/我-2 隧道域
-缓存三缺/我-4 wake 管道〕+ P2 低危批〔L-1..L-12 + 我-3..我-8 + 我-6 tier rust 档
-脏检出闸〕+ 两条拍板项〔bind 全候选发送统计的噪声门控边界/M-7 取向〕）。完成后
-R7 收官转 R8。**第 2 棒已完成面**：真机两轮全量判据（本地 Rust exit 轮 + 现役 Go
-出口轮，`docs/E2E-APP-RUST-CORE.md`）+ tier `CORE_IMPL=rust` 档（51036b4，Go 档
-零行为变化验证过）+ 评审 r2 P0 四项已修（H-1/H-2/H-3/我-1——接线即坏类）。
+**下一步（当前指针）**：**R8 终测收官**。R7 已三棒完成（见下方 R7 完成证据）。
+R8 范围 = ROADMAP R8 节 + 复核 r3 的登记移交（`docs/reviews/R7-design.md` §六）：
+① 真机 WG **上行 bulk 吞吐退化**（测速 up 归因链 = R6.6 encap/发送路径瓶颈同族，
+修复判据已立项：下行 ≥0.5×Go + 发送路径 profile + 上行帧中途断判据与轮 1 原文
+并列）；② SpeedConn 的 Go SetDeadline 同义期限面（F8 timeout 分支极端形态）；
+③ tier 侧 homeway-rs.pin 期望 SHA（与「仓归属」决策一并）；④ ServiceRun↔BridgeHost
+引用环（F15，每 start/stop 周期泄漏一套对象）；⑤ term 测试 attach_size 偶发挂死
+的硬期限加固（F3，本机 4 轮未复现）；⑥ smoltcp 0.11→0.14 升级前置批（R6.6 立项）。
+**用户触点**：R8 的共存定案（合入 homeway 仓 `rust/` vs 独立仓）+ tier 文档地图
+指针补录。
 
 **R7 前置批工单：smoltcp 0.11 → 0.14 升级（R6.6 决策，2026-10-04 登记）**
 ——正式条目，R7 开工时与基线重锚一起做或排 R8，由届时会话按预算定：
@@ -646,6 +647,39 @@ OHOS 交叉与链接配方）→ 20 个导出面实装（语义真源 = `tier:AG
   软失败不再连锁成扩展拒绝建接口）；P1/P2 = 第 3 棒工单（R7-design §四）；L-10
   驳回（cargo env-dep 机制实测覆盖）。整改后 ci-local quick 全绿（18:54:06）+
   323 lib 全绿 + clippy 0 + 真机重装修复版复验（连现役出口 via=direct 全链绿）。
+
+**第 3 棒完成证据（2026-10-04，7l–7n 三工作单元，commit 0baca9f..3ab9891 + tier 4b8a0a1/e6c640c）**：
+- **7l 整改批**：评审 r2 的 P1 13 项 + P2 16 项**全处置无挂账**（处置表 =
+  `docs/reviews/R7-design.md` §五；L-10 驳回维持）；两条留桩边界拍板落地——
+  ① bind 全候选发送统计**提前补全**（sendTries/sendLocalFails 双计数 + 巡检噪声
+  双信号〔Go tunmode.go:1024-1027 同构〕+ tunStatusJSON demand.localErr* 两键）；
+  ② M-7 speedtest **最小相位出口**（LiveProgress 原子面 + SpeedHost 差分 instBps）。
+  两条 r2 失实登记就地修正（C-4②/工单⑥——eb3e6fa 时点未落码，实际落 7l）。
+  我-6 = tier rust 档**脏检出闸 + HEAD 钉定门**（4b8a0a1 + e6c640c 加固——与 Go 档
+  同纪律；正式出包路径不再接受未提交核码）。
+- **7m 真机补验四项**（第 3 轮，核 `ea00b2c4e781-rust`，E2E §6/§7）：
+  - **tunStatusJSON 对账快照面收口**：attached 后每世代产一行与 ClientCoreTunStatus
+    同源的真机字节快照——键面 18 键/键序字典序/值域逐项过账，localErr 两键在位
+    （第 2 棒的「构造输入守卫替代」折衷收口）；
+  - **term 键盘机器采证完整闭环**：`uitest uiInput text/keyEvent` 能进 native
+    surface——回显视觉证据 + `touch /tmp/R7KEY_OK` 副作用硬证据（文件真实出现在
+    exit 主机）+ exit 自灭（腿断开 reason=finish）——**真手指复测清单撤销**；
+  - **测速**：M-7 相位 UI 真机验证（下行测速中→上行测速中两相位切换，恒「连接中」
+    死相消除）+ 取消面无 hang；EOF 归因收口 = **phone→exit WG 上行 bulk 吞吐退化**
+    （下行 4 会话 ~94Mbps 全成、上行帧中途断+看门狗收、同签名旧核即有、host 同引擎
+    up=411Mbps ⇒ 非本批引入——归 R8 与 R6.6 encap 瓶颈同族）；
+  - **files 上传**：系统 picker 对自动化不稳定（dumpLayout 时隐时现、行选择无法
+    稳定注册）——机器验证不完整；E2E P2-4 App 侧静默问题维持登记（真手指复测清单）。
+- **7n 收口**：dsh r3 复核（r7l.5XAMBa）——§五 29 项对 diff 逐条核验**无失实复发**、
+  新引入面五路复查无问题、登记项三条核验（上行归 R8 成立/cmd 无界成立/M-8 兜底
+  部分失真）；抓出 F1 高危回归（gen_loop 早退漏 finish_generation）+ F2-F16。
+  全处置（§六处置表：修 12/登记 R8 5/无法复现登记 1）；332 lib 全绿（含 4 串行轮）
+  + clippy 0 + OHOS 交叉 0 + **ci-local 七步全绿（2026-10-04 21:06:56 终轮）**。
+  真机三轮判据总表 = `docs/E2E-APP-RUST-CORE.md` §7；收口口径 = 两处非阻断残留
+  （上行吞吐归 R8 / files 上传 picker 归 App 侧真手指清单）。
+- **R7 集成面清单（完成证据汇总）**：真机双轮判据（第 2 棒）+ 第 3 轮复验；
+  体积 **1.9MB vs Go 9.7MB（0.20×）**；tier `CORE_IMPL=rust` 档（Go 档零行为变化
+  验证）+ 脏检出闸/钉定门；napi-sync 20/20 + 词表门（ci-local 内）；对账快照面。
 
 ## R8 终测收官
 
