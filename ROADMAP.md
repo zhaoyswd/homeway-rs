@@ -68,6 +68,24 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 files/speedtest 动词与常驻 connect 同 identity 并发的 foot-gun——与 hostsession/
 常驻会话设计一并定，见 docs/reviews/R2.md 豁免表）。
 
+**R7 前置批工单：smoltcp 0.11 → 0.14 升级（R6.6 决策，2026-10-04 登记）**
+——正式条目，R7 开工时与基线重锚一起做或排 R8，由届时会话按预算定：
+
+- **动机（R6.6 P1-② 根因）**：smoltcp 0.11 无拥塞控制（发送上限 = min(对端窗,
+  本地 tx_buffer)，bulk 整窗突发）且 fast-retransmit 在 bulk 中恒不触发、RTO =
+  go-back-N 整窗重炸——真机 WiFi 下行 20× 塌陷的根因。0.12.0 起 CC 入库、
+  0.13.0 带 RFC 6298 重传退避修复、0.14.0 重构为 RFC 合规 Reno/CUBIC。
+- **收益**：上游 CC + RFC 6298（含零窗探测）替代 `intercept` 内的**临时应用层
+  CC 垫片**（R6.6 加，temporary shim——cwnd 门 + CUBIC 增长律 + 2×ACK 速率
+  pacing + seq 回退×ACK 停滞丢包检测；升级后该垫片整体退役，判据 =
+  `downlink_lossy_link_recovery` harness 在无垫片形态全绿）。
+- **适配量（估中等）**：core::net 类型迁移（wire API 的 IpAddress/Endpoint 家族）、
+  Edition 2024/MSRV 1.91（本仓 1.99 无碍）、RxToken::consume 签名、socket 缓冲
+  API；**双侧**自建 phy Device（服务端 TunDevice + 客户端 stackb/CableEnd）与
+  拦截栈/客户端 hub 的装配面同步适配；矩阵（六链路）+ PERF-AB 复测。
+- **决策依据**：R7 前夕横跨双侧的共享底座迁移风险不对等；先以应用层垫片修真机
+  可感差距（已验收），升级挪到有专属窗口的时点（主会话 2026-10-04 批准）。
+
 R6 已收官（2026-10-04，两道门全过 + 判据实测入册 + ci-local 全绿；评审记录 =
 `docs/reviews/R6.md`〔两轮〕）。
 
