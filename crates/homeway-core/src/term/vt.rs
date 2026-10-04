@@ -24,6 +24,8 @@ use alacritty_terminal::vte::ansi::{
     self as alac_ansi, Color as AlacColor, CursorShape as AlacCursorShape, NamedColor,
 };
 
+use super::responder;
+
 /// 回滚行数上限默认值（Go `vt.DefaultScrollbackLines` 同值；env
 /// `HOMEWAY_TERM_SCROLLBACK_LINES` 由会话层注入）。
 pub const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
@@ -72,6 +74,29 @@ pub enum Screen {
     #[default]
     Primary = 0,
     Alternate = 1,
+}
+
+/// 鼠标上报事件面（门一评审 B5：**编码面是 last-set 单值语义**，与 wire 位的独立记账
+/// 并存——ghostty `flags.mouse_event` 只记最后一次 set/reset 的模式；Go 实测
+/// `?1000h ?1002h` 与 `?1002h ?1000h` 的 wire 位相同但 motion 上报行为不同）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MouseTracking {
+    #[default]
+    None,
+    X10,        // DEC 9（ghostty 有独立位；alacritty 无 ⇒ 自管，D-18）
+    Clicks,     // DEC 1000
+    CellMotion, // DEC 1002
+    AllMotion,  // DEC 1003
+}
+
+/// 鼠标上报字节格式（同 B5：last-set 单值；unset 回默认 X10 三字节）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MouseFormat {
+    #[default]
+    Default, // X10 三字节
+    Utf8,    // DEC 1005
+    Sgr,     // DEC 1006
+    Urxvt,   // DEC 1015（D-18：alacritty 无位 ⇒ 自管）
 }
 
 /// 模式位快照（字段面对齐 Go `vt.Modes`；注释给 DEC/ANSI 模式号）。
@@ -187,6 +212,18 @@ pub struct SessionVt {
     flushed: Vec<u64>,
     /// resize 后行数变化 ⇒ 指纹表整体失效，强制全量重建。
     flushed_cols: usize,
+    /// ghostty 全 DEC 模式自管表（DECRQM 应答面；应答器 6c）。
+    dec_modes: responder::DecModes,
+    /// 动态色（OSC 10/11/12 set 与 SetDefaultColors 的合并存储；查询应答面）。
+    colors: responder::DynamicColors,
+    /// OSC 4 set 镜像（索引 → 最近 set 值；查询回显，未 set 回 ghostty 基表）。
+    palette_mirror: [Option<[u8; 3]>; 256],
+    /// B5：编码面 last-set 单值（与 wire 独立位并存）。
+    mouse_tracking: MouseTracking,
+    mouse_format: MouseFormat,
+    /// DECSTBM 滚动区顶（0-based 视口行；Term.scroll_region 私有 ⇒ 拦截 set_scrolling_region
+    /// 自管记账——CPR 的 DECOM 折算用）。
+    scroll_top: i32,
 }
 
 impl Default for SessionVt {
@@ -231,22 +268,55 @@ impl SessionVt {
             force_full: false,
             flushed: vec![0; rows],
             flushed_cols: cols,
+            dec_modes: responder::DecModes::default(),
+            colors: responder::DynamicColors::default(),
+            palette_mirror: [None; 256],
+            mouse_tracking: MouseTracking::None,
+            mouse_format: MouseFormat::Default,
+            scroll_top: 0,
         })
     }
 
-    /// 把一批 PTY 输出喂进 vt（屏态唯一入口）。经 [`TermProbe`] 双面分发器：
-    /// 查询应答（DA/DSR/DECRQM/OSC 颜色）与 ghostty 兼容位在分发器上拦截，其余全量委托。
-    pub fn write(&mut self, p: &[u8]) {
+    /// 设置客户端上报的主题色（Go `SetDefaultColors` 面；THEME 帧后由会话层调）。
+    /// 设置后 OSC 10/11 查询按上报值应答（未设置 ⇒ 不答，V-2 定案）。
+    pub fn set_default_colors(&mut self, fg: [u8; 3], bg: [u8; 3]) {
+        self.colors.fg = Some(fg);
+        self.colors.bg = Some(bg);
+    }
+
+    /// 喂入并收集应答分片（`write_pty` 面）：每个应答一片、顺序与流中触发一致。
+    /// 对齐 Go `SetResponseSink` 的流中同步回调语义（同一次 write 内顺序不乱）。
+    pub fn write_collecting(&mut self, p: &[u8], sink: &mut impl FnMut(&[u8])) {
         if p.is_empty() {
             return;
         }
-        let mut probe = TermProbe {
-            term: &mut self.term,
-            modify_other_keys: &mut self.modify_other_keys,
-            mouse_flags: &mut self.mouse_flags,
-            force_full: &mut self.force_full,
-        };
-        self.processor.advance(&mut probe, p);
+        let mut responses: Vec<Vec<u8>> = Vec::new();
+        {
+            let mut probe = TermProbe {
+                term: &mut self.term,
+                modify_other_keys: &mut self.modify_other_keys,
+                mouse_flags: &mut self.mouse_flags,
+                force_full: &mut self.force_full,
+                dec_modes: &mut self.dec_modes,
+                colors: &mut self.colors,
+                palette_mirror: &mut self.palette_mirror,
+                mouse_tracking: &mut self.mouse_tracking,
+                mouse_format: &mut self.mouse_format,
+                scroll_top: &mut self.scroll_top,
+                responses: &mut responses,
+            };
+            self.processor.advance(&mut probe, p);
+        }
+        for r in &responses {
+            sink(r);
+        }
+    }
+
+    /// 把一批 PTY 输出喂进 vt（屏态唯一入口；应答丢弃——收集应答用
+    /// [`SessionVt::write_collecting`]）。经 [`TermProbe`] 双面分发器：查询应答
+    /// （DA/DSR/DECRQM/OSC 颜色）与 ghostty 兼容位在分发器上拦截，其余全量委托。
+    pub fn write(&mut self, p: &[u8]) {
+        self.write_collecting(p, &mut |_| {});
     }
 
     /// 改尺寸（含主屏回滚重排；备用屏不重排——alacritty 语义与 ghostty 一致）。
@@ -265,6 +335,7 @@ impl SessionVt {
         self.rows = rows;
         self.flushed = vec![u64::MAX; rows];
         self.flushed_cols = cols;
+        self.scroll_top = 0; // resize 清滚动区
         Ok(())
     }
 
@@ -386,18 +457,6 @@ impl SessionVt {
         self.term.reset_damage();
     }
 
-    fn rows_in(&self, keep: impl Fn(usize) -> bool) -> Vec<Row> {
-        let grid = self.term.grid();
-        let mut out = Vec::new();
-        for y in 0..self.rows {
-            if !keep(y) {
-                continue;
-            }
-            out.push(self.read_row(grid, y));
-        }
-        out
-    }
-
     fn read_row(&self, grid: &alacritty_terminal::grid::Grid<AlacCell>, y: usize) -> Row {
         let line = Line(y as i32);
         let row = &grid[line];
@@ -410,7 +469,7 @@ impl SessionVt {
 
     fn row_at(&self, y: usize) -> Row {
         let grid = self.term.grid();
-        self.read_row(&grid, y)
+        self.read_row(grid, y)
     }
 
     /// 光标快照（视口坐标）。
@@ -547,12 +606,12 @@ fn row_fingerprint(row: &Row) -> u64 {
         h.write_u16(match c.fg {
             Color::None => 0,
             Color::Palette(i) => 1 + i as u16,
-            Color::Rgb(r, g, b) => 2 + ((r as u16) << 8) ^ ((g as u16) << 4) ^ (b as u16),
+            Color::Rgb(r, g, b) => 2 + (((r as u16) << 8) ^ ((g as u16) << 4) ^ (b as u16)),
         });
         h.write_u16(match c.bg {
             Color::None => 0,
             Color::Palette(i) => 1 + i as u16,
-            Color::Rgb(r, g, b) => 2 + ((r as u16) << 8) ^ ((g as u16) << 4) ^ (b as u16),
+            Color::Rgb(r, g, b) => 2 + (((r as u16) << 8) ^ ((g as u16) << 4) ^ (b as u16)),
         });
         h.write_u16(c.attr);
     }
@@ -685,6 +744,14 @@ struct TermProbe<'a, T> {
     modify_other_keys: &'a mut bool,
     mouse_flags: &'a mut u8,
     force_full: &'a mut bool,
+    dec_modes: &'a mut responder::DecModes,
+    colors: &'a mut responder::DynamicColors,
+    palette_mirror: &'a mut [Option<[u8; 3]>; 256],
+    mouse_tracking: &'a mut MouseTracking,
+    mouse_format: &'a mut MouseFormat,
+    scroll_top: &'a mut i32,
+    /// 本次 write 的应答分片（流中收集、批末由 [`SessionVt::write_collecting`] 投递）。
+    responses: &'a mut Vec<Vec<u8>>,
 }
 
 impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, T> {
@@ -708,10 +775,24 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
     fn move_up(&mut self, _p0: usize) { self.term.move_up(_p0) }
     #[inline]
     fn move_down(&mut self, _p0: usize) { self.term.move_down(_p0) }
-    #[inline]
-    fn identify_terminal(&mut self, _intermediate: Option<char>) { self.term.identify_terminal(_intermediate) }
-    #[inline]
-    fn device_status(&mut self, _p0: usize) { self.term.device_status(_p0) }
+    /// 应答器（6c）：DA 族按 ghostty 应答（alacritty 自答 `\x1b[?6c` ≠ ghostty `?62;22c`，
+    /// 拦截不委托；其应答走 PtyWrite 事件，VoidListener 丢弃——本层直接产字节进 responses）。
+    fn identify_terminal(&mut self, _intermediate: Option<char>) {
+        let r = responder::device_attributes(_intermediate);
+        if !r.is_empty() {
+            self.responses.push(r);
+        }
+    }
+    /// 应答器（6c）：DSR 族。CPR 按 DECOM 折算（ghostty：origin 态报滚动区相对坐标）。
+    fn device_status(&mut self, _p0: usize) {
+        let point = self.term.grid().cursor.point;
+        let origin = self.term.mode().contains(TermMode::ORIGIN);
+        let top = *self.scroll_top;
+        let r = responder::device_status(_p0, (point.line.0, point.column.0), origin, top);
+        if !r.is_empty() {
+            self.responses.push(r);
+        }
+    }
     #[inline]
     fn move_forward(&mut self, _col: usize) { self.term.move_forward(_col) }
     #[inline]
@@ -763,10 +844,14 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
     #[inline]
     fn set_tabs(&mut self, _interval: u16) { self.term.set_tabs(_interval) }
     /// RIS 全复位：自管位（mouse_flags/modifyOtherKeys，D-17/§二）随 ghostty 语义归零，
-    /// 其余委托 alacritty reset_state。
+    /// DECRQM 模式表与调色板镜像同样复位；theme（客户端上报）保留。其余委托 alacritty。
     fn reset_state(&mut self) {
         *self.mouse_flags = 0;
         *self.modify_other_keys = false;
+        *self.mouse_tracking = MouseTracking::None;
+        *self.mouse_format = MouseFormat::Default;
+        *self.dec_modes = responder::DecModes::default();
+        *self.palette_mirror = [None; 256];
         self.term.reset_state();
     }
     #[inline]
@@ -779,27 +864,52 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
     fn unset_mode(&mut self, _mode: alac_ansi::Mode) { self.term.unset_mode(_mode) }
     #[inline]
     fn report_mode(&mut self, _mode: alac_ansi::Mode) { self.term.report_mode(_mode) }
-    /// ghostty 兼容位（D-17）：鼠标上报三模式（1000/1002/1003）ghostty 独立记账，
-    /// alacritty 互斥（设 1002 会清 1000）。此处拦截自管、不委托——alacritty 的
-    /// MOUSE_MODE 位我们不用（编码器读本层快照），互斥态不影响任何行为。
+    /// ghostty 兼容位（D-17 + B5）：wire 位独立记账（模式 1000/1002/1003 各自置/复位）；
+    /// **编码面单值**（mouse_tracking/mouse_format 只记最后一次 set/reset——ghostty
+    /// `flags.mouse_event/format` 语义，门一评审 B5）；DECRQM 面 = dec_modes 全表记账。
+    /// X10（9）/URXVT（1015）/1016/47/1047 走 `PrivateMode::Unknown`（vte 表外，D-18）。
     fn set_private_mode(&mut self, mode: alac_ansi::PrivateMode) {
         use alac_ansi::{NamedPrivateMode, PrivateMode};
         if let PrivateMode::Named(m) = mode {
             match m {
                 NamedPrivateMode::ReportMouseClicks => {
                     *self.mouse_flags |= 1;
+                    *self.mouse_tracking = MouseTracking::Clicks;
+                    self.dec_modes.set(1000, true);
                     return;
                 }
                 NamedPrivateMode::ReportCellMouseMotion => {
                     *self.mouse_flags |= 2;
+                    *self.mouse_tracking = MouseTracking::CellMotion;
+                    self.dec_modes.set(1002, true);
                     return;
                 }
                 NamedPrivateMode::ReportAllMouseMotion => {
                     *self.mouse_flags |= 4;
+                    *self.mouse_tracking = MouseTracking::AllMotion;
+                    self.dec_modes.set(1003, true);
                     return;
+                }
+                NamedPrivateMode::Utf8Mouse => {
+                    *self.mouse_format = MouseFormat::Utf8;
+                }
+                NamedPrivateMode::SgrMouse => {
+                    *self.mouse_format = MouseFormat::Sgr;
                 }
                 _ => {}
             }
+            self.dec_modes.set(m as u16, true);
+        } else if let PrivateMode::Unknown(n) = mode {
+            match n {
+                9 => *self.mouse_tracking = MouseTracking::X10,
+                1015 => *self.mouse_format = MouseFormat::Urxvt,
+                47 | 1047 => {
+                    // B6 登记残余：alacritty 无公开 swap-alt API，备用屏内容面暂不可达
+                    // （wire Alt 位与 DECRQM 报告面已记账；真 TUI 多用 1049 不受影响）。
+                }
+                _ => {}
+            }
+            self.dec_modes.set(n, true);
         }
         self.term.set_private_mode(mode);
     }
@@ -815,15 +925,37 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
             match m {
                 NamedPrivateMode::ReportMouseClicks => {
                     *self.mouse_flags &= !1;
+                    if *self.mouse_tracking == MouseTracking::Clicks {
+                        *self.mouse_tracking = MouseTracking::None; // B5 单值 reset
+                    }
+                    self.dec_modes.set(1000, false);
                     return;
                 }
                 NamedPrivateMode::ReportCellMouseMotion => {
                     *self.mouse_flags &= !2;
+                    if *self.mouse_tracking == MouseTracking::CellMotion {
+                        *self.mouse_tracking = MouseTracking::None;
+                    }
+                    self.dec_modes.set(1002, false);
                     return;
                 }
                 NamedPrivateMode::ReportAllMouseMotion => {
                     *self.mouse_flags &= !4;
+                    if *self.mouse_tracking == MouseTracking::AllMotion {
+                        *self.mouse_tracking = MouseTracking::None;
+                    }
+                    self.dec_modes.set(1003, false);
                     return;
+                }
+                NamedPrivateMode::Utf8Mouse => {
+                    if *self.mouse_format == MouseFormat::Utf8 {
+                        *self.mouse_format = MouseFormat::Default;
+                    }
+                }
+                NamedPrivateMode::SgrMouse => {
+                    if *self.mouse_format == MouseFormat::Sgr {
+                        *self.mouse_format = MouseFormat::Default;
+                    }
                 }
                 NamedPrivateMode::SwapScreenAndSetRestoreCursor
                     if !self.term.mode().contains(TermMode::ALT_SCREEN) =>
@@ -835,13 +967,39 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
                 }
                 _ => {}
             }
+            self.dec_modes.set(m as u16, false);
+        } else if let PrivateMode::Unknown(n) = mode {
+            match n {
+                9 => {
+                    if *self.mouse_tracking == MouseTracking::X10 {
+                        *self.mouse_tracking = MouseTracking::None;
+                    }
+                }
+                1015 if *self.mouse_format == MouseFormat::Urxvt => {
+                    *self.mouse_format = MouseFormat::Default;
+                }
+                _ => {}
+            }
+            self.dec_modes.set(n, false);
         }
         self.term.unset_private_mode(mode);
     }
-    #[inline]
-    fn report_private_mode(&mut self, _mode: alac_ansi::PrivateMode) { self.term.report_private_mode(_mode) }
-    #[inline]
-    fn set_scrolling_region(&mut self, _top: usize, _bottom: Option<usize>) { self.term.set_scrolling_region(_top, _bottom) }
+    /// 应答器（6c）：DECRQM 按自管全模式表（alacritty 只认它有位的模式且自答格式不同）。
+    fn report_private_mode(&mut self, _mode: alac_ansi::PrivateMode) {
+        use alac_ansi::PrivateMode;
+        let n = match _mode {
+            PrivateMode::Named(m) => m as u16,
+            PrivateMode::Unknown(n) => n,
+        };
+        let state = self.dec_modes.decrqm_state(n);
+        self.responses.push(responder::decrqm(n, state));
+    }
+    fn set_scrolling_region(&mut self, _top: usize, _bottom: Option<usize>) {
+        // 拦截记账（0-based 顶）：vte 传 1-based（`CSI 5;20r` → top=5，alacritty 内部
+        // 减 1）——CPR 的 DECOM 折算用同基准。
+        *self.scroll_top = _top as i32 - 1;
+        self.term.set_scrolling_region(_top, _bottom)
+    }
     #[inline]
     fn set_keypad_application_mode(&mut self) { self.term.set_keypad_application_mode() }
     #[inline]
@@ -851,11 +1009,51 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
     #[inline]
     fn configure_charset(&mut self, _p0: alac_ansi::CharsetIndex, _p1: alac_ansi::StandardCharset) { self.term.configure_charset(_p0, _p1) }
     #[inline]
-    fn set_color(&mut self, _p0: usize, _p1: alac_ansi::Rgb) { self.term.set_color(_p0, _p1) }
+    /// 应答器（6c）：OSC 颜色查询（10/11/12 未设主题不答、12 回落 fg；OSC 4 = 镜像/基表；
+    /// 终止符跟随查询）。委托版只会把应答发进 VoidListener ⇒ 拦截自行产字节。
+    fn dynamic_color_sequence(&mut self, _p0: String, _p1: usize, _p2: &str) {
+        let answer: Option<[u8; 3]> = if let Some(idx) = _p0.strip_prefix("4;") {
+            // OSC 4：镜像值优先，未 set 回 ghostty 内置基表
+            let idx: usize = idx.parse().unwrap_or(256);
+            (idx < 256).then(|| {
+                self.palette_mirror[idx]
+                    .unwrap_or(responder::ghostty_palette()[idx])
+            })
+        } else {
+            _p0.parse::<u16>().ok().and_then(|c| self.colors.answer(c))
+        };
+        if let Some(rgb) = answer {
+            self.responses
+                .push(format!("\x1b]{};{}{}", _p0, responder::color_report(rgb), _p2).into_bytes());
+        }
+    }
+    /// OSC 颜色 set：委托（alacritty 自身色面）+ 记账（调色板镜像 / 动态色分量）。
+    fn set_color(&mut self, _p0: usize, _p1: alac_ansi::Rgb) {
+        let rgb = [_p1.r, _p1.g, _p1.b];
+        if let Some(i) = _p0.checked_sub(256) {
+            // NamedColor::Foreground=256 / Background=257 / Cursor=258
+            self.colors.set(10 + i as u16, rgb);
+        } else if _p0 < 256 {
+            self.palette_mirror[_p0] = Some(rgb);
+        }
+        self.term.set_color(_p0, _p1);
+    }
     #[inline]
-    fn dynamic_color_sequence(&mut self, _p0: String, _p1: usize, _p2: &str) { self.term.dynamic_color_sequence(_p0, _p1, _p2) }
-    #[inline]
-    fn reset_color(&mut self, _p0: usize) { self.term.reset_color(_p0) }
+    /// OSC 104/110-119 颜色复位：委托 + 清镜像/分量（theme 由 SetDefaultColors 设定的
+    /// 分量随 RIS 保留——客户端上报主题是会话属性，非终端态；OSC 104 复位只清程序 set 面）。
+    fn reset_color(&mut self, _p0: usize) {
+        if let Some(i) = _p0.checked_sub(256) {
+            match 10 + i as u16 {
+                10 => self.colors.fg = None,
+                11 => self.colors.bg = None,
+                12 => self.colors.cursor = None,
+                _ => {}
+            }
+        } else if _p0 < 256 {
+            self.palette_mirror[_p0] = None;
+        }
+        self.term.reset_color(_p0);
+    }
     #[inline]
     fn clipboard_store(&mut self, _p0: u8, _p1: &[u8]) { self.term.clipboard_store(_p0, _p1) }
     #[inline]
@@ -874,8 +1072,27 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
     fn set_hyperlink(&mut self, _p0: Option<alac_ansi::Hyperlink>) { self.term.set_hyperlink(_p0) }
     // CursorIcon 在 vte 0.15 是私有类型：本方法不委托（Term 的默认实现即 no-op，
     // 鼠标光标形状由客户端自理——服务端无 UI 面）。
-    #[inline]
-    fn report_keyboard_mode(&mut self) { self.term.report_keyboard_mode() }
+    /// 应答器（6c）：kitty 键盘查询 `\x1b[?{flags}u`（flags 从 TermMode 拼装；0 也显式）。
+    fn report_keyboard_mode(&mut self) {
+        let mode = self.term.mode();
+        let mut flags = 0u8;
+        if mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
+            flags |= 1;
+        }
+        if mode.contains(TermMode::REPORT_EVENT_TYPES) {
+            flags |= 2;
+        }
+        if mode.contains(TermMode::REPORT_ALTERNATE_KEYS) {
+            flags |= 4;
+        }
+        if mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) {
+            flags |= 8;
+        }
+        if mode.contains(TermMode::REPORT_ASSOCIATED_TEXT) {
+            flags |= 16;
+        }
+        self.responses.push(responder::kitty_query(flags));
+    }
     #[inline]
     fn push_keyboard_mode(&mut self, _mode: alac_ansi::KeyboardModes) { self.term.push_keyboard_mode(_mode) }
     #[inline]
@@ -883,7 +1100,8 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
     #[inline]
     fn set_keyboard_mode(&mut self, _mode: alac_ansi::KeyboardModes, _behavior: alac_ansi::KeyboardModesApplyBehavior) { self.term.set_keyboard_mode(_mode, _behavior) }
     #[inline]
-    fn report_modify_other_keys(&mut self) { self.term.report_modify_other_keys() }
+    /// 应答器（6c）：XTQMODKEYS 不答（实测向量 mok_query_*；拦截丢弃 alacritty 的自答事件）。
+    fn report_modify_other_keys(&mut self) {}
     #[inline]
     fn set_scp(&mut self, _char_path: alac_ansi::ScpCharPath, _update_mode: alac_ansi::ScpUpdateMode) { self.term.set_scp(_char_path, _update_mode) }
 
