@@ -1978,18 +1978,18 @@ mod tests {
         // 而稳态 24.8MB/s=满链路）——量级提到稳态支配（塌陷判别语义不变：0.4MB/s
         // 塌陷形态在 64MB 下 160s 超时必红）。
         const LINK_RATE_MB: f64 = 24.0; // DirLink::deep 的速率参数（改一处同步两处）
-        let (secs, bytes, _) = run_shaped_download(
+        let (secs, bytes, _, _) = run_shaped_download(
             1,
             16 * 1024 * 1024,
             DirLink::passthrough(),
             DirLink::passthrough(),
         );
         let ceiling = bytes as f64 / secs / (1024.0 * 1024.0);
-        let (secs, bytes, down) =
+        let (secs, bytes, down, tail) =
             run_shaped_download(1, 64 * 1024 * 1024, DirLink::deep(), DirLink::deep());
         let got = bytes as f64 / secs / (1024.0 * 1024.0);
         println!(
-            "A 单流：无损天花板 {ceiling:.1}MB/s → 深队列有损 {got:.1}MB/s（丢 {} 包 / 峰值队列 {}B）",
+            "A 单流：无损天花板 {ceiling:.1}MB/s → 深队列有损 {got:.1}MB/s 尾2s={tail:.1}MB/s（丢 {} 包 / 峰值队列 {}B）",
             down.dropped, down.peak_queue
         );
         let reach1 = LINK_RATE_MB.min(ceiling);
@@ -1997,15 +1997,23 @@ mod tests {
             got >= reach1 * 0.5,
             "深队列形态下单流吞吐 {got:.1}MB/s 应 ≥ 可达速率 {reach1:.1}MB/s（min(链路 24, 天花板 {ceiling:.1})）的 50%（无回归判据）"
         );
+        // R8-2 8g 尾窗速率门（评审 F1 登记义务）：最后 2s 均值 ≥ 窗口均值的 50%——
+        // 防「前段突发把均值抬过门、尾段已塌」的假绿（真机口径同款判别 = speedtest
+        // 结算行的 尾3s 速率）。取 50% 而非 100%：CUBIC 爬坡期均值偏低、稳态尾窗
+        // 通常 ≥ 均值，50% 只拦塌陷形态不拦正常波动。
+        assert!(
+            tail >= got * 0.5,
+            "尾窗（最后 2s）速率 {tail:.1}MB/s 应 ≥ 窗口均值 {got:.1}MB/s 的 50%（尾段塌陷 = 假绿拦截）"
+        );
 
-        let (secs, bytes, _) = run_shaped_download(
+        let (secs, bytes, _, _) = run_shaped_download(
             6,
             3 * 1024 * 1024,
             DirLink::passthrough(),
             DirLink::passthrough(),
         );
         let ceiling6 = bytes as f64 / secs / (1024.0 * 1024.0);
-        let (secs, bytes, down6) =
+        let (secs, bytes, down6, _) =
             run_shaped_download(6, 8 * 1024 * 1024, DirLink::deep(), DirLink::deep());
         let got6 = bytes as f64 / secs / (1024.0 * 1024.0);
         println!(
@@ -2028,7 +2036,7 @@ mod tests {
         // （2026-10-04，commit c0a244f 前的 4325c1b 基线 + 同链路形态；部分消融
         // 〔仅去 allowed 上限、保留 pacing〕实测 5.2MB/s，介于两者之间——判据下界
         // 取保守的 3.2MB/s = 0.4×8）
-        let (secs, bytes, downb) =
+        let (secs, bytes, downb, _) =
             run_shaped_download(1, 8 * 1024 * 1024, DirLink::shallow(), DirLink::shallow());
         let gotb = bytes as f64 / secs / (1024.0 * 1024.0);
         println!(
@@ -2137,7 +2145,7 @@ mod tests {
         bytes_each: usize,
         mut up: DirLink,
         mut down: DirLink,
-    ) -> (f64, usize, DirLink) {
+    ) -> (f64, usize, DirLink, f64) {
         // origin：回环 TCP，每连接写满 bytes_each 后 shutdown 写半边
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
@@ -2199,6 +2207,9 @@ mod tests {
         let timeout = Duration::from_secs(120);
         let mut last_diag = Instant::now() - Duration::from_secs(2);
         let mut last_drop = 0u64;
+        // 尾窗速率的采样线（R8-2 8g 尾窗速率门：每 0.5s 记 (秒, 累计字节)——收尾取
+        // 最后 2s 的均值，判「窗口收在稳态」而非靠前段突发达标）。
+        let mut timeline: Vec<(f64, usize)> = Vec::new();
         loop {
             let now = Instant::now();
             let tel = now.duration_since(t0);
@@ -2207,6 +2218,7 @@ mod tests {
             }
             if now.duration_since(last_diag) >= Duration::from_millis(500) {
                 last_diag = now;
+                timeline.push((tel.as_secs_f64(), received.iter().sum()));
                 let f = itc.flows.values().next();
                 if let Some(f) = f {
                     let (sq, bl) = f
@@ -2275,11 +2287,29 @@ mod tests {
             }
             if all_done {
                 let _ = origin.join();
-                return (tel.as_secs_f64(), received.iter().sum(), down);
+                let total = received.iter().sum();
+                let tail = tail_rate_mbps(&timeline, tel.as_secs_f64(), total);
+                return (tel.as_secs_f64(), total, down, tail);
             }
             std::thread::sleep(Duration::from_micros(500));
         }
         let _ = origin.join();
-        (timeout.as_secs_f64(), received.iter().sum(), down)
+        let total = received.iter().sum();
+        let tail = tail_rate_mbps(&timeline, timeout.as_secs_f64(), total);
+        (timeout.as_secs_f64(), total, down, tail)
     }
+}
+
+/// 尾窗（最后 2s）平均速率，MB/s（R8-2 8g 尾窗速率门的计算面——传输不足 2s
+/// 返回 None 形态的 0.0，由调用方决定是否设门）。采样线取「≤ t-2s 的最后一点」
+/// 与收尾点的字节差 ÷ 实际时长（尾段首点晚于 t-2s 时用更短的实际窗口）。
+fn tail_rate_mbps(timeline: &[(f64, usize)], t_end: f64, total: usize) -> f64 {
+    let Some(&(_, base)) = timeline.iter().rev().find(|(t, _)| *t <= t_end - 2.0) else {
+        return 0.0;
+    };
+    let span = t_end - timeline.iter().rev().find(|(t, _)| *t <= t_end - 2.0).unwrap().0;
+    if span <= 0.0 {
+        return 0.0;
+    }
+    (total - base) as f64 / span / (1024.0 * 1024.0)
 }
