@@ -20,7 +20,10 @@
 
 use std::io;
 use std::net::SocketAddr;
-use std::os::fd::{FromRawFd, RawFd};
+#[cfg(not(target_os = "linux"))]
+use std::os::fd::FromRawFd;
+use std::os::fd::RawFd;
+#[cfg(not(target_os = "linux"))]
 use std::net::UdpSocket;
 
 /// 单条待发消息：目的端点 + 载荷（载荷借用须存活到本函数返回）。
@@ -132,6 +135,7 @@ fn sock_addr_parts(
 }
 
 /// 逐包回退（macOS 等）：借用 fd 包一层 std UdpSocket，逐包 send_to（v4/v6 双栈）。
+#[cfg(not(target_os = "linux"))]
 fn send_one_by_one(fd: RawFd, msgs: &[OutMsg<'_>]) -> (usize, Option<(SocketAddr, io::Error)>) {
     // 借用形态：from_raw_fd 后立即在 drop 前换回——fd 生命周期不变。
     let sock = unsafe { UdpSocket::from_raw_fd(fd) };
