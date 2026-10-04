@@ -113,15 +113,24 @@ impl TunShared {
         if snap.stage != TunStage::Failed {
             self.stage.set_if_current(gen, TunStage::Idle, "", "", false);
         }
-        if self.gen.load(Ordering::Acquire) == gen {
+        let is_current = self.gen.load(Ordering::Acquire) == gen;
+        if is_current {
             self.mark_unhealthy("stop");
             self.probe_running.store(false, Ordering::Release);
         }
-        self.close_attach();
-        let mut done = lock_unpoison(&self.done);
-        if !*done {
-            *done = true;
-            self.done_cv.notify_all();
+        // done/attach 通道同过世代守卫（评审 r2-H2：它们是 TunShared 单例槽——
+        // 旧世代迟到的收尾若无条件写，会污染新世代：① attach 通道被关 ⇒ 新世代
+        // tun_attach 恒 -1 直到 60s 死线；② done 被置真 ⇒ 新世代 tun_stop 命中
+        // is_done() 快路径直接 0、从不 request_stop ⇒ stop 位永假、probe_running
+        // 无人放——之后所有 prepare 恒 -1，只有进程重启能解。Go 的 done/attachCh
+        // 是每世代 tunRun 自己的通道，无此面；单例槽形态下以 gen 比对等价表达）。
+        if is_current {
+            self.close_attach();
+            let mut done = lock_unpoison(&self.done);
+            if !*done {
+                *done = true;
+                self.done_cv.notify_all();
+            }
         }
     }
 
@@ -197,14 +206,18 @@ mod tests {
         sh.begin_generation(2); // 新世代接管
         sh.probe_running.store(true, Ordering::Release);
         sh.stage.set_if_current(2, TunStage::Preparing, "", "", false);
+        let _rx2 = sh.attach_receiver(); // 新世代注册自己的 attach 接收端
         sh.finish_generation(1); // 旧世代迟到收尾
         assert!(
             sh.probe_running.load(Ordering::Acquire),
             "旧世代收尾不得放新世代的锁"
         );
         assert_eq!(sh.stage.snapshot().stage, TunStage::Preparing);
-        // 但 done 仍发（旧世代自己的收尾事实）
-        assert!(sh.is_done());
+        // 评审 r2-H2：done/attach 也是世代共享面——旧世代迟到收尾**不得**发 done
+        // （否则新世代 tun_stop 命中 is_done() 快路径、request_stop 永不执行）
+        // 也不得关 attach 通道（否则新世代 tun_attach 恒 -1）
+        assert!(!sh.is_done(), "旧世代收尾不得发新世代的 done");
+        assert!(sh.deliver_fd(1), "旧世代收尾不得关新世代的 attach 通道");
     }
 
     /// attach 通道：注册 → 投递 → 收口后迟到投递 false。
@@ -224,7 +237,7 @@ mod tests {
         assert!(!sh.deliver_fd(2), "通道满 = false（调用方按 -1 收）");
     }
 
-    /// wait_done 有界等待：未收尾超时 false；收尾后 Condvar 唤醒 true。
+    /// wait_done 有界等待：未收尾超时 false；当前世代收尾后 Condvar 唤醒 true。
     #[test]
     fn wait_done_bounded() {
         use std::sync::Arc;
@@ -233,6 +246,7 @@ mod tests {
             !sh.wait_done(std::time::Duration::from_millis(50)),
             "未收尾 = 超时 false"
         );
+        sh.begin_generation(1); // done 属世代面——当前世代收尾才发
         let sh2 = Arc::clone(&sh);
         let t = std::thread::spawn(move || {
             std::thread::sleep(std::time::Duration::from_millis(30));

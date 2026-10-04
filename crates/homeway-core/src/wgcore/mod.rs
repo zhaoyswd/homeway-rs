@@ -212,8 +212,19 @@ pub struct TunCounters {
     pub write_bytes: AtomicU64,
     /// App 出站包计数（demand-driven-recovery D1：巡检拍「取走清零」消费）。
     pub out_pkts: std::sync::atomic::AtomicI64,
-    /// 最近出站包时刻（unix nano；0 = 本世代从未有过应用出站）。
+    /// 最近出站包时刻（unix nano；0 = 本世代从未有过应用出站——tunStatusJSON 的
+    /// demand.outboundAt 面）。
     pub last_outbound_ns: AtomicI64,
+    /// 同一时刻的**单调相对读数**（自进程起点的 ns；0 = 从未）——下推器（D4）的
+    /// 时基。评审 r2-H1：单调面与 unix 面分离（曾用 unix ns 换算 Instant，减出
+    /// 56 年前的时刻 ⇒ should_push 恒 false）。
+    pub last_outbound_mono_ns: AtomicI64,
+}
+
+/// 进程单调起点（last_outbound_mono_ns 的基准；懒初始化）。
+fn process_mono_start() -> Instant {
+    static START: std::sync::OnceLock<Instant> = std::sync::OnceLock::new();
+    *START.get_or_init(Instant::now)
 }
 
 /// 引擎内的应用 TUN 源（L3 直通；Go hub 的 appTun 面收窄——栈 B 本就在 Engine 里，
@@ -1146,13 +1157,12 @@ impl Client {
         self.tun_counters.out_pkts.swap(0, Ordering::Relaxed)
     }
 
-    /// 最近一次 App 出站包的时刻（None = 本世代从未——Go LastOutboundAt 的零值形态）。
+    /// 最近一次 App 出站包的时刻（单调 Instant；None = 从未——Go LastOutboundAt
+    /// 的零值形态）。**必须**用 `last_outbound_mono_ns`（单调相对读数）换算——
+    /// 评审 r2-H1：曾用 unix epoch ns 换算，Instant 减出 56 年前 ⇒ D4 恒不触发。
     pub fn last_outbound_at(&self) -> Option<Instant> {
-        let ns = self.tun_counters.last_outbound_ns.load(Ordering::Relaxed);
-        (ns != 0).then(|| {
-            let d = Duration::from_nanos(ns as u64);
-            Instant::now() - d
-        })
+        let mono = self.tun_counters.last_outbound_mono_ns.load(Ordering::Relaxed);
+        (mono != 0).then(|| process_mono_start() + Duration::from_nanos(mono as u64))
     }
 
     /// 最近出站的 unix 毫秒（tunStatusJSON demand.outboundAt 源；0 = 从未）。
@@ -1335,9 +1345,10 @@ fn tun_read_loop(
         counters.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
         // 需求信号：App 出站包到达（demand-driven-recovery D1——只计 App 源）
         counters.out_pkts.fetch_add(1, Ordering::Relaxed);
-        counters
-            .last_outbound_ns
-            .store(now_unix_nanos(), Ordering::Relaxed);
+        let now_unix = now_unix_nanos();
+        let mono = process_mono_start().elapsed().as_nanos() as i64;
+        counters.last_outbound_ns.store(now_unix, Ordering::Relaxed);
+        counters.last_outbound_mono_ns.store(mono, Ordering::Relaxed);
         if cmd_tx.send(Cmd::TunPacket(pkt)).is_err() {
             return; // driver 已死
         }

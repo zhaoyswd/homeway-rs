@@ -443,7 +443,15 @@ impl TunExecutor for TunnelExec {
     fn runner(&self) -> Option<RunnerIn> {
         let run = self.gen_run()?;
         let (rd, wr) = run.current_client().tun_stats();
-        let link = lock_unpoison(&run.link).clone()?;
+        // link 兜底 via="none"（评审 r2-我-1：暖机软失败期 link 未写过 ⇒ 整块 runner
+        // 消失 ⇒ exitIp/bridgeAuth 缺 ⇒ 扩展「拒绝建接口（DNS 将无处可去）」——Go 的
+        // 软失败自愈路径在 Rust 变启动失败。runner 块只要求世代在场，link 键恒在）
+        let link = lock_unpoison(&run.link).clone().unwrap_or(LinkIn {
+            via: "none".into(),
+            ep: String::new(),
+            rtt_ms: 0,
+            at_ms: 0,
+        });
         let bridge = lock_unpoison(&run.bridge)
             .as_ref()
             .map(|b| {
@@ -805,10 +813,12 @@ fn gen_loop(
         std::thread::sleep(Duration::from_millis(200));
     }
     (logf)("收到停止信号，正在回收（client/stack）");
-    // 巡检/pusher/stats 随 stop 位退出（join 有界——卡住的按分离处理）
+    // 巡检/pusher/stats 随 stop 位退出（join 有界——**总预算 2s**，与 STOP_WAIT=3s
+    // 留 1s 给桥停/client 收尾；评审 r2-H3：原每线程 2s 总 6s 恒超预算 ⇒ tun_stop
+    // 常态化 -2。分片等待改造后三者 ≤~300ms 即退，2s 只是卡死兜底）
+    let join_deadline = Instant::now() + Duration::from_secs(2);
     for h in [patrol_handle, pusher_handle, stats_handle].into_iter().flatten() {
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while !h.is_finished() && Instant::now() < deadline {
+        while !h.is_finished() && Instant::now() < join_deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
         if h.is_finished() {
@@ -1133,13 +1143,23 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
         if run.stop.load(Ordering::Acquire) {
             return;
         }
-        std::thread::sleep(PUSHER_TICK);
+        // 分片等待（评审 r2-H3：整段 sleep(1s) 一样挡收工；100ms 片界查 stop）
+        let next = Instant::now() + PUSHER_TICK;
+        while Instant::now() < next {
+            if run.stop.load(Ordering::Acquire) {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(100).min(next.saturating_duration_since(Instant::now())));
+        }
         let client = run.current_client();
         let snap = client.snapshot();
         if snap.rx != last_rx {
             last_rx = snap.rx;
             recv_at = Some(Instant::now());
         }
+        // 单调时基（评审 r2-H1：last_outbound_at 返回的 Instant 曾由 unix epoch ns
+        // 换算——减出 56 年前的时刻 ⇒ should_push 恒 false、D4 整条静默失效。现改
+        // TunCounters 的相对单调读数，unix ns 只留给 JSON 面）
         let out_at = client.last_outbound_at();
         let has_fresh_local_err = snap.last_local_send_err.is_some_and(|t| t.elapsed() < NOISE_WINDOW);
         let since = last_push.map(|t| t.elapsed());
@@ -1164,9 +1184,15 @@ fn stats_loop(run: Arc<GenRun>, stats_secs: i64, diag_fd_secs: i64) {
     let mut base_done = false;
     let mut last_diag: i64 = 0;
     loop {
-        std::thread::sleep(tick);
-        if run.stop.load(Ordering::Acquire) {
-            return;
+        // 分片等待（评审 r2-H3：整段 sleep(tick)〔默认 60s〕让收工 join 白烧满预算
+        // ⇒ tun_stop 常态化 -2 强制放锁——Go 统计 goroutine 的 select{tick, stop} 同义）
+        let deadline = Instant::now() + tick;
+        while Instant::now() < deadline {
+            if run.stop.load(Ordering::Acquire) {
+                return;
+            }
+            let nap = Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now()));
+            std::thread::sleep(nap);
         }
         elapsed += stats_secs.max(STATS_SECS_MIN);
         let (rd, wr) = run.current_client().tun_stats();
