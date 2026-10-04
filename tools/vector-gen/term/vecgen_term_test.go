@@ -169,6 +169,16 @@ func TestVecgenTermResponder(t *testing.T) {
 		{name: "mok_query_on", setup: "\x1b[>4;2m", query: "\x1b[?4m"},
 		// 同批多查询（分片语义：一次 Write 多次 sink 调用）
 		{name: "batch_da1_dsr", query: "\x1b[c\x1b[6n"},
+		// 门一评审 F2：可见性查询 CSI ? 998 n（ghostty sendVisibilityReport，write_pty 直答）
+		{name: "csi998n", query: "\x1b[?998n"},
+		// 门一评审 F3：DECRQSS（DCS $q，vim 用）与 XTGETTCAP（DCS +q，tmux/ncurses 用）
+		{name: "decrqss_sgr", query: "\x1bP$qm\x1b\\"},
+		{name: "decrqss_decscusr", query: "\x1bP$q q\x1b\\"},
+		{name: "decrqss_unknown", query: "\x1bP$qzz\x1b\\"},
+		{name: "xtgettcap_TN", query: "\x1bP+q544e\x1b\\"},
+		{name: "xtgettcap_unknown", query: "\x1bP+q6162\x1b\\"}, // "ab"
+		// 门一评审 F4：mode 2048（in-band size reports）set 即报一次尺寸
+		{name: "csi2048_set_reports_size", query: "\x1b[?2048h"},
 	}
 	out := make([]vecResponderCase, 0, len(cases)*2+4)
 	for _, c := range cases {
@@ -316,6 +326,9 @@ func TestVecgenTermKeyenc(t *testing.T) {
 		{"kitty31", "\x1b[=31u"},
 		{"kitty_131", "\x1b[=1u\x1b[=31u"},          // 重设为 31（set 全量替换语义）
 		{"kitty_push_pop", "\x1b[>15u\x1b[<1u"},     // push 15 → pop 1 → 回默认 0
+		// 门一评审 F5：mok 复位形态（`CSI > 4 m` 无子参——复位回 legacy；键编码须回 CSI u）
+		{"mok2_reset", "\x1b[>4;2m\x1b[>4m"},
+		{"mok2_zero", "\x1b[>4;2m\x1b[>4;0m"},
 	}
 
 	// 通用采样集：每个模式都跑（legacy/kitty 分叉全覆盖）

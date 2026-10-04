@@ -317,6 +317,53 @@
       ]
     },
     {
+      "name": "csi998n",
+      "query_hex": "1b5b3f3939386e",
+      "response_hex": "1b5b3f3939393b316e",
+      "chunks": [
+        "1b5b3f3939393b316e"
+      ]
+    },
+    {
+      "name": "decrqss_sgr",
+      "query_hex": "1b5024716d1b5c",
+      "response_hex": "1b50312472306d1b5c",
+      "chunks": [
+        "1b50312472306d1b5c"
+      ]
+    },
+    {
+      "name": "decrqss_decscusr",
+      "query_hex": "1b50247120711b5c",
+      "response_hex": "1b503124723220711b5c",
+      "chunks": [
+        "1b503124723220711b5c"
+      ]
+    },
+    {
+      "name": "decrqss_unknown",
+      "query_hex": "1b5024717a7a1b5c",
+      "response_hex": "1b503024721b5c",
+      "chunks": [
+        "1b503024721b5c"
+      ]
+    },
+    {
+      "name": "xtgettcap_TN",
+      "query_hex": "1b502b71353434651b5c",
+      "response_hex": ""
+    },
+    {
+      "name": "xtgettcap_unknown",
+      "query_hex": "1b502b71363136321b5c",
+      "response_hex": ""
+    },
+    {
+      "name": "csi2048_set_reports_size",
+      "query_hex": "1b5b3f3230343868",
+      "response_hex": ""
+    },
+    {
       "name": "osc10_theme",
       "query_hex": "1b5d31303b3f07",
       "response_hex": "1b5d31303b7267623a313131312f323232322f3333333307",

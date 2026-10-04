@@ -62,6 +62,8 @@
     "kitty_131": "1b5b3d31751b5b3d333175",
     "kitty_push_pop": "1b5b3e3135751b5b3c3175",
     "mok2": "1b5b3e343b326d",
+    "mok2_reset": "1b5b3e343b326d1b5b3e346d",
+    "mok2_zero": "1b5b3e343b326d1b5b3e343b306d",
     "plain": ""
   },
   "cases": [
@@ -3758,6 +3760,408 @@
     },
     {
       "mode": "kitty_push_pop",
+      "name": "a#18",
+      "event": {
+        "key": "a",
+        "action": 2,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "mok2_reset",
+      "name": "a#00",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "mok2_reset",
+      "name": "a#01",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 2,
+        "text": "\u0001"
+      },
+      "out_hex": "1b5b313b3575"
+    },
+    {
+      "mode": "mok2_reset",
+      "name": "a#02",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 1,
+        "text": "A"
+      },
+      "out_hex": "41"
+    },
+    {
+      "mode": "mok2_reset",
+      "name": "a#03",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 4,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "mok2_reset",
+      "name": "a#04",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 6,
+        "text": "\u0001"
+      },
+      "out_hex": "1b5b313b3775"
+    },
+    {
+      "mode": "mok2_reset",
+      "name": "enter#05",
+      "event": {
+        "key": "enter",
+        "action": 1,
+        "mods": 0,
+        "text": "\r"
+      },
+      "out_hex": "0d"
+    },
+    {
+      "mode": "mok2_reset",
+      "name": "tab#06",
+      "event": {
+        "key": "tab",
+        "action": 1,
+        "mods": 0,
+        "text": "\t"
+      },
+      "out_hex": "09"
+    },
+    {
+      "mode": "mok2_reset",
+      "name": "backspace#07",
+      "event": {
+        "key": "backspace",
+        "action": 1,
+        "mods": 0,
+        "text": ""
+      },
+      "out_hex": "7f"
+    },
+    {
+      "mode": "mok2_reset",
+      "name": "escape#08",
+      "event": {
+        "key": "escape",
+        "action": 1,
+        "mods": 0,
+        "text": "\u001b"
+      },
+      "out_hex": "1b"
+    },
+    {
+      "mode": "mok2_reset",
+      "name": "arrow_up#09",
+      "event": {
+        "key": "arrow_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b41"
+    },
+    {
+      "mode": "mok2_reset",
+      "name": "arrow_left#10",
+      "event": {
+        "key": "arrow_left",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b313b3544"
+    },
+    {
+      "mode": "mok2_reset",
+      "name": "arrow_right#11",
+      "event": {
+        "key": "arrow_right",
+        "action": 1,
+        "mods": 1
+      },
+      "out_hex": "1b5b313b3243"
+    },
+    {
+      "mode": "mok2_reset",
+      "name": "f1#12",
+      "event": {
+        "key": "f1",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b4f50"
+    },
+    {
+      "mode": "mok2_reset",
+      "name": "f5#13",
+      "event": {
+        "key": "f5",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b31353b357e"
+    },
+    {
+      "mode": "mok2_reset",
+      "name": "delete#14",
+      "event": {
+        "key": "delete",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b337e"
+    },
+    {
+      "mode": "mok2_reset",
+      "name": "home#15",
+      "event": {
+        "key": "home",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b48"
+    },
+    {
+      "mode": "mok2_reset",
+      "name": "page_up#16",
+      "event": {
+        "key": "page_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b357e"
+    },
+    {
+      "mode": "mok2_reset",
+      "name": "a#17",
+      "event": {
+        "key": "a",
+        "action": 0,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "mok2_reset",
+      "name": "a#18",
+      "event": {
+        "key": "a",
+        "action": 2,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "mok2_zero",
+      "name": "a#00",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "mok2_zero",
+      "name": "a#01",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 2,
+        "text": "\u0001"
+      },
+      "out_hex": "1b5b313b3575"
+    },
+    {
+      "mode": "mok2_zero",
+      "name": "a#02",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 1,
+        "text": "A"
+      },
+      "out_hex": "41"
+    },
+    {
+      "mode": "mok2_zero",
+      "name": "a#03",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 4,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "mok2_zero",
+      "name": "a#04",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 6,
+        "text": "\u0001"
+      },
+      "out_hex": "1b5b313b3775"
+    },
+    {
+      "mode": "mok2_zero",
+      "name": "enter#05",
+      "event": {
+        "key": "enter",
+        "action": 1,
+        "mods": 0,
+        "text": "\r"
+      },
+      "out_hex": "0d"
+    },
+    {
+      "mode": "mok2_zero",
+      "name": "tab#06",
+      "event": {
+        "key": "tab",
+        "action": 1,
+        "mods": 0,
+        "text": "\t"
+      },
+      "out_hex": "09"
+    },
+    {
+      "mode": "mok2_zero",
+      "name": "backspace#07",
+      "event": {
+        "key": "backspace",
+        "action": 1,
+        "mods": 0,
+        "text": ""
+      },
+      "out_hex": "7f"
+    },
+    {
+      "mode": "mok2_zero",
+      "name": "escape#08",
+      "event": {
+        "key": "escape",
+        "action": 1,
+        "mods": 0,
+        "text": "\u001b"
+      },
+      "out_hex": "1b"
+    },
+    {
+      "mode": "mok2_zero",
+      "name": "arrow_up#09",
+      "event": {
+        "key": "arrow_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b41"
+    },
+    {
+      "mode": "mok2_zero",
+      "name": "arrow_left#10",
+      "event": {
+        "key": "arrow_left",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b313b3544"
+    },
+    {
+      "mode": "mok2_zero",
+      "name": "arrow_right#11",
+      "event": {
+        "key": "arrow_right",
+        "action": 1,
+        "mods": 1
+      },
+      "out_hex": "1b5b313b3243"
+    },
+    {
+      "mode": "mok2_zero",
+      "name": "f1#12",
+      "event": {
+        "key": "f1",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b4f50"
+    },
+    {
+      "mode": "mok2_zero",
+      "name": "f5#13",
+      "event": {
+        "key": "f5",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b31353b357e"
+    },
+    {
+      "mode": "mok2_zero",
+      "name": "delete#14",
+      "event": {
+        "key": "delete",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b337e"
+    },
+    {
+      "mode": "mok2_zero",
+      "name": "home#15",
+      "event": {
+        "key": "home",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b48"
+    },
+    {
+      "mode": "mok2_zero",
+      "name": "page_up#16",
+      "event": {
+        "key": "page_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b357e"
+    },
+    {
+      "mode": "mok2_zero",
+      "name": "a#17",
+      "event": {
+        "key": "a",
+        "action": 0,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "mok2_zero",
       "name": "a#18",
       "event": {
         "key": "a",
