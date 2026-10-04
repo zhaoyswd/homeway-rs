@@ -753,7 +753,7 @@ fn driver_loop(
         for fd in &leg_fds {
             pollfds.push(libc::pollfd { fd: *fd, events: libc::POLLIN, revents: 0 });
         }
-        let n = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as u32, 5) };
+        let n = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 5) };
         if n < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() != std::io::ErrorKind::Interrupted {

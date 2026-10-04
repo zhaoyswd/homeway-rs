@@ -381,7 +381,7 @@ impl Relay {
             if next_stats > now {
                 timeout = timeout.min(next_stats.duration_since(now).as_millis() as i32);
             }
-            let n = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as u32, timeout) };
+            let n = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout) };
             if n < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() != io::ErrorKind::Interrupted {

@@ -200,7 +200,9 @@ pub fn pin_socket_to_iface(fd: std::os::fd::RawFd, index: u32, name: &str) -> io
         }
         #[cfg(target_os = "linux")]
         {
-            let cname = std::ffi::CString::new(name).map_err(|_| EgressError::IfaceNameNul)?;
+            let _ = index; // linux 走 SO_BINDTODEVICE（按名），index 不参与
+            let cname = std::ffi::CString::new(name)
+                .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "网卡名含 NUL"))?;
             let r = libc::setsockopt(
                 fd,
                 libc::SOL_SOCKET,

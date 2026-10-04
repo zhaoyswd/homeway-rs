@@ -147,7 +147,7 @@ impl Worker {
                 }
                 pollfds.push(libc::pollfd { fd: io.fd, events: ev, revents: 0 });
             }
-            let n = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as u32, 1000) };
+            let n = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, 1000) };
             if n < 0 && std::io::Error::last_os_error().kind() != io::ErrorKind::Interrupted {
                 // poll 硬错误：清场退出（不应发生）
                 break;
