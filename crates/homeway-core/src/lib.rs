@@ -25,6 +25,7 @@ pub mod session;
 pub mod speedtest;
 pub mod speedtest_server;
 pub mod status_json;
+pub mod term;
 pub mod token;
 pub mod tunnel_addr;
 pub mod wgcore;

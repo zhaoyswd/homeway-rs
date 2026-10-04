@@ -1,0 +1,1017 @@
+//! vt — 会话屏态的仿真底座（alacritty_terminal 0.26 适配层，R6 6b）。
+//!
+//! 对齐 Go `pkg/term/vt`（libghostty-vt cgo 绑定）的**读面**：视口网格、脏行、光标、
+//! 模式位、回滚条、镜像窗口、绝对行号拉取。差异与归一化口径全部收在本文件
+//! （设计 D-1..D-7，`docs/reviews/R6-design.md` §一）：
+//!
+//! - **坐标系**：alacritty `Line(0)` = 视口顶（负数进回滚）——与 Go render state 同向，
+//!   换算只发生在「绝对行号 ⇔ Line」一处（`line_of_abs`）。
+//! - **cell 归一化**：alacritty 空白格 = `' '` + Named 前景/背景 + 无样式位 ⇒ 归一化为
+//!   Go 的「无字素空白格」（symbol 空、颜色 None）；zerowidth 组合字符并进 symbol。
+//! - **模式位缺口**：X10 鼠标（DEC 9）/URXVT（1015）/光标闪烁独立位无对应 ⇒ 恒 false
+//!   （D-4/D-7 登记）；kitty 键盘协议五位从 TermMode 拼装。
+//! - **damage**：`Full`（滚动常态）⇒ 全视口行；`Partial` ⇒ 标脏行（含光标行 = 安全超集，
+//!   D-6）。`reset_damage` 由调用方在载荷成功下发后调（乐观消费 + 全量兜底，同 Go）。
+//!
+//! 并发：本类型不带锁——由会话层的会话锁串行（同 Go 的 sessionVT 纪律）。
+
+use alacritty_terminal::event::{EventListener, VoidListener};
+use alacritty_terminal::grid::Dimensions;
+use alacritty_terminal::index::{Column, Line, Point};
+use alacritty_terminal::term::cell::{Cell as AlacCell, Flags as AlacFlags};
+use alacritty_terminal::term::{Config, Term, TermDamage, TermMode};
+use alacritty_terminal::vte::ansi::{
+    self as alac_ansi, Color as AlacColor, CursorShape as AlacCursorShape, NamedColor,
+};
+
+/// 回滚行数上限默认值（Go `vt.DefaultScrollbackLines` 同值；env
+/// `HOMEWAY_TERM_SCROLLBACK_LINES` 由会话层注入）。
+pub const DEFAULT_SCROLLBACK_LINES: usize = 10_000;
+
+/// 光标形状（wire 值 = Go `vt.CursorShape`）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CursorShape {
+    #[default]
+    Bar = 0,
+    Block = 1,
+    Underline = 2,
+    BlockHollow = 3,
+}
+
+/// 光标快照（视口坐标，回滚偏移已折算——本层 display_offset 恒 0）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Cursor {
+    pub x: u16,
+    pub y: u16,
+    pub visible: bool,
+    pub blinking: bool,
+    /// ghostty 的密码输入推断位：alacritty 无对应面 ⇒ 恒 false（D-7）。
+    pub password: bool,
+    pub wide_tail: bool,
+    pub shape: CursorShape,
+}
+
+/// 回滚条（行号空间 = 绝对行 [0, total)，视口占 [offset, offset+len)）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Scrollbar {
+    pub total: u64,
+    pub offset: u64,
+    pub len: u64,
+}
+
+impl Scrollbar {
+    /// 视口是否贴底（= 跟随输出）。
+    pub fn at_bottom(&self) -> bool {
+        self.offset + self.len >= self.total
+    }
+}
+
+/// 当前活动屏。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Screen {
+    #[default]
+    Primary = 0,
+    Alternate = 1,
+}
+
+/// 模式位快照（字段面对齐 Go `vt.Modes`；注释给 DEC/ANSI 模式号）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct Modes {
+    pub screen: Screen,
+
+    pub cursor_keys_app: bool,  // DEC 1
+    pub keypad_app: bool,       // DEC 66
+    pub bracketed_paste: bool,  // DEC 2004
+    pub focus_events: bool,     // DEC 1004
+
+    pub mouse_x10: bool,   // DEC 9（alacritty 无位 ⇒ 恒 false，D-4）
+    pub mouse_normal: bool, // DEC 1000
+    pub mouse_button: bool, // DEC 1002
+    pub mouse_any: bool,    // DEC 1003
+    pub mouse_sgr: bool,    // DEC 1006
+    pub mouse_utf8: bool,   // DEC 1005
+    pub mouse_urxvt: bool,  // DEC 1015（alacritty 无位 ⇒ 恒 false，D-4）
+    pub alt_scroll: bool,   // DEC 1007
+
+    pub cursor_visible: bool, // DEC 25
+    pub cursor_blink: bool,   // DEC 12（按光标样式带不带 blink 位近似）
+
+    pub insert: bool,     // ANSI 4
+    pub origin: bool,     // DEC 6
+    pub wraparound: bool, // DEC 7
+
+    /// kitty 键盘协议标志（位值 = 协议位：1/2/4/8/16）。
+    pub kitty_flags: u8,
+    /// xterm modifyOtherKeys mode 2（vendor 补丁 0002 暴露的查询面）。
+    /// alacritty 不跟踪 ⇒ 由应答器侧记账后经 [`SessionVt::set_modify_other_keys`] 注入。
+    pub modify_other_keys: bool,
+}
+
+impl Modes {
+    /// 是否有任何鼠标上报模式激活（含 X10）。
+    pub fn mouse_tracking(&self) -> bool {
+        self.mouse_x10 || self.mouse_normal || self.mouse_button || self.mouse_any
+    }
+}
+
+/// 颜色来源（cell 契约：调色板索引或 RGB，由客户端按主题解析）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Color {
+    #[default]
+    None,
+    Palette(u8),
+    Rgb(u8, u8, u8),
+}
+
+/// 属性位（u16 wire 掩码；下划线样式占 bit 8..11）。
+pub mod attr {
+    pub const BOLD: u16 = 1 << 0;
+    pub const ITALIC: u16 = 1 << 1;
+    pub const FAINT: u16 = 1 << 2;
+    pub const BLINK: u16 = 1 << 3;
+    pub const INVERSE: u16 = 1 << 4;
+    pub const INVISIBLE: u16 = 1 << 5;
+    pub const STRIKETHROUGH: u16 = 1 << 6;
+    pub const OVERLINE: u16 = 1 << 7; // alacritty 无位 ⇒ 不可达（D-5）
+    pub const UNDERLINE_SHIFT: u16 = 8;
+    pub const UNDERLINE_MASK: u16 = 0xf << UNDERLINE_SHIFT;
+}
+
+/// 一个网格单元（wire cell 契约；symbol = 字素簇 UTF-8，空格/无文本为空串）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Cell {
+    pub symbol: String,
+    /// 显示宽度：1 窄、2 宽、0 = 占位格（不渲染）。编码侧由「symbol 空」派生，此处保留
+    /// 语义字段供适配层与测试直读。
+    pub width: u8,
+    /// 差分跳过位（宽字符尾/软折行占位）。
+    pub skip: bool,
+    pub fg: Color,
+    pub bg: Color,
+    pub attr: u16,
+}
+
+/// 一行（视口坐标 Y，顶起 0）。
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct Row {
+    pub y: u16,
+    pub dirty: bool,
+    pub cells: Vec<Cell>,
+}
+
+/// 脏度。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Dirty {
+    None,
+    Partial,
+    Full,
+}
+
+/// 一个会话的服务端仿真器。
+pub struct SessionVt {
+    term: Term<VoidListener>,
+    processor: alac_ansi::Processor,
+    cols: usize,
+    rows: usize,
+    modify_other_keys: bool,
+    /// 鼠标上报模式独立记账（ghostty 语义：1000/1002/1003 各自独立置/复位；
+    /// alacritty 把三者做成互斥单值——对齐 golden 模式位列在此自管）。
+    mouse_flags: u8,
+}
+
+impl Default for SessionVt {
+    fn default() -> Self {
+        SessionVt::new(80, 24, DEFAULT_SCROLLBACK_LINES).expect("80x24 合法")
+    }
+}
+
+/// 会话级事件接收方（EventListener 面）。term 服务的剪贴板/写回应答事件由 6c/6f 接线；
+/// 底座阶段用空实现（VoidListener 同义，但保留类型以便后续替换）。
+#[derive(Default)]
+pub struct Sink;
+
+impl EventListener for Sink {
+    fn send_event(&self, _event: alacritty_terminal::event::Event) {}
+}
+
+impl SessionVt {
+    /// 建 cols×rows 终端，回滚行数上限 scrollback（0 ⇒ 默认 10000）。
+    pub fn new(cols: u16, rows: u16, scrollback: usize) -> Result<Self, String> {
+        if cols == 0 || rows == 0 {
+            return Err(format!("vt: 尺寸非法 {cols}x{rows}"));
+        }
+        let scrollback = if scrollback == 0 { DEFAULT_SCROLLBACK_LINES } else { scrollback };
+        let config = Config {
+            scrolling_history: scrollback,
+            // kitty 协议的模式栈跟踪总开关：不开则 set/push/pop/query 全被忽略。
+            kitty_keyboard: true,
+            // OSC 52 双向（写=CLIPBOARD 帧转发、读=缓存应答；OnlyCopy 会拒掉读方向）。
+            osc52: alacritty_terminal::term::Osc52::CopyPaste,
+            ..Config::default()
+        };
+        let (cols, rows) = (cols as usize, rows as usize);
+        let dims = SimpleDims { cols, rows };
+        Ok(SessionVt {
+            term: Term::new(config, &dims, VoidListener),
+            processor: alac_ansi::Processor::new(),
+            cols,
+            rows,
+            modify_other_keys: false,
+            mouse_flags: 0,
+        })
+    }
+
+    /// 把一批 PTY 输出喂进 vt（屏态唯一入口）。经 [`TermProbe`] 双面分发器：
+    /// 查询应答（DA/DSR/DECRQM/OSC 颜色）与 ghostty 兼容位在分发器上拦截，其余全量委托。
+    pub fn write(&mut self, p: &[u8]) {
+        if p.is_empty() {
+            return;
+        }
+        let mut probe = TermProbe {
+            term: &mut self.term,
+            modify_other_keys: &mut self.modify_other_keys,
+            mouse_flags: &mut self.mouse_flags,
+        };
+        self.processor.advance(&mut probe, p);
+    }
+
+    /// 改尺寸（含主屏回滚重排；备用屏不重排——alacritty 语义与 ghostty 一致）。
+    /// 尺寸未变时空操作。
+    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String> {
+        if cols == 0 || rows == 0 {
+            return Err(format!("vt: 尺寸非法 {cols}x{rows}"));
+        }
+        let (cols, rows) = (cols as usize, rows as usize);
+        if self.cols == cols && self.rows == rows {
+            return Ok(());
+        }
+        self.term.resize(SimpleDims { cols, rows });
+        self.cols = cols;
+        self.rows = rows;
+        Ok(())
+    }
+
+    /// 当前网格尺寸。
+    pub fn size(&self) -> (u16, u16) {
+        (self.cols as u16, self.rows as u16)
+    }
+
+    /// 应答器侧的 modifyOtherKeys 记账回填（`CSI > 4;N m` 的解析在 6c 接线）。
+    pub fn set_modify_other_keys(&mut self, on: bool) {
+        self.modify_other_keys = on;
+    }
+
+    /// 模式位快照。
+    pub fn modes(&self) -> Modes {
+        let mode = self.term.mode();
+        let mut kitty = 0u8;
+        if mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
+            kitty |= 1;
+        }
+        if mode.contains(TermMode::REPORT_EVENT_TYPES) {
+            kitty |= 2;
+        }
+        if mode.contains(TermMode::REPORT_ALTERNATE_KEYS) {
+            kitty |= 4;
+        }
+        if mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) {
+            kitty |= 8;
+        }
+        if mode.contains(TermMode::REPORT_ASSOCIATED_TEXT) {
+            kitty |= 16;
+        }
+        let style = self.term.cursor_style();
+        Modes {
+            screen: if mode.contains(TermMode::ALT_SCREEN) {
+                Screen::Alternate
+            } else {
+                Screen::Primary
+            },
+            cursor_keys_app: mode.contains(TermMode::APP_CURSOR),
+            keypad_app: mode.contains(TermMode::APP_KEYPAD),
+            bracketed_paste: mode.contains(TermMode::BRACKETED_PASTE),
+            focus_events: mode.contains(TermMode::FOCUS_IN_OUT),
+            mouse_x10: false,
+            mouse_normal: self.mouse_flags & 1 != 0,
+            mouse_button: self.mouse_flags & 2 != 0,
+            mouse_any: self.mouse_flags & 4 != 0,
+            mouse_sgr: mode.contains(TermMode::SGR_MOUSE),
+            mouse_utf8: mode.contains(TermMode::UTF8_MOUSE),
+            mouse_urxvt: false,
+            alt_scroll: mode.contains(TermMode::ALTERNATE_SCROLL),
+            cursor_visible: mode.contains(TermMode::SHOW_CURSOR),
+            cursor_blink: style.blinking,
+            insert: mode.contains(TermMode::INSERT),
+            origin: mode.contains(TermMode::ORIGIN),
+            wraparound: mode.contains(TermMode::LINE_WRAP),
+            kitty_flags: kitty,
+            modify_other_keys: self.modify_other_keys,
+        }
+    }
+
+    /// 消费脏状态并返回全局脏度（`Full` = 滚动/清屏等常态，视口全行脏）。
+    pub fn update(&mut self) -> Dirty {
+        match self.term.damage() {
+            TermDamage::Full => Dirty::Full,
+            TermDamage::Partial(iter) => {
+                if iter.into_iter().next().is_some() {
+                    Dirty::Partial
+                } else {
+                    Dirty::None
+                }
+            }
+        }
+    }
+
+    /// 取本拍需要重绘的视口行（`Full` 时 = 全视口行）。**必须先 [`SessionVt::update`]**。
+    /// 只在「构建载荷」时调用；下发成功后 [`SessionVt::clean`]。
+    pub fn dirty_rows(&mut self) -> Vec<Row> {
+        match self.term.damage() {
+            TermDamage::Full => self.rows(),
+            TermDamage::Partial(iter) => {
+                let damaged: std::collections::HashSet<usize> =
+                    iter.into_iter().map(|l| l.line).collect();
+                self.rows_in(|y| damaged.contains(&y))
+            }
+        }
+    }
+
+    /// 全部视口行（快照路径；隐含消费脏状态——调用方随后本就要发全量并 clean）。
+    pub fn rows(&mut self) -> Vec<Row> {
+        let _ = self.term.damage(); // 拉到最新（同 Go Rows 的隐含 Update）
+        self.rows_in(|_| true)
+    }
+
+    /// 在载荷成功下发后消费脏标记。
+    pub fn clean(&mut self) {
+        self.term.reset_damage();
+    }
+
+    fn rows_in(&self, keep: impl Fn(usize) -> bool) -> Vec<Row> {
+        let grid = self.term.grid();
+        let mut out = Vec::new();
+        for y in 0..self.rows {
+            if !keep(y) {
+                continue;
+            }
+            let line = Line(y as i32);
+            let row = &grid[line];
+            let mut cells = Vec::with_capacity(self.cols);
+            for x in 0..self.cols {
+                cells.push(cell_of(&row[Column(x)]));
+            }
+            out.push(Row { y: y as u16, dirty: false, cells });
+        }
+        out
+    }
+
+    /// 光标快照（视口坐标）。
+    pub fn cursor(&mut self) -> Cursor {
+        let grid = self.term.grid();
+        let point: Point = grid.cursor.point; // 视口内（display_offset 恒 0）
+        let style = self.term.cursor_style();
+        let wide_tail = point.column.0 > 0
+            && grid[point.line][Column(point.column.0 - 1)]
+                .flags
+                .contains(AlacFlags::WIDE_CHAR);
+        let cur_cell = &grid[point.line][point.column];
+        Cursor {
+            x: point.column.0 as u16,
+            y: point.line.0 as u16,
+            visible: self.term.mode().contains(TermMode::SHOW_CURSOR),
+            blinking: style.blinking,
+            password: false,
+            wide_tail: wide_tail && cur_cell.c == ' ',
+            shape: match style.shape {
+                alacritty_terminal::vte::ansi::CursorShape::Block => CursorShape::Block,
+                alacritty_terminal::vte::ansi::CursorShape::Underline => CursorShape::Underline,
+                alacritty_terminal::vte::ansi::CursorShape::Beam => CursorShape::Bar,
+                _ => CursorShape::Block,
+            },
+        }
+    }
+
+    /// 回滚条状态（服务端不滚视口 ⇒ 恒贴底；offset/total 语义同 Go）。
+    pub fn scrollbar(&self) -> Scrollbar {
+        let total = self.term.total_lines() as u64;
+        let len = self.term.screen_lines() as u64;
+        Scrollbar { total, offset: total.saturating_sub(len), len }
+    }
+
+    /// 视口上方最多 `above` 行的回滚镜像窗口（最旧在前；备用屏/无回滚返回空）。
+    pub fn mirror_rows(&self, above: usize) -> Vec<Row> {
+        if above == 0 || self.modes_static().screen == Screen::Alternate {
+            return Vec::new();
+        }
+        let sb = self.scrollbar();
+        if sb.offset == 0 {
+            return Vec::new();
+        }
+        let start = sb.offset.saturating_sub(above as u64);
+        self.abs_rows(start as usize, (sb.offset - start) as usize)
+    }
+
+    /// 绝对行号区间 [from, from+count) 的行（FETCH-ROWS 应答；越界自动截断）。
+    pub fn rows_at(&self, from: u64, count: usize) -> Vec<Row> {
+        if count == 0 || self.modes_static().screen == Screen::Alternate {
+            return Vec::new();
+        }
+        let total = self.scrollbar().total;
+        if from >= total {
+            return Vec::new();
+        }
+        let end = (from + count as u64).min(total);
+        self.abs_rows(from as usize, (end - from) as usize)
+    }
+
+    fn modes_static(&self) -> Modes {
+        // 供镜像/拉取路径的备用屏判定（不取 cursor_style，避免可变借用）。
+        let mode = self.term.mode();
+        Modes {
+            screen: if mode.contains(TermMode::ALT_SCREEN) {
+                Screen::Alternate
+            } else {
+                Screen::Primary
+            },
+            ..Modes::default()
+        }
+    }
+
+    fn abs_rows(&self, from: usize, count: usize) -> Vec<Row> {
+        let grid = self.term.grid();
+        let total = self.term.total_lines();
+        let cols = self.cols;
+        let mut out = Vec::with_capacity(count);
+        for i in 0..count {
+            let abs = from + i;
+            if abs >= total {
+                break;
+            }
+            // 绝对行 a ⇔ Line(a - total)：0 = 最旧回滚行，total-1 = 视口底行。
+            let line = Line(abs as i32 - total as i32);
+            let row = &grid[line];
+            let mut cells = Vec::with_capacity(cols);
+            for x in 0..cols {
+                cells.push(cell_of(&row[Column(x)]));
+            }
+            // 镜像/拉取行的 y 是**视口相对值**（服务端发的镜像 y 从视口顶起算——与 Go
+            // 一致：客户端按返回顺序重排，不拿 y 当绝对行号）。
+            out.push(Row { y: 0, dirty: false, cells });
+        }
+        out
+    }
+
+    /// 当前视口纯文本（检测引擎输入口径：跳占位格、空符号补空格、行尾裁空白）。
+    pub fn screen_text(&mut self) -> String {
+        let rows = self.rows();
+        let lines: Vec<String> = rows
+            .iter()
+            .map(|r| {
+                let mut s = String::with_capacity(r.cells.len());
+                for c in &r.cells {
+                    if c.skip {
+                        continue;
+                    }
+                    if c.symbol.is_empty() {
+                        s.push(' ');
+                    } else {
+                        s.push_str(&c.symbol);
+                    }
+                }
+                s.trim_end_matches([' ', '\t', '\u{a0}']).to_string()
+            })
+            .collect();
+        lines.join("\n")
+    }
+}
+
+/// alacritty cell → wire cell（归一化见模块头）。
+fn cell_of(c: &AlacCell) -> Cell {
+    let mut symbol = String::new();
+    // width = **解码语义宽度**（Go goldenStyleText 的消费口径）：占位格/带样式空格 → 0
+    // （客户端不画字形），其余 → 1（wire 不编宽度——宽字符的显示宽度由 skip 尾格表达）。
+    let mut width = 1u8;
+    let mut skip = false;
+    if c.flags.contains(AlacFlags::WIDE_CHAR_SPACER)
+        || c.flags.contains(AlacFlags::LEADING_WIDE_CHAR_SPACER)
+    {
+        width = 0;
+        skip = true;
+    }
+
+    // 空白格归一化（V-1 实测定调，golden 逐格对拍裁决）：
+    //   - 任何空格（含带样式）与占位格 ⇒ symbol 空（ghostty 的字素簇形态：未写格/
+    //     带样式空格/占位格均无字素；「显式无样式空格」ghostty 保留 " "，但 alacritty
+    //     无法区分显式空格与未写格——两者渲染/样式完全一致，编码侧统一走空白格，
+    //     登记 D-13）；
+    //   - 非空格字符 ⇒ symbol = 字符 + zerowidth 组合字符。
+    // wire 的宽度不编（Go appendCell 同款），「解码语义宽度」由消费方从 symbol 推。
+    let is_space = c.c == ' ' && c.zerowidth().is_none_or(|z| z.is_empty());
+    if is_space {
+        // 空格（显式或未写）一律无字素；**带样式的空格**宽度记 0（Go codecCell+decodeCell
+        // 口径），无样式空格（= blankRun 族）宽度 1。
+        let styled = !c.flags.is_empty()
+            || c.fg != AlacColor::Named(NamedColor::Foreground)
+            || c.bg != AlacColor::Named(NamedColor::Background);
+        if styled && !skip {
+            width = 0;
+        }
+    } else {
+        symbol.push(c.c);
+        if let Some(zw) = c.zerowidth() {
+            for ch in zw {
+                symbol.push(*ch);
+            }
+        }
+    }
+
+    let mut attr_bits = 0u16;
+    if c.flags.contains(AlacFlags::BOLD) {
+        attr_bits |= attr::BOLD;
+    }
+    if c.flags.contains(AlacFlags::ITALIC) {
+        attr_bits |= attr::ITALIC;
+    }
+    if c.flags.contains(AlacFlags::DIM) {
+        attr_bits |= attr::FAINT;
+    }
+    if c.flags.contains(AlacFlags::INVERSE) {
+        attr_bits |= attr::INVERSE;
+    }
+    if c.flags.contains(AlacFlags::HIDDEN) {
+        attr_bits |= attr::INVISIBLE;
+    }
+    if c.flags.contains(AlacFlags::STRIKEOUT) {
+        attr_bits |= attr::STRIKETHROUGH;
+    }
+    // 下划线样式：1..5 = single/double/curly/dotted/dashed（ghostty SGR 下划线值同序）。
+    let underline: u16 = if c.flags.contains(AlacFlags::UNDERLINE) {
+        1
+    } else if c.flags.contains(AlacFlags::DOUBLE_UNDERLINE) {
+        2
+    } else if c.flags.contains(AlacFlags::UNDERCURL) {
+        3
+    } else if c.flags.contains(AlacFlags::DOTTED_UNDERLINE) {
+        4
+    } else if c.flags.contains(AlacFlags::DASHED_UNDERLINE) {
+        5
+    } else {
+        0
+    };
+    attr_bits |= underline << attr::UNDERLINE_SHIFT;
+
+    Cell {
+        symbol,
+        width,
+        skip,
+        fg: color_of(&c.fg, false),
+        bg: color_of(&c.bg, true),
+        attr: attr_bits,
+    }
+}
+
+/// alacritty 颜色 → wire 颜色。Named(Foreground/Background) 归 None（终端默认色）；
+/// Named 调色板名/Indexed(n) → Palette；Spec → Rgb。
+fn color_of(c: &AlacColor, _background: bool) -> Color {
+    match c {
+        AlacColor::Named(NamedColor::Foreground | NamedColor::Background) => Color::None,
+        AlacColor::Named(named) => Color::Palette(*named as u8),
+        AlacColor::Indexed(idx) => Color::Palette(*idx),
+        AlacColor::Spec(rgb) => Color::Rgb(rgb.r, rgb.g, rgb.b),
+    }
+}
+
+/// 最小 Dimensions（alacritty Term 构造/resize 用）。
+struct SimpleDims {
+    cols: usize,
+    rows: usize,
+}
+
+impl alacritty_terminal::grid::Dimensions for SimpleDims {
+    fn columns(&self) -> usize {
+        self.cols
+    }
+    fn screen_lines(&self) -> usize {
+        self.rows
+    }
+    fn total_lines(&self) -> usize {
+        self.rows
+    }
+}
+
+
+/// 双面分发器：vte Handler 的全量委托 + 拦截面。
+///
+/// 为什么必须有它：libghostty-vt 在流中同步应答查询/维护若干自管位，而 alacritty 的
+/// `Term` 对同一批序列要么自答（DA/DSR/DECRQM——**答案与 ghostty 不同**，如 DA1 是
+/// `?6c` vs ghostty `?62;22c`）、要么不落状态（modifyOtherKeys）。分发器在委托前拦下
+/// 这些序列，按 ghostty 语义处置（查询应答通道 6c 接线；此处先落两个 ghostty 兼容位）。
+struct TermProbe<'a, T> {
+    term: &'a mut Term<T>,
+    modify_other_keys: &'a mut bool,
+    mouse_flags: &'a mut u8,
+}
+
+impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, T> {
+    #[inline]
+    fn set_title(&mut self, _p0: Option<String>) { self.term.set_title(_p0) }
+    #[inline]
+    fn set_cursor_style(&mut self, _p0: Option<alac_ansi::CursorStyle>) { self.term.set_cursor_style(_p0) }
+    #[inline]
+    fn set_cursor_shape(&mut self, _shape: AlacCursorShape) { self.term.set_cursor_shape(_shape) }
+    #[inline]
+    fn input(&mut self, _c: char) { self.term.input(_c) }
+    #[inline]
+    fn goto(&mut self, _line: i32, _col: usize) { self.term.goto(_line, _col) }
+    #[inline]
+    fn goto_line(&mut self, _line: i32) { self.term.goto_line(_line) }
+    #[inline]
+    fn goto_col(&mut self, _col: usize) { self.term.goto_col(_col) }
+    #[inline]
+    fn insert_blank(&mut self, _p0: usize) { self.term.insert_blank(_p0) }
+    #[inline]
+    fn move_up(&mut self, _p0: usize) { self.term.move_up(_p0) }
+    #[inline]
+    fn move_down(&mut self, _p0: usize) { self.term.move_down(_p0) }
+    #[inline]
+    fn identify_terminal(&mut self, _intermediate: Option<char>) { self.term.identify_terminal(_intermediate) }
+    #[inline]
+    fn device_status(&mut self, _p0: usize) { self.term.device_status(_p0) }
+    #[inline]
+    fn move_forward(&mut self, _col: usize) { self.term.move_forward(_col) }
+    #[inline]
+    fn move_backward(&mut self, _col: usize) { self.term.move_backward(_col) }
+    #[inline]
+    fn move_down_and_cr(&mut self, _row: usize) { self.term.move_down_and_cr(_row) }
+    #[inline]
+    fn move_up_and_cr(&mut self, _row: usize) { self.term.move_up_and_cr(_row) }
+    #[inline]
+    fn put_tab(&mut self, _count: u16) { self.term.put_tab(_count) }
+    #[inline]
+    fn backspace(&mut self) { self.term.backspace() }
+    #[inline]
+    fn carriage_return(&mut self) { self.term.carriage_return() }
+    #[inline]
+    fn linefeed(&mut self) { self.term.linefeed() }
+    #[inline]
+    fn bell(&mut self) { self.term.bell() }
+    #[inline]
+    fn substitute(&mut self) { self.term.substitute() }
+    #[inline]
+    fn newline(&mut self) { self.term.newline() }
+    #[inline]
+    fn set_horizontal_tabstop(&mut self) { self.term.set_horizontal_tabstop() }
+    #[inline]
+    fn scroll_up(&mut self, _p0: usize) { self.term.scroll_up(_p0) }
+    #[inline]
+    fn scroll_down(&mut self, _p0: usize) { self.term.scroll_down(_p0) }
+    #[inline]
+    fn insert_blank_lines(&mut self, _p0: usize) { self.term.insert_blank_lines(_p0) }
+    #[inline]
+    fn delete_lines(&mut self, _p0: usize) { self.term.delete_lines(_p0) }
+    #[inline]
+    fn erase_chars(&mut self, _p0: usize) { self.term.erase_chars(_p0) }
+    #[inline]
+    fn delete_chars(&mut self, _p0: usize) { self.term.delete_chars(_p0) }
+    #[inline]
+    fn move_backward_tabs(&mut self, _count: u16) { self.term.move_backward_tabs(_count) }
+    #[inline]
+    fn move_forward_tabs(&mut self, _count: u16) { self.term.move_forward_tabs(_count) }
+    #[inline]
+    fn save_cursor_position(&mut self) { self.term.save_cursor_position() }
+    #[inline]
+    fn restore_cursor_position(&mut self) { self.term.restore_cursor_position() }
+    #[inline]
+    fn clear_line(&mut self, _mode: alac_ansi::LineClearMode) { self.term.clear_line(_mode) }
+    #[inline]
+    fn clear_tabs(&mut self, _mode: alac_ansi::TabulationClearMode) { self.term.clear_tabs(_mode) }
+    #[inline]
+    fn set_tabs(&mut self, _interval: u16) { self.term.set_tabs(_interval) }
+    /// RIS 全复位：自管位（mouse_flags/modifyOtherKeys，D-17/§二）随 ghostty 语义归零，
+    /// 其余委托 alacritty reset_state。
+    fn reset_state(&mut self) {
+        *self.mouse_flags = 0;
+        *self.modify_other_keys = false;
+        self.term.reset_state();
+    }
+    #[inline]
+    fn reverse_index(&mut self) { self.term.reverse_index() }
+    #[inline]
+    fn terminal_attribute(&mut self, _attr: alac_ansi::Attr) { self.term.terminal_attribute(_attr) }
+    #[inline]
+    fn set_mode(&mut self, _mode: alac_ansi::Mode) { self.term.set_mode(_mode) }
+    #[inline]
+    fn unset_mode(&mut self, _mode: alac_ansi::Mode) { self.term.unset_mode(_mode) }
+    #[inline]
+    fn report_mode(&mut self, _mode: alac_ansi::Mode) { self.term.report_mode(_mode) }
+    /// ghostty 兼容位（D-17）：鼠标上报三模式（1000/1002/1003）ghostty 独立记账，
+    /// alacritty 互斥（设 1002 会清 1000）。此处拦截自管、不委托——alacritty 的
+    /// MOUSE_MODE 位我们不用（编码器读本层快照），互斥态不影响任何行为。
+    fn set_private_mode(&mut self, mode: alac_ansi::PrivateMode) {
+        use alac_ansi::{NamedPrivateMode, PrivateMode};
+        if let PrivateMode::Named(m) = mode {
+            match m {
+                NamedPrivateMode::ReportMouseClicks => {
+                    *self.mouse_flags |= 1;
+                    return;
+                }
+                NamedPrivateMode::ReportCellMouseMotion => {
+                    *self.mouse_flags |= 2;
+                    return;
+                }
+                NamedPrivateMode::ReportAllMouseMotion => {
+                    *self.mouse_flags |= 4;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        self.term.set_private_mode(mode);
+    }
+
+    fn unset_private_mode(&mut self, mode: alac_ansi::PrivateMode) {
+        use alac_ansi::{NamedPrivateMode, PrivateMode};
+        if let PrivateMode::Named(m) = mode {
+            match m {
+                NamedPrivateMode::ReportMouseClicks => {
+                    *self.mouse_flags &= !1;
+                    return;
+                }
+                NamedPrivateMode::ReportCellMouseMotion => {
+                    *self.mouse_flags &= !2;
+                    return;
+                }
+                NamedPrivateMode::ReportAllMouseMotion => {
+                    *self.mouse_flags &= !4;
+                    return;
+                }
+                _ => {}
+            }
+        }
+        if let PrivateMode::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor) = mode {
+            if !self.term.mode().contains(TermMode::ALT_SCREEN) {
+                self.term.goto(0, 0);
+            }
+        }
+        self.term.unset_private_mode(mode);
+    }
+    #[inline]
+    fn report_private_mode(&mut self, _mode: alac_ansi::PrivateMode) { self.term.report_private_mode(_mode) }
+    #[inline]
+    fn set_scrolling_region(&mut self, _top: usize, _bottom: Option<usize>) { self.term.set_scrolling_region(_top, _bottom) }
+    #[inline]
+    fn set_keypad_application_mode(&mut self) { self.term.set_keypad_application_mode() }
+    #[inline]
+    fn unset_keypad_application_mode(&mut self) { self.term.unset_keypad_application_mode() }
+    #[inline]
+    fn set_active_charset(&mut self, _p0: alac_ansi::CharsetIndex) { self.term.set_active_charset(_p0) }
+    #[inline]
+    fn configure_charset(&mut self, _p0: alac_ansi::CharsetIndex, _p1: alac_ansi::StandardCharset) { self.term.configure_charset(_p0, _p1) }
+    #[inline]
+    fn set_color(&mut self, _p0: usize, _p1: alac_ansi::Rgb) { self.term.set_color(_p0, _p1) }
+    #[inline]
+    fn dynamic_color_sequence(&mut self, _p0: String, _p1: usize, _p2: &str) { self.term.dynamic_color_sequence(_p0, _p1, _p2) }
+    #[inline]
+    fn reset_color(&mut self, _p0: usize) { self.term.reset_color(_p0) }
+    #[inline]
+    fn clipboard_store(&mut self, _p0: u8, _p1: &[u8]) { self.term.clipboard_store(_p0, _p1) }
+    #[inline]
+    fn clipboard_load(&mut self, _p0: u8, _p1: &str) { self.term.clipboard_load(_p0, _p1) }
+    #[inline]
+    fn decaln(&mut self) { self.term.decaln() }
+    #[inline]
+    fn push_title(&mut self) { self.term.push_title() }
+    #[inline]
+    fn pop_title(&mut self) { self.term.pop_title() }
+    #[inline]
+    fn text_area_size_pixels(&mut self) { self.term.text_area_size_pixels() }
+    #[inline]
+    fn text_area_size_chars(&mut self) { self.term.text_area_size_chars() }
+    #[inline]
+    fn set_hyperlink(&mut self, _p0: Option<alac_ansi::Hyperlink>) { self.term.set_hyperlink(_p0) }
+    // CursorIcon 在 vte 0.15 是私有类型：本方法不委托（Term 的默认实现即 no-op，
+    // 鼠标光标形状由客户端自理——服务端无 UI 面）。
+    #[inline]
+    fn report_keyboard_mode(&mut self) { self.term.report_keyboard_mode() }
+    #[inline]
+    fn push_keyboard_mode(&mut self, _mode: alac_ansi::KeyboardModes) { self.term.push_keyboard_mode(_mode) }
+    #[inline]
+    fn pop_keyboard_modes(&mut self, _to_pop: u16) { self.term.pop_keyboard_modes(_to_pop) }
+    #[inline]
+    fn set_keyboard_mode(&mut self, _mode: alac_ansi::KeyboardModes, _behavior: alac_ansi::KeyboardModesApplyBehavior) { self.term.set_keyboard_mode(_mode, _behavior) }
+    #[inline]
+    fn report_modify_other_keys(&mut self) { self.term.report_modify_other_keys() }
+    #[inline]
+    fn set_scp(&mut self, _char_path: alac_ansi::ScpCharPath, _update_mode: alac_ansi::ScpUpdateMode) { self.term.set_scp(_char_path, _update_mode) }
+
+    /// ghostty 兼容位（D-16）：`CSI 2J`（ED2）在主屏上 alacritty 走 `clear_viewport`
+    /// ——把当前视口推入回滚（xterm 形态）；ghostty 只清视口、不增回滚（golden
+    /// session-styles 的回滚 total=32 即此语义）。Go 出口的回滚条/镜像语义跟 ghostty，
+    /// 此处对齐：主屏 ED2 = 重置视口区（不进历史）。
+    fn clear_screen(&mut self, mode: alac_ansi::ClearMode) {
+        use alac_ansi::ClearMode;
+        if matches!(mode, ClearMode::All) && !self.term.mode().contains(TermMode::ALT_SCREEN) {
+            self.term.grid_mut().reset_region(..);
+            return;
+        }
+        self.term.clear_screen(mode);
+    }
+
+    // ghostty 兼容位（D-15）：未配对的 `CSI ? 1049 l`（不在备用屏时收到 1049 退出）
+    // ghostty 按 DECRC 的「从未保存 ⇒ 恢复到初始位 (0,0)」处理（golden session-styles
+    // 夹具的光标/覆写形态即此语义）；alacritty 对此 no-op。真实 TUI 的 1049h/l 成对，
+    // 两者无差——上面 unset_private_mode 的 SwapScreenAndSetRestoreCursor 分支只钉未配对形态。
+
+    /// modifyOtherKeys 记账（alacritty 的 Term 不落状态）：mode 2（EnableAll）置位、
+    /// 其余（Reset/EnableExceptWellDefined）清零——ghostty 只认「other_keys_numeric」。
+    fn set_modify_other_keys(&mut self, mode: alac_ansi::ModifyOtherKeys) {
+        *self.modify_other_keys = matches!(mode, alac_ansi::ModifyOtherKeys::EnableAll);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fixture(p: &str) -> Vec<u8> {
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures");
+        std::fs::read(format!("{base}/{p}")).unwrap_or_else(|e| panic!("夹具 {p}: {e}"))
+    }
+
+    /// Go goldenDigest 同款：FNV-1a 64 → 16 位小写 hex。
+    fn fnv_hex(data: &[u8]) -> String {
+        let mut h = fnv::FnvHasher::default();
+        use std::hash::Hasher;
+        h.write(data);
+        format!("{:016x}", h.finish())
+    }
+
+    /// Go gridTextLines 口径：占位格跳过、空符号补空格、行尾 TrimRight(" ")、\n 连接。
+    fn text_of(rows: &[Row]) -> String {
+        rows.iter()
+            .map(|r| {
+                let mut s = String::new();
+                for c in &r.cells {
+                    if c.skip {
+                        continue;
+                    }
+                    if c.symbol.is_empty() {
+                        s.push(' ');
+                    } else {
+                        s.push_str(&c.symbol);
+                    }
+                }
+                s.trim_end_matches(' ').to_string()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Go goldenStyleText 口径：逐行逐格 26 个 hex（fg 5B · bg 5B · attr 2B · flags 1B）。
+    /// 缺格按空白格（Width=1）；flags = skip(bit0) | width<<1。
+    fn style_of(rows: &[Row], cols: usize) -> String {
+        fn color_hex(c: Color) -> [u8; 5] {
+            match c {
+                Color::None => [0, 0, 0, 0, 0],
+                Color::Palette(i) => [1, i, 0, 0, 0],
+                Color::Rgb(r, g, b) => [2, 0, r, g, b],
+            }
+        }
+        let mut out = String::new();
+        for r in rows {
+            for x in 0..cols {
+                let blank = Cell { width: 1, ..Cell::default() };
+                let c = r.cells.get(x).unwrap_or(&blank);
+                let mut flags = 0u8;
+                if c.skip {
+                    flags |= 1;
+                }
+                flags |= c.width << 1;
+                let fg = color_hex(c.fg);
+                let bg = color_hex(c.bg);
+                for b in fg.iter().chain(bg.iter()) {
+                    out.push_str(&format!("{b:02x}"));
+                }
+                out.push_str(&format!("{:04x}{:02x}", c.attr, flags));
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// 读 surface-golden/manifest.tsv：name → 列向量。
+    fn golden_manifest() -> Vec<Vec<String>> {
+        let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures");
+        let raw = std::fs::read_to_string(format!("{base}/surface-golden/manifest.tsv"))
+            .expect("golden manifest");
+        raw.lines()
+            .filter(|l| !l.is_empty())
+            .map(|l| l.split('\t').map(|s| s.to_string()).collect())
+            .collect()
+    }
+
+    /// 6b 自检①：三个会话夹具喂底座——damage 有值、screen_text 非空且含语义锚点。
+    #[test]
+    fn vt_fixture_damage_and_text() {
+        for (name, anchor) in [
+            ("session-cjk.bin", "文件"),
+            ("session-git-log.bin", "* a991c02"),
+            ("session-hexdump.bin", "|"),
+        ] {
+            let data = fixture(&format!("term-vt/{name}"));
+            let mut vt = SessionVt::new(100, 32, 5000).unwrap();
+            vt.write(&data);
+            let d = vt.update();
+            assert!(d != Dirty::None, "{name}: damage 为空");
+            let text = vt.screen_text();
+            assert!(!text.is_empty(), "{name}: 屏幕文本为空");
+            assert!(text.contains(anchor), "{name}: 文本缺锚点 {anchor}（截取：{}）", &text[..text.len().min(200)].escape_default());
+        }
+    }
+
+    /// 6b 自检②（V-1 裁决）：golden 文本/样式向量 digest 对拍 manifest.tsv。
+    /// 仿真等价（alacritty vs ghostty）与 cell 归一化（空白格/带样式空格）在此定调。
+    #[test]
+    fn vt_golden_digest_parity() {
+        let manifest = golden_manifest();
+        assert!(manifest.len() >= 8, "golden manifest 行数 {}", manifest.len());
+        let cases = [
+            "session-cjk",
+            "session-git-log",
+            "session-hexdump",
+            // 样式专项：内联序列（Go goldenStylesSession 同款）
+            "session-styles",
+        ];
+        for key in cases {
+            let row = manifest
+                .iter()
+                .find(|r| r[0] == key)
+                .unwrap_or_else(|| panic!("manifest 缺 {key}"));
+            let data = if key == "session-styles" {
+                "\u{1b}[2J\u{1b}[H\u{1b}[1;3;4;7mBOLD\u{1b}[0m\u{1b}[2;9mDIM-STRIKE\u{1b}[0m\u{1b}[38;5;196mPAL256\u{1b}[0m \u{1b}[48;2;10;20;30mRGBBG\u{1b}[0m \u{1b}[31;44mRED-BLUE\u{1b}[0m \u{5bbd}\u{5b57}\r\n\u{1b}[?1000h\u{1b}[?1002h\u{1b}[?1006h\u{1b}[?2004h\u{1b}[?1049lSTYLES-OK".as_bytes().to_vec()
+            } else {
+                fixture(&format!("term-vt/{key}.bin"))
+            };
+            let mut vt = SessionVt::new(100, 32, 5000).unwrap();
+            vt.write(&data);
+            let rows = vt.rows();
+            let text = fnv_hex(text_of(&rows).as_bytes());
+            let style = fnv_hex(style_of(&rows, 100).as_bytes());
+            assert_eq!(text, row[5], "{key}: 文本 digest 不一致（仿真等价/归一化漂移，见 V-1）");
+            assert_eq!(style, row[15], "{key}: 样式向量 digest 不一致（V-1）");
+        }
+    }
+
+    /// RIS 全复位清自管位（D-17 mouse_flags + modifyOtherKeys）——golden 模式位列之外
+    /// 的行为钉子：`CSI ? 1000h` + `CSI > 4;2m` + RIS 后三位快照全归零。
+    #[test]
+    fn vt_ris_resets_self_managed_flags() {
+        let mut vt = SessionVt::new(80, 24, 100).unwrap();
+        vt.write(b"\x1b[?1000h\x1b[?1002h\x1b[?1006h\x1b[>4;2m");
+        let m = vt.modes();
+        assert!(m.mouse_normal && m.mouse_button && m.mouse_sgr);
+        vt.set_modify_other_keys(true); // 记账路径（6c 接线前的直接面）
+        vt.write(b"\x1bc"); // RIS
+        let m = vt.modes();
+        assert!(!m.mouse_normal && !m.mouse_button && !m.mouse_sgr, "RIS 须清 mouse_flags");
+        assert!(!m.modify_other_keys, "RIS 须清 modifyOtherKeys");
+        assert!(!m.bracketed_paste && m.cursor_visible, "RIS 须复位常规模式");
+    }
+
+    /// 光标/回滚条/模式位列对拍（快照语义的另一半）。
+    #[test]
+    fn vt_golden_cursor_scroll_modes_parity() {
+        let manifest = golden_manifest();
+        for key in ["session-cjk", "session-git-log", "session-hexdump", "session-styles"] {
+            let row = manifest.iter().find(|r| r[0] == key).unwrap();
+            let data = if key == "session-styles" {
+                "\u{1b}[2J\u{1b}[H\u{1b}[1;3;4;7mBOLD\u{1b}[0m\u{1b}[2;9mDIM-STRIKE\u{1b}[0m\u{1b}[38;5;196mPAL256\u{1b}[0m \u{1b}[48;2;10;20;30mRGBBG\u{1b}[0m \u{1b}[31;44mRED-BLUE\u{1b}[0m \u{5bbd}\u{5b57}\r\n\u{1b}[?1000h\u{1b}[?1002h\u{1b}[?1006h\u{1b}[?2004h\u{1b}[?1049lSTYLES-OK".as_bytes().to_vec()
+            } else {
+                fixture(&format!("term-vt/{key}.bin"))
+            };
+            let mut vt = SessionVt::new(100, 32, 5000).unwrap();
+            vt.write(&data);
+            let cur = vt.cursor();
+            let sb = vt.scrollbar();
+            let m = vt.modes();
+            assert_eq!(cur.x.to_string(), row[8], "{key}: 光标 X");
+            assert_eq!(cur.y.to_string(), row[9], "{key}: 光标 Y");
+            assert_eq!(sb.total.to_string(), row[12], "{key}: 回滚 total");
+            assert_eq!(sb.offset.to_string(), row[13], "{key}: 回滚 offset");
+            assert_eq!(sb.len.to_string(), row[14], "{key}: 回滚 len");
+            // 模式位（wire u32：DECCKM=1|M1000=2|M1002=4|M1003=8|M1006=16|Focus=32|Bracketed=64|Alt=128）
+            let mut bits = 0u32;
+            let mm = vt.modes();
+            if mm.cursor_keys_app { bits |= 1; }
+            if mm.mouse_normal { bits |= 2; }
+            if mm.mouse_button { bits |= 4; }
+            if mm.mouse_any { bits |= 8; }
+            if mm.mouse_sgr { bits |= 16; }
+            if mm.focus_events { bits |= 32; }
+            if mm.bracketed_paste { bits |= 64; }
+            if mm.screen == Screen::Alternate { bits |= 128; }
+            let _ = m;
+            assert_eq!(bits.to_string(), row[16], "{key}: 模式位");
+        }
+    }
+}
