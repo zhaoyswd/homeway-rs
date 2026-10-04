@@ -306,6 +306,10 @@ struct Engine {
     /// driver 的 poll(2) 最多 250ms 才醒，上行每串包白等一拍；与 Client::send 共用
     /// 同一 fd 与互斥位，stop 关闭后写入自然 no-op）。
     wake: Arc<Mutex<Option<i32>>>,
+    /// 上行批量面（R8-8b）：命令拍收集的应用出站包（encap 前的明文）。
+    tun_pending: Vec<Vec<u8>>,
+    /// 上行批量面（R8-8b）：encap 产出的 wire 包（一批一次 send_wg_batch）。
+    uplink_out: Vec<Vec<u8>>,
 }
 
 impl Engine {
@@ -345,12 +349,28 @@ impl Engine {
 
     /// 单轮驱动：命令 → UDP 批量收 → 栈 poll → TX 出队封装 → 定时器 → 待决结算。
     /// 返回 false = 收到 Stop。
+    ///
+    /// R8-8b：上行 bulk 批化——TUN 读线程投来的应用包与栈 B 的 TCP 段先**收集**，
+    /// 命令拍结束后逐个 encap（Tunn 串行——会话计数器依赖序）、wire 产物一批
+    /// sendmmsg 发出（macOS 回退逐包；此前每包一次 sendto——bulk 上行 = 8k+ syscalls/s）。
     fn pump_once(&mut self, udp_buf: &mut [u8]) -> bool {
+        self.uplink_out.clear();
         while let Ok(cmd) = self.cmd_rx.try_recv() {
-            if !self.handle_cmd(cmd) {
-                return false;
+            match cmd {
+                Cmd::TunPacket(pkt) => self.tun_pending.push(pkt),
+                other => {
+                    if !self.handle_cmd(other) {
+                        return false;
+                    }
+                }
             }
         }
+        // 应用出站包批量 encap + 批量发送（R8-8b；take/还回保容量零分配）
+        let pending = std::mem::take(&mut self.tun_pending);
+        for pkt in &pending {
+            self.encap_collect(pkt);
+        }
+        self.tun_pending = pending;
         self.bind.tick_unlock();
         self.drain_udp(udp_buf);
         let now = self.now_smol();
@@ -360,8 +380,9 @@ impl Engine {
         let mut tx: Vec<Vec<u8>> = Vec::new();
         self.stack.device.drain_tx(&mut tx);
         for pkt in &tx {
-            self.encap_send(pkt);
+            self.encap_collect(pkt);
         }
+        self.bind.send_wg_batch(&mut self.uplink_out);
         self.timer_tick();
         self.resolve_pending();
         self.resolve_udp();
@@ -470,6 +491,20 @@ impl Engine {
         // 不 clear/resize（每包 65KB memset 纯浪费，中-10①）。长度由返回值给。
         match self.tunn.encapsulate(pkt, &mut self.wg_buf) {
             TunnResult::WriteToNetwork(w) => self.bind.send_wg(w),
+            TunnResult::Err(WireGuardError::ConnectionExpired) => self.rebuild_tunn_once(),
+            TunnResult::Err(_) => {
+                self.silent_drops += 1;
+            }
+            _ => {}
+        }
+    }
+
+    /// 批量路径的 encap（R8-8b）：wire 产物进 `uplink_out`（收集完一批一次
+    /// `Bind::send_wg_batch` 发出——非批量语义面〔握手/keepalive/单发〕仍走
+    /// `encap_send`）。
+    fn encap_collect(&mut self, pkt: &[u8]) {
+        match self.tunn.encapsulate(pkt, &mut self.wg_buf) {
+            TunnResult::WriteToNetwork(w) => self.uplink_out.push(w.to_vec()),
             TunnResult::Err(WireGuardError::ConnectionExpired) => self.rebuild_tunn_once(),
             TunnResult::Err(_) => {
                 self.silent_drops += 1;
@@ -982,6 +1017,8 @@ impl Client {
             on_tun_error: None,
             cmd_tx: Some(cmd_tx.clone()),
             wake: Arc::clone(&wake_wr_shared),
+            tun_pending: Vec::with_capacity(64),
+            uplink_out: Vec::with_capacity(64),
         };
 
         let stop2 = Arc::clone(&stop);

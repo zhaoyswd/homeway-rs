@@ -3466,31 +3466,44 @@ mod tests {
 
     /// H2 回归：createOnly 80x24 → 异尺寸 attach（100x30）⇒ PTY/vt/注册表三方几何
     /// 一致（修前 registry 100x30 而 PTY/vt 停在 80x24——真实 shell 的 stty 实证）。
+    ///
+    /// R8-8c（F3 处置）：整测**硬期限 60s**——本测跑真登录 shell（环境偶发挂死
+    /// n=1，本机 4 轮未复现）；各内层预算（expect 5s / drain 10s）覆盖不了
+    /// 「connect/close/serve 线程」层面的卡死，硬期限超时**判失败**而不是挂死
+    /// 整个测试进程（评审建议的加固形态）。
     #[test]
     fn attach_size_applies_to_pty() {
-        let lines = Arc::new(Mutex::new(Vec::new()));
-        let cfg = TermConfig { shell: None, ..TermConfig::default() }; // 真登录 shell
-        let svc = svc_with(cfg, Arc::clone(&lines));
-        let (ln, path) = start_listener();
-        {
-            let svc = Arc::clone(&svc);
-            std::thread::spawn(move || svc.serve(ln));
+        let (done_tx, done_rx) = std::sync::mpsc::channel::<()>();
+        let body = std::thread::spawn(move || {
+            let lines = Arc::new(Mutex::new(Vec::new()));
+            let cfg = TermConfig { shell: None, ..TermConfig::default() }; // 真登录 shell
+            let svc = svc_with(cfg, Arc::clone(&lines));
+            let (ln, path) = start_listener();
+            {
+                let svc = Arc::clone(&svc);
+                std::thread::spawn(move || svc.serve(ln));
+            }
+            let mut c0 = Client::connect(&path);
+            c0.send(Op::CREATE, &frames::enc_create(0, "t-h2"));
+            c0.expect(Op::OK, 5);
+            drop(c0);
+            std::thread::sleep(Duration::from_millis(800)); // 等 shell 就绪
+            let mut c = Client::connect(&path);
+            let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "h2");
+            c.send(Op::HELLO, &frames::enc_hello(100, 30, 0, "t-h2", &tail));
+            c.expect(Op::ATTACHED, 5);
+            c.expect(Op::REPLAY_DONE, 5);
+            // shell 里跑 stty size：PTY 几何真变 100x30 ⇒ "30 100"
+            c.send(Op::DATA, b"stty size\r");
+            let got = c.drain_data_until(|d| has_bytes(d, b"30 100"), 10);
+            assert!(has_bytes(&got, b"30 100"), "PTY 尺寸未随 attach 跟进：{:?}", String::from_utf8_lossy(&got));
+            svc.close();
+            let _ = done_tx.send(());
+        });
+        match done_rx.recv_timeout(Duration::from_secs(60)) {
+            Ok(()) => { let _ = body.join(); }
+            Err(_) => panic!("attach_size_applies_to_pty 硬期限 60s 超时（环境性挂死复现——按 F3 加固判失败）"),
         }
-        let mut c0 = Client::connect(&path);
-        c0.send(Op::CREATE, &frames::enc_create(0, "t-h2"));
-        c0.expect(Op::OK, 5);
-        drop(c0);
-        std::thread::sleep(Duration::from_millis(800)); // 等 shell 就绪
-        let mut c = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "h2");
-        c.send(Op::HELLO, &frames::enc_hello(100, 30, 0, "t-h2", &tail));
-        c.expect(Op::ATTACHED, 5);
-        c.expect(Op::REPLAY_DONE, 5);
-        // shell 里跑 stty size：PTY 几何真变 100x30 ⇒ "30 100"
-        c.send(Op::DATA, b"stty size\r");
-        let got = c.drain_data_until(|d| has_bytes(d, b"30 100"), 10);
-        assert!(has_bytes(&got, b"30 100"), "PTY 尺寸未随 attach 跟进：{:?}", String::from_utf8_lossy(&got));
-        svc.close();
     }
 
     /// H3 回归：上限腾位（裸断无 ENDED）的旧腿必须**立即见 EOF**——修前 dup fd 的

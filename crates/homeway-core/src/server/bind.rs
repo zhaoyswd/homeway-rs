@@ -106,6 +106,10 @@ pub struct ServerBind {
     pub rx_bytes: u64,
     pub tx_bytes: u64,
     recv_buf: Box<[u8; 65536]>,
+    /// 批量发送的复用 staging（腿帧连排；驱动线程独占——零热路径分配）。
+    tx_stage: Vec<u8>,
+    /// staging 内各帧的 (记账载荷长, 端点, 帧全长)。
+    tx_lens: Vec<(usize, SocketAddr, usize)>,
 }
 
 impl ServerBind {
@@ -178,6 +182,8 @@ impl ServerBind {
             rx_bytes: 0,
             tx_bytes: 0,
             recv_buf: Box::new([0u8; 65536]),
+            tx_stage: Vec::with_capacity(256 * 1024),
+            tx_lens: Vec::with_capacity(256),
         })
     }
 
@@ -502,14 +508,24 @@ impl ServerBind {
     /// endpoint 命中腿表走该腿 socket（回程五元组与拨出映射一致）；命中
     /// leg_recent/leg_ports = 腿已摘（#17 丢弃——打到中继主口/被复用的数据口只会
     /// 污染别的会话）；否则主 socket。
+    ///
+    /// R8-8b：主 socket 路径**批量发送**——腿帧先落进复用 staging（消除逐包
+    /// frame_bytes 的 Vec 分配，载荷一次拷贝），Linux/OHOS 经 sendmmsg 一批一次
+    /// 系统调用（macOS 回退逐包 sendto，与 Go 同形态——同机 A/B 公平）。腿 socket
+    /// 命中是稀疏路径（中继腿的建立/保活面），保持逐包。
     pub fn send_wire(&mut self, out: &InboundOut) {
+        if out.wire.is_empty() {
+            return; // 常态快速路径（handle_inbound 的逐包调用多无产出）
+        }
+        self.tx_stage.clear();
+        self.tx_lens.clear();
         for (ep, wg) in &out.wire {
-            let wire = frame::frame_bytes(FrameKind::Data, wg);
             // 腿表命中（先取 fd 再发——借用分离）
             let leg_fd = self.leg_by_r.get(ep).and_then(|id| self.leg_by_id.get(id)).map(|lg| lg.sock.as_raw_fd());
             if let Some(fd) = leg_fd {
                 if let Some(lg) = self.leg_by_id.values_mut().find(|lg| lg.sock.as_raw_fd() == fd) {
                     lg.last = Instant::now(); // Send 刷 last（Go Send 同义）
+                    let wire = frame::frame_bytes(FrameKind::Data, wg);
                     let n = unsafe { libc::send(fd, wire.as_ptr().cast(), wire.len(), 0) };
                     if n != wire.len() as isize {
                         let remote = lg.remote;
@@ -536,17 +552,35 @@ impl ServerBind {
                 }
                 continue;
             }
-            match self.sock.send_to(&wire, ep) {
-                Ok(_) => self.tx_bytes += wg.len() as u64,
-                Err(e) => {
-                    // 发送失败限流记一行（排障面；对端可控面不能刷屏）
-                    (self.logf)(&format!("发送到 {ep} 失败（{e}）"));
-                }
-            }
+            // 主 socket：帧入复用 staging（载荷一次拷贝；记录 (记账载荷长, 端点, 帧全长)）。
+            let start = self.tx_stage.len();
+            let wire = frame::frame_bytes(FrameKind::Data, wg);
+            self.tx_stage.extend_from_slice(&wire);
+            self.tx_lens.push((wg.len(), *ep, wire.len()));
+            let _ = start;
         }
-        if !out.wire.is_empty() {
-            // 清算显式丢弃计数（诊断面：no_endpoint_drops 在 device 内）
+        if self.tx_lens.is_empty() {
+            return;
         }
+        // 批量发出（msgs 借 staging 裸切片——staging 在发送期间不再动）。
+        let stage_ptr = self.tx_stage.as_ptr();
+        let mut msgs: Vec<crate::udpbatch::OutMsg<'_>> = Vec::with_capacity(self.tx_lens.len());
+        let mut off = 0usize;
+        for &(_, ep, fr_len) in &self.tx_lens {
+            let sl = unsafe { std::slice::from_raw_parts(stage_ptr.add(off), fr_len) };
+            msgs.push(crate::udpbatch::OutMsg { dst: ep, buf: sl });
+            off += fr_len;
+        }
+        let (sent, first_err) = crate::udpbatch::send_batch(self.sock.as_raw_fd(), &msgs);
+        // 记账按「成功前缀」（send_batch 顺序发送，短返只发前缀；余量留下一拍）。
+        for &(wg_len, _, _) in self.tx_lens.iter().take(sent) {
+            self.tx_bytes += wg_len as u64;
+        }
+        if let Some((ep, e)) = first_err {
+            // 发送失败限流记一行（排障面；对端可控面不能刷屏）
+            (self.logf)(&format!("发送到 {ep} 失败（{e}）"));
+        }
+        // 诊断面：no_endpoint_drops 在 device 内
     }
 
     /// 底层 UDP fd（驱动线程 poll(2) 用）。

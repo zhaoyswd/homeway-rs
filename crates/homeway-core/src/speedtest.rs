@@ -243,7 +243,14 @@ pub trait SpeedConn: Send + Sync {
     fn read_some(&self) -> Result<Vec<u8>, SpeedtestError>;
     /// 关闭（收口/看门狗中断用；幂等）。
     fn kill(&self);
+    /// 请求发出后的**每连接读写硬期限**（Go `SetDeadline(now+warmup+window+
+    /// connBudget)` 同义——R8-8c 处置 F8 登记项：桥接形态在窗口期读阻塞时按
+    /// 期限打断，不挂到引擎看门狗；CLI/栈内形态缺省 no-op（看门狗已覆盖）。
+    fn set_deadline(&self, _d: Option<Duration>) {}
 }
+
+/// 请求发出后每连接的读写硬期限裕量（Go connBudget = 15s，engine.go:72 同值）。
+const CONN_BUDGET: Duration = Duration::from_secs(15);
 
 /// CLI 形态承载（Arc<Client> + 流 id）。
 struct ClientConn {
@@ -754,6 +761,9 @@ fn run_phases(
             p.down.as_millis() as u64,
         );
         c.write_frame(w.control(TYPE_REQUEST, &payload))?;
+        // Go SetDeadline 同义（engine.go:573）：请求已发出——本连接后续读写按
+        // warmup+window+15s 硬期限收口（R8-8c：F8 登记的 timeout 分支极端形态）。
+        c.set_deadline(Some(p.warmup + p.down + CONN_BUDGET));
     }
     let window_start = Instant::now() + p.warmup + PHASE_SLACK;
     // 每流一线程并发读（Go goroutine 同构；窗口内到达才计读数）
@@ -866,6 +876,8 @@ fn run_phases(
     for c in &up_conns {
         let payload = request_payload("send", p.warmup.as_millis() as u64, p.up.as_millis() as u64);
         c.write_frame(w.control(TYPE_REQUEST, &payload))?;
+        // 同下行：Go SetDeadline 同义的硬期限（pump 的收口 report 读也罩在内）。
+        c.set_deadline(Some(p.warmup + p.up + CONN_BUDGET));
     }
     let mut up_bytes: i64 = 0;
     let mut up_usage: i64 = 0;

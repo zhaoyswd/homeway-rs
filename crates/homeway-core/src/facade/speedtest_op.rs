@@ -155,6 +155,13 @@ pub struct BridgeSpeedConn {
 }
 
 impl crate::speedtest::SpeedConn for BridgeSpeedConn {
+    fn set_deadline(&self, d: Option<std::time::Duration>) {
+        // SO_RCVTIMEO/SO_SNDTIMEO 是 socket 级选项——raw/读写半（同 socket 的
+        // dup fd 集）一处设置全体生效。
+        self.raw.set_read_timeout(d).ok();
+        self.raw.set_write_timeout(d).ok();
+    }
+
     fn write_frame(&self, data: &[u8]) -> Result<(), crate::speedtest::SpeedtestError> {
         use crate::speedtest::SpeedtestError;
         let mut w = self.w.lock().unwrap_or_else(|e| e.into_inner());
@@ -241,11 +248,15 @@ pub fn speed_dial_conn(
                 format!("测速通道暂时不可用（桥未就绪或正在恢复）：{e}"),
             )
         })?;
-    // 长任务连接不设逐操作超时（窗口期读阻塞是常态；中断由引擎看门狗 kill 承担）
-    conn.set_read_timeout(None).ok();
-    conn.set_write_timeout(None).ok();
+    // 鉴权交换先带拨号预算（R8-8c：复核 r3 对 M-8 兜底「部分失真」的修正——此前
+    // 预算只罩 connect，auth 写读挂 None 可无限等；请求发出后的硬期限由引擎
+    // set_deadline 挂 warmup+window+15s，窗口期读阻塞是常态不在此设短值）。
+    conn.set_read_timeout(Some(budget)).ok();
+    conn.set_write_timeout(Some(budget)).ok();
     write_auth(&mut conn, auth_hex)
         .map_err(|e| ("bridge_auth", format!("测速通道鉴权失败：{e}")))?;
+    conn.set_read_timeout(None).ok();
+    conn.set_write_timeout(None).ok();
     let raw = conn
         .try_clone()
         .map_err(|e| ("bridge_down", format!("测速桥 fd 复制失败：{e}")))?;

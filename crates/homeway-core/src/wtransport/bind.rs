@@ -18,6 +18,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
+use std::os::fd::AsRawFd as _;
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -129,6 +130,10 @@ pub struct Bind {
     rx_bytes: u64,
     tx_bytes: u64,
     send_errs: u64,
+    /// 批量出站的复用 staging 与帧长缓存（R8-8b；驱动线程独占——零热路径分配）。
+    batch_stage: Vec<u8>,
+    batch_lens: Vec<usize>,
+    frame_head_len: Option<usize>,
     /// 全候选发送统计（拍板①：Go sendTries/sendLocalFails——尝试>0 且全部本地失败
     /// = 环境性禁发〔挂起 EPERM 全候选皆败；蜂窝下 LAN 候选 ENETUNREACH 但中继发
     /// 得出去 ⇒ 不算全失败〕，覆盖非采纳〔赛跑〕态下采纳路径粘性信号够不着的盲区）。
@@ -199,6 +204,9 @@ impl Bind {
             rx_bytes: 0,
             tx_bytes: 0,
             send_errs: 0,
+            batch_stage: Vec::with_capacity(256 * 1024),
+            batch_lens: Vec::with_capacity(256),
+            frame_head_len: None,
             send_tries: 0,
             send_local_fails: 0,
             adopted_local_err_count: 0,
@@ -375,6 +383,86 @@ impl Bind {
                 relay_sent
             ));
         }
+    }
+
+    /// 批量出站收口（R8-8b 上行 bulk 批化）：采纳路径上的 N 个 wire 包一批发出——
+    /// Linux/OHOS 经 sendmmsg 一次系统调用（macOS 回退逐包 sendto，与 Go 同形态）。
+    /// 非 bulk 语义面全部回落到逐包 `send_wg`：
+    /// - 未采纳（镜像/赛跑/reg 搭车/捕获——首包语义复杂且量小）；
+    /// - 过渡双发窗（FIX-09 的 handover 3s 窗——两路帧形不同）；
+    /// - 首包 reg 搭车（reg_armed 时首包单独走 send_wg，余量批发）。
+    ///
+    /// 计数口径与采纳路径 send_wg 一致：每包一次尝试（send_tries += N）、成功才计
+    /// tx_bytes、本地失败进 adopted_local_err_count（复核 r3-F5 同口径）。
+    pub fn send_wg_batch(&mut self, wgs: &mut Vec<Vec<u8>>) {
+        if wgs.is_empty() {
+            return;
+        }
+        #[cfg(feature = "test-seams")]
+        if self.poisoned {
+            for w in wgs.iter() {
+                self.send_wg(w);
+            }
+            wgs.clear();
+            return;
+        }
+        if self.adopted.is_none() || self.handover.is_some() || self.reg_armed {
+            for w in wgs.iter() {
+                self.send_wg(w);
+            }
+            wgs.clear();
+            return;
+        }
+        let Some(addr) = self.adopted else { unreachable!("上面已判") };
+        if self.adopted_is_relay {
+            // 中继腿：路由头 `[0xAA]…` 前置于帧——staging 追加写做不到前置；且中继
+            // 侧 200pps 准入限速下无 bulk 收益。逐包回退（形态正确优先）。
+            for w in wgs.iter() {
+                self.send_wg(w);
+            }
+            wgs.clear();
+            return;
+        }
+        // 帧化进复用 staging（帧头‖载荷），msgs 借裸切片。
+        self.batch_stage.clear();
+        self.batch_lens.clear();
+        for w in wgs.iter() {
+            frame::encode_frame(FrameKind::Data, w, &mut self.batch_stage);
+            self.batch_lens.push(w.len());
+        }
+        let ptr = self.batch_stage.as_ptr();
+        let head = self.frame_head_len();
+        let mut msgs: Vec<crate::udpbatch::OutMsg<'_>> = Vec::with_capacity(self.batch_lens.len());
+        let mut off = 0usize;
+        for &wl in self.batch_lens.iter() {
+            let fr_len = head + wl;
+            let sl = unsafe { std::slice::from_raw_parts(ptr.add(off), fr_len) };
+            msgs.push(crate::udpbatch::OutMsg { dst: addr, buf: sl });
+            off += fr_len;
+        }
+        self.send_tries += wgs.len() as i64;
+        let (sent, err) = crate::udpbatch::send_batch(self.sock.as_raw_fd(), &msgs);
+        for &wl in self.batch_lens.iter().take(sent) {
+            self.tx_bytes += wl as u64;
+        }
+        if let Some((ep, e)) = err {
+            self.send_errs += 1;
+            let unsent = wgs.len().saturating_sub(sent);
+            self.send_local_fails += unsent as i64;
+            self.adopted_local_err_count += unsent as u64;
+            self.last_local_send_err = Some(Instant::now());
+            self.log_send_err_throttled(ep, &e);
+        }
+        wgs.clear();
+    }
+
+    /// 帧头长（帧头‖载荷 布局下 staging 切片回推用；0 载荷编码量一次缓存）。
+    fn frame_head_len(&mut self) -> usize {
+        *self.frame_head_len.get_or_insert_with(|| {
+            let mut probe = Vec::new();
+            frame::encode_frame(FrameKind::Data, &[], &mut probe);
+            probe.len()
+        })
     }
 
     /// 中继腿封装：`[0xAA][relayID(8B)] ‖ 已编码腿帧`（容器帧在内、路由头在外——

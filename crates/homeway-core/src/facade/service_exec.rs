@@ -198,10 +198,18 @@ impl ServiceExec {
         }
         *guard = Some(Arc::clone(&run));
         drop(guard);
-        // 桥在会话受理后启动（dial 经运行态会话——见 dial_via_run）
-        let run3 = Arc::clone(&run);
-        bridge.set_dial(Box::new(move |port, budget| {
-            dial_via_run(&run3, port, budget)
+        // 桥在会话受理后启动（dial 经运行态会话——见 dial_via_run）。
+        // R8-8c（F15 处置）：闭包持 **Weak**——ServiceRun.bridge → BridgeHost →
+        // 闭包 → Arc<ServiceRun> 的引用环每 start/stop 周期泄漏一套对象；降 Weak
+        // 后强引用只剩 run 槽 + 会话线程（stop 清槽 + 线程退出即整组释放）。
+        // upgrade 失败（正在收工）= 桥拨号「服务会话未就绪」同语义。
+        let run3 = Arc::downgrade(&run);
+        bridge.set_dial(Box::new(move |port, budget| match run3.upgrade() {
+            Some(r) => dial_via_run(&r, port, budget),
+            None => Err(io::Error::new(
+                io::ErrorKind::NotConnected,
+                "服务会话未就绪",
+            )),
         }));
         bridge.start();
         0

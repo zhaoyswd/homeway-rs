@@ -29,6 +29,7 @@ pub mod status_json;
 pub mod term;
 pub mod token;
 pub mod tunnel_addr;
+pub mod udpbatch;
 pub mod wgcore;
 pub mod wtransport;
 
