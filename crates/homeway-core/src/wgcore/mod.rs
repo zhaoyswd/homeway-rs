@@ -1244,25 +1244,49 @@ fn driver(mut engine: Engine, wake_r: i32, stop: Arc<AtomicBool>) {
 }
 
 /// TUN fd 全量写（部分写回补——包写入原子性由内核 tun 语义保证，这里兜短写）。
+/// EAGAIN：OHOS 的 VPN fd 是**非阻塞**的（Go tunfd_unix.go 同款真机实证）——
+/// poll(POLLOUT) 等可写再续写。
 fn write_fd_all(fd: i32, mut buf: &[u8]) -> io::Result<()> {
     while !buf.is_empty() {
         let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
         if n < 0 {
             let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                continue;
+            match e.kind() {
+                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::WouldBlock => {
+                    poll_fd(fd, libc::POLLOUT)?;
+                    continue;
+                }
+                _ => return Err(e),
             }
-            return Err(e);
         }
         buf = &buf[n as usize..];
     }
     Ok(())
 }
 
+/// 单 fd poll 等待（500ms 片——与 Go tunfd 的 poll 节拍同值；EINTR 重试）。
+fn poll_fd(fd: i32, events: i16) -> io::Result<()> {
+    loop {
+        let mut pfd = libc::pollfd { fd, events, revents: 0 };
+        let r = unsafe { libc::poll(&mut pfd, 1, 500) };
+        if r < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        return Ok(());
+    }
+}
+
 /// TUN 读循环（应用出站方向）：裸 read → 计数 → 投 TunPacket 给 driver encap。
-/// 阻塞 read（无超时）——退出路径：fd 失效报错（扩展 destroy；回调上层已挂）/
-/// stop 位（引擎收工，配合 fd 失效生效）/ channel 断（driver 已死）。
-/// panic 兜底不在这层（读循环无可 panic 面：裸 fd + 通道 send）。
+/// **OHOS 的 VPN fd 是非阻塞的**（Go tunfd_unix.go 真机实证——裸读立即返回
+/// EAGAIN，被当错误上报会当场把健康隧道判死）：EAGAIN → poll(POLLIN, 500ms) →
+/// 再读；stop 位在 poll 片界检查（引擎收工后 ≤~500ms 内退出）。
+/// 退出路径：fd 失效报错（EBADF/EINVAL = 扩展 destroy）/ stop 位 / channel 断
+/// （driver 已死）。
 fn tun_read_loop(
     fd: i32,
     cmd_tx: Sender<Cmd>,
@@ -1275,16 +1299,34 @@ fn tun_read_loop(
         let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
         if n < 0 {
             let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                if stop.load(Ordering::SeqCst) {
+            match e.kind() {
+                io::ErrorKind::Interrupted => {
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                }
+                io::ErrorKind::WouldBlock => {
+                    // 非阻塞 fd 的常态：等 POLLIN（500ms 片——stop 位在片界检查）
+                    if let Err(pe) = poll_fd(fd, libc::POLLIN) {
+                        if pe.kind() == io::ErrorKind::Interrupted {
+                            continue;
+                        }
+                        logf(&format!("tun fd poll 失败：{pe}（标记隧道不健康）"));
+                        let _ = cmd_tx.send(Cmd::TunFdDead { msg: format!("tun fd poll 失败：{pe}") });
+                        return;
+                    }
+                    if stop.load(Ordering::SeqCst) {
+                        return;
+                    }
+                }
+                _ => {
+                    logf(&format!("tun fd 读取失败：{e}（标记隧道不健康）"));
+                    // 读失败即卸源（driver 侧同样处理写失败——两者都意味着 fd 已被收回）
+                    let _ = cmd_tx.send(Cmd::TunFdDead { msg: format!("tun fd 读取失败：{e}") });
                     return;
                 }
-                continue;
             }
-            logf(&format!("tun fd 读取失败：{e}（标记隧道不健康）"));
-            // 读失败即卸源（driver 侧同样处理写失败——两者都意味着 fd 已被收回）
-            let _ = cmd_tx.send(Cmd::TunFdDead { msg: format!("tun fd 读取失败：{e}") });
-            return;
+            continue;
         }
         if n == 0 {
             return; // EOF：fd 被关
