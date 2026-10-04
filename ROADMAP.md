@@ -57,12 +57,14 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 | **R4** | 中继（信封 + 准入 + 升级条纹） | **完成**（2026-10-03：两道门全过 + 三链路判据实测 + 升级条纹实测） | 4/4 步 |
 | **R5** | 互操作矩阵全量 + fuzz + 性能 A/B + 台账三方门 | **完成**（2026-10-03：两道门全过〔两轮代码评审 4高/15中/18低全处置〕+ 终验轮 4 六链路 + L3 复跑全绿 + PERF-AB 入库 + ci-local 一键门全绿） | 6/6 步 |
 | **R6** | term 服务面（协议/surface 产出/检测引擎 + 自建编码器/应答器） | **完成**（2026-10-04 五棒收官：6a 设计 + 6b vt 底座 + 门一〔4高全修〕+ 6c 编码器/应答器全量〔键 387+/鼠 245/应答 64 向量全绿〕+ 6d 帧族/会话注册表 + 6e surface 体编码〔golden 两向全绿〕+ 6f-1/2 manifest 引擎+检测融合 + 6f-3a PTY/环 + 6f-3b 会话装配/引擎接线〔八模块装成 TermService：ServeConn/raw 腿握手与停滞写者/surface 投递/pump/sample/LIST/EXPLAIN/HOMEWAY_TERM=off；D-19 信号死 -1 映射〕+ 6g 判据实测〔Go term CLI 消费 Rust term 服务全流程 + 检测三态 + linux 交叉面清账 + 判据行入册〕+ 门二两轮〔高3+2/中4+3/低9+10 全处置，评审记录 docs/reviews/R6.md〕+ ci-local 七步全绿） | 6a-6g ✅ 门一/门二 ✅ |
-| **R7** | APP 接入（napi-rs 或 C-ABI 胶水 + OHOS 交叉 + 20 导出面 + hostsession） | 未开始 | — |
+| **R7** | APP 接入（napi-rs 或 C-ABI 胶水 + OHOS 交叉 + 20 导出面 + hostsession） | **进行中**（第 1 棒 7a–7f 完成 2026-10-04；第 2 棒 = HSP 集成〔用户触点〕，前置工单见 R7 节注记） | 6/9 步 |
 | **R8** | 终测收官（包体/性能终测 + 共存定案 + 文档指针补录） | 未开始 | — |
 
-**下一步（当前指针）**：**R7 APP 接入**（napi-rs OHOS 支持评估〔退路 = C-ABI +
-手写 NAPI 胶水，PoC 已验证交叉与链接配方〕→ 20 个导出面实装 → hostsession/facade
-→ HSP 集成〔动 tier 跟踪文件——用户触点〕→ 词表门三方化 → 真机判据全量）。
+**下一步（当前指针）**：**R7 第 2 棒 = HSP 集成**（extern "C" 壳 + 真 wgcore hub 接线 +
+版本注入管线 + tier build-core.sh 对接〔动 tier 跟踪文件——**用户触点**〕）。**开工前置**
+= ①用户确认发版会话收官状态与开工点头（硬规则 2）②`docs/reviews/R7-design.md` §二
+「第 2 棒开工前置工单」六项（世代生命周期/桥宿主线程模型/tun_stop 终态/传输期限/
+trait 签名统一/panic 策略——dsh r1 评审的结构性高危，接线即坏类）。
 **R7 开工前置**：①发版会话收官（homeway Go 侧 v0.16.0 之后有无在途 change——由
 用户确认）②用户点头（硬规则 2）。另带 **R5 移交的 CLI 双会话治理项**（Rust CLI
 files/speedtest 动词与常驻 connect 同 identity 并发的 foot-gun——与 hostsession/
@@ -581,6 +583,36 @@ OHOS 交叉与链接配方）→ 20 个导出面实装（语义真源 = `tier:AG
 文件，需用户触点**）→ 词表门三方化（tier `tools/gen` 生成物对齐）→ 真机判据全量
 （`attached（数据面已接管 fd=N，L3 直通）`、恢复阶梯真机时间窗、冻结/挂起恢复）。
 判据：真机全量判据 + 包体实测（对比 9.2MB，PoC 估 1.3–1.5MB）。
+
+**第 1 棒完成证据（2026-10-04，7a–7f 六工作单元，commit 43a6feb..HEAD）**：
+- **7a 基线重锚**：`621fe0e → d4148f6`（8 commit；向量 15 件字节零 drift、ledger 422 单元
+  不变、词表门 PASS）；影响清单逐 commit 入 `docs/BASELINE.md`——唯一需补 =
+  `term/service.rs` note_scrollbar 平移/非平移分流对齐基线 8167cb7（基线从快照时刻改随
+  成功入队帧推进、平移型回落不再强制全量；单测四路 + shifts 计数位）。
+- **7b 选型拍板**：**C-ABI + 手写 NAPI 胶水转正**（napi-rs 不采用——上游 OHOS 运行时支持
+  未文档化、实际依赖 245 星社区 fork；20 导出面全部同步请求/应答使 napi-rs 增值近零；
+  tier 四处同步契约按符号名闭合 ⇒ 原位换 .so、第 2 棒 tier diff 最小化）。决策矩阵 =
+  `docs/reviews/R7-design.md` §一。等价冒烟 = `cargo check --target
+  aarch64-unknown-linux-ohos`（core+cli）0 错 0 警（63c1281：target_env=ohos 的 ioctl
+  request 类型/time_t deprecated/EWOULDBLOCK 同值三处修复）。
+- **7c 20 导出面**：`facade/` 目录模块（stage/demand/tun_status/probe_json/portfwd/
+  term_op/files_op/speedtest_op/service_op/mod）；tunStatusJSON **完整键面**（含
+  stats/exitIp/link/portForwards/桥四键/identity 顶层键/tunIp/demand 可选三键）；
+  **Go 向量对照**（vecgen 阶段机 10 案真 Go 字节逐案相等；向量实证 readyBy 跨阶段持久）；
+  runner 期键面以构造输入键集合守卫（真机字节对账归第 2 棒）。TunExecutor trait 留缝。
+- **7d 服务桥 + 事件面**：`bridge_host.rs`（三座 UDS 桥宿主：48B 令牌鉴权/并发闸满员
+  自愈/死活残留区分/(dev,ino) 身份删除/退避重绑）+ `events.rs`（可轮询事件队列 +
+  冷启动快照——真 IPC 推送在 ArkTS 侧）；挂起预算/恢复语义确认 R2 已就位
+  （patrol_evidence_gate 五分支 + demand 新鲜期）。第 2 棒接真 Session。
+- **7e 会话锁**：`session_lock.rs`（flock 内核判活 + 持有者自述）接 CLI 五动词；
+  R6 前置批 rekey stall 根因形态的 CLI 面转正防线；App 侧第 2 棒复用（隧道/服务
+  会话不得并发）。工具脚本 16 处逃生口。
+- **7f 收口**：ci-local 七步全绿（2026-10-04 17:07 quick 档，RRR 矩阵 447s）+ dsh 外部
+  评审 r1（6 高 + 复核补 2 高）→ 「接线即坏」4 项当棒整改（eb3e6fa/2147b70）、结构性
+  4 项 + 中低危登记第 2 棒前置工单与顺手批（`docs/reviews/R7-design.md` §二）。
+- **留桩声明**（防「已实装」措辞掩盖）：speedtest 引擎未接桥（信封+参数门+拨号件在）、
+  service 三面是 rc 门+状态短路（真 Session 第 2 棒接）、portfwd 热替换承载默认 -1
+  （TunExecutor trait 面）、tun 域数据面执行体 = trait（真 hub 第 2 棒）。
 
 ## R8 终测收官
 
