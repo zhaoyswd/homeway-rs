@@ -46,7 +46,7 @@ pub struct TunShared {
     done: Mutex<bool>,
     done_cv: Condvar,
     /// 执行体世代的停止位（Go run.stop 的收口面：finish 里 close(r.stop) 同义——
-    /// 评审 r2-L12。世代线程构建 GenRun 后经 [`Self::set_stop_flag`] 登记；
+    /// 评审 r2-L12。世代线程入口经 [`Self::set_stop_flag_if_current`] 登记；
     /// `finish_generation` 对当前世代置位——保证收尾路径不依赖 request_stop 先行）。
     stop_flag: Mutex<Option<Arc<AtomicBool>>>,
 }
@@ -73,8 +73,13 @@ impl TunShared {
     }
 
     /// 执行体登记本世代的停止位（世代线程构建 GenRun 后调；世代起点换新）。
-    pub fn set_stop_flag(&self, f: Arc<AtomicBool>) {
-        *lock_unpoison(&self.stop_flag) = Some(f);
+    /// 带世代守卫（复核 r3-F11：-2 强放锁后被挂起 ≥3s 的旧线程恢复时不得把槽
+    /// 改回旧世代的旗标——冻结恢复是手机真实场景）。
+    pub fn set_stop_flag_if_current(&self, gen: u64, f: Arc<AtomicBool>) {
+        let mut slot = lock_unpoison(&self.stop_flag);
+        if self.gen.load(Ordering::Acquire) == gen || slot.is_none() {
+            *slot = Some(f);
+        }
     }
 
     /// 置当前世代的停止位（request_stop 之外的收口面：finish_generation 兜底；
@@ -138,7 +143,8 @@ impl TunShared {
     pub fn finish_generation(&self, gen: u64) {
         let snap = self.stage.snapshot();
         if snap.stage != TunStage::Failed {
-            self.stage.set_if_current(gen, TunStage::Idle, "", "", false);
+            self.stage
+                .set_if_current(gen, TunStage::Idle, "", "", false);
         }
         let is_current = self.gen.load(Ordering::Acquire) == gen;
         if is_current {
@@ -211,7 +217,11 @@ mod tests {
         sh.stage.set_if_current(1, TunStage::Attached, "", "", true);
         sh.finish_generation(1);
         assert!(!sh.probe_running.load(Ordering::Acquire), "收尾放锁");
-        assert_eq!(sh.stage.snapshot().stage, TunStage::Idle, "非 failed 回 idle");
+        assert_eq!(
+            sh.stage.snapshot().stage,
+            TunStage::Idle,
+            "非 failed 回 idle"
+        );
         assert_eq!(sh.stage.snapshot().code, "", "空码（stopped 码是窗口语义）");
         assert!(!sh.healthy.load(Ordering::Acquire));
         assert_eq!(*lock_unpoison(&sh.unhealthy_why), "stop");
@@ -223,7 +233,8 @@ mod tests {
     fn finish_keeps_failed() {
         let sh = TunShared::new();
         sh.begin_generation(1);
-        sh.stage.set_if_current(1, TunStage::Failed, "core", "启动失败", false);
+        sh.stage
+            .set_if_current(1, TunStage::Failed, "core", "启动失败", false);
         sh.finish_generation(1);
         assert_eq!(sh.stage.snapshot().stage, TunStage::Failed);
         assert_eq!(sh.stage.snapshot().code, "core");
@@ -237,7 +248,8 @@ mod tests {
         sh.begin_generation(1);
         sh.begin_generation(2); // 新世代接管
         sh.probe_running.store(true, Ordering::Release);
-        sh.stage.set_if_current(2, TunStage::Preparing, "", "", false);
+        sh.stage
+            .set_if_current(2, TunStage::Preparing, "", "", false);
         let _rx2 = sh.attach_receiver(); // 新世代注册自己的 attach 接收端
         sh.finish_generation(1); // 旧世代迟到收尾
         assert!(
@@ -284,7 +296,10 @@ mod tests {
             std::thread::sleep(std::time::Duration::from_millis(30));
             sh2.finish_generation(1);
         });
-        assert!(sh.wait_done(std::time::Duration::from_secs(2)), "收尾后被唤醒");
+        assert!(
+            sh.wait_done(std::time::Duration::from_secs(2)),
+            "收尾后被唤醒"
+        );
         t.join().unwrap();
     }
 
@@ -311,14 +326,20 @@ mod tests {
         let sh = TunShared::new();
         sh.begin_generation(1);
         let f1 = Arc::new(AtomicBool::new(false));
-        sh.set_stop_flag(Arc::clone(&f1));
+        sh.set_stop_flag_if_current(1, Arc::clone(&f1));
         sh.begin_generation(2); // 新起点：槽已清
         let f2 = Arc::new(AtomicBool::new(false));
-        sh.set_stop_flag(Arc::clone(&f2));
+        sh.set_stop_flag_if_current(2, Arc::clone(&f2));
         sh.finish_generation(1); // 旧世代迟到收尾
-        assert!(!f1.load(Ordering::Acquire), "旧世代收尾不动自己的旧位（已出槽）");
+        assert!(
+            !f1.load(Ordering::Acquire),
+            "旧世代收尾不动自己的旧位（已出槽）"
+        );
         assert!(!f2.load(Ordering::Acquire), "更不得动新世代的停止位");
         sh.finish_generation(2); // 当前世代收尾
-        assert!(f2.load(Ordering::Acquire), "收尾置当前世代停止位（Go close(r.stop) 同义）");
+        assert!(
+            f2.load(Ordering::Acquire),
+            "收尾置当前世代停止位（Go close(r.stop) 同义）"
+        );
     }
 }

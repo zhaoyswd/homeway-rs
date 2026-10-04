@@ -41,7 +41,9 @@ use super::portfwd::PortForwardRule;
 use super::stage::TunStage;
 use super::tun_shared::{lock_unpoison, TunShared};
 use super::tun_status::{LinkIn, RunnerIn, TransportIn};
-use super::{TunConfigJson, TunError, TunExecutor, ATTACH_DEADLINE, ATTACH_TIMEOUT_REASON, WARM_TIMEOUT};
+use super::{
+    TunConfigJson, TunError, TunExecutor, ATTACH_DEADLINE, ATTACH_TIMEOUT_REASON, WARM_TIMEOUT,
+};
 
 /// 巡检间隔（固定 60s——保活 + 可达性；与连接策略真源同值）。
 pub const PATROL_INTERVAL: Duration = Duration::from_secs(60);
@@ -144,15 +146,21 @@ impl WriteHalf for SessionWriteHalf {
 
 /// 恢复感知的会话流拨号（Go DialTCPPort 的等价面：healing_dial_port——首段短试 →
 /// 阶梯 R2 → 余预算重试）。隧道域桥消费。
-pub fn session_connect(run: &GenRun, port: u16, budget: Duration) -> io::Result<Box<dyn BridgeStream>> {
+pub fn session_connect(
+    run: &GenRun,
+    port: u16,
+    budget: Duration,
+) -> io::Result<Box<dyn BridgeStream>> {
     let dst = SocketAddrV4::new(crate::wgcore::SERVER_TUNNEL_IP, port);
     let gen_client = run.current_client();
     // 装配期拨号（世代在世但 Client 未起——理论窗口；桥 attached 后才有，防御性收口）
-    let gen_client = gen_client.ok_or_else(|| {
-        io::Error::new(io::ErrorKind::NotConnected, "世代装配中（数据面未就绪）")
-    })?;
+    let gen_client = gen_client
+        .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "世代装配中（数据面未就绪）"))?;
     let id = healing_dial(&gen_client, run, dst, budget)?;
-    let shared = Arc::new(SharedConn { client: gen_client, id });
+    let shared = Arc::new(SharedConn {
+        client: gen_client,
+        id,
+    });
     Ok(Box::new(SessionStream { shared }))
 }
 
@@ -164,7 +172,9 @@ pub(crate) struct SessionStream {
 impl SessionStream {
     /// 从会话句柄 + 流 id 构造（服务桥消费——dial_via_run）。
     pub(crate) fn shared(client: Arc<Client>, id: u64) -> Self {
-        SessionStream { shared: Arc::new(SharedConn { client, id }) }
+        SessionStream {
+            shared: Arc::new(SharedConn { client, id }),
+        }
     }
 }
 
@@ -173,8 +183,14 @@ impl BridgeStream for SessionStream {
         self: Box<Self>,
     ) -> io::Result<(Box<dyn Read + Send>, Box<dyn WriteHalf + Send>)> {
         Ok((
-            Box::new(SessionReadHalf { shared: Arc::clone(&self.shared), buf: Vec::new(), off: 0 }),
-            Box::new(SessionWriteHalf { shared: Arc::clone(&self.shared) }),
+            Box::new(SessionReadHalf {
+                shared: Arc::clone(&self.shared),
+                buf: Vec::new(),
+                off: 0,
+            }),
+            Box::new(SessionWriteHalf {
+                shared: Arc::clone(&self.shared),
+            }),
         ))
     }
 }
@@ -206,10 +222,10 @@ fn healing_dial(
     // 拨号失败 → 阶梯（世代还在就恢复它；引擎收工 = 如实报错）
     let rc = run.recover(Level::R2, "拨号失败");
     if matches!(rc, LadderRc::Recovered(_)) {
-        let remain = budget.saturating_sub(t0.elapsed()).max(Duration::from_millis(1));
-        return client
-            .connect_deadline(dst, remain)
-            .map_err(conn_err_to_io);
+        let remain = budget
+            .saturating_sub(t0.elapsed())
+            .max(Duration::from_millis(1));
+        return client.connect_deadline(dst, remain).map_err(conn_err_to_io);
     }
     Err(io::Error::new(
         io::ErrorKind::NotConnected,
@@ -246,7 +262,8 @@ pub struct GenRun {
     static_cands: Vec<Candidate>,
     /// 重建材料（Token 的身份面；候选 = static_cands 另存）。
     secret: [u8; 32],
-    #[allow(dead_code)] // 重建材料位（对齐 Go tunRun 的会话材料；隧道域不 rebuild——阶梯失败交扩展）
+    #[allow(dead_code)]
+    // 重建材料位（对齐 Go tunRun 的会话材料；隧道域不 rebuild——阶梯失败交扩展）
     peer_pub: [u8; 32],
     identity: Identity,
     /// 链路快照（runner link 段数据源；巡检写）。
@@ -330,7 +347,10 @@ fn run_round(run: &GenRun, from: Level, cause: &str) -> LadderRc {
         ));
         return LadderRc::ActionFailed("世代装配中".into());
     };
-    let mut tr = TunnelTransport { run, client: &client };
+    let mut tr = TunnelTransport {
+        run,
+        client: &client,
+    };
     let mut probe = |d: Duration| client.path_probe(d).is_ok();
     let mut deps = recover::LadderDeps {
         probe: &mut probe,
@@ -354,7 +374,10 @@ impl LadderTransport for TunnelTransport<'_> {
                 .client
                 .reset_peer_session_bounded(recover::ACTION)
                 .map_err(action_err),
-            Action::Rebind => self.client.rebind_bounded(recover::ACTION).map_err(action_err),
+            Action::Rebind => self
+                .client
+                .rebind_bounded(recover::ACTION)
+                .map_err(action_err),
             Action::Rearm => {
                 // R3 = 清采纳重赛跑 + 候选重投（Go Transport.Rearm 复合）
                 self.client
@@ -451,7 +474,11 @@ impl TunExecutor for TunnelExec {
                 STATS_SECS_DEFAULT
             },
             diag_fd_secs: cfg.diag_fd_secs.max(0),
-            dial_ms: if cfg.dial_ms > 0 { cfg.dial_ms } else { DIAL_MS_DEFAULT },
+            dial_ms: if cfg.dial_ms > 0 {
+                cfg.dial_ms
+            } else {
+                DIAL_MS_DEFAULT
+            },
             identity_dir: (!cfg.identity_dir.is_empty()).then(|| PathBuf::from(&cfg.identity_dir)),
             endpoint_cache_dir: (!cfg.endpoint_cache_dir.is_empty())
                 .then(|| PathBuf::from(&cfg.endpoint_cache_dir)),
@@ -474,17 +501,23 @@ impl TunExecutor for TunnelExec {
 
     fn request_stop(&self) {
         if let Some(run) = self.gen_run() {
-            run.stop.store(true, Ordering::Release);
-            let _ = run.ev_tx.try_send(GenEvent::Stop);
-            // preparing 阶段没有 fd 循环可打断，暖机探测可能挂在引擎 RPC 上——
-            // 关客户端是最可靠的第二条打断路径（Go tunStopWait 同义）。
-            if run.tun_shared.stage.snapshot().stage == TunStage::Preparing {
-                if let Some(c) = run.current_client() {
-                    c.stop();
+            // 陈旧世代（登记槽还挂着已死/在收尾的旧世代——新世代装配窗口）不处理，
+            // 落到共享面旗标中继（复核 r3-F2：M-2 的窗口在第 2+ 世代必须真正可达）
+            if run.gen == run.tun_shared.gen.load(Ordering::Acquire) {
+                run.stop.store(true, Ordering::Release);
+                let _ = run.ev_tx.try_send(GenEvent::Stop);
+                // preparing 阶段没有 fd 循环可打断，暖机探测可能挂在引擎 RPC 上——
+                // 关客户端是最可靠的第二条打断路径（Go tunStopWait 同义）。
+                if run.tun_shared.stage.snapshot().stage == TunStage::Preparing {
+                    if let Some(c) = run.current_client() {
+                        c.stop();
+                    }
                 }
+                return;
             }
-        } else if let Some(sh) = lock_unpoison(&self.shared).clone() {
-            // 世代句柄未就（identity 装配窗口——评审 r2-M2）：经共享面旗标中继，
+        }
+        if let Some(sh) = lock_unpoison(&self.shared).clone() {
+            // 世代句柄未就/陈旧（identity 装配窗口——评审 r2-M2）：经共享面旗标中继，
             // 世代线程在装配完成点统一收口
             sh.signal_stop();
         }
@@ -494,6 +527,11 @@ impl TunExecutor for TunnelExec {
         let Some(run) = self.gen_run() else {
             return -2; // 没有 attached 隧道（不构成网络结论）
         };
+        // 陈旧世代 → -2（复核 r3-F12：Go recoverTunnelReady 在该窗口明确 -2 并警告
+        // 非 -2 会让扩展做无意义恢复、甚至触发整套重建）
+        if run.gen != run.tun_shared.gen.load(Ordering::Acquire) {
+            return -2;
+        }
         let lvl = Level::clamp(from);
         run.recover(lvl, cause).as_rc()
     }
@@ -520,7 +558,11 @@ fn portfwd_states(run: &GenRun) -> Vec<super::tun_status::PfStateIn> {
         .iter()
         .map(|r| super::tun_status::PfStateIn {
             listen: r.listen,
-            target: if r.target_ip.is_empty() { format!(":{}", r.target_port) } else { format!("{}:{}", r.target_ip, r.target_port) },
+            target: if r.target_ip.is_empty() {
+                format!(":{}", r.target_port)
+            } else {
+                format!("{}:{}", r.target_ip, r.target_port)
+            },
             state: "listening".into(),
             err: String::new(),
             code: String::new(),
@@ -626,10 +668,30 @@ fn gen_loop(
     (logf)("传输：新栈（wg-native-stack）");
 
     // ---- 装配（identity/Client/缓存——Go startSession 段判据行同串）----
+    // 早段收尾守卫（复核 r3-F1：GenRun/Finish 挂上**之前**的失败路径〔空候选/身份
+    // 装配失败〕也必须 finish_generation——否则单飞锁泄漏、tun_stop 恒 -2；此前的
+    // 「接线即坏」同形态。真 Finish 挂上后 disarm，收尾义务交接）
+    struct EarlyFinish {
+        shared: Arc<TunShared>,
+        gen: u64,
+        disarmed: bool,
+    }
+    impl Drop for EarlyFinish {
+        fn drop(&mut self) {
+            if !self.disarmed {
+                self.shared.finish_generation(self.gen);
+            }
+        }
+    }
+    let mut _early = EarlyFinish {
+        shared: Arc::clone(&shared),
+        gen,
+        disarmed: false,
+    };
     // 停止位先登记进共享面：identity 装配窗口内的 request_stop（世代句柄未就）经
     // TunShared 的旗标中继，装配完成点统一收口（评审 r2-M2 的窗口语义）。
     let stop = Arc::new(AtomicBool::new(false));
-    shared.set_stop_flag(Arc::clone(&stop));
+    shared.set_stop_flag_if_current(gen, Arc::clone(&stop));
     let candidates: Vec<Candidate> = cfg
         .token
         .endpoints
@@ -642,16 +704,29 @@ fn gen_loop(
         })
         .collect();
     if candidates.is_empty() {
-        shared.stage.set_if_current(gen, TunStage::Failed, "core", "token 里没有任何可用端点", false);
+        shared.stage.set_if_current(
+            gen,
+            TunStage::Failed,
+            "core",
+            "token 里没有任何可用端点",
+            false,
+        );
         return;
     }
-    let (ident, src, warn) = match identity::load_or_create(cfg.identity_dir.as_deref(), &cfg.token.peer_id) {
-        Ok(v) => v,
-        Err(e) => {
-            shared.stage.set_if_current(gen, TunStage::Failed, "core", &format!("身份装配失败：{e}"), false);
-            return;
-        }
-    };
+    let (ident, src, warn) =
+        match identity::load_or_create(cfg.identity_dir.as_deref(), &cfg.token.peer_id) {
+            Ok(v) => v,
+            Err(e) => {
+                shared.stage.set_if_current(
+                    gen,
+                    TunStage::Failed,
+                    "core",
+                    &format!("身份装配失败：{e}"),
+                    false,
+                );
+                return;
+            }
+        };
     log_identity(&logf, &ident, src, warn, &cfg.identity_dir);
     // 缓存先开（Client 起来前的候选合并要用——我-2①）
     let cache = cfg.endpoint_cache_dir.map(|dir| {
@@ -688,11 +763,13 @@ fn gen_loop(
     *lock_unpoison(&state) = Some(Arc::clone(&run));
 
     // 世代退出收尾（一切路径经它——Go defer run.finish + closeClientOnce 的合成：
-    // client 停 + 缓存终写 + finish_generation；guard 挂在函数栈上，return 即收）
+    // client 停 + 缓存终写 + finish_generation + **登记槽清理**；guard 挂在函数栈上，
+    // return 即收）
     struct Finish {
         shared: Arc<TunShared>,
         gen: u64,
         run: Arc<GenRun>,
+        state: Arc<Mutex<Option<Arc<GenRun>>>>,
     }
     impl Drop for Finish {
         fn drop(&mut self) {
@@ -710,10 +787,26 @@ fn gen_loop(
             if let Some(c) = self.run.cache.as_ref() {
                 let _ = lock_unpoison(c).save(SystemTime::now());
             }
+            // 登记槽清理（复核 r3-F2：只清自己——ptr_eq 防误清接管者；清掉后新世代的
+            // 装配窗口里 gen_run() 返回 None ⇒ request_stop 走共享面旗标中继〔M-2
+            // 声称的窗口在第 2+ 世代真正可达〕）
+            {
+                let mut slot = lock_unpoison(&self.state);
+                if slot.as_ref().is_some_and(|cur| Arc::ptr_eq(cur, &self.run)) {
+                    *slot = None;
+                }
+            }
             self.shared.finish_generation(self.gen);
         }
     }
-    let _finish = Finish { shared: Arc::clone(&shared), gen, run: Arc::clone(&run) };
+    let _finish = Finish {
+        shared: Arc::clone(&shared),
+        gen,
+        run: Arc::clone(&run),
+        state: Arc::clone(&state),
+    };
+    // 收尾义务交接给真 Finish（早段守卫 disarm——见 EarlyFinish 注释）
+    _early.disarmed = true;
 
     let client = match Client::start(CoreConfig {
         peer_id: cfg.token.peer_id,
@@ -724,9 +817,13 @@ fn gen_loop(
     }) {
         Ok(c) => c,
         Err(e) => {
-            shared
-                .stage
-                .set_if_current(gen, TunStage::Failed, "core", &format!("新栈启动失败：数据面装配失败：{e}"), false);
+            shared.stage.set_if_current(
+                gen,
+                TunStage::Failed,
+                "core",
+                &format!("新栈启动失败：数据面装配失败：{e}"),
+                false,
+            );
             return;
         }
     };
@@ -734,13 +831,19 @@ fn gen_loop(
     // 装配窗口内收到 stop（评审 r2-M2 的窗口收口）：停在装配完成点，不进暖机
     if run.stop.load(Ordering::Acquire) {
         client.stop();
-        shared.stage.set_if_current(gen, TunStage::Idle, "stopped", "被停止请求中断", false);
+        shared
+            .stage
+            .set_if_current(gen, TunStage::Idle, "stopped", "被停止请求中断", false);
         (logf)("装配期间收到停止信号，收工（不进暖机）");
         return;
     }
     run.set_client(Arc::clone(&client));
     let tunnel_ip = crate::tunnel_addr::derive_tunnel_ip(&cfg.token.secret, &ident.public_key());
-    (logf)(&format!("新栈会话已建立（token 端点 {} 个，后端隧道地址 {}）", cfg.token.endpoints.len(), tunnel_ip));
+    (logf)(&format!(
+        "新栈会话已建立（token 端点 {} 个，后端隧道地址 {}）",
+        cfg.token.endpoints.len(),
+        tunnel_ip
+    ));
 
     // ---- 端点学习缓存接线（我-2 三缺的修复面）----
     // ① 首次候选合并喂给 bind（学习缓存里的历史端点进赛跑集——Go Transport 构造
@@ -808,45 +911,77 @@ fn gen_loop(
         Err(ConnErr::EngineGone) => {
             // stop 打断（request_stop 关了客户端）或引擎异常退出
             if run.stop.load(Ordering::Acquire) {
-                shared.stage.set_if_current(gen, TunStage::Idle, "stopped", "被停止请求中断", false);
+                shared.stage.set_if_current(
+                    gen,
+                    TunStage::Idle,
+                    "stopped",
+                    "被停止请求中断",
+                    false,
+                );
                 (logf)("暖机期间收到停止信号，收工（不等 attach）");
             } else {
-                shared.stage.set_if_current(gen, TunStage::Failed, "core", "暖机期间引擎异常退出", false);
+                shared.stage.set_if_current(
+                    gen,
+                    TunStage::Failed,
+                    "core",
+                    "暖机期间引擎异常退出",
+                    false,
+                );
             }
             return;
         }
         Err(e) => {
             (logf)(&format!("warmup ping: {e}"));
-            shared
-                .stage
-                .set_if_current(gen, TunStage::Failed, "core", &format!("建立隧道会话失败：{e}"), false);
+            shared.stage.set_if_current(
+                gen,
+                TunStage::Failed,
+                "core",
+                &format!("建立隧道会话失败：{e}"),
+                false,
+            );
             return;
         }
     };
     if run.stop.load(Ordering::Acquire) {
-        shared.stage.set_if_current(gen, TunStage::Idle, "stopped", "被停止请求中断", false);
+        shared
+            .stage
+            .set_if_current(gen, TunStage::Idle, "stopped", "被停止请求中断", false);
         (logf)("暖机期间收到停止信号，收工（不等 attach）");
         return;
     }
     // ---- 等 attach 的接收端先注册（评审 r2-M3：晚于 Ready 发布的窗口内投 fd 必
     // false ⇒ tun_attach -1 且 tier 侧不重试 ⇒ 整次连接失败；一行时序修复）----
     let fd_rx = shared.attach_receiver();
-    shared.stage.set_if_current(gen, TunStage::Ready, "", "", meowed);
+    shared
+        .stage
+        .set_if_current(gen, TunStage::Ready, "", "", meowed);
     // running 行打真实派生地址（L3 直通后 TUN 实际地址）
-    (logf)(&format!("running (mtu={} tunIp={})", cfg.mtu, run.tun_ip_string()));
+    (logf)(&format!(
+        "running (mtu={} tunIp={})",
+        cfg.mtu,
+        run.tun_ip_string()
+    ));
 
     // ---- 等 attach（60s 死线；fd 通道 = TunShared）----
     let deadline = Instant::now() + ATTACH_DEADLINE;
     let fd = loop {
         if run.stop.load(Ordering::Acquire) {
-            shared.stage.set_if_current(gen, TunStage::Idle, "stopped", "被停止请求中断", false);
+            shared
+                .stage
+                .set_if_current(gen, TunStage::Idle, "stopped", "被停止请求中断", false);
             (logf)("prepare 就绪后、attach 之前收到停止信号，收工");
             return;
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left.is_zero() {
             // 防止单飞锁被「无人推进的世代」长期占住（design 决策 5）
-            shared.stage.set_if_current(gen, TunStage::Idle, "attach-timeout", ATTACH_TIMEOUT_REASON, false);
+            shared.stage.set_if_current(
+                gen,
+                TunStage::Idle,
+                "attach-timeout",
+                ATTACH_TIMEOUT_REASON,
+                false,
+            );
             (logf)(&format!(
                 "prepare 后 {} 内没有 attach，自行收工并释放单飞锁（状态回 idle）",
                 crate::go_fmt::fmt_duration_go_secs(ATTACH_DEADLINE)
@@ -858,7 +993,13 @@ fn gen_loop(
             Err(mpsc::RecvTimeoutError::Timeout) => continue,
             Err(mpsc::RecvTimeoutError::Disconnected) => {
                 // 通道被收口（世代已被强制放锁后的迟到清理）
-                shared.stage.set_if_current(gen, TunStage::Idle, "stopped", "被停止请求中断", false);
+                shared.stage.set_if_current(
+                    gen,
+                    TunStage::Idle,
+                    "stopped",
+                    "被停止请求中断",
+                    false,
+                );
                 return;
             }
         }
@@ -877,15 +1018,23 @@ fn gen_loop(
     }
     if let Err(e) = client.attach_fd(fd, cfg.mtu) {
         if run.stop.load(Ordering::Acquire) {
-            shared.stage.set_if_current(gen, TunStage::Idle, "stopped", "被停止请求中断", false);
+            shared
+                .stage
+                .set_if_current(gen, TunStage::Idle, "stopped", "被停止请求中断", false);
             return;
         }
-        shared
-            .stage
-            .set_if_current(gen, TunStage::Failed, "attach", &format!("attach 失败：{e}"), false);
+        shared.stage.set_if_current(
+            gen,
+            TunStage::Failed,
+            "attach",
+            &format!("attach 失败：{e}"),
+            false,
+        );
         return;
     }
-    shared.stage.set_if_current(gen, TunStage::Attached, "", "", meowed);
+    shared
+        .stage
+        .set_if_current(gen, TunStage::Attached, "", "", meowed);
     (logf)(&format!("attached（数据面已接管 fd={fd}，L3 直通）"));
 
     // ---- 隧道桥（attached 后才起——「会话在桥在」）----
@@ -962,7 +1111,10 @@ fn gen_loop(
     // 留 1s 给桥停/client 收尾；评审 r2-H3：原每线程 2s 总 6s 恒超预算 ⇒ tun_stop
     // 常态化 -2。分片等待改造后三者 ≤~300ms 即退，2s 只是卡死兜底）
     let join_deadline = Instant::now() + Duration::from_secs(2);
-    for h in [patrol_handle, pusher_handle, stats_handle].into_iter().flatten() {
+    for h in [patrol_handle, pusher_handle, stats_handle]
+        .into_iter()
+        .flatten()
+    {
         while !h.is_finished() && Instant::now() < join_deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
@@ -997,7 +1149,9 @@ fn spawn_derived(
             let gen = run.gen;
             let logf = Arc::clone(&run.logf);
             if std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || body(run))).is_err() {
-                (logf)(&format!("{name}: 线程 panic（已兜住）—— 标记隧道不健康交扩展重建"));
+                (logf)(&format!(
+                    "{name}: 线程 panic（已兜住）—— 标记隧道不健康交扩展重建"
+                ));
                 r2.tun_shared.mark_unhealthy_if_current(gen, "panic");
             }
         })
@@ -1051,9 +1205,13 @@ fn tunnel_punch_to(run: &Arc<GenRun>, addr: SocketAddr) {
         }
         *lp = Some(Instant::now());
     }
-    let Some(client) = run.current_client() else { return };
+    let Some(client) = run.current_client() else {
+        return;
+    };
     let _ = client.rearm_soft();
-    (run.logf)(&format!("中继 hint {addr} → 重新武装候选赛跑，打一发握手兼打洞"));
+    (run.logf)(&format!(
+        "中继 hint {addr} → 重新武装候选赛跑，打一发握手兼打洞"
+    ));
     // 打洞探测（5s 预算；refused = 路径通——RST 说明握手与路径都通了）
     match client.path_probe(Duration::from_secs(5)) {
         Ok(()) => {
@@ -1066,7 +1224,9 @@ fn tunnel_punch_to(run: &Arc<GenRun>, addr: SocketAddr) {
             }
         }
         Err(e) => {
-            (run.logf)(&format!("打洞后探测未成功（{e}）—— 继续停留在原路径（中继/旧直连）"));
+            (run.logf)(&format!(
+                "打洞后探测未成功（{e}）—— 继续停留在原路径（中继/旧直连）"
+            ));
         }
     }
 }
@@ -1100,8 +1260,12 @@ fn log_identity(
     src: identity::IdentitySource,
     warn: Option<String>,
     dir: &Option<PathBuf>,
-) {    use identity::IdentitySource;
-    let dir_text = dir.as_ref().map(|d| d.display().to_string()).unwrap_or_default();
+) {
+    use identity::IdentitySource;
+    let dir_text = dir
+        .as_ref()
+        .map(|d| d.display().to_string())
+        .unwrap_or_default();
     match src {
         IdentitySource::Created => (logf)(&format!(
             "身份：新建（dev={} pub={}，目录 {dir_text}）",
@@ -1122,7 +1286,9 @@ fn log_identity(
         IdentitySource::Ephemeral => {}
     }
     if let Some(w) = warn {
-        (logf)(&format!("身份：不可持久化（{w}）—— 本次用临时身份建连；重连会换钥匙（出口会多占一条记录）"));
+        (logf)(&format!(
+            "身份：不可持久化（{w}）—— 本次用临时身份建连；重连会换钥匙（出口会多占一条记录）"
+        ));
     }
 }
 
@@ -1258,7 +1424,8 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
         }
         // ---- 失败证据的需求门控（demand-driven-recovery）----
         let (demand_active, demand_why) = run.demand.patrol_demand(out_pkts, Instant::now());
-        run.demand.note_demand(demand_active, demand_why, now_unix_ms());
+        run.demand
+            .note_demand(demand_active, demand_why, now_unix_ms());
         // 环境噪声双信号（Go tunmode.go:1024-1027 同构——拍板①补全）：
         // ① 全候选发送统计：尝试>0 且全部本地失败 = 环境性禁发（挂起 EPERM 全候选
         //    皆败；蜂窝下 LAN 候选 ENETUNREACH 但中继发得出去 ⇒ 不算全失败）——
@@ -1284,8 +1451,14 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
             local_noise
         };
         let probe_ok = probe.is_ok();
-        let (new_streak, counted) =
-            evidence_gate(local_noise, demand_active, fail_streak, last_counted, now, probe_ok);
+        let (new_streak, counted) = evidence_gate(
+            local_noise,
+            demand_active,
+            fail_streak,
+            last_counted,
+            now,
+            probe_ok,
+        );
         fail_streak = new_streak;
         if !probe_ok {
             if !counted {
@@ -1305,7 +1478,12 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
                     (run.logf)(&format!("需求恢复（{demand_why}）：巡检失败重新计入证据"));
                 }
                 last_counted = Some(now);
-                (run.logf)(&format!("对端巡检失败 {}/{}: {}", fail_streak, FAIL_STREAK_LADDER, probe.unwrap_err()));
+                (run.logf)(&format!(
+                    "对端巡检失败 {}/{}: {}",
+                    fail_streak,
+                    FAIL_STREAK_LADDER,
+                    probe.unwrap_err()
+                ));
                 // 失败当拍进 R1（补注册 + 丢会话，保采纳）——出口重启/记录被回收时
                 // 手机侧没有别的信号，原本要等 3 连败，现在本次巡检内就能恢复。
                 let rc = run.recover(Level::R1, "巡检失败");
@@ -1351,12 +1529,13 @@ fn evidence_gate(
     if local_noise || !demand {
         return (0, false);
     }
-    let fail_streak =
-        if fail_streak > 0 && last_counted.is_some_and(|t| now.duration_since(t) > PATROL_FAIL_WINDOW) {
-            0
-        } else {
-            fail_streak
-        };
+    let fail_streak = if fail_streak > 0
+        && last_counted.is_some_and(|t| now.duration_since(t) > PATROL_FAIL_WINDOW)
+    {
+        0
+    } else {
+        fail_streak
+    };
     (fail_streak + 1, true)
 }
 
@@ -1372,7 +1551,11 @@ fn noise_escalated(noise: bool, since: Option<Instant>, now: Instant) -> (bool, 
 }
 
 fn relay_upgrade_streak(via: Via, streak: u32) -> u32 {
-    if via == Via::Relay { streak + 1 } else { 0 }
+    if via == Via::Relay {
+        streak + 1
+    } else {
+        0
+    }
 }
 
 fn relay_upgrade_due(via: Via, streak: u32) -> bool {
@@ -1423,9 +1606,13 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
             if run.stop.load(Ordering::Acquire) {
                 return;
             }
-            std::thread::sleep(Duration::from_millis(100).min(next.saturating_duration_since(Instant::now())));
+            std::thread::sleep(
+                Duration::from_millis(100).min(next.saturating_duration_since(Instant::now())),
+            );
         }
-        let Some(client) = run.current_client() else { continue };
+        let Some(client) = run.current_client() else {
+            continue;
+        };
         let snap = client.snapshot();
         if snap.rx != last_rx {
             last_rx = snap.rx;
@@ -1469,7 +1656,8 @@ fn stats_loop(run: Arc<GenRun>, stats_secs: i64, diag_fd_secs: i64) {
             if run.stop.load(Ordering::Acquire) {
                 return;
             }
-            let nap = Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now()));
+            let nap =
+                Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now()));
             std::thread::sleep(nap);
         }
         elapsed += stats_secs.max(STATS_SECS_MIN);
@@ -1477,7 +1665,9 @@ fn stats_loop(run: Arc<GenRun>, stats_secs: i64, diag_fd_secs: i64) {
             .current_client()
             .map(|c| c.tun_stats())
             .unwrap_or((0, 0));
-        (run.logf)(&format!("stats: fdReadBytes={rd}B fdWriteBytes={wr}B ｜ pf=0/0"));
+        (run.logf)(&format!(
+            "stats: fdReadBytes={rd}B fdWriteBytes={wr}B ｜ pf=0/0"
+        ));
         // 基线一行 + 可选周期快照（fd 快照面 OHOS 沙箱受限——不打，登记）
         if !base_done || (diag_fd_secs > 0 && elapsed - last_diag >= diag_fd_secs) {
             base_done = true;
@@ -1513,7 +1703,9 @@ fn open_gen_log(out: &str) -> Result<FileLogf, String> {
 
 pub(crate) fn local_ts() -> String {
     // 本地时间紧凑形（判据行 grep 消息本体；时间戳供人工排查）
-    let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default();
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
     let secs = now.as_secs() as i64;
     let ms = now.subsec_millis();
     // 无时区库依赖的本地近似：直接 UTC+8 不可取；用 libc::localtime_r
@@ -1551,7 +1743,65 @@ fn is_lan_addr(ap: SocketAddr) -> bool {
     }
     if let std::net::IpAddr::V4(v4) = ip {
         let o = v4.octets();
-        return o[0] == 10 || o[0] == 172 && (16..=31).contains(&o[1]) || o[0] == 192 && o[1] == 168;
+        return o[0] == 10
+            || o[0] == 172 && (16..=31).contains(&o[1])
+            || o[0] == 192 && o[1] == 168;
     }
     false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::facade::{ClientCore, TunStage};
+    use crate::token::{self, EndpointKind, EndpointRef, PeerId, Secret, TokenSpec};
+
+    /// 复核 r3-F1：空候选早退路径（域名端点——token 解析接受、候选解析只收 IP ⇒ 空）
+    /// 必须放单飞锁——下一次 prepare 可受理。回归背景：EarlyFinish 守卫引入前该路径
+    /// 漏 finish_generation ⇒ tun_prepare 之后恒 -1、tun_stop 恒 -2（接线即坏同形态）。
+    #[test]
+    fn tunnel_empty_candidates_releases_lock() {
+        let peer = PeerId::from([1u8; 32]);
+        let secret = Secret::from([2u8; 32]);
+        let eps = [EndpointRef::new(
+            "home.example.com:443",
+            EndpointKind::Direct,
+        )];
+        let tok = token::encode(&TokenSpec {
+            peer_id: &peer,
+            secret: &secret,
+            endpoints: &eps,
+        })
+        .expect("域名端点 token 可编码");
+        let demand = Arc::new(DemandSignals::new());
+        let exec = TunnelExec::new(Arc::clone(&demand));
+        let core = ClientCore::with_shared(exec, demand);
+        assert_eq!(
+            core.tun_prepare(&format!(r#"{{"token":"{tok}"}}"#), true),
+            0
+        );
+        // 等世代线程走到 failed 终态（放锁发生在 finish_generation）
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while core.tun_status().contains("\"state\":\"preparing\"") {
+            assert!(Instant::now() < deadline, "空候选应在 3s 内落 failed 终态");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            core.tun_status().contains("\"state\":\"failed\""),
+            "空候选 = failed 终态"
+        );
+        // 锁已放：下一次 prepare 可受理（不是 -1 忙）
+        assert_eq!(
+            core.tun_prepare(&format!(r#"{{"token":"{tok}"}}"#), true),
+            0
+        );
+        // 收尾：等第二次也落终态再停（避免测试进程留下游离世代线程）
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while core.tun_status().contains("\"state\":\"preparing\"") {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(core.tun_stop(), 0, "失败终态后 stop 应即收 0");
+        let _ = TunStage::Idle; // 引用 stage 枚举（保持 import）
+    }
 }

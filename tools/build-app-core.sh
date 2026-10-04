@@ -46,10 +46,12 @@ if [ ! -x "${NM}" ]; then
   exit 1
 fi
 
-# 版本注入串：核源 SHA（+dirty 标记）——与 tier build-core.sh 的注入口径同形
+# 版本注入串：核源 SHA（+dirty 标记）——与 tier build-core.sh 的注入口径同形。
+# dirty 判定路径集与 tier 侧闸门一致（复核 r3-F9：crates/tools/fixtures/Cargo.*/
+# .cargo/rust-toolchain.toml——两侧不一致会让 dev 模式的 +dirty 标记错位）
 SHA="$(git -C "$ROOT" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
 DIRTY=""
-if [ -n "$(git -C "$ROOT" status --porcelain -- crates 2>/dev/null)" ]; then
+if [ -n "$(git -C "$ROOT" status --porcelain -- crates tools fixtures Cargo.toml Cargo.lock .cargo rust-toolchain.toml 2>/dev/null)" ]; then
   DIRTY="+dirty"
 fi
 INJECT_VER="${SHA}${DIRTY}-rust"

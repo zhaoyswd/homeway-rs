@@ -70,7 +70,11 @@ fn ret_cstring(s: &str) -> *mut std::os::raw::c_char {
                 if buf.is_null() {
                     return empty_cstr();
                 }
-                std::ptr::copy_nonoverlapping(bytes.as_ptr() as *const std::os::raw::c_char, buf, len);
+                std::ptr::copy_nonoverlapping(
+                    bytes.as_ptr() as *const std::os::raw::c_char,
+                    buf,
+                    len,
+                );
                 buf
             }
         }
@@ -112,11 +116,10 @@ pub extern "C" fn ClientCoreVersion() -> *mut std::os::raw::c_char {
 
 /// ClientCoreTunPrepare：0 已开始 / -1 忙 / -2 日志打不开 / -3 参数错（含 token 空）。
 #[no_mangle]
-pub extern "C" fn ClientCoreTunPrepare(c_config: *const std::os::raw::c_char) -> std::os::raw::c_int {
-    guard(
-        || core().tun_prepare(&arg_str(c_config), true),
-        || -9,
-    )
+pub extern "C" fn ClientCoreTunPrepare(
+    c_config: *const std::os::raw::c_char,
+) -> std::os::raw::c_int {
+    guard(|| core().tun_prepare(&arg_str(c_config), true), || -9)
 }
 
 /// ClientCoreTunAttach：0 已接管 / -1 无 ready 世代 / -3 fd≤0 / -4 接管失败 / -5 轮询超时。
@@ -148,7 +151,9 @@ pub extern "C" fn ClientCoreTunRecover(from: std::os::raw::c_int) -> std::os::ra
 
 /// ClientCoreTunSetPortForwards：运行中整表热替换（0/-1/-2）。
 #[no_mangle]
-pub extern "C" fn ClientCoreTunSetPortForwards(c_cfg: *const std::os::raw::c_char) -> std::os::raw::c_int {
+pub extern "C" fn ClientCoreTunSetPortForwards(
+    c_cfg: *const std::os::raw::c_char,
+) -> std::os::raw::c_int {
     guard(|| core().tun_set_port_forwards(&arg_str(c_cfg)), || -9)
 }
 
@@ -166,19 +171,15 @@ pub extern "C" fn ClientCoreTunSetForeground(fg: std::os::raw::c_int) -> std::os
 
 /// ClientCoreTunSetActivity：需求信号每拍下发（fg/screen）。
 #[no_mangle]
-pub extern "C" fn ClientCoreTunSetActivity(
-    fg: std::os::raw::c_int,
-    screen: std::os::raw::c_int,
-) {
-    guard(
-        || core().tun_set_activity(fg != 0, screen != 0),
-        || (),
-    )
+pub extern "C" fn ClientCoreTunSetActivity(fg: std::os::raw::c_int, screen: std::os::raw::c_int) {
+    guard(|| core().tun_set_activity(fg != 0, screen != 0), || ())
 }
 
 /// ClientCoreProbeAddr：token 本地解析（不联网）。
 #[no_mangle]
-pub extern "C" fn ClientCoreProbeAddr(c_token: *const std::os::raw::c_char) -> *mut std::os::raw::c_char {
+pub extern "C" fn ClientCoreProbeAddr(
+    c_token: *const std::os::raw::c_char,
+) -> *mut std::os::raw::c_char {
     guard(
         || ret_cstring(&core().probe_addr(&arg_str(c_token))),
         empty_cstr,
@@ -189,7 +190,9 @@ pub extern "C" fn ClientCoreProbeAddr(c_token: *const std::os::raw::c_char) -> *
 /// 进程旁路（独立临时 socket、无身份明文包，不碰在跑会话），总预算 ~3s。
 /// results 只含应答端点（死端点静默；中继应答为尾部能力）。
 #[no_mangle]
-pub extern "C" fn ClientCoreProbeReach(c_token: *const std::os::raw::c_char) -> *mut std::os::raw::c_char {
+pub extern "C" fn ClientCoreProbeReach(
+    c_token: *const std::os::raw::c_char,
+) -> *mut std::os::raw::c_char {
     guard(
         || {
             let report = probe_reach_report(&arg_str(c_token));
@@ -258,14 +261,14 @@ fn probe_reach_report(
                 let addr = *addr;
                 let relay = *relay;
                 s.spawn(move || {
-                    probe::ping_ex(addr, probe::PROBE_PAD, budget).ok().map(|r| {
-                        homeway_core::facade::probe_json::ReachEntry {
+                    probe::ping_ex(addr, probe::PROBE_PAD, budget)
+                        .ok()
+                        .map(|r| homeway_core::facade::probe_json::ReachEntry {
                             ep: addr.to_string(),
                             rtt_ms: r.rtt.as_millis() as i64,
                             build: r.build,
                             relay,
-                        }
-                    })
+                        })
                 })
             })
             .collect();
@@ -275,9 +278,7 @@ fn probe_reach_report(
             .collect()
     });
     let mut m = homeway_core::facade::probe_json::ReachReport {
-        peer: tok
-            .peer_id
-            .as_bytes()[..6]
+        peer: tok.peer_id.as_bytes()[..6]
             .iter()
             .map(|b| format!("{b:02x}"))
             .collect(),
@@ -297,7 +298,9 @@ fn probe_reach_report(
 
 /// ClientCoreServiceStart：服务会话（App 进程内、无 TUN 的 WG 会话 + 三座桥）。
 #[no_mangle]
-pub extern "C" fn ClientCoreServiceStart(c_config: *const std::os::raw::c_char) -> std::os::raw::c_int {
+pub extern "C" fn ClientCoreServiceStart(
+    c_config: *const std::os::raw::c_char,
+) -> std::os::raw::c_int {
     guard(|| core().service_start(&arg_str(c_config)), || -9)
 }
 
@@ -315,7 +318,9 @@ pub extern "C" fn ClientCoreServiceStatus() -> *mut std::os::raw::c_char {
 
 /// ClientCoreFilesCall：文件管理单导出（操作名分发）。
 #[no_mangle]
-pub extern "C" fn ClientCoreFilesCall(c_op: *const std::os::raw::c_char) -> *mut std::os::raw::c_char {
+pub extern "C" fn ClientCoreFilesCall(
+    c_op: *const std::os::raw::c_char,
+) -> *mut std::os::raw::c_char {
     guard(
         || ret_cstring(&core().files_call(&arg_str(c_op))),
         empty_cstr,
@@ -324,7 +329,9 @@ pub extern "C" fn ClientCoreFilesCall(c_op: *const std::os::raw::c_char) -> *mut
 
 /// ClientCoreTermCall：终端一次性操作（list/kill）。
 #[no_mangle]
-pub extern "C" fn ClientCoreTermCall(c_op: *const std::os::raw::c_char) -> *mut std::os::raw::c_char {
+pub extern "C" fn ClientCoreTermCall(
+    c_op: *const std::os::raw::c_char,
+) -> *mut std::os::raw::c_char {
     guard(
         || ret_cstring(&core().term_call(&arg_str(c_op))),
         empty_cstr,
@@ -334,7 +341,9 @@ pub extern "C" fn ClientCoreTermCall(c_op: *const std::os::raw::c_char) -> *mut 
 /// ClientCoreSpeedTestStart：同步跑完整轮（NAPI 在 async work 线程上调）——busy 门 +
 /// Cancel 真取消在 SpeedHost。
 #[no_mangle]
-pub extern "C" fn ClientCoreSpeedTestStart(c_params: *const std::os::raw::c_char) -> *mut std::os::raw::c_char {
+pub extern "C" fn ClientCoreSpeedTestStart(
+    c_params: *const std::os::raw::c_char,
+) -> *mut std::os::raw::c_char {
     guard(
         || ret_cstring(&speed().start(&arg_str(c_params))),
         empty_cstr,

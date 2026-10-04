@@ -137,12 +137,8 @@ impl TunError {
 /// - `request_stop` 要能打断暖机（Go：关客户端是第二条打断路径）。
 pub trait TunExecutor: Send + Sync {
     /// 暖机一个世代（启动即返；见模块头生命周期契约）。
-    fn warmup(
-        &self,
-        cfg: &TunConfigJson,
-        shared: Arc<TunShared>,
-        gen: u64,
-    ) -> Result<(), TunError>;
+    fn warmup(&self, cfg: &TunConfigJson, shared: Arc<TunShared>, gen: u64)
+        -> Result<(), TunError>;
     /// 请求世代收工（幂等信号；要能打断暖机中的阻塞调用）。
     fn request_stop(&self);
     /// 恢复阶梯入口（from 起跑档位；rc 契约见 session::LadderRc::as_rc）。
@@ -304,7 +300,9 @@ impl ClientCore {
         let gen = self.tun.gen.fetch_add(1, Ordering::AcqRel) + 1;
         self.tun.begin_generation(gen); // 写入权交接 + done/attach 通道/停止位槽复位
         self.tun.begin_healthy(); // 新世代不带上一世代的分类残留（先清——顺序即注释）
-        self.tun.stage.set_if_current(gen, TunStage::Preparing, "", "", false);
+        self.tun
+            .stage
+            .set_if_current(gen, TunStage::Preparing, "", "", false);
         match self.executor().warmup(&cfg, Arc::clone(&self.tun), gen) {
             Ok(()) => 0,
             Err(e) => {
@@ -320,9 +318,13 @@ impl ClientCore {
                 }
                 // 同步硬失败（如线程 spawn 失败）：世代就地收尾（failed 终态 + 放锁）。
                 // 仍返回受理 0——失败原因经 tun_status 读（Go goroutine 内失败同语义）。
-                self.tun
-                    .stage
-                    .set_if_current(gen, TunStage::Failed, e.code(), &e.to_string(), false);
+                self.tun.stage.set_if_current(
+                    gen,
+                    TunStage::Failed,
+                    e.code(),
+                    &e.to_string(),
+                    false,
+                );
                 self.tun.finish_generation(gen);
                 0
             }
@@ -336,7 +338,9 @@ impl ClientCore {
     pub fn tun_attach(&self, fd: i32, mtu: u32) -> i32 {
         let _ = mtu; // mtu 由世代线程从 cfg 读（fd 通道只传 fd——Go attachCh 同形）
         if fd <= 0 {
-            self.tun.stage.set(TunStage::Failed, "attach", "attach 收到非法 fd", false);
+            self.tun
+                .stage
+                .set(TunStage::Failed, "attach", "attach 收到非法 fd", false);
             return -3;
         }
         let snap = self.tun.stage.snapshot();
@@ -433,7 +437,8 @@ impl ClientCore {
     /// Go 同串）。
     pub fn tun_recover(&self, from: i64) -> i32 {
         let lvl = crate::session::recover::Level::clamp(from);
-        self.executor().recover(from, &format!("扩展下推({})", lvl.name()))
+        self.executor()
+            .recover(from, &format!("扩展下推({})", lvl.name()))
     }
 
     // ---- ⑦ ClientCoreTunRunning ----
@@ -583,7 +588,9 @@ mod tests {
                 // 窗口内投 fd 必须可达；假件此前反序，µs 级竞态偶发 -1〔终轮 ci 实抓〕）
                 let fd_rx = shared.attach_receiver();
                 if warmup_ok {
-                    shared.stage.set_if_current(gen, TunStage::Ready, "", "", true);
+                    shared
+                        .stage
+                        .set_if_current(gen, TunStage::Ready, "", "", true);
                     shared.stage.set_ready_by("wg");
                 } else {
                     shared.stage.set_if_current(
@@ -601,7 +608,9 @@ mod tests {
                     match fd_rx.recv_timeout(Duration::from_millis(200)) {
                         Ok(_fd) => {
                             if attach_ok {
-                                shared.stage.set_if_current(gen, TunStage::Attached, "", "", true);
+                                shared
+                                    .stage
+                                    .set_if_current(gen, TunStage::Attached, "", "", true);
                                 // 挂到 stop 才收尾
                                 while !stop.load(Ordering::Acquire) {
                                     std::thread::sleep(Duration::from_millis(20));
@@ -664,7 +673,11 @@ mod tests {
         let deadline = std::time::Instant::now() + budget;
         while core.tun.stage.snapshot().stage != want {
             if std::time::Instant::now() >= deadline {
-                panic!("等 stage={:?} 超时（现 {:?}）", want, core.tun.stage.snapshot().stage);
+                panic!(
+                    "等 stage={:?} 超时（现 {:?}）",
+                    want,
+                    core.tun.stage.snapshot().stage
+                );
             }
             std::thread::sleep(Duration::from_millis(10));
         }
@@ -714,7 +727,10 @@ mod tests {
         assert_eq!(core3.tun_prepare(r#"{"token":"hmw1-x"}"#, true), 0);
         wait_stage(&core3, TunStage::Ready, Duration::from_secs(2));
         assert_eq!(core3.tun_attach(90, 1280), -4);
-        assert!(core3.tun_status().contains("\"state\":\"failed\""), "failed 终态保留");
+        assert!(
+            core3.tun_status().contains("\"state\":\"failed\""),
+            "failed 终态保留"
+        );
         assert_eq!(core3.tun_running(), 0);
         // failed 后锁已放：可重新 prepare
         assert_eq!(core3.tun_prepare(r#"{"token":"hmw1-x"}"#, true), 0);
@@ -770,12 +786,16 @@ mod tests {
         assert_eq!(core.tun_set_port_forwards("{oops"), -2);
         // 校验不过（listen 0）→ -2
         assert_eq!(
-            core.tun_set_port_forwards(r#"{"portForwards":[{"listen":0,"targetIp":"","targetPort":80}]}"#),
+            core.tun_set_port_forwards(
+                r#"{"portForwards":[{"listen":0,"targetIp":"","targetPort":80}]}"#
+            ),
             -2
         );
         // 未 attached → -1
         assert_eq!(
-            core.tun_set_port_forwards(r#"{"portForwards":[{"listen":18080,"targetIp":"","targetPort":80}]}"#),
+            core.tun_set_port_forwards(
+                r#"{"portForwards":[{"listen":18080,"targetIp":"","targetPort":80}]}"#
+            ),
             -1
         );
         core.tun_prepare(r#"{"token":"hmw1-x"}"#, true);
@@ -784,7 +804,9 @@ mod tests {
         wait_stage(&core, TunStage::Attached, Duration::from_secs(2));
         // attached 后过了门，执行体无承载 ⇒ 仍 -1（改动随下次连接生效——语义正确）
         assert_eq!(
-            core.tun_set_port_forwards(r#"{"portForwards":[{"listen":18080,"targetIp":"","targetPort":80}]}"#),
+            core.tun_set_port_forwards(
+                r#"{"portForwards":[{"listen":18080,"targetIp":"","targetPort":80}]}"#
+            ),
             -1
         );
     }
@@ -837,7 +859,12 @@ mod tests {
     /// 尾 ⇒ App 轮询面停在 preparing/running:0 永远等不到结果）。
     struct LogOpenExec;
     impl TunExecutor for LogOpenExec {
-        fn warmup(&self, _cfg: &TunConfigJson, _shared: Arc<TunShared>, _gen: u64) -> Result<(), TunError> {
+        fn warmup(
+            &self,
+            _cfg: &TunConfigJson,
+            _shared: Arc<TunShared>,
+            _gen: u64,
+        ) -> Result<(), TunError> {
             Err(TunError::LogOpen("permission denied".into()))
         }
         fn request_stop(&self) {}
@@ -857,7 +884,10 @@ mod tests {
         let core = ClientCore::new(Arc::new(LogOpenExec));
         assert_eq!(core.tun_prepare(r#"{"token":"hmw1-x"}"#, true), -2);
         let st = core.tun_status();
-        assert!(st.contains("\"state\":\"idle\""), "log -2 后不得停在 preparing：{st}");
+        assert!(
+            st.contains("\"state\":\"idle\""),
+            "log -2 后不得停在 preparing：{st}"
+        );
         // 锁已放：可再次受理
         assert_eq!(core.tun_prepare(r#"{"token":"hmw1-x"}"#, true), -2);
     }

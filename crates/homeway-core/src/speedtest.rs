@@ -204,7 +204,8 @@ impl Frame {
         self.buf.extend_from_slice(&MAGIC);
         self.buf.push(typ);
         self.buf.extend_from_slice(&seq.to_le_bytes());
-        self.buf.extend_from_slice(&(payload_len as u16).to_le_bytes());
+        self.buf
+            .extend_from_slice(&(payload_len as u16).to_le_bytes());
         self.buf.extend_from_slice(&crc.to_le_bytes());
     }
 
@@ -255,7 +256,10 @@ impl SpeedConn for ClientConn {
         let mut off = 0;
         let mut zero_streak = 0u32;
         while off < data.len() {
-            let n = self.client.write(self.id, data[off..].to_vec()).map_err(SpeedtestError::Conn)?;
+            let n = self
+                .client
+                .write(self.id, data[off..].to_vec())
+                .map_err(SpeedtestError::Conn)?;
             if n == 0 {
                 zero_streak += 1;
                 if zero_streak > 1_000_000 {
@@ -281,14 +285,16 @@ impl SpeedConn for ClientConn {
     }
 }
 
-
 enum FrameIn {
     /// data 帧：载荷已在读侧消耗丢弃，只回长度（下行零拷贝读路径）。
-    Data { payload_len: usize },
-    Other { typ: u8, payload: Vec<u8> },
+    Data {
+        payload_len: usize,
+    },
+    Other {
+        typ: u8,
+        payload: Vec<u8>,
+    },
 }
-
-
 
 /// 流式帧读取器（TCP 是字节流：块边界 ≠ 帧边界——读进内部缓冲后按帧解析；
 /// data 帧载荷不拷出（下行计数按头长度），控制帧载荷带回）。
@@ -298,7 +304,9 @@ struct FrameReader {
 
 impl FrameReader {
     fn new() -> Self {
-        Self { buf: Vec::with_capacity(128 * 1024) }
+        Self {
+            buf: Vec::with_capacity(128 * 1024),
+        }
     }
 
     /// 读一帧：内部缓冲不足时从连接补读（SpeedConn 面——桥/直连同构）。
@@ -323,11 +331,16 @@ impl FrameReader {
         let n = HEADER + head.len;
         if head.typ == TYPE_DATA {
             self.buf.drain(..n);
-            return Ok(Some(FrameIn::Data { payload_len: head.len }));
+            return Ok(Some(FrameIn::Data {
+                payload_len: head.len,
+            }));
         }
         let payload = payload.to_vec();
         self.buf.drain(..n);
-        Ok(Some(FrameIn::Other { typ: head.typ, payload }))
+        Ok(Some(FrameIn::Other {
+            typ: head.typ,
+            payload,
+        }))
     }
 }
 
@@ -532,7 +545,8 @@ impl LiveProgress {
     }
 
     fn add_bytes(&self, n: i64) {
-        self.bytes.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+        self.bytes
+            .fetch_add(n, std::sync::atomic::Ordering::Relaxed);
     }
 
     fn reset(&self) {
@@ -543,8 +557,14 @@ impl LiveProgress {
     /// (phase, 累计字节)——status 面消费；phase 词面 "down"/"up"/None。
     pub fn snapshot(&self) -> (Option<&'static str>, i64) {
         match self.phase.load(std::sync::atomic::Ordering::Acquire) {
-            1 => (Some("down"), self.bytes.load(std::sync::atomic::Ordering::Relaxed)),
-            2 => (Some("up"), self.bytes.load(std::sync::atomic::Ordering::Relaxed)),
+            1 => (
+                Some("down"),
+                self.bytes.load(std::sync::atomic::Ordering::Relaxed),
+            ),
+            2 => (
+                Some("up"),
+                self.bytes.load(std::sync::atomic::Ordering::Relaxed),
+            ),
             _ => (None, 0),
         }
     }
@@ -567,11 +587,28 @@ fn watchdog_cancellable(
         if let Some(cx) = external_cancel {
             if cx.load(std::sync::atomic::Ordering::Acquire) {
                 cancelled.store(true, std::sync::atomic::Ordering::Release);
-                let conns = conns.lock().expect("连接表锁中毒").clone();
-                for c in conns {
+                let first = conns.lock().expect("连接表锁中毒").clone();
+                for c in first {
                     c.kill();
                 }
-                return;
+                // 复核 r3-F8：取消后**不退出**——继续守到 done/父预算烧尽，周期性
+                // 再杀迟登记的连接（在途拨号成功入表后无人杀 ⇒ 读线程无期限阻塞 ⇒
+                // SpeedHost 恒 busy；timeout 分支预算已尽，维持原退出语义〔SpeedConn
+                // 的 Go SetDeadline 同义期限面登记 R8〕）
+                loop {
+                    match done.recv_timeout(Duration::from_millis(200)) {
+                        Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+                        Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                            let late = conns.lock().expect("连接表锁中毒").clone();
+                            for c in late {
+                                c.kill();
+                            }
+                            if Instant::now() >= deadline {
+                                return;
+                            }
+                        }
+                    }
+                }
             }
         }
         match done.recv_timeout(Duration::from_millis(200)) {
@@ -599,9 +636,15 @@ pub fn run(
     // CLI 形态：拨号闭包 = ClientConn（每流一连接，直连引擎）；无进度出口消费方
     let dial = || -> Result<std::sync::Arc<dyn SpeedConn>, SpeedtestError> {
         let id = client
-            .connect(SocketAddrV4::new(crate::wgcore::SERVER_TUNNEL_IP, SPEEDTEST_PORT))
+            .connect(SocketAddrV4::new(
+                crate::wgcore::SERVER_TUNNEL_IP,
+                SPEEDTEST_PORT,
+            ))
             .map_err(SpeedtestError::Conn)?;
-        Ok(std::sync::Arc::new(ClientConn { client: std::sync::Arc::clone(client), id }))
+        Ok(std::sync::Arc::new(ClientConn {
+            client: std::sync::Arc::clone(client),
+            id,
+        }))
     };
     run_dial(&dial, params, logf, None, None)
 }
@@ -622,8 +665,12 @@ pub fn run_dial(
     if let Some(l) = live {
         l.reset();
     }
-    let conns = std::sync::Arc::new(std::sync::Mutex::new(Vec::<std::sync::Arc<dyn SpeedConn>>::new()));
-    let _guard = ConnGuard { conns: std::sync::Arc::clone(&conns) };
+    let conns = std::sync::Arc::new(std::sync::Mutex::new(
+        Vec::<std::sync::Arc<dyn SpeedConn>>::new(),
+    ));
+    let _guard = ConnGuard {
+        conns: std::sync::Arc::clone(&conns),
+    };
     let (wd_tx, wd_rx) = std::sync::mpsc::channel::<()>();
     let budget = Duration::from_secs(60) + p.warmup + p.down + p.up;
     let wd_conns = std::sync::Arc::clone(&conns);
@@ -638,20 +685,15 @@ pub fn run_dial(
         run_phases(dial, &p, logf, &conns, cancel, live)
     });
     let _ = wd_tx.send(()); // 看门狗收工（scope 已 join 线程，此处只解阻塞 recv）
+                            // 取消旗标**优先**于一切归因（复核 r3-F7：Go engine.go finish 先判 isCancelled，
+                            // 任何已归因错误被取消覆盖——此前白名单外的 NotSupported/Report 会抢先，
+                            // 下行首帧前取消会误报「出口需升级」）。
+    if cancelled.load(std::sync::atomic::Ordering::Acquire) && body.is_err() {
+        return Err(SpeedtestError::Cancelled);
+    }
     // M24：看门狗触发（预算烧满）时，读/泵线程带出的连接级错误统一归因 timeout
     //（窗口没跑完 = 链路死/服务端卡，不是 interrupted）。Report/InvalidArg/NotSupported
-    // 等服务端语义错误不改写。外部取消优先归因 cancelled（评审 r2-M8：类型化——
-    // 取消直达 REASON_CANCELLED，不再落 interrupted）。
-    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
-        if let Err(e) = &body {
-            if matches!(
-                e,
-                SpeedtestError::Conn(_) | SpeedtestError::Frame(_) | SpeedtestError::Bridge(_, _)
-            ) {
-                return Err(SpeedtestError::Cancelled);
-            }
-        }
-    }
+    // 等服务端语义错误不改写。
     if body.is_err() {
         if let Some(l) = live {
             l.reset();
@@ -659,10 +701,7 @@ pub fn run_dial(
     }
     if timed_out.load(std::sync::atomic::Ordering::Acquire) {
         if let Err(e) = &body {
-            if matches!(
-                e,
-                SpeedtestError::Conn(_) | SpeedtestError::Frame(_)
-            ) {
+            if matches!(e, SpeedtestError::Conn(_) | SpeedtestError::Frame(_)) {
                 return Err(SpeedtestError::Conn(ConnErr::Timeout));
             }
         }
@@ -698,7 +737,10 @@ fn run_phases(
             return Err(SpeedtestError::Cancelled);
         }
         let c = dial()?;
-        conns.lock().expect("连接表锁中毒").push(std::sync::Arc::clone(&c));
+        conns
+            .lock()
+            .expect("连接表锁中毒")
+            .push(std::sync::Arc::clone(&c));
         down_conns.push(c);
     }
     if let Some(l) = live {
@@ -706,7 +748,11 @@ fn run_phases(
     }
     let mut w = Frame::new();
     for c in &down_conns {
-        let payload = request_payload("recv", p.warmup.as_millis() as u64, p.down.as_millis() as u64);
+        let payload = request_payload(
+            "recv",
+            p.warmup.as_millis() as u64,
+            p.down.as_millis() as u64,
+        );
         c.write_frame(w.control(TYPE_REQUEST, &payload))?;
     }
     let window_start = Instant::now() + p.warmup + PHASE_SLACK;
@@ -733,7 +779,11 @@ fn run_phases(
                         let fin = match fr.read_frame(c.as_ref()).map_err(|e| {
                             // 首帧前 EOF/通道关 = 出口没有测速服务（连接被出口侧立即收流）
                             if first_frame
-                                && matches!(e, SpeedtestError::Conn(ConnErr::Closed) | SpeedtestError::Frame(_))
+                                && matches!(
+                                    e,
+                                    SpeedtestError::Conn(ConnErr::Closed)
+                                        | SpeedtestError::Frame(_)
+                                )
                             {
                                 SpeedtestError::NotSupported
                             } else {
@@ -792,17 +842,26 @@ fn run_phases(
     let down_bps = down_bytes as f64 / p.down.as_secs_f64();
 
     // ---- 上行：新连接（每流一角色不复用）；每流一线程泵送 ----
+    // 拨号窗相位回空档（复核 r3-F13：Go 相位回「建立连接」——Status 面对应
+    // connecting，不带着 down 误报）
+    if let Some(l) = live {
+        l.set_phase(0);
+    }
     let mut up_conns = Vec::with_capacity(p.streams);
     for _ in 0..p.streams {
         if cancel_hit() {
             return Err(SpeedtestError::Cancelled);
         }
         let c = dial()?;
-        conns.lock().expect("连接表锁中毒").push(std::sync::Arc::clone(&c));
+        conns
+            .lock()
+            .expect("连接表锁中毒")
+            .push(std::sync::Arc::clone(&c));
         up_conns.push(c);
     }
     if let Some(l) = live {
-        l.set_phase(2); // up（相位切换点——字节计数器连续累计）
+        l.set_phase(2); // up（相位切换点——字节计数器连续累计〔含预热字节：Rust
+                        // 进度面口径，Go 的 liveBytes 只计窗内——登记为已知口径差〕）
     }
     for c in &up_conns {
         let payload = request_payload("send", p.warmup.as_millis() as u64, p.up.as_millis() as u64);
@@ -828,13 +887,13 @@ fn run_phases(
                     let (used, bytes, wall) = {
                         let mut fr = FrameReader::new();
                         match fr.read_frame(c.as_ref())? {
-                        FrameIn::Other { typ, payload } if typ == TYPE_REPORT => {
-                            let rep = parse_report(&payload)?;
-                            (warm + win, rep.bytes, rep.wall_ms)
-                        }
-                        FrameIn::Other { typ, .. } => {
-                            return Err(SpeedtestError::Frame(format!("窗口期收到类型 {typ}")))
-                        }
+                            FrameIn::Other { typ, payload } if typ == TYPE_REPORT => {
+                                let rep = parse_report(&payload)?;
+                                (warm + win, rep.bytes, rep.wall_ms)
+                            }
+                            FrameIn::Other { typ, .. } => {
+                                return Err(SpeedtestError::Frame(format!("窗口期收到类型 {typ}")))
+                            }
                             FrameIn::Data { .. } => {
                                 return Err(SpeedtestError::Frame("收口期收到 data 帧".into()))
                             }
@@ -893,16 +952,19 @@ fn pump(
     const SLICE: Duration = Duration::from_millis(250);
     let deadline = Instant::now() + dur;
     let mut total: i64 = 0;
+    let mut reported: i64 = 0;
     while Instant::now() < deadline {
-        let slice_end = Instant::now() + SLICE.min(deadline.saturating_duration_since(Instant::now()));
+        let slice_end =
+            Instant::now() + SLICE.min(deadline.saturating_duration_since(Instant::now()));
         while Instant::now() < slice_end {
             conn.write_frame(f.data(BLOCK)?)?;
             total += BLOCK as i64;
         }
-        // 分片边界：live 字节与取消检查点（conn 关闭由看门狗负责——分片节拍保留
-        // Go 的 PumpDataChunk 形态）
+        // 分片边界：live 字节上报**本片增量**（复核 r3-F4：此前每片加运行累计 ⇒
+        // n 片后 ≈ 真值 ×(n+1)/2 虚高；Go engine.go「字节数必须用分片泵的返回值」）
         if let Some(l) = live {
-            l.add_bytes(total);
+            l.add_bytes(total - reported);
+            reported = total;
         }
     }
     Ok(total)
@@ -920,7 +982,11 @@ mod tests {
         let frame = f.control(TYPE_REQUEST, &payload).to_vec();
         assert_eq!(&frame[..4], b"SPED");
         assert_eq!(frame[4], TYPE_REQUEST);
-        assert_eq!(u32::from_le_bytes(frame[5..9].try_into().unwrap()), 0, "控制帧 seq 恒 0（Go 同义）");
+        assert_eq!(
+            u32::from_le_bytes(frame[5..9].try_into().unwrap()),
+            0,
+            "控制帧 seq 恒 0（Go 同义）"
+        );
         assert_eq!(
             u16::from_le_bytes(frame[9..11].try_into().unwrap()) as usize,
             payload.len()
@@ -941,7 +1007,11 @@ mod tests {
         assert_eq!(u32::from_le_bytes(d1[5..9].try_into().unwrap()), 1);
         let _ = f2.control(TYPE_START, &[]);
         let d2 = f2.data(8).unwrap().to_vec();
-        assert_eq!(u32::from_le_bytes(d2[5..9].try_into().unwrap()), 2, "控制帧不得推进 seq");
+        assert_eq!(
+            u32::from_le_bytes(d2[5..9].try_into().unwrap()),
+            2,
+            "控制帧不得推进 seq"
+        );
         assert_eq!(d2.len(), HEADER + 8);
         assert_eq!(&d2[HEADER..], &[0u8; 8]);
     }
@@ -956,18 +1026,27 @@ mod tests {
     #[test]
     fn params_validation_matches_go_bounds() {
         assert!(Params::default().normalized().is_ok());
+        assert!(
+            Params {
+                down: Duration::from_secs(16),
+                ..Default::default()
+            }
+            .normalized()
+            .is_err(),
+            "窗口超 15s 应拒绝"
+        );
         assert!(Params {
-            down: Duration::from_secs(16),
+            streams: 7,
             ..Default::default()
         }
         .normalized()
-        .is_err(), "窗口超 15s 应拒绝");
-        assert!(Params { streams: 7, ..Default::default() }.normalized().is_err());
-        assert!(
-            Params { warmup: Duration::from_secs(6), ..Default::default() }
-                .normalized()
-                .is_err()
-        );
+        .is_err());
+        assert!(Params {
+            warmup: Duration::from_secs(6),
+            ..Default::default()
+        }
+        .normalized()
+        .is_err());
         let n = Params {
             down: Duration::ZERO,
             up: Duration::ZERO,
@@ -977,6 +1056,26 @@ mod tests {
         .normalized()
         .unwrap();
         assert_eq!(n, Params::default(), "零值取默认");
+    }
+
+    /// 泵分片上报增量（复核 r3-F4 的回归钉）：累计面不重复累加。
+    #[test]
+    fn live_progress_delta_accounting() {
+        let l = LiveProgress::new();
+        l.set_phase(1);
+        // 模拟 pump 的分片上报形状：每片加「本片增量」
+        let mut total = 0i64;
+        let mut reported = 0i64;
+        for slice_bytes in [1000i64, 1000, 500, 700] {
+            total += slice_bytes;
+            l.add_bytes(total - reported);
+            reported = total;
+        }
+        assert_eq!(
+            l.snapshot(),
+            (Some("down"), 3200),
+            "增量上报 ⇒ bytes == total"
+        );
     }
 
     /// LiveProgress（M-7）：相位切换 + 字节累计的原子面——Status 面的数据源。
@@ -1004,7 +1103,10 @@ mod tests {
         assert!(matches!(r, Err(SpeedtestError::Busy)), "busy 类型化：{r:?}");
         assert_eq!(r.unwrap_err().reason(), REASON_BUSY);
         let r = parse_report(br#"{"bytes":1,"warmup_bytes":0,"wall_ms":9,"error":"link_down"}"#);
-        assert!(matches!(r, Err(SpeedtestError::LinkDown)), "link_down 类型化：{r:?}");
+        assert!(
+            matches!(r, Err(SpeedtestError::LinkDown)),
+            "link_down 类型化：{r:?}"
+        );
         assert_eq!(r.unwrap_err().reason(), REASON_LINK_DOWN);
         // 取消归因可达（评审 r2-M8：REASON_CANCELLED 此前是死常量）
         assert_eq!(SpeedtestError::Cancelled.reason(), REASON_CANCELLED);
@@ -1013,17 +1115,14 @@ mod tests {
     #[test]
     fn report_parse_quote_aware() {
         // 低-4：error 文案含 ASCII 逗号/引号/`}`/转义时不再错分（引号感知顶层切分）
-        let r = parse_report(
-            br#"{"bytes":7,"warmup_bytes":2,"wall_ms":33,"error":"a,b \"x\", c}d"}"#,
-        );
+        let r =
+            parse_report(br#"{"bytes":7,"warmup_bytes":2,"wall_ms":33,"error":"a,b \"x\", c}d"}"#);
         assert!(
             matches!(&r, Err(SpeedtestError::Report(m)) if m == "a,b \"x\", c}d"),
             "含逗号/引号/大括号的 error 值必须整段保真，得 {r:?}"
         );
         // error 在前、数字在后的键序形态（切分不依赖键序）
-        let r = parse_report(
-            br#"{"error":"x,y","bytes":8,"warmup_bytes":1,"wall_ms":5}"#,
-        );
+        let r = parse_report(br#"{"error":"x,y","bytes":8,"warmup_bytes":1,"wall_ms":5}"#);
         assert!(matches!(&r, Err(SpeedtestError::Report(m)) if m == "x,y"));
         // 值内 `\,`（转义逗号）不切分
         let r = parse_report(br#"{"bytes":1,"warmup_bytes":0,"wall_ms":1,"error":"a\,b"}"#);

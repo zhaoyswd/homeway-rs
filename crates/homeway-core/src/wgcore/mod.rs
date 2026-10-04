@@ -28,8 +28,8 @@ use std::time::{Duration, Instant};
 use boringtun::noise::errors::WireGuardError;
 use boringtun::noise::{Tunn, TunnResult};
 use boringtun::x25519::StaticSecret;
-use smoltcp::socket::tcp::{self, Socket as TcpSocket};
 use smoltcp::iface::SocketHandle;
+use smoltcp::socket::tcp::{self, Socket as TcpSocket};
 use smoltcp::time::Instant as SmolInstant;
 
 use crate::identity::Identity;
@@ -187,8 +187,9 @@ pub struct Snapshot {
     /// 最近一次**采纳路径**本地类发送错误时刻（巡检失败拍的噪声判定数据源；
     /// Go Bind.lastLocalSendErrAt 同义——镜像候选的本地错误不刷此位）。
     pub last_local_send_err: Option<Instant>,
-    /// 全候选发送统计的**待取走**拍内累计（(尝试, 本地失败)；swap_send_stats 消费
-    /// 后置 None——拍板①：Go sendTries/sendLocalFails 的按拍取走清零语义）。
+    /// 全候选发送统计的**生命周期累计**（(尝试, 本地失败)；Bind 计数器单调，快照每
+    /// 拍重写，Client::swap_send_stats 以差分等价 Go 的 swap-reset——复核 r3-F5 更正
+    /// 注释：此前误写「消费后置 None」）。
     pub bind_stats: Option<(i64, i64)>,
     /// 本地发送错误累计（(采纳路径, 全部)——tunStatusJSON demand.localErr* 源；
     /// 拍板①：Go adoptedLocalErrCount/localErrCount 的累计面）。
@@ -398,7 +399,10 @@ impl Engine {
         let src_ip = src_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         // 热路径：容量恒足（构造时 WG_BUF 一次分配）；boringtun 只写前缀——
         // 不 clear/resize（每包 65KB memset 纯浪费，中-10①）。长度由返回值给。
-        match self.tunn.decapsulate(Some(src_ip), datagram, &mut self.wg_buf) {
+        match self
+            .tunn
+            .decapsulate(Some(src_ip), datagram, &mut self.wg_buf)
+        {
             TunnResult::WriteToNetwork(w) => {
                 self.bind.send_wg(w);
                 loop {
@@ -420,9 +424,12 @@ impl Engine {
             }
             TunnResult::WriteToTunnelV4(pkt, _) => {
                 self.expired_pending = false; // 明文包到达 = 会话活着
-                // L3 直通分流（Go hub.Write）：dst == B 的本地地址（派生隧道 IP）→ 栈 B
-                // （核心自连回程），其余 → 真 TUN fd（内核投给应用）。
-                if pkt.len() >= 20 && pkt[0] >> 4 == 4 && pkt[16..20] == self.stack.tunnel_ip.octets() {
+                                              // L3 直通分流（Go hub.Write）：dst == B 的本地地址（派生隧道 IP）→ 栈 B
+                                              // （核心自连回程），其余 → 真 TUN fd（内核投给应用）。
+                if pkt.len() >= 20
+                    && pkt[0] >> 4 == 4
+                    && pkt[16..20] == self.stack.tunnel_ip.octets()
+                {
                     self.stack.inject(pkt);
                 } else if let Some(tun) = self.app_tun.as_ref() {
                     match write_fd_all(tun.fd, pkt) {
@@ -488,16 +495,25 @@ impl Engine {
     fn start_udp(&mut self, id: u64) -> Result<u16, ConnErr> {
         use smoltcp::socket::udp;
         let port = self.stack.alloc_udp_port();
-        let rx_meta: Vec<udp::PacketMetadata> = (0..16).map(|_| udp::PacketMetadata::EMPTY).collect();
-        let tx_meta: Vec<udp::PacketMetadata> = (0..16).map(|_| udp::PacketMetadata::EMPTY).collect();
+        let rx_meta: Vec<udp::PacketMetadata> =
+            (0..16).map(|_| udp::PacketMetadata::EMPTY).collect();
+        let tx_meta: Vec<udp::PacketMetadata> =
+            (0..16).map(|_| udp::PacketMetadata::EMPTY).collect();
         let mut sock = udp::Socket::new(
             udp::PacketBuffer::new(rx_meta, vec![0u8; 64 * 1024]),
             udp::PacketBuffer::new(tx_meta, vec![0u8; 64 * 1024]),
         );
         let ep = smoltcp::wire::IpEndpoint::new(self.stack.tunnel_ip.into(), port);
-        sock.bind(ep).map_err(|e| ConnErr::Dial(DialError::Stack(format!("{e:?}"))))?;
+        sock.bind(ep)
+            .map_err(|e| ConnErr::Dial(DialError::Stack(format!("{e:?}"))))?;
         let h = self.stack.sockets.add(sock);
-        self.udp.insert(id, UdpConn { handle: h, wait_recv: None });
+        self.udp.insert(
+            id,
+            UdpConn {
+                handle: h,
+                wait_recv: None,
+            },
+        );
         Ok(port)
     }
 
@@ -509,7 +525,10 @@ impl Engine {
             return Err(ConnErr::Closed);
         };
         let ep = smoltcp::wire::IpEndpoint::new((*dst.ip()).into(), dst.port());
-        let sock = self.stack.sockets.get_mut::<smoltcp::socket::udp::Socket>(u.handle);
+        let sock = self
+            .stack
+            .sockets
+            .get_mut::<smoltcp::socket::udp::Socket>(u.handle);
         sock.send_slice(data, ep).map_err(|_| ConnErr::Closed)?;
         Ok(())
     }
@@ -518,7 +537,9 @@ impl Engine {
     fn resolve_udp(&mut self) {
         let ids: Vec<u64> = self.udp.keys().copied().collect();
         for id in ids {
-            let Some(u) = self.udp.get_mut(&id) else { continue };
+            let Some(u) = self.udp.get_mut(&id) else {
+                continue;
+            };
             if u.wait_recv.is_none() {
                 continue;
             }
@@ -549,18 +570,21 @@ impl Engine {
     /// 返回 false = 收到 Stop。
     fn handle_cmd(&mut self, cmd: Cmd) -> bool {
         match cmd {
-            Cmd::Connect { id, dst, deadline, reply } => {
-                match self.start_conn(id, dst, deadline) {
-                    Ok(()) => {
-                        if let Some(c) = self.conns.get_mut(&id) {
-                            c.wait_est = Some(reply);
-                        }
-                    }
-                    Err(e) => {
-                        let _ = reply.send(Err(e));
+            Cmd::Connect {
+                id,
+                dst,
+                deadline,
+                reply,
+            } => match self.start_conn(id, dst, deadline) {
+                Ok(()) => {
+                    if let Some(c) = self.conns.get_mut(&id) {
+                        c.wait_est = Some(reply);
                     }
                 }
-            }
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                }
+            },
             Cmd::Write { id, data, reply } => {
                 let r = match self.conns.get(&id) {
                     Some(c) => {
@@ -611,7 +635,12 @@ impl Engine {
                 let r = self.start_udp(id);
                 let _ = reply.send(r);
             }
-            Cmd::UdpSend { id, dst, data, reply } => {
+            Cmd::UdpSend {
+                id,
+                dst,
+                data,
+                reply,
+            } => {
                 let r = self.udp_send(id, dst, &data);
                 let _ = reply.send(r);
             }
@@ -713,7 +742,9 @@ impl Engine {
         let stop = Arc::new(AtomicBool::new(false));
         let counters = Arc::clone(&self.tun_counters);
         let on_error = self.on_tun_error.take();
-        (self.logf)(&format!("wgcore: 应用面就绪（TUN fd={fd} 已接上，mtu={mtu}，transit 直通）"));
+        (self.logf)(&format!(
+            "wgcore: 应用面就绪（TUN fd={fd} 已接上，mtu={mtu}，transit 直通）"
+        ));
         self.app_tun = Some(AppTun {
             fd,
             stop: Arc::clone(&stop),
@@ -731,12 +762,16 @@ impl Engine {
 
     fn cmd_tx_clone(&self) -> Sender<Cmd> {
         // Engine 的投递通道（构造期由 Client::start 注入的克隆；读线程投 TunPacket 用）
-        self.cmd_tx
-            .clone()
-            .expect("cmd_tx 由 Client::start 注入")
+        self.cmd_tx.clone().expect("cmd_tx 由 Client::start 注入")
     }
 
-    fn start_conn(&mut self, id: u64, dst: SocketAddrV4, deadline: Duration) -> Result<(), ConnErr> {        let handle = self.stack.connect(dst)?;
+    fn start_conn(
+        &mut self,
+        id: u64,
+        dst: SocketAddrV4,
+        deadline: Duration,
+    ) -> Result<(), ConnErr> {
+        let handle = self.stack.connect(dst)?;
         self.conns.insert(
             id,
             Conn {
@@ -763,7 +798,9 @@ impl Engine {
         let mut reap: Vec<SocketHandle> = Vec::new();
 
         for id in ids {
-            let Some(c) = self.conns.get_mut(&id) else { continue };
+            let Some(c) = self.conns.get_mut(&id) else {
+                continue;
+            };
             let (state, can_recv, may_recv, is_active) = {
                 let s = self.stack.sockets.get_mut::<TcpSocket>(c.handle);
                 (s.state(), s.can_recv(), s.may_recv(), s.is_active())
@@ -824,7 +861,11 @@ impl Engine {
             }
             // 彻底关、缓冲排空且无待决：回收槽位（TIME_WAIT 由 poll 推进至 Closed 后
             // 回收，评审 ③-8；can_recv 兜「Closed 但缓冲还有数据」的窗口）
-            if state == tcp::State::Closed && !can_recv && c.wait_est.is_none() && c.wait_read.is_none() {
+            if state == tcp::State::Closed
+                && !can_recv
+                && c.wait_est.is_none()
+                && c.wait_read.is_none()
+            {
                 reap.push(c.handle);
             }
         }
@@ -973,7 +1014,8 @@ impl Client {
                 }
             }
         }
-    }    pub fn snapshot(&self) -> Snapshot {
+    }
+    pub fn snapshot(&self) -> Snapshot {
         self.snapshot.lock().expect("快照锁中毒").clone()
     }
 
@@ -986,7 +1028,12 @@ impl Client {
     pub fn connect_deadline(&self, dst: SocketAddrV4, deadline: Duration) -> Result<u64, ConnErr> {
         let id = self.alloc_id();
         let (tx, rx) = mpsc::channel();
-        self.send(Cmd::Connect { id, dst, deadline, reply: tx });
+        self.send(Cmd::Connect {
+            id,
+            dst,
+            deadline,
+            reply: tx,
+        });
         rx.recv().map_err(|_| ConnErr::EngineGone)??;
         Ok(id)
     }
@@ -998,13 +1045,19 @@ impl Client {
         let id = self.alloc_id();
         let (tx, rx) = mpsc::channel();
         self.send(Cmd::UdpOpen { id, reply: tx });
-        rx.recv().map_err(|_| ConnErr::EngineGone)?
+        rx.recv()
+            .map_err(|_| ConnErr::EngineGone)?
             .map(|port| (id, port))
     }
 
     pub fn udp_send(&self, id: u64, dst: SocketAddrV4, data: Vec<u8>) -> Result<(), ConnErr> {
         let (tx, rx) = mpsc::channel();
-        self.send(Cmd::UdpSend { id, dst, data, reply: tx });
+        self.send(Cmd::UdpSend {
+            id,
+            dst,
+            data,
+            reply: tx,
+        });
         rx.recv().map_err(|_| ConnErr::EngineGone)?
     }
 
@@ -1029,7 +1082,12 @@ impl Client {
     pub fn path_probe(&self, timeout: Duration) -> Result<(), ConnErr> {
         let id = self.alloc_id();
         let (tx, rx) = mpsc::channel();
-        self.send(Cmd::Connect { id, dst: SocketAddrV4::new(SERVER_TUNNEL_IP, 1), deadline: timeout, reply: tx });
+        self.send(Cmd::Connect {
+            id,
+            dst: SocketAddrV4::new(SERVER_TUNNEL_IP, 1),
+            deadline: timeout,
+            reply: tx,
+        });
         const SLACK: Duration = Duration::from_secs(2);
         match rx.recv_timeout(timeout + SLACK) {
             Ok(Ok(())) => {
@@ -1046,7 +1104,11 @@ impl Client {
 
     pub fn write(&self, id: u64, data: Vec<u8>) -> Result<usize, ConnErr> {
         let (tx, rx) = mpsc::channel();
-        self.send(Cmd::Write { id, data, reply: tx });
+        self.send(Cmd::Write {
+            id,
+            data,
+            reply: tx,
+        });
         rx.recv().map_err(|_| ConnErr::EngineGone)?
     }
 
@@ -1199,7 +1261,10 @@ impl Client {
     /// TUN fd 计数（read = 上行 / write = 下行；attach 前全零）。
     pub fn tun_stats(&self) -> (u64, u64) {
         let c = &self.tun_counters;
-        (c.read_bytes.load(Ordering::Relaxed), c.write_bytes.load(Ordering::Relaxed))
+        (
+            c.read_bytes.load(Ordering::Relaxed),
+            c.write_bytes.load(Ordering::Relaxed),
+        )
     }
 
     /// 取走并清零「自上次调用以来的 App 出站包数」（巡检拍消费：>0 = 本拍有真实需求）。
@@ -1211,7 +1276,10 @@ impl Client {
     /// 的零值形态）。**必须**用 `last_outbound_mono_ns`（单调相对读数）换算——
     /// 评审 r2-H1：曾用 unix epoch ns 换算，Instant 减出 56 年前 ⇒ D4 恒不触发。
     pub fn last_outbound_at(&self) -> Option<Instant> {
-        let mono = self.tun_counters.last_outbound_mono_ns.load(Ordering::Relaxed);
+        let mono = self
+            .tun_counters
+            .last_outbound_mono_ns
+            .load(Ordering::Relaxed);
         (mono != 0).then(|| process_mono_start() + Duration::from_nanos(mono as u64))
     }
 
@@ -1284,9 +1352,7 @@ fn driver(mut engine: Engine, wake_r: i32, stop: Arc<AtomicBool>) {
         }
         if fds[1].revents & libc::POLLIN != 0 {
             let mut b = [0u8; 64];
-            unsafe {
-                while libc::read(wake_r, b.as_mut_ptr().cast(), 64) > 0 {}
-            }
+            unsafe { while libc::read(wake_r, b.as_mut_ptr().cast(), 64) > 0 {} }
         }
         if !engine.pump_once(&mut udp_buf[..]) {
             break;
@@ -1334,9 +1400,16 @@ fn write_fd_all(fd: i32, mut buf: &[u8]) -> io::Result<()> {
 fn poll_fd(fd: i32, events: i16, deadline: Instant) -> io::Result<()> {
     loop {
         if Instant::now() >= deadline {
-            return Err(io::Error::new(io::ErrorKind::TimedOut, "tun fd 等待可写超预算"));
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "tun fd 等待可写超预算",
+            ));
         }
-        let mut pfd = libc::pollfd { fd, events, revents: 0 };
+        let mut pfd = libc::pollfd {
+            fd,
+            events,
+            revents: 0,
+        };
         let r = unsafe { libc::poll(&mut pfd, 1, 500) };
         if r < 0 {
             let e = io::Error::last_os_error();
@@ -1378,13 +1451,18 @@ fn tun_read_loop(
                 }
                 io::ErrorKind::WouldBlock => {
                     // 非阻塞 fd 的常态：等 POLLIN（500ms 片——stop 位在片界检查）
-                    if let Err(pe) = poll_fd(fd, libc::POLLIN, Instant::now() + Duration::from_millis(500))
-                    {
+                    if let Err(pe) = poll_fd(
+                        fd,
+                        libc::POLLIN,
+                        Instant::now() + Duration::from_millis(500),
+                    ) {
                         if pe.kind() == io::ErrorKind::Interrupted {
                             continue;
                         }
                         logf(&format!("tun fd poll 失败：{pe}（标记隧道不健康）"));
-                        let _ = cmd_tx.send(Cmd::TunFdDead { msg: format!("tun fd poll 失败：{pe}") });
+                        let _ = cmd_tx.send(Cmd::TunFdDead {
+                            msg: format!("tun fd poll 失败：{pe}"),
+                        });
                         return;
                     }
                     if stop.load(Ordering::SeqCst) {
@@ -1394,7 +1472,9 @@ fn tun_read_loop(
                 _ => {
                     logf(&format!("tun fd 读取失败：{e}（标记隧道不健康）"));
                     // 读失败即卸源（driver 侧同样处理写失败——两者都意味着 fd 已被收回）
-                    let _ = cmd_tx.send(Cmd::TunFdDead { msg: format!("tun fd 读取失败：{e}") });
+                    let _ = cmd_tx.send(Cmd::TunFdDead {
+                        msg: format!("tun fd 读取失败：{e}"),
+                    });
                     return;
                 }
             }
@@ -1404,7 +1484,12 @@ fn tun_read_loop(
             // n==0 不判死（评审 r2-我-8：Go 是 continue——TUN 设备的 0 字节读是可
             // 复现的空读形态，静默 return 会「看着健康、上行全丢」；随后 poll 一片
             // 防非阻塞 fd 上的热自旋）
-            poll_fd(fd, libc::POLLIN, Instant::now() + Duration::from_millis(500)).ok();
+            poll_fd(
+                fd,
+                libc::POLLIN,
+                Instant::now() + Duration::from_millis(500),
+            )
+            .ok();
             continue;
         }
         let mut n = n as usize;
@@ -1423,7 +1508,9 @@ fn tun_read_loop(
         let now_unix = now_unix_nanos();
         let mono = process_mono_start().elapsed().as_nanos() as i64;
         counters.last_outbound_ns.store(now_unix, Ordering::Relaxed);
-        counters.last_outbound_mono_ns.store(mono, Ordering::Relaxed);
+        counters
+            .last_outbound_mono_ns
+            .store(mono, Ordering::Relaxed);
         if cmd_tx.send(Cmd::TunPacket(pkt)).is_err() {
             return; // driver 已死
         }

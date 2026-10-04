@@ -61,7 +61,10 @@ pub fn speed_start(raw: &str, run: impl FnOnce(Params) -> SpeedOutcome) -> Strin
         Err(e) => return speed_fail("invalid_arg", format!("参数不是合法 JSON：{e}")),
     };
     if p.auth.is_empty() || p.sock.is_empty() {
-        return speed_fail("bridge_down", "桥未就绪（缺 auth/sock：VPN 未连接且服务会话未就绪）");
+        return speed_fail(
+            "bridge_down",
+            "桥未就绪（缺 auth/sock：VPN 未连接且服务会话未就绪）",
+        );
     }
     let params = Params {
         down: Duration::from_millis(p.down_ms.max(0) as u64),
@@ -91,7 +94,9 @@ pub fn speed_start(raw: &str, run: impl FnOnce(Params) -> SpeedOutcome) -> Strin
 
 fn num(v: f64) -> Value {
     // Go json.Marshal 对 float64 产最短形态；serde_json 同策略（Number 保精度）。
-    serde_json::Number::from_f64(v).map(Value::Number).unwrap_or(Value::from(0))
+    serde_json::Number::from_f64(v)
+        .map(Value::Number)
+        .unwrap_or(Value::from(0))
 }
 
 /// speedFail 业务失败的统一返回。
@@ -156,9 +161,16 @@ impl crate::speedtest::SpeedConn for BridgeSpeedConn {
         let mut off = 0;
         while off < data.len() {
             match w.write(&data[off..]) {
-                Ok(0) => return Err(SpeedtestError::Frame("测速桥写通道返回 0（对端已关）".into())),
+                Ok(0) => {
+                    return Err(SpeedtestError::Frame(
+                        "测速桥写通道返回 0（对端已关）".into(),
+                    ))
+                }
                 Ok(n) => off += n,
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                Err(e)
+                    if e.kind() == std::io::ErrorKind::WouldBlock
+                        || e.kind() == std::io::ErrorKind::TimedOut =>
+                {
                     return Err(SpeedtestError::Conn(crate::wgcore::ConnErr::Timeout));
                 }
                 Err(e) => return Err(SpeedtestError::Frame(format!("测速桥写失败：{e}"))),
@@ -173,7 +185,10 @@ impl crate::speedtest::SpeedConn for BridgeSpeedConn {
         match r.read(&mut buf) {
             Ok(0) => Ok(Vec::new()), // EOF
             Ok(n) => Ok(buf[..n].to_vec()),
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
                 Err(SpeedtestError::Conn(crate::wgcore::ConnErr::Timeout))
             }
             Err(e) => Err(SpeedtestError::Frame(format!("测速桥读失败：{e}"))),
@@ -206,7 +221,10 @@ pub fn app_run(
     };
     match crate::speedtest::run_dial(&dial, *p, logf, cancel, live) {
         Ok(res) => SpeedOutcome::Ok(res),
-        Err(e) => SpeedOutcome::Fail { reason: e.reason().to_string(), msg: e.to_string() },
+        Err(e) => SpeedOutcome::Fail {
+            reason: e.reason().to_string(),
+            msg: e.to_string(),
+        },
     }
 }
 
@@ -216,12 +234,18 @@ pub fn speed_dial_conn(
     sock: &str,
     budget: Duration,
 ) -> Result<BridgeSpeedConn, (&'static str, String)> {
-    let mut conn = super::bridge_host::connect_budget(std::path::Path::new(sock), budget)
-        .map_err(|e| ("bridge_down", format!("测速通道暂时不可用（桥未就绪或正在恢复）：{e}")))?;
+    let mut conn =
+        super::bridge_host::connect_budget(std::path::Path::new(sock), budget).map_err(|e| {
+            (
+                "bridge_down",
+                format!("测速通道暂时不可用（桥未就绪或正在恢复）：{e}"),
+            )
+        })?;
     // 长任务连接不设逐操作超时（窗口期读阻塞是常态；中断由引擎看门狗 kill 承担）
     conn.set_read_timeout(None).ok();
     conn.set_write_timeout(None).ok();
-    write_auth(&mut conn, auth_hex).map_err(|e| ("bridge_auth", format!("测速通道鉴权失败：{e}")))?;
+    write_auth(&mut conn, auth_hex)
+        .map_err(|e| ("bridge_auth", format!("测速通道鉴权失败：{e}")))?;
     let raw = conn
         .try_clone()
         .map_err(|e| ("bridge_down", format!("测速桥 fd 复制失败：{e}")))?;
@@ -238,13 +262,22 @@ pub fn speed_dial_conn(
 
 /// 测速桥拨号 + 鉴权（引擎的 Dial 缝；ctx 语义由 UnixStream deadline 承载——
 /// 拨号预算/取消要能打断在途拨号，FIX-39）。
-pub fn speed_dial(auth_hex: &str, sock: &str, budget: Duration) -> Result<UnixStream, (&'static str, String)> {
+pub fn speed_dial(
+    auth_hex: &str,
+    sock: &str,
+    budget: Duration,
+) -> Result<UnixStream, (&'static str, String)> {
     // 工单④：UDS 拨号加 connect 预算（拨号预算/取消要能打断在途拨号——FIX-39 面）
     let conn = super::bridge_host::connect_budget(
         std::path::Path::new(sock),
         budget.max(Duration::from_millis(500)),
     )
-        .map_err(|e| ("bridge_down", format!("测速通道暂时不可用（桥未就绪或正在恢复）：{e}")))?;
+    .map_err(|e| {
+        (
+            "bridge_down",
+            format!("测速通道暂时不可用（桥未就绪或正在恢复）：{e}"),
+        )
+    })?;
     conn.set_read_timeout(Some(budget)).ok();
     conn.set_write_timeout(Some(budget)).ok();
     let mut c = conn;
@@ -261,7 +294,8 @@ pub fn speed_dial_and_request(
     budget: Duration,
 ) -> Result<UnixStream, (&'static str, String)> {
     let mut c = speed_dial(auth_hex, sock, budget)?;
-    c.write_all(request).map_err(|e| ("bridge_down", format!("发测速请求失败：{e}")))?;
+    c.write_all(request)
+        .map_err(|e| ("bridge_down", format!("发测速请求失败：{e}")))?;
     Ok(c)
 }
 
@@ -282,7 +316,10 @@ pub fn read_to_end_timeout(c: &UnixStream, budget: Duration) -> std::io::Result<
                     return Ok(out); // 预算内尽力收（测速流的窗口语义由引擎管）
                 }
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+            Err(e)
+                if e.kind() == std::io::ErrorKind::WouldBlock
+                    || e.kind() == std::io::ErrorKind::TimedOut =>
+            {
                 return Ok(out);
             }
             Err(e) => return Err(e),
@@ -301,13 +338,17 @@ mod tests {
         assert_eq!(v["reason"], "invalid_arg");
         // 缺 auth/sock → bridge_down
         let v: Value =
-            serde_json::from_str(&speed_start(r#"{"auth":"","sock":""}"#, |_| unreachable!())).unwrap();
+            serde_json::from_str(&speed_start(r#"{"auth":"","sock":""}"#, |_| unreachable!()))
+                .unwrap();
         assert_eq!(v["reason"], "bridge_down");
         // streams 非法（Params.normalized 拒）→ invalid_arg
         let v: Value = serde_json::from_str(&speed_start(
             r#"{"auth":"a","sock":"s","streams":99}"#,
             |p| match p.normalized() {
-                Err(e) => SpeedOutcome::Fail { reason: "invalid_arg".into(), msg: e },
+                Err(e) => SpeedOutcome::Fail {
+                    reason: "invalid_arg".into(),
+                    msg: e,
+                },
                 Ok(_) => unreachable!(),
             },
         ))
@@ -319,16 +360,29 @@ mod tests {
     /// downBps,ok,phase,upBps,usageDown,usageUp,wallMs）。
     #[test]
     fn success_envelope() {
-        let out = speed_start(r#"{"auth":"a","sock":"s"}"#, |_| SpeedOutcome::Ok(SpeedtestResult {
-            down_bps: 123.5,
-            up_bps: 456.0,
-            usage_down: 1000,
-            usage_up: 2000,
-            wall_ms: 25000,
-        }));
+        let out = speed_start(r#"{"auth":"a","sock":"s"}"#, |_| {
+            SpeedOutcome::Ok(SpeedtestResult {
+                down_bps: 123.5,
+                up_bps: 456.0,
+                usage_down: 1000,
+                usage_up: 2000,
+                wall_ms: 25000,
+            })
+        });
         let v: Value = serde_json::from_str(&out).unwrap();
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
-        assert_eq!(keys, vec!["downBps", "ok", "phase", "upBps", "usageDown", "usageUp", "wallMs"]);
+        assert_eq!(
+            keys,
+            vec![
+                "downBps",
+                "ok",
+                "phase",
+                "upBps",
+                "usageDown",
+                "usageUp",
+                "wallMs"
+            ]
+        );
         assert_eq!(v["phase"], "done");
         assert_eq!(v["downBps"], 123.5);
     }
@@ -354,7 +408,19 @@ mod tests {
         };
         let v: Value = serde_json::from_str(&speed_status_json(&live)).unwrap();
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
-        assert_eq!(keys, vec!["bytes", "dir", "elapsedMs", "instBps", "phase", "reason", "usageDown", "usageUp"]);
+        assert_eq!(
+            keys,
+            vec![
+                "bytes",
+                "dir",
+                "elapsedMs",
+                "instBps",
+                "phase",
+                "reason",
+                "usageDown",
+                "usageUp"
+            ]
+        );
         assert_eq!(v["dir"], "down");
     }
 
@@ -563,11 +629,10 @@ mod host_tests {
     #[test]
     fn busy_gate_and_idle_status() {
         let h = SpeedHost::new();
-        let v: serde_json::Value =
-            serde_json::from_str(&h.status()).unwrap();
+        let v: serde_json::Value = serde_json::from_str(&h.status()).unwrap();
         assert_eq!(v["phase"], "idle");
         assert_eq!(v.as_object().unwrap().len(), 2); // phase + reason（elapsedMs -1 不出现）
-        // 参数错不占轮（invalid_arg 即时回）
+                                                     // 参数错不占轮（invalid_arg 即时回）
         let out = h.start("{oops");
         let v: serde_json::Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["reason"], "invalid_arg");
