@@ -85,6 +85,12 @@ files/speedtest 动词与常驻 connect 同 identity 并发的 foot-gun——与
   拦截栈/客户端 hub 的装配面同步适配；矩阵（六链路）+ PERF-AB 复测。
 - **决策依据**：R7 前夕横跨双侧的共享底座迁移风险不对等；先以应用层垫片修真机
   可感差距（已验收），升级挪到有专属窗口的时点（主会话 2026-10-04 批准）。
+- **R6.6 真机复测追加项（2026-10-04）**：垫片本地 harness 验收（并发 3.2×/浅队列
+  17×）但真机端到端下行仍 ≈1MB/s vs Go 出口 20MB/s（同机同刻 A/B）——CC 状态
+  健康（cwnd/pacing/md 全正常），剩余瓶颈在 **WG encap/UDP 发送路径**（本地
+  harness 直接 on_plain/pump 交换包、绕过该层，复现不出）。0.14 迁移的验收判据
+  必须含：真机下行测速 ≥0.5× Go 出口 + encap/发送路径 profile（详见
+  docs/reviews/R6.6.md §三）。
 
 R6 已收官（2026-10-04，两道门全过 + 判据实测入册 + ci-local 全绿；评审记录 =
 `docs/reviews/R6.md`〔两轮〕）。

@@ -990,7 +990,8 @@ mod tests {
     #[test]
     fn self_check_query_shape() {
         let q = self_check_query();
-        assert_eq!(q.len(), 47, "12 头 + 31 名字 + 4 尾");
+        assert_eq!(q.len(), 47, "12 头 + 30 名字 + 5 尾（根 + QTYPE/CLASS）");
+        assert_eq!(&q[2..4], &[0x01, 0x00], "flags = RD（评审 r1：丢 RD 也绿的缺口钉死）");
         assert_eq!(qtype(&q), Some(1), "A 查询应可解析出 qtype");
         assert_eq!(u16::from_be_bytes([q[4], q[5]]), 1, "QDCOUNT=1");
         assert_eq!(&q[6..12], &[0u8; 6], "AN/NS/AR 全零");

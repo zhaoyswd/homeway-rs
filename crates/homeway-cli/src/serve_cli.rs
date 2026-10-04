@@ -168,13 +168,15 @@ fn parse_serve_flags(args: &[String]) -> ServeFlags {
             // 数值 flag 非法即报错退出（Go flag 包同语义）——静默回退默认值会让
             // 「--listen 127.0.0.1:42671」这类形态占到非预期端口（R6.5 E2E P2-3 实录）
             "listen" => {
-                if let Some(v) = take_val(&mut j) {
-                    match v.parse::<u16>() {
-                        Ok(p) => f.listen = Some(p),
-                        Err(_) => {
-                            eprintln!("--listen 非法（{v:?}——仅收端口数字，如 41641；不收 ip:port）");
-                            std::process::exit(2);
-                        }
+                let Some(v) = take_val(&mut j) else {
+                    eprintln!("--listen 缺值（端口数字，如 41641）");
+                    std::process::exit(2);
+                };
+                match v.parse::<u16>() {
+                    Ok(p) if p >= 1 => f.listen = Some(p),
+                    _ => {
+                        eprintln!("--listen 非法（{v:?}——仅收端口数字 1-65535，如 41641；不收 ip:port；0 不收——Go 同口径）");
+                        std::process::exit(2);
                     }
                 }
             }
@@ -198,25 +200,29 @@ fn parse_serve_flags(args: &[String]) -> ServeFlags {
                 }
             }
             "max-peers" => {
-                if let Some(v) = take_val(&mut j) {
-                    match v.parse::<usize>() {
-                        Ok(n) => f.max_peers = Some(n),
-                        Err(_) => {
-                            eprintln!("--max-peers 非法（{v:?}——非负整数，如 32）");
-                            std::process::exit(2);
-                        }
+                let Some(v) = take_val(&mut j) else {
+                    eprintln!("--max-peers 缺值（非负整数，如 32）");
+                    std::process::exit(2);
+                };
+                match v.parse::<usize>() {
+                    Ok(n) => f.max_peers = Some(n),
+                    Err(_) => {
+                        eprintln!("--max-peers 非法（{v:?}——非负整数，如 32）");
+                        std::process::exit(2);
                     }
                 }
             }
             "public-endpoint" => f.public_endpoint = take_val(&mut j),
             "dns-port" => {
-                if let Some(v) = take_val(&mut j) {
-                    match v.parse::<u16>() {
-                        Ok(p) => f.dns_port = Some(p),
-                        Err(_) => {
-                            eprintln!("--dns-port 非法（{v:?}——端口数字，0 = 关闭代答）");
-                            std::process::exit(2);
-                        }
+                let Some(v) = take_val(&mut j) else {
+                    eprintln!("--dns-port 缺值（端口数字，0 = 关闭代答）");
+                    std::process::exit(2);
+                };
+                match v.parse::<u16>() {
+                    Ok(p) => f.dns_port = Some(p),
+                    Err(_) => {
+                        eprintln!("--dns-port 非法（{v:?}——端口数字，0 = 关闭代答）");
+                        std::process::exit(2);
                     }
                 }
             }

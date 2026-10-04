@@ -84,10 +84,17 @@ const PACE_FLOOR: f64 = (10 * MSS) as f64 * 10.0; // IW × 10 / s
 const PACE_BURST_MAX: usize = 10 * MSS;
 /// 减窗的最小时间间隔（App 层无 RTT——「每 RTT 至多一次」的保守下限）。
 const MD_MIN_INTERVAL: Duration = Duration::from_millis(200);
+/// 拨号失败降噪键（kind + 原始目的；源端点不进键——见 dial_fail_seen 注释）。
+type DialFailKey = (&'static str, (Ipv4Addr, u16));
+
 /// 「真丢包」的 ACK 停滞判据（RACK 风味）：seq 回退 + ACK 前沿停滞 ≥25ms 才减窗。
 /// 单独的 seq 回退不可靠——dup-ACK 风暴（接收端无 RFC 5961 限速时的重复段回执）
 /// 会持续制造回退假阳性，但其 ACK 前沿在推进；真丢包（快重传/RTO 路径）的停滞
 /// ≈ 1×RTT（≥25ms），判据分离两类事件。
+/// 适用域注记（评审 r1 低-中）：smoltcp 的 RTO 下限 10ms（clamp(rtt+margin,10ms,10s)），
+/// RTT ≲20ms 的链路上真丢包的首次停滞可能 <25ms 被滤掉（减窗晚一两拍，非漏检——
+/// RTO 回卷重发会再次触发）；本常量按真机 RTT ≥20ms 形态标定，短 RTT 链路待
+/// smoltcp 0.14 上游化后由其内建 RTT 自适应替代。
 const LOSS_ACK_STALL: Duration = Duration::from_millis(25);
 
 /// 转发面计数器（拦截层是唯一生产写入方；键名 = 观测面契约：dialok/dialfail/flows/rejected）。
@@ -214,7 +221,8 @@ struct Flow {
     /// 本门 = **临时应用层 CC 垫片（temporary shim）**，随 smoltcp 0.11→0.14 升级
     /// 退役（升级工单 = ROADMAP「R7 前置批」）：smoltcp 0.14 起自带 RFC 合规的
     /// Reno/CUBIC 与 RFC 6298 重传退避。语义 = CUBIC（RFC 9438）：
-    /// 「进 socket 的未确认字节 ≤ cwnd」（send_queue 观测），ACK 进度驱动慢启动/
+    /// 「新写入 ≤ cwnd − 在途存量」（减窗后存量可暂时高于 cwnd，只封新写；评审 r1 措辞整改），
+    /// ACK 进度驱动慢启动/
     /// CUBIC 增长律 + 2×ACK 速率 pacing 塑形，TX 面数据段 seq 回退（+ACK 停滞确认）
     /// 检测重传做减窗（β=0.7）。
     /// 对齐口径注记：CC 算法选择不是 wire 可见行为（Go 出口 gVisor 默认 Reno）——
@@ -289,7 +297,11 @@ pub struct Interceptor {
     /// UDP 会话号（判据行 #N——进程级递增，对齐旧 udp relay 口径）。
     udp_seq: u64,
     /// 拨号失败日志的降噪表（形态 → (累计次数, 是否已记过首行)；R6.6 P2）。
-    dial_fail_seen: HashMap<(&'static str, (Ipv4Addr, u16), (Ipv4Addr, u16)), (u64, bool)>,
+    /// 键 = (kind, 原始目的)——**不含源端点**：手机核自连探测每次换临时源端口，
+    /// 键含源则每条都成「首行」，降噪失效（评审 r1 低危整改）。
+    dial_fail_seen: HashMap<DialFailKey, (u64, bool)>,
+    /// CC 观测行的上次打印时刻。
+    last_cc_stats: Option<Instant>,
     time0: Instant,
     smol_now: SmolInstant,
 }
@@ -339,6 +351,7 @@ impl Interceptor {
             dns_rx,
             udp_seq: 0,
             dial_fail_seen: HashMap::new(),
+            last_cc_stats: None,
             time0: Instant::now(),
             smol_now: SmolInstant::from_millis(0),
         }
@@ -747,6 +760,7 @@ impl Interceptor {
         }
         // ①' DNS 应答回投（worker 池异步产出；H3——驱动线程只做路由写回）
         self.drain_dns();
+        self.cc_stats_line();
         // ② 栈 poll
         let now = self.now_smol();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
@@ -771,6 +785,34 @@ impl Interceptor {
         std::mem::take(&mut self.tx_out)
     }
 
+
+    /// 发送侧 CC 的周期观测行（verbose/dlogf 面；仅存在在途 TCP 流时打——
+    /// 真机吞吐排障的关键窗口：cwnd/在途/速率/减窗次数/backlog）。
+    fn cc_stats_line(&mut self) {
+        let now = Instant::now();
+        if self.last_cc_stats.map(|t| now.duration_since(t) < Duration::from_secs(5)).unwrap_or(false) {
+            return;
+        }
+        self.last_cc_stats = Some(now);
+        let mut active = 0usize;
+        let mut busiest: Option<(usize, usize, f64, u64, usize)> = None; // (cwnd, sq, rate, md, backlog)
+        for f in self.flows.values() {
+            if f.proto != Proto::Tcp || f.sq_snapshot == 0 {
+                continue;
+            }
+            active += 1;
+            let cur = (f.cwnd, f.sq_snapshot, f.ack_rate, f.md_count, f.tx_backlog.len());
+            if busiest.as_ref().map(|b| cur.1 > b.1).unwrap_or(true) {
+                busiest = Some(cur);
+            }
+        }
+        if let Some((cwnd, sq, rate, md, backlog)) = busiest {
+            (self.cfg.logf)(&format!(
+                "intercept: cc 活跃TCP={active} 最大流 cwnd={}B 在途={}B rate={:.1}MB/s md={} backlog={}B",
+                cwnd, sq, rate / 1048576.0, md, backlog
+            ));
+        }
+    }
 
     /// DNS 应答路由（回投通道 → 栈内 socket / 拦截腿 flow）。
     fn drain_dns(&mut self) {
@@ -925,11 +967,11 @@ impl Interceptor {
             // 日志降噪（R6.5 E2E P2-6）：手机核自连探测拨隧道 IP:1，逐次记行会刷屏
             // （dialfail 计数不受影响——判据面是计数器不是日志行）。同形态首行即记、
             // 之后每 100 次记一行汇总。
-            let key = (kind.as_str(), orig_dst, client);
+            let key = (kind.as_str(), orig_dst);
             let (log, seen) = {
                 let e = self.dial_fail_seen.entry(key).or_insert((0u64, false));
                 e.0 += 1;
-                let log = !e.1 || e.0 % 100 == 0;
+                let log = !e.1 || e.0.is_multiple_of(100);
                 e.1 = true;
                 (log, e.0)
             };
@@ -1001,6 +1043,9 @@ impl Interceptor {
     fn cwnd_flush(&mut self, flow: u64) -> usize {
         let Some(f) = self.flows.get_mut(&flow) else { return 0 };
         let Some(h) = f.sock else { return 0 };
+        if self.sockets.get_mut::<TcpSocket>(h).state() == tcp::State::Closed {
+            return 0; // Closed/reset 会清空 tx_buffer（伪 ACK 源）——观测面排除（评审 r1 低危）
+        }
         let q = self.sockets.get_mut::<TcpSocket>(h).send_queue();
         let acked = f.sq_snapshot.saturating_sub(q);
         f.sq_snapshot = q;
@@ -1070,10 +1115,11 @@ impl Interceptor {
         if take == 0 {
             return 0; // 速率预算耗尽/不足一段：下一拍（~ms 级）预算补充续写
         }
-        let w = match self.sockets.get_mut::<TcpSocket>(h).send_slice(&f.tx_backlog[..take]) {
-            Ok(w) => w,
-            Err(_) => 0,
-        };
+        let w = self
+            .sockets
+            .get_mut::<TcpSocket>(h)
+            .send_slice(&f.tx_backlog[..take])
+            .unwrap_or_default();
         if w > 0 {
             f.tx_backlog.drain(..w);
             f.sq_snapshot = q + w;
@@ -1105,7 +1151,7 @@ impl Interceptor {
                 if (seq.wrapping_sub(hi) as i32) < 0
                     && ack_stalled
                     && f.acked_total >= f.md_rearm
-                    && f.last_md_at.map(|t| t.elapsed() >= MD_MIN_INTERVAL).unwrap_or(true)
+                    && f.last_md_at.is_none_or(|t| t.elapsed() >= MD_MIN_INTERVAL)
                 {
                     // 减窗（CUBIC β=0.7）：W_max = 当前窗；K = cbrt(W_max(1-β)/C)（秒）；
                     // cwnd/W_est/ssthresh 同落 β·W_max；CA epoch 在下一个 ACK 起表。
@@ -1901,77 +1947,55 @@ mod tests {
         drop(echo_thread);
     }
 
-    /// R6.6 P1-② 回归验收（忽略：跑真墙钟 ~20-60s）。见 `run_shaped_download`。
-    /// 阈值口径：有损链路（24MB/s）下对照**链路速率**（无损 loopback 天花板只作
-    /// 量级参考——任何 CC 都不可能超过链路速率，拿它当分母是伪验收）。
-    /// 两形态：
-    /// A = 深队列（2MB）——部署形态的缓冲量级（WG socket SO_SNDBUF=4MB，见
-    ///     bind.rs），CC 应逼近链路速率且无塌陷；
-    /// B = 浅队列（192KB）——塌陷复现/压力形态：队列 ≪ BDP（648KB）时慢启动
-    ///     2× 速率律必然过冲（无 pacing 的内核 TCP 同样跛行——已知浅队列病理），
-    ///     验收面 = 不塌陷（≥ 修复前实测 0.4MB/s 的 8 倍）。
+    /// R6.6 P1-② 回归验收（忽略：真跑 ~5-10s 且独占机器才稳）。见 `run_shaped_download`。
+    /// 阈值口径（评审 r1 整改的两轮收敛：绝对阈值在重载下假红〔天花板实测可掉到
+    /// 10MB/s〕，纯天花板相对阈值在闲机假红〔天花板可上到 56MB/s 而整形链路封在
+    /// 24MB/s〕）：**分母 = min(链路速率, 同轮实测 passthrough 天花板)** = 可达速率
+    /// （链路容量与机器能力取小——同进程同负载自校准）。
+    /// 判别力注记：深队列 2MB 下单流本就不丢包（修复前后都 ≈ 天花板）——A 单流是
+    /// **无回归**判据；真正判别本 bug 的是 A 并发（评审消融：门关 9.3MB/s≈42% 红、
+    /// 门开 15.8MB/s≈83% 绿）与 B 浅队列（门关塌到 MB/s 级）。
     #[test]
-    #[ignore = "性能 harness：真跑数十秒，验证时 cargo test -- --ignored 显式跑"]
+    #[ignore = "性能 harness：跑真墙钟 ~5-10s，验证时 cargo test -- --ignored 显式跑（重负载下阈值随同轮天花板自校准）"]
     fn downlink_lossy_link_recovery() {
-        const LINK_RATE_MB: f64 = 24.0; // DirLink 速率参数（改一处同步两处）
-        // 形态 A：深队列——单长流与并发短流都应 ≥ 链路速率的 50%
-        let (secs, bytes, _) = run_shaped_download(
-            1,
-            16 * 1024 * 1024,
-            DirLink::passthrough(),
-            DirLink::passthrough(),
-            None,
-        );
+        // A：深队列（部署形态）——单流（无回归）+ 并发 6 流（判别）
+        const LINK_RATE_MB: f64 = 24.0; // DirLink::deep 的速率参数（改一处同步两处）
+        let (secs, bytes, _) = run_shaped_download(1, 16 * 1024 * 1024, DirLink::passthrough(), DirLink::passthrough());
         let ceiling = bytes as f64 / secs / (1024.0 * 1024.0);
-        let (secs, bytes, down) = run_shaped_download(
-            1,
-            16 * 1024 * 1024,
-            DirLink::deep(),
-            DirLink::deep(),
-            None,
-        );
+        let (secs, bytes, down) = run_shaped_download(1, 16 * 1024 * 1024, DirLink::deep(), DirLink::deep());
         let got = bytes as f64 / secs / (1024.0 * 1024.0);
         println!(
             "A 单流：无损天花板 {ceiling:.1}MB/s → 深队列有损 {got:.1}MB/s（丢 {} 包 / 峰值队列 {}B）",
             down.dropped, down.peak_queue
         );
+        let reach1 = LINK_RATE_MB.min(ceiling);
         assert!(
-            got >= LINK_RATE_MB * 0.5,
-            "深队列形态下有损链路（{LINK_RATE_MB}MB/s）单流吞吐 {got:.1}MB/s 应 ≥ 链路速率的 50%（收敛/塌陷未达标）"
+            got >= reach1 * 0.5,
+            "深队列形态下单流吞吐 {got:.1}MB/s 应 ≥ 可达速率 {reach1:.1}MB/s（min(链路 24, 天花板 {ceiling:.1})）的 50%（无回归判据）"
         );
 
-        let (secs, bytes, _) = run_shaped_download(
-            6,
-            3 * 1024 * 1024,
-            DirLink::passthrough(),
-            DirLink::passthrough(),
-            None,
-        );
+        let (secs, bytes, _) = run_shaped_download(6, 3 * 1024 * 1024, DirLink::passthrough(), DirLink::passthrough());
         let ceiling6 = bytes as f64 / secs / (1024.0 * 1024.0);
-        let (secs, bytes, down6) =
-            run_shaped_download(6, 3 * 1024 * 1024, DirLink::deep(), DirLink::deep(), None);
+        let (secs, bytes, down6) = run_shaped_download(6, 3 * 1024 * 1024, DirLink::deep(), DirLink::deep());
         let got6 = bytes as f64 / secs / (1024.0 * 1024.0);
         println!(
             "A 并发 6 流：无损天花板 {ceiling6:.1}MB/s → 深队列有损 {got6:.1}MB/s（丢 {} 包 / 峰值队列 {}B）",
             down6.dropped, down6.peak_queue
         );
+        let reach6 = LINK_RATE_MB.min(ceiling6);
         assert!(
-            got6 >= LINK_RATE_MB * 0.5,
-            "深队列形态下并发短流聚合 {got6:.1}MB/s 应 ≥ 链路速率 {LINK_RATE_MB}MB/s 的 50%"
+            got6 >= reach6 * 0.5,
+            "深队列形态下并发短流聚合 {got6:.1}MB/s 应 ≥ 可达速率 {reach6:.1}MB/s（min(链路 24, 天花板 {ceiling6:.1})）的 50%（塌陷判别判据）"
         );
 
-        // 形态 B：浅队列——不塌陷即可（修复前同链路实测 0.4MB/s：整窗突发 vs 192KB
-        // 队列的突发规模丢包 + smoltcp go-back-N 重传风暴，与 ACK 时钟粒度无关）
-        let (secs, bytes, downb) = run_shaped_download(
-            1,
-            8 * 1024 * 1024,
-            DirLink::shallow(),
-            DirLink::shallow(),
-            None,
-        );
+        // B：浅队列（192KB ≪ BDP）——修复前真代码（无门控无 pacing）实测 0.4MB/s
+        // （2026-10-04，commit c0a244f 前的 4325c1b 基线 + 同链路形态；部分消融
+        // 〔仅去 allowed 上限、保留 pacing〕实测 5.2MB/s，介于两者之间——判据下界
+        // 取保守的 3.2MB/s = 0.4×8）
+        let (secs, bytes, downb) = run_shaped_download(1, 8 * 1024 * 1024, DirLink::shallow(), DirLink::shallow());
         let gotb = bytes as f64 / secs / (1024.0 * 1024.0);
         println!(
-            "B 浅队列单流：{gotb:.1}MB/s（丢 {} 包 / 峰值队列 {}B；修复前同链路 0.4MB/s）",
+            "B 浅队列单流：{gotb:.1}MB/s（丢 {} 包 / 峰值队列 {}B；修复前真代码 0.4MB/s）",
             downb.dropped, downb.peak_queue
         );
         assert!(
@@ -2060,15 +2084,12 @@ mod tests {
     }
 
     /// 一轮受控下载：n_flows 条并发流（各一台栈 B 客户端，独立隧道 IP）经共享的上/下
-    /// 行链路拉 bytes_each 字节；豁免腿转投回环 origin。`ack_delay` = 客户端 socket 的
-    /// 延迟 ACK（None = 即 ACK——真机内核 quickack 形态；Some(10ms) = 粗时钟压力形态）。
-    /// 返回（耗时秒, 总字节, 下行统计）。
+    /// 行链路拉 bytes_each 字节；豁免腿转投回环 origin。返回（耗时秒, 总字节, 下行统计）。
     fn run_shaped_download(
         n_flows: usize,
         bytes_each: usize,
         mut up: DirLink,
         mut down: DirLink,
-        ack_delay: Option<Duration>,
     ) -> (f64, usize, DirLink) {
         // origin：回环 TCP，每连接写满 bytes_each 后 shutdown 写半边
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -2121,9 +2142,6 @@ mod tests {
                 SmolInstant::from_millis(0),
             );
             let h = s.connect(std::net::SocketAddrV4::new(tunnel, port)).unwrap();
-            s.sockets.get_mut::<TcpSocket>(h).set_ack_delay(
-                ack_delay.map(|d| smoltcp::time::Duration::from_millis(d.as_millis() as u64)),
-            );
             clients.push((s, h));
         }
 

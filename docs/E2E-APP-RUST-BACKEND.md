@@ -60,13 +60,13 @@
 
 ## 2. 问题分级清单
 
-**P1（Rust 侧待修）**
+**P1（Rust 侧待修）——2026-10-04 R6.6 处置：①已修复收口（真机复测转绿）；②CC 垫片已修（本地 harness 验收），真机复测仍有独立残差（归因 smoltcp 0.14 工单，见 docs/reviews/R6.6.md §三）**
 
-1. **DNS 代答自检误报 + malformed 常驻**：每次启动必打 `⚠️ dns 代答自验证未通过（自验证无应答（查询处理失败））——上游此刻不可达…期间查询按 SERVFAIL/兜底处理`，
+1. **DNS 代答自检误报 + malformed 常驻**：〔**R6.6 已修复**：根因 = self_check_query 头部只写 5 字节（Go 基线 12 字节头直译残缺），名字错位致 qtype 解析必败；修复 + 单测钉死后真机启动自检行转绿、malformed=0。commit 1b8d6b5〕：每次启动必打 `⚠️ dns 代答自验证未通过（自验证无应答（查询处理失败））——上游此刻不可达…期间查询按 SERVFAIL/兜底处理`，
    且 `malformed=1` 恒存（两台 exit 均复现）。但真实客户端查询完全正常（q=46/resp=23/filter=23、
    假 IP 应答、页面可开）——疑自检查询构造/解析自身即那 1 条 malformed。影响：启动窗口内真实查询
    可能被按 SERVFAIL 兜底 + 运维判据被污染。归属：Rust 修（dns 自检路径）。
-2. **下行吞吐 ~1MB/s，同机 A/B 铁证 Rust 侧**：对 Rust 出口测速 `↑24MB/s ↓947KB/s`；**同一手机
+2. **下行吞吐 ~1MB/s，同机 A/B 铁证 Rust 侧**〔**R6.6 部分修复**：根因之一 = smoltcp 0.11 无拥塞控制（bulk 整窗突发 + RTO go-back-N 重传风暴，本地受控复现 448× 塌陷）；应用层 CC 垫片（CUBIC + pacing + 停滞确认丢包检测）已修并本地 harness 验收（并发 3.2×/浅队列 17×）；真机复测 CC 状态健康但端到端仍 ≈1MB/s vs Go 20MB/s——剩余瓶颈在 encap/UDP 发送路径（harness 绕过该层），登记 smoltcp 0.14 工单追加项。commit c0a244f + docs/reviews/R6.6.md §三〕：对 Rust 出口测速 `↑24MB/s ↓947KB/s`；**同一手机
    同一 Wi-Fi 15 分钟后对生产 Go 出口（41641）复测 `↑28MB/s ↓19MB/s`**——上行相当、下行差 20 倍
    ⇒ 瓶颈在 Rust 出口下行发送路径，非手机/Wi-Fi。交叉印证：经 Rust 出口的浏览器整页 ~4MB/15s、
    files 10MB 下载 <8s（≈1.3MB/s），三口径一致 ≈1MB/s 下行。（PERF-AB 的 down 0.79× 是 CLI 对
