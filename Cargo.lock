@@ -511,6 +511,7 @@ dependencies = [
  "sha2",
  "smoltcp",
  "thiserror 2.0.21",
+ "toml",
  "x25519-dalek",
 ]
 

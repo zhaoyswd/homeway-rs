@@ -19,8 +19,10 @@ boringtun.workspace = true
 # 端点缓存落盘（与 Go 字节对齐的持久化 JSON——键序/omitempty 语义面，R2）
 serde.workspace = true
 serde_json.workspace = true
-# R6 term 服务面（alacritty = 仿真底座；flate2 = surface gzip；fnv = golden digest）
+# R6 term 服务面（alacritty = 仿真底座；flate2 = surface gzip；fnv = golden digest；
+# toml = manifest 规则文件；regex = manifest 方言垫片）
 alacritty_terminal.workspace = true
+toml.workspace = true
 portable-pty.workspace = true
 flate2.workspace = true
 fnv.workspace = true

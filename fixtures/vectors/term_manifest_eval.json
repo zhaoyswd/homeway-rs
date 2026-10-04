@@ -1,0 +1,3047 @@
+{
+  "agents": [
+    "agy",
+    "amp",
+    "claude",
+    "cline",
+    "codex",
+    "copilot",
+    "cursor",
+    "devin",
+    "droid",
+    "gemini",
+    "grok",
+    "hermes",
+    "kilo",
+    "kimi",
+    "kiro",
+    "letta",
+    "maki",
+    "muse",
+    "opencode",
+    "pi",
+    "qodercli",
+    "qwen"
+  ],
+  "cases": [
+    {
+      "agent": "agy",
+      "fixture": "codex-startup.txt",
+      "rules": [
+        {
+          "id": "permission_prompt",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "spinner_working",
+          "priority": 100,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "background_tasks_working",
+          "priority": 90,
+          "region": "bottom_non_empty_lines(5)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 273
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "amp",
+      "fixture": "codex-startup.txt",
+      "rules": [
+        {
+          "id": "osc_title_plugin_confirmation_blocked",
+          "priority": 1100,
+          "region": "osc_title",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "osc_title_working",
+          "priority": 1050,
+          "region": "osc_title",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "approval_footer",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "status_footer_working",
+          "priority": 200,
+          "region": "bottom_non_empty_lines(5)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 273
+        },
+        {
+          "id": "esc_cancel_working",
+          "priority": 100,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "osc_title_idle",
+          "priority": 50,
+          "region": "osc_title",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 0
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "claude",
+      "fixture": "codex-startup.txt",
+      "rules": [
+        {
+          "id": "osc_title_working",
+          "priority": 1100,
+          "region": "osc_title",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "live_turn_working",
+          "priority": 970,
+          "region": "bottom_non_empty_lines(12)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "background_agents_working",
+          "priority": 965,
+          "region": "last_non_empty_above_prompt_box",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 25
+        },
+        {
+          "id": "background_mcp_task_working",
+          "priority": 965,
+          "region": "bottom_non_empty_lines(12)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "btw_overlay_working",
+          "priority": 975,
+          "region": "bottom_non_empty_lines(5)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 273
+        },
+        {
+          "id": "transcript_viewer",
+          "priority": 1000,
+          "region": "bottom_non_empty_lines(3)",
+          "state": 0,
+          "matched": false,
+          "region_bytes": 61
+        },
+        {
+          "id": "live_blocked_form",
+          "priority": 980,
+          "region": "after_last_horizontal_rule",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "dynamic_workflow_prompt",
+          "priority": 980,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "mcp_elicitation_prompt",
+          "priority": 980,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "live_prompt_box",
+          "priority": 950,
+          "region": "prompt_box_body",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "model_picker_menu",
+          "priority": 900,
+          "region": "whole_recent",
+          "state": 0,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "bash_permission_prompt",
+          "priority": 850,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "generic_permission_prompt",
+          "priority": 840,
+          "region": "after_last_horizontal_rule",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "legacy_no_prompt_blocker",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "osc_title_idle",
+          "priority": 250,
+          "region": "osc_title",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "osc_progress_idle",
+          "priority": 250,
+          "region": "osc_progress",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 0
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "cline",
+      "fixture": "codex-startup.txt",
+      "rules": [
+        {
+          "id": "tool_permission",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "inline_tool_permission",
+          "priority": 300,
+          "region": "bottom_non_empty_lines(16)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 987
+        },
+        {
+          "id": "inline_question",
+          "priority": 300,
+          "region": "bottom_non_empty_lines(24)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1359
+        },
+        {
+          "id": "active_turn",
+          "priority": 200,
+          "region": "bottom_non_empty_lines(20)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1228
+        },
+        {
+          "id": "composer_idle",
+          "priority": 100,
+          "region": "bottom_non_empty_lines(12)",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "default_cline_working",
+          "priority": -10,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": true,
+          "region_bytes": 1436
+        }
+      ],
+      "state": "working",
+      "matched_rule": "default_cline_working",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": true
+    },
+    {
+      "agent": "codex",
+      "fixture": "codex-startup.txt",
+      "rules": [
+        {
+          "id": "osc_title_blocked",
+          "priority": 1100,
+          "region": "osc_title",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "osc_title_working",
+          "priority": 1050,
+          "region": "osc_title",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "transcript_viewer",
+          "priority": 1000,
+          "region": "after_last_prompt_marker",
+          "state": 0,
+          "matched": false,
+          "region_bytes": 40
+        },
+        {
+          "id": "trust_directory",
+          "priority": 950,
+          "region": "top_non_empty_lines(20)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1396
+        },
+        {
+          "id": "startup_update",
+          "priority": 950,
+          "region": "bottom_non_empty_lines(20)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1228
+        },
+        {
+          "id": "live_strong_blocker",
+          "priority": 900,
+          "region": "after_last_prompt_marker",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 40
+        },
+        {
+          "id": "weak_blocker",
+          "priority": 600,
+          "region": "whole_recent_without_current_prompt_marker",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "screen_working_fallback",
+          "priority": 500,
+          "region": "before_current_prompt_marker",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1375
+        },
+        {
+          "id": "osc_title_idle",
+          "priority": 100,
+          "region": "osc_title",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 0
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "copilot",
+      "fixture": "codex-startup.txt",
+      "rules": [
+        {
+          "id": "selection_blocker",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "background_agents_working",
+          "priority": 110,
+          "region": "bottom_non_empty_lines(6)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 306
+        },
+        {
+          "id": "working_cancel_hint",
+          "priority": 100,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1436
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "cursor",
+      "fixture": "codex-startup.txt",
+      "rules": [
+        {
+          "id": "write_file_approval",
+          "priority": 320,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 506
+        },
+        {
+          "id": "approval_prompt",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "stop_hint_working",
+          "priority": 100,
+          "region": "bottom_non_empty_lines(6)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 306
+        },
+        {
+          "id": "background_task_status_working",
+          "priority": 95,
+          "region": "bottom_non_empty_lines(5)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 273
+        },
+        {
+          "id": "spinner_working",
+          "priority": 90,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 506
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "devin",
+      "fixture": "codex-startup.txt",
+      "rules": [
+        {
+          "id": "workspace_trust_prompt",
+          "priority": 300,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 506
+        },
+        {
+          "id": "permission_prompt",
+          "priority": 290,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 506
+        },
+        {
+          "id": "running_tools_footer",
+          "priority": 200,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 506
+        },
+        {
+          "id": "guide_while_working",
+          "priority": 190,
+          "region": "bottom_non_empty_lines(6)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 306
+        },
+        {
+          "id": "tool_reading_timeout",
+          "priority": 180,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 506
+        },
+        {
+          "id": "welcome_prompt_footer",
+          "priority": 120,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 506
+        },
+        {
+          "id": "live_prompt_footer",
+          "priority": 100,
+          "region": "bottom_non_empty_lines(6)",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 306
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "droid",
+      "fixture": "codex-startup.txt",
+      "rules": [
+        {
+          "id": "execute_selection_blocker",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "selection_menu_blocker",
+          "priority": 290,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 506
+        },
+        {
+          "id": "spinner_stop_working",
+          "priority": 110,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "stop_hint_working",
+          "priority": 100,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1436
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "gemini",
+      "fixture": "codex-startup.txt",
+      "rules": [
+        {
+          "id": "apply_or_allow_change",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "esc_cancel_working",
+          "priority": 100,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1436
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "grok",
+      "fixture": "codex-startup.txt",
+      "rules": [
+        {
+          "id": "osc_title_blocked",
+          "priority": 1300,
+          "region": "osc_title",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "option_dialog_blocked",
+          "priority": 1200,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "permission_hints_blocked",
+          "priority": 1190,
+          "region": "bottom_non_empty_lines(2)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 40
+        },
+        {
+          "id": "question_dialog_hints_blocked",
+          "priority": 1185,
+          "region": "bottom_non_empty_lines(2)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 40
+        },
+        {
+          "id": "permission_scope_selector",
+          "priority": 1180,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "background_work_chip_working",
+          "priority": 1170,
+          "region": "top_non_empty_lines(1)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 145
+        },
+        {
+          "id": "background_status_working",
+          "priority": 1165,
+          "region": "bottom_non_empty_lines(12)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "osc_progress_working",
+          "priority": 1150,
+          "region": "osc_progress",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "osc_title_idle",
+          "priority": 1100,
+          "region": "osc_title",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "osc_title_working",
+          "priority": 1000,
+          "region": "osc_title",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "osc_progress_idle",
+          "priority": 950,
+          "region": "osc_progress",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "spinner_status_working",
+          "priority": 1160,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "esc_cancel_hints_working",
+          "priority": 1155,
+          "region": "bottom_non_empty_lines(2)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 40
+        },
+        {
+          "id": "waiting_tool_working",
+          "priority": 1140,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "prompt_hints_idle",
+          "priority": 100,
+          "region": "bottom_non_empty_lines(2)",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 40
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "hermes",
+      "fixture": "codex-startup.txt",
+      "rules": [
+        {
+          "id": "osc_title_blocked",
+          "priority": 1100,
+          "region": "osc_title",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "osc_title_working",
+          "priority": 1050,
+          "region": "osc_title",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "dangerous_command_approval",
+          "priority": 900,
+          "region": "bottom_non_empty_lines(14)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 869
+        },
+        {
+          "id": "clarification_prompt",
+          "priority": 900,
+          "region": "bottom_non_empty_lines(14)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 869
+        },
+        {
+          "id": "credential_prompt",
+          "priority": 900,
+          "region": "bottom_non_empty_lines(14)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 869
+        },
+        {
+          "id": "confirmation_prompt",
+          "priority": 900,
+          "region": "bottom_non_empty_lines(14)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 869
+        },
+        {
+          "id": "interrupt_status_working",
+          "priority": 950,
+          "region": "bottom_non_empty_lines(5)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 273
+        },
+        {
+          "id": "classic_cancel_working",
+          "priority": 500,
+          "region": "bottom_non_empty_lines(5)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 273
+        },
+        {
+          "id": "osc_title_idle",
+          "priority": 100,
+          "region": "osc_title",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 0
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "kilo",
+      "fixture": "codex-startup.txt",
+      "rules": [
+        {
+          "id": "opencode_permission",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "esc_interrupt_working",
+          "priority": 100,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1436
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "kimi",
+      "fixture": "codex-startup.txt",
+      "rules": [
+        {
+          "id": "current_approval_panel",
+          "priority": 400,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "question_panel",
+          "priority": 390,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "legacy_approval_panel",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "background_agent_status_working",
+          "priority": 120,
+          "region": "bottom_non_empty_lines(3)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 61
+        },
+        {
+          "id": "moon_spinner_working",
+          "priority": 100,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "braille_spinner_working",
+          "priority": 90,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1436
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "kiro",
+      "fixture": "codex-startup.txt",
+      "rules": [
+        {
+          "id": "live_prompt_idle",
+          "priority": 1100,
+          "region": "bottom_non_empty_lines(4)",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 161
+        },
+        {
+          "id": "tool_approval",
+          "priority": 1050,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 506
+        },
+        {
+          "id": "tool_approval_edit",
+          "priority": 1045,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "crew_approval",
+          "priority": 1040,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 506
+        },
+        {
+          "id": "question_panel",
+          "priority": 1030,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 506
+        },
+        {
+          "id": "live_working_footer",
+          "priority": 950,
+          "region": "bottom_non_empty_lines(4)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 161
+        },
+        {
+          "id": "osc_title_working",
+          "priority": 900,
+          "region": "osc_title",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "osc_progress_working",
+          "priority": 890,
+          "region": "osc_progress",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 0
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "letta",
+      "fixture": "codex-startup.txt",
+      "rules": [
+        {
+          "id": "osc_progress_blocked",
+          "priority": 1400,
+          "region": "osc_progress",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "osc_title_blocked",
+          "priority": 1300,
+          "region": "osc_title",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "command_approval",
+          "priority": 1200,
+          "region": "bottom_non_empty_lines(20)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1228
+        },
+        {
+          "id": "osc_title_working",
+          "priority": 900,
+          "region": "osc_title",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "active_status",
+          "priority": 850,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 506
+        },
+        {
+          "id": "running_tool",
+          "priority": 800,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 506
+        },
+        {
+          "id": "profile_selector",
+          "priority": 700,
+          "region": "bottom_non_empty_lines(12)",
+          "state": 0,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "composer_input",
+          "priority": 150,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 0,
+          "matched": true,
+          "region_bytes": 506
+        },
+        {
+          "id": "composer_idle",
+          "priority": 100,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 506
+        },
+        {
+          "id": "no_live_state_evidence",
+          "priority": 0,
+          "region": "whole_recent",
+          "state": 0,
+          "matched": true,
+          "region_bytes": 1436
+        }
+      ],
+      "state": "unknown",
+      "matched_rule": "composer_input",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false
+    },
+    {
+      "agent": "maki",
+      "fixture": "codex-startup.txt",
+      "rules": [
+        {
+          "id": "permission_prompt",
+          "priority": 980,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "plan_complete_form",
+          "priority": 970,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "status_bar_spinner_working",
+          "priority": 900,
+          "region": "bottom_non_empty_lines(1)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 25
+        },
+        {
+          "id": "status_bar_idle",
+          "priority": 850,
+          "region": "bottom_non_empty_lines(1)",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 25
+        },
+        {
+          "id": "prompt_box_idle",
+          "priority": 840,
+          "region": "bottom_non_empty_lines(3)",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 61
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "muse",
+      "fixture": "codex-startup.txt",
+      "rules": [
+        {
+          "id": "workspace_trust_blocked",
+          "priority": 970,
+          "region": "bottom_non_empty_lines(12)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "pick_request_blocked",
+          "priority": 950,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 506
+        },
+        {
+          "id": "menu_overlay",
+          "priority": 940,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 0,
+          "matched": false,
+          "region_bytes": 506
+        },
+        {
+          "id": "working_esc_interrupt",
+          "priority": 900,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 506
+        },
+        {
+          "id": "blocked_approval",
+          "priority": 850,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 506
+        },
+        {
+          "id": "idle_prompt",
+          "priority": 700,
+          "region": "bottom_non_empty_lines(5)",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 273
+        },
+        {
+          "id": "idle_status_fallback",
+          "priority": 500,
+          "region": "bottom_non_empty_lines(3)",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 61
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "opencode",
+      "fixture": "codex-startup.txt",
+      "rules": [
+        {
+          "id": "permission_required",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "interrupt_hint_working",
+          "priority": 110,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "progress_bar_working",
+          "priority": 100,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1436
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "pi",
+      "fixture": "codex-startup.txt",
+      "rules": [
+        {
+          "id": "working_literal",
+          "priority": 100,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "working_border",
+          "priority": 100,
+          "region": "bottom_non_empty_lines(12)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 754
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "qodercli",
+      "fixture": "codex-startup.txt",
+      "rules": [
+        {
+          "id": "confirmation_or_input_blocker",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "cancel_hint_working",
+          "priority": 100,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1436
+        },
+        {
+          "id": "spinner_working",
+          "priority": 90,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1436
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "qwen",
+      "fixture": "codex-startup.txt",
+      "rules": [
+        {
+          "id": "osc_title_blocked",
+          "priority": 1200,
+          "region": "osc_title",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "osc_title_working",
+          "priority": 1100,
+          "region": "osc_title",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "waiting_for_confirmation",
+          "priority": 1000,
+          "region": "bottom_non_empty_lines(20)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1228
+        },
+        {
+          "id": "tool_confirmation",
+          "priority": 990,
+          "region": "bottom_non_empty_lines(20)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1228
+        },
+        {
+          "id": "question_dialog",
+          "priority": 980,
+          "region": "bottom_non_empty_lines(20)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1228
+        },
+        {
+          "id": "folder_trust_dialog",
+          "priority": 970,
+          "region": "bottom_non_empty_lines(20)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1228
+        },
+        {
+          "id": "cancel_hint_working",
+          "priority": 900,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 506
+        },
+        {
+          "id": "narrow_cancel_hint_working",
+          "priority": 890,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 506
+        },
+        {
+          "id": "osc_tool_progress_working",
+          "priority": 850,
+          "region": "osc_progress",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "composer_idle",
+          "priority": 100,
+          "region": "bottom_non_empty_lines(30)",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 1359
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "agy",
+      "fixture": "opencode-startup.txt",
+      "rules": [
+        {
+          "id": "permission_prompt",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "spinner_working",
+          "priority": 100,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "background_tasks_working",
+          "priority": 90,
+          "region": "bottom_non_empty_lines(5)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 589
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "amp",
+      "fixture": "opencode-startup.txt",
+      "rules": [
+        {
+          "id": "osc_title_plugin_confirmation_blocked",
+          "priority": 1100,
+          "region": "osc_title",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "osc_title_working",
+          "priority": 1050,
+          "region": "osc_title",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "approval_footer",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "status_footer_working",
+          "priority": 200,
+          "region": "bottom_non_empty_lines(5)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 589
+        },
+        {
+          "id": "esc_cancel_working",
+          "priority": 100,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "osc_title_idle",
+          "priority": 50,
+          "region": "osc_title",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 0
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "claude",
+      "fixture": "opencode-startup.txt",
+      "rules": [
+        {
+          "id": "osc_title_working",
+          "priority": 1100,
+          "region": "osc_title",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "live_turn_working",
+          "priority": 970,
+          "region": "bottom_non_empty_lines(12)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1242
+        },
+        {
+          "id": "background_agents_working",
+          "priority": 965,
+          "region": "last_non_empty_above_prompt_box",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 120
+        },
+        {
+          "id": "background_mcp_task_working",
+          "priority": 965,
+          "region": "bottom_non_empty_lines(12)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1242
+        },
+        {
+          "id": "btw_overlay_working",
+          "priority": 975,
+          "region": "bottom_non_empty_lines(5)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 589
+        },
+        {
+          "id": "transcript_viewer",
+          "priority": 1000,
+          "region": "bottom_non_empty_lines(3)",
+          "state": 0,
+          "matched": false,
+          "region_bytes": 474
+        },
+        {
+          "id": "live_blocked_form",
+          "priority": 980,
+          "region": "after_last_horizontal_rule",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "dynamic_workflow_prompt",
+          "priority": 980,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "mcp_elicitation_prompt",
+          "priority": 980,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "live_prompt_box",
+          "priority": 950,
+          "region": "prompt_box_body",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "model_picker_menu",
+          "priority": 900,
+          "region": "whole_recent",
+          "state": 0,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "bash_permission_prompt",
+          "priority": 850,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "generic_permission_prompt",
+          "priority": 840,
+          "region": "after_last_horizontal_rule",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "legacy_no_prompt_blocker",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "osc_title_idle",
+          "priority": 250,
+          "region": "osc_title",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "osc_progress_idle",
+          "priority": 250,
+          "region": "osc_progress",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 0
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "cline",
+      "fixture": "opencode-startup.txt",
+      "rules": [
+        {
+          "id": "tool_permission",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "inline_tool_permission",
+          "priority": 300,
+          "region": "bottom_non_empty_lines(16)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1242
+        },
+        {
+          "id": "inline_question",
+          "priority": 300,
+          "region": "bottom_non_empty_lines(24)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1242
+        },
+        {
+          "id": "active_turn",
+          "priority": 200,
+          "region": "bottom_non_empty_lines(20)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1242
+        },
+        {
+          "id": "composer_idle",
+          "priority": 100,
+          "region": "bottom_non_empty_lines(12)",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 1242
+        },
+        {
+          "id": "default_cline_working",
+          "priority": -10,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": true,
+          "region_bytes": 1256
+        }
+      ],
+      "state": "working",
+      "matched_rule": "default_cline_working",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": true
+    },
+    {
+      "agent": "codex",
+      "fixture": "opencode-startup.txt",
+      "rules": [
+        {
+          "id": "osc_title_blocked",
+          "priority": 1100,
+          "region": "osc_title",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "osc_title_working",
+          "priority": 1050,
+          "region": "osc_title",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "transcript_viewer",
+          "priority": 1000,
+          "region": "after_last_prompt_marker",
+          "state": 0,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "trust_directory",
+          "priority": 950,
+          "region": "top_non_empty_lines(20)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "startup_update",
+          "priority": 950,
+          "region": "bottom_non_empty_lines(20)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1242
+        },
+        {
+          "id": "live_strong_blocker",
+          "priority": 900,
+          "region": "after_last_prompt_marker",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "weak_blocker",
+          "priority": 600,
+          "region": "whole_recent_without_current_prompt_marker",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "screen_working_fallback",
+          "priority": 500,
+          "region": "before_current_prompt_marker",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "osc_title_idle",
+          "priority": 100,
+          "region": "osc_title",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 0
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "copilot",
+      "fixture": "opencode-startup.txt",
+      "rules": [
+        {
+          "id": "selection_blocker",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "background_agents_working",
+          "priority": 110,
+          "region": "bottom_non_empty_lines(6)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 652
+        },
+        {
+          "id": "working_cancel_hint",
+          "priority": 100,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1256
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "cursor",
+      "fixture": "opencode-startup.txt",
+      "rules": [
+        {
+          "id": "write_file_approval",
+          "priority": 320,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "approval_prompt",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "stop_hint_working",
+          "priority": 100,
+          "region": "bottom_non_empty_lines(6)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 652
+        },
+        {
+          "id": "background_task_status_working",
+          "priority": 95,
+          "region": "bottom_non_empty_lines(5)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 589
+        },
+        {
+          "id": "spinner_working",
+          "priority": 90,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 754
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "devin",
+      "fixture": "opencode-startup.txt",
+      "rules": [
+        {
+          "id": "workspace_trust_prompt",
+          "priority": 300,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "permission_prompt",
+          "priority": 290,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "running_tools_footer",
+          "priority": 200,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "guide_while_working",
+          "priority": 190,
+          "region": "bottom_non_empty_lines(6)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 652
+        },
+        {
+          "id": "tool_reading_timeout",
+          "priority": 180,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "welcome_prompt_footer",
+          "priority": 120,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "live_prompt_footer",
+          "priority": 100,
+          "region": "bottom_non_empty_lines(6)",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 652
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "droid",
+      "fixture": "opencode-startup.txt",
+      "rules": [
+        {
+          "id": "execute_selection_blocker",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "selection_menu_blocker",
+          "priority": 290,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "spinner_stop_working",
+          "priority": 110,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "stop_hint_working",
+          "priority": 100,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1256
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "gemini",
+      "fixture": "opencode-startup.txt",
+      "rules": [
+        {
+          "id": "apply_or_allow_change",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "esc_cancel_working",
+          "priority": 100,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1256
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "grok",
+      "fixture": "opencode-startup.txt",
+      "rules": [
+        {
+          "id": "osc_title_blocked",
+          "priority": 1300,
+          "region": "osc_title",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "option_dialog_blocked",
+          "priority": 1200,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "permission_hints_blocked",
+          "priority": 1190,
+          "region": "bottom_non_empty_lines(2)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 225
+        },
+        {
+          "id": "question_dialog_hints_blocked",
+          "priority": 1185,
+          "region": "bottom_non_empty_lines(2)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 225
+        },
+        {
+          "id": "permission_scope_selector",
+          "priority": 1180,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "background_work_chip_working",
+          "priority": 1170,
+          "region": "top_non_empty_lines(1)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 92
+        },
+        {
+          "id": "background_status_working",
+          "priority": 1165,
+          "region": "bottom_non_empty_lines(12)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1242
+        },
+        {
+          "id": "osc_progress_working",
+          "priority": 1150,
+          "region": "osc_progress",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "osc_title_idle",
+          "priority": 1100,
+          "region": "osc_title",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "osc_title_working",
+          "priority": 1000,
+          "region": "osc_title",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "osc_progress_idle",
+          "priority": 950,
+          "region": "osc_progress",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "spinner_status_working",
+          "priority": 1160,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "esc_cancel_hints_working",
+          "priority": 1155,
+          "region": "bottom_non_empty_lines(2)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 225
+        },
+        {
+          "id": "waiting_tool_working",
+          "priority": 1140,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "prompt_hints_idle",
+          "priority": 100,
+          "region": "bottom_non_empty_lines(2)",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 225
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "hermes",
+      "fixture": "opencode-startup.txt",
+      "rules": [
+        {
+          "id": "osc_title_blocked",
+          "priority": 1100,
+          "region": "osc_title",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "osc_title_working",
+          "priority": 1050,
+          "region": "osc_title",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "dangerous_command_approval",
+          "priority": 900,
+          "region": "bottom_non_empty_lines(14)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1242
+        },
+        {
+          "id": "clarification_prompt",
+          "priority": 900,
+          "region": "bottom_non_empty_lines(14)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1242
+        },
+        {
+          "id": "credential_prompt",
+          "priority": 900,
+          "region": "bottom_non_empty_lines(14)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1242
+        },
+        {
+          "id": "confirmation_prompt",
+          "priority": 900,
+          "region": "bottom_non_empty_lines(14)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1242
+        },
+        {
+          "id": "interrupt_status_working",
+          "priority": 950,
+          "region": "bottom_non_empty_lines(5)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 589
+        },
+        {
+          "id": "classic_cancel_working",
+          "priority": 500,
+          "region": "bottom_non_empty_lines(5)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 589
+        },
+        {
+          "id": "osc_title_idle",
+          "priority": 100,
+          "region": "osc_title",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 0
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "kilo",
+      "fixture": "opencode-startup.txt",
+      "rules": [
+        {
+          "id": "opencode_permission",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "esc_interrupt_working",
+          "priority": 100,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1256
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "kimi",
+      "fixture": "opencode-startup.txt",
+      "rules": [
+        {
+          "id": "current_approval_panel",
+          "priority": 400,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "question_panel",
+          "priority": 390,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "legacy_approval_panel",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "background_agent_status_working",
+          "priority": 120,
+          "region": "bottom_non_empty_lines(3)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 474
+        },
+        {
+          "id": "moon_spinner_working",
+          "priority": 100,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "braille_spinner_working",
+          "priority": 90,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1256
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "kiro",
+      "fixture": "opencode-startup.txt",
+      "rules": [
+        {
+          "id": "live_prompt_idle",
+          "priority": 1100,
+          "region": "bottom_non_empty_lines(4)",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 562
+        },
+        {
+          "id": "tool_approval",
+          "priority": 1050,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "tool_approval_edit",
+          "priority": 1045,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "crew_approval",
+          "priority": 1040,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "question_panel",
+          "priority": 1030,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "live_working_footer",
+          "priority": 950,
+          "region": "bottom_non_empty_lines(4)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 562
+        },
+        {
+          "id": "osc_title_working",
+          "priority": 900,
+          "region": "osc_title",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "osc_progress_working",
+          "priority": 890,
+          "region": "osc_progress",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 0
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "letta",
+      "fixture": "opencode-startup.txt",
+      "rules": [
+        {
+          "id": "osc_progress_blocked",
+          "priority": 1400,
+          "region": "osc_progress",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "osc_title_blocked",
+          "priority": 1300,
+          "region": "osc_title",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "command_approval",
+          "priority": 1200,
+          "region": "bottom_non_empty_lines(20)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1242
+        },
+        {
+          "id": "osc_title_working",
+          "priority": 900,
+          "region": "osc_title",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "active_status",
+          "priority": 850,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "running_tool",
+          "priority": 800,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "profile_selector",
+          "priority": 700,
+          "region": "bottom_non_empty_lines(12)",
+          "state": 0,
+          "matched": false,
+          "region_bytes": 1242
+        },
+        {
+          "id": "composer_input",
+          "priority": 150,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 0,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "composer_idle",
+          "priority": 100,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "no_live_state_evidence",
+          "priority": 0,
+          "region": "whole_recent",
+          "state": 0,
+          "matched": true,
+          "region_bytes": 1256
+        }
+      ],
+      "state": "unknown",
+      "matched_rule": "no_live_state_evidence",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false
+    },
+    {
+      "agent": "maki",
+      "fixture": "opencode-startup.txt",
+      "rules": [
+        {
+          "id": "permission_prompt",
+          "priority": 980,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "plan_complete_form",
+          "priority": 970,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "status_bar_spinner_working",
+          "priority": 900,
+          "region": "bottom_non_empty_lines(1)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 121
+        },
+        {
+          "id": "status_bar_idle",
+          "priority": 850,
+          "region": "bottom_non_empty_lines(1)",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 121
+        },
+        {
+          "id": "prompt_box_idle",
+          "priority": 840,
+          "region": "bottom_non_empty_lines(3)",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 474
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "muse",
+      "fixture": "opencode-startup.txt",
+      "rules": [
+        {
+          "id": "workspace_trust_blocked",
+          "priority": 970,
+          "region": "bottom_non_empty_lines(12)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1242
+        },
+        {
+          "id": "pick_request_blocked",
+          "priority": 950,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "menu_overlay",
+          "priority": 940,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 0,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "working_esc_interrupt",
+          "priority": 900,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "blocked_approval",
+          "priority": 850,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "idle_prompt",
+          "priority": 700,
+          "region": "bottom_non_empty_lines(5)",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 589
+        },
+        {
+          "id": "idle_status_fallback",
+          "priority": 500,
+          "region": "bottom_non_empty_lines(3)",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 474
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "opencode",
+      "fixture": "opencode-startup.txt",
+      "rules": [
+        {
+          "id": "permission_required",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "interrupt_hint_working",
+          "priority": 110,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "progress_bar_working",
+          "priority": 100,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1256
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "pi",
+      "fixture": "opencode-startup.txt",
+      "rules": [
+        {
+          "id": "working_literal",
+          "priority": 100,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "working_border",
+          "priority": 100,
+          "region": "bottom_non_empty_lines(12)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1242
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "qodercli",
+      "fixture": "opencode-startup.txt",
+      "rules": [
+        {
+          "id": "confirmation_or_input_blocker",
+          "priority": 300,
+          "region": "whole_recent",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "cancel_hint_working",
+          "priority": 100,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1256
+        },
+        {
+          "id": "spinner_working",
+          "priority": 90,
+          "region": "whole_recent",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 1256
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    },
+    {
+      "agent": "qwen",
+      "fixture": "opencode-startup.txt",
+      "rules": [
+        {
+          "id": "osc_title_blocked",
+          "priority": 1200,
+          "region": "osc_title",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "osc_title_working",
+          "priority": 1100,
+          "region": "osc_title",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "waiting_for_confirmation",
+          "priority": 1000,
+          "region": "bottom_non_empty_lines(20)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1242
+        },
+        {
+          "id": "tool_confirmation",
+          "priority": 990,
+          "region": "bottom_non_empty_lines(20)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1242
+        },
+        {
+          "id": "question_dialog",
+          "priority": 980,
+          "region": "bottom_non_empty_lines(20)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1242
+        },
+        {
+          "id": "folder_trust_dialog",
+          "priority": 970,
+          "region": "bottom_non_empty_lines(20)",
+          "state": 3,
+          "matched": false,
+          "region_bytes": 1242
+        },
+        {
+          "id": "cancel_hint_working",
+          "priority": 900,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "narrow_cancel_hint_working",
+          "priority": 890,
+          "region": "bottom_non_empty_lines(8)",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 754
+        },
+        {
+          "id": "osc_tool_progress_working",
+          "priority": 850,
+          "region": "osc_progress",
+          "state": 2,
+          "matched": false,
+          "region_bytes": 0
+        },
+        {
+          "id": "composer_idle",
+          "priority": 100,
+          "region": "bottom_non_empty_lines(30)",
+          "state": 1,
+          "matched": false,
+          "region_bytes": 1242
+        }
+      ],
+      "state": "idle",
+      "visible_idle": false,
+      "visible_blocker": false,
+      "visible_working": false,
+      "fallback_reason": "default_known_agent_idle_fallback"
+    }
+  ],
+  "engine_version": 3,
+  "regions": [
+    {
+      "name": "prompt_box",
+      "screen": "旧的一轮对话输出\n• 已完成上一步\n› 历史输入行\n• 之后又有块标记\n\n───\n│ 提示框正文第一行\n│ 提示框正文第二行\n───\n• 新一轮开始\n› 当前输入\n",
+      "osc_title": "codex 工作中",
+      "osc_progress": "4;1;42",
+      "region": "whole_recent",
+      "want": "旧的一轮对话输出\n• 已完成上一步\n› 历史输入行\n• 之后又有块标记\n\n───\n│ 提示框正文第一行\n│ 提示框正文第二行\n───\n• 新一轮开始\n› 当前输入\n"
+    },
+    {
+      "name": "prompt_box",
+      "screen": "旧的一轮对话输出\n• 已完成上一步\n› 历史输入行\n• 之后又有块标记\n\n───\n│ 提示框正文第一行\n│ 提示框正文第二行\n───\n• 新一轮开始\n› 当前输入\n",
+      "osc_title": "codex 工作中",
+      "osc_progress": "4;1;42",
+      "region": "osc_title",
+      "want": "codex 工作中"
+    },
+    {
+      "name": "prompt_box",
+      "screen": "旧的一轮对话输出\n• 已完成上一步\n› 历史输入行\n• 之后又有块标记\n\n───\n│ 提示框正文第一行\n│ 提示框正文第二行\n───\n• 新一轮开始\n› 当前输入\n",
+      "osc_title": "codex 工作中",
+      "osc_progress": "4;1;42",
+      "region": "osc_progress",
+      "want": "4;1;42"
+    },
+    {
+      "name": "prompt_box",
+      "screen": "旧的一轮对话输出\n• 已完成上一步\n› 历史输入行\n• 之后又有块标记\n\n───\n│ 提示框正文第一行\n│ 提示框正文第二行\n───\n• 新一轮开始\n› 当前输入\n",
+      "osc_title": "codex 工作中",
+      "osc_progress": "4;1;42",
+      "region": "bottom_lines(2)",
+      "want": "• 新一轮开始\n› 当前输入\n"
+    },
+    {
+      "name": "prompt_box",
+      "screen": "旧的一轮对话输出\n• 已完成上一步\n› 历史输入行\n• 之后又有块标记\n\n───\n│ 提示框正文第一行\n│ 提示框正文第二行\n───\n• 新一轮开始\n› 当前输入\n",
+      "osc_title": "codex 工作中",
+      "osc_progress": "4;1;42",
+      "region": "bottom_lines(200)",
+      "want": "旧的一轮对话输出\n• 已完成上一步\n› 历史输入行\n• 之后又有块标记\n\n───\n│ 提示框正文第一行\n│ 提示框正文第二行\n───\n• 新一轮开始\n› 当前输入\n"
+    },
+    {
+      "name": "prompt_box",
+      "screen": "旧的一轮对话输出\n• 已完成上一步\n› 历史输入行\n• 之后又有块标记\n\n───\n│ 提示框正文第一行\n│ 提示框正文第二行\n───\n• 新一轮开始\n› 当前输入\n",
+      "osc_title": "codex 工作中",
+      "osc_progress": "4;1;42",
+      "region": "bottom_non_empty_lines(1)",
+      "want": "› 当前输入\n"
+    },
+    {
+      "name": "prompt_box",
+      "screen": "旧的一轮对话输出\n• 已完成上一步\n› 历史输入行\n• 之后又有块标记\n\n───\n│ 提示框正文第一行\n│ 提示框正文第二行\n───\n• 新一轮开始\n› 当前输入\n",
+      "osc_title": "codex 工作中",
+      "osc_progress": "4;1;42",
+      "region": "bottom_non_empty_lines(2)",
+      "want": "• 新一轮开始\n› 当前输入\n"
+    },
+    {
+      "name": "prompt_box",
+      "screen": "旧的一轮对话输出\n• 已完成上一步\n› 历史输入行\n• 之后又有块标记\n\n───\n│ 提示框正文第一行\n│ 提示框正文第二行\n───\n• 新一轮开始\n› 当前输入\n",
+      "osc_title": "codex 工作中",
+      "osc_progress": "4;1;42",
+      "region": "top_non_empty_lines(3)",
+      "want": "旧的一轮对话输出\n• 已完成上一步\n› 历史输入行\n"
+    },
+    {
+      "name": "prompt_box",
+      "screen": "旧的一轮对话输出\n• 已完成上一步\n› 历史输入行\n• 之后又有块标记\n\n───\n│ 提示框正文第一行\n│ 提示框正文第二行\n───\n• 新一轮开始\n› 当前输入\n",
+      "osc_title": "codex 工作中",
+      "osc_progress": "4;1;42",
+      "region": "prompt_box_body",
+      "want": "│ 提示框正文第一行\n│ 提示框正文第二行\n"
+    },
+    {
+      "name": "prompt_box",
+      "screen": "旧的一轮对话输出\n• 已完成上一步\n› 历史输入行\n• 之后又有块标记\n\n───\n│ 提示框正文第一行\n│ 提示框正文第二行\n───\n• 新一轮开始\n› 当前输入\n",
+      "osc_title": "codex 工作中",
+      "osc_progress": "4;1;42",
+      "region": "above_prompt_box",
+      "want": "旧的一轮对话输出\n• 已完成上一步\n› 历史输入行\n• 之后又有块标记\n\n"
+    },
+    {
+      "name": "prompt_box",
+      "screen": "旧的一轮对话输出\n• 已完成上一步\n› 历史输入行\n• 之后又有块标记\n\n───\n│ 提示框正文第一行\n│ 提示框正文第二行\n───\n• 新一轮开始\n› 当前输入\n",
+      "osc_title": "codex 工作中",
+      "osc_progress": "4;1;42",
+      "region": "last_non_empty_above_prompt_box",
+      "want": "• 之后又有块标记"
+    },
+    {
+      "name": "prompt_box",
+      "screen": "旧的一轮对话输出\n• 已完成上一步\n› 历史输入行\n• 之后又有块标记\n\n───\n│ 提示框正文第一行\n│ 提示框正文第二行\n───\n• 新一轮开始\n› 当前输入\n",
+      "osc_title": "codex 工作中",
+      "osc_progress": "4;1;42",
+      "region": "after_last_horizontal_rule",
+      "want": "• 新一轮开始\n› 当前输入\n"
+    },
+    {
+      "name": "prompt_box",
+      "screen": "旧的一轮对话输出\n• 已完成上一步\n› 历史输入行\n• 之后又有块标记\n\n───\n│ 提示框正文第一行\n│ 提示框正文第二行\n───\n• 新一轮开始\n› 当前输入\n",
+      "osc_title": "codex 工作中",
+      "osc_progress": "4;1;42",
+      "region": "current_prompt_block_marker",
+      "want": "• 新一轮开始"
+    },
+    {
+      "name": "prompt_box",
+      "screen": "旧的一轮对话输出\n• 已完成上一步\n› 历史输入行\n• 之后又有块标记\n\n───\n│ 提示框正文第一行\n│ 提示框正文第二行\n───\n• 新一轮开始\n› 当前输入\n",
+      "osc_title": "codex 工作中",
+      "osc_progress": "4;1;42",
+      "region": "after_current_prompt_block_marker",
+      "want": "• 新一轮开始\n› 当前输入\n"
+    },
+    {
+      "name": "prompt_box",
+      "screen": "旧的一轮对话输出\n• 已完成上一步\n› 历史输入行\n• 之后又有块标记\n\n───\n│ 提示框正文第一行\n│ 提示框正文第二行\n───\n• 新一轮开始\n› 当前输入\n",
+      "osc_title": "codex 工作中",
+      "osc_progress": "4;1;42",
+      "region": "after_last_prompt_marker",
+      "want": ""
+    },
+    {
+      "name": "prompt_box",
+      "screen": "旧的一轮对话输出\n• 已完成上一步\n› 历史输入行\n• 之后又有块标记\n\n───\n│ 提示框正文第一行\n│ 提示框正文第二行\n───\n• 新一轮开始\n› 当前输入\n",
+      "osc_title": "codex 工作中",
+      "osc_progress": "4;1;42",
+      "region": "before_current_prompt_marker",
+      "want": "旧的一轮对话输出\n• 已完成上一步\n› 历史输入行\n• 之后又有块标记\n\n───\n│ 提示框正文第一行\n│ 提示框正文第二行\n───\n• 新一轮开始\n"
+    },
+    {
+      "name": "prompt_box",
+      "screen": "旧的一轮对话输出\n• 已完成上一步\n› 历史输入行\n• 之后又有块标记\n\n───\n│ 提示框正文第一行\n│ 提示框正文第二行\n───\n• 新一轮开始\n› 当前输入\n",
+      "osc_title": "codex 工作中",
+      "osc_progress": "4;1;42",
+      "region": "whole_recent_without_current_prompt_marker",
+      "want": ""
+    },
+    {
+      "name": "prompt_box",
+      "screen": "旧的一轮对话输出\n• 已完成上一步\n› 历史输入行\n• 之后又有块标记\n\n───\n│ 提示框正文第一行\n│ 提示框正文第二行\n───\n• 新一轮开始\n› 当前输入\n",
+      "osc_title": "codex 工作中",
+      "osc_progress": "4;1;42",
+      "region": "unknown_region_name",
+      "want": ""
+    },
+    {
+      "name": "current_prompt_current_input",
+      "screen": "输出\n› \n当前输入内容",
+      "region": "after_last_prompt_marker",
+      "want": "当前输入内容"
+    },
+    {
+      "name": "prompt_is_history",
+      "screen": "输出\n› 历史输入\n• 之后又有块标记\n新输出",
+      "region": "whole_recent_without_current_prompt_marker",
+      "want": "输出\n› 历史输入\n• 之后又有块标记\n新输出"
+    },
+    {
+      "name": "prompt_is_history",
+      "screen": "输出\n› 历史输入\n• 之后又有块标记\n新输出",
+      "region": "before_current_prompt_marker",
+      "want": "输出\n› 历史输入\n• 之后又有块标记\n新输出"
+    },
+    {
+      "name": "current_prompt_tail",
+      "screen": "输出一\n输出二\n› 当前输入",
+      "region": "whole_recent_without_current_prompt_marker",
+      "want": ""
+    },
+    {
+      "name": "current_prompt_tail",
+      "screen": "输出一\n输出二\n› 当前输入",
+      "region": "before_current_prompt_marker",
+      "want": "输出一\n输出二\n"
+    },
+    {
+      "name": "empty",
+      "screen": "",
+      "region": "bottom_lines(3)",
+      "want": ""
+    },
+    {
+      "name": "empty",
+      "screen": "",
+      "region": "bottom_non_empty_lines(3)",
+      "want": ""
+    },
+    {
+      "name": "empty",
+      "screen": "",
+      "region": "top_non_empty_lines(2)",
+      "want": ""
+    },
+    {
+      "name": "empty",
+      "screen": "",
+      "region": "after_last_prompt_marker",
+      "want": ""
+    },
+    {
+      "name": "empty",
+      "screen": "",
+      "region": "whole_recent",
+      "want": ""
+    },
+    {
+      "name": "all_blank",
+      "screen": "\n\n\n",
+      "region": "bottom_non_empty_lines(2)",
+      "want": ""
+    },
+    {
+      "name": "all_blank",
+      "screen": "\n\n\n",
+      "region": "top_non_empty_lines(2)",
+      "want": ""
+    },
+    {
+      "name": "all_blank",
+      "screen": "\n\n\n",
+      "region": "last_non_empty_above_prompt_box",
+      "want": ""
+    },
+    {
+      "name": "repeat_marker_bottom_wins",
+      "screen": "marker\nold\n\nmiddle\nmarker\nnew\n",
+      "region": "bottom_non_empty_lines(2)",
+      "want": "marker\nnew\n"
+    },
+    {
+      "name": "repeat_marker_bottom_wins",
+      "screen": "marker\nold\n\nmiddle\nmarker\nnew\n",
+      "region": "bottom_non_empty_lines(1)",
+      "want": "new\n"
+    },
+    {
+      "name": "no_prompt_no_rule_lines",
+      "screen": "普通输出一\n普通输出二",
+      "region": "current_prompt_block_marker",
+      "want": ""
+    },
+    {
+      "name": "no_prompt_no_rule_lines",
+      "screen": "普通输出一\n普通输出二",
+      "region": "after_current_prompt_block_marker",
+      "want": ""
+    },
+    {
+      "name": "no_prompt_no_rule_lines",
+      "screen": "普通输出一\n普通输出二",
+      "region": "above_prompt_box",
+      "want": "普通输出一\n普通输出二"
+    },
+    {
+      "name": "no_prompt_no_rule_lines",
+      "screen": "普通输出一\n普通输出二",
+      "region": "prompt_box_body",
+      "want": ""
+    },
+    {
+      "name": "trailing_newline_only",
+      "screen": "一行\n",
+      "region": "bottom_lines(1)",
+      "want": "一行\n"
+    },
+    {
+      "name": "trailing_newline_only",
+      "screen": "一行\n",
+      "region": "top_non_empty_lines(1)",
+      "want": "一行\n"
+    },
+    {
+      "name": "trailing_newline_only",
+      "screen": "一行\n",
+      "region": "bottom_non_empty_lines(1)",
+      "want": "一行\n"
+    }
+  ]
+}
