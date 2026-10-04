@@ -79,7 +79,7 @@ flock 语义正确）；**6 高危 + 评审者复核补 2 高危**，其中「�
 
 | # | 项 | 处置 |
 |---|---|---|
-| C-4② | readyBy 世代起点未清 | **已修**（eb3e6fa：begin_generation 清） |
+| C-4② | readyBy 世代起点未清 | **已修（eb3e6fa 时点登记失实——见 §四末「失实登记修正」；实际修复落 7l/0baca9f：`StageMachine::begin_generation` 清 `ready_by` + 单测 `begin_generation_clears_ready_by`）** |
 | C-6 | 锁预建目录 0755 | **已修**（eb3e6fa：0700） |
 | F-09 | tun_stop 抹失败终态/终态字节面 | 登记（工单③；窄窗——失败路径已当场放锁） |
 | C-4①③ | attach 硬写 meowed=true / 健康位清清理缺 | 登记（工单③） |
@@ -136,7 +136,7 @@ tun_recover 未钳位等 12 项）——**登记第 2 棒顺手批**，不阻塞
 | ③tun_stop 终态语义 | **已做**：只放锁不写阶段（终态由世代线程 finish_generation 写；failed 保留）；-2 强制放锁路径同样不写阶段 | facade/mod.rs tun_stop + tun_shared |
 | ④传输/拨号期限 | **已做**：files 传输体清 15s（read/write timeout None——取消走 cancel 断 I/O，开场警戒独立）；UDS 拨号加 connect 预算（connect_budget 公共件：files/term/speedtest 桥全换）；速度桥 link_down 回帧（非 refused 类回 report{link_down} 再有序收口——ReplyThenClose 语义：吞请求帧→回帧→FIN→短窗吞输入） | files_op.rs / term_op.rs / speedtest_op.rs / bridge_host.rs |
 | ⑤trait/装配签名统一 | **已做**：dial_port 接缝 = BridgeStream trait（into_halves 拆半 + WriteHalf 半关——UDS 与 SessionConn 流适配同构）；TunExecutor 类型化错误 TunError（code() 映射状态码）；桥状态并入 serviceStatusJSON（bridge 四键）；speedtest 引擎接桥（run_dial 拨号闭包形态 + SpeedConn trait + BridgeSpeedConn 承载 + Cancel 真取消 = 看门狗 kill）；service 三面接真 Session（service_exec.rs：Session + 服务桥 + rc 门接线）；版本注入管线（HOMEWAY_CORE_VERSION option_env! 已在 facade::version，构建侧 7h 注入） | speedtest.rs / facade/{tun_exec,service_exec,speedtest_op,bridge_host}.rs |
-| ⑥panic 策略 | **已做（锁面）**：facade 全域锁 unwrap → into_inner（lock_unpoison/lock_host 单件）；extern "C" 壳的 catch_unwind 在 7h 的 homeway-capi（每导出包 panic 边界，返回安全错误值） | facade/* + homeway-capi（7h） |
+| ⑥panic 策略 | **部分失实修正（见 §四末「失实登记修正」）**：eb3e6fa 时点只做了 tun_shared/mod 的锁面（lock_unpoison/lock_host）；demand/events/service_op/files_op/stage 的存量 `.expect("…锁中毒")` 约 40 处留到 7l 才收敛（LockUnpoison trait 化 + stage 直用 lock_unpoison）；三派生线程 catch_unwind 也在 7l。extern "C" 壳的 catch_unwind 在 7h 属实 | facade/*（7l 补齐）+ homeway-capi（7h） |
 
 **登记（不阻塞）**：
 - portfwd 监听器执行体未实现（pf 表存 + runner 状态面就位；`pf=0/0` 恒零）——Go 侧端口转发监听器的实装排第 3 棒；
@@ -202,3 +202,72 @@ build-core.sh rust 档缺脏检出闸与钉定**——未提交代码可走正�
 同时是巡检噪声门控的输入（sendTries 全败 ⇒ 环境噪声不计证据），Rust 只剩采纳
 路径粘性信号 ⇒ 挂起禁发期（EPERM 事故形态）可能被计成质量失败、每拍烧 R1；是否
 提前补 bind 统计面由用户定。② M-7 speedtest live/dir 最小相位出口 vs 登记受限。
+
+## §五 第 3 棒（7l 整改批）处置表 + 拍板记录（2026-10-04）
+
+**P1/P2 全量处置（commit `0baca9f`；tier 侧 `4b8a0a1`）——29 项全处置，无挂账**：
+
+### P1 中危批（13 项）
+
+| # | 项 | 处置 |
+|---|---|---|
+| M-1 | mark_unhealthy 世代守卫 | **修**：`TunShared::mark_unhealthy_if_current(gen, why)`；fd 错误回调捕获 gen、patrol 用 run.gen（两个生产调用点全过守卫；单测 `mark_unhealthy_generation_guard`） |
+| M-2 | GenRun 登记过晚 | **修**：GenRun 构造 + state 登记提前到 `Client::start` 之前（client 改 `RwLock<Option<Arc<Client>>>` 后填）；identity 装配窗口的停止请求经 `TunShared` 停止位槽中继（`signal_stop`）；装配完成点查 stop 统一收口（不进暖机） |
+| M-3 | attach_receiver 晚于 Ready | **修**：`attach_receiver()` 提到 `set_if_current(Ready)` 之前（一行时序） |
+| M-4 | path_probe 无外层硬超时 | **修**：`recv_timeout(预算+2s)` 双保险（Go 暖机 select/time.After 同义）；成功连接补 close 防引擎内槽位滞留 |
+| M-5 | connect_budget 未覆盖 connect | **修**：真非阻塞 connect（socket+fcntl O_NONBLOCK → EINPROGRESS → poll → SO_ERROR；darwin 无 SOCK_NONBLOCK 类型位故走 fcntl） |
+| M-6 | begin_generation 不清 ready_by | **修**：`begin_generation` 清 `ready_by` + 单测；两条失实登记修正见本节末 |
+| M-7 | speedtest live/dir 恒缺 | **修（拍板②）**：`LiveProgress` 原子面（相位+字节）+ `run_dial` 进度出口 + SpeedHost 差分 instBps + 相位跟随（down→up）；Status 面在途轮 live 三键齐 |
+| M-8 | 取消被归因 interrupted | **修**：`SpeedtestError::{Busy,LinkDown,Cancelled}` 类型化（REASON_CANCELLED 复活、contains("满员/refused") 嗅探全消）；拨号间隙查取消位；残余登记：单次在途拨号自带 ≤10s 预算兜底（Go ctx 即刻打断——差值 = 取消生效点延到拨号预算边界） |
+| M-9 | is_refused_like 字符串嗅探 | **修**：healing_dial（隧道/服务两域）把 `ConnErr::Refused` 映射成 `ErrorKind::ConnectionRefused` 带过接缝；`is_refused_like` 只认 kind |
+| M-10 | service stop 提前 take + dial 持锁 | **修**：超时路径 run 槽保留（域状态 Stopping 挡 start）；`Session::stop` 改 `&self`（句柄 Mutex 化）+ `Arc<Session>` 克隆出锁再拨/再快照（status 轮询面不再被 15s 拨号阻塞） |
+| M-11 | runner 条件语义（残尾） | **修**：runner/transport 组装抽 `runner_of/transport_of` 共享件；配合 M-2 早期登记，runner 从 prepare 起在场（Go setRunner 时序对齐），link 兜底沿用 P0 我-1 |
+| 我-2 | 隧道域端点缓存三缺 | **修**：① `Client::start` 后 `set_candidates(merged)`（历史端点进赛跑集）② hint 链路线程（observe(Hint)+候选重投+打洞〔5s 节流+rearm_soft+probe 5s〕+落盘信号）③ save 去抖线程（1s 窗合并）+ Finish guard 终写；旁路探测 on_ep 补落盘信号 |
+| 我-4 | TunPacket 不写 wake 管道 | **修**：读线程投包后写 wake 管道（与 Client::send 共享 `Arc<Mutex<Option<i32>>>` 锁位——stop 关闭后写入自然 no-op）；残余登记：cmd 通道无界 vs Go hubQueue=512（driver 每拍全量 drain，堆积只在一拍内；换 bounded 通道引入新阻塞面，不换） |
+
+### P2 低危批（16 项）
+
+| # | 项 | 处置 |
+|---|---|---|
+| L-1 | -2 分支补健康位 | **修**：`mark_unhealthy("stop")`（Go 同分支） |
+| L-2 | 日志 -2 停在 preparing | **修**：LogOpen 错误路径 `set_if_current(gen, Idle)` 回 idle（单测 `log_open_minus2_resets_stage_to_idle`） |
+| L-3 | 派生线程无 catch_unwind + 存量 expect | **修**：`spawn_derived` 统一壳（panic→日志+markUnhealthy_if_current("panic")）；demand/events/service_op/files_op 存量 expect 收敛（LockUnpoison trait），stage 直用 lock_unpoison |
+| L-4 | packet-info 探测剥离缺失 | **修**（优于登记）：读侧 4B PI 自动探测剥离（Go tunfd_unix.go 同款判定：PI 头 + 合法 IP 版本号双条件） |
+| L-5 | 三处常量 | **修**：旁路探测 8s（Go 同值）；mtu `≤0→1280` 不 clamp（Go Normalize 同形）；dial_ms 缺省 15000 且经 `BridgeHost::set_dial_timeout` 热传入（死字段转正） |
+| L-6 | cause 文案档位名 | **修**：`扩展下推(R1 重握手)` 形态（Level::clamp(from).name()） |
+| L-7 | 下推器噪声窗 15s | **修**：改 `demand::OUTBOUND_FRESH`(5s)（Go shouldPush 同源） |
+| L-8 | 三处死件 | **修**：`Cmd::TunStats` 删（计数经 Arc<TunCounters> 直读）；`orphan_alive/orphan_flag` 删（无消费者的诊断位）；`BridgeSock.listener` 删（恒 None 的空操作——监听器由 accept 线程独占，stop 收口靠 stopped 位+有界等待） |
+| L-9 | ProbeReach 无预算/串行解析/不去重 | **修**：父预算 3.5s（spec MUST）+ 解析并行（1.5s 子预算，挂死线程超时即弃）+ 地址去重 + 探测预算 = 余量与 3s 取小 |
+| L-10 | option_env! 增量失效 | **驳回维持**（r2 已证伪：cargo env-dep 机制跟踪编译期 env；双层实测） |
+| L-11 | starting 缺 elapsedMs / failed 后槽不回收 | **修**：ServiceRun.since → starting 形态带 elapsedMs（Go serviceSnapshotJSON 同形）；会话线程 Err 清 run 槽 + 停桥（start 不再恒 -1） |
+| L-12 | finish 不关本世代 stop | **修**：TunShared 停止位槽（`set_stop_flag`/`signal_stop`）；finish_generation 对当前世代置位（Go close(r.stop) 同义；单测 `finish_stops_current_generation_flag`） |
+| 我-3 | capi guard fallback 立即求值泄漏 | **修**：fallback 改 `impl FnOnce() -> T` 闭包（懒求值；13 处调用点全改） |
+| 我-5 | write_fd_all 无界重试 + 卸源丢停止通道 | **修**：POLLOUT 总预算 5s（超预算按 TimedOut 收 ⇒ 卸源路径）；写失败卸源**先置读线程停止位**再卸（评审者「不认同②」的修复建议：卸源必须同时 stop.store(true)——照办） |
+| 我-7 | R1 动作立即失败收轮 | **修**：ResetPeerSession 立即失败只记日志「丢会话失败——按既有状态验证」继续验证（Go 闭包恒 nil 同义）；超时仍 -3 收轮 |
+| 我-8 | fd 读 n==0 静默判死 | **修**：continue + poll 一片（防非阻塞 fd 热自旋；Go continue 同义） |
+| 我-6 | tier rust 档缺脏检出闸与钉定 | **修（tier `4b8a0a1`）**：核相关路径（crates/tools/Cargo.*）脏检出默认硬失败；`HOMEWAY_RS_ALLOW_DIRTY=1` 逃生口（醒目告警）；产物版本标记 SHA == HEAD 钉定校验（拦旧产物复检/脏码未重编） |
+
+### 拍板记录（两条留桩边界，第 3 棒拍板）
+
+1. **bind 全候选发送统计——拍板：提前补全（不留桩）**。理由：它在 Go 里同时是
+   巡检噪声门控的输入（sendTries>0 且全本地失败 ⇒ 环境性禁发不计证据），挂起
+   禁发期（EPERM 事故形态）被计成质量失败、每拍烧 R1 的风险在本产品是**真实场景**
+   （挂起/唤醒是核心测试面），不属「可等 R8」的优化面。落点：`Bind`
+   send_tries/send_local_fails（采纳单发 + 镜像逐候选计数；过渡双发/解锁补发的
+   尽力语义不进计数——Go FIX-09 同口径）→ `Client::swap_send_stats`（差分等价
+   swap-reset）→ 巡检噪声双信号（Go tunmode.go:1024-1027 双保险同构）+
+   `local_err_counters` → tunStatusJSON `demand.localErrAdopted/localErrTotal` 两键
+   （runner 键缺省的登记项一并消掉）。
+2. **M-7 speedtest live/dir——拍板：本棒补最小相位出口**（评审者倾向同向：UI
+   消费面已就位〔SpeedTestStore.ets 按 dir 分档〕，登记受限等于把已修好的 UI 面
+   留在恒「连接中」）。落点见 M-7 行。
+
+### 失实登记修正（M-6 要求，2026-10-04 第 3 棒核实）
+
+1. **§二 C-4②「已修（eb3e6fa：begin_generation 清）」失实**——`git show eb3e6fa`
+   的 diff 无此行（只有提交信息正文提到）；生产代码在 7l/0baca9f 才落
+   （`begin_generation` 清 `ready_by`）。§二表已就地标注。
+2. **§三 工单⑥「已做（锁面）：facade 全域锁 unwrap → into_inner」部分失实**——
+   eb3e6fa 只覆盖 tun_shared/mod/bridge_host 三处；demand/events/service_op/
+   files_op/stage 约 40 处 `.expect("…锁中毒")` 与三派生线程 catch_unwind 留到
+   7l 才收敛。§三表已就地标注。eb3e6fa 提交信息本身不可改，以本节为准。
