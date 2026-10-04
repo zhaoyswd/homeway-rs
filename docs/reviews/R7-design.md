@@ -271,3 +271,37 @@ build-core.sh rust 档缺脏检出闸与钉定**——未提交代码可走正�
    eb3e6fa 只覆盖 tun_shared/mod/bridge_host 三处；demand/events/service_op/
    files_op/stage 约 40 处 `.expect("…锁中毒")` 与三派生线程 catch_unwind 留到
    7l 才收敛。§三表已就地标注。eb3e6fa 提交信息本身不可改，以本节为准。
+
+## §六 第 3 棒复核轮（dsh r3=r7l.5XAMBa，2026-10-04）处置表
+
+**复核结论摘要（原文 = /tmp/dsh-review/r7l.5XAMBa/output.md）**：§五 29 项「已修」
+逐条对 diff 核验**无失实复发**（r2 的教训过关）；新引入面五路复查
+（run_dial 五参/Session::stop&self/wake 共享/connect_budget/swap 差分数学）**无问题**；
+登记项三条理由核验（上行归 R8 成立/cmd 无界成立/M-8 兜底**部分失真**）；抓出
+**F1 高危回归**（gen_loop 两条早退路径漏 finish_generation——前一棒 P0 同形态）+
+4 项「修但不完整」（M-2 中继对 gen≥2 不可达 / M-7 字节三角累计 / M-10 双会话窗口
+未闭 + 新引入持锁阻塞 / 拍板① 计数口径）+ 低危 12 条。
+
+**处置（commit 3ab9891 + tier e6c640c 一族）**：
+
+| # | 定级 | 处置 |
+|---|---|---|
+| F1 早退漏 finish_generation | 高 | **修**：EarlyFinish 守卫（真 Finish 挂上后 disarm 交接）+ 回归单测 `tunnel_empty_candidates_releases_lock`（域名端点 token 驱动真 gen_loop，验「失败后下一次 prepare 可受理」） |
+| F2 state 槽不清 ⇒ 中继 gen≥2 不可达 | 中 | **修**：Finish::drop 以 ptr_eq 清自己；request_stop/recover 加陈旧世代过滤（陈旧→共享面旗标中继 / -2） |
+| F3 term 测试偶发挂死 | 中（流程门） | **无法复现**：本机串行 4 轮（单测 0.87s + 3×全量 30.4s）全绿；登记环境偶发（term/ 本批未触碰；评审者 base 证据 n=1）——ci-local 若再现按评审建议加硬期限，归 R8 测试健壮性 |
+| F4 LiveProgress 三角累计 | 中 | **修**：pump 分片上报改「本片增量」+ `live_progress_delta_accounting` 单测 |
+| F5 bind 计数口径 | 中 | **修**：解锁补发/RREG 腿补计数（writeUDP 统一点全覆盖）；采纳路径错误只进 adoptedLocalErrCount（localErrTotal=镜像专属——Go bind_test 口径）；注释更正；+计数面单测（0.0.0.0 候选=必然本地错） |
+| F6 stop 双会话窗口 + 持锁阻塞 | 中 | **修**：顶层锁开头即放；fully_stopped 完成信号（重试 stop 等同一个信号）；warmup 期 stop 竞态收口（不发布 Ready 自查自收）；清槽全 ptr_eq |
+| F7 取消抢先分支 | 中 | **修**：取消旗标优先于一切归因（Go isCancelled 先判） |
+| F8 取消后无期限执行者 | 中 | **修**（取消分支）：看门狗 kill 后守到 done/父预算、迟登记连接周期性再杀；**登记 R8**：SpeedConn 的 Go SetDeadline 同义期限面（timeout 分支的极端形态） |
+| F9 tier 闸门四类绕过 | 中 | **修三**（tier e6c640c + 本仓 build-app-core.sh 对齐）：路径集补 fixtures/.cargo/rust-toolchain.toml、git 状态 fail-closed、钉定改整串比较（含 +dirty）；**登记 R8**：tier 侧落 homeway-rs.pin 期望 SHA（与「仓归属」决策一并） |
+| F10 healing_dial 兜底丢 kind | 低 | **登记**（会话已坏形态，回 link_down 语义等价合理） |
+| F11 set_stop_flag 无守卫 | 低 | **修**：set_stop_flag_if_current |
+| F12 装配窗口 recover -4 vs Go -2 | 低 | **修**：陈旧世代 → -2 |
+| F13 M-7 三处口径差 | 低 | **修**（上行拨号窗相位回空档）；**登记**（含预热字节的 bytes 口径/终态键面——tier 零消费） |
+| F14 rustfmt 三处 | 低 | **修**：fmt 落本批触碰文件（全仓 fmt 波及 71 个未触碰文件已回退） |
+| F15 ServiceRun↔Bridge 引用环 | 低 | **登记 R8**（存量，每 start/stop 周期泄漏一套对象） |
+| F16 观察项（PI 求值序/hint 线程孤儿语义/write 返 0 空转） | 低 | **登记**（无行为差异/既有孤儿语义延伸/理论边界） |
+
+**闭环判断（评审者原话）**：不建议按「29 项全处置」直接收口 → 处置：F1-F9 全修后
+重跑门禁（332 lib 全绿含 4 串行轮 + clippy 0 + OHOS 交叉 0 + ci-local 终轮），R7 按本表收口。
