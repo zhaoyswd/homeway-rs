@@ -716,6 +716,7 @@ fn driver_loop(
     let mut last_dns_stats = Instant::now();
     let mut last_tx_stats = Instant::now();
     let mut last_tx_stats_snap = (0u64, 0u64, 0usize, 0u64);
+    let mut last_tx_bytes = 0u64;
     let mut out = InboundOut::default();
     let mut stop = false;
     let mut stop_grace = STOP_GRACE;
@@ -841,25 +842,29 @@ fn driver_loop(
         if now.duration_since(last_tx_stats) > Duration::from_secs(5) {
             last_tx_stats = now;
             let s = bind.tx_batch_stats();
+            let txb = bind.tx_bytes;
             if s.0 > last_tx_stats_snap.0 {
                 let dcalls = s.0 - last_tx_stats_snap.0;
                 let dpkgs = s.1 - last_tx_stats_snap.1;
+                let dbytes = txb - last_tx_bytes;
                 let avg = dpkgs as f64 / dcalls as f64;
+                let bpp = if dpkgs > 0 { dbytes / dpkgs } else { 0 };
                 if s.3 > last_tx_stats_snap.3 {
                     (dlogf)(&format!(
-                        "serve: UDP 出站 调用+{dcalls} 均批{avg:.1}包/调用 单调用最大{}包 累计丢弃{}包（+{}）",
+                        "serve: UDP 出站 调用+{dcalls} 均批{avg:.1}包/调用 单调用最大{}包 均包{bpp}B 累计丢弃{}包（+{}）",
                         s.2,
                         s.3,
                         s.3 - last_tx_stats_snap.3
                     ));
                 } else {
                     (dlogf)(&format!(
-                        "serve: UDP 出站 调用+{dcalls} 均批{avg:.1}包/调用 单调用最大{}包",
+                        "serve: UDP 出站 调用+{dcalls} 均批{avg:.1}包/调用 单调用最大{}包 均包{bpp}B",
                         s.2
                     ));
                 }
             }
             last_tx_stats_snap = s;
+            last_tx_bytes = txb;
         }
     }
     // ---- 收工（D5：① 已由 Stop 置位；这里 ③④——drain 的出站包照走 encap 链
