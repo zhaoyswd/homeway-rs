@@ -57,18 +57,18 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 | **R4** | 中继（信封 + 准入 + 升级条纹） | **完成**（2026-10-03：两道门全过 + 三链路判据实测 + 升级条纹实测） | 4/4 步 |
 | **R5** | 互操作矩阵全量 + fuzz + 性能 A/B + 台账三方门 | **完成**（2026-10-03：两道门全过〔两轮代码评审 4高/15中/18低全处置〕+ 终验轮 4 六链路 + L3 复跑全绿 + PERF-AB 入库 + ci-local 一键门全绿） | 6/6 步 |
 | **R6** | term 服务面（协议/surface 产出/检测引擎 + 自建编码器/应答器） | **完成**（2026-10-04 五棒收官：6a 设计 + 6b vt 底座 + 门一〔4高全修〕+ 6c 编码器/应答器全量〔键 387+/鼠 245/应答 64 向量全绿〕+ 6d 帧族/会话注册表 + 6e surface 体编码〔golden 两向全绿〕+ 6f-1/2 manifest 引擎+检测融合 + 6f-3a PTY/环 + 6f-3b 会话装配/引擎接线〔八模块装成 TermService：ServeConn/raw 腿握手与停滞写者/surface 投递/pump/sample/LIST/EXPLAIN/HOMEWAY_TERM=off；D-19 信号死 -1 映射〕+ 6g 判据实测〔Go term CLI 消费 Rust term 服务全流程 + 检测三态 + linux 交叉面清账 + 判据行入册〕+ 门二两轮〔高3+2/中4+3/低9+10 全处置，评审记录 docs/reviews/R6.md〕+ ci-local 七步全绿） | 6a-6g ✅ 门一/门二 ✅ |
-| **R7** | APP 接入（napi-rs 或 C-ABI 胶水 + OHOS 交叉 + 20 导出面 + hostsession） | **进行中**（第 1 棒 7a–7f 完成 2026-10-04；第 2 棒 = HSP 集成〔用户触点〕，前置工单见 R7 节注记） | 6/9 步 |
+| **R7** | APP 接入（C-ABI 胶水 + OHOS 交叉 + 20 导出面 + HSP 集成 + 真机判据） | **进行中**（第 1 棒 7a–7f + 第 2 棒 7g–7k 完成 2026-10-04：真机两轮全量判据过 + dsh r2 评审 P0 四项当棒整改；**第 3 棒 = 评审 r2 的 P1/P2 整改批**〔工单表 = R7-design §四〕） | 8/9 步 |
 | **R8** | 终测收官（包体/性能终测 + 共存定案 + 文档指针补录） | 未开始 | — |
 
-**下一步（当前指针）**：**R7 第 2 棒 = HSP 集成**（extern "C" 壳 + 真 wgcore hub 接线 +
-版本注入管线 + tier build-core.sh 对接〔动 tier 跟踪文件——**用户触点**〕）。**开工前置**
-= ①用户确认发版会话收官状态与开工点头（硬规则 2）②`docs/reviews/R7-design.md` §二
-「第 2 棒开工前置工单」六项（世代生命周期/桥宿主线程模型/tun_stop 终态/传输期限/
-trait 签名统一/panic 策略——dsh r1 评审的结构性高危，接线即坏类）。
-**R7 开工前置**：①发版会话收官（homeway Go 侧 v0.16.0 之后有无在途 change——由
-用户确认）②用户点头（硬规则 2）。另带 **R5 移交的 CLI 双会话治理项**（Rust CLI
-files/speedtest 动词与常驻 connect 同 identity 并发的 foot-gun——与 hostsession/
-常驻会话设计一并定，见 docs/reviews/R2.md 豁免表）。
+**下一步（当前指针）**：**R7 第 3 棒 = 评审 r2 整改批**（工单表全量 =
+`docs/reviews/R7-design.md` §四：P1 中危批〔M-1 世代守卫/M-2 GenRun 登记时序/M-3
+attach_receiver 提前/M-4 探测外层硬超时/M-5·M-9·M-8 接缝类型化与取消归因/M-6
+ready_by+两条失实登记修正/M-7 speedtest live/M-10 service 双会话窗口/我-2 隧道域
+缓存三缺/我-4 wake 管道〕+ P2 低危批〔L-1..L-12 + 我-3..我-8 + 我-6 tier rust 档
+脏检出闸〕+ 两条拍板项〔bind 全候选发送统计的噪声门控边界/M-7 取向〕）。完成后
+R7 收官转 R8。**第 2 棒已完成面**：真机两轮全量判据（本地 Rust exit 轮 + 现役 Go
+出口轮，`docs/E2E-APP-RUST-CORE.md`）+ tier `CORE_IMPL=rust` 档（51036b4，Go 档
+零行为变化验证过）+ 评审 r2 P0 四项已修（H-1/H-2/H-3/我-1——接线即坏类）。
 
 **R7 前置批工单：smoltcp 0.11 → 0.14 升级（R6.6 决策，2026-10-04 登记）**
 ——正式条目，R7 开工时与基线重锚一起做或排 R8，由届时会话按预算定：
@@ -613,6 +613,39 @@ OHOS 交叉与链接配方）→ 20 个导出面实装（语义真源 = `tier:AG
 - **留桩声明**（防「已实装」措辞掩盖）：speedtest 引擎未接桥（信封+参数门+拨号件在）、
   service 三面是 rc 门+状态短路（真 Session 第 2 棒接）、portfwd 热替换承载默认 -1
   （TunExecutor trait 面）、tun 域数据面执行体 = trait（真 hub 第 2 棒）。
+
+**第 2 棒完成证据（2026-10-04，7g–7k 五工作单元，commit 23fd540..7432439 + tier 51036b4）**：
+- **7g 前置工单六项**：全部落地（处置表 = R7-design §三；争议三条拍板入册——
+  attach-timeout 严格对齐 Go 生产路径〔C-5 向量重产，三处同步〕、events 面声明
+  Rust 独有、FB-files 判据 rc 化）。
+- **7h .so 产出管线**：`crates/homeway-capi`（cdylib，产物 libclientcore.so——
+  20 个 ClientCore* 符号与 tier tailcat_napi.cpp extern 块逐个对齐）+
+  `tools/build-app-core.sh` 三道门（符号 20/20 / 版本注入〔SHA-rust 串 rodata
+  校验〕/ 体积 **1.98MB vs Go 9.7MB = 0.20×**）。CString 走 libc::malloc（NAPI 侧
+  free 兼容）、每导出 catch_unwind。
+- **7i tier 构建对接**：`tools/tailcat/build-core.sh` 加 `CORE_IMPL=go|rust` 开关
+  （默认 go **零行为变化**——重跑验证 9,697,688B Go 产物正常；rust 档 = 调
+  homeway-rs 侧三道门 + 共用 napi-sync/log-index 门 + 双落盘〔两处 md5 一致〕）。
+  Index.d.ts/Index.ets/tailcat_napi.cpp/CMakeLists **零改动**（同名符号原位替换，
+  napi-sync 门 20/20 佐证）。顺带清场 tier 根 cache/serve 死实例残留。
+- **7j 真机全量判据（两轮，`docs/E2E-APP-RUST-CORE.md`）**：本地 Rust exit 轮——
+  建连全链（身份复用 devTag 与 Go 核同源/赛跑/warmup=wg/attached fd=L3 直通/三桥/
+  via=direct/RREG）+ L3 真负载（vpn-tun 双向 1.2MB、transit dialok 38 条、DNS 代答、
+  Wikipedia 真加载、核 stats 与设备计数对表吻合）+ files（浏览/10MB 下载本体）+
+  term（新建/Connected/stateV2）+ 恢复（杀 exit：失败当拍 R1→R2→R3 同串、走完
+  39.9s 交上层；exit 回：中继腿 RREG 兜底 + R1 命中 3.1s）+ 中继驻留（via=relay）+
+  挂起（后台 90s 存活）；现役 Go 出口轮——同身份 refresh 互操作（RREG v2 被现役
+  v0.16.0 接受、peer ~ refresh n=4/32、transit 15 条、真负载 +109KB）。
+  **首轮发现并当场修复**：OHOS TUN fd 非阻塞 EAGAIN 判死健康隧道（Go tunfd 有专门
+  注释与 poll 处理——Rust 漏移植；修复 = read/write EAGAIN 分支改 poll 500ms）。
+  受限项分级在册（term 键盘输入/测速完整轮 UI 交互/上传〔App 侧老问题〕/tunStatusJSON
+  字节对账以构造输入守卫替代）。
+- **7k 评审门（dsh r2.JCkfJb）**：3 高 + 11 中 + 12 低 + 评审者补充 8 条；「接线
+  即坏」P0 四项**当棒整改**（H-2 done/attach 世代守卫〔含把 bug 钉成预期的单测改向〕/
+  H-3 收工分片等待与 join 总预算/H-1 出站时刻单调时基/我-1 runner link 兜底——暖机
+  软失败不再连锁成扩展拒绝建接口）；P1/P2 = 第 3 棒工单（R7-design §四）；L-10
+  驳回（cargo env-dep 机制实测覆盖）。整改后 ci-local quick 全绿（18:54:06）+
+  323 lib 全绿 + clippy 0 + 真机重装修复版复验（连现役出口 via=direct 全链绿）。
 
 ## R8 终测收官
 
