@@ -26,6 +26,10 @@ TARGET4="$CLONE/pkg/term/vecgen_surface_test.go"
 # R6 6f：manifest 检测引擎求值向量（pkg/term/manifest——region 逐函数 + startup 夹具全轨迹）
 TPL5="$REPO_ROOT/tools/vector-gen/term/vecgen_manifest_test.go"
 TARGET5="$CLONE/pkg/term/manifest/vecgen_manifest_test.go"
+# R7 7c：tunStatusJSON 阶段机对照向量（clientcore/cmd/clientcore——cshared 面，
+# 无 runner 期的全部可达形态；runner 键面由 Rust 侧键集合守卫钉）
+TPL6="$REPO_ROOT/tools/vector-gen/tunstatus/vecgen_tunstatus_test.go"
+TARGET6="$CLONE/clientcore/cmd/clientcore/vecgen_tunstatus_test.go"
 OUT="$REPO_ROOT/fixtures/vectors"
 
 "$REPO_ROOT/tools/check-baseline.sh"
@@ -36,7 +40,8 @@ cp "$TPL3" "$TARGET3"
 cp "$TPL3A" "$TARGET3A"
 cp "$TPL4" "$TARGET4"
 cp "$TPL5" "$TARGET5"
-cleanup() { rm -f "$TARGET" "$TARGET2" "$TARGET3" "$TARGET3A" "$TARGET4" "$TARGET5"; }
+cp "$TPL6" "$TARGET6"
+cleanup() { rm -f "$TARGET" "$TARGET2" "$TARGET3" "$TARGET3A" "$TARGET4" "$TARGET5" "$TARGET6"; }
 trap cleanup EXIT
 
 cd "$CLONE"
@@ -62,6 +67,13 @@ HOMEWAY_VECGEN_OUT="$OUT" GOTOOLCHAIN=go1.24.5 \
   go test ./pkg/term/manifest/ -run 'TestVecgenManifest' -count=1 -v > /tmp/vecgen-manifest.log 2>&1
 grep -E '^(=== RUN|--- |ok|FAIL|PASS)' /tmp/vecgen-manifest.log | head -5
 
+cd "$REPO_ROOT"
+rm -f "$OUT/tun_status.jsonl"
+cd "$CLONE"  # 前面已 cd 回 REPO_ROOT——本段重进克隆
+echo "==> 克隆内运行 tunStatusJSON 阶段机向量生成（go test -run TestVecgenTunStatus -tags cshared）"
+HOMEWAY_VECGEN_OUT="$OUT" GOTOOLCHAIN=go1.24.5 CGO_ENABLED=1 \
+  go test -tags cshared ./clientcore/cmd/clientcore/ -run 'TestVecgenTunStatus' -count=1 -v > /tmp/vecgen-tunstatus.log 2>&1
+grep -E '^(=== RUN|--- |ok|FAIL|PASS)' /tmp/vecgen-tunstatus.log | head -5
 cd "$REPO_ROOT"
 echo "==> 产物："; find "$OUT" -type f -name '*.json' -exec stat -f '    %N (%z 字节)' {} \;
 # 确定性 diff 门（M8）：重跑对已入库向量 diff 应为空——非空即语义漂移，必须复核
