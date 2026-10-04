@@ -461,9 +461,8 @@ impl SpeedHost {
             // 轮内日志经 stderr？App 形态无 stdout 消费面——丢弃（判据行在 exit 侧）
             let _ = s;
         };
-        // 相位推进（M-7：live/dir 由引擎进度出口驱动——down→up 相位切换 + 字节累计；
-        // Status 面按 250ms 轮询差分算 instBps；收尾相位在轮结束时写回）
-        lock_round(&self.state).phase = "down";
+        // 相位推进（M-7）：不预置 "down"——Status 面的相位/字节全跟引擎进度出口
+        // （down→up 切换 + 累计），轮结束写收尾相位；拨号期保持 "connecting"
         let cancel = std::sync::Arc::clone(&self.cancel);
         let live = std::sync::Arc::clone(&self.live);
         let outcome = app_run(&p.auth, &p.sock, &params, &logf, Some(&cancel), Some(&live));
