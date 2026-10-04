@@ -507,6 +507,24 @@ Validate 耦合 = `skip_state_update ⇒ state=unknown`；`top_non_empty_lines �
 - **OSC 4 多索引的分片粒度**：vte 对 `4;1;?;2;?` 逐参分发（每参一片应答）、ghostty
   合成一条；拼接字节一致（wire 契约不受影响），harness 的 chunks 契约按「piece 只
   允许更细分」放宽对拍（r1-低11）。
+- **（6f-3b 新增）explain 的 `rules` 空表序列化**：Go `[]evaluatedRuleOut` nil 切片
+  序列化为 `null`、Rust 空 Vec 为 `[]`——只在「manifest 零规则」的病态形态可见
+  （内嵌 22 份全非空；覆盖目录可造空表但 Validate 门会拒大部分形态）。wire 兼容
+  （消费方按数组迭代）。
+- **（6f-3b 新增）D-19 已处置关闭**：信号死退出码按 Go `-1` 语义映射
+  （`pty.rs::wait`——`ExitStatus::signal()` 可辨）；残余 = portable-pty 不暴露信号
+  数值（只给词面），EXIT 面不需要。正常退出码（0..255）两侧一致（6g 实测 exit 7/3）。
+- **（6f-3b 新增）LIST JSON 的 cwd 来源**：Go 取 vt 的 OSC 7 解析、Rust 取旁路扫描器
+  的 OSC 7（`scan::pwd_path`，Go `vtPwdPath` 同语义含百分号解码）——单来源等价；
+  终端不发 OSC 7 时两侧同为缺省（字段 omitempty）。
+- **（6f-3b 新增）surface 腿写超时 = 断腿**：Go 同款（停滞语义只给 raw 腿）——非差异，
+  登记为口径注记（Rust 侧 `run_surface_writer` 的 Timeout 与 Hard 都断腿）。
+- **（门二 r2 补登）plain_text 的折行展开口径**：Go `PlainText = format(unwrap=true)`
+  的软折行展开按 ghostty formatter 实现；Rust `plain_text` 以 alacritty 的行尾
+  WRAPLINE 位合并逻辑行（`vt::Row.wraps`）——两侧都是「折行合并 + 行尾裁」，
+  差异面只剩极端字形簇拼合的字节级边界（不进判据）。
+- **（门二 r2 补登）非 surface 腿的 surface 族上行帧**：Go 静默丢弃（`if
+  client.surface` 无 else）；Rust 对齐为静默（无错误回执）——严格对齐，无差异。
 
 ### 9.8 A9/A6/A7 顺手修正
 

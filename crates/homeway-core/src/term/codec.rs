@@ -305,7 +305,7 @@ pub fn decode_grid(b: &[u8]) -> Result<(u16, u16, Vec<vt::Row>), CodecError> {
         off += 2;
         let (cells, n) = decode_row_cells(&b[off..], cols as usize)?;
         off += n;
-        out.push(vt::Row { y, dirty: false, cells });
+        out.push(vt::Row { y, dirty: false, wraps: false, cells });
     }
     Ok((cols, rows, out))
 }
@@ -322,7 +322,7 @@ pub fn decode_rows(b: &[u8], count: usize, cols: usize) -> Result<Vec<vt::Row>, 
         off += 2;
         let (cells, n) = decode_row_cells(&b[off..], cols)?;
         off += n;
-        out.push(vt::Row { y, dirty: false, cells });
+        out.push(vt::Row { y, dirty: false, wraps: false, cells });
     }
     Ok(out)
 }
@@ -948,6 +948,7 @@ mod tests {
                 .map(|r| vt::Row {
                     y: r.get("y").and_then(Value::as_u64).expect("y") as u16,
                     dirty: false,
+                    wraps: false,
                     cells: r
                         .get("cells")
                         .and_then(Value::as_array)
@@ -1212,7 +1213,7 @@ mod tests {
             let mut rows = rows;
             // 行数补齐到视口（blankRun 语义：缺行按全空白行——Go 客户端同款）
             while rows.len() < body.rows as usize {
-                rows.push(Row { y: rows.len() as u16, dirty: false, cells: vec![] });
+                rows.push(Row { y: rows.len() as u16, dirty: false, wraps: false, cells: vec![] });
             }
             ClientGrid { cols, rows }
         }

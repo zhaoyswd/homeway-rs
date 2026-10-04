@@ -184,6 +184,9 @@ pub struct Cell {
 pub struct Row {
     pub y: u16,
     pub dirty: bool,
+    /// 软折行位（行尾 cell 带 WRAPLINE ⇒ 与下一物理行同属一条逻辑行——
+    /// `plain_text` 的 unwrap 口径；编码面不读）。
+    pub wraps: bool,
     pub cells: Vec<Cell>,
 }
 
@@ -657,7 +660,14 @@ impl SessionVt {
         for x in 0..self.cols {
             cells.push(cell_of(&row[Column(x)]));
         }
-        Row { y: y as u16, dirty: false, cells }
+        Row { y: y as u16, dirty: false, wraps: self.row_wraps(y), cells }
+    }
+
+    /// 物理行 y 是否软折行（行尾 cell 的 WRAPLINE 位；grid 只读面）。
+    fn row_wraps(&self, y: usize) -> bool {
+        let grid = self.term.grid();
+        let row = &grid[Line(y as i32)];
+        self.cols > 0 && row[Column(self.cols - 1)].flags.contains(AlacFlags::WRAPLINE)
     }
 
     fn row_at(&self, y: usize) -> Row {
@@ -758,18 +768,44 @@ impl SessionVt {
             }
             // 镜像/拉取行的 y 是**视口相对值**（服务端发的镜像 y 从视口顶起算——与 Go
             // 一致：客户端按返回顺序重排，不拿 y 当绝对行号）。
-            out.push(Row { y: 0, dirty: false, cells });
+            out.push(Row { y: 0, dirty: false, wraps: false, cells });
         }
         out
     }
 
-    /// 整屏 + 回滚的纯文本（Go `PlainText` 口径——explain 的输入面；region 求值
-    /// 自尾部切「最近约一屏」，回滚在前不改变判定，但 region_bytes/screenBytes 与
-    /// Go 逐字节可比——评审 M2）。
+    /// 整屏 + 回滚的纯文本（Go `PlainText` = format(unwrap=true, trim=true) 口径——
+    /// explain 的输入面：**软折行展开合并**（行尾 WRAPLINE 位 ⇒ 与下一物理行拼成
+    /// 一条逻辑行，不插换行）再逐逻辑行裁尾；region 求值自尾部切「最近约一屏」，
+    /// 回滚在前不改变判定，但 region_bytes/screenBytes 与 Go 逐字节可比——评审
+    /// M2/P2）。
     pub fn plain_text(&mut self) -> String {
         let total = self.term.total_lines() as u64;
         let rows = self.rows_at(0, total as usize);
-        text_of_rows(&rows)
+        // 展开折行：合并段内的行尾裁剪不做（拼接后才裁逻辑行尾）
+        let mut logical: Vec<String> = Vec::new();
+        let mut acc = String::new();
+        for r in &rows {
+            let mut line = String::with_capacity(r.cells.len());
+            for c in &r.cells {
+                if c.skip {
+                    continue;
+                }
+                if c.symbol.is_empty() {
+                    line.push(' ');
+                } else {
+                    line.push_str(&c.symbol);
+                }
+            }
+            acc.push_str(&line);
+            if r.wraps {
+                continue; // 软折行：并进同一条逻辑行
+            }
+            logical.push(std::mem::take(&mut acc).trim_end_matches([' ', '\t', '\u{a0}']).to_string());
+        }
+        if !acc.is_empty() {
+            logical.push(acc.trim_end_matches([' ', '\t', '\u{a0}']).to_string());
+        }
+        logical.join("\n")
     }
 
     /// 当前视口纯文本（检测引擎输入口径：跳占位格、空符号补空格、行尾裁空白）。
