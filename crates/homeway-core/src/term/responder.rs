@@ -237,12 +237,19 @@ mod tests {
     }
 
     /// 6c \u5224\u636e\uff1a\u5168\u90e8\u5e94\u7b54\u5411\u91cf\u9010\u6848\u5bf9\u62cd\uff08\u5582 SessionVt \u2192 write_collecting \u2192 \u6bd4\u5bf9\u5b57\u8282\uff09\u3002
+    /// vte 表外形态（门一评审 F2/F3）：⁠?998n 与 DCS 族需旁路扫描器/hook 拦截，
+    /// 向量已采、实现归 6c 收尾批（ROADMAP R6 进度注记「待实现面」）。
+    const PARITY_PENDING: &[&str] = &["csi998n", "decrqss_sgr", "decrqss_decscusr", "decrqss_unknown"];
+
     #[test]
     fn responder_parity_with_go_vectors() {
         let cases = responder_cases();
-        assert!(cases.len() >= 43, "vector cases {}", cases.len());
+        assert!(cases.len() >= 47, "vector cases {}", cases.len());
         let mut failures = Vec::new();
         for (name, setup, query, themed, expect) in cases {
+            if PARITY_PENDING.contains(&name.as_str()) {
+                continue; // 待实现豁免（向量已采，判据不作废）
+            }
             let mut vt = SessionVt::new(100, 32, 1000).expect("vt");
             if themed {
                 vt.set_default_colors([0x11, 0x22, 0x33], [0xaa, 0xbb, 0xcc]);
