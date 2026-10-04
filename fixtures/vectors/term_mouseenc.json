@@ -1,0 +1,1936 @@
+{
+  "cases": [
+    {
+      "mode": "moff",
+      "name": "press_left",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "moff",
+      "name": "press_right",
+      "event": {
+        "action": 0,
+        "button": 2,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "moff",
+      "name": "press_middle",
+      "event": {
+        "action": 0,
+        "button": 3,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "moff",
+      "name": "release_left",
+      "event": {
+        "action": 1,
+        "button": 1,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "moff",
+      "name": "release_right",
+      "event": {
+        "action": 1,
+        "button": 2,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "moff",
+      "name": "motion_left_held",
+      "event": {
+        "action": 2,
+        "button": 1,
+        "mods": 0,
+        "x": 6,
+        "y": 4
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "moff",
+      "name": "motion_no_button",
+      "event": {
+        "action": 2,
+        "button": 0,
+        "mods": 0,
+        "x": 6,
+        "y": 4
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "moff",
+      "name": "wheel_four",
+      "event": {
+        "action": 0,
+        "button": 4,
+        "mods": 0,
+        "x": 1,
+        "y": 1
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "moff",
+      "name": "wheel_five",
+      "event": {
+        "action": 0,
+        "button": 5,
+        "mods": 0,
+        "x": 1,
+        "y": 1
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "moff",
+      "name": "press_left_origin",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 0,
+        "y": 0
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "moff",
+      "name": "press_left_edge",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 222,
+        "y": 222
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "moff",
+      "name": "press_left_over",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 223,
+        "y": 5
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "moff",
+      "name": "press_left_shift",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 1,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "moff",
+      "name": "press_left_ctrl",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 2,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "moff",
+      "name": "press_left_ctrlshift",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 3,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "moff",
+      "name": "motion_left_ctrl",
+      "event": {
+        "action": 2,
+        "button": 1,
+        "mods": 2,
+        "x": 7,
+        "y": 2
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1000",
+      "name": "press_left",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d202624"
+    },
+    {
+      "mode": "m1000",
+      "name": "press_right",
+      "event": {
+        "action": 0,
+        "button": 2,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d222624"
+    },
+    {
+      "mode": "m1000",
+      "name": "press_middle",
+      "event": {
+        "action": 0,
+        "button": 3,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d212624"
+    },
+    {
+      "mode": "m1000",
+      "name": "release_left",
+      "event": {
+        "action": 1,
+        "button": 1,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d232624"
+    },
+    {
+      "mode": "m1000",
+      "name": "release_right",
+      "event": {
+        "action": 1,
+        "button": 2,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d232624"
+    },
+    {
+      "mode": "m1000",
+      "name": "motion_left_held",
+      "event": {
+        "action": 2,
+        "button": 1,
+        "mods": 0,
+        "x": 6,
+        "y": 4
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1000",
+      "name": "motion_no_button",
+      "event": {
+        "action": 2,
+        "button": 0,
+        "mods": 0,
+        "x": 6,
+        "y": 4
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1000",
+      "name": "wheel_four",
+      "event": {
+        "action": 0,
+        "button": 4,
+        "mods": 0,
+        "x": 1,
+        "y": 1
+      },
+      "out_hex": "1b5b4d602222"
+    },
+    {
+      "mode": "m1000",
+      "name": "wheel_five",
+      "event": {
+        "action": 0,
+        "button": 5,
+        "mods": 0,
+        "x": 1,
+        "y": 1
+      },
+      "out_hex": "1b5b4d612222"
+    },
+    {
+      "mode": "m1000",
+      "name": "press_left_origin",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 0,
+        "y": 0
+      },
+      "out_hex": "1b5b4d202121"
+    },
+    {
+      "mode": "m1000",
+      "name": "press_left_edge",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 222,
+        "y": 222
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1000",
+      "name": "press_left_over",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 223,
+        "y": 5
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1000",
+      "name": "press_left_shift",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 1,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d242624"
+    },
+    {
+      "mode": "m1000",
+      "name": "press_left_ctrl",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 2,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d302624"
+    },
+    {
+      "mode": "m1000",
+      "name": "press_left_ctrlshift",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 3,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d342624"
+    },
+    {
+      "mode": "m1000",
+      "name": "motion_left_ctrl",
+      "event": {
+        "action": 2,
+        "button": 1,
+        "mods": 2,
+        "x": 7,
+        "y": 2
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1002",
+      "name": "press_left",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d202624"
+    },
+    {
+      "mode": "m1002",
+      "name": "press_right",
+      "event": {
+        "action": 0,
+        "button": 2,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d222624"
+    },
+    {
+      "mode": "m1002",
+      "name": "press_middle",
+      "event": {
+        "action": 0,
+        "button": 3,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d212624"
+    },
+    {
+      "mode": "m1002",
+      "name": "release_left",
+      "event": {
+        "action": 1,
+        "button": 1,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d232624"
+    },
+    {
+      "mode": "m1002",
+      "name": "release_right",
+      "event": {
+        "action": 1,
+        "button": 2,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d232624"
+    },
+    {
+      "mode": "m1002",
+      "name": "motion_left_held",
+      "event": {
+        "action": 2,
+        "button": 1,
+        "mods": 0,
+        "x": 6,
+        "y": 4
+      },
+      "out_hex": "1b5b4d402725"
+    },
+    {
+      "mode": "m1002",
+      "name": "motion_no_button",
+      "event": {
+        "action": 2,
+        "button": 0,
+        "mods": 0,
+        "x": 6,
+        "y": 4
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1002",
+      "name": "wheel_four",
+      "event": {
+        "action": 0,
+        "button": 4,
+        "mods": 0,
+        "x": 1,
+        "y": 1
+      },
+      "out_hex": "1b5b4d602222"
+    },
+    {
+      "mode": "m1002",
+      "name": "wheel_five",
+      "event": {
+        "action": 0,
+        "button": 5,
+        "mods": 0,
+        "x": 1,
+        "y": 1
+      },
+      "out_hex": "1b5b4d612222"
+    },
+    {
+      "mode": "m1002",
+      "name": "press_left_origin",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 0,
+        "y": 0
+      },
+      "out_hex": "1b5b4d202121"
+    },
+    {
+      "mode": "m1002",
+      "name": "press_left_edge",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 222,
+        "y": 222
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1002",
+      "name": "press_left_over",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 223,
+        "y": 5
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1002",
+      "name": "press_left_shift",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 1,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d242624"
+    },
+    {
+      "mode": "m1002",
+      "name": "press_left_ctrl",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 2,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d302624"
+    },
+    {
+      "mode": "m1002",
+      "name": "press_left_ctrlshift",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 3,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d342624"
+    },
+    {
+      "mode": "m1002",
+      "name": "motion_left_ctrl",
+      "event": {
+        "action": 2,
+        "button": 1,
+        "mods": 2,
+        "x": 7,
+        "y": 2
+      },
+      "out_hex": "1b5b4d502823"
+    },
+    {
+      "mode": "m1003",
+      "name": "press_left",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d202624"
+    },
+    {
+      "mode": "m1003",
+      "name": "press_right",
+      "event": {
+        "action": 0,
+        "button": 2,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d222624"
+    },
+    {
+      "mode": "m1003",
+      "name": "press_middle",
+      "event": {
+        "action": 0,
+        "button": 3,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d212624"
+    },
+    {
+      "mode": "m1003",
+      "name": "release_left",
+      "event": {
+        "action": 1,
+        "button": 1,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d232624"
+    },
+    {
+      "mode": "m1003",
+      "name": "release_right",
+      "event": {
+        "action": 1,
+        "button": 2,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d232624"
+    },
+    {
+      "mode": "m1003",
+      "name": "motion_left_held",
+      "event": {
+        "action": 2,
+        "button": 1,
+        "mods": 0,
+        "x": 6,
+        "y": 4
+      },
+      "out_hex": "1b5b4d402725"
+    },
+    {
+      "mode": "m1003",
+      "name": "motion_no_button",
+      "event": {
+        "action": 2,
+        "button": 0,
+        "mods": 0,
+        "x": 6,
+        "y": 4
+      },
+      "out_hex": "1b5b4d432725"
+    },
+    {
+      "mode": "m1003",
+      "name": "wheel_four",
+      "event": {
+        "action": 0,
+        "button": 4,
+        "mods": 0,
+        "x": 1,
+        "y": 1
+      },
+      "out_hex": "1b5b4d602222"
+    },
+    {
+      "mode": "m1003",
+      "name": "wheel_five",
+      "event": {
+        "action": 0,
+        "button": 5,
+        "mods": 0,
+        "x": 1,
+        "y": 1
+      },
+      "out_hex": "1b5b4d612222"
+    },
+    {
+      "mode": "m1003",
+      "name": "press_left_origin",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 0,
+        "y": 0
+      },
+      "out_hex": "1b5b4d202121"
+    },
+    {
+      "mode": "m1003",
+      "name": "press_left_edge",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 222,
+        "y": 222
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1003",
+      "name": "press_left_over",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 223,
+        "y": 5
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1003",
+      "name": "press_left_shift",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 1,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d242624"
+    },
+    {
+      "mode": "m1003",
+      "name": "press_left_ctrl",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 2,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d302624"
+    },
+    {
+      "mode": "m1003",
+      "name": "press_left_ctrlshift",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 3,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d342624"
+    },
+    {
+      "mode": "m1003",
+      "name": "motion_left_ctrl",
+      "event": {
+        "action": 2,
+        "button": 1,
+        "mods": 2,
+        "x": 7,
+        "y": 2
+      },
+      "out_hex": "1b5b4d502823"
+    },
+    {
+      "mode": "m1000sgr",
+      "name": "press_left",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c303b363b344d"
+    },
+    {
+      "mode": "m1000sgr",
+      "name": "press_right",
+      "event": {
+        "action": 0,
+        "button": 2,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c323b363b344d"
+    },
+    {
+      "mode": "m1000sgr",
+      "name": "press_middle",
+      "event": {
+        "action": 0,
+        "button": 3,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c313b363b344d"
+    },
+    {
+      "mode": "m1000sgr",
+      "name": "release_left",
+      "event": {
+        "action": 1,
+        "button": 1,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c303b363b346d"
+    },
+    {
+      "mode": "m1000sgr",
+      "name": "release_right",
+      "event": {
+        "action": 1,
+        "button": 2,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c323b363b346d"
+    },
+    {
+      "mode": "m1000sgr",
+      "name": "motion_left_held",
+      "event": {
+        "action": 2,
+        "button": 1,
+        "mods": 0,
+        "x": 6,
+        "y": 4
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1000sgr",
+      "name": "motion_no_button",
+      "event": {
+        "action": 2,
+        "button": 0,
+        "mods": 0,
+        "x": 6,
+        "y": 4
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1000sgr",
+      "name": "wheel_four",
+      "event": {
+        "action": 0,
+        "button": 4,
+        "mods": 0,
+        "x": 1,
+        "y": 1
+      },
+      "out_hex": "1b5b3c36343b323b324d"
+    },
+    {
+      "mode": "m1000sgr",
+      "name": "wheel_five",
+      "event": {
+        "action": 0,
+        "button": 5,
+        "mods": 0,
+        "x": 1,
+        "y": 1
+      },
+      "out_hex": "1b5b3c36353b323b324d"
+    },
+    {
+      "mode": "m1000sgr",
+      "name": "press_left_origin",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 0,
+        "y": 0
+      },
+      "out_hex": "1b5b3c303b313b314d"
+    },
+    {
+      "mode": "m1000sgr",
+      "name": "press_left_edge",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 222,
+        "y": 222
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1000sgr",
+      "name": "press_left_over",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 223,
+        "y": 5
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1000sgr",
+      "name": "press_left_shift",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 1,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c343b363b344d"
+    },
+    {
+      "mode": "m1000sgr",
+      "name": "press_left_ctrl",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 2,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c31363b363b344d"
+    },
+    {
+      "mode": "m1000sgr",
+      "name": "press_left_ctrlshift",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 3,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c32303b363b344d"
+    },
+    {
+      "mode": "m1000sgr",
+      "name": "motion_left_ctrl",
+      "event": {
+        "action": 2,
+        "button": 1,
+        "mods": 2,
+        "x": 7,
+        "y": 2
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1002sgr",
+      "name": "press_left",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c303b363b344d"
+    },
+    {
+      "mode": "m1002sgr",
+      "name": "press_right",
+      "event": {
+        "action": 0,
+        "button": 2,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c323b363b344d"
+    },
+    {
+      "mode": "m1002sgr",
+      "name": "press_middle",
+      "event": {
+        "action": 0,
+        "button": 3,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c313b363b344d"
+    },
+    {
+      "mode": "m1002sgr",
+      "name": "release_left",
+      "event": {
+        "action": 1,
+        "button": 1,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c303b363b346d"
+    },
+    {
+      "mode": "m1002sgr",
+      "name": "release_right",
+      "event": {
+        "action": 1,
+        "button": 2,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c323b363b346d"
+    },
+    {
+      "mode": "m1002sgr",
+      "name": "motion_left_held",
+      "event": {
+        "action": 2,
+        "button": 1,
+        "mods": 0,
+        "x": 6,
+        "y": 4
+      },
+      "out_hex": "1b5b3c33323b373b354d"
+    },
+    {
+      "mode": "m1002sgr",
+      "name": "motion_no_button",
+      "event": {
+        "action": 2,
+        "button": 0,
+        "mods": 0,
+        "x": 6,
+        "y": 4
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1002sgr",
+      "name": "wheel_four",
+      "event": {
+        "action": 0,
+        "button": 4,
+        "mods": 0,
+        "x": 1,
+        "y": 1
+      },
+      "out_hex": "1b5b3c36343b323b324d"
+    },
+    {
+      "mode": "m1002sgr",
+      "name": "wheel_five",
+      "event": {
+        "action": 0,
+        "button": 5,
+        "mods": 0,
+        "x": 1,
+        "y": 1
+      },
+      "out_hex": "1b5b3c36353b323b324d"
+    },
+    {
+      "mode": "m1002sgr",
+      "name": "press_left_origin",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 0,
+        "y": 0
+      },
+      "out_hex": "1b5b3c303b313b314d"
+    },
+    {
+      "mode": "m1002sgr",
+      "name": "press_left_edge",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 222,
+        "y": 222
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1002sgr",
+      "name": "press_left_over",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 223,
+        "y": 5
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1002sgr",
+      "name": "press_left_shift",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 1,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c343b363b344d"
+    },
+    {
+      "mode": "m1002sgr",
+      "name": "press_left_ctrl",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 2,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c31363b363b344d"
+    },
+    {
+      "mode": "m1002sgr",
+      "name": "press_left_ctrlshift",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 3,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c32303b363b344d"
+    },
+    {
+      "mode": "m1002sgr",
+      "name": "motion_left_ctrl",
+      "event": {
+        "action": 2,
+        "button": 1,
+        "mods": 2,
+        "x": 7,
+        "y": 2
+      },
+      "out_hex": "1b5b3c34383b383b334d"
+    },
+    {
+      "mode": "m1003sgr",
+      "name": "press_left",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c303b363b344d"
+    },
+    {
+      "mode": "m1003sgr",
+      "name": "press_right",
+      "event": {
+        "action": 0,
+        "button": 2,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c323b363b344d"
+    },
+    {
+      "mode": "m1003sgr",
+      "name": "press_middle",
+      "event": {
+        "action": 0,
+        "button": 3,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c313b363b344d"
+    },
+    {
+      "mode": "m1003sgr",
+      "name": "release_left",
+      "event": {
+        "action": 1,
+        "button": 1,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c303b363b346d"
+    },
+    {
+      "mode": "m1003sgr",
+      "name": "release_right",
+      "event": {
+        "action": 1,
+        "button": 2,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c323b363b346d"
+    },
+    {
+      "mode": "m1003sgr",
+      "name": "motion_left_held",
+      "event": {
+        "action": 2,
+        "button": 1,
+        "mods": 0,
+        "x": 6,
+        "y": 4
+      },
+      "out_hex": "1b5b3c33323b373b354d"
+    },
+    {
+      "mode": "m1003sgr",
+      "name": "motion_no_button",
+      "event": {
+        "action": 2,
+        "button": 0,
+        "mods": 0,
+        "x": 6,
+        "y": 4
+      },
+      "out_hex": "1b5b3c33353b373b354d"
+    },
+    {
+      "mode": "m1003sgr",
+      "name": "wheel_four",
+      "event": {
+        "action": 0,
+        "button": 4,
+        "mods": 0,
+        "x": 1,
+        "y": 1
+      },
+      "out_hex": "1b5b3c36343b323b324d"
+    },
+    {
+      "mode": "m1003sgr",
+      "name": "wheel_five",
+      "event": {
+        "action": 0,
+        "button": 5,
+        "mods": 0,
+        "x": 1,
+        "y": 1
+      },
+      "out_hex": "1b5b3c36353b323b324d"
+    },
+    {
+      "mode": "m1003sgr",
+      "name": "press_left_origin",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 0,
+        "y": 0
+      },
+      "out_hex": "1b5b3c303b313b314d"
+    },
+    {
+      "mode": "m1003sgr",
+      "name": "press_left_edge",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 222,
+        "y": 222
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1003sgr",
+      "name": "press_left_over",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 223,
+        "y": 5
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1003sgr",
+      "name": "press_left_shift",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 1,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c343b363b344d"
+    },
+    {
+      "mode": "m1003sgr",
+      "name": "press_left_ctrl",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 2,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c31363b363b344d"
+    },
+    {
+      "mode": "m1003sgr",
+      "name": "press_left_ctrlshift",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 3,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b3c32303b363b344d"
+    },
+    {
+      "mode": "m1003sgr",
+      "name": "motion_left_ctrl",
+      "event": {
+        "action": 2,
+        "button": 1,
+        "mods": 2,
+        "x": 7,
+        "y": 2
+      },
+      "out_hex": "1b5b3c34383b383b334d"
+    },
+    {
+      "mode": "m1000utf8",
+      "name": "press_left",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d202624"
+    },
+    {
+      "mode": "m1000utf8",
+      "name": "press_right",
+      "event": {
+        "action": 0,
+        "button": 2,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d222624"
+    },
+    {
+      "mode": "m1000utf8",
+      "name": "press_middle",
+      "event": {
+        "action": 0,
+        "button": 3,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d212624"
+    },
+    {
+      "mode": "m1000utf8",
+      "name": "release_left",
+      "event": {
+        "action": 1,
+        "button": 1,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d232624"
+    },
+    {
+      "mode": "m1000utf8",
+      "name": "release_right",
+      "event": {
+        "action": 1,
+        "button": 2,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d232624"
+    },
+    {
+      "mode": "m1000utf8",
+      "name": "motion_left_held",
+      "event": {
+        "action": 2,
+        "button": 1,
+        "mods": 0,
+        "x": 6,
+        "y": 4
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1000utf8",
+      "name": "motion_no_button",
+      "event": {
+        "action": 2,
+        "button": 0,
+        "mods": 0,
+        "x": 6,
+        "y": 4
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1000utf8",
+      "name": "wheel_four",
+      "event": {
+        "action": 0,
+        "button": 4,
+        "mods": 0,
+        "x": 1,
+        "y": 1
+      },
+      "out_hex": "1b5b4d602222"
+    },
+    {
+      "mode": "m1000utf8",
+      "name": "wheel_five",
+      "event": {
+        "action": 0,
+        "button": 5,
+        "mods": 0,
+        "x": 1,
+        "y": 1
+      },
+      "out_hex": "1b5b4d612222"
+    },
+    {
+      "mode": "m1000utf8",
+      "name": "press_left_origin",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 0,
+        "y": 0
+      },
+      "out_hex": "1b5b4d202121"
+    },
+    {
+      "mode": "m1000utf8",
+      "name": "press_left_edge",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 222,
+        "y": 222
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1000utf8",
+      "name": "press_left_over",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 223,
+        "y": 5
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1000utf8",
+      "name": "press_left_shift",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 1,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d242624"
+    },
+    {
+      "mode": "m1000utf8",
+      "name": "press_left_ctrl",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 2,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d302624"
+    },
+    {
+      "mode": "m1000utf8",
+      "name": "press_left_ctrlshift",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 3,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d342624"
+    },
+    {
+      "mode": "m1000utf8",
+      "name": "motion_left_ctrl",
+      "event": {
+        "action": 2,
+        "button": 1,
+        "mods": 2,
+        "x": 7,
+        "y": 2
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1002utf8",
+      "name": "press_left",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d202624"
+    },
+    {
+      "mode": "m1002utf8",
+      "name": "press_right",
+      "event": {
+        "action": 0,
+        "button": 2,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d222624"
+    },
+    {
+      "mode": "m1002utf8",
+      "name": "press_middle",
+      "event": {
+        "action": 0,
+        "button": 3,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d212624"
+    },
+    {
+      "mode": "m1002utf8",
+      "name": "release_left",
+      "event": {
+        "action": 1,
+        "button": 1,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d232624"
+    },
+    {
+      "mode": "m1002utf8",
+      "name": "release_right",
+      "event": {
+        "action": 1,
+        "button": 2,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d232624"
+    },
+    {
+      "mode": "m1002utf8",
+      "name": "motion_left_held",
+      "event": {
+        "action": 2,
+        "button": 1,
+        "mods": 0,
+        "x": 6,
+        "y": 4
+      },
+      "out_hex": "1b5b4d402725"
+    },
+    {
+      "mode": "m1002utf8",
+      "name": "motion_no_button",
+      "event": {
+        "action": 2,
+        "button": 0,
+        "mods": 0,
+        "x": 6,
+        "y": 4
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1002utf8",
+      "name": "wheel_four",
+      "event": {
+        "action": 0,
+        "button": 4,
+        "mods": 0,
+        "x": 1,
+        "y": 1
+      },
+      "out_hex": "1b5b4d602222"
+    },
+    {
+      "mode": "m1002utf8",
+      "name": "wheel_five",
+      "event": {
+        "action": 0,
+        "button": 5,
+        "mods": 0,
+        "x": 1,
+        "y": 1
+      },
+      "out_hex": "1b5b4d612222"
+    },
+    {
+      "mode": "m1002utf8",
+      "name": "press_left_origin",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 0,
+        "y": 0
+      },
+      "out_hex": "1b5b4d202121"
+    },
+    {
+      "mode": "m1002utf8",
+      "name": "press_left_edge",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 222,
+        "y": 222
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1002utf8",
+      "name": "press_left_over",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 223,
+        "y": 5
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "m1002utf8",
+      "name": "press_left_shift",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 1,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d242624"
+    },
+    {
+      "mode": "m1002utf8",
+      "name": "press_left_ctrl",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 2,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d302624"
+    },
+    {
+      "mode": "m1002utf8",
+      "name": "press_left_ctrlshift",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 3,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d342624"
+    },
+    {
+      "mode": "m1002utf8",
+      "name": "motion_left_ctrl",
+      "event": {
+        "action": 2,
+        "button": 1,
+        "mods": 2,
+        "x": 7,
+        "y": 2
+      },
+      "out_hex": "1b5b4d502823"
+    },
+    {
+      "mode": "mx10",
+      "name": "press_left",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d202624"
+    },
+    {
+      "mode": "mx10",
+      "name": "press_right",
+      "event": {
+        "action": 0,
+        "button": 2,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d222624"
+    },
+    {
+      "mode": "mx10",
+      "name": "press_middle",
+      "event": {
+        "action": 0,
+        "button": 3,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d212624"
+    },
+    {
+      "mode": "mx10",
+      "name": "release_left",
+      "event": {
+        "action": 1,
+        "button": 1,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "mx10",
+      "name": "release_right",
+      "event": {
+        "action": 1,
+        "button": 2,
+        "mods": 0,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "mx10",
+      "name": "motion_left_held",
+      "event": {
+        "action": 2,
+        "button": 1,
+        "mods": 0,
+        "x": 6,
+        "y": 4
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "mx10",
+      "name": "motion_no_button",
+      "event": {
+        "action": 2,
+        "button": 0,
+        "mods": 0,
+        "x": 6,
+        "y": 4
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "mx10",
+      "name": "wheel_four",
+      "event": {
+        "action": 0,
+        "button": 4,
+        "mods": 0,
+        "x": 1,
+        "y": 1
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "mx10",
+      "name": "wheel_five",
+      "event": {
+        "action": 0,
+        "button": 5,
+        "mods": 0,
+        "x": 1,
+        "y": 1
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "mx10",
+      "name": "press_left_origin",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 0,
+        "y": 0
+      },
+      "out_hex": "1b5b4d202121"
+    },
+    {
+      "mode": "mx10",
+      "name": "press_left_edge",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 222,
+        "y": 222
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "mx10",
+      "name": "press_left_over",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 0,
+        "x": 223,
+        "y": 5
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "mx10",
+      "name": "press_left_shift",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 1,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d202624"
+    },
+    {
+      "mode": "mx10",
+      "name": "press_left_ctrl",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 2,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d202624"
+    },
+    {
+      "mode": "mx10",
+      "name": "press_left_ctrlshift",
+      "event": {
+        "action": 0,
+        "button": 1,
+        "mods": 3,
+        "x": 5,
+        "y": 3
+      },
+      "out_hex": "1b5b4d202624"
+    },
+    {
+      "mode": "mx10",
+      "name": "motion_left_ctrl",
+      "event": {
+        "action": 2,
+        "button": 1,
+        "mods": 2,
+        "x": 7,
+        "y": 2
+      },
+      "out_hex": ""
+    }
+  ],
+  "modes": {
+    "m1000": "1b5b3f3130303068",
+    "m1000sgr": "1b5b3f31303030681b5b3f3130303668",
+    "m1000utf8": "1b5b3f31303030681b5b3f3130303568",
+    "m1002": "1b5b3f3130303268",
+    "m1002sgr": "1b5b3f31303032681b5b3f3130303668",
+    "m1002utf8": "1b5b3f31303032681b5b3f3130303568",
+    "m1003": "1b5b3f3130303368",
+    "m1003sgr": "1b5b3f31303033681b5b3f3130303668",
+    "moff": "",
+    "mx10": "1b5b3f3968"
+  }
+}

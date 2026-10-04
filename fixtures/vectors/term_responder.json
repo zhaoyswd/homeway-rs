@@ -1,0 +1,333 @@
+{
+  "cases": [
+    {
+      "name": "da1",
+      "query_hex": "1b5b63",
+      "response_hex": "1b5b3f36323b323263",
+      "chunks": [
+        "1b5b3f36323b323263"
+      ]
+    },
+    {
+      "name": "da1_zero",
+      "query_hex": "1b5b3063",
+      "response_hex": "1b5b3f36323b323263",
+      "chunks": [
+        "1b5b3f36323b323263"
+      ]
+    },
+    {
+      "name": "da2",
+      "query_hex": "1b5b3e63",
+      "response_hex": "1b5b3e313b303b3063",
+      "chunks": [
+        "1b5b3e313b303b3063"
+      ]
+    },
+    {
+      "name": "da2_args",
+      "query_hex": "1b5b3e3063",
+      "response_hex": "1b5b3e313b303b3063",
+      "chunks": [
+        "1b5b3e313b303b3063"
+      ]
+    },
+    {
+      "name": "da3",
+      "query_hex": "1b5b3d63",
+      "response_hex": "1b50217c30303030303030301b5c",
+      "chunks": [
+        "1b50217c30303030303030301b5c"
+      ]
+    },
+    {
+      "name": "xtversion",
+      "query_hex": "1b5b3f363563",
+      "response_hex": ""
+    },
+    {
+      "name": "dsr_os",
+      "query_hex": "1b5b356e",
+      "response_hex": "1b5b306e",
+      "chunks": [
+        "1b5b306e"
+      ]
+    },
+    {
+      "name": "dsr_cpr",
+      "setup_hex": "1b5b333b3748",
+      "query_hex": "1b5b366e",
+      "response_hex": "1b5b333b3752",
+      "chunks": [
+        "1b5b333b3752"
+      ]
+    },
+    {
+      "name": "dsr_cpr_top_left",
+      "query_hex": "1b5b366e",
+      "response_hex": "1b5b313b3152",
+      "chunks": [
+        "1b5b313b3152"
+      ]
+    },
+    {
+      "name": "dsr_cpr_origin",
+      "setup_hex": "1b5b3f36681b5b353b313048",
+      "query_hex": "1b5b366e",
+      "response_hex": "1b5b353b313052",
+      "chunks": [
+        "1b5b353b313052"
+      ]
+    },
+    {
+      "name": "dsr_cpr_origin_scrolled",
+      "setup_hex": "1b5b353b3230721b5b3f36681b5b333b3448",
+      "query_hex": "1b5b366e",
+      "response_hex": "1b5b333b3452",
+      "chunks": [
+        "1b5b333b3452"
+      ]
+    },
+    {
+      "name": "decxcpr",
+      "query_hex": "1b5b3f366e",
+      "response_hex": ""
+    },
+    {
+      "name": "decrqm_priv_on",
+      "setup_hex": "1b5b3f3130303068",
+      "query_hex": "1b5b3f313030302470",
+      "response_hex": "1b5b3f313030303b312479",
+      "chunks": [
+        "1b5b3f313030303b312479"
+      ]
+    },
+    {
+      "name": "decrqm_priv_off",
+      "setup_hex": "1b5b3f313030306c",
+      "query_hex": "1b5b3f313030302470",
+      "response_hex": "1b5b3f313030303b322479",
+      "chunks": [
+        "1b5b3f313030303b322479"
+      ]
+    },
+    {
+      "name": "decrqm_priv_unknown",
+      "query_hex": "1b5b3f393939392470",
+      "response_hex": "1b5b3f393939393b302479",
+      "chunks": [
+        "1b5b3f393939393b302479"
+      ]
+    },
+    {
+      "name": "decrqm_priv_117",
+      "query_hex": "1b5b3f3131372470",
+      "response_hex": "1b5b3f3131373b342479",
+      "chunks": [
+        "1b5b3f3131373b342479"
+      ]
+    },
+    {
+      "name": "decrqm_priv_7_on",
+      "query_hex": "1b5b3f372470",
+      "response_hex": "1b5b3f373b312479",
+      "chunks": [
+        "1b5b3f373b312479"
+      ]
+    },
+    {
+      "name": "decrqm_ansi_insert_on",
+      "setup_hex": "1b5b3468",
+      "query_hex": "1b5b342470",
+      "response_hex": ""
+    },
+    {
+      "name": "decrqm_ansi_insert_off",
+      "setup_hex": "1b5b346c",
+      "query_hex": "1b5b342470",
+      "response_hex": ""
+    },
+    {
+      "name": "decrqm_ansi_lnm",
+      "query_hex": "1b5b32302470",
+      "response_hex": ""
+    },
+    {
+      "name": "decrqm_ansi_unknown",
+      "query_hex": "1b5b39392470",
+      "response_hex": ""
+    },
+    {
+      "name": "kitty_query_default",
+      "query_hex": "1b5b3f75",
+      "response_hex": "1b5b3f3075",
+      "chunks": [
+        "1b5b3f3075"
+      ]
+    },
+    {
+      "name": "kitty_query_after_set1",
+      "setup_hex": "1b5b3d3175",
+      "query_hex": "1b5b3f75",
+      "response_hex": "1b5b3f3175",
+      "chunks": [
+        "1b5b3f3175"
+      ]
+    },
+    {
+      "name": "kitty_query_after_set31",
+      "setup_hex": "1b5b3d333175",
+      "query_hex": "1b5b3f75",
+      "response_hex": "1b5b3f333175",
+      "chunks": [
+        "1b5b3f333175"
+      ]
+    },
+    {
+      "name": "kitty_query_after_push_pop",
+      "setup_hex": "1b5b3e3135751b5b3c3175",
+      "query_hex": "1b5b3f75",
+      "response_hex": "1b5b3f3075",
+      "chunks": [
+        "1b5b3f3075"
+      ]
+    },
+    {
+      "name": "kitty_query_after_pop_all",
+      "setup_hex": "1b5b3d3135751b5b3c3175",
+      "query_hex": "1b5b3f75",
+      "response_hex": "1b5b3f3075",
+      "chunks": [
+        "1b5b3f3075"
+      ]
+    },
+    {
+      "name": "osc10_default",
+      "query_hex": "1b5d31303b3f07",
+      "response_hex": ""
+    },
+    {
+      "name": "osc11_default",
+      "query_hex": "1b5d31313b3f07",
+      "response_hex": ""
+    },
+    {
+      "name": "osc12_default",
+      "query_hex": "1b5d31323b3f07",
+      "response_hex": ""
+    },
+    {
+      "name": "osc10_multi",
+      "query_hex": "1b5d31303b3f3b3f3b3f07",
+      "response_hex": ""
+    },
+    {
+      "name": "osc10_11_multi",
+      "query_hex": "1b5d31303b3f3b3f071b5d31313b3f07",
+      "response_hex": ""
+    },
+    {
+      "name": "osc4_mirror",
+      "setup_hex": "1b5d343b353b7267623a31322f33342f353607",
+      "query_hex": "1b5d343b353b3f07",
+      "response_hex": "1b5d343b353b7267623a313231322f333433342f3536353607",
+      "chunks": [
+        "1b5d343b353b7267623a313231322f333433342f3536353607"
+      ]
+    },
+    {
+      "name": "osc4_unset",
+      "query_hex": "1b5d343b353b3f07",
+      "response_hex": "1b5d343b353b7267623a623262322f393439342f6262626207",
+      "chunks": [
+        "1b5d343b353b7267623a623262322f393439342f6262626207"
+      ]
+    },
+    {
+      "name": "osc4_multi",
+      "query_hex": "1b5d343b313b3f3b323b3f07",
+      "response_hex": "1b5d343b313b7267623a636363632f363636362f36363636071b5d343b323b7267623a623562352f626462642f3638363807",
+      "chunks": [
+        "1b5d343b313b7267623a636363632f363636362f36363636071b5d343b323b7267623a623562352f626462642f3638363807"
+      ]
+    },
+    {
+      "name": "csi14t",
+      "query_hex": "1b5b313474",
+      "response_hex": ""
+    },
+    {
+      "name": "csi16t",
+      "query_hex": "1b5b313674",
+      "response_hex": ""
+    },
+    {
+      "name": "csi18t",
+      "query_hex": "1b5b313874",
+      "response_hex": ""
+    },
+    {
+      "name": "csi21t_off",
+      "query_hex": "1b5b323174",
+      "response_hex": ""
+    },
+    {
+      "name": "csi21t_on",
+      "setup_hex": "1b5b3f323168",
+      "query_hex": "1b5b323174",
+      "response_hex": ""
+    },
+    {
+      "name": "enq",
+      "query_hex": "05",
+      "response_hex": ""
+    },
+    {
+      "name": "mok_query_off",
+      "query_hex": "1b5b3f346d",
+      "response_hex": ""
+    },
+    {
+      "name": "mok_query_on",
+      "setup_hex": "1b5b3e343b326d",
+      "query_hex": "1b5b3f346d",
+      "response_hex": ""
+    },
+    {
+      "name": "batch_da1_dsr",
+      "query_hex": "1b5b631b5b366e",
+      "response_hex": "1b5b3f36323b3232631b5b313b3152",
+      "chunks": [
+        "1b5b3f36323b323263",
+        "1b5b313b3152"
+      ]
+    },
+    {
+      "name": "osc10_theme",
+      "query_hex": "1b5d31303b3f07",
+      "response_hex": "1b5d31303b7267623a313131312f323232322f3333333307",
+      "chunks": [
+        "1b5d31303b7267623a313131312f323232322f3333333307"
+      ],
+      "themed": true
+    },
+    {
+      "name": "osc11_theme",
+      "query_hex": "1b5d31313b3f07",
+      "response_hex": "1b5d31313b7267623a616161612f626262622f6363636307",
+      "chunks": [
+        "1b5d31313b7267623a616161612f626262622f6363636307"
+      ],
+      "themed": true
+    },
+    {
+      "name": "osc12_theme",
+      "query_hex": "1b5d31323b3f07",
+      "response_hex": "1b5d31323b7267623a313131312f323232322f3333333307",
+      "chunks": [
+        "1b5d31323b7267623a313131312f323232322f3333333307"
+      ],
+      "themed": true
+    }
+  ]
+}

@@ -1,0 +1,3771 @@
+{
+  "keys": {
+    "a": 20,
+    "alt_left": 51,
+    "arrow_down": 75,
+    "arrow_left": 76,
+    "arrow_right": 77,
+    "arrow_up": 78,
+    "b": 21,
+    "backquote": 1,
+    "backslash": 2,
+    "backspace": 53,
+    "bracket_left": 3,
+    "bracket_right": 4,
+    "c": 22,
+    "comma": 5,
+    "ctrl_left": 56,
+    "delete": 68,
+    "digit0": 6,
+    "digit5": 11,
+    "end": 69,
+    "enter": 58,
+    "equal": 16,
+    "escape": 120,
+    "f1": 121,
+    "f12": 132,
+    "f2": 122,
+    "f3": 123,
+    "f5": 125,
+    "home": 71,
+    "i": 28,
+    "insert": 72,
+    "m": 32,
+    "minus": 46,
+    "numpad0": 80,
+    "numpad1": 81,
+    "numpad_add": 90,
+    "numpad_enter": 97,
+    "page_down": 73,
+    "page_up": 74,
+    "period": 47,
+    "quote": 48,
+    "semicolon": 49,
+    "shift_left": 61,
+    "slash": 50,
+    "space": 63,
+    "super_left": 59,
+    "tab": 64,
+    "z": 45
+  },
+  "modes": {
+    "decckm": "1b5b3f3168",
+    "deckpam": "1b5b3f363668",
+    "kitty1": "1b5b3d3175",
+    "kitty15": "1b5b3d313575",
+    "kitty16": "1b5b3d313675",
+    "kitty2": "1b5b3d3275",
+    "kitty31": "1b5b3d333175",
+    "kitty4": "1b5b3d3475",
+    "kitty5": "1b5b3d3575",
+    "kitty8": "1b5b3d3875",
+    "kitty_131": "1b5b3d31751b5b3d333175",
+    "kitty_push_pop": "1b5b3e3135751b5b3c3175",
+    "mok2": "1b5b3e343b326d",
+    "plain": ""
+  },
+  "cases": [
+    {
+      "mode": "plain",
+      "name": "a#00",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "plain",
+      "name": "a#01",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 2,
+        "text": "\u0001"
+      },
+      "out_hex": "1b5b313b3575"
+    },
+    {
+      "mode": "plain",
+      "name": "a#02",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 1,
+        "text": "A"
+      },
+      "out_hex": "41"
+    },
+    {
+      "mode": "plain",
+      "name": "a#03",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 4,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "plain",
+      "name": "a#04",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 6,
+        "text": "\u0001"
+      },
+      "out_hex": "1b5b313b3775"
+    },
+    {
+      "mode": "plain",
+      "name": "enter#05",
+      "event": {
+        "key": "enter",
+        "action": 1,
+        "mods": 0,
+        "text": "\r"
+      },
+      "out_hex": "0d"
+    },
+    {
+      "mode": "plain",
+      "name": "tab#06",
+      "event": {
+        "key": "tab",
+        "action": 1,
+        "mods": 0,
+        "text": "\t"
+      },
+      "out_hex": "09"
+    },
+    {
+      "mode": "plain",
+      "name": "backspace#07",
+      "event": {
+        "key": "backspace",
+        "action": 1,
+        "mods": 0,
+        "text": ""
+      },
+      "out_hex": "7f"
+    },
+    {
+      "mode": "plain",
+      "name": "escape#08",
+      "event": {
+        "key": "escape",
+        "action": 1,
+        "mods": 0,
+        "text": "\u001b"
+      },
+      "out_hex": "1b"
+    },
+    {
+      "mode": "plain",
+      "name": "arrow_up#09",
+      "event": {
+        "key": "arrow_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b41"
+    },
+    {
+      "mode": "plain",
+      "name": "arrow_left#10",
+      "event": {
+        "key": "arrow_left",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b313b3544"
+    },
+    {
+      "mode": "plain",
+      "name": "arrow_right#11",
+      "event": {
+        "key": "arrow_right",
+        "action": 1,
+        "mods": 1
+      },
+      "out_hex": "1b5b313b3243"
+    },
+    {
+      "mode": "plain",
+      "name": "f1#12",
+      "event": {
+        "key": "f1",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b4f50"
+    },
+    {
+      "mode": "plain",
+      "name": "f5#13",
+      "event": {
+        "key": "f5",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b31353b357e"
+    },
+    {
+      "mode": "plain",
+      "name": "delete#14",
+      "event": {
+        "key": "delete",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b337e"
+    },
+    {
+      "mode": "plain",
+      "name": "home#15",
+      "event": {
+        "key": "home",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b48"
+    },
+    {
+      "mode": "plain",
+      "name": "page_up#16",
+      "event": {
+        "key": "page_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b357e"
+    },
+    {
+      "mode": "plain",
+      "name": "a#17",
+      "event": {
+        "key": "a",
+        "action": 0,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "plain",
+      "name": "a#18",
+      "event": {
+        "key": "a",
+        "action": 2,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "plain",
+      "name": "space#19",
+      "event": {
+        "key": "space",
+        "action": 1,
+        "mods": 0,
+        "text": " "
+      },
+      "out_hex": "20"
+    },
+    {
+      "mode": "plain",
+      "name": "digit5#20",
+      "event": {
+        "key": "digit5",
+        "action": 1,
+        "mods": 0,
+        "text": "5"
+      },
+      "out_hex": "35"
+    },
+    {
+      "mode": "plain",
+      "name": "backquote#21",
+      "event": {
+        "key": "backquote",
+        "action": 1,
+        "mods": 0,
+        "text": "`"
+      },
+      "out_hex": "60"
+    },
+    {
+      "mode": "plain",
+      "name": "bracket_left#22",
+      "event": {
+        "key": "bracket_left",
+        "action": 1,
+        "mods": 0,
+        "text": "["
+      },
+      "out_hex": "5b"
+    },
+    {
+      "mode": "plain",
+      "name": "z#23",
+      "event": {
+        "key": "z",
+        "action": 1,
+        "mods": 0,
+        "text": "z"
+      },
+      "out_hex": "7a"
+    },
+    {
+      "mode": "plain",
+      "name": "z#24",
+      "event": {
+        "key": "z",
+        "action": 1,
+        "mods": 1,
+        "text": "Z"
+      },
+      "out_hex": "5a"
+    },
+    {
+      "mode": "plain",
+      "name": "c#25",
+      "event": {
+        "key": "c",
+        "action": 1,
+        "mods": 2,
+        "text": "c"
+      },
+      "out_hex": "03"
+    },
+    {
+      "mode": "plain",
+      "name": "i#26",
+      "event": {
+        "key": "i",
+        "action": 1,
+        "mods": 2,
+        "text": "i"
+      },
+      "out_hex": "1b5b3130353b3575"
+    },
+    {
+      "mode": "plain",
+      "name": "m#27",
+      "event": {
+        "key": "m",
+        "action": 1,
+        "mods": 2,
+        "text": "m"
+      },
+      "out_hex": "1b5b3130393b3575"
+    },
+    {
+      "mode": "plain",
+      "name": "bracket_left#28",
+      "event": {
+        "key": "bracket_left",
+        "action": 1,
+        "mods": 2,
+        "text": "["
+      },
+      "out_hex": "1b5b39313b3575"
+    },
+    {
+      "mode": "plain",
+      "name": "space#29",
+      "event": {
+        "key": "space",
+        "action": 1,
+        "mods": 2,
+        "text": " "
+      },
+      "out_hex": "00"
+    },
+    {
+      "mode": "plain",
+      "name": "backquote#30",
+      "event": {
+        "key": "backquote",
+        "action": 1,
+        "mods": 2,
+        "text": "`"
+      },
+      "out_hex": "1b5b39363b3575"
+    },
+    {
+      "mode": "plain",
+      "name": "a#31",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0,
+        "text": "a",
+        "composing": true
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "plain",
+      "name": "a#32",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "plain",
+      "name": "escape#33",
+      "event": {
+        "key": "escape",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b"
+    },
+    {
+      "mode": "decckm",
+      "name": "a#00",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "decckm",
+      "name": "a#01",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 2,
+        "text": "\u0001"
+      },
+      "out_hex": "1b5b313b3575"
+    },
+    {
+      "mode": "decckm",
+      "name": "a#02",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 1,
+        "text": "A"
+      },
+      "out_hex": "41"
+    },
+    {
+      "mode": "decckm",
+      "name": "a#03",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 4,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "decckm",
+      "name": "a#04",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 6,
+        "text": "\u0001"
+      },
+      "out_hex": "1b5b313b3775"
+    },
+    {
+      "mode": "decckm",
+      "name": "enter#05",
+      "event": {
+        "key": "enter",
+        "action": 1,
+        "mods": 0,
+        "text": "\r"
+      },
+      "out_hex": "0d"
+    },
+    {
+      "mode": "decckm",
+      "name": "tab#06",
+      "event": {
+        "key": "tab",
+        "action": 1,
+        "mods": 0,
+        "text": "\t"
+      },
+      "out_hex": "09"
+    },
+    {
+      "mode": "decckm",
+      "name": "backspace#07",
+      "event": {
+        "key": "backspace",
+        "action": 1,
+        "mods": 0,
+        "text": ""
+      },
+      "out_hex": "7f"
+    },
+    {
+      "mode": "decckm",
+      "name": "escape#08",
+      "event": {
+        "key": "escape",
+        "action": 1,
+        "mods": 0,
+        "text": "\u001b"
+      },
+      "out_hex": "1b"
+    },
+    {
+      "mode": "decckm",
+      "name": "arrow_up#09",
+      "event": {
+        "key": "arrow_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b4f41"
+    },
+    {
+      "mode": "decckm",
+      "name": "arrow_left#10",
+      "event": {
+        "key": "arrow_left",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b313b3544"
+    },
+    {
+      "mode": "decckm",
+      "name": "arrow_right#11",
+      "event": {
+        "key": "arrow_right",
+        "action": 1,
+        "mods": 1
+      },
+      "out_hex": "1b5b313b3243"
+    },
+    {
+      "mode": "decckm",
+      "name": "f1#12",
+      "event": {
+        "key": "f1",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b4f50"
+    },
+    {
+      "mode": "decckm",
+      "name": "f5#13",
+      "event": {
+        "key": "f5",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b31353b357e"
+    },
+    {
+      "mode": "decckm",
+      "name": "delete#14",
+      "event": {
+        "key": "delete",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b337e"
+    },
+    {
+      "mode": "decckm",
+      "name": "home#15",
+      "event": {
+        "key": "home",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b4f48"
+    },
+    {
+      "mode": "decckm",
+      "name": "page_up#16",
+      "event": {
+        "key": "page_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b357e"
+    },
+    {
+      "mode": "decckm",
+      "name": "a#17",
+      "event": {
+        "key": "a",
+        "action": 0,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "decckm",
+      "name": "a#18",
+      "event": {
+        "key": "a",
+        "action": 2,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "deckpam",
+      "name": "a#00",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "deckpam",
+      "name": "a#01",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 2,
+        "text": "\u0001"
+      },
+      "out_hex": "1b5b313b3575"
+    },
+    {
+      "mode": "deckpam",
+      "name": "a#02",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 1,
+        "text": "A"
+      },
+      "out_hex": "41"
+    },
+    {
+      "mode": "deckpam",
+      "name": "a#03",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 4,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "deckpam",
+      "name": "a#04",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 6,
+        "text": "\u0001"
+      },
+      "out_hex": "1b5b313b3775"
+    },
+    {
+      "mode": "deckpam",
+      "name": "enter#05",
+      "event": {
+        "key": "enter",
+        "action": 1,
+        "mods": 0,
+        "text": "\r"
+      },
+      "out_hex": "0d"
+    },
+    {
+      "mode": "deckpam",
+      "name": "tab#06",
+      "event": {
+        "key": "tab",
+        "action": 1,
+        "mods": 0,
+        "text": "\t"
+      },
+      "out_hex": "09"
+    },
+    {
+      "mode": "deckpam",
+      "name": "backspace#07",
+      "event": {
+        "key": "backspace",
+        "action": 1,
+        "mods": 0,
+        "text": ""
+      },
+      "out_hex": "7f"
+    },
+    {
+      "mode": "deckpam",
+      "name": "escape#08",
+      "event": {
+        "key": "escape",
+        "action": 1,
+        "mods": 0,
+        "text": "\u001b"
+      },
+      "out_hex": "1b"
+    },
+    {
+      "mode": "deckpam",
+      "name": "arrow_up#09",
+      "event": {
+        "key": "arrow_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b41"
+    },
+    {
+      "mode": "deckpam",
+      "name": "arrow_left#10",
+      "event": {
+        "key": "arrow_left",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b313b3544"
+    },
+    {
+      "mode": "deckpam",
+      "name": "arrow_right#11",
+      "event": {
+        "key": "arrow_right",
+        "action": 1,
+        "mods": 1
+      },
+      "out_hex": "1b5b313b3243"
+    },
+    {
+      "mode": "deckpam",
+      "name": "f1#12",
+      "event": {
+        "key": "f1",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b4f50"
+    },
+    {
+      "mode": "deckpam",
+      "name": "f5#13",
+      "event": {
+        "key": "f5",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b31353b357e"
+    },
+    {
+      "mode": "deckpam",
+      "name": "delete#14",
+      "event": {
+        "key": "delete",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b337e"
+    },
+    {
+      "mode": "deckpam",
+      "name": "home#15",
+      "event": {
+        "key": "home",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b48"
+    },
+    {
+      "mode": "deckpam",
+      "name": "page_up#16",
+      "event": {
+        "key": "page_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b357e"
+    },
+    {
+      "mode": "deckpam",
+      "name": "a#17",
+      "event": {
+        "key": "a",
+        "action": 0,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "deckpam",
+      "name": "a#18",
+      "event": {
+        "key": "a",
+        "action": 2,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "deckpam",
+      "name": "numpad0#19",
+      "event": {
+        "key": "numpad0",
+        "action": 1,
+        "mods": 0,
+        "text": "0"
+      },
+      "out_hex": "30"
+    },
+    {
+      "mode": "deckpam",
+      "name": "numpad1#20",
+      "event": {
+        "key": "numpad1",
+        "action": 1,
+        "mods": 0,
+        "text": "1"
+      },
+      "out_hex": "31"
+    },
+    {
+      "mode": "deckpam",
+      "name": "numpad_enter#21",
+      "event": {
+        "key": "numpad_enter",
+        "action": 1,
+        "mods": 0,
+        "text": "\r"
+      },
+      "out_hex": "0d"
+    },
+    {
+      "mode": "deckpam",
+      "name": "numpad_add#22",
+      "event": {
+        "key": "numpad_add",
+        "action": 1,
+        "mods": 0,
+        "text": "+"
+      },
+      "out_hex": "2b"
+    },
+    {
+      "mode": "mok2",
+      "name": "a#00",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "mok2",
+      "name": "a#01",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 2,
+        "text": "\u0001"
+      },
+      "out_hex": "1b5b32373b353b317e"
+    },
+    {
+      "mode": "mok2",
+      "name": "a#02",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 1,
+        "text": "A"
+      },
+      "out_hex": "1b5b32373b323b36357e"
+    },
+    {
+      "mode": "mok2",
+      "name": "a#03",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 4,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "mok2",
+      "name": "a#04",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 6,
+        "text": "\u0001"
+      },
+      "out_hex": "1b5b32373b353b317e"
+    },
+    {
+      "mode": "mok2",
+      "name": "enter#05",
+      "event": {
+        "key": "enter",
+        "action": 1,
+        "mods": 0,
+        "text": "\r"
+      },
+      "out_hex": "0d"
+    },
+    {
+      "mode": "mok2",
+      "name": "tab#06",
+      "event": {
+        "key": "tab",
+        "action": 1,
+        "mods": 0,
+        "text": "\t"
+      },
+      "out_hex": "09"
+    },
+    {
+      "mode": "mok2",
+      "name": "backspace#07",
+      "event": {
+        "key": "backspace",
+        "action": 1,
+        "mods": 0,
+        "text": ""
+      },
+      "out_hex": "7f"
+    },
+    {
+      "mode": "mok2",
+      "name": "escape#08",
+      "event": {
+        "key": "escape",
+        "action": 1,
+        "mods": 0,
+        "text": "\u001b"
+      },
+      "out_hex": "1b"
+    },
+    {
+      "mode": "mok2",
+      "name": "arrow_up#09",
+      "event": {
+        "key": "arrow_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b41"
+    },
+    {
+      "mode": "mok2",
+      "name": "arrow_left#10",
+      "event": {
+        "key": "arrow_left",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b313b3544"
+    },
+    {
+      "mode": "mok2",
+      "name": "arrow_right#11",
+      "event": {
+        "key": "arrow_right",
+        "action": 1,
+        "mods": 1
+      },
+      "out_hex": "1b5b313b3243"
+    },
+    {
+      "mode": "mok2",
+      "name": "f1#12",
+      "event": {
+        "key": "f1",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b4f50"
+    },
+    {
+      "mode": "mok2",
+      "name": "f5#13",
+      "event": {
+        "key": "f5",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b31353b357e"
+    },
+    {
+      "mode": "mok2",
+      "name": "delete#14",
+      "event": {
+        "key": "delete",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b337e"
+    },
+    {
+      "mode": "mok2",
+      "name": "home#15",
+      "event": {
+        "key": "home",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b48"
+    },
+    {
+      "mode": "mok2",
+      "name": "page_up#16",
+      "event": {
+        "key": "page_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b357e"
+    },
+    {
+      "mode": "mok2",
+      "name": "a#17",
+      "event": {
+        "key": "a",
+        "action": 0,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "mok2",
+      "name": "a#18",
+      "event": {
+        "key": "a",
+        "action": 2,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "mok2",
+      "name": "a#19",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 3,
+        "text": "\u0001"
+      },
+      "out_hex": "1b5b32373b363b317e"
+    },
+    {
+      "mode": "mok2",
+      "name": "space#20",
+      "event": {
+        "key": "space",
+        "action": 1,
+        "mods": 1,
+        "text": " "
+      },
+      "out_hex": "1b5b32373b323b33327e"
+    },
+    {
+      "mode": "mok2",
+      "name": "backquote#21",
+      "event": {
+        "key": "backquote",
+        "action": 1,
+        "mods": 2,
+        "text": "`"
+      },
+      "out_hex": "1b5b32373b353b39367e"
+    },
+    {
+      "mode": "mok2",
+      "name": "comma#22",
+      "event": {
+        "key": "comma",
+        "action": 1,
+        "mods": 2,
+        "text": ","
+      },
+      "out_hex": "1b5b32373b353b34347e"
+    },
+    {
+      "mode": "kitty1",
+      "name": "a#00",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty1",
+      "name": "a#01",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 2,
+        "text": "\u0001"
+      },
+      "out_hex": "01"
+    },
+    {
+      "mode": "kitty1",
+      "name": "a#02",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 1,
+        "text": "A"
+      },
+      "out_hex": "41"
+    },
+    {
+      "mode": "kitty1",
+      "name": "a#03",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 4,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty1",
+      "name": "a#04",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 6,
+        "text": "\u0001"
+      },
+      "out_hex": "01"
+    },
+    {
+      "mode": "kitty1",
+      "name": "enter#05",
+      "event": {
+        "key": "enter",
+        "action": 1,
+        "mods": 0,
+        "text": "\r"
+      },
+      "out_hex": "0d"
+    },
+    {
+      "mode": "kitty1",
+      "name": "tab#06",
+      "event": {
+        "key": "tab",
+        "action": 1,
+        "mods": 0,
+        "text": "\t"
+      },
+      "out_hex": "09"
+    },
+    {
+      "mode": "kitty1",
+      "name": "backspace#07",
+      "event": {
+        "key": "backspace",
+        "action": 1,
+        "mods": 0,
+        "text": ""
+      },
+      "out_hex": "7f"
+    },
+    {
+      "mode": "kitty1",
+      "name": "escape#08",
+      "event": {
+        "key": "escape",
+        "action": 1,
+        "mods": 0,
+        "text": "\u001b"
+      },
+      "out_hex": "1b5b323775"
+    },
+    {
+      "mode": "kitty1",
+      "name": "arrow_up#09",
+      "event": {
+        "key": "arrow_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b41"
+    },
+    {
+      "mode": "kitty1",
+      "name": "arrow_left#10",
+      "event": {
+        "key": "arrow_left",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b313b3544"
+    },
+    {
+      "mode": "kitty1",
+      "name": "arrow_right#11",
+      "event": {
+        "key": "arrow_right",
+        "action": 1,
+        "mods": 1
+      },
+      "out_hex": "1b5b313b3243"
+    },
+    {
+      "mode": "kitty1",
+      "name": "f1#12",
+      "event": {
+        "key": "f1",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b50"
+    },
+    {
+      "mode": "kitty1",
+      "name": "f5#13",
+      "event": {
+        "key": "f5",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b31353b357e"
+    },
+    {
+      "mode": "kitty1",
+      "name": "delete#14",
+      "event": {
+        "key": "delete",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b337e"
+    },
+    {
+      "mode": "kitty1",
+      "name": "home#15",
+      "event": {
+        "key": "home",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b48"
+    },
+    {
+      "mode": "kitty1",
+      "name": "page_up#16",
+      "event": {
+        "key": "page_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b357e"
+    },
+    {
+      "mode": "kitty1",
+      "name": "a#17",
+      "event": {
+        "key": "a",
+        "action": 0,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty1",
+      "name": "a#18",
+      "event": {
+        "key": "a",
+        "action": 2,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty1",
+      "name": "shift_left#19",
+      "event": {
+        "key": "shift_left",
+        "action": 1,
+        "mods": 1
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty1",
+      "name": "ctrl_left#20",
+      "event": {
+        "key": "ctrl_left",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty1",
+      "name": "alt_left#21",
+      "event": {
+        "key": "alt_left",
+        "action": 1,
+        "mods": 4
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty1",
+      "name": "a#22",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 8,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty1",
+      "name": "enter#23",
+      "event": {
+        "key": "enter",
+        "action": 1,
+        "mods": 2,
+        "text": "\r"
+      },
+      "out_hex": "1b5b31333b3575"
+    },
+    {
+      "mode": "kitty1",
+      "name": "enter#24",
+      "event": {
+        "key": "enter",
+        "action": 0,
+        "mods": 0,
+        "text": "\r"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty1",
+      "name": "backspace#25",
+      "event": {
+        "key": "backspace",
+        "action": 1,
+        "mods": 0,
+        "text": "xx"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty1",
+      "name": "a#26",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0,
+        "text": "ä"
+      },
+      "out_hex": "c3a4"
+    },
+    {
+      "mode": "kitty1",
+      "name": "numpad_enter#27",
+      "event": {
+        "key": "numpad_enter",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b353734313475"
+    },
+    {
+      "mode": "kitty1",
+      "name": "numpad1#28",
+      "event": {
+        "key": "numpad1",
+        "action": 1,
+        "mods": 0,
+        "text": "1"
+      },
+      "out_hex": "31"
+    },
+    {
+      "mode": "kitty2",
+      "name": "a#00",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty2",
+      "name": "a#01",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 2,
+        "text": "\u0001"
+      },
+      "out_hex": "01"
+    },
+    {
+      "mode": "kitty2",
+      "name": "a#02",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 1,
+        "text": "A"
+      },
+      "out_hex": "41"
+    },
+    {
+      "mode": "kitty2",
+      "name": "a#03",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 4,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty2",
+      "name": "a#04",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 6,
+        "text": "\u0001"
+      },
+      "out_hex": "01"
+    },
+    {
+      "mode": "kitty2",
+      "name": "enter#05",
+      "event": {
+        "key": "enter",
+        "action": 1,
+        "mods": 0,
+        "text": "\r"
+      },
+      "out_hex": "0d"
+    },
+    {
+      "mode": "kitty2",
+      "name": "tab#06",
+      "event": {
+        "key": "tab",
+        "action": 1,
+        "mods": 0,
+        "text": "\t"
+      },
+      "out_hex": "09"
+    },
+    {
+      "mode": "kitty2",
+      "name": "backspace#07",
+      "event": {
+        "key": "backspace",
+        "action": 1,
+        "mods": 0,
+        "text": ""
+      },
+      "out_hex": "7f"
+    },
+    {
+      "mode": "kitty2",
+      "name": "escape#08",
+      "event": {
+        "key": "escape",
+        "action": 1,
+        "mods": 0,
+        "text": "\u001b"
+      },
+      "out_hex": "1b5b323775"
+    },
+    {
+      "mode": "kitty2",
+      "name": "arrow_up#09",
+      "event": {
+        "key": "arrow_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b313b313a3141"
+    },
+    {
+      "mode": "kitty2",
+      "name": "arrow_left#10",
+      "event": {
+        "key": "arrow_left",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b313b353a3144"
+    },
+    {
+      "mode": "kitty2",
+      "name": "arrow_right#11",
+      "event": {
+        "key": "arrow_right",
+        "action": 1,
+        "mods": 1
+      },
+      "out_hex": "1b5b313b323a3143"
+    },
+    {
+      "mode": "kitty2",
+      "name": "f1#12",
+      "event": {
+        "key": "f1",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b313b313a3150"
+    },
+    {
+      "mode": "kitty2",
+      "name": "f5#13",
+      "event": {
+        "key": "f5",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b31353b357e"
+    },
+    {
+      "mode": "kitty2",
+      "name": "delete#14",
+      "event": {
+        "key": "delete",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b337e"
+    },
+    {
+      "mode": "kitty2",
+      "name": "home#15",
+      "event": {
+        "key": "home",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b313b313a3148"
+    },
+    {
+      "mode": "kitty2",
+      "name": "page_up#16",
+      "event": {
+        "key": "page_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b357e"
+    },
+    {
+      "mode": "kitty2",
+      "name": "a#17",
+      "event": {
+        "key": "a",
+        "action": 0,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty2",
+      "name": "a#18",
+      "event": {
+        "key": "a",
+        "action": 2,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty2",
+      "name": "shift_left#19",
+      "event": {
+        "key": "shift_left",
+        "action": 1,
+        "mods": 1
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty2",
+      "name": "ctrl_left#20",
+      "event": {
+        "key": "ctrl_left",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty2",
+      "name": "alt_left#21",
+      "event": {
+        "key": "alt_left",
+        "action": 1,
+        "mods": 4
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty2",
+      "name": "a#22",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 8,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty2",
+      "name": "enter#23",
+      "event": {
+        "key": "enter",
+        "action": 1,
+        "mods": 2,
+        "text": "\r"
+      },
+      "out_hex": "1b5b31333b3575"
+    },
+    {
+      "mode": "kitty2",
+      "name": "enter#24",
+      "event": {
+        "key": "enter",
+        "action": 0,
+        "mods": 0,
+        "text": "\r"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty2",
+      "name": "backspace#25",
+      "event": {
+        "key": "backspace",
+        "action": 1,
+        "mods": 0,
+        "text": "xx"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty2",
+      "name": "a#26",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0,
+        "text": "ä"
+      },
+      "out_hex": "c3a4"
+    },
+    {
+      "mode": "kitty2",
+      "name": "numpad_enter#27",
+      "event": {
+        "key": "numpad_enter",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b353734313475"
+    },
+    {
+      "mode": "kitty2",
+      "name": "numpad1#28",
+      "event": {
+        "key": "numpad1",
+        "action": 1,
+        "mods": 0,
+        "text": "1"
+      },
+      "out_hex": "31"
+    },
+    {
+      "mode": "kitty4",
+      "name": "a#00",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty4",
+      "name": "a#01",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 2,
+        "text": "\u0001"
+      },
+      "out_hex": "01"
+    },
+    {
+      "mode": "kitty4",
+      "name": "a#02",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 1,
+        "text": "A"
+      },
+      "out_hex": "41"
+    },
+    {
+      "mode": "kitty4",
+      "name": "a#03",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 4,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty4",
+      "name": "a#04",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 6,
+        "text": "\u0001"
+      },
+      "out_hex": "01"
+    },
+    {
+      "mode": "kitty4",
+      "name": "enter#05",
+      "event": {
+        "key": "enter",
+        "action": 1,
+        "mods": 0,
+        "text": "\r"
+      },
+      "out_hex": "0d"
+    },
+    {
+      "mode": "kitty4",
+      "name": "tab#06",
+      "event": {
+        "key": "tab",
+        "action": 1,
+        "mods": 0,
+        "text": "\t"
+      },
+      "out_hex": "09"
+    },
+    {
+      "mode": "kitty4",
+      "name": "backspace#07",
+      "event": {
+        "key": "backspace",
+        "action": 1,
+        "mods": 0,
+        "text": ""
+      },
+      "out_hex": "7f"
+    },
+    {
+      "mode": "kitty4",
+      "name": "escape#08",
+      "event": {
+        "key": "escape",
+        "action": 1,
+        "mods": 0,
+        "text": "\u001b"
+      },
+      "out_hex": "1b5b323775"
+    },
+    {
+      "mode": "kitty4",
+      "name": "arrow_up#09",
+      "event": {
+        "key": "arrow_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b41"
+    },
+    {
+      "mode": "kitty4",
+      "name": "arrow_left#10",
+      "event": {
+        "key": "arrow_left",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b313b3544"
+    },
+    {
+      "mode": "kitty4",
+      "name": "arrow_right#11",
+      "event": {
+        "key": "arrow_right",
+        "action": 1,
+        "mods": 1
+      },
+      "out_hex": "1b5b313b3243"
+    },
+    {
+      "mode": "kitty4",
+      "name": "f1#12",
+      "event": {
+        "key": "f1",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b50"
+    },
+    {
+      "mode": "kitty4",
+      "name": "f5#13",
+      "event": {
+        "key": "f5",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b31353b357e"
+    },
+    {
+      "mode": "kitty4",
+      "name": "delete#14",
+      "event": {
+        "key": "delete",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b337e"
+    },
+    {
+      "mode": "kitty4",
+      "name": "home#15",
+      "event": {
+        "key": "home",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b48"
+    },
+    {
+      "mode": "kitty4",
+      "name": "page_up#16",
+      "event": {
+        "key": "page_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b357e"
+    },
+    {
+      "mode": "kitty4",
+      "name": "a#17",
+      "event": {
+        "key": "a",
+        "action": 0,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty4",
+      "name": "a#18",
+      "event": {
+        "key": "a",
+        "action": 2,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty8",
+      "name": "a#00",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty8",
+      "name": "a#01",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 2,
+        "text": "\u0001"
+      },
+      "out_hex": "01"
+    },
+    {
+      "mode": "kitty8",
+      "name": "a#02",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 1,
+        "text": "A"
+      },
+      "out_hex": "41"
+    },
+    {
+      "mode": "kitty8",
+      "name": "a#03",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 4,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty8",
+      "name": "a#04",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 6,
+        "text": "\u0001"
+      },
+      "out_hex": "01"
+    },
+    {
+      "mode": "kitty8",
+      "name": "enter#05",
+      "event": {
+        "key": "enter",
+        "action": 1,
+        "mods": 0,
+        "text": "\r"
+      },
+      "out_hex": "1b5b313375"
+    },
+    {
+      "mode": "kitty8",
+      "name": "tab#06",
+      "event": {
+        "key": "tab",
+        "action": 1,
+        "mods": 0,
+        "text": "\t"
+      },
+      "out_hex": "1b5b3975"
+    },
+    {
+      "mode": "kitty8",
+      "name": "backspace#07",
+      "event": {
+        "key": "backspace",
+        "action": 1,
+        "mods": 0,
+        "text": ""
+      },
+      "out_hex": "1b5b31323775"
+    },
+    {
+      "mode": "kitty8",
+      "name": "escape#08",
+      "event": {
+        "key": "escape",
+        "action": 1,
+        "mods": 0,
+        "text": "\u001b"
+      },
+      "out_hex": "1b5b323775"
+    },
+    {
+      "mode": "kitty8",
+      "name": "arrow_up#09",
+      "event": {
+        "key": "arrow_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b41"
+    },
+    {
+      "mode": "kitty8",
+      "name": "arrow_left#10",
+      "event": {
+        "key": "arrow_left",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b313b3544"
+    },
+    {
+      "mode": "kitty8",
+      "name": "arrow_right#11",
+      "event": {
+        "key": "arrow_right",
+        "action": 1,
+        "mods": 1
+      },
+      "out_hex": "1b5b313b3243"
+    },
+    {
+      "mode": "kitty8",
+      "name": "f1#12",
+      "event": {
+        "key": "f1",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b50"
+    },
+    {
+      "mode": "kitty8",
+      "name": "f5#13",
+      "event": {
+        "key": "f5",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b31353b357e"
+    },
+    {
+      "mode": "kitty8",
+      "name": "delete#14",
+      "event": {
+        "key": "delete",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b337e"
+    },
+    {
+      "mode": "kitty8",
+      "name": "home#15",
+      "event": {
+        "key": "home",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b48"
+    },
+    {
+      "mode": "kitty8",
+      "name": "page_up#16",
+      "event": {
+        "key": "page_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b357e"
+    },
+    {
+      "mode": "kitty8",
+      "name": "a#17",
+      "event": {
+        "key": "a",
+        "action": 0,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty8",
+      "name": "a#18",
+      "event": {
+        "key": "a",
+        "action": 2,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty8",
+      "name": "shift_left#19",
+      "event": {
+        "key": "shift_left",
+        "action": 1,
+        "mods": 1
+      },
+      "out_hex": "1b5b35373434313b3275"
+    },
+    {
+      "mode": "kitty8",
+      "name": "ctrl_left#20",
+      "event": {
+        "key": "ctrl_left",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b35373434323b3575"
+    },
+    {
+      "mode": "kitty8",
+      "name": "alt_left#21",
+      "event": {
+        "key": "alt_left",
+        "action": 1,
+        "mods": 4
+      },
+      "out_hex": "1b5b35373434333b3375"
+    },
+    {
+      "mode": "kitty8",
+      "name": "a#22",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 8,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty8",
+      "name": "enter#23",
+      "event": {
+        "key": "enter",
+        "action": 1,
+        "mods": 2,
+        "text": "\r"
+      },
+      "out_hex": "1b5b31333b3575"
+    },
+    {
+      "mode": "kitty8",
+      "name": "enter#24",
+      "event": {
+        "key": "enter",
+        "action": 0,
+        "mods": 0,
+        "text": "\r"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty8",
+      "name": "backspace#25",
+      "event": {
+        "key": "backspace",
+        "action": 1,
+        "mods": 0,
+        "text": "xx"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty8",
+      "name": "a#26",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0,
+        "text": "ä"
+      },
+      "out_hex": "c3a4"
+    },
+    {
+      "mode": "kitty8",
+      "name": "numpad_enter#27",
+      "event": {
+        "key": "numpad_enter",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b353734313475"
+    },
+    {
+      "mode": "kitty8",
+      "name": "numpad1#28",
+      "event": {
+        "key": "numpad1",
+        "action": 1,
+        "mods": 0,
+        "text": "1"
+      },
+      "out_hex": "1b5b353734303075"
+    },
+    {
+      "mode": "kitty16",
+      "name": "a#00",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty16",
+      "name": "a#01",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 2,
+        "text": "\u0001"
+      },
+      "out_hex": "01"
+    },
+    {
+      "mode": "kitty16",
+      "name": "a#02",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 1,
+        "text": "A"
+      },
+      "out_hex": "41"
+    },
+    {
+      "mode": "kitty16",
+      "name": "a#03",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 4,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty16",
+      "name": "a#04",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 6,
+        "text": "\u0001"
+      },
+      "out_hex": "01"
+    },
+    {
+      "mode": "kitty16",
+      "name": "enter#05",
+      "event": {
+        "key": "enter",
+        "action": 1,
+        "mods": 0,
+        "text": "\r"
+      },
+      "out_hex": "0d"
+    },
+    {
+      "mode": "kitty16",
+      "name": "tab#06",
+      "event": {
+        "key": "tab",
+        "action": 1,
+        "mods": 0,
+        "text": "\t"
+      },
+      "out_hex": "09"
+    },
+    {
+      "mode": "kitty16",
+      "name": "backspace#07",
+      "event": {
+        "key": "backspace",
+        "action": 1,
+        "mods": 0,
+        "text": ""
+      },
+      "out_hex": "7f"
+    },
+    {
+      "mode": "kitty16",
+      "name": "escape#08",
+      "event": {
+        "key": "escape",
+        "action": 1,
+        "mods": 0,
+        "text": "\u001b"
+      },
+      "out_hex": "1b5b323775"
+    },
+    {
+      "mode": "kitty16",
+      "name": "arrow_up#09",
+      "event": {
+        "key": "arrow_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b41"
+    },
+    {
+      "mode": "kitty16",
+      "name": "arrow_left#10",
+      "event": {
+        "key": "arrow_left",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b313b3544"
+    },
+    {
+      "mode": "kitty16",
+      "name": "arrow_right#11",
+      "event": {
+        "key": "arrow_right",
+        "action": 1,
+        "mods": 1
+      },
+      "out_hex": "1b5b313b3243"
+    },
+    {
+      "mode": "kitty16",
+      "name": "f1#12",
+      "event": {
+        "key": "f1",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b50"
+    },
+    {
+      "mode": "kitty16",
+      "name": "f5#13",
+      "event": {
+        "key": "f5",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b31353b357e"
+    },
+    {
+      "mode": "kitty16",
+      "name": "delete#14",
+      "event": {
+        "key": "delete",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b337e"
+    },
+    {
+      "mode": "kitty16",
+      "name": "home#15",
+      "event": {
+        "key": "home",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b48"
+    },
+    {
+      "mode": "kitty16",
+      "name": "page_up#16",
+      "event": {
+        "key": "page_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b357e"
+    },
+    {
+      "mode": "kitty16",
+      "name": "a#17",
+      "event": {
+        "key": "a",
+        "action": 0,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty16",
+      "name": "a#18",
+      "event": {
+        "key": "a",
+        "action": 2,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty16",
+      "name": "shift_left#19",
+      "event": {
+        "key": "shift_left",
+        "action": 1,
+        "mods": 1
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty16",
+      "name": "ctrl_left#20",
+      "event": {
+        "key": "ctrl_left",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty16",
+      "name": "alt_left#21",
+      "event": {
+        "key": "alt_left",
+        "action": 1,
+        "mods": 4
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty16",
+      "name": "a#22",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 8,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty16",
+      "name": "enter#23",
+      "event": {
+        "key": "enter",
+        "action": 1,
+        "mods": 2,
+        "text": "\r"
+      },
+      "out_hex": "1b5b31333b3575"
+    },
+    {
+      "mode": "kitty16",
+      "name": "enter#24",
+      "event": {
+        "key": "enter",
+        "action": 0,
+        "mods": 0,
+        "text": "\r"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty16",
+      "name": "backspace#25",
+      "event": {
+        "key": "backspace",
+        "action": 1,
+        "mods": 0,
+        "text": "xx"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty16",
+      "name": "a#26",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0,
+        "text": "ä"
+      },
+      "out_hex": "c3a4"
+    },
+    {
+      "mode": "kitty16",
+      "name": "numpad_enter#27",
+      "event": {
+        "key": "numpad_enter",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b353734313475"
+    },
+    {
+      "mode": "kitty16",
+      "name": "numpad1#28",
+      "event": {
+        "key": "numpad1",
+        "action": 1,
+        "mods": 0,
+        "text": "1"
+      },
+      "out_hex": "31"
+    },
+    {
+      "mode": "kitty5",
+      "name": "a#00",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty5",
+      "name": "a#01",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 2,
+        "text": "\u0001"
+      },
+      "out_hex": "01"
+    },
+    {
+      "mode": "kitty5",
+      "name": "a#02",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 1,
+        "text": "A"
+      },
+      "out_hex": "41"
+    },
+    {
+      "mode": "kitty5",
+      "name": "a#03",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 4,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty5",
+      "name": "a#04",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 6,
+        "text": "\u0001"
+      },
+      "out_hex": "01"
+    },
+    {
+      "mode": "kitty5",
+      "name": "enter#05",
+      "event": {
+        "key": "enter",
+        "action": 1,
+        "mods": 0,
+        "text": "\r"
+      },
+      "out_hex": "0d"
+    },
+    {
+      "mode": "kitty5",
+      "name": "tab#06",
+      "event": {
+        "key": "tab",
+        "action": 1,
+        "mods": 0,
+        "text": "\t"
+      },
+      "out_hex": "09"
+    },
+    {
+      "mode": "kitty5",
+      "name": "backspace#07",
+      "event": {
+        "key": "backspace",
+        "action": 1,
+        "mods": 0,
+        "text": ""
+      },
+      "out_hex": "7f"
+    },
+    {
+      "mode": "kitty5",
+      "name": "escape#08",
+      "event": {
+        "key": "escape",
+        "action": 1,
+        "mods": 0,
+        "text": "\u001b"
+      },
+      "out_hex": "1b5b323775"
+    },
+    {
+      "mode": "kitty5",
+      "name": "arrow_up#09",
+      "event": {
+        "key": "arrow_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b41"
+    },
+    {
+      "mode": "kitty5",
+      "name": "arrow_left#10",
+      "event": {
+        "key": "arrow_left",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b313b3544"
+    },
+    {
+      "mode": "kitty5",
+      "name": "arrow_right#11",
+      "event": {
+        "key": "arrow_right",
+        "action": 1,
+        "mods": 1
+      },
+      "out_hex": "1b5b313b3243"
+    },
+    {
+      "mode": "kitty5",
+      "name": "f1#12",
+      "event": {
+        "key": "f1",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b50"
+    },
+    {
+      "mode": "kitty5",
+      "name": "f5#13",
+      "event": {
+        "key": "f5",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b31353b357e"
+    },
+    {
+      "mode": "kitty5",
+      "name": "delete#14",
+      "event": {
+        "key": "delete",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b337e"
+    },
+    {
+      "mode": "kitty5",
+      "name": "home#15",
+      "event": {
+        "key": "home",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b48"
+    },
+    {
+      "mode": "kitty5",
+      "name": "page_up#16",
+      "event": {
+        "key": "page_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b357e"
+    },
+    {
+      "mode": "kitty5",
+      "name": "a#17",
+      "event": {
+        "key": "a",
+        "action": 0,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty5",
+      "name": "a#18",
+      "event": {
+        "key": "a",
+        "action": 2,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty15",
+      "name": "a#00",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty15",
+      "name": "a#01",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 2,
+        "text": "\u0001"
+      },
+      "out_hex": "01"
+    },
+    {
+      "mode": "kitty15",
+      "name": "a#02",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 1,
+        "text": "A"
+      },
+      "out_hex": "41"
+    },
+    {
+      "mode": "kitty15",
+      "name": "a#03",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 4,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty15",
+      "name": "a#04",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 6,
+        "text": "\u0001"
+      },
+      "out_hex": "01"
+    },
+    {
+      "mode": "kitty15",
+      "name": "enter#05",
+      "event": {
+        "key": "enter",
+        "action": 1,
+        "mods": 0,
+        "text": "\r"
+      },
+      "out_hex": "1b5b313375"
+    },
+    {
+      "mode": "kitty15",
+      "name": "tab#06",
+      "event": {
+        "key": "tab",
+        "action": 1,
+        "mods": 0,
+        "text": "\t"
+      },
+      "out_hex": "1b5b3975"
+    },
+    {
+      "mode": "kitty15",
+      "name": "backspace#07",
+      "event": {
+        "key": "backspace",
+        "action": 1,
+        "mods": 0,
+        "text": ""
+      },
+      "out_hex": "1b5b31323775"
+    },
+    {
+      "mode": "kitty15",
+      "name": "escape#08",
+      "event": {
+        "key": "escape",
+        "action": 1,
+        "mods": 0,
+        "text": "\u001b"
+      },
+      "out_hex": "1b5b323775"
+    },
+    {
+      "mode": "kitty15",
+      "name": "arrow_up#09",
+      "event": {
+        "key": "arrow_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b313b313a3141"
+    },
+    {
+      "mode": "kitty15",
+      "name": "arrow_left#10",
+      "event": {
+        "key": "arrow_left",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b313b353a3144"
+    },
+    {
+      "mode": "kitty15",
+      "name": "arrow_right#11",
+      "event": {
+        "key": "arrow_right",
+        "action": 1,
+        "mods": 1
+      },
+      "out_hex": "1b5b313b323a3143"
+    },
+    {
+      "mode": "kitty15",
+      "name": "f1#12",
+      "event": {
+        "key": "f1",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b313b313a3150"
+    },
+    {
+      "mode": "kitty15",
+      "name": "f5#13",
+      "event": {
+        "key": "f5",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b31353b357e"
+    },
+    {
+      "mode": "kitty15",
+      "name": "delete#14",
+      "event": {
+        "key": "delete",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b337e"
+    },
+    {
+      "mode": "kitty15",
+      "name": "home#15",
+      "event": {
+        "key": "home",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b313b313a3148"
+    },
+    {
+      "mode": "kitty15",
+      "name": "page_up#16",
+      "event": {
+        "key": "page_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b357e"
+    },
+    {
+      "mode": "kitty15",
+      "name": "a#17",
+      "event": {
+        "key": "a",
+        "action": 0,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty15",
+      "name": "a#18",
+      "event": {
+        "key": "a",
+        "action": 2,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty15",
+      "name": "shift_left#19",
+      "event": {
+        "key": "shift_left",
+        "action": 1,
+        "mods": 1
+      },
+      "out_hex": "1b5b35373434313b3275"
+    },
+    {
+      "mode": "kitty15",
+      "name": "ctrl_left#20",
+      "event": {
+        "key": "ctrl_left",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b35373434323b3575"
+    },
+    {
+      "mode": "kitty15",
+      "name": "alt_left#21",
+      "event": {
+        "key": "alt_left",
+        "action": 1,
+        "mods": 4
+      },
+      "out_hex": "1b5b35373434333b3375"
+    },
+    {
+      "mode": "kitty15",
+      "name": "a#22",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 8,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty15",
+      "name": "enter#23",
+      "event": {
+        "key": "enter",
+        "action": 1,
+        "mods": 2,
+        "text": "\r"
+      },
+      "out_hex": "1b5b31333b3575"
+    },
+    {
+      "mode": "kitty15",
+      "name": "enter#24",
+      "event": {
+        "key": "enter",
+        "action": 0,
+        "mods": 0,
+        "text": "\r"
+      },
+      "out_hex": "1b5b31333b313a3375"
+    },
+    {
+      "mode": "kitty15",
+      "name": "backspace#25",
+      "event": {
+        "key": "backspace",
+        "action": 1,
+        "mods": 0,
+        "text": "xx"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty15",
+      "name": "a#26",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0,
+        "text": "ä"
+      },
+      "out_hex": "c3a4"
+    },
+    {
+      "mode": "kitty15",
+      "name": "numpad_enter#27",
+      "event": {
+        "key": "numpad_enter",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b353734313475"
+    },
+    {
+      "mode": "kitty15",
+      "name": "numpad1#28",
+      "event": {
+        "key": "numpad1",
+        "action": 1,
+        "mods": 0,
+        "text": "1"
+      },
+      "out_hex": "1b5b353734303075"
+    },
+    {
+      "mode": "kitty31",
+      "name": "a#00",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty31",
+      "name": "a#01",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 2,
+        "text": "\u0001"
+      },
+      "out_hex": "01"
+    },
+    {
+      "mode": "kitty31",
+      "name": "a#02",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 1,
+        "text": "A"
+      },
+      "out_hex": "41"
+    },
+    {
+      "mode": "kitty31",
+      "name": "a#03",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 4,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty31",
+      "name": "a#04",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 6,
+        "text": "\u0001"
+      },
+      "out_hex": "01"
+    },
+    {
+      "mode": "kitty31",
+      "name": "enter#05",
+      "event": {
+        "key": "enter",
+        "action": 1,
+        "mods": 0,
+        "text": "\r"
+      },
+      "out_hex": "1b5b313375"
+    },
+    {
+      "mode": "kitty31",
+      "name": "tab#06",
+      "event": {
+        "key": "tab",
+        "action": 1,
+        "mods": 0,
+        "text": "\t"
+      },
+      "out_hex": "1b5b3975"
+    },
+    {
+      "mode": "kitty31",
+      "name": "backspace#07",
+      "event": {
+        "key": "backspace",
+        "action": 1,
+        "mods": 0,
+        "text": ""
+      },
+      "out_hex": "1b5b31323775"
+    },
+    {
+      "mode": "kitty31",
+      "name": "escape#08",
+      "event": {
+        "key": "escape",
+        "action": 1,
+        "mods": 0,
+        "text": "\u001b"
+      },
+      "out_hex": "1b5b323775"
+    },
+    {
+      "mode": "kitty31",
+      "name": "arrow_up#09",
+      "event": {
+        "key": "arrow_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b313b313a3141"
+    },
+    {
+      "mode": "kitty31",
+      "name": "arrow_left#10",
+      "event": {
+        "key": "arrow_left",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b313b353a3144"
+    },
+    {
+      "mode": "kitty31",
+      "name": "arrow_right#11",
+      "event": {
+        "key": "arrow_right",
+        "action": 1,
+        "mods": 1
+      },
+      "out_hex": "1b5b313b323a3143"
+    },
+    {
+      "mode": "kitty31",
+      "name": "f1#12",
+      "event": {
+        "key": "f1",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b313b313a3150"
+    },
+    {
+      "mode": "kitty31",
+      "name": "f5#13",
+      "event": {
+        "key": "f5",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b31353b357e"
+    },
+    {
+      "mode": "kitty31",
+      "name": "delete#14",
+      "event": {
+        "key": "delete",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b337e"
+    },
+    {
+      "mode": "kitty31",
+      "name": "home#15",
+      "event": {
+        "key": "home",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b313b313a3148"
+    },
+    {
+      "mode": "kitty31",
+      "name": "page_up#16",
+      "event": {
+        "key": "page_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b357e"
+    },
+    {
+      "mode": "kitty31",
+      "name": "a#17",
+      "event": {
+        "key": "a",
+        "action": 0,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty31",
+      "name": "a#18",
+      "event": {
+        "key": "a",
+        "action": 2,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty31",
+      "name": "shift_left#19",
+      "event": {
+        "key": "shift_left",
+        "action": 1,
+        "mods": 1
+      },
+      "out_hex": "1b5b35373434313b3275"
+    },
+    {
+      "mode": "kitty31",
+      "name": "ctrl_left#20",
+      "event": {
+        "key": "ctrl_left",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b35373434323b3575"
+    },
+    {
+      "mode": "kitty31",
+      "name": "alt_left#21",
+      "event": {
+        "key": "alt_left",
+        "action": 1,
+        "mods": 4
+      },
+      "out_hex": "1b5b35373434333b3375"
+    },
+    {
+      "mode": "kitty31",
+      "name": "a#22",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 8,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty31",
+      "name": "enter#23",
+      "event": {
+        "key": "enter",
+        "action": 1,
+        "mods": 2,
+        "text": "\r"
+      },
+      "out_hex": "1b5b31333b3575"
+    },
+    {
+      "mode": "kitty31",
+      "name": "enter#24",
+      "event": {
+        "key": "enter",
+        "action": 0,
+        "mods": 0,
+        "text": "\r"
+      },
+      "out_hex": "1b5b31333b313a3375"
+    },
+    {
+      "mode": "kitty31",
+      "name": "backspace#25",
+      "event": {
+        "key": "backspace",
+        "action": 1,
+        "mods": 0,
+        "text": "xx"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty31",
+      "name": "a#26",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0,
+        "text": "ä"
+      },
+      "out_hex": "c3a4"
+    },
+    {
+      "mode": "kitty31",
+      "name": "numpad_enter#27",
+      "event": {
+        "key": "numpad_enter",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b353734313475"
+    },
+    {
+      "mode": "kitty31",
+      "name": "numpad1#28",
+      "event": {
+        "key": "numpad1",
+        "action": 1,
+        "mods": 0,
+        "text": "1"
+      },
+      "out_hex": "1b5b35373430303b3b343975"
+    },
+    {
+      "mode": "kitty_131",
+      "name": "a#00",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty_131",
+      "name": "a#01",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 2,
+        "text": "\u0001"
+      },
+      "out_hex": "01"
+    },
+    {
+      "mode": "kitty_131",
+      "name": "a#02",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 1,
+        "text": "A"
+      },
+      "out_hex": "41"
+    },
+    {
+      "mode": "kitty_131",
+      "name": "a#03",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 4,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty_131",
+      "name": "a#04",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 6,
+        "text": "\u0001"
+      },
+      "out_hex": "01"
+    },
+    {
+      "mode": "kitty_131",
+      "name": "enter#05",
+      "event": {
+        "key": "enter",
+        "action": 1,
+        "mods": 0,
+        "text": "\r"
+      },
+      "out_hex": "1b5b313375"
+    },
+    {
+      "mode": "kitty_131",
+      "name": "tab#06",
+      "event": {
+        "key": "tab",
+        "action": 1,
+        "mods": 0,
+        "text": "\t"
+      },
+      "out_hex": "1b5b3975"
+    },
+    {
+      "mode": "kitty_131",
+      "name": "backspace#07",
+      "event": {
+        "key": "backspace",
+        "action": 1,
+        "mods": 0,
+        "text": ""
+      },
+      "out_hex": "1b5b31323775"
+    },
+    {
+      "mode": "kitty_131",
+      "name": "escape#08",
+      "event": {
+        "key": "escape",
+        "action": 1,
+        "mods": 0,
+        "text": "\u001b"
+      },
+      "out_hex": "1b5b323775"
+    },
+    {
+      "mode": "kitty_131",
+      "name": "arrow_up#09",
+      "event": {
+        "key": "arrow_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b313b313a3141"
+    },
+    {
+      "mode": "kitty_131",
+      "name": "arrow_left#10",
+      "event": {
+        "key": "arrow_left",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b313b353a3144"
+    },
+    {
+      "mode": "kitty_131",
+      "name": "arrow_right#11",
+      "event": {
+        "key": "arrow_right",
+        "action": 1,
+        "mods": 1
+      },
+      "out_hex": "1b5b313b323a3143"
+    },
+    {
+      "mode": "kitty_131",
+      "name": "f1#12",
+      "event": {
+        "key": "f1",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b313b313a3150"
+    },
+    {
+      "mode": "kitty_131",
+      "name": "f5#13",
+      "event": {
+        "key": "f5",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b31353b357e"
+    },
+    {
+      "mode": "kitty_131",
+      "name": "delete#14",
+      "event": {
+        "key": "delete",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b337e"
+    },
+    {
+      "mode": "kitty_131",
+      "name": "home#15",
+      "event": {
+        "key": "home",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b313b313a3148"
+    },
+    {
+      "mode": "kitty_131",
+      "name": "page_up#16",
+      "event": {
+        "key": "page_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b357e"
+    },
+    {
+      "mode": "kitty_131",
+      "name": "a#17",
+      "event": {
+        "key": "a",
+        "action": 0,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty_131",
+      "name": "a#18",
+      "event": {
+        "key": "a",
+        "action": 2,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty_push_pop",
+      "name": "a#00",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty_push_pop",
+      "name": "a#01",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 2,
+        "text": "\u0001"
+      },
+      "out_hex": "1b5b313b3575"
+    },
+    {
+      "mode": "kitty_push_pop",
+      "name": "a#02",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 1,
+        "text": "A"
+      },
+      "out_hex": "41"
+    },
+    {
+      "mode": "kitty_push_pop",
+      "name": "a#03",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 4,
+        "text": "a"
+      },
+      "out_hex": "61"
+    },
+    {
+      "mode": "kitty_push_pop",
+      "name": "a#04",
+      "event": {
+        "key": "a",
+        "action": 1,
+        "mods": 6,
+        "text": "\u0001"
+      },
+      "out_hex": "1b5b313b3775"
+    },
+    {
+      "mode": "kitty_push_pop",
+      "name": "enter#05",
+      "event": {
+        "key": "enter",
+        "action": 1,
+        "mods": 0,
+        "text": "\r"
+      },
+      "out_hex": "0d"
+    },
+    {
+      "mode": "kitty_push_pop",
+      "name": "tab#06",
+      "event": {
+        "key": "tab",
+        "action": 1,
+        "mods": 0,
+        "text": "\t"
+      },
+      "out_hex": "09"
+    },
+    {
+      "mode": "kitty_push_pop",
+      "name": "backspace#07",
+      "event": {
+        "key": "backspace",
+        "action": 1,
+        "mods": 0,
+        "text": ""
+      },
+      "out_hex": "7f"
+    },
+    {
+      "mode": "kitty_push_pop",
+      "name": "escape#08",
+      "event": {
+        "key": "escape",
+        "action": 1,
+        "mods": 0,
+        "text": "\u001b"
+      },
+      "out_hex": "1b"
+    },
+    {
+      "mode": "kitty_push_pop",
+      "name": "arrow_up#09",
+      "event": {
+        "key": "arrow_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b41"
+    },
+    {
+      "mode": "kitty_push_pop",
+      "name": "arrow_left#10",
+      "event": {
+        "key": "arrow_left",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b313b3544"
+    },
+    {
+      "mode": "kitty_push_pop",
+      "name": "arrow_right#11",
+      "event": {
+        "key": "arrow_right",
+        "action": 1,
+        "mods": 1
+      },
+      "out_hex": "1b5b313b3243"
+    },
+    {
+      "mode": "kitty_push_pop",
+      "name": "f1#12",
+      "event": {
+        "key": "f1",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b4f50"
+    },
+    {
+      "mode": "kitty_push_pop",
+      "name": "f5#13",
+      "event": {
+        "key": "f5",
+        "action": 1,
+        "mods": 2
+      },
+      "out_hex": "1b5b31353b357e"
+    },
+    {
+      "mode": "kitty_push_pop",
+      "name": "delete#14",
+      "event": {
+        "key": "delete",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b337e"
+    },
+    {
+      "mode": "kitty_push_pop",
+      "name": "home#15",
+      "event": {
+        "key": "home",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b48"
+    },
+    {
+      "mode": "kitty_push_pop",
+      "name": "page_up#16",
+      "event": {
+        "key": "page_up",
+        "action": 1,
+        "mods": 0
+      },
+      "out_hex": "1b5b357e"
+    },
+    {
+      "mode": "kitty_push_pop",
+      "name": "a#17",
+      "event": {
+        "key": "a",
+        "action": 0,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": ""
+    },
+    {
+      "mode": "kitty_push_pop",
+      "name": "a#18",
+      "event": {
+        "key": "a",
+        "action": 2,
+        "mods": 0,
+        "text": "a"
+      },
+      "out_hex": "61"
+    }
+  ]
+}
