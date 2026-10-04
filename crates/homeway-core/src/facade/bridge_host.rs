@@ -75,7 +75,8 @@ fn lock_host<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// 桥拨号闭包面（工单⑤ dial_port 接缝的类型别名）。
-pub type DialFn = Box<dyn Fn(u16, Duration) -> std::io::Result<Box<dyn BridgeStream>> + Send + Sync>;
+pub type DialFn =
+    Box<dyn Fn(u16, Duration) -> std::io::Result<Box<dyn BridgeStream>> + Send + Sync>;
 
 /// 现有 socket 路径是否无主的探测预算（工单②：本地 UDS connect 一般即成，
 /// 但对端 backlog 满时会挂——200ms 内连不上按「有活主人」处理，不误删）。
@@ -118,7 +119,13 @@ pub(crate) fn connect_budget(path: &Path, budget: Duration) -> std::io::Result<U
         }
     }
     // 出错路径统一关 fd（成功则所有权移交 UnixStream）
-    let r = unsafe { libc::connect(fd, &addr as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t) };
+    let r = unsafe {
+        libc::connect(
+            fd,
+            &addr as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
+        )
+    };
     if r < 0 {
         let e = std::io::Error::last_os_error();
         // EINPROGRESS = 非阻塞连接已发起（darwin/linux 同码）；其余（ENOENT/ECONNREFUSED/
@@ -127,7 +134,11 @@ pub(crate) fn connect_budget(path: &Path, budget: Duration) -> std::io::Result<U
             unsafe { libc::close(fd) };
             return Err(e);
         }
-        let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+        let mut pfd = libc::pollfd {
+            fd,
+            events: libc::POLLOUT,
+            revents: 0,
+        };
         let t = budget.as_millis().clamp(1, i32::MAX as u128) as i32;
         let pr = unsafe { libc::poll(&mut pfd, 1, t) };
         if pr < 0 {
@@ -143,7 +154,14 @@ pub(crate) fn connect_budget(path: &Path, budget: Duration) -> std::io::Result<U
         let mut err: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
         unsafe {
-            if libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_ERROR, &mut err as *mut _ as *mut _, &mut len) != 0 {
+            if libc::getsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_ERROR,
+                &mut err as *mut _ as *mut _,
+                &mut len,
+            ) != 0
+            {
                 let ge = std::io::Error::last_os_error();
                 libc::close(fd);
                 return Err(ge);
@@ -214,7 +232,11 @@ struct ConnGate {
 
 impl ConnGate {
     fn new(max: usize) -> Self {
-        ConnGate { max, live: Mutex::new(VecDeque::new()), next_ticket: AtomicU64::new(1) }
+        ConnGate {
+            max,
+            live: Mutex::new(VecDeque::new()),
+            next_ticket: AtomicU64::new(1),
+        }
     }
 
     /// 登记：满员挤掉最老（返回其 fd 供调用方断连）。clone 失败不入表（少记一条
@@ -272,7 +294,10 @@ impl BridgeSock {
         stopped: &AtomicBool,
         logf: &Logf,
     ) -> Option<(UnixListener, Option<(u64, u64)>)> {
-        for (attempt, backoff) in std::iter::once(Duration::ZERO).chain(LISTEN_BACKOFF.iter().copied()).enumerate() {
+        for (attempt, backoff) in std::iter::once(Duration::ZERO)
+            .chain(LISTEN_BACKOFF.iter().copied())
+            .enumerate()
+        {
             if stopped.load(Ordering::Acquire) {
                 return None;
             }
@@ -288,7 +313,9 @@ impl BridgeSock {
                     ln.set_nonblocking(true).ok();
                     (logf)(&format!(
                         "{}: {} unix:{} → 出口虚拟端口（经会话）监听中",
-                        "桥宿主", name, path.display()
+                        "桥宿主",
+                        name,
+                        path.display()
                     ));
                     return Some((ln, own));
                 }
@@ -313,8 +340,12 @@ impl BridgeSock {
 fn sock_path_free(path: &Path) -> bool {
     match connect_budget(path, PROBE_BUDGET) {
         Ok(_) => false,
-        Err(e) => matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused | ErrorKind::NotConnected)
-            || e.raw_os_error() == Some(libc::ENOTSOCK),
+        Err(e) => {
+            matches!(
+                e.kind(),
+                ErrorKind::NotFound | ErrorKind::ConnectionRefused | ErrorKind::NotConnected
+            ) || e.raw_os_error() == Some(libc::ENOTSOCK)
+        }
     }
 }
 
@@ -372,12 +403,7 @@ pub struct BridgeStatus {
 
 impl BridgeHost {
     /// 构造（未启动）。`dir` = filesDir（socket 落 `<dir>/bridge/*.sock`；None = 不起桥）。
-    pub fn new(
-        what: &'static str,
-        dir: Option<PathBuf>,
-        logf: Logf,
-        dial_port: DialFn,
-    ) -> Self {
+    pub fn new(what: &'static str, dir: Option<PathBuf>, logf: Logf, dial_port: DialFn) -> Self {
         BridgeHost {
             what,
             dir,
@@ -428,12 +454,18 @@ impl BridgeHost {
             return; // 已启动 / 已停止
         }
         let Some(dir) = self.dir.clone() else {
-            (self.logf)(&format!("{}: 没有桥目录（identityDir 未配置）—— files/term/测速 本轮不可用", self.what));
+            (self.logf)(&format!(
+                "{}: 没有桥目录（identityDir 未配置）—— files/term/测速 本轮不可用",
+                self.what
+            ));
             return;
         };
         let bridge_dir = dir.join(BRIDGE_DIR);
         if let Err(e) = std::fs::create_dir_all(&bridge_dir) {
-            (self.logf)(&format!("{}: 建桥目录失败（{e}）—— files/term/测速 本轮不可用", self.what));
+            (self.logf)(&format!(
+                "{}: 建桥目录失败（{e}）—— files/term/测速 本轮不可用",
+                self.what
+            ));
             return;
         }
         // sun_path 上限预检：路径超长的 bind 报 invalid argument 且重试无意义。
@@ -449,8 +481,18 @@ impl BridgeHost {
             return;
         }
         let mut socks = vec![
-            BridgeSock { name: "files-bridge", port: port::FILES, path: files, own: None },
-            BridgeSock { name: "term-bridge", port: term_port(), path: bridge_socket_path(&dir, "term"), own: None },
+            BridgeSock {
+                name: "files-bridge",
+                port: port::FILES,
+                path: files,
+                own: None,
+            },
+            BridgeSock {
+                name: "term-bridge",
+                port: term_port(),
+                path: bridge_socket_path(&dir, "term"),
+                own: None,
+            },
         ];
         let speed_path = bridge_socket_path(&dir, "speedtest");
         if speed_path.as_os_str().len() >= MAX_UNIX_SOCKET_PATH {
@@ -460,12 +502,20 @@ impl BridgeHost {
                 speed_path.as_os_str().len()
             ));
         } else {
-            socks.push(BridgeSock { name: "speed-bridge", port: port::SPEEDTEST, path: speed_path, own: None });
+            socks.push(BridgeSock {
+                name: "speed-bridge",
+                port: port::SPEEDTEST,
+                path: speed_path,
+                own: None,
+            });
         }
         // 令牌（32B 随机；生成失败宁可不 exposing 桥——鉴权是硬要求，不做明文回退）
         let mut tok = [0u8; 32];
         if getrandom_fill(&mut tok).is_err() {
-            (self.logf)(&format!("{}: 生成桥令牌失败 —— files/term/测速 本轮不可用", self.what));
+            (self.logf)(&format!(
+                "{}: 生成桥令牌失败 —— files/term/测速 本轮不可用",
+                self.what
+            ));
             return;
         }
         inner.socks = socks;
@@ -496,14 +546,17 @@ impl BridgeHost {
                 None => return self.live_leave(),
             }
         };
-        let ln = BridgeSock::listen_path(name, &path, &self.stopped, &self.logf).map(|(ln, own)| {
-            let mut inner = lock_host(&self.inner);
-            if let Some(s) = inner.socks.get_mut(idx) {
-                s.own = own;
-            }
-            ln
-        });
-        let Some(ln) = ln else { return self.live_leave() };
+        let ln =
+            BridgeSock::listen_path(name, &path, &self.stopped, &self.logf).map(|(ln, own)| {
+                let mut inner = lock_host(&self.inner);
+                if let Some(s) = inner.socks.get_mut(idx) {
+                    s.own = own;
+                }
+                ln
+            });
+        let Some(ln) = ln else {
+            return self.live_leave();
+        };
 
         while !self.stopped.load(Ordering::Acquire) {
             match ln.accept() {
@@ -705,7 +758,9 @@ fn pump(r: &mut dyn Read, w: &mut dyn WriteHalf, logf: &crate::Logf, dir: &'stat
             }
             Err(_) => {
                 if dbg_n > 0 {
-                    (logf)(&format!("桥泵[{dir}] 读错误（累计 {dbg_n}B / {dbg_ok} 次）"));
+                    (logf)(&format!(
+                        "桥泵[{dir}] 读错误（累计 {dbg_n}B / {dbg_ok} 次）"
+                    ));
                 }
                 break;
             }
@@ -790,9 +845,12 @@ mod tests {
         let dir = tmp_dir("face");
         let (logf, _lines) = log_silent();
         // dial_port 恒失败（本测试不起会话）
-        let host = Arc::new(BridgeHost::new("测试桥", Some(dir.clone()), logf, Box::new(|_, _| {
-            Err(std::io::Error::new(ErrorKind::ConnectionRefused, "无会话"))
-        })));
+        let host = Arc::new(BridgeHost::new(
+            "测试桥",
+            Some(dir.clone()),
+            logf,
+            Box::new(|_, _| Err(std::io::Error::new(ErrorKind::ConnectionRefused, "无会话"))),
+        ));
         host.start();
         // 等 listen 就位（auth_hex 在 start 同步段就有；socket 文件在后台线程落盘）
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
@@ -800,20 +858,31 @@ mod tests {
         while (!Path::new(&files_path).exists()) && std::time::Instant::now() < deadline {
             std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(Path::new(&files_path).exists(), "files 桥应在 2s 内监听就位");
+        assert!(
+            Path::new(&files_path).exists(),
+            "files 桥应在 2s 内监听就位"
+        );
         let st = host.status();
         assert_eq!(st.auth_hex.len(), 96, "hex(16B 魔数 + 32B 令牌) = 96 hex");
         assert!(st.files_sock.ends_with("bridge/files.sock"));
         assert!(st.term_sock.ends_with("bridge/term.sock"));
         assert!(st.speed_sock.ends_with("bridge/speedtest.sock"));
-        let magic_hex: String = BRIDGE_AUTH_MAGIC.iter().map(|b| format!("{b:02x}")).collect();
-        assert!(st.auth_hex.starts_with(&magic_hex), "魔数 hex 前缀（TIERBRIDGEAUTH01）");
+        let magic_hex: String = BRIDGE_AUTH_MAGIC
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert!(
+            st.auth_hex.starts_with(&magic_hex),
+            "魔数 hex 前缀（TIERBRIDGEAUTH01）"
+        );
         // socket 文件在盘上
         assert!(Path::new(&st.files_sock).exists());
         host.stop();
         let st = host.status();
         assert_eq!(st, BridgeStatus::default(), "stop 后状态面全空");
-        assert!(!Path::new(&host.status().files_sock).exists() || host.status().files_sock.is_empty());
+        assert!(
+            !Path::new(&host.status().files_sock).exists() || host.status().files_sock.is_empty()
+        );
     }
 
     /// 鉴权链：坏魔数/坏令牌 ⇒ 服务端静默断开（客户端读到 EOF）；好令牌 ⇒ 放行进泵
@@ -824,10 +893,15 @@ mod tests {
         let (logf, _lines) = log_silent();
         let (tx, rx) = mpsc::channel::<u16>();
         let rx = Arc::new(Mutex::new(rx));
-        let host = Arc::new(BridgeHost::new("测试桥", Some(dir), logf, Box::new(move |port, _| {
-            tx.send(port).unwrap();
-            Err(std::io::Error::new(ErrorKind::ConnectionRefused, "拒"))
-        })));
+        let host = Arc::new(BridgeHost::new(
+            "测试桥",
+            Some(dir),
+            logf,
+            Box::new(move |port, _| {
+                tx.send(port).unwrap();
+                Err(std::io::Error::new(ErrorKind::ConnectionRefused, "拒"))
+            }),
+        ));
         host.start();
         let deadline = std::time::Instant::now() + Duration::from_secs(2);
         while host.status().auth_hex.is_empty() && std::time::Instant::now() < deadline {
@@ -859,7 +933,11 @@ mod tests {
         })
         .join()
         .unwrap();
-        assert_eq!(seen_port.unwrap(), 7724, "鉴权过 ⇒ 泵起 ⇒ 经会话拨 term 端口");
+        assert_eq!(
+            seen_port.unwrap(),
+            7724,
+            "鉴权过 ⇒ 泵起 ⇒ 经会话拨 term 端口"
+        );
         assert!(eof, "dial 失败后连接收口");
 
         // 坏令牌（改尾字节）：静默断开，且**不触发 dial**
@@ -875,7 +953,10 @@ mod tests {
         })
         .join();
         let _ = dial_count;
-        assert!(rx.lock().unwrap().try_recv().is_err(), "坏令牌不得触发 dial");
+        assert!(
+            rx.lock().unwrap().try_recv().is_err(),
+            "坏令牌不得触发 dial"
+        );
         host.stop();
     }
 
@@ -887,10 +968,19 @@ mod tests {
     #[test]
     fn no_dir_no_bridge() {
         let (logf, lines) = log_silent();
-        let host = Arc::new(BridgeHost::new("测试桥", None, logf, Box::new(|_, _| unreachable!())));
+        let host = Arc::new(BridgeHost::new(
+            "测试桥",
+            None,
+            logf,
+            Box::new(|_, _| unreachable!()),
+        ));
         host.start();
         assert_eq!(host.status(), BridgeStatus::default());
-        assert!(lines.lock().unwrap().iter().any(|l| l.contains("没有桥目录")));
+        assert!(lines
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|l| l.contains("没有桥目录")));
     }
 
     /// 死残留清理：预置一个 socket 文件（无监听）⇒ listen 应删掉重绑成功。
@@ -902,9 +992,12 @@ mod tests {
         let files_sock = dir.join("bridge").join("files.sock");
         UnixListener::bind(&files_sock).unwrap(); // 死残留（listener 立即 drop，无 accept）
         drop(std::fs::read_dir(&dir).unwrap().next());
-        let host = Arc::new(BridgeHost::new("测试桥", Some(dir), logf, Box::new(|_, _| {
-            Err(std::io::Error::new(ErrorKind::ConnectionRefused, "无"))
-        })));
+        let host = Arc::new(BridgeHost::new(
+            "测试桥",
+            Some(dir),
+            logf,
+            Box::new(|_, _| Err(std::io::Error::new(ErrorKind::ConnectionRefused, "无"))),
+        ));
         host.start();
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
         while host.status().auth_hex.is_empty() && std::time::Instant::now() < deadline {
@@ -943,7 +1036,11 @@ mod tests {
         }
         assert!(got_refused, "死残留应即时 ConnectionRefused");
         // 不存在 = NotFound
-        let e = connect_budget(&dir.join("bridge").join("none.sock"), Duration::from_secs(1)).unwrap_err();
+        let e = connect_budget(
+            &dir.join("bridge").join("none.sock"),
+            Duration::from_secs(1),
+        )
+        .unwrap_err();
         assert_eq!(e.kind(), ErrorKind::NotFound);
         // 超长路径 = InvalidInput（sun_path 上限）
         let long = dir.join("x".repeat(200));
@@ -958,4 +1055,3 @@ mod tests {
         assert_eq!(term_port(), 7724);
     }
 }
-

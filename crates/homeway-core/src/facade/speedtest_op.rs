@@ -152,12 +152,40 @@ pub struct BridgeSpeedConn {
     raw: UnixStream,
     r: Mutex<Box<dyn Read + Send>>,
     w: Mutex<Box<dyn super::bridge_host::WriteHalf + Send>>,
+    /// **绝对期限**（评审 r1-F13：set_read/write_timeout 是 per-syscall 超时——
+    /// 慢滴对端每次成功读写都给整份期限续命；Go SetDeadline 是绝对时刻。这里记
+    /// deadline 时刻，每次读写前按剩余量收敛 per-op 超时，到点后读写立即失败——
+    /// 复刻 speedtest_server 侧 set_io_deadline 的 M13 整改同款语义）。
+    deadline: Mutex<Option<Instant>>,
+}
+
+impl BridgeSpeedConn {
+    /// per-op 超时收敛（绝对期限的执行半边）。
+    fn op_timeout(&self) -> std::io::Result<Option<std::time::Duration>> {
+        let dl = self.deadline.lock().unwrap_or_else(|e| e.into_inner());
+        match *dl {
+            None => Ok(None),
+            Some(t) => {
+                let remain = t.saturating_duration_since(Instant::now());
+                if remain.is_zero() {
+                    Err(std::io::Error::new(
+                        std::io::ErrorKind::WouldBlock,
+                        "连接期限已到（绝对期限）",
+                    ))
+                } else {
+                    Ok(Some(remain))
+                }
+            }
+        }
+    }
 }
 
 impl crate::speedtest::SpeedConn for BridgeSpeedConn {
     fn set_deadline(&self, d: Option<std::time::Duration>) {
-        // SO_RCVTIMEO/SO_SNDTIMEO 是 socket 级选项——raw/读写半（同 socket 的
-        // dup fd 集）一处设置全体生效。
+        // 绝对期限语义（见字段注记）：记时刻；每次读写前按剩余收敛 per-op 超时。
+        // SO_RCV/SNDTIMEO 是 socket 级选项（dup fd 共享）——一处设置全体生效。
+        let mut dl = self.deadline.lock().unwrap_or_else(|e| e.into_inner());
+        *dl = d.map(|dur| Instant::now() + dur);
         self.raw.set_read_timeout(d).ok();
         self.raw.set_write_timeout(d).ok();
     }
@@ -167,6 +195,11 @@ impl crate::speedtest::SpeedConn for BridgeSpeedConn {
         let mut w = self.w.lock().unwrap_or_else(|e| e.into_inner());
         let mut off = 0;
         while off < data.len() {
+            let remain = self.op_timeout();
+            if remain.is_err() {
+                return Err(SpeedtestError::Conn(crate::wgcore::ConnErr::Timeout));
+            }
+            self.raw.set_write_timeout(remain.unwrap()).ok();
             match w.write(&data[off..]) {
                 Ok(0) => {
                     return Err(SpeedtestError::Frame(
@@ -189,6 +222,11 @@ impl crate::speedtest::SpeedConn for BridgeSpeedConn {
         use crate::speedtest::SpeedtestError;
         let mut r = self.r.lock().unwrap_or_else(|e| e.into_inner());
         let mut buf = [0u8; 128 * 1024];
+        let remain = self.op_timeout();
+        if let Err(_e) = remain {
+            return Err(SpeedtestError::Conn(crate::wgcore::ConnErr::Timeout));
+        }
+        self.raw.set_read_timeout(remain.unwrap()).ok();
         match r.read(&mut buf) {
             Ok(0) => Ok(Vec::new()), // EOF
             Ok(n) => Ok(buf[..n].to_vec()),
@@ -248,9 +286,10 @@ pub fn speed_dial_conn(
                 format!("测速通道暂时不可用（桥未就绪或正在恢复）：{e}"),
             )
         })?;
-    // 鉴权交换先带拨号预算（R8-8c：复核 r3 对 M-8 兜底「部分失真」的修正——此前
-    // 预算只罩 connect，auth 写读挂 None 可无限等；请求发出后的硬期限由引擎
-    // set_deadline 挂 warmup+window+15s，窗口期读阻塞是常态不在此设短值）。
+    // 鉴权写先带拨号预算（R8-8c：复核 r3 对 M-8 兜底「部分失真」的修正——此前预算
+    // 只罩 connect、auth 写挂 None 可无限等；write_auth 是纯写（评审 r1-F15：读半
+    // 无对象）。请求发出后的硬期限由引擎 set_deadline 挂 warmup+window+15s——绝对
+    // 期限语义（评审 r1-F13），窗口期读阻塞是常态不在此设短值）。
     conn.set_read_timeout(Some(budget)).ok();
     conn.set_write_timeout(Some(budget)).ok();
     write_auth(&mut conn, auth_hex)
@@ -268,6 +307,7 @@ pub fn speed_dial_conn(
         raw,
         r: Mutex::new(r),
         w: Mutex::new(w),
+        deadline: Mutex::new(None),
     })
 }
 

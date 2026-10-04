@@ -26,9 +26,9 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::sync::Arc;
-use std::os::fd::AsRawFd as _;
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::os::fd::AsRawFd as _;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::wtransport::frame::{self, FrameKind};
@@ -106,10 +106,15 @@ pub struct ServerBind {
     pub rx_bytes: u64,
     pub tx_bytes: u64,
     recv_buf: Box<[u8; 65536]>,
-    /// 批量发送的复用 staging（腿帧连排；驱动线程独占——零热路径分配）。
+    /// 批量发送的复用 staging（腿帧连排；驱动线程独占——热路径零分配〔F9 整改：
+    /// encode_frame 直写〕）。
     tx_stage: Vec<u8>,
     /// staging 内各帧的 (记账载荷长, 端点, 帧全长)。
     tx_lens: Vec<(usize, SocketAddr, usize)>,
+    /// 批量出站的**丢弃计数**（评审 r1-F7/F8）：短返余量 + 失败批次——旧行为逐包
+    /// send_to 失败有日志无计数；批化后短返余量既无日志也无计数（静默）——本计数
+    /// 补观测面（日志 100 次一行节流；与 leg_dropped 同范式）。
+    tx_dropped: u64,
 }
 
 impl ServerBind {
@@ -184,6 +189,7 @@ impl ServerBind {
             recv_buf: Box::new([0u8; 65536]),
             tx_stage: Vec::with_capacity(256 * 1024),
             tx_lens: Vec::with_capacity(256),
+            tx_dropped: 0,
         })
     }
 
@@ -223,7 +229,9 @@ impl ServerBind {
     pub fn recv_packet(&mut self) -> io::Result<Option<Inbound>> {
         let (n, src) = match self.sock.recv_from(&mut self.recv_buf[..]) {
             Ok(v) => v,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut => {
+            Err(e)
+                if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
+            {
                 return Err(e)
             }
             Err(e) => return Err(e),
@@ -254,7 +262,9 @@ impl ServerBind {
         }
 
         // 参照点探测：明文一问一答，不进 WG、不登记 peer。
-        if let Some(resp) = crate::probe::respond_ex(buf, &self.build, self.caps, &self.probe_endpoints) {
+        if let Some(resp) =
+            crate::probe::respond_ex(buf, &self.build, self.caps, &self.probe_endpoints)
+        {
             self.note_new_src(src, "参照点探测", buf.len());
             let _ = self.sock.send_to(&resp, src);
             return None;
@@ -275,16 +285,23 @@ impl ServerBind {
                 }
                 k if k == FrameKind::Reg.to_wire() => {
                     self.note_new_src(src, "腿帧注册", buf.len());
-                    return Some(Inbound { data: None, regs: vec![(payload.to_vec(), src)] });
+                    return Some(Inbound {
+                        data: None,
+                        regs: vec![(payload.to_vec(), src)],
+                    });
                 }
                 k if k == FrameKind::Control.to_wire() => {
                     self.note_new_src(src, "腿帧控制", buf.len());
-                    if let (Some(f), Some(addr)) = (&mut self.on_hint, frame::decode_hint_payload(payload)) {
+                    if let (Some(f), Some(addr)) =
+                        (&mut self.on_hint, frame::decode_hint_payload(payload))
+                    {
                         f(addr, src);
                     }
                     return None;
                 }
-                k if k == FrameKind::Batch.to_wire() => return self.handle_batch(buf, payload, src),
+                k if k == FrameKind::Batch.to_wire() => {
+                    return self.handle_batch(buf, payload, src)
+                }
                 k if k == crate::relaywire::FRAME_TYPE_RELAY_REG => {
                     // 中继控制帧：转发给 relay-leg 线程（解析/源校验不进驱动线程）
                     self.note_new_src(src, "腿帧type=3", buf.len());
@@ -330,7 +347,9 @@ impl ServerBind {
                     }
                 }
                 k if k == FrameKind::Control.to_wire() => {
-                    if let (Some(f), Some(addr)) = (&mut self.on_hint, frame::decode_hint_payload(mpayload)) {
+                    if let (Some(f), Some(addr)) =
+                        (&mut self.on_hint, frame::decode_hint_payload(mpayload))
+                    {
                         f(addr, src);
                     }
                 }
@@ -351,7 +370,12 @@ impl ServerBind {
     /// 向中继数据口拨一条腿：连接 socket + 发认证标记（v2 = LEGUP‖cookie‖MAC）+
     /// 入双表。同 id 或同远端重复注册 = 先拆旧再建（中继侧会话重建的语义）。
     /// 上限只拦新 id（C3：重放替换不拦）。
-    pub fn register_leg(&mut self, id: u64, remote: SocketAddr, marker: &[u8]) -> Result<(), super::relayleg::LegError> {
+    pub fn register_leg(
+        &mut self,
+        id: u64,
+        remote: SocketAddr,
+        marker: &[u8],
+    ) -> Result<(), super::relayleg::LegError> {
         let sock = UdpSocket::bind("0.0.0.0:0")?;
         sock.connect(remote)?;
         sock.set_nonblocking(true).ok();
@@ -372,7 +396,15 @@ impl ServerBind {
         self.leg_ports.insert(remote); // 记住「这个端口当过腿」（Send 的兜底丢弃判据）
         self.leg_recent.remove(&remote); // 同地址重拨成功：撤掉「最近摘除」标记
         self.leg_by_r.insert(remote, id);
-        self.leg_by_id.insert(id, RelayLeg { id, remote, sock, last: Instant::now() });
+        self.leg_by_id.insert(
+            id,
+            RelayLeg {
+                id,
+                remote,
+                sock,
+                last: Instant::now(),
+            },
+        );
         Ok(())
     }
 
@@ -414,8 +446,12 @@ impl ServerBind {
             .values()
             .find(|lg| lg.sock.as_raw_fd() == fd)
             .map(|lg| (lg.id, lg.remote))
-        else { return (false, None) };
-        let Some(lg) = self.leg_by_id.get_mut(&id) else { return (false, None) };
+        else {
+            return (false, None);
+        };
+        let Some(lg) = self.leg_by_id.get_mut(&id) else {
+            return (false, None);
+        };
         let mut buf = [0u8; 65536];
         match lg.sock.recv(&mut buf) {
             Ok(0) => {
@@ -459,12 +495,16 @@ impl ServerBind {
             self.remove_leg_by(&id, &remote);
             (self.logf)(&format!("腿（会话 #{id} → {remote}）空闲超 3m0s，回收"));
         }
-        self.leg_recent.retain(|_, at| now.duration_since(*at) <= LEG_RECENT_TTL);
+        self.leg_recent
+            .retain(|_, at| now.duration_since(*at) <= LEG_RECENT_TTL);
     }
 
     /// 腿表当前 fd 集（驱动线程 poll 用）。
     pub fn leg_fds(&self) -> Vec<std::os::fd::RawFd> {
-        self.leg_by_id.values().map(|lg| lg.sock.as_raw_fd()).collect()
+        self.leg_by_id
+            .values()
+            .map(|lg| lg.sock.as_raw_fd())
+            .collect()
     }
 
     /// 收工：拆全部腿（不打卡日志——收工路径）。
@@ -488,7 +528,10 @@ impl ServerBind {
         result: std::sync::mpsc::Sender<Option<SocketAddr>>,
     ) -> io::Result<()> {
         if self.stun_wait_txid.is_some() {
-            return Err(io::Error::new(io::ErrorKind::WouldBlock, "server: 已有一次 STUN 查询在等"));
+            return Err(io::Error::new(
+                io::ErrorKind::WouldBlock,
+                "server: 已有一次 STUN 查询在等",
+            ));
         }
         let txid = super::egress::new_txid();
         let req = super::egress::stun_request(&txid, ""); // servercore 形态：20B 无属性
@@ -521,9 +564,17 @@ impl ServerBind {
         self.tx_lens.clear();
         for (ep, wg) in &out.wire {
             // 腿表命中（先取 fd 再发——借用分离）
-            let leg_fd = self.leg_by_r.get(ep).and_then(|id| self.leg_by_id.get(id)).map(|lg| lg.sock.as_raw_fd());
+            let leg_fd = self
+                .leg_by_r
+                .get(ep)
+                .and_then(|id| self.leg_by_id.get(id))
+                .map(|lg| lg.sock.as_raw_fd());
             if let Some(fd) = leg_fd {
-                if let Some(lg) = self.leg_by_id.values_mut().find(|lg| lg.sock.as_raw_fd() == fd) {
+                if let Some(lg) = self
+                    .leg_by_id
+                    .values_mut()
+                    .find(|lg| lg.sock.as_raw_fd() == fd)
+                {
                     lg.last = Instant::now(); // Send 刷 last（Go Send 同义）
                     let wire = frame::frame_bytes(FrameKind::Data, wg);
                     let n = unsafe { libc::send(fd, wire.as_ptr().cast(), wire.len(), 0) };
@@ -552,33 +603,53 @@ impl ServerBind {
                 }
                 continue;
             }
-            // 主 socket：帧入复用 staging（载荷一次拷贝；记录 (记账载荷长, 端点, 帧全长)）。
+            // 主 socket：帧头直写复用 staging（评审 r1-F9：此前 frame_bytes 每包
+            // new 一个 Vec 再整包拷回 staging = 1 分配 + 2 拷贝，比改前更差——
+            // encode_frame(kind, payload, &mut out) 直写消掉分配与第二次拷贝）。
             let start = self.tx_stage.len();
-            let wire = frame::frame_bytes(FrameKind::Data, wg);
-            self.tx_stage.extend_from_slice(&wire);
-            self.tx_lens.push((wg.len(), *ep, wire.len()));
-            let _ = start;
+            frame::encode_frame(FrameKind::Data, wg, &mut self.tx_stage);
+            self.tx_lens
+                .push((wg.len(), *ep, self.tx_stage.len() - start));
         }
         if self.tx_lens.is_empty() {
             return;
         }
-        // 批量发出（msgs 借 staging 裸切片——staging 在发送期间不再动）。
-        let stage_ptr = self.tx_stage.as_ptr();
-        let mut msgs: Vec<crate::udpbatch::OutMsg<'_>> = Vec::with_capacity(self.tx_lens.len());
+        // 批量发出。评审 r1-补4：fd 先取（RawFd 是 Copy，借用即断）+ 分字段借用
+        // （tx_stage 不可变借 / tx_lens 读）——无需裸指针切片。
+        let fd = self.sock.as_raw_fd();
         let mut off = 0usize;
+        let mut msgs: Vec<crate::udpbatch::OutMsg<'_>> = Vec::with_capacity(self.tx_lens.len());
         for &(_, ep, fr_len) in &self.tx_lens {
-            let sl = unsafe { std::slice::from_raw_parts(stage_ptr.add(off), fr_len) };
-            msgs.push(crate::udpbatch::OutMsg { dst: ep, buf: sl });
+            msgs.push(crate::udpbatch::OutMsg {
+                dst: ep,
+                buf: &self.tx_stage[off..off + fr_len],
+            });
             off += fr_len;
         }
-        let (sent, first_err) = crate::udpbatch::send_batch(self.sock.as_raw_fd(), &msgs);
-        // 记账按「成功前缀」（send_batch 顺序发送，短返只发前缀；余量留下一拍）。
+        let (sent, first_err) = crate::udpbatch::send_batch(fd, &msgs);
+        // 注：msgs 为本函数局建（OutMsg 借 staging——自引用结构不能做成字段）；
+        // 每次调用一次 Vec 分配（相对每包一次 frame_bytes 分配已是数量级改善）。
+        // 记账按「成功前缀」（send_batch 顺序发送，短返只发前缀；Linux sendmmsg
+        // 返回值语义 = 前缀已发）。**短返余量/失败批次本拍丢弃**（非阻塞 socket 的
+        // EAGAIN/不可达对余量同型，逐包重试只是重复同错；UDP 本身不保证送达——
+        // TCP 层的重传由对端 ACK 时钟兜底）——丢弃进 tx_dropped 计数（评审 r1-F7）。
         for &(wg_len, _, _) in self.tx_lens.iter().take(sent) {
             self.tx_bytes += wg_len as u64;
         }
+        let dropped = (self.tx_lens.len() - sent) as u64;
+        if dropped > 0 {
+            self.tx_dropped += dropped;
+        }
         if let Some((ep, e)) = first_err {
-            // 发送失败限流记一行（排障面；对端可控面不能刷屏）
-            (self.logf)(&format!("发送到 {ep} 失败（{e}）"));
+            // 发送失败节流记行（评审 r1-F8：100 次一行——对端可控面不能刷屏；
+            // 首错即弃整批是**有意**语义：同 socket 同型错误，余量重试大概率同错
+            // 且会造成同 peer 乱序）
+            if self.tx_dropped <= 3 || self.tx_dropped.is_multiple_of(100) {
+                (self.logf)(&format!(
+                    "发送到 {ep} 失败（{e}；批量出站累计丢弃 {} 包）",
+                    self.tx_dropped
+                ));
+            }
         }
         // 诊断面：no_endpoint_drops 在 device 内
     }
@@ -663,7 +734,10 @@ mod tests {
 
         let reg = vec![0x41u8; 66];
         let wg = vec![1u8, 0, 0, 0, 2, 0, 0, 0]; // 假 init 形状
-        let batch = frame::batch_bytes(&[(FrameKind::Reg.to_wire(), &reg), (FrameKind::Data.to_wire(), &wg)]);
+        let batch = frame::batch_bytes(&[
+            (FrameKind::Reg.to_wire(), &reg),
+            (FrameKind::Data.to_wire(), &wg),
+        ]);
         let src: SocketAddr = "127.0.0.1:5001".parse().unwrap();
         let r = b2.process_packet(&batch, src).expect("容器帧应投出");
         assert_eq!(r.regs.len(), 1, "reg 应被收集恰好一次");
@@ -686,11 +760,18 @@ mod tests {
     #[test]
     fn leg_frames_dispatch_go_wire_bytes() {
         let v: serde_json::Value = serde_json::from_str(
-            &std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures/vectors/relay.json")).unwrap(),
+            &std::fs::read_to_string(concat!(
+                env!("CARGO_MANIFEST_DIR"),
+                "/../../fixtures/vectors/relay.json"
+            ))
+            .unwrap(),
         )
         .unwrap();
         let unhex = |s: &str| -> Vec<u8> {
-            (0..s.len()).step_by(2).map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap()).collect()
+            (0..s.len())
+                .step_by(2)
+                .map(|i| u8::from_str_radix(&s[i..i + 2], 16).unwrap())
+                .collect()
         };
         use std::sync::Mutex;
         let seen: Arc<Mutex<Vec<Vec<u8>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -727,14 +808,22 @@ mod tests {
         assert!(b.process_packet(&req, src).is_none(), "探测被消费");
 
         // 直接对 respond_ex 验细节（socket 回发路径由 3f 实测覆盖）
-        let resp = crate::probe::respond_ex(&req, "rust-exit-test", 0x01, &["203.0.113.9:42641".parse().unwrap()]).unwrap();
+        let resp = crate::probe::respond_ex(
+            &req,
+            "rust-exit-test",
+            0x01,
+            &["203.0.113.9:42641".parse().unwrap()],
+        )
+        .unwrap();
         assert_eq!(&resp[..3], b"HWR");
         assert_eq!(&resp[5..13], &nonce);
         // pad 200 够 → 带列表
         assert!(resp.len() > 13 + 8);
         // pad 16 的老形态 → 不带列表（防放大）
         let old_req = crate::probe::encode_request(crate::probe::TYPE_PING, &nonce, 16);
-        let old_resp = crate::probe::respond_ex(&old_req, "b", 0, &["203.0.113.9:42641".parse().unwrap()]).unwrap();
+        let old_resp =
+            crate::probe::respond_ex(&old_req, "b", 0, &["203.0.113.9:42641".parse().unwrap()])
+                .unwrap();
         assert!(old_resp.len() <= old_req.len() + 45, "45B 不变量");
     }
 
@@ -756,7 +845,6 @@ mod tests {
         let hint = frame::hint_bytes("1.2.3.4:9");
         assert!(b.process_packet(&hint, src).is_none());
     }
-
 
     // ---------- 腿表（R4；评审 中-4 补测） ----------
 
@@ -780,14 +868,21 @@ mod tests {
             let r: SocketAddr = format!("127.0.0.1:{}", 6000 + i).parse().unwrap();
             assert!(b.register_leg(i, r, b"m").is_ok(), "id={i} 应入表");
         }
-        assert_eq!(b.leg_fds().len(), RELAY_LEG_MAX, "应恰好满表（id2 + 62 新 id）");
+        assert_eq!(
+            b.leg_fds().len(),
+            RELAY_LEG_MAX,
+            "应恰好满表（id2 + 62 新 id）"
+        );
         let extra: SocketAddr = "127.0.0.1:6999".parse().unwrap();
         assert!(matches!(
             b.register_leg(999, extra, b"m"),
             Err(crate::server::relayleg::LegError::LegCap(RELAY_LEG_MAX))
         ));
         // 已有 id 的替换（重放语义）不受上限拦——id 1 已被顶掉，用仍在表内的 id 5
-        assert!(b.register_leg(5, r1, b"m").is_ok(), "已有 id 替换不受上限拦");
+        assert!(
+            b.register_leg(5, r1, b"m").is_ok(),
+            "已有 id 替换不受上限拦"
+        );
         b.clear_legs();
         assert_eq!(b.leg_fds().len(), 0);
     }

@@ -161,7 +161,9 @@ enum Proto {
 
 enum Phase {
     /// TCP：upstream 拨号中（SYN 缓存）；UDP：建会话窗口（pending 队列）。
-    Dialing { cache: Vec<Vec<u8>> },
+    Dialing {
+        cache: Vec<Vec<u8>>,
+    },
     Established,
 }
 
@@ -184,7 +186,7 @@ struct Flow {
     tx_backlog: Vec<u8>,
     /// upstream EOF 后待补的 FIN（**backlog 排空后才 close**：close 会把 FIN 排进
     /// socket 发送队列——backlog 里的数据若在 FIN 之后才写就永远出不去，客户端看到
-    /// 「数据 + FIN + 丢尾」的流错位【2026-09-02 实测抓出：speedtest report 帧丢失】）。
+    /// 「数据 + FIN + 丢尾」的流错位【2026-10-02 实测抓出：speedtest report 帧丢失】）。
     fin_pending: bool,
     /// transit UDP：是否收到过回包（udpcap 实测位）。
     udp_replied: bool,
@@ -308,7 +310,13 @@ impl Interceptor {
         let Some(v) = Ipv4View::parse(&pkt) else {
             return; // 畸形：静默丢（IP 层）
         };
-        let l4_off = if v.proto == 6 { 20 } else if v.proto == 17 { 8 } else { 0 };
+        let l4_off = if v.proto == 6 {
+            20
+        } else if v.proto == 17 {
+            8
+        } else {
+            0
+        };
         let payload_start = v.header_len + l4_off;
         let snapshot = View5 {
             src: v.src,
@@ -331,13 +339,19 @@ impl Interceptor {
         let proto = if v.proto == 6 { Proto::Tcp } else { Proto::Udp };
         let five = (v.src, v.src_port, v.dst, v.dst_port, v.proto);
         if let Some(&flow) = self.by_five.get(&five) {
-            let Some(f) = self.flows.get_mut(&flow) else { return };
+            let Some(f) = self.flows.get_mut(&flow) else {
+                return;
+            };
             let rw = f.rw_port;
             let is_dialing = matches!(f.phase, Phase::Dialing { .. });
             if is_dialing {
                 // 建会话窗口：包进缓存（重放用）——上限丢最新（TCP ≤4 / UDP ≤16）。
                 // UDP 缓存**纯载荷**（重放直投 upstream）；TCP 缓存整包（就绪后重写注栈）。
-                let cap = if proto == Proto::Tcp { SYN_CACHE_MAX } else { UDP_PENDING_MAX };
+                let cap = if proto == Proto::Tcp {
+                    SYN_CACHE_MAX
+                } else {
+                    UDP_PENDING_MAX
+                };
                 let item = if proto == Proto::Udp {
                     let (a, b) = snapshot.udp_payload;
                     pkt[a.min(pkt.len())..b.min(pkt.len())].to_vec()
@@ -377,13 +391,23 @@ impl Interceptor {
             self.tx_out.push(build_rst_for(v));
             return;
         }
-        let tcp_flows = self.flows.values().filter(|f| f.proto == Proto::Tcp).count();
+        let tcp_flows = self
+            .flows
+            .values()
+            .filter(|f| f.proto == Proto::Tcp)
+            .count();
         if tcp_flows >= MAX_CONNS {
             self.stats.incr_reject();
             let rejects = self.stats.rejects();
             (self.cfg.logf)(&format!(
                 "intercept: tcp 拒绝 {}:{} ← {}:{}（并发上限 {}，在册 {}，累计拒绝 {}）",
-                v.dst, v.dst_port, v.src, v.src_port, MAX_CONNS, tcp_flows + 1, rejects
+                v.dst,
+                v.dst_port,
+                v.src,
+                v.src_port,
+                MAX_CONNS,
+                tcp_flows + 1,
+                rejects
             ));
             self.tx_out.push(build_rst_for(v));
             return;
@@ -394,7 +418,11 @@ impl Interceptor {
         if kind == Kind::Dns {
             // M3：TCP DNS 腿不走 worker 拨号——直接建栈内 listen + 注入缓存
             //（SYN-ACK 即刻可产）；数据面走进程内代答（dns_tcp_feed）。
-            let legs = self.flows.values().filter(|f| f.kind == Kind::Dns && f.proto == Proto::Tcp).count();
+            let legs = self
+                .flows
+                .values()
+                .filter(|f| f.kind == Kind::Dns && f.proto == Proto::Tcp)
+                .count();
             if legs >= MAX_TCP_DNS_LEGS {
                 (self.cfg.logf)(&format!(
                     "intercept: tcp dns {}:{} ← {}:{} 拒绝（并发上限 {}）",
@@ -413,7 +441,9 @@ impl Interceptor {
     /// TCP DNS 腿建立（Go serveDNSTCP 同义：CreateEndpoint → 「进程内代答」判据行 →
     /// ServeStream；此处 = 建 listen + 注入缓存，后续每拍 service_sockets 喂数据）。
     fn dns_tcp_establish(&mut self, flow: u64) {
-        let Some(f) = self.flows.get(&flow) else { return };
+        let Some(f) = self.flows.get(&flow) else {
+            return;
+        };
         let rw = f.rw_port;
         let mut sock = TcpSocket::new(
             tcp::SocketBuffer::new(vec![0u8; FLOW_BUF]),
@@ -421,7 +451,9 @@ impl Interceptor {
         );
         sock.set_nagle_enabled(false);
         sock.set_congestion_control(tcp::CongestionControl::Cubic); // R8-8a：RFC 合规 CUBIC（CC 垫片退役）
-        sock.set_timeout(Some(smoltcp::time::Duration::from_secs(TCP_DNS_IDLE.as_secs())));
+        sock.set_timeout(Some(smoltcp::time::Duration::from_secs(
+            TCP_DNS_IDLE.as_secs(),
+        )));
         if let Err(e) = sock.listen(IpEndpoint::new(self.cfg.tunnel_ip.into(), rw)) {
             (self.cfg.logf)(&format!("intercept: tcp listen rw_port {rw} 失败：{e:?}"));
             self.teardown_flow(flow, false);
@@ -448,13 +480,17 @@ impl Interceptor {
     /// TCP DNS 腿数据面：RFC1035 分帧积攒 → 完整报文投 DNS worker（qtcp 计数面；
     /// 应答经 DnsRoute::TcpFlow 回投）。超长帧（>64KB+2B 缓冲界）按对端异常收线。
     fn dns_tcp_feed(&mut self, flow: u64, data: &[u8]) {
-        let Some(f) = self.flows.get_mut(&flow) else { return };
+        let Some(f) = self.flows.get_mut(&flow) else {
+            return;
+        };
         f.dns_rx.extend_from_slice(data);
         f.last_active = Instant::now();
         // 循环取完整帧（一条读可能含多条报文）
         loop {
             let (mlen, query) = {
-                let Some(f) = self.flows.get(&flow) else { return };
+                let Some(f) = self.flows.get(&flow) else {
+                    return;
+                };
                 if f.dns_rx.len() < 2 {
                     return;
                 }
@@ -545,7 +581,11 @@ impl Interceptor {
     fn alloc_rw_port(&mut self) -> u16 {
         loop {
             let p = self.next_rw_port;
-            self.next_rw_port = if self.next_rw_port >= 61000 { 20000 } else { self.next_rw_port + 1 };
+            self.next_rw_port = if self.next_rw_port >= 61000 {
+                20000
+            } else {
+                self.next_rw_port + 1
+            };
             if !self.by_rw_port.contains_key(&p) {
                 return p;
             }
@@ -567,7 +607,11 @@ impl Interceptor {
             }
             return;
         }
-        let udp_flows = self.flows.values().filter(|f| f.proto == Proto::Udp).count();
+        let udp_flows = self
+            .flows
+            .values()
+            .filter(|f| f.proto == Proto::Udp)
+            .count();
         if udp_flows >= MAX_UDP_SESSIONS {
             self.stats.incr_reject();
             (self.cfg.logf)(&format!(
@@ -596,8 +640,12 @@ impl Interceptor {
     /// UDP 会话就绪（DialOk 或 DNS 腿）：重放 first+pending（upstream 直投，不注栈）。
     fn udp_ready(&mut self, flow: u64) {
         let (replays, kind, orig_dst, client) = {
-            let Some(f) = self.flows.get_mut(&flow) else { return };
-            let Phase::Dialing { cache } = &f.phase else { return };
+            let Some(f) = self.flows.get_mut(&flow) else {
+                return;
+            };
+            let Phase::Dialing { cache } = &f.phase else {
+                return;
+            };
             let snap = (cache.clone(), f.kind, f.orig_dst, f.client);
             f.phase = Phase::Established;
             snap
@@ -611,7 +659,11 @@ impl Interceptor {
         self.stats.incr_flow();
         (self.cfg.logf)(&format!(
             "udp intercept: 会话 #{seq} {} 建立（{}:{} ← {}:{}）",
-            kind.as_str(), orig_dst.0, orig_dst.1, client.0, client.1
+            kind.as_str(),
+            orig_dst.0,
+            orig_dst.1,
+            client.0,
+            client.1
         ));
         if kind == Kind::Dns {
             // DNS 腿：逐包投进程内代答（**异步**——H3 整改：阻塞面全长 2.5s/查询，
@@ -639,7 +691,9 @@ impl Interceptor {
     /// service_sockets 的 backlog 续写会把它排进栈内 socket（与 worker 上行同路径，
     /// 背压/部分写语义一致）。
     fn dns_tcp_send(&mut self, flow: u64, resp: &[u8]) {
-        let Some(f) = self.flows.get_mut(&flow) else { return };
+        let Some(f) = self.flows.get_mut(&flow) else {
+            return;
+        };
         let mut frame = Vec::with_capacity(2 + resp.len());
         frame.extend_from_slice(&(resp.len() as u16).to_be_bytes());
         frame.extend_from_slice(resp);
@@ -649,7 +703,9 @@ impl Interceptor {
 
     /// 把一段数据经栈内 udp socket 回投客户端（DNS 应答/UpstreamData 共用）。
     fn udp_send_to_client(&mut self, flow: u64, data: &[u8]) {
-        let Some(f) = self.flows.get(&flow) else { return };
+        let Some(f) = self.flows.get(&flow) else {
+            return;
+        };
         let Some(h) = f.sock else { return };
         let ep = IpEndpoint::new(f.client.0.into(), f.client.1);
         let sock = self.sockets.get_mut::<UdpSocket>(h);
@@ -693,14 +749,17 @@ impl Interceptor {
         std::mem::take(&mut self.tx_out)
     }
 
-
     /// 发送侧吞吐观测行（verbose/dlogf 面；仅存在在途 TCP 流时打——真机吞吐排障的
     /// 关键窗口：栈内 CUBIC 的在途/未收账面 + backlog）。R8-8a：垫片退役后 cwnd/
     /// 减窗计数不再可观测（栈内私有），改看 send_queue（tx_buffer 存量 = 上线在途
     /// + 待发）与 backlog。
     fn cc_stats_line(&mut self) {
         let now = Instant::now();
-        if self.last_cc_stats.map(|t| now.duration_since(t) < Duration::from_secs(5)).unwrap_or(false) {
+        if self
+            .last_cc_stats
+            .map(|t| now.duration_since(t) < Duration::from_secs(5))
+            .unwrap_or(false)
+        {
             return;
         }
         self.last_cc_stats = Some(now);
@@ -736,8 +795,12 @@ impl Interceptor {
                 },
                 None => return,
             };
-            let Some(faces) = self.dns_faces.as_mut() else { continue };
-            let Some(route) = faces.take_route(reply.tag) else { continue };
+            let Some(faces) = self.dns_faces.as_mut() else {
+                continue;
+            };
+            let Some(route) = faces.take_route(reply.tag) else {
+                continue;
+            };
             let Some(resp) = reply.resp else { continue }; // 畸形不回包
             match route {
                 DnsRoute::UdpFlow(flow) => self.udp_send_to_client(flow, &resp),
@@ -750,7 +813,9 @@ impl Interceptor {
 
     /// DNS 面服务拍（读查询 → submit worker；监听池推进）。
     fn service_dns(&mut self) {
-        let Some(dns) = self.cfg.dns.clone() else { return };
+        let Some(dns) = self.cfg.dns.clone() else {
+            return;
+        };
         if let Some(faces) = self.dns_faces.as_mut() {
             faces.service(&dns, &mut self.sockets);
             faces.reap(&mut self.sockets);
@@ -793,7 +858,9 @@ impl Interceptor {
     }
 
     fn on_dial_ok(&mut self, flow: u64) {
-        let Some(f) = self.flows.get(&flow) else { return };
+        let Some(f) = self.flows.get(&flow) else {
+            return;
+        };
         let Phase::Dialing { .. } = f.phase else {
             return; // 非 Dialing（竞态）：Adopt 已发生，让 Closed 路径清
         };
@@ -820,7 +887,8 @@ impl Interceptor {
                 }
                 let h = self.sockets.add(sock);
                 let f = self.flows.get_mut(&flow).expect("刚判存在");
-                let Phase::Dialing { cache } = std::mem::replace(&mut f.phase, Phase::Established) else {
+                let Phase::Dialing { cache } = std::mem::replace(&mut f.phase, Phase::Established)
+                else {
                     unreachable!("上面已判 Dialing");
                 };
                 f.sock = Some(h);
@@ -835,7 +903,11 @@ impl Interceptor {
                 self.stats.incr_flow();
                 (self.cfg.logf)(&format!(
                     "intercept: tcp {} {}:{} ← {}:{}（dialok）",
-                    kind.as_str(), orig_dst.0, orig_dst.1, client.0, client.1
+                    kind.as_str(),
+                    orig_dst.0,
+                    orig_dst.1,
+                    client.0,
+                    client.1
                 ));
             }
         }
@@ -848,8 +920,10 @@ impl Interceptor {
             return;
         }
         let rw = f.rw_port;
-        let rx_meta: Vec<udp::PacketMetadata> = (0..64).map(|_| udp::PacketMetadata::EMPTY).collect();
-        let tx_meta: Vec<udp::PacketMetadata> = (0..64).map(|_| udp::PacketMetadata::EMPTY).collect();
+        let rx_meta: Vec<udp::PacketMetadata> =
+            (0..64).map(|_| udp::PacketMetadata::EMPTY).collect();
+        let tx_meta: Vec<udp::PacketMetadata> =
+            (0..64).map(|_| udp::PacketMetadata::EMPTY).collect();
         let mut sock = UdpSocket::new(
             udp::PacketBuffer::new(rx_meta, vec![0u8; 64 * 1024]),
             udp::PacketBuffer::new(tx_meta, vec![0u8; 64 * 1024]),
@@ -863,8 +937,11 @@ impl Interceptor {
     }
 
     fn on_dial_failed(&mut self, flow: u64) {
-        let Some(f) = self.flows.get(&flow) else { return };
-        let (kind, orig_dst, client, proto, f_syn_seq) = (f.kind, f.orig_dst, f.client, f.proto, f.syn_seq);
+        let Some(f) = self.flows.get(&flow) else {
+            return;
+        };
+        let (kind, orig_dst, client, proto, f_syn_seq) =
+            (f.kind, f.orig_dst, f.client, f.proto, f.syn_seq);
         self.stats.incr_fail();
         if proto == Proto::Tcp {
             // RST 回客户端（源 = orig dst——Go r.Complete(true) 同义）。ack = 记录的
@@ -889,14 +966,26 @@ impl Interceptor {
             if log {
                 (self.cfg.logf)(&format!(
                     "intercept: tcp {} {}:{} ← {}:{} 拨号失败：连接失败{}",
-                    kind.as_str(), orig_dst.0, orig_dst.1, client.0, client.1,
-                    if seen > 1 { format!("（该形态累计 {seen} 次，此后每 100 次记一行）") } else { String::new() }
+                    kind.as_str(),
+                    orig_dst.0,
+                    orig_dst.1,
+                    client.0,
+                    client.1,
+                    if seen > 1 {
+                        format!("（该形态累计 {seen} 次，此后每 100 次记一行）")
+                    } else {
+                        String::new()
+                    }
                 ));
             }
         } else {
             (self.cfg.logf)(&format!(
                 "intercept: udp {} {}:{} ← {}:{} 开 socket 失败：连接失败",
-                kind.as_str(), orig_dst.0, orig_dst.1, client.0, client.1
+                kind.as_str(),
+                orig_dst.0,
+                orig_dst.1,
+                client.0,
+                client.1
             ));
         }
         self.pool.forget_flow(flow); // 拨号失败：无 fd 可关，属主条目收口（H1 同族）
@@ -905,7 +994,9 @@ impl Interceptor {
 
     fn on_upstream_data(&mut self, flow: u64, data: Vec<u8>) {
         let n = data.len();
-        let Some(f) = self.flows.get_mut(&flow) else { return };
+        let Some(f) = self.flows.get_mut(&flow) else {
+            return;
+        };
         match f.proto {
             Proto::Tcp => {
                 let has_sock = f.sock.is_some();
@@ -935,7 +1026,11 @@ impl Interceptor {
         }
         // TCP 的 Ack 已在写 socket 处按「实际进入量」发出；UDP 面（数据报整包）在此清账
         if n > 0 {
-            let proto_udp = self.flows.get(&flow).map(|f| f.proto == Proto::Udp).unwrap_or(false);
+            let proto_udp = self
+                .flows
+                .get(&flow)
+                .map(|f| f.proto == Proto::Udp)
+                .unwrap_or(false);
             if proto_udp {
                 self.pool.send_for(flow, PoolCmd::Ack { flow, n });
             }
@@ -948,7 +1043,9 @@ impl Interceptor {
     /// backlog 清空且挂起 FIN 时补 close。返回本次写进 socket 的字节数（调用方按
     /// 此对 worker 清背压账）。
     fn flush_backlog(&mut self, flow: u64) -> usize {
-        let Some(f) = self.flows.get_mut(&flow) else { return 0 };
+        let Some(f) = self.flows.get_mut(&flow) else {
+            return 0;
+        };
         let Some(h) = f.sock else { return 0 };
         if f.tx_backlog.is_empty() {
             return 0;
@@ -968,7 +1065,9 @@ impl Interceptor {
     }
 
     fn on_upstream_eof(&mut self, flow: u64) {
-        let Some(f) = self.flows.get_mut(&flow) else { return };
+        let Some(f) = self.flows.get_mut(&flow) else {
+            return;
+        };
         match f.proto {
             Proto::Tcp => {
                 // 「任一方 EOF 即双向拆」的 upstream 半边：栈内 socket 发 FIN——
@@ -990,8 +1089,11 @@ impl Interceptor {
     /// 回收是 UDP 会话最常见的收尾路径，不发 Close 会让 upstream fd 与 worker 的
     /// 流属主表永久滞留 ⇒ 数小时内 EMFILE、整机出口逐渐瘫痪）。
     fn finish_udp(&mut self, flow: u64) {
-        let Some(f) = self.flows.get(&flow) else { return };
-        let (kind, orig_dst, client, replied, seq) = (f.kind, f.orig_dst, f.client, f.udp_replied, f.udp_seq_of);
+        let Some(f) = self.flows.get(&flow) else {
+            return;
+        };
+        let (kind, orig_dst, client, replied, seq) =
+            (f.kind, f.orig_dst, f.client, f.udp_replied, f.udp_seq_of);
         self.stats.decr_flow();
         if kind == Kind::Transit {
             self.stats.incr_udp_session(replied);
@@ -1001,7 +1103,13 @@ impl Interceptor {
             "udp intercept: 会话 #{seq} 关闭（{}:{} ← {}:{}）",
             orig_dst.0, orig_dst.1, client.0, client.1
         ));
-        self.pool.send_for(flow, PoolCmd::Close { flow, linger_rst: false }); // H1：fd 收口（DNS 腿无 owner，静默丢弃安全）
+        self.pool.send_for(
+            flow,
+            PoolCmd::Close {
+                flow,
+                linger_rst: false,
+            },
+        ); // H1：fd 收口（DNS 腿无 owner，静默丢弃安全）
         self.remove_flow(flow);
     }
 
@@ -1009,7 +1117,9 @@ impl Interceptor {
     fn service_sockets(&mut self) {
         let flows: Vec<u64> = self.flows.keys().copied().collect();
         for flow in flows {
-            let Some(f) = self.flows.get(&flow) else { continue };
+            let Some(f) = self.flows.get(&flow) else {
+                continue;
+            };
             let (proto, phase_ready) = (f.proto, matches!(f.phase, Phase::Established));
             if !phase_ready {
                 continue;
@@ -1029,7 +1139,11 @@ impl Interceptor {
                     if flushed > 0 {
                         self.pool.send_for(flow, PoolCmd::Ack { flow, n: flushed });
                     }
-                    let is_dns_leg = self.flows.get(&flow).map(|f| f.kind == Kind::Dns).unwrap_or(false);
+                    let is_dns_leg = self
+                        .flows
+                        .get(&flow)
+                        .map(|f| f.kind == Kind::Dns)
+                        .unwrap_or(false);
                     if can_recv && !gated {
                         // 读尽 → DNS 腿喂进程内代答 / 其余投 worker Out
                         let mut total = 0usize;
@@ -1089,10 +1203,11 @@ impl Interceptor {
                         .unwrap_or_else(|| IpEndpoint::new(Ipv4Addr::UNSPECIFIED.into(), 0));
                     loop {
                         let mut buf = [0u8; 65536];
-                        let (n, meta) = match self.sockets.get_mut::<UdpSocket>(h).recv_slice(&mut buf) {
-                            Ok(v) => v,
-                            Err(_) => break,
-                        };
+                        let (n, meta) =
+                            match self.sockets.get_mut::<UdpSocket>(h).recv_slice(&mut buf) {
+                                Ok(v) => v,
+                                Err(_) => break,
+                            };
                         if meta.endpoint != expect {
                             continue; // 非客户端来源：丢弃（包已取出，继续读）
                         }
@@ -1125,7 +1240,11 @@ impl Interceptor {
             .map(|(k, _)| *k)
             .collect();
         for flow in victims {
-            let is_udp = self.flows.get(&flow).map(|f| f.proto == Proto::Udp).unwrap_or(false);
+            let is_udp = self
+                .flows
+                .get(&flow)
+                .map(|f| f.proto == Proto::Udp)
+                .unwrap_or(false);
             if is_udp {
                 self.finish_udp(flow);
             } else {
@@ -1136,7 +1255,9 @@ impl Interceptor {
 
     /// 拆流（TCP 关闭路径）：栈 socket abort/close + worker Close + 判据行。
     fn teardown_flow(&mut self, flow: u64, linger_rst: bool) {
-        let Some(f) = self.flows.get(&flow) else { return };
+        let Some(f) = self.flows.get(&flow) else {
+            return;
+        };
         let (kind, orig_dst, client, proto) = (f.kind, f.orig_dst, f.client, f.proto);
         if proto == Proto::Tcp {
             if let Some(h) = f.sock {
@@ -1146,10 +1267,15 @@ impl Interceptor {
             self.stats.decr_flow();
             (self.cfg.logf)(&format!(
                 "intercept: tcp {} {}:{} ← {}:{} 关闭",
-                kind.as_str(), orig_dst.0, orig_dst.1, client.0, client.1
+                kind.as_str(),
+                orig_dst.0,
+                orig_dst.1,
+                client.0,
+                client.1
             ));
         }
-        self.pool.send_for(flow, PoolCmd::Close { flow, linger_rst });
+        self.pool
+            .send_for(flow, PoolCmd::Close { flow, linger_rst });
         self.remove_flow(flow);
     }
 
@@ -1178,8 +1304,13 @@ impl Interceptor {
                 // 的调用纪律承载（service_sockets 的 state==Closed 检查）
             }
             self.by_rw_port.remove(&f.rw_port);
-            self.by_five
-                .remove(&(f.client.0, f.client.1, f.orig_dst.0, f.orig_dst.1, if f.proto == Proto::Tcp { 6 } else { 17 }));
+            self.by_five.remove(&(
+                f.client.0,
+                f.client.1,
+                f.orig_dst.0,
+                f.orig_dst.1,
+                if f.proto == Proto::Tcp { 6 } else { 17 },
+            ));
         }
     }
 
@@ -1319,7 +1450,9 @@ mod tests {
             // 客户端 → 拦截层（时间单调推进——栈定时器依赖）
             *tick += 5;
             let t = SmolInstant::from_millis(*tick);
-            client.iface.poll(t, &mut client.device, &mut client.sockets);
+            client
+                .iface
+                .poll(t, &mut client.device, &mut client.sockets);
             let mut out = Vec::new();
             client.device.drain_tx(&mut out);
             for p in out {
@@ -1381,17 +1514,29 @@ mod tests {
                 break;
             }
         }
-        assert!(established, "豁免流应建连（state={:?}）", client.sockets.get::<TcpSocket>(h).state());
+        assert!(
+            established,
+            "豁免流应建连（state={:?}）",
+            client.sockets.get::<TcpSocket>(h).state()
+        );
         assert!(stats.snapshot()[0].1 >= 1, "dialok 应计数");
 
         // 数据往返
-        client.sockets.get_mut::<TcpSocket>(h).send_slice(b"hello-exempt").unwrap();
+        client
+            .sockets
+            .get_mut::<TcpSocket>(h)
+            .send_slice(b"hello-exempt")
+            .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut got = Vec::new();
         while Instant::now() < deadline {
             cross_pump(&mut client, &mut itc, 4, &mut 0);
             let mut buf = [0u8; 4096];
-            let n = client.sockets.get_mut::<TcpSocket>(h).recv_slice(&mut buf).unwrap_or(0);
+            let n = client
+                .sockets
+                .get_mut::<TcpSocket>(h)
+                .recv_slice(&mut buf)
+                .unwrap_or(0);
             if n > 0 {
                 got.extend_from_slice(&buf[..n]);
                 break;
@@ -1450,7 +1595,9 @@ mod tests {
         std::thread::spawn(move || {
             let mut buf = [0u8; 1500];
             loop {
-                let Ok((n, from)) = up.recv_from(&mut buf) else { return };
+                let Ok((n, from)) = up.recv_from(&mut buf) else {
+                    return;
+                };
                 let mut r = Vec::new();
                 r.extend_from_slice(&buf[..2]); // ID 回显
                 r.extend_from_slice(&[0x80 | 0x01, 0x80, 0x00, 0x01]);
@@ -1471,7 +1618,10 @@ mod tests {
         std::fs::write(dir.join("resolv.conf"), format!("nameserver {up_addr}\n")).unwrap();
 
         let (proxy, events) = DnsProxy::spawn(
-            DnsConfig { resolv_path: dir.join("resolv.conf").to_string_lossy().into_owned(), ..Default::default() },
+            DnsConfig {
+                resolv_path: dir.join("resolv.conf").to_string_lossy().into_owned(),
+                ..Default::default()
+            },
             Arc::new(|_| {}),
             Arc::new(|_| {}),
         );
@@ -1522,8 +1672,15 @@ mod tests {
         let resp = resp53.expect(":53 面应答到达");
         assert_eq!(&resp[..2], &0x3344u16.to_be_bytes(), "ID 回显");
         assert_eq!(resp[3] & 0x0F, 0, "RCODE=0");
-        assert!(resp.windows(4).any(|w| w == [127, 0, 0, 1]), "A 记录 127.0.0.1 在应答里");
-        assert!(proxy.stats_line().contains("q=1"), "隧道 UDP 面计 q：{}", proxy.stats_line());
+        assert!(
+            resp.windows(4).any(|w| w == [127, 0, 0, 1]),
+            "A 记录 127.0.0.1 在应答里"
+        );
+        assert!(
+            proxy.stats_line().contains("q=1"),
+            "隧道 UDP 面计 q：{}",
+            proxy.stats_line()
+        );
         assert!(proxy.stats_line().contains("resp=1"));
 
         // ② 进程内腿：dst=8.8.8.8:53（非隧道 IP 的 :53）→ 拦截 dns 会话 → submit_leg
@@ -1540,7 +1697,10 @@ mod tests {
         while Instant::now() < deadline {
             for p in itc.pump() {
                 if let Some(v) = Ipv4View::parse(&p) {
-                    if v.proto == 17 && v.dst == Ipv4Addr::new(100, 64, 10, 9) && v.src == Ipv4Addr::new(8, 8, 8, 8) {
+                    if v.proto == 17
+                        && v.dst == Ipv4Addr::new(100, 64, 10, 9)
+                        && v.src == Ipv4Addr::new(8, 8, 8, 8)
+                    {
                         resp_leg = Some(v.payload.to_vec());
                     }
                 }
@@ -1553,7 +1713,11 @@ mod tests {
         let resp = resp_leg.expect("拦截腿应答到达（源反重写为 8.8.8.8）");
         assert_eq!(&resp[..2], &0x3344u16.to_be_bytes());
         // submit_leg 不计 q（Go Answer 口径）；resp 计数 +1
-        assert!(proxy.stats_line().contains("q=1"), "腿不计 q：{}", proxy.stats_line());
+        assert!(
+            proxy.stats_line().contains("q=1"),
+            "腿不计 q：{}",
+            proxy.stats_line()
+        );
         assert!(proxy.stats_line().contains("resp=2"));
         let _ = SI::from_millis(0i64);
         let _ = CUdp::new(
@@ -1578,7 +1742,9 @@ mod tests {
         std::thread::spawn(move || {
             let mut buf = [0u8; 1500];
             loop {
-                let Ok((n, from)) = up.recv_from(&mut buf) else { return };
+                let Ok((n, from)) = up.recv_from(&mut buf) else {
+                    return;
+                };
                 let mut r = Vec::new();
                 r.extend_from_slice(&buf[..2]);
                 r.extend_from_slice(&[0x80 | 0x01, 0x80, 0x00, 0x01]);
@@ -1599,7 +1765,10 @@ mod tests {
         std::fs::write(dir.join("resolv.conf"), format!("nameserver {up_addr}\n")).unwrap();
 
         let (proxy, events) = DnsProxy::spawn(
-            DnsConfig { resolv_path: dir.join("resolv.conf").to_string_lossy().into_owned(), ..Default::default() },
+            DnsConfig {
+                resolv_path: dir.join("resolv.conf").to_string_lossy().into_owned(),
+                ..Default::default()
+            },
             Arc::new(|_| {}),
             Arc::new(|_| {}),
         );
@@ -1617,7 +1786,11 @@ mod tests {
         itc.attach_dns();
 
         // 客户端栈 connect(8.8.8.8:53)——非隧道 IP 的 :53 TCP
-        let mut client = StackB::new(Ipv4Addr::new(100, 64, 10, 7), tunnel, SmolInstant::from_millis(0));
+        let mut client = StackB::new(
+            Ipv4Addr::new(100, 64, 10, 7),
+            tunnel,
+            SmolInstant::from_millis(0),
+        );
         let dst = std::net::SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53);
         let h: SocketHandle = client.connect(dst).unwrap();
         let mut tick = 0i64;
@@ -1630,7 +1803,11 @@ mod tests {
                 break;
             }
         }
-        assert!(established, "TCP DNS 腿应无拨号直接建立（state={:?}）", client.sockets.get::<TcpSocket>(h).state());
+        assert!(
+            established,
+            "TCP DNS 腿应无拨号直接建立（state={:?}）",
+            client.sockets.get::<TcpSocket>(h).state()
+        );
 
         // 一条 A 查询（id=0x5566，a.example）——RFC1035 帧化，**分两次 send**（半帧跨读）
         let mut q = Vec::new();
@@ -1646,17 +1823,29 @@ mod tests {
         frame.extend_from_slice(&(q.len() as u16).to_be_bytes());
         frame.extend_from_slice(&q);
         let (cut,) = (frame.len() / 2,);
-        client.sockets.get_mut::<TcpSocket>(h).send_slice(&frame[..cut]).unwrap();
+        client
+            .sockets
+            .get_mut::<TcpSocket>(h)
+            .send_slice(&frame[..cut])
+            .unwrap();
         let mut tick = 0i64;
         cross_pump(&mut client, &mut itc, 6, &mut tick); // 半帧进积攒缓冲，不应有应答
-        client.sockets.get_mut::<TcpSocket>(h).send_slice(&frame[cut..]).unwrap();
+        client
+            .sockets
+            .get_mut::<TcpSocket>(h)
+            .send_slice(&frame[cut..])
+            .unwrap();
 
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut got: Vec<u8> = Vec::new();
         while Instant::now() < deadline {
             cross_pump(&mut client, &mut itc, 4, &mut tick);
             let mut buf = [0u8; 4096];
-            let n = client.sockets.get_mut::<TcpSocket>(h).recv_slice(&mut buf).unwrap_or(0);
+            let n = client
+                .sockets
+                .get_mut::<TcpSocket>(h)
+                .recv_slice(&mut buf)
+                .unwrap_or(0);
             if n > 0 {
                 got.extend_from_slice(&buf[..n]);
                 if got.len() >= 2 {
@@ -1673,9 +1862,16 @@ mod tests {
         let resp = &got[2..];
         assert_eq!(&resp[..2], &0x5566u16.to_be_bytes(), "ID 回显");
         assert_eq!(resp[3] & 0x0F, 0, "RCODE=0");
-        assert!(resp.windows(4).any(|w| w == [127, 0, 0, 1]), "A 记录在应答里");
+        assert!(
+            resp.windows(4).any(|w| w == [127, 0, 0, 1]),
+            "A 记录在应答里"
+        );
         // qtcp 单列（Go ServeStream 的 qtcp.Add 口径——M3 腿与隧道内 TCP 面同计数）
-        assert!(proxy.stats_line().contains("qtcp=1"), "TCP 腿计 qtcp：{}", proxy.stats_line());
+        assert!(
+            proxy.stats_line().contains("qtcp=1"),
+            "TCP 腿计 qtcp：{}",
+            proxy.stats_line()
+        );
         let _ = SI::from_millis(0i64);
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -1715,7 +1911,10 @@ mod tests {
         while Instant::now() < deadline {
             for p in itc.pump() {
                 if let Some(v) = Ipv4View::parse(&p) {
-                    if v.proto == 17 && v.dst == Ipv4Addr::new(100, 64, 10, 3) && v.src == Ipv4Addr::LOCALHOST {
+                    if v.proto == 17
+                        && v.dst == Ipv4Addr::new(100, 64, 10, 3)
+                        && v.src == Ipv4Addr::LOCALHOST
+                    {
                         resp = Some(v.payload.to_vec());
                     }
                 }
@@ -1725,7 +1924,11 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
-        assert_eq!(resp.as_deref(), Some(&b"udp-echo-q"[..]), "UDP 回投应反重写到客户端");
+        assert_eq!(
+            resp.as_deref(),
+            Some(&b"udp-echo-q"[..]),
+            "UDP 回投应反重写到客户端"
+        );
         assert!(stats.snapshot()[2].1 >= 1, "flows gauge 应计会话");
         // fd 收口回归（评审 H1）：close() 的 teardown 必须给 worker 发 Close（此前
         // idle/close 路径不发 Close，upstream fd 与属主表永久滞留 ⇒ EMFILE）。
@@ -1758,9 +1961,15 @@ mod tests {
         // 而稳态 24.8MB/s=满链路）——量级提到稳态支配（塌陷判别语义不变：0.4MB/s
         // 塌陷形态在 64MB 下 160s 超时必红）。
         const LINK_RATE_MB: f64 = 24.0; // DirLink::deep 的速率参数（改一处同步两处）
-        let (secs, bytes, _) = run_shaped_download(1, 16 * 1024 * 1024, DirLink::passthrough(), DirLink::passthrough());
+        let (secs, bytes, _) = run_shaped_download(
+            1,
+            16 * 1024 * 1024,
+            DirLink::passthrough(),
+            DirLink::passthrough(),
+        );
         let ceiling = bytes as f64 / secs / (1024.0 * 1024.0);
-        let (secs, bytes, down) = run_shaped_download(1, 64 * 1024 * 1024, DirLink::deep(), DirLink::deep());
+        let (secs, bytes, down) =
+            run_shaped_download(1, 64 * 1024 * 1024, DirLink::deep(), DirLink::deep());
         let got = bytes as f64 / secs / (1024.0 * 1024.0);
         println!(
             "A 单流：无损天花板 {ceiling:.1}MB/s → 深队列有损 {got:.1}MB/s（丢 {} 包 / 峰值队列 {}B）",
@@ -1772,9 +1981,15 @@ mod tests {
             "深队列形态下单流吞吐 {got:.1}MB/s 应 ≥ 可达速率 {reach1:.1}MB/s（min(链路 24, 天花板 {ceiling:.1})）的 50%（无回归判据）"
         );
 
-        let (secs, bytes, _) = run_shaped_download(6, 3 * 1024 * 1024, DirLink::passthrough(), DirLink::passthrough());
+        let (secs, bytes, _) = run_shaped_download(
+            6,
+            3 * 1024 * 1024,
+            DirLink::passthrough(),
+            DirLink::passthrough(),
+        );
         let ceiling6 = bytes as f64 / secs / (1024.0 * 1024.0);
-        let (secs, bytes, down6) = run_shaped_download(6, 8 * 1024 * 1024, DirLink::deep(), DirLink::deep());
+        let (secs, bytes, down6) =
+            run_shaped_download(6, 8 * 1024 * 1024, DirLink::deep(), DirLink::deep());
         let got6 = bytes as f64 / secs / (1024.0 * 1024.0);
         println!(
             "A 并发 6 流：无损天花板 {ceiling6:.1}MB/s → 深队列有损 {got6:.1}MB/s（丢 {} 包 / 峰值队列 {}B）",
@@ -1796,7 +2011,8 @@ mod tests {
         // （2026-10-04，commit c0a244f 前的 4325c1b 基线 + 同链路形态；部分消融
         // 〔仅去 allowed 上限、保留 pacing〕实测 5.2MB/s，介于两者之间——判据下界
         // 取保守的 3.2MB/s = 0.4×8）
-        let (secs, bytes, downb) = run_shaped_download(1, 8 * 1024 * 1024, DirLink::shallow(), DirLink::shallow());
+        let (secs, bytes, downb) =
+            run_shaped_download(1, 8 * 1024 * 1024, DirLink::shallow(), DirLink::shallow());
         let gotb = bytes as f64 / secs / (1024.0 * 1024.0);
         println!(
             "B 浅队列单流：{gotb:.1}MB/s（丢 {} 包 / 峰值队列 {}B；修复前真代码 0.4MB/s）",
@@ -1955,7 +2171,9 @@ mod tests {
                 tunnel,
                 SmolInstant::from_millis(0),
             );
-            let h = s.connect(std::net::SocketAddrV4::new(tunnel, port)).unwrap();
+            let h = s
+                .connect(std::net::SocketAddrV4::new(tunnel, port))
+                .unwrap();
             clients.push((s, h));
         }
 
@@ -1974,7 +2192,8 @@ mod tests {
                 last_diag = now;
                 let f = itc.flows.values().next();
                 if let Some(f) = f {
-                    let (sq, bl) = f.sock
+                    let (sq, bl) = f
+                        .sock
                         .map(|h| {
                             let s = itc.sockets.get_mut::<TcpSocket>(h);
                             (s.send_queue(), 0usize)
@@ -2023,7 +2242,11 @@ mod tests {
             for (i, (s, h)) in clients.iter_mut().enumerate() {
                 let mut buf = [0u8; 64 * 1024];
                 loop {
-                    let n = s.sockets.get_mut::<TcpSocket>(*h).recv_slice(&mut buf).unwrap_or(0);
+                    let n = s
+                        .sockets
+                        .get_mut::<TcpSocket>(*h)
+                        .recv_slice(&mut buf)
+                        .unwrap_or(0);
                     if n == 0 {
                         break;
                     }

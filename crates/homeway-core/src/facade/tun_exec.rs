@@ -135,6 +135,10 @@ impl Write for SessionWriteHalf {
     /// 展开成**有界等待重试**（Go net.Conn.Write 的阻塞语义）：重试节拍 2ms（RPC
     /// 风暴防护——停滞期 ~500 次/s），无进展上限 10s（远大于窗口时长，防死锁兜底）。
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
+        if data.is_empty() {
+            return Ok(0); // 空写短路（评审 r1-补1：send_slice(&[]) 恒 Ok(0) 会被
+                          // 背压环当「缓冲满」空转 10s——io::Write 约定空写返 Ok(0)）
+        }
         let no_progress = Instant::now();
         loop {
             match self.shared.client.write(self.shared.id, data.to_vec()) {

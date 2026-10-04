@@ -7,7 +7,10 @@
 //! 平台分派：
 //! - **Linux/OHOS**：`sendmmsg`（libc 面已在 aarch64-unknown-linux-ohos 编译验证）。
 //!   分批 ≤64 条/次（栈上 mmsghdr/iovec/sockaddr_storage 数组有界）；短返（非阻塞
-//!   下余量 EAGAIN）即停，余量按「本批未发」计，调用方下拍续发。
+//!   下余量 EAGAIN）即停——余量本批丢弃不续发（调用方按成功前缀记账 + 丢弃计数，
+//!   见 server/bind.rs 的 tx_dropped）。
+//!   EINTR 仅整批未动时整批重试；部分发出后的 EINTR 与 macOS 回退（std send_to
+//!   不重试 EINTR）语义不一致——登记差异。
 //! - **macOS/其余**：无批量发送系统调用——退化为逐包 `std UdpSocket::send_to`
 //!   （与 Go 侧同形态：wireguard-go 在 macOS 亦逐包 sendto ⇒ 同机 A/B 公平）。
 //!
@@ -21,10 +24,10 @@
 use std::io;
 use std::net::SocketAddr;
 #[cfg(not(target_os = "linux"))]
+use std::net::UdpSocket;
+#[cfg(not(target_os = "linux"))]
 use std::os::fd::FromRawFd;
 use std::os::fd::RawFd;
-#[cfg(not(target_os = "linux"))]
-use std::net::UdpSocket;
 
 /// 单条待发消息：目的端点 + 载荷（载荷借用须存活到本函数返回）。
 pub struct OutMsg<'a> {
@@ -72,13 +75,20 @@ fn send_mmsg(fd: RawFd, msgs: &[OutMsg<'_>]) -> (usize, Option<(SocketAddr, io::
             hdrs[i].msg_hdr.msg_iov = &mut iovs[i] as *mut _ as *mut libc::iovec;
             hdrs[i].msg_hdr.msg_iovlen = 1;
         }
-        let r = unsafe { libc::sendmmsg(fd, hdrs.as_mut_ptr(), n as libc::c_uint, libc::MSG_DONTWAIT as libc::c_uint) };
+        let r = unsafe {
+            libc::sendmmsg(
+                fd,
+                hdrs.as_mut_ptr(),
+                n as libc::c_uint,
+                libc::MSG_DONTWAIT as libc::c_uint,
+            )
+        };
         if r < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted && sent_total == 0 && off == 0 {
                 continue 'outer; // EINTR 且整批未动：整批重试
             }
-            first_err = Some((msgs[off].dst, e));
+            first_err = Some((msgs[off].dst, e)); // 首错即弃余量（评审 r1-F8：有意语义）
             break;
         }
         let sent = r as usize;
@@ -103,7 +113,9 @@ fn sock_addr_parts(
                 let sin = libc::sockaddr_in {
                     sin_family: libc::AF_INET as _,
                     sin_port: v4.port().to_be(),
-                    sin_addr: libc::in_addr { s_addr: u32::from_ne_bytes(v4.ip().octets()) },
+                    sin_addr: libc::in_addr {
+                        s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                    },
                     sin_zero: [0; 8],
                 };
                 storage.write(std::mem::zeroed());
@@ -112,13 +124,18 @@ fn sock_addr_parts(
                     storage.as_mut_ptr().cast::<u8>(),
                     std::mem::size_of::<libc::sockaddr_in>(),
                 );
-                (storage.as_mut_ptr().cast(), std::mem::size_of::<libc::sockaddr_in>() as _)
+                (
+                    storage.as_mut_ptr().cast(),
+                    std::mem::size_of::<libc::sockaddr_in>() as _,
+                )
             }
             SocketAddr::V6(v6) => {
                 let sin6 = libc::sockaddr_in6 {
                     sin6_family: libc::AF_INET6 as _,
                     sin6_port: v6.port().to_be(),
-                    sin6_addr: libc::in6_addr { s6_addr: v6.ip().octets() },
+                    sin6_addr: libc::in6_addr {
+                        s6_addr: v6.ip().octets(),
+                    },
                     sin6_flowinfo: v6.flowinfo(),
                     sin6_scope_id: v6.scope_id(),
                 };
@@ -128,7 +145,10 @@ fn sock_addr_parts(
                     storage.as_mut_ptr().cast::<u8>(),
                     std::mem::size_of::<libc::sockaddr_in6>(),
                 );
-                (storage.as_mut_ptr().cast(), std::mem::size_of::<libc::sockaddr_in6>() as _)
+                (
+                    storage.as_mut_ptr().cast(),
+                    std::mem::size_of::<libc::sockaddr_in6>() as _,
+                )
             }
         }
     }
@@ -181,12 +201,19 @@ mod tests {
             );
         }
         let payloads: Vec<Vec<u8>> = (0..80usize).map(|i| vec![i as u8; 64]).collect();
-        let msgs: Vec<OutMsg<'_>> = payloads.iter().map(|p| OutMsg { dst, buf: p.as_slice() }).collect();
+        let msgs: Vec<OutMsg<'_>> = payloads
+            .iter()
+            .map(|p| OutMsg {
+                dst,
+                buf: p.as_slice(),
+            })
+            .collect();
         let (sent, err) = send_batch(tx.as_raw_fd(), &msgs);
         assert_eq!(sent, 80, "应全量发出（首错 = {err:?}）");
         // 超批（>64）分批语义由 sent==80 钉死
         let mut got = Vec::new();
-        rx.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+        rx.set_read_timeout(Some(std::time::Duration::from_secs(2)))
+            .unwrap();
         let mut buf = [0u8; 128];
         while got.len() < 80 {
             match rx.recv_from(&mut buf) {

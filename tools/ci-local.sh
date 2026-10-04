@@ -4,7 +4,7 @@
 # 编排（顺序，前者失败即停）：
 #   1. tools/check-baseline.sh            基线门（克隆 HEAD == BASELINE.md 锚定）
 #   2. cargo test --workspace             单测+集成（fuzz_replay #[ignore] 跳过——quick 档）
-#   3. cargo clippy --all-targets -D warnings
+#   3. cargo clippy --all-targets -D warnings + OHOS 交叉 check（r1-F18）
 #   4. tools/gen-vectors.sh + shasum -c + git diff   向量确定性门（含 SUMS 校验——G-11）
 #   5. tools/check-vocab.sh               词表三方门
 #   6. cargo build --release -p homeway-cli           smoke 前置（G-10）
@@ -31,8 +31,9 @@ if (( FULL )); then
   (cd "$REPO_ROOT" && cargo test --workspace --ignored) || fail 2 "fuzz_replay"
 fi
 
-echo "==> [3/7] clippy（-D warnings）"
+echo "==> [3/7] clippy（-D warnings）+ OHOS 交叉面（评审 r1-F18：macOS 编译不到 sendmmsg 支——交叉 check 补覆盖）"
 (cd "$REPO_ROOT" && cargo clippy --workspace --all-targets -- -D warnings) || fail 3 "clippy"
+(cd "$REPO_ROOT" && cargo check --target aarch64-unknown-linux-ohos -p homeway-core -p homeway-cli -p homeway-capi) || fail 3 "OHOS 交叉 check"
 
 echo "==> [4/7] 向量确定性门（gen-vectors + SUMS + git diff）"
 "$REPO_ROOT/tools/gen-vectors.sh" >/dev/null || fail 4 "向量生成"

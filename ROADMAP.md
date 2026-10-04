@@ -58,18 +58,50 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 | **R5** | 互操作矩阵全量 + fuzz + 性能 A/B + 台账三方门 | **完成**（2026-10-03：两道门全过〔两轮代码评审 4高/15中/18低全处置〕+ 终验轮 4 六链路 + L3 复跑全绿 + PERF-AB 入库 + ci-local 一键门全绿） | 6/6 步 |
 | **R6** | term 服务面（协议/surface 产出/检测引擎 + 自建编码器/应答器） | **完成**（2026-10-04 五棒收官：6a 设计 + 6b vt 底座 + 门一〔4高全修〕+ 6c 编码器/应答器全量〔键 387+/鼠 245/应答 64 向量全绿〕+ 6d 帧族/会话注册表 + 6e surface 体编码〔golden 两向全绿〕+ 6f-1/2 manifest 引擎+检测融合 + 6f-3a PTY/环 + 6f-3b 会话装配/引擎接线〔八模块装成 TermService：ServeConn/raw 腿握手与停滞写者/surface 投递/pump/sample/LIST/EXPLAIN/HOMEWAY_TERM=off；D-19 信号死 -1 映射〕+ 6g 判据实测〔Go term CLI 消费 Rust term 服务全流程 + 检测三态 + linux 交叉面清账 + 判据行入册〕+ 门二两轮〔高3+2/中4+3/低9+10 全处置，评审记录 docs/reviews/R6.md〕+ ci-local 七步全绿） | 6a-6g ✅ 门一/门二 ✅ |
 | **R7** | APP 接入（C-ABI 胶水 + OHOS 交叉 + 20 导出面 + HSP 集成 + 真机判据） | **完成**（2026-10-04 三棒收官：第 1 棒 7a–7f + 第 2 棒 7g–7k〔真机两轮全量判据 + P0 整改〕+ 第 3 棒 7l–7n〔P1/P2 29 项全处置 + 两条拍板落地 + 7m 补验四项收口 + dsh r3 复核〔F1 回归修复 + F2-F16 处置〕；真机三轮判据总表 + ci-local 全绿 21:06〕） | 9/9 步 |
-| **R8** | 终测收官（包体/性能终测 + 共存定案 + 文档指针补录） | 未开始 | — |
+| **R8** | 终测收官（包体/性能终测 + 共存定案 + 文档指针补录） | **R8-1 完成**（2026-10-05 凌晨：8a 迁移 + 8b 发送路径 + 8c 六项处置 + 8d 收口；下行 0.5× 门未过挂 R8-2） | 8a-8d ✅（下行缺口 → R8-2） |
 
-**下一步（当前指针）**：**R8 终测收官**。R7 已三棒完成（见下方 R7 完成证据）。
-R8 范围 = ROADMAP R8 节 + 复核 r3 的登记移交（`docs/reviews/R7-design.md` §六）：
-① 真机 WG **上行 bulk 吞吐退化**（测速 up 归因链 = R6.6 encap/发送路径瓶颈同族，
-修复判据已立项：下行 ≥0.5×Go + 发送路径 profile + 上行帧中途断判据与轮 1 原文
-并列）；② SpeedConn 的 Go SetDeadline 同义期限面（F8 timeout 分支极端形态）；
-③ tier 侧 homeway-rs.pin 期望 SHA（与「仓归属」决策一并）；④ ServiceRun↔BridgeHost
-引用环（F15，每 start/stop 周期泄漏一套对象）；⑤ term 测试 attach_size 偶发挂死
-的硬期限加固（F3，本机 4 轮未复现）；⑥ smoltcp 0.11→0.14 升级前置批（R6.6 立项）。
-**用户触点**：R8 的共存定案（合入 homeway 仓 `rust/` vs 独立仓）+ tier 文档地图
-指针补录。
+**下一步（当前指针）**：**R8-2 收官批**。R8-1 已完成（2026-10-05 凌晨，见下方
+「R8-1 完成证据」与 `docs/reviews/R8.md` 全量处置表）。R8-2 范围：
+
+1. **下行 0.5× 门缺口**（R8-1 真机 A/B 唯一未过判据：Rust exit 下行 14.7MB/s vs
+   Go 同刻 40.4MB/s = 0.36×，门 ≥0.5×）。归因候选与已排除项见 R8.md §二：
+   - 已排除：客户端批化（消融实测劣化已移除）、上行 bulk 断流（Ok(0)→WriteZero
+     已修——上行 109-279Mbps 完整轮）；
+   - 候选：出口侧发送形态（单驱动线程串行 encap+sendto，profile 78% sendto；
+     CUBIC 无 pacing 的窗口均值拉低）+ **Linux 出口（阿里云）的 sendmmsg 面真机
+     验证**（macOS 本地 exit 无 sendmmsg，只验了 staging 收益）；
+   - 顺手批：tier install-tier.sh 的 mtime 护栏只盯 .ets 不盯 .so 输入 + hvigor
+     对 prebuilt .so 缓存不重打包（R8-1 实测四次「装了旧核」假事故——判据 =
+     hilog `tun prepare ver=`，重出包须 rm module/build/default/outputs）。
+2. r3 登记 ③ tier `homeway-rs.pin` 期望 SHA——与「仓归属」用户触点一并定。
+3. R8 原有收官项：共存定案（用户触点）、性能/包体终测报告定稿、tier 文档地图
+   指针补录（用户触点）、本仓 AGENTS/README 定稿、遗留项清账移交。
+4. dsh 评审 R8-1 处置表的未清项跟进（见 docs/reviews/R8.md §五）。
+
+**R8-1 完成证据（2026-10-05 凌晨，commit b9730a9..e0fbcc72bde6）**：
+
+- **8a smoltcp 0.11→0.14 迁移 + CC 垫片退役**：破坏面三处适配（RxToken 共享切片/
+  core::net 直用/CC feature）+ CUBIC 启用（栈 B + 拦截层两建点——算法选择与依据见
+  R8.md §一）+ 垫片全删（17 字段/11 常量/cwnd_flush 门/note_tx_segment，ROADMAP
+  「R7 前置批 smoltcp 0.14 工单」闭环）。harness 三臂全绿（重标定三条均有物理论证：
+  链路模型突发额度 2MB→rate×2ms 的 mega-burst 失真修正 + ACK 时钟饿死根因、传输量
+  稳态化、并发臂判别职责移交 B 臂——CC=None 浅队列塌陷实测 <0.2MB/s 仍判别）。
+- **8b 发送路径**：profile（出口驱动线程 78% __sendto）→ udpbatch 原语（sendmmsg/
+  回退双形 + 单测）+ 出口 send_wire staging 批化（macOS 回环 A/B：down 持平 Go、
+  up 401→469Mbps）；**客户端批化真机消融实测劣化（down 47→15MB/流、up 86→25MB/流）
+  已整体移除**；**上行 bulk 断流根因修复** = SessionWriteHalf 把 send_slice 的 Ok(0)
+  透传成 io::Write「通道关」（write_all 以 WriteZero 报错 ⇒ 桥泵拆连接）——展开为
+  有界等待重试（2ms 节拍/10s 上限）；桥泵收口观测转正式。
+- **真机 A/B 终态**（FMR0224116011480，本地 Rust exit 42651 vs 现役 Go 41641 同刻）：
+  上行 13.6-34.9MB/s vs Go 34.2（**断流→完整轮，判据过/贴线**）；下行 14.7 vs 40.4
+  （0.36×，**未过 0.5× 门→R8-2**）。⚠️ 测量教训入册：hvigor 缓存不重打包 .so——
+  判据必须 hilog ver=（R8.md §二）。
+- **8c r3 六项**：①上行=8b 根因修复收口 ②set_deadline（Go SetDeadline 同义 +
+  M-8 失实半边修正）④ServiceRun↔Bridge Weak 化 ⑤attach_size 60s 硬期限 ⑥=8a；
+  ③挂账 R8-2（依赖仓归属触点）；cmd 无界/F10/F13 残/F16 维持登记（理由在册）。
+- **8d**：dsh 评审（R8.md §五）+ ci-local 七步全绿（2026-10-05 00:13:55 终轮，
+  RRR 矩阵 446s）+ 333 lib 全绿 + clippy 0 + OHOS 交叉 0。
+- 真机终态：Rust 核 e0fbcc72bde6 连现役 Go 出口（用户常态）。
 
 **R7 前置批工单：smoltcp 0.11 → 0.14 升级（R6.6 决策，2026-10-04 登记）**
 ——正式条目，R7 开工时与基线重锚一起做或排 R8，由届时会话按预算定：
@@ -686,6 +718,10 @@ OHOS 交叉与链接配方）→ 20 个导出面实装（语义真源 = `tier:AG
 性能/包体终测报告、双栈共存定案（合入 homeway 仓 `rust/` vs 独立仓——用户触点）、
 tier 文档地图指针补录（`docs/agents/roadmap.md` 或 AGENTS.md 加一行指针——用户触点，发版
 会话收官后做）、本仓 AGENTS/README 定稿、遗留项清账（附录「发现的 Go 侧问题」移交清单）。
+
+**R8-1 进度注记（2026-10-05 凌晨，接棒真源 = `docs/reviews/R8.md` + 上方「下一步」指针）**：
+8a/8b/8c/8d 四单元完成（处置表/实测数字/重标定依据全量在 R8.md）；唯一未过判据 =
+下行 0.5× 门（0.36×，归因与 R8-2 路径在 R8.md §二）；r3 登记项 ③ 挂账 R8-2。
 
 ---
 
