@@ -848,7 +848,7 @@ fn driver_loop(
                 let dpkgs = s.1 - last_tx_stats_snap.1;
                 let dbytes = txb - last_tx_bytes;
                 let avg = dpkgs as f64 / dcalls as f64;
-                let bpp = if dpkgs > 0 { dbytes / dpkgs } else { 0 };
+                let bpp = (dbytes as f64 / dpkgs.max(1) as f64) as u64;
                 if s.3 > last_tx_stats_snap.3 {
                     (dlogf)(&format!(
                         "serve: UDP 出站 调用+{dcalls} 均批{avg:.1}包/调用 单调用最大{}包 均包{bpp}B 累计丢弃{}包（+{}）",

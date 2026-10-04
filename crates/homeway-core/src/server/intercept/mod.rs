@@ -2138,6 +2138,21 @@ mod tests {
         }
     }
 
+    /// 尾窗（最后 2s）平均速率，MB/s（R8-2 8g 尾窗速率门的计算面——传输不足 2s
+    /// 返回 0.0，由调用方决定是否设门）。采样线取「≤ t-2s 的最后一点」与收尾点的
+    /// 字节差 ÷ 实际时长（尾段首点晚于 t-2s 时用更短的实际窗口）。
+    fn tail_rate_mbps(timeline: &[(f64, usize)], t_end: f64, total: usize) -> f64 {
+        let idx = timeline.iter().rposition(|(t, _)| *t <= t_end - 2.0);
+        let Some(&(_, base)) = idx.map(|i| &timeline[i]) else {
+            return 0.0;
+        };
+        let span = t_end - timeline[idx.unwrap()].0;
+        if span <= 0.0 {
+            return 0.0;
+        }
+        (total - base) as f64 / span / (1024.0 * 1024.0)
+    }
+
     /// 一轮受控下载：n_flows 条并发流（各一台栈 B 客户端，独立隧道 IP）经共享的上/下
     /// 行链路拉 bytes_each 字节；豁免腿转投回环 origin。返回（耗时秒, 总字节, 下行统计）。
     fn run_shaped_download(
@@ -2300,16 +2315,3 @@ mod tests {
     }
 }
 
-/// 尾窗（最后 2s）平均速率，MB/s（R8-2 8g 尾窗速率门的计算面——传输不足 2s
-/// 返回 None 形态的 0.0，由调用方决定是否设门）。采样线取「≤ t-2s 的最后一点」
-/// 与收尾点的字节差 ÷ 实际时长（尾段首点晚于 t-2s 时用更短的实际窗口）。
-fn tail_rate_mbps(timeline: &[(f64, usize)], t_end: f64, total: usize) -> f64 {
-    let Some(&(_, base)) = timeline.iter().rev().find(|(t, _)| *t <= t_end - 2.0) else {
-        return 0.0;
-    };
-    let span = t_end - timeline.iter().rev().find(|(t, _)| *t <= t_end - 2.0).unwrap().0;
-    if span <= 0.0 {
-        return 0.0;
-    }
-    (total - base) as f64 / span / (1024.0 * 1024.0)
-}
