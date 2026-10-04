@@ -450,7 +450,7 @@ impl Interceptor {
             tcp::SocketBuffer::new(vec![0u8; FLOW_TX_BUF]),
         );
         sock.set_nagle_enabled(false);
-        sock.set_congestion_control(tcp::CongestionControl::Cubic); // R8-8a：RFC 合规 CUBIC（CC 垫片退役）
+        sock.set_congestion_control(self.cc_algo()); // R8-8a CUBIC（R8-2 起 HOMEWAY_CC 可消融）
         sock.set_timeout(Some(smoltcp::time::Duration::from_secs(
             TCP_DNS_IDLE.as_secs(),
         )));
@@ -749,6 +749,23 @@ impl Interceptor {
         std::mem::take(&mut self.tx_out)
     }
 
+    /// 栈内 TCP socket 的 CC 算法（R8-2 归因插桩）：`crate::cc_choice()` 的默认
+    /// CUBIC + **非默认值一次性记行**（消融轮的判据面——hilog/stdout 里能确证
+    /// 本轮跑的是 reno/none 而不是环境变量没生效）。
+    fn cc_algo(&self) -> tcp::CongestionControl {
+        let cc = crate::cc_choice();
+        if cc != tcp::CongestionControl::Cubic {
+            static LOGGED: std::sync::atomic::AtomicBool =
+                std::sync::atomic::AtomicBool::new(false);
+            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                (self.cfg.logf)(&format!(
+                    "intercept: CC 消融臂生效（HOMEWAY_CC={cc:?}——非产品默认 CUBIC）"
+                ));
+            }
+        }
+        cc
+    }
+
     /// 发送侧吞吐观测行（verbose/dlogf 面；仅存在在途 TCP 流时打——真机吞吐排障的
     /// 关键窗口：栈内 CUBIC 的在途/未收账面 + backlog）。R8-8a：垫片退役后 cwnd/
     /// 减窗计数不再可观测（栈内私有），改看 send_queue（tx_buffer 存量 = 上线在途
@@ -878,7 +895,7 @@ impl Interceptor {
                     tcp::SocketBuffer::new(vec![0u8; FLOW_TX_BUF]),
                 );
                 sock.set_nagle_enabled(false); // Go SetDelayOption(false) 同口径
-                sock.set_congestion_control(tcp::CongestionControl::Cubic); // R8-8a：RFC 合规 CUBIC（CC 垫片退役——下行 bulk 发送方）
+                sock.set_congestion_control(self.cc_algo()); // R8-8a CUBIC（R8-2 起 HOMEWAY_CC 可消融——下行 bulk 发送方）
                 sock.set_timeout(Some(smoltcp::time::Duration::from_secs(TCP_IDLE.as_secs()))); // R2 低-10：精确 idle 回收
                 if let Err(e) = sock.listen(IpEndpoint::new(self.cfg.tunnel_ip.into(), rw)) {
                     (self.cfg.logf)(&format!("intercept: tcp listen rw_port {rw} 失败：{e:?}"));

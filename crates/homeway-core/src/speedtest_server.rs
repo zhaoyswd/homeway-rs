@@ -231,6 +231,10 @@ impl SpeedtestServer {
     }
 
     /// role=recv：预热发 → 窗口发 → report。发送侧按接收方 TCP 背压自然限速。
+    ///
+    /// R8-2 归因插桩：窗口段按 1s 切片泵送（共享同一截止时刻——墙钟行为与整段
+    /// pump_data 等价，切片只用于计量），末尾多打一行逐秒字节序列 + 尾 3s 速率
+    /// ——真机下行「爬坡支配 vs 稳态封顶」的判别面（窗口均值会掩盖前者）。
     fn serve_recv(&self, id: u64, w: &UnixStream, warmup: Duration, window: Duration) {
         let mut bw = BufWriter::new(w);
         let block = vec![0u8; MAX_BLOCK];
@@ -241,7 +245,17 @@ impl SpeedtestServer {
             (self.logf)(&format!("speedtest: 会话 #{id} 异常（下行发送：flush 失败）"));
             return;
         }
-        let window_bytes = pump_data(&mut bw, &block, &mut seq, window);
+        let window_deadline = Instant::now() + window;
+        let mut per_sec: Vec<i64> = Vec::with_capacity(window.as_secs() as usize + 1);
+        loop {
+            let now = Instant::now();
+            if now >= window_deadline {
+                break;
+            }
+            let slice = (window_deadline - now).min(Duration::from_secs(1));
+            per_sec.push(pump_data(&mut bw, &block, &mut seq, slice));
+        }
+        let window_bytes: i64 = per_sec.iter().sum();
         if bw.flush().is_err() {
             (self.logf)(&format!("speedtest: 会话 #{id} 异常（下行发送：flush 失败）"));
             return;
@@ -251,10 +265,29 @@ impl SpeedtestServer {
             (self.logf)(&format!("speedtest: 会话 #{id} 异常（回报告：写失败）"));
             return;
         }
+        // 尾 3s 速率（不足 3s 取全部）：末段均值——与窗口均值对比即可判别
+        // 「窗口内仍在爬坡」（尾 ≫ 均值）还是「稳态封顶」（尾 ≈ 均值）。
+        let tail_secs = per_sec.len().min(3);
+        let tail_bytes: i64 = per_sec[per_sec.len() - tail_secs..].iter().sum();
+        let tail_mbps = if tail_secs > 0 {
+            tail_bytes as f64 * 8.0 / (tail_secs as f64 * 1_000_000.0)
+        } else {
+            0.0
+        };
         // E13 结算行（role=recv）
         (self.logf)(&format!(
             "speedtest: 会话 #{id} role=recv bytes={window_bytes}（含预热 {warmup_bytes}）用时={}ms",
             t0.elapsed().as_millis()
+        ));
+        // R8-2 归因行（逐秒载荷 MB + 尾 3s Mbps）
+        (self.logf)(&format!(
+            "speedtest: 会话 #{id} role=recv 逐秒MB=[{}] 尾{}s={tail_mbps:.0}Mbps",
+            per_sec
+                .iter()
+                .map(|b| format!("{:.1}", *b as f64 / (1024.0 * 1024.0)))
+                .collect::<Vec<_>>()
+                .join(","),
+            tail_secs,
         ));
     }
 

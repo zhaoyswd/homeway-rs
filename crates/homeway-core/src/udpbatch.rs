@@ -23,9 +23,7 @@
 
 use std::io;
 use std::net::SocketAddr;
-#[cfg(not(target_os = "linux"))]
 use std::net::UdpSocket;
-#[cfg(not(target_os = "linux"))]
 use std::os::fd::FromRawFd;
 use std::os::fd::RawFd;
 
@@ -42,12 +40,19 @@ const BATCH: usize = 64;
 /// 批量发送。返回 (成功包数, 首个失败的 (端点, 错误))——调用方按成功数记账；
 /// 失败后的余量不再尝试（非阻塞 socket 的 EAGAIN/不可达类错误对余量同型，
 /// 逐包重试只是把同错重复 N 遍）。
+///
+/// R8-2 归因消融：环境变量 `HOMEWAY_UDP_NO_BATCH=1` 强制走逐包回退路径
+/// （Linux 上对照 sendmmsg 批量 vs 逐包的收益差——不设即平台默认，产品行为不变）。
 pub fn send_batch(fd: RawFd, msgs: &[OutMsg<'_>]) -> (usize, Option<(SocketAddr, io::Error)>) {
     if msgs.is_empty() {
         return (0, None);
     }
     #[cfg(target_os = "linux")]
     {
+        static NO_BATCH: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *NO_BATCH.get_or_init(|| std::env::var_os("HOMEWAY_UDP_NO_BATCH").is_some()) {
+            return send_one_by_one(fd, msgs);
+        }
         send_mmsg(fd, msgs)
     }
     #[cfg(not(target_os = "linux"))]
@@ -154,8 +159,8 @@ fn sock_addr_parts(
     }
 }
 
-/// 逐包回退（macOS 等）：借用 fd 包一层 std UdpSocket，逐包 send_to（v4/v6 双栈）。
-#[cfg(not(target_os = "linux"))]
+/// 逐包回退（macOS 平台默认；Linux 消融臂 = HOMEWAY_UDP_NO_BATCH=1）：借用 fd 包
+/// 一层 std UdpSocket，逐包 send_to（v4/v6 双栈）。
 fn send_one_by_one(fd: RawFd, msgs: &[OutMsg<'_>]) -> (usize, Option<(SocketAddr, io::Error)>) {
     // 借用形态：from_raw_fd 后立即在 drop 前换回——fd 生命周期不变。
     let sock = unsafe { UdpSocket::from_raw_fd(fd) };

@@ -11,6 +11,20 @@
 /// 日志面（跨线程共享的判据行输出；Session 在其上加前缀）。
 pub type Logf = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
+/// 拥塞控制算法选择（R8-2 归因插桩）：默认 CUBIC；环境变量 `HOMEWAY_CC=reno|none`
+/// 供真机 A/B 消融（Go gVisor 默认 Reno——`reno` 臂消除「算法差 vs 发送路径差」的
+/// 混杂；`none` 臂复现无 CC 塌陷形态，R8-1 评审 F4 的可复现消融义务）。
+/// 不设/值不识别 ⇒ 恒 CUBIC——产品行为不变；解析一次（OnceLock），非法值静默回落。
+pub fn cc_choice() -> smoltcp::socket::tcp::CongestionControl {
+    use smoltcp::socket::tcp::CongestionControl;
+    static CHOICE: std::sync::OnceLock<CongestionControl> = std::sync::OnceLock::new();
+    *CHOICE.get_or_init(|| match std::env::var("HOMEWAY_CC").as_deref() {
+        Ok("reno") => CongestionControl::Reno,
+        Ok("none") => CongestionControl::None,
+        _ => CongestionControl::Cubic,
+    })
+}
+
 pub mod facade;
 pub mod files;
 pub mod files_server;

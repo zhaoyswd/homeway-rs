@@ -115,6 +115,11 @@ pub struct ServerBind {
     /// send_to 失败有日志无计数；批化后短返余量既无日志也无计数（静默）——本计数
     /// 补观测面（日志 100 次一行节流；与 leg_dropped 同范式）。
     tx_dropped: u64,
+    /// 批量出站形态统计（R8-2 归因插桩）：发送调用数 / 累计包数 / 单调用最大包数
+    /// ——「每拍实际排空几包」（唤醒粒度）的判别面。空闲不增长，5s 周期行由引擎打。
+    tx_calls: u64,
+    tx_pkgs: u64,
+    tx_batch_max: usize,
 }
 
 impl ServerBind {
@@ -190,6 +195,9 @@ impl ServerBind {
             tx_stage: Vec::with_capacity(256 * 1024),
             tx_lens: Vec::with_capacity(256),
             tx_dropped: 0,
+            tx_calls: 0,
+            tx_pkgs: 0,
+            tx_batch_max: 0,
         })
     }
 
@@ -627,6 +635,11 @@ impl ServerBind {
             off += fr_len;
         }
         let (sent, first_err) = crate::udpbatch::send_batch(fd, &msgs);
+        // 形态统计（R8-2 归因）：本调用入批包数（含被丢弃的——「每拍攒了几包」
+        // 与「发出去几包」分开看：丢弃主导时前者才是真实唤醒粒度）。
+        self.tx_calls += 1;
+        self.tx_pkgs += self.tx_lens.len() as u64;
+        self.tx_batch_max = self.tx_batch_max.max(self.tx_lens.len());
         // 注：msgs 为本函数局建（OutMsg 借 staging——自引用结构不能做成字段）；
         // 每次调用一次 Vec 分配（相对每包一次 frame_bytes 分配已是数量级改善）。
         // 记账按「成功前缀」（send_batch 顺序发送，短返只发前缀；Linux sendmmsg
@@ -658,6 +671,12 @@ impl ServerBind {
     pub fn udp_fd(&self) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd as _;
         self.sock.as_raw_fd()
+    }
+
+    /// 批量出站形态快照（R8-2 归因插桩）：(调用数, 累计包数, 单调用最大包数,
+    /// 累计丢弃包数)——均批 = pkgs/calls；引擎 5s 周期行消费。
+    pub fn tx_batch_stats(&self) -> (u64, u64, usize, u64) {
+        (self.tx_calls, self.tx_pkgs, self.tx_batch_max, self.tx_dropped)
     }
 
     /// 从本 socket 直接发裸载荷（STUN 请求等 3e 面；SendRawTo 同义——与数据面同端口）。

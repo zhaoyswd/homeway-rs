@@ -293,6 +293,9 @@ struct Engine {
     /// expired 重建执行位（一次性；避免每拍重建——update_timers 过期后每 tick 回错）。
     expired_pending: bool,
     silent_drops: u64,
+    /// 栈 B 收队列溢出丢弃的节流记行（R8-2 归因插桩：上次记行时刻——下行突发超
+    /// QUEUE_CAP 的丢弃是「出口 bulk 突发 vs 手机队列容量」失配的判别面）。
+    last_rx_drop_log: Option<Instant>,
     time0: Instant,
     /// L3 直通的应用 TUN 源（None = 未 attach——transit 回包丢弃，Go hub 同义）。
     app_tun: Option<AppTun>,
@@ -358,6 +361,24 @@ impl Engine {
         }
         self.bind.tick_unlock();
         self.drain_udp(udp_buf);
+        // R8-2 归因插桩：栈 B 收队列溢出丢弃（节流 1s——只增打、有丢才打）。
+        // 下行 bulk 的出口突发（拦截栈单拍可产上千包）超 QUEUE_CAP=1024 时，
+        // 多余内层包在这里静默丢 ⇒ TCP 层大规模重传——本行即该丢失面的判据。
+        {
+            let now = Instant::now();
+            let dropped = self.stack.device.rx_dropped();
+            if dropped > 0
+                && self
+                    .last_rx_drop_log
+                    .map(|t| now.duration_since(t) >= Duration::from_secs(1))
+                    .unwrap_or(true)
+            {
+                self.last_rx_drop_log = Some(now);
+                (self.logf)(&format!(
+                    "wgcore: 栈B 收队列溢出（QUEUE_CAP=1024）累计丢弃 {dropped} 包——出口下行突发超队列容量"
+                ));
+            }
+        }
         let now = self.now_smol();
         self.stack
             .iface
@@ -981,6 +1002,7 @@ impl Client {
             peer_id: cfg.peer_id,
             expired_pending: false,
             silent_drops: 0,
+            last_rx_drop_log: None,
             time0: Instant::now(),
             app_tun: None,
             tun_counters: Arc::clone(&tun_counters),

@@ -86,6 +86,11 @@ impl TunDevice {
         self.rx_queue.len()
     }
 
+    /// 收队列溢出丢弃的累计计数（R8-2 归因插桩——驱动线程节流记行消费）。
+    pub fn rx_dropped(&self) -> u64 {
+        self.rx_dropped
+    }
+
     /// 测试面：TX 出站队列长度（拦截层排障用）。
     #[cfg(test)]
     pub fn tx_out_len_for_test(&self) -> usize {
@@ -231,7 +236,8 @@ impl StackB {
         // （测速上行/files 上传）此前是 0.11 的「整窗突发 + RTO go-back-N」形态，真机
         // 有损 WiFi 下吞吐塌陷（E2E §6 A5' 上行 bulk 退化的机制归因，同 R6.6 下行）。
         // 线上行为（wire 字节）不可见差异——性能选择，无对齐义务（R6.6 垫片同口径）。
-        sock.set_congestion_control(tcp::CongestionControl::Cubic);
+        // R8-2：HOMEWAY_CC 消融（归因插桩，默认仍 CUBIC）。
+        sock.set_congestion_control(crate::cc_choice());
         let handle = self.sockets.add(sock);
         let local = self.alloc_local_port();
         let cx = self.iface.context();

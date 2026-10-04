@@ -24,8 +24,10 @@ getrandom = { version = "0.2", features = ["std"] }
 #  tier:tools/spikes/rust-ohos-poc/ring-shim/，**依赖组合勿改**——PoC 已实测）
 boringtun = "0.6"
 # 0.14 起 TCP 拥塞控制按算法 feature 门控（R8-8a：CUBIC——R6.6 的 CC 垫片即 CUBIC
-# 增长律，迁移后由上游 RFC 合规实现替代；Reno 未启用）。
-smoltcp = { version = "0.14", features = ["socket-tcp-cubic"] }
+# 增长律，迁移后由上游 RFC 合规实现替代）。R8-2 加开 reno feature：真机归因消融
+# 对照臂（HOMEWAY_CC=reno——Go gVisor 默认 Reno，同机 A/B 消除算法差；不设即恒
+# CUBIC，产品行为不变）。
+smoltcp = { version = "0.14", features = ["socket-tcp-cubic", "socket-tcp-reno"] }
 libc = "0.2"
 # ---- R6 term 服务面：alacritty_terminal 0.26 = 仿真+Damage+kitty 模式位
 # （应答器与键/鼠标/焦点编码器自建，设计见 docs/reviews/R6-design.md）；

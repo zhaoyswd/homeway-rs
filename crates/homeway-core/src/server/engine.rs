@@ -714,6 +714,8 @@ fn driver_loop(
     let revoked_path = cfg.state_dir.join("serve").join("revoked.jsonl");
     let mut revoked_mtime = std::fs::metadata(&revoked_path).and_then(|m| m.modified()).ok();
     let mut last_dns_stats = Instant::now();
+    let mut last_tx_stats = Instant::now();
+    let mut last_tx_stats_snap = (0u64, 0u64, 0usize, 0u64);
     let mut out = InboundOut::default();
     let mut stop = false;
     let mut stop_grace = STOP_GRACE;
@@ -832,6 +834,32 @@ fn driver_loop(
                 last_dns_stats = now;
                 (dlogf)(&d.stats_line());
             }
+        }
+        // R8-2 归因：批量出站形态 5s 行（dlogf 面；本窗调用有增长才打——空闲静默）。
+        // 判别面 = 均批包数（唤醒粒度：每拍一包 ⇒ 瓶颈在逻辑/唤醒；批已大 ⇒ 瓶颈在
+        // syscall/链路）+ 丢弃计数（EAGAIN/失败——SO_SNDBUF 满时的整批余量丢弃）。
+        if now.duration_since(last_tx_stats) > Duration::from_secs(5) {
+            last_tx_stats = now;
+            let s = bind.tx_batch_stats();
+            if s.0 > last_tx_stats_snap.0 {
+                let dcalls = s.0 - last_tx_stats_snap.0;
+                let dpkgs = s.1 - last_tx_stats_snap.1;
+                let avg = dpkgs as f64 / dcalls as f64;
+                if s.3 > last_tx_stats_snap.3 {
+                    (dlogf)(&format!(
+                        "serve: UDP 出站 调用+{dcalls} 均批{avg:.1}包/调用 单调用最大{}包 累计丢弃{}包（+{}）",
+                        s.2,
+                        s.3,
+                        s.3 - last_tx_stats_snap.3
+                    ));
+                } else {
+                    (dlogf)(&format!(
+                        "serve: UDP 出站 调用+{dcalls} 均批{avg:.1}包/调用 单调用最大{}包",
+                        s.2
+                    ));
+                }
+            }
+            last_tx_stats_snap = s;
         }
     }
     // ---- 收工（D5：① 已由 Stop 置位；这里 ③④——drain 的出站包照走 encap 链
