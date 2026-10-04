@@ -22,6 +22,7 @@ pub mod relay;
 pub mod relaywire;
 pub mod server;
 pub mod session;
+pub mod session_lock;
 pub mod speedtest;
 pub mod speedtest_server;
 pub mod status_json;

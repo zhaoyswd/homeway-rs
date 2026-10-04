@@ -127,6 +127,8 @@ struct ConnectArgs {
     /// 测试注入：token 的直连端点改指死端口（127.0.0.1:1）——压出「只有中继可达」
     /// 形态（DirectFirst 解锁 + via=relay）。
     dead_direct: bool,
+    /// 跳过 identity 会话锁（矩阵脚本/刻意并发测试的逃生口——R7-7e）。
+    no_session_lock: bool,
 }
 
 fn parse_connect(args: &[String]) -> ConnectArgs {
@@ -144,6 +146,7 @@ fn parse_connect(args: &[String]) -> ConnectArgs {
         recover_delay: 0,
         inject: None,
         dead_direct: false,
+        no_session_lock: false,
     };
     let mut i = 0;
     while i < args.len() {
@@ -191,6 +194,7 @@ fn parse_connect(args: &[String]) -> ConnectArgs {
                 a.recover_cause = args.get(i).cloned().unwrap_or_else(|| "测试注入".into());
             }
             "--dead-direct" => a.dead_direct = true,
+            "--no-session-lock" => a.no_session_lock = true,
             "--inject" => {
                 i += 1;
                 a.inject = args.get(i).cloned();
@@ -203,6 +207,31 @@ fn parse_connect(args: &[String]) -> ConnectArgs {
         i += 1;
     }
     a
+}
+
+
+// ---------------------------------------------------------------------------
+// identity 会话锁（R7-7e：同 identity 并发会话 = WG keypair 互踢形态——R6 前置批 ①
+// 根因的 CLI 面防线；App 侧第 2 棒复用同一模块落实「隧道/服务会话不得并发」）
+// ---------------------------------------------------------------------------
+
+/// 拿 identity 会话锁（verb 自述进错误信息）。`--no-session-lock` 已解析为 false 时直通。
+/// 锁存活到返回的守卫 drop（= 本动词会话生命周期）。
+fn session_lock_or_exit(identity_dir: &Option<PathBuf>, verb: &str) -> Option<homeway_core::session_lock::SessionLock> {
+    let dir = identity_dir.clone().or_else(|| Some(PathBuf::from("identity")))?;
+    match homeway_core::session_lock::acquire(&dir, verb) {
+        Ok(lock) => Some(lock),
+        Err(homeway_core::session_lock::LockError::Held(h)) => {
+            eprintln!("!! {h}");
+            eprintln!("   同 identity 的另一个会话正在跑（{verb} 想用同一身份）：wireguard 单 peer 只有一条 keypair 链，第二个会话的握手会顶掉第一个 ⇒ 双向黑洞 + 15s 互踢（rekey 螺旋）。");
+            eprintln!("   先停掉在跑的会话；或 --identity-dir 指别的目录；或确知无害时 --no-session-lock。");
+            std::process::exit(1);
+        }
+        Err(e) => {
+            eprintln!("会话锁失败（继续，不阻塞）：{e}");
+            None
+        }
+    }
 }
 
 fn cmd_connect(args: &[String]) {
@@ -226,6 +255,7 @@ fn cmd_connect(args: &[String]) {
         }
         println!("inject: token 直连端点已改指死端口（127.0.0.1:1）——只有中继可达");
     }
+    let _session_lock = (!a.no_session_lock).then(|| session_lock_or_exit(&a.identity_dir, "connect"));
 
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
     let mut session = match Session::start(SessionConfig {
@@ -407,6 +437,7 @@ fn cmd_speedtest(args: &[String]) {
     let mut rounds: u32 = 3;
     let mut hold = false;
     let mut dead_direct = false;
+    let mut no_session_lock = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -416,6 +447,7 @@ fn cmd_speedtest(args: &[String]) {
             "--rounds" => { i += 1; rounds = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(3); }
             "--hold" => hold = true,
             "--dead-direct" => dead_direct = true,
+            "--no-session-lock" => no_session_lock = true,
             other => { eprintln!("未知参数：{other}"); std::process::exit(2); }
         }
         i += 1;
@@ -436,6 +468,7 @@ fn cmd_speedtest(args: &[String]) {
         }
         println!("inject: token 直连端点已改指死端口（127.0.0.1:1）——只有中继可达");
     }
+    let _session_lock = (!no_session_lock).then(|| session_lock_or_exit(&identity_dir, "speedtest"));
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
     let mut session = match Session::start(SessionConfig {
         token: t,
@@ -491,6 +524,7 @@ fn cmd_files(args: &[String]) {
     let mut identity_dir: Option<PathBuf> = None;
     let mut dead_direct = false;
     let mut inject_what: Option<String> = None;
+    let mut no_session_lock = false;
     let mut rate_limit: Option<i64> = None;
     let mut rest: Vec<String> = Vec::new();
     let mut i = 0;
@@ -509,6 +543,7 @@ fn cmd_files(args: &[String]) {
                 i += 1;
                 inject_what = args.get(i).cloned();
             }
+            "--no-session-lock" => no_session_lock = true,
             "--rate-limit" => {
                 i += 1;
                 let v = args.get(i).and_then(|v| v.parse::<i64>().ok());
@@ -554,6 +589,7 @@ fn cmd_files(args: &[String]) {
         }
         println!("inject: token 直连端点已改指死端口（127.0.0.1:1）——只有中继可达");
     }
+    let _session_lock = (!no_session_lock).then(|| session_lock_or_exit(&identity_dir, "files"));
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
     let mut session = match Session::start(SessionConfig {
         token: t,
