@@ -579,6 +579,9 @@ mod tests {
             let stop = Arc::clone(&self.stop_flag);
             stop.store(false, Ordering::Release);
             std::thread::spawn(move || {
+                // attach 接收端**先于 Ready 发布注册**（评审 r2-M3 的生产时序契约——
+                // 窗口内投 fd 必须可达；假件此前反序，µs 级竞态偶发 -1〔终轮 ci 实抓〕）
+                let fd_rx = shared.attach_receiver();
                 if warmup_ok {
                     shared.stage.set_if_current(gen, TunStage::Ready, "", "", true);
                     shared.stage.set_ready_by("wg");
@@ -594,7 +597,6 @@ mod tests {
                     return;
                 }
                 // 等 fd（TunShared 的 attach 通道——facade::tun_attach 投递）/ stop
-                let fd_rx = shared.attach_receiver();
                 loop {
                     match fd_rx.recv_timeout(Duration::from_millis(200)) {
                         Ok(_fd) => {
