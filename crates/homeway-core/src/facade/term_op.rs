@@ -86,7 +86,11 @@ fn term_dial(auth_hex: &str, sock: &str) -> Result<UnixStream, TermOpError> {
             "终端通道暂时不可用（桥未就绪：VPN 未连接且服务会话未就绪，或正在恢复）",
         ));
     }
-    let mut conn = UnixStream::connect(sock)
+    // 工单④：UDS 拨号加 connect 预算（本地一般即成；对端 backlog 满时不得无限挂）
+    let mut conn = super::bridge_host::connect_budget(
+        std::path::Path::new(sock),
+        Duration::from_millis(500),
+    )
         .map_err(|e| TermOpError::new(code::BRIDGE_DOWN, format!("终端通道暂时不可用（桥未就绪或正在恢复）：{e}")))?;
     conn.set_write_timeout(Some(IO_TIMEOUT)).ok();
     conn.set_read_timeout(Some(IO_TIMEOUT)).ok();

@@ -83,8 +83,11 @@ impl BridgeStream {
                 "文件通道暂时不可用（桥未就绪：VPN 未连接且服务会话未就绪，或正在恢复）",
             ));
         }
-        let mut conn = UnixStream::connect(sock)
-            .map_err(|e| FilesOpError::new(code::BRIDGE_DOWN, format!("文件通道暂时不可用（桥未就绪或正在恢复）：{e}")))?;
+        let mut conn = super::bridge_host::connect_budget(
+            std::path::Path::new(sock),
+            budget.max(Duration::from_millis(500)),
+        )
+        .map_err(|e| FilesOpError::new(code::BRIDGE_DOWN, format!("文件通道暂时不可用（桥未就绪或正在恢复）：{e}")))?;
         conn.set_read_timeout(Some(budget)).ok();
         conn.set_write_timeout(Some(budget)).ok();
         write_auth(&mut conn, auth_hex)
@@ -553,6 +556,10 @@ fn run_transfer(sess: Arc<FilesSession>, tx: Arc<Transfer>) {
             return;
         }
     };
+    // 传输体无期限（工单④ r1-C3：大文件传输不受 15s 空闲超时——取消走 cancel 的
+    // 断 I/O，开场警戒独立在下方进度回调前收口；Go 无 deadline 同义）。
+    stream.conn.set_read_timeout(None).ok();
+    stream.conn.set_write_timeout(None).ok();
     // 登记断 I/O 出口（拨号成功后；重复登记以最后一次为准——本形态每传输一条流）
     *tx.cut.lock().expect("cut 锁中毒") = Some(Box::new({
         let conn = stream.conn.try_clone().ok();

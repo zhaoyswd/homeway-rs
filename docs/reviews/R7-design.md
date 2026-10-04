@@ -118,3 +118,28 @@ tun_recover 未钳位等 12 项）——**登记第 2 棒顺手批**，不阻塞
    三面接真 Session、version 注入管线（HOMEWAY_CORE_VERSION + [lib] cdylib 配置 + tier
    build-core.sh 对接——F-03，动 tier 跟踪文件属用户触点）。
 6. panic 策略：extern "C" 壳 catch_unwind + 锁 unwrap_or_else(into_inner)（F-02）。
+
+## §三 第 2 棒争议三条拍板（2026-10-04，开工时按工单约定拍板）
+
+| # | 争议 | 拍板 | 依据 |
+|---|---|---|---|
+| 1 | attach-timeout 的 code/state 归属（严格对齐 Go 生产路径 vs 保留 d.ts 描述改 tier 文档） | **严格对齐 Go 生产路径**：`state=idle` + `code=attach-timeout` + `reason=就绪后无人 attach，已自行收工放锁`（tunmode.go:802 逐字）。C-5 向量已重产（`failed_attach_timeout` 案改名 `attach_timeout_idle`，三处同步：vecgen 生成器 / fixtures/vectors/tun_status.jsonl / Rust 对照测试）。原向量是「Go 不可达合成态」（failed + 错文案）——生产路径里 60s 死线写的是 idle，且该 code 只在世代收尾完成前的窗口可读（收尾 defer 统一归 idle 空码）；d.ts 的 code 词面族（stopped/attach-timeout）与生产路径兼容，无需改 tier 文档 | 生产语义唯一真源是 Go 代码行为；「窗口可读」语义两侧一致（Rust finish_generation 同样在收尾时清 code） |
+| 2 | events 面去留（Rust 独有则文档声明不参与词表对账 / 对齐 Go facade/bus.go） | **保留 + 文档声明不参与词表对账**。events（EventHub 可轮询队列）不在 20 个导出面内（Go 无对应导出——App 侧推送经 IPC 在 ArkTS 层），是 facade 内部诊断/测试面；`facade/mod.rs` 头注释已声明。Go facade/bus.go 的不重不漏语义归 ArkTS 侧（跨进程推送通道不在核内），核侧不需要对齐物 | 对齐一个不存在的消费面只会引入第二真源；App 的状态通道在扩展进程侧（R7 不动 ArkTS） |
+| 3 | FB-files 判据按 rc 判定（matrix.sh:627 grep -c . 无条件 PASS） | **按 rc 判定**：FB-files 的 files CLI 子命令以退出码为判据（rc!=0 红），输出行只作旁证（matrix.sh 已改） | grep -c . 对空输出也 PASS——判据门假绿（评审 F 项同类） |
+
+**前置工单六项处置记录（2026-10-04 第 2 棒）**：
+
+| 工单 | 处置 | 落点 |
+|---|---|---|
+| ①世代生命周期 | **已做**：TunExecutor.warmup 改「启动即返」（spawn 世代线程即返，同步硬失败仍 Err）；TunShared 承载世代共享面（单飞锁/世代号/阶段机/健康位/attach 通道/done 信号），执行体世代线程一切退出路径调 `finish_generation`（非 failed 回 idle 空码、放锁、unhealthy="stop"、done）；attach 60s 死线由世代线程收割（idle/"attach-timeout"/生产路径文案）；meowed 沿用暖机结果（attached 写入）；新世代清健康位/分类（begin_healthy） | facade/tun_shared.rs（新）+ facade/mod.rs 重构 + facade/tun_exec.rs（世代线程 gen_loop） |
+| ②桥宿主线程模型 | **已做**：handle_conn 整体 spawn（鉴权 5s + 拨号 15s 出 accept 线程）；鉴权绝对 5s 期限（read_timeout 承载）；sock_path_free 200ms 预算（connect_budget：非阻塞 connect + poll）；remove_sock_own 的 None 分支不删；try_clone/锁中毒不 panic（lock_host + into_inner）；listen 重试不持宿主锁（信息交接式短临界区）；stop 有界等 accept/conn 线程收口（live 计数 + Condvar，2s） | facade/bridge_host.rs |
+| ③tun_stop 终态语义 | **已做**：只放锁不写阶段（终态由世代线程 finish_generation 写；failed 保留）；-2 强制放锁路径同样不写阶段 | facade/mod.rs tun_stop + tun_shared |
+| ④传输/拨号期限 | **已做**：files 传输体清 15s（read/write timeout None——取消走 cancel 断 I/O，开场警戒独立）；UDS 拨号加 connect 预算（connect_budget 公共件：files/term/speedtest 桥全换）；速度桥 link_down 回帧（非 refused 类回 report{link_down} 再有序收口——ReplyThenClose 语义：吞请求帧→回帧→FIN→短窗吞输入） | files_op.rs / term_op.rs / speedtest_op.rs / bridge_host.rs |
+| ⑤trait/装配签名统一 | **已做**：dial_port 接缝 = BridgeStream trait（into_halves 拆半 + WriteHalf 半关——UDS 与 SessionConn 流适配同构）；TunExecutor 类型化错误 TunError（code() 映射状态码）；桥状态并入 serviceStatusJSON（bridge 四键）；speedtest 引擎接桥（run_dial 拨号闭包形态 + SpeedConn trait + BridgeSpeedConn 承载 + Cancel 真取消 = 看门狗 kill）；service 三面接真 Session（service_exec.rs：Session + 服务桥 + rc 门接线）；版本注入管线（HOMEWAY_CORE_VERSION option_env! 已在 facade::version，构建侧 7h 注入） | speedtest.rs / facade/{tun_exec,service_exec,speedtest_op,bridge_host}.rs |
+| ⑥panic 策略 | **已做（锁面）**：facade 全域锁 unwrap → into_inner（lock_unpoison/lock_host 单件）；extern "C" 壳的 catch_unwind 在 7h 的 homeway-capi（每导出包 panic 边界，返回安全错误值） | facade/* + homeway-capi（7h） |
+
+**登记（不阻塞）**：
+- portfwd 监听器执行体未实现（pf 表存 + runner 状态面就位；`pf=0/0` 恒零）——Go 侧端口转发监听器的实装排第 3 棒；
+- bind 全候选发送统计面（localErrAdopted/localErrTotal + sendTries 全败判据）未实现——tunStatusJSON 该二键缺省（可选键）、巡检噪声判定只用采纳路径粘性信号；
+- fd: 快照行（fdSnapshot）不打——OHOS 沙箱 /proc/self/fd 面受限（Go 侧该行同样受限）；
+- 隧道域无 REBUILD（对齐 Go：阶梯失败 markUnhealthy 交扩展重建整条 VPN——与服务域的 rebuild_session 语义分流）。

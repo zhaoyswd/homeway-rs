@@ -19,7 +19,7 @@ use std::collections::HashMap;
 use std::io::{self, Write as _};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::fd::AsRawFd;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -41,6 +41,9 @@ use crate::wtransport::{Bind, Candidate, RegCtx, Via};
 pub mod stackb;
 
 use self::stackb::{DialError, StackB};
+
+/// TUN 面错误回调类型（fd 读写失败 → facade markUnhealthy；driver 线程执行）。
+pub type OnTunError = Box<dyn Fn(&str) + Send>;
 
 /// 出口隧道 IP 的契约常量（两端共同，dns-host-resolver 起钉死；非 token 派生）。
 pub const SERVER_TUNNEL_IP: Ipv4Addr = Ipv4Addr::new(100, 64, 255, 1);
@@ -152,6 +155,28 @@ pub enum Cmd {
     /// R2 阶梯 R2 档注入；Go 集成测试注入假 transport 同义）。
     #[cfg(feature = "test-seams")]
     DebugPoisonSocket,
+    /// L3 直通：注册应用 TUN 源（Go hub.AttachTUN——只允许一次；fd 所有权在扩展，
+    /// 引擎只裸读写、**从不 close**，失效经错误回调暴露——坑 50）。
+    TunAttach {
+        fd: i32,
+        mtu: u32,
+        reply: Sender<Result<(), ConnErr>>,
+    },
+    /// TUN 读线程投来的应用出站包（driver encap 发送——Go hub 的 outbound 通道面）。
+    TunPacket(Vec<u8>),
+    /// 读 TUN 面 fd/demand 计数（tunStatusJSON 的 stats 段与需求门控源）。
+    TunStats {
+        reply: Sender<(u64, u64)>,
+    },
+    /// 装 TUN 面错误回调（fd 读写失败 → facade 挂 markUnhealthy；attach 前后都可调，
+    /// driver 线程执行——回调只允许原子/内存操作，Go SetOnTunError 同义）。
+    SetOnTunError {
+        f: OnTunError,
+    },
+    /// TUN 读线程报 fd 失效（driver 卸源 + 触发错误回调——与写失败同收口）。
+    TunFdDead {
+        msg: String,
+    },
     Stop,
 }
 
@@ -177,6 +202,31 @@ pub struct CoreConfig {
 }
 
 type UdpRecvReply = Result<(Vec<u8>, SocketAddrV4), ConnErr>;
+
+/// TUN 面的共享计数（fd 字节对表 + 需求信号源；driver 与读线程两写、主线程读）。
+#[derive(Debug, Default)]
+pub struct TunCounters {
+    /// 读（应用出站方向）累计字节——与设备 `vpn-tun` 的 TX 对表。
+    pub read_bytes: AtomicU64,
+    /// 写（应用入站方向）累计字节——与设备 `vpn-tun` 的 RX 对表。
+    pub write_bytes: AtomicU64,
+    /// App 出站包计数（demand-driven-recovery D1：巡检拍「取走清零」消费）。
+    pub out_pkts: std::sync::atomic::AtomicI64,
+    /// 最近出站包时刻（unix nano；0 = 本世代从未有过应用出站）。
+    pub last_outbound_ns: AtomicI64,
+}
+
+/// 引擎内的应用 TUN 源（L3 直通；Go hub 的 appTun 面收窄——栈 B 本就在 Engine 里，
+/// hub 的「双源喂 device」= decap 分流 + TunPacket 命令两个动作）。
+struct AppTun {
+    fd: i32,
+    /// 读线程停止位（Engine stop/重复 attach 时置位；线程分离不 join——阻塞在
+    /// read 上，退出靠 fd 失效〔扩展 destroy〕或错误返回）。
+    stop: Arc<AtomicBool>,
+    counters: Arc<TunCounters>,
+    /// fd 读写失败回调（facade 挂 markUnhealthy；driver 线程执行——只允许原子/内存操作）。
+    on_error: Option<OnTunError>,
+}
 
 struct UdpConn {
     handle: SocketHandle,
@@ -230,6 +280,14 @@ struct Engine {
     expired_pending: bool,
     silent_drops: u64,
     time0: Instant,
+    /// L3 直通的应用 TUN 源（None = 未 attach——transit 回包丢弃，Go hub 同义）。
+    app_tun: Option<AppTun>,
+    /// TUN 计数（attach 前也可读——全零；detach/收尾后保留末值）。
+    tun_counters: Arc<TunCounters>,
+    /// 挂起的 TUN 错误回调（attach 前设置则存这里，attach 时搬进 AppTun）。
+    on_tun_error: Option<OnTunError>,
+    /// 投递通道（读线程投 TunPacket 用；Client::start 注入克隆）。
+    cmd_tx: Option<Sender<Cmd>>,
 }
 
 impl Engine {
@@ -345,7 +403,29 @@ impl Engine {
             }
             TunnResult::WriteToTunnelV4(pkt, _) => {
                 self.expired_pending = false; // 明文包到达 = 会话活着
-                self.stack.inject(pkt);
+                // L3 直通分流（Go hub.Write）：dst == B 的本地地址（派生隧道 IP）→ 栈 B
+                // （核心自连回程），其余 → 真 TUN fd（内核投给应用）。
+                if pkt.len() >= 20 && pkt[0] >> 4 == 4 && pkt[16..20] == self.stack.tunnel_ip.octets() {
+                    self.stack.inject(pkt);
+                } else if let Some(tun) = self.app_tun.as_ref() {
+                    match write_fd_all(tun.fd, pkt) {
+                        Ok(()) => {
+                            tun.counters
+                                .write_bytes
+                                .fetch_add(pkt.len() as u64, Ordering::Relaxed);
+                        }
+                        Err(e) => {
+                            let msg = format!("tun fd 写入失败：{e}");
+                            (self.logf)(&msg);
+                            if let Some(cb) = self.app_tun.as_ref().and_then(|t| t.on_error.as_ref()) {
+                                cb(&msg);
+                            }
+                            // 写失败 = fd 已失效（系统收回）；卸下 TUN 源，后续包不再尝试写
+                            self.app_tun = None;
+                        }
+                    }
+                }
+                // 未 attach：transit 回包不该出现（还没有应用流量）；丢弃（Go 同义）
             }
             TunnResult::WriteToTunnelV6(_, _) => {} // 内层只承载 IPv4（D4）
             TunnResult::Done => {}
@@ -574,13 +654,73 @@ impl Engine {
             Cmd::DebugPoisonSocket => {
                 self.bind.poison_socket_for_test();
             }
+            Cmd::TunAttach { fd, mtu, reply } => {
+                let r = self.attach_tun(fd, mtu);
+                let _ = reply.send(r);
+            }
+            Cmd::TunPacket(pkt) => {
+                // 应用出站包：encap 后经 bind 发出（Go hub 的 outbound → device.Read 面）
+                self.encap_send(&pkt);
+            }
+            Cmd::TunStats { reply } => {
+                let c = &self.tun_counters;
+                let _ = reply.send((
+                    c.read_bytes.load(Ordering::Relaxed),
+                    c.write_bytes.load(Ordering::Relaxed),
+                ));
+            }
+            Cmd::SetOnTunError { f } => {
+                if let Some(tun) = self.app_tun.as_mut() {
+                    tun.on_error = Some(f);
+                } else {
+                    self.on_tun_error = Some(f);
+                }
+            }
+            Cmd::TunFdDead { msg } => {
+                if let Some(tun) = self.app_tun.take() {
+                    if let Some(cb) = tun.on_error.as_ref() {
+                        cb(&msg);
+                    }
+                }
+            }
             Cmd::Stop => return false,
         }
         true
     }
 
-    fn start_conn(&mut self, id: u64, dst: SocketAddrV4, deadline: Duration) -> Result<(), ConnErr> {
-        let handle = self.stack.connect(dst)?;
+    /// L3 直通 attach（Go hub.AttachTUN）：注册应用 TUN 源 + 起读线程。fd 所有权在
+    /// 扩展（坑 50）——引擎裸读写、从不 close；读线程退出靠 fd 失效（错误回调）或
+    /// 引擎收工（stop 位 + fd 随扩展 destroy 报错）。重复 attach = 拒绝（保会话不断）。
+    fn attach_tun(&mut self, fd: i32, mtu: u32) -> Result<(), ConnErr> {
+        if self.app_tun.is_some() {
+            return Err(ConnErr::Closed);
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let counters = Arc::clone(&self.tun_counters);
+        let on_error = self.on_tun_error.take();
+        (self.logf)(&format!("wgcore: 应用面就绪（TUN fd={fd} 已接上，mtu={mtu}，transit 直通）"));
+        self.app_tun = Some(AppTun {
+            fd,
+            stop: Arc::clone(&stop),
+            counters: Arc::clone(&counters),
+            on_error,
+        });
+        let cmd_tx = self.cmd_tx_clone();
+        let logf = Arc::clone(&self.logf);
+        let _ = thread::Builder::new()
+            .name("homeway-tun-read".into())
+            .spawn(move || tun_read_loop(fd, cmd_tx, stop, counters, logf));
+        Ok(())
+    }
+
+    fn cmd_tx_clone(&self) -> Sender<Cmd> {
+        // Engine 的投递通道（构造期由 Client::start 注入的克隆；读线程投 TunPacket 用）
+        self.cmd_tx
+            .clone()
+            .expect("cmd_tx 由 Client::start 注入")
+    }
+
+    fn start_conn(&mut self, id: u64, dst: SocketAddrV4, deadline: Duration) -> Result<(), ConnErr> {        let handle = self.stack.connect(dst)?;
         self.conns.insert(
             id,
             Conn {
@@ -710,6 +850,8 @@ pub struct Client {
     stop: Arc<AtomicBool>,
     next_id: Arc<AtomicU64>,
     pub tunnel_ip: Ipv4Addr,
+    /// TUN 面计数（L3 直通 attach 后与设备 vpn-tun 对表；需求信号源）。
+    tun_counters: Arc<TunCounters>,
 }
 
 impl Client {
@@ -751,6 +893,7 @@ impl Client {
         let identity_key = cfg.identity.private_key().clone();
         let secret = cfg.secret;
         let tunn = make_tunn(&identity_key, &secret, cfg.peer_id.as_bytes());
+        let tun_counters = Arc::new(TunCounters::default());
         let engine = Engine {
             bind,
             tunn,
@@ -767,6 +910,10 @@ impl Client {
             expired_pending: false,
             silent_drops: 0,
             time0: Instant::now(),
+            app_tun: None,
+            tun_counters: Arc::clone(&tun_counters),
+            on_tun_error: None,
+            cmd_tx: Some(cmd_tx.clone()),
         };
 
         let stop2 = Arc::clone(&stop);
@@ -782,6 +929,7 @@ impl Client {
             stop,
             next_id,
             tunnel_ip,
+            tun_counters,
         })
     }
 
@@ -972,6 +1120,46 @@ impl Client {
         self.send(Cmd::DebugPoisonSocket);
     }
 
+    // ---- L3 直通面（Go hub.AttachTUN/FdStats/SwapOutboundPackets/LastOutboundAt）----
+
+    /// 注册应用 TUN 源（两阶段启动的第二阶段；只允许一次——Err(Closed) = 已 attach）。
+    /// fd 所有权在扩展：引擎裸读写、从不 close。
+    pub fn attach_fd(&self, fd: i32, mtu: u32) -> Result<(), ConnErr> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::TunAttach { fd, mtu, reply: tx });
+        rx.recv().map_err(|_| ConnErr::EngineGone)?
+    }
+
+    /// 装 TUN 面错误回调（fd 读写失败 → 挂 markUnhealthy 的面）。
+    pub fn set_on_tun_error(&self, f: Box<dyn Fn(&str) + Send>) {
+        self.send(Cmd::SetOnTunError { f });
+    }
+
+    /// TUN fd 计数（read = 上行 / write = 下行；attach 前全零）。
+    pub fn tun_stats(&self) -> (u64, u64) {
+        let c = &self.tun_counters;
+        (c.read_bytes.load(Ordering::Relaxed), c.write_bytes.load(Ordering::Relaxed))
+    }
+
+    /// 取走并清零「自上次调用以来的 App 出站包数」（巡检拍消费：>0 = 本拍有真实需求）。
+    pub fn swap_out_pkts(&self) -> i64 {
+        self.tun_counters.out_pkts.swap(0, Ordering::Relaxed)
+    }
+
+    /// 最近一次 App 出站包的时刻（None = 本世代从未——Go LastOutboundAt 的零值形态）。
+    pub fn last_outbound_at(&self) -> Option<Instant> {
+        let ns = self.tun_counters.last_outbound_ns.load(Ordering::Relaxed);
+        (ns != 0).then(|| {
+            let d = Duration::from_nanos(ns as u64);
+            Instant::now() - d
+        })
+    }
+
+    /// 最近出站的 unix 毫秒（tunStatusJSON demand.outboundAt 源；0 = 从未）。
+    pub fn last_outbound_unix_ms(&self) -> i64 {
+        self.tun_counters.last_outbound_ns.load(Ordering::Relaxed) / 1_000_000
+    }
+
     /// 收工（幂等；Drop 同义——不显式 stop 也能停线程关 fd，评审中-11）。
     pub fn stop(&self) {
         if self.stop.swap(true, Ordering::SeqCst) {
@@ -1044,10 +1232,81 @@ fn driver(mut engine: Engine, wake_r: i32, stop: Arc<AtomicBool>) {
             break;
         }
     }
+    // TUN 读线程收口（stop 位；线程若还阻塞在 read 上则等 fd 失效自然退出——
+    // fd 所有权在扩展，引擎不 close）
+    if let Some(tun) = engine.app_tun.take() {
+        tun.stop.store(true, Ordering::SeqCst);
+    }
     unsafe {
         libc::close(wake_r);
     }
     let _ = io::stdout().flush();
+}
+
+/// TUN fd 全量写（部分写回补——包写入原子性由内核 tun 语义保证，这里兜短写）。
+fn write_fd_all(fd: i32, mut buf: &[u8]) -> io::Result<()> {
+    while !buf.is_empty() {
+        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(e);
+        }
+        buf = &buf[n as usize..];
+    }
+    Ok(())
+}
+
+/// TUN 读循环（应用出站方向）：裸 read → 计数 → 投 TunPacket 给 driver encap。
+/// 阻塞 read（无超时）——退出路径：fd 失效报错（扩展 destroy；回调上层已挂）/
+/// stop 位（引擎收工，配合 fd 失效生效）/ channel 断（driver 已死）。
+/// panic 兜底不在这层（读循环无可 panic 面：裸 fd + 通道 send）。
+fn tun_read_loop(
+    fd: i32,
+    cmd_tx: Sender<Cmd>,
+    stop: Arc<AtomicBool>,
+    counters: Arc<TunCounters>,
+    logf: Arc<dyn Fn(&str) + Send + Sync>,
+) {
+    let mut buf = vec![0u8; 65535];
+    loop {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n < 0 {
+            let e = io::Error::last_os_error();
+            if e.kind() == io::ErrorKind::Interrupted {
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
+                continue;
+            }
+            logf(&format!("tun fd 读取失败：{e}（标记隧道不健康）"));
+            // 读失败即卸源（driver 侧同样处理写失败——两者都意味着 fd 已被收回）
+            let _ = cmd_tx.send(Cmd::TunFdDead { msg: format!("tun fd 读取失败：{e}") });
+            return;
+        }
+        if n == 0 {
+            return; // EOF：fd 被关
+        }
+        let pkt: Vec<u8> = buf[..n as usize].to_vec();
+        counters.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+        // 需求信号：App 出站包到达（demand-driven-recovery D1——只计 App 源）
+        counters.out_pkts.fetch_add(1, Ordering::Relaxed);
+        counters
+            .last_outbound_ns
+            .store(now_unix_nanos(), Ordering::Relaxed);
+        if cmd_tx.send(Cmd::TunPacket(pkt)).is_err() {
+            return; // driver 已死
+        }
+    }
+}
+
+fn now_unix_nanos() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as i64)
+        .unwrap_or(0)
 }
 
 #[cfg(test)]

@@ -67,9 +67,11 @@ func TestVecgenTunStatus(t *testing.T) {
 	setStage(stageFailed, "core", "新栈启动失败：token 解析失败", false)
 	vtEmit(t, "failed_core")
 
-	// ⑥ failed + code=attach-timeout（无人接入而收工）
-	setStage(stageFailed, "attach-timeout", "等待接入超时，世代已收工", false)
-	vtEmit(t, "failed_attach_timeout")
+	// ⑥ idle + code=attach-timeout（无人接入而收工——**Go 生产路径形态**：60s 死线
+	// 收割写 idle（tunmode.go:802），reason 逐字；7g 争议①拍板 = 严格对齐生产路径，
+	// C-5 向量重产）
+	setStage(stageIdle, "attach-timeout", "就绪后无人 attach，已自行收工放锁", false)
+	vtEmit(t, "attach_timeout_idle")
 
 	// ⑦ demand：未判定（零值——reason 兜「未判定」、at=0）
 	setStage(stagePreparing, "", "", false)

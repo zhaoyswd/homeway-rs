@@ -109,6 +109,10 @@ pub enum SpeedtestError {
     /// 出口没有测速服务（首帧前 EOF/复位——Go :625-643 的 not_supported 判据）。
     #[error("not_supported: 出口没有测速服务")]
     NotSupported,
+    /// 注入缝（拨号闭包）错误透传：bridge_down / bridge_auth——App 形态的桥鉴权
+    /// 拨号面产生，引擎原样透传（Go *speedtest.DialError{Code} 同义）。
+    #[error("{0}: {1}")]
+    Bridge(&'static str, String),
 }
 
 impl SpeedtestError {
@@ -129,6 +133,7 @@ impl SpeedtestError {
             SpeedtestError::Conn(ConnErr::Timeout) => REASON_TIMEOUT,
             SpeedtestError::Conn(_) => REASON_INTERRUPTED,
             SpeedtestError::InvalidArg(_) => REASON_INVALID_ARG,
+            SpeedtestError::Bridge(code, _) => code,
         }
     }
 }
@@ -222,26 +227,54 @@ impl Frame {
     }
 }
 
-fn write_all(client: &Client, id: u64, data: &[u8]) -> Result<(), SpeedtestError> {
-    let mut off = 0;
-    let mut zero_streak = 0u32;
-    while off < data.len() {
-        let n = client.write(id, data[off..].to_vec())?;
-        if n == 0 {
-            // Ok(0) = 发送缓冲满（部分写语义）：立即重试——RPC 往返（引擎 poll 驱动 ACK
-            // 排空）本身就是背压节拍；百万次零进展（≈数十秒无 ACK）才判死
-            zero_streak += 1;
-            if zero_streak > 1_000_000 {
-                return Err(SpeedtestError::Frame("写通道长时间无进展".into()));
-            }
-            std::thread::yield_now();
-            continue;
-        }
-        zero_streak = 0;
-        off += n;
-    }
-    Ok(())
+/// 测速连接抽象（App 形态经本机测速桥〔UDS + 鉴权〕、CLI 形态直连引擎——
+/// 工单⑤ speedtest 接桥：引擎只依赖本面，两种承载各自实现）。
+pub trait SpeedConn: Send + Sync {
+    /// 全量写（发送缓冲满时的部分写语义由实现侧处理——重试/背压）。
+    fn write_frame(&self, data: &[u8]) -> Result<(), SpeedtestError>;
+    /// 阻塞读一段（空 Vec = EOF——映射 Frame("流在帧中途关闭") 语义）。
+    fn read_some(&self) -> Result<Vec<u8>, SpeedtestError>;
+    /// 关闭（收口/看门狗中断用；幂等）。
+    fn kill(&self);
 }
+
+/// CLI 形态承载（Arc<Client> + 流 id）。
+struct ClientConn {
+    client: std::sync::Arc<Client>,
+    id: u64,
+}
+
+impl SpeedConn for ClientConn {
+    fn write_frame(&self, data: &[u8]) -> Result<(), SpeedtestError> {
+        let mut off = 0;
+        let mut zero_streak = 0u32;
+        while off < data.len() {
+            let n = self.client.write(self.id, data[off..].to_vec()).map_err(SpeedtestError::Conn)?;
+            if n == 0 {
+                zero_streak += 1;
+                if zero_streak > 1_000_000 {
+                    return Err(SpeedtestError::Frame("写通道长时间无进展".into()));
+                }
+                std::thread::yield_now();
+                continue;
+            }
+            zero_streak = 0;
+            off += n;
+        }
+        Ok(())
+    }
+    fn read_some(&self) -> Result<Vec<u8>, SpeedtestError> {
+        match self.client.read(self.id) {
+            Ok(v) => Ok(v),
+            Err(ConnErr::Closed) => Ok(Vec::new()), // EOF
+            Err(e) => Err(SpeedtestError::Conn(e)),
+        }
+    }
+    fn kill(&self) {
+        let _ = self.client.close(self.id);
+    }
+}
+
 
 enum FrameIn {
     /// data 帧：载荷已在读侧消耗丢弃，只回长度（下行零拷贝读路径）。
@@ -262,13 +295,13 @@ impl FrameReader {
         Self { buf: Vec::with_capacity(128 * 1024) }
     }
 
-    /// 读一帧：内部缓冲不足时从连接补读。
-    fn read_frame(&mut self, client: &Client, id: u64) -> Result<FrameIn, SpeedtestError> {
+    /// 读一帧：内部缓冲不足时从连接补读（SpeedConn 面——桥/直连同构）。
+    fn read_frame(&mut self, conn: &dyn SpeedConn) -> Result<FrameIn, SpeedtestError> {
         loop {
             if let Some(f) = self.try_parse()? {
                 return Ok(f);
             }
-            let chunk = client.read(id)?;
+            let chunk = conn.read_some()?;
             if chunk.is_empty() {
                 return Err(SpeedtestError::Frame("流在帧中途关闭".into()));
             }
@@ -290,6 +323,13 @@ impl FrameReader {
         self.buf.drain(..n);
         Ok(Some(FrameIn::Other { typ: head.typ, payload }))
     }
+}
+
+/// 构造一帧 report 控制帧（Go WriteControl(TypeReport, payload) 的公共件——
+/// 桥宿主 link_down 回复面消费；error 形如 `{"error":"link_down"}`）。
+pub fn make_report_frame(error_json: &str) -> Vec<u8> {
+    let mut w = Frame::new();
+    w.control(TYPE_REPORT, error_json.as_bytes()).to_vec()
 }
 
 /// 帧头（纯数据视图——`decode_frame` 的产物；fuzz/向量对照的公共面）。
@@ -454,17 +494,16 @@ pub fn parse_report(payload: &[u8]) -> Result<Report, SpeedtestError> {
 }
 
 /// 轮内连接守卫：任何退出路径（含 `?` 提前返回）关闭全部已拨连接（Go closeAll 同义，
-/// 评审高-2/中-12——`Cmd::Read` 的待决读在 close 后由引擎结算为 Closed，scope join 可返回）。
-struct ConnGuard<'a> {
-    client: &'a Client,
-    ids: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+/// 评审高-2/中-12；SpeedConn 面——kill 语义由承载实现〔引擎 close / 桥 shutdown〕）。
+struct ConnGuard {
+    conns: std::sync::Arc<std::sync::Mutex<Vec<std::sync::Arc<dyn SpeedConn>>>>,
 }
 
-impl Drop for ConnGuard<'_> {
+impl Drop for ConnGuard {
     fn drop(&mut self) {
-        let ids = self.ids.lock().expect("连接表锁中毒").clone();
-        for id in ids {
-            let _ = self.client.close(id);
+        let conns = self.conns.lock().expect("连接表锁中毒").clone();
+        for c in conns {
+            c.kill();
         }
     }
 }
@@ -474,34 +513,54 @@ impl Drop for ConnGuard<'_> {
 /// （R3-M24：后续读线程收到的 Closed/Frame 错误统一归因 timeout——「窗口没跑完」
 /// 与「链路死」是同一个根因面，不应报 interrupted）。
 fn watchdog(
-    client: &Client,
-    ids: std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    conns: std::sync::Arc<std::sync::Mutex<Vec<std::sync::Arc<dyn SpeedConn>>>>,
     budget: Duration,
     done: std::sync::mpsc::Receiver<()>,
     timed_out: &std::sync::atomic::AtomicBool,
 ) {
     if done.recv_timeout(budget).is_err() {
         timed_out.store(true, std::sync::atomic::Ordering::Release);
-        let ids = ids.lock().expect("连接表锁中毒").clone();
-        for id in ids {
-            let _ = client.close(id);
+        let conns = conns.lock().expect("连接表锁中毒").clone();
+        for c in conns {
+            c.kill();
         }
     }
 }
 
 /// 跑完整一轮（下行 → 上行；读数由服务端 report 报）。拨号目标恒隧道 IP:7803。
-pub fn run(client: &Client, params: Params, logf: &dyn Fn(&str)) -> Result<SpeedtestResult, SpeedtestError> {
+pub fn run(
+    client: &std::sync::Arc<Client>,
+    params: Params,
+    logf: &dyn Fn(&str),
+) -> Result<SpeedtestResult, SpeedtestError> {
+    // CLI 形态：拨号闭包 = ClientConn（每流一连接，直连引擎）
+    let dial = || -> Result<std::sync::Arc<dyn SpeedConn>, SpeedtestError> {
+        let id = client
+            .connect(SocketAddrV4::new(crate::wgcore::SERVER_TUNNEL_IP, SPEEDTEST_PORT))
+            .map_err(SpeedtestError::Conn)?;
+        Ok(std::sync::Arc::new(ClientConn { client: std::sync::Arc::clone(client), id }))
+    };
+    run_dial(&dial, params, logf)
+}
+
+/// App/CLI 双入口的引擎主体（拨号闭包形态——Go speed.Start(ctx, dial, params) 同构；
+/// 工单⑤ speedtest 接桥：App 形态的 dial = 本机测速桥〔UDS + 鉴权首包〕）。
+pub fn run_dial(
+    dial: &dyn Fn() -> Result<std::sync::Arc<dyn SpeedConn>, SpeedtestError>,
+    params: Params,
+    logf: &dyn Fn(&str),
+) -> Result<SpeedtestResult, SpeedtestError> {
     let p = params.normalized().map_err(SpeedtestError::InvalidArg)?;
-    let ids = std::sync::Arc::new(std::sync::Mutex::new(Vec::<u64>::new()));
-    let _guard = ConnGuard { client, ids: std::sync::Arc::clone(&ids) };
+    let conns = std::sync::Arc::new(std::sync::Mutex::new(Vec::<std::sync::Arc<dyn SpeedConn>>::new()));
+    let _guard = ConnGuard { conns: std::sync::Arc::clone(&conns) };
     let (wd_tx, wd_rx) = std::sync::mpsc::channel::<()>();
     let budget = Duration::from_secs(60) + p.warmup + p.down + p.up;
-    let wd_ids = std::sync::Arc::clone(&ids);
+    let wd_conns = std::sync::Arc::clone(&conns);
     let timed_out = std::sync::atomic::AtomicBool::new(false);
     let wd_flag = &timed_out;
     let body = std::thread::scope(|scope| {
-        scope.spawn(move || watchdog(client, wd_ids, budget, wd_rx, wd_flag));
-        run_phases(client, &p, logf, &ids)
+        scope.spawn(move || watchdog(wd_conns, budget, wd_rx, wd_flag));
+        run_phases(dial, &p, logf, &conns)
     });
     let _ = wd_tx.send(()); // 看门狗收工（scope 已 join 线程，此处只解阻塞 recv）
     // M24：看门狗触发（预算烧满）时，读/泵线程带出的连接级错误统一归因 timeout
@@ -521,12 +580,11 @@ pub fn run(client: &Client, params: Params, logf: &dyn Fn(&str)) -> Result<Speed
 }
 
 fn run_phases(
-    client: &Client,
+    dial: &dyn Fn() -> Result<std::sync::Arc<dyn SpeedConn>, SpeedtestError>,
     p: &Params,
     logf: &dyn Fn(&str),
-    ids: &std::sync::Arc<std::sync::Mutex<Vec<u64>>>,
+    conns: &std::sync::Arc<std::sync::Mutex<Vec<std::sync::Arc<dyn SpeedConn>>>>,
 ) -> Result<SpeedtestResult, SpeedtestError> {
-    let dst = SocketAddrV4::new(crate::wgcore::SERVER_TUNNEL_IP, SPEEDTEST_PORT);
     let t0 = Instant::now();
     logf(&format!(
         "speedtest: 开跑（down {}流 warmup={} window={}）",
@@ -536,16 +594,16 @@ fn run_phases(
     ));
 
     // ---- 下行：拨齐全部连接 → 统一发请求（各流窗口对齐，design D3）----
-    let mut down_ids = Vec::with_capacity(p.streams);
+    let mut down_conns = Vec::with_capacity(p.streams);
     for _ in 0..p.streams {
-        let id = client.connect(dst)?;
-        ids.lock().expect("连接表锁中毒").push(id);
-        down_ids.push(id);
+        let c = dial()?;
+        conns.lock().expect("连接表锁中毒").push(std::sync::Arc::clone(&c));
+        down_conns.push(c);
     }
     let mut w = Frame::new();
-    for &id in &down_ids {
+    for c in &down_conns {
         let payload = request_payload("recv", p.warmup.as_millis() as u64, p.down.as_millis() as u64);
-        write_all(client, id, w.control(TYPE_REQUEST, &payload))?;
+        c.write_frame(w.control(TYPE_REQUEST, &payload))?;
     }
     let window_start = Instant::now() + p.warmup + PHASE_SLACK;
     // 每流一线程并发读（Go goroutine 同构；窗口内到达才计读数）
@@ -554,9 +612,10 @@ fn run_phases(
     let mut srv_bytes: i64 = 0;
     let mut srv_warm: i64 = 0;
     let down_join: Result<(), SpeedtestError> = std::thread::scope(|s| {
-        let handles: Vec<_> = down_ids
+        let handles: Vec<_> = down_conns
             .iter()
-            .map(|&id| {
+            .map(|c| {
+                let c = std::sync::Arc::clone(c);
                 s.spawn(move || -> Result<(i64, i64, i64, i64), SpeedtestError> {
                     let (mut got, mut used) = (0i64, 0i64);
                     let (sb, sw): (i64, i64);
@@ -565,7 +624,7 @@ fn run_phases(
                     // 任何帧错误都被降级 not_supported——成功读到首帧后必须复位。
                     let mut first_frame = true;
                     loop {
-                        let fin = match fr.read_frame(client, id).map_err(|e| {
+                        let fin = match fr.read_frame(c.as_ref()).map_err(|e| {
                             // 首帧前 EOF/通道关 = 出口没有测速服务（连接被出口侧立即收流）
                             if first_frame
                                 && matches!(e, SpeedtestError::Conn(ConnErr::Closed) | SpeedtestError::Frame(_))
@@ -624,33 +683,34 @@ fn run_phases(
     let down_bps = down_bytes as f64 / p.down.as_secs_f64();
 
     // ---- 上行：新连接（每流一角色不复用）；每流一线程泵送 ----
-    let mut up_ids = Vec::with_capacity(p.streams);
+    let mut up_conns = Vec::with_capacity(p.streams);
     for _ in 0..p.streams {
-        let id = client.connect(dst)?;
-        ids.lock().expect("连接表锁中毒").push(id);
-        up_ids.push(id);
+        let c = dial()?;
+        conns.lock().expect("连接表锁中毒").push(std::sync::Arc::clone(&c));
+        up_conns.push(c);
     }
-    for &id in &up_ids {
+    for c in &up_conns {
         let payload = request_payload("send", p.warmup.as_millis() as u64, p.up.as_millis() as u64);
-        write_all(client, id, w.control(TYPE_REQUEST, &payload))?;
+        c.write_frame(w.control(TYPE_REQUEST, &payload))?;
     }
     let mut up_bytes: i64 = 0;
     let mut up_usage: i64 = 0;
     let mut wall_sum: i64 = 0;
     let up_join: Result<(), SpeedtestError> = std::thread::scope(|s| {
-        let handles: Vec<_> = up_ids
+        let handles: Vec<_> = up_conns
             .iter()
-            .map(|&id| {
+            .map(|c| {
+                let c = std::sync::Arc::clone(c);
                 s.spawn(move || -> Result<(i64, i64, i64), SpeedtestError> {
                     let mut f = Frame::new();
                     // 预热泵 → START → 窗口泵 → FINISH → report（接收端报数）
-                    let warm = pump(client, id, &mut f, p.warmup)?;
-                    write_all(client, id, f.control(TYPE_START, &[]))?;
-                    let win = pump(client, id, &mut f, p.up)?;
-                    write_all(client, id, f.control(TYPE_FINISH, &[]))?;
+                    let warm = pump(c.as_ref(), &mut f, p.warmup)?;
+                    c.write_frame(f.control(TYPE_START, &[]))?;
+                    let win = pump(c.as_ref(), &mut f, p.up)?;
+                    c.write_frame(f.control(TYPE_FINISH, &[]))?;
                     let (used, bytes, wall) = {
                         let mut fr = FrameReader::new();
-                        match fr.read_frame(client, id)? {
+                        match fr.read_frame(c.as_ref())? {
                         FrameIn::Other { typ, payload } if typ == TYPE_REPORT => {
                             let rep = parse_report(&payload)?;
                             (warm + win, rep.bytes, rep.wall_ms)
@@ -686,9 +746,6 @@ fn run_phases(
     };
     let up_bps = up_bytes as f64 / denom.as_secs_f64();
 
-    for &id in up_ids.iter().chain(down_ids.iter()) {
-        let _ = client.close(id);
-    }
     let wall_ms = t0.elapsed().as_millis() as u64;
     logf(&format!(
         "speedtest: 完成（down={:.0}B/s（{:.2}Mbps） up={:.0}B/s（{:.2}Mbps） 用量={}MB 用时={}s）",
@@ -710,14 +767,14 @@ fn run_phases(
 
 /// 泵一段 data（250ms 分片节奏——Go PumpDataChunk 形态：分片边界 = live 字节更新点
 /// 与取消检查点；整帧单次写全；返回本段 payload 字节数）。
-fn pump(client: &Client, id: u64, f: &mut Frame, dur: Duration) -> Result<i64, SpeedtestError> {
+fn pump(conn: &dyn SpeedConn, f: &mut Frame, dur: Duration) -> Result<i64, SpeedtestError> {
     const SLICE: Duration = Duration::from_millis(250);
     let deadline = Instant::now() + dur;
     let mut total: i64 = 0;
     while Instant::now() < deadline {
         let slice_end = Instant::now() + SLICE.min(deadline.saturating_duration_since(Instant::now()));
         while Instant::now() < slice_end {
-            write_all(client, id, f.data(BLOCK)?)?;
+            conn.write_frame(f.data(BLOCK)?)?;
             total += BLOCK as i64;
         }
         // 分片边界：live 字节与取消检查点（客户端当前无外部取消面——conn 关闭由

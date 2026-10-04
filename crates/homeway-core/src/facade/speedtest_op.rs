@@ -9,8 +9,9 @@
 //!
 //! via/rtt 不在这层取：App 侧在开跑时从状态快照冻结。
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::os::unix::net::UnixStream;
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
 use serde::Deserialize;
@@ -139,10 +140,102 @@ pub fn speed_cancel_json() -> String {
     Value::Object(m).to_string()
 }
 
+/// App 形态的引擎承载（本机测速桥：UDS + 鉴权首包 → 拆半读写 + kill 面）。
+/// `raw` 保留一份克隆专门给 kill（watchdog 到点 shutdown Both 打断在途读写——
+/// 拆半后的 Box<dyn Read> 无法从外部关）。
+pub struct BridgeSpeedConn {
+    raw: UnixStream,
+    r: Mutex<Box<dyn Read + Send>>,
+    w: Mutex<Box<dyn super::bridge_host::WriteHalf + Send>>,
+}
+
+impl crate::speedtest::SpeedConn for BridgeSpeedConn {
+    fn write_frame(&self, data: &[u8]) -> Result<(), crate::speedtest::SpeedtestError> {
+        use crate::speedtest::SpeedtestError;
+        let mut w = self.w.lock().unwrap_or_else(|e| e.into_inner());
+        let mut off = 0;
+        while off < data.len() {
+            match w.write(&data[off..]) {
+                Ok(0) => return Err(SpeedtestError::Frame("测速桥写通道返回 0（对端已关）".into())),
+                Ok(n) => off += n,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                    return Err(SpeedtestError::Conn(crate::wgcore::ConnErr::Timeout));
+                }
+                Err(e) => return Err(SpeedtestError::Frame(format!("测速桥写失败：{e}"))),
+            }
+        }
+        Ok(())
+    }
+    fn read_some(&self) -> Result<Vec<u8>, crate::speedtest::SpeedtestError> {
+        use crate::speedtest::SpeedtestError;
+        let mut r = self.r.lock().unwrap_or_else(|e| e.into_inner());
+        let mut buf = [0u8; 128 * 1024];
+        match r.read(&mut buf) {
+            Ok(0) => Ok(Vec::new()), // EOF
+            Ok(n) => Ok(buf[..n].to_vec()),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock || e.kind() == std::io::ErrorKind::TimedOut => {
+                Err(SpeedtestError::Conn(crate::wgcore::ConnErr::Timeout))
+            }
+            Err(e) => Err(SpeedtestError::Frame(format!("测速桥读失败：{e}"))),
+        }
+    }
+    fn kill(&self) {
+        let _ = self.raw.shutdown(std::net::Shutdown::Both);
+    }
+}
+
+/// App 引擎入口：拨桥 + 鉴权 → `speedtest::run_dial`（同步跑完整轮——NAPI 壳在
+/// async work 线程上跑；失败信封同 `SpeedOutcome::Fail`）。
+pub fn app_run(auth: &str, sock: &str, p: &crate::speedtest::Params, logf: &dyn Fn(&str)) -> SpeedOutcome {
+    let dial = || -> Result<std::sync::Arc<dyn crate::speedtest::SpeedConn>, crate::speedtest::SpeedtestError> {
+        match speed_dial_conn(auth, sock, Duration::from_secs(10)) {
+            Ok(c) => Ok(std::sync::Arc::new(c)),
+            Err((reason, msg)) => {
+                // 拨号/鉴权失败 = 注入缝错误（bridge_down/bridge_auth——引擎透传面）
+                Err(crate::speedtest::SpeedtestError::Bridge(reason, msg))
+            }
+        }
+    };
+    match crate::speedtest::run_dial(&dial, *p, logf) {
+        Ok(res) => SpeedOutcome::Ok(res),
+        Err(e) => SpeedOutcome::Fail { reason: e.reason().to_string(), msg: e.to_string() },
+    }
+}
+
+/// 拨测速桥 + 鉴权 + 拆半（SpeedConn 承载构造）。
+pub fn speed_dial_conn(
+    auth_hex: &str,
+    sock: &str,
+    budget: Duration,
+) -> Result<BridgeSpeedConn, (&'static str, String)> {
+    let mut conn = super::bridge_host::connect_budget(std::path::Path::new(sock), budget)
+        .map_err(|e| ("bridge_down", format!("测速通道暂时不可用（桥未就绪或正在恢复）：{e}")))?;
+    // 长任务连接不设逐操作超时（窗口期读阻塞是常态；中断由引擎看门狗 kill 承担）
+    conn.set_read_timeout(None).ok();
+    conn.set_write_timeout(None).ok();
+    write_auth(&mut conn, auth_hex).map_err(|e| ("bridge_auth", format!("测速通道鉴权失败：{e}")))?;
+    let raw = conn
+        .try_clone()
+        .map_err(|e| ("bridge_down", format!("测速桥 fd 复制失败：{e}")))?;
+    let boxed: Box<dyn super::bridge_host::BridgeStream> = Box::new(conn);
+    let (r, w) = boxed
+        .into_halves()
+        .map_err(|e| ("bridge_down", format!("测速桥拆半失败：{e}")))?;
+    Ok(BridgeSpeedConn {
+        raw,
+        r: Mutex::new(r),
+        w: Mutex::new(w),
+    })
+}
+
 /// 测速桥拨号 + 鉴权（引擎的 Dial 缝；ctx 语义由 UnixStream deadline 承载——
 /// 拨号预算/取消要能打断在途拨号，FIX-39）。
 pub fn speed_dial(auth_hex: &str, sock: &str, budget: Duration) -> Result<UnixStream, (&'static str, String)> {
-    let conn = UnixStream::connect(sock)
+    // 工单④：UDS 拨号加 connect 预算（拨号预算/取消要能打断在途拨号——FIX-39 面）
+    let conn = super::bridge_host::connect_budget(
+        std::path::Path::new(sock),
+        budget.max(Duration::from_millis(500)),
+    )
         .map_err(|e| ("bridge_down", format!("测速通道暂时不可用（桥未就绪或正在恢复）：{e}")))?;
     conn.set_read_timeout(Some(budget)).ok();
     conn.set_write_timeout(Some(budget)).ok();

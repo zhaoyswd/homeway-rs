@@ -1,8 +1,8 @@
-//! homeway-core facade：App 核门面（20 个 NAPI 导出面的 Rust API——R7-7c）。
+//! homeway-core facade：App 核门面（20 个 NAPI 导出面的 Rust API——R7-7c/7g）。
 //!
 //! 语义真源 = `baseline:clientcore/cmd/clientcore/` 的 `//export` 族（tier:AGENTS.md
 //! 原生契约四处同步清单；7b 拍板 = C-ABI 复刻同名符号，本模块即符号面之下的纯 Rust
-//! API——**不接 NAPI 绑定**，extern "C" 壳是 R7 第 2 棒的活）。
+//! API——extern "C" 壳在 `homeway-capi` crate）。
 //!
 //! 20 个面（tier:AGENTS.md 清单）：
 //! - tun 生命周期 8：`tun_prepare/tun_attach/tun_status/tun_stop/tun_recover/
@@ -14,13 +14,21 @@
 //!
 //! 返回码契约（probe_lib.go 头注释逐字）：
 //! - `tun_prepare`：0 开始 / -1 忙 / -2 日志打不开 / -3 参数错（含 token 空）；
-//! - `tun_attach`：0 接管 / -1 无 ready 世代 / -3 fd≤0 / -4 接管失败 / -5 轮询超时；
+//! - `tun_attach`：0 接管 / -1 无 ready 世代（或 fd 投不进） / -3 fd≤0 / -4 接管失败
+//!   （世代已整体收工，原因见 tun_status）/ -5 轮询超时（5s 内没等到 attached——
+//!   只是慢，不是失败）；
 //! - `tun_stop`：0 已停 / -1 等超时 / -2 超时后强制放锁；
 //! - `tun_recover`：0 某档通过 / -1 走完未恢复 / -2 无 attached 隧道 / -3·-4 本地动作 /
 //!   -9 异步壳异常（壳面产生，本面不产）。
 //!
-//! tun 域的数据面执行体经 [`TunExecutor`] 注入——第 2 棒接真 wgcore hub（TUN fd →
-//! L3 直通）；本棒以 trait 契约 + 状态机全路径单测钉语义（两阶段/世代/单飞/停等）。
+//! 世代生命周期（7g 工单①）：`warmup` **启动即返**（tier 壳在 JS 线程同步直调
+//! prepare——暖机 20s 窗在线程里跑会冻结事件泵）；世代线程持有 [`TunShared`] 的
+//! 收尾义务（`finish_generation`：非 failed 回 idle、放单飞锁、健康位/分类、done 信号）；
+//! attach 60s 死线由世代线程收割（`idle/"attach-timeout"/"就绪后无人 attach，已自行
+//! 收工放锁"`——Go 生产路径同串，C-5 向量重产对齐）。
+//!
+//! tun 域的数据面执行体经 [`TunExecutor`] 注入；本仓实现 = `tun_exec::TunnelExec`
+//! （真 wgcore hub：TUN fd → L3 直通）。
 
 pub mod bridge_host;
 pub mod demand;
@@ -28,20 +36,24 @@ pub mod events;
 pub mod files_op;
 pub mod portfwd;
 pub mod probe_json;
+pub mod service_exec;
 pub mod service_op;
 pub mod speedtest_op;
 pub mod stage;
 pub mod term_op;
+pub mod tun_exec;
+pub mod tun_shared;
 pub mod tun_status;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use serde::Deserialize;
 
 use demand::DemandSignals;
-use stage::{StageMachine, TunStage};
+use stage::TunStage;
+use tun_shared::{lock_unpoison, TunShared};
 use tun_status::{RunnerIn, TransportIn, TunStatusInput};
 
 /// 暖机窗口：等注册确认为止（软失败——超时仍 ready、可 attach 自愈）。
@@ -49,8 +61,13 @@ pub const WARM_TIMEOUT: Duration = Duration::from_secs(20);
 /// prepare 成功后等 attach 的上限（唯一合法长间隔 = 系统侧建接口/授权；到点世代
 /// 自行收工放锁，防无人推进的世代占锁）。
 pub const ATTACH_DEADLINE: Duration = Duration::from_secs(60);
+/// attach 投递后等世代进入 attached 的轮询上限（Go attachTun 的 5s——到点 -5「慢」
+/// 与 -4「失败」区分）。
+pub const ATTACH_POLL: Duration = Duration::from_secs(5);
 /// stop 收工等待预算（tunStopWait 的 3s；超时 -1，且期间无新世代 ⇒ 强制放锁 -2）。
 pub const STOP_WAIT: Duration = Duration::from_secs(3);
+/// attach 死线终态的判据串（Go tunmode.go:802 生产路径逐字；C-5 向量源）。
+pub const ATTACH_TIMEOUT_REASON: &str = "就绪后无人 attach，已自行收工放锁";
 
 /// tunConfig（hostsession.Config 同形；JSON 键 = Go json tag 的 camelCase——
 /// 评审 r1-F05 整改：App 实发 camelCase，无 rename 会静默丢 7 字段）。
@@ -79,25 +96,59 @@ pub struct TunConfigJson {
     pub port_forwards: Vec<portfwd::PortForwardRule>,
 }
 
-/// tun 域执行体（世代生命周期里需要外部世界的动作）。第 2 棒接 wgcore hub；
-/// 本棒测试用受控实现。
+/// warmup 的类型化错误（工单⑤ r1-F27：字符串错误改枚举；code 即 tun_status 的
+/// 机器可读原因码）。
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum TunError {
+    /// 会话/核类（token 解析失败、数据面装配失败等）。
+    #[error("{0}")]
+    Core(String),
+    /// 日志面打不开（tun_prepare 的 -2 同源）。
+    #[error("日志文件打不开：{0}")]
+    LogOpen(String),
+    /// 参数类（tun_prepare 的 -3 同源）。
+    #[error("参数错误：{0}")]
+    InvalidConfig(String),
+}
+
+impl TunError {
+    /// tun_status 的 code 词面（stage 机的原因码族：core/config/derp/attach/…）。
+    pub fn code(&self) -> &'static str {
+        match self {
+            TunError::Core(_) => "core",
+            TunError::LogOpen(_) => "core",
+            TunError::InvalidConfig(_) => "config",
+        }
+    }
+}
+
+/// tun 域执行体（世代生命周期里需要外部世界的动作）。本仓实现 = `tun_exec::TunnelExec`
+/// （真 hub）；测试用受控实现。
+///
+/// 生命周期契约（工单①）：
+/// - `warmup` **启动即返**：受理后 spawn 世代线程即回 `Ok(())`；同步硬失败回 `Err`
+///   （facade 写 failed 终态 + 放锁后仍返回受理 0——失败原因经 `tun_status` 读，
+///   Go tunBegin 的 goroutine 内失败同语义）；
+/// - 世代线程**必须**在一切退出路径调 `shared.finish_generation(gen)`（终态/放锁/
+///   done 信号——漏调 = 单飞锁永不释放）；
+/// - 世代线程从 `shared.attach_receiver()` 拿 fd 接收端：暖机完成（stage=ready）后
+///   在 `ATTACH_DEADLINE` 内等 fd，到点自行收工（`idle/"attach-timeout"` 终态）；
+/// - `request_stop` 要能打断暖机（Go：关客户端是第二条打断路径）。
 pub trait TunExecutor: Send + Sync {
-    /// 暖机一个世代（不碰 TUN fd；完成时把阶段机置 ready〔meowed〕/failed）。
-    /// 返回 Err = 同步硬失败（世代立刻 failed）。
-    fn warmup(&self, cfg: &TunConfigJson, stage: &StageMachine, gen: u64) -> Result<(), String>;
-    /// attach：把 TUN fd 交给已就绪的世代接管数据面。
-    fn attach(&self, fd: i32, mtu: u32) -> Result<(), String>;
-    /// 请求世代收工（幂等信号）。
+    /// 暖机一个世代（启动即返；见模块头生命周期契约）。
+    fn warmup(
+        &self,
+        cfg: &TunConfigJson,
+        shared: Arc<TunShared>,
+        gen: u64,
+    ) -> Result<(), TunError>;
+    /// 请求世代收工（幂等信号；要能打断暖机中的阻塞调用）。
     fn request_stop(&self);
-    /// 等世代真正退出（≤ budget）；返回是否已退。
-    fn wait_stopped(&self, budget: Duration) -> bool;
     /// 恢复阶梯入口（from 起跑档位；rc 契约见 session::LadderRc::as_rc）。
     fn recover(&self, from: i64, cause: &str) -> i32;
-    /// 世代健康位快照（fd 循环异常会翻 false——「界面显示已连接、隧道其实已死」的漂谎防线）。
-    fn healthy(&self) -> bool;
-    /// 不健康原因分类（patrol=传输类/fd/panic/stop=设备层；空 = 健康）。
-    fn unhealthy_why(&self) -> String;
     /// runner/transport 状态块（tunStatusJSON 的条件键源；None = 无 runner 期）。
+    /// 健康位/分类在 `TunShared`（不走本 trait——世代共享面）。
     fn runner(&self) -> Option<RunnerIn>;
     fn transport(&self) -> Option<TransportIn>;
     /// portfwd 整表热替换承载（默认 -1：无承载 = 改动随下次连接的 tunConfig 生效）。
@@ -106,33 +157,24 @@ pub trait TunExecutor: Send + Sync {
     }
 }
 
-/// 无操作执行体（默认：一切本地动作失败——prepare 只到参数校验、attach 恒败）。
-/// 真壳在第 2 棒注入；这保证 facade 独立可测。
+/// 无操作执行体（默认：一切本地动作失败——prepare 只到参数校验、暖机即失败）。
+/// `TunnelExec`（真 hub）在 tun_exec；这保证 facade 独立可测。
 #[derive(Debug, Default)]
-pub struct NoopTunExecutor {
-    pub healthy: AtomicBool,
-}
+pub struct NoopTunExecutor;
 
 impl TunExecutor for NoopTunExecutor {
-    fn warmup(&self, _cfg: &TunConfigJson, stage: &StageMachine, _gen: u64) -> Result<(), String> {
-        stage.set(TunStage::Failed, "core", "无执行体（NoopTunExecutor）", false);
-        Err("无执行体".to_owned())
-    }
-    fn attach(&self, _fd: i32, _mtu: u32) -> Result<(), String> {
-        Err("无执行体".to_owned())
+    fn warmup(
+        &self,
+        _cfg: &TunConfigJson,
+        _shared: Arc<TunShared>,
+        _gen: u64,
+    ) -> Result<(), TunError> {
+        // 同步硬失败（无执行体）：facade 会写 failed 终态 + 放锁
+        Err(TunError::Core("无执行体（NoopTunExecutor）".into()))
     }
     fn request_stop(&self) {}
-    fn wait_stopped(&self, _budget: Duration) -> bool {
-        true
-    }
     fn recover(&self, _from: i64, _cause: &str) -> i32 {
         -2
-    }
-    fn healthy(&self) -> bool {
-        self.healthy.load(Ordering::Relaxed)
-    }
-    fn unhealthy_why(&self) -> String {
-        String::new()
     }
     fn runner(&self) -> Option<RunnerIn> {
         None
@@ -142,95 +184,85 @@ impl TunExecutor for NoopTunExecutor {
     }
 }
 
-/// tun 域状态（单飞锁 + 世代 + 阶段机 + 前台位）。
-struct TunDomain {
-    /// 单飞锁（probeRunning）：世代在世期间持有，收工放。
-    probe_running: AtomicBool,
-    /// 世代计数（每次 prepare 递增；阶段机/attach 都比对它防陈旧）。
-    gen: std::sync::atomic::AtomicU64,
-    stage: StageMachine,
-    /// 当前世代的 attach 截止（ready 时起表；过线世代自收工放锁）。
-    attach_deadline: Mutex<Option<Instant>>,
+/// App 核门面（20 导出面的 Rust API；线程安全）。
+pub struct ClientCore {
+    /// tun 域世代共享面（单飞锁/世代/阶段机/健康位/attach 通道/done）。
+    tun: Arc<TunShared>,
     /// 前台位（SetForeground 的返回值语义 = 上一状态）。
     foreground: AtomicBool,
     /// 「回到前台」转变时的补探钩子（false→true 踢一次立即探测；只影响时机）。
     foreground_kick: Mutex<Option<Box<dyn Fn() + Send>>>,
-    /// 收工强制放锁后的「孤儿世代」标记（旧世代 goroutine 可能还在收尾——它写阶段
-    /// 前必须过世代比对，见 StageMachine::set_if_current）。
-    orphan_alive: AtomicBool,
-}
-
-impl TunDomain {
-    fn new() -> Self {
-        TunDomain {
-            probe_running: AtomicBool::new(false),
-            gen: std::sync::atomic::AtomicU64::new(0),
-            stage: StageMachine::new(),
-            attach_deadline: Mutex::new(None),
-            foreground: AtomicBool::new(false),
-            foreground_kick: Mutex::new(None),
-            orphan_alive: AtomicBool::new(false),
-        }
-    }
-}
-
-/// App 核门面（20 导出面的 Rust API；线程安全）。
-pub struct ClientCore {
-    tun: TunDomain,
+    /// 收工强制放锁后的「孤儿世代」标记（tun_stop 的 -2 路径；世代线程迟到收尾
+    /// 过世代守卫即可，此位供诊断区分「锁被强制放过后旧世代是否还活着」）。
+    orphan_alive: Arc<AtomicBool>,
     pub demand: DemandSignals,
     pub files: files_op::FilesOps,
     executor: Mutex<Arc<dyn TunExecutor>>,
-    /// 服务会话域（rc 门与状态面在 service_op；真 Session/桥挂接在 7d 装配位）。
-    pub service: service_op::ServiceDomain,
+    /// 服务会话域（rc 门与状态机在 service_op；Arc = ServiceExec 的共享事实源）。
+    pub service: Arc<service_op::ServiceDomain>,
+    /// 服务会话真装配（Session + 桥；三导出的执行面——rc 门先行、本模块接线）。
+    pub service_exec: service_exec::ServiceExec,
     /// 状态推送的最小等价面（可轮询事件队列 + 冷启动快照；真 IPC 推送在 ArkTS 侧）。
+    /// Rust 独有内部面——不进 20 导出面、不参与词表对账（7g 争议②拍板：文档声明）。
     pub events: events::EventHub,
-    /// 服务桥宿主（`<filesDir>/bridge/*.sock` 三座；None = 未装配——第 2 棒随真
-    /// Session 注入，本棒接口 + 单测已齐）。
+    /// 服务桥宿主（`<filesDir>/bridge/*.sock` 三座；None = 未装配——随真 Session 注入）。
     pub service_bridge: Mutex<Option<Arc<bridge_host::BridgeHost>>>,
 }
 
 impl Default for ClientCore {
     fn default() -> Self {
-        Self::new(Arc::new(NoopTunExecutor::default()))
+        Self::new(Arc::new(NoopTunExecutor))
     }
 }
 
 impl ClientCore {
     pub fn new(executor: Arc<dyn TunExecutor>) -> Self {
         ClientCore {
-            tun: TunDomain::new(),
+            tun: Arc::new(TunShared::new()),
+            foreground: AtomicBool::new(false),
+            foreground_kick: Mutex::new(None),
+            orphan_alive: Arc::new(AtomicBool::new(false)),
             demand: DemandSignals::new(),
             files: files_op::FilesOps::new(),
             executor: Mutex::new(executor),
-            service: service_op::ServiceDomain::new(),
+            service: Arc::new(service_op::ServiceDomain::new()),
+            service_exec: service_exec::ServiceExec::new(),
             events: events::EventHub::new(),
             service_bridge: Mutex::new(None),
         }
     }
 
-    /// 装配服务桥（7d：服务会话宿主形态——`service_start` 受理后由装配方注入；
+    /// 装配服务桥（服务会话宿主形态——`service_start` 受理后由装配方注入；
     /// 桥状态经 `bridge_status` 并入 serviceStatusJSON 的 bridge 四键）。
     pub fn attach_service_bridge(&self, host: Option<Arc<bridge_host::BridgeHost>>) {
-        *self.service_bridge.lock().expect("服务桥锁中毒") = host;
+        *lock_unpoison(&self.service_bridge) = host;
     }
 
     /// 桥状态快照（bridge 四键源；未装配 = 全空——serviceStatusJSON 的缺省形态）。
     pub fn bridge_status(&self) -> bridge_host::BridgeStatus {
-        self.service_bridge
-            .lock()
-            .expect("服务桥锁中毒")
+        lock_unpoison(&self.service_bridge)
             .as_ref()
             .map(|h| h.status())
             .unwrap_or_default()
     }
 
-    /// 替换执行体（第 2 棒装配真 hub 用；测试注入受控实现用）。
+    /// 替换执行体（装配真 hub 用；测试注入受控实现用）。
     pub fn set_executor(&self, e: Arc<dyn TunExecutor>) {
-        *self.executor.lock().expect("executor 锁中毒") = e;
+        *lock_unpoison(&self.executor) = e;
     }
 
     fn executor(&self) -> Arc<dyn TunExecutor> {
-        Arc::clone(&self.executor.lock().expect("executor 锁中毒"))
+        Arc::clone(&lock_unpoison(&self.executor))
+    }
+
+    /// tun 共享面（执行体装配/测试用）。
+    pub fn tun_shared(&self) -> Arc<TunShared> {
+        Arc::clone(&self.tun)
+    }
+
+    /// 孤儿世代标记位（tun_exec 的世代线程在 stop 强制放锁路径上报用）。
+    pub fn orphan_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.orphan_alive)
     }
 
     // ---- ① ClientCoreVersion ----
@@ -245,83 +277,83 @@ impl ClientCore {
 
     // ---- ② ClientCoreTunPrepare（tunBegin）----
 
-    /// 两阶段启动第一阶段：暖机（不碰 TUN fd）。调用后轮询 `tun_status` 直到
-    /// state=ready（或 failed）；就绪后必须在 `ATTACH_DEADLINE` 内 attach。
+    /// 两阶段启动第一阶段：暖机（不碰 TUN fd）。**启动即返**（世代线程在执行体里）；
+    /// 调用后轮询 `tun_status` 直到 state=ready（或 failed）；就绪后必须在
+    /// `ATTACH_DEADLINE` 内 attach（到点世代自行收工）。
     pub fn tun_prepare(&self, cfg_json: &str, log_path_ok: bool) -> i32 {
         // 单飞：在世世代期间拒绝（-1 忙）
         if self.tun.probe_running.swap(true, Ordering::AcqRel) {
             return -1;
         }
+        let release = |tun: &TunShared| tun.probe_running.store(false, Ordering::Release);
         let cfg: TunConfigJson = match serde_json::from_str(cfg_json) {
             Ok(c) => c,
             Err(_) => {
-                self.tun.probe_running.store(false, Ordering::Release);
+                release(&self.tun);
                 return -3;
             }
         };
         // 参数预检（同步可判的硬失败）：空 token 是唯一能在这关同步判死的配置错
         if cfg.token.is_empty() {
-            self.tun.probe_running.store(false, Ordering::Release);
+            release(&self.tun);
             return -3;
         }
         // 日志重定向面（-2）：真壳接文件；本面以标志位承载（打开失败 = -2）
         if !log_path_ok {
-            self.tun.probe_running.store(false, Ordering::Release);
+            release(&self.tun);
             return -2;
         }
         let gen = self.tun.gen.fetch_add(1, Ordering::AcqRel) + 1;
-        self.tun.stage.begin_generation(gen);
-        // 新世代不带上一世代的分类残留（先清——顺序即注释）
-        self.tun.orphan_alive.store(false, Ordering::Release);
+        self.tun.begin_generation(gen); // 写入权交接 + done/attach 通道复位
+        self.orphan_alive.store(false, Ordering::Release);
+        self.tun.begin_healthy(); // 新世代不带上一世代的分类残留（先清——顺序即注释）
         self.tun.stage.set_if_current(gen, TunStage::Preparing, "", "", false);
-        let exec = self.executor();
-        let stage = &self.tun.stage;
-        let result = exec.warmup(&cfg, stage, gen);
-        if let Err(e) = result {
-            // 同步硬失败：世代收尾（放锁 + failed 终态）
-            self.tun.stage.set_if_current(gen, TunStage::Failed, "core", &e, false);
-            self.tun.probe_running.store(false, Ordering::Release);
-            return 0; // 受理 0；failed 原因经 tun_status 读
+        match self.executor().warmup(&cfg, Arc::clone(&self.tun), gen) {
+            Ok(()) => 0,
+            Err(e) => {
+                // 同步硬失败（如线程 spawn 失败）：世代就地收尾（failed 终态 + 放锁）。
+                // 仍返回受理 0——失败原因经 tun_status 读（Go goroutine 内失败同语义）。
+                self.tun
+                    .stage
+                    .set_if_current(gen, TunStage::Failed, e.code(), &e.to_string(), false);
+                self.tun.finish_generation(gen);
+                0
+            }
         }
-        0
     }
 
-    // ---- ③ ClientCoreTunAttach ----
+    // ---- ③ ClientCoreTunAttach（attachTun）----
 
     /// 两阶段启动第二阶段：把 TUN fd 交给已就绪的世代。
     /// fd≤0 直接拒（fd=0 是合法的 stdin——会把核读扩展进程标准输入，极难查）。
     pub fn tun_attach(&self, fd: i32, mtu: u32) -> i32 {
+        let _ = mtu; // mtu 由世代线程从 cfg 读（fd 通道只传 fd——Go attachCh 同形）
         if fd <= 0 {
             self.tun.stage.set(TunStage::Failed, "attach", "attach 收到非法 fd", false);
             return -3;
         }
-        let gen = self.tun.gen.load(Ordering::Acquire);
         let snap = self.tun.stage.snapshot();
         if !self.tun.probe_running.load(Ordering::Acquire) || snap.stage != TunStage::Ready {
             return -1;
         }
-        // attach 截止检查（无人推进的世代已收工——tun_status 可读 attach-timeout）
-        if let Some(dl) = *self.tun.attach_deadline.lock().expect("attach 截止锁中毒") {
-            if Instant::now() > dl {
-                self.tun.stage.set_if_current(gen, TunStage::Idle, "attach-timeout", "等待接入超时，世代已收工", false);
-                self.tun.probe_running.store(false, Ordering::Release);
-                return -1;
-            }
+        // 投 fd（通道缓冲 1 非阻塞；世代线程未注册接收端〔暖机未完成〕= -1——
+        // 调用方稍后重试，与 Go attachCh 2s 投递窗的 -1 同归因）
+        if !self.tun.deliver_fd(fd) {
+            return -1;
         }
-        match self.executor().attach(fd, mtu) {
-            Ok(()) => {
-                self.tun
-                    .stage
-                    .set_if_current(gen, TunStage::Attached, "", "", true);
-                *self.tun.attach_deadline.lock().expect("attach 截止锁中毒") = None;
-                0
+        // 轮询 stage：attached → 0；failed/idle → -4；5s → -5（慢，不是失败）
+        let deadline = std::time::Instant::now() + ATTACH_POLL;
+        loop {
+            let st = self.tun.stage.snapshot().stage;
+            match st {
+                TunStage::Attached => return 0,
+                TunStage::Failed | TunStage::Idle => return -4,
+                _ => {}
             }
-            Err(e) => {
-                // 接管失败：世代整体收工（状态可查原因）
-                self.tun.stage.set_if_current(gen, TunStage::Failed, "attach", &e, false);
-                self.tun.probe_running.store(false, Ordering::Release);
-                -4
+            if std::time::Instant::now() >= deadline {
+                return -5;
             }
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -333,7 +365,7 @@ impl ClientCore {
         let snap = self.tun.stage.snapshot();
         let running = self.tun_running_inner(&exec);
         // unhealthyReason 只看分类是否非空（Go `if why != ""`——与 running 位独立）
-        let why = exec.unhealthy_why();
+        let why = lock_unpoison(&self.tun.unhealthy_why).clone();
         let input = TunStatusInput {
             stage: snap,
             running,
@@ -346,32 +378,39 @@ impl ClientCore {
         tun_status::tun_status_json(&input)
     }
 
-    fn tun_running_inner(&self, exec: &Arc<dyn TunExecutor>) -> bool {
+    fn tun_running_inner(&self, _exec: &Arc<dyn TunExecutor>) -> bool {
         // 只有接上数据面且健康才算 1（单飞锁 + 健康位 + attached 的合成——三个信号
         // 各自原子、合起来不是一致快照，转换瞬间可能瞬时 0/1；调用方已用去抖）。
         self.tun.probe_running.load(Ordering::Acquire)
-            && exec.healthy()
+            && self.tun.healthy.load(Ordering::Acquire)
             && self.tun.stage.snapshot().stage == TunStage::Attached
     }
 
-    // ---- ⑤ ClientCoreTunStop ----
+    // ---- ⑤ ClientCoreTunStop（tunStopWait）----
 
     /// 停止并等待收尾：0 已停（或本就没跑）/ -1 等待超时（世代仍在，锁未放）/
     /// -2 等超时后强制放锁（收工超时且期间没有新世代启动）。
+    ///
+    /// 终态语义（工单③）：**只放锁不写阶段**——终态由世代线程的 finish_generation
+    /// 写（非 failed 回 idle；failed 保留）；tun_stop 不抢写。
     pub fn tun_stop(&self) -> i32 {
         if !self.tun.probe_running.load(Ordering::Acquire) {
             return 0; // 本就没在跑
         }
+        if self.tun.is_done() {
+            return 0; // 本世代早已退出（锁可能尚未被观测到放下——finish 已放）
+        }
         let gen = self.tun.gen.load(Ordering::Acquire);
         self.executor().request_stop();
-        if self.executor().wait_stopped(STOP_WAIT) {
-            self.tun.stage.set_if_current(gen, TunStage::Idle, "stopped", "", false);
-            self.tun.probe_running.store(false, Ordering::Release);
+        if self.tun.wait_done(STOP_WAIT) {
             return 0;
         }
-        // 超时：若期间没有新世代启动（gen 未变且锁未放出）⇒ 强制放锁
-        if self.tun.gen.load(Ordering::Acquire) == gen && self.tun.probe_running.load(Ordering::Acquire) {
-            self.tun.orphan_alive.store(true, Ordering::Release);
+        // 超时：若期间没有新世代启动（gen 未变且锁未放出）⇒ 强制放锁（不写阶段——
+        // 工单③：终态由世代写；旧世代迟到收尾过世代守卫无害）
+        if self.tun.gen.load(Ordering::Acquire) == gen
+            && self.tun.probe_running.load(Ordering::Acquire)
+        {
+            self.orphan_alive.store(true, Ordering::Release);
             self.tun.probe_running.store(false, Ordering::Release);
             -2
         } else {
@@ -397,9 +436,9 @@ impl ClientCore {
     /// 下发「App 是否前台」；返回上一状态。false→true 的转变踢一次立即探测
     /// （巡检节拍固定 60s 不变；只影响探测时机）。
     pub fn tun_set_foreground(&self, fg: bool) -> i32 {
-        let prev = self.tun.foreground.swap(fg, Ordering::AcqRel);
+        let prev = self.foreground.swap(fg, Ordering::AcqRel);
         if !prev && fg {
-            if let Some(kick) = self.tun.foreground_kick.lock().expect("kick 锁中毒").as_ref() {
+            if let Some(kick) = lock_unpoison(&self.foreground_kick).as_ref() {
                 kick();
             }
         }
@@ -408,7 +447,7 @@ impl ClientCore {
 
     /// 注册「回到前台」补探钩子。
     pub fn set_foreground_kick(&self, f: Option<Box<dyn Fn() + Send>>) {
-        *self.tun.foreground_kick.lock().expect("kick 锁中毒") = f;
+        *lock_unpoison(&self.foreground_kick) = f;
     }
 
     // ---- ⑨ ClientCoreTunSetActivity ----
@@ -465,7 +504,11 @@ impl ClientCore {
 
     // ---- ⑮⑯⑰ ClientCoreSpeedTest* ----
 
-    pub fn speedtest_start(&self, params_json: &str, run: impl FnOnce(speedtest_op::EngineParams) -> speedtest_op::SpeedOutcome) -> String {
+    pub fn speedtest_start(
+        &self,
+        params_json: &str,
+        run: impl FnOnce(speedtest_op::EngineParams) -> speedtest_op::SpeedOutcome,
+    ) -> String {
         speedtest_op::speed_start(params_json, run)
     }
 
@@ -479,16 +522,18 @@ impl ClientCore {
 
     // ---- ⑱⑲⑳ ClientCoreService* ----
 
+    /// 真装配形态（工单⑤ service 三面接真 Session）：rc 门 + Session/桥接线都在
+    /// ServiceExec；纯门形态（`self.service.start/stop/status_json`）保留给测试。
     pub fn service_start(&self, cfg_json: &str) -> i32 {
-        self.service.start(cfg_json)
+        self.service_exec.start(cfg_json, &self.service)
     }
 
     pub fn service_stop(&self) -> i32 {
-        self.service.stop()
+        self.service_exec.stop(&self.service)
     }
 
     pub fn service_status(&self) -> String {
-        self.service.status_json()
+        self.service_exec.status()
     }
 }
 
@@ -503,46 +548,86 @@ mod tests {
     use super::*;
     use std::sync::mpsc;
 
-    /// 受控执行体：warmup 置 ready/failed 由测试定；attach 成率可定。
+    /// 受控执行体：暖机在线程里推进（置 ready/failed 由测试定）；attach 成率可定。
+    /// 走世代线程形态（对齐工单①语义：warmup 启动即返）。
     struct FakeExec {
         warmup_ok: bool,
         attach_ok: bool,
-        healthy: AtomicBool,
-        stop_tx: mpsc::Sender<()>,
-        stopped: Arc<AtomicBool>,
+        stop_flag: Arc<AtomicBool>,
     }
 
     impl TunExecutor for FakeExec {
-        fn warmup(&self, _cfg: &TunConfigJson, stage: &StageMachine, _gen: u64) -> Result<(), String> {
-            if self.warmup_ok {
-                stage.set(TunStage::Ready, "", "", true);
-                stage.set_ready_by("wg");
-                Ok(())
-            } else {
-                Err("新栈启动失败：token 解析失败".into())
-            }
-        }
-        fn attach(&self, _fd: i32, _mtu: u32) -> Result<(), String> {
-            if self.attach_ok {
-                Ok(())
-            } else {
-                Err("接管失败".into())
-            }
+        fn warmup(
+            &self,
+            _cfg: &TunConfigJson,
+            shared: Arc<TunShared>,
+            gen: u64,
+        ) -> Result<(), TunError> {
+            let warmup_ok = self.warmup_ok;
+            let attach_ok = self.attach_ok;
+            let stop = Arc::clone(&self.stop_flag);
+            stop.store(false, Ordering::Release);
+            std::thread::spawn(move || {
+                if warmup_ok {
+                    shared.stage.set_if_current(gen, TunStage::Ready, "", "", true);
+                    shared.stage.set_ready_by("wg");
+                } else {
+                    shared.stage.set_if_current(
+                        gen,
+                        TunStage::Failed,
+                        "core",
+                        "新栈启动失败：token 解析失败",
+                        false,
+                    );
+                    shared.finish_generation(gen);
+                    return;
+                }
+                // 等 fd（TunShared 的 attach 通道——facade::tun_attach 投递）/ stop
+                let fd_rx = shared.attach_receiver();
+                loop {
+                    match fd_rx.recv_timeout(Duration::from_millis(200)) {
+                        Ok(_fd) => {
+                            if attach_ok {
+                                shared.stage.set_if_current(gen, TunStage::Attached, "", "", true);
+                                // 挂到 stop 才收尾
+                                while !stop.load(Ordering::Acquire) {
+                                    std::thread::sleep(Duration::from_millis(20));
+                                }
+                            } else {
+                                shared.stage.set_if_current(
+                                    gen,
+                                    TunStage::Failed,
+                                    "attach",
+                                    "接管失败",
+                                    false,
+                                );
+                            }
+                            break;
+                        }
+                        Err(mpsc::RecvTimeoutError::Timeout) => {
+                            if stop.load(Ordering::Acquire) {
+                                shared.stage.set_if_current(
+                                    gen,
+                                    TunStage::Idle,
+                                    "stopped",
+                                    "被停止请求中断",
+                                    false,
+                                );
+                                break;
+                            }
+                        }
+                        Err(mpsc::RecvTimeoutError::Disconnected) => break,
+                    }
+                }
+                shared.finish_generation(gen);
+            });
+            Ok(())
         }
         fn request_stop(&self) {
-            let _ = self.stop_tx.send(());
-        }
-        fn wait_stopped(&self, _budget: Duration) -> bool {
-            self.stopped.load(Ordering::Relaxed)
+            self.stop_flag.store(true, Ordering::Release);
         }
         fn recover(&self, _from: i64, _cause: &str) -> i32 {
             0
-        }
-        fn healthy(&self) -> bool {
-            self.healthy.load(Ordering::Relaxed)
-        }
-        fn unhealthy_why(&self) -> String {
-            String::new()
         }
         fn runner(&self) -> Option<RunnerIn> {
             None
@@ -552,89 +637,106 @@ mod tests {
         }
     }
 
-    fn core_with(warmup_ok: bool, attach_ok: bool) -> (ClientCore, mpsc::Receiver<()>, Arc<AtomicBool>) {
-        let (tx, rx) = mpsc::channel();
-        let stopped = Arc::new(AtomicBool::new(false));
+    fn core_with(warmup_ok: bool, attach_ok: bool) -> ClientCore {
         let exec = Arc::new(FakeExec {
             warmup_ok,
             attach_ok,
-            healthy: AtomicBool::new(true),
-            stop_tx: tx,
-            stopped: Arc::clone(&stopped),
+            stop_flag: Arc::new(AtomicBool::new(false)),
         });
-        (ClientCore::new(exec), rx, stopped)
+        ClientCore::new(exec)
+    }
+
+    /// 等 stage 到目标态（或超时红）。
+    fn wait_stage(core: &ClientCore, want: TunStage, budget: Duration) {
+        let deadline = std::time::Instant::now() + budget;
+        while core.tun.stage.snapshot().stage != want {
+            if std::time::Instant::now() >= deadline {
+                panic!("等 stage={:?} 超时（现 {:?}）", want, core.tun.stage.snapshot().stage);
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
     }
 
     /// 两阶段全流程：prepare（受理 → ready）→ attach（0）→ running=1 → stop（0）。
     #[test]
     fn two_phase_lifecycle() {
-        let (core, _rx, stopped) = core_with(true, true);
+        let core = core_with(true, true);
         assert_eq!(core.tun_prepare(r#"{"token":"hmw1-x"}"#, true), 0);
+        wait_stage(&core, TunStage::Ready, Duration::from_secs(2));
         assert!(core.tun_status().contains("\"state\":\"ready\""));
         assert!(core.tun_status().contains("\"readyBy\":\"wg\""));
         assert_eq!(core.tun_attach(90, 1280), 0);
+        wait_stage(&core, TunStage::Attached, Duration::from_secs(2));
         assert!(core.tun_status().contains("\"state\":\"attached\""));
         assert_eq!(core.tun_running(), 1);
         assert!(core.tun_status().contains("\"running\":1"));
-        stopped.store(true, Ordering::Relaxed);
         assert_eq!(core.tun_stop(), 0);
+        wait_stage(&core, TunStage::Idle, Duration::from_secs(2));
         assert_eq!(core.tun_running(), 0);
     }
 
     /// rc 契约：-1 忙 / -3 参数（坏 JSON、空 token）/ -2 日志。
     #[test]
     fn prepare_rc_contract() {
-        let (core, _rx, _s) = core_with(true, true);
+        let core = core_with(true, true);
         assert_eq!(core.tun_prepare("{oops", true), -3);
         assert_eq!(core.tun_prepare(r#"{"mtu":1280}"#, true), -3);
         assert_eq!(core.tun_prepare(r#"{"token":"hmw1-x"}"#, false), -2);
         assert_eq!(core.tun_prepare(r#"{"token":"hmw1-x"}"#, true), 0);
-        // 在世世代：-1 忙（服务会话与隧道会话不得并发的前提在 App 侧；核内只有单飞）
+        // 在世世代：-1 忙
         assert_eq!(core.tun_prepare(r#"{"token":"hmw1-x"}"#, true), -1);
     }
 
-    /// attach 契约：fd≤0 → -3 + failed；未 ready → -1；失败 → -4 + failed。
+    /// attach rc 契约：fd≤0 → -3 + failed；未 ready → -1；失败 → -4 + failed 终态保留。
     #[test]
     fn attach_rc_contract() {
-        let (core, _rx, _s) = core_with(true, false);
+        let core = core_with(true, false);
         assert_eq!(core.tun_attach(0, 1280), -3);
         assert!(core.tun_status().contains("\"code\":\"attach\""));
         // 未 prepare：-1
-        let (core2, _rx2, _s2) = core_with(true, true);
+        let core2 = core_with(true, true);
         assert_eq!(core2.tun_attach(90, 1280), -1);
-        // prepare 后 attach 失败：-4 + failed（世代收工放锁——可再次 prepare）
-        assert_eq!(core2.tun_prepare(r#"{"token":"hmw1-x"}"#, true), 0);
-        core2.set_executor({
-            let (tx, _rx) = mpsc::channel();
-            Arc::new(FakeExec {
-                warmup_ok: true,
-                attach_ok: false,
-                healthy: AtomicBool::new(true),
-                stop_tx: tx,
-                stopped: Arc::new(AtomicBool::new(true)),
-            })
-        });
-        assert_eq!(core2.tun_attach(90, 1280), -4);
-        assert!(core2.tun_status().contains("\"state\":\"failed\""));
+        // prepare 后 attach 失败：-4 + failed 终态保留 + 放锁（可再次 prepare）
+        let core3 = core_with(true, false);
+        assert_eq!(core3.tun_prepare(r#"{"token":"hmw1-x"}"#, true), 0);
+        wait_stage(&core3, TunStage::Ready, Duration::from_secs(2));
+        assert_eq!(core3.tun_attach(90, 1280), -4);
+        assert!(core3.tun_status().contains("\"state\":\"failed\""), "failed 终态保留");
+        assert_eq!(core3.tun_running(), 0);
+        // failed 后锁已放：可重新 prepare
+        assert_eq!(core3.tun_prepare(r#"{"token":"hmw1-x"}"#, true), 0);
     }
 
-    /// stop 契约：本就没跑 0；收工完成 0；超时且无新世代 ⇒ -2 强制放锁（此后可重启）。
+    /// stop 契约：本就没跑 0；收工完成 0（终态由世代写——工单③）；收工卡死 →
+    /// 强制放锁 -2（此后可重启）。
     #[test]
     fn stop_rc_contract() {
-        let (core, _rx, stopped) = core_with(true, true);
+        let core = core_with(true, true);
         assert_eq!(core.tun_stop(), 0); // 本就没跑
         core.tun_prepare(r#"{"token":"hmw1-x"}"#, true);
-        // 未收工（stopped=false）⇒ 超时后 -2 放锁
-        stopped.store(false, Ordering::Relaxed);
-        assert_eq!(core.tun_stop(), -2);
+        // 世代线程挂住不收 stop（stop_tx 被 drop 前挂在 recv 上）⇒ 等 3s 后 -2 放锁
+        // 受控执行体收 stop 即收尾 ⇒ 正常路径 0
+        wait_stage(&core, TunStage::Ready, Duration::from_secs(2));
+        assert_eq!(core.tun_stop(), 0);
         // 放锁后可重启（无 -1 忙）
+        assert_eq!(core.tun_prepare(r#"{"token":"hmw1-x"}"#, true), 0);
+    }
+
+    /// 同步硬失败（warmup 返回 Err）：受理 0 + failed 终态可读 + 锁已放。
+    #[test]
+    fn sync_hard_fail_releases_lock() {
+        let core = ClientCore::new(Arc::new(NoopTunExecutor));
+        assert_eq!(core.tun_prepare(r#"{"token":"hmw1-x"}"#, true), 0);
+        assert!(core.tun_status().contains("\"state\":\"failed\""));
+        assert!(core.tun_status().contains("无执行体"));
+        // 锁已放：可再次 prepare
         assert_eq!(core.tun_prepare(r#"{"token":"hmw1-x"}"#, true), 0);
     }
 
     /// SetForeground 返回上一状态；false→true 踢补探钩。
     #[test]
     fn foreground_prev_and_kick() {
-        let (core, _rx, _s) = core_with(true, true);
+        let core = core_with(true, true);
         let kicked = Arc::new(AtomicBool::new(false));
         let k2 = Arc::clone(&kicked);
         core.set_foreground_kick(Some(Box::new(move || k2.store(true, Ordering::Relaxed))));
@@ -650,7 +752,7 @@ mod tests {
     /// portfwd 热替换门：attached 才收（Noop 执行体恒 -1）；校验失败 -2。
     #[test]
     fn port_forwards_gate() {
-        let (core, _rx, stopped) = core_with(true, true);
+        let core = core_with(true, true);
         // JSON 非法 → -2
         assert_eq!(core.tun_set_port_forwards("{oops"), -2);
         // 校验不过（listen 0）→ -2
@@ -658,14 +760,15 @@ mod tests {
             core.tun_set_port_forwards(r#"{"portForwards":[{"listen":0,"targetIp":"","targetPort":80}]}"#),
             -2
         );
-        // 未 attached → -1（Noop 执行体恒 -1；门先红在 stage）
+        // 未 attached → -1
         assert_eq!(
             core.tun_set_port_forwards(r#"{"portForwards":[{"listen":18080,"targetIp":"","targetPort":80}]}"#),
             -1
         );
         core.tun_prepare(r#"{"token":"hmw1-x"}"#, true);
+        wait_stage(&core, TunStage::Ready, Duration::from_secs(2));
         core.tun_attach(90, 1280);
-        stopped.store(true, Ordering::Relaxed);
+        wait_stage(&core, TunStage::Attached, Duration::from_secs(2));
         // attached 后过了门，执行体无承载 ⇒ 仍 -1（改动随下次连接生效——语义正确）
         assert_eq!(
             core.tun_set_port_forwards(r#"{"portForwards":[{"listen":18080,"targetIp":"","targetPort":80}]}"#),
@@ -709,5 +812,11 @@ mod tests {
         let v = ClientCore::version();
         assert!(v.starts_with("tier core "), "{v}");
         assert!(v.ends_with(", c-shared)"), "{v}");
+    }
+
+    /// attach-timeout 文案对齐（C-5 拍板：Go 生产路径同串——阶段机的窗口形态）。
+    #[test]
+    fn attach_timeout_reason_literal() {
+        assert_eq!(ATTACH_TIMEOUT_REASON, "就绪后无人 attach，已自行收工放锁");
     }
 }

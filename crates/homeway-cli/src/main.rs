@@ -325,7 +325,7 @@ fn cmd_connect(args: &[String]) {
     // ---- speedtest（可选；直连面，不走 healing）----
     if a.do_speedtest {
         let client = session.client();
-        match speedtest::run(client.as_ref(), Params::default(), &|s| println!("{s}")) {
+        match speedtest::run(&client, Params::default(), &|s| println!("{s}")) {
             Ok(r) => {
                 println!(
                     "speedtest: 摘要 down={:.0}Mbps up={:.0}Mbps",
@@ -487,7 +487,7 @@ fn cmd_speedtest(args: &[String]) {
     println!("warmup pong: 就绪（判据=wg）");
     let client = session.client();
     for r in 1..=rounds {
-        match speedtest::run(client.as_ref(), Params::default(), &|s| println!("{s}")) {
+        match speedtest::run(&client, Params::default(), &|s| println!("{s}")) {
             Ok(res) => {
                 println!(
                     "round {}/{}: down={:.0}Mbps up={:.0}Mbps",

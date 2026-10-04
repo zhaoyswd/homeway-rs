@@ -18,16 +18,99 @@
 
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
+use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use crate::Logf;
 
 use super::term_op::{write_auth, BRIDGE_AUTH_LEN};
+
+/// 桥接流抽象（工单⑤ dial_port 接缝：远端可以是本机 UDS（服务会话直拨形态），
+/// 也可以是「经隧道会话的流 id」——TunnelExec 注入 SessionConn）。
+pub trait BridgeStream: Send {
+    /// 拆成读/写两半（两半可在不同线程并发使用——泵模型的前提；UDS = try_clone，
+    /// 会话流 = 各自持 `Arc<Client> + id` 的半句柄）。
+    fn into_halves(
+        self: Box<Self>,
+    ) -> std::io::Result<(Box<dyn Read + Send>, Box<dyn WriteHalf + Send>)>;
+}
+
+/// 单向写端的半关闭（EOF 传播：UDS = shutdown(WRITE)；会话流 = 发 FIN——
+/// files 的「write 关流即取消」靠它）。
+pub trait WriteHalf: Write {
+    fn close_write(&mut self);
+}
+
+impl BridgeStream for UnixStream {
+    fn into_halves(
+        self: Box<Self>,
+    ) -> std::io::Result<(Box<dyn Read + Send>, Box<dyn WriteHalf + Send>)> {
+        let r = (*self).try_clone()?;
+        let w: Box<dyn WriteHalf + Send> = self;
+        Ok((Box::new(r), w))
+    }
+}
+
+impl WriteHalf for UnixStream {
+    fn close_write(&mut self) {
+        let _ = self.shutdown(std::net::Shutdown::Write);
+    }
+}
+
+/// 会话流的读写两半统一包装面（读半纯 `dyn Read`；写半 `dyn WriteHalf`）。
+impl WriteHalf for Box<dyn WriteHalf + Send> {
+    fn close_write(&mut self) {
+        (**self).close_write()
+    }
+}
+
+/// 宿主域的锁获取（工单②：锁中毒不 panic——c-shared 宿主进程里 panic = 扩展进程
+/// 死；持锁线程 panic 后数据仍可用，into_inner 取出继续）。
+fn lock_host<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+/// 桥拨号闭包面（工单⑤ dial_port 接缝的类型别名）。
+pub type DialFn = Box<dyn Fn(u16, Duration) -> std::io::Result<Box<dyn BridgeStream>> + Send + Sync>;
+
+/// 现有 socket 路径是否无主的探测预算（工单②：本地 UDS connect 一般即成，
+/// 但对端 backlog 满时会挂——200ms 内连不上按「有活主人」处理，不误删）。
+const PROBE_BUDGET: Duration = Duration::from_millis(200);
+
+/// 有预算的 UDS 探测/拨号连接（非阻塞 connect + poll(2) 等可写；超时 = TimedOut）。
+/// pub(crate)：files/term/speedtest 桥消费方共用（工单④：UDS 拨号加 connect 预算）。
+pub(crate) fn connect_budget(path: &Path, budget: Duration) -> std::io::Result<UnixStream> {
+    let s = UnixStream::connect(path)?;
+    s.set_nonblocking(true)?;
+    let fd = s.as_raw_fd();
+    let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+    let t = budget.as_millis().clamp(1, i32::MAX as u128) as i32;
+    let r = unsafe { libc::poll(&mut pfd, 1, t) };
+    if r < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    if r == 0 {
+        return Err(std::io::Error::new(ErrorKind::TimedOut, "探测连接超时"));
+    }
+    // 连接结果经 SO_ERROR 取（POLLERR 也走这里拿真实 errno）
+    let mut err: libc::c_int = 0;
+    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    unsafe {
+        if libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_ERROR, &mut err as *mut _ as *mut _, &mut len) != 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    if err != 0 {
+        return Err(std::io::Error::from_raw_os_error(err));
+    }
+    s.set_nonblocking(false)?;
+    Ok(s)
+}
 
 /// 桥 socket 的子目录（`<dir>/bridge/`）。
 const BRIDGE_DIR: &str = "bridge";
@@ -90,7 +173,7 @@ impl ConnGate {
     /// 登记：满员挤掉最老（返回其 fd 供调用方断连）。clone 失败不入表（少记一条
     /// 比误挤好）。
     fn admit(&self, conn: &UnixStream) -> (u64, Option<UnixStream>) {
-        let mut live = self.live.lock().expect("gate 锁中毒");
+        let mut live = lock_host(&self.live);
         let evicted = if live.len() >= self.max {
             live.pop_front().map(|(_, c)| c)
         } else {
@@ -104,7 +187,7 @@ impl ConnGate {
     }
 
     fn leave(&self, ticket: u64) {
-        self.live.lock().expect("gate 锁中毒").retain(|(t, _)| *t != ticket);
+        lock_host(&self.live).retain(|(t, _)| *t != ticket);
     }
 }
 
@@ -131,13 +214,16 @@ struct BridgeSock {
 }
 
 impl BridgeSock {
-    /// 带重试的 UDS listen（返回 None = 重试耗尽或已被 stop）。listener 归 accept
-    /// 线程所有（stop 经 stopped 位让线程退出，fd 由 drop 关——Rust std 不在 drop 时
-    /// unlink，文件删除统一走 remove_sock_own 身份比对）。
+    /// 带 bind 有界重试的 listen（工单②：**不持宿主锁**——重试最长 ~7.75s）。
     /// 残留处理按「死/活」区分：先拨一下现有路径——拨得通 = 活宿主占着（不删它的
     /// 文件，listen 自然 address in use → 走退避让位）；拨不通（ECONNREFUSED/
     /// ENOENT/ENOTSOCK）才是死残留，删掉重绑。
-    fn listen(&mut self, stopped: &AtomicBool, logf: &Logf) -> Option<UnixListener> {
+    fn listen_path(
+        name: &str,
+        path: &Path,
+        stopped: &AtomicBool,
+        logf: &Logf,
+    ) -> Option<(UnixListener, Option<(u64, u64)>)> {
         for (attempt, backoff) in std::iter::once(Duration::ZERO).chain(LISTEN_BACKOFF.iter().copied()).enumerate() {
             if stopped.load(Ordering::Acquire) {
                 return None;
@@ -145,24 +231,24 @@ impl BridgeSock {
             if !backoff.is_zero() {
                 std::thread::sleep(backoff);
             }
-            if sock_path_free(&self.path) {
-                let _ = std::fs::remove_file(&self.path); // 死残留（前主人异常退出没清文件）
+            if sock_path_free(path) {
+                let _ = std::fs::remove_file(path); // 死残留（前主人异常退出没清文件）
             }
-            match UnixListener::bind(&self.path) {
+            match UnixListener::bind(path) {
                 Ok(ln) => {
-                    self.own = std::fs::metadata(&self.path).ok().map(|m| (m.dev(), m.ino()));
+                    let own = std::fs::metadata(path).ok().map(|m| (m.dev(), m.ino()));
                     ln.set_nonblocking(true).ok();
                     (logf)(&format!(
                         "{}: {} unix:{} → 出口虚拟端口（经会话）监听中",
-                        "桥宿主", self.name, self.path.display()
+                        "桥宿主", name, path.display()
                     ));
-                    return Some(ln);
+                    return Some((ln, own));
                 }
                 Err(e) => {
                     if attempt >= LISTEN_BACKOFF.len() {
                         (logf)(&format!(
                             "{}: {} 监听 unix:{} 失败（{e}）——重试 {attempt} 次后放弃，本轮不可用（换轨让位或目录异常）",
-                            "桥宿主", self.name, self.path.display()
+                            "桥宿主", name, path.display()
                         ));
                         return None;
                     }
@@ -173,10 +259,11 @@ impl BridgeSock {
     }
 }
 
-/// 现有 socket 路径是否无主（ENOENT / ECONNREFUSED / ENOTSOCK）；拨得通或状态
-/// 不明都按「有活主人」（保守：不删状态不明的东西）。
+/// 现有 socket 路径是否无主（ENOENT / ECONNREFUSED / ENOTSOCK / 探测超时）；拨得通
+/// 或状态不明都按「有活主人」（保守：不删状态不明的东西）。探测带 200ms 预算
+/// （工单②：对端 backlog 满时 connect 挂死不得卡 accept 线程）。
 fn sock_path_free(path: &Path) -> bool {
-    match UnixStream::connect(path) {
+    match connect_budget(path, PROBE_BUDGET) {
         Ok(_) => false,
         Err(e) => matches!(e.kind(), ErrorKind::NotFound | ErrorKind::ConnectionRefused | ErrorKind::NotConnected)
             || e.raw_os_error() == Some(libc::ENOTSOCK),
@@ -184,17 +271,13 @@ fn sock_path_free(path: &Path) -> bool {
 }
 
 /// 只删「还是自己 bind 出来的那个文件」；路径已被其它宿主接管时不动它。
+/// **own=None（从未成功 bind / 身份取证失败）不删**（工单②：换轨窗口里这个
+/// 文件可能是接管方在用的——误删 = 踢掉服务中的桥）。
 fn remove_sock_own(path: &Path, own: Option<(u64, u64)>) {
-    match own {
-        None => {
+    let Some((dev, ino)) = own else { return };
+    if let Ok(md) = std::fs::metadata(path) {
+        if md.dev() == dev && md.ino() == ino {
             let _ = std::fs::remove_file(path);
-        }
-        Some((dev, ino)) => {
-            if let Ok(md) = std::fs::metadata(path) {
-                if md.dev() == dev && md.ino() == ino {
-                    let _ = std::fs::remove_file(path);
-                }
-            }
         }
     }
 }
@@ -204,11 +287,17 @@ pub struct BridgeHost {
     what: &'static str,
     dir: Option<PathBuf>,
     logf: Logf,
-    /// 「经会话拨出口本机端口」的接缝（隧道宿主/服务会话宿主各注入自己的实现）。
-    dial_port: Box<dyn Fn(u16, Duration) -> std::io::Result<UnixStream> + Send + Sync>,
+    /// 「经会话拨出口本机端口」的接缝（隧道宿主/服务会话宿主各注入自己的实现；
+    /// 返回实现 [`BridgeStream`]——本机 UDS 或经隧道的流 id 适配器〔工单⑤〕）。
+    /// 可后换（服务桥的会话句柄在受理线程里才建好——set_dial 换入真拨号面）。
+    dial_port: Mutex<DialFn>,
     inner: Mutex<HostInner>,
     stopped: Arc<AtomicBool>,
     auth_drops: AtomicU64,
+    /// accept/pump 线程的收尾观测面（stop 有界等待用；工单②：stop 不再只发信号
+    /// 就走——pump 线程可能正持着 gate 票在收尾，等一下让「下一次 start 不撞旧锁」）。
+    live: Mutex<usize>,
+    live_cv: Condvar,
 }
 
 struct HostInner {
@@ -237,13 +326,13 @@ impl BridgeHost {
         what: &'static str,
         dir: Option<PathBuf>,
         logf: Logf,
-        dial_port: Box<dyn Fn(u16, Duration) -> std::io::Result<UnixStream> + Send + Sync>,
+        dial_port: DialFn,
     ) -> Self {
         BridgeHost {
             what,
             dir,
             logf,
-            dial_port,
+            dial_port: Mutex::new(dial_port),
             inner: Mutex::new(HostInner {
                 socks: Vec::new(),
                 token: None,
@@ -253,13 +342,31 @@ impl BridgeHost {
             }),
             stopped: Arc::new(AtomicBool::new(false)),
             auth_drops: AtomicU64::new(0),
+            live: Mutex::new(0),
+            live_cv: Condvar::new(),
         }
+    }
+
+    fn live_enter(&self) {
+        let mut n = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        *n += 1;
+    }
+
+    /// 换拨号面（服务桥形态：构造时给占位，会话建好后换真拨号；幂等替换）。
+    pub fn set_dial(&self, f: DialFn) {
+        *lock_host(&self.dial_port) = f;
+    }
+
+    fn live_leave(&self) {
+        let mut n = self.live.lock().unwrap_or_else(|e| e.into_inner());
+        *n = n.saturating_sub(1);
+        self.live_cv.notify_all();
     }
 
     /// 起桥（幂等；非阻塞——listen 重试在后台线程）。任一座桥起不来只记状态不
     /// 阻断宿主（桥是附加能力，不是数据面本体）。
     pub fn start(self: &Arc<Self>) {
-        let mut inner = self.inner.lock().expect("桥宿主锁中毒");
+        let mut inner = lock_host(&self.inner);
         if inner.token.is_some() || self.stopped.load(Ordering::Acquire) {
             return; // 已启动 / 已停止
         }
@@ -321,39 +428,51 @@ impl BridgeHost {
 
     /// 一座桥的 accept 循环（非阻塞 accept + 100ms 节拍轮询 stopped——桥连接非
     /// 热路径，粗粒度足够；stop 位置起后线程退出、fd 由 drop 关）。
+    /// 工单②：listen 重试**不持宿主锁**（信息交接式短临界区）；每条连接的处理
+    /// spawn 出去（鉴权 5s + 经会话拨号 15s 不得卡 accept 面）。
     fn accept_loop(self: Arc<Self>, idx: usize) {
-        let (name, port) = {
-            let inner = self.inner.lock().expect("桥宿主锁中毒");
+        self.live_enter();
+        let (name, port, path) = {
+            let inner = lock_host(&self.inner);
             match inner.socks.get(idx) {
-                Some(s) => (s.name, s.port),
-                None => return,
+                Some(s) => (s.name, s.port, s.path.clone()),
+                None => return self.live_leave(),
             }
         };
-        let ln = {
-            let mut inner = self.inner.lock().expect("桥宿主锁中毒");
-            let Some(sock) = inner.socks.get_mut(idx) else { return };
-            sock.listen(&self.stopped, &self.logf)
-        };
-        let Some(ln) = ln else { return };
+        let ln = BridgeSock::listen_path(name, &path, &self.stopped, &self.logf).map(|(ln, own)| {
+            let mut inner = lock_host(&self.inner);
+            if let Some(s) = inner.socks.get_mut(idx) {
+                s.own = own;
+            }
+            ln
+        });
+        let Some(ln) = ln else { return self.live_leave() };
 
         while !self.stopped.load(Ordering::Acquire) {
             match ln.accept() {
                 Ok((conn, _)) => {
                     conn.set_nonblocking(false).ok();
-                    self.handle_conn(name, port, conn);
+                    let host = Arc::clone(&self);
+                    let _ = std::thread::Builder::new()
+                        .name("hw-bridge-conn".into())
+                        .spawn(move || host.handle_conn(name, port, conn));
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(100));
                 }
-                Err(_) => return, // 监听器被关（收工）
+                Err(_) => break, // 监听器被关（收工）
             }
         }
+        self.live_leave();
     }
 
-    /// 一条桥接连接：闸 → 鉴权 → 经会话拨出口 → 双向泵。
+    /// 一条桥接连接：闸 → 鉴权 → 经会话拨出口 → 双向泵（**在自己的线程上**——
+    /// accept 线程只接连接；鉴权 5s / 拨号 15s 都不卡它）。泵线程不进 live 计数：
+    /// 在途连接随会话关闭自然断（Go bridge.stop 同形态——只关监听，不 join 泵）。
     fn handle_conn(&self, name: &'static str, port: u16, mut conn: UnixStream) {
+        self.live_enter();
         let (gate, token) = {
-            let inner = self.inner.lock().expect("桥宿主锁中毒");
+            let inner = lock_host(&self.inner);
             let g = match name {
                 "files-bridge" => Arc::clone(&inner.files_gate),
                 "term-bridge" => Arc::clone(&inner.term_gate),
@@ -377,41 +496,62 @@ impl BridgeHost {
                     n + 1
                 ));
             }
+            self.live_leave();
             return;
         }
-        match (self.dial_port)(port, DIAL_TIMEOUT) {
+        let dial = lock_host(&self.dial_port);
+        let r = dial(port, DIAL_TIMEOUT);
+        drop(dial);
+        match r {
             Ok(remote) => {
-                // 双向泵（两条线程；任一方向断即整体收口；守卫随最后一泵结束销票）
-                let mut up_r = conn.try_clone().expect("桥接 fd 复制");
-                let mut up_w = remote.try_clone().expect("桥接 fd 复制");
-                let mut down_r = remote;
-                let mut down_w = conn;
-                // 守卫克隆进两泵（Arc 强计数——最后一泵结束才销票）
-                let guard = Arc::new(guard);
-                let g1 = Arc::clone(&guard);
-                let g2 = Arc::clone(&guard);
-                drop(guard);
-                std::thread::Builder::new()
-                    .name("hw-bridge-pump".into())
-                    .spawn(move || {
-                        let _g = g1;
-                        pump(&mut up_r, &mut up_w);
-                    })
-                    .ok();
-                std::thread::Builder::new()
-                    .name("hw-bridge-pump".into())
-                    .spawn(move || {
-                        let _g = g2;
-                        pump(&mut down_r, &mut down_w);
-                    })
-                    .ok();
+                // 双向泵（两条线程；任一方向断即整体收口；守卫随最后一泵结束销票）。
+                // 拆半失败不 panic（工单②——fd 耗尽/引擎收工形态按连接收口处理）。
+                let halves = remote.into_halves();
+                let local_r = conn.try_clone().ok();
+                match (halves, local_r) {
+                    (Ok((mut remote_r, mut remote_w)), Some(mut local_r)) => {
+                        let mut local_w = conn;
+                        let guard = Arc::new(guard);
+                        let g1 = Arc::clone(&guard);
+                        let g2 = Arc::clone(&guard);
+                        drop(guard);
+                        std::thread::Builder::new()
+                            .name("hw-bridge-pump".into())
+                            .spawn(move || {
+                                let _g = g1;
+                                pump(&mut local_r, &mut *remote_w);
+                            })
+                            .ok();
+                        std::thread::Builder::new()
+                            .name("hw-bridge-pump".into())
+                            .spawn(move || {
+                                let _g = g2;
+                                pump(&mut *remote_r, &mut local_w);
+                            })
+                            .ok();
+                    }
+                    (Err(_), _) => {
+                        (self.logf)(&format!("{name}: 桥接流拆半失败——连接收口"));
+                    }
+                    (_, None) => {
+                        (self.logf)(&format!("{name}: 本地 fd 复制失败——连接收口"));
+                    }
+                }
             }
             Err(e) => {
                 (self.logf)(&format!("{name}: 经会话拨出口 {port} 失败: {e}"));
-                // 不回帧直接关（refused 类由客户端零字节 EOF 归 not_supported；
-                // link_down 回帧面属 speedtest 引擎层，本泵不解释协议）
+                // 按错误种类分流（Go 评审 r2-N2 同义）：
+                // - refused 类 = 出口活着、该端口没服务 ⇒ 不回帧直接关——客户端
+                //   请求后零字节 EOF ⇒ not_supported（「请升级出口」）；
+                // - 其余（speed 桥）= 出口不在/正在恢复 ⇒ 回 report{link_down} 再
+                //   有序收口（工单④：页面回等待循环自动续跑）。回帧在桥鉴权之后，
+                //   不向未鉴权探测者泄任何信息。
+                if name == "speed-bridge" && !is_refused_like(&e) {
+                    speed_link_down_reply(&mut conn);
+                }
             }
         }
+        self.live_leave();
     }
 
     /// 收工（幂等）：关监听器，已建立的桥接连接随会话关闭自然断。令牌清零——状态
@@ -419,7 +559,7 @@ impl BridgeHost {
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
         let socks = {
-            let mut inner = self.inner.lock().expect("桥宿主锁中毒");
+            let mut inner = lock_host(&self.inner);
             inner.token = None;
             std::mem::take(&mut inner.socks)
         };
@@ -429,12 +569,28 @@ impl BridgeHost {
             }
             remove_sock_own(&s.path, s.own);
         }
+        // accept/conn 线程的有界收口（工单②：在途 handle_conn 持着 gate 票在
+        // 鉴权/拨号——等一下让「下一次 start 不撞旧票/旧监听」；泵线程不等待，
+        // 在途连接随会话关闭自然断——Go bridge.stop 同形态）。
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut n = lock_host(&self.live);
+        while *n > 0 {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            let (g, _to) = self
+                .live_cv
+                .wait_timeout(n, left)
+                .unwrap_or_else(|e| e.into_inner());
+            n = g;
+        }
         (self.logf)(&format!("{}: 已停止监听", self.what));
     }
 
     /// 当前三座桥的状态（socket 路径随令牌在场；桥未起/已停全空串）。
     pub fn status(&self) -> BridgeStatus {
-        let inner = self.inner.lock().expect("桥宿主锁中毒");
+        let inner = lock_host(&self.inner);
         let Some(tok) = inner.token else {
             return BridgeStatus::default();
         };
@@ -470,8 +626,10 @@ impl BridgeHost {
     }
 }
 
-/// 单向泵：读尽即关对侧写端（EOF 传播）；错误亦收口。
-fn pump(r: &mut UnixStream, w: &mut UnixStream) {
+/// 单向泵：读尽即关对侧写端（EOF 传播——半关闭语义，FIN 穿透）；错误亦收口。
+/// 两侧为 trait 对象（工单⑤：远端是会话流/本机 UDS 的统一拆半面；桥连接非
+/// 热路径，dyn 派发开销可忽略）。
+fn pump(r: &mut dyn Read, w: &mut dyn WriteHalf) {
     let mut buf = [0u8; 16 * 1024];
     loop {
         match r.read(&mut buf) {
@@ -483,8 +641,7 @@ fn pump(r: &mut UnixStream, w: &mut UnixStream) {
             }
         }
     }
-    // 关写端传播 EOF（shutdown 不影响另一方向的读）
-    let _ = w.shutdown(std::net::Shutdown::Write);
+    w.close_write();
 }
 
 /// getrandom 填充（32B 令牌；不引直接依赖——getrandom crate 已在依赖面）。
@@ -495,6 +652,32 @@ fn getrandom_fill(buf: &mut [u8]) -> Result<(), ()> {
 /// 客户端侧：连上桥后先发鉴权首包（`write_auth` 的再导出——同链分发的客户端面）。
 pub fn bridge_client_auth<W: Write>(w: &mut W, auth_hex: &str) -> std::io::Result<()> {
     write_auth(w, auth_hex)
+}
+
+/// 拨出口失败的 refused 类判定（Go wgcore.IsRefusedLike：连接被拒/不可达等
+/// 「对端在网络意义上明确回答了」的形态 = 出口活着、端口没服务）。
+fn is_refused_like(e: &std::io::Error) -> bool {
+    matches!(
+        e.kind(),
+        std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
+    ) || e.to_string().contains("refused")
+}
+
+/// speed 桥的 link_down 拒绝回帧（Go speedLinkDownReply / pkg/speedtest.ReplyThenClose）：
+/// 有界读掉客户端已写出的请求帧（2s）→ 回 report{link_down} → 半关写端 → 短窗吞输入
+/// → 关。直接回帧后关会走 RST 路径、已发出的 report 可能被对端丢弃。
+fn speed_link_down_reply(conn: &mut UnixStream) {
+    use std::io::Read as _;
+    conn.set_read_timeout(Some(Duration::from_secs(2))).ok();
+    // 有界吞一帧（15B 头 + ≤64KB 载荷；失败也继续回帧——连接本就异常，尽力而为）
+    let mut sink = [0u8; 128 * 1024];
+    let _ = conn.read(&mut sink);
+    let frame = crate::speedtest::make_report_frame("{\"error\":\"link_down\"}");
+    let _ = conn.write_all(&frame);
+    let _ = conn.flush();
+    let _ = conn.shutdown(std::net::Shutdown::Write); // FIN 先于任何复位
+    conn.set_read_timeout(Some(Duration::from_millis(300))).ok();
+    let _ = conn.read(&mut sink); // 短窗吞掉后续输入（role=send 的泵送数据）
 }
 
 #[cfg(test)]
@@ -658,3 +841,4 @@ mod tests {
         assert_eq!(term_port(), 7724);
     }
 }
+

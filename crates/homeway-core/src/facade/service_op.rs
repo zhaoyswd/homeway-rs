@@ -13,7 +13,7 @@
 
 use serde_json::Value;
 
-/// 服务域状态（rc 门的载体；Session/桥在 7d 接入）。
+/// 服务域状态（rc 门的载体；Session/桥接线在 service_exec）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
     /// 无实例（状态 JSON 短路 `{"state":"idle"}`）。
@@ -27,9 +27,23 @@ pub enum ServiceState {
     Failed,
 }
 
-/// 服务域（单例语义——App 全核一个服务会话；7d 在此挂真 Session）。
+impl ServiceState {
+    /// 状态 JSON 词面（SessState 同串：idle/starting/ready/failed/stopping）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ServiceState::Idle => "idle",
+            ServiceState::Starting => "starting",
+            ServiceState::Ready => "ready",
+            ServiceState::Failed => "failed",
+            ServiceState::Stopping => "stopping",
+        }
+    }
+}
+
+/// 服务域（单例语义——App 全核一个服务会话；真 Session 接线在 service_exec）。
 pub struct ServiceDomain {
     state: std::sync::Mutex<ServiceState>,
+    reason: std::sync::Mutex<String>,
     /// 7d 接入的 Session 快照产出面（None = 状态 JSON 走 idle 短路）。
     snapshot_json: std::sync::Mutex<Option<Box<dyn Fn() -> String + Send>>>,
 }
@@ -44,6 +58,7 @@ impl ServiceDomain {
     pub fn new() -> Self {
         ServiceDomain {
             state: std::sync::Mutex::new(ServiceState::Idle),
+            reason: std::sync::Mutex::new(String::new()),
             snapshot_json: std::sync::Mutex::new(None),
         }
     }
@@ -97,9 +112,23 @@ impl ServiceDomain {
         crate::status_json::idle_json().to_owned()
     }
 
-    /// 状态位直写（7d 的 Session 状态机推进用 + 测试）。
+    /// 状态位直写（Session 状态机推进用 + 测试）。
     pub fn set_state(&self, s: ServiceState) {
         *self.state.lock().expect("服务状态锁中毒") = s;
+    }
+
+    /// 当前状态位（ServiceExec 的 rc 门/状态面共享读取）。
+    pub fn state(&self) -> ServiceState {
+        *self.state.lock().expect("服务状态锁中毒")
+    }
+
+    /// 失败原因（状态 JSON 的 reason 源；装配失败/会话线程失败时写）。
+    pub fn set_reason(&self, r: &str) {
+        self.reason.lock().expect("服务原因锁中毒").clone_from(&r.to_owned());
+    }
+
+    pub fn reason(&self) -> String {
+        self.reason.lock().expect("服务原因锁中毒").clone()
     }
 }
 

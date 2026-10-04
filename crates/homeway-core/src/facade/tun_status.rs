@@ -264,7 +264,7 @@ mod tests {
             "ready_meowed" => base(stage_in(TunStage::Ready, "", "", true, "wg"), demand(false, "", 0), false),
             "ready_softfail" => base(stage_in(TunStage::Ready, "", "暖机窗口内未收到注册确认", false, "wg"), demand(false, "", 0), false),
             "failed_core" => base(stage_in(TunStage::Failed, "core", "新栈启动失败：token 解析失败", false, "wg"), demand(false, "", 0), false),
-            "failed_attach_timeout" => base(stage_in(TunStage::Failed, "attach-timeout", "等待接入超时，世代已收工", false, "wg"), demand(false, "", 0), false),
+            "attach_timeout_idle" => base(stage_in(TunStage::Idle, "attach-timeout", "就绪后无人 attach，已自行收工放锁", false, "wg"), demand(false, "", 0), false),
             "demand_unset" => base(stage_in(TunStage::Preparing, "", "", false, "wg"), demand(false, "", 0), false),
             "demand_screen_on" => base(stage_in(TunStage::Preparing, "", "", false, "wg"), demand(true, "亮屏", 1696000000000), false),
             "demand_stale_screen_fg" => base(stage_in(TunStage::Preparing, "", "", false, "wg"), demand(false, "熄屏（位陈旧）", 1696000000000), true),
