@@ -55,3 +55,66 @@
   `cargo check --target aarch64-unknown-linux-ohos -p homeway-core`（OHOS 目标已装、
   链接器配置在位）——第 2 棒开工前唯一的交叉面风险已清。
 - 第 2 棒（HSP 集成，用户触点）开工前置确认单列于 ROADMAP R7 节。
+
+## §二 第 1 棒评审记录（dsh r1.5L80Vz，2026-10-04）
+
+**结论**：工程形态总体扎实（facade 按域拆分、tunStatusJSON 真 Go 向量逐字节对账、OHOS 交叉清零、
+flock 语义正确）；**6 高危 + 评审者复核补 2 高危**，其中「接线即坏」类 4 项已在本棒整改
+（eb3e6fa / 2147b70 两 commit），结构性 4 项登记为**第 2 棒开工前置工单**（见下）。
+评审原文全量 = `/tmp/dsh-review/r1.5L80Vz/output.md`（含三路并行对照核查）。
+
+### 高危处置表
+
+| # | 项 | 定级 | 处置 |
+|---|---|---|---|
+| F-05 | TunConfigJson 缺 camelCase rename（7 字段静默丢） | 高 | **已修**（eb3e6fa：rename_all + 守卫测试） |
+| F-08 | SpeedParams 同面（窗口值静默忽略） | 高 | **已修**（同上） |
+| C-2 | files 响应行 64KB 上限（512KB readText 直接 op_failed） | 高 | **已修**（eb3e6fa：上限只留请求行） |
+| F-16 | term LIST 坏 JSON 被吞成假成功 | 中→高（复核加重） | **已修**（eb3e6fa） |
+| F-30 | 锁覆盖面不全 + matrix/perf-ab 会被锁拒（判据静默失效） | 高 | **已修**（2147b70：dnstest/portfwd 接锁 + 脚本 16 处逃生口） |
+| F-06/F-07/C-1 | attach 60s 死线未实装 + warmup 同步阻塞 JS 线程 + 无世代退出通知（锁泄漏） | 高 | **登记第 2 棒前置**（见工单①） |
+| F-19/F-20/F-22/F-23 | 桥宿主鉴权/拨号在 accept 线程同步 + stop 删非己 bind 的 socket + 无超时探测 + panic 面 | 高 | **登记第 2 棒前置**（工单②） |
+
+### 中危处置表（摘）
+
+| # | 项 | 处置 |
+|---|---|---|
+| C-4② | readyBy 世代起点未清 | **已修**（eb3e6fa：begin_generation 清） |
+| C-6 | 锁预建目录 0755 | **已修**（eb3e6fa：0700） |
+| F-09 | tun_stop 抹失败终态/终态字节面 | 登记（工单③；窄窗——失败路径已当场放锁） |
+| C-4①③ | attach 硬写 meowed=true / 健康位清清理缺 | 登记（工单③） |
+| C-5 | attach-timeout 向量是 Go 不可达合成态（state/reason 双偏） | 登记（工单①随死线实装重产向量） |
+| C-3 | 传输体受 15s 空闲超时（Go 无期限） | 登记（工单④） |
+| F-10~F-12 | speedtest 取消空操作 / 引擎未接桥 / service 三面是桩 | **留桩性质登记**（第 2 棒接真引擎/真 Session——本棒范围就是接口+单测） |
+| F-13/F-24/F-28 | 桥状态装配位接不上 / dial_port 接缝签名 / events 面无消费者 | 登记（工单⑤——trait 签名在接线时统一定） |
+| F-14/F-15/F-17/F-18/F-21/F-25/F-27/F-31 | portfwd stale 复查 / MTU 形参 / null 表拒绝 / UDS 无拨号超时 / listen 持锁 / link_down 回帧 / 字符串错误 / 锁 fail-open | 登记（工单④⑤批处理） |
+
+### 低危
+
+F-33（SUMS 前缀）/F-34（§四冒烟结论补记——**已补：2026-10-04 cargo check OHOS 0 错 0 警**）/F-35（code 词表补 config/derp）
++ 评审低危表批量（readText mode 空串、entries 键序、err 前缀、帧 128KiB、version 文案、
+tun_recover 未钳位等 12 项）——**登记第 2 棒顺手批**，不阻塞。
+
+### 争议项（第 2 棒开工时拍板）
+
+1. attach-timeout 的 code/state 归属（严格对齐 Go 生产路径 vs 保留 d.ts 描述改 tier 文档）；
+2. events 面去留（Rust 独有则文档声明不参与词表对账 / 对齐 Go facade/bus.go 的不重不漏语义）；
+3. FB-files 判据按 rc 判定（matrix.sh:627 grep -c . 无条件 PASS）。
+
+### 第 2 棒开工前置工单（接线即坏类，按序）
+
+1. **世代生命周期补全**：TunExecutor 增「世代退出通知」；warmup 改「启动即返」（Arc<StageMachine>
+   或 facade 自持世代线程——tier 壳在 JS 线程同步直调 prepare，20s 暖机窗会冻结事件泵）；
+   attach 60s 死线收割 + `idle/"attach-timeout"/"就绪后无人 attach，已自行收工放锁"` 终态
+   （向量 C-5 随之重产）；meowed 沿用暖机结果；新世代清健康位/分类。
+2. **桥宿主线程模型**：handle_conn 挪 spawn（鉴权+拨号出 accept 线程）；鉴权绝对 5s 期限；
+   sock_path_free 200ms 预算；remove_sock_own 的 None 分支不删（换轨窗口误删在服务方 socket）；
+   try_clone/锁中毒不 panic；listen 重试出宿主锁。
+3. **tun_stop 终态语义**：只放锁不写阶段（终态由世代写；failed 保留）。
+4. **传输/拨号期限**：files 传输体清 15s（大文件无期限）；UDS 拨号加 connect 预算；速度桥
+   link_down 回帧面。
+5. **trait/装配签名统一**：dial_port 接缝对真 Session（流 id vs fd 桥）、TunExecutor 类型化
+   错误（F-27）、桥状态并入 serviceStatusJSON、speedtest 引擎接桥 + Cancel 真取消、service
+   三面接真 Session、version 注入管线（HOMEWAY_CORE_VERSION + [lib] cdylib 配置 + tier
+   build-core.sh 对接——F-03，动 tier 跟踪文件属用户触点）。
+6. panic 策略：extern "C" 壳 catch_unwind + 锁 unwrap_or_else(into_inner)（F-02）。
