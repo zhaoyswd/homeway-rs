@@ -24,7 +24,7 @@ use smoltcp::iface::SocketHandle;
 use smoltcp::phy::{self, DeviceCapabilities, Medium};
 use smoltcp::socket::tcp::{self, Socket as TcpSocket};
 use smoltcp::time::Instant;
-use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address};
+use smoltcp::wire::{HardwareAddress, IpCidr};
 
 /// 隧道 MTU（两端契约常量，坑 4/23）。
 pub const MTU: usize = 1280;
@@ -108,11 +108,12 @@ pub struct DevRxToken {
 }
 
 impl phy::RxToken for DevRxToken {
-    fn consume<R, F>(mut self, f: F) -> R
+    // 0.14 签名：闭包收共享切片（R8-8a 迁移——此前 &mut [u8]）。
+    fn consume<R, F>(self, f: F) -> R
     where
-        F: FnOnce(&mut [u8]) -> R,
+        F: FnOnce(&[u8]) -> R,
     {
-        f(&mut self.buf)
+        f(&self.buf)
     }
 }
 
@@ -190,7 +191,7 @@ impl StackB {
         });
         iface
             .routes_mut()
-            .add_default_ipv4_route(Ipv4Address::from_bytes(&server_tunnel_ip.octets()))
+            .add_default_ipv4_route(server_tunnel_ip)
             .expect("路由表默认空，必成功");
         // ephemeral 端口基址**每次装配随机**（对齐内核随机端口语义）：确定性起点会让
         // 同身份跨进程重连复用同四元组，撞上出口 gVisor 拦截层尚在 idle 等待的半开
@@ -226,6 +227,11 @@ impl StackB {
         let tx = tcp::SocketBuffer::new(vec![0u8; TCP_BUF]);
         let mut sock = TcpSocket::new(rx, tx);
         sock.set_nagle_enabled(false); // Go wgnet「Nagle 关」口径
+        // R8-8a：上游 CUBIC（smoltcp 0.14 RFC 合规实现）——核心自连的 bulk 发送方
+        // （测速上行/files 上传）此前是 0.11 的「整窗突发 + RTO go-back-N」形态，真机
+        // 有损 WiFi 下吞吐塌陷（E2E §6 A5' 上行 bulk 退化的机制归因，同 R6.6 下行）。
+        // 线上行为（wire 字节）不可见差异——性能选择，无对齐义务（R6.6 垫片同口径）。
+        sock.set_congestion_control(tcp::CongestionControl::Cubic);
         let handle = self.sockets.add(sock);
         let local = self.alloc_local_port();
         let cx = self.iface.context();
@@ -274,7 +280,7 @@ mod tests {
     use smoltcp::phy::Device as _;
     use smoltcp::socket::tcp::{self, Socket as TcpSocket};
     use smoltcp::time::Instant as SmolInstant;
-    use smoltcp::wire::{HardwareAddress, IpCidr, Ipv4Address};
+    use smoltcp::wire::{HardwareAddress, IpCidr};
     use std::net::{Ipv4Addr, SocketAddrV4};
 
     /// 两台 TunDevice 背靠背（A.tx → B.rx / B.tx → A.rx），驱动两栈 poll 直到稳定。
@@ -315,7 +321,7 @@ mod tests {
         let mut dev = TunDevice::new();
         let mut iface = Interface::new(IfaceConfig::new(HardwareAddress::Ip), &mut dev, SmolInstant::from_millis(0));
         iface.update_ip_addrs(|a| a.push(IpCidr::new(ip.into(), 32)).unwrap());
-        iface.routes_mut().add_default_ipv4_route(Ipv4Address::new(100, 64, 255, 1)).unwrap();
+        iface.routes_mut().add_default_ipv4_route(Ipv4Addr::new(100, 64, 255, 1)).unwrap();
         Stack { iface, socks: SocketSet::new(vec![]), dev, addr: ip }
     }
 

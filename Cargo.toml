@@ -23,7 +23,9 @@ getrandom = { version = "0.2", features = ["std"] }
 # （R0 就位、R1 数据面消费；垫片源码 tools/ring-shim/，配方源自
 #  tier:tools/spikes/rust-ohos-poc/ring-shim/，**依赖组合勿改**——PoC 已实测）
 boringtun = "0.6"
-smoltcp = "0.11"
+# 0.14 起 TCP 拥塞控制按算法 feature 门控（R8-8a：CUBIC——R6.6 的 CC 垫片即 CUBIC
+# 增长律，迁移后由上游 RFC 合规实现替代；Reno 未启用）。
+smoltcp = { version = "0.14", features = ["socket-tcp-cubic"] }
 libc = "0.2"
 # ---- R6 term 服务面：alacritty_terminal 0.26 = 仿真+Damage+kitty 模式位
 # （应答器与键/鼠标/焦点编码器自建，设计见 docs/reviews/R6-design.md）；

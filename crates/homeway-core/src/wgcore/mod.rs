@@ -554,7 +554,7 @@ impl Engine {
                 Ok((n, meta)) if n > 0 => {
                     buf.truncate(n);
                     let from = match meta.endpoint.addr {
-                        smoltcp::wire::IpAddress::Ipv4(a) => Ipv4Addr::from(a.0),
+                        smoltcp::wire::IpAddress::Ipv4(a) => a, // 0.14：core::net::Ipv4Addr 直存（R8-8a）
                         _ => continue,
                     };
                     let tx = self.udp.get_mut(&id).and_then(|u| u.wait_recv.take());
