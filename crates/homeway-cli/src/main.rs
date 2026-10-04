@@ -258,7 +258,7 @@ fn cmd_connect(args: &[String]) {
     let _session_lock = (!a.no_session_lock).then(|| session_lock_or_exit(&a.identity_dir, "connect"));
 
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
-    let mut session = match Session::start(SessionConfig {
+    let session = match Session::start(SessionConfig {
         token: t,
         identity_dir: a.identity_dir.clone().or_else(|| Some(PathBuf::from("identity"))),
         endpoint_cache_dir: a.cache_dir.clone(),
@@ -470,7 +470,7 @@ fn cmd_speedtest(args: &[String]) {
     }
     let _session_lock = (!no_session_lock).then(|| session_lock_or_exit(&identity_dir, "speedtest"));
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
-    let mut session = match Session::start(SessionConfig {
+    let session = match Session::start(SessionConfig {
         token: t,
         identity_dir: identity_dir.or_else(|| Some(PathBuf::from("identity"))),
         endpoint_cache_dir: cache_dir,
@@ -591,7 +591,7 @@ fn cmd_files(args: &[String]) {
     }
     let _session_lock = (!no_session_lock).then(|| session_lock_or_exit(&identity_dir, "files"));
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
-    let mut session = match Session::start(SessionConfig {
+    let session = match Session::start(SessionConfig {
         token: t,
         identity_dir: identity_dir.or_else(|| Some(PathBuf::from("identity"))),
         endpoint_cache_dir: None,
@@ -720,7 +720,7 @@ fn cmd_dnstest(args: &[String]) {
     };
     let _session_lock = (!no_session_lock).then(|| session_lock_or_exit(&identity_dir, "dnstest"));
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
-    let mut session = match homeway_core::session::Session::start(homeway_core::session::SessionConfig {
+    let session = match homeway_core::session::Session::start(homeway_core::session::SessionConfig {
         token: t,
         identity_dir: identity_dir.or_else(|| Some(PathBuf::from("identity"))),
         endpoint_cache_dir: None,

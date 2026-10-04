@@ -222,10 +222,11 @@ fn now_unix_ms() -> i64 {
 /// 服务会话句柄。
 pub struct Session {
     shared: Arc<Shared>,
-    patrol: Option<JoinHandle<()>>,
-    /// 后台线程柄（stop 时 join 收口——中-4：不泄漏）。
-    hint: Option<JoinHandle<()>>,
-    save: Option<JoinHandle<()>>,
+    /// 后台线程柄（stop 时 join 收口——中-4：不泄漏）。Mutex 包一层：stop 改 &self
+    /// （服务桥 dial 与 status 共享 `Arc<Session>`——评审 r2-M-10② 的共享前提）。
+    patrol: Mutex<Option<JoinHandle<()>>>,
+    hint: Mutex<Option<JoinHandle<()>>>,
+    save: Mutex<Option<JoinHandle<()>>>,
 }
 
 impl Session {
@@ -393,7 +394,7 @@ impl Session {
             Err(e) => {
                 (logf)(&format!("暖机硬失败：{e}"));
                 shared.set_state(SessState::Failed, &format!("出口不可达：{e}"));
-                return Ok(Session { shared, patrol: None, hint: hint_handle, save: save_handle });
+                return Ok(Session { shared, patrol: Mutex::new(None), hint: Mutex::new(hint_handle), save: Mutex::new(save_handle) });
             }
         }
 
@@ -407,7 +408,7 @@ impl Session {
             .spawn(move || patrol_loop(sh))
             .ok();
 
-        Ok(Session { shared, patrol, hint: hint_handle, save: save_handle })
+        Ok(Session { shared, patrol: Mutex::new(patrol), hint: Mutex::new(hint_handle), save: Mutex::new(save_handle) })
     }
 
     pub fn snapshot(&self) -> SessionSnapshot {
@@ -531,12 +532,12 @@ impl Session {
 
     /// 收工（幂等）：置 stop → join 三线程（patrol 有界 STOP_WAIT——中-3）→
     /// 缓存终写 → 停当前世代 → Idle（failed 终态保留——低-15：失败原因在状态面不丢）。
-    pub fn stop(&mut self) {
+    pub fn stop(&self) {
         if self.shared.stop.swap(true, Ordering::SeqCst) {
             return;
         }
         self.shared.set_state(SessState::Stopping, "");
-        if let Some(h) = self.patrol.take() {
+        if let Some(h) = self.patrol.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let deadline = Instant::now() + STOP_WAIT;
             while !h.is_finished() && Instant::now() < deadline {
                 std::thread::sleep(Duration::from_millis(50));
@@ -549,10 +550,10 @@ impl Session {
                 (self.shared.logf)("收工等待巡检线程超时（STOP_WAIT）——放行自退");
             }
         }
-        if let Some(h) = self.hint.take() {
+        if let Some(h) = self.hint.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = h.join();
         }
-        if let Some(h) = self.save.take() {
+        if let Some(h) = self.save.lock().unwrap_or_else(|e| e.into_inner()).take() {
             let _ = h.join();
         }
         if let Some(c) = &self.shared.cache {

@@ -17,7 +17,7 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 
 use super::stage::{StageMachine, TunStage};
 
@@ -45,6 +45,10 @@ pub struct TunShared {
     /// 世代收尾信号（Go run.done：`tun_stop` 有界等待的观测面；每世代一次性）。
     done: Mutex<bool>,
     done_cv: Condvar,
+    /// 执行体世代的停止位（Go run.stop 的收口面：finish 里 close(r.stop) 同义——
+    /// 评审 r2-L12。世代线程构建 GenRun 后经 [`Self::set_stop_flag`] 登记；
+    /// `finish_generation` 对当前世代置位——保证收尾路径不依赖 request_stop 先行）。
+    stop_flag: Mutex<Option<Arc<AtomicBool>>>,
 }
 
 impl Default for TunShared {
@@ -64,6 +68,20 @@ impl TunShared {
             attach_tx: Mutex::new(None),
             done: Mutex::new(false),
             done_cv: Condvar::new(),
+            stop_flag: Mutex::new(None),
+        }
+    }
+
+    /// 执行体登记本世代的停止位（世代线程构建 GenRun 后调；世代起点换新）。
+    pub fn set_stop_flag(&self, f: Arc<AtomicBool>) {
+        *lock_unpoison(&self.stop_flag) = Some(f);
+    }
+
+    /// 置当前世代的停止位（request_stop 之外的收口面：finish_generation 兜底；
+    /// 世代句柄未就的窗口期由 request_stop 中继调用——评审 r2-M2）。
+    pub fn signal_stop(&self) {
+        if let Some(f) = lock_unpoison(&self.stop_flag).as_ref() {
+            f.store(true, Ordering::Release);
         }
     }
 
@@ -95,6 +113,15 @@ impl TunShared {
         self.healthy.store(false, Ordering::Release);
     }
 
+    /// 带世代守卫的不健康标记（评审 r2-M1：Go `tunRun.markUnhealthy` 内有
+    /// `r.isCurrent()`——旧世代的 fd 被 destroy 后报错是必然事件，不能拿它判
+    /// 新世代死没死。生产调用点〔fd 错误回调/patrol 收尾〕一律走本面）。
+    pub fn mark_unhealthy_if_current(&self, gen: u64, why: &str) {
+        if self.gen.load(Ordering::Acquire) == gen {
+            self.mark_unhealthy(why);
+        }
+    }
+
     /// 新世代起点：清健康位与分类（Go tunBegin：tunUnhealthyWhy.Store("") +
     /// tunHealthy.Store(true)；顺序即注释——先清分类再置健康）。
     pub fn begin_healthy(&self) {
@@ -115,6 +142,10 @@ impl TunShared {
         }
         let is_current = self.gen.load(Ordering::Acquire) == gen;
         if is_current {
+            // stop 收口（评审 r2-L12：Go finish 里 close(r.stop)——收尾路径不依赖
+            // request_stop 先行；置位让世代的一切派生线程〔patrol/pusher/stats/
+            // 桥/hint〕从片界观察到收尾）
+            self.signal_stop();
             self.mark_unhealthy("stop");
             self.probe_running.store(false, Ordering::Release);
         }
@@ -158,12 +189,13 @@ impl TunShared {
     }
 
     /// 世代起点的 done 复位（新 prepare 受理时——TunShared 是全核单例，done 位
-    /// 随世代翻新；attach 通道也一并复位）。
+    /// 随世代翻新；attach 通道与停止位槽也一并复位）。
     pub fn begin_generation(&self, gen: u64) {
         self.gen.store(gen, Ordering::Release);
         self.stage.begin_generation(gen);
         *lock_unpoison(&self.done) = false;
         self.close_attach();
+        *lock_unpoison(&self.stop_flag) = None;
     }
 }
 
@@ -254,5 +286,39 @@ mod tests {
         });
         assert!(sh.wait_done(std::time::Duration::from_secs(2)), "收尾后被唤醒");
         t.join().unwrap();
+    }
+
+    /// mark_unhealthy_if_current（评审 r2-M1）：旧世代（fd 被 destroy 后的迟到报错
+    /// 是必然事件）不得把新世代标成不健康。
+    #[test]
+    fn mark_unhealthy_generation_guard() {
+        let sh = TunShared::new();
+        sh.begin_generation(1);
+        sh.begin_healthy();
+        sh.begin_generation(2); // 新世代接管
+        sh.mark_unhealthy_if_current(1, "fd"); // 旧世代的 fd 错误回调
+        assert!(sh.healthy.load(Ordering::Acquire), "旧世代不得标记新世代");
+        assert!(lock_unpoison(&sh.unhealthy_why).is_empty());
+        sh.mark_unhealthy_if_current(2, "fd"); // 当前世代照常
+        assert!(!sh.healthy.load(Ordering::Acquire));
+        assert_eq!(*lock_unpoison(&sh.unhealthy_why), "fd");
+    }
+
+    /// stop 位收口（评审 r2-L12）：finish 对当前世代置位；旧世代迟到收尾不动
+    /// 新世代的停止位；begin_generation 换新时清槽。
+    #[test]
+    fn finish_stops_current_generation_flag() {
+        let sh = TunShared::new();
+        sh.begin_generation(1);
+        let f1 = Arc::new(AtomicBool::new(false));
+        sh.set_stop_flag(Arc::clone(&f1));
+        sh.begin_generation(2); // 新起点：槽已清
+        let f2 = Arc::new(AtomicBool::new(false));
+        sh.set_stop_flag(Arc::clone(&f2));
+        sh.finish_generation(1); // 旧世代迟到收尾
+        assert!(!f1.load(Ordering::Acquire), "旧世代收尾不动自己的旧位（已出槽）");
+        assert!(!f2.load(Ordering::Acquire), "更不得动新世代的停止位");
+        sh.finish_generation(2); // 当前世代收尾
+        assert!(f2.load(Ordering::Acquire), "收尾置当前世代停止位（Go close(r.stop) 同义）");
     }
 }

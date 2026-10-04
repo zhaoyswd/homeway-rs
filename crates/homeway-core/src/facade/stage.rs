@@ -9,6 +9,8 @@
 use std::sync::Mutex;
 use std::time::Instant;
 
+use super::tun_shared::lock_unpoison;
+
 /// 隧道生命周期阶段（`tunStageName` 同串）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum TunStage {
@@ -85,7 +87,7 @@ impl StageMachine {
 
     /// 无条件写阶段（Go setStage：随写打 since 时间戳）。
     pub fn set(&self, stage: TunStage, code: &str, reason: &str, meowed: bool) {
-        let mut g = self.inner.lock().expect("阶段锁中毒");
+        let mut g = lock_unpoison(&self.inner);
         g.snap = StageSnapshot {
             stage,
             code: code.to_owned(),
@@ -100,7 +102,7 @@ impl StageMachine {
     /// Go 的 setStageIfCurrent 经 tunRun 指针身份判「当前」；Rust 面以世代计数等价表达
     /// （世代 = begin 时递增的 u64，同号即同世代）。
     pub fn set_if_current(&self, gen: u64, stage: TunStage, code: &str, reason: &str, meowed: bool) {
-        let mut g = self.inner.lock().expect("阶段锁中毒");
+        let mut g = lock_unpoison(&self.inner);
         if g.writer_gen != gen {
             return;
         }
@@ -117,16 +119,20 @@ impl StageMachine {
     /// 记录最近一次就绪的判据（现仅 "wg"——隧道内暖机探测；随 tunStatusJSON 下发）。
     /// 新世代起点清空（Go runTun2Tailcat 世代起点 setReadyBy("")）。
     pub fn set_ready_by(&self, by: &str) {
-        self.inner.lock().expect("阶段锁中毒").snap.ready_by = by.to_owned();
+        lock_unpoison(&self.inner).snap.ready_by = by.to_owned();
     }
 
     pub fn snapshot(&self) -> StageSnapshot {
-        self.inner.lock().expect("阶段锁中毒").snap.clone()
+        lock_unpoison(&self.inner).snap.clone()
     }
 
     /// 世代起点的写入权交接（begin 时调）：旧世代此后的 set_if_current 全部失效。
+    /// 同时清 readyBy（评审 r2-M6：Go runTun2Tailcat 世代起点 setReadyBy("")——
+    /// 重建期 status 不得带着上一世代的就绪判据）。
     pub fn begin_generation(&self, gen: u64) {
-        self.inner.lock().expect("阶段锁中毒").writer_gen = gen;
+        let mut g = lock_unpoison(&self.inner);
+        g.writer_gen = gen;
+        g.snap.ready_by = String::new();
     }
 }
 
@@ -179,5 +185,16 @@ mod tests {
         assert_eq!(m.snapshot().ready_by, "wg");
         m.set_ready_by("");
         assert_eq!(m.snapshot().ready_by, "");
+    }
+
+    /// 世代起点清 readyBy（评审 r2-M6：重建期 status 不带上一世代的就绪判据）。
+    #[test]
+    fn begin_generation_clears_ready_by() {
+        let m = StageMachine::new();
+        m.begin_generation(1);
+        m.set_ready_by("wg");
+        assert_eq!(m.snapshot().ready_by, "wg");
+        m.begin_generation(2);
+        assert_eq!(m.snapshot().ready_by, "", "世代起点清 readyBy（Go setReadyBy(\"\")）");
     }
 }

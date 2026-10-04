@@ -164,10 +164,6 @@ pub enum Cmd {
     },
     /// TUN 读线程投来的应用出站包（driver encap 发送——Go hub 的 outbound 通道面）。
     TunPacket(Vec<u8>),
-    /// 读 TUN 面 fd/demand 计数（tunStatusJSON 的 stats 段与需求门控源）。
-    TunStats {
-        reply: Sender<(u64, u64)>,
-    },
     /// 装 TUN 面错误回调（fd 读写失败 → facade 挂 markUnhealthy；attach 前后都可调，
     /// driver 线程执行——回调只允许原子/内存操作，Go SetOnTunError 同义）。
     SetOnTunError {
@@ -191,6 +187,12 @@ pub struct Snapshot {
     /// 最近一次**采纳路径**本地类发送错误时刻（巡检失败拍的噪声判定数据源；
     /// Go Bind.lastLocalSendErrAt 同义——镜像候选的本地错误不刷此位）。
     pub last_local_send_err: Option<Instant>,
+    /// 全候选发送统计的**待取走**拍内累计（(尝试, 本地失败)；swap_send_stats 消费
+    /// 后置 None——拍板①：Go sendTries/sendLocalFails 的按拍取走清零语义）。
+    pub bind_stats: Option<(i64, i64)>,
+    /// 本地发送错误累计（(采纳路径, 全部)——tunStatusJSON demand.localErr* 源；
+    /// 拍板①：Go adoptedLocalErrCount/localErrCount 的累计面）。
+    pub local_err: (u64, u64),
 }
 
 pub struct CoreConfig {
@@ -299,6 +301,10 @@ struct Engine {
     on_tun_error: Option<OnTunError>,
     /// 投递通道（读线程投 TunPacket 用；Client::start 注入克隆）。
     cmd_tx: Option<Sender<Cmd>>,
+    /// 装载的 TUN 读线程唤醒面（我-4：读线程投 TunPacket 后写同一 wake 管道——
+    /// driver 的 poll(2) 最多 250ms 才醒，上行每串包白等一拍；与 Client::send 共用
+    /// 同一 fd 与互斥位，stop 关闭后写入自然 no-op）。
+    wake: Arc<Mutex<Option<i32>>>,
 }
 
 impl Engine {
@@ -428,11 +434,16 @@ impl Engine {
                         Err(e) => {
                             let msg = format!("tun fd 写入失败：{e}");
                             (self.logf)(&msg);
-                            if let Some(cb) = self.app_tun.as_ref().and_then(|t| t.on_error.as_ref()) {
-                                cb(&msg);
+                            // 卸源 + 置读线程停止位（评审 r2-我-5/评审者「不认同②」：
+                            // 停止位在 AppTun 里——直接 `= None` 会把引擎侧唯一能置位
+                            // 的句柄一起丢掉。先置 stop 再卸源；错误回调同拍发出
+                            // 〔markUnhealthy_if_current("fd") → 扩展重建〕）。
+                            if let Some(tun) = self.app_tun.take() {
+                                tun.stop.store(true, Ordering::SeqCst);
+                                if let Some(cb) = tun.on_error.as_ref() {
+                                    cb(&msg);
+                                }
                             }
-                            // 写失败 = fd 已失效（系统收回）；卸下 TUN 源，后续包不再尝试写
-                            self.app_tun = None;
                         }
                     }
                 }
@@ -673,13 +684,6 @@ impl Engine {
                 // 应用出站包：encap 后经 bind 发出（Go hub 的 outbound → device.Read 面）
                 self.encap_send(&pkt);
             }
-            Cmd::TunStats { reply } => {
-                let c = &self.tun_counters;
-                let _ = reply.send((
-                    c.read_bytes.load(Ordering::Relaxed),
-                    c.write_bytes.load(Ordering::Relaxed),
-                ));
-            }
             Cmd::SetOnTunError { f } => {
                 if let Some(tun) = self.app_tun.as_mut() {
                     tun.on_error = Some(f);
@@ -718,9 +722,10 @@ impl Engine {
         });
         let cmd_tx = self.cmd_tx_clone();
         let logf = Arc::clone(&self.logf);
+        let wake = Arc::clone(&self.wake);
         let _ = thread::Builder::new()
             .name("homeway-tun-read".into())
-            .spawn(move || tun_read_loop(fd, cmd_tx, stop, counters, logf));
+            .spawn(move || tun_read_loop(fd, cmd_tx, wake, stop, counters, logf));
         Ok(())
     }
 
@@ -841,6 +846,8 @@ impl Engine {
     fn update_snapshot(&self) {
         let st = self.bind.status();
         let (rx, tx) = self.bind.rx_tx();
+        let (tries, fails) = self.bind.send_stats_pending();
+        let local_err = self.bind.local_err_counters();
         let mut s = self.snapshot.lock().expect("快照锁中毒");
         s.via = st.via;
         s.ep = st.ep;
@@ -848,6 +855,8 @@ impl Engine {
         s.rx = rx;
         s.tx = tx;
         s.last_local_send_err = self.bind.last_local_send_err_at();
+        s.bind_stats = Some((tries, fails));
+        s.local_err = local_err;
     }
 }
 
@@ -855,7 +864,8 @@ impl Engine {
 /// 经 `Arc<Client>` 共享时也能收口）。
 pub struct Client {
     cmd_tx: mpsc::Sender<Cmd>,
-    wake_wr: Mutex<Option<i32>>,
+    /// wake 管道写端（与引擎内 TUN 读线程共享同一把锁位——我-4；stop 取出后关闭）。
+    wake_wr: Arc<Mutex<Option<i32>>>,
     handle: Mutex<Option<JoinHandle<()>>>,
     snapshot: Arc<Mutex<Snapshot>>,
     stop: Arc<AtomicBool>,
@@ -863,6 +873,8 @@ pub struct Client {
     pub tunnel_ip: Ipv4Addr,
     /// TUN 面计数（L3 直通 attach 后与设备 vpn-tun 对表；需求信号源）。
     tun_counters: Arc<TunCounters>,
+    /// 发送统计的 swap 基线（拍板①：差分等价 Go 的 swap-reset）。
+    last_send_swap: Mutex<(i64, i64)>,
 }
 
 impl Client {
@@ -900,6 +912,9 @@ impl Client {
         let snapshot = Arc::new(Mutex::new(Snapshot::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let next_id = Arc::new(AtomicU64::new(1));
+        // wake 写端共享面（Client::send 与 TUN 读线程共用——我-4：读线程投包后
+        // 即写管道唤醒 driver，不等 poll 超时拍）
+        let wake_wr_shared = Arc::new(Mutex::new(Some(wake_w)));
 
         let identity_key = cfg.identity.private_key().clone();
         let secret = cfg.secret;
@@ -925,6 +940,7 @@ impl Client {
             tun_counters: Arc::clone(&tun_counters),
             on_tun_error: None,
             cmd_tx: Some(cmd_tx.clone()),
+            wake: Arc::clone(&wake_wr_shared),
         };
 
         let stop2 = Arc::clone(&stop);
@@ -934,13 +950,14 @@ impl Client {
 
         Ok(Self {
             cmd_tx,
-            wake_wr: Mutex::new(Some(wake_w)),
+            wake_wr: wake_wr_shared,
             handle: Mutex::new(Some(handle)),
             snapshot,
             stop,
             next_id,
             tunnel_ip,
             tun_counters,
+            last_send_swap: Mutex::new((0, 0)),
         })
     }
 
@@ -956,9 +973,7 @@ impl Client {
                 }
             }
         }
-    }
-
-    pub fn snapshot(&self) -> Snapshot {
+    }    pub fn snapshot(&self) -> Snapshot {
         self.snapshot.lock().expect("快照锁中毒").clone()
     }
 
@@ -1006,14 +1021,27 @@ impl Client {
         rx.recv().map_err(|_| ConnErr::EngineGone)?
     }
 
+    /// PathProbe：拨出口必然拒绝的端口（主入口恒 :1），拿到 RST = 隧道通、出口在、
+    /// 拦截层可用（C8 `判据=wg` 的依据；超时/不可达才算死）。预算下沉引擎 + **外层
+    /// 硬超时**（评审 r2-M4：引擎 driver 线程卡死时 rx.recv() 永不返回 ⇒ 暖机永久
+    /// preparing/巡检线程永久卡死——Go 暖机 select+time.After(warmTimeout)、巡检
+    /// time.After(perTry+2s) 的双保险同义：预算 + 2s 宽限后按超时收）。
     pub fn path_probe(&self, timeout: Duration) -> Result<(), ConnErr> {
-        self.connect_deadline(SocketAddrV4::new(SERVER_TUNNEL_IP, 1), timeout)
-            .map(|_| ())
-            // 对端 :1 若真有服务（连接成功）也说明会话活着
-            .or_else(|e| match e {
-                ConnErr::Refused => Ok(()),
-                other => Err(other),
-            })
+        let id = self.alloc_id();
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::Connect { id, dst: SocketAddrV4::new(SERVER_TUNNEL_IP, 1), deadline: timeout, reply: tx });
+        const SLACK: Duration = Duration::from_secs(2);
+        match rx.recv_timeout(timeout + SLACK) {
+            Ok(Ok(())) => {
+                // :1 真有服务（连接成功）也说明会话活着——关掉探针连接防引擎内槽位滞留
+                let _ = self.close(id);
+                Ok(())
+            }
+            Ok(Err(ConnErr::Refused)) => Ok(()),
+            Ok(Err(other)) => Err(other),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ConnErr::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ConnErr::EngineGone),
+        }
     }
 
     pub fn write(&self, id: u64, data: Vec<u8>) -> Result<usize, ConnErr> {
@@ -1050,6 +1078,28 @@ impl Client {
         let (tx, rx) = mpsc::channel();
         self.send(Cmd::RefreshReg { reply: Some(tx) });
         rx.recv().map_err(|_| ConnErr::EngineGone)
+    }
+
+    /// 全候选发送统计的「取走清零」面（拍板①：Go SwapSendStats——巡检拍头消费；
+    /// 返回 (尝试数, 本地失败数) = 本次快照累计 − 上次取走值（Bind 计数器随引擎
+    /// 生命周期单调，差分等价 Go 的 swap-reset）。
+    pub fn swap_send_stats(&self) -> (i64, i64) {
+        let cur = self
+            .snapshot
+            .lock()
+            .expect("快照锁中毒")
+            .bind_stats
+            .unwrap_or((0, 0));
+        let mut last = self.last_send_swap.lock().expect("发送统计基线锁中毒");
+        let delta = (cur.0 - last.0, cur.1 - last.1);
+        *last = cur;
+        delta
+    }
+
+    /// 本地发送错误累计（tunStatusJSON demand.localErr* 两键源；Go
+    /// adoptedLocalErrCount/localErrCount——拍板①补全）。
+    pub fn local_err_counters(&self) -> (u64, u64) {
+        self.snapshot.lock().expect("快照锁中毒").local_err
     }
 
     /// 清采纳、重启赛跑（阶梯 R3 档动作）。
@@ -1255,8 +1305,12 @@ fn driver(mut engine: Engine, wake_r: i32, stop: Arc<AtomicBool>) {
 
 /// TUN fd 全量写（部分写回补——包写入原子性由内核 tun 语义保证，这里兜短写）。
 /// EAGAIN：OHOS 的 VPN fd 是**非阻塞**的（Go tunfd_unix.go 同款真机实证）——
-/// poll(POLLOUT) 等可写再续写。
+/// poll(POLLOUT) 等可写再续写。POLLOUT 等待有**总预算**（评审 r2-我-5：此前在
+/// 唯一 driver 线程里无界重试——fd 长期不可写时 Cmd::Stop 处理不了、Client::stop
+/// 的 join 挂死；超预算按超时错误收 ⇒ 卸源 + 停止位 + 错误回调）。
 fn write_fd_all(fd: i32, mut buf: &[u8]) -> io::Result<()> {
+    const WRITE_BUDGET: Duration = Duration::from_secs(5);
+    let deadline = Instant::now() + WRITE_BUDGET;
     while !buf.is_empty() {
         let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
         if n < 0 {
@@ -1264,7 +1318,7 @@ fn write_fd_all(fd: i32, mut buf: &[u8]) -> io::Result<()> {
             match e.kind() {
                 io::ErrorKind::Interrupted => continue,
                 io::ErrorKind::WouldBlock => {
-                    poll_fd(fd, libc::POLLOUT)?;
+                    poll_fd(fd, libc::POLLOUT, deadline)?;
                     continue;
                 }
                 _ => return Err(e),
@@ -1275,9 +1329,13 @@ fn write_fd_all(fd: i32, mut buf: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// 单 fd poll 等待（500ms 片——与 Go tunfd 的 poll 节拍同值；EINTR 重试）。
-fn poll_fd(fd: i32, events: i16) -> io::Result<()> {
+/// 单 fd poll 等待（500ms 片——与 Go tunfd 的 poll 节拍同值；EINTR 重试；到总预算
+/// 返回 TimedOut）。
+fn poll_fd(fd: i32, events: i16, deadline: Instant) -> io::Result<()> {
     loop {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(io::ErrorKind::TimedOut, "tun fd 等待可写超预算"));
+        }
         let mut pfd = libc::pollfd { fd, events, revents: 0 };
         let r = unsafe { libc::poll(&mut pfd, 1, 500) };
         if r < 0 {
@@ -1295,11 +1353,14 @@ fn poll_fd(fd: i32, events: i16) -> io::Result<()> {
 /// **OHOS 的 VPN fd 是非阻塞的**（Go tunfd_unix.go 真机实证——裸读立即返回
 /// EAGAIN，被当错误上报会当场把健康隧道判死）：EAGAIN → poll(POLLIN, 500ms) →
 /// 再读；stop 位在 poll 片界检查（引擎收工后 ≤~500ms 内退出）。
+/// 投包后**写 wake 管道**（我-4：driver 的 poll 超时上限 250ms——不写管道时上行
+/// 每串包最长排队一拍；Go 是 channel 直接唤醒 wireguard-go 读循环，无此延迟）。
 /// 退出路径：fd 失效报错（EBADF/EINVAL = 扩展 destroy）/ stop 位 / channel 断
 /// （driver 已死）。
 fn tun_read_loop(
     fd: i32,
     cmd_tx: Sender<Cmd>,
+    wake: Arc<Mutex<Option<i32>>>,
     stop: Arc<AtomicBool>,
     counters: Arc<TunCounters>,
     logf: Arc<dyn Fn(&str) + Send + Sync>,
@@ -1317,7 +1378,8 @@ fn tun_read_loop(
                 }
                 io::ErrorKind::WouldBlock => {
                     // 非阻塞 fd 的常态：等 POLLIN（500ms 片——stop 位在片界检查）
-                    if let Err(pe) = poll_fd(fd, libc::POLLIN) {
+                    if let Err(pe) = poll_fd(fd, libc::POLLIN, Instant::now() + Duration::from_millis(500))
+                    {
                         if pe.kind() == io::ErrorKind::Interrupted {
                             continue;
                         }
@@ -1339,9 +1401,22 @@ fn tun_read_loop(
             continue;
         }
         if n == 0 {
-            return; // EOF：fd 被关
+            // n==0 不判死（评审 r2-我-8：Go 是 continue——TUN 设备的 0 字节读是可
+            // 复现的空读形态，静默 return 会「看着健康、上行全丢」；随后 poll 一片
+            // 防非阻塞 fd 上的热自旋）
+            poll_fd(fd, libc::POLLIN, Instant::now() + Duration::from_millis(500)).ok();
+            continue;
         }
-        let pkt: Vec<u8> = buf[..n as usize].to_vec();
+        let mut n = n as usize;
+        // packet-info 头自动探测（评审 r2-L4 补齐：OHOS 不需要 PI，但读侧保留探测
+        // 以防万一——Go tunfd_unix.go 同款判定）：4 字节 PI 后面跟合法 IP 版本号才剥。
+        let looks_like_pi = (buf[2] == 0x08 && buf[3] == 0x00 && buf[4] >> 4 == 4)
+            || (buf[2] == 0x86 && buf[3] == 0xdd && buf[4] >> 4 == 6);
+        if n >= 5 && buf[0] == 0 && buf[1] == 0 && looks_like_pi {
+            buf.copy_within(4..n, 0);
+            n -= 4;
+        }
+        let pkt: Vec<u8> = buf[..n].to_vec();
         counters.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
         // 需求信号：App 出站包到达（demand-driven-recovery D1——只计 App 源）
         counters.out_pkts.fetch_add(1, Ordering::Relaxed);
@@ -1351,6 +1426,12 @@ fn tun_read_loop(
         counters.last_outbound_mono_ns.store(mono, Ordering::Relaxed);
         if cmd_tx.send(Cmd::TunPacket(pkt)).is_err() {
             return; // driver 已死
+        }
+        // 唤醒 driver（我-4：与 Client::send 同一管道——写入 1 字节即触发 POLLIN）
+        if let Some(wfd) = *wake.lock().expect("wake 锁中毒") {
+            unsafe {
+                libc::write(wfd, b"x".as_ptr().cast(), 1);
+            }
         }
     }
 }

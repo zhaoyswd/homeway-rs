@@ -207,9 +207,12 @@ pub fn run_ladder(deps: &mut LadderDeps, from: Level, cause: &str) -> LadderRc {
     LadderRc::Exhausted
 }
 
-/// R1 档动作：RefreshReg + ResetPeerSession（Go :163-182；两步都在动作预算内，
-/// 任何一步的**超时/立即失败**收轮——Rust 单体重建无「移除失败/回写失败」子态，
-/// 「丢会话失败」行不可达〔形态豁免〕）。
+/// R1 档动作：RefreshReg + ResetPeerSession（Go :163-182）。语义（评审 r2-我-7 对齐）：
+/// - **超时**（runBoundedAction 到点）→ -3 收轮；
+/// - RefreshReg 无发送（bind 收工/无采纳）→ 留现场证据行继续；
+/// - ResetPeerSession **立即失败只记日志、按既有状态继续验证**（Go 闭包恒
+///   `return nil`——「丢会话失败——按既有状态验证」；Rust 单体此前直接收轮 -4，
+///   巡检失败当拍若丢会话立即报错，Go 可能验证通过并报「已恢复」）。
 fn run_r1_actions(deps: &mut LadderDeps, cause: &str) -> Result<(), LadderRc> {
     match deps.tr.refresh_reg() {
         Ok(RefreshRegOutcome::Sent) => {}
@@ -221,7 +224,14 @@ fn run_r1_actions(deps: &mut LadderDeps, cause: &str) -> Result<(), LadderRc> {
         Err(e) => return Err(local_fail(deps, Level::R1, cause, &e)),
     }
     if let Err(e) = deps.tr.apply(Action::ResetPeerSession) {
-        return Err(local_fail(deps, Level::R1, cause, &e));
+        match e {
+            ActionError::Timeout => return Err(local_fail(deps, Level::R1, cause, &ActionError::Timeout)),
+            ActionError::Failed(m) => {
+                (deps.logf)(&format!(
+                    "RECOVER R1 重握手（原因={cause}）：丢会话失败（{m}）—— 按既有状态验证"
+                ));
+            }
+        }
     }
     (deps.logf)(&format!(
         "RECOVER R1 重握手（原因={cause}）：补注册 + 丢会话（保采纳）"

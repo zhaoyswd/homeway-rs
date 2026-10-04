@@ -192,9 +192,6 @@ pub struct ClientCore {
     foreground: AtomicBool,
     /// 「回到前台」转变时的补探钩子（false→true 踢一次立即探测；只影响时机）。
     foreground_kick: Mutex<Option<Box<dyn Fn() + Send>>>,
-    /// 收工强制放锁后的「孤儿世代」标记（tun_stop 的 -2 路径；世代线程迟到收尾
-    /// 过世代守卫即可，此位供诊断区分「锁被强制放过后旧世代是否还活着」）。
-    orphan_alive: Arc<AtomicBool>,
     pub demand: Arc<DemandSignals>,
     pub files: files_op::FilesOps,
     executor: Mutex<Arc<dyn TunExecutor>>,
@@ -228,7 +225,6 @@ impl ClientCore {
             tun: Arc::new(TunShared::new()),
             foreground: AtomicBool::new(false),
             foreground_kick: Mutex::new(None),
-            orphan_alive: Arc::new(AtomicBool::new(false)),
             demand,
             files: files_op::FilesOps::new(),
             executor: Mutex::new(executor),
@@ -265,11 +261,6 @@ impl ClientCore {
     /// tun 共享面（执行体装配/测试用）。
     pub fn tun_shared(&self) -> Arc<TunShared> {
         Arc::clone(&self.tun)
-    }
-
-    /// 孤儿世代标记位（tun_exec 的世代线程在 stop 强制放锁路径上报用）。
-    pub fn orphan_flag(&self) -> Arc<AtomicBool> {
-        Arc::clone(&self.orphan_alive)
     }
 
     // ---- ① ClientCoreVersion ----
@@ -311,8 +302,7 @@ impl ClientCore {
             return -2;
         }
         let gen = self.tun.gen.fetch_add(1, Ordering::AcqRel) + 1;
-        self.tun.begin_generation(gen); // 写入权交接 + done/attach 通道复位
-        self.orphan_alive.store(false, Ordering::Release);
+        self.tun.begin_generation(gen); // 写入权交接 + done/attach 通道/停止位槽复位
         self.tun.begin_healthy(); // 新世代不带上一世代的分类残留（先清——顺序即注释）
         self.tun.stage.set_if_current(gen, TunStage::Preparing, "", "", false);
         match self.executor().warmup(&cfg, Arc::clone(&self.tun), gen) {
@@ -320,7 +310,11 @@ impl ClientCore {
             Err(e) => {
                 if matches!(e, TunError::LogOpen(_)) {
                     // 日志面打不开 = 同步 -2（Go tunStdioBegin 失败的 rc 契约；
-                    // 世代未起——只放锁，不写终态）
+                    // 世代未起——只放锁不写终态；此前 Preparing 已写 ⇒ 回 Idle 防
+                    // App 轮询面停在 preparing 永远等不到了——评审 r2-L2）
+                    self.tun
+                        .stage
+                        .set_if_current(gen, TunStage::Idle, "", "", false);
                     self.tun.probe_running.store(false, Ordering::Release);
                     return -2;
                 }
@@ -419,11 +413,12 @@ impl ClientCore {
             return 0;
         }
         // 超时：若期间没有新世代启动（gen 未变且锁未放出）⇒ 强制放锁（不写阶段——
-        // 工单③：终态由世代写；旧世代迟到收尾过世代守卫无害）
+        // 工单③：终态由世代写；旧世代迟到收尾过世代守卫无害）。健康位照 Go 同分支
+        // 补写 why="stop"/healthy=false（评审 r2-L1）。
         if self.tun.gen.load(Ordering::Acquire) == gen
             && self.tun.probe_running.load(Ordering::Acquire)
         {
-            self.orphan_alive.store(true, Ordering::Release);
+            self.tun.mark_unhealthy("stop");
             self.tun.probe_running.store(false, Ordering::Release);
             -2
         } else {
@@ -433,9 +428,12 @@ impl ClientCore {
 
     // ---- ⑥ ClientCoreTunRecover ----
 
-    /// 恢复阶梯下推入口（from 钳位 R1..=R3；rc 契约见 facade 头注释）。
+    /// 恢复阶梯下推入口（from 钳位 R1..=R3；rc 契约见 facade 头注释）。cause 文案
+    /// 用**档位名**（评审 r2-L6：`扩展下推(R1 重握手)`——会进 RECOVER 判据行，
+    /// Go 同串）。
     pub fn tun_recover(&self, from: i64) -> i32 {
-        self.executor().recover(from, &format!("扩展下推({from})"))
+        let lvl = crate::session::recover::Level::clamp(from);
+        self.executor().recover(from, &format!("扩展下推({})", lvl.name()))
     }
 
     // ---- ⑦ ClientCoreTunRunning ----
@@ -831,5 +829,34 @@ mod tests {
     #[test]
     fn attach_timeout_reason_literal() {
         assert_eq!(ATTACH_TIMEOUT_REASON, "就绪后无人 attach，已自行收工放锁");
+    }
+
+    /// 日志打不开 = 同步 -2 且 stage 回 idle（评审 r2-L2：此前 Preparing 已写又不收
+    /// 尾 ⇒ App 轮询面停在 preparing/running:0 永远等不到结果）。
+    struct LogOpenExec;
+    impl TunExecutor for LogOpenExec {
+        fn warmup(&self, _cfg: &TunConfigJson, _shared: Arc<TunShared>, _gen: u64) -> Result<(), TunError> {
+            Err(TunError::LogOpen("permission denied".into()))
+        }
+        fn request_stop(&self) {}
+        fn recover(&self, _from: i64, _cause: &str) -> i32 {
+            -2
+        }
+        fn runner(&self) -> Option<RunnerIn> {
+            None
+        }
+        fn transport(&self) -> Option<TransportIn> {
+            None
+        }
+    }
+
+    #[test]
+    fn log_open_minus2_resets_stage_to_idle() {
+        let core = ClientCore::new(Arc::new(LogOpenExec));
+        assert_eq!(core.tun_prepare(r#"{"token":"hmw1-x"}"#, true), -2);
+        let st = core.tun_status();
+        assert!(st.contains("\"state\":\"idle\""), "log -2 后不得停在 preparing：{st}");
+        // 锁已放：可再次受理
+        assert_eq!(core.tun_prepare(r#"{"token":"hmw1-x"}"#, true), -2);
     }
 }

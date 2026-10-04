@@ -25,6 +25,19 @@ use crate::files::{decode_prefix, Prefix, MAX_REQUEST_LINE, CODE_STREAM_OPEN};
 
 use super::term_op::write_auth;
 
+/// [`std::sync::Mutex`] 的锁中毒不 panic 扩展（评审 r2-L3：facade 存量 expect 收敛
+/// ——c-shared 宿主里 panic = 扩展进程死；tun_shared::lock_unpoison 的 trait 化件）。
+trait LockUnpoison<T> {
+    fn lup(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockUnpoison<T> for std::sync::Mutex<T> {
+    fn lup(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+
 /// 一次性命令的期限（Go filesConnectTimeout 同值；读预算落到 conn deadline——
 /// 对端「连着但不说话」时不得无限挂死）。
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -252,19 +265,19 @@ impl Transfer {
         m.insert("bytes".into(), Value::from(self.bytes.load(Ordering::Relaxed)));
         m.insert("total".into(), Value::from(self.total.load(Ordering::Relaxed)));
         m.insert("done".into(), Value::from(self.done.load(Ordering::Relaxed)));
-        m.insert("err".into(), Value::String(self.err.lock().expect("err 锁中毒").clone()));
+        m.insert("err".into(), Value::String(self.err.lup().clone()));
         Value::Object(m)
     }
 
     /// 断在途 I/O（幂等）。
     fn cut_io(&self) {
-        if let Some(f) = self.cut.lock().expect("cut 锁中毒").take() {
+        if let Some(f) = self.cut.lup().take() {
             f();
         }
     }
 
     fn set_done(&self, err: &str) {
-        *self.err.lock().expect("err 锁中毒") = err.to_owned();
+        *self.err.lup() = err.to_owned();
         self.done.store(true, Ordering::Relaxed);
     }
 
@@ -287,7 +300,7 @@ struct FilesSession {
 impl FilesSession {
     /// 收工：打断全部在跑传输（FIX-42——被淘汰/关闭的会话不得留孤儿 I/O）。
     fn shutdown(&self) {
-        let txs: Vec<Arc<Transfer>> = self.txs.lock().expect("tx 锁中毒").values().cloned().collect();
+        let txs: Vec<Arc<Transfer>> = self.txs.lup().values().cloned().collect();
         for tx in txs {
             tx.cancelled.store(true, Ordering::Relaxed);
             tx.cut_io();
@@ -339,8 +352,8 @@ impl FilesOps {
             "download" => Self::op_transfer(&sess, "download", &strv("remotePath"), &strv("localPath")),
             "upload" => Self::op_transfer(&sess, "upload", &strv("remotePath"), &strv("localPath")),
             "transfers" => {
-                let txs = sess.txs.lock().expect("tx 锁中毒");
-                let next = *sess.tx_next.lock().expect("txNext 锁中毒");
+                let txs = sess.txs.lup();
+                let next = *sess.tx_next.lup();
                 let out: Vec<Value> = (1..=next).filter_map(|id| txs.get(&id).map(|t| t.snapshot_json())).collect();
                 let mut m = Map::new();
                 m.insert("transfers".into(), Value::Array(out));
@@ -353,11 +366,11 @@ impl FilesOps {
     }
 
     fn get_session(&self, handle: i64) -> Result<Arc<FilesSession>, FilesOpError> {
-        let guard = self.sessions.lock().expect("会话锁中毒");
+        let guard = self.sessions.lup();
         let Some(s) = guard.get(&handle) else {
             return Err(FilesOpError::new(code::NO_SESSION, "会话不存在或已关闭"));
         };
-        *s.last_used.lock().expect("lastUsed 锁中毒") = Instant::now();
+        *s.last_used.lup() = Instant::now();
         Ok(Arc::clone(s))
     }
 
@@ -376,11 +389,11 @@ impl FilesOps {
         drop(stream);
 
         let (id, evicted) = {
-            let mut guard = self.sessions.lock().expect("会话锁中毒");
+            let mut guard = self.sessions.lup();
             let evicted = if guard.len() >= MAX_SESSIONS {
                 guard
                     .iter()
-                    .min_by_key(|(_, s)| *s.last_used.lock().expect("lastUsed 锁中毒"))
+                    .min_by_key(|(_, s)| *s.last_used.lup())
                     .map(|(id, _)| *id)
                     .and_then(|id| guard.remove(&id))
             } else {
@@ -412,7 +425,7 @@ impl FilesOps {
     }
 
     fn op_close(&self, sess: &Arc<FilesSession>) -> Result<Value, FilesOpError> {
-        self.sessions.lock().expect("会话锁中毒").remove(&sess.id);
+        self.sessions.lup().remove(&sess.id);
         sess.shutdown();
         let mut m = Map::new();
         m.insert("ok".into(), Value::from(true));
@@ -491,11 +504,11 @@ impl FilesOps {
         if remote_path.is_empty() || local_path.is_empty() {
             return Err(FilesOpError::new(code::INVALID_ARG, "remotePath 与 localPath 必填"));
         }
-        let mut txs = sess.txs.lock().expect("tx 锁中毒");
+        let mut txs = sess.txs.lup();
         if txs.values().any(|t| !t.done.load(Ordering::Relaxed)) {
             return Err(FilesOpError::new(code::BUSY, "已有传输进行中，请等它完成或取消"));
         }
-        let mut next = sess.tx_next.lock().expect("txNext 锁中毒");
+        let mut next = sess.tx_next.lup();
         *next += 1;
         let tx = Arc::new(Transfer {
             id: *next,
@@ -524,7 +537,7 @@ impl FilesOps {
     }
 
     fn op_cancel(sess: &Arc<FilesSession>, id: i64) -> Result<Value, FilesOpError> {
-        let txs = sess.txs.lock().expect("tx 锁中毒");
+        let txs = sess.txs.lup();
         if let Some(tx) = txs.get(&id) {
             // 先归因后断 I/O（Go cancelled 旗标时序）
             tx.cancelled.store(true, Ordering::Relaxed);
@@ -561,7 +574,7 @@ fn run_transfer(sess: Arc<FilesSession>, tx: Arc<Transfer>) {
     stream.conn.set_read_timeout(None).ok();
     stream.conn.set_write_timeout(None).ok();
     // 登记断 I/O 出口（拨号成功后；重复登记以最后一次为准——本形态每传输一条流）
-    *tx.cut.lock().expect("cut 锁中毒") = Some(Box::new({
+    *tx.cut.lup() = Some(Box::new({
         let conn = stream.conn.try_clone().ok();
         move || {
             if let Some(c) = &conn {

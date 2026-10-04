@@ -185,13 +185,15 @@ impl crate::speedtest::SpeedConn for BridgeSpeedConn {
 }
 
 /// App 引擎入口：拨桥 + 鉴权 → `speedtest::run_dial`（同步跑完整轮——NAPI 壳在
-/// async work 线程上跑；失败信封同 `SpeedOutcome::Fail`）。cancel 位经参数注入。
+/// async work 线程上跑；失败信封同 `SpeedOutcome::Fail`）。cancel 位经参数注入；
+/// `live` = 进度出口（M-7：SpeedHost 的 Status 面消费——相位 + 字节）。
 pub fn app_run(
     auth: &str,
     sock: &str,
     p: &crate::speedtest::Params,
     logf: &dyn Fn(&str),
     cancel: Option<&std::sync::atomic::AtomicBool>,
+    live: Option<&std::sync::Arc<crate::speedtest::LiveProgress>>,
 ) -> SpeedOutcome {
     let dial = || -> Result<std::sync::Arc<dyn crate::speedtest::SpeedConn>, crate::speedtest::SpeedtestError> {
         match speed_dial_conn(auth, sock, Duration::from_secs(10)) {
@@ -202,7 +204,7 @@ pub fn app_run(
             }
         }
     };
-    match crate::speedtest::run_dial(&dial, *p, logf, cancel) {
+    match crate::speedtest::run_dial(&dial, *p, logf, cancel, live) {
         Ok(res) => SpeedOutcome::Ok(res),
         Err(e) => SpeedOutcome::Fail { reason: e.reason().to_string(), msg: e.to_string() },
     }
@@ -377,6 +379,8 @@ struct RoundState {
     usage: Option<(i64, i64)>,
     live: Option<(&'static str, i64, f64)>,
     started_at: Option<Instant>,
+    /// 上次 status 采样的 (字节, 时刻)——instBps 的差分基线（M-7）。
+    sample: Option<(i64, Instant)>,
 }
 
 impl Default for RoundState {
@@ -387,6 +391,7 @@ impl Default for RoundState {
             usage: None,
             live: None,
             started_at: None,
+            sample: None,
         }
     }
 }
@@ -396,6 +401,8 @@ impl Default for RoundState {
 pub struct SpeedHost {
     running: AtomicBool,
     cancel: std::sync::Arc<AtomicBool>,
+    /// 引擎进度出口（M-7：live/dir 的数据源——相位 + 字节累计，instBps 差分算）。
+    live: std::sync::Arc<crate::speedtest::LiveProgress>,
     state: Mutex<RoundState>,
 }
 
@@ -410,6 +417,7 @@ impl SpeedHost {
         SpeedHost {
             running: AtomicBool::new(false),
             cancel: std::sync::Arc::new(AtomicBool::new(false)),
+            live: std::sync::Arc::new(crate::speedtest::LiveProgress::new()),
             state: Mutex::new(RoundState::default()),
         }
     }
@@ -453,11 +461,12 @@ impl SpeedHost {
             // 轮内日志经 stderr？App 形态无 stdout 消费面——丢弃（判据行在 exit 侧）
             let _ = s;
         };
-        // 相位推进（粗粒度：connecting → down——引擎日志驱动的细分相不在这层复刻，
-        // Status 面按窗口近似；收尾相位在轮结束时写回）
+        // 相位推进（M-7：live/dir 由引擎进度出口驱动——down→up 相位切换 + 字节累计；
+        // Status 面按 250ms 轮询差分算 instBps；收尾相位在轮结束时写回）
         lock_round(&self.state).phase = "down";
         let cancel = std::sync::Arc::clone(&self.cancel);
-        let outcome = app_run(&p.auth, &p.sock, &params, &logf, Some(&cancel));
+        let live = std::sync::Arc::clone(&self.live);
+        let outcome = app_run(&p.auth, &p.sock, &params, &logf, Some(&cancel), Some(&live));
         let out = speed_start(params_json, |_| outcome);
         // 收尾快照（done/cancelled/failed + usage）
         {
@@ -487,15 +496,40 @@ impl SpeedHost {
                 }
             }
             st.live = None;
+            st.sample = None;
             st.started_at = None;
         }
         self.running.store(false, Ordering::Release);
         out
     }
 
-    /// ClientCoreSpeedTestStatus（250ms 轮询面）。
+    /// ClientCoreSpeedTestStatus（250ms 轮询面；instBps = 进度字节对上次采样的差分）。
     pub fn status(&self) -> String {
-        let st = lock_round(&self.state).clone();
+        let mut st = lock_round(&self.state);
+        let in_flight = st.phase == "connecting" || st.phase == "down" || st.phase == "up";
+        if in_flight {
+            let (dir, bytes) = self.live.snapshot();
+            if let Some(dir) = dir {
+                let now = Instant::now();
+                let inst = match st.sample {
+                    Some((prev_b, prev_t)) => {
+                        let dt = now.duration_since(prev_t).as_secs_f64();
+                        if dt > 0.0 {
+                            ((bytes - prev_b) as f64 / dt).max(0.0)
+                        } else {
+                            0.0
+                        }
+                    }
+                    None => 0.0,
+                };
+                st.live = Some((dir, bytes, inst));
+                st.sample = Some((bytes, now));
+                // 相位跟随引擎出口（down → up——M-7 的核心修复：此前恒 "down"）
+                st.phase = dir;
+            } else {
+                st.live = None;
+            }
+        }
         let elapsed_ms = match st.started_at {
             Some(t) => t.elapsed().as_millis() as i64,
             None => -1,
@@ -511,7 +545,7 @@ impl SpeedHost {
     }
 
     /// ClientCoreSpeedTestCancel（即时返回；在途轮由取消位收场——「已产生用量后
-    /// 打断」归因 interrupted 的细分在引擎 report 面，本层恒 ok:true）。
+    /// 打断」归因 cancelled（M-8：类型化直达 reason 面）；本层恒 ok:true）。
     pub fn cancel(&self) -> String {
         self.cancel.store(true, Ordering::Release);
         speed_cancel_json()

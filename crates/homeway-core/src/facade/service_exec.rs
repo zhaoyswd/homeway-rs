@@ -42,17 +42,23 @@ pub struct ServiceConfigJson {
     pub out: String,
 }
 
-/// 服务会话运行态（start 受理后持有；stop 清空）。
+/// 服务会话运行态（start 受理后持有；stop 完成后清槽）。
 struct ServiceRun {
-    session: Mutex<Option<Session>>,
+    /// Arc 形态（M-10②：桥的拨号闭包从锁里**克隆出来**再拨——此前持锁 15s 拨号，
+    /// status() 同锁 ⇒ App 轮询面被同步阻塞）。
+    session: Mutex<Option<Arc<Session>>>,
     bridge: Arc<BridgeHost>,
     /// 会话线程的状态推进面（快照读 + state 写回 ServiceDomain）。
     domain: Arc<ServiceDomain>,
+    /// 受理时刻（starting 形态的 elapsedMs 源——L-11：Go serviceSnapshotJSON 的
+    /// elapsedMs 随 Since 恒在，此前 starting 形态缺）。
+    since: std::time::Instant,
 }
 
 /// 服务会话宿主（App 核单例）。
 pub struct ServiceExec {
-    run: Mutex<Option<Arc<ServiceRun>>>,
+    /// Arc 包一层：会话线程失败时要能清槽（L-11②：failed 后 run 槽未清 ⇒ start 恒 -1）。
+    run: Arc<Mutex<Option<Arc<ServiceRun>>>>,
 }
 
 impl Default for ServiceExec {
@@ -63,7 +69,7 @@ impl Default for ServiceExec {
 
 impl ServiceExec {
     pub fn new() -> Self {
-        ServiceExec { run: Mutex::new(None) }
+        ServiceExec { run: Arc::new(Mutex::new(None)) }
     }
 
     /// ClientCoreServiceStart：rc 契约见 service_op 模块头（0/−1/−2/−3/−4）。
@@ -89,8 +95,7 @@ impl ServiceExec {
         if guard.is_some() {
             // 域门说 Idle/Failed 但运行态还在 = 上次 stop 半途（等收工）——按 -1
             return -1;
-        }
-        // token 解析（同步硬失败：参数面 -3 同源——Go Start 的 json.Unmarshal 后
+        }        // token 解析（同步硬失败：参数面 -3 同源——Go Start 的 json.Unmarshal 后
         // token 装配失败即返回）
         let tk = match token::decode(&cfg.token) {
             Ok(t) => t,
@@ -128,10 +133,13 @@ impl ServiceExec {
             session: Mutex::new(None),
             bridge: Arc::clone(&bridge),
             domain: Arc::clone(domain),
+            since: std::time::Instant::now(),
         });
 
-        // 会话线程（Session::start 阻塞暖机 ~12s——不占调用线程）
+        // 会话线程（Session::start 阻塞暖机 ~12s——不占调用线程；失败时清 run 槽
+        // 〔L-11②：failed 后槽未清 ⇒ 下次 start 恒 -1〕+ 停桥）
         let run2 = Arc::clone(&run);
+        let run_slot = Arc::clone(&self.run);
         let spawn = std::thread::Builder::new().name("homeway-svc".into()).spawn(move || {
             let sess = Session::start(SessionConfig {
                 token: tk,
@@ -145,13 +153,16 @@ impl ServiceExec {
                     // 桥的 dial 闭包拿不到会话句柄（构造在先）——桥 dial 经「运行态取
                     // 会话」由泵侧闭包完成：见下方 dial_via_run（桥重建成本高，改为
                     // 桥持有运行态：这里通过 set_dial 注入）。
-                    *run2.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(s);
+                    *run2.session.lock().unwrap_or_else(|e| e.into_inner()) = Some(Arc::new(s));
                     run2.domain.set_state(ServiceState::Ready);
                     run2.domain.set_reason("");
                 }
                 Err(e) => {
                     run2.domain.set_state(ServiceState::Failed);
                     run2.domain.set_reason(&e.to_string());
+                    // 失败清槽（L-11②）+ 桥收工（受理侧起的桥随失败收掉）
+                    run2.bridge.stop();
+                    *run_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
                 }
             }
         });
@@ -171,34 +182,41 @@ impl ServiceExec {
 
     /// ClientCoreServiceStop：0 已收工 / -1 等待超时（调用方重试；期间 start 恒 -1）。
     /// 顺序 = 桥 → 会话 → （缓存落盘由 Session::stop 内完成）。
+    /// **超时不提前清槽**（评审 r2-M-10①：旧实现超时前已 take ⇒ 第二次 stop 见空槽
+    /// 直接置 Idle 返回 0 ⇒ start 放行 ⇒ 同钥双会话窗口；现 run 槽留到真正收完）。
     pub fn stop(&self, domain: &ServiceDomain) -> i32 {
-        let run = self.run.lock().unwrap_or_else(|e| e.into_inner()).take();
-        let Some(run) = run else {
+        let mut guard = self.run.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(run) = guard.clone() else {
+            drop(guard);
             domain.set_state(ServiceState::Idle);
             return 0; // 本就没在跑
         };
         domain.set_state(ServiceState::Stopping);
         run.bridge.stop();
-        let mut sess = run.session.lock().unwrap_or_else(|e| e.into_inner()).take();
+        // 会话句柄取走（重试 stop 时已取空 ⇒ 跳过；桥停幂等）
+        let sess = run.session.lock().unwrap_or_else(|e| e.into_inner()).take();
         // 有界等待（Go serviceStopWait 的 6s；Session::stop 自身也 join 巡检）
         let deadline = std::time::Instant::now() + Duration::from_secs(6);
         // Session::stop 是同步收尾（join 巡检 ≤6s）——放线程跑并等
         let done = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let d2 = Arc::clone(&done);
         let h = std::thread::spawn(move || {
-            if let Some(s) = sess.as_mut() {
+            if let Some(s) = sess.as_ref() {
                 s.stop();
             }
             d2.store(true, std::sync::atomic::Ordering::Release);
         });
         while !done.load(std::sync::atomic::Ordering::Acquire) {
             if std::time::Instant::now() >= deadline {
-                // 收工超时：状态回 stopping（start 恒 -1 防双持钥）；线程随后自行收尾
+                // 收工超时：run 槽保留 + 域状态停在 stopping（start 恒 -1 防双持钥）；
+                // 线程随后自行收尾——下一次 stop 重入走「会话已取空」路径等它结束
                 return -1;
             }
             std::thread::sleep(Duration::from_millis(50));
         }
         let _ = h.join();
+        *guard = None;
+        drop(guard);
         domain.set_state(ServiceState::Idle);
         domain.set_reason("");
         0
@@ -210,14 +228,21 @@ impl ServiceExec {
         let Some(run) = guard.as_ref() else {
             return crate::status_json::idle_json().to_owned();
         };
-        let sess = run.session.lock().unwrap_or_else(|e| e.into_inner());
-        let Some(s) = sess.as_ref() else {
-            // 会话线程还在装配：starting 形态（域状态的快照面）
+        // 会话句柄**克隆出来**再快照（M-10② 的同款——status 轮询面不被在途拨号/
+        // 收尾持锁阻塞）
+        let sess = run.session.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        let Some(s) = sess else {
+            // 会话线程还在装配：starting 形态（域状态的快照面 + elapsedMs——L-11①：
+            // Go serviceSnapshotJSON 的 elapsedMs 随 Since 恒在）
             let mut m = serde_json::Map::new();
             m.insert("state".into(), serde_json::Value::String(run.domain.state().as_str().into()));
             m.insert(
                 "reason".into(),
                 serde_json::Value::String(run.domain.reason().to_owned()),
+            );
+            m.insert(
+                "elapsedMs".into(),
+                serde_json::Value::from(run.since.elapsed().as_millis() as i64),
             );
             return serde_json::Value::Object(m).to_string();
         };
@@ -236,18 +261,28 @@ impl ServiceExec {
 }
 
 /// 经运行态会话拨出口虚拟端口（服务会话形态的桥 dial：流 id 适配成 BridgeStream）。
+/// 会话句柄从锁里克隆出来再拨（评审 r2-M-10②：此前持 `run.session` 锁做 15s 拨号
+/// ⇒ status() 同锁被同步阻塞——App 轮询面卡住）。
 fn dial_via_run(
     run: &Arc<ServiceRun>,
     port: u16,
     budget: Duration,
 ) -> io::Result<Box<dyn BridgeStream>> {
-    let sess = run.session.lock().unwrap_or_else(|e| e.into_inner());
-    let Some(s) = sess.as_ref() else {
+    let sess = run.session.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let Some(s) = sess else {
         return Err(io::Error::new(io::ErrorKind::NotConnected, "服务会话未就绪"));
     };
     let id = s
         .healing_dial_port(port, budget)
-        .map_err(|e| io::Error::other(e.to_string()))?;
+        .map_err(|e| match e {
+            crate::wgcore::ConnErr::Refused => {
+                io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string())
+            }
+            crate::wgcore::ConnErr::Timeout => {
+                io::Error::new(io::ErrorKind::TimedOut, e.to_string())
+            }
+            other => io::Error::other(other.to_string()),
+        })?;
     let client = s.client();
     Ok(Box::new(SessionStream::shared(client, id)))
 }

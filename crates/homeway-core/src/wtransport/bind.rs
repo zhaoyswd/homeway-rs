@@ -129,6 +129,14 @@ pub struct Bind {
     rx_bytes: u64,
     tx_bytes: u64,
     send_errs: u64,
+    /// 全候选发送统计（拍板①：Go sendTries/sendLocalFails——尝试>0 且全部本地失败
+    /// = 环境性禁发〔挂起 EPERM 全候选皆败；蜂窝下 LAN 候选 ENETUNREACH 但中继发
+    /// 得出去 ⇒ 不算全失败〕，覆盖非采纳〔赛跑〕态下采纳路径粘性信号够不着的盲区）。
+    send_tries: i64,
+    send_local_fails: i64,
+    /// 本地发送错误累计（(采纳路径, 全部)——Go adoptedLocalErrCount/localErrCount）。
+    adopted_local_err_count: u64,
+    local_err_count: u64,
     last_local_send_err: Option<Instant>,
     send_err_log_at: HashMap<SocketAddr, Instant>,
     /// 接收读错误退避（到点前跳过收包；poll 超时参与——持续 POLLERR 不空转）。
@@ -183,6 +191,10 @@ impl Bind {
             rx_bytes: 0,
             tx_bytes: 0,
             send_errs: 0,
+            send_tries: 0,
+            send_local_fails: 0,
+            adopted_local_err_count: 0,
+            local_err_count: 0,
             last_local_send_err: None,
             send_err_log_at: HashMap::new(),
             recv_backoff_until: None,
@@ -239,10 +251,15 @@ impl Bind {
             wire.clear();
             frame::encode_frame(FrameKind::Data, wg, &mut wire);
             let wire = self.tag_relay(self.adopted_is_relay, wire);
+            // 发送统计（拍板①：采纳路径单发 = 一次尝试）
+            self.send_tries += 1;
             match self.sock.send_to(&wire, addr) {
                 Ok(_) => self.tx_bytes += wg.len() as u64, // 成功才计（Go bind.go:644-651）
                 Err(e) => {
                     self.send_errs += 1;
+                    self.send_local_fails += 1;
+                    self.adopted_local_err_count += 1;
+                    self.local_err_count += 1;
                     self.last_local_send_err = Some(Instant::now());
                     self.log_send_err_throttled(addr, &e);
                 }
@@ -288,10 +305,14 @@ impl Bind {
                 continue;
             }
             let wire: Vec<u8> = if c.relay { self.tag_relay(true, frame_bytes.clone()) } else { frame_bytes.clone() };
+            // 发送统计（拍板①：镜像逐候选 = 每候选一次尝试；本地失败逐次累计）
+            self.send_tries += 1;
             match self.sock.send_to(&wire, c.addr) {
                 Ok(_) => {}
                 Err(e) => {
                     self.send_errs += 1;
+                    self.send_local_fails += 1;
+                    self.local_err_count += 1;
                     send_errs.push((c.addr, e));
                 }
             }
@@ -581,6 +602,20 @@ impl Bind {
 
     pub fn rx_tx(&self) -> (u64, u64) {
         (self.rx_bytes, self.tx_bytes)
+    }
+
+    /// 全候选发送统计的待取走累计（拍板①：(尝试数, 本地失败数)——Go sendTries/
+    /// sendLocalFails 的累计面；主线程经差分消费〔swap 语义〕）。计数面 = 采纳路径
+    /// 单发 + 未采纳镜像的逐候选发送（过渡双发/解锁补发的尽力语义不进计数——
+    /// Go FIX-09 同口径）。
+    pub fn send_stats_pending(&self) -> (i64, i64) {
+        (self.send_tries, self.send_local_fails)
+    }
+
+    /// 本地发送错误累计（(采纳路径, 全部)——Go adoptedLocalErrCount/localErrCount；
+    /// tunStatusJSON demand.localErr* 两键源）。
+    pub fn local_err_counters(&self) -> (u64, u64) {
+        (self.adopted_local_err_count, self.local_err_count)
     }
 
     pub fn socket(&self) -> &UdpSocket {

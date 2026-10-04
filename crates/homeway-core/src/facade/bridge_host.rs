@@ -18,7 +18,6 @@
 
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
-use std::os::fd::AsRawFd;
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -82,32 +81,80 @@ pub type DialFn = Box<dyn Fn(u16, Duration) -> std::io::Result<Box<dyn BridgeStr
 /// 但对端 backlog 满时会挂——200ms 内连不上按「有活主人」处理，不误删）。
 const PROBE_BUDGET: Duration = Duration::from_millis(200);
 
-/// 有预算的 UDS 探测/拨号连接（非阻塞 connect + poll(2) 等可写；超时 = TimedOut）。
+/// 有预算的 UDS 探测/拨号连接（评审 r2-M5 整改：**真非阻塞 connect**——
+/// socket(SOCK_NONBLOCK) → connect 返回 EINPROGRESS → poll(2) 等可写 → SO_ERROR
+/// 取连接结果；旧实现先阻塞 `UnixStream::connect` 再设非阻塞，预算完全没覆盖
+/// connect 本身（对端 backlog 满正是要防的形态）。超时 = TimedOut）。
 /// pub(crate)：files/term/speedtest 桥消费方共用（工单④：UDS 拨号加 connect 预算）。
 pub(crate) fn connect_budget(path: &Path, budget: Duration) -> std::io::Result<UnixStream> {
-    let s = UnixStream::connect(path)?;
-    s.set_nonblocking(true)?;
-    let fd = s.as_raw_fd();
-    let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
-    let t = budget.as_millis().clamp(1, i32::MAX as u128) as i32;
-    let r = unsafe { libc::poll(&mut pfd, 1, t) };
-    if r < 0 {
+    use std::os::fd::FromRawFd;
+    // sockaddr_un 组装（路径长度由调用侧的 MAX_UNIX_SOCKET_PATH 预检兜）
+    let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+    addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
+    let bytes = path.as_os_str().as_encoded_bytes();
+    if bytes.len() >= addr.sun_path.len() {
+        return Err(std::io::Error::new(
+            ErrorKind::InvalidInput,
+            "unix socket 路径超长（sun_path 上限）",
+        ));
+    }
+    addr.sun_path[..bytes.len()]
+        .copy_from_slice(unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast(), bytes.len()) });
+    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
+    if fd < 0 {
         return Err(std::io::Error::last_os_error());
     }
-    if r == 0 {
-        return Err(std::io::Error::new(ErrorKind::TimedOut, "探测连接超时"));
-    }
-    // 连接结果经 SO_ERROR 取（POLLERR 也走这里拿真实 errno）
-    let mut err: libc::c_int = 0;
-    let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+    // 非阻塞 + cloexec 经 fcntl（darwin 无 SOCK_NONBLOCK/SOCK_CLOEXEC 类型位——
+    // apple 的 socket() 第二参只认类型；linux/ohos 走 fcntl 同样成立）
     unsafe {
-        if libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_ERROR, &mut err as *mut _ as *mut _, &mut len) != 0 {
-            return Err(std::io::Error::last_os_error());
+        let fl = libc::fcntl(fd, libc::F_GETFL);
+        if fl < 0
+            || libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) < 0
+            || libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0
+        {
+            let e = std::io::Error::last_os_error();
+            libc::close(fd);
+            return Err(e);
         }
     }
-    if err != 0 {
-        return Err(std::io::Error::from_raw_os_error(err));
+    // 出错路径统一关 fd（成功则所有权移交 UnixStream）
+    let r = unsafe { libc::connect(fd, &addr as *const _ as *const libc::sockaddr, std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t) };
+    if r < 0 {
+        let e = std::io::Error::last_os_error();
+        // EINPROGRESS = 非阻塞连接已发起（darwin/linux 同码）；其余（ENOENT/ECONNREFUSED/
+        // EACCES…）是即时结果，直接回
+        if e.raw_os_error() != Some(libc::EINPROGRESS) {
+            unsafe { libc::close(fd) };
+            return Err(e);
+        }
+        let mut pfd = libc::pollfd { fd, events: libc::POLLOUT, revents: 0 };
+        let t = budget.as_millis().clamp(1, i32::MAX as u128) as i32;
+        let pr = unsafe { libc::poll(&mut pfd, 1, t) };
+        if pr < 0 {
+            let pe = std::io::Error::last_os_error();
+            unsafe { libc::close(fd) };
+            return Err(pe);
+        }
+        if pr == 0 {
+            unsafe { libc::close(fd) };
+            return Err(std::io::Error::new(ErrorKind::TimedOut, "探测连接超时"));
+        }
+        // 连接结果经 SO_ERROR 取（POLLERR 也走这里拿真实 errno）
+        let mut err: libc::c_int = 0;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        unsafe {
+            if libc::getsockopt(fd, libc::SOL_SOCKET, libc::SO_ERROR, &mut err as *mut _ as *mut _, &mut len) != 0 {
+                let ge = std::io::Error::last_os_error();
+                libc::close(fd);
+                return Err(ge);
+            }
+        }
+        if err != 0 {
+            unsafe { libc::close(fd) };
+            return Err(std::io::Error::from_raw_os_error(err));
+        }
     }
+    let s = unsafe { UnixStream::from_raw_fd(fd) };
     s.set_nonblocking(false)?;
     Ok(s)
 }
@@ -208,8 +255,9 @@ struct BridgeSock {
     name: &'static str,
     port: u16,
     path: PathBuf,
-    listener: Option<UnixListener>,
     /// bind 出的 socket 文件身份（stop 只删自己的——防误删接管者；(dev, ino)）。
+    /// （评审 r2-L8：listener 恒 None 的死字段已删——监听器由 accept 线程独占持有，
+    /// stop 的收口 = stopped 位 + 100ms 节拍轮询 + 2s 有界等待，不靠关 fd。）
     own: Option<(u64, u64)>,
 }
 
@@ -291,6 +339,8 @@ pub struct BridgeHost {
     /// 返回实现 [`BridgeStream`]——本机 UDS 或经隧道的流 id 适配器〔工单⑤〕）。
     /// 可后换（服务桥的会话句柄在受理线程里才建好——set_dial 换入真拨号面）。
     dial_port: Mutex<DialFn>,
+    /// 拨号预算（缺省 DIAL_TIMEOUT=15s；随 tunConfig.dialMs 热传入——评审 r2-L5）。
+    dial_timeout: Mutex<Duration>,
     inner: Mutex<HostInner>,
     stopped: Arc<AtomicBool>,
     auth_drops: AtomicU64,
@@ -333,6 +383,7 @@ impl BridgeHost {
             dir,
             logf,
             dial_port: Mutex::new(dial_port),
+            dial_timeout: Mutex::new(DIAL_TIMEOUT),
             inner: Mutex::new(HostInner {
                 socks: Vec::new(),
                 token: None,
@@ -355,6 +406,12 @@ impl BridgeHost {
     /// 换拨号面（服务桥形态：构造时给占位，会话建好后换真拨号；幂等替换）。
     pub fn set_dial(&self, f: DialFn) {
         *lock_host(&self.dial_port) = f;
+    }
+
+    /// 换拨号预算（隧道域随 tunConfig.dialMs 传入——Go tunRunner.dialTimeout 同义；
+    /// 评审 r2-L5：dial_ms 此前是死字段）。
+    pub fn set_dial_timeout(&self, d: Duration) {
+        *lock_host(&self.dial_timeout) = d.max(Duration::from_millis(500));
     }
 
     fn live_leave(&self) {
@@ -392,8 +449,8 @@ impl BridgeHost {
             return;
         }
         let mut socks = vec![
-            BridgeSock { name: "files-bridge", port: port::FILES, path: files, listener: None, own: None },
-            BridgeSock { name: "term-bridge", port: term_port(), path: bridge_socket_path(&dir, "term"), listener: None, own: None },
+            BridgeSock { name: "files-bridge", port: port::FILES, path: files, own: None },
+            BridgeSock { name: "term-bridge", port: term_port(), path: bridge_socket_path(&dir, "term"), own: None },
         ];
         let speed_path = bridge_socket_path(&dir, "speedtest");
         if speed_path.as_os_str().len() >= MAX_UNIX_SOCKET_PATH {
@@ -403,7 +460,7 @@ impl BridgeHost {
                 speed_path.as_os_str().len()
             ));
         } else {
-            socks.push(BridgeSock { name: "speed-bridge", port: port::SPEEDTEST, path: speed_path, listener: None, own: None });
+            socks.push(BridgeSock { name: "speed-bridge", port: port::SPEEDTEST, path: speed_path, own: None });
         }
         // 令牌（32B 随机；生成失败宁可不 exposing 桥——鉴权是硬要求，不做明文回退）
         let mut tok = [0u8; 32];
@@ -499,8 +556,11 @@ impl BridgeHost {
             self.live_leave();
             return;
         }
+        // 预算先取（短临界区）——dial_port 的锁在拨号全程持有（换轨窗口里 set_dial
+        // 排队等在途拨号，防半换状态）
+        let budget = *lock_host(&self.dial_timeout);
         let dial = lock_host(&self.dial_port);
-        let r = dial(port, DIAL_TIMEOUT);
+        let r = dial(port, budget);
         drop(dial);
         match r {
             Ok(remote) => {
@@ -564,9 +624,6 @@ impl BridgeHost {
             std::mem::take(&mut inner.socks)
         };
         for s in socks {
-            if let Some(ln) = s.listener {
-                drop(ln);
-            }
             remove_sock_own(&s.path, s.own);
         }
         // accept/conn 线程的有界收口（工单②：在途 handle_conn 持着 gate 票在
@@ -656,11 +713,13 @@ pub fn bridge_client_auth<W: Write>(w: &mut W, auth_hex: &str) -> std::io::Resul
 
 /// 拨出口失败的 refused 类判定（Go wgcore.IsRefusedLike：连接被拒/不可达等
 /// 「对端在网络意义上明确回答了」的形态 = 出口活着、端口没服务）。
+/// **只认 ErrorKind**（评审 r2-M9：隧道内拨号的 Refused 在 healing_dial 已映射成
+/// `ErrorKind::ConnectionRefused` 带过接缝——不再字符串嗅探）。
 fn is_refused_like(e: &std::io::Error) -> bool {
     matches!(
         e.kind(),
         std::io::ErrorKind::ConnectionRefused | std::io::ErrorKind::ConnectionReset
-    ) || e.to_string().contains("refused")
+    )
 }
 
 /// speed 桥的 link_down 拒绝回帧（Go speedLinkDownReply / pkg/speedtest.ReplyThenClose）：
@@ -832,6 +891,43 @@ mod tests {
         }
         assert!(!host.status().auth_hex.is_empty(), "死残留被清理、桥就位");
         host.stop();
+    }
+
+    /// connect_budget（M-5 真非阻塞）：死 socket 路径 = 即时 ConnectionRefused；
+    /// 超长路径 = InvalidInput；活监听 = 连得上。
+    #[test]
+    fn connect_budget_immediate_results() {
+        let dir = tmp_dir("cb");
+        std::fs::create_dir_all(dir.join("bridge")).unwrap();
+        // 活监听
+        let live = dir.join("bridge").join("live.sock");
+        let ln = UnixListener::bind(&live).unwrap();
+        let c = connect_budget(&live, Duration::from_secs(1)).unwrap();
+        drop(c);
+        // 死残留（listener 已关）= ECONNREFUSED 即时回（非超时）
+        let dead = dir.join("bridge").join("dead.sock");
+        UnixListener::bind(&dead).unwrap();
+        drop(std::fs::read_dir(&dir).unwrap().next());
+        drop(ln);
+        // 等 listener 真正关闭后拨：ECONNREFUSED
+        let mut got_refused = false;
+        for _ in 0..20 {
+            if let Err(e) = connect_budget(&dead, Duration::from_secs(1)) {
+                if e.kind() == ErrorKind::ConnectionRefused {
+                    got_refused = true;
+                    break;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(got_refused, "死残留应即时 ConnectionRefused");
+        // 不存在 = NotFound
+        let e = connect_budget(&dir.join("bridge").join("none.sock"), Duration::from_secs(1)).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::NotFound);
+        // 超长路径 = InvalidInput（sun_path 上限）
+        let long = dir.join("x".repeat(200));
+        let e = connect_budget(&long, Duration::from_secs(1)).unwrap_err();
+        assert_eq!(e.kind(), ErrorKind::InvalidInput);
     }
 
     #[test]

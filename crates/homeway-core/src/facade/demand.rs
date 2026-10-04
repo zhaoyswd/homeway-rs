@@ -10,6 +10,19 @@
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+/// [`std::sync::Mutex`] 的锁中毒不 panic 扩展（评审 r2-L3：facade 存量 expect 收敛
+/// ——c-shared 宿主里 panic = 扩展进程死；tun_shared::lock_unpoison 的 trait 化件）。
+trait LockUnpoison<T> {
+    fn lup(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockUnpoison<T> for std::sync::Mutex<T> {
+    fn lup(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+
 /// 扩展下发的亮屏/前台位的新鲜期（> 泵节拍 5s × 若干抖动，<< 巡检 60s×2）。
 pub const ACTIVITY_FRESHNESS: Duration = Duration::from_secs(90);
 
@@ -56,7 +69,7 @@ impl DemandSignals {
 
     /// 记录扩展下发的亮屏/前台诊断位（每拍必发；唤醒拍扩展会立即补一次）。
     pub fn set_activity(&self, fg: bool, screen: bool) {
-        let mut a = self.activity.lock().expect("activity 锁中毒");
+        let mut a = self.activity.lup();
         a.fg = fg;
         a.screen = screen;
         a.pushed_at = Some(Instant::now());
@@ -65,7 +78,7 @@ impl DemandSignals {
     /// （值, 新鲜）。**值 = 亮屏位**（fg 不参与合成）。新鲜 = 距上次推送未超过
     /// `ACTIVITY_FRESHNESS`——挂起空窗后旧值自然过期，唤醒拍扩展先推新值、巡检后评估。
     pub fn activity_signal(&self, now: Instant) -> (bool, bool) {
-        let a = self.activity.lock().expect("activity 锁中毒");
+        let a = self.activity.lup();
         match a.pushed_at {
             None => (false, false),
             Some(at) => (a.screen, now.duration_since(at) < ACTIVITY_FRESHNESS),
@@ -74,12 +87,12 @@ impl DemandSignals {
 
     /// fg 诊断位（demand 段的 fg 键）。
     pub fn fg(&self) -> bool {
-        self.activity.lock().expect("activity 锁中毒").fg
+        self.activity.lup().fg
     }
 
     /// 记录一拍的需求判定（巡检循环每拍调用；下推器不写）。
     pub fn note_demand(&self, active: bool, reason: &str, at_ms: i64) {
-        *self.last.lock().expect("demand 锁中毒") = DemandState {
+        *self.last.lup() = DemandState {
             active,
             reason: reason.to_owned(),
             at_ms,
@@ -87,7 +100,7 @@ impl DemandSignals {
     }
 
     pub fn last(&self) -> DemandState {
-        self.last.lock().expect("demand 锁中毒").clone()
+        self.last.lup().clone()
     }
 
     /// 巡检拍的需求合成：本拍 App 出站包数 ‖ 新鲜的亮屏位。

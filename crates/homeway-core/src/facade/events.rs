@@ -11,6 +11,19 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+/// [`std::sync::Mutex`] 的锁中毒不 panic 扩展（评审 r2-L3：facade 存量 expect 收敛
+/// ——c-shared 宿主里 panic = 扩展进程死；tun_shared::lock_unpoison 的 trait 化件）。
+trait LockUnpoison<T> {
+    fn lup(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockUnpoison<T> for std::sync::Mutex<T> {
+    fn lup(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+
 /// 事件队列上限（状态类事件的高水位——正常每分钟个位数）。
 pub const QUEUE_CAP: usize = 128;
 
@@ -41,29 +54,29 @@ impl EventHub {
 
     /// 入队（非阻塞；队满丢最旧 + drop 计数）。
     pub fn push(&self, ev: CoreEvent) {
-        let mut q = self.queue.lock().expect("事件锁中毒");
+        let mut q = self.queue.lup();
         if q.len() >= QUEUE_CAP {
             q.pop_front();
-            *self.dropped.lock().expect("事件锁中毒") += 1;
+            *self.dropped.lup() += 1;
         }
         q.push_back(ev);
     }
 
     /// 取走全部积压（轮询器每拍调；空拍 = 空 Vec）。
     pub fn drain(&self) -> Vec<CoreEvent> {
-        let mut q = self.queue.lock().expect("事件锁中毒");
+        let mut q = self.queue.lup();
         q.drain(..).collect()
     }
 
     /// 队满丢弃累计（诊断面）。
     pub fn dropped(&self) -> u64 {
-        *self.dropped.lock().expect("事件锁中毒")
+        *self.dropped.lup()
     }
 
     /// 最新状态事件缓存（冷启动快照兜底——`push_state` 时刷新）。
     pub fn push_state(&self, ev: CoreEvent) {
         self.push(ev.clone());
-        let mut latest = self.latest.lock().expect("快照锁中毒");
+        let mut latest = self.latest.lup();
         latest.push(ev);
         if latest.len() > 4 {
             latest.remove(0);
@@ -72,7 +85,7 @@ impl EventHub {
 
     /// 冷启动读（最近几条状态事件）。
     pub fn latest(&self) -> Vec<CoreEvent> {
-        self.latest.lock().expect("快照锁中毒").clone()
+        self.latest.lup().clone()
     }
 }
 

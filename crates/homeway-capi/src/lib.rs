@@ -90,11 +90,13 @@ fn empty_cstr() -> *mut std::os::raw::c_char {
     }
 }
 
-/// panic 边界（工单⑥）：导出体的 catch_unwind 包装。
-fn guard<T>(body: impl FnOnce() -> T + std::panic::UnwindSafe, fallback: T) -> T {
+/// panic 边界（工单⑥）：导出体的 catch_unwind 包装。fallback 是**闭包**（评审
+/// r2-我-3：立即求值形态在成功路径也执行 `empty_cstr()` ⇒ 每次成功调用 malloc(1)
+/// 一个无主堆块——裸指针无 Drop，10 个导出全中；懒求值后只在真 panic 时兜底）。
+fn guard<T>(body: impl FnOnce() -> T + std::panic::UnwindSafe, fallback: impl FnOnce() -> T) -> T {
     match std::panic::catch_unwind(body) {
         Ok(v) => v,
-        Err(_) => fallback,
+        Err(_) => fallback(),
     }
 }
 
@@ -105,7 +107,7 @@ fn guard<T>(body: impl FnOnce() -> T + std::panic::UnwindSafe, fallback: T) -> T
 /// ClientCoreVersion：`tier core %s (%s, c-shared)` 同形。
 #[no_mangle]
 pub extern "C" fn ClientCoreVersion() -> *mut std::os::raw::c_char {
-    guard(|| ret_cstring(&ClientCore::version()), empty_cstr())
+    guard(|| ret_cstring(&ClientCore::version()), empty_cstr)
 }
 
 /// ClientCoreTunPrepare：0 已开始 / -1 忙 / -2 日志打不开 / -3 参数错（含 token 空）。
@@ -113,7 +115,7 @@ pub extern "C" fn ClientCoreVersion() -> *mut std::os::raw::c_char {
 pub extern "C" fn ClientCoreTunPrepare(c_config: *const std::os::raw::c_char) -> std::os::raw::c_int {
     guard(
         || core().tun_prepare(&arg_str(c_config), true),
-        -9,
+        || -9,
     )
 }
 
@@ -122,44 +124,44 @@ pub extern "C" fn ClientCoreTunPrepare(c_config: *const std::os::raw::c_char) ->
 pub extern "C" fn ClientCoreTunAttach(fd: std::os::raw::c_int) -> std::os::raw::c_int {
     guard(
         || core().tun_attach(fd, 0), // mtu 由世代线程从 cfg 读（fd 通道只传 fd）
-        -9,
+        || -9,
     )
 }
 
 /// ClientCoreTunStatus：tunStatusJSON（完整键面）。
 #[no_mangle]
 pub extern "C" fn ClientCoreTunStatus() -> *mut std::os::raw::c_char {
-    guard(|| ret_cstring(&core().tun_status()), empty_cstr())
+    guard(|| ret_cstring(&core().tun_status()), empty_cstr)
 }
 
 /// ClientCoreTunStop：0 已停 / -1 等待超时 / -2 超时后强制放锁。
 #[no_mangle]
 pub extern "C" fn ClientCoreTunStop() -> std::os::raw::c_int {
-    guard(|| core().tun_stop(), -9)
+    guard(|| core().tun_stop(), || -9)
 }
 
 /// ClientCoreTunRecover：恢复阶梯下推（from = 起跑档位 1..=3）。
 #[no_mangle]
 pub extern "C" fn ClientCoreTunRecover(from: std::os::raw::c_int) -> std::os::raw::c_int {
-    guard(|| core().tun_recover(from as i64), -9)
+    guard(|| core().tun_recover(from as i64), || -9)
 }
 
 /// ClientCoreTunSetPortForwards：运行中整表热替换（0/-1/-2）。
 #[no_mangle]
 pub extern "C" fn ClientCoreTunSetPortForwards(c_cfg: *const std::os::raw::c_char) -> std::os::raw::c_int {
-    guard(|| core().tun_set_port_forwards(&arg_str(c_cfg)), -9)
+    guard(|| core().tun_set_port_forwards(&arg_str(c_cfg)), || -9)
 }
 
 /// ClientCoreTunRunning：1 在跑（attached 且健康）/ 0。
 #[no_mangle]
 pub extern "C" fn ClientCoreTunRunning() -> std::os::raw::c_int {
-    guard(|| core().tun_running(), -9)
+    guard(|| core().tun_running(), || -9)
 }
 
 /// ClientCoreTunSetForeground：前台位下发；返回上一状态。
 #[no_mangle]
 pub extern "C" fn ClientCoreTunSetForeground(fg: std::os::raw::c_int) -> std::os::raw::c_int {
-    guard(|| core().tun_set_foreground(fg != 0), -9)
+    guard(|| core().tun_set_foreground(fg != 0), || -9)
 }
 
 /// ClientCoreTunSetActivity：需求信号每拍下发（fg/screen）。
@@ -170,7 +172,7 @@ pub extern "C" fn ClientCoreTunSetActivity(
 ) {
     guard(
         || core().tun_set_activity(fg != 0, screen != 0),
-        (),
+        || (),
     )
 }
 
@@ -179,7 +181,7 @@ pub extern "C" fn ClientCoreTunSetActivity(
 pub extern "C" fn ClientCoreProbeAddr(c_token: *const std::os::raw::c_char) -> *mut std::os::raw::c_char {
     guard(
         || ret_cstring(&core().probe_addr(&arg_str(c_token))),
-        empty_cstr(),
+        empty_cstr,
     )
 }
 
@@ -196,30 +198,59 @@ pub extern "C" fn ClientCoreProbeReach(c_token: *const std::os::raw::c_char) -> 
                 Err(msg) => ret_cstring(&homeway_core::facade::probe_json::probe_reach_err(&msg)),
             }
         },
-        empty_cstr(),
+        empty_cstr,
     )
 }
 
 /// ProbeReach 的探测编排（App 旁路形态：独立 socket、无身份、并发全端点）。
+/// 预算口径（评审 r2-L9 对齐 Go）：**父预算 3.5s**（spec ≤3.5s MUST）——域名解析
+/// 并行（1.5s 子预算；挂死的解析线程超时即弃，不拖父预算）+ 去重（同地址多端点
+/// 只探一次）+ 探测预算 = 父预算余量与 3s 取小。
 fn probe_reach_report(
     token_raw: &str,
 ) -> Result<homeway_core::facade::probe_json::ReachReport, String> {
+    let t0 = std::time::Instant::now();
+    const PARENT: std::time::Duration = std::time::Duration::from_millis(3500);
+    const RESOLVE: std::time::Duration = std::time::Duration::from_millis(1500);
+    const PROBE_MAX: std::time::Duration = std::time::Duration::from_secs(3);
     let raw = token_raw.trim();
     let tok = token::decode(raw).map_err(|e| e.to_string())?;
-    // 端点全集（域名先解析；解析失败该端点静默跳过）
-    let mut targets: Vec<(std::net::SocketAddr, bool)> = Vec::new();
+    // 端点全集（域名先解析——并行、带 1.5s 子预算；解析失败/超时的端点静默跳过）
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<(std::net::SocketAddr, bool)>>();
     for ep in &tok.endpoints {
+        let addr = ep.addr.clone();
         let relay = ep.kind == token::EndpointKind::Relay;
-        if let Ok(addrs) = ep.addr.to_socket_addrs() {
-            for a in addrs {
-                targets.push((a, relay));
+        let tx2 = tx.clone();
+        std::thread::spawn(move || {
+            if let Ok(addrs) = addr.to_socket_addrs() {
+                let _ = tx2.send(addrs.map(|a| (a, relay)).collect());
             }
+        });
+    }
+    drop(tx);
+    let mut targets: Vec<(std::net::SocketAddr, bool)> = Vec::new();
+    let resolve_deadline = t0 + RESOLVE;
+    loop {
+        let left = resolve_deadline.saturating_duration_since(std::time::Instant::now());
+        if left.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(left) {
+            Ok(batch) => targets.extend(batch),
+            Err(_) => break,
         }
     }
+    // 去重（同地址只探一次——域名展开成多地址时避免重复打）
+    targets.sort_by_key(|(a, _)| *a);
+    targets.dedup_by_key(|(a, _)| *a);
     if targets.is_empty() {
         return Err("token 里没有可解析的端点".into());
     }
-    let budget = std::time::Duration::from_secs(3);
+    // 探测预算 = 父预算余量与 3s 取小（spec：整轮 ≤3.5s MUST）
+    let budget = PARENT.saturating_sub(t0.elapsed()).min(PROBE_MAX);
+    if budget.is_zero() {
+        return Err("端点解析耗尽预算".into());
+    }
     let results: Vec<homeway_core::facade::probe_json::ReachEntry> = std::thread::scope(|s| {
         let handles: Vec<_> = targets
             .iter()
@@ -267,19 +298,19 @@ fn probe_reach_report(
 /// ClientCoreServiceStart：服务会话（App 进程内、无 TUN 的 WG 会话 + 三座桥）。
 #[no_mangle]
 pub extern "C" fn ClientCoreServiceStart(c_config: *const std::os::raw::c_char) -> std::os::raw::c_int {
-    guard(|| core().service_start(&arg_str(c_config)), -9)
+    guard(|| core().service_start(&arg_str(c_config)), || -9)
 }
 
 /// ClientCoreServiceStop：0 已收工 / -1 等待超时（重试）。
 #[no_mangle]
 pub extern "C" fn ClientCoreServiceStop() -> std::os::raw::c_int {
-    guard(|| core().service_stop(), -9)
+    guard(|| core().service_stop(), || -9)
 }
 
 /// ClientCoreServiceStatus：状态 JSON + bridge 四键。
 #[no_mangle]
 pub extern "C" fn ClientCoreServiceStatus() -> *mut std::os::raw::c_char {
-    guard(|| ret_cstring(&core().service_status()), empty_cstr())
+    guard(|| ret_cstring(&core().service_status()), empty_cstr)
 }
 
 /// ClientCoreFilesCall：文件管理单导出（操作名分发）。
@@ -287,7 +318,7 @@ pub extern "C" fn ClientCoreServiceStatus() -> *mut std::os::raw::c_char {
 pub extern "C" fn ClientCoreFilesCall(c_op: *const std::os::raw::c_char) -> *mut std::os::raw::c_char {
     guard(
         || ret_cstring(&core().files_call(&arg_str(c_op))),
-        empty_cstr(),
+        empty_cstr,
     )
 }
 
@@ -296,7 +327,7 @@ pub extern "C" fn ClientCoreFilesCall(c_op: *const std::os::raw::c_char) -> *mut
 pub extern "C" fn ClientCoreTermCall(c_op: *const std::os::raw::c_char) -> *mut std::os::raw::c_char {
     guard(
         || ret_cstring(&core().term_call(&arg_str(c_op))),
-        empty_cstr(),
+        empty_cstr,
     )
 }
 
@@ -306,20 +337,20 @@ pub extern "C" fn ClientCoreTermCall(c_op: *const std::os::raw::c_char) -> *mut 
 pub extern "C" fn ClientCoreSpeedTestStart(c_params: *const std::os::raw::c_char) -> *mut std::os::raw::c_char {
     guard(
         || ret_cstring(&speed().start(&arg_str(c_params))),
-        empty_cstr(),
+        empty_cstr,
     )
 }
 
 /// ClientCoreSpeedTestStatus：轮询快照（250ms 面经 NAPI async 壳）。
 #[no_mangle]
 pub extern "C" fn ClientCoreSpeedTestStatus() -> *mut std::os::raw::c_char {
-    guard(|| ret_cstring(&speed().status()), empty_cstr())
+    guard(|| ret_cstring(&speed().status()), empty_cstr)
 }
 
 /// ClientCoreSpeedTestCancel：取消在途轮（即时返回 ok；轮以 cancelled 收场）。
 #[no_mangle]
 pub extern "C" fn ClientCoreSpeedTestCancel() -> *mut std::os::raw::c_char {
-    guard(|| ret_cstring(&speed().cancel()), empty_cstr())
+    guard(|| ret_cstring(&speed().cancel()), empty_cstr)
 }
 
 /// 进程内自检位（测试/诊断面——非导出契约；防「未消费」告警的显式标记）。

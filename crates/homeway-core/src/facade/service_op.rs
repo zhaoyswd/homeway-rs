@@ -13,6 +13,19 @@
 
 use serde_json::Value;
 
+/// [`std::sync::Mutex`] 的锁中毒不 panic 扩展（评审 r2-L3：facade 存量 expect 收敛
+/// ——c-shared 宿主里 panic = 扩展进程死；tun_shared::lock_unpoison 的 trait 化件）。
+trait LockUnpoison<T> {
+    fn lup(&self) -> std::sync::MutexGuard<'_, T>;
+}
+
+impl<T> LockUnpoison<T> for std::sync::Mutex<T> {
+    fn lup(&self) -> std::sync::MutexGuard<'_, T> {
+        self.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
+
 /// 服务域状态（rc 门的载体；Session/桥接线在 service_exec）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ServiceState {
@@ -65,7 +78,7 @@ impl ServiceDomain {
 
     /// 7d 装配：挂状态 JSON 产出面（真 Session 的 snapshot → status_json）。
     pub fn set_snapshot_json(&self, f: Option<Box<dyn Fn() -> String + Send>>) {
-        *self.snapshot_json.lock().expect("服务快照锁中毒") = f;
+        *self.snapshot_json.lup() = f;
     }
 
     /// ClientCoreServiceStart（rc 契约见模块头）。
@@ -78,7 +91,7 @@ impl ServiceDomain {
         if v.get("token").and_then(Value::as_str).unwrap_or("").is_empty() {
             return -4;
         }
-        let mut st = self.state.lock().expect("服务状态锁中毒");
+        let mut st = self.state.lup();
         match *st {
             ServiceState::Starting | ServiceState::Ready => 0, // 幂等
             ServiceState::Stopping => -1,                      // 上一个还在收工
@@ -92,7 +105,7 @@ impl ServiceDomain {
 
     /// ClientCoreServiceStop（rc 契约见模块头）。
     pub fn stop(&self) -> i32 {
-        let mut st = self.state.lock().expect("服务状态锁中毒");
+        let mut st = self.state.lup();
         match *st {
             ServiceState::Idle => 0, // 本就没在跑
             // 7d 接真收工（桥 → 会话 → 端点缓存落盘的顺序 + ≤6s 等待）；当前直收
@@ -106,7 +119,7 @@ impl ServiceDomain {
 
     /// ClientCoreServiceStatus（无实例 = `{"state":"idle"}` 逐字节短路）。
     pub fn status_json(&self) -> String {
-        if let Some(f) = self.snapshot_json.lock().expect("服务快照锁中毒").as_ref() {
+        if let Some(f) = self.snapshot_json.lup().as_ref() {
             return f();
         }
         crate::status_json::idle_json().to_owned()
@@ -114,21 +127,21 @@ impl ServiceDomain {
 
     /// 状态位直写（Session 状态机推进用 + 测试）。
     pub fn set_state(&self, s: ServiceState) {
-        *self.state.lock().expect("服务状态锁中毒") = s;
+        *self.state.lup() = s;
     }
 
     /// 当前状态位（ServiceExec 的 rc 门/状态面共享读取）。
     pub fn state(&self) -> ServiceState {
-        *self.state.lock().expect("服务状态锁中毒")
+        *self.state.lup()
     }
 
     /// 失败原因（状态 JSON 的 reason 源；装配失败/会话线程失败时写）。
     pub fn set_reason(&self, r: &str) {
-        self.reason.lock().expect("服务原因锁中毒").clone_from(&r.to_owned());
+        self.reason.lup().clone_from(&r.to_owned());
     }
 
     pub fn reason(&self) -> String {
-        self.reason.lock().expect("服务原因锁中毒").clone()
+        self.reason.lup().clone()
     }
 }
 

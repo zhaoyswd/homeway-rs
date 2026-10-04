@@ -104,6 +104,17 @@ pub enum SpeedtestError {
     Frame(String),
     #[error("服务端报告错误：{0}")]
     Report(String),
+    /// 出口测速服务并发满员（服务端 report 的 error=busy——评审 r2-M8/M-9：类型化，
+    /// 归因不再走字符串嗅探 contains("满员")）。
+    #[error("出口测速服务并发满员，请稍后再试")]
+    Busy,
+    /// 链路正在恢复（服务端 report 的 error=link_down——同上类型化）。
+    #[error("链路正在恢复")]
+    LinkDown,
+    /// 用户取消（评审 r2-M8：取消此前被归因成 interrupted——REASON_CANCELLED 死
+    /// 常量、tier「已取消」分支不可达；类型化后 reason 面直达）。
+    #[error("已取消")]
+    Cancelled,
     #[error("参数非法：{0}")]
     InvalidArg(String),
     /// 出口没有测速服务（首帧前 EOF/复位——Go :625-643 的 not_supported 判据）。
@@ -119,15 +130,10 @@ impl SpeedtestError {
     /// 归因码（App 短因分派面；Go Result.Reason 同串）。
     pub fn reason(&self) -> &'static str {
         match self {
-            SpeedtestError::Report(m) => {
-                if m.contains("满员") {
-                    REASON_BUSY
-                } else if m.contains("链路正在恢复") {
-                    REASON_LINK_DOWN
-                } else {
-                    REASON_INTERRUPTED
-                }
-            }
+            SpeedtestError::Busy => REASON_BUSY,
+            SpeedtestError::LinkDown => REASON_LINK_DOWN,
+            SpeedtestError::Cancelled => REASON_CANCELLED,
+            SpeedtestError::Report(_) => REASON_INTERRUPTED,
             SpeedtestError::NotSupported => REASON_NOT_SUPPORTED,
             SpeedtestError::Frame(_) => REASON_INTERRUPTED,
             SpeedtestError::Conn(ConnErr::Timeout) => REASON_TIMEOUT,
@@ -485,8 +491,8 @@ pub fn parse_report(payload: &[u8]) -> Result<Report, SpeedtestError> {
     }
     if let Some(e) = error {
         return Err(match e.as_str() {
-            "busy" => SpeedtestError::Report("出口测速服务并发满员，请稍后再试".into()),
-            "link_down" => SpeedtestError::Report("链路正在恢复".into()),
+            "busy" => SpeedtestError::Busy,
+            "link_down" => SpeedtestError::LinkDown,
             other => SpeedtestError::Report(other.to_owned()),
         });
     }
@@ -504,6 +510,42 @@ impl Drop for ConnGuard {
         let conns = self.conns.lock().expect("连接表锁中毒").clone();
         for c in conns {
             c.kill();
+        }
+    }
+}
+
+/// 引擎进度出口（评审 r2-M7：SpeedHost 的 live/dir 数据源——相位切换 + 字节累计
+/// 的原子面；status 侧按轮询间隔差分算 instBps）。phase：0=无 1=down 2=up。
+#[derive(Debug, Default)]
+pub struct LiveProgress {
+    phase: std::sync::atomic::AtomicU8,
+    bytes: std::sync::atomic::AtomicI64,
+}
+
+impl LiveProgress {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    fn set_phase(&self, p: u8) {
+        self.phase.store(p, std::sync::atomic::Ordering::Release);
+    }
+
+    fn add_bytes(&self, n: i64) {
+        self.bytes.fetch_add(n, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn reset(&self) {
+        self.phase.store(0, std::sync::atomic::Ordering::Release);
+        self.bytes.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// (phase, 累计字节)——status 面消费；phase 词面 "down"/"up"/None。
+    pub fn snapshot(&self) -> (Option<&'static str>, i64) {
+        match self.phase.load(std::sync::atomic::Ordering::Acquire) {
+            1 => (Some("down"), self.bytes.load(std::sync::atomic::Ordering::Relaxed)),
+            2 => (Some("up"), self.bytes.load(std::sync::atomic::Ordering::Relaxed)),
+            _ => (None, 0),
         }
     }
 }
@@ -554,27 +596,32 @@ pub fn run(
     params: Params,
     logf: &dyn Fn(&str),
 ) -> Result<SpeedtestResult, SpeedtestError> {
-    // CLI 形态：拨号闭包 = ClientConn（每流一连接，直连引擎）
+    // CLI 形态：拨号闭包 = ClientConn（每流一连接，直连引擎）；无进度出口消费方
     let dial = || -> Result<std::sync::Arc<dyn SpeedConn>, SpeedtestError> {
         let id = client
             .connect(SocketAddrV4::new(crate::wgcore::SERVER_TUNNEL_IP, SPEEDTEST_PORT))
             .map_err(SpeedtestError::Conn)?;
         Ok(std::sync::Arc::new(ClientConn { client: std::sync::Arc::clone(client), id }))
     };
-    run_dial(&dial, params, logf, None)
+    run_dial(&dial, params, logf, None, None)
 }
 
 /// App/CLI 双入口的引擎主体（拨号闭包形态——Go speed.Start(ctx, dial, params) 同构；
 /// 工单⑤ speedtest 接桥：App 形态的 dial = 本机测速桥〔UDS + 鉴权首包〕）。
 /// `cancel`：外部取消位（Cancel 导出面置位 → 看门狗分片轮询发现 → kill 全部连接，
 /// 本轮以 `cancelled` 收场——Go 的 cancel 关连接同义）。
+/// `live`：进度出口（M-7：相位切换 + 字节累计——SpeedHost 的 Status 面消费）。
 pub fn run_dial(
     dial: &dyn Fn() -> Result<std::sync::Arc<dyn SpeedConn>, SpeedtestError>,
     params: Params,
     logf: &dyn Fn(&str),
     cancel: Option<&std::sync::atomic::AtomicBool>,
+    live: Option<&std::sync::Arc<LiveProgress>>,
 ) -> Result<SpeedtestResult, SpeedtestError> {
     let p = params.normalized().map_err(SpeedtestError::InvalidArg)?;
+    if let Some(l) = live {
+        l.reset();
+    }
     let conns = std::sync::Arc::new(std::sync::Mutex::new(Vec::<std::sync::Arc<dyn SpeedConn>>::new()));
     let _guard = ConnGuard { conns: std::sync::Arc::clone(&conns) };
     let (wd_tx, wd_rx) = std::sync::mpsc::channel::<()>();
@@ -588,20 +635,26 @@ pub fn run_dial(
         scope.spawn(move || {
             watchdog_cancellable(wd_conns, budget, wd_rx, wd_flag, wd_cancelled, cancel)
         });
-        run_phases(dial, &p, logf, &conns)
+        run_phases(dial, &p, logf, &conns, cancel, live)
     });
     let _ = wd_tx.send(()); // 看门狗收工（scope 已 join 线程，此处只解阻塞 recv）
     // M24：看门狗触发（预算烧满）时，读/泵线程带出的连接级错误统一归因 timeout
     //（窗口没跑完 = 链路死/服务端卡，不是 interrupted）。Report/InvalidArg/NotSupported
-    // 等服务端语义错误不改写。外部取消优先归因 cancelled（在 timeout 检查之前）。
+    // 等服务端语义错误不改写。外部取消优先归因 cancelled（评审 r2-M8：类型化——
+    // 取消直达 REASON_CANCELLED，不再落 interrupted）。
     if cancelled.load(std::sync::atomic::Ordering::Acquire) {
         if let Err(e) = &body {
             if matches!(
                 e,
                 SpeedtestError::Conn(_) | SpeedtestError::Frame(_) | SpeedtestError::Bridge(_, _)
             ) {
-                return Err(SpeedtestError::Report("已取消".into()));
+                return Err(SpeedtestError::Cancelled);
             }
+        }
+    }
+    if body.is_err() {
+        if let Some(l) = live {
+            l.reset();
         }
     }
     if timed_out.load(std::sync::atomic::Ordering::Acquire) {
@@ -624,6 +677,8 @@ fn run_phases(
     p: &Params,
     logf: &dyn Fn(&str),
     conns: &std::sync::Arc<std::sync::Mutex<Vec<std::sync::Arc<dyn SpeedConn>>>>,
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+    live: Option<&std::sync::Arc<LiveProgress>>,
 ) -> Result<SpeedtestResult, SpeedtestError> {
     let t0 = Instant::now();
     logf(&format!(
@@ -632,13 +687,22 @@ fn run_phases(
         crate::go_fmt::fmt_duration_go_ms(p.warmup),
         crate::go_fmt::fmt_duration_go_ms(p.down)
     ));
+    // 评审 r2-M8：拨号间隙查取消位（在途单次拨号自带 ≤10s 预算兜底；Go 用 ctx
+    // 即刻打断——差值是「取消生效点延到拨号预算边界」，登记）
+    let cancel_hit = || cancel.is_some_and(|c| c.load(std::sync::atomic::Ordering::Acquire));
 
     // ---- 下行：拨齐全部连接 → 统一发请求（各流窗口对齐，design D3）----
     let mut down_conns = Vec::with_capacity(p.streams);
     for _ in 0..p.streams {
+        if cancel_hit() {
+            return Err(SpeedtestError::Cancelled);
+        }
         let c = dial()?;
         conns.lock().expect("连接表锁中毒").push(std::sync::Arc::clone(&c));
         down_conns.push(c);
+    }
+    if let Some(l) = live {
+        l.set_phase(1); // down
     }
     let mut w = Frame::new();
     for c in &down_conns {
@@ -652,10 +716,12 @@ fn run_phases(
     let mut srv_bytes: i64 = 0;
     let mut srv_warm: i64 = 0;
     let down_join: Result<(), SpeedtestError> = std::thread::scope(|s| {
+        let live2 = live.cloned();
         let handles: Vec<_> = down_conns
             .iter()
             .map(|c| {
                 let c = std::sync::Arc::clone(c);
+                let live2 = live2.clone();
                 s.spawn(move || -> Result<(i64, i64, i64, i64), SpeedtestError> {
                     let (mut got, mut used) = (0i64, 0i64);
                     let (sb, sw): (i64, i64);
@@ -681,6 +747,9 @@ fn run_phases(
                         match fin {
                             FrameIn::Data { payload_len } => {
                                 let now = Instant::now();
+                                if let Some(l) = live2.as_ref() {
+                                    l.add_bytes(payload_len as i64);
+                                }
                                 if now >= window_start && now < window_start + p.down {
                                     got += payload_len as i64;
                                 } else {
@@ -725,9 +794,15 @@ fn run_phases(
     // ---- 上行：新连接（每流一角色不复用）；每流一线程泵送 ----
     let mut up_conns = Vec::with_capacity(p.streams);
     for _ in 0..p.streams {
+        if cancel_hit() {
+            return Err(SpeedtestError::Cancelled);
+        }
         let c = dial()?;
         conns.lock().expect("连接表锁中毒").push(std::sync::Arc::clone(&c));
         up_conns.push(c);
+    }
+    if let Some(l) = live {
+        l.set_phase(2); // up（相位切换点——字节计数器连续累计）
     }
     for c in &up_conns {
         let payload = request_payload("send", p.warmup.as_millis() as u64, p.up.as_millis() as u64);
@@ -737,16 +812,18 @@ fn run_phases(
     let mut up_usage: i64 = 0;
     let mut wall_sum: i64 = 0;
     let up_join: Result<(), SpeedtestError> = std::thread::scope(|s| {
+        let live2 = live.cloned();
         let handles: Vec<_> = up_conns
             .iter()
             .map(|c| {
                 let c = std::sync::Arc::clone(c);
+                let live2 = live2.clone();
                 s.spawn(move || -> Result<(i64, i64, i64), SpeedtestError> {
                     let mut f = Frame::new();
                     // 预热泵 → START → 窗口泵 → FINISH → report（接收端报数）
-                    let warm = pump(c.as_ref(), &mut f, p.warmup)?;
+                    let warm = pump(c.as_ref(), &mut f, p.warmup, live2.as_deref())?;
                     c.write_frame(f.control(TYPE_START, &[]))?;
-                    let win = pump(c.as_ref(), &mut f, p.up)?;
+                    let win = pump(c.as_ref(), &mut f, p.up, live2.as_deref())?;
                     c.write_frame(f.control(TYPE_FINISH, &[]))?;
                     let (used, bytes, wall) = {
                         let mut fr = FrameReader::new();
@@ -807,7 +884,12 @@ fn run_phases(
 
 /// 泵一段 data（250ms 分片节奏——Go PumpDataChunk 形态：分片边界 = live 字节更新点
 /// 与取消检查点；整帧单次写全；返回本段 payload 字节数）。
-fn pump(conn: &dyn SpeedConn, f: &mut Frame, dur: Duration) -> Result<i64, SpeedtestError> {
+fn pump(
+    conn: &dyn SpeedConn,
+    f: &mut Frame,
+    dur: Duration,
+    live: Option<&LiveProgress>,
+) -> Result<i64, SpeedtestError> {
     const SLICE: Duration = Duration::from_millis(250);
     let deadline = Instant::now() + dur;
     let mut total: i64 = 0;
@@ -817,8 +899,11 @@ fn pump(conn: &dyn SpeedConn, f: &mut Frame, dur: Duration) -> Result<i64, Speed
             conn.write_frame(f.data(BLOCK)?)?;
             total += BLOCK as i64;
         }
-        // 分片边界：live 字节与取消检查点（客户端当前无外部取消面——conn 关闭由
-        // 看门狗负责；此处保留节拍形态与 Go 对齐）
+        // 分片边界：live 字节与取消检查点（conn 关闭由看门狗负责——分片节拍保留
+        // Go 的 PumpDataChunk 形态）
+        if let Some(l) = live {
+            l.add_bytes(total);
+        }
     }
     Ok(total)
 }
@@ -894,14 +979,35 @@ mod tests {
         assert_eq!(n, Params::default(), "零值取默认");
     }
 
+    /// LiveProgress（M-7）：相位切换 + 字节累计的原子面——Status 面的数据源。
+    #[test]
+    fn live_progress_phase_and_bytes() {
+        let l = LiveProgress::new();
+        assert_eq!(l.snapshot(), (None, 0));
+        l.set_phase(1);
+        l.add_bytes(100);
+        l.add_bytes(23);
+        assert_eq!(l.snapshot(), (Some("down"), 123));
+        l.set_phase(2);
+        l.add_bytes(1);
+        assert_eq!(l.snapshot(), (Some("up"), 124));
+        l.reset();
+        assert_eq!(l.snapshot(), (None, 0));
+    }
+
     #[test]
     fn report_parse_and_error_mapping() {
         let r = parse_report(br#"{"bytes":123,"warmup_bytes":45,"wall_ms":678}"#).unwrap();
         assert_eq!((r.bytes, r.warmup_bytes, r.wall_ms), (123, 45, 678));
+        // 评审 r2-M8/M-9：busy/link_down 类型化（归因不再字符串嗅探）
         let r = parse_report(br#"{"bytes":0,"warmup_bytes":0,"wall_ms":0,"error":"busy"}"#);
-        assert!(matches!(r, Err(SpeedtestError::Report(m)) if m.contains("满员")));
+        assert!(matches!(r, Err(SpeedtestError::Busy)), "busy 类型化：{r:?}");
+        assert_eq!(r.unwrap_err().reason(), REASON_BUSY);
         let r = parse_report(br#"{"bytes":1,"warmup_bytes":0,"wall_ms":9,"error":"link_down"}"#);
-        assert!(matches!(r, Err(SpeedtestError::Report(m)) if m.contains("链路")));
+        assert!(matches!(r, Err(SpeedtestError::LinkDown)), "link_down 类型化：{r:?}");
+        assert_eq!(r.unwrap_err().reason(), REASON_LINK_DOWN);
+        // 取消归因可达（评审 r2-M8：REASON_CANCELLED 此前是死常量）
+        assert_eq!(SpeedtestError::Cancelled.reason(), REASON_CANCELLED);
     }
 
     #[test]
