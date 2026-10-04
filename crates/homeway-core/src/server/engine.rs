@@ -269,6 +269,7 @@ impl ServeEngine {
                 dns: dns_proxy,
                 dns_events,
                 dns_resolve_port: if dns_enabled { cfg.dns_port } else { 0 },
+                tx_shape: intercept::tx_shape_default(),
                 logf: Arc::clone(&dlogf),
             },
             Arc::clone(&itc_stats),
@@ -715,7 +716,7 @@ fn driver_loop(
     let mut revoked_mtime = std::fs::metadata(&revoked_path).and_then(|m| m.modified()).ok();
     let mut last_dns_stats = Instant::now();
     let mut last_tx_stats = Instant::now();
-    let mut last_tx_stats_snap = (0u64, 0u64, 0usize, 0u64);
+    let mut last_tx_stats_snap = (0u64, 0u64, 0usize, 0u64, [0u64; 13]);
     let mut last_tx_bytes = 0u64;
     let mut out = InboundOut::default();
     let mut stop = false;
@@ -849,17 +850,27 @@ fn driver_loop(
                 let dbytes = txb - last_tx_bytes;
                 let avg = dpkgs as f64 / dcalls as f64;
                 let bpp = (dbytes as f64 / dpkgs.max(1) as f64) as u64;
+                // 批分布直方图紧凑打印（R8-3 8i；非零桶）：桶 i 的上界 = 2^(i+1) 包。
+                let hist: Vec<String> = s
+                    .4
+                    .iter()
+                    .enumerate()
+                    .filter(|(_, c)| **c > 0)
+                    .map(|(i, c)| format!("≤{}:{}", 1usize << (i + 1), c))
+                    .collect();
                 if s.3 > last_tx_stats_snap.3 {
                     (dlogf)(&format!(
-                        "serve: UDP 出站 调用+{dcalls} 均批{avg:.1}包/调用 单调用最大{}包 均包{bpp}B 累计丢弃{}包（+{}）",
+                        "serve: UDP 出站 调用+{dcalls} 均批{avg:.1}包/调用 单调用最大{}包 均包{bpp}B 累计丢弃{}包（+{}） 批分布[{}]",
                         s.2,
                         s.3,
-                        s.3 - last_tx_stats_snap.3
+                        s.3 - last_tx_stats_snap.3,
+                        hist.join(" ")
                     ));
                 } else {
                     (dlogf)(&format!(
-                        "serve: UDP 出站 调用+{dcalls} 均批{avg:.1}包/调用 单调用最大{}包 均包{bpp}B",
-                        s.2
+                        "serve: UDP 出站 调用+{dcalls} 均批{avg:.1}包/调用 单调用最大{}包 均包{bpp}B 批分布[{}]",
+                        s.2,
+                        hist.join(" ")
                     ));
                 }
             }

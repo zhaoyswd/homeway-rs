@@ -123,9 +123,16 @@ pub struct ServerBind {
     tx_calls: u64,
     tx_pkgs: u64,
     tx_batch_max: usize,
+    /// 批量出站**批分布直方图**（R8-3 8i 插桩）：log2 桶——`tx_hist[i]` = 本观察窗
+    /// 批大小 ∈ (2^i, 2^(i+1)] 的调用数（i=0 即批恰 1 包）。窗语义（消费即清零，
+    /// 与 tx_batch_max 同拍）——「修复前 ≤2379 包倾泻 → 修复后 ≤128 包主导」的
+    /// 直方图对比面（PERF-AB §9.3 修复前基线：均批 36-442，单调用峰值 2379）。
+    tx_hist: [u64; Self::TX_HIST_BUCKETS],
 }
 
 impl ServerBind {
+    /// 直方图桶数（1,2,4,…,4096 共 13 档；>4096 并入末桶——修复后不应出现）。
+    const TX_HIST_BUCKETS: usize = 13;
     /// 监听固定端口（被占退让 +1…+9 → 随机；Go listenWithFallback 同序）。
     /// 返回 Err = 全失败（出口起不来——占端口硬失败，R0.6 评审 M13 同口径）。
     pub fn open(port: u16, build: &str, logf: crate::Logf) -> io::Result<Self> {
@@ -201,6 +208,7 @@ impl ServerBind {
             tx_calls: 0,
             tx_pkgs: 0,
             tx_batch_max: 0,
+            tx_hist: [0; Self::TX_HIST_BUCKETS],
         })
     }
 
@@ -643,6 +651,10 @@ impl ServerBind {
         self.tx_calls += 1;
         self.tx_pkgs += self.tx_lens.len() as u64;
         self.tx_batch_max = self.tx_batch_max.max(self.tx_lens.len());
+        // 批分布直方图（R8-3 8i）：log2 桶（n=1 → 桶 0；floor(log2(n)) 截末桶）。
+        let idx = (usize::BITS as usize - 1 - self.tx_lens.len().leading_zeros() as usize)
+            .min(Self::TX_HIST_BUCKETS - 1);
+        self.tx_hist[idx] += 1;
         // 注：msgs 为本函数局建（OutMsg 借 staging——自引用结构不能做成字段）；
         // 每次调用一次 Vec 分配（相对每包一次 frame_bytes 分配已是数量级改善）。
         // 记账按「成功前缀」（send_batch 顺序发送，短返只发前缀；Linux sendmmsg
@@ -676,13 +688,15 @@ impl ServerBind {
         self.sock.as_raw_fd()
     }
 
-    /// 批量出站形态快照（R8-2 归因插桩）：(调用数, 累计包数, **本窗**单调用峰值
-    /// 包数, 累计丢弃包数)——均批 = pkgs/calls。峰值消费即清零（窗口语义）；计数
-    /// 累计（丢弃计数恒累计——失败面的单调观测）。
-    pub(crate) fn tx_batch_stats(&mut self) -> (u64, u64, usize, u64) {
+    /// 批量出站形态快照（R8-2 归因插桩 + R8-3 直方图）：(调用数, 累计包数, **本窗**
+    /// 单调用峰值包数, 累计丢弃包数, **本窗**批分布直方图)——均批 = pkgs/calls。峰值
+    /// 与直方图消费即清零（窗口语义）；计数累计（丢弃计数恒累计——失败面的单调观测）。
+    pub(crate) fn tx_batch_stats(&mut self) -> (u64, u64, usize, u64, [u64; Self::TX_HIST_BUCKETS]) {
         let m = self.tx_batch_max;
+        let h = self.tx_hist;
         self.tx_batch_max = 0;
-        (self.tx_calls, self.tx_pkgs, m, self.tx_dropped)
+        self.tx_hist = [0; Self::TX_HIST_BUCKETS];
+        (self.tx_calls, self.tx_pkgs, m, self.tx_dropped, h)
     }
 
     /// 从本 socket 直接发裸载荷（STUN 请求等 3e 面；SendRawTo 同义——与数据面同端口）。

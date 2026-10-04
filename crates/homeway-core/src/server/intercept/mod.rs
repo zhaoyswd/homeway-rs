@@ -66,6 +66,85 @@ const SYN_CACHE_MAX: usize = 4;
 /// 拨号失败降噪键（kind + 原始目的；源端点不进键——见 dial_fail_seen 注释）。
 type DialFailKey = (&'static str, (Ipv4Addr, u16));
 
+// ---------- 出口发送整形（R8-3 8i；设计 = docs/reviews/R8.md §九） ----------
+//
+// 归因背景（PERF-AB §9）：Rust 出口单 poll 把拦截栈排空的 ≤2379 包（≈3.1MB）一次
+// 倾泻上线——团块在接收端/空口成组丢失（冷 WiFi 电源态尤甚，§9.5 同步悬崖）。本整形
+// = **字节令牌桶 + 下拍续传**：pump 尾把本拍产物并入滞留 FIFO，按令牌从头释放；余量
+// 留给后续 pump 拍（驱动线程每拍必调——poll 5ms 上界 + ACK 到达即醒；5ms 续水
+// 320KB ≥ 2×突发额度 ⇒ 桶不会连续两拍枯竭）。只削峰不平率：稳态到达 < 速率时令牌
+// 常满、零延迟直通；平均率仍由 ACK 时钟（栈内 CUBIC）决定——整形器不注入流量，
+// 滞留深度 ≤ Σcwnd（TCP 在途记账自钳制），**不设显式上限**（上限 = 整形器丢包 =
+// 伪修复禁区）。
+
+/// 整形速率默认 64 MiB/s：真机层 0 天花板 94MB/s 的 0.68×，验收带 40-45MB/s 之上
+/// 留 ≥40% 余量（`HOMEWAY_TX_RATE_MBPS` 覆盖）。
+pub const TX_SHAPE_RATE: u64 = 64 * 1024 * 1024;
+/// 突发额度默认 160 KiB = 128 × MTU1280（满包口径「≤128 包」，§9.7 建议带下沿；
+/// `HOMEWAY_TX_BURST_KB` 覆盖）。
+pub const TX_SHAPE_BURST: usize = 160 * 1024;
+
+/// 出口发送整形参数（字节令牌桶）。
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct TxShape {
+    /// 续水速率（B/s）。
+    pub rate: u64,
+    /// 突发额度 = 令牌容量（B）：任意窗口 w 内线上深度 ≤ burst + rate·w。
+    pub burst: usize,
+}
+
+/// 产品默认整形参数（env 读取；`HOMEWAY_TX_SHAPING` 设非空值且非 `on` 时关——
+/// 消融臂 presence 语义与 HOMEWAY_UDP_NO_BATCH 同惯例：`off`/`0`/任意非 `on`
+/// 值都视为关，唯一豁免词 `on` 用于显式开启）。`HOMEWAY_TX_RATE_MBPS` /
+/// `HOMEWAY_TX_BURST_KB` 覆盖对应参数（非法值静默回落默认）。
+pub(crate) fn tx_shape_default() -> Option<TxShape> {
+    match std::env::var("HOMEWAY_TX_SHAPING").as_deref() {
+        Ok(v) if v != "on" => return None, // 消融臂：off/0/… = 关
+        _ => {}
+    }
+    let mut shape = TxShape { rate: TX_SHAPE_RATE, burst: TX_SHAPE_BURST };
+    if let Ok(v) = std::env::var("HOMEWAY_TX_RATE_MBPS") {
+        if let Ok(n) = v.trim().parse::<u64>() {
+            if n > 0 {
+                shape.rate = n * 1024 * 1024;
+            }
+        }
+    }
+    if let Ok(v) = std::env::var("HOMEWAY_TX_BURST_KB") {
+        if let Ok(n) = v.trim().parse::<usize>() {
+            if n > 0 {
+                shape.burst = n * 1024;
+            }
+        }
+    }
+    Some(shape)
+}
+
+/// 令牌桶释放的一拍（纯函数面——单测可注入时间）：`produce` 并入 `deferred` 尾部
+/// （FIFO 保序），先按 `dt` 续水（容量 = burst），再从头释放 credit 覆盖得住的包。
+/// 返回 (本拍释放, 余 credit)。大于 burst 的包防御性直通（内层 IP 恒 ≤ 64KB <
+/// 默认 burst；防极小 burst 配置把队列头部卡死）。
+fn shape_slice(
+    deferred: &mut std::collections::VecDeque<Vec<u8>>,
+    produce: Vec<Vec<u8>>,
+    mut credit: f64,
+    shape: TxShape,
+    dt: f64,
+) -> (Vec<Vec<u8>>, f64) {
+    deferred.extend(produce);
+    credit = (credit + shape.rate as f64 * dt).min(shape.burst as f64);
+    let mut out = Vec::with_capacity(deferred.len());
+    while let Some(front) = deferred.front() {
+        let fl = front.len() as f64;
+        if credit < fl && fl <= shape.burst as f64 {
+            break;
+        }
+        credit -= fl;
+        out.push(deferred.pop_front().expect("front 已判"));
+    }
+    (out, credit)
+}
+
 // 「真丢包」检测与发送塑形的历史注记（R6.6 应用层 CC 垫片，R8-8a 随 smoltcp
 // 0.11→0.14 迁移**整体退役**）：拥塞控制/重传退避/零窗探测现由栈内
 // `CongestionControl::Cubic`（RFC 合规）承担——cwnd 门、pacing、seq 回退检测、
@@ -133,6 +212,9 @@ pub struct Config {
     pub dns_events: Option<std::sync::mpsc::Receiver<DnsReply>>,
     /// 客户端远程解析腿端口（隧道 IP:<它> TCP；0 = 不建该面）。
     pub dns_resolve_port: u16,
+    /// 出口发送整形（R8-3 8i）：None = 关（消融臂/单测直通面），Some = 字节令牌桶
+    /// 参数。产品装配面由 `tx_shape_default()`（env 消融臂）填充。
+    pub tx_shape: Option<TxShape>,
     pub logf: Logf,
 }
 
@@ -217,6 +299,17 @@ pub struct Interceptor {
     served_ports: std::collections::HashSet<u16>,
     /// 出站明文包队列（TX 反重写后待 encap——pump 返回给引擎）。
     tx_out: Vec<Vec<u8>>,
+    // ---- 发送整形（R8-3 8i；驱动线程独占——与 tx_out 同生命周期） ----
+    /// 滞留队列（令牌不够时的未释放出站包，FIFO 保序；深度 ≤ Σcwnd 自钳制）。
+    tx_deferred: std::collections::VecDeque<Vec<u8>>,
+    /// 当前令牌余量（B）。
+    tx_credit: f64,
+    /// 上次续水时刻。
+    tx_last_refill: Instant,
+    /// 本观察窗释放包数（cc_stats_line 5s 消费清零——窗语义）。
+    tx_win_released: u64,
+    /// 本观察窗滞留深度峰值 (包, B)（同窗消费清零）。
+    tx_win_defer_peak: (usize, usize),
     /// DNS 的隧道栈内监听面（:53 UDP/TCP + 解析腿 TCP；dns 开才建）。
     dns_faces: Option<DnsFaces>,
     /// DNS worker 应答回投通道（pump 拍内 drain）。
@@ -253,11 +346,21 @@ impl Interceptor {
             .add_default_ipv4_route(Ipv4Address::new(100, 64, 255, 254))
             .expect("路由表默认空");
         let (pool, events) = WorkerPool::spawn(8);
+        // E5 判据行 + 整形状态段（R8-3 8i：on = 参数；off = 消融臂词面）
+        let shape_note = match cfg.tx_shape {
+            Some(s) => format!(
+                "；发送整形=开（rate={}MiB/s burst={}KiB）",
+                s.rate / (1024 * 1024),
+                s.burst / 1024
+            ),
+            None => "；发送整形=关（HOMEWAY_TX_SHAPING 消融臂或单测直通面）".to_owned(),
+        };
         (cfg.logf)(&format!(
-            "intercept: 过境拦截就绪（隧道IP {}；豁免=转投本机同端口；TCP 并发上限 {}）",
-            cfg.tunnel_ip, MAX_CONNS
+            "intercept: 过境拦截就绪（隧道IP {}；豁免=转投本机同端口；TCP 并发上限 {}{}）",
+            cfg.tunnel_ip, MAX_CONNS, shape_note
         ));
         let dns_rx = cfg.dns_events.take();
+        let tx_credit0 = cfg.tx_shape.map(|s| s.burst as f64).unwrap_or(0.0);
         Self {
             cfg,
             stats,
@@ -274,6 +377,11 @@ impl Interceptor {
             halted: false,
             served_ports: std::collections::HashSet::new(),
             tx_out: Vec::new(),
+            tx_deferred: std::collections::VecDeque::new(),
+            tx_credit: tx_credit0,
+            tx_last_refill: Instant::now(),
+            tx_win_released: 0,
+            tx_win_defer_peak: (0, 0),
             dns_faces: None,
             dns_rx,
             udp_seq: 0,
@@ -746,7 +854,30 @@ impl Interceptor {
         for pkt in raw {
             self.on_tx(pkt);
         }
-        std::mem::take(&mut self.tx_out)
+        // ⑥ 发送整形（R8-3 8i）：本拍产物并入滞留 FIFO，按字节令牌桶从头释放——
+        // 余量下拍续传（驱动线程每拍必调本函数）。None = 关臂直通（行为与
+        // 整形前逐字节等价）。
+        match self.cfg.tx_shape {
+            None => std::mem::take(&mut self.tx_out),
+            Some(shape) => {
+                let now = Instant::now();
+                let dt = now.duration_since(self.tx_last_refill).as_secs_f64();
+                self.tx_last_refill = now;
+                let produce = std::mem::take(&mut self.tx_out);
+                let n_defer = self.tx_deferred.len() + produce.len();
+                let b_defer = self.tx_deferred.iter().map(|p| p.len()).sum::<usize>()
+                    + produce.iter().map(|p| p.len()).sum::<usize>();
+                self.tx_win_defer_peak = (
+                    self.tx_win_defer_peak.0.max(n_defer),
+                    self.tx_win_defer_peak.1.max(b_defer),
+                );
+                let (out, credit) =
+                    shape_slice(&mut self.tx_deferred, produce, self.tx_credit, shape, dt);
+                self.tx_credit = credit;
+                self.tx_win_released += out.len() as u64;
+                out
+            }
+        }
     }
 
     /// 栈内 TCP socket 的 CC 算法（R8-2 归因插桩）：`crate::cc_choice()` 的默认
@@ -795,9 +926,26 @@ impl Interceptor {
             }
         }
         if let Some((sq, backlog)) = busiest {
+            // 整形观测段（R8-3 8i）：滞留当前/峰值（窗语义——打印即清零）+ 本窗释放
+            // 包数。判别面 = 峰值不再出现千包级团块（修复前单拍 ≤2379 包）。
+            let shape_note = if self.cfg.tx_shape.is_some() {
+                let cur = self.tx_deferred.len();
+                let cur_b = self.tx_deferred.iter().map(|p| p.len()).sum::<usize>();
+                let peak = self.tx_win_defer_peak;
+                let rel = self.tx_win_released;
+                self.tx_win_defer_peak = (0, 0);
+                self.tx_win_released = 0;
+                format!(
+                    " 整形滞留={cur}包/{}KB 峰值={}包/{}KB 窗释={rel}",
+                    cur_b / 1024,
+                    peak.0,
+                    peak.1 / 1024
+                )
+            } else {
+                String::new()
+            };
             (self.cfg.logf)(&format!(
-                "intercept: cc 活跃TCP={active} 最大流 txq={}B backlog={}B（smoltcp 0.14 CUBIC）",
-                sq, backlog
+                "intercept: cc 活跃TCP={active} 最大流 txq={sq}B backlog={backlog}B（smoltcp 0.14 CUBIC）{shape_note}"
             ));
         }
     }
@@ -1450,6 +1598,13 @@ mod tests {
         Arc::new(|_| {})
     }
 
+    /// harness 臂的产品默认整形参数（与 `tx_shape_default()` 无 env 覆盖时同值——
+    /// 直接引常量保测试确定性：CI 环境变量不参与）。
+    const PRODUCT_SHAPE: Option<TxShape> = Some(TxShape {
+        rate: TX_SHAPE_RATE,
+        burst: TX_SHAPE_BURST,
+    });
+
     fn cfg_base(tunnel_ip: Ipv4Addr) -> Config {
         Config {
             tunnel_ip,
@@ -1457,6 +1612,9 @@ mod tests {
             dns: None,
             dns_events: None,
             dns_resolve_port: 0,
+            // 功能单测直通面（整形关闭——pump 在紧循环里跑无墙钟间隔，令牌不续水；
+            // 整形行为面在 shape_slice 单测 + 受控 harness 臂）。
+            tx_shape: None,
             logf: noop_logf(),
         }
     }
@@ -1650,6 +1808,7 @@ mod tests {
             dns: Some(std::sync::Arc::clone(&proxy)),
             dns_events: Some(events),
             dns_resolve_port: 5300,
+            tx_shape: None,
             logf: noop_logf(),
         };
         let mut itc = Interceptor::attach(cfg, Arc::clone(&stats));
@@ -1797,6 +1956,7 @@ mod tests {
             dns: Some(std::sync::Arc::clone(&proxy)),
             dns_events: Some(events),
             dns_resolve_port: 5300,
+            tx_shape: None,
             logf: noop_logf(),
         };
         let mut itc = Interceptor::attach(cfg, Arc::clone(&stats));
@@ -1983,10 +2143,16 @@ mod tests {
             16 * 1024 * 1024,
             DirLink::passthrough(),
             DirLink::passthrough(),
+            None, // 天花板臂：无损透传 + 整形关——量的是机器能力，不掺整形开销
         );
         let ceiling = bytes as f64 / secs / (1024.0 * 1024.0);
-        let (secs, bytes, down, tail) =
-            run_shaped_download(1, 64 * 1024 * 1024, DirLink::deep(), DirLink::deep());
+        let (secs, bytes, down, tail) = run_shaped_download(
+            1,
+            64 * 1024 * 1024,
+            DirLink::deep(),
+            DirLink::deep(),
+            PRODUCT_SHAPE,
+        );
         let got = bytes as f64 / secs / (1024.0 * 1024.0);
         let tail = tail.expect("64MB 深队列臂实测 >2s（爬坡即 >1.5s）——尾窗必在");
         println!(
@@ -2012,10 +2178,16 @@ mod tests {
             3 * 1024 * 1024,
             DirLink::passthrough(),
             DirLink::passthrough(),
+            None, // 同上：天花板臂
         );
         let ceiling6 = bytes as f64 / secs / (1024.0 * 1024.0);
-        let (secs, bytes, down6, _) =
-            run_shaped_download(6, 8 * 1024 * 1024, DirLink::deep(), DirLink::deep());
+        let (secs, bytes, down6, _) = run_shaped_download(
+            6,
+            8 * 1024 * 1024,
+            DirLink::deep(),
+            DirLink::deep(),
+            PRODUCT_SHAPE,
+        );
         let got6 = bytes as f64 / secs / (1024.0 * 1024.0);
         println!(
             "A 并发 6 流：无损天花板 {ceiling6:.1}MB/s → 深队列有损 {got6:.1}MB/s（丢 {} 包 / 峰值队列 {}B）",
@@ -2040,17 +2212,169 @@ mod tests {
         // 3.2 vs 门 3.2 红；闲机 3.2-3.4、旧垫片 8.1）——R8-1 F5 的「自校准分母」
         // 整改挂 R8-3（再动阈值需对照跑先行，8f 已备数据）；引用本臂数字一律带
         // 负载状态（闲机/负载）。
-        let (secs, bytes, downb, _) =
-            run_shaped_download(1, 8 * 1024 * 1024, DirLink::shallow(), DirLink::shallow());
+        let (secs, bytes, downb, _) = run_shaped_download(
+            1,
+            8 * 1024 * 1024,
+            DirLink::shallow(),
+            DirLink::shallow(),
+            PRODUCT_SHAPE,
+        );
         let gotb = bytes as f64 / secs / (1024.0 * 1024.0);
         println!(
-            "B 浅队列单流：{gotb:.1}MB/s（丢 {} 包 / 峰值队列 {}B；修复前真代码 0.4MB/s）",
+            "B 浅队列单流（整形 on）：{gotb:.1}MB/s（丢 {} 包 / 峰值队列 {}B；整形前真代码 3.2MB/s 带状 / 塌陷基线 0.4MB/s）",
             downb.dropped, downb.peak_queue
         );
+        // R8-3 F5/F18 重标定（r1-F18 两轮复现负载下 0 余量红——旧绝对门 3.2 与实测
+        // 带重合）。**为什么不用 A 臂同款自校准分母**：本臂的稳态带不随天花板走——
+        // 实测（8f/R8-3 同带）整形前后都钉在 ~3.2-3.4MB/s（此值由 harness 接收端
+        // ACK 时钟形态决定——smoltcp 每 poll 至多一个 ACK 的稀疏时钟 + 浅队列小窗
+        // 均衡，与链路 24/天花板 25-66 无关：R8-3 实测 A 臂天花板 25.3/65.8 时本臂
+        // 仍 3.4）。天花板派生分母会把门耦合到机器负载而带不动——正是 F18 假红的
+        // 根因形态。**取而代之：绝对门 = 健康带与塌陷基线的几何中点** sqrt(3.3×0.4)
+        // ≈ 1.2（8f 数据：现行 CUBIC 带 3.2 / 旧垫片 8.1 / 塌陷基线 0.4）——两侧各
+        // 留 ≥2.7×/3× 余量：负载把带压半（1.6）仍 1.3× 过门；CC 关/pacing 丢失类
+        // 塌陷（0.4）仍 3× 红差。引用本臂数据一律带负载状态（闲机/负载）。
+        const B_ARM_GATE_MB: f64 = 1.2;
         assert!(
-            gotb >= 8.0 * 0.4,
-            "浅队列压力形态吞吐 {gotb:.1}MB/s 应 ≥ 修复前实测 0.4MB/s 的 8 倍（塌陷回归）"
+            gotb >= B_ARM_GATE_MB,
+            "浅队列压力形态吞吐 {gotb:.1}MB/s 应 ≥ {B_ARM_GATE_MB}MB/s（健康带 3.2-3.4 与塌陷基线 0.4 的几何中点门——两侧 ≥2.7× 判别余量；塌陷回归）"
         );
+    }
+
+    /// 令牌桶释放的机制单测（R8-3 8i；纯函数面——时间注入，不依赖墙钟）：
+    /// ① 突发额度截断本拍释放深度；② 续水后下拍续传（FIFO 保序）；③ dt=0 时
+    /// 零续水（紧循环不放大）；④ 大于 burst 的包防御性直通（防极小 burst 死锁）。
+    #[test]
+    fn shape_slice_budget_and_continuation() {
+        let shape = TxShape { rate: 1000, burst: 3000 };
+        let mut deferred = std::collections::VecDeque::new();
+        // 5×1000B 倾泻，dt=0（紧拍）：只放 3（额度 3000）
+        let (out, credit) = shape_slice(&mut deferred, vec![vec![0u8; 1000]; 5], 3000.0, shape, 0.0);
+        assert_eq!(out.len(), 3, "突发额度 3000B 截断本拍释放");
+        assert_eq!(deferred.len(), 2, "余量滞留");
+        assert!(credit < 1000.0);
+        // dt=1s：续水 1000（cap 3000，余 credit）→ 放 1
+        let (out, credit) = shape_slice(&mut deferred, vec![], credit, shape, 1.0);
+        assert_eq!(out.len(), 1, "下拍续传一包（续水 1000B）");
+        assert_eq!(deferred.len(), 1);
+        // 空闲 60s：令牌回满 → 余量全放
+        let (out, _) = shape_slice(&mut deferred, vec![], credit, shape, 60.0);
+        assert_eq!(out.len(), 1, "空闲后桶满，滞留清空");
+        assert!(deferred.is_empty());
+        // 保序：1..=6 依次入，分两拍释放，并起来仍是 1..=6
+        let mut deferred = std::collections::VecDeque::new();
+        let pkts: Vec<Vec<u8>> = (1..=6u8).map(|i| vec![i; 1000]).collect();
+        let (mut out1, credit) = shape_slice(&mut deferred, pkts, 3000.0, shape, 0.0);
+        let (mut out2, _) = shape_slice(&mut deferred, vec![], credit, shape, 60.0);
+        out1.append(&mut out2);
+        let seq: Vec<u8> = out1.iter().map(|p| p[0]).collect();
+        assert_eq!(seq, vec![1, 2, 3, 4, 5, 6], "FIFO 释放保序");
+        // 极小 burst 配置：大于 burst 的包直通（不死锁）
+        let tiny = TxShape { rate: 1000, burst: 100 };
+        let mut deferred = std::collections::VecDeque::new();
+        let (out, _) = shape_slice(&mut deferred, vec![vec![7u8; 500]], 100.0, tiny, 0.0);
+        assert_eq!(out.len(), 1, "大于 burst 的包防御性直通");
+        assert!(deferred.is_empty());
+    }
+
+    /// 冷空口形态验证（R8-3 8i）。**模型表达力边界（实测 2026-10-05，入册）**：
+    /// 本 harness 的泵节奏（500µs/拍）把拦截栈每拍的窗口开度钳在 ~24KB（ACK 按
+    /// 拍到达、每拍至多释放拍内 ACK 腾出的窗）⇒ 单拍倾泻天然 ≤~190KB——**再现不了
+    /// 真机出口的 3.1MB 级团块**（真源 = 驱动线程 5ms poll 停等 + ACK 批量腾窗 +
+    /// worker backlog 补写的复合形态）。因此 on/off 同臂同速（15.1 vs 15.1，到达口
+    /// 零星丢包两臂同量级）——**因果判别不可在本模型内成立**（任务预案：「若模型
+    /// 表达不了冷悬崖，用真机验证补」⇒ 8j 矩阵冷连形态 + 真机 HOMEWAY_TX_SHAPING
+    /// 消融臂为裁决面）。本测试保模型的可达面判别：
+    /// ① 10ms 到达额度臂（空口容忍充分——0 到达丢失）= 本链路可达速率自校准分母；
+    /// ② 冷形态臂（1.2× 产品突发额度）整形 on：吞吐 ≥ 可达速率 50% 且到达丢失
+    ///    有界（≤ 万分之一——整形把线上团块钳在产品突发内，不触空口冷预算）；
+    /// ③ off 臂数据行（不设门——记录「模型内无分离」这个事实本身）。
+    #[test]
+    #[ignore = "性能 harness：跑真墙钟 ~15-20s（三臂 64MB @ 冷链路），验证时 cargo test -- --ignored 显式跑"]
+    fn cold_air_form_verification() {
+        // ① 可达速率臂：空口容忍充分（10ms 额度）——整形 on，量「这条冷链路+本机」
+        //    无到达丢失形态下跑得到的速率（BDP≈1.25MB > FLOW_TX_BUF 1MB ⇒ 实测
+        //    受窗口约束 ~10-15MB/s，分母取实测量而非 48——同轮自校准）
+        let (secs, bytes, down, _) = run_shaped_download(
+            1,
+            64 * 1024 * 1024,
+            DirLink::cold_with(10 * 48 * 1024 * 1024 / 1000),
+            DirLink::cold_with(10 * 48 * 1024 * 1024 / 1000),
+            PRODUCT_SHAPE,
+        );
+        let reach = bytes as f64 / secs / (1024.0 * 1024.0);
+        println!(
+            "冷空口 可达臂（10ms 额度，整形 on）：{reach:.1}MB/s（到达口丢 {} / 队列丢 {}）",
+            down.air_dropped, down.dropped
+        );
+        assert_eq!(down.air_dropped, 0, "可达臂不应有到达丢失（额度 ≫ 线上团块）");
+        // ② 冷形态臂：1.2× 产品突发额度（192KiB）
+        let (secs, bytes, down, tail) = run_shaped_download(
+            1,
+            64 * 1024 * 1024,
+            DirLink::cold(),
+            DirLink::cold(),
+            PRODUCT_SHAPE,
+        );
+        let got = bytes as f64 / secs / (1024.0 * 1024.0);
+        let total_pkgs = (bytes / 1300).max(1);
+        println!(
+            "冷空口 冷形态臂（192KiB 额度，整形 on）：{got:.1}MB/s（到达口丢 {} / 队列丢 {}；可达 {reach:.1}）",
+            down.air_dropped, down.dropped
+        );
+        assert!(
+            got >= reach * 0.5,
+            "冷形态臂 {got:.1}MB/s 应 ≥ 可达速率 {reach:.1}MB/s 的 50%（整形下团块不触冷预算——无塌陷）"
+        );
+        assert!(
+            down.air_dropped as f64 <= total_pkgs as f64 / 10000.0,
+            "到达丢失 {} 包应 ≤ 万分之一（整形把线上团块钳在产品突发 160KiB < 额度 192KiB）",
+            down.air_dropped
+        );
+        // 尾窗门（与 A 臂同款——拦前段达标尾段塌陷）
+        if let Some(tail) = tail {
+            assert!(
+                tail >= got * 0.5,
+                "冷形态臂尾窗 {tail:.1}MB/s 应 ≥ 均值 {got:.1}MB/s 的 50%"
+            );
+        }
+        // ③ off 臂：数据行（无门——见头注「模型表达力边界」）
+        let (secs, bytes, down, _) = run_shaped_download(
+            1,
+            64 * 1024 * 1024,
+            DirLink::cold(),
+            DirLink::cold(),
+            None,
+        );
+        let got_off = bytes as f64 / secs / (1024.0 * 1024.0);
+        println!(
+            "冷空口 off 臂（192KiB 额度，整形 off——数据行）：{got_off:.1}MB/s（到达口丢 {} / 队列丢 {}）",
+            down.air_dropped, down.dropped
+        );
+    }
+
+    /// F2 burst 敏感性矩阵（评审 §五 F2 登记项——「整形参数即该矩阵实践面」的数据
+    /// 面；诊断打印、不设门）：冷空口到达额度扫 {1,2,5,10}ms×48MiB/s =
+    /// {48,96,240,480}KiB，产品整形 on——观察额度低于产品突发额度（160KiB）时的
+    /// 劣化拐点。产出表入册 PERF-AB §9（R8-3 终版）。
+    #[test]
+    #[ignore = "性能 harness：跑真墙钟 ~6-10s（4 臂各 16MB 量级），验证时 cargo test -- --ignored 显式跑"]
+    fn cold_air_burst_allowance_matrix() {
+        for ms in [1u64, 2, 5, 10] {
+            let allowance = (48 * 1024 * 1024usize / 1000) * (ms as usize);
+            let (secs, bytes, down, _) = run_shaped_download(
+                1,
+                16 * 1024 * 1024,
+                DirLink::cold_with(allowance),
+                DirLink::cold_with(allowance),
+                PRODUCT_SHAPE,
+            );
+            let got = bytes as f64 / secs / (1024.0 * 1024.0);
+            println!(
+                "F2 矩阵：到达额度 {ms}ms（{allowance}B，产品突发 160KiB）→ {got:.1}MB/s（到达口丢 {} / 队列丢 {}）",
+                down.air_dropped, down.dropped
+            );
+        }
     }
 
     /// 单向链路模型：有限 FIFO 队列（超额即丢）+ 速率出队 + 固定传播时延——
@@ -2075,6 +2399,13 @@ mod tests {
         flying: Vec<(Instant, Vec<u8>)>,
         dropped: u64,
         peak_queue: usize,
+        // ---- 冷空口形态（R8-3 8i；§9.5 悬崖机制的模型化） ----
+        /// 到达侧冷预算 (突发额度 B, 当前 credit, 上次续水)：Some = 启用。瞬时到达
+        /// 超过「额度 + rate×经过时间」的部分在**到达口**丢弃（先于队列判满——deep
+        /// 队列也丢；物理面对应 WiFi 电源态未热时空口对团块的成组丢失，与队列容量
+        /// 无关）。`air_dropped` 单独计数。
+        cold: Option<(usize, f64, Instant)>,
+        air_dropped: u64,
     }
 
     impl DirLink {
@@ -2091,6 +2422,20 @@ mod tests {
         fn shallow() -> Self {
             Self::new(192 * 1024, 24 * 1024 * 1024, Duration::from_millis(13))
         }
+        /// 冷电源态形态（R8-3 8i）：48MiB/s 空口 + 1MB 队列（bufferbloat 深度——
+        /// 队列本身不构成瓶颈）+ **到达侧**冷预算 192KiB = 产品突发额度 160KiB 的
+        /// 1.2×（模型假设：空口容忍数百 µs 级团块、不容忍 ms 级团块——即修复论点；
+        /// 该假设的真机裁决 = 8j 矩阵冷连形态）。F2 burst 矩阵臂经 `cold_with` 扫
+        /// 额度。
+        fn cold() -> Self {
+            Self::cold_with(192 * 1024)
+        }
+        /// 冷形态 + 自定到达额度（F2 burst 敏感性矩阵 {1,2,5,10}ms×rate 用）。
+        fn cold_with(allowance: usize) -> Self {
+            let mut l = Self::new(1024 * 1024, 48 * 1024 * 1024, Duration::from_millis(13));
+            l.cold = Some((allowance, allowance as f64, Instant::now()));
+            l
+        }
         fn new(cap: usize, rate: usize, delay: Duration) -> Self {
             Self {
                 queue: Default::default(),
@@ -2104,9 +2449,23 @@ mod tests {
                 flying: Vec::new(),
                 dropped: 0,
                 peak_queue: 0,
+                cold: None,
+                air_dropped: 0,
             }
         }
         fn send(&mut self, pkt: Vec<u8>) {
+            // 到达口冷预算：先于队列判满（团块敌意与队列容量无关——见 cold 字段注记）
+            if let Some((allow, credit, last)) = &mut self.cold {
+                let now = Instant::now();
+                let dt = now.duration_since(*last).as_secs_f64();
+                *last = now;
+                *credit = (*credit + self.rate as f64 * dt).min(*allow as f64);
+                if pkt.len() as f64 > *credit {
+                    self.air_dropped += 1;
+                    return;
+                }
+                *credit -= pkt.len() as f64;
+            }
             if self.queued + pkt.len() > self.cap {
                 self.dropped += 1;
                 return;
@@ -2163,6 +2522,7 @@ mod tests {
         bytes_each: usize,
         mut up: DirLink,
         mut down: DirLink,
+        tx_shape: Option<TxShape>,
     ) -> (f64, usize, DirLink, Option<f64>) {
         // origin：回环 TCP，每连接写满 bytes_each 后 shutdown 写半边
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -2206,7 +2566,9 @@ mod tests {
 
         let tunnel = Ipv4Addr::new(100, 64, 255, 1);
         let stats = Arc::new(Stats::default());
-        let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::clone(&stats));
+        let mut cfg = cfg_base(tunnel);
+        cfg.tx_shape = tx_shape; // 产品臂 = Some(默认参数)；消融臂 = None（harness 自控，不经 env）
+        let mut itc = Interceptor::attach(cfg, Arc::clone(&stats));
         let mut clients = Vec::new();
         for i in 0..n_flows {
             let mut s = StackB::new(
