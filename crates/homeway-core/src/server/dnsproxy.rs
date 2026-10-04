@@ -738,13 +738,19 @@ fn resolve_udp_addr(addr: &str) -> Option<SocketAddr> {
 }
 
 /// 构造自验证查询（随机 ID + 一次性域名，避免命中任何缓存）。
+/// 头部**完整 12 字节**（ID/flags/QD + 置零的 AN/NS/AR——Go selfCheckQuery 的
+/// `make([]byte, 12)` 同形态）：R6.5 E2E 抓出过 5 字节残头的直译 bug——名字错位到
+/// offset 12 之后，自检恒 malformed=1 且「自验证无应答」误报（真代答不受影响）。
 fn self_check_query() -> Vec<u8> {
     let mut id = [0u8; 2];
     getrandom::getrandom(&mut id).ok();
-    let mut q = Vec::with_capacity(40);
+    let mut q = Vec::with_capacity(47);
     q.extend_from_slice(&id);
-    q.push(0x01); // RD
+    q.extend_from_slice(&[0x01, 0x00]); // flags：RD
     q.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    q.extend_from_slice(&0u16.to_be_bytes()); // ANCOUNT
+    q.extend_from_slice(&0u16.to_be_bytes()); // NSCOUNT
+    q.extend_from_slice(&0u16.to_be_bytes()); // ARCOUNT
     for label in ["selfcheck", "dns", "homeway", "invalid"] {
         q.push(label.len() as u8);
         q.extend_from_slice(label.as_bytes());
@@ -976,6 +982,75 @@ mod tests {
         // 计数：q=1（只有 submit_udp 计；answer_sync = Go Answer() 直调口径不计 q）
         assert!(proxy.stats_line().contains("q=1"), "stats: {}", proxy.stats_line());
         assert!(proxy.stats_line().contains("resp=2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 自检查询构造（R6.6 P1-① 回归钉）：完整 12 字节头 + qtype 可解析——
+    /// 残头形态（5 字节）会让 qtype() 把名字当头解析 → 恒 malformed、自检恒误报。
+    #[test]
+    fn self_check_query_shape() {
+        let q = self_check_query();
+        assert_eq!(q.len(), 47, "12 头 + 31 名字 + 4 尾");
+        assert_eq!(qtype(&q), Some(1), "A 查询应可解析出 qtype");
+        assert_eq!(u16::from_be_bytes([q[4], q[5]]), 1, "QDCOUNT=1");
+        assert_eq!(&q[6..12], &[0u8; 6], "AN/NS/AR 全零");
+        assert_eq!(empty_response(&q).map(|r| r.len()), Some(47), "可回显 question");
+    }
+
+    /// 自检链路真跑（R6.6 P1-①）：fake 上游 → self_check 过 + 不产 malformed；
+    /// 上游全死 → SERVFAIL 报错（Go TestSelfCheckFailsWhenAllDead 对齐）。
+    #[test]
+    fn self_check_passes_with_upstream_and_fails_when_dead() {
+        let up = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let up_addr = format!("127.0.0.1:{}", up.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            loop {
+                let Ok((n, from)) = up.recv_from(&mut buf) else { return };
+                let mut r = a_response("selfcheck.dns.homeway.invalid.", 0, 10, &[0x7f00_0001]);
+                let id = u16::from_be_bytes([buf[0], buf[1]]);
+                r[0..2].copy_from_slice(&id.to_be_bytes());
+                r[12..12 + (n - 12)].copy_from_slice(&buf[12..n]);
+                let _ = up.send_to(&r, from);
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("homeway-rs-dnssc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("resolv.conf"), format!("nameserver {up_addr}\n")).unwrap();
+        let (logf, dlogf) = noop();
+        let (proxy, _events) = DnsProxy::spawn(
+            DnsConfig {
+                resolv_path: dir.join("resolv.conf").to_string_lossy().into_owned(),
+                fallback_dns: up_addr.clone(), // 兜底也指 fake（防真实外联）
+                ..Default::default()
+            },
+            logf,
+            dlogf,
+        );
+        assert!(proxy.self_check().is_ok(), "上游活着时自检应通过");
+        assert!(
+            !proxy.stats_line().contains("malformed=1"),
+            "自检不应产 malformed：{}",
+            proxy.stats_line()
+        );
+
+        // 上游全死（含兜底）：自检必须报错（老 bug 形态 = 恒「无应答」误报，
+        // 修复后死上游报 SERVFAIL、活上游报 Ok——两种结局都真实反映链路）
+        let dead_dir = dir.join("dead");
+        std::fs::create_dir_all(&dead_dir).unwrap();
+        std::fs::write(dead_dir.join("resolv.conf"), "nameserver 127.0.0.1:1\n").unwrap();
+        let (proxy2, _events2) = DnsProxy::spawn(
+            DnsConfig {
+                resolv_path: dead_dir.join("resolv.conf").to_string_lossy().into_owned(),
+                fallback_dns: "127.0.0.1:1".to_owned(), // 兜底也死（防真实外联 223.5.5.5）
+                budget: Duration::from_millis(300),
+                ..Default::default()
+            },
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+        );
+        let err = proxy2.self_check().expect_err("全死上游应报错");
+        assert!(err.contains("SERVFAIL"), "死上游报 SERVFAIL：{err}");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
