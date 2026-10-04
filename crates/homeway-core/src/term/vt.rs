@@ -24,6 +24,7 @@ use alacritty_terminal::vte::ansi::{
     self as alac_ansi, Color as AlacColor, CursorShape as AlacCursorShape, NamedColor,
 };
 
+use super::keyenc;
 use super::responder;
 
 /// 回滚行数上限默认值（Go `vt.DefaultScrollbackLines` 同值；env
@@ -221,9 +222,14 @@ pub struct SessionVt {
     /// B5：编码面 last-set 单值（与 wire 独立位并存）。
     mouse_tracking: MouseTracking,
     mouse_format: MouseFormat,
-    /// DECSTBM 滚动区顶（0-based 视口行；Term.scroll_region 私有 ⇒ 拦截 set_scrolling_region
-    /// 自管记账——CPR 的 DECOM 折算用）。
+    /// DECSTBM 滚动区（0-based 视口行；Term.scroll_region 私有 ⇒ 拦截
+    /// set_scrolling_region 自管记账——CPR 的 DECOM 折算与 DECRQSS DECSTBM 应答用）。
     scroll_top: i32,
+    scroll_bottom: i32,
+    /// 旁路扫描器的跨块续接尾（vte 0.15 的语义层不转发 `CSI ? 998 n` 与 DCS
+    /// hook/put/unhook ⇒ 这两族在解析器里被静默丢弃；扫描器在喂入前按字节流识别，
+    /// 尾巴 = 上一批结尾处「可能是模式前缀」的未决字节）。
+    scan_tail: Vec<u8>,
 }
 
 impl Default for SessionVt {
@@ -274,6 +280,8 @@ impl SessionVt {
             mouse_tracking: MouseTracking::None,
             mouse_format: MouseFormat::Default,
             scroll_top: 0,
+            scroll_bottom: rows as i32 - 1,
+            scan_tail: Vec::new(),
         })
     }
 
@@ -286,30 +294,71 @@ impl SessionVt {
 
     /// 喂入并收集应答分片（`write_pty` 面）：每个应答一片、顺序与流中触发一致。
     /// 对齐 Go `SetResponseSink` 的流中同步回调语义（同一次 write 内顺序不乱）。
+    ///
+    /// **旁路扫描器**（vte 0.15 表外形态）：`CSI ? 998 n`（可见性查询，门一评审 F2）
+    /// 与 `DCS $q … ST`（DECRQSS 三态，F3）在 vte 语义层没有分发臂 ⇒ 解析器静默丢弃。
+    /// 扫描器按字节流在喂入前识别，命中段的应答按流内位置与解析器应答交错；
+    /// 未决尾巴（跨块的模式前缀）存 `scan_tail` 续接到下一批。
     pub fn write_collecting(&mut self, p: &[u8], sink: &mut impl FnMut(&[u8])) {
         if p.is_empty() {
             return;
         }
         let mut responses: Vec<Vec<u8>> = Vec::new();
-        {
-            let mut probe = TermProbe {
-                term: &mut self.term,
-                modify_other_keys: &mut self.modify_other_keys,
-                mouse_flags: &mut self.mouse_flags,
-                force_full: &mut self.force_full,
-                dec_modes: &mut self.dec_modes,
-                colors: &mut self.colors,
-                palette_mirror: &mut self.palette_mirror,
-                mouse_tracking: &mut self.mouse_tracking,
-                mouse_format: &mut self.mouse_format,
-                scroll_top: &mut self.scroll_top,
-                responses: &mut responses,
+        let tail_len = self.scan_tail.len();
+        let combined: Vec<u8> = if tail_len == 0 {
+            p.to_vec()
+        } else {
+            let mut c = Vec::with_capacity(tail_len + p.len());
+            c.extend_from_slice(&self.scan_tail);
+            c.extend_from_slice(p);
+            c
+        };
+        let mut fed = 0usize; // 本批 p 已喂入解析器的字节
+        let mut i = 0usize; // combined 上的扫描游标（= 末次匹配结尾）
+        while let Some((start, end, hit)) = scan_out_of_table(&combined, i) {
+            // 模式终点前的字节先喂解析器（应答顺序 = 流内位置序）
+            let feed_until = end.saturating_sub(tail_len).min(p.len());
+            if feed_until > fed {
+                self.feed_parser(&mut responses, &p[fed..feed_until]);
+                fed = feed_until;
+            }
+            let resp = match hit {
+                OutOfTableHit::Visibility => b"\x1b[?999;1n".to_vec(), // 服务端恒「潜在可见」
+                OutOfTableHit::Decrqss { ps, pe } => {
+                    let view = self.decrqss_view();
+                    responder::decrqss(&combined[ps..pe], &view)
+                }
             };
-            self.processor.advance(&mut probe, p);
+            responses.push(resp);
+            i = end;
+            let _ = start;
         }
+        if fed < p.len() {
+            self.feed_parser(&mut responses, &p[fed..]);
+        }
+        // 续接尾 = 未消费段结尾处最长的「模式前缀」（完整模式已被上面消费，不会重触）
+        self.scan_tail = carry_prefix(&combined[i..]);
         for r in &responses {
             sink(r);
         }
+    }
+
+    fn feed_parser(&mut self, responses: &mut Vec<Vec<u8>>, bytes: &[u8]) {
+        let mut probe = TermProbe {
+            term: &mut self.term,
+            modify_other_keys: &mut self.modify_other_keys,
+            mouse_flags: &mut self.mouse_flags,
+            force_full: &mut self.force_full,
+            dec_modes: &mut self.dec_modes,
+            colors: &mut self.colors,
+            palette_mirror: &mut self.palette_mirror,
+            mouse_tracking: &mut self.mouse_tracking,
+            mouse_format: &mut self.mouse_format,
+            scroll_top: &mut self.scroll_top,
+            scroll_bottom: &mut self.scroll_bottom,
+            responses,
+        };
+        self.processor.advance(&mut probe, bytes);
     }
 
     /// 把一批 PTY 输出喂进 vt（屏态唯一入口；应答丢弃——收集应答用
@@ -336,6 +385,7 @@ impl SessionVt {
         self.flushed = vec![u64::MAX; rows];
         self.flushed_cols = cols;
         self.scroll_top = 0; // resize 清滚动区
+        self.scroll_bottom = rows as i32 - 1;
         Ok(())
     }
 
@@ -349,25 +399,119 @@ impl SessionVt {
         self.modify_other_keys = on;
     }
 
+    /// 键编码选项快照（`ghostty_key_encoder_setopt_from_terminal` 的等价面）：
+    /// DECCKM/DECKPAM 取 TermMode（ESC 路径与 CSI 路径都会落到 alacritty 的模式位；
+    /// 66 另见 dec_modes——CSI ?66h 不进 TermMode，与 ESC = 取或）；DECBKM/1035/1036
+    /// 取自管 DECRQM 表（vte 表外模式）；mok2/kitty 取自管位/TermMode。
+    pub fn key_options(&self) -> keyenc::KeyOptions {
+        let mode = self.term.mode();
+        keyenc::KeyOptions {
+            cursor_key_application: mode.contains(TermMode::APP_CURSOR),
+            keypad_key_application: self.dec_modes.get(66) || mode.contains(TermMode::APP_KEYPAD),
+            backarrow_key_mode: self.dec_modes.get(67),
+            ignore_keypad_with_numlock: self.dec_modes.get(1035),
+            alt_esc_prefix: self.dec_modes.get(1036),
+            modify_other_keys_state_2: self.modify_other_keys,
+            kitty_flags: kitty_flags_of(*mode),
+        }
+    }
+
+    /// 键编码（Go `Terminal.EncodeKey` 等价：选项按当前模式态现取现用）。
+    pub fn encode_key(&self, ev: &keyenc::KeyEvent) -> Vec<u8> {
+        keyenc::encode_key(ev, &self.key_options())
+    }
+
+    /// 鼠标编码（Go `Terminal.EncodeMouse` 等价：B5 单值 + 1×1 虚拟网格几何）。
+    pub fn encode_mouse(&self, ev: &keyenc::MouseEvent) -> Vec<u8> {
+        keyenc::encode_mouse(
+            ev,
+            &keyenc::MouseOptions {
+                tracking: self.mouse_tracking,
+                format: self.mouse_format,
+                cols: self.cols as u16,
+                rows: self.rows as u16,
+            },
+        )
+    }
+
+    /// DECRQSS 应答所需的当前态快照（SGR 笔态 / DECSCUSR / DECSTBM）。
+    fn decrqss_view(&self) -> responder::DecrqssView {
+        responder::DecrqssView {
+            sgr: self.sgr_pen_string(),
+            decscusr: self.decscusr_value(),
+            scroll_region: (
+                (self.scroll_top + 1).max(1) as u32,
+                (self.scroll_bottom + 1).max(1) as u32,
+            ),
+        }
+    }
+
+    /// 当前 SGR 笔态串（ghostty `printAttributes`：恒 "0" 起头 + 属性段 + 前景/背景）。
+    /// alacritty 笔态无 blink/overline 位 ⇒ SGR 5/53 不可达（与 D-5/B7 同族登记）。
+    fn sgr_pen_string(&self) -> String {
+        use std::fmt::Write as _;
+        let cell = &self.term.grid().cursor.template;
+        let mut s = String::from("0");
+        if cell.flags.contains(AlacFlags::BOLD) {
+            let _ = write!(s, ";1");
+        }
+        if cell.flags.contains(AlacFlags::DIM) {
+            let _ = write!(s, ";2");
+        }
+        if cell.flags.contains(AlacFlags::ITALIC) {
+            let _ = write!(s, ";3");
+        }
+        // 下划线：single 编 "4"，样式位编 "4:N"（ghostty 的 4 特例分支）
+        if cell.flags.contains(AlacFlags::UNDERLINE) {
+            s.push_str(";4");
+        } else if cell.flags.contains(AlacFlags::DOUBLE_UNDERLINE) {
+            s.push_str(";4:2");
+        } else if cell.flags.contains(AlacFlags::UNDERCURL) {
+            s.push_str(";4:3");
+        } else if cell.flags.contains(AlacFlags::DOTTED_UNDERLINE) {
+            s.push_str(";4:4");
+        } else if cell.flags.contains(AlacFlags::DASHED_UNDERLINE) {
+            s.push_str(";4:5");
+        }
+        // ;53（overline）/;5（blink）不可达：alacritty Flags 无对应位
+        if cell.flags.contains(AlacFlags::INVERSE) {
+            let _ = write!(s, ";7");
+        }
+        if cell.flags.contains(AlacFlags::HIDDEN) {
+            let _ = write!(s, ";8");
+        }
+        if cell.flags.contains(AlacFlags::STRIKEOUT) {
+            let _ = write!(s, ";9");
+        }
+        for (which, c) in [("38", &cell.fg), ("48", &cell.bg)] {
+            match c {
+                AlacColor::Named(NamedColor::Foreground | NamedColor::Background) => {}
+                AlacColor::Named(named) => push_palette_sgr(&mut s, which, *named as u8),
+                AlacColor::Indexed(n) => push_palette_sgr(&mut s, which, *n),
+                AlacColor::Spec(rgb) => {
+                    let _ = write!(s, ";{which}:2::{}:{}:{}", rgb.r, rgb.g, rgb.b);
+                }
+            }
+        }
+        s
+    }
+
+    /// DECSCUSR 数值（blink=1/3/5，steady=2/4/6；blink = 模式 12 或样式 blink 位）。
+    fn decscusr_value(&self) -> u8 {
+        let blink = self.dec_modes.get(12) || self.term.cursor_style().blinking;
+        match self.term.cursor_style().shape {
+            alacritty_terminal::vte::ansi::CursorShape::Underline if blink => 3,
+            alacritty_terminal::vte::ansi::CursorShape::Underline => 4,
+            alacritty_terminal::vte::ansi::CursorShape::Beam if blink => 5,
+            alacritty_terminal::vte::ansi::CursorShape::Beam => 6,
+            _ if blink => 1,
+            _ => 2,
+        }
+    }
+
     /// 模式位快照。
     pub fn modes(&self) -> Modes {
         let mode = self.term.mode();
-        let mut kitty = 0u8;
-        if mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
-            kitty |= 1;
-        }
-        if mode.contains(TermMode::REPORT_EVENT_TYPES) {
-            kitty |= 2;
-        }
-        if mode.contains(TermMode::REPORT_ALTERNATE_KEYS) {
-            kitty |= 4;
-        }
-        if mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) {
-            kitty |= 8;
-        }
-        if mode.contains(TermMode::REPORT_ASSOCIATED_TEXT) {
-            kitty |= 16;
-        }
         let style = self.term.cursor_style();
         Modes {
             screen: if mode.contains(TermMode::ALT_SCREEN) {
@@ -392,7 +536,7 @@ impl SessionVt {
             insert: mode.contains(TermMode::INSERT),
             origin: mode.contains(TermMode::ORIGIN),
             wraparound: mode.contains(TermMode::LINE_WRAP),
-            kitty_flags: kitty,
+            kitty_flags: kitty_flags_of(*mode),
             modify_other_keys: self.modify_other_keys,
         }
     }
@@ -594,6 +738,135 @@ impl SessionVt {
     }
 }
 
+/// TermMode → kitty 协议五位（1/2/4/8/16；快照与查询应答共用一处拼装）。
+fn kitty_flags_of(mode: TermMode) -> u8 {
+    let mut kitty = 0u8;
+    if mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
+        kitty |= 1;
+    }
+    if mode.contains(TermMode::REPORT_EVENT_TYPES) {
+        kitty |= 2;
+    }
+    if mode.contains(TermMode::REPORT_ALTERNATE_KEYS) {
+        kitty |= 4;
+    }
+    if mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) {
+        kitty |= 8;
+    }
+    if mode.contains(TermMode::REPORT_ASSOCIATED_TEXT) {
+        kitty |= 16;
+    }
+    kitty
+}
+
+/// SGR 颜色段的调色板形态（ghostty printAttributes：0..7 → `;3N`/`;4N`、
+/// 8..15 → `;9N`/`;10N`、≥16 → `{which}:5:N`）。
+fn push_palette_sgr(s: &mut String, which: &str, idx: u8) {
+    use std::fmt::Write as _;
+    if idx < 8 {
+        let c = if which == "38" { '3' } else { '4' };
+        let _ = write!(s, ";{c}{idx}");
+    } else if idx < 16 {
+        let n = idx - 8;
+        if which == "38" {
+            let _ = write!(s, ";9{n}");
+        } else {
+            let _ = write!(s, ";10{n}");
+        }
+    } else {
+        let _ = write!(s, ";{which}:5:{idx}");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 旁路扫描器（vte 表外形态：?998n 与 DCS $q；见 write_collecting 模块注）
+// ---------------------------------------------------------------------------
+
+/// 可见性查询的完整模式（`\x1b[?998n`）。
+const VIS_QUERY: &[u8] = b"\x1b[?998n";
+/// 续接尾的长度上限（`\x1bP` + 参数段 + `$q` + ≤2 载荷 + `\x1b\`；病态长参数放弃续接）。
+const SCAN_CARRY_MAX: usize = 32;
+
+/// 一次命中的形态（载荷区间指向 combined 里的 DECRQSS payload）。
+enum OutOfTableHit {
+    Visibility,
+    Decrqss { ps: usize, pe: usize },
+}
+
+/// 在 `s[from..]` 找下一个完整命中（起始、结束、形态）。只认完整模式——
+/// 结尾处的未决前缀由 [`carry_prefix`] 续接。
+fn scan_out_of_table(s: &[u8], from: usize) -> Option<(usize, usize, OutOfTableHit)> {
+    let mut i = from;
+    while i < s.len() {
+        if s[i] != 0x1b {
+            i += 1;
+            continue;
+        }
+        if s.len() - i >= VIS_QUERY.len() && &s[i..i + VIS_QUERY.len()] == VIS_QUERY {
+            return Some((i, i + VIS_QUERY.len(), OutOfTableHit::Visibility));
+        }
+        // DCS $q：`\x1bP` + [0-9;:]* + `$q` + ≤2 非 ESC 载荷 + `\x1b\`
+        // （ghostty dcs.zig：参数不设限；载荷第 3 字节起丢弃且**不**应答——扫描器
+        // 以「载荷 ≤2」为完整模式的一部分，3+ 载荷自然不匹配）
+        if s.len() - i >= 3 && s[i + 1] == b'P' {
+            let mut j = i + 2;
+            while j < s.len() && matches!(s[j], b'0'..=b'9' | b';' | b':') {
+                j += 1;
+            }
+            if s.len() - j >= 2 && s[j] == b'$' && s[j + 1] == b'q' {
+                let mut k = j + 2;
+                while k < s.len() && s[k] != 0x1b && k < j + 4 {
+                    k += 1; // 载荷至多 2 字节
+                }
+                if k + 1 < s.len() && s[k] == 0x1b && s[k + 1] == b'\\' {
+                    return Some((i, k + 2, OutOfTableHit::Decrqss { ps: j + 2, pe: k }));
+                }
+            }
+        }
+        i += 1;
+    }
+    None
+}
+
+/// `s` 结尾处最长的「模式真前缀」（跨块续接依据）。
+fn carry_prefix(s: &[u8]) -> Vec<u8> {
+    for k in (1..=SCAN_CARRY_MAX.min(s.len())).rev() {
+        let cand = &s[s.len() - k..];
+        if (cand.len() < VIS_QUERY.len() && VIS_QUERY.starts_with(cand)) || is_dcs_prefix(cand) {
+            return cand.to_vec();
+        }
+    }
+    Vec::new()
+}
+
+/// DCS DECRQSS 模式的真前缀判定（参数段/载荷/半个 ST 都算未决）。
+fn is_dcs_prefix(s: &[u8]) -> bool {
+    if s.len() < 2 {
+        return s == b"\x1b";
+    }
+    if s[0] != 0x1b || s[1] != b'P' {
+        return false;
+    }
+    let mut j = 2;
+    while j < s.len() && matches!(s[j], b'0'..=b'9' | b';' | b':') {
+        j += 1;
+    }
+    if j == s.len() {
+        return true; // 仍在参数段
+    }
+    if s[j] == b'$' {
+        if j + 1 == s.len() {
+            return true;
+        }
+        if s[j + 1] == b'q' {
+            let payload = &s[j + 2..];
+            let non_esc = payload.len() - usize::from(payload.last() == Some(&0x1b));
+            return non_esc <= 2; // ≤2 载荷 + 可选半个 ST
+        }
+    }
+    false
+}
+
 /// 行内容指纹（B3 的过滤依据）：对全格逐字段 FNV-1a——symbol/width/skip/颜色/属性任一
 /// 变化即不同；同内容行（如 damage_cursor 误标的光标行）指纹稳定。
 fn row_fingerprint(row: &Row) -> u64 {
@@ -750,6 +1023,7 @@ struct TermProbe<'a, T> {
     mouse_tracking: &'a mut MouseTracking,
     mouse_format: &'a mut MouseFormat,
     scroll_top: &'a mut i32,
+    scroll_bottom: &'a mut i32,
     /// 本次 write 的应答分片（流中收集、批末由 [`SessionVt::write_collecting`] 投递）。
     responses: &'a mut Vec<Vec<u8>>,
 }
@@ -844,7 +1118,8 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
     #[inline]
     fn set_tabs(&mut self, _interval: u16) { self.term.set_tabs(_interval) }
     /// RIS 全复位：自管位（mouse_flags/modifyOtherKeys，D-17/§二）随 ghostty 语义归零，
-    /// DECRQM 模式表与调色板镜像同样复位；theme（客户端上报）保留。其余委托 alacritty。
+    /// DECRQM 模式表、调色板镜像与滚动区记账同样复位；theme（客户端上报）保留。
+    /// 其余委托 alacritty。
     fn reset_state(&mut self) {
         *self.mouse_flags = 0;
         *self.modify_other_keys = false;
@@ -852,6 +1127,8 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
         *self.mouse_format = MouseFormat::Default;
         *self.dec_modes = responder::DecModes::default();
         *self.palette_mirror = [None; 256];
+        *self.scroll_top = 0;
+        *self.scroll_bottom = self.term.screen_lines() as i32 - 1;
         self.term.reset_state();
     }
     #[inline]
@@ -995,9 +1272,13 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
         self.responses.push(responder::decrqm(n, state));
     }
     fn set_scrolling_region(&mut self, _top: usize, _bottom: Option<usize>) {
-        // 拦截记账（0-based 顶）：vte 传 1-based（`CSI 5;20r` → top=5，alacritty 内部
-        // 减 1）——CPR 的 DECOM 折算用同基准。
+        // 拦截记账（0-based 顶/底）：vte 传 1-based（`CSI 5;20r` → top=5，alacritty 内部
+        // 减 1）；bottom None/0 = 全屏。CPR 的 DECOM 折算与 DECRQSS DECSTBM 应答用同基准。
         *self.scroll_top = _top as i32 - 1;
+        *self.scroll_bottom = match _bottom {
+            Some(b) => b as i32 - 1,
+            None => self.term.screen_lines() as i32 - 1,
+        };
         self.term.set_scrolling_region(_top, _bottom)
     }
     #[inline]
@@ -1074,24 +1355,7 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
     // 鼠标光标形状由客户端自理——服务端无 UI 面）。
     /// 应答器（6c）：kitty 键盘查询 `\x1b[?{flags}u`（flags 从 TermMode 拼装；0 也显式）。
     fn report_keyboard_mode(&mut self) {
-        let mode = self.term.mode();
-        let mut flags = 0u8;
-        if mode.contains(TermMode::DISAMBIGUATE_ESC_CODES) {
-            flags |= 1;
-        }
-        if mode.contains(TermMode::REPORT_EVENT_TYPES) {
-            flags |= 2;
-        }
-        if mode.contains(TermMode::REPORT_ALTERNATE_KEYS) {
-            flags |= 4;
-        }
-        if mode.contains(TermMode::REPORT_ALL_KEYS_AS_ESC) {
-            flags |= 8;
-        }
-        if mode.contains(TermMode::REPORT_ASSOCIATED_TEXT) {
-            flags |= 16;
-        }
-        self.responses.push(responder::kitty_query(flags));
+        self.responses.push(responder::kitty_query(kitty_flags_of(*self.term.mode())));
     }
     #[inline]
     fn push_keyboard_mode(&mut self, _mode: alac_ansi::KeyboardModes) { self.term.push_keyboard_mode(_mode) }
@@ -1224,7 +1488,7 @@ mod tests {
             assert!(d != Dirty::None, "{name}: damage 为空");
             let text = vt.screen_text();
             assert!(!text.is_empty(), "{name}: 屏幕文本为空");
-            assert!(text.contains(anchor), "{name}: 文本缺锚点 {anchor}（截取：{}）", &text[..text.len().min(200)].escape_default());
+            assert!(text.contains(anchor), "{name}: 文本缺锚点 {anchor}（截取：{}）", text[..text.len().min(200)].escape_default());
         }
     }
 
@@ -1362,6 +1626,70 @@ mod tests {
         assert!(!vt.modes().origin, "DECOM 一并复位（B4）");
         let rows = vt.rows();
         assert_eq!(rows[0].cells[0].attr & attr::INVERSE, 0, "SGR 反相须复位（B4）");
+    }
+
+    /// 门一评审 F2/F3 补充：旁路扫描器的跨块续接与流内应答顺序。
+    #[test]
+    fn vt_bypass_scanner_continuation_and_order() {
+        // ① ?998n 跨三块拆分：应答 `\x1b[?999;1n` 且只应一次
+        let mut vt = SessionVt::new(80, 24, 100).unwrap();
+        let mut got: Vec<u8> = Vec::new();
+        for chunk in [&b"\x1b["[..], &b"?99"[..], &b"8n"[..]] {
+            vt.write_collecting(chunk, &mut |p| got.extend_from_slice(p));
+        }
+        assert_eq!(got, b"\x1b[?999;1n");
+        // ② DA1 在前 + 998n 在后：应答顺序 = 流内顺序（解析器应答先出）
+        let mut vt = SessionVt::new(80, 24, 100).unwrap();
+        let mut got: Vec<u8> = Vec::new();
+        vt.write_collecting(b"\x1b[c\x1b[?998n", &mut |p| got.extend_from_slice(p));
+        assert_eq!(got, b"\x1b[?62;22c\x1b[?999;1n");
+        // ③ DECRQSS 跨块（`\x1bP` 与 `$qm` 与 ST 各自一块）+ 应答反映查询时刻笔态
+        let mut vt = SessionVt::new(80, 24, 100).unwrap();
+        vt.write(b"\x1b[1;31;4m"); // BOLD + 红 fg + 单下划线
+        let mut got: Vec<u8> = Vec::new();
+        for chunk in [&b"\x1bP"[..], &b"$q"[..], &b"m"[..], &b"\x1b\\"[..]] {
+            vt.write_collecting(chunk, &mut |p| got.extend_from_slice(p));
+        }
+        // "0;1;4;3;31m"（0 起头 + bold + 单下划线 4 + fg palette 1 → ";31"）
+        assert_eq!(got, b"\x1bP1$r0;1;4;31m\x1b\\");
+        // ④ 3+ 字节载荷不构成完整模式（ghostty 第 3 个 put 即丢弃、不应答）
+        let mut vt = SessionVt::new(80, 24, 100).unwrap();
+        let mut got: Vec<u8> = Vec::new();
+        vt.write_collecting(b"\x1bP$qzzz\x1b\\", &mut |p| got.extend_from_slice(p));
+        assert!(got.is_empty());
+        // ⑤ 未决尾巴在后续不成立时自然消解（不误触）
+        let mut vt = SessionVt::new(80, 24, 100).unwrap();
+        let mut got: Vec<u8> = Vec::new();
+        vt.write_collecting(b"\x1b[?9", &mut |p| got.extend_from_slice(p));
+        vt.write_collecting(b"xyz", &mut |p| got.extend_from_slice(p));
+        assert!(got.is_empty());
+    }
+
+    /// DECRQSS 的 DECSCUSR/DECSTBM 态（样式与滚动区折算）。
+    #[test]
+    fn vt_decrqss_decscusr_and_decstbm() {
+        // 默认块形不闪 ⇒ "2 q"
+        let mut vt = SessionVt::new(80, 24, 100).unwrap();
+        let mut got: Vec<u8> = Vec::new();
+        vt.write_collecting(b"\x1bP$q q\x1b\\", &mut |p| got.extend_from_slice(p));
+        assert_eq!(got, b"\x1bP1$r2 q\x1b\\");
+        // DECSCUSR 3（闪下划线）⇒ "3 q"
+        let mut vt = SessionVt::new(80, 24, 100).unwrap();
+        vt.write(b"\x1b[3 q");
+        let mut got: Vec<u8> = Vec::new();
+        vt.write_collecting(b"\x1bP$q q\x1b\\", &mut |p| got.extend_from_slice(p));
+        assert_eq!(got, b"\x1bP1$r3 q\x1b\\");
+        // DECSTBM 5..20 ⇒ "5;20r"
+        let mut vt = SessionVt::new(80, 24, 100).unwrap();
+        vt.write(b"\x1b[5;20r");
+        let mut got: Vec<u8> = Vec::new();
+        vt.write_collecting(b"\x1bP$qr\x1b\\", &mut |p| got.extend_from_slice(p));
+        assert_eq!(got, b"\x1bP1$r5;20r\x1b\\");
+        // DECSLRM 恒 invalid（alacritty 无边距面）
+        let mut vt = SessionVt::new(80, 24, 100).unwrap();
+        let mut got: Vec<u8> = Vec::new();
+        vt.write_collecting(b"\x1bP$qs\x1b\\", &mut |p| got.extend_from_slice(p));
+        assert_eq!(got, b"\x1bP0$r\x1b\\");
     }
 
     /// 光标/回滚条/模式位列对拍（快照语义的另一半）。

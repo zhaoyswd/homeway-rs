@@ -86,6 +86,11 @@ impl DecModes {
         }
     }
 
+    /// 模式号 → 当前值（表外模式恒 false）。
+    pub fn get(&self, mode: u16) -> bool {
+        Self::index_of(mode).is_some_and(|i| self.values[i])
+    }
+
     /// DEC 1049/1047/1048 的互斥联动（alt_screen 族）：1049/1047 置位 ⇒ 各自位记录；
     /// 具体屏态由 alacritty 处理，这里只管 DECRQM 报告面。
     pub fn set_alt_screen(&mut self, on: bool) {
@@ -204,13 +209,50 @@ pub fn kitty_query(flags: u8) -> Vec<u8> {
     format!("\x1b[?{flags}u").into_bytes()
 }
 
+/// DECRQSS 应答所需的当前态快照（由 [`crate::term::vt::SessionVt`] 组装——
+/// alacritty 类型不透出本模块）。
+pub struct DecrqssView {
+    /// SGR 笔态串（ghostty `printAttributes` 形态，恒 "0" 起头；不含 'm'）。
+    pub sgr: String,
+    /// DECSCUSR 数值（1..6）。
+    pub decscusr: u8,
+    /// DECSTBM（1-based top/bottom）。
+    pub scroll_region: (u32, u32),
+}
+
+/// DECRQSS 应答（旁路扫描器面，门一评审 F3；载荷 0..2 字节，ghostty `dcs.zig`）：
+/// - `m`（SGR）→ `DCS 1 $r {sgr}m ST`；` q`（DECSCUSR）→ `1 $r {n} q`；
+///   `r`（DECSTBM）→ `1 $r {top};{bottom}r`；
+/// - `s`（DECSLRM）恒答 **0**（invalid）——alacritty 不跟踪左右边距（DECLRMM
+///   面 69 有记账但边距无从取；真应用不开 69，登记差异）；
+/// - 其余/空载荷 → `DCS 0 $r ST`。
+///
+/// 3+ 字节载荷在扫描器层就不构成完整模式（ghostty 第 3 个 put 即丢弃且不应答）。
+pub fn decrqss(payload: &[u8], view: &DecrqssView) -> Vec<u8> {
+    let body: String = match payload {
+        b"m" => format!("{}m", view.sgr),
+        b" q" => format!("{} q", view.decscusr),
+        b"r" => format!("{};{}r", view.scroll_region.0, view.scroll_region.1),
+        b"s" => String::new(), // DECSLRM：恒 invalid（见上）
+        _ => String::new(),
+    };
+    if body.is_empty() {
+        b"\x1bP0$r\x1b\\".to_vec()
+    } else {
+        format!("\x1bP1$r{body}\x1b\\").into_bytes()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::term::vt::SessionVt;
 
+    /// 单案：name / setup / query / themed / 期望应答 hex。
+    type ResponderCase = (String, Vec<u8>, Vec<u8>, bool, String);
+
     /// 读应答向量：name -> (setup, query, themed, response_hex)。
-    fn responder_cases() -> Vec<(String, Vec<u8>, Vec<u8>, bool, String)> {
+    fn responder_cases() -> Vec<ResponderCase> {
         let raw = include_str!("../../../../fixtures/vectors/term_responder.json");
         let v: serde_json::Value = serde_json::from_str(raw).expect("term_responder.json invalid");
         v.get("cases")
@@ -236,20 +278,15 @@ mod tests {
             .collect()
     }
 
-    /// 6c \u5224\u636e\uff1a\u5168\u90e8\u5e94\u7b54\u5411\u91cf\u9010\u6848\u5bf9\u62cd\uff08\u5582 SessionVt \u2192 write_collecting \u2192 \u6bd4\u5bf9\u5b57\u8282\uff09\u3002
-    /// vte 表外形态（门一评审 F2/F3）：⁠?998n 与 DCS 族需旁路扫描器/hook 拦截，
-    /// 向量已采、实现归 6c 收尾批（ROADMAP R6 进度注记「待实现面」）。
-    const PARITY_PENDING: &[&str] = &["csi998n", "decrqss_sgr", "decrqss_decscusr", "decrqss_unknown"];
-
+    /// 6c 判据：全部应答向量逐案对拍（喂 SessionVt → write_collecting → 比对字节）。
+    /// F2/F3（?998n 与 DECRQSS 三态）已由旁路扫描器实装——四案从豁免名单移除、
+    /// 进入对拍（含跨块续接的补充测试见 vt.rs）。
     #[test]
     fn responder_parity_with_go_vectors() {
         let cases = responder_cases();
-        assert!(cases.len() >= 47, "vector cases {}", cases.len());
+        assert!(cases.len() >= 51, "vector cases {}", cases.len());
         let mut failures = Vec::new();
         for (name, setup, query, themed, expect) in cases {
-            if PARITY_PENDING.contains(&name.as_str()) {
-                continue; // 待实现豁免（向量已采，判据不作废）
-            }
             let mut vt = SessionVt::new(100, 32, 1000).expect("vt");
             if themed {
                 vt.set_default_colors([0x11, 0x22, 0x33], [0xaa, 0xbb, 0xcc]);
