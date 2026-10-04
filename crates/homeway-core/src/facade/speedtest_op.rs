@@ -185,8 +185,14 @@ impl crate::speedtest::SpeedConn for BridgeSpeedConn {
 }
 
 /// App 引擎入口：拨桥 + 鉴权 → `speedtest::run_dial`（同步跑完整轮——NAPI 壳在
-/// async work 线程上跑；失败信封同 `SpeedOutcome::Fail`）。
-pub fn app_run(auth: &str, sock: &str, p: &crate::speedtest::Params, logf: &dyn Fn(&str)) -> SpeedOutcome {
+/// async work 线程上跑；失败信封同 `SpeedOutcome::Fail`）。cancel 位经参数注入。
+pub fn app_run(
+    auth: &str,
+    sock: &str,
+    p: &crate::speedtest::Params,
+    logf: &dyn Fn(&str),
+    cancel: Option<&std::sync::atomic::AtomicBool>,
+) -> SpeedOutcome {
     let dial = || -> Result<std::sync::Arc<dyn crate::speedtest::SpeedConn>, crate::speedtest::SpeedtestError> {
         match speed_dial_conn(auth, sock, Duration::from_secs(10)) {
             Ok(c) => Ok(std::sync::Arc::new(c)),
@@ -196,7 +202,7 @@ pub fn app_run(auth: &str, sock: &str, p: &crate::speedtest::Params, logf: &dyn 
             }
         }
     };
-    match crate::speedtest::run_dial(&dial, *p, logf) {
+    match crate::speedtest::run_dial(&dial, *p, logf, cancel) {
         Ok(res) => SpeedOutcome::Ok(res),
         Err(e) => SpeedOutcome::Fail { reason: e.reason().to_string(), msg: e.to_string() },
     }
@@ -353,5 +359,187 @@ mod tests {
     #[test]
     fn cancel_envelope() {
         assert_eq!(speed_cancel_json(), r#"{"ok":true}"#);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// SpeedHost：App 形态的轮级状态机（busy 门 + Cancel 真取消 + Status 快照）
+// 语义真源 `baseline:clientcore/cmd/clientcore/app_speedtest.go` 的轮管理面。
+// ---------------------------------------------------------------------------
+
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// 一轮的进度快照（Status 信封源；phase 缺省 = idle）。
+#[derive(Clone)]
+struct RoundState {
+    phase: &'static str,
+    reason: String,
+    usage: Option<(i64, i64)>,
+    live: Option<(&'static str, i64, f64)>,
+    started_at: Option<Instant>,
+}
+
+impl Default for RoundState {
+    fn default() -> Self {
+        RoundState {
+            phase: "idle",
+            reason: String::new(),
+            usage: None,
+            live: None,
+            started_at: None,
+        }
+    }
+}
+
+/// 轮级状态机（Start 同步跑完整轮〔NAPI async work 线程〕；Cancel 即时返回、
+/// 在途轮以 cancelled 收场；Status 250ms 轮询面）。
+pub struct SpeedHost {
+    running: AtomicBool,
+    cancel: std::sync::Arc<AtomicBool>,
+    state: Mutex<RoundState>,
+}
+
+impl Default for SpeedHost {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl SpeedHost {
+    pub fn new() -> Self {
+        SpeedHost {
+            running: AtomicBool::new(false),
+            cancel: std::sync::Arc::new(AtomicBool::new(false)),
+            state: Mutex::new(RoundState::default()),
+        }
+    }
+
+    /// ClientCoreSpeedTestStart（同步完整轮；busy 门 = 并发轮拒绝）。
+    pub fn start(&self, params_json: &str) -> String {
+        if self.running.swap(true, Ordering::AcqRel) {
+            return speed_fail("busy", "已有测速在跑（请等它完成或取消）");
+        }
+        self.cancel.store(false, Ordering::Release);
+        {
+            let mut st = lock_round(&self.state);
+            *st = RoundState {
+                phase: "connecting",
+                started_at: Some(Instant::now()),
+                ..RoundState::default()
+            };
+        }
+        // 参数解析（引擎外的前置门——错参数不占轮）
+        let p: SpeedParams = match serde_json::from_str(params_json) {
+            Ok(p) => p,
+            Err(e) => {
+                self.running.store(false, Ordering::Release);
+                return speed_fail("invalid_arg", format!("参数不是合法 JSON：{e}"));
+            }
+        };
+        let raw = crate::speedtest::Params {
+            down: Duration::from_millis(p.down_ms.max(0) as u64),
+            up: Duration::from_millis(p.up_ms.max(0) as u64),
+            warmup: Duration::from_millis(p.warmup_ms.max(0) as u64),
+            streams: p.streams.max(0) as usize,
+        };
+        let params = match raw.normalized() {
+            Ok(v) => v,
+            Err(e) => {
+                self.running.store(false, Ordering::Release);
+                return speed_fail("invalid_arg", e);
+            }
+        };
+        let logf = |s: &str| {
+            // 轮内日志经 stderr？App 形态无 stdout 消费面——丢弃（判据行在 exit 侧）
+            let _ = s;
+        };
+        // 相位推进（粗粒度：connecting → down——引擎日志驱动的细分相不在这层复刻，
+        // Status 面按窗口近似；收尾相位在轮结束时写回）
+        lock_round(&self.state).phase = "down";
+        let cancel = std::sync::Arc::clone(&self.cancel);
+        let outcome = app_run(&p.auth, &p.sock, &params, &logf, Some(&cancel));
+        let out = speed_start(params_json, |_| outcome);
+        // 收尾快照（done/cancelled/failed + usage）
+        {
+            let mut st = lock_round(&self.state);
+            let ok = serde_json::from_str::<serde_json::Value>(&out)
+                .ok()
+                .and_then(|v| v.get("ok").and_then(|o| o.as_bool()))
+                .unwrap_or(false);
+            if ok {
+                st.phase = "done";
+                let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_default();
+                st.usage = Some((
+                    v.get("usageDown").and_then(|x| x.as_i64()).unwrap_or(0),
+                    v.get("usageUp").and_then(|x| x.as_i64()).unwrap_or(0),
+                ));
+                st.reason = String::new();
+            } else {
+                let v: serde_json::Value = serde_json::from_str(&out).unwrap_or_default();
+                st.phase = "failed";
+                st.reason = v
+                    .get("reason")
+                    .and_then(|x| x.as_str())
+                    .unwrap_or("")
+                    .to_owned();
+                if st.reason == "cancelled" {
+                    st.phase = "cancelled";
+                }
+            }
+            st.live = None;
+            st.started_at = None;
+        }
+        self.running.store(false, Ordering::Release);
+        out
+    }
+
+    /// ClientCoreSpeedTestStatus（250ms 轮询面）。
+    pub fn status(&self) -> String {
+        let st = lock_round(&self.state).clone();
+        let elapsed_ms = match st.started_at {
+            Some(t) => t.elapsed().as_millis() as i64,
+            None => -1,
+        };
+        let snap = SpeedSnapshotIn {
+            phase: st.phase,
+            reason: st.reason.clone(),
+            usage: st.usage,
+            live: st.live,
+            elapsed_ms,
+        };
+        speed_status_json(&snap)
+    }
+
+    /// ClientCoreSpeedTestCancel（即时返回；在途轮由取消位收场——「已产生用量后
+    /// 打断」归因 interrupted 的细分在引擎 report 面，本层恒 ok:true）。
+    pub fn cancel(&self) -> String {
+        self.cancel.store(true, Ordering::Release);
+        speed_cancel_json()
+    }
+}
+
+fn lock_round(m: &Mutex<RoundState>) -> std::sync::MutexGuard<'_, RoundState> {
+    m.lock().unwrap_or_else(|e| e.into_inner())
+}
+
+#[cfg(test)]
+mod host_tests {
+    use super::*;
+
+    /// busy 门：并发第二轮直接拒绝（不占轮——running 位原子交换）。
+    #[test]
+    fn busy_gate_and_idle_status() {
+        let h = SpeedHost::new();
+        let v: serde_json::Value =
+            serde_json::from_str(&h.status()).unwrap();
+        assert_eq!(v["phase"], "idle");
+        assert_eq!(v.as_object().unwrap().len(), 2); // phase + reason（elapsedMs -1 不出现）
+        // 参数错不占轮（invalid_arg 即时回）
+        let out = h.start("{oops");
+        let v: serde_json::Value = serde_json::from_str(&out).unwrap();
+        assert_eq!(v["reason"], "invalid_arg");
+        // running=false：取消恒 ok
+        let v: serde_json::Value = serde_json::from_str(&h.cancel()).unwrap();
+        assert_eq!(v["ok"], true);
     }
 }

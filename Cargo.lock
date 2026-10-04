@@ -480,6 +480,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "homeway-capi"
+version = "0.1.0"
+dependencies = [
+ "homeway-core",
+ "libc",
+]
+
+[[package]]
 name = "homeway-cli"
 version = "0.1.0"
 dependencies = [

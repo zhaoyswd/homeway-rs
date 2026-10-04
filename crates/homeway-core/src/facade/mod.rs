@@ -195,7 +195,7 @@ pub struct ClientCore {
     /// 收工强制放锁后的「孤儿世代」标记（tun_stop 的 -2 路径；世代线程迟到收尾
     /// 过世代守卫即可，此位供诊断区分「锁被强制放过后旧世代是否还活着」）。
     orphan_alive: Arc<AtomicBool>,
-    pub demand: DemandSignals,
+    pub demand: Arc<DemandSignals>,
     pub files: files_op::FilesOps,
     executor: Mutex<Arc<dyn TunExecutor>>,
     /// 服务会话域（rc 门与状态机在 service_op；Arc = ServiceExec 的共享事实源）。
@@ -217,12 +217,19 @@ impl Default for ClientCore {
 
 impl ClientCore {
     pub fn new(executor: Arc<dyn TunExecutor>) -> Self {
+        Self::with_shared(executor, Arc::new(DemandSignals::new()))
+    }
+
+    /// 共享 demand 构造（capi 装配形态：TunnelExec 的巡检/pusher 与 ClientCore 的
+    /// SetActivity 面必须消费**同一个** DemandSignals——共享只能经 Arc：内部全 Mutex，
+    /// 值克隆会分裂成两份状态）。
+    pub fn with_shared(executor: Arc<dyn TunExecutor>, demand: Arc<DemandSignals>) -> Self {
         ClientCore {
             tun: Arc::new(TunShared::new()),
             foreground: AtomicBool::new(false),
             foreground_kick: Mutex::new(None),
             orphan_alive: Arc::new(AtomicBool::new(false)),
-            demand: DemandSignals::new(),
+            demand,
             files: files_op::FilesOps::new(),
             executor: Mutex::new(executor),
             service: Arc::new(service_op::ServiceDomain::new()),
@@ -311,6 +318,12 @@ impl ClientCore {
         match self.executor().warmup(&cfg, Arc::clone(&self.tun), gen) {
             Ok(()) => 0,
             Err(e) => {
+                if matches!(e, TunError::LogOpen(_)) {
+                    // 日志面打不开 = 同步 -2（Go tunStdioBegin 失败的 rc 契约；
+                    // 世代未起——只放锁，不写终态）
+                    self.tun.probe_running.store(false, Ordering::Release);
+                    return -2;
+                }
                 // 同步硬失败（如线程 spawn 失败）：世代就地收尾（failed 终态 + 放锁）。
                 // 仍返回受理 0——失败原因经 tun_status 读（Go goroutine 内失败同语义）。
                 self.tun

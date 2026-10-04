@@ -1211,7 +1211,9 @@ pub(crate) fn local_ts() -> String {
     let ms = now.subsec_millis();
     // 无时区库依赖的本地近似：直接 UTC+8 不可取；用 libc::localtime_r
     unsafe {
-        let t = secs as libc::time_t;
+        // musl 1.2 起 time_t 64 位；OHOS 面的 libc::time_t 别名 deprecated（7b 同款
+        // 整改）——直接以 i64 传（darwin/linux/ohos 的 time_t 均 64 位）
+        let t: i64 = secs;
         let mut tm: libc::tm = std::mem::zeroed();
         if libc::localtime_r(&t, &mut tm).is_null() {
             return format!("[{secs}.{ms:03}]");

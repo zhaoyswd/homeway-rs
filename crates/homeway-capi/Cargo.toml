@@ -1,0 +1,14 @@
+[package]
+name = "homeway-capi"
+description = "libclientcore.so 的 Rust C-ABI 壳（20 个 ClientCore* 导出——tier HSP 原位替换 Go 版产物）"
+version.workspace = true
+edition.workspace = true
+
+[lib]
+# 产物名 = libclientcore.so（tier 的 CMake 按 -lclientcore 链接、运行期 $ORIGIN 加载）
+name = "clientcore"
+crate-type = ["cdylib"]
+
+[dependencies]
+homeway-core = { path = "../homeway-core" }
+libc = "0.2"

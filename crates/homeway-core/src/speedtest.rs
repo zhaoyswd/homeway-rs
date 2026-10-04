@@ -512,17 +512,38 @@ impl Drop for ConnGuard {
 /// 从待决 RPC 里解出来（close ⇒ 引擎结算 EOF/Closed）。到点先置 timed_out 旗标
 /// （R3-M24：后续读线程收到的 Closed/Frame 错误统一归因 timeout——「窗口没跑完」
 /// 与「链路死」是同一个根因面，不应报 interrupted）。
-fn watchdog(
+fn watchdog_cancellable(
     conns: std::sync::Arc<std::sync::Mutex<Vec<std::sync::Arc<dyn SpeedConn>>>>,
     budget: Duration,
     done: std::sync::mpsc::Receiver<()>,
     timed_out: &std::sync::atomic::AtomicBool,
+    cancelled: &std::sync::atomic::AtomicBool,
+    external_cancel: Option<&std::sync::atomic::AtomicBool>,
 ) {
-    if done.recv_timeout(budget).is_err() {
-        timed_out.store(true, std::sync::atomic::Ordering::Release);
-        let conns = conns.lock().expect("连接表锁中毒").clone();
-        for c in conns {
-            c.kill();
+    let deadline = Instant::now() + budget;
+    loop {
+        if let Some(cx) = external_cancel {
+            if cx.load(std::sync::atomic::Ordering::Acquire) {
+                cancelled.store(true, std::sync::atomic::Ordering::Release);
+                let conns = conns.lock().expect("连接表锁中毒").clone();
+                for c in conns {
+                    c.kill();
+                }
+                return;
+            }
+        }
+        match done.recv_timeout(Duration::from_millis(200)) {
+            Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                if Instant::now() >= deadline {
+                    timed_out.store(true, std::sync::atomic::Ordering::Release);
+                    let conns = conns.lock().expect("连接表锁中毒").clone();
+                    for c in conns {
+                        c.kill();
+                    }
+                    return;
+                }
+            }
         }
     }
 }
@@ -540,15 +561,18 @@ pub fn run(
             .map_err(SpeedtestError::Conn)?;
         Ok(std::sync::Arc::new(ClientConn { client: std::sync::Arc::clone(client), id }))
     };
-    run_dial(&dial, params, logf)
+    run_dial(&dial, params, logf, None)
 }
 
 /// App/CLI 双入口的引擎主体（拨号闭包形态——Go speed.Start(ctx, dial, params) 同构；
 /// 工单⑤ speedtest 接桥：App 形态的 dial = 本机测速桥〔UDS + 鉴权首包〕）。
+/// `cancel`：外部取消位（Cancel 导出面置位 → 看门狗分片轮询发现 → kill 全部连接，
+/// 本轮以 `cancelled` 收场——Go 的 cancel 关连接同义）。
 pub fn run_dial(
     dial: &dyn Fn() -> Result<std::sync::Arc<dyn SpeedConn>, SpeedtestError>,
     params: Params,
     logf: &dyn Fn(&str),
+    cancel: Option<&std::sync::atomic::AtomicBool>,
 ) -> Result<SpeedtestResult, SpeedtestError> {
     let p = params.normalized().map_err(SpeedtestError::InvalidArg)?;
     let conns = std::sync::Arc::new(std::sync::Mutex::new(Vec::<std::sync::Arc<dyn SpeedConn>>::new()));
@@ -557,15 +581,29 @@ pub fn run_dial(
     let budget = Duration::from_secs(60) + p.warmup + p.down + p.up;
     let wd_conns = std::sync::Arc::clone(&conns);
     let timed_out = std::sync::atomic::AtomicBool::new(false);
+    let cancelled = std::sync::atomic::AtomicBool::new(false);
     let wd_flag = &timed_out;
+    let wd_cancelled = &cancelled;
     let body = std::thread::scope(|scope| {
-        scope.spawn(move || watchdog(wd_conns, budget, wd_rx, wd_flag));
+        scope.spawn(move || {
+            watchdog_cancellable(wd_conns, budget, wd_rx, wd_flag, wd_cancelled, cancel)
+        });
         run_phases(dial, &p, logf, &conns)
     });
     let _ = wd_tx.send(()); // 看门狗收工（scope 已 join 线程，此处只解阻塞 recv）
     // M24：看门狗触发（预算烧满）时，读/泵线程带出的连接级错误统一归因 timeout
     //（窗口没跑完 = 链路死/服务端卡，不是 interrupted）。Report/InvalidArg/NotSupported
-    // 等服务端语义错误不改写。
+    // 等服务端语义错误不改写。外部取消优先归因 cancelled（在 timeout 检查之前）。
+    if cancelled.load(std::sync::atomic::Ordering::Acquire) {
+        if let Err(e) = &body {
+            if matches!(
+                e,
+                SpeedtestError::Conn(_) | SpeedtestError::Frame(_) | SpeedtestError::Bridge(_, _)
+            ) {
+                return Err(SpeedtestError::Report("已取消".into()));
+            }
+        }
+    }
     if timed_out.load(std::sync::atomic::Ordering::Acquire) {
         if let Err(e) = &body {
             if matches!(
@@ -579,6 +617,8 @@ pub fn run_dial(
     body
 }
 
+/// 看门狗（可取消形态）：分片轮询取消位（200ms）——取消触发 = kill 全部连接 +
+/// cancelled 旗标（归因面在 run_dial 尾部）。
 fn run_phases(
     dial: &dyn Fn() -> Result<std::sync::Arc<dyn SpeedConn>, SpeedtestError>,
     p: &Params,
