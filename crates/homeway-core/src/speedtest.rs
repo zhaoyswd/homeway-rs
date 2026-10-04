@@ -262,12 +262,16 @@ impl SpeedConn for ClientConn {
     fn write_frame(&self, data: &[u8]) -> Result<(), SpeedtestError> {
         let mut off = 0;
         let mut zero_streak = 0u32;
+        // R8-3 F12：零接纳时引擎带回原 Vec——重试环不重拷（与 SessionWriteHalf 同款）。
+        let mut pending: Option<Vec<u8>> = None;
         while off < data.len() {
-            let n = self
-                .client
-                .write(self.id, data[off..].to_vec())
-                .map_err(SpeedtestError::Conn)?;
-            if n == 0 {
+            let chunk = match pending.take() {
+                Some(v) => v,
+                None => data[off..].to_vec(),
+            };
+            let w = self.client.write(self.id, chunk).map_err(SpeedtestError::Conn)?;
+            if w.n == 0 {
+                pending = w.back;
                 zero_streak += 1;
                 if zero_streak > 1_000_000 {
                     return Err(SpeedtestError::Frame("写通道长时间无进展".into()));
@@ -276,7 +280,7 @@ impl SpeedConn for ClientConn {
                 continue;
             }
             zero_streak = 0;
-            off += n;
+            off += w.n;
         }
         Ok(())
     }
@@ -689,9 +693,15 @@ pub fn run_dial(
         scope.spawn(move || {
             watchdog_cancellable(wd_conns, budget, wd_rx, wd_flag, wd_cancelled, cancel)
         });
-        run_phases(dial, &p, logf, &conns, cancel, live)
+        let r = run_phases(dial, &p, logf, &conns, cancel, live);
+        // R8-3 尾账（F14 测试写出）：收工信号必须在 **scope join 之前** 发——
+        // std::thread::scope 返回即 join 看门狗线程，而它只认 done/预算烧尽；
+        // 旧位（scope 之后）发 = 永远晚于 join ⇒ 每轮白等满 60s 基础预算
+        // （CLI 实测 3 轮 246s = 3×(22s 相位 + 60s 空等)；App 形态同罪）。
+        let _ = wd_tx.send(());
+        r
     });
-    let _ = wd_tx.send(()); // 看门狗收工（scope 已 join 线程，此处只解阻塞 recv）
+    let _ = wd_tx.send(()); // 幂等兜底（recv 侧单消费即退）
                             // 取消旗标**优先**于一切归因（复核 r3-F7：Go engine.go finish 先判 isCancelled，
                             // 任何已归因错误被取消覆盖——此前白名单外的 NotSupported/Report 会抢先，
                             // 下行首帧前取消会误报「出口需升级」）。
@@ -1068,6 +1078,118 @@ mod tests {
         .normalized()
         .unwrap();
         assert_eq!(n, Params::default(), "零值取默认");
+    }
+
+    /// F14（R8-3 尾账）：读期限到点的归因回归——Go 对照 `TestEngineReadDeadline
+    /// Interrupted`（exec-r1 L4：期限到点 ≠ 判据②，不得冒充 not_supported）。**口径
+    /// 注记**：Go 侧到点按 interrupted 呈现；Rust 侧 R3-M24 既定口径 = 窗口没跑完
+    /// 与链路死同根因，统一 **timeout**——本测试钉死的是「到点绝不冒充
+    /// not_supported（出口没有测速服务）」这个两侧共有的不变量 + 我方口径本身。
+    /// 两形态与 Go 同构：①hold（请求后永无应答——下行首帧前期限到点）；②halfhold
+    /// （下行相位正常收场、上行收口 report 缺席到点）。
+    #[test]
+    fn read_deadline_expiry_attribution() {
+        use std::sync::Mutex;
+        /// 钳制期限的假连接：`set_deadline` 把引擎给的期限钳到 ≤300ms（Go clampConn
+        /// 同义）；read_some hold 到期限后以 Conn(Timeout) 失败。`serve_report` 形态
+        /// 的连接在首读即回一帧合法 REPORT（下行相位秒过），其后 hold。
+        struct ClampConn {
+            deadline: Mutex<Option<Instant>>,
+            serve_report: bool,
+            served: std::sync::atomic::AtomicBool,
+        }
+        impl SpeedConn for ClampConn {
+            fn write_frame(&self, _data: &[u8]) -> Result<(), SpeedtestError> {
+                Ok(()) // 请求/START/FINISH 全成功（写不设障）
+            }
+            fn read_some(&self) -> Result<Vec<u8>, SpeedtestError> {
+                if self.serve_report
+                    && !self.served.swap(true, std::sync::atomic::Ordering::AcqRel)
+                {
+                    let mut f = Frame::new();
+                    return Ok(f
+                        .control(TYPE_REPORT, b"{\"bytes\":0,\"warmup_bytes\":0,\"wall_ms\":1}")
+                        .to_vec());
+                }
+                loop {
+                    let dl = *self.deadline.lock().unwrap();
+                    match dl {
+                        Some(t) => {
+                            let now = Instant::now();
+                            if now >= t {
+                                return Err(SpeedtestError::Conn(ConnErr::Timeout));
+                            }
+                            std::thread::sleep(((t - now) / 4).max(Duration::from_millis(5)));
+                        }
+                        None => std::thread::sleep(Duration::from_millis(5)),
+                    }
+                }
+            }
+            fn kill(&self) {}
+            fn set_deadline(&self, d: Option<Duration>) {
+                // 钳制：把 warmup+window+15s connBudget 收到 ≤300ms
+                let clamped = d.map(|x| x.min(Duration::from_millis(300)));
+                *self.deadline.lock().unwrap() = clamped.map(|x| Instant::now() + x);
+            }
+        }
+        let p = Params {
+            warmup: Duration::from_millis(50),
+            down: Duration::from_millis(200),
+            up: Duration::from_millis(200),
+            streams: 1,
+        }
+        .normalized()
+        .unwrap();
+
+        // 形态一 hold：首帧前期限到点。
+        let hold = std::sync::Arc::new(ClampConn {
+            deadline: Mutex::new(None),
+            serve_report: false,
+            served: std::sync::atomic::AtomicBool::new(false),
+        });
+        let h2 = std::sync::Arc::clone(&hold);
+        let r = run_dial(
+            &|| Ok(h2.clone()),
+            p,
+            &|_| {},
+            None,
+            None,
+        );
+        match r {
+            Err(SpeedtestError::Conn(ConnErr::Timeout)) => {}
+            Err(SpeedtestError::NotSupported) => {
+                panic!("期限到点冒充 not_supported（Go exec-r1 L4 同款 bug）")
+            }
+            other => panic!("形态一 hold：期望 Conn(Timeout)，实得 {other:?}"),
+        }
+
+        // 形态二 halfhold：下行正常收场（REPORT 即回），上行收口 report 缺席到点。
+        // dial 计数：第 1 个 = 下行连接（serve_report），其后 = 上行连接（纯 hold）。
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let r2 = {
+            let n = std::sync::Arc::clone(&n);
+            run_dial(
+                &move || {
+                    let i = n.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+                    Ok(std::sync::Arc::new(ClampConn {
+                        deadline: Mutex::new(None),
+                        serve_report: i == 0,
+                        served: std::sync::atomic::AtomicBool::new(false),
+                    }))
+                },
+                p,
+                &|_| {},
+                None,
+                None,
+            )
+        };
+        match r2 {
+            Err(SpeedtestError::Conn(ConnErr::Timeout)) => {}
+            Err(SpeedtestError::NotSupported) => {
+                panic!("收口期限到点冒充 not_supported（Go exec-r1 L4 同款 bug）")
+            }
+            other => panic!("形态二 halfhold：期望 Conn(Timeout)，实得 {other:?}"),
+        }
     }
 
     /// 泵分片上报增量（复核 r3-F4 的回归钉）：累计面不重复累加。

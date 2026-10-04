@@ -399,7 +399,7 @@ fn transit_dial(session: &Session, dst: SocketAddrV4) -> Result<usize, ConnErr> 
     let mut zero = 0u32;
     while off < probe.len() {
         match session.client().write(id, probe[off..].to_vec()) {
-            Ok(w) if w > 0 => off += w,
+            Ok(w) if w.n > 0 => off += w.n,
             _ => {
                 zero += 1;
                 if zero > 100_000 {
@@ -786,11 +786,11 @@ fn dns_tcp(client: &homeway_core::wgcore::Client, q: &[u8]) -> Result<Vec<u8>, S
     let mut off = 0;
     while off < frame.len() {
         let n = client.write(id, frame[off..].to_vec()).map_err(|e| e.to_string())?;
-        if n == 0 {
+        if n.n == 0 {
             std::thread::yield_now();
             continue;
         }
-        off += n;
+        off += n.n;
     }
     // 读：2B 长度 + 报文
     let mut buf = Vec::new();
@@ -1007,7 +1007,7 @@ fn cmd_portfwd(args: &[String]) {
                                 let mut off = 0;
                                 while off < n {
                                     match sess.client().write(remote_id, buf[off..n].to_vec()) {
-                                        Ok(w) if w > 0 => off += w,
+                                        Ok(w) if w.n > 0 => off += w.n,
                                         _ => {
                                             let _ = lc.shutdown(std::net::Shutdown::Both);
                                             return;

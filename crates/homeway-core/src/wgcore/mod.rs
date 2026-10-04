@@ -73,6 +73,14 @@ pub enum ConnErr {
 }
 
 /// 主线程 → 驱动线程的命令（全部非阻塞投递；带 reply 的由驱动线程在事件到点时应答）。
+/// `Client::write` 的回执（R8-3 F12）：`n` = 本次接纳字节数；`back` = 零接纳时
+/// **原样带回**的载荷（调用方重试直接复用，消背压期的整段重拷；部分接纳时
+/// 余量由调用方按 io::Write 契约自行切片）。
+pub struct WriteOut {
+    pub n: usize,
+    pub back: Option<Vec<u8>>,
+}
+
 pub enum Cmd {
     Connect {
         id: u64,
@@ -85,7 +93,7 @@ pub enum Cmd {
     Write {
         id: u64,
         data: Vec<u8>,
-        reply: Sender<Result<usize, ConnErr>>,
+        reply: Sender<Result<WriteOut, ConnErr>>,
     },
     Read {
         id: u64,
@@ -624,7 +632,12 @@ impl Engine {
                                 sock.local_endpoint()
                             );
                         }
-                        r
+                        // R8-3 F12：零接纳（背压 Ok(0)）把数据原 Vec 带回——调用方
+                        // 重试环不再每 2ms 重拷整段（登记的「每次重拷」面）。
+                        r.map(|n| WriteOut {
+                            n,
+                            back: if n == 0 { Some(data) } else { None },
+                        })
                     }
                     None => Err(ConnErr::Closed),
                 };
@@ -1130,14 +1143,24 @@ impl Client {
         }
     }
 
-    pub fn write(&self, id: u64, data: Vec<u8>) -> Result<usize, ConnErr> {
+    /// 写通道的回执等待上界（R8-3 F12：引擎线程卡死时 `rx.recv()` 永不返回 ⇒
+    /// SessionWriteHalf 的外层 10s 无进展界永远走不到——每笔写自身必须有界。
+    /// 正常引擎回执是即时的（背压在引擎侧以 Ok(0) 即答，不挂本通道）——10s 只
+    /// 兜「引擎死了」的极端形态，与外层无进展界同刻度）。
+    const WRITE_REPLY_BOUND: Duration = Duration::from_secs(10);
+
+    pub fn write(&self, id: u64, data: Vec<u8>) -> Result<WriteOut, ConnErr> {
         let (tx, rx) = mpsc::channel();
         self.send(Cmd::Write {
             id,
             data,
             reply: tx,
         });
-        rx.recv().map_err(|_| ConnErr::EngineGone)?
+        match rx.recv_timeout(Self::WRITE_REPLY_BOUND) {
+            Ok(r) => r,
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ConnErr::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ConnErr::EngineGone),
+        }
     }
 
     pub fn read(&self, id: u64) -> Result<Vec<u8>, ConnErr> {

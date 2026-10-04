@@ -261,9 +261,16 @@ impl<'a> Stream<'a> {
     fn write_all(&mut self, data: &[u8]) -> Result<(), FilesError> {
         let mut off = 0;
         let mut zero_streak = 0u32;
+        // R8-3 F12：零接纳时引擎带回原 Vec——重试环不重拷（与 SessionWriteHalf 同款）。
+        let mut pending: Option<Vec<u8>> = None;
         while off < data.len() {
-            let n = self.sess.client().write(self.id, data[off..].to_vec()).map_err(transport)?;
-            if n == 0 {
+            let chunk = match pending.take() {
+                Some(v) => v,
+                None => data[off..].to_vec(),
+            };
+            let w = self.sess.client().write(self.id, chunk).map_err(transport)?;
+            if w.n == 0 {
+                pending = w.back;
                 zero_streak += 1;
                 if zero_streak > 1_000_000 {
                     return Err(transport("写通道长时间无进展"));
@@ -272,7 +279,7 @@ impl<'a> Stream<'a> {
                 continue;
             }
             zero_streak = 0;
-            off += n;
+            off += w.n;
         }
         Ok(())
     }

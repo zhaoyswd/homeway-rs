@@ -203,14 +203,7 @@ impl ServiceExec {
         // 闭包 → Arc<ServiceRun> 的引用环每 start/stop 周期泄漏一套对象；降 Weak
         // 后强引用只剩 run 槽 + 会话线程（stop 清槽 + 线程退出即整组释放）。
         // upgrade 失败（正在收工）= 桥拨号「服务会话未就绪」同语义。
-        let run3 = Arc::downgrade(&run);
-        bridge.set_dial(Box::new(move |port, budget| match run3.upgrade() {
-            Some(r) => dial_via_run(&r, port, budget),
-            None => Err(io::Error::new(
-                io::ErrorKind::NotConnected,
-                "服务会话未就绪",
-            )),
-        }));
+        bridge.set_dial(bridge_dial_closure(run, dial_via_run));
         bridge.start();
         0
     }
@@ -352,6 +345,29 @@ fn clear_slot_if_same(slot: &Arc<Mutex<Option<Arc<ServiceRun>>>>, expect: &Arc<S
 /// 经运行态会话拨出口虚拟端口（服务会话形态的桥 dial：流 id 适配成 BridgeStream）。
 /// 会话句柄从锁里克隆出来再拨（评审 r2-M-10②：此前持 `run.session` 锁做 15s 拨号
 /// ⇒ status() 同锁被同步阻塞——App 轮询面卡住）。
+/// 桥拨号闭包工厂（R8-3 F16 可测面）：闭包持 **Weak**——ServiceRun.bridge →
+/// BridgeHost → 闭包 → Arc<ServiceRun> 的引用环每 start/stop 周期泄漏一套对象
+/// （R8-8c F15 整改的原始动机）；降 Weak 后强引用只剩 run 槽 + 会话线程（stop
+/// 清槽 + 线程退出即整组释放）。upgrade 失败（正在收工）= 桥拨号「服务会话未
+/// 就绪」同语义。泛型 `T` + 函数指针只为单测能以轻量替身钉死两点：闭包不抬
+/// 强计数 / 收工后拨号报未就绪（见 tests::bridge_dial_closure_weak_only）。
+/// 桥拨号闭包的产出类型（set_dial 形参同形——type_complexity 收口）。
+type BridgeDialFn =
+    Box<dyn Fn(u16, Duration) -> io::Result<Box<dyn crate::facade::bridge_host::BridgeStream>> + Send + Sync>;
+/// 闭包工厂的拨号实现面（dial_via_run 同形——T = ServiceRun）。
+type BridgeDialImpl<T> = fn(&Arc<T>, u16, Duration) -> io::Result<Box<dyn crate::facade::bridge_host::BridgeStream>>;
+
+fn bridge_dial_closure<T: Send + Sync + 'static>(run: Arc<T>, dial: BridgeDialImpl<T>) -> BridgeDialFn {
+    let weak = Arc::downgrade(&run);
+    Box::new(move |port, budget| match weak.upgrade() {
+        Some(r) => dial(&r, port, budget),
+        None => Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "服务会话未就绪",
+        )),
+    })
+}
+
 fn dial_via_run(
     run: &Arc<ServiceRun>,
     port: u16,
@@ -402,4 +418,54 @@ fn open_service_log(out: &str) -> Result<Logf, String> {
 #[allow(dead_code)]
 fn dial_unix_direct(_sock: &str) -> io::Result<UnixStream> {
     unreachable!("服务桥的远端恒为会话流（dial_via_run）")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// F16（R8-3 尾账）：桥拨号闭包**只持 Weak**——不抬强计数（R8-8c F15 的
+    /// 引用环整改点），run 释放后闭包不复活对象、拨号报「服务会话未就绪」
+    /// （NotConnected——与 dial_via_run 会话缺席分支同词面同语义）。
+    #[test]
+    fn bridge_dial_closure_weak_only() {
+        #[derive(Default)]
+        struct Dummy {
+            called: AtomicBool,
+        }
+        fn fake_dial(
+            r: &Arc<Dummy>,
+            _port: u16,
+            _budget: Duration,
+        ) -> io::Result<Box<dyn crate::facade::bridge_host::BridgeStream>> {
+            r.called.store(true, Ordering::Release);
+            Err(io::Error::new(io::ErrorKind::AddrInUse, "替身不产流"))
+        }
+        let run = Arc::new(Dummy::default());
+        let dial = bridge_dial_closure(Arc::clone(&run), fake_dial);
+        // ① 闭包持 Weak：本测试的 run 强引用只有这里的一个（工厂已 downgrade）
+        assert_eq!(
+            Arc::strong_count(&run),
+            1,
+            "闭包不得抬强计数（引用环回归——每 start/stop 周期泄漏一套对象）"
+        );
+        // ② run 在世：拨号抵达真实现（替身被调 = upgrade 成功路径）
+        let r1 = match dial(7802, Duration::from_secs(1)) {
+            Err(e) => e,
+            Ok(_) => panic!("替身不产流——不应成功"),
+        };
+        assert_eq!(r1.kind(), io::ErrorKind::AddrInUse, "替身透传");
+        assert!(run.called.load(Ordering::Acquire), "upgrade 成功应抵达 dial 实现");
+        // ③ run 收工（强引用清零）：闭包不复活对象，拨号 = NotConnected + 同词面
+        let weak = Arc::downgrade(&run);
+        drop(run);
+        assert!(weak.upgrade().is_none(), "前置：对象确已释放");
+        let err = match dial(7802, Duration::from_secs(1)) {
+            Err(e) => e,
+            Ok(_) => panic!("run 已释放——不应拨通"),
+        };
+        assert_eq!(err.kind(), io::ErrorKind::NotConnected);
+        assert_eq!(err.to_string(), "服务会话未就绪");
+    }
 }

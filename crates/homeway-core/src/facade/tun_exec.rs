@@ -140,9 +140,18 @@ impl Write for SessionWriteHalf {
                           // 背压环当「缓冲满」空转 10s——io::Write 约定空写返 Ok(0)）
         }
         let no_progress = Instant::now();
+        // R8-3 F12：零接纳时引擎把原 Vec 带回（WriteOut.back）——背压重试环不再
+        // 每拍重拷整段（此前 data.to_vec() 在循环内，2ms 节拍 × 整段 = 停滞期
+        // 常驻拷贝面）。
+        let mut pending: Option<Vec<u8>> = Some(data.to_vec());
         loop {
-            match self.shared.client.write(self.shared.id, data.to_vec()) {
-                Ok(0) => {
+            let chunk = match pending.take() {
+                Some(v) => v,
+                None => data.to_vec(), // 防御面：回执未带（不发生——引擎零接纳必带）
+            };
+            match self.shared.client.write(self.shared.id, chunk) {
+                Ok(w) if w.n == 0 => {
+                    pending = w.back;
                     if no_progress.elapsed() > Duration::from_secs(10) {
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
@@ -151,7 +160,7 @@ impl Write for SessionWriteHalf {
                     }
                     std::thread::sleep(Duration::from_millis(2));
                 }
-                Ok(n) => return Ok(n),
+                Ok(w) => return Ok(w.n),
                 Err(e) => return Err(io::Error::other(e.to_string())),
             }
         }
