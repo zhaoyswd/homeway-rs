@@ -574,19 +574,24 @@ impl BridgeHost {
                         let guard = Arc::new(guard);
                         let g1 = Arc::clone(&guard);
                         let g2 = Arc::clone(&guard);
+                        // 泵收口观测（R8-8b 转正式）：桥泵此前静默收口——上行 bulk 断流
+                        // 排障时无迹可循；累计字节 + 收口原因一行（有流量才打——
+                        // 空闲连接的常规收口零噪音）。
+                        let logf1 = Arc::clone(&self.logf);
+                        let logf2 = Arc::clone(&self.logf);
                         drop(guard);
                         std::thread::Builder::new()
                             .name("hw-bridge-pump".into())
                             .spawn(move || {
                                 let _g = g1;
-                                pump(&mut local_r, &mut *remote_w);
+                                pump(&mut local_r, &mut *remote_w, &logf1, "up");
                             })
                             .ok();
                         std::thread::Builder::new()
                             .name("hw-bridge-pump".into())
                             .spawn(move || {
                                 let _g = g2;
-                                pump(&mut *remote_r, &mut local_w);
+                                pump(&mut *remote_r, &mut local_w, &logf2, "down");
                             })
                             .ok();
                     }
@@ -686,15 +691,31 @@ impl BridgeHost {
 /// 单向泵：读尽即关对侧写端（EOF 传播——半关闭语义，FIN 穿透）；错误亦收口。
 /// 两侧为 trait 对象（工单⑤：远端是会话流/本机 UDS 的统一拆半面；桥连接非
 /// 热路径，dyn 派发开销可忽略）。
-fn pump(r: &mut dyn Read, w: &mut dyn WriteHalf) {
+fn pump(r: &mut dyn Read, w: &mut dyn WriteHalf, logf: &crate::Logf, dir: &'static str) {
     let mut buf = [0u8; 16 * 1024];
+    let mut dbg_n = 0u64;
+    let mut dbg_ok = 0u64;
     loop {
         match r.read(&mut buf) {
-            Ok(0) | Err(_) => break,
+            Ok(0) => {
+                if dbg_n > 0 {
+                    (logf)(&format!("桥泵[{dir}] EOF（累计 {dbg_n}B / {dbg_ok} 次）"));
+                }
+                break;
+            }
+            Err(_) => {
+                if dbg_n > 0 {
+                    (logf)(&format!("桥泵[{dir}] 读错误（累计 {dbg_n}B / {dbg_ok} 次）"));
+                }
+                break;
+            }
             Ok(n) => {
-                if w.write_all(&buf[..n]).is_err() {
+                dbg_n += n as u64;
+                if let Err(e) = w.write_all(&buf[..n]) {
+                    (logf)(&format!("桥泵[{dir}] 写失败 after {dbg_n}B：{e}"));
                     break;
                 }
+                dbg_ok += 1;
             }
         }
     }

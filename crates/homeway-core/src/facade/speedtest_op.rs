@@ -534,12 +534,12 @@ impl SpeedHost {
                 return speed_fail("invalid_arg", e);
             }
         };
+        // R8-8b 临时排障面（收口前回退）：引擎轮内日志落文件（sock 同目录——上行
+        // bulk 真机排障唯一证据源，App 形态无 stdout）。
         let logf = |s: &str| {
             // 轮内日志经 stderr？App 形态无 stdout 消费面——丢弃（判据行在 exit 侧）
             let _ = s;
         };
-        // 相位推进（M-7）：不预置 "down"——Status 面的相位/字节全跟引擎进度出口
-        // （down→up 切换 + 累计），轮结束写收尾相位；拨号期保持 "connecting"
         let cancel = std::sync::Arc::clone(&self.cancel);
         let live = std::sync::Arc::clone(&self.live);
         let outcome = app_run(&p.auth, &p.sock, &params, &logf, Some(&cancel), Some(&live));

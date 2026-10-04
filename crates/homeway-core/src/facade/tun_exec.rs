@@ -127,11 +127,30 @@ pub struct SessionWriteHalf {
 }
 
 impl Write for SessionWriteHalf {
+    /// 背压语义（R8-8b 上行 bulk 断流根因修复）：栈内 tx 缓冲满时 `send_slice` 返回
+    /// **Ok(0)**——io::Write 契约里 Ok(0) = 通道关（`write_all` 随即以 WriteZero 报错），
+    /// 桥泵据此拆连接 ⇒ 上行 bulk 一进慢链路（缓冲被 cwnd 门限速填满）就整轮断流
+    /// （真机实测：4 会话请求后 <1s 全 EOF；R7 E2E 的「上行帧中途断」同根因——
+    /// host 形态 CLI 走 ClientConn 的零进展重试环，此桥路径裸露）。这里把 Ok(0)
+    /// 展开成**有界等待重试**（Go net.Conn.Write 的阻塞语义）：重试节拍 2ms（RPC
+    /// 风暴防护——停滞期 ~500 次/s），无进展上限 10s（远大于窗口时长，防死锁兜底）。
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.shared
-            .client
-            .write(self.shared.id, data.to_vec())
-            .map_err(|e| io::Error::other(e.to_string()))
+        let no_progress = Instant::now();
+        loop {
+            match self.shared.client.write(self.shared.id, data.to_vec()) {
+                Ok(0) => {
+                    if no_progress.elapsed() > Duration::from_secs(10) {
+                        return Err(io::Error::new(
+                            io::ErrorKind::TimedOut,
+                            "写通道长时间无进展（栈内发送缓冲不排空）",
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(2));
+                }
+                Ok(n) => return Ok(n),
+                Err(e) => return Err(io::Error::other(e.to_string())),
+            }
+        }
     }
     fn flush(&mut self) -> io::Result<()> {
         Ok(())
