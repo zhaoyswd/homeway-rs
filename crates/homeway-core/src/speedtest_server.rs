@@ -246,16 +246,26 @@ impl SpeedtestServer {
             return;
         }
         let window_deadline = Instant::now() + window;
-        let mut per_sec: Vec<i64> = Vec::with_capacity(window.as_secs() as usize + 1);
+        // 片 = (载荷字节, 实际时长)——末片常为残片（<1s），尾速率按真实时长折算
+        // （评审 r1-F4：片数当秒数会把尾速率系统性低报至多 ~1/3）。
+        let mut per_sec: Vec<(i64, f64)> = Vec::with_capacity(window.as_secs() as usize + 1);
         loop {
             let now = Instant::now();
             if now >= window_deadline {
                 break;
             }
             let slice = (window_deadline - now).min(Duration::from_secs(1));
-            per_sec.push(pump_data(&mut bw, &block, &mut seq, slice));
+            let slice_t0 = Instant::now();
+            let b = pump_data(&mut bw, &block, &mut seq, slice);
+            per_sec.push((b, slice_t0.elapsed().as_secs_f64().min(1.0)));
+            // 评审 r1-F1：写错误早退——pump_data 写失败时本片快速返回，若仍剩窗口
+            // 时间继续空转（64KB 分配+立即失败的写）最长 MAX_WINDOW。0 字节且未到
+            // 截止 ⇒ 通道已断，跳出走 flush 的错误路径记行。
+            if b == 0 && Instant::now() < window_deadline {
+                break;
+            }
         }
-        let window_bytes: i64 = per_sec.iter().sum();
+        let window_bytes: i64 = per_sec.iter().map(|(b, _)| b).sum();
         if bw.flush().is_err() {
             (self.logf)(&format!("speedtest: 会话 #{id} 异常（下行发送：flush 失败）"));
             return;
@@ -265,12 +275,14 @@ impl SpeedtestServer {
             (self.logf)(&format!("speedtest: 会话 #{id} 异常（回报告：写失败）"));
             return;
         }
-        // 尾 3s 速率（不足 3s 取全部）：末段均值——与窗口均值对比即可判别
-        // 「窗口内仍在爬坡」（尾 ≫ 均值）还是「稳态封顶」（尾 ≈ 均值）。
+        // 尾 3s 速率（不足 3s 取全部，按各片真实时长折算）：末段均值——与窗口均值
+        // 对比即可判别「窗口内仍在爬坡」（尾 ≫ 均值）还是「稳态封顶」（尾 ≈ 均值）。
         let tail_secs = per_sec.len().min(3);
-        let tail_bytes: i64 = per_sec[per_sec.len() - tail_secs..].iter().sum();
-        let tail_mbps = if tail_secs > 0 {
-            tail_bytes as f64 * 8.0 / (tail_secs as f64 * 1_000_000.0)
+        let tail: Vec<&(i64, f64)> = per_sec[per_sec.len() - tail_secs..].iter().collect();
+        let tail_span: f64 = tail.iter().map(|(_, d)| d).sum();
+        let tail_bytes: i64 = tail.iter().map(|(b, _)| b).sum();
+        let tail_mbps = if tail_span > 0.0 {
+            tail_bytes as f64 * 8.0 / (tail_span * 1_000_000.0)
         } else {
             0.0
         };
@@ -279,12 +291,13 @@ impl SpeedtestServer {
             "speedtest: 会话 #{id} role=recv bytes={window_bytes}（含预热 {warmup_bytes}）用时={}ms",
             t0.elapsed().as_millis()
         ));
-        // R8-2 归因行（逐秒载荷 MB + 尾 3s Mbps）
+        // R8-2 归因行（词面与判据行区分——评审 r1-F13：`grep role=recv` 的会话计数
+        // 不受本行污染）。
         (self.logf)(&format!(
-            "speedtest: 会话 #{id} role=recv 逐秒MB=[{}] 尾{}s={tail_mbps:.0}Mbps",
+            "speedtest: 归因 #{id} 下行逐秒MB=[{}] 尾{}片({tail_span:.1}s)={tail_mbps:.0}Mbps",
             per_sec
                 .iter()
-                .map(|b| format!("{:.1}", *b as f64 / (1024.0 * 1024.0)))
+                .map(|(b, d)| format!("{:.1}/{:.0}s", *b as f64 / (1024.0 * 1024.0), d))
                 .collect::<Vec<_>>()
                 .join(","),
             tail_secs,

@@ -293,9 +293,11 @@ struct Engine {
     /// expired 重建执行位（一次性；避免每拍重建——update_timers 过期后每 tick 回错）。
     expired_pending: bool,
     silent_drops: u64,
-    /// 栈 B 收队列溢出丢弃的节流记行（R8-2 归因插桩：上次记行时刻——下行突发超
-    /// QUEUE_CAP 的丢弃是「出口 bulk 突发 vs 手机队列容量」失配的判别面）。
-    last_rx_drop_log: Option<Instant>,
+    /// 栈 B 收队列溢出丢弃的节流记行（R8-2 归因插桩）：已记行数 + 上次记行时的
+    /// 累计丢弃——**首 3 次 + 此后每 1000 包一行**（仓内计数记行同惯例，评审 r1-F10：
+    /// 纯时间节流在持续溢出形态下 1 行/秒无限刷）。
+    rx_drop_logs: u32,
+    last_rx_drop_logged_at: u64,
     time0: Instant,
     /// L3 直通的应用 TUN 源（None = 未 attach——transit 回包丢弃，Go hub 同义）。
     app_tun: Option<AppTun>,
@@ -361,21 +363,19 @@ impl Engine {
         }
         self.bind.tick_unlock();
         self.drain_udp(udp_buf);
-        // R8-2 归因插桩：栈 B 收队列溢出丢弃（节流 1s——只增打、有丢才打）。
-        // 下行 bulk 的出口突发（拦截栈单拍可产上千包）超 QUEUE_CAP=1024 时，
-        // 多余内层包在这里静默丢 ⇒ TCP 层大规模重传——本行即该丢失面的判据。
+        // R8-2 归因插桩：栈 B 收队列溢出丢弃（首 3 次 + 每 1000 包一行）。
+        // 下行 bulk 的出口突发（拦截栈单拍可产上千包）超 QUEUE_CAP 时，多余内层包
+        // 在这里静默丢 ⇒ TCP 层大规模重传——本行即该丢失面的判据。
         {
-            let now = Instant::now();
             let dropped = self.stack.device.rx_dropped();
             if dropped > 0
-                && self
-                    .last_rx_drop_log
-                    .map(|t| now.duration_since(t) >= Duration::from_secs(1))
-                    .unwrap_or(true)
+                && (self.rx_drop_logs < 3 || dropped - self.last_rx_drop_logged_at >= 1000)
             {
-                self.last_rx_drop_log = Some(now);
+                self.rx_drop_logs += 1;
+                self.last_rx_drop_logged_at = dropped;
                 (self.logf)(&format!(
-                    "wgcore: 栈B 收队列溢出（QUEUE_CAP=1024）累计丢弃 {dropped} 包——出口下行突发超队列容量"
+                    "wgcore: 栈B 收队列溢出（QUEUE_CAP={}）累计丢弃 {dropped} 包——出口下行突发超队列容量",
+                    crate::wgcore::stackb::QUEUE_CAP
                 ));
             }
         }
@@ -1002,7 +1002,8 @@ impl Client {
             peer_id: cfg.peer_id,
             expired_pending: false,
             silent_drops: 0,
-            last_rx_drop_log: None,
+            rx_drop_logs: 0,
+            last_rx_drop_logged_at: 0,
             time0: Instant::now(),
             app_tun: None,
             tun_counters: Arc::clone(&tun_counters),

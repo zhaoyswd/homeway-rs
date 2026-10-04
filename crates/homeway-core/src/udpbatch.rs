@@ -41,8 +41,10 @@ const BATCH: usize = 64;
 /// 失败后的余量不再尝试（非阻塞 socket 的 EAGAIN/不可达类错误对余量同型，
 /// 逐包重试只是把同错重复 N 遍）。
 ///
-/// R8-2 归因消融：环境变量 `HOMEWAY_UDP_NO_BATCH=1` 强制走逐包回退路径
-/// （Linux 上对照 sendmmsg 批量 vs 逐包的收益差——不设即平台默认，产品行为不变）。
+/// R8-2 归因消融：环境变量 `HOMEWAY_UDP_NO_BATCH`（**设非空即启用**，presence-only
+/// ——与 HOMEWAY_WG_DEBUG 同惯例；注释曾写 `=1` 属口径偏差，评审 r1-F7）强制走逐包
+/// 回退路径（Linux 上对照 sendmmsg 批量 vs 逐包的收益差——不设即平台默认，产品
+/// 行为不变）。
 pub fn send_batch(fd: RawFd, msgs: &[OutMsg<'_>]) -> (usize, Option<(SocketAddr, io::Error)>) {
     if msgs.is_empty() {
         return (0, None);
@@ -80,14 +82,15 @@ fn send_mmsg(fd: RawFd, msgs: &[OutMsg<'_>]) -> (usize, Option<(SocketAddr, io::
             hdrs[i].msg_hdr.msg_iov = &mut iovs[i] as *mut _ as *mut libc::iovec;
             hdrs[i].msg_hdr.msg_iovlen = 1;
         }
-        let r = unsafe {
-            libc::sendmmsg(
-                fd,
-                hdrs.as_mut_ptr(),
-                n as libc::c_uint,
-                libc::MSG_DONTWAIT as libc::c_uint,
-            )
-        };
+        // 评审 r1-补3 的 Linux 真跑兑现时抓到：sendmmsg 的 flags 形参类型两面不同
+        // （glibc/musl = c_int，OHOS libc 面 = c_uint）——R8-1 只在 OHOS 面编译验证
+        // 过，桌面/服务器 Linux（gnu）一直编不过。按 target_env 分面 cast（OHOS
+        // 三段名的 env 段 = "ohos"，target_os 两面都是 "linux"）。
+        #[cfg(target_env = "ohos")]
+        let flags = libc::MSG_DONTWAIT as libc::c_uint;
+        #[cfg(not(target_env = "ohos"))]
+        let flags = libc::MSG_DONTWAIT as libc::c_int;
+        let r = unsafe { libc::sendmmsg(fd, hdrs.as_mut_ptr(), n as libc::c_uint, flags) };
         if r < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted && sent_total == 0 && off == 0 {

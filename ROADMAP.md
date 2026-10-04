@@ -70,16 +70,12 @@ R8-2 已完成（2026-10-05，见 `docs/reviews/R8.md` §七 与 `docs/PERF-AB.m
 Linux sendmmsg 消融（臂已留 HOMEWAY_UDP_NO_BATCH，>100MB/s 档再验）。R8-2 原范围
 （用户升级指令前的三候选验证）处置表见 R8.md §七。
 
-1. **下行 0.5× 门缺口**（R8-1 真机 A/B 唯一未过判据：Rust exit 下行 14.7MB/s vs
-   Go 同刻 40.4MB/s = 0.36×，门 ≥0.5×）。归因候选与已排除项见 R8.md §二：
-   - 已排除：客户端批化（消融实测劣化已移除）、上行 bulk 断流（Ok(0)→WriteZero
-     已修——上行 109-279Mbps 完整轮）；
-   - 候选：出口侧发送形态（单驱动线程串行 encap+sendto，profile 78% sendto；
-     CUBIC 无 pacing 的窗口均值拉低）+ **Linux 出口（阿里云）的 sendmmsg 面真机
-     验证**（macOS 本地 exit 无 sendmmsg，只验了 staging 收益）；
-   - 顺手批：tier install-tier.sh 的 mtime 护栏只盯 .ets 不盯 .so 输入 + hvigor
-     对 prebuilt .so 缓存不重打包（R8-1 实测四次「装了旧核」假事故——判据 =
-     hilog `tun prepare ver=`，重出包须 rm module/build/default/outputs）。
+1. ~~下行 0.5× 门缺口~~ **R8-2 已归因收口**（PERF-AB §9）：三候选全部判明——
+   CUBIC 爬坡窗非主因（热态平坦）；出口「单线程串行成本」非主因（进程 0% CPU），
+   **真因 = 出口单 poll 倾泻 ≤2379 包的突发形态**；sendmmsg 验证撤销必要性
+   （syscall 面两个量级富余，消融臂 HOMEWAY_UDP_NO_BATCH 已留）。R8-1 的 0.36×
+   另含冷连测量 artifact——热态口径 B=0.73× 过门。顺手批已落（护栏补 .so 看守 +
+   模拟器目标陷阱两修）。修复（发送整形）= R8-3。
 2. r3 登记 ③ tier `homeway-rs.pin` 期望 SHA——与「仓归属」用户触点一并定。
 3. R8 原有收官项：共存定案（用户触点）、性能/包体终测报告定稿、tier 文档地图
    指针补录（用户触点）、本仓 AGENTS/README 定稿、遗留项清账移交。

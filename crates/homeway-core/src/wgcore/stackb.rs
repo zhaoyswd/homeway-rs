@@ -31,7 +31,7 @@ pub const MTU: usize = 1280;
 /// 每方向每连接 TCP 缓冲（Go netstack 同量级：files 帧 256KB 不触发零窗）。
 const TCP_BUF: usize = 1024 * 1024;
 /// Device RX/TX 队列深度（包数；满则丢 + 计数——burst 吞吐位）。
-const QUEUE_CAP: usize = 1024;
+pub(crate) const QUEUE_CAP: usize = 1024;
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -87,7 +87,7 @@ impl TunDevice {
     }
 
     /// 收队列溢出丢弃的累计计数（R8-2 归因插桩——驱动线程节流记行消费）。
-    pub fn rx_dropped(&self) -> u64 {
+    pub(crate) fn rx_dropped(&self) -> u64 {
         self.rx_dropped
     }
 
@@ -236,7 +236,10 @@ impl StackB {
         // （测速上行/files 上传）此前是 0.11 的「整窗突发 + RTO go-back-N」形态，真机
         // 有损 WiFi 下吞吐塌陷（E2E §6 A5' 上行 bulk 退化的机制归因，同 R6.6 下行）。
         // 线上行为（wire 字节）不可见差异——性能选择，无对齐义务（R6.6 垫片同口径）。
-        // R8-2：HOMEWAY_CC 消融（归因插桩，默认仍 CUBIC）。
+        // R8-2：HOMEWAY_CC 消融（归因插桩，默认仍 CUBIC）。注（评审 r1-F7）：
+        // StackB 无 logf——客户端臂（上行 bulk 发送方）设错值静默回落 CUBIC 且无
+        // 记行面；上行消融轮以出口侧判据（E13/归因行）交叉核对，或后续给 StackB
+        // 引日志面时补同款一次性记行。
         sock.set_congestion_control(crate::cc_choice());
         let handle = self.sockets.add(sock);
         let local = self.alloc_local_port();

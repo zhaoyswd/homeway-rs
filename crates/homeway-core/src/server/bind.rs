@@ -115,8 +115,11 @@ pub struct ServerBind {
     /// send_to 失败有日志无计数；批化后短返余量既无日志也无计数（静默）——本计数
     /// 补观测面（日志 100 次一行节流；与 leg_dropped 同范式）。
     tx_dropped: u64,
-    /// 批量出站形态统计（R8-2 归因插桩）：发送调用数 / 累计包数 / 单调用最大包数
+    /// 批量出站形态统计（R8-2 归因插桩）：发送调用数 / 累计包数 / **本观察窗**单调用
+    /// 峰值包数（消费即清零——评审 r1-F5：生命周期累计 max 会污染后续所有窗口行）
     /// ——「每拍实际排空几包」（唤醒粒度）的判别面。空闲不增长，5s 周期行由引擎打。
+    /// 注（r1-F6）：tx_pkgs 按入批计（含被丢弃的余量——「攒了几包」口径）；
+    /// tx_bytes 按成功前缀计——drops>0 时均包 B 低报（实测轮 drops=0 不受影响）。
     tx_calls: u64,
     tx_pkgs: u64,
     tx_batch_max: usize,
@@ -673,10 +676,13 @@ impl ServerBind {
         self.sock.as_raw_fd()
     }
 
-    /// 批量出站形态快照（R8-2 归因插桩）：(调用数, 累计包数, 单调用最大包数,
-    /// 累计丢弃包数)——均批 = pkgs/calls；引擎 5s 周期行消费。
-    pub fn tx_batch_stats(&self) -> (u64, u64, usize, u64) {
-        (self.tx_calls, self.tx_pkgs, self.tx_batch_max, self.tx_dropped)
+    /// 批量出站形态快照（R8-2 归因插桩）：(调用数, 累计包数, **本窗**单调用峰值
+    /// 包数, 累计丢弃包数)——均批 = pkgs/calls。峰值消费即清零（窗口语义）；计数
+    /// 累计（丢弃计数恒累计——失败面的单调观测）。
+    pub(crate) fn tx_batch_stats(&mut self) -> (u64, u64, usize, u64) {
+        let m = self.tx_batch_max;
+        self.tx_batch_max = 0;
+        (self.tx_calls, self.tx_pkgs, m, self.tx_dropped)
     }
 
     /// 从本 socket 直接发裸载荷（STUN 请求等 3e 面；SendRawTo 同义——与数据面同端口）。

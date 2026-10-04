@@ -1988,6 +1988,7 @@ mod tests {
         let (secs, bytes, down, tail) =
             run_shaped_download(1, 64 * 1024 * 1024, DirLink::deep(), DirLink::deep());
         let got = bytes as f64 / secs / (1024.0 * 1024.0);
+        let tail = tail.expect("64MB 深队列臂实测 >2s（爬坡即 >1.5s）——尾窗必在");
         println!(
             "A 单流：无损天花板 {ceiling:.1}MB/s → 深队列有损 {got:.1}MB/s 尾2s={tail:.1}MB/s（丢 {} 包 / 峰值队列 {}B）",
             down.dropped, down.peak_queue
@@ -2035,7 +2036,10 @@ mod tests {
         // B：浅队列（192KB ≪ BDP）——修复前真代码（无门控无 pacing）实测 0.4MB/s
         // （2026-10-04，commit c0a244f 前的 4325c1b 基线 + 同链路形态；部分消融
         // 〔仅去 allowed 上限、保留 pacing〕实测 5.2MB/s，介于两者之间——判据下界
-        // 取保守的 3.2MB/s = 0.4×8）
+        // 取保守的 3.2MB/s = 0.4×8）。⚠️ 绝对门 0 余量（评审 r1-F18 实复现：负载下
+        // 3.2 vs 门 3.2 红；闲机 3.2-3.4、旧垫片 8.1）——R8-1 F5 的「自校准分母」
+        // 整改挂 R8-3（再动阈值需对照跑先行，8f 已备数据）；引用本臂数字一律带
+        // 负载状态（闲机/负载）。
         let (secs, bytes, downb, _) =
             run_shaped_download(1, 8 * 1024 * 1024, DirLink::shallow(), DirLink::shallow());
         let gotb = bytes as f64 / secs / (1024.0 * 1024.0);
@@ -2138,19 +2142,18 @@ mod tests {
         }
     }
 
-    /// 尾窗（最后 2s）平均速率，MB/s（R8-2 8g 尾窗速率门的计算面——传输不足 2s
-    /// 返回 0.0，由调用方决定是否设门）。采样线取「≤ t-2s 的最后一点」与收尾点的
-    /// 字节差 ÷ 实际时长（尾段首点晚于 t-2s 时用更短的实际窗口）。
-    fn tail_rate_mbps(timeline: &[(f64, usize)], t_end: f64, total: usize) -> f64 {
-        let idx = timeline.iter().rposition(|(t, _)| *t <= t_end - 2.0);
-        let Some(&(_, base)) = idx.map(|i| &timeline[i]) else {
-            return 0.0;
-        };
-        let span = t_end - timeline[idx.unwrap()].0;
-        if span <= 0.0 {
-            return 0.0;
-        }
-        (total - base) as f64 / span / (1024.0 * 1024.0)
+    /// 尾窗（最后 2s）平均速率，MB/s（R8-2 8g 尾窗速率门的计算面）。`None` =
+    /// 传输不足 2s（首采样点在 t≈0 预置下必在；无 ≤ t-2s 的点 ⇒ 窗口太短）——
+    /// 类型承担不变量，设门侧必须显式处理（评审 r1-F3：0.0 哨兵会被当真速率）。
+    /// span 构造上 ≥2s（取样点 t ≤ t_end-2）——无除零面。
+    fn tail_rate_mbps(timeline: &[(f64, usize)], t_end: f64, total: usize) -> Option<f64> {
+        let (_, base) = timeline
+            .iter()
+            .rev()
+            .find(|(t, _)| *t <= t_end - 2.0)
+            .copied()?;
+        let span = t_end - timeline.iter().rev().find(|(t, _)| *t <= t_end - 2.0)?.0;
+        Some((total - base) as f64 / span / (1024.0 * 1024.0))
     }
 
     /// 一轮受控下载：n_flows 条并发流（各一台栈 B 客户端，独立隧道 IP）经共享的上/下
@@ -2160,7 +2163,7 @@ mod tests {
         bytes_each: usize,
         mut up: DirLink,
         mut down: DirLink,
-    ) -> (f64, usize, DirLink, f64) {
+    ) -> (f64, usize, DirLink, Option<f64>) {
         // origin：回环 TCP，每连接写满 bytes_each 后 shutdown 写半边
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
