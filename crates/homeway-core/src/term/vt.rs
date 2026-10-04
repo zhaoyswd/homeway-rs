@@ -806,13 +806,27 @@ fn scan_out_of_table(s: &[u8], mut from: usize) -> Option<(usize, OutOfTableHit)
         }
         // DCS $q：`\x1bP` + [0-9;:]* + `$q` + ≤2 非 ESC 载荷 + `\x1b\`
         // （ghostty dcs.zig：参数不设限；载荷第 3 字节起丢弃且**不**应答——扫描器
-        // 以「载荷 ≤2」为完整模式的一部分，3+ 载荷自然不匹配）
+        // 以「载荷 ≤2」为完整模式的一部分，3+ 载荷自然不匹配）。
+        // 参数段门（6e 向量钉死 ghostty 实跑形态）：分号参数 >24 个（≥24 个 ';'）或
+        // 出现冒号子参数 ⇒ 整条静默丢（不应答）；单参数不限字节长。
         if s.len() - i >= 3 && s[i + 1] == b'P' {
             let mut j = i + 2;
+            let mut semis = 0usize;
+            let mut colon = false;
             while j < s.len() && matches!(s[j], b'0'..=b'9' | b';' | b':') {
+                if s[j] == b';' {
+                    semis += 1;
+                } else if s[j] == b':' {
+                    colon = true;
+                }
                 j += 1;
             }
-            if s.len() - j >= 2 && s[j] == b'$' && s[j + 1] == b'q' {
+            if s.len() - j >= 2
+                && s[j] == b'$'
+                && s[j + 1] == b'q'
+                && semis < 24
+                && !colon
+            {
                 let mut k = j + 2;
                 while k < s.len() && s[k] != 0x1b && k < j + 4 {
                     k += 1; // 载荷至多 2 字节

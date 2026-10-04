@@ -20,6 +20,9 @@ TPL3="$REPO_ROOT/tools/vector-gen/term/vecgen_term_test.go"
 TARGET3="$CLONE/pkg/term/vt/vecgen_term_test.go"
 TPL3A="$REPO_ROOT/tools/vector-gen/term/vecgen_term_aux.go"
 TARGET3A="$CLONE/pkg/term/vt/vecgen_term_aux.go"
+# R6 6e：surface 体编码向量（pkg/term——encSnapshotBody 等未导出面在包内直调）
+TPL4="$REPO_ROOT/tools/vector-gen/term/vecgen_surface_test.go"
+TARGET4="$CLONE/pkg/term/vecgen_surface_test.go"
 OUT="$REPO_ROOT/fixtures/vectors"
 
 "$REPO_ROOT/tools/check-baseline.sh"
@@ -28,7 +31,8 @@ cp "$TPL" "$TARGET"
 cp "$TPL2" "$TARGET2"
 cp "$TPL3" "$TARGET3"
 cp "$TPL3A" "$TARGET3A"
-cleanup() { rm -f "$TARGET" "$TARGET2" "$TARGET3" "$TARGET3A"; }
+cp "$TPL4" "$TARGET4"
+cleanup() { rm -f "$TARGET" "$TARGET2" "$TARGET3" "$TARGET3A" "$TARGET4"; }
 trap cleanup EXIT
 
 cd "$CLONE"
@@ -45,6 +49,10 @@ echo "==> 克隆内运行 term 编码/应答向量生成（go test -run TestVecg
 HOMEWAY_VECGEN_OUT="$OUT" GOTOOLCHAIN=go1.24.5 \
   go test ./pkg/term/vt/ -run 'TestVecgenTerm' -count=1 -v > /tmp/vecgen-term.log 2>&1
 grep -E '^(=== RUN|--- |ok|FAIL|PASS)' /tmp/vecgen-term.log | head -8
+echo "==> 克隆内运行 surface 体编码向量生成（go test -run TestVecgenSurface）"
+HOMEWAY_VECGEN_OUT="$OUT" GOTOOLCHAIN=go1.24.5 \
+  go test ./pkg/term/ -run 'TestVecgenSurface' -count=1 -v > /tmp/vecgen-surface.log 2>&1
+grep -E '^(=== RUN|--- |ok|FAIL|PASS)' /tmp/vecgen-surface.log | head -5
 
 cd "$REPO_ROOT"
 echo "==> 产物："; find "$OUT" -type f -name '*.json' -exec stat -f '    %N (%z 字节)' {} \;

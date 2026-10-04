@@ -1,0 +1,2329 @@
+{
+  "cells": [
+    {
+      "name": "blank_row",
+      "cols": 10,
+      "rows_in": [
+        {
+          "y": 0,
+          "cells": [
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            }
+          ]
+        }
+      ],
+      "grid_hex": "010a0001000000000a",
+      "rows_hex": "0000000a",
+      "note": "全空白行 → 单 blankRun"
+    },
+    {
+      "name": "blank_127",
+      "cols": 127,
+      "rows_in": [
+        {
+          "y": 0,
+          "cells": [
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            }
+          ]
+        }
+      ],
+      "grid_hex": "017f0001000000007f",
+      "rows_hex": "0000007f",
+      "note": "varint 单字节上限"
+    },
+    {
+      "name": "blank_128",
+      "cols": 128,
+      "rows_in": [
+        {
+          "y": 0,
+          "cells": [
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            }
+          ]
+        }
+      ],
+      "grid_hex": "01800001000000008001",
+      "rows_hex": "0000008001",
+      "note": "varint 双字节起"
+    },
+    {
+      "name": "blank_300",
+      "cols": 300,
+      "rows_in": [
+        {
+          "y": 0,
+          "cells": [
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            }
+          ]
+        }
+      ],
+      "grid_hex": "012c010100000000ac02",
+      "rows_hex": "000000ac02",
+      "note": "varint 多字节"
+    },
+    {
+      "name": "repeat_box",
+      "cols": 10,
+      "rows_in": [
+        {
+          "y": 0,
+          "cells": [
+            {
+              "sym": "─",
+              "width": 1,
+              "fg": "AQQ="
+            },
+            {
+              "sym": "─",
+              "width": 1,
+              "fg": "AQQ="
+            },
+            {
+              "sym": "─",
+              "width": 1,
+              "fg": "AQQ="
+            },
+            {
+              "sym": "─",
+              "width": 1,
+              "fg": "AQQ="
+            },
+            {
+              "sym": "─",
+              "width": 1,
+              "fg": "AQQ="
+            },
+            {
+              "sym": "─",
+              "width": 1,
+              "fg": "AQQ="
+            },
+            {
+              "sym": "─",
+              "width": 1,
+              "fg": "AQQ="
+            },
+            {
+              "sym": "─",
+              "width": 1,
+              "fg": "AQQ="
+            },
+            {
+              "sym": "─",
+              "width": 1,
+              "fg": "AQQ="
+            },
+            {
+              "sym": "─",
+              "width": 1,
+              "fg": "AQQ="
+            }
+          ]
+        }
+      ],
+      "grid_hex": "010a00010000000103e2948001040000000209",
+      "rows_hex": "00000103e2948001040000000209",
+      "note": "全重复行 → 首格 cell + repeatRun"
+    },
+    {
+      "name": "cell_blank_cell",
+      "cols": 6,
+      "rows_in": [
+        {
+          "y": 0,
+          "cells": [
+            {
+              "sym": "A",
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "sym": "B",
+              "width": 1
+            }
+          ]
+        }
+      ],
+      "grid_hex": "0106000100000001014100000000000301014200000000",
+      "rows_hex": "000001014100000000000301014200000000",
+      "note": "cell→blank→cell：flush 顺序"
+    },
+    {
+      "name": "repeat_blank_repeat",
+      "cols": 8,
+      "rows_in": [
+        {
+          "y": 0,
+          "cells": [
+            {
+              "sym": "─",
+              "width": 1,
+              "fg": "AQQ="
+            },
+            {
+              "sym": "─",
+              "width": 1,
+              "fg": "AQQ="
+            },
+            {
+              "sym": "─",
+              "width": 1,
+              "fg": "AQQ="
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "sym": "─",
+              "width": 1,
+              "fg": "AQQ="
+            },
+            {
+              "sym": "─",
+              "width": 1,
+              "fg": "AQQ="
+            },
+            {
+              "sym": "─",
+              "width": 1,
+              "fg": "AQQ="
+            }
+          ]
+        }
+      ],
+      "grid_hex": "010800010000000103e294800104000000020200020103e2948001040000000202",
+      "rows_hex": "00000103e294800104000000020200020103e2948001040000000202",
+      "note": "repeat→blank→repeat：两个 repeatRun 被空白隔开"
+    },
+    {
+      "name": "blank_repeat_blank",
+      "cols": 7,
+      "rows_in": [
+        {
+          "y": 0,
+          "cells": [
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "sym": "─",
+              "width": 1,
+              "fg": "AQQ="
+            },
+            {
+              "sym": "─",
+              "width": 1,
+              "fg": "AQQ="
+            },
+            {
+              "sym": "─",
+              "width": 1,
+              "fg": "AQQ="
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            }
+          ]
+        }
+      ],
+      "grid_hex": "0107000100000000020103e29480010400000002020002",
+      "rows_hex": "000000020103e29480010400000002020002",
+      "note": "blank→repeat→blank：首 repeat 前无 prev 格"
+    },
+    {
+      "name": "wide_tail",
+      "cols": 4,
+      "rows_in": [
+        {
+          "y": 3,
+          "cells": [
+            {
+              "sym": "宽",
+              "width": 2
+            },
+            {
+              "skip": true
+            },
+            {
+              "sym": "A",
+              "width": 1
+            },
+            {
+              "width": 1
+            }
+          ]
+        }
+      ],
+      "grid_hex": "010400010003000103e5aebd00000000018000000000010141000000000001",
+      "rows_hex": "03000103e5aebd00000000018000000000010141000000000001",
+      "note": "宽字符 + 占位格（skipBit）+ 尾部空白"
+    },
+    {
+      "name": "colors",
+      "cols": 4,
+      "rows_in": [
+        {
+          "y": 0,
+          "cells": [
+            {
+              "sym": "a",
+              "width": 1
+            },
+            {
+              "sym": "b",
+              "width": 1,
+              "fg": "AcQ=",
+              "bg": "ARE="
+            },
+            {
+              "sym": "c",
+              "width": 1,
+              "fg": "AgoUHg==",
+              "bg": "AgECAw=="
+            },
+            {
+              "sym": "d",
+              "width": 1,
+              "bg": "AQA="
+            }
+          ]
+        }
+      ],
+      "grid_hex": "010400010000000101610000000001016201c401110000010163020a141e0201020300000101640001000000",
+      "rows_hex": "00000101610000000001016201c401110000010163020a141e0201020300000101640001000000",
+      "note": "none/palette/rgb 三 kind 的 fg×bg 组合"
+    },
+    {
+      "name": "attr_bits",
+      "cols": 9,
+      "rows_in": [
+        {
+          "y": 0,
+          "cells": [
+            {
+              "sym": "x",
+              "width": 1,
+              "attr": 1
+            },
+            {
+              "sym": "x",
+              "width": 1,
+              "attr": 2
+            },
+            {
+              "sym": "x",
+              "width": 1,
+              "attr": 4
+            },
+            {
+              "sym": "x",
+              "width": 1,
+              "attr": 8
+            },
+            {
+              "sym": "x",
+              "width": 1,
+              "attr": 16
+            },
+            {
+              "sym": "x",
+              "width": 1,
+              "attr": 32
+            },
+            {
+              "sym": "x",
+              "width": 1,
+              "attr": 64
+            },
+            {
+              "sym": "x",
+              "width": 1,
+              "attr": 128
+            },
+            {
+              "sym": "x",
+              "width": 1,
+              "attr": 258
+            }
+          ]
+        }
+      ],
+      "grid_hex": "01090001000000010178000001000101780000020001017800000400010178000008000101780000100001017800002000010178000040000101780000800001017800000201",
+      "rows_hex": "0000010178000001000101780000020001017800000400010178000008000101780000100001017800002000010178000040000101780000800001017800000201",
+      "note": "attr 各位 + 下划线样式位（bit8..11）"
+    },
+    {
+      "name": "styled_space",
+      "cols": 3,
+      "rows_in": [
+        {
+          "y": 0,
+          "cells": [
+            {
+              "bg": "AgkJCQ==",
+              "attr": 16
+            },
+            {
+              "width": 1
+            },
+            {
+              "sym": "Z",
+              "width": 1
+            }
+          ]
+        }
+      ],
+      "grid_hex": "01030001000000010000020909091000000101015a00000000",
+      "rows_hex": "0000010000020909091000000101015a00000000",
+      "note": "带样式空格（sym 空但 attr/bg 非零 → 非 blank，编完整格）+ 中间无样式空白格"
+    },
+    {
+      "name": "multi_row_nonseq",
+      "cols": 4,
+      "rows_in": [
+        {
+          "y": 5,
+          "cells": [
+            {
+              "sym": "─",
+              "width": 1,
+              "fg": "AQQ="
+            },
+            {
+              "sym": "─",
+              "width": 1,
+              "fg": "AQQ="
+            },
+            {
+              "sym": "─",
+              "width": 1,
+              "fg": "AQQ="
+            },
+            {
+              "sym": "─",
+              "width": 1,
+              "fg": "AQQ="
+            }
+          ]
+        },
+        {
+          "y": 2,
+          "cells": [
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            }
+          ]
+        },
+        {
+          "y": 9,
+          "cells": [
+            {
+              "sym": "Q",
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            }
+          ]
+        }
+      ],
+      "grid_hex": "010400030005000103e2948001040000000203020000040900010151000000000003",
+      "rows_hex": "05000103e2948001040000000203020000040900010151000000000003",
+      "note": "行序不连续：y 按给定值原样编码"
+    },
+    {
+      "name": "cols0_empty_row",
+      "cols": 0,
+      "rows_in": [
+        {
+          "y": 0,
+          "cells": null
+        }
+      ],
+      "grid_hex": "01000001000000",
+      "rows_hex": "0000",
+      "note": "cols=0 的空行（头 + y，格流为空）"
+    },
+    {
+      "name": "long_grapheme",
+      "cols": 5,
+      "rows_in": [
+        {
+          "y": 0,
+          "cells": [
+            {
+              "sym": "é",
+              "width": 1
+            },
+            {
+              "sym": "é",
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            },
+            {
+              "width": 1
+            }
+          ]
+        }
+      ],
+      "grid_hex": "010500010000000102c3a900000000010365cc81000000000003",
+      "rows_hex": "00000102c3a900000000010365cc81000000000003",
+      "note": "多字节 symbol（symLen \u003e 1）"
+    }
+  ],
+  "cells_bad": [
+    {
+      "name": "bad_version",
+      "in_hex": "020a0001000000000a",
+      "count": 0,
+      "cols": 0,
+      "note": "版本字节 ≠ 1"
+    },
+    {
+      "name": "truncated_header",
+      "in_hex": "010a0001",
+      "count": 0,
+      "cols": 0,
+      "note": "头都不全"
+    },
+    {
+      "name": "bad_marker",
+      "in_hex": "010a0001000000030a",
+      "count": 1,
+      "cols": 10,
+      "note": "格流标记 0x03（表外值）"
+    },
+    {
+      "name": "bad_color_kind",
+      "in_hex": "0101000100000001014103000000",
+      "count": 1,
+      "cols": 1,
+      "note": "完整格的颜色 kind 0x03"
+    },
+    {
+      "name": "repeat_first",
+      "in_hex": "010a0001000000020a",
+      "count": 1,
+      "cols": 10,
+      "note": "行首 repeat（无上一格）"
+    },
+    {
+      "name": "varint_unterminated",
+      "in_hex": "010a00010000000080808080808080808080",
+      "count": 1,
+      "cols": 10,
+      "note": "varint 10 字节未终止"
+    },
+    {
+      "name": "row_short",
+      "in_hex": "010a0001000000000a",
+      "count": 2,
+      "cols": 10,
+      "note": "DecodeRows 行数声明 \u003e 实有"
+    }
+  ],
+  "snapshot": [
+    {
+      "name": "minimal",
+      "body_hex": "04010000005000180000000000000000000000000000000000000000000000000000000000000000000000000000000000",
+      "note": "全零字段（空 title/grid/mirror 也带长度位）"
+    },
+    {
+      "name": "full",
+      "body_hex": "04040302016400200009001e000f03ff0000001f01cb04fb711f010000b504fb711f01000020000c00e6a087e9a2982d7469746c6513000000010400010000000103e294800104000000020309000000010400010000000004",
+      "note": "全字段（光标块 6B 含全部 flag 位；title 是原始字节长度）"
+    },
+    {
+      "name": "empty_title_nonempty_grid",
+      "body_hex": "040700000004000100030000000101000000000000050000000000000004000000000000000100000013000000010400010000000103e294800104000000020300000000",
+      "note": "空 title + 有 grid + 无 mirror"
+    }
+  ],
+  "diff": [
+    {
+      "name": "zero_rows",
+      "body_hex": "040300000050001800000001000200010022000000090000000000000003000000000000000600",
+      "note": "rowCount=0 合法帧（只有光标/模式位/回滚条变化）"
+    },
+    {
+      "name": "with_rows",
+      "body_hex": "0408000000040001000100020000000302ff00000004000000000000000300000000000000010007000103e2948001040000000203",
+      "note": "带脏行序列"
+    }
+  ],
+  "fetch_req": [
+    {
+      "name": "basic",
+      "body_hex": "07000000000000000c00"
+    },
+    {
+      "name": "max",
+      "body_hex": "00000000000000000002"
+    },
+    {
+      "name": "large_from",
+      "body_hex": "ffffffffffffffff0100"
+    }
+  ],
+  "fetch_reply": [
+    {
+      "name": "empty",
+      "body_hex": "04020000005000180001000000000000000000",
+      "note": "越界截断后空行集"
+    },
+    {
+      "name": "with_rows",
+      "body_hex": "0409000000040001000000000000000000010007000103e2948001040000000203"
+    }
+  ],
+  "fragment": [
+    {
+      "name": "empty",
+      "in_hex": "",
+      "frags": [
+        {
+          "flags": 0,
+          "hex": ""
+        }
+      ],
+      "note": "空数据也发一片（flags=0、data 空）"
+    },
+    {
+      "name": "small",
+      "in_hex": "010203ff",
+      "frags": [
+        {
+          "flags": 0,
+          "hex": "010203ff"
+        }
+      ]
+    }
+  ]
+}

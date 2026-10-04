@@ -175,6 +175,18 @@ func TestVecgenTermResponder(t *testing.T) {
 		{name: "decrqss_sgr", query: "\x1bP$qm\x1b\\"},
 		{name: "decrqss_decscusr", query: "\x1bP$q q\x1b\\"},
 		{name: "decrqss_unknown", query: "\x1bP$qzz\x1b\\"},
+		// 编码器评审 r1-低⑤ 补案：DCS 参数段 >32B（跨块续接的病态窗口；Rust 回归先行，
+		// 本向量把 Go/ghostty 的应答面钉进对照集）。两种形态分开钉：单参数 40B = 应答；
+		// 41 个分号参数 = vte 参数数溢出 ⇒ 静默丢（不应答）。
+		{name: "decrqss_param40bytes", query: "\x1bP" + strings.Repeat("5", 40) + "$qm\x1b\\"},
+		{name: "decrqss_param40bytes_sgr_setup", setup: "\x1b[1;4m", query: "\x1bP" + strings.Repeat("9", 40) + "$qm\x1b\\"},
+		{name: "decrqss_many_params_41", query: "\x1bP" + strings.Repeat("1;", 40) + "$qm\x1b\\"},
+		// 参数数/子参数边界（探针实测钉死）：≤24 个分号参数仍应答、25 个起静默丢；
+		// 冒号子参数（:）出现即静默丢；单参数不限字节长（40B/1000B 同答）。
+		{name: "decrqss_params_24", query: "\x1bP" + strings.Repeat("1;", 23) + "1$qm\x1b\\"},
+		{name: "decrqss_params_25", query: "\x1bP" + strings.Repeat("1;", 24) + "1$qm\x1b\\"},
+		{name: "decrqss_colon_subparam", query: "\x1bP1:2$qm\x1b\\"},
+		{name: "decrqss_single_param_1000b", query: "\x1bP" + strings.Repeat("7", 1000) + "$qm\x1b\\"},
 		{name: "xtgettcap_TN", query: "\x1bP+q544e\x1b\\"},
 		{name: "xtgettcap_unknown", query: "\x1bP+q6162\x1b\\"}, // "ab"
 		// 门一评审 F4：mode 2048（in-band size reports）set 即报一次尺寸
@@ -471,6 +483,13 @@ func TestVecgenTermMouseenc(t *testing.T) {
 		{"m1000utf8", "\x1b[?1000h\x1b[?1005h"},
 		{"m1002utf8", "\x1b[?1002h\x1b[?1005h"},
 		{"mx10", "\x1b[?9h"},
+		// 交错 set/unset（编码器评审 r1-中③ B5 无条件覆盖/归零语义——Rust 侧交错回归先行，
+		// 本组把 Go/ghostty 实跑行为钉进对照集）
+		{"m1000_1002", "\x1b[?1000h\x1b[?1002h"},
+		{"m1000_1002_unset1000", "\x1b[?1000h\x1b[?1002h\x1b[?1000l"},
+		{"m1002_unset1002", "\x1b[?1002h\x1b[?1002l"},
+		{"m1006_then_unset1005", "\x1b[?1000h\x1b[?1006h\x1b[?1005l"},
+		{"m1003_then_unset1003", "\x1b[?1003h\x1b[?1003l"},
 	}
 	events := []struct {
 		name string
