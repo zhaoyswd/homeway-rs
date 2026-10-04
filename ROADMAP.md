@@ -56,14 +56,20 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 | **R3** | 出口（多 peer WG device + 拦截层 + files/DNS/STUN/UPnP + servercore） | **完成**（2026-10-02：两道门全过 + 判据全量实测入册） | 6/6 步 |
 | **R4** | 中继（信封 + 准入 + 升级条纹） | **完成**（2026-10-03：两道门全过 + 三链路判据实测 + 升级条纹实测） | 4/4 步 |
 | **R5** | 互操作矩阵全量 + fuzz + 性能 A/B + 台账三方门 | **完成**（2026-10-03：两道门全过〔两轮代码评审 4高/15中/18低全处置〕+ 终验轮 4 六链路 + L3 复跑全绿 + PERF-AB 入库 + ci-local 一键门全绿） | 6/6 步 |
-| **R6** | term 服务面（协议/surface 产出/检测引擎 + 自建编码器/应答器） | **进行中**（2026-10-04 会话 1-4：6a 设计 + 6b vt 底座 + 门一评审〔4高全修〕+ 6c 编码器/应答器全量〔键 387+/鼠 245/应答 64 向量逐字节全绿 + 编码器评审 1高3中11低全处置〕+ 6d 帧族/词表面/会话注册表 + 6e surface 体编码〔surface_codec 向量逐字节 + golden 两向全绿〕+ 6f-1 manifest 引擎〔region 40 + 求值 44 逐规则对拍全绿〕+ 6f-2 检测融合/扫描器/卫生 + 6f-3a PTY/环；**待做 = 6f-3b 会话装配与引擎接线 + 6g**；详见 R6 节进度注记） | 6a/6b/6c/6e ✅ 门一 ✅ 6d ✅ 6f ◐ |
+| **R6** | term 服务面（协议/surface 产出/检测引擎 + 自建编码器/应答器） | **完成**（2026-10-04 五棒收官：6a 设计 + 6b vt 底座 + 门一〔4高全修〕+ 6c 编码器/应答器全量〔键 387+/鼠 245/应答 64 向量全绿〕+ 6d 帧族/会话注册表 + 6e surface 体编码〔golden 两向全绿〕+ 6f-1/2 manifest 引擎+检测融合 + 6f-3a PTY/环 + 6f-3b 会话装配/引擎接线〔八模块装成 TermService：ServeConn/raw 腿握手与停滞写者/surface 投递/pump/sample/LIST/EXPLAIN/HOMEWAY_TERM=off；D-19 信号死 -1 映射〕+ 6g 判据实测〔Go term CLI 消费 Rust term 服务全流程 + 检测三态 + linux 交叉面清账 + 判据行入册〕+ 门二两轮〔高3+2/中4+3/低9+10 全处置，评审记录 docs/reviews/R6.md〕+ ci-local 七步全绿） | 6a-6g ✅ 门一/门二 ✅ |
 | **R7** | APP 接入（napi-rs 或 C-ABI 胶水 + OHOS 交叉 + 20 导出面 + hostsession） | 未开始 | — |
 | **R8** | 终测收官（包体/性能终测 + 共存定案 + 文档指针补录） | 未开始 | — |
 
-**下一步（当前指针）**：**R6 6f-3b 会话装配 + 引擎接线**（term/service.rs——把
-frames/session/codec/manifest/scan/agent/pty/ring 八模块装成 TermService，挂 engine.rs
-UDS；接棒从本节「R6 进度注记」第 4 棒段读起）。R5 已收官（2026-10-03，两道门
-全过，评审记录 = `docs/reviews/R5.md`、性能报告 = `docs/PERF-AB.md`）。
+**下一步（当前指针）**：**R7 APP 接入**（napi-rs OHOS 支持评估〔退路 = C-ABI +
+手写 NAPI 胶水，PoC 已验证交叉与链接配方〕→ 20 个导出面实装 → hostsession/facade
+→ HSP 集成〔动 tier 跟踪文件——用户触点〕→ 词表门三方化 → 真机判据全量）。
+**R7 开工前置**：①发版会话收官（homeway Go 侧 v0.16.0 之后有无在途 change——由
+用户确认）②用户点头（硬规则 2）。另带 **R5 移交的 CLI 双会话治理项**（Rust CLI
+files/speedtest 动词与常驻 connect 同 identity 并发的 foot-gun——与 hostsession/
+常驻会话设计一并定，见 docs/reviews/R2.md 豁免表）。
+
+R6 已收官（2026-10-04，两道门全过 + 判据实测入册 + ci-local 全绿；评审记录 =
+`docs/reviews/R6.md`〔两轮〕）。
 
 **R6 进度注记（2026-10-04，接棒真源）**：
 
@@ -169,6 +175,40 @@ UDS；接棒从本节「R6 进度注记」第 4 棒段读起）。R5 已收官�
 - **6g 待做（6f-3b 后）**：local-rust-exit + Go term CLI 全流程判据 / 检测三态判据 /
   surface 快照+差分真实腿对账 / linux 分支〔CI cargo check + linux 向量〕/ 门二评审
   〔dsh，checklist 含 Go 直译痕迹〕/ ROADMAP 收口。
+
+**R6 第 5 棒注记（2026-10-04，6f-3b + 6g + 门二两轮 + 收口；R6 完成证据）**：
+
+- **6f-3b ✅**（commit a62dbd1）：`term/wire.rs`（poll(2) 帧读写 + **断尾续写**——
+  Go writeFrameOnce 的 torn/torn_whole 语义；std Write 超时不带回写字节数 ⇒ 非阻塞
+  + poll 自管进度）+ `term/legout.rs`（腿出站队列：latest-wins STATE/ENDED 排空后
+  交出/停滞记账）+ `term/service.rs`（八模块装配：ServeConn 状态机〔GREETING→HELLO
+  版本门/能力协商→一锤子命令 + 流内读循环〕/raw 腿握手〔ATTACHED→清屏→ring 回放
+  16KiB×2s→REPLAY-DONE flags→首腿 focus-in〕/停滞感知写者〔超时退避重写同片、
+  超限断腿裸 EOF〕/surface 投递〔合并窗 16-33ms、快照/差分/背压两失败模式、代数
+  唤醒防丢〕/pump〔应答让位 capsRawTerminal 窄规则 + OSC 52 双向 + 应答写者
+  FIX-25〕/sample 1s 拍〔融合+卫生+判据行〕/LIST JSON〔derive 声明序 = Go struct
+  序〕/EXPLAIN〔plain_text 整屏+回滚+折行展开；两段式取进程表〕/kill〔SIGHUP→
+  500ms→SIGKILL〕/HOMEWAY_TERM=off 与 HOMEWAY_TERM_VT 逃生口；并发模型 = 自管线程
+  + 一把服务锁〔锁内零阻塞 I/O〕+ 会话代数〔同名重建不误触〕）；vt 加 ClipSink
+  （OSC 52 事件面）、scan 加 OSC 7 pwd、pty 的 D-19 处置〔信号死 -1——ENDED code
+  与 Go 逐值一致〕；engine 挂 term.sock + 判据行 E15/E16。
+- **6g ✅**（commit 7ae0540）：Go term CLI（baseline 克隆构建）消费 Rust term 服务
+  全流程实测——list 表格/JSON（三态徽章）、new -d、attach 交互（回放前序/回显/
+  退格/Ctrl-C）、exit 自灭退出码直传（ENDED 7）、KILL（-2 文案）、多腿接管
+  （-1/replaced 归因）、版本门、explain 在线、HOMEWAY_TERM=off；检测三态（伪造
+  codex：working=输出腿/blocked=osc_title_blocked+800ms 重发/idle=osc_title_idle/
+  直报=osc21337）判据行全部入册 INTEROP-CRITERIA.md（E15/E16/E15a/E16a-d + Go CLI
+  消费面专节）；linux 交叉面清账（x86_64-unknown-linux-gnu cargo check 全绿——修
+  4 处既有不可移植面：libc::poll nfds_t ×3 + egress NUL 名错误归一）。
+- **门二两轮 ✅**（d59b708 + c536d51，记录 docs/reviews/R6.md）：r1 = 高 3
+  〔H1 断尾零进展死循环/H2 注册丢 size_applied/H3 dup fd 不打 FIN〕+ 补充 N1/D1 +
+  中 4 + 低 9；r2 复核 = 已修 17/部分 6 → P1-P10 回炉全处置（H3 用例判别力、
+  plain_text 折行展开、L1 两调用点、writers 记账竞态、锁内 2s、A4 静默对齐、
+  EXPLAIN 成功路径用例、poll(2) accept、代数化收尾、哨兵计数断言）。
+- **测试/门禁终态**：**257 lib 全绿**（term 面 113：service 13 + wire 4 + legout 3 +
+  前四棒 93）+ clippy all-targets 0 + x86_64-linux check 全绿 + ci-local 七步全绿
+  （2026-10-04 13:01，quick 档 446s 矩阵冒烟）。
+- 残余登记：pty 字符串错误归 R7 thiserror 化；§9.7 口径注记 6 条在册。
 
 **R6 前置批处置（2026-10-04 收口，评审记录 = `docs/reviews/R6-pre.md`）**：
 | # | 项 | 处置 | 判据证据 |
