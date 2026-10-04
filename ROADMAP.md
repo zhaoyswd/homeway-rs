@@ -56,13 +56,54 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 | **R3** | 出口（多 peer WG device + 拦截层 + files/DNS/STUN/UPnP + servercore） | **完成**（2026-10-02：两道门全过 + 判据全量实测入册） | 6/6 步 |
 | **R4** | 中继（信封 + 准入 + 升级条纹） | **完成**（2026-10-03：两道门全过 + 三链路判据实测 + 升级条纹实测） | 4/4 步 |
 | **R5** | 互操作矩阵全量 + fuzz + 性能 A/B + 台账三方门 | **完成**（2026-10-03：两道门全过〔两轮代码评审 4高/15中/18低全处置〕+ 终验轮 4 六链路 + L3 复跑全绿 + PERF-AB 入库 + ci-local 一键门全绿） | 6/6 步 |
-| **R6** | term 服务面（协议/surface 产出/检测引擎 + 自建编码器/应答器） | 未开始（有前置批，见 R6 节） | — |
+| **R6** | term 服务面（协议/surface 产出/检测引擎 + 自建编码器/应答器） | **进行中**（2026-10-04 会话 1+2：6a 设计 + 6b vt 底座 + 门一评审〔4高全修〕+ 6c 应答器〔47/47 向量全绿〕；详见 R6 节进度注记） | 6a/6b ✅ 门一 ✅ 6c ◐ |
 | **R7** | APP 接入（napi-rs 或 C-ABI 胶水 + OHOS 交叉 + 20 导出面 + hostsession） | 未开始 | — |
 | **R8** | 终测收官（包体/性能终测 + 共存定案 + 文档指针补录） | 未开始 | — |
 
-**下一步（当前指针）**：**R6 term 服务面主体**（前置批已清，见下方处置表；接棒从
-本节「R6 前置批处置」读起，然后进 R6 期小节）。R5 已收官（2026-10-03，两道门全过，
-评审记录 = `docs/reviews/R5.md`、性能报告 = `docs/PERF-AB.md`）。
+**下一步（当前指针）**：**R6 6c 键/鼠标编码器**（应答器已完成，接棒从 R6 节
+「R6 进度注记」读起——真源/向量/已定调规则都在那里）。R5 已收官（2026-10-03，两道门
+全过，评审记录 = `docs/reviews/R5.md`、性能报告 = `docs/PERF-AB.md`）。
+
+**R6 进度注记（2026-10-04，接棒真源）**：
+
+- **6a 设计 ✅**（`docs/reviews/R6-design.md`，已按实测向量两轮回写校正）；**门一评审 ✅**
+  （`docs/reviews/R6-gate1.md`：4 高危 B1-B4 已修 + B5 已修 + F1 机制口径已并入实现；
+  **中危未清账**：A1 region 层设计缺口〔6f 前必须补——pkg/term/manifest/region.go 448 行
+  的判定范围选择器面设计全文只字未提〕、A2 regex 方言垫片〔`\p{Alphabetic}` 在 3 份
+  manifest 真用，Rust regex 原生语义不同，「编译通过即证」不成立〕、A5 帧表九种布局 +
+  截断上限〔6d 前补〕、A6 env 面 15 项〔6f 补〕、A10/D-4 X10 wire 位〔已部分自管〕、
+  A10/D-10 darwin/Linux alt 分支〔向量是 darwin 宿主产的，linux 分支无判据——6g 补〕、
+  B6 47/1047 备用屏〔已记账、屏内容面无公开 API 登记残余〕、C4 带样式空格 golden 零
+  覆盖、低危 12 条见 gate1 记录）。
+- **6b vt 底座 ✅**：`term/vt.rs`（SessionVt + TermProbe 双面分发器 + B1-B4 修复 +
+  B3 行指纹过滤），8 测试绿（golden digest/光标/回滚/模式位对拍 + ED2 Full + 空闲差分空
+  + rows_at + 1049l 复位 + RIS）。
+- **6c 应答器 ✅**：`term/responder.rs` + vt.rs 集成（DecModes 38 位全模式表 + CPR DECOM
+  折算 + OSC 颜色三分量/镜像/基表 + kitty query + write_collecting）；**47/47 向量全绿**
+  （`term_responder.json` 47 案 + palette 256 项）。**判据已扩展待实现面**：DECRQSS 三态
+  （`DCS $q` → `DCS 1 $ r … ST`——F3，向量已采）与 `CSI ? 998 n` 可见性（→ `[?999;1n`
+  ——F2，已采）都还没在 Rust 实现（vte 表外形态，需旁路扫描或 DCS hook 拦截）。
+- **6c 键/鼠标编码器 ◐ 未开工**（下一棒主体）：向量已全产（`term_keyenc.json` 349 案 +
+  `term_mouseenc.json` 160 案）。实现路径：
+  ① 键码表 = 向量 keys 节 47 键 + libghostty-vt `src/input/kitty.zig` raw_entries 81 条
+  （`{key, code, final, modifier}`，kitty spec 值）；
+  ② legacy 表 = `function_keys.zig`：pcStyle 生成器（15 修饰位矩阵 × `\x1b[1;{}A` 形模板，
+  modcode=索引+2）+ cursorKey（DECCKM 分 CSI/SS3）+ kpKeys（DECKPAM 分流）+ tab/backspace
+  全修饰矩阵（mok normal/other 双列）；
+  ③ ctrl 白名单（Kitty 同款 `ctrlSeq` 表：c/space/数字/符号 → C0；i/m/[/\` 故意除外 →
+  CSI u）——**已实测钉死两条路径**：text 可打印 + ctrl-only + 表内 → C0；text 是控制
+  字符 → CSI u（codepoint=text 码点）；
+  ④ kitty 路径决策树 = key_encode.zig kitty()：无表项且无 unshifted ⇒ 纯文本直发/丢弃、
+  binding_mods 空 ⇒ enter/tab/backspace 裸字节、可打印直发、release 无 EVENT_TYPES 丢弃、
+  alternates/associated text 位、`:1` press 显式（**~ 终止符族不带**——实测 f5 ctrl 无 :1
+  而字母族有）、darwin alt 分支（向量 = darwin 形态）；
+  ⑤ 鼠标 = mouse_encode.zig + **B5 单值语义**（vt.rs 已有 mouse_tracking/mouse_format
+  last-set 字段可直接消费）：坐标 ≥222 不报（先于格式选择）、1000 模式 release 报 `#`、
+  X10 只报 press、修饰位 shift4/meta8/ctrl16、wheel=64/65；
+  ⑥ 对拍测试形态照 `responder_parity_with_go_vectors`（喂 SessionVt 模式序列 + encode）。
+- **向量生成器**：`tools/vector-gen/term/`（vecgen_term_test.go + vecgen_term_aux.go 伴随
+  包文件——test 不能用 cgo）+ `tools/gen-vectors.sh` 第三段；产物 5 件在 `fixtures/vectors/`。
+  **升级基线后必须重跑**（`tools/gen-vectors.sh` 确定性 diff 门）。
 
 **R6 前置批处置（2026-10-04 收口，评审记录 = `docs/reviews/R6-pre.md`）**：
 | # | 项 | 处置 | 判据证据 |
