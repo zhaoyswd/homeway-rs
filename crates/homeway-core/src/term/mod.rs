@@ -13,18 +13,24 @@
 //!   判据 = fixtures/vectors/surface_codec.json + fixtures/surface-golden/ 夹具）；
 //! - [`manifest`]：agent 状态识别规则的数据驱动引擎（region 切片/谓词求值/优先级
 //!   仲裁 + 内嵌 23 文件与本地覆盖；判据 = fixtures/vectors/term_manifest_eval.json）；
+//! - [`scan`]：旁路扫描器（只读不消费字节）——标题单一来源/OSC 9 双语义/OSC 21337
+//!   直报/legacy 模式位，能吃跨 read 切断的序列；
+//! - [`agent`]：检测融合（身份/输出/CPU/屏幕/直报五路权威序 + 状态机卫生 +
+//!   平台进程表）；
 //! - [`session`]：会话注册表与腿接入语义（多腿注册序/ENDED 词表应用/活动选举；
 //!   纯状态机——PTY/泵/写者接线在 6f）；
 //! - 其余模块（scan/leg/surface/agent/pty）按拆步 6f 陆续就位。
 //!
 //! 行为对齐基线 = baseline 克隆 `pkg/term/`（wire 字节与判据行逐一对齐）。
 
+pub mod agent;
 pub mod codec;
 pub mod frames;
 pub mod manifest;
 pub mod session;
 pub mod keyenc;
 pub mod responder;
+pub mod scan;
 pub mod vt;
 
 /// 跨模块共享的测试件：golden 夹具读取与 digest 口径（只在测试构建编译）。
