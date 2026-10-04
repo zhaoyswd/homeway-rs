@@ -381,3 +381,124 @@ kitty 全量挂 R6.5」，不阻塞其它步。
    起本地实例）。
 3. 检测三态同输入同输出：manifest 评测向量 + startup 夹具对拍。
 4. 应答器/键编码器单测：3.4 向量集逐字节。
+
+---
+
+## 九、门一评审整改的设计增量（2026-10-04 第二会话补，A1/A2/A5 清账）
+
+> 本节补门一评审（`R6-gate1.md`）的「6d/6f 前置三件」+ 顺手修 A3/A4/A9 描述。**全部条款的
+> 行为真源 = baseline 克隆源码**（本节引用处已逐条对读）；6d/6f 实现照本节走，不再现读。
+
+### 9.1 A5｜帧总表（6d 规格；`pkg/term/frames.go` 逐条）
+
+帧 = `[op:1][len:2 LE][payload]`，`len ≤ 65535`（**超限截断不是拒帧**：`encodeTermFrame`
+直接 `payload[:65535]`）；DATA 由发送方按 ≤16KiB 分片。op 表（两方向共字节空间，
+靠连接方向区分）：
+
+| op | 名 | 方向 | 载荷布局 |
+|---|---|---|---|
+| 0x00 | HELLO | C→S | `[cols:2LE][rows:2LE][flags:1][nameLen:1][name]` + 尾随块（下 9.2） |
+| 0x01 | DATA | 双向 | 原始 PTY 字节（≤16KiB/片） |
+| 0x02 | RESIZE | C→S | `[cols:2LE][rows:2LE]` |
+| 0x03 | ENDED | S→C | `[code:4LE][reasonLen:1][reason≤200]`（code 词表见 9.4） |
+| 0x04 | LIST | C→S / S→C | 请求空载荷；应答 = LIST JSON（外壳 `{"sessions":[…]}`，字段序见 §五） |
+| 0x05 | KILL | C→S | `[nameLen:1][name≤64]`（encName） |
+| 0x06 | ERROR | S→C | `[codeLen:1][code≤255][msgLen:2LE][msg≤4096]` |
+| 0x07 | STATE | S→C | `[agent:1][state:1][titleLen:2LE][title≤512]` |
+| 0x09 | ATTACHED | S→C | `[cols:2LE][rows:2LE][modes:4LE][agent:1][state:1][name]`（name 无长度前缀，吃尽余量；头部 ≥10B，短了 ok=false） |
+| 0x0A | REPLAY-DONE | S→C | `[replayed:4LE][flags:1]`（bit0 头部截断 / bit1 回放跨尺寸变化） |
+| 0x0B | OK | S→C | 空载荷（一锤子命令的应答壳） |
+| 0x0C | GREETING | S→C | `[ver:1=1][features:4LE]`（features = 0x7F：list1\|replay2\|modes4\|agent8\|title16\|surface32\|protoVer64） |
+| 0x0D–0x0F | SNAPSHOT / SNAPSHOT-DONE / SURFACE-DIFF | S→C | §4.1（0x08 历史保留位绝不复用） |
+| 0x10 | FETCH-ROWS | C→S / S→C | 请求 `[from:8LE][count:2LE]`（`surfaceFetchRowsMax=512`）；应答体 §4.1 |
+| 0x11 | INPUT | C→S | 首字节 kind：0 键 `[key:2][mods:2][action:1][utf8Len:1][utf8]`、1 文本 `[flags:1][len:2LE][text]`（bit0 粘贴/bit1 More/bit2 Cont）、2 鼠标 `[action:1][button:1][mods:2][x:2][y:2]`（网格坐标）、3 焦点 `[gained:1]` |
+| 0x12 | THEME | C→S | 默认色上报（§4.1） |
+| 0x13 | CLIPBOARD | 双向 | OSC 52 转发（§4.1；65532/4096 截断在载荷层） |
+| 0x14 | NOTIFY | S→C | OSC 9 转发 `[len:2LE][payload≤4096]` |
+| 0x15 | FETCH-SNAPSHOT | C→S | 空载荷（断档/拒收后请求全量） |
+| 0x16 | EXPLAIN | 双向 | 诊断面：请求空；应答 explainJSON |
+| 0x17 | CREATE | C→S | `[flags:1][nameLen:1][name]`（bit0 = reuse-if-exists，**极性与 HELLO bit1 相反**：置位=存在则复用、不置位=存在则 already_exists）；应答 OK/ERROR |
+
+截断上限单表：`termMaxPayload=65535`、`termDataChunk=16KiB`、name≤64、reason≤200、
+title≤512、errmsg code≤255 + msg≤4096、clientID≤64、clip 65532、notify 4096。
+
+### 9.2 A5 续｜HELLO 尾随块（`encHelloTail`/`decHelloTail`，FIX-29）
+
+形状（顺序固定，三段都可省略）：`[capLen:1][caps:capLen][ver:1?][idLen:1][clientID:idLen]`。
+- caps 位：surface=1、rawTerminal=2、**protoVer=0x80（bit 7）**——位只增不改；
+- **ver 字节只在 caps 带 protoVer 位时出现**（位即信号，不做位置推断）；声明位在而版本
+  字节缺失 = 畸形（拒收，不静默补默认）；
+- 解析**必须恰好耗尽**尾随字节（残留/超长声明一律 `bad_capability` 拒腿）；
+- 空 caps 块（capLen=0）消费 1 字节、形状合法；
+- **同形不可判别约束落在编码侧**：带 ID 必带 caps 块（不产出「无 caps 的 ID」）；
+- 服务端版本门（`service.go` ServeConn）：caps 声明 protoVer 且版本 ≠ 1 ⇒ `ERROR(term_version)` 拒腿。
+
+HELLO flags：bit0 create（既有）／bit1 only-if-absent（存在则 `already_exists`）／
+bit2 takeover（显式接管，ENDED reason=replaced）。
+
+### 9.3 A3｜ENDED code 与 reason 词表（冻结枚举，term-host-cli design D8）
+
+code（`[code:4LE]`）：**≥0 = 子进程退出码**；-1 replaced；-2 killed（App KILL）；-3
+service_stopped。`math.MinInt32` 是「不发 ENDED」哨兵（硬错误/客户端已关——裸 EOF）。
+
+reason 只在 code=-1 时有值且是**受控硬词表**（扩值 MUST 先扩表）：
+`replaced`（另一客户端显式接管）、`self_reconnect`（同实例标识重连替换）；
+code=-3 的 reason 词面 = `service_stopped`（Go `service.go:452`
+`sess.finish(termEndServiceStopped, "service_stopped")`——CLI 按 reason 渲染文案，
+漏词会落「未知 reason」分支）。
+
+stateV2 字节枚举（STATE/ATTACHED/LIST 共用）：unknown=0 / working=1 / blocked=2 /
+idle=3；agent 枚举：shell=0 / codex=1 / claude=2 / opencode=3 / openclaw=4 / other=5 /
+unknown=255（名字词面一一对应，只增不改）。
+
+### 9.4 A4｜SNAPSHOT/DIFF 体的光标块 = 6B
+
+§4.1 原文「DIFF 体 `[cursor 4B]`」有误：光标块 = `x:u16 + y:u16 + flags:u8 + shape:u8`
+= **6B**（`term_surface.go:386-389`），SNAPSHOT 与 DIFF 同形。
+
+### 9.5 A2｜manifest regex 方言垫片（Rust 侧同款近似，6f 规格）
+
+规则集**不在**两方言交集内：`\p{Alphabetic}` 在 3 份 manifest 真用（antigravity/cursor/
+qodercli）。「编译通过即证」不成立——Rust 原生 `\p{Alphabetic}` ⊋ Go 侧实跑口径。
+
+**Rust 侧方案 = 复用 Go 同款近似映射**：`compilePattern` 单一入口先做方言翻译——
+`\p{Alphabetic}`/`\P{Alphabetic}` → `\p{L}`/`\P{L}`（与 Go `propertyAliases` 同表；
+`\p{L}` 是 Alphabetic 的子集 ⇒ 与 Go 出口的行为**逐规则一致**，而非「更准」）；
+`\uXXXX`/`\u{XXXX}` Rust 原生支持、无需翻译（`\\` 字面反斜杠保护与 Go 同款，防
+`\\u2800` 误翻）。`contains` 文本**不过**翻译（`\u` 在那边是两个普通字符）。
+判据：`term_manifest_eval.json` 按**逐规则 region+matched** 对拍（不是只对状态）。
+
+### 9.6 A1｜manifest region 层全集（6f 规格；`manifest/region.go` 逐函数）
+
+region = 规则的**判定范围选择器**（旧提示残留不误判的锚定机制）。`Input` 四路：
+`Screen`（屏尾纯文本，约一屏）、`OSCTitle`（OSC 0/2，termScan 维护）、`OSCProgress`
+（OSC 9;4 原始载荷）。取不到（无提示框/无标记）按 herdr 口径**退回整屏或空**。
+
+全集（12 具名 + 3 参数化；默认 `whole_recent`）：
+- `osc_title` / `osc_progress`：走专用字段；
+- `whole_recent`（默认）/ `after_last_prompt_marker`（最后一条 codex 提示行 `›`/`› ` 之后；
+  无标记退整屏）/ `before_current_prompt_marker`（当前提示行之前；无则整屏）/
+  `whole_recent_without_current_prompt_marker`（**有**当前提示行 ⇒ 空——提示输入态不当整屏证据）；
+- `current_prompt_block_marker`（当前提示行上方最近的块标记行 `•■✗✓` 前缀，返回该行）/
+  `after_current_prompt_block_marker`（该块标记行起至结尾）；
+- `prompt_box_body`（提示框顶边框后到框内下一条分隔线前）/ `above_prompt_box`（顶边框
+  之前；无框退整屏）/ `last_non_empty_above_prompt_box`（上述范围最后一条非空行）/
+  `after_last_horizontal_rule`（最后一条水平分隔线之后；无则从 0 起=整屏）；
+- 参数化：`bottom_lines(N)` / `bottom_non_empty_lines(N)` / `top_non_empty_lines(N)`
+  （**拒绝前导 0**；N ≤ 65535 对齐 herdr u16::MAX；计数 parse 上限 1<<20 防病态）。
+
+关键实现口径：行迭代对齐 Rust `str::lines()`（结尾换行不产生空元素）；「当前提示行」
+= 最后一条提示行且**其后不得再出现块标记**（否则是历史提示）；水平分隔线 = `─` 开头且
+（只含横线或横线 ≥3 条）；`top_non_empty_lines` 需 **MinEngineVersion ≥ 3**（加载门）。
+
+加载面耦合：`index.toml` 的 `processes` 是选表入口（按前台进程名选 manifest）；
+Validate 耦合 = `skip_state_update ⇒ state=unknown`；`top_non_empty_lines ≥3 行`约束。
+判据：region 逐函数产向量（`term_manifest_eval.json` 按 region+matched 对拍，见 9.5）。
+
+### 9.7 A9/A6/A7 顺手修正
+
+- 「24 文件内嵌」改述：**23 个 toml**（22 agent + index）+ README（`load.go` 的
+  `//go:embed manifests/*.toml`）；
+- env 面（A6）与剪贴板/应答抑制字节面（E3）留 6f 设计增量一并补（本节不展开）；
+- §二总结句改述：「未装 effect（XTVERSION/尺寸/标题上报）⇒ 该族查询**不答**」（A7，
+  表格已按向量改判）。

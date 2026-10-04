@@ -7,11 +7,14 @@
 //!   行为真源 = fixtures/vectors/term_responder.json）；
 //! - [`keyenc`]：自建键/鼠标/焦点/粘贴编码器（行为真源 =
 //!   fixtures/vectors/term_{keyenc,mouseenc}.json）；
+//! - [`frames`]：term 帧协议编解码（op 表/词表面/HELLO 尾随块/INPUT 上行；
+//!   判据 = fixtures/term/frames.v1.jsonl 冻结契约）；
 //! - 其余模块（frames/codec/scan/manifest/session/leg/surface/agent）
 //!   按拆步 6c–6f 陆续就位。
 //!
 //! 行为对齐基线 = baseline 克隆 `pkg/term/`（wire 字节与判据行逐一对齐）。
 
+pub mod frames;
 pub mod keyenc;
 pub mod responder;
 pub mod vt;
