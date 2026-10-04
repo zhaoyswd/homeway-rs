@@ -163,16 +163,21 @@ fn term_list(auth_hex: &str, sock: &str) -> (Option<Value>, Option<TermOpError>)
     };
     match frame.op {
         Op::LIST => {
-            let mut out: Value = serde_json::from_slice(&frame.payload)
-                .map_err(|e| TermOpError::new(code::BAD_REPLY, format!("LIST 回复不是合法 JSON：{e}")))
-                .unwrap_or(Value::Null);
-            if out.is_null() {
-                out = Value::Object(Map::new());
+            // 坏 JSON 必须报 bad_reply（评审 r1-F16：旧写法 unwrap_or(Null) 会吞错并
+            // 假成功回 {"ok":true,"sessions":[]}）
+            let parsed: Result<Value, _> = serde_json::from_slice(&frame.payload);
+            match parsed {
+                Err(e) => (None, Some(TermOpError::new(code::BAD_REPLY, format!("LIST 回复不是合法 JSON：{e}")))),
+                Ok(mut out) => {
+                    if !out.is_object() {
+                        out = Value::Object(Map::new());
+                    }
+                    if let Some(obj) = out.as_object_mut() {
+                        obj.entry("sessions").or_insert_with(|| Value::Array(vec![]));
+                    }
+                    (Some(out), None)
+                }
             }
-            if let Some(obj) = out.as_object_mut() {
-                obj.entry("sessions").or_insert_with(|| Value::Array(vec![]));
-            }
-            (Some(out), None)
         }
         Op::ERROR => (None, Some(decode_error(&frame.payload))),
         other => (None, Some(TermOpError::new(code::BAD_REPLY, format!("LIST 回复帧意外（0x{:02x}）", other.0)))),

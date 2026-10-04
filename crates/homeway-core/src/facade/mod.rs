@@ -52,8 +52,10 @@ pub const ATTACH_DEADLINE: Duration = Duration::from_secs(60);
 /// stop 收工等待预算（tunStopWait 的 3s；超时 -1，且期间无新世代 ⇒ 强制放锁 -2）。
 pub const STOP_WAIT: Duration = Duration::from_secs(3);
 
-/// tunConfig（hostsession.Config 同形；JSON 键 = Go json tag）。
+/// tunConfig（hostsession.Config 同形；JSON 键 = Go json tag 的 camelCase——
+/// 评审 r1-F05 整改：App 实发 camelCase，无 rename 会静默丢 7 字段）。
 #[derive(Debug, Clone, Default, Deserialize)]
+#[serde(rename_all = "camelCase")]
 pub struct TunConfigJson {
     #[serde(default)]
     pub mtu: i64,
@@ -669,6 +671,36 @@ mod tests {
             core.tun_set_port_forwards(r#"{"portForwards":[{"listen":18080,"targetIp":"","targetPort":80}]}"#),
             -1
         );
+    }
+
+    /// rename 面（评审 r1-F05/F08 整改的守卫）：真实 App 报文（camelCase）→ 全字段
+    /// 非默认都能解进来；snake_case 报文不受认（不双形态容忍）。
+    #[test]
+    fn config_json_camelcase_rename() {
+        let cfg: TunConfigJson = serde_json::from_str(
+            r#"{"mtu":1280,"out":"/l","dialMs":9000,"statsSecs":30,"endpointCacheDir":"/ec","identityDir":"/id","diagFdSecs":5,"tzOffsetMinutes":480,"token":"hmw1-x","portForwards":[{"listen":18080,"targetIp":"","targetPort":80}]}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.mtu, 1280);
+        assert_eq!(cfg.out, "/l");
+        assert_eq!(cfg.dial_ms, 9000);
+        assert_eq!(cfg.stats_secs, 30);
+        assert_eq!(cfg.endpoint_cache_dir, "/ec");
+        assert_eq!(cfg.identity_dir, "/id");
+        assert_eq!(cfg.diag_fd_secs, 5);
+        assert_eq!(cfg.tz_offset_minutes, 480);
+        assert_eq!(cfg.token, "hmw1-x");
+        assert_eq!(cfg.port_forwards.len(), 1);
+        assert_eq!(cfg.port_forwards[0].listen, 18080);
+        // speedtest 参数同面（r1-F08）
+        let sp: speedtest_op::SpeedParams = serde_json::from_str(
+            r#"{"auth":"a","sock":"s","downMs":5000,"upMs":6000,"warmupMs":700,"streams":2}"#,
+        )
+        .unwrap();
+        assert_eq!(sp.down_ms, 5000);
+        assert_eq!(sp.up_ms, 6000);
+        assert_eq!(sp.warmup_ms, 700);
+        assert_eq!(sp.streams, 2);
     }
 
     /// 版本串形状（tier core 前缀 + c-shared 尾）。

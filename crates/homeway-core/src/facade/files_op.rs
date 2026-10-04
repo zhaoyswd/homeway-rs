@@ -90,7 +90,9 @@ impl BridgeStream {
         write_auth(&mut conn, auth_hex)
             .map_err(|e| FilesOpError::new(code::BRIDGE_AUTH, format!("文件通道鉴权失败：{e}")))?;
         let mut s = BridgeStream { conn, buf: Vec::with_capacity(16 * 1024) };
-        let line = s.read_line().map_err(|e| FilesOpError::new(CODE_STREAM_OPEN, format!("读问候帧失败：{}", e.msg)))?;
+        let line = s
+            .read_line_capped(false)
+            .map_err(|e| FilesOpError::new(CODE_STREAM_OPEN, format!("读问候帧失败：{}", e.msg)))?;
         let g: Value = serde_json::from_slice(&line)
             .map_err(|e| FilesOpError::new(CODE_STREAM_OPEN, format!("问候帧不是 JSON：{e}")))?;
         if !g.get("ok").and_then(Value::as_bool).unwrap_or(false) {
@@ -107,20 +109,23 @@ impl BridgeStream {
         Ok(tmp[..n].to_vec())
     }
 
-    /// 读一行（≤64KB；去 EOL）。
-    fn read_line(&mut self) -> Result<Vec<u8>, FilesOpError> {
+    /// 读一行（去 EOL）。上限只约束**入向请求行**（镜像 crate::files 的请求面上限）；
+    /// 响应行（问候/回执/内联读结果）不设 64KB 上限——Go 客户端 bufio.ReadBytes 无
+    /// 上限、服务端内联上限 16MB，App 默认 512KB 的 readText 会超 64KB（评审 r1-C2）。
+    /// `cap_request`：是否套 64KB 请求面上限（响应行 false）。
+    fn read_line_capped(&mut self, cap_request: bool) -> Result<Vec<u8>, FilesOpError> {
         loop {
             if let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
                 let mut line: Vec<u8> = self.buf.drain(..=pos).collect();
                 while matches!(line.last(), Some(b'\n') | Some(b'\r')) {
                     line.pop();
                 }
-                if line.len() > MAX_REQUEST_LINE {
+                if cap_request && line.len() > MAX_REQUEST_LINE {
                     return Err(FilesOpError::new(code::OP_FAILED, "行超过 64KB 上限"));
                 }
                 return Ok(line);
             }
-            if self.buf.len() > MAX_REQUEST_LINE {
+            if cap_request && self.buf.len() > MAX_REQUEST_LINE {
                 return Err(FilesOpError::new(code::OP_FAILED, "行超过 64KB 上限"));
             }
             let chunk = self.read_some()?;
@@ -135,11 +140,11 @@ impl BridgeStream {
         self.conn.write_all(data).map_err(op_failed_io)
     }
 
-    /// 发命令行并读响应行。
+    /// 发命令行并读响应行（响应行不设上限——见 read_line_capped）。
     fn call(&mut self, line: &str) -> Result<Value, FilesOpError> {
         self.write_all(line.as_bytes())?;
         self.write_all(b"\n")?;
-        let resp = self.read_line()?;
+        let resp = self.read_line_capped(false)?;
         serde_json::from_slice(&resp)
             .map_err(|e| FilesOpError::new(code::OP_FAILED, format!("响应行不是 JSON：{e}")))
     }
@@ -628,9 +633,9 @@ fn run_transfer(sess: Arc<FilesSession>, tx: Arc<Transfer>) {
                     progressed = true;
                     tx.mark(sent, size);
                 }
-                // 终止帧（len=0）= 提交；读提交结果行
+                // 终止帧（len=0）= 提交；读提交结果行（响应面，不设上限）
                 stream.write_frame(&[]).map_err(|e| e.msg)?;
-                let line = stream.read_line().map_err(|e| e.msg)?;
+                let line = stream.read_line_capped(false).map_err(|e| e.msg)?;
                 let resp: Value = serde_json::from_slice(&line).map_err(|e| format!("上传回执不是 JSON：{e}"))?;
                 check_ok(&resp).map_err(|e| e.msg)?;
                 tx.mark(sent, size);

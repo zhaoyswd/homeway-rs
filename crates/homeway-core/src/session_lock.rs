@@ -65,7 +65,14 @@ impl Drop for SessionLock {
 /// 为一个会话动词拿 identity 锁。`verb` = 自述动词（connect/files/speedtest——
 /// 错误信息消费）。identity 目录不存在则创建（与 master.key 的目录契约一致）。
 pub fn acquire(identity_dir: &Path, verb: &str) -> Result<SessionLock, LockError> {
-    std::fs::create_dir_all(identity_dir)
+    // 密钥目录权限契约（identity.rs 同款 0700——评审 r1-C6：create_dir_all 的 0755
+    // 会把新目录的权限放宽）
+    use std::os::unix::fs::DirBuilderExt;
+    let mut builder = std::fs::DirBuilder::new();
+    builder.mode(0o700);
+    builder
+        .recursive(true)
+        .create(identity_dir)
         .map_err(|e| LockError::Io(LockIo { path: identity_dir.to_owned(), err: e }))?;
     let path = identity_dir.join(LOCK_NAME);
     let file = OpenOptions::new()

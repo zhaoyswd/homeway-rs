@@ -25,8 +25,10 @@ use super::term_op::write_auth;
 /// 出口测速服务端口（= 本仓 speedtest_server 的默认端口；桥拨号消费）。
 pub const SPEEDTEST_SERVICE_PORT: u16 = 7803;
 
-/// Start 的入参（JSON；字段名与迁移前逐字一致）。
+/// Start 的入参（JSON；字段名与迁移前逐字一致——camelCase，评审 r1-F08 整改：
+/// 无 rename 时非 0 窗口值会被静默忽略）。
 #[derive(Debug, Deserialize, Default)]
+#[serde(rename_all = "camelCase")]
 pub struct SpeedParams {
     /// 桥鉴权 blob（状态 JSON 的 bridgeAuth）。
     #[serde(default)]
