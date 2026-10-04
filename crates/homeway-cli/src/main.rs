@@ -678,6 +678,7 @@ fn cmd_dnstest(args: &[String]) {
     let mut identity_dir: Option<PathBuf> = None;
     let mut mode = "tcp5300".to_owned();
     let mut name = String::new();
+    let mut no_session_lock = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -693,6 +694,7 @@ fn cmd_dnstest(args: &[String]) {
                 i += 1;
                 mode = args.get(i).cloned().unwrap_or_else(|| "tcp5300".into());
             }
+            "--no-session-lock" => no_session_lock = true,
             other if !other.starts_with('-') => name = other.to_owned(),
             other => {
                 eprintln!("未知参数：{other}");
@@ -716,6 +718,7 @@ fn cmd_dnstest(args: &[String]) {
             std::process::exit(1);
         }
     };
+    let _session_lock = (!no_session_lock).then(|| session_lock_or_exit(&identity_dir, "dnstest"));
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
     let mut session = match homeway_core::session::Session::start(homeway_core::session::SessionConfig {
         token: t,
@@ -862,6 +865,7 @@ fn cmd_portfwd(args: &[String]) {
     let mut tok: Option<String> = None;
     let mut identity_dir: Option<PathBuf> = None;
     let mut maps: Vec<(u16, Option<SocketAddrV4>)> = Vec::new();
+    let mut no_session_lock = false;
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
@@ -873,6 +877,7 @@ fn cmd_portfwd(args: &[String]) {
                 i += 1;
                 identity_dir = args.get(i).map(PathBuf::from);
             }
+            "--no-session-lock" => no_session_lock = true,
             "--map" => {
                 i += 1;
                 let spec = args.get(i).cloned().unwrap_or_default();
@@ -921,6 +926,7 @@ fn cmd_portfwd(args: &[String]) {
             std::process::exit(1);
         }
     };
+    let _session_lock = (!no_session_lock).then(|| session_lock_or_exit(&identity_dir, "portfwd"));
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
     let session = match Session::start(SessionConfig {
         token: t,

@@ -119,7 +119,7 @@ setup_stack_rust_client() { # <side> <ep>
   local TOK
   TOK=$("$RUST_BIN" serve token --state "$st/exit" | grep -o 'hmw1[A-Za-z0-9+/=_-]*' | head -1)
   TOK=$("$RUST_BIN" token "$TOK" --loopback-only)
-  nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$st/client/identity" --hold 3600 >> "$st/client.log" 2>&1 &
+  nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$st/client/identity" --no-session-lock --hold 3600 >> "$st/client.log" 2>&1 &
   echo $! > "$st/client.pid"
   echo "$TOK" > "$st/token"
 }
@@ -196,7 +196,7 @@ for i in 1 2 3; do
   R_OUT="" R_TRY=0
   while (( R_TRY < 2 )); do
     R_TRY=$(( R_TRY + 1 ))
-    (cd "$BASE/rrr" && "$RUST_BIN" speedtest --token "$RRR_TOK" --identity-dir "$BASE/rrr/client/identity" --rounds 1 > "$BASE/rrr/round-$i.log" 2>&1) &
+    (cd "$BASE/rrr" && "$RUST_BIN" speedtest --token "$RRR_TOK" --identity-dir "$BASE/rrr/client/identity" --no-session-lock --rounds 1 > "$BASE/rrr/round-$i.log" 2>&1) &
     local_cli=$!
     (while kill -0 $local_cli 2>/dev/null; do
       rss=$(ps -o rss= -p $local_cli 2>/dev/null | tr -d ' ')
@@ -228,7 +228,7 @@ python3 "$REPO_ROOT/tools/echo-rtt.py" 127.0.0.1 42900 200 > "$BASE/rtt-ggg.json
 echo "  GGG: $(cat "$BASE/rtt-ggg.json")"
 # Rust 侧 portfwd（独立会话——RTT 面单连接，与会话竞速无关；直连断言同中-7：
 # 中继腿 RTT 会混入 200pps 排队，A/B 失真）
-(cd "$BASE/rrr" && nohup "$RUST_BIN" portfwd --token "$RRR_TOK" --identity-dir "$BASE/rrr/client/identity" --map 42901:$(lan_ip):42807 > "$BASE/rrr/portfwd.log" 2>&1 &)
+(cd "$BASE/rrr" && nohup "$RUST_BIN" portfwd --token "$RRR_TOK" --identity-dir "$BASE/rrr/client/identity" --no-session-lock --map 42901:$(lan_ip):42807 > "$BASE/rrr/portfwd.log" 2>&1 &)
 sleep 4
 if ! grep -E '路径确立：|link: via=' "$BASE/rrr/portfwd.log" 2>/dev/null | grep -m1 -qE '直连|via=direct'; then
   echo "!! RTT 腿 portfwd 会话非直连——中止（RTT 对照失真）" >&2; exit 1

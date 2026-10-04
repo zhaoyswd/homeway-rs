@@ -450,7 +450,7 @@ base_segment() {
     local IDDIR="$st/c-main/identity" CACHEDIR="$st/c-main/ep-base"
     mkdir -p "$IDDIR" "$CACHEDIR"
     local CL0=$(log_lines "$st/c-main/rust.log")
-    nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$IDDIR" --endpoint-cache-dir "$CACHEDIR" \
+    nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$IDDIR" --no-session-lock --endpoint-cache-dir "$CACHEDIR" \
       --speedtest --hold 600 >> "$st/c-main/rust.log" 2>&1 &
     echo $! > "$st/c-main/pid"
     if V=$(wait_line_from "$st/c-main/rust.log" 'warmup pong: 就绪' "$CL0" 25); then
@@ -466,7 +466,7 @@ base_segment() {
       # 简单可靠；主客户端 --speedtest 会重跑，E13 判据照常收）
       stop_pid "$st/c-main/pid"
       local CL0r=$(log_lines "$st/c-main/rust.log")
-      nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$IDDIR" --endpoint-cache-dir "$CACHEDIR" \
+      nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$IDDIR" --no-session-lock --endpoint-cache-dir "$CACHEDIR" \
         --speedtest --hold 600 >> "$st/c-main/rust.log" 2>&1 &
       echo $! > "$st/c-main/pid"
       if V=$(wait_line_from "$st/c-main/rust.log" '路径确立：直连|link: via=direct' "$CL0r" 60); then
@@ -523,7 +523,7 @@ base_segment() {
   while [[ -z "$SP" || "$SP" == *失败* ]] && (( tries < 3 )); do
     tries=$((tries + 1))
     sleep 20
-    SP=$(tmo 90 "$RUST_BIN" speedtest --token "$TOK" --identity-dir "$st/c-main/identity" --endpoint-cache-dir "$st/c-main/ep-base" --rounds 1 2>&1 | grep -E 'round|失败' | tail -2)
+    SP=$(tmo 90 "$RUST_BIN" speedtest --token "$TOK" --identity-dir "$st/c-main/identity" --no-session-lock --endpoint-cache-dir "$st/c-main/ep-base" --rounds 1 2>&1 | grep -E 'round|失败' | tail -2)
   done
   if [[ -n "$SP" && "$SP" != *失败* ]]; then
     record "$link" E13-speedtest "PASS" "$(echo "$SP" | tr '\n' '；' | cut -c1-100)" $'（复核第 '"$tries"' 轮命中）'
@@ -562,8 +562,8 @@ base_segment() {
     UP=$(tmo 150 "$GO_BIN" files put --state "$st/c-main" --host "m$link" "$LOCAL" "/$RNAME" 2>&1 | tail -1)
     DN=$(tmo 150 "$GO_BIN" files get --state "$st/c-main" --host "m$link" "/$RNAME" -o "$st/dn-100mb.bin" 2>&1 | tail -1)
   else
-    UP=$(tmo 120 "$RUST_BIN" files upload --token "$TOK" --identity-dir "$st/c-main/identity" --rate-limit 0 "/$RNAME" "$LOCAL" 2>&1 | tail -1)
-    DN=$(tmo 120 "$RUST_BIN" files download --token "$TOK" --identity-dir "$st/c-main/identity" "/$RNAME" "$st/dn-100mb.bin" 2>&1 | tail -1)
+    UP=$(tmo 120 "$RUST_BIN" files upload --token "$TOK" --identity-dir "$st/c-main/identity" --no-session-lock --rate-limit 0 "/$RNAME" "$LOCAL" 2>&1 | tail -1)
+    DN=$(tmo 120 "$RUST_BIN" files download --token "$TOK" --identity-dir "$st/c-main/identity" --no-session-lock "/$RNAME" "$st/dn-100mb.bin" 2>&1 | tail -1)
   fi
   local DN_SHA=$(sha256_of "$st/dn-100mb.bin")
   if [[ "$UP_SHA" == "$DN_SHA" && -n "$UP_SHA" ]]; then
@@ -575,7 +575,7 @@ base_segment() {
   if [[ "$C" == go ]]; then
     "$GO_BIN" files delete --state "$st/c-main" -host "m$link" "/$RNAME" >/dev/null 2>&1
   else
-    tmo 60 "$RUST_BIN" files rm --token "$TOK" --identity-dir "$st/c-main/identity" "/$RNAME" >/dev/null 2>&1
+    tmo 60 "$RUST_BIN" files rm --token "$TOK" --identity-dir "$st/c-main/identity" --no-session-lock "/$RNAME" >/dev/null 2>&1
   fi
   rm -f "$LOCAL" "$st/dn-100mb.bin"
 
@@ -590,7 +590,7 @@ base_segment() {
     # 同 devTag 在出口侧互抢，竞速/超时不稳）
     stop_pid "$st/c-main/pid"
     local CL0b=$(log_lines "$st/c-main/rust.log")
-    nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$st/c-main/identity" \
+    nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$st/c-main/identity" --no-session-lock \
       --endpoint-cache-dir "$st/c-main/ep-base" --dial "$(lan_ip):$(echo_port "$link")" --hold 600 \
       >> "$st/c-main/rust.log" 2>&1 &
     echo $! > "$st/c-main/pid"
@@ -624,14 +624,14 @@ base_segment() {
     FBOK=$("$GO_BIN" files list --state "$st/c-main" --host "m$link" 2>&1 | grep -c .)
     record "$link" FB-files "PASS" "list ${FBOK} 行（并发闸不误伤；满员拒绝面见单测）"
   else
-    FB=$(tmo 30 "$RUST_BIN" files list --token "$TOK" --identity-dir "$st/c-main/identity" 2>&1 | grep -c .)
+    FB=$(tmo 30 "$RUST_BIN" files list --token "$TOK" --identity-dir "$st/c-main/identity" --no-session-lock 2>&1 | grep -c .)
     record "$link" FB-files "PASS" "list ${FB} 行（并发闸不误伤；满员拒绝面见单测）"
   fi
 
   # DNS（Rust 客户端链路；Go 客户端无 DNS 拨号动词——未纳入表见设计 §1.6）
   if [[ "$C" == rust ]]; then
     local DNST
-    if DNST=$(tmo 30 "$RUST_BIN" dnstest --token "$TOK" --identity-dir "$st/c-main/identity" --mode leg example.com 2>&1 | grep 'rcode=' | head -1); then
+    if DNST=$(tmo 30 "$RUST_BIN" dnstest --token "$TOK" --identity-dir "$st/c-main/identity" --no-session-lock --mode leg example.com 2>&1 | grep 'rcode=' | head -1); then
       if [[ "$DNST" == *"rcode=0"* ]]; then
         record "$link" DNS "PASS" "${DNST:0:100}"
       else
@@ -666,7 +666,7 @@ EOF
     go_client_add_sub "$link" "$TOK" || true
   else
     mkdir -p "$st/c-sub/identity" "$st/c-sub/ep"
-    nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$st/c-sub/identity" --endpoint-cache-dir "$st/c-sub/ep" \
+    nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$st/c-sub/identity" --no-session-lock --endpoint-cache-dir "$st/c-sub/ep" \
       --hold 120 >> "$st/c-sub/rust.log" 2>&1 &
     echo $! > "$st/c-sub/pid"
   fi
@@ -712,7 +712,7 @@ relay_segment() {
     stop_pid "$st/c-main/pid"
     mkdir -p "$st/c-main/ep-relay"
     local CL0=$(log_lines "$st/c-main/rust.log")
-    nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$st/c-main/identity" \
+    nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$st/c-main/identity" --no-session-lock \
       --endpoint-cache-dir "$st/c-main/ep-relay" --dead-direct --speedtest --hold 240 \
       >> "$st/c-main/rust.log" 2>&1 &
     echo $! > "$st/c-main/pid"
@@ -818,8 +818,8 @@ relay_segment() {
   else
     # files CLI 无 --endpoint-cache-dir（不识别会错位进 rest）——不带 = 会话无落盘缓存，
     # 竞速 token 端点（dead-direct 形态下恒中继），段级隔离天然成立
-    UP_OUT=$(tmo 150 "$RUST_BIN" files upload --token "$TOK" --identity-dir "$st/c-main/identity" --dead-direct "${RLIM[@]}" "/$RNAME" "$LOCAL" 2>&1 | tail -1)
-    DN_OUT=$(tmo 150 "$RUST_BIN" files download --token "$TOK" --identity-dir "$st/c-main/identity" --dead-direct "/$RNAME" "$st/dn-rl.bin" 2>&1 | tail -1)
+    UP_OUT=$(tmo 150 "$RUST_BIN" files upload --token "$TOK" --identity-dir "$st/c-main/identity" --no-session-lock --dead-direct "${RLIM[@]}" "/$RNAME" "$LOCAL" 2>&1 | tail -1)
+    DN_OUT=$(tmo 150 "$RUST_BIN" files download --token "$TOK" --identity-dir "$st/c-main/identity" --no-session-lock --dead-direct "/$RNAME" "$st/dn-rl.bin" 2>&1 | tail -1)
   fi
   local DN_SHA=$(sha256_of "$st/dn-rl.bin")
   { echo "== upload =="; echo "$UP_OUT"; echo "== download =="; echo "$DN_OUT"; } >> "$st/rl-files.log" 2>/dev/null
