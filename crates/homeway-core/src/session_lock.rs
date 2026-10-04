@@ -79,10 +79,10 @@ pub fn acquire(identity_dir: &Path, verb: &str) -> Result<SessionLock, LockError
     let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
     if rc != 0 {
         let err = std::io::Error::last_os_error();
-        let held = matches!(
-            err.raw_os_error(),
-            Some(libc::EWOULDBLOCK) | Some(libc::EAGAIN) | Some(libc::EACCES) | Some(libc::EINTR)
-        );
+        // EWOULDBLOCK 与 EAGAIN 在 POSIX 上同值（11）——只匹配一个（同值双匹配在
+        // 部分目标报 unreachable pattern）
+        let eagain = libc::EWOULDBLOCK;
+        let held = matches!(err.raw_os_error(), Some(e) if e == eagain || e == libc::EACCES);
         if held {
             // 读持有者自述（拿锁失败 ⇒ 内容是有效持有者写的）
             let (pid, v, since_ms) = read_holder(&file);

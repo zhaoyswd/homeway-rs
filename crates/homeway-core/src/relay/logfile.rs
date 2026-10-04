@@ -95,7 +95,9 @@ fn stamp() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let secs_utc = now.as_secs() as i64;
-    // 本地时区偏移（libc::localtime_r；失败按 UTC）
+    // 本地时区偏移（libc::localtime_r；失败按 UTC）。time_t 用 i64 直述——
+    // libc 对部分目标（musl/ohos）把 time_t 别名标 deprecated，i64 是它的实指。
+    #[allow(deprecated)]
     let local_offset: i64 = unsafe {
         let t: libc::time_t = secs_utc as libc::time_t;
         let mut tm: libc::tm = std::mem::zeroed();

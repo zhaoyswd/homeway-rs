@@ -436,14 +436,18 @@ pub fn read_procs() -> Vec<ProcInfo> {
 
 /// 取终端前台进程组；0 = 拿不到（会话刚建、已结束等）。
 pub fn foreground_pgid(fd: std::os::fd::RawFd) -> i32 {
-    // TIOCGPGRP
-    const TIOCGPGRP: libc::c_ulong = if cfg!(any(target_os = "linux", target_os = "android")) {
+    // TIOCGPGRP：linux 族（含 OHOS——target_env=ohos，libc 面把 request 记为
+    // c_int）= 0x540F；darwin = 0x40047477
+    #[cfg(target_env = "ohos")]
+    let req: libc::c_int = 0x540F;
+    #[cfg(not(target_env = "ohos"))]
+    let req: libc::c_ulong = if cfg!(any(target_os = "linux", target_os = "android")) {
         0x540F
     } else {
         0x40047477
     };
     let mut pgid: libc::c_int = 0;
-    let rc = unsafe { libc::ioctl(fd, TIOCGPGRP, &mut pgid) };
+    let rc = unsafe { libc::ioctl(fd, req, &mut pgid) };
     if rc == 0 {
         pgid
     } else {
