@@ -134,24 +134,24 @@ ghostty 默认值；helpers.h 仅有 set_write_pty/set_clipboard_*/set_default_c
 
 | 查询（应用 → 出口） | 触发解析 | 应答字节面 | 依据 |
 |---|---|---|---|
-| DA1 `CSI c`（无参/0 参） | csi_dispatch action='c'，无 intermediates/`>` | `\x1b[?62;22c` | device_attributes.zig 默认（VT220 + ansi_color），Go 不装回调 |
-| DA2 `CSI > c` | prefix `>` | `\x1b[>1;0;0c` | 同上（Secondary 默认） |
-| DA3 `CSI = c` | prefix `=` | `\x1bP!|00000000\x1b\\` | Tertiary 默认 unit_id 0 |
-| XTVERSION `CSI ? 65 c` | `?` + 65 | `\x1bP>|libghostty\x1b\\` | reportXtversion 无回调时字面 "libghostty"（**故意同串**，tmux 类探测按它认终端） |
-| DSR-OS `CSI 5 n` | action='n' param 5 | `\x1b[0n` | deviceStatus |
-| DSR-CPR `CSI 6 n` | param 6 无 `?` | `\x1b[<y+1>;<x+1>R`；DECOM 置位时 y,x 各减滚动区顶/左（饱和减） | deviceStatus.cursor_position（origin 口径） |
-| DECXCPR `CSI ? 6 n` | `?`+6 | **不答**（ghostty entries 只认无 `?` 的 6） | device_status.zig entries |
-| DECRQM `CSI ? Pm $ p` | intermediates 含 `$`，action='p'，带 `?` | `\x1b[?<mode>;<state>$y`；state：已知私有模式 1/2（按 TermMode 位），未知 0 | stream_terminal 测试钉死（`?7$p`→`7;1`、`?9999$p`→`9999;0`、`?117$p`→`117;4` 永久态按 ghostty 模式表） |
-| DECRQM ANSI `CSI Pm $ p` | 同上无 `?` | `\x1b[<mode>;<state>$y`（4=INSERT、20=LNM…） | requestModeUnknown |
-| kitty 查询 `CSI ? u` | `?` action='u' | `\x1b[?<flags>u`（flags = KittyFlags int，0..31） | queryKittyKeyboard |
-| OSC 10/11 `?` | osc_dispatch 参数 `10;?` / `11;?`（含 `10;?;?;?` 联查形态） | `\x1b]10;rgb:RRRR/GGGG/BBBB\x1b\\` 依次回 10/11（/12）；16bit/通道 = 8bit×257（`01→0101`） | osc 颜色查询测试；颜色 = 客户端主题（THEME 帧落后态），未上报用默认（**V-2 实测定调**：ghostty 默认 fg/bg 具体值，6c 以 `CSI 14t` 同源法实测校准） |
-| OSC 12 `?`（光标色） | 同上 | 同上格式；值 = 主题前景（近似，D-8 登记） | |
-| OSC 4 `idx;?` | osc_dispatch 4 号 | `\x1b]4;<idx>;rgb:…\x1b\\`：**已被 OSC 4 set 过的索引回镜像值**；未 set 的回内嵌 xterm-256 基表 | ghostty 会答自有默认调色板（与 xterm 基表可能不同 ⇒ **D-9 登记**：未 set 索引的应答值可能漂；常见 TUI 不查未 set 索引，6g 实测遇红再补 ghostty 真表） |
-| 像素尺寸 `CSI 14 t`/`CSI 16 t` | action='t' param 14/16 | 14 → `\x1b[4;<cellH*rows>;<cellW*cols>t`；16 → `\x1b[6;<cellH>;<cellW>t`；名义 cell 8×16（对齐 Go nominalCellPx） | reportSize |
-| 字符尺寸 `CSI 18 t` | param 18 | `\x1b[8;<rows>;<cols>t` | 同上 |
-| 标题上报 `CSI 21 t` | param 21 且 DEC 21 开 | `\x1b]l<title>\x1b\\`（title = termScan 单一来源）；DEC 21 关则不答 | csi_21_t 分支 |
-| ENQ 0x05 | print/dispatch 0x05 | **不答**（Go 未装 enquiry 回调） | reportEnquiry |
-| kitty 键盘 set/push/pop `CSI > flag u`/`CSI < n u`/`CSI = flag u` | csi_dispatch | 不产生应答，只改 TermMode（alacritty 原生处理）；`CSI > 4;N m` 由 probe 记账 modifyOtherKeys（N==2 置位、其余/复位/RIS 清零） | stream_terminal modify_key_format |
+| DA1 `CSI c`（无参/0 参） | csi_dispatch action='c'，无 intermediates/`>` | `\x1b[?62;22c` | **实测向量**（term_responder.json da1/da1_zero） |
+| DA2 `CSI > c` | prefix `>` | `\x1b[>1;0;0c` | 实测（da2/da2_args 同答） |
+| DA3 `CSI = c` | prefix `=` | `\x1bP!\|00000000\x1b\\` | 实测 |
+| XTVERSION `CSI ? 65 c` | `?` + 65 | **不答**（设计期预期答 `libghostty` 系误判；实测向量 xtversion 空） | 实测 |
+| DSR-OS `CSI 5 n` | action='n' param 5 | `\x1b[0n` | 实测 |
+| DSR-CPR `CSI 6 n` | param 6 无 `?` | `\x1b[<y+1>;<x+1>R`；DECOM 置位时 y 按滚动区顶折算（实测 origin_scrolled：滚动区 5..20 + `\x1b[3;4H` → `[3;4R` = 相对坐标） | 实测（dsr_cpr 三态） |
+| DECXCPR `CSI ? 6 n` | `?`+6 | 不答 | 实测 |
+| DECRQM `CSI ? Pm $ p` | intermediates 含 `$`，action='p'，带 `?` | `\x1b[?<mode>;<state>$y`；state：已知私有模式 1/2，未知 0，永久态 4 | 实测（1000 开/关、9999、117→4、7→1） |
+| DECRQM ANSI `CSI Pm $ p` | 同上无 `?` | **不答**（设计期预期应答系误判；实测 insert/lnm/未知全空） | 实测 |
+| kitty 查询 `CSI ? u` | `?` action='u' | `\x1b[?<flags>u`（flags=0 也显式编 `?0u`） | 实测（默认/各档/push-pop 后） |
+| OSC 10/11/12 `?` | osc_dispatch 参数 `10;?` 等 | **未上报主题（SetDefaultColors 未设）⇒ 不答**（V-2 实测定案：不是答默认色值）；上报后按上报值答 `\x1b]10;rgb:RRRR/GGGG/BBBB\x07`（8bit×257） | 实测（osc10_default 空 vs osc10_theme） |
+| OSC 12 `?`（光标色） | 同上 | 同上格式；上报主题时**答前景色**（实测 osc12_theme = fg 值） | 实测 |
+| OSC 4 `idx;?` | osc_dispatch 4 号 | `\x1b]4;<idx>;rgb:…\x07`：set 过的索引回**镜像值**（实测 set rgb:12/34/56 → 答 1212/3434/5656）；未 set 的回 ghostty 内置调色板（实测 idx5=b2b2/9494/bbbb、idx1/2 有值——**真表已在向量里**，D-9 关闭） | 实测 |
+| 像素尺寸 `CSI 14 t`/`CSI 16 t`/`CSI 18 t` | action='t' | **不答**（设计期预期按名义 cell 自答系误判） | 实测 |
+| 标题上报 `CSI 21 t` | param 21 | **不答**（DEC 21 开后同样不答） | 实测 |
+| ENQ 0x05 | print/dispatch 0x05 | 不答 | 实测 |
+| kitty 键盘 set/push/pop `CSI > flag u`/`CSI < n u`/`CSI = flag u` | csi_dispatch | 不产生应答，只改 TermMode（alacritty 原生处理）；`CSI > 4;N m` 由 probe 记账 modifyOtherKeys（N==2 置位、其余/复位/RIS 清零） | 实测（query 应答见 kitty 行） |
+| XTQMODKEYS `CSI ? 4 m` | csi_dispatch | **不答**（herdr 补丁 0002 的查询面在现产线未暴露） | 实测 |
 | OSC 52 剪贴板 | alacritty Handler 原生 `clipboard_store/load` 事件 | 经 EventListener 捕获 → `clipChan`/读缓存（不走 write_pty）；`VoidListener` 换成 `TermSink`（EventListener impl 只收 clipboard 事件） | 对齐 Go 双向语义 |
 
 应答抑制（对齐 Go 任务 5.1 窄规则）：腿集合里存在 `capsRawTerminal` 声明腿 ⇒ probe 停止
@@ -189,23 +189,16 @@ term_vt.go 组 KeyEvent 时不填）⇒ 我们实现同样按 0 处理（kitty �
      alternates：REPORT_ALTERNATE_KEYS 时 utf8 首码点为 shifted 形态且 shift 置位 → alt1；
      基座码点（W3C key 的 codepoint）≠ key → alt2；REPORT_ASSOCIATED_TEXT 且非 release 且
      修饰不阻文本（ctrl/super 恒阻、alt 按 D-10 平台口径）→ text 段码点列表（控制码剔除）。
-2. legacy 路径：
+2. legacy 路径（**决策优先级以 term_keyenc.json 实测为准**——下列描述已按 349 案向量校正）：
    - 仅 press/repeat；composing → 无输出；
    - **PC 功能键表**（function_keys.zig：光标键 DECCKM 分 SS3/CSI、F1-F12 修饰族、小键盘
      DECKPAM 分流含 1035/numlock 语义、backarrow DECBKM 0x08/0x7f、modifyOtherKeys 抑制位）
-     按「绑定修饰精确匹配 + 光标/小键盘/修饰位过滤」取序列；命中且 utf8 非空且
-     key∈{backspace,enter,escape} → 控制字符 utf8 时照发序列、否则 enter 直发文本 /
-     backspace 无输出；
-   - **modifyOtherKeys mode 2**（`CSI > 4;2m` 后）：单码点 + 绑定修饰命中 xterm 规则
-     （`@`..`\x7f` 控制区、非 shift 修饰、或 shift+space）→ `CSI 27;<modcode>;<codepoint>~`
-     （modcode：shift=2、alt=3、ctrl=5、shift+alt=4、shift+ctrl=6、alt+ctrl=7、shift+alt+ctrl=8）；
-   - **ctrlSeq → C0**：ctrl 且（绑定修饰恰为 ctrl-only）且字符落在映射表（a..z、0-9 部分位、
-     符号表、space=0、`?`=127 等；`i`/`m`/`[` 故意除外走 CSI u）→ C0 字节；alt 置位加 ESC 前缀；
-     大写+unshifted 归小写（unshifted 恒 0 ⇒ 跳过该归一化，同 Go 实跑形态）；
-   - utf8 空 → legacyAltPrefix（alt+alt_esc_prefix(1036) 时 ESC+unshifted/文本）；1036 默认关 ⇒
-     常态无输出；
-   - ctrl + 多码点/表外字符 → **fixterms CSI u**：`CSI <lowercodepoint>;<mods+1>u`（shift+大写
-     归小写；unshifted==codepoint 时 shift 位保留，否则清 shift）；
+     按「绑定修饰精确匹配 + 光标/小键盘/修饰位过滤」取序列；
+   - **ctrl+字母不走 C0**（实测 plain 模式 ctrl+a → `\x1b[1;5u` = fixterms CSI u；C0 直发仅
+     控制字符 text 形态在 kitty 全开下出现——kitty31 ctrl+a → `\x01`）；alt 置位且无其它
+     修饰 ⇒ alt 修饰被丢弃、直发文本（实测 alt+a → `a`）；
+   - **modifyOtherKeys mode 2**（`CSI > 4;2m` 后）：绑定修饰命中 → `CSI 27;<modcode>;<codepoint>~`
+     （实测 ctrl+a → `27;5;1~`、shift+a → `27;2;65~`；**ctrl+alt 只叠 ctrl 位**——alt 不进 modcode）；
    - darwin 且 super → 无输出（D-10）；其余直发 utf8。
 
 ### 3.2 鼠标（`term/keyenc.rs` 同文件 mouse 段）
@@ -215,13 +208,16 @@ term_vt.go 组 KeyEvent 时不填）⇒ 我们实现同样按 0 处理（kitty �
 **D-4 影响面**：URXVT 位 alacritty 无 ⇒ 1015 形态不可达（恒走默认/X10），登记。
 字节面：
 
-- SGR：`CSI <btn;X+1;Y+1M|m`（release 用 m）；btn = 按钮码 + 修饰(4/8/16) + motion 位 32 +
-  wheel 位 64（4/5 键）；
-- X10 三字节：`ESC[M` + `32+btn` + `32+X+1` + `32+Y+1`（>222 越界不发）；
+- SGR：`CSI <btn;X+1;Y+1M|m`（release 用 m）；btn = 按钮码 + 修饰(shift4/meta8/ctrl16) + motion 位 32 +
+  wheel 位 64（4/5 键；实测 wheel four=64、five=65）；
+- X10 三字节：`ESC[M` + `32+btn` + `32+X+1` + `32+Y+1`；**1000 模式 release 报 btn=3（`#`）**（实测）；
+  **坐标 X 或 Y ≥ 222 即不报**（实测 press_left_edge 222 → None，对 SGR 格式同样生效——
+  坐标检查在格式选择之前）；
 - UTF8：同 X10 但坐标按码点编码；
-- 上报范围规则（shouldReport）：X10 只报左/中/右 press；normal 只报非 motion；motion 模式按
-  any_button_pressed 与视口内规则；**同格 motion 去重**：Go 的 setopt_from_terminal 是否带
-  last_cell 未传（input.go 未设 OPT）⇒ 按无去重实现（同 Go 实跑），D-11 登记复核。
+- 上报范围规则（shouldReport，实测钉死）：X10 只报左/中/右 press；normal 只报非 motion
+  （motion 不报）；motion 模式按 any_button_pressed 与视口内规则；**同格 motion 去重**：Go 的
+  setopt_from_terminal 是否带 last_cell 未传（input.go 未设 OPT）⇒ 按无去重实现（同 Go 实跑），
+  D-11 登记复核。
 
 ### 3.3 焦点与粘贴
 
@@ -230,15 +226,18 @@ term_vt.go 组 KeyEvent 时不填）⇒ 我们实现同样按 0 处理（kitty �
 - 粘贴：bracketed（2004 开）时 `\x1b[200~` + 文本 + `\x1b[201~`，**分帧续接语义**（首片开、
   末片闭、中片裸文本——textPasteMore/Cont 位驱动），对齐 EncodePastePart。
 
-### 3.4 单测对齐面（6c 验收）
+### 3.4 单测对齐面（6c 验收；向量**已产出**，见 6c 提交）
 
-- 向量生成（tools/vector-gen 扩展，进克隆跑 Go 真源）：**键编码对照表**——克隆内写最小
-  harness 直接调 `vt.Terminal.EncodeKey`（cgo）产「输入事件（key/mods/action/text + 终端模式
-  状态）→ 字节」向量集（覆盖：legacy 全功能键栏、DECCKM 两态、kitty 五位全组合采样、
-  REPORT_ALL/TEXT 各形态、modifyOtherKeys on/off、ctrl 表、fixterms、alt 前缀）；Rust 对照
-  逐字节。鼠标/焦点同理（含 SGR/X10/UTF8 × press/release/motion × wheel）。
-- 应答器向量：克隆 harness 喂查询串收 write_pty 字节（DA1/DA2/DA3/DSR×2/DECRQM 已知未
-  知/kitty query/OSC 10/11/12/4/14t/16t/18t/21t），Rust 对照逐字节（含模式态翻转中间态）。
+- 键编码对照 `fixtures/vectors/term_keyenc.json`（47 键码表 + 14 模式 349 案，克隆 harness
+  直调 `vt.Terminal.EncodeKey` 产）：覆盖 legacy 全功能键栏、DECCKM 两态、kitty 五位及组合、
+  REPORT_ALL/TEXT 各形态、modifyOtherKeys on/off、ctrl/alt 组合、release/repeat、composing、
+  小键盘 DECCKPM、修饰键本身。Rust 对照逐字节。
+- 应答器对照 `term_responder.json`（43 案，克隆 harness 喂查询串收 write_pty 字节）：
+  DA 族/DSR 族（含 DECOM 两态）/DECRQM（私有开/关/未知/永久态 + ANSI 面不答）/kitty 查询
+  各档/OSC 颜色（默认不答 + 主题应答 + 镜像 + 未 set 基表）/尺寸与标题上报不答/ENQ/同批
+  多查询分片语义。Rust 对照逐字节。
+- 鼠标对照 `term_mouseenc.json`（10 模式 160 案）：SGR/X10/UTF8 × press/release/motion ×
+  wheel × 修饰 × 坐标边界（origin/edge/over）。
 
 ## 四、surface v4 产出端字节面（必答④）
 
@@ -278,14 +277,14 @@ Alt=128；kitty u8 原样；misc bit0 = modifyOtherKeys（自管位）。快照/
 | `surface-golden/surface_input_cases.tsv`（19 案） | INPUT/HELLO-tail/caps/theme/clipboard 载荷解码单测（hex 列 = 期望 wire 字节） | 19/19 |
 | `vectors/`（R0 既有） | 不变 | — |
 
-### 4.4 新增生成向量（tools/vector-gen 扩展，都从克隆真源产）
+### 4.4 生成向量（tools/vector-gen，都从克隆真源产；term 三件已产出）
 
 - `vectors/surface_codec.json`：固定 cell 输入 → `vt.EncodeGrid/EncodeRows/DecodeGrid`（pkg/term/vt
   导出面）逐字节；SNAPSHOT/DIFF 体（encSnapshotBody/encDiffBody 为未导出 ⇒ 模板测试文件进
-  克隆内跑，R0.4 同法）→ 字节 + 字段表。**这是「逐字节」的格式锚**——与仿真器无关。
-- `vectors/term_keyenc.json` + `vectors/term_responder.json`：见 3.4/②。
+  克隆内跑，R0.4 同法）→ 字节 + 字段表。**这是「逐字节」的格式锚**——与仿真器无关。（6d 产）
+- `vectors/term_keyenc.json` + `term_responder.json` + `term_mouseenc.json`：**已产出**（见 3.4）。
 - `vectors/term_manifest_eval.json`：两份 startup 夹具 × 22 manifest 的求值轨迹（matched 规则/
-  状态/可见位），Rust 对拍。
+  状态/可见位），Rust 对拍。（6f 产）
 
 ## 五、会话面（必答⑤）
 
@@ -354,13 +353,13 @@ OS=255 头）、`fnv = 1`（golden digest）。regex：manifest 方言垫片（R
 |---|---|---|---|
 | D-1 | alacritty 与 Go 的坐标系关系（设计期误判为反向） | 实现陷阱 | **实现核实（6b）**：alacritty Line(0)=视口顶、负数进回滚，与 Go **同向**，无需换算；唯一换算点 = 绝对行号⇔Line。golden 光标/回滚列对拍全绿钉死 |
 | D-2 | 空白格/带样式空格的 Symbol 归一化（ghostty 内部形态未文档化） | 仿真等价 | **V-1 已裁决（6b golden 全绿）**：空格（显式或未写）一律无字素（symbol 空）；带样式空格 width=0、无样式空格 width=1（blankRun 族）；占位格 skip。alacritty 无法区分「显式无样式空格」与「未写格」⇒ 统一走空白格（渲染一致，并入 D-13 登记） |
-| D-3 | OSC 10/11 默认色（未上报主题时）ghostty 缺省值未知 | 应答字节 | V-2：克隆 harness 实测采值入向量（6c） |
+| D-3 | OSC 10/11 默认色（未上报主题时）ghostty 缺省值未知 | 应答字节 | **V-2 实测定案（6c 向量）**：未设 SetDefaultColors 时 OSC 10/11/12 查询**不应答**——无需默认色值表；Rust 同形（theme 状态三态：未上报/已上报/换帧） |
 | D-4 | X10 鼠标位（DEC 9）/URXVT（1015）alacritty 无位 | 模式位/编码不可达 | wire 位恒 false：M1000 位语义等价（Go 也 OR 两位）；URXVT 编码恒不走。真机 TUI 极罕用，登记豁免 |
 | D-5 | SGR 53 overline 无位 | 样式位丢失 | attr bit7 不可达；golden 不含；登记，遇真需求补 |
 | D-6 | damage 含光标行（比 Go 多发一行） | 安全超集 | 观测项 |
 | D-7 | 光标 Password 位恒 false | 提示位降级 | 登记 |
-| D-8 | OSC 12 光标色近似 | 应答值 | 用主题前景；登记 |
-| D-9 | OSC 4 未 set 索引答 xterm 基表 vs ghostty 自有调色板 | 应答值漂 | 镜像值精确；未 set 值登记，6g 实测遇红再补真表 |
+| D-8 | OSC 12 光标色近似 | 应答值 | **实测定案**：ghostty 答前景色（向量 osc12_theme），Rust 同形即精确对齐，登记关闭 |
+| D-9 | OSC 4 未 set 索引答 xterm 基表 vs ghostty 自有调色板 | 应答值漂 | **实测定案**：向量已采 ghostty 内置调色板样本（idx1/2/5），Rust 按向量值内嵌同表，登记关闭 |
 | D-10 | darwin 平台分支（super 抑制文本、alt 关联文本口径） | 平台条件 | 按 ghostty 编译期分支同形实现；linux 出口无此面 |
 | D-11 | 鼠标 motion 同格去重未确认（Go 未显式设 last_cell） | 编码频率 | 按「不去重」实现（同 Go 实跑），克隆 harness 验证 |
 | D-12 | gzip 字节不逐位同（deflate 实现差） | 非契约层 | 契约 = 解压后字节 + digest；flate2 尽力同头 |
