@@ -17,6 +17,7 @@ use homeway_core::speedtest::{self, Params};
 use homeway_core::token;
 use homeway_core::wgcore::ConnErr;
 
+mod daemon_cli;
 mod relay_cli;
 mod serve_cli;
 mod unified_cli;
@@ -41,14 +42,41 @@ fn main() {
             println!("homeway-cli {}", cli_version());
         }
         Some("token") => cmd_token(&args[2..]),
-        Some("serve") => {
-            if args.get(2).map(String::as_str) == Some("token") {
-                serve_cli::cmd_serve_token(&args[3..]);
-            } else {
-                serve_cli::cmd_serve(&args[2..]);
+        // serve 命令组（start/stop/restart/status/token）= 控制面往返；动词之外的
+        // 形态 = 前台单角色（`serve token [list|revoke]` 纯读命令保留直连 state 形态）。
+        Some("serve") => match args.get(2).map(String::as_str) {
+            Some("start") | Some("stop") | Some("restart") | Some("status") => {
+                daemon_cli::cmd_serve_group(&args[2..])
             }
-        }
-        Some("relay") => relay_cli::cmd_relay(&args[2..]),
+            Some("token") => {
+                // `serve token` = reveal：控制面运行态优先（Go 同款命令组形态，认
+                // --state）；`serve token list|revoke` = 纯读/纯文件操作（不经控制面，
+                // 直连 state——local-rust-exit.sh 等脚本契约）。
+                match args.get(3).map(String::as_str) {
+                    Some("list") | Some("revoke") => serve_cli::cmd_serve_token(&args[3..]),
+                    Some(other) if other.starts_with('-') || other.len() >= 64 => {
+                        // --state 等(flag)/疑似 token 直给形态：控制面 reveal。
+                        daemon_cli::cmd_serve_group(&args[2..])
+                    }
+                    Some(other) => {
+                        eprintln!("serve token 不认识的动词 {other:?}（可用：list / revoke <id>；无动词 = reveal）");
+                        std::process::exit(2);
+                    }
+                    None => daemon_cli::cmd_serve_group(&args[2..]),
+                }
+            }
+            Some("relay") | Some("ddns") => daemon_cli::cmd_serve_group(&args[2..]),
+            _ => serve_cli::cmd_serve(&args[2..]),
+        },
+        // relay 命令组同款分流。
+        Some("relay") => match args.get(2).map(String::as_str) {
+            Some("start") | Some("stop") | Some("restart") | Some("status") | Some("token") => {
+                daemon_cli::cmd_relay_group(&args[2..])
+            }
+            _ => relay_cli::cmd_relay(&args[2..]),
+        },
+        Some("host") => daemon_cli::cmd_host(&args[2..]),
+        Some("status") => daemon_cli::cmd_status(&args[2..]),
         Some("connect") => cmd_connect(&args[2..]),
         Some("speedtest") => cmd_speedtest(&args[2..]),
         Some("files") => cmd_files(&args[2..]),
@@ -56,7 +84,7 @@ fn main() {
         Some("portfwd") => cmd_portfwd(&args[2..]),
         _ => {
             eprintln!(
-"homeway-cli——可用：\n  token <hmw1…> [--dead-direct]（改写输出：Direct 端点 → 死端口——矩阵中继段注入缝）\n  connect --token <hmw1…> [--identity-dir <dir>] [--endpoint-cache-dir <dir>]\n      [--speedtest] [--dial <ip:port>] [--hold <secs>] [--probe N] [--status-json]\n      [--recover-from <1|2|3> [--recover-cause <s>]] [--inject poison-socket|relay-lock]（注入需 test-seams 构建）\n  speedtest --token <hmw1…> [--identity-dir D] [--endpoint-cache-dir D] [--rounds N] [--hold]（同会话 N 轮——A/B 轮次口径）"
+"homeway-cli——可用：\n  零参 = 统一进程（--state DIR / --verbose；client/control 恒开 + serve/relay 按期望态）\n  host add [--name N] [--force] <token> / host list [--json] / host status [name] / host delete <name|id> [--yes]\n  status [--json]（daemon.status 聚合面）\n  serve <start|stop|restart|status|token> / relay <start|stop|restart|status|token>（控制面命令组）\n  serve [flags]（前台单角色）/ relay [flags]（前台单角色）\n  token <hmw1…> [--dead-direct]（改写输出：Direct 端点 → 死端口——矩阵中继段注入缝）\n  connect --token <hmw1…> [--identity-dir <dir>] [--endpoint-cache-dir <dir>]\n      [--speedtest] [--dial <ip:port>] [--hold <secs>] [--probe N] [--status-json]\n      [--recover-from <1|2|3> [--recover-cause <s>]] [--inject poison-socket|relay-lock]（注入需 test-seams 构建）\n  speedtest --token <hmw1…> [--identity-dir D] [--endpoint-cache-dir D] [--rounds N] [--hold]（同会话 N 轮——A/B 轮次口径）"
             );
             std::process::exit(2);
         }
