@@ -22,6 +22,8 @@ use super::{CarrierDial, DialErr};
 pub const SPEEDTEST_SERVICE_PORT: u16 = 7803;
 /// link_down 重试节拍（与 CLI 轮询同拍 250ms）。
 const RETRY_INTERVAL: Duration = Duration::from_millis(250);
+/// runner 侧单流拨号预算（引擎每次拨 1–6 流——份额口径，Go dialFn 的 ctx 份额）。
+const DIAL_BUDGET: Duration = Duration::from_secs(10);
 
 /// start 载荷（Go SpeedtestStart）。
 #[derive(Debug, Clone, Copy)]
@@ -76,9 +78,14 @@ pub struct SpeedtestStatus {
     pub wait_remain_ms: i64,
     /// waiting | connecting | down | up | idle。
     pub phase: String,
-    /// 当前相位累计字节（CLI 轮询差分算 instBps）。
+    /// 当前相位累计字节。
     pub bytes: i64,
     pub elapsed_ms: i64,
+    /// 相位瞬时速率（daemon 侧差分——Go CLI 的 st.InstBps 直读面，中-3）。
+    pub inst_bps: f64,
+    /// 已完成相位 + 当前相位的用量（down/up 各一）。
+    pub usage_down: i64,
+    pub usage_up: i64,
     pub result: Option<SpeedtestOutcome>,
 }
 
@@ -87,6 +94,19 @@ struct RunState {
     waiting: bool,
     /// 终态（runner 收场时写回；None = 未到终态）。写回后 runLoop 即退（busy 随之假）。
     result: Option<SpeedtestOutcome>,
+    /// 轮询差分面（中-3：instBps 的 daemon 侧计算 + 相位切换时的用量累计——
+    /// Go CLI 直读 dir/instBps 的 wire 对齐）。
+    probe: ProbeState,
+}
+
+#[derive(Default)]
+struct ProbeState {
+    last_phase: Option<&'static str>,
+    last_bytes: i64,
+    last_at: Option<Instant>,
+    /// 已完成相位的用量累计（down/up 各一）。
+    usage_down: i64,
+    usage_up: i64,
 }
 
 /// 一台主机的运行时（run 线程与 status 面的共享面）。
@@ -150,8 +170,17 @@ impl SpeedtestManager {
     /// 对一台主机开跑：per-host 单飞（busy = 成功载荷 reason，同手机信封形态）；
     /// 立即返回 waiting 相位，整轮在后台线程里跑。
     pub fn start(&self, host: &str, p: SpeedtestParams) -> SpeedtestAck {
+        // check+insert 同一临界区（评审 D-1：两个并发 start 不得同时通过 busy 检查——
+        // per-host 单飞契约；Go 在同一把 m.mu 内完成）。
+        let run = Arc::new(SpeedRun {
+            cancel: AtomicBool::new(false),
+            live: Arc::new(LiveProgress::new()),
+            state: Mutex::new(RunState { waiting: true, result: None, probe: ProbeState::default() }),
+            wait_until: Instant::now() + Duration::from_millis(p.wait_ms.max(0) as u64),
+            started_at: Instant::now(),
+        });
         {
-            let runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
+            let mut runs = self.runs.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(r) = runs.get(host) {
                 if r.busy() {
                     return SpeedtestAck {
@@ -160,25 +189,27 @@ impl SpeedtestManager {
                     };
                 }
             }
+            runs.insert(host.to_owned(), Arc::clone(&run));
         }
-        let run = Arc::new(SpeedRun {
-            cancel: AtomicBool::new(false),
-            live: Arc::new(LiveProgress::new()),
-            state: Mutex::new(RunState { waiting: true, result: None }),
-            wait_until: Instant::now() + Duration::from_millis(p.wait_ms.max(0) as u64),
-            started_at: Instant::now(),
-        });
-        self.runs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(host.to_owned(), Arc::clone(&run));
         let dial = clone_dial(&self.dial);
         let logf = Arc::clone(&self.logf);
         let host = host.to_owned();
         std::thread::Builder::new()
             .name("hw-spd-run".to_owned())
             .stack_size(2 * 1024 * 1024)
-            .spawn(move || run_loop(run, host, p, dial, logf))
+            .spawn(move || {
+                // 低-12：panic 收位——run 线程意外退出必须落终态（否则 busy 判定
+                // 永真，该主机永久 busy）。
+                let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    run_loop(Arc::clone(&run), host.clone(), p, dial, logf)
+                }));
+                if let Err(e) = r {
+                    run.finish_with(outcome_err(
+                        speedtest::REASON_INTERRUPTED,
+                        &format!("run 线程异常退出：{e:?}"),
+                    ));
+                }
+            })
             .expect("线程创建不可失败");
         SpeedtestAck { phase: "waiting", reason: None }
     }
@@ -186,7 +217,7 @@ impl SpeedtestManager {
     /// 该主机的运行态（无运行面 = None——CLI 判「运行面丢失」的形态）。
     pub fn status(&self, host: &str) -> Option<SpeedtestStatus> {
         let run = self.runs.lock().unwrap_or_else(|e| e.into_inner()).get(host).cloned()?;
-        let st = run.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut st = run.state.lock().unwrap_or_else(|e| e.into_inner());
         if st.waiting {
             let remain = run.wait_until.saturating_duration_since(Instant::now());
             return Some(SpeedtestStatus {
@@ -195,6 +226,9 @@ impl SpeedtestManager {
                 phase: "waiting".to_owned(),
                 bytes: 0,
                 elapsed_ms: -1,
+                inst_bps: 0.0,
+                usage_down: st.probe.usage_down,
+                usage_up: st.probe.usage_up,
                 result: st.result.clone(),
             });
         }
@@ -203,16 +237,45 @@ impl SpeedtestManager {
         // CLI 的「运行面丢失」判据以 idle 为准，这里把在册 run 的瞬态 idle 归一到
         // connecting，免得轮询撞上微秒级窗口误判。
         let phase = match (phase, st.result.is_none()) {
-            (Some(p), _) => p.to_owned(),
-            (None, true) => "connecting".to_owned(),
-            (None, false) => "idle".to_owned(),
+            (Some(p), _) => p,
+            (None, true) => "connecting",
+            (None, false) => "idle",
         };
+        // 轮询差分（中-3）：相位切换 → 上一相位用量入累计；同相位 → instBps 差分。
+        let now = Instant::now();
+        let mut inst = 0.0f64;
+        let p = phase;
+        match (st.probe.last_phase, st.probe.last_at) {
+            (Some(prev), Some(at)) if prev == p => {
+                let dt = now.duration_since(at).as_secs_f64();
+                if dt > 0.0 && bytes >= st.probe.last_bytes {
+                    inst = (bytes - st.probe.last_bytes) as f64 / dt;
+                }
+            }
+            (Some(prev), _) if prev != p => {
+                // 相位切换：上一相位用量入累计（down→up 或 up→收尾）。
+                let add = st.probe.last_bytes;
+                if prev == "down" {
+                    st.probe.usage_down += add;
+                } else if prev == "up" {
+                    st.probe.usage_up += add;
+                }
+            }
+            _ => {}
+        }
+        st.probe.last_phase = Some(p);
+        st.probe.last_bytes = bytes;
+        st.probe.last_at = Some(now);
+        let (ud, uu) = (st.probe.usage_down, st.probe.usage_up);
         Some(SpeedtestStatus {
             waiting: false,
             wait_remain_ms: 0,
-            phase,
+            phase: p.to_owned(),
             bytes,
             elapsed_ms: run.started_at.elapsed().as_millis() as i64,
+            inst_bps: inst,
+            usage_down: ud + if p == "down" { bytes } else { 0 },
+            usage_up: uu + if p == "up" { bytes } else { 0 },
             result: st.result.clone(),
         })
     }
@@ -330,7 +393,7 @@ fn dial_speedtest(
     if run.cancel.load(Ordering::Acquire) {
         return Err(SpeedtestError::Cancelled);
     }
-    match (dial.dial_port)(host, SPEEDTEST_SERVICE_PORT) {
+    match (dial.dial_port)(host, SPEEDTEST_SERVICE_PORT, DIAL_BUDGET) {
         Ok(c) => Ok(c.speed),
         Err(DialErr::Refused) => Err(SpeedtestError::NotSupported),
         Err(e @ (DialErr::NoSession | DialErr::NoHost)) => Err(SpeedtestError::Bridge(

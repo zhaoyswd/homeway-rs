@@ -23,16 +23,20 @@ pub(super) mod testutil;
 
 use std::net::SocketAddrV4;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use super::StreamConn;
 pub use forward::{describe_target, ForwardRule, ForwardState};
 pub use socksmgr::{SocksState, SOCKS_DEFAULT_LISTEN};
 pub use speedrun::{SpeedtestOutcome, SpeedtestParams, SpeedtestStatus};
 
-/// 拨号缝闭包形（出口本机端口形态）。
-pub type DialPortFn = Arc<dyn Fn(&str, u16) -> Result<CarrierConn, DialErr> + Send + Sync>;
-/// 拨号缝闭包形（任意目标形态）。
-pub type DialAddrFn = Arc<dyn Fn(&str, SocketAddrV4) -> Result<CarrierConn, DialErr> + Send + Sync>;
+/// 拨号缝闭包形（出口本机端口形态；`Duration` = 本次拨号预算——socks 的候选
+/// 份额与 DNS 解析腿的 5s 都经此传导，中-1/中-8）。
+pub type DialPortFn =
+    Arc<dyn Fn(&str, u16, Duration) -> Result<CarrierConn, DialErr> + Send + Sync>;
+/// 拨号缝闭包形（任意目标形态；`Duration` = 本次拨号预算）。
+pub type DialAddrFn =
+    Arc<dyn Fn(&str, SocketAddrV4, Duration) -> Result<CarrierConn, DialErr> + Send + Sync>;
 
 /// 承载面统一拨号缝（Go carrierDial）：host = peerID hex；出口本机端口 / 任意目标
 /// 两形态。同一连接的两个消费面（`.io` = StreamConn 透传/解析腿；`.speed` = 测速
@@ -76,7 +80,7 @@ pub enum CarrierErr {
     NoHost,
     #[error("端口须在 1024–65535：{0}")]
     PortRange(u16),
-    #[error("监听端口已被占用（全局唯一）：{port} 已被 {owner} 占用")]
+    #[error("监听端口已被占用（全局唯一）：{port} 已被 {owner} 占用（可用 --listen 另选）")]
     PortTaken { port: u16, owner: String },
     #[error("每主机 forward 规则上限 8 条（{0} 已 {1} 条）")]
     TooManyRules(String, usize),
@@ -174,9 +178,10 @@ impl Carriers {
         let port = if listen == 0 { self.sks.default_listen(host) } else { listen };
         if port != 0 {
             if let Some(owner) = self.fwd.port_owner(port) {
-                return Err(CarrierErr::PortTaken { port, owner: format!("{owner}（可用 --listen 另选）") });
+                return Err(CarrierErr::PortTaken { port, owner });
             }
         }
+        let _ = &self.fwd;
         self.sks.on(host, listen)
     }
 
@@ -411,19 +416,27 @@ impl PollListener {
                 let _ = stream.set_nodelay(true);
                 PollAccept::Conn(stream)
             }
-            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => PollAccept::Idle,
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                // 高-1 整改：无待收 = 50ms 节拍（非阻塞 accept 不空转；接入延迟
+                // 0–50ms——与 Go 阻塞 accept 的零延迟差，登记 B0-2b §十六）。
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                PollAccept::Idle
+            }
+            // fd/内存短缺族 = 瞬态（低-2 整改：与 Go transientAcceptError 同集——
+            // 一次 EMFILE 不该把监听打死为 failed）。
             Err(e)
-                if matches!(
-                    e.kind(),
-                    std::io::ErrorKind::ConnectionAborted
-                        | std::io::ErrorKind::ConnectionReset
-                        | std::io::ErrorKind::Interrupted
-                ) =>
+                if matches!(e.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOMEM))
+                    || matches!(
+                        e.kind(),
+                        std::io::ErrorKind::ConnectionAborted
+                            | std::io::ErrorKind::ConnectionReset
+                            | std::io::ErrorKind::Interrupted
+                    ) =>
             {
                 // 瞬态：线性退避（烧尽 = 监听失效）。
                 self.backoff += 1;
                 if self.backoff > ACCEPT_RETRY_MAX {
-                    return PollAccept::Failed(format!("accept 连续失败（{} 次）：{e}", self.backoff));
+                    return PollAccept::Failed(format!("连续失败（{} 次）：{e}", self.backoff));
                 }
                 std::thread::sleep(std::time::Duration::from_millis(
                     self.backoff as u64 * ACCEPT_RETRY_STEP_MS,

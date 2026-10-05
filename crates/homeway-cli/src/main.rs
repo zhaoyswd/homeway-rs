@@ -946,6 +946,7 @@ fn cmd_files(args: &[String]) {
     session.stop();
     if let Err(e) = r {
         eprintln!("files {verb} 失败：{e}");
+        std::process::exit(1);
     }
 }
 

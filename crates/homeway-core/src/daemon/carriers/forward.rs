@@ -12,6 +12,7 @@
 
 use std::path::Path;
 use std::sync::atomic::{AtomicI32, Ordering};
+use std::time::Duration;
 use std::sync::{Arc, Mutex};
 
 use super::{
@@ -393,11 +394,12 @@ fn serve_conn(e: Arc<FwdEntry>, conn: std::net::TcpStream) {
     let _dec = ConnGuard(&e);
     let r = &e.rule;
     let port = if r.target_port == 0 { r.listen } else { r.target_port };
+    // 上游拨号预算 15s（Go serveConn 的 ctx 同值——经拨号缝传导）。
     let upstream = if r.target_ip.is_empty() {
-        (e.wire.dial.dial_port)(&r.host, port).map(|c| c.io)
+        (e.wire.dial.dial_port)(&r.host, port, Duration::from_secs(15)).map(|c| c.io)
     } else {
         let ip: std::net::Ipv4Addr = r.target_ip.parse().expect("校验已挡非 v4 字面量");
-        (e.wire.dial.dial)(&r.host, std::net::SocketAddrV4::new(ip, port)).map(|c| c.io)
+        (e.wire.dial.dial)(&r.host, std::net::SocketAddrV4::new(ip, port), Duration::from_secs(15)).map(|c| c.io)
     };
     let upstream = match upstream {
         Ok(u) => u,
@@ -462,7 +464,8 @@ mod tests {
     use super::*;
     use std::time::Duration;
 
-    fn nop_log() -> (Arc<dyn Fn(&str) + Send + Sync>, Arc<dyn Fn(&str) + Send + Sync>) {
+    type Logf2 = (Arc<dyn Fn(&str) + Send + Sync>, Arc<dyn Fn(&str) + Send + Sync>);
+    fn nop_log() -> Logf2 {
         (Arc::new(|_| {}), Arc::new(|_| {}))
     }
 

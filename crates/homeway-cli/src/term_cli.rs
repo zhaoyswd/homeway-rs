@@ -50,7 +50,7 @@ fn resolve_host_ref(state_dir: &std::path::Path, r#ref: &str, timeout: Duration)
     if r#ref.trim().is_empty() {
         return Err("空寻址串不可用——homeway-cli term <子命令> --host 需要 <name|id>（homeway-cli host list 查看在表主机）".to_owned());
     }
-    let c = dial_control_spawn_term(state_dir)?;
+    let c = dial_control_spawn_term(state_dir, false)?;
     let briefs = c
         .request(vocab::OpName::HostList.as_str(), None, timeout)
         .map_err(|e| format!("host.list 失败：{}", crate::daemon_cli::op_err_text(&e)))?;
@@ -60,14 +60,15 @@ fn resolve_host_ref(state_dir: &std::path::Path, r#ref: &str, timeout: Duration)
 }
 
 /// term 面的控制面拨号：先试拨（其它错误保留 term 面的误指提示文案），未运行族
-/// 走按需拉起（D-1：Go dialCarrierCLI → dialControlSpawn 同义）。
-fn dial_control_spawn_term(state_dir: &std::path::Path) -> Result<Arc<ControlClient>, String> {
+/// 走按需拉起（D-1：Go dialCarrierCLI → dialControlSpawn 同义；`--no-spawn` =
+/// fail-fast——Go FIX-57 共享位）。
+fn dial_control_spawn_term(state_dir: &std::path::Path, no_spawn: bool) -> Result<Arc<ControlClient>, String> {
     let sock = state_dir.join("control.sock");
     match ControlClient::dial(&sock, "cli", "homeway-term") {
         Ok((c, _)) => Ok(c),
         Err(e) => {
             if crate::daemon_cli::sock_not_running(&sock) {
-                crate::daemon_cli::dial_control_spawn(state_dir, "homeway-term", false)
+                crate::daemon_cli::dial_control_spawn(state_dir, "homeway-term", no_spawn)
             } else {
                 Err(control_dial_err(&sock, &e))
             }
@@ -130,6 +131,8 @@ struct TermTarget {
     host_ref: String,
     host_id: Option<String>,
     timeout: Duration,
+    /// 守护未跑时不按需拉起（Go FIX-57 共享位；D-1 评审补齐）。
+    no_spawn: bool,
 }
 
 impl TermTarget {
@@ -332,7 +335,7 @@ fn dial_term(t: &mut TermTarget) -> Result<(TermConn, u32), String> {
                 id
             }
         };
-        let client = dial_control_spawn_term(&t.state_dir)?;
+        let client = dial_control_spawn_term(&t.state_dir, t.no_spawn)?;
         let st = client.open_stream(vocab::STREAM_KIND_TERM, &id, t.timeout).map_err(|e| stream_open_err_text(&e))?;
         TermConn::Remote { client, st, buf: Vec::new() }
     } else {
@@ -453,6 +456,7 @@ struct TermCommon {
     state_dir: Option<PathBuf>,
     host_ref: String,
     timeout: Option<Duration>,
+    no_spawn: bool,
 }
 
 impl TermCommon {
@@ -470,6 +474,7 @@ impl TermCommon {
             host_ref: self.host_ref,
             host_id: None,
             timeout: self.timeout.unwrap_or(DEFAULT_REMOTE_TIMEOUT),
+            no_spawn: self.no_spawn,
         })
     }
 }
@@ -542,13 +547,14 @@ fn parse_term_args(
                     || format!("--timeout {v:?} 不是合法时长（如 10s、1500ms）"),
                 )?);
             }
+            "--no-spawn" => out.common.no_spawn = true,
             other if value_flags.contains(&other) => {
                 let v = take(&mut i, other)?;
                 out.values.push((other.to_owned(), v));
             }
             other if other.starts_with('-') => {
                 if !known_flags.contains(&other) {
-                    let mut usable = String::from("--state <dir>、--host <name|id>、--timeout <时长>");
+                    let mut usable = String::from("--state <dir>、--host <name|id>、--timeout <时长>、--no-spawn");
                     if !known_flags.is_empty() {
                         usable.push_str(&format!("、{}", known_flags.join("、")));
                     }
@@ -750,6 +756,7 @@ fn cli_new(args: &[String]) -> Result<(), String> {
         state_dir: t.state_dir.clone(),
         timeout: t.timeout,
         timeout_given,
+        no_spawn: t.no_spawn,
         create: true,
         reuse,
         takeover: false,
@@ -823,6 +830,8 @@ struct AttachOpts {
     timeout: Duration,
     /// 用户显式给了 --timeout（本地面拒绝用；缺省补的 10s 不算）。
     timeout_given: bool,
+    /// 守护未跑时不按需拉起（D-1 评审补齐——远程 attach 直组 TermTarget 的透传面）。
+    no_spawn: bool,
     create: bool,
     reuse: bool,
     takeover: bool,
@@ -840,6 +849,7 @@ fn cli_attach(args: &[String]) -> Result<(), String> {
         host_ref: p.common.host_ref.clone(),
         timeout: p.common.timeout.unwrap_or(DEFAULT_REMOTE_TIMEOUT),
         timeout_given: p.common.timeout.is_some(),
+        no_spawn: p.common.no_spawn,
         create: false,
         reuse: false,
         takeover,
@@ -868,6 +878,7 @@ fn attach_cmd(o: AttachOpts) -> Result<(), String> {
         host_ref: o.host_ref.clone(),
         host_id: None,
         timeout: o.timeout,
+        no_spawn: o.no_spawn,
     };
     // 本地面拒绝 --timeout（Go exec-r1 L6；远程缺省在 TermCommon::into_target 补，attach
     // 直组 TermTarget——此处同款校验）。
@@ -2010,14 +2021,15 @@ mod tests {
     #[test]
     fn local_mode_rejects_timeout() {
         // Go exec-r1 L6：本地面给 --timeout = 显式报错（不静默忽略）。
-        let c = TermCommon { state_dir: None, host_ref: String::new(), timeout: Some(Duration::from_secs(5)) };
+        let c = TermCommon { state_dir: None, host_ref: String::new(), timeout: Some(Duration::from_secs(5)), no_spawn: false };
         assert!(c.into_target().is_err());
-        let c = TermCommon { state_dir: None, host_ref: String::new(), timeout: None };
+        let c = TermCommon { state_dir: None, host_ref: String::new(), timeout: None, no_spawn: false };
         assert!(c.into_target().is_ok());
         let c = TermCommon {
             state_dir: None,
             host_ref: "exit1".to_owned(),
             timeout: Some(Duration::from_secs(5)),
+            no_spawn: false,
         };
         assert!(c.into_target().is_ok());
     }

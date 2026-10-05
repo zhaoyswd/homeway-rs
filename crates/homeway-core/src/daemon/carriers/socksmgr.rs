@@ -123,8 +123,12 @@ impl SocksManager {
             }
         }
         if let Some(i) = entries.iter().position(|e| e.rec.host == host) {
-            if entries[i].srv.is_some() && listen != 0 && entries[i].rec.listen == listen {
-                return Ok(listen); // 幂等：同端口已开
+            let healthy = entries[i]
+                .srv
+                .as_ref()
+                .is_some_and(|s| s.dead_reason().is_none());
+            if healthy && listen != 0 && entries[i].rec.listen == listen {
+                return Ok(listen); // 幂等：同端口已开（死监听不短路——走换新路径）
             }
             // 先算后写（FIX-38）：**先在新端口上把 listener 起起来**，成功了才换监听与
             // 记忆；失败时旧监听照常在役、记忆保持上一次成功的端口（与「off 不抹端口
@@ -192,6 +196,8 @@ impl SocksManager {
             if e.rec.host == host {
                 let port = e.rec.listen;
                 if e.srv.is_some() {
+                    // 死监听（accept 烧尽）也随 off 收口（清 dead 位）。
+                    e.err.clear();
                     stop_listener(e);
                     (self.logf)(&format!(
                         "socks: {} off（在世连接已 RST 收口，端口 {port} 记忆保留）",
@@ -230,12 +236,16 @@ impl SocksManager {
         let entries = self.entries.lock().unwrap_or_else(|e| e.into_inner());
         let mut out: Vec<SocksState> = entries
             .iter()
-            .map(|e| SocksState {
-                host: e.rec.host.clone(),
-                on: e.srv.is_some(),
-                listen: e.rec.listen,
-                conns: e.srv.as_ref().map_or(0, |s| s.conns()),
-                err: e.err.clone(),
+            .map(|e| {
+                let dead = e.srv.as_ref().and_then(|s| s.dead_reason());
+                SocksState {
+                    host: e.rec.host.clone(),
+                    on: e.srv.is_some() && dead.is_none(),
+                    listen: e.rec.listen,
+                    conns: e.srv.as_ref().map_or(0, |s| s.conns()),
+                    // dead 原因优先（在役但失效 = 最新的可行动归因）。
+                    err: dead.clone().unwrap_or_else(|| e.err.clone()),
+                }
             })
             .collect();
         out.sort_by(|a, b| a.host.cmp(&b.host));
@@ -348,9 +358,12 @@ fn resolver_for(dial: &CarrierDial, host: &str, cache: &Arc<DnsCache>) -> Resolv
         if let Some(addrs) = cache.get(name) {
             return Ok(addrs);
         }
-        let conn = dial_port(&host, SOCKS_DNS_PORT)
+        // 拨号腿 5s + 解析总预算 5s（中-1：Go ResolveOverConn 的 SetReadDeadline +
+        // ctx 同义——出口代答黑洞时 5s 归因超时、不缓存；超时由 dnsq 的期限壳收
+        // 连接解阻塞）。
+        let conn = dial_port(&host, SOCKS_DNS_PORT, RESOLVE_BUDGET)
             .map_err(|e| format!("解析腿拨号（出口 {SOCKS_DNS_PORT}）失败：{e}"))?;
-        let res = dnsq::resolve_over_conn(conn.io.as_ref(), name, RESOLVE_BUDGET);
+        let res = dnsq::resolve_with_deadline(Arc::clone(&conn.io), name, RESOLVE_BUDGET);
         conn.io.close(); // 每查询一条新连接
         match res {
             // NXDOMAIN / 无 A / 超时——不缓存，错误文案可区分。
@@ -445,7 +458,8 @@ mod tests {
     use super::super::testutil::{temp_dir, FakeDial};
     use super::*;
 
-    fn nop_log() -> (Arc<dyn Fn(&str) + Send + Sync>, Arc<dyn Fn(&str) + Send + Sync>) {
+    type Logf2 = (Arc<dyn Fn(&str) + Send + Sync>, Arc<dyn Fn(&str) + Send + Sync>);
+    fn nop_log() -> Logf2 {
         (Arc::new(|_| {}), Arc::new(|_| {}))
     }
 

@@ -287,22 +287,27 @@ impl DaemonCore {
 /// Go DialPort 的 15s 档）。
 fn carriers_dial_of(hosts: &Arc<hosts::HostTable>) -> carriers::CarrierDial {
     let h1 = Arc::clone(hosts);
-    let dial_port = Arc::new(move |host: &str, port: u16| -> Result<carriers::CarrierConn, carriers::DialErr> {
-        let id = hosts::decode_peer_id_pub(host).ok_or(carriers::DialErr::NoHost)?;
-        let sess = h1.session(&id).ok_or(carriers::DialErr::NoSession)?;
-        let conn_id = sess
-            .healing_dial_port(port, std::time::Duration::from_secs(15))
-            .map_err(map_dial_err)?;
-        Ok(carrier_conn_of(sess.client(), conn_id))
-    });
+    let dial_port = Arc::new(
+        move |host: &str, port: u16, budget: std::time::Duration| -> Result<carriers::CarrierConn, carriers::DialErr> {
+            let id = hosts::decode_peer_id_pub(host).ok_or(carriers::DialErr::NoHost)?;
+            let sess = h1.session(&id).ok_or(carriers::DialErr::NoSession)?;
+            let conn_id =
+                sess.healing_dial_port(port, budget.min(std::time::Duration::from_secs(15)))
+                    .map_err(map_dial_err)?;
+            Ok(carrier_conn_of(sess.client(), conn_id))
+        },
+    );
     let h2 = Arc::clone(hosts);
     let dial = Arc::new(
-        move |host: &str, dst: std::net::SocketAddrV4| -> Result<carriers::CarrierConn, carriers::DialErr> {
+        move |host: &str,
+              dst: std::net::SocketAddrV4,
+              budget: std::time::Duration|
+              -> Result<carriers::CarrierConn, carriers::DialErr> {
             let id = hosts::decode_peer_id_pub(host).ok_or(carriers::DialErr::NoHost)?;
             let sess = h2.session(&id).ok_or(carriers::DialErr::NoSession)?;
-            let conn_id = sess
-                .healing_dial_addr(dst, std::time::Duration::from_secs(15))
-                .map_err(map_dial_err)?;
+            let conn_id =
+                sess.healing_dial_addr(dst, budget.min(std::time::Duration::from_secs(15)))
+                    .map_err(map_dial_err)?;
             Ok(carrier_conn_of(sess.client(), conn_id))
         },
     );
@@ -355,12 +360,15 @@ impl Backend for DaemonCore {
 
     fn remove_host(&self, host_hex: &str) -> Result<(), BackendErr> {
         let id = hosts::decode_peer_id_pub(host_hex).ok_or(BackendErr::NoHost)?;
+        // 级联键规范化（低-3）：承载面按字符串比对 host——用解码后重编码的
+        // canonical 小写 hex（大写形态的请求不级联漏删）。
+        let canonical: String = id.iter().map(|b| format!("{b:02x}")).collect();
         // FIX-05：级联与承载面的「成员检查 + 落地」同锁（add_mu）串行——级联要么
         // 看到规则并删掉，要么规则因成员检查失败而根本落不了地（锁序恒为
         // add_mu → hosts.inner，无反向取锁面）。
         let _cascade = self.carriers.cascade_lock();
         self.hosts.remove_host(&id)?;
-        self.carriers.remove_host_cascade_locked(host_hex);
+        self.carriers.remove_host_cascade_locked(&canonical);
         Ok(())
     }
 
@@ -438,15 +446,17 @@ impl Backend for DaemonCore {
     // ---------- 承载面（语义在 carriers；本层只做 host hex 存在性闸 + 委托） ----------
 
     fn forward_add(&self, rule: ForwardRule) -> Result<ForwardState, BackendErr> {
-        let listen = rule.listen;
-        let host = rule.host.clone();
-        self.carriers.add_forward(rule).map_err(carrier_err_to_backend)?;
-        // 成功载荷 = 建成的规则面（listening 态——Go ForwardAdd 的 forwardBriefOf 同构）。
-        self.carriers
-            .forward_states(&host)
-            .into_iter()
-            .find(|s| s.rule.listen == listen)
-            .ok_or(BackendErr::Other("规则建成但快照缺席（不可达）".to_owned()))
+        // 成功载荷 = 请求规则合成 listening 态（Go control.go:233-235 同义——免二次
+        // 查表的 TOCTOU：并发 remove 后快照缺席会误报错误）。
+        let brief = ForwardState {
+            state: "listening".to_owned(),
+            err: String::new(),
+            conns: 0,
+            rejected: 0,
+            rule,
+        };
+        self.carriers.add_forward(brief.rule.clone()).map_err(carrier_err_to_backend)?;
+        Ok(brief)
     }
 
     fn forward_remove(&self, host_hex: &str, listen: u16) -> Result<(), BackendErr> {

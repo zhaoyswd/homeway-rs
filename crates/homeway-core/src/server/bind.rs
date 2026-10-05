@@ -647,7 +647,11 @@ impl ServerBind {
                 {
                     lg.last = Instant::now(); // Send 刷 last（Go Send 同义）
                     let wire = frame::frame_bytes(FrameKind::Data, wg);
-                    let n = unsafe { libc::send(fd, wire.as_ptr().cast(), wire.len(), 0) };
+                    let n = unsafe {
+                        // MSG_NOSIGNAL（评审 D-1 中-4：与 relay/ctlface 同款——n != len 的
+                        // 错误分支依赖 EPIPE 而非进程被信号打死）。
+                        libc::send(fd, wire.as_ptr().cast(), wire.len(), libc::MSG_NOSIGNAL)
+                    };
                     if n != wire.len() as isize {
                         let remote = lg.remote;
                         let id = lg.id;

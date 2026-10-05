@@ -65,6 +65,9 @@ pub struct SocksServer {
     cfg: SocksServerConfig,
     /// 服务端生命周期位：close 置位 → 在途拨号/解析预算收口 + 新请求拒绝。
     closed: AtomicBool,
+    /// 监听失效位（serve 线程 accept 瞬态烧尽 → 中-2：状态面据此按 off 呈现 +
+    /// err 如实可查——「状态说在听、实际没人受理」的反僵尸不变量）。
+    dead: Mutex<Option<String>>,
     conns: Mutex<(u64, HashMap<u64, std::net::TcpStream>)>,
     /// 在役监听（close 同步取走释放——「off 之后端口立即可重用」的确定性面；
     /// serve 线程按 50ms 节拍轮询，listener 为 None = 正常收口）。
@@ -76,6 +79,7 @@ impl SocksServer {
         Arc::new(SocksServer {
             cfg,
             closed: AtomicBool::new(false),
+            dead: Mutex::new(None),
             conns: Mutex::new((0, HashMap::new())),
             ln: Mutex::new(None),
         })
@@ -93,6 +97,11 @@ impl SocksServer {
 
     /// 受理循环（每连接一线程）；返回 Err = 监听失效（accept 瞬态错误烧尽）——
     /// 消费方按「off + err 如实呈现」收口。
+    /// 监听失效原因（None = 在役健康；Some = serve 线程已退——status 面按 off 呈现）。
+    pub fn dead_reason(&self) -> Option<String> {
+        self.dead.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    }
+
     pub(super) fn serve(self: &Arc<Self>) -> Result<(), String> {
         loop {
             if self.closed.load(Ordering::Acquire) {
@@ -131,9 +140,9 @@ impl SocksServer {
                         })
                         .expect("线程创建不可失败");
                 }
-                PollAccept::Idle => {}
+                PollAccept::Idle => {} // 节拍在 PollListener::accept 的 WouldBlock 分支内（高-1）
                 PollAccept::Closed => return Ok(()),
-                PollAccept::Failed(err) => return Err(format!("accept 连续失败：{err}")),
+                PollAccept::Failed(err) => return Err(err),
             }
         }
     }
@@ -285,13 +294,13 @@ impl SocksServer {
             }
             let remain = deadline.saturating_duration_since(Instant::now());
             if remain.is_zero() {
-                break;
+                break; // 总预算耗尽 / 服务已关——不再试下一候选
             }
-            let share = remain / (addrs.len() - i) as u32;
-            // 拨号预算由拨号缝内嵌（healing_dial 的 budget 参数面）；share 只做
-            // 「剩余均分」的语义面（缝内预算 ≤ share）。
-            let _ = share;
-            match (self.cfg.dial.dial)(&self.cfg.host, SocketAddrV4::new(*ip, port)).map(|c| c.io) {
+            // 每候选子预算 = min(DIAL_BUDGET, 剩余按剩余候选数均分)（Go dialAny 的
+            // N2 同义——单候选黑洞只烧自己的份额，总上界不破；中-8 整改：真传给
+            // 拨号缝，不再各吃 15s）。
+            let share = (remain / (addrs.len() - i) as u32).min(DIAL_BUDGET);
+            match (self.cfg.dial.dial)(&self.cfg.host, SocketAddrV4::new(*ip, port), share).map(|c| c.io) {
                 Ok(c) => return Ok(c),
                 Err(e) => {
                     last_err = Some(e.to_string());
@@ -364,7 +373,7 @@ fn read_exact_n(conn: &mut std::net::TcpStream, n: usize) -> std::io::Result<Vec
 
 #[cfg(test)]
 mod tests {
-    use super::super::testutil::{echo_listener, eventually, tcp_conn, FakeDial};
+    use super::super::testutil::{echo_listener, eventually, FakeDial};
     use super::*;
     use std::io::{Read, Write};
     use std::time::Duration;
@@ -464,11 +473,11 @@ mod tests {
         dial.addr_map
             .lock()
             .unwrap()
-            .insert(SocketAddrV4::new("10.9.9.1".parse().unwrap(), 80).into(), format!("127.0.0.1:{dead_port}").parse().unwrap());
+            .insert(SocketAddrV4::new("10.9.9.1".parse().unwrap(), 80), format!("127.0.0.1:{dead_port}").parse().unwrap());
         dial.addr_map
             .lock()
             .unwrap()
-            .insert(SocketAddrV4::new("10.9.9.2".parse().unwrap(), 80).into(), echo_addr);
+            .insert(SocketAddrV4::new("10.9.9.2".parse().unwrap(), 80), echo_addr);
         let resolver: Resolver = Arc::new(move |_| {
             Ok(vec!["10.9.9.1".parse().unwrap(), "10.9.9.2".parse().unwrap()])
         });

@@ -954,7 +954,11 @@ impl ConnShared {
             wait_remain_ms: 0,
             phase: "idle".to_owned(),
             reason: String::new(),
+            usage_down: 0,
+            usage_up: 0,
+            dir: String::new(),
             bytes: 0,
+            inst_bps: 0.0,
             elapsed_ms: 0,
             result: None,
         };
@@ -964,10 +968,18 @@ impl ConnShared {
             Ok(Some(st)) => {
                 res.waiting = st.waiting;
                 res.wait_remain_ms = st.wait_remain_ms;
-                res.phase = st.phase;
+                res.phase = st.phase.clone();
                 res.bytes = st.bytes;
                 res.elapsed_ms = st.elapsed_ms;
+                res.usage_down = st.usage_down;
+                res.usage_up = st.usage_up;
+                res.inst_bps = st.inst_bps;
+                // dir = 相位方向（down/up；waiting/connecting/idle 不载——omitempty）。
+                if st.phase == "down" || st.phase == "up" {
+                    res.dir = st.phase;
+                }
                 if let Some(r) = st.result {
+                    res.reason = r.reason.clone();
                     res.result = Some(SpeedtestResultBrief {
                         ok: r.ok,
                         reason: r.reason,

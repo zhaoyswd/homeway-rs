@@ -135,7 +135,17 @@ fn load_config_quiet(state_dir: &std::path::Path) -> FileConfig {
         .unwrap_or_default()
 }
 
-fn write_config_enabled(state_dir: &std::path::Path, serve: Option<bool>, relay: Option<bool>) -> Result<(), String> {
+/// 读 config 的角色 enabled 位（纯读降级面用；坏/缺 config = 默认 true——Go 同款）。
+pub(crate) fn config_role_enabled(state_dir: &std::path::Path, role: &str) -> bool {
+    let cfg = load_config_quiet(state_dir);
+    if role == "serve" {
+        cfg.serve.enabled
+    } else {
+        cfg.relay.enabled
+    }
+}
+
+pub(crate) fn write_config_enabled(state_dir: &std::path::Path, serve: Option<bool>, relay: Option<bool>) -> Result<(), String> {
     let path = state_dir.join("config.toml");
     let raw = std::fs::read_to_string(&path).map_err(|e| format!("重读 {path:?}：{e}"))?;
     let mut cfg: FileConfig = toml::from_str(&raw).map_err(|e| format!("config 解析失败（拒绝写入，先修复）：{e}"))?;

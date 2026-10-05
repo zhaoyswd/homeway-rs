@@ -41,9 +41,6 @@ impl CarrierArgs {
         self.values.iter().rev().find(|(k, _)| k == flag).map(|(_, v)| v.as_str())
     }
 
-    fn has(&self, flag: &str) -> bool {
-        self.values.iter().any(|(k, _)| k == flag)
-    }
 }
 
 /// 解析（`--flag value` 与 `--flag=value` 等价；未知 flag 报错退出 2）。
@@ -88,7 +85,11 @@ fn parse_carrier_args(usage: &str, args: &[String], value_flags: &[&str]) -> Car
             "no-spawn" => out.no_spawn = true,
             "json" => out.json = true,
             "quiet" => out.quiet = true,
-            "h" | "help" => {}
+            "h" | "help" => {
+                // 低-5① 整改：--help 打用法退 0（此前被吞 → 子命令带缺参错误继续执行）。
+                eprintln!("用法：{usage}");
+                std::process::exit(0);
+            }
             other => {
                 if let Some(vf) = value_flags.iter().find(|f| **f == other) {
                     let v = inline.clone().or_else(|| args.get(i + 1).cloned());
@@ -423,16 +424,17 @@ fn forward_list(args: &[String]) {
         let out: Vec<serde_json::Value> = forwards
             .iter()
             .map(|r| {
+                // 低-4：omitempty 缺键回 null——Go JSON 输出零值（""/""/0），对齐。
                 serde_json::json!({
                     "host": r["host"],
                     "name": name_of_host(&hosts, r["host"].as_str().unwrap_or("?")),
                     "listen": r["listen"],
-                    "targetIp": r["targetIp"],
+                    "targetIp": r["targetIp"].as_str().unwrap_or(""),
                     "targetPort": r["targetPort"],
                     "state": r["state"],
-                    "err": r["err"],
+                    "err": r["err"].as_str().unwrap_or(""),
                     "conns": r["conns"],
-                    "rejected": r["rejected"],
+                    "rejected": r["rejected"].as_i64().unwrap_or(0),
                 })
             })
             .collect();
@@ -814,6 +816,13 @@ impl SpeedHostResult {
 }
 
 pub fn cmd_speedtest_hosted(args: &[String]) {
+    if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h" | "help")) {
+        eprintln!("用法：homeway-cli speedtest [--host <ref>] [--json] [--down 10s] [--up 10s] [--warmup 2s] [--streams 4] [--wait 60s] [--quiet] [--state D] [--no-spawn]");
+        eprintln!("  对指定主机（或全部主机顺序轮流）做隧道上下行测速；参数默认与边界 = 手机口径。");
+        eprintln!("  --wait = 链路未就绪的有界等待（0 = 不等即报错；默认 60s 覆盖恢复阶梯最坏时长）。");
+        eprintln!("  Ctrl-C 终止整个轮转（先取消当前主机再退出，退出码非零）；--quiet 抑制过程提示。");
+        return;
+    }
     let p = parse_carrier_args(
         "speedtest [--host <ref>] [--json] [--down 10s] [--up 10s] [--warmup 2s] [--streams 4] [--wait 60s] [--quiet]",
         &expand_flag_eq(args),
@@ -835,11 +844,22 @@ pub fn cmd_speedtest_hosted(args: &[String]) {
     let down = dur_of("down", Duration::from_secs(10));
     let up = dur_of("up", Duration::from_secs(10));
     let warmup = dur_of("warmup", Duration::from_secs(2));
-    let streams: usize = p.value_of("streams").and_then(|v| v.parse().ok()).unwrap_or(4);
-    let wait = dur_of("wait", Duration::from_secs(60));
-    if wait.is_zero() && p.has("wait") {
-        eprintln!("homeway: --wait 0 为「不等即报错」（合法）；负值不支持");
-    }
+    let streams: usize = match p.value_of("streams") {
+        None => 4,
+        Some(v) => match v.parse::<usize>() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("homeway: --streams {v:?} 须为整数（1–6）");
+                std::process::exit(2);
+            }
+        },
+    };
+    // --wait 0 = 「不等即报错」（Go 明确接受 0；parse_duration 拒零是时长通用面，
+    // 此处特判）。
+    let wait = match p.value_of("wait") {
+        Some("0") | Some("0s") => Duration::ZERO,
+        _ => dur_of("wait", Duration::from_secs(60)),
+    };
     // 参数边界 = 引擎边界（手机口径；越界就地报错，不连 daemon）。
     let params = homeway_core::speedtest::Params { down, up, warmup, streams };
     if let Err(e) = params.normalized() {
@@ -990,6 +1010,27 @@ pub fn cmd_speedtest_hosted(args: &[String]) {
     }
 }
 
+/// start 在途的取消守卫（中-6，Go `startSent && !settled` defer 同义）：一切中途
+/// 返回路径（status 连败/运行面丢失/错误分支）都补发 speedtest.cancel——用户立刻
+/// 重试不再撞 busy 到预算烧满。终态/busy/显式取消的路径置 settled 免补发。
+struct CancelGuard<'a> {
+    c: &'a Arc<ControlClient>,
+    host: &'a str,
+    settled: bool,
+}
+
+impl Drop for CancelGuard<'_> {
+    fn drop(&mut self) {
+        if !self.settled {
+            let _ = self.c.request(
+                vocab::OpName::SpeedtestCancel.as_str(),
+                Some(serde_json::json!({ "host": self.host })),
+                TIMEOUT,
+            );
+        }
+    }
+}
+
 /// 一台主机的完整轮次：start（waitMs 载荷）→ 250ms 轮询 status 到终态；
 /// Ctrl-C/超预算 = 先 cancel 再返回错误。via/rtt 开跑时冻结（daemon.status 的链路态）。
 fn run_speed_host(
@@ -1002,8 +1043,8 @@ fn run_speed_host(
 ) -> Result<SpeedHostResult, String> {
     let (id, name) = (&host.0, &host.1);
     let (via, rtt) = link;
-    let cancel_speed_host = |why: &str| {
-        let _ = why;
+    let mut _cg = CancelGuard { c, host: id, settled: true }; // start 发出前不补发
+    let cancel_speed_host = |_why: &str| {
         let _ = c.request(
             vocab::OpName::SpeedtestCancel.as_str(),
             Some(serde_json::json!({ "host": id })),
@@ -1019,12 +1060,17 @@ fn run_speed_host(
         "waitMs": wait.as_millis() as i64,
     });
     let raw = match c.request(vocab::OpName::SpeedtestStart.as_str(), Some(req), TIMEOUT) {
-        Ok(v) => v,
+        Ok(v) => {
+            _cg.settled = false; // start 已受理：从此一切中途返回都要补发 cancel
+            v
+        }
         Err(e) => {
             if SPD_CANCEL.load(std::sync::atomic::Ordering::SeqCst) {
                 return Err("已取消".to_owned());
             }
-            // no_host/unknown_op 等控制面错误：直接成为该台失败短因（轮转继续）。
+            // no_host/unknown_op 等控制面错误：直接成为该台失败短因（轮转继续；
+            // start 未受理——daemon 侧无我们的轮，免补发）。
+            _cg.settled = true;
             return Ok(SpeedHostResult {
                 name: name.to_owned(),
                 hex: id.to_owned(),
@@ -1042,6 +1088,7 @@ fn run_speed_host(
         }
     };
     if raw["phase"].as_str() == Some("busy") {
+        _cg.settled = true; // busy = 另一会话的轮在跑——cancel 会误伤
         return Ok(SpeedHostResult {
             name: name.to_owned(),
             hex: id.to_owned(),
@@ -1094,6 +1141,8 @@ fn run_speed_host(
                 }
                 fail_streak += 1;
                 if fail_streak >= STATUS_FAIL_STREAK {
+                    // 守卫在 drop 补发 cancel（中-6：status 连败路径同样清掉 daemon
+                    // 侧可能在跑的轮——用户重试不再撞 busy）。
                     return Ok(SpeedHostResult {
                         name: name.to_owned(),
                         hex: id.to_owned(),
@@ -1116,6 +1165,7 @@ fn run_speed_host(
         fail_streak = 0;
         // Map 索引对缺键 panic（Value 索引才回落 Null）——omitempty 的键一律 get。
         if let Some(r) = st["result"].as_object() {
+            _cg.settled = true; // 终态——daemon 侧已收场，不动
             let g = |k: &str| r.get(k).cloned().unwrap_or(serde_json::Value::Null);
             return Ok(SpeedHostResult {
                 name: name.to_owned(),

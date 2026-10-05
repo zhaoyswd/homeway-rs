@@ -192,7 +192,7 @@ fn start_spawned_process(state_dir: &std::path::Path) -> Result<u32, String> {
     if let Some(dir) = log.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("建 {}: {e}", dir.display()))?;
     }
-    let lf = std::fs::OpenOptions::new()
+    let mut lf = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
         .open(&log)
@@ -200,6 +200,15 @@ fn start_spawned_process(state_dir: &std::path::Path) -> Result<u32, String> {
     {
         use std::os::unix::fs::PermissionsExt as _;
         let _ = std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600));
+    }
+    // 分隔行（Go spawn.go 同形态——多次拉起的失败原因累积可查）。
+    {
+        use std::io::Write as _;
+        let _ = writeln!(
+            lf,
+            "---- spawn {} ----",
+            chrono_like_now()
+        );
     }
     let mut cmd = std::process::Command::new(exe);
     cmd.arg("--state").arg(state_dir).stdin(std::process::Stdio::null());
@@ -292,6 +301,15 @@ pub fn dial_control_spawn(
                 format!("拉起后重拨失败（{}）：{e}", sock.display())
             })
         }
+    }
+}
+
+/// 纯读拨号（不拉起——中-5）：连通则 Some。
+fn try_dial_control_named(state_dir: &std::path::Path, name: &str) -> Option<Arc<ControlClient>> {
+    let sock = state_dir.join("control.sock");
+    match ControlClient::dial(&sock, "cli", name) {
+        Ok((c, _)) => Some(c),
+        Err(_) => None,
     }
 }
 
@@ -690,7 +708,15 @@ pub fn cmd_status(args: &[String]) {
         status_watch(&state);
         return;
     }
-    let c = dial_control(&state, p.no_spawn);
+    // 纯读不拉起（中-5——Go status_cli 同义：未跑 = 降级呈现，不起进程）。
+    let Some(c) = try_dial_control_named(&state, "homeway") else {
+        println!(
+            "守护进程：未运行（sock={}/control.sock 不存在/不可连）——本命令纯读不拉起；先启动：homeway-cli --state {}（零参统一进程）",
+            state.display(),
+            state.display()
+        );
+        return;
+    };
     let v = c.request(vocab::OpName::DaemonStatus.as_str(), None, TIMEOUT).unwrap_or_else(|e| exit_op_err(&e));
     if json {
         println!("{}", serde_json::to_string_pretty(&v).unwrap());
@@ -757,56 +783,75 @@ pub fn cmd_serve_group(args: &[String]) {
         token_reveal_with_fallback(&state, op);
         return;
     }
+    // 纯读/直改族不拉起（中-5——Go dialGroupRead/roleStopCLI：status 未跑 = 降级
+    // 读 config；stop 未跑 = 直改 config 即达期望态；start/restart 才走拉起缝）。
+    if op == vocab::OpName::ServeStatus {
+        let Some(c) = try_dial_control_named(&state, "homeway-serve") else {
+            let enabled = crate::unified_cli::config_role_enabled(&state, "serve");
+            println!("serve：进程未运行（本命令纯读不拉起）；config serve.enabled={enabled}");
+            return;
+        };
+        render_serve_status(&c);
+        return;
+    }
+    if op == vocab::OpName::ServeStop {
+        if let Some(c) = try_dial_control_named(&state, "homeway-serve") {
+            let v = c.request(op.as_str(), Some(serde_json::json!({})), TIMEOUT).unwrap_or_else(|e| exit_op_err(&e));
+            println!("serve：{}", v["action"].as_str().unwrap_or("?"));
+            return;
+        }
+        // 未跑：直改 config（Go 同义——拉一个进程只为停它本末倒置）。
+        if let Err(e) = crate::unified_cli::write_config_enabled(&state, Some(false), None) {
+            eprintln!("homeway: 写 config 失败：{e}");
+            std::process::exit(1);
+        }
+        println!("serve：进程未运行——期望已写为停用（config serve.enabled=false），下次启动不再装配");
+        return;
+    }
     let c = dial_control(&state, p.no_spawn);
     let v = c.request(op.as_str(), Some(serde_json::json!({})), TIMEOUT).unwrap_or_else(|e| exit_op_err(&e));
-    match op {
-        vocab::OpName::ServeStatus => {
-            println!(
-                "serve：enabled={} state={} listenPort={}",
-                v["enabled"].as_bool().unwrap_or(false),
-                v["state"].as_str().unwrap_or("?"),
-                v["listenPort"].as_u64().unwrap_or(0),
-            );
-            if let Some(m) = v["tokenMask"].as_str() {
-                println!("  token：{m}");
-            }
-            if let Some(eps) = v["endpoints"].as_array() {
-                let eps: Vec<_> = eps.iter().filter_map(|e| e.as_str()).collect();
-                if !eps.is_empty() {
-                    println!("  端点：{}", eps.join("、"));
-                }
-            }
-            if let Some(peers) = v["peers"].as_array() {
-                println!("  peers：{}", peers.len());
-                for p in peers {
-                    println!(
-                        "    dev={} ip={} 空闲={}s",
-                        &p["dev"].as_str().unwrap_or("?")[..16.min(p["dev"].as_str().unwrap_or("?").len())],
-                        p["tunnelIp"].as_str().unwrap_or("?"),
-                        p["idleMs"].as_i64().unwrap_or(0) / 1000,
-                    );
-                }
-            }
-            let itc = &v["intercept"];
-            println!(
-                "  intercept：dialOk={} dialFail={} reject={} flows={}",
-                itc["dialOk"].as_u64().unwrap_or(0),
-                itc["dialFail"].as_u64().unwrap_or(0),
-                itc["reject"].as_u64().unwrap_or(0),
-                itc["flows"].as_u64().unwrap_or(0),
-            );
-        }
-        vocab::OpName::ServeToken => {
-            println!("{}", v["token"].as_str().unwrap_or("?"));
-            if let Some(eps) = v["endpoints"].as_array() {
-                let eps: Vec<_> = eps.iter().filter_map(|e| e.as_str()).collect();
-                if !eps.is_empty() {
-                    eprintln!("（端点：{}；来源={}）", eps.join("、"), v["source"].as_str().unwrap_or("?"));
-                }
-            }
-        }
-        _ => println!("serve：{}", v["action"].as_str().unwrap_or("?")),
+    // （start/restart 的应答面；status/stop 已在纯读/直改分支提前返回。）
+    println!("serve：{}", v["action"].as_str().unwrap_or("?"));
+}
+
+/// serve.status 的渲染单实现（中-5 收敛：在线/拉起两路共用）。
+fn render_serve_status(c: &Arc<ControlClient>) {
+    let v = c.request(vocab::OpName::ServeStatus.as_str(), Some(serde_json::json!({})), TIMEOUT)
+        .unwrap_or_else(|e| exit_op_err(&e));
+    println!(
+        "serve：enabled={} state={} listenPort={}",
+        v["enabled"].as_bool().unwrap_or(false),
+        v["state"].as_str().unwrap_or("?"),
+        v["listenPort"].as_u64().unwrap_or(0),
+    );
+    if let Some(m) = v["tokenMask"].as_str() {
+        println!("  token：{m}");
     }
+    if let Some(eps) = v["endpoints"].as_array() {
+        let eps: Vec<_> = eps.iter().filter_map(|e| e.as_str()).collect();
+        if !eps.is_empty() {
+            println!("  端点：{}", eps.join("、"));
+        }
+    }
+    if let Some(peers) = v["peers"].as_array() {
+        println!("  peers：{}", peers.len());
+        for p in peers {
+            println!(
+                "    dev={} ip={} 空闲={}s",
+                &p["dev"].as_str().unwrap_or("?")[..16.min(p["dev"].as_str().unwrap_or("?").len())],
+                p["tunnelIp"].as_str().unwrap_or("?"),
+                p["idleMs"].as_i64().unwrap_or(0) / 1000,
+            );
+        }
+    }
+    let itc = &v["intercept"];
+    println!(
+        "  intercept：dialOk={} dialFail={} reject={} flows={}",
+        itc["dialOk"].as_u64().unwrap_or(0),
+        itc["dialFail"].as_u64().unwrap_or(0),
+        itc["reject"].as_u64().unwrap_or(0),
+        itc["flows"].as_u64().unwrap_or(0),
+    );
 }
 
 pub fn cmd_relay_group(args: &[String]) {
@@ -831,25 +876,46 @@ pub fn cmd_relay_group(args: &[String]) {
         token_reveal_with_fallback(&state, op);
         return;
     }
+    // 纯读/直改族不拉起（中-5——与 serve 组同款）。
+    if op == vocab::OpName::RelayStatus {
+        let Some(c) = try_dial_control_named(&state, "homeway-relay") else {
+            let enabled = crate::unified_cli::config_role_enabled(&state, "relay");
+            println!("relay：进程未运行（本命令纯读不拉起）；config relay.enabled={enabled}");
+            return;
+        };
+        let v = c.request(op.as_str(), Some(serde_json::json!({})), TIMEOUT).unwrap_or_else(|e| exit_op_err(&e));
+        render_relay_status(&v);
+        return;
+    }
+    if op == vocab::OpName::RelayStop {
+        if let Some(c) = try_dial_control_named(&state, "homeway-relay") {
+            let v = c.request(op.as_str(), Some(serde_json::json!({})), TIMEOUT).unwrap_or_else(|e| exit_op_err(&e));
+            println!("relay：{}", v["action"].as_str().unwrap_or("?"));
+            return;
+        }
+        if let Err(e) = crate::unified_cli::write_config_enabled(&state, None, Some(false)) {
+            eprintln!("homeway: 写 config 失败：{e}");
+            std::process::exit(1);
+        }
+        println!("relay：进程未运行——期望已写为停用（config relay.enabled=false），下次启动不再装配");
+        return;
+    }
     let c = dial_control(&state, p.no_spawn);
     let v = c.request(op.as_str(), Some(serde_json::json!({})), TIMEOUT).unwrap_or_else(|e| exit_op_err(&e));
-    match op {
-        vocab::OpName::RelayStatus => {
-            println!(
-                "relay：enabled={} state={} listen={}",
-                v["enabled"].as_bool().unwrap_or(false),
-                v["state"].as_str().unwrap_or("?"),
-                v["listen"].as_str().unwrap_or("-"),
-            );
-            if let Some(m) = v["tokenMask"].as_str() {
-                println!("  token：{m}");
-            }
-        }
-        vocab::OpName::RelayToken => {
-            println!("{}", v["token"].as_str().unwrap_or("?"));
-            eprintln!("（来源={}）", v["source"].as_str().unwrap_or("?"));
-        }
-        _ => println!("relay：{}", v["action"].as_str().unwrap_or("?")),
+    // （start/restart 的应答面；status/stop 已在纯读/直改分支提前返回。）
+    println!("relay：{}", v["action"].as_str().unwrap_or("?"));
+}
+
+/// relay.status 的渲染单实现（中-5 收敛）。
+fn render_relay_status(v: &serde_json::Value) {
+    println!(
+        "relay：enabled={} state={} listen={}",
+        v["enabled"].as_bool().unwrap_or(false),
+        v["state"].as_str().unwrap_or("?"),
+        v["listen"].as_str().unwrap_or("-"),
+    );
+    if let Some(m) = v["tokenMask"].as_str() {
+        println!("  token：{m}");
     }
 }
 
@@ -987,6 +1053,28 @@ pub fn cmd_reset(args: &[String]) {
         std::process::exit(1);
     }
     println!("cache/ 已清（日志/端点缓存可弃层；L1/L2 与 migration-backup-* 不动；下次启动自动重建）");
+}
+
+/// RFC3339 近形时间戳（spawn 分隔行用；localtime 面与 now_timestamp 同源）。
+fn chrono_like_now() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&secs, &mut tm);
+        format!(
+            "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{:+03}:00",
+            tm.tm_year as i64 + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec,
+            tm.tm_gmtoff / 3600
+        )
+    }
 }
 
 fn now_timestamp() -> String {

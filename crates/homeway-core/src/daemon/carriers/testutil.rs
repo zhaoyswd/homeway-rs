@@ -89,7 +89,7 @@ impl FakeDial {
     pub fn carrier_dial(self: &Arc<Self>) -> CarrierDial {
         let d1 = Arc::clone(self);
         let dial_port = Arc::new(
-            move |host: &str, port: u16| -> Result<CarrierConn, DialErr> {
+            move |host: &str, port: u16, _budget: Duration| -> Result<CarrierConn, DialErr> {
                 if let Some(e) = d1.fail_with.lock().unwrap().clone() {
                     return Err(e);
                 }
@@ -108,7 +108,7 @@ impl FakeDial {
         );
         let d2 = Arc::clone(self);
         let dial = Arc::new(
-            move |host: &str, dst: std::net::SocketAddrV4| -> Result<CarrierConn, DialErr> {
+            move |host: &str, dst: std::net::SocketAddrV4, _budget: Duration| -> Result<CarrierConn, DialErr> {
                 if let Some(e) = d2.fail_with.lock().unwrap().clone() {
                     return Err(e);
                 }

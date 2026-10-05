@@ -9,6 +9,7 @@
 //! NXDOMAIN 与「无 A 记录」两类否定形态以可区分哨兵错误返回（调用方回 rep=0x04
 //! 且文案可区分、不缓存）。
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::daemon::StreamConn;
@@ -22,6 +23,36 @@ const TYPE_A: u16 = 1;
 const MAX_QUERY_NAME: usize = 255;
 /// 单次解析总预算缺省（拨 5300 + 查询；design D3：5s，超时归因、不缓存）。
 pub const RESOLVE_BUDGET: Duration = Duration::from_secs(5);
+
+/// 带期限的解析壳（中-1：`StreamConn` 阻塞读无原生超时——worker 线程跑真解析、
+/// 主面按期限等；超时**关连接**解阻塞 worker 的读（连接关 = 读错误退出，无泄漏），
+/// 归因解析超时）。
+pub fn resolve_with_deadline(
+    conn: Arc<dyn StreamConn>,
+    domain: &str,
+    budget: Duration,
+) -> Result<DnsResolved, DnsErr> {
+    let (tx, rx) = std::sync::mpsc::channel::<Result<DnsResolved, DnsErr>>();
+    let d = domain.to_owned();
+    let c = Arc::clone(&conn);
+    let h = std::thread::Builder::new()
+        .name("hw-dnsq".to_owned())
+        .stack_size(256 * 1024)
+        .spawn(move || {
+            let r = resolve_over_conn(c.as_ref(), &d, Duration::MAX);
+            let _ = tx.send(r);
+        });
+    match rx.recv_timeout(budget) {
+        Ok(r) => {
+            let _ = h.map(|h| h.join());
+            r
+        }
+        Err(_) => {
+            conn.close(); // 解阻塞 worker（读错误退出）
+            Err(DnsErr::Io("解析超时（预算 {budget:?}）".replace("{budget:?}", &format!("{budget:?}"))))
+        }
+    }
+}
 
 /// 解析失败的哨兵（两类否定形态可区分）。
 #[derive(Debug, thiserror::Error)]
@@ -243,7 +274,7 @@ mod tests {
         let addr = ln.local_addr().unwrap();
         let h = std::thread::spawn(move || {
             let (c, _) = ln.accept().unwrap();
-            let mut srv_io = TcpIo::new(c);
+            let srv_io = TcpIo::new(c);
             let mut buf = Vec::new();
             while buf.len() < 2 {
                 match srv_io.read_chunk().unwrap() {

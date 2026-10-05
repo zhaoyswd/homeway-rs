@@ -298,7 +298,9 @@ impl Worker {
         if io.udp {
             // UDP：out_buf 按数据报整发（建流时投递的每条 Out 都是一个完整数据报）
             let n = unsafe {
-                libc::send(io.fd, remaining.as_ptr().cast(), remaining.len(), 0)
+                // MSG_NOSIGNAL：对端 RST 后的写回 EPIPE 而非 SIGPIPE（评审 D-1 中-4——
+                // 主进程对 SIGPIPE 已恢复默认处置，裸写不带此 flag 会打死进程）。
+                libc::send(io.fd, remaining.as_ptr().cast(), remaining.len(), libc::MSG_NOSIGNAL)
             };
             if n >= 0 {
                 let sent = remaining.len();
@@ -312,7 +314,10 @@ impl Worker {
             }
             return 0;
         }
-        let n = unsafe { libc::write(io.fd, remaining.as_ptr().cast(), remaining.len()) };
+        let n = unsafe {
+            // 同上：TCP 腿的裸 write 用 send+MSG_NOSIGNAL（write 无 flag 面）。
+            libc::send(io.fd, remaining.as_ptr().cast(), remaining.len(), libc::MSG_NOSIGNAL)
+        };
         let mut written = 0usize;
         if n > 0 {
             io.out_buf.consume(n as usize);

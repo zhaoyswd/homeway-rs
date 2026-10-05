@@ -611,8 +611,9 @@ fn is_zero_f64(v: &f64) -> bool {
     *v == 0.0
 }
 
-/// speedtest.status 成功载荷：waiting 相位（waitRemainMs）或引擎快照（phase/bytes/
-/// elapsedMs）；轮次到终态时 result 携带完整结果（None = 未到终态）。
+/// speedtest.status 成功载荷：waiting 相位（waitRemainMs）或引擎快照（phase/dir/
+/// instBps/usage/bytes/elapsedMs——与 Go 手机 Status 信封同面）；轮次到终态时
+/// result 携带完整结果（None = 未到终态）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SpeedtestStatusResult {
     pub host: String,
@@ -623,9 +624,19 @@ pub struct SpeedtestStatusResult {
     pub phase: String,
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub reason: String,
-    /// 当前相位累计字节（CLI 轮询差分算 instBps）。
+    #[serde(rename = "usageDown", default, skip_serializing_if = "is_zero_i64")]
+    pub usage_down: i64,
+    #[serde(rename = "usageUp", default, skip_serializing_if = "is_zero_i64")]
+    pub usage_up: i64,
+    /// 相位方向（down/up——Go CLI 的 st.Dir 直读面，中-3）。
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub dir: String,
+    /// 当前相位累计字节。
     #[serde(default, skip_serializing_if = "is_zero_i64")]
     pub bytes: i64,
+    /// 相位瞬时速率（daemon 侧差分——Go CLI 的 st.InstBps 直读面）。
+    #[serde(rename = "instBps", default, skip_serializing_if = "is_zero_f64")]
+    pub inst_bps: f64,
     #[serde(rename = "elapsedMs", default, skip_serializing_if = "is_zero_i64")]
     pub elapsed_ms: i64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
