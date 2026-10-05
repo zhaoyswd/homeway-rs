@@ -79,6 +79,28 @@ launchd 本地网络隐私（同 Go v0.14.0 事件）、P1-1 生产无 debug 落
 B0-2 轮转批）。⚠️ **tier 仓 AGENTS.md/exits.md 出口表仍描述 Go 形态**（tier 文档触点归 R8 收官批
 用户触点，未动）。
 
+**C 批：tier 仓全面转正完成（2026-10-05）**——tier 侧 Go 线整体退役、文档/门禁改指本仓：
+①surface 解码四件套 vendor 入 tier（字节同一于 d4148f6 与本仓 baseline 克隆；terminal HSP
+构建脱离外部检出）②`git rm third_party/homeway` submodule + `.gitmodules` + `tools/ohos-go/`
+（退役钉定 d4148f658513c10e8cb7f67a1096b0c080f5f79c 记入移除提交）③tier `build-core.sh`
+CORE_IMPL=go 档删除，Rust 唯一路径 + **`tools/tailcat/homeway-rs.pin` 钉定门**（HEAD != pin
+硬失败；逃生口 ALLOW_UNPINNED/ALLOW_DIRTY——r3 登记 ③ 落地，首钉 `e17b057`）④tier 四门禁
+改指本仓：check-napi-sync 真源 = `crates/homeway-capi`（20 导出逐名相等）/ check-vocab-sync +
+vocab.mjs 台账 = 本仓 baseline 克隆（422 行与 submodule 副本逐字节一致）/ gen-log-index 核层 =
+crates（含 `(logf)` 闭包调用形态 marker + `#[cfg(test)]` 跳过，418 条）/ check-code-map 前缀表
+（capi/facade/wtransport/wgcore/session/term/server/cli）⑤文档全量改指（AGENTS/exits 现状段
+= v0.2.0 双出口形态、code-map 跨仓边界表、connection-lifecycle 常量表 Go 历史锚 + Rust 位置
+双注、EXIT-NODE-SETUP §A 新写 + Go 长文降 §A-go、roadmap 记真源移交；Go 时代记录按历史口径
+保留加注）。**验证链全绿**：build-core（pin e17b057，产物 2.0MB、符号 20/20、版本标记
+e17b0576460f-rust）→ assembleHsp×2 + assembleHap → 覆盖装（三包）→ 真机烟囱
+（FMR0224116011480）：`tailcat tun prepare ver=tier core e17b0576460f-rust` + `attached
+（数据面已接管 fd=90，L3 直通）` + `link: via=direct ep=192.168.3.12:41641 rtt=7ms` + RREG
+dev=aca645d3 身份复用 + files 桥第 1 击成功 + term surface 快照渲染（vendor 解码 ↔ 本仓编码器）
++ 浏览器经隧道 stats 双向增长（fdRead 3794→66026B/fdWrite 10376→130705B）+ tier 四门禁
+0 红。tier 侧 4 commit（656d092/a9b5829/eb196ab/77343f1，**未 push**——tier 双推配置的一次性
+授权原则）；本仓侧 = 本提交（AGENTS 速查补 tier pin 前进指引 + 本段）。已知注记：token 缺
+中继端点缺口（DEPLOY-RUST-EXIT §5，修法 = relay 注册完成后重铸或延迟铸——归后续批）。
+
 **下一步（当前指针）**：**B0-2**（GAP-AUDIT P0-1 剩余：daemon 控制面/client 角色/CLI 族/supervisor 退避/events 轮转——B0-1 已清部署最小面，见下方 B0-1 段）→ **R8 收官批**（技术修复项已全清——R8-3 完成，2026-10-05：
 8i 出口发送整形实装 + 8j 真机矩阵复测 + 8k 尾账五项全清 + 8l 评审收口；判据链与
 消融数据 = `docs/reviews/R8.md` §十 + `docs/PERF-AB.md` §9.7-bis/§9.9）。
@@ -93,9 +115,9 @@ R8-3 结果速记：**冷连悬崖消除**（B 冷/热 0.85 ≥ 0.70 门 + 逐�
    （冷悬崖/发散带/批分布）= 突发形态支配，已修复验证（B 冷/热 0.85、批分布
    2379→130-136 包）；绝对吞吐差（B/D）与突发正交（off/reno 消融同带）——第二
    瓶颈登记（手机侧每字节成本 1.8× + ACK 时钟面，>45MB/s 下一档同族）。
-2. r3 登记 ③ tier `homeway-rs.pin` 期望 SHA——与「仓归属」用户触点一并定。
-3. R8 原有收官项：共存定案（用户触点）、性能/包体终测报告定稿、tier 文档地图
-   指针补录（用户触点）、本仓 AGENTS/README 定稿、遗留项清账移交。
+2. ~~r3 登记 ③ tier `homeway-rs.pin` 期望 SHA~~ **C 批已落地**（首钉 e17b057，前进 = tier 侧同批改 pin；见上方 C 批段）。
+3. R8 原有收官项：共存定案（用户触点）、性能/包体终测报告定稿、
+   ~~tier 文档地图指针补录~~（**C 批已做**）、本仓 AGENTS/README 定稿、遗留项清账移交。
 4. dsh 评审 R8-1 处置表的未清项跟进（见 docs/reviews/R8.md §五）。
 
 **R8-1 完成证据（2026-10-05 凌晨，commit b9730a9..e0fbcc72bde6）**：

@@ -55,6 +55,7 @@
 
 | 事 | 去 |
 |---|---|
+| **App 侧消费本仓（tier）**：pin 钉定 + 构建 | tier `tools/tailcat/build-core.sh`（HEAD 必须 == tier `tools/tailcat/homeway-rs.pin`，前进 = 同批改 pin；脏检出/未钉定逃生口在脚本头）——**核侧 commit 合入 main 后，若要出 App 包，记得让 tier 侧前进 pin** |
 | 干什么/干到哪/怎么接棒 | `ROADMAP.md` |
 | 基线 hash / 台账 / 在途 change | `docs/BASELINE.md` |
 | 互操作判据行 | `docs/INTEROP-CRITERIA.md` |
