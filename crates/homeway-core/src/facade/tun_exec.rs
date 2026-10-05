@@ -900,15 +900,7 @@ fn gen_loop(
             .map(|c| {
                 let known = run.static_cands.iter().any(|s| s.addr == c.addr);
                 let learned = if known { "" } else { "·学习" };
-                let tag = if c.relay {
-                    "中继"
-                } else if c.addr.is_ipv6() {
-                    "公网v6"
-                } else if is_lan_addr(c.addr) {
-                    "LAN"
-                } else {
-                    "公网v4"
-                };
+                let tag = crate::wtransport::bind::candidate_tag(c.addr, c.relay);
                 format!("{}（{tag}{learned}）", c.addr)
             })
             .collect();
@@ -1770,19 +1762,6 @@ fn now_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn is_lan_addr(ap: SocketAddr) -> bool {
-    let ip = ap.ip();
-    if ip.is_loopback() {
-        return true;
-    }
-    if let std::net::IpAddr::V4(v4) = ip {
-        let o = v4.octets();
-        return o[0] == 10
-            || o[0] == 172 && (16..=31).contains(&o[1])
-            || o[0] == 192 && o[1] == 168;
-    }
-    false
-}
 
 #[cfg(test)]
 mod tests {

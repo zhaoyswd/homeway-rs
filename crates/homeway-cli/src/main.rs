@@ -82,6 +82,10 @@ fn cmd_token(args: &[String]) {
         std::process::exit(2);
     };
     if v6_only {
+        if dead_direct || loopback_only {
+            eprintln!("--v6-only 与 --dead-direct/--loopback-only 互斥（各自的改写目标重叠）");
+            std::process::exit(2);
+        }
         let mut t = match token::decode(&s) {
             Ok(t) => t,
             Err(e) => {

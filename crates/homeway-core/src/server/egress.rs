@@ -242,6 +242,16 @@ pub fn pin_socket_to_iface(fd: std::os::fd::RawFd, index: u32, name: &str) -> io
     }
 }
 
+/// 找出拥有该地址的网卡（Go `IfaceForAddr`——IP 字面量绑定形态的**附带钉卡**：
+/// 绑源地址还要把 socket 钉在该网卡上，否则默认路由被 TUN 型代理抢走时观测仍被
+/// 污染；取不到 = None，调用方按未钉卡处理）。
+pub fn iface_for_addr(ip: IpAddr) -> Option<IfaceInfo> {
+    interfaces().into_iter().find(|i| {
+        i.addrs.iter().any(|a| IpAddr::V4(*a) == ip)
+            || i.cidrs.iter().any(|c| c.split('/').next() == Some(&ip.to_string()))
+    })
+}
+
 /// 系统默认路由会从哪张卡出去（UDP dial 只做路由查询，不发包）；拿不到 None。
 pub fn preferred_iface() -> Option<IfaceInfo> {
     let s = UdpSocket::bind("0.0.0.0:0").ok()?;
@@ -644,10 +654,12 @@ mod tests {
             pin_socket_to_iface(s4.as_raw_fd(), ifi.index, &ifi.name).is_ok(),
             "v4 socket：v6 族失败应被单栈容错"
         );
-        let s6 = UdpSocket::bind("[::]:0").unwrap();
+        // 真 v6 单栈（V6ONLY=1——std bind 的 [::] 在 macOS 默认双栈，测不到 v4 族
+        // 失败容错；r1-L10）：v4 族 setsockopt 报错被容错、v6 族成立
+        let s6 = crate::udpbatch::bind_v6_only(std::net::Ipv6Addr::LOCALHOST, 0).unwrap();
         assert!(
             pin_socket_to_iface(s6.as_raw_fd(), ifi.index, &ifi.name).is_ok(),
-            "v6 socket：v4 族失败应被单栈容错"
+            "v6 单栈 socket：v4 族失败应被单栈容错"
         );
         // 双栈 socket（服务端主 socket 形态）：两族都成立
         let dual = UdpSocket::bind("[::]:0").unwrap();

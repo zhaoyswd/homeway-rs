@@ -833,7 +833,8 @@ fn same_candidates(a: &[Candidate], b: &[Candidate]) -> bool {
 }
 
 /// 候选一行标签（C5 未响应列表的 tag：中继/IPv6/LAN/公网v4；Go candidateTag 同义）。
-fn candidate_tag(ap: SocketAddr, relay: bool) -> &'static str {
+/// **单一实现**（session/tun_exec 的候选行共用——r1-M5：三处两口径曾漂移）。
+pub(crate) fn candidate_tag(ap: SocketAddr, relay: bool) -> &'static str {
     if relay {
         return "中继";
     }
@@ -894,6 +895,50 @@ mod tests {
             pubkey: [9; 32],
             dev_tag: [0xAA; 8],
         }
+    }
+
+    /// 客户端双栈收发面（B0-1 回归锚点——r1-L9）：候选 [::1]（v6）时镜像包能到达
+    /// v6 fake 出口、且出口回包被收进（recv unmap 不动纯 v6）；与 v4 候选并存时
+    /// 双族都能到达（发送面 map 只作用于 v4 目标）。
+    #[test]
+    fn dual_stack_client_reaches_v6_exit() {
+        let exit6 = UdpSocket::bind("[::1]:0").unwrap();
+        let ep6 = exit6.local_addr().unwrap();
+        let exit4 = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let ep4 = exit4.local_addr().unwrap();
+        let cands = vec![
+            Candidate { addr: ep6, relay: false },
+            Candidate { addr: ep4, relay: false },
+        ];
+        let (logf, _rx) = log_sink();
+        let mut b = bind(&cands, None, &logf);
+        b.send_wg(b"v6-probe");
+        // v6 fake 出口收到镜像包
+        exit6.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 64];
+        let (n, from) = exit6.recv_from(&mut buf).unwrap();
+        assert!(n >= 2, "腿帧至少有帧头");
+        // 回包（出口→客户端）：源地址 = 客户端 dual socket 的 [::1] 形态
+        let cli_ep = match from {
+            SocketAddr::V6(v6) => SocketAddr::V6(v6),
+            other => panic!("客户端源应为 v6 形态（dual socket）：{other}"),
+        };
+        let resp = crate::wtransport::frame::frame_bytes(crate::wtransport::frame::FrameKind::Data, b"resp6");
+        exit6.send_to(&resp, cli_ep).unwrap();
+        // 客户端收到（纯 v6 不经 unmap 变形）
+        exit4.set_read_timeout(Some(Duration::from_millis(200))).ok();
+        let mut got = Vec::new();
+        for _ in 0..100 {
+            let mut b2 = [0u8; 64];
+            match b.recv_from(&mut b2) {
+                Ok(Some(n)) => {
+                    got.extend_from_slice(&b2[..n]);
+                    break;
+                }
+                _ => std::thread::sleep(Duration::from_millis(10)),
+            }
+        }
+        assert!(!got.is_empty(), "出口回包应被客户端收到");
     }
 
     fn bind(cands: &[Candidate], reg: Option<RegCtx>, logf: &crate::Logf) -> Bind {

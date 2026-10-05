@@ -177,7 +177,9 @@ pub fn assemble_relay(
             log2.logf(&format!("⚠️ token 生成失败（{e}）—— 后端可用裸地址走开放模式"));
         }
     };
-    let (stop_r, stop_w) = stop_pipe();
+    // 只建 pipe、不装信号 handler（统一进程形态：信号 handler 由宿主统一安装——
+    // 装配期覆盖宿主 handler 会造成「relay 收工、主线程挂等」的半死窗口，评审 r1-Z5）
+    let (stop_r, stop_w) = new_stop_pipe();
     let join = std::thread::Builder::new()
         .name("homeway-relay".into())
         .stack_size(1024 * 1024)
@@ -255,6 +257,7 @@ pub fn cmd_relay(args: &[String]) {
         }
     };
     println!("（relay 前台运行中——Ctrl-C 收工）");
+    stop_pipe(); // 装 handler（前台形态；pipe 已在装配时建好）
     wait_pipe_readable();
     proc.stop();
 }
@@ -304,12 +307,18 @@ extern "C" fn on_stop_signal(_sig: i32) {
 
 static STOP_PIPE: std::sync::OnceLock<(i32, i32)> = std::sync::OnceLock::new();
 
-fn stop_pipe() -> (i32, i32) {
-    let (r, w) = *STOP_PIPE.get_or_init(|| unsafe {
+/// 建 stop pipe（不装 handler——装配与信号安装分离，见 assemble_relay 注释）。
+fn new_stop_pipe() -> (i32, i32) {
+    *STOP_PIPE.get_or_init(|| unsafe {
         let mut fds = [0i32; 2];
         libc::pipe(fds.as_mut_ptr());
         (fds[0], fds[1])
-    });
+    })
+}
+
+/// 前台单角色形态：装信号 handler（Ctrl-C/SIGTERM → relay stop pipe）。
+fn stop_pipe() -> (i32, i32) {
+    let (r, w) = new_stop_pipe();
     STOP_FD.store(w, std::sync::atomic::Ordering::SeqCst);
     unsafe {
         let h = on_stop_signal as extern "C" fn(i32) as libc::sighandler_t;

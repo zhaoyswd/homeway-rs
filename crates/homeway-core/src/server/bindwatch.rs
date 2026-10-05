@@ -169,8 +169,8 @@ struct RealDeps {
     probe_targets: Vec<SocketAddrV4>,
     cmd_tx: Sender<EngineCmd>,
     pinned_flag: Arc<AtomicBool>,
-    pub_kick: Sender<()>,
-    udpcap_kick: Sender<()>,
+    pub_kick: std::sync::mpsc::SyncSender<()>,
+    udpcap_kick: std::sync::mpsc::SyncSender<()>,
     logf: Logf,
 }
 
@@ -192,11 +192,17 @@ impl WatchDeps for RealDeps {
     }
 
     fn probe(&mut self, ifi: &IfaceInfo) -> Result<(), String> {
-        egress::probe_iface(ifi, &self.probe_targets, Duration::from_secs(3)).map(|_| ()).map_err(|e| e.to_string())
+        egress::probe_iface(ifi, &self.probe_targets, Duration::from_secs(2)).map(|_| ()).map_err(|e| e.to_string())
     }
 
     fn state_of(&mut self, ifi: &IfaceInfo) -> IfaceFingerprint {
-        fingerprint_of(ifi)
+        // live 读（Go stateOf 每拍 ifi.Addrs() 查内核——指纹变化/网卡 down 是
+        // 看护的触发面，快照会让分支恒不触发，评审 r1-M2）：按 index 重枚举，
+        // 卡消失 = down + 空地址集（触发重挑）。
+        match egress::interfaces().into_iter().find(|i| i.index == ifi.index) {
+            Some(live) => fingerprint_of(&live),
+            None => IfaceFingerprint { index: ifi.index, up: false, addrs: Vec::new() },
+        }
     }
 
     fn repin(&mut self, index: u32, name: &str) -> Result<(), String> {
@@ -217,8 +223,8 @@ impl WatchDeps for RealDeps {
     fn on_change(&mut self) {
         // 端点要重测（可能换网/换 IP）；UDP 能力也要重测（换了条路）。pub_kick 直发
         // 即可（EngineCmd::KickPublicEndpoint 是外部/测试面的转传路径，双发=双 kick）
-        let _ = self.pub_kick.send(());
-        let _ = self.udpcap_kick.send(());
+        let _ = self.pub_kick.try_send(());
+        let _ = self.udpcap_kick.try_send(());
     }
 
     fn log(&mut self, line: String) {
@@ -235,8 +241,8 @@ pub struct WatcherArgs {
     pub probe_targets: Vec<SocketAddrV4>,
     pub cmd_tx: Sender<EngineCmd>,
     pub pinned_flag: Arc<AtomicBool>,
-    pub pub_kick: Sender<()>,
-    pub udpcap_kick: Sender<()>,
+    pub pub_kick: std::sync::mpsc::SyncSender<()>,
+    pub udpcap_kick: std::sync::mpsc::SyncSender<()>,
     pub logf: Logf,
     pub stop: Arc<AtomicBool>,
 }

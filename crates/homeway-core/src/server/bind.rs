@@ -612,9 +612,9 @@ impl ServerBind {
     /// 都设、单栈容错）。驱动线程内执行（socket 由本结构独占）。
     pub fn repin_to(&mut self, index: u32, name: &str) -> io::Result<()> {
         use std::os::fd::AsRawFd as _;
-        super::egress::pin_socket_to_iface(self.sock.as_raw_fd(), index, name)?;
-        self.pinned = Some((index, name.to_owned()));
-        Ok(())
+        super::egress::pin_socket_to_iface(self.sock.as_raw_fd(), index, name)
+        // 注：不回写 self.pinned——该字段只在装配期被读一次（pinned_flag 的初值），
+        // 运行期真源是 pinned_flag（看护重钉成功后置位；评审 r1-Z3 防双真源漂移）
     }
 
     /// 出站收口：把 device 产出的 wire 批封装腿帧发出（Send 恒发腿帧——Go 同义）。

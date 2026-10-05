@@ -351,12 +351,8 @@ impl Session {
                     let learned = if known { "" } else { "·学习" };
                     let tag = if c.relay {
                         "中继"
-                    } else if c.addr.is_ipv6() {
-                        "公网v6"
-                    } else if is_lan_addr(c.addr) {
-                        "LAN"
                     } else {
-                        "公网v4"
+                        crate::wtransport::bind::candidate_tag(c.addr, false)
                     };
                     format!("{}（{tag}{learned}）", c.addr)
                 })
@@ -1061,18 +1057,6 @@ fn token_of(sh: &Shared) -> Token {
     }
 }
 
-/// LAN 判定（C13 标签面：回环/RFC1918）。
-fn is_lan_addr(ap: SocketAddr) -> bool {
-    let ip = ap.ip();
-    if ip.is_loopback() {
-        return true;
-    }
-    if let std::net::IpAddr::V4(v4) = ip {
-        let o = v4.octets();
-        return o[0] == 10 || o[0] == 172 && (16..=31).contains(&o[1]) || o[0] == 192 && o[1] == 168;
-    }
-    false
-}
 
 // ---------- 纯决策函数（Go patrolrule.go / PatrolEvidenceGate 同串语义） ----------
 

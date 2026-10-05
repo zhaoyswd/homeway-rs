@@ -199,7 +199,16 @@ impl ServeEngine {
         let mut bind_addr: Option<IpAddr> = None;
         match &cfg.bind_iface {
             BindMode::Off => {}
-            BindMode::Addr(ip) => bind_addr = Some(*ip),
+            BindMode::Addr(ip) => {
+                bind_addr = Some(*ip);
+                // Go bind.go Open 的 `else if laddr.IP != nil` 分支：绑源地址**且**
+                // 把 socket 钉在该地址所属网卡上（IfaceForAddr——绑地址不钉卡时
+                // TUN 代理机器的观测仍会被污染；查不到所属卡 = 只绑地址不钉）。
+                if let Some(ifi) = egress::iface_for_addr(*ip) {
+                    (logf)(&format!("绑卡：绑定地址 {ip}（钉 {}）", ifi.name));
+                    resolved = Some(ifi);
+                }
+            }
             BindMode::Auto => {
                 let cands = egress::physical_candidates();
                 let d2 = Arc::clone(&dlogf);
@@ -226,9 +235,13 @@ impl ServeEngine {
                         resolved = Some(i);
                     }
                     None => {
-                        // Go cli.go 语义：名字不存在 → 告警后退回 auto（TUN 代理机器上
-                        // 「不绑」恰恰是最危险的形态——评审 M18）
-                        (logf)(&format!("绑卡：网卡 {name:?} 不存在—— 退回自动挑卡"));
+                        // Go cli.go ResolveBind 语义：名字不存在 → 告警后退回 auto（TUN
+                        // 代理机器上「不绑」恰恰是最危险的形态——评审 M18）。**模式随
+                        // 之变 auto**（看护每轮重挑——Go 返回 BindAuto 同义；评审 r1-M1：
+                        // 不改写会让看护按死名字每 5s 空转）。
+                        (logf)(&format!(
+                            "⚠️ --bind-interface {name:?} 找不到（no such interface）—— 退回 auto（自动挑卡）"
+                        ));
                         let cands = egress::physical_candidates();
                         let d2 = Arc::clone(&dlogf);
                         match egress::select_best(&cands, &[], Duration::from_secs(2), &move |s: &str| {
@@ -427,7 +440,9 @@ impl ServeEngine {
 
         // ---- 命令通道（驱动线程收；观测/udpcap/中继控制面都经它交互） ----
         let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCmd>();
-        let (pub_kick_tx, pub_kick_rx) = mpsc::channel::<()>();
+        // kick 通道 cap=1 + 非阻塞发送（Go kickUDPCap/kickPublicEndpoint 的
+        // chan struct{} cap=1 + select-default 同义——重复 kick 合并成一次）
+        let (pub_kick_tx, pub_kick_rx) = mpsc::sync_channel::<()>(1);
 
         // ---- 中继注册腿（--relay；R4）：必须在 TokenCtx 构造前把 relay_ep 配好
         //      （token 首轮打印要带中继端点——Go serve.go:406-409 用户口径），
@@ -544,7 +559,7 @@ impl ServeEngine {
         }
 
         // ---- udpcap 探测线程（kick = 换网卡后立即重探——绑卡看护 onChange） ----
-        let (udpcap_kick_tx, udpcap_kick_rx) = mpsc::channel::<()>();
+        let (udpcap_kick_tx, udpcap_kick_rx) = mpsc::sync_channel::<()>(1);
         {
             let cmd_tx2 = cmd_tx.clone();
             let dlogf = Arc::clone(&dlogf);
@@ -558,8 +573,15 @@ impl ServeEngine {
         // ---- 绑卡看护循环（Go bindwatch.go；条件同 Go role.go：钉了卡才看护
         //      （auto 挑到 / 显式名），IP 字面量单栈形态不看护）----
         if resolved.is_some() && bind_addr.is_none() {
+            // （IP 字面量形态不挂看护——Go role.go `!cfg.BindAddr.IsValid()` 同义）
             let explicit_name = match &cfg.bind_iface {
-                BindMode::Explicit(name) => Some(name.clone()),
+                // 只有「显式名确实找到了并钉上」才按名重解析；退回 auto 的形态
+                // （名字不存在）每轮重挑——评审 r1-M1
+                BindMode::Explicit(name)
+                    if resolved.as_ref().is_some_and(|r| &r.name == name) =>
+                {
+                    Some(name.clone())
+                }
                 _ => None, // auto：每轮重新挑（Go WatchBind Explicit=nil 同义）
             };
             let stop = spawn_service_stop_flag(&mut stop_flags);
@@ -646,6 +668,7 @@ impl ServeEngine {
     pub fn kick_public_endpoint(&self) {
         let _ = self.cmd_tx.send(EngineCmd::KickPublicEndpoint);
     }
+
 }
 
 impl Drop for ServeEngine {
@@ -743,7 +766,7 @@ fn driver_loop(
     cmd_rx: mpsc::Receiver<EngineCmd>,
     dlogf: &Logf,
     _itc_stats: &Arc<ItcStats>,
-    pub_kick_tx: Sender<()>,
+    pub_kick_tx: std::sync::mpsc::SyncSender<()>,
 ) {
     let udp_fd = bind.udp_fd();
     // GC 节拍（10min ±10% 抖动）与吊销跟随（1s mtime）/DNS 统计（60s）
@@ -782,7 +805,7 @@ fn driver_loop(
                 EngineCmd::SetCaps(c) => bind.set_caps(c),
                 EngineCmd::SetProbeEndpoints(eps) => bind.set_probe_endpoints(eps),
                 EngineCmd::KickPublicEndpoint => {
-                    let _ = pub_kick_tx.send(()); // 转发到观测线程（换网重测）
+                    let _ = pub_kick_tx.try_send(()); // 转发到观测线程（满=已有待处理 kick）
                 }
                 EngineCmd::Repin { index, name, reply } => {
                     // 看护循环重钉（socket 由驱动线程独占——两族都设、单栈容错）
@@ -1189,8 +1212,10 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
     if ctx.cfg.stun6.is_empty() {
         (ctx.logf)("公网端点：未配置 --stun6（需要有 AAAA 的 STUN 服务器），跳过 IPv6 公布");
     } else {
-        let v6 = resolve_stun6(&ctx.cfg.stun6)
-            .and_then(|s| stun_query_sync(cmd_tx, s, Duration::from_secs(8)));
+        let v6 = match resolve_stun6(&ctx.cfg.stun6) {
+            None => None,
+            Some(server) => stun_query_sync(cmd_tx, server, Duration::from_secs(8)),
+        };
         match v6 {
             Some(ap6) => {
                 let ip = ap6.ip();
@@ -1214,7 +1239,13 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
                 // 成功但非全局 v6（v4-mapped/链路本地）：静默不加条目（Go 同义）
             }
             None => {
-                (ctx.logf)("公网端点：IPv6 不可用（解析失败或无应答），本轮只公布 IPv4");
+                // Go 的 %v 带具体原因——这里按断点分两类（解析失败 / 无应答）
+                let why = if resolve_stun6(&ctx.cfg.stun6).is_none() {
+                    format!("{} 解析失败（无 AAAA？）", ctx.cfg.stun6)
+                } else {
+                    "无应答".to_owned()
+                };
+                (ctx.logf)(&format!("公网端点：IPv6 不可用（{why}），本轮只公布 IPv4"));
             }
         }
     }
@@ -1396,8 +1427,14 @@ fn udpcap_loop(
             ));
             last = cur;
         }
-        // 周期等待可被 kick 打断（换网卡 = 换了条路，能力结论立即重测）
-        let _ = kick_rx.recv_timeout(UDPCAP_INTERVAL);
+        // 周期等待可被 kick 打断（换网卡 = 换了条路，能力结论立即重测）。
+        // Disconnected（看护未起：--bind-interface none / IP 字面量 / auto 挑卡
+        // 失败——sender 已随 start() 返回被 drop）必须**按原节拍继续**：探测与
+        // SetCaps 是 P1-4 客户端能力打行的数据源，退出或全速自旋（评审 r1-H1：
+        // 吞掉 Disconnected 会 ~7 轮/秒持续探测）都不成立。
+        if kick_rx.recv_timeout(UDPCAP_INTERVAL).is_err() {
+            std::thread::sleep(UDPCAP_INTERVAL);
+        }
     }
 }
 

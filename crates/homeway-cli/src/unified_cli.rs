@@ -94,7 +94,9 @@ struct FileConfig {
 /// 统一进程入口（零参/仅全局 flag 形态）。
 pub fn cmd_unified(args: &[String]) {
     // 预扫描拒收角色 flag（Go RunUnified 同义——**先于**正式解析，给可行动提示）。
-    // 只扫 flag 形态 token：--state 的值位跳过，--state=DIR 归并。
+    // 只认 --state <dir> / --state=DIR / --verbose / --help：内联与空格两种取值形态
+    // 等价（评审 r1-H2：等号形态曾被静默忽略→跑在默认 state 上）；未知 flag 精确
+    // 匹配报错（评审 r1-Z1：前缀匹配曾把 --stateful 当 --state 收下）。
     let mut state_dir = default_state_dir();
     let mut verbose = false;
     let mut i = 0;
@@ -104,20 +106,24 @@ pub fn cmd_unified(args: &[String]) {
             eprintln!("统一进程不接受位置参数（{a:?}）——角色命令见 `homeway-cli serve` / `homeway-cli relay` / 客户端域命令");
             std::process::exit(2);
         }
-        let name = a.trim_start_matches('-');
-        if name.starts_with("state") && !name.contains('=') {
-            if let Some(v) = args.get(i + 1) {
-                state_dir = PathBuf::from(v);
+        let body = a.trim_start_matches('-');
+        let (name, inline) = match body.split_once('=') {
+            Some((k, v)) => (k.to_owned(), Some(v.to_owned())),
+            None => (body.to_owned(), None),
+        };
+        match name.as_str() {
+            "state" => {
+                if let Some(v) = inline {
+                    state_dir = PathBuf::from(v);
+                } else if let Some(v) = args.get(i + 1) {
+                    state_dir = PathBuf::from(v.clone());
+                    i += 1; // --state 的值位
+                }
             }
-            i += 1; // --state 的值位
-            i += 1;
-            continue;
-        }
-        let name = name.split('=').next().unwrap_or(name);
-        match name {
-            "state" | "verbose" => verbose = name == "verbose" || verbose,
+            "verbose" => verbose = true,
             "help" | "h" => {
                 println!("homeway-cli [统一进程] —— 零参起；只认 --state <dir> / --verbose（角色参数写 config.toml，或用 serve/relay 前台单角色形态）");
+                println!("子命令形态：homeway-cli <serve|relay|connect|speedtest|files|token|dnstest|portfwd> …（无子命令 = 统一进程）");
                 return;
             }
             other => {
@@ -131,6 +137,7 @@ pub fn cmd_unified(args: &[String]) {
     run_unified_state(state_dir, verbose);
 }
 
+
 fn run_unified_state(state_dir: PathBuf, verbose: bool) {
     // ① 单实例锁（与前台单角色共用 <state>/lock——同 state 双进程互斥）
     let lock = match InstanceLock::acquire(&state_dir, "unified") {
@@ -141,6 +148,9 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
             std::process::exit(1);
         }
     };
+
+    // 信号 handler 先装（角色装配期到达的信号也有归属；再由主循环 pipe 等待）
+    crate::serve_cli::install_stop_signals();
 
     // ② 三层布局 + config 缺失生成默认 + events 最小面
     let ns = match open_node_state(&state_dir) {
@@ -241,7 +251,7 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
         crate::cli_version(),
     ));
 
-    // ⑧ 等信号收工（SIGTERM/SIGINT——launchd 的 KeepAlive 停止/nohup 的 kill 走这里）
+    // 信号 handler 在**角色装配前**装好（装配期到达的信号也有归属；r1-Z5 整改面）
     crate::serve_cli::install_stop_signals();
     println!("（homeway 统一进程前台运行中——Ctrl-C 收工）");
     let _ = crate::serve_cli::wait_stop_pipe();
@@ -258,4 +268,40 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
         p.stop();
     }
     lock.release();
+}
+
+#[cfg(test)]
+mod tests {
+    /// --state=DIR 与 --state DIR 等价（r1-H2 回归钉）——解析逻辑单测面（预扫描
+    /// 是 cmd_unified 内联闭包，这里以同构断言钉住两种形态的取值路径不回退）。
+    #[test]
+    fn state_flag_forms_equivalent() {
+        for (args, want) in [
+            (vec!["--state", "/tmp/a"], "/tmp/a"),
+            (vec!["--state=/tmp/b"], "/tmp/b"),
+            (vec!["-state", "/tmp/c"], "/tmp/c"),
+            (vec!["--verbose", "--state=/tmp/d"], "/tmp/d"),
+        ] {
+            let mut state_dir = "/default".to_owned();
+            let mut i = 0;
+            while i < args.len() {
+                let a = args[i];
+                let body = a.trim_start_matches('-');
+                let (name, inline) = match body.split_once('=') {
+                    Some((k, v)) => (k.to_owned(), Some(v.to_owned())),
+                    None => (body.to_owned(), None),
+                };
+                if name == "state" {
+                    if let Some(v) = inline {
+                        state_dir = v.to_owned();
+                    } else if let Some(v) = args.get(i + 1) {
+                        state_dir = v.to_string();
+                        i += 1;
+                    }
+                }
+                i += 1;
+            }
+            assert_eq!(state_dir, want, "args={args:?}");
+        }
+    }
 }

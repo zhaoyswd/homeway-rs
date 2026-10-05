@@ -159,7 +159,12 @@ pub(crate) fn unmap_v4_in6(a: SocketAddr) -> SocketAddr {
 /// 环境回退 v4（Go 在纯 v4 平台同样回落 AF_INET）。返回 (socket, 是否双栈)。
 pub(crate) fn open_client_socket() -> io::Result<(UdpSocket, bool)> {
     match bind_dual_stack(0) {
-        Ok(s) => Ok((s, true)),
+        // dual 以 getsockopt 运行期事实为准（r1-L4：V6ONLY setsockopt 被环境
+        // 忽略时会得到「自认双栈的单栈 socket」——v4 发送面全 EINVAL）
+        Ok(s) => {
+            let dual = is_dual_stack(&s);
+            Ok((s, dual))
+        }
         Err(_) => {
             let s = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0))?;
             Ok((s, false))

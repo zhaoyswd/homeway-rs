@@ -46,7 +46,13 @@ impl InstanceLock {
     /// 取 `<state>/lock` 排他非阻塞锁；成功写 pid + 归一角色（homeway）+ 形态
     /// （unified/serve/relay），失败读持有者报 `Held`。
     pub fn acquire(state_dir: &Path, form: &str) -> Result<Self, LockError> {
-        std::fs::create_dir_all(state_dir)?;
+        // state 根收紧 0700（Go MkdirAll(dir, 0o700)；chmod 失败只告警不阻断——
+        // r1-W2：create_dir_all 的默认权限不该留一个 0755 的 state 根）
+        if let Err(e) = std::fs::create_dir_all(state_dir)
+            .and_then(|_| std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)))
+        {
+            eprintln!("homeway: ⚠️ state 目录 {} 建立/收紧 0700 失败（{e}）——建议手工 chmod", state_dir.display());
+        }
         let path = state_dir.join("lock");
         #[allow(clippy::suspicious_open_options)] // 读写打开持锁文件：不清内容（截断在锁内做）
         let mut f = OpenOptions::new().create(true).read(true).write(true).mode(0o600).open(&path)?;
@@ -105,6 +111,11 @@ fn read_lock_holder(f: &mut File) -> (i32, String) {
             pid = v.trim().parse().unwrap_or(0);
         } else if let Some(v) = line.strip_prefix("form=") {
             form = v.trim().to_owned();
+        } else if let Some(v) = line.strip_prefix("role=") {
+            // 旧格式（role 归一为 homeway）——形态未知（Go readLockHolder 同义）
+            if form == "?" {
+                form = format!("legacy:{}", v.trim());
+            }
         }
     }
     (pid, form)
@@ -192,11 +203,15 @@ pub struct NodeState {
 
 pub fn open_node_state(dir: &Path) -> std::io::Result<NodeState> {
     std::fs::create_dir_all(dir)?;
-    let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
+    if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+        eprintln!("homeway: ⚠️ state 目录 {} 收紧 0700 失败（{e}）——建议手工 chmod", dir.display());
+    }
     for sub in ["serve", "relay", "client", "cache"] {
         let p = dir.join(sub);
         std::fs::create_dir_all(&p)?;
-        let _ = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700));
+        if let Err(e) = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)) {
+            eprintln!("homeway: ⚠️ state 子目录 {} 收紧 0700 失败（{e}）——建议手工 chmod", p.display());
+        }
     }
     let cfg_path = dir.join("config.toml");
     let mut generated = false;
