@@ -254,3 +254,43 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 | CA11 | dialControlSpawn 按需拉起：`--no-spawn` → `守护进程未运行且 --no-spawn 已给定（不拉起）`（fail-fast）；无 no-spawn → `守护进程未运行（launchd 代理 me.zhaozhe.homeway-exit 在册）——等 KeepAlive 重拉…` → `KeepAlive 4s 内未重拉——改为自行拉起` → `守护进程未运行，已启动 pid=N（state=…）` → 命令照常完成；子进程 stdio 落 `<state>/cache/spawn.log`（tail 见统一进程就绪行） |
 | CA12 | no_host 族：`forward add --host nosuch` / `socks on --host nosuch` → `没有匹配 "nosuch" 的主机（host list 看全表）`（CLI 侧 resolve 先行——与 term/host delete 同一份规则文案） |
 | CA13 | 纯读/直改族不拉起（评审中-5 整改后实采）：停机态 `status` → `守护进程：未运行（sock=…/control.sock 不存在/不可连）——本命令纯读不拉起；先启动：…`；`serve status` → `serve：进程未运行（本命令纯读不拉起）；config serve.enabled=false`；`serve stop` → `serve：进程未运行——期望已写为停用（config serve.enabled=false），下次启动不再装配`（直改 config 实查 enabled=false）；`--help` → 用法 + exit 0（speedtest/--host 族同） |
+
+## DDNS 双半边（P0-4；D-2 8o，2026-10-06 实采于本地实例 /tmp/d2-ddns-state）
+
+### server 侧（命令面 + config + token 叠加 + 自检）
+
+- `homeway-cli serve ddns add <domain>` → `ddns 条目 home.example.com 已写入 config`
+  （重复 add：`ddns 条目 home.example.com 已在 config（不重复添加）` exit 1）
+- `serve ddns delete` → `ddns 条目 … 已从 config 删除` / 不存在幂等
+  `ddns 条目 … 不在 config（幂等，无动作）`
+- `serve ddns list`（逐行域名 / 空表 `（config 无 ddns 条目）` / `--json`
+  `["home.example.com"]`）
+- config 写出形态：`[[serve.ddns]]` + `domain = "…"`（原子写 0600）；非法条目
+  （空/带端口路径）启动报错 `serve.ddns.domain "…" 非法（只要裸域名，不带端口/路径）`
+- 装配行：`DDNS：已配置 1 个域名（token 叠加域名条目、既有端点全保留；自检随公网端点探测同拍跑）`
+- 探测全关 + ddns 配置：`DDNS：公网端点探测未开（--upnp=false --stun=''），自检没有观测可比对、跳过；token 的域名条目端口按实际监听口`
+- **token 叠加**（本地实采）：`客户端 token（…3 个端点）` 端点行 =
+  `192.168.3.12:42677（内网）、127.0.0.1:42677（公网）、home.example.com:42677（域名）`
+  ——端口 = 已公布公网端点外部口（`ddnsEntryPort` 同义；无公网观测回退实际监听口）
+- **自检真跑**（域名不存在形态，公共解析器直查）：
+  `⚠️ DDNS 自检：解析 home.example.com 失败（ddns: 全部解析器（2 个）均无可用应答）——本轮跳过对比`
+  （连续失败只打第一拍；恢复行 `DDNS 自检：解析恢复（%s → %v）`）
+- 滞后告警族（连续 ≥3 拍不一致）：`⚠️ DDNS 自检：记录滞后——域名解析 … 与本机观测 … 连续 N 拍不一致；请检查 DDNS 更新器（路由器/脚本）是否还在工作`；恢复 `DDNS 自检：记录已恢复一致（…）`
+- 缺 AAAA 告警：`⚠️ DDNS 自检：域名 … 没有 AAAA 记录（只解析出 A）——蜂窝用户将失去 v6 直连路径；请让 DDNS 同时更新 AAAA`；恢复 `DDNS 自检：域名已带 AAAA 记录，v6 直连路径恢复`
+- 卫兵两档（错误文案）：`ddns: 解析结果落在 fake-IP 段（代理环境污染，检查绑卡/代理）` /
+  `ddns: 解析结果非全球单播（DDNS 记录本身不可路由，检查记录值）`
+- serve.status 的 ddns 段：`{"domain":…,"lagStreak":N,"warnedLag":true?,"warnedAAAA":true?}`
+  （false 位省略——omitempty 同义）
+- 顺手补：`serve relay set <token> [--stdin]` / `serve relay clear`（写 config 0600 +
+  在跑检测提示 `⚠️ 不热更：需 homeway serve restart 生效`）
+
+### client 侧（token 域名端点展开 + 重解析）
+
+- 建会话：域名端点解析一次（A+AAAA，v4 在前；5s 预算）；成功记行
+  `token 端点 localhost:41641 解析为 N 个地址（[…]）`；失败
+  `token 端点 %q 域名解析失败（跳过）：%v`（其它端点照常；全失败 = NoCandidates）
+- 重解析（Rearm/RearmSoft 触发，异步 5s 单飞）：失败
+  `域名重解析 %s 失败（退回上次解析结果）：%v`；候选变化
+  `域名重解析：N 条候选已刷新（…）`；中继采纳 + 15s 节流窗到
+  `域名重解析晚于赛跑结算（当前中继 …）→ 节流软赛跑补投新候选`
+- hosts reach 探测同样解析域名条目（父预算内）
