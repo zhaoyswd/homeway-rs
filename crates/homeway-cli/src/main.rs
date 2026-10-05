@@ -622,7 +622,7 @@ fn cmd_files(args: &[String]) {
         i += 1;
     }
     let Some(tok) = tok else {
-        eprintln!("用法：homeway-cli files <list|stat|mkdir|read|download|upload> --token <hmw1> [--identity-dir D] [--rate-limit B/s（缺省 2MiB/s；0 不限）] <远端路径> [<本地路径>]");
+        eprintln!("用法：homeway-cli files <list|stat|mkdir|read|get|put|download|upload>（get/put = download/upload 的 Go 契约名） --token <hmw1> [--identity-dir D] [--rate-limit B/s（缺省 2MiB/s；0 不限）] <远端路径> [<本地路径>]");
         std::process::exit(2);
     };
     let mut t = match token::decode(&tok) {
@@ -684,7 +684,9 @@ fn cmd_files(args: &[String]) {
         "read" => homeway_core::files::read(&session, budget, &path, "", 1 << 20).map(|r| {
             print!("{}", r.text);
         }),
-        "download" => {
+        "download" | "get" => {
+            // get = Go 脚本契约名（files_cli 六动词 list/stat/mkdir/read/get/put）；
+            // download 保留为别名——两侧脚本都不破（GAP-AUDIT P1-7 动词别名半边）。
             let mut out: Box<dyn std::io::Write> = if local == "-" {
                 Box::new(std::io::stdout())
             } else {
@@ -698,7 +700,7 @@ fn cmd_files(args: &[String]) {
             })
             .map(|n| println!("下载完成 {n} 字节 → {local}"))
         }
-        "upload" => {
+        "upload" | "put" => {
             let mut f = std::fs::File::open(&local).unwrap_or_else(|e| {
                 eprintln!("本地文件打不开（{local}）：{e}");
                 std::process::exit(1);
