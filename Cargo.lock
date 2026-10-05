@@ -483,10 +483,12 @@ name = "homeway-cli"
 version = "0.1.0"
 dependencies = [
  "base64 0.22.1",
+ "getrandom",
  "homeway-core",
  "libc",
  "serde",
  "serde_json",
+ "sha2",
  "toml",
 ]
 

@@ -11,6 +11,8 @@ toml.workspace = true
 libc.workspace = true
 base64.workspace = true
 serde.workspace = true
+sha2.workspace = true
+getrandom.workspace = true
 
 [features]
 # 透传 homeway-core 的故障注入缝（阶梯时间窗实测用）
