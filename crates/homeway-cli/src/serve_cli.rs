@@ -382,29 +382,44 @@ pub fn cmd_serve(args: &[String]) {
     let verbose = cfg.verbose;
     let cache_dir = cfg.state_dir.join("cache");
     let events = match homeway_core::nodestate::EventsLog::open(&cache_dir) {
-        Ok(w) => w,
+        Ok(w) => Arc::new(w),
         Err(e) => {
             eprintln!("homeway: ⚠️ events.log 打开失败（{e}）——本轮公告只回显终端");
-            homeway_core::nodestate::EventsLog::terminal_only(cache_dir.join("events.log"))
+            Arc::new(homeway_core::nodestate::EventsLog::terminal_only(cache_dir.join("events.log")))
         }
     };
     let debug = match homeway_core::nodestate::DebugLog::open(&cache_dir) {
-        Ok(w) => w,
+        Ok(w) => Arc::new(w),
         Err(e) => {
             eprintln!("homeway: ⚠️ debug.log 打开失败（{e}）——本轮细节日志缺失，服务继续");
-            homeway_core::nodestate::DebugLog::disabled(cache_dir.join("debug.log"))
+            Arc::new(homeway_core::nodestate::DebugLog::disabled(cache_dir.join("debug.log")))
         }
     };
     let logf: Arc<dyn Fn(&str) + Send + Sync> = {
-        let ev = Arc::new(events);
+        let ev = Arc::clone(&events);
         Arc::new(move |s: &str| ev.eventf(s))
     };
+    // token 端点变化轮流（Go tokenToFile：events 文件只写 + verbose 回显）
+    let tokf: Arc<dyn Fn(&str) + Send + Sync> = {
+        let ev = Arc::clone(&events);
+        Arc::new(move |s: &str| ev.quietf(s, verbose))
+    };
+    let log_paths = Some((
+        events.path().display().to_string(),
+        debug.path().display().to_string(),
+    ));
     let dlogf: Arc<dyn Fn(&str) + Send + Sync> = {
         let db = Arc::new(debug);
         Arc::new(move |s: &str| db.dlogf(s, verbose))
     };
     let upnp_used = cfg.upnp;
-    let engine = match ServeEngine::start(cfg, Arc::clone(&logf), Arc::clone(&dlogf)) {
+    let engine = match ServeEngine::start(
+        cfg,
+        Arc::clone(&logf),
+        Arc::clone(&dlogf),
+        Arc::clone(&tokf),
+        log_paths,
+    ) {
         Ok(e) => e,
         Err(e) => {
             eprintln!("serve 启动失败：{e}");

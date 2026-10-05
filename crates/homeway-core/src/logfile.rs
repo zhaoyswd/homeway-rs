@@ -59,8 +59,9 @@ impl RotatingWriter {
         &self.path
     }
 
-    /// 追加一段（调用方自带换行语义——本方法写 `line + '\n'`）。超限先轮转再写；
-    /// 轮转/写失败丢本段（下次重试 open）。
+    /// 追加一段（调用方自带换行语义——本方法写 `line + '\n'`，单次 write 与 Go 的
+    /// 单次 `Write([]byte(line+"\n"))` 同形）。超限先轮转再写；轮转/写失败丢本段
+    /// （下次重试 open）。
     pub fn write_line(&self, line: &str) {
         let mut slot = self.lock_slot();
         if slot.f.is_none() && self.open_locked(&mut slot).is_err() {
@@ -72,10 +73,10 @@ impl RotatingWriter {
                 return; // 轮转失败（重开没成）：丢本段
             }
         }
-        let ok = slot
-            .f
-            .as_mut()
-            .is_some_and(|f| f.write_all(line.as_bytes()).and_then(|_| f.write_all(b"\n")).is_ok());
+        let mut buf = String::with_capacity(line.len() + 1);
+        buf.push_str(line);
+        buf.push('\n');
+        let ok = slot.f.as_mut().is_some_and(|f| f.write_all(buf.as_bytes()).is_ok());
         if ok {
             slot.written += line.len() as u64 + 1;
         } else {
@@ -84,11 +85,10 @@ impl RotatingWriter {
         }
     }
 
-    /// 关闭当前句柄（幂等；收工用）。
+    /// 关闭当前句柄（幂等；收工用）。毒锁按「无句柄」降级取锁（与 write_line 同策）。
     pub fn close(&self) {
-        if let Ok(mut slot) = self.slot.lock() {
-            slot.f = None;
-        }
+        let mut slot = self.lock_slot();
+        slot.f = None;
     }
 
     fn lock_slot(&self) -> std::sync::MutexGuard<'_, Slot> {

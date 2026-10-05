@@ -157,7 +157,16 @@ pub struct ServeEngine {
 impl ServeEngine {
     /// 装配并启动（非阻塞；判据行按 Go 同序打出：E2/E18 → E21 → E4 → E5 → E6 →
     /// E14/E17 → E19 → E1）。
-    pub fn start(cfg: ServeConfig, logf: Logf, dlogf: Logf) -> std::io::Result<Arc<Self>> {
+    /// 日志流参数：`logf` = 摘要流〔终端+events 文件——统一进程 launchd stdout 双写
+    /// 口径〕；`dlogf` = 细节流〔debug 文件恒写，verbose 回显〕；`tokf` = token 端点
+    /// 变化轮流〔events 文件只写，verbose 回显〕；`log_paths` = 首轮「日志：」提示行。
+    pub fn start(
+        cfg: ServeConfig,
+        logf: Logf,
+        dlogf: Logf,
+        tokf: Logf,
+        log_paths: Option<(String, String)>,
+    ) -> std::io::Result<Arc<Self>> {
         let serve_dir = cfg.state_dir.join("serve");
         let cache_dir = cfg.state_dir.join("cache");
         std::fs::create_dir_all(&serve_dir)?;
@@ -538,6 +547,8 @@ impl ServeEngine {
             relay_ep,
             relay_wanted,
             dlogf: Arc::clone(&dlogf),
+            tokf,
+            log_paths,
             pinned_flag: Arc::clone(&pinned_flag),
         });
         let pub_enabled = cfg.upnp || !cfg.stun.is_empty() || !cfg.public_endpoint.is_empty();
@@ -552,8 +563,8 @@ impl ServeEngine {
                 })
                 .ok();
         } else {
-            // 探测全关：观测线程不起、first_probe_tx 随此 drop——兜底线 recv 到
-            // Disconnected 即按 15s 兜底档走（Go firstProbe==nil 同义）。
+            // 探测全关：观测线程不起、first_probe_tx 在此 drop（兜底线 pub_enabled
+            // 分支不会执行 recv——它走自己的 15s 档；tx drop 只是让通道不悬空）。
             drop(first_probe_tx);
             drop(pub_kick_rx);
         }
@@ -570,11 +581,12 @@ impl ServeEngine {
                 .name("homeway-tokfb".into())
                 .spawn(move || {
                     if pub_enabled {
-                        // 等首轮探测信号；发送端已 drop（探测全关）= 15s 兜底档
+                        // 等首轮探测信号；观测线程早夭（发送端全部 drop）= 15s 兜底档
                         if first_probe_rx.recv().is_err() {
                             std::thread::sleep(Duration::from_secs(15));
                         }
                     } else {
+                        // 探测全关（Go firstProbe==nil）：tokenFallbackWait 15s 档
                         std::thread::sleep(Duration::from_secs(15));
                     }
                     for _ in 0..10 {
@@ -1112,6 +1124,13 @@ struct TokenCtx {
     relay_wanted: bool,
     /// 细节日志（降级行等）。
     dlogf: Logf,
+    /// 端点变化轮专用流（Go tokenToFile = logf 形态：**只进摘要文件**，--verbose 才
+    /// 回显终端——终端只打首轮 token，端点变化冒第二串只会让人拿错，2026-09-21
+    /// 用户口径；首轮仍走 logf = ulogf 形态〔终端+文件〕）。
+    tokf: Logf,
+    /// （events 路径, debug 路径）——首轮 token 公告前的「日志：…（摘要）｜…（细节）」
+    /// 落点提示行用（Go publicendpoint.go 同串；None = 无文件日志形态）。
+    log_paths: Option<(String, String)>,
     /// 「socket 已钉卡/绑地址」的运行期事实（Go `pinnedNow`——钉卡失败自动降级、
     /// 看护循环重钉成功后置回；公网端点公布的保守判据读这里）。
     pinned_flag: Arc<AtomicBool>,
@@ -1461,11 +1480,19 @@ fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
     let first = inner.last_token.is_empty();
     inner.last_token = tok_str.clone();
     if first {
+        // 首轮（进程内仅此一次）= Go ulogf 形态：带一行日志落点提示，终端 + 摘要文件。
+        if let Some((ev_p, dbg_p)) = &ctx.log_paths {
+            (ctx.logf)(&format!("日志：{ev_p}（摘要）｜ {dbg_p}（细节）"));
+        }
         (ctx.logf)(&format!("客户端 token（粘进 App 的「添加主机」即可；{eps_count} 个端点）：{tok_str}"));
+        (ctx.logf)(&format!("端点：{}", labels.join("、")));
     } else {
-        (ctx.logf)(&format!("客户端 token（端点已变化；粘进 App 的「添加主机」即可；{eps_count} 个端点）：{tok_str}"));
+        // 端点变化轮 = Go tokenToFile 形态：只进摘要文件（--verbose 才回显终端）——
+        // 终端冒出第二串 token 只会让人拿错（2026-09-21 用户口径；取最新 =
+        // grep 客户端 token events.log | tail -1）。
+        (ctx.tokf)(&format!("客户端 token（端点已变化；粘进 App 的「添加主机」即可；{eps_count} 个端点）：{tok_str}"));
+        (ctx.tokf)(&format!("端点：{}", labels.join("、")));
     }
-    (ctx.logf)(&format!("端点：{}", labels.join("、")));
 }
 
 // ---------- udpcap（默认路径 UDP 能力探测；结论喂探测应答 caps） ----------

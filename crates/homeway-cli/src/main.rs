@@ -622,7 +622,8 @@ fn cmd_files(args: &[String]) {
         i += 1;
     }
     let Some(tok) = tok else {
-        eprintln!("用法：homeway-cli files <list|stat|mkdir|read|get|put|download|upload>（get/put = download/upload 的 Go 契约名） --token <hmw1> [--identity-dir D] [--rate-limit B/s（缺省 2MiB/s；0 不限）] <远端路径> [<本地路径>]");
+        eprintln!("用法：homeway-cli files <list|stat|mkdir|read|get|put|download|upload> --token <hmw1> [--identity-dir D] [--rate-limit B/s（缺省 2MiB/s；0 不限）] <远端路径> [<本地路径>]");
+        eprintln!("  get <远端> [-o 本地] [--force]（目标缺省 = basename，已存在默认拒）；put <本地> <远端>——Go 契约参数序，与 download/upload（<远端> [<本地>]）不同");
         std::process::exit(2);
     };
     let mut t = match token::decode(&tok) {
@@ -633,12 +634,128 @@ fn cmd_files(args: &[String]) {
         }
     };
     let verb = rest.first().cloned().unwrap_or_default();
-    let path = rest.get(1).cloned().unwrap_or_default();
-    let local = rest.get(2).cloned().unwrap_or_default();
-    if verb.is_empty() || path.is_empty() {
-        eprintln!("用法：homeway-cli files <verb> --token <hmw1> [--dead-direct] [--inject relay-lock] [--rate-limit B/s] <远端路径> [<本地路径>]");
-        std::process::exit(2);
-    }
+    // ---- 动词感知解析（dsh r1 高-1 整改）：get/put 是 Go 契约形态，参数序/flag 面
+    // 与 download/upload（<远端> [<本地>]）**不同**——按动词分别解析，别混用：
+    //   get <远端> [-o 本地] [--force] [--quiet]   （目标缺省 = basename；已存在默认拒）
+    //   put <本地> <远端> [--rate-limit N] [--quiet]（本地在前——Go files_cli 同序）
+    // download/upload 保留 Rust 原生序（<远端> [<本地>]），两侧脚本契约都不破。
+    let (path, local): (String, String) = match verb.as_str() {
+        "get" => {
+            let mut remote = String::new();
+            let mut o_local: Option<String> = None;
+            let mut force = false;
+            let mut i = 1;
+            while i < rest.len() {
+                let a = rest[i].as_str();
+                match a {
+                    "-o" => {
+                        i += 1;
+                        match rest.get(i) {
+                            Some(v) => o_local = Some(v.clone()),
+                            None => {
+                                eprintln!("-o 需要本地路径（get <远端> [-o 本地] [--force] [--quiet]）");
+                                std::process::exit(2);
+                            }
+                        }
+                    }
+                    "--force" => force = true,
+                    "--quiet" => {} // 接受（Rust 进度本就走 stderr）
+                    other if other.starts_with('-') => {
+                        eprintln!("未知参数：{other}（get 认 -o <本地>、--force、--quiet）");
+                        std::process::exit(2);
+                    }
+                    other => {
+                        if !remote.is_empty() {
+                            eprintln!("只能给一个远端路径（已有 {remote:?}）");
+                            std::process::exit(2);
+                        }
+                        remote = other.to_owned();
+                    }
+                }
+                i += 1;
+            }
+            if remote.is_empty() {
+                eprintln!("get 需要远端路径：homeway-cli files get <远端> [-o 本地] [--force]");
+                std::process::exit(2);
+            }
+            let target = match o_local {
+                Some(t) => t,
+                None => {
+                    let base = std::path::Path::new(remote.trim_end_matches('/'))
+                        .file_name()
+                        .and_then(|s| s.to_str())
+                        .unwrap_or("");
+                    if base.is_empty() || base == "." {
+                        eprintln!("从远端路径 {remote:?} 推不出本地文件名；用 -o 显式指定");
+                        std::process::exit(2);
+                    }
+                    base.to_owned()
+                }
+            };
+            // 已存在默认拒、--force 覆盖（Go get 契约）
+            if !force && std::path::Path::new(&target).exists() {
+                eprintln!("本地目标 {target} 已存在；覆盖请加 --force");
+                std::process::exit(2);
+            }
+            (remote, target)
+        }
+        "put" => {
+            let mut p_local = String::new();
+            let mut p_remote = String::new();
+            let mut i = 1;
+            while i < rest.len() {
+                let a = rest[i].as_str();
+                match a {
+                    "--quiet" => {} // 接受（--rate-limit 由通用预解析收走，动词前后都行）
+                    other if other.starts_with('-') => {
+                        eprintln!("未知参数：{other}（put 认 --rate-limit <bytes/s>、--quiet）");
+                        std::process::exit(2);
+                    }
+                    other => {
+                        if p_local.is_empty() {
+                            p_local = other.to_owned();
+                        } else if p_remote.is_empty() {
+                            p_remote = other.to_owned();
+                        } else {
+                            eprintln!("只能给本地与远端两个路径（已有 {p_local:?} {p_remote:?}）");
+                            std::process::exit(2);
+                        }
+                    }
+                }
+                i += 1;
+            }
+            if p_local.is_empty() || p_remote.is_empty() {
+                eprintln!("put 需要两个路径：homeway-cli files put <本地> <远端>");
+                std::process::exit(2);
+            }
+            // Go 同义前置校验：本地必须是可读文件（不存在/目录 = 可行动错误）
+            match std::fs::metadata(&p_local) {
+                Ok(m) if m.is_file() => {}
+                Ok(_) => {
+                    eprintln!("{p_local} 是目录（put 只支持文件）");
+                    std::process::exit(2);
+                }
+                Err(e) => {
+                    eprintln!("读本地文件 {p_local}：{e}");
+                    std::process::exit(1);
+                }
+            }
+            (p_remote, p_local)
+        }
+        "list" | "stat" | "mkdir" | "read" | "download" | "upload" => {
+            let p = rest.get(1).cloned().unwrap_or_default();
+            let l = rest.get(2).cloned().unwrap_or_default();
+            if p.is_empty() {
+                eprintln!("用法：homeway-cli files <verb> --token <hmw1> [--rate-limit B/s] <远端路径> [<本地路径>]");
+                std::process::exit(2);
+            }
+            (p, l)
+        }
+        other => {
+            eprintln!("未知动词：{other}");
+            std::process::exit(2);
+        }
+    };
     if dead_direct {
         for e in &mut t.endpoints {
             if e.kind == token::EndpointKind::Direct {

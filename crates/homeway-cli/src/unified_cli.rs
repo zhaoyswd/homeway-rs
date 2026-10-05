@@ -177,11 +177,21 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
     // events tee：engine 的摘要判据行进 cache/events.log（2MB×3 轮转；stdout 与文件
     // 双写——launchd stdout 重定向继续可用）；细节行（peer/intercept/dns 判据族）进
     // cache/debug.log（8MB×2 轮转，恒落盘；--verbose 时才回显终端）——P1-1。
+    // tokf = token 端点变化轮流（Go tokenToFile：events 文件只写 + verbose 回显——
+    // 终端只出首轮 token）。
     let events = Arc::new(ns.events);
     let logf: Arc<dyn Fn(&str) + Send + Sync> = {
         let ev = Arc::clone(&events);
         Arc::new(move |s: &str| ev.eventf(s))
     };
+    let tokf: Arc<dyn Fn(&str) + Send + Sync> = {
+        let ev = Arc::clone(&events);
+        Arc::new(move |s: &str| ev.quietf(s, verbose))
+    };
+    let log_paths = Some((
+        events.path().display().to_string(),
+        ns.debug.path().display().to_string(),
+    ));
     let dlogf: Arc<dyn Fn(&str) + Send + Sync> = {
         let db = Arc::new(ns.debug);
         Arc::new(move |s: &str| db.dlogf(s, verbose))
@@ -197,7 +207,13 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
         ]);
         upnp_used = cfg.upnp;
         events.eventf("serve: 按期望态装配（config serve.enabled=true）");
-        match ServeEngine::start(cfg, Arc::clone(&logf), Arc::clone(&dlogf)) {
+        match ServeEngine::start(
+            cfg,
+            Arc::clone(&logf),
+            Arc::clone(&dlogf),
+            Arc::clone(&tokf),
+            log_paths,
+        ) {
             Ok(e) => serve_engine = Some(e),
             Err(e) => {
                 events.eventf(&format!("serve: 装配失败（{e}）——统一进程退出"));

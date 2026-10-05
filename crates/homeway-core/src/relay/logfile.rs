@@ -10,7 +10,12 @@
 
 use std::path::Path;
 
-use crate::logfile::{RotatingWriter, EVENTS_BACKUPS, EVENTS_MAX_BYTES};
+use crate::logfile::RotatingWriter;
+
+/// 轮转参数（Go relay/logging.go 同参：relay.log 2MB×3——与 events 同值但独立声明，
+/// 两者的档位语义各自演化）。
+const MAX_BYTES: u64 = 2 << 20;
+const BACKUPS: usize = 3;
 
 /// 时间戳（Go 布局 `2006-01-02 15:04:05.000 [relay] ` 的**本地时区**等价形态：
 /// localtime_r 取本地偏移——epoch civil 换算仍是 UTC 基）。
@@ -59,7 +64,7 @@ pub struct RelayLog {
 
 impl RelayLog {
     pub fn open(state_cache_dir: &Path, term: crate::Logf) -> Self {
-        let file = match RotatingWriter::open(state_cache_dir, "relay.log", EVENTS_MAX_BYTES, EVENTS_BACKUPS) {
+        let file = match RotatingWriter::open(state_cache_dir, "relay.log", MAX_BYTES, BACKUPS) {
             Ok(f) => Some(f),
             Err(e) => {
                 term(&format!(

@@ -127,6 +127,9 @@ fn read_lock_holder(f: &mut File) -> (i32, String) {
 
 /// 摘要级日志：`cache/events.log`（2MB×3 轮转）+ 终端回显。时间前缀 = Go
 /// `logTimePrefix` 同形（`2006-01-02 15:04:05.000 [homeway] `）。
+/// ⚠️ 前缀单标签说明：Go serve 侧行带 `[homewayd]`（旧守护二进制名的历史遗留）、
+/// nodestate/daemon 面带 `[homeway]`——Rust 有意收拢为单一 `[homeway]`（判据行
+/// 检索按内容 grep，双前缀无诊断价值、徒增形态分裂；GAP-AUDIT 措辞差异类）。
 pub struct EventsLog {
     w: Option<RotatingWriter>,
     path: PathBuf,
@@ -155,6 +158,19 @@ impl EventsLog {
         let ts = crate::go_fmt::now_log_prefix();
         let full = format!("{ts}[homeway] {line}");
         println!("{full}");
+        if let Some(w) = &self.w {
+            w.write_line(&full);
+        }
+    }
+
+    /// 摘要行只进文件、不回显终端（`echo` = `--verbose` 时回显）——Go `server.logf`
+    /// 形态；token 端点变化轮专用（终端只出首轮 token，2026-09-21 用户口径）。
+    pub fn quietf(&self, line: &str, echo: bool) {
+        let ts = crate::go_fmt::now_log_prefix();
+        let full = format!("{ts}[homeway] {line}");
+        if echo {
+            println!("{full}");
+        }
         if let Some(w) = &self.w {
             w.write_line(&full);
         }
@@ -334,10 +350,28 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
+    /// 双文件日志面（P1-1）：open_node_state 建 events.log + debug.log；quietf 只进
+    /// 文件（token 端点变化轮流——Go tokenToFile 形态）；dlogf 恒进 debug.log。
+    /// （stdout 回显面单测不可捕，由真机/统一进程验收覆盖。）
+    #[test]
+    fn dual_log_files_and_quietf() {
+        let d = tmpdir("logs");
+        let ns = open_node_state(&d).unwrap();
+        assert!(d.join("cache").join("events.log").exists(), "events.log 应建");
+        assert!(d.join("cache").join("debug.log").exists(), "debug.log 应建");
+        ns.events.quietf("客户端 token（端点已变化…）：hmw1TEST", false);
+        ns.debug.dlogf("peer: + dev=… n=1/32", false);
+        let ev = std::fs::read_to_string(d.join("cache").join("events.log")).unwrap();
+        assert!(ev.contains("端点已变化"), "quietf 落 events.log");
+        assert!(ev.contains("[homeway] "), "时间前缀形态");
+        let dbg = std::fs::read_to_string(d.join("cache").join("debug.log")).unwrap();
+        assert!(dbg.contains("peer: + dev=…"), "dlogf 落 debug.log");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     /// 默认 config 模板可被 serve_cli/relay_cli 的 serde schema 解析（键表一致性）。
     #[test]
-    fn default_config_parses() {
-        #[derive(serde::Deserialize, Default)]
+    fn default_config_parses() {        #[derive(serde::Deserialize, Default)]
         #[serde(deny_unknown_fields)]
         #[allow(dead_code)]
         struct FileServe {
