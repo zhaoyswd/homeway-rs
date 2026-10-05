@@ -1,6 +1,7 @@
 # DEPLOY-RUST-EXIT — 两台生产主机换装 Rust 出口（homeway-rs B 批，2026-10-05）
 
 > 换装执行记录 + 回退手册。授权链：用户明确指令（发版 → 部署 → 停删）。
+> §9 = B0-2a 滚动升级（v0.2.1，生产可观测性批）。
 > 前置 = B0-1 部署阻塞集清零（v6 族/期望态装配/单实例锁真网实证，判据 =
 > `INTEROP-CRITERIA.md` B0-1 节）。发版产物 = **v0.2.0**（tag `v0.2.0` = commit
 > `b1f1410`）。**token 是凭证不进仓库**——本文一律掩码（`hmw1…`/`rl1…` 前缀 + 尾 4）。
@@ -187,13 +188,13 @@ state 留存）→ `launchctl kickstart -k` → 13:07:05：
 
 ## 5. 已知注记（非阻塞）
 
-- **P1-1 日志面**：Rust 统一进程生产形态 dlogf 不落盘（无 debug.log、无轮转，
-  B0-2 范围）——`peer: +/-/~`、`dns:` 计数、`intercept: …（dialok）` 判据行生产
-  不可见（Go 生产写在 debug.log；**级别约定两侧一致**，差异仅 Rust 无落盘目标）。
-  `events.log`/`exit.log`/`unified-stdout.log` append-only 无轮转——观察期实测
-  增速（Mac ~40KB/小时量级，含公网端点重测/新源行；无 --verbose 时增速低），
-  长期靠 B0-2 轮转，短期可周期归档。需要判据行时临时 `--verbose` 起或用
-  `serve token`/状态面。
+- **P1-1 日志面**：~~Rust 统一进程生产形态 dlogf 不落盘~~ **✅ 已修（B0-2a，v0.2.1 滚动升级）**：
+  events.log 2MB×3 + debug.log 8MB×2 双文件轮转落 `<state>/cache/`（`peer: +/-/~`、
+  `dns: q=`、`intercept: …（dialok）` 判据族在 debug.log；摘要判据行在 events.log），
+  stdout+文件双写维持（launchd 重定向继续可用）。剩余注记：**stdout 重定向件**
+  （`cache/exit.log`/`unified-stdout.log`）随双写无轮转——增速 = 摘要率（debug 行不进
+  stdout），与 v0.2.0 观察值同量级；缓解 = plist 改指向/周期归档/daemon 侧接管（B0-2）。
+  详见 §9。
 - **UPnP**：Mac launchd 形态 M-SEARCH 被本地网络隐私拒（新二进制签名身份，同
   Go v0.14.0 事件）；v6 直连 + v4 STUN 公布在位，中继后备已接（本节 §2）。修复
   = 用户在场授权一次。
@@ -203,11 +204,11 @@ state 留存）→ `launchctl kickstart -k` → 13:07:05：
   正确）。后果：手机 token 里的公网 v4 `114.242.60.128:41641` 可能失效（离网
   场景赛跑不中即弃）；**公网可达性由 v6 直连 + 阿里云中继兜底**（与 Go 生产
   UPnP 失效期同构）。`public_endpoint.txt` 保留 12:40 双栈两行。
-- **relay 端点未进 token（登记 C 批小缺口）**：统一进程的 token 铸出发生在 serve
-  就绪前（13:07:05.147 台账行 < 13:07:05.249 中继注册成功），且 relay 注册后无
-  「端点已变化」重铸/重打（Go 有）⇒ 重启后铸的 token 恒缺中继端点（本例与
-  12:40 首铸同串，倒也无害）。影响：经中继可达本出口的兜底端点不进新 token
-  （在跑中继腿本身正常）。修法归 C 批（relay 注册完成后重铸或延迟铸）。
+- ~~**relay 端点未进 token（登记 C 批小缺口）**~~ **✅ 已修（B0-2a，v0.2.1 滚动升级）**：
+  根因 = 探测失败（暂不公布）形态下 `print_client_token` 整个进程生命周期从未被调
+  （非 relay 注册慢）；修法 = Go role.go 首轮探测信号 + 10×1s 兜底重试（探测全关 =
+  15s 档）——探测失败形态下也铸出「内网+中继」端点集，台账末行不再滞留在旧版本。
+  验证见 §9。
 - **CLI 一次性会话副作用**：`files/speedtest --token` 各起一个临时 peer（新设备
   身份），TTL/GC 自愈（cap=32），对手机会话无干扰（设备身份隔离）。
 - **来源 113.201.200.103 的探测流**：两出口均持续收到该 IP 的 213B 参照点探测

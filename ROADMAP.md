@@ -104,7 +104,24 @@ dev=aca645d3 身份复用 + files 桥第 1 击成功 + term surface 快照渲染
 （ver=d68eb1b3d986-rust + attached fd=90 + via=direct rtt=4ms + 身份复用 dev=aca645d3）。已知注记：token 缺
 中继端点缺口（DEPLOY-RUST-EXIT §5，修法 = relay 注册完成后重铸或延迟铸——归后续批）。
 
-**下一步（当前指针）**：**B0-2**（GAP-AUDIT P0-1 剩余：daemon 控制面/client 角色/CLI 族/supervisor 退避/events 轮转——B0-1 已清部署最小面，见下方 B0-1 段）→ **R8 收官批**（技术修复项已全清——R8-3 完成，2026-10-05：
+**B0-2a 生产可观测性优先批（2026-10-05 完成，本段）**：B 批换装后生产无 debug 落盘
+（`peer:`/`intercept: dialok`/`dns:` 判据行不可见）+ events 无轮转——本批最优先补齐：
+①**P1-1 日志体系**（commit `9edb5a7`）：共享 `logfile::RotatingWriter`（Go `internal/logfile`
+语义全量）+ events.log 2MB×3 / debug.log 8MB×2 双文件 + 统一进程/前台 serve 三级接线
+（logf=stdout+events 双写、dlogf=debug 恒落盘+verbose 回显；relay::logfile 私有轮转器收拢
+同源）；本地统一进程验收 = events.log grep 到 `serve 就绪`/token 行、debug.log grep 到
+`peer: +`/`intercept: tcp transit …（dialok）`/`dns: q=1`。②**token 兜底重试**（`4b344fa`，
+上段「已知注记」清账）：根因非 relay 注册慢——是公网端点「暂不公布」（端口改写）形态下
+`print_client_token` 整个进程生命周期从未被调；修法 = Go role.go 首轮探测信号 + 10×1s
+兜底重试（探测全关 = 15s 档），本地实证 15s 铸出「内网+中继」2 端点 token。③小件
+（`de6b2e9`）：files get/put 别名（P1-7 半边）+ 台账吊销分支告警（P1-5 收口，主行 R3-3f
+起已在位——GAP-AUDIT 登记修正）；install-tier.sh HDC_TARGET unbound 修复（tier 侧工具，
+Desktop 脚本直接修）。P1-6 export/import/reset 挂 B0-2b（与 daemon CLI 族同框，见
+GAP-AUDIT 行内理由）。发版 **v0.2.1** + 两台生产滚动升级记录 = `DEPLOY-RUST-EXIT.md` §9。
+
+**下一步（当前指针）**：**B0-2 剩余**（daemon 控制面/client 角色/CLI 族/supervisor 退避
+〔serve 面日志轮转与 events 体系已随 B0-2a 清账，daemon 侧 daemon-events/debug 仍在本批〕——
+B0-1 已清部署最小面，B0-2a 已清生产可观测性，见下方两段）→ **R8 收官批**（技术修复项已全清——R8-3 完成，2026-10-05：
 8i 出口发送整形实装 + 8j 真机矩阵复测 + 8k 尾账五项全清 + 8l 评审收口；判据链与
 消融数据 = `docs/reviews/R8.md` §十 + `docs/PERF-AB.md` §9.7-bis/§9.9）。
 R8-3 结果速记：**冷连悬崖消除**（B 冷/热 0.85 ≥ 0.70 门 + 逐秒形态证据）、**批分布
