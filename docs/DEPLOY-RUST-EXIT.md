@@ -253,3 +253,58 @@ state 留存）→ `launchctl kickstart -k` → 13:07:05：
 tunIp=100.64.210.203 / pub=14ffdc3b（与 12:45 首连完全一致——身份跨切换稳定）。
 **两台新 token 均已在手机在位**（HostStore 条目：Mac `hmw1iu50C3Ig…`〔当前〕
 + 阿里云 `hmw1ECDD6ui…`，切换经 App 主机卡「切换」即可）。
+
+## 9. B0-2a 滚动升级 v0.2.1（2026-10-05 15:15–15:24，生产可观测性批）
+
+> 发版 = tag `v0.2.1`（commit `7be330c`，Release run `37276297287` 绿；四目标产物
+> + SHA256SUMS 双端校验 OK；`--version` = `homeway-cli v0.2.1` 双端实测）。
+> 内容：P1-1 双文件日志体系 + token 兜底重试 + files get/put 契约 + 台账吊销分支
+> 告警（dsh r1 整改后，评审记录 `docs/reviews/B0-2a.md`；ci-local 两轮绿）。
+
+**Mac（launchd，15:15–15:17）**：
+
+- 备份在位：`~/bin/homeway-rs.bak-v0.2.0`（sha `edf4f739…` = v0.2.0 装机件字节）+
+  state tar `~/homeway-state-backup-pre021-20261005-151552.tar.gz`（13 条目）。
+- 换装：`~/bin/homeway-rs` = v0.2.1 darwin-arm64（sha `96b02537…`）→ `launchctl
+  kickstart -k` → running（pid 73323）。
+- **判据行落盘（本批主目标）**：`cache/debug.log` **新建并即时有内容**（`intercept:
+  过境拦截就绪`/`peer 表：设备表就绪`/`UDP 默认路径：DNS:53 可用`/60s 周期 `dns:`
+  计数行）；events.log 续写（append 语义，历史 121KB 保留）+ 首轮 token 公告带
+  「日志：…events.log（摘要）｜ …debug.log（细节）」落点行。
+- **token 兜底重试真网实证**（§5 第二条的修复）：重启后探测仍失败（端口改写
+  `暂不公布 —— STUN 观测到 114.242.60.128:24577`）→ **首轮探测结束后 2s** 兜底
+  铸出 token：`端点：192.168.3.12:41641（内网）、123.56.218.212:41741（中继）`——
+  **台账末行首次含中继端点（Relay: true）**，secret 不变（id=61f1b59e）⇒ 手机
+  在用 token 仍有效，无需重贴；要拿带中继兜底端点的新串可 `serve token` 取或
+  App 重贴（用户侧按需）。
+- **手机自动重连**（未触碰手机）：`peer: + dev=aca645d3 pub=14ffdc3b`（15:17:49，
+  devTag/身份与 12:45 首连逐字一致）+ 5min 巡检 `peer: ~ dev=aca645d3 refresh`；
+  生产 `dns: q=1 … resp=2`（15:24，CLI dnstest 经生产出口——一次性会话副作用与
+  §5 同口径，TTL/GC 自愈）。
+- 中继腿：Mac 重启后 15:16:00 `中继：注册成功`；阿里云重启窗口（15:18–15:19）
+  控制面两次退避重连后 15:19:05 `中继身份已认证（OK-MAC 通过）`——跨主机滚动
+  升级零人工干预。
+
+**阿里云（nohup 双角色，15:18–15:19）**：
+
+- 备份在位：`/usr/local/bin/homeway-rs.bak-v0.2.0`（sha `521bcb38…` = v0.2.0）+
+  `/opt/homeway/backups/data-rs-pre021-20261005-151844.tar.gz`。⚠️ 操作实录：首次
+  `cp` 撞 `Text file busy`（先 cp 后 pkill 的顺序错——进程退净后重 cp 即好，登记
+  为操作注意：**先停进程再换二进制**）。
+- 换装：sha `2ea2e025…`（static-pie）→ `pkill -x homeway-rs` → 等退净/端口释放 →
+  重跑 §2 同款 nohup 命令行（pid 1548689；UDP 41641@eth0 + 41741 同 pid）。
+- 启动形态（Go 同款两轮竞态的正确收敛）：首轮 STUN 无证据（`暂不公布`）→ 兜底
+  铸 1 端点 token → 13s 后探测成功 `已公布 [123.56.218.212:41641]` → **端点已
+  变化轮走 tokf 流：events.log 有、unified-stdout.log 无**（终端不冒第二串 token
+  的生产实证）→ 台账末行 = 2 端点（内网 + 公网）。
+- debug.log 新建（60s `dns:` 计数行）；relay.log 续写（轮转 2MB×3 到量才动）。
+
+**回退（如需，v0.2.0 件在位）**：Mac `cp ~/bin/homeway-rs.bak-v0.2.0 ~/bin/homeway-rs
+&& launchctl kickstart -k …`；阿里云 pkill 后 `cp /usr/local/bin/homeway-rs.bak-v0.2.0
+/usr/local/bin/homeway-rs` + 重跑 nohup 命令行。state 兼容（本轮无布局变更；debug.log
+对 v0.2.0 只是无人读的多余文件）。
+
+**剩余注记（登记 B0-2/B0-2b）**：stdout 重定向件（`exit.log`/`unified-stdout.log`）
+随双写无轮转——增速 = 摘要率（debug 行不进 stdout），v0.2.1 实测与 v0.2.0 同量级，
+长期靠 plist 改指向/周期归档/daemon 侧接管；matrix「非 verbose 起 grep debug.log」
+自动门与 print_client_token 锁面收窄挂 B0-2b（`docs/reviews/B0-2a.md`）。
