@@ -130,6 +130,21 @@ impl ClientStream {
         }
     }
 
+    /// 阻塞收一条下行（无预算——term CLI 长连接消费面；终结/连接断开 = None，
+    /// 终因查 [`Self::end_reason`]）。与 [`Self::recv_timeout`] 同锁同队列。
+    pub fn recv_wait(&self) -> Option<Vec<u8>> {
+        let mut q = self.recv.lock().unwrap_or_else(|e| e.into_inner());
+        loop {
+            if let Some(v) = q.items.pop_front() {
+                return Some(v);
+            }
+            if q.closed || self.end_reason().is_some() {
+                return None;
+            }
+            q = self.recv_cv.wait(q).unwrap_or_else(|e| e.into_inner());
+        }
+    }
+
     // 上行/关闭面见 ControlClient::stream_send / stream_close——流对象不持客户端
     // 引用（写出面归客户端，调用方两者都持有）。
 }
