@@ -1417,6 +1417,20 @@ mod tests {
         }
     }
 
+    /// 控制面 TCP 连接（竞态容忍）：`run` 的 on_ready 在 UDP 绑定后、TCP 监听 bind
+    /// **前**回调（Go RunWithReady 同序——语义即如此，token 须在端口确定后尽早铸出），
+    /// 测试侧拿到端口立即 connect 会撞上「监听还没 bind」的窗口（macOS CI 实测
+    /// ConnectionRefused 偶发）——短窗重试吸收，1s 仍拒即真失败。
+    fn ctl_connect(addr: SocketAddr) -> std::net::TcpStream {
+        for _ in 0..40 {
+            if let Ok(s) = std::net::TcpStream::connect(addr) {
+                return s;
+            }
+            std::thread::sleep(Duration::from_millis(25));
+        }
+        panic!("控制面 TCP 连不上（1s 重试后仍拒绝）：{addr}");
+    }
+
     /// 后端注册腿全流程（开放模式）：Hello → Challenge → Proof → OK + 注册成功行为。
     #[test]
     fn udp_registration_open_mode() {
@@ -1581,7 +1595,7 @@ mod tests {
         let pub_ = PublicKey::from(&priv_);
         let label = relay_id(pub_.as_bytes());
 
-        let mut ctl = std::net::TcpStream::connect(relay_addr).unwrap();
+        let mut ctl = ctl_connect(relay_addr);
         ctl.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         ctl.set_write_timeout(Some(Duration::from_secs(5))).unwrap();
         // HELLO/CHALLENGE/PROOF/OK（token 模式）
@@ -1653,7 +1667,7 @@ mod tests {
         let priv_ = rand_secret();
         let pub_ = PublicKey::from(&priv_);
 
-        let mut ctl = std::net::TcpStream::connect(relay_addr).unwrap();
+        let mut ctl = ctl_connect(relay_addr);
         ctl.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let _ = ctl.set_write_timeout(Some(Duration::from_secs(5)));
         use std::io::{Read as _, Write as _};

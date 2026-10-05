@@ -1269,10 +1269,13 @@ mod tests {
     #[test]
     fn send_stats_mirror_all_local_fail() {
         let (logf, _rx) = log_sink();
-        // 必然本地错误的候选（0.0.0.0 = 无路由——darwin/linux/ohos 一致；TEST-NET-1
-        // 在 darwin 上 sendto 会先成功、ICMP 异步回，不能当本地错）
+        // 必然本地错误的候选：受限广播地址 + 无 SO_BROADCAST ⇒ sendto 同步被拒
+        // （实测 darwin=EADDRNOTAVAIL(49)、linux=EACCES(13)，都是本地错误面）。
+        // 0.0.0.0 **不可用**：linux 把目的 0.0.0.0 当本地回环送出、sendto 会成功
+        // （转正 A 批 ubuntu CI 实测抓出；darwin 面原注释「一致」不实）；TEST-NET-1
+        // 在 darwin 上 sendto 会先成功、ICMP 异步回，也不能当本地错。
         let cands = [Candidate {
-            addr: "0.0.0.0:9".parse().unwrap(),
+            addr: "255.255.255.255:9".parse().unwrap(),
             relay: false,
         }];
         let mut b = bind(&cands, Some(reg_ctx()), &logf);

@@ -1321,6 +1321,12 @@ mod tests {
     }
 
     /// 6c 判据：键编码 387 案逐字节对拍（喂 SessionVt 模式序列 → encode_key）。
+    /// **仅 darwin 面**：编码器按宿主平台走 ghostty 编译期分支（D-10，IS_DARWIN——
+    /// alt 是否阻文本等 8 案随平台分叉），向量是 macOS 基线上生成的 darwin 形态；
+    /// linux 面跑 darwin 向量必然差这 8 案（转正 A 批 ubuntu CI 实测抓出）。
+    /// 非 darwin 面的编码行为由本文件 IS_DARWIN 分支单测（mok2_modifier_matrix_codes
+    /// 等）钉住——两平台各自对齐 ghostty 语义，不互相对拍。
+    #[cfg(target_os = "macos")]
     #[test]
     fn keyenc_parity_with_go_vectors() {
         use crate::term::vt::SessionVt;

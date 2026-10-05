@@ -36,6 +36,10 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: Swatinem/rust-cache@v2
+      # rust-toolchain.toml 钉 1.99.0——runner 首次自动安装该工具链时不带 clippy
+      # 组件（首跑实测 'cargo-clippy' is not installed），显式补装（跟随仓内
+      # toolchain 文件的激活目标）。
+      - run: rustup component add clippy
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings
 
   cross-check:
