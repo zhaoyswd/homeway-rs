@@ -97,8 +97,11 @@ e17b0576460f-rust）→ assembleHsp×2 + assembleHap → 覆盖装（三包）�
 （数据面已接管 fd=90，L3 直通）` + `link: via=direct ep=192.168.3.12:41641 rtt=7ms` + RREG
 dev=aca645d3 身份复用 + files 桥第 1 击成功 + term surface 快照渲染（vendor 解码 ↔ 本仓编码器）
 + 浏览器经隧道 stats 双向增长（fdRead 3794→66026B/fdWrite 10376→130705B）+ tier 四门禁
-0 红。tier 侧 4 commit（656d092/a9b5829/eb196ab/77343f1，**未 push**——tier 双推配置的一次性
-授权原则）；本仓侧 = 本提交（AGENTS 速查补 tier pin 前进指引 + 本段）。已知注记：token 缺
+0 红。tier 侧 5 commit（656d092/a9b5829/eb196ab/77343f1/e7d5d68，**未 push**——tier 双推配置的一次性
+授权原则）；本仓侧 = 本提交（AGENTS 速查补 tier pin 前进指引 + 本段）。**pin 门后置修正（e7d5d68）**：
+严格相等门会被本仓 docs-only 推送假红（e17b057→d68eb1b 即触发），改**祖先语义**（后代放行 +
+提示、回退/分叉硬失败）并前进 pin 至 d68eb1b（核代码逐字节同源），产物/装机/真机判据链复跑绿
+（ver=d68eb1b3d986-rust + attached fd=90 + via=direct rtt=4ms + 身份复用 dev=aca645d3）。已知注记：token 缺
 中继端点缺口（DEPLOY-RUST-EXIT §5，修法 = relay 注册完成后重铸或延迟铸——归后续批）。
 
 **下一步（当前指针）**：**B0-2**（GAP-AUDIT P0-1 剩余：daemon 控制面/client 角色/CLI 族/supervisor 退避/events 轮转——B0-1 已清部署最小面，见下方 B0-1 段）→ **R8 收官批**（技术修复项已全清——R8-3 完成，2026-10-05：
