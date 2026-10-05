@@ -1814,14 +1814,21 @@ mod tests {
             tunnel,
             SmolInstant::from_millis(0),
         );
-        // 隧道 IP 上无服务的端口（豁免 upstream 127.0.0.1:1——无人听）
+        // 隧道 IP 上无服务的端口：豁免 upstream = 127.0.0.1:<临时死端口>（绑一个
+        // listener 取号再立刻关掉——无人听且不碰特权端口）。**别用 :1**：部分
+        // ubuntu CI 沙箱对特权端口的出站策略是 DROP 而非 RST（连接悬死，RST 判据
+        // 永远等不到——dd99ae0/7be330c/2f56af2 三轮红 + 同树 rerun 仍红、macos 恒绿、
+        // 预算 15s 也不救 ⇒ 非时序面而是投递策略面）；临时端口在回环面上恒
+        // ECONNREFUSED，跨平台/跨沙箱稳定。
+        let dead_port = {
+            let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+            let p = l.local_addr().unwrap().port();
+            drop(l);
+            p
+        };
         let h: SocketHandle = client
-            .connect(std::net::SocketAddrV4::new(tunnel, 1))
+            .connect(std::net::SocketAddrV4::new(tunnel, dead_port))
             .unwrap();
-        // 15s 预算（0a92758 家族第二例：连续两轮 ubuntu CI 假红——dd99ae0〔docs-only
-        // 提交〕与 7be330c 同测试同平台失败，macos/本地多轮绿 ⇒ 共享 runner 饿死
-        // 拦截层工作线程的时序面；2ms yield 已在，5s 墙钟不够满载 runner 用——只加
-        // 预算不动断言）
         let deadline = Instant::now() + Duration::from_secs(15);
         let mut refused = false;
         let mut was_syn_sent = false;
@@ -1839,7 +1846,7 @@ mod tests {
             std::thread::sleep(Duration::from_millis(2));
             // 拒绝忙转：共享 runner 满载时饿死拦截层工作线程（ubuntu CI 偶发 RST/建连超时——2ms 让出）
         }
-        assert!(refused, "拨号失败应回 RST（PathProbe :1 同款语义）");
+        assert!(refused, "拨号失败应回 RST（死端口拨号同款语义）");
         assert!(stats.snapshot()[1].1 >= 1, "dialfail 应计数");
     }
 

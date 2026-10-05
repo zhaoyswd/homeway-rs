@@ -842,6 +842,12 @@ R7 8–12+真机；R8 2–3。全量 47–72。Rust 新增代码估 38–42k 行
    RST，同代码树 b1f1410 绿/1782e2f 红后 rerun 绿——runner 负载下 RST 时窗漂移）
    各红过一轮；处置口径 = 同树复跑确认为 flake 后放行 + 登记，不因此改产品码。
    与 0a92758「deadline 循环补 2ms yield（共享 runner 忙转饿死）」同族。
+   **演进（B0-2a 批收尾，同日午后）**：`dial_failed_gets_rst` 在 ubuntu 连三轮红
+   （dd99ae0/7be330c/2f56af2）且同树 rerun 仍红——预算 5s→15s 不救、macos 恒绿，
+   判定不再是时序面而是**投递策略面**：部分 ubuntu 沙箱对特权端口（测试原用
+   豁免 upstream 127.0.0.1:1）出站 DROP 而非 RST，连接悬死判据永不到。修法 =
+   测试改用「绑 listener 取号再关」的临时死端口（回环面恒 ECONNREFUSED，跨平台
+   跨沙箱稳定）——测试码可改、产品码不动（PathProbe 产品面仍用 :1，不受影响）。
 2. **SO_BINDTODEVICE 无特权语义（b1f1410 修）**：linux 钉卡按名、index 不参与；
    **已钉过的 socket 重复设置在无特权下恒 EPERM**（内核只放行首次绑定；容器
    实测 fresh=OK / re-set-same=EPERM / 坏名=ENODEV）——涉钉卡的测试负例必须
