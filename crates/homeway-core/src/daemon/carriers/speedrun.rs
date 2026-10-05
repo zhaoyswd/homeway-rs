@@ -442,9 +442,19 @@ mod tests {
         // busy：单飞（同主机立即再 start = busy）。
         let ack2 = m.start(&hex_host(1), SpeedtestParams::from_ms(50, 50, 10, 1, 0));
         assert_eq!(ack2.phase, "busy");
-        // waiting 相位可见 + wait_remain_ms 递减面。
-        let st = m.status(&hex_host(1)).expect("run 在册");
-        assert!(st.waiting);
+        // waiting 相位可见 + wait_remain_ms 递减面（retry 拍间隙 waiting 短暂为假——
+        // eventually 等进 waiting 窗，免拍_race）。
+        let mut got = None;
+        eventually(Duration::from_millis(600), "waiting 相位", || {
+            match m.status(&hex_host(1)) {
+                Some(st) if st.waiting => {
+                    got = Some(st);
+                    true
+                }
+                _ => false,
+            }
+        });
+        let st = got.expect("run 在册");
         assert!(st.wait_remain_ms > 0);
         // 到点（900ms wait + 引擎拨号 10s 预算兜底——FakeDial 立即失败，实际由
         // RETRY_INTERVAL 节拍收场）：终态 link_down。

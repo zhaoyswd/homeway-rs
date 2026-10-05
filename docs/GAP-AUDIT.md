@@ -50,10 +50,18 @@
 > 接管 replaced/分离键；顺带修 blocking_push 漏 notify 的 P0 级 bug——recv_wait 消费面 15s 黑洞）
 > ③serve.status peers/intercept 观测缝（EngineCmd::StatusQuery + 原子直读）④status --watch（**P2-5 清**）
 > ⑤export/import/reset（**P1-6 清**——自管 ustar，Go↔Rust 工件双向互通实测）⑥低-6/S1 小项清。
-> 记录 = docs/reviews/B0-2b.md §七–§十二。**P0-1 余量（转 D 批，接棒指针在 ROADMAP「下一步」）**：
-> 承载面 9 op（forward/socks/speedtest 托管——socks 无 Rust 服务端、forward 需持久化+端口唯一+级联
-> 整块、speedtest 需 runner 状态机；逐 op 理由 B0-2b.md §十）+ files CLI `--host` 远程模式（term 同底座
-> 可复用）+ dialControlSpawn 按需拉起形态。
+> 记录 = docs/reviews/B0-2b.md §七–§十二。
+>
+> **2026-10-05 D-1 处置（承载面清零——P0-1 余量全清，GAP-AUDIT P0 全清）**：承载面 9 op
+> 实装（forward：forwards.json 持久化 + 127.0.0.1 监听 + 半关闭透传 + RST 收口 + 端口全局唯一 +
+> FIX-05 级联；socks：**SOCKS5 子集服务端从零建**〔no-auth/CONNECT/IPv4+域名、多 A 按序回退 +
+> per-candidate 份额预算、off 端口记忆 + RST 在世连接〕+ DNS-over-TCP 解析腿〔A 查询 + NXDOMAIN/
+> NoA 哨兵 + 期限壳〕；speedtest：per-host 单飞 runner 状态机〔waiting/busy 相位、link_down 在
+> waitMs 预算内重试、refused→not_supported、取消合成 cancelled〕）+ files CLI `--host` 远程模式
+> （Stream 承载枚举化，零 wire 改动）+ dialControlSpawn 按需拉起（锁试探/KeepAlive 等待/setsid
+> 自 exec/spawn.log；纯读与直改族不拉起）。判据 = INTEROP-CRITERIA「承载面族实采」CA1-CA12 +
+> carriers 单测 19 例；dsh 评审高 2 + 中 8 全处置（修 7 登 1，处置表 B0-2b.md §十七）。
+> **P0-1 至此全清**（部署最小面 B0-1 + daemon 面 B0-2b×2 + 承载面 D-1）。
 >
 > **2026-10-05 B0-2a 生产可观测性批处置**：P1-1 已修清（双文件轮转 + 三级接线，判据行落盘
 > 本地验收 + 两台滚动升级）；P1-5 登记修正后收口（主检测/停打/提示行 R3-3f 起已在位——审计时
@@ -66,7 +74,7 @@
 
 | # | 能力 | Go 侧位置 | Rust 现状 | 影响 | 归属 | 量 |
 |---|---|---|---|---|---|---|
-| P0-1 | **daemon/统一进程整块**——**部署最小面 ✅ 已完成（B0-1，2026-10-05）**：零参统一进程（config 期望态装配 serve/relay、单实例锁 `<state>/lock` 全形态共用、三层布局 + config 原子生成、events 最小集、SIGTERM/SIGINT 按序收尾；client/control 留桩如实标注）；两生产形态真跑验收 + 手机式客户端数据面通（INTEROP-CRITERIA「B0-1 统一进程两生产形态验收」节）。**剩余面归 B0-2**：control.sock 控制面（帧复用/hello/req/evt/stream.open）、client 角色（hosts.json/多主机会话）、CLI 消费面（host/forward/socks/status --watch/term --host/files --host/serve start-stop-restart）、~~events 完整轮转体系~~（**serve 面 ✅ B0-2a**：events 2MB×3 + debug 8MB×2；daemon 侧 daemon-events/daemon-debug 仍归 B0-2）、**角色装配失败的 supervisor 退避重建**（r1-M4：现 Rust exit(1)——launchd KeepAlive 能拉回，nohup 形态直接退出）、前台 serve/relay 的 OpenNodeState 三步序与默认 --state 对齐（r1-N1/L7：前台默认 --state=. 与统一进程 ~/.config/homeway 不一致 ⇒ 默认取值下「全形态共用锁」不成立） | `internal/daemon/` + `internal/control/` + `clientcore/facade/` | 部署最小面在（`homeway-cli` 零参 + `nodestate.rs` + `unified_cli.rs`）；daemon 面 B0-2 | Rust 版**可以两种生产形态部署**（B 批解锁）；CLI 运维面仍缺 | **B0-2**（daemon 面） | L（剩余） |
+| P0-1 | **daemon/统一进程整块——✅ 全清（B0-1 + B0-2b×2 + D-1〔承载面 9 op + files --host + dialControlSpawn〕，2026-10-05）**；原部署最小面（B0-1）：零参统一进程（config 期望态装配 serve/relay、单实例锁 `<state>/lock` 全形态共用、三层布局 + config 原子生成、events 最小集、SIGTERM/SIGINT 按序收尾；client/control 留桩如实标注）；两生产形态真跑验收 + 手机式客户端数据面通（INTEROP-CRITERIA「B0-1 统一进程两生产形态验收」节）。**剩余面归 B0-2**：control.sock 控制面（帧复用/hello/req/evt/stream.open）、client 角色（hosts.json/多主机会话）、CLI 消费面（host/forward/socks/status --watch/term --host/files --host/serve start-stop-restart）、~~events 完整轮转体系~~（**serve 面 ✅ B0-2a**：events 2MB×3 + debug 8MB×2；daemon 侧 daemon-events/daemon-debug 仍归 B0-2）、**角色装配失败的 supervisor 退避重建**（r1-M4：现 Rust exit(1)——launchd KeepAlive 能拉回，nohup 形态直接退出）、前台 serve/relay 的 OpenNodeState 三步序与默认 --state 对齐（r1-N1/L7：前台默认 --state=. 与统一进程 ~/.config/homeway 不一致 ⇒ 默认取值下「全形态共用锁」不成立） | `internal/daemon/` + `internal/control/` + `clientcore/facade/` | 部署最小面在（`homeway-cli` 零参 + `nodestate.rs` + `unified_cli.rs`）；daemon 面 B0-2 | 已对齐（承载面 9 op + files --host + 拉起形态 = D-1 清） | **已清**（B0-1 + B0-2b×2 + D-1） | — |
 | P0-2 | ~~v6 双栈钉卡半边~~ **✅ 已修（B0-1，2026-10-05）**：`pin_socket_to_iface` 两族都设 + 各自单栈容错（两族都失败才报错、文案 Go 同串）——`egress.rs`；配套单测钉 v4/v6/双栈三类真 socket + 非法 index 错误面 | `pkg/ifaceutil/ifacebind_darwin.go:31-36` | 已对齐 | — | 已清 | S |
 | P0-3 | ~~v6 STUN 观测与 v6 公网端点公布族~~ **✅ 已修（B0-1，2026-10-05）**：`--stun6`/config 接线（默认 cloudflare 对齐 Go）；**出口主 socket 双栈化**（[::] V6ONLY=0，v4 回退；IP 字面量单栈 udp4/udp6 **且按地址所属网卡附带钉卡**——Go IfaceForAddr 分支，r1-M3 整改）+ recv unmap + 发送族 map；v6 同 socket 观测（8s 预算）+ 三形态判据行 + `[v6]:port` 条目 + token 携带；客户端 wtransport socket 同步双栈（真机 v6 直连前提）。真网全链实采见 INTEROP-CRITERIA「B0-1 手机 v6 直连真机实采」节 | `internal/server/publicendpoint.go` + `pkg/egress/stun.go` | 已对齐 | — | 已清 | M |
 | P0-4 | **DDNS 双半边**：server 侧 `serve ddns add/delete/list` 命令面 + `[[serve.ddns]]` 写 config + token 叠加域名条目 + 域名自检（随公网端点探测同拍）；client 侧 token 端点含域名时的解析/重解析进候选（「token 端点 %q 域名解析失败（跳过）」「域名重解析：%d 条候选已刷新」「域名重解析晚于赛跑结算→节流软赛跑补投」族） | `internal/server/ddnscheck.go`/`ddnsresolve.go`/`servegroup_cli.go`（ddns）+ `clientcore/hostsession/session_endpoints.go`（域名解析编排） | **两侧都没有**。config `ddns` 键仅「接受不拒绝」（M17 兼容），flag `--ddns` 不存在；Rust token 端点仅收 `ip:port` 字面量，无 `to_socket_addrs` 域名解析面 | 家里宽带动态 IP 用户（DDNS 域名进 token）整个能力不可用；出口换 Rust 后 DDNS 主机连不上 | B0 或 C 批（视 B 批范围；与 P0-3 同属「端点公布/解析」族可同批） | M |

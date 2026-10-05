@@ -158,12 +158,34 @@ export/import/reset（P1-6 清：自管 ustar 最小读写无新依赖，**Go↔
 forward 需持久化+端口唯一+级联整块 / speedtest 需 runner 状态机）、files CLI
 --host（term 底座可复用）、matrix debug.log 硬门、低-7/低-8/N3、dialControlSpawn。
 
-**下一步（当前指针）：D 批（B0-2b 余量——接棒指针：①承载面先 speedtest〔引擎在、
-依赖最少〕再 forward〔manager+持久化+全局端口唯一+级联〕后 socks〔需建 SOCKS5
-服务端〕，语义真源 baseline clientcore/facade/carriers.go + internal/daemon/
-{forward,socks,speedtest}_cli.go；②files CLI --host 复用 term_cli.rs 的
-TermConn/resolve_host_pub 底座（先查 files 参数面的带值 flag 同款问题）；
-③matrix.sh 各链路收工段加 debug.log grep 硬门后整矩阵复跑）→**
+**D-1 承载面清零（2026-10-05 完成，本段；GAP-AUDIT P0-1 最后余量 → P0 全清）**：
+按三步序一棒完成——①speedtest runner 状态机（per-host 单飞：start 立即 waiting/busy
+相位、link_down 在 waitMs 预算内 250ms 重试、refused→not_supported 立即终态、取消合成
+cancelled 终态、run 线程 panic 收位）②forward 管理器（forwards.json 持久化原子读写 +
+按表重建监听 + 端口全局唯一〔跨 socks〕+ FIX-05 级联〔add_mu 单向锁序〕+ 每监听并发上限
++ 在世连接不强关/拨失败 RST 收口/半关闭透传）③socks 承载面（**SOCKS5 子集服务端从零
+实装**——B0-2b §十的最大缺口：no-auth/CONNECT/IPv4+域名、多 A 按序回退 + per-candidate
+份额预算、close 同步释放监听 + RST 在世连接、accept 失败 dead 位落状态；socks.json 记忆
++ FIX-38 先算后写；DNS-over-TCP 解析腿 dnsq〔A 查询构造/NXDOMAIN-NoA 哨兵/压缩指针/
+带缓冲拼装读 + 期限壳——实测抓出 2B 前缀越界丢字节的帧错位死等〕）。**附带**：files
+CLI `--host`（files.rs Stream 承载枚举化——本地 Session 拨号/远程控制面透传腿，六动词
+零 wire 改动）+ dialControlSpawn 按需拉起（锁试探只读 flock/启动窗口有界等/launchd
+KeepAlive 4s/setsid 自 exec + spawn.log；**纯读与直改族不拉起**——status 降级、serve|relay
+status 降级读 config、stop 直改 config）+ 顺手批全清（r2-B 出队 notify/r2-17 Remote 帧抽取
+去重与 *_pub 壳收敛/r2-11 动态 start-restart 失败 spawn bootstrap/低-7 print_client_token
+锁面收窄/低-8 SIGPIPE〔裸写三点补 MSG_NOSIGNAL〕/N3 relay ulogf 不经 events tee/matrix
+DBG-log 硬门）。CLI 族：forward add/list/delete、socks on/off/status、speedtest 守护托管形
+（--token 直连旧形态保留——matrix/perf 脚本契约；全主机轮转/双口径输出/--json/busy/
+Ctrl-C 先 cancel 再退）。判据 = INTEROP-CRITERIA「承载面族实采」CA1-CA12（forward 往返 +
+出口 dialok 行/重启重建/负例族、socks IPv4+域名过隧道 + 记忆沿用、speedtest 数字/busy/
+取消、files --host sha256 对账、拉起三态、no_host 族）+ carriers 单测 19 例。dsh 评审一轮
+（三层评审链）：高 2 + 中 8（修 7 登 1）+ 评审主动修正 3 + 低危修 9 登 8——处置表 =
+docs/reviews/B0-2b.md §十四–§十七。4 commit（4435de6/a35b67d/48940e2/73daa37）。
+
+**下一步（当前指针）：~~D 批（B0-2b 余量）~~ **D-1 完成（2026-10-05，见上段）**；余量归
+D-2（登记项：files 问候帧看门〔本地+远程一次收〕、9 op 协议层 server 级用例、lock_held_probe
+与 nodestate 收敛、carriers 字符串错误面收敘认领、低-1 线程 expect 僵尸面、低-7 余项——
+清单 = B0-2b.md §十七登记段）→**
 R8 收官批（技术修复项已全清——R8-3 完成，2026-10-05：→ **R8 收官批**（技术修复项已全清——R8-3 完成，2026-10-05：
 8i 出口发送整形实装 + 8j 真机矩阵复测 + 8k 尾账五项全清 + 8l 评审收口；判据链与
 消融数据 = `docs/reviews/R8.md` §十 + `docs/PERF-AB.md` §9.7-bis/§9.9）。

@@ -1,20 +1,21 @@
-# 互操作矩阵最近一次运行（生成：2026-10-05 20:17:02；工具 tools/matrix.sh）
+# 互操作矩阵最近一次运行（生成：2026-10-06 01:34:32；工具 tools/matrix.sh）
 
 | 链路 | 判据 | 结果 | 摘录/耗时 | 备注 |
 |---|---|---|---|---|
-| RRR | R-ready | PASS | /tmp/homeway-rs-matrix/RRR/relay/cache/relay.log:2026-10-05 20:11:27.572 [relay] 中继控制面：TCP 0.0.0.0:4 |  |
-| RRR | E1 | PASS | 2026-10-05 20:11:28.353 [homeway] serve 就绪：wg=:42667（配置端口；被占用会自动退让）tunnel=100.64.255.1 files=7802 te |  |
-| RRR | X1-reg | PASS | 2026-10-05 20:11:28.354 [homeway] 中继：注册成功（腿 42667 → 127.0.0.1:42757）—— 客户端可经它到达本机 |  |
-| RRR | R3-backend | PASS | 2026-10-05 20:11:28.354 [relay] 中继：后端 c67918d268a9cb13 注册成功（腿 127.0.0.1:42667） |  |
+| RRR | R-ready | PASS | /tmp/homeway-rs-matrix/RRR/relay/cache/relay.log:2026-10-06 01:28:57.602 [relay] 中继控制面：TCP 0.0.0.0:4 |  |
+| RRR | E1 | PASS | 2026-10-06 01:28:58.142 [homeway] serve 就绪：wg=:42667（配置端口；被占用会自动退让）tunnel=100.64.255.1 files=7802 te |  |
+| RRR | X1-reg | PASS | 2026-10-06 01:28:58.145 [homeway] 中继：注册成功（腿 42667 → 127.0.0.1:42757）—— 客户端可经它到达本机 |  |
+| RRR | R3-backend | PASS | 2026-10-06 01:28:58.146 [relay] 中继：后端 b169a88957c8e66b 注册成功（腿 127.0.0.1:42667） |  |
 | RRR | C-ready | PASS | warmup pong: 就绪（判据=wg） |  |
 | RRR | C-via-direct | PASS | 服务会话: 路径确立：直连 192.168.3.12:42667（首个回包来源） |  |
-| RRR | E7 | PASS | 2026-10-05 20:11:29.898 [homeway] peer: + dev=3dd3c05d pub=79cc8f61 ip=100.64.204.79 n=1/32 |  |
-| RRR | E13-speedtest | PASS | speedtest: 摘要 down=197Mbps up=357Mbps； | （复核第 0 轮命中） |
-| RRR | F-100MB | PASS | sha256 双侧一致（0d58adf8c98dfb05…） |  |
-| RRR | E10 | PASS | 2026-10-05 20:15:57.220 [homeway] intercept: tcp transit 192.168.3.12:42807 ← 100.64.204.79:39177（di |  |
-| RRR | E11 | PASS | 2026-10-05 20:15:57.227 [homeway] intercept: tcp transit 192.168.3.12:42807 ← 100.64.204.79:39177 关闭 |  |
+| RRR | E7 | PASS | 2026-10-06 01:28:59.684 [homeway] peer: + dev=5593e34e pub=a29b4e7e ip=100.64.48.137 n=1/32 |  |
+| RRR | E13-speedtest | PASS | speedtest: 摘要 down=188Mbps up=355Mbps； | （复核第 0 轮命中） |
+| RRR | F-100MB | PASS | sha256 双侧一致（5f2eaa0bb0ca2a90…） |  |
+| RRR | E10 | PASS | 2026-10-06 01:33:26.939 [homeway] intercept: tcp transit 192.168.3.12:42807 ← 100.64.48.137:46832（di |  |
+| RRR | E11 | PASS | 2026-10-06 01:33:26.946 [homeway] intercept: tcp transit 192.168.3.12:42807 ← 100.64.48.137:46832 关闭 |  |
 | RRR | FB-files | PASS | list 1 行（并发闸不误伤；满员拒绝面见单测） |  |
 | RRR | DNS | PASS | dnstest[leg] example.com: rcode=0 answers=1 bytes=56 |  |
-| RRR | TOTAL | PASS | 331s |  |
+| RRR | DBG-log | PASS | 2026-10-06 01:28:59.684 [homeway] peer: + dev=5593e34e pub=a29b4e7e ip=100.64.48.137 n=1/3 |  |
+| RRR | TOTAL | PASS | 330s |  |
 
 **结论：全绿**（豁免：WARN 0 / SKIP 0——各降档的独立证据绑定见备注列）
