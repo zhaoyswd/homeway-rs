@@ -1765,6 +1765,8 @@ mod tests {
                 established = true;
                 break;
             }
+            std::thread::sleep(Duration::from_millis(2));
+            // 拒绝忙转：共享 runner 满载时饿死拦截层工作线程（ubuntu CI 偶发 RST/建连超时——2ms 让出）
         }
         assert!(
             established,
@@ -1793,6 +1795,8 @@ mod tests {
                 got.extend_from_slice(&buf[..n]);
                 break;
             }
+            std::thread::sleep(Duration::from_millis(2));
+            // 拒绝忙转：共享 runner 满载时饿死拦截层工作线程（ubuntu CI 偶发 RST/建连超时——2ms 让出）
         }
         assert_eq!(got, b"hello-exempt", "echo 数据应经豁免流往返");
         drop(echo_thread); // 不 join：echo 在 read 阻塞直到对端断连（测试进程退出即终结）
@@ -1828,6 +1832,8 @@ mod tests {
                 refused = true;
                 break;
             }
+            std::thread::sleep(Duration::from_millis(2));
+            // 拒绝忙转：共享 runner 满载时饿死拦截层工作线程（ubuntu CI 偶发 RST/建连超时——2ms 让出）
         }
         assert!(refused, "拨号失败应回 RST（PathProbe :1 同款语义）");
         assert!(stats.snapshot()[1].1 >= 1, "dialfail 应计数");
@@ -2056,6 +2062,8 @@ mod tests {
                 established = true;
                 break;
             }
+            std::thread::sleep(Duration::from_millis(2));
+            // 拒绝忙转：共享 runner 满载时饿死拦截层工作线程（ubuntu CI 偶发 RST/建连超时——2ms 让出）
         }
         assert!(
             established,
@@ -2109,6 +2117,8 @@ mod tests {
                     }
                 }
             }
+            std::thread::sleep(Duration::from_millis(2));
+            // 拒绝忙转：共享 runner 满载时饿死拦截层工作线程（ubuntu CI 偶发 RST/建连超时——2ms 让出）
         }
         assert!(got.len() >= 15, "应答帧应到达（得 {got:?}）");
         let mlen = u16::from_be_bytes([got[0], got[1]]) as usize;
