@@ -117,7 +117,12 @@ dev=aca645d3 身份复用 + files 桥第 1 击成功 + term surface 快照渲染
 （`de6b2e9`）：files get/put 别名（P1-7 半边）+ 台账吊销分支告警（P1-5 收口，主行 R3-3f
 起已在位——GAP-AUDIT 登记修正）；install-tier.sh HDC_TARGET unbound 修复（tier 侧工具，
 Desktop 脚本直接修）。P1-6 export/import/reset 挂 B0-2b（与 daemon CLI 族同框，见
-GAP-AUDIT 行内理由）。发版 **v0.2.1** + 两台生产滚动升级记录 = `DEPLOY-RUST-EXIT.md` §9。
+GAP-AUDIT 行内理由）。发版 **v0.2.1**（tag = `7be330c`，Release run 绿）+ 两台生产滚动
+升级全记录 = `docs/DEPLOY-RUST-EXIT.md` §9（Mac 兜底 2s 铸出内网+中继 token〔台账末行
+首次含中继端点〕+ 手机自动重连 peer: + dev=aca645d3 + debug.log 判据行落盘；阿里云
+端点变化轮走 tokf 流〔events 有/stdout 无〕）。收尾批件：dsh r1 评审全处置表
+（`docs/reviews/B0-2a.md`）+ CI 假红双修（`dial_failed_gets_rst` 预算 15s → 改临时死
+端口——ubuntu 沙箱对特权端口 DROP 投递，附录 D 条目 1 演进）。
 
 **下一步（当前指针）**：**B0-2 剩余**（daemon 控制面/client 角色/CLI 族/supervisor 退避
 〔serve 面日志轮转与 events 体系已随 B0-2a 清账，daemon 侧 daemon-events/debug 仍在本批〕——
