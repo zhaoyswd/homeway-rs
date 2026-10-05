@@ -1818,7 +1818,11 @@ mod tests {
         let h: SocketHandle = client
             .connect(std::net::SocketAddrV4::new(tunnel, 1))
             .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
+        // 15s 预算（0a92758 家族第二例：连续两轮 ubuntu CI 假红——dd99ae0〔docs-only
+        // 提交〕与 7be330c 同测试同平台失败，macos/本地多轮绿 ⇒ 共享 runner 饿死
+        // 拦截层工作线程的时序面；2ms yield 已在，5s 墙钟不够满载 runner 用——只加
+        // 预算不动断言）
+        let deadline = Instant::now() + Duration::from_secs(15);
         let mut refused = false;
         let mut was_syn_sent = false;
         while Instant::now() < deadline {
