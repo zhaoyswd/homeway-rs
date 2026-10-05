@@ -132,13 +132,19 @@ impl SocksServer {
                         id
                     };
                     let srv = Arc::clone(self);
-                    std::thread::Builder::new()
+                    // 低-1（D-2 收敛）：per-conn 线程创建失败（EMFILE/ENOMEM 级资源
+                    // 耗尽）= 摘连接继续服务，不带走进程（原 expect 形态的全仓既有
+                    // 面逐批收敛——本处是外部可触发面）。
+                    if std::thread::Builder::new()
                         .name("hw-socks-conn".to_owned())
                         .stack_size(512 * 1024)
                         .spawn(move || {
                             srv.serve_conn_by(id);
                         })
-                        .expect("线程创建不可失败");
+                        .is_err()
+                    {
+                        self.drop_conn_by(id);
+                    }
                 }
                 PollAccept::Idle => {} // 节拍在 PollListener::accept 的 WouldBlock 分支内（高-1）
                 PollAccept::Closed => return Ok(()),
@@ -160,6 +166,18 @@ impl SocksServer {
             rst_close_tcp(&s);
             let _ = s.shutdown(std::net::Shutdown::Both);
         }
+    }
+
+    /// 摘连接（spawn 失败路径共用 serve_conn_by 的收尾语义）。
+    fn drop_conn_by(self: &Arc<Self>, id: u64) {
+        (self.cfg.logf)("socks: 连接线程创建失败（资源耗尽？）——关闭该连接继续服务");
+        let _ = self
+            .conns
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1
+            .remove(&id)
+            .map(|s| s.shutdown(std::net::Shutdown::Both));
     }
 
     fn serve_conn_by(self: Arc<Self>, id: u64) {

@@ -359,11 +359,16 @@ fn accept_loop(e: Arc<FwdEntry>, port_for_log: u16) {
                 }
                 e.conns.fetch_add(1, Ordering::Relaxed);
                 let entry = Arc::clone(&e);
-                std::thread::Builder::new()
+                // 低-1（D-2 收敛）：per-conn 线程创建失败 = RST 关该连接继续服务
+                //（资源耗尽不该带走监听线程/进程）。
+                if std::thread::Builder::new()
                     .name("hw-fwd-conn".to_owned())
                     .stack_size(512 * 1024)
                     .spawn(move || serve_conn(entry, conn))
-                    .expect("线程创建不可失败");
+                    .is_err()
+                {
+                    e.conns.fetch_sub(1, Ordering::Relaxed);
+                }
             }
             PollAccept::Idle => {}
             PollAccept::Closed => return, // delete/级联/收工——正常收口

@@ -188,6 +188,11 @@ struct MockBackend {
     echo: Mutex<Option<Arc<EchoConn>>>,
     slow_add: Duration,
     not_ready: AtomicBool,
+    /// 承载面内存版（低-11：9 op 的 server 级用例——内存语义足以钉 wire 面：
+    /// op 名/载荷字段/错误码映射；真语义面归 carriers 单测 + CA 实采）。
+    forwards: Mutex<Vec<super::ForwardRule>>,
+    socks_mem: Mutex<Vec<(String, bool, u16)>>, // (host, on, port)
+    speed_mem: Mutex<std::collections::HashMap<String, bool>>, // host -> running
 }
 
 impl MockBackend {
@@ -197,7 +202,14 @@ impl MockBackend {
             echo: Mutex::new(None),
             slow_add: Duration::ZERO,
             not_ready: AtomicBool::new(false),
+            forwards: Mutex::new(Vec::new()),
+            socks_mem: Mutex::new(Vec::new()),
+            speed_mem: Mutex::new(std::collections::HashMap::new()),
         })
+    }
+
+    fn host_exists(&self, host_hex: &str) -> bool {
+        self.hosts.lock().unwrap().iter().any(|r| r.id == host_hex)
     }
 }
 
@@ -288,8 +300,140 @@ impl Backend for MockBackend {
         Err(BackendErr::RoleStopped)
     }
 
-    // 承载面 9 方法：走 trait 缺省（未装配）——协议面测试只验 wire 行为，语义面归
-    // carriers 单测。
+    // 承载面 9 方法（低-11：内存版实装——端口全局唯一 / no_host / 幂等 off /
+    // speedtest busy 相位的最小语义）。
+
+    fn forward_add(&self, rule: super::ForwardRule) -> Result<super::carriers::forward::ForwardState, BackendErr> {
+        if !self.host_exists(&rule.host) {
+            return Err(BackendErr::NoHost);
+        }
+        let mut fs = self.forwards.lock().unwrap();
+        if fs.iter().any(|r| r.listen == rule.listen) {
+            return Err(BackendErr::Other(format!("本地端口 {} 已被其他转发或 socks 占用", rule.listen)));
+        }
+        fs.push(rule.clone());
+        Ok(super::carriers::forward::ForwardState {
+            state: "listening".to_owned(),
+            err: String::new(),
+            conns: 0,
+            rejected: 0,
+            rule,
+        })
+    }
+
+    fn forward_remove(&self, host_hex: &str, listen: u16) -> Result<(), BackendErr> {
+        let mut fs = self.forwards.lock().unwrap();
+        let n = fs.len();
+        fs.retain(|r| !(r.host == host_hex && r.listen == listen));
+        if fs.len() == n {
+            return Err(BackendErr::Other(format!("转发不存在（{host_hex} :{listen}）")));
+        }
+        Ok(())
+    }
+
+    fn forward_list(&self, host_hex: &str) -> Vec<super::carriers::forward::ForwardState> {
+        self.forwards
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| host_hex.is_empty() || r.host == host_hex)
+            .map(|r| super::carriers::forward::ForwardState {
+                state: "listening".to_owned(),
+                err: String::new(),
+                conns: 1,
+                rejected: 0,
+                rule: r.clone(),
+            })
+            .collect()
+    }
+
+    fn socks_on(&self, host_hex: &str, listen: u16) -> Result<u16, BackendErr> {
+        if !self.host_exists(host_hex) {
+            return Err(BackendErr::NoHost);
+        }
+        let mut m = self.socks_mem.lock().unwrap();
+        let port = if listen == 0 {
+            m.iter().find(|(h, _, _)| h == host_hex).map(|(_, _, p)| *p).unwrap_or(super::carriers::SOCKS_DEFAULT_LISTEN)
+        } else {
+            listen
+        };
+        if let Some(e) = m.iter_mut().find(|(h, _, _)| h == host_hex) {
+            e.1 = true;
+            e.2 = port;
+        } else {
+            m.push((host_hex.to_owned(), true, port));
+        }
+        Ok(port)
+    }
+
+    fn socks_off(&self, host_hex: &str) -> Result<u16, BackendErr> {
+        let mut m = self.socks_mem.lock().unwrap();
+        let Some(e) = m.iter_mut().find(|(h, _, _)| h == host_hex) else {
+            return Err(BackendErr::Other("socks 未开过（无记忆端口）".into()));
+        };
+        e.1 = false;
+        Ok(e.2)
+    }
+
+    fn socks_states(&self) -> Vec<super::carriers::SocksState> {
+        self.socks_mem
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(h, on, p)| super::carriers::SocksState {
+                host: h.clone(),
+                on: *on,
+                listen: *p,
+                conns: 0,
+                err: String::new(),
+            })
+            .collect()
+    }
+
+    fn speedtest_start(
+        &self,
+        host_hex: &str,
+        _p: super::SpeedtestParams,
+    ) -> Result<super::carriers::speedrun::SpeedtestAck, BackendErr> {
+        if !self.host_exists(host_hex) {
+            return Err(BackendErr::NoHost);
+        }
+        let mut m = self.speed_mem.lock().unwrap();
+        if m.get(host_hex).copied().unwrap_or(false) {
+            return Ok(super::carriers::speedrun::SpeedtestAck { phase: "busy", reason: Some("上一轮还在跑") });
+        }
+        m.insert(host_hex.to_owned(), true);
+        Ok(super::carriers::speedrun::SpeedtestAck { phase: "waiting", reason: None })
+    }
+
+    fn speedtest_status(&self, host_hex: &str) -> Result<Option<super::SpeedtestStatus>, BackendErr> {
+        if !self.host_exists(host_hex) {
+            return Err(BackendErr::NoHost);
+        }
+        Ok(if self.speed_mem.lock().unwrap().get(host_hex).copied().unwrap_or(false) {
+            Some(super::SpeedtestStatus {
+                waiting: false,
+                wait_remain_ms: 0,
+                phase: "down".to_owned(),
+                bytes: 42,
+                elapsed_ms: 7,
+                inst_bps: 1.0,
+                usage_down: 0,
+                usage_up: 0,
+                result: None,
+            })
+        } else {
+            None
+        })
+    }
+
+    fn speedtest_cancel(&self, host_hex: &str) -> Result<(), BackendErr> {
+        if !self.host_exists(host_hex) {
+            return Err(BackendErr::NoHost);
+        }
+        self.speed_mem.lock().unwrap().insert(host_hex.to_owned(), false);
+        Ok(())
+    }
 }
 
 fn start_server(tag: &str, backend: Arc<dyn Backend>) -> (Arc<ControlServer>, PathBuf, Arc<super::bus::Bus>, std::thread::JoinHandle<()>) {
@@ -823,4 +967,104 @@ fn handshake_version_mismatch_reloads() {
     srv.shutdown();
     let _ = serve_h.join();
     let _ = std::fs::remove_dir_all(sock.parent().unwrap());
+}
+
+/// 低-11（D-1 评审登记 → D-2 收口）：承载面 9 op 的 **server 级用例**——真实 UDS
+/// 控制面 client 发请求，MockBackend 内存版承接。钉三件事：① op 名/载荷字段进
+/// backend 方法；② 成功载荷形状（wire 面）；③ 错误码映射（no_host / bad_request /
+/// 端口冲突 detail）。语义面（真监听/RST/状态机）归 carriers 单测 + CA 实采。
+#[test]
+fn carrier_ops_server_roundtrip() {
+    let backend = MockBackend::new();
+    let (srv, sock, _bus, serve_h) = start_server("carops", Arc::clone(&backend) as Arc<dyn Backend>);
+    let (c, _w) = ControlClient::dial(&sock, "cli", "test").unwrap();
+    let v = c.request("host.add", Some(json!({"token": "aaaa"})), short()).unwrap();
+    let id = v["id"].as_str().unwrap().to_owned();
+
+    // ---- forward.add：成功（listening 态）/ 端口冲突 / 缺字段 / no_host ----
+    let v = c
+        .request("forward.add", Some(json!({"host": id, "listen": 18081, "targetIp": "10.1.2.3", "targetPort": 80})), short())
+        .unwrap();
+    assert_eq!(v["rule"]["state"], "listening");
+    assert_eq!(v["rule"]["listen"], 18081);
+    assert_eq!(v["rule"]["targetIp"], "10.1.2.3");
+    let e = c
+        .request("forward.add", Some(json!({"host": id, "listen": 18081, "targetPort": 80})), short())
+        .unwrap_err();
+    assert_eq!(e.code, "bad_request", "端口冲突经 Other 映射 bad_request + detail（实收 {} {}）", e.code, e.detail());
+    let e = c
+        .request("forward.add", Some(json!({"host": id, "targetPort": 80})), short())
+        .unwrap_err();
+    assert_eq!(e.code, "bad_request", "缺 listen 字段");
+    let e = c
+        .request("forward.add", Some(json!({"host": "f".repeat(64), "listen": 18082, "targetPort": 80})), short())
+        .unwrap_err();
+    assert_eq!(e.code, "no_host", "host 不在表");
+
+    // ---- forward.list：全部（host 空）与按 host 过滤 ----
+    c.request("forward.add", Some(json!({"host": id, "listen": 18082, "targetPort": 443})), short()).unwrap();
+    let v = c.request("forward.list", Some(json!({"host": ""})), short()).unwrap();
+    assert_eq!(v["forwards"].as_array().unwrap().len(), 2);
+    let v = c.request("forward.list", Some(json!({"host": "f".repeat(64)})), short()).unwrap();
+    assert_eq!(v["forwards"].as_array().unwrap().len(), 0, "不在表 host = 空形状");
+
+    // ---- forward.remove：成功幂等差（不存在 → bad_request detail）----
+    let v = c
+        .request("forward.remove", Some(json!({"host": id, "listen": 18082})), short())
+        .unwrap();
+    assert_eq!(v["removed"], true);
+    let e = c
+        .request("forward.remove", Some(json!({"host": id, "listen": 18082})), short())
+        .unwrap_err();
+    assert_eq!(e.code, "bad_request", "重复 remove 报错（内存版语义）");
+
+    // ---- socks.on / off / status：记忆端口 + 幂等 off + 状态面 ----
+    let v = c.request("socks.on", Some(json!({"host": id, "listen": 18099})), short()).unwrap();
+    assert_eq!(v["listen"], 18099);
+    let e = c.request("socks.on", Some(json!({"host": "f".repeat(64)})), short()).unwrap_err();
+    assert_eq!(e.code, "no_host");
+    let v = c.request("socks.off", Some(json!({"host": id})), short()).unwrap();
+    assert_eq!(v["listen"], 18099, "off 返回记忆端口");
+    let v = c.request("socks.status", None, short()).unwrap();
+    assert_eq!(v["socks"][0]["host"].as_str().unwrap(), id);
+    assert_eq!(v["socks"][0]["on"], false);
+    assert_eq!(v["socks"][0]["listen"], 18099, "off 后端口记忆保留");
+    // 再 on（listen 0 = 用记忆端口）。
+    let v = c.request("socks.on", Some(json!({"host": id, "listen": 0})), short()).unwrap();
+    assert_eq!(v["listen"], 18099, "listen 0 = 记忆/缺省端口");
+
+    // ---- speedtest.start / status / cancel：waiting → down 相位 → cancel ----
+    let v = c
+        .request("speedtest.start", Some(json!({"host": id, "downMs": 100, "upMs": 0, "warmupMs": 0, "streams": 2, "waitMs": 0})), short())
+        .unwrap();
+    assert_eq!(v["phase"], "waiting");
+    // 单飞：再 start → busy。
+    let v = c
+        .request("speedtest.start", Some(json!({"host": id, "downMs": 100})), short())
+        .unwrap();
+    assert_eq!(v["phase"], "busy");
+    assert_eq!(v["reason"], "上一轮还在跑");
+    let v = c.request("speedtest.status", Some(json!({"host": id})), short()).unwrap();
+    assert_eq!(v["phase"], "down", "引擎快照相位透出");
+    assert_eq!(v["bytes"], 42);
+    let e = c.request("speedtest.status", Some(json!({"host": "f".repeat(64)})), short()).unwrap_err();
+    assert_eq!(e.code, "no_host");
+    let v = c.request("speedtest.cancel", Some(json!({"host": id})), short()).unwrap();
+    assert_eq!(v["cancelled"], true);
+    // cancel 后 status = 运行面丢失（None → idle 形态——「运行面丢失」判据 =
+    // idle + 非 waiting + 无终态，Go 同义）。
+    let v = c.request("speedtest.status", Some(json!({"host": id})), short()).unwrap();
+    assert_eq!(v["phase"], "idle", "无运行面 = idle 形态（实收 {v}）");
+    assert!(v["waiting"].is_null() || v["waiting"] == false, "waiting=false 省略（omitempty）");
+
+    // ---- not_ready 门：承载面同样被挡 ----
+    backend.not_ready.store(true, Ordering::SeqCst);
+    let e = c.request("forward.list", Some(json!({"host": ""})), short()).unwrap_err();
+    assert_eq!(e.code, "not_ready");
+    backend.not_ready.store(false, Ordering::SeqCst);
+    c.request("forward.list", Some(json!({"host": ""})), short()).unwrap();
+
+    let _ = c.goodbye();
+    srv.shutdown();
+    let _ = serve_h.join();
 }

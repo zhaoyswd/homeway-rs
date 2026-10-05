@@ -103,6 +103,22 @@ impl Drop for InstanceLock {
     }
 }
 
+/// 只读锁试探（**不重写持有者信息**、不持有锁）：探测 `<state>/lock` 是否被持有，
+/// 被持有时读出 (pid, 形态)。CLI 的「守护在跑判定/锁僵死归因」共用面
+///（D-1 补-3 收敛：此前 daemon_cli 侧有一份逐字段重复实现）。
+pub fn probe_lock_holder(state_dir: &Path) -> (bool, i32, String) {
+    let Ok(f) = File::open(state_dir.join("lock")) else { return (false, 0, String::new()) };
+    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&f);
+    let r = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if r == 0 {
+        unsafe { libc::flock(fd, libc::LOCK_UN) };
+        return (false, 0, String::new());
+    }
+    let mut f = f;
+    let (pid, form) = read_lock_holder(&mut f);
+    (true, pid, form)
+}
+
 /// 持有者 pid/形态（读不到 = 0 / "?"）。
 fn read_lock_holder(f: &mut File) -> (i32, String) {
     use std::os::unix::fs::FileExt as _;

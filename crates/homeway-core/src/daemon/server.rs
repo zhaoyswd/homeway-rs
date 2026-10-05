@@ -113,8 +113,15 @@ impl ControlServer {
             match ln.accept() {
                 Ok((stream, _)) => {
                     retry = Duration::ZERO;
-                    let peer = self.spawn_conn(stream);
-                    self.conns.lock().unwrap_or_else(|e| e.into_inner()).push(peer);
+                    match self.spawn_conn(stream) {
+                        Some(peer) => {
+                            self.conns.lock().unwrap_or_else(|e| e.into_inner()).push(peer);
+                        }
+                        None => {
+                            // 低-1：连接线程起不来（资源耗尽）——连接已降级关闭，
+                            // 接入循环继续服务其余连接。
+                        }
+                    }
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
                     // 空转拍：收工检查（50ms 节拍）。
@@ -145,12 +152,15 @@ impl ControlServer {
         }
     }
 
-    fn spawn_conn(self: &Arc<Self>, stream: std::os::unix::net::UnixStream) -> Arc<ConnShared> {
+    /// 低-1（D-2 收敛）：连接线程/fd 克隆失败（资源耗尽级）= **该连接降级关闭**，
+    /// 不带走进程（原 expect 形态把外部可触发的 EMFILE 变成整进程 panic）。任一步
+    /// 失败：已起的线程随 conn.close 的收工语义自灭，接入循环继续。
+    fn spawn_conn(self: &Arc<Self>, stream: std::os::unix::net::UnixStream) -> Option<Arc<ConnShared>> {
         let _ = stream.set_nonblocking(false);
         let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
         let _ = stream.set_write_timeout(Some(WRITE_STALL_TIMEOUT));
-        let writer_sock = stream.try_clone().expect("UDS fd 克隆不可失败");
-        let ctl_sock = stream.try_clone().expect("UDS fd 克隆不可失败");
+        let writer_sock = stream.try_clone().ok()?;
+        let ctl_sock = stream.try_clone().ok()?;
         let (req_tx, req_rx) = std::sync::mpsc::channel::<RequestBody>();
         let conn = Arc::new(ConnShared {
             srv: Arc::clone(self),
@@ -165,28 +175,43 @@ impl ControlServer {
             streams: Mutex::new(StreamTable { next_id: 0, map: HashMap::new(), closed: false }),
         });
         let r_conn = Arc::clone(&conn);
-        let reader = std::thread::Builder::new()
+        let Some(reader) = std::thread::Builder::new()
             .name("hw-ctl-reader".to_owned())
             .spawn(move || r_conn.reader_main(stream))
-            .expect("线程创建不可失败");
+            .ok()
+        else {
+            conn.close("");
+            return None;
+        };
         let w_conn = Arc::clone(&conn);
-        let writer = std::thread::Builder::new()
+        let Some(writer) = std::thread::Builder::new()
             .name("hw-ctl-writer".to_owned())
             .spawn(move || w_conn.writer_main(writer_sock))
-            .expect("线程创建不可失败");
+            .ok()
+        else {
+            conn.close("");
+            let _ = reader.join();
+            return None;
+        };
         let d_conn = Arc::clone(&conn);
         // dispatcher 句柄即弃（分离线程）：joiner 不 join 它（慢请求不绑架收工——
         // Go 同款纪律；经 recv_timeout 节拍 + is_closed 自终止）。
-        let _dispatcher = std::thread::Builder::new()
+        if std::thread::Builder::new()
             .name("hw-ctl-disp".to_owned())
             .spawn(move || d_conn.dispatcher_main(req_rx))
-            .expect("线程创建不可失败");
+            .is_err()
+        {
+            conn.close("");
+            let _ = reader.join();
+            let _ = writer.join();
+            return None;
+        }
         // reader 退出即整连接收工（等 writer；**不 join dispatcher**——工位可能仍在
         // 执行在途慢请求（host.add 探测等有界慢操作），close 后经 closed 分支自终止；
         // 等它会让收工被一条慢请求绑架——Go 同款纪律）。
         let j_conn = Arc::clone(&conn);
         let j_srv = Arc::clone(self);
-        let joiner = std::thread::Builder::new()
+        let Some(joiner) = std::thread::Builder::new()
             .name("hw-ctl-join".to_owned())
             .spawn(move || {
                 let _ = reader.join();
@@ -196,9 +221,14 @@ impl ControlServer {
                 // 每条泄漏一个 Arc<ConnShared>（连带 ctl_sock 的 fd），长跑必炸 EMFILE）。
                 j_srv.conns.lock().unwrap_or_else(|e| e.into_inner()).retain(|c| !Arc::ptr_eq(c, &j_conn));
             })
-            .expect("线程创建不可失败");
+            .ok()
+        else {
+            // joiner 起不来：reader/writer 都已起——直接收工等它俩退出，连接不入表。
+            conn.close("");
+            return None;
+        };
         self.conn_threads.lock().unwrap_or_else(|e| e.into_inner()).push(joiner);
-        conn
+        Some(conn)
     }
 
     /// 收工：停接入、断开全部连接（在途请求由 shutting_down 错误码路径承接；

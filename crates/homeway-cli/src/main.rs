@@ -1009,17 +1009,17 @@ fn cmd_files_remote(host_ref: &str, a: FilesRemoteArgs) {
     };
     // ③ 动词（远程壳——协议与本地同一条实现）。
     let r: Result<(), homeway_core::files::FilesError> = match verb.as_str() {
-        "list" => homeway_core::files::list_remote(c.clone(), st.clone(), &path).map(|entries| {
+        "list" => homeway_core::files::list_remote(c.clone(), st.clone(), timeout, &path).map(|entries| {
             for e in entries {
                 let kind = if e.is_dir { "dir " } else { "file" };
                 println!("{kind} {:>12}  {}", e.size, e.name);
             }
         }),
-        "stat" => homeway_core::files::stat_remote(c.clone(), st.clone(), &path).map(|e| {
+        "stat" => homeway_core::files::stat_remote(c.clone(), st.clone(), timeout, &path).map(|e| {
             println!("{} {} size={} mtimeMs={} mode={}", if e.is_dir { "dir" } else { "file" }, e.name, e.size, e.mtime_ms, e.mode);
         }),
-        "mkdir" => homeway_core::files::mkdir_remote(c.clone(), st.clone(), &path).map(|_| println!("已建目录 {path}")),
-        "read" => homeway_core::files::read_remote(c.clone(), st.clone(), &path, "", 1 << 20).map(|r| {
+        "mkdir" => homeway_core::files::mkdir_remote(c.clone(), st.clone(), timeout, &path).map(|_| println!("已建目录 {path}")),
+        "read" => homeway_core::files::read_remote(c.clone(), st.clone(), timeout, &path, "", 1 << 20).map(|r| {
             print!("{}", r.text);
         }),
         "download" | "get" => {
@@ -1031,7 +1031,7 @@ fn cmd_files_remote(host_ref: &str, a: FilesRemoteArgs) {
                     std::process::exit(1);
                 }))
             };
-            homeway_core::files::download_remote(c.clone(), st.clone(), &path, &mut out, |size| {
+            homeway_core::files::download_remote(c.clone(), st.clone(), timeout, &path, &mut out, |size| {
                 eprintln!("服务端声明 {size} 字节");
             })
             .map(|n| println!("下载完成 {n} 字节 → {local}"))
@@ -1047,6 +1047,7 @@ fn cmd_files_remote(host_ref: &str, a: FilesRemoteArgs) {
             homeway_core::files::upload_remote(
                 c.clone(),
                 st.clone(),
+                timeout,
                 &path,
                 &mut f,
                 size,

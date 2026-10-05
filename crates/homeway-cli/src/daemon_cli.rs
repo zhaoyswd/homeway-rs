@@ -101,31 +101,10 @@ fn probe_sock(sock: &std::path::Path) -> SockState {
     }
 }
 
-/// `<state>/lock` 的 flock 试探（只读打开 + 非阻塞排他——探测不重写持有者信息）。
-/// 返回 (held, pid, form)。
+/// `<state>/lock` 的 flock 试探（补-3 收敛：实现收敛到 nodestate::probe_lock_holder
+/// ——此前这里有一份逐字段重复的解析实现）。
 fn lock_held_probe(state_dir: &std::path::Path) -> (bool, i32, String) {
-    use std::os::unix::fs::FileExt as _;
-    let path = state_dir.join("lock");
-    let Ok(f) = std::fs::File::open(&path) else { return (false, 0, String::new()) };
-    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&f);
-    let r = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if r == 0 {
-        unsafe { libc::flock(fd, libc::LOCK_UN) };
-        return (false, 0, String::new());
-    }
-    // 被持有：读持有者（读不到 = 0 / "?"——Go readLockHolder 同义）。
-    let mut buf = [0u8; 128];
-    let n = f.read_at(&mut buf, 0).unwrap_or(0);
-    let mut pid = 0;
-    let mut form = "?".to_owned();
-    for line in String::from_utf8_lossy(&buf[..n]).lines() {
-        if let Some(v) = line.strip_prefix("pid=") {
-            pid = v.trim().parse().unwrap_or(0);
-        } else if let Some(v) = line.strip_prefix("form=") {
-            form = v.trim().to_owned();
-        }
-    }
-    (true, pid, form)
+    homeway_core::nodestate::probe_lock_holder(state_dir)
 }
 
 /// control.sock 可连性轮询（dial 成功即回 true 并关闭）。

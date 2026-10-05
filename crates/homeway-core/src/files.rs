@@ -225,13 +225,18 @@ impl<'a> Stream<'a> {
                 }
             })
             .ok();
-        Stream::handshake(Stream {
-            io: StreamIo::Local { sess, id },
-            buf: Vec::with_capacity(16 * 1024),
-            rx,
-            root: String::new(),
-            ver: 0,
-        })
+        // 问候帧看门（评审中-7 → D-2 收口）：首响应段带预算（与拨号同一段预算——
+        // Go files-cli「连接+首响应两段各 --timeout」同义）；到点关流打断挂死的读。
+        Stream::handshake(
+            Stream {
+                io: StreamIo::Local { sess, id },
+                buf: Vec::with_capacity(16 * 1024),
+                rx,
+                root: String::new(),
+                ver: 0,
+            },
+            budget,
+        )
     }
 
     /// 远程形态：已打开的控制面流腿上读问候帧（`--host` 模式——files 协议经
@@ -240,6 +245,7 @@ impl<'a> Stream<'a> {
     pub fn open_remote(
         client: std::sync::Arc<crate::daemon::client::ControlClient>,
         st: std::sync::Arc<crate::daemon::client::ClientStream>,
+        greet_budget: Duration,
     ) -> Result<Stream<'static>, FilesError> {
         let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, ConnErr>>();
         let rd_st = std::sync::Arc::clone(&st);
@@ -262,18 +268,25 @@ impl<'a> Stream<'a> {
                 }
             })
             .ok();
-        Stream::handshake(Stream {
-            io: StreamIo::Remote { client, st },
-            buf: Vec::with_capacity(16 * 1024),
-            rx,
-            root: String::new(),
-            ver: 0,
-        })
+        // 问候帧看门（本地/远程一次收两面——D-1 评审中-7 的 D-2 收口项）：远程腿
+        // 挂死（出口 files.sock 无应答/腿停滞）不再永久挂 CLI。
+        Stream::handshake(
+            Stream {
+                io: StreamIo::Remote { client, st },
+                buf: Vec::with_capacity(16 * 1024),
+                rx,
+                root: String::new(),
+                ver: 0,
+            },
+            greet_budget,
+        )
     }
 
-    /// 问候帧公共段（两种承载共用）。
-    fn handshake(mut s: Stream<'_>) -> Result<Stream<'_>, FilesError> {
-        let line = s.read_line().map_err(|e| FilesError::Code {
+    /// 问候帧公共段（两种承载共用）。首响应带预算（Go armWatchdog 同义：到点关流
+    /// 打断阻塞中的问候帧读——对端不应答时不会永久挂死；**问候帧返回后不再受此
+    /// 预算约束**，传输期无期限——传输中的流不会被首响应预算误杀）。
+    fn handshake(mut s: Stream<'_>, budget: Duration) -> Result<Stream<'_>, FilesError> {
+        let line = s.read_line_deadline(budget).map_err(|e| FilesError::Code {
             code: CODE_STREAM_OPEN.to_owned(),
             msg: format!("读问候帧失败：{e}"),
         })?;
@@ -296,8 +309,17 @@ impl<'a> Stream<'a> {
         }
     }
 
-    /// 读一行（≤64KB；去 EOL）。
+    /// 读一行（≤64KB；去 EOL；无期限——传输期）。
     fn read_line(&mut self) -> Result<Vec<u8>, FilesError> {
+        self.read_line_opt(None)
+    }
+
+    /// 读一行（带首响应预算的问候帧形态：到点关流 + 超预算归因）。
+    fn read_line_deadline(&mut self, budget: Duration) -> Result<Vec<u8>, FilesError> {
+        self.read_line_opt(Some(budget))
+    }
+
+    fn read_line_opt(&mut self, deadline: Option<Duration>) -> Result<Vec<u8>, FilesError> {
         loop {
             if let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
                 let mut line: Vec<u8> = self.buf.drain(..=pos).collect();
@@ -312,8 +334,42 @@ impl<'a> Stream<'a> {
             if self.buf.len() > MAX_REQUEST_LINE {
                 return Err(transport("行超过 64KB 上限"));
             }
-            let chunk = self.next_chunk()?;
+            let chunk = match deadline {
+                Some(d) => self.next_chunk_timeout(d)?,
+                None => self.next_chunk()?,
+            };
             self.buf.extend_from_slice(&chunk);
+        }
+    }
+
+    /// 带期限取一块（问候帧看门面）：到点**关流**（本地 = 引擎关连接——读线程的
+    /// 阻塞 read 随连接回收退出；远程 = stream_close——腿终结）再报超预算——
+    /// 不关流的话读线程与消费侧通道都悬着（drop 时 Local 走 close 幂等无害）。
+    fn next_chunk_timeout(&mut self, d: Duration) -> Result<Vec<u8>, FilesError> {
+        match self.rx.recv_timeout(d) {
+            Ok(Ok(chunk)) if !chunk.is_empty() => Ok(chunk),
+            Ok(_) => Err(transport("流已到尾（EOF）")),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                self.abort_stream();
+                Err(transport(format!("首响应（问候帧）超预算（{d:?}）")))
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                Err(transport("读线程已退出"))
+            }
+        }
+    }
+
+    /// 看门到点的关流动作（两面统一；幂等——drop 的收口路径重复关无害）。
+    fn abort_stream(&self) {
+        match &self.io {
+            StreamIo::Local { sess, id } => {
+                if *id != u64::MAX {
+                    let _ = sess.client().close(*id);
+                }
+            }
+            StreamIo::Remote { client, st } => {
+                let _ = client.stream_close(st, Duration::from_secs(3));
+            }
         }
     }
 
@@ -451,38 +507,42 @@ pub fn mkdir(sess: &Session, budget: Duration, path: &str) -> Result<(), FilesEr
 pub fn list_remote(
     client: std::sync::Arc<crate::daemon::client::ControlClient>,
     st: std::sync::Arc<crate::daemon::client::ClientStream>,
+    greet_budget: Duration,
     path: &str,
 ) -> Result<Vec<Entry>, FilesError> {
-    let mut s = Stream::open_remote(client, st)?;
+    let mut s = Stream::open_remote(client, st, greet_budget)?;
     list_at(&mut s, path)
 }
 
 pub fn stat_remote(
     client: std::sync::Arc<crate::daemon::client::ControlClient>,
     st: std::sync::Arc<crate::daemon::client::ClientStream>,
+    greet_budget: Duration,
     path: &str,
 ) -> Result<Entry, FilesError> {
-    let mut s = Stream::open_remote(client, st)?;
+    let mut s = Stream::open_remote(client, st, greet_budget)?;
     stat_at(&mut s, path)
 }
 
 pub fn mkdir_remote(
     client: std::sync::Arc<crate::daemon::client::ControlClient>,
     st: std::sync::Arc<crate::daemon::client::ClientStream>,
+    greet_budget: Duration,
     path: &str,
 ) -> Result<(), FilesError> {
-    let mut s = Stream::open_remote(client, st)?;
+    let mut s = Stream::open_remote(client, st, greet_budget)?;
     mkdir_at(&mut s, path)
 }
 
 pub fn read_remote(
     client: std::sync::Arc<crate::daemon::client::ControlClient>,
     st: std::sync::Arc<crate::daemon::client::ClientStream>,
+    greet_budget: Duration,
     path: &str,
     mode: &str,
     max_bytes: i64,
 ) -> Result<ReadResult, FilesError> {
-    let mut s = Stream::open_remote(client, st)?;
+    let mut s = Stream::open_remote(client, st, greet_budget)?;
     let resp = s.call(&Request { op: "read", path, max_bytes, mode: Some(mode), size: 0 })?;
     Ok(ReadResult { text: resp.text, base64: resp.base64, truncated: resp.truncated })
 }
@@ -490,6 +550,7 @@ pub fn read_remote(
 pub fn download_remote<W, F>(
     client: std::sync::Arc<crate::daemon::client::ControlClient>,
     st: std::sync::Arc<crate::daemon::client::ClientStream>,
+    greet_budget: Duration,
     path: &str,
     w: &mut W,
     on_size: F,
@@ -498,13 +559,17 @@ where
     W: io::Write + ?Sized,
     F: FnOnce(i64),
 {
-    let mut s = Stream::open_remote(client, st)?;
+    let mut s = Stream::open_remote(client, st, greet_budget)?;
     download_at(&mut s, path, w, on_size)
 }
 
+// 8 参 = client/st/greet_budget 三承载参 + 协议四参 + 限速器（Go 同族函数的
+// 参数面；承载三参已在 6 个远程动词间同构——收敛为结构体的收益不抵本批侵入面）。
+#[allow(clippy::too_many_arguments)]
 pub fn upload_remote<R, F>(
     client: std::sync::Arc<crate::daemon::client::ControlClient>,
     st: std::sync::Arc<crate::daemon::client::ClientStream>,
+    greet_budget: Duration,
     path: &str,
     r: &mut R,
     size: i64,
@@ -515,7 +580,7 @@ where
     R: io::Read + ?Sized,
     F: FnMut(u64),
 {
-    let mut s = Stream::open_remote(client, st)?;
+    let mut s = Stream::open_remote(client, st, greet_budget)?;
     upload_at(&mut s, path, r, size, on_progress, limiter)
 }
 
@@ -925,5 +990,43 @@ mod tests {
         let t1 = std::time::Instant::now();
         l.await_quota(1000);
         assert!(t1.elapsed() < std::time::Duration::from_secs(3), "差额路径不应久等");
+    }
+}
+
+#[cfg(test)]
+mod greeting_watchdog_tests {
+    use super::*;
+
+    /// 问候帧看门（D-1 中-7 → D-2 收口）：对端不应答时首响应段按预算到点退出
+    /// （不永久挂死），错误归因带「首响应（问候帧）超预算」。
+    #[test]
+    fn greeting_deadline_fires_on_silent_peer() {
+        // 静默对端的等价形态：读线程从未投递（通道有发送方但从不发、也未断开——
+        // Disconnected 走另一分支，这里钉 Timeout 分支）。
+        let (_tx_keepalive, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, ConnErr>>();
+        let mut s = Stream::from_rx(rx);
+        let t0 = std::time::Instant::now();
+        let r = s.read_line_deadline(Duration::from_millis(200));
+        let dt = t0.elapsed();
+        assert!(r.is_err(), "静默对端必须按预算失败");
+        let msg = match &r.unwrap_err() {
+            FilesError::Code { msg, .. } => msg.clone(),
+            other => format!("{other:?}"),
+        };
+        assert!(msg.contains("首响应（问候帧）超预算"), "归因文案（实收 {msg:?}）");
+        assert!(dt < Duration::from_secs(2), "不应等到天荒地老（{dt:?}）");
+    }
+
+    /// 问候帧正常返回的路径不受预算影响（预算内完成 handshake）。
+    #[test]
+    fn greeting_arrives_within_budget() {
+        let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, ConnErr>>();
+        tx.send(Ok(br#"{"ok":true,"root":"/tmp","ver":1}
+"#.to_vec())).unwrap();
+        let s = Stream::from_rx(rx);
+        let s = Stream::handshake(s, Duration::from_secs(2)).expect("预算内问候");
+        assert_eq!(s.root, "/tmp");
+        assert_eq!(s.ver, 1);
+        let _ = rx; // 通道保活（读线程形态在测试构造下不存在）
     }
 }
