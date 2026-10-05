@@ -137,9 +137,15 @@ pub struct EventsLog {
 
 impl EventsLog {
     pub fn open(cache_dir: &Path) -> std::io::Result<Self> {
+        Self::open_named(cache_dir, "events.log")
+    }
+
+    /// 自定义文件名（daemon 侧 daemon-events.log 防撞落名——B0-2b：serve 角色独占
+    /// events.log/debug.log，守护侧自有日志走同目录不同名，两侧写者不同文件）。
+    pub fn open_named(cache_dir: &Path, name: &str) -> std::io::Result<Self> {
         std::fs::create_dir_all(cache_dir)?;
-        let path = cache_dir.join("events.log");
-        let w = RotatingWriter::open(cache_dir, "events.log", EVENTS_MAX_BYTES, EVENTS_BACKUPS)?;
+        let path = cache_dir.join(name);
+        let w = RotatingWriter::open(cache_dir, name, EVENTS_MAX_BYTES, EVENTS_BACKUPS)?;
         Ok(Self { w: Some(w), path })
     }
 
@@ -187,9 +193,14 @@ pub struct DebugLog {
 
 impl DebugLog {
     pub fn open(cache_dir: &Path) -> std::io::Result<Self> {
+        Self::open_named(cache_dir, "debug.log")
+    }
+
+    /// 自定义文件名（daemon 侧 daemon-debug.log；同 EventsLog::open_named 的防撞面）。
+    pub fn open_named(cache_dir: &Path, name: &str) -> std::io::Result<Self> {
         std::fs::create_dir_all(cache_dir)?;
-        let path = cache_dir.join("debug.log");
-        let w = RotatingWriter::open(cache_dir, "debug.log", DEBUG_MAX_BYTES, DEBUG_BACKUPS)?;
+        let path = cache_dir.join(name);
+        let w = RotatingWriter::open(cache_dir, name, DEBUG_MAX_BYTES, DEBUG_BACKUPS)?;
         Ok(Self { w: Some(w), path })
     }
 
