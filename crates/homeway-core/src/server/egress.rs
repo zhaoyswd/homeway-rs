@@ -674,12 +674,31 @@ mod tests {
             );
         }
         assert!(pin_socket_to_iface(dual.as_raw_fd(), ifi.index, &ifi.name).is_ok());
-        // 两族都失败（非法 index）⇒ Err + Go 同串文案
-        let e = pin_socket_to_iface(s4.as_raw_fd(), u32::MAX, &ifi.name).unwrap_err();
-        assert!(
-            e.to_string().starts_with("IP_BOUND_IF/IPV6_BOUND_IF:"),
-            "错误文案应与 Go 同串：{e}"
-        );
+        // 负例分平台（首跑 cb64fce CI 实测红在 ubuntu——两平台的前提根本不同）：
+        // - macOS：按 index 钉卡，「非法 index ⇒ 两族都失败」成立 ⇒ Err + Go 同串文案；
+        // - linux：SO_BINDTODEVICE 按名、index 不参与——「非法 index」前提不成立，且
+        //   **已钉过的 socket 重复设置在无特权下恒 EPERM**（内核只放行首次绑定，
+        //   容器实测 fresh=OK / re-set-same=EPERM / 坏名=ENODEV）——复用 s4 会把
+        //   权限形态误判成钉卡语义。等价负例 = **新 socket** + 不存在网卡名 ⇒ ENODEV
+        //   （内核先查名后查权，特权/无特权同值）。
+        #[cfg(target_os = "macos")]
+        {
+            let e = pin_socket_to_iface(s4.as_raw_fd(), u32::MAX, &ifi.name).unwrap_err();
+            assert!(
+                e.to_string().starts_with("IP_BOUND_IF/IPV6_BOUND_IF:"),
+                "错误文案应与 Go 同串：{e}"
+            );
+        }
+        #[cfg(target_os = "linux")]
+        {
+            let s = UdpSocket::bind("0.0.0.0:0").unwrap();
+            let e = pin_socket_to_iface(s.as_raw_fd(), ifi.index, "hwtest-nodev0").unwrap_err();
+            assert_eq!(
+                e.raw_os_error(),
+                Some(libc::ENODEV),
+                "不存在网卡名应 ENODEV：{e}"
+            );
+        }
     }
 
     /// 本地 fake STUN 服务器：probe_stun 全链（事务 ID/XOR/来源校验）。
