@@ -41,13 +41,13 @@ jobs:
           set -euo pipefail
           git fetch --depth=1 origin main
           main="$(git rev-parse origin/main)"
-          head="$(git rev-parse HEAD)"
-          if [ "$main" != "$head" ]; then
-            echo "error: tag $GITHUB_REF_NAME 指向 $head，而 origin/main 当前为 $main" >&2
+          tag_head="$(git rev-parse HEAD)"
+          if [ "$main" != "$tag_head" ]; then
+            echo "error: tag $GITHUB_REF_NAME 指向 ${tag_head}，而 origin/main 当前为 ${main}" >&2
             echo "发版纪律：先把要发的提交合入并推 main，再打 tag" >&2
             exit 1
           fi
-          echo "ok: tag 指向 origin/main 头（$head）"
+          echo "ok: tag 指向 origin/main 头（${tag_head}）"
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
@@ -57,9 +57,11 @@ jobs:
         env:
           HOMEWAY_CLI_VERSION: ${{ github.ref_name }}
       - run: strip target/${{ matrix.target }}/release/homeway-cli
-      - name: 静态核验（musl 面必须 statically linked）
+      - name: 静态核验（musl 面必须静态链接）
         if: endsWith(matrix.target, '-musl')
-        run: file target/${{ matrix.target }}/release/homeway-cli | grep -w 'statically linked'
+        # 措辞按 file 版本有差：新版 file 对 static-PIE 报 "static-pie linked"
+        # （首跑 ubuntu 实测），旧版报 "statically linked"——两形都认，动态依赖才红。
+        run: file "target/${{ matrix.target }}/release/homeway-cli" | grep -Eq 'statically linked|static-pie linked'
       - name: 版本烟囱（可本机执行的目标上跑 --version）
         if: matrix.smoke && startsWith(github.ref, 'refs/tags/v')
         run: target/${{ matrix.target }}/release/homeway-cli --version | grep -F "$GITHUB_REF_NAME"
