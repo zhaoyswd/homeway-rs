@@ -615,10 +615,23 @@ fn reach(token_raw: &str) -> ReachReport {
     };
     let t0 = Instant::now();
     let (tx, rx) = std::sync::mpsc::channel::<ReachTested>();
-    for ep in &tok.endpoints {
-        // Rust token 端点为字面量 ip:port（DDNS 域名面 = GAP-AUDIT P0-4 未实现）。
-        let Some(addr) = ep.addr.parse::<std::net::SocketAddr>().ok() else { continue };
-        let is_relay = ep.kind == EndpointKind::Relay;
+    // P0-4：域名端点解析（IP 字面量直用；域名解析一次——每端点独立线程语义下
+    // 域名解析在分发前做，预算共享父预算 3.5s）。
+    let eps: Vec<(std::net::SocketAddr, bool)> = tok
+        .endpoints
+        .iter()
+        .filter_map(|ep| {
+            let relay = ep.kind == EndpointKind::Relay;
+            if let Ok(addr) = ep.addr.parse::<std::net::SocketAddr>() {
+                return Some((addr, relay));
+            }
+            let (host, port) = crate::wtransport::domain_eps::split_host_port_pub(&ep.addr)?;
+            let budget = REACH_PARENT_BUDGET.saturating_sub(t0.elapsed());
+            let ips = crate::wtransport::domain_eps::lookup_host(&host, budget).ok()?;
+            ips.first().map(|ip| (std::net::SocketAddr::new(*ip, port), relay))
+        })
+        .collect();
+    for (addr, is_relay) in eps {
         let tx = tx.clone();
         let budget = REACH_PROBE_BUDGET.min(REACH_PARENT_BUDGET.saturating_sub(t0.elapsed()));
         std::thread::spawn(move || {

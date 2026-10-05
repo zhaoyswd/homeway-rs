@@ -6,6 +6,7 @@
 //! 恢复阶梯档位（R2 期；注意与 roadmap「R1 期」撞名——恢复阶梯整体属 R2）。
 
 pub mod bind;
+pub mod domain_eps;
 pub mod endpoint_cache;
 pub mod frame;
 pub mod reg;

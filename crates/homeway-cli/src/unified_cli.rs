@@ -80,7 +80,6 @@ struct FileServe {
 
 #[derive(serde::Deserialize, serde::Serialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
-#[allow(dead_code)]
 struct FileDdns {
     #[serde(default)]
     domain: String,
@@ -155,7 +154,84 @@ pub(crate) fn write_config_enabled(state_dir: &std::path::Path, serve: Option<bo
     if let Some(v) = relay {
         cfg.relay.enabled = v;
     }
-    let body = toml::to_string_pretty(&cfg).map_err(|e| e.to_string())?;
+    write_config_file(state_dir, &cfg)
+}
+
+/// 纯配置写命令的通用改写壳（`serve ddns add/delete`、`serve relay set/clear`
+/// 用——Go nodeconfig.Update 同纪律：**重读现文件 → 只改目标键 → 同目录 tmp +
+/// rename 原子替换、创建即 0600**；重读失败（手编坏 config）= 拒绝写入）。
+/// FileConfig 字段私有——操作面收敛为枚举（调用方不直接碰 config 结构）。
+pub(crate) enum ConfigEdit {
+    DdnsAdd(String),
+    DdnsRemove(String),
+    RelaySet(String),
+    RelayClear,
+}
+
+/// ddns 写结果（CLI 的幂等输出语义）。
+pub(crate) enum DdnsWrite {
+    Written,
+    AlreadyThere,
+    Absent,
+}
+
+pub(crate) fn update_config(state_dir: &std::path::Path, edit: ConfigEdit) -> Result<DdnsWrite, String> {
+    let path = state_dir.join("config.toml");
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("读取 {path:?}：{e}"))?;
+    let mut cfg: FileConfig = toml::from_str(&raw).map_err(|e| format!("config 解析失败（拒绝写入，先修复）：{e}"))?;
+    let out = match edit {
+        ConfigEdit::DdnsAdd(domain) => {
+            let list = cfg.serve.ddns.get_or_insert_with(Vec::new);
+            if list.iter().any(|d| d.domain == domain) {
+                DdnsWrite::AlreadyThere
+            } else {
+                list.push(FileDdns { domain });
+                DdnsWrite::Written
+            }
+        }
+        ConfigEdit::DdnsRemove(domain) => {
+            let mut removed = false;
+            if let Some(list) = cfg.serve.ddns.as_mut() {
+                let before = list.len();
+                list.retain(|d| d.domain != domain);
+                removed = list.len() != before;
+            }
+            if removed { DdnsWrite::Written } else { DdnsWrite::Absent }
+        }
+        ConfigEdit::RelaySet(tok) => {
+            cfg.serve.relay = Some(tok);
+            DdnsWrite::Written
+        }
+        ConfigEdit::RelayClear => {
+            cfg.serve.relay = None;
+            DdnsWrite::Written
+        }
+    };
+    if matches!(out, DdnsWrite::AlreadyThere | DdnsWrite::Absent) {
+        return Ok(out); // 无动作不写盘
+    }
+    write_config_file(state_dir, &cfg)?;
+    Ok(out)
+}
+
+/// 读 [[serve.ddns]] 域名表（`serve ddns list` 纯读；坏/缺 config = 空表 + 报错面
+/// 由调用方处理）。
+pub(crate) fn config_serve_ddns(state_dir: &std::path::Path) -> Result<Vec<String>, String> {
+    let path = state_dir.join("config.toml");
+    let raw = std::fs::read_to_string(&path).map_err(|e| format!("读取 {path:?}：{e}"))?;
+    let cfg: FileConfig = toml::from_str(&raw).map_err(|e| format!("config 解析失败：{e}"))?;
+    Ok(cfg
+        .serve
+        .ddns
+        .unwrap_or_default()
+        .into_iter()
+        .map(|d| d.domain)
+        .collect())
+}
+
+fn write_config_file(state_dir: &std::path::Path, cfg: &FileConfig) -> Result<(), String> {
+    let path = state_dir.join("config.toml");
+    let body = toml::to_string_pretty(cfg).map_err(|e| e.to_string())?;
     #[cfg(unix)]
     {
         use std::io::Write;
@@ -347,7 +423,7 @@ impl UnifiedRoles {
         self.serve_status_inner(&mut inner, bits)
     }
 
-    fn serve_status_inner(&self, inner: &mut RolesInner, bits: Option<(Vec<homeway_core::server::engine::EnginePeerBrief>, homeway_core::server::engine::EngineInterceptBits)>) -> ServeStatusResult {
+    fn serve_status_inner(&self, inner: &mut RolesInner, bits: Option<(Vec<homeway_core::server::engine::EnginePeerBrief>, homeway_core::server::engine::EngineInterceptBits, Vec<homeway_core::server::ddnscheck::DdnsBrief>)>) -> ServeStatusResult {
         // token 掩码/端点 = 台账末行（reveal 纪律：status 族只见掩码）。
         let st = homeway_core::server::state::State::open(&self.state_dir.join("serve")).ok();
         let last = st.and_then(|s| s.last_token().ok().flatten());
@@ -375,8 +451,8 @@ impl UnifiedRoles {
         };
         // engine 观测缝（B0-2b：peers 经驱动线程快照 + 拦截计数原子直读；引擎不在
         // 位 = 空表零计数——观测面不复活角色）。bits 在锁外取（评审 r2-13）。
-        let (peers, intercept) = bits
-            .map(|(p, i)| {
+        let (peers, intercept, ddns) = bits
+            .map(|(p, i, d)| {
                 (
                     p.into_iter()
                         .map(|b| homeway_core::daemon::proto::ServePeerBrief {
@@ -392,6 +468,7 @@ impl UnifiedRoles {
                         reject: i.reject,
                         flows: i.flows,
                     },
+                    d,
                 )
             })
             .unwrap_or_default();
@@ -404,7 +481,12 @@ impl UnifiedRoles {
             token_mask: mask,
             endpoints: (!eps.is_empty()).then_some(eps),
             peers,
-            ddns: None,
+            ddns: (!ddns.is_empty()).then(|| {
+                ddns
+                    .into_iter()
+                    .map(|b| serde_json::to_value(&b).unwrap_or_default())
+                    .collect::<Vec<_>>()
+            }),
             intercept,
         }
     }

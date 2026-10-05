@@ -161,6 +161,11 @@ struct Shared {
     suppress_hints: std::sync::atomic::AtomicBool,
     /// 【test-seams】中继锁定（relay-lock）——重建世代要重装 bind 锁定。
     relay_lock: bool,
+    /// 域名端点重解析编排（P0-4；无域名条目 = None——Rearm/RearmSoft/旁路探测拍触发）。
+    /// RwLock：构造期（Shared 建好后）才填——回调持 Weak 回指 Shared。
+    domain_refresher: RwLock<Option<Arc<crate::wtransport::domain_eps::DomainRefresher>>>,
+    /// 域名条目候选（最近一次解析产物；static_cands = IP 字面量，两者相加 = 静态面）。
+    domain_cands: Mutex<Vec<Candidate>>,
 }
 
 impl Shared {
@@ -190,12 +195,15 @@ impl Shared {
     }
 
     fn merged_candidates(&self) -> Vec<Candidate> {
+        let domain = self.domain_cands.lock().expect("域名候选锁中毒").clone();
+        let mut base = self.static_cands.clone();
+        base.extend(domain);
         match &self.cache {
             Some(c) => {
                 let c = c.lock().expect("缓存锁中毒");
-                c.merge(&self.static_cands, SystemTime::now())
+                c.merge(&base, SystemTime::now())
             }
-            None => self.static_cands.clone(),
+            None => base,
         }
     }
 
@@ -239,18 +247,19 @@ impl Session {
         };
         (logf)("启动（无 TUN 服务会话）"); // C12
 
-        // 端点解析：直连 + 中继（type=1）都进候选——中继是直连的后备（DirectFirst 窗口）
-        let candidates: Vec<Candidate> = cfg
+        // 端点解析：直连 + 中继（type=1）都进候选——中继是直连的后备（DirectFirst 窗口）。
+        // 域名条目按 P0-4 展开（split_and_resolve：IP 字面量直入 + 域名建会话解析一次
+        // + 原文保留给重解析）。
+        let ep_refs: Vec<crate::token::EndpointRef> = cfg
             .token
             .endpoints
             .iter()
-            .filter_map(|e| {
-                e.addr.parse().ok().map(|addr| Candidate {
-                    addr,
-                    relay: e.kind == crate::token::EndpointKind::Relay,
-                })
-            })
+            .map(|e| crate::token::EndpointRef::new(e.addr.as_str(), e.kind))
             .collect();
+        let inputs = crate::wtransport::domain_eps::split_and_resolve(&ep_refs, &logf);
+        let candidates: Vec<Candidate> = inputs.candidates;
+        let domain_eps = inputs.domains;
+        let domain_initial = inputs.domain_initial;
         if candidates.is_empty() {
             return Err(SessionErr::NoCandidates);
         }
@@ -323,7 +332,15 @@ impl Session {
             gate: recover::RecoverGate::new(),
             ladder: Mutex::new(LadderState::default()),
             cache: cache.map(Mutex::new),
-            static_cands: candidates,
+            static_cands: {
+                let dom: Vec<SocketAddr> = domain_initial.iter().map(|c| c.addr).collect();
+                candidates
+                    .into_iter()
+                    .filter(|c| !dom.contains(&c.addr))
+                    .collect()
+            },
+            domain_cands: Mutex::new(domain_initial.clone()),
+            domain_refresher: RwLock::new(None),
             logf: Arc::clone(&logf),
             stop: AtomicBool::new(false),
             secret: *cfg.token.secret.as_bytes(),
@@ -335,6 +352,41 @@ impl Session {
             relay_lock: cfg.relay_only,
         });
 
+        // P0-4：域名重解析编排装配（回调持 Weak 回指——Shared 生命周期自洽）。
+        if !domain_eps.is_empty() {
+            let w1 = Arc::downgrade(&shared);
+            let w2 = Arc::downgrade(&shared);
+            let w3 = Arc::downgrade(&shared);
+            let rf = Arc::new(crate::wtransport::domain_eps::DomainRefresher::new(
+                domain_eps,
+                domain_initial,
+                Arc::clone(&logf),
+                Arc::new(move |fresh: &[Candidate]| {
+                    if let Some(sh) = w1.upgrade() {
+                        *sh.domain_cands.lock().expect("域名候选锁中毒") = fresh.to_vec();
+                        let merged = sh.merged_candidates();
+                        sh.current().set_candidates(merged);
+                    }
+                }),
+                Arc::new(move || {
+                    let sh = w2.upgrade()?;
+                    let snap = sh.current().snapshot();
+                    if snap.via == Via::Relay {
+                        snap.ep
+                    } else {
+                        None
+                    }
+                }),
+                Arc::new(move || {
+                    if let Some(sh) = w3.upgrade() {
+                        let _ = sh.current().rearm_soft();
+                        let merged = sh.merged_candidates();
+                        sh.current().set_candidates(merged);
+                    }
+                }),
+            ));
+            *shared.domain_refresher.write().expect("重解析器锁中毒") = Some(rf);
+        }
         // C3（第二字段 = 本设备派生隧道地址——评审中-4）
         (logf)(&format!(
             "新栈会话已建立（token 端点 {} 个，后端隧道地址 {}）",
@@ -611,6 +663,18 @@ impl recover::LadderTransport for EngineTransport<'_> {
                     .map_err(action_err)?;
                 let cands = self.shared.merged_candidates();
                 self.client.set_candidates(cands);
+                // 域名重解析并发另跑（P0-4：Rearm 动作本体零 DNS 等待——恢复阶梯的
+                // 动作预算 2s 有界，塞进 5s DNS 预算会把蜂窝下常态 DNS 空等打成
+                // rc=-3 误升整套重建）。
+                if let Some(rf) = self
+                    .shared
+                    .domain_refresher
+                    .read()
+                    .expect("重解析器锁中毒")
+                    .clone()
+                {
+                    rf.refresh_async();
+                }
                 Ok(())
             }
         }
@@ -702,6 +766,14 @@ fn punch_to(shared: &Arc<Shared>, addr: SocketAddr) {
     }
     let client = shared.current();
     let _ = client.rearm_soft();
+    if let Some(rf) = shared
+        .domain_refresher
+        .read()
+        .expect("重解析器锁中毒")
+        .clone()
+    {
+        rf.refresh_async();
+    }
     (shared.logf)(&format!("中继 hint {addr} → 重新武装候选赛跑，打一发握手兼打洞"));
     // 打洞探测（5s 预算；refused = 路径通——RST 说明握手与路径都通了）
     match client.path_probe(Duration::from_secs(5)) {
@@ -748,6 +820,20 @@ fn spawn_save_loop(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<()>) -> Op
 /// 旁路探测候选（Go ProbeCandidates：只打直连条目——探测中继端点拿到的是中继自己的
 /// 列表，污染候选表；应答端点经消费卫兵后入缓存）。
 fn run_probe_candidates(shared: &Arc<Shared>) {
+    // 域名同步重解析（Go ProbeCandidates：3s 预算，等待有界——DNS 慢不能拖死探测
+    // 本身；单飞由调用频度〔60s 巡检拍〕天然限住）。
+    if let Some(rf) = shared
+        .domain_refresher
+        .read()
+        .expect("重解析器锁中毒")
+        .clone()
+    {
+        if let Some(fresh) = rf.refresh_sync(crate::wtransport::domain_eps::PROBE_SYNC_BUDGET) {
+            *shared.domain_cands.lock().expect("域名候选锁中毒") = fresh;
+            let merged = shared.merged_candidates();
+            shared.current().set_candidates(merged);
+        }
+    }
     // 只打直连条目（探测中继端点拿到的是中继自己的列表，污染候选表）
     let targets: Vec<SocketAddr> = shared
         .merged_candidates()
@@ -877,6 +963,14 @@ fn patrol_loop(shared: Arc<Shared>) {
                     let _ = client.rearm_soft();
                     let merged = shared.merged_candidates();
                     shared.current().set_candidates(merged);
+                    if let Some(rf) = shared
+                        .domain_refresher
+                        .read()
+                        .expect("重解析器锁中毒")
+                        .clone()
+                    {
+                        rf.refresh_async();
+                    }
                     let _ = shared.save_tx.send(());
                     // 这一发探测包就是「镜像出去试直连」的出站包（perTry 10s 窗）
                     let ustarted = Instant::now();

@@ -7,6 +7,7 @@
 
 pub mod bind;
 pub mod bindwatch;
+pub mod ddnscheck;
 pub mod device;
 pub mod dnsproxy;
 pub mod engine;

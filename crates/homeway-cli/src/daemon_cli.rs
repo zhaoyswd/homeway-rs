@@ -759,7 +759,7 @@ pub fn cmd_status(args: &[String]) {
 
 pub fn cmd_serve_group(args: &[String]) {
     let Some(verb) = args.first() else {
-        eprintln!("serve 命令组需要动词：start / stop / restart / status / token");
+        eprintln!("serve 命令组需要动词：start / stop / restart / status / token / relay / ddns");
         std::process::exit(2);
     };
     let op = match verb.as_str() {
@@ -768,12 +768,14 @@ pub fn cmd_serve_group(args: &[String]) {
         "restart" => vocab::OpName::ServeRestart,
         "status" => vocab::OpName::ServeStatus,
         "token" => vocab::OpName::ServeToken,
+        // 一次性直跑（纯文件操作——servegroup_cli.go「serve relay set/clear 与 ddns」
+        // 同框：写完打「需 restart 生效」提示）。
         "relay" | "ddns" => {
-            eprintln!("serve {verb} 归 B0-2 后续棒（serve relay set / ddns 管理）");
-            std::process::exit(2);
+            serve_ddns_relay_group(verb, &args[1..]);
+            return;
         }
         other => {
-            eprintln!("serve 不认识的动词 {other:?}（可用：start / stop / restart / status / token）");
+            eprintln!("serve 不认识的动词 {other:?}（可用：start / stop / restart / status / token / relay / ddns）");
             std::process::exit(2);
         }
     };
@@ -1348,5 +1350,241 @@ fn drop_status_watch_signals(p: WatchSigPipe) {
         libc::signal(libc::SIGTERM, libc::SIG_DFL);
         libc::close(p.read_fd);
         libc::close(p.write_fd);
+    }
+}
+
+// ---------- serve relay set/clear 与 serve ddns（一次性直跑：纯文件操作） ----------
+// 语义真源 baseline:internal/daemon/servegroup_cli.go 的 serveRelayCLI/serveDDNSCLI。
+// 写 config 用 unified_cli::update_config（重读→只改目标键→原子写 0600）；
+// 在跑检测 = 控制面 dial 短试 + lock 试探兜（Go daemonRunning 同义）。
+
+/// 守护进程在跑判定（提示「需 restart 生效」的依据）。
+fn daemon_running_probe(state_dir: &std::path::Path) -> bool {
+    if try_dial_control_named(state_dir, "homeway-serve").is_some() {
+        return true;
+    }
+    lock_held_probe(state_dir).0
+}
+
+fn serve_ddns_relay_group(group: &str, args: &[String]) {
+    let Some(verb) = args.first() else {
+        match group {
+            "ddns" => {
+                eprintln!("用法：homeway serve ddns add <domain> | homeway serve ddns delete <domain> | homeway serve ddns list");
+                eprintln!("（[[serve.ddns]] = token 叠加域名条目 + 自检；域名记录由你的 DDNS 设施维护）");
+                std::process::exit(2);
+            }
+            _ => {
+                eprintln!("用法：homeway serve relay set <token> [--stdin] | homeway serve relay clear");
+                eprintln!("（serve.relay = 本出口注册到哪个**上游中继**的 token；[relay] 节 = 本机当中继——同词根不同义）");
+                std::process::exit(2);
+            }
+        }
+    };
+    match (group, verb.as_str()) {
+        ("ddns", "add") | ("ddns", "delete") => serve_ddns_write(verb, &args[1..]),
+        ("ddns", "list") => serve_ddns_list(&args[1..]),
+        ("relay", "set") => serve_relay_set(&args[1..]),
+        ("relay", "clear") => serve_relay_clear(&args[1..]),
+        ("ddns", other) => {
+            eprintln!("serve ddns 不认识的动词 {other:?}（可用：add / delete / list）");
+            std::process::exit(2);
+        }
+        ("relay", other) => {
+            eprintln!("serve relay 不认识的动词 {other:?}（可用：set / clear）");
+            std::process::exit(2);
+        }
+        _ => unreachable!(),
+    }
+}
+
+fn serve_ddns_write(verb: &str, args: &[String]) {
+    let p = parse_args("serve ddns <add|delete> [--state DIR]", args);
+    if p.positional.len() != 1 {
+        eprintln!("serve ddns {verb} 需要 <domain>（裸域名）");
+        std::process::exit(2);
+    }
+    let domain = p.positional[0].trim().to_owned();
+    if domain.is_empty() || domain.contains(':') || domain.contains('/') || domain.contains(' ') {
+        eprintln!("serve ddns {verb} 需要 <domain>（裸域名——不带端口/路径）：{domain:?}");
+        std::process::exit(2);
+    }
+    let edit = if verb == "add" {
+        crate::unified_cli::ConfigEdit::DdnsAdd(domain.clone())
+    } else {
+        crate::unified_cli::ConfigEdit::DdnsRemove(domain.clone())
+    };
+    let r = crate::unified_cli::update_config(&p.state, edit);
+    let written = match r {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    };
+    match written {
+        crate::unified_cli::DdnsWrite::AlreadyThere => {
+            eprintln!("ddns 条目 {domain} 已在 config（不重复添加）");
+            std::process::exit(1);
+        }
+        crate::unified_cli::DdnsWrite::Absent => {
+            println!("ddns 条目 {domain} 不在 config（幂等，无动作）");
+        }
+        crate::unified_cli::DdnsWrite::Written => {
+            if verb == "add" {
+                println!("ddns 条目 {domain} 已写入 config");
+            } else {
+                println!("ddns 条目 {domain} 已从 config 删除");
+            }
+        }
+    }
+    if daemon_running_probe(&p.state) {
+        println!("⚠️ 不热更：需 `homeway serve restart` 生效");
+    }
+}
+
+fn serve_ddns_list(args: &[String]) {
+    let p = parse_args("serve ddns list [--json] [--state DIR]", args);
+    match crate::unified_cli::config_serve_ddns(&p.state) {
+        Ok(list) => {
+            if p.json {
+                println!("{}", serde_json::to_string(&list).unwrap_or_else(|_| "[]".to_owned()));
+                return;
+            }
+            if list.is_empty() {
+                println!("（config 无 ddns 条目）");
+                return;
+            }
+            for d in list {
+                println!("{d}");
+            }
+        }
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// CLI 侧 relay token 形态校验（与 config 校验同口径：rl1 前缀必须可解码，否则裸
+/// IP:port——Go ValidateRelayArg 同义）。
+fn validate_relay_arg(tok: &str) -> Result<(), String> {
+    if tok.starts_with("rl1") {
+        return homeway_core::relay::rltoken::decode_relay_token(tok)
+            .map(|_| ())
+            .map_err(|e| format!("rl1 token 解码失败：{e}"));
+    }
+    if let Ok(ap) = tok.parse::<std::net::SocketAddr>() {
+        if ap.port() != 0 {
+            return Ok(());
+        }
+    }
+    Err(format!("relay 参数非法：{tok:?}（rl1… token 或 IP:port）"))
+}
+
+fn serve_relay_set(args: &[String]) {
+    let mut state = default_state_dir();
+    let mut stdin_flag = false;
+    let mut i = 0;
+    while i < args.len() {
+        let a = args[i].as_str();
+        let (name, inline) = match a.strip_prefix("--").unwrap_or(a).split_once('=') {
+            Some((k, v)) => (k.to_owned(), Some(v.to_owned())),
+            None => (a.trim_start_matches('-').to_owned(), None),
+        };
+        match name.as_str() {
+            "state" => {
+                if let Some(v) = inline {
+                    state = PathBuf::from(v);
+                } else {
+                    i += 1;
+                    let Some(v) = args.get(i) else {
+                        eprintln!("--state 需要目录参数");
+                        std::process::exit(2);
+                    };
+                    state = PathBuf::from(v.clone());
+                }
+            }
+            "stdin" => stdin_flag = true,
+            "help" | "h" => {
+                println!("用法：homeway serve relay set <token> [--stdin] [--state D]");
+                return;
+            }
+            _ => {
+                eprintln!("未知参数：{a}");
+                std::process::exit(2);
+            }
+        }
+        i += 1;
+    }
+    let positional: Vec<&String> = args
+        .iter()
+        .filter(|a| !a.starts_with('-') && !matches!(a.as_str(), "set"))
+        .collect();
+    let token = if stdin_flag {
+        let mut line = String::new();
+        use std::io::BufRead;
+        if std::io::stdin().lock().read_line(&mut line).is_err() && line.is_empty() {
+            eprintln!("读 stdin 失败");
+            std::process::exit(1);
+        }
+        line.trim().to_owned()
+    } else {
+        if positional.len() != 1 {
+            eprintln!("serve relay set 需要 <token>（rl1… 或裸 IP:port）或 --stdin（从 stdin 读单行）");
+            std::process::exit(2);
+        }
+        positional[0].trim().to_owned()
+    };
+    if token.is_empty() {
+        eprintln!("token 为空（--stdin 读到空行）");
+        std::process::exit(1);
+    }
+    if let Err(e) = validate_relay_arg(&token) {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+    let masked = mask_for_hint(&token);
+    if let Err(e) = crate::unified_cli::update_config(
+        &state,
+        crate::unified_cli::ConfigEdit::RelaySet(token.clone()),
+    ) {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+    println!("serve.relay 已写入 config（{masked}，0600 原子写）");
+    if daemon_running_probe(&state) {
+        println!("⚠️ 不热更：需 `homeway serve restart` 生效（重启后中继注册腿以新 token 注册）");
+    }
+}
+
+fn serve_relay_clear(args: &[String]) {
+    let p = parse_args("serve relay clear [--state DIR]", args);
+    if !p.positional.is_empty() {
+        eprintln!("serve relay clear 不接受位置参数（得 {:?}）", p.positional);
+        std::process::exit(2);
+    }
+    if let Err(e) = crate::unified_cli::update_config(
+        &p.state,
+        crate::unified_cli::ConfigEdit::RelayClear,
+    ) {
+        eprintln!("{e}");
+        std::process::exit(1);
+    }
+    println!("serve.relay 已从 config 清除");
+    if daemon_running_probe(&p.state) {
+        println!("⚠️ 不热更：需 `homeway serve restart` 生效（重启后不再注册中继）");
+    }
+}
+
+/// 写入回显的 token 掩码（凭证纪律：全文在命令行参数里，输出面保持掩码习惯）。
+fn mask_for_hint(tok: &str) -> String {
+    let n = tok.chars().count();
+    if n <= 12 {
+        let head: String = tok.chars().take(4).collect();
+        format!("{head}…")
+    } else {
+        let head: String = tok.chars().take(12).collect();
+        format!("{head}…")
     }
 }

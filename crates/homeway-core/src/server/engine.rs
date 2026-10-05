@@ -79,6 +79,9 @@ pub struct ServeConfig {
     pub build: String,
     /// serve --relay / config serve.relay：rl1 token 或裸 host:port（None = 不起注册腿）。
     pub relay: Option<String>,
+    /// DDNS 裸域名（可多条，`[[serve.ddns]]` / `--ddns`）：token 叠加 `域:端口` 条目
+    /// （不解析不踢除；域名记录由用户 DDNS 设施维护）+ 自检随公网端点探测同拍跑。
+    pub ddns: Vec<String>,
 }
 
 impl Default for ServeConfig {
@@ -102,6 +105,7 @@ impl Default for ServeConfig {
             verbose: false,
             build: "homeway-rs-dev".to_owned(),
             relay: None,
+            ddns: Vec::new(),
         }
     }
 }
@@ -178,6 +182,9 @@ pub struct ServeEngine {
     pub state_dir: PathBuf,
     pub serve_dir: PathBuf,
     socks: Vec<(PathBuf, (u64, u64))>,
+    /// DDNS 域名表与自检状态（status 观测面快照用；与 TokenCtx 共享同一份）。
+    ddns: Vec<String>,
+    ddns_checks: super::ddnscheck::DdnsChecks,
 }
 
 impl ServeEngine {
@@ -574,6 +581,16 @@ impl ServeEngine {
             .expect("spawn serve driver");
 
         // ---- 公网端点观测线程 + token 打印 ----
+        // P0-4：DDNS 域名配置行（Go serve.go Start 同串）+ 探测全关时的跳过告示。
+        if !cfg.ddns.is_empty() {
+            (logf)(&format!(
+                "DDNS：已配置 {} 个域名（token 叠加域名条目、既有端点全保留；自检随公网端点探测同拍跑）",
+                cfg.ddns.len()
+            ));
+        }
+        let ddns_checks: super::ddnscheck::DdnsChecks = Arc::new(
+            std::collections::HashMap::new().into(),
+        );
         let shared = Arc::new(TokenCtx {
             cfg: cfg.clone(),
             st: Arc::clone(&st),
@@ -589,6 +606,7 @@ impl ServeEngine {
             tokf,
             log_paths,
             pinned_flag: Arc::clone(&pinned_flag),
+            ddns_checks: Arc::clone(&ddns_checks),
         });
         let pub_enabled = cfg.upnp || !cfg.stun.is_empty() || !cfg.public_endpoint.is_empty();
         if pub_enabled {
@@ -606,6 +624,11 @@ impl ServeEngine {
             // 分支不会执行 recv——它走自己的 15s 档；tx drop 只是让通道不悬空）。
             drop(first_probe_tx);
             drop(pub_kick_rx);
+            if !cfg.ddns.is_empty() {
+                (logf)(
+                    "DDNS：公网端点探测未开（--upnp=false --stun=''），自检没有观测可比对、跳过；token 的域名条目端口按实际监听口",
+                );
+            }
         }
 
         // ---- token 兜底线（Go role.go 终端兜底 goroutine 同义）----
@@ -733,6 +756,8 @@ impl ServeEngine {
             state_dir: cfg.state_dir.clone(),
             serve_dir,
             socks,
+            ddns: cfg.ddns.clone(),
+            ddns_checks,
         }))
     }
 
@@ -785,8 +810,15 @@ impl ServeEngine {
     }
 
     /// serve.status 观测面（B0-2b 缝）：peers 经驱动线程快照（设备表驱动独占），
-    /// 拦截计数共享原子直读。引擎已停/驱动不应答 = 空表 + 零计数（观测面不复活角色）。
-    pub fn status_bits(&self) -> (Vec<EnginePeerBrief>, EngineInterceptBits) {
+    /// 拦截计数共享原子直读；ddns 自检快照读共享状态表。引擎已停/驱动不应答 =
+    /// 空表 + 零计数（观测面不复活角色）。
+    pub fn status_bits(
+        &self,
+    ) -> (
+        Vec<EnginePeerBrief>,
+        EngineInterceptBits,
+        Vec<super::ddnscheck::DdnsBrief>,
+    ) {
         let peers = (|| {
             let (tx, rx) = mpsc::channel();
             self.cmd_tx.send(EngineCmd::StatusQuery { reply: tx }).ok()?;
@@ -795,6 +827,7 @@ impl ServeEngine {
         .unwrap_or_default();
         let s = self.itc_stats.snapshot();
         let get = |k: &str| s.iter().find(|(n, _)| *n == k).map(|(_, v)| *v).unwrap_or(0);
+        let ddns = super::ddnscheck::briefs(&self.ddns_checks, &self.ddns);
         (
             peers,
             EngineInterceptBits {
@@ -803,6 +836,7 @@ impl ServeEngine {
                 reject: get("rejected"),
                 flows: get("flows"),
             },
+            ddns,
         )
     }
 
@@ -1230,6 +1264,8 @@ struct TokenCtx {
     /// 「socket 已钉卡/绑地址」的运行期事实（Go `pinnedNow`——钉卡失败自动降级、
     /// 看护循环重钉成功后置回；公网端点公布的保守判据读这里）。
     pinned_flag: Arc<AtomicBool>,
+    /// DDNS 自检的滚动状态（按域名一域一份；探测线程写 / status 快照读——P0-4）。
+    ddns_checks: super::ddnscheck::DdnsChecks,
 }
 
 /// 公网端点循环：成功 10min / 失败 2min 一轮；显式端点配置覆盖最高优先（FIX-61）。
@@ -1243,6 +1279,21 @@ fn public_endpoint_loop(
     let mut first = true;
     loop {
         let ok = refresh_public_endpoint(&ctx, &cmd_tx);
+        // DDNS 自检与探测同拍（换网 kick 轮也会跑到——published 取最近一轮观测；
+        // Go publicendpoint.go:83 同义）。published 为空时自检内部自跳。
+        {
+            let published = ctx
+                .inner
+                .lock()
+                .map(|i| i.last_published.clone())
+                .unwrap_or_default();
+            super::ddnscheck::run_ddns_self_check(
+                &ctx.ddns_checks,
+                &ctx.cfg.ddns,
+                &published,
+                &*ctx.logf,
+            );
+        }
         if first {
             first = false;
             let _ = first_probe_tx.try_send(()); // cap=1 非阻塞（Go select-default 同义）
@@ -1435,6 +1486,19 @@ fn format_lines(lines: &[String]) -> String {
     format!("[{}]", lines.join(" "))
 }
 
+/// `--ddns` 域名条目的端口 = 已公布公网 v4 端点的外部端口；无公网端点观测
+/// （--upnp=false --stun=""）时回退实际监听口（`ddnsEntryPort` 同义）。
+fn ddns_entry_port(published: &[String], listen_port: u16) -> u16 {
+    for line in published {
+        if let Ok(ap) = line.parse::<SocketAddr>() {
+            if ap.is_ipv4() && ap.port() != 0 {
+                return ap.port();
+            }
+        }
+    }
+    listen_port
+}
+
 fn public_v4(ap: SocketAddr) -> bool {
     match ap.ip() {
         IpAddr::V4(v4) => egress::is_public_addr(IpAddr::V4(v4)),
@@ -1530,6 +1594,22 @@ fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
     }
     for p in published {
         add(Endpoint { addr: p.clone(), kind: EndpointKind::Direct }, "公网");
+    }
+    // DDNS 域名条目（多条，叠加不踢除——B-1 拍板）：端口口径 = 已公布公网 v4 端点的
+    // 外部端口；无公网观测时回退实际监听口（让位退让后的真实口）。
+    if !ctx.cfg.ddns.is_empty() {
+        let p = ddns_entry_port(published, ctx.local_port);
+        if p != 0 {
+            for domain in &ctx.cfg.ddns {
+                add(
+                    Endpoint { addr: format!("{domain}:{p}"), kind: EndpointKind::Direct },
+                    "域名",
+                );
+            }
+        } else {
+            // listenPort=0 的调用形态（探测应答的即时快照）：域名条目这轮缺席，下一轮补上。
+            (dlogf)("域名条目：本轮拿不到端口（socket 未开？），token/列表暂不带 ddns 条目");
+        }
     }
     if let Some(r) = &ctx.relay_ep {
         add(r.clone(), "中继");

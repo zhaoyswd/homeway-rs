@@ -40,10 +40,9 @@ struct FileServe {
     dns_port: Option<u16>,
     #[serde(default)]
     files_root: Option<String>,
-    /// Go 键表含 `[[serve.ddns]]`（serve ddns add 写出）——R3 不实现自检，但**必须
-    /// 接受**该键：同 state 目录被 Go 配过 DDNS 后拒绝启动是兼容性破坏（评审 M17）。
+    /// Go 键表含 `[[serve.ddns]]`（serve ddns add 写出）——P0-4 起消费：token
+    /// 叠加域名条目 + 自检。
     #[serde(default)]
-    #[allow(dead_code)]
     ddns: Option<Vec<FileDdns>>,
 }
 
@@ -51,7 +50,6 @@ struct FileServe {
 #[serde(deny_unknown_fields)]
 struct FileDdns {
     #[serde(default)]
-    #[allow(dead_code)]
     domain: String,
 }
 
@@ -122,6 +120,9 @@ struct ServeFlags {
     files_root: Option<String>,
     verbose: bool,
     relay: Option<String>,
+    /// DDNS 域名（`--ddns` 单值 flag：显式给 = 覆盖 config 的**全部**条目——
+    /// 一次性覆盖语义，Go cli.go:127-134 同口径）。
+    ddns: Option<String>,
     /// 位置参数（serve 不接受）。
     extra: Vec<String>,
 }
@@ -141,6 +142,7 @@ fn parse_serve_flags(args: &[String]) -> ServeFlags {
         files_root: None,
         verbose: false,
         relay: None,
+        ddns: None,
         extra: Vec::new(),
     };
     let mut i = 0;
@@ -231,6 +233,18 @@ fn parse_serve_flags(args: &[String]) -> ServeFlags {
             }
             "files-root" => f.files_root = take_val(&mut j),
             "relay" => f.relay = take_val(&mut j),
+            "ddns" => {
+                let Some(v) = take_val(&mut j) else {
+                    eprintln!("--ddns 缺值（裸域名，如 home.example.com）");
+                    std::process::exit(2);
+                };
+                if v.contains(':') || v.contains('/') || v.contains(' ') {
+                    // Go cli.go:55 同校验同串
+                    eprintln!("--ddns 只要裸域名（不带端口/路径）：{v:?}");
+                    std::process::exit(2);
+                }
+                f.ddns = Some(v);
+            }
             "verbose" => f.verbose = true,
             other => {
                 eprintln!("未知参数：--{other}");
@@ -314,6 +328,25 @@ pub fn assemble(args: &[String]) -> ServeConfig {
                 cfg.relay = Some(v);
             }
         }
+        // [[serve.ddns]]：域名条目（P0-4）。校验口径同 Go nodeconfig（空域名/带端口
+        // 路径 = 非法——`serve.ddns.domain` 键名同串）。
+        if let Some(list) = fc.serve.ddns {
+            for d in &list {
+                let dom = d.domain.trim();
+                if dom.is_empty() {
+                    eprintln!("{}: serve.ddns.domain 空域名非法", cfg_path.display());
+                    std::process::exit(1);
+                }
+                if dom.contains(':') || dom.contains('/') || dom.contains(' ') {
+                    eprintln!(
+                        "{}: serve.ddns.domain {dom:?} 非法（只要裸域名，不带端口/路径）",
+                        cfg_path.display()
+                    );
+                    std::process::exit(1);
+                }
+            }
+            cfg.ddns = list.into_iter().map(|d| d.domain.trim().to_owned()).collect();
+        }
     }
     // flag 覆盖
     if let Some(v) = f.listen {
@@ -353,6 +386,15 @@ pub fn assemble(args: &[String]) -> ServeConfig {
         } else {
             cfg.relay = Some(v.clone());
         }
+    }
+    // --ddns 单值 flag 显式给出 = 覆盖 config 的**全部**条目（一次性覆盖语义；
+    // --ddns= 空值 = 清空）。
+    if let Some(v) = &f.ddns {
+        cfg.ddns = if v.is_empty() {
+            Vec::new()
+        } else {
+            vec![v.clone()]
+        };
     }
     cfg
 }

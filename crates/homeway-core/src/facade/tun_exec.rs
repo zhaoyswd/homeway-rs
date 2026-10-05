@@ -292,6 +292,10 @@ pub struct GenRun {
     /// 端点学习缓存（None = 不落盘不学）。
     cache: Option<Mutex<EndpointCache>>,
     static_cands: Vec<Candidate>,
+    /// 域名条目候选（最近一次解析产物；静态面 = static_cands + 本组——P0-4）。
+    domain_cands: Mutex<Vec<Candidate>>,
+    /// 域名重解析编排（无域名条目 = None；Rearm/RearmSoft/旁路探测拍触发）。
+    domain_refresher: RwLock<Option<Arc<crate::wtransport::domain_eps::DomainRefresher>>>,
     /// 重建材料（Token 的身份面；候选 = static_cands 另存）。
     secret: [u8; 32],
     #[allow(dead_code)]
@@ -340,12 +344,27 @@ impl GenRun {
     }
 
     fn merged_candidates(&self) -> Vec<Candidate> {
+        let domain = lock_unpoison(&self.domain_cands).clone();
+        let mut base = self.static_cands.clone();
+        base.extend(domain);
         match &self.cache {
             Some(c) => {
                 let c = lock_unpoison(c);
-                c.merge(&self.static_cands, SystemTime::now())
+                c.merge(&base, SystemTime::now())
             }
-            None => self.static_cands.clone(),
+            None => base,
+        }
+    }
+
+    /// 域名重解析触发（Rearm/RearmSoft 面——无域名 = no-op）。
+    fn domain_refresh_async(&self) {
+        if let Some(rf) = self
+            .domain_refresher
+            .read()
+            .map(|g| g.clone())
+            .unwrap_or(None)
+        {
+            rf.refresh_async();
         }
     }
 
@@ -411,12 +430,14 @@ impl LadderTransport for TunnelTransport<'_> {
                 .rebind_bounded(recover::ACTION)
                 .map_err(action_err),
             Action::Rearm => {
-                // R3 = 清采纳重赛跑 + 候选重投（Go Transport.Rearm 复合）
+                // R3 = 清采纳重赛跑 + 候选重投（Go Transport.Rearm 复合）+ 域名重解析
+                // 并发另跑（P0-4：动作本体零 DNS 等待）。
                 self.client
                     .rearm_bounded(recover::ACTION)
                     .map_err(action_err)?;
                 let cands = self.run.merged_candidates();
                 self.client.set_candidates(cands);
+                self.run.domain_refresh_async();
                 Ok(())
             }
         }
@@ -724,17 +745,17 @@ fn gen_loop(
     // TunShared 的旗标中继，装配完成点统一收口（评审 r2-M2 的窗口语义）。
     let stop = Arc::new(AtomicBool::new(false));
     shared.set_stop_flag_if_current(gen, Arc::clone(&stop));
-    let candidates: Vec<Candidate> = cfg
+    // P0-4：域名端点展开（IP 字面量直入 + 域名建会话解析一次 + 原文留给重解析）。
+    let ep_refs: Vec<crate::token::EndpointRef> = cfg
         .token
         .endpoints
         .iter()
-        .filter_map(|e| {
-            e.addr.parse().ok().map(|addr| Candidate {
-                addr,
-                relay: e.kind == crate::token::EndpointKind::Relay,
-            })
-        })
+        .map(|e| crate::token::EndpointRef::new(e.addr.as_str(), e.kind))
         .collect();
+    let inputs = crate::wtransport::domain_eps::split_and_resolve(&ep_refs, &logf);
+    let candidates: Vec<Candidate> = inputs.candidates;
+    let domain_eps = inputs.domains;
+    let domain_initial = inputs.domain_initial;
     if candidates.is_empty() {
         shared.stage.set_if_current(
             gen,
@@ -789,7 +810,48 @@ fn gen_loop(
         started: Instant::now(),
         save_tx: Some(save_tx),
         last_punch: Mutex::new(None),
+        domain_cands: Mutex::new(domain_initial.clone()),
+        domain_refresher: RwLock::new(None),
     });
+    // P0-4：域名重解析编排装配（回调持 Weak 回指 GenRun）。
+    if !domain_eps.is_empty() {
+        let w1 = Arc::downgrade(&run);
+        let w2 = Arc::downgrade(&run);
+        let w3 = Arc::downgrade(&run);
+        let rf = Arc::new(crate::wtransport::domain_eps::DomainRefresher::new(
+            domain_eps,
+            domain_initial,
+            Arc::clone(&logf),
+            Arc::new(move |fresh: &[Candidate]| {
+                if let Some(r) = w1.upgrade() {
+                    *lock_unpoison(&r.domain_cands) = fresh.to_vec();
+                    if let Some(c) = r.current_client() {
+                        let merged = r.merged_candidates();
+                        c.set_candidates(merged);
+                    }
+                }
+            }),
+            Arc::new(move || {
+                let r = w2.upgrade()?;
+                let c = r.current_client()?;
+                let snap = c.snapshot();
+                if snap.via == Via::Relay { snap.ep } else { None }
+            }),
+            Arc::new(move || {
+                if let Some(r) = w3.upgrade() {
+                    if let Some(c) = r.current_client() {
+                        let _ = c.rearm_soft();
+                        let merged = r.merged_candidates();
+                        c.set_candidates(merged);
+                    }
+                }
+            }),
+        ));
+        *run
+            .domain_refresher
+            .write()
+            .unwrap_or_else(|e| e.into_inner()) = Some(rf);
+    }
     // ---- 世代句柄登记（Client::start **之前**——评审 r2-M2：窗口内 request_stop/
     // recover/runner 打得到世代；Go beginTunRun 在 goroutine 之前建好世代句柄）----
     *lock_unpoison(&state) = Some(Arc::clone(&run));
@@ -1235,6 +1297,7 @@ fn tunnel_punch_to(run: &Arc<GenRun>, addr: SocketAddr) {
         return;
     };
     let _ = client.rearm_soft();
+    run.domain_refresh_async();
     (run.logf)(&format!(
         "中继 hint {addr} → 重新武装候选赛跑，打一发握手兼打洞"
     ));
@@ -1422,6 +1485,7 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
                 let _ = client.rearm_soft();
                 let merged = run.merged_candidates();
                 client.set_candidates(merged);
+                run.domain_refresh_async();
                 let ustarted = Instant::now();
                 if client.path_probe(PROBE_TIMEOUT).is_ok() {
                     let st2 = client.snapshot();
@@ -1590,6 +1654,23 @@ fn relay_upgrade_due(via: Via, streak: u32) -> bool {
 
 /// 旁路探测候选（只打直连条目——探测中继端点拿到的是中继自己的列表，污染候选表）。
 fn run_probe_candidates(run: &Arc<GenRun>) {
+    // 域名同步重解析（Go ProbeCandidates 的 3s 有界形态——单飞由 60s 巡检拍限住）。
+    if let Some(rf) = run
+        .domain_refresher
+        .read()
+        .map(|g| g.clone())
+        .unwrap_or(None)
+    {
+        if let Some(fresh) =
+            rf.refresh_sync(crate::wtransport::domain_eps::PROBE_SYNC_BUDGET)
+        {
+            *lock_unpoison(&run.domain_cands) = fresh;
+            if let Some(cl) = run.current_client() {
+                let merged = run.merged_candidates();
+                cl.set_candidates(merged);
+            }
+        }
+    }
     let targets: Vec<SocketAddr> = run
         .merged_candidates()
         .into_iter()
@@ -1767,25 +1848,24 @@ fn now_unix_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::facade::{ClientCore, TunStage};
-    use crate::token::{self, EndpointKind, EndpointRef, PeerId, Secret, TokenSpec};
+    use crate::token::{self, EndpointRef, PeerId, Secret, TokenSpec};
 
-    /// 复核 r3-F1：空候选早退路径（域名端点——token 解析接受、候选解析只收 IP ⇒ 空）
-    /// 必须放单飞锁——下一次 prepare 可受理。回归背景：EarlyFinish 守卫引入前该路径
-    /// 漏 finish_generation ⇒ tun_prepare 之后恒 -1、tun_stop 恒 -2（接线即坏同形态）。
+    /// 复核 r3-F1：空候选早退路径（token 端点列表空 ⇒ 候选空）必须放单飞锁——下一次
+    /// prepare 可受理。回归背景：EarlyFinish 守卫引入前该路径漏 finish_generation ⇒
+    /// tun_prepare 之后恒 -1、tun_stop 恒 -2（接线即坏同形态）。
+    /// 注（P0-4 起）：域名端点不再天然构成空候选（建会话时解析一次、失败跳过）——
+    /// 空候选的确定性构造改用空端点列表。
     #[test]
     fn tunnel_empty_candidates_releases_lock() {
         let peer = PeerId::from([1u8; 32]);
         let secret = Secret::from([2u8; 32]);
-        let eps = [EndpointRef::new(
-            "home.example.com:443",
-            EndpointKind::Direct,
-        )];
+        let eps: [EndpointRef; 0] = [];
         let tok = token::encode(&TokenSpec {
             peer_id: &peer,
             secret: &secret,
             endpoints: &eps,
         })
-        .expect("域名端点 token 可编码");
+        .expect("空端点 token 可编码");
         let demand = Arc::new(DemandSignals::new());
         let exec = TunnelExec::new(Arc::clone(&demand));
         let core = ClientCore::with_shared(exec, demand);
