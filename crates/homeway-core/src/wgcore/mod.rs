@@ -419,11 +419,15 @@ impl Engine {
         self.hp_encap_ns += hp_t3.saturating_duration_since(hp_t2).as_nanos();
         // 8n 归因观测行（每秒；收向有流量才打）：判别 = 三段耗时占比定位手机核
         // 每字节成本的去处（decap/栈 poll/上行 encap）+ 收包速率与均包长。
-        if self
-            .hp_last_line
-            .map(|t| t.elapsed() >= Duration::from_secs(1))
-            .unwrap_or(false)
-        {
+        // 首拍只落时间基（None → 起算点），满 1s 才报。
+        let due = match self.hp_last_line {
+            None => {
+                self.hp_last_line = Some(Instant::now());
+                false
+            }
+            Some(t) => t.elapsed() >= Duration::from_secs(1),
+        };
+        if due {
             if self.hp_rx_bytes > 0 {
                 let ms = |ns: u128| (ns / 1_000_000).min(9999) as u64;
                 (self.logf)(&format!(
@@ -438,6 +442,7 @@ impl Engine {
                     self.hp_tx_bytes / 1024,
                 ));
             }
+            self.hp_last_line = Some(Instant::now());
             self.hp_drain_ns = 0;
             self.hp_poll_ns = 0;
             self.hp_encap_ns = 0;
