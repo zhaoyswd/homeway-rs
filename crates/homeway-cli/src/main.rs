@@ -79,6 +79,9 @@ fn main() {
         Some("host") => daemon_cli::cmd_host(&args[2..]),
         Some("status") => daemon_cli::cmd_status(&args[2..]),
         Some("term") => term_cli::cmd_term(&args[2..]),
+        Some("export") => daemon_cli::cmd_export(&args[2..]),
+        Some("import") => daemon_cli::cmd_import(&args[2..]),
+        Some("reset") => daemon_cli::cmd_reset(&args[2..]),
         Some("connect") => cmd_connect(&args[2..]),
         Some("speedtest") => cmd_speedtest(&args[2..]),
         Some("files") => cmd_files(&args[2..]),
@@ -86,7 +89,7 @@ fn main() {
         Some("portfwd") => cmd_portfwd(&args[2..]),
         _ => {
             eprintln!(
-"homeway-cli——可用：\n  零参 = 统一进程（--state DIR / --verbose；client/control 恒开 + serve/relay 按期望态）\n  host add [--name N] [--force] <token> / host list [--json] / host status [name] / host delete <name|id> [--yes]\n  status [--json] [--watch]（daemon.status 聚合面）\n  term <list|new|attach|delete|explain> […]（本地面 term.sock；--host <ref> = 经控制面远程接入）\n  serve <start|stop|restart|status|token> / relay <start|stop|restart|status|token>（控制面命令组）\n  serve [flags]（前台单角色）/ relay [flags]（前台单角色）\n  token <hmw1…> [--dead-direct]（改写输出：Direct 端点 → 死端口——矩阵中继段注入缝）\n  connect --token <hmw1…> [--identity-dir <dir>] [--endpoint-cache-dir <dir>]\n      [--speedtest] [--dial <ip:port>] [--hold <secs>] [--probe N] [--status-json]\n      [--recover-from <1|2|3> [--recover-cause <s>]] [--inject poison-socket|relay-lock]（注入需 test-seams 构建）\n  speedtest --token <hmw1…> [--identity-dir D] [--endpoint-cache-dir D] [--rounds N] [--hold]（同会话 N 轮——A/B 轮次口径）"
+"homeway-cli——可用：\n  零参 = 统一进程（--state DIR / --verbose；client/control 恒开 + serve/relay 按期望态）\n  host add [--name N] [--force] <token> / host list [--json] / host status [name] / host delete <name|id> [--yes]\n  status [--json] [--watch]（daemon.status 聚合面）\n  term <list|new|attach|delete|explain> […]（本地面 term.sock；--host <ref> = 经控制面远程接入）\n  export [dest.tar] / import <file> / reset cache [--state D]（状态工件面：不变量四件打包/落位/清 cache）\n  serve <start|stop|restart|status|token> / relay <start|stop|restart|status|token>（控制面命令组）\n  serve [flags]（前台单角色）/ relay [flags]（前台单角色）\n  token <hmw1…> [--dead-direct]（改写输出：Direct 端点 → 死端口——矩阵中继段注入缝）\n  connect --token <hmw1…> [--identity-dir <dir>] [--endpoint-cache-dir <dir>]\n      [--speedtest] [--dial <ip:port>] [--hold <secs>] [--probe N] [--status-json]\n      [--recover-from <1|2|3> [--recover-cause <s>]] [--inject poison-socket|relay-lock]（注入需 test-seams 构建）\n  speedtest --token <hmw1…> [--identity-dir D] [--endpoint-cache-dir D] [--rounds N] [--hold]（同会话 N 轮——A/B 轮次口径）"
             );
             std::process::exit(2);
         }

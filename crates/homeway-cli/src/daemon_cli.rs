@@ -595,3 +595,136 @@ pub fn cmd_relay_group(args: &[String]) {
         _ => println!("relay：{}", v["action"].as_str().unwrap_or("?")),
     }
 }
+
+// ---------- export / import / reset（状态工件面；P1-6） ----------
+
+/// `homeway export [--state D] [dest.tar]`——一次性直跑（不连控制面；语义真源
+/// internal/daemon/artifact_cli.go）。默认名 homeway-export-<ts>.tar 于当前目录。
+pub fn cmd_export(args: &[String]) {
+    let mut state: Option<std::path::PathBuf> = None;
+    let mut dest = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--state" => {
+                i += 1;
+                state = args.get(i).map(std::path::PathBuf::from);
+                if state.is_none() {
+                    eprintln!("--state 后面缺参数");
+                    std::process::exit(2);
+                }
+            }
+            other => {
+                if dest.is_some() {
+                    eprintln!("export 至多一个位置参数（目标文件），got {other:?}");
+                    std::process::exit(2);
+                }
+                dest = Some(other.to_owned());
+            }
+        }
+        i += 1;
+    }
+    let state_dir = state.unwrap_or_else(crate::unified_cli::default_state_dir);
+    let dest = dest.unwrap_or_else(|| format!("homeway-export-{}.tar", now_timestamp()));
+    if let Err(e) = homeway_core::artifact::export(&state_dir, std::path::Path::new(&dest)) {
+        eprintln!("homeway: export 失败：{e}");
+        std::process::exit(1);
+    }
+    println!("已导出：{dest}（不变量四件 = config.toml + serve/ + relay/ + client/；0600、未压缩 tar）");
+}
+
+/// `homeway import <file> [--state D]`——布局校验 + 安全解包 + 落位序（目标进程
+/// 必须在停——锁试探拒绝）。
+pub fn cmd_import(args: &[String]) {
+    let mut state: Option<std::path::PathBuf> = None;
+    let mut file: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--state" => {
+                i += 1;
+                state = args.get(i).map(std::path::PathBuf::from);
+                if state.is_none() {
+                    eprintln!("--state 后面缺参数");
+                    std::process::exit(2);
+                }
+            }
+            other => {
+                if file.is_some() {
+                    eprintln!("import 只接受一个位置参数（工件文件），got {other:?}");
+                    std::process::exit(2);
+                }
+                file = Some(other.to_owned());
+            }
+        }
+        i += 1;
+    }
+    let Some(file) = file else {
+        eprintln!("import 需要 <file>（homeway export 产出的 tar 工件）");
+        std::process::exit(2);
+    };
+    let state_dir = state.unwrap_or_else(crate::unified_cli::default_state_dir);
+    if let Err(e) = homeway_core::artifact::import(&state_dir, std::path::Path::new(&file)) {
+        eprintln!("homeway: import 失败：{e}");
+        std::process::exit(1);
+    }
+    println!("已导入 {file} → {}（旧四件备份于 .import-old-*；身份与 token 连续）", state_dir.display());
+}
+
+/// `homeway reset cache [--state D]`（两词动词；v1 唯一动词 = cache）。
+pub fn cmd_reset(args: &[String]) {
+    let Some(verb) = args.first() else {
+        eprintln!("用法：homeway reset cache [--state D]（清可弃层 cache/；进程在跑拒绝）");
+        eprintln!("homeway: reset 需要动词：cache");
+        std::process::exit(1);
+    };
+    if verb != "cache" {
+        eprintln!("homeway: reset 不认识的动词 {verb:?}（可用：cache）");
+        std::process::exit(1);
+    }
+    let mut state: Option<std::path::PathBuf> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--state" => {
+                i += 1;
+                state = args.get(i).map(std::path::PathBuf::from);
+                if state.is_none() {
+                    eprintln!("--state 后面缺参数");
+                    std::process::exit(2);
+                }
+            }
+            other => {
+                eprintln!("reset cache 不接受位置参数（got {other:?}）");
+                std::process::exit(2);
+            }
+        }
+        i += 1;
+    }
+    let state_dir = state.unwrap_or_else(crate::unified_cli::default_state_dir);
+    if let Err(e) = homeway_core::artifact::reset_cache(&state_dir) {
+        eprintln!("homeway: reset cache 失败：{e}");
+        std::process::exit(1);
+    }
+    println!("cache/ 已清（日志/端点缓存可弃层；L1/L2 与 migration-backup-* 不动；下次启动自动重建）");
+}
+
+fn now_timestamp() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs() as i64;
+    unsafe {
+        let mut tm: libc::tm = std::mem::zeroed();
+        libc::localtime_r(&secs, &mut tm);
+        format!(
+            "{:04}{:02}{:02}-{:02}{:02}{:02}",
+            tm.tm_year as i64 + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec
+        )
+    }
+}

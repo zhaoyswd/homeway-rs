@@ -26,6 +26,7 @@ pub(crate) fn cc_choice() -> smoltcp::socket::tcp::CongestionControl {
 }
 
 pub mod facade;
+pub mod artifact;
 pub mod daemon;
 pub mod files;
 pub mod files_server;
