@@ -127,6 +127,9 @@ pub enum EngineCmd {
         name: String,
         reply: Sender<std::io::Result<()>>,
     },
+    /// serve.status 观测缝（B0-2b）：设备表 brief 快照（表 = 驱动线程独占——快照
+    /// 必须经驱动线程取；拦截计数是共享原子、不经此路）。
+    StatusQuery { reply: Sender<Vec<EnginePeerBrief>> },
     /// 控制面 SESSION 通告 → 向中继数据口拨腿（R4）。
     LegRegister { id: u64, remote: SocketAddr, marker: Vec<u8> },
     /// 控制面 RELEASE → 拆腿。
@@ -142,12 +145,33 @@ pub const UDPCAP_OBSERVED: u8 = 1 << 2;
 pub const UDPCAP_PROBED: u8 = 1 << 3;
 pub const UDPCAP_SEEN: u8 = 1 << 4;
 
+/// 设备表 brief 单条（观测面：dev = devTag 全 16hex、隧道 /32、最近注册 UnixMilli、
+/// 距今毫秒——Go servercore.DeviceBrief 同形）。
+#[derive(Debug, Clone)]
+pub struct EnginePeerBrief {
+    pub dev: String,
+    pub tunnel_ip: std::net::Ipv4Addr,
+    pub last_reg_ms: i64,
+    pub idle_ms: i64,
+}
+
+/// 过境拦截计数 brief（共享原子读——Go ServeInterceptBits 同形）。
+#[derive(Debug, Clone, Copy, Default)]
+pub struct EngineInterceptBits {
+    pub dial_ok: u64,
+    pub dial_fail: u64,
+    pub reject: u64,
+    pub flows: u64,
+}
+
 /// 出口引擎句柄（装配线程持有；stop 收工）。
 pub struct ServeEngine {
     cmd_tx: Sender<EngineCmd>,
     driver: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// 驱动线程在世位（线程出口清零——panic 也清：supervisor 的存活判据）。
     driver_alive: Arc<AtomicBool>,
+    /// 拦截计数共享原子（status 观测面直读——不占驱动线程）。
+    itc_stats: Arc<super::intercept::Stats>,
     pub local_port: u16,
     stop_flags: Vec<Arc<AtomicBool>>,
     term_srv: Option<Arc<crate::term::service::TermService>>,
@@ -687,6 +711,7 @@ impl ServeEngine {
             cmd_tx,
             driver: Mutex::new(Some(driver)),
             driver_alive: driver_alive_ctor,
+            itc_stats: Arc::clone(&itc_stats),
             local_port,
             stop_flags,
             term_srv,
@@ -742,6 +767,28 @@ impl ServeEngine {
     /// 的运行期失败判据）。
     pub fn alive(&self) -> bool {
         self.driver_alive.load(Ordering::SeqCst)
+    }
+
+    /// serve.status 观测面（B0-2b 缝）：peers 经驱动线程快照（设备表驱动独占），
+    /// 拦截计数共享原子直读。引擎已停/驱动不应答 = 空表 + 零计数（观测面不复活角色）。
+    pub fn status_bits(&self) -> (Vec<EnginePeerBrief>, EngineInterceptBits) {
+        let peers = (|| {
+            let (tx, rx) = mpsc::channel();
+            self.cmd_tx.send(EngineCmd::StatusQuery { reply: tx }).ok()?;
+            rx.recv_timeout(Duration::from_secs(2)).ok()
+        })()
+        .unwrap_or_default();
+        let s = self.itc_stats.snapshot();
+        let get = |k: &str| s.iter().find(|(n, _)| *n == k).map(|(_, v)| *v).unwrap_or(0);
+        (
+            peers,
+            EngineInterceptBits {
+                dial_ok: get("dialok"),
+                dial_fail: get("dialfail"),
+                reject: get("rejected"),
+                flows: get("flows"),
+            },
+        )
     }
 
 }
@@ -870,6 +917,19 @@ fn driver_loop(
                 EngineCmd::Stop { grace } => {
                     stop_grace = grace;
                     stop = true;
+                }
+                EngineCmd::StatusQuery { reply } => {
+                    let briefs = table
+                        .briefs()
+                        .into_iter()
+                        .map(|(dev, tunnel_ip, last_reg_ms, idle_ms)| EnginePeerBrief {
+                            dev,
+                            tunnel_ip,
+                            last_reg_ms,
+                            idle_ms,
+                        })
+                        .collect();
+                    let _ = reply.send(briefs);
                 }
                 EngineCmd::StunQuery { server, reply } => {
                     if bind.stun_query(server, reply).is_err() {

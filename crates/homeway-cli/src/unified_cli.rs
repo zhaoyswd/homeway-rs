@@ -347,6 +347,31 @@ impl UnifiedRoles {
             }
             None => (None, Vec::new()),
         };
+        // engine 观测缝（B0-2b：peers 经驱动线程快照 + 拦截计数原子直读；引擎不在
+        // 位 = 空表零计数——观测面不复活角色）。
+        let (peers, intercept) = inner
+            .serve
+            .as_ref()
+            .map(|e| {
+                let (p, i) = e.status_bits();
+                (
+                    p.into_iter()
+                        .map(|b| homeway_core::daemon::proto::ServePeerBrief {
+                            dev: b.dev,
+                            tunnel_ip: b.tunnel_ip.to_string(),
+                            last_reg: b.last_reg_ms,
+                            idle_ms: b.idle_ms,
+                        })
+                        .collect::<Vec<_>>(),
+                    homeway_core::daemon::proto::ServeInterceptBits {
+                        dial_ok: i.dial_ok,
+                        dial_fail: i.dial_fail,
+                        reject: i.reject,
+                        flows: i.flows,
+                    },
+                )
+            })
+            .unwrap_or_default();
         ServeStatusResult {
             enabled: inner.cfg.serve.enabled,
             state: role_state(Self::serve_running(inner), &inner.serve_reason).to_owned(),
@@ -355,10 +380,9 @@ impl UnifiedRoles {
             published: None,
             token_mask: mask,
             endpoints: (!eps.is_empty()).then_some(eps),
-            // 留桩（如实）：engine 观测面（peer 表/拦截计数）未开缝——见文件头挂账表。
-            peers: Vec::new(),
+            peers,
             ddns: None,
-            intercept: Default::default(),
+            intercept,
         }
     }
 }

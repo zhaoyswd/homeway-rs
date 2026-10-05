@@ -219,6 +219,30 @@ impl DeviceTable {
         (self.cfg.max_devices, self.cfg.ttl, self.cfg.grace)
     }
 
+    /// 设备表 brief（serve.status 观测面：dev = devTag 全 16hex、隧道 /32、最近注册
+    /// 与距今毫秒——Go DeviceTable.Briefs 同形）。
+    pub fn briefs(&self) -> Vec<(String, Ipv4Addr, i64, i64)> {
+        fn hex16(b: &[u8; 8]) -> String {
+            b.iter().map(|x| format!("{x:02x}")).collect()
+        }
+        let now = SystemTime::now();
+        let mut out: Vec<(String, Ipv4Addr, i64, i64)> = self
+            .entries
+            .iter()
+            .map(|(k, e)| {
+                let last_reg = e
+                    .last_reg
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default()
+                    .as_millis() as i64;
+                let idle = now.duration_since(e.last_reg).unwrap_or_default().as_millis() as i64;
+                (hex16(k), e.ip, last_reg, idle)
+            })
+            .collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     /// 拒绝计数快照（诊断/测试）。
     pub fn reject_counts(&self) -> HashMap<&'static str, u64> {
         self.rej

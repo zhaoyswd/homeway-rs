@@ -127,6 +127,7 @@ struct ParsedArgs {
     state: PathBuf,
     positional: Vec<String>,
     json: bool,
+    watch: bool,
     yes: bool,
     force: bool,
     name: Option<String>,
@@ -137,6 +138,7 @@ fn parse_args(usage: &str, args: &[String]) -> ParsedArgs {
         state: default_state_dir(),
         positional: Vec::new(),
         json: false,
+        watch: false,
         yes: false,
         force: false,
         name: None,
@@ -163,6 +165,7 @@ fn parse_args(usage: &str, args: &[String]) -> ParsedArgs {
             }
             "json" => out.json = true,
             "yes" => out.yes = true,
+            "watch" => out.watch = true,
             "force" => out.force = true,
             "name" => {
                 i += 1;
@@ -448,9 +451,17 @@ fn host_delete(args: &[String]) {
 // ---------- status（聚合状态面） ----------
 
 pub fn cmd_status(args: &[String]) {
-    let p = parse_args("status [--json] [--state DIR]", args);
+    let p = parse_args("status [--json] [--watch] [--state DIR]", args);
     let json = p.json;
     let state = p.state.clone();
+    if p.watch {
+        if json {
+            eprintln!("homeway: --json 与 --watch 互斥（--watch = 人类可读 live 渲染；机器可读消费走 --json）");
+            std::process::exit(1);
+        }
+        status_watch(&state);
+        return;
+    }
     let c = dial_control(&state);
     let v = c.request(vocab::OpName::DaemonStatus.as_str(), None, TIMEOUT).unwrap_or_else(|e| exit_op_err(&e));
     if json {
@@ -537,7 +548,25 @@ pub fn cmd_serve_group(args: &[String]) {
                     println!("  端点：{}", eps.join("、"));
                 }
             }
-            println!("  peers：{}（观测面后续棒）", v["peers"].as_array().map(|a| a.len()).unwrap_or(0));
+            if let Some(peers) = v["peers"].as_array() {
+                println!("  peers：{}", peers.len());
+                for p in peers {
+                    println!(
+                        "    dev={} ip={} 空闲={}s",
+                        &p["dev"].as_str().unwrap_or("?")[..16.min(p["dev"].as_str().unwrap_or("?").len())],
+                        p["tunnelIp"].as_str().unwrap_or("?"),
+                        p["idleMs"].as_i64().unwrap_or(0) / 1000,
+                    );
+                }
+            }
+            let itc = &v["intercept"];
+            println!(
+                "  intercept：dialOk={} dialFail={} reject={} flows={}",
+                itc["dialOk"].as_u64().unwrap_or(0),
+                itc["dialFail"].as_u64().unwrap_or(0),
+                itc["reject"].as_u64().unwrap_or(0),
+                itc["flows"].as_u64().unwrap_or(0),
+            );
         }
         vocab::OpName::ServeToken => {
             println!("{}", v["token"].as_str().unwrap_or("?"));
@@ -726,5 +755,210 @@ fn now_timestamp() -> String {
             tm.tm_min,
             tm.tm_sec
         )
+    }
+}
+
+
+// ---------- status --watch（live 渲染：client 域快照 + 订阅续播；P2-5） ----------
+
+/// watch 渲染行（快照初值 + 事件增量；Go watchHost 同形）。
+struct WatchHost {
+    id: String,
+    name: String,
+    state: String,
+    reason: String,
+    via: String,
+    ep: String,
+    rtt_ms: i64,
+}
+
+/// `homeway status --watch`：一次 Dial → snapshot.get → events.subscribe（link+session
+/// 域，view=启动时主机集合——参与需求合成，退出后贡献消失）→ 终端原地渲染
+/// （state/reason/via/rtt 随事件刷新，Ctrl-C 退出）。⚠️ 观测副作用：watch 期间被
+/// 显示主机被视为有需求（订阅视图源，门控不压制其巡检证据）——观测行为改变被观测
+/// 系统，watch 不是纯被动观测（Go status_watch.go 同语义）。
+fn status_watch(state_dir: &std::path::Path) {
+    let sock = state_dir.join("control.sock");
+    let (c, welcome) = match ControlClient::dial(&sock, "cli", "homeway-watch") {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!(
+                "homeway 未在运行（sock={}：{e}）\n--watch 需进程在位（纯读不拉起）；先启动：homeway-cli --state {}（零参统一进程）",
+                sock.display(),
+                state_dir.display()
+            );
+            std::process::exit(1);
+        }
+    };
+    let snap = c
+        .request(vocab::OpName::SnapshotGet.as_str(), None, TIMEOUT)
+        .unwrap_or_else(|e| exit_op_err(&e));
+    let seq = snap["seq"].as_u64().unwrap_or(0);
+    let mut hosts: Vec<WatchHost> = Vec::new();
+    let mut view = String::new();
+    if let Some(arr) = snap["hosts"].as_array() {
+        for (i, h) in arr.iter().enumerate() {
+            hosts.push(WatchHost {
+                id: h["id"].as_str().unwrap_or("?").to_owned(),
+                name: h["name"].as_str().unwrap_or("-").to_owned(),
+                state: h["state"].as_str().unwrap_or("?").to_owned(),
+                reason: h["reason"].as_str().unwrap_or("").to_owned(),
+                via: h["link"]["via"].as_str().unwrap_or("-").to_owned(),
+                ep: h["link"]["ep"].as_str().unwrap_or("-").to_owned(),
+                rtt_ms: h["link"]["rttMs"].as_i64().unwrap_or(0),
+            });
+            if i > 0 {
+                view.push(',');
+            }
+            view.push_str(&format!("host={}", h["id"].as_str().unwrap_or("?")));
+        }
+    }
+    let generation = welcome.generation.clone();
+    if let Err(e) = c.subscribe(
+        &[vocab::DOMAIN_LINK.to_owned(), vocab::DOMAIN_SESSION.to_owned()],
+        Some(seq),
+        &view,
+        &generation,
+        TIMEOUT,
+    ) {
+        if e.code == vocab::CODE_CURSOR_STALE {
+            eprintln!(
+                "homeway: 订阅游标失效（cursor_stale：守护进程已重启或事件窗过旧）——重新运行一次 homeway-cli status --watch 即从全量快照开始"
+            );
+            std::process::exit(1);
+        }
+        exit_op_err(&e);
+    }
+    let events = c.take_events().expect("订阅成功后事件通道在位");
+
+    // Ctrl-C/SIGTERM = 正常退出（退订由连接关闭承载——view 的需求贡献消失）。
+    let pipes = install_status_watch_signals();
+    render_watch(&hosts);
+    loop {
+        // 事件优先（500ms 心跳复检信号/连接）。
+        match events.recv_timeout(std::time::Duration::from_millis(500)) {
+            Ok(ev) => {
+                apply_watch_event(&mut hosts, &ev);
+                render_watch(&hosts);
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                if let Some(g) = c.goodbye() {
+                    eprintln!(
+                        "homeway: 守护进程已断开（goodbye={}）——检查守护进程（homeway-cli status）后重新运行本命令",
+                        g.reason
+                    );
+                } else {
+                    eprintln!("homeway: 守护进程连接已断开——守护进程可能已退出（homeway-cli status 确认后重新运行本命令）");
+                }
+                drop_status_watch_signals(pipes);
+                std::process::exit(1);
+            }
+        }
+        if watch_signal_fired(&pipes) {
+            // Ctrl-C：正常退出（exit 0——Go 同口径）
+            drop_status_watch_signals(pipes);
+            return;
+        }
+    }
+}
+
+/// 事件增量应用（渲染行按 host 键幂等覆盖——at-least-once 语义下重复事件无害；
+/// 词表只增：未入渲染面的 kind 忽略）。
+fn apply_watch_event(hosts: &mut [WatchHost], ev: &homeway_core::daemon::proto::EventBody) {
+    let host = ev.payload.as_ref().and_then(|p| p["host"].as_str()).unwrap_or("").to_owned();
+    let Some(row) = hosts.iter_mut().find(|h| h.id == host) else {
+        return; // 视图外主机（watch 期间新增——照常忽略；Go 同口径不追溯进视图）
+    };
+    match ev.kind.as_str() {
+        vocab::KIND_LINK_CHANGED => {
+            if let Some(p) = &ev.payload {
+                row.via = p["via"].as_str().unwrap_or(&row.via).to_owned();
+                row.ep = p["ep"].as_str().unwrap_or(&row.ep).to_owned();
+                row.rtt_ms = p["rttMs"].as_i64().unwrap_or(row.rtt_ms);
+            }
+        }
+        vocab::KIND_SESSION_STATE_CHANGED => {
+            if let Some(p) = &ev.payload {
+                row.state = p["state"].as_str().unwrap_or(&row.state).to_owned();
+                row.reason = p["reason"].as_str().unwrap_or("").to_owned();
+            }
+        }
+        vocab::KIND_SESSION_DIAG => {
+            if let Some(p) = &ev.payload {
+                row.reason = p["reason"].as_str().unwrap_or("").to_owned();
+            }
+        }
+        _ => {}
+    }
+}
+
+fn render_watch(hosts: &[WatchHost]) {
+    use std::io::Write as _;
+    let mut out = std::io::stdout();
+    let _ = write!(out, "\x1b[2J\x1b[H");
+    let _ = writeln!(out, "homeway status --watch（Ctrl-C 退出；观测副作用：显示中主机被视为有需求）");
+    let _ = writeln!(out, "{:<18} {:<10} {:<10} {:<8} {:<22} {:>6}", "HOST", "NAME", "STATE", "VIA", "EP", "RTT");
+    for h in hosts {
+        let mut reason = h.reason.clone();
+        if reason.len() > 20 {
+            reason = format!("{}…", &reason[..18]);
+        }
+        let _ = writeln!(
+            out,
+            "{:<18} {:<10} {:<10} {:<8} {:<22} {:>4}ms {}",
+            &h.id[..12.min(h.id.len())],
+            h.name,
+            h.state,
+            h.via,
+            h.ep,
+            h.rtt_ms,
+            reason,
+        );
+    }
+    let _ = out.flush();
+}
+
+/// 信号管道（SIGINT/SIGTERM → 'x'；status watch 的干净退出面）。
+struct WatchSigPipe {
+    read_fd: i32,
+    write_fd: i32,
+}
+
+static WATCH_SIG_W: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
+
+extern "C" fn on_watch_sig(_sig: i32) {
+    let fd = WATCH_SIG_W.load(std::sync::atomic::Ordering::SeqCst);
+    if fd >= 0 {
+        let b = b"x";
+        unsafe { libc::write(fd, b.as_ptr().cast(), 1) };
+    }
+}
+
+fn install_status_watch_signals() -> WatchSigPipe {
+    let mut fds = [0i32; 2];
+    unsafe { libc::pipe(fds.as_mut_ptr()) };
+    WATCH_SIG_W.store(fds[1], std::sync::atomic::Ordering::SeqCst);
+    unsafe {
+        let h = on_watch_sig as extern "C" fn(i32) as libc::sighandler_t;
+        libc::signal(libc::SIGINT, h);
+        libc::signal(libc::SIGTERM, h);
+    }
+    WatchSigPipe { read_fd: fds[0], write_fd: fds[1] }
+}
+
+fn watch_signal_fired(p: &WatchSigPipe) -> bool {
+    let mut b = [0u8; 8];
+    let n = unsafe { libc::read(p.read_fd, b.as_mut_ptr().cast(), 8) };
+    n > 0
+}
+
+fn drop_status_watch_signals(p: WatchSigPipe) {
+    WATCH_SIG_W.store(-1, std::sync::atomic::Ordering::SeqCst);
+    unsafe {
+        libc::signal(libc::SIGINT, libc::SIG_DFL);
+        libc::signal(libc::SIGTERM, libc::SIG_DFL);
+        libc::close(p.read_fd);
+        libc::close(p.write_fd);
     }
 }
