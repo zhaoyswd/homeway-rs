@@ -178,25 +178,44 @@ pub fn physical_candidates() -> Vec<IfaceInfo> {
         .collect()
 }
 
-/// 把 UDP socket 钉在网卡上（darwin IP_BOUND_IF / linux SO_BINDTODEVICE——
-/// ifacebind_*.go 同义；unix 面由本仓仅服务 macOS/linux）。
+/// 把 UDP socket 钉在网卡上（darwin IP_BOUND_IF+IPV6_BOUND_IF 两族 / linux
+/// SO_BINDTODEVICE——ifacebind_*.go 同义；unix 面由本仓仅服务 macOS/linux）。
+///
+/// darwin **两族都设、各自单栈容错**（Go `pinToFD` 语义）：v4-only socket 上
+/// IPV6_BOUND_IF 报 ENOPROTOOPT、v6-only socket 上 IP_BOUND_IF 报错——都属预期，
+/// 另一族成立即算钉上；**两族都失败才报错**（错误文案 = Go 同串
+/// `IP_BOUND_IF/IPV6_BOUND_IF: %v / %v`——文案即契约）。半边缺失的形态会让人
+/// 「v6 钉卡失败拖死 v4」（GAP-AUDIT P0-2 的根因），两族独立容错后 v6 路径可用性
+/// 不再受 v4 面牵连（反之亦然）。
 pub fn pin_socket_to_iface(fd: std::os::fd::RawFd, index: u32, name: &str) -> io::Result<()> {
     unsafe {
         #[cfg(target_os = "macos")]
         {
             let _ = name;
             let idx = index as libc::c_int;
-            let r = libc::setsockopt(
+            let r4 = libc::setsockopt(
                 fd,
                 libc::IPPROTO_IP,
                 libc::IP_BOUND_IF,
                 &idx as *const _ as *const libc::c_void,
                 std::mem::size_of::<libc::c_int>() as u32,
             );
-            if r != 0 {
-                return Err(io::Error::last_os_error());
+            // errno 即取即存（第二次 setsockopt 会覆盖 errno——分开取防串）
+            let e4 = (r4 != 0).then(io::Error::last_os_error);
+            let r6 = libc::setsockopt(
+                fd,
+                libc::IPPROTO_IPV6,
+                libc::IPV6_BOUND_IF,
+                &idx as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as u32,
+            );
+            let e6 = (r6 != 0).then(io::Error::last_os_error);
+            match (e4, e6) {
+                (Some(e4), Some(e6)) => Err(io::Error::other(format!(
+                    "IP_BOUND_IF/IPV6_BOUND_IF: {e4} / {e6}"
+                ))),
+                _ => Ok(()),
             }
-            Ok(())
         }
         #[cfg(target_os = "linux")]
         {
@@ -609,6 +628,46 @@ mod tests {
             assert!(!is_virtual_iface(&i.name), "{} 不应是虚拟卡", i.name);
             assert!(!i.loopback);
         }
+    }
+
+    /// 两族钉卡（真 socket 面）：v4 socket 上 v6 族 setsockopt 报错被容错、v4 族
+    /// 成立 ⇒ Ok；v6 socket 同理；**两族都失败才 Err**（文案 = Go 同串）。无物理
+    /// 网卡的形态（CI 容器）跳过。
+    #[test]
+    fn pin_socket_dual_family_tolerant() {
+        use std::os::fd::AsRawFd as _;
+        let Some(ifi) = physical_candidates().into_iter().next() else {
+            return;
+        };
+        let s4 = UdpSocket::bind("0.0.0.0:0").unwrap();
+        assert!(
+            pin_socket_to_iface(s4.as_raw_fd(), ifi.index, &ifi.name).is_ok(),
+            "v4 socket：v6 族失败应被单栈容错"
+        );
+        let s6 = UdpSocket::bind("[::]:0").unwrap();
+        assert!(
+            pin_socket_to_iface(s6.as_raw_fd(), ifi.index, &ifi.name).is_ok(),
+            "v6 socket：v4 族失败应被单栈容错"
+        );
+        // 双栈 socket（服务端主 socket 形态）：两族都成立
+        let dual = UdpSocket::bind("[::]:0").unwrap();
+        unsafe {
+            let off: libc::c_int = 0;
+            libc::setsockopt(
+                dual.as_raw_fd(),
+                libc::IPPROTO_IPV6,
+                libc::IPV6_V6ONLY,
+                &off as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as u32,
+            );
+        }
+        assert!(pin_socket_to_iface(dual.as_raw_fd(), ifi.index, &ifi.name).is_ok());
+        // 两族都失败（非法 index）⇒ Err + Go 同串文案
+        let e = pin_socket_to_iface(s4.as_raw_fd(), u32::MAX, &ifi.name).unwrap_err();
+        assert!(
+            e.to_string().starts_with("IP_BOUND_IF/IPV6_BOUND_IF:"),
+            "错误文案应与 Go 同串：{e}"
+        );
     }
 
     /// 本地 fake STUN 服务器：probe_stun 全链（事务 ID/XOR/来源校验）。

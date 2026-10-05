@@ -6,6 +6,7 @@
 //! 对称结构，全路径区分）。
 
 pub mod bind;
+pub mod bindwatch;
 pub mod device;
 pub mod dnsproxy;
 pub mod engine;

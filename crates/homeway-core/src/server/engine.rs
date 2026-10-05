@@ -46,8 +46,13 @@ const UDPCAP_INTERVAL: Duration = Duration::from_secs(300);
 /// WG socket 钉哪张物理网卡（BindMode）。
 #[derive(Clone, Debug, PartialEq)]
 pub enum BindMode {
+    /// 自动挑卡（探针取最快；看护循环每轮重挑）。
     Auto,
+    /// 显式网卡名（看护循环按名重解析）。
     Explicit(String),
+    /// IP 字面量：单栈绑该地址（不钉卡、不看护——历史上绕开 Surge 抢路由的形态；
+    /// Go `ResolveBind` 的 BindAddr 分支同义）。
+    Addr(IpAddr),
     Off,
 }
 
@@ -67,6 +72,8 @@ pub struct ServeConfig {
     pub bind_iface: BindMode,
     pub upnp: bool,
     pub stun: String,
+    /// v6 路径校验 STUN（Go `STUN6`；空 = 跳过 v6 公布。默认同 Go = cloudflare）。
+    pub stun6: String,
     pub files_root: Option<PathBuf>,
     pub verbose: bool,
     pub build: String,
@@ -90,6 +97,7 @@ impl Default for ServeConfig {
             bind_iface: BindMode::Auto,
             upnp: true,
             stun: "stun.cloudflare.com:3478".to_owned(),
+            stun6: "stun.cloudflare.com:3478".to_owned(),
             files_root: None,
             verbose: false,
             build: "homeway-rs-dev".to_owned(),
@@ -111,8 +119,14 @@ pub enum EngineCmd {
     SetCaps(u8),
     /// 探测应答的端点列表段（已公布公网端点）。
     SetProbeEndpoints(Vec<SocketAddr>),
-    /// 公网端点立即重测（换网事件——R3 无看护循环，预留）。
+    /// 公网端点立即重测（换网事件——绑卡看护的 onChange）。
     KickPublicEndpoint,
+    /// 把 WG socket 重钉到指定网卡（绑卡看护换卡/重挑；驱动线程独占 socket）。
+    Repin {
+        index: u32,
+        name: String,
+        reply: Sender<std::io::Result<()>>,
+    },
     /// 控制面 SESSION 通告 → 向中继数据口拨腿（R4）。
     LegRegister { id: u64, remote: SocketAddr, marker: Vec<u8> },
     /// 控制面 RELEASE → 拆腿。
@@ -179,9 +193,13 @@ impl ServeEngine {
         };
 
         // ---- 绑卡（E21；挑不到就不绑，绝不因此拒绝启动）----
+        // Go `ResolveBind` 语义拆分：网卡名/auto = **整 socket 钉卡不绑地址**（双栈
+        // 监听，v6 直连路径不被 v4 源地址绑死）；IP 字面量 = 单栈绑地址（无钉卡）。
         let mut resolved: Option<IfaceInfo> = None;
+        let mut bind_addr: Option<IpAddr> = None;
         match &cfg.bind_iface {
             BindMode::Off => {}
+            BindMode::Addr(ip) => bind_addr = Some(*ip),
             BindMode::Auto => {
                 let cands = egress::physical_candidates();
                 let d2 = Arc::clone(&dlogf);
@@ -295,11 +313,15 @@ impl ServeEngine {
         ));
         let device = Device::new(priv_key.clone(), Arc::clone(&dlogf));
 
-        // ---- ServerBind（端口退让；实际端口落盘）----
-        let bind_addr = resolved.as_ref().and_then(|i| i.addrs.first().copied());
+        // ---- ServerBind（双栈监听 + 钉卡；实际端口落盘）----
+        // 绑地址形态（IP 字面量）单栈；钉卡形态不绑地址（双栈 [::]——v4/v6 客户端
+        // 都能连，v6 STUN 观测同 socket 成立）。
         let mut bind = ServerBind::open_bound(cfg.listen_port, &cfg.build, bind_addr, resolved.as_ref().map(|i| (i.index, i.name.clone())), Arc::clone(&logf))?;
         let local_port = bind.local_port();
         std::fs::write(cache_dir.join("listen_port.txt"), format!("{local_port}\n"))?;
+        // 公布口径的 pinned 判据 = **运行期事实**（socket 钉卡成功与否 + 绑地址），
+        // 看护循环重钉后更新（Go `pinnedNow`/`PinnedIface` 同义）。
+        let pinned_flag = Arc::new(AtomicBool::new(bind.pinned.is_some() || bind_addr.is_some()));
 
         // ---- files / speedtest / term UDS 服务（E14/E15/E16/E17）----
         let mut stop_flags = Vec::new();
@@ -498,6 +520,7 @@ impl ServeEngine {
             relay_ep,
             relay_wanted,
             dlogf: Arc::clone(&dlogf),
+            pinned_flag: Arc::clone(&pinned_flag),
         });
         let pub_enabled = cfg.upnp || !cfg.stun.is_empty() || !cfg.public_endpoint.is_empty();
         if pub_enabled {
@@ -520,15 +543,36 @@ impl ServeEngine {
             });
         }
 
-        // ---- udpcap 探测线程 ----
+        // ---- udpcap 探测线程（kick = 换网卡后立即重探——绑卡看护 onChange） ----
+        let (udpcap_kick_tx, udpcap_kick_rx) = mpsc::channel::<()>();
         {
             let cmd_tx2 = cmd_tx.clone();
             let dlogf = Arc::clone(&dlogf);
             let itc_stats = Arc::clone(&itc_stats);
             std::thread::Builder::new()
                 .name("homeway-udpcap".into())
-                .spawn(move || udpcap_loop(cmd_tx2, itc_stats, &dlogf))
+                .spawn(move || udpcap_loop(cmd_tx2, itc_stats, &dlogf, udpcap_kick_rx))
                 .ok();
+        }
+
+        // ---- 绑卡看护循环（Go bindwatch.go；条件同 Go role.go：钉了卡才看护
+        //      （auto 挑到 / 显式名），IP 字面量单栈形态不看护）----
+        if resolved.is_some() && bind_addr.is_none() {
+            let explicit_name = match &cfg.bind_iface {
+                BindMode::Explicit(name) => Some(name.clone()),
+                _ => None, // auto：每轮重新挑（Go WatchBind Explicit=nil 同义）
+            };
+            let stop = spawn_service_stop_flag(&mut stop_flags);
+            super::bindwatch::spawn_watcher(super::bindwatch::WatcherArgs {
+                explicit_name,
+                probe_targets: super::bindwatch::probe_targets_from_env(),
+                cmd_tx: cmd_tx.clone(),
+                pinned_flag: Arc::clone(&pinned_flag),
+                pub_kick: pub_kick_tx.clone(),
+                udpcap_kick: udpcap_kick_tx,
+                logf: Arc::clone(&logf),
+                stop,
+            });
         }
 
         // ---- E19 + E1 ----
@@ -739,6 +783,10 @@ fn driver_loop(
                 EngineCmd::SetProbeEndpoints(eps) => bind.set_probe_endpoints(eps),
                 EngineCmd::KickPublicEndpoint => {
                     let _ = pub_kick_tx.send(()); // 转发到观测线程（换网重测）
+                }
+                EngineCmd::Repin { index, name, reply } => {
+                    // 看护循环重钉（socket 由驱动线程独占——两族都设、单栈容错）
+                    let _ = reply.send(bind.repin_to(index, &name));
                 }
                 EngineCmd::LegRegister { id, remote, marker } => {
                     // SESSION 通告 → 拨腿（连接 socket + LEGUP 标记 + 入表）
@@ -999,6 +1047,9 @@ struct TokenCtx {
     relay_wanted: bool,
     /// 细节日志（降级行等）。
     dlogf: Logf,
+    /// 「socket 已钉卡/绑地址」的运行期事实（Go `pinnedNow`——钉卡失败自动降级、
+    /// 看护循环重钉成功后置回；公网端点公布的保守判据读这里）。
+    pinned_flag: Arc<AtomicBool>,
 }
 
 /// 公网端点循环：成功 10min / 失败 2min 一轮；显式端点配置覆盖最高优先（FIX-61）。
@@ -1092,8 +1143,9 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
     }
 
     // 证据合流（publicendpoint.go 同序；外口≠监听口时「STUN 的 IP + UPnP 的外口」——
-    // 只有没钉网卡时才要求端口一致，防代理把 STUN 观测污染成假的）
-    let pinned = matches!(ctx.cfg.bind_iface, BindMode::Explicit(_)) || matches!(ctx.cfg.bind_iface, BindMode::Auto);
+    // 只有没钉网卡时才要求端口一致，防代理把 STUN 观测污染成假的；pinned 判据是
+    // **运行期事实**（钉卡失败自动降级——Go pinnedNow 语义））
+    let pinned = ctx.pinned_flag.load(Ordering::SeqCst);
     let pub_ap: Option<SocketAddr> = match (observed, ext_port, wan_ip) {
         (Some(ap), ext, _) if ext != 0 && ap.port() == ext && public_v4(ap) => Some(ap),
         (Some(ap), ext, _) if ext != 0 && pinned && public_v4(ap) => {
@@ -1129,7 +1181,43 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
         }
     };
     let Some(pub_ap) = pub_ap else { return false };
-    let lines = vec![pub_ap.to_string()];
+    // v4 主体公布 + v6 路径校验（Go publicendpoint.go:205-223）：v6 无 NAT，
+    // 「公网地址」= 本机在该网卡上的全局地址 + 监听端口——用**同一个监听 socket**
+    // 做一次 v6 STUN 验证路径真的可用，失败就不公布 v6（宁可不给，也不给一个发
+    // 不出去的候选）；v6 条目端口 = v4 公布端点的端口。
+    let mut lines = vec![pub_ap.to_string()];
+    if ctx.cfg.stun6.is_empty() {
+        (ctx.logf)("公网端点：未配置 --stun6（需要有 AAAA 的 STUN 服务器），跳过 IPv6 公布");
+    } else {
+        let v6 = resolve_stun6(&ctx.cfg.stun6)
+            .and_then(|s| stun_query_sync(cmd_tx, s, Duration::from_secs(8)));
+        match v6 {
+            Some(ap6) => {
+                let ip = ap6.ip();
+                // Go `ap6.Addr().Is6() && !Is4In6 && !IsLinkLocalUnicast`：非 v4-mapped
+                // 且非链路本地的 v6 才算 v6 公布证据（ULA 不在此滤——与 Go 主路径
+                // 同口径；probe 应答侧的 IsPublicAddr 过滤是另一层）
+                let global_v6 = match ip {
+                    IpAddr::V6(v6) => {
+                        v6.to_ipv4_mapped().is_none() && (v6.segments()[0] & 0xffc0) != 0xfe80
+                    }
+                    IpAddr::V4(_) => false,
+                };
+                if global_v6 {
+                    // Go 逐字同串：`公布 [%v]:%d`（v6 方括号形态）
+                    lines.push(format!("[{ip}]:{}", pub_ap.port()));
+                    (ctx.logf)(&format!(
+                        "公网端点：IPv6 路径可用（STUN 看到 {ap6}），公布 [{ip}]:{}",
+                        pub_ap.port()
+                    ));
+                }
+                // 成功但非全局 v6（v4-mapped/链路本地）：静默不加条目（Go 同义）
+            }
+            None => {
+                (ctx.logf)("公网端点：IPv6 不可用（解析失败或无应答），本轮只公布 IPv4");
+            }
+        }
+    }
     let _ = std::fs::write(&endpoint_file, format!("{}\n", lines.join("\n")));
     (ctx.logf)(&format!(
         "公网端点：已公布 {}（写进 public_endpoint.txt；下次签发 token 会带上它）",
@@ -1160,6 +1248,16 @@ fn resolve_stun(server: &str) -> Option<SocketAddr> {
     // 只取 v4（Go `network="ip4"` 同义——评审 M22：AAAA 优先的主机名会让 v4 socket
     // 恒发送失败，把可公布的判成不可用）
     server.to_socket_addrs().ok()?.find(|a| a.is_ipv4())
+}
+
+/// 解析 v6 STUN 目标（Go `LookupNetIP("ip6")` 同义）：取**非 v4-mapped 的 v6**
+/// 地址（stun.cloudflare.com 同名双栈；观测 v6 路径必须真走 v6）。
+fn resolve_stun6(server: &str) -> Option<SocketAddr> {
+    use std::net::ToSocketAddrs as _;
+    server.to_socket_addrs().ok()?.find(|a| match a {
+        SocketAddr::V6(v6) => v6.ip().to_ipv4_mapped().is_none(),
+        SocketAddr::V4(_) => false,
+    })
 }
 
 fn stun_query_sync(cmd_tx: &Sender<EngineCmd>, server: SocketAddr, timeout: Duration) -> Option<SocketAddr> {
@@ -1278,7 +1376,12 @@ fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
 
 // ---------- udpcap（默认路径 UDP 能力探测；结论喂探测应答 caps） ----------
 
-fn udpcap_loop(cmd_tx: Sender<EngineCmd>, stats: Arc<ItcStats>, logf: &Logf) {
+fn udpcap_loop(
+    cmd_tx: Sender<EngineCmd>,
+    stats: Arc<ItcStats>,
+    logf: &Logf,
+    kick_rx: mpsc::Receiver<()>,
+) {
     let mut last = "?".to_owned();
     let mut prev_replied: u64 = 0;
     let mut prev_no_reply: u64 = 0;
@@ -1293,7 +1396,8 @@ fn udpcap_loop(cmd_tx: Sender<EngineCmd>, stats: Arc<ItcStats>, logf: &Logf) {
             ));
             last = cur;
         }
-        std::thread::sleep(UDPCAP_INTERVAL);
+        // 周期等待可被 kick 打断（换网卡 = 换了条路，能力结论立即重测）
+        let _ = kick_rx.recv_timeout(UDPCAP_INTERVAL);
     }
 }
 

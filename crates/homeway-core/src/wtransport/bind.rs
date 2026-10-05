@@ -19,7 +19,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::os::fd::AsRawFd as _;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::net::{SocketAddr, UdpSocket};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -100,6 +100,9 @@ pub type OnHint = Arc<dyn Fn(&str) + Send + Sync>;
 
 pub struct Bind {
     sock: UdpSocket,
+    /// socket 是 AF_INET6 **双栈**（V6ONLY=0——Go 客户端 `conn.Bind` 的双栈 socket
+    /// 同义：v6 候选可发、v4 对端可达；发送面按族 map，接收面 unmap 归一）。
+    dual: bool,
     candidates: Vec<Candidate>,
     /// 中继端点表（与候选集同临界区重建——FIX-10：收包路径的 relay 判定不吃旧表）。
     relay_eps: HashSet<SocketAddr>,
@@ -164,11 +167,12 @@ impl Bind {
         peer_pub: &[u8; 32],
         logf: crate::Logf,
     ) -> io::Result<Self> {
-        let sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?;
+        let (sock, dual) = crate::udpbatch::open_client_socket()?;
         enlarge_udp_bufs(&sock);
         sock.set_nonblocking(true)?;
         let mut b = Self {
             sock,
+            dual,
             candidates: candidates.to_vec(),
             relay_eps: candidates
                 .iter()
@@ -267,7 +271,7 @@ impl Bind {
             let wire = self.tag_relay(self.adopted_is_relay, wire);
             // 发送统计（拍板①：采纳路径单发 = 一次尝试）
             self.send_tries += 1;
-            match self.sock.send_to(&wire, addr) {
+            match self.sock.send_to(&wire, crate::udpbatch::xmit_addr(addr, self.dual)) {
                 Ok(_) => self.tx_bytes += wg.len() as u64, // 成功才计（Go bind.go:644-651）
                 Err(e) => {
                     self.send_errs += 1;
@@ -285,7 +289,7 @@ impl Bind {
                     let mut wire2 = Vec::with_capacity(wg.len() + 16);
                     frame::encode_frame(FrameKind::Data, wg, &mut wire2);
                     let wire2 = self.tag_relay(old_relay, wire2);
-                    let _ = self.sock.send_to(&wire2, old);
+                    let _ = self.sock.send_to(&wire2, crate::udpbatch::xmit_addr(old, self.dual));
                 }
             }
             return;
@@ -332,7 +336,7 @@ impl Bind {
             };
             // 发送统计（拍板①：镜像逐候选 = 每候选一次尝试；本地失败逐次累计）
             self.send_tries += 1;
-            match self.sock.send_to(&wire, c.addr) {
+            match self.sock.send_to(&wire, crate::udpbatch::xmit_addr(c.addr, self.dual)) {
                 Ok(_) => {}
                 Err(e) => {
                     self.send_errs += 1;
@@ -434,7 +438,7 @@ impl Bind {
             // FIX-09 的「不进计数」只覆盖 sendToSilent 过渡双发。漏计会让「蜂窝下
             // LAN 全败 + 解锁补发到中继成功」被误判成环境性禁发〔判据反转〕）
             self.send_tries += 1;
-            if let Err(e) = self.sock.send_to(&wire, c) {
+            if let Err(e) = self.sock.send_to(&wire, crate::udpbatch::xmit_addr(*c, self.dual)) {
                 self.send_errs += 1;
                 self.send_local_fails += 1;
                 self.local_err_count += 1;
@@ -477,7 +481,7 @@ impl Bind {
         if self.recv_backoff_until.is_some_and(|t| Instant::now() < t) {
             return Err(io::Error::new(io::ErrorKind::WouldBlock, "读退避中"));
         }
-        let (n, src) = match self.sock.recv_from(&mut self.recv_buf[..]) {
+        let (n, src_raw) = match self.sock.recv_from(&mut self.recv_buf[..]) {
             Ok(v) => v,
             Err(e)
                 if e.kind() == io::ErrorKind::WouldBlock || e.kind() == io::ErrorKind::TimedOut =>
@@ -490,6 +494,9 @@ impl Bind {
             }
         };
         self.rx_bytes += n as u64;
+        // 双栈 socket 上 v4 对端的源地址是 v4-mapped v6——归一成纯 v4（内部表示
+        // 恒纯 v4/v6：采纳/候选比对/应答回发不因 socket 族漂移）
+        let src = crate::udpbatch::unmap_v4_in6(src_raw);
         self.adopt(src);
         let Some((kind, payload)) = frame::decode_frame(&self.recv_buf[..n]) else {
             return Ok(None); // 非帧包（垃圾/旧对端）：丢弃
@@ -637,7 +644,7 @@ impl Bind {
         // Go 的 localErrTotal 只含镜像候选〔bind_test 断言口径〕，采纳路径错误只进
         // adoptedLocalErrCount）
         self.send_tries += 1;
-        if let Err(e) = self.sock.send_to(&wire, addr) {
+        if let Err(e) = self.sock.send_to(&wire, crate::udpbatch::xmit_addr(addr, self.dual)) {
             self.send_errs += 1;
             self.send_local_fails += 1;
             (self.logf)(&format!("RREG 注册刷新发送失败（{e}）"));
@@ -708,9 +715,10 @@ impl Bind {
     /// 换本地 socket（Go Rebind 同义：不换 Identity、不动采纳——漫游 = 同钥换源地址，
     /// 会话保持）。新 socket 非阻塞；旧 socket 关闭（驱动线程 poll 的 fd 由每轮重取跟随）。
     pub fn rebind(&mut self) -> io::Result<u16> {
-        let sock = UdpSocket::bind(SocketAddrV4::new(Ipv4Addr::UNSPECIFIED, 0))?;
+        let (sock, dual) = crate::udpbatch::open_client_socket()?;
         enlarge_udp_bufs(&sock);
         sock.set_nonblocking(true)?;
+        self.dual = dual;
         let old = std::mem::replace(&mut self.sock, sock);
         let port = self.sock.local_addr().map(|a| a.port()).unwrap_or(0);
         drop(old);

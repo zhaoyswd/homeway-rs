@@ -26,11 +26,12 @@
 
 use std::collections::{HashMap, HashSet};
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::os::fd::AsRawFd as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::udpbatch::{bind_dual_stack, bind_v6_only, is_dual_stack, unmap_v4_in6};
 use crate::wtransport::frame::{self, FrameKind};
 
 use super::device::InboundOut;
@@ -81,6 +82,13 @@ struct RelayLeg {
 /// 出口腿帧收发面（驱动线程独占）。
 pub struct ServerBind {
     sock: UdpSocket,
+    /// socket 是 AF_INET6 **双栈**（V6ONLY=0）：v4 目标发送前须 map 成 v4-mapped、
+    /// v4 包的源地址（v4-mapped 形态）须 unmap 回纯 v4——内部表示恒纯 v4/v6
+    /// （Go `net.ListenUDP("udp", nil)` 双栈 + 内部 AsSlice/unmap 同义）。
+    dual: bool,
+    /// socket 当前钉住的网卡（钉卡事实——IP_BOUND_IF/SO_BINDTODEVICE 成功即真；
+    /// 公网端点公布的 pinned 判据读这里，Go `PinnedIface()` 同义）。None = 未钉。
+    pub pinned: Option<(u32, String)>,
     build: String,
     /// 探测应答的能力位（udpcap 周期结论；3e 接——现在恒 0）。
     caps: u8,
@@ -140,20 +148,35 @@ impl ServerBind {
         Self::open_bound(port, build, None, None, logf)
     }
 
-    /// 绑定形态：`bind_ip`（钉卡的源地址；None = 0.0.0.0）+ 可选的整 socket 钉卡
-    /// （index + 名——IP_BOUND_IF/SO_BINDTODEVICE；Go ServerBind BindIface 双栈钉卡
-    /// 的 v4 单栈面，v6 面登记 R5）。
+    /// 绑定形态：`bind_ip`（**IP 字面量单栈绑**（Go `BindAddr`：该族的
+    /// `udp4`/`udp6` 单栈 socket）；None = 双栈 `[::]`——v4/v6 客户端都能连、
+    /// 同 socket 的 STUN 观测对两族都成立）+ 可选的整 socket 钉卡（index + 名——
+    /// darwin IP_BOUND_IF/IPV6_BOUND_IF 两族 / linux SO_BINDTODEVICE；**绑卡不绑
+    /// 地址**，Go `BindIface` 语义：钉卡保持双栈，v6 直连路径才不被 v4 源地址绑死）。
+    /// 钉卡失败不致命（Go 同义告警 + 保守公布）。
     pub fn open_bound(
         port: u16,
         build: &str,
-        bind_ip: Option<Ipv4Addr>,
+        bind_ip: Option<IpAddr>,
         pin: Option<(u32, String)>,
         logf: crate::Logf,
     ) -> io::Result<Self> {
         use std::os::fd::AsRawFd as _;
         let sock = listen_with_fallback_addr(port, bind_ip)?;
+        // 运行期事实判据：AF_INET6 且 V6ONLY=0 才是双栈（v6 字面量单栈 socket 上
+        // 不能对 v4 目标做 mapped map——Go udp6 socket 发 v4 报错同义）
+        let dual = is_dual_stack(&sock);
+        let mut pinned = None;
         if let Some((index, name)) = pin {
-            let _ = super::egress::pin_socket_to_iface(sock.as_raw_fd(), index, &name);
+            match super::egress::pin_socket_to_iface(sock.as_raw_fd(), index, &name) {
+                Ok(()) => pinned = Some((index, name)),
+                Err(e) => {
+                    // Go bind.go:546 同串：钉不上卡不致命，公网端点公布自动变保守
+                    (logf)(&format!(
+                        "⚠️ 钉网卡 {name} 失败（{e}）—— 继续以未绑卡运行：STUN 观测可能被 TUN 型代理污染，公网端点公布会因此变保守"
+                    ));
+                }
+            }
         }
         // 大收发缓冲：拦截栈每拍可产 ~1MB 突发（MTU 1280 × 数百段），内核默认
         // SO_SNDBUF/SO_RCVBUF（~128-9216B）会整包丢弃 WG 数据报 ⇒ TCP 层 RTO
@@ -185,6 +208,8 @@ impl ServerBind {
         sock.set_nonblocking(true)?;
         Ok(Self {
             sock,
+            dual,
+            pinned,
             build: build.to_string(),
             caps: 0,
             probe_endpoints: Vec::new(),
@@ -257,6 +282,10 @@ impl ServerBind {
             Err(e) => return Err(e),
         };
         self.rx_bytes += n as u64;
+        // 双栈 socket 上 v4 包的源地址是 v4-mapped v6（::ffff:x.y.z.w）——归一成
+        // 纯 v4（Go readOnce 的 `Is4In6 → Unmap` 同义）：内部表示（新源表/endpoint/
+        // 腿表）恒纯 v4/v6，发送面再按 socket 族 map 回去。
+        let src = unmap_v4_in6(src);
         // 拷出本包再解析（recv_buf 与 &mut self 的借用分离；长度按 n——热路径一次
         // 分配，R5 性能批再消）
         let pkt = self.recv_buf[..n].to_vec();
@@ -286,7 +315,7 @@ impl ServerBind {
             crate::probe::respond_ex(buf, &self.build, self.caps, &self.probe_endpoints)
         {
             self.note_new_src(src, "参照点探测", buf.len());
-            let _ = self.sock.send_to(&resp, src);
+            let _ = self.sock.send_to(&resp, self.xmit_addr(src));
             return None;
         }
 
@@ -396,7 +425,11 @@ impl ServerBind {
         remote: SocketAddr,
         marker: &[u8],
     ) -> Result<(), super::relayleg::LegError> {
-        let sock = UdpSocket::bind("0.0.0.0:0")?;
+        // 腿 socket 按远端族建（中继 v6 地址形态；connected socket 族必须匹配）
+        let sock = match remote {
+            SocketAddr::V4(_) => UdpSocket::bind("0.0.0.0:0")?,
+            SocketAddr::V6(_) => UdpSocket::bind("[::]:0")?,
+        };
         sock.connect(remote)?;
         sock.set_nonblocking(true).ok();
         sock.send(marker)?;
@@ -540,8 +573,10 @@ impl ServerBind {
 
     /// STUN 观测（**在本 Bind 的 UDP socket 上**问一次——监听端口那个 socket 的 NAT
     /// 映射；从临时 socket 问出来的是默认路由的映射，两者在 TUN 代理机器上完全不同）。
-    /// 应答经 result 通道回执（None = 应答未到/不合法——调用方按超时收场）；同一时刻
-    /// 只允许一次查询（观测周期都是分钟级——Go stunPending 同义）。
+    /// v4/v6 目标都可问（双栈 socket 同一条观测面——Go `STUNQuery`/`STUNQueryV6`
+    /// 共用同一 socket 的同义面）。应答经 result 通道回执（None = 应答未到/不合法
+    /// ——调用方按超时收场）；同一时刻只允许一次查询（观测周期都是分钟级——Go
+    /// stunPending 同义）。
     pub fn stun_query(
         &mut self,
         server: SocketAddr,
@@ -557,7 +592,7 @@ impl ServerBind {
         let req = super::egress::stun_request(&txid, ""); // servercore 形态：20B 无属性
         self.stun_wait_txid = Some(txid);
         self.stun_wait_result = Some(result);
-        self.sock.send_to(&req, server)?;
+        self.sock.send_to(&req, self.xmit_addr(server))?;
         Ok(())
     }
 
@@ -565,6 +600,21 @@ impl ServerBind {
     pub fn stun_query_abort(&mut self) {
         self.stun_wait_txid = None;
         self.stun_wait_result = None;
+    }
+
+    /// 发送目标的族适配（`udpbatch::xmit_addr` 的 dual=self.dual 面：双栈 socket 发
+    /// v4 目标须 map 成 v4-mapped；单栈 socket 原样，族不匹配错误如实上报）。
+    fn xmit_addr(&self, ep: SocketAddr) -> SocketAddr {
+        crate::udpbatch::xmit_addr(ep, self.dual)
+    }
+
+    /// 把当前 socket 重钉到指定网卡（绑卡看护换卡/重挑用；Go `RepinTo` 同义——两族
+    /// 都设、单栈容错）。驱动线程内执行（socket 由本结构独占）。
+    pub fn repin_to(&mut self, index: u32, name: &str) -> io::Result<()> {
+        use std::os::fd::AsRawFd as _;
+        super::egress::pin_socket_to_iface(self.sock.as_raw_fd(), index, name)?;
+        self.pinned = Some((index, name.to_owned()));
+        Ok(())
     }
 
     /// 出站收口：把 device 产出的 wire 批封装腿帧发出（Send 恒发腿帧——Go 同义）。
@@ -641,7 +691,9 @@ impl ServerBind {
         let mut msgs: Vec<crate::udpbatch::OutMsg<'_>> = Vec::with_capacity(self.tx_lens.len());
         for &(_, ep, fr_len) in &self.tx_lens {
             msgs.push(crate::udpbatch::OutMsg {
-                dst: ep,
+                // 族适配（双栈 socket 的 v4 目标 map 成 v4-mapped——udpbatch 的
+                // sockaddr 拼装按字面族走，不感知 socket family）
+                dst: self.xmit_addr(ep),
                 buf: &self.tx_stage[off..off + fr_len],
             });
             off += fr_len;
@@ -702,7 +754,7 @@ impl ServerBind {
 
     /// 从本 socket 直接发裸载荷（STUN 请求等 3e 面；SendRawTo 同义——与数据面同端口）。
     pub fn send_raw_to(&self, addr: SocketAddr, payload: &[u8]) -> io::Result<()> {
-        self.sock.send_to(payload, addr).map(|_| ())
+        self.sock.send_to(payload, self.xmit_addr(addr)).map(|_| ())
     }
 
     /// 入站新源的首包一行（每来源一次；容量满清表重记）。
@@ -725,17 +777,25 @@ fn listen_with_fallback(port: u16) -> io::Result<UdpSocket> {
     listen_with_fallback_addr(port, None)
 }
 
-fn listen_with_fallback_addr(port: u16, ip: Option<Ipv4Addr>) -> io::Result<UdpSocket> {
-    let base = ip.unwrap_or(Ipv4Addr::UNSPECIFIED);
-    if let Ok(s) = UdpSocket::bind((base, port)) {
+fn listen_with_fallback_addr(port: u16, ip: Option<IpAddr>) -> io::Result<UdpSocket> {
+    let try_one = |p: u16| -> io::Result<UdpSocket> {
+        match ip {
+            // 双栈优先；无 v6 环境回退 v4（Go 在纯 v4 平台同样回落 AF_INET）
+            None => bind_dual_stack(p).or_else(|_| UdpSocket::bind((Ipv4Addr::UNSPECIFIED, p))),
+            Some(IpAddr::V4(v4)) => UdpSocket::bind((v4, p)),
+            // v6 字面量 = 单栈 udp6（Go 显式 V6ONLY=1 同义）
+            Some(IpAddr::V6(v6)) => bind_v6_only(v6, p),
+        }
+    };
+    if let Ok(s) = try_one(port) {
         return Ok(s);
     }
     for p in port + 1..=port + 9 {
-        if let Ok(s) = UdpSocket::bind((base, p)) {
+        if let Ok(s) = try_one(p) {
             return Ok(s);
         }
     }
-    UdpSocket::bind((base, 0))
+    try_one(0)
 }
 
 /// STUN 应答快速判别（servercore/stun.go 同义：类型 0x0101 + magic cookie）。
@@ -759,11 +819,74 @@ fn wg_msg_name(b: u8) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::net::Ipv6Addr;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
 
     fn noop_logf() -> crate::Logf {
         Arc::new(|_| {})
+    }
+
+    /// 双栈监听 + 源地址归一：v4 与 v6 客户端都能打到同一 socket（Go
+    /// `ListenUDP("udp", nil)` 双栈语义）；v4 包的 v4-mapped 源被 unmap 回纯 v4
+    /// （新源表形态断言）、v6 源保持原样。
+    #[test]
+    fn dual_stack_listen_and_unmap() {
+        let mut srv = ServerBind::open_bound(0, "t", None, None, noop_logf()).unwrap();
+        assert!(srv.dual, "无 bind_ip 形态应为双栈 socket");
+        let port = srv.local_port();
+        let c4 = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let c4_addr = c4.local_addr().unwrap();
+        let c6 = UdpSocket::bind("[::1]:0").unwrap();
+        let c6_addr = c6.local_addr().unwrap();
+        c4.send_to(b"v4", (Ipv4Addr::LOCALHOST, port)).unwrap();
+        c6.send_to(b"v6", (Ipv6Addr::LOCALHOST, port)).unwrap();
+        let mut got = 0;
+        for _ in 0..200 {
+            if got >= 2 {
+                break;
+            }
+            match srv.recv_packet() {
+                Ok(_) => got += 1,
+                Err(_) => std::thread::sleep(Duration::from_millis(5)),
+            }
+        }
+        assert_eq!(got, 2, "v4/v6 两个客户端的包都应收到（双栈监听）");
+        assert!(
+            srv.src_seen.contains_key(&c4_addr),
+            "v4 客户端应可达且源已 unmap 为纯 v4（{:?}）",
+            srv.src_seen.keys().collect::<Vec<_>>()
+        );
+        assert!(srv.src_seen.contains_key(&c6_addr), "v6 客户端应可达");
+        // 发送面族适配：双栈 socket 发 v4 目标（map 成 v4-mapped）能到达 v4 接收者
+        let rx = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let rx_addr = rx.local_addr().unwrap();
+        srv.send_raw_to(rx_addr, b"xmit").unwrap();
+        rx.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 8];
+        let (n, from) = rx.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], b"xmit");
+        // 发送者地址：dual socket 的 v4 出站 = v4-mapped 形态（unmap 后即 127.0.0.1）
+        assert_eq!(unmap_v4_in6(from).ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+    }
+
+    /// 单栈绑 IP 字面量形态（Go BindAddr udp4/udp6 单栈）：族即所绑族、无双栈 map。
+    #[test]
+    fn single_stack_by_literal() {
+        let srv4 = ServerBind::open_bound(0, "t", Some(IpAddr::V4(Ipv4Addr::LOCALHOST)), None, noop_logf()).unwrap();
+        assert!(!srv4.dual);
+        let srv6 = ServerBind::open_bound(0, "t", Some(IpAddr::V6(Ipv6Addr::LOCALHOST)), None, noop_logf()).unwrap();
+        assert!(!srv6.dual, "v6 字面量是单栈 udp6（Go 同义）");
+        // v4 单栈：v6 客户端不可达（族外）；v4 可达
+        let c4 = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let p4 = srv4.local_port();
+        c4.send_to(b"x", (Ipv4Addr::LOCALHOST, p4)).unwrap();
+        // unmap 纯函数面
+        let m: SocketAddr = "[::ffff:192.0.2.33]:99".parse().unwrap();
+        assert!(matches!(m, SocketAddr::V6(_)), "std 解析 v4-mapped 保持 v6 形态");
+        assert_eq!(unmap_v4_in6(m), "192.0.2.33:99".parse::<SocketAddr>().unwrap());
+        let pure6: SocketAddr = "[2001:db8::1]:7".parse().unwrap();
+        assert_eq!(unmap_v4_in6(pure6), pure6, "非 mapped 的 v6 原样");
     }
 
     /// 收发对拍：容器帧 [reg][data] 的 Go 客户端形态首包（评审 H1 验收）——reg 先于

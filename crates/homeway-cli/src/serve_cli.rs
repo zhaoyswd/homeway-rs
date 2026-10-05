@@ -27,7 +27,6 @@ struct FileServe {
     #[serde(default)]
     stun: Option<String>,
     #[serde(default)]
-    #[allow(dead_code)]
     stun6: Option<String>,
     #[serde(default)]
     relay: Option<String>,
@@ -281,6 +280,9 @@ pub fn assemble(args: &[String]) -> ServeConfig {
         if let Some(v) = &fc.serve.stun {
             cfg.stun = v.clone();
         }
+        if let Some(v) = fc.serve.stun6 {
+            cfg.stun6 = v; // 空串 = 显式关 v6 校验（config 显式写 "" 才覆盖默认）
+        }
         if let Some(v) = fc.serve.max_peers {
             cfg.max_devices = v;
         }
@@ -324,13 +326,11 @@ pub fn assemble(args: &[String]) -> ServeConfig {
     if let Some(v) = f.upnp {
         cfg.upnp = v;
     }
-    if let Some(v) = &f.stun {
-        cfg.stun = v.clone();
+    if let Some(v) = f.stun {
+        cfg.stun = v;
     }
     if let Some(v) = f.stun6 {
-        if v.is_empty() {
-            // 关 v6 校验（v6 面本就登记 R5——占位对齐 flag 面）
-        }
+        cfg.stun6 = v; // --stun6 '' = 关 v6 校验（Go flag 空串同义）
     }
     if let Some(v) = f.peer_ttl {
         cfg.peer_ttl = v;
@@ -361,8 +361,13 @@ pub fn assemble(args: &[String]) -> ServeConfig {
 fn parse_bind_iface(v: &str) -> BindMode {
     match v {
         "auto" => BindMode::Auto,
-        "none" | "off" => BindMode::Off,
-        name => BindMode::Explicit(name.to_owned()),
+        "none" | "off" | "no" => BindMode::Off,
+        // IP 字面量 = 单栈绑地址（Go `ResolveBind` 的 BindAddr 分支：历史上绕开
+        // Surge 抢路由的形态；无钉卡无看护）
+        other => match other.parse::<std::net::IpAddr>() {
+            Ok(ip) => BindMode::Addr(ip),
+            Err(_) => BindMode::Explicit(other.to_owned()),
+        },
     }
 }
 
