@@ -77,12 +77,22 @@ type DialFailKey = (&'static str, (Ipv4Addr, u16));
 // 滞留深度 ≤ Σcwnd（TCP 在途记账自钳制），**不设显式上限**（上限 = 整形器丢包 =
 // 伪修复禁区）。
 
-/// 整形速率默认 64 MiB/s：真机层 0 天花板 94MB/s 的 0.68×，验收带 40-45MB/s 之上
-/// 留 ≥40% 余量（`HOMEWAY_TX_RATE_MBPS` 覆盖）。
-pub const TX_SHAPE_RATE: u64 = 64 * 1024 * 1024;
-/// 突发额度默认 160 KiB = 128 × MTU1280（满包口径「≤128 包」，§9.7 建议带下沿；
-/// `HOMEWAY_TX_BURST_KB` 覆盖）。
-pub const TX_SHAPE_BURST: usize = 160 * 1024;
+/// 整形速率默认 200 MiB/s（D-2 8n② 修订；`HOMEWAY_TX_RATE_MBPS` 覆盖）。
+/// R8-3 的 64MiB/s（层 0 天花板 94 的 0.68×）在 40MB/s 级需求下**把稳态吞吐钳进
+/// 桶并注入 RTT**：滞留队列常驻 ~500KB ⇒ 排队延迟 ≈ 深度/64MiB/s ≈ 8ms ⇒ 真机
+/// TCP RTT 17-27ms（Go 出口同刻 6ms）⇒ 吞吐 = 窗/RTT 同比塌到 17.5MB/s。真机
+/// 梯度（同小时同机）：64/160KiB=17.5 稳、128/256 与 160/512=锯齿带（拍频-ACK 团
+/// 耦合）、200/2048=30-40 稳（Go 出口同刻 41-46）；冷连 200/2048 平滑爬坡无悬崖
+/// （冷/热 0.77 ≥ 0.70 门）。**R 的职责修正**：本整形器的存在意义是团块钳制
+/// （冷连悬崖），不是速率限制——R 取 ~2× 层 0 天花板（均值面对 3MB/s 级极端场景
+/// 仍有钳制），路径容量由 ACK 时钟（栈内 CUBIC）自管。
+pub const TX_SHAPE_RATE: u64 = 200 * 1024 * 1024;
+/// 突发额度默认 256 KiB = **单拍放行上界**（D-2 8n③ 语义修订；`HOMEWAY_TX_BURST_KB`
+/// 覆盖）。梯度数据：2MB 桶容量形态（8n②）消除了排队延迟但团块 1-2MB 在空口成组
+/// 丢失（dup 260-657/5s → CUBIC 反复砍窗，B 稳 19-30）；256KB 单拍上界 = 修复前
+/// 3.1MB 倾泻的 1/12、≈ Go 出口自然发送团的量级——团块钳制与无排队同时成立
+/// （拍频 1ms ⇒ 峰值放行率 256MB/s）。
+pub const TX_SHAPE_BURST: usize = 256 * 1024;
 
 /// 出口发送整形参数（字节令牌桶）。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -136,10 +146,20 @@ fn shape_slice(
     deferred.extend(produce);
     credit = (credit + shape.rate as f64 * dt).min(shape.burst as f64);
     let mut out = Vec::with_capacity(deferred.len());
+    // 单拍放行上界（D-2 8n③）：burst 兼任**单拍上界**——此前它只是「桶容量」
+    // （累积额度），空闲/久等后额度攒满 ⇒ 下一拍把 2MB 一次倾泻上线，团块在
+    // 空口成组丢失（真机终验：滞留 0 但 dup 260-657/5s、CUBIC 反复砍窗）。加上
+    // 每拍上界后，团块 ≤ burst（256KB = 修复前 3.1MB 倾泻的 1/12 ≈ Go 出口的
+    // 自然发送团量级），且拍频 1ms ⇒ 峰值放行率 256MB/s 远超吞吐 ⇒ 无持续排队。
+    let beat_cap = shape.burst as f64;
+    let mut beat = 0.0f64;
     while let Some(front) = deferred.front() {
         let fl = front.len() as f64;
         if credit < fl && fl <= shape.burst as f64 {
             break;
+        }
+        if beat + fl > beat_cap && !out.is_empty() {
+            break; // 本拍额度用尽：留给下一拍（保序 FIFO）
         }
         if fl > shape.burst as f64 {
             // 防死锁直通 ≠ 参与记账（评审 r2-1.2）：极小 burst 配置下直通分支
@@ -147,6 +167,7 @@ fn shape_slice(
         } else {
             credit -= fl;
         }
+        beat += fl;
         out.push(deferred.pop_front().expect("front 已判"));
     }
     (out, credit)
