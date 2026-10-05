@@ -42,7 +42,7 @@ c60ffb2e49a6cd09ca565e0de14817ad963801975fb9ca603c51b640fb12d07e  ./term-vt/sess
 558cc64a0fdc23dde0f8b7c01a306e904e3631e96d8e4cb7691cd1bc947ba662  ./term/frames.v1.jsonl
 0e65b56d3c92672456d74bd9e761c420b11e5e896b3f2c4df43e16bb64fdc1e3  ./vectors/identity.json
 48928dd4256c3f8cfcfffac66e01fd7161c5b0de0c7d11d2ea5f1f31ff052edf  ./vectors/psk.json
-9ce2f9f3c69d7c4b7f656179ab57fde79973c8ecc8229c7063b99951efcd3193  ./vectors/token.json
+1c5a087f82280e2ca56f3cc03e055a6f975d1f800fca31df870b507a4f1ea341  ./vectors/token.json
 d065823d92a23c917b7afbe76623a1f196eb72a81e610c7943b09d77dfed049b  ./vectors/tunnel_addr.json
 32600dd0d10730c6bd3f24a002544087ba4c344a96eecc5b297a6e757e66692e  ./vectors/reg.json
 61d7dfb13d8831268542aebb4c65e9a01ec0e4cb6efb0be248ca51e3d05ca7d2  ./vectors/endpointcache.json
