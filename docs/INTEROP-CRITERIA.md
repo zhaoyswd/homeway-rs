@@ -221,3 +221,17 @@ v6 路径）+ Rust 统一进程出口 42680（upnp=true 同号映射成立 ⇒ v
 **留桩（如实标注，判据不可见）**：serve.status 的 peers/intercept 观测面（空表——ServeEngine 状态缝未开）、
 supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）、term/files `--host` 远程模式与承载面 9 op
 （forward/socks/speedtest 回 bad_request+归因）——挂账与接棒指针 = `docs/reviews/B0-2b.md` §三。
+
+## term `--host` 远程 + supervisor/工件族实采（B0-2b 第 2 棒，2026-10-05；daemon =
+`homeway-cli --state /tmp/hw-2b2-uni`〔client 角色常驻 exit1 会话 via=direct rtt=1ms〕，
+出口 = local-rust-exit #1〔42651〕；CLI = 新构建 release；PTY 驱动逐腿伪终端）
+
+| # | 实采行 |
+|---|---|
+| DC14 | 远程拨号链（CLI → control.sock → stream.open{kind:term} → 隧道 → 出口拦截）：出口 `intercept: tcp exempt 100.64.255.1:7724 ← 100.64.130.176:<port>（dialok）` + 会话/腿行 `term: 新建会话 pty-…（pid=… 80x24 shell=/bin/zsh）` / `腿接入（kind=host 80x24 id=host-<8B> 首腿=true）n=1/8` |
+| DC15 | 远程 attach 全流程 9/9：回放+`echo` 回显到达；`touch /tmp/hw-term-marker-*` **经隧道在出口侧 shell 真执行**（marker 落盘）；`exit 7` → `会话 … 已结束（退出码 7）`；KILL → delete 方 `会话 … 已结束` + 在接腿 `… 已被关闭（App 或 homeway-cli term delete）`；`attach -d` 接管 → 首腿 `… 已被另一客户端接管（replaced）；重新接入：homeway-cli term attach …` + 出口 `腿断开（kind=host 原因=takeover）`；Ctrl-b d → `已分离（会话 … 继续在出口运行）` exit 0 |
+| DC16 | blocking_push 漏 notify 形态（修前对照）：CLI `对端已关闭连接（term 服务退出或会话收工；也可能是本端长时间停止读取、出口侧慢腿自治收尾了本腿——停滞超 60s 断腿不发 ENDED）` 挂 15s（= 出口 HELLO_TIMEOUT 收线）——修后 `term list --host exit1` 即时应答 |
+| DC17 | supervisor：`role serve: 失败（…）——退避 500ms/1s/5s 后进程内重建`（daemon-events.log，Go 同串）；daemon.status 角色面 `serve failed restarts=N`；健康面 `running restarts=0` |
+| DC18 | serve.status 观测缝：`peers：1` + `dev=<16hex> ip=100.64.x.x 空闲=Ns` + `intercept：dialOk=N dialFail=N reject=N flows=N`（speedtest 真连实测 dialOk=4 dialFail=1 flows=4） |
+| DC19 | 工件互通：Rust export/import 全往返（config 逐字节一致 + 覆盖导入 + 在跑拒绝 `import: 目标 state 的统一进程在跑（…/lock 被持有）——先停进程再导入`）；Go export → Rust import ✓ / Rust export → Go import ✓（bin/homeway-go 实测） |
+| DC20 | status --watch：快照渲染 `exit1 ready direct 192.168.3.12:42651 7ms`；SIGINT → exit 0 |

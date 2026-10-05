@@ -43,9 +43,17 @@
 > 对拍 + 全协议集成测试）+ client 角色（hosts.json 表 + 每主机常驻会话 + reach 探测）+ stream.open 流
 > 转发底座（TunnelConn 适配器，EchoConn 集成实证）+ serve/relay 动态角色管理（期望态写 config +
 > start/stop/restart/token）+ host/status/serve 组/relay 组 CLI 接线 + daemon-{events,debug}.log 落地；
-> 判据 = INTEROP-CRITERIA「daemon/控制面族实采」节（DC1–DC13）。**仍缺（第 2 棒工单，
-> docs/reviews/B0-2b.md §三）**：supervisor 退避重建（r1-M4）、term/files `--host` 远程模式（Rust term
-> CLI）、export/import/reset（P1-6）、承载面 9 op、serve.status peers/intercept 观测面、status --watch。
+> 判据 = INTEROP-CRITERIA「daemon/控制面族实采」节（DC1–DC13）。
+>
+> **2026-10-05 B0-2b 第 2 棒处置（daemon 收尾棒）**：①supervisor 退避重建（r1-M4 清）②term CLI
+> 五动词 + `--host` 远程模式（**P1-3 清**——双实例 9/9 判据：回显/marker 真执行/exit 7 直传/KILL/
+> 接管 replaced/分离键；顺带修 blocking_push 漏 notify 的 P0 级 bug——recv_wait 消费面 15s 黑洞）
+> ③serve.status peers/intercept 观测缝（EngineCmd::StatusQuery + 原子直读）④status --watch（**P2-5 清**）
+> ⑤export/import/reset（**P1-6 清**——自管 ustar，Go↔Rust 工件双向互通实测）⑥低-6/S1 小项清。
+> 记录 = docs/reviews/B0-2b.md §七–§十二。**P0-1 余量（转 D 批，接棒指针在 ROADMAP「下一步」）**：
+> 承载面 9 op（forward/socks/speedtest 托管——socks 无 Rust 服务端、forward 需持久化+端口唯一+级联
+> 整块、speedtest 需 runner 状态机；逐 op 理由 B0-2b.md §十）+ files CLI `--host` 远程模式（term 同底座
+> 可复用）+ dialControlSpawn 按需拉起形态。
 >
 > **2026-10-05 B0-2a 生产可观测性批处置**：P1-1 已修清（双文件轮转 + 三级接线，判据行落盘
 > 本地验收 + 两台滚动升级）；P1-5 登记修正后收口（主检测/停打/提示行 R3-3f 起已在位——审计时
