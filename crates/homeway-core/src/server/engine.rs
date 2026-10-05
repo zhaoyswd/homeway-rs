@@ -443,6 +443,9 @@ impl ServeEngine {
         // kick 通道 cap=1 + 非阻塞发送（Go kickUDPCap/kickPublicEndpoint 的
         // chan struct{} cap=1 + select-default 同义——重复 kick 合并成一次）
         let (pub_kick_tx, pub_kick_rx) = mpsc::sync_channel::<()>(1);
+        // 首轮探测信号（Go s.firstProbe：公网端点第一轮结束〔成不成都算〕即发一次——
+        // token 兜底线在等它，探测全关形态由兜底线自己睡 15s）
+        let (first_probe_tx, first_probe_rx) = mpsc::sync_channel::<()>(1);
 
         // ---- 中继注册腿（--relay；R4）：必须在 TokenCtx 构造前把 relay_ep 配好
         //      （token 首轮打印要带中继端点——Go serve.go:406-409 用户口径），
@@ -545,17 +548,56 @@ impl ServeEngine {
             std::thread::Builder::new()
                 .name("homeway-pubep".into())
                 .spawn(move || {
-                    public_endpoint_loop(shared, cmd_tx2, kick_rx);
+                    public_endpoint_loop(shared, cmd_tx2, kick_rx, first_probe_tx);
                 })
                 .ok();
         } else {
-            // 探测全关：15s 兜底打一轮 token（Go tokenFallbackWait 同义——首轮端点
-            // 至少要有 LAN，别让终端一直空着）
+            // 探测全关：观测线程不起、first_probe_tx 随此 drop——兜底线 recv 到
+            // Disconnected 即按 15s 兜底档走（Go firstProbe==nil 同义）。
+            drop(first_probe_tx);
+            drop(pub_kick_rx);
+        }
+
+        // ---- token 兜底线（Go role.go 终端兜底 goroutine 同义）----
+        // 首轮探测结束（成不成都算；探测全关 = 15s 后）每秒重试一小会儿，直到 token
+        // 铸出。没有它，公网端点「暂不公布」（端口改写/无证据）的形态下整个进程
+        // 生命周期都不会铸 token——重启后台账末行恒缺中继端点（DEPLOY-RUST-EXIT §5
+        // 登记缺口：13:07 重启后探测失败 ⇒ token 从未重铸 ⇒ serve token 取到的是
+        // 12:40 的无中继版本）。
+        {
             let shared = Arc::clone(&shared);
-            std::thread::spawn(move || {
-                std::thread::sleep(Duration::from_secs(15));
-                print_client_token(&shared, &[]);
-            });
+            std::thread::Builder::new()
+                .name("homeway-tokfb".into())
+                .spawn(move || {
+                    if pub_enabled {
+                        // 等首轮探测信号；发送端已 drop（探测全关）= 15s 兜底档
+                        if first_probe_rx.recv().is_err() {
+                            std::thread::sleep(Duration::from_secs(15));
+                        }
+                    } else {
+                        std::thread::sleep(Duration::from_secs(15));
+                    }
+                    for _ in 0..10 {
+                        let (printed, published) = match shared.inner.lock() {
+                            Ok(i) => (!i.last_token.is_empty(), i.last_published.clone()),
+                            Err(_) => return,
+                        };
+                        if printed {
+                            return;
+                        }
+                        print_client_token(&shared, &published);
+                        let printed = shared
+                            .inner
+                            .lock()
+                            .map(|i| !i.last_token.is_empty())
+                            .unwrap_or(false);
+                        if printed {
+                            return;
+                        }
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                })
+                .ok();
         }
 
         // ---- udpcap 探测线程（kick = 换网卡后立即重探——绑卡看护 onChange） ----
@@ -1076,9 +1118,20 @@ struct TokenCtx {
 }
 
 /// 公网端点循环：成功 10min / 失败 2min 一轮；显式端点配置覆盖最高优先（FIX-61）。
-fn public_endpoint_loop(ctx: Arc<TokenCtx>, cmd_tx: Sender<EngineCmd>, kick_rx: mpsc::Receiver<()>) {
+/// 首轮结束（成不成都算）发一次 first_probe 信号——token 兜底线在等它（Go 同构）。
+fn public_endpoint_loop(
+    ctx: Arc<TokenCtx>,
+    cmd_tx: Sender<EngineCmd>,
+    kick_rx: mpsc::Receiver<()>,
+    first_probe_tx: mpsc::SyncSender<()>,
+) {
+    let mut first = true;
     loop {
         let ok = refresh_public_endpoint(&ctx, &cmd_tx);
+        if first {
+            first = false;
+            let _ = first_probe_tx.try_send(()); // cap=1 非阻塞（Go select-default 同义）
+        }
         let wait = if ok { PUBLIC_REFRESH_OK } else { PUBLIC_REFRESH_FAIL };
         match kick_rx.recv_timeout(wait) {
             Ok(()) => {
@@ -1388,9 +1441,19 @@ fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
         }
     };
     let eps_count = eps.len();
-    // 台账写入纪律：与末行不同即追加（无变化不追加；吊销拒写）
+    // 台账写入纪律：与末行不同即追加（无变化不追加）；吊销拒写（分支告警——Go
+    // printClientToken 的 ErrSecretRevoked 专用行，P1-5 收口）
     if let Err(e) = ctx.st.append_token(&ctx.secret, &eps) {
-        (ctx.logf)(&format!("⚠️ token 台账追加失败（{e}）——台账末行可能与在用 token 短暂不一致"));
+        match e {
+            crate::server::state::StateError::SecretRevoked => {
+                (ctx.logf)(&format!(
+                    "⚠️ 在用凭证已被吊销（{e}）——本轮 token 未入台账；执行 `homeway-cli serve restart`（重启）铸出新凭证"
+                ));
+            }
+            other => {
+                (ctx.logf)(&format!("⚠️ token 台账追加失败（{other}）——台账末行可能与在用 token 短暂不一致"));
+            }
+        }
     }
     if tok_str == inner.last_token {
         return;
