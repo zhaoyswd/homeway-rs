@@ -319,6 +319,18 @@ struct Engine {
     /// driver 的 poll(2) 最多 250ms 才醒，上行每串包白等一拍；与 Client::send 共用
     /// 同一 fd 与互斥位，stop 关闭后写入自然 no-op）。
     wake: Arc<Mutex<Option<i32>>>,
+    /// R8-4 8n 归因插桩：热路径分段计时（累计 ns）+ 收发计数。分段 = drain_udp
+    /// （UDP 收 syscall + boringtun decap）/ iface.poll（smoltcp ingress + ACK 产出）/
+    /// encap（TX 出队 + encap + sendto）。每秒观测行消费清零；只在收向有流量时打
+    /// （空闲静默——与出口 cc 行同惯例）。
+    hp_drain_ns: u128,
+    hp_poll_ns: u128,
+    hp_encap_ns: u128,
+    hp_rx_pkts: u64,
+    hp_rx_bytes: u64,
+    hp_tx_pkts: u64,
+    hp_tx_bytes: u64,
+    hp_last_line: Option<Instant>,
 }
 
 impl Engine {
@@ -370,7 +382,9 @@ impl Engine {
             }
         }
         self.bind.tick_unlock();
+        let hp_t0 = Instant::now();
         self.drain_udp(udp_buf);
+        let hp_t1 = Instant::now();
         // R8-2 归因插桩：栈 B 收队列溢出丢弃（首 3 次 + 每 1000 包一行）。
         // 下行 bulk 的出口突发（拦截栈单拍可产上千包）超 QUEUE_CAP 时，多余内层包
         // 在这里静默丢 ⇒ TCP 层大规模重传——本行即该丢失面的判据。
@@ -391,10 +405,46 @@ impl Engine {
         self.stack
             .iface
             .poll(now, &mut self.stack.device, &mut self.stack.sockets);
+        let hp_t2 = Instant::now();
         let mut tx: Vec<Vec<u8>> = Vec::new();
         self.stack.device.drain_tx(&mut tx);
         for pkt in &tx {
+            self.hp_tx_pkts += 1;
+            self.hp_tx_bytes += pkt.len() as u64;
             self.encap_send(pkt);
+        }
+        let hp_t3 = Instant::now();
+        self.hp_drain_ns += hp_t1.saturating_duration_since(hp_t0).as_nanos();
+        self.hp_poll_ns += hp_t2.saturating_duration_since(hp_t1).as_nanos();
+        self.hp_encap_ns += hp_t3.saturating_duration_since(hp_t2).as_nanos();
+        // 8n 归因观测行（每秒；收向有流量才打）：判别 = 三段耗时占比定位手机核
+        // 每字节成本的去处（decap/栈 poll/上行 encap）+ 收包速率与均包长。
+        if self
+            .hp_last_line
+            .map(|t| t.elapsed() >= Duration::from_secs(1))
+            .unwrap_or(false)
+        {
+            if self.hp_rx_bytes > 0 {
+                let ms = |ns: u128| (ns / 1_000_000).min(9999) as u64;
+                (self.logf)(&format!(
+                    "wgcore: 热路径1s 收={}包/{}KB(均{}B) drain={}ms poll={}ms encap={}ms 出={}包/{}KB",
+                    self.hp_rx_pkts,
+                    self.hp_rx_bytes / 1024,
+                    self.hp_rx_bytes / self.hp_rx_pkts.max(1),
+                    ms(self.hp_drain_ns),
+                    ms(self.hp_poll_ns),
+                    ms(self.hp_encap_ns),
+                    self.hp_tx_pkts,
+                    self.hp_tx_bytes / 1024,
+                ));
+            }
+            self.hp_drain_ns = 0;
+            self.hp_poll_ns = 0;
+            self.hp_encap_ns = 0;
+            self.hp_rx_pkts = 0;
+            self.hp_rx_bytes = 0;
+            self.hp_tx_pkts = 0;
+            self.hp_tx_bytes = 0;
         }
         self.timer_tick();
         self.resolve_pending();
@@ -458,6 +508,9 @@ impl Engine {
             }
             TunnResult::WriteToTunnelV4(pkt, _) => {
                 self.expired_pending = false; // 明文包到达 = 会话活着
+                // 8n 归因插桩：收向明文包计数（inject 与 TUN 投递两条路都算）。
+                self.hp_rx_pkts += 1;
+                self.hp_rx_bytes += pkt.len() as u64;
                                               // L3 直通分流（Go hub.Write）：dst == B 的本地地址（派生隧道 IP）→ 栈 B
                                               // （核心自连回程），其余 → 真 TUN fd（内核投给应用）。
                 if pkt.len() >= 20
@@ -1023,6 +1076,14 @@ impl Client {
             on_tun_error: None,
             cmd_tx: Some(cmd_tx.clone()),
             wake: Arc::clone(&wake_wr_shared),
+            hp_drain_ns: 0,
+            hp_poll_ns: 0,
+            hp_encap_ns: 0,
+            hp_rx_pkts: 0,
+            hp_rx_bytes: 0,
+            hp_tx_pkts: 0,
+            hp_tx_bytes: 0,
+            hp_last_line: None,
         };
 
         let stop2 = Arc::clone(&stop);

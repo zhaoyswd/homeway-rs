@@ -256,6 +256,71 @@ enum Phase {
     Established,
 }
 
+/// R8-4 8n 第二瓶颈归因插桩：单 TCP 流的收发观测（**驱动线程独占，无锁**）。
+/// TX 累计点 = on_tx 反重写命中；RX 累计点 = on_plain 流命中（客户端 ACK）。
+/// cc_stats_line 5s 窗差分消费报出。判别目标：
+/// - 对端通告窗原始 u16（min~max/last）——检测 rwnd 门限（CUBIC cwnd 上限 =
+///   max(64×536, 对端窗)，smoltcp 只升不降）与窗口更新稀疏度；
+/// - ACK 段数/确认推进字节——ACK 时钟密度（每 2 段一个 ACK + 10ms delayed 兜底）；
+/// - dup ACK——手机侧乱序/丢包代理观测；
+/// - 发送段最大载荷（≈实际协商 MSS）；
+/// - 在途 ≈ Σ发送 - Σ确认（含重传量，配 dup 解读）。
+#[derive(Default, Clone, Copy)]
+struct TcpObs {
+    tx_seg: u64,
+    tx_data_seg: u64,
+    tx_bytes: u64,
+    tx_max_seg: usize,
+    ack_seg: u64,
+    ack_bytes: u64,
+    ack_dup: u64,
+    win_min: Option<u32>,
+    win_max: u32,
+    win_last: u32,
+    ack_last: Option<u32>,
+    inflight_est: i64,
+}
+
+impl TcpObs {
+    /// 客户端→出口 ACK 段累计（on_plain 点；v.proto 已判 6）。
+    fn note_rx_ack(&mut self, v: &Ipv4View) {
+        self.ack_seg += 1;
+        let ack = v.tcp_ack;
+        match self.ack_last {
+            Some(prev) => {
+                let d = ack.wrapping_sub(prev);
+                if d == 0 && v.payload.is_empty() {
+                    self.ack_dup += 1;
+                } else if d < 0x8000_0000 {
+                    // 单调推进（回绕安全半窗内）才计确认字节
+                    self.ack_bytes += d as u64;
+                    self.inflight_est -= d as i64;
+                }
+            }
+            None => {
+                // 首 ACK 基线：不含 SYN 计数，从第二次起算推进
+            }
+        }
+        self.ack_last = Some(ack);
+        let w = v.tcp_win as u32;
+        self.win_min = Some(self.win_min.map_or(w, |m| m.min(w)));
+        self.win_max = self.win_max.max(w);
+        self.win_last = w;
+    }
+
+    /// 出口→客户端段累计（on_tx 点；载荷长度按反重写前的包体）。
+    fn note_tx_seg(&mut self, v: &Ipv4View) {
+        self.tx_seg += 1;
+        let n = v.payload.len();
+        if n > 0 {
+            self.tx_data_seg += 1;
+            self.tx_bytes += n as u64;
+            self.tx_max_seg = self.tx_max_seg.max(n);
+            self.inflight_est += n as i64;
+        }
+    }
+}
+
 struct Flow {
     kind: Kind,
     proto: Proto,
@@ -285,6 +350,32 @@ struct Flow {
     syn_seq: u32,
     /// TCP DNS 腿的 RFC1035 分帧积攒（2B 长度前缀 + 报文；跨读保留不完整帧）。
     dns_rx: Vec<u8>,
+    /// TCP 归因观测（8n；UDP 流恒零值闲置）。
+    obs: TcpObs,
+}
+
+/// cc_stats_line 观测行的上一窗快照（差分用；字段 = TcpObs 的累计子集）。
+#[derive(Clone, Copy)]
+struct TcpObsSnap {
+    tx_seg: u64,
+    tx_data_seg: u64,
+    tx_bytes: u64,
+    ack_seg: u64,
+    ack_bytes: u64,
+    ack_dup: u64,
+}
+
+impl From<&TcpObs> for TcpObsSnap {
+    fn from(o: &TcpObs) -> Self {
+        Self {
+            tx_seg: o.tx_seg,
+            tx_data_seg: o.tx_data_seg,
+            tx_bytes: o.tx_bytes,
+            ack_seg: o.ack_seg,
+            ack_bytes: o.ack_bytes,
+            ack_dup: o.ack_dup,
+        }
+    }
 }
 
 /// 拦截层本体（**驱动线程独占**——RX/TX/流表/栈全在一条线程）。
@@ -332,6 +423,8 @@ pub struct Interceptor {
     dial_fail_seen: HashMap<DialFailKey, (u64, bool)>,
     /// CC 观测行的上次打印时刻。
     last_cc_stats: Option<Instant>,
+    /// 观测行上一窗快照（8n；流 id → 累计快照——差分本窗增量）。
+    obs_snaps: HashMap<u64, TcpObsSnap>,
     time0: Instant,
     smol_now: SmolInstant,
 }
@@ -401,6 +494,7 @@ impl Interceptor {
             udp_seq: 0,
             dial_fail_seen: HashMap::new(),
             last_cc_stats: None,
+            obs_snaps: HashMap::new(),
             time0: Instant::now(),
             smol_now: SmolInstant::from_millis(0),
         }
@@ -486,6 +580,13 @@ impl Interceptor {
                     }
                 }
                 return;
+            }
+            // 8n 归因插桩：客户端→出口 ACK 段累计（含通告窗原始 u16）——在 pkt move
+            // 前观测（v 借用 pkt）。
+            if proto == Proto::Tcp {
+                if let Some(f) = self.flows.get_mut(&flow) {
+                    f.obs.note_rx_ack(&v);
+                }
             }
             let mut p = pkt;
             nat::rewrite_dst(&mut p, self.cfg.tunnel_ip, rw);
@@ -694,6 +795,7 @@ impl Interceptor {
                 udp_replied: false,
                 syn_seq: v.tcp_seq,
                 dns_rx: Vec::new(),
+                obs: TcpObs::default(),
             },
         );
         flow
@@ -987,6 +1089,51 @@ impl Interceptor {
             (self.cfg.logf)(&format!(
                 "intercept: cc 活跃TCP={active} 最大流 txq={sq}B backlog={backlog}B（smoltcp 0.14 CUBIC）{shape_note}"
             ));
+            // 8n 归因观测行：累计发送字节最大的 TCP 流（bulk 测速场景即最大吞吐流）。
+            // 窗差分（快照失配/首窗 = 报累计 + RAW 标记）；通告窗 min~max 为流生命周期
+            // 值、在途/maxSeg 为窗末现值。判据面注意：本行带「tcp 观测」前缀，与 dialok
+            // 判据行（「tcp transit/exempt …（dialok）」）不同前缀不互扰。
+            let mut pick: Option<(u64, TcpObs)> = None;
+            for (id, f) in self.flows.iter() {
+                if f.proto != Proto::Tcp || f.sock.is_none() {
+                    continue;
+                }
+                let obs = f.obs;
+                if pick.as_ref().map(|(_, o)| obs.tx_bytes > o.tx_bytes).unwrap_or(true) {
+                    pick = Some((*id, obs));
+                }
+            }
+            if let Some((id, obs)) = pick.filter(|(_, o)| o.tx_seg > 0) {
+                let snap = self.obs_snaps.get(&id).copied();
+                let (dtx, ddata, dbytes, dack, dackb, ddup, raw) = match snap {
+                    Some(s) if s.tx_seg <= obs.tx_seg => (
+                        obs.tx_seg - s.tx_seg,
+                        obs.tx_data_seg - s.tx_data_seg,
+                        obs.tx_bytes - s.tx_bytes,
+                        obs.ack_seg - s.ack_seg,
+                        obs.ack_bytes - s.ack_bytes,
+                        obs.ack_dup - s.ack_dup,
+                        "",
+                    ),
+                    _ => (obs.tx_seg, obs.tx_data_seg, obs.tx_bytes, obs.ack_seg, obs.ack_bytes, obs.ack_dup, " RAW"),
+                };
+                self.obs_snaps.insert(id, TcpObsSnap::from(&obs));
+                let win_min = obs.win_min.unwrap_or(0);
+                let _ = ddata;
+                (self.cfg.logf)(&format!(
+                    "intercept: tcp 观测 段={}({}KB,maxSeg={}B) ACK={}({}KB确认) dup={} 通告窗u16[min~max/末]={}~{}/{} 在途≈{}KB{raw}",
+                    dtx,
+                    dbytes / 1024,
+                    obs.tx_max_seg,
+                    dack,
+                    dackb / 1024,
+                    ddup,
+                    win_min,
+                    obs.win_max,
+                    obs.win_last,
+                    obs.inflight_est.max(0) / 1024,
+                ));
+            }
         }
     }
 
@@ -1036,6 +1183,10 @@ impl Interceptor {
         if v.src == self.cfg.tunnel_ip && self.by_rw_port.contains_key(&v.src_port) {
             if let Some(&flow) = self.by_rw_port.get(&v.src_port) {
                 if let Some(f) = self.flows.get_mut(&flow) {
+                    // 8n 归因插桩：出口→客户端段累计（载荷长度按包体）。
+                    if v.proto == 6 {
+                        f.obs.note_tx_seg(&v);
+                    }
                     let (ip, port) = f.orig_dst;
                     nat::rewrite_src(&mut pkt, ip, port);
                 }

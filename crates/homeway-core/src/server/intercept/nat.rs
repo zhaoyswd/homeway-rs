@@ -20,6 +20,8 @@ pub struct Ipv4View<'a> {
     pub tcp_flags: u8,
     pub tcp_seq: u32,
     pub tcp_ack: u32,
+    /// TCP 头 window 字段原始 u16（未 shift——R8-4 8n 归因观测面）。
+    pub tcp_win: u16,
 }
 
 pub const TCP_SYN: u8 = 0x02;
@@ -46,7 +48,7 @@ impl<'a> Ipv4View<'a> {
         let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
         let body = &pkt[ihl..total_len];
         let mut payload_off = 0usize;
-        let (src_port, dst_port, tcp_flags, tcp_seq, tcp_ack) = match proto {
+        let (src_port, dst_port, tcp_flags, tcp_seq, tcp_ack, tcp_win) = match proto {
             6 => {
                 if body.len() < 20 {
                     return None;
@@ -59,15 +61,16 @@ impl<'a> Ipv4View<'a> {
                     body[13],
                     u32::from_be_bytes(body[4..8].try_into().unwrap()),
                     u32::from_be_bytes(body[8..12].try_into().unwrap()),
+                    u16::from_be_bytes([body[14], body[15]]),
                 )
             }
             17 => {
                 if body.len() < 8 {
                     return None;
                 }
-                (u16::from_be_bytes([body[0], body[1]]), u16::from_be_bytes([body[2], body[3]]), 0, 0, 0)
+                (u16::from_be_bytes([body[0], body[1]]), u16::from_be_bytes([body[2], body[3]]), 0, 0, 0, 0)
             }
-            _ => (0, 0, 0, 0, 0),
+            _ => (0, 0, 0, 0, 0, 0),
         };
         let l4_hdr = if proto == 6 {
             payload_off
@@ -88,6 +91,7 @@ impl<'a> Ipv4View<'a> {
             tcp_flags,
             tcp_seq,
             tcp_ack,
+            tcp_win,
         })
     }
 
