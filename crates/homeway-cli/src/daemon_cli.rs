@@ -57,18 +57,246 @@ fn exit_op_err(e: &OpError) -> ! {
     std::process::exit(1);
 }
 
-fn dial_control(state_dir: &std::path::Path) -> Arc<ControlClient> {
+/// host/status/serve 组/relay 组的拨号面：按需拉起（Go dialControlSpawn——客户端
+/// 域命令共用；未运行 = 拉起统一进程并重拨，--no-spawn 走 fail-fast）。
+fn dial_control(state_dir: &std::path::Path, no_spawn: bool) -> Arc<ControlClient> {
+    match dial_control_spawn(state_dir, "homeway", no_spawn) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("homeway: {e}");
+            std::process::exit(1);
+        }
+    }
+}
+
+/// 裸 socket 三态探测的「未运行」出口（term/files --host 的拉起分流共用）。
+pub fn sock_not_running(sock: &std::path::Path) -> bool {
+    matches!(probe_sock(sock), SockState::NotRunning)
+}
+
+// ---------- 按需拉起（Go internal/daemon/spawn.go——D-1 实装） ----------
+
+/// 拉起节拍（Go design D4：KeepAlive 等待 3–5s、就绪上限 10s）。
+const SPAWN_KEEPALIVE_WAIT: Duration = Duration::from_secs(4);
+const SPAWN_READY_TIMEOUT: Duration = Duration::from_secs(10);
+const SPAWN_POLL_STEP: Duration = Duration::from_millis(100);
+/// 就绪超时错误里回显的 spawn.log 尾部行数。
+const SPAWN_LOG_TAIL_LINES: usize = 12;
+
+/// 裸 socket 探测三态（dial 失败后的分流依据）。
+enum SockState {
+    /// 裸连成功（握手面失败——协议/超时类，不按未运行处理）。
+    Alive,
+    /// ENOENT（socket 不存在）/ ECONNREFUSED（残留 socket 的监听者已消失）。
+    NotRunning,
+    /// 其它（权限等）。
+    Unreachable,
+}
+
+fn probe_sock(sock: &std::path::Path) -> SockState {
+    match std::os::unix::net::UnixStream::connect(sock) {
+        Ok(_) => SockState::Alive,
+        Err(e) => match e.kind() {
+            std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
+                SockState::NotRunning
+            }
+            _ => SockState::Unreachable,
+        },
+    }
+}
+
+/// `<state>/lock` 的 flock 试探（只读打开 + 非阻塞排他——探测不重写持有者信息）。
+/// 返回 (held, pid, form)。
+fn lock_held_probe(state_dir: &std::path::Path) -> (bool, i32, String) {
+    use std::os::unix::fs::FileExt as _;
+    let path = state_dir.join("lock");
+    let Ok(f) = std::fs::File::open(&path) else { return (false, 0, String::new()) };
+    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&f);
+    let r = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
+    if r == 0 {
+        unsafe { libc::flock(fd, libc::LOCK_UN) };
+        return (false, 0, String::new());
+    }
+    // 被持有：读持有者（读不到 = 0 / "?"——Go readLockHolder 同义）。
+    let mut buf = [0u8; 128];
+    let n = f.read_at(&mut buf, 0).unwrap_or(0);
+    let mut pid = 0;
+    let mut form = "?".to_owned();
+    for line in String::from_utf8_lossy(&buf[..n]).lines() {
+        if let Some(v) = line.strip_prefix("pid=") {
+            pid = v.trim().parse().unwrap_or(0);
+        } else if let Some(v) = line.strip_prefix("form=") {
+            form = v.trim().to_owned();
+        }
+    }
+    (true, pid, form)
+}
+
+/// control.sock 可连性轮询（dial 成功即回 true 并关闭）。
+fn wait_control_ready(state_dir: &std::path::Path, d: Duration) -> bool {
     let sock = state_dir.join("control.sock");
-    ControlClient::dial(&sock, "cli", "homeway")
-        .map(|(c, _)| c)
-        .unwrap_or_else(|e| {
-            eprintln!(
-                "homeway: 连不上 {}（{e}）——守护进程未运行？先起统一进程：homeway-cli --state {}（host add 的按需拉起归后续棒）",
-                sock.display(),
-                state_dir.display()
-            );
-            std::process::exit(1)
-        })
+    let deadline = std::time::Instant::now() + d;
+    while std::time::Instant::now() < deadline {
+        if let Ok(c) = std::os::unix::net::UnixStream::connect(&sock) {
+            drop(c);
+            return true;
+        }
+        std::thread::sleep(SPAWN_POLL_STEP);
+    }
+    false
+}
+
+/// launchd 托管形态检测（darwin）：LaunchAgents 目录里任意 homeway 代理 plist
+/// （按文件名泛化——模板 label 与现役 label 都覆盖）。命中返回 label；无 = None
+/// （Linux/未安装场景恒 None——直接自 exec）。
+fn detect_launchd_agent() -> Option<String> {
+    if !cfg!(target_os = "macos") {
+        return None;
+    }
+    let home = std::env::var("HOME").ok()?;
+    let dirs = [
+        std::path::PathBuf::from(&home).join("Library/LaunchAgents"),
+        std::path::PathBuf::from("/Library/LaunchAgents"),
+    ];
+    for d in dirs {
+        let Ok(ents) = std::fs::read_dir(&d) else { continue };
+        for e in ents.flatten() {
+            let n = e.file_name().to_string_lossy().to_string();
+            if n.contains("homeway") && n.ends_with(".plist") {
+                return Some(n.trim_end_matches(".plist").to_owned());
+            }
+        }
+    }
+    None
+}
+
+/// 拉起子进程 stdio 落点（`<state>/cache/spawn.log`，追加 + 0600）。
+fn spawn_log_path(state_dir: &std::path::Path) -> std::path::PathBuf {
+    state_dir.join("cache/spawn.log")
+}
+
+fn spawn_log_tail(state_dir: &std::path::Path) -> String {
+    match std::fs::read_to_string(spawn_log_path(state_dir)) {
+        Ok(s) => {
+            let lines: Vec<&str> = s.trim_end_matches('\n').split('\n').collect();
+            let from = lines.len().saturating_sub(SPAWN_LOG_TAIL_LINES);
+            lines[from..].join("\n")
+        }
+        Err(_) => "（spawn.log 尚无内容/不可读）".to_owned(),
+    }
+}
+
+/// 自 exec 拉起统一进程：同二进制 + `--state` 透传 + setsid（脱离会话——CLI 退出
+/// 不带走它）+ stdio → `<state>/cache/spawn.log`（子进程失败原因发生在启动早期，
+/// 接 /dev/null 会让「就绪超时」拿不到失败原因）。返回子进程 pid（不 wait——
+/// setsid 后由 init 收养）。
+fn start_spawned_process(state_dir: &std::path::Path) -> Result<u32, String> {
+    let exe = std::env::current_exe().map_err(|e| e.to_string())?;
+    let log = spawn_log_path(state_dir);
+    if let Some(dir) = log.parent() {
+        std::fs::create_dir_all(dir).map_err(|e| format!("建 {}: {e}", dir.display()))?;
+    }
+    let lf = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log)
+        .map_err(|e| e.to_string())?;
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600));
+    }
+    let mut cmd = std::process::Command::new(exe);
+    cmd.arg("--state").arg(state_dir).stdin(std::process::Stdio::null());
+    cmd.stdout(lf.try_clone().map_err(|e| e.to_string())?);
+    cmd.stderr(lf);
+    unsafe {
+        cmd.pre_exec(|| {
+            if libc::setsid() == -1 {
+                return Err(std::io::Error::last_os_error());
+            }
+            Ok(())
+        });
+    }
+    use std::os::unix::process::CommandExt as _;
+    let child = cmd.spawn().map_err(|e| e.to_string())?;
+    Ok(child.id())
+}
+
+/// 按需拉起的统一拨号缝（Go dialControlSpawn——客户端域命令共用）：先试拨
+/// control.sock；失败且判定「未运行」→ 拉起（提示行走 stderr）→ 就绪后重拨。
+/// `--no-spawn`（脚本友好）= fail-fast 可行动错误；「锁被持有但 socket 未就绪」
+/// = 另一进程启动窗口——有界等就绪复用。
+pub fn dial_control_spawn(
+    state_dir: &std::path::Path,
+    name: &str,
+    no_spawn: bool,
+) -> Result<Arc<ControlClient>, String> {
+    let sock = state_dir.join("control.sock");
+    let first = ControlClient::dial(&sock, "cli", name);
+    if let Ok((c, _)) = first {
+        return Ok(c);
+    }
+    let dial_err = first.err().expect("Ok 分支已返回");
+    match probe_sock(&sock) {
+        SockState::Alive | SockState::Unreachable => {
+            // 握手/权限面失败：不按未运行处理——可行动错误。
+            Err(format!(
+                "连不上 {}：{dial_err}（协议不匹配或守护进程异常；核对版本与 --state 指向）",
+                sock.display()
+            ))
+        }
+        SockState::NotRunning => {
+            // 「未运行族 + 锁被持有」= 另一进程刚取锁、control.sock 尚未就绪的启动
+            // 窗口（两个 CLI 同时冷启动的竞态）——有界等就绪后重拨复用。
+            let (held, pid, form) = lock_held_probe(state_dir);
+            if held {
+                if wait_control_ready(state_dir, SPAWN_READY_TIMEOUT) {
+                    if let Ok((c, _)) = ControlClient::dial(&sock, "cli", name) {
+                        return Ok(c);
+                    }
+                }
+                return Err(format!(
+                    "另一 homeway 进程（pid {pid}，形态 {form}）正持有 state 锁，但控制面 {}s 内未就绪（该进程可能正在启动或卡住）\nstate={}\n可稍后重试；卡住时先停该进程再试",
+                    SPAWN_READY_TIMEOUT.as_secs(),
+                    state_dir.display()
+                ));
+            }
+            if no_spawn {
+                return Err(format!(
+                    "守护进程未运行且 --no-spawn 已给定（不拉起）\nsock={}\n先手动启动：homeway-cli --state {}（零参统一进程；Ctrl-C 收工）",
+                    sock.display(),
+                    state_dir.display()
+                ));
+            }
+            // launchd 托管形态：先短轮询等 KeepAlive 重拉（CLI 自 exec 出的进程
+            // 不归 launchd 管，KeepAlive 会反复重拉自己的实例撞锁）。
+            if let Some(label) = detect_launchd_agent() {
+                eprintln!("守护进程未运行（launchd 代理 {label} 在册）——等 KeepAlive 重拉…");
+                if wait_control_ready(state_dir, SPAWN_KEEPALIVE_WAIT) {
+                    if let Ok((c, _)) = ControlClient::dial(&sock, "cli", name) {
+                        return Ok(c);
+                    }
+                }
+                eprintln!("KeepAlive {}s 内未重拉——改为自行拉起", SPAWN_KEEPALIVE_WAIT.as_secs());
+            }
+            let pid = start_spawned_process(state_dir)
+                .map_err(|e| format!("拉起统一进程失败：{e}"))?;
+            eprintln!("守护进程未运行，已启动 pid={pid}（state={}）", state_dir.display());
+            if !wait_control_ready(state_dir, SPAWN_READY_TIMEOUT) {
+                return Err(format!(
+                    "拉起的统一进程 {}s 内未就绪（control.sock 未出现/未可连）\n{} 尾部：\n{}\n完整日志：{}",
+                    SPAWN_READY_TIMEOUT.as_secs(),
+                    spawn_log_path(state_dir).display(),
+                    spawn_log_tail(state_dir),
+                    spawn_log_path(state_dir).display()
+                ));
+            }
+            // 就绪后重拨（新预算：原预算可能已在首拨里烧掉大半）。
+            ControlClient::dial(&sock, "cli", name).map(|(c, _)| c).map_err(|e| {
+                format!("拉起后重拨失败（{}）：{e}", sock.display())
+            })
+        }
+    }
 }
 
 /// 控制面连通则 Some，否则 None（reveal 族回落台账直读用）。
@@ -130,6 +358,8 @@ struct ParsedArgs {
     yes: bool,
     force: bool,
     name: Option<String>,
+    /// 守护未跑时不按需拉起（脚本友好；Go cliBoolFlags 共享位）。
+    no_spawn: bool,
 }
 
 fn parse_args(usage: &str, args: &[String]) -> ParsedArgs {
@@ -140,6 +370,7 @@ fn parse_args(usage: &str, args: &[String]) -> ParsedArgs {
         yes: false,
         force: false,
         name: None,
+        no_spawn: false,
     };
     let mut i = 0;
     while i < args.len() {
@@ -164,6 +395,7 @@ fn parse_args(usage: &str, args: &[String]) -> ParsedArgs {
             "json" => out.json = true,
             "yes" => out.yes = true,
             "force" => out.force = true,
+            "no-spawn" => out.no_spawn = true,
             "name" => {
                 i += 1;
                 let Some(v) = args.get(i) else {
@@ -268,7 +500,7 @@ fn host_add(args: &[String]) {
         eprintln!("token 非法：{e}（token 形如 hmw1…，从出口启动日志现场获取后重新粘贴）");
         std::process::exit(1);
     }
-    let c = dial_control(&state);
+    let c = dial_control(&state, p.no_spawn);
     let v = c
         .request(
             vocab::OpName::HostAdd.as_str(),
@@ -308,7 +540,7 @@ fn host_list(args: &[String]) {
     let p = parse_args("host list [--json] [--state DIR]", args);
     let json = p.json;
     let state = p.state.clone();
-    let c = dial_control(&state);
+    let c = dial_control(&state, p.no_spawn);
     // host.list 给静态面；动态面（state/link/stats）走 snapshot.get——Go host list
     // 输出会话态/链路态，两查合一表。
     let briefs = c.request(vocab::OpName::HostList.as_str(), None, TIMEOUT).unwrap_or_else(|e| exit_op_err(&e));
@@ -364,7 +596,7 @@ fn host_status(args: &[String]) {
     let p = parse_args("host status [name] [--json] [--state DIR]", args);
     let state = p.state.clone();
     let id: Option<String> = p.positional.first().cloned();
-    let c = dial_control(&state);
+    let c = dial_control(&state, p.no_spawn);
     let snap = c.request(vocab::OpName::SnapshotGet.as_str(), None, TIMEOUT).unwrap_or_else(|e| exit_op_err(&e));
     let json = p.json;
     let hosts = snap["hosts"].as_array().cloned().unwrap_or_default();
@@ -422,7 +654,7 @@ fn host_delete(args: &[String]) {
         eprintln!("host delete 需要 <name|id>");
         std::process::exit(2);
     };
-    let c = dial_control(&state);
+    let c = dial_control(&state, p.no_spawn);
     // name/id 解析：空串拒绝、唯一前缀、歧义列候选、全长 64 hex 直用。
     let briefs = c.request(vocab::OpName::HostList.as_str(), None, TIMEOUT).unwrap_or_else(|e| exit_op_err(&e));
     let full = match resolve_host(&briefs, &want) {
@@ -467,7 +699,7 @@ pub fn cmd_status(args: &[String]) {
         status_watch(&state);
         return;
     }
-    let c = dial_control(&state);
+    let c = dial_control(&state, p.no_spawn);
     let v = c.request(vocab::OpName::DaemonStatus.as_str(), None, TIMEOUT).unwrap_or_else(|e| exit_op_err(&e));
     if json {
         println!("{}", serde_json::to_string_pretty(&v).unwrap());
@@ -534,7 +766,7 @@ pub fn cmd_serve_group(args: &[String]) {
         token_reveal_with_fallback(&state, op);
         return;
     }
-    let c = dial_control(&state);
+    let c = dial_control(&state, p.no_spawn);
     let v = c.request(op.as_str(), Some(serde_json::json!({})), TIMEOUT).unwrap_or_else(|e| exit_op_err(&e));
     match op {
         vocab::OpName::ServeStatus => {
@@ -608,7 +840,7 @@ pub fn cmd_relay_group(args: &[String]) {
         token_reveal_with_fallback(&state, op);
         return;
     }
-    let c = dial_control(&state);
+    let c = dial_control(&state, p.no_spawn);
     let v = c.request(op.as_str(), Some(serde_json::json!({})), TIMEOUT).unwrap_or_else(|e| exit_op_err(&e));
     match op {
         vocab::OpName::RelayStatus => {

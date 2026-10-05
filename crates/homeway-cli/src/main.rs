@@ -17,6 +17,7 @@ use homeway_core::speedtest::{self, Params};
 use homeway_core::token;
 use homeway_core::wgcore::ConnErr;
 
+mod carriers_cli;
 mod daemon_cli;
 mod relay_cli;
 mod serve_cli;
@@ -83,13 +84,15 @@ fn main() {
         Some("import") => daemon_cli::cmd_import(&args[2..]),
         Some("reset") => daemon_cli::cmd_reset(&args[2..]),
         Some("connect") => cmd_connect(&args[2..]),
-        Some("speedtest") => cmd_speedtest(&args[2..]),
+        Some("forward") => carriers_cli::cmd_forward(&args[2..]),
+        Some("socks") => carriers_cli::cmd_socks(&args[2..]),
+        Some("speedtest") => cmd_speedtest_dispatch(&args[2..]),
         Some("files") => cmd_files(&args[2..]),
         Some("dnstest") => cmd_dnstest(&args[2..]),
         Some("portfwd") => cmd_portfwd(&args[2..]),
         _ => {
             eprintln!(
-"homeway-cli——可用：\n  零参 = 统一进程（--state DIR / --verbose；client/control 恒开 + serve/relay 按期望态）\n  host add [--name N] [--force] <token> / host list [--json] / host status [name] / host delete <name|id> [--yes]\n  status [--json] [--watch]（daemon.status 聚合面）\n  term <list|new|attach|delete|explain> […]（本地面 term.sock；--host <ref> = 经控制面远程接入）\n  export [dest.tar] / import <file> / reset cache [--state D]（状态工件面：不变量四件打包/落位/清 cache）\n  serve <start|stop|restart|status|token> / relay <start|stop|restart|status|token>（控制面命令组）\n  serve [flags]（前台单角色）/ relay [flags]（前台单角色）\n  token <hmw1…> [--dead-direct]（改写输出：Direct 端点 → 死端口——矩阵中继段注入缝）\n  connect --token <hmw1…> [--identity-dir <dir>] [--endpoint-cache-dir <dir>]\n      [--speedtest] [--dial <ip:port>] [--hold <secs>] [--probe N] [--status-json]\n      [--recover-from <1|2|3> [--recover-cause <s>]] [--inject poison-socket|relay-lock]（注入需 test-seams 构建）\n  speedtest --token <hmw1…> [--identity-dir D] [--endpoint-cache-dir D] [--rounds N] [--hold]（同会话 N 轮——A/B 轮次口径）"
+"homeway-cli——可用：\n  零参 = 统一进程（--state DIR / --verbose；client/control 恒开 + serve/relay 按期望态）\n  host add [--name N] [--force] <token> / host list [--json] / host status [name] / host delete <name|id> [--yes]\n  status [--json] [--watch]（daemon.status 聚合面）\n  term <list|new|attach|delete|explain> […]（本地面 term.sock；--host <ref> = 经控制面远程接入）\n  export [dest.tar] / import <file> / reset cache [--state D]（状态工件面：不变量四件打包/落位/清 cache）\n  serve <start|stop|restart|status|token> / relay <start|stop|restart|status|token>（控制面命令组）\n  serve [flags]（前台单角色）/ relay [flags]（前台单角色）\n  token <hmw1…> [--dead-direct]（改写输出：Direct 端点 → 死端口——矩阵中继段注入缝）\n  connect --token <hmw1…> [--identity-dir <dir>] [--endpoint-cache-dir <dir>]\n      [--speedtest] [--dial <ip:port>] [--hold <secs>] [--probe N] [--status-json]\n      [--recover-from <1|2|3> [--recover-cause <s>]] [--inject poison-socket|relay-lock]（注入需 test-seams 构建）\n  speedtest [--host <ref>] [--json] [--down/--up 10s] [--streams 4] [--wait 60s]（守护托管：全主机轮转或单台；Ctrl-C 终止轮转）\n  speedtest --token <hmw1…> [--identity-dir D] [--endpoint-cache-dir D] [--rounds N] [--hold]（直连形态：同会话 N 轮——A/B 轮次口径）\n  forward <add|list|delete> / socks <on|off|status>（承载面：端口转发规则/SOCKS5 监听，--state 恒指 daemon state）"
             );
             std::process::exit(2);
         }
@@ -518,6 +521,17 @@ fn transit_dial(session: &Session, dst: SocketAddrV4) -> Result<usize, ConnErr> 
 
 // ---------- speedtest 独立动词（A/B 轮次口径：轮 = 同一会话内一次 run；评审 ③-1） ----------
 
+/// speedtest 双模式分流：`--token` = 直连旧形态（R1 起 matrix/perf-ab 脚本契约，
+/// 会话内 N 轮）；无 `--token` = 守护托管形态（D-1：`homeway speedtest` 的 Go 对齐
+/// 面——runner 状态机 + 全主机轮转 + 双口径输出）。
+fn cmd_speedtest_dispatch(args: &[String]) {
+    if args.iter().any(|a| a == "--token") {
+        cmd_speedtest(args);
+    } else {
+        carriers_cli::cmd_speedtest_hosted(args);
+    }
+}
+
 /// `homeway-cli speedtest --token <hmw1…> [--identity-dir D] [--endpoint-cache-dir D]
 ///  [--rounds N] [--hold]`——建一次会话跑 N 轮（每轮自带 2s warmup，与 Go daemon
 /// `speedtest --state -host` 常驻同会话口径一致）。`--hold` = 跑完保持会话（RSS 采样）。
@@ -611,12 +625,19 @@ fn cmd_files(args: &[String]) {
     // files <verb> --token <hmw1> [--identity-dir D] [--dead-direct] [--inject no-hint]
     //   [--rate-limit <bytes/s>] <path> [<local>]（--rate-limit 缺省 2MiB/s 发送端速率
     //   义务；0 = 不限、风险自担——对齐 Go files-cli 1.4）
+    // files <verb> --host <ref> [--state D] [--timeout T] [--no-spawn] <path> [<local>]
+    //   （--host = 远程形态：寻址与拨号都经 control.sock 的 stream.open{kind:files}
+    //   透传腿，与 term --host 同一底座——D-1）
     let mut tok: Option<String> = None;
     let mut identity_dir: Option<PathBuf> = None;
     let mut dead_direct = false;
     let mut inject_what: Option<String> = None;
     let mut no_session_lock = false;
     let mut rate_limit: Option<i64> = None;
+    let mut host_ref: Option<String> = None;
+    let mut host_state: Option<PathBuf> = None;
+    let mut host_timeout: Option<Duration> = None;
+    let mut no_spawn = false;
     let mut rest: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
@@ -635,6 +656,31 @@ fn cmd_files(args: &[String]) {
                 inject_what = args.get(i).cloned();
             }
             "--no-session-lock" => no_session_lock = true,
+            "--host" => {
+                i += 1;
+                host_ref = args.get(i).cloned();
+                if host_ref.is_none() {
+                    eprintln!("--host 需要值（<name|id>——homeway-cli host list 查看在表主机）");
+                    std::process::exit(2);
+                }
+            }
+            "--state" => {
+                i += 1;
+                host_state = args.get(i).map(PathBuf::from);
+                if host_state.is_none() {
+                    eprintln!("--state 需要目录参数（统一 state 根〔control.sock 所在〕）");
+                    std::process::exit(2);
+                }
+            }
+            "--timeout" => {
+                i += 1;
+                host_timeout = args.get(i).and_then(|v| term_cli::parse_duration(v));
+                if host_timeout.is_none() {
+                    eprintln!("--timeout 需要时长（如 10s / 1500ms）");
+                    std::process::exit(2);
+                }
+            }
+            "--no-spawn" => no_spawn = true,
             "--rate-limit" => {
                 i += 1;
                 let v = args.get(i).and_then(|v| v.parse::<i64>().ok());
@@ -656,6 +702,7 @@ fn cmd_files(args: &[String]) {
     }
     let Some(tok) = tok else {
         eprintln!("用法：homeway-cli files <list|stat|mkdir|read|get|put|download|upload> --token <hmw1> [--identity-dir D] [--rate-limit B/s（缺省 2MiB/s；0 不限）] <远端路径> [<本地路径>]");
+        eprintln!("  远程形态：homeway-cli files <verb> --host <ref> [--state D] [--timeout T] <远端路径> [<本地路径>]（经控制面 stream.open 转发——D-1）");
         eprintln!("  get <远端> [-o 本地] [--force]（目标缺省 = basename，已存在默认拒）；put <本地> <远端>——Go 契约参数序，与 download/upload（<远端> [<本地>]）不同");
         std::process::exit(2);
     };
@@ -797,6 +844,21 @@ fn cmd_files(args: &[String]) {
         }
         println!("inject: token 直连端点已改指死端口（127.0.0.1:1）——只有中继可达");
     }
+    if let Some(host_ref) = host_ref {
+        cmd_files_remote(
+            &host_ref,
+            FilesRemoteArgs {
+                verb: verb.clone(),
+                path: path.clone(),
+                local: local.clone(),
+                state: host_state,
+                timeout: host_timeout,
+                no_spawn,
+                rate_limit,
+            },
+        );
+        return;
+    }
     let _session_lock = (!no_session_lock).then(|| session_lock_or_exit(&identity_dir, "files"));
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
     let session = match Session::start(SessionConfig {
@@ -874,6 +936,155 @@ fn cmd_files(args: &[String]) {
     session.stop();
     if let Err(e) = r {
         eprintln!("files {verb} 失败：{e}");
+    }
+}
+
+
+// ---------- files 远程形态（--host：控制面 stream.open{kind:files} 透传腿——D-1） ----------
+
+/// 远程形态：寻址（host.list + resolve——与 term/host delete 同规则）→ 控制面
+/// stream.open → files 协议端到端原样承载（零 wire 改动）。`--timeout` 缺省 10s
+/// （解析与打开各一次预算——Go defaultRemoteTimeout 同义）。
+/// 远程形态的参数束（cmd_files 转发面收敛）。
+struct FilesRemoteArgs {
+    verb: String,
+    path: String,
+    local: String,
+    state: Option<PathBuf>,
+    timeout: Option<Duration>,
+    no_spawn: bool,
+    rate_limit: Option<i64>,
+}
+
+fn cmd_files_remote(host_ref: &str, a: FilesRemoteArgs) {
+    let FilesRemoteArgs { verb, path, local, state, timeout, no_spawn, rate_limit } = a;
+    use homeway_core::daemon::vocab;
+    let timeout = timeout.unwrap_or(Duration::from_secs(10));
+    let state_dir = state.unwrap_or_else(crate::unified_cli::default_state_dir);
+    let ref_trim = host_ref.trim();
+    if ref_trim.is_empty() {
+        eprintln!("homeway: 空寻址串不可用——homeway-cli files <子命令> --host 需要 <name|id>（homeway-cli host list 查看在表主机）");
+        std::process::exit(2);
+    }
+    // ① 解析（拉起面共用；host.list 寻址——与 host delete/term 同一份规则文案）。
+    let c = match daemon_cli::dial_control_spawn(&state_dir, "homeway-files", no_spawn) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("homeway: {e}");
+            std::process::exit(1);
+        }
+    };
+    let briefs = match c.request(vocab::OpName::HostList.as_str(), None, timeout) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("homeway: host.list 失败：{}", daemon_cli::op_err_text_pub(&e));
+            std::process::exit(1);
+        }
+    };
+    let id = match daemon_cli::resolve_host_pub(&briefs, ref_trim) {
+        Ok(id) => id,
+        Err(e) => {
+            eprintln!("homeway: {e}");
+            std::process::exit(1);
+        }
+    };
+    // ② 打开流（解析与打开各一次 --timeout 预算）。
+    let st = match c.open_stream(vocab::STREAM_KIND_FILES, &id, timeout) {
+        Ok(st) => st,
+        Err(e) => {
+            eprintln!("homeway: {}", files_stream_open_err_text(&e));
+            std::process::exit(1);
+        }
+    };
+    // ③ 动词（远程壳——协议与本地同一条实现）。
+    let r: Result<(), homeway_core::files::FilesError> = match verb.as_str() {
+        "list" => homeway_core::files::list_remote(c.clone(), st.clone(), &path).map(|entries| {
+            for e in entries {
+                let kind = if e.is_dir { "dir " } else { "file" };
+                println!("{kind} {:>12}  {}", e.size, e.name);
+            }
+        }),
+        "stat" => homeway_core::files::stat_remote(c.clone(), st.clone(), &path).map(|e| {
+            println!("{} {} size={} mtimeMs={} mode={}", if e.is_dir { "dir" } else { "file" }, e.name, e.size, e.mtime_ms, e.mode);
+        }),
+        "mkdir" => homeway_core::files::mkdir_remote(c.clone(), st.clone(), &path).map(|_| println!("已建目录 {path}")),
+        "read" => homeway_core::files::read_remote(c.clone(), st.clone(), &path, "", 1 << 20).map(|r| {
+            print!("{}", r.text);
+        }),
+        "download" | "get" => {
+            let mut out: Box<dyn std::io::Write> = if local == "-" {
+                Box::new(std::io::stdout())
+            } else {
+                Box::new(std::fs::File::create(&local).unwrap_or_else(|e| {
+                    eprintln!("本地文件建不了（{local}）：{e}");
+                    std::process::exit(1);
+                }))
+            };
+            homeway_core::files::download_remote(c.clone(), st.clone(), &path, &mut out, |size| {
+                eprintln!("服务端声明 {size} 字节");
+            })
+            .map(|n| println!("下载完成 {n} 字节 → {local}"))
+        }
+        "upload" | "put" => {
+            let mut f = std::fs::File::open(&local).unwrap_or_else(|e| {
+                eprintln!("本地文件打不开（{local}）：{e}");
+                std::process::exit(1);
+            });
+            let size = f.metadata().map(|m| m.len() as i64).unwrap_or(0);
+            let rate = rate_limit.unwrap_or(homeway_core::files::DEFAULT_RATE_LIMIT);
+            let mut limiter = homeway_core::files::UploadLimiter::new(rate);
+            homeway_core::files::upload_remote(
+                c.clone(),
+                st.clone(),
+                &path,
+                &mut f,
+                size,
+                |done| {
+                    if done % (64 << 20) == 0 {
+                        eprintln!("上传进度 {done}/{size}");
+                    }
+                },
+                limiter.as_mut(),
+            )
+            .map(|n| println!("上传完成 {n} 字节 → {path}"))
+        }
+        other => {
+            eprintln!("未知动词：{other}");
+            std::process::exit(2);
+        }
+    };
+    // 收口：先 Client.Close（唯一可靠逃生口——closed 解阻塞读腿），stream.close
+    // 尽力而为（上传未提交 = 取消语义由流终结承载）。
+    let _ = c.stream_close(&st, Duration::from_secs(3));
+    c.close();
+    if let Err(e) = r {
+        eprintln!("files {verb} 失败：{e}");
+        std::process::exit(1);
+    }
+}
+
+/// stream.open 错误码 → files 面可行动文案（Go filesStreamOpenErr：bad_request 的
+/// 代际文案——kind 值域外 = 新 CLI 配旧 daemon 的唯一兼容断点，design D5）。
+fn files_stream_open_err_text(e: &homeway_core::daemon::proto::OpError) -> String {
+    let detail = {
+        let d = e.detail();
+        if d.is_empty() { String::new() } else { format!("：{d}") }
+    };
+    match e.code.as_str() {
+        homeway_core::daemon::vocab::CODE_BAD_REQUEST => {
+            "守护进程代际过旧，不识 files 流；请同批升级 daemon（bad_request：stream.open 的 kind 值域外）".to_owned()
+        }
+        homeway_core::daemon::vocab::CODE_NO_HOST => {
+            "主机不在守护进程表中（no_host）；homeway-cli host list 查看在表主机".to_owned()
+        }
+        homeway_core::daemon::vocab::CODE_NOT_READY => {
+            "守护进程注册表未就绪（not_ready；client 角色启动中/重建窗口），稍后重试".to_owned()
+        }
+        homeway_core::daemon::vocab::CODE_STREAM_REFUSED => format!(
+            "与主机的流打开被拒（stream_refused）——主机离线、隧道未通或主机会话不可用；用 homeway-cli host status <name> 核对会话与链路态{detail}"
+        ),
+        "timeout" => "连接/打开超预算（--timeout）：daemon 未应答或目标主机拨号黑洞；可用 --timeout 加大预算后重试".to_owned(),
+        other => format!("stream.open 失败：{other}{detail}"),
     }
 }
 

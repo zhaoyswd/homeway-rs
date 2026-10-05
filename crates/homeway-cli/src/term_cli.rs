@@ -50,15 +50,29 @@ fn resolve_host_ref(state_dir: &std::path::Path, r#ref: &str, timeout: Duration)
     if r#ref.trim().is_empty() {
         return Err("空寻址串不可用——homeway-cli term <子命令> --host 需要 <name|id>（homeway-cli host list 查看在表主机）".to_owned());
     }
-    let sock = state_dir.join("control.sock");
-    let (c, _) =
-        ControlClient::dial(&sock, "cli", "homeway-term").map_err(|e| control_dial_err(&sock, &e))?;
+    let c = dial_control_spawn_term(state_dir)?;
     let briefs = c
         .request(vocab::OpName::HostList.as_str(), None, timeout)
         .map_err(|e| format!("host.list 失败：{}", crate::daemon_cli::op_err_text_pub(&e)))?;
     let r = crate::daemon_cli::resolve_host_pub(&briefs, r#ref);
     c.close(); // 显式关（评审 r2-10：ControlClient 无 Drop——不关则 fd+reader 线程滞留到进程退出）
     r
+}
+
+/// term 面的控制面拨号：先试拨（其它错误保留 term 面的误指提示文案），未运行族
+/// 走按需拉起（D-1：Go dialCarrierCLI → dialControlSpawn 同义）。
+fn dial_control_spawn_term(state_dir: &std::path::Path) -> Result<Arc<ControlClient>, String> {
+    let sock = state_dir.join("control.sock");
+    match ControlClient::dial(&sock, "cli", "homeway-term") {
+        Ok((c, _)) => Ok(c),
+        Err(e) => {
+            if crate::daemon_cli::sock_not_running(&sock) {
+                crate::daemon_cli::dial_control_spawn(state_dir, "homeway-term", false)
+            } else {
+                Err(control_dial_err(&sock, &e))
+            }
+        }
+    }
 }
 
 /// 控制面连接层错误 → 可行动文案（Go controlDialErr 同义：ENOENT 带出口 state 误指提示）。
@@ -328,9 +342,7 @@ fn dial_term(t: &mut TermTarget) -> Result<(TermConn, u32), String> {
                 id
             }
         };
-        let sock = t.state_dir.join("control.sock");
-        let (client, _) = ControlClient::dial(&sock, "cli", "homeway-term")
-            .map_err(|e| control_dial_err(&sock, &e))?;
+        let client = dial_control_spawn_term(&t.state_dir)?;
         let st = client.open_stream(vocab::STREAM_KIND_TERM, &id, t.timeout).map_err(|e| stream_open_err_text(&e))?;
         TermConn::Remote { client, st, buf: Vec::new() }
     } else {
@@ -428,7 +440,7 @@ attach 分离键：Ctrl-b d 分离 / Ctrl-b r 重对齐 / Ctrl-b Ctrl-b 字面�
 }
 
 /// `--flag=value` → `--flag value`（Go expandFlagEq 同义；cmd_term 入口统一归一）。
-fn expand_flag_eq(args: &[String]) -> Vec<String> {
+pub(crate) fn expand_flag_eq(args: &[String]) -> Vec<String> {
     let mut out = Vec::with_capacity(args.len());
     for a in args {
         if let Some(rest) = a.strip_prefix("--") {
@@ -473,7 +485,7 @@ impl TermCommon {
 }
 
 /// `--timeout <10s|1500ms>` 解析（Go time.ParseDuration 的 CLI 子集；无单位拒绝——Go 同款）。
-fn parse_duration(v: &str) -> Option<Duration> {
+pub(crate) fn parse_duration(v: &str) -> Option<Duration> {
     let split = v.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(v.len());
     let (num, unit) = v.split_at(split);
     let n: f64 = num.parse().ok()?;
