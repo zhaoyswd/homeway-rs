@@ -486,6 +486,7 @@ dependencies = [
  "homeway-core",
  "libc",
  "serde",
+ "serde_json",
  "toml",
 ]
 
