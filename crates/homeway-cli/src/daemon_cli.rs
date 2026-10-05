@@ -127,7 +127,6 @@ struct ParsedArgs {
     state: PathBuf,
     positional: Vec<String>,
     json: bool,
-    watch: bool,
     yes: bool,
     force: bool,
     name: Option<String>,
@@ -138,7 +137,6 @@ fn parse_args(usage: &str, args: &[String]) -> ParsedArgs {
         state: default_state_dir(),
         positional: Vec::new(),
         json: false,
-        watch: false,
         yes: false,
         force: false,
         name: None,
@@ -165,7 +163,6 @@ fn parse_args(usage: &str, args: &[String]) -> ParsedArgs {
             }
             "json" => out.json = true,
             "yes" => out.yes = true,
-            "watch" => out.watch = true,
             "force" => out.force = true,
             "name" => {
                 i += 1;
@@ -451,10 +448,18 @@ fn host_delete(args: &[String]) {
 // ---------- status（聚合状态面） ----------
 
 pub fn cmd_status(args: &[String]) {
-    let p = parse_args("status [--json] [--watch] [--state DIR]", args);
+    // --watch 只属 status（评审 r2-14：进共享 flag 表会让 host list --watch 被静默
+    // 吞——先本地剥再走共享解析）。
+    let watch = args.iter().any(|a| a == "--watch" || a == "--watch=true");
+    let rest: Vec<String> = args
+        .iter()
+        .filter(|a| **a != "--watch" && !a.starts_with("--watch="))
+        .cloned()
+        .collect();
+    let p = parse_args("status [--json] [--watch] [--state DIR]", &rest);
     let json = p.json;
     let state = p.state.clone();
-    if p.watch {
+    if watch {
         if json {
             eprintln!("homeway: --json 与 --watch 互斥（--watch = 人类可读 live 渲染；机器可读消费走 --json）");
             std::process::exit(1);
@@ -627,9 +632,30 @@ pub fn cmd_relay_group(args: &[String]) {
 
 // ---------- export / import / reset（状态工件面；P1-6） ----------
 
+/// 工件族三动词的参数归一（评审 r2-5：手写解析只认 `--state DIR`，`--state=DIR`
+/// 会落进位置参数——CLI-1 同款；统一在入口拆等号形态）。
+fn normalize_flag_eq(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    for a in args {
+        if let Some(rest) = a.strip_prefix("--") {
+            if let Some((k, v)) = rest.split_once('=') {
+                if !k.is_empty() && !v.is_empty() {
+                    out.push(format!("--{k}"));
+                    out.push(v.to_owned());
+                    continue;
+                }
+            }
+        }
+        out.push(a.clone());
+    }
+    out
+}
+
+
 /// `homeway export [--state D] [dest.tar]`——一次性直跑（不连控制面；语义真源
 /// internal/daemon/artifact_cli.go）。默认名 homeway-export-<ts>.tar 于当前目录。
 pub fn cmd_export(args: &[String]) {
+    let args = &normalize_flag_eq(args);
     let mut state: Option<std::path::PathBuf> = None;
     let mut dest = None;
     let mut i = 0;
@@ -665,6 +691,7 @@ pub fn cmd_export(args: &[String]) {
 /// `homeway import <file> [--state D]`——布局校验 + 安全解包 + 落位序（目标进程
 /// 必须在停——锁试探拒绝）。
 pub fn cmd_import(args: &[String]) {
+    let args = &normalize_flag_eq(args);
     let mut state: Option<std::path::PathBuf> = None;
     let mut file: Option<String> = None;
     let mut i = 0;
@@ -702,6 +729,7 @@ pub fn cmd_import(args: &[String]) {
 
 /// `homeway reset cache [--state D]`（两词动词；v1 唯一动词 = cache）。
 pub fn cmd_reset(args: &[String]) {
+    let args = &normalize_flag_eq(args);
     let Some(verb) = args.first() else {
         eprintln!("用法：homeway reset cache [--state D]（清可弃层 cache/；进程在跑拒绝）");
         eprintln!("homeway: reset 需要动词：cache");
@@ -835,25 +863,27 @@ fn status_watch(state_dir: &std::path::Path) {
     let pipes = install_status_watch_signals();
     render_watch(&hosts);
     loop {
-        // 事件优先（500ms 心跳复检信号/连接）。
+        // 事件优先（500ms 心跳复检信号/连接——评审 r2-1：断开判据走 is_closed/
+        // goodbye 状态面；通道 Disconnected 永不触发〔发送端随长命 ControlClient 活着〕）。
         match events.recv_timeout(std::time::Duration::from_millis(500)) {
             Ok(ev) => {
                 apply_watch_event(&mut hosts, &ev);
                 render_watch(&hosts);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                if let Some(g) = c.goodbye() {
-                    eprintln!(
-                        "homeway: 守护进程已断开（goodbye={}）——检查守护进程（homeway-cli status）后重新运行本命令",
-                        g.reason
-                    );
-                } else {
-                    eprintln!("homeway: 守护进程连接已断开——守护进程可能已退出（homeway-cli status 确认后重新运行本命令）");
-                }
-                drop_status_watch_signals(pipes);
-                std::process::exit(1);
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {}
+        }
+        if c.is_closed() {
+            if let Some(g) = c.goodbye() {
+                eprintln!(
+                    "homeway: 守护进程已断开（goodbye={}）——检查守护进程（homeway-cli status）后重新运行本命令",
+                    g.reason
+                );
+            } else {
+                eprintln!("homeway: 守护进程连接已断开——守护进程可能已退出（homeway-cli status 确认后重新运行本命令）");
             }
+            drop_status_watch_signals(pipes);
+            std::process::exit(1);
         }
         if watch_signal_fired(&pipes) {
             // Ctrl-C：正常退出（exit 0——Go 同口径）
@@ -865,10 +895,33 @@ fn status_watch(state_dir: &std::path::Path) {
 
 /// 事件增量应用（渲染行按 host 键幂等覆盖——at-least-once 语义下重复事件无害；
 /// 词表只增：未入渲染面的 kind 忽略）。
-fn apply_watch_event(hosts: &mut [WatchHost], ev: &homeway_core::daemon::proto::EventBody) {
+fn apply_watch_event(hosts: &mut Vec<WatchHost>, ev: &homeway_core::daemon::proto::EventBody) {
     let host = ev.payload.as_ref().and_then(|p| p["host"].as_str()).unwrap_or("").to_owned();
+    match ev.kind.as_str() {
+        vocab::KIND_SESSION_ADDED => {
+            // 新主机建行（渲染随表；视图声明不追溯——Go 同口径）。
+            if !hosts.iter().any(|h| h.id == host) {
+                hosts.push(WatchHost {
+                    id: host.clone(),
+                    name: ev.payload.as_ref().and_then(|p| p["name"].as_str()).unwrap_or("-").to_owned(),
+                    state: "connecting".to_owned(),
+                    reason: String::new(),
+                    via: "-".to_owned(),
+                    ep: "-".to_owned(),
+                    rtt_ms: 0,
+                });
+            }
+            return;
+        }
+        vocab::KIND_SESSION_REMOVED => {
+            // 移除主机删行。
+            hosts.retain(|h| h.id != host);
+            return;
+        }
+        _ => {}
+    }
     let Some(row) = hosts.iter_mut().find(|h| h.id == host) else {
-        return; // 视图外主机（watch 期间新增——照常忽略；Go 同口径不追溯进视图）
+        return; // 视图外主机
     };
     match ev.kind.as_str() {
         vocab::KIND_LINK_CHANGED => {
@@ -900,10 +953,13 @@ fn render_watch(hosts: &[WatchHost]) {
     let _ = writeln!(out, "homeway status --watch（Ctrl-C 退出；观测副作用：显示中主机被视为有需求）");
     let _ = writeln!(out, "{:<18} {:<10} {:<10} {:<8} {:<22} {:>6}", "HOST", "NAME", "STATE", "VIA", "EP", "RTT");
     for h in hosts {
-        let mut reason = h.reason.clone();
-        if reason.len() > 20 {
-            reason = format!("{}…", &reason[..18]);
-        }
+        // 字符截断（评审 r2-6：字节下标切中文必 panic）。
+        let rc: Vec<char> = h.reason.chars().collect();
+        let reason = if rc.len() > 20 {
+            rc[..19].iter().collect::<String>() + "…"
+        } else {
+            h.reason.clone()
+        };
         let _ = writeln!(
             out,
             "{:<18} {:<10} {:<10} {:<8} {:<22} {:>4}ms {}",
@@ -937,7 +993,17 @@ extern "C" fn on_watch_sig(_sig: i32) {
 
 fn install_status_watch_signals() -> WatchSigPipe {
     let mut fds = [0i32; 2];
-    unsafe { libc::pipe(fds.as_mut_ptr()) };
+    let r = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if r != 0 {
+        let e = std::io::Error::last_os_error();
+        eprintln!("homeway: 信号管道建立失败（{e}）——watch 退出");
+        std::process::exit(1);
+    }
+    // 读端非阻塞（评审 r2-1：阻塞读端曾令主循环每轮末尾挂死——事件/断开全冻结）。
+    unsafe {
+        let fl = libc::fcntl(fds[0], libc::F_GETFL);
+        libc::fcntl(fds[0], libc::F_SETFL, fl | libc::O_NONBLOCK);
+    }
     WATCH_SIG_W.store(fds[1], std::sync::atomic::Ordering::SeqCst);
     unsafe {
         let h = on_watch_sig as extern "C" fn(i32) as libc::sighandler_t;
@@ -947,10 +1013,21 @@ fn install_status_watch_signals() -> WatchSigPipe {
     WatchSigPipe { read_fd: fds[0], write_fd: fds[1] }
 }
 
+/// 非阻塞排空信号管道（有 'x' = 退出信号到过）。
 fn watch_signal_fired(p: &WatchSigPipe) -> bool {
-    let mut b = [0u8; 8];
-    let n = unsafe { libc::read(p.read_fd, b.as_mut_ptr().cast(), 8) };
-    n > 0
+    let mut b = [0u8; 64];
+    let mut got = false;
+    loop {
+        let n = unsafe { libc::read(p.read_fd, b.as_mut_ptr().cast(), b.len()) };
+        if n > 0 {
+            if b[..n as usize].contains(&b'x') {
+                got = true;
+            }
+            continue;
+        }
+        break;
+    }
+    got
 }
 
 fn drop_status_watch_signals(p: WatchSigPipe) {

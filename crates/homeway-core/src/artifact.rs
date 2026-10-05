@@ -191,7 +191,11 @@ struct Entry {
 
 /// 工件落位（校验 → 解包 → 落位序 → 回滚）。成功后旧四件备份目录一并清理。
 pub fn import(state_dir: &Path, artifact: &Path) -> Result<(), String> {
-    std::fs::create_dir_all(state_dir).map_err(|e| e.to_string())?;
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut b = std::fs::DirBuilder::new();
+        b.mode(0o700).recursive(true).create(state_dir).map_err(|e| e.to_string())?;
+    }
     // 目标进程在停（锁试探；在跑 = 可行动错误拒绝）。
     if lock_held(state_dir)? {
         return Err(format!(
@@ -233,6 +237,12 @@ pub fn import(state_dir: &Path, artifact: &Path) -> Result<(), String> {
 /// 读 tar 并做逐条目安全校验（前缀/路径段/类型/规模四界——工件来自用户，半可信）。
 fn read_artifact(path: &Path) -> Result<Vec<Entry>, String> {
     let mut f = std::fs::File::open(path).map_err(|e| format!("import: 打开工件失败：{e}"))?;
+    // 真界（评审 r2-8：先 read_to_end 再校验 = 10GB 工件先 OOM；文件长度先验——
+    // 条目级上限在逐条目循环里仍逐条判）。
+    let file_len = f.metadata().map_err(|e| format!("import: 读工件元数据失败：{e}"))?.len();
+    if file_len > MAX_TOTAL_BYTES {
+        return Err(format!("import: 工件总字节超上限（{} MB）——拒绝", MAX_TOTAL_BYTES >> 20));
+    }
     let mut raw = Vec::new();
     f.read_to_end(&mut raw).map_err(|e| format!("import: 读工件失败：{e}"))?;
     let mut tr = TarReader::new(&raw).map_err(|e| format!("import: 工件不是合法 tar：{e}"))?;
@@ -343,19 +353,24 @@ fn validate_artifact(entries: &[Entry]) -> Result<(), String> {
     Ok(())
 }
 
-/// 解包到临时目录（文件 0600、目录 0700）。
+/// 解包到临时目录（文件 0600、目录 0700——评审 r2-9：create_dir_all 默认 0755）。
 fn extract_artifact(entries: &[Entry], tmp_dir: &Path) -> Result<(), String> {
+    use std::os::unix::fs::DirBuilderExt as _;
+    fn mkdir_700(p: &Path) -> std::io::Result<()> {
+        let mut b = std::fs::DirBuilder::new();
+        b.mode(0o700).recursive(true).create(p)
+    }
     for e in entries {
         if e.name == EXPORT_TOP {
             continue;
         }
         let dst = tmp_dir.join(&e.name);
         if e.dir {
-            std::fs::create_dir_all(&dst).map_err(|err| err.to_string())?;
+            mkdir_700(&dst).map_err(|err| err.to_string())?;
             continue;
         }
         if let Some(parent) = dst.parent() {
-            std::fs::create_dir_all(parent).map_err(|err| err.to_string())?;
+            mkdir_700(parent).map_err(|err| err.to_string())?;
         }
         std::fs::OpenOptions::new()
             .create(true)
@@ -403,7 +418,12 @@ fn place_pieces_inner(
         if !src.exists() {
             continue;
         }
-        std::fs::create_dir_all(old_dir).map_err(|e| format!("import: 建旧件暂存目录失败：{e}"))?;
+        {
+            use std::os::unix::fs::DirBuilderExt as _;
+            let mut b = std::fs::DirBuilder::new();
+            b.mode(0o700).recursive(true).create(old_dir)
+                .map_err(|e| format!("import: 建旧件暂存目录失败：{e}"))?;
+        }
         std::fs::rename(&src, old_dir.join(p))
             .map_err(|e| format!("import: 旧件 {p} 搬走失败：{e}"))?;
         moved_old.push((*p).to_owned());
@@ -432,8 +452,16 @@ pub fn reset_cache(state_dir: &Path) -> Result<(), String> {
             state_dir.display()
         ));
     }
-    std::fs::remove_dir_all(state_dir.join("cache")).map_err(|e| e.to_string())?;
-    std::fs::create_dir_all(state_dir.join("cache")).map_err(|e| e.to_string())?;
+    match std::fs::remove_dir_all(state_dir.join("cache")) {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // Go os.RemoveAll 语义
+        Err(e) => return Err(e.to_string()),
+    }
+    {
+        use std::os::unix::fs::DirBuilderExt as _;
+        let mut b = std::fs::DirBuilder::new();
+        b.mode(0o700).create(state_dir.join("cache")).map_err(|e| e.to_string())?;
+    }
     Ok(())
 }
 
@@ -512,7 +540,7 @@ impl TarWriter {
     }
 
     fn dir(&mut self, name: &str) -> Result<(), String> {
-        self.header(name, 0, b'5')?;
+        self.header_mode(name, 0, b'5', 0o700)?;
         Ok(())
     }
 
@@ -525,13 +553,21 @@ impl TarWriter {
     }
 
     fn header(&mut self, name: &str, size: u64, typeflag: u8) -> Result<(), String> {
+        // 文件条目 mode 0600（评审 r2-9：Go fileEntry 同值——恒 0700 会露馅 tar -tvf 对拍）。
+        self.header_mode(name, size, typeflag, 0o600)
+    }
+
+    fn header_mode(&mut self, name: &str, size: u64, typeflag: u8, mode: u32) -> Result<(), String> {
         let name_b = name.as_bytes();
         if name_b.len() > 100 {
             return Err(format!("tar 条目名超 100 字节（{name}）——固定布局不会出现，疑似异物"));
         }
+        if name_b.contains(&0) {
+            return Err(format!("tar 条目名含内嵌 NUL（{name:?}）——拒绝"));
+        }
         let mut h = [0u8; BLOCK];
         h[..name_b.len()].copy_from_slice(name_b);
-        h[100..108].copy_from_slice(octal(0o700, 8).as_bytes()); // mode
+        h[100..108].copy_from_slice(octal(mode as u64, 8).as_bytes()); // mode
         h[108..116].copy_from_slice(octal(0, 8).as_bytes()); // uid
         h[116..124].copy_from_slice(octal(0, 8).as_bytes()); // gid
         h[124..136].copy_from_slice(octal(size, 12).as_bytes()); // size
@@ -572,7 +608,12 @@ impl<'a> TarReader<'a> {
     /// 下一条目（None = 结束）；返回 (名字, 是否目录, 数据)。
     fn next(&mut self) -> Result<Option<(String, bool, Vec<u8>)>, String> {
         if self.off + BLOCK > self.data.len() {
-            return Ok(None);
+            // 尾巴有字节但不足一头块：全零尾巴 = 正常截断；非零 = 坏工件（评审
+            // r2-16：原样 Ok(None) 会把截断错误退化成「缺件」）。
+            if self.data[self.off..].iter().all(|&b| b == 0) {
+                return Ok(None);
+            }
+            return Err("尾部不足一个头块且非全零（截断的工件）".to_owned());
         }
         let h = &self.data[self.off..self.off + BLOCK];
         if h.iter().all(|&b| b == 0) {

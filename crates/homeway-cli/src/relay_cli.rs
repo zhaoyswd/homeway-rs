@@ -126,6 +126,25 @@ impl RelayProc {
     pub fn exited_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
         Arc::clone(&self.exited)
     }
+
+    /// run 线程是否已退出（false = 在跑；前台等待循环与 supervisor 同判据）。
+    pub fn exited(&self) -> bool {
+        self.exited.load(std::sync::atomic::Ordering::SeqCst)
+    }
+}
+
+impl Drop for RelayProc {
+    /// 兜底收口（评审 r2-E：无 Drop 时宿主覆盖/丢弃表项 = stop 管道 fd 泄漏；
+    /// 显式 stop() 先走、Drop 幂等——write 对已关 fd 只 EBADF）。
+    fn drop(&mut self) {
+        unsafe {
+            libc::write(self.stop_w, b"x".as_ptr().cast(), 1);
+            if let Some(h) = self.join.take() {
+                let _ = h.join();
+            }
+            libc::close(self.stop_w);
+        }
+    }
 }
 
 /// relay 角色装配参数（flag 覆盖后的终值；统一进程 = 纯 config 值）。
@@ -278,7 +297,29 @@ pub fn cmd_relay(args: &[String]) {
     };
     println!("（relay 前台运行中——Ctrl-C 收工）");
     stop_pipe(); // 装 handler（前台形态；pipe 已在装配时建好）
-    wait_pipe_readable();
+    // 评审 r2-4：run 失败不再 exit(1) 后，前台等待必须双看——只等信号会把
+    // 「run 早失败」退化成无输出挂死（RelayLog::logf 只进 relay.log 不进终端）。
+    // 形态：poll stop 管道（非阻塞）+ exited 位；任一先到即收。
+    {
+        let (r, _) = *STOP_PIPE.get().expect("stop_pipe 已装");
+        unsafe {
+            let fl = libc::fcntl(r, libc::F_GETFL);
+            libc::fcntl(r, libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+        loop {
+            let mut b = [0u8; 8];
+            let n = unsafe { libc::read(r, b.as_mut_ptr().cast(), b.len()) };
+            if n > 0 {
+                break; // 信号
+            }
+            if proc.exited() {
+                eprintln!("relay: 运行失败已收线（细节见 cache/relay.log）——前台退出");
+                proc.stop();
+                std::process::exit(1);
+            }
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    }
     proc.stop();
 }
 
@@ -346,10 +387,4 @@ fn stop_pipe() -> (i32, i32) {
         libc::signal(libc::SIGINT, h);
     }
     (r, w)
-}
-
-fn wait_pipe_readable() -> bool {
-    let (r, _) = *STOP_PIPE.get_or_init(|| (0, 0));
-    let mut b = [0u8; 1];
-    unsafe { libc::read(r, b.as_mut_ptr().cast(), 1) >= 0 }
 }

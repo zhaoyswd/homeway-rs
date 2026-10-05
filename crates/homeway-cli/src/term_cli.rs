@@ -56,7 +56,9 @@ fn resolve_host_ref(state_dir: &std::path::Path, r#ref: &str, timeout: Duration)
     let briefs = c
         .request(vocab::OpName::HostList.as_str(), None, timeout)
         .map_err(|e| format!("host.list 失败：{}", crate::daemon_cli::op_err_text_pub(&e)))?;
-    crate::daemon_cli::resolve_host_pub(&briefs, r#ref)
+    let r = crate::daemon_cli::resolve_host_pub(&briefs, r#ref);
+    c.close(); // 显式关（评审 r2-10：ControlClient 无 Drop——不关则 fd+reader 线程滞留到进程退出）
+    r
 }
 
 /// 控制面连接层错误 → 可行动文案（Go controlDialErr 同义：ENOENT 带出口 state 误指提示）。
@@ -484,7 +486,8 @@ fn parse_duration(v: &str) -> Option<Duration> {
         "h" => n * 3600.0,
         _ => return None,
     };
-    (secs > 0.0).then(|| Duration::from_secs_f64(secs))
+    // 溢出防护（评审 r2-D：from_secs_f64 超界 panic）。
+    (secs > 0.0 && secs < 86400.0 * 365.0).then(|| Duration::from_secs_f64(secs))
 }
 
 /// 解析产物：公共参数 + 出现过的已知名 flag（动词自行消化）+ 带值 flag 的值对 + 位置会话名。
@@ -1297,7 +1300,11 @@ impl Clone for SigPipe {
 
 fn install_signal_pipes() -> SigPipe {
     let mut fds = [0i32; 2];
-    unsafe { libc::pipe(fds.as_mut_ptr()) };
+    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
+        let e = std::io::Error::last_os_error();
+        eprintln!("homeway term: 信号管道建立失败（{e}）——退出");
+        std::process::exit(1);
+    }
     SIG_W.store(fds[1], Ordering::SeqCst);
     unsafe {
         let h_winch = on_sigwinch as extern "C" fn(i32) as libc::sighandler_t;
@@ -1396,6 +1403,20 @@ fn attach_run(
     // OSC 21 查询（150ms 预算；剩余字节回投——首键不丢）。
     let (old_title, query_leftover) = if title_on { tty_query_title() } else { (String::new(), Vec::new()) };
 
+    // 数据到达管道（读腿 poke —— 主循环 poll 面的第三源）。写端非阻塞（评审
+    // r2-7/r2-12：满管 EAGAIN 丢弃无害；建立失败 = 可行动错误退出——裸 -1 会把
+    // SIG_W/poke 指到 fd 0〔stdin〕）。
+    let mut poke_fds = [0i32; 2];
+    if unsafe { libc::pipe(poke_fds.as_mut_ptr()) } != 0 {
+        let e = std::io::Error::last_os_error();
+        conn.close();
+        let _ = tty.restore();
+        return Err(format!("poke 管道建立失败：{e}"));
+    }
+    unsafe {
+        let fl = libc::fcntl(poke_fds[1], libc::F_GETFL);
+        libc::fcntl(poke_fds[1], libc::F_SETFL, fl | libc::O_NONBLOCK);
+    }
     // 连接分两半：读腿线程持读半（帧 → 通道 + 数据管道 poke），主线程持写半。
     let (read_half, write_half) = match conn.split() {
         Ok(v) => v,
@@ -1411,9 +1432,6 @@ fn attach_run(
         fail: Mutex<Option<TermReadErr>>,
     }
     let shared = Arc::new(ReaderShared { stop: AtomicBool::new(false), fail: Mutex::new(None) });
-    // 数据到达管道（读腿 poke —— 主循环 poll 面的第三源）。
-    let mut poke_fds = [0i32; 2];
-    unsafe { libc::pipe(poke_fds.as_mut_ptr()) };
     let (data_tx, data_rx) = mpsc::channel::<frames::Frame>();
     let reader = {
         let shared = Arc::clone(&shared);
@@ -1620,17 +1638,19 @@ fn attach_run(
 
 /// 读腿 poke（非阻塞写——主循环停转时由管道容量背压，EAGAIN 忽略）。
 fn poke(fd: i32) {
+    // 非阻塞写（评审 r2-7：注释写「非阻塞」但管道是阻塞的——积压满时会挂住读腿）；
+    // EAGAIN 丢弃无害（管道里已有未消费的唤醒字节）。
     let b = b"d";
     unsafe { libc::write(fd, b.as_ptr().cast(), 1) };
 }
 
+/// 排空唤醒管道。**读一次即返**（评审 r2-7：原「读到 <64 才收手」在恰好整段时
+/// 会对空管道再读一次 = 主循环永久挂死；唤醒语义只需清一次——data_rx 队列由
+/// try_recv 循环自己抽干，poke 只承担唤醒）。
 fn drain_poke(fd: i32) {
-    let mut b = [0u8; 64];
-    loop {
-        let n = unsafe { libc::read(fd, b.as_mut_ptr().cast(), b.len()) };
-        if n <= 0 || n < b.len() as isize {
-            return;
-        }
+    let mut b = [0u8; 256];
+    unsafe {
+        libc::read(fd, b.as_mut_ptr().cast(), b.len());
     }
 }
 

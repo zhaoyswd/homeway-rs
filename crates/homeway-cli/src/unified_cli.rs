@@ -321,7 +321,19 @@ impl UnifiedRoles {
         Ok((proc, token, listen_str))
     }
 
-    fn serve_status_inner(&self, inner: &RolesInner) -> ServeStatusResult {
+    /// serve.status 载荷（评审 r2-13：引擎查询（≤2s 的 StatusQuery 往返）必须在
+    /// inner 锁**外**做——观测面不挡角色操作）。
+    fn serve_status_out_of_lock(&self) -> ServeStatusResult {
+        let engine = {
+            let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+            inner.serve.clone()
+        };
+        let bits = engine.as_ref().map(|e| e.status_bits());
+        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+        self.serve_status_inner(&mut inner, bits)
+    }
+
+    fn serve_status_inner(&self, inner: &mut RolesInner, bits: Option<(Vec<homeway_core::server::engine::EnginePeerBrief>, homeway_core::server::engine::EngineInterceptBits)>) -> ServeStatusResult {
         // token 掩码/端点 = 台账末行（reveal 纪律：status 族只见掩码）。
         let st = homeway_core::server::state::State::open(&self.state_dir.join("serve")).ok();
         let last = st.and_then(|s| s.last_token().ok().flatten());
@@ -348,12 +360,9 @@ impl UnifiedRoles {
             None => (None, Vec::new()),
         };
         // engine 观测缝（B0-2b：peers 经驱动线程快照 + 拦截计数原子直读；引擎不在
-        // 位 = 空表零计数——观测面不复活角色）。
-        let (peers, intercept) = inner
-            .serve
-            .as_ref()
-            .map(|e| {
-                let (p, i) = e.status_bits();
+        // 位 = 空表零计数——观测面不复活角色）。bits 在锁外取（评审 r2-13）。
+        let (peers, intercept) = bits
+            .map(|(p, i)| {
                 (
                     p.into_iter()
                         .map(|b| homeway_core::daemon::proto::ServePeerBrief {
@@ -447,12 +456,12 @@ impl UnifiedRoles {
             while engine.alive() {
                 std::thread::sleep(Duration::from_millis(500));
             }
-            // 属主判定：动态 stop/restart 会 take + 前进代际——那时收尾属正常操作。
+            // 属主判定（评审 r2-A/r2-2：只看代际——「表内已无本台」在自身失败路径
+            // 也是真〔失败时已置 None〕，混进判据会把首次重建失败当「被接管」而退出。
+            // 动态 stop/restart/接管必前进代际 ⇒ 唯一可靠的接管信号）。
             {
                 let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                if inner.serve_epoch != epoch
-                    || !inner.serve.as_ref().is_some_and(|e| Arc::ptr_eq(e, &engine))
-                {
+                if inner.serve_epoch != epoch {
                     return;
                 }
             }
@@ -474,6 +483,14 @@ impl UnifiedRoles {
                 backoff_text(wait)
             ));
             std::thread::sleep(wait);
+            // 重建前复查属主（评审 r2-2：退避窗内动态 start 可能把新引擎入表——
+            // 再装配 = 双引擎双写台账；此时本线程静默退）。
+            {
+                let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if inner.serve_epoch != epoch || inner.serve.is_some() {
+                    return;
+                }
+            }
             // 重建（与 ServeStart/Restart 的串行化一致：先等上一轮 stop 收尾再装配）
             let rebuilt = {
                 let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -488,8 +505,11 @@ impl UnifiedRoles {
             match rebuilt {
                 Ok((e, upnp)) => {
                     let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                    if !inner.cfg.serve.enabled {
-                        // 退避窗内被动态停用：尊重期望态，不再起
+                    if inner.serve_epoch != epoch || inner.serve.is_some() || !inner.cfg.serve.enabled {
+                        // 窗口内被动态操作/停用接管：撤掉刚建的引擎（评审 r2-2——
+                        // 不撤 = 双引擎并存），静默退。
+                        drop(inner);
+                        e.shutdown(homeway_core::server::engine::STOP_GRACE);
                         return;
                     }
                     inner.serve_epoch += 1;
@@ -504,6 +524,8 @@ impl UnifiedRoles {
                     engine = e;
                 }
                 Err(e) => {
+                    // 装配失败：留在循环里继续退避重试（评审 r2-A——此前下一轮属主
+                    // 闸门会误判退出，退避重试只试一次）。
                     last_err = e;
                 }
             }
@@ -515,11 +537,23 @@ impl UnifiedRoles {
     fn bootstrap_serve(self: &Arc<Self>) {
         let mut fails = 0usize;
         loop {
+            // 期望态/在跑检查在装配**之前**（评审 r2-3：先装配后查 = 并发 serve start
+            // 成功后 bootstrap 仍每 30s 装一次〔必失败〕刷事件 + 覆写 reason）。
+            {
+                let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if !inner.cfg.serve.enabled || inner.serve.is_some() {
+                    return; // 动态翻停 / 已有人在跑（start 或另一轮 bootstrap）
+                }
+            }
             let r = self.assemble_serve();
             {
                 let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                if !inner.cfg.serve.enabled {
-                    return; // 退避窗内被动态翻停（config 期望态真源）
+                if !inner.cfg.serve.enabled || inner.serve.is_some() {
+                    if let Ok((e, _)) = &r {
+                        // 窗口内被接管/翻停：撤掉刚建的引擎。
+                        e.shutdown(homeway_core::server::engine::STOP_GRACE);
+                    }
+                    return;
                 }
             }
             match r {
@@ -574,8 +608,8 @@ impl UnifiedRoles {
             }
             {
                 let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                if inner.relay_epoch != epoch || inner.relay.is_none() {
-                    return; // 动态 stop/restart 接管（stop 会 join run 线程 ⇒ exited 也置位）
+                if inner.relay_epoch != epoch {
+                    return; // 动态 stop/restart 接管（stop 会 join run 线程 ⇒ exited 也置位；失败路径已置 None——只认代际〔评审 r2-A〕）
                 }
             }
             let reason = if last_err.is_empty() {
@@ -595,17 +629,27 @@ impl UnifiedRoles {
                 backoff_text(wait)
             ));
             std::thread::sleep(wait);
-            let cfg = {
+            // 重建前复查属主（评审 r2-2：防与动态 start 双装配）。
+            {
                 let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                if !inner.cfg.relay.enabled {
+                if inner.relay_epoch != epoch || inner.relay.is_some() || !inner.cfg.relay.enabled {
                     return;
                 }
+            }
+            let cfg = {
+                let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                 inner.cfg.clone()
             };
             match self.assemble_relay_role(&cfg) {
                 Ok((proc, token, listen)) => {
-                    let exited2 = proc.exited_flag();
                     let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    if inner.relay_epoch != epoch || inner.relay.is_some() || !inner.cfg.relay.enabled {
+                        // 窗口内被接管：停掉刚建的 run 线程（RelayProc 无 Drop——评审 r2-E），静默退。
+                        drop(inner);
+                        proc.stop();
+                        return;
+                    }
+                    let exited2 = proc.exited_flag();
                     inner.relay_epoch += 1;
                     epoch = inner.relay_epoch;
                     inner.relay = Some(proc);
@@ -619,7 +663,7 @@ impl UnifiedRoles {
                     exited = exited2;
                 }
                 Err(e) => {
-                    last_err = e;
+                    last_err = e; // 留在循环里继续退避重试（评审 r2-A）
                 }
             }
         }
@@ -630,13 +674,20 @@ impl UnifiedRoles {
         loop {
             let cfg = {
                 let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-                if !inner.cfg.relay.enabled {
-                    return;
+                if !inner.cfg.relay.enabled || inner.relay.is_some() {
+                    return; // 动态翻停 / 已在跑（评审 r2-3）
                 }
                 inner.cfg.clone()
             };
             match self.assemble_relay_role(&cfg) {
                 Ok((proc, token, listen)) => {
+                    {
+                        let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                        if inner.relay.is_some() || !inner.cfg.relay.enabled {
+                            proc.stop(); // 窗口内被接管：撤掉刚建的（评审 r2-2）
+                            return;
+                        }
+                    }
                     let exited = proc.exited_flag();
                     let epoch = {
                         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -730,6 +781,7 @@ impl RoleHost for UnifiedRoles {
                     .map_err(|e| BackendErr::Other(format!("写 config：{e}")))?;
                 if let Some(engine) = inner.serve.take() {
                     inner.serve_epoch += 1;
+                    inner.serve_reason.clear(); // 停用 = stopped 收面（评审 r2-11：failed 残留 reason 会把停用态误呈 failed）
                     // **立即应答，收尾异步**（Go D5 完成语义 r1 中-4：收尾最长 =
                     // STOP_GRACE 10s + UPnP 缩租预算，同步等会烧穿请求预算——CLI-6
                     // 整改；宽限 10s = engine::STOP_GRACE，Go role.go 同值——CLI-8）。
@@ -747,13 +799,16 @@ impl RoleHost for UnifiedRoles {
                     (self.eventf)("serve: 期望停用（config serve.enabled=false，经控制面）——收尾进行中");
                     Ok(RoleOpOut::Action(RoleActionResult { action: "stopped".into() }))
                 } else {
+                    inner.serve_reason.clear();
                     Ok(RoleOpOut::Action(RoleActionResult { action: "already".into() }))
                 }
             }
             R::ServeRestart => {
-                if !Self::serve_running(&inner) {
+                if !Self::serve_running(&inner) && inner.serve_reason.is_empty() {
                     return Err(BackendErr::Other("serve 未在运行（先 start）——restart 无重建对象".into()));
                 }
+                // failed 态可 restart（Go RestartRole 同义：跳过剩余退避立即重建——
+                // 评审 r2-11：failed 变常态后「先 start」文案不可行动）。
                 // 与 stop 同款：旧引擎异步收尾（join 后再装配——串行化防端口退让）。
                 if let Some(engine) = inner.serve.take() {
                     inner.serve_epoch += 1;
@@ -797,7 +852,10 @@ impl RoleHost for UnifiedRoles {
                 }
             }
             R::ServeStatus => {
-                let st = self.serve_status_inner(&inner);
+                // 出锁查询（评审 r2-13）：role_op 顶部的 inner 守卫先放——引擎查询
+                // ≤2s，持锁做会挡住全部角色操作与 daemon.status。
+                drop(inner);
+                let st = self.serve_status_out_of_lock();
                 Ok(RoleOpOut::Status(
                     serde_json::to_value(st).map_err(|e| BackendErr::Other(e.to_string()))?,
                 ))
@@ -871,6 +929,7 @@ impl RoleHost for UnifiedRoles {
                     .map_err(|e| BackendErr::Other(format!("写 config：{e}")))?;
                 if let Some(proc) = inner.relay.take() {
                     inner.relay_epoch += 1;
+                    inner.relay_reason.clear(); // 停用 = stopped 收面（评审 r2-11）
                     proc.stop();
                     (self.eventf)("relay: 期望停用（config relay.enabled=false，经控制面）——已收工");
                     Ok(RoleOpOut::Action(RoleActionResult { action: "stopped".into() }))
@@ -879,9 +938,10 @@ impl RoleHost for UnifiedRoles {
                 }
             }
             R::RelayRestart => {
-                if !Self::relay_running(&inner) {
+                if !Self::relay_running(&inner) && inner.relay_reason.is_empty() {
                     return Err(BackendErr::Other("relay 未在运行（先 start）——restart 无重建对象".into()));
                 }
+                // failed 态可 restart（同 serve——评审 r2-11）。
                 if let Some(proc) = inner.relay.take() {
                     inner.relay_epoch += 1;
                     proc.stop();
