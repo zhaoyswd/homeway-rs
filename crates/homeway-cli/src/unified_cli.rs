@@ -160,9 +160,8 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
             std::process::exit(1);
         }
     };
-    let events = Arc::new(ns.events);
     if ns.config_generated {
-        events.eventf("config.toml 缺失——已生成默认（serve.enabled=true）");
+        ns.events.eventf("config.toml 缺失——已生成默认（serve.enabled=true）");
     }
 
     // ③ 读 config（fail-fast：非法 = 可行动错误拒启，不静默按默认）
@@ -175,18 +174,17 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
         }
     };
 
-    // events tee：engine 的摘要判据行进 cache/events.log（完整三级轮转归 B0-2）
+    // events tee：engine 的摘要判据行进 cache/events.log（2MB×3 轮转；stdout 与文件
+    // 双写——launchd stdout 重定向继续可用）；细节行（peer/intercept/dns 判据族）进
+    // cache/debug.log（8MB×2 轮转，恒落盘；--verbose 时才回显终端）——P1-1。
+    let events = Arc::new(ns.events);
     let logf: Arc<dyn Fn(&str) + Send + Sync> = {
         let ev = Arc::clone(&events);
         Arc::new(move |s: &str| ev.eventf(s))
     };
     let dlogf: Arc<dyn Fn(&str) + Send + Sync> = {
-        let ev = Arc::clone(&events);
-        Arc::new(move |s: &str| {
-            if verbose {
-                ev.eventf(s);
-            }
-        })
+        let db = Arc::new(ns.debug);
+        Arc::new(move |s: &str| db.dlogf(s, verbose))
     };
 
     // ④ serve 按期望态（复用前台 serve 的 config 组装——纯 config 形态，无 flag）

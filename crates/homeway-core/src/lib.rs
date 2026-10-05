@@ -30,6 +30,7 @@ pub mod files;
 pub mod files_server;
 pub mod go_fmt;
 pub mod identity;
+pub mod logfile;
 pub mod nodestate;
 pub mod probe;
 pub mod psk;

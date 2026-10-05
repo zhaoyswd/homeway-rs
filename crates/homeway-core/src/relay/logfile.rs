@@ -6,87 +6,11 @@
 //! - 打不开不致命（中继没有必须落盘的状态）：终端提示一句，服务继续。
 //!
 //! 时间戳前缀与 Go 同形：`2006-01-02 15:04:05.000 [relay] `。
+//! 轮转写文件本体在 `crate::logfile`（events/debug/relay 三处共用——P1-1 收拢）。
 
-use std::fs::{File, OpenOptions};
-use std::io::Write as _;
-use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::path::Path;
 
-/// 轮转参数（Go logfile.Open 同参）。
-const MAX_BYTES: u64 = 2 << 20; // 2MB
-const BACKUPS: usize = 3;
-
-/// 轮转写文件（追加；超限轮转 .1/.2/.3——旧档顺移）。
-pub struct RotatingLog {
-    path: PathBuf,
-    file: Option<File>,
-    written: u64,
-}
-
-impl RotatingLog {
-    pub fn open(dir: &Path, name: &str) -> std::io::Result<Self> {
-        {
-            use std::os::unix::fs::DirBuilderExt as _;
-            std::fs::DirBuilder::new().mode(0o700).create(dir)
-        }
-        .or_else(|e| {
-            if e.kind() == std::io::ErrorKind::AlreadyExists {
-                Ok(())
-            } else {
-                Err(e)
-            }
-        })?;
-        let path = dir.join(name);
-        #[cfg(unix)]
-        let mut opts = OpenOptions::new();
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt as _;
-            opts.mode(0o600);
-        }
-        #[cfg(not(unix))]
-        let mut opts = OpenOptions::new();
-        let file = opts.create(true).append(true).open(&path)?;
-        let written = file.metadata().map(|m| m.len()).unwrap_or(0);
-        Ok(Self { path, file: Some(file), written })
-    }
-
-    pub fn path(&self) -> &Path {
-        &self.path
-    }
-
-    pub fn write_line(&mut self, line: &str) {
-        if self.file.is_none() {
-            return;
-        }
-        if self.written + line.len() as u64 + 1 > MAX_BYTES {
-            self.rotate();
-        }
-        let Some(f) = self.file.as_mut() else { return };
-        if f.write_all(line.as_bytes()).and_then(|_| f.write_all(b"\n")).is_ok() {
-            self.written += line.len() as u64 + 1;
-        }
-    }
-
-    fn rotate(&mut self) {
-        self.file = None;
-        // .2→.3, .1→.2, 主→.1（旧的顶掉）
-        for i in (1..BACKUPS).rev() {
-            let from = rotate_path(&self.path, i);
-            let to = rotate_path(&self.path, i + 1);
-            let _ = std::fs::rename(&from, &to);
-        }
-        let _ = std::fs::rename(&self.path, rotate_path(&self.path, 1));
-        self.file = OpenOptions::new().create(true).append(true).open(&self.path).ok();
-        self.written = 0;
-    }
-}
-
-fn rotate_path(base: &Path, i: usize) -> PathBuf {
-    let mut s = base.as_os_str().to_owned();
-    s.push(format!(".{i}"));
-    PathBuf::from(s)
-}
+use crate::logfile::{RotatingWriter, EVENTS_BACKUPS, EVENTS_MAX_BYTES};
 
 /// 时间戳（Go 布局 `2006-01-02 15:04:05.000 [relay] ` 的**本地时区**等价形态：
 /// localtime_r 取本地偏移——epoch civil 换算仍是 UTC 基）。
@@ -129,17 +53,13 @@ fn stamp() -> String {
 /// 两级日志句柄：ulogf（终端 + 抄文件）/ logf（只文件）。
 /// 终端打印经 `term` 注入（CLI 给 println，测试给收集器）。
 pub struct RelayLog {
-    inner: Mutex<Inner>,
+    file: Option<RotatingWriter>,
     term: crate::Logf,
-}
-
-struct Inner {
-    file: Option<RotatingLog>,
 }
 
 impl RelayLog {
     pub fn open(state_cache_dir: &Path, term: crate::Logf) -> Self {
-        let file = match RotatingLog::open(state_cache_dir, "relay.log") {
+        let file = match RotatingWriter::open(state_cache_dir, "relay.log", EVENTS_MAX_BYTES, EVENTS_BACKUPS) {
             Ok(f) => Some(f),
             Err(e) => {
                 term(&format!(
@@ -148,34 +68,27 @@ impl RelayLog {
                 None
             }
         };
-        Self { inner: Mutex::new(Inner { file }), term }
+        Self { file, term }
     }
 
     pub fn log_path(&self) -> Option<String> {
-        self.inner
-            .lock()
-            .ok()
-            .and_then(|i| i.file.as_ref().map(|f| f.path().display().to_string()))
+        self.file.as_ref().map(|f| f.path().display().to_string())
     }
 
     /// 用户流：终端 + 抄文件。
     pub fn ulogf(&self, s: &str) {
         let line = format!("{}[relay] {}", stamp(), s);
         (self.term)(&line);
-        if let Ok(mut i) = self.inner.lock() {
-            if let Some(f) = i.file.as_mut() {
-                f.write_line(&line);
-            }
+        if let Some(f) = &self.file {
+            f.write_line(&line);
         }
     }
 
     /// 运行日志：只进文件。
     pub fn logf(&self, s: &str) {
         let line = format!("{}[relay] {}", stamp(), s);
-        if let Ok(mut i) = self.inner.lock() {
-            if let Some(f) = i.file.as_mut() {
-                f.write_line(&line);
-            }
+        if let Some(f) = &self.file {
+            f.write_line(&line);
         }
     }
 
@@ -191,27 +104,10 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rotation_kicks_in() {
-        let dir = std::env::temp_dir().join(format!("rllog-{}", std::process::id()));
-        let _ = std::fs::remove_dir_all(&dir);
-        {
-            let mut log = RotatingLog::open(&dir, "relay.log").unwrap();
-            let line = "x".repeat(1024);
-            for _ in 0..(MAX_BYTES / 1024 + 2048) {
-                log.write_line(&line);
-            }
-        }
-        // 轮转档存在
-        assert!(dir.join("relay.log").exists());
-        assert!(dir.join("relay.log.1").exists(), "超限应轮转出 .1 档");
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
     fn two_level_logging() {
         let dir = std::env::temp_dir().join(format!("rllog2-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
-        let seen = std::sync::Arc::new(Mutex::new(Vec::<String>::new()));
+        let seen = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
         let seen2 = std::sync::Arc::clone(&seen);
         let term: crate::Logf = std::sync::Arc::new(move |s: &str| {
             seen2.lock().unwrap().push(s.to_owned());

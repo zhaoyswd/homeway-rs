@@ -16,12 +16,16 @@
 //! 进程与 serve/relay 前台单角色共用——同 state 双进程在任何形态组合下互斥，防
 //! launchd 双起互抢 UDP）。
 //!
-//! events 面最小集：`cache/events.log` append + 终端回显（完整三级轮转体系归
-//! B0-2/P1-1；时间前缀与 Go `logTimePrefix` 同形）。
+//! events 面与 debug 面（Go `nodestate.Eventf` + `server/logging.go` 的文件侧）：
+//! `cache/events.log`（摘要，2MB×3 轮转）+ `cache/debug.log`（细节，8MB×2 轮转）——
+//! 统一进程的 serve 角色与前台 `serve` 共用这对文件（Go 同一 `cache/` 落点，两写者
+//! 不同时在世）。时间前缀与 Go `logTimePrefix` 同形（本地时区）。
 
 use std::fs::{File, OpenOptions};
 use std::os::unix::fs::{FileExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
+
+use crate::logfile::{RotatingWriter, DEBUG_BACKUPS, DEBUG_MAX_BYTES, EVENTS_BACKUPS, EVENTS_MAX_BYTES};
 
 /// 单实例锁错误（文案即契约——Go 同串）。
 #[derive(Debug, thiserror::Error)]
@@ -121,10 +125,10 @@ fn read_lock_holder(f: &mut File) -> (i32, String) {
     (pid, form)
 }
 
-/// 摘要级日志最小面：`cache/events.log` append（无轮转——完整体系归 B0-2）+
-/// 终端回显。时间前缀 = Go `logTimePrefix` 同形（`2006-01-02 15:04:05.000 [homeway] `）。
+/// 摘要级日志：`cache/events.log`（2MB×3 轮转）+ 终端回显。时间前缀 = Go
+/// `logTimePrefix` 同形（`2006-01-02 15:04:05.000 [homeway] `）。
 pub struct EventsLog {
-    f: Option<std::sync::Mutex<File>>,
+    w: Option<RotatingWriter>,
     path: PathBuf,
 }
 
@@ -132,13 +136,13 @@ impl EventsLog {
     pub fn open(cache_dir: &Path) -> std::io::Result<Self> {
         std::fs::create_dir_all(cache_dir)?;
         let path = cache_dir.join("events.log");
-        let f = OpenOptions::new().create(true).append(true).open(&path)?;
-        Ok(Self { f: Some(std::sync::Mutex::new(f)), path })
+        let w = RotatingWriter::open(cache_dir, "events.log", EVENTS_MAX_BYTES, EVENTS_BACKUPS)?;
+        Ok(Self { w: Some(w), path })
     }
 
     /// 无文件句柄形态（打开失败时的告警降级——只回显终端）。
     pub fn terminal_only(path: PathBuf) -> Self {
-        Self { f: None, path }
+        Self { w: None, path }
     }
 
     pub fn path(&self) -> &Path {
@@ -151,9 +155,46 @@ impl EventsLog {
         let ts = crate::go_fmt::now_log_prefix();
         let full = format!("{ts}[homeway] {line}");
         println!("{full}");
-        if let Some(f) = &self.f {
-            use std::io::Write as _;
-            let _ = f.lock().map(|mut w| w.write_all(format!("{full}\n").as_bytes()));
+        if let Some(w) = &self.w {
+            w.write_line(&full);
+        }
+    }
+}
+
+/// 细节级日志：`cache/debug.log`（8MB×2 轮转；Go `internal/server/logging.go` 的
+/// dlogf 文件侧）。`--verbose` 时回显终端（显式调试模式），否则只落盘——生产形态
+/// 判据行（`peer: +/-`、`dns: q=`、`intercept: …（dialok）`）由这里持久化。
+pub struct DebugLog {
+    w: Option<RotatingWriter>,
+    path: PathBuf,
+}
+
+impl DebugLog {
+    pub fn open(cache_dir: &Path) -> std::io::Result<Self> {
+        std::fs::create_dir_all(cache_dir)?;
+        let path = cache_dir.join("debug.log");
+        let w = RotatingWriter::open(cache_dir, "debug.log", DEBUG_MAX_BYTES, DEBUG_BACKUPS)?;
+        Ok(Self { w: Some(w), path })
+    }
+
+    /// 无文件句柄形态（打开失败时的告警降级——细节行丢弃，服务继续）。
+    pub fn disabled(path: PathBuf) -> Self {
+        Self { w: None, path }
+    }
+
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// 细节行（debug.log 恒写；`echo` = `--verbose` 时同时回显终端）。
+    pub fn dlogf(&self, line: &str, echo: bool) {
+        let ts = crate::go_fmt::now_log_prefix();
+        let full = format!("{ts}[homeway] {line}");
+        if echo {
+            println!("{full}");
+        }
+        if let Some(w) = &self.w {
+            w.write_line(&full);
         }
     }
 }
@@ -194,10 +235,11 @@ advertise = ""
 "#;
 
 /// 打开（或初始化）三层 state 布局（Go `OpenNodeState` 裁剪面：无旧布局迁移——
-/// Rust 版无历史 state）。0700 收紧 + 四子目录 + config 缺失生成默认 + events.log。
-/// 返回 (events 句柄, config 是否新生成)。
+/// Rust 版无历史 state）。0700 收紧 + 四子目录 + config 缺失生成默认 + events.log
+/// + debug.log（两个都带轮转——P1-1；打开失败各自告警降级，不挡启动）。
 pub struct NodeState {
     pub events: EventsLog,
+    pub debug: DebugLog,
     pub config_generated: bool,
 }
 
@@ -223,7 +265,7 @@ pub fn open_node_state(dir: &Path) -> std::io::Result<NodeState> {
         std::fs::rename(&tmp, &cfg_path)?;
         generated = true;
     }
-    // 摘要日志（打开失败只告警——日志不该挡启动；Go 同义）
+    // 摘要/细节双文件日志（打开失败只告警——日志不该挡启动；Go initLogs 同义）
     let events = match EventsLog::open(&dir.join("cache")) {
         Ok(w) => w,
         Err(e) => {
@@ -231,7 +273,14 @@ pub fn open_node_state(dir: &Path) -> std::io::Result<NodeState> {
             EventsLog::terminal_only(dir.join("cache").join("events.log"))
         }
     };
-    Ok(NodeState { events, config_generated: generated })
+    let debug = match DebugLog::open(&dir.join("cache")) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("homeway: ⚠️ debug.log 打开失败（{e}）——本轮细节日志缺失，服务继续");
+            DebugLog::disabled(dir.join("cache").join("debug.log"))
+        }
+    };
+    Ok(NodeState { events, debug, config_generated: generated })
 }
 
 #[cfg(test)]

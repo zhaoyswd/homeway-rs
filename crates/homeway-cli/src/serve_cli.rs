@@ -376,13 +376,33 @@ pub fn cmd_serve(args: &[String]) {
     // 单实例锁（Go 全形态共用 <state>/lock；form=serve——防 launchd 双起/统一进程
     // 与前台单角色同 state 互抢 UDP）
     let _lock = crate::relay_cli::acquire_lock_or_exit(&cfg.state_dir, "serve");
+    // 文件日志先立起来（Go cli.go initLogs(cacheDir) 同义）：events.log（摘要，2MB×3）
+    // + debug.log（细节，8MB×2）落 `<state>/cache/`；打开失败只告警降级，不挡启动。
+    // 前台形态摘要行保持 stdout 可见（终端 + 文件双写——与统一进程同口径）。
     let verbose = cfg.verbose;
-    let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
-    let dlogf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |s: &str| {
-        if verbose {
-            println!("{s}");
+    let cache_dir = cfg.state_dir.join("cache");
+    let events = match homeway_core::nodestate::EventsLog::open(&cache_dir) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("homeway: ⚠️ events.log 打开失败（{e}）——本轮公告只回显终端");
+            homeway_core::nodestate::EventsLog::terminal_only(cache_dir.join("events.log"))
         }
-    });
+    };
+    let debug = match homeway_core::nodestate::DebugLog::open(&cache_dir) {
+        Ok(w) => w,
+        Err(e) => {
+            eprintln!("homeway: ⚠️ debug.log 打开失败（{e}）——本轮细节日志缺失，服务继续");
+            homeway_core::nodestate::DebugLog::disabled(cache_dir.join("debug.log"))
+        }
+    };
+    let logf: Arc<dyn Fn(&str) + Send + Sync> = {
+        let ev = Arc::new(events);
+        Arc::new(move |s: &str| ev.eventf(s))
+    };
+    let dlogf: Arc<dyn Fn(&str) + Send + Sync> = {
+        let db = Arc::new(debug);
+        Arc::new(move |s: &str| db.dlogf(s, verbose))
+    };
     let upnp_used = cfg.upnp;
     let engine = match ServeEngine::start(cfg, Arc::clone(&logf), Arc::clone(&dlogf)) {
         Ok(e) => e,
