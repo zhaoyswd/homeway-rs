@@ -794,7 +794,18 @@ R7 8–12+真机；R8 2–3。全量 47–72。Rust 新增代码估 38–42k 行
 
 ## 附录 D：判据标定教训（随推进追加）
 
-1. **贴闸标定（R5 批十六→十七，2026-10-03）**：凡涉 **pps 闸**的判据标定（限速、
+1. **CI 时序 flake 双例（2026-10-05 B 批发版窗口）**：共享 runner 上
+   `term exit_code_passthrough_and_surface_leg`（等 ATTACHED 收 EOF，一轮红后
+   本地 20 连绿 + 复跑绿未再现）与 `intercept dial_failed_gets_rst`（拨失败应回
+   RST，同代码树 b1f1410 绿/1782e2f 红后 rerun 绿——runner 负载下 RST 时窗漂移）
+   各红过一轮；处置口径 = 同树复跑确认为 flake 后放行 + 登记，不因此改产品码。
+   与 0a92758「deadline 循环补 2ms yield（共享 runner 忙转饿死）」同族。
+2. **SO_BINDTODEVICE 无特权语义（b1f1410 修）**：linux 钉卡按名、index 不参与；
+   **已钉过的 socket 重复设置在无特权下恒 EPERM**（内核只放行首次绑定；容器
+   实测 fresh=OK / re-set-same=EPERM / 坏名=ENODEV）——涉钉卡的测试负例必须
+   分平台且用新 socket。
+
+3. **贴闸标定（R5 批十六→十七，2026-10-03）**：凡涉 **pps 闸**的判据标定（限速、
    发送速率、突发），必须先把 bytes/s 标定值**除以 MSS 折算成每秒包数**再与闸比——
    中继准入闸 200pps @MSS≈1220B ≈ 244KB/s，250KB/s「看起来很小」实为 205pps、
    恰在闸上方（轮 3' 的 L3/L6 连续塌速：TCP 重传螺旋、看门狗中止）。正确口径 =
@@ -802,7 +813,7 @@ R7 8–12+真机；R8 2–3。全量 47–72。Rust 新增代码估 38–42k 行
    （UploadLimiter::block_hint）防整块放行的瞬时突发贴闸。同族提醒：跨窗形态
    也要算——>~30s 的持续传输必然横跨 WG rekey 窗口（批十八教训，见 R6 前置批
    rekey stall P0）。
-  1. **G1（R0.4，2026-10-02）**：`pkg/proto.DecodeToken("hmw")` 对恰 3 字节 hmw 前缀串
+   4. **G1（R0.4，2026-10-02）**：`pkg/proto.DecodeToken("hmw")` 对恰 3 字节 hmw 前缀串
      panic（`token.go:105` 的 `s[:4]` 越界，实测 `slice bounds out of range [:4] with length 3`）。
      对抗性输入面（用户粘贴残串可触）；Rust 侧已按安全语义返回 UnsupportedVersion
      （`crates/homeway-core/src/token.rs` 头注记）。修在 Go 仓自己的流程。
