@@ -406,6 +406,12 @@ impl HostTable {
             .and_then(|e| e.sess.clone())
     }
 
+    /// 登记在册谓词（承载面成员检查用——与 `session` 不同：会话对象不在〔构造期
+    /// 失败/重建窗口〕仍在册）。
+    pub fn has_record(&self, id: &[u8; 32]) -> bool {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).hosts.contains_key(id)
+    }
+
     pub fn session_by_hex(&self, id_hex: &str) -> Option<Arc<Session>> {
         decode_peer_id(id_hex).and_then(|id| self.session(&id))
     }

@@ -176,6 +176,11 @@ impl StreamConn for EchoConn {
     fn close(&self) {
         self.closed.store(true, Ordering::SeqCst);
     }
+
+    fn shutdown_write(&self) {
+        // 测试桩无半关面：退化为全关（trait 契约允许）。
+        self.close();
+    }
 }
 
 struct MockBackend {
@@ -282,6 +287,9 @@ impl Backend for MockBackend {
     fn role_op(&self, _op: RoleOp) -> Result<RoleOpOut, BackendErr> {
         Err(BackendErr::RoleStopped)
     }
+
+    // 承载面 9 方法：走 trait 缺省（未装配）——协议面测试只验 wire 行为，语义面归
+    // carriers 单测。
 }
 
 fn start_server(tag: &str, backend: Arc<dyn Backend>) -> (Arc<ControlServer>, PathBuf, Arc<super::bus::Bus>, std::thread::JoinHandle<()>) {

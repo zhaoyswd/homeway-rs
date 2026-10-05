@@ -1165,7 +1165,8 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
 
     roles.set_self_ref(Arc::downgrade(&roles));
 
-    // ⑥ client 角色恒开（hosts.json 表 + 每主机常驻会话；事件总线进程级唯一）。
+    // ⑥ client 角色恒开（hosts.json 表 + 每主机常驻会话；事件总线进程级唯一；
+    // 承载面随表同生命周期——forwards.json/socks.json 重建监听 + speedtest 运行面）。
     let client_dir = state_dir.join("client");
     let core = match DaemonCore::new(
         crate::cli_version(),
@@ -1173,6 +1174,7 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
         &client_dir.join("identity"),
         &cache_dir.join("endpoints"),
         Arc::clone(&daemon_dlogf),
+        Arc::clone(&daemon_logf),
         Some(roles.clone() as Arc<dyn RoleHost>),
     ) {
         Ok(c) => c,

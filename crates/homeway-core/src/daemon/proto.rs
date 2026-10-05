@@ -424,6 +424,227 @@ pub struct RelayTokenResult {
     pub eps: Option<Vec<String>>,
 }
 
+// ---------- forward / socks / speedtest（承载面 wire 体；语义真源
+// `baseline:internal/control/proto.go`——3e 只增，design D6） ----------
+//
+// host 载荷 = peerID hex（CLI 侧 resolve 先行解析，同 term/files）。
+// 错误码零新增：值域外/冲突 = bad_request、主机不在表 = no_host（用例锁死映射）。
+
+/// forward.add 载荷。target_ip 空 = 出口自己；target_port 0 = 同监听端口。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ForwardAddArgs {
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub listen: u16,
+    #[serde(rename = "targetIp", default, skip_serializing_if = "String::is_empty")]
+    pub target_ip: String,
+    #[serde(rename = "targetPort", default, skip_serializing_if = "is_zero_u16")]
+    pub target_port: u16,
+}
+
+fn is_zero_u16(v: &u16) -> bool {
+    *v == 0
+}
+
+/// forward.add 成功载荷（建成的规则面，listening 态）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForwardRuleBrief {
+    pub host: String,
+    pub listen: u16,
+    #[serde(rename = "targetIp", default, skip_serializing_if = "String::is_empty")]
+    pub target_ip: String,
+    #[serde(rename = "targetPort", default, skip_serializing_if = "is_zero_u16")]
+    pub target_port: u16,
+    pub state: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub err: String,
+    pub conns: i32,
+    /// 超并发上限被拒计数。
+    #[serde(default, skip_serializing_if = "is_zero_i32")]
+    pub rejected: i32,
+}
+
+fn is_zero_i32(v: &i32) -> bool {
+    *v == 0
+}
+
+/// forward.add 成功载荷。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForwardAddResult {
+    pub rule: ForwardRuleBrief,
+}
+
+/// forward.remove 载荷。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ForwardRemoveArgs {
+    #[serde(default)]
+    pub host: String,
+    #[serde(default)]
+    pub listen: u16,
+}
+
+/// forward.remove 成功载荷。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForwardRemoveResult {
+    pub removed: bool,
+}
+
+/// forward.list 载荷（host 空 = 全部）。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct ForwardListArgs {
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub host: String,
+}
+
+/// forward.list 成功载荷。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ForwardListResult {
+    pub forwards: Vec<ForwardRuleBrief>,
+}
+
+/// socks.on 载荷（listen 0 = 沿用记忆端口，无记忆则 1080）。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct SocksOnArgs {
+    #[serde(default)]
+    pub host: String,
+    #[serde(default, skip_serializing_if = "is_zero_u16")]
+    pub listen: u16,
+}
+
+/// socks.on 成功载荷（实际监听端口）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocksOnResult {
+    pub listen: u16,
+}
+
+/// socks.off 载荷。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct SocksOffArgs {
+    #[serde(default)]
+    pub host: String,
+}
+
+/// socks.off 成功载荷（listen = 记忆保留的端口，下次 on 缺省沿用）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocksOffResult {
+    pub listen: u16,
+}
+
+/// socks.status 单条（off 也出现——listen = 记住的端口）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocksBrief {
+    pub host: String,
+    pub on: bool,
+    pub listen: u16,
+    pub conns: i32,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub err: String,
+}
+
+/// socks.status 成功载荷。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SocksStatusResult {
+    pub socks: Vec<SocksBrief>,
+}
+
+/// speedtest.start 载荷（0 = 手机口径默认；waitMs 0 = 不等——start 立即返回
+/// waiting 相位、等待由 runner 状态机承载）。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct SpeedtestStartArgs {
+    #[serde(default)]
+    pub host: String,
+    #[serde(rename = "downMs", default, skip_serializing_if = "is_zero_i64")]
+    pub down_ms: i64,
+    #[serde(rename = "upMs", default, skip_serializing_if = "is_zero_i64")]
+    pub up_ms: i64,
+    #[serde(rename = "warmupMs", default, skip_serializing_if = "is_zero_i64")]
+    pub warmup_ms: i64,
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub streams: i64,
+    #[serde(rename = "waitMs", default, skip_serializing_if = "is_zero_i64")]
+    pub wait_ms: i64,
+}
+
+fn is_zero_i64(v: &i64) -> bool {
+    *v == 0
+}
+
+/// speedtest.start 成功载荷（waiting 或 busy——busy 是载荷里的 reason，同手机信封
+/// 形态、不占错误码表）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeedtestStartAck {
+    /// waiting | busy。
+    pub phase: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+}
+
+/// speedtest.status 载荷。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct SpeedtestStatusArgs {
+    #[serde(default)]
+    pub host: String,
+}
+
+/// speedtest 终态结果（镜像引擎 Result 字段名——与手机信封同名，CLI --json 对拍真源）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeedtestResultBrief {
+    pub ok: bool,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub msg: String,
+    #[serde(rename = "downBps", default, skip_serializing_if = "is_zero_f64")]
+    pub down_bps: f64,
+    #[serde(rename = "upBps", default, skip_serializing_if = "is_zero_f64")]
+    pub up_bps: f64,
+    #[serde(rename = "usageDown", default, skip_serializing_if = "is_zero_i64")]
+    pub usage_down: i64,
+    #[serde(rename = "usageUp", default, skip_serializing_if = "is_zero_i64")]
+    pub usage_up: i64,
+    #[serde(rename = "wallMs", default, skip_serializing_if = "is_zero_i64")]
+    pub wall_ms: i64,
+}
+
+fn is_zero_f64(v: &f64) -> bool {
+    *v == 0.0
+}
+
+/// speedtest.status 成功载荷：waiting 相位（waitRemainMs）或引擎快照（phase/bytes/
+/// elapsedMs）；轮次到终态时 result 携带完整结果（None = 未到终态）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeedtestStatusResult {
+    pub host: String,
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub waiting: bool,
+    #[serde(rename = "waitRemainMs", default, skip_serializing_if = "is_zero_i64")]
+    pub wait_remain_ms: i64,
+    pub phase: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub reason: String,
+    /// 当前相位累计字节（CLI 轮询差分算 instBps）。
+    #[serde(default, skip_serializing_if = "is_zero_i64")]
+    pub bytes: i64,
+    #[serde(rename = "elapsedMs", default, skip_serializing_if = "is_zero_i64")]
+    pub elapsed_ms: i64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<SpeedtestResultBrief>,
+}
+
+/// speedtest.cancel 载荷（只作用指定主机，不波及轮转）。
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+pub struct SpeedtestCancelArgs {
+    #[serde(default)]
+    pub host: String,
+}
+
+/// speedtest.cancel 成功载荷。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SpeedtestCancelResult {
+    pub cancelled: bool,
+}
+
 // ---------- 编解码助手 ----------
 
 /// 帧化一个 JSON body（serde 序列化 + 帧封装；body 类型必须无序列化失败面——

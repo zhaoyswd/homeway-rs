@@ -572,18 +572,17 @@ impl ConnShared {
             O::EventsUnsubscribe => self.op_unsubscribe(req.corr, &args),
             O::StreamOpen => {} // dispatcher 已分流到 run_stream_open（理论不可达）
             O::StreamClose => self.op_stream_close(req.corr, &args),
-            // 承载面 9 op（forward/socks/speedtest）：词表已注册、宿主面未装配——
-            // 稳定 bad_request + 归因（B0-2 后续棒实装，见 docs/reviews/B0-2b.md）。
-            O::ForwardAdd | O::ForwardRemove | O::ForwardList | O::SocksOn | O::SocksOff
-            | O::SocksStatus | O::SpeedtestStart | O::SpeedtestStatus | O::SpeedtestCancel => {
-                self.reply_err(
-                    req.corr,
-                    OpError::with_detail(
-                        vocab::CODE_BAD_REQUEST,
-                        "承载面（forward/socks/speedtest 托管操作）归 B0-2 后续棒——本期未装配",
-                    ),
-                );
-            }
+            // 承载面 9 op（forward/socks/speedtest 托管——D-1 实装；语义在 carriers，
+            // 本层只做载荷解析 + not_ready 门 + 错误映射）。
+            O::ForwardAdd => self.op_forward_add(req.corr, &args),
+            O::ForwardRemove => self.op_forward_remove(req.corr, &args),
+            O::ForwardList => self.op_forward_list(req.corr, &args),
+            O::SocksOn => self.op_socks_on(req.corr, &args),
+            O::SocksOff => self.op_socks_off(req.corr, &args),
+            O::SocksStatus => self.op_socks_status(req.corr),
+            O::SpeedtestStart => self.op_speedtest_start(req.corr, &args),
+            O::SpeedtestStatus => self.op_speedtest_status(req.corr, &args),
+            O::SpeedtestCancel => self.op_speedtest_cancel(req.corr, &args),
             O::ServeStart => self.role_op(req.corr, RoleOp::ServeStart),
             O::ServeStop => self.role_op(req.corr, RoleOp::ServeStop),
             O::ServeRestart => self.role_op(req.corr, RoleOp::ServeRestart),
@@ -773,6 +772,236 @@ impl ConnShared {
                 st.finish(vocab::STREAM_END_CLOSED);
                 self.reply_json(corr, Some(serde_json::json!({"closed": true})), None);
             }
+        }
+    }
+
+    // ---------- 承载面 9 op（语义在 Backend/carriers；本层 = parseArgs + 门 + 映射） ----------
+
+    fn op_forward_add(&self, corr: u64, args: &serde_json::Value) {
+        let a: ForwardAddArgs = match self.parse_args(args) {
+            Ok(a) => a,
+            Err(e) => return self.reply_err(corr, e),
+        };
+        if a.host.is_empty() || a.listen == 0 {
+            return self.reply_err(corr, OpError::code(vocab::CODE_BAD_REQUEST));
+        }
+        if self.gate_not_ready(corr) {
+            return;
+        }
+        let rule = super::ForwardRule {
+            host: a.host,
+            listen: a.listen,
+            target_ip: a.target_ip,
+            target_port: a.target_port,
+        };
+        match self.srv.backend.forward_add(rule) {
+            Ok(state) => {
+                let brief = forward_brief_of(&state);
+                self.reply_json(
+                    corr,
+                    Some(serde_json::to_value(ForwardAddResult { rule: brief }).unwrap()),
+                    None,
+                )
+            }
+            Err(e) => self.reply_err(corr, map_backend_err(e)),
+        }
+    }
+
+    fn op_forward_remove(&self, corr: u64, args: &serde_json::Value) {
+        let a: ForwardRemoveArgs = match self.parse_args(args) {
+            Ok(a) => a,
+            Err(e) => return self.reply_err(corr, e),
+        };
+        if a.host.is_empty() || a.listen == 0 {
+            return self.reply_err(corr, OpError::code(vocab::CODE_BAD_REQUEST));
+        }
+        if self.gate_not_ready(corr) {
+            return;
+        }
+        match self.srv.backend.forward_remove(&a.host, a.listen) {
+            Ok(()) => self.reply_json(
+                corr,
+                Some(serde_json::to_value(ForwardRemoveResult { removed: true }).unwrap()),
+                None,
+            ),
+            Err(e) => self.reply_err(corr, map_backend_err(e)),
+        }
+    }
+
+    fn op_forward_list(&self, corr: u64, args: &serde_json::Value) {
+        let a: ForwardListArgs = match self.parse_args(args) {
+            Ok(a) => a,
+            Err(e) => return self.reply_err(corr, e),
+        };
+        if self.gate_not_ready(corr) {
+            return;
+        }
+        let forwards: Vec<ForwardRuleBrief> =
+            self.srv.backend.forward_list(&a.host).iter().map(forward_brief_of).collect();
+        self.reply_json(
+            corr,
+            Some(serde_json::to_value(ForwardListResult { forwards }).unwrap()),
+            None,
+        );
+    }
+
+    fn op_socks_on(&self, corr: u64, args: &serde_json::Value) {
+        let a: SocksOnArgs = match self.parse_args(args) {
+            Ok(a) => a,
+            Err(e) => return self.reply_err(corr, e),
+        };
+        if a.host.is_empty() {
+            return self.reply_err(corr, OpError::code(vocab::CODE_BAD_REQUEST));
+        }
+        if self.gate_not_ready(corr) {
+            return;
+        }
+        match self.srv.backend.socks_on(&a.host, a.listen) {
+            Ok(listen) => self.reply_json(
+                corr,
+                Some(serde_json::to_value(SocksOnResult { listen }).unwrap()),
+                None,
+            ),
+            Err(e) => self.reply_err(corr, map_backend_err(e)),
+        }
+    }
+
+    fn op_socks_off(&self, corr: u64, args: &serde_json::Value) {
+        let a: SocksOffArgs = match self.parse_args(args) {
+            Ok(a) => a,
+            Err(e) => return self.reply_err(corr, e),
+        };
+        if a.host.is_empty() {
+            return self.reply_err(corr, OpError::code(vocab::CODE_BAD_REQUEST));
+        }
+        if self.gate_not_ready(corr) {
+            return;
+        }
+        match self.srv.backend.socks_off(&a.host) {
+            Ok(listen) => self.reply_json(
+                corr,
+                Some(serde_json::to_value(SocksOffResult { listen }).unwrap()),
+                None,
+            ),
+            Err(e) => self.reply_err(corr, map_backend_err(e)),
+        }
+    }
+
+    fn op_socks_status(&self, corr: u64) {
+        if self.gate_not_ready(corr) {
+            return;
+        }
+        let socks: Vec<SocksBrief> = self
+            .srv
+            .backend
+            .socks_states()
+            .into_iter()
+            .map(|s| SocksBrief {
+                host: s.host,
+                on: s.on,
+                listen: s.listen,
+                conns: s.conns,
+                err: s.err,
+            })
+            .collect();
+        self.reply_json(corr, Some(serde_json::to_value(SocksStatusResult { socks }).unwrap()), None);
+    }
+
+    fn op_speedtest_start(&self, corr: u64, args: &serde_json::Value) {
+        let a: SpeedtestStartArgs = match self.parse_args(args) {
+            Ok(a) => a,
+            Err(e) => return self.reply_err(corr, e),
+        };
+        if a.host.is_empty() {
+            return self.reply_err(corr, OpError::code(vocab::CODE_BAD_REQUEST));
+        }
+        if self.gate_not_ready(corr) {
+            return;
+        }
+        let p = super::SpeedtestParams::from_ms(a.down_ms, a.up_ms, a.warmup_ms, a.streams, a.wait_ms);
+        match self.srv.backend.speedtest_start(&a.host, p) {
+            Ok(ack) => self.reply_json(
+                corr,
+                Some(
+                    serde_json::to_value(SpeedtestStartAck {
+                        phase: ack.phase.to_owned(),
+                        reason: ack.reason.unwrap_or_default().to_owned(),
+                    })
+                    .unwrap(),
+                ),
+                None,
+            ),
+            Err(e) => self.reply_err(corr, map_backend_err(e)),
+        }
+    }
+
+    fn op_speedtest_status(&self, corr: u64, args: &serde_json::Value) {
+        let a: SpeedtestStatusArgs = match self.parse_args(args) {
+            Ok(a) => a,
+            Err(e) => return self.reply_err(corr, e),
+        };
+        if a.host.is_empty() {
+            return self.reply_err(corr, OpError::code(vocab::CODE_BAD_REQUEST));
+        }
+        if self.gate_not_ready(corr) {
+            return;
+        }
+        // 无运行面（从未 start / 守护进程重启后）= idle 形态（Go 同义——CLI 的
+        // 「运行面丢失」判据以 idle + 非 waiting + 无终态为准）。
+        let mut res = SpeedtestStatusResult {
+            host: a.host.clone(),
+            waiting: false,
+            wait_remain_ms: 0,
+            phase: "idle".to_owned(),
+            reason: String::new(),
+            bytes: 0,
+            elapsed_ms: 0,
+            result: None,
+        };
+        match self.srv.backend.speedtest_status(&a.host) {
+            Err(e) => return self.reply_err(corr, map_backend_err(e)),
+            Ok(None) => {}
+            Ok(Some(st)) => {
+                res.waiting = st.waiting;
+                res.wait_remain_ms = st.wait_remain_ms;
+                res.phase = st.phase;
+                res.bytes = st.bytes;
+                res.elapsed_ms = st.elapsed_ms;
+                if let Some(r) = st.result {
+                    res.result = Some(SpeedtestResultBrief {
+                        ok: r.ok,
+                        reason: r.reason,
+                        msg: r.msg,
+                        down_bps: r.down_bps,
+                        up_bps: r.up_bps,
+                        usage_down: r.usage_down,
+                        usage_up: r.usage_up,
+                        wall_ms: r.wall_ms as i64,
+                    });
+                }
+            }
+        }
+        self.reply_json(corr, Some(serde_json::to_value(&res).unwrap()), None);
+    }
+
+    fn op_speedtest_cancel(&self, corr: u64, args: &serde_json::Value) {
+        let a: SpeedtestCancelArgs = match self.parse_args(args) {
+            Ok(a) => a,
+            Err(e) => return self.reply_err(corr, e),
+        };
+        if a.host.is_empty() {
+            return self.reply_err(corr, OpError::code(vocab::CODE_BAD_REQUEST));
+        }
+        if self.gate_not_ready(corr) {
+            return;
+        }
+        match self.srv.backend.speedtest_cancel(&a.host) {
+            Ok(()) => self.reply_json(
+                corr,
+                Some(serde_json::to_value(SpeedtestCancelResult { cancelled: true }).unwrap()),
+                None,
+            ),
+            Err(e) => self.reply_err(corr, map_backend_err(e)),
         }
     }
 
@@ -1261,6 +1490,20 @@ impl Stream {
 }
 
 // ---------- Backend 错误 → 错误码映射 ----------
+
+/// ForwardState → wire brief（字段名/omitempty 与 Go ForwardRuleBrief 对齐）。
+fn forward_brief_of(st: &super::ForwardState) -> ForwardRuleBrief {
+    ForwardRuleBrief {
+        host: st.rule.host.clone(),
+        listen: st.rule.listen,
+        target_ip: st.rule.target_ip.clone(),
+        target_port: st.rule.target_port,
+        state: st.state.clone(),
+        err: st.err.clone(),
+        conns: st.conns,
+        rejected: st.rejected,
+    }
+}
 
 fn map_backend_err(e: super::proto::BackendErr) -> OpError {
     match e {

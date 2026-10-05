@@ -9,12 +9,11 @@
 //!   收窄为 [`Backend`] trait；
 //! - `client`：控制面客户端（CLI 消费面）；
 //! - `hosts`：多主机表（hosts.json + 每主机常驻会话）——host.* 的宿主面；
-//! - [`DaemonCore`]：统一进程侧的 Backend 装配（hosts + 角色管理面注入）。
-//!
-//! 承载面 9 op（forward/socks/speedtest 托管）与 supervisor 退避重建（r1-M4）、
-//! export/import/reset 的控制面接线归 B0-2 后续棒（挂账见 docs/reviews/B0-2b.md）。
+//! - `carriers`：承载面管理器束（forward/socks/speedtest 托管——D-1 实装）；
+//! - [`DaemonCore`]：统一进程侧的 Backend 装配（hosts + 承载面 + 角色管理面注入）。
 
 pub mod bus;
+pub mod carriers;
 pub mod client;
 pub mod frame;
 pub mod hosts;
@@ -25,6 +24,10 @@ pub mod vocab;
 
 use std::sync::Arc;
 
+pub use carriers::{
+    CarrierErr, ForwardRule, ForwardState, SocksState, SpeedtestOutcome, SpeedtestParams,
+    SpeedtestStatus, SOCKS_DEFAULT_LISTEN,
+};
 pub use proto::{BackendErr, RoleActionResult, RoleBrief, ServeTokenResult};
 pub use server::{ControlServer, ServerConfig};
 
@@ -48,6 +51,9 @@ pub trait StreamConn: Send + Sync {
     fn read_chunk(&self) -> std::io::Result<Vec<u8>>;
     /// 阻塞写（返回本次推进字节数；预算耗尽/失败 = Err）。
     fn write_chunk(&self, data: &[u8]) -> std::io::Result<usize>;
+    /// 半关写端（FIN；对端仍可发——承载面 pipe 的半关闭透传用）。不支持半关的
+    /// 实现退化为全关（netpipe.Both 的「对端不支持则退化为 Close」同款）。
+    fn shutdown_write(&self);
     /// 关连接（幂等）。
     fn close(&self);
 }
@@ -103,6 +109,11 @@ impl StreamConn for TunnelConn {
 
     fn close(&self) {
         let _ = self.client.close(self.id);
+    }
+
+    fn shutdown_write(&self) {
+        // 半关（FIN）：对端仍可发——Client::shutdown 是引擎原生半关面。
+        let _ = self.client.shutdown(self.id);
     }
 }
 
@@ -167,44 +178,158 @@ pub trait Backend: Send + Sync {
     fn not_ready(&self) -> bool;
     /// serve/relay 角色管理（宿主面注入）。
     fn role_op(&self, op: RoleOp) -> Result<RoleOpOut, BackendErr>;
+    // ---------- 承载面（forward/socks/speedtest 托管——D-1） ----------
+    /// forward.add（全局端口检查 + 成员检查 + 当场监听；失败不入表）。缺省实现 =
+    /// 未装配（测试形态；生产宿主 DaemonCore 必实装）。
+    fn forward_add(&self, rule: ForwardRule) -> Result<ForwardState, BackendErr> {
+        let _ = rule;
+        Err(BackendErr::Other("承载面未装配".to_owned()))
+    }
+    /// forward.remove（不强关在世连接）。
+    fn forward_remove(&self, host_hex: &str, listen: u16) -> Result<(), BackendErr> {
+        let _ = (host_hex, listen);
+        Err(BackendErr::Other("承载面未装配".to_owned()))
+    }
+    /// forward.list（host 空 = 全部）。
+    fn forward_list(&self, host_hex: &str) -> Vec<ForwardState> {
+        let _ = host_hex;
+        Vec::new()
+    }
+    /// socks.on（listen 0 = 记忆/缺省）；返回实际端口。
+    fn socks_on(&self, host_hex: &str, listen: u16) -> Result<u16, BackendErr> {
+        let _ = (host_hex, listen);
+        Err(BackendErr::Other("承载面未装配".to_owned()))
+    }
+    /// socks.off（显式关在世连接；端口记忆保留）；返回记忆端口。
+    fn socks_off(&self, host_hex: &str) -> Result<u16, BackendErr> {
+        let _ = host_hex;
+        Err(BackendErr::Other("承载面未装配".to_owned()))
+    }
+    /// socks.status（各主机承载态）。
+    fn socks_states(&self) -> Vec<SocksState> {
+        Vec::new()
+    }
+    /// speedtest.start（per-host 单飞；立即返回 waiting/busy 相位）。host 不在表 =
+    /// no_host 错误（Go hostInTable 门同义）。
+    fn speedtest_start(
+        &self,
+        host_hex: &str,
+        p: SpeedtestParams,
+    ) -> Result<carriers::speedrun::SpeedtestAck, BackendErr> {
+        let _ = (host_hex, p);
+        Err(BackendErr::Other("承载面未装配".to_owned()))
+    }
+    /// speedtest.status（无运行面 = None——CLI 判「运行面丢失」的形态）。
+    fn speedtest_status(&self, host_hex: &str) -> Result<Option<SpeedtestStatus>, BackendErr> {
+        let _ = host_hex;
+        Ok(None)
+    }
+    /// speedtest.cancel（幂等）。
+    fn speedtest_cancel(&self, host_hex: &str) -> Result<(), BackendErr> {
+        let _ = host_hex;
+        Ok(())
+    }
 }
 
 // ---------- DaemonCore：统一进程侧的 Backend 装配 ----------
 
-/// 统一进程的控制面宿主：hosts 表（client 角色）+ 角色管理面（serve/relay 动态
-/// 启停——CLI 装配层注入）+ 进程级事件总线。
+/// 统一进程的控制面宿主：hosts 表（client 角色）+ 承载面（forward/socks/speedtest
+/// 托管——随表生命周期、stateDir 同源）+ 角色管理面（serve/relay 动态启停——CLI
+/// 装配层注入）+ 进程级事件总线。
 pub struct DaemonCore {
     version: String,
     pub bus: Arc<bus::Bus>,
     pub hosts: Arc<hosts::HostTable>,
+    carriers: Arc<carriers::Carriers>,
     roles: Option<Arc<dyn RoleHost>>,
 }
 
 impl DaemonCore {
-    /// 装配（hosts 表 = client 角色恒开的表语义）。`roles` = None 时角色面呈
-    /// absent/RoleStopped（测试形态）。
+    /// 装配（hosts 表 = client 角色恒开的表语义；承载面随表同源同生命周期）。
+    /// `roles` = None 时角色面呈 absent/RoleStopped（测试形态）。
     pub fn new(
         version: &str,
         client_dir: &std::path::Path,
         identity_dir: &std::path::Path,
         endpoint_cache_dir: &std::path::Path,
         logf: Arc<dyn Fn(&str) + Send + Sync>,
+        warnf: Arc<dyn Fn(&str) + Send + Sync>,
         roles: Option<Arc<dyn RoleHost>>,
     ) -> Result<Arc<DaemonCore>, String> {
         let bus = Arc::new(bus::Bus::new());
-        let hosts = hosts::HostTable::open(client_dir, identity_dir, endpoint_cache_dir, logf, Arc::clone(&bus))?;
+        let hosts = hosts::HostTable::open(client_dir, identity_dir, endpoint_cache_dir, Arc::clone(&logf), Arc::clone(&bus))?;
         hosts.publish_loaded();
         hosts.spawn_event_pump();
-        Ok(Arc::new(DaemonCore { version: version.to_owned(), bus, hosts, roles }))
+        // 承载面拨号缝（Host 面：查表 + healing 拨号——同记账同重建感知；表外主机
+        // = NoHost——绑定层沿 no_host 族映射）。
+        let dial = carriers_dial_of(&hosts);
+        let host_exists: carriers::HostExists = {
+            let hosts = Arc::clone(&hosts);
+            Arc::new(move |id: &[u8; 32]| hosts.session(id).is_some() || hosts.has_record(id))
+        };
+        let cars = carriers::Carriers::open(client_dir, dial, logf, warnf, host_exists)?;
+        Ok(Arc::new(DaemonCore { version: version.to_owned(), bus, hosts, carriers: cars, roles }))
     }
 
     pub fn bus(&self) -> &Arc<bus::Bus> {
         &self.bus
     }
 
-    /// client 角色收工（停全部会话 + 逐台 session.removed detach）。
+    /// client 角色收工（先收承载面——socks 显式关在世连接/speedtest 取消——再停
+    /// 全部会话 + 逐台 session.removed detach）。
     pub fn close(&self) {
+        self.carriers.close();
         self.hosts.close();
+    }
+}
+
+/// 承载面拨号缝的表侧实现（Go carrierDialOf：Host 查表 + healing 拨号；预算 =
+/// Go DialPort 的 15s 档）。
+fn carriers_dial_of(hosts: &Arc<hosts::HostTable>) -> carriers::CarrierDial {
+    let h1 = Arc::clone(hosts);
+    let dial_port = Arc::new(move |host: &str, port: u16| -> Result<carriers::CarrierConn, carriers::DialErr> {
+        let id = hosts::decode_peer_id_pub(host).ok_or(carriers::DialErr::NoHost)?;
+        let sess = h1.session(&id).ok_or(carriers::DialErr::NoSession)?;
+        let conn_id = sess
+            .healing_dial_port(port, std::time::Duration::from_secs(15))
+            .map_err(map_dial_err)?;
+        Ok(carrier_conn_of(sess.client(), conn_id))
+    });
+    let h2 = Arc::clone(hosts);
+    let dial = Arc::new(
+        move |host: &str, dst: std::net::SocketAddrV4| -> Result<carriers::CarrierConn, carriers::DialErr> {
+            let id = hosts::decode_peer_id_pub(host).ok_or(carriers::DialErr::NoHost)?;
+            let sess = h2.session(&id).ok_or(carriers::DialErr::NoSession)?;
+            let conn_id = sess
+                .healing_dial_addr(dst, std::time::Duration::from_secs(15))
+                .map_err(map_dial_err)?;
+            Ok(carrier_conn_of(sess.client(), conn_id))
+        },
+    );
+    carriers::CarrierDial { dial_port, dial }
+}
+
+fn map_dial_err(e: crate::wgcore::ConnErr) -> carriers::DialErr {
+    match e {
+        crate::wgcore::ConnErr::Refused => carriers::DialErr::Refused,
+        crate::wgcore::ConnErr::EngineGone => carriers::DialErr::NoSession,
+        other => carriers::DialErr::Other(other.to_string()),
+    }
+}
+
+/// 同一隧道连接的两种承载面（TunnelConn 透传腿 + speedtest 引擎腿）。
+fn carrier_conn_of(client: Arc<crate::wgcore::Client>, id: u64) -> carriers::CarrierConn {
+    carriers::CarrierConn {
+        io: Arc::new(TunnelConn::new(Arc::clone(&client), id)),
+        speed: crate::speedtest::engine_conn(client, id),
+    }
+}
+
+fn carrier_err_to_backend(e: CarrierErr) -> BackendErr {
+    let detail = e.to_string();
+    match e {
+        CarrierErr::NoHost => BackendErr::NoHost,
+        _ => BackendErr::Other(detail),
     }
 }
 
@@ -230,7 +355,13 @@ impl Backend for DaemonCore {
 
     fn remove_host(&self, host_hex: &str) -> Result<(), BackendErr> {
         let id = hosts::decode_peer_id_pub(host_hex).ok_or(BackendErr::NoHost)?;
-        self.hosts.remove_host(&id)
+        // FIX-05：级联与承载面的「成员检查 + 落地」同锁（add_mu）串行——级联要么
+        // 看到规则并删掉，要么规则因成员检查失败而根本落不了地（锁序恒为
+        // add_mu → hosts.inner，无反向取锁面）。
+        let _cascade = self.carriers.cascade_lock();
+        self.hosts.remove_host(&id)?;
+        self.carriers.remove_host_cascade_locked(host_hex);
+        Ok(())
     }
 
     fn host_states(&self) -> Vec<proto::HostState> {
@@ -303,6 +434,77 @@ impl Backend for DaemonCore {
             },
         }
     }
+
+    // ---------- 承载面（语义在 carriers；本层只做 host hex 存在性闸 + 委托） ----------
+
+    fn forward_add(&self, rule: ForwardRule) -> Result<ForwardState, BackendErr> {
+        let listen = rule.listen;
+        let host = rule.host.clone();
+        self.carriers.add_forward(rule).map_err(carrier_err_to_backend)?;
+        // 成功载荷 = 建成的规则面（listening 态——Go ForwardAdd 的 forwardBriefOf 同构）。
+        self.carriers
+            .forward_states(&host)
+            .into_iter()
+            .find(|s| s.rule.listen == listen)
+            .ok_or(BackendErr::Other("规则建成但快照缺席（不可达）".to_owned()))
+    }
+
+    fn forward_remove(&self, host_hex: &str, listen: u16) -> Result<(), BackendErr> {
+        self.carriers.remove_forward(host_hex, listen).map_err(carrier_err_to_backend)
+    }
+
+    fn forward_list(&self, host_hex: &str) -> Vec<ForwardState> {
+        if !host_hex.is_empty() {
+            match hosts::decode_peer_id_pub(host_hex) {
+                Some(id) if self.hosts.has_record(&id) => {}
+                _ => return Vec::new(), // host 不在表 = 空形状（Go hostInTable 门同义）
+            }
+        }
+        self.carriers.forward_states(host_hex)
+    }
+
+    fn socks_on(&self, host_hex: &str, listen: u16) -> Result<u16, BackendErr> {
+        self.carriers.socks_on(host_hex, listen).map_err(carrier_err_to_backend)
+    }
+
+    fn socks_off(&self, host_hex: &str) -> Result<u16, BackendErr> {
+        self.carriers.socks_off(host_hex).map_err(carrier_err_to_backend)
+    }
+
+    fn socks_states(&self) -> Vec<SocksState> {
+        self.carriers.socks_states()
+    }
+
+    fn speedtest_start(
+        &self,
+        host_hex: &str,
+        p: SpeedtestParams,
+    ) -> Result<carriers::speedrun::SpeedtestAck, BackendErr> {
+        if !host_in_table(&self.hosts, host_hex) {
+            return Err(BackendErr::NoHost);
+        }
+        Ok(self.carriers.speedtest_start(host_hex, p))
+    }
+
+    fn speedtest_status(&self, host_hex: &str) -> Result<Option<SpeedtestStatus>, BackendErr> {
+        if !host_in_table(&self.hosts, host_hex) {
+            return Err(BackendErr::NoHost);
+        }
+        Ok(self.carriers.speedtest_status(host_hex))
+    }
+
+    fn speedtest_cancel(&self, host_hex: &str) -> Result<(), BackendErr> {
+        if !host_in_table(&self.hosts, host_hex) {
+            return Err(BackendErr::NoHost);
+        }
+        self.carriers.speedtest_cancel(host_hex);
+        Ok(())
+    }
+}
+
+/// host hex 存在性闸（非法 hex 或不在表 = false）。
+fn host_in_table(hosts: &Arc<hosts::HostTable>, host_hex: &str) -> bool {
+    hosts::decode_peer_id_pub(host_hex).is_some_and(|id| hosts.has_record(&id))
 }
 
 #[cfg(test)]

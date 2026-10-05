@@ -1,0 +1,442 @@
+//! 承载面管理器束（语义真源 `baseline:clientcore/facade/carriers.go`——D 批，
+//! B0-2b §十裁剪的整块兑现）。
+//!
+//! forward / socks / speedtest 三个管理器的装配点与协调面：随 DaemonCore 生命周期
+//! （stateDir = client 角色目录，与 hosts.json 同源）；「监听端口全局唯一」（跨
+//! forward 规则与 socks 监听——多主机会话并发在世、共享同一回环命名空间）的检查
+//! 在本层做（两管理器各自只查名下端口）；host.remove 级联清理经本层分发
+//! （forward = delete 语义不强关、socks = off 语义显式关、speedtest = cancel）。
+//! 拨号一律经注入的拨号缝（同记账同重建感知），无旁路直拨。
+//!
+//! 与 Go 的锁序拍板（FIX-05）：`add_mu` 串行「全局端口检查 + 成员检查 + 落地」与
+//! 「删条目 → 级联」（DaemonCore::remove_host 先取 add_mu 再动表）——级联要么看到
+//! 规则并删掉，要么规则因成员检查失败而根本落不了地；锁序恒为
+//! `add_mu → hosts.inner`（表侧从不在持自己的锁时反向取 add_mu）。
+
+pub mod dnsq;
+pub mod forward;
+pub mod socksmgr;
+pub mod socks_srv;
+pub mod speedrun;
+#[cfg(test)]
+pub(super) mod testutil;
+
+use std::net::SocketAddrV4;
+use std::sync::{Arc, Mutex};
+
+use super::StreamConn;
+pub use forward::{describe_target, ForwardRule, ForwardState};
+pub use socksmgr::{SocksState, SOCKS_DEFAULT_LISTEN};
+pub use speedrun::{SpeedtestOutcome, SpeedtestParams, SpeedtestStatus};
+
+/// 拨号缝闭包形（出口本机端口形态）。
+pub type DialPortFn = Arc<dyn Fn(&str, u16) -> Result<CarrierConn, DialErr> + Send + Sync>;
+/// 拨号缝闭包形（任意目标形态）。
+pub type DialAddrFn = Arc<dyn Fn(&str, SocketAddrV4) -> Result<CarrierConn, DialErr> + Send + Sync>;
+
+/// 承载面统一拨号缝（Go carrierDial）：host = peerID hex；出口本机端口 / 任意目标
+/// 两形态。同一连接的两个消费面（`.io` = StreamConn 透传/解析腿；`.speed` = 测速
+/// 引擎腿）。拨号失败的四态归因（`DialErr`）供 speedtest runner 分类与 forward/socks
+/// 的日志归因。
+pub struct CarrierDial {
+    pub dial_port: DialPortFn,
+    pub dial: DialAddrFn,
+}
+
+/// 拨号缝产物：同一隧道连接的两种承载面。
+pub struct CarrierConn {
+    /// 透传/解析腿（forward/socks/DNS 面）。
+    pub io: Arc<dyn StreamConn>,
+    /// 测速引擎腿（speedtest runner 面）。
+    pub speed: Arc<dyn crate::speedtest::SpeedConn>,
+}
+
+/// 拨号缝错误四态（Go ErrNoHost / ErrSessionNotCurrent / wgnet.ErrRefused / 其它）。
+/// Clone = 测试注入面（FakeDial 的失败注入快照）。
+#[derive(Debug, Clone, thiserror::Error)]
+#[non_exhaustive]
+pub enum DialErr {
+    #[error("主机不在表中")]
+    NoHost,
+    #[error("会话不在（收工/重建窗口）")]
+    NoSession,
+    /// 对端 RST（出口无该服务——runner 归 not_supported 的判据）。
+    #[error("连接被拒（对端 RST）")]
+    Refused,
+    #[error("{0}")]
+    Other(String),
+}
+
+/// 承载面哨兵错误族（server 层统一落 bad_request/no_host + 归因 detail——Go
+/// mapCarrierErr 的 FIX-50 口径：底层可行动归因随行不被吞）。
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum CarrierErr {
+    #[error("主机不在表中")]
+    NoHost,
+    #[error("端口须在 1024–65535：{0}")]
+    PortRange(u16),
+    #[error("监听端口已被占用（全局唯一）：{port} 已被 {owner} 占用")]
+    PortTaken { port: u16, owner: String },
+    #[error("每主机 forward 规则上限 8 条（{0} 已 {1} 条）")]
+    TooManyRules(String, usize),
+    #[error("目标须为空（出口自己）或 IPv4 字面量：{0}")]
+    BadTarget(String),
+    #[error("forward 规则不存在：{0}")]
+    NoRule(String),
+    #[error("监听 127.0.0.1:{0} 失败（{1}）")]
+    ListenFailed(u16, String),
+    #[error("落盘失败：{0}")]
+    Save(String),
+}
+
+/// 成员谓词（FIX-05：AddForward/SocksOn 的成员检查在 add_mu 临界区内跑）。
+pub type HostExists = Arc<dyn Fn(&[u8; 32]) -> bool + Send + Sync>;
+
+/// 承载面管理器束（DaemonCore 持有）。
+pub struct Carriers {
+    fwd: forward::ForwardManager,
+    sks: socksmgr::SocksManager,
+    spd: speedrun::SpeedtestManager,
+    /// 「全局端口检查 + 成员检查 + 落地」与「删条目 → 级联」的串行化。
+    add_mu: Mutex<()>,
+    host_exists: HostExists,
+}
+
+impl Carriers {
+    /// 打开三个管理器：读各自持久化文件、按表重建监听/运行面（半途失败收尾已开的，
+    /// 不留半挂面——Go openCarriers 同序）。
+    pub fn open(
+        state_dir: &std::path::Path,
+        dial: CarrierDial,
+        logf: Arc<dyn Fn(&str) + Send + Sync>,
+        warnf: Arc<dyn Fn(&str) + Send + Sync>,
+        host_exists: HostExists,
+    ) -> Result<Arc<Carriers>, String> {
+        let fwd = forward::ForwardManager::open(state_dir, &dial, &logf, &warnf)?;
+        let sks = match socksmgr::SocksManager::open(state_dir, &dial, &logf, &warnf) {
+            Ok(m) => m,
+            Err(e) => {
+                fwd.close();
+                return Err(e);
+            }
+        };
+        let spd = speedrun::SpeedtestManager::new(&dial, &logf);
+        Ok(Arc::new(Carriers { fwd, sks, spd, add_mu: Mutex::new(()), host_exists }))
+    }
+
+    /// 级联闸（FIX-05）：DaemonCore::remove_host 先取本锁再「删条目 → 级联」。
+    pub fn cascade_lock(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.add_mu.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// 成员检查（须在 add_mu 临界区内调用）。坏 hex = 不在表（Go peerIDFromHex 同义）。
+    fn member_check(&self, host: &str) -> Result<(), CarrierErr> {
+        match super::hosts::decode_peer_id_pub(host) {
+            Some(id) if (self.host_exists)(&id) => Ok(()),
+            _ => Err(CarrierErr::NoHost),
+        }
+    }
+
+    /// 建转发规则（全局端口检查 + 委托 ForwardManager::add——当场监听失败 = 错误
+    /// 返回、不入表）。
+    pub fn add_forward(&self, rule: ForwardRule) -> Result<(), CarrierErr> {
+        let _g = self.add_mu.lock().unwrap_or_else(|e| e.into_inner());
+        self.member_check(&rule.host)?;
+        if let Some(owner) = self.fwd.port_owner(rule.listen) {
+            return Err(CarrierErr::PortTaken { port: rule.listen, owner });
+        }
+        let port = rule.listen;
+        if let Some(owner) = self.sks.port_owner(port) {
+            return Err(CarrierErr::PortTaken { port, owner: format!("{owner}（可用 --listen 另选）") });
+        }
+        self.fwd.add(rule)
+    }
+
+    /// 删规则（不强关在世连接）。
+    pub fn remove_forward(&self, host: &str, listen: u16) -> Result<(), CarrierErr> {
+        self.fwd.remove(host, listen)
+    }
+
+    /// 规则表快照（host 空 = 全部；按 host/listen 稳定排序）。
+    pub fn forward_states(&self, host: &str) -> Vec<ForwardState> {
+        self.fwd.list(host)
+    }
+
+    /// 开 SOCKS 监听（listen 0 = 沿用记忆/缺省 1080）；全局端口检查后委托。
+    /// 返回实际端口。
+    pub fn socks_on(&self, host: &str, listen: u16) -> Result<u16, CarrierErr> {
+        let _g = self.add_mu.lock().unwrap_or_else(|e| e.into_inner());
+        self.member_check(host)?;
+        // socks×socks 的跨主机冲突（含记忆端口、文案含另选提示）由 SocksManager::on
+        // 自带；这里只补 forward 侧的占用检查——按**解析后的端口**判（exec-r1 B1：
+        // 此前 listen==0 时整个跳过，靠 On 恒落 1080 的〔错误〕假设兜着）。
+        let port = if listen == 0 { self.sks.default_listen(host) } else { listen };
+        if port != 0 {
+            if let Some(owner) = self.fwd.port_owner(port) {
+                return Err(CarrierErr::PortTaken { port, owner: format!("{owner}（可用 --listen 另选）") });
+            }
+        }
+        self.sks.on(host, listen)
+    }
+
+    /// 关监听（显式关在世连接；端口记忆保留）。返回记忆端口（CLI 文案数据源）。
+    pub fn socks_off(&self, host: &str) -> Result<u16, CarrierErr> {
+        self.sks.off(host)
+    }
+
+    /// socks 承载态快照（按 host 排序稳定输出）。
+    pub fn socks_states(&self) -> Vec<SocksState> {
+        self.sks.status()
+    }
+
+    /// speedtest 三面（per-host 单飞 + runner 状态机承载等待）。
+    pub fn speedtest_start(&self, host: &str, p: SpeedtestParams) -> speedrun::SpeedtestAck {
+        self.spd.start(host, p)
+    }
+
+    pub fn speedtest_status(&self, host: &str) -> Option<SpeedtestStatus> {
+        self.spd.status(host)
+    }
+
+    pub fn speedtest_cancel(&self, host: &str) {
+        self.spd.cancel(host)
+    }
+
+    /// host.remove 级联（**调用方须已持 add_mu**——cascade_lock）：forward 规则
+    /// （delete 语义，不强关）、socks 监听（off 语义，显式 RST + 记忆消失）、
+    /// speedtest（cancel）。
+    pub fn remove_host_cascade_locked(&self, host_hex: &str) {
+        self.fwd.remove_host(host_hex);
+        self.sks.remove_host(host_hex);
+        self.spd.cancel(host_hex);
+    }
+
+    /// 收工：forward 只关监听、socks 显式关在世连接、speedtest 取消全部在跑轮。
+    pub fn close(&self) {
+        self.fwd.close();
+        self.sks.close();
+        self.spd.close();
+    }
+}
+
+// ---------- 局部共享件 ----------
+
+/// 0600 原子写（tmp + rename；hosts.json 同口径）。目录缺失即建（0700）。
+pub(super) fn save_json_atomic(path: &std::path::Path, body: &[u8]) -> Result<(), String> {
+    use std::io::Write as _;
+    let dir = path.parent().unwrap_or(std::path::Path::new("."));
+    std::fs::create_dir_all(dir).map_err(|e| format!("建目录 {}：{e}", dir.display()))?;
+    let tmp = path.with_extension("json.tmp");
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .open(&tmp)
+        .map_err(|e| format!("建 {}：{e}", tmp.display()))?;
+    {
+        // 创建即收紧到 0600（hosts-2 同款：避免 umask 面上的 0644 窗口）。
+        use std::os::unix::fs::PermissionsExt as _;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    f.write_all(body).and_then(|_| f.write(b"\n")).map_err(|e| format!("写 {}：{e}", tmp.display()))?;
+    drop(f);
+    std::fs::rename(&tmp, path).map_err(|e| format!("rename {} → {}：{e}", tmp.display(), path.display()))
+}
+
+/// 监听失败的错误描述（bind 错误原文随行——占用/权限/不可用各形态自带 OS 文案）。
+pub(super) fn describe_listen_err(port: u16, e: &std::io::Error) -> String {
+    format!("bind 127.0.0.1:{port}：{e}")
+}
+
+/// peerID hex 的短形态（日志/错误文案用；Go shortHost 同串）。
+pub(super) fn short_host(host: &str) -> String {
+    if host.len() > 8 {
+        format!("{}…", &host[..8])
+    } else {
+        host.to_owned()
+    }
+}
+
+/// 本地 TCP 连接 RST 收口（SO_LINGER 0——尽力而为；失败路径专用，优雅 FIN 会让
+/// 浏览器/客户端静默挂住）。
+pub(super) fn rst_close_tcp(stream: &std::net::TcpStream) {
+    use std::os::unix::io::AsRawFd as _;
+    unsafe {
+        let linger = libc::linger { l_onoff: 1, l_linger: 0 };
+        let _ = libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::linger>() as u32,
+        );
+    }
+}
+
+/// TCP 双向透传的半关闭单实现（Go pkg/netpipe.Both 同义：任一向 EOF 只收该向写端，
+/// 两向都收工才关两端；RST 只属于失败路径，由调用方负责）。
+///
+/// `local` 的半关走 `TcpStream::shutdown(Write)`；`upstream` 的半关走
+/// `StreamConn::shutdown_write`（不支持半关的实现退化为全关——同 Go「对端不支持
+/// 则退化为 Close」）。
+pub(super) fn pipe_half_close(
+    logf: &Arc<dyn Fn(&str) + Send + Sync>,
+    local: std::net::TcpStream,
+    upstream: Arc<dyn StreamConn>,
+) {
+    let write_half = local.try_clone().expect("TcpStream clone 不可失败");
+    let up2l = std::thread::Builder::new()
+        .name("hw-pipe-l2u".to_owned())
+        .spawn({
+            let up = Arc::clone(&upstream);
+            let logf = Arc::clone(logf);
+            move || copy_local_to_up(local, up, &logf)
+        })
+        .expect("线程创建不可失败");
+    // 本线程跑 upstream → local（读上游阻塞面 = StreamConn::read_chunk）。
+    loop {
+        match upstream.read_chunk() {
+            Ok(v) if v.is_empty() => break,
+            Ok(v) => {
+                if write_all_tcp(&write_half, &v).is_err() {
+                    break;
+                }
+            }
+            Err(_) => break,
+        }
+    }
+    let _ = write_half.shutdown(std::net::Shutdown::Write);
+    let _ = up2l.join();
+    upstream.close();
+    let _ = write_half.shutdown(std::net::Shutdown::Both);
+}
+
+/// local → upstream 单向拷贝（EOF/错误 = 收该向写端；错误带日志）。
+fn copy_local_to_up(
+    mut local: std::net::TcpStream,
+    upstream: Arc<dyn StreamConn>,
+    logf: &Arc<dyn Fn(&str) + Send + Sync>,
+) {
+    use std::io::Read as _;
+    let mut buf = [0u8; 16 * 1024];
+    loop {
+        match local.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => {
+                if write_progress_upstream(&upstream, &buf[..n]).is_err() {
+                    logf("pipe: 上游写失败/停滞——收该向");
+                    let _ = local.shutdown(std::net::Shutdown::Read);
+                    upstream.close();
+                    return;
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => {
+                if e.kind() != std::io::ErrorKind::UnexpectedEof {
+                    logf(&format!("pipe: 本地读失败（{e}）——收该向"));
+                }
+                break;
+            }
+        }
+    }
+    upstream.shutdown_write();
+}
+
+/// 上游整块写（30s 无进展预算在 `TunnelConn::write_chunk` 内部承载——此处薄封装）。
+fn write_progress_upstream(
+    upstream: &Arc<dyn StreamConn>,
+    data: &[u8],
+) -> std::io::Result<()> {
+    upstream.write_chunk(data).map(|_| ())
+}
+
+/// TCP 整块写（部分写重试）。
+pub(super) fn write_all_tcp(
+    stream: &std::net::TcpStream,
+    mut data: &[u8],
+) -> std::io::Result<()> {
+    use std::io::Write as _;
+    let mut stream = stream;
+    while !data.is_empty() {
+        match stream.write(data) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "本地写零接纳",
+                ))
+            }
+            Ok(n) => data = &data[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// 阻塞 accept 的非阻塞轮询形态（50ms 节拍；listener 由本循环独占，关停 = 置
+/// generation 失效 + drop listener）。
+pub(super) struct PollListener {
+    ln: Option<std::net::TcpListener>,
+    /// accept 瞬态错误的有界线性退避（Go serveAcceptRetry*：一次瞬态错误即退 =
+    /// 无人受理的僵尸监听；烧尽 = 上抛按监听失效收口）。
+    backoff: u32,
+}
+
+pub(super) const ACCEPT_RETRY_MAX: u32 = 8;
+pub(super) const ACCEPT_RETRY_STEP_MS: u64 = 50;
+
+pub(super) enum PollAccept {
+    Conn(std::net::TcpStream),
+    /// 无待收（正常节拍）。
+    Idle,
+    /// 监听器被关（正常收口）。
+    Closed,
+    /// 瞬态错误烧尽（监听失效——按 failed/off 收口）。
+    Failed(String),
+}
+
+impl PollListener {
+    pub fn new(ln: std::net::TcpListener) -> PollListener {
+        let _ = ln.set_nonblocking(true);
+        PollListener { ln: Some(ln), backoff: 0 }
+    }
+
+    pub fn accept(&mut self) -> PollAccept {
+        let Some(ln) = self.ln.as_ref() else { return PollAccept::Closed };
+        match ln.accept() {
+            Ok((stream, _)) => {
+                self.backoff = 0;
+                let _ = stream.set_nonblocking(false);
+                let _ = stream.set_nodelay(true);
+                PollAccept::Conn(stream)
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => PollAccept::Idle,
+            Err(e)
+                if matches!(
+                    e.kind(),
+                    std::io::ErrorKind::ConnectionAborted
+                        | std::io::ErrorKind::ConnectionReset
+                        | std::io::ErrorKind::Interrupted
+                ) =>
+            {
+                // 瞬态：线性退避（烧尽 = 监听失效）。
+                self.backoff += 1;
+                if self.backoff > ACCEPT_RETRY_MAX {
+                    return PollAccept::Failed(format!("accept 连续失败（{} 次）：{e}", self.backoff));
+                }
+                std::thread::sleep(std::time::Duration::from_millis(
+                    self.backoff as u64 * ACCEPT_RETRY_STEP_MS,
+                ));
+                PollAccept::Idle
+            }
+            Err(e) => PollAccept::Failed(format!("accept：{e}")),
+        }
+    }
+
+    /// 关监听（幂等）。
+    pub fn close(&mut self) {
+        self.ln = None;
+    }
+}
+

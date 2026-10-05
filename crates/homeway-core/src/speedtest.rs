@@ -258,6 +258,12 @@ struct ClientConn {
     id: u64,
 }
 
+/// 由既有引擎连接构造 SpeedConn（daemon 承载面 speedtest runner 的拨号腿——
+/// 会话侧 healing 拨号拿到 conn id 后经本面交给引擎；与 CLI 形态同一承载实现）。
+pub fn engine_conn(client: std::sync::Arc<Client>, id: u64) -> std::sync::Arc<dyn SpeedConn> {
+    std::sync::Arc::new(ClientConn { client, id })
+}
+
 impl SpeedConn for ClientConn {
     fn write_frame(&self, data: &[u8]) -> Result<(), SpeedtestError> {
         let mut off = 0;
