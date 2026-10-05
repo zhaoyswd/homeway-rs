@@ -279,10 +279,12 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 - 缺 AAAA 告警：`⚠️ DDNS 自检：域名 … 没有 AAAA 记录（只解析出 A）——蜂窝用户将失去 v6 直连路径；请让 DDNS 同时更新 AAAA`；恢复 `DDNS 自检：域名已带 AAAA 记录，v6 直连路径恢复`
 - 卫兵两档（错误文案）：`ddns: 解析结果落在 fake-IP 段（代理环境污染，检查绑卡/代理）` /
   `ddns: 解析结果非全球单播（DDNS 记录本身不可路由，检查记录值）`
-- serve.status 的 ddns 段：`{"domain":…,"lagStreak":N,"warnedLag":true?,"warnedAAAA":true?}`
-  （false 位省略——omitempty 同义）
+- serve.status 的 ddns 段（载荷）：`{"domain":…,"lagStreak":N,"warnedLag":true?,"warnedAAAA":true?}`
+  （false 位省略——omitempty 同义）；CLI 人读面渲染（评审 3.5 整改）：
+  `  ddns：` + `    - <domain>（连续不一致 N 拍）[ 已告警滞后][ 已告警缺 AAAA]`
 - 顺手补：`serve relay set <token> [--stdin]` / `serve relay clear`（写 config 0600 +
-  在跑检测提示 `⚠️ 不热更：需 homeway serve restart 生效`）
+  在跑检测提示 `⚠️ 不热更：需 homeway serve restart 生效`；评审 5.1 整改后位置参数形
+  与 --stdin 形均可用）
 
 ### client 侧（token 域名端点展开 + 重解析）
 

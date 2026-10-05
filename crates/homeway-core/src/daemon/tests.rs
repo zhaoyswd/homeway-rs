@@ -193,6 +193,8 @@ struct MockBackend {
     forwards: Mutex<Vec<super::ForwardRule>>,
     socks_mem: Mutex<Vec<(String, bool, u16)>>, // (host, on, port)
     speed_mem: Mutex<std::collections::HashMap<String, bool>>, // host -> running
+    /// cancel 合成的终态记录（host -> done）。
+    speed_done: Mutex<std::collections::HashMap<String, ()>>,
 }
 
 impl MockBackend {
@@ -205,6 +207,7 @@ impl MockBackend {
             forwards: Mutex::new(Vec::new()),
             socks_mem: Mutex::new(Vec::new()),
             speed_mem: Mutex::new(std::collections::HashMap::new()),
+            speed_done: Mutex::new(std::collections::HashMap::new()),
         })
     }
 
@@ -400,7 +403,7 @@ impl Backend for MockBackend {
         }
         let mut m = self.speed_mem.lock().unwrap();
         if m.get(host_hex).copied().unwrap_or(false) {
-            return Ok(super::carriers::speedrun::SpeedtestAck { phase: "busy", reason: Some("上一轮还在跑") });
+            return Ok(super::carriers::speedrun::SpeedtestAck { phase: "busy", reason: Some("busy") });
         }
         m.insert(host_hex.to_owned(), true);
         Ok(super::carriers::speedrun::SpeedtestAck { phase: "waiting", reason: None })
@@ -409,6 +412,29 @@ impl Backend for MockBackend {
     fn speedtest_status(&self, host_hex: &str) -> Result<Option<super::SpeedtestStatus>, BackendErr> {
         if !self.host_exists(host_hex) {
             return Err(BackendErr::NoHost);
+        }
+        // 终态优先（cancel 合成的 cancelled）；运行中 = 引擎快照；从未跑 = None。
+        if self.speed_done.lock().unwrap().contains_key(host_hex) {
+            return Ok(Some(super::SpeedtestStatus {
+                waiting: false,
+                wait_remain_ms: 0,
+                phase: "idle".to_owned(),
+                bytes: 0,
+                elapsed_ms: 0,
+                inst_bps: 0.0,
+                usage_down: 0,
+                usage_up: 0,
+                result: Some(super::carriers::speedrun::SpeedtestOutcome {
+                    ok: false,
+                    reason: "cancelled".to_owned(),
+                    msg: String::new(),
+                    down_bps: 0.0,
+                    up_bps: 0.0,
+                    usage_down: 0,
+                    usage_up: 0,
+                    wall_ms: 0,
+                }),
+            }));
         }
         Ok(if self.speed_mem.lock().unwrap().get(host_hex).copied().unwrap_or(false) {
             Some(super::SpeedtestStatus {
@@ -431,7 +457,12 @@ impl Backend for MockBackend {
         if !self.host_exists(host_hex) {
             return Err(BackendErr::NoHost);
         }
+        // cancel = 合成 cancelled **终态**（生产 speedrun 的 cancel 语义——评审 8.1）。
         self.speed_mem.lock().unwrap().insert(host_hex.to_owned(), false);
+        self.speed_done
+            .lock()
+            .unwrap()
+            .insert(host_hex.to_owned(), ());
         Ok(())
     }
 }
@@ -1033,17 +1064,18 @@ fn carrier_ops_server_roundtrip() {
     let v = c.request("socks.on", Some(json!({"host": id, "listen": 0})), short()).unwrap();
     assert_eq!(v["listen"], 18099, "listen 0 = 记忆/缺省端口");
 
-    // ---- speedtest.start / status / cancel：waiting → down 相位 → cancel ----
+    // ---- speedtest.start / status / cancel：waiting → down 相位 → cancel 终态 ----
     let v = c
         .request("speedtest.start", Some(json!({"host": id, "downMs": 100, "upMs": 0, "warmupMs": 0, "streams": 2, "waitMs": 0})), short())
         .unwrap();
     assert_eq!(v["phase"], "waiting");
-    // 单飞：再 start → busy。
+    // 单飞：再 start → busy（reason = 生产契约词表值 "busy"——REASON_BUSY；评审 8.1：
+    // 用例不得把 mock 自编文案钉成期望）。
     let v = c
         .request("speedtest.start", Some(json!({"host": id, "downMs": 100})), short())
         .unwrap();
     assert_eq!(v["phase"], "busy");
-    assert_eq!(v["reason"], "上一轮还在跑");
+    assert_eq!(v["reason"], "busy", "busy 原因 = 契约词表值（生产 REASON_BUSY）");
     let v = c.request("speedtest.status", Some(json!({"host": id})), short()).unwrap();
     assert_eq!(v["phase"], "down", "引擎快照相位透出");
     assert_eq!(v["bytes"], 42);
@@ -1051,11 +1083,11 @@ fn carrier_ops_server_roundtrip() {
     assert_eq!(e.code, "no_host");
     let v = c.request("speedtest.cancel", Some(json!({"host": id})), short()).unwrap();
     assert_eq!(v["cancelled"], true);
-    // cancel 后 status = 运行面丢失（None → idle 形态——「运行面丢失」判据 =
-    // idle + 非 waiting + 无终态，Go 同义）。
+    // cancel 后 = **终态**（reason=cancelled + result 透出——生产/Go 同语义；评审
+    // 8.1：此前 mock 把 cancel 实现成「运行面消失→idle」，把终态链钉反了）。
     let v = c.request("speedtest.status", Some(json!({"host": id})), short()).unwrap();
-    assert_eq!(v["phase"], "idle", "无运行面 = idle 形态（实收 {v}）");
-    assert!(v["waiting"].is_null() || v["waiting"] == false, "waiting=false 省略（omitempty）");
+    assert_eq!(v["reason"], "cancelled", "cancel 合成终态（实收 {v}）");
+    assert!(v["result"].is_object(), "终态 result 透出（result.reason=result/downBps/upBps）");
 
     // ---- not_ready 门：承载面同样被挡 ----
     backend.not_ready.store(true, Ordering::SeqCst);

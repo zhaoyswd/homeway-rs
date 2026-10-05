@@ -616,21 +616,33 @@ fn reach(token_raw: &str) -> ReachReport {
     let t0 = Instant::now();
     let (tx, rx) = std::sync::mpsc::channel::<ReachTested>();
     // P0-4：域名端点解析（IP 字面量直用；域名解析一次——每端点独立线程语义下
-    // 域名解析在分发前做，预算共享父预算 3.5s）。
-    let eps: Vec<(std::net::SocketAddr, bool)> = tok
-        .endpoints
-        .iter()
-        .filter_map(|ep| {
-            let relay = ep.kind == EndpointKind::Relay;
-            if let Ok(addr) = ep.addr.parse::<std::net::SocketAddr>() {
-                return Some((addr, relay));
-            }
-            let (host, port) = crate::wtransport::domain_eps::split_host_port_pub(&ep.addr)?;
+    // 域名解析在分发前做，预算共享父预算 3.5s）。**全量地址**入探测（评审 4.9：
+    // 只取首个 A 会让多记录域名的活路径被误判不可达）；跨端点同址去重。
+    let mut eps: Vec<(std::net::SocketAddr, bool)> = Vec::new();
+    for ep in &tok.endpoints {
+        let relay = ep.kind == EndpointKind::Relay;
+        let expanded: Vec<std::net::SocketAddr> = if let Ok(addr) =
+            ep.addr.parse::<std::net::SocketAddr>()
+        {
+            vec![addr]
+        } else {
+            let Some((host, port)) = crate::wtransport::domain_eps::split_host_port_pub(&ep.addr)
+            else {
+                continue;
+            };
             let budget = REACH_PARENT_BUDGET.saturating_sub(t0.elapsed());
-            let ips = crate::wtransport::domain_eps::lookup_host(&host, budget).ok()?;
-            ips.first().map(|ip| (std::net::SocketAddr::new(*ip, port), relay))
-        })
-        .collect();
+            crate::wtransport::domain_eps::lookup_host(&host, budget)
+                .unwrap_or_default()
+                .into_iter()
+                .map(|ip| std::net::SocketAddr::new(ip, port))
+                .collect()
+        };
+        for ap in expanded {
+            if !eps.iter().any(|(a, _)| *a == ap) {
+                eps.push((ap, relay));
+            }
+        }
+    }
     for (addr, is_relay) in eps {
         let tx = tx.clone();
         let budget = REACH_PROBE_BUDGET.min(REACH_PARENT_BUDGET.saturating_sub(t0.elapsed()));

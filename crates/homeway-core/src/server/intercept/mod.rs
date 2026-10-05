@@ -87,11 +87,11 @@ type DialFailKey = (&'static str, (Ipv4Addr, u16));
 /// （冷连悬崖），不是速率限制——R 取 ~2× 层 0 天花板（均值面对 3MB/s 级极端场景
 /// 仍有钳制），路径容量由 ACK 时钟（栈内 CUBIC）自管。
 pub const TX_SHAPE_RATE: u64 = 200 * 1024 * 1024;
-/// 突发额度默认 256 KiB = **单拍放行上界**（D-2 8n③ 语义修订；`HOMEWAY_TX_BURST_KB`
-/// 覆盖）。梯度数据：2MB 桶容量形态（8n②）消除了排队延迟但团块 1-2MB 在空口成组
-/// 丢失（dup 260-657/5s → CUBIC 反复砍窗，B 稳 19-30）；256KB 单拍上界 = 修复前
-/// 3.1MB 倾泻的 1/12、≈ Go 出口自然发送团的量级——团块钳制与无排队同时成立
-/// （拍频 1ms ⇒ 峰值放行率 256MB/s）。
+/// 突发额度默认 256 KiB = **桶容量 = 单拍放行上界**（D-2 8n③；`HOMEWAY_TX_BURST_KB`
+/// 覆盖；两义同值——见 shape_slice 的不变量注释）。梯度数据：2048KB 形态消除了
+/// 排队延迟但团块 1-2MB 在空口成组丢失（dup 260-657/5s → CUBIC 反复砍窗，B 稳
+/// 19-40 波动）；256KB = 修复前 3.1MB 倾泻的 1/12、≈ Go 出口自然发送团的量级——
+/// 团块钳制与无排队同时成立（B 热态 25-28 平稳无锯齿）。
 pub const TX_SHAPE_BURST: usize = 256 * 1024;
 
 /// 出口发送整形参数（字节令牌桶）。
@@ -146,20 +146,17 @@ fn shape_slice(
     deferred.extend(produce);
     credit = (credit + shape.rate as f64 * dt).min(shape.burst as f64);
     let mut out = Vec::with_capacity(deferred.len());
-    // 单拍放行上界（D-2 8n③）：burst 兼任**单拍上界**——此前它只是「桶容量」
-    // （累积额度），空闲/久等后额度攒满 ⇒ 下一拍把 2MB 一次倾泻上线，团块在
-    // 空口成组丢失（真机终验：滞留 0 但 dup 260-657/5s、CUBIC 反复砍窗）。加上
-    // 每拍上界后，团块 ≤ burst（256KB = 修复前 3.1MB 倾泻的 1/12 ≈ Go 出口的
-    // 自然发送团量级），且拍频 1ms ⇒ 峰值放行率 256MB/s 远超吞吐 ⇒ 无持续排队。
-    let beat_cap = shape.burst as f64;
-    let mut beat = 0.0f64;
+    // burst 语义（评审 1.1 认账修订）：**桶容量 = 单拍放行上界（同值）**——不变量
+    // 由 credit 逐包扣减自带：每拍开始 credit ≤ burst、每放一包 credit -= fl ⇒ 单拍
+    // 释放总量恒 ≤ burst（曾手写的 beat 计数与该不变量同值，是死逻辑，已删）。**调大
+    // burst 等于同时放开累积额度与单拍倾泻**（真机梯度：桶 2MB 时团块 1-2MB 在空口
+    // 成组丢失、dup 260-657/5s、CUBIC 反复砍窗）——256KiB = 修复前 3.1MB 倾泻的
+    // 1/12 ≈ Go 出口的自然发送团量级，排空期拍频 1ms ⇒ 峰值放行率 ~256MB/s
+    //（稳态 5ms 拍时首批上界 ~51MB/s）≫ 吞吐 ⇒ 无持续排队。
     while let Some(front) = deferred.front() {
         let fl = front.len() as f64;
         if credit < fl && fl <= shape.burst as f64 {
             break;
-        }
-        if beat + fl > beat_cap && !out.is_empty() {
-            break; // 本拍额度用尽：留给下一拍（保序 FIFO）
         }
         if fl > shape.burst as f64 {
             // 防死锁直通 ≠ 参与记账（评审 r2-1.2）：极小 burst 配置下直通分支
@@ -167,7 +164,6 @@ fn shape_slice(
         } else {
             credit -= fl;
         }
-        beat += fl;
         out.push(deferred.pop_front().expect("front 已判"));
     }
     (out, credit)
@@ -379,7 +375,6 @@ struct Flow {
 #[derive(Clone, Copy)]
 struct TcpObsSnap {
     tx_seg: u64,
-    tx_data_seg: u64,
     tx_bytes: u64,
     ack_seg: u64,
     ack_bytes: u64,
@@ -390,7 +385,6 @@ impl From<&TcpObs> for TcpObsSnap {
     fn from(o: &TcpObs) -> Self {
         Self {
             tx_seg: o.tx_seg,
-            tx_data_seg: o.tx_data_seg,
             tx_bytes: o.tx_bytes,
             ack_seg: o.ack_seg,
             ack_bytes: o.ack_bytes,
@@ -1126,24 +1120,21 @@ impl Interceptor {
             }
             if let Some((id, obs)) = pick.filter(|(_, o)| o.tx_seg > 0) {
                 let snap = self.obs_snaps.get(&id).copied();
-                let (dtx, ddata, dbytes, dack, dackb, ddup, raw) = match snap {
+                let (dbytes, dack, dackb, ddup, raw) = match snap {
                     Some(s) if s.tx_seg <= obs.tx_seg => (
-                        obs.tx_seg - s.tx_seg,
-                        obs.tx_data_seg - s.tx_data_seg,
                         obs.tx_bytes - s.tx_bytes,
                         obs.ack_seg - s.ack_seg,
                         obs.ack_bytes - s.ack_bytes,
                         obs.ack_dup - s.ack_dup,
                         "",
                     ),
-                    _ => (obs.tx_seg, obs.tx_data_seg, obs.tx_bytes, obs.ack_seg, obs.ack_bytes, obs.ack_dup, " RAW"),
+                    _ => (obs.tx_bytes, obs.ack_seg, obs.ack_bytes, obs.ack_dup, " RAW"),
                 };
                 self.obs_snaps.insert(id, TcpObsSnap::from(&obs));
                 let win_min = obs.win_min.unwrap_or(0);
-                let _ = ddata;
+                // RAW = 首窗（快照缺失）——流 id 单调不复用，不存在「失配回退」形态。
                 (self.cfg.logf)(&format!(
-                    "intercept: tcp 观测 段={}({}KB,maxSeg={}B) ACK={}({}KB确认) dup={} 通告窗u16[min~max/末]={}~{}/{} 在途≈{}KB{raw}",
-                    dtx,
+                    "intercept: tcp 观测 发={}KB(maxSeg={}B) ACK={}({}KB确认) dup={} 通告窗u16[min~max/末]={}~{}/{} 在途≈{}KB{raw}",
                     dbytes / 1024,
                     obs.tx_max_seg,
                     dack,
@@ -1674,6 +1665,9 @@ impl Interceptor {
 
     /// 清流记录（表 + 栈 socket 槽位）。worker 侧 fd 由 Close 命令收。
     fn remove_flow(&mut self, flow: u64) {
+        // 评审 2.1：观测快照随流回收（键单调不复用 ⇒ 不清 = 长跑出口每天 ~1.5MB
+        // 的无界累积）。
+        self.obs_snaps.remove(&flow);
         if let Some(f) = self.flows.remove(&flow) {
             if let Some(h) = f.sock {
                 self.sockets.remove(h);

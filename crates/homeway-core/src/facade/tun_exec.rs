@@ -755,6 +755,9 @@ fn gen_loop(
     let inputs = crate::wtransport::domain_eps::split_and_resolve(&ep_refs, &logf);
     let candidates: Vec<Candidate> = inputs.candidates;
     let domain_eps = inputs.domains;
+    // 静态基座 = 仅 IP 字面量（评审 4.3：域名首解析产物进 domain_cands 组——
+    // 否则旧解析地址永不退场、且与 domain 组在 merged_candidates 里重复）。
+    let inputs_static_base = inputs.static_base;
     let domain_initial = inputs.domain_initial;
     if candidates.is_empty() {
         shared.stage.set_if_current(
@@ -797,7 +800,7 @@ fn gen_loop(
         client: RwLock::new(None),
         gate: RecoverGate::new(),
         cache: cache.map(Mutex::new),
-        static_cands: candidates.clone(),
+        static_cands: inputs_static_base,
         secret: *cfg.token.secret.as_bytes(),
         peer_pub: *cfg.token.peer_id.as_bytes(),
         identity: ident.clone(),

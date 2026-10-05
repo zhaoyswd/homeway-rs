@@ -360,7 +360,10 @@ fn accept_loop(e: Arc<FwdEntry>, port_for_log: u16) {
                 e.conns.fetch_add(1, Ordering::Relaxed);
                 let entry = Arc::clone(&e);
                 // 低-1（D-2 收敛）：per-conn 线程创建失败 = RST 关该连接继续服务
-                //（资源耗尽不该带走监听线程/进程）。
+                //（资源耗尽不该带走监听线程/进程；评审 7.2：与上限拒绝路径同款
+                // rst_close_tcp——闭包丢弃 conn 只发 FIN，客户端会重试到超时而不是
+                // 立即失败；spawn 前留 fd 克隆，失败时对同 socket 施 RST）。
+                let rst_guard = conn.try_clone().ok();
                 if std::thread::Builder::new()
                     .name("hw-fwd-conn".to_owned())
                     .stack_size(512 * 1024)
@@ -368,6 +371,12 @@ fn accept_loop(e: Arc<FwdEntry>, port_for_log: u16) {
                     .is_err()
                 {
                     e.conns.fetch_sub(1, Ordering::Relaxed);
+                    if let Some(c) = rst_guard {
+                        rst_close_tcp(&c);
+                    }
+                    (e.wire.logf)(&format!(
+                        "forward :{port_for_log} 连接线程创建失败（资源耗尽？）——RST 关闭该连接继续服务"
+                    ));
                 }
             }
             PollAccept::Idle => {}

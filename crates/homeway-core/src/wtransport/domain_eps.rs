@@ -103,8 +103,13 @@ pub struct EndpointInputs {
     pub candidates: Vec<Candidate>,
     /// 域名条目原文（重解析输入；空 = 无域名面）。
     pub domains: Vec<DomainEndpoint>,
-    /// 域名首解析产物（静态面 = IP 字面量 + 本组；重解析只替换这组——Go
-    /// staticBase/domainCands 分离同构）。
+    /// **静态基座**（仅 IP 字面量——Go `staticBase` 同义：永不变、重建世代沿用）。
+    /// 静态面 = static_base + domain_initial / 最新域名解析产物（重解析只替换域名组
+    /// ——评审 4.2/4.3：按条目类型分组而非地址反推，字面量永不被域名解析结果挤出，
+    /// 域名 IP 漂移后旧地址随组替换退场）。
+    pub static_base: Vec<Candidate>,
+    /// 域名首解析产物（与 static_base 分组各自独立去重——Go staticBase/domainCands
+    /// 分离同构）。
     pub domain_initial: Vec<Candidate>,
 }
 
@@ -115,17 +120,29 @@ pub struct EndpointInputs {
 /// - 「token 端点 %s 解析为 %d 个地址（%s）」
 pub fn split_and_resolve(eps: &[EndpointRef<'_>], logf: &Logf) -> EndpointInputs {
     let mut out = Vec::with_capacity(eps.len());
-    let mut seen: Vec<SocketAddr> = Vec::new();
+    let mut seen: Vec<SocketAddr> = Vec::new(); // 全局去重（token 内跨组同址：先到先得）
+    let mut seen_static: Vec<SocketAddr> = Vec::new();
+    let mut seen_domain: Vec<SocketAddr> = Vec::new();
     let mut domains = Vec::new();
+    let mut static_base = Vec::new();
     let mut domain_initial = Vec::new();
     let mut add = |ap: SocketAddr, relay: bool, into_domain: bool| {
         if !seen.contains(&ap) {
             seen.push(ap);
+            let group_seen = if into_domain { &mut seen_domain } else { &mut seen_static };
             let c = Candidate { addr: ap, relay };
-            if into_domain {
-                domain_initial.push(c);
+            if group_seen.contains(&ap) {
+                // 全局未见但组内已见（跨组同址的第二次出现）：只进 out（两个组
+                // 各自保留一份——静态组保字面量、域名组保解析产物）。
+                out.push(c);
+            } else {
+                group_seen.push(ap);
+                match into_domain {
+                    true => domain_initial.push(c),
+                    false => static_base.push(c),
+                }
+                out.push(c);
             }
-            out.push(c);
         }
     };
     for ep in eps {
@@ -141,6 +158,11 @@ pub fn split_and_resolve(eps: &[EndpointRef<'_>], logf: &Logf) -> EndpointInputs
                 continue;
             }
         };
+        // 域名条目**先入表再解析**（评审 4.1：解析失败也必须保留原文——Go
+        // `domainEndpointPorts` 只依赖 SplitHostPort 成功，与解析结果无关；
+        // DDNS 动态 IP + 建会话时 DNS 抖一下的场景靠重解析自愈，丢条目 = 这一代
+        // 会话永不再解析该域名）。
+        domains.push(DomainEndpoint { host: host.clone(), port, relay });
         match lookup_host(&host, RESOLVE_BUDGET) {
             Err(e) => {
                 (logf)(&format!("token 端点 {:?} 域名解析失败（跳过）：{e}", ep.addr));
@@ -162,9 +184,8 @@ pub fn split_and_resolve(eps: &[EndpointRef<'_>], logf: &Logf) -> EndpointInputs
                 ));
             }
         }
-        domains.push(DomainEndpoint { host, port, relay });
     }
-    EndpointInputs { candidates: out, domains, domain_initial }
+    EndpointInputs { candidates: out, domains, static_base, domain_initial }
 }
 
 /// 重解析一拍：解析全部域名条目 → 候选集（`refreshDomainLocked` 的解析段）。
@@ -265,7 +286,7 @@ impl DomainRefresher {
             return;
         }
         let inner = Arc::clone(&self.inner);
-        std::thread::Builder::new()
+        match std::thread::Builder::new()
             .name("hw-domrefresh".to_owned())
             .stack_size(256 * 1024)
             .spawn(move || {
@@ -309,8 +330,15 @@ impl DomainRefresher {
                         (inner.soft_rearm)();
                     }
                 }
-            })
-            .ok();
+            }) {
+            Ok(_) => {}
+            Err(e) => {
+                // 评审 4.7 整改：spawn 失败必须复位单飞位——否则一次线程建立失败后
+                // 本会话所有重解析静默关闭（三条触发全失效且无日志）。
+                self.inner.inflight.store(false, Ordering::SeqCst);
+                (self.inner.logf)(&format!("域名重解析线程建立失败（{e}）——本轮跳过"));
+            }
+        }
     }
 
     fn set_inflight(&self) -> bool {

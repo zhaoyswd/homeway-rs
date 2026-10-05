@@ -159,8 +159,20 @@ impl ControlServer {
         let _ = stream.set_nonblocking(false);
         let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
         let _ = stream.set_write_timeout(Some(WRITE_STALL_TIMEOUT));
-        let writer_sock = stream.try_clone().ok()?;
-        let ctl_sock = stream.try_clone().ok()?;
+        let writer_sock = match stream.try_clone() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("控制面连接 fd 克隆失败（{e}）——降级关闭该连接");
+                return None;
+            }
+        };
+        let ctl_sock = match stream.try_clone() {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("控制面连接 fd 克隆失败（{e}）——降级关闭该连接");
+                return None;
+            }
+        };
         let (req_tx, req_rx) = std::sync::mpsc::channel::<RequestBody>();
         let conn = Arc::new(ConnShared {
             srv: Arc::clone(self),
@@ -180,6 +192,7 @@ impl ControlServer {
             .spawn(move || r_conn.reader_main(stream))
             .ok()
         else {
+            eprintln!("控制面 reader 线程创建失败（资源耗尽？）——降级关闭该连接");
             conn.close("");
             return None;
         };
@@ -189,6 +202,7 @@ impl ControlServer {
             .spawn(move || w_conn.writer_main(writer_sock))
             .ok()
         else {
+            eprintln!("控制面 writer 线程创建失败（资源耗尽？）——降级关闭该连接");
             conn.close("");
             let _ = reader.join();
             return None;
@@ -201,6 +215,7 @@ impl ControlServer {
             .spawn(move || d_conn.dispatcher_main(req_rx))
             .is_err()
         {
+            eprintln!("控制面 dispatcher 线程创建失败（资源耗尽？）——降级关闭该连接");
             conn.close("");
             let _ = reader.join();
             let _ = writer.join();
@@ -224,6 +239,7 @@ impl ControlServer {
             .ok()
         else {
             // joiner 起不来：reader/writer 都已起——直接收工等它俩退出，连接不入表。
+            eprintln!("控制面 joiner 线程创建失败（资源耗尽？）——降级关闭该连接");
             conn.close("");
             return None;
         };

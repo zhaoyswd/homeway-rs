@@ -259,6 +259,7 @@ impl Session {
         let inputs = crate::wtransport::domain_eps::split_and_resolve(&ep_refs, &logf);
         let candidates: Vec<Candidate> = inputs.candidates;
         let domain_eps = inputs.domains;
+        let inputs_static_base = inputs.static_base;
         let domain_initial = inputs.domain_initial;
         if candidates.is_empty() {
             return Err(SessionErr::NoCandidates);
@@ -332,13 +333,7 @@ impl Session {
             gate: recover::RecoverGate::new(),
             ladder: Mutex::new(LadderState::default()),
             cache: cache.map(Mutex::new),
-            static_cands: {
-                let dom: Vec<SocketAddr> = domain_initial.iter().map(|c| c.addr).collect();
-                candidates
-                    .into_iter()
-                    .filter(|c| !dom.contains(&c.addr))
-                    .collect()
-            },
+            static_cands: inputs_static_base,
             domain_cands: Mutex::new(domain_initial.clone()),
             domain_refresher: RwLock::new(None),
             logf: Arc::clone(&logf),

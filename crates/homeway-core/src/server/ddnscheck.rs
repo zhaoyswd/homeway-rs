@@ -143,7 +143,7 @@ fn check_one(
         st.resolve_err_streak = 0;
         drop(m);
         if recovered {
-            logf(&format!("DDNS 自检：解析恢复（{domain} → {addrs:?}）"));
+            logf(&format!("DDNS 自检：解析恢复（{domain} → {}）", fmt_addrs(&addrs)));
         }
     }
 
@@ -181,14 +181,19 @@ fn check_one(
         st.mismatch_streak = 0;
         if st.warned_lag {
             st.warned_lag = false;
-            logf(&format!("DDNS 自检：记录已恢复一致（解析 {addrs:?} 与观测匹配）"));
+            logf(&format!(
+                "DDNS 自检：记录已恢复一致（解析 {} 与观测匹配）",
+                fmt_addrs(&addrs)
+            ));
         }
     } else {
         st.mismatch_streak += 1;
         if st.mismatch_streak >= DDNS_LAG_THRESHOLD && !st.warned_lag {
             st.warned_lag = true;
             logf(&format!(
-                "⚠️ DDNS 自检：记录滞后——域名解析 {addrs:?} 与本机观测 {published:?} 连续 {} 拍不一致；请检查 DDNS 更新器（路由器/脚本）是否还在工作",
+                "⚠️ DDNS 自检：记录滞后——域名解析 {} 与本机观测 {} 连续 {} 拍不一致；请检查 DDNS 更新器（路由器/脚本）是否还在工作",
+                fmt_addrs(&addrs),
+                fmt_published(published),
                 st.mismatch_streak
             ));
         }
@@ -355,7 +360,13 @@ fn parse_answers(b: &[u8], want_id: u16) -> Option<Vec<IpAddr>> {
             QTYPE_AAAA if rdlen == 16 => {
                 let mut o = [0u8; 16];
                 o.copy_from_slice(rdata);
-                out.push(IpAddr::V6(o.into()));
+                let v6: std::net::Ipv6Addr = o.into();
+                // Go `a.Unmap()` 同义：v4-mapped AAAA 归一成 v4 再进卫兵/比对——
+                // 否则 `::ffff:198.18.x.y` 形态的假应答两档卫兵都过得去（评审 3.2）。
+                match v6.to_ipv4_mapped() {
+                    Some(v4) => out.push(IpAddr::V4(v4)),
+                    None => out.push(IpAddr::V6(v6)),
+                }
             }
             _ => {}
         }
@@ -386,6 +397,21 @@ fn skip_dns_name(b: &[u8], mut p: usize) -> Option<usize> {
         }
         p += 1 + l as usize;
     }
+}
+
+/// 地址列表的 Go `%v` 形态渲染（空格分隔、无引号/括号——判据行同串；Rust `{:?}`
+/// 给的是 `[a, b]` 逗号+空格带括号，与 Go 逐字对不上——评审 3.3）。
+fn fmt_addrs(addrs: &[IpAddr]) -> String {
+    addrs
+        .iter()
+        .map(|a| a.to_string())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// `published` 列表的 Go `%v` 形态渲染（`[a b]`——Go %v 对 slice 带方括号）。
+fn fmt_published(lines: &[String]) -> String {
+    format!("[{}]", lines.join(" "))
 }
 
 /// serve.status 的 ddns 段快照（未跑字段为零值——Go Snapshot 同义）。

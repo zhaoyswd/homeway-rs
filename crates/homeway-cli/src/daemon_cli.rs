@@ -353,6 +353,8 @@ struct ParsedArgs {
     name: Option<String>,
     /// 守护未跑时不按需拉起（脚本友好；Go cliBoolFlags 共享位）。
     no_spawn: bool,
+    /// 从 stdin 读单行（serve relay set 的凭证输入面——缓解 shell history 落凭证）。
+    stdin: bool,
 }
 
 fn parse_args(usage: &str, args: &[String]) -> ParsedArgs {
@@ -364,6 +366,7 @@ fn parse_args(usage: &str, args: &[String]) -> ParsedArgs {
         force: false,
         name: None,
         no_spawn: false,
+        stdin: false,
     };
     let mut i = 0;
     while i < args.len() {
@@ -387,6 +390,7 @@ fn parse_args(usage: &str, args: &[String]) -> ParsedArgs {
             }
             "json" => out.json = true,
             "yes" => out.yes = true,
+            "stdin" => out.stdin = true,
             "force" => out.force = true,
             "no-spawn" => out.no_spawn = true,
             "name" => {
@@ -812,6 +816,27 @@ fn render_serve_status(c: &Arc<ControlClient>) {
         let eps: Vec<_> = eps.iter().filter_map(|e| e.as_str()).collect();
         if !eps.is_empty() {
             println!("  端点：{}", eps.join("、"));
+        }
+    }
+    // ddns 段（Go servegroup_cli.go:483-486 同串——P0-4 的 status 出口；评审 3.5：
+    // 此前控制面载荷已对齐但 CLI 侧没有消费口）。
+    if let Some(ddns) = v["ddns"].as_array() {
+        if !ddns.is_empty() {
+            println!("  ddns：");
+            for d in ddns {
+                let mut line = format!(
+                    "    - {}（连续不一致 {} 拍）",
+                    d["domain"].as_str().unwrap_or("?"),
+                    d["lagStreak"].as_i64().unwrap_or(0),
+                );
+                if d["warnedLag"].as_bool().unwrap_or(false) {
+                    line.push_str("[ 已告警滞后]");
+                }
+                if d["warnedAAAA"].as_bool().unwrap_or(false) {
+                    line.push_str("[ 已告警缺 AAAA]");
+                }
+                println!("{line}");
+            }
         }
     }
     if let Some(peers) = v["peers"].as_array() {
@@ -1462,45 +1487,11 @@ fn validate_relay_arg(tok: &str) -> Result<(), String> {
 }
 
 fn serve_relay_set(args: &[String]) {
-    let mut state = default_state_dir();
-    let mut stdin_flag = false;
-    let mut i = 0;
-    while i < args.len() {
-        let a = args[i].as_str();
-        let (name, inline) = match a.strip_prefix("--").unwrap_or(a).split_once('=') {
-            Some((k, v)) => (k.to_owned(), Some(v.to_owned())),
-            None => (a.trim_start_matches('-').to_owned(), None),
-        };
-        match name.as_str() {
-            "state" => {
-                if let Some(v) = inline {
-                    state = PathBuf::from(v);
-                } else {
-                    i += 1;
-                    let Some(v) = args.get(i) else {
-                        eprintln!("--state 需要目录参数");
-                        std::process::exit(2);
-                    };
-                    state = PathBuf::from(v.clone());
-                }
-            }
-            "stdin" => stdin_flag = true,
-            "help" | "h" => {
-                println!("用法：homeway serve relay set <token> [--stdin] [--state D]");
-                return;
-            }
-            _ => {
-                eprintln!("未知参数：{a}");
-                std::process::exit(2);
-            }
-        }
-        i += 1;
-    }
-    let positional: Vec<&String> = args
-        .iter()
-        .filter(|a| !a.starts_with('-') && !matches!(a.as_str(), "set"))
-        .collect();
-    let token = if stdin_flag {
+    // 评审 5.1 整改：位置参数形（`serve relay set <token>`）此前走手写 flag 循环
+    // 被判「未知参数」100% 不可用——改 parse_args 统一解析（--state/--stdin 等 flag
+    // 之外的内容全进 positional，取第一个为 token；--stdin 从 stdin 读单行）。
+    let p = parse_args("serve relay set <token> [--stdin] [--state DIR]", args);
+    let token = if p.stdin {
         let mut line = String::new();
         use std::io::BufRead;
         if std::io::stdin().lock().read_line(&mut line).is_err() && line.is_empty() {
@@ -1509,11 +1500,11 @@ fn serve_relay_set(args: &[String]) {
         }
         line.trim().to_owned()
     } else {
-        if positional.len() != 1 {
+        if p.positional.len() != 1 {
             eprintln!("serve relay set 需要 <token>（rl1… 或裸 IP:port）或 --stdin（从 stdin 读单行）");
             std::process::exit(2);
         }
-        positional[0].trim().to_owned()
+        p.positional[0].trim().to_owned()
     };
     if token.is_empty() {
         eprintln!("token 为空（--stdin 读到空行）");
@@ -1525,14 +1516,14 @@ fn serve_relay_set(args: &[String]) {
     }
     let masked = mask_for_hint(&token);
     if let Err(e) = crate::unified_cli::update_config(
-        &state,
+        &p.state,
         crate::unified_cli::ConfigEdit::RelaySet(token.clone()),
     ) {
         eprintln!("{e}");
         std::process::exit(1);
     }
     println!("serve.relay 已写入 config（{masked}，0600 原子写）");
-    if daemon_running_probe(&state) {
+    if daemon_running_probe(&p.state) {
         println!("⚠️ 不热更：需 `homeway serve restart` 生效（重启后中继注册腿以新 token 注册）");
     }
 }

@@ -21,7 +21,7 @@
 //! 重放的阶段**：请求未送达）。
 
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
@@ -282,11 +282,13 @@ impl<'a> Stream<'a> {
         )
     }
 
-    /// 问候帧公共段（两种承载共用）。首响应带预算（Go armWatchdog 同义：到点关流
-    /// 打断阻塞中的问候帧读——对端不应答时不会永久挂死；**问候帧返回后不再受此
-    /// 预算约束**，传输期无期限——传输中的流不会被首响应预算误杀）。
+    /// 问候帧公共段（两种承载共用）。首响应带预算（Go armWatchdog 同义：**绝对
+    /// 期限**（dial 返回起一次性），到点关流打断阻塞中的问候帧读——对端不应答时
+    /// 不会永久挂死；问候帧返回后不再受此预算约束，传输期无期限——传输中的流
+    /// 不会被首响应预算误杀）。
     fn handshake(mut s: Stream<'_>, budget: Duration) -> Result<Stream<'_>, FilesError> {
-        let line = s.read_line_deadline(budget).map_err(|e| FilesError::Code {
+        let deadline = Instant::now() + budget;
+        let line = s.read_line_deadline(deadline).map_err(|e| FilesError::Code {
             code: CODE_STREAM_OPEN.to_owned(),
             msg: format!("读问候帧失败：{e}"),
         })?;
@@ -314,12 +316,12 @@ impl<'a> Stream<'a> {
         self.read_line_opt(None)
     }
 
-    /// 读一行（带首响应预算的问候帧形态：到点关流 + 超预算归因）。
-    fn read_line_deadline(&mut self, budget: Duration) -> Result<Vec<u8>, FilesError> {
-        self.read_line_opt(Some(budget))
+    /// 读一行（带首响应**绝对期限**的问候帧形态：到点关流 + 超预算归因）。
+    fn read_line_deadline(&mut self, deadline: Instant) -> Result<Vec<u8>, FilesError> {
+        self.read_line_opt(Some(deadline))
     }
 
-    fn read_line_opt(&mut self, deadline: Option<Duration>) -> Result<Vec<u8>, FilesError> {
+    fn read_line_opt(&mut self, deadline: Option<Instant>) -> Result<Vec<u8>, FilesError> {
         loop {
             if let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
                 let mut line: Vec<u8> = self.buf.drain(..=pos).collect();
@@ -342,16 +344,23 @@ impl<'a> Stream<'a> {
         }
     }
 
-    /// 带期限取一块（问候帧看门面）：到点**关流**（本地 = 引擎关连接——读线程的
-    /// 阻塞 read 随连接回收退出；远程 = stream_close——腿终结）再报超预算——
-    /// 不关流的话读线程与消费侧通道都悬着（drop 时 Local 走 close 幂等无害）。
-    fn next_chunk_timeout(&mut self, d: Duration) -> Result<Vec<u8>, FilesError> {
-        match self.rx.recv_timeout(d) {
+    /// 带期限取一块（问候帧看门面；**绝对期限**——每轮按剩余时间收窄，评审 6.1：
+    /// 按块重置的滑动期限会被「滴灌对端」拖成 块数×预算，Go armWatchdog 是 dial
+    /// 返回起一次性定时器）：到点**关流**（本地 = 引擎关连接——读线程的阻塞 read
+    /// 随连接回收退出；远程 = stream_close——腿终结）再报超预算——不关流的话读
+    /// 线程与消费侧通道都悬着（drop 时 Local 走 close 幂等无害）。
+    fn next_chunk_timeout(&mut self, deadline: Instant) -> Result<Vec<u8>, FilesError> {
+        let remain = deadline.saturating_duration_since(Instant::now());
+        if remain.is_zero() {
+            self.abort_stream();
+            return Err(transport("首响应（问候帧）超预算"));
+        }
+        match self.rx.recv_timeout(remain) {
             Ok(Ok(chunk)) if !chunk.is_empty() => Ok(chunk),
             Ok(_) => Err(transport("流已到尾（EOF）")),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 self.abort_stream();
-                Err(transport(format!("首响应（问候帧）超预算（{d:?}）")))
+                Err(transport("首响应（问候帧）超预算".to_owned()))
             }
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 Err(transport("读线程已退出"))
@@ -1006,7 +1015,7 @@ mod greeting_watchdog_tests {
         let (_tx_keepalive, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, ConnErr>>();
         let mut s = Stream::from_rx(rx);
         let t0 = std::time::Instant::now();
-        let r = s.read_line_deadline(Duration::from_millis(200));
+        let r = s.read_line_deadline(std::time::Instant::now() + Duration::from_millis(200));
         let dt = t0.elapsed();
         assert!(r.is_err(), "静默对端必须按预算失败");
         let msg = match &r.unwrap_err() {
