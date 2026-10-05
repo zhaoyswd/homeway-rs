@@ -1328,26 +1328,28 @@ fn drop_signal_pipes(p: SigPipe) {
 // attach 主体（raw 模式 + 双向透传 + 分离键 + 尺寸同步 + 收尾）
 // ---------------------------------------------------------------------------
 
-/// ENDED 码 → 可行动文案（Go endedMessage 同串）。
+/// ENDED 码 → 可行动文案（Go endedMessage 同串；前缀「homeway term: 」由 finish
+/// 的收尾打印统一加——Go 侧 endedMessage 自带前缀而 detach/信号 note 不带、各打印
+/// 点单加一次，Rust 侧收敛为 printer 单加，避免双前缀）。
 fn ended_message(name: &str, code: i32, reason: &str) -> String {
     match (code, reason) {
         (c, r) if c == ended_code::REPLACED && r == frames::ended_reason::SELF_RECONNECT => {
-            format!("homeway term: 本实例的新连接替换了这条腿（self_reconnect）；重新接入：homeway-cli term attach {name}")
+            format!("本实例的新连接替换了这条腿（self_reconnect）；重新接入：homeway-cli term attach {name}")
         }
         (c, r) if c == ended_code::REPLACED && r == frames::ended_reason::REPLACED => {
-            format!("homeway term: 会话 {name} 已被另一客户端接管（replaced）；重新接入：homeway-cli term attach {name}")
+            format!("会话 {name} 已被另一客户端接管（replaced）；重新接入：homeway-cli term attach {name}")
         }
         (c, r) if c == ended_code::REPLACED => {
-            format!("homeway term: 会话 {name} 的这条腿被服务端结束（{r}）")
+            format!("会话 {name} 的这条腿被服务端结束（{r}）")
         }
         (c, _) if c == ended_code::KILLED => {
-            format!("homeway term: 会话 {name} 已被关闭（App 或 homeway-cli term delete）")
+            format!("会话 {name} 已被关闭（App 或 homeway-cli term delete）")
         }
         (c, _) if c == ended_code::SERVICE_STOPPED => {
-            format!("homeway term: 出口服务正在退出，会话 {name} 已结束")
+            format!("出口服务正在退出，会话 {name} 已结束")
         }
-        (c, _) if c >= 0 => format!("homeway term: 会话 {name} 已结束（退出码 {c}）"),
-        (c, r) => format!("homeway term: 会话 {name} 已结束（code={c} reason={r}）"),
+        (c, _) if c >= 0 => format!("会话 {name} 已结束（退出码 {c}）"),
+        (c, r) => format!("会话 {name} 已结束（code={c} reason={r}）"),
     }
 }
 
