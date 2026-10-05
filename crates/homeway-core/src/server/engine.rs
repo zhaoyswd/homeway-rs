@@ -553,6 +553,7 @@ impl ServeEngine {
                 let dlogf = Arc::clone(&dlogf);
                 let itc_stats = Arc::clone(&itc_stats);
                 let pub_kick_tx = pub_kick_tx.clone();
+                let driver_alive_t = Arc::clone(&driver_alive); // move 闭包独占一份（外层留给兜底线/构造面）
                 move || {
                     // 在世守卫：线程体任何出口（含 panic 展开）都清零——supervisor 据此
                     // 判角色终结（守卫必须活在闭包体内——外层 spawn 参数块在闭包构造
@@ -563,7 +564,7 @@ impl ServeEngine {
                             self.0.store(false, Ordering::SeqCst);
                         }
                     }
-                    let _alive_guard = AliveGuard(Arc::clone(&driver_alive));
+                    let _alive_guard = AliveGuard(driver_alive_t);
                     driver_loop(
                         cfg, bind, &mut device, &mut table, &mut intercept, dns.as_ref(), &st,
                         &revoked_set, cmd_rx, &dlogf, &itc_stats, pub_kick_tx,
@@ -608,6 +609,17 @@ impl ServeEngine {
         }
 
         // ---- token 兜底线（Go role.go 终端兜底 goroutine 同义）----
+
+        // 兜底等待档（S1 测试缝：HOMEWAY_TOKEN_FALLBACK_WAIT_MS 覆盖——测试注入
+        // 短档；生产 15s = Go tokenFallbackWait 同值）。
+        let driver_alive_tokfb = Arc::clone(&driver_alive); // 兜底线取消位（轮询驱动在世）
+        let fallback_wait = std::env::var("HOMEWAY_TOKEN_FALLBACK_WAIT_MS")
+            .ok()
+            .and_then(|v| v.parse::<u64>().ok())
+            .map(Duration::from_millis)
+            .unwrap_or(Duration::from_secs(15));
+        // 兜底线的取消位（低-6：驱动线程退出〔正常 shutdown 或异常终结〕即取消——
+        //AliveGuard 清 driver_alive，此处轮询）。
         // 首轮探测结束（成不成都算；探测全关 = 15s 后）每秒重试一小会儿，直到 token
         // 铸出。没有它，公网端点「暂不公布」（端口改写/无证据）的形态下整个进程
         // 生命周期都不会铸 token——重启后台账末行恒缺中继端点（DEPLOY-RUST-EXIT §5
@@ -619,15 +631,18 @@ impl ServeEngine {
                 .name("homeway-tokfb".into())
                 .spawn(move || {
                     if pub_enabled {
-                        // 等首轮探测信号；观测线程早夭（发送端全部 drop）= 15s 兜底档
+                        // 等首轮探测信号；观测线程早夭（发送端全部 drop）= 兜底档
                         if first_probe_rx.recv().is_err() {
-                            std::thread::sleep(Duration::from_secs(15));
+                            std::thread::sleep(fallback_wait);
                         }
                     } else {
-                        // 探测全关（Go firstProbe==nil）：tokenFallbackWait 15s 档
-                        std::thread::sleep(Duration::from_secs(15));
+                        // 探测全关（Go firstProbe==nil）：tokenFallbackWait 兜底档
+                        std::thread::sleep(fallback_wait);
                     }
                     for _ in 0..10 {
+                        if !driver_alive_tokfb.load(Ordering::SeqCst) {
+                            return; // 低-6：驱动已收工，不再重试铸打
+                        }
                         let (printed, published) = match shared.inner.lock() {
                             Ok(i) => (!i.last_token.is_empty(), i.last_published.clone()),
                             Err(_) => return,
