@@ -39,6 +39,14 @@
 > 形态；P1-1（serve 面文件日志体系）在生产的影响面 = dlogf 无落盘（peer/dns/dialok 判据行生产
 > 不可见）+ events 无轮转，优先级维持 C 批不变。
 >
+> **2026-10-05 B0-2b 第 1 棒处置**：控制面底座（frame/vocab/proto/bus/listen/server/client——43 帧夹具
+> 对拍 + 全协议集成测试）+ client 角色（hosts.json 表 + 每主机常驻会话 + reach 探测）+ stream.open 流
+> 转发底座（TunnelConn 适配器，EchoConn 集成实证）+ serve/relay 动态角色管理（期望态写 config +
+> start/stop/restart/token）+ host/status/serve 组/relay 组 CLI 接线 + daemon-{events,debug}.log 落地；
+> 判据 = INTEROP-CRITERIA「daemon/控制面族实采」节（DC1–DC13）。**仍缺（第 2 棒工单，
+> docs/reviews/B0-2b.md §三）**：supervisor 退避重建（r1-M4）、term/files `--host` 远程模式（Rust term
+> CLI）、export/import/reset（P1-6）、承载面 9 op、serve.status peers/intercept 观测面、status --watch。
+>
 > **2026-10-05 B0-2a 生产可观测性批处置**：P1-1 已修清（双文件轮转 + 三级接线，判据行落盘
 > 本地验收 + 两台滚动升级）；P1-5 登记修正后收口（主检测/停打/提示行 R3-3f 起已在位——审计时
 > 误判缺失；真正缺的台账追加吊销分支行已补）；P1-7 动词别名半边收口（get/put 别名在，

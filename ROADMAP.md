@@ -124,9 +124,25 @@ GAP-AUDIT 行内理由）。发版 **v0.2.1**（tag = `7be330c`，Release run �
 （`docs/reviews/B0-2a.md`）+ CI 假红双修（`dial_failed_gets_rst` 预算 15s → 改临时死
 端口——ubuntu 沙箱对特权端口 DROP 投递，附录 D 条目 1 演进）。
 
-**下一步（当前指针）**：**B0-2 剩余**（daemon 控制面/client 角色/CLI 族/supervisor 退避
-〔serve 面日志轮转与 events 体系已随 B0-2a 清账，daemon 侧 daemon-events/debug 仍在本批〕——
-B0-1 已清部署最小面，B0-2a 已清生产可观测性，见下方两段）→ **R8 收官批**（技术修复项已全清——R8-3 完成，2026-10-05：
+**B0-2b 第 1 棒（2026-10-05 完成，本段）**：daemon/控制面大块的底座棒——①控制面底座
+`crates/homeway-core/src/daemon/`（frame/vocab/proto/bus/listen/server/client；**并发模型拍板 =
+沿 R1 自管线程决议**：每连接三线程〔reader/dispatcher/writer 唯一写者 + Condvar 优先级出队〕
++ 每流两线程；Go B3 heldFrames/复检暂存收敛为单 writer 复合出队项 SubConfirm——wire 等价
+论证与差异表 D1–D12 = `docs/reviews/B0-2b.md`）②client 角色（hosts.json 表——B5 先落盘再起
+会话/同键刷新/carried 保真/损坏备份空表；每主机常驻 Session + reach 三档探测）③stream.open
+流转发底座（TunnelConn 适配器：30s 写无进展预算；上行 32 帧/512KiB 双界）④serve/relay 动态
+角色管理（UnifiedRoles：期望态写 config + start/stop/restart/token 幂等）⑤CLI 族（host
+add/list/status/delete、status、serve 组、relay 组；`serve token` reveal 控制面优先 + 台账直读
+回落——保 local-rust-exit.sh 契约）⑥daemon-{events,debug}.log（nodestate open_named）。
+判据：43 帧夹具对拍（decode 43/43 + 五类帧字节级编码一致）+ 服务器全协议集成 28 例 +
+本地实例 DC1–DC13（INTEROP-CRITERIA daemon 节：host 全往返/多主机两活一死/断线重连/
+serve 运行时启停/token reveal/SIGTERM 收工）。**第 2 棒工单**（docs/reviews/B0-2b.md §三）：
+supervisor 退避重建（r1-M4）、term `--host` 远程模式（+ P1-3 Rust term CLI 合做）、
+export/import/reset（P1-6）、承载面 9 op、serve.status peers/intercept 缝、status --watch、
+B0-2a 登记小项五件、matrix debug.log 硬门。
+
+**下一步（当前指针）**：**B0-2b 第 2 棒**（上方工单；term remote 是 B0-2b 验收判据项）→
+R8 收官批（技术修复项已全清——R8-3 完成，2026-10-05：→ **R8 收官批**（技术修复项已全清——R8-3 完成，2026-10-05：
 8i 出口发送整形实装 + 8j 真机矩阵复测 + 8k 尾账五项全清 + 8l 评审收口；判据链与
 消融数据 = `docs/reviews/R8.md` §十 + `docs/PERF-AB.md` §9.7-bis/§9.9）。
 R8-3 结果速记：**冷连悬崖消除**（B 冷/热 0.85 ≥ 0.70 门 + 逐秒形态证据）、**批分布
