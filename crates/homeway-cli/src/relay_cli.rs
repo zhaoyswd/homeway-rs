@@ -93,13 +93,102 @@ fn parse_flags(args: &[String]) -> RelayFlags {
 }
 
 /// 解析监听地址（":41741"/"127.0.0.1:41741"——缺 host = 全卡 v4）。
-fn parse_listen(v: &str) -> Option<SocketAddr> {
+pub fn parse_listen(v: &str) -> Option<SocketAddr> {
     let v = v.trim();
     if let Some(port) = v.strip_prefix(':') {
         let p: u16 = port.parse().ok()?;
         return Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), p));
     }
     v.parse().ok()
+}
+
+/// relay 角色装配产物（统一进程与前台单角色共用）：停止位 fd + 运行线程句柄。
+pub struct RelayProc {
+    stop_w: i32,
+    join: Option<std::thread::JoinHandle<()>>,
+}
+
+impl RelayProc {
+    /// 停止并收线程（确定性 closeAll——Ctrl-C/SIGTERM 的统一收口）。
+    pub fn stop(mut self) {
+        unsafe { libc::write(self.stop_w, b"x".as_ptr().cast(), 1) };
+        if let Some(h) = self.join.take() {
+            let _ = h.join();
+        }
+        unsafe { libc::close(self.stop_w) };
+    }
+}
+
+/// relay 角色装配参数（flag 覆盖后的终值；统一进程 = 纯 config 值）。
+pub struct RelayAssemble {
+    pub listen: SocketAddr,
+    pub advertise: String,
+    pub no_hints: bool,
+    pub open: bool,
+}
+
+/// 装配 relay 角色（key 加载/token 铸出/run 线程起跑——on_ready 打中继 token）。
+/// `logf` = 摘要行出口（前台 = println；统一进程 = events tee）。
+pub fn assemble_relay(
+    state_dir: &std::path::Path,
+    a: RelayAssemble,
+    logf: Arc<dyn Fn(&str) + Send + Sync>,
+) -> Result<RelayProc, String> {
+    let relay_dir = state_dir.join("relay");
+    let cache_dir = state_dir.join("cache");
+    std::fs::create_dir_all(&relay_dir)
+        .and_then(|_| std::fs::create_dir_all(&cache_dir))
+        .map_err(|e| format!("state 目录建不起来（{}）：{e}", state_dir.display()))?;
+
+    // 两级日志（终端只出 token 与端点变化；全量进 cache/relay.log）
+    let log2 = Arc::new(RelayLog::open(&cache_dir, Arc::clone(&logf)));
+    let (secret, created) =
+        rltoken::load_or_create_secret(&relay_dir).map_err(|e| format!("relay.key 管理失败（{}）：{e}", relay_dir.display()))?;
+    if created {
+        log2.logf(&format!(
+            "已生成中继鉴权密钥（{}/relay.key，0600）—— 重启不变，token 因此稳定",
+            relay_dir.display()
+        ));
+    }
+    if let Some(p) = log2.log_path() {
+        log2.ulogf(&format!("日志：{p} —— 终端只出 token 与端点变化"));
+    }
+    let auth = if a.open { None } else { Some(secret) };
+    let mut cfg = Config::new(a.listen, auth, log2.logf_fn());
+    cfg.no_hints = a.no_hints;
+    let relay = Relay::new(cfg);
+    let adv = a.advertise;
+    let on_ready = move |port: u16| match rltoken::build_token(
+        &secret,
+        &adv,
+        port,
+        &|s: &str| log2.ulogf(s),
+        &|_s: &str| {},
+    ) {
+        Ok(b) => {
+            log2.ulogf(&format!("中继 token：{}", b.token));
+            log2.ulogf(&format!("端点：{}", b.endpoints.join("、")));
+            if rltoken::all_private(&b.endpoints) {
+                log2.ulogf("⚠️ 公布的地址都在内网：公网中继请加 --advertise <公网IP:端口>");
+            }
+            log2.logf(&format!("后端这样用：homeway serve --relay '{}'", b.token));
+        }
+        Err(e) => {
+            log2.logf(&format!("⚠️ token 生成失败（{e}）—— 后端可用裸地址走开放模式"));
+        }
+    };
+    let (stop_r, stop_w) = stop_pipe();
+    let join = std::thread::Builder::new()
+        .name("homeway-relay".into())
+        .stack_size(1024 * 1024)
+        .spawn(move || {
+            if let Err(e) = relay.run(stop_r, on_ready) {
+                eprintln!("relay 运行失败：{e}");
+                std::process::exit(1);
+            }
+        })
+        .expect("spawn relay");
+    Ok(RelayProc { stop_w, join: Some(join) })
 }
 
 /// `homeway-cli relay [...]`：前台中继（Ctrl-C / SIGTERM 收工——确定性 closeAll）。
@@ -109,13 +198,9 @@ pub fn cmd_relay(args: &[String]) {
         eprintln!("relay 不接受位置参数（得 {:?}）——启停/查询命令组不在本 CLI 裁剪面", f.extra);
         std::process::exit(2);
     }
-    let state_dir = f.state.unwrap_or_else(|| PathBuf::from("."));
-    let relay_dir = state_dir.join("relay");
-    let cache_dir = state_dir.join("cache");
-    if let Err(e) = std::fs::create_dir_all(&relay_dir).and_then(|_| std::fs::create_dir_all(&cache_dir)) {
-        eprintln!("state 目录建不起来（{}）：{e}", state_dir.display());
-        std::process::exit(1);
-    }
+    let state_dir = f.state.clone().unwrap_or_else(|| PathBuf::from("."));
+    // 单实例锁（Go 全形态共用 <state>/lock；form=relay）
+    let _lock = acquire_lock_or_exit(&state_dir, "relay");
 
     // config.toml（存在即解析 [relay] 节；缺失 = 内置默认）
     let mut listen_str = ":41741".to_owned();
@@ -144,7 +229,6 @@ pub fn cmd_relay(args: &[String]) {
             advertise = v;
         }
     }
-    // flag 覆盖
     if let Some(v) = &f.listen {
         listen_str = v.clone();
     }
@@ -158,76 +242,32 @@ pub fn cmd_relay(args: &[String]) {
             std::process::exit(2);
         }
     };
-
-    // 两级日志（终端只出 token 与端点变化；全量进 cache/relay.log）
-    let log = Arc::new(RelayLog::open(&cache_dir, Arc::new(|s: &str| println!("{s}"))));
-
-    // 鉴权密钥：加载/生成（重启不变 ⇒ token 稳定）
-    let (secret, created) = match rltoken::load_or_create_secret(&relay_dir) {
-        Ok(v) => v,
+    let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
+    let proc = match assemble_relay(
+        &state_dir,
+        RelayAssemble { listen, advertise, no_hints: f.no_hints, open: f.open },
+        Arc::clone(&logf),
+    ) {
+        Ok(p) => p,
         Err(e) => {
-            eprintln!("relay.key 管理失败（{}）：{e}", relay_dir.display());
+            eprintln!("{e}");
             std::process::exit(1);
         }
     };
-    if created {
-        log.logf(&format!(
-            "已生成中继鉴权密钥（{}/relay.key，0600）—— 重启不变，token 因此稳定",
-            relay_dir.display()
-        ));
-    }
-    if let Some(p) = log.log_path() {
-        log.ulogf(&format!("日志：{p} —— 终端只出 token 与端点变化"));
-    }
-
-    // 鉴权形态：--open（测试）= 显式开放；生产恒 token 模式
-    let auth = if f.open { None } else { Some(secret) };
-
-    let mut cfg = Config::new(listen, auth, log.logf_fn());
-    cfg.no_hints = f.no_hints;
-    let relay = Relay::new(cfg);
-    let log2 = Arc::clone(&log);
-    let adv = advertise;
-    let on_ready = move |port: u16| {
-        match rltoken::build_token(
-            &secret,
-            &adv,
-            port,
-            &|s: &str| log2.ulogf(s),
-            &|_s: &str| {},
-        ) {
-            Ok(b) => {
-                log2.ulogf(&format!("中继 token：{}", b.token));
-                log2.ulogf(&format!("端点：{}", b.endpoints.join("、")));
-                if rltoken::all_private(&b.endpoints) {
-                    log2.ulogf("⚠️ 公布的地址都在内网：公网中继请加 --advertise <公网IP:端口>");
-                }
-                log2.logf(&format!("后端这样用：homeway serve --relay '{}'", b.token));
-            }
-            Err(e) => {
-                log2.logf(&format!("⚠️ token 生成失败（{e}）—— 后端可用裸地址走开放模式"));
-            }
-        }
-    };
-
-    // SIGTERM/SIGINT → stop 管道（与 serve 同款 async-signal-safe 面）
-    let (stop_r, stop_w) = stop_pipe();
-    let join = std::thread::Builder::new()
-        .name("homeway-relay".into())
-        .stack_size(1024 * 1024)
-        .spawn(move || {
-            if let Err(e) = relay.run(stop_r, on_ready) {
-                eprintln!("relay 运行失败：{e}");
-                std::process::exit(1);
-            }
-        })
-        .expect("spawn relay");
-
     println!("（relay 前台运行中——Ctrl-C 收工）");
     wait_pipe_readable();
-    unsafe { libc::write(stop_w, b"x".as_ptr().cast(), 1) };
-    let _ = join.join();
-    unsafe { libc::close(stop_w) };
+    proc.stop();
+}
+
+/// 单实例锁失败 = 可行动错误退出（Held 文案带 pid/形态/state）。
+pub fn acquire_lock_or_exit(state_dir: &std::path::Path, form: &str) -> homeway_core::nodestate::InstanceLock {
+    match homeway_core::nodestate::InstanceLock::acquire(state_dir, form) {
+        Ok(l) => l,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
+        }
+    }
 }
 
 /// 手工抽 [relay] 节（避免整文件反序列化时被 serve 节的键表拒启——serve 键归 serve 校验）。

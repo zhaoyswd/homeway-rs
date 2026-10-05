@@ -351,6 +351,8 @@ impl Session {
                     let learned = if known { "" } else { "·学习" };
                     let tag = if c.relay {
                         "中继"
+                    } else if c.addr.is_ipv6() {
+                        "公网v6"
                     } else if is_lan_addr(c.addr) {
                         "LAN"
                     } else {

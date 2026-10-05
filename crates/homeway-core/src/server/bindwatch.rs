@@ -212,8 +212,8 @@ impl WatchDeps for RealDeps {
     }
 
     fn on_change(&mut self) {
-        // 端点要重测（可能换网/换 IP）；UDP 能力也要重测（换了条路）
-        let _ = self.cmd_tx.send(EngineCmd::KickPublicEndpoint);
+        // 端点要重测（可能换网/换 IP）；UDP 能力也要重测（换了条路）。pub_kick 直发
+        // 即可（EngineCmd::KickPublicEndpoint 是外部/测试面的转传路径，双发=双 kick）
         let _ = self.pub_kick.send(());
         let _ = self.udpcap_kick.send(());
     }

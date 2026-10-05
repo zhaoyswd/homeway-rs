@@ -58,6 +58,36 @@ fn fmt_duration_go_ns(ns: u64) -> String {
     out
 }
 
+/// 日志时间前缀（Go `logTimePrefix` 同形：`2006-01-02 15:04:05.000 `，本地时区
+/// 带毫秒；nodestate events.log / serve 文件日志共用）。libc 的 localtime_r 取本地
+/// 时区（无 chrono 依赖；失败回空串——时间戳缺位不挡日志本体）。
+///
+/// 返回串形如 `2026-10-05 12:34:56.789 `（尾随空格——拼 `[homeway]` 前的 Go 形态）。
+pub fn now_log_prefix() -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    unsafe {
+        let t: libc::time_t = libc::time(std::ptr::null_mut());
+        let mut tm: libc::tm = std::mem::zeroed();
+        if libc::localtime_r(&t, &mut tm).is_null() {
+            return String::new();
+        }
+        let ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.subsec_millis())
+            .unwrap_or(0);
+        format!(
+            "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03} ",
+            tm.tm_year + 1900,
+            tm.tm_mon + 1,
+            tm.tm_mday,
+            tm.tm_hour,
+            tm.tm_min,
+            tm.tm_sec,
+            ms
+        )
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

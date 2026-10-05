@@ -209,12 +209,19 @@ fn run_relay_leg(
     }
 }
 
+/// 经腿 socket 发往端点（族适配：sock 是主 WG socket 的克隆——双栈形态发 v4 目标
+/// 须 map v4-mapped，否则 EINVAL）。控制面低频路径，getsockopt 每次查无妨。
+fn send_to_ep(sock: &UdpSocket, payload: &[u8], ep: SocketAddr) -> std::io::Result<usize> {
+    let dual = crate::udpbatch::is_dual_stack(sock);
+    sock.send_to(payload, crate::udpbatch::xmit_addr(ep, dual))
+}
+
 fn send_hello(sock: &UdpSocket, relay: SocketAddr, label: [u8; 8], pub_: &[u8; 32], logf: &Logf) {
     // 发往中继 listener 的包必须带 [0xAA][label] 路由标签（中继靠它认腿）
     let hello = frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::encode_hello(pub_));
     let mut tagged = Vec::with_capacity(9 + hello.len());
     frame::encode_tagged_frame(&label, &hello, &mut tagged);
-    if let Err(e) = sock.send_to(&tagged, relay) {
+    if let Err(e) = send_to_ep(sock, &tagged, relay) {
         (logf)(&format!("中继：注册 Hello 发送失败（{e}）"));
     }
 }
@@ -223,7 +230,7 @@ fn send_keepalive(sock: &UdpSocket, relay: SocketAddr, label: [u8; 8]) {
     let ka = frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::keepalive_bytes());
     let mut tagged = Vec::with_capacity(9 + ka.len());
     frame::encode_tagged_frame(&label, &ka, &mut tagged);
-    let _ = sock.send_to(&tagged, relay);
+    let _ = send_to_ep(sock, &tagged, relay);
 }
 
 /// 中继回的控制消息（源**全等**判据：IP+端口；其余来源冒充中继控制帧一律忽略）。
@@ -255,7 +262,7 @@ fn handle_control(
         let pf = frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &proof);
         let mut tagged = Vec::with_capacity(9 + pf.len());
         frame::encode_tagged_frame(&label, &pf, &mut tagged);
-        if let Err(e) = sock.send_to(&tagged, relay) {
+        if let Err(e) = send_to_ep(sock, &tagged, relay) {
             (logf)(&format!("中继：注册证明发送失败（{e}）"));
         }
         return;
@@ -314,7 +321,7 @@ fn run_punch_worker(
         for _ in 0..PUNCH_BURST {
             // 小载荷腿帧：对端解析不出数据会静默丢弃，但 NAT 过滤已被打开
             let f = frame::frame_bytes(frame::FrameKind::Data, &[0, 0, 0, 0]);
-            if sock.send_to(&f, client).is_err() {
+            if send_to_ep(&sock, &f, client).is_err() {
                 break;
             }
             std::thread::sleep(PUNCH_GAP);

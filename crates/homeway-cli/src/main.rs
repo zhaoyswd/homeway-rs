@@ -19,16 +19,23 @@ use homeway_core::wgcore::ConnErr;
 
 mod relay_cli;
 mod serve_cli;
+mod unified_cli;
 
 /// 版本串（构建方注入：release 流水线 `HOMEWAY_CLI_VERSION=<tag>`——与核面
 /// `HOMEWAY_CORE_VERSION`（facade::ClientCore::version）同机制；本地直构建回落
 /// devel 形态。发版烟囱判据 = `homeway-cli --version` 能 grep 到 tag）。
-fn cli_version() -> &'static str {
+pub(crate) fn cli_version() -> &'static str {
     option_env!("HOMEWAY_CLI_VERSION").unwrap_or("(devel)")
 }
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
+    // 零参/仅全局 flag形态 = 统一进程（Go `homeway` 零参同义——B0-1 部署最小面）
+    let first_is_flag = args.get(1).map(|a| a.starts_with('-')).unwrap_or(false);
+    if args.len() <= 1 || (first_is_flag && !matches!(args[1].as_str(), "--version" | "version")) {
+        unified_cli::cmd_unified(&args[1..]);
+        return;
+    }
     match args.get(1).map(String::as_str) {
         Some("--version") | Some("version") => {
             println!("homeway-cli {}", cli_version());

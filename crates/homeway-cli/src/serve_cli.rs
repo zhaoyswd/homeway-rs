@@ -59,6 +59,7 @@ struct FileDdns {
 #[serde(deny_unknown_fields)]
 struct FileRelay {
     #[serde(default)]
+    #[allow(dead_code)]
     enabled: bool,
     #[serde(default)]
     #[allow(dead_code)]
@@ -73,7 +74,10 @@ struct FileRelay {
 struct FileConfig {
     #[serde(default)]
     serve: FileServe,
+    /// relay 节由统一进程/`homeway-cli relay` 消费；serve 命令只须**接受**该节
+    ///（整文件 deny_unknown 的键表完整性——不拒启同 state 的双角色配置）。
     #[serde(default)]
+    #[allow(dead_code)]
     relay: FileRelay,
 }
 
@@ -310,11 +314,6 @@ pub fn assemble(args: &[String]) -> ServeConfig {
                 cfg.relay = Some(v);
             }
         }
-        // [relay] enabled=true：中继角色期望态（统一进程面不在本 CLI 裁剪面——
-        // 单角色经 `homeway-cli relay` 起；此处不装也不拒启）
-        if fc.relay.enabled {
-            println!("[relay] enabled=true：中继角色请用 `homeway-cli relay` 前台起（本 CLI 无统一进程形态）");
-        }
     }
     // flag 覆盖
     if let Some(v) = f.listen {
@@ -374,6 +373,9 @@ fn parse_bind_iface(v: &str) -> BindMode {
 /// `homeway-cli serve [...]`：前台出口（Ctrl-C / SIGTERM 有序收工）。
 pub fn cmd_serve(args: &[String]) {
     let cfg = assemble(args);
+    // 单实例锁（Go 全形态共用 <state>/lock；form=serve——防 launchd 双起/统一进程
+    // 与前台单角色同 state 互抢 UDP）
+    let _lock = crate::relay_cli::acquire_lock_or_exit(&cfg.state_dir, "serve");
     let verbose = cfg.verbose;
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
     let dlogf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |s: &str| {
@@ -414,7 +416,7 @@ extern "C" fn on_stop_signal(_sig: i32) {
 
 static STOP_PIPE: std::sync::OnceLock<(i32, i32)> = std::sync::OnceLock::new();
 
-fn install_stop_signals() {
+pub fn install_stop_signals() {
     let (r, w) = *STOP_PIPE.get_or_init(|| unsafe {
         let mut fds = [0i32; 2];
         libc::pipe(fds.as_mut_ptr());
@@ -429,7 +431,7 @@ fn install_stop_signals() {
     let _ = r;
 }
 
-fn wait_stop_pipe() -> bool {
+pub fn wait_stop_pipe() -> bool {
     let (r, _) = *STOP_PIPE.get_or_init(|| (0, 0));
     let mut b = [0u8; 1];
     unsafe { libc::read(r, b.as_mut_ptr().cast(), 1) >= 0 }
