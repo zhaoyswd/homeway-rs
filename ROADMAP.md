@@ -141,7 +141,29 @@ supervisor 退避重建（r1-M4）、term `--host` 远程模式（+ P1-3 Rust te
 export/import/reset（P1-6）、承载面 9 op、serve.status peers/intercept 缝、status --watch、
 B0-2a 登记小项五件、matrix debug.log 硬门。
 
-**下一步（当前指针）**：**B0-2b 第 2 棒**（上方工单；term remote 是 B0-2b 验收判据项）→
+**B0-2b 第 2 棒（2026-10-05 完成，本段）**：daemon 收尾棒（判据与逐项处置 =
+`docs/reviews/B0-2b.md` §七–§十二）——①supervisor 退避重建（r1-M4：退避表
+[500ms,1s,5s,30s] 表尾封顶；serve/relay 双角色看护 + 启动装配失败进程内重试 +
+状态面三态 running/stopped/failed）②**term CLI 五动词 + `--host` 远程模式**（P1-3
+清：raw 腿全流程对齐 Go term_cli_attach；双实例 9/9——回显/marker 经隧道真执行/
+exit 7 直传/KILL/接管 replaced/分离键；**顺带修 ClientStream::blocking_push 漏
+notify**——recv_wait 无预算消费面睡到流终结的 15s 黑洞，回归测试钉住）③
+serve.status peers/intercept 观测缝（EngineCmd::StatusQuery 经驱动线程快照设备表 +
+拦截计数原子直读；speedtest 真连实测 peers:1 + dialOk=4/flows=4）④status --watch
+（P2-5 清：快照+订阅续播 live 渲染、view 参与需求合成、Ctrl-C exit 0）⑤
+export/import/reset（P1-6 清：自管 ustar 最小读写无新依赖，**Go↔Rust 工件双向互通
+实测**——bin/homeway-go export→Rust import ✓ / Rust export→Go import ✓）⑥低-6
+（兜底线收工取消）+ S1（15s 档 env 测试缝）。7 commit（f61b1c4…a4ebd6e）。
+**余量转 D 批**（B0-2b.md §十/§十一逐项理由）：承载面 9 op（socks 无 Rust 服务端 /
+forward 需持久化+端口唯一+级联整块 / speedtest 需 runner 状态机）、files CLI
+--host（term 底座可复用）、matrix debug.log 硬门、低-7/低-8/N3、dialControlSpawn。
+
+**下一步（当前指针）：D 批（B0-2b 余量——接棒指针：①承载面先 speedtest〔引擎在、
+依赖最少〕再 forward〔manager+持久化+全局端口唯一+级联〕后 socks〔需建 SOCKS5
+服务端〕，语义真源 baseline clientcore/facade/carriers.go + internal/daemon/
+{forward,socks,speedtest}_cli.go；②files CLI --host 复用 term_cli.rs 的
+TermConn/resolve_host_pub 底座（先查 files 参数面的带值 flag 同款问题）；
+③matrix.sh 各链路收工段加 debug.log grep 硬门后整矩阵复跑）→**
 R8 收官批（技术修复项已全清——R8-3 完成，2026-10-05：→ **R8 收官批**（技术修复项已全清——R8-3 完成，2026-10-05：
 8i 出口发送整形实装 + 8j 真机矩阵复测 + 8k 尾账五项全清 + 8l 评审收口；判据链与
 消融数据 = `docs/reviews/R8.md` §十 + `docs/PERF-AB.md` §9.7-bis/§9.9）。
