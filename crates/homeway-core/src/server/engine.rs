@@ -1484,16 +1484,22 @@ fn set_probe_endpoints_cmd(cmd_tx: &Sender<EngineCmd>, lines: &[String]) {
 /// 打客户端 token（E3）：终端只打第一轮（进程生命周期内不再重打——端点变化冒出
 /// 第二串 token 只会让人拿错）；台账追加纪律 = 每次铸出与末行不同即追加。
 fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
-    let mut inner = ctx.inner.lock().expect("token 状态锁中毒");
-    // 在用凭证已被吊销：只大声一次并停打
-    if ctx.revoked.lock().map(|m| m.contains(&ctx.secret)).unwrap_or(false) {
-        if !inner.revoked_logged {
-            inner.revoked_logged = true;
-            (ctx.logf)(
-                "⚠️ 在用凭证已被吊销——**不再打印 token**（旧 token 已作废）；执行 `homeway-cli serve restart`（重启）铸出新凭证，客户端需重新粘贴",
-            );
+    // 低-7（B0-2a 登记→D-1 收口）：inner 锁只护 revoked_logged/last_token 的读写
+    // 小临界区——网卡枚举/token 编码/台账追加在锁外（Go tokMu 同款小临界区语义；
+    // 台账幂等由 append_token 的末行比对自带，并发轮至多同条目双追加——无害）。
+    {
+        let mut inner = ctx.inner.lock().expect("token 状态锁中毒");
+        // 在用凭证已被吊销：只大声一次并停打
+        if ctx.revoked.lock().map(|m| m.contains(&ctx.secret)).unwrap_or(false) {
+            if !inner.revoked_logged {
+                inner.revoked_logged = true;
+                drop(inner);
+                (ctx.logf)(
+                    "⚠️ 在用凭证已被吊销——**不再打印 token**（旧 token 已作废）；执行 `homeway-cli serve restart`（重启）铸出新凭证，客户端需重新粘贴",
+                );
+            }
+            return;
         }
-        return;
     }
     // 端点组装（四块语义——R4-design §4.3，评审 ⑥-8）：
     // ① add 收**整个 Endpoint（含 kind）**——relay 标记靠结构流动（57012ad 防线）；
@@ -1570,11 +1576,19 @@ fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
             }
         }
     }
-    if tok_str == inner.last_token {
+    // 打印去重与首轮判定：小临界区（check-and-set 原子——两路并发打印只此一处互斥）。
+    let (is_same, first) = {
+        let mut inner = ctx.inner.lock().expect("token 状态锁中毒");
+        let same = tok_str == inner.last_token;
+        let first = inner.last_token.is_empty();
+        if !same {
+            inner.last_token = tok_str.clone();
+        }
+        (same, first)
+    };
+    if is_same {
         return;
     }
-    let first = inner.last_token.is_empty();
-    inner.last_token = tok_str.clone();
     if first {
         // 首轮（进程内仅此一次）= Go ulogf 形态：带一行日志落点提示，终端 + 摘要文件。
         if let Some((ev_p, dbg_p)) = &ctx.log_paths {

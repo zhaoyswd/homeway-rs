@@ -53,8 +53,8 @@ fn resolve_host_ref(state_dir: &std::path::Path, r#ref: &str, timeout: Duration)
     let c = dial_control_spawn_term(state_dir)?;
     let briefs = c
         .request(vocab::OpName::HostList.as_str(), None, timeout)
-        .map_err(|e| format!("host.list 失败：{}", crate::daemon_cli::op_err_text_pub(&e)))?;
-    let r = crate::daemon_cli::resolve_host_pub(&briefs, r#ref);
+        .map_err(|e| format!("host.list 失败：{}", crate::daemon_cli::op_err_text(&e)))?;
+    let r = crate::daemon_cli::resolve_host(&briefs, r#ref);
     c.close(); // 显式关（评审 r2-10：ControlClient 无 Drop——不关则 fd+reader 线程滞留到进程退出）
     r
 }
@@ -160,6 +160,28 @@ fn remote_end_message(name: &str, reason: &str) -> String {
     }
 }
 
+/// 远程腿的帧抽取（r2-17 去重：块边界 ≠ 帧边界——`[op:len2LE]` 帧按缓冲拼装到
+/// 帧齐；终结三态折 RemoteEndError）。
+fn pull_remote_frame(st: &Arc<ClientStream>, buf: &mut Vec<u8>) -> Result<frames::Frame, TermReadErr> {
+    loop {
+        if buf.len() >= 3 {
+            let n = u16::from_le_bytes([buf[1], buf[2]]) as usize;
+            if buf.len() >= 3 + n {
+                let f = frames::Frame { op: Op(buf[0]), payload: buf[3..3 + n].to_vec() };
+                buf.drain(..3 + n);
+                return Ok(f);
+            }
+        }
+        match st.recv_wait() {
+            Some(chunk) => buf.extend_from_slice(&chunk),
+            None => {
+                let reason = st.end_reason().unwrap_or_else(|| "conn".to_owned());
+                return Err(TermReadErr::Ended(RemoteEndError { reason }));
+            }
+        }
+    }
+}
+
 enum TermConn {
     Local(FrameIo),
     Remote {
@@ -221,23 +243,7 @@ impl TermConn {
     fn read_frame(&mut self) -> Result<frames::Frame, TermReadErr> {
         match self {
             TermConn::Local(io) => io.read_frame().map_err(|e| TermReadErr::Io(e.to_string())),
-            TermConn::Remote { st, buf, .. } => loop {
-                if buf.len() >= 3 {
-                    let n = u16::from_le_bytes([buf[1], buf[2]]) as usize;
-                    if buf.len() >= 3 + n {
-                        let f = frames::Frame { op: Op(buf[0]), payload: buf[3..3 + n].to_vec() };
-                        buf.drain(..3 + n);
-                        return Ok(f);
-                    }
-                }
-                match st.recv_wait() {
-                    Some(chunk) => buf.extend_from_slice(&chunk),
-                    None => {
-                        let reason = st.end_reason().unwrap_or_else(|| "conn".to_owned());
-                        return Err(Self::ended_err(reason));
-                    }
-                }
-            },
+            TermConn::Remote { st, buf, .. } => pull_remote_frame(st, buf),
         }
     }
 
@@ -279,23 +285,7 @@ impl TermReadHalf {
     fn read_frame(&mut self) -> Result<frames::Frame, TermReadErr> {
         match self {
             TermReadHalf::Local(io) => io.read_frame().map_err(|e| TermReadErr::Io(e.to_string())),
-            TermReadHalf::Remote { st, buf } => loop {
-                if buf.len() >= 3 {
-                    let n = u16::from_le_bytes([buf[1], buf[2]]) as usize;
-                    if buf.len() >= 3 + n {
-                        let f = frames::Frame { op: Op(buf[0]), payload: buf[3..3 + n].to_vec() };
-                        buf.drain(..3 + n);
-                        return Ok(f);
-                    }
-                }
-                match st.recv_wait() {
-                    Some(chunk) => buf.extend_from_slice(&chunk),
-                    None => {
-                        let reason = st.end_reason().unwrap_or_else(|| "conn".to_owned());
-                        return Err(TermReadErr::Ended(RemoteEndError { reason }));
-                    }
-                }
-            },
+            TermReadHalf::Remote { st, buf } => pull_remote_frame(st, buf),
         }
     }
 }

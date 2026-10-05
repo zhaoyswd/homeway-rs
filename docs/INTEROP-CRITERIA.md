@@ -235,3 +235,21 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 | DC18 | serve.status 观测缝：`peers：1` + `dev=<16hex> ip=100.64.x.x 空闲=Ns` + `intercept：dialOk=N dialFail=N reject=N flows=N`（speedtest 真连实测 dialOk=4 dialFail=1 flows=4） |
 | DC19 | 工件互通：Rust export/import 全往返（config 逐字节一致 + 覆盖导入 + 在跑拒绝 `import: 目标 state 的统一进程在跑（…/lock 被持有）——先停进程再导入`）；Go export → Rust import ✓ / Rust export → Go import ✓（bin/homeway-go 实测） |
 | DC20 | status --watch：快照渲染 `exit1 ready direct 192.168.3.12:42651 7ms`；SIGINT → exit 0 |
+
+## 承载面族实采（D-1，2026-10-05；daemon = `homeway-cli --state /tmp/hw-d1-uni`〔serve 显式停用〕，
+出口 = local-rust-exit #1〔42651〕+ 出口侧本地 echo/http 目标；CLI = 新构建 release；单测 = `cargo test -p homeway-core --lib carriers::`〔18 例〕）
+
+| # | 实采行 |
+|---|---|
+| CA1 | forward 往返：`已建转发 exit1 127.0.0.1:42701 → 出口自己:42781（listening，目标经 exit1 出网）`；`nc 127.0.0.1 42701` 发 `ping-forward-1` 收 `ECHO:ping-forward-1`（经隧道往返）；出口侧 `intercept: tcp exempt 100.64.255.1:42781 ← 100.64.213.226:<port>（dialok）` |
+| CA2 | forward 持久化：daemon 重启后 `forward list` 规则重建（listening、无 warn）+ 重启后往返复绿（暖机窗口外） |
+| CA3 | forward 负例：端口值域外/目标非 v4/跨族占用（`监听端口 42701 已被 exit1 的 forward 规则 占用（可用 --listen 另选）`——socks on 撞 forward 端口的现场诊断）；每主机 8 条上限；损坏 forwards.json → 备份 + 空表重建（单测） |
+| CA4 | socks 代理（IPv4 目标）：`socks 已开启：exit1 127.0.0.1:42702（域名经 exit1 出口远程解析，不在本机解析）`；`curl --socks5 127.0.0.1:42702 http://192.168.3.12:42783/f.txt` → `hello-socks-file`（请求过隧道） |
+| CA5 | socks 域名目标（远程解析腿）：`curl --socks5-hostname 127.0.0.1:42702 http://example.com/` → `HTTP 200`（DNS-over-TCP → 隧道 IP:5300 出口代答 → 应答候选按序拨）；出口 `dns: … qtcp=N` 计数增长 |
+| CA6 | socks 记忆：daemon 重启后 `socks on` 缺省沿用记忆端口（42702）；`socks off` → `socks 已关闭：exit1（在世连接已 RST 收口；端口 42702 记忆保留，下次 on 缺省沿用）` |
+| CA7 | speedtest 守护托管：`✓ exit1：↑38MB/s ↓18MB/s` + 精确值行 `down=19005150B/s（152.04Mbps，18.12MB/s） up=40119589B/s（320.96Mbps，38.26MB/s） 用量 ↓51.06MB ↑95.44MB 墙钟 5.4s`；过程提示（stderr）`▶ exit1（via=direct rtt=7ms，开跑时冻结）`/`下行中 17MB/s`；`--json` 逐主机对象（host/name/ok/downBps/upBps/usageDown/usageUp/wallMs/via/rttMs） |
+| CA8 | speedtest busy：同主机并发第二台 `✗ exit1：并发满员，稍后再试（busy）` rc=1；Ctrl-C：CLI `已按 Ctrl-C 终止轮转（当前主机已取消；未测的主机不再测量）` rc=1 → daemon 侧 busy ~1s 内解除（重试立即可开新轮） |
+| CA9 | speedtest 负例（单测）：link_down 在 waitMs 预算内 waiting 重试（waitRemainMs 递减面）到点收场；refused（7803 回 RST）→ not_supported 立即终态；等待期取消 → cancelled 终态 |
+| CA10 | files `--host`：`files list --host exit1 d1-host-test`（root 相对）→ `file 26 src.txt`；put/get 往返 `上传完成 26 字节`/`下载完成 26 字节` + sha256 两侧一致（`2` 同 hash） |
+| CA11 | dialControlSpawn 按需拉起：`--no-spawn` → `守护进程未运行且 --no-spawn 已给定（不拉起）`（fail-fast）；无 no-spawn → `守护进程未运行（launchd 代理 me.zhaozhe.homeway-exit 在册）——等 KeepAlive 重拉…` → `KeepAlive 4s 内未重拉——改为自行拉起` → `守护进程未运行，已启动 pid=N（state=…）` → 命令照常完成；子进程 stdio 落 `<state>/cache/spawn.log`（tail 见统一进程就绪行） |
+| CA12 | no_host 族：`forward add --host nosuch` / `socks on --host nosuch` → `没有匹配 "nosuch" 的主机（host list 看全表）`（CLI 侧 resolve 先行——与 term/host delete 同一份规则文案） |

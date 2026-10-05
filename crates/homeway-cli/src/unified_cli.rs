@@ -313,10 +313,14 @@ impl UnifiedRoles {
             .map(|b| b.token),
             _ => None,
         };
+        // N3（B0-2a 登记→D-1 收口）：relay 的 ulogf 走**终端 + relay.log**，不经
+        // events tee（Go 同形——中继 token/端点变化行不进 events.log；serve 侧的
+        // 摘要面才进）。
+        let relay_term: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
         let proc = assemble_relay(
             &self.state_dir,
             RelayAssemble { listen, advertise, no_hints: false, open: false },
-            Arc::clone(&self.logf),
+            relay_term,
         )?;
         Ok((proc, token, listen_str))
     }
@@ -770,9 +774,20 @@ impl RoleHost for UnifiedRoles {
                         self.spawn_serve_supervisor(engine, epoch);
                         Ok(RoleOpOut::Action(RoleActionResult { action: "started".into() }))
                     }
-                    None => Err(BackendErr::Other(
-                        "serve 装配失败（状态面 failed；supervisor 将退避重试）".into(),
-                    )),
+                    None => {
+                        // r2-11 剩余半边（D-1）：失败也 spawn 退避重建（Go StartRole 同款；
+                        // bootstrap 自带期望态复核——并发 start 成功后自动让位）。
+                        if let Some(roles) = self.self_arc() {
+                            std::thread::Builder::new()
+                                .name("hw-boot-serve2".to_owned())
+                                .stack_size(512 * 1024)
+                                .spawn(move || roles.bootstrap_serve())
+                                .expect("线程创建不可失败");
+                        }
+                        Err(BackendErr::Other(
+                            "serve 装配失败（状态面 failed；退避重建已启动——稍后 serve status 复查）".into(),
+                        ))
+                    }
                 }
             }
             R::ServeStop => {
@@ -846,9 +861,19 @@ impl RoleHost for UnifiedRoles {
                         self.spawn_serve_supervisor(engine, epoch);
                         Ok(RoleOpOut::Action(RoleActionResult { action: "restarted".into() }))
                     }
-                    None => Err(BackendErr::Other(
-                        "serve 重启装配失败（状态面 failed；supervisor 将退避重试）".into(),
-                    )),
+                    None => {
+                        // r2-11 剩余半边（D-1）：与 start 同款——失败 spawn 退避重建。
+                        if let Some(roles) = self.self_arc() {
+                            std::thread::Builder::new()
+                                .name("hw-boot-serve3".to_owned())
+                                .stack_size(512 * 1024)
+                                .spawn(move || roles.bootstrap_serve())
+                                .expect("线程创建不可失败");
+                        }
+                        Err(BackendErr::Other(
+                            "serve 重启装配失败（状态面 failed；退避重建已启动——稍后 serve status 复查）".into(),
+                        ))
+                    }
                 }
             }
             R::ServeStatus => {
@@ -918,9 +943,20 @@ impl RoleHost for UnifiedRoles {
                         self.spawn_relay_supervisor(exited, epoch);
                         Ok(RoleOpOut::Action(RoleActionResult { action: "started".into() }))
                     }
-                    None => Err(BackendErr::Other(
-                        "relay 装配失败（状态面 failed；supervisor 将退避重试）".into(),
-                    )),
+                    None => {
+                        // r2-11 剩余半边（D-1）：失败 spawn 退避重建（bootstrap_relay
+                        // 自带期望态复核——并发 start 成功后自动让位）。
+                        if let Some(roles) = self.self_arc() {
+                            std::thread::Builder::new()
+                                .name("hw-boot-relay2".to_owned())
+                                .stack_size(512 * 1024)
+                                .spawn(move || roles.bootstrap_relay())
+                                .expect("线程创建不可失败");
+                        }
+                        Err(BackendErr::Other(
+                            "relay 装配失败（状态面 failed；退避重建已启动——稍后 relay status 复查）".into(),
+                        ))
+                    }
                 }
             }
             R::RelayStop => {
@@ -969,9 +1005,19 @@ impl RoleHost for UnifiedRoles {
                         self.spawn_relay_supervisor(exited, epoch);
                         Ok(RoleOpOut::Action(RoleActionResult { action: "restarted".into() }))
                     }
-                    None => Err(BackendErr::Other(
-                        "relay 重启装配失败（状态面 failed；supervisor 将退避重试）".into(),
-                    )),
+                    None => {
+                        // r2-11 剩余半边（D-1）：与 start 同款——失败 spawn 退避重建。
+                        if let Some(roles) = self.self_arc() {
+                            std::thread::Builder::new()
+                                .name("hw-boot-relay3".to_owned())
+                                .stack_size(512 * 1024)
+                                .spawn(move || roles.bootstrap_relay())
+                                .expect("线程创建不可失败");
+                        }
+                        Err(BackendErr::Other(
+                            "relay 重启装配失败（状态面 failed；退避重建已启动——稍后 relay status 复查）".into(),
+                        ))
+                    }
                 }
             }
             R::RelayStatus => {

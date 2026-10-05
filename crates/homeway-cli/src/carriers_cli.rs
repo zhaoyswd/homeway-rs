@@ -15,7 +15,7 @@ use homeway_core::daemon::client::ControlClient;
 use homeway_core::daemon::proto::OpError;
 use homeway_core::daemon::vocab;
 
-use crate::daemon_cli::{dial_control_spawn, op_err_text_pub, resolve_host_pub};
+use crate::daemon_cli::{dial_control_spawn, op_err_text, resolve_host};
 use crate::term_cli::{expand_flag_eq, parse_duration};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -130,7 +130,7 @@ fn dial_and_hosts(
     let hosts = match c.request(vocab::OpName::DaemonStatus.as_str(), None, TIMEOUT) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("homeway: daemon.status 失败：{}", op_err_text_pub(&e));
+            eprintln!("homeway: daemon.status 失败：{}", op_err_text(&e));
             std::process::exit(1);
         }
     };
@@ -174,7 +174,7 @@ fn carrier_op_err(op: &str, e: &OpError) -> String {
         vocab::CODE_UNKNOWN_OP => format!(
             "{op} 得 unknown_op——守护进程代际过旧（无承载面 op），请同批升级 daemon 后重试{extra}"
         ),
-        _ => format!("{op} 失败：{}", op_err_text_pub(e)),
+        _ => format!("{op} 失败：{}", op_err_text(e)),
     }
 }
 
@@ -275,7 +275,7 @@ fn forward_add(args: &[String]) {
         Ok(v) => v,
         Err(e) => exit_carrier_op("host.list", &e),
     };
-    let id = match resolve_host_pub(&briefs, host_ref.trim()) {
+    let id = match resolve_host(&briefs, host_ref.trim()) {
         Ok(id) => id,
         Err(e) => {
             eprintln!("homeway: {e}");
@@ -405,7 +405,7 @@ fn forward_list(args: &[String]) {
             Ok(v) => v,
             Err(e) => exit_carrier_op("host.list", &e),
         };
-        let id = match resolve_host_pub(&briefs, host_ref) {
+        let id = match resolve_host(&briefs, host_ref) {
             Ok(id) => id,
             Err(e) => {
                 eprintln!("homeway: {e}");
@@ -491,7 +491,7 @@ fn forward_delete(args: &[String]) {
         Ok(v) => v,
         Err(e) => exit_carrier_op("host.list", &e),
     };
-    let id = match resolve_host_pub(&briefs, host_ref.trim()) {
+    let id = match resolve_host(&briefs, host_ref.trim()) {
         Ok(id) => id,
         Err(e) => {
             eprintln!("homeway: {e}");
@@ -589,7 +589,7 @@ fn socks_on(args: &[String]) {
         Ok(v) => v,
         Err(e) => exit_carrier_op("host.list", &e),
     };
-    let id = match resolve_host_pub(&briefs, host_ref.trim()) {
+    let id = match resolve_host(&briefs, host_ref.trim()) {
         Ok(id) => id,
         Err(e) => {
             eprintln!("homeway: {e}");
@@ -656,7 +656,7 @@ fn socks_off(args: &[String]) {
         Ok(v) => v,
         Err(e) => exit_carrier_op("host.list", &e),
     };
-    let id = match resolve_host_pub(&briefs, host_ref.trim()) {
+    let id = match resolve_host(&briefs, host_ref.trim()) {
         Ok(id) => id,
         Err(e) => {
             eprintln!("homeway: {e}");
@@ -856,7 +856,7 @@ pub fn cmd_speedtest_hosted(args: &[String]) {
                 Ok(v) => v,
                 Err(e) => exit_carrier_op("host.list", &e),
             };
-            let id = match resolve_host_pub(&briefs, r) {
+            let id = match resolve_host(&briefs, r) {
                 Ok(id) => id,
                 Err(e) => {
                     eprintln!("homeway: {e}");
@@ -1099,7 +1099,7 @@ fn run_speed_host(
                         hex: id.to_owned(),
                         ok: false,
                         reason: "control_error".to_owned(),
-                        msg: format!("status 连续 {fail_streak} 次失败：{}", op_err_text_pub(&e)),
+                        msg: format!("status 连续 {fail_streak} 次失败：{}", op_err_text(&e)),
                         down_bps: 0.0,
                         up_bps: 0.0,
                         usage_down: 0,
@@ -1114,19 +1114,20 @@ fn run_speed_host(
             }
         };
         fail_streak = 0;
+        // Map 索引对缺键 panic（Value 索引才回落 Null）——omitempty 的键一律 get。
         if let Some(r) = st["result"].as_object() {
-            let ok = r["ok"].as_bool().unwrap_or(false);
+            let g = |k: &str| r.get(k).cloned().unwrap_or(serde_json::Value::Null);
             return Ok(SpeedHostResult {
                 name: name.to_owned(),
                 hex: id.to_owned(),
-                ok,
-                reason: r["reason"].as_str().unwrap_or("").to_owned(),
-                msg: r["msg"].as_str().unwrap_or("").to_owned(),
-                down_bps: r["downBps"].as_f64().unwrap_or(0.0),
-                up_bps: r["upBps"].as_f64().unwrap_or(0.0),
-                usage_down: r["usageDown"].as_i64().unwrap_or(0),
-                usage_up: r["usageUp"].as_i64().unwrap_or(0),
-                wall_ms: r["wallMs"].as_i64().unwrap_or(0),
+                ok: g("ok").as_bool().unwrap_or(false),
+                reason: g("reason").as_str().unwrap_or("").to_owned(),
+                msg: g("msg").as_str().unwrap_or("").to_owned(),
+                down_bps: g("downBps").as_f64().unwrap_or(0.0),
+                up_bps: g("upBps").as_f64().unwrap_or(0.0),
+                usage_down: g("usageDown").as_i64().unwrap_or(0),
+                usage_up: g("usageUp").as_i64().unwrap_or(0),
+                wall_ms: g("wallMs").as_i64().unwrap_or(0),
                 via,
                 rtt_ms: rtt,
             });

@@ -24,13 +24,9 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// spec 的 ≤3.5s MUST 约束的是服务端**探测**预算，不是 CLI 请求预算）。
 const HOST_ADD_TIMEOUT: Duration = Duration::from_secs(20);
 
-/// 控制面错误 → 人类可读文案（码不进契约，文案按码分支——Go host_cli 同纪律）。
-fn op_err_text(e: &OpError) -> String {
-    op_err_text_pub(e)
-}
-
-/// 上面的 crate 内公开面（term/files `--host` 远程模式共用同一文案）。
-pub fn op_err_text_pub(e: &OpError) -> String {
+/// 控制面错误 → 人类可读文案（码不进契约，文案按码分支——Go host_cli 同纪律；
+/// term/files `--host` 远程模式共用同一文案——r2-17 收敛：单一定义）。
+pub fn op_err_text(e: &OpError) -> String {
     let extra = {
         let d = e.detail();
         if d.is_empty() { String::new() } else { format!("：{d}") }
@@ -419,14 +415,9 @@ fn parse_args(usage: &str, args: &[String]) -> ParsedArgs {
 }
 
 /// 主机寻址（Go resolveHostTarget 同义：空串拒绝、名称/唯一前缀、歧义列候选、
-/// 全长 64 hex 直用——CLI-2 整改：`starts_with("")` 恒真曾可静默删第一台）。
-fn resolve_host(briefs: &serde_json::Value, want: &str) -> Result<String, String> {
-    resolve_host_pub(briefs, want)
-}
-
-/// 上面的 crate 内公开面（term/files `--host` 寻址与 host delete 同规则同文案——
-/// Go「--host 寻址统一」退出口判据）。
-pub fn resolve_host_pub(briefs: &serde_json::Value, want: &str) -> Result<String, String> {
+/// 全长 64 hex 直用——CLI-2 整改：`starts_with("")` 恒真曾可静默删第一台；
+/// term/files `--host` 与 host delete 同规则同文案——r2-17 收敛：单一定义）。
+pub fn resolve_host(briefs: &serde_json::Value, want: &str) -> Result<String, String> {
     if want.is_empty() {
         return Err("寻址串为空（给 name、id 前缀或全长 id）".to_owned());
     }

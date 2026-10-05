@@ -104,29 +104,30 @@ pub fn resolve_over_conn(
     framed.extend_from_slice(&q);
     conn.write_chunk(&framed)
         .map_err(|e| DnsErr::Io(format!("发查询失败：{e}")))?;
-    // 读：2B 长度前缀 + 应答（读预算 = budget；StreamConn 阻塞读无原生超时——
-    // 预算由消费方的拨号/连接生命周期面兜底，此处只按帧长收齐）。
-    let head = read_exact(conn, 2).map_err(|e| DnsErr::Io(format!("读应答失败：{e}")))?;
-    let n = u16::from_be_bytes([head[0], head[1]]) as usize;
+    let _ = budget; // 读预算由消费方的连接生命周期面兜底（StreamConn 阻塞读无原生超时）
+    // 读：2B 长度前缀 + 应答（**带缓冲拼装**：TCP 块边界 ≠ 帧边界——2B 前缀读块
+    // 越界时余量必须留在缓冲里，丢字节会让帧读错位死等）。
+    let mut buf: Vec<u8> = Vec::with_capacity(512);
+    while buf.len() < 2 {
+        let chunk = conn.read_chunk().map_err(|e| DnsErr::Io(format!("读应答失败：{e}")))?;
+        if chunk.is_empty() {
+            return Err(DnsErr::Io("连接在帧中途关闭".to_owned()));
+        }
+        buf.extend_from_slice(&chunk);
+    }
+    let n = u16::from_be_bytes([buf[0], buf[1]]) as usize;
     if !(12..=65535).contains(&n) {
         return Err(DnsErr::Io(format!("应答长度非法：{n}")));
     }
-    let resp = read_exact(conn, n).map_err(|e| DnsErr::Io(format!("读应答失败：{e}")))?;
-    let _ = budget;
-    parse_a_response(&resp, txid)
-}
-
-/// 读恰好 n 字节（跨块拼装；EOF/错误 = Err）。
-fn read_exact(conn: &dyn StreamConn, n: usize) -> Result<Vec<u8>, String> {
-    let mut out = Vec::with_capacity(n);
-    while out.len() < n {
-        let chunk = conn.read_chunk().map_err(|e| e.to_string())?;
+    while buf.len() - 2 < n {
+        let chunk = conn.read_chunk().map_err(|e| DnsErr::Io(format!("读应答失败：{e}")))?;
         if chunk.is_empty() {
-            return Err("连接在帧中途关闭".to_owned());
+            return Err(DnsErr::Io("连接在帧中途关闭".to_owned()));
         }
-        out.extend_from_slice(&chunk);
+        buf.extend_from_slice(&chunk);
     }
-    Ok(out)
+    let resp = buf[2..2 + n].to_vec();
+    parse_a_response(&resp, txid)
 }
 
 /// 解析 A 查询应答：ID 校验 → RCODE 分流（3 = NXDOMAIN）→ 答案段依序抽取 A 记录
@@ -229,6 +230,55 @@ mod tests {
         assert!(a_query("").is_err());
         assert!(a_query("a..b").is_err());
         assert!(a_query(&"a".repeat(64)).is_err());
+    }
+
+    /// 跨块读：2B 前缀与应答体任意切块都能拼装（真实现测抓出的丢字节 bug 的
+    /// 回归钉——旧实现在前缀读越界时丢弃余量，帧读错位死等）。
+    #[test]
+    fn resolve_over_conn_with_arbitrary_chunking() {
+        use super::super::testutil::TcpIo;
+        use crate::daemon::StreamConn;
+        // 模拟出口代答：读 2B 前缀帧 → 回一条单 A 应答。
+        let ln = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = ln.local_addr().unwrap();
+        let h = std::thread::spawn(move || {
+            let (c, _) = ln.accept().unwrap();
+            let mut srv_io = TcpIo::new(c);
+            let mut buf = Vec::new();
+            while buf.len() < 2 {
+                match srv_io.read_chunk().unwrap() {
+                    v if v.is_empty() => panic!("查询中途 EOF"),
+                    v => buf.extend_from_slice(&v),
+                }
+            }
+            let n = u16::from_be_bytes([buf[0], buf[1]]) as usize;
+            while buf.len() - 2 < n {
+                buf.extend_from_slice(&srv_io.read_chunk().unwrap());
+            }
+            let q = buf[2..2 + n].to_vec();
+            // 应答：单 A 10.1.2.3（事务 ID 回显查询的）。
+            let mut r = vec![0u8; 12];
+            r[0..2].copy_from_slice(&q[0..2]);
+            r[2] = 0x80;
+            r[3] = 0x00;
+            r[6..8].copy_from_slice(&1u16.to_be_bytes());
+            r.extend_from_slice(b"\x04test\x03com\x00\x00\x01\x00\x01");
+            r.extend_from_slice(b"\xc0\x0c\x00\x01\x00\x01");
+            r.extend_from_slice(&60u32.to_be_bytes());
+            r.extend_from_slice(&4u16.to_be_bytes());
+            r.extend_from_slice(&[10, 1, 2, 3]);
+            let mut framed = (r.len() as u16).to_be_bytes().to_vec();
+            framed.extend_from_slice(&r);
+            srv_io.write_chunk(&framed).unwrap();
+            srv_io.close();
+        });
+        let c = std::net::TcpStream::connect(addr).unwrap();
+        let io = TcpIo::new(c);
+        let res = resolve_over_conn(&io, "test.com", Duration::from_secs(3)).unwrap();
+        assert_eq!(res.addrs, vec!["10.1.2.3".parse::<std::net::Ipv4Addr>().unwrap()]);
+        assert_eq!(res.ttl_min, 60);
+        io.close();
+        let _ = h.join();
     }
 
     /// 应答解析：多 A 按序 / NXDOMAIN / 无 A / 串答（Go client_test 同形对拍）。

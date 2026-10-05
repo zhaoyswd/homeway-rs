@@ -393,6 +393,18 @@ run_link() {
     relay_segment "$link" "$E" "$C" "$R"
   fi
 
+  # B0-2a 中-5 半边（D-1 收口）：Rust 出口的 debug.log 落盘硬门——非 verbose 起
+  # 的出口也要能 grep 到 peer/intercept 判据行（生产可观测性路径的证明；Go 出口
+  # 的落盘形态不同〔verbose 才落 debug〕，本门只对 Rust 出口生效）。
+  if [[ "$E" == "rust" ]]; then
+    local dbg="$st/exit/cache/debug.log"
+    if [[ -f "$dbg" ]] && grep -qam1 'peer: +\|intercept: tcp' "$dbg"; then
+      record "$link" DBG-log "PASS" "$(grep -am1 'peer: +\|intercept: tcp' "$dbg" | cut -c1-90)"
+    else
+      record "$link" DBG-log "FAIL" "Rust 出口 debug.log 无 peer/intercept 判据行（非 verbose 落盘路径未证）"
+    fi
+  fi
+
   # 低-4（第二道门）：有 FAIL 行时 TOTAL 记 FAIL——「TOTAL PASS 与 FAIL 并存」误导
   local any_fail_total=0
   for row in "${TABLE_ROWS[@]}"; do

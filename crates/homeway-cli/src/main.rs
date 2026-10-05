@@ -32,6 +32,12 @@ pub(crate) fn cli_version() -> &'static str {
 }
 
 fn main() {
+    // 低-8（B0-2a 登记→D-1 收口）：SIGPIPE 恢复默认处置——Go 运行时同语义（fd1/2
+    // 写断管 = 进程静默退出）；Rust 默认忽略 SIGPIPE 会把 println! 变成 panic 链
+    //（`homeway-cli … | head` 形态）。恢复默认后全仓 println 面无需逐处改写。
+    unsafe {
+        libc::signal(libc::SIGPIPE, libc::SIG_DFL);
+    }
     let args: Vec<String> = std::env::args().collect();
     // 零参/仅全局 flag形态 = 统一进程（Go `homeway` 零参同义——B0-1 部署最小面）
     let first_is_flag = args.get(1).map(|a| a.starts_with('-')).unwrap_or(false);
@@ -700,19 +706,12 @@ fn cmd_files(args: &[String]) {
         }
         i += 1;
     }
-    let Some(tok) = tok else {
+    if tok.is_none() && host_ref.is_none() {
         eprintln!("用法：homeway-cli files <list|stat|mkdir|read|get|put|download|upload> --token <hmw1> [--identity-dir D] [--rate-limit B/s（缺省 2MiB/s；0 不限）] <远端路径> [<本地路径>]");
         eprintln!("  远程形态：homeway-cli files <verb> --host <ref> [--state D] [--timeout T] <远端路径> [<本地路径>]（经控制面 stream.open 转发——D-1）");
         eprintln!("  get <远端> [-o 本地] [--force]（目标缺省 = basename，已存在默认拒）；put <本地> <远端>——Go 契约参数序，与 download/upload（<远端> [<本地>]）不同");
         std::process::exit(2);
-    };
-    let mut t = match token::decode(&tok) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("token 解析失败：{e}");
-            std::process::exit(1);
-        }
-    };
+    }
     let verb = rest.first().cloned().unwrap_or_default();
     // ---- 动词感知解析（dsh r1 高-1 整改）：get/put 是 Go 契约形态，参数序/flag 面
     // 与 download/upload（<远端> [<本地>]）**不同**——按动词分别解析，别混用：
@@ -836,14 +835,6 @@ fn cmd_files(args: &[String]) {
             std::process::exit(2);
         }
     };
-    if dead_direct {
-        for e in &mut t.endpoints {
-            if e.kind == token::EndpointKind::Direct {
-                e.addr = "127.0.0.1:1".to_owned();
-            }
-        }
-        println!("inject: token 直连端点已改指死端口（127.0.0.1:1）——只有中继可达");
-    }
     if let Some(host_ref) = host_ref {
         cmd_files_remote(
             &host_ref,
@@ -858,6 +849,25 @@ fn cmd_files(args: &[String]) {
             },
         );
         return;
+    }
+    let Some(tok) = tok else {
+        eprintln!("homeway: files 需要 --token <hmw1> 或 --host <ref>（远程形态）");
+        std::process::exit(2);
+    };
+    let mut t = match token::decode(&tok) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("token 解析失败：{e}");
+            std::process::exit(1);
+        }
+    };
+    if dead_direct {
+        for e in &mut t.endpoints {
+            if e.kind == token::EndpointKind::Direct {
+                e.addr = "127.0.0.1:1".to_owned();
+            }
+        }
+        println!("inject: token 直连端点已改指死端口（127.0.0.1:1）——只有中继可达");
     }
     let _session_lock = (!no_session_lock).then(|| session_lock_or_exit(&identity_dir, "files"));
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
@@ -977,11 +987,11 @@ fn cmd_files_remote(host_ref: &str, a: FilesRemoteArgs) {
     let briefs = match c.request(vocab::OpName::HostList.as_str(), None, timeout) {
         Ok(v) => v,
         Err(e) => {
-            eprintln!("homeway: host.list 失败：{}", daemon_cli::op_err_text_pub(&e));
+            eprintln!("homeway: host.list 失败：{}", daemon_cli::op_err_text(&e));
             std::process::exit(1);
         }
     };
-    let id = match daemon_cli::resolve_host_pub(&briefs, ref_trim) {
+    let id = match daemon_cli::resolve_host(&briefs, ref_trim) {
         Ok(id) => id,
         Err(e) => {
             eprintln!("homeway: {e}");

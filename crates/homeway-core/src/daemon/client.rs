@@ -119,6 +119,10 @@ impl ClientStream {
         let mut q = self.recv.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(v) = q.items.pop_front() {
+                drop(q);
+                // r2-B（D-1 收口）：出队即唤醒满槽生产者（blocking_push 的 200ms 轮询
+                // 节拍消除——慢消费者排空一格，生产者立刻能推）。
+                self.recv_cv.notify_all();
                 return Some(v);
             }
             if q.closed || self.end_reason().is_some() {
@@ -142,6 +146,8 @@ impl ClientStream {
         let mut q = self.recv.lock().unwrap_or_else(|e| e.into_inner());
         loop {
             if let Some(v) = q.items.pop_front() {
+                drop(q);
+                self.recv_cv.notify_all(); // r2-B：出队即唤醒满槽生产者
                 return Some(v);
             }
             if q.closed || self.end_reason().is_some() {
