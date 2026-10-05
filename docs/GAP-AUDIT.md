@@ -33,6 +33,11 @@
 >
 > **2026-10-05 B0-1 批处置**：P0-2/P0-3/P1-2 已修清；P0-1 部署最小面完成（统一进程期望态装配，
 > 剩余 daemon 控制面/client 角色/CLI 族归 B0-2）。真网证据 = `INTEROP-CRITERIA.md` B0-1 两节。
+>
+> **2026-10-05 B 批换装后生产基线变更**：两台生产出口已换装 homeway-rs **v0.2.0**（Mac launchd +
+> 阿里云双角色，`docs/DEPLOY-RUST-EXIT.md` 全记录）——本审计的「生产部署」判定基线自此按 Rust
+> 形态；P1-1（serve 面文件日志体系）在生产的影响面 = dlogf 无落盘（peer/dns/dialok 判据行生产
+> 不可见）+ events 无轮转，优先级维持 C 批不变。
 
 ### P0（4 项）
 

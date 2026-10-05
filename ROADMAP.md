@@ -68,6 +68,17 @@ events 最小集/SIGTERM 收尾/client-control 留桩）。真网验证：两生
 剩余归 B0-2：daemon 控制面/client 角色/CLI 族（GAP-AUDIT P0-1 后半）。手机核换装过
 e1fbd181309d-rust（含客户端双栈）并已切回现役出口常态。
 
+**B 批两台生产主机换装 Rust 出口（2026-10-05 完成，`docs/DEPLOY-RUST-EXIT.md` 全记录）**：
+发版 **v0.2.0**（tag = `b1f1410`，前置修 cb64fce CI 双红：pin 测试 linux 负例分平台 + term runner
+flake 登记）→ **Mac 出口**（launchd 指向 `~/bin/homeway-rs --state ~/.config/homeway-rs`，端口 41641
+沿用，v4/v6 双公布，新身份新 token 手机重贴，L3/files 10MB sha256 一致/term 真执行/speedtest 53↓/303↑Mbps
+全判据）→ **阿里云出口**（双角色 serve 41641 + relay 41741，中继 ID df7664188129，Mac 出口经公网
+注册成功互证 `中继：后端 d07c57dd5bde1fa7 注册成功`，手机直连 v4 公网 85↓/95↑Mbps）→ Go 停删
+（进程停 + 指向换 + 活体二进制删〔字节同 .bak-go-prerust〕，state/备份全留）。已知注记：UPnP
+launchd 本地网络隐私（同 Go v0.14.0 事件）、P1-1 生产无 debug 落盘（peer/dns/dialok 判据行不可见，
+B0-2 轮转批）。⚠️ **tier 仓 AGENTS.md/exits.md 出口表仍描述 Go 形态**（tier 文档触点归 R8 收官批
+用户触点，未动）。
+
 **下一步（当前指针）**：**B0-2**（GAP-AUDIT P0-1 剩余：daemon 控制面/client 角色/CLI 族/supervisor 退避/events 轮转——B0-1 已清部署最小面，见下方 B0-1 段）→ **R8 收官批**（技术修复项已全清——R8-3 完成，2026-10-05：
 8i 出口发送整形实装 + 8j 真机矩阵复测 + 8k 尾账五项全清 + 8l 评审收口；判据链与
 消融数据 = `docs/reviews/R8.md` §十 + `docs/PERF-AB.md` §9.7-bis/§9.9）。
