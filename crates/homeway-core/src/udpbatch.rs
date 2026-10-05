@@ -82,13 +82,13 @@ fn send_mmsg(fd: RawFd, msgs: &[OutMsg<'_>]) -> (usize, Option<(SocketAddr, io::
             hdrs[i].msg_hdr.msg_iov = &mut iovs[i] as *mut _ as *mut libc::iovec;
             hdrs[i].msg_hdr.msg_iovlen = 1;
         }
-        // 评审 r1-补3 的 Linux 真跑兑现时抓到：sendmmsg 的 flags 形参类型两面不同
-        // （glibc/musl = c_int，OHOS libc 面 = c_uint）——R8-1 只在 OHOS 面编译验证
-        // 过，桌面/服务器 Linux（gnu）一直编不过。按 target_env 分面 cast（OHOS
-        // 三段名的 env 段 = "ohos"，target_os 两面都是 "linux"）。
-        #[cfg(target_env = "ohos")]
+        // 评审 r1-补3 的 Linux 真跑兑现时抓到：sendmmsg 的 flags 形参类型按 libc 面
+        // 不同（glibc = c_int；musl 系 = c_uint——musl 与 OHOS 同族；原注释把 musl
+        // 归到 c_int 面是错的，转正 A 批 musl 交叉构建实测抓出）——按 target_env 分面
+        // cast（OHOS 三段名的 env 段 = "ohos"，target_os 两面都是 "linux"）。
+        #[cfg(any(target_env = "ohos", target_env = "musl"))]
         let flags = libc::MSG_DONTWAIT as libc::c_uint;
-        #[cfg(not(target_env = "ohos"))]
+        #[cfg(not(any(target_env = "ohos", target_env = "musl")))]
         let flags = libc::MSG_DONTWAIT as libc::c_int;
         let r = unsafe { libc::sendmmsg(fd, hdrs.as_mut_ptr(), n as libc::c_uint, flags) };
         if r < 0 {

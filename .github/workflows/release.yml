@@ -1,0 +1,92 @@
+name: release
+
+# 发版 = 推 tag：`git tag v0.x.y && git push origin v0.x.y`（triple-check 纪律：
+# 改版本→commit→推 main→打 tag 在 main 头上→推 tag；tag 纪律门在 build 前拦截错位 tag）。
+# 产物 = homeway-cli 四目标二进制（strip + tar.gz + SHA256SUMS）：
+#   - darwin-arm64/amd64：macos-latest（arm64）原生 + x86_64-apple-darwin 交叉
+#     （纯 Rust 依赖面，Xcode CLT 链接一次过——本机已实测同配方）。
+#   - linux-amd64/arm64：ubuntu-latest 上 musl 静态（x86_64 原生 + aarch64 交叉，
+#     musl 目标自带 self-contained CRT，纯 Rust 无 C 依赖不需 musl-gcc）。
+#     `file` 核验 statically linked + 可执行目标上 `--version` 烟囱。
+# 版本注入：HOMEWAY_CLI_VERSION=<tag>（option_env! 编译期注入，与核面
+# HOMEWAY_CORE_VERSION 同机制；本地直构建回落 "(devel)"）。
+# push main 不触发本 workflow（触发只有 v* tag 与 workflow_dispatch）——
+# CI/工作流自身改动后可先 workflow_dispatch 手动试跑（构建不发 Release）。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, target: aarch64-apple-darwin, name: darwin-arm64, smoke: true }
+          - { os: macos-latest, target: x86_64-apple-darwin, name: darwin-amd64, smoke: false }
+          - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, name: linux-amd64, smoke: true }
+          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, name: linux-arm64, smoke: false }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      # 发版纪律门（对齐 homeway Go 版 FIX-100）：tag 必须打在 origin/main 头上——
+      # 错位 tag 产物与 main 不符且事后难对齐；非 tag 触发（workflow_dispatch）跳过。
+      - name: 发版纪律门：tag == origin/main 头
+        if: startsWith(github.ref, 'refs/tags/v')
+        run: |
+          set -euo pipefail
+          git fetch --depth=1 origin main
+          main="$(git rev-parse origin/main)"
+          head="$(git rev-parse HEAD)"
+          if [ "$main" != "$head" ]; then
+            echo "error: tag $GITHUB_REF_NAME 指向 $head，而 origin/main 当前为 $main" >&2
+            echo "发版纪律：先把要发的提交合入并推 main，再打 tag" >&2
+            exit 1
+          fi
+          echo "ok: tag 指向 origin/main 头（$head）"
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: rustup target add ${{ matrix.target }}
+      - name: 构建（版本注入 HOMEWAY_CLI_VERSION）
+        run: cargo build --release --target ${{ matrix.target }} --locked -p homeway-cli
+        env:
+          HOMEWAY_CLI_VERSION: ${{ github.ref_name }}
+      - run: strip target/${{ matrix.target }}/release/homeway-cli
+      - name: 静态核验（musl 面必须 statically linked）
+        if: endsWith(matrix.target, '-musl')
+        run: file target/${{ matrix.target }}/release/homeway-cli | grep -w 'statically linked'
+      - name: 版本烟囱（可本机执行的目标上跑 --version）
+        if: matrix.smoke && startsWith(github.ref, 'refs/tags/v')
+        run: target/${{ matrix.target }}/release/homeway-cli --version | grep -F "$GITHUB_REF_NAME"
+      - name: 打包 tar.gz
+        run: |
+          set -euo pipefail
+          cd "target/${{ matrix.target }}/release"
+          tar czf "$GITHUB_WORKSPACE/homeway-cli-${GITHUB_REF_NAME:-manual}-${{ matrix.name }}.tar.gz" homeway-cli
+      - uses: actions/upload-artifact@v4
+        with:
+          name: homeway-cli-${{ matrix.name }}
+          path: homeway-cli-*.tar.gz
+          if-no-files-found: error
+
+  release:
+    needs: build
+    if: startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          merge-multiple: true
+      - name: SHA256SUMS
+        run: shasum -a 256 homeway-cli-*.tar.gz | tee SHA256SUMS
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            homeway-cli-*.tar.gz
+            SHA256SUMS
+          generate_release_notes: true

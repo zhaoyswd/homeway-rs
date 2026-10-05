@@ -6,7 +6,12 @@
 
 ## 硬规则（违反就出事）
 
-1. **只本地，不推远端**：不 push、不建 GitHub 仓（用户显式点头前）。
+1. **远端 = `github.com/zhaoyswd/homeway-rs`（公开仓，2026-10-05 用户建仓并授权推送——
+   转正 A 批；推送前敏感扫描存档见 `docs/PUSH-PRECHECK.md`）**。CI = `.github/workflows/ci.yml`
+   （push/PR：test 双 runner + clippy + OHOS/musl 交叉 check）；发版 = 推 `v*` tag 触发
+   `release.yml`（四目标产物 + tag 纪律门 + SHA256SUMS）。**推 tag / 发 Release / 建 PR
+   仍需用户明确指令**；日常 main 直推照旧。本地-only 门（基线/向量/词表/矩阵冒烟）走
+   `tools/ci-local.sh`，不在公开 CI 复刻（依赖私有 baseline/）。
 2. **两仓只读**：`~/Documents/projects/homeway` 与 `~/Documents/projects/tier` 的跟踪文件一律
    不改；Go 侧源码/构建/测试向量只从 `baseline/homeway` 快照克隆走（见 ROADMAP 隔离条款）。
    发版会话收官信号由用户给出，在那之前不进 R7。

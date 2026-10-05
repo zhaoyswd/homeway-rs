@@ -1,0 +1,57 @@
+name: ci
+
+# 公开仓 CI（转正 A 批）。语义对齐本地七步门 tools/ci-local.sh 的可公开子集：
+#   - clippy -D warnings（linux runner——sendmmsg 等平台分支在 linux 面编译才覆盖）
+#   - cargo test --workspace（ubuntu + macOS 双面）
+#   - 交叉 check：aarch64-unknown-linux-ohos（鸿蒙核面，纯 check 无需 NDK——
+#     .cargo/config.toml 的 OHOS linker 只在链接期生效）+ musl 双架构（发版产物面）
+# 本地-only 的门（基线克隆/向量确定性/词表三方/矩阵冒烟）依赖私有 baseline/ 与
+# bin/homeway-go，不在公开 CI 复刻——这些门仍走 tools/ci-local.sh（发版前本地跑）。
+# cargo fmt 未启用：仓内无 rustfmt 配置、现有排版非 fmt-clean，本批不整仓重排。
+# fuzz 独立 workspace（nightly + cargo-fuzz），不在 cargo test --workspace 内。
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  test:
+    name: test（${{ matrix.runner }}）
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --workspace --locked
+
+  clippy:
+    name: clippy -D warnings（linux 面）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy --workspace --all-targets --locked -- -D warnings
+
+  cross-check:
+    name: check ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        target:
+          - aarch64-unknown-linux-ohos
+          - x86_64-unknown-linux-musl
+          - aarch64-unknown-linux-musl
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+      - run: rustup target add ${{ matrix.target }}
+      - run: cargo check --target ${{ matrix.target }} --locked -p homeway-core -p homeway-cli -p homeway-capi

@@ -20,9 +20,19 @@ use homeway_core::wgcore::ConnErr;
 mod relay_cli;
 mod serve_cli;
 
+/// 版本串（构建方注入：release 流水线 `HOMEWAY_CLI_VERSION=<tag>`——与核面
+/// `HOMEWAY_CORE_VERSION`（facade::ClientCore::version）同机制；本地直构建回落
+/// devel 形态。发版烟囱判据 = `homeway-cli --version` 能 grep 到 tag）。
+fn cli_version() -> &'static str {
+    option_env!("HOMEWAY_CLI_VERSION").unwrap_or("(devel)")
+}
+
 fn main() {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(String::as_str) {
+        Some("--version") | Some("version") => {
+            println!("homeway-cli {}", cli_version());
+        }
         Some("token") => cmd_token(&args[2..]),
         Some("serve") => {
             if args.get(2).map(String::as_str) == Some("token") {
