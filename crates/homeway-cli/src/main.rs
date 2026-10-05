@@ -73,11 +73,41 @@ fn cmd_token(args: &[String]) {
     //「endpoint 路径成本」与「实现栈成本」）。
     let dead_direct = args.iter().any(|a| a == "--dead-direct");
     let loopback_only = args.iter().any(|a| a == "--loopback-only");
+    // v6-only：Direct 的 **v4** 端点改死端口（v6 保留）——压出「只有 v6 直连可达」
+    // 形态（B0-1 验证缝：v6 路径不被 LAN v4 赛跑掩盖；中继端点不动）
+    let v6_only = args.iter().any(|a| a == "--v6-only");
     let input = args.iter().find(|a| !a.starts_with("--")).cloned();
     let Some(s) = input else {
-        eprintln!("用法：homeway-cli token <hmw1…> [--dead-direct] [--loopback-only]");
+        eprintln!("用法：homeway-cli token <hmw1…> [--dead-direct] [--loopback-only] [--v6-only]");
         std::process::exit(2);
     };
+    if v6_only {
+        let mut t = match token::decode(&s) {
+            Ok(t) => t,
+            Err(e) => {
+                eprintln!("解析失败：{e}");
+                std::process::exit(1);
+            }
+        };
+        for e in &mut t.endpoints {
+            if e.kind == token::EndpointKind::Direct && e.addr.parse::<std::net::SocketAddr>().is_ok_and(|a| a.is_ipv4()) {
+                e.addr = "127.0.0.1:1".to_owned();
+            }
+        }
+        let eps: Vec<token::EndpointRef<'_>> =
+            t.endpoints.iter().map(|e| token::EndpointRef::new(&e.addr, e.kind)).collect();
+        let spec = token::TokenSpec { peer_id: &t.peer_id, secret: &t.secret, endpoints: &eps };
+        match token::encode(&spec) {
+            Ok(out) => {
+                println!("{out}");
+                return;
+            }
+            Err(e) => {
+                eprintln!("重编码失败：{e}");
+                std::process::exit(1);
+            }
+        }
+    }
     if dead_direct || loopback_only {
         let mut t = match token::decode(&s) {
             Ok(t) => t,

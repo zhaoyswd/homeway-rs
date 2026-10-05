@@ -14,9 +14,11 @@
 //! （%v）—— 本轮不绑，走系统默认路由`。
 //!
 //! **探针目标注入缝**：`HOMEWAY_BINDWATCH_PROBE=<ip:port[,…]>`（诊断缝，与
-//! HOMEWAY_WG_DEBUG 同惯例）把健康探针/挑卡目标临时指向死地址（如 TEST-NET
-//! `203.0.113.1:53`）——真机上模拟「拔线」形态采看护判据行（Go 用单测注入
-//! BindWatchOpts.Probe；Rust 单测走 WatchDeps trait，真机走此环境变量）。
+//! HOMEWAY_WG_DEBUG 同惯例）把**健康探针**目标临时指向死地址（如 TEST-NET
+//! `203.0.113.1:53`）——真机上模拟「当前卡出网退化」采看护判据行（探针失败
+//! →连续探不通→重新挑卡）。挑卡（resolve）恒用真 anycast 目标：注入面收窄在
+//! 健康探针（挑卡同死会走到「本轮不绑」族——那族行的真网形态另由默认目标下
+//! 无网卡的环境给出，语义面单测逐字钉死）。
 
 use std::net::SocketAddrV4;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -180,9 +182,10 @@ impl WatchDeps for RealDeps {
                 .find(|i| &i.name == name)
                 .ok_or_else(|| format!("网卡 {name} 当前不可用"));
         }
+        // 挑卡恒用真目标（probe 注入只模拟健康探针退化——挑卡同死会误触「不绑」）
         let cands = egress::physical_candidates();
         let logf = Arc::clone(&self.logf);
-        egress::select_best(&cands, &self.probe_targets, Duration::from_secs(2), &move |s| {
+        egress::select_best(&cands, &[], Duration::from_secs(2), &move |s| {
             (logf)(s);
         })
         .map_err(|e| e.to_string())
@@ -227,6 +230,8 @@ impl WatchDeps for RealDeps {
 pub struct WatcherArgs {
     /// 显式网卡名（--bind-interface <网卡名>）：只按名重解析；None = auto（每轮重挑）。
     pub explicit_name: Option<String>,
+    /// 健康探针目标（诊断缝 HOMEWAY_BINDWATCH_PROBE 注入死地址 = 真机采
+    /// 「探针失败→重挑卡」判据行）。
     pub probe_targets: Vec<SocketAddrV4>,
     pub cmd_tx: Sender<EngineCmd>,
     pub pinned_flag: Arc<AtomicBool>,
