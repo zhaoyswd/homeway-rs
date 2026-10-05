@@ -29,7 +29,10 @@ jobs:
           - { os: macos-latest, target: aarch64-apple-darwin, name: darwin-arm64, smoke: true }
           - { os: macos-latest, target: x86_64-apple-darwin, name: darwin-amd64, smoke: false }
           - { os: ubuntu-latest, target: x86_64-unknown-linux-musl, name: linux-amd64, smoke: true }
-          - { os: ubuntu-latest, target: aarch64-unknown-linux-musl, name: linux-arm64, smoke: false }
+          # linux-arm64 用原生 arm64 runner（公开仓免费）：x86_64 runner 交叉**链接**
+          # aarch64-musl 时 rustc 传的 --fix-cortex-a53-843419 撞宿主 x86 ld（首跑实测；
+          # 编译面是 self-contained 的、链接面不是）。原生面顺带解锁 --version 烟囱。
+          - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, name: linux-arm64, smoke: true }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
