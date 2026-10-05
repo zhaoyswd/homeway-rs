@@ -427,6 +427,46 @@ fn server_full_roundtrip() {
     let _ = std::fs::remove_dir_all(sock.parent().unwrap());
 }
 
+/// recv_wait（无预算阻塞收）必须被**数据到达**唤醒——不是只靠流终结/超时逃生。
+/// 回归背景（B0-2b 第 2 棒实测）：blocking_push 漏 notify_all 时，远程 term 腿的
+/// 首帧要睡到流终结（15s HELLO 超时）才醒——recv_timeout 因自带超时幸免，本测试
+/// 用 recv_wait 钉住唤醒链。
+#[test]
+fn stream_recv_wait_wakes_on_data() {
+    let backend = MockBackend::new();
+    let (srv, sock, _bus, serve_h) = start_server("recvwake", backend as Arc<dyn Backend>);
+    let (c, _) = ControlClient::dial(&sock, "cli", "test").unwrap();
+    c.request("host.add", Some(json!({"token": "aaaa", "name": "mbp"})), short()).unwrap();
+    let id: String = c.request("host.list", None, short()).unwrap()["hosts"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let st = c.open_stream(vocab::STREAM_KIND_TERM, &id, short()).unwrap();
+
+    // 先挂 recv_wait（此刻队列空——线程必须在 recv_cv 上睡），再发数据。
+    let st2 = Arc::clone(&st);
+    let (tx, rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let waiter = std::thread::spawn(move || {
+        if let Some(v) = st2.recv_wait() {
+            let _ = tx.send(v);
+        }
+    });
+    std::thread::sleep(Duration::from_millis(100)); // 确保消费面已挂起
+    c.stream_send(&st, b"ping").unwrap(); // EchoConn 回声 → 下行 stream.data → blocking_push
+    let got = rx.recv_timeout(Duration::from_secs(3));
+    assert!(
+        matches!(got.as_deref(), Ok(b"ping")),
+        "recv_wait 应被数据到达唤醒（≤3s），得 {got:?}"
+    );
+    // 收尾解挂线程（流终结路径 notify——此处显式 close）。
+    c.stream_close(&st, short()).unwrap();
+    let _ = waiter.join();
+    c.close();
+    srv.shutdown();
+    let _ = serve_h.join();
+    let _ = std::fs::remove_dir_all(sock.parent().unwrap());
+}
+
 #[test]
 fn server_bad_frame_gets_goodbye_and_disconnect() {
     let (srv, sock, _bus, serve_h) = start_server("badframe", MockBackend::new());

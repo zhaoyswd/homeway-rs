@@ -83,21 +83,27 @@ impl ClientStream {
     }
 
     fn blocking_push(self: &Arc<Self>, payload: Vec<u8>) {
-        let mut q = self.recv.lock().unwrap_or_else(|e| e.into_inner());
-        loop {
-            if q.closed || self.end_reason().is_some() {
-                return;
+        {
+            let mut q = self.recv.lock().unwrap_or_else(|e| e.into_inner());
+            loop {
+                if q.closed || self.end_reason().is_some() {
+                    return;
+                }
+                if q.items.len() < STREAM_RECV_ITEMS {
+                    q.items.push_back(payload);
+                    break;
+                }
+                let (guard, _) = self
+                    .recv_cv
+                    .wait_timeout(q, Duration::from_millis(200))
+                    .unwrap_or_else(|e| e.into_inner());
+                q = guard;
             }
-            if q.items.len() < STREAM_RECV_ITEMS {
-                q.items.push_back(payload);
-                return;
-            }
-            let (guard, _) = self
-                .recv_cv
-                .wait_timeout(q, Duration::from_millis(200))
-                .unwrap_or_else(|e| e.into_inner());
-            q = guard;
         }
+        // 入队即唤醒无预算消费面（recv_wait——Go Recv 阻塞投递的同义唤醒链；
+        // 实测：漏 notify 时 term CLI 远程腿首帧睡到流终结才醒——15s 黑洞）。
+        // notify_all 不持锁调用（锁内 notify 合法但白持一段）。
+        self.recv_cv.notify_all();
     }
 
     fn unblock_recv(&self) {
