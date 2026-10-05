@@ -106,6 +106,9 @@ pub fn parse_listen(v: &str) -> Option<SocketAddr> {
 pub struct RelayProc {
     stop_w: i32,
     join: Option<std::thread::JoinHandle<()>>,
+    /// run 线程在世位（线程出口清零——panic 也清；统一进程 supervisor 的运行期
+    /// 失败判据）。
+    exited: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl RelayProc {
@@ -116,6 +119,12 @@ impl RelayProc {
             let _ = h.join();
         }
         unsafe { libc::close(self.stop_w) };
+    }
+
+    /// 在世位的共享句柄（supervisor 看护用——proc 本体留在宿主表内被 stop 消费；
+    /// false = 在跑，true = run 线程已退〔正常 stop 或失败〕）。
+    pub fn exited_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.exited)
     }
 }
 
@@ -142,6 +151,7 @@ pub fn assemble_relay(
 
     // 两级日志（终端只出 token 与端点变化；全量进 cache/relay.log）
     let log2 = Arc::new(RelayLog::open(&cache_dir, Arc::clone(&logf)));
+    let log2_run = Arc::clone(&log2); // run 线程的失败行出口（log2 本体随后移入 on_ready）
     let (secret, created) =
         rltoken::load_or_create_secret(&relay_dir).map_err(|e| format!("relay.key 管理失败（{}）：{e}", relay_dir.display()))?;
     if created {
@@ -180,17 +190,27 @@ pub fn assemble_relay(
     // 只建 pipe、不装信号 handler（统一进程形态：信号 handler 由宿主统一安装——
     // 装配期覆盖宿主 handler 会造成「relay 收工、主线程挂等」的半死窗口，评审 r1-Z5）
     let (stop_r, stop_w) = new_stop_pipe();
+    let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let exited_t = Arc::clone(&exited);
     let join = std::thread::Builder::new()
         .name("homeway-relay".into())
         .stack_size(1024 * 1024)
         .spawn(move || {
+            // 失败不再 exit（r1-M4：角色失败 = supervisor 退避重建，绝不带走统一进程）；
+            // 在世位出口清零（panic 也清）——supervisor 据此判终结。
+            struct ExitedGuard(Arc<std::sync::atomic::AtomicBool>);
+            impl Drop for ExitedGuard {
+                fn drop(&mut self) {
+                    self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+            let _guard = ExitedGuard(exited_t);
             if let Err(e) = relay.run(stop_r, on_ready) {
-                eprintln!("relay 运行失败：{e}");
-                std::process::exit(1);
+                log2_run.logf(&format!("⚠️ relay 运行失败（{e}）—— 线程收工，宿主 supervisor 决定重建"));
             }
         })
         .expect("spawn relay");
-    Ok(RelayProc { stop_w, join: Some(join) })
+    Ok(RelayProc { stop_w, join: Some(join), exited })
 }
 
 /// `homeway-cli relay [...]`：前台中继（Ctrl-C / SIGTERM 收工——确定性 closeAll）。

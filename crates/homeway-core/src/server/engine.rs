@@ -146,6 +146,8 @@ pub const UDPCAP_SEEN: u8 = 1 << 4;
 pub struct ServeEngine {
     cmd_tx: Sender<EngineCmd>,
     driver: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// 驱动线程在世位（线程出口清零——panic 也清：supervisor 的存活判据）。
+    driver_alive: Arc<AtomicBool>,
     pub local_port: u16,
     stop_flags: Vec<Arc<AtomicBool>>,
     term_srv: Option<Arc<crate::term::service::TermService>>,
@@ -510,6 +512,8 @@ impl ServeEngine {
         }
 
         // ---- 驱动线程 ----
+        let driver_alive = Arc::new(AtomicBool::new(true));
+        let driver_alive_ctor = Arc::clone(&driver_alive); // 构造面（spawn 外）与线程体守卫各持一份
         let driver = std::thread::Builder::new()
             .name("homeway-serve-drv".into())
             .stack_size(1024 * 1024)
@@ -526,6 +530,16 @@ impl ServeEngine {
                 let itc_stats = Arc::clone(&itc_stats);
                 let pub_kick_tx = pub_kick_tx.clone();
                 move || {
+                    // 在世守卫：线程体任何出口（含 panic 展开）都清零——supervisor 据此
+                    // 判角色终结（守卫必须活在闭包体内——外层 spawn 参数块在闭包构造
+                    // 后即退出，放那里 = 装配完成即误报死亡）。
+                    struct AliveGuard(Arc<AtomicBool>);
+                    impl Drop for AliveGuard {
+                        fn drop(&mut self) {
+                            self.0.store(false, Ordering::SeqCst);
+                        }
+                    }
+                    let _alive_guard = AliveGuard(Arc::clone(&driver_alive));
                     driver_loop(
                         cfg, bind, &mut device, &mut table, &mut intercept, dns.as_ref(), &st,
                         &revoked_set, cmd_rx, &dlogf, &itc_stats, pub_kick_tx,
@@ -672,6 +686,7 @@ impl ServeEngine {
         Ok(Arc::new(Self {
             cmd_tx,
             driver: Mutex::new(Some(driver)),
+            driver_alive: driver_alive_ctor,
             local_port,
             stop_flags,
             term_srv,
@@ -721,6 +736,12 @@ impl ServeEngine {
     /// 公网端点立即重测（换网事件）。
     pub fn kick_public_endpoint(&self) {
         let _ = self.cmd_tx.send(EngineCmd::KickPublicEndpoint);
+    }
+
+    /// 驱动线程在世位（false = 已停——正常 shutdown 或异常终结；统一进程 supervisor
+    /// 的运行期失败判据）。
+    pub fn alive(&self) -> bool {
+        self.driver_alive.load(Ordering::SeqCst)
     }
 
 }

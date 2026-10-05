@@ -21,6 +21,7 @@
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 
 use homeway_core::daemon::proto::{
@@ -44,7 +45,7 @@ pub fn default_state_dir() -> PathBuf {
 /// config.toml 全键面（serve/relay 双节，deny_unknown——typo 保护；与 serve_cli/
 /// relay_cli 的分节 schema 同表）。Serialize 面 = serve/relay start/stop 写回
 /// 期望态（enabled 位）——手编注释会丢（Go nodeconfig.Write 同形态）。
-#[derive(serde::Deserialize, serde::Serialize, Default)]
+#[derive(serde::Deserialize, serde::Serialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)] // 键表完整性守卫（消费经 assemble_serve_cfg 走 serve_cli 的同表解析）
 struct FileServe {
@@ -77,7 +78,7 @@ struct FileServe {
     ddns: Option<Vec<FileDdns>>,
 }
 
-#[derive(serde::Deserialize, serde::Serialize, Default)]
+#[derive(serde::Deserialize, serde::Serialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 #[allow(dead_code)]
 struct FileDdns {
@@ -89,7 +90,7 @@ fn default_enabled_true() -> bool {
     true
 }
 
-#[derive(serde::Deserialize, serde::Serialize, Default)]
+#[derive(serde::Deserialize, serde::Serialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 struct FileRelay {
     #[serde(default)]
@@ -100,7 +101,7 @@ struct FileRelay {
     advertise: Option<String>,
 }
 
-#[derive(serde::Deserialize, serde::Serialize, Default)]
+#[derive(serde::Deserialize, serde::Serialize, Default, Clone)]
 #[serde(deny_unknown_fields)]
 struct FileConfig {
     #[serde(default)]
@@ -217,6 +218,11 @@ struct RolesInner {
     serve: Option<Arc<ServeEngine>>,
     serve_upnp: bool,
     relay: Option<RelayProc>,
+    /// 角色「代际」：serve/relay 的一切宿主侧变更（start/stop/restart/重建）各自
+    /// 前进——supervisor 线程据此区分「我看的引擎死了但被动态操作接管」（静默退）
+    /// 与「仍在属主位上死了」（失败 → 退避重建）。
+    serve_epoch: u64,
+    relay_epoch: u64,
     /// relay 装配期铸出的 token（运行态真源；relay.token 优先用）。
     relay_token: Option<String>,
     relay_listen: Option<String>,
@@ -231,6 +237,9 @@ struct RolesInner {
 
 struct UnifiedRoles {
     state_dir: PathBuf,
+    /// 自引用（构造后注入 Weak；supervisor 线程 spawn 需要 Arc 而 RoleHost::role_op
+    /// 只拿得到 &self——经此升级）。
+    me: Mutex<Option<std::sync::Weak<UnifiedRoles>>>,
     /// serve 角色侧摘要流（events.log + 终端）——engine 装配判据行面。
     logf: Arc<dyn Fn(&str) + Send + Sync>,
     /// 守护侧摘要流（daemon-events.log + 终端）——角色管理动作行（serve/relay
@@ -243,6 +252,15 @@ struct UnifiedRoles {
 }
 
 impl UnifiedRoles {
+    /// 构造后注入自引用（一次性）。
+    fn set_self_ref(&self, me: std::sync::Weak<UnifiedRoles>) {
+        *self.me.lock().unwrap_or_else(|e| e.into_inner()) = Some(me);
+    }
+
+    fn self_arc(&self) -> Option<Arc<UnifiedRoles>> {
+        self.me.lock().unwrap_or_else(|e| e.into_inner()).as_ref().and_then(std::sync::Weak::upgrade)
+    }
+
     fn serve_running(inner: &RolesInner) -> bool {
         inner.serve.is_some()
     }
@@ -331,7 +349,7 @@ impl UnifiedRoles {
         };
         ServeStatusResult {
             enabled: inner.cfg.serve.enabled,
-            state: if Self::serve_running(inner) { "running" } else { "stopped" }.to_owned(),
+            state: role_state(Self::serve_running(inner), &inner.serve_reason).to_owned(),
             reason: (!inner.serve_reason.is_empty()).then(|| inner.serve_reason.clone()),
             listen_port: inner.serve.as_ref().map(|e| e.local_port),
             published: None,
@@ -358,6 +376,287 @@ fn mask_token(tok: &str) -> Option<String> {
     }
 }
 
+// ---------- supervisor（r1-M4：角色运行期失败 = 进程内退避重建，绝不 exit） ----------
+
+/// 重建退避表（Go defaultRoleBackoff 同值：索引递增取值、越界取表尾——失败节拍
+/// 收敛到表尾间隔，不无限加密、也绝不退出进程）。
+const ROLE_BACKOFF: [Duration; 4] = [
+    Duration::from_millis(500),
+    Duration::from_secs(1),
+    Duration::from_secs(5),
+    Duration::from_secs(30),
+];
+
+/// 角色三态（Go roleState 同名：running / stopped / failed——非运行且带原因 = failed）。
+fn role_state(running: bool, reason: &str) -> &'static str {
+    if running {
+        "running"
+    } else if reason.is_empty() {
+        "stopped"
+    } else {
+        "failed"
+    }
+}
+
+fn role_backoff(fails: usize) -> Duration {
+    ROLE_BACKOFF[fails.min(ROLE_BACKOFF.len() - 1)]
+}
+
+/// 退避时长文案（Go time.Duration.String 同形：500ms / 1s / 5s / 30s）。
+fn backoff_text(d: Duration) -> String {
+    if d.subsec_millis() > 0 {
+        format!("{}ms", d.as_millis())
+    } else {
+        format!("{}s", d.as_secs())
+    }
+}
+
+impl UnifiedRoles {
+    /// serve 角色看护：轮询引擎在世位；死时仍属主（代际未变 + 表内即本台）= 运行期
+    /// 失败 → 状态面 failed → Go 同串日志 → 退避 → 重装配（与显式 restart 同一重建面）；
+    /// 非属主（动态 stop/restart 已接管）= 静默退。装配失败同路退避重试（Go makeRole
+    /// 失败 = Run 快速失败的等价面）。
+    fn supervise_serve(self: &Arc<Self>, mut engine: Arc<ServeEngine>, mut epoch: u64) {
+        let mut fails = 0usize;
+        let mut last_err = String::new();
+        loop {
+            while engine.alive() {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            // 属主判定：动态 stop/restart 会 take + 前进代际——那时收尾属正常操作。
+            {
+                let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if inner.serve_epoch != epoch
+                    || !inner.serve.as_ref().is_some_and(|e| Arc::ptr_eq(e, &engine))
+                {
+                    return;
+                }
+            }
+            // 失败路径（Go runRoleLoop 同序：failed → 日志 → 退避 → 重建 → restarts++ → running）
+            let reason = if last_err.is_empty() {
+                "serve 引擎线程退出（异常终结）".to_owned()
+            } else {
+                std::mem::take(&mut last_err)
+            };
+            {
+                let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                inner.serve = None;
+                inner.serve_reason = reason.clone();
+            }
+            let wait = role_backoff(fails);
+            fails += 1;
+            (self.eventf)(&format!(
+                "role serve: 失败（{reason}）——退避 {} 后进程内重建",
+                backoff_text(wait)
+            ));
+            std::thread::sleep(wait);
+            // 重建（与 ServeStart/Restart 的串行化一致：先等上一轮 stop 收尾再装配）
+            let rebuilt = {
+                let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(h) = inner.serve_stop_join.take() {
+                    drop(inner);
+                    let _ = h.join();
+                } else {
+                    drop(inner);
+                }
+                self.assemble_serve()
+            };
+            match rebuilt {
+                Ok((e, upnp)) => {
+                    let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    if !inner.cfg.serve.enabled {
+                        // 退避窗内被动态停用：尊重期望态，不再起
+                        return;
+                    }
+                    inner.serve_epoch += 1;
+                    epoch = inner.serve_epoch;
+                    inner.serve = Some(Arc::clone(&e));
+                    inner.serve_upnp = upnp;
+                    inner.serve_restarts += 1;
+                    inner.serve_reason.clear();
+                    let n = inner.serve_restarts;
+                    drop(inner);
+                    (self.dlogf)(&format!("role serve: 第 {n} 次进程内重建"));
+                    engine = e;
+                }
+                Err(e) => {
+                    last_err = e;
+                }
+            }
+        }
+    }
+
+    /// serve 启动装配失败的看护（原 exit(1) 形态的进程内替代）：退避重试装配直至
+    /// 成功转 supervise_serve，或期望态被动态翻停。Go：装配错误经 runRoleLoop 同表退避。
+    fn bootstrap_serve(self: &Arc<Self>) {
+        let mut fails = 0usize;
+        loop {
+            let r = self.assemble_serve();
+            {
+                let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if !inner.cfg.serve.enabled {
+                    return; // 退避窗内被动态翻停（config 期望态真源）
+                }
+            }
+            match r {
+                Ok((engine, upnp)) => {
+                    let epoch = {
+                        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                        inner.serve_epoch += 1;
+                        inner.serve = Some(Arc::clone(&engine));
+                        inner.serve_upnp = upnp;
+                        inner.serve_reason.clear();
+                        inner.serve_epoch
+                    };
+                    (self.eventf)("serve: 退避重建装配成功");
+                    self.spawn_serve_supervisor(engine, epoch);
+                    return;
+                }
+                Err(e) => {
+                    {
+                        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                        inner.serve_reason = e.clone();
+                    }
+                    let wait = role_backoff(fails);
+                    fails += 1;
+                    (self.eventf)(&format!(
+                        "role serve: 失败（装配失败：{e}）——退避 {} 后进程内重建",
+                        backoff_text(wait)
+                    ));
+                    std::thread::sleep(wait);
+                }
+            }
+        }
+    }
+
+    fn spawn_serve_supervisor(&self, engine: Arc<ServeEngine>, epoch: u64) {
+        let Some(roles) = self.self_arc() else { return };
+        std::thread::Builder::new()
+            .name("hw-super-serve".to_owned())
+            .stack_size(512 * 1024)
+            .spawn(move || roles.supervise_serve(engine, epoch))
+            .expect("线程创建不可失败");
+    }
+
+    /// relay 角色看护：轮询 run 线程在世位；死时仍属主（代际未变 + 表内仍 relay）=
+    /// 失败 → 退避 → 重装配。RelayStop 会 take + 前进代际 ⇒ 看护静默退。
+    fn supervise_relay(self: &Arc<Self>, mut exited: Arc<std::sync::atomic::AtomicBool>, mut epoch: u64) {
+        use std::sync::atomic::Ordering;
+        let mut fails = 0usize;
+        let mut last_err = String::new();
+        loop {
+            while !exited.load(Ordering::SeqCst) {
+                std::thread::sleep(Duration::from_millis(500));
+            }
+            {
+                let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if inner.relay_epoch != epoch || inner.relay.is_none() {
+                    return; // 动态 stop/restart 接管（stop 会 join run 线程 ⇒ exited 也置位）
+                }
+            }
+            let reason = if last_err.is_empty() {
+                "relay run 线程退出（异常终结）".to_owned()
+            } else {
+                std::mem::take(&mut last_err)
+            };
+            {
+                let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                inner.relay = None;
+                inner.relay_reason = reason.clone();
+            }
+            let wait = role_backoff(fails);
+            fails += 1;
+            (self.eventf)(&format!(
+                "role relay: 失败（{reason}）——退避 {} 后进程内重建",
+                backoff_text(wait)
+            ));
+            std::thread::sleep(wait);
+            let cfg = {
+                let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if !inner.cfg.relay.enabled {
+                    return;
+                }
+                inner.cfg.clone()
+            };
+            match self.assemble_relay_role(&cfg) {
+                Ok((proc, token, listen)) => {
+                    let exited2 = proc.exited_flag();
+                    let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                    inner.relay_epoch += 1;
+                    epoch = inner.relay_epoch;
+                    inner.relay = Some(proc);
+                    inner.relay_token = token;
+                    inner.relay_listen = Some(listen);
+                    inner.relay_restarts += 1;
+                    inner.relay_reason.clear();
+                    let n = inner.relay_restarts;
+                    drop(inner);
+                    (self.dlogf)(&format!("role relay: 第 {n} 次进程内重建"));
+                    exited = exited2;
+                }
+                Err(e) => {
+                    last_err = e;
+                }
+            }
+        }
+    }
+
+    /// relay 启动装配失败的看护（原 exit(1) 形态的进程内替代）。
+    fn bootstrap_relay(self: &Arc<Self>) {
+        loop {
+            let cfg = {
+                let inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                if !inner.cfg.relay.enabled {
+                    return;
+                }
+                inner.cfg.clone()
+            };
+            match self.assemble_relay_role(&cfg) {
+                Ok((proc, token, listen)) => {
+                    let exited = proc.exited_flag();
+                    let epoch = {
+                        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                        inner.relay_epoch += 1;
+                        inner.relay = Some(proc);
+                        inner.relay_token = token;
+                        inner.relay_listen = Some(listen);
+                        inner.relay_reason.clear();
+                        inner.relay_epoch
+                    };
+                    (self.eventf)("relay: 退避重建装配成功");
+                    self.spawn_relay_supervisor(exited, epoch);
+                    return;
+                }
+                Err(e) => {
+                    {
+                        let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
+                        inner.relay_reason = e.clone();
+                    }
+                    let wait = role_backoff(0);
+                    (self.eventf)(&format!(
+                        "role relay: 失败（装配失败：{e}）——退避 {} 后进程内重建",
+                        backoff_text(wait)
+                    ));
+                    std::thread::sleep(wait);
+                }
+            }
+        }
+    }
+
+    fn spawn_relay_supervisor(
+        &self,
+        exited: Arc<std::sync::atomic::AtomicBool>,
+        epoch: u64,
+    ) {
+        let Some(roles) = self.self_arc() else { return };
+        std::thread::Builder::new()
+            .name("hw-super-relay".to_owned())
+            .stack_size(512 * 1024)
+            .spawn(move || roles.supervise_relay(exited, epoch))
+            .expect("线程创建不可失败");
+    }
+}
+
 impl RoleHost for UnifiedRoles {
     fn role_op(&self, op: RoleOp) -> Result<RoleOpOut, BackendErr> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -376,18 +675,29 @@ impl RoleHost for UnifiedRoles {
                     let _ = h.join();
                 }
                 inner.cfg = load_config_quiet(&self.state_dir);
-                match self.assemble_serve() {
+                let started = match self.assemble_serve() {
                     Ok((engine, upnp)) => {
-                        inner.serve = Some(engine);
+                        inner.serve_epoch += 1;
+                        let epoch = inner.serve_epoch;
+                        inner.serve = Some(Arc::clone(&engine));
                         inner.serve_upnp = upnp;
                         inner.serve_reason.clear();
                         (self.eventf)("serve: 按期望态装配（config serve.enabled=true，经控制面）");
-                        Ok(RoleOpOut::Action(RoleActionResult { action: "started".into() }))
+                        Some((engine, epoch))
                     }
                     Err(e) => {
                         inner.serve_reason = e.clone();
-                        Err(BackendErr::Other(format!("serve 装配失败：{e}")))
+                        None
                     }
+                };
+                match started {
+                    Some((engine, epoch)) => {
+                        self.spawn_serve_supervisor(engine, epoch);
+                        Ok(RoleOpOut::Action(RoleActionResult { action: "started".into() }))
+                    }
+                    None => Err(BackendErr::Other(
+                        "serve 装配失败（状态面 failed；supervisor 将退避重试）".into(),
+                    )),
                 }
             }
             R::ServeStop => {
@@ -395,6 +705,7 @@ impl RoleHost for UnifiedRoles {
                 write_config_enabled(&self.state_dir, Some(false), None)
                     .map_err(|e| BackendErr::Other(format!("写 config：{e}")))?;
                 if let Some(engine) = inner.serve.take() {
+                    inner.serve_epoch += 1;
                     // **立即应答，收尾异步**（Go D5 完成语义 r1 中-4：收尾最长 =
                     // STOP_GRACE 10s + UPnP 缩租预算，同步等会烧穿请求预算——CLI-6
                     // 整改；宽限 10s = engine::STOP_GRACE，Go role.go 同值——CLI-8）。
@@ -421,6 +732,7 @@ impl RoleHost for UnifiedRoles {
                 }
                 // 与 stop 同款：旧引擎异步收尾（join 后再装配——串行化防端口退让）。
                 if let Some(engine) = inner.serve.take() {
+                    inner.serve_epoch += 1;
                     let upnp = inner.serve_upnp;
                     let logf = Arc::clone(&self.logf);
                     let h = std::thread::Builder::new()
@@ -434,19 +746,30 @@ impl RoleHost for UnifiedRoles {
                         .expect("线程创建不可失败");
                     let _ = h.join();
                 }
-                match self.assemble_serve() {
+                let restarted = match self.assemble_serve() {
                     Ok((engine, upnp)) => {
-                        inner.serve = Some(engine);
+                        inner.serve_epoch += 1;
+                        let epoch = inner.serve_epoch;
+                        inner.serve = Some(Arc::clone(&engine));
                         inner.serve_upnp = upnp;
                         inner.serve_restarts += 1;
                         inner.serve_reason.clear();
                         (self.eventf)(&format!("serve: 显式重启完成（重建计数 {}）", inner.serve_restarts));
-                        Ok(RoleOpOut::Action(RoleActionResult { action: "restarted".into() }))
+                        Some((engine, epoch))
                     }
                     Err(e) => {
                         inner.serve_reason = e.clone();
-                        Err(BackendErr::Other(format!("serve 重启装配失败：{e}")))
+                        None
                     }
+                };
+                match restarted {
+                    Some((engine, epoch)) => {
+                        self.spawn_serve_supervisor(engine, epoch);
+                        Ok(RoleOpOut::Action(RoleActionResult { action: "restarted".into() }))
+                    }
+                    None => Err(BackendErr::Other(
+                        "serve 重启装配失败（状态面 failed；supervisor 将退避重试）".into(),
+                    )),
                 }
             }
             R::ServeStatus => {
@@ -491,19 +814,31 @@ impl RoleHost for UnifiedRoles {
                 write_config_enabled(&self.state_dir, None, Some(true))
                     .map_err(|e| BackendErr::Other(format!("写 config：{e}")))?;
                 inner.cfg = load_config_quiet(&self.state_dir);
-                match self.assemble_relay_role(&inner.cfg) {
+                let started = match self.assemble_relay_role(&inner.cfg) {
                     Ok((proc, token, listen)) => {
+                        inner.relay_epoch += 1;
+                        let epoch = inner.relay_epoch;
+                        let exited = proc.exited_flag();
                         inner.relay = Some(proc);
                         inner.relay_token = token;
                         inner.relay_listen = Some(listen);
                         inner.relay_reason.clear();
                         (self.eventf)("relay: 按期望态装配（config relay.enabled=true，经控制面）");
-                        Ok(RoleOpOut::Action(RoleActionResult { action: "started".into() }))
+                        Some((exited, epoch))
                     }
                     Err(e) => {
                         inner.relay_reason = e.clone();
-                        Err(BackendErr::Other(format!("relay 装配失败：{e}")))
+                        None
                     }
+                };
+                match started {
+                    Some((exited, epoch)) => {
+                        self.spawn_relay_supervisor(exited, epoch);
+                        Ok(RoleOpOut::Action(RoleActionResult { action: "started".into() }))
+                    }
+                    None => Err(BackendErr::Other(
+                        "relay 装配失败（状态面 failed；supervisor 将退避重试）".into(),
+                    )),
                 }
             }
             R::RelayStop => {
@@ -511,6 +846,7 @@ impl RoleHost for UnifiedRoles {
                 write_config_enabled(&self.state_dir, None, Some(false))
                     .map_err(|e| BackendErr::Other(format!("写 config：{e}")))?;
                 if let Some(proc) = inner.relay.take() {
+                    inner.relay_epoch += 1;
                     proc.stop();
                     (self.eventf)("relay: 期望停用（config relay.enabled=false，经控制面）——已收工");
                     Ok(RoleOpOut::Action(RoleActionResult { action: "stopped".into() }))
@@ -523,22 +859,35 @@ impl RoleHost for UnifiedRoles {
                     return Err(BackendErr::Other("relay 未在运行（先 start）——restart 无重建对象".into()));
                 }
                 if let Some(proc) = inner.relay.take() {
+                    inner.relay_epoch += 1;
                     proc.stop();
                 }
-                match self.assemble_relay_role(&inner.cfg) {
+                let restarted = match self.assemble_relay_role(&inner.cfg) {
                     Ok((proc, token, listen)) => {
+                        inner.relay_epoch += 1;
+                        let epoch = inner.relay_epoch;
+                        let exited = proc.exited_flag();
                         inner.relay = Some(proc);
                         inner.relay_token = token;
                         inner.relay_listen = Some(listen);
                         inner.relay_restarts += 1;
                         inner.relay_reason.clear();
                         (self.eventf)(&format!("relay: 显式重启完成（重建计数 {}）", inner.relay_restarts));
-                        Ok(RoleOpOut::Action(RoleActionResult { action: "restarted".into() }))
+                        Some((exited, epoch))
                     }
                     Err(e) => {
                         inner.relay_reason = e.clone();
-                        Err(BackendErr::Other(format!("relay 重启装配失败：{e}")))
+                        None
                     }
+                };
+                match restarted {
+                    Some((exited, epoch)) => {
+                        self.spawn_relay_supervisor(exited, epoch);
+                        Ok(RoleOpOut::Action(RoleActionResult { action: "restarted".into() }))
+                    }
+                    None => Err(BackendErr::Other(
+                        "relay 重启装配失败（状态面 failed；supervisor 将退避重试）".into(),
+                    )),
                 }
             }
             R::RelayStatus => {
@@ -614,13 +963,13 @@ impl RoleHost for UnifiedRoles {
             },
             RoleBrief {
                 name: "serve".into(),
-                state: if Self::serve_running(&inner) { "running" } else { "stopped" }.into(),
+                state: role_state(Self::serve_running(&inner), &inner.serve_reason).into(),
                 restarts: inner.serve_restarts,
                 reason: (!inner.serve_reason.is_empty()).then(|| inner.serve_reason.clone()),
             },
             RoleBrief {
                 name: "relay".into(),
-                state: if Self::relay_running(&inner) { "running" } else { "stopped" }.into(),
+                state: role_state(Self::relay_running(&inner), &inner.relay_reason).into(),
                 restarts: inner.relay_restarts,
                 reason: (!inner.relay_reason.is_empty()).then(|| inner.relay_reason.clone()),
             },
@@ -707,6 +1056,7 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
     // ⑤ serve/relay 角色管理面（控制面 serve.*/relay.* 的宿主；config 即期望态）。
     let roles = Arc::new(UnifiedRoles {
         state_dir: state_dir.clone(),
+        me: Mutex::new(None),
         logf: Arc::clone(&logf),
         eventf: Arc::clone(&daemon_logf),
         dlogf: Arc::clone(&dlogf),
@@ -717,6 +1067,8 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
             serve: None,
             serve_upnp: false,
             relay: None,
+            serve_epoch: 0,
+            relay_epoch: 0,
             relay_token: None,
             relay_listen: None,
             serve_restarts: 0,
@@ -726,6 +1078,8 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
             serve_stop_join: None,
         }),
     });
+
+    roles.set_self_ref(Arc::downgrade(&roles));
 
     // ⑥ client 角色恒开（hosts.json 表 + 每主机常驻会话；事件总线进程级唯一）。
     let client_dir = state_dir.join("client");
@@ -746,19 +1100,29 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
     daemon_logf(&format!("client: 角色已装配（{} 台主机，hosts 表 {}）", core.hosts.hosts().len(), client_dir.join("hosts.json").display()));
 
     // ⑦ serve/relay 按期望态（config enabled；动态启停经控制面 serve.*/relay.*）。
+    // r1-M4：装配失败 ≠ 进程退出——状态面 failed + supervisor 退避重试（Go 装配错误
+    // 经 runRoleLoop 同表退避；统一进程 client/control 照常）。
+    let mut serve_watch: Option<(Arc<ServeEngine>, u64)> = None;
+    let mut serve_bootstrap = false;
+    let mut relay_watch: Option<(Arc<std::sync::atomic::AtomicBool>, u64)> = None;
+    let mut relay_bootstrap = false;
     {
         let mut inner = roles.inner.lock().unwrap_or_else(|e| e.into_inner());
         if inner.cfg.serve.enabled {
             match roles.assemble_serve() {
                 Ok((engine, upnp)) => {
-                    inner.serve = Some(engine);
+                    inner.serve_epoch += 1;
+                    inner.serve = Some(Arc::clone(&engine));
                     inner.serve_upnp = upnp;
+                    serve_watch = Some((engine, inner.serve_epoch));
                     logf("serve: 按期望态装配（config serve.enabled=true）");
                 }
                 Err(e) => {
-                    // 装配失败 = 可行动错误拒启（supervisor 退避重建归后续棒，文件头留桩）。
-                    daemon_logf(&format!("serve: 装配失败（{e}）——统一进程退出"));
-                    std::process::exit(1);
+                    inner.serve_reason = e.clone();
+                    serve_bootstrap = true;
+                    daemon_logf(&format!(
+                        "serve: 装配失败（{e}）——状态面 failed，退避后进程内重建（supervisor）"
+                    ));
                 }
             }
         } else {
@@ -767,19 +1131,47 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
         if inner.cfg.relay.enabled {
             match roles.assemble_relay_role(&inner.cfg) {
                 Ok((proc, token, listen)) => {
+                    inner.relay_epoch += 1;
+                    let exited = proc.exited_flag();
                     inner.relay = Some(proc);
                     inner.relay_token = token;
                     inner.relay_listen = Some(listen);
+                    relay_watch = Some((exited, inner.relay_epoch));
                     logf("relay: 按期望态装配（config relay.enabled=true）");
                 }
                 Err(e) => {
-                    daemon_logf(&format!("relay: 装配失败（{e}）——统一进程退出"));
-                    std::process::exit(1);
+                    inner.relay_reason = e.clone();
+                    relay_bootstrap = true;
+                    daemon_logf(&format!(
+                        "relay: 装配失败（{e}）——状态面 failed，退避后进程内重建（supervisor）"
+                    ));
                 }
             }
         } else {
             logf("relay: 期望停用（config relay.enabled=false）——不装配");
         }
+    }
+    if let Some((engine, epoch)) = serve_watch {
+        roles.spawn_serve_supervisor(engine, epoch);
+    }
+    if serve_bootstrap {
+        let roles2 = roles.self_arc().expect("自引用已注入");
+        std::thread::Builder::new()
+            .name("hw-boot-serve".to_owned())
+            .stack_size(512 * 1024)
+            .spawn(move || roles2.bootstrap_serve())
+            .expect("线程创建不可失败");
+    }
+    if let Some((exited, epoch)) = relay_watch {
+        roles.spawn_relay_supervisor(exited, epoch);
+    }
+    if relay_bootstrap {
+        let roles2 = roles.self_arc().expect("自引用已注入");
+        std::thread::Builder::new()
+            .name("hw-boot-relay".to_owned())
+            .stack_size(512 * 1024)
+            .spawn(move || roles2.bootstrap_relay())
+            .expect("线程创建不可失败");
     }
 
     // ⑧ control 角色恒开（首启 Listen fail-fast：监听失败 = 报错退出——控制面是
