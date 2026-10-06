@@ -202,16 +202,21 @@ B0-2b §十七 D-2 段）；8q 收口（本注记 + dsh 评审 + ci-local）。*
 无缺口、OHOS 内核 ACK 密度 ~5.3-7.5 段/ACK 自带中间档时钟、pacing on/off 同带——
 PERF-AB §9.12）、上行日间带 44 上限的夜间复核。
 
-**P1 批（2026-10-06 深夜，部分完成——接棒真源 = docs/reviews/P1.md）**：出口发送
+**P1 批（2026-10-06，定位批收口——真源 = docs/reviews/P1.md「P1 定位记录」）**：出口发送
 路径并行化（浅拆：密文→sendto 独立线程）。**完成**：P1a 设计过评审门（dsh 24 项
-全处置——socketpair+MSG_NOSIGNAL 唤醒/join 无超时/SPSC 不变量/两级背压/收益模型
-诚实化）+ P1b-0 剂量基线（**下行 bulk 期 sendto 占驱动线程 59-77% 墙钟**的绝对
-剂量实证）+ P1b 机制全量（txring SPSC/发送线程/降级/收工/插桩，433 lib 全绿 +
-ci-local 全绿 21:30）。**阻塞**：引擎级集成未定位问题——队列路径的 WG 密文包
-客户端层确定性拒收（SYN-ACK 类；字节合法/延迟 0ms/内核无罪已排除，取证全档与
-候选方向见 P1.md 接棒指针节）⇒ **产品默认 off**（HOMEWAY_TX_SENDTHREAD 显式开，
-默认行为 = 拆分前，stash 对照验证零回归）。P1c 消融终验/P1d 生产滚动/P1e 收口
-挂起至定位完成。诊断面板（HOMEWAY_TX_DBG 三面）在位。
+全处置）+ P1b-0 剂量基线（下行 bulk 期 sendto 占驱动线程 59-77% 墙钟）+ P1b 机制
+全量（txring SPSC/发送线程/降级/收工/插桩）+ **P1 定位批：引擎级集成根因修复**——
+①唤醒合并位 pending 在 tx_start 被 new 双实例（生产侧/消费侧各打各的旗 ⇒ 全进程
+仅首次唤醒、首排空窗外包永驻 ring——前棒全部「客户端拒收/SYN-ACK 丢」观察的
+唯一根因，「WG 层拒收」系误诊：修复后同一 94B response 被接受）；②alive 初值
+false 启动竞态 + tx_degrade join 永等（新回归测试钉死）；send_wire_ctl 误诊缓解
+删除、全量 Queued 恢复；回归测试 tx_thread_gapped_push_rewakes（旧代码确定性
+失败）；434 lib 全绿 + clippy 0；本地引擎级复现全绿（connect --speedtest 判据
+全过）。**P1c 本地臂过**（T1 发送面耗时 21-133ms/5s vs 基线 2942-3831〔1/22，
+门 1/4〕/T3 队深峰 24-81 满丢 0/T4 上行无回归/本地 B/A 持平=预期内——收益门在
+真机）。**剩**：P1c 真机 2×2 同刻消融 + T5（阿里云隔离实例 sendmmsg 批分布）
+⇒ 全绿后默认翻 on 发 v0.2.2（P1d 与 P1c 同批）。**产品默认 off 维持**（收益
+未经真机终验）。诊断面板（HOMEWAY_TX_DBG 三面）在位。
 
 真手指复测清单（files 上传 picker〔K-10〕、~~逐包 pacing 下一档~~（**D-3 已落**——
 8s 进默认 + 8r 机制在册默认关）、

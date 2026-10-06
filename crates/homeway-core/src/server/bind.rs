@@ -713,21 +713,6 @@ impl ServerBind {
         self.tx_wall_ns += t0.elapsed().as_nanos() as u64;
     }
 
-    /// 控制面直发（P1 修订：解封应答/keepalive 等**低频时序敏感面**保持拆分前
-    /// 的同步直发形态——无论 Queued/Inline 模式都 inline 发出。归因：真机排查
-    /// 实测队列路径的握手应答在本机回环形态下客户端解密失败（response 字节
-    /// 逐字节合法、发送线程发送成功、客户端 UDP 层已收到但 WG 层拒收——异步
-    /// 交接面的时序/状态耦合未及根因定位，先以「控制面 inline」恢复既有基线；
-    /// 数据面〔route_encap 主体 = 78% 的大头〕保持队列拆分）。
-    pub fn send_wire_ctl(&mut self, out: &InboundOut) {
-        if out.wire.is_empty() {
-            return;
-        }
-        let t0 = Instant::now();
-        self.send_wire_inner(out);
-        self.tx_wall_ns += t0.elapsed().as_nanos() as u64;
-    }
-
     /// 判定面单条（两模式共用）：腿命中 → 腿 socket 直发（tx_bytes 记账）；
     /// #17 丢弃（腿已摘）。返回 true = 该条已消化（不走主 socket）。
     fn dispatch_leg(&mut self, ep: &SocketAddr, wg: &[u8], out: &InboundOut) -> bool {
@@ -923,9 +908,15 @@ impl ServerBind {
         let (producer, consumer) = txring::txring_new();
         let pending = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));
-        // alive 初值 false（p1a-C-3：spawn 失败 ⇒ 恒 false ⇒ 降级判据不误报；
-        // 线程体首指令置 true）
-        let alive = Arc::new(AtomicBool::new(false));
+        // alive **预置 true**（P1 定位批第二修复）：初值 false + 线程体首指令置 true
+        // 在「spawn 成功 ↔ 线程首指令」之间存在窗口——驱动线程紧接的 send_wire 读到
+        // false ⇒ 误判失活走降级 ⇒ tx_degrade 对仍活在 poll 长眠中的线程 join 永等
+        //（唤醒字节只有生产侧写，而降级路径在 join 返回后才关 wake_w）⇒ 驱动线程
+        // 死锁（新回归测试 tx_thread_gapped_push_rewakes 在测试并行负载下确定性踩中）。
+        // 预置 true 后 p1a-C-3 的「spawn 失败不误判」仍成立——判据从「旗值」改为
+        // 「QueuedFace 在位」：spawn/socketpair 失败路径不装 QueuedFace ⇒ alive 无
+        // 读者；线程真退出（panic/收工）由 AliveGuard 清零，降级语义不变。
+        let alive = Arc::new(AtomicBool::new(true));
         self.wake_r = fds[0];
         let stats = Arc::clone(&self.tx_stats);
         let builder = std::thread::Builder::new()
@@ -935,6 +926,13 @@ impl ServerBind {
             let stop = Arc::clone(&stop);
             let alive = Arc::clone(&alive);
             let dlogf = Arc::clone(&dlogf);
+            // 唤醒合并位必须与 QueuedFace **共用同一实例**（P1 定位修复：实装首版
+            // 此处误 new 了第二个 pending ⇒ 生产侧 swap 与消费侧 store 各打各的旗
+            // ⇒ 消费侧清的是线程闭包里那个（永 false），生产侧的旗首次置 true 后
+            // 无人再清 ⇒ swap 恒返 true ⇒ 首次唤醒后再无唤醒字节 ⇒ 后续包永驻
+            // ring、发送线程 poll(-1) 长眠——引擎级「队列发包客户端收不到」的根因，
+            // 见 docs/reviews/P1.md「P1 定位记录」）。
+            let pending = Arc::clone(&pending);
             move || {
                 tx_thread_loop(
                     sock, consumer, fds[0], stats, pending, stop, alive, burst_bytes, dlogf,
@@ -946,7 +944,7 @@ impl ServerBind {
                 self.tx_thread = Some(h);
                 self.tx_queued = Some(Box::new(QueuedFace {
                     producer,
-                    pending: Arc::new(AtomicBool::new(false)),
+                    pending,
                     wake_w: fds[1],
                     stop,
                     alive,
@@ -1030,6 +1028,15 @@ impl ServerBind {
         (self.dlogf)(&format!(
             "⚠️ 发送线程异常退出——已降级内联发送（ring 存量：接管发出 {rescued} 包 / 放弃 {lost} 包〔放弃 = 洞语义，TCP 重传恢复〕）"
         ));
+        // 收尸前先 stop + 唤醒（P1 定位批防御）：降级语义 = 线程已宣判死亡 ⇒ 令其
+        // 真退出——即便 alive 是被误读的（窗口类 bug 复发），活着的线程也会醒、
+        // 见 stop、drain-then-exit ⇒ join 必返（否则对 poll 长眠线程 join 永等 =
+        // 驱动线程死锁——p1a-C-1「join 必返」论证在降级路径的补全）。
+        q.stop.store(true, Ordering::SeqCst);
+        let wake = [1u8];
+        unsafe {
+            libc::send(q.wake_w, wake.as_ptr().cast(), 1, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL)
+        };
         // 收尸（线程已在退出路径——join 立即或极快返回）
         if let Some(h) = self.tx_thread.take() {
             let _ = h.join();
@@ -1109,13 +1116,11 @@ impl Drop for ServerBind {
 
 // ---------- P1 发送线程体 ----------
 
-/// P1 发送线程开关（值匹配惯例——与 HOMEWAY_TX_SHAPING 同款）。**产品默认 off
-///（内联 = 拆分前形态）**——本批引擎级集成存在未定位问题（本地 4265x 实测：
-/// 队列路径的 WG 密文包客户端层偶发拒收——握手应答队列发 = 客户端拒收死锁
-///〔已以控制面 inline 缓解〕；数据面 bulk 连接建立 flaky。字节级/时序级/内核
-/// 路径已大量排除〔见 docs/reviews/P1.md 接棒指针〕，机制与单测全绿）——未定位
-/// 前不开默认（「不带上未定位问题的行为变化上生产」）。on/1/true = 开（实验/
-/// 下棒定位用，机制全量在位）。
+/// P1 发送线程开关（值匹配惯例——与 HOMEWAY_TX_SHAPING 同款）。**默认 off
+///（内联 = 拆分前形态）**——引擎级集成的根因（唤醒合并位 pending 双实例）已在
+/// P1 定位批修复并本地全通（见 docs/reviews/P1.md「P1 定位记录」），但 P1c
+/// 消融终验（真机 2×2 同刻）未跑完前不开默认（收益未经终验的行为不上产品默认）。
+/// on/1/true = 开（P1c 终验 / 实验臂）。
 pub(crate) fn tx_sendthread_enabled() -> bool {
     matches!(
         std::env::var("HOMEWAY_TX_SENDTHREAD").as_deref(),
@@ -1137,7 +1142,7 @@ fn tx_thread_loop(
     burst: usize,
     dlogf: crate::Logf,
 ) {
-    alive.store(true, Ordering::SeqCst);
+    alive.store(true, Ordering::SeqCst); // 幂等（tx_start 已预置——留此行作文档锚点）
     // 在世守卫（driver_alive 同款纪律：任何出口含 panic 展开都清零——驱动线程的
     // 降级判据）。注：consumer 参数绑定先于本守卫存在 ⇒ drop 顺序在守卫之后
     //（「alive=false ⇒ consumer 已 drop」不成立）——降级接管用 strong_count 证明
@@ -1672,6 +1677,48 @@ mod tests {
         // 收工（drain-then-exit + join 必返）
         b.tx_shutdown(&noop_logf());
         assert!(!b.tx_queued_mode(), "收工后应退 Queued 模式");
+    }
+
+    /// **根因回归钉**（P1 定位修复）：间隔推送必须每次重新唤醒发送线程。
+    /// 实装首版 `tx_start` 误为线程闭包与 QueuedFace 各 new 一个 `pending`
+    ///（生产侧 swap / 消费侧 store 各打各的旗）⇒ 首次唤醒后生产侧旗恒 true ⇒
+    /// 再无唤醒字节 ⇒ 首排空窗之外的包永驻 ring（引擎级「队列发包客户端收不到」
+    /// / speedtest SYN-ACK 丢 / Queued 全量死锁的根因）。既有
+    /// `tx_thread_end_to_end_ordered` 是紧循环连推——全部落在首个排空窗内，
+    /// 钉不住本形态；本测试用「推送→收妥→落回 poll→再推送」的间隔节拍
+    ///（真实流量 request→process→response 的形态）钉死：**每次间隔推送都可达**
+    ///（判据只断到达——唤醒计数在抢占下可合法合并〔线程在 send 后、pending 清
+    /// 前被抢占 >50ms ⇒ 下一轮并入同周期〕，不做数值断言）。
+    #[test]
+    fn tx_thread_gapped_push_rewakes() {
+        let mut b = ServerBind::open(0, "t", noop_logf()).unwrap();
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dst = sink.local_addr().unwrap();
+        // 并行测试负载下线程调度延迟可观——超时给 10s（判据是「可达」不是「快」）
+        sink.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let sock_dup = b.try_clone_socket().unwrap();
+        b.tx_start(sock_dup, 64 * 1024, noop_logf());
+        // 三轮间隔推送：每轮 1 包、轮间等收妥 + 落回 poll（50ms ≫ 排空/回睡时序）
+        for round in 0..3u32 {
+            let mut out = InboundOut::default();
+            let mut wg = round.to_le_bytes().to_vec();
+            wg.resize(64, 0);
+            out.wire.push((dst, wg));
+            b.send_wire(&out);
+            let mut buf = [0u8; 128];
+            let (n, _) = sink.recv_from(&mut buf).unwrap_or_else(|e| {
+                panic!("第 {round} 轮间隔推送未到达（发送线程未再唤醒——pending 双实例回归）：{e}")
+            });
+            assert_eq!(u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]), round, "帧壳载荷序号");
+            assert_eq!(buf[0], 0xBB, "帧魔数");
+            assert!(n >= 66);
+            std::thread::sleep(Duration::from_millis(50)); // 让发送线程落回 poll 长眠
+        }
+        let snap = b.tx_stats_snapshot();
+        assert!(snap.wakeups >= 1, "至少应有一次唤醒（实醒 {}）", snap.wakeups);
+        assert!(snap.pkgs >= 3, "三轮各 1 包都应经发送线程计账（{}）", snap.pkgs);
+        assert_eq!(snap.ring_drops, 0);
+        b.tx_shutdown(&noop_logf());
     }
 
     /// harness 快臂登记（P1c）：曾实装「发送线程排空吞吐 vs 内联 send_batch」

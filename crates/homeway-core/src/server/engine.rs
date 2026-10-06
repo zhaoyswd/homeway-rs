@@ -1204,7 +1204,8 @@ fn driver_loop(
         route_encap(&tx, device, &mut bind, &mut out);
         // ④ WG 定时器（握手重传/keepalive/服务端主动握手的产出面）
         device.tick_timers(&mut out);
-        bind.send_wire_ctl(&out); // 控制面直发（keepalive/重传——同上）
+        bind.send_wire(&out); // P1 定位批回退全量 Queued（设计 v2 形态——控制面同队；
+        // send_wire_ctl 的 inline 分流是对 pending 双实例误诊的临时缓解，根因已修）
         out.wire.clear();
         // ⑤ 周期任务
         let now = Instant::now();
@@ -1373,7 +1374,8 @@ fn handle_inbound(
     }
     if let Some((src, wg)) = inbound.data {
         device.decapsulate(src, &wg, out);
-        bind.send_wire_ctl(out); // 控制面直发（握手应答——引擎级验证：队列路径的应答客户端 WG 层拒收，见 send_wire_ctl 注释）
+        bind.send_wire(out); // P1 定位批回退全量 Queued（握手应答同队——根因修复后
+        // 队列路径实测全通；send_wire_ctl 分流已删）
         out.wire.clear();
         for p in out.plain.drain(..) {
             intercept.on_plain(p);
