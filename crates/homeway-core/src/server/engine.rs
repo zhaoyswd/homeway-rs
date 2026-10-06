@@ -935,6 +935,9 @@ fn spawn_service_stop_flag(flags: &mut Vec<Arc<AtomicBool>>) -> Arc<AtomicBool> 
 /// 其它负返回**节流记行**（评审 r1-1.4：EBADF/EINVAL 会静默满速自旋，必须可见）
 /// ——首 3 次 + 此后每 1000 次一行。select 语义上 POLLERR/HUP 也落在读就绪位——
 /// 与 poll 路径的三事件过滤等价覆盖。调用方已保证 max(fd) < FD_SETSIZE。
+/// pselect 持续错误时的退化位（连续非 EINTR 错误 ⇒ 驱动循环退回 poll 路径）。
+static PSELECT_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 fn pselect_readable(udp_fd: i32, leg_fds: &[i32], wait: Duration, dlogf: &Logf) -> Vec<i32> {
     unsafe {
         let mut set: libc::fd_set = std::mem::zeroed();
@@ -945,9 +948,11 @@ fn pselect_readable(udp_fd: i32, leg_fds: &[i32], wait: Duration, dlogf: &Logf) 
             libc::FD_SET(*fd, &mut set);
             nfds = nfds.max(*fd + 1);
         }
+        // tv_nsec < 1e9（POSIX；评审 r2-2.2：i64::MAX 钳只在「调用方保证 <1ms」时
+        // 安全——把不变量搬进函数本体。本函数本就只服务亚毫秒拍）。
         let ts = libc::timespec {
             tv_sec: 0,
-            tv_nsec: wait.as_nanos().clamp(1, i64::MAX as u128) as libc::c_long,
+            tv_nsec: wait.as_nanos().clamp(1, 999_999_999) as libc::c_long,
         };
         let rc = libc::pselect(
             nfds,
@@ -960,13 +965,19 @@ fn pselect_readable(udp_fd: i32, leg_fds: &[i32], wait: Duration, dlogf: &Logf) 
         if rc < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() != std::io::ErrorKind::Interrupted {
+                // 连续 10 次非 EINTR 错误 ⇒ 置退化位让驱动循环退回 poll 路径（评审
+                // r2-2.3：错误形态下 pselect 不等待——满速自旋，需要与 FD_SETSIZE
+                // 对称的降级闸，不能只靠日志）。
                 static ERR_COUNT: std::sync::atomic::AtomicU64 =
                     std::sync::atomic::AtomicU64::new(0);
                 let n = ERR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
                 if n <= 3 || n.is_multiple_of(1000) {
                     (dlogf)(&format!(
-                        "serve: pselect 错误（{e}，累计 {n} 次）—— 亚毫秒拍按到点返回继续"
+                        "serve: pselect 错误（{e}，累计 {n} 次）—— 立即返回不等待"
                     ));
+                }
+                if n >= 10 {
+                    PSELECT_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
                 }
             }
         }
@@ -1065,7 +1076,12 @@ fn driver_loop(
         //      分时）；pacing off 时 = 1ms（8n③ 形态原样）。
         //    - 滞留空：5ms 常规拍（不加空转唤醒成本）。
         //    腿 fd 同轮在等待集（R4：控制面通告建立的腿与主 socket 同构收包）。
-        let leg_fds = bind.leg_fds();
+        // 负 fd 防御（r2-2.4：理论上不可达——腿 fd 只取活 socket——防御位）
+        let leg_fds: Vec<i32> = bind
+            .leg_fds()
+            .into_iter()
+            .filter(|fd| *fd >= 0)
+            .collect();
         let mut pollfds = Vec::with_capacity(1 + leg_fds.len());
         pollfds.push(libc::pollfd { fd: udp_fd, events: libc::POLLIN, revents: 0 });
         for fd in &leg_fds {
@@ -1091,7 +1107,9 @@ fn driver_loop(
             ));
         }
         let sub_ms = shape_wait
-            .filter(|_| fdset_ok)
+            .filter(|_| {
+                fdset_ok && !PSELECT_BROKEN.load(std::sync::atomic::Ordering::Relaxed)
+            })
             .map(|d| d.max(MIN_PACE_WAIT))
             .filter(|d| *d < Duration::from_millis(1));
         let readable_legs: Vec<i32> = if let Some(d) = sub_ms {

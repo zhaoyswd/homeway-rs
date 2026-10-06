@@ -65,7 +65,7 @@ const POLL_CAP: i32 = 250;
 /// 经 TUN 的应用流量由 OHOS 内核回 ACK，本改动对其零作用。
 /// env `HOMEWAY_ACK_POLL_CHUNK`（字节阈值覆盖；CLI/harness 消融缝——手机上 env
 /// 不可设，真机 off 臂 = 装 baseline 核对照；大值 ≈ 旧行为〔单 poll〕）。
-const ACK_DRAIN_BYTES: usize = 2 * 1280;
+const ACK_DRAIN_BYTES: usize = 2 * stackb::MTU; // 2×MTU（MSS=MTU-40 ⇒ 2 满段 > 1×MSS 即触发立即 ACK；抬 MTU 时随动——r2-3.4）
 
 /// ACK drain 阈值（env 覆盖的缓存读——热路径不重复走 env 解析）。
 fn ack_drain_bytes() -> usize {
