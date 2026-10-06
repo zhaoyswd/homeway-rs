@@ -467,7 +467,10 @@ struct TcpObs {
 
 impl TcpObs {
     /// 客户端→出口 ACK 段累计（on_plain 点；v.proto 已判 6）。返回本段的**确认推进
-    /// 字节**（8r：ACK 时钟估计的累计源；dup/回退段返回 0）。
+    /// 字节**（8r：ACK 时钟估计的累计源；dup/回退段返回 0）。单段推进截在 1MiB
+    ///（真 ACK 的推进 ≤ 对端通告窗——快路径 ~1MB 量级；超出的是五元组复用/回绕的
+    /// 假推进〔真机 8r 消融实测抓到一次性 +378MB 的 wrap 假跳变把 est 顶到 3.6G〕
+    /// ——截断防 est 污染，pace 误升方向的退化虽安全〔更松〕仍要防）。
     fn note_rx_ack(&mut self, v: &Ipv4View) -> u64 {
         self.ack_seg += 1;
         let ack = v.tcp_ack;
@@ -478,8 +481,8 @@ impl TcpObs {
                 if d == 0 && v.payload.is_empty() {
                     self.ack_dup += 1;
                 } else if d < 0x8000_0000 {
-                    // 单调推进（回绕安全半窗内）才计确认字节
-                    adv = d as u64;
+                    // 单调推进（回绕安全半窗内）才计确认字节；1MiB 截断见函数头
+                    adv = (d as u64).min(1024 * 1024);
                     self.ack_bytes += adv;
                     self.inflight_est -= adv as i64;
                 }
