@@ -113,10 +113,13 @@ struct QueuedFace {
     pending: Arc<AtomicBool>,
     /// socketpair 写端（fd 属 ServerBind；-1 = 未建/已关）。
     wake_w: i32,
-    /// 收工位（驱动线程置位 + 写唤醒；发送线程每轮读）。
+    /// 收工位（驱动线程置位 + 写唤醒——恒「先 store 再 send」；发送线程每轮读 +
+    /// 空转路径读干后的电平复查〔r1-①〕）。
     stop: Arc<AtomicBool>,
-    /// 发送线程在世位（发送线程首指令置 true、AliveGuard 任何出口清零——
-    /// 驱动线程降级判据；初值 false ⇒ spawn 失败不误判〔评审 p1a-C-3〕）。
+    /// 发送线程在世位（**预置 true**〔P1 定位批：防「spawn 成功 ↔ 线程首指令」窗口内
+    /// 驱动线程误读 false ⇒ 降级 join 永等〕；AliveGuard 任何出口清零——驱动线程降级
+    /// 判据。p1a-C-3「spawn 失败不误判」由「QueuedFace 仅 spawn 成功才装配」结构性
+    /// 承担——失败路径无 face ⇒ 旗无读者）。
     alive: Arc<AtomicBool>,
 }
 
@@ -997,7 +1000,7 @@ impl ServerBind {
     /// consumer 并存会破 SPSC 不变量；None 分支 = 线程退出中未透，弃存量〔洞语义，
     /// TCP 重传恢复〕记行）。切换后 send_wire 恒内联。
     fn tx_degrade(&mut self) {
-        let Some(mut q) = self.tx_queued.take() else { return };
+        let Some(q) = self.tx_queued.take() else { return };
         let fd = self.sock.as_raw_fd();
         let mut rescued = 0usize;
         let mut lost = 0usize;
@@ -1022,7 +1025,10 @@ impl ServerBind {
                 }
             }
             None => {
-                lost = q.producer.approx_len();
+                // 原线程未透 consumer（退出中）：随后的 stop+唤醒令其 drain-then-exit
+                // 把存量真发出（正常收尾/panic 后残余形态度量级 ≈ 0；观测口径 r1-⑤——
+                // 「放弃」仅在停发字节也丢的形态才成立，不虚报）。
+                lost = 0;
             }
         }
         (self.dlogf)(&format!(
@@ -1030,8 +1036,10 @@ impl ServerBind {
         ));
         // 收尸前先 stop + 唤醒（P1 定位批防御）：降级语义 = 线程已宣判死亡 ⇒ 令其
         // 真退出——即便 alive 是被误读的（窗口类 bug 复发），活着的线程也会醒、
-        // 见 stop、drain-then-exit ⇒ join 必返（否则对 poll 长眠线程 join 永等 =
-        // 驱动线程死锁——p1a-C-1「join 必返」论证在降级路径的补全）。
+        // 见 stop、drain-then-exit ⇒ join 必返。**不变量：先 store(stop) 再 send(唤醒
+        // 字节)**——与发送线程空转路径的「stop 电平复查」（tx_thread_loop）配对成
+        // 完整论证（r1-①前该配对缺接收侧 ⇒ 微秒窗口内字节被 tx_read_dry 吞 ⇒
+        // join 永等）。
         q.stop.store(true, Ordering::SeqCst);
         let wake = [1u8];
         unsafe {
@@ -1051,11 +1059,13 @@ impl ServerBind {
     }
 
     /// 收工（驱动线程收工循环后调用）：stop + 唤醒 + join（**无超时**——必返论证：
-    /// 发送线程全部阻塞面 = poll〔唤醒字节可醒〕与排空循环〔真实工作，send 非阻塞
-    /// socket EAGAIN 短返不长阻塞〕⇒ stop 后至多一轮排空（4096 包 ≈ ms 级）即返。
-    /// 超时/detach 路径**不存在**——泄漏 dup fd → socket 占端口 → 下次启动端口漂移
-    /// → token 端点漂移〔p1a-C-1〕）。发送线程退出语义 = drain-then-exit（收 stop
-    /// 先排空剩余再退——宽限期尾数据不丢）。
+    /// **不变量：先 store(stop) 再 send(唤醒字节)**，与发送线程空转路径的「stop
+    /// 电平复查」（tx_thread_loop）配对 ⇒ 字节必被 poll 看到（复查读到 false ⇒
+    /// 字节必在其后发出 ⇒ 其后唯一读干已过去）；其余阻塞面 = 排空循环〔真实工作，
+    /// send 非阻塞 socket EAGAIN 短返不长阻塞〕⇒ stop 后至多一轮排空（4096 包 ≈
+    /// ms 级）即返。超时/detach 路径**不存在**——泄漏 dup fd → socket 占端口 →
+    /// 下次启动端口漂移 → token 端点漂移〔p1a-C-1〕）。发送线程退出语义 =
+    /// drain-then-exit（收 stop 先排空剩余再退——宽限期尾数据不丢）。
     pub fn tx_shutdown(&mut self, dlogf: &crate::Logf) {
         if let Some(q) = self.tx_queued.take() {
             q.stop.store(true, Ordering::SeqCst);
@@ -1156,18 +1166,27 @@ fn tx_thread_loop(
     let _guard = AliveGuard(alive);
     let mut batch: Vec<Slot> = Vec::with_capacity(256);
     loop {
-        if stop.load(Ordering::Relaxed) {
+        if stop.load(Ordering::Acquire) {
             break;
         }
         // 队深峰观测（每唤醒一次，排空前可见深度）
         stats.depth_peak.fetch_max(consumer.visible_len() as u64, Ordering::Relaxed);
         let drained = tx_drain_rounds(&mut consumer, &sock, &stats, burst, &mut batch, &dlogf);
-            if drained == 0 {
+        if drained == 0 {
             // 空转路径（次序不变量 p1a-G-2）：pending 清 → 读干 → 竞态兜底再排 →
             // poll 长眠。「pending 清」必须先于「最后一次空取」——否则 push 方
             // 恰在空取后、store 前完成 ⇒ pending 旧 true ⇒ 不 send ⇒ 睡死。
             pending.store(false, Ordering::Release);
             tx_read_dry(wake_r);
+            // stop 电平复查（r1-①，高）：驱动侧收工/降级恒「先 store(stop) 再 send(唤醒
+            // 字节)」（tx_shutdown / tx_degrade 的不变量）。本复查读到 false ⇒ 字节必在
+            // 其后才发出 ⇒ 之后唯一的读干（上面那行）已经过去 ⇒ 进 poll 时字节必在缓冲里
+            // ⇒ poll 立即返回。没有这行：stop+字节落在〔循环顶检查 → tx_read_dry〕窗口内
+            // ⇒ 字节被读干、stop 不再复查 ⇒ poll(-1) 长眠 ⇒ join 永等 = 驱动线程整线程
+            // 死锁（评审受控复现：窗口加宽 100ms 下 tx_shutdown 45s 不返；补本行 51ms 返）。
+            if stop.load(Ordering::Acquire) {
+                continue;
+            }
             if consumer.has_items() {
                 continue;
             }
@@ -1698,6 +1717,10 @@ mod tests {
         sink.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let sock_dup = b.try_clone_socket().unwrap();
         b.tx_start(sock_dup, 64 * 1024, noop_logf());
+        // 模式守卫（r1-②）：tx_start 失败（socketpair/spawn）只经 dlogf 记行，而本测试
+        // 传 noop_logf ⇒ 静默 Inline 下三轮照过、只有 wakeups 断言会红且指向错根因
+        //（评审实测 alive=false 变体 8 跑 6 次以「实醒 0」假红）。必须钉死在 Queued 上。
+        assert!(b.tx_queued_mode(), "tx_start 未进 Queued——本测试会在 Inline 臂上假绿");
         // 三轮间隔推送：每轮 1 包、轮间等收妥 + 落回 poll（50ms ≫ 排空/回睡时序）
         for round in 0..3u32 {
             let mut out = InboundOut::default();
@@ -1714,6 +1737,8 @@ mod tests {
             assert!(n >= 66);
             std::thread::sleep(Duration::from_millis(50)); // 让发送线程落回 poll 长眠
         }
+        // 循环后复查：全程不得降级（降级 = 本测试的判别前提已失效）
+        assert!(b.tx_queued_mode(), "测试中途降级到 Inline——判别前提失效");
         let snap = b.tx_stats_snapshot();
         assert!(snap.wakeups >= 1, "至少应有一次唤醒（实醒 {}）", snap.wakeups);
         assert!(snap.pkgs >= 3, "三轮各 1 包都应经发送线程计账（{}）", snap.pkgs);
