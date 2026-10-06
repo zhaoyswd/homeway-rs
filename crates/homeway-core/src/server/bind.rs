@@ -28,6 +28,7 @@ use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
 use std::os::fd::AsRawFd as _;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,6 +36,7 @@ use crate::udpbatch::{bind_dual_stack, bind_v6_only, is_dual_stack, unmap_v4_in6
 use crate::wtransport::frame::{self, FrameKind};
 
 use super::device::InboundOut;
+use super::txring::{self, Slot};
 
 /// 新源记录表容量上限（Go srcSeenMax）。
 const SRC_SEEN_MAX: usize = 4096;
@@ -53,6 +55,70 @@ const LEG_PORTS_MAX: usize = 4096;
 
 /// 出站收口产物：一个要发上网络的 WG 包（含目标端点）。
 pub struct WireOut(pub Vec<(SocketAddr, Vec<u8>)>);
+
+// ---------- P1 发送路径拆分（浅拆；设计 = docs/reviews/P1-design.md） ----------
+//
+// 驱动线程串行五道工序中「密文→sendto」独立成发送线程：send_wire 的判定面
+//（腿派发/#17 丢弃/族适配/腿帧帧化）留驱动线程，主 socket 的密文经 SPSC ring
+// 交接给发送线程批量发出（Linux sendmmsg / macOS 逐包——udpbatch::send_batch 原样
+// 复用）。收益：sendto 不再占驱动线程（下行倾泻期 ACK 消费不被排后）；发送节奏
+// 脱离驱动线程 poll 拍（排空循环事件驱动、单轮团块 ≤ burst）；批量化有归宿。
+
+/// 主 socket 发送面统计（双模式统一写、驱动线程 5s 读）。**「轮」口径**
+///（评审 p1a-D-1）：Queued = 发送线程一次排空轮（单轮 ≤ burst 字节）；
+/// Inline = 一次 send_wire 调用（拆分前语义）——跨模式不可直比，行面带口径。
+/// 窗口语义字段（batch_max/hist/depth_peak）消费即清零；累计字段差分。
+pub(crate) struct TxStats {
+    pub bytes: AtomicU64,
+    pub calls: AtomicU64,
+    pub pkgs: AtomicU64,
+    /// send_batch 短返余量/失败批丢弃（发送线程或内联写）。
+    pub drops: AtomicU64,
+    /// ring 满丢（驱动线程写——丢新，TCP 尾丢语义）。
+    pub ring_drops: AtomicU64,
+    /// 发送线程唤醒数（Inline 恒 0）。
+    pub wakeups: AtomicU64,
+    /// 发送线程排空耗时累计（ns；Inline 模式不含〔send_wire wall 已含发送〕）。
+    pub drain_ns: AtomicU64,
+    pub batch_max: AtomicU64,
+    pub depth_peak: AtomicU64,
+    pub hist: [AtomicU64; 13],
+}
+
+impl TxStats {
+    fn new() -> Self {
+        Self {
+            bytes: AtomicU64::new(0),
+            calls: AtomicU64::new(0),
+            pkgs: AtomicU64::new(0),
+            drops: AtomicU64::new(0),
+            ring_drops: AtomicU64::new(0),
+            wakeups: AtomicU64::new(0),
+            drain_ns: AtomicU64::new(0),
+            batch_max: AtomicU64::new(0),
+            depth_peak: AtomicU64::new(0),
+            hist: std::array::from_fn(|_| AtomicU64::new(0)),
+        }
+    }
+}
+
+/// 队列模式交接面（ServerBind 持有；发送线程只经原子/裸 fd 交互——fd 生命周期
+/// 锚定 ServerBind，发送线程不持所有权 ⇒ panic 展开不 close 任何 fd，唤醒 send
+/// 永不面对 EPIPE〔评审 p1a-G-1：socketpair + MSG_NOSIGNAL，本仓 SIGPIPE 已恢复
+/// 默认处置〕）。
+struct QueuedFace {
+    producer: txring::TxProducer,
+    /// 唤醒合并位：producer 侧 `push → !swap(true) 才 send`；consumer 侧
+    /// `store(false) → 读干 → 取队`——次序颠倒会丢唤醒睡死（评审 p1a-G-2）。
+    pending: Arc<AtomicBool>,
+    /// socketpair 写端（fd 属 ServerBind；-1 = 未建/已关）。
+    wake_w: i32,
+    /// 收工位（驱动线程置位 + 写唤醒；发送线程每轮读）。
+    stop: Arc<AtomicBool>,
+    /// 发送线程在世位（发送线程首指令置 true、AliveGuard 任何出口清零——
+    /// 驱动线程降级判据；初值 false ⇒ spawn 失败不误判〔评审 p1a-C-3〕）。
+    alive: Arc<AtomicBool>,
+}
 
 /// 入站消费结果（recv_packet 的返回契约——驱动循环 drain 语义同客户端 bind）。
 /// **reg 先于 data 应用**：容器帧 `[reg][init]`（Go 客户端首包形态）里 reg 登记设备表
@@ -119,28 +185,24 @@ pub struct ServerBind {
     tx_stage: Vec<u8>,
     /// staging 内各帧的 (记账载荷长, 端点, 帧全长)。
     tx_lens: Vec<(usize, SocketAddr, usize)>,
-    /// 批量出站的**丢弃计数**（评审 r1-F7/F8）：短返余量 + 失败批次——旧行为逐包
-    /// send_to 失败有日志无计数；批化后短返余量既无日志也无计数（静默）——本计数
-    /// 补观测面（日志 100 次一行节流；与 leg_dropped 同范式）。
-    tx_dropped: u64,
-    /// 批量出站形态统计（R8-2 归因插桩）：发送调用数 / 累计包数 / **本观察窗**单调用
-    /// 峰值包数（消费即清零——评审 r1-F5：生命周期累计 max 会污染后续所有窗口行）
-    /// ——「每拍实际排空几包」（唤醒粒度）的判别面。空闲不增长，5s 周期行由引擎打。
-    /// 注（r1-F6）：tx_pkgs 按入批计（含被丢弃的余量——「攒了几包」口径）；
-    /// tx_bytes 按成功前缀计——drops>0 时均包 B 低报（实测轮 drops=0 不受影响）。
-    tx_calls: u64,
-    tx_pkgs: u64,
-    tx_batch_max: usize,
     /// 发送面耗时（P1b-0 剂量插桩）：send_wire 的 wall-time 累计（ns，空批早退
-    /// 不计——那不是发送成本）。驱动线程被「密文→sendto」占住的 ms/s 的直接
-    /// 观测面：P1 拆分的前后对照（拆分后 = 判定+入队侧；发送线程侧分列）。
+    /// 不计——那不是发送成本）。驱动线程被发送面占住的 ms/s 的直接观测面：
+    /// P1 拆分的前后对照（拆分后此值 = 判定+入队侧，发送线程排空耗时另列
+    /// `TxStats.drain_ns`）。
     pub tx_wall_ns: u64,
-    /// 批量出站**批分布直方图**（R8-3 8i 插桩）：log2 桶——`tx_hist[i]` = 本观察窗
-    /// 批大小 ∈ **[2^i, 2^(i+1))** 的调用数（i=0 即批恰 1 包；评审 r2-5.2 订正
-    /// 区间语义——此前注释写 (2^i, 2^(i+1)] 与 i=0=单包自相矛盾）。窗语义（消费即
-    /// 清零，与 tx_batch_max 同拍）——「修复前 ≤2379 包倾泻 → 修复后 ≤128 包主导」
-    /// 的直方图对比面（PERF-AB §9.3 修复前基线：均批 36-442，单调用峰值 2379）。
-    tx_hist: [u64; Self::TX_HIST_BUCKETS],
+    // ---- P1 发送路径拆分（见模块头「P1 发送路径拆分」注释块） ----
+    /// None = Inline（内联直发，= 拆分前形态：消融臂 / spawn 失败 / 降级）；
+    /// Some = Queued（主 socket 密文经 ring 交发送线程）。一次性切换（降级路径
+    /// tx_degrade 拿走并置 None）。
+    tx_queued: Option<Box<QueuedFace>>,
+    /// 发送线程句柄（驱动线程收工时 join——无超时，必返论证见 tx_shutdown）。
+    tx_thread: Option<std::thread::JoinHandle<()>>,
+    /// socketpair 读端（fd 生命周期锚 ServerBind；-1 = 未建/已关）。
+    wake_r: i32,
+    /// 主 socket 发送面统计（双模式统一写——Inline 由 send_wire_inner 记、
+    /// Queued 由发送线程记；驱动线程 5s 行读快照。R8-2/R8-3 时代的 ServerBind
+    /// 侧窗口统计〔calls/pkgs/batch_max/hist/dropped〕P1 起全部迁此）。
+    tx_stats: Arc<TxStats>,
 }
 
 impl ServerBind {
@@ -234,12 +296,11 @@ impl ServerBind {
             recv_buf: Box::new([0u8; 65536]),
             tx_stage: Vec::with_capacity(256 * 1024),
             tx_lens: Vec::with_capacity(256),
-            tx_dropped: 0,
-            tx_calls: 0,
-            tx_pkgs: 0,
-            tx_batch_max: 0,
             tx_wall_ns: 0,
-            tx_hist: [0; Self::TX_HIST_BUCKETS],
+            tx_queued: None,
+            tx_thread: None,
+            wake_r: -1,
+            tx_stats: Arc::new(TxStats::new()),
         })
     }
 
@@ -636,56 +697,144 @@ impl ServerBind {
             return; // 常态快速路径（handle_inbound 的逐包调用多无产出）
         }
         let t0 = Instant::now();
+        // 降级检测（P1）：Queued 模式下发送线程失活 ⇒ 一次性切 Inline（切换即接管
+        // 排空 ring 存量——p1a-B-1 的 TxMode 一次性状态位语义）。之后恒走内联。
+        if self.tx_queued.as_ref().is_some_and(|q| !q.alive.load(Ordering::Relaxed)) {
+            self.tx_degrade();
+        }
+        if self.tx_queued.is_some() {
+            // 借用拆分：take → 处理 → 放回（判定面需要 &mut self 做腿派发）
+            let mut q = self.tx_queued.take().expect("is_some 已判");
+            self.send_wire_queued(out, &mut q);
+            self.tx_queued = Some(q);
+        } else {
+            self.send_wire_inner(out);
+        }
+        self.tx_wall_ns += t0.elapsed().as_nanos() as u64;
+    }
+
+    /// 控制面直发（P1 修订：解封应答/keepalive 等**低频时序敏感面**保持拆分前
+    /// 的同步直发形态——无论 Queued/Inline 模式都 inline 发出。归因：真机排查
+    /// 实测队列路径的握手应答在本机回环形态下客户端解密失败（response 字节
+    /// 逐字节合法、发送线程发送成功、客户端 UDP 层已收到但 WG 层拒收——异步
+    /// 交接面的时序/状态耦合未及根因定位，先以「控制面 inline」恢复既有基线；
+    /// 数据面〔route_encap 主体 = 78% 的大头〕保持队列拆分）。
+    pub fn send_wire_ctl(&mut self, out: &InboundOut) {
+        if out.wire.is_empty() {
+            return;
+        }
+        let t0 = Instant::now();
         self.send_wire_inner(out);
         self.tx_wall_ns += t0.elapsed().as_nanos() as u64;
+    }
+
+    /// 判定面单条（两模式共用）：腿命中 → 腿 socket 直发（tx_bytes 记账）；
+    /// #17 丢弃（腿已摘）。返回 true = 该条已消化（不走主 socket）。
+    fn dispatch_leg(&mut self, ep: &SocketAddr, wg: &[u8], out: &InboundOut) -> bool {
+        // 腿表命中（先取 fd 再发——借用分离）
+        let leg_fd = self
+            .leg_by_r
+            .get(ep)
+            .and_then(|id| self.leg_by_id.get(id))
+            .map(|lg| lg.sock.as_raw_fd());
+        if let Some(fd) = leg_fd {
+            if let Some(lg) = self
+                .leg_by_id
+                .values_mut()
+                .find(|lg| lg.sock.as_raw_fd() == fd)
+            {
+                lg.last = Instant::now(); // Send 刷 last（Go Send 同义）
+                let wire = frame::frame_bytes(FrameKind::Data, wg);
+                let n = unsafe {
+                    // MSG_NOSIGNAL（评审 D-1 中-4：与 relay/ctlface 同款——n != len 的
+                    // 错误分支依赖 EPIPE 而非进程被信号打死）。
+                    libc::send(fd, wire.as_ptr().cast(), wire.len(), libc::MSG_NOSIGNAL)
+                };
+                if n != wire.len() as isize {
+                    let remote = lg.remote;
+                    let id = lg.id;
+                    self.leg_read_exit(id, remote);
+                } else {
+                    self.tx_bytes += wg.len() as u64;
+                }
+                return true;
+            }
+        }
+        let recent = self.leg_recent.contains_key(ep);
+        let ever_leg = self.leg_ports.contains(ep);
+        if recent || ever_leg {
+            // #17：丢弃 + 节流计数（等控制面重放重建腿，或下一入站包重学 endpoint）。
+            // 计数口径 = 每次 Send 派发 +1（Go bind.go:975 同义；非逐包），
+            // 包数取本 endpoint 批内包数（len(bufs)），通道 = 细节日志（logfD）。
+            self.leg_dropped += 1;
+            let ep_pkgs = out.wire.iter().filter(|(e2, _)| e2 == ep).count();
+            if self.leg_dropped <= 3 || self.leg_dropped.is_multiple_of(1000) {
+                (self.dlogf)(&format!(
+                    "腿已摘或非现任（{ep}）丢弃出站 {ep_pkgs} 包（等控制面重放重建腿）"
+                ));
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Queued 模式的 send_wire 主体（P1）：判定面 + 帧化 + 入队 + 唤醒。
+    /// 满丢 = 丢新（队尾拒绝——TCP 尾丢语义，dup-ACK/RTO 恢复；**绝不丢队头/队中**
+    ///——乱序禁区）。
+    fn send_wire_queued(&mut self, out: &InboundOut, q: &mut QueuedFace) {
+        let mut pushed = 0usize;
+        let mut dropped: u64 = 0;
+        let mut first_drop_ep: Option<SocketAddr> = None;
+        for (ep, wg) in &out.wire {
+            if self.dispatch_leg(ep, wg, out) {
+                continue;
+            }
+            // 主 socket：帧化直写新 Vec（跨线程所有权移交的最简形态——每包一次
+            // ~1.3KB 分配，39k 包/s ≈ 0.3% CPU 量级；回收环登记后续）
+            let mut buf = Vec::with_capacity(wg.len() + 8);
+            frame::encode_frame(FrameKind::Data, wg, &mut buf);
+            if q.producer
+                .push(Slot { dst: self.xmit_addr(*ep), buf })
+            {
+                pushed += 1;
+            } else {
+                dropped += 1;
+                if first_drop_ep.is_none() {
+                    first_drop_ep = Some(*ep);
+                }
+            }
+        }
+        if dropped > 0 {
+            // 满丢节流记行（首 3 + 每 1000；含首丢端点——多 peer 归因面，p1a-A-2）
+            let d = self.tx_stats.ring_drops.fetch_add(dropped, Ordering::Relaxed) + dropped;
+            if d <= 3 || d.is_multiple_of(1000) {
+                (self.dlogf)(&format!(
+                    "发送队列满：本批丢新 {dropped} 包（累计 {d}，首丢端点 {}）——队尾丢 = TCP 尾丢语义，重传恢复",
+                    first_drop_ep.map(|e| e.to_string()).unwrap_or_else(|| "?".into())
+                ));
+            }
+        }
+        if pushed > 0 && !q.pending.swap(true, Ordering::AcqRel) {
+            // 唤醒（合并位：本拍已有 pending 则不写——EAGAIN〔socketpair 缓冲满〕
+            // 同样无害：pending 已 true，消费侧读干后必能取到包）
+            let b = [1u8];
+            let rc2 = unsafe {
+                libc::send(
+                    q.wake_w,
+                    b.as_ptr().cast(),
+                    1,
+                    libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
+                )
+            };
+            if std::env::var_os("HOMEWAY_TX_DBG").is_some() { eprintln!("[TXDBG] wake send rc={rc2} pushed={pushed} at={:?}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)); }
+        }
     }
 
     fn send_wire_inner(&mut self, out: &InboundOut) {
         self.tx_stage.clear();
         self.tx_lens.clear();
         for (ep, wg) in &out.wire {
-            // 腿表命中（先取 fd 再发——借用分离）
-            let leg_fd = self
-                .leg_by_r
-                .get(ep)
-                .and_then(|id| self.leg_by_id.get(id))
-                .map(|lg| lg.sock.as_raw_fd());
-            if let Some(fd) = leg_fd {
-                if let Some(lg) = self
-                    .leg_by_id
-                    .values_mut()
-                    .find(|lg| lg.sock.as_raw_fd() == fd)
-                {
-                    lg.last = Instant::now(); // Send 刷 last（Go Send 同义）
-                    let wire = frame::frame_bytes(FrameKind::Data, wg);
-                    let n = unsafe {
-                        // MSG_NOSIGNAL（评审 D-1 中-4：与 relay/ctlface 同款——n != len 的
-                        // 错误分支依赖 EPIPE 而非进程被信号打死）。
-                        libc::send(fd, wire.as_ptr().cast(), wire.len(), libc::MSG_NOSIGNAL)
-                    };
-                    if n != wire.len() as isize {
-                        let remote = lg.remote;
-                        let id = lg.id;
-                        self.leg_read_exit(id, remote);
-                    } else {
-                        self.tx_bytes += wg.len() as u64;
-                    }
-                    continue;
-                }
-            }
-            let recent = self.leg_recent.contains_key(ep);
-            let ever_leg = self.leg_ports.contains(ep);
-            if recent || ever_leg {
-                // #17：丢弃 + 节流计数（等控制面重放重建腿，或下一入站包重学 endpoint）。
-                // 计数口径 = 每次 Send 派发 +1（Go bind.go:975 同义；非逐包），
-                // 包数取本 endpoint 批内包数（len(bufs)），通道 = 细节日志（logfD）。
-                self.leg_dropped += 1;
-                let ep_pkgs = out.wire.iter().filter(|(e2, _)| e2 == ep).count();
-                if self.leg_dropped <= 3 || self.leg_dropped.is_multiple_of(1000) {
-                    (self.dlogf)(&format!(
-                        "腿已摘或非现任（{ep}）丢弃出站 {ep_pkgs} 包（等控制面重放重建腿）"
-                    ));
-                }
+            if self.dispatch_leg(ep, wg, out) {
                 continue;
             }
             // 主 socket：帧头直写复用 staging（评审 r1-F9：此前 frame_bytes 每包
@@ -714,57 +863,219 @@ impl ServerBind {
             off += fr_len;
         }
         let (sent, first_err) = crate::udpbatch::send_batch(fd, &msgs);
-        // 形态统计（R8-2 归因）：本调用入批包数（含被丢弃的——「每拍攒了几包」
-        // 与「发出去几包」分开看：丢弃主导时前者才是真实唤醒粒度）。
-        self.tx_calls += 1;
-        self.tx_pkgs += self.tx_lens.len() as u64;
-        self.tx_batch_max = self.tx_batch_max.max(self.tx_lens.len());
+        if std::env::var_os("HOMEWAY_TX_DBG").is_some() && !self.tx_lens.is_empty() {
+            let fr = self.tx_lens[0].2;
+            eprintln!("[TXDBG-inline] n={} dst={} full={:02x?}", self.tx_lens.len(), self.tx_lens[0].1, &self.tx_stage[..fr.min(100)]);
+        }
+        // 形态统计（R8-2 归因 → P1 迁 TxStats；Inline 模式 = 拆分前语义）：本调用
+        // 入批包数（含被丢弃的——「每拍攒了几包」与「发出去几包」分开看）。
+        let n = self.tx_lens.len();
+        self.tx_stats.calls.fetch_add(1, Ordering::Relaxed);
+        self.tx_stats.pkgs.fetch_add(n as u64, Ordering::Relaxed);
+        self.tx_stats.batch_max.fetch_max(n as u64, Ordering::Relaxed);
         // 批分布直方图（R8-3 8i）：log2 桶（n=1 → 桶 0；floor(log2(n)) 截末桶）。
-        let idx = (usize::BITS as usize - 1 - self.tx_lens.len().leading_zeros() as usize)
+        let idx = (usize::BITS as usize - 1 - n.leading_zeros() as usize)
             .min(Self::TX_HIST_BUCKETS - 1);
-        self.tx_hist[idx] += 1;
-        // 注：msgs 为本函数局建（OutMsg 借 staging——自引用结构不能做成字段）；
-        // 每次调用一次 Vec 分配（相对每包一次 frame_bytes 分配已是数量级改善）。
+        self.tx_stats.hist[idx].fetch_add(1, Ordering::Relaxed);
+        // 注：msgs 为本函数局建（OutMsg 借 staging——自引用结构不能做成字段）。
         // 记账按「成功前缀」（send_batch 顺序发送，短返只发前缀；Linux sendmmsg
         // 返回值语义 = 前缀已发）。**短返余量/失败批次本拍丢弃**（非阻塞 socket 的
         // EAGAIN/不可达对余量同型，逐包重试只是重复同错；UDP 本身不保证送达——
-        // TCP 层的重传由对端 ACK 时钟兜底）——丢弃进 tx_dropped 计数（评审 r1-F7）。
+        // TCP 层的重传由对端 ACK 时钟兜底）——丢弃进 TxStats.drops（评审 r1-F7）。
         for &(wg_len, _, _) in self.tx_lens.iter().take(sent) {
             self.tx_bytes += wg_len as u64;
         }
-        let dropped = (self.tx_lens.len() - sent) as u64;
+        let ok_bytes: u64 = self.tx_lens.iter().take(sent).map(|(l, _, _)| *l as u64).sum();
+        self.tx_stats.bytes.fetch_add(ok_bytes, Ordering::Relaxed);
+        let dropped = (n - sent) as u64;
         if dropped > 0 {
-            self.tx_dropped += dropped;
+            self.tx_stats.drops.fetch_add(dropped, Ordering::Relaxed);
         }
         if let Some((ep, e)) = first_err {
             // 发送失败节流记行（评审 r1-F8：100 次一行——对端可控面不能刷屏；
             // 首错即弃整批是**有意**语义：同 socket 同型错误，余量重试大概率同错
             // 且会造成同 peer 乱序）
-            if self.tx_dropped <= 3 || self.tx_dropped.is_multiple_of(100) {
-                (self.logf)(&format!(
-                    "发送到 {ep} 失败（{e}；批量出站累计丢弃 {} 包）",
-                    self.tx_dropped
-                ));
+            let d = self.tx_stats.drops.load(Ordering::Relaxed);
+            if d <= 3 || d.is_multiple_of(100) {
+                (self.logf)(&format!("发送到 {ep} 失败（{e}；批量出站累计丢弃 {d} 包）"));
             }
         }
         // 诊断面：no_endpoint_drops 在 device 内
+    }
+
+    // ---------- P1 发送线程面 ----------
+
+    /// 装配面：起发送线程（浅拆）。失败（socketpair/spawn）不致命——保持 Inline
+    ///（= 拆分前串行形态）+ 记行（隧道不受影响）。
+    /// `sock` = try_clone 的 dup fd（发送线程独占；退出/panic 时 Drop 自关）；
+    /// `burst_bytes` = 单轮排空字节上界（团块钳制——与整形器单拍上界同语义）。
+    pub fn tx_start(&mut self, sock: UdpSocket, burst_bytes: usize, dlogf: crate::Logf) {
+        // socketpair（fd 生命周期锚 ServerBind；SOCK_DGRAM + MSG_NOSIGNAL——本仓
+        // main 已把 SIGPIPE 恢复默认处置，裸写死管道会打死进程〔评审 p1a-G-1〕；
+        // Darwin 无 pipe2 绑定，socketpair 全平台可用〔p1a-G-3〕）
+        let mut fds = [-1i32; 2];
+        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
+        if rc != 0 {
+            let e = io::Error::last_os_error();
+            (dlogf)(&format!("⚠️ 发送线程：socketpair 失败（{e}）—— 保持内联发送（拆分前形态）"));
+            return;
+        }
+        let (producer, consumer) = txring::txring_new();
+        let pending = Arc::new(AtomicBool::new(false));
+        let stop = Arc::new(AtomicBool::new(false));
+        // alive 初值 false（p1a-C-3：spawn 失败 ⇒ 恒 false ⇒ 降级判据不误报；
+        // 线程体首指令置 true）
+        let alive = Arc::new(AtomicBool::new(false));
+        self.wake_r = fds[0];
+        let stats = Arc::clone(&self.tx_stats);
+        let builder = std::thread::Builder::new()
+            .name("homeway-serve-tx".into())
+            .stack_size(1024 * 1024);
+        let sp = builder.spawn({
+            let stop = Arc::clone(&stop);
+            let alive = Arc::clone(&alive);
+            let dlogf = Arc::clone(&dlogf);
+            move || {
+                tx_thread_loop(
+                    sock, consumer, fds[0], stats, pending, stop, alive, burst_bytes, dlogf,
+                );
+            }
+        });
+        match sp {
+            Ok(h) => {
+                self.tx_thread = Some(h);
+                self.tx_queued = Some(Box::new(QueuedFace {
+                    producer,
+                    pending: Arc::new(AtomicBool::new(false)),
+                    wake_w: fds[1],
+                    stop,
+                    alive,
+                }));
+            }
+            Err(e) => {
+                // spawn 失败：闭包已 drop（sock 随之关闭）；关 socketpair 保持 Inline
+                unsafe {
+                    libc::close(fds[0]);
+                    libc::close(fds[1]);
+                }
+                self.wake_r = -1;
+                (dlogf)(&format!("⚠️ 发送线程：spawn 失败（{e}）—— 保持内联发送（拆分前形态）"));
+            }
+        }
+    }
+
+    /// ring 高水位（P1 两级前置背压：驱动线程本拍整形放行退化为「只并入不释放」
+    ///——包留整形 FIFO = 真背压不丢包，满丢成为最后兜底）。
+    pub fn tx_high_water(&mut self) -> bool {
+        match self.tx_queued.as_mut() {
+            Some(q) => q.producer.approx_len() >= txring::HIGH_WATER,
+            None => false,
+        }
+    }
+
+    /// 是否 Queued 模式（观测行口径判据）。
+    pub fn tx_queued_mode(&self) -> bool {
+        self.tx_queued.is_some()
+    }
+
+    /// 主 socket 发送面统计快照（驱动线程 5s 行读；窗口语义字段消费即清零）。
+    pub(crate) fn tx_stats_snapshot(&self) -> TxStatsSnap {
+        TxStatsSnap {
+            bytes: self.tx_stats.bytes.load(Ordering::Relaxed),
+            calls: self.tx_stats.calls.load(Ordering::Relaxed),
+            pkgs: self.tx_stats.pkgs.load(Ordering::Relaxed),
+            drops: self.tx_stats.drops.load(Ordering::Relaxed),
+            ring_drops: self.tx_stats.ring_drops.load(Ordering::Relaxed),
+            wakeups: self.tx_stats.wakeups.load(Ordering::Relaxed),
+            drain_ns: self.tx_stats.drain_ns.load(Ordering::Relaxed),
+            batch_max: self.tx_stats.batch_max.swap(0, Ordering::Relaxed),
+            depth_peak: self.tx_stats.depth_peak.swap(0, Ordering::Relaxed),
+            hist: std::array::from_fn(|i| self.tx_stats.hist[i].swap(0, Ordering::Relaxed)),
+        }
+    }
+
+    /// 降级（P1：发送线程失活 ⇒ 一次性切 Inline）。切换即接管排空 ring 存量
+    ///（`takeover_consumer` 以 strong_count==1 证明原 consumer 已 drop——两个
+    /// consumer 并存会破 SPSC 不变量；None 分支 = 线程退出中未透，弃存量〔洞语义，
+    /// TCP 重传恢复〕记行）。切换后 send_wire 恒内联。
+    fn tx_degrade(&mut self) {
+        let Some(mut q) = self.tx_queued.take() else { return };
+        let fd = self.sock.as_raw_fd();
+        let mut rescued = 0usize;
+        let mut lost = 0usize;
+        match q.producer.takeover_consumer() {
+            Some(mut c) => {
+                // 内联排空存量（p1a-B-1：drain → 内联发出——切换点串行化，无并发
+                // 乱序窗口；本批随后的 send_wire 走 Inline 同批追加）
+                let mut batch = Vec::new();
+                loop {
+                    batch.clear();
+                    let n = c.pop_batch(&mut batch, usize::MAX);
+                    if n == 0 {
+                        break;
+                    }
+                    let msgs: Vec<crate::udpbatch::OutMsg<'_>> = batch
+                        .iter()
+                        .map(|s| crate::udpbatch::OutMsg { dst: s.dst, buf: &s.buf })
+                        .collect();
+                    let (sent, _) = crate::udpbatch::send_batch(fd, &msgs);
+                    rescued += sent;
+                    lost += n - sent;
+                }
+            }
+            None => {
+                lost = q.producer.approx_len();
+            }
+        }
+        (self.dlogf)(&format!(
+            "⚠️ 发送线程异常退出——已降级内联发送（ring 存量：接管发出 {rescued} 包 / 放弃 {lost} 包〔放弃 = 洞语义，TCP 重传恢复〕）"
+        ));
+        // 收尸（线程已在退出路径——join 立即或极快返回）
+        if let Some(h) = self.tx_thread.take() {
+            let _ = h.join();
+        }
+        unsafe {
+            libc::close(q.wake_w);
+            if self.wake_r >= 0 {
+                libc::close(self.wake_r);
+                self.wake_r = -1;
+            }
+        }
+    }
+
+    /// 收工（驱动线程收工循环后调用）：stop + 唤醒 + join（**无超时**——必返论证：
+    /// 发送线程全部阻塞面 = poll〔唤醒字节可醒〕与排空循环〔真实工作，send 非阻塞
+    /// socket EAGAIN 短返不长阻塞〕⇒ stop 后至多一轮排空（4096 包 ≈ ms 级）即返。
+    /// 超时/detach 路径**不存在**——泄漏 dup fd → socket 占端口 → 下次启动端口漂移
+    /// → token 端点漂移〔p1a-C-1〕）。发送线程退出语义 = drain-then-exit（收 stop
+    /// 先排空剩余再退——宽限期尾数据不丢）。
+    pub fn tx_shutdown(&mut self, dlogf: &crate::Logf) {
+        if let Some(q) = self.tx_queued.take() {
+            q.stop.store(true, Ordering::SeqCst);
+            let b = [1u8];
+            unsafe {
+                libc::send(q.wake_w, b.as_ptr().cast(), 1, libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL)
+            };
+            if let Some(h) = self.tx_thread.take() {
+                if h.join().is_err() {
+                    (dlogf)("⚠️ 发送线程 join 失败（panic）——残余存量随线程丢失（洞语义，TCP 重传恢复）");
+                }
+            }
+            unsafe { libc::close(q.wake_w) };
+        } else if let Some(h) = self.tx_thread.take() {
+            // Queued 已降级但句柄未收（tx_degrade 已收——防御位）
+            let _ = h.join();
+        }
+        if self.wake_r >= 0 {
+            unsafe { libc::close(self.wake_r) };
+            self.wake_r = -1;
+        }
     }
 
     /// 底层 UDP fd（驱动线程 poll(2) 用）。
     pub fn udp_fd(&self) -> std::os::fd::RawFd {
         use std::os::fd::AsRawFd as _;
         self.sock.as_raw_fd()
-    }
-
-    /// 批量出站形态快照（R8-2 归因插桩 + R8-3 直方图）：(调用数, 累计包数, **本窗**
-    /// 单调用峰值包数, 累计丢弃包数, **本窗**批分布直方图)——均批 = pkgs/calls。峰值
-    /// 与直方图消费即清零（窗口语义）；计数累计（丢弃计数恒累计——失败面的单调观测）。
-    pub(crate) fn tx_batch_stats(&mut self) -> (u64, u64, usize, u64, [u64; Self::TX_HIST_BUCKETS]) {
-        let m = self.tx_batch_max;
-        let h = self.tx_hist;
-        self.tx_batch_max = 0;
-        self.tx_hist = [0; Self::TX_HIST_BUCKETS];
-        (self.tx_calls, self.tx_pkgs, m, self.tx_dropped, h)
     }
 
     /// 从本 socket 直接发裸载荷（STUN 请求等 3e 面；SendRawTo 同义——与数据面同端口）。
@@ -784,6 +1095,173 @@ impl ServerBind {
         self.src_seen.insert(src, ());
         (self.logf)(&format!("入站新源：{src}（{shape}，{n} 字节）"));
     }
+}
+
+impl Drop for ServerBind {
+    fn drop(&mut self) {
+        // 防御：未显式 tx_shutdown 的 drop 也走一遍收工（幂等——正常路径
+        // driver_loop 尾已调，此处只覆盖驱动线程异常终结的形态；必返论证同
+        // tx_shutdown，不引入 drop 阻塞面）。
+        let dlogf = Arc::clone(&self.dlogf);
+        self.tx_shutdown(&dlogf);
+    }
+}
+
+// ---------- P1 发送线程体 ----------
+
+/// P1 发送线程开关（值匹配惯例——与 HOMEWAY_TX_SHAPING 同款）。**产品默认 off
+///（内联 = 拆分前形态）**——本批引擎级集成存在未定位问题（本地 4265x 实测：
+/// 队列路径的 WG 密文包客户端层偶发拒收——握手应答队列发 = 客户端拒收死锁
+///〔已以控制面 inline 缓解〕；数据面 bulk 连接建立 flaky。字节级/时序级/内核
+/// 路径已大量排除〔见 docs/reviews/P1.md 接棒指针〕，机制与单测全绿）——未定位
+/// 前不开默认（「不带上未定位问题的行为变化上生产」）。on/1/true = 开（实验/
+/// 下棒定位用，机制全量在位）。
+pub(crate) fn tx_sendthread_enabled() -> bool {
+    matches!(
+        std::env::var("HOMEWAY_TX_SENDTHREAD").as_deref(),
+        Ok("on") | Ok("1") | Ok("true")
+    )
+}
+
+/// 发送线程主循环：排空循环（事件驱动、单轮 ≤ burst、轮间无拍隙）+ 空窗长眠
+///（poll 无限等待——stop 唤醒字节可醒）。收 stop ⇒ drain-then-exit。
+#[allow(clippy::too_many_arguments)] // 线程体一次性装配入参（拆 struct 无收益）
+fn tx_thread_loop(
+    sock: UdpSocket,
+    mut consumer: super::txring::TxConsumer,
+    wake_r: i32,
+    stats: Arc<TxStats>,
+    pending: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    alive: Arc<AtomicBool>,
+    burst: usize,
+    dlogf: crate::Logf,
+) {
+    alive.store(true, Ordering::SeqCst);
+    // 在世守卫（driver_alive 同款纪律：任何出口含 panic 展开都清零——驱动线程的
+    // 降级判据）。注：consumer 参数绑定先于本守卫存在 ⇒ drop 顺序在守卫之后
+    //（「alive=false ⇒ consumer 已 drop」不成立）——降级接管用 strong_count 证明
+    //（TxProducer::takeover_consumer），不依赖此顺序。
+    struct AliveGuard(Arc<AtomicBool>);
+    impl Drop for AliveGuard {
+        fn drop(&mut self) {
+            self.0.store(false, Ordering::SeqCst);
+        }
+    }
+    let _guard = AliveGuard(alive);
+    let mut batch: Vec<Slot> = Vec::with_capacity(256);
+    loop {
+        if stop.load(Ordering::Relaxed) {
+            break;
+        }
+        // 队深峰观测（每唤醒一次，排空前可见深度）
+        stats.depth_peak.fetch_max(consumer.visible_len() as u64, Ordering::Relaxed);
+        let drained = tx_drain_rounds(&mut consumer, &sock, &stats, burst, &mut batch, &dlogf);
+            if drained == 0 {
+            // 空转路径（次序不变量 p1a-G-2）：pending 清 → 读干 → 竞态兜底再排 →
+            // poll 长眠。「pending 清」必须先于「最后一次空取」——否则 push 方
+            // 恰在空取后、store 前完成 ⇒ pending 旧 true ⇒ 不 send ⇒ 睡死。
+            pending.store(false, Ordering::Release);
+            tx_read_dry(wake_r);
+            if consumer.has_items() {
+                continue;
+            }
+            let mut pf = libc::pollfd { fd: wake_r, events: libc::POLLIN, revents: 0 };
+            let rc = unsafe { libc::poll(&mut pf, 1, -1) };
+            stats.wakeups.fetch_add(1, Ordering::Relaxed);
+            if std::env::var_os("HOMEWAY_TX_DBG").is_some() { eprintln!("[TXDBG] poll rc={rc} revents={:#x}", pf.revents); }
+            if rc < 0 {
+                let e = io::Error::last_os_error();
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue; // EINTR：按到点返回重查 stop/队列
+                }
+                // 等待原语硬错误（不应发生——EBADF 形态 = fd 被关）：退 1ms 慢轮
+                // 防自旋（错误率极低，不值得更复杂的退化闸）
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            tx_read_dry(wake_r);
+        }
+    }
+    // drain-then-exit（收工语义：排空剩余再退——宽限期尾数据不丢）
+    while tx_drain_rounds(&mut consumer, &sock, &stats, burst, &mut batch, &dlogf) > 0 {}
+}
+
+/// 排空循环：循环取队（单轮 ≤ `burst` 字节——团块上界与整形器单拍上界同语义）
+/// 直到空；轮间无拍隙（发送节奏脱离驱动线程 poll 拍的体现）。返回本轮排空包数。
+/// msgs 每轮局建（OutMsg 借 batch——跨轮复用 msgs 会把上轮借用钉进签名；分配
+/// churn 与 Vec 回收环同登记后续）。
+fn tx_drain_rounds(
+    consumer: &mut super::txring::TxConsumer,
+    sock: &UdpSocket, // dup fd 的属主（生命周期 = 发送线程）；发送借其 raw fd 走 udpbatch
+    stats: &TxStats,
+    burst: usize,
+    batch: &mut Vec<Slot>,
+    dlogf: &crate::Logf,
+) -> usize {
+    let t0 = Instant::now();
+    let mut total = 0usize;
+    loop {
+        batch.clear();
+        let n = consumer.pop_batch(batch, burst);
+        if n == 0 {
+            break;
+        }
+        stats.calls.fetch_add(1, Ordering::Relaxed);
+        stats.pkgs.fetch_add(n as u64, Ordering::Relaxed);
+        stats.batch_max.fetch_max(n as u64, Ordering::Relaxed);
+        let idx = (usize::BITS as usize - 1 - n.leading_zeros() as usize)
+            .min(ServerBind::TX_HIST_BUCKETS - 1);
+        stats.hist[idx].fetch_add(1, Ordering::Relaxed);
+        let msgs: Vec<crate::udpbatch::OutMsg<'_>> =
+            batch.iter().map(|s| crate::udpbatch::OutMsg { dst: s.dst, buf: &s.buf }).collect();
+        let (sent, first_err) = crate::udpbatch::send_batch(sock.as_raw_fd(), &msgs);
+        if std::env::var_os("HOMEWAY_TX_DBG").is_some() {
+            eprintln!("[TXDBG] round n={n} sent={sent} dst={} len={} at={:?}", batch[0].dst, batch[0].buf.len(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
+        }
+        // 记账：成功前缀（帧全长口径——Inline 模式的 TxStats.bytes 同口径切换，
+        // 与 ServerBind.tx_bytes〔wg 载荷口径，腿面〕相差 4B/包，观测面均包 B 以
+        // TxStats 为准）
+        let ok_bytes: u64 = batch.iter().take(sent).map(|s| s.buf.len() as u64).sum();
+        stats.bytes.fetch_add(ok_bytes, Ordering::Relaxed);
+        let dropped = (n - sent) as u64;
+        if dropped > 0 {
+            let d = stats.drops.fetch_add(dropped, Ordering::Relaxed) + dropped;
+            if let Some((ep, e)) = first_err {
+                if d <= 3 || d.is_multiple_of(100) {
+                    (dlogf)(&format!("发送线程：发送到 {ep} 失败（{e}；累计丢弃 {d} 包）"));
+                }
+            }
+        }
+        total += n;
+    }
+    if total > 0 {
+        stats
+            .drain_ns
+            .fetch_add(t0.elapsed().as_nanos() as u64, Ordering::Relaxed);
+    }
+    total
+}
+
+/// 读干唤醒 socketpair（pool.rs 同款先例——残留字节会让 poll 恒可读空转）。
+fn tx_read_dry(wake_r: i32) {
+    let mut b = [0u8; 64];
+    unsafe {
+        while libc::recv(wake_r, b.as_mut_ptr().cast(), 64, libc::MSG_DONTWAIT) > 0 {}
+    }
+}
+
+/// 主 socket 发送面统计快照（驱动线程 5s 行消费；窗口语义字段已清零）。
+pub(crate) struct TxStatsSnap {
+    pub bytes: u64,
+    pub calls: u64,
+    pub pkgs: u64,
+    pub drops: u64,
+    pub ring_drops: u64,
+    pub wakeups: u64,
+    pub drain_ns: u64,
+    pub batch_max: u64,
+    pub depth_peak: u64,
+    pub hist: [u64; 13],
 }
 
 /// 监听口被占用时的退让顺序：+1…+9，最后随机（Go listenWithFallback 同序）。
@@ -1122,5 +1600,119 @@ mod tests {
         let port = holder.local_addr().unwrap().port();
         let s = listen_with_fallback(port).unwrap();
         assert_ne!(s.local_addr().unwrap().port(), port, "被占应退让");
+    }
+
+    // ---------- P1 发送路径拆分 ----------
+
+    /// 端到端（Queued 模式；harness 中臂形态）：send_wire 入队 → 发送线程排空 →
+    /// 回环 sink 收齐保序。覆盖：判定面/帧化/入队/唤醒次序/排空循环/统计记账全链。
+    /// 包量 = 3000（< ring 容量 4096——测试形态 = 产品形态的「入队受上游整形钳制」，
+    /// 不构造满丢〔满丢语义由 txring 单测钉死〕；回环全速 sink ⇒ 全收 + 保序 + 满丢 0）。
+    #[test]
+    fn tx_thread_end_to_end_ordered() {
+        const N: u32 = 3000;
+        let mut b = ServerBind::open(0, "t", noop_logf()).unwrap();
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        // 收侧放大缓冲（8000×66B ≈ 528KB——默认 RCVBUF 会丢尾批）
+        unsafe {
+            let sz: libc::c_int = 8 * 1024 * 1024;
+            libc::setsockopt(
+                sink.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_RCVBUF,
+                &sz as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as u32,
+            );
+        }
+        let dst = sink.local_addr().unwrap();
+        let sock_dup = b.try_clone_socket().unwrap();
+        b.tx_start(sock_dup, 64 * 1024, noop_logf());
+        assert!(b.tx_queued_mode(), "tx_start 成功应进 Queued 模式");
+        // 收线程并行收（回环 RCVBUF 有限——主线程只发不收会溢出丢尾）
+        let rx = std::thread::spawn({
+            let sink2 = sink.try_clone().unwrap();
+            move || {
+                sink2.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+                let mut got: Vec<u32> = Vec::new();
+                let mut buf = [0u8; 128];
+                while (got.len() as u32) < N {
+                    match sink2.recv_from(&mut buf) {
+                        // 腿帧壳 = [0xBB][kind=0][payload]——载荷在 +2 偏移
+                        Ok((n, _)) => {
+                            assert!(n >= 6, "腿帧壳 + 载荷");
+                            assert_eq!(buf[0], 0xBB, "帧魔数");
+                            got.push(u32::from_le_bytes([buf[2], buf[3], buf[4], buf[5]]));
+                        }
+                        Err(_) => break,
+                    }
+                }
+                got
+            }
+        });
+        // 分批入队（每包唯一序号载荷；驱动线程面形态——多次 send_wire 小批）
+        for chunk in 0..(N / 500) {
+            let mut out = InboundOut::default();
+            for i in 0..500u32 {
+                let mut wg = (chunk * 500 + i).to_le_bytes().to_vec();
+                wg.resize(64, 0);
+                out.wire.push((dst, wg));
+            }
+            b.send_wire(&out);
+        }
+        let got = rx.join().unwrap();
+        assert_eq!(got.len(), N as usize, "应收满 {N} 包（实收 {}）", got.len());
+        let expect: Vec<u32> = (0..N).collect();
+        assert_eq!(got, expect, "FIFO 保序（帧壳 2B 后载荷序号连续）");
+        // 统计面：排空包数 ≥ N（轮计数 ≥ 1）+ 满丢 0
+        let snap = b.tx_stats_snapshot();
+        assert!(snap.pkgs >= N as u64, "排空包数应计入（{}）", snap.pkgs);
+        assert!(snap.calls >= 1, "排空轮应计入");
+        assert_eq!(snap.ring_drops, 0, "中臂满丢应为 0");
+        assert_eq!(snap.drops, 0, "中臂 send_batch 丢弃应为 0");
+        // 收工（drain-then-exit + join 必返）
+        b.tx_shutdown(&noop_logf());
+        assert!(!b.tx_queued_mode(), "收工后应退 Queued 模式");
+    }
+
+    /// harness 快臂登记（P1c）：曾实装「发送线程排空吞吐 vs 内联 send_batch」
+    /// 的回环对照（60k 包）——**macOS 回环内核面不可靠**：inline 臂 tx socket
+    /// 默认 ~9KB SNDBUF 的流控坑（已修：4MB 同产品）之外，更大包量下逐包
+    /// send_to 仍偶发卡进内核流控（非阻塞 socket 也不返回——flaky 挂死，复现率
+    /// 随系统状态漂移）。**快臂能力对照移到本地引擎端到端（local-rust-exit +
+    /// speedtest，真实管线）与真机 2×2 终验**（PERF-AB P1 节）——与仓惯例一致
+    ///（harness 判机制，性能终验真机判）。
+    ///
+    /// 降级路径：发送线程死后（stop 收工模拟）send_wire 仍可达（内联形态）+
+    /// tx_shutdown 幂等。
+    #[test]
+    fn tx_shutdown_then_inline_still_sends() {
+        let mut b = ServerBind::open(0, "t", noop_logf()).unwrap();
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let dst = sink.local_addr().unwrap();
+        let sock_dup = b.try_clone_socket().unwrap();
+        b.tx_start(sock_dup, 64 * 1024, noop_logf());
+        // 直接收工（发送线程被 stop 排空退出——模拟「线程失活」后的 Inline 面）
+        b.tx_shutdown(&noop_logf());
+        b.tx_shutdown(&noop_logf()); // 幂等
+        let mut out = InboundOut::default();
+        out.wire.push((dst, vec![9u8; 32]));
+        b.send_wire(&out);
+        sink.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 64];
+        let (n, _) = sink.recv_from(&mut buf).expect("内联形态应可达");
+        assert_eq!(&buf[..2], &[0xBB, 0], "腿帧壳");
+        assert_eq!(n, 34);
+    }
+
+    /// 高水位面：tx_high_water 在空 ring 时恒 false（背压不误触发——接线面；
+    /// ring 本身的满语义由 txring 单测钉死）。
+    #[test]
+    fn tx_high_water_idle_false() {
+        let mut b = ServerBind::open(0, "t", noop_logf()).unwrap();
+        assert!(!b.tx_high_water(), "Inline 模式恒 false");
+        let sock_dup = b.try_clone_socket().unwrap();
+        b.tx_start(sock_dup, 64 * 1024, noop_logf());
+        assert!(!b.tx_high_water(), "空 ring 不触发");
+        b.tx_shutdown(&noop_logf());
     }
 }

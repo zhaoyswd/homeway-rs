@@ -340,7 +340,18 @@ impl Device {
     fn encap_peer(&mut self, key: &[u8; 32], plain: &[u8], out: &mut InboundOut) {
         let step = {
             let peer = self.peers.get_mut(key).expect("查表已判存在");
-            step_of(peer.tunn.encapsulate(plain, &mut self.wg_buf))
+            let r = peer.tunn.encapsulate(plain, &mut self.wg_buf);
+            if std::env::var_os("HOMEWAY_TX_DBG").is_some() {
+                let desc: String = match &r {
+                    boringtun::noise::TunnResult::WriteToNetwork(_) => "Wire".to_string(),
+                    boringtun::noise::TunnResult::WriteToTunnelV4(_, _) => "PlainV4".to_string(),
+                    boringtun::noise::TunnResult::WriteToTunnelV6(_, _) => "PlainV6".to_string(),
+                    boringtun::noise::TunnResult::Done => "Done".to_string(),
+                    boringtun::noise::TunnResult::Err(e) => format!("Err({e:?})"),
+                };
+                eprintln!("[ENCDBG] tunn.encapsulate(plain {}B) => {desc}", plain.len());
+            }
+            step_of(r)
         };
         self.consume_step(*key, step, out);
     }

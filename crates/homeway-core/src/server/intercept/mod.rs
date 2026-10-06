@@ -1247,6 +1247,58 @@ impl Interceptor {
         self.tx_shape_release(false)
     }
 
+    /// 高水位背压拍（P1 两级前置背压；引擎面在发送 ring 高水位时以本函数替代
+    /// pump）：与 pump 同拍序，唯一差别 = ⑥ 的整形释放退化为「只并入不释放」
+    ///——本拍产物并入滞留 FIFO 后**不扣 credit、不推时刻表**（整形状态原样，
+    /// 下拍 ring 水位回落后照常释放——无双重记账）。包留 FIFO = 真背压不丢包，
+    /// 发送 ring 的满丢成为最后兜底。整形关臂（无 FIFO）保持直通——该臂满丢
+    /// 即唯一兜底（消融态接受）。
+    pub fn pump_hold(&mut self) -> Vec<Vec<u8>> {
+        // ① worker 事件
+        while let Ok(ev) = self.events.try_recv() {
+            self.on_event(ev);
+        }
+        self.drain_dns();
+        self.ack_clk_tick();
+        self.cc_stats_line();
+        let now = self.now_smol();
+        self.iface.poll(now, &mut self.device, &mut self.sockets);
+        let mut raw = Vec::new();
+        self.device.drain_tx(&mut raw);
+        for pkt in raw {
+            self.on_tx(pkt);
+        }
+        self.service_sockets();
+        self.service_dns();
+        self.reap_idle();
+        let now = self.now_smol();
+        self.iface.poll(now, &mut self.device, &mut self.sockets);
+        let mut raw = Vec::new();
+        self.device.drain_tx(&mut raw);
+        for pkt in raw {
+            self.on_tx(pkt);
+        }
+        // ⑥' 只并入不释放（tx_shape_release 的并路径同款记账；整形关 = 直通）
+        match self.cfg.tx_shape {
+            None => std::mem::take(&mut self.tx_out),
+            Some(_) => {
+                let produce = std::mem::take(&mut self.tx_out);
+                if produce.is_empty() {
+                    return Vec::new();
+                }
+                let n = produce.len();
+                let b = produce.iter().map(|p| p.len()).sum::<usize>();
+                self.tx_win_defer_peak = (
+                    self.tx_win_defer_peak.0.max(self.tx_deferred.len() + n),
+                    self.tx_win_defer_peak.1.max(self.tx_deferred_bytes + b),
+                );
+                self.tx_deferred.extend(produce);
+                self.tx_deferred_bytes += b;
+                Vec::new()
+            }
+        }
+    }
+
     /// ACK 时钟估计的一拍（pump 头部调用；ACK_EST_WIN 粗节流——非窗口期零成本）。
     /// 窗粗于团块（100ms ≫ 团内 ACK 尖峰的毫秒尺度）⇒ est 反映持续速率而非团内
     /// 尖峰；max 攻击/慢衰减 ⇒ 无「估计跌 → pace 收紧 → 到达变慢 → 估计再跌」的
@@ -2859,7 +2911,36 @@ mod tests {
         );
     }
 
-    /// 收工宽限的全量释放（评审 r2-1.1 整改验收）：滞留队列在 pump_with_flush
+    /// P1 两级前置背压：pump_hold 只并入不释放（credit/时刻表原样——下拍照常
+    /// 释放，无双重记账）；整形关臂直通。
+    #[test]
+    fn pump_hold_defers_without_double_accounting() {
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::new(Stats::default()));
+        itc.cfg.tx_shape = Some(TxShape { rate: 1 << 20, burst: 1024, pace: None });
+        for i in 0..4u8 {
+            itc.tx_out.push(vec![i; 8]);
+        }
+        let out = itc.pump_hold();
+        assert!(out.is_empty(), "hold 拍应零释放");
+        assert_eq!(itc.tx_deferred.len(), 4, "4 包全部滞留 FIFO");
+        assert_eq!(itc.tx_deferred_bytes, 32);
+        // credit 不被 hold 拍扣减（tx_shape_release 才扣）——下拍全量释放验证：若
+        // hold 拍扣过 credit，释放量会短缺。先攒 credit（续水按 dt——测试瞬间
+        // dt≈0 ⇒ credit≈0，sleep 20ms 攒出 rate×0.02s = 20KB ≫ 4×8B 额度）。
+        std::thread::sleep(Duration::from_millis(20));
+        let out2 = itc.pump();
+        assert_eq!(out2.len(), 4, "hold 后首拍应全量释放（credit 完整）");
+        let seq: Vec<u8> = out2.iter().map(|p| p[0]).collect();
+        assert_eq!(seq, (0..4u8).collect::<Vec<_>>(), "FIFO 保序");
+        // 整形关臂：hold = 直通（无 FIFO 可滞留）
+        itc.cfg.tx_shape = None;
+        itc.tx_out.push(vec![9u8; 8]);
+        let out3 = itc.pump_hold();
+        assert_eq!(out3.len(), 1, "整形关臂 hold 直通");
+    }
+
+    /// 宽限全量释放的清空语义（评审 r2-1.1 整改验收）：滞留队列在 pump_with_flush
     /// 后必须清空——「宽限期尾数据/FIN 不丢」（M2）不因整形回归。构造面 =
     /// 直接驱动 tx_shape_release 的 flush_all 分支（同代码路径）+ pump_with_flush
     /// 的滞留排空断言（无流量面，验证的是清空语义本身）。

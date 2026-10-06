@@ -494,6 +494,9 @@ impl Bind {
             }
         };
         self.rx_bytes += n as u64;
+        if std::env::var_os("HOMEWAY_TX_DBG").is_some() {
+            eprintln!("[RXDBG] client got {n}B from {src_raw} first={:02x?}", &self.recv_buf[..n.min(8)]);
+        }
         // 双栈 socket 上 v4 对端的源地址是 v4-mapped v6——归一成纯 v4（内部表示
         // 恒纯 v4/v6：采纳/候选比对/应答回发不因 socket 族漂移）
         let src = crate::udpbatch::unmap_v4_in6(src_raw);
