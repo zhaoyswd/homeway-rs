@@ -202,6 +202,17 @@ B0-2b §十七 D-2 段）；8q 收口（本注记 + dsh 评审 + ci-local）。*
 无缺口、OHOS 内核 ACK 密度 ~5.3-7.5 段/ACK 自带中间档时钟、pacing on/off 同带——
 PERF-AB §9.12）、上行日间带 44 上限的夜间复核。
 
+**P1 批（2026-10-06 深夜，部分完成——接棒真源 = docs/reviews/P1.md）**：出口发送
+路径并行化（浅拆：密文→sendto 独立线程）。**完成**：P1a 设计过评审门（dsh 24 项
+全处置——socketpair+MSG_NOSIGNAL 唤醒/join 无超时/SPSC 不变量/两级背压/收益模型
+诚实化）+ P1b-0 剂量基线（**下行 bulk 期 sendto 占驱动线程 59-77% 墙钟**的绝对
+剂量实证）+ P1b 机制全量（txring SPSC/发送线程/降级/收工/插桩，433 lib 全绿 +
+ci-local 全绿 21:30）。**阻塞**：引擎级集成未定位问题——队列路径的 WG 密文包
+客户端层确定性拒收（SYN-ACK 类；字节合法/延迟 0ms/内核无罪已排除，取证全档与
+候选方向见 P1.md 接棒指针节）⇒ **产品默认 off**（HOMEWAY_TX_SENDTHREAD 显式开，
+默认行为 = 拆分前，stash 对照验证零回归）。P1c 消融终验/P1d 生产滚动/P1e 收口
+挂起至定位完成。诊断面板（HOMEWAY_TX_DBG 三面）在位。
+
 真手指复测清单（files 上传 picker〔K-10〕、~~逐包 pacing 下一档~~（**D-3 已落**——
 8s 进默认 + 8r 机制在册默认关）、
 echo RTT +6.3ms 恒定粒度〔K-7，设计代价〕、共存定案与 AGENTS/README 终稿〔K-20〕）。
