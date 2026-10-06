@@ -1021,6 +1021,7 @@ fn driver_loop(
     let mut last_tx_stats = Instant::now();
     let mut last_tx_stats_snap = (0u64, 0u64, 0usize, 0u64, [0u64; 13]);
     let mut last_tx_bytes = 0u64;
+    let mut last_tx_wall_ns = 0u64;
     let mut out = InboundOut::default();
     let mut stop = false;
     let mut stop_grace = STOP_GRACE;
@@ -1217,6 +1218,10 @@ fn driver_loop(
                 let dbytes = txb - last_tx_bytes;
                 let avg = dpkgs as f64 / dcalls as f64;
                 let bpp = (dbytes as f64 / dpkgs.max(1) as f64) as u64;
+                // P1b-0 剂量插桩：发送面耗时（send_wire wall-time 差分，ms/s）——
+                // 驱动线程被「密文→sendto」占住时长的直接观测（PERF-AB §9.3 的
+                // 78% 是线程内占比，这里是绝对剂量）。
+                let dwell_ms = (bind.tx_wall_ns - last_tx_wall_ns) as f64 / 1e6;
                 // 批分布直方图紧凑打印（R8-3 8i；非零桶）：桶 i = 批大小
                 // [2^i, 2^(i+1))（评审 r2-5.2：标签按区间标——「≤2^(i+1)」的松上界
                 // 会让「≤8」被读成 8 包以内，实际装 4-7 包）。
@@ -1237,7 +1242,7 @@ fn driver_loop(
                     .collect();
                 if s.3 > last_tx_stats_snap.3 {
                     (dlogf)(&format!(
-                        "serve: UDP 出站 调用+{dcalls} 均批{avg:.1}包/调用 单调用最大{}包 均包{bpp}B 累计丢弃{}包（+{}） 批分布[{}]",
+                        "serve: UDP 出站 调用+{dcalls} 均批{avg:.1}包/调用 单调用最大{}包 均包{bpp}B 发送面耗时{dwell_ms:.0}ms/5s 累计丢弃{}包（+{}） 批分布[{}]",
                         s.2,
                         s.3,
                         s.3 - last_tx_stats_snap.3,
@@ -1245,7 +1250,7 @@ fn driver_loop(
                     ));
                 } else {
                     (dlogf)(&format!(
-                        "serve: UDP 出站 调用+{dcalls} 均批{avg:.1}包/调用 单调用最大{}包 均包{bpp}B 批分布[{}]",
+                        "serve: UDP 出站 调用+{dcalls} 均批{avg:.1}包/调用 单调用最大{}包 均包{bpp}B 发送面耗时{dwell_ms:.0}ms/5s 批分布[{}]",
                         s.2,
                         hist.join(" ")
                     ));
@@ -1253,6 +1258,7 @@ fn driver_loop(
             }
             last_tx_stats_snap = s;
             last_tx_bytes = txb;
+            last_tx_wall_ns = bind.tx_wall_ns;
         }
     }
     // ---- 收工（D5：① 已由 Stop 置位；这里 ③④——drain 的出站包照走 encap 链

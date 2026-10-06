@@ -131,6 +131,10 @@ pub struct ServerBind {
     tx_calls: u64,
     tx_pkgs: u64,
     tx_batch_max: usize,
+    /// 发送面耗时（P1b-0 剂量插桩）：send_wire 的 wall-time 累计（ns，空批早退
+    /// 不计——那不是发送成本）。驱动线程被「密文→sendto」占住的 ms/s 的直接
+    /// 观测面：P1 拆分的前后对照（拆分后 = 判定+入队侧；发送线程侧分列）。
+    pub tx_wall_ns: u64,
     /// 批量出站**批分布直方图**（R8-3 8i 插桩）：log2 桶——`tx_hist[i]` = 本观察窗
     /// 批大小 ∈ **[2^i, 2^(i+1))** 的调用数（i=0 即批恰 1 包；评审 r2-5.2 订正
     /// 区间语义——此前注释写 (2^i, 2^(i+1)] 与 i=0=单包自相矛盾）。窗语义（消费即
@@ -234,6 +238,7 @@ impl ServerBind {
             tx_calls: 0,
             tx_pkgs: 0,
             tx_batch_max: 0,
+            tx_wall_ns: 0,
             tx_hist: [0; Self::TX_HIST_BUCKETS],
         })
     }
@@ -630,6 +635,12 @@ impl ServerBind {
         if out.wire.is_empty() {
             return; // 常态快速路径（handle_inbound 的逐包调用多无产出）
         }
+        let t0 = Instant::now();
+        self.send_wire_inner(out);
+        self.tx_wall_ns += t0.elapsed().as_nanos() as u64;
+    }
+
+    fn send_wire_inner(&mut self, out: &InboundOut) {
         self.tx_stage.clear();
         self.tx_lens.clear();
         for (ep, wg) in &out.wire {
