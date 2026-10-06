@@ -112,19 +112,26 @@ pub enum PaceMode {
 }
 
 /// 自适应增益/上下限（数值依据 = §十二）：
-/// - GAIN 2.0：绑定面只覆盖超过当前速率 2 倍的团块——平衡点吞吐 = est，pace=2×est
-///   不触及平衡点（无自激下探环）；
+/// - GAIN 1.2（Linux fq 稳态档：pacing_rate = cwnd/RTT × 1.2，慢启动才 ×2——慢启动
+///   的松化由 est 的 max 攻击承担：爬坡窗的峰值速率被 est 锁存 ⇒ pace 随之抬升）。
+///   2.0 档真机消融实测的失效机理（2026-10-06 日间带，A 臂 32 / baseline 13）：
+///   稳态 produce 率 = ACK 时钟 ≈ est ≪ 2×est ⇒ 时刻表恒在过去、pacing 整体不
+///   engage——ACK 时钟团块（~23KB/团）原样直通，wire 形态与 off 臂无差。1.2 档：
+///   每团排空 ~1.7ms（真展开），同时 20% 余量使 CC 平衡点（吞吐=est）永不被
+///   节流（无 R=64MiB/s 事故型的持续排队；est 测的就是被 pace 后的 ACK 时钟，
+///   收敛点 est=g、pace=1.2g ≥ g 自洽）；
 /// - FLOOR 16MiB/s：est 下界 TX_PACE_EST0 已保证间隔 ≤10µs/1280B（无慢路径滴流），
 ///   此地板是 est 参数调整时的防御位；
 /// - CEIL 4GiB/s：2.5G 出口（312MB/s×2=625MB/s）≪ 4G——快路径不构成瓶颈。
-pub const TX_PACE_GAIN: f64 = 2.0;
+pub const TX_PACE_GAIN: f64 = 1.2;
 pub const TX_PACE_FLOOR: u64 = 16 * 1024 * 1024;
 pub const TX_PACE_CEIL: u64 = 4 * 1024 * 1024 * 1024;
-/// est 初值与衰减下界 16MiB/s：重启/空闲后 pace 从 32MiB/s 起步——首个 100ms
-/// 估计窗内 max 攻击即跳到实测速率（45MB/s 流 ⇒ ~200ms 内 pace=90），期间更紧的
-/// pacing 只作用于首个团（冷形态友好）。下界防滴流（32MiB/s 的 pace 间隔 40µs/包
-/// ——任意慢路径都不会被节流）。
-pub const TX_PACE_EST0: f64 = 16.0 * 1024.0 * 1024.0;
+/// est 初值与衰减下界 8MiB/s：重启/空闲后 pace 从 9.6MiB/s 起步——首个 100ms
+/// 估计窗内 max 攻击即跳到实测速率，期间更紧的 pacing 只作用于首个团（冷形态
+/// 友好）。下界防滴流（9.6MiB/s 的 pace 下界 ≫ est<8 的任何路径需求——20Mbps
+/// 蜂窝形态 pace 恒不绑定）。16MiB 档真机实测会把 est 钉在下界（日间带 goodput
+/// 11-14 < 16）⇒ pace 与实测脱钩；8 档让 10MB/s 级路径的 est 贴实测。
+pub const TX_PACE_EST0: f64 = 8.0 * 1024.0 * 1024.0;
 /// 补账量子（单次释放的字节上界，pacing on 时生效）：`max(pace×2ms, 2×MSS)`。
 /// 驱动循环迟到时时刻表积欠一次放多包——**量子把补账团块钉住**（而非 burst 的
 /// 256KB：冷空口臂实测抓到 256KB 补账团击穿 192KiB 到达预算——25 到达丢失，量子
