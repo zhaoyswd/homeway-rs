@@ -36,6 +36,11 @@
    **`contracts/`**（ledger.jsonl 词表 + cleanroom 对照 + Go 测试内联断言）；
    跨仓需求规格实际在 **tier 仓 `openspec/specs/`（37 份）**——R2+ 消费时经 tier 只读路径取。
 2. **契约台账 422 单元**（ROADMAP 附录 A 的 349 为旧盘点值）。
+3. **tunConfig.mtu 起功能面 + 上限 clamp（P2，2026-10-07）**——Go Normalize 的
+   「MTU ≤0 → 1280、**不**做上限 clamp」旧口径在 Rust 侧有意偏离：P2 起 cfg.mtu
+   是升档门的请求值（>1280 走 docs/reviews/P2.md §3.2 的门控），消费侧按
+   `wgcore::stackb::clamp_inner_mtu` 收口到 [1280,1400]（彼时 cfg.mtu 仅进日志
+   无消费，不 clamp 无后果；起功能面后域必须有界）。Go 侧无对应行为（Go 核已退役）。
 
 ## 快照克隆
 

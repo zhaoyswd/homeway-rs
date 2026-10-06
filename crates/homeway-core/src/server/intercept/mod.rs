@@ -327,6 +327,7 @@ fn shape_slice(
     p: ShapeResolved,
     dt: f64,
     now: Instant,
+    two_mtu: usize,
 ) -> (Vec<Vec<u8>>, ShapeRun) {
     let ShapeResolved { rate, burst, pace } = p;
     let ShapeRun { mut credit, mut pace_next, deferred_bytes } = run_in;
@@ -337,10 +338,11 @@ fn shape_slice(
         deferred_bytes + produce.iter().map(|p| p.len()).sum::<usize>();
     deferred.extend(produce);
     credit = (credit + rate as f64 * dt).min(burst as f64);
-    // 补账量子（8r 改版）：单次释放 ≤ max(pace×QUANTUM, 2×MSS)——迟到的时刻表
-    // 积欠跨多拍排空（每拍一团），不把 256KB 的桶上限当补账上界。
+    // 补账量子（8r 改版）：单次释放 ≤ max(pace×QUANTUM, 2×MTU)——迟到的时刻表
+    // 积欠跨多拍排空（每拍一团），不把 256KB 的桶上限当补账上界。P2：2×MTU 随
+    // 拦截栈内层 MTU（1380 档 = 2 满段口径随动；评审 P2-r1-6）。
     let quantum = pace
-        .map(|p| (p as f64 * TX_PACE_QUANTUM.as_secs_f64()).max(2.0 * 1280.0) as usize)
+        .map(|p| (p as f64 * TX_PACE_QUANTUM.as_secs_f64()).max(two_mtu as f64) as usize)
         .unwrap_or(usize::MAX);
     let mut released = 0usize;
     // 容量按量子上界估（不按队深）：本拍释放至多 quantum/最小包 个
@@ -454,6 +456,11 @@ pub struct Config {
     /// 出口发送整形（R8-3 8i）：None = 关（消融臂/单测直通面），Some = 字节令牌桶
     /// 参数。产品装配面由 `tx_shape_default()`（env 消融臂）填充。
     pub tx_shape: Option<TxShape>,
+    /// 拦截栈内层 MTU（P2）：默认 1280；opt-in 1380（域 = stackb::clamp_inner_mtu，
+    /// 开放档 {1280,1380}）。**静态**——`Interface::new` 构造期快照消费，运行中
+    /// 不变（运行时降档 = P3 候选，见 docs/reviews/P2.md §3.2）。上行段尺寸由手机
+    /// 侧 SYN 通告 MSS 封顶（两端不一致自洽）。
+    pub inner_mtu: usize,
     pub logf: Logf,
 }
 
@@ -682,7 +689,8 @@ pub struct Interceptor {
 impl Interceptor {
     /// 装配：拦截栈（地址 = 隧道 IP）+ worker 池。E5 判据行在此打出。
     pub fn attach(mut cfg: Config, stats: Arc<Stats>) -> Self {
-        let mut device = TunDevice::new();
+        let inner_mtu = crate::wgcore::stackb::clamp_inner_mtu(cfg.inner_mtu);
+        let mut device = TunDevice::with_mtu(inner_mtu);
         let mut iface = Interface::new(
             IfaceConfig::new(HardwareAddress::Ip),
             &mut device,
@@ -726,6 +734,14 @@ impl Interceptor {
             None => (cfg.logf)(
                 "intercept: 发送整形=关（HOMEWAY_TX_SHAPING 消融臂或单测直通面）",
             ),
+        }
+        // 内层 MTU 独立行（P2；同 r2-1.4 口径：E5 原串不扩展）——升档形态才打，
+        // 默认 1280 保持日志面零变化。
+        if inner_mtu != crate::wgcore::stackb::MTU {
+            (cfg.logf)(&format!(
+                "intercept: 内层MTU={inner_mtu}（P2 opt-in；MSS={}，需手机侧同档才有下行收益）",
+                inner_mtu - 40
+            ));
         }
         let dns_rx = cfg.dns_events.take();
         let tx_credit0 = cfg.tx_shape.map(|s| s.burst as f64).unwrap_or(0.0);
@@ -1383,6 +1399,7 @@ impl Interceptor {
                         shape,
                         dt,
                         now,
+                        2 * self.device.mtu(),
                     );
                     self.tx_deferred_bytes = run.deferred_bytes;
                     self.tx_credit = run.credit;
@@ -2264,6 +2281,7 @@ mod tests {
             // 功能单测直通面（整形关闭——pump 在紧循环里跑无墙钟间隔，令牌不续水；
             // 整形行为面在 shape_slice 单测 + 受控 harness 臂）。
             tx_shape: None,
+            inner_mtu: crate::wgcore::stackb::MTU,
             logf: noop_logf(),
         }
     }
@@ -2475,6 +2493,7 @@ mod tests {
             dns_events: Some(events),
             dns_resolve_port: 5300,
             tx_shape: None,
+            inner_mtu: crate::wgcore::stackb::MTU,
             logf: noop_logf(),
         };
         let mut itc = Interceptor::attach(cfg, Arc::clone(&stats));
@@ -2623,6 +2642,7 @@ mod tests {
             dns_events: Some(events),
             dns_resolve_port: 5300,
             tx_shape: None,
+            inner_mtu: crate::wgcore::stackb::MTU,
             logf: noop_logf(),
         };
         let mut itc = Interceptor::attach(cfg, Arc::clone(&stats));
@@ -3017,6 +3037,7 @@ mod tests {
             ShapeResolved { rate: 1000, burst: 3000, pace: None },
             0.0,
             now,
+            2 * crate::wgcore::stackb::MTU,
         );
         assert_eq!(out.len(), 3, "突发额度 3000B 截断本拍释放");
         assert_eq!(deferred.len(), 2, "余量滞留");
@@ -3029,6 +3050,7 @@ mod tests {
             ShapeResolved { rate: 1000, burst: 3000, pace: None },
             1.0,
             now,
+            2 * crate::wgcore::stackb::MTU,
         );
         assert_eq!(out.len(), 1, "下拍续传一包（续水 1000B）");
         assert_eq!(deferred.len(), 1);
@@ -3040,6 +3062,7 @@ mod tests {
             ShapeResolved { rate: 1000, burst: 3000, pace: None },
             60.0,
             now,
+            2 * crate::wgcore::stackb::MTU,
         );
         assert_eq!(out.len(), 1, "空闲后桶满，滞留清空");
         let _ = &run;
@@ -3054,6 +3077,7 @@ mod tests {
             ShapeResolved { rate: 1000, burst: 3000, pace: None },
             0.0,
             now,
+            2 * crate::wgcore::stackb::MTU,
         );
         let (mut out2, _) = shape_slice(
             &mut deferred,
@@ -3062,6 +3086,7 @@ mod tests {
             ShapeResolved { rate: 1000, burst: 3000, pace: None },
             60.0,
             now,
+            2 * crate::wgcore::stackb::MTU,
         );
         out1.append(&mut out2);
         let seq: Vec<u8> = out1.iter().map(|p| p[0]).collect();
@@ -3075,6 +3100,7 @@ mod tests {
             ShapeResolved { rate: 1000, burst: 100, pace: None },
             0.0,
             now,
+            2 * crate::wgcore::stackb::MTU,
         );
         assert_eq!(out.len(), 1, "大于 burst 的包防御性直通");
         assert!(deferred.is_empty());
@@ -3099,6 +3125,7 @@ mod tests {
             ShapeResolved { rate: 10_000_000, burst: 3000, pace: Some(1000) },
             0.0,
             t0,
+            2 * crate::wgcore::stackb::MTU,
         );
         assert_eq!(out.len(), 1, "团首包直通（时刻表在过去）");
         assert_eq!(deferred.len(), 3);
@@ -3112,6 +3139,7 @@ mod tests {
             ShapeResolved { rate: 10_000_000, burst: 3000, pace: Some(1000) },
             0.0,
             t0 + Duration::from_secs(1),
+            2 * crate::wgcore::stackb::MTU,
         );
         assert_eq!(out.len(), 1);
         let pace_next = next_run.pace_next;
@@ -3125,6 +3153,7 @@ mod tests {
             ShapeResolved { rate: 10_000_000, burst: 3000, pace: Some(1000) },
             0.0,
             t0 + Duration::from_millis(4500),
+            2 * crate::wgcore::stackb::MTU,
         );
         assert_eq!(out.len(), 2, "迟到补账一次放到期包（不向 now 钳）");
         assert!(deferred.is_empty());
@@ -3148,6 +3177,7 @@ mod tests {
             ShapeResolved { rate: 10_000_000, burst: 3000, pace: Some(1000) },
             0.0,
             t0,
+            2 * crate::wgcore::stackb::MTU,
         );
         assert_eq!(out.len(), 3, "补账上界 = burst（credit 不变量）——不会比 8n③ 更差");
         assert_eq!(deferred.len(), 7);
@@ -3162,6 +3192,7 @@ mod tests {
             ShapeResolved { rate: 10_000_000, burst: 3000, pace: Some(1000) },
             0.0,
             t0 + Duration::from_millis(4900),
+            2 * crate::wgcore::stackb::MTU,
         );
         assert_eq!(out.len(), 1, "空闲后新团首包直通（间隔未满 gap 时第 2 包仍门住）");
         // ④ 桶门串联：credit 只够 1 包时，时间门即便全开也只放 1
@@ -3173,6 +3204,7 @@ mod tests {
             ShapeResolved { rate: 10_000_000, burst: 3000, pace: Some(1000) },
             0.0,
             t0,
+            2 * crate::wgcore::stackb::MTU,
         );
         assert_eq!(out.len(), 1, "桶门先断（credit 只够 1 包）");
         // ⑤ 等价门（评审 r1-2.4）：pace 极大（间隔 < 1ns）与 None 同输入同输出——
@@ -3188,6 +3220,7 @@ mod tests {
                 ShapeResolved { rate: 1000, burst: 3000, pace: Some(u64::MAX) },
                 dt,
                 t0,
+                2 * crate::wgcore::stackb::MTU,
             );
             let (ob, rb) = shape_slice(
                 &mut b,
@@ -3196,6 +3229,7 @@ mod tests {
                 ShapeResolved { rate: 1000, burst: 3000, pace: None },
                 dt,
                 t0,
+                2 * crate::wgcore::stackb::MTU,
             );
             let sa: Vec<u8> = oa.iter().map(|p| p[0]).collect();
             let sb: Vec<u8> = ob.iter().map(|p| p[0]).collect();
@@ -3454,6 +3488,14 @@ mod tests {
         queued: usize,
         cap: usize,
         rate: usize,
+        /// 外层 PMTU 瓶颈注入（P2 坑 4 回归专测）：包长超限即丢（DF 语义——
+        /// 模拟「外层路径承载不住」的丢包形态，**不覆盖**无 DF 分片可达那条
+        /// 真实兜底；评审 P2-r1-7(c)）。None = 不注入。
+        mtu_limit: Option<usize>,
+        /// mtu_limit 丢包独立计数（不污染 dropped 的冷/浅臂零丢断言）。
+        mtu_dropped: u64,
+        /// 观测到的最大包长（P2 段尺寸机器判据：1380 档下载数据段 = 1340+40）。
+        seen_max: usize,
         credit: f64,
         /// 令牌桶的**突发额度**（R8-8a 修正）：出队许可以 credit 计，空闲期累积的
         /// credit 以此为上限——与队列容量解耦。此前误把额度上限设成队列容量
@@ -3525,9 +3567,20 @@ mod tests {
                 peak_queue: 0,
                 cold: None,
                 air_dropped: 0,
+                mtu_limit: None,
+                mtu_dropped: 0,
+                seen_max: 0,
             }
         }
         fn send(&mut self, pkt: Vec<u8>) {
+            // MTU 瓶颈（到达口最先判——形态学 = 外层一跳就丢）
+            if let Some(limit) = self.mtu_limit {
+                if pkt.len() > limit {
+                    self.mtu_dropped += 1;
+                    return;
+                }
+            }
+            self.seen_max = self.seen_max.max(pkt.len());
             // 到达口冷预算：先于队列判满（团块敌意与队列容量无关——见 cold 字段注记）
             if let Some((allow, credit, last)) = &mut self.cold {
                 let now = Instant::now();
@@ -3594,9 +3647,24 @@ mod tests {
     fn run_shaped_download(
         n_flows: usize,
         bytes_each: usize,
+        up: DirLink,
+        down: DirLink,
+        tx_shape: Option<TxShape>,
+    ) -> (f64, usize, DirLink, Option<f64>) {
+        run_shaped_download_mtu(n_flows, bytes_each, up, down, tx_shape, crate::wgcore::stackb::MTU, Duration::from_secs(120))
+    }
+
+    /// P2：内层 MTU 臂 + 超时可调（坑 4 注入臂不烧满 120s 死线）。mtu 同时作用于
+    /// 客户端栈（模型 = 手机内核按 TUN MTU 推的 MSS）与拦截栈（出口 caps）——
+    /// 生产手机核 stack B 恒 1280，本面模型的是 **TUN 应用流量**两端的 MSS 口径。
+    fn run_shaped_download_mtu(
+        n_flows: usize,
+        bytes_each: usize,
         mut up: DirLink,
         mut down: DirLink,
         tx_shape: Option<TxShape>,
+        mtu: usize,
+        timeout: Duration,
     ) -> (f64, usize, DirLink, Option<f64>) {
         // origin：回环 TCP，每连接写满 bytes_each 后 shutdown 写半边
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
@@ -3642,13 +3710,15 @@ mod tests {
         let stats = Arc::new(Stats::default());
         let mut cfg = cfg_base(tunnel);
         cfg.tx_shape = tx_shape; // 产品臂 = Some(默认参数)；消融臂 = None（harness 自控，不经 env）
+        cfg.inner_mtu = mtu; // P2：出口 caps 臂（Interface::new 构造期快照即生效）
         let mut itc = Interceptor::attach(cfg, Arc::clone(&stats));
         let mut clients = Vec::new();
         for i in 0..n_flows {
-            let mut s = StackB::new(
+            let mut s = StackB::with_mtu(
                 Ipv4Addr::new(100, 64, 10, 40 + i as u8),
                 tunnel,
                 SmolInstant::from_millis(0),
+                mtu,
             );
             let h = s
                 .connect(std::net::SocketAddrV4::new(tunnel, port))
@@ -3658,7 +3728,7 @@ mod tests {
 
         let t0 = Instant::now();
         let mut received = vec![0usize; n_flows];
-        let timeout = Duration::from_secs(120);
+        // timeout 由参数（见函数头注记）
         let mut last_diag = Instant::now() - Duration::from_secs(2);
         let mut last_drop = 0u64;
         // 尾窗速率的采样线（R8-2 8g 尾窗速率门：每 0.5s 记 (秒, 累计字节)——收尾取
@@ -3752,5 +3822,113 @@ mod tests {
         let tail = tail_rate_mbps(&timeline, timeout.as_secs_f64(), total);
         (timeout.as_secs_f64(), total, down, tail)
     }
+
+    // ---------- P2：内层 MTU 面（设计 = docs/reviews/P2.md §3.7） ----------
+
+    /// 段尺寸机器判据（快测、常开）：双端 1380 ⇒ 下载数据段 = MSS 1340 + 头 40 =
+    /// IP 包 1380（`seen_max` 恰满段）；双端 1280 ⇒ 1280。这是「包数 −7.5%」
+    /// 收益的机制面直接验证（吞吐增益在真机 2×2 与三臂 harness 量）。
+    #[test]
+    fn mtu_segment_size_machine_check() {
+        for mtu in [1280usize, 1380] {
+            let (secs, got, down, _) = run_shaped_download_mtu(
+                1,
+                256 * 1024,
+                DirLink::passthrough(),
+                DirLink::passthrough(),
+                None,
+                mtu,
+                Duration::from_secs(60),
+            );
+            assert_eq!(got, 256 * 1024, "传输应完成（mtu={mtu}）");
+            assert_eq!(down.seen_max, mtu, "满段尺寸应恰为内层 MTU（mtu={mtu}，得 {}）", down.seen_max);
+            assert_eq!(down.mtu_dropped, 0);
+            let _ = secs;
+        }
+    }
+
+    /// 坑 4 回归专测（注入形态学）：外层人为限 1400 ⇒ 可承载内层包长上限 =
+    /// 1400−62〔直连 v4 封账〕= 1338。臂 A（双端 1380）：满段 1380 全被丢 ⇒
+    /// 停滞（复现「能握手、载荷黑洞」的坑 4 形态——证明注入有效）；臂 B
+    /// （门拒回落 1280 = ItcConfig 1280 直通）：全通零丢 = **正确降级路径**。
+    /// 「门为何拒」的裁决逻辑在 facade::mtu_gate 单测（注入缝 = ProbeOutcome），
+    /// 本面验端到端行为。注记：超限即丢 = DF 语义保守臂，不覆盖 v4 分片可达
+    /// 那条真实兜底（评审 P2-r1-7）。
+    #[test]
+    #[ignore = "性能 harness：坑 4 注入臂烧 20s 死线（停滞臂自然到点），验证时 cargo test -- --ignored 显式跑"]
+    fn mtu_blackhole_injection_and_fallback() {
+        let limit = 1400 - 62; // 外层 1400 − 直连 v4 封账 62 = 1338
+        // 臂 A：1380 满段（1380 > 1338）全丢——坑 4 形态
+        let mut down_a = DirLink::passthrough();
+        down_a.mtu_limit = Some(limit);
+        let (secs, got, down_a, _) = run_shaped_download_mtu(
+            1,
+            128 * 1024,
+            DirLink::passthrough(),
+            down_a,
+            None,
+            1380,
+            Duration::from_secs(20),
+        );
+        assert!(got < 16 * 1024, "坑 4 形态：1380 段被注入链丢弃 ⇒ 停滞（得 {got}B / 20s）");
+        assert!(down_a.mtu_dropped > 0, "注入应产生 mtu 丢包计数");
+        let _ = secs;
+        // 臂 B：门拒回落（= 1280 直通）——正确降级：满段 1280 ≤ 1338 全通
+        let mut down_b = DirLink::passthrough();
+        down_b.mtu_limit = Some(limit);
+        let (_, got, down_b, _) = run_shaped_download_mtu(
+            1,
+            128 * 1024,
+            DirLink::passthrough(),
+            down_b,
+            None,
+            1280,
+            Duration::from_secs(30),
+        );
+        assert_eq!(got, 128 * 1024, "降级路径：1280 段不受注入影响，应全通");
+        assert_eq!(down_b.mtu_dropped, 0, "1280 段不触发 mtu 丢弃");
+    }
+
+    /// 三臂消融（P2c）：慢/快链路 × 内层 1280 vs 1380。主判据 = 机器面
+    /// （段尺寸已在 mtu_segment_size_machine_check 钉死；本面补吞吐不劣化门：
+    /// 1380 臂中位 ≥ 0.9×1280 臂中位——消融不设增益门，增益数据登记 PERF-AB）。
+    #[test]
+    #[ignore = "性能 harness：跑真墙钟 ~40-60s（两臂×三链路×3 轮），验证时 cargo test -- --ignored 显式跑（串行）"]
+    fn mtu_ab_three_paths() {
+        let arms: &[(&str, usize, usize, Duration, usize)] = &[
+            ("慢路径", 64 * 1024, 2_621_440, Duration::from_millis(40), 8 * 1024 * 1024),
+            ("快路径", 8 * 1024 * 1024, 125_829_120, Duration::from_millis(2), 48 * 1024 * 1024),
+        ];
+        for (name, cap, rate, delay, bytes) in arms {
+            let mut m1280 = Vec::new();
+            let mut m1380 = Vec::new();
+            for _ in 0..3 {
+                let (secs, got, down, _) = run_shaped_download_mtu(
+                    1, *bytes,
+                    DirLink::new(*cap, *rate, *delay),
+                    DirLink::new(*cap, *rate, *delay),
+                    PRODUCT_SHAPE, 1280, Duration::from_secs(120),
+                );
+                assert_eq!(got, *bytes, "1280 臂应完成（{name}）");
+                assert_eq!(down.seen_max, 1280);
+                m1280.push(got as f64 / secs / (1024.0 * 1024.0));
+                let (secs, got, down, _) = run_shaped_download_mtu(
+                    1, *bytes,
+                    DirLink::new(*cap, *rate, *delay),
+                    DirLink::new(*cap, *rate, *delay),
+                    PRODUCT_SHAPE, 1380, Duration::from_secs(120),
+                );
+                assert_eq!(got, *bytes, "1380 臂应完成（{name}）");
+                assert_eq!(down.seen_max, 1380, "1380 臂段尺寸机器判据（{name}）");
+                m1380.push(got as f64 / secs / (1024.0 * 1024.0));
+            }
+            m1280.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            m1380.sort_by(|a, b| a.partial_cmp(b).unwrap());
+            let (a, b) = (m1280[1], m1380[1]);
+            println!("MTU A/B {name}（链路 {}MB/s）：1280={a:.1}MB/s 1380={b:.1}MB/s 比={:.3}", rate / (1024 * 1024), b / a);
+            assert!(b >= 0.9 * a, "{name}：1380 臂不劣化门（0.9×）未过：{b:.1} vs {a:.1}");
+        }
+    }
+
 }
 

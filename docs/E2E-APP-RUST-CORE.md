@@ -43,7 +43,7 @@
 | A1 | 会话/候选 | ✓ | `新栈会话已建立（token 端点 2 个…）`；`候选端点（2 条…）：192.168.3.12:42670（LAN）、192.168.3.12:42770（中继）` |
 | A1 | 赛跑/路径 | ✓ | `赛跑结算：胜出 直连 192.168.3.12:42670（镜像 1 包，耗时 22ms）`；`路径确立：直连 …（首个回包来源）` |
 | A1 | warmup | ✓ | `warmup pong: 就绪（判据=wg）` |
-| A1 | running 行 | ✓ | `running (mtu=1280 tunIp=100.64.204.150)`（真实派生地址） |
+| A1 | running 行 | ✓ | `running (mtu=1280 tunIp=100.64.204.150)`（真实派生地址；mtu = 请求值——默认 1280，P2 opt-in 档 1380 时此处为 1380，生效值看 `mtu: 档位` 判据行） |
 | A1 | attach | ✓ | `wgcore: 应用面就绪（TUN fd=90 已接上，mtu=1280，transit 直通）` → `attached（数据面已接管 fd=90，L3 直通）` |
 | A1 | 隧道桥 | ✓ | 三座桥 `files-bridge/term-bridge/speed-bridge unix:…/identity/bridge/*.sock → 出口虚拟端口（经会话）监听中` |
 | A1 | 链路 | ✓ | `link: via=direct ep=192.168.3.12:42670 rtt=27ms（新栈状态快照）` |
@@ -122,7 +122,7 @@ token 经 `serve token` 取、`aa start --ps host_token` 注入。
 | # | 项 | 结果 | 证据 |
 |---|---|---|---|
 | A1 | 版本/身份/数据面装配 | ✓ | `身份：复用（dev=7dc61647 pub=0e6dc129）`（与轮 1/2 同 devTag 跨核稳定）；`隧道侧就绪（L3 直通…）`；`新栈会话已建立（token 端点 2 个…）` |
-| A1 | 候选/赛跑/warmup/attach/桥 | ✓ | `候选端点（2 条…LAN、中继）`→`赛跑结算：胜出 直连 192.168.3.12:42670（镜像 1 包，耗时 24ms）`→`warmup pong: 就绪（判据=wg）`→`running (mtu=1280 tunIp=100.64.248.46)`→`attached（数据面已接管 fd=90，L3 直通）`→三座桥监听行 |
+| A1 | 候选/赛跑/warmup/attach/桥 | ✓ | `候选端点（2 条…LAN、中继）`→`赛跑结算：胜出 直连 192.168.3.12:42670（镜像 1 包，耗时 24ms）`→`warmup pong: 就绪（判据=wg）`→`running (mtu=1280 tunIp=100.64.248.46)`（mtu = 请求值，同上）→`attached（数据面已接管 fd=90，L3 直通）`→三座桥监听行 |
 | A1 | link/RREG/peer 表 | ✓ | `link: via=direct ep=192.168.3.12:42670 rtt=25ms`；`RREG 注册刷新 → …（中继=false）`；exit `peer: + dev=7dc61647 pub=0e6dc129 ip=100.64.34.94 n=1/32`（三指纹逐字段一致）→ `peer: ~ refresh` |
 | A4' | **tunStatusJSON 真机对账快照**（7m-④ 收口） | ✓ | attached 后 1.5s 产出完整 JSON（§6.B 逐项过账）；与 `ClientCoreTunStatus` 同源同字节面（同纯函数 + runner_of/transport_of 同组装）；轮 3 两世代各产一行（本地 exit 轮 + 现役出口轮），键面/键序/值域全符合 |
 | A5' | **测速相位 UI**（M-7 真机验证） | ✓ | 卡片副标题实测 `下行测速中` → `上行测速中` 两相位切换（整改前恒「连接中」的 UI 死相消除）；再点卡片 = 取消 → UI 回 idle 并恢复旧结果副标题（M-8 取消面真机无 hang） |

@@ -28,6 +28,17 @@ use smoltcp::wire::{HardwareAddress, IpCidr};
 
 /// 隧道 MTU（两端契约常量，坑 4/23）。
 pub const MTU: usize = 1280;
+/// 内层 MTU 域上界（P2：直连 v6 最坏封账 40+8+2+32=82 ⇒ 1492−82≈1410，
+/// 取整 1400——中继 v6 口径〔+9 路由头〕下 1400+91=1491 ≤ 1492 仍安全；
+/// 开放档仅 {1280,1380}，本上界是防呆不是功能）。
+pub const MTU_MAX: usize = 1400;
+
+/// 内层 MTU 收口（<1280 抬回、>上界压回——cfg.mtu 起了功能面（P2 门控）就该有域；
+/// Go Normalize 无 clamp 的旧口径按「仅日志无消费」理解，本处为有意偏离，见
+/// docs/BASELINE.md 偏离表）。
+pub fn clamp_inner_mtu(v: usize) -> usize {
+    v.clamp(MTU, MTU_MAX)
+}
 /// 每方向每连接 TCP 缓冲（Go netstack 同量级：files 帧 256KB 不触发零窗）。
 const TCP_BUF: usize = 1024 * 1024;
 /// Device RX/TX 队列深度（包数；满则丢 + 计数——burst 吞吐位）。
@@ -54,6 +65,9 @@ pub struct TunDevice {
     rx_queue: VecDeque<Vec<u8>>,
     tx_out: SharedQueue,
     rx_dropped: u64,
+    /// 内层 MTU（caps 面；P2 起 **Interface::new 构造期快照**消费——运行中改字段
+    /// 对已建 Interface 无效〔smoltcp 0.14 语义，评审 P2-r1-3〕，静态装配用）。
+    mtu: usize,
 }
 
 impl Default for TunDevice {
@@ -64,11 +78,22 @@ impl Default for TunDevice {
 
 impl TunDevice {
     pub fn new() -> Self {
+        Self::with_mtu(MTU)
+    }
+
+    /// 指定内层 MTU（clamp 域内）；出口拦截栈（P2 静态升档）与 harness 臂用。
+    pub fn with_mtu(mtu: usize) -> Self {
         Self {
             rx_queue: VecDeque::with_capacity(QUEUE_CAP),
             tx_out: Arc::new(Mutex::new(VecDeque::with_capacity(QUEUE_CAP))),
             rx_dropped: 0,
+            mtu: clamp_inner_mtu(mtu),
         }
+    }
+
+    /// 生效内层 MTU（clamp 后）。
+    pub fn mtu(&self) -> usize {
+        self.mtu
     }
 
     /// WG 解密出的明文包入队（hub 判据后的投递面）。
@@ -162,7 +187,7 @@ impl phy::Device for TunDevice {
     fn capabilities(&self) -> DeviceCapabilities {
         let mut caps = DeviceCapabilities::default();
         caps.medium = Medium::Ip; // 显式：Default=Ethernet 会走 ARP（评审 ③-1）
-        caps.max_transmission_unit = MTU;
+        caps.max_transmission_unit = self.mtu;
         // max_burst_size 保持 None：Some(N) 会把通告窗口硬截到 N×MSS（评审 ③-2）
         caps
     }
@@ -183,7 +208,18 @@ impl StackB {
     /// 装配：本地 /32 = 派生隧道 IP；默认路由网关 = 出口隧道 IP（Medium::Ip 不做邻居
     /// 解析）。`random_seed` 用时基抖动（smoltcp 建议：避免端口/序号跨启动碰撞）。
     pub fn new(tunnel_ip: Ipv4Addr, server_tunnel_ip: Ipv4Addr, now: Instant) -> Self {
-        let mut device = TunDevice::new();
+        Self::with_mtu(tunnel_ip, server_tunnel_ip, now, MTU)
+    }
+
+    /// 指定内层 MTU 的装配（**harness/测试面专用**——生产手机核 stack B 恒走
+    /// `new()`=1280，P2 的升档门不覆盖核自连面，见 docs/reviews/P2.md §3.2）。
+    pub fn with_mtu(
+        tunnel_ip: Ipv4Addr,
+        server_tunnel_ip: Ipv4Addr,
+        now: Instant,
+        mtu: usize,
+    ) -> Self {
+        let mut device = TunDevice::with_mtu(mtu);
         let mut iface = Interface::new(
             IfaceConfig::new(HardwareAddress::Ip),
             &mut device,
@@ -335,6 +371,7 @@ mod tests {
     }
 
     /// caps 三项钉死（评审 ③-1/③-2 验收）：Medium::Ip / MTU 1280 / burst 不截窗口。
+    /// P2 起 MTU 可配（with_mtu + clamp 域），默认构造恒 1280。
     #[test]
     fn device_caps_are_explicit() {
         let dev = TunDevice::new();
@@ -342,6 +379,11 @@ mod tests {
         assert_eq!(caps.medium, Medium::Ip, "Default=Ethernet 会走 ARP（静默不通）");
         assert_eq!(caps.max_transmission_unit, MTU);
         assert!(caps.max_burst_size.is_none(), "Some(N) 会把通告窗口硬截到 N×MSS");
+        // P2：升档构造与 clamp 域
+        assert_eq!(TunDevice::with_mtu(1380).capabilities().max_transmission_unit, 1380);
+        assert_eq!(TunDevice::with_mtu(2000).capabilities().max_transmission_unit, MTU_MAX);
+        assert_eq!(TunDevice::with_mtu(600).capabilities().max_transmission_unit, MTU);
+        assert_eq!(clamp_inner_mtu(0), MTU);
     }
 
     /// 栈对栈 TCP：建立 → 传输 4MB → 通告窗口不被 burst 截断（单流吞吐量级验收）。

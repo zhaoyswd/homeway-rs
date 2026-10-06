@@ -66,6 +66,9 @@ pub struct RunnerIn {
     pub pf_fails: u64,
     pub exit_ip: String,
     pub link: LinkIn,
+    /// 内层 MTU 生效值（P2 扩展键 mtuEff；None = 默认档不输出——键面 =
+    /// runner 在场才有，Go 向量 10 案全无 runner ⇒ 逐字节门不动）。
+    pub mtu_eff: Option<u32>,
     pub port_forwards: Vec<PfStateIn>,
     pub bridge: Option<BridgeIn>,
 }
@@ -156,6 +159,9 @@ pub fn tun_status_json(input: &TunStatusInput) -> String {
         link.insert("rttMs".into(), Value::from(r.link.rtt_ms));
         link.insert("at".into(), Value::from(r.link.at_ms));
         m.insert("link".into(), Value::Object(link));
+        if let Some(v) = r.mtu_eff {
+            m.insert("mtuEff".into(), Value::from(v));
+        }
         m.insert(
             "portForwards".into(),
             Value::Array(
@@ -317,6 +323,7 @@ mod tests {
                 pf_accepted: 3,
                 pf_fails: 1,
                 exit_ip: "100.64.255.1".into(),
+                mtu_eff: None,
                 link: LinkIn {
                     via: "direct".into(),
                     ep: "192.168.3.12:41641".into(),
@@ -405,6 +412,7 @@ mod tests {
                 pf_fails: 0,
                 exit_ip: "100.64.255.1".into(),
                 link: LinkIn { via: "none".into(), ep: String::new(), rtt_ms: 0, at_ms: 0 },
+                mtu_eff: Some(1380),
                 port_forwards: vec![],
                 bridge: None,
             }),
@@ -416,6 +424,8 @@ mod tests {
             assert!(v.get(k).is_none(), "无桥不应含 {k}");
         }
         assert!(v.get("link").is_some());
+        // P2 扩展键：Some 才出、值原样（tier 侧 VpnConfig 用它建接口）
+        assert_eq!(v.get("mtuEff").and_then(|x| x.as_u64()), Some(1380));
         // 空映射表 = 空数组（Go make([]map,0,0) → []）
         assert_eq!(v["portForwards"], Value::Array(vec![]));
     }

@@ -85,6 +85,9 @@ pub struct ServeConfig {
     /// 发送整形/pacing 的 config 覆盖（D-3 反过拟合约束 3：`[serve.tx_shape]` 节；
     /// None = 全默认。env 测试缝的优先级在 `tx_shape_resolve` 内——env > config > 默认）。
     pub tx_shape_cfg: Option<crate::server::intercept::TxShapeCfg>,
+    /// 拦截栈内层 MTU（P2：默认 1280；开放档 {1280,1380}。flag/config/env 三层
+    /// 覆盖在 serve_cli；L4 启动自检（出向接口 MTU）不过则回落 1280）。
+    pub inner_mtu: usize,
 }
 
 impl Default for ServeConfig {
@@ -110,6 +113,7 @@ impl Default for ServeConfig {
             relay: None,
             ddns: Vec::new(),
             tx_shape_cfg: None,
+            inner_mtu: crate::wgcore::stackb::MTU,
         }
     }
 }
@@ -332,6 +336,36 @@ impl ServeEngine {
         }
 
         // ---- 拦截层（E5）+ LocalServices 映射 ----
+        // P2 L4 启动自检：升档形态须确认出向接口承载得住（最坏腿封账 = 中继 v6
+        // 40+8+9+2+32 = 91B；inner+91 ≤ iface_mtu 才放行，否则回落 1280——坑 4/23
+        // 防线；未钉卡/读不到 = 跳过 + 记行，上行门与 v4 分片兜底仍在）。
+        let mut inner_mtu = crate::wgcore::stackb::clamp_inner_mtu(cfg.inner_mtu);
+        if inner_mtu != crate::wgcore::stackb::MTU {
+            match resolved.as_ref().map(|i| egress::iface_mtu(&i.name)) {
+                Some(Some(mtu)) => {
+                    if inner_mtu + 91 > mtu as usize {
+                        (dlogf)(&format!(
+                            "intercept: 内层MTU拒升（出口接口 {} MTU={mtu}，需 ≥{}）——回落 1280",
+                            resolved.as_ref().map(|i| i.name.clone()).unwrap_or_default(),
+                            inner_mtu + 91
+                        ));
+                        inner_mtu = crate::wgcore::stackb::MTU;
+                    }
+                }
+                Some(None) => {
+                    (dlogf)(&format!(
+                        "intercept: 内层MTU自检跳过（接口 {} MTU 读取失败）——按配置 {} 放行",
+                        resolved.as_ref().map(|i| i.name.clone()).unwrap_or_default(),
+                        inner_mtu
+                    ));
+                }
+                None => {
+                    (dlogf)(&format!(
+                        "intercept: 内层MTU自检跳过（未钉卡，出向接口未知）——按配置 {inner_mtu} 放行（上行门与 v4 分片兜底仍在）"
+                    ));
+                }
+            }
+        }
         let mut local_services = std::collections::HashMap::new();
         local_services.insert(cfg.files_port, serve_dir.join("files.sock").display().to_string());
         local_services.insert(cfg.term_port, serve_dir.join("term.sock").display().to_string());
@@ -347,6 +381,7 @@ impl ServeEngine {
                 dns_events,
                 dns_resolve_port: if dns_enabled { cfg.dns_port } else { 0 },
                 tx_shape: intercept::tx_shape_resolve(cfg.tx_shape_cfg),
+                inner_mtu,
                 logf: Arc::clone(&dlogf),
             },
             Arc::clone(&itc_stats),

@@ -567,6 +567,66 @@ pub fn select_best(
     Ok(best.0)
 }
 
+
+// ---------- P2：出向接口 MTU（内层 MTU 升档的启动自检面） ----------
+
+/// 读一张网卡的 MTU（P2 L4 自检用）。平台分派（评审 P2-r1-2(i)）：
+/// macOS = getifaddrs 的 `ifa_data`→`if_data.ifi_mtu`；Linux/OHOS = `ioctl
+/// (SIOCGIFMTU)`（libc 0.2.189 未给 generic linux 导出该常量，本地钉 0x8921——
+/// Linux/Android 系统头同值）。失败（名字不在/调用错）= None（调用方按
+/// 「自检跳过」处理，不拒启）。
+pub fn iface_mtu(name: &str) -> Option<u32> {
+    #[cfg(target_os = "macos")]
+    unsafe {
+        let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
+        if libc::getifaddrs(&mut ifap) != 0 {
+            return None;
+        }
+        let mut out = None;
+        let mut cur = ifap;
+        'walk: while !cur.is_null() {
+            let ifa = &*cur;
+            if !ifa.ifa_name.is_null() && !ifa.ifa_data.is_null() {
+                let n = std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy();
+                if n == name {
+                    out = Some((*ifa.ifa_data.cast::<libc::if_data>()).ifi_mtu as u32);
+                    break 'walk;
+                }
+            }
+            cur = ifa.ifa_next;
+        }
+        libc::freeifaddrs(ifap);
+        out
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        // ifreq：IFNAMSIZ(16) 名字 + union（MTU = c_int，紧随其后）。40B 覆盖
+        // 全平台 ifr 尺寸；只用前 16+4。
+        // request 参数类型随 libc 平台面不同（glibc=c_ulong / musl/OHOS=c_int）——
+        // 常量钉 c_int、调用点 `as _` 适配两者。
+        const SIOCGIFMTU: libc::c_int = 0x8921;
+        let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        if fd < 0 {
+            return None;
+        }
+        let mut ifr = [0u8; 40];
+        let bytes = name.as_bytes();
+        if bytes.len() >= libc::IFNAMSIZ {
+            unsafe { libc::close(fd) };
+            return None;
+        }
+        ifr[..bytes.len()].copy_from_slice(bytes);
+        let rc = unsafe { libc::ioctl(fd, SIOCGIFMTU as _, &mut ifr as *mut u8) };
+        let mtu = if rc == 0 {
+            Some(u32::from(ifr[16]) | (u32::from(ifr[17]) << 8) | (u32::from(ifr[18]) << 16) | (u32::from(ifr[19]) << 24))
+        } else {
+            None
+        };
+        unsafe { libc::close(fd) };
+        mtu
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
