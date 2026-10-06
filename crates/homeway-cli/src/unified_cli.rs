@@ -76,6 +76,16 @@ struct FileServe {
     files_root: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     ddns: Option<Vec<FileDdns>>,
+    /// 发送整形（D-3）：与 serve_cli::FileServe 同键——镜像表漏键会让统一进程
+    /// 读到该键即 TOML parse error 退出（P2-r2-H1 实测形态；本表是键表完整性
+    /// 守卫，serve_cli 加键必须同批进这里）。本表只做「键被接受」（消费与类型
+    /// 校验经 assemble_serve 走 serve_cli 的同表解析），故用 toml::Value 承载
+    /// 〔TxShapeCfg 未实现 Serialize，本表 derive 了写回面〕。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tx_shape: Option<toml::Value>,
+    /// 内层 MTU（P2）：同上——serve_cli::FileServe 的同键镜像。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    inner_mtu: Option<usize>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Default, Clone)]

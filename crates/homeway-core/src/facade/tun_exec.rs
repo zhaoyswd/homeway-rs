@@ -1049,23 +1049,22 @@ fn gen_loop(
     }
     // ---- P2 升档门（每世代一次；Ready 发布前定值 ⇒ 扩展建 VpnConfig 时读到的
     // mtuEff 已终值——接口 MTU 建立时定型，运行中不可变）。门语义与防线 =
-    // docs/reviews/P2.md §3.2/§3.3；默认档（cfg.mtu ≤1280）零日志零行为。----
-    if cfg.mtu > crate::wgcore::stackb::MTU as u32 {
-        let req = crate::wgcore::stackb::clamp_inner_mtu(cfg.mtu as usize) as u32;
+    // docs/reviews/P2.md §3.2/§3.3；默认档（cfg.mtu ≤1280）零日志零行为。
+    // 接线逻辑收在 mtu_gate::generation_mtu_eff（P2-r2-M2 可测面）。----
+    {
         let link = lock_unpoison(&run.link).clone();
-        let (via, ep) = match &link {
-            Some(l) => (l.via.clone(), l.ep.parse::<std::net::SocketAddr>().ok()),
-            None => ("none".to_owned(), None),
+        let (direct, ep) = match &link {
+            // 「direct」词面真源 = wtransport::Via::as_str（link 快照携带字符串形态）
+            Some(l) => (l.via == "direct", l.ep.parse::<std::net::SocketAddr>().ok()),
+            None => (false, None),
         };
-        // 探针只在「直连 v4」形态才有意义——其余形态 decide 自会拒并记行。
-        let outcome = match ep {
-            Some(std::net::SocketAddr::V4(ep4)) if via == "direct" => {
-                super::mtu_gate::df_probe(ep4, req as usize)
-            }
-            _ => super::mtu_gate::ProbeOutcome::Error("未探（非直连 v4 形态）".into()),
-        };
-        let eff = super::mtu_gate::decide(cfg.mtu, &via, ep, &outcome, &|s: &str| (logf)(s));
-        *lock_unpoison(&run.mtu_eff) = Some(eff);
+        *lock_unpoison(&run.mtu_eff) = super::mtu_gate::generation_mtu_eff(
+            cfg.mtu,
+            direct,
+            ep,
+            super::mtu_gate::df_probe,
+            &|s: &str| (logf)(s),
+        );
     }
     // ---- 等 attach 的接收端先注册（评审 r2-M3：晚于 Ready 发布的窗口内投 fd 必
     // false ⇒ tun_attach -1 且 tier 侧不重试 ⇒ 整次连接失败；一行时序修复）----

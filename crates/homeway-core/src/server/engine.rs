@@ -121,6 +121,40 @@ impl Default for ServeConfig {
 /// 停机宽限（Go StopGrace 同值——「stop 后还能通最多 10s」的显式语义）。
 pub const STOP_GRACE: Duration = Duration::from_secs(10);
 
+/// P2 L4 自检的纯裁决（engine 装配消费；单测注入缝——评审 P2-r2-M1）。
+/// `iface` = Some((名字, Some(MTU))) 已钉卡且读到 / Some((_, None)) 读失败 /
+/// None 未钉卡。返回生效内层 MTU（拒升回落 1280 / 跳过按配置放行）。
+fn l4_resolve(
+    cfg_inner: usize,
+    iface: Option<&(String, Option<u32>)>,
+    logf: &crate::Logf,
+) -> usize {
+    /// 最坏腿封账（中继 v6：40+8+9+2+32 = 91B——P2.md §3.1）。
+    const WORST_LEG_OVERHEAD: usize = 91;
+    let inner = crate::wgcore::stackb::clamp_inner_mtu(cfg_inner);
+    if inner == crate::wgcore::stackb::MTU {
+        return inner; // 默认档零变化
+    }
+    match iface {
+        Some((name, Some(mtu))) => {
+            if inner + WORST_LEG_OVERHEAD > *mtu as usize {
+                logf(&format!("intercept: 内层MTU拒升（出口接口 {name} MTU={mtu}，需 ≥{}）——回落 1280", inner + WORST_LEG_OVERHEAD));
+                crate::wgcore::stackb::MTU
+            } else {
+                inner
+            }
+        }
+        Some((name, None)) => {
+            logf(&format!("intercept: 内层MTU自检跳过（接口 {name} MTU 读取失败）——按配置 {inner} 放行"));
+            inner
+        }
+        None => {
+            logf(&format!("intercept: 内层MTU自检跳过（未钉卡，出向接口未知）——按配置 {inner} 放行（上行门与 v4 分片兜底仍在）"));
+            inner
+        }
+    }
+}
+
 /// 观测线程 → 驱动线程的命令。
 pub enum EngineCmd {
     Stop { grace: Duration },
@@ -336,36 +370,12 @@ impl ServeEngine {
         }
 
         // ---- 拦截层（E5）+ LocalServices 映射 ----
-        // P2 L4 启动自检：升档形态须确认出向接口承载得住（最坏腿封账 = 中继 v6
+        // P2 L4 启动自检（判据行走 logf——升档被拒在默认日志面必须可见，评审
+        // P2-r2-M3）：升档形态须确认出向接口承载得住（最坏腿封账 = 中继 v6
         // 40+8+9+2+32 = 91B；inner+91 ≤ iface_mtu 才放行，否则回落 1280——坑 4/23
         // 防线；未钉卡/读不到 = 跳过 + 记行，上行门与 v4 分片兜底仍在）。
-        let mut inner_mtu = crate::wgcore::stackb::clamp_inner_mtu(cfg.inner_mtu);
-        if inner_mtu != crate::wgcore::stackb::MTU {
-            match resolved.as_ref().map(|i| egress::iface_mtu(&i.name)) {
-                Some(Some(mtu)) => {
-                    if inner_mtu + 91 > mtu as usize {
-                        (dlogf)(&format!(
-                            "intercept: 内层MTU拒升（出口接口 {} MTU={mtu}，需 ≥{}）——回落 1280",
-                            resolved.as_ref().map(|i| i.name.clone()).unwrap_or_default(),
-                            inner_mtu + 91
-                        ));
-                        inner_mtu = crate::wgcore::stackb::MTU;
-                    }
-                }
-                Some(None) => {
-                    (dlogf)(&format!(
-                        "intercept: 内层MTU自检跳过（接口 {} MTU 读取失败）——按配置 {} 放行",
-                        resolved.as_ref().map(|i| i.name.clone()).unwrap_or_default(),
-                        inner_mtu
-                    ));
-                }
-                None => {
-                    (dlogf)(&format!(
-                        "intercept: 内层MTU自检跳过（未钉卡，出向接口未知）——按配置 {inner_mtu} 放行（上行门与 v4 分片兜底仍在）"
-                    ));
-                }
-            }
-        }
+        let iface = resolved.as_ref().map(|i| (i.name.clone(), egress::iface_mtu(&i.name)));
+        let inner_mtu = l4_resolve(cfg.inner_mtu, iface.as_ref(), &logf);
         let mut local_services = std::collections::HashMap::new();
         local_services.insert(cfg.files_port, serve_dir.join("files.sock").display().to_string());
         local_services.insert(cfg.term_port, serve_dir.join("term.sock").display().to_string());
@@ -1992,4 +2002,56 @@ fn probe_once(
         (saw, hint)
     };
     (dns_note, gen_note, saw, hint, flags)
+}
+
+#[cfg(test)]
+mod p2_tests {
+    use super::*;
+
+    fn sink() -> crate::Logf {
+        Arc::new(|_: &str| {})
+    }
+
+    /// P2-r2-M1：L4 三态 + 拒升门槛（纯函数注入缝）。
+    #[test]
+    fn l4_resolve_three_states_and_refusal() {
+        let m = crate::wgcore::stackb::MTU;
+        // 默认档直通（零日志零变化）
+        assert_eq!(l4_resolve(1280, None, &sink()), m);
+        assert_eq!(l4_resolve(0, Some(&("en0".into(), Some(1500))), &sink()), m);
+        // 已钉卡 + MTU 足够（1500 ≥ 1380+91=1471）→ 放行
+        assert_eq!(l4_resolve(1380, Some(&("en0".into(), Some(1500))), &sink()), 1380);
+        // 已钉卡 + MTU 不足（1400 < 1471）→ 拒升回落（真机坑 4 注入形态的裁决面）
+        let lines = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let l2 = Arc::clone(&lines);
+        let logf: crate::Logf = Arc::new(move |s: &str| l2.lock().unwrap().push(s.to_owned()));
+        assert_eq!(l4_resolve(1380, Some(&("en0".into(), Some(1400))), &logf), m);
+        let got = lines.lock().unwrap();
+        assert_eq!(got.len(), 1, "拒升恰好一行");
+        assert!(got[0].contains("内层MTU拒升") && got[0].contains("1471"), "{}", got[0]);
+        // 读失败 / 未钉卡 → 跳过放行
+        assert_eq!(l4_resolve(1380, Some(&("en0".into(), None)), &sink()), 1380);
+        assert_eq!(l4_resolve(1380, None, &sink()), 1380);
+        // 超域请求先 clamp 再判（2000→1400：1400+91=1491 ≤ 1500 ⇒ 放行 clamp 值；
+        // 若接口 1490 则拒）
+        assert_eq!(l4_resolve(2000, Some(&("en0".into(), Some(1500))), &sink()), 1400);
+        assert_eq!(l4_resolve(2000, Some(&("en0".into(), Some(1490))), &sink()), m);
+    }
+
+    /// P2-r2-M1：iface_mtu 真读数（macOS 分支；lo0 = 16384）。
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn iface_mtu_reads_loopback_macos() {
+        assert_eq!(crate::server::egress::iface_mtu("lo0"), Some(16384));
+        assert_eq!(crate::server::egress::iface_mtu("no-such-if"), None);
+        assert_eq!(crate::server::egress::iface_mtu(""), None);
+    }
+
+    /// P2-r2-M1：iface_mtu 真读数（Linux 分支；lo = 65536——CI ubuntu runner 跑）。
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn iface_mtu_reads_loopback_linux() {
+        assert_eq!(crate::server::egress::iface_mtu("lo"), Some(65536));
+        assert_eq!(crate::server::egress::iface_mtu("no-such-if"), None);
+    }
 }

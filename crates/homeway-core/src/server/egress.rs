@@ -586,7 +586,12 @@ pub fn iface_mtu(name: &str) -> Option<u32> {
         let mut cur = ifap;
         'walk: while !cur.is_null() {
             let ifa = &*cur;
-            if !ifa.ifa_name.is_null() && !ifa.ifa_data.is_null() {
+            // AF_LINK 条目才读（P2-r2-L10：族校验——BSD 的 ifa_data 语义上属链路层）
+            if !ifa.ifa_name.is_null()
+                && !ifa.ifa_data.is_null()
+                && !ifa.ifa_addr.is_null()
+                && (*ifa.ifa_addr).sa_family == libc::AF_LINK as libc::sa_family_t
+            {
                 let n = std::ffi::CStr::from_ptr(ifa.ifa_name).to_string_lossy();
                 if n == name {
                     out = Some((*ifa.ifa_data.cast::<libc::if_data>()).ifi_mtu as u32);
@@ -600,28 +605,31 @@ pub fn iface_mtu(name: &str) -> Option<u32> {
     }
     #[cfg(not(target_os = "macos"))]
     {
-        // ifreq：IFNAMSIZ(16) 名字 + union（MTU = c_int，紧随其后）。40B 覆盖
-        // 全平台 ifr 尺寸；只用前 16+4。
+        // ifreq：IFNAMSIZ(16) 名字 + union（P2-r2-L10：repr(C) 结构体代替裸字节
+        // 索引——MTU = c_int 在 offset 16，原生对齐读，无字节序手拼）。
         // request 参数类型随 libc 平台面不同（glibc=c_ulong / musl/OHOS=c_int）——
         // 常量钉 c_int、调用点 `as _` 适配两者。
+        #[repr(C)]
+        struct IfreqMtu {
+            ifr_name: [libc::c_char; libc::IFNAMSIZ],
+            ifr_mtu: libc::c_int,
+        }
         const SIOCGIFMTU: libc::c_int = 0x8921;
         let fd = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
         if fd < 0 {
             return None;
         }
-        let mut ifr = [0u8; 40];
         let bytes = name.as_bytes();
         if bytes.len() >= libc::IFNAMSIZ {
             unsafe { libc::close(fd) };
             return None;
         }
-        ifr[..bytes.len()].copy_from_slice(bytes);
-        let rc = unsafe { libc::ioctl(fd, SIOCGIFMTU as _, &mut ifr as *mut u8) };
-        let mtu = if rc == 0 {
-            Some(u32::from(ifr[16]) | (u32::from(ifr[17]) << 8) | (u32::from(ifr[18]) << 16) | (u32::from(ifr[19]) << 24))
-        } else {
-            None
-        };
+        let mut ifr = IfreqMtu { ifr_name: [0; libc::IFNAMSIZ], ifr_mtu: 0 };
+        for (i, b) in bytes.iter().enumerate() {
+            ifr.ifr_name[i] = *b as libc::c_char;
+        }
+        let rc = unsafe { libc::ioctl(fd, SIOCGIFMTU as _, &mut ifr as *mut IfreqMtu) };
+        let mtu = (rc == 0).then_some(ifr.ifr_mtu as u32);
         unsafe { libc::close(fd) };
         mtu
     }

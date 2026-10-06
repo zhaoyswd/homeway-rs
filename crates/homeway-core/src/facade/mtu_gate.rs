@@ -95,11 +95,13 @@ fn set_df_v4(sock: &UdpSocket) -> bool {
     rc == 0
 }
 
-/// 升档门裁决（每世代一次；`outcome` 由调用方先用 [`df_probe`] 取或单测注入）。
+/// 升档门裁决（每世代一次；`outcome` 由调用方先用 [`df_probe`] 取或单测注入；
+/// `direct` = 采纳链路是否直连——评审 P2-r2-L3：enum/bool 代替字符串模式匹配，
+/// 「direct」词面的真源在 `wtransport::Via::as_str`，调用点比较后传布尔）。
 /// 返回生效内层 MTU（1280 或请求值），并打出判据行（仅请求 ≠1280 时）。
 pub fn decide(
     requested: u32,
-    via: &str,
+    direct: bool,
     ep: Option<SocketAddr>,
     outcome: &ProbeOutcome,
     logf: &dyn Fn(&str),
@@ -112,7 +114,7 @@ pub fn decide(
         logf(&format!("mtu: 维持 1280（请求 {req}；{why}）"));
         crate::wgcore::stackb::MTU as u32
     };
-    if via != "direct" {
+    if !direct {
         return keep("非直连腿不升档（坑 23 防线）");
     }
     let Some(SocketAddr::V4(_)) = ep.filter(|a| a.is_ipv4()) else {
@@ -120,16 +122,33 @@ pub fn decide(
     };
     match outcome {
         ProbeOutcome::Pass => {
-            logf(&format!(
-                "mtu: 档位 {req}（直连 v4 + DF 探针通过；出口侧需 inner_mtu 同档才有下行收益）"
-            ));
+            logf(&format!("mtu: 档位 {req}（直连 v4 + DF 探针通过；出口侧需 inner_mtu 同档才有下行收益）"));
             req
         }
-        ProbeOutcome::TooLarge => {
-            keep("DF 探针 EMSGSIZE——本地路由承载不住满尺寸外层包")
-        }
+        ProbeOutcome::TooLarge => keep("DF 探针 EMSGSIZE——本地路由承载不住满尺寸外层包"),
         ProbeOutcome::Error(e) => keep(&format!("DF 探针失败：{e}")),
     }
+}
+
+/// 世代接线助手（评审 P2-r2-M2：把「是否进门/是否探针」的分支收进可测函数，
+/// `gen_loop` 只剩一行存储）。返回 `Some(生效 MTU)`（仅请求 ≠1280 时 Some——
+/// 默认档保持 None ⇒ status 无 mtuEff 键）。`probe` 注入缝 = 单测替身。
+pub fn generation_mtu_eff(
+    cfg_mtu: u32,
+    direct: bool,
+    ep: Option<SocketAddr>,
+    probe: impl FnOnce(SocketAddrV4, usize) -> ProbeOutcome,
+    logf: &dyn Fn(&str),
+) -> Option<u32> {
+    if crate::wgcore::stackb::clamp_inner_mtu(cfg_mtu as usize) <= crate::wgcore::stackb::MTU {
+        return None; // 默认档：不进门、不探针、不记行
+    }
+    // 探针只在「直连 + v4」形态才有意义——其余形态 decide 自会拒并记行。
+    let outcome = match ep {
+        Some(SocketAddr::V4(ep4)) if direct => probe(ep4, crate::wgcore::stackb::clamp_inner_mtu(cfg_mtu as usize)),
+        _ => ProbeOutcome::Error("未探（非直连 v4 形态）".into()),
+    };
+    Some(decide(cfg_mtu, direct, ep, &outcome, logf))
 }
 
 #[cfg(test)]
@@ -138,50 +157,48 @@ mod tests {
 
     fn no_log(_: &str) {}
 
+    fn counter() -> (std::sync::Arc<std::sync::atomic::AtomicUsize>, impl Fn(&str)) {
+        let n = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let n2 = std::sync::Arc::clone(&n);
+        (n, move |_| {
+            n2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        })
+    }
+
     #[test]
     fn default_request_is_zero_touch() {
-        // 1280/0/超界回落的请求：恒 1280、零日志（默认档字节级零变化）。
-        assert_eq!(decide(1280, "direct", Some("1.2.3.4:1".parse().unwrap()), &ProbeOutcome::Pass, &no_log), 1280);
-        assert_eq!(decide(0, "direct", None, &ProbeOutcome::Pass, &no_log), 1280);
-        assert_eq!(decide(600, "direct", None, &ProbeOutcome::Pass, &no_log), 1280);
+        // 1280/0/超下界请求：恒 1280 且**零日志**（P2-r2-L4：计数断言，不是空实现）。
+        for req in [1280u32, 0, 600] {
+            let (n, log) = counter();
+            assert_eq!(decide(req, true, Some("1.2.3.4:1".parse().unwrap()), &ProbeOutcome::Pass, &log), 1280);
+            assert_eq!(n.load(std::sync::atomic::Ordering::Relaxed), 0, "默认档不得打行（req={req}）");
+            // 世代助手同口径：None ⇒ status 无 mtuEff 键
+            assert_eq!(generation_mtu_eff(req, true, None, |_, _| ProbeOutcome::Pass, &log), None);
+        }
     }
 
     #[test]
     fn relay_leg_never_raises() {
-        let n = std::sync::atomic::AtomicUsize::new(0);
-        let counted = |s: &str| {
-            assert!(s.contains("维持 1280"));
-            let _ = s;
-            n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        };
-        let v = decide(1380, "relay", Some("1.2.3.4:1".parse().unwrap()), &ProbeOutcome::Pass, &counted);
+        let (n, log) = counter();
+        let v = decide(1380, false, Some("1.2.3.4:1".parse().unwrap()), &ProbeOutcome::Pass, &log);
         assert_eq!(v, 1280);
         assert_eq!(n.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 
     #[test]
     fn v6_endpoint_never_raises() {
-        let v = decide(
-            1380,
-            "direct",
-            Some("[2001:db8::1]:1".parse().unwrap()),
-            &ProbeOutcome::Pass,
-            &no_log,
-        );
+        let v = decide(1380, true, Some("[2001:db8::1]:1".parse().unwrap()), &ProbeOutcome::Pass, &no_log);
         assert_eq!(v, 1280);
         // 无端点（软失败暖机形态）同样不升
-        assert_eq!(decide(1380, "direct", None, &ProbeOutcome::Pass, &no_log), 1280);
+        assert_eq!(decide(1380, true, None, &ProbeOutcome::Pass, &no_log), 1280);
     }
 
     #[test]
     fn probe_verdict_decides_direct_v4() {
         let ep = Some(SocketAddr::from(([114, 242, 60, 128], 41641)));
-        assert_eq!(decide(1380, "direct", ep, &ProbeOutcome::Pass, &no_log), 1380);
-        assert_eq!(decide(1380, "direct", ep, &ProbeOutcome::TooLarge, &no_log), 1280);
-        assert_eq!(
-            decide(1380, "direct", ep, &ProbeOutcome::Error("x".into()), &no_log),
-            1280
-        );
+        assert_eq!(decide(1380, true, ep, &ProbeOutcome::Pass, &no_log), 1380);
+        assert_eq!(decide(1380, true, ep, &ProbeOutcome::TooLarge, &no_log), 1280);
+        assert_eq!(decide(1380, true, ep, &ProbeOutcome::Error("x".into()), &no_log), 1280);
     }
 
     #[test]
@@ -195,8 +212,43 @@ mod tests {
                 n.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
         };
-        assert_eq!(decide(2000, "direct", ep, &ProbeOutcome::Pass, &log), 1400);
+        assert_eq!(decide(2000, true, ep, &ProbeOutcome::Pass, &log), 1400);
         assert_eq!(n.load(std::sync::atomic::Ordering::Relaxed), 1);
+    }
+
+    /// P2-r2-M2：世代接线（gen_loop 那一行的逻辑面）——不进门/进门各态。
+    #[test]
+    fn generation_wiring_states() {
+        let ep = Some(SocketAddr::from(([10, 1, 2, 3], 41641)));
+        // 软失败暖机（无链路信息）→ Some(1280) + 一行「维持」
+        let (n, log) = counter();
+        assert_eq!(generation_mtu_eff(1380, false, None, |_, _| ProbeOutcome::Pass, &log), Some(1280));
+        assert_eq!(n.load(std::sync::atomic::Ordering::Relaxed), 1);
+        // 中继（direct=false，有端点）→ 不调探针、Some(1280)
+        let probed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let p2 = std::sync::Arc::clone(&probed);
+        assert_eq!(
+            generation_mtu_eff(1380, false, ep, move |_, _| {
+                p2.store(true, std::sync::atomic::Ordering::Relaxed);
+                ProbeOutcome::Pass
+            }, &|_| {}),
+            Some(1280)
+        );
+        assert!(!probed.load(std::sync::atomic::Ordering::Relaxed), "中继腿不得发探针");
+        // 直连 v4 + 探针过 → Some(1380)
+        assert_eq!(
+            generation_mtu_eff(1380, true, ep, |ep4, inner| {
+                assert_eq!(ep4.port(), 41641);
+                assert_eq!(inner, 1380);
+                ProbeOutcome::Pass
+            }, &no_log),
+            Some(1380)
+        );
+        // 直连 v6 端点 → 不调探针（族门先拒）
+        assert_eq!(
+            generation_mtu_eff(1380, true, Some("[2001:db8::1]:1".parse().unwrap()), |_, _| ProbeOutcome::Pass, &no_log),
+            Some(1280)
+        );
     }
 
     #[test]

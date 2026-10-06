@@ -262,9 +262,12 @@ fn parse_serve_flags(args: &[String]) -> ServeFlags {
                     std::process::exit(2);
                 };
                 match v.parse::<usize>() {
-                    Ok(n) if n == 1280 || n == 1380 => f.inner_mtu = Some(n),
-                    _ => {
-                        eprintln!("--inner-mtu 非法（{v:?}——本批开放档仅 1280/1380；升档需手机侧同档才有收益，防线见 docs/reviews/P2.md）");
+                    Ok(n) => {
+                        validate_inner_mtu(n, "--inner-mtu");
+                        f.inner_mtu = Some(n);
+                    }
+                    Err(_) => {
+                        eprintln!("--inner-mtu 非法（{v:?}——仅收整数）");
                         std::process::exit(2);
                     }
                 }
@@ -434,9 +437,12 @@ pub fn assemble(args: &[String]) -> ServeConfig {
         let raw = raw.to_string_lossy().trim().to_owned();
         if !raw.is_empty() {
             match raw.parse::<usize>() {
-                Ok(n) if n == 1280 || n == 1380 => cfg.inner_mtu = n,
-                _ => {
-                    eprintln!("HOMEWAY_INNER_MTU 非法（{raw:?}——本批开放档仅 1280/1380）");
+                Ok(n) => {
+                    validate_inner_mtu(n, "HOMEWAY_INNER_MTU");
+                    cfg.inner_mtu = n;
+                }
+                Err(_) => {
+                    eprintln!("HOMEWAY_INNER_MTU 非法（{raw:?}——仅收整数）");
                     std::process::exit(2);
                 }
             }

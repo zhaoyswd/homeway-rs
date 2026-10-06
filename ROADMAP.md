@@ -236,14 +236,26 @@ PERF-AB §9.13。诊断面板（HOMEWAY_TX_DBG 三面）在位。
 echo RTT +6.3ms 恒定粒度〔K-7，设计代价〕、共存定案与 AGENTS/README 终稿〔K-20〕）。
 真机终态：手机核 bf61e51 连本地出口测试后已断开还原（当前主机 = 用户生产 token）。
 
-**P2 批（下一主批指针，2026-10-07 登记）**：**MTU 面**（任务书指针——现隧道
-MTU 钉 1280〔坑 4/23〕、MSS 1240，P1 终验的 TUN/speedtest 形态下每包协议开销与
-段尺寸是吞吐面的下一候选因子）。立项时走 openspec proposal/design 正常流程，
-范围与假设由立项批定义；P1 的「发送循环按时戳散布」（T2 无收益分支预登记的
-下一档）为并行候选，与 P2 的取舍由用户拍板。另登记观察（r1-O-1/O-2 + term
-flake）：daemon 全量 lib 偶发挂死（ControlServer::shutdown join）与 term
-attach_size 并行负载 flake——定性需空闲机复跑；实验纪律 = 还原验证一律独立
-worktree/copy（勿与评审/CI 共用工作区）。
+**P2 批（2026-10-07 执行，主体落地——真机 2×2 待环境修复接棒）**：**内层 MTU
+上调**。已完成：P2a 设计过 dsh 评审门（r1 四高危全处置：smoltcp caps 构造期
+快照 ⇒ 出口运行时降档移出本批、CoreConfig.mtu 绕门 ⇒ 栈 B 不升、v6 无分片
+兜底 ⇒ 端点族硬门、mtuEff 撞三道契约门 ⇒ runner 在场才出 + tier 扩展键白名单
+机制；有效拍板 = docs/reviews/P2.md §三）+ P2b 实装（commit ed81546，已推）：
+1280 默认零变化 + 1380 opt-in（手机门 = 直连+v4+DF 探针 → `mtuEff` → VpnConfig；
+出口 = `[serve] inner_mtu`/flag/env + L4 启动自检〔egress::iface_mtu 平台分派〕
++ pacing 量子随动）+ P2c harness：三臂消融（慢臂 0.7→1.3MB/s 比 1.817、快臂
++1.1% = 每包开销面印证；段尺寸机器判据常开）+ 坑 4 注入臂（1380+外层限 1400
+⇒ 黑洞形态复现；1280 直通臂全通零丢）+ 单测 447 绿 + ci-local quick 全绿。
+**真机 2×2 未跑成（环境阻塞）**：重装后扩展进程授权即死（旧核对照同样症状 ⇒
+非本批回归；伴 token 解密 401 ⇒ HUKS/asset 态坏）——接棒 = 用户在场重启手机后
+按 PERF-AB §9.14 接棒段重跑。**默认值决策（P2d，按消融数据）**：默认维持
+1280、1380 保持 opt-in（「宁可不升」总纲 + 真机收益证据未取得前不动默认；
+真机 2×2 拿到 ≥+5% 后可再议翻默认）。**P3 候选登记**：栈 B 升档（Interface
+重建 + SocketSet 复用形态）、出口运行时 DF/EMSGSIZE 降档（同形态）、漫游后
+降档重建。tier 侧（注入/VpnConfig/词表白名单/文档四点）随 tier commit 落地。
+另登记观察（r1-O-1/O-2 + term flake）：daemon 全量 lib 偶发挂死
+（ControlServer::shutdown join）与 term attach_size 并行负载 flake——定性需
+空闲机复跑；实验纪律 = 还原验证一律独立 worktree/copy（勿与评审/CI 共用工作区）。
 
 1. ~~下行 0.5× 门缺口~~ **R8-3 修复收口**（PERF-AB §9.7-bis/§9.9）：形态类症状
    （冷悬崖/发散带/批分布）= 突发形态支配，已修复验证（B 冷/热 0.85、批分布

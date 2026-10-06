@@ -738,10 +738,7 @@ impl Interceptor {
         // 内层 MTU 独立行（P2；同 r2-1.4 口径：E5 原串不扩展）——升档形态才打，
         // 默认 1280 保持日志面零变化。
         if inner_mtu != crate::wgcore::stackb::MTU {
-            (cfg.logf)(&format!(
-                "intercept: 内层MTU={inner_mtu}（P2 opt-in；MSS={}，需手机侧同档才有下行收益）",
-                inner_mtu - 40
-            ));
+            (cfg.logf)(&format!("intercept: 内层MTU={inner_mtu}（P2 opt-in；MSS={}，需手机侧同档才有下行收益）", inner_mtu - 40));
         }
         let dns_rx = cfg.dns_events.take();
         let tx_credit0 = cfg.tx_shape.map(|s| s.burst as f64).unwrap_or(0.0);
@@ -3889,14 +3886,19 @@ mod tests {
         assert_eq!(down_b.mtu_dropped, 0, "1280 段不触发 mtu 丢弃");
     }
 
-    /// 三臂消融（P2c）：慢/快链路 × 内层 1280 vs 1380。主判据 = 机器面
+    /// 三臂消融（P2c）：慢/深/快链路 × 内层 1280 vs 1380。主判据 = 机器面
     /// （段尺寸已在 mtu_segment_size_machine_check 钉死；本面补吞吐不劣化门：
-    /// 1380 臂中位 ≥ 0.9×1280 臂中位——消融不设增益门，增益数据登记 PERF-AB）。
+    /// 1380 臂中位 ≥ 0.95×1280 臂中位〔§3.7-2 预登记值——P2-r2-L1 收回 0.9 的
+    /// 事后放宽〕——消融不设增益门，增益数据登记 PERF-AB）。
+    /// 注（P2-r2-L9）：单参数 mtu 同时作用于两端 = (1280,1280) vs (1380,1380) 两臂；
+    /// 「单端升档」形态（两端不一致窗口）本批有意不做 harness 面（文档论证 =
+    /// 设计 §3.4），登记 P3 候选。
     #[test]
-    #[ignore = "性能 harness：跑真墙钟 ~40-60s（两臂×三链路×3 轮），验证时 cargo test -- --ignored 显式跑（串行）"]
+    #[ignore = "性能 harness：跑真墙钟 ~50-70s（两臂×三链路×3 轮），验证时 cargo test -- --ignored 显式跑（串行）"]
     fn mtu_ab_three_paths() {
         let arms: &[(&str, usize, usize, Duration, usize)] = &[
             ("慢路径", 64 * 1024, 2_621_440, Duration::from_millis(40), 8 * 1024 * 1024),
+            ("深队列", 2 * 1024 * 1024, 24 * 1024 * 1024, Duration::from_millis(26), 24 * 1024 * 1024),
             ("快路径", 8 * 1024 * 1024, 125_829_120, Duration::from_millis(2), 48 * 1024 * 1024),
         ];
         for (name, cap, rate, delay, bytes) in arms {
@@ -3926,7 +3928,7 @@ mod tests {
             m1380.sort_by(|a, b| a.partial_cmp(b).unwrap());
             let (a, b) = (m1280[1], m1380[1]);
             println!("MTU A/B {name}（链路 {}MB/s）：1280={a:.1}MB/s 1380={b:.1}MB/s 比={:.3}", rate / (1024 * 1024), b / a);
-            assert!(b >= 0.9 * a, "{name}：1380 臂不劣化门（0.9×）未过：{b:.1} vs {a:.1}");
+            assert!(b >= 0.95 * a, "{name}：1380 臂不劣化门（0.95×）未过：{b:.1} vs {a:.1}");
         }
     }
 
