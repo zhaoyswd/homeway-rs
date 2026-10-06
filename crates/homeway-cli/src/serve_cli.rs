@@ -44,6 +44,10 @@ struct FileServe {
     /// 叠加域名条目 + 自检。
     #[serde(default)]
     ddns: Option<Vec<FileDdns>>,
+    /// 发送整形/pacing（D-3 反过拟合约束 3：参数 config 化——键表 =
+    /// `homeway_core::server::intercept::TxShapeCfg`；覆盖序 env > config > 默认）。
+    #[serde(default)]
+    tx_shape: Option<homeway_core::server::intercept::TxShapeCfg>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -322,6 +326,8 @@ pub fn assemble(args: &[String]) -> ServeConfig {
         if let Some(v) = &fc.serve.files_root {
             cfg.files_root = Some(PathBuf::from(v));
         }
+        // [serve.tx_shape]（D-3）：解析与 env 覆盖在 tx_shape_resolve（engine 装配点）。
+        cfg.tx_shape_cfg = fc.serve.tx_shape;
         // serve.relay：注册腿端点（rl1 token / 裸 host:port——R4-4c 接线）
         if let Some(v) = fc.serve.relay {
             if !v.is_empty() {
