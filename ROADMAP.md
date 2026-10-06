@@ -192,7 +192,16 @@ hosts reach；判据 = INTEROP-CRITERIA DDNS 节）；8p D-1 接棒小项（file
 server 级用例/lock_held_probe 收敛/per-conn expect 面；低-7/低-10 注记收口；处置表 =
 B0-2b §十七 D-2 段）；8q 收口（本注记 + dsh 评审 + ci-local）。**程序状态：技术面全清**
 ——GAP-AUDIT P0 4/4 全清、P1 8/8 清或注记、登记总账 20 项全处置；剩余仅用户触点/
-真手指复测清单（files 上传 picker〔K-10〕、逐包 pacing 下一档〔PERF-AB §9.10 归因〕、
+**D-3 批（2026-10-06 完成）**：8r 出口逐包 pacing（自适应时刻表 est×1.2 + 补账量子
++ pselect 亚毫秒拍 + [serve.tx_shape] config 化 + 三臂 harness；默认 off——止损裁定）+
+8s 手机核密集 ACK 时钟（有界 drain 2×MSS，段/ACK 18→2、dup 402-1486→0-21、日间带
+热态 +39%，冷/热 0.84 过门，终态 B/A 0.73 vs baseline 0.42；设计门 + 代码门 + 真机
+四臂消融 + ci-local 全绿；数据链 = PERF-AB §9.11 + 已知限制节；评审 = R8 §十二-§十四）。
+登记后续：夜间带复测（40 门在日间带物理不可达——A 臂同刻 26-33）、经 TUN 应用流量
+的 8r 定量收益、上行日间带 44 上限的夜间复核。
+
+真手指复测清单（files 上传 picker〔K-10〕、~~逐包 pacing 下一档~~（**D-3 已落**——
+8s 进默认 + 8r 机制在册默认关）、
 echo RTT +6.3ms 恒定粒度〔K-7，设计代价〕、共存定案与 AGENTS/README 终稿〔K-20〕）。
 真机终态：手机核 bf61e51 连本地出口测试后已断开还原（当前主机 = 用户生产 token）。
 
