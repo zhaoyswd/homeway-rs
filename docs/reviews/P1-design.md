@@ -182,9 +182,12 @@ STUN 请求（`stun_query` inline）、**probe 应答（`process_packet` 内 inl
 
 ### ③ 发送线程生命周期 / panic 收口（RunGuard 纪律沿用）
 
-- **在世位**：`tx_alive: Arc<AtomicBool>`，**初值 false**（评审 C-3：spawn 失败
-  不许恒 true），线程体首指令置 true + AliveGuard（任何出口含 panic 展开都清零
-  ——`driver_alive` 同款纪律）。spawn 失败（Err）⇒ 直接 `TxMode::Inline` +
+- **在世位**：`tx_alive: Arc<AtomicBool>`，~~**初值 false**（评审 C-3：spawn 失败
+  不许恒 true），线程体首指令置 true~~ + AliveGuard（任何出口含 panic 展开都清零
+  ——`driver_alive` 同款纪律）。**〔P1 定位批已改：预置 true——初值 false 在
+  「spawn 成功 ↔ 线程首指令」窗口内被驱动线程误读 ⇒ 降级 join 永等；C-3 的
+  「spawn 失败不误判」改由「QueuedFace 仅 spawn 成功才装配」结构性承担，见
+  §10 定位批更新〕** spawn 失败（Err）⇒ 直接 `TxMode::Inline` +
   一次性记行（发送面回拆分前形态，隧道不中断）。
 - **panic 收口 = 降级不重启**：发送线程异常退出 ⇒ alive=false ⇒ 驱动线程下一拍
   `send_wire` 检测失活走 §3② 降级分支 + 一次性记行（`⚠️ 发送线程异常退出
@@ -200,8 +203,11 @@ STUN 请求（`stun_query` inline）、**probe 应答（`process_packet` 内 inl
   （评审 G-3）。
 - **收工序（评审 C-1/C-2 整改版）**：驱动线程宽限循环（pump_grace → route_encap
   → 入队）结束、`intercept.close()` 前：置 tx_stop + 写唤醒字节 → `join`
-  （**无超时**——与 `engine.rs:781` 驱动线程 join 同款）。**join 必返论证**：
-  发送线程全部阻塞面 = pselect（stop 唤醒字节可醒）与排空循环（真实工作）；
+  （**无超时**——与 `engine.rs:781` 驱动线程 join 同款）。**join 必返论证
+  〔r1 评审修订版——原版漏了 stop 字节被读干吞掉的窗口〕**：驱动侧恒
+  「先 store(stop) 再 send(唤醒字节)」；发送线程空转路径在读干后**复查 stop 电平**
+  （复查读到 false ⇒ 字节必在其后发出 ⇒ 其后唯一的读干已过去 ⇒ 进 poll 时字节
+  必在缓冲里 ⇒ poll 立即返回）；其余阻塞面 = 排空循环（真实工作）；
   send 面是非阻塞 socket（EAGAIN 短返丢弃，不长阻塞）⇒ stop+唤醒后至多一轮
   排空（≤ 队列存量/排空率，4096 包×1.3KB ≈ ms 级）即返。**收工总上界 = stop_grace
   + ms 级 join**（评审 C-2：无独立 drain/join 双预算叠加；发送线程退出语义 =
@@ -369,3 +375,7 @@ off/0/false = 关〔= 拆分前串行形态，真机 A/B 对照臂〕）——�
 - **产品默认 off 维持**：根因已修、本地全绿（434 lib 全绿 + 本地引擎级
   speedtest 全绿 + P1c 本地臂 T1/T3/T4 过），但 P1c 真机 2×2 同刻消融未跑
   ——收益未经终验的行为不上产品默认，P1c 全绿后翻 on 发 v0.2.2。
+  **〔终验收口（2026-10-07）：P1c 真机终验 T1/T3/T4/T5 过、T2 未达 15% 门 ⇒
+  走 §7 预登记无收益分支——默认维持 off、v0.2.2 不发（无生产行为变化），
+  r1 代码评审整改与终验数据见 P1.md 文末两节与 PERF-AB §9.13；稳定好带
+  复测拿到 ≥15% 收益即按本节原流程翻 on 发版〕**
