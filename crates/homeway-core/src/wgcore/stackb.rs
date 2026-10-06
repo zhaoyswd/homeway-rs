@@ -404,6 +404,105 @@ mod tests {
         assert!(mbps > 100.0, "栈对栈吞吐 {mbps:.0}Mbps 过低（疑似窗口被截）");
     }
 
+    /// 8s 机制钉子（D-3；评审 r1-5.4）：接收端 smoltcp 的 ACK 密度由「ingress 分批 ×
+    /// poll 交错」决定——Interface::poll 先排空全部 ingress 再 egress、每 poll 每
+    /// socket 至多一个累积 ACK ⇒ **一次收光一次 poll = 一团一 ACK**（真机 18 段/ACK
+    /// 的机制根源）；**每 2 满段一 poll = 每 ≤2 段一 ACK**（immediate_ack_to_transmit
+    /// 阈值 = 未确认 > 1×MSS）。8s（有界 drain）的整个前提是这两条 smoltcp 行为——
+    /// 栈升级若改行为，本测试红（8s 时钟失效面）。
+    #[test]
+    fn ack_density_batched_vs_interleaved_poll() {
+        let a_ip = Ipv4Addr::new(100, 64, 10, 1);
+        let b_ip = Ipv4Addr::new(100, 64, 20, 2);
+        let mut b = stack(b_ip);
+        let mut listen_sock = TcpSocket::new(
+            tcp::SocketBuffer::new(vec![0u8; 128 * 1024]),
+            tcp::SocketBuffer::new(vec![0u8; 128 * 1024]),
+        );
+        listen_sock.listen(7804).unwrap();
+        let listen_h = b.socks.add(listen_sock);
+        let mut stackb_like = StackB::new(a_ip, Ipv4Addr::new(100, 64, 255, 1), SmolInstant::from_millis(0));
+        let client_h = stackb_like
+            .connect(SocketAddrV4::new(b_ip, 7804))
+            .expect("建连");
+        let mut a = stackb_like_to_stack(stackb_like);
+        pump(&mut a, &mut b, 50);
+        assert_eq!(a.socks.get::<TcpSocket>(client_h).state(), tcp::State::Established);
+        assert_eq!(b.socks.get::<TcpSocket>(listen_h).state(), tcp::State::Established);
+
+        // 热身：过 64KB（多轮 pump 让 cwnd 离开 2×MSS 初始窗——单轮 A-poll 才产得出
+        // ≥4 段的批，两种形态才可判别）
+        let block = vec![0x5au8; 4096];
+        let mut warm = 0usize;
+        let mut rounds = 0;
+        while warm < 64 * 1024 && rounds < 400 {
+            a.socks.get_mut::<TcpSocket>(client_h).send_slice(&block).unwrap_or(0);
+            pump(&mut a, &mut b, 2);
+            let mut buf = [0u8; 16384];
+            loop {
+                let n = b.socks.get_mut::<TcpSocket>(listen_h).recv_slice(&mut buf).unwrap_or(0);
+                if n == 0 { break; }
+                warm += n;
+            }
+            rounds += 1;
+        }
+        assert!(warm >= 64 * 1024, "热身未完成（{warm}B）");
+
+        // 产一批 ≥4 段的下行数据（单次 A-poll 后收 A 的 tx 产物，不投 B）
+        let a_poll_collect = |a: &mut Stack, t_ms: i64| -> Vec<Vec<u8>> {
+            a.iface.poll(SmolInstant::from_millis(t_ms), &mut a.dev, &mut a.socks);
+            let mut out = Vec::new();
+            a.dev.drain_tx(&mut out);
+            out
+        };
+        let t_ms = 10_000i64;
+        // —— 形态甲（旧行为）：一次收光一次 poll
+        a.socks.get_mut::<TcpSocket>(client_h).send_slice(&vec![0x5b; 8 * 1220]).unwrap_or(0);
+        let mut pkts = a_poll_collect(&mut a, t_ms);
+        // A 可能先发已 ACK 部分的补发/新数据——把数据包按序投 B（全部一次投）
+        let n1 = pkts.len();
+        for p in pkts.drain(..) {
+            b.inject(&p);
+        }
+        assert!(n1 >= 4, "单次 A-poll 应产 ≥4 段（实测 {n1}——热身不足则 cwnd 未长）");
+        b.iface.poll(SmolInstant::from_millis(t_ms), &mut b.dev, &mut b.socks);
+        let mut acks = Vec::new();
+        b.dev.drain_tx(&mut acks);
+        assert_eq!(acks.len(), 1, "一次收光+一次 poll = 恰一个累积 ACK（实测 {}）", acks.len());
+        // A 消化该 ACK（窗口推进，形态乙的批才产得出）
+        for p in acks {
+            a.inject(&p);
+        }
+        a.iface.poll(SmolInstant::from_millis(t_ms + 1), &mut a.dev, &mut a.socks);
+        let mut sink = Vec::new();
+        a.dev.drain_tx(&mut sink);
+
+        // —— 形态乙（8s）：每 2 段投一次、各配一次 poll
+        a.socks.get_mut::<TcpSocket>(client_h).send_slice(&vec![0x5c; 8 * 1220]).unwrap_or(0);
+        let pkts = a_poll_collect(&mut a, t_ms + 2);
+        let n2 = pkts.len();
+        assert!(n2 >= 4, "形态乙同款批产 ≥4 段（实测 {n2}）");
+        let mut ack_count = 0usize;
+        for chunk in pkts.chunks(2) {
+            for p in chunk {
+                b.inject(p);
+            }
+            b.iface.poll(SmolInstant::from_millis(t_ms + 3), &mut b.dev, &mut b.socks);
+            let mut acks = Vec::new();
+            b.dev.drain_tx(&mut acks);
+            ack_count += acks.len();
+            for p in acks {
+                a.inject(&p);
+            }
+        }
+        println!("ACK 密度形态对照：批收光（{n1} 段）=1 ACK；每 2 段一 poll（{n2} 段）={ack_count} ACK");
+        assert!(
+            ack_count >= n2 / 2 - 1,
+            "每 2 段一 poll 的 ACK 数（{ack_count}）应接近段数/2（{n2}/2）——8s 时钟形态"
+        );
+        let _ = MTU;
+    }
+
     fn stackb_like_to_stack(s: StackB) -> Stack {
         Stack {
             iface: s.iface,

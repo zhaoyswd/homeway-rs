@@ -49,6 +49,35 @@ pub type OnTunError = Box<dyn Fn(&str) + Send>;
 pub const SERVER_TUNNEL_IP: Ipv4Addr = Ipv4Addr::new(100, 64, 255, 1);
 /// poll 等待上限（smoltcp poll_delay 的封顶；延迟 ACK 10ms 一类栈定时器的到点保障）。
 const POLL_CAP: i32 = 250;
+/// 8s 密集 ACK 时钟：有界 drain 的**栈字节阈值**（D-3；设计 docs/reviews/R8.md
+/// §十二）。背景：smoltcp 0.14 的 ACK 策略已内建 RFC5681/Linux 风格（未确认 >
+/// 1×remote_mss ⇒ 立即 ACK；10ms delayed 兜底）且「每 poll 每 socket 至多一个
+/// 累积 ACK」（Interface::poll 先排空全部 ingress 再 egress——评审 r1-4.1 已核）；
+/// 稀疏 ACK 时钟（实测 18 段/ACK）的成因是驱动循环「一次收光 → 一次 poll」的
+/// **批到达形态**。改法 = drain_udp 每累计 2×1280B（2×MSS：>1×MSS 起即产立即
+/// ACK）的**进 stack B 字节**就返回——驱动循环的 poll 因 UDP fd 仍可读立即返回
+/// → pump_once 的既有栈 poll 产 ACK ⇒ ACK 密度 ≈ 每 2 满段一个（Go/gVisor 接收
+/// 端同档节奏；pump_once 保持唯一栈驱动点，8n① 三段计时口径不动——评审 r1-4.2
+/// 采納的有界 drain 形态）。transit/TUN 包不计（不经 stack B，零额外 poll 成本
+/// ——评审 r1-3.3）；小包按字节累积自然合并；批尾不足阈值由 pump_once 兜底，
+/// 奇尾段走 smoltcp 10ms delayed-ACK（驱动 poll 超时已尊重 poll_delay——不变）。
+/// **适用域**：只覆盖核心自连（stack B 收端 = speedtest/files/term/探测路径）；
+/// 经 TUN 的应用流量由 OHOS 内核回 ACK，本改动对其零作用。
+/// env `HOMEWAY_ACK_POLL_CHUNK`（字节阈值覆盖；CLI/harness 消融缝——手机上 env
+/// 不可设，真机 off 臂 = 装 baseline 核对照；大值 ≈ 旧行为〔单 poll〕）。
+const ACK_DRAIN_BYTES: usize = 2 * 1280;
+
+/// ACK drain 阈值（env 覆盖的缓存读——热路径不重复走 env 解析）。
+fn ack_drain_bytes() -> usize {
+    static CHUNK: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *CHUNK.get_or_init(|| {
+        std::env::var("HOMEWAY_ACK_POLL_CHUNK")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .filter(|n| *n > 0)
+            .unwrap_or(ACK_DRAIN_BYTES)
+    })
+}
 /// WG 网络包缓冲上界（握手 148 / 数据 = 明文 + 32B 开销）。
 const WG_BUF: usize = 65536 + 148;
 /// 连接的建立期限（engine 侧；主线程另有自己的 RPC 超时）。
@@ -458,7 +487,12 @@ impl Engine {
         true
     }
 
+    /// UDP 收包排空（8s：**有界**——每累计 `ACK_DRAIN_BYTES` 的进 stack B 字节返回
+    /// 一次，驱动循环的下一轮 poll 因 UDP fd 仍可读立即返回、pump_once 产 ACK；
+    /// transit/TUN 包不计，非栈流量形态与旧全量排空逐字节一致）。
     fn drain_udp(&mut self, buf: &mut [u8]) {
+        let threshold = ack_drain_bytes();
+        let mut stack_bytes = 0usize;
         loop {
             match self.bind.recv_from(buf) {
                 Ok(Some(n)) => {
@@ -466,7 +500,10 @@ impl Engine {
                         SocketAddr::V4(v4) => IpAddr::V4(*v4.ip()),
                         SocketAddr::V6(v6) => IpAddr::V6(*v6.ip()),
                     });
-                    self.decapsulate_in(src_ip, &buf[..n]);
+                    stack_bytes += self.decapsulate_in(src_ip, &buf[..n]);
+                    if stack_bytes >= threshold {
+                        return; // 8s：栈字节满一拍即返回（ACK 在 pump_once 的 poll 产出）
+                    }
                 }
                 Ok(None) => continue,
                 Err(e)
@@ -484,7 +521,8 @@ impl Engine {
     }
 
     /// decapsulate + 空数据报重调协议（WriteToNetwork 后以空输入重调到 Done）。
-    fn decapsulate_in(&mut self, src_ip: Option<IpAddr>, datagram: &[u8]) {
+    /// 返回**进 stack B 的字节数**（transit/TUN/其它 = 0——8s 有界 drain 的计数面）。
+    fn decapsulate_in(&mut self, src_ip: Option<IpAddr>, datagram: &[u8]) -> usize {
         let src_ip = src_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         // 热路径：容量恒足（构造时 WG_BUF 一次分配）；boringtun 只写前缀——
         // 不 clear/resize（每包 65KB memset 纯浪费，中-10①）。长度由返回值给。
@@ -510,6 +548,7 @@ impl Engine {
                         _ => break,
                     }
                 }
+                0
             }
             TunnResult::WriteToTunnelV4(pkt, _) => {
                 self.expired_pending = false; // 明文包到达 = 会话活着
@@ -523,6 +562,7 @@ impl Engine {
                     && pkt[16..20] == self.stack.tunnel_ip.octets()
                 {
                     self.stack.inject(pkt);
+                    return pkt.len();
                 } else if let Some(tun) = self.app_tun.as_ref() {
                     match write_fd_all(tun.fd, pkt) {
                         Ok(()) => {
@@ -547,12 +587,17 @@ impl Engine {
                     }
                 }
                 // 未 attach：transit 回包不该出现（还没有应用流量）；丢弃（Go 同义）
+                0
             }
-            TunnResult::WriteToTunnelV6(_, _) => {} // 内层只承载 IPv4（D4）
-            TunnResult::Done => {}
-            TunnResult::Err(WireGuardError::ConnectionExpired) => self.rebuild_tunn_once(),
+            TunnResult::WriteToTunnelV6(_, _) => 0, // 内层只承载 IPv4（D4）
+            TunnResult::Done => 0,
+            TunnResult::Err(WireGuardError::ConnectionExpired) => {
+                self.rebuild_tunn_once();
+                0
+            }
             TunnResult::Err(_) => {
                 self.silent_drops += 1; // 静默丢包类：计数继续（评审 ②-9）
+                0
             }
         }
     }
