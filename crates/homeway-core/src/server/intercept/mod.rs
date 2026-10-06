@@ -99,7 +99,8 @@ pub const TX_SHAPE_BURST: usize = 256 * 1024;
 /// 的「留交织窗」算式方向也反〔评审 r1-5.3〕）。
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum PaceMode {
-    /// 自适应（产品默认）：pace = clamp(TX_PACE_GAIN×est, FLOOR, CEIL)，
+    /// 自适应（config `pacing="adaptive"` / env `HOMEWAY_TX_PACING=on`）：
+    /// pace = clamp(TX_PACE_GAIN×est, FLOOR, CEIL)，
     /// est = ACK 时钟吞吐估计（Interceptor 维护，稳态 ≈ cwnd/RTT——smoltcp 0.14
     /// 不暴露 cwnd/ssthresh〔R8-8a 已核〕，ACK 时钟测其等价量，Linux fq pacing 的
     /// delivered-rate 派生同型）；同时桶均值抬到 ≥ TX_RATE_GAIN×est（快路径不设
@@ -175,7 +176,9 @@ pub struct TxShapeCfg {
     /// 单拍放行上界/桶容量（KiB，默认 256）。
     #[serde(default)]
     pub burst_kb: Option<usize>,
-    /// 逐包 pacing 模式：`adaptive`（默认）| `fixed` | `off`。
+    /// 逐包 pacing 模式：`off`（默认——D-3 止损裁定，见 tx_shape_resolve 注释）
+    /// | `adaptive` | `fixed`。适用形态：接收端无密集 ACK 时钟的路径（旧核手机、
+    /// 经 TUN 的应用流量）与快路径（≥1Gbps）建议 `adaptive`。
     #[serde(default)]
     pub pacing: Option<PaceCfg>,
     /// pacing=fixed 时的速率（MiB/s）——诊断/梯度臂用；未给值回落 adaptive。
@@ -222,15 +225,23 @@ pub(crate) fn tx_shape_resolve(cfg: Option<TxShapeCfg>) -> Option<TxShape> {
             burst = b * 1024;
         }
     }
+    // 默认 off（D-3 真机消融的止损裁定）：8s 密集 ACK 在位时 pacing 无增益
+    //（18.1 vs 19.2 同带）且组合形态出现 2-4MB 常驻整形滞留（CUBIC 窗过冲改停
+    // 整形队列——RTT 代价）；8r 单独对旧核 +32%，但整链默认受益者是 8s。8r 保留
+    // 全套机制与开关面：无 8s 的接收端（旧核手机/Go 核/经 TUN 的应用流量——OHOS
+    // 内核 ACK 时钟不受 8s 覆盖）与快路径由 config/env 显式开启。
     let mut pace = match cfg.pacing {
-        Some(PaceCfg::Off) => None,
+        Some(PaceCfg::Adaptive) => Some(PaceMode::Adaptive),
         Some(PaceCfg::Fixed) if cfg.pace_mbps.is_some_and(|n| n > 0) => {
             Some(PaceMode::Fixed(cfg.pace_mbps.unwrap_or(0) * 1024 * 1024))
         }
-        Some(PaceCfg::Fixed) | Some(PaceCfg::Adaptive) | None => Some(PaceMode::Adaptive),
+        Some(PaceCfg::Off) | None | Some(PaceCfg::Fixed) => None,
     };
     match std::env::var("HOMEWAY_TX_PACING").as_deref() {
         Ok("off") | Ok("0") | Ok("false") => pace = None,
+        Ok("on") | Ok("adaptive") | Ok("1") | Ok("true") => {
+            pace = Some(PaceMode::Adaptive)
+        }
         Ok(_) | Err(_) => {}
     }
     if let Ok(v) = std::env::var("HOMEWAY_TX_PACE_MBPS") {
@@ -667,7 +678,9 @@ impl Interceptor {
         match cfg.tx_shape {
             Some(s) => {
                 let pace_note = match s.pace {
-                    Some(PaceMode::Adaptive) => " pace=自适应（ACK 时钟估计×2，亚毫秒拍）".to_owned(),
+                    Some(PaceMode::Adaptive) => {
+                        " pace=自适应（ACK 时钟估计×增益，亚毫秒拍）".to_owned()
+                    }
                     Some(PaceMode::Fixed(p)) => format!(
                         " pace={}MiB/s（固定，逐包时刻表+亚毫秒拍）",
                         p / (1024 * 1024)
@@ -2849,10 +2862,19 @@ mod tests {
         assert!(parse(None) && parse(Some("on")) && parse(Some("1")) && parse(Some("true")));
         // 与 `=1` 被当关的旧语义（HOMEWAY_UDP_NO_BATCH 惯例误用面）显式区分
         assert!(parse(Some("1")), "`=1` 必须是开（旧 presence 语义会把消融方向搞反）");
-        // HOMEWAY_TX_PACING（8r）同惯例同匹配表——只关 pacing 时间门（= 8n③ 纯桶
-        // 形态），HOMEWAY_TX_SHAPING 才关整套整形。两开关的匹配形一致（tx_shape_default
-        // 内两个 match 分支形态为准，不真设 env）。
-        assert!(!parse(Some("off")) && parse(None) && parse(Some("1")));
+        // HOMEWAY_TX_PACING（8r）双向值匹配：off/0/false = 关（= 8n③ 纯桶形态），
+        // on/adaptive/1/true = 开（adaptive）——**默认关**（D-3 止损裁定：8s 在位时
+        // pacing 无增益 + 组合形态 2-4MB 常驻滞留；8r 面向无 8s 的接收端路径，
+        // config/env 显式开）。镜像断言 match 分支形态（不真设 env）。
+        let parse_pacing = |v: Option<&str>, cfg: Option<bool>| match (v, cfg) {
+            (Some("off") | Some("0") | Some("false"), _) => false,
+            (Some("on") | Some("adaptive") | Some("1") | Some("true"), _) => true,
+            (_, Some(true)) => true,  // config pacing="adaptive"
+            (_, _) => false,          // 未设未配 = 默认关
+        };
+        assert!(!parse_pacing(Some("off"), None) && !parse_pacing(None, None));
+        assert!(parse_pacing(Some("on"), None) && parse_pacing(Some("1"), None));
+        assert!(parse_pacing(None, Some(true)), "config adaptive 显式开");
     }
 
     /// 令牌桶释放的机制单测（R8-3 8i；纯函数面——时间注入，不依赖墙钟）：
