@@ -122,17 +122,6 @@ impl TxProducer {
         self.sh.tail.0.load(Ordering::Relaxed).wrapping_sub(h)
     }
 
-    /// 降级接管（P1 降级路径）：发送线程死亡后驱动线程构造新 consumer 排空存量。
-    /// owner 唯一性由 **strong_count==1** 证明（原 TxConsumer 是 Shared 的第二份
-    /// 强引用——它在 ⇒ count==2；drop 后 ⇒ count==1 且不再有第二 consumer）。
-    /// None = 原消费者未 drop 完（线程退出中的微窗口）——调用方走弃存量兜底。
-    pub(crate) fn takeover_consumer(&self) -> Option<super::txring::TxConsumer> {
-        if Arc::strong_count(&self.sh) != 1 {
-            return None;
-        }
-        Some(TxConsumer { sh: Arc::clone(&self.sh), cached_tail: 0 })
-    }
-
     unsafe fn slots_write(&self, tail: usize, slot: Slot) {
         // SAFETY：tail - cached_head（≤ 真实 head）< CAP ⇒ 该槽已被 consumer 读走
         //（head.store(Release) 之后）或从未写——producer 独占写权；Arc 内共享存储的

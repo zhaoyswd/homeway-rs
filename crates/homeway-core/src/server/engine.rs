@@ -591,23 +591,17 @@ impl ServeEngine {
             );
         }
 
-        // ---- P1 发送线程（浅拆：密文→sendto 独立；默认 on，HOMEWAY_TX_SENDTHREAD=off 消融臂） ----
+        // ---- P1 发送线程（浅拆：密文→sendto 独立；唯一发送路径——无条件起） ----
         // 单轮排空字节上界 = burst（团块钳制与整形器单拍上界同语义）；整形 off 臂
         // 用默认 TX_SHAPE_BURST（形态约束与整形开关正交）。
-        if crate::server::bind::tx_sendthread_enabled() {
-            match bind.try_clone_socket() {
-                Ok(sock_dup) => {
-                    let burst = crate::server::intercept::tx_shape_resolve(cfg.tx_shape_cfg)
-                        .map(|s| s.burst)
-                        .unwrap_or(crate::server::intercept::TX_SHAPE_BURST);
-                    bind.tx_start(sock_dup, burst, Arc::clone(&dlogf));
-                }
-                Err(e) => {
-                    (dlogf)(&format!("⚠️ 发送线程：dup socket 失败（{e}）—— 保持内联发送（拆分前形态）"));
-                }
-            }
-        } else {
-            (dlogf)("serve: 发送线程消融臂 HOMEWAY_TX_SENDTHREAD=off——内联发送（拆分前形态）");
+        {
+            let sock_dup = bind
+                .try_clone_socket()
+                .expect("dup WG socket（发送线程装配——唯一发送路径，起不来即出口起不来）");
+            let burst = crate::server::intercept::tx_shape_resolve(cfg.tx_shape_cfg)
+                .map(|s| s.burst)
+                .unwrap_or(crate::server::intercept::TX_SHAPE_BURST);
+            bind.tx_start(sock_dup, burst, Arc::clone(&dlogf));
         }
 
         // ---- 驱动线程 ----
@@ -1288,10 +1282,9 @@ fn driver_loop(
             }
         }
         // R8-2 归因 + P1 拆分观测：批量出站形态 5s 行（dlogf 面；本窗调用有增长才打
-        // ——空闲静默）。判别面 = 均批包数（**「轮」口径**：Queued = 发送线程一次排空
-        // 轮 ≤ burst 字节；Inline = 一次 send_wire〔拆分前语义〕——跨模式不可直比）
-        // + 丢弃计数（send_batch 短返/失败 + ring 满丢）+ 发送面耗时剂量
-        //（P1b-0：Inline = sendto 占驱动线程；Queued = 判定+入队侧，排空耗时另列）。
+        // ——空闲静默）。判别面 = 均批包数（**「轮」口径**：发送线程一次排空轮
+        // ≤ burst 字节）+ 丢弃计数（send_batch 短返/失败 + ring 满丢）+ 发送面耗时
+        // 剂量（P1b-0：send_wire wall = 判定+入队侧，排空耗时另列 drain_ns）。
         if now.duration_since(last_tx_stats) > Duration::from_secs(5) {
             last_tx_stats = now;
             let s = bind.tx_stats_snapshot();
@@ -1306,7 +1299,6 @@ fn driver_loop(
                 // 占比，这里是绝对剂量）。
                 let dwell_ms = (bind.tx_wall_ns - last_tx_wall_ns) as f64 / 1e6;
                 let drain_ms = (s.drain_ns - last_tx_stats_snap.drain_ns) as f64 / 1e6;
-                let mode = if bind.tx_queued_mode() { "发送线程" } else { "内联" };
                 let hist: Vec<String> = s
                     .hist
                     .iter()
@@ -1336,19 +1328,14 @@ fn driver_loop(
                 } else {
                     String::new()
                 };
-                let drain_seg = if bind.tx_queued_mode() {
-                    format!(" 排空耗时{drain_ms:.0}ms/5s",)
-                } else {
-                    String::new()
-                };
                 (dlogf)(&format!(
-                    "serve: UDP 出站[{mode}] 轮+{dcalls} 均轮{avg:.1}包 单轮最大{}包 均包{bpp}B 发送面耗时{dwell_ms:.0}ms/5s{drain_seg}{drop_seg}{ring_drop_seg} 批分布[{}]",
+                    "serve: UDP 出站[发送线程] 轮+{dcalls} 均轮{avg:.1}包 单轮最大{}包 均包{bpp}B 发送面耗时{dwell_ms:.0}ms/5s 排空耗时{drain_ms:.0}ms/5s{drop_seg}{ring_drop_seg} 批分布[{}]",
                     s.batch_max,
                     hist.join(" ")
                 ));
-                // 发送线程行（Queued 模式才有唤醒/队深面；评审 p1a-D-2：由驱动线程打
-                //——窗口稳定，发送线程空窗长眠不打行）
-                if bind.tx_queued_mode() {
+                // 发送线程行（唤醒/队深面；评审 p1a-D-2：由驱动线程打——窗口稳定，
+                // 发送线程空窗长眠不打行）
+                {
                     let dwake = s.wakeups - last_tx_stats_snap.wakeups;
                     let per_wake = if dwake > 0 { dpkgs as f64 / dwake as f64 } else { 0.0 };
                     (dlogf)(&format!(
