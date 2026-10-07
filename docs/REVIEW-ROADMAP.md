@@ -21,14 +21,24 @@
 | **Q-F** | 客户端核与桥（portfwd 诚实性/状态分裂/预算/锁纪律） | 等指令 | — | — | — |
 | **Q-G** | 进程卫生与 fd（CLOEXEC/poll revents/STOP_PIPE/权限） | 等指令 | — | — | — |
 | **Q-H** | CLI 与 daemon 控制面（config 双表/--state 形态/daemon 上限） | 等指令 | — | — | — |
-| **Q-I** | 性能细节批（memset/env/缓冲复用/DNS 缓存） | 等指令 | — | — | — |
+| **Q-I** | 性能细节批（memset/env/缓冲复用/DNS 缓存）——**2026-10-08 拆前段/尾段并提前**（前段＝device/wgcore/intercept/relay/facade/udpcap 即时做；尾段＝DNS TTL/files 挂 Q-E 之后） | **进行中**（2026-10-08，前段开工；重排理由与范围切分见「依赖与顺序建议」节） | — | — | — |
 | **Q-J** | 通用性批（keyenc 平台/DNS 上游配置化/UPnP 协议面） | 等指令 | — | — | — |
 
 ## 依赖与顺序建议
 
 - **同文件面串行**：Q-B、Q-C、Q-G 同触 `server/intercept/**`、`wtransport/**`、`udp*` 面 → 按序做；
-  Q-I 性能批触 Q-B/Q-E 刚修过的热路径 → 排最后；Q-J 依赖 Q-D（HELLO caps 协商）与 Q-E（DNS/UPnP）。
-- **建议顺序**：Q-A → Q-B → Q-C → Q-D → Q-E → Q-F → Q-G → Q-H → Q-I → Q-J（用户可重排）。
+  Q-J 依赖 Q-D（HELLO caps 协商）与 Q-E（DNS/UPnP）。
+- **建议顺序（2026-10-08 重排；用户授权「按建议定序、连续推进、不必逐批问」）**：
+  Q-A → Q-B → Q-C → **Q-I 前段** → Q-D → Q-E → **Q-I 尾** → Q-F → Q-G → Q-H → Q-J。
+  - **重排理由**：2026-10-08 实测暴露性能面（Mac 出口 30–50% CPU @ <10MB/s；全管线 ≈38µs/包，
+    而 lo0 消融最佳臂仅 12.6µs/包、组件天花板 boringtun ~1µs / smoltcp ~0.05µs；`sample` 热点
+    前两名 = `flush_backlog` 的 memmove 与 `sendto`）⇒ Q-I 从「排最后」提到 Q-D 之前。
+    原顾虑「Q-I 触 Q-B/Q-E 刚修过的热路径」中 **Q-B 已完成**，只剩 Q-E 面重叠。
+  - **Q-I 拆两段**：**前段**（即时做）只做不与 Q-E 撞面的热路径项——`server/device.rs`、
+    `wgcore/**`、`server/intercept/**`、`relay/**`、`facade/**`、`udpcap`；**尾段**（Q-E 之后）
+    做 DNS TTL 缓存 + files 拷贝——避免与 Q-E 的 `dnsproxy.rs`/`files*` 改动互相返工。
+  - **PERF-AB 复测纪律（本次排查再次实证）**：本机负载对吞吐/CPU 判决影响极大（同二进制
+    load≈4 → 203–341Mbps；load≈30 → 9–85Mbps）⇒ 性能判决必须在**安静环境**跑，报数带 loadavg 表头。
 - **pin**：tier `tools/tailcat/homeway-rs.pin` 落后本仓 HEAD 属正常（出包时前进）；Q 批不主动动 pin。
 
 ## 每批执行协议（子代理按此跑，主会话按此核对）
@@ -125,11 +135,16 @@
 - **（待用户裁决）** GAP-AUDIT P1-4「客户端『出口能力』打行」代码面无实现（服务端 caps 位在、
   客户端 Session 侧无消费）——做（客户端消费 caps 并打行）或标注不做，二选一由用户拍板。
 
-### Q-I 性能细节批
-- `Device::consume_step` 65KB memset 消除；`HOMEWAY_TX_DBG` OnceLock；
-- 热路径缓冲复用（intercept/wgcore 每拍分配、relay sendmsg iovec、files 拷贝）；
-- DNS TTL 缓存 + socket/缓冲复用；`udpcap` 周期修正；状态快照分层；
+### Q-I 性能细节批（**2026-10-08 拆前段/尾段**；前段即时做，尾段挂 Q-E 之后）
+
+**前段（不与 Q-E 撞面）**：
+- `Device::consume_step` 65KB memset 消除；`encap_peer` 每包 `to_vec`；`HOMEWAY_TX_DBG` OnceLock（每包 getenv 全局锁）；
+- 热路径缓冲复用（intercept 每拍分配 + `flush_backlog` 的 `copy_within`/`drain` memmove、`flows.keys().collect()` 每拍全表拷贝、wgcore 每拍 64KB/65KB 分配）；
+- `relay` sendmsg iovec；`RelayLog::logf` 无缓冲（QC-design §5 登记）；`udpcap` 周期多睡一个 interval；状态快照分层；
 - 全部改动跑 PERF-AB 复测纪律（loadavg 表头 + 干净环境判决）。
+
+**尾段（Q-E 之后做，避免与 Q-E 的 `dnsproxy.rs`/`files*` 返工）**：
+- DNS TTL 缓存 + socket/缓冲复用；files 客户端/服务端拷贝与分配。
 
 ### Q-J 通用性批
 - keyenc 平台/布局字段化（HELLO 声明，缺省兼容）；DNS 上游列表/fake-IP 卫兵统一配置化；
