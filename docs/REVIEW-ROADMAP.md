@@ -14,7 +14,7 @@
 | 批 | 内容 | 状态（更新时间） | 设计门 | 代码门 | 记录 |
 |---|---|---|---|---|---|
 | **Q-A** | 文档与治理对齐（**无评审**） | **完成**（2026-10-07，提交 `5d47087` + `37b4fe5`）——PERF-AB 删除批注记（pacing/MTU/SENDTHREAD；§10 推荐键改现存面）+ AGENTS 退役事实修订（Go 退役/R7 完成/smoltcp 0.14/openspec 指向/锚点/硬规则 2·4 重述）+ BASELINE 冻结声明 + make-baseline 锚点对齐 d4148f6 + INTEROP-CRITERIA 出处修正与「判据变更记录」政策（含 Q-B 两条预登记占位）+ ROADMAP 去重（R2 段）+ 「下一步（当前指针）」节 + 隔离条款状态注记 + R8 既成事实注记 + GAP-AUDIT 账实修正（P0-1 余项 OPEN→Q-H / P1-3 / P1-6）+ ROADMAP P1 7/8 修正 + fixtures SUMS 全量重生成（45/52→59 项）+ MANIFEST 口径 + README 建仓首页 + workspace version 0.1.0→0.2.3 + cli 描述/unified_cli 头注/ci-local 头注口径 | — | — | 本表 |
-| **Q-B** | 拦截层与出口数据面加固（P0-1/P0-5 等） | 等指令 | — | — | — |
+| **Q-B** | 拦截层与出口数据面加固（P0-1/P0-5 等） | **进行中**（2026-10-07，第 1 棒设计完成） | **通过**（2026-10-07，dsh `r1.jhb9HE` exit=0；27 条意见→21 认同改设计/0 不认同；三处结构性修订 A1〔空帧收线时序〕/A2〔F1 有界性订正+门移进循环〕/B2〔F8 改 per-conn 续写〕已并入） | 待第 2 棒 | `docs/reviews/QB-design.md` |
 | **Q-C** | 入口安全与资源上限（P0-2 等：wtransport/中继/设备表） | 等指令 | — | — | — |
 | **Q-D** | 终端子系统加固（P0-3 等） | 等指令 | — | — | — |
 | **Q-E** | 出口服务修复（P0-4 等：files/DNS/UPnP/speedtest） | 等指令 | — | — | — |
