@@ -201,6 +201,19 @@ v6 路径）+ Rust 统一进程出口 42680（upnp=true 同号映射成立 ⇒ v
 - E1 打的是**配置端口**；实际端口（占用退让后）落 `<state>/serve/listen_port.txt`，token
   端点跟实际端口走（`serve.go:553` 注释）。
 - E3 的 token 行有去重纪律：端点没变不重打（`serve.go:157` lastToken）。
+- **【Q-B 批，2026-10-07】IPv4 分片丢弃（F7，接受的差异）**：拦截层在 `on_plain` 的
+  parse 之后、demux 与五元组查表**之前**丢弃分片包（非首片 `frag_off>0` 或 MF 置位）并计
+  `fragDrop`——**拒绝 Go/gVisor 会重组的形态**（>1280 的 UDP 被分片后，本层不再当独立会话
+  处理）。后果：被分片的 UDP（少见）不转发，客户端按超时/不可达重试；出口侧分片重组**未实现**
+  （另议）。DF-only（flags=0x4000、off=0、MF=0）不算分片，照常处理。
+- **【Q-B 批，2026-10-07】非 TCP/UDP 协议不建会话（F9，接受的差异）**：ICMP 等非 6/17 协议
+  在 `on_plain` 直接丢弃——**不产出 Go netstack 会回的 ICMP 不可达**（`build_icmp_unreachable`
+  现仅对 UDP 生效，扩展面另议）；收益 = 移除每包 `socket/bind/connect` 开销与 `dialfail` 计数
+  噪声（**非**「占表」——拨号失败同调用内 `remove_flow`，不留存）。
+- **【Q-B 批，2026-10-07】应用层丢新（F3/F4，接受的差异）**：`out_udp` 超条数/字节上限、以及
+  `tx_deferred` 滞留超 `TX_DEFER_MAX_BYTES`（非 TCP 包）时**丢新 + 计数**（`udpDrop`/`shapeDrop`）。
+  Go 侧对应面是内核 rcvbuf 界定 / 无界 channel——本层以显式上限换取内存有界，代价是压力下丢新
+  率上升（`udpNoReply` 观测漂移）。**TCP 恒不丢**（字节流丢字节 = 流错位）。
 
 ## daemon/控制面族实采（B0-2b 第 1 棒，2026-10-05；统一进程本地实例 /tmp/hw-ctl-unified——serve/relay 初始停用，control.sock 0600；出口 = local-rust-exit.sh 实例 1/2〔42651/42652，隔离端口绝不触生产 41641〕）
 
@@ -318,9 +331,21 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 
 | 日期 | 条目 | 从 → 到 | 原因 | 影响面 |
 |---|---|---|---|---|
-| （占位）2026-10-07 | **E12 关闭行 `udp_seq_of` 恒 `#0`**（待 Q-B 批落地登记） | `udp intercept: 会话 #0 … 关闭` → `udp intercept: 会话 #<真实序号> … 关闭` | **修复型变更**：`udp_seq_of` 从未赋值（唯一写点 = 0），E12 关闭行恒 #0 是缺陷不是契约；Q-B 批补赋值 | `docs/INTEROP-CRITERIA.md` E12 行、`crates/homeway-core/src/server/intercept/mod.rs`、任何按「E12 关闭行 #0」写断言的测试 |
-| （占位）2026-10-07 | **`decr_flow` 下溢**（待 Q-B 批落地登记） | flows gauge 回绕（未 incr 的流上 decr）→ 记负/回绕 | **修复型变更**：`decr_flow` 可在未 `incr_flow` 的流上执行，属计数器缺陷；Q-B 批加配对守卫 | `intercept` stats flows 面、`serve.status` intercept 段、相关单测 |
+| 2026-10-07（Q-B 批落地） | **E12 关闭行会话号**（`udp intercept: 会话 #%d … 关闭`） | `udp intercept: 会话 #0 关闭（…）`（恒 0）→ `udp intercept: 会话 #<本会话建立号> 关闭（…）` | **修复型变更**：`udp_seq_of` 从未赋值（唯一写点 = 0），E12 关闭行恒 #0 是缺陷不是契约；Q-B 批在 `udp_ready` 建立时 `f.udp_seq_of = seq`（F5-1） | `docs/INTEROP-CRITERIA.md` E12 行、`crates/homeway-core/src/server/intercept/mod.rs`（`udp_ready`/`finish_udp`）、单测 `udp_close_line_reuses_establish_seq`；任何按「E12 关闭行 #0」写断言的测试须改按建立号 |
+| 2026-10-07（Q-B 批落地） | **`decr_flow` 下溢（flows gauge 回绕）** | 未 `incr_flow` 的流上 `decr_flow` → flows gauge 回绕（`fetch_sub` 记负/极大值）→ 改为**配对守卫**（仅对已建立流计数） | **修复型变更**：`decr_flow` 可在未 `incr_flow` 的流上执行（listen 失败路径、`close()` 期在途 Dialing 流）属计数器缺陷；Q-B 批以 `establish`/`retire` 收口（F5-2，`Flow.counted` 守卫 + `debug_assert`） | `intercept` stats flows 面、`serve.status` intercept 段、单测 `close_does_not_underflow_flow_gauge`/`udp_session_end_to_end`（flows gauge 断言） |
 
-> 上述两行为 **2026-10-07 预登记（占位条目）**：Q-B 批将实施该两条修复，属修复型变更——
-> 届时按本政策把「从 → 到」的实际行文补全并去掉「占位」标注（同批 commit）。
-> 登记生效后，E12 关闭行与 flows 计数按新行文验收（旧行文不再要求同串）。
+> 上述两行 = **2026-10-07 Q-B 批落地登记**（Q-A 批预登记的占位条目已按本政策补全「从 → 到」
+> 实际行文并去掉「占位」标注，同批 commit）。登记生效后，E12 关闭行与 flows 计数按新行文
+> 验收（旧行文不再要求同串）。
+
+### 计数输入集 / 数值语义变化（**行文不变**，登记留痕）
+
+> 口径（Q-B 批确立）：**计数器输入集变化不属判据行变更**（行文未动、不需改同串口径），
+> 但**必须在本节列明**——供验收方追踪数值语义演进。以下均不改任何判据行行文。
+
+| 日期 | 条目 | 从 → 到（数值语义） | 原因 | 影响面 |
+|---|---|---|---|---|
+| 2026-10-07（Q-B） | **DC18** `intercept：dialOk=N dialFail=N reject=N flows=N` | `dialFail` 含 ICMP 等非 TCP/UDP 协议的每包拨号失败 → 非 TCP/UDP 不再建会话，`dialFail` 不再被 ICMP 抬高（F9） | F9：仅 TCP(6)/UDP(17) 建会话（Go 仅注册 TCP/UDP handler） | DC18 数值、`serve.status` intercept 段 |
+| 2026-10-07（Q-B） | **E22** `dns: q=… qtcp=… resp=… malformed=…` | ① `qtcp`/`malformed` 不再被 DNS-TCP 腿的空帧（`mlen==0`）抬高（F2-3 收线，**与 Go 对齐**：Go 读失败即 `return`、不计 qtcp，`server.go:294-300`）；② `resp` 按 DNS 腿**每包**增长（F6，**与 Go 对齐**：`dnsleg.go:35` 每包 `Answer`） | F2-3 空帧收线 / F6 腿会话内每包应答 | E22 数值、DNS 相关单测 |
+| 2026-10-07（Q-B） | **`udpNoReply`**（udpcap 实测位） | 压力下上升（F3 UDP 上行门丢新 + F4 非 TCP 滞留丢新） | F3/F4 应用层丢新策略的观测漂移 | E12/udpcap 相关观测 |
+| 2026-10-07（Q-B） | **新增独立丢弃计数** `udpDrop`/`shapeDrop`/`fragDrop`（`Stats::snapshot()` 追加末位） | 无 → 有（新增观测） | F3/F4/F7/F10 静默失败/丢新改为可观测 | additive：① `snapshot()` 索引 `[0..=5]` 与键查找语义不变；② 经 `serve.status` 载荷 `ServeInterceptBits`（`udpDrop`/`shapeDrop`/`fragDrop`，serde `default` 兼容旧载荷）暴露；**DC18 人读行文不变**（`daemon_cli` 仍只渲染 dialOk/dialFail/reject/flows） |

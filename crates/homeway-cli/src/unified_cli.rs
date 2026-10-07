@@ -475,6 +475,9 @@ impl UnifiedRoles {
                         dial_fail: i.dial_fail,
                         reject: i.reject,
                         flows: i.flows,
+                        udp_drop: i.udp_drop,
+                        shape_drop: i.shape_drop,
+                        frag_drop: i.frag_drop,
                     },
                     d,
                 )

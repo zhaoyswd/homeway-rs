@@ -355,6 +355,13 @@ pub struct ServeInterceptBits {
     pub dial_fail: u64,
     pub reject: u64,
     pub flows: u64,
+    /// Q-B 新增丢弃计数（F3/F4/F7/F10；additive——旧载荷缺省 0）。
+    #[serde(rename = "udpDrop", default)]
+    pub udp_drop: u64,
+    #[serde(rename = "shapeDrop", default)]
+    pub shape_drop: u64,
+    #[serde(rename = "fragDrop", default)]
+    pub frag_drop: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

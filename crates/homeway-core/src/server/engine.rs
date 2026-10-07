@@ -170,6 +170,10 @@ pub struct EngineInterceptBits {
     pub dial_fail: u64,
     pub reject: u64,
     pub flows: u64,
+    /// Q-B 新增丢弃计数（F3/F4/F7/F10）。
+    pub udp_drop: u64,
+    pub shape_drop: u64,
+    pub frag_drop: u64,
 }
 
 /// 出口引擎句柄（装配线程持有；stop 收工）。
@@ -852,6 +856,9 @@ impl ServeEngine {
                 dial_fail: get("dialfail"),
                 reject: get("rejected"),
                 flows: get("flows"),
+                udp_drop: get("udpDrop"),
+                shape_drop: get("shapeDrop"),
+                frag_drop: get("fragDrop"),
             },
             ddns,
         )
