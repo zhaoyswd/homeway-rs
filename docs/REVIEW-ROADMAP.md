@@ -115,10 +115,15 @@
 ### Q-H CLI 与 daemon 控制面
 - config 双表收敛（统一进程启动期严格 schema 试装配；`assemble` 改 `Result`，`process::exit`
   只留前台层）；**非法配置不再打崩统一进程**（含实测回归）；
+- **（Q-A 批遗留登记）** `nodestate.rs:257` 默认 config 模板注释把键写成 `burst_kib`，实际
+  `TxShapeCfg` 字段 = `burst_kb`（`intercept/mod.rs:363`，`deny_unknown_fields`）——用户照模板
+  填键会拒启；随本批 config 面一并修正；
 - `--state` 形态族（`--state=` 等号/缺值/空值全量 fail-fast；`serve token` 支线补齐）；
 - daemon SOCKS `dead` 落账 + `socks on` 重建;hosts 会话重建环;连接/握手上限;
 - `short_host` char-boundary；数字回退 fail-fast；`serve --help` 拦截；幂等口径统一；
-- N1/L7：前台 serve/relay 默认 state 与统一进程对齐（GAP-AUDIT OPEN 项）。
+- N1/L7：前台 serve/relay 默认 state 与统一进程对齐（GAP-AUDIT OPEN 项）；
+- **（待用户裁决）** GAP-AUDIT P1-4「客户端『出口能力』打行」代码面无实现（服务端 caps 位在、
+  客户端 Session 侧无消费）——做（客户端消费 caps 并打行）或标注不做，二选一由用户拍板。
 
 ### Q-I 性能细节批
 - `Device::consume_step` 65KB memset 消除；`HOMEWAY_TX_DBG` OnceLock；
