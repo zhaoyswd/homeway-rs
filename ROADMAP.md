@@ -276,6 +276,19 @@ HOMEWAY_UDP_NO_BATCH）。净删约 -1440 行。②门禁：ci-local quick 全�
 是 **x86_64**，拿 arm64 产物会 Exec format error）；手机 R1→R2→R3 自动重连
 18.5s 恢复 direct。回退件 `.bak-v0.2.1` 两台在位。
 
+**拦截 reactor 简化批（2026-10-07 挂单，用户已入队——本批）**：出口拦截层的重拨
+OS socket 从 8-worker 池收进**单个事件循环**（redis/nginx 式：每流一个状态结构
+〔读/写兴趣位 + 缓冲〕、无锁无 Arc 无 worker 分配、无跨线程流队列）——消灭本仓
+bug 密度最高的管道族（R3 三 bug / R6.6 双拷贝 / Written 差额补报〔files 上传
+卡死〕/ 短返丢弃 / 收工丢尾包 / ubuntu CI worker 饿死全在此族）。**协议语义零
+改动**（SYN 缓存三态拨号 / UDP 五元组会话 pending 重放 / 豁免 demux / RST+ICMP
+responder / E5/E10/E11/E12 判据行与 Stats 计数同串同口径）。分棒：Ra 设计门
+（`docs/reviews/reactor-design.md` 必答六题 + dsh 评审过门）→ Rb 实装（删
+pool.rs，净删行数入册——「保持代码最为简洁」的兑现度量）→ Rc 验收（harness
+有损链路三臂 + ci-local quick 全绿 + RRR 矩阵冒烟 + 真机烟囱判据行同串）→
+Rd 发版 v0.2.3 两台滚动（B0-2a 手法；阿里云 **x86_64/amd64 产物**〔v0.2.2 实录
+教训〕）→ Re 收口。tier 本批不动（纯出口侧）。
+
 真手指复测清单（files 上传 picker〔K-10〕、~~逐包 pacing 下一档~~（**D-3 已落**——
 8s 进默认 + 8r 机制在册默认关）、
 echo RTT +6.3ms 恒定粒度〔K-7，设计代价〕、共存定案与 AGENTS/README 终稿〔K-20〕）。
