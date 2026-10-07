@@ -53,6 +53,37 @@ const DEFAULT_MAX_LEGS: usize = 256; // 注册腿总数上限（匿名洪水兜�
 const DEFAULT_MAX_CTL_CONNS: u16 = 64; // 已建立控制连接总数上限
 const CTL_PEND_MAX: usize = 16; // 等腿窗的客户端包缓冲上限
 const RATE_BUCKET_TTL: Duration = Duration::from_secs(2); // 限流桶清理窗
+/// **未验证挑战**表上限（F5：HELLO 不占 `legs`，只占本表；满按最旧淘汰**而非拒绝**——
+/// 拒绝会让合法后端在洪水下也进不来）。Q17 语义之一。
+const PENDING_MAX: usize = 64;
+/// 全局分配腿（assoc socket）总数上限（F7.3）：`max_per_peer` 是**每腿**上限，
+/// 全局最坏 `32 × 256 = 8192` socket（每枚 4MB+4MB 内核缓冲）⇒ fd/内存双耗尽面。
+const MAX_ASSOCS_TOTAL: usize = 1024;
+/// 单会话下行字节桶（F7.2）：目标吞吐 ≥100Mbit/s（16MiB/s ≈ 128Mbit/s 留余量；
+/// **禁止**照抄 `leg_rate_ok` 的 2000pps——那是 ~22Mbit/s 硬顶的静默下载回归）。
+const ASSOC_DOWN_BYTES_PER_SEC: u64 = 16 * 1024 * 1024;
+
+// 拒绝类日志的节流原因（F6：首 3 条 + 每 100 条一条）。enum 代 int 常量
+// （AGENTS 工程原则 1：类型承担不变量；饱和面仅是节流桶键，不做线上编码）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum RejectLog {
+    /// 注册腿总数达上限（PROOF 提升 / 控制面新腿）
+    LegCap,
+    /// 每腿分配上限
+    PerPeer,
+    /// PROOF 协议版本不符
+    ProofVer,
+    /// token 校验不过
+    Token,
+    /// 并发握手上限
+    CtlFull,
+    /// 全局分配腿总数上限（F7.3）
+    AssocTotal,
+    /// 下行字节桶超限（F7.2）
+    DownLimit,
+    /// 转发发送失败（F8）
+    SendFail,
+}
 
 /// 中继参数（CLI/装配层构造）。
 #[derive(Clone)]
@@ -111,6 +142,12 @@ pub struct Stats {
     pub forwarded_up: u64,
     pub forwarded_down: u64,
     pub leg_rejected: u64,
+    /// 上行转发发送失败（F8：`send_to` 返 Err 才计，不再计成功）。
+    pub send_fail_up: u64,
+    /// 下行转发发送失败（F8）。
+    pub send_fail_down: u64,
+    /// 下行字节桶丢弃（F7.2：超目标吞吐被丢的包）。
+    pub down_limited: u64,
 }
 
 // ---------- 内部状态（驱动线程独占） ----------
@@ -122,19 +159,27 @@ struct AssocKey {
 }
 
 /// 一条注册腿（后端身份 = label = HashMap 键；relayID 分配/回收见 R4-design §1.2）。
+/// **只有认证过（PROOF 通过 / 控制面握手通过）的腿才进本表**——未认证的 HELLO 挑战
+/// 落在 `pending`（F5）。
 struct Leg {
     pubkey: [u8; 32],
     /// 注册腿源地址（后端公网映射，也是给客户端的 hint）；None = 纯控制腿。
     addr: Option<SocketAddr>,
     last: Instant,
-    /// 挑战在飞（UDP 面）：临时私钥 + nonce + 出题时刻（用完即弃）。
-    eph_priv: Option<x25519_dalek::StaticSecret>,
-    nonce: [u8; 16],
-    chall_at: Option<Instant>,
     verified: bool,
     ctl_verified: bool,
     /// 挂着的控制连接（conn id；attach 顶旧连）。
     ctl: Option<u64>,
+}
+
+/// 一次未完成的挑战（F5：HELLO 只写这里，不占 `legs`）。真正需要的只有
+/// `(pubkey, eph_priv, nonce, 出题时刻)`——token 模式 PROOF 不用 `eph_priv`，但
+/// **pubkey 必须留存**（PROOF wire 不含 pubkey，label=sha256(pubkey)[:8] 不可逆）。
+struct PendingLeg {
+    pubkey: [u8; 32],
+    eph_priv: x25519_dalek::StaticSecret,
+    nonce: [u8; 16],
+    chall_at: Instant,
 }
 
 impl Leg {
@@ -151,6 +196,13 @@ struct Assoc {
     key: AssocKey,
     backend: Option<SocketAddr>,
     sock: UdpSocket,
+    /// socket 是否双栈（F8：按族 map 发送目标，对齐 Go `ListenUDP("udp", nil)`）。
+    dual: bool,
+    /// 大缓冲是否已抬高（F7.3：未认证不 bump——认证后/首次真实下行才抬）。
+    bufs_bumped: bool,
+    /// 下行字节桶（F7.2）：窗口起点 + 窗口内字节数。
+    down_win: Instant,
+    down_bytes: u64,
     last: Instant,
     last_down: Instant,
     sid: u64,
@@ -217,6 +269,8 @@ fn bump_sock_bufs(sock: &UdpSocket) {
 pub struct Relay {
     cfg: Config,
     legs: HashMap<[u8; 8], Leg>,
+    /// 未验证挑战表（F5：HELLO 写这里，PROOF 通过才提升进 `legs`）。
+    pending: HashMap<[u8; 8], PendingLeg>,
     assocs: HashMap<AssocKey, Assoc>,
     rates: HashMap<IpAddr, RateBucket>,
     leg_rates: HashMap<IpAddr, RateBucket>,
@@ -230,6 +284,10 @@ pub struct Relay {
     wake_w: i32,
     /// poll 集成员已变（会话/连接/腿的增删）——下一轮重建。
     poll_dirty: bool,
+    /// 控制面（TCP 同号口）是否就绪（F10：bind 失败 = 纯 UDP 降级，探针 flags 报降级位）。
+    ctl_ok: bool,
+    /// 拒绝类日志的每原因节流计数（F6）。
+    reject_log: HashMap<RejectLog, u64>,
 }
 
 impl Relay {
@@ -241,6 +299,7 @@ impl Relay {
         Self {
             cfg,
             legs: HashMap::new(),
+            pending: HashMap::new(),
             assocs: HashMap::new(),
             rates: HashMap::new(),
             leg_rates: HashMap::new(),
@@ -253,6 +312,8 @@ impl Relay {
             msg_tx,
             wake_w: -1,
             poll_dirty: false,
+            ctl_ok: false,
+            reject_log: HashMap::new(),
         }
     }
 
@@ -296,14 +357,16 @@ impl Relay {
         )) {
             Ok(ln) => {
                 ln.set_nonblocking(true)?;
+                self.ctl_ok = true;
                 self.logf(&format!(
                     "中继控制面：TCP 0.0.0.0:{actual_port} 就绪（后端拨腿模式可用）"
                 ));
                 Some(ln)
             }
             Err(e) => {
+                self.ctl_ok = false;
                 self.logf(&format!(
-                    "⚠️ 控制面 TCP 0.0.0.0:{actual_port} 监听失败（{e}）—— 退回纯 UDP 中继（拨腿特性缺席）"
+                    "⚠️ 控制面 TCP 0.0.0.0:{actual_port} 监听失败（{e}）—— 退回纯 UDP 中继（拨腿特性缺席；探针 flags 报降级位）"
                 ));
                 None
             }
@@ -522,8 +585,9 @@ impl Relay {
             self.stats.dropped += 1;
             return;
         }
-        // 参照点探测（无状态一问一答；防放大 ≤ req+45B；合法探测不进任何计数）
-        if let Some(resp) = crate::probe::respond_ex(pkt, self.build_str(), 0, &[]) {
+        // 参照点探测（无状态一问一答；防放大 ≤ req+45B；合法探测不进任何计数）。
+        // F10：flags 报「控制面降级」位（serve 侧 flags=caps 不动；中继 flags 命名空间）。
+        if let Some(resp) = crate::probe::respond_ex(pkt, self.build_str(), self.relay_flags(), &[]) {
             let _ = udp.send_to(&resp, src);
             return;
         }
@@ -549,6 +613,22 @@ impl Relay {
         if self.cfg.build.is_empty() { "relay-dev" } else { &self.cfg.build }
     }
 
+    /// 探针 flags（F10）：控制面降级位（bit5，中继命名空间——bit0–4 是 serve 的 udpcap）。
+    fn relay_flags(&self) -> u8 {
+        if self.ctl_ok {
+            0
+        } else {
+            crate::probe::FLAG_RELAY_CTL_DEGRADED
+        }
+    }
+
+    /// 拒绝类日志的每原因节流（F6：首 3 条 + 每 100 条一条）。
+    fn reject_log_due(&mut self, reason: RejectLog) -> bool {
+        let n = self.reject_log.entry(reason).or_insert(0);
+        *n += 1;
+        *n <= 3 || n.is_multiple_of(100)
+    }
+
     /// 后端注册腿的 UDP 控制消息（Hello/Proof/Keepalive）。
     fn handle_control(&mut self, udp: &UdpSocket, src: SocketAddr, label: [u8; 8], payload: &[u8]) {
         let sub = payload.first().copied().unwrap_or(0);
@@ -561,99 +641,79 @@ impl Relay {
                 self.stats.forged += 1;
                 return;
             }
-            // 出题：临时密钥 + nonce（复用/建腿——**绝不替换**对象，只覆写挑战字段；
-            // 随机源异常静默放弃本轮（Go leg.go 同义——不 panic 掉驱动线程）
+            // 出题（F5）：**不写 `legs`**——挑战落在独立 `pending` 表（≤PENDING_MAX，
+            // 满按最旧淘汰**而非拒绝**）。未认证的 HELLO 因此不再占用受 `max_legs`
+            // 约束的腿槽（匿名洪水灌不满真腿表；合法后端总能拿到挑战）。
             let mut eph_bytes = [0u8; 32];
             let mut nonce_out = [0u8; 16];
             if getrandom::getrandom(&mut eph_bytes).is_err() || getrandom::getrandom(&mut nonce_out).is_err() {
-                return;
+                return; // 随机源异常静默放弃本轮（不 panic 掉驱动线程）
             }
-            let nonce = nonce_out;
-            let eph = x25519_dalek::StaticSecret::from(eph_bytes);
-            let entry = if let Some(lg) = self.legs.get_mut(&label) {
-                lg
-            } else {
-                if self.legs.len() >= self.cfg.max_legs {
-                    self.stats.denied += 1;
-                    self.logf(&format!(
-                        "中继：注册腿总数已达上限 {}，拒绝新的 {}（防匿名洪水）",
-                        self.cfg.max_legs, hex(&label)
-                    ));
-                    return;
+            let now = Instant::now();
+            if !self.pending.contains_key(&label) && self.pending.len() >= PENDING_MAX {
+                if let Some(oldest) = self
+                    .pending
+                    .iter()
+                    .min_by_key(|(_, p)| p.chall_at)
+                    .map(|(k, _)| *k)
+                {
+                    self.pending.remove(&oldest);
                 }
-                self.legs.insert(
-                    label,
-                    Leg {
-                        pubkey: pub_,
-                        addr: None,
-                        last: Instant::now(), // 未验证腿的注册窗口起点
-                        eph_priv: None,
-                        nonce: [0; 16],
-                        chall_at: None,
-                        verified: false,
-                        ctl_verified: false,
-                        ctl: None,
-                    },
-                );
-                self.legs.get_mut(&label).expect("刚插入")
-            };
-            entry.pubkey = pub_;
-            entry.eph_priv = Some(eph);
-            entry.nonce = nonce;
-            entry.chall_at = Some(Instant::now());
-            let eph_pub = match &entry.eph_priv {
-                Some(k) => PublicKey::from(k),
-                None => return,
-            };
-            let resp = frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::encode_challenge(eph_pub.as_bytes(), &nonce));
+            }
+            let eph = x25519_dalek::StaticSecret::from(eph_bytes);
+            let eph_pub = PublicKey::from(&eph);
+            self.pending.insert(
+                label,
+                PendingLeg { pubkey: pub_, eph_priv: eph, nonce: nonce_out, chall_at: now },
+            );
+            let resp = frame::frame_bytes(
+                rw::FRAME_TYPE_RELAY_REG,
+                &rw::encode_challenge(eph_pub.as_bytes(), &nonce_out),
+            );
             let _ = udp.send_to(&resp, src);
             return;
         }
         if sub == rw::sub::PROOF {
-            if !self.legs.contains_key(&label) {
+            // 挑战态在 `pending`（HELLO 写入）；PROOF 通过才提升进 `legs`。
+            let Some(p) = self.pending.get(&label) else {
                 self.stats.forged += 1;
                 return;
-            }
+            };
             let Some(parts) = rw::decode_proof(payload) else {
                 self.stats.forged += 1;
                 return;
             };
             if parts.ver != rw::RELAY_CTL_VER {
                 self.stats.forged += 1;
-                self.logf(&format!(
-                    "中继：后端 {} 注册证明协议版本 {} 不符（需要 {}）—— 拒绝",
-                    hex(&label), parts.ver, rw::RELAY_CTL_VER
-                ));
+                if self.reject_log_due(RejectLog::ProofVer) {
+                    self.logf(&format!(
+                        "中继：后端 {} 注册证明协议版本 {} 不符（需要 {}）—— 拒绝",
+                        hex(&label), parts.ver, rw::RELAY_CTL_VER
+                    ));
+                }
                 return;
             }
-            // 腿材料快照（避免跨借用；对象同一性守卫 = 快照后仍按 label 命中同一表项）
-            let (chall_at, nonce, pubkey, eph_priv, old_addr) = {
-                let lg = self.legs.get(&label).expect("已判在");
-                (lg.chall_at, lg.nonce, lg.pubkey, lg.eph_priv.clone(), lg.addr)
-            };
-            let Some(chall_at) = chall_at else {
-                self.stats.forged += 1;
-                return;
-            };
-            if chall_at.elapsed() > CHALLENGE_TTL || nonce != parts.nonce {
+            if p.chall_at.elapsed() > CHALLENGE_TTL || p.nonce != parts.nonce {
                 self.stats.forged += 1;
                 return;
             }
+            // 快照挑战材料（避免跨借用；用完即弃）
+            let pubkey = p.pubkey;
+            let eph_priv = p.eph_priv.clone();
             // 校验：开放模式只看 DH；token 模式只看 PSK（DH 谁都算得出，不当准入）
-            let pass = match (&self.cfg.secret, eph_priv.as_ref()) {
-                (Some(sec), Some(_eph)) => {
+            let pass = match &self.cfg.secret {
+                Some(sec) => {
                     let want = rw::auth_mac(sec, &parts.nonce, &pubkey);
                     rw::ct_eq_16(&want, parts.mac_psk)
                 }
-                (None, Some(eph)) => {
-                    let dh = eph.diffie_hellman(&PublicKey::from(pubkey));
+                None => {
+                    let dh = eph_priv.diffie_hellman(&PublicKey::from(pubkey));
                     let want = rw::proof_mac(dh.as_bytes(), &parts.nonce, &pubkey);
                     rw::ct_eq_16(&want, parts.mac_dh)
                 }
-                _ => false,
             };
             if !pass {
-                if self.cfg.secret.is_some() {
+                if self.cfg.secret.is_some() && self.reject_log_due(RejectLog::Token) {
                     self.logf(&format!(
                         "中继：后端 {} 的 token 校验不过（密钥不对/没带 token）—— 拒绝",
                         hex(&label)
@@ -661,6 +721,20 @@ impl Relay {
                 }
                 self.stats.forged += 1;
                 return;
+            }
+            self.pending.remove(&label);
+            // 提升进 `legs`（受 max_legs 闸）；已存在的腿**就地更新**（Q17 ①：绝不
+            // 迁移/替换对象——否则在用数据腿在挑战窗口 `admitted()` 会变 false、数据面闸关）。
+            let old_addr = self.legs.get(&label).and_then(|l| l.addr);
+            if !self.legs.contains_key(&label) && self.legs.len() >= self.cfg.max_legs {
+                self.stats.denied += 1;
+                if self.reject_log_due(RejectLog::LegCap) {
+                    self.logf(&format!(
+                        "中继：注册腿总数已达上限 {}，拒绝新的 {}（防匿名洪水）",
+                        self.cfg.max_legs, hex(&label)
+                    ));
+                }
+                return; // 后端 5s 后会重发 HELLO（重试即自愈）
             }
             let moved = old_addr.is_some_and(|a| a != src);
             let stale_sids: Vec<u64> = if moved {
@@ -684,11 +758,18 @@ impl Relay {
                 0
             };
             {
-                let lg = self.legs.get_mut(&label).expect("已判在");
+                let lg = self.legs.entry(label).or_insert_with(|| Leg {
+                    pubkey,
+                    addr: None,
+                    last: Instant::now(),
+                    verified: false,
+                    ctl_verified: false,
+                    ctl: None,
+                });
+                lg.pubkey = pubkey; // 控制面先建的腿 pubkey 占位 [0;32]——此处补真值
                 lg.verified = true;
                 lg.addr = Some(src);
                 lg.last = Instant::now();
-                lg.eph_priv = None; // 用完即弃
             }
             self.stats.registered += 1;
             for sid in stale_sids {
@@ -765,21 +846,36 @@ impl Relay {
             let per_peer = self.assocs.keys().filter(|k| k.label == label).count();
             if per_peer >= self.cfg.max_per_peer {
                 self.stats.dropped += 1;
-                self.logf(&format!(
-                    "中继：后端 {} 的分配腿已达上限 {}，丢弃新客户端 {}",
-                    hex(&label), self.cfg.max_per_peer, client
-                ));
+                if self.reject_log_due(RejectLog::PerPeer) {
+                    self.logf(&format!(
+                        "中继：后端 {} 的分配腿已达上限 {}，丢弃新客户端 {}",
+                        hex(&label), self.cfg.max_per_peer, client
+                    ));
+                }
                 return;
             }
-            let sock = match UdpSocket::bind("0.0.0.0:0") {
-                Ok(s) => s,
+            // F7.3 全局闸（每腿上限之外的第二道：fd/内存双耗尽面）
+            if self.assocs.len() >= MAX_ASSOCS_TOTAL {
+                self.stats.dropped += 1;
+                if self.reject_log_due(RejectLog::AssocTotal) {
+                    self.logf(&format!(
+                        "中继：分配腿总数已达全局上限 {}，丢弃新客户端 {}（后端 {}）",
+                        MAX_ASSOCS_TOTAL, client, hex(&label)
+                    ));
+                }
+                return;
+            }
+            // F8：双栈 assoc socket（对齐 Go `net.ListenUDP("udp", nil)`——v4/v6 后端都可发）。
+            let (sock, dual) = match crate::udpbatch::open_client_socket() {
+                Ok(v) => v,
                 Err(_) => {
                     self.stats.dropped += 1;
                     return;
                 }
             };
             let _ = sock.set_nonblocking(true);
-            bump_sock_bufs(&sock);
+            // F7.3：**不在此 bump 缓冲**——未认证来源也能建会话，此处抬 4MB×2 会被灌爆；
+            // 延迟到「认证成功 / 首次真实下行」（见 assoc_read）。
             let mut cookie = [0u8; 16];
             if getrandom::getrandom(&mut cookie).is_err() {
                 // 不退化全零 cookie 的假认证：拆会话让客户端重试
@@ -791,6 +887,10 @@ impl Relay {
                 key,
                 backend: leg_addr,
                 sock,
+                dual,
+                bufs_bumped: false,
+                down_win: Instant::now(),
+                down_bytes: 0,
                 last: Instant::now(),
                 last_down: Instant::now(),
                 sid: 0,
@@ -820,7 +920,10 @@ impl Relay {
                     let _ = udp.send_to(&frame::hint_bytes(&addr.to_string()), client);
                 }
                 if let Some(b) = self.assocs.get(&key).and_then(|a| a.backend) {
-                    let _ = self.assocs.get(&key).unwrap().sock.send_to(&frame::hint_bytes(&client.to_string()), b);
+                    let a = self.assocs.get(&key).expect("已判在");
+                    let _ = a
+                        .sock
+                        .send_to(&frame::hint_bytes(&client.to_string()), crate::udpbatch::xmit_addr(b, a.dual));
                 }
             }
             if has_ctl {
@@ -864,8 +967,17 @@ impl Relay {
             return;
         }
         if let Some(dst) = a.backend {
-            let _ = a.sock.send_to(&frame_bytes, dst);
-            self.stats.forwarded_up += 1;
+            // F8：**只计成功**（`send_to` 返 Err 不再计 forwarded_up——ENOBUFS/EAFNOSUPPORT
+            // 曾被计成健康转发）。
+            match a.sock.send_to(&frame_bytes, crate::udpbatch::xmit_addr(dst, a.dual)) {
+                Ok(_) => self.stats.forwarded_up += 1,
+                Err(e) => {
+                    self.stats.send_fail_up += 1;
+                    if self.reject_log_due(RejectLog::SendFail) {
+                        self.logf(&format!("中继：上行转发发送失败（{e}）—— 已计数，不转发成功面"));
+                    }
+                }
+            }
         }
     }
 
@@ -911,6 +1023,11 @@ impl Relay {
                             a.dial_up = false;
                             flush = Some(std::mem::take(&mut a.pend));
                         }
+                        // F7.3：认证成功（真实后端在）才抬缓冲
+                        if !a.bufs_bumped {
+                            a.bufs_bumped = true;
+                            bump_sock_bufs(&a.sock);
+                        }
                         if moved {
                             moved_log = Some((sid, from));
                         }
@@ -919,9 +1036,21 @@ impl Relay {
                     }
                 }
             } else {
-                // v1 会话（sid==0，fallback）：backend = lg.addr
-                a.last = now;
-                a.last_down = now;
+                // v1 fallback 会话（sid==0）：**只认注册腿源 `a.backend`**。replay 回滚
+                // 会把 a.sid=0/dial_up=false/dialed=false 而**保留 a.backend**（故取
+                // a.backend 而非 lg.addr——纯控制腿的 lg.addr=None，用它会当场丢光下行）。
+                // 其它来源**显式丢弃 + 计数、不续命**（此前是排他 if/else、无第三出口，
+                // 会穿透到原样回投 ⇒ 任意源可续命并借中继回投）。
+                if a.backend == Some(from) {
+                    a.last = now;
+                    a.last_down = now;
+                    if !a.bufs_bumped {
+                        a.bufs_bumped = true;
+                        bump_sock_bufs(&a.sock);
+                    }
+                } else {
+                    rejected = true;
+                }
             }
         }
         if rejected {
@@ -939,10 +1068,21 @@ impl Relay {
             return;
         }
         if let Some(pend) = flush {
-            let a = self.assocs.get(&key).expect("已判在");
-            for p in pend {
-                let _ = a.sock.send_to(&p, from);
+            // 等腿窗缓冲放行：包在**入队时**已计 forwarded_up（等腿窗语义）；回放失败
+            // 只进 send_fail_up（F8：不再动 forwarded_down——那是下行面，混面会失真）。
+            let mut fails = 0u64;
+            {
+                let a = self.assocs.get(&key).expect("已判在");
+                for p in pend {
+                    if a.sock
+                        .send_to(&p, crate::udpbatch::xmit_addr(from, a.dual))
+                        .is_err()
+                    {
+                        fails += 1;
+                    }
+                }
             }
+            self.stats.send_fail_up += fails;
         }
         if let Some((sid, from)) = moved_log {
             self.logf(&format!("中继：会话 #{sid} 的后端腿重拨 → {from}（cookie 认证通过，跟随）"));
@@ -951,9 +1091,37 @@ impl Relay {
         if rw::legup_cookie(&pkt).is_some() || pkt == b"LEGUP" {
             return;
         }
-        // FIX-91：出口恒发腿帧——原样转发（未知/畸形包由客户端按解码失败丢弃）
-        let _ = udp.send_to(&pkt, key.client);
-        self.stats.forwarded_down += 1;
+        // F7.2 下行字节桶（每会话；目标吞吐 ≥100Mbit/s——超限丢弃 + 计数 + 限流日志）
+        let over = {
+            let a = self.assocs.get_mut(&key).expect("已判在");
+            if now.duration_since(a.down_win) >= Duration::from_secs(1) {
+                a.down_win = now;
+                a.down_bytes = 0;
+            }
+            a.down_bytes += pkt.len() as u64;
+            a.down_bytes > ASSOC_DOWN_BYTES_PER_SEC
+        };
+        if over {
+            self.stats.down_limited += 1;
+            if self.reject_log_due(RejectLog::DownLimit) {
+                let sid = self.assocs.get(&key).map(|a| a.sid).unwrap_or(0);
+                self.logf(&format!(
+                    "中继：会话 #{sid} 下行超目标吞吐（{ASSOC_DOWN_BYTES_PER_SEC}B/s）—— 丢弃"
+                ));
+            }
+            return;
+        }
+        // FIX-91：出口恒发腿帧——原样转发（未知/畸形包由客户端按解码失败丢弃）。
+        // F8：只计成功。
+        match udp.send_to(&pkt, key.client) {
+            Ok(_) => self.stats.forwarded_down += 1,
+            Err(e) => {
+                self.stats.send_fail_down += 1;
+                if self.reject_log_due(RejectLog::SendFail) {
+                    self.logf(&format!("中继：下行转发发送失败（{e}）—— 已计数，不转发成功面"));
+                }
+            }
+        }
     }
 
     // ---------- 控制面 ----------
@@ -982,10 +1150,12 @@ impl Relay {
             None => {
                 drop(stream);
                 self.stats.dropped += 1;
-                self.logf(&format!(
-                    "中继：并发握手上限 {} 已满，拒绝 {remote}（慢握手洪水防护）",
-                    ctlface::HANDSHAKE_MAX
-                ));
+                if self.reject_log_due(RejectLog::CtlFull) {
+                    self.logf(&format!(
+                        "中继：并发握手上限 {} 已满，拒绝 {remote}（慢握手洪水防护）",
+                        ctlface::HANDSHAKE_MAX
+                    ));
+                }
             }
         }
     }
@@ -998,10 +1168,12 @@ impl Relay {
                 let label = h.label;
                 if !self.legs.contains_key(&label) && self.legs.len() >= self.cfg.max_legs {
                     self.stats.denied += 1;
-                    self.logf(&format!(
-                        "中继：注册腿总数已达上限 {}，拒绝控制面新腿 {}",
-                        self.cfg.max_legs, hex(&label)
-                    ));
+                    if self.reject_log_due(RejectLog::LegCap) {
+                        self.logf(&format!(
+                            "中继：注册腿总数已达上限 {}，拒绝控制面新腿 {}",
+                            self.cfg.max_legs, hex(&label)
+                        ));
+                    }
                     drop(h.stream); // 连接关闭（established 计数回退见下）
                     self.established.fetch_sub(1, Ordering::SeqCst);
                     return;
@@ -1012,12 +1184,10 @@ impl Relay {
                 let remote = conn.remote;
                 self.ctl_conns.insert(id, conn);
                 let leg = self.legs.entry(label).or_insert_with(|| Leg {
-                    pubkey: [0; 32], // 控制面建腿拿不到 pubkey——保留占位（准入靠 ctl_verified）
+                    pubkey: [0; 32], // 控制面建腿拿不到 pubkey——保留占位（准入靠 ctl_verified；
+                    // UDP PROOF 提升时会补上真 pubkey）
                     addr: None,
                     last: Instant::now(),
-                    eph_priv: None,
-                    nonce: [0; 16],
-                    chall_at: None,
                     verified: false,
                     ctl_verified: false,
                     ctl: None,
@@ -1302,6 +1472,8 @@ impl Relay {
         // 限流桶清理
         self.rates.retain(|_, b| now.duration_since(b.window) <= RATE_BUCKET_TTL);
         self.leg_rates.retain(|_, b| now.duration_since(b.window) <= RATE_BUCKET_TTL);
+        // 过期挑战清理（F5：pending 也须随 TTL 退场，否则长时间运行会累积）
+        self.pending.retain(|_, p| now.duration_since(p.chall_at) <= CHALLENGE_TTL);
         if reclaim > 0 {
             self.logf(&format!(
                 "中继：回收 {reclaim} 条空闲分配腿（当前 {} 条）",
@@ -1741,6 +1913,217 @@ mod tests {
             }
         }
         assert!(last_src.is_some(), "回收后重发包应重建会话并转发");
+    }
+
+    /// F5：未认证 HELLO 不占 `legs`——伪造 label 洪水灌不满真腿表，合法后端仍可注册。
+    /// （`max_legs=2` + 20 个自洽伪造 HELLO：若 HELLO 仍插腿，合法 PROOF 必被拒。）
+    #[test]
+    fn hello_flood_does_not_occupy_legs() {
+        let mut cfg = Config::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), None, noop_logf());
+        cfg.max_legs = 2;
+        let tr = TestRelay::start(cfg);
+        let relay_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), tr.port);
+        let be = UdpSocket::bind("127.0.0.1:0").unwrap();
+        be.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        for _ in 0..20 {
+            let p = rand_secret();
+            let pk = PublicKey::from(&p);
+            let label = relay_id(pk.as_bytes());
+            let hello = frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::encode_hello(pk.as_bytes()));
+            let mut tagged = Vec::new();
+            frame::encode_tagged_frame(&label, &hello, &mut tagged);
+            be.send_to(&tagged, relay_addr).unwrap();
+            let _ = be.recv_from(&mut [0u8; 128]); // 吃掉 CHALLENGE
+        }
+        let priv_ = rand_secret();
+        let pub_ = PublicKey::from(&priv_);
+        let label = relay_id(pub_.as_bytes());
+        register_open(&be, relay_addr, &priv_, &pub_, &label);
+    }
+
+    /// F5：`pending` 满按最旧淘汰（**不拒绝**）——洪水下合法后端仍能完成注册。
+    #[test]
+    fn pending_full_evicts_oldest_not_reject() {
+        let tr = TestRelay::start(Config::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            None,
+            noop_logf(),
+        ));
+        let relay_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), tr.port);
+        let be = UdpSocket::bind("127.0.0.1:0").unwrap();
+        be.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        for _ in 0..(PENDING_MAX + 5) {
+            let p = rand_secret();
+            let pk = PublicKey::from(&p);
+            let label = relay_id(pk.as_bytes());
+            let hello = frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::encode_hello(pk.as_bytes()));
+            let mut tagged = Vec::new();
+            frame::encode_tagged_frame(&label, &hello, &mut tagged);
+            be.send_to(&tagged, relay_addr).unwrap();
+            let _ = be.recv_from(&mut [0u8; 128]);
+        }
+        let priv_ = rand_secret();
+        let pub_ = PublicKey::from(&priv_);
+        let label = relay_id(pub_.as_bytes());
+        register_open(&be, relay_addr, &priv_, &pub_, &label);
+    }
+
+    /// F5：`legs` 闸移到 PROOF 提升（`max_legs` 只数**已接纳**腿）——超限拒绝、后端重试。
+    #[test]
+    fn legs_cap_applied_at_promotion() {
+        let mut cfg = Config::new(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0), None, noop_logf());
+        cfg.max_legs = 1;
+        let tr = TestRelay::start(cfg);
+        let relay_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), tr.port);
+        let be = UdpSocket::bind("127.0.0.1:0").unwrap();
+        be.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
+        let p1 = rand_secret();
+        let pub1 = PublicKey::from(&p1);
+        register_open(&be, relay_addr, &p1, &pub1, &relay_id(pub1.as_bytes()));
+        // 第二条：PROOF 通过但 legs 满 ⇒ 无 OK（后端重试自愈）
+        let p2 = rand_secret();
+        let pub2 = PublicKey::from(&p2);
+        let label2 = relay_id(pub2.as_bytes());
+        let hello = frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::encode_hello(pub2.as_bytes()));
+        let mut tagged = Vec::new();
+        frame::encode_tagged_frame(&label2, &hello, &mut tagged);
+        be.send_to(&tagged, relay_addr).unwrap();
+        let mut buf = [0u8; 128];
+        let (n, _) = be.recv_from(&mut buf).unwrap();
+        let (_, payload) = frame::decode_frame(&buf[..n]).unwrap();
+        let (eph_pub, nonce) = rw::decode_challenge(payload).unwrap();
+        let dh = p2.diffie_hellman(&PublicKey::from(eph_pub));
+        let proof = rw::encode_proof(&nonce, dh.as_bytes(), pub2.as_bytes(), None);
+        let mut tagged = Vec::new();
+        frame::encode_tagged_frame(&label2, &frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &proof), &mut tagged);
+        be.send_to(&tagged, relay_addr).unwrap();
+        assert!(be.recv_from(&mut buf).is_err(), "legs 满 ⇒ 不应回 OK");
+    }
+
+    /// F7.1：v1 fallback 会话只认注册腿源 `a.backend`——未知源下行被显式丢弃、不续命。
+    #[test]
+    fn v1_fallback_binds_to_backend_source() {
+        let tr = TestRelay::start(Config::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            None,
+            noop_logf(),
+        ));
+        let relay_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), tr.port);
+        let be = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let cl = UdpSocket::bind("127.0.0.1:0").unwrap();
+        cl.set_read_timeout(Some(Duration::from_millis(400))).unwrap();
+        let p = rand_secret();
+        let pub_ = PublicKey::from(&p);
+        let label = relay_id(pub_.as_bytes());
+        register_open(&be, relay_addr, &p, &pub_, &label);
+        let data = frame::frame_bytes(frame::FrameKind::Data, b"up");
+        let mut tagged = Vec::new();
+        frame::encode_tagged_frame(&label, &data, &mut tagged);
+        cl.send_to(&tagged, relay_addr).unwrap();
+        be.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut buf = [0u8; 256];
+        let assoc_src = {
+            let mut src = None;
+            for _ in 0..4 {
+                let Ok((n, s)) = be.recv_from(&mut buf) else { break };
+                if frame::decode_frame(&buf[..n])
+                    .is_some_and(|(k, pl)| k == frame::FrameKind::Data.to_wire() && pl == b"up")
+                {
+                    src = Some(s);
+                    break;
+                }
+            }
+            src.expect("应收到转发帧")
+        };
+        // 未知源下行 ⇒ 丢弃；合法后端下行 ⇒ 到达
+        let intruder = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let bad = frame::frame_bytes(frame::FrameKind::Data, b"forged-down");
+        intruder.send_to(&bad, assoc_src).unwrap();
+        let good = frame::frame_bytes(frame::FrameKind::Data, b"good-down");
+        be.send_to(&good, assoc_src).unwrap();
+        let mut got: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..4 {
+            let Ok((n, _)) = cl.recv_from(&mut buf) else { break };
+            got.push(buf[..n].to_vec());
+        }
+        assert!(got.iter().any(|p| p.as_slice() == &good[..]), "合法后端下行应达客户端");
+        assert!(!got.iter().any(|p| p.as_slice() == &bad[..]), "未知源下行必须被丢弃");
+    }
+
+    /// F7.3/F8：未认证 assoc 不抬缓冲；下行发送失败只计 `send_fail_down`、不计成功。
+    #[test]
+    fn assoc_lazy_bump_and_down_fail_counted() {
+        let mut relay = Relay::new(Config::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            None,
+            noop_logf(),
+        ));
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let label = [0x5Au8; 8];
+        relay.legs.insert(
+            label,
+            Leg {
+                pubkey: [1; 32],
+                addr: Some("127.0.0.1:9999".parse().unwrap()),
+                last: Instant::now(),
+                verified: true,
+                ctl_verified: false,
+                ctl: None,
+            },
+        );
+        // 客户端地址用广播地址：下行 sendto 在本机必失败（无 SO_BROADCAST）
+        let client: SocketAddr = "255.255.255.255:9".parse().unwrap();
+        let data = frame::frame_bytes(frame::FrameKind::Data, b"x");
+        let mut tagged = Vec::new();
+        frame::encode_tagged_frame(&label, &data, &mut tagged);
+        relay.handle_udp_packet(&udp, client, &tagged);
+        assert_eq!(relay.assocs.len(), 1, "应建一条 assoc");
+        let key = AssocKey { label, client };
+        assert!(!relay.assocs[&key].bufs_bumped, "未认证不得抬缓冲（F7.3）");
+        // 合法后端下行 ⇒ 抬缓冲（v1 合法源首包）；但客户端发送失败 ⇒ 只计 send_fail_down
+        relay.assoc_read(&udp, key, "127.0.0.1:9999".parse().unwrap(), b"down".to_vec());
+        assert!(relay.assocs[&key].bufs_bumped, "v1 合法源首包后抬缓冲");
+        assert_eq!(relay.stats.forwarded_down, 0, "失败不计成功（F8）");
+        assert_eq!(relay.stats.send_fail_down, 1, "失败进 send_fail_down（F8）");
+    }
+
+    /// F10：控制面 TCP 同号口 bind 失败 ⇒ 探针 flags 报降级位；正常 ⇒ flags=0。
+    #[test]
+    fn probe_flags_report_ctl_degraded() {
+        // 占住 TCP 0.0.0.0:P（UDP P 仍空闲）⇒ 中继 UDP 绑 P、TCP 绑 0.0.0.0:P 失败
+        let ln = std::net::TcpListener::bind("0.0.0.0:0").unwrap();
+        let port = ln.local_addr().unwrap().port();
+        let tr = TestRelay::start(Config::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), port),
+            None,
+            noop_logf(),
+        ));
+        assert_eq!(tr.port, port, "UDP 绑到同号口（TCP 被占不影响 UDP）");
+        let cl = UdpSocket::bind("127.0.0.1:0").unwrap();
+        cl.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let nonce = [7u8; 8];
+        let req = crate::probe::encode_request(crate::probe::TYPE_PING, &nonce, 16);
+        cl.send_to(&req, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), tr.port)).unwrap();
+        let mut buf = [0u8; 512];
+        let (n, _) = cl.recv_from(&mut buf).unwrap();
+        let r = crate::probe::decode_response(&buf[..n], &nonce).unwrap();
+        assert_ne!(
+            r.flags & crate::probe::FLAG_RELAY_CTL_DEGRADED,
+            0,
+            "控制面 bind 失败应报降级位（实收 flags={:#x}）",
+            r.flags
+        );
+        drop(tr);
+        // 正常形态：flags = 0
+        let tr2 = TestRelay::start(Config::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            None,
+            noop_logf(),
+        ));
+        cl.send_to(&req, SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), tr2.port)).unwrap();
+        let (n2, _) = cl.recv_from(&mut buf).unwrap();
+        let r2 = crate::probe::decode_response(&buf[..n2], &nonce).unwrap();
+        assert_eq!(r2.flags, 0, "正常形态 flags 应为 0");
     }
 
     fn register_open(be: &UdpSocket, relay_addr: SocketAddr, priv_: &x25519_dalek::StaticSecret, pub_: &PublicKey, label: &[u8; 8]) {
