@@ -181,6 +181,11 @@
 
 ## 5. 本批残余与挂账（不含已裁决的 Q-J/Q-I 项）
 
+- **F1 进程级 E2E（设计 §2 测试计划 4）未执行**：`tools/local-rust-exit.sh` + 表满注入的复现需要
+  「设备超 grace 未刷新」——生产装配 `grace` 硬编码 `DEFAULT_GRACE=600s`（`engine.rs:368`
+  传 `Default::default()`，无 CLI 开关）⇒ 进程级复现须先让设备空闲 ≥10 分钟。表-设备一致
+  **同一不变量**已由 engine 级单测（真实 `Device` + `apply_dev_ops`）覆盖；进程级复现留作
+  需要时的交接口径（若要可测，需给 grace 加注入面，属 CLI/config 面）。
 - **F5 pending 淘汰竞态（代码门 M1）**：单源 200pps 洪水可在 ~0.32s 刷空 64 槽，极端时序下
   合法后端 `HELLO→PROOF` 的挑战条目被淘汰 ⇒ PROOF 静默计 `forged`，后端 5s 重发 HELLO 自愈。
   按用户裁决的「满按最旧淘汰不拒绝」语义保留；已登记（登记表 F5 行边缘注记）。
