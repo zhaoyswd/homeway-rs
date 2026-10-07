@@ -245,11 +245,7 @@ impl StackB {
         // （测速上行/files 上传）此前是 0.11 的「整窗突发 + RTO go-back-N」形态，真机
         // 有损 WiFi 下吞吐塌陷（E2E §6 A5' 上行 bulk 退化的机制归因，同 R6.6 下行）。
         // 线上行为（wire 字节）不可见差异——性能选择，无对齐义务（R6.6 垫片同口径）。
-        // R8-2：HOMEWAY_CC 消融（归因插桩，默认仍 CUBIC）。注（评审 r1-F7）：
-        // StackB 无 logf——客户端臂（上行 bulk 发送方）设错值静默回落 CUBIC 且无
-        // 记行面；上行消融轮以出口侧判据（E13/归因行）交叉核对，或后续给 StackB
-        // 引日志面时补同款一次性记行。
-        sock.set_congestion_control(crate::cc_choice());
+        sock.set_congestion_control(tcp::CongestionControl::Cubic);
         let handle = self.sockets.add(sock);
         let local = self.alloc_local_port();
         let cx = self.iface.context();

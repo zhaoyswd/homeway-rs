@@ -94,76 +94,14 @@ pub const TX_SHAPE_RATE: u64 = 200 * 1024 * 1024;
 /// 团块钳制与无排队同时成立（B 热态 25-28 平稳无锯齿）。
 pub const TX_SHAPE_BURST: usize = 256 * 1024;
 
-/// pacing 模式（D-3 8r；**反过拟合约束 1：节奏自适应而非固定间隔**——固定 ~10µs
-/// 对 1280B 包的极限 ~1Gbps，2.5G+ 快路径会变人为限速；固定 128MiB/s 对空口 94MB/s
-/// 的「留交织窗」算式方向也反〔评审 r1-5.3〕）。
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum PaceMode {
-    /// 自适应（config `pacing="adaptive"` / env `HOMEWAY_TX_PACING=on`）：
-    /// pace = clamp(TX_PACE_GAIN×est, FLOOR, CEIL)，
-    /// est = ACK 时钟吞吐估计（Interceptor 维护，稳态 ≈ cwnd/RTT——smoltcp 0.14
-    /// 不暴露 cwnd/ssthresh〔R8-8a 已核〕，ACK 时钟测其等价量，Linux fq pacing 的
-    /// delivered-rate 派生同型）；同时桶均值抬到 ≥ TX_RATE_GAIN×est（快路径不设
-    /// 人为上限）。增益 1.2 使 CC 平衡点（吞吐=est）永不被节流，同时 ACK 时钟
-    /// 团块（produce 率=est）贴着 pace 排空——每团真展开（2.0 档实测不 engage，
-    /// 见 TX_PACE_GAIN 注释）。
-    Adaptive,
-    /// 固定速率（B/s）——env `HOMEWAY_TX_PACE_MBPS` / config `pace_mbps` 的诊断
-    /// 梯度臂（与 adaptive 的 A/B 判别用；不抬桶均值）。
-    Fixed(u64),
-}
-
-/// 自适应增益/上下限（数值依据 = §十二）：
-/// - GAIN 1.2（Linux fq 稳态档：pacing_rate = cwnd/RTT × 1.2，慢启动才 ×2——慢启动
-///   的松化由 est 的 max 攻击承担：爬坡窗的峰值速率被 est 锁存 ⇒ pace 随之抬升）。
-///   2.0 档真机消融实测的失效机理（2026-10-06 日间带，A 臂 32 / baseline 13）：
-///   稳态 produce 率 = ACK 时钟 ≈ est ≪ 2×est ⇒ 时刻表恒在过去、pacing 整体不
-///   engage——ACK 时钟团块（~23KB/团）原样直通，wire 形态与 off 臂无差。1.2 档：
-///   每团排空 ~1.7ms（真展开），同时 20% 余量使 CC 平衡点（吞吐=est）永不被
-///   节流（无 R=64MiB/s 事故型的持续排队；est 测的就是被 pace 后的 ACK 时钟，
-///   收敛点 est=g、pace=1.2g ≥ g 自洽）；
-/// - FLOOR 16MiB/s：est 下界 TX_PACE_EST0 已保证间隔 ≤10µs/1280B（无慢路径滴流），
-///   此地板是 est 参数调整时的防御位；
-/// - CEIL 4GiB/s：2.5G 出口（312MB/s×2=625MB/s）≪ 4G——快路径不构成瓶颈。
-pub const TX_PACE_GAIN: f64 = 1.2;
-pub const TX_PACE_FLOOR: u64 = 16 * 1024 * 1024;
-pub const TX_PACE_CEIL: u64 = 4 * 1024 * 1024 * 1024;
-/// est 初值与衰减下界 8MiB/s（**注意有效 pace 下界 = max(TX_PACE_FLOOR,
-/// GAIN×est 下界) = 16MiB/s**——FLOOR 是当前生效钳位；est 下界的作用是把 est 钉在
-/// 贴实测的量级，防 8MiB 以下路径的滴流误判）：重启/空闲后 pace 从 16MiB/s 起步——首个 100ms
-/// 估计窗内 max 攻击即跳到实测速率，期间更紧的 pacing 只作用于首个团（冷形态
-/// 友好）。下界防滴流（9.6MiB/s 的 pace 下界 ≫ est<8 的任何路径需求——20Mbps
-/// 蜂窝形态 pace 恒不绑定）。16MiB 档真机实测会把 est 钉在下界（日间带 goodput
-/// 11-14 < 16）⇒ pace 与实测脱钩；8 档让 10MB/s 级路径的 est 贴实测。
-pub const TX_PACE_EST0: f64 = 8.0 * 1024.0 * 1024.0;
-/// 补账量子（单次释放的字节上界，pacing on 时生效）：`max(pace×2ms, 2×MSS)`。
-/// 驱动循环迟到时时刻表积欠一次放多包——**量子把补账团块钉住**（而非 burst 的
-/// 256KB：冷空口臂实测抓到 256KB 补账团击穿 192KiB 到达预算——25 到达丢失，量子
-/// 收紧后归零）。2ms 档的取舍：补账排空速率 = 量子×拍频须 ≥ pace——真机拍频
-/// ~20k/s（50µs pselect）余量 40×；harness 泵 ~0.6-1.5k/s（负载机实测 630/s）余量
-/// ~2.5×（500µs 档在负载机上把快臂压到 0.63×off——排空能力不足的实测教训）；
-/// 换来补账团块上界 pace×2ms（设备带 50-90MB/s ⇒ 100-180KB ≈ Go 出口自然团量级
-/// 〔§9.10〕——常态（无迟到达）释放仍由时刻表按拍距散布，量子只封迟到尾部）。
-pub const TX_PACE_QUANTUM: Duration = Duration::from_millis(2);
-/// pacing on 时的桶均值抬升增益（R ≥ 4×est）：WiFi 形态 est≈45 ⇒ 4×45=180 < 200
-/// ⇒ R 不变（8n③ 语义）；2.5G 形态 est≈312 ⇒ R≈1.25GB/s——桶不再是快路径瓶颈。
-pub const TX_RATE_GAIN: f64 = 4.0;
-/// est 的估计窗（ACK 确认字节/窗长；窗粗于团块 ⇒ 团内 ACK 速率尖峰被平均掉，
-/// est 反映的是持续速率）与每窗衰减系数（max 攻击、慢衰减——无振荡面）。
-pub const ACK_EST_WIN: Duration = Duration::from_millis(100);
-pub const ACK_EST_DECAY: f64 = 0.95;
-
-/// 出口发送整形参数（字节令牌桶 + 逐包时刻表；用户面形态——Adaptive 在使用点经
-/// `tx_shape_eff` 解析为具体速率）。
+/// 出口发送整形参数（字节令牌桶——团块钳制面；v0.2.2 简洁化批起逐包时刻表
+/// 已删除，只剩令牌桶本体 + `HOMEWAY_TX_SHAPING` 逃生口）。
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct TxShape {
-    /// 续水速率（B/s）。Adaptive pacing 下这只是**下界**（R_eff = max(rate, 4×est)）。
+    /// 续水速率（B/s）。
     pub rate: u64,
     /// 突发额度 = 令牌容量（B）：任意窗口 w 内线上深度 ≤ burst + rate·w。
     pub burst: usize,
-    /// 逐包 pacing：None = 时间门关（= 8n③ 纯桶形态，滞留非空时驱动拍 1ms）；
-    /// Some = 开（Some(PaceMode) 语义见枚举）。
-    pub pace: Option<PaceMode>,
 }
 
 /// config.toml `[serve.tx_shape]` 节（D-3 反过拟合约束 3：参数 config 化；env 臂
@@ -171,43 +109,20 @@ pub struct TxShape {
 #[derive(serde::Deserialize, Default, Clone, Copy, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct TxShapeCfg {
-    /// 桶均值钳制速率下界（MiB/s，默认 200；pacing=adaptive 时实际取
-    /// max(rate, 4×est)）。适用形态注释：家宽/无线出口按默认即可；极快路径
-    /// （≥1Gbps）交给 adaptive 自动抬升，无需手调。
+    /// 桶均值钳制速率（MiB/s，默认 200——~2× 层 0 天花板；家宽/无线出口按默认即可）。
     #[serde(default)]
     pub rate_mbps: Option<u64>,
     /// 单拍放行上界/桶容量（KiB，默认 256）。
     #[serde(default)]
     pub burst_kb: Option<usize>,
-    /// 逐包 pacing 模式：`off`（默认——D-3 止损裁定，见 tx_shape_resolve 注释）
-    /// | `adaptive` | `fixed`。适用形态：接收端无密集 ACK 时钟的路径（旧核手机、
-    /// 经 TUN 的应用流量）与快路径（≥1Gbps）建议 `adaptive`。
-    #[serde(default)]
-    pub pacing: Option<PaceCfg>,
-    /// pacing=fixed 时的速率（MiB/s）——诊断/梯度臂用；未给值回落 adaptive。
-    #[serde(default)]
-    pub pace_mbps: Option<u64>,
 }
 
-/// config 的 pacing 模式值面。
-#[derive(serde::Deserialize, Clone, Copy, Debug, PartialEq, Eq)]
-#[serde(rename_all = "lowercase")]
-pub enum PaceCfg {
-    Adaptive,
-    Fixed,
-    Off,
-}
-
-/// 整形参数解析（D-3：config 面 + env 测试缝，覆盖序 **env > config > 产品默认**）。
+/// 整形参数解析（config 面 + env 测试缝，覆盖序 **env > config > 产品默认**）。
 ///
 /// - 总开关 `HOMEWAY_TX_SHAPING`（**值匹配**：未设/`on`/`1`/`true` = 开，`off`/`0`/
 ///   `false` = 整套关——评审 r2 自补1 的惯例：presence 语义会把消融方向搞反）；
-/// - pacing 门 `HOMEWAY_TX_PACING`（同值匹配惯例）单独关**时间门**（= 8n③ 纯桶
-///   形态——消融对照面）；`HOMEWAY_TX_PACE_MBPS` = Fixed 梯度臂（>0 生效）；
 /// - `HOMEWAY_TX_RATE_MBPS` / `HOMEWAY_TX_BURST_KB` 覆盖桶参数；
 /// - config 面 = `TxShapeCfg`（[serve.tx_shape]）；
-/// - Fixed 臂交叉钳制 pace ≤ rate（pace > rate 时 credit 门长期闭合 + min 等待
-///   ⇒ 纯自旋——评审 r1-1.1）；
 /// - 非法值静默回落默认。
 pub(crate) fn tx_shape_resolve(cfg: Option<TxShapeCfg>) -> Option<TxShape> {
     match std::env::var("HOMEWAY_TX_SHAPING").as_deref() {
@@ -228,41 +143,6 @@ pub(crate) fn tx_shape_resolve(cfg: Option<TxShapeCfg>) -> Option<TxShape> {
             burst = b * 1024;
         }
     }
-    // 默认 off（D-3 真机消融的止损裁定）：8s 密集 ACK 在位时 pacing 无增益
-    //（18.1 vs 19.2 同带）且组合形态出现 2-4MB 常驻整形滞留（CUBIC 窗过冲改停
-    // 整形队列——RTT 代价）；8r 单独对旧核 +32%，但整链默认受益者是 8s。8r 保留
-    // 全套机制与开关面：无 8s 的接收端（旧核手机/Go 核/经 TUN 的应用流量——OHOS
-    // 内核 ACK 时钟不受 8s 覆盖）与快路径由 config/env 显式开启。
-    let mut pace = match cfg.pacing {
-        Some(PaceCfg::Adaptive) => Some(PaceMode::Adaptive),
-        // fixed 缺/非法 pace_mbps ⇒ 回落 adaptive（与 TxShapeCfg 字段注释一致——
-        // 评审 r2-2.7：静默关与注释承诺相反）
-        Some(PaceCfg::Fixed) => match cfg.pace_mbps {
-            Some(n) if n > 0 => Some(PaceMode::Fixed(n * 1024 * 1024)),
-            _ => Some(PaceMode::Adaptive),
-        },
-        Some(PaceCfg::Off) | None => None,
-    };
-    let mut pacing_explicit_off = false;
-    match std::env::var("HOMEWAY_TX_PACING").as_deref() {
-        Ok("off") | Ok("0") | Ok("false") => {
-            pace = None;
-            pacing_explicit_off = true; // 显式关最终胜出（r2-2.6：梯度缝不得掀翻消融臂）
-        }
-        Ok("on") | Ok("adaptive") | Ok("1") | Ok("true") => {
-            pace = Some(PaceMode::Adaptive)
-        }
-        Ok(_) | Err(_) => {}
-    }
-    if !pacing_explicit_off {
-        if let Ok(v) = std::env::var("HOMEWAY_TX_PACE_MBPS") {
-            if let Ok(n) = v.trim().parse::<u64>() {
-                if n > 0 {
-                    pace = Some(PaceMode::Fixed(n * 1024 * 1024));
-                }
-            }
-        }
-    }
     if let Ok(v) = std::env::var("HOMEWAY_TX_RATE_MBPS") {
         if let Ok(n) = v.trim().parse::<u64>() {
             if n > 0 {
@@ -277,22 +157,7 @@ pub(crate) fn tx_shape_resolve(cfg: Option<TxShapeCfg>) -> Option<TxShape> {
             }
         }
     }
-    if let Some(PaceMode::Fixed(p)) = pace {
-        if p > rate {
-            pace = Some(PaceMode::Fixed(rate)); // 交叉钳制：防 credit 闭合期的纯自旋
-        }
-    }
-    Some(TxShape { rate, burst, pace })
-}
-
-/// shape_slice 的已解析参数（`tx_shape_eff` 的产物：Adaptive 已折算成具体速率的
-/// Fixed 形态——纯函数只认数值）。
-#[derive(Clone, Copy)]
-struct ShapeResolved {
-    rate: u64,
-    burst: usize,
-    /// 已解析的 pacing 速率（None = 时间门关）。
-    pace: Option<u64>,
+    Some(TxShape { rate, burst })
 }
 
 /// shape_slice 的运行态进出（credit/时刻表/滞留字节——调用方持有、按值进出，
@@ -300,90 +165,53 @@ struct ShapeResolved {
 #[derive(Clone, Copy)]
 struct ShapeRun {
     credit: f64,
-    pace_next: Instant,
     /// 并入前的队存字节（与 tx_deferred_bytes 同源的 O(1) 维护量）。
     deferred_bytes: usize,
 }
 
-/// 令牌桶释放的一拍（纯函数面——单测可注入时间；参数 = `tx_shape_eff` 解析后的
-/// 具体速率值，Adaptive 不进这里）：`produce` 并入 `deferred` 尾部（FIFO 保序），
-/// 先按 `dt` 续水（容量 = burst），再从头释放「桶 credit 与（若开）**pacing 时刻
-/// 表**」都放行的包。返回 (本拍释放, ShapeRun 余态〔credit/时刻表/滞留字节〕)。
-/// 大于 burst 的包
+/// 令牌桶释放的一拍（纯函数面——单测可注入时间）：`produce` 并入 `deferred`
+/// 尾部（FIFO 保序），先按 `dt` 续水（容量 = burst），再从头释放桶 credit 放得
+/// 下的包。返回 (本拍释放, ShapeRun 余态〔credit/滞留字节〕)。大于 burst 的包
 /// 防御性直通（内层 IP 恒 ≤ 64KB < 默认 burst；防极小 burst 配置把队列头部卡死）。
 ///
-/// 8r 逐包时刻表（设计 docs/reviews/R8.md §十二）：桶门之上串联时间门——团内包按
-/// `len/pace` 间隔散布。时刻表 **advisory**：`now` 已过的时刻全放（驱动循环迟到
-/// 一次放多包补账，任意窗内平均放行率恒 = pace、不累积漂移；**单次补账上界 ≤
-/// burst**〔credit 不变量自带〕⇒ pacer 最坏形态 = 8n③ 单拍形态，不会更坏）；
-/// 时刻按 `pace_next += len/pace` 严格前进（**不向 now 钳**——钳了会把迟到时长
-/// 折进下一包间隔，补账退化成每唤醒一包）；队列排空时时刻表重置到 now（空闲期
-/// 不积累放行额度——否则空闲后的首个团会被整团一次放出）。稳态到达 < pace 时
-/// 时刻恒在过去 ⇒ 直通零延迟。
+/// burst 语义（评审 1.1 认账修订）：**桶容量 = 单拍放行上界（同值）**——不变量
+/// 由 credit 逐包扣减自带：每拍开始 credit ≤ burst、每放一包 credit -= fl ⇒ 单拍
+/// 释放总量恒 ≤ burst。**调大 burst 等于同时放开累积额度与单拍倾泻**（真机梯度：
+/// 桶 2MB 时团块 1-2MB 在空口成组丢失、dup 260-657/5s、CUBIC 反复砍窗）——
+/// 256KiB = 修复前 3.1MB 倾泻的 1/12 ≈ Go 出口的自然发送团量级。
 fn shape_slice(
     deferred: &mut std::collections::VecDeque<Vec<u8>>,
     produce: Vec<Vec<u8>>,
     run_in: ShapeRun,
-    p: ShapeResolved,
+    p: TxShape,
     dt: f64,
-    now: Instant,
-    two_mtu: usize,
 ) -> (Vec<Vec<u8>>, ShapeRun) {
-    let ShapeResolved { rate, burst, pace } = p;
-    let ShapeRun { mut credit, mut pace_next, deferred_bytes } = run_in;
-    // 并入字节先记账（评审 r2-4.6：释放路径的字节维护量改增量——pacing-on 的深
-    // 滞留形态〔实测 2-3MB〕下每拍 O(队深) 重扫 + 按队深预分配在 ~20k 拍频下是
-    // GB/s 级 churn）。滞留字节并入侧自增、释放侧自减、余量随 ShapeRun 出——O(1)。
+    let TxShape { rate, burst } = p;
+    let ShapeRun { mut credit, deferred_bytes } = run_in;
+    // 并入字节先记账（评审 r2-4.6：释放路径的字节维护量改增量——深滞留形态下
+    // 每拍 O(队深) 重扫 + 按队深预分配在高拍频下是 GB/s 级 churn）。滞留字节并入
+    // 侧自增、释放侧自减、余量随 ShapeRun 出——O(1)。
     let mut deferred_bytes =
         deferred_bytes + produce.iter().map(|p| p.len()).sum::<usize>();
     deferred.extend(produce);
     credit = (credit + rate as f64 * dt).min(burst as f64);
-    // 补账量子（8r 改版）：单次释放 ≤ max(pace×QUANTUM, 2×MTU)——迟到的时刻表
-    // 积欠跨多拍排空（每拍一团），不把 256KB 的桶上限当补账上界。P2：2×MTU 随
-    // 拦截栈内层 MTU（1380 档 = 2 满段口径随动；评审 P2-r1-6）。
-    let quantum = pace
-        .map(|p| (p as f64 * TX_PACE_QUANTUM.as_secs_f64()).max(two_mtu as f64) as usize)
-        .unwrap_or(usize::MAX);
-    let mut released = 0usize;
-    // 容量按量子上界估（不按队深）：本拍释放至多 quantum/最小包 个
-    let mut out = Vec::with_capacity((quantum / 256).min(deferred.len()));
-    // burst 语义（评审 1.1 认账修订）：**桶容量 = 单拍放行上界（同值）**——不变量
-    // 由 credit 逐包扣减自带：每拍开始 credit ≤ burst、每放一包 credit -= fl ⇒ 单拍
-    // 释放总量恒 ≤ burst（曾手写的 beat 计数与该不变量同值，是死逻辑，已删）。**调大
-    // burst 等于同时放开累积额度与单拍倾泻**（真机梯度：桶 2MB 时团块 1-2MB 在空口
-    // 成组丢失、dup 260-657/5s、CUBIC 反复砍窗）——256KiB = 修复前 3.1MB 倾泻的
-    // 1/12 ≈ Go 出口的自然发送团量级。pacing on 时时间门在排空期更紧（串联门，
-    // 释放率 = min(桶门, 时间门)——非并联防御），桶继续钳均值与极端场景。
+    let mut out = Vec::with_capacity(deferred.len());
     while let Some(front) = deferred.front() {
         let fl = front.len() as f64;
         if fl > burst as f64 {
-            // 防死锁直通 ≠ 参与记账（评审 r2-1.2 + 8r 同口径）：极小 burst 配置下直通
-            // 分支不扣 credit、不查时间门、不推进时刻表——扣了会打成负值/卡时刻表，
-            // 后续包要等续水补回才放行。
+            // 防死锁直通 ≠ 参与记账（评审 r2-1.2 同口径）：极小 burst 配置下直通
+            // 分支不扣 credit——扣了会打成负值，后续包要等续水补回才放行。
         } else {
             if credit < fl {
                 break;
             }
-            if let Some(pace) = pace {
-                if now < pace_next {
-                    break;
-                }
-                pace_next += Duration::from_secs_f64(fl / pace as f64);
-            }
             credit -= fl;
         }
+        let fl_usize = front.len();
         out.push(deferred.pop_front().expect("front 已判"));
-        released += fl as usize;
-        deferred_bytes -= fl as usize;
-        if released >= quantum {
-            break; // 补账量子：余量留下一拍（时刻表已推进，下拍无条件可放）
-        }
+        deferred_bytes -= fl_usize;
     }
-    if deferred.is_empty() {
-        // 队列排空 = 时刻表重置（见函数头注释：空闲期不积累放行额度）
-        pace_next = now;
-    }
-    (out, ShapeRun { credit, pace_next, deferred_bytes })
+    (out, ShapeRun { credit, deferred_bytes })
 }
 
 // 「真丢包」检测与发送塑形的历史注记（R6.6 应用层 CC 垫片，R8-8a 随 smoltcp
@@ -516,15 +344,12 @@ struct TcpObs {
 }
 
 impl TcpObs {
-    /// 客户端→出口 ACK 段累计（on_plain 点；v.proto 已判 6）。返回本段的**确认推进
-    /// 字节**（8r：ACK 时钟估计的累计源；dup/回退段返回 0）。单段推进截在 1MiB
-    ///（真 ACK 的推进 ≤ 对端通告窗——快路径 ~1MB 量级；超出的是五元组复用/回绕的
-    /// 假推进〔真机 8r 消融实测抓到一次性 +378MB 的 wrap 假跳变把 est 顶到 3.6G〕
-    /// ——截断防 est 污染，pace 误升方向的退化虽安全〔更松〕仍要防）。
-    fn note_rx_ack(&mut self, v: &Ipv4View) -> u64 {
+    /// 客户端→出口 ACK 段累计（on_plain 点；v.proto 已判 6）。单段推进截在
+    /// 1MiB（真 ACK 的推进 ≤ 对端通告窗——快路径 ~1MB 量级；超出的是五元组
+    /// 复用/回绕的假推进——截断防累计面污染）。
+    fn note_rx_ack(&mut self, v: &Ipv4View) {
         self.ack_seg += 1;
         let ack = v.tcp_ack;
-        let mut adv = 0u64;
         match self.ack_last {
             Some(prev) => {
                 let d = ack.wrapping_sub(prev);
@@ -532,7 +357,7 @@ impl TcpObs {
                     self.ack_dup += 1;
                 } else if d < 0x8000_0000 {
                     // 单调推进（回绕安全半窗内）才计确认字节；1MiB 截断见函数头
-                    adv = (d as u64).min(1024 * 1024);
+                    let adv = (d as u64).min(1024 * 1024);
                     self.ack_bytes += adv;
                     self.inflight_est -= adv as i64;
                 }
@@ -546,7 +371,6 @@ impl TcpObs {
         self.win_min = Some(self.win_min.map_or(w, |m| m.min(w)));
         self.win_max = self.win_max.max(w);
         self.win_last = w;
-        adv
     }
 
     /// 出口→客户端段累计（on_tx 点；载荷长度按反重写前的包体）。
@@ -646,18 +470,8 @@ pub struct Interceptor {
     tx_credit: f64,
     /// 上次续水时刻。
     tx_last_refill: Instant,
-    /// pacing 时刻表：下一包的最早放行时刻（8r；仅 pace 开时参与释放判定）。
-    tx_pace_next: Instant,
-    // ---- ACK 时钟吞吐估计（8r 自适应 pacing 的 est；驱动线程独占） ----
-    /// 本估计窗累计的 ACK 确认字节。
-    ack_clk_bytes: u64,
-    /// 估计窗起点（每 ACK_EST_WIN 一拍）。
-    ack_clk_last: Instant,
-    /// est（B/s）：窗内 ACK 确认速率，max 攻击 / ACK_EST_DECAY 每窗慢衰减 /
-    /// 下界 TX_PACE_EST0——稳态 ≈ cwnd/RTT（PaceMode::Adaptive 注释）。
-    ack_rate_est: f64,
     /// 本观察窗整形拍数（cc 5s 行消费清零——「每次唤醒放行包数」的判读面，
-    /// 评审 r1-1.1：pace 间隔低于循环固定成本时有效放行率由循环容量界定）。
+    /// 评审 r1-1.1：间隔低于循环固定成本时有效放行率由循环容量界定）。
     tx_win_pumps: u64,
     /// 本观察窗释放包数（cc_stats_line 5s 消费清零——窗语义）。
     tx_win_released: u64,
@@ -709,18 +523,8 @@ impl Interceptor {
         // Rust 侧扩展后缀会让 INTEROP-CRITERIA 的串匹配面失效）。
         match cfg.tx_shape {
             Some(s) => {
-                let pace_note = match s.pace {
-                    Some(PaceMode::Adaptive) => {
-                        " pace=自适应（ACK 时钟估计×增益，亚毫秒拍）".to_owned()
-                    }
-                    Some(PaceMode::Fixed(p)) => format!(
-                        " pace={}MiB/s（固定，逐包时刻表+亚毫秒拍）",
-                        p / (1024 * 1024)
-                    ),
-                    None => String::new(),
-                };
                 (cfg.logf)(&format!(
-                    "intercept: 发送整形=开（rate={}MiB/s burst={}KiB{pace_note}；单拍倾泻钳突发内、余量下拍续传）",
+                    "intercept: 发送整形=开（rate={}MiB/s burst={}KiB；单拍倾泻钳突发内、余量下拍续传）",
                     s.rate / (1024 * 1024),
                     s.burst / 1024
                 ))
@@ -751,10 +555,6 @@ impl Interceptor {
             tx_deferred_bytes: 0,
             tx_credit: tx_credit0,
             tx_last_refill: Instant::now(),
-            tx_pace_next: Instant::now(),
-            ack_clk_bytes: 0,
-            ack_clk_last: Instant::now(),
-            ack_rate_est: TX_PACE_EST0,
             tx_win_pumps: 0,
             tx_win_released: 0,
             tx_win_defer_peak: (0, 0),
@@ -851,14 +651,11 @@ impl Interceptor {
                 return;
             }
             // 8n 归因插桩：客户端→出口 ACK 段累计（含通告窗原始 u16）——在 pkt move
-            // 前观测（v 借用 pkt）；推进字节进 ACK 时钟估计（8r）。
+            // 前观测（v 借用 pkt）。
             if proto == Proto::Tcp {
-                let adv = self
-                    .flows
-                    .get_mut(&flow)
-                    .map(|f| f.obs.note_rx_ack(&v))
-                    .unwrap_or(0);
-                self.ack_clk_bytes += adv;
+                if let Some(f) = self.flows.get_mut(&flow) {
+                    f.obs.note_rx_ack(&v);
+                }
             }
             let mut p = pkt;
             nat::rewrite_dst(&mut p, self.cfg.tunnel_ip, rw);
@@ -945,7 +742,7 @@ impl Interceptor {
             tcp::SocketBuffer::new(vec![0u8; FLOW_TX_BUF]),
         );
         sock.set_nagle_enabled(false);
-        sock.set_congestion_control(self.cc_algo()); // R8-8a CUBIC（R8-2 起 HOMEWAY_CC 可消融）
+        sock.set_congestion_control(tcp::CongestionControl::Cubic); // R8-8a CUBIC
         sock.set_timeout(Some(smoltcp::time::Duration::from_secs(
             TCP_DNS_IDLE.as_secs(),
         )));
@@ -1220,7 +1017,6 @@ impl Interceptor {
         }
         // ①' DNS 应答回投（worker 池异步产出；H3——驱动线程只做路由写回）
         self.drain_dns();
-        self.ack_clk_tick();
         self.cc_stats_line();
         // ② 栈 poll
         let now = self.now_smol();
@@ -1261,7 +1057,6 @@ impl Interceptor {
             self.on_event(ev);
         }
         self.drain_dns();
-        self.ack_clk_tick();
         self.cc_stats_line();
         let now = self.now_smol();
         self.iface.poll(now, &mut self.device, &mut self.sockets);
@@ -1301,53 +1096,12 @@ impl Interceptor {
         }
     }
 
-    /// ACK 时钟估计的一拍（pump 头部调用；ACK_EST_WIN 粗节流——非窗口期零成本）。
-    /// 窗粗于团块（100ms ≫ 团内 ACK 尖峰的毫秒尺度）⇒ est 反映持续速率而非团内
-    /// 尖峰；max 攻击/慢衰减 ⇒ 无「估计跌 → pace 收紧 → 到达变慢 → 估计再跌」的
-    /// 下探振荡面（增益 1.2 使平衡点永不被节流，双保险）。
-    fn ack_clk_tick(&mut self) {
-        if self.cfg.tx_shape.is_none() {
-            self.ack_clk_bytes = 0; // 整形关时无消费者——不跨配置生命周期累计（r2-1.2低）
-            return;
-        }
-        let now = Instant::now();
-        let dt = now.duration_since(self.ack_clk_last);
-        if dt < ACK_EST_WIN {
-            return;
-        }
-        let inst = self.ack_clk_bytes as f64 / dt.as_secs_f64();
-        self.ack_clk_bytes = 0;
-        self.ack_clk_last = now;
-        self.ack_rate_est = inst.max(self.ack_rate_est * ACK_EST_DECAY).max(TX_PACE_EST0);
-    }
-
-    /// 有效整形参数（Adaptive → 具体速率的解析点；驱动线程独占）：
-    /// - Adaptive：pace = clamp(GAIN×est, FLOOR, CEIL)；R 抬到 ≥ TX_RATE_GAIN×est
-    ///   （快路径不设人为上限——反过拟合约束 1）；
-    /// - Fixed：pace 用配置值，R 不抬（诊断臂语义纯净）；
-    /// - None：原样。
-    fn tx_shape_eff(&self) -> Option<ShapeResolved> {
-        let s = self.cfg.tx_shape?;
-        let mut rate = s.rate;
-        let pace = match s.pace {
-            None => None,
-            Some(PaceMode::Fixed(p)) => Some(p.min(rate)),
-            Some(PaceMode::Adaptive) => {
-                let pace = (TX_PACE_GAIN * self.ack_rate_est)
-                    .clamp(TX_PACE_FLOOR as f64, TX_PACE_CEIL as f64) as u64;
-                rate = rate.max((TX_RATE_GAIN * self.ack_rate_est) as u64);
-                Some(pace.min(rate))
-            }
-        };
-        Some(ShapeResolved { rate, burst: s.burst, pace })
-    }
-
     /// 整形释放（`flush_all` = 收工宽限形态——评审 r2-1.1：宽限路径的原始语义是
     /// 「尽快把尾数据/FIN 送出去」（M2 判据），整形在这里没有收益还会丢尾包——
     /// 原实现每拍只拿令牌放得下的部分，宽限循环在流清空/到点即 break，滞留余量
     /// 随对象 drop = 静默丢尾数据）。返回本拍上线包集。
     fn tx_shape_release(&mut self, flush_all: bool) -> Vec<Vec<u8>> {
-        match self.tx_shape_eff() {
+        match self.cfg.tx_shape {
             None => std::mem::take(&mut self.tx_out),
             Some(shape) => {
                 let now = Instant::now();
@@ -1379,39 +1133,18 @@ impl Interceptor {
                         produce,
                         ShapeRun {
                             credit: self.tx_credit,
-                            pace_next: self.tx_pace_next,
                             deferred_bytes: self.tx_deferred_bytes,
                         },
                         shape,
                         dt,
-                        now,
-                        2 * self.device.mtu(),
                     );
                     self.tx_deferred_bytes = run.deferred_bytes;
                     self.tx_credit = run.credit;
-                    self.tx_pace_next = run.pace_next;
                     self.tx_win_released += out.len() as u64;
                     out
                 }
             }
         }
-    }
-
-    /// 栈内 TCP socket 的 CC 算法（R8-2 归因插桩）：`crate::cc_choice()` 的默认
-    /// CUBIC + **非默认值一次性记行**（消融轮的判据面——hilog/stdout 里能确证
-    /// 本轮跑的是 reno/none 而不是环境变量没生效）。
-    fn cc_algo(&self) -> tcp::CongestionControl {
-        let cc = crate::cc_choice();
-        if cc != tcp::CongestionControl::Cubic {
-            static LOGGED: std::sync::atomic::AtomicBool =
-                std::sync::atomic::AtomicBool::new(false);
-            if !LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed) {
-                (self.cfg.logf)(&format!(
-                    "intercept: CC 消融臂生效（HOMEWAY_CC={cc:?}——非产品默认 CUBIC）"
-                ));
-            }
-        }
-        cc
     }
 
     /// 发送侧吞吐观测行（verbose/dlogf 面；仅存在在途 TCP 流时打——真机吞吐排障的
@@ -1435,12 +1168,10 @@ impl Interceptor {
             let peak = self.tx_win_defer_peak;
             let rel = self.tx_win_released;
             let pumps = self.tx_win_pumps;
-            let est = self.ack_rate_est;
-            let pace = self.tx_shape_eff().and_then(|s| s.pace).unwrap_or(0);
             self.tx_win_defer_peak = (0, 0);
             self.tx_win_released = 0;
             self.tx_win_pumps = 0;
-            Some((cur, peak, rel, pumps, est, pace))
+            Some((cur, peak, rel, pumps))
         } else {
             None
         };
@@ -1461,22 +1192,20 @@ impl Interceptor {
         // 整形观测独立行（评审 r2-4.4：cc 行只在有活跃 TCP 流时打——纯 UDP transit
         // 场景 pacing 同样生效，est/pace 读数不能跟着 TCP 走；且 Fixed 档的 est 无
         // 驱动关系，混打易误读）。
-        if let Some((cur, peak, rel, pumps, est, pace)) = shape_cur {
-            // 「每次唤醒放行包数」= 有效放行率的判读面（评审 r1-1.1：pace 间隔低于
-            // 驱动循环固定成本时，有效放行率由循环容量界定——均包/拍 贴 1 即该形态）。
+        if let Some((cur, peak, rel, pumps)) = shape_cur {
+            // 「每次唤醒放行包数」= 有效放行率的判读面（评审 r1-1.1：间隔低于驱动
+            // 循环固定成本时，有效放行率由循环容量界定——均包/拍 贴 1 即该形态）。
             let per_pump = rel as f64 / pumps.max(1) as f64;
             (self.cfg.logf)(&format!(
-                "intercept: 整形观测 滞留={cur}包/{}KB 峰值={}包/{}KB 窗释={rel}(均{per_pump:.1}包/拍) est={}MiB/s pace={}MiB/s",
+                "intercept: 整形观测 滞留={cur}包/{}KB 峰值={}包/{}KB 窗释={rel}(均{per_pump:.1}包/拍)",
                 self.tx_deferred_bytes / 1024,
                 peak.0,
                 peak.1 / 1024,
-                est as u64 / (1024 * 1024),
-                pace / (1024 * 1024),
             ));
         }
         if let Some((sq, backlog)) = busiest {
             let shape_note = shape_cur
-                .map(|(cur, _peak, _rel, _pumps, _est, _pace)| {
+                .map(|(cur, _peak, _rel, _pumps)| {
                     format!(
                         " 整形滞留={cur}包/{}KB",
                         self.tx_deferred_bytes / 1024,
@@ -1628,7 +1357,7 @@ impl Interceptor {
                     tcp::SocketBuffer::new(vec![0u8; FLOW_TX_BUF]),
                 );
                 sock.set_nagle_enabled(false); // Go SetDelayOption(false) 同口径
-                sock.set_congestion_control(self.cc_algo()); // R8-8a CUBIC（R8-2 起 HOMEWAY_CC 可消融——下行 bulk 发送方）
+                sock.set_congestion_control(tcp::CongestionControl::Cubic); // R8-8a CUBIC（下行 bulk 发送方）
                 sock.set_timeout(Some(smoltcp::time::Duration::from_secs(TCP_IDLE.as_secs()))); // R2 低-10：精确 idle 回收
                 if let Err(e) = sock.listen(IpEndpoint::new(self.cfg.tunnel_ip.into(), rw)) {
                     (self.cfg.logf)(&format!("intercept: tcp listen rw_port {rw} 失败：{e:?}"));
@@ -2144,33 +1873,14 @@ impl Interceptor {
     /// 一个突发额度（160KB/5.3ms ≈ 30MB/s）——**突发额度退化成了速率上限**。滞留
     /// 非空时驱动循环应缩短 poll 超时（1ms：续水 64KB/拍 = 64MiB/s 直通面上限，
     /// 且线上团块随之细化到 ~64KB）。
-    pub fn tx_pacing_pending(&self) -> bool {
+    pub fn tx_deferred_pending(&self) -> bool {
         self.cfg.tx_shape.is_some() && !self.tx_deferred.is_empty()
     }
 
-    /// 驱动循环的整形等待提示（8r）：滞留非空时返回「到下一包可放行」的时长——
-    /// pacing on = min(桶门等待, 时间门等待)（亚毫秒粒度，配 pselect 用；credit 恒满
-    /// 的排空期 = 时间门等待）；pacing off = 恒 1ms（8n③ 的拍频形态原样——消融
-    /// 对照面）；滞留空/整形关 = None（5ms 常规拍）。返回值只是**提示**：等待早归/
-    /// 迟到都由释放侧的时刻表补账语义兜住（早归 = poll 有包到即醒照常收包；
-    /// 迟到 = 一次放多包）。
+    /// 驱动循环的整形等待提示：滞留非空 = Some(1ms)（8n③ 拍频形态——每拍续水
+    /// rate×1ms、线上团块随之细化）；滞留空/整形关 = None（5ms 常规拍）。
     pub fn tx_shape_wait(&self) -> Option<Duration> {
-        let eff = self.tx_shape_eff()?;
-        let front = self.tx_deferred.front()?;
-        if eff.pace.is_none() {
-            return Some(Duration::from_millis(1)); // pacing 关（8n③ 拍频形态）
-        }
-        let now = Instant::now();
-        // 桶门等待：头包还差多少 credit、按续水速率折算
-        let credit_wait = Duration::from_secs_f64(
-            ((front.len() as f64) - self.tx_credit).max(0.0) / eff.rate as f64,
-        );
-        // 时间门等待：时刻表下一拍（已在过去 = 0——本拍即可放）
-        let pace_wait = self.tx_pace_next.saturating_duration_since(now);
-        // 两道门**串联**（credit 够且到时刻才放行）⇒ 到下一包可放行 = 两门等待的
-        // **max**（评审 r2-2.1：min 会让 credit 恒满时恒返 0 ⇒ 驱动线程被 50µs 量化
-        // 下限钉死在 20k 唤醒/s 空转——放行率不受影响〔时间门/补账照常〕，纯 CPU）
-        Some(credit_wait.max(pace_wait))
+        self.tx_deferred_pending().then_some(Duration::from_millis(1))
     }
 
     /// 全停（teardown：在途 TCP 立即拆——收工语义）。
@@ -2248,13 +1958,10 @@ mod tests {
     }
 
     /// harness 臂的产品默认整形参数（与 `tx_shape_resolve(None)` 无 env/config 覆盖
-    /// 时同值——直接引常量保测试确定性：CI 环境变量不参与）。Adaptive 在
-    /// Interceptor 内按墙钟 est 解析——harness 的真实 ACK 流会驱动 est 收敛到
-    /// 本臂链路的实际速率（三臂形态判别的机制面，设计 §十二）。
+    /// 时同值——直接引常量保测试确定性：CI 环境变量不参与）。
     const PRODUCT_SHAPE: Option<TxShape> = Some(TxShape {
         rate: TX_SHAPE_RATE,
         burst: TX_SHAPE_BURST,
-        pace: Some(PaceMode::Adaptive),
     });
 
     fn cfg_base(tunnel_ip: Ipv4Addr) -> Config {
@@ -2920,7 +2627,7 @@ mod tests {
     fn pump_hold_defers_without_double_accounting() {
         let tunnel = Ipv4Addr::new(100, 64, 255, 1);
         let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::new(Stats::default()));
-        itc.cfg.tx_shape = Some(TxShape { rate: 1 << 20, burst: 1024, pace: None });
+        itc.cfg.tx_shape = Some(TxShape { rate: 1 << 20, burst: 1024 });
         for i in 0..4u8 {
             itc.tx_out.push(vec![i; 8]);
         }
@@ -2951,7 +2658,7 @@ mod tests {
     fn grace_flush_drains_deferred() {
         let tunnel = Ipv4Addr::new(100, 64, 255, 1);
         let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::new(Stats::default()));
-        itc.cfg.tx_shape = Some(TxShape { rate: 1, burst: 16, pace: None }); // 极小额度：一切都会滞留
+        itc.cfg.tx_shape = Some(TxShape { rate: 1, burst: 16 }); // 极小额度：一切都会滞留
         // 直接产出一批待发包（模拟拦截栈排空产物——不建真实流）
         for i in 0..8u8 {
             itc.tx_out.push(vec![i; 8]);
@@ -2987,21 +2694,7 @@ mod tests {
         };
         assert!(!parse(Some("off")) && !parse(Some("0")) && !parse(Some("false")));
         assert!(parse(None) && parse(Some("on")) && parse(Some("1")) && parse(Some("true")));
-        // 与 `=1` 被当关的旧语义（HOMEWAY_UDP_NO_BATCH 惯例误用面）显式区分
-        assert!(parse(Some("1")), "`=1` 必须是开（旧 presence 语义会把消融方向搞反）");
-        // HOMEWAY_TX_PACING（8r）双向值匹配：off/0/false = 关（= 8n③ 纯桶形态），
-        // on/adaptive/1/true = 开（adaptive）——**默认关**（D-3 止损裁定：8s 在位时
-        // pacing 无增益 + 组合形态 2-4MB 常驻滞留；8r 面向无 8s 的接收端路径，
-        // config/env 显式开）。镜像断言 match 分支形态（不真设 env）。
-        let parse_pacing = |v: Option<&str>, cfg: Option<bool>| match (v, cfg) {
-            (Some("off") | Some("0") | Some("false"), _) => false,
-            (Some("on") | Some("adaptive") | Some("1") | Some("true"), _) => true,
-            (_, Some(true)) => true,  // config pacing="adaptive"
-            (_, _) => false,          // 未设未配 = 默认关
-        };
-        assert!(!parse_pacing(Some("off"), None) && !parse_pacing(None, None));
-        assert!(parse_pacing(Some("on"), None) && parse_pacing(Some("1"), None));
-        assert!(parse_pacing(None, Some(true)), "config adaptive 显式开");
+        assert!(parse(Some("1")), "`=1` 必须是开（presence 语义会把消融方向搞反）");
     }
 
     /// 令牌桶释放的机制单测（R8-3 8i；纯函数面——时间注入，不依赖墙钟）：
@@ -3009,18 +2702,15 @@ mod tests {
     /// 零续水（紧循环不放大）；④ 大于 burst 的包防御性直通（防极小 burst 死锁）。
     #[test]
     fn shape_slice_budget_and_continuation() {
-        // 纯桶形态（pace=None——8n③ 语义的机制面；参数与 8n③ 实现同构）
+        // 令牌桶机制面（参数与实现同构）
         let mut deferred = std::collections::VecDeque::new();
-        let now = Instant::now();
         // 5×1000B 倾泻，dt=0（紧拍）：只放 3（额度 3000）
         let (out, run) = shape_slice(
             &mut deferred,
             vec![vec![0u8; 1000]; 5],
-            ShapeRun { credit: 3000.0, pace_next: now, deferred_bytes: 0 },
-            ShapeResolved { rate: 1000, burst: 3000, pace: None },
+            ShapeRun { credit: 3000.0, deferred_bytes: 0 },
+            TxShape { rate: 1000, burst: 3000 },
             0.0,
-            now,
-            2 * crate::wgcore::stackb::MTU,
         );
         assert_eq!(out.len(), 3, "突发额度 3000B 截断本拍释放");
         assert_eq!(deferred.len(), 2, "余量滞留");
@@ -3029,11 +2719,9 @@ mod tests {
         let (out, run) = shape_slice(
             &mut deferred,
             vec![],
-            ShapeRun { credit: run.credit, pace_next: now, deferred_bytes: 2000 },
-            ShapeResolved { rate: 1000, burst: 3000, pace: None },
+            ShapeRun { credit: run.credit, deferred_bytes: 2000 },
+            TxShape { rate: 1000, burst: 3000 },
             1.0,
-            now,
-            2 * crate::wgcore::stackb::MTU,
         );
         assert_eq!(out.len(), 1, "下拍续传一包（续水 1000B）");
         assert_eq!(deferred.len(), 1);
@@ -3041,11 +2729,9 @@ mod tests {
         let (out, _) = shape_slice(
             &mut deferred,
             vec![],
-            ShapeRun { credit: run.credit, pace_next: now, deferred_bytes: 1000 },
-            ShapeResolved { rate: 1000, burst: 3000, pace: None },
+            ShapeRun { credit: run.credit, deferred_bytes: 1000 },
+            TxShape { rate: 1000, burst: 3000 },
             60.0,
-            now,
-            2 * crate::wgcore::stackb::MTU,
         );
         assert_eq!(out.len(), 1, "空闲后桶满，滞留清空");
         let _ = &run;
@@ -3056,20 +2742,16 @@ mod tests {
         let (mut out1, run) = shape_slice(
             &mut deferred,
             pkts,
-            ShapeRun { credit: 3000.0, pace_next: now, deferred_bytes: 0 },
-            ShapeResolved { rate: 1000, burst: 3000, pace: None },
+            ShapeRun { credit: 3000.0, deferred_bytes: 0 },
+            TxShape { rate: 1000, burst: 3000 },
             0.0,
-            now,
-            2 * crate::wgcore::stackb::MTU,
         );
         let (mut out2, _) = shape_slice(
             &mut deferred,
             vec![],
-            ShapeRun { credit: run.credit, pace_next: now, deferred_bytes: 3000 },
-            ShapeResolved { rate: 1000, burst: 3000, pace: None },
+            ShapeRun { credit: run.credit, deferred_bytes: 3000 },
+            TxShape { rate: 1000, burst: 3000 },
             60.0,
-            now,
-            2 * crate::wgcore::stackb::MTU,
         );
         out1.append(&mut out2);
         let seq: Vec<u8> = out1.iter().map(|p| p[0]).collect();
@@ -3079,232 +2761,58 @@ mod tests {
         let (out, _) = shape_slice(
             &mut deferred,
             vec![vec![7u8; 500]],
-            ShapeRun { credit: 100.0, pace_next: now, deferred_bytes: 0 },
-            ShapeResolved { rate: 1000, burst: 100, pace: None },
+            ShapeRun { credit: 100.0, deferred_bytes: 0 },
+            TxShape { rate: 1000, burst: 100 },
             0.0,
-            now,
-            2 * crate::wgcore::stackb::MTU,
         );
         assert_eq!(out.len(), 1, "大于 burst 的包防御性直通");
         assert!(deferred.is_empty());
     }
 
-    /// 8r 逐包时刻表的机制单测（D-3；时间注入面）：① 团首包直通（时刻表在过去）
-    /// 其余按 len/pace 间隔门住；② 到点补账（一次放多包、间隔不向 now 钳——迟到
-    /// 时长不折进下一包间隔）+ 补账上界 ≤ burst（评审 r1-1.2：pacer 最坏形态 =
-    /// 8n③ 单拍形态）；③ 队列排空时时刻表重置到 now（空闲后新团不整团放）；
-    /// ④ 与桶门串联（credit 不足时先断在桶门）；⑤ 等价门（评审 r1-2.4）：pace 极大
-    /// 时与 pace=None 同输入同输出（稳态直通面逐包等价）。
-    #[test]
-    fn shape_slice_pacing_schedule() {
-        // pace=1000B/s：1000B 包间隔恰 1s——时刻表用整秒可断言
-        let t0 = Instant::now();
-        let mut deferred = std::collections::VecDeque::new();
-        // ① t0 倾泻 4×1000B（时刻表在 t0——首包直通）+ 第 2 包起被时间门门住
-        let (out, run) = shape_slice(
-            &mut deferred,
-            vec![vec![0u8; 1000]; 4],
-            ShapeRun { credit: 3000.0, pace_next: t0, deferred_bytes: 0 },
-            ShapeResolved { rate: 10_000_000, burst: 3000, pace: Some(1000) },
-            0.0,
-            t0,
-            2 * crate::wgcore::stackb::MTU,
-        );
-        assert_eq!(out.len(), 1, "团首包直通（时刻表在过去）");
-        assert_eq!(deferred.len(), 3);
-        assert_eq!(run.pace_next, t0 + Duration::from_secs(1), "时刻前进 len/pace");
-        let pace_next = run.pace_next;
-        // ② t0+1s 到点：放 1 包（补账只放到期者）；时刻 = t0+2s
-        let (out, next_run) = shape_slice(
-            &mut deferred,
-            vec![],
-            ShapeRun { credit: run.credit, pace_next, deferred_bytes: 3000 },
-            ShapeResolved { rate: 10_000_000, burst: 3000, pace: Some(1000) },
-            0.0,
-            t0 + Duration::from_secs(1),
-            2 * crate::wgcore::stackb::MTU,
-        );
-        assert_eq!(out.len(), 1);
-        let pace_next = next_run.pace_next;
-        assert_eq!(pace_next, t0 + Duration::from_secs(2));
-        // ②' 迟到 2.5s（时刻停在 t0+2s）：补账一次放 2（2s、3s 两拍都已过——间隔
-        //     不向 now 钳）；放完队列空 ⇒ 时刻表重置到本次 now（见 ③ 的机制）
-        let (out, next_run) = shape_slice(
-            &mut deferred,
-            vec![],
-            ShapeRun { credit: 3000.0, pace_next, deferred_bytes: 2000 },
-            ShapeResolved { rate: 10_000_000, burst: 3000, pace: Some(1000) },
-            0.0,
-            t0 + Duration::from_millis(4500),
-            2 * crate::wgcore::stackb::MTU,
-        );
-        assert_eq!(out.len(), 2, "迟到补账一次放到期包（不向 now 钳）");
-        assert!(deferred.is_empty());
-        assert_eq!(
-            next_run.pace_next,
-            t0 + Duration::from_millis(4500),
-            "放完排空 ⇒ 时刻表重置到 now"
-        );
-        let pace_next = next_run.pace_next; // 排空重置后的时刻表（t0+4.5s）
-        // ②'' 补账上界 ≤ burst（评审 r1-1.2 不变量）：10 包滞留 + 时刻表全过期 +
-        //      credit 满 ⇒ 单次释放 ≤ burst/包长 = 3 包——pacer 最坏形态 = 8n③ 单拍
-        let mut deferred = std::collections::VecDeque::new();
-        let (out, _) = shape_slice(
-            &mut deferred,
-            vec![vec![0u8; 1000]; 10],
-            ShapeRun {
-                credit: 3000.0,
-                pace_next: t0 - Duration::from_secs(600),
-                deferred_bytes: 0,
-            },
-            ShapeResolved { rate: 10_000_000, burst: 3000, pace: Some(1000) },
-            0.0,
-            t0,
-            2 * crate::wgcore::stackb::MTU,
-        );
-        assert_eq!(out.len(), 3, "补账上界 = burst（credit 不变量）——不会比 8n③ 更差");
-        assert_eq!(deferred.len(), 7);
-        // ③ 空闲后再来新团：首包直通（排空时已重置，不把空闲前的余量带进来）。
-        //     注：空闲超过一个 gap 时第 2 拍（重置时刻+gap）也已到期——至多多放
-        //     1 包（2 包小团，无累积——slot 只在放行时推进，空闲时长不折算成额度）。
-        let mut deferred = std::collections::VecDeque::new();
-        let (out, _) = shape_slice(
-            &mut deferred,
-            vec![vec![0u8; 1000]; 4],
-            ShapeRun { credit: 3000.0, pace_next, deferred_bytes: 0 },
-            ShapeResolved { rate: 10_000_000, burst: 3000, pace: Some(1000) },
-            0.0,
-            t0 + Duration::from_millis(4900),
-            2 * crate::wgcore::stackb::MTU,
-        );
-        assert_eq!(out.len(), 1, "空闲后新团首包直通（间隔未满 gap 时第 2 包仍门住）");
-        // ④ 桶门串联：credit 只够 1 包时，时间门即便全开也只放 1
-        let mut deferred = std::collections::VecDeque::new();
-        let (out, _) = shape_slice(
-            &mut deferred,
-            vec![vec![0u8; 1000]; 3],
-            ShapeRun { credit: 1000.0, pace_next: t0, deferred_bytes: 0 },
-            ShapeResolved { rate: 10_000_000, burst: 3000, pace: Some(1000) },
-            0.0,
-            t0,
-            2 * crate::wgcore::stackb::MTU,
-        );
-        assert_eq!(out.len(), 1, "桶门先断（credit 只够 1 包）");
-        // ⑤ 等价门（评审 r1-2.4）：pace 极大（间隔 < 1ns）与 None 同输入同输出——
-        //    「稳态到达 < pace 时逐字节等价」的机械化面
-        let pkts: Vec<Vec<u8>> = (1..=8u8).map(|i| vec![i; 1000]).collect();
-        for dt in [0.0, 1.2, 60.0] {
-            let mut a = std::collections::VecDeque::new();
-            let mut b = std::collections::VecDeque::new();
-            let (mut oa, ra) = shape_slice(
-                &mut a,
-                pkts.clone(),
-                ShapeRun { credit: 2500.0, pace_next: t0, deferred_bytes: 0 },
-                ShapeResolved { rate: 1000, burst: 3000, pace: Some(u64::MAX) },
-                dt,
-                t0,
-                2 * crate::wgcore::stackb::MTU,
-            );
-            let (ob, rb) = shape_slice(
-                &mut b,
-                pkts.clone(),
-                ShapeRun { credit: 2500.0, pace_next: t0, deferred_bytes: 0 },
-                ShapeResolved { rate: 1000, burst: 3000, pace: None },
-                dt,
-                t0,
-                2 * crate::wgcore::stackb::MTU,
-            );
-            let sa: Vec<u8> = oa.iter().map(|p| p[0]).collect();
-            let sb: Vec<u8> = ob.iter().map(|p| p[0]).collect();
-            assert_eq!(sa, sb, "pace 极大与 None 逐包等价（dt={dt}）");
-            assert_eq!(a.len(), b.len());
-            assert_eq!(ra.credit, rb.credit);
-            assert_eq!(ra.pace_next, rb.pace_next, "排空重置语义两形态一致");
-            oa.clear();
-        }
-    }
 
-    /// tx_shape_wait 四态单测（评审 r2-6.2：min/max 缺陷恰好在此——零覆盖是它漏网的
-    /// 原因）：① credit 饱和 ⇒ wait == pace_wait（r2-2.1 的回归钉：min 会返 0）；
-    /// ② credit 亏空且时刻已到 ⇒ wait == credit_wait；③ 两门都未到 ⇒ max(两门)；
-    /// ④ pacing 关 ⇒ 恒 1ms。
+
+    /// tx_shape_wait 两态单测：滞留非空 = Some(1ms)（拍频形态）；滞留空/整形关
+    /// = None（5ms 常规拍）。
     #[test]
-    fn tx_shape_wait_serial_gate_semantics() {
+    fn tx_shape_wait_two_states() {
         let tunnel = Ipv4Addr::new(100, 64, 255, 1);
         let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::new(Stats::default()));
-        itc.cfg.tx_shape = Some(TxShape {
-            rate: 10_000_000,
-            burst: 4096,
-            pace: Some(PaceMode::Fixed(1000)),
-        });
+        assert_eq!(itc.tx_shape_wait(), None, "整形关 = None");
+        itc.cfg.tx_shape = Some(TxShape { rate: 10_000_000, burst: 4096 });
+        assert_eq!(itc.tx_shape_wait(), None, "滞留空 = None");
         itc.tx_deferred.push_back(vec![0u8; 1000]);
-        // ① credit 饱和（= burst）+ 时刻表在未来 0.5s ⇒ wait = pace_wait（≈0.5s）
-        itc.tx_credit = 4096.0;
-        itc.tx_pace_next = Instant::now() + Duration::from_millis(500);
-        let w = itc.tx_shape_wait().expect("滞留非空");
-        assert!(
-            w >= Duration::from_millis(400) && w <= Duration::from_millis(600),
-            "credit 饱和 ⇒ wait = pace_wait（实测 {w:?}；min 缺陷形态会返 ~0）"
-        );
-        // ② 时刻已到（过去）+ credit 亏空 900B ⇒ wait = credit_wait = 900/10MB/s = 90µs
-        itc.tx_pace_next = Instant::now() - Duration::from_secs(1);
-        itc.tx_credit = 100.0;
-        let w = itc.tx_shape_wait().expect("滞留非空");
-        assert!(w < Duration::from_millis(1), "credit_wait 90µs 应取亚毫秒档（实测 {w:?}）");
-        // ③ 两门都在未来 ⇒ max：时刻 0.3s、credit_wait ~99.9µs ⇒ wait ≈ 0.3s
-        itc.tx_pace_next = Instant::now() + Duration::from_millis(300);
-        let w = itc.tx_shape_wait().expect("滞留非空");
-        assert!(w >= Duration::from_millis(200), "两门串联取 max（实测 {w:?}）");
-        // ④ pacing 关 ⇒ 恒 1ms
-        itc.cfg.tx_shape = Some(TxShape { rate: 10_000_000, burst: 4096, pace: None });
         assert_eq!(itc.tx_shape_wait(), Some(Duration::from_millis(1)));
     }
 
-    /// tx_shape_resolve 的 config 面表格测试（评审 r2-6.3：env>config>默认 的解析面
-    /// 零覆盖——config 分支不碰 env，可直测；env 面保留镜像测试并注明局限）。
+
+
+    /// tx_shape_resolve 的 config 面表格测试（env>config>默认 的解析面；config
+    /// 分支不碰 env，可直测；env 面保留镜像测试并注明局限）。
     #[test]
     fn tx_shape_resolve_config_table() {
-        let mk = |pacing: Option<PaceCfg>, pace_mbps: Option<u64>| TxShapeCfg {
-            rate_mbps: None,
-            burst_kb: None,
-            pacing,
-            pace_mbps,
-        };
-        // 默认（无 config）= off
+        // 默认（无 config）= 产品默认参数
         let r = tx_shape_resolve(None).unwrap();
-        assert_eq!(r.pace, None, "默认 pacing off（D-3 止损裁定）");
-        // config adaptive
-        let r = tx_shape_resolve(Some(mk(Some(PaceCfg::Adaptive), None))).unwrap();
-        assert_eq!(r.pace, Some(PaceMode::Adaptive));
-        // config fixed + pace_mbps
-        let r = tx_shape_resolve(Some(mk(Some(PaceCfg::Fixed), Some(96)))).unwrap();
-        assert_eq!(r.pace, Some(PaceMode::Fixed(96 * 1024 * 1024)));
-        // config fixed 缺 pace_mbps ⇒ 回落 adaptive（与字段注释一致——r2-2.7）
-        let r = tx_shape_resolve(Some(mk(Some(PaceCfg::Fixed), None))).unwrap();
-        assert_eq!(r.pace, Some(PaceMode::Adaptive));
-        // config off
-        let r = tx_shape_resolve(Some(mk(Some(PaceCfg::Off), None))).unwrap();
-        assert_eq!(r.pace, None);
+        assert_eq!(r.rate, TX_SHAPE_RATE);
+        assert_eq!(r.burst, TX_SHAPE_BURST);
         // rate/burst 覆盖
         let r = tx_shape_resolve(Some(TxShapeCfg {
             rate_mbps: Some(64),
             burst_kb: Some(128),
-            pacing: None,
-            pace_mbps: None,
         }))
         .unwrap();
         assert_eq!(r.rate, 64 * 1024 * 1024);
         assert_eq!(r.burst, 128 * 1024);
-        // fixed 超过 rate ⇒ 交叉钳制到 rate
+        // 非法值（0）静默回落默认
         let r = tx_shape_resolve(Some(TxShapeCfg {
-            rate_mbps: Some(32),
-            burst_kb: None,
-            pacing: Some(PaceCfg::Fixed),
-            pace_mbps: Some(512),
+            rate_mbps: Some(0),
+            burst_kb: Some(0),
         }))
         .unwrap();
-        assert_eq!(r.pace, Some(PaceMode::Fixed(32 * 1024 * 1024)), "pace ≤ rate 交叉钳制");
+        assert_eq!(r.rate, TX_SHAPE_RATE);
+        assert_eq!(r.burst, TX_SHAPE_BURST);
     }
+
+
 
     /// 冷空口形态验证（R8-3 8i；r2-5.1 复核修正后的口径）。**模型判别力（实测
     /// 2026-10-05，串行跑）**：空口速率 80MiB/s（须高于产品整形 R=64MiB/s——把

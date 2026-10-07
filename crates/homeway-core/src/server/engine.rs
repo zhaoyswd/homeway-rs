@@ -941,67 +941,6 @@ fn spawn_service_stop_flag(flags: &mut Vec<Arc<AtomicBool>>) -> Arc<AtomicBool> 
 
 // ---------- 驱动循环（WG 驱动线程独占：device/拦截栈/设备表/ServerBind） ----------
 
-/// pselect 亚毫秒等待（D-3 8r）：pacing 时刻表的等待原语——poll(2) 超时是整毫秒，
-/// 1ms 拍内无法逐包分时；pselect(2) 的 timespec 到纳秒（macOS/Linux/OHOS-musl 三面
-/// 可用）。fd 集与 poll 路径同构（主 UDP fd + 腿 fd），返回可读的腿 fd（主 fd 的
-/// 收包走 recv_packet 非阻塞排空，无需读就绪位）。EINTR 无害（按到点返回）；
-/// 其它负返回**节流记行**（评审 r1-1.4：EBADF/EINVAL 会静默满速自旋，必须可见）
-/// ——首 3 次 + 此后每 1000 次一行。select 语义上 POLLERR/HUP 也落在读就绪位——
-/// 与 poll 路径的三事件过滤等价覆盖。调用方已保证 max(fd) < FD_SETSIZE。
-/// pselect 持续错误时的退化位（连续非 EINTR 错误 ⇒ 驱动循环退回 poll 路径）。
-static PSELECT_BROKEN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-fn pselect_readable(udp_fd: i32, leg_fds: &[i32], wait: Duration, dlogf: &Logf) -> Vec<i32> {
-    unsafe {
-        let mut set: libc::fd_set = std::mem::zeroed();
-        libc::FD_ZERO(&mut set);
-        libc::FD_SET(udp_fd, &mut set);
-        let mut nfds = udp_fd + 1;
-        for fd in leg_fds {
-            libc::FD_SET(*fd, &mut set);
-            nfds = nfds.max(*fd + 1);
-        }
-        // tv_nsec < 1e9（POSIX；评审 r2-2.2：i64::MAX 钳只在「调用方保证 <1ms」时
-        // 安全——把不变量搬进函数本体。本函数本就只服务亚毫秒拍）。
-        let ts = libc::timespec {
-            tv_sec: 0,
-            tv_nsec: wait.as_nanos().clamp(1, 999_999_999) as libc::c_long,
-        };
-        let rc = libc::pselect(
-            nfds,
-            &mut set,
-            std::ptr::null_mut(),
-            std::ptr::null_mut(),
-            &ts,
-            std::ptr::null(),
-        );
-        if rc < 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() != std::io::ErrorKind::Interrupted {
-                // 连续 10 次非 EINTR 错误 ⇒ 置退化位让驱动循环退回 poll 路径（评审
-                // r2-2.3：错误形态下 pselect 不等待——满速自旋，需要与 FD_SETSIZE
-                // 对称的降级闸，不能只靠日志）。
-                static ERR_COUNT: std::sync::atomic::AtomicU64 =
-                    std::sync::atomic::AtomicU64::new(0);
-                let n = ERR_COUNT.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
-                if n <= 3 || n.is_multiple_of(1000) {
-                    (dlogf)(&format!(
-                        "serve: pselect 错误（{e}，累计 {n} 次）—— 立即返回不等待"
-                    ));
-                }
-                if n >= 10 {
-                    PSELECT_BROKEN.store(true, std::sync::atomic::Ordering::Relaxed);
-                }
-            }
-        }
-        leg_fds
-            .iter()
-            .copied()
-            .filter(|fd| libc::FD_ISSET(*fd, &set))
-            .collect()
-    }
-}
-
 #[allow(clippy::too_many_arguments)] // 装配线程一次性移交全驱动状态（线程起点单参化无收益）
 fn driver_loop(
     cfg: ServeConfig,
@@ -1094,10 +1033,8 @@ fn driver_loop(
                 EngineCmd::LegsClear => bind.clear_legs(),
             }
         }
-        // ② UDP 收包（等待原语两档，R8-3 8i 拍频自适应 + D-3 8r 逐包时刻表）：
-        //    - 整形滞留非空：按 tx_shape_wait 等「下一包可放行」——pacing on 时该值
-        //      是亚毫秒（µs 级 pselect，poll(2) 的超时是整毫秒、1ms 拍内无法逐包
-        //      分时）；pacing off 时 = 1ms（8n③ 形态原样）。
+        // ② UDP 收包（等待原语两档，R8-3 8i 拍频自适应）：
+        //    - 整形滞留非空：1ms 拍（每拍续水 rate×1ms、线上团块随之细化）；
         //    - 滞留空：5ms 常规拍（不加空转唤醒成本）。
         //    腿 fd 同轮在等待集（R4：控制面通告建立的腿与主 socket 同构收包）。
         // 负 fd 防御（r2-2.4：理论上不可达——腿 fd 只取活 socket——防御位）
@@ -1111,53 +1048,24 @@ fn driver_loop(
         for fd in &leg_fds {
             pollfds.push(libc::pollfd { fd: *fd, events: libc::POLLIN, revents: 0 });
         }
-        let shape_wait = intercept.tx_shape_wait();
-        // 亚毫秒面（8r）：pselect 微秒级等待 + **50µs 量化下限**（评审 r1-1.1：pace
-        // 间隔低于循环固定成本时驱动线程满占空——量化由释放侧补账语义吸收，唤醒率
-        // 上界 20k/s）。FD_SETSIZE 防御**按 fd 编号判**（评审 r1-1.3 高危：fd_set 的
-        // 容量约束是 fd 值不是 fd 数——出口的 worker/上游 socket 可把腿 fd 推过 1024，
-        // Darwin 的 FD_SET 无边界检查 = 越界写 UB）；越界一次性记行后退回 poll——
-        // pacing 退化为拍粒度，不静默降级（排障时可判）。
-        let max_fd = leg_fds.iter().copied().chain([udp_fd]).max().unwrap_or(udp_fd);
-        const MIN_PACE_WAIT: Duration = Duration::from_micros(50);
-        static FD_SETSIZE_LOGGED: std::sync::atomic::AtomicBool =
-            std::sync::atomic::AtomicBool::new(false);
-        let fdset_ok = (max_fd as usize) < libc::FD_SETSIZE;
-        if !fdset_ok
-            && !FD_SETSIZE_LOGGED.swap(true, std::sync::atomic::Ordering::Relaxed)
-        {
-            (dlogf)(&format!(
-                "serve: 腿 fd 编号 ≥ FD_SETSIZE（max={max_fd}）——pacing 亚毫秒拍退回 poll 1ms（拍粒度整形）"
-            ));
-        }
-        let sub_ms = shape_wait
-            .filter(|_| {
-                fdset_ok && !PSELECT_BROKEN.load(std::sync::atomic::Ordering::Relaxed)
-            })
-            .map(|d| d.max(MIN_PACE_WAIT))
-            .filter(|d| *d < Duration::from_millis(1));
-        let readable_legs: Vec<i32> = if let Some(d) = sub_ms {
-            pselect_readable(udp_fd, &leg_fds, d, dlogf)
-        } else {
-            let poll_ms: libc::c_int = match shape_wait {
-                Some(d) => (d.as_millis() as i64).clamp(1, 5) as libc::c_int,
-                None => 5,
-            };
-            let n = unsafe {
-                libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, poll_ms)
-            };
-            if n < 0 {
-                let e = std::io::Error::last_os_error();
-                if e.kind() != std::io::ErrorKind::Interrupted {
-                    (dlogf)(&format!("serve: poll 错误（{e}）—— 继续循环"));
-                }
-            }
-            pollfds[1..]
-                .iter()
-                .filter(|pf| pf.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0)
-                .map(|pf| pf.fd)
-                .collect()
+        let poll_ms: libc::c_int = match intercept.tx_shape_wait() {
+            Some(_) => 1,
+            None => 5,
         };
+        let n = unsafe {
+            libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, poll_ms)
+        };
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() != std::io::ErrorKind::Interrupted {
+                (dlogf)(&format!("serve: poll 错误（{e}）—— 继续循环"));
+            }
+        }
+        let readable_legs: Vec<i32> = pollfds[1..]
+            .iter()
+            .filter(|pf| pf.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0)
+            .map(|pf| pf.fd)
+            .collect();
         // 腿 fd 可读（与主 socket 同一消费管线——data 进 device / reg 进设备表）
         for fd in readable_legs {
             let (_alive, inbound) = bind.leg_readable(fd);
@@ -1327,7 +1235,7 @@ fn driver_loop(
         out2.wire.clear();
         // 评审 r2-1.1 兜底：滞留未清空不提前收摊（流表空但尾数据还在整形队列——
         // 主修在 pump_grace 的全量释放面，这里是宽限循环侧的第二道闸）。
-        if (intercept.flow_count() == 0 && !intercept.tx_pacing_pending())
+        if (intercept.flow_count() == 0 && !intercept.tx_deferred_pending())
             || Instant::now() >= deadline
         {
             break;
