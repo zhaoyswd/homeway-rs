@@ -259,14 +259,17 @@ impl Device {
     /// 消化一次物化后的 Tunn 结果：空数据报重调协议（WriteToNetwork 后以空输入重调
     /// 到 Done——冲掉握手期排队包与握手响应 keepalive）+ 明文源校验 + expired 日志抑制。
     fn consume_step(&mut self, peer_key: [u8; 32], step: StepOut, out: &mut InboundOut) {
+        // Q-I F2：缓冲自 `Device::new` 起恒为 `WG_BUF` 长——boringtun 的
+        // decapsulate/encapsulate 只写前缀并返回子切片，不改 dst 长度 ⇒ 删掉旧的
+        // clear+resize（每出站包 65KB memset，实测占驱动线程 2.7%）。长度不变量在此
+        // 兜底（debug 构建拦「未来有人把缓冲改短」）。
+        debug_assert_eq!(self.wg_buf.len(), WG_BUF, "wg_buf 长度契约（构造期一次分配）");
         let mut step = step;
         loop {
             match step {
                 StepOut::Wire(w) => {
                     self.push_wire(peer_key, w, out);
-                    // 空数据报重调（R1 ③-7 同款协议）
-                    self.wg_buf.clear();
-                    self.wg_buf.resize(WG_BUF, 0);
+                    // 空数据报重调（R1 ③-7 同款协议）——只写前缀，无需清缓冲
                     let next = {
                         let peer = self.peers.get_mut(&peer_key).expect("路由已判存在");
                         step_of(peer.tunn.decapsulate(None, &[], &mut self.wg_buf))
@@ -341,7 +344,7 @@ impl Device {
         let step = {
             let peer = self.peers.get_mut(key).expect("查表已判存在");
             let r = peer.tunn.encapsulate(plain, &mut self.wg_buf);
-            if std::env::var_os("HOMEWAY_TX_DBG").is_some() {
+            if crate::envflag::tx_dbg() {
                 let desc: String = match &r {
                     boringtun::noise::TunnResult::WriteToNetwork(_) => "Wire".to_string(),
                     boringtun::noise::TunnResult::WriteToTunnelV4(_, _) => "PlainV4".to_string(),
@@ -467,6 +470,19 @@ mod tests {
         p[0] = 0x45;
         let total = 28u16;
         p[2..4].copy_from_slice(&total.to_be_bytes());
+        p[12..16].copy_from_slice(&src.octets());
+        p[16..20].copy_from_slice(&dst.octets());
+        p
+    }
+
+    /// 指定总长的 IPv4 包（Q-I F2 长度面用；`len ≥ 20`）。
+    fn inner_pkt_len(src: Ipv4Addr, dst: Ipv4Addr, len: usize) -> Vec<u8> {
+        assert!(len >= 20);
+        let mut p = vec![0u8; len];
+        p[0] = 0x45;
+        p[2..4].copy_from_slice(&(len as u16).to_be_bytes());
+        p[8] = 64;
+        p[9] = 17;
         p[12..16].copy_from_slice(&src.octets());
         p[16..20].copy_from_slice(&dst.octets());
         p
@@ -649,6 +665,96 @@ mod tests {
         dev.tick_timers(&mut out2);
         for (epx, _) in &out2.wire {
             assert_eq!(*epx, ep);
+        }
+    }
+
+    /// Q-I F2：删掉 `consume_step` 的 65KB `clear+resize` 后「大包后小包」不泄漏陈旧
+    /// 前缀——第二个密文长度 = 100+32 且对端解出的内容正确（缓冲只写前缀的契约）。
+    #[test]
+    fn encap_after_large_packet_no_stale_prefix() {
+        let server_key = random_key();
+        let mut dev = Device::new(server_key.clone(), noop_logf());
+        let secret = [0x77u8; 32];
+        let mut c = mk_client(&server_key, secret, 5);
+        dev.add_peer(client_cfg(&c, secret));
+        let ep: SocketAddr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 43000).into();
+        let mut buf_c = [0u8; 65536];
+        // 握手（应答 → 客户端 keepalive → 回投服务端 ⇒ 双向会话齐）
+        let init = client_init(&mut c);
+        let mut out = InboundOut::default();
+        dev.decapsulate(ep, &init, &mut out);
+        let ka = match c.tunn.decapsulate(None, &out.wire[0].1, &mut buf_c) {
+            TunnResult::WriteToNetwork(w) => w.to_vec(),
+            other => panic!("期望会话建立 keepalive，实得 {other:?}"),
+        };
+        let mut out_ka = InboundOut::default();
+        dev.decapsulate(ep, &ka, &mut out_ka);
+        // 大包（1400B）之后紧跟小包（100B）
+        let big = inner_pkt_len(Ipv4Addr::new(100, 64, 255, 1), c.tunnel_ip, 1400);
+        let mut out_big = InboundOut::default();
+        dev.encapsulate(&IpAddr::V4(c.tunnel_ip), &big, &mut out_big);
+        assert_eq!(out_big.wire.len(), 1, "大包出一个密文");
+        assert_eq!(out_big.wire[0].1.len(), 1400 + 32, "密文长度 = 明文 + 32");
+        match c.tunn.decapsulate(None, &out_big.wire[0].1, &mut buf_c) {
+            TunnResult::WriteToTunnelV4(q, _) => assert_eq!(q, &big[..]),
+            other => panic!("大包解密失败：{other:?}"),
+        }
+        let small = inner_pkt_len(Ipv4Addr::new(100, 64, 255, 1), c.tunnel_ip, 100);
+        let mut out_small = InboundOut::default();
+        dev.encapsulate(&IpAddr::V4(c.tunnel_ip), &small, &mut out_small);
+        assert_eq!(out_small.wire.len(), 1, "小包出一个密文");
+        assert_eq!(
+            out_small.wire[0].1.len(),
+            100 + 32,
+            "小包密文长度 = 100+32（无陈旧前缀泄漏）"
+        );
+        match c.tunn.decapsulate(None, &out_small.wire[0].1, &mut buf_c) {
+            TunnResult::WriteToTunnelV4(q, _) => assert_eq!(q, &small[..], "小包内容逐字节正确"),
+            other => panic!("小包解密失败：{other:?}"),
+        }
+    }
+
+    /// Q-I F2：连续 100 包双向 round-trip 字节一致（删 memset 后的稳定性回归）。
+    #[test]
+    fn hundred_packet_roundtrip_bytes_identical() {
+        let server_key = random_key();
+        let mut dev = Device::new(server_key.clone(), noop_logf());
+        let secret = [0x88u8; 32];
+        let mut c = mk_client(&server_key, secret, 6);
+        dev.add_peer(client_cfg(&c, secret));
+        let ep: SocketAddr = SocketAddrV4::new(Ipv4Addr::LOCALHOST, 43100).into();
+        let mut buf_c = [0u8; 65536];
+        let init = client_init(&mut c);
+        let mut out = InboundOut::default();
+        dev.decapsulate(ep, &init, &mut out);
+        let ka = match c.tunn.decapsulate(None, &out.wire[0].1, &mut buf_c) {
+            TunnResult::WriteToNetwork(w) => w.to_vec(),
+            other => panic!("期望会话建立 keepalive，实得 {other:?}"),
+        };
+        let mut out_ka = InboundOut::default();
+        dev.decapsulate(ep, &ka, &mut out_ka);
+        // 服务端 → 客户端 100 包
+        for i in 0..100usize {
+            let p = inner_pkt_len(Ipv4Addr::new(100, 64, 255, 1), c.tunnel_ip, 40 + i);
+            let mut o = InboundOut::default();
+            dev.encapsulate(&IpAddr::V4(c.tunnel_ip), &p, &mut o);
+            assert_eq!(o.wire.len(), 1, "第 {i} 包");
+            match c.tunn.decapsulate(None, &o.wire[0].1, &mut buf_c) {
+                TunnResult::WriteToTunnelV4(q, _) => assert_eq!(q, &p[..], "下行第 {i} 包字节一致"),
+                other => panic!("下行第 {i} 包解密失败：{other:?}"),
+            }
+        }
+        // 客户端 → 服务端 100 包（src = 客户端隧道 IP，过源校验）
+        for i in 0..100usize {
+            let p = inner_pkt_len(c.tunnel_ip, Ipv4Addr::new(93, 184, 216, 34), 60 + i);
+            let enc = match c.tunn.encapsulate(&p, &mut buf_c) {
+                TunnResult::WriteToNetwork(w) => w.to_vec(),
+                other => panic!("上行第 {i} 包加密失败：{other:?}"),
+            };
+            let mut o = InboundOut::default();
+            dev.decapsulate(ep, &enc, &mut o);
+            assert_eq!(o.plain.len(), 1, "上行第 {i} 包应解出明文");
+            assert_eq!(o.plain[0], p, "上行第 {i} 包字节一致");
         }
     }
 }

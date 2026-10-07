@@ -322,6 +322,10 @@ struct Engine {
     /// UDP 面：id → 栈内 socket + 待决读。
     udp: HashMap<u64, UdpConn>,
     wg_buf: Vec<u8>,
+    /// Q-I F5-1：`resolve_udp` 的复用读缓冲（构造期一次分配；此前每待决 id 每拍
+    /// `vec![0u8; 65535]`——挂起无包时也发生）。交付时 `[..n].to_vec()`（内层包小，
+    /// n 字节拷贝 ≪ 省下的 64KB alloc+memset；不复用交付 = 防别名）。
+    udp_rx_buf: Vec<u8>,
     cmd_rx: mpsc::Receiver<Cmd>,
     snapshot: Arc<Mutex<Snapshot>>,
     logf: Arc<dyn Fn(&str) + Send + Sync>,
@@ -527,6 +531,9 @@ impl Engine {
         let src_ip = src_ip.unwrap_or(IpAddr::V4(Ipv4Addr::UNSPECIFIED));
         // 热路径：容量恒足（构造时 WG_BUF 一次分配）；boringtun 只写前缀——
         // 不 clear/resize（每包 65KB memset 纯浪费，中-10①）。长度由返回值给。
+        // Q-I F2：空数据报重调循环内的同款 clear+resize 也已删（此前注释-实现不符）；
+        // 长度不变量在入口兜底（debug 拦「未来有人把缓冲改短」）。
+        debug_assert_eq!(self.wg_buf.len(), WG_BUF, "wg_buf 长度契约（构造期一次分配）");
         match self
             .tunn
             .decapsulate(Some(src_ip), datagram, &mut self.wg_buf)
@@ -534,8 +541,6 @@ impl Engine {
             TunnResult::WriteToNetwork(w) => {
                 self.bind.send_wg(w);
                 loop {
-                    self.wg_buf.clear();
-                    self.wg_buf.resize(WG_BUF, 0);
                     match self.tunn.decapsulate(Some(src_ip), &[], &mut self.wg_buf) {
                         TunnResult::WriteToNetwork(w2) => self.bind.send_wg(w2),
                         TunnResult::Err(WireGuardError::ConnectionExpired) => {
@@ -682,22 +687,24 @@ impl Engine {
                 continue;
             }
             let handle = u.handle;
-            let mut buf = vec![0u8; 65535];
+            // Q-I F5-1：复用缓冲（构造期一次分配）——此前每拍 `vec![0u8; 65535]`
+            // （有 `UdpRecv` 挂起但无包时也发生）。
             let got = self
                 .stack
                 .sockets
                 .get_mut::<smoltcp::socket::udp::Socket>(handle)
-                .recv_slice(&mut buf);
+                .recv_slice(&mut self.udp_rx_buf);
             match got {
                 Ok((n, meta)) if n > 0 => {
-                    buf.truncate(n);
                     let from = match meta.endpoint.addr {
                         smoltcp::wire::IpAddress::Ipv4(a) => a, // 0.14：core::net::Ipv4Addr 直存（R8-8a）
                         _ => continue,
                     };
+                    // 交付走 owned 副本（复用缓冲不得跨调用泄漏——防别名）
+                    let pkt = self.udp_rx_buf[..n].to_vec();
                     let tx = self.udp.get_mut(&id).and_then(|u| u.wait_recv.take());
                     if let Some(tx) = tx {
-                        let _ = tx.send(Ok((buf, SocketAddrV4::new(from, meta.endpoint.port))));
+                        let _ = tx.send(Ok((pkt, SocketAddrV4::new(from, meta.endpoint.port))));
                     }
                 }
                 _ => {} // 无包：继续等
@@ -728,7 +735,7 @@ impl Engine {
                     Some(c) => {
                         let sock = self.stack.sockets.get_mut::<TcpSocket>(c.handle);
                         let r = sock.send_slice(&data).map_err(|_| ConnErr::Closed);
-                        if r.is_err() && std::env::var_os("HOMEWAY_WG_DEBUG").is_some() {
+                        if r.is_err() && crate::envflag::wg_debug() {
                             eprintln!(
                                 "[wr-debug] write 失败 id={id} state={:?} may_send={} local={:?}",
                                 sock.state(),
@@ -1111,6 +1118,7 @@ impl Client {
             conns: HashMap::new(),
             udp: HashMap::new(),
             wg_buf: vec![0u8; WG_BUF],
+            udp_rx_buf: vec![0u8; 65535],
             cmd_rx,
             snapshot: Arc::clone(&snapshot),
             logf: cfg.logf,

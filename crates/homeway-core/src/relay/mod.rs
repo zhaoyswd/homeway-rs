@@ -20,7 +20,7 @@ pub mod ctlface;
 pub mod logfile;
 pub mod rltoken;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
 use std::os::fd::AsRawFd as _;
@@ -288,6 +288,10 @@ pub struct Relay {
     ctl_ok: bool,
     /// 拒绝类日志的每原因节流计数（F6）。
     reject_log: HashMap<RejectLog, u64>,
+    /// Q-I F6-1：`forward_up` 直发路径的复用编帧缓冲（消每包 alloc/free；
+    /// payload→帧缓冲的 memcpy 保留且必要）。占用窗口 = 同调用内 send_to 即返回
+    /// （等腿窗 `pend` 路径跨拍持有 ⇒ 仍走 owned `frame_bytes`）。
+    frame_scratch: Vec<u8>,
 }
 
 impl Relay {
@@ -314,6 +318,7 @@ impl Relay {
             poll_dirty: false,
             ctl_ok: false,
             reject_log: HashMap::new(),
+            frame_scratch: Vec::new(),
         }
     }
 
@@ -410,6 +415,11 @@ impl Relay {
         let mut sources: Vec<PollSource> = Vec::new();
         let mut events: Vec<PollSource> = Vec::new();
         let mut msgs: Vec<(u8, Vec<u8>)> = Vec::new();
+        // Q-I F6-2/6-3：主循环外的复用读缓冲（每事件 64KB 分配 → 每次 run 一次分配）。
+        // 局部量而非结构体字段：`self.assoc_read(...)` 是 `&mut self` 方法，字段形态会撞
+        // E0502（设计门 1.2 已复现）；局部量无此冲突。
+        let mut udp_buf = vec![0u8; 65535];
+        let mut assoc_buf = vec![0u8; 65535];
 
         loop {
             // ---- poll 集重建（成员变化时） ----
@@ -477,11 +487,10 @@ impl Relay {
                         }
                     }
                     PollSource::Udp => {
-                        let mut buf = vec![0u8; 65535];
                         loop {
-                            match udp.recv_from(&mut buf[..]) {
+                            match udp.recv_from(&mut udp_buf[..]) {
                                 Ok((n, src)) => {
-                                    self.handle_udp_packet(&udp, unmap(src), &buf[..n])
+                                    self.handle_udp_packet(&udp, unmap(src), &udp_buf[..n])
                                 }
                                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => break,
                                 Err(_) => break,
@@ -497,9 +506,10 @@ impl Relay {
                     }
                     PollSource::Assoc(key) => {
                         if self.assocs.contains_key(&key) {
-                            let mut b = vec![0u8; 65535];
-                            match self.assocs.get(&key).unwrap().sock.recv_from(&mut b[..]) {
-                                Ok((n, from)) => self.assoc_read(&udp, key, unmap(from), b[..n].to_vec()),
+                            match self.assocs.get(&key).unwrap().sock.recv_from(&mut assoc_buf[..]) {
+                                Ok((n, from)) => {
+                                    self.assoc_read(&udp, key, unmap(from), &assoc_buf[..n])
+                                }
                                 Err(e) if e.kind() == io::ErrorKind::WouldBlock => {}
                                 Err(_) => {
                                     // 读错误：立即走回收路径（R4-design §2.3）
@@ -955,11 +965,11 @@ impl Relay {
             self.assocs.get_mut(&key).expect("已判在").last = Instant::now();
         }
         // 投递（等腿窗缓冲 / 直发）
-        let frame_bytes = frame::frame_bytes(kind, payload);
         let a = self.assocs.get_mut(&key).expect("已判在");
         if a.dial_up {
             if a.pend.len() < CTL_PEND_MAX {
-                a.pend.push(frame_bytes);
+                // 等腿窗：帧跨拍持有 ⇒ owned（慢路径，非热面）
+                a.pend.push(frame::frame_bytes(kind, payload));
                 self.stats.forwarded_up += 1;
             } else {
                 self.stats.dropped += 1;
@@ -969,7 +979,11 @@ impl Relay {
         if let Some(dst) = a.backend {
             // F8：**只计成功**（`send_to` 返 Err 不再计 forwarded_up——ENOBUFS/EAFNOSUPPORT
             // 曾被计成健康转发）。
-            match a.sock.send_to(&frame_bytes, crate::udpbatch::xmit_addr(dst, a.dual)) {
+            // Q-I F6-1：复用 scratch 编帧（消每包 alloc/free；memcpy 保留）——
+            // 同调用内 send_to 即返回，无重入。
+            self.frame_scratch.clear();
+            frame::encode_frame(kind, payload, &mut self.frame_scratch);
+            match a.sock.send_to(&self.frame_scratch, crate::udpbatch::xmit_addr(dst, a.dual)) {
                 Ok(_) => self.stats.forwarded_up += 1,
                 Err(e) => {
                     self.stats.send_fail_up += 1;
@@ -982,7 +996,8 @@ impl Relay {
     }
 
     /// 分配 socket 可读：后端 → 客户端（v2 拨腿会话先过腿身份认证状态机）。
-    fn assoc_read(&mut self, udp: &UdpSocket, key: AssocKey, from: SocketAddr, pkt: Vec<u8>) {
+    /// Q-I F6-2：`pkt` 借用零拷贝（全程只读——此前 `Vec<u8>` 多一次整包拷贝）。
+    fn assoc_read(&mut self, udp: &UdpSocket, key: AssocKey, from: SocketAddr, pkt: &[u8]) {
         let now = Instant::now();
         // 腿认证密钥预取（token 模式 = 中继密钥；开放模式 = cookie 低半字——
         // 后续 block 持有 assocs 借用，方法调用进不去）
@@ -1006,9 +1021,9 @@ impl Relay {
                     a.last_down = now;
                 } else {
                     let (sid, cookie) = (a.sid, a.cookie);
-                    let authed = rw::legup_cookie(&pkt) == Some(cookie) && {
+                    let authed = rw::legup_cookie(pkt) == Some(cookie) && {
                         let k = mac_key_for(cookie);
-                        rw::verify_legup(&pkt, sid, &cookie, &k)
+                        rw::verify_legup(pkt, sid, &cookie, &k)
                     };
                     if authed {
                         // 合法认证：首拨（放行 pend）或已认证腿的重拨/换源
@@ -1088,7 +1103,7 @@ impl Relay {
             self.logf(&format!("中继：会话 #{sid} 的后端腿重拨 → {from}（cookie 认证通过，跟随）"));
         }
         // LEGUP 认证标记吞包（5B/37B 两形态；判定在分支外——首腿/重拨/重复标记都不外泄）
-        if rw::legup_cookie(&pkt).is_some() || pkt == b"LEGUP" {
+        if rw::legup_cookie(pkt).is_some() || pkt == b"LEGUP" {
             return;
         }
         // F7.2 下行字节桶（每会话；目标吞吐 ≥100Mbit/s——超限丢弃 + 计数 + 限流日志）
@@ -1113,7 +1128,7 @@ impl Relay {
         }
         // FIX-91：出口恒发腿帧——原样转发（未知/畸形包由客户端按解码失败丢弃）。
         // F8：只计成功。
-        match udp.send_to(&pkt, key.client) {
+        match udp.send_to(pkt, key.client) {
             Ok(_) => self.stats.forwarded_down += 1,
             Err(e) => {
                 self.stats.send_fail_down += 1;
@@ -1260,12 +1275,14 @@ impl Relay {
                 lg.ctl = None;
             }
         }
-        // 孤儿清理：既无 UDP 注册（!verified 且无 addr）也无新控制连接，且无活跃会话
+        // 孤儿清理：既无 UDP 注册（!verified 且无 addr）也无新控制连接，且无活跃会话。
+        // Q-I F6-4：活跃会话标签先一遍聚合（O(L×A) → O(L+A)）。
+        let active: HashSet<[u8; 8]> = self.assocs.keys().map(|k| k.label).collect();
         let orphans: Vec<[u8; 8]> = self
             .legs
             .iter()
             .filter(|(_, lg)| lg.ctl.is_none() && !lg.verified && lg.addr.is_none())
-            .filter(|(label, _)| !self.assocs.keys().any(|k| k.label == **label))
+            .filter(|(label, _)| !active.contains(*label))
             .map(|(label, _)| *label)
             .collect();
         for label in orphans {
@@ -1544,6 +1561,36 @@ mod tests {
 
     fn noop_logf() -> Logf {
         Arc::new(|_| {})
+    }
+
+    /// Q-I F6-1：scratch 复用编帧（`clear` + `encode_frame`）与 `frame_bytes` 逐字节
+    /// 相同——wire 零变化的直接判据（含空载荷/短载荷/满 MTU 载荷与重复复用同一缓冲）。
+    #[test]
+    fn frame_scratch_bytes_match_frame_bytes() {
+        let mut scratch = Vec::new();
+        for payload in [
+            &b""[..],
+            b"x",
+            b"wg-payload",
+            &[0xABu8; 1400][..],
+            &[0u8; 65535][..],
+        ] {
+            for kind in [
+                frame::FrameKind::Data,
+                frame::FrameKind::Control,
+                frame::FrameKind::Reg,
+                frame::FrameKind::Batch,
+            ] {
+                scratch.clear();
+                frame::encode_frame(kind, payload, &mut scratch);
+                assert_eq!(
+                    scratch,
+                    frame::frame_bytes(kind, payload),
+                    "kind={kind:?} len={}",
+                    payload.len()
+                );
+            }
+        }
     }
 
     /// 测试形态的中继（run 在独立线程；Drop 停）。
@@ -2081,7 +2128,7 @@ mod tests {
         let key = AssocKey { label, client };
         assert!(!relay.assocs[&key].bufs_bumped, "未认证不得抬缓冲（F7.3）");
         // 合法后端下行 ⇒ 抬缓冲（v1 合法源首包）；但客户端发送失败 ⇒ 只计 send_fail_down
-        relay.assoc_read(&udp, key, "127.0.0.1:9999".parse().unwrap(), b"down".to_vec());
+        relay.assoc_read(&udp, key, "127.0.0.1:9999".parse().unwrap(), b"down");
         assert!(relay.assocs[&key].bufs_bumped, "v1 合法源首包后抬缓冲");
         assert_eq!(relay.stats.forwarded_down, 0, "失败不计成功（F8）");
         assert_eq!(relay.stats.send_fail_down, 1, "失败进 send_fail_down（F8）");

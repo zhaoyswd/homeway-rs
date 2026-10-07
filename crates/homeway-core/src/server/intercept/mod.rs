@@ -171,6 +171,13 @@ impl VecDequeLite {
         self.off >= self.buf.len()
     }
     fn consume(&mut self, n: usize) {
+        // Q-I 代码门 L1：消费量不得超余量（旧 `Vec::drain(..w)` 越界会 panic；
+        // 静默多消费 = 上游字节流错位——调试构建在此暴露误用）。调用点恒满足。
+        debug_assert!(
+            n <= self.buf.len().saturating_sub(self.off),
+            "consume 超余量（n={n} remaining={}）——上游字节流错位",
+            self.buf.len().saturating_sub(self.off)
+        );
         self.off += n;
         if self.off >= self.buf.len() {
             self.buf.clear();
@@ -710,7 +717,10 @@ struct Flow {
     /// upstream→栈内 socket 写不下的余量（**部分写回补**——send_slice 只写前缀时
     /// 余量必须留住：静默丢字节 = 下游流错位【2026-10-02 实测抓出：speedtest 下行
     /// 大流量下帧错位】；poll 开窗后在 service_sockets 续写）。
-    tx_backlog: Vec<u8>,
+    /// Q-I F1：`Vec` + `drain(..w)` 的尾部整体前移是引擎忙时第一热点（实测占 32%），
+    /// 换 `VecDequeLite` 前缀偏移 + 摊还压缩（`consume` 内 `off*2 >= len` 触发；
+    /// 不变量 `len < 2*remaining`，摊还 ≤2B 搬移/B 消费）。
+    tx_backlog: VecDequeLite,
     /// upstream EOF 后待补的 FIN（**backlog 排空后才 close**：close 会把 FIN 排进
     /// socket 发送队列——backlog 里的数据若在 FIN 之后才写就永远出不去，客户端看到
     /// 「数据 + FIN + 丢尾」的流错位【2026-10-02 实测抓出：speedtest report 帧丢失】）。
@@ -814,6 +824,9 @@ pub struct Interceptor {
     obs_snaps: HashMap<u64, TcpObsSnap>,
     time0: Instant,
     smol_now: SmolInstant,
+    /// Q-I F3：`service_sockets` 的栈读复用缓冲（TCP/UDP 两读循环共用；构造期一次
+    /// 分配 `Box`——此前每读循环迭代各一次 64KB 栈缓冲零初始化，实测 1.5%）。
+    rx_scratch: Box<[u8; 64 * 1024]>,
 }
 
 impl Interceptor {
@@ -890,6 +903,7 @@ impl Interceptor {
             obs_snaps: HashMap::new(),
             time0: Instant::now(),
             smol_now: SmolInstant::from_millis(0),
+            rx_scratch: Box::new([0u8; 64 * 1024]),
         }
     }
 
@@ -1204,7 +1218,7 @@ impl Interceptor {
                 phase: Phase::Dialing { cache },
                 last_active: Instant::now(),
                 io: None,
-                tx_backlog: Vec::new(),
+                tx_backlog: VecDequeLite::new(),
                 fin_pending: false,
                 udp_seq_of: 0,
                 counted: false,
@@ -1490,7 +1504,7 @@ impl Interceptor {
         let mut frame = Vec::with_capacity(2 + resp.len());
         frame.extend_from_slice(&(resp.len() as u16).to_be_bytes());
         frame.extend_from_slice(resp);
-        f.tx_backlog.extend_from_slice(&frame);
+        f.tx_backlog.push(&frame);
         f.last_active = Instant::now();
     }
 
@@ -1747,7 +1761,7 @@ impl Interceptor {
             active += 1;
             let Some(h) = f.sock else { continue };
             let sq = self.sockets.get_mut::<TcpSocket>(h).send_queue();
-            let cur = (sq, f.tx_backlog.len());
+            let cur = (sq, f.tx_backlog.remaining().len());
             if busiest.as_ref().map(|b| cur.0 > b.0).unwrap_or(true) {
                 busiest = Some(cur);
             }
@@ -1911,7 +1925,7 @@ impl Interceptor {
         self.poll_index.clear();
         for (id, f) in &self.flows {
             let Some(io) = f.io.as_ref() else { continue };
-            let Some(ev) = interests_for(io, f.tx_backlog.len()) else { continue };
+            let Some(ev) = interests_for(io, f.tx_backlog.remaining().len()) else { continue };
             self.pollfds.push(libc::pollfd {
                 fd: io.fd.as_raw_fd(),
                 events: ev,
@@ -1990,8 +2004,9 @@ impl Interceptor {
         };
         if is_udp {
             // downSeen 实测位 + 数据报整包回投（应用层无预算——内核 rcvbuf 界定，§四/R-11）
+            // Q-I F3：读缓冲循环外提（每次调用一次零初始化，不再每数据报一次）。
+            let mut buf = [0u8; 65536];
             loop {
-                let mut buf = [0u8; 65536];
                 let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
                 if n > 0 {
                     if let Some(f) = self.flows.get_mut(&flow) {
@@ -2016,21 +2031,21 @@ impl Interceptor {
             return;
         }
         // TCP/UDS：读尽到 EAGAIN / 水位（WATERMARK 门控读端——Ack 清账通道删除后的
-        // 直读等价物）
+        // 直读等价物）。Q-I F3：读缓冲循环外提（每次调用一次零初始化）。
+        let mut buf = [0u8; READ_CHUNK];
         loop {
             let gated = self
                 .flows
                 .get(&flow)
-                .map(|f| f.tx_backlog.len() >= WATERMARK)
+                .map(|f| f.tx_backlog.remaining().len() >= WATERMARK)
                 .unwrap_or(false);
             if gated {
                 break;
             }
-            let mut buf = [0u8; READ_CHUNK];
             let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
             if n > 0 {
                 let Some(f) = self.flows.get_mut(&flow) else { return };
-                f.tx_backlog.extend_from_slice(&buf[..n as usize]);
+                f.tx_backlog.push(&buf[..n as usize]);
                 f.last_active = Instant::now();
             } else if n == 0 {
                 self.on_upstream_eof(flow);
@@ -2347,10 +2362,10 @@ impl Interceptor {
         let w = self
             .sockets
             .get_mut::<TcpSocket>(h)
-            .send_slice(&f.tx_backlog)
+            .send_slice(f.tx_backlog.remaining())
             .unwrap_or_default();
         if w > 0 {
-            f.tx_backlog.drain(..w);
+            f.tx_backlog.consume(w);
         }
         if f.tx_backlog.is_empty() && f.fin_pending {
             self.sockets.get_mut::<TcpSocket>(h).close();
@@ -2493,21 +2508,20 @@ impl Interceptor {
                             if self.pending_out(flow) > WATERMARK {
                                 break;
                             }
-                            let mut buf = [0u8; 64 * 1024];
                             let n = self
                                 .sockets
                                 .get_mut::<TcpSocket>(h)
-                                .recv_slice(&mut buf)
+                                .recv_slice(&mut self.rx_scratch[..])
                                 .unwrap_or(0);
                             if n == 0 {
                                 break;
                             }
                             if is_dns_leg {
-                                dns_chunks.push(buf[..n].to_vec());
+                                dns_chunks.push(self.rx_scratch[..n].to_vec());
                             } else if let Some(io) =
                                 self.flows.get_mut(&flow).and_then(|f| f.io.as_mut())
                             {
-                                io.out_tcp.push(&buf[..n]);
+                                io.out_tcp.push(&self.rx_scratch[..n]);
                             }
                             total += n;
                         }
@@ -2566,13 +2580,11 @@ impl Interceptor {
                         .map(|f| IpEndpoint::new(f.client.0.into(), f.client.1))
                         .unwrap_or_else(|| IpEndpoint::new(Ipv4Addr::UNSPECIFIED.into(), 0));
                     let mut any = false;
-                    loop {
-                        let mut buf = [0u8; 65536];
-                        let (n, meta) =
-                            match self.sockets.get_mut::<UdpSocket>(h).recv_slice(&mut buf) {
-                                Ok(v) => v,
-                                Err(_) => break,
-                            };
+                    while let Ok((n, meta)) = self
+                        .sockets
+                        .get_mut::<UdpSocket>(h)
+                        .recv_slice(&mut self.rx_scratch[..])
+                    {
                         if meta.endpoint != expect {
                             continue; // 非客户端来源：丢弃（包已取出，继续读）
                         }
@@ -2586,7 +2598,7 @@ impl Interceptor {
                                     .map(|f| f.route_tag(DnsRoute::UdpFlow(flow)))
                                     .unwrap_or(0);
                                 if tag != 0
-                                    && dns.submit_leg(tag, buf[..n].to_vec())
+                                    && dns.submit_leg(tag, self.rx_scratch[..n].to_vec())
                                         == SubmitOutcome::Dropped
                                 {
                                     // F2：丢弃路径回收 tag
@@ -2608,7 +2620,7 @@ impl Interceptor {
                         }
                         if let Some(f) = self.flows.get_mut(&flow) {
                             if let Some(io) = f.io.as_mut() {
-                                io.out_udp.push_back(buf[..n].to_vec());
+                                io.out_udp.push_back(self.rx_scratch[..n].to_vec());
                                 any = true;
                             }
                         }
@@ -4490,7 +4502,7 @@ mod tests {
                         tel.as_millis(),
                         received.iter().sum::<usize>() / (1024 * 1024),
                         sq,
-                        f.tx_backlog.len(),
+                        f.tx_backlog.remaining().len(),
                         down.dropped - last_drop,
                         up.dropped
                     );
@@ -4593,6 +4605,129 @@ mod tests {
             q2.buf.capacity() < 16384,
             "capacity 不随累计传输量增长（得 {}）",
             q2.buf.capacity()
+        );
+    }
+
+    /// Q-I F1：`VecDequeLite` 与 `Vec<u8>` 参照实现随机交错 push/consume 逐字节等价 +
+    /// 不变量 `buf.len() < 2*remaining`（`tx_backlog` 换型后水位门/兴趣位/cc 观测读
+    /// 的 `remaining` 与旧 `len` 同语义的依据）。
+    #[test]
+    fn vecdequelite_matches_vec_reference_and_stays_bounded() {
+        let mut seed = 0x5eed_1234_5678_9abcu64;
+        let mut rnd = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (seed >> 33) as usize
+        };
+        let mut q = VecDequeLite::new();
+        let mut r: Vec<u8> = Vec::new();
+        for i in 0..5000u32 {
+            if rnd() % 3 == 0 {
+                let n = rnd() % 97;
+                let b: Vec<u8> = (0..n).map(|k| (i as u8).wrapping_add(k as u8)).collect();
+                q.push(&b);
+                r.extend_from_slice(&b);
+            } else {
+                let n = (rnd() % 130).min(r.len());
+                q.consume(n);
+                r.drain(..n);
+            }
+            assert_eq!(q.remaining(), &r[..], "第 {i} 步内容与参照实现一致");
+            assert_eq!(q.is_empty(), r.is_empty(), "第 {i} 步判空一致");
+            if !r.is_empty() {
+                assert!(
+                    q.buf.len() < 2 * r.len(),
+                    "不变量 len<2*remaining（第 {i} 步：len={} remaining={}）",
+                    q.buf.len(),
+                    r.len()
+                );
+            }
+        }
+    }
+
+    /// Q-I F1：水门槛/停读门按 `remaining` 计——灌到 `WATERMARK` 时 `interests_for`
+    /// 摘 POLLIN、`read_upstream` 一行不读（backlog 不再增长）；消费回门下后读取恢复。
+    #[test]
+    fn tx_backlog_watermark_gate_uses_remaining() {
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        // 纯函数边界（read_upstream 的门与 interests_for 同式）
+        let devnull: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        let io = ReactorIo {
+            fd: devnull,
+            udp: false,
+            out_tcp: VecDequeLite::new(),
+            out_udp: VecDeque::new(),
+            conn: None,
+            dial_deadline: Instant::now(),
+            dead: false,
+        };
+        assert!(
+            interests_for(&io, WATERMARK - 1).unwrap() & libc::POLLIN != 0,
+            "门下：POLLIN 在"
+        );
+        assert!(
+            interests_for(&io, WATERMARK).unwrap() & libc::POLLIN == 0,
+            "达水门：摘 POLLIN"
+        );
+
+        // 门实测：socketpair 充 upstream fd；backlog = WATERMARK（死前缀非零——门必须
+        // 按 remaining 而非 backing 长度判）
+        let (up, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
+        up.set_nonblocking(true).unwrap();
+        let fd: OwnedFd = up.into();
+        let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::new(Stats::default()));
+        let flow = 1u64;
+        let mut tb = VecDequeLite::new();
+        tb.push(&vec![0u8; WATERMARK]);
+        tb.consume(1); // 死前缀 off=1（1*2 < len——不触发压缩）
+        tb.push(&[0u8]); // remaining 回到 WATERMARK，backing = WATERMARK+1
+        assert_eq!(tb.remaining().len(), WATERMARK);
+        assert_eq!(tb.off, 1, "死前缀非零（门必须按 remaining 而非 backing 长度判）");
+        itc.flows.insert(
+            flow,
+            Flow {
+                kind: Kind::Transit,
+                proto: Proto::Tcp,
+                client: (Ipv4Addr::new(10, 0, 0, 2), 40000),
+                orig_dst: (Ipv4Addr::new(93, 184, 216, 34), 80),
+                rw_port: 50000,
+                sock: None,
+                phase: Phase::Established,
+                last_active: Instant::now(),
+                io: Some(ReactorIo {
+                    fd,
+                    udp: false,
+                    out_tcp: VecDequeLite::new(),
+                    out_udp: VecDeque::new(),
+                    conn: None,
+                    dial_deadline: Instant::now(),
+                    dead: false,
+                }),
+                tx_backlog: tb,
+                fin_pending: false,
+                udp_replied: false,
+                udp_seq_of: 0,
+                counted: true,
+                syn_seq: 0,
+                dns_rx: Vec::new(),
+                obs: TcpObs::default(),
+            },
+        );
+        peer.write_all(&[0xABu8; 4096]).unwrap();
+        itc.read_upstream(flow);
+        assert_eq!(
+            itc.flows[&flow].tx_backlog.remaining().len(),
+            WATERMARK,
+            "满水门：一行不读（backlog 不增长）"
+        );
+        // 消费回门下 → 恢复读取
+        itc.flows.get_mut(&flow).unwrap().tx_backlog.consume(WATERMARK);
+        itc.read_upstream(flow);
+        assert_eq!(
+            itc.flows[&flow].tx_backlog.remaining().len(),
+            4096,
+            "门下降后读入 4096B"
         );
     }
 

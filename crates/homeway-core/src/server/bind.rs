@@ -789,7 +789,7 @@ impl ServerBind {
                     libc::MSG_DONTWAIT | libc::MSG_NOSIGNAL,
                 )
             };
-            if std::env::var_os("HOMEWAY_TX_DBG").is_some() { eprintln!("[TXDBG] wake send rc={rc2} pushed={pushed} at={:?}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)); }
+            if crate::envflag::tx_dbg() { eprintln!("[TXDBG] wake send rc={rc2} pushed={pushed} at={:?}", std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0)); }
         }
     }
 
@@ -996,7 +996,7 @@ fn tx_thread_loop(
             let mut pf = libc::pollfd { fd: wake_r, events: libc::POLLIN, revents: 0 };
             let rc = unsafe { libc::poll(&mut pf, 1, -1) };
             stats.wakeups.fetch_add(1, Ordering::Relaxed);
-            if std::env::var_os("HOMEWAY_TX_DBG").is_some() { eprintln!("[TXDBG] poll rc={rc} revents={:#x}", pf.revents); }
+            if crate::envflag::tx_dbg() { eprintln!("[TXDBG] poll rc={rc} revents={:#x}", pf.revents); }
             if rc < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() == io::ErrorKind::Interrupted {
@@ -1042,7 +1042,7 @@ fn tx_drain_rounds(
         let msgs: Vec<crate::udpbatch::OutMsg<'_>> =
             batch.iter().map(|s| crate::udpbatch::OutMsg { dst: s.dst, buf: &s.buf }).collect();
         let (sent, first_err) = crate::udpbatch::send_batch(sock.as_raw_fd(), &msgs);
-        if std::env::var_os("HOMEWAY_TX_DBG").is_some() {
+        if crate::envflag::tx_dbg() {
             eprintln!("[TXDBG] round n={n} sent={sent} dst={} len={} at={:?}", batch[0].dst, batch[0].buf.len(), std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis()).unwrap_or(0));
         }
         // 记账：成功前缀（帧全长口径——Inline 模式的 TxStats.bytes 同口径切换，

@@ -11,6 +11,9 @@
 /// 日志面（跨线程共享的判据行输出；Session 在其上加前缀）。
 pub type Logf = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 
+/// 进程级 env 开关缓存（Q-I F4：热路径 getenv 归零）。
+pub(crate) mod envflag;
+
 pub mod facade;
 pub mod artifact;
 pub mod daemon;

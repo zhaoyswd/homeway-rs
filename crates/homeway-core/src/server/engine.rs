@@ -1793,14 +1793,24 @@ fn udpcap_loop(
             last = cur;
         }
         // 周期等待可被 kick 打断（换网卡 = 换了条路，能力结论立即重测）。
-        // Disconnected（看护未起：--bind-interface none / IP 字面量 / auto 挑卡
-        // 失败——sender 已随 start() 返回被 drop）必须**按原节拍继续**：探测与
-        // SetCaps 是 P1-4 客户端能力打行的数据源，退出或全速自旋（评审 r1-H1：
-        // 吞掉 Disconnected 会 ~7 轮/秒持续探测）都不成立。
-        if kick_rx.recv_timeout(UDPCAP_INTERVAL).is_err() {
+        // 三态（Q-I F7）：Ok(kick) 与 **Timeout 都立即重探**——旧形态对 Timeout 也再
+        // sleep 一个 interval（bindwatch 在位时实际周期 ~600s，Go 真源 = 5min ticker
+        // + kick，`udpcap.go:26/140-152`；`--bind-interface none` 形态本已 ~300s 不变）；
+        // Disconnected（看护未起：--bind-interface none / IP 字面量 / auto 挑卡失败
+        // ——sender 已随 start() 返回被 drop）必须**按原节拍继续**：探测与 SetCaps 是
+        // P1-4 客户端能力打行的数据源，退出或全速自旋（评审 r1-H1：吞掉 Disconnected
+        // 会 ~7 轮/秒持续探测）都不成立。
+        let wait = kick_rx.recv_timeout(UDPCAP_INTERVAL);
+        if udpcap_disconnected_backoff(wait) {
             std::thread::sleep(UDPCAP_INTERVAL);
         }
     }
+}
+
+/// Q-I F7 纯函数：`recv_timeout` 结果 → 是否需要补睡一个 `UDPCAP_INTERVAL`。
+/// 只有 `Disconnected`（看护 sender 已 drop，recv 立即返回）需要——否则自旋。
+fn udpcap_disconnected_backoff(r: Result<(), mpsc::RecvTimeoutError>) -> bool {
+    matches!(r, Err(mpsc::RecvTimeoutError::Disconnected))
 }
 
 #[allow(clippy::type_complexity)]
@@ -1890,6 +1900,25 @@ mod tests {
 
     fn now_unix() -> u64 {
         1_800_000_000
+    }
+
+    /// Q-I F7（主判据）：`udpcap_loop` 等待三态——Ok(kick) 与 Timeout 立即重探
+    /// （旧形态对 Timeout 再睡一个 interval ⇒ bindwatch 在位时实际周期 ~600s）；
+    /// Disconnected 补睡一个节拍（防自旋，`--bind-interface none` 形态不变）。
+    #[test]
+    fn udpcap_wait_three_states() {
+        assert!(
+            !udpcap_disconnected_backoff(Ok(())),
+            "kick：立即重探（不补睡）"
+        );
+        assert!(
+            !udpcap_disconnected_backoff(Err(mpsc::RecvTimeoutError::Timeout)),
+            "到期：立即重探（旧形态多睡一拍 = 周期翻倍）"
+        );
+        assert!(
+            udpcap_disconnected_backoff(Err(mpsc::RecvTimeoutError::Disconnected)),
+            "看护未起：补睡一个节拍（按 300s 原节拍继续，不空转）"
+        );
     }
 
     fn dev() -> Device {

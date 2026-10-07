@@ -539,7 +539,7 @@ impl Bind {
             }
         };
         self.rx_bytes += n as u64;
-        if std::env::var_os("HOMEWAY_TX_DBG").is_some() {
+        if crate::envflag::tx_dbg() {
             eprintln!("[RXDBG] client got {n}B from {src_raw} first={:02x?}", &self.recv_buf[..n.min(8)]);
         }
         // 双栈 socket 上 v4 对端的源地址是 v4-mapped v6——归一成纯 v4（内部表示
