@@ -309,8 +309,70 @@ tunIp=100.64.210.203 / pub=14ffdc3b（与 12:45 首连完全一致——身份�
 长期靠 plist 改指向/周期归档/daemon 侧接管；matrix「非 verbose 起 grep debug.log」
 自动门与 print_client_token 锁面收窄挂 B0-2b（`docs/reviews/B0-2a.md`）。
 
-**v0.2.2 未发（2026-10-07 登记，防操作侧困惑）**：P1 批（出口发送线程）原计划
+**v0.2.2 未发（2026-10-07 登记，防操作侧困惑）**：~~P1 批（出口发送线程）原计划
 随 P1c 全绿发 v0.2.2 并滚动两台——终验 T2 未达 15% 收益门 ⇒ 走预登记无收益
-分支，默认 off 维持 ⇒ 无生产行为变化 ⇒ **不发版、不滚动**（ROADMAP P1 终档）。
-两台生产出口维持 v0.2.1 形态；P1 代码（定位批 + r1 评审整改）已在 main，
-随下一个有行为变化的版本自然发布。
+分支，默认 off 维持 ⇒ 无生产行为变化 ⇒ **不发版、不滚动**（ROADMAP P1 终档）。~~
+**〔已被 §10 覆盖〕**同日用户改用多因子框架终局裁定发送线程默认 on + 简洁化
+删除批，v0.2.2 已发并滚动——见 §10；两台生产出口现为 **v0.2.2** 形态。
+
+## 10. 滚动升级 v0.2.2（2026-10-07 12:37–12:41，P1 发送线程默认 on/唯一化 + 简洁化删除批）
+
+> 发版 = tag `v0.2.2`（commit `981e6f5`，Release run `37572093951` 绿；四目标
+> 产物 + SHA256SUMS `--check` 全 OK；darwin-arm64 本机与 linux-amd64 阿里云
+> `--version` = `homeway-cli v0.2.2` 实测）。内容：发送线程默认 on 并唯一化
+> （Queued 唯一路径；启动新判据行「发送线程：就绪」）+ MTU 机器全删（恒 1280，
+> tier 侧 tunMtu 注入/mtuEff 白名单同批退役）+ pacing 时刻表删（令牌桶/
+> `HOMEWAY_TX_SHAPING`/TX_DBG 保留）+ `HOMEWAY_CC`/`HOMEWAY_UDP_NO_BATCH`
+> 清理（裁定记录 = ROADMAP P1 终档「P1 默认开启裁定」+ CHANGELOG v0.2.2 段；
+> ci-local quick 全绿 + RRR 矩阵冒烟全过 + 真机烟囱 L3/files/term 全绿）。
+> **兼容性预检**：两台 config 均无已删键（`inner_mtu`/`pacing`/`pace_mbps`）
+> ——serve_cli `deny_unknown_fields` 不会拒启（滚动前已核）。
+
+**Mac（launchd，12:37:54）**：
+
+- 备份在位：`~/bin/homeway-rs.bak-v0.2.1`（sha `96b02537…` = v0.2.1 装机件字节）。
+- 换装：`~/bin/homeway-rs` = v0.2.2 darwin-arm64（sha `7b65d49e…`，**临时件 +
+  `mv` 原子换名**——不撞运行中二进制的写锁）→ `launchctl kickstart -k` →
+  running（pid 55950）。
+- 判据行（exit.log/debug.log，12:37:54–59）：`serve 就绪：wg=:41641
+  tunnel=100.64.255.1 … tokens=27`；**`发送线程：就绪（homeway-serve-tx，单轮
+  排空上界 256KiB）`（本批新行，debug.log 面）**；`绑卡：自动挑到 en0` +
+  `绑卡看护：WG socket 钉在 en0`；v6 双公布 `已公布 [114.242.60.128:41641
+  [2408:…]:41641]`；`中继：注册成功（腿 41641 → 123.56.218.212:41741）` +
+  `中继控制面已连`。5s 观测行 `UDP 出站[发送线程]`（mode 判别已删——恒发送
+  线程面）。
+- **手机自动重连**（未触碰手机）：出口重启窗口手机走 R1 重握手 → R2 换源 →
+  R3 重赛跑，`RECOVER 恢复于 R3 重赛跑（… 耗时 18.495s）` → attached、link
+  via=direct。L3 一轮：browser 流量出口侧 `intercept: tcp transit …（dialok）`
+  成串 + 手机 `stats:` fdRead 48100→186432B / fdWrite 116096→3633288B 双向增长。
+
+**阿里云（nohup 双角色，12:40:31）**：
+
+- 备份在位：`/usr/local/bin/homeway-rs.bak-v0.2.1`（sha `2ea2e025…`）。
+  ⚠️ 操作实录：首次换件拿错目标产物（linux-**arm64**）→ `Exec format error`
+  ——**catzhao.com 是 x86_64**（`uname -m`；v0.2.1 件 = x86-64 static-pie），
+  换 linux-**amd64** 即好；进程先停净再 cp（§9 的 Text file busy 教训未重犯）。
+- 换装：sha `d0f51bff…`（static-pie）→ 重跑 §2 同款 nohup 命令行（pid 1565023；
+  UDP 41641@eth0 + 41741 同 pid）。启动两轮竞态同 §9 形态（STUN 先「不可用/
+  无应答」→ `已公布 [123.56.218.212:41641]`，v6 无 = 该机无 v6，预期）。
+- 判据行（unified-stdout.log/debug.log，12:40:31）：`统一进程就绪（… serve=true
+  relay=true … version=v0.2.2）`；`serve 就绪：wg=:41641 … tokens=4`；**
+  `发送线程：就绪（homeway-serve-tx，单轮排空上界 256KiB）`（debug.log 面）**；
+  `绑卡看护：WG socket 钉在 eth0`；`relay: 端点：123.56.218.212:41741`。
+- **中继互注（v0.2.2↔v0.2.2）**：Mac 重启（12:37:54）后 relay.log
+  `中继：后端 d07c57dd5bde1fa7 注册成功（腿 114.242.60.128:41641）`——两侧
+  同版互注零人工干预。
+
+**手机侧（12:29 起，先于本批滚动）**：v0.2.2 批核（.so = cbd45f0，pin 前进）
+覆盖装机：`身份：复用` / `warmup pong: 就绪（判据=wg）` / `attached（数据面已
+接管 fd=89，L3 直通）` / `running (mtu=1280 …)`（**tunStatusJSON 无 mtuEff 键
+——删除面行为一致**）；files 两轮（home 列表 + `~/.cargo` 层级+文件元数据过
+隧道）+ term 一轮（`Connect … (fresh attach)` → `Session state -> Connected`，
+term-1Surface 帧在渲）。
+
+**回退（如需，v0.2.1 件在位）**：Mac `cp ~/bin/homeway-rs.bak-v0.2.1 ~/bin/homeway-rs
+&& launchctl kickstart -k …`；阿里云 pkill 等退净后 `cp …/homeway-rs.bak-v0.2.1
+/usr/local/bin/homeway-rs` + 重跑 nohup 命令行。state 兼容（无布局变更；已删
+config 键本就未配置）。**注意回退后 tier 侧核（v0.2.2 形态）与出口 v0.2.1 的
+组合**：wire 面无差异（删除批不动协议），此前双版混跑形态（12:29–12:37 手机
+v0.2.2 核 × Mac v0.2.1 出口）实测四判据全绿——回退出口不需要回滚手机。

@@ -258,6 +258,23 @@ T3 ✓ 满丢 0、T4 ✓ 上行无回归）⇒ **判决维持：默认 off、不
 裁定**维持 opt-in**——失败族是坑 4 连通性黑洞（风险不对称：off 臂只是性能回退、
 P2 默认升档失败是**载荷完全丢失**）+ 常见形态零收益（真机 TUN 中位比 0.950），
 翻默认无收益只加风险（PERF-AB §9.14 注记）。
+翻默认无收益只加风险（PERF-AB §9.14 注记）。
+
+**v0.2.2 执行收口（2026-10-07，终局裁定当日发版+滚动）**：①简洁化删除批落地——
+发送路径唯一化（`855ffec`：Queued 唯一路径，Inline 直发/TxMode 降级切换/
+HOMEWAY_TX_SENDTHREAD 消融臂删；发送线程无条件起，socketpair/spawn/dup 失败 =
+panic 同款纪律；panic 后无接管、ring 满丢丢新 + 重传兜底）+ MTU 机器全删
+（`24e091a`：mtu_gate.rs 全文件/出口 inner_mtu 全链/stackb clamp 域/mtuEff
+扩展键——恒 1280；tier 侧 tunMtu 注入与白名单同批退役）+ pacing 时刻表删
+（`cbd45f0`：PaceMode/est 估计器/HOMEWAY_TX_PACING 族/pselect 亚毫秒面——令牌桶
++ SHAPING 逃生口 + TX_DBG 保留）+ 测量遗留 env 清理（HOMEWAY_CC/
+HOMEWAY_UDP_NO_BATCH）。净删约 -1440 行。②门禁：ci-local quick 全绿（含 RRR
+矩阵冒烟）+ 真机烟囱（新核覆盖装机：attached/L3 双向计数/files/term 四判据）。
+③发版：tag `v0.2.2`（`981e6f5`）→ Release 四产物 sha 全 OK。④两台滚动
+（`docs/DEPLOY-RUST-EXIT.md` §10）：Mac launchd（sha `7b65d49e…`，判据含新行
+「发送线程：就绪（…256KiB）」）+ 阿里云 nohup（sha `d0f51bff…`——⚠️ catzhao.com
+是 **x86_64**，拿 arm64 产物会 Exec format error）；手机 R1→R2→R3 自动重连
+18.5s 恢复 direct。回退件 `.bak-v0.2.1` 两台在位。
 
 真手指复测清单（files 上传 picker〔K-10〕、~~逐包 pacing 下一档~~（**D-3 已落**——
 8s 进默认 + 8r 机制在册默认关）、
