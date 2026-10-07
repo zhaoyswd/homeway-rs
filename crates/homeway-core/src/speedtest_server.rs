@@ -25,15 +25,79 @@ use crate::speedtest::{
 
 /// 并发测速连接上限（客户端 4+4 条流，留出下行摘表时差的余量——Go MaxConns 缺省）。
 pub const MAX_CONNS: usize = 12;
-/// 单连接硬超时（覆盖 5s 预热 + 15s 窗口 + 控制帧余量）。
+/// 单连接硬超时缺省（覆盖 5s 预热 + 15s 窗口 + 控制帧余量）。
 const CONN_TIMEOUT: Duration = Duration::from_secs(30);
-/// 预热时长上限。
+/// 预热时长上限缺省。
 const MAX_WARMUP: Duration = Duration::from_secs(5);
-/// 窗口时长区间。
+/// 窗口时长区间（下限是 Rust 侧既有约束，Go Limits 只有上限）。
 const MIN_WINDOW: Duration = Duration::from_millis(100);
 const MAX_WINDOW: Duration = Duration::from_secs(15);
 /// data 载荷上限（u16 长度场）+ 服务端发送块（Go SendBlock）。
 const MAX_BLOCK: usize = 65535;
+/// 注入限额的硬上界（防 `Instant::now() + Duration` 溢出 panic——`Limits` 是 pub 面；
+/// Go `time.Now().Add` 不 panic，但超长限额也没有实际用途）。
+const LIMITS_MAX_TIMEOUT: Duration = Duration::from_secs(3600);
+/// busy 拒绝路径的帧吞窗（Go `ReplyThenClose`：`now+2s` **绝对**期限）。
+const BUSY_FRAME_BUDGET: Duration = Duration::from_secs(2);
+/// busy 拒绝路径吞输入窗（Go `speedtest.go:434-440`：`now+1s` **绝对**期限——
+/// per-syscall 续命会让滴流连接永久占住一条线程）。
+const BUSY_DRAIN_BUDGET: Duration = Duration::from_secs(1);
+
+/// 服务端限额（移植 Go `Limits` + `SetLimits`——硬超时/上限**可注入** ⇒ 可测；
+/// 缺省值与生产常量同源）。`send_block` = 下行泵送块（Go `SendBlock`）。
+#[derive(Debug, Clone, Copy)]
+pub struct Limits {
+    pub max_conns: usize,
+    pub conn_timeout: Duration,
+    pub max_warmup: Duration,
+    pub max_window: Duration,
+    pub max_block: usize,
+    pub send_block: usize,
+}
+
+impl Default for Limits {
+    fn default() -> Self {
+        Self {
+            max_conns: MAX_CONNS,
+            conn_timeout: CONN_TIMEOUT,
+            max_warmup: MAX_WARMUP,
+            max_window: MAX_WINDOW,
+            max_block: MAX_BLOCK,
+            send_block: MAX_BLOCK,
+        }
+    }
+}
+
+impl Limits {
+    /// Go `withDefaults` 同判点（0/越界回缺省；send_block 不得超过 max_block）。
+    fn filled(mut self) -> Self {
+        if self.max_conns == 0 {
+            self.max_conns = MAX_CONNS;
+        }
+        if self.conn_timeout.is_zero() {
+            self.conn_timeout = CONN_TIMEOUT;
+        }
+        if self.max_warmup.is_zero() {
+            self.max_warmup = MAX_WARMUP;
+        }
+        if self.max_window.is_zero() {
+            self.max_window = MAX_WINDOW;
+        }
+        if self.max_block == 0 || self.max_block > MAX_BLOCK {
+            self.max_block = MAX_BLOCK;
+        }
+        if self.send_block == 0 || self.send_block > self.max_block {
+            self.send_block = self.max_block;
+        }
+        // 防溢出 panic（注入面是 pub）
+        for t in [&mut self.conn_timeout, &mut self.max_warmup, &mut self.max_window] {
+            if *t > LIMITS_MAX_TIMEOUT {
+                *t = LIMITS_MAX_TIMEOUT;
+            }
+        }
+        self
+    }
+}
 
 /// 会话计数（受理/拒绝——验收对账面；total 只在登记成功时 +1）。`next` = 会话号
 /// 分配器（**单调自增、可 >MAX_CONNS**——Go connreg.Add 语义，评审 H3：此前用
@@ -48,6 +112,8 @@ pub struct SessStats {
 /// 测速服务（UDS 承载；Serve 由装配层在 listener 上拉起——照 files 的形状）。
 pub struct SpeedtestServer {
     logf: crate::Logf,
+    /// 限额（可注入——F6a；生产 = 缺省常量）。
+    limits: Limits,
     /// 在册连接表（上限判定与登记同锁——受理/摘除的原子面）。
     conns: Arc<Mutex<CountingRegistry>>,
     pub stats: Arc<SessStats>,
@@ -55,32 +121,38 @@ pub struct SpeedtestServer {
 
 struct CountingRegistry {
     live: usize,
-    /// 在册会话句柄（收工 CloseAll——Go speedSrv.Close() 语义，评审 M12）。
-    conns: Vec<UnixStream>,
+    /// 在册会话句柄（会话号 → dup 句柄；F6b：`release(id)` 按会话收口——修前
+    /// `release()` 清整表，任一会话结束会把其它在跑会话的句柄从账上抹掉）。
+    conns: Vec<(u64, UnixStream)>,
 }
 
 impl CountingRegistry {
     /// 受理：满员 None；否则在册 +1 并返回**单调会话号**（评审 H3——Go connreg
     /// 单调自增语义，可 >MAX_CONNS）。
-    fn admit(&mut self, id_alloc: &AtomicU64, conn: &UnixStream) -> Option<u64> {
-        if self.live >= MAX_CONNS {
+    fn admit(&mut self, id_alloc: &AtomicU64, conn: &UnixStream, max_conns: usize) -> Option<u64> {
+        if self.live >= max_conns {
             return None;
         }
+        let id = id_alloc.fetch_add(1, Ordering::Relaxed) + 1;
         self.live += 1;
         if let Ok(c) = conn.try_clone() {
-            self.conns.push(c);
+            self.conns.push((id, c));
         }
-        Some(id_alloc.fetch_add(1, Ordering::Relaxed) + 1)
+        Some(id)
     }
 
-    fn release(&mut self) {
+    /// 按会话号收口（只摘自己那条；在册计数减一）。
+    fn release(&mut self, id: u64) {
         self.live = self.live.saturating_sub(1);
-        self.conns.clear(); // 会话收线由各线程自行收（守卫侧只做簿记）
+        self.conns.retain(|(i, _)| *i != id);
     }
 
-    /// 收工：断开全部在跑会话（Go connreg.CloseAll 同义，评审 M12）。
+    /// 收工：断开全部在跑会话（Go connreg.CloseAll 同义，评审 M12）。`live = 0` 对**已
+    /// 登记**的会话是事实；窄窗残余：stop 前已 accept、尚未 admit 的会话不在表内
+    /// （其线程照常跑完 30s 硬超时），`try_clone` 失败时也不登记句柄（EMFILE/ENFILE 恰是
+    /// accept 退避场景——该会话只能等硬超时自收）。
     fn close_all(&mut self) {
-        for c in self.conns.drain(..) {
+        for (_, c) in self.conns.drain(..) {
             let _ = c.shutdown(std::net::Shutdown::Both);
         }
         self.live = 0;
@@ -89,8 +161,14 @@ impl CountingRegistry {
 
 impl SpeedtestServer {
     pub fn new(logf: crate::Logf) -> Self {
+        Self::with_limits(logf, Limits::default())
+    }
+
+    /// 注入限额（Go `SetLimits`；0/越界走缺省——`Limits::filled`）。
+    pub fn with_limits(logf: crate::Logf, limits: Limits) -> Self {
         Self {
             logf,
+            limits: limits.filled(),
             conns: Arc::new(Mutex::new(CountingRegistry { live: 0, conns: Vec::new() })),
             stats: Arc::new(SessStats::default()),
         }
@@ -110,33 +188,39 @@ impl SpeedtestServer {
         Ok(())
     }
 
-    /// 可停形态（引擎收工面——files::serve_stoppable 同构；停时断开在跑会话，M12）。
+    /// 可停形态（引擎收工面）。accept 错误分类/退避/节流日志走共享件
+    /// `files_server::serve_stoppable_accepts`（F5：瞬态错误不再摘服务）。
     pub fn serve_stoppable(self: &Arc<Self>, ln: UnixListener, stop: Arc<std::sync::atomic::AtomicBool>) -> std::io::Result<()> {
-        use std::sync::atomic::Ordering as OD;
         ln.set_nonblocking(true)?;
-        loop {
-            if stop.load(OD::Relaxed) {
-                if let Ok(mut reg) = self.conns.lock() {
-                    reg.close_all();
+        let accept = || {
+            ln.accept().map(|(conn, _)| {
+                let _ = conn.set_nonblocking(false);
+                conn
+            })
+        };
+        let logf = self.logf.clone();
+        let r = crate::files_server::serve_stoppable_accepts(
+            accept,
+            move |conn| {
+                let srv = Arc::clone(self);
+                let logf = logf.clone();
+                if let Err(e) = std::thread::Builder::new()
+                    .name("homeway-speedtest".into())
+                    .stack_size(512 * 1024)
+                    .spawn(move || srv.serve_conn(conn))
+                {
+                    (logf)(&format!("speedtest: 会话线程起不来（{e}）——连接直接收线"));
                 }
-                return Ok(());
-            }
-            match ln.accept() {
-                Ok((conn, _)) => {
-                    let _ = conn.set_nonblocking(false);
-                    let srv = Arc::clone(self);
-                    std::thread::Builder::new()
-                        .name("homeway-speedtest".into())
-                        .stack_size(512 * 1024)
-                        .spawn(move || srv.serve_conn(conn))
-                        .ok();
-                }
-                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(200));
-                }
-                Err(_) => return Ok(()),
-            }
+            },
+            stop,
+            &self.logf,
+            "speedtest",
+        );
+        // 收工：断开全部在跑会话（Go connreg.CloseAll 同义，评审 M12）
+        if let Ok(mut reg) = self.conns.lock() {
+            reg.close_all();
         }
+        r
     }
 
     /// 在册会话数（诊断面）。
@@ -149,7 +233,7 @@ impl SpeedtestServer {
         // 立刻关会走 RST 路径、已发出的 report 可能被对端丢弃）。
         let conn_id = {
             let mut reg = self.conns.lock().expect("会话表锁中毒");
-            match reg.admit(&self.stats.next, &conn) {
+            match reg.admit(&self.stats.next, &conn, self.limits.max_conns) {
                 Some(id) => {
                     self.stats.total.fetch_add(1, Ordering::Relaxed);
                     id
@@ -157,23 +241,24 @@ impl SpeedtestServer {
                 None => {
                     drop(reg);
                     self.stats.rejected.fetch_add(1, Ordering::Relaxed);
-                    (self.logf)(&format!("speedtest: 会话拒绝（并发上限 {MAX_CONNS}）"));
+                    (self.logf)(&format!("speedtest: 会话拒绝（并发上限 {}）", self.limits.max_conns));
                     reply_then_close(conn, &report_json(0, 0, 0, Some("busy")));
                     return;
                 }
             }
         };
-        let _guard = ConnGuard { conns: Arc::clone(&self.conns) };
+        // 守卫按会话号收口（F6b）：任何退出路径只摘自己那条（修前清整表）。
+        let _guard = ConnGuard { conns: Arc::clone(&self.conns), id: conn_id };
 
-        // 单连接硬超时（**绝对期限**——评审 M13：set_read_timeout 是 per-syscall，
-        // 慢滴客户端每次成功读都续命 30s；每次读写前按剩余时间收敛设置）
-        let deadline = Instant::now() + CONN_TIMEOUT;
-        set_io_deadline(&conn, deadline);
+        // 单连接硬超时（**绝对期限**——F6a：每次触达 socket 的读写前 `arm_io` 按剩余
+        // 收敛设置；`SO_RCVTIMEO` 是 per-syscall，只在会话开头设一次会被慢滴客户端
+        // 每次成功读续命 30s）。
+        let deadline = Instant::now() + self.limits.conn_timeout;
         let w = match conn.try_clone() {
             Ok(c) => c,
             Err(_) => return,
         };
-        let mut r = BufReader::with_capacity(128 * 1024, conn);
+        let mut r = BufReader::with_capacity(128 * 1024, DeadlineIo { sock: &conn, deadline });
 
         // 恒第一帧：会话请求（客户端先写、服务端后答）
         let (typ, payload) = match read_frame(&mut r) {
@@ -194,25 +279,31 @@ impl SpeedtestServer {
         let warmup = Duration::from_millis(req.warmup_ms);
         let window = Duration::from_millis(req.window_ms);
         if req.role != "recv" && req.role != "send" {
-            finish_with_error(&w, &format!("未知角色 {:?}", req.role));
+            finish_with_error(&w, &format!("未知角色 {:?}", req.role), deadline);
             return;
         }
-        if warmup > MAX_WARMUP {
+        if warmup > self.limits.max_warmup {
             finish_with_error(
                 &w,
-                &format!("预热 {} 超上限 {}", fmt_duration_go_ms(warmup), fmt_duration_go_ms(MAX_WARMUP)),
+                &format!(
+                    "预热 {} 超上限 {}",
+                    fmt_duration_go_ms(warmup),
+                    fmt_duration_go_ms(self.limits.max_warmup)
+                ),
+                deadline,
             );
             return;
         }
-        if window < MIN_WINDOW || window > MAX_WINDOW {
+        if window < MIN_WINDOW || window > self.limits.max_window {
             finish_with_error(
                 &w,
                 &format!(
                     "窗口 {} 超出 [{}, {}]",
                     fmt_duration_go_ms(window),
                     fmt_duration_go_ms(MIN_WINDOW),
-                    fmt_duration_go_ms(MAX_WINDOW)
+                    fmt_duration_go_ms(self.limits.max_window)
                 ),
+                deadline,
             );
             return;
         }
@@ -224,9 +315,9 @@ impl SpeedtestServer {
             fmt_duration_go_ms(window)
         ));
         if req.role == "recv" {
-            self.serve_recv(conn_id, &w, warmup, window);
+            self.serve_recv(conn_id, &w, warmup, window, deadline);
         } else {
-            self.serve_send(conn_id, &mut r, &w);
+            self.serve_send(conn_id, &mut r, &w, deadline);
         }
     }
 
@@ -235,9 +326,9 @@ impl SpeedtestServer {
     /// R8-2 归因插桩：窗口段按 1s 切片泵送（共享同一截止时刻——墙钟行为与整段
     /// pump_data 等价，切片只用于计量），末尾多打一行逐秒字节序列 + 尾 3s 速率
     /// ——真机下行「爬坡支配 vs 稳态封顶」的判别面（窗口均值会掩盖前者）。
-    fn serve_recv(&self, id: u64, w: &UnixStream, warmup: Duration, window: Duration) {
-        let mut bw = BufWriter::new(w);
-        let block = vec![0u8; MAX_BLOCK];
+    fn serve_recv(&self, id: u64, w: &UnixStream, warmup: Duration, window: Duration, deadline: Instant) {
+        let mut bw = BufWriter::new(DeadlineIo { sock: w, deadline });
+        let block = vec![0u8; self.limits.send_block];
         let mut seq: u32 = 0;
         let t0 = Instant::now();
         let warmup_bytes = pump_data(&mut bw, &block, &mut seq, warmup);
@@ -245,7 +336,7 @@ impl SpeedtestServer {
             (self.logf)(&format!("speedtest: 会话 #{id} 异常（下行发送：flush 失败）"));
             return;
         }
-        let window_deadline = Instant::now() + window;
+        let window_deadline = (Instant::now() + window).min(deadline);
         // 片 = (载荷字节, 实际时长)——末片常为残片（<1s），尾速率按真实时长折算
         // （评审 r1-F4：片数当秒数会把尾速率系统性低报至多 ~1/3）。
         let mut per_sec: Vec<(i64, f64)> = Vec::with_capacity(window.as_secs() as usize + 1);
@@ -305,7 +396,7 @@ impl SpeedtestServer {
     }
 
     /// role=send：读帧计数——START 前 = 预热，START 后 = 窗口；FINISH 触发 report。
-    fn serve_send(&self, id: u64, r: &mut BufReader<UnixStream>, w: &UnixStream) {
+    fn serve_send(&self, id: u64, r: &mut BufReader<DeadlineIo<'_>>, w: &UnixStream, deadline: Instant) {
         let mut window_bytes: i64 = 0;
         let mut warmup_bytes: i64 = 0;
         let mut started = false;
@@ -327,8 +418,8 @@ impl SpeedtestServer {
             }
             match typ {
                 TYPE_DATA => {
-                    if payload_len > MAX_BLOCK {
-                        finish_with_error(w, &format!("data 载荷 {payload_len} 超上限 {MAX_BLOCK}"));
+                    if payload_len > self.limits.max_block {
+                        finish_with_error(w, &format!("data 载荷 {payload_len} 超上限 {}", self.limits.max_block), deadline);
                         return;
                     }
                     if discard_payload(r, payload_len).is_err() {
@@ -343,7 +434,7 @@ impl SpeedtestServer {
                 }
                 TYPE_START => {
                     if started {
-                        finish_with_error(w, "重复 START");
+                        finish_with_error(w, "重复 START", deadline);
                         return;
                     }
                     started = true;
@@ -351,7 +442,7 @@ impl SpeedtestServer {
                 }
                 TYPE_FINISH => {
                     if !started {
-                        finish_with_error(w, "FINISH 前无 START");
+                        finish_with_error(w, "FINISH 前无 START", deadline);
                         return;
                     }
                     let rep = report_json(
@@ -360,7 +451,7 @@ impl SpeedtestServer {
                         start_at.elapsed().as_millis() as i64,
                         None,
                     );
-                    let mut bw = BufWriter::new(w);
+                    let mut bw = BufWriter::new(DeadlineIo { sock: w, deadline });
                     if write_control(&mut bw, TYPE_REPORT, rep.as_bytes()).is_err() || bw.flush().is_err() {
                         (self.logf)(&format!("speedtest: 会话 #{id} 异常（回报告：写失败）"));
                         return;
@@ -373,7 +464,7 @@ impl SpeedtestServer {
                     return;
                 }
                 other => {
-                    finish_with_error(w, &format!("窗口期收到类型 {other}"));
+                    finish_with_error(w, &format!("窗口期收到类型 {other}"), deadline);
                     return;
                 }
             }
@@ -381,8 +472,9 @@ impl SpeedtestServer {
     }
 }
 
-/// 按绝对期限收敛设置读写超时（评审 M13）。
-fn set_io_deadline(conn: &UnixStream, deadline: Instant) {
+/// 按**绝对期限**收敛设置读写超时（每次触达 socket 的读写前调用——`SO_RCVTIMEO`
+/// 是 per-syscall，只在会话开头设一次会被慢滴客户端每次成功读续命；零即设 1ms 立即失败）。
+fn arm_io(conn: &UnixStream, deadline: Instant) {
     let remain = deadline.saturating_duration_since(Instant::now());
     if remain.is_zero() {
         let _ = conn.set_read_timeout(Some(Duration::from_millis(1)));
@@ -393,15 +485,43 @@ fn set_io_deadline(conn: &UnixStream, deadline: Instant) {
     let _ = conn.set_write_timeout(Some(remain));
 }
 
-/// 受理计数守卫（任何退出路径摘除在册）。
+/// 期限感知的 IO 适配器（F6a 的收口形态）：**每次 syscall 前**按绝对期限重设超时，
+/// 于是 `read_exact`/`BufWriter` 的内部循环也受同一绝对期限约束（逐字节滴流无法靠
+/// 「每次成功读续命」把会话拖过期限）。设计 R8 的三个 arm 点（读前 / flush 前 /
+/// 直写前）由本适配器统一覆盖。
+struct DeadlineIo<'a> {
+    sock: &'a UnixStream,
+    deadline: Instant,
+}
+
+impl std::io::Read for DeadlineIo<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        arm_io(self.sock, self.deadline);
+        self.sock.read(buf)
+    }
+}
+
+impl std::io::Write for DeadlineIo<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        arm_io(self.sock, self.deadline);
+        self.sock.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        arm_io(self.sock, self.deadline);
+        self.sock.flush()
+    }
+}
+
+/// 受理计数守卫（按**会话号**收口——F6b；任何退出路径只摘自己那条，panic 兜底同）。
 struct ConnGuard {
     conns: Arc<Mutex<CountingRegistry>>,
+    id: u64,
 }
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
         if let Ok(mut c) = self.conns.lock() {
-            c.release();
+            c.release(self.id);
         }
     }
 }
@@ -467,9 +587,9 @@ fn json_escape(s: &str) -> String {
     out
 }
 
-/// 失败收场：回 report（error 形态）后冲刷。
-fn finish_with_error(w: &UnixStream, msg: &str) {
-    let mut bw = BufWriter::new(w);
+/// 失败收场：回 report（error 形态）后冲刷（写前按绝对期限 arm）。
+fn finish_with_error(w: &UnixStream, msg: &str, deadline: Instant) {
+    let mut bw = BufWriter::new(DeadlineIo { sock: w, deadline });
     let rep = report_json(0, 0, 0, Some(msg));
     let _ = write_control(&mut bw, TYPE_REPORT, rep.as_bytes());
     let _ = bw.flush();
@@ -477,38 +597,59 @@ fn finish_with_error(w: &UnixStream, msg: &str) {
 
 /// busy/link_down 类拒绝回帧的有序收口（Go ReplyThenClose）：先有界吞一帧（请求）→
 /// 回 report 并冲刷 → 短窗继续吞输入（send 角色在回帧抵达前还在泵）→ 关。
+/// 两段各自**绝对期限**（F6c：帧吞 `now+2s`、循环 `now+1s`——per-syscall 续命会让
+/// 滴流连接永久占住一条线程）。
 fn reply_then_close(conn: UnixStream, error_report: &str) {
     let Ok(r_stream) = conn.try_clone() else { return };
-    let _ = conn.set_read_timeout(Some(Duration::from_secs(2)));
-    let mut r = BufReader::new(r_stream);
     {
-        let mut sink = [0u8; 512];
-        let _ = read_frame_bounded(&mut r, &mut sink);
+        let frame_deadline = Instant::now() + BUSY_FRAME_BUDGET;
+        // 两腿都走 `DeadlineIo`（逐 syscall 按剩余重设）——只 arm 一次的话，
+        // `read_exact`/`BufWriter` 的内部循环会被「每 <2s 送 1 字节」的滴流无限续命
+        // （声明长度 ≤65535 ⇒ 单条 busy 连接可占线程数小时；Go 是 SetReadDeadline 绝对语义）
+        let mut r = BufReader::new(DeadlineIo { sock: &r_stream, deadline: frame_deadline });
+        let _ = drain_one_frame(&mut r, frame_deadline);
     }
     let mut w = conn;
-    let _ = w.set_write_timeout(Some(Duration::from_secs(2)));
-    let mut bw = BufWriter::new(&w);
+    let write_deadline = Instant::now() + BUSY_FRAME_BUDGET;
+    let mut bw = BufWriter::new(DeadlineIo { sock: &w, deadline: write_deadline });
     let _ = write_control(&mut bw, TYPE_REPORT, error_report.as_bytes());
     let _ = bw.flush();
     drop(bw);
     // 继续吞输入一小窗（期限内对端先关则自然提前结束）
-    let _ = w.set_read_timeout(Some(Duration::from_secs(1)));
+    let drain_deadline = Instant::now() + BUSY_DRAIN_BUDGET;
     let mut discard = [0u8; 4096];
-    while let Ok(n) = w.read(&mut discard) {
-        if n == 0 {
+    loop {
+        if Instant::now() >= drain_deadline {
             break;
+        }
+        arm_io(&w, drain_deadline);
+        match w.read(&mut discard) {
+            Ok(0) | Err(_) => break,
+            Ok(_) => {}
         }
     }
 }
 
-/// 有界吞一帧（拒绝路径用；失败也继续回帧——连接本就异常，尽力而为）。
-fn read_frame_bounded(r: &mut BufReader<UnixStream>, buf: &mut [u8]) -> std::io::Result<()> {
-    let (typ, n) = read_frame_header(r)?;
-    let _ = typ;
-    if n > buf.len() {
+/// 有界吞一帧（拒绝路径用）：**类型字节已由头读消费，载荷必须流式吞完**——否则载荷
+/// 留在流里，后续吞输入从载荷中间对帧（错位）；声明载荷超 `MAX_BLOCK` 即收线。
+/// 失败也继续回帧（连接本就异常，尽力而为）。
+fn drain_one_frame(r: &mut BufReader<DeadlineIo<'_>>, deadline: Instant) -> std::io::Result<()> {
+    let (_typ, n) = read_frame_header(r)?;
+    if n > MAX_BLOCK {
+        // u16 长度场 ⇒ 恒不触发（保留语义位：MAX_BLOCK 若调小即成真门）
         return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "帧超长"));
     }
-    r.read_exact(&mut buf[..n])
+    let mut buf = [0u8; 8192];
+    let mut left = n;
+    while left > 0 {
+        if Instant::now() >= deadline {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "帧吞窗耗尽"));
+        }
+        let c = left.min(buf.len());
+        r.read_exact(&mut buf[..c])?; // 块内每次 syscall 由 DeadlineIo 收敛（滴流不续命）
+        left -= c;
+    }
+    Ok(())
 }
 
 // ---------- 帧编解码（BufReader 面；头解析复用 speedtest::decode_head 单一真源——
@@ -774,6 +915,274 @@ mod tests {
         let rep = read_frame(&mut r).expect("busy report 应到达");
         assert_eq!(rep.0, TYPE_REPORT);
         assert_eq!(String::from_utf8(rep.1).unwrap(), r#"{"bytes":0,"warmup_bytes":0,"wall_ms":0,"error":"busy"}"#);
+        assert_eq!(srv.stats.rejected.load(Ordering::Relaxed), 1);
+        drop(holders);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- F6a 绝对硬超时（可注入 Limits） ----------
+
+    /// 滴流客户端（每 100ms 1 字节）在注入的 `conn_timeout = 300ms` 下必须按期收线
+    /// （修前：per-syscall 期限每次成功读续命 ⇒ 会话一直活着；本用例断言 ≤1s = ≥3× 余量）。
+    #[test]
+    fn conn_timeout_is_absolute_under_dribble() {
+        let dir = std::env::temp_dir().join(format!("homeway-rs-spdrib-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("speedtest.sock");
+        let _ = std::fs::remove_file(&sock);
+        let ln = UnixListener::bind(&sock).unwrap();
+        let logf: crate::Logf = Arc::new(|_| {});
+        let srv = Arc::new(SpeedtestServer::with_limits(
+            Arc::clone(&logf),
+            Limits { conn_timeout: Duration::from_millis(300), ..Default::default() },
+        ));
+        let srv2 = Arc::clone(&srv);
+        std::thread::spawn(move || {
+            let _ = srv2.serve(ln);
+        });
+        let mut c = UnixStream::connect(&sock).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        write_control(&mut c, TYPE_REQUEST, br#"{"role":"send","warmup_ms":0,"window_ms":100}"#).unwrap();
+        // 滴流：每 100ms 1 字节（对端逐 syscall 续命即永远读不完帧头）
+        let t0 = Instant::now();
+        let mut closed = false;
+        let mut byte = 0u8;
+        while t0.elapsed() < Duration::from_secs(3) {
+            std::thread::sleep(Duration::from_millis(100));
+            if c.write_all(&[byte]).is_err() {
+                closed = true;
+                break;
+            }
+            byte = byte.wrapping_add(1);
+            let mut b = [0u8; 64];
+            match c.read(&mut b) {
+                Ok(0) => {
+                    closed = true;
+                    break;
+                }
+                Ok(_) => {} // 服务端可能回错误帧（也是收线前的正常产物）
+                Err(e) if matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut) => {}
+                Err(_) => {
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        let dt = t0.elapsed();
+        assert!(closed, "滴流会话必须被绝对硬超时收线（{dt:?}）");
+        assert!(dt < Duration::from_secs(1), "上界 = conn_timeout(300ms) + 余量（实 {dt:?}）");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 正例：正常短会话在宽松 timeout 内完成（不贴目标值）。
+    #[test]
+    fn normal_session_completes_within_loose_timeout() {
+        let dir = std::env::temp_dir().join(format!("homeway-rs-spok-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("speedtest.sock");
+        let _ = std::fs::remove_file(&sock);
+        let ln = UnixListener::bind(&sock).unwrap();
+        let logf: crate::Logf = Arc::new(|_| {});
+        let srv = Arc::new(SpeedtestServer::with_limits(
+            Arc::clone(&logf),
+            Limits { conn_timeout: Duration::from_secs(2), ..Default::default() },
+        ));
+        let srv2 = Arc::clone(&srv);
+        std::thread::spawn(move || {
+            let _ = srv2.serve(ln);
+        });
+        let mut c = UnixStream::connect(&sock).unwrap();
+        write_control(&mut c, TYPE_REQUEST, br#"{"role":"send","warmup_ms":10,"window_ms":100}"#).unwrap();
+        write_control(&mut c, TYPE_START, &[]).unwrap();
+        write_control(&mut c, TYPE_FINISH, &[]).unwrap();
+        let mut r = BufReader::new(c);
+        let (rt, payload) = read_frame(&mut r).expect("report 应到达");
+        assert_eq!(rt, TYPE_REPORT);
+        assert!(String::from_utf8(payload).unwrap().contains("\"bytes\":0"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- F6b release(id) 按会话收口 / close_all ----------
+
+    /// 在册表：`release(id)` 只摘自己那条（修前清整表）；`close_all` 切断全部在跑会话
+    /// 且 `live = 0` 是事实。
+    #[test]
+    fn release_by_session_id_and_close_all() {
+        let (a1, a2) = UnixStream::pair().unwrap();
+        let (b1, mut b2) = UnixStream::pair().unwrap();
+        let mut reg = CountingRegistry { live: 0, conns: Vec::new() };
+        let alloc = AtomicU64::new(0);
+        let id1 = reg.admit(&alloc, &a1, MAX_CONNS).expect("会话 1");
+        let id2 = reg.admit(&alloc, &b1, MAX_CONNS).expect("会话 2");
+        assert_eq!((id1, id2), (1, 2));
+        assert_eq!(reg.live, 2);
+        reg.release(id1);
+        assert_eq!(reg.live, 1, "只减一条");
+        assert_eq!(reg.conns.len(), 1, "只摘自己那条（修前清整表）");
+        assert_eq!(reg.conns[0].0, id2);
+        // close_all：切断仍注册的会话 2（dup 句柄 shutdown ⇒ 对端读到 EOF/错误）
+        reg.close_all();
+        assert_eq!(reg.live, 0);
+        assert!(reg.conns.is_empty());
+        let mut buf = [0u8; 8];
+        b2.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        match b2.read(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => panic!("close_all 后不应有数据（{n}B）"),
+            Err(e) => assert!(
+                !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut),
+                "应是 EOF/连接类错误而非超时：{e}"
+            ),
+        }
+        drop((a1, a2, b1));
+    }
+
+    /// 真会话端到端：两条 role=send 挂住 → 会话 1 FINISH 收口后 `live()==1` →
+    /// 停止位置位（serve_stoppable 收工）⇒ 会话 2 被切断。
+    #[test]
+    fn stop_cuts_remaining_sessions_after_release() {
+        let dir = std::env::temp_dir().join(format!("homeway-rs-sprel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("speedtest.sock");
+        let _ = std::fs::remove_file(&sock);
+        let ln = UnixListener::bind(&sock).unwrap();
+        let logf: crate::Logf = Arc::new(|_| {});
+        let srv = Arc::new(SpeedtestServer::new(Arc::clone(&logf)));
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        {
+            let srv2 = Arc::clone(&srv);
+            let stop2 = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let _ = srv2.serve_stoppable(ln, stop2);
+            });
+        }
+        let mut c1 = UnixStream::connect(&sock).unwrap();
+        c1.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        write_control(&mut c1, TYPE_REQUEST, br#"{"role":"send","warmup_ms":0,"window_ms":100}"#).unwrap();
+        let mut c2 = UnixStream::connect(&sock).unwrap();
+        c2.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        write_control(&mut c2, TYPE_REQUEST, br#"{"role":"send","warmup_ms":0,"window_ms":100}"#).unwrap();
+        let wait_live = |want: usize| {
+            let t0 = Instant::now();
+            while t0.elapsed() < Duration::from_secs(3) {
+                if srv.live() == want {
+                    return true;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            false
+        };
+        assert!(wait_live(2), "两条会话应在册（实 {}）", srv.live());
+        // 会话 1 收口
+        write_control(&mut c1, TYPE_START, &[]).unwrap();
+        write_control(&mut c1, TYPE_FINISH, &[]).unwrap();
+        let mut r1 = BufReader::new(c1);
+        let (rt, _) = read_frame(&mut r1).expect("report 应到达");
+        assert_eq!(rt, TYPE_REPORT);
+        assert!(wait_live(1), "会话 1 收口后应在册 1（实 {}）", srv.live());
+        // 收工：close_all 切断仍在跑的会话 2
+        stop.store(true, Ordering::Release);
+        let mut buf = [0u8; 8];
+        match c2.read(&mut buf) {
+            Ok(0) => {}
+            Ok(n) => panic!("收工后不应有数据（{n}B）"),
+            Err(e) => assert!(
+                !matches!(e.kind(), std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut),
+                "应是 EOF/连接类错误而非超时：{e}"
+            ),
+        }
+        assert_eq!(srv.live(), 0, "收工后在册归零");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---------- F6c busy 路径帧吞 / 绝对窗 ----------
+
+    /// **滴流 busy 连接**（H2 回归）：占满并发后第 13 条按 400ms/字节滴 15B 帧头 ⇒
+    /// 帧吞窗（2s **绝对**期限）到点即回 busy report 并释放线程（修前 per-syscall
+    /// 续命 ⇒ 每字节都重置 2s，单连接可挂数小时）。
+    #[test]
+    fn busy_path_dribble_released_by_absolute_window() {
+        let dir = std::env::temp_dir().join(format!("homeway-rs-spbd2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("speedtest.sock");
+        let _ = std::fs::remove_file(&sock);
+        let ln = UnixListener::bind(&sock).unwrap();
+        let logf: crate::Logf = Arc::new(|_| {});
+        let srv = Arc::new(SpeedtestServer::new(Arc::clone(&logf)));
+        let srv2 = Arc::clone(&srv);
+        std::thread::spawn(move || {
+            let _ = srv2.serve(ln);
+        });
+        let mut holders = Vec::new();
+        for _ in 0..MAX_CONNS {
+            let mut c = UnixStream::connect(&sock).unwrap();
+            write_control(&mut c, TYPE_REQUEST, br#"{"role":"recv","warmup_ms":1000,"window_ms":5000}"#).unwrap();
+            holders.push(c);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        // 第 13 条：滴流（每 700ms 1 字节，共 15B 帧头；帧头 10.5s 才凑齐——修前
+        // per-syscall 续命 ⇒ 回帧要等帧头凑齐/对端停发）
+        let mut c = UnixStream::connect(&sock).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let rd = c.try_clone().unwrap();
+        rd.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
+        let hdr = [0u8; 15]; // 全是 0：magic 不符，读满 15B 后 read_frame_header 会报错
+        let writer = std::thread::spawn(move || {
+            for b in hdr {
+                if c.write_all(&[b]).is_err() {
+                    return;
+                }
+                std::thread::sleep(Duration::from_millis(700));
+            }
+        });
+        let t0 = Instant::now();
+        let mut r = BufReader::new(rd);
+        let rep = read_frame(&mut r).expect("滴流 busy 连接仍须按期拿到 report");
+        let dt = t0.elapsed();
+        assert_eq!(rep.0, TYPE_REPORT);
+        assert!(String::from_utf8(rep.1).unwrap().contains("\"error\":\"busy\""));
+        // 最坏墙钟 = 2s（帧）+ 2s（写）+ 1s（吞输入）= 5s ⇒ 阈值 8s 留 ≥1.6× 余量；
+        // 修前形态（单次 arm）实测 ≈9.9s ⇒ 仍必红。
+        assert!(dt < Duration::from_secs(8), "帧吞窗绝对期限 2s（+吞输入窗）应到点放行（实 {dt:?}）");
+        let _ = writer.join();
+        drop(holders);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// busy 路径喂「非 request 首帧 + 大载荷」⇒ 帧边界不错位、回帧到达、按期返回
+    /// （≤ 帧吞 2s + 吞输入 1s + 余量）。
+    #[test]
+    fn busy_path_drains_frame_and_bounded() {
+        let dir = std::env::temp_dir().join(format!("homeway-rs-spbd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("speedtest.sock");
+        let _ = std::fs::remove_file(&sock);
+        let ln = UnixListener::bind(&sock).unwrap();
+        let logf: crate::Logf = Arc::new(|_| {});
+        let srv = Arc::new(SpeedtestServer::new(Arc::clone(&logf)));
+        let srv2 = Arc::clone(&srv);
+        std::thread::spawn(move || {
+            let _ = srv2.serve(ln);
+        });
+        // 占满并发
+        let mut holders = Vec::new();
+        for _ in 0..MAX_CONNS {
+            let mut c = UnixStream::connect(&sock).unwrap();
+            write_control(&mut c, TYPE_REQUEST, br#"{"role":"recv","warmup_ms":1000,"window_ms":5000}"#).unwrap();
+            holders.push(c);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+        // 第 13 条：首帧是 data 大载荷（非 request）+ 后续垃圾滴流
+        let mut c = UnixStream::connect(&sock).unwrap();
+        c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let big = vec![0u8; 60 * 1024];
+        write_control(&mut c, TYPE_DATA, &big).unwrap();
+        let t0 = Instant::now();
+        let mut r = BufReader::new(c);
+        let rep = read_frame(&mut r).expect("busy report 应到达（帧吞不错位）");
+        assert_eq!(rep.0, TYPE_REPORT);
+        assert!(String::from_utf8(rep.1).unwrap().contains("\"error\":\"busy\""));
+        assert!(t0.elapsed() < Duration::from_secs(4), "帧吞 + 吞输入窗应受界（实 {:?}）", t0.elapsed());
         assert_eq!(srv.stats.rejected.load(Ordering::Relaxed), 1);
         drop(holders);
         let _ = std::fs::remove_dir_all(&dir);

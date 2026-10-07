@@ -34,6 +34,23 @@ const LISTEN_BACKLOG: usize = 2;
 const CONN_BUF: usize = 128 * 1024;
 /// UDP 查询面缓冲（代答栈内 socket 的收包粒度）。
 const UDP_RX: usize = 64 * 1024;
+/// UDP 面的收/发槽数与字节容量（F4d：与在途上限对齐——修前各 64 槽 / 64KB）。
+///
+/// - **tx**：`drain_dns` 每拍排空回投通道，超过容量即 `send_slice` 失败 ⇒
+///   `deliver_udp53` 返 false ⇒ `udp_drop`（**应答丢失**）。必要性来源 = tx 容量 ≥
+///   workers × max payload（64 × 1232 = 78,848 > 64KB——F4c 把 worker 2→64 后 64KB
+///   先撞墙）；取 256 槽 = 「驱动线程停摆窗口内积压上界 = 在途上限」的保守上界。
+/// - **rx**：smoltcp 0.14 `socket/udp.rs:522-529` 在 `rx_buffer.enqueue` 失败时
+///   `net_trace!("buffer full, dropped incoming packet")` —— **静默丢包且无计数**；
+///   容量留在 64 槽 = 自造一个静默丢弃面 ⇒ 同口径抬到 256。
+/// - `+1` 包余量：smoltcp `PacketBuffer` 要求连续窗口并有 padding
+///   （`storage/packet_buffer.rs:80-115`）⇒ 恰好 256 满额包仍可能 `Err(Full)`。
+///   注：元数据**槽**不额外 +1（从空环起 256 条满额包安全：字节容量 316,624 是
+///   1232 的整数倍，环空即 clear；padding 只在非空环续排时占窗口）。
+///
+/// 残余（登记）：rx 溢出仍无观测面（本批不引入新计数；容量只降低触发概率）。
+const UDP_META: usize = crate::server::dnsproxy::MAX_IN_FLIGHT;
+const UDP_BUF_CAP: usize = UDP_META * crate::server::dnsproxy::MAX_DNS_PAYLOAD_53 + crate::server::dnsproxy::MAX_DNS_PAYLOAD_53;
 /// 单连接待写字节上限（F8/H1：per-conn 待写队列的**硬上界**）。隧道 TCP 面 tx buffer
 /// 仅 16KB，慢读客户端不读应答时 `deliver_tcp` 入队会无界增长——超本上限即**收线**
 /// （客户端按超时重试）。取 256KB = 数个大应答（≤64KB）的余量，与拦截腿 `WATERMARK`
@@ -137,11 +154,11 @@ impl DnsFaces {
             pending: HashMap::new(),
             next_tag: 1,
         };
-        let rx_meta: Vec<udp::PacketMetadata> = (0..64).map(|_| udp::PacketMetadata::EMPTY).collect();
-        let tx_meta: Vec<udp::PacketMetadata> = (0..64).map(|_| udp::PacketMetadata::EMPTY).collect();
+        let rx_meta: Vec<udp::PacketMetadata> = (0..UDP_META).map(|_| udp::PacketMetadata::EMPTY).collect();
+        let tx_meta: Vec<udp::PacketMetadata> = (0..UDP_META).map(|_| udp::PacketMetadata::EMPTY).collect();
         let mut usock = UdpSocket::new(
-            udp::PacketBuffer::new(rx_meta, vec![0u8; UDP_RX]),
-            udp::PacketBuffer::new(tx_meta, vec![0u8; UDP_RX]),
+            udp::PacketBuffer::new(rx_meta, vec![0u8; UDP_BUF_CAP]),
+            udp::PacketBuffer::new(tx_meta, vec![0u8; UDP_BUF_CAP]),
         );
         if usock.bind(IpEndpoint::new(tunnel_ip.into(), 53)).is_ok() {
             me.udp53 = Some(sockets.add(usock));
@@ -438,6 +455,45 @@ mod tests {
             .conns
             .insert(h, TcpConn { rx: Vec::new(), tx: Vec::new(), last: Instant::now() });
         h
+    }
+
+    /// F4d：回投容量与在途上限对齐——200 × 1232B 的应答全部写进栈 tx（修前 64 槽/64KB
+    /// 下第 54 条即 `Err(Full)` ⇒ `udp_drop` 丢应答）；rx/tx 常量同口径（rx 溢出是
+    /// smoltcp 的**静默丢弃**，容量只降低触发概率——残余已登记）。
+    #[test]
+    fn udp_tx_capacity_matches_inflight() {
+        assert_eq!(UDP_META, crate::server::dnsproxy::MAX_IN_FLIGHT, "槽数 = 在途上限");
+        assert_eq!(
+            UDP_BUF_CAP,
+            crate::server::dnsproxy::MAX_IN_FLIGHT * crate::server::dnsproxy::MAX_DNS_PAYLOAD_53
+                + crate::server::dnsproxy::MAX_DNS_PAYLOAD_53,
+            "+1 包余量（smoltcp PacketBuffer 连续窗口/padding）"
+        );
+        let mut sockets = SocketSet::new(vec![]);
+        let mut served = std::collections::HashSet::new();
+        let faces = DnsFaces::attach(Ipv4Addr::new(100, 64, 255, 1), 0, &mut sockets, &mut served);
+        let from = IpEndpoint::new(Ipv4Addr::new(100, 64, 255, 9).into(), 53000);
+        let resp = vec![0x5Au8; crate::server::dnsproxy::MAX_DNS_PAYLOAD_53];
+        let mut ok = 0usize;
+        for _ in 0..200 {
+            if faces.deliver_udp53(&mut sockets, from, &resp) {
+                ok += 1;
+            }
+        }
+        assert_eq!(ok, 200, "200 × 1232B 必须全进 tx（容量 = 在途上限；实 {ok}）");
+    }
+
+    /// F4d（rx 半边）：容量常量与在途上限同口径——smoltcp 的 rx 溢出是**静默丢弃且无
+    /// 计数**（`socket/udp.rs:522-529`），本批只能靠容量对齐降低触发概率（残余登记）。
+    #[test]
+    fn udp_rx_capacity_matches_inflight() {
+        assert_eq!(UDP_META, crate::server::dnsproxy::MAX_IN_FLIGHT, "rx 槽数 = 在途上限");
+        assert_eq!(
+            UDP_BUF_CAP,
+            crate::server::dnsproxy::MAX_IN_FLIGHT * crate::server::dnsproxy::MAX_DNS_PAYLOAD_53
+                + crate::server::dnsproxy::MAX_DNS_PAYLOAD_53,
+            "rx 字节容量 = 在途上限 × 最大载荷 + 1 包余量"
+        );
     }
 
     /// F8：长度域 u16 溢出（> 65535）→ 收线（对齐 Go writeTCPMessage 返错）。

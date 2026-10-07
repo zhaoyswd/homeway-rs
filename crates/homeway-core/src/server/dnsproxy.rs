@@ -25,8 +25,8 @@ use crate::Logf;
 const DEFAULT_FALLBACK: &str = "223.5.5.5";
 /// 单查询总预算（主/兜共享）。
 const DEFAULT_BUDGET: Duration = Duration::from_millis(2500);
-/// 在途查询上限（超限丢弃计数）。
-const MAX_IN_FLIGHT: usize = 256;
+/// 在途查询上限（超限丢弃计数；`dnsface` 回投容量与之对齐——见 F4d）。
+pub(crate) const MAX_IN_FLIGHT: usize = 256;
 /// 应答 TTL 钳制上限（秒）。
 const MAX_TTL: u32 = 60;
 /// 上游列表跟随检查节流。
@@ -35,8 +35,12 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(1);
 const MAX_PER_TRY: Duration = Duration::from_millis(800);
 /// UDP 缓冲上界（Go udpBufSize）。
 const UDP_BUF: usize = 64 << 10;
-/// DNS worker 池线程数（设计 §1.1「独立 1-2 条」）。
-const WORKERS: usize = 2;
+/// DNS worker 池线程数缺省（F4c：2 → 64）。依据 = 到达率 × 上游时延（手机整页解析
+/// 突发 ~50 查询/100ms、慢上游 800ms/次 ⇒ 数十并发才不排队）；资源上界 = 64 × 512KB
+/// 栈 = 32MB 虚存；与 DNS 面既有容量同阶（`dnsface::MAX_TCP_CONNS = 64`）。
+/// 修掉 F4a（per-attempt 绝对期限）后 worker 不再会被**永久**占死，worker 数只决定
+/// 稳态吞吐。残余：全死上游下稳态 ≈25.6 qps（Go goroutine-per-query ~102 qps）⇒ §6。
+const DEFAULT_WORKERS: usize = 64;
 
 /// DNS UDP 应答在隧道内可承载的报文上限（proto.MaxDNSPayload53）。
 pub const MAX_DNS_PAYLOAD_53: usize = 1232;
@@ -344,6 +348,8 @@ pub struct DnsConfig {
     pub fallback_dns: String,
     pub budget: Duration,
     pub max_in_flight: usize,
+    /// worker 池线程数（0 = `DEFAULT_WORKERS`；测试注入小值以钉并发语义）。
+    pub workers: usize,
 }
 
 impl Default for DnsConfig {
@@ -353,6 +359,7 @@ impl Default for DnsConfig {
             fallback_dns: DEFAULT_FALLBACK.to_owned(),
             budget: DEFAULT_BUDGET,
             max_in_flight: MAX_IN_FLIGHT,
+            workers: DEFAULT_WORKERS,
         }
     }
 }
@@ -367,6 +374,7 @@ impl DnsConfig {
                 self.fallback_dns
             },
             max_in_flight: if self.max_in_flight == 0 { MAX_IN_FLIGHT } else { self.max_in_flight },
+            workers: if self.workers == 0 { DEFAULT_WORKERS } else { self.workers },
             ..self
         }
     }
@@ -418,21 +426,31 @@ impl DnsProxy {
         });
         let in_flight = Arc::new(AtomicUsize::new(0));
         let job_rx = Arc::new(Mutex::new(job_rx));
-        for _ in 0..WORKERS {
-            let core = Arc::clone(&core);
-            let job_rx = Arc::clone(&job_rx);
-            let in_flight = Arc::clone(&in_flight);
-            std::thread::Builder::new()
+        let mut started = 0usize;
+        for _ in 0..cfg.workers {
+            let c2 = Arc::clone(&core);
+            let job_rx2 = Arc::clone(&job_rx);
+            let in_flight2 = Arc::clone(&in_flight);
+            match std::thread::Builder::new()
                 .name("homeway-dns".into())
                 .stack_size(512 * 1024)
                 .spawn(move || loop {
-                    let job = { job_rx.lock().expect("作业队列锁中毒").recv() };
+                    let job = { job_rx2.lock().expect("作业队列锁中毒").recv() };
                     let Ok(job) = job else { return };
-                    let resp = core.respond(&job.query, job.is_tcp);
+                    let resp = c2.respond(&job.query, job.is_tcp);
                     let _ = job.reply_to.send(DnsReply { tag: job.tag, resp });
-                    in_flight.fetch_sub(1, Ordering::Relaxed);
-                })
-                .expect("spawn dns worker");
+                    in_flight2.fetch_sub(1, Ordering::Relaxed);
+                }) {
+                Ok(_) => started += 1,
+                Err(e) => {
+                    // worker 数从 2→64 后 spawn 失败概率上升（EMFILE 等）：记行并按已起数继续
+                    (core.logf)(&format!("⚠️ dns: worker 线程起不来（{e}）——已起 {started} 条"));
+                    break;
+                }
+            }
+        }
+        if started == 0 {
+            (core.logf)("⚠️ dns: 没有可用 worker——代答不可用（上游查询不会被处理）");
         }
         (
             Arc::new(Self { core, job_tx, reply_tx, in_flight }),
@@ -628,10 +646,17 @@ impl ResponderCore {
 
 /// 向单个上游转发一条查询（UDP，TC 切 TCP）。应答回填原始 ID；只接受来自该 socket、
 /// ID 与 question 段匹配的应答（防投毒/串答）。连接层失败 = None；否定应答原样透传。
+///
+/// **本腿期限是绝对期限**（F4a，对齐 Go `conn.SetDeadline(now+budget)`，`server.go:415`）：
+/// `budget` = 调用方给的**本腿上试预算**（`per_try`，末次腿不吃上限），循环里每次
+/// `recv` 前按剩余重设读超时——`SO_RCVTIMEO` 是 per-syscall，灌不匹配包的坏上游
+/// 此前可让该 worker **永不返回**（配合 worker 数少 = 全通道瘫痪）。
+/// 全局 `deadline` **仍只喂 TC→TCP 分支**（不改 `MAX_PER_TRY` 与上游回退序语义）。
 fn exchange(addr: &str, query: &[u8], budget: Duration, deadline: Instant) -> Option<Vec<u8>> {
     if budget.is_zero() {
         return None;
     }
+    let attempt_deadline = Instant::now() + budget; // 本腿绝对期限（per-attempt）
     let orig_id = u16::from_be_bytes([query[0], query[1]]);
     let mut fwd = [0u8; 2];
     getrandom::getrandom(&mut fwd).ok()?;
@@ -642,11 +667,17 @@ fn exchange(addr: &str, query: &[u8], budget: Duration, deadline: Instant) -> Op
     let raddr: SocketAddr = resolve_udp_addr(addr)?;
     let conn = UdpSocket::bind(if raddr.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" }).ok()?;
     conn.connect(raddr).ok()?; // 每查询新 socket = 随机源端口
-    conn.set_read_timeout(Some(budget)).ok()?;
+    conn.set_read_timeout(Some(budget)).ok()?; // 初值（循环顶按本腿剩余重设）
     conn.send(&q).ok()?;
     let qend = skip_name(&q, 12)?;
     let mut buf = vec![0u8; UDP_BUF];
     loop {
+        // 每轮按本腿剩余重设（绝对期限收敛——continue 不续命）
+        let remain = attempt_deadline.saturating_duration_since(Instant::now());
+        if remain.is_zero() {
+            return None;
+        }
+        conn.set_read_timeout(Some(remain)).ok()?;
         let n = conn.recv(&mut buf).ok()?;
         if n < 12 {
             continue;
@@ -678,19 +709,23 @@ fn exchange(addr: &str, query: &[u8], budget: Duration, deadline: Instant) -> Op
 
 /// 经 TCP 向上游重查：发**原始查询报文**（重新随机事务 ID），读单条应答并校验
 /// (ID, question)。失败回退 = 入参的 UDP 截断应答（TC 保持，客户端可自行重试）。
+/// 拨号带期限（F4b：`to_socket_addrs` + 逐地址 `connect_timeout`，对齐 Go
+/// `net.Dialer{Timeout: budget}`，`server.go:460`——修前是 OS 默认，macOS 可达 ~75s）。
 fn exchange_tcp(addr: &str, query: &[u8], udp_resp: &[u8], budget: Duration) -> Option<Vec<u8>> {
-    let mut conn = TcpStream::connect(resolve_udp_addr(addr)?).ok()?;
-    // 拨号与读共用同一绝对期限（tarpit 上游不能把单查询推到 ~2×perTry）
-    conn.set_read_timeout(Some(budget)).ok()?;
-    conn.set_write_timeout(Some(budget)).ok()?;
+    let deadline = Instant::now() + budget;
+    let conn = connect_within(addr, deadline)?;
+    // 拨号 + 读写**共用同一绝对期限**（tarpit 上游不能把单查询推到 ~2×perTry）：
+    // `SO_RCVTIMEO` 是 per-syscall，只设一次会被「每 <budget 送 1 字节」的滴流无限续命
+    // （`read_exact` 内部循环同理）⇒ 走逐 syscall 收敛的 `DeadlineIo`。
+    let mut io = DeadlineIo { sock: &conn, deadline };
     let orig_id = u16::from_be_bytes([query[0], query[1]]);
     let mut q = query.to_vec();
     let mut id = [0u8; 2];
     getrandom::getrandom(&mut id).ok()?;
     let new_id = u16::from_be_bytes(id);
     q[0..2].copy_from_slice(&new_id.to_be_bytes());
-    write_tcp_message(&mut conn, &q).ok()?;
-    let resp = read_tcp_message(&mut conn).ok()?;
+    write_tcp_message(&mut io, &q).ok()?;
+    let resp = read_tcp_message(&mut io).ok()?;
     if resp.len() < 12 {
         return Some(udp_resp.to_vec());
     }
@@ -749,6 +784,54 @@ fn dial_addr(up: &str) -> String {
 
 fn resolve_udp_addr(addr: &str) -> Option<SocketAddr> {
     addr.to_socket_addrs().ok()?.next()
+}
+
+/// 期限感知读（F4b 收口）：每次 syscall 前按**绝对期限**剩余重设 `SO_RCVTIMEO`——零即
+/// 立即报超时（`read_exact` 的内部循环同样受界；逐字节滴流无法靠「每次成功读续命」）。
+struct DeadlineIo<'a> {
+    sock: &'a TcpStream,
+    deadline: Instant,
+}
+
+impl std::io::Read for DeadlineIo<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+        let remain = self.deadline.saturating_duration_since(Instant::now());
+        if remain.is_zero() {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "dns: TCP 腿预算耗尽"));
+        }
+        self.sock.set_read_timeout(Some(remain))?;
+        self.sock.read(buf)
+    }
+}
+
+impl std::io::Write for DeadlineIo<'_> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let remain = self.deadline.saturating_duration_since(Instant::now());
+        if remain.is_zero() {
+            return Err(std::io::Error::new(std::io::ErrorKind::TimedOut, "dns: TCP 腿预算耗尽"));
+        }
+        self.sock.set_write_timeout(Some(remain))?;
+        self.sock.write(buf)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.sock.flush()
+    }
+}
+
+/// 带期限拨号（F4b/F7 共用形态）：`to_socket_addrs` + 逐地址 `connect_timeout(剩余)`；
+/// 剩余为零即放弃。
+fn connect_within(addr: &str, deadline: Instant) -> Option<TcpStream> {
+    let addrs = addr.to_socket_addrs().ok()?;
+    for a in addrs {
+        let remain = deadline.saturating_duration_since(Instant::now());
+        if remain.is_zero() {
+            return None;
+        }
+        if let Ok(c) = TcpStream::connect_timeout(&a, remain) {
+            return Some(c);
+        }
+    }
+    None
 }
 
 /// 构造自验证查询（随机 ID + 一次性域名，避免命中任何缓存）。
@@ -1110,6 +1193,169 @@ mod tests {
         assert_eq!(dial_addr("127.0.0.1:15353"), "127.0.0.1:15353");
         assert_eq!(dial_addr("fd00::1"), "[fd00::1]:53");
         assert_eq!(dial_addr("[fd00::1]:53"), "[fd00::1]:53");
+    }
+
+    // ---------- F4a 本腿绝对期限（per-attempt） ----------
+
+    /// **核心回归（修前红/挂死）**：坏上游持续灌「错误 ID + 短包」，按**生产形态**
+    /// 构造（`budget = 200ms`、全局 `deadline = now + 2500ms`）⇒ `exchange` 必须在
+    /// 本腿期限（~200ms）内判负返回 `None`。若误把全局 deadline 当本腿期限重设，
+    /// 用例会跑满 2.5s（> 1s 阈值 ⇒ 红）；修前（per-syscall 续命）则永不返回。
+    #[test]
+    fn exchange_absolute_deadline_under_poison_upstream() {
+        let up = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let up_addr = format!("127.0.0.1:{}", up.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            let Ok((_n, from)) = up.recv_from(&mut buf) else { return };
+            // 灌包 2s（跨过 2×budget）：错误 ID 的应答 + 短包交替。poison 的 **question
+            // 段用别的域名**（即便 0xBEEF 与随机 new_id 撞车，question 比对也会拒）——
+            // 修前 1/65536 概率的假绿/假红已消除。
+            let poison = a_response("poison.test", 0xBEEF, 5, &[0x0102_0304]);
+            let t0 = Instant::now();
+            while t0.elapsed() < Duration::from_secs(2) {
+                let _ = up.send_to(&poison, from);
+                let _ = up.send_to(&[0u8; 8], from);
+            }
+        });
+        let q = a_query("fake.test", 0x1234);
+        let t0 = Instant::now();
+        let r = exchange(
+            &up_addr,
+            &q,
+            Duration::from_millis(200),
+            Instant::now() + Duration::from_millis(2500),
+        );
+        let dt = t0.elapsed();
+        assert!(r.is_none(), "灌包下必须按本腿期限判负（得 {r:?}）");
+        assert!(
+            dt < Duration::from_millis(1000),
+            "本腿绝对期限（per-attempt ≈200ms；误用全局 deadline ⇒ ~2.5s）应生效（实 {dt:?}）"
+        );
+    }
+
+    // ---------- F4b TCP 腿拨号期限 ----------
+
+    /// 期限已过 ⇒ 立即放弃（不进入拨号）；黑洞形态（TEST-NET，无对端应答）也须
+    /// 在 `budget + 余量` 内返回。注：拨号失败返 `None`（由 `exchange` 调用方回退到
+    /// UDP 截断应答，既有语义）；本用例只钉**受界性**（修前无期限 = OS 默认可达 ~75s）。
+    #[test]
+    fn tcp_leg_connect_bounded() {
+        let t0 = Instant::now();
+        assert!(connect_within("192.0.2.1:53", Instant::now()).is_none(), "期限已过应放弃");
+        assert!(t0.elapsed() < Duration::from_millis(100), "零剩余不得阻塞：{:?}", t0.elapsed());
+        let q = a_query("blackhole.test", 0x2222);
+        let udp_resp = a_response("blackhole.test", 0x2222, 5, &[1]);
+        let t0 = Instant::now();
+        let _ = exchange_tcp("192.0.2.1:53", &q, &udp_resp, Duration::from_millis(300));
+        let dt = t0.elapsed();
+        assert!(dt < Duration::from_millis(1000), "拨号须带期限（budget=300ms；实 {dt:?}）");
+    }
+
+    /// **M1 回归**：TCP 腿滴流上游（长度前缀声明 0xFFFF，1 字节/100ms 持续 5s）⇒
+    /// `exchange_tcp` 按本腿绝对期限（300ms）收口返回（修前 `read_exact` 每字节续命，
+    /// 最坏 ≈(2+65535)×budget）。用例在两种形态下都有界（修前 ~5s+ ⇒ 阈值 1s 判红）。
+    #[test]
+    fn tcp_leg_read_bounded_under_dribble() {
+        use std::io::{Read as _, Write as _};
+        let ln = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let addr = format!("127.0.0.1:{}", ln.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            for conn in ln.incoming().flatten() {
+                let mut c = conn;
+                // 读掉 2B 长度前缀 + 正文（尽力而为），随后滴流一段「大声明」响应
+                let mut req = [0u8; 512];
+                let _ = c.read(&mut req);
+                let mut out: Vec<u8> = vec![0xFFu8, 0xFF]; // 声明 65535 字节
+                let t0 = Instant::now();
+                while t0.elapsed() < Duration::from_secs(5) {
+                    out.push(0x41);
+                    if c.write_all(&out).is_err() {
+                        return;
+                    }
+                    out.clear();
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+            }
+        });
+        let q = a_query("dribble.test", 0x3333);
+        let udp_resp = a_response("dribble.test", 0x3333, 5, &[1]);
+        let t0 = Instant::now();
+        let _ = exchange_tcp(&addr, &q, &udp_resp, Duration::from_millis(300));
+        let dt = t0.elapsed();
+        assert!(dt < Duration::from_secs(1), "TCP 腿读须按绝对期限收口（实 {dt:?}）");
+    }
+
+    // ---------- F4c worker 池并发 ----------
+
+    /// 并发 fake 上游（按请求起线程应答，避免 responder 串行化污染测量）：
+    /// workers=8 + 8 条查询 ⇒ 总耗时远小于串行理论值（8×300ms）；workers=1 的控制臂
+    /// 反向钉死（3 条查询 ≥ 2× 单条时延）。
+    #[test]
+    fn worker_pool_concurrency() {
+        fn fake_upstream(delay: Duration) -> String {
+            let up = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+            let addr = format!("127.0.0.1:{}", up.local_addr().unwrap().port());
+            std::thread::spawn(move || {
+                let up = std::sync::Arc::new(up);
+                let mut buf = [0u8; 1500];
+                loop {
+                    let Ok((n, from)) = up.recv_from(&mut buf) else { return };
+                    let req = buf[..n].to_vec();
+                    let up2 = std::sync::Arc::clone(&up);
+                    std::thread::spawn(move || {
+                        std::thread::sleep(delay);
+                        let mut r = a_response("cc.test", 0, 5, &[0x7f00_0001]);
+                        r[0..2].copy_from_slice(&req[..2]);
+                        let _ = up2.send_to(&r, from);
+                    });
+                }
+            });
+            addr
+        }
+        fn run(workers: usize, n: usize, up_addr: &str) -> Duration {
+            let dir = std::env::temp_dir().join(format!(
+                "homeway-rs-dnswk-{}-{}-{}",
+                std::process::id(),
+                workers,
+                std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().subsec_nanos()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            std::fs::write(dir.join("resolv.conf"), format!("nameserver {up_addr}\n")).unwrap();
+            let (logf, dlogf) = noop();
+            let (proxy, events) = DnsProxy::spawn(
+                DnsConfig {
+                    resolv_path: dir.join("resolv.conf").to_string_lossy().into_owned(),
+                    // 兜底也指 fake（防真实外联；也避免"真兜底快速应答"造成的假绿）
+                    fallback_dns: up_addr.to_owned(),
+                    workers,
+                    budget: Duration::from_secs(5),
+                    ..Default::default()
+                },
+                logf,
+                dlogf,
+            );
+            let t0 = Instant::now();
+            for i in 0..n {
+                assert_eq!(proxy.submit_udp(i as u64 + 1, a_query("cc.test", i as u16 + 1)), SubmitOutcome::Accepted);
+            }
+            for _ in 0..n {
+                events.recv_timeout(Duration::from_secs(5)).expect("应答应到达");
+            }
+            let dt = t0.elapsed();
+            let _ = std::fs::remove_dir_all(&dir);
+            dt
+        }
+        // 生产缺省 = 64（F4c 的注入面之外，钉住默认值本身）
+        assert_eq!(DnsConfig::default().filled().workers, DEFAULT_WORKERS);
+        assert_eq!(DEFAULT_WORKERS, 64);
+        let up = fake_upstream(Duration::from_millis(300));
+        let parallel = run(8, 8, &up);
+        // 串行理论值 = 8 × 300ms = 2.4s；并行 ≈300ms。阈值 1.2s = 串行值的 1/2（两侧 ≥2× 余量）
+        assert!(parallel < Duration::from_millis(1200), "8 workers × 8 查询应并行（实 {parallel:?}）");
+        let serial = run(1, 3, &up);
+        // 单 worker：3 条 × 300ms = 900ms 理论；断言 ≥ 600ms（≥2× 余量，防串行臂被误判并行）
+        assert!(serial >= Duration::from_millis(600), "单 worker 形态应串行（实 {serial:?}）");
     }
 
     /// 上游跟随：文件变更后 1s 节流窗内取 last-good、窗口后跟随。

@@ -311,7 +311,10 @@ impl<'a> Stream<'a> {
         }
     }
 
-    /// 读一行（≤64KB；去 EOL；无期限——传输期）。
+    /// 读一行（去 EOL；**无上限——响应面**：客户端只读响应行/问候帧，请求行上限
+    /// 是服务端的事（见 `files_server::read_line`）；口径与 `facade/files_op.rs`
+    /// 的 `read_line_capped(false)` 一致——服务端内联上限 16MB 与 list 大目录 JSON
+    /// 都可超 64KB，卡上限会把合法响应判死。无期限——传输期）。
     fn read_line(&mut self) -> Result<Vec<u8>, FilesError> {
         self.read_line_opt(None)
     }
@@ -328,13 +331,7 @@ impl<'a> Stream<'a> {
                 while matches!(line.last(), Some(b'\n') | Some(b'\r')) {
                     line.pop();
                 }
-                if line.len() > MAX_REQUEST_LINE {
-                    return Err(transport("行超过 64KB 上限"));
-                }
                 return Ok(line);
-            }
-            if self.buf.len() > MAX_REQUEST_LINE {
-                return Err(transport("行超过 64KB 上限"));
             }
             let chunk = match deadline {
                 Some(d) => self.next_chunk_timeout(d)?,
@@ -877,6 +874,38 @@ mod tests {
             if let Err(e) = g {
                 std::panic::resume_unwind(e);
             }
+        }
+    }
+
+    /// F2：客户端**响应行不设上限**（对齐 `facade/files_op.rs` 的 `read_line_capped(false)`；
+    /// 原 64KB 门是服务端请求行上限的**误移植**）。200KB 的 list 响应行 + 12MB 的 text
+    /// 响应行都必须读通——修前第二条必报「行超过 64KB 上限」。
+    /// 注：直接打 `read_line`（= `call()` 的读侧；写请求侧不涉及本上限，且测试构造的
+    /// dangling Session 不可走写路径）。
+    #[test]
+    fn response_line_over_64k_accepted() {
+        let big = format!(
+            r#"{{"ok":true,"entries":[{}]}}"#,
+            (0..2000)
+                .map(|i| format!(
+                    r#"{{"name":"file-{i:04}-xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx","isDir":false,"size":1,"mtimeMs":1}}"#
+                ))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert!(big.len() > 3 * 64 * 1024, "构造 64KB 门 3 倍以上的响应行（实 {}B）", big.len());
+        let text_line = format!(r#"{{"ok":true,"text":"{}"}}"#, "a".repeat(12 << 20));
+        for line in [big, text_line] {
+            let mut stream = line.into_bytes();
+            stream.push(b'\n');
+            let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, ConnErr>>();
+            std::thread::spawn(move || {
+                let _ = tx.send(Ok(stream));
+            });
+            let mut s = Stream::from_rx(rx);
+            let got = s.read_line().expect(">64KB 响应行必须读通（F2 去掉误移植的 64KB 门）");
+            assert!(got.len() > 64 * 1024, "实收 {}B", got.len());
+            std::mem::forget(s); // 测试构造不 drop
         }
     }
 

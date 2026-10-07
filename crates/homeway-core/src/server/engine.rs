@@ -403,12 +403,19 @@ impl ServeEngine {
                         cfg.files_port
                     ));
                     let stop = spawn_service_stop_flag(&mut stop_flags);
-                    std::thread::Builder::new()
+                    let d2 = Arc::clone(&dlogf);
+                    let d3 = Arc::clone(&dlogf);
+                    if let Err(e) = std::thread::Builder::new()
                         .name("homeway-files".into())
                         .spawn(move || {
-                            let _ = fsrv.serve_stoppable(ln, stop);
+                            // F5：只 Fatal（监听面真没了）退工——退工记行（修前静默 `let _ =`）
+                            if let Err(e) = fsrv.serve_stoppable(ln, stop) {
+                                (d2)(&format!("files: 服务线程退工（{e}）——文件管理不可用，直到重启出口"));
+                            }
                         })
-                        .ok();
+                    {
+                        (d3)(&format!("⚠️ files: 服务线程起不来（{e}）——监听点无人受理（文件管理不可用）"));
+                    }
                 }
                 Err(e) => {
                     (logf)(&format!(
@@ -432,12 +439,19 @@ impl ServeEngine {
                 ));
                 let stop = spawn_service_stop_flag(&mut stop_flags);
                 let srv2 = Arc::clone(&speed_srv);
-                std::thread::Builder::new()
+                let d2 = Arc::clone(&dlogf);
+                let d3 = Arc::clone(&dlogf);
+                if let Err(e) = std::thread::Builder::new()
                     .name("homeway-speedtest".into())
                     .spawn(move || {
-                        let _ = srv2.serve_stoppable(ln, stop);
+                        // F5：只 Fatal 退工——退工记行（修前静默 `let _ =`）
+                        if let Err(e) = srv2.serve_stoppable(ln, stop) {
+                            (d2)(&format!("speedtest: 服务线程退工（{e}）——测速不可用，直到重启出口"));
+                        }
                     })
-                    .ok();
+                {
+                    (d3)(&format!("⚠️ speedtest: 服务线程起不来（{e}）——监听点无人受理（测速不可用）"));
+                }
             }
             Err(e) => {
                 (logf)(&format!(
@@ -875,18 +889,29 @@ impl Drop for ServeEngine {
 
 /// UPnP 退出缩租（shrinkUPnPClease：把映射租期缩到 5 分钟——快速重启沿用同一外口，
 /// 出口真退休了映射自动过期；装配早失败时没有要缩租的映射）。
+/// F10：**全局 8s 预算**（Go serve.go:728 单 ctx）——期限穿透到 SSDP/描述腿，候选循环
+/// 共享同一 deadline（修前每候选 5s(SSDP) + 8s(SOAP) ⇒ 停机最坏 N×13s）；结果显式
+/// 归因（静默跳过变可见）。
 pub fn shrink_upnp_lease(engine: &ServeEngine, logf: &Logf) {
     let port = engine.local_port;
     let cands = crate::server::upnp::local_ipv4_candidates();
-    for cand in cands {
-        // 缩租路径独立 8s 预算（Go serve.go:728-739 ctx——收工不被慢网关拖死）
-        let Ok(g) = crate::server::upnp::discover_igd(cand, crate::server::upnp::UPNP_SHRINK_BUDGET) else { continue };
-        if let Some((ext, internal)) = g.find_our_mapping(crate::server::upnp::UPNP_MAP_DESC, cand, port) {
-            if g.re_add_short_lease(ext, cand, internal, 300).is_ok() {
-                (logf)(&format!("UPnP：退出前把映射 外部 {ext} 的租期缩到 5 分钟（快速重启仍会沿用这个端口）"));
-            }
+    let deadline = std::time::Instant::now() + crate::server::upnp::UPNP_SHRINK_TOTAL_BUDGET;
+    match crate::server::upnp::shrink_lease_before(&cands, port, deadline) {
+        crate::server::upnp::ShrinkOutcome::Shrunk { ext } => {
+            (logf)(&format!("UPnP：退出前把映射 外部 {ext} 的租期缩到 5 分钟（快速重启仍会沿用这个端口）"));
         }
-        return;
+        crate::server::upnp::ShrinkOutcome::NoIgd => {
+            (logf)("UPnP：缩租跳过——8s 预算内没找到可用 IGD（映射保持原租期，自动过期）");
+        }
+        crate::server::upnp::ShrinkOutcome::TableIncomplete => {
+            (logf)("UPnP：缩租跳过——映射表枚举残缺（清单不可信，不当作「没有映射」；映射保持原租期）");
+        }
+        crate::server::upnp::ShrinkOutcome::NoMapping => {
+            (logf)("UPnP：缩租跳过——路由器表里没有我们的映射");
+        }
+        crate::server::upnp::ShrinkOutcome::Failed { ext, err } => {
+            (logf)(&format!("UPnP：缩租失败（外部 {ext}：{err}）——原映射仍在，租期到期自动过期"));
+        }
     }
 }
 
@@ -1425,7 +1450,9 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
         } else {
             let d2 = ctx.logf.clone();
             let logf2: Logf = Arc::clone(&d2);
-            match crate::server::upnp::ensure_port_mapping(&cands, ctx.local_port, &*logf2, &*logf2) {
+            // 全局 40s 预算贯穿「映射 + 外网 IP 查询」两步（Go publicendpoint.go:141 单 ctx）
+            let upnp_deadline = std::time::Instant::now() + crate::server::upnp::UPNP_TOTAL_BUDGET;
+            match crate::server::upnp::ensure_port_mapping(&cands, ctx.local_port, &*logf2, &*logf2, upnp_deadline) {
                 Err(e) => {
                     (ctx.logf)(&format!(
                         "UPnP：未取得端口映射（{e}）；出口在 NAT 后时可在路由器上手动把 UDP {} 转发到本机（候选 {:?}）",
@@ -1438,7 +1465,7 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
                         "UPnP：已建立端口映射 外部 UDP {ext} → {used}:{}（重启时从路由器表认领，不需本地文件）",
                         ctx.local_port
                     ));
-                    if let Ok(g) = crate::server::upnp::discover_igd(used, crate::server::upnp::UPNP_TOTAL_BUDGET) {
+                    if let Ok(g) = crate::server::upnp::discover_igd(used, upnp_deadline) {
                         if let Ok(ip) = g.external_ip() {
                             if egress::is_public_addr(IpAddr::V4(ip)) {
                                 wan_ip = Some(ip);
