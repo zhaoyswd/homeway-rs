@@ -1033,9 +1033,10 @@ fn driver_loop(
                 EngineCmd::LegsClear => bind.clear_legs(),
             }
         }
-        // ② UDP 收包（等待原语两档，R8-3 8i 拍频自适应）：
-        //    - 整形滞留非空：1ms 拍（每拍续水 rate×1ms、线上团块随之细化）；
-        //    - 滞留空：5ms 常规拍（不加空转唤醒成本）。
+        // ② UDP 收包（等待原语两档；reactor 批起 = wait_hint 扩档）：
+        //    - 整形滞留非空 ∨ reactor 存在等待者（connect 在途/待写缓冲非空）：1ms 拍
+        //     （每拍续水 rate×1ms、线上团块细化；上游事件最晚 1ms 被发现）；
+        //    - 否则：5ms 常规拍（不加空转唤醒成本）。
         //    腿 fd 同轮在等待集（R4：控制面通告建立的腿与主 socket 同构收包）。
         // 负 fd 防御（r2-2.4：理论上不可达——腿 fd 只取活 socket——防御位）
         let leg_fds: Vec<i32> = bind
@@ -1048,7 +1049,7 @@ fn driver_loop(
         for fd in &leg_fds {
             pollfds.push(libc::pollfd { fd: *fd, events: libc::POLLIN, revents: 0 });
         }
-        let poll_ms: libc::c_int = match intercept.tx_shape_wait() {
+        let poll_ms: libc::c_int = match intercept.wait_hint() {
             Some(_) => 1,
             None => 5,
         };

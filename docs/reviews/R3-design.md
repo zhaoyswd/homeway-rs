@@ -225,7 +225,9 @@ TX（拦截栈 poll 出的包，encap 前）:
   从 SocketSet 移除后映射才删（TIME_WAIT 期保留）；rw_port 复用 = 映射删除后可再分配
   （分配器跳过在用）。UDP 映射随会话（idle/关闭即删）。**Drain/HaltNew 语义**
   （M13）：① HaltNew 后新 TCP 一律 RST、新 UDP 一律 ICMP（无日志——Go 同）；② 关 UDS
-  listeners；③ 宽限内自然收销账、到期 `Close{linger_rst}` RST；④ 关 WG socket；
+  listeners；③ 宽限内自然收销账、到期 `Close{linger_rst}` RST（**差异登记**：Rust 侧
+  linger_rst 路径从未接线——宽限到期 close() 一直走 FIN teardown；reactor 简化批
+  〔评审 R-15〕删除该死分支时正式登记）；④ 关 WG socket；
   ⑤ DNS/服务/观测收工。
 - **栈内 socket 选项**（M12，接 R2 低-10）：过境/豁免 TCP socket `set_timeout(Some(idle))`
   （smoltcp 0.11 socket/tcp.rs:612——**精确 idle 回收**，替代 R2 客户端侧的「拍检查
