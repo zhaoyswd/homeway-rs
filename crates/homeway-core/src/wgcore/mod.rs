@@ -45,8 +45,9 @@ use self::stackb::{DialError, StackB};
 /// TUN 面错误回调类型（fd 读写失败 → facade markUnhealthy；driver 线程执行）。
 pub type OnTunError = Box<dyn Fn(&str) + Send>;
 
-/// 出口隧道 IP 的契约常量（两端共同，dns-host-resolver 起钉死；非 token 派生）。
-pub const SERVER_TUNNEL_IP: Ipv4Addr = Ipv4Addr::new(100, 64, 255, 1);
+/// 出口隧道 IP 的契约常量（**单一真源已迁至 `crate::tunnel_addr`**——F11 撞车守卫与
+/// 两个派生函数同域判定；此处保留再导出以免大范围改引用点）。
+pub use crate::tunnel_addr::SERVER_TUNNEL_IP;
 /// poll 等待上限（smoltcp poll_delay 的封顶；延迟 ACK 10ms 一类栈定时器的到点保障）。
 const POLL_CAP: i32 = 250;
 /// 8s 密集 ACK 时钟：有界 drain 的**栈字节阈值**（D-3；设计 docs/reviews/R8.md

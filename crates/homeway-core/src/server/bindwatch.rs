@@ -330,6 +330,7 @@ mod tests {
             IfaceInfo {
                 name: name.to_owned(),
                 index,
+                index_ok: index != 0,
                 addrs: vec![std::net::Ipv4Addr::new(192, 0, 2, index as u8)],
                 cidrs: vec![format!("192.0.2.{index}/24")],
                 up: true,

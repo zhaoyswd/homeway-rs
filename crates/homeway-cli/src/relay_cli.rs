@@ -185,6 +185,8 @@ pub fn assemble_relay(
     let auth = if a.open { None } else { Some(secret) };
     let mut cfg = Config::new(a.listen, auth, log2.logf_fn());
     cfg.no_hints = a.no_hints;
+    // F9：探针应答上报真实构建（此前 `Config.build` 全仓无赋值 ⇒ 恒 "relay-dev"）
+    cfg.build = homeway_core::BUILD_STR.to_owned();
     let relay = Relay::new(cfg);
     let adv = a.advertise;
     let on_ready = move |port: u16| match rltoken::build_token(

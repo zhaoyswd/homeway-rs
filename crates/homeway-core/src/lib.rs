@@ -37,6 +37,10 @@ pub mod udpbatch;
 pub mod wgcore;
 pub mod wtransport;
 
+/// 构建标记（探针应答 `build` 字段 / 出口能力行的单一真源）。中继与出口共用——
+/// 中继此前 `Config.build` 全仓无赋值 ⇒ 恒 `"relay-dev"`（F9：探针应答上报真实构建）。
+pub const BUILD_STR: &str = "homeway-rs-dev";
+
 /// 端口转发失败码（portfwd/err 词表——tier 台账 422 单元之一；Display = 线上词面）。
 /// bind_failed = 本地监听建不起来（映射不可用但隧道不受影响）；dial_failed /
 /// invalid_target 为登记保留值（本核形态尚不产出——词汇门允许缺席表在册）。

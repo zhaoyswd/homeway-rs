@@ -110,6 +110,10 @@ pub fn is_virtual_iface(name: &str) -> bool {
 pub struct IfaceInfo {
     pub name: String,
     pub index: u32,
+    /// `index` 是否可用（`if_nametoindex` 非 0）。F12：0 时**不可钉卡**——darwin 上
+    /// `IP_BOUND_IF=0` 是「解绑」且 `setsockopt` 会成功，若不守卫就会把「解绑」误报成
+    /// 「已钉卡」（判据反向）。E21 判据行仍按既有形态渲染 `index=0`（不改取值路径）。
+    pub index_ok: bool,
     pub addrs: Vec<Ipv4Addr>,
     /// `ip/prefix` 形态（netmask 换算——E21 判据行的 `addrs=[192.168.3.12/24]` 面）。
     pub cidrs: Vec<String>,
@@ -134,7 +138,7 @@ pub fn interfaces() -> Vec<IfaceInfo> {
                 let flags = ifa.ifa_flags;
                 let e = map.entry(name.clone()).or_insert_with(|| {
                     order.push(name.clone());
-                    IfaceInfo { name: name.clone(), index: 0, addrs: Vec::new(), cidrs: Vec::new(), up: false, loopback: false }
+                    IfaceInfo { name: name.clone(), index: 0, index_ok: false, addrs: Vec::new(), cidrs: Vec::new(), up: false, loopback: false }
                 });
                 e.up = e.up || (flags & libc::IFF_UP as u32) != 0;
                 e.loopback = e.loopback || (flags & libc::IFF_LOOPBACK as u32) != 0;
@@ -162,9 +166,23 @@ pub fn interfaces() -> Vec<IfaceInfo> {
         libc::freeifaddrs(ifap);
         let mut out: Vec<IfaceInfo> = order.into_iter().filter_map(|n| map.remove(&n)).collect();
         for e in &mut out {
-            e.index = libc::if_nametoindex(
+            let idx = libc::if_nametoindex(
                 std::ffi::CString::new(e.name.as_bytes()).expect("网卡名无 NUL").as_ptr(),
             );
+            e.index = idx;
+            // F12 最小守卫：返 0 不静默——记告警并把该卡标为「无 index / 不可钉」，
+            // **不进入「已钉卡」成功路径**（完整语义〔降级策略/AddAnyMapping/平台假设〕
+            // 挂 Q-J）。E21 `index=` 仍按 0 渲染（取值路径形态不变）。
+            if idx == 0 {
+                e.index_ok = false;
+                let errno = std::io::Error::last_os_error();
+                eprintln!(
+                    "⚠️ 绑卡：网卡 {} 取不到 index（if_nametoindex 返 0：{errno}）—— 该卡不可钉（不会进入「已钉卡」路径）",
+                    e.name
+                );
+            } else {
+                e.index_ok = true;
+            }
         }
         out
     }
@@ -188,6 +206,15 @@ pub fn physical_candidates() -> Vec<IfaceInfo> {
 /// 「v6 钉卡失败拖死 v4」（GAP-AUDIT P0-2 的根因），两族独立容错后 v6 路径可用性
 /// 不再受 v4 面牵连（反之亦然）。
 pub fn pin_socket_to_iface(fd: std::os::fd::RawFd, index: u32, name: &str) -> io::Result<()> {
+    // F12 最小守卫：index=0（if_nametoindex 失败/无该卡）**不可钉**——darwin 上
+    // `IP_BOUND_IF=0` 语义是「解绑」且 setsockopt 成功，直接下发会把「解绑」误报成
+    // 「已钉卡」（判据反向）。此处硬拒，让调用方走「钉不上卡」的既有降级路径。
+    if index == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "网卡 index 为 0（if_nametoindex 失败/无该卡）—— 不可钉卡",
+        ));
+    }
     unsafe {
         #[cfg(target_os = "macos")]
         {
@@ -737,6 +764,20 @@ mod tests {
         let (mapped, rtt) = probe_stun(None, &[target], Duration::from_secs(3)).expect("应探通");
         assert_eq!(mapped, SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)));
         assert!(rtt < Duration::from_secs(3));
+    }
+
+    /// F12：`if_nametoindex` 返 0（不存在网卡名）⇒ 不静默——标「不可钉」且钉卡硬拒
+    /// （不进入「已钉卡」成功路径）；E21 `index=` 取值路径形态不变（仍渲染 0）。
+    #[test]
+    fn if_nametoindex_zero_is_not_pinned() {
+        let ifaces = interfaces();
+        for i in &ifaces {
+            assert_eq!(i.index_ok, i.index != 0, "index_ok 必须与 index 一致：{i:?}");
+        }
+        // 不存在的网卡名 ⇒ index=0 ⇒ 硬拒（不误报「已钉卡」）
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&UdpSocket::bind("127.0.0.1:0").unwrap());
+        let e = pin_socket_to_iface(fd, 0, "hw-no-such-iface").unwrap_err();
+        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
     }
 
 /// 测试面：解析请求拿 txid。

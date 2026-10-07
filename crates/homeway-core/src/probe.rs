@@ -24,6 +24,10 @@ pub const VERSION: u8 = 1;
 pub const TYPE_PING: u8 = 1;
 /// 端点列表段条数上限（出口与消费侧同约束）。
 pub const MAX_ENDPOINTS: usize = 8;
+/// 探针 flags：**中继命名空间**的「控制面降级」位（F10）。bit0–4 是 serve 的 udpcap
+/// （`engine.rs` UDPCAP_*），故中继位从 bit5 起——按位掩码消费方（客户端只按位取用）
+/// 追加位安全。
+pub const FLAG_RELAY_CTL_DEGRADED: u8 = 1 << 5;
 
 const REQ_MAGIC: [u8; 3] = *b"HWQ";
 const RESP_MAGIC: [u8; 3] = *b"HWR";
@@ -92,9 +96,13 @@ pub fn respond_ex(req: &[u8], build: &str, flags: u8, endpoints: &[SocketAddr]) 
     base.extend_from_slice(&nonce);
     match typ {
         TYPE_PING => {
-            let build = if build.len() > 32 { &build[..32] } else { build };
-            base.push(build.len() as u8);
-            base.extend_from_slice(build.as_bytes());
+            // **字节截断**（与 Go `probe.go:173-174` 的 `build[:maxBuild]` 逐字同形、且
+            // **不 panic**）。不用 `floor_char_boundary`：多字节字符跨界时会少发 1–3 字节、
+            // 长度字节也跟着变 ⇒ 引入未登记的 wire 差异。
+            let b = build.as_bytes();
+            let n = b.len().min(32);
+            base.push(n as u8);
+            base.extend_from_slice(&b[..n]);
             base.push(flags);
         }
         _ => return None, // 未知类型：忽略（前向兼容）
@@ -324,6 +332,27 @@ mod tests {
         let mut bad = resp.clone();
         bad[0] = b'X';
         assert!(decode_response(&bad, &nonce).is_err());
+    }
+
+    /// F9：build 串按**字节**截断（与 Go `probe.go:173-174` 同形），非 ASCII 跨界不 panic。
+    #[test]
+    fn respond_build_byte_truncation_no_panic() {
+        let nonce = [1u8; 8];
+        let req = encode_request(TYPE_PING, &nonce, 16);
+        // 31 个 ASCII + 一个 3 字节汉字 = 34 字节，汉字恰跨 32 字节边界
+        let build = format!("{}汉", "a".repeat(31));
+        assert!(build.len() > 32);
+        let resp = respond_ex(&req, &build, 0x20, &[]).unwrap();
+        let payload = &resp[13..];
+        assert_eq!(payload[0] as usize, 32, "长度字节 = 32（字节截断）");
+        assert_eq!(&payload[1..33], &build.as_bytes()[..32], "字节前缀与 Go 同形");
+        assert_eq!(payload[33], 0x20, "flags 紧随 build");
+        // 解码侧 lossy 读回不报错
+        assert!(decode_response(&resp, &nonce).is_ok());
+        // 纯 ASCII > 32 同样截断
+        let long = "b".repeat(40);
+        let r2 = respond_ex(&req, &long, 0, &[]).unwrap();
+        assert_eq!(r2[13] as usize, 32);
     }
 
     /// 消费卫兵：私网/回环/fake-IP/CGNAT 拒；全球单播 v4/v6 收。

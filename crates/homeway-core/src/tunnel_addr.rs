@@ -18,6 +18,11 @@ use crate::token::Secret;
 
 type HmacSha256 = Hmac<Sha256>;
 
+/// 出口隧道 IP 的契约常量（两端共同，dns-host-resolver 起钉死；非 token 派生）。
+/// **地址空间单一真源**（F11：从 `wgcore` 迁来，撞车守卫与两个派生函数同域判定）。
+/// `v = 65281` 落在 `derive_tunnel_ip` 的值域 `[1,65534]` 内 ⇒ 无守卫时设备可撞上。
+pub const SERVER_TUNNEL_IP: Ipv4Addr = Ipv4Addr::new(100, 64, 255, 1);
+
 fn hmac_sum(key: &[u8; 32], label: &[u8], pubkey: &[u8; 32]) -> [u8; 32] {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC 接受任意长密钥，不可达");
     mac.update(label);
@@ -38,12 +43,24 @@ fn addr_of(v: u16) -> Ipv4Addr {
 }
 
 /// 隧道侧地址（栈 B 本地地址 = 后端 peer allowed_ip 的第一条）。
+///
+/// **撞车守卫（F11，B 类有意分歧）**：结果恰为 `SERVER_TUNNEL_IP`（出口保留地址）时按
+/// `hw-tun.N`（N=2..=9）再散列。守卫在**两个派生函数共用**（`derive_tun_ip` 同域）——
+/// 服务端 `ip_taken` 是双地址并集判定。碰撞**可故意研磨**（设备自选公钥，~6.5e4 次可得），
+/// 且旧对端/fixtures 向量对该设备的地址**不一致 ⇒ 直接连不上**（已知代价，已登记）。
 pub fn derive_tunnel_ip(secret: &Secret, pubkey: &[u8; 32]) -> Ipv4Addr {
-    let sum = hmac_sum(secret.as_bytes(), b"hw-tun", pubkey);
-    addr_of(to_v(&sum, 0))
+    let mut ip = addr_of(to_v(&hmac_sum(secret.as_bytes(), b"hw-tun", pubkey), 0));
+    let mut i = 2u8;
+    while i <= 9 && ip == SERVER_TUNNEL_IP {
+        let label = format!("hw-tun.{i}");
+        ip = addr_of(to_v(&hmac_sum(secret.as_bytes(), label.as_bytes(), pubkey), 0));
+        i += 1;
+    }
+    ip
 }
 
-/// 应用面（TUN）第二派生地址；与隧道地址同设备相等时按 `hw-app.N`（N=2..=9）再散列。
+/// 应用面（TUN）第二派生地址；与隧道地址同设备相等时按 `hw-app.N`（N=2..=9）再散列，
+/// 并同样避开出口保留地址 `SERVER_TUNNEL_IP`（F11 守卫共用）。
 ///
 /// 守卫语义与 Go 循环逐拍对齐：`while i<=9 && ip == tunnel_ip { 用 hw-app.{i} 再散列; i+=1 }`
 /// ——真撞满 8 次属 2^-256 量级（「身份推导本身坏了」），接受最后结果。
@@ -51,7 +68,7 @@ pub fn derive_tun_ip(secret: &Secret, pubkey: &[u8; 32]) -> Ipv4Addr {
     let tunnel = derive_tunnel_ip(secret, pubkey);
     let mut ip = addr_of(to_v(&hmac_sum(secret.as_bytes(), b"hw-app", pubkey), 2));
     let mut i = 2u8;
-    while i <= 9 && ip == tunnel {
+    while i <= 9 && (ip == tunnel || ip == SERVER_TUNNEL_IP) {
         let label = format!("hw-app.{i}");
         ip = addr_of(to_v(
             &hmac_sum(secret.as_bytes(), label.as_bytes(), pubkey),
@@ -123,5 +140,45 @@ mod tests {
             derive_tunnel_ip(&sec, &pk),
             "再散列后必须脱开"
         );
+    }
+
+    /// F11：撞车守卫——raw 派生恰为 `SERVER_TUNNEL_IP` 时再散列（两个派生函数共用，
+    /// 双侧同规则）。研磨样本（期望 ~6.5e4 次命中）。
+    #[test]
+    fn guard_against_server_tunnel_ip() {
+        let sec = Secret::from([0x5Au8; 32]);
+        let mut hit: Option<[u8; 32]> = None;
+        for i in 0u32..2_000_000 {
+            let mut pk = [0u8; 32];
+            pk[..4].copy_from_slice(&i.to_be_bytes());
+            let raw = addr_of(to_v(&hmac_sum(sec.as_bytes(), b"hw-tun", &pk), 0));
+            if raw == SERVER_TUNNEL_IP {
+                hit = Some(pk);
+                break;
+            }
+        }
+        let pk = hit.expect("应在 2e6 次内研磨出撞车样本（期望 ~6.5e4）");
+        assert_ne!(derive_tunnel_ip(&sec, &pk), SERVER_TUNNEL_IP, "隧道侧守卫应脱开");
+        assert_ne!(derive_tun_ip(&sec, &pk), SERVER_TUNNEL_IP, "应用面也须避开保留地址");
+        assert_eq!(derive_tunnel_ip(&sec, &pk).octets()[..2], [100, 64], "仍在 100.64/16 域内");
+        // 另研磨一个「hw-app 原始派生 == SERVER_TUNNEL_IP」样本——执行 `derive_tun_ip`
+        // 新增的那半个条件（代码门 L4：只研磨 hw-tun 时该分支实际不被执行）。
+        let mut hit_app: Option<[u8; 32]> = None;
+        for i in 0u32..2_000_000 {
+            let mut pk = [0u8; 32];
+            pk[..4].copy_from_slice(&i.to_be_bytes());
+            let raw = addr_of(to_v(&hmac_sum(sec.as_bytes(), b"hw-app", &pk), 2));
+            if raw == SERVER_TUNNEL_IP {
+                hit_app = Some(pk);
+                break;
+            }
+        }
+        let pk_app = hit_app.expect("应在 2e6 次内研磨出 hw-app 撞车样本（期望 ~6.5e4）");
+        assert_eq!(
+            addr_of(to_v(&hmac_sum(sec.as_bytes(), b"hw-app", &pk_app), 2)),
+            SERVER_TUNNEL_IP,
+            "样本必须先命中保留地址（否则该分支仍是假绿）"
+        );
+        assert_ne!(derive_tun_ip(&sec, &pk_app), SERVER_TUNNEL_IP, "应用面守卫应脱开保留地址");
     }
 }
