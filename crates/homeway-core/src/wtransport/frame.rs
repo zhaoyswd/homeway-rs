@@ -74,6 +74,14 @@ pub fn decode_frame(buf: &[u8]) -> Option<(u8, &[u8])> {
     Some((buf[1], &buf[2..]))
 }
 
+/// 只看帧头 kind（不产生 payload 借用——F2 采纳判定用，避免与 `&mut self` 借用冲突）。
+pub fn frame_kind(buf: &[u8]) -> Option<u8> {
+    if buf.len() < 2 || buf[0] != FRAME_MAGIC {
+        return None;
+    }
+    Some(buf[1])
+}
+
 /// 中继路由键：后端静态公钥的 sha256 前 8 字节（`[0xAA]` 路由头用；R1 不发中继腿，
 /// 解码侧保留）。
 pub fn relay_id(peer_pubkey: &[u8; 32]) -> [u8; 8] {
@@ -106,6 +114,12 @@ pub fn encode_batch(msgs: &[(u8, &[u8])], out: &mut Vec<u8>) {
     out.push(FRAME_MAGIC);
     out.push(FrameKind::Batch.to_wire());
     for (kind, payload) in msgs {
+        // 长度域是 u16：> 65535 会**静默回绕**（现状不可达——数据面 MTU 远小于此；
+        // 热路径不宜返 Result，故用 debug_assert 防御性收口）。
+        debug_assert!(
+            payload.len() <= u16::MAX as usize,
+            "容器帧 payload 超 u16 长度域（会静默回绕）"
+        );
         out.push(*kind);
         let len = payload.len() as u16;
         out.extend_from_slice(&len.to_be_bytes());
@@ -146,6 +160,8 @@ pub fn decode_batch(payload: &[u8]) -> Option<Vec<(u8, &[u8])>> {
 
 /// hint 控制帧整包（`[0xBB][1][len BE][addr]`）。
 pub fn hint_bytes(addr: &str) -> Vec<u8> {
+    // 长度域是 u16：> 65535 静默回绕（现状不可达——hint 地址串远小于此）。
+    debug_assert!(addr.len() <= u16::MAX as usize, "hint 地址超 u16 长度域（会静默回绕）");
     let mut p = Vec::with_capacity(4 + addr.len());
     p.extend_from_slice(&(addr.len() as u16).to_be_bytes());
     p.extend_from_slice(addr.as_bytes());

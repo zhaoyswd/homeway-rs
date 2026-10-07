@@ -375,6 +375,9 @@ impl Session {
                 Arc::new(move || {
                     if let Some(sh) = w3.upgrade() {
                         let _ = sh.current().rearm_soft();
+                        if let Some(c) = &sh.cache {
+                            c.lock().expect("缓存锁中毒").note_rearm();
+                        }
                         let merged = sh.merged_candidates();
                         sh.current().set_candidates(merged);
                     }
@@ -761,6 +764,9 @@ fn punch_to(shared: &Arc<Shared>, addr: SocketAddr) {
     }
     let client = shared.current();
     let _ = client.rearm_soft();
+    if let Some(c) = &shared.cache {
+        c.lock().expect("缓存锁中毒").note_rearm();
+    }
     if let Some(rf) = shared
         .domain_refresher
         .read()
@@ -956,6 +962,9 @@ fn patrol_loop(shared: Arc<Shared>) {
                         fmt_duration_go_secs(RELAY_UPGRADE_EVERY * PATROL_INTERVAL)
                     ));
                     let _ = client.rearm_soft();
+                    if let Some(c) = &shared.cache {
+                        c.lock().expect("缓存锁中毒").note_rearm();
+                    }
                     let merged = shared.merged_candidates();
                     shared.current().set_candidates(merged);
                     if let Some(rf) = shared

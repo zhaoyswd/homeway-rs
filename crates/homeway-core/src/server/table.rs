@@ -296,10 +296,10 @@ impl DeviceTable {
             // 身份轮换：先移除旧 peer 再写新的——顺序固定（返回序承载）。
             let old_pub = e.pub_key;
             let old_ip = e.ip;
-            let ip = self.assign_ip(&secret, &pubkey, &dev_tag).inspect_err(|&r| {
+            let ip = self.assign_ip(&secret, &pubkey, &dev_tag, None).inspect_err(|&r| {
                 self.note_reject(r, "");
             })?;
-            let tun_ip = self.assign_tun_ip(&secret, &pubkey, &dev_tag).inspect_err(|&r| {
+            let tun_ip = self.assign_tun_ip(&secret, &pubkey, &dev_tag, None).inspect_err(|&r| {
                 self.note_reject(r, "");
             })?;
             let e = self.entries.get_mut(&dev_tag).expect("刚判存在");
@@ -327,24 +327,51 @@ impl DeviceTable {
             ));
         }
 
-        if self.entries.len() >= self.cfg.max_devices && !self.evict_stale(now) {
-            self.note_reject(
-                RejectReason::TableFull,
-                &format!(
-                    "dev={} n={}/{}",
-                    dev_short(&dev_tag),
-                    self.entries.len(),
-                    self.cfg.max_devices
-                ),
-            );
-            return Err(RejectReason::TableFull);
+        // 表满：**先纯选择** stale victim（不落库、不打行），再看「排除 victim 视图」下
+        // 新设备地址能否落位——校验通过才真正淘汰 + 产 `Remove`。P0-2 的根因正是
+        // 「淘汰先删表项、Remove 却丢失」；这里把 Remove 与表变更绑在同一段里，且
+        // 错误路径（地址撞车）**不动表、不打 E9 行**（Go `assignIPLocked` 失败时已摘
+        // peer + 已打 E9，故 E9 触发集是登记在案的差异）。
+        let victim = if self.entries.len() >= self.cfg.max_devices {
+            match self.select_stale_victim(now) {
+                Some(v) => Some(v),
+                None => {
+                    self.note_reject(
+                        RejectReason::TableFull,
+                        &format!(
+                            "dev={} n={}/{}",
+                            dev_short(&dev_tag),
+                            self.entries.len(),
+                            self.cfg.max_devices
+                        ),
+                    );
+                    return Err(RejectReason::TableFull);
+                }
+            }
+        } else {
+            None
+        };
+        let exclude = victim.as_ref().map(|(dev, _)| dev);
+        let ip = self.assign_ip(&secret, &pubkey, &dev_tag, exclude).inspect_err(|&r| {
+            self.note_reject(r, "");
+        })?;
+        let tun_ip = self.assign_tun_ip(&secret, &pubkey, &dev_tag, exclude).inspect_err(|&r| {
+            self.note_reject(r, "");
+        })?;
+        let mut ops: Vec<DevOp> = Vec::with_capacity(2);
+        if let Some((vdev, _)) = victim {
+            let e = self.entries.remove(&vdev).expect("刚选出的 victim");
+            let idle = now.duration_since(e.last_reg).unwrap_or_default();
+            (self.logf)(&format!(
+                "peer: - dev={} reason=stale (idle={}) n={}/{}",
+                dev_short(&vdev),
+                fmt_idle(idle),
+                self.entries.len(),
+                self.cfg.max_devices
+            ));
+            // Remove 先于 Add（与 Go removeLocked→AddPeer 同序）——device 侧同序应用。
+            ops.push(DevOp::Remove { pubkey: e.pub_key });
         }
-        let ip = self.assign_ip(&secret, &pubkey, &dev_tag).inspect_err(|&r| {
-            self.note_reject(r, "");
-        })?;
-        let tun_ip = self.assign_tun_ip(&secret, &pubkey, &dev_tag).inspect_err(|&r| {
-            self.note_reject(r, "");
-        })?;
         self.entries.insert(
             dev_tag,
             Entry { dev: dev_tag, pub_key: pubkey, psk, ip, tun_ip, last_reg: now },
@@ -366,7 +393,8 @@ impl DeviceTable {
             self.entries.len(),
             self.cfg.max_devices
         ));
-        Ok((Action::Added, vec![DevOp::Add { pubkey, psk, tunnel_ip: ip, tun_ip }]))
+        ops.push(DevOp::Add { pubkey, psk, tunnel_ip: ip, tun_ip });
+        Ok((Action::Added, ops))
     }
 
     /// TTL 回收（GC 同义）：回收超过 TTL 未刷新的设备（每条打日志），返回快照与 ops。
@@ -401,9 +429,11 @@ impl DeviceTable {
         out
     }
 
-    /// 表满时淘汰：只在「超过 grace 未刷新」的设备里挑最旧的一条（严格 > 比较）。
-    /// false = 全部活跃（调用方拒绝新设备，绝不淘汰在线设备）。
-    fn evict_stale(&mut self, now: SystemTime) -> bool {
+    /// 表满时**纯选择**淘汰候选：只在「超过 grace 未刷新」的设备里挑最旧的一条
+    /// （严格 `>` 比较）。**不落库、不打行、不产 op**——调用方在「排除视图」校验
+    /// 通过后才真正摘除并产 `Remove`（P0-2：表-设备一致）。
+    /// `None` = 全部活跃（调用方拒绝新设备，绝不淘汰在线设备）。
+    fn select_stale_victim(&self, now: SystemTime) -> Option<([u8; 8], SystemTime)> {
         let mut victim: Option<([u8; 8], SystemTime)> = None;
         for (k, e) in &self.entries {
             let idle = now.duration_since(e.last_reg).unwrap_or_default();
@@ -414,27 +444,25 @@ impl DeviceTable {
                 victim = Some((*k, e.last_reg));
             }
         }
-        let Some((dev, _)) = victim else { return false };
-        let e = self.entries.remove(&dev).expect("刚选出的 victim");
-        let idle = now.duration_since(e.last_reg).unwrap_or_default();
-        (self.logf)(&format!(
-            "peer: - dev={} reason=stale (idle={}) n={}/{}",
-            dev_short(&dev),
-            fmt_idle(idle),
-            self.entries.len(),
-            self.cfg.max_devices
-        ));
-        true
+        victim
     }
 
     /// 隧道地址派生 + 双地址并集占用检测（Go assignIPLocked 同义）。
-    fn assign_ip(&mut self, secret: &[u8; 32], pub_key: &[u8; 32], dev: &[u8; 8]) -> Result<Ipv4Addr, RejectReason> {
+    /// `exclude` = 本次淘汰的 victim（**排除视图**：它即将离表，不应算作占用——
+    /// 否则「新设备只与 victim 撞车」会被误判冲突，A 版视图的核心语义）。
+    fn assign_ip(
+        &mut self,
+        secret: &[u8; 32],
+        pub_key: &[u8; 32],
+        dev: &[u8; 8],
+        exclude: Option<&[u8; 8]>,
+    ) -> Result<Ipv4Addr, RejectReason> {
         let ip = derive_tunnel_ip(&crate::token::Secret::from(*secret), pub_key);
-        if !self.ip_taken(&ip) {
+        if !self.ip_taken(&ip, exclude) {
             return Ok(ip);
         }
         // 同公钥不同 devTag（克隆场景）：同钥派生地址本就相同，不算冲突——沿用
-        if self.ip_held_by_pub(pub_key, &ip) {
+        if self.ip_held_by_pub(pub_key, &ip, exclude) {
             return Ok(ip);
         }
         self.note_reject(
@@ -445,12 +473,18 @@ impl DeviceTable {
         Err(RejectReason::IpConflict)
     }
 
-    fn assign_tun_ip(&mut self, secret: &[u8; 32], pub_key: &[u8; 32], dev: &[u8; 8]) -> Result<Ipv4Addr, RejectReason> {
+    fn assign_tun_ip(
+        &mut self,
+        secret: &[u8; 32],
+        pub_key: &[u8; 32],
+        dev: &[u8; 8],
+        exclude: Option<&[u8; 8]>,
+    ) -> Result<Ipv4Addr, RejectReason> {
         let ip = derive_tun_ip(&crate::token::Secret::from(*secret), pub_key);
-        if !self.ip_taken(&ip) {
+        if !self.ip_taken(&ip, exclude) {
             return Ok(ip);
         }
-        if self.ip_held_by_pub(pub_key, &ip) {
+        if self.ip_held_by_pub(pub_key, &ip, exclude) {
             return Ok(ip);
         }
         self.note_reject(
@@ -462,14 +496,17 @@ impl DeviceTable {
     }
 
     /// 双地址集合占用判定（任一类的 /32 撞车都让 allowedips 错路由——并集判定）。
-    fn ip_taken(&self, ip: &Ipv4Addr) -> bool {
-        self.entries.values().any(|e| &e.ip == ip || &e.tun_ip == ip)
+    /// `exclude` 命中的表项（本次淘汰的 victim）不计入。
+    fn ip_taken(&self, ip: &Ipv4Addr, exclude: Option<&[u8; 8]>) -> bool {
+        self.entries
+            .iter()
+            .any(|(k, e)| Some(k) != exclude && (&e.ip == ip || &e.tun_ip == ip))
     }
 
-    fn ip_held_by_pub(&self, pub_key: &[u8; 32], ip: &Ipv4Addr) -> bool {
-        self.entries
-            .values()
-            .any(|e| &e.pub_key == pub_key && (&e.ip == ip || &e.tun_ip == ip))
+    fn ip_held_by_pub(&self, pub_key: &[u8; 32], ip: &Ipv4Addr, exclude: Option<&[u8; 8]>) -> bool {
+        self.entries.iter().any(|(k, e)| {
+            Some(k) != exclude && &e.pub_key == pub_key && (&e.ip == ip || &e.tun_ip == ip)
+        })
     }
 
     fn find_by_pub(&self, pub_key: &[u8; 32], except: &[u8; 8]) -> Option<[u8; 8]> {
@@ -566,6 +603,18 @@ mod tests {
             .collect()
     }
 
+    /// 直插一条表项（F1 排除视图单测用——绕过 HMAC 派生以精确构造撞车形态）。
+    fn insert_entry(
+        t: &mut DeviceTable,
+        dev: [u8; 8],
+        pk: [u8; 32],
+        ip: Ipv4Addr,
+        tun: Ipv4Addr,
+        last_reg: SystemTime,
+    ) {
+        t.entries.insert(dev, Entry { dev, pub_key: pk, psk: [0u8; 32], ip, tun_ip: tun, last_reg });
+    }
+
     /// add → refresh → rotate → 拒绝全族 + 判据行文案。
     #[test]
     fn register_lifecycle_and_lines() {
@@ -608,7 +657,7 @@ mod tests {
         assert_eq!(r.unwrap_err(), RejectReason::NoToken);
     }
 
-    /// 表满：活跃全在 ⇒ 拒绝；超宽限的最旧被淘汰（stale 行）。
+    /// 表满：活跃全在 ⇒ 拒绝；超宽限的最旧被淘汰（stale 行）+ ops 序 = [Remove, Add]。
     #[test]
     fn table_full_and_stale_eviction() {
         let secret = [7u8; 32];
@@ -620,15 +669,95 @@ mod tests {
         t.register(&reg_bytes(&secret, &[1; 32], &[1; 8], old_ts), base - DEFAULT_GRACE - Duration::from_secs(60)).unwrap();
         t.register(&reg_bytes(&secret, &[2; 32], &[2; 8], now_unix()), base).unwrap();
         assert_eq!(t.len(), 2);
-        // 第三个：淘汰 d1（超宽限最旧）
-        let (a, _) = t.register(&reg_bytes(&secret, &[3; 32], &[3; 8], now_unix()), base).unwrap();
+        // 第三个：淘汰 d1（超宽限最旧）——**ops 恰为 [Remove(d1.pub), Add(d3.pub)]**
+        // （P0-2：原实现丢弃 ops ⇒ device 侧 peer 永驻；旧断言 `let (a, _)` 正是漏网原因）。
+        let (a, ops) = t.register(&reg_bytes(&secret, &[3; 32], &[3; 8], now_unix()), base).unwrap();
         assert_eq!(a, Action::Added);
         assert_eq!(t.len(), 2, "淘汰一个加一个");
+        assert_eq!(ops.len(), 2, "淘汰必须产 Remove + Add：{ops:?}");
+        assert!(matches!(ops[0], DevOp::Remove { pubkey } if pubkey == [1; 32]), "Remove 先于 Add（P0-2）");
+        assert!(matches!(ops[1], DevOp::Add { pubkey, .. } if pubkey == [3; 32]));
         assert!(sink.0.lock().unwrap().iter().any(|l| l.contains("reason=stale")));
-        // 全活跃 ⇒ 拒绝
+        // 全活跃 ⇒ 拒绝（不淘汰、不产 op）
         let r = t.register(&reg_bytes(&secret, &[4; 32], &[4; 8], now_unix()), base);
         assert_eq!(r.unwrap_err(), RejectReason::TableFull);
         assert_eq!(t.reject_counts().get("table-full"), Some(&1));
+    }
+
+    /// A 版排除视图的核心回归守卫：新设备派生地址**只与 victim 撞车** ⇒ 应成功。
+    /// （若误把 victim 计入占用，就会拒掉一个本该被淘汰腾位的设备。）
+    #[test]
+    fn eviction_view_allows_collision_with_victim_only() {
+        let secret = [0x21u8; 32];
+        let (_sink, logf) = sink();
+        let mut t = DeviceTable::new(vec![secret], TableConfig { max_devices: 2, ..Default::default() }, logf);
+        let base = now();
+        let sec = crate::token::Secret::from(secret);
+        let pk3 = [0x33u8; 32];
+        let d3 = derive_tunnel_ip(&sec, &pk3);
+        let tun3 = derive_tun_ip(&sec, &pk3);
+        let mut other_a = Ipv4Addr::new(100, 64, 2, 2);
+        let mut other_b = Ipv4Addr::new(100, 64, 2, 3);
+        if other_a == d3 || other_a == tun3 {
+            other_a = Ipv4Addr::new(100, 64, 9, 9);
+        }
+        if other_b == d3 || other_b == tun3 || other_b == other_a {
+            other_b = Ipv4Addr::new(100, 64, 9, 10);
+        }
+        // victim：隧道地址恰为新设备派生地址（排除视图下不应算冲突）
+        insert_entry(
+            &mut t,
+            [1; 8],
+            [1; 32],
+            d3,
+            Ipv4Addr::new(100, 64, 1, 1),
+            base - DEFAULT_GRACE - Duration::from_secs(60),
+        );
+        insert_entry(&mut t, [2; 8], [2; 32], other_a, other_b, base);
+        let (a, ops) = t.register(&reg_bytes(&secret, &pk3, &[3; 8], now_unix()), base).unwrap();
+        assert_eq!(a, Action::Added, "只与 victim 撞车 ⇒ 排除视图后应成功");
+        assert_eq!(ops.len(), 2);
+        assert!(matches!(ops[0], DevOp::Remove { pubkey } if pubkey == [1; 32]));
+        assert!(matches!(ops[1], DevOp::Add { tunnel_ip, .. } if tunnel_ip == d3));
+        assert_eq!(t.len(), 2);
+        assert!(!t.entries.contains_key(&[1; 8]), "victim 已腾位");
+        assert_eq!(
+            t.briefs().into_iter().find(|b| b.0.starts_with("03030303")).map(|b| b.1),
+            Some(d3),
+        );
+    }
+
+    /// A 版错误路径：与**在表另一设备**撞车 ⇒ 拒绝，且表内条目不变、victim 仍在、
+    /// 不打 stale 行（Remove 被推迟到校验之后——E9 触发集差异，已登记）。
+    #[test]
+    fn eviction_view_rejects_collision_with_live_device() {
+        let secret = [0x22u8; 32];
+        let (sink, logf) = sink();
+        let mut t = DeviceTable::new(vec![secret], TableConfig { max_devices: 2, ..Default::default() }, logf);
+        let base = now();
+        let sec = crate::token::Secret::from(secret);
+        let pk3 = [0x44u8; 32];
+        let d3 = derive_tunnel_ip(&sec, &pk3);
+        // 活跃设备占住新设备的派生地址
+        insert_entry(&mut t, [2; 8], [2; 32], d3, Ipv4Addr::new(100, 64, 2, 3), base);
+        // victim：超宽限最旧（本会被选）
+        insert_entry(
+            &mut t,
+            [1; 8],
+            [1; 32],
+            Ipv4Addr::new(100, 64, 1, 1),
+            Ipv4Addr::new(100, 64, 1, 2),
+            base - DEFAULT_GRACE - Duration::from_secs(60),
+        );
+        let r = t.register(&reg_bytes(&secret, &pk3, &[3; 8], now_unix()), base);
+        assert_eq!(r.unwrap_err(), RejectReason::IpConflict, "与在表设备撞车 ⇒ 拒");
+        assert_eq!(t.len(), 2, "错误路径表内条目不变");
+        assert!(t.entries.contains_key(&[1; 8]), "victim 未被摘除");
+        assert!(t.entries.contains_key(&[2; 8]));
+        assert!(
+            !sink.0.lock().unwrap().iter().any(|l| l.contains("reason=stale")),
+            "撞车拒绝不打 stale 行（E9 触发集差异）"
+        );
     }
 
     /// TTL 回收（gc）。

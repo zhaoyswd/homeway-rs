@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crate::token::{EndpointKind, EndpointRef};
-use crate::wtransport::bind::Candidate;
+use crate::wtransport::bind::{same_candidates, Candidate};
 use crate::Logf;
 
 /// 候选应用回调（新候选集已并入静态面并重投给 Bind）。
@@ -357,22 +357,6 @@ impl Drop for InflightGuard<'_> {
     }
 }
 
-/// 候选集等价（Relay 位参与——同地址不同腿类型必须判「变了」，FIX-14 同义）。
-fn same_candidates(a: &[Candidate], b: &[Candidate]) -> bool {
-    if a.len() != b.len() {
-        return false;
-    }
-    'outer: for x in a {
-        for y in b {
-            if x.addr == y.addr && x.relay == y.relay {
-                continue 'outer;
-            }
-        }
-        return false;
-    }
-    true
-}
-
 /// 候选描述串（link 行 `ep=…` 的候选简述同族形态）。
 fn describe_candidates(c: &[Candidate]) -> String {
     c.iter()
@@ -479,6 +463,18 @@ mod tests {
         let c = vec![Candidate { addr: "1.2.3.4:1".parse().unwrap(), relay: true }];
         assert!(same_candidates(&a, &b));
         assert!(!same_candidates(&a, &c), "Relay 位参与比较");
+    }
+
+    /// F11：多重集反例——`[A,A,B]` vs `[A,B,B]` 必须判「变了」（旧的非多重集实现会误判
+    /// 相等 ⇒ 跳过中继档的软赛跑补投并污染 last_cands）。
+    #[test]
+    fn same_candidates_multiset_counterexample() {
+        let a: SocketAddr = "1.2.3.4:1".parse().unwrap();
+        let b: SocketAddr = "1.2.3.4:2".parse().unwrap();
+        let ca = Candidate { addr: a, relay: false };
+        let cb = Candidate { addr: b, relay: false };
+        assert!(!same_candidates(&[ca, ca, cb], &[ca, cb, cb]), "多重集必须不等");
+        assert!(same_candidates(&[ca, cb], &[cb, ca]), "同集忽略顺序");
     }
 
     /// 重解析编排全链：候选变化 → apply 回调 + 记行；无变化 → 静默；中继采纳 →

@@ -1861,3 +1861,103 @@ fn probe_once(
     };
     (dns_note, gen_note, saw, hint, flags)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use hmac::{Hmac, Mac};
+    use sha2::Sha256;
+
+    const REG_LEN: usize = 66;
+
+    fn reg_bytes(secret: &[u8; 32], pubkey: &[u8; 32], dev: &[u8; 8], ts: u64) -> Vec<u8> {
+        let mut out = Vec::with_capacity(REG_LEN);
+        out.extend_from_slice(b"H2");
+        out.extend_from_slice(pubkey);
+        out.extend_from_slice(dev);
+        out.extend_from_slice(&ts.to_be_bytes());
+        let mut mac = Hmac::<Sha256>::new_from_slice(secret).unwrap();
+        mac.update(b"hr-reg2");
+        mac.update(&out[2..50]);
+        let sum = mac.finalize().into_bytes();
+        out.extend_from_slice(&sum[..16]);
+        out
+    }
+
+    fn now() -> SystemTime {
+        SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)
+    }
+
+    fn now_unix() -> u64 {
+        1_800_000_000
+    }
+
+    fn dev() -> Device {
+        let logf: Logf = Arc::new(|_: &str| {});
+        Device::new(x25519_dalek::StaticSecret::from([0x5Au8; 32]), logf)
+    }
+
+    /// P0-2 端到端不变量：表满淘汰后 `apply_dev_ops` **真摘掉** victim 的 peer——
+    /// `Device.peers` 不再随淘汰单调增长（表-设备一致）。
+    #[test]
+    fn eviction_removes_device_peer() {
+        let secret = [0x66u8; 32];
+        let logf: Logf = Arc::new(|_: &str| {});
+        let mut table = DeviceTable::new(
+            vec![secret],
+            TableConfig { max_devices: 2, ..Default::default() },
+            Arc::clone(&logf),
+        );
+        let mut device = dev();
+        let base = now();
+        // d1：已超宽限（10 分钟 + 60s 前注册）
+        let old_ts = now_unix() - (crate::server::table::DEFAULT_GRACE.as_secs() + 60);
+        let (_, ops) = table
+            .register(&reg_bytes(&secret, &[1; 32], &[1; 8], old_ts), base - Duration::from_secs(660))
+            .unwrap();
+        apply_dev_ops(ops, &mut device);
+        let (_, ops) = table.register(&reg_bytes(&secret, &[2; 32], &[2; 8], now_unix()), base).unwrap();
+        apply_dev_ops(ops, &mut device);
+        assert_eq!(device.peer_count(), 2);
+
+        // d3 触发淘汰：ops = [Remove(d1.pub), Add(d3.pub)]
+        let (_, ops) = table.register(&reg_bytes(&secret, &[3; 32], &[3; 8], now_unix()), base).unwrap();
+        assert!(matches!(ops[0], DevOp::Remove { pubkey } if pubkey == [1; 32]));
+        apply_dev_ops(ops, &mut device);
+        assert_eq!(device.peer_count(), 2, "淘汰一个加一个——peers 表不单调增长");
+        assert!(!device.has_peer(&[1; 32]), "victim peer 已被真摘除");
+        assert!(device.has_peer(&[2; 32]));
+        assert!(device.has_peer(&[3; 32]));
+    }
+
+    /// 克隆场景的**弱不变量**：同公钥挂两个 devTag 时，device 侧同一 pubkey 只保留
+    /// 一条 peer；按 pubkey 发 Remove 会把仍在表的另一 devTag 的 peer 一并摘掉——
+    /// 这与 Go `peers.go` 同序同缺口（共享），故断言写成弱不变量而非「表-设备一一对应」。
+    #[test]
+    fn clone_same_pubkey_keeps_single_peer() {
+        let secret = [0x67u8; 32];
+        let logf: Logf = Arc::new(|_: &str| {});
+        let mut table = DeviceTable::new(
+            vec![secret],
+            TableConfig { max_devices: 2, ..Default::default() },
+            Arc::clone(&logf),
+        );
+        let mut device = dev();
+        let base = now();
+        // 同公钥 [9;32]、两个 devTag（克隆形态：应用数据被复制）；d1 超宽限以便被淘汰
+        let old_ts = now_unix() - (crate::server::table::DEFAULT_GRACE.as_secs() + 60);
+        let (_, ops) = table
+            .register(&reg_bytes(&secret, &[9; 32], &[1; 8], old_ts), base - Duration::from_secs(660))
+            .unwrap();
+        apply_dev_ops(ops, &mut device);
+        let (_, ops) = table.register(&reg_bytes(&secret, &[9; 32], &[2; 8], now_unix()), base).unwrap();
+        apply_dev_ops(ops, &mut device);
+        assert_eq!(table.len(), 2, "两个 devTag 都在表（克隆合法）");
+        assert_eq!(device.peer_count(), 1, "同 pubkey 只保留一条 peer（弱不变量）");
+        // 淘汰其一 ⇒ Remove(pubkey [9;32]) ⇒ 唯一那条 peer 被摘（已知共享差异）
+        let (_, ops) = table.register(&reg_bytes(&secret, &[3; 32], &[3; 8], now_unix()), base).unwrap();
+        assert!(matches!(ops[0], DevOp::Remove { pubkey } if pubkey == [9; 32]));
+        apply_dev_ops(ops, &mut device);
+        assert!(device.peer_count() <= 1, "同一 pubkey 至多一条 peer");
+    }
+}

@@ -846,6 +846,9 @@ fn gen_loop(
                 if let Some(r) = w3.upgrade() {
                     if let Some(c) = r.current_client() {
                         let _ = c.rearm_soft();
+                        if let Some(ec) = &r.cache {
+                            ec.lock().expect("缓存锁中毒").note_rearm();
+                        }
                         let merged = r.merged_candidates();
                         c.set_candidates(merged);
                     }
@@ -1302,6 +1305,9 @@ fn tunnel_punch_to(run: &Arc<GenRun>, addr: SocketAddr) {
         return;
     };
     let _ = client.rearm_soft();
+    if let Some(c) = &run.cache {
+        c.lock().expect("缓存锁中毒").note_rearm();
+    }
     run.domain_refresh_async();
     (run.logf)(&format!(
         "中继 hint {addr} → 重新武装候选赛跑，打一发握手兼打洞"
@@ -1488,6 +1494,9 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
                     crate::go_fmt::fmt_duration_go_secs(RELAY_UPGRADE_EVERY * PATROL_INTERVAL)
                 ));
                 let _ = client.rearm_soft();
+                if let Some(c) = &run.cache {
+                    c.lock().expect("缓存锁中毒").note_rearm();
+                }
                 let merged = run.merged_candidates();
                 client.set_candidates(merged);
                 run.domain_refresh_async();

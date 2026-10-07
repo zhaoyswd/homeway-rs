@@ -82,6 +82,14 @@ const RECV_BACKOFF: Duration = Duration::from_millis(300);
 const RECV_ERR_LOG_GAP: Duration = Duration::from_secs(5);
 /// 发送失败限流（每目标 5s 一条）。
 const SEND_ERR_LOG_GAP: Duration = Duration::from_secs(5);
+/// 未采纳期 reg 补投间隔（F3）：首包丢/时钟偏差不再干等分钟级恢复阶梯。
+const REG_RESEND_INTERVAL: Duration = Duration::from_secs(2);
+/// 未采纳期 reg 补投**次数上限**（F3×F1 交互，评审 N1）：隧道坏但出站可达的客户端
+/// 若无限补投，每次 reg 都会刷新出口设备表的 `last_reg` ⇒ 条目永不 stale、永不淘汰，
+/// 在 `max_devices` 表里长期占位（反噬 F1）。到上限即交恢复阶梯。
+const REG_RESEND_MAX: u32 = 15;
+/// 未采纳期 reg 补投**时长上限**（自首次补投起）。
+const REG_RESEND_WINDOW: Duration = Duration::from_secs(60);
 
 /// 直连优先窗口缺省（Go directFirst 0→2s 同义）。
 pub const DIRECT_FIRST_DEFAULT: Duration = Duration::from_secs(2);
@@ -111,6 +119,15 @@ pub struct Bind {
     direct_first: Option<Duration>,
     reg: Option<RegCtx>,
     reg_armed: bool,
+    /// 上次真正写出搭车 reg 的时刻（F3：未采纳期 2s 补投的节拍基准）。
+    last_reg_sent: Option<Instant>,
+    /// 未采纳期补投计数与起点（F3 上界；rearm 归零）。
+    reg_resend_n: u32,
+    reg_resend_start: Option<Instant>,
+    /// 补投节拍参数（F3；生产恒为 `REG_RESEND_INTERVAL`/`REG_RESEND_WINDOW`——
+    /// 测试可注入小值，避免墙钟 sleep 与负载假红，见代码门 L5/M3）。
+    reg_resend_interval: Duration,
+    reg_resend_window: Duration,
     adopted: Option<SocketAddr>,
     adopted_is_relay: bool,
     /// 【测试缝】中继锁定（relay-lock 注入）：模拟「直连路径全被 NAT 丢弃」的真机
@@ -180,15 +197,17 @@ impl Bind {
                 .map(|c| c.addr)
                 .collect(),
             relay_id: relay_id(peer_pub),
-            direct_first: direct_first.map_or(Some(DIRECT_FIRST_DEFAULT), |d| {
-                if d.is_zero() {
-                    Some(DIRECT_FIRST_DEFAULT)
-                } else {
-                    Some(d)
-                }
-            }),
+            // F11：`None` 保持 `None` = **显式关**（全部候选同时打）；`Some(0)` → 缺省 2s
+            // （Go `core.go:117-124` 的 `0 → 2s` 同义）。此前 `map_or(Some(DEFAULT), …)`
+            // 把 `None` 与 `Some(0)` 都映射成 `Some(DEFAULT)`——文档语义「None = 关」无实现。
+            direct_first: direct_first.map(|d| if d.is_zero() { DIRECT_FIRST_DEFAULT } else { d }),
             reg,
             reg_armed: true,
+            last_reg_sent: None,
+            reg_resend_n: 0,
+            reg_resend_start: None,
+            reg_resend_interval: REG_RESEND_INTERVAL,
+            reg_resend_window: REG_RESEND_WINDOW,
             adopted: None,
             adopted_is_relay: false,
             relay_only: false,
@@ -307,6 +326,7 @@ impl Bind {
         }
         // 捕获（unlock_once）：窗口锁定期的首个未采纳出站包 + 该发搭车 reg
         let need_capture = !relay_ok && self.unlock_captured.is_none();
+        let was_armed = self.reg_armed;
         let reg_pkt = self.peek_reg();
         let mut frame_bytes =
             Vec::with_capacity(wg.len() + reg_pkt.as_ref().map_or(0, |r| r.len()) + 16);
@@ -359,6 +379,14 @@ impl Bind {
             self.tx_bytes += wg.len() as u64;
             if reg_pkt.is_some() {
                 self.reg_armed = false; // 真正写出才消费（R1 评审中-1 的收紧语义）
+                self.last_reg_sent = Some(now);
+                if !was_armed {
+                    // F3：未采纳期补投（首包丢/时钟偏差的自愈）——计入上界。
+                    self.reg_resend_n += 1;
+                    if self.reg_resend_start.is_none() {
+                        self.reg_resend_start = Some(now);
+                    }
+                }
             }
         }
         if need_capture {
@@ -453,8 +481,10 @@ impl Bind {
     }
 
     /// 预取本轮搭车 reg（不消费 arm——消费点在「真正写出」之后，见 send_wg）。
+    /// F3：arm 已消费后，未采纳期按 `REG_RESEND_INTERVAL`（2s）**补投**（受次数/时长
+    /// 上界约束）；已采纳后不再补投（send_wg 的采纳分支根本不调本函数）。
     fn peek_reg(&mut self) -> Option<Vec<u8>> {
-        if !self.reg_armed {
+        if !self.reg_armed && !self.reg_resend_due() {
             return None;
         }
         let ctx = self.reg.as_ref()?;
@@ -465,6 +495,21 @@ impl Bind {
         let mut pkt = Vec::with_capacity(reg::REG_LEN);
         reg::encode_reg_parts(&ctx.secret, &ctx.pubkey, &ctx.dev_tag, now, &mut pkt);
         Some(pkt)
+    }
+
+    /// 未采纳期是否到点补投 reg（F3）：有 reg、未采纳、间隔到、未超次数/时长上界。
+    /// 上界是**每次未采纳期**口径（rearm 归零——恢复阶梯重开一轮，见登记 E8 行）。
+    fn reg_resend_due(&self) -> bool {
+        if self.reg.is_none() || self.adopted.is_some() {
+            return false;
+        }
+        if self.reg_resend_n >= REG_RESEND_MAX {
+            return false;
+        }
+        if self.reg_resend_start.is_some_and(|t| t.elapsed() >= self.reg_resend_window) {
+            return false;
+        }
+        self.last_reg_sent.is_some_and(|t| t.elapsed() >= self.reg_resend_interval)
     }
 
     /// 收一个数据报：退避检查 → 采纳（先于帧解码）→ 腿帧解码。
@@ -500,7 +545,15 @@ impl Bind {
         // 双栈 socket 上 v4 对端的源地址是 v4-mapped v6——归一成纯 v4（内部表示
         // 恒纯 v4/v6：采纳/候选比对/应答回发不因 socket 族漂移）
         let src = crate::udpbatch::unmap_v4_in6(src_raw);
-        self.adopt(src);
+        // F2：**只在解出 Data 帧时采纳**。`decode_frame` 只判 `len>=2 && buf[0]==0xBB`
+        // 且未知 kind 原样返回 ⇒「解码成功」几乎无门槛（`[0xBB, 任意 1 字节]` 即通过），
+        // 任意来源（含 1 字节垃圾）都能触发采纳。收紧后：Control(hint)/未知 kind/垃圾
+        // 一律**不 adopt**（不写 adopted/race_seen、不打 C5/C6、不登记 handover）；
+        // 真正的漫游/自愈仍由「未知来源 + 合法 Data 帧」成立（与 Go bind.go:511-515
+        // 自注的收紧方向同向）。
+        if frame::frame_kind(&self.recv_buf[..n]) == Some(FrameKind::Data.to_wire()) {
+            self.adopt(src);
+        }
         let Some((kind, payload)) = frame::decode_frame(&self.recv_buf[..n]) else {
             return Ok(None); // 非帧包（垃圾/旧对端）：丢弃
         };
@@ -513,6 +566,22 @@ impl Bind {
             k if k == FrameKind::Control.to_wire() => {
                 // hint 线索（学习缓存接线：回调只改内存 + 投递落盘信号，不阻塞收包热路径）
                 if let Some(addr) = frame::decode_hint_payload(payload) {
+                    // F2：hint **不构成路径证据**（上面已不 adopt），但仍是候选学习线索。
+                    // 未知来源的 hint 必须过 `probe_addr_acceptable`——封掉「谁能发一个
+                    // Control 帧就让客户端向任意地址打洞/污染候选表」的注入面；已知来源
+                    // （候选/中继腿）豁免（其地址本就可信，且本机回环候选会被卫兵误杀）。
+                    let known = self.relay_eps.contains(&src)
+                        || self.candidates.iter().any(|c| c.addr == src);
+                    let ok = known
+                        || addr
+                            .parse::<SocketAddr>()
+                            .is_ok_and(|ap| crate::probe::probe_addr_acceptable(&ap));
+                    if !ok {
+                        (self.logf)(&format!(
+                            "HINT 忽略未知来源 {src} 的线索 {addr}（地址不可接受——防投喂注入）"
+                        ));
+                        return Ok(None);
+                    }
                     match &self.on_hint {
                         Some(_) => {
                             (self.logf)(&format!("HINT 收到对端地址线索 {addr}（来自 {src}）"));
@@ -764,6 +833,9 @@ impl Bind {
         self.adopted = None;
         self.adopted_is_relay = false;
         self.reg_armed = true;
+        self.last_reg_sent = None;
+        self.reg_resend_n = 0;
+        self.reg_resend_start = None;
         self.race_start = Instant::now();
         self.relay_unlocked = self.direct_candidates().is_empty();
         self.unlock_captured = None;
@@ -771,10 +843,15 @@ impl Bind {
         self.mirror_log_n = 0;
         self.mirror_log_at = None;
         self.handover = None;
-        (self.logf)(&format!(
-            "RARM 候选赛跑重启（直连优先：中继在 {} 后才解锁）",
-            fmt_duration_go_ms(self.direct_first.unwrap_or(DIRECT_FIRST_DEFAULT)),
-        ));
+        (self.logf)(&match self.direct_first {
+            Some(d) => format!(
+                "RARM 候选赛跑重启（直连优先：中继在 {} 后才解锁）",
+                fmt_duration_go_ms(d)
+            ),
+            // F11：`None` = 显式关（中继立即参与）——旧文案 `unwrap_or(DEFAULT)` 会打
+            // 「中继在 2s 后才解锁」，与语义相反。
+            None => "RARM 候选赛跑重启（直连优先：关——中继立即参与）".to_owned(),
+        });
     }
 
     /// 软赛跑（Go RearmSoft：中继立即参与——「已在用中继、只想试着升直连」的时刻，
@@ -783,6 +860,9 @@ impl Bind {
         self.adopted = None;
         self.adopted_is_relay = false;
         self.reg_armed = true;
+        self.last_reg_sent = None;
+        self.reg_resend_n = 0;
+        self.reg_resend_start = None;
         self.race_start = Instant::now();
         self.relay_unlocked = true;
         self.unlock_captured = None;
@@ -823,8 +903,9 @@ fn path_kind(relay: bool) -> &'static str {
     }
 }
 
-/// 集合比较（忽略顺序；relay 位参与）。
-fn same_candidates(a: &[Candidate], b: &[Candidate]) -> bool {
+/// 集合比较（忽略顺序；relay 位参与）。**单一实现**——domain_eps 的重解析编排共用
+/// （F11：此前 domain_eps 有第二份非多重集实现：`a=[A,A,B]` vs `b=[A,B,B]` 会误判相等）。
+pub(crate) fn same_candidates(a: &[Candidate], b: &[Candidate]) -> bool {
     if a.len() != b.len() {
         return false;
     }
@@ -1320,6 +1401,40 @@ mod tests {
         );
     }
 
+    /// F11：`direct_first(None)` = 显式关（中继立即参与 + RARM 文案正确）；`Some(0)` = 缺省 2s。
+    #[test]
+    fn direct_first_none_means_off() {
+        let relay = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let (logf, logs) = log_sink();
+        let mut b = Bind::open(
+            &[Candidate { addr: relay_addr, relay: true }],
+            None,
+            None, // 显式关
+            &[1u8; 32],
+            Arc::clone(&logf),
+        )
+        .unwrap();
+        assert_eq!(b.direct_first, None, "None 保持 None（不再被映射成 Some(DEFAULT)）");
+        assert!(b.relay_unlocked, "无直连候选 ⇒ 中继立即参与");
+        b.rearm();
+        let all: Vec<String> = logs.try_iter().collect();
+        assert!(
+            all.iter().any(|l| l.contains("直连优先：关——中继立即参与")),
+            "None 的 RARM 文案须与语义一致：{all:?}"
+        );
+        // Some(0) → 缺省 2s
+        let b2 = Bind::open(
+            &[Candidate { addr: relay_addr, relay: true }],
+            None,
+            Some(Duration::ZERO),
+            &[1u8; 32],
+            Arc::clone(&logf),
+        )
+        .unwrap();
+        assert_eq!(b2.direct_first, Some(DIRECT_FIRST_DEFAULT), "Some(0) → 缺省 2s");
+    }
+
     /// 发送统计计数面（复核 r3-F5）：镜像逐候选计数 + 全本地失败判定 + localErr 口径
     /// （镜像错误进 local_err_count；采纳路径错误只进 adopted 面——Go bind_test 同口径）。
     #[test]
@@ -1345,5 +1460,123 @@ mod tests {
         let (adopted, total) = b.local_err_counters();
         assert_eq!(adopted, 0, "未采纳 ⇒ 无采纳面错误");
         assert!(total >= 1, "镜像本地错误进 local_err_count");
+    }
+
+    /// F2：仅 Data 帧才采纳——垃圾/未知 kind/Control 帧不 adopt、不写 race_seen、
+    /// 不打 C5/C6；合法 Data 帧仍采纳（漫游/自愈不受影响）。
+    #[test]
+    fn only_data_frames_adopt() {
+        let exit = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let exit_addr = exit.local_addr().unwrap();
+        let (logf, logs) = log_sink();
+        let mut b = bind(
+            &[Candidate { addr: exit_addr, relay: false }],
+            Some(reg_ctx()),
+            &logf,
+        );
+        let me = format!("127.0.0.1:{}", b.local_port());
+        let mut buf = [0u8; 64];
+        // ① 1 字节垃圾 → 不采纳
+        exit.send_to(b"x", &me).unwrap();
+        let _ = b.recv_from(&mut buf);
+        assert_eq!(b.adopted(), None, "垃圾包不得采纳");
+        // ② 0xBB + 未知 kind → 不采纳
+        exit.send_to(&[0xBB, 9, 7], &me).unwrap();
+        let _ = b.recv_from(&mut buf);
+        assert_eq!(b.adopted(), None, "未知 kind 不得采纳");
+        // ③ Control(hint) → 不采纳（hint 不构成路径证据）
+        exit.send_to(&frame::hint_bytes("203.0.113.5:41641"), &me).unwrap();
+        let _ = b.recv_from(&mut buf);
+        assert_eq!(b.adopted(), None, "Control 帧不得采纳");
+        assert!(b.race_seen.is_empty(), "赛跑来源集不得被非 Data 帧写入");
+        let all: Vec<String> = logs.try_iter().collect();
+        assert!(!all.iter().any(|l| l.starts_with("赛跑结算：")), "非 Data 帧不得打 C5：{all:?}");
+        assert!(!all.iter().any(|l| l.starts_with("路径确立：")), "非 Data 帧不得打 C6：{all:?}");
+        // ④ 合法 Data 帧 → 仍采纳
+        let mut resp = Vec::new();
+        frame::encode_frame(FrameKind::Data, b"hello", &mut resp);
+        exit.send_to(&resp, &me).unwrap();
+        assert_eq!(b.recv_from(&mut buf).unwrap(), Some(5));
+        assert_eq!(b.adopted(), Some(exit_addr));
+    }
+
+    /// F2：未知来源的 hint 过 `probe_addr_acceptable`（私网/CGNAT/fake-IP 注入被拒），
+    /// 可接受地址仍投给 on_hint；已知来源（候选）豁免。
+    #[test]
+    fn unknown_source_hint_filtered() {
+        let exit = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let exit_addr = exit.local_addr().unwrap();
+        let intruder = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let (logf, logs) = log_sink();
+        let hits = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let h2 = Arc::clone(&hits);
+        let mut b = bind(&[Candidate { addr: exit_addr, relay: false }], None, &logf);
+        b.set_on_hint(Arc::new(move |a: &str| h2.lock().unwrap().push(a.to_owned())));
+        let me = format!("127.0.0.1:{}", b.local_port());
+        let mut buf = [0u8; 64];
+        // 未知来源 + 不可接受地址（私网）→ 丢
+        intruder.send_to(&frame::hint_bytes("10.0.0.5:41641"), &me).unwrap();
+        let _ = b.recv_from(&mut buf);
+        assert!(hits.lock().unwrap().is_empty(), "私网 hint 应被拒");
+        assert!(
+            logs.try_iter().any(|l| l.contains("HINT 忽略未知来源")),
+            "应打忽略行"
+        );
+        // 未知来源 + 可接受地址（TEST-NET-3）→ 通过
+        intruder.send_to(&frame::hint_bytes("203.0.113.9:41641"), &me).unwrap();
+        let _ = b.recv_from(&mut buf);
+        assert_eq!(hits.lock().unwrap().as_slice(), &["203.0.113.9:41641".to_owned()]);
+    }
+
+    /// F3：未采纳期按间隔补投 reg（首包丢/时钟偏差自愈），并受次数/时长上界约束。
+    /// 节拍参数注入小值（生产 2s/60s）——不依赖墙钟 sleep，负载机上不假红（代码门 L5）。
+    #[test]
+    fn reg_resend_while_unadopted() {
+        let exit = UdpSocket::bind("127.0.0.1:0").unwrap();
+        exit.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+        let exit_addr = exit.local_addr().unwrap();
+        let (logf, _logs) = log_sink();
+        let mut b = bind(&[Candidate { addr: exit_addr, relay: false }], Some(reg_ctx()), &logf);
+        b.reg_resend_interval = Duration::from_millis(40);
+        let mut buf = [0u8; 2048];
+        // 首包搭 reg
+        b.send_wg(b"a");
+        let (n, _) = exit.recv_from(&mut buf).unwrap();
+        let (k, p) = frame::decode_frame(&buf[..n]).unwrap();
+        assert_eq!(k, FrameKind::Batch.to_wire());
+        assert_eq!(frame::decode_batch(p).unwrap()[0].0, FrameKind::Reg.to_wire());
+        // 间隔未到 ⇒ 不补投
+        b.send_wg(b"b");
+        let (n, _) = exit.recv_from(&mut buf).unwrap();
+        assert_eq!(frame::decode_frame(&buf[..n]).unwrap().0, FrameKind::Data.to_wire(), "间隔内不补投");
+        // 过间隔 ⇒ 补投
+        std::thread::sleep(Duration::from_millis(80));
+        b.send_wg(b"c");
+        let (n, _) = exit.recv_from(&mut buf).unwrap();
+        let (k, p) = frame::decode_frame(&buf[..n]).unwrap();
+        assert_eq!(k, FrameKind::Batch.to_wire(), "过间隔应补投 reg");
+        assert_eq!(frame::decode_batch(p).unwrap()[0].0, FrameKind::Reg.to_wire());
+        assert_eq!(b.reg_resend_n, 1);
+        // 次数上界：达上限后不再补投
+        b.reg_resend_n = REG_RESEND_MAX;
+        std::thread::sleep(Duration::from_millis(80));
+        b.send_wg(b"d");
+        let (n, _) = exit.recv_from(&mut buf).unwrap();
+        assert_eq!(frame::decode_frame(&buf[..n]).unwrap().0, FrameKind::Data.to_wire(), "达次数上界后不再补投");
+        // 时长上界：次数复位但窗口已到 ⇒ 同样不补投（代码门 M3：窗口分支必须有测试）
+        b.reg_resend_n = 0;
+        b.reg_resend_window = Duration::ZERO;
+        std::thread::sleep(Duration::from_millis(80));
+        b.send_wg(b"e");
+        let (n, _) = exit.recv_from(&mut buf).unwrap();
+        assert_eq!(frame::decode_frame(&buf[..n]).unwrap().0, FrameKind::Data.to_wire(), "达时长上界后不再补投");
+        // rearm 归零：恢复阶梯重开一轮预算（新未采纳期）
+        b.rearm();
+        b.send_wg(b"f");
+        let (n, _) = exit.recv_from(&mut buf).unwrap();
+        let (k, p) = frame::decode_frame(&buf[..n]).unwrap();
+        assert_eq!(k, FrameKind::Batch.to_wire(), "rearm 后重新搭 reg");
+        assert_eq!(frame::decode_batch(p).unwrap()[0].0, FrameKind::Reg.to_wire());
+        assert_eq!(b.reg_resend_n, 0, "rearm 归零计数");
     }
 }

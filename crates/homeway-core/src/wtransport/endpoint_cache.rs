@@ -19,6 +19,13 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 /// 学习地址的有效期（Go `LearnedEndpointTTL`）。
 pub const LEARNED_ENDPOINT_TTL: Duration = Duration::from_secs(7 * 24 * 3600);
+/// 单后端学习缓存条数上限（F4；Go 无此上限——本批为**有意分歧**，已登记）。
+pub const MAX_ENTRIES: usize = 64;
+/// 投喂配额窗口（F4）：每窗口内**新增未验证地址**条数上限（hint/probe 共用计数器）。
+pub const FEED_WINDOW: Duration = Duration::from_secs(60);
+/// 投喂配额上限（F4）：一次探测应答可注入 ≤8 条永久候选，多个应答/多次 hint 可无限
+/// 灌入；只计**新增**（刷新已有条目不计），rearm 归零。
+pub const FEED_MAX_NEW: usize = 24;
 
 /// 学习来源（provenance；强度 Inband > Hint = Probe > Token）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
@@ -73,6 +80,12 @@ pub struct EndpointCache {
     /// 上次写盘内容（节流：内容未变不写）。
     last_raw: String,
     logf: Option<crate::Logf>,
+    /// 条数上限（F4：cap 是唯一必须的硬界；落 observe/mark_verified/load/merge_disk/
+    /// entries 出口——只落写入侧的话 `merge_disk`/`load` 仍能绕过）。
+    max_entries: usize,
+    /// 投喂配额窗口起点与窗口内新增未验证地址数（F4；hint/probe 共用）。
+    feed_win: Option<SystemTime>,
+    feed_new: usize,
 }
 
 fn now_ms(t: SystemTime) -> i64 {
@@ -97,6 +110,9 @@ impl EndpointCache {
             peer_hex: String::new(),
             last_raw: String::new(),
             logf: None,
+            max_entries: MAX_ENTRIES,
+            feed_win: None,
+            feed_new: 0,
         }
     }
 
@@ -146,6 +162,7 @@ impl EndpointCache {
                 );
             }
         }
+        self.trim();
     }
 
     /// 落盘（内容未变不写；原子写 tmp+rename；**写前重读合并**——同一 peerID 的两份
@@ -213,10 +230,16 @@ impl EndpointCache {
                 });
             }
         }
+        self.trim();
     }
 
     /// 记录一条学习到的地址（hint/inband/token）：刷新时间；来源按强度升级。
-    pub fn observe(&mut self, addr: SocketAddr, source: EndpointSource, now: SystemTime) {
+    /// 返回 false = 被**投喂配额**拒绝（F4：本窗口新增未验证地址超限；刷新已有条目
+    /// 不计配额、永不被拒）。
+    pub fn observe(&mut self, addr: SocketAddr, source: EndpointSource, now: SystemTime) -> bool {
+        if !self.feed_allows(addr, source, now) {
+            return false;
+        }
         let ts = now_ms(now);
         let e = self.entries.entry(addr).or_insert(LearnedEndpoint {
             addr,
@@ -228,9 +251,12 @@ impl EndpointCache {
         if source.strength() > e.source.strength() {
             e.source = source;
         }
+        self.trim_except(Some(addr));
+        true
     }
 
-    /// 标记「该地址上完成过一次成功认证会话」（缺记录时补建）。
+    /// 标记「该地址上完成过一次成功认证会话」（缺记录时补建）。verified 是保护档，
+    /// 不受投喂配额约束。
     pub fn mark_verified(&mut self, addr: SocketAddr, source: EndpointSource, now: SystemTime) {
         let ts = now_ms(now);
         let e = self.entries.entry(addr).or_insert(LearnedEndpoint {
@@ -243,6 +269,65 @@ impl EndpointCache {
         if source.strength() > e.source.strength() {
             e.source = source;
         }
+        self.trim_except(Some(addr));
+    }
+
+    /// rearm 归零投喂配额（F4：软/硬赛跑是「重新开始」的语义边界）。
+    pub fn note_rearm(&mut self) {
+        self.feed_win = None;
+        self.feed_new = 0;
+    }
+
+    /// 投喂配额判定：只对**新增**的不可信来源（hint/probe）计数；刷新已有条目、
+    /// 以及可信来源（inband/token）不受限。
+    fn feed_allows(&mut self, addr: SocketAddr, source: EndpointSource, now: SystemTime) -> bool {
+        if self.entries.contains_key(&addr) {
+            return true;
+        }
+        if matches!(source, EndpointSource::Inband | EndpointSource::Token) {
+            return true;
+        }
+        let t = now_ms(now);
+        let expired = self
+            .feed_win
+            .is_none_or(|w| t.saturating_sub(now_ms(w)) >= FEED_WINDOW.as_millis() as i64);
+        if expired {
+            self.feed_win = Some(now);
+            self.feed_new = 0;
+        }
+        if self.feed_new >= FEED_MAX_NEW {
+            return false;
+        }
+        self.feed_new += 1;
+        true
+    }
+
+    /// 超 cap 时从**排序尾部**淘汰（保护 verified：未验证优先、其中最旧 learned 先出；
+    /// 全 verified 时淘汰最久未验证的）。
+    fn trim(&mut self) {
+        self.trim_except(None);
+    }
+
+    /// `protect` = 本次刚接纳的新条目——**新条目永不被拒**（设计 F4 的核心：全 verified
+    /// 且表满时若把新 hint 自己淘汰掉，就等于「存不进」，漫游/换网新线索永久丢失）。
+    /// 故淘汰只在**既有条目**里挑排序尾部。
+    fn trim_except(&mut self, protect: Option<SocketAddr>) {
+        while self.entries.len() > self.max_entries {
+            let ranked: Vec<LearnedEndpoint> = self
+                .sorted_all()
+                .into_iter()
+                .filter(|e| Some(e.addr) != protect)
+                .collect();
+            let Some(victim) = ranked.last() else { break };
+            self.entries.remove(&victim.addr);
+        }
+    }
+
+    /// 全量排序（不按 TTL 过滤——淘汰必须能清掉过期条目，否则过期条目永不退场）。
+    fn sorted_all(&self) -> Vec<LearnedEndpoint> {
+        let mut out: Vec<_> = self.entries.values().copied().collect();
+        out.sort_by(cmp_rank);
+        out
     }
 
     /// TTL 内、按「已验证优先 → 最近验证 → 最近学习 → 地址定序」排序的记录。
@@ -254,12 +339,8 @@ impl EndpointCache {
             .copied()
             .filter(|e| e.valid(now, self.ttl.unwrap_or(LEARNED_ENDPOINT_TTL)))
             .collect();
-        out.sort_by(|a, b| {
-            b.verified().cmp(&a.verified())
-                .then(b.verified_at.cmp(&a.verified_at))
-                .then(b.learned_at.cmp(&a.learned_at))
-                .then(a.addr.to_string().cmp(&b.addr.to_string()))
-        });
+        out.sort_by(cmp_rank);
+        out.truncate(self.max_entries); // 出口截断（F4：C13 条数上界）
         out
     }
 
@@ -364,6 +445,15 @@ fn hex_encode(b: &[u8]) -> String {
     b.iter().map(|x| format!("{x:02x}")).collect()
 }
 
+/// 排序键（`entries()` 与淘汰共用）：已验证优先 → 最近验证 → 最近学习 → 地址定序。
+fn cmp_rank(a: &LearnedEndpoint, b: &LearnedEndpoint) -> std::cmp::Ordering {
+    b.verified()
+        .cmp(&a.verified())
+        .then(b.verified_at.cmp(&a.verified_at))
+        .then(b.learned_at.cmp(&a.learned_at))
+        .then(a.addr.to_string().cmp(&b.addr.to_string()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -425,5 +515,101 @@ mod tests {
         c2.observe(addr(5), EndpointSource::Probe, t0);
         let m2 = c2.merge(&[Candidate { addr: addr(5), relay: true }], t0);
         assert_eq!(m2, vec![Candidate { addr: addr(5), relay: true }]);
+    }
+
+    /// F4：超 cap 插入 ⇒ 条数受限、未验证/最旧先出、**已验证保留**；全 verified + 表满
+    /// ⇒ 新条目仍被接纳（淘汰尾部，不得因满而丢新 hint）。
+    #[test]
+    fn cap_evicts_tail_and_protects_verified() {
+        let mut c = EndpointCache::new();
+        c.max_entries = 3;
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        // 一条已验证（长连活口）——必须活到最后
+        c.mark_verified(addr(1), EndpointSource::Probe, t0);
+        // 灌入未验证条目：最旧 learned 先出
+        for p in 2..=5u16 {
+            c.observe(addr(p), EndpointSource::Hint, t0 + Duration::from_secs(p as u64));
+        }
+        let list = c.entries(t0 + Duration::from_secs(100));
+        assert_eq!(list.len(), 3, "条数受限");
+        assert!(list.iter().any(|e| e.addr == addr(1)), "已验证保留");
+        assert!(!list.iter().any(|e| e.addr == addr(2)), "最旧未验证先出");
+        assert!(list.iter().any(|e| e.addr == addr(5)), "最新未验证在");
+
+        // 全 verified + 表满：新条目仍被接纳（淘汰尾部）
+        let mut c2 = EndpointCache::new();
+        c2.max_entries = 2;
+        c2.mark_verified(addr(1), EndpointSource::Probe, t0);
+        c2.mark_verified(addr(2), EndpointSource::Probe, t0 + Duration::from_secs(1));
+        assert!(c2.observe(addr(3), EndpointSource::Hint, t0 + Duration::from_secs(2)), "新条目永不被拒");
+        let list = c2.entries(t0 + Duration::from_secs(10));
+        assert_eq!(list.len(), 2);
+        assert!(list.iter().any(|e| e.addr == addr(3)), "新条目在表");
+    }
+
+    /// F4：`load`/`merge_disk` 超 cap 也受限（写盘路径不得绕过 cap）。
+    /// **真断言**（代码门 M2）：直接看内部表 `entries.len()`——用 `entries()` 出口
+    /// 断言会被出口 `truncate` 兜住，测不出 load/merge 自己是否 trim。
+    #[test]
+    fn load_and_merge_respect_cap() {
+        let dir = std::env::temp_dir().join(format!("hw-epc-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let peer = crate::token::PeerId::from([0x11u8; 32]);
+        {
+            let mut c = EndpointCache::open(&dir, peer);
+            c.max_entries = 64;
+            for p in 1..=6u16 {
+                c.observe(addr(p), EndpointSource::Hint, t0 + Duration::from_secs(p as u64));
+            }
+            c.save(t0 + Duration::from_secs(10)).unwrap();
+        }
+        // load 真断言：默认 cap 下 open 已装载 6 条；调小 cap 后再 load 一次同盘文件，
+        // 内部表必须被 trim 到 2（不是靠 entries() 出口截断）。
+        let mut c = EndpointCache::open(&dir, peer);
+        assert_eq!(c.entries.len(), 6, "默认 cap 下 load 全量装载");
+        c.max_entries = 2;
+        c.load();
+        assert_eq!(c.entries.len(), 2, "load 自身必须 trim（真断言）");
+        // merge_disk 真断言：满表内存 + 磁盘 6 条合并后仍 ≤ cap
+        let mut c2 = EndpointCache::open(&dir, peer);
+        c2.max_entries = 1;
+        c2.merge_disk();
+        assert_eq!(c2.entries.len(), 1, "merge_disk 自身必须 trim（真断言）");
+        assert!(c2.entries(t0 + Duration::from_secs(31)).len() <= 1, "出口截断兜底");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F4：投喂配额——每窗口新增未验证地址 ≤ FEED_MAX_NEW（hint/probe 共用）；刷新
+    /// 已有条目不计；新窗口重置；rearm 归零。
+    #[test]
+    fn feed_quota_shared_and_reset() {
+        let mut c = EndpointCache::new();
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let mut accepted = 0usize;
+        for p in 0..(FEED_MAX_NEW as u16 + 10) {
+            if c.observe(addr(1000 + p), EndpointSource::Hint, t0) {
+                accepted += 1;
+            }
+        }
+        assert_eq!(accepted, FEED_MAX_NEW, "hint 新增受配额");
+        // probe 与 hint 共用同一计数器
+        assert!(!c.observe(addr(9999), EndpointSource::Probe, t0), "probe 共享同一配额");
+        // 刷新已有条目不被拒
+        assert!(c.observe(addr(1000), EndpointSource::Hint, t0), "刷新已有条目不计配额");
+        // 下一窗口重置（满额可用）
+        let t1 = t0 + FEED_WINDOW + Duration::from_secs(1);
+        let mut again = 0usize;
+        for p in 0..(FEED_MAX_NEW as u16 + 5) {
+            if c.observe(addr(2000 + p), EndpointSource::Hint, t1) {
+                again += 1;
+            }
+        }
+        assert_eq!(again, FEED_MAX_NEW, "新窗口重置配额");
+        // rearm 归零（同窗口内）
+        assert!(!c.observe(addr(3000), EndpointSource::Hint, t1), "同窗口已用尽");
+        c.note_rearm();
+        assert!(c.observe(addr(3000), EndpointSource::Hint, t1), "rearm 归零配额");
     }
 }
