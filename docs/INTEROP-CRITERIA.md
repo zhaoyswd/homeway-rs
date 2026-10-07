@@ -210,6 +210,18 @@ v6 路径）+ Rust 统一进程出口 42680（upnp=true 同号映射成立 ⇒ v
   在 `on_plain` 直接丢弃——**不产出 Go netstack 会回的 ICMP 不可达**（`build_icmp_unreachable`
   现仅对 UDP 生效，扩展面另议）；收益 = 移除每包 `socket/bind/connect` 开销与 `dialfail` 计数
   噪声（**非**「占表」——拨号失败同调用内 `remove_flow`，不留存）。
+- **【Q-D 批，2026-10-08】差分下发行集合的竞态窗口（F2，行文不变）**：`flushed` 指纹的推进收紧为
+  「只在第 y 行内容进入一次下发载荷时推进」——1Hz 采样（`screen_text`）此前会无条件提交指纹，
+  导致该行在下次变化前**永久不再下发**（客户端字形/光标错位；最小复现已转正为回归测试）。
+  新语义：竞态窗口内下发的行集合可能变化（**以前被静默丢掉的行现在会补发**；快照路径提交全屏
+  指纹后，后续增量不重复带已随快照发过的行——幂等且更省）。
+- **【Q-D 批，2026-10-08】EXPLAIN 文本面与回滚折行（F8，行文不变）**：`plain_text` 在**备用屏**
+  下从「恒空串」→「活动屏视口文本」（对齐 ghostty formatter 只格式化活动屏）；主屏的
+  回滚行软折行位（WRAPLINE）从「恒 false」→「按行读」——EXPLAIN 的 `screenBytes`/匹配结果
+  在含折行长行滚入回滚的场景下会变化（`region_bytes` 随之变化；定检路径的视口 `ScreenText`
+  不受影响）。
+- **【Q-D 批，2026-10-08】快照镜像窗口行数（F1c）**：见上「计数输入集/数值语义变化」表——
+  宽屏（大 `cols×rows`）下客户端初始滚动窗口变小，超出部分走 FETCH-ROWS 按需拉取（规格场景不变）。
 - **【Q-B 批，2026-10-07】应用层丢新（F3/F4，接受的差异）**：`out_udp` 超条数/字节上限、以及
   `tx_deferred` 滞留超 `TX_DEFER_MAX_BYTES`（非 TCP 包）时**丢新 + 计数**（`udpDrop`/`shapeDrop`）。
   Go 侧对应面是内核 rcvbuf 界定 / 无界 channel——本层以显式上限换取内存有界，代价是压力下丢新
@@ -336,9 +348,13 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 | 2026-10-07（Q-C 批落地） | **中继注册腿上限拒绝行**（`中继：注册腿总数已达上限 %d，拒绝新的 %x（防匿名洪水）`——**非 R1–R13 判据行**，仅中继运维日志） | 现状「HELLO 即占 `legs` 槽、超限在 HELLO 拒」→「HELLO 只写独立 `pending` 挑战表（≤64、满按最旧淘汰**不拒绝**），PROOF 通过才提升进 `legs`（受 `max_legs` 闸）」——**拒绝点从 HELLO 移到 PROOF 提升**；边缘：极端洪水下合法 PROOF 因 `pending` 条目被淘汰而未命中时**静默计 `伪造`**（R10 `伪造` 输入集边缘变化；后端 5s 重发 HELLO 自愈，代码门 M1 登记） | F5：未认证 HELLO 不得占用受 `max_legs` 约束的腿槽（匿名洪水面）。**设计文档「无状态 cookie 挑战」版经复验不可实现**（PROOF 校验必须知道 HELLO 的 pubkey——token 模式 `HMAC(secret,"relay-psk"‖nonce‖pubkey)`、开放模式 DH 均需；而 PROOF wire 固定 50B **不含 pubkey**、`label=sha256(pubkey)[:8]` 不可逆）⇒ 采设计文档「备选」pending 分表（**用户裁决 2026-10-07**） | `relay/mod.rs`（`Leg`/`PendingLeg`/`handle_control`/`reap_round`）、单测 `hello_flood_does_not_occupy_legs`/`pending_full_evicts_oldest_not_reject`/`legs_cap_applied_at_promotion`；中继运维日志读者 |
 | 2026-10-07（Q-C 批落地） | **`tunnel_addr` 撞车分支**（派生隧道地址） | 极稀有/可研磨设备（自选公钥使 raw 派生 == `SERVER_TUNNEL_IP` = 100.64.255.1）→ 按 `hw-tun.N`/`hw-app.N`（N=2..9）再散列值 | F11：`SERVER_TUNNEL_IP`（v=65281）落在 `derive_tunnel_ip` 值域 `[1,65534]` 内且两端无守卫（共享缺口）；碰撞**可故意研磨**（~6.5e4 次） | **wire 差异（双侧对称）**：客户端 `derive_tunnel_ip`/`derive_tun_ip`（`tunnel_addr.rs`）与服务端 `table.rs` 派生同规则；旧对端/fixtures 向量对该设备地址不一致 ⇒ 直接连不上（已知代价）；`fixtures/vectors/tunnel_addr.json` 现有样本不撞车（取值不变） |
 
+| 2026-10-08（Q-D 批落地） | **E16a/E16b 尺寸字段**（`新建会话 … 80x24` / `腿接入（kind=… 80x24 …）`；同族面 = LIST JSON 的 `cols`/`rows` 与 ATTACHED 的 `cols`/`rows`） | 任意 u16 尺寸原样接受（`RESIZE/HELLO 65535×65535` ⇒ alacritty 按 `rows×cols` 即时分配两屏，实测 ≈96–192 GiB，分配失败 = abort）→ **>1000×500 夹取到上限**；`RESIZE 0×0` **忽略本次上报**（会话几何保持旧值，对齐 Go 的 0 门在尺寸写点之前） | **修复型变更**（P0-3，实测锚）：尺寸入径此前无上限（alacritty 无 MAX，`MIN_COLUMNS` 全库零引用）；`RESIZE 0×0` 曾把会话几何污染成 0×0 而格流仍按 vt 宽编（客户端错位）——Rust 独有移植偏差 | `docs/INTEROP-CRITERIA.md` E16a/E16b 行、`service.rs`（HELLO/RESIZE 入径 + LIST/ATTACHED 路径）、`term/size.rs`、单测 `vt_size_gate_rejects_oversize_and_zero`/`resize_clamp_and_zero_ignore`/`normalized_boundaries`/`report_gate_zero_and_clamp`；**正常尺寸（≤1000×500 且非 0）逐字节不变**；raw CLI 不回读几何 ⇒ 夹取对它是静默的（残余登记见 `docs/reviews/QD.md`） |
+| 2026-10-08（Q-D 批落地） | **surface cell 流 symLen 域**（`[hdr]` 低 7 位 = symbol 字节长） | >127 B 字素簇编码为**错位字节流**（hdr 写 `len & 0x7f` 而体写全量 ⇒ 后续颜色/属性字段全部错位）→ 按 **UTF-8 边界截断到 ≤127 B**（真源 = `codec::marker::SYM_LEN_MASK`，`vt::cell_of` 主截 + `codec::append_cell` 副门） | **修复型变更**：alacritty `push_zerowidth` 无上限（200+ 组合字符可达），7 位长度域约定下现状即错乱帧 | `codec.rs`/`vt.rs`、单测 `vt_symbol_cluster_truncated_at_boundary`/`surface_symbol_truncation_roundtrip`/`append_cell_secondary_gate_alignment`、fuzz 哨兵 `fuzz_term_vt`（每格 ≤127）；**fixtures/vectors 无该形态 ⇒ 无夹具变更** |
 > **上表 E12/decr_flow 两行 = 2026-10-07 Q-B 批落地登记**（Q-A 批预登记的占位条目已按本政策补全
-> 「从 → 到」实际行文并去掉「占位」标注，同批 commit）；**其下两行 = 2026-10-07 Q-C 批落地登记**。
-> 登记生效后，E12 关闭行与 flows 计数按新行文验收（旧行文不再要求同串）。
+> 「从 → 到」实际行文并去掉「占位」标注，同批 commit）；**其下两行 = 2026-10-07 Q-C 批落地登记**；
+> **再下两行 = 2026-10-08 Q-D 批落地登记**（E16a/E16b 尺寸字段 + surface symLen 域）。
+> 登记生效后，E12 关闭行与 flows 计数按新行文验收（旧行文不再要求同串）；Q-D 的尺寸面按
+> 「正常尺寸逐字节同串、极端输入按登记」验收。
 
 ### 计数输入集 / 数值语义变化（**行文不变**，登记留痕）
 
@@ -360,4 +376,6 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 | 2026-10-07（Q-C） | **R10** `中继统计：… 转发 上 %d / 下 %d 包｜丢弃 %d` | ①「转发 上/下」**只计成功**（`send_to` 返 Err 不再计成功）；②「丢弃」**输入集扩大**：新增「全局分配腿上限（1024）拒绝」入 `dropped`（限流/每腿上限等旧口径不变）；③ 拨腿等腿窗 `pend` **入队即计** `forwarded_up`（既有语义，本批未改——回放失败只进 `send_fail_up`，不再动下行面）；新增 `send_fail_up`/`send_fail_down`/`down_limited` 为 **additive** 计数（中继无 JSON 遥测通道，仅日志/单测可见） | F7/F8：静默丢包计成功修正 + 下行字节桶 + 全局 assoc 闸 | R10 数值、`relay/mod.rs` 单测 `assoc_lazy_bump_and_down_fail_counted` |
 | 2026-10-07（Q-C） | **中继 assoc 下行速率**（上行 200pps ≈2.7Mbps 口径之外的**下行**面） | 无上限 → 每会话字节桶 16MiB/s（≈128Mbit/s；目标 ≥100Mbit/s） | F7.2：下行准入限流（**性能行为差异**；**禁止**复用 `leg_rate_ok` 的 2000pps ≈22Mbit/s 硬顶） | 中继下行吞吐、`relay/mod.rs`（`ASSOC_DOWN_BYTES_PER_SEC`） |
 | 2026-10-07（Q-C） | **观测面 additive**：探针 flags 中继降级位（bit5 `FLAG_RELAY_CTL_DEGRADED`）/ `send_fail_*` / `down_limited` / 中继拒绝日志限流 | 无 → 有 | F7/F8/F10/F6：中继无 JSON 遥测通道，本批多为日志/单测可见 | 探针 flags（**中继命名空间** bit5；serve 侧 bit0–4 与 C14 **不受影响**）、`relay/mod.rs` 单测 `probe_flags_report_ctl_degraded` |
+| 2026-10-08（Q-D） | **快照镜像窗口行数**（SNAPSHOT 体的 mirror 段；不在判据行、无夹具） | 恒 `rows × 10`（视口数）→ `min(rows × 10, 32MiB / (cols × 48B))`（下限 64 行；1000 列 ⇒ 699 行） | F1c：快照材质内存上界（上限处最坏 ≈200 MiB/次 + 反复 RESIZE 可反复触发） | 快照镜像面、`service.rs`（`mirror_rows_budget`/`mirror_window_rows`）、单测 `mirror_window_rows_budget`；**窄屏（80/100 列）与既有 golden 形态不变**；宽屏客户端滚动窗口变小（FETCH-ROWS 按需拉取兜底，tier `term-surface-protocol` 场景不变） |
+| 2026-10-08（Q-D） | **新增观测行（additive）** | 无 → 有：`term: 会话 {n} 查询应答丢弃 {n} 条（队列满）` / `剪贴板写丢弃 {n} 条` / `PTY 注入丢弃 {n} 条（队列满）`（节流：首 3 次 + 每 100 次；消费者已退出时尾缀换 `（消费者已退出）`——代码门 M3）；`term: {ctx}{term-pump\|term-leg-writer\|term-surface\|term-resp\|term-sample\|term-conn} 线程 panic（已兜住）：{载荷}`；`term: 会话 {n} 尺寸夹取 {cols}x{rows} → {c}x{r}（上限 1000x500）`（**只在夹取结果真变、尺寸真被应用时打**——同值重复上报不刷屏，代码门 L5）；`term: 会话 {n} 忽略 RESIZE 0×0 上报 {k} 次（会话几何保持）`（节流同款）；腿断开归因新增 `原因=panicked` | F6/F7/F1a 观测面（原 `resp_dropped` 只写不读、nudge 丢弃与线程 panic 静默） | 非 E 族判据行；`docs/reviews/QD.md`、`service.rs` 单测 `drop_counters_and_throttled_log`/`guard_thread_logs_and_reports_action`/`nudge_bytes_for_three_states`/`sample_tick_panic_keeps_loop_alive`、E16d 的 `原因=` 归因集合新增 `panicked`（词表是自由文本归因，非 ENDED reason 词表） |
 | 2026-10-08（Q-I 前段） | **udpcap 探测周期 / caps 新鲜度**（`UDP 默认路径：…` 行 = 本表 udpcap 的 `—` 行，**行文与语义均不变**） | 频次：**bindwatch 在位形态**（auto 挑卡/显式绑卡 = 生产形态）周期 `~600s`（`recv_timeout(300s)` 超时后又 `sleep(300s)`，等于每拍睡两次）→ **`~300s`**（超时即重探；对齐 Go `udpcap.go:26` 5min ticker + kick，`udpcap.go:140-152`）；**`--bind-interface none` 形态本已 ~300s（不变）**。喂客户端 C14 的 caps 位新鲜度：`≤10min` → **`≤5min`**（kick 面即时重探不变） | Q-I F7：`recv_timeout` 的 Timeout 与 Disconnected 未区分（多睡一拍） | `UDP 默认路径` 行频次（行文不变）、caps 新鲜度、`server/engine.rs` 纯函数 `udpcap_disconnected_backoff` + 单测 `udpcap_wait_three_states`；**非**编号判据行（无 R1–R13/E* 行文变更） |
