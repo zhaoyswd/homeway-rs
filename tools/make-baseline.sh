@@ -2,7 +2,9 @@
 # make-baseline.sh — 重建 baseline/homeway 快照克隆（R0.2；克隆 gitignore 不入库，本脚本可重跑）
 #
 # 用法：tools/make-baseline.sh [--force] [hash]
-#   hash 缺省 = docs/BASELINE.md 锚定的 621fe0e（升级基线时显式传新 hash 并更新 BASELINE.md）
+#   hash 缺省 = docs/BASELINE.md 锚定的 d4148f6 —— **基线已冻结（2026-10-07）：Go 仓退役，
+#   快照不再前移**，此缺省值即长期值；仅在「为复现历史判据而重建快照」等特殊情况下显式传 hash
+#   （并同步 docs/BASELINE.md 说明）。
 #
 # 步骤：本地 clone（**不用 --shared**：alternates 借 dev 仓对象库，发版会话一旦 repack/gc
 #   快照即损坏——本地 clone 默认硬链接对象，自足且省盘）→ **移除 origin 远程**（push URL
@@ -15,7 +17,7 @@ REPO_ROOT="${0:h:A:h}"
 DEV_HOMEWAY="$HOME/Documents/projects/homeway"
 TIER_VT="$HOME/Documents/projects/tier/third_party/homeway/third_party/libghostty-vt/prebuilt/darwin-arm64"
 ARG1="${1:-}"
-if [[ "$ARG1" == "--force" ]]; then HASH="${2:-621fe0e173e13b7a0a58da657860a615e0204664}"; else HASH="${ARG1:-621fe0e173e13b7a0a58da657860a615e0204664}"; fi
+if [[ "$ARG1" == "--force" ]]; then HASH="${2:-d4148f658513c10e8cb7f67a1096b0c080f5f79c}"; else HASH="${ARG1:-d4148f658513c10e8cb7f67a1096b0c080f5f79c}"; fi
 CLONE="$REPO_ROOT/baseline/homeway"
 
 if [[ -d "$CLONE" && "$ARG1" != "--force" ]]; then
