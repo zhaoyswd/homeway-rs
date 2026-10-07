@@ -40,7 +40,7 @@ use crate::Logf;
 
 use self::dnsface::{DnsFaces, DnsRoute};
 use self::nat::Ipv4View;
-use crate::server::dnsproxy::{DnsProxy, DnsReply};
+use crate::server::dnsproxy::{DnsProxy, DnsReply, SubmitOutcome};
 
 /// TCP 并发上限（serve 装配层覆盖包内默认 4096——FIX-63 生产值）。
 pub const MAX_CONNS: usize = 1024;
@@ -58,6 +58,20 @@ const TCP_DNS_IDLE: Duration = Duration::from_secs(30);
 const MAX_TCP_DNS_LEGS: usize = 64;
 /// UDP 会话上限（保险阀）。
 pub const MAX_UDP_SESSIONS: usize = 4096;
+/// DNS 待答路由表在途量告警阈值（F2/[门-A4] 观测面：正常随应答回投归零；持续高于
+/// 本阈值 = 回执回收失灵——丢弃路径漏回收 tag / 回投通道无人 drain）。**低于
+/// `MAX_IN_FLIGHT=256`**（评审 L2：取 256 时「worker panic ⇒ in_flight 有界滞留」
+/// 这条残余永远到不了阈值，信号面失效）。
+const DNS_PENDING_WARN: usize = 128;
+/// 单流栈→upstream 待写**数据报条数**上限（F3：UDP 语义丢新+计数——不阻塞不排队）。
+/// 64 = 与栈内 socket 的 tx 元数据槽数同量级；字节上限复用 `WATERMARK`。
+const MAX_OUT_UDP_PKTS: usize = 64;
+/// UDP 栈→upstream **读侧门**阈值（F3/[门-B7]）。**严格低于字节上限 `WATERMARK`**：
+/// 达阈值即停读该流（栈 rx 缓冲填满 ⇒ 栈层丢新），使门成为真正的背压面；`WATERMARK`
+/// 上限则拦「单拍读尽」造成的越界。两者同阈值时上限会先拦、门成死代码（评审 M3）。
+const UDP_OUT_GATE: usize = WATERMARK / 2;
+// 门阈值须严格低于字节上限（评审 M3 的编译期守卫）。
+const _: () = assert!(UDP_OUT_GATE < WATERMARK);
 /// 非阻塞 connect 死线（Go dialTimeout 同值；reap_idle 先判）。
 const DIAL_TIMEOUT: Duration = Duration::from_secs(10);
 /// upstream 读块大小（旧 worker 的 Go bufSize 同值）。
@@ -158,11 +172,27 @@ impl VecDequeLite {
     }
     fn consume(&mut self, n: usize) {
         self.off += n;
-        if self.off == self.buf.len() {
+        if self.off >= self.buf.len() {
             self.buf.clear();
+            self.off = 0;
+        } else if self.off * 2 >= self.buf.len() {
+            // 死前缀原地压缩（P0-1）：上游持续 `push` 与部分写交错时 `off` 难命中
+            // `buf.len()`，死前缀 `buf[..off]` 若不回收 ⇒ backing `Vec` 随累计传输量
+            // 线性增长。压缩阈值 `off*2 >= len` ⇒ 每字节摊还 ≤1 次 `copy_within`
+            // （无分配），且不变量 `len = off + remaining < 2*remaining` 保 backing 有界。
+            let len = self.buf.len();
+            self.buf.copy_within(self.off.., 0);
+            self.buf.truncate(len - self.off);
             self.off = 0;
         }
     }
+}
+
+/// `dns_tcp_feed` 的返回形态（F2）：`Ok` = 正常（含帧未到齐）；`CloseLeg` = 读到
+/// 空 TCP 消息（`mlen == 0`）——调用方须在 `for flow` 循环**外**统一拆流（[门-A1]）。
+enum FeedOutcome {
+    Ok,
+    CloseLeg,
 }
 
 /// 非阻塞 connect 的返回形态（即时成功也走统一验收收口——R-1：即时成功不产生
@@ -339,6 +369,14 @@ pub const TX_SHAPE_RATE: u64 = 200 * 1024 * 1024;
 /// 19-40 波动）；256KB = 修复前 3.1MB 倾泻的 1/12、≈ Go 出口自然发送团的量级——
 /// 团块钳制与无排队同时成立（B 热态 25-28 平稳无锯齿）。
 pub const TX_SHAPE_BURST: usize = 256 * 1024;
+/// `tx_deferred` 滞留字节上限（F4：无窗流丢新；TCP 不丢）。
+///
+/// 取值依据：`16 × TX_SHAPE_BURST = 4 MiB`——≫ 单拍突发额度（256KiB，16 拍才会触及），
+/// 又远小于 OOM 阈值；非 TCP（UDP/DNS/ICMP）并入会超上限时**丢新 + 计数**，TCP 保持
+/// 不丢（字节流丢字节 = 流错位，比内存增长更严重）。TCP 侧上界仍是「Σcwnd +
+/// Σ(FLOW_TX_BUF 未释放部分) ≤ MAX_CONNS(1024) × ~1MB ≈ 1GB」的全局最坏（登记口径，
+/// 见 `docs/reviews/QB.md`）。
+const TX_DEFER_MAX_BYTES: usize = 16 * TX_SHAPE_BURST;
 
 /// 出口发送整形参数（字节令牌桶——团块钳制面；v0.2.2 简洁化批起逐包时刻表
 /// 已删除，只剩令牌桶本体 + `HOMEWAY_TX_SHAPING` 逃生口）。
@@ -475,6 +513,13 @@ pub struct Stats {
     /// transit UDP 会话的归宿（收到过回包 / 只有上行——udpcap 实测位）。
     udp_replied: AtomicU64,
     udp_no_reply: AtomicU64,
+    /// UDP 应用层丢新（F3：栈→upstream 门/上限丢新 + 回投客户端失败；F10：UDP :53
+    /// 应答写回失败——同族静默失败，独立计数不改既有计数器语义）。
+    udp_drop: AtomicU64,
+    /// 发送整形滞留上限丢新（F4：无窗流并入会超 `TX_DEFER_MAX_BYTES` 时丢新）。
+    shape_drop: AtomicU64,
+    /// IPv4 分片丢弃（F7：非首片/MF 置位——拒绝 Go/gVisor 会重组的形态）。
+    frag_drop: AtomicU64,
 }
 
 impl Stats {
@@ -504,7 +549,20 @@ impl Stats {
             self.udp_no_reply.fetch_add(1, Ordering::Relaxed);
         }
     }
-    pub fn snapshot(&self) -> [(&'static str, u64); 6] {
+    /// UDP 应用层丢新/回投失败（F3/F10）。
+    fn incr_udp_drop(&self) {
+        self.udp_drop.fetch_add(1, Ordering::Relaxed);
+    }
+    /// 发送整形滞留上限丢新（F4）。
+    fn incr_shape_drop(&self) {
+        self.shape_drop.fetch_add(1, Ordering::Relaxed);
+    }
+    /// IPv4 分片丢弃（F7）。
+    fn incr_frag_drop(&self) {
+        self.frag_drop.fetch_add(1, Ordering::Relaxed);
+    }
+    /// 观测快照（键名 = 观测面契约；新增计数一律**追加末位**——保既有索引断言）。
+    pub fn snapshot(&self) -> [(&'static str, u64); 9] {
         [
             ("dialok", self.dial_ok.load(Ordering::Relaxed)),
             ("dialfail", self.dial_fail.load(Ordering::Relaxed)),
@@ -512,6 +570,9 @@ impl Stats {
             ("rejected", self.rejected.load(Ordering::Relaxed)),
             ("udpReplied", self.udp_replied.load(Ordering::Relaxed)),
             ("udpNoReply", self.udp_no_reply.load(Ordering::Relaxed)),
+            ("udpDrop", self.udp_drop.load(Ordering::Relaxed)),
+            ("shapeDrop", self.shape_drop.load(Ordering::Relaxed)),
+            ("fragDrop", self.frag_drop.load(Ordering::Relaxed)),
         ]
     }
 }
@@ -658,6 +719,10 @@ struct Flow {
     udp_replied: bool,
     /// UDP 会话号（E12 关闭行用——建立时分配、关闭时回放，评审 M4）。
     udp_seq_of: u64,
+    /// flows gauge 配对守卫（F5）：`establish` 置位并 `incr_flow`，`retire` 仅在此位
+    /// 为真时 `decr_flow` 并清零。防「未 incr 即 decr」（listen 失败、close() 期在途
+    /// Dialing 流）导致的 gauge 回绕。守卫状态由 establish/retire 转移伴生。
+    counted: bool,
     /// TCP：建流 SYN 的 seq（拨号失败构造 RST|ACK 的 ack 依据）。
     syn_seq: u32,
     /// TCP DNS 腿的 RFC1035 分帧积攒（2B 长度前缀 + 报文；跨读保留不完整帧）。
@@ -854,6 +919,14 @@ impl Interceptor {
         let Some(v) = Ipv4View::parse(&pkt) else {
             return; // 畸形：静默丢（IP 层）
         };
+        // F7：分片（非首片 `frag_off>0` 或 MF 置位）**在 demux 与 by_five 查表之前**丢弃。
+        // 分片与正常包共享五元组——若落在查表之后，非首片会被当独立会话（`body[0..4]`
+        // 被读成端口）、首片被 `rewrite_dst` 污染分片载荷。丢弃即拒绝 Go/gVisor 会重组的
+        // 形态（行为差异登记）；DF-only（off=0、MF=0）不算分片。
+        if v.is_fragment() {
+            self.stats.incr_frag_drop();
+            return;
+        }
         let l4_off = if v.proto == 6 {
             20
         } else if v.proto == 17 {
@@ -880,7 +953,13 @@ impl Interceptor {
             self.device.rx_push(&pkt);
             return;
         }
-        let proto = if v.proto == 6 { Proto::Tcp } else { Proto::Udp };
+        // F9：仅 TCP(6)/UDP(17) 建会话；其它协议（ICMP 等）丢弃——不再走 udp_new 建
+        // 端口 0 会话（Go 仅注册 TCP/UDP handler，其余交 netstack 兜底；本层直接丢弃）。
+        let proto = match v.proto {
+            6 => Proto::Tcp,
+            17 => Proto::Udp,
+            _ => return,
+        };
         let five = (v.src, v.src_port, v.dst, v.dst_port, v.proto);
         if let Some(&flow) = self.by_five.get(&five) {
             let Some(f) = self.flows.get_mut(&flow) else {
@@ -1003,17 +1082,22 @@ impl Interceptor {
             return;
         }
         let h = self.sockets.add(sock);
-        let f = self.flows.get_mut(&flow).expect("刚判存在");
-        let Phase::Dialing { cache } = std::mem::replace(&mut f.phase, Phase::Established) else {
-            unreachable!("alloc_flow 后必为 Dialing");
+        let cache = {
+            let f = self.flows.get_mut(&flow).expect("刚判存在");
+            match std::mem::replace(&mut f.phase, Phase::Established) {
+                Phase::Dialing { cache } => cache,
+                Phase::Established => Vec::new(), // 防御：alloc_flow 后必为 Dialing
+            }
         };
-        f.sock = Some(h);
+        self.establish(flow, Some(h));
         for mut p in cache {
             nat::rewrite_dst(&mut p, self.cfg.tunnel_ip, rw);
             self.device.rx_push(&p);
         }
-        let (orig_dst, client) = (f.orig_dst, f.client);
-        self.stats.incr_flow();
+        let (orig_dst, client) = {
+            let f = self.flows.get(&flow).expect("刚判存在");
+            (f.orig_dst, f.client)
+        };
         (self.cfg.logf)(&format!(
             "intercept: tcp dns {}:{} ← {}:{}（进程内代答）",
             orig_dst.0, orig_dst.1, client.0, client.1
@@ -1022,38 +1106,49 @@ impl Interceptor {
 
     /// TCP DNS 腿数据面：RFC1035 分帧积攒 → 完整报文投 DNS worker（qtcp 计数面；
     /// 应答经 DnsRoute::TcpFlow 回投）。超长帧（>64KB+2B 缓冲界）按对端异常收线。
-    fn dns_tcp_feed(&mut self, flow: u64, data: &[u8]) {
+    ///
+    /// 返回 `FeedOutcome::CloseLeg` 表示读到**空 TCP 消息**（`mlen == 0`）——与隧道面
+    /// `decode_tcp_frame` + `service_face` 的空帧判异常**同口径收线**（Go 读失败即
+    /// `return`、不计 qtcp）。**收线必须由调用方在 `for flow` 循环外统一做**（[门-A1]：
+    /// 本函数由 `service_sockets` 在同一次迭代内调用，若就地 `teardown_flow` →
+    /// `remove_flow` → `sockets.remove(h)`，该臂后续用快照 `h` 再 `get_mut` 会 panic）。
+    fn dns_tcp_feed(&mut self, flow: u64, data: &[u8]) -> FeedOutcome {
         let Some(f) = self.flows.get_mut(&flow) else {
-            return;
+            return FeedOutcome::Ok;
         };
         f.dns_rx.extend_from_slice(data);
         f.last_active = Instant::now();
         // 循环取完整帧（一条读可能含多条报文）
         loop {
-            let (mlen, query) = {
-                let Some(f) = self.flows.get(&flow) else {
-                    return;
-                };
-                if f.dns_rx.len() < 2 {
-                    return;
+            let query = match self.flows.get_mut(&flow) {
+                Some(f) => {
+                    if f.dns_rx.len() < 2 {
+                        return FeedOutcome::Ok;
+                    }
+                    let mlen = u16::from_be_bytes([f.dns_rx[0], f.dns_rx[1]]) as usize;
+                    if mlen == 0 {
+                        return FeedOutcome::CloseLeg; // 空 TCP 消息：收线（对齐 Go）
+                    }
+                    if f.dns_rx.len() < 2 + mlen {
+                        return FeedOutcome::Ok;
+                    }
+                    let query = f.dns_rx[2..2 + mlen].to_vec();
+                    f.dns_rx.drain(..2 + mlen);
+                    query
                 }
-                let mlen = u16::from_be_bytes([f.dns_rx[0], f.dns_rx[1]]) as usize;
-                if f.dns_rx.len() < 2 + mlen {
-                    return;
-                }
-                (mlen, f.dns_rx[2..2 + mlen].to_vec())
+                None => return FeedOutcome::Ok,
             };
-            if let Some(f) = self.flows.get_mut(&flow) {
-                f.dns_rx.drain(..2 + mlen);
-            }
             let dns = self.cfg.dns.clone().expect("kind=Dns 必有腿");
             let tag = self
                 .dns_faces
                 .as_mut()
                 .map(|faces| faces.route_tag(DnsRoute::TcpFlow(flow)))
                 .unwrap_or(0);
-            if tag != 0 {
-                dns.submit_tcp(tag, query);
+            if tag != 0 && dns.submit_tcp(tag, query) == SubmitOutcome::Dropped {
+                // F2：丢弃路径回收 tag（否则 pending 项永不回收）
+                if let Some(faces) = self.dns_faces.as_mut() {
+                    faces.take_route(tag);
+                }
             }
         }
     }
@@ -1112,6 +1207,7 @@ impl Interceptor {
                 tx_backlog: Vec::new(),
                 fin_pending: false,
                 udp_seq_of: 0,
+                counted: false,
                 udp_replied: false,
                 syn_seq: v.tcp_seq,
                 dns_rx: Vec::new(),
@@ -1322,10 +1418,10 @@ impl Interceptor {
             let Phase::Dialing { cache } = &f.phase else {
                 return;
             };
-            let snap = (cache.clone(), f.kind, f.orig_dst, f.client);
-            f.phase = Phase::Established;
-            snap
+            (cache.clone(), f.kind, f.orig_dst, f.client)
         };
+        // 建立收口（incr_flow 唯一入口——F5）：置 counted + phase→Established。
+        self.establish(flow, None);
         // 栈内 udp socket 就位（DNS 进程内腿无 OS socket——dial_accept 之外也要建；
         // ensure 幂等，验收路径重复调用无害）
         self.ensure_udp_socket(flow);
@@ -1333,7 +1429,11 @@ impl Interceptor {
         // reactor-design §三 R-4：不得借对齐之名重排）
         self.udp_seq += 1;
         let seq = self.udp_seq;
-        self.stats.incr_flow();
+        // F5-1：把真实会话号写回 flow——E12 关闭行打本会话号（此前恒 #0 是缺陷，
+        // 见 `docs/INTEROP-CRITERIA.md` 判据变更记录）。
+        if let Some(f) = self.flows.get_mut(&flow) {
+            f.udp_seq_of = seq;
+        }
         (self.cfg.logf)(&format!(
             "udp intercept: 会话 #{seq} {} 建立（{}:{} ← {}:{}）",
             kind.as_str(),
@@ -1353,8 +1453,11 @@ impl Interceptor {
                     .as_mut()
                     .map(|f| f.route_tag(DnsRoute::UdpFlow(flow)))
                     .unwrap_or(0);
-                if tag != 0 {
-                    dns.submit_leg(tag, q);
+                if tag != 0 && dns.submit_leg(tag, q) == SubmitOutcome::Dropped {
+                    // F2：丢弃路径回收 tag
+                    if let Some(faces) = self.dns_faces.as_mut() {
+                        faces.take_route(tag);
+                    }
                 }
             }
             return;
@@ -1375,6 +1478,12 @@ impl Interceptor {
     /// service_sockets 的 backlog 续写会把它排进栈内 socket（与 worker 上行同路径，
     /// 背压/部分写语义一致）。
     fn dns_tcp_send(&mut self, flow: u64, resp: &[u8]) {
+        // F8：长度域 u16 是协议事实——超 65535 回绕会错位；对齐 Go
+        //（`writeTCPMessage` 返错 → `ServeStream` 返回 → 连接关闭）= 收线。
+        if resp.len() > u16::MAX as usize {
+            self.teardown_flow(flow);
+            return;
+        }
         let Some(f) = self.flows.get_mut(&flow) else {
             return;
         };
@@ -1393,7 +1502,10 @@ impl Interceptor {
         let Some(h) = f.sock else { return };
         let ep = IpEndpoint::new(f.client.0.into(), f.client.1);
         let sock = self.sockets.get_mut::<UdpSocket>(h);
-        let _ = sock.send_slice(data, ep);
+        if sock.send_slice(data, ep).is_err() {
+            // F3：栈 tx 满（应答/回投写不进）不再静默——计数（丢新）。
+            self.stats.incr_udp_drop();
+        }
         if let Some(f) = self.flows.get_mut(&flow) {
             f.last_active = Instant::now();
         }
@@ -1469,6 +1581,7 @@ impl Interceptor {
             None => std::mem::take(&mut self.tx_out),
             Some(_) => {
                 let produce = std::mem::take(&mut self.tx_out);
+                let produce = self.filter_defer(produce);
                 if produce.is_empty() {
                     return Vec::new();
                 }
@@ -1485,6 +1598,28 @@ impl Interceptor {
         }
     }
 
+    /// 并入 `tx_deferred` 前的非 TCP 丢新预筛（F4）。逐包取内层 IP proto——
+    /// **`pkt.get(9)` 而非裸索引**（`tx_out` 允许非 IPv4/短包：`on_tx` parse 失败
+    /// 原样 push，测试也 push 过 8B vec；裸索引会 panic）。
+    /// - TCP（proto 6）：恒不丢（字节流丢字节 = 流错位，比内存增长更严重）；
+    /// - 非 TCP（UDP/DNS/ICMP 等）：并入后总字节会超 `TX_DEFER_MAX_BYTES` ⇒ 丢新 + 计数；
+    /// - 取不到 proto（短包/非 IPv4）：放行不计数（不属数据面）。
+    fn filter_defer(&mut self, produce: Vec<Vec<u8>>) -> Vec<Vec<u8>> {
+        let mut out = Vec::with_capacity(produce.len());
+        let mut bytes = self.tx_deferred_bytes;
+        for p in produce {
+            if let Some(&proto) = p.get(9) {
+                if proto != 6 && bytes + p.len() > TX_DEFER_MAX_BYTES {
+                    self.stats.incr_shape_drop();
+                    continue;
+                }
+            }
+            bytes += p.len();
+            out.push(p);
+        }
+        out
+    }
+
     /// 整形释放（`flush_all` = 收工宽限形态——评审 r2-1.1：宽限路径的原始语义是
     /// 「尽快把尾数据/FIN 送出去」（M2 判据），整形在这里没有收益还会丢尾包——
     /// 原实现每拍只拿令牌放得下的部分，宽限循环在流清空/到点即 break，滞留余量
@@ -1497,16 +1632,17 @@ impl Interceptor {
                 let dt = now.duration_since(self.tx_last_refill).as_secs_f64();
                 self.tx_last_refill = now;
                 let produce = std::mem::take(&mut self.tx_out);
-                let n_defer = self.tx_deferred.len() + produce.len();
-                let b_defer = self.tx_deferred_bytes
-                    + produce.iter().map(|p| p.len()).sum::<usize>();
-                self.tx_win_defer_peak = (
-                    self.tx_win_defer_peak.0.max(n_defer),
-                    self.tx_win_defer_peak.1.max(b_defer),
-                );
                 if flush_all {
                     // 宽限全量释放：deadline 由收工侧兜底，滞留清空（记账面同步）。
-                    // FIFO 保序：滞留（更早产出）在前、本拍产物在后。
+                    // FIFO 保序：滞留（更早产出）在前、本拍产物在后。宽限面**不套**
+                    // F4 上限——尾数据/FIN 尽快上线（M2）优先于内存钳制。
+                    let n_defer = self.tx_deferred.len() + produce.len();
+                    let b_defer = self.tx_deferred_bytes
+                        + produce.iter().map(|p| p.len()).sum::<usize>();
+                    self.tx_win_defer_peak = (
+                        self.tx_win_defer_peak.0.max(n_defer),
+                        self.tx_win_defer_peak.1.max(b_defer),
+                    );
                     let mut out = Vec::with_capacity(self.tx_deferred.len() + produce.len());
                     for p in self.tx_deferred.drain(..) {
                         out.push(p);
@@ -1517,6 +1653,16 @@ impl Interceptor {
                     out
                 } else {
                     self.tx_win_pumps += 1;
+                    // F4：并入前非 TCP 丢新预筛（TCP 不丢；短包放行不计数）
+                    let produce = self.filter_defer(produce);
+                    // 峰值统计在过滤之后（L1：否则峰值可读到 > TX_DEFER_MAX_BYTES）
+                    let n_defer = self.tx_deferred.len() + produce.len();
+                    let b_defer = self.tx_deferred_bytes
+                        + produce.iter().map(|p| p.len()).sum::<usize>();
+                    self.tx_win_defer_peak = (
+                        self.tx_win_defer_peak.0.max(n_defer),
+                        self.tx_win_defer_peak.1.max(b_defer),
+                    );
                     let (out, run) = shape_slice(
                         &mut self.tx_deferred,
                         produce,
@@ -1565,6 +1711,16 @@ impl Interceptor {
                     "intercept: reactor 观测 pump={pumps}/5s（均周期 {:.2}ms）名下fd峰={fds} 单拍峰={}µs",
                     5000.0 / pumps as f64,
                     wall.as_micros(),
+                ));
+            }
+        }
+        // F2/[门-A4] 观测面：DNS 待答路由表在途量（阈值化——正常在途不噪声；持续高位 =
+        // 回执回收失灵）。**独立 additive 行**，不改任何既有行文。
+        if let Some(faces) = self.dns_faces.as_ref() {
+            let pending = faces.pending_len();
+            if pending > DNS_PENDING_WARN {
+                (self.cfg.logf)(&format!(
+                    "intercept: dns 待答路由表在途 {pending} 条（> {DNS_PENDING_WARN}——回执回收失灵信号面）"
                 ));
             }
         }
@@ -1687,7 +1843,12 @@ impl Interceptor {
             match route {
                 DnsRoute::UdpFlow(flow) => self.udp_send_to_client(flow, &resp),
                 DnsRoute::TcpFlow(flow) => self.dns_tcp_send(flow, &resp),
-                DnsRoute::Udp53(from) => faces.deliver_udp53(&mut self.sockets, from, &resp),
+                DnsRoute::Udp53(from) => {
+                    if !faces.deliver_udp53(&mut self.sockets, from, &resp) {
+                        // F10：栈 tx 满/无 socket 时写回失败不再静默——计 udp_drop。
+                        self.stats.incr_udp_drop();
+                    }
+                }
                 DnsRoute::Tcp(h) => faces.deliver_tcp(&mut self.sockets, h, &resp),
             }
         }
@@ -2061,21 +2222,25 @@ impl Interceptor {
                     return;
                 }
                 let h = self.sockets.add(sock);
-                let f = self.flows.get_mut(&flow).expect("刚判存在");
-                let Phase::Dialing { cache } = std::mem::replace(&mut f.phase, Phase::Established)
-                else {
-                    unreachable!("上面已判 Dialing");
+                let cache = {
+                    let f = self.flows.get_mut(&flow).expect("刚判存在");
+                    match std::mem::replace(&mut f.phase, Phase::Established) {
+                        Phase::Dialing { cache } => cache,
+                        Phase::Established => Vec::new(), // 防御：上面已判 Dialing
+                    }
                 };
-                f.sock = Some(h);
+                self.establish(flow, Some(h));
                 // 注入缓存（重写后）——此时 SYN-ACK 会在本拍 poll 产出
                 for mut p in cache {
                     nat::rewrite_dst(&mut p, self.cfg.tunnel_ip, rw);
                     self.device.rx_push(&p);
                 }
                 // 判据行（E10 dialok）
-                let (kind, orig_dst, client) = (f.kind, f.orig_dst, f.client);
+                let (kind, orig_dst, client) = {
+                    let f = self.flows.get(&flow).expect("刚判存在");
+                    (f.kind, f.orig_dst, f.client)
+                };
                 self.stats.incr_ok();
-                self.stats.incr_flow();
                 (self.cfg.logf)(&format!(
                     "intercept: tcp {} {}:{} ← {}:{}（dialok）",
                     kind.as_str(),
@@ -2230,6 +2395,40 @@ impl Interceptor {
         self.maybe_close_dead_io(flow);
     }
 
+    /// 会话建立收口（`incr_flow` **唯一入口**——F5）：置 `counted`、phase→Established、
+    /// 计数；`sock = Some(h)` 时同时落位栈内 socket（`None` = **保持现状**——UDP 腿的
+    /// socket 由 `ensure_udp_socket` 就位，勿在此清空）。与 `retire` 配对；守卫由
+    /// `counted` 位随状态转移伴生（`debug_assert` 兜底重复建立）。
+    fn establish(&mut self, flow: u64, sock: Option<SocketHandle>) {
+        {
+            let Some(f) = self.flows.get_mut(&flow) else {
+                return;
+            };
+            debug_assert!(!f.counted, "重复 establish（flow {flow}）");
+            f.phase = Phase::Established;
+            if sock.is_some() {
+                f.sock = sock;
+            }
+            f.counted = true;
+        }
+        self.stats.incr_flow();
+    }
+
+    /// 会话退役收口（`decr_flow` **唯一入口**——F5）：仅对已 `establish`（`counted`）的
+    /// 流计数。防「未 incr 即 decr」的 gauge 回绕：① `dns_tcp_establish` listen 失败、
+    /// ② `dial_accept` listen 失败、③ `close()` 期在途 Dialing 流——三条路径的
+    /// `teardown_flow` 都不再扣减未计数的流。
+    fn retire(&mut self, flow: u64) {
+        let counted = self
+            .flows
+            .get_mut(&flow)
+            .map(|f| std::mem::take(&mut f.counted))
+            .unwrap_or(false);
+        if counted {
+            self.stats.decr_flow();
+        }
+    }
+
     /// UDP 会话收尾（判据行 + 计数 + 清流——fd 随 remove_flow 的 io drop 收口）。
     fn finish_udp(&mut self, flow: u64) {
         let Some(f) = self.flows.get(&flow) else {
@@ -2237,7 +2436,7 @@ impl Interceptor {
         };
         let (kind, orig_dst, client, replied, seq) =
             (f.kind, f.orig_dst, f.client, f.udp_replied, f.udp_seq_of);
-        self.stats.decr_flow();
+        self.retire(flow);
         if kind == Kind::Transit {
             self.stats.incr_udp_session(replied);
         }
@@ -2252,6 +2451,10 @@ impl Interceptor {
     /// 栈内 socket 服务：读数据 → 待写缓冲（水位门控）+ TCP 关闭推进。
     fn service_sockets(&mut self) {
         let flows: Vec<u64> = self.flows.keys().copied().collect();
+        // 待拆流收口（F2/[门-A1]）：DNS TCP 腿读到空帧（mlen==0）须收线，但**不得在
+        // 本迭代内 `teardown_flow`**——本臂后续还要用快照 `h` 取 socket，`remove_flow`
+        // 后再 `get_mut(h)` 会 panic。统一收到循环外。
+        let mut close_legs: Vec<u64> = Vec::new();
         for flow in flows {
             let Some(f) = self.flows.get(&flow) else {
                 continue;
@@ -2284,6 +2487,12 @@ impl Interceptor {
                         let mut total = 0usize;
                         let mut dns_chunks: Vec<Vec<u8>> = Vec::new();
                         loop {
+                            // 水位门每块复查（[门-A2]）：门只在读循环前判一次会把上界
+                            // 从 WATERMARK 抬到 +FLOW_BUF（读循环会把栈内已缓冲的全部
+                            // 读光）；每读一块后复查收紧到 WATERMARK + READ_CHUNK。
+                            if self.pending_out(flow) > WATERMARK {
+                                break;
+                            }
                             let mut buf = [0u8; 64 * 1024];
                             let n = self
                                 .sockets
@@ -2303,8 +2512,16 @@ impl Interceptor {
                             total += n;
                         }
                         if is_dns_leg {
+                            let mut closed = false;
                             for c in dns_chunks {
-                                self.dns_tcp_feed(flow, &c);
+                                if matches!(self.dns_tcp_feed(flow, &c), FeedOutcome::CloseLeg) {
+                                    close_legs.push(flow);
+                                    closed = true;
+                                    break;
+                                }
+                            }
+                            if closed {
+                                continue; // 收线在循环外统一做——本迭代不再碰快照 h
                             }
                         } else if total > 0 {
                             if let Some(f) = self.flows.get_mut(&flow) {
@@ -2329,9 +2546,20 @@ impl Interceptor {
                     }
                 }
                 Proto::Udp => {
+                    // 上行读侧门（F3：栈→upstream 方向此前缺门）。阈值 `UDP_OUT_GATE`
+                    // 严格低于字节上限 `WATERMARK`——门先拦（达阈值停读 ⇒ 栈 rx 缓冲填满
+                    // ⇒ 栈层丢新），上限拦单拍读尽造成的越界（评审 M3）。
+                    // DNS 腿 io=None ⇒ `pending_out` 恒 0 ⇒ 门对 DNS 腿天然不生效（勿误伤 F6）。
+                    if self.pending_out(flow) > UDP_OUT_GATE {
+                        continue;
+                    }
+                    let is_dns_udp_leg = self
+                        .flows
+                        .get(&flow)
+                        .map(|f| f.kind == Kind::Dns && f.proto == Proto::Udp)
+                        .unwrap_or(false);
                     // 读出（读时校验源 = 客户端——「connect 语义」的替代）→ 待写数据报
-                    // 队列（DNS 腿 io=None = 静默丢——应答走 dns_rx 回投面，与旧 pool
-                    // 「无属主丢弃」同义）
+                    // 队列；DNS 腿走进程内代答（F6），其余进 out_udp。
                     let expect = self
                         .flows
                         .get(&flow)
@@ -2347,6 +2575,36 @@ impl Interceptor {
                             };
                         if meta.endpoint != expect {
                             continue; // 非客户端来源：丢弃（包已取出，继续读）
+                        }
+                        if is_dns_udp_leg {
+                            // F6：DNS 腿会话内**每包**应答（对齐 Go `dnsLeg.Write` 每包
+                            // `Answer`）——此前 io=None 静默丢 ⇒ 固定源端口重传全黑洞。
+                            if let Some(dns) = self.cfg.dns.clone() {
+                                let tag = self
+                                    .dns_faces
+                                    .as_mut()
+                                    .map(|f| f.route_tag(DnsRoute::UdpFlow(flow)))
+                                    .unwrap_or(0);
+                                if tag != 0
+                                    && dns.submit_leg(tag, buf[..n].to_vec())
+                                        == SubmitOutcome::Dropped
+                                {
+                                    // F2：丢弃路径回收 tag
+                                    if let Some(faces) = self.dns_faces.as_mut() {
+                                        faces.take_route(tag);
+                                    }
+                                }
+                            }
+                            if let Some(f) = self.flows.get_mut(&flow) {
+                                f.last_active = Instant::now();
+                            }
+                            continue;
+                        }
+                        // out_udp 上限（F3：条数 MAX_OUT_UDP_PKTS + 字节 WATERMARK——
+                        // 超限丢新+计数，不阻塞不排队）。
+                        if self.udp_out_full(flow, n) {
+                            self.stats.incr_udp_drop();
+                            continue;
                         }
                         if let Some(f) = self.flows.get_mut(&flow) {
                             if let Some(io) = f.io.as_mut() {
@@ -2364,6 +2622,10 @@ impl Interceptor {
                 }
             }
         }
+        // DNS TCP 腿空帧收线（[门-A1]：循环外统一拆——避免同迭代悬垂 SocketHandle）。
+        for flow in close_legs {
+            self.teardown_flow(flow);
+        }
     }
 
     /// 栈→upstream 在途待写字节（unacked_out 的直读等价物——TCP 字节流 + UDP 数据报）。
@@ -2376,6 +2638,19 @@ impl Interceptor {
                     + io.out_udp.iter().map(|d| d.len()).sum::<usize>()
             })
             .unwrap_or(0)
+    }
+
+    /// `out_udp` 是否已达上限（F3：条数 `MAX_OUT_UDP_PKTS` ∨ 字节 `WATERMARK`）——
+    /// `incoming` = 待入队数据报长度。无 io（DNS 腿）= 恒不满。
+    fn udp_out_full(&self, flow: u64, incoming: usize) -> bool {
+        self.flows
+            .get(&flow)
+            .and_then(|f| f.io.as_ref())
+            .map(|io| {
+                io.out_udp.len() >= MAX_OUT_UDP_PKTS
+                    || io.out_udp.iter().map(|d| d.len()).sum::<usize>() + incoming > WATERMARK
+            })
+            .unwrap_or(false)
     }
 
     /// idle 看门狗（TCP 5min / UDP 60s / DNS 10s——共享活跃时间戳）+ connect 死线
@@ -2436,7 +2711,6 @@ impl Interceptor {
                 self.sockets.get_mut::<TcpSocket>(h).close();
                 let _ = h;
             }
-            self.stats.decr_flow();
             (self.cfg.logf)(&format!(
                 "intercept: tcp {} {}:{} ← {}:{} 关闭",
                 kind.as_str(),
@@ -2446,6 +2720,10 @@ impl Interceptor {
                 client.1
             ));
         }
+        // F5 收口（评审 L4）：TCP 与 UDP 都退役——`close()` 对在册 UDP 流走本路径，
+        // 已建立流的 gauge 须归零（否则 `serve.status` 的 flows 在收工面失真）。
+        // UDP 正常收尾走 `finish_udp`（自带 retire），不经本函数，无双重扣减。
+        self.retire(flow);
         self.remove_flow(flow);
     }
 
@@ -4278,6 +4556,570 @@ mod tests {
         (timeout.as_secs_f64(), total, down, tail)
     }
 
+    // ---------- Q-B 批（F1–F10）回归面 ----------
 
+    fn snap_of(stats: &Arc<Stats>, key: &str) -> u64 {
+        stats
+            .snapshot()
+            .iter()
+            .find(|(n, _)| *n == key)
+            .map(|(_, v)| *v)
+            .unwrap_or_else(|| panic!("快照键 {key} 存在"))
+    }
+
+    /// F1：`VecDequeLite::consume` 死前缀原地压缩——余量内容不变、backing 不随累计
+    /// 传输量增长（P0-1：旧实现 off 只增，交错 push/部分 consume 下死前缀永不回收）。
+    #[test]
+    fn vecdequelite_compacts_dead_prefix() {
+        let mut q = VecDequeLite::new();
+        q.push(b"abcdefgh");
+        q.consume(4);
+        assert_eq!(q.remaining(), b"efgh", "压缩后余量内容不变");
+        assert_eq!(q.off, 0, "压缩后前缀偏移归零");
+        assert_eq!(q.buf.len(), 4, "死前缀已回收");
+        // 部分写交错序列：消费 37 + 推 37（余量恒定），累计传输 7.4MB 后 backing 有界
+        let mut q2 = VecDequeLite::new();
+        for _ in 0..16 {
+            q2.push(&[0u8; 64]); // 预置 ~1KB
+        }
+        for _ in 0..200_000 {
+            let r = q2.remaining().len().min(37);
+            q2.consume(r);
+            q2.push(&[1u8; 37]);
+        }
+        assert!(!q2.remaining().is_empty());
+        assert!(q2.buf.len() < 8192, "累计传输 7.4MB 后 backing 有界（得 {}）", q2.buf.len());
+        assert!(
+            q2.buf.capacity() < 16384,
+            "capacity 不随累计传输量增长（得 {}）",
+            q2.buf.capacity()
+        );
+    }
+
+    /// F4：`filter_defer` 非 TCP 超上限丢新+计数；TCP 恒不丢；短包（取不到 proto）放行不计数。
+    #[test]
+    fn filter_defer_drops_non_tcp_over_cap() {
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let stats = Arc::new(Stats::default());
+        let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::clone(&stats));
+        // 非 TCP（proto=17）64KB 包 × 80 = 5MB > 上限 4MB
+        let mut p = vec![0u8; 64 * 1024];
+        p[0] = 0x45;
+        p[9] = 17;
+        let kept = itc.filter_defer((0..80).map(|_| p.clone()).collect());
+        let kept_bytes: usize = kept.iter().map(|p| p.len()).sum();
+        assert!(kept.len() < 80, "超上限应丢新（留 {} 包）", kept.len());
+        assert!(kept_bytes <= TX_DEFER_MAX_BYTES, "滞留字节不超上限");
+        assert_eq!(snap_of(&stats, "shapeDrop"), (80 - kept.len()) as u64, "丢新计数");
+        // TCP（proto=6）恒不丢
+        let mut t = vec![0u8; 64 * 1024];
+        t[0] = 0x45;
+        t[9] = 6;
+        let kept_tcp = itc.filter_defer((0..80).map(|_| t.clone()).collect());
+        assert_eq!(kept_tcp.len(), 80, "TCP 不丢");
+        assert_eq!(snap_of(&stats, "shapeDrop"), (80 - kept.len()) as u64, "TCP 不增计数");
+        // 短包（<10B，pkt.get(9) 取不到）放行不计数（不 panic）
+        let kept_short = itc.filter_defer(vec![vec![0u8; 8]; 100]);
+        assert_eq!(kept_short.len(), 100, "短包放行");
+        assert_eq!(snap_of(&stats, "shapeDrop"), (80 - kept.len()) as u64, "短包不计数");
+    }
+
+    /// F7：分片（MF/非首片）在 parse 后、会话查表前丢弃+计数；DF-only 不误判（照常处理）。
+    #[test]
+    fn fragment_packet_dropped_no_session() {
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let stats = Arc::new(Stats::default());
+        let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::clone(&stats));
+        let mk = || nat::build_udp(Ipv4Addr::new(100, 64, 10, 1), 50000, tunnel, 47999, b"frag");
+        // MF 首片
+        let mut p = mk();
+        p[6] = 0x20;
+        itc.on_plain(p);
+        assert_eq!(snap_of(&stats, "fragDrop"), 1, "MF 首片丢弃计数");
+        assert_eq!(itc.flow_count(), 0, "分片不建会话");
+        // 非首片
+        let mut p2 = mk();
+        p2[7] = 0x08;
+        itc.on_plain(p2);
+        assert_eq!(snap_of(&stats, "fragDrop"), 2, "非首片丢弃计数");
+        assert_eq!(itc.flow_count(), 0, "非首片不建会话");
+        // DF-only 不误判（照常处理——豁免到回环端口，不出网）
+        let mut p3 = mk();
+        p3[6] = 0x40;
+        itc.on_plain(p3);
+        assert_eq!(snap_of(&stats, "fragDrop"), 2, "DF-only 不计数");
+        assert!(itc.flow_count() >= 1, "DF-only 照常处理");
+    }
+
+    /// F9：非 TCP/UDP 协议（ICMP 等）不再当 UDP 建端口 0 会话——丢弃、不产 dialfail 噪声。
+    #[test]
+    fn non_tcp_udp_proto_not_sessionized() {
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let stats = Arc::new(Stats::default());
+        let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::clone(&stats));
+        // 最小 ICMP 回显请求（IPv4 20B + ICMP 8B）
+        let mut p = vec![0u8; 28];
+        p[0] = 0x45;
+        p[2] = 0;
+        p[3] = 28;
+        p[9] = 1; // ICMP
+        p[12..16].copy_from_slice(&Ipv4Addr::new(100, 64, 10, 1).octets());
+        p[16..20].copy_from_slice(&tunnel.octets());
+        p[20] = 8; // echo request
+        itc.on_plain(p);
+        assert_eq!(itc.flow_count(), 0, "ICMP 不建会话");
+        assert_eq!(snap_of(&stats, "dialfail"), 0, "ICMP 不产 dialfail 噪声");
+    }
+
+    /// F5-2：`close()` 期在途 Dialing（未 incr）的流退役不得使 flows gauge 下溢回绕。
+    #[test]
+    fn close_does_not_underflow_flow_gauge() {
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let stats = Arc::new(Stats::default());
+        let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::clone(&stats));
+        let v = View5 {
+            src: Ipv4Addr::new(100, 64, 10, 1),
+            src_port: 40000,
+            dst: Ipv4Addr::new(1, 2, 3, 4),
+            dst_port: 80,
+            proto: 6,
+            tcp_flags: nat::TCP_SYN,
+            tcp_seq: 100,
+            tcp_ack: 0,
+            udp_payload: (40, 40),
+        };
+        let _flow = itc.alloc_flow(&v, Kind::Transit, Proto::Tcp, vec![]);
+        assert_eq!(snap_of(&stats, "flows"), 0, "Dialing 未计数");
+        itc.close();
+        assert_eq!(snap_of(&stats, "flows"), 0, "close 未 incr 的 Dialing 流不得下溢");
+        assert_eq!(itc.flow_count(), 0);
+    }
+
+    /// F5-1：E12 关闭行打**本会话号**（此前恒 #0 是缺陷）——建立行与关闭行同号、非 0。
+    #[test]
+    fn udp_close_line_reuses_establish_seq() {
+        let echo = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let port = echo.local_addr().unwrap().port();
+        let echo_thread = std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, from)) = echo.recv_from(&mut buf) {
+                if echo.send_to(&buf[..n], from).is_err() {
+                    break;
+                }
+            }
+        });
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let stats = Arc::new(Stats::default());
+        let logs: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let l2 = Arc::clone(&logs);
+        let mut cfg = cfg_base(tunnel);
+        cfg.logf = Arc::new(move |s: &str| l2.lock().unwrap().push(s.to_string()));
+        let mut itc = Interceptor::attach(cfg, Arc::clone(&stats));
+        let q = nat::build_udp(
+            Ipv4Addr::new(100, 64, 10, 3),
+            50000,
+            Ipv4Addr::LOCALHOST,
+            port,
+            b"q",
+        );
+        itc.on_plain(q);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            for _ in itc.pump() {}
+            if itc.flows.values().any(|f| f.udp_replied) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // 手动收尾触发 E12 关闭行
+        let flow = *itc.flows.keys().next().expect("会话在册");
+        itc.finish_udp(flow);
+        let seq_of = |needle: &str| -> String {
+            logs.lock()
+                .unwrap()
+                .iter()
+                .find(|l| l.contains("会话 #") && l.contains(needle))
+                .and_then(|l| l.split("会话 #").nth(1))
+                .and_then(|s| s.split_whitespace().next())
+                .map(|s| s.to_string())
+                .unwrap_or_else(|| panic!("未找到含 {needle} 的会话行"))
+        };
+        let est = seq_of("建立");
+        let clo = seq_of("关闭");
+        assert_eq!(est, clo, "E12 建立行与关闭行同号");
+        assert_ne!(est, "0", "会话号非 0（修复前恒 #0）");
+        drop(echo_thread);
+    }
+
+    /// F3：`udp_out_full` 上限判定（条数/字节）；`udp_send_to_client` 栈 tx 满时计 udp_drop。
+    #[test]
+    fn udp_out_cap_and_send_failure_counted() {
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let stats = Arc::new(Stats::default());
+        let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::clone(&stats));
+        let v = View5 {
+            src: Ipv4Addr::new(100, 64, 10, 1),
+            src_port: 40000,
+            dst: Ipv4Addr::new(8, 8, 8, 8),
+            dst_port: 9999,
+            proto: 17,
+            tcp_flags: 0,
+            tcp_seq: 0,
+            tcp_ack: 0,
+            udp_payload: (28, 28),
+        };
+        let flow = itc.alloc_flow(&v, Kind::Transit, Proto::Udp, vec![]);
+        assert!(!itc.udp_out_full(flow, 1000), "无 io = 不满");
+        // 造 io + 填满条数
+        let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        itc.place_io(flow, OwnedFd::from(s), true, None, Instant::now());
+        if let Some(io) = itc.flows.get_mut(&flow).and_then(|f| f.io.as_mut()) {
+            for _ in 0..MAX_OUT_UDP_PKTS {
+                io.out_udp.push_back(vec![0u8; 10]);
+            }
+        }
+        assert!(itc.udp_out_full(flow, 10), "条数达上限 = 满");
+        if let Some(io) = itc.flows.get_mut(&flow).and_then(|f| f.io.as_mut()) {
+            io.out_udp.clear();
+            io.out_udp.push_back(vec![0u8; WATERMARK]);
+        }
+        assert!(itc.udp_out_full(flow, 1), "字节达上限 = 满");
+        // udp_send_to_client：栈 tx（64KB）写满后失败 → udp_drop 计数
+        itc.ensure_udp_socket(flow);
+        let before = snap_of(&stats, "udpDrop");
+        for _ in 0..5 {
+            itc.udp_send_to_client(flow, &vec![0u8; 60_000]);
+        }
+        assert!(snap_of(&stats, "udpDrop") > before, "栈 tx 满 → udp_drop 计数");
+    }
+
+    // ---------- DNS 面回归（F2/F6/F8/A1） ----------
+
+    /// 起一个 fake 上游 + DnsProxy + 挂 DNS 面的拦截器。`respond` 决定上游应答字节。
+    fn dns_itc_with_upstream(
+        respond: impl Fn(&[u8]) -> Vec<u8> + Send + 'static,
+        max_in_flight: usize,
+    ) -> (Interceptor, Arc<Stats>, std::path::PathBuf) {
+        use crate::server::dnsproxy::{DnsConfig, DnsProxy};
+        let up = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        // 大应答（>16KB）测试：macOS 默认 SO_SNDBUF 较小会把大 UDP 数据报丢掉——
+        // 显式放大（同机自测面，不涉产品路径）。
+        let bufsz: libc::c_int = 1 << 20;
+        unsafe {
+            libc::setsockopt(
+                up.as_raw_fd(),
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &bufsz as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as u32,
+            );
+        }
+        let up_addr = format!("127.0.0.1:{}", up.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 65536];
+            loop {
+                let Ok((n, from)) = up.recv_from(&mut buf) else {
+                    return;
+                };
+                let r = respond(&buf[..n]);
+                let _ = up.send_to(&r, from);
+            }
+        });
+        let dir = std::env::temp_dir().join(format!(
+            "homeway-rs-qb-dns-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .subsec_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("resolv.conf"), format!("nameserver {up_addr}\n")).unwrap();
+        let (proxy, events) = DnsProxy::spawn(
+            DnsConfig {
+                resolv_path: dir.join("resolv.conf").to_string_lossy().into_owned(),
+                budget: Duration::from_secs(5),
+                max_in_flight,
+                ..Default::default()
+            },
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+        );
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let stats = Arc::new(Stats::default());
+        let cfg = Config {
+            tunnel_ip: tunnel,
+            local_services: HashMap::new(),
+            dns: Some(Arc::clone(&proxy)),
+            dns_events: Some(events),
+            dns_resolve_port: 5300,
+            tx_shape: None,
+            logf: noop_logf(),
+        };
+        let mut itc = Interceptor::attach(cfg, Arc::clone(&stats));
+        itc.attach_dns();
+        (itc, stats, dir)
+    }
+
+    /// A 查询（id=0x5566，a.example）的 RFC1035 帧。
+    fn dns_a_query(id: u16) -> Vec<u8> {
+        let mut q = Vec::new();
+        q.extend_from_slice(&id.to_be_bytes());
+        q.extend_from_slice(&[0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+        for label in ["a", "example"] {
+            q.push(label.len() as u8);
+            q.extend_from_slice(label.as_bytes());
+        }
+        q.push(0);
+        q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+        q
+    }
+
+    /// 小 A 应答（回显 question + 一条 A 记录）。
+    fn small_a_response(q: &[u8]) -> Vec<u8> {
+        let mut r = Vec::new();
+        r.extend_from_slice(&q[..2]);
+        r.extend_from_slice(&[0x80 | 0x01, 0x80, 0x00, 0x01]);
+        r.extend_from_slice(&1u16.to_be_bytes());
+        r.extend_from_slice(&[0, 0, 0, 0]);
+        r.extend_from_slice(&q[12..]);
+        r.extend_from_slice(&[0xC0, 0x0C]);
+        r.extend_from_slice(&1u16.to_be_bytes());
+        r.extend_from_slice(&1u16.to_be_bytes());
+        r.extend_from_slice(&60u32.to_be_bytes());
+        r.extend_from_slice(&4u16.to_be_bytes());
+        r.extend_from_slice(&[127, 0, 0, 1]);
+        r
+    }
+
+    /// F2：DNS 提交在途超限（Dropped）时回收 route tag——`pending` 不增长。
+    #[test]
+    fn dns_dropped_submit_recycles_tag() {
+        // 上游不回（worker 阻塞到 budget）——max_in_flight=1 ⇒ 第二条必 Dropped
+        let (mut itc, _stats, dir) = dns_itc_with_upstream(|_q| Vec::new(), 1);
+        // 注意：respond 返回空 ⇒ exchange 收不到有效应答；worker 阻塞到 budget（5s）
+        let q = dns_a_query(0x7788);
+        let p1 = nat::build_udp(
+            Ipv4Addr::new(100, 64, 10, 9),
+            52100,
+            Ipv4Addr::new(100, 64, 255, 1),
+            53,
+            &q,
+        );
+        let p2 = nat::build_udp(
+            Ipv4Addr::new(100, 64, 10, 9),
+            52101,
+            Ipv4Addr::new(100, 64, 255, 1),
+            53,
+            &q,
+        );
+        itc.on_plain(p1);
+        itc.on_plain(p2);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut plen = 0;
+        while Instant::now() < deadline {
+            for _ in itc.pump() {}
+            plen = itc.dns_faces.as_ref().map(|f| f.pending_len()).unwrap_or(0);
+            if plen >= 1 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(plen, 1, "两条查询：一条在途、一条丢弃回收（pending 不增长到 2）");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A1（[门-A1]）：DNS TCP 腿读到空帧（mlen==0）+ 同段 FIN → **不 panic**、腿被拆、
+    /// pending 不增长（收线在 `for flow` 循环外统一做）。
+    #[test]
+    fn dns_tcp_leg_empty_frame_no_panic() {
+        let (mut itc, _stats, dir) = dns_itc_with_upstream(small_a_response, 256);
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let mut client = StackB::new(
+            Ipv4Addr::new(100, 64, 10, 7),
+            tunnel,
+            SmolInstant::from_millis(0),
+        );
+        let dst = std::net::SocketAddrV4::new(Ipv4Addr::new(8, 8, 8, 8), 53);
+        let h: SocketHandle = client.connect(dst).unwrap();
+        let mut tick = 0i64;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            cross_pump(&mut client, &mut itc, 4, &mut tick);
+            if client.sockets.get::<TcpSocket>(h).state() == tcp::State::Established {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            client.sockets.get::<TcpSocket>(h).state(),
+            tcp::State::Established,
+            "TCP DNS 腿建立"
+        );
+        // 空帧（2B 长度 = 0）+ 立即 FIN——同段到达
+        client.sockets.get_mut::<TcpSocket>(h).send_slice(&[0x00, 0x00]).unwrap();
+        client.sockets.get_mut::<TcpSocket>(h).close();
+        // 不 panic 即过（旧实现在同迭代内 teardown 后 get_mut(快照 h) 会 panic）
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            cross_pump(&mut client, &mut itc, 4, &mut tick);
+            if itc.flow_count() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(itc.flow_count(), 0, "空帧腿已拆");
+        assert_eq!(
+            itc.dns_faces.as_ref().map(|f| f.pending_len()).unwrap_or(0),
+            0,
+            "空帧不进 submit ⇒ pending 不增长"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F8：隧道 IP:53 TCP 面大应答（>16KB tx buffer）→ per-conn 待写队列分多次续写、
+    /// 最终完整送达（帧无错位）。
+    #[test]
+    fn dns_tcp_face_large_response() {
+        // 上游回 ~20KB 大应答（TXT 记录，rdlen 撑大）
+        let big = |q: &[u8]| -> Vec<u8> {
+            let rdata = 20_000usize;
+            let mut r = Vec::with_capacity(64 + rdata);
+            r.extend_from_slice(&q[..2]);
+            r.extend_from_slice(&[0x80 | 0x01, 0x80, 0x00, 0x01]);
+            r.extend_from_slice(&1u16.to_be_bytes());
+            r.extend_from_slice(&[0, 0, 0, 0]);
+            r.extend_from_slice(&q[12..]);
+            r.extend_from_slice(&[0xC0, 0x0C]); // name ptr
+            r.extend_from_slice(&16u16.to_be_bytes()); // TYPE TXT
+            r.extend_from_slice(&1u16.to_be_bytes()); // CLASS IN
+            r.extend_from_slice(&60u32.to_be_bytes()); // TTL
+            r.extend_from_slice(&(rdata as u16).to_be_bytes()); // RDLENGTH
+            r.extend(std::iter::repeat_n(0x41u8, rdata)); // RDATA
+            r
+        };
+        let (mut itc, _stats, dir) = dns_itc_with_upstream(big, 256);
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let mut client = StackB::new(
+            Ipv4Addr::new(100, 64, 10, 8),
+            tunnel,
+            SmolInstant::from_millis(0),
+        );
+        // 隧道 IP:53（demux 投栈内 listener）
+        let h: SocketHandle = client
+            .connect(std::net::SocketAddrV4::new(tunnel, 53))
+            .unwrap();
+        let mut tick = 0i64;
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            cross_pump(&mut client, &mut itc, 4, &mut tick);
+            if client.sockets.get::<TcpSocket>(h).state() == tcp::State::Established {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(
+            client.sockets.get::<TcpSocket>(h).state(),
+            tcp::State::Established,
+            "隧道 IP:53 TCP 面建立"
+        );
+        // 发一条 A 查询（RFC1035 帧）
+        let q = dns_a_query(0x9911);
+        let mut frame = Vec::new();
+        frame.extend_from_slice(&(q.len() as u16).to_be_bytes());
+        frame.extend_from_slice(&q);
+        client.sockets.get_mut::<TcpSocket>(h).send_slice(&frame).unwrap();
+        // 收应答：完整帧（2 + mlen）
+        let mut got: Vec<u8> = Vec::new();
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            cross_pump(&mut client, &mut itc, 4, &mut tick);
+            let mut buf = [0u8; 16384];
+            let n = client
+                .sockets
+                .get_mut::<TcpSocket>(h)
+                .recv_slice(&mut buf)
+                .unwrap_or(0);
+            if n > 0 {
+                got.extend_from_slice(&buf[..n]);
+                if got.len() >= 2 {
+                    let mlen = u16::from_be_bytes([got[0], got[1]]) as usize;
+                    if got.len() >= 2 + mlen {
+                        break;
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(got.len() >= 2, "应答帧头到达");
+        let mlen = u16::from_be_bytes([got[0], got[1]]) as usize;
+        assert_eq!(got.len(), 2 + mlen, "应答恰一帧（无错位）");
+        assert!(mlen > 16 * 1024, "大应答（{mlen}B）分多次续写后完整送达");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F6：DNS 腿（非隧道 IP :53）会话内**每包**应答（固定源端口）——审计 P1「手机
+    /// stub resolver 固定源端口重传全黑洞」的回归钉。首包走 `udp_ready` 重放，后续包
+    /// 走 `service_sockets` 的 F6 分支。
+    #[test]
+    fn dns_udp_leg_answers_every_packet() {
+        let (mut itc, _stats, dir) = dns_itc_with_upstream(small_a_response, 256);
+        let client = Ipv4Addr::new(100, 64, 10, 9);
+        let dst = Ipv4Addr::new(8, 8, 8, 8);
+        let src_port = 53000; // 固定源端口（同一会话）
+        // 首包（建立 + 重放应答）+ 会话内后续包（同五元组 → F6 分支）
+        itc.on_plain(nat::build_udp(client, src_port, dst, 53, &dns_a_query(0x1001)));
+        itc.on_plain(nat::build_udp(client, src_port, dst, 53, &dns_a_query(0x1002)));
+        let mut ids = std::collections::HashSet::new();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && ids.len() < 2 {
+            for p in itc.pump() {
+                if let Some(v) = Ipv4View::parse(&p) {
+                    if v.proto == 17 && v.dst == client && v.src == dst && v.payload.len() >= 2 {
+                        ids.insert(u16::from_be_bytes([v.payload[0], v.payload[1]]));
+                    }
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            ids.contains(&0x1001) && ids.contains(&0x1002),
+            "会话内每包均获应答（得 {ids:?}）"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F7（[门-B6] 计划②）：**已有流存在**时喂同五元组的 MF 首片 → 仍被丢弃（不重写、
+    /// 不注入）——证明分片判定落在 `by_five` 查表之前。
+    #[test]
+    fn fragment_dropped_even_with_existing_flow() {
+        let echo = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let port = echo.local_addr().unwrap().port();
+        let echo_thread = std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while let Ok((n, from)) = echo.recv_from(&mut buf) {
+                if echo.send_to(&buf[..n], from).is_err() {
+                    break;
+                }
+            }
+        });
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let stats = Arc::new(Stats::default());
+        let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::clone(&stats));
+        let client = Ipv4Addr::new(100, 64, 10, 3);
+        let (src_port, dst) = (50000u16, Ipv4Addr::LOCALHOST);
+        // 建流（正常包）
+        itc.on_plain(nat::build_udp(client, src_port, dst, port, b"q"));
+        let flows_before = itc.flow_count();
+        assert!(flows_before >= 1, "正常包建会话");
+        let frag_before = snap_of(&stats, "fragDrop");
+        // 同五元组的 MF 首片 → 丢弃（不得注入既有流）
+        let mut frag = nat::build_udp(client, src_port, dst, port, b"frag");
+        frag[6] = 0x20;
+        itc.on_plain(frag);
+        assert_eq!(snap_of(&stats, "fragDrop"), frag_before + 1, "分片被丢弃");
+        assert_eq!(itc.flow_count(), flows_before, "既有流不受影响（无新会话/无注入）");
+        drop(echo_thread);
+    }
 }
 

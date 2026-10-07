@@ -381,6 +381,16 @@ struct DnsJob {
     reply_to: mpsc::Sender<DnsReply>,
 }
 
+/// 提交回执（F2）：`Dropped` = 在途超限或 `try_send` 失败，**未进 worker 队列、
+/// 不会有应答回投**——调用方须回收已登记的 route tag（否则 `pending` 项永不回收）。
+/// `#[must_use]` 借 `clippy -D warnings` 兜住漏检。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[must_use]
+pub enum SubmitOutcome {
+    Accepted,
+    Dropped,
+}
+
 /// DNS 代答句柄（驱动线程/拦截层持有；submit 非阻塞，应答经回投通道异步到达）。
 pub struct DnsProxy {
     core: Arc<ResponderCore>,
@@ -441,26 +451,26 @@ impl DnsProxy {
     }
 
     /// 提交一条 UDP 查询（非阻塞；在途超限按 Go drop 计数丢弃）。
-    pub fn submit_udp(&self, tag: u64, query: Vec<u8>) {
-        self.submit(tag, query, false);
+    pub fn submit_udp(&self, tag: u64, query: Vec<u8>) -> SubmitOutcome {
+        self.submit(tag, query, false)
     }
 
     /// 拦截层进程内腿（非隧道 IP :53 的兜底）：**不计 q**（Go `Answer()` 直调 respond
     /// 同口径——q 只在隧道栈 UDP listener 面计数）。
-    pub fn submit_leg(&self, tag: u64, query: Vec<u8>) {
-        self.submit_leg_impl(tag, query);
+    pub fn submit_leg(&self, tag: u64, query: Vec<u8>) -> SubmitOutcome {
+        self.submit_leg_impl(tag, query)
     }
 
     /// 提交一条 TCP 查询（qtcp 单列——「出口 5300 收到 TCP 查询」的判据面）。
-    pub fn submit_tcp(&self, tag: u64, query: Vec<u8>) {
-        self.submit(tag, query, true);
+    pub fn submit_tcp(&self, tag: u64, query: Vec<u8>) -> SubmitOutcome {
+        self.submit(tag, query, true)
     }
 
-    fn submit_leg_impl(&self, tag: u64, query: Vec<u8>) {
+    fn submit_leg_impl(&self, tag: u64, query: Vec<u8>) -> SubmitOutcome {
         if self.in_flight.fetch_add(1, Ordering::Relaxed) + 1 > self.core.max_in_flight {
             self.in_flight.fetch_sub(1, Ordering::Relaxed);
             self.core.stats.dropped.fetch_add(1, Ordering::Relaxed);
-            return;
+            return SubmitOutcome::Dropped;
         }
         if self
             .job_tx
@@ -469,10 +479,12 @@ impl DnsProxy {
         {
             self.in_flight.fetch_sub(1, Ordering::Relaxed);
             self.core.stats.dropped.fetch_add(1, Ordering::Relaxed);
+            return SubmitOutcome::Dropped;
         }
+        SubmitOutcome::Accepted
     }
 
-    fn submit(&self, tag: u64, query: Vec<u8>, is_tcp: bool) {
+    fn submit(&self, tag: u64, query: Vec<u8>, is_tcp: bool) -> SubmitOutcome {
         if is_tcp {
             self.core.stats.qtcp.fetch_add(1, Ordering::Relaxed);
         } else {
@@ -481,7 +493,7 @@ impl DnsProxy {
         if self.in_flight.fetch_add(1, Ordering::Relaxed) + 1 > self.core.max_in_flight {
             self.in_flight.fetch_sub(1, Ordering::Relaxed);
             self.core.stats.dropped.fetch_add(1, Ordering::Relaxed);
-            return; // 超限丢弃：客户端按超时重试，不排长队放大延迟
+            return SubmitOutcome::Dropped; // 超限丢弃：客户端按超时重试，不排长队放大延迟
         }
         if self
             .job_tx
@@ -490,7 +502,9 @@ impl DnsProxy {
         {
             self.in_flight.fetch_sub(1, Ordering::Relaxed);
             self.core.stats.dropped.fetch_add(1, Ordering::Relaxed);
+            return SubmitOutcome::Dropped;
         }
+        SubmitOutcome::Accepted
     }
 
     /// 同步应答一条查询（自检/测试面；经同一 worker 管线——与异步路径同一条应答逻辑）。
@@ -972,7 +986,11 @@ mod tests {
             logf,
             dlogf,
         );
-        proxy.submit_udp(42, a_query("wr.test", 0x7777));
+        assert_eq!(
+            proxy.submit_udp(42, a_query("wr.test", 0x7777)),
+            SubmitOutcome::Accepted,
+            "正常提交应进 worker 队列"
+        );
         let reply = events.recv_timeout(Duration::from_secs(3)).expect("应答应到达");
         assert_eq!(reply.tag, 42);
         assert_eq!(&reply.resp.unwrap()[..2], &0x7777u16.to_be_bytes());
@@ -982,6 +1000,36 @@ mod tests {
         // 计数：q=1（只有 submit_udp 计；answer_sync = Go Answer() 直调口径不计 q）
         assert!(proxy.stats_line().contains("q=1"), "stats: {}", proxy.stats_line());
         assert!(proxy.stats_line().contains("resp=2"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F2：在途超限 ⇒ `submit_*` 返 `Dropped`（调用方据此回收 route tag）+ drop 计数。
+    #[test]
+    fn submit_over_limit_returns_dropped() {
+        // 上游不回（worker 阻塞到 budget）——max_in_flight=1 下第二条必被丢
+        let up = UdpSocket::bind(("127.0.0.1", 0)).unwrap(); // 只绑不收
+        let up_addr = format!("127.0.0.1:{}", up.local_addr().unwrap().port());
+        let dir = std::env::temp_dir().join(format!("homeway-rs-dnsdrop-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("resolv.conf"), format!("nameserver {up_addr}\n")).unwrap();
+        let (logf, dlogf) = noop();
+        let (proxy, _events) = DnsProxy::spawn(
+            DnsConfig {
+                resolv_path: dir.join("resolv.conf").to_string_lossy().into_owned(),
+                budget: Duration::from_secs(5),
+                max_in_flight: 1,
+                ..Default::default()
+            },
+            logf,
+            dlogf,
+        );
+        assert_eq!(proxy.submit_udp(1, a_query("a.test", 0x1111)), SubmitOutcome::Accepted);
+        assert_eq!(
+            proxy.submit_udp(2, a_query("b.test", 0x2222)),
+            SubmitOutcome::Dropped,
+            "在途超限 = 丢弃（无应答回投 ⇒ 调用方须回收 tag）"
+        );
+        assert!(proxy.stats_line().contains("drop=1"), "丢弃计数：{}", proxy.stats_line());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -22,6 +22,10 @@ pub struct Ipv4View<'a> {
     pub tcp_ack: u32,
     /// TCP 头 window 字段原始 u16（未 shift——R8-4 8n 归因观测面）。
     pub tcp_win: u16,
+    /// 分片偏移（IP 头 flags 低 13 位；首片 = 0）。
+    pub frag_off: u16,
+    /// MF（More Fragments，IP 头 flags bit 13）。
+    pub mf: bool,
 }
 
 pub const TCP_SYN: u8 = 0x02;
@@ -46,6 +50,10 @@ impl<'a> Ipv4View<'a> {
         let proto = pkt[9];
         let src = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
         let dst = Ipv4Addr::new(pkt[16], pkt[17], pkt[18], pkt[19]);
+        // 分片字段（bytes 6-7：flags 高 3 位 + 分片偏移低 13 位——F7）
+        let flags_frag = u16::from_be_bytes([pkt[6], pkt[7]]);
+        let mf = flags_frag & 0x2000 != 0;
+        let frag_off = flags_frag & 0x1FFF;
         let body = &pkt[ihl..total_len];
         let mut payload_off = 0usize;
         let (src_port, dst_port, tcp_flags, tcp_seq, tcp_ack, tcp_win) = match proto {
@@ -92,7 +100,15 @@ impl<'a> Ipv4View<'a> {
             tcp_seq,
             tcp_ack,
             tcp_win,
+            frag_off,
+            mf,
         })
+    }
+
+    /// 分片判定（F7）：非首片（`frag_off > 0`）或 MF 置位。DF-only（flags=0x4000、
+    /// off=0、MF=0）**不**算分片——照常处理。
+    pub fn is_fragment(&self) -> bool {
+        self.frag_off != 0 || self.mf
     }
 
     /// 过境五元组键（UDP 会话表与 TCP 映射共用形态）。
@@ -448,5 +464,34 @@ mod tests {
         // TCP 输入不产 ICMP（对齐 gVisor——TCP 无监听回 RST 不是 ICMP）
         let syn = build_tcp_syn(Ipv4Addr::new(1, 1, 1, 1), 1, Ipv4Addr::new(2, 2, 2, 2), 2, 1);
         assert!(build_icmp_unreachable(&syn).is_none());
+    }
+
+    /// F7：分片字段判定——非首片（frag_off>0）/ MF 置位 = 分片；DF-only 不误判。
+    #[test]
+    fn fragment_flag_detection() {
+        let mk = || {
+            build_udp(
+                Ipv4Addr::new(100, 64, 10, 1),
+                50000,
+                Ipv4Addr::new(1, 2, 3, 4),
+                53,
+                b"x",
+            )
+        };
+        let mut p = mk();
+        assert!(!Ipv4View::parse(&p).unwrap().is_fragment(), "普通包非分片");
+        p[6] = 0x20; // MF（More Fragments）
+        assert!(Ipv4View::parse(&p).unwrap().is_fragment(), "MF 置位 = 分片");
+        p[6] = 0x00;
+        p[7] = 0x08; // frag_off = 8（非首片）
+        assert!(Ipv4View::parse(&p).unwrap().is_fragment(), "非首片 = 分片");
+        p[6] = 0x40; // DF-only
+        p[7] = 0x00;
+        assert!(!Ipv4View::parse(&p).unwrap().is_fragment(), "DF-only 不算分片");
+        p[6] = 0x60; // DF | MF
+        assert!(Ipv4View::parse(&p).unwrap().is_fragment(), "DF+MF 仍是分片");
+        p[6] = 0x40;
+        p[7] = 0x08; // DF + frag_off
+        assert!(Ipv4View::parse(&p).unwrap().is_fragment(), "DF+偏移仍是分片");
     }
 }
