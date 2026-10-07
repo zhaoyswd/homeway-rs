@@ -1,5 +1,40 @@
 # Changelog
 
+## v0.2.3（2026-10-07）
+
+拦截层单线程 reactor 简化批（出口重拨 OS socket 从 8-worker 池收进单事件循环——
+消灭本仓 bug 密度最高的管道族；协议语义零改动）：
+
+- **worker 池/泵管道整体拆除**（pool.rs 全删）：重拨 socket 归驱动线程单循环
+  （pump 内 `poll(2, timeout=0)` 自查就绪——电平触发 + 全非阻塞，就绪集是提示不是
+  契约），每流一个 `ReactorIo`（读/写兴趣位 + TCP 字节流/UDP 数据报双待写缓冲 +
+  `OwnedFd` 恰一次关闭），无锁无跨线程流队列——出口常驻线程 **-8 起** + 暂态拨号
+  线程 0。R3 池族三 bug（fd 属主表泄漏 EMFILE/Adopt 时序/池形态）、Written 差额
+  补报（files 上传卡死根因族）、Ack 短返清账、收工 Closed 回执竞态（丢尾包）、
+  ubuntu CI worker 饿死——这些**代码路径整体不存在**。
+- **非阻塞拨号三分类**（libc socket+fcntl+connect，禁 std connect〔std 把
+  EINPROGRESS 当 Err〕）：即时成功与 POLLOUT 验收统一收口 dial_accept；EAGAIN
+  （Linux UDS backlog 满）每拍重拨共用死线；UDP 拨号同步化（bind+connect 本地
+  即时——pending 重放窗口坍缩为零）；connect 10s 死线（Go dialTimeout 同值）。
+- **背压清账通道删除**：unacked_out/Written 差额补报/Ack 往返全删——水位直读
+  （tx_backlog ≥256KB 摘 POLLIN 停读；待写缓冲 >256KB 门控栈读）；flush_out 三态
+  步进（EAGAIN 必 break 等 POLLOUT——原地重试 = 驱动线程自旋 = 整出口挂死，评审
+  高危整改）。
+- **死分支删除**：drain()/linger_rst/SO_LINGER 面（Rust 侧从未接线——R3-design
+  §4.1 M13 差异正式登记）。
+- **新观测行**（verbose 5s 面）：`intercept: reactor 观测 pump=N/5s（均周期…ms）
+  名下fd峰=N 单拍峰=Nµs`。**判据行/Stats 同串同口径零变化**（E5/E10/E11/E12/
+  dialfail 计数——评审机械比对，新增仅观测与 POLLNVAL 防御两行 verbose）。
+- 两道 dsh 评审门全过：设计门 16 条（1 高：非阻塞 connect 即时成功无验收点）+
+  代码门 11 条（1 高：flush_out EAGAIN 自旋——修复含单元钉反向验证闭环〔注入
+  必红 abort〕）。记录 = `docs/reviews/reactor.md`，设计 = 
+  `docs/reviews/reactor-design.md`（v2.1）。
+- 测试面 +5：reactor_interests_matrix（兴趣集四态纯函数）/ uds_exempt_flow_
+  end_to_end（UDS 即时 connect 回归钉 + reactor_fds 归零）/ flush_out_eagain_
+  returns_with_backlog（EAGAIN 语义单元钉 + 看门狗 abort）/ upstream_partial_
+  write_continues（停读→开读→按序完整）/ wait_hint_states。harness 有损链路
+  A/B 臂绿；ci-local quick 全绿（含 RRR 矩阵冒烟）。
+
 ## v0.2.2（2026-10-07）
 
 P1 收口 + 简洁化删除批（出口发送线程默认开启并成为唯一发送路径）：
