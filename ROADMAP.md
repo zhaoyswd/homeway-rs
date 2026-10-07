@@ -276,18 +276,39 @@ HOMEWAY_UDP_NO_BATCH）。净删约 -1440 行。②门禁：ci-local quick 全�
 是 **x86_64**，拿 arm64 产物会 Exec format error）；手机 R1→R2→R3 自动重连
 18.5s 恢复 direct。回退件 `.bak-v0.2.1` 两台在位。
 
-**拦截 reactor 简化批（2026-10-07 挂单，用户已入队——本批）**：出口拦截层的重拨
-OS socket 从 8-worker 池收进**单个事件循环**（redis/nginx 式：每流一个状态结构
-〔读/写兴趣位 + 缓冲〕、无锁无 Arc 无 worker 分配、无跨线程流队列）——消灭本仓
-bug 密度最高的管道族（R3 三 bug / R6.6 双拷贝 / Written 差额补报〔files 上传
-卡死〕/ 短返丢弃 / 收工丢尾包 / ubuntu CI worker 饿死全在此族）。**协议语义零
-改动**（SYN 缓存三态拨号 / UDP 五元组会话 pending 重放 / 豁免 demux / RST+ICMP
-responder / E5/E10/E11/E12 判据行与 Stats 计数同串同口径）。分棒：Ra 设计门
-（`docs/reviews/reactor-design.md` 必答六题 + dsh 评审过门）→ Rb 实装（删
-pool.rs，净删行数入册——「保持代码最为简洁」的兑现度量）→ Rc 验收（harness
-有损链路三臂 + ci-local quick 全绿 + RRR 矩阵冒烟 + 真机烟囱判据行同串）→
-Rd 发版 v0.2.3 两台滚动（B0-2a 手法；阿里云 **x86_64/amd64 产物**〔v0.2.2 实录
-教训〕）→ Re 收口。tier 本批不动（纯出口侧）。
+**拦截 reactor 简化批（2026-10-07 挂单，当日五棒收官——完成）**：出口拦截层的重拨
+OS socket 从 8-worker 池收进**单个事件循环**（pump 内 poll(0) 自查就绪；每流一个
+ReactorIo〔读/写兴趣位 + TCP 字节流/UDP 数据报双待写缓冲 + OwnedFd〕、无锁无跨
+线程流队列）——R3 池族三 bug（fd 属主表泄漏 EMFILE/Adopt 时序/池形态）、Written
+差额补报（files 上传卡死根因族）、Ack 短返清账、收工 Closed 回执竞态（丢尾包）、
+ubuntu CI worker 饿死——这些**代码路径整体不存在**；出口常驻线程 **-8 起** + 暂态
+拨号线程 0。**协议语义零改动**（判据行机械比对 19→21 行，新增仅 reactor 观测与
+POLLNVAL 防御两 verbose 行；E5/E10/E11/E12/Stats 同串同口径）。执行实录：① Ra
+设计门两轮（reactor-design v1→v2：dsh 16 条全处置，1 高 = 非阻塞 connect 即时
+成功路径无验收点——统一收口 dial_accept）；② Rb 实装（`f965009`：pool.rs 全删
+619 行 + 非阻塞拨号三分类 + 背压清账通道删除 + UDP 拨号同步化〔pending 窗口坍缩
+为零〕+ drain/linger 死分支删〔R3-design M13 差异登记〕）；③ Rc 两道门收口
+（`05491b3`：代码评审 11 条——**1 高 = flush_out EAGAIN 自旋**〔驱动线程死循环
+= 整出口挂死，评审者独立复现；修复 = 三态步进〔Wrote/Full=break 等 POLLOUT/Dead=
+清缓冲〕+ 单元钉反向验证闭环〔注入必红 abort〕；教训：「禁阻塞」字面全过但忙等
+比阻塞更糟〕+ 1 中 + 9 低全处置；ci-local quick 两轮全绿〔f965009 与 05491b3〕；
+harness A/B 臂绿〔B 臂 3.5MB/s 高于健康带〕、cold_air 负载机本批与基线同红同形
+〔评审者静默机复跑绿——门对负载敏感，R-16 注记成立〕、三径慢臂高方差两轮无回归
+定论）；④ Rd 发版 v0.2.3（tag `da95496` → Release 四产物 sha 全 OK → 两台滚动：
+Mac 原子换名+kickstart / 阿里云先停净再 cp amd64〔首 cp 撞 Text file busy 二次等
+净成功〕→ 手机自动重连 peer: + 16:30:37、reactor 拨号失败路径真机在跑〔:1 探测
+降噪行同串〕、reactor 观测行生产输出〔pump 822/5s 均周期 6.08ms 单拍峰 ≤196µs〕、
+中继 v0.2.3↔v0.2.3 互注；dialok 行待手机自然流量〔滚动时闲置，观察项入
+DEPLOY §11〕）；实录 = `docs/DEPLOY-RUST-EXIT.md` §11）；⑤ Re 收口（本段）。
+**简化收益（诚实度量）**：行数 = 逻辑 +65（旧 mod+pool 2493 → 新 mod 2558——
+非阻塞拨号 libc FFI 与评审强制的 wait_hint 刷新/剂量观测/兴趣集纯函数是新必需
+质量面）、测试 +178（评审 R-7 测试网 = 五条新测资产）、pool.rs -619——**结构性
+简化不体现在行数**：线程 -8、通道/唤醒管道/清账/回执全删、OwnedFd 类型化、「语义
+零改动」由 19 单测 + harness + 矩阵 + 两道评审门背书。评审全记录 =
+`docs/reviews/reactor.md`（两道门），设计 = `docs/reviews/reactor-design.md`
+（v2.1）。存量登记（评审者发现、非本批、未修）：`udp_seq_of` 未赋值（E12 关闭行
+恒「会话 #0」——M4 口径未兑现，修属判据行变更需单独确认）+ `dial_accept` listen
+失败路径与 close() 的 decr_flow 可能下溢。tier 本批未动（纯出口侧）。
 
 真手指复测清单（files 上传 picker〔K-10〕、~~逐包 pacing 下一档~~（**D-3 已落**——
 8s 进默认 + 8r 机制在册默认关）、

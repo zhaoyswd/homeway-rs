@@ -376,3 +376,52 @@ term-1Surface 帧在渲）。
 config 键本就未配置）。**注意回退后 tier 侧核（v0.2.2 形态）与出口 v0.2.1 的
 组合**：wire 面无差异（删除批不动协议），此前双版混跑形态（12:29–12:37 手机
 v0.2.2 核 × Mac v0.2.1 出口）实测四判据全绿——回退出口不需要回滚手机。
+
+## 11. 滚动升级 v0.2.3（2026-10-07 16:26–16:31，拦截层单线程 reactor 简化批）
+
+> 发版 = tag `v0.2.3`（commit `da95496`，Release run `37593598650` 绿；四目标产物
+> + SHA256SUMS `--check` 全 OK；darwin-arm64 本机与 linux-amd64 阿里云 `--version`
+> = `homeway-cli v0.2.3` 实测）。内容：出口拦截层重拨 OS socket 从 8-worker 池收进
+> **单线程 reactor**（pool.rs 全删 619 行；每流 ReactorIo/非阻塞拨号三分类/背压清账
+> 通道删除；协议语义零改动——判据行/Stats 同串）。两道 dsh 评审门（设计 16 条 + 代码
+> 11 条，代码门 1 高：flush_out EAGAIN 自旋——修复含单元钉反向验证闭环）；记录 =
+> `docs/reviews/reactor.md`，设计 = `docs/reviews/reactor-design.md` v2.1。
+> **兼容性**：零 config 变更（无新删键）；state 无布局变更；wire 面零差异——手机
+> （v0.2.2 核）与出口 v0.2.3 混跑无需动手机。
+
+**Mac（launchd，16:26–16:28）**：
+
+- 备份在位：`~/bin/homeway-rs.bak-v0.2.2`（sha `7b65d49e…` = v0.2.2 装机件字节）。
+- 换装：`~/bin/homeway-rs` = v0.2.3 darwin-arm64（sha `98f337e5…`，临时件 + `mv`
+  原子换名）→ `launchctl kickstart -k` → running。
+- 判据行（16:28:27–28:59）：`serve 就绪` + `intercept: 过境拦截就绪（隧道IP
+  100.64.255.1；豁免=转投本机同端口；TCP 并发上限 1024）`（E5 同串）+ `发送线程：
+  就绪（homeway-serve-tx，单轮排空上界 256KiB）` + 绑卡 en0 + v4/v6 双公布 +
+  `中继：注册成功`。**本批新 verbose 观测行**：`intercept: reactor 观测
+  pump=819/5s（均周期 6.11ms）名下fd峰=1 单拍峰=196µs`（idle 形态：低拍频 5ms 档、
+  单拍 wall ≤196µs——低-4 的 fds>0 门控下静默期不打，有流才出）。
+- **手机自动重连**（未触碰手机）：`peer: + dev=aca645d3 pub=14ffdc3b
+  ip=100.64.119.141`（16:30:37，重启窗口后自动恢复）；手机核自连探测 :1 走 reactor
+  拨号失败路径——`intercept: tcp exempt 100.64.255.1:1 ← …:33731 拨号失败：连接失败`
+  （降噪形态行同串，非阻塞 connect→RST 真机在跑）。
+
+**阿里云（nohup 双角色，16:29–16:31）**：
+
+- 备份在位：`/usr/local/bin/homeway-rs.bak-v0.2.2`（sha `d0f51bff…`）。流程照 §10
+  教训：**先 pkill 等退净（宽限 drain 收尾 ~数秒）再 cp**（首cp 撞 Text file busy——
+  二次等净后成功）；产物 = linux-**amd64**（sha `2dabce88…`）。
+- 换装后重跑 nohup 命令行（pid 1567909）：`统一进程就绪（… serve=true relay=true
+  … version=v0.2.3）`（16:30:34）+ `serve 就绪：wg=:41641 … tokens=4` + 绑卡 eth0 +
+  STUN 公布 `123.56.218.212:41641`（UPnP 无 IGD = 云主机常态）。
+- **中继互注（v0.2.3↔v0.2.3）**：阿里云 relay.log `中继：后端 d07c57dd5bde1fa7
+  注册成功（腿 114.242.60.128:41641）`（16:30:40）+ Mac 侧 `中继：注册成功` ——
+  同刻互注零人工。
+
+**观察项**：滚动时刻手机闲置（无人使用），E10 dialok 行待手机下次自然 transit 流量
+时出现（语义等价已由 19 单测 + harness 三臂 + RRR 矩阵 + 评审判据行机械比对背书；
+隧道健康面已验：peer 注册/refresh/keepalive + 探测拨号失败路径 + reactor 观测行）。
+
+**回退（如需，v0.2.2 件在位）**：Mac `cp ~/bin/homeway-rs.bak-v0.2.2 ~/bin/homeway-rs
+&& launchctl kickstart -k …`；阿里云 pkill 等退净后 `cp …/homeway-rs.bak-v0.2.2
+/usr/local/bin/homeway-rs` + 重跑 nohup 命令行。state/config 兼容（零变更）；
+wire 面零差异——回退出口不需要动手机。
