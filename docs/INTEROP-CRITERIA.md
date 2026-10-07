@@ -222,6 +222,65 @@ v6 路径）+ Rust 统一进程出口 42680（upnp=true 同号映射成立 ⇒ v
   不受影响）。
 - **【Q-D 批，2026-10-08】快照镜像窗口行数（F1c）**：见上「计数输入集/数值语义变化」表——
   宽屏（大 `cols×rows`）下客户端初始滚动窗口变小，超出部分走 FETCH-ROWS 按需拉取（规格场景不变）。
+- **【Q-E 批，2026-10-08】files 路径沙箱逐分量复核（F1，行为差异）**：`canonicalize` 快路径换成
+  逐分量 walk（Go `os.Root` 同规则，设计文档 §0.4 对 Go 1.24.5 的实测）——**(a)** 目标**绝对**的
+  符号链接**一律** `not_found`（即便落在根内：现状 Rust 放行、Go 拒；本批对齐）；**(b)** 相对目标
+  词法越界拒；**(c)** 悬空链接 `not_found`（Go 实测亦回 ENOENT）。此前「不存在叶子原样放行」可在
+  根外落文件（P0-4）。残余：复核与使用点分离的 **TOCTOU 未收口**（无 `openat2`，macOS 不可用；
+  威胁模型 = 经隧道的设备）；`stat` 的 `entry.name`（实址 basename vs Go 请求 basename）与 `write`
+  穿透符号链接语义（vs Go `rename` 替换链接）**均维持既有**，未在本批改动。
+- **【Q-E 批，2026-10-08】files 客户端响应行不设上限（F2，行为差异）**：>64KB 响应由「报错」→
+  「正常返回」；与 `facade/files_op.rs` 的 `read_line_capped(false)` 同口径（原 64KB 门是服务端
+  请求行上限的误移植）。残余：客户端内存随对端响应行增长（对端 = 用户自己的出口）。
+- **【Q-E 批，2026-10-08】files 服务端请求行上限（F3b，与 Go 对齐）**：由「无界读」→
+  「`MAX_REQUEST_LINE` 64KB **累积中判负** ⇒ `invalid_arg`「请求行超过 65536 字节」（Go 同串）+
+  收线」；请求行**读出错**（含 busy 路径）按 Go `errorResponse` 语义回 `op_failed`（`server.go:177-183`：
+  非 `*Error` ⇒ `op_failed` + 原文）再收线。**这是补 Rust 漏用（移植偏差修复），不是新增偏离**。
+- **【Q-E 批，2026-10-08】files 上传磁盘水位（F3a，行为差异）**：目标文件系统可用空间 <
+  `UPLOAD_RESERVE_BYTES`（1 GiB）时拒收新上传（起始门 + 每 8MiB 进行中门），拒绝码 = 既有
+  `op_failed`（**不新增码**）。Go 无任何上限（照收）⇒ **加固超出 Go 基线**；并发两条上传可越
+  保留量 ≤8MiB 窗口；`statvfs` 失败 fail-open（节流告警）。
+- **【Q-E 批，2026-10-08】UPnP `http_call` 上限/长度/期限（F7，行为差异）**：①体积闸从无到有
+  （**分调用**：描述文件 1 MiB / SOAP 64 KiB = Go 同值），但**超限报错**而 Go 是 `io.LimitReader`
+  **静默截断**（理由：截断会切掉 `>713<` 表尾判定体 ⇒ 静默改变映射表语义）；②`Content-Length`
+  一致性校验为**新增严格度**（Go 无；声明 > 上限立即拒、实收 ≠ 声明报错）；③拨号与读的**绝对
+  期限**（Go ctx 同义）。
+- **【Q-E 批，2026-10-08】SSDP 应答来源过滤（F8，行为差异）**：只采纳「私网/环回来源 +
+  `HTTP/1.1 200`/`HTTP/1.0 200` + 非空 LOCATION」（Go 只查非空 LOCATION、不校来源）；未采纳者
+  **继续读**、不中断重试；公开地址 LAN 会漏配（真机可回退）。
+- **【Q-E 批，2026-10-08】UPnP 加映射的所有权门与轮级序（F9，行为差异）**：①轮级「先加后删」——
+  `clean_mappings` 跳过 `prefer` 条目 ⇒ **`prefer` 端口**在候选申请成功前**不删**（口径订正，
+  代码门 r10 M2/r11：**只保证 `prefer`**——`prefer` 由 `find_our_mapping` 选出，若它与"在用映射"
+  不同（例如表里另有 Ours 条目），其余 Ours 仍会被 clean 删除后再在候选上加回 ⇒ 存在一轮真空窗）；
+  ②仅当「枚举完整且快照明确属于我们」才允许 718 时先删后加（幂等重建）；fail-open 与「表说空闲
+  但路由器报 718」改为**让位下一候选、不删既有映射**（Go 会强删）⇒ fail-open 轮里 `prefer` 端口
+  续不上时会**换外部端口**（登记为已知漂移，Go 是"删了再加回同一口"）；③缩租改「先 add(300) →
+  718 才 delete + add(300)」（加不回去时原映射仍在）；④候选去重（Go `tried` 同义）。**残余**：
+  路由器若**静默覆盖**同名映射（不回 718），"先加"仍会顶掉别人的（Go 先删同样如此）。
+- **【Q-E 批，2026-10-08】UPnP 期限穿透与全局预算（F10，行为差异）**：`ssdp_location`/`discover_igd`
+  收 `deadline`（内部取 `min(deadline, 5s)`；每轮 recv 超时与 sleep 均按剩余夹取）；公网端点路径的
+  40s 预算**贯穿「映射 + 外网 IP 查询」两步**（Go `publicendpoint.go:141` 单 ctx），缩租 8s 为**全局**
+  预算。停机路径（`serve_cli.rs:482`、`unified_cli.rs:912/939/1470`）最坏时长由 N×(5s+8s) 降到
+  **8s + 1 个 recv/sleep 上界（≤1.7s）**（代码门 M3 订正口径）。**残余**：`to_socket_addrs` 的系统
+  域名解析没有可取消面（字面 IP 走快路径；生产 IGD LOCATION 基本是字面 IP）——挂死的 LAN 主机名
+  解析不受 deadline 约束（Go 的 ctx 下解析可取消）。
+- **【Q-E 批，2026-10-08】UPnP 缩租结果归因（additive）**：`ShrinkOutcome` 分 `NoIgd`/`TableIncomplete`
+  （枚举残缺 ≠ 没有映射）/`NoMapping`/`Shrunk`/`Failed` 五态（engine 侧各打归因行）。
+- **【Q-E 批，2026-10-08】accept 错误分类（F5，行为差异）**：`EMFILE/ENFILE/ENOBUFS/ENOMEM/
+  ECONNABORTED/EPROTO/EINTR` 从「当监听已关、静默退出」→「退避重试（200ms→1s 上限）+ 节流日志」；
+  Go 的接受循环遇错即退出（由调用方 Close + 日志）。`Fatal`（EBADF/EINVAL/…）仍退工，但现在**记行**。
+- **【Q-E 批，2026-10-08】speedtest busy 路径帧吞（F6c，行为差异）**：拒绝路径的「有界吞一帧」从
+  「512B 缓冲 + 超长即报错（载荷留流里 ⇒ 后续对帧错位）」→「按声明长度**流式吞完**（64KB 复用缓冲，
+  超 `MAX_BLOCK` 收线）」；帧吞窗 `2s` / 吞输入窗 `1s`（Go `ReplyThenClose` 同值），**两腿都走逐
+  syscall 收敛的 `DeadlineIo`**（代码门 H2 订正：只 arm 一次时 `read_exact`/`BufWriter` 的内部
+  循环会被「每 <2s 送 1 字节」的滴流无限续命 ⇒ 单条 busy 连接可占线程数小时；现为真绝对期限）。
+- **【Q-E 批，2026-10-08】DNS TCP 腿读侧期限（M1 订正，与 Go 对齐）**：`exchange_tcp` 的读/写
+  从「一次性 `set_read_timeout(budget)`（per-syscall）」→ **逐 syscall 按绝对期限收敛**（同
+  `DeadlineIo` 形态）——滴流上游最坏从 ≈(2+65535)×budget 收敛到 ≤budget（Go `SetDeadline(now+budget)`，
+  `server.go:460`）。
+- **【Q-E 批，2026-10-08】UPnP `http_call` 收满声明长度即返（M5，与 Go 对齐）**：`Content-Length`
+  已知且正文收满即 break（Go `io.ReadAll(resp.Body)` 在长度边界返 EOF）——忽略 `Connection: close`
+  的 keep-alive 路由器不再把每次 SOAP 拖到预算耗尽。
 - **【Q-B 批，2026-10-07】应用层丢新（F3/F4，接受的差异）**：`out_udp` 超条数/字节上限、以及
   `tx_deferred` 滞留超 `TX_DEFER_MAX_BYTES`（非 TCP 包）时**丢新 + 计数**（`udpDrop`/`shapeDrop`）。
   Go 侧对应面是内核 rcvbuf 界定 / 无界 channel——本层以显式上限换取内存有界，代价是压力下丢新
@@ -378,4 +437,9 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 | 2026-10-07（Q-C） | **观测面 additive**：探针 flags 中继降级位（bit5 `FLAG_RELAY_CTL_DEGRADED`）/ `send_fail_*` / `down_limited` / 中继拒绝日志限流 | 无 → 有 | F7/F8/F10/F6：中继无 JSON 遥测通道，本批多为日志/单测可见 | 探针 flags（**中继命名空间** bit5；serve 侧 bit0–4 与 C14 **不受影响**）、`relay/mod.rs` 单测 `probe_flags_report_ctl_degraded` |
 | 2026-10-08（Q-D） | **快照镜像窗口行数**（SNAPSHOT 体的 mirror 段；不在判据行、无夹具） | 恒 `rows × 10`（视口数）→ `min(rows × 10, 32MiB / (cols × 48B))`（下限 64 行；1000 列 ⇒ 699 行） | F1c：快照材质内存上界（上限处最坏 ≈200 MiB/次 + 反复 RESIZE 可反复触发） | 快照镜像面、`service.rs`（`mirror_rows_budget`/`mirror_window_rows`）、单测 `mirror_window_rows_budget`；**窄屏（80/100 列）与既有 golden 形态不变**；宽屏客户端滚动窗口变小（FETCH-ROWS 按需拉取兜底，tier `term-surface-protocol` 场景不变） |
 | 2026-10-08（Q-D） | **新增观测行（additive）** | 无 → 有：`term: 会话 {n} 查询应答丢弃 {n} 条（队列满）` / `剪贴板写丢弃 {n} 条` / `PTY 注入丢弃 {n} 条（队列满）`（节流：首 3 次 + 每 100 次；消费者已退出时尾缀换 `（消费者已退出）`——代码门 M3）；`term: {ctx}{term-pump\|term-leg-writer\|term-surface\|term-resp\|term-sample\|term-conn} 线程 panic（已兜住）：{载荷}`；`term: 会话 {n} 尺寸夹取 {cols}x{rows} → {c}x{r}（上限 1000x500）`（**只在夹取结果真变、尺寸真被应用时打**——同值重复上报不刷屏，代码门 L5）；`term: 会话 {n} 忽略 RESIZE 0×0 上报 {k} 次（会话几何保持）`（节流同款）；腿断开归因新增 `原因=panicked` | F6/F7/F1a 观测面（原 `resp_dropped` 只写不读、nudge 丢弃与线程 panic 静默） | 非 E 族判据行；`docs/reviews/QD.md`、`service.rs` 单测 `drop_counters_and_throttled_log`/`guard_thread_logs_and_reports_action`/`nudge_bytes_for_three_states`/`sample_tick_panic_keeps_loop_alive`、E16d 的 `原因=` 归因集合新增 `panicked`（词表是自由文本归因，非 ENDED reason 词表） |
+| 2026-10-08（Q-E） | **E22** `dns: q=… qtcp=… resp=… fallback=… fail=…` | ① `fail` 输入集扩大：上游持续灌不匹配包/短包时，此前 worker 被**永久占用**、该查询永不结束（不计 `fail`、无应答）；现在按**本腿预算的绝对期限**结束 ⇒ 计 `fail` 并回 SERVFAIL。② `fallback` 输入集随 ① 上升（坏上游被按期判负后，后续腿与兜底才真正被尝试）——**单腿预算（含 `MAX_PER_TRY=800ms`）与上游回退序不变** | F4a：per-syscall → **per-attempt** 绝对期限（对齐 Go `SetDeadline(now+budget)`，`server.go:415`） | E22 数值、DNS 单测（`exchange_absolute_deadline_under_poison_upstream`）、`dnsproxy.rs` |
+| 2026-10-08（Q-E） | **`udpDrop`**（intercept 计数） | ① **输入集不变**（三个来源：DNS 回投 tx 写失败 `intercept/mod.rs:1861-1863`、`udp_send_to_client` 栈 tx 满、`out_udp` 超限）；② 数值下降：DNS 回投 rx/tx 容量 64 槽/64KB → **256 槽 / 316,624B**（F4c 把 worker 2→64 后 64KB 先撞墙，故容量必须同比扩） | F4c+F4d：回投容量与 worker/在途对齐 | `udpDrop` 数值、`serve.status` intercept 段、`dnsface.rs`（`udp_tx_capacity_matches_inflight`） |
+| 2026-10-08（Q-E） | **E13** 会话时长 | 滴流客户端此前每次成功读续命（30s 硬超时形同虚设）⇒ 现在**绝对** 30s 上界；正常会话（≤5s 预热 + ≤15s 窗口）不变 | F6a：硬超时绝对化（`Limits` 可注入） | E13 数值（时长字段）、speedtest 单测（`conn_timeout_is_absolute_under_dribble`） |
+| 2026-10-08（Q-E） | **UPnP 映射表枚举次数**（`GetGenericPortMappingEntry` SOAP 往返，非判据行） | 每轮 `3 × (N+1)` → **`(N+1)`** 次往返（N = 表长；第 N+1 次取表尾 713） | F9a：枚举一次缓存（**优化，偏离 Go 的 3 次**） | 路由器负载、UPnP 轮次耗时；日志行文不变（`enumerate_once_per_round`） |
+| 2026-10-08（Q-E） | **新增观测行（additive）** | 无 → 有：`files`/`speedtest` accept **瞬态错误退避**行（首 3 + 每 100）、accept **Fatal 退工**行（含 engine 侧「服务线程退工」）、`files` 会话线程/busy 线程起不来行、files **水位检查失败 fail-open 告警**（首 3 + 每 100）与**上传中止**行、UPnP「枚举一次 / 未经核验不删（让位）」行、缩租 `ShrinkOutcome` 归因行（NoIgd/NoMapping/Shrunk/Failed）、`http_call` 三条新错误串（超限/长度不符/预算耗尽） | F3a/F5/F6c/F7/F9/F10：静默路径改可观测 | 各日志族读者；**非编号判据行** |
 | 2026-10-08（Q-I 前段） | **udpcap 探测周期 / caps 新鲜度**（`UDP 默认路径：…` 行 = 本表 udpcap 的 `—` 行，**行文与语义均不变**） | 频次：**bindwatch 在位形态**（auto 挑卡/显式绑卡 = 生产形态）周期 `~600s`（`recv_timeout(300s)` 超时后又 `sleep(300s)`，等于每拍睡两次）→ **`~300s`**（超时即重探；对齐 Go `udpcap.go:26` 5min ticker + kick，`udpcap.go:140-152`）；**`--bind-interface none` 形态本已 ~300s（不变）**。喂客户端 C14 的 caps 位新鲜度：`≤10min` → **`≤5min`**（kick 面即时重探不变） | Q-I F7：`recv_timeout` 的 Timeout 与 Disconnected 未区分（多睡一拍） | `UDP 默认路径` 行频次（行文不变）、caps 新鲜度、`server/engine.rs` 纯函数 `udpcap_disconnected_backoff` + 单测 `udpcap_wait_three_states`；**非**编号判据行（无 R1–R13/E* 行文变更） |
