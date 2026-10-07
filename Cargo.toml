@@ -4,7 +4,7 @@ members = ["crates/homeway-core", "crates/homeway-cli", "crates/homeway-capi"]
 exclude = ["fuzz"]  # fuzz 独立 workspace（nightly + cargo-fuzz；不进 cargo test --workspace——G-10）
 
 [workspace.package]
-version = "0.1.0"
+version = "0.2.3"
 edition = "2021"
 
 [workspace.dependencies]

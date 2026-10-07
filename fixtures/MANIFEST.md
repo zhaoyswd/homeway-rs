@@ -1,7 +1,8 @@
 # fixtures — golden 夹具与对照向量清单（R0.4）
 
-> **来源纪律**：一切 golden 拷自 baseline 克隆（基线 `621fe0e`，见 `docs/BASELINE.md`）。
-> 升级基线后重拷 + 重跑 `tools/gen-vectors.sh`，diff 非空即语义漂移，必须复核 Rust 侧与判据文档。
+> **来源纪律**：一切 golden 拷自 baseline 克隆（基线 `d4148f6`，见 `docs/BASELINE.md`；
+> **基线已冻结不再前移**）。将来若重拷/重跑 `tools/gen-vectors.sh`，diff 非空即语义漂移，
+> 必须复核 Rust 侧与判据文档。
 
 ## vectors/（生成物，确定性——重跑 diff 应为空）
 
@@ -32,8 +33,17 @@ daemon 控制面帧向量 + `decode_check.py`（**语言无关**的解码对拍�
 
 ## 机器校验
 
-`SHA256SUMS` 覆盖本目录全部文件（45 项，向量 JSON 亦入册）；`shasum -c SHA256SUMS`（在
-`fixtures/` 下执行）应全 OK——升级基线重拷/重生成后必须重跑并重写（R5 本地 CI 挂门）。
+`SHA256SUMS` **覆盖本目录全部文件（59 项，含本清单 `MANIFEST.md`；`SHA256SUMS` 自身除外）**；
+`shasum -c SHA256SUMS`（在 `fixtures/` 下执行）应全 OK——重拷/重生成后必须重跑并重写
+（R5 本地 CI 第 4 步挂门）。生成口径 = 遍历 `fixtures/` 下全部文件、排除 `SHA256SUMS` 自身，
+行格式 `<sha256>  ./<相对 fixtures 的路径>`（与 `shasum -c` 兼容）。
+
+**2026-10-07 Q-A 批修正**：原「45 项」为 R0.4 时点计数，此后 R2/R4/R5/R6/R7 陆续新增向量
+与目录，入册条目实际长到 52 行但一直未补齐（8 个文件缺册：本清单、`vectors/surface_codec.json`、
+`vectors/term_manifest_eval.json`、`vectors/term_mouseenc.json`、`vectors/term_keyenc.json`、
+`vectors/term_responder.json`、`vectors/term_palette.json`、`vectors/tun_status.jsonl`〔且该行
+缺 `./` 前缀〕）。本次按现行全量重生成：**45（文档口径）/52（实际行数）→ 59 项**，覆盖口径
+自此字面成真。
 
 ## term golden（拷贝，来源 hash 锚定）
 

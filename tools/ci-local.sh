@@ -1,17 +1,19 @@
 #!/bin/zsh
 # ci-local.sh — 本地 CI 一键门（R5-5f；设计 §7，评审 G-10 整改）
 #
-# 编排（顺序，前者失败即停）：
+# 编排（步骤 **1–7 + 4.5**，共八步；顺序，前者失败即停）：
 #   1. tools/check-baseline.sh            基线门（克隆 HEAD == BASELINE.md 锚定）
 #   2. cargo test --workspace             单测+集成（fuzz_replay #[ignore] 跳过——quick 档）
 #   3. cargo clippy --all-targets -D warnings + OHOS 交叉 check（r1-F18）
 #   4. tools/gen-vectors.sh + shasum -c + git diff   向量确定性门（含 SUMS 校验——G-11）
+#   4.5 tools/gen-fuzz-seeds.sh + 摘要对账  fuzz 种子展开门（第二道门 中-13 整改）
 #   5. tools/check-vocab.sh               词表三方门
 #   6. cargo build --release -p homeway-cli           smoke 前置（G-10）
 #   7. tools/matrix.sh --smoke            RRR 基础段冒烟
 # 全量档：--full 加 cargo test --ignored（fuzz_replay 9 目标 × 100k）。
-# 预算：quick 热 target ≈12–15 分钟（冒烟档实测 399s——R5-5f 收口实测值；冷构建首轮
-# 显著更长）。另：第 7 步依赖 bin/homeway-go（gitignore）——干净 clone 先
+# 预算（实测口径，2026-10-07 Q-A 修订）：**冒烟档快步 ≈399s ≈ 6.6 分钟**（R5-5f 收口
+# 实测值，热 target）；**冷构建首轮显著更长**（依赖全量编译，未见分钟级上界）。另：
+# 第 7 步依赖 bin/homeway-go（bin 为 gitignore）——干净 clone 先
 # tools/local-exit.sh start 1 触发构建。
 set -uo pipefail
 

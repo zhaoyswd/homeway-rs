@@ -1,6 +1,6 @@
 [package]
 name = "homeway-cli"
-description = "homeway-cli：测试/运维命令面（R1 实装 connect；当前为占位 + token 解析冒烟）"
+description = "homeway-cli：生产出口/中继/客户端/daemon 统一二进制（零参 = 统一进程；v0.2.3）"
 version.workspace = true
 edition.workspace = true
 

@@ -14,10 +14,11 @@
 //! 只认全局 flag（--state/--verbose）——角色 flag打在统一进程 = 可行动错误
 //! （走 config 或前台单角色形态；Go RunUnified 同义）。
 //!
-//! **B0-2b 第 1 棒留桩（如实标注）**：serve/relay 角色失败退避重建（supervisor
-//! M4——本棒 start 失败即报错、运行期崩溃 = 进程退出靠 launchd/nohup 拉回）；
-//! serve.status 的 peers/intercept 观测面（engine 状态缝未开）；承载面 9 op
-//! （forward/socks/speedtest）——见 docs/reviews/B0-2b.md 挂账表。
+//! **已完成面（原 B0-2b 留桩，逐项兑现）**：supervisor 退避重建（B0-2b 第 2 棒：
+//! 退避表 [500ms,1s,5s,30s] 表尾封顶 + serve/relay 双角色看护 + 状态面三态）；
+//! serve.status 的 peers/intercept 观测面（EngineCmd::StatusQuery + 原子直读）；
+//! 承载面 9 op（forward/socks/speedtest 守护托管——D-1 批）。记录 = docs/reviews/B0-2b.md
+//! §七–§十七。
 
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
