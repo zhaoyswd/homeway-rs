@@ -48,10 +48,6 @@ struct FileServe {
     /// `homeway_core::server::intercept::TxShapeCfg`；覆盖序 env > config > 默认）。
     #[serde(default)]
     tx_shape: Option<homeway_core::server::intercept::TxShapeCfg>,
-    /// 拦截栈内层 MTU（P2：默认 1280；开放档 {1280,1380}；覆盖序 env > flag >
-    /// config > 默认）。升档语义/防线见 docs/reviews/P2.md。
-    #[serde(default)]
-    inner_mtu: Option<usize>,
 }
 
 #[derive(serde::Deserialize, Default)]
@@ -131,8 +127,6 @@ struct ServeFlags {
     /// DDNS 域名（`--ddns` 单值 flag：显式给 = 覆盖 config 的**全部**条目——
     /// 一次性覆盖语义，Go cli.go:127-134 同口径）。
     ddns: Option<String>,
-    /// 内层 MTU（P2：--inner-mtu 1280|1380）。
-    inner_mtu: Option<usize>,
     /// 位置参数（serve 不接受）。
     extra: Vec<String>,
 }
@@ -153,7 +147,6 @@ fn parse_serve_flags(args: &[String]) -> ServeFlags {
         verbose: false,
         relay: None,
         ddns: None,
-        inner_mtu: None,
         extra: Vec::new(),
     };
     let mut i = 0;
@@ -256,22 +249,6 @@ fn parse_serve_flags(args: &[String]) -> ServeFlags {
                 }
                 f.ddns = Some(v);
             }
-            "inner-mtu" => {
-                let Some(v) = take_val(&mut j) else {
-                    eprintln!("--inner-mtu 缺值（1280 或 1380）");
-                    std::process::exit(2);
-                };
-                match v.parse::<usize>() {
-                    Ok(n) => {
-                        validate_inner_mtu(n, "--inner-mtu");
-                        f.inner_mtu = Some(n);
-                    }
-                    Err(_) => {
-                        eprintln!("--inner-mtu 非法（{v:?}——仅收整数）");
-                        std::process::exit(2);
-                    }
-                }
-            }
             "verbose" => f.verbose = true,
             other => {
                 eprintln!("未知参数：--{other}");
@@ -351,10 +328,6 @@ pub fn assemble(args: &[String]) -> ServeConfig {
         }
         // [serve.tx_shape]（D-3）：解析与 env 覆盖在 tx_shape_resolve（engine 装配点）。
         cfg.tx_shape_cfg = fc.serve.tx_shape;
-        if let Some(v) = fc.serve.inner_mtu {
-            validate_inner_mtu(v, &format!("{}: serve.inner_mtu", cfg_path.display()));
-            cfg.inner_mtu = v;
-        }
         // serve.relay：注册腿端点（rl1 token / 裸 host:port——R4-4c 接线）
         if let Some(v) = fc.serve.relay {
             if !v.is_empty() {
@@ -429,34 +402,7 @@ pub fn assemble(args: &[String]) -> ServeConfig {
             vec![v.clone()]
         };
     }
-    if let Some(v) = f.inner_mtu {
-        cfg.inner_mtu = v;
-    }
-    // env 消融缝（P2：harness/matrix 臂用；env > flag > config > 默认——tx_shape 同序）
-    if let Some(raw) = std::env::var_os("HOMEWAY_INNER_MTU") {
-        let raw = raw.to_string_lossy().trim().to_owned();
-        if !raw.is_empty() {
-            match raw.parse::<usize>() {
-                Ok(n) => {
-                    validate_inner_mtu(n, "HOMEWAY_INNER_MTU");
-                    cfg.inner_mtu = n;
-                }
-                Err(_) => {
-                    eprintln!("HOMEWAY_INNER_MTU 非法（{raw:?}——仅收整数）");
-                    std::process::exit(2);
-                }
-            }
-        }
-    }
     cfg
-}
-
-/// 内层 MTU 的入口校验（CLI/config 同串）。
-fn validate_inner_mtu(v: usize, where_: &str) {
-    if v != 1280 && v != 1380 {
-        eprintln!("{where_} 非法（{v}——本批开放档仅 1280/1380；升档需手机侧同档才有收益，防线见 docs/reviews/P2.md）");
-        std::process::exit(2);
-    }
 }
 
 fn parse_bind_iface(v: &str) -> BindMode {

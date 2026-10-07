@@ -254,9 +254,7 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# homeway 配置（L1 意图层，唯�
 #           peer_ttl(时长串，"0s"=关) / dns_port(0=关；非 0 = 客户端解析腿端口，缺省 5300) /
 #           files_root(空=$HOME)
 #   [[serve.ddns]] domain = "裸域名"（可多条；出口只读解析，记录由外部 DDNS 维护）
-#   [serve.tx_shape] 发送整形（rate_mbps/burst_kib/pace；缺省关）
-#   [serve] inner_mtu = 1280|1380（P2 内层 MTU 档；升档需手机侧同档才有下行收益，
-#           防线见 docs/reviews/P2.md）
+#   [serve.tx_shape] 发送整形（rate_mbps/burst_kib；缺省关）
 #   [relay] enabled / listen(":41741") / advertise(逗号分隔，空=自动探测)
 # 客户端角色无配置节（随进程常开）；host 表在 <state>/client/hosts.json（不进 config）。
 

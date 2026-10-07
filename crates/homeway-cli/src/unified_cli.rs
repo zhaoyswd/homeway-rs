@@ -83,9 +83,6 @@ struct FileServe {
     /// 〔TxShapeCfg 未实现 Serialize，本表 derive 了写回面〕。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tx_shape: Option<toml::Value>,
-    /// 内层 MTU（P2）：同上——serve_cli::FileServe 的同键镜像。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    inner_mtu: Option<usize>,
 }
 
 #[derive(serde::Deserialize, serde::Serialize, Default, Clone)]

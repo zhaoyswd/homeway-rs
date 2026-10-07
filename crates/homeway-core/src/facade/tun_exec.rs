@@ -70,9 +70,9 @@ const STATS_SECS_DEFAULT: i64 = 60;
 /// 旁路探测预算（endpoint-freshness；结果只进缓存与日志——Go 8s 同值，
 /// 评审 r2-L5 对齐）。
 const PROBE_CANDIDATES_BUDGET: Duration = Duration::from_secs(8);
-/// mtu 缺省（Go Normalize：MTU ≤0 → 1280）。上限 clamp（[1280,1400]，P2 起
-/// cfg.mtu 有了功能消费面——升档门）为**有意偏离** Go 的旧「不 clamp」口径
-/// （彼时 cfg.mtu 仅进日志无消费）；登记 = docs/BASELINE.md 偏离表。
+/// mtu 缺省（Go Normalize：MTU ≤0 → 1280）。cfg.mtu 只进日志行（running /
+/// wgcore 应用面就绪），数据面恒 1280——P2 升档门已随 v0.2.2 简洁化批删除
+///（docs/BASELINE.md 偏离表的 clamp 条目同批撤销）。
 const MTU_DEFAULT: i64 = 1280;
 /// 桥拨号预算缺省（Go Normalize：DialMs ≤0 → 15000——评审 r2-L5；随 tunConfig
 /// 的 dialMs 热传入 BridgeHost）。
@@ -306,9 +306,6 @@ pub struct GenRun {
     identity: Identity,
     /// 链路快照（runner link 段数据源；巡检写）。
     pub link: Mutex<Option<LinkIn>>,
-    /// 升档门裁决的内层 MTU（P2：cfg.mtu==1280 时恒 None ⇒ status 无 mtuEff 键，
-    /// 默认档字节级零变化；≠1280 时每世代一次、Ready 发布前定值）。
-    pub mtu_eff: Mutex<Option<u32>>,
     /// 隧道桥（attached 后起；None = 未起/已停）。
     pub bridge: Mutex<Option<Arc<BridgeHost>>>,
     /// 日志面（带 `tier-core: ` 前缀；写世代日志文件）。
@@ -659,7 +656,6 @@ pub(crate) fn runner_of(run: &GenRun) -> RunnerIn {
         pf_fails: 0,
         exit_ip: crate::wgcore::SERVER_TUNNEL_IP.to_string(),
         link,
-        mtu_eff: *lock_unpoison(&run.mtu_eff),
         port_forwards: portfwd_states(run),
         bridge,
     }
@@ -811,7 +807,6 @@ fn gen_loop(
         peer_pub: *cfg.token.peer_id.as_bytes(),
         identity: ident.clone(),
         link: Mutex::new(None),
-        mtu_eff: Mutex::new(None),
         bridge: Mutex::new(None),
         logf: Arc::clone(&logf),
         tun_shared: Arc::clone(&shared),
@@ -1046,25 +1041,6 @@ fn gen_loop(
             .set_if_current(gen, TunStage::Idle, "stopped", "被停止请求中断", false);
         (logf)("暖机期间收到停止信号，收工（不等 attach）");
         return;
-    }
-    // ---- P2 升档门（每世代一次；Ready 发布前定值 ⇒ 扩展建 VpnConfig 时读到的
-    // mtuEff 已终值——接口 MTU 建立时定型，运行中不可变）。门语义与防线 =
-    // docs/reviews/P2.md §3.2/§3.3；默认档（cfg.mtu ≤1280）零日志零行为。
-    // 接线逻辑收在 mtu_gate::generation_mtu_eff（P2-r2-M2 可测面）。----
-    {
-        let link = lock_unpoison(&run.link).clone();
-        let (direct, ep) = match &link {
-            // 「direct」词面真源 = wtransport::Via::as_str（link 快照携带字符串形态）
-            Some(l) => (l.via == "direct", l.ep.parse::<std::net::SocketAddr>().ok()),
-            None => (false, None),
-        };
-        *lock_unpoison(&run.mtu_eff) = super::mtu_gate::generation_mtu_eff(
-            cfg.mtu,
-            direct,
-            ep,
-            super::mtu_gate::df_probe,
-            &|s: &str| (logf)(s),
-        );
     }
     // ---- 等 attach 的接收端先注册（评审 r2-M3：晚于 Ready 发布的窗口内投 fd 必
     // false ⇒ tun_attach -1 且 tier 侧不重试 ⇒ 整次连接失败；一行时序修复）----
