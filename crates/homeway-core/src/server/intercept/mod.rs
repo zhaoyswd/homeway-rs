@@ -24,7 +24,7 @@ pub mod nat;
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd, RawFd};
+use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -102,8 +102,7 @@ struct ReactorIo {
 }
 
 /// upstream 的拨号目标（豁免/过境/DNS 的建流决策面）。
-#[derive(Debug, Clone)]
-pub enum DialTarget {
+enum DialTarget {
     /// 本机 TCP（transit；exempt 未命中 LocalServices 时的回环同端口）。
     Tcp(std::net::SocketAddr),
     /// LocalServices UDS（files/term/speedtest）。
@@ -179,7 +178,9 @@ enum DialOutcome {
 
 /// 非阻塞拨号（reactor-design §二：**禁止 std 的 connect/connect_timeout**——std 在
 /// 非阻塞 socket 上把 EINPROGRESS 当 Err 返回；`SOCK_NONBLOCK` 在 libc 的 apple 目标
-/// 未定义，非阻塞一律 fcntl）。
+/// 未定义，非阻塞一律 fcntl）。**前提**：UDP（bind+connect 皆本地操作）恒即时成功
+/// ——「pending 窗口坍缩为零」（设计 §三）的依据；SOCK_DGRAM 上 EINPROGRESS/EAGAIN
+/// 不可达，出现即按 fail 收口。
 fn dial_nonblocking(target: &DialTarget) -> std::io::Result<DialOutcome> {
     let (domain, ty, addr, len, bind_any) = target_sockaddr(target)?;
     unsafe {
@@ -188,7 +189,7 @@ fn dial_nonblocking(target: &DialTarget) -> std::io::Result<DialOutcome> {
             return Err(std::io::Error::last_os_error());
         }
         let fd = OwnedFd::from_raw_fd(raw);
-        set_fd_nonblocking(&fd);
+        set_fd_nonblocking(&fd)?;
         if let Some((baddr, blen)) = bind_any {
             // UDP：先绑临时端口（Go「bind ephemeral + connect」同形态）
             if libc::bind(fd.as_raw_fd(), &baddr as *const _ as *const libc::sockaddr, blen) != 0 {
@@ -263,17 +264,18 @@ fn target_sockaddr(target: &DialTarget) -> std::io::Result<SockAddrPack> {
             Ok((domain, libc::SOCK_DGRAM, ss, len, Some((bind_any, blen))))
         }
         DialTarget::Unix(path) => {
-            // 装配约定 UDS 路径 < 100B（R3 §4.1 LocalServices 组装边界）
+            // 装配约定 UDS 路径 < 100B（R3 §4.1 LocalServices 组装边界）；上界按
+            // 平台结构判（macOS sun_path=104B、Linux=108B——写死 108 会越界）
             let bytes = path.as_bytes();
-            if bytes.len() >= 108 {
+            let mut ss: libc::sockaddr_un = unsafe { std::mem::zeroed() };
+            if bytes.len() >= ss.sun_path.len() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
                     "UDS 路径超长",
                 ));
             }
-            let mut ss: libc::sockaddr_un = unsafe { std::mem::zeroed() };
             ss.sun_family = libc::AF_UNIX as libc::sa_family_t;
-            // sun_path 在部分平台是 [i8]——按字节指针拷
+            // sun_path 在部分平台是 [i8]——按字节指针拷；尾零靠 zeroed
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     bytes.as_ptr(),
@@ -282,7 +284,9 @@ fn target_sockaddr(target: &DialTarget) -> std::io::Result<SockAddrPack> {
                 );
             }
             let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-            let len = std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t;
+            // 长度自洽 = family 段 + 实际路径 + NUL（不依赖零填充到全结构长）
+            let len = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1)
+                as libc::socklen_t;
             unsafe {
                 std::ptr::copy_nonoverlapping(
                     &ss as *const _ as *const u8,
@@ -296,11 +300,16 @@ fn target_sockaddr(target: &DialTarget) -> std::io::Result<SockAddrPack> {
 }
 
 /// fcntl 建非阻塞（`SOCK_NONBLOCK` 在 libc 的 apple 目标未定义——唯一形态）。
-fn set_fd_nonblocking(fd: &OwnedFd) {
+/// 失败按 Err 返回（「循环内禁阻塞」的防御闭合：置不上非阻塞的 fd 会阻塞驱动
+/// 线程——评审 r2-低6）。
+fn set_fd_nonblocking(fd: &OwnedFd) -> std::io::Result<()> {
     unsafe {
         let fl = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
-        libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK);
+        if fl < 0 || libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
     }
+    Ok(())
 }
 
 // ---------- 出口发送整形（R8-3 8i；设计 = docs/reviews/R8.md §九） ----------
@@ -694,8 +703,8 @@ pub struct Interceptor {
     halted: bool,
     /// reactor 的 pollfd 复用缓冲（每拍 clear 重建——评审 R-6：不重建 Vec 只重填）。
     pollfds: Vec<libc::pollfd>,
-    /// pollfds 与 (flow, fd) 的同序索引（revents → 流回指）。
-    poll_index: Vec<(u64, RawFd)>,
+    /// pollfds 的同序流号索引（revents → 流回指）。
+    poll_index: Vec<u64>,
     /// reactor 等待者位（connect 在途 ∨ 任一流待写缓冲非空——引擎 wait_hint 消费；
     /// **pump 尾刷新**，评审 R-5：pump 开头算会漏本拍 service_sockets 新攒的待写量）。
     reactor_waiters: bool,
@@ -1167,7 +1176,9 @@ impl Interceptor {
     }
 
     /// InProgress 态的 connect 验收（POLLOUT/POLLERR/POLLHUP 任一触发）。
-    /// **conn 的唯一清零点**（reactor-design §二——否则 POLLOUT 兴趣常驻空转）。
+    /// conn 的清零点两处（评审 r2-低8 口径订正）：本函数（InProgress 验收）与
+    /// retry_connect 的 Accepted（Retry 重拨成功）——都要立即走 dial_accept，
+    /// 否则 POLLIN 兴趣挂不上 = 流死。
     fn on_connect_done(&mut self, flow: u64) {
         let fd_ok = {
             let Some(f) = self.flows.get_mut(&flow) else { return };
@@ -1549,9 +1560,9 @@ impl Interceptor {
             );
             (self.reactor_win_pumps, self.reactor_win_peak_fds, self.reactor_win_peak_wall) =
                 (0, 0, Duration::ZERO);
-            if pumps > 0 {
+            if pumps > 0 && fds > 0 {
                 (self.cfg.logf)(&format!(
-                    "intercept: reactor 观测 pump={pumps}/5s（均拍 {:.2}ms）名下fd峰={fds} 单拍峰={}µs",
+                    "intercept: reactor 观测 pump={pumps}/5s（均周期 {:.2}ms）名下fd峰={fds} 单拍峰={}µs",
                     5000.0 / pumps as f64,
                     wall.as_micros(),
                 ));
@@ -1745,7 +1756,7 @@ impl Interceptor {
                 events: ev,
                 revents: 0,
             });
-            self.poll_index.push((*id, io.fd.as_raw_fd()));
+            self.poll_index.push(*id);
         }
         let n_fds = self.pollfds.len();
         if n_fds > 0 {
@@ -1756,7 +1767,7 @@ impl Interceptor {
                     .iter()
                     .zip(self.poll_index.iter())
                     .filter(|(pf, _)| pf.revents != 0)
-                    .map(|(pf, (flow, _))| (*flow, pf.revents))
+                    .map(|(pf, flow)| (*flow, pf.revents))
                     .collect();
                 for (flow, revents) in ready {
                     if revents & libc::POLLNVAL != 0 {
@@ -1877,7 +1888,18 @@ impl Interceptor {
 
     /// 待写缓冲续写（POLLOUT / 追加后即试写）：TCP 字节流前缀消费（部分写余量续
     /// 传）；UDP 数据报整取整发（POSIX send = 整数据报语义，无部分发）。
+    ///
+    /// 三态步进（评审 r2-高1/中1 整改）：`Wrote`（写进了——续写）；`Full`（EAGAIN
+    /// ——**break 等 POLLOUT**：原地重试 = 驱动线程自旋 = 整出口挂死，单线程收编后
+    /// 无任何线程能解围）；`Dead`（硬错误——**先清待写缓冲再走 EOF**：余量静默丢 =
+    /// 旧 worker「EOF 后不再写」口径；不清则 `dead ∧ 排空` 永不成立，fd 挂到 5min
+    /// idle + 每拍注定失败的 send + wait_hint 恒 1ms 空转）。
     fn flush_out(&mut self, flow: u64) {
+        enum Step {
+            Wrote,
+            Full,
+            Dead,
+        }
         let is_udp = self
             .flows
             .get(&flow)
@@ -1886,7 +1908,7 @@ impl Interceptor {
             .unwrap_or(false);
         if is_udp {
             loop {
-                let eof = {
+                let step = {
                     let Some(f) = self.flows.get_mut(&flow) else { return };
                     let Some(io) = f.io.as_mut() else { return };
                     let Some(dg) = io.out_udp.front() else { break };
@@ -1898,19 +1920,26 @@ impl Interceptor {
                     if n >= 0 {
                         io.out_udp.pop_front();
                         f.last_active = Instant::now();
-                        false
+                        Step::Wrote
+                    } else if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+                        Step::Full
                     } else {
-                        std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock
+                        Step::Dead
                     }
                 };
-                if eof {
-                    self.on_upstream_eof(flow);
-                    break;
+                match step {
+                    Step::Wrote => continue,
+                    Step::Full => break, // 余量留缓冲等 POLLOUT
+                    Step::Dead => {
+                        self.discard_out(flow);
+                        self.on_upstream_eof(flow);
+                        break;
+                    }
                 }
             }
         } else {
             loop {
-                let eof = {
+                let step = {
                     let Some(f) = self.flows.get_mut(&flow) else { return };
                     let Some(io) = f.io.as_mut() else { return };
                     let rem = io.out_tcp.remaining();
@@ -1924,20 +1953,38 @@ impl Interceptor {
                     if n > 0 {
                         io.out_tcp.consume(n as usize);
                         f.last_active = Instant::now();
-                        false
-                    } else if n < 0 {
-                        std::io::Error::last_os_error().kind() != std::io::ErrorKind::WouldBlock
+                        Step::Wrote
+                    } else if n == 0 {
+                        Step::Dead // send 返 0（流语义下不应发生）——按错误处置
+                    } else if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
+                        Step::Full
                     } else {
-                        true // send 返 0（流语义下不应发生）——按错误处置
+                        Step::Dead
                     }
                 };
-                if eof {
-                    self.on_upstream_eof(flow);
-                    break;
+                match step {
+                    Step::Wrote => continue,
+                    Step::Full => break, // 余量留缓冲等 POLLOUT
+                    Step::Dead => {
+                        self.discard_out(flow);
+                        self.on_upstream_eof(flow);
+                        break;
+                    }
                 }
             }
         }
         self.maybe_close_dead_io(flow);
+    }
+
+    /// 丢弃待写缓冲（硬写失败收口用——连接已死，余量不可投递：静默丢 =
+    /// 旧 worker「EOF 后不再写」口径；之后 `dead ∧ 排空` 成立、maybe_close_dead_io
+    /// 即可收 fd）。
+    fn discard_out(&mut self, flow: u64) {
+        if let Some(io) = self.flows.get_mut(&flow).and_then(|f| f.io.as_mut()) {
+            let rem = io.out_tcp.remaining().len();
+            io.out_tcp.consume(rem);
+            io.out_udp.clear();
+        }
     }
 
     /// `dead ∧ 待写排空` → 立即关 fd、io=None（Flow 保留——栈侧 FIN/idle 收尾照旧，
@@ -2232,9 +2279,10 @@ impl Interceptor {
                         .map(|f| f.kind == Kind::Dns)
                         .unwrap_or(false);
                     if can_recv && !gated {
-                        // 读尽 → DNS 腿喂进程内代答 / 其余直进待写缓冲
+                        // 读尽 → DNS 腿喂进程内代答 / 其余直进待写缓冲（边读边
+                        // push——每方向 1 拷，设计 §二；DNS 腿才需要中间 Vec）
                         let mut total = 0usize;
-                        let mut chunks: Vec<Vec<u8>> = Vec::new();
+                        let mut dns_chunks: Vec<Vec<u8>> = Vec::new();
                         loop {
                             let mut buf = [0u8; 64 * 1024];
                             let n = self
@@ -2245,28 +2293,25 @@ impl Interceptor {
                             if n == 0 {
                                 break;
                             }
-                            chunks.push(buf[..n].to_vec());
+                            if is_dns_leg {
+                                dns_chunks.push(buf[..n].to_vec());
+                            } else if let Some(io) =
+                                self.flows.get_mut(&flow).and_then(|f| f.io.as_mut())
+                            {
+                                io.out_tcp.push(&buf[..n]);
+                            }
                             total += n;
                         }
                         if is_dns_leg {
-                            for c in chunks {
+                            for c in dns_chunks {
                                 self.dns_tcp_feed(flow, &c);
                             }
-                        } else {
-                            for c in chunks {
-                                if let Some(f) = self.flows.get_mut(&flow) {
-                                    if let Some(io) = f.io.as_mut() {
-                                        io.out_tcp.push(&c);
-                                    }
-                                }
+                        } else if total > 0 {
+                            if let Some(f) = self.flows.get_mut(&flow) {
+                                f.last_active = Instant::now();
                             }
-                            if total > 0 {
-                                if let Some(f) = self.flows.get_mut(&flow) {
-                                    f.last_active = Instant::now();
-                                }
-                                // 本拍即试写（EAGAIN 余量留缓冲等 POLLOUT）
-                                self.flush_out(flow);
-                            }
+                            // 本拍即试写（EAGAIN 余量留缓冲等 POLLOUT）
+                            self.flush_out(flow);
                         }
                     }
                     // 对端 FIN 且缓冲排空 → 本地 close（FIN 推进；CloseWait 不会自发迁移——
@@ -3190,20 +3235,92 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// 部分写续写 E2E（R-7②）：TCP 豁免腿对慢读对端——upstream socket EAGAIN 余量留
-    /// 待写缓冲，对端读开后 POLLOUT 续传，字节流完整按序到达（不丢字节/不丢序——
-    /// 旧 Written/Ack 清账族的回归钉）。
+    /// flush_out 的 EAGAIN 语义单元钉（评审 r2-高1 回归）：写满的 socket（自设
+    /// 8KB sndbuf 的 socketpair，对端不读）上 1MB 待写——`flush_out` 必须**立即
+    /// 返回**（原地重试 = 驱动线程自旋 = 整出口挂死）且余量保留在待写缓冲。
+    /// 看门狗 30s abort 兜底：自旋回归时测试进程死而非无限挂起。
+    #[test]
+    fn flush_out_eagain_returns_with_backlog() {
+        let wd_done = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let wd = {
+            let wd_done = Arc::clone(&wd_done);
+            std::thread::spawn(move || {
+                let t0 = Instant::now();
+                while !wd_done.load(Ordering::Relaxed) {
+                    if t0.elapsed() > Duration::from_secs(30) {
+                        eprintln!("看门狗：flush_out 疑似 EAGAIN 自旋（评审 r2-高1 回归）——abort");
+                        unsafe { libc::abort() };
+                    }
+                    std::thread::sleep(Duration::from_millis(200));
+                }
+            })
+        };
+        let mut fds = [-1i32; 2];
+        unsafe {
+            assert_eq!(libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()), 0);
+            let sz: libc::c_int = 8 * 1024;
+            libc::setsockopt(
+                fds[0],
+                libc::SOL_SOCKET,
+                libc::SO_SNDBUF,
+                &sz as *const _ as *const libc::c_void,
+                std::mem::size_of::<libc::c_int>() as u32,
+            );
+        }
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::new(Stats::default()));
+        // 手搓豁免流 + 8KB socketpair 写端当 upstream（对端〔读端〕不读）
+        let v = View5 {
+            src: Ipv4Addr::new(100, 64, 10, 13),
+            src_port: 40000,
+            dst: tunnel,
+            dst_port: 47903,
+            proto: 6,
+            tcp_flags: nat::TCP_SYN,
+            tcp_seq: 1,
+            tcp_ack: 0,
+            udp_payload: (0, 0),
+        };
+        let flow = itc.alloc_flow(&v, Kind::Exempt, Proto::Tcp, Vec::new());
+        let fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
+        set_fd_nonblocking(&fd).unwrap(); // place_io 契约：fd 已非阻塞（dial_nonblocking 平时的保证）
+        itc.place_io(flow, fd, false, None, Instant::now());
+        if let Some(io) = itc.flows.get_mut(&flow).and_then(|f| f.io.as_mut()) {
+            io.out_tcp.push(&vec![0x5au8; 1024 * 1024]);
+        }
+        // 必须在预算内返回（自旋形态 = 挂死 = 看门狗 abort）
+        itc.flush_out(flow);
+        let left = itc
+            .flows
+            .get(&flow)
+            .and_then(|f| f.io.as_ref())
+            .map(|io| io.out_tcp.remaining().len())
+            .unwrap_or(0);
+        assert!(left > 0, "EAGAIN 后余量应留在待写缓冲（非全写非丢弃）——left={left}");
+        assert!(left < 1024 * 1024, "应有部分写出（sndbuf 8KB 已吞）——left={left}");
+        wd_done.store(true, Ordering::Relaxed);
+        let _ = wd.join();
+        itc.remove_flow(flow); // fd 收口
+        unsafe { libc::close(fds[1]) };
+        assert_eq!(itc.reactor_fds(), 0);
+    }
+
+    /// 停读对端 → 开读后完整按序 E2E（R-7② 行为面）：TCP 豁免腿对停读窗口的
+    /// upstream——待写缓冲积压/续传不得丢字节/丢序；EAGAIN 语义由
+    /// flush_out_eagain_returns_with_backlog 单元钉直测（本机 sndbuf 自动调优过
+    /// 大，E2E 层逼不出确定性 EAGAIN——大载荷下客户端内层窗口先关，同属背压正
+    /// 常行为）。
     #[test]
     fn upstream_partial_write_continues() {
-        const TOTAL: usize = 128 * 1024;
+        const TOTAL: usize = 256 * 1024;
         let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = listener.local_addr().unwrap().port();
         let (done_tx, done_rx) = std::sync::mpsc::channel::<usize>();
         let origin = std::thread::spawn(move || {
             let (mut c, _) = listener.accept().unwrap();
-            // 小接收缓冲（关自调优）+ 先不读——把 upstream socket 的内核发送缓冲顶满
+            // 小接收缓冲（关自调优）+ 停读 400ms——促成待写缓冲积压
             unsafe {
-                let sz: libc::c_int = 16 * 1024;
+                let sz: libc::c_int = 8 * 1024;
                 libc::setsockopt(
                     c.as_raw_fd(),
                     libc::SOL_SOCKET,
@@ -3212,7 +3329,7 @@ mod tests {
                     std::mem::size_of::<libc::c_int>() as u32,
                 );
             }
-            std::thread::sleep(Duration::from_millis(300));
+            std::thread::sleep(Duration::from_millis(400));
             let mut got = 0usize;
             let mut expect = 0u8;
             let mut buf = [0u8; 16384];
@@ -3221,7 +3338,7 @@ mod tests {
                 if n == 0 {
                     break;
                 }
-                // 序校验：载荷 = 循环递增字节
+                // 序校验：载荷 = 循环递增字节（积压续传不得丢字节/丢序）
                 for &b in &buf[..n] {
                     assert_eq!(b, expect, "字节流应按序无缺口（got={got}）");
                     expect = expect.wrapping_add(1);
@@ -3254,9 +3371,9 @@ mod tests {
             tcp::State::Established
         );
 
-        // 整段载荷（循环递增字节），一次灌给客户端栈（1MB 发送缓冲装得下）
         let payload: Vec<u8> = (0..TOTAL as u32).map(|i| (i % 256) as u8).collect();
         let mut sent = 0usize;
+        let send_deadline = Instant::now() + Duration::from_secs(10);
         while sent < TOTAL {
             let n = client
                 .sockets
@@ -3265,10 +3382,12 @@ mod tests {
                 .unwrap();
             sent += n;
             cross_pump(&mut client, &mut itc, 4, &mut 0);
+            if Instant::now() >= send_deadline {
+                panic!("10s 内未灌完（sent={sent}）");
+            }
             std::thread::sleep(Duration::from_millis(1));
         }
-        // 发完持续泵到对端收齐（reactor 的续传只在 pump 里发生——out_tcp 余量
-        // 靠 POLLOUT 逐拍推进）
+        // 对端开读后持续泵到收齐（待写余量逐拍续传）
         let deadline = Instant::now() + Duration::from_secs(10);
         let got = loop {
             cross_pump(&mut client, &mut itc, 4, &mut 0);
@@ -3280,7 +3399,7 @@ mod tests {
                 Err(std::sync::mpsc::TryRecvError::Empty) => {}
             }
             if Instant::now() >= deadline {
-                panic!("10s 内对端未收齐（EAGAIN 余量未续传）");
+                panic!("10s 内对端未收齐（余量未续传）");
             }
             std::thread::sleep(Duration::from_millis(2));
         };

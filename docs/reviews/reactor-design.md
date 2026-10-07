@@ -81,6 +81,7 @@ struct ReactorIo {
 |---|---|
 | upstream EOF 且待写缓冲排空（`dead ∧ out 空`） | **立即关 fd、`io = None`、Flow 保留**（栈侧 FIN/idle 收尾照旧——对齐现状 worker「排空即收 fd、流记录等栈侧」） |
 | 拨号失败 / 验收 SO_ERROR≠0 / connect 死线 | `remove_flow`（io 随流 drop 即关——socket() 已建而 connect 失败的 fd 同此收口） |
+| **硬写失败**（send 非 EAGAIN 错误，如对端 RST 后 EPIPE） | **先清待写缓冲（余量静默丢 = 旧 worker「EOF 后不再写」口径）再走 EOF 路径**——不清则 `dead ∧ 排空` 永不成立、fd 挂到 5min idle + 每拍注定失败的 send + wait_hint 恒 1ms 空转（评审 r2-中1） |
 | teardown / close() / 收工 / idle 回收 | `remove_flow`（同上） |
 
 **兴趣位**（pump 每拍重建，纯函数面可单测——`interests_for(io, backlog_len) -> events`）：
@@ -109,6 +110,9 @@ struct ReactorIo {
   ——`unacked_out ≡ 待写缓冲量`，直接可读；Written 差额补报通道
   （written_total/written_reported 双计数器）整族删除。
 
+**待写续写的三态步进**（评审 r2-高1 整改后写死）：`Wrote`（写进了——续写）/
+`Full`（EAGAIN——**必须 break 等 POLLOUT**：原地重试 = 驱动线程自旋 = 整出口挂死，
+单线程收编后无任何线程能解围）/ `Dead`（硬错误——先清待写缓冲再走 EOF，见规则表）。
 **缓冲拷贝（R6.6 双拷贝收敛）**：现状每方向 2 拷（通道消息 Vec ↔ 缓冲 extend），
 新形态每方向 1 拷（栈缓冲 ↔ 流缓冲）——零拷贝需栈内缓冲外露，不值。
 
@@ -174,8 +178,11 @@ TCP 的 Dialing 窗口**保留**（真网络 connect 异步）：SYN 缓存 ≤4
   - TCP/UDS 读 ≤ `WATERMARK − 现存 backlog`（256KB 门——读进 tx_backlog 才算数）；
     写 ≤ 待写缓冲存量。单流单拍上界 ≈ 512KB。
   - UDP 读 = drain 到 EAGAIN，上界 = **内核 rcvbuf**（默认 ~200KB 量级）——**现状
-    既有上界**（worker 时代同样无应用层门，in-stack socket 64KB tx 满即丢），
-    本批不变；给 UDP 加预算属行为变更，不掺进结构批。
+    既有上界**（in-stack socket 64KB tx 满即丢）。**上行门（评审 r2-低2 登记为等价
+    迁移）**：旧形态 worker 的 `unacked > WATERMARK` 读门对 UDP 生效（作用点 = worker
+    读 upstream fd，积压滞留内核 rcvbuf）；新形态统一为驱动侧栈读门（`pending_out`
+    含 out_udp，积压滞留栈内 socket 64 槽 rx）——同为 256KB 积压后停止摄取、内存有
+    界同；突发吸收面略降（64 槽 < 内核 rcvbuf），登记。
 - **单流风暴有界**：水位门控读端 = 慢消费者自我降速（现状 Ack 清账同一稳态，少一次
   往返延迟）；超过 rcvbuf 的 UDP 到达由内核丢弃——与现状一致。
 - **worker 饿死族结构性消失**：无 worker 线程即无「共享 runner 满载饿死拦截层工作
@@ -255,8 +262,10 @@ cc 观测行原样；新增 reactor 观测行（verbose 5s 面，非启动判据
   reactor 观测行。
 - **测试面**（评审 R-7：四 E2E 原样过 ≠ 新机制有测试网——删 pool_end_to_end_uds
   后必须补）：① **UDS 豁免腿 E2E**（local_services 映射 → UDS echo：即时 connect
-  路径 + dialok + 数据往返——正是 R-1 形态的回归钉）；② **部分写续写 E2E**（TCP
-  豁免腿对慢读对端：EAGAIN 余量留缓冲、最终完整按序送达）；③ **fd 收口断言**
+  路径 + dialok + 数据往返——正是 R-1 形态的回归钉）；② **flush_out EAGAIN 语义单元钉**（socketpair 自设小
+  SNDBUF + 对端不读：flush_out 必须在预算内返回且余量保留——看门狗 abort 兜底，
+  高-1 的直接回归钉；E2E 面为「停读→开读→按序完整」行为钉——本机 sndbuf 自动调
+  过大，E2E 层逼不出确定性 EAGAIN）；③ **fd 收口断言**
   （`#[cfg(test)] reactor_fds()` 计数：exempt/dial-fail/udp/close 四路径跑完后归零
   ——R-3 规则表的机器验收）；④ **兴趣集纯函数单测**（水位摘 POLLIN / InProgress
   只 POLLOUT / Retry 无位 / dead 只 POLLOUT）。

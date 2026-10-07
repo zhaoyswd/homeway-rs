@@ -36,6 +36,37 @@ reactor-design v1 / R3-design 语义基线 / pool.rs+mod.rs+engine.rs 现状代�
 归属）、§二缓冲拷贝 2→1 论证、关闭路径删 Close/Closed/forget_flow（结构性消灭收工
 竞态）、§七保持在外清单、§四 worker 饿死族消失、§八判据行面（除 R-8 口径）。
 
-## 第二道门：代码评审（实装后）
+## 第二道门：代码评审（dsh headless，2026-10-07，实装 commit f965009）
 
-（Rb 完成后记：见本文件尾部追加段。）
+评审者独立读 diff + 设计文档 + 新旧实现对照（含自建 worktree 复现实验）。结论：
+结构收编干净、R-1..R-16 绝大多数逐条兑现、判据行机械比对同串（19→21 行，新增仅
+reactor 观测与 POLLNVAL 防御两行）；**1 高 / 1 中 / 9 低**，十六个「看过没问题」面。
+
+### 处置表
+
+| # | 级 | 问题（原文要义） | 处置 |
+|---|---|---|---|
+| 高-1 | 高 | **flush_out 在 send=EAGAIN 上原地自旋**（WouldBlock 归入「非 eof」→ 无 break → 缓冲不变再 send）——驱动线程永不返回 = 整出口挂死；旧 worker flush_flow EAGAIN 即返，本批新引入。评审者独立复现（对端停读 + 2MB 载荷，pump 700KB 处锁死） | **修**。三态步进：Wrote 续写 / **Full(EAGAIN) break 等 POLLOUT** / Dead 先清待写缓冲再 EOF。单元钉 `flush_out_eagain_returns_with_backlog`（socketpair 小 SNDBUF + 对端不读 + 看门狗 abort）——反向验证闭环（注入 Full→continue 必红 abort，恢复绿）。顺带教训：**本批第一硬项「禁阻塞」的字面检查全过，但忙等自旋比阻塞更糟**——单线程后单点自旋 = 整机挂死 |
+| 中-1 | 中 | 硬写失败（EPIPE/ECONNRESET）+ 待写缓冲非空 ⇒ `dead∧排空` 永不成立——fd 滞留至 5min idle + 每拍注定失败的 send + wait_hint 恒 1ms 空转 | **修**。flush_out 的 Dead 步进先 `discard_out`（余量静默丢 = 旧 worker「EOF 后不再写」口径）再 on_upstream_eof；设计 §二 fd 规则表补「硬写失败」行 |
+| 低-1 | 低 | UDS `sun_path` 上界写死 108（Linux）——macOS 是 104B，104..107B 路径越界写（栈 UB；装配面 <100B 守卫使其当前不可达） | **修**。`>= ss.sun_path.len()` + 长度自洽（offset_of + len + NUL） |
+| 低-2 | 低 | 上行水位门对 UDP 新生效（旧 unacked_out 只对 TCP 累加；但旧 worker 侧读门对 UDP 生效） | **登记为等价迁移**（保留实现）：门从 worker 读门挪到驱动侧栈读门（统一 pending_out 含 out_udp），同为 256KB 积压停摄取、内存有界同；突发吸收面略降（栈内 64 槽 < 内核 rcvbuf）——设计 §四 R-11 行更新 |
+| 低-3 | 低 | 下行读门 `> 256KB` 收紧为 `≥`（差一个读块） | 记录不改（量级内、内存更省；service_sockets 侧同旧操作符） |
+| 低-4 | 低 | reactor 观测行「均拍」实为 pump 周期非单拍耗时；空载也打行 | **修**。标签改「均周期」+ `fds>0` 门控 |
+| 低-5 | 低 | poll_index 的 fd 分量冗余；DialTarget pub+derive 超需；chunks 中间 Vec 三拷 | **修**：poll_index→Vec<u64>（并删 RawFd import）、DialTarget 收可见性、非 DNS 腿边读边 push（每方向 1 拷对齐设计 §二）。retry 的目标重推导分配保留（低频路径） |
+| 低-6 | 低 | set_fd_nonblocking 吞 fcntl 失败——「禁阻塞」唯一理论破口 | **修**。两次 fcntl 校验，失败按拨号失败收口 |
+| 低-7 | 低 | UDP「connect 恒即时成功」前提未设防（SOCK_DGRAM 上 EINPROGRESS 不可达但未写死） | **修**。dial_nonblocking 文档前提写死（fail 收口口径） |
+| 低-8 | 低 | 「conn 唯一清零点」与实装不符（retry 也清） | **修**。注释口径改「验收与重拨成功两处清零、都须立即 dial_accept」 |
+| 低-9 | 低 | 部分写测试强度不足（与高-1 同源漏网：对端只停 300ms 且 macOS sndbuf 默认吞下 128KB——EAGAIN 可能从未触发） | **修**。单元钉直测 EAGAIN 语义（见高-1）+ E2E 改「停读→开读→按序完整」行为钉；本机 sndbuf 自动调优过大（4MB 灌不动）实测入册 |
+| 存量 | — | 评审者另发现（HEAD~1 既有，非本批）：①`udp_seq_of` 从未赋值——E12 关闭行恒「会话 #0」（M4 评审声称打本会话号）；②`dial_accept` listen 失败路径与 close() 对未 incr_flow 的流调 decr_flow 可能下溢 | **登记不修**（语义零改动边界：①改了会变更判据行字节；两者均为既有形态，移交后续批） |
+| R-16 复测 | — | cold_air 三臂 | 负载机：本批与 v0.2.2 基线同红同形（丢 51/34 vs 54/50 包，吞吐持平偏好）——负载敏感；**评审者静默机复跑本批 = 绿（25.8s）**。结论：非本批回归，门对机器负载敏感（R-16 注记成立） |
+
+### 验收面（评审者实测 + 本会话补充）
+
+reactor 相关 8+1 测全绿；harness A/B 臂绿（B 臂 3.5MB/s 高于健康带）；三径臂慢臂
+高方差两轮（1.1/0.5 红 → 0.5/0.7 绿；off 臂自身波动 2 倍——按 R8-2「单轮不可 A/B」
+纪律无回归定论）；ci-local quick 全绿（含 RRR 矩阵冒烟）。整改后全量
+`cargo test --workspace` 435+ 绿、clippy -D warnings 绿、OHOS 交叉 check 绿。
+
+整改 commit：见 git log「拦截 reactor 简化批 Rc-1」（flush_out 三态 + discard_out +
+单元钉/测试重写 + 低项批量 + 文档落档）。
+
