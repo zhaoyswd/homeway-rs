@@ -952,6 +952,13 @@ impl ServerBind {
                     stop,
                     alive,
                 }));
+                // 就绪行（滚动判据——默认 on 后启动面即见；形态/排空细节在 5s
+                // 观测行「UDP 出站[发送线程]」/「发送线程 唤醒+…」，那两行
+                // 有流量才打，不能当启动判据）。
+                (dlogf)(&format!(
+                    "发送线程：就绪（homeway-serve-tx，单轮排空上界 {}KiB；消融臂 HOMEWAY_TX_SENDTHREAD=off）",
+                    burst_bytes / 1024
+                ));
             }
             Err(e) => {
                 // spawn 失败：闭包已 drop（sock 随之关闭）；关 socketpair 保持 Inline
@@ -1126,15 +1133,16 @@ impl Drop for ServerBind {
 
 // ---------- P1 发送线程体 ----------
 
-/// P1 发送线程开关（值匹配惯例——与 HOMEWAY_TX_SHAPING 同款）。**默认 off
-///（内联 = 拆分前形态）**——引擎级集成的根因（唤醒合并位 pending 双实例）已在
-/// P1 定位批修复并本地全通（见 docs/reviews/P1.md「P1 定位记录」），但 P1c
-/// 消融终验（真机 2×2 同刻）未跑完前不开默认（收益未经终验的行为不上产品默认）。
-/// on/1/true = 开（P1c 终验 / 实验臂）。
+/// P1 发送线程开关（值匹配惯例——与 HOMEWAY_TX_SHAPING 同款）。**默认 on**
+///（2026-10-07 用户多因子框架裁定翻默认：架构合理性/实际性能/理论性能/设备负载/
+/// 复杂度五维，覆盖原纯经验 15% 收益门——真机稳态 +7% 从未负值、回环 +25%、
+/// 收益随更强网卡放大、复杂度已沉没、死代码路径反成负担；裁定记录 = ROADMAP
+/// P1 终档「默认开启裁定」+ PERF-AB §9.17 注记）。`off/0/false` = 消融臂
+///（内联发送 = 拆分前形态——回退/对照面保留）。
 pub(crate) fn tx_sendthread_enabled() -> bool {
-    matches!(
+    !matches!(
         std::env::var("HOMEWAY_TX_SENDTHREAD").as_deref(),
-        Ok("on") | Ok("1") | Ok("true")
+        Ok("off") | Ok("0") | Ok("false")
     )
 }
 

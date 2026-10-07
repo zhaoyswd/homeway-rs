@@ -591,7 +591,7 @@ impl ServeEngine {
             );
         }
 
-        // ---- P1 发送线程（浅拆：密文→sendto 独立；HOMEWAY_TX_SENDTHREAD 消融臂） ----
+        // ---- P1 发送线程（浅拆：密文→sendto 独立；默认 on，HOMEWAY_TX_SENDTHREAD=off 消融臂） ----
         // 单轮排空字节上界 = burst（团块钳制与整形器单拍上界同语义）；整形 off 臂
         // 用默认 TX_SHAPE_BURST（形态约束与整形开关正交）。
         if crate::server::bind::tx_sendthread_enabled() {
