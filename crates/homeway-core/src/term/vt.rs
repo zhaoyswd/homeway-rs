@@ -26,8 +26,10 @@ use alacritty_terminal::vte::ansi::{
 };
 use std::sync::Arc;
 
+use super::codec::{marker, symbol_prefix};
 use super::keyenc;
 use super::responder;
+use super::size::Size;
 
 /// 回滚行数上限默认值（Go `vt.DefaultScrollbackLines` 同值；env
 /// `HOMEWAY_TERM_SCROLLBACK_LINES` 由会话层注入）。
@@ -289,9 +291,19 @@ impl Default for SessionVt {
 /// 应答字节不经事件（TermProbe 拦截面直接产进 `responses`）。
 impl SessionVt {
     /// 建 cols×rows 终端，回滚行数上限 scrollback（0 ⇒ 默认 10000）。
+    ///
+    /// **尺寸硬拒（F1a 末道门）**：只接受已归一尺寸（非 0 且 ≤ [`Size::MAX_COLS`]×
+    /// [`Size::MAX_ROWS`]）。alacritty 的 `Term::new/resize` 对两屏按 `rows × cols` **即时
+    /// 分配**且无上限——实测 `65535×65535` ≈96 GiB 起（分配失败 = abort，不是 unwind），
+    /// 所以这里**在发起分配之前**拒绝。会话层的 [`Size`] 已保证入参合法，本门是组件层的
+    /// 兜底（测试/未来调用点直连时同样安全）。
     pub fn new(cols: u16, rows: u16, scrollback: usize) -> Result<Self, String> {
-        if cols == 0 || rows == 0 {
-            return Err(format!("vt: 尺寸非法 {cols}x{rows}"));
+        if !Size::is_exact(cols, rows) {
+            return Err(format!(
+                "vt: 尺寸非法 {cols}x{rows}（须为 1..={}×1..={}）",
+                Size::MAX_COLS,
+                Size::MAX_ROWS
+            ));
         }
         let scrollback = if scrollback == 0 { DEFAULT_SCROLLBACK_LINES } else { scrollback };
         let config = Config {
@@ -420,11 +432,15 @@ impl SessionVt {
     }
 
     /// 改尺寸（含主屏回滚重排；备用屏不重排——alacritty 语义与 ghostty 一致）。
-    /// 尺寸未变时空操作。行列变化 ⇒ 指纹表失效（下拍 `update()` 仍会 Full——resize 走
-    /// 全量路径），此处重置。
+    /// 尺寸未变时空操作。行列变化 ⇒ `flushed` 指纹表整体重置（下拍 `update()` 仍会
+    /// Full——resize 走全量路径）。入参走与 [`SessionVt::new`] 相同的硬拒门（F1a）。
     pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String> {
-        if cols == 0 || rows == 0 {
-            return Err(format!("vt: 尺寸非法 {cols}x{rows}"));
+        if !Size::is_exact(cols, rows) {
+            return Err(format!(
+                "vt: 尺寸非法 {cols}x{rows}（须为 1..={}×1..={}）",
+                Size::MAX_COLS,
+                Size::MAX_ROWS
+            ));
         }
         let (cols, rows) = (cols as usize, rows as usize);
         if self.cols == cols && self.rows == rows {
@@ -615,13 +631,23 @@ impl SessionVt {
     /// 只在「构建载荷」时调用；下发成功后 [`SessionVt::clean`]。
     /// Partial 路径按指纹过滤「内容未变」的行（B3：damage_cursor 会无条件标脏光标行，
     /// 空闲/纯光标移动的差分因此与 Go 的 count=0 对齐）。
+    ///
+    /// 指纹推进的唯一不变量（F2）：**`flushed[y]` 只在第 y 行内容进入一次下发载荷时推进**。
+    /// 本函数返回的行 = 即将成帧的行 ⇒ 这里提交；`rows()`（采样/纯读面）**不**提交，
+    /// 否则 1Hz 采样会静默吞掉后续差分（QD 证据 B）。
+    ///
+    /// damage 只取一次（F9）：`Term::damage()` 非纯读（刷新 last_cursor + damage_cursor），
+    /// 旧实现的「先判 Full 再取 Partial」会调两次；未知形态按全量安全回落。
     pub fn dirty_rows(&mut self) -> Vec<Row> {
-        if self.force_full || matches!(self.term.damage(), TermDamage::Full) {
-            return self.rows();
+        if self.force_full {
+            return self.rows_and_commit(); // 短路优先：不再调 damage()
         }
-        let damaged: std::collections::HashSet<usize> = match self.term.damage() {
-            TermDamage::Partial(iter) => iter.into_iter().map(|l| l.line).collect(),
-            _ => unreachable!("上分支已处理"),
+        let damaged: Option<std::collections::HashSet<usize>> = match self.term.damage() {
+            TermDamage::Full => None, // None = 全视口（与安全回落同路）
+            TermDamage::Partial(iter) => Some(iter.map(|l| l.line).collect()),
+        };
+        let Some(damaged) = damaged else {
+            return self.rows_and_commit();
         };
         let mut out = Vec::new();
         for y in (0..self.rows).filter(|y| damaged.contains(y)) {
@@ -635,9 +661,21 @@ impl SessionVt {
         out
     }
 
-    /// 全部视口行（快照路径；隐含消费脏状态——调用方随后本就要发全量并 clean）。
+    /// 全部视口行（**纯读**：不推进指纹；快照/采样/explain 面用）。
+    /// 隐含消费脏状态（同 Go Rows 的隐含 Update）——`damage()` 的既有副作用保留，
+    /// 但指纹不在此推进（F2：采样调用不得改变后续差分内容）。
     pub fn rows(&mut self) -> Vec<Row> {
-        let _ = self.term.damage(); // 拉到最新（同 Go Rows 的隐含 Update）
+        let _ = self.term.damage(); // 隐含 Update 保留；指纹不在此推进
+        let mut out = Vec::with_capacity(self.rows);
+        for y in 0..self.rows {
+            out.push(self.row_at(y));
+        }
+        out
+    }
+
+    /// 全部视口行 + **提交指纹**（快照路径：全量确实要下发，提交后增量不重复带）。
+    pub fn rows_and_commit(&mut self) -> Vec<Row> {
+        let _ = self.term.damage(); // 隐含 Update（同 rows()）
         let mut out = Vec::with_capacity(self.rows);
         for y in 0..self.rows {
             let row = self.row_at(y);
@@ -660,14 +698,7 @@ impl SessionVt {
         for x in 0..self.cols {
             cells.push(cell_of(&row[Column(x)]));
         }
-        Row { y: y as u16, dirty: false, wraps: self.row_wraps(y), cells }
-    }
-
-    /// 物理行 y 是否软折行（行尾 cell 的 WRAPLINE 位；grid 只读面）。
-    fn row_wraps(&self, y: usize) -> bool {
-        let grid = self.term.grid();
-        let row = &grid[Line(y as i32)];
-        self.cols > 0 && row[Column(self.cols - 1)].flags.contains(AlacFlags::WRAPLINE)
+        Row { y: y as u16, dirty: false, wraps: line_wraps(row, self.cols), cells }
     }
 
     fn row_at(&self, y: usize) -> Row {
@@ -767,8 +798,10 @@ impl SessionVt {
                 cells.push(cell_of(&row[Column(x)]));
             }
             // 镜像/拉取行的 y 是**视口相对值**（服务端发的镜像 y 从视口顶起算——与 Go
-            // 一致：客户端按返回顺序重排，不拿 y 当绝对行号）。
-            out.push(Row { y: 0, dirty: false, wraps: false, cells });
+            // 一致：客户端按返回顺序重排，不拿 y 当绝对行号）。wraps 按行读 WRAPLINE
+            // （F8②：原实现回滚行恒 false ⇒ plain_text 的折行合并在回滚段断裂；
+            // wire 不编 wraps——codec 无字节影响）。
+            out.push(Row { y: 0, dirty: false, wraps: line_wraps(row, cols), cells });
         }
         out
     }
@@ -778,34 +811,52 @@ impl SessionVt {
     /// 一条逻辑行，不插换行）再逐逻辑行裁尾；region 求值自尾部切「最近约一屏」，
     /// 回滚在前不改变判定，但 region_bytes/screenBytes 与 Go 逐字节可比——评审
     /// M2/P2）。
+    ///
+    /// 备用屏（F8①）：ghostty formatter **只格式化活动屏**（`formatter.zig:236-239`）
+    /// ⇒ 备用屏下取视口行；主屏取整屏 + 回滚。
+    ///
+    /// 实现口径（Q-D 代码门 A1）：**流式**逐格写进输出串——不物化 `Vec<Row>`
+    /// （上限处 `10500 × 1000` 格 ≈250 MB 材质 + 千万次 `String` 堆分配，且调用方
+    /// `explain_json` 持服务锁）。输出与「先 `rows_at` 再合并」的参考实现逐字节等价
+    /// （单测 `vt_plain_text_streaming_matches_reference` 钉住）。
     pub fn plain_text(&mut self) -> String {
-        let total = self.term.total_lines() as u64;
-        let rows = self.rows_at(0, total as usize);
-        // 展开折行：合并段内的行尾裁剪不做（拼接后才裁逻辑行尾）
-        let mut logical: Vec<String> = Vec::new();
+        let _ = self.term.damage(); // 隐含 Update（与 rows() 同口径）
+        let cols = self.cols;
+        let rows = self.rows;
+        let alt = self.modes_static().screen == Screen::Alternate;
+        let grid = self.term.grid();
+        // 备用屏 = Line 0..rows；主屏 = 从最旧回滚行（-(total-rows)）到视口底
+        let total = self.term.total_lines();
+        let first = if alt { 0i64 } else { rows as i64 - total as i64 };
+        let mut out = String::new();
         let mut acc = String::new();
-        for r in &rows {
-            let mut line = String::with_capacity(r.cells.len());
-            for c in &r.cells {
-                if c.skip {
-                    continue;
-                }
-                if c.symbol.is_empty() {
-                    line.push(' ');
-                } else {
-                    line.push_str(&c.symbol);
-                }
+        let mut line_buf = String::new();
+        let mut first_logical = true;
+        for li in first..rows as i64 {
+            let line = Line(li as i32);
+            let row = &grid[line];
+            line_buf.clear();
+            for x in 0..cols {
+                push_cell_text(&row[Column(x)], &mut line_buf);
             }
-            acc.push_str(&line);
-            if r.wraps {
+            acc.push_str(&line_buf);
+            if line_wraps(row, cols) {
                 continue; // 软折行：并进同一条逻辑行
             }
-            logical.push(std::mem::take(&mut acc).trim_end_matches([' ', '\t', '\u{a0}']).to_string());
+            if !first_logical {
+                out.push('\n');
+            }
+            out.push_str(acc.trim_end_matches([' ', '\t', '\u{a0}']));
+            acc.clear();
+            first_logical = false;
         }
         if !acc.is_empty() {
-            logical.push(acc.trim_end_matches([' ', '\t', '\u{a0}']).to_string());
+            if !first_logical {
+                out.push('\n');
+            }
+            out.push_str(acc.trim_end_matches([' ', '\t', '\u{a0}']));
         }
-        logical.join("\n")
+        out
     }
 
     /// 当前视口纯文本（检测引擎输入口径：跳占位格、空符号补空格、行尾裁空白）。
@@ -986,6 +1037,42 @@ fn is_dcs_prefix(s: &[u8]) -> bool {
     false
 }
 
+/// 一格的「纯文本贡献」直接写进 out（`plain_text` 的流式口径；与
+/// `cell_of` + `text_of_rows` 的逐格结果逐字节等价）：占位格跳过、空格（含带样式空格）
+/// 补 `' '`、非空格写 symbol，含 F5 的 ≤127 B UTF-8 边界截断。
+fn push_cell_text(c: &AlacCell, out: &mut String) {
+    if c.flags.contains(AlacFlags::WIDE_CHAR_SPACER)
+        || c.flags.contains(AlacFlags::LEADING_WIDE_CHAR_SPACER)
+    {
+        return; // 占位格（cell_of 的 skip）
+    }
+    let is_space = c.c == ' ' && c.zerowidth().is_none_or(|z| z.is_empty());
+    if is_space {
+        out.push(' ');
+        return;
+    }
+    let max = marker::SYM_LEN_MASK as usize;
+    let mut used = c.c.len_utf8();
+    if used > max {
+        return; // 理论不可达（单码点 ≤ 4 B）
+    }
+    out.push(c.c);
+    if let Some(zw) = c.zerowidth() {
+        for ch in zw {
+            if used + ch.len_utf8() > max {
+                return; // 与 symbol_prefix 同口径：截到最后一个不越界的码点
+            }
+            used += ch.len_utf8();
+            out.push(*ch);
+        }
+    }
+}
+
+/// 行尾 cell 的 WRAPLINE 位（软折行判定；视口行与绝对行共用同一判据——F8②）。
+fn line_wraps(row: &alacritty_terminal::grid::Row<AlacCell>, cols: usize) -> bool {
+    cols > 0 && row[Column(cols - 1)].flags.contains(AlacFlags::WRAPLINE)
+}
+
 /// 行内容指纹（B3 的过滤依据）：对全格逐字段 FNV-1a——symbol/width/skip/颜色/属性任一
 /// 变化即不同；同内容行（如 damage_cursor 误标的光标行）指纹稳定。
 fn row_fingerprint(row: &Row) -> u64 {
@@ -1047,6 +1134,14 @@ fn cell_of(c: &AlacCell) -> Cell {
             for ch in zw {
                 symbol.push(*ch);
             }
+        }
+        // F5：单格 symbol 收口 ≤ SYM_LEN_MASK（=127 B，wire 长度域真源）。
+        // alacritty 的 push_zerowidth 无上限 ⇒ 200+ 组合字符的病态字素簇会让 7 位
+        // 长度域回绕（hdr 写 len & 0x7f、体写全量 ⇒ 后续颜色/属性字段全部错位）。
+        // 按 UTF-8 边界截断（绝不截半个码点——线协议是字节流，错位比截断更糟）。
+        let max = marker::SYM_LEN_MASK as usize;
+        if symbol.len() > max {
+            symbol.truncate(symbol_prefix(&symbol, max).len());
         }
     }
 
@@ -1790,6 +1885,174 @@ mod tests {
         let mut got: Vec<u8> = Vec::new();
         vt.write_collecting(b"\x1bP$qs\x1b\\", &mut |p| got.extend_from_slice(p));
         assert_eq!(got, b"\x1bP0$r\x1b\\");
+    }
+
+    /// F1a：尺寸硬拒——超大/0 值在**发起分配之前**被拒（绝不让 alacritty 分配 96 GiB）。
+    /// 本测试只用受控尺寸，不构造真实巨型分配。
+    #[test]
+    fn vt_size_gate_rejects_oversize_and_zero() {
+        for (c, r) in [(0u16, 24u16), (80, 0), (0, 0), (1001, 24), (80, 501), (u16::MAX, u16::MAX)] {
+            let err = SessionVt::new(c, r, 100).err().unwrap_or_else(|| panic!("{c}x{r} 应被拒"));
+            assert!(err.contains("尺寸非法"), "{c}x{r}: 错误文案：{err}");
+        }
+        // 边界合法值原样接受（上限内不夹取）
+        let mut vt = SessionVt::new(1000, 500, 100).expect("上限值合法");
+        assert_eq!(vt.size(), (1000, 500));
+        // resize 同门：被拒后尺寸不变（不发起分配）
+        assert!(vt.resize(u16::MAX, 8).is_err());
+        assert!(vt.resize(0, 0).is_err());
+        assert_eq!(vt.size(), (1000, 500), "被拒的 resize 不得改尺寸");
+        assert!(vt.resize(999, 499).is_ok());
+        assert_eq!(vt.size(), (999, 499));
+    }
+
+    /// F2 回归（证据 B 转正）：1Hz 采样（screen_text）插在 update 与 dirty_rows 之间，
+    /// 不得吞掉差分——修复前 `rows()` 无条件提交指纹 ⇒ 该行被静默剔除、永久不再下发。
+    #[test]
+    fn vt_screen_text_does_not_consume_fingerprint() {
+        let mut vt = SessionVt::new(20, 5, 100).unwrap();
+        vt.write(b"hello");
+        let _ = vt.update();
+        let first = vt.dirty_rows();
+        assert!(!first.is_empty(), "首拍有真脏行");
+        vt.clean();
+        vt.write(b"X");
+        let _ = vt.update();
+        // 采样面（1Hz）插在中间：修复前这里提交指纹
+        let text = vt.screen_text();
+        assert!(text.contains("helloX"), "采样文本：{text:?}");
+        let rows = vt.dirty_rows();
+        assert_eq!(rows.len(), 1, "采样不得吞掉差分（F2）");
+        let got: String = rows[0].cells.iter().map(|c| c.symbol.as_str()).collect();
+        assert!(got.contains('X'), "补发的行须含新字节：{got:?}");
+    }
+
+    /// F2②：快照路径提交全屏指纹后，单行改动只差分一行（不重复带已发过的行）。
+    #[test]
+    fn vt_snapshot_commit_then_diff_no_repeat() {
+        let mut vt = SessionVt::new(20, 5, 100).unwrap();
+        vt.write(b"abc");
+        let snap = vt.rows_and_commit();
+        assert_eq!(snap.len(), 5, "快照 = 全视口行");
+        vt.clean();
+        vt.write(b"Z");
+        let _ = vt.update();
+        assert_eq!(vt.dirty_rows().len(), 1, "快照后增量只带改动行");
+    }
+
+    /// F9：force_full 短路 = 全视口行（单次 damage() 形态下的既有语义回归）。
+    #[test]
+    fn vt_force_full_dirty_rows_all() {
+        let mut vt = SessionVt::new(20, 5, 100).unwrap();
+        vt.write(b"x");
+        let _ = vt.dirty_rows();
+        vt.clean();
+        vt.force_full = true; // B1 拦截位（同 ED2 路径置位）
+        let rows = vt.dirty_rows();
+        assert_eq!(rows.len(), 5, "force_full ⇒ 全视口行");
+        assert!(vt.force_full, "clean 前 force_full 仍置位");
+        vt.clean();
+        assert!(!vt.force_full);
+    }
+
+    /// F5①：200×U+0301 的病态字素簇按 UTF-8 边界截到 ≤127 B。
+    #[test]
+    fn vt_symbol_cluster_truncated_at_boundary() {
+        let mut vt = SessionVt::new(20, 5, 100).unwrap();
+        let mut seq = String::from("a");
+        for _ in 0..200 {
+            seq.push('\u{301}'); // 每个 2 B ⇒ 总长 401 B
+        }
+        vt.write(seq.as_bytes());
+        let rows = vt.rows();
+        let sym = &rows[0].cells[0].symbol;
+        assert!(sym.starts_with('a'), "字素簇首字符保留：{sym:?}");
+        assert!(sym.len() <= 127, "symbol 须 ≤127 B（实得 {}）", sym.len());
+        assert!(sym.len() > 1, "不应整簇丢弃");
+        assert!(sym.is_char_boundary(sym.len()), "截断须落在 UTF-8 边界");
+        // 末字符是完整码点（U+0301 = CC 81 两字节）
+        assert!(sym.ends_with('\u{301}'), "边界截断保留完整码点");
+    }
+
+    /// F8①：备用屏 plain_text 取活动屏（ghostty formatter 语义）；退出备用屏恢复主屏。
+    #[test]
+    fn vt_plain_text_alternate_screen() {
+        let mut vt = SessionVt::new(20, 5, 100).unwrap();
+        vt.write(b"primary-text");
+        assert!(vt.plain_text().contains("primary-text"));
+        vt.write(b"\x1b[?1049h");
+        vt.write(b"ALT-ANCHOR");
+        let t = vt.plain_text();
+        assert!(t.contains("ALT-ANCHOR"), "备用屏 plain_text 非空（修复前恒空串）：{t:?}");
+        assert!(!t.contains("primary-text"), "备用屏只格式化活动屏：{t:?}");
+        vt.write(b"\x1b[?1049l");
+        let t = vt.plain_text();
+        assert!(t.contains("primary-text"), "退出备用屏恢复主屏口径：{t:?}");
+    }
+
+    /// F8②：滚入回滚的软折行段在 plain_text 里合并为单条逻辑行（wraps 位随行读）。
+    #[test]
+    fn vt_plain_text_rollback_wrap_merge() {
+        let mut vt = SessionVt::new(10, 3, 100).unwrap();
+        vt.write(b"AAAAAAAAAABBBBBBBBBBCCCCC"); // 25 字符 ⇒ 10/10/5 三物理行、两处折行
+        vt.write(b"\r\n\r\n\r\n"); // 把三段推入回滚
+        assert!(vt.scrollbar().offset >= 3, "回滚至少 3 行（实得 {}）", vt.scrollbar().offset);
+        let text = vt.plain_text();
+        assert!(
+            text.lines().any(|l| l.trim_end() == "AAAAAAAAAABBBBBBBBBBCCCCC"),
+            "折行段合并为单条逻辑行（修复前回滚行 wraps 恒 false ⇒ 断行）：{text:?}"
+        );
+    }
+
+    /// A1（代码门）：`plain_text` 的流式实现与「rows_at + 合并」参考实现逐字节等价
+    /// （主屏含回滚/折行/空行、备用屏、F5 截断簇三个形态）。
+    #[test]
+    fn vt_plain_text_streaming_matches_reference() {
+        fn reference(rows: &[Row]) -> String {
+            let mut logical: Vec<String> = Vec::new();
+            let mut acc = String::new();
+            for r in rows {
+                for c in &r.cells {
+                    if c.skip {
+                        continue;
+                    }
+                    if c.symbol.is_empty() {
+                        acc.push(' ');
+                    } else {
+                        acc.push_str(&c.symbol);
+                    }
+                }
+                if r.wraps {
+                    continue;
+                }
+                logical.push(std::mem::take(&mut acc).trim_end_matches([' ', '\t', '\u{a0}']).to_string());
+            }
+            if !acc.is_empty() {
+                logical.push(acc.trim_end_matches([' ', '\t', '\u{a0}']).to_string());
+            }
+            logical.join("\n")
+        }
+        // 主屏：折行 + 空行 + 回滚
+        let mut vt = SessionVt::new(10, 3, 100).unwrap();
+        vt.write(b"AAAAAAAAAABBBBBBBBBBCCCCC\r\n\r\nx\r\ny");
+        let total = vt.term.total_lines() as u64;
+        let want = reference(&vt.rows_at(0, total as usize));
+        assert_eq!(vt.plain_text(), want, "主屏流式 == 参考");
+        // 备用屏（活动屏口径）
+        vt.write(b"\x1b[?1049h");
+        vt.write(b"ALT1\r\nALT2");
+        let want = reference(&vt.rows());
+        assert_eq!(vt.plain_text(), want, "备用屏流式 == 参考");
+        // F5 截断簇
+        let mut vt = SessionVt::new(20, 3, 100).unwrap();
+        let mut seq = String::from("a");
+        for _ in 0..200 {
+            seq.push('\u{301}');
+        }
+        vt.write(seq.as_bytes());
+        let total = vt.term.total_lines() as u64;
+        let want = reference(&vt.rows_at(0, total as usize));
+        assert_eq!(vt.plain_text(), want, "截断簇流式 == 参考");
     }
 
     /// 光标/回滚条/模式位列对拍（快照语义的另一半）。

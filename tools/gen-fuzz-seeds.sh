@@ -16,6 +16,8 @@
 #   - fuzz_probe 吃真探测响应（HWR 头 + nonce + build + flags + 端点列表段）。
 # 手工合成样本（设计 §2.3；第二道门 低-21 整改）：UPnP 713 body / M-SEARCH /
 # DNS 查询应答 / 内层 IPv4 头——三个原零种子目标补齐。
+# term 区（Q-D F11）：frames.v1.jsonl payloadHex / term-vt 真会话流 / surface-golden
+# 分片帧 / surface_codec.json 体向量——供 fuzz_term_{frames,vt,codec} 三目标。
 # 注意：files 的 70KB 跨 u16 样本会展开（>4096）——libFuzzer 需 `-max_len=262160`
 # 才吃得到（默认 4096 会拒收长种子）。
 set -euo pipefail
@@ -166,6 +168,62 @@ dns_resp = (b"\x12\x34\x81\x80\x00\x01\x00\x01\x00\x00\x00\x00"
 write("fuzz_dns", "resp-a", dns_resp)
 write("fuzz_dns", "tcp-framed", (len(dns_resp)).to_bytes(2, "big") + dns_resp)
 n += 3
+
+# ---------- term 面（Q-D F11；三个新目标） ----------
+# 帧向量：frames.v1.jsonl 的 payloadHex（完整帧字节 = op 前缀 + 载荷）
+frames_jsonl = os.path.join(root, "fixtures/term/frames.v1.jsonl")
+if os.path.exists(frames_jsonl):
+    with open(frames_jsonl) as f:
+        for i, line in enumerate(f):
+            line = line.strip()
+            if not line:
+                continue
+            c = json.loads(line)
+            ph = c.get("payloadHex") or ""
+            if not ph:
+                continue
+            payload = unhex(ph)
+            op = int(c.get("op", "0x00"), 16)
+            write("fuzz_term_frames", f"vec{i}", bytes([op]) + len(payload).to_bytes(2, "little") + payload)
+            write("fuzz_term_frames", f"vec{i}-payload", payload)
+            n += 2
+
+# 真会话字节流（vt 目标 + 帧目标共用底座）
+for i, name in enumerate(["session-cjk.bin", "session-git-log.bin", "session-hexdump.bin"]):
+    p2 = os.path.join(root, "fixtures/term-vt", name)
+    if os.path.exists(p2):
+        b = open(p2, "rb").read()
+        write("fuzz_term_vt", f"session{i}", b)
+        write("fuzz_term_frames", f"session{i}", b)
+        n += 2
+
+# golden 分片帧（surface 体：攒片 → gunzip → 体解码；整文件 = 真分片序列）
+for name in ["session-cjk.bin", "session-git-log.bin", "session-styles.bin"]:
+    p2 = os.path.join(root, "fixtures/surface-golden", name)
+    if os.path.exists(p2):
+        write("fuzz_term_codec", name.replace(".bin", ""), open(p2, "rb").read())
+        n += 1
+
+# surface 体向量（快照/差分/分片正例字节）
+sc = os.path.join(vec, "surface_codec.json")
+if os.path.exists(sc):
+    v = json.load(open(sc))
+    for i, c in enumerate(v.get("snapshot", [])):
+        b = unhex(c.get("body_hex", ""))
+        if b:
+            write("fuzz_term_codec", f"snap{i}", b)
+            n += 1
+    for i, c in enumerate(v.get("diff", [])):
+        b = unhex(c.get("body_hex", ""))
+        if b:
+            write("fuzz_term_codec", f"diff{i}", b)
+            n += 1
+    for i, c in enumerate(v.get("fragment", [])):
+        for j, f in enumerate(c.get("frags", [])):
+            b = unhex(f.get("hex", ""))
+            if b:
+                write("fuzz_term_codec", f"frag{i}-{j}", bytes([int(f.get("flags", 0))]) + b)
+                n += 1
 
 # fuzz_inner_pkt（IPv4+UDP / IPv4+TCP SYN 最小骨架）
 def v4_pkt(proto: int, body: bytes) -> bytes:

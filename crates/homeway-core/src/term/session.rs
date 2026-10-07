@@ -12,8 +12,10 @@
 //! 墙钟只做淘汰的次级比较（Go 同款：NTP 步进会翻转排序，故不用墙钟做主序）。
 
 use std::collections::HashMap;
+use std::time::Duration;
 
 use super::frames::{ended_code, ended_reason, ENDED_REASON_SERVICE_STOPPED};
+use super::size::Size;
 
 /// 会话数上限默认值（`HOMEWAY_TERM_MAX_SESSIONS`）。
 pub const DEFAULT_MAX_SESSIONS: usize = 16;
@@ -106,14 +108,14 @@ impl LegKind {
 pub struct LegKey(pub u64);
 
 /// 接入一刻的腿描述（HELLO/尾随块解析出的字段）。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegDescriptor {
     /// 实例标识（HELLO 尾随 ID 块；空 = 旧客户端）。
     pub client_id: String,
     pub surface: bool,
     pub raw_capable: bool,
-    pub cols: u16,
-    pub rows: u16,
+    /// 本腿声明的网格尺寸（已归一——类型保证非 0 且在限内）。
+    pub size: Size,
 }
 
 /// 一条腿的注册态（排序与淘汰所需的全部字段）。
@@ -122,14 +124,11 @@ struct LegState {
     key: LegKey,
     client_id: String,
     kind: LegKind,
-    cols: u16,
-    rows: u16,
+    size: Size,
     attach_seq: u64,
     last_activity_seq: u64,
     since_ms: u64,
     last_touch_ms: u64,
-    /// 写停滞时长（毫秒；0 = 未停滞）——调用方按写者状态刷新，淘汰的优先依据。
-    stalled_ms: u64,
     removed: bool,
 }
 
@@ -153,7 +152,7 @@ pub struct RegisterOutcome {
     /// 被替换/接管/腾位断掉的腿（按触发序）。
     pub ended: Vec<LegEnd>,
     /// 接入即活动 ⇒ 会话尺寸对齐本腿（Some = 尺寸真变，调用方做 PTY setsize + 哨兵）。
-    pub size_applied: Option<(u16, u16)>,
+    pub size_applied: Option<Size>,
     /// 判据行（腿接入日志，调用方直接打）。
     pub log: String,
 }
@@ -162,9 +161,8 @@ pub struct RegisterOutcome {
 #[derive(Debug, Clone)]
 pub struct Session {
     pub name: String,
-    /// 会话当前尺寸（活动选举改写；0x0 = 未接入过——createOnly 形态）。
-    pub cols: u16,
-    pub rows: u16,
+    /// 会话当前尺寸（活动选举改写；类型保证已归一——0×0 不可表达）。
+    pub size: Size,
     pub done: bool,
     pub killed: bool,
     /// 子进程退出码（自然退出路径喂入；killed 时 ENDED 用 -2 覆盖）。
@@ -194,8 +192,7 @@ pub struct LegView {
     pub key: LegKey,
     pub client_id: String,
     pub kind: LegKind,
-    pub cols: u16,
-    pub rows: u16,
+    pub size: Size,
     pub since_ms: u64,
     pub attach_seq: u64,
 }
@@ -206,8 +203,7 @@ impl LegView {
             key: l.key,
             client_id: l.client_id.clone(),
             kind: l.kind,
-            cols: l.cols,
-            rows: l.rows,
+            size: l.size,
             since_ms: l.since_ms,
             attach_seq: l.attach_seq,
         }
@@ -240,8 +236,7 @@ impl SessionRegistry {
     pub fn attach_or_create(
         &mut self,
         name: &str,
-        cols: u16,
-        rows: u16,
+        size: Size,
         create: bool,
         only_if_absent: bool,
     ) -> Result<(), TermError> {
@@ -259,8 +254,7 @@ impl SessionRegistry {
                 name.to_string(),
                 Session {
                     name: name.to_string(),
-                    cols,
-                    rows,
+                    size,
                     done: false,
                     killed: false,
                     exit_code: 0,
@@ -281,9 +275,9 @@ impl SessionRegistry {
         Ok(())
     }
 
-    /// CREATE 不接入（service.go `createOnly`，`new -d`）：不动尺寸（默认 0x0 =
-    /// 「未接入过」）、不产生腿、不触发哨兵/焦点。reuse_if_exists 置位 = 存在则静默
-    /// 复用（极性与 HELLO bit1 相反）。
+    /// CREATE 不接入（service.go `createOnly`，`new -d`）：不动尺寸、不产生腿、不触发
+    /// 哨兵/焦点。尺寸取缺省 80×24（Go `spawnLocked` 的 0 → 80/24 归一；会话几何类型上
+    /// 不可为空）。reuse_if_exists 置位 = 存在则静默复用（极性与 HELLO bit1 相反）。
     pub fn create_only(&mut self, name: &str, reuse_if_exists: bool) -> Result<(), TermError> {
         if self.sessions.contains_key(name) {
             if reuse_if_exists {
@@ -304,8 +298,7 @@ impl SessionRegistry {
             name.to_string(),
             Session {
                 name: name.to_string(),
-                cols: 0,
-                rows: 0,
+                size: Size::DEFAULT,
                 done: false,
                 killed: false,
                 exit_code: 0,
@@ -332,12 +325,17 @@ impl SessionRegistry {
 
     /// 注册腿（`registerLegLocked` 全序）。会话已结束 ⇒ no_session；上限满且腾不出位 ⇒
     /// too_many_clients。成功 ⇒ 入表 + 接入即活动（尺寸对齐本腿）。
+    ///
+    /// `stalled` = 调用方在**同一把服务锁内**从各腿 [`super::legout::LegOut`] 取的实时停滞
+    /// 快照（只含停滞腿；本表是淘汰排序的唯一真源——`term_leg.go:927-948` 读实时
+    /// `out.isStalled()/stalledFor()` 同义）。注册表保持纯状态机：不做反向回调。
     pub fn register_leg(
         &mut self,
         name: &str,
         desc: LegDescriptor,
         takeover: bool,
         now_ms: u64,
+        stalled: &[(LegKey, Duration)],
     ) -> Result<RegisterOutcome, TermError> {
         let max_clients = self.max_clients;
         let next_key = LegKey(self.next_leg_key);
@@ -380,7 +378,7 @@ impl SessionRegistry {
         }
         // ③ 上限腾位（停滞最久优先，其次最久空闲；裸断无 ENDED）
         if s.leg_count() >= max_clients {
-            if let Some(victim) = evict_victim(s) {
+            if let Some(victim) = evict_victim(s, stalled) {
                 if let Some(e) = end_leg_internal(s, victim, i32::MIN, String::new(), "evicted_cap") {
                     out.ended.push(e);
                 }
@@ -398,8 +396,7 @@ impl SessionRegistry {
             key: next_key,
             kind: LegKind::of(desc.surface, desc.raw_capable),
             client_id: desc.client_id.clone(),
-            cols: desc.cols,
-            rows: desc.rows,
+            size: desc.size,
             attach_seq: {
                 s.attach_seq += 1;
                 s.attach_seq
@@ -407,15 +404,13 @@ impl SessionRegistry {
             last_activity_seq: 0,
             since_ms: now_ms,
             last_touch_ms: now_ms,
-            stalled_ms: 0,
             removed: false,
         });
         out.size_applied = note_activity_internal(s, next_key, now_ms);
         out.log = format!(
-            "term: 会话 {name} 腿接入（kind={} {}x{} id={} 首腿={}）n={}/{}",
+            "term: 会话 {name} 腿接入（kind={} {} id={} 首腿={}）n={}/{}",
             LegKind::of(desc.surface, desc.raw_capable).as_str(),
-            desc.cols,
-            desc.rows,
+            desc.size,
             if desc.client_id.is_empty() { "-" } else { &desc.client_id },
             out.first,
             s.leg_count(),
@@ -450,26 +445,17 @@ impl SessionRegistry {
 
     /// 记一次活动（接入/上报尺寸/输入）。返回会话尺寸应用（Some = 真变，调用方
     /// setsize + 哨兵）。
-    pub fn note_activity(&mut self, name: &str, key: LegKey, now_ms: u64) -> Option<(u16, u16)> {
+    pub fn note_activity(&mut self, name: &str, key: LegKey, now_ms: u64) -> Option<Size> {
         let s = self.sessions.get_mut(name)?;
         note_activity_internal(s, key, now_ms)
     }
 
-    /// 刷新腿的写停滞时长（淘汰依据；0 = 未停滞）。
-    pub fn set_stalled(&mut self, name: &str, key: LegKey, stalled_ms: u64) {
-        if let Some(s) = self.sessions.get_mut(name) {
-            if let Some(l) = s.legs.iter_mut().find(|l| l.key == key) {
-                l.stalled_ms = stalled_ms;
-            }
-        }
-    }
-
-    /// 腿上报尺寸（RESIZE；活动选举决定是否真改会话尺寸）。
-    pub fn leg_resize(&mut self, name: &str, key: LegKey, cols: u16, rows: u16) -> Option<(u16, u16)> {
+    /// 腿上报尺寸（RESIZE；活动选举决定是否真改会话尺寸）。入参已归一（[`Size::from_report`]
+    /// 的 0 门在调用方）——会话几何只能由合法尺寸写入。
+    pub fn leg_resize(&mut self, name: &str, key: LegKey, size: Size) -> Option<Size> {
         let s = self.sessions.get_mut(name)?;
         let l = s.legs.iter_mut().find(|l| l.key == key)?;
-        l.cols = cols;
-        l.rows = rows;
+        l.size = size;
         None // 尺寸应用归 note_activity（活动选举）——本调用方随后必调 note_activity
     }
 
@@ -550,14 +536,14 @@ pub struct LegEndOutcome {
     /// 重选举接管的活动腿（活动腿被摘且有剩余腿时）。
     pub re_elected: Option<LegKey>,
     /// 新活动腿的尺寸应用（Some = 真变，调用方 setsize + 哨兵）。
-    pub size_applied: Option<(u16, u16)>,
+    pub size_applied: Option<Size>,
     /// 末腿离开的 focus-out 注入位（会话未结束时）。
     pub focus_out: bool,
 }
 
 /// 重选举（electActiveLocked）：activitySeq 最大者；平手按更晚接入（attachSeq）优先。
 /// 返回（新活动腿, 尺寸应用）。
-fn elect_active(s: &mut Session) -> (Option<LegKey>, Option<(u16, u16)>) {
+fn elect_active(s: &mut Session) -> (Option<LegKey>, Option<Size>) {
     let best = s
         .legs
         .iter()
@@ -568,10 +554,9 @@ fn elect_active(s: &mut Session) -> (Option<LegKey>, Option<(u16, u16)>) {
         return (None, None);
     };
     s.active = Some(b.key);
-    let size = if s.cols != b.cols || s.rows != b.rows {
-        s.cols = b.cols;
-        s.rows = b.rows;
-        Some((b.cols, b.rows))
+    let size = if s.size != b.size {
+        s.size = b.size;
+        Some(b.size)
     } else {
         None
     };
@@ -579,43 +564,45 @@ fn elect_active(s: &mut Session) -> (Option<LegKey>, Option<(u16, u16)>) {
 }
 
 /// 活动记账 + 选举（noteActivityLocked / electActiveLocked 的纯逻辑面）：
-/// activitySeq++、active 切换、会话尺寸对齐本腿（真变才返回）。
-fn note_activity_internal(s: &mut Session, key: LegKey, now_ms: u64) -> Option<(u16, u16)> {
+/// activitySeq++、active 切换、会话尺寸对齐本腿（真变才返回）。会话几何只能由
+/// 腿上的 [`Size`] 写入——`RESIZE 0×0` 在入径已被 [`Size::from_report`] 拦下
+/// （Go 的会话尺寸写点同样在 0 门之后，F1b）。
+fn note_activity_internal(s: &mut Session, key: LegKey, now_ms: u64) -> Option<Size> {
     s.activity_seq += 1;
     let seq = s.activity_seq;
     let l = s.legs.iter_mut().find(|l| l.key == key)?;
     l.last_activity_seq = seq;
     l.last_touch_ms = now_ms;
-    let (cols, rows) = (l.cols, l.rows);
+    let size = l.size;
     s.active = Some(key);
-    // 尺寸对齐（applySizeLocked 的真变判定；0x0 = 未接入过的 createOnly 会话首接入）
-    (s.cols != cols || s.rows != rows).then(|| {
-        s.cols = cols;
-        s.rows = rows;
-        (cols, rows)
+    // 尺寸对齐（applySizeLocked 的真变判定）
+    (s.size != size).then(|| {
+        s.size = size;
+        size
     })
 }
 
 /// 腾位受害者：停滞腿里停滞最久者，否则最久空闲腿（evictForSlotLocked）。
-fn evict_victim(s: &Session) -> Option<LegKey> {
+/// `stalled` = 调用方锁内取的实时停滞快照（只含停滞腿）——表里查不到 = 未停滞。
+fn evict_victim(s: &Session, stalled: &[(LegKey, Duration)]) -> Option<LegKey> {
     let alive: Vec<&LegState> = s.legs.iter().filter(|l| !l.removed).collect();
-    let mut victim: Option<&LegState> = None;
+    let mut victim: Option<(LegKey, Duration)> = None;
     for l in &alive {
-        if l.stalled_ms == 0 {
-            continue;
-        }
-        if victim.is_none() || l.stalled_ms > victim.unwrap().stalled_ms {
-            victim = Some(l);
+        let Some((_, d)) = stalled.iter().find(|(k, _)| *k == l.key) else { continue };
+        if victim.is_none() || *d > victim.unwrap().1 {
+            victim = Some((l.key, *d));
         }
     }
-    if victim.is_none() {
-        for l in &alive {
-            if victim.is_none() || l.last_touch_ms < victim.unwrap().last_touch_ms {
-                victim = Some(l);
-            }
+    if let Some((key, _)) = victim {
+        return Some(key);
+    }
+    let mut idle: Option<&LegState> = None;
+    for l in &alive {
+        if idle.is_none() || l.last_touch_ms < idle.unwrap().last_touch_ms {
+            idle = Some(l);
         }
     }
-    victim.map(|l| l.key)
+    idle.map(|l| l.key)
 }
 
 #[cfg(test)]
@@ -626,13 +613,16 @@ mod tests {
         SessionRegistry::new(0, 0) // 默认上限 16/8
     }
 
+    fn sz(cols: u16, rows: u16) -> Size {
+        Size::normalized(cols, rows)
+    }
+
     fn desc(id: &str, cols: u16, rows: u16) -> LegDescriptor {
         LegDescriptor {
             client_id: id.to_string(),
             surface: true,
             raw_capable: false,
-            cols,
-            rows,
+            size: sz(cols, rows),
         }
     }
 
@@ -642,20 +632,20 @@ mod tests {
         let mut r = reg();
         // 不存在 + !create
         assert_eq!(
-            r.attach_or_create("a", 80, 24, false, false).unwrap_err().code,
+            r.attach_or_create("a", sz(80, 24), false, false).unwrap_err().code,
             TermErrorCode::NoSession
         );
         // 不存在 + create
-        r.attach_or_create("a", 80, 24, true, false).unwrap();
-        assert_eq!(r.session("a").unwrap().cols, 80);
+        r.attach_or_create("a", sz(80, 24), true, false).unwrap();
+        assert_eq!(r.session("a").unwrap().size.cols(), 80);
         // 已存在 + create + only_if_absent
         assert_eq!(
-            r.attach_or_create("a", 100, 32, true, true).unwrap_err().code,
+            r.attach_or_create("a", sz(100, 32), true, true).unwrap_err().code,
             TermErrorCode::AlreadyExists
         );
         // 已存在 + 纯 attach（复用，尺寸不动——尺寸归选举）
-        r.attach_or_create("a", 100, 32, false, false).unwrap();
-        assert_eq!(r.session("a").unwrap().cols, 80);
+        r.attach_or_create("a", sz(100, 32), false, false).unwrap();
+        assert_eq!(r.session("a").unwrap().size.cols(), 80);
         // CREATE 不接入：极性与 HELLO bit1 相反
         r.create_only("b", false).unwrap();
         assert_eq!(r.session("b").unwrap().leg_count(), 0);
@@ -682,25 +672,25 @@ mod tests {
     #[test]
     fn register_leg_order_and_ended_vocab() {
         let mut r = reg();
-        r.attach_or_create("a", 80, 24, true, false).unwrap();
+        r.attach_or_create("a", sz(80, 24), true, false).unwrap();
         // 三条腿
-        let l1 = r.register_leg("a", desc("id1", 80, 24), false, 100).unwrap();
+        let l1 = r.register_leg("a", desc("id1", 80, 24), false, 100, &[]).unwrap();
         assert!(l1.first && l1.ended.is_empty());
-        let l2 = r.register_leg("a", desc("id2", 80, 24), false, 200).unwrap();
+        let l2 = r.register_leg("a", desc("id2", 80, 24), false, 200, &[]).unwrap();
         assert!(!l2.first && l2.ended.is_empty());
         // ① 同实例替换：id2 重连 ⇒ 旧 id2 腿 ENDED(-1, self_reconnect)
-        let l3 = r.register_leg("a", desc("id2", 80, 24), false, 300).unwrap();
+        let l3 = r.register_leg("a", desc("id2", 80, 24), false, 300, &[]).unwrap();
         assert_eq!(l3.ended.len(), 1);
         assert_eq!(l3.ended[0].key, l2.key);
         assert_eq!(l3.ended[0].ended, Some((ended_code::REPLACED, ended_reason::SELF_RECONNECT.into())));
         assert_eq!(r.session("a").unwrap().leg_count(), 2);
         // ② 接管：全部旧腿 ENDED(-1, replaced)
-        let l4 = r.register_leg("a", desc("id3", 100, 32), true, 400).unwrap();
+        let l4 = r.register_leg("a", desc("id3", 100, 32), true, 400, &[]).unwrap();
         assert_eq!(l4.ended.len(), 2, "接管踢掉全部旧腿");
         assert!(l4.ended.iter().all(|e| e.ended == Some((ended_code::REPLACED, ended_reason::REPLACED.into()))));
         assert_eq!(r.session("a").unwrap().leg_count(), 1);
         // 接入即活动 ⇒ 会话尺寸对齐本腿（100x32）
-        assert_eq!(l4.size_applied, Some((100, 32)));
+        assert_eq!(l4.size_applied, Some(sz(100, 32)));
         assert_eq!(r.session("a").unwrap().active, Some(l4.key));
         // 判据行形态
         assert!(l4.log.contains("kind=app 100x32 id=id3 首腿=true）n=1/8"), "判据行（接管踢空后即首腿）：{}", l4.log);
@@ -710,24 +700,24 @@ mod tests {
     #[test]
     fn evict_prefers_stalled_then_idle() {
         let mut r = SessionRegistry::new(16, 3);
-        r.attach_or_create("a", 80, 24, true, false).unwrap();
-        let l1 = r.register_leg("a", desc("id1", 80, 24), false, 100).unwrap().key;
-        let l2 = r.register_leg("a", desc("id2", 80, 24), false, 200).unwrap().key;
-        let _l3 = r.register_leg("a", desc("id3", 80, 24), false, 300).unwrap().key;
-        // l2 停滞 5s（其余未停滞）
-        r.set_stalled("a", l2, 5000);
-        let l4 = r.register_leg("a", desc("id4", 80, 24), false, 400).unwrap();
+        r.attach_or_create("a", sz(80, 24), true, false).unwrap();
+        let l1 = r.register_leg("a", desc("id1", 80, 24), false, 100, &[]).unwrap().key;
+        let l2 = r.register_leg("a", desc("id2", 80, 24), false, 200, &[]).unwrap().key;
+        let _l3 = r.register_leg("a", desc("id3", 80, 24), false, 300, &[]).unwrap().key;
+        // l2 停滞 5s（其余未停滞）——实时停滞快照随 register_leg 传入（F4：淘汰唯一真源）
+        let stalled = [(l2, Duration::from_millis(5000))];
+        let l4 = r.register_leg("a", desc("id4", 80, 24), false, 400, &stalled).unwrap();
         assert_eq!(l4.ended.len(), 1);
         assert_eq!(l4.ended[0].key, l2, "停滞腿优先");
         assert!(l4.ended[0].ended.is_none(), "腾位是裸断（无 ENDED——词表没有「被挤出」）");
         assert_eq!(l4.ended[0].why, "evicted_cap");
         // 无停滞 ⇒ 最久空闲（last_touch 最早）
         r.note_activity("a", l1, 900); // l1 刚活动过 ⇒ l3（touch=300）成最旧
-        let l5 = r.register_leg("a", desc("id5", 80, 24), false, 1000).unwrap();
+        let l5 = r.register_leg("a", desc("id5", 80, 24), false, 1000, &[]).unwrap();
         assert_eq!(l5.ended[0].key, LegKey(3), "无停滞时淘汰最久空闲腿（l3 touch=300 最早）");
         // 腾位总能找到受害者（idle-most 兜底）⇒ 再接一条仍然成功（l4 touch=400 成最旧）；
         // too_many_clients 是防御性死支（victim 只在无腿时为 nil，无腿时上限判定本就不过）
-        let l6 = r.register_leg("a", desc("id6", 80, 24), false, 1100).unwrap();
+        let l6 = r.register_leg("a", desc("id6", 80, 24), false, 1100, &[]).unwrap();
         assert_eq!(l6.ended[0].key, LegKey(4), "连续腾位：次旧者出局");
         assert_eq!(r.session("a").unwrap().leg_count(), 3);
         let _ = l1;
@@ -737,9 +727,9 @@ mod tests {
     #[test]
     fn activity_election_tiebreak() {
         let mut r = reg();
-        r.attach_or_create("a", 80, 24, true, false).unwrap();
-        let l1 = r.register_leg("a", desc("id1", 80, 24), false, 100).unwrap().key;
-        let l2 = r.register_leg("a", desc("id2", 80, 24), false, 200).unwrap().key;
+        r.attach_or_create("a", sz(80, 24), true, false).unwrap();
+        let l1 = r.register_leg("a", desc("id1", 80, 24), false, 100, &[]).unwrap().key;
+        let l2 = r.register_leg("a", desc("id2", 80, 24), false, 200, &[]).unwrap().key;
         // l2 后接入 ⇒ attach_seq 更大；同活动序（都不活动）下 l2 胜
         assert_eq!(r.session("a").unwrap().active, Some(l2), "接入即活动：后接入者胜");
         // l1 活动一次 ⇒ 序号反超
@@ -761,27 +751,27 @@ mod tests {
     #[test]
     fn re_election_applies_new_active_size() {
         let mut r = reg();
-        r.attach_or_create("a", 80, 24, true, false).unwrap();
-        let l1 = r.register_leg("a", desc("id1", 80, 24), false, 100).unwrap().key;
-        let _l2 = r.register_leg("a", desc("id2", 100, 32), false, 200).unwrap().key;
-        assert_eq!(r.session("a").unwrap().cols, 100, "后接入的活动腿把会话带到 100x32");
+        r.attach_or_create("a", sz(80, 24), true, false).unwrap();
+        let l1 = r.register_leg("a", desc("id1", 80, 24), false, 100, &[]).unwrap().key;
+        let _l2 = r.register_leg("a", desc("id2", 100, 32), false, 200, &[]).unwrap().key;
+        assert_eq!(r.session("a").unwrap().size.cols(), 100, "后接入的活动腿把会话带到 100x32");
         // l1 上报新尺寸并活动 ⇒ 反超选举 + 尺寸对齐
-        r.leg_resize("a", l1, 120, 40);
+        r.leg_resize("a", l1, sz(120, 40));
         r.note_activity("a", l1, 300);
         assert_eq!(r.session("a").unwrap().active, Some(l1));
-        assert_eq!((r.session("a").unwrap().cols, r.session("a").unwrap().rows), (120, 40));
+        assert_eq!((r.session("a").unwrap().size.cols(), r.session("a").unwrap().size.rows()), (120, 40));
         // 摘 l1 ⇒ 重选举 _l2（100x32）⇒ 尺寸跟随
         let out = r.end_leg("a", l1, i32::MIN, "", "client_closed", 400).unwrap();
-        assert_eq!(out.size_applied, Some((100, 32)));
+        assert_eq!(out.size_applied, Some(sz(100, 32)));
     }
 
     /// finish 幂等 + 三种收尾原因的 ENDED 词表。
     #[test]
     fn finish_ended_vocab() {
         let mut r = reg();
-        r.attach_or_create("a", 80, 24, true, false).unwrap();
-        let l1 = r.register_leg("a", desc("id1", 80, 24), false, 100).unwrap().key;
-        let l2 = r.register_leg("a", desc("id2", 80, 24), false, 100).unwrap().key;
+        r.attach_or_create("a", sz(80, 24), true, false).unwrap();
+        let l1 = r.register_leg("a", desc("id1", 80, 24), false, 100, &[]).unwrap().key;
+        let l2 = r.register_leg("a", desc("id2", 80, 24), false, 100, &[]).unwrap().key;
         // 服务关停：全腿 ENDED(-3, service_stopped)
         let ends = r.finish("a", FinishReason::ServiceStopped);
         assert_eq!(ends.len(), 2);
@@ -790,16 +780,16 @@ mod tests {
         // 幂等
         assert!(r.finish("a", FinishReason::ServiceStopped).is_empty());
         // kill 面：killed 标记 → finish 用 -2；已结束 ⇒ no_session
-        r.attach_or_create("b", 80, 24, true, false).unwrap();
-        r.register_leg("b", desc("id1", 80, 24), false, 100).unwrap();
+        r.attach_or_create("b", sz(80, 24), true, false).unwrap();
+        r.register_leg("b", desc("id1", 80, 24), false, 100, &[]).unwrap();
         r.kill_mark("b").unwrap();
         let ends = r.finish("b", FinishReason::Killed);
         assert_eq!(ends.len(), 1);
         assert_eq!(ends[0].ended, Some((ended_code::KILLED, String::new())));
         assert_eq!(r.kill_mark("b").unwrap_err().code, TermErrorCode::NoSession);
         // 自然退出：退出码 ≥0 + 空 reason
-        r.attach_or_create("c", 80, 24, true, false).unwrap();
-        r.register_leg("c", desc("id1", 80, 24), false, 100).unwrap();
+        r.attach_or_create("c", sz(80, 24), true, false).unwrap();
+        r.register_leg("c", desc("id1", 80, 24), false, 100, &[]).unwrap();
         r.set_exit_code("c", 42);
         let ends = r.finish("c", FinishReason::Exit(42));
         assert_eq!(ends[0].ended, Some((42, String::new())));

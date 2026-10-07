@@ -506,11 +506,206 @@ fn fuzz_fixture_expectations() {
     );
 }
 
+// ---------- ⑫ term 帧协议（fuzz_term_frames；cargo-fuzz 同名目标） ----------
+
+/// term 种子池（夹具字节：真会话流 + golden 分片帧 + 帧骨架）。
+fn term_seeds() -> Vec<Vec<u8>> {
+    use homeway_core::term::frames;
+    let base = format!("{}/../../fixtures", env!("CARGO_MANIFEST_DIR"));
+    let mut v: Vec<Vec<u8>> = Vec::new();
+    for name in ["session-cjk.bin", "session-git-log.bin", "session-hexdump.bin"] {
+        if let Ok(b) = std::fs::read(format!("{base}/term-vt/{name}")) {
+            v.push(b);
+        }
+    }
+    for name in ["session-cjk.bin", "session-styles.bin"] {
+        if let Ok(b) = std::fs::read(format!("{base}/surface-golden/{name}")) {
+            v.push(b);
+        }
+    }
+    // 帧骨架（真形：HELLO 尾随块 / ATTACHED / STATE / ENDED / RESIZE / INPUT）
+    let tail = frames::enc_hello_tail(frames::caps::SURFACE | frames::caps::RAW_TERMINAL, true, "fuzz-1");
+    v.push(frames::encode_frame(frames::Op::HELLO, &frames::enc_hello(80, 24, 3, "s", &tail)));
+    v.push(frames::encode_frame(frames::Op::ATTACHED, &frames::enc_attached(100, 32, 0x41, 1, 2, "s")));
+    v.push(frames::encode_frame(frames::Op::STATE, &frames::enc_state(1, 2, "标题")));
+    v.push(frames::encode_frame(frames::Op::ENDED, &frames::enc_ended(-1, "replaced")));
+    v.push(frames::encode_frame(frames::Op::RESIZE, &frames::enc_resize(120, 40)));
+    v.push(frames::encode_frame(
+        frames::Op::INPUT,
+        &frames::enc_input(&frames::InputEvent::Key { key: 65, mods: 1, action: 1, text: String::new() }),
+    ));
+    v.push(frames::encode_frame(frames::Op::ERROR, &frames::enc_error("bad_hello", "x")));
+    v
+}
+
+/// ⑫ term 帧协议解码族（fuzz_term_frames）：不 panic（帧头/长度域/尾随块全分支）。
+#[test]
+#[ignore = "fuzz 全量档"]
+fn fuzz_term_frames() {
+    use homeway_core::term::frames;
+    let mut rng = Rng(seed() ^ 0x0c0c);
+    let sd = term_seeds();
+    for _ in 0..ITER {
+        let b = gen_input(&mut rng, &sd);
+        let _ = frames::read_frame(&mut &b[..]);
+        let _ = frames::dec_greeting(&b);
+        let _ = frames::dec_hello(&b);
+        let _ = frames::dec_hello_tail(&b);
+        let _ = frames::dec_create(&b);
+        let _ = frames::dec_resize(&b);
+        let _ = frames::dec_attached(&b);
+        let _ = frames::dec_replay_done(&b);
+        let _ = frames::dec_ended(&b);
+        let _ = frames::dec_state(&b);
+        let _ = frames::dec_error(&b);
+        let _ = frames::dec_name(&b);
+        let _ = frames::dec_input(&b);
+    }
+}
+
+// ---------- ⑬ term vt 底座 + 键/鼠标编码（fuzz_term_vt） ----------
+
+/// ⑬ vt 仿真底座（fuzz_term_vt）：不 panic + **F5 运行时哨兵**（每格 symbol ≤127 B）。
+#[test]
+#[ignore = "fuzz 全量档"]
+fn fuzz_term_vt() {
+    use homeway_core::term::keyenc;
+    use homeway_core::term::vt::SessionVt;
+    let mut rng = Rng(seed() ^ 0x0d0d);
+    let sd = term_seeds();
+    for _ in 0..ITER {
+        let b = gen_input(&mut rng, &sd);
+        let Ok(mut vt) = SessionVt::new(20, 5, 100) else { continue };
+        vt.write_collecting(&b, &mut |_r| {});
+        let _ = vt.take_clip_events();
+        let _ = vt.update();
+        for row in vt.dirty_rows() {
+            for c in &row.cells {
+                assert!(c.symbol.len() <= 127, "cell symbol 超上限（F5 哨兵）：{} B", c.symbol.len());
+            }
+        }
+        vt.clean();
+        let _ = vt.rows();
+        let _ = vt.screen_text();
+        let _ = vt.plain_text();
+        let _ = vt.cursor();
+        let _ = vt.modes();
+        let _ = vt.scrollbar();
+        let _ = vt.rows_at(0, 64);
+        let _ = vt.mirror_rows(32);
+        let g = |i: usize| b.get(i).copied().unwrap_or(0);
+        let _ = vt.encode_key(&keyenc::KeyEvent {
+            key: keyenc::Key(u16::from_le_bytes([g(0), g(1)])),
+            action: keyenc::KeyAction::from_wire(g(2) % 3).unwrap_or_default(),
+            mods: keyenc::Mods(u16::from_le_bytes([g(3), g(4)])),
+            text: "",
+            composing: g(5) & 1 != 0,
+        });
+        let _ = vt.encode_mouse(&keyenc::MouseEvent {
+            action: keyenc::MouseAction::from_wire(g(6) % 3).unwrap_or_default(),
+            button: keyenc::MouseButton(g(7)),
+            mods: keyenc::Mods(u16::from_le_bytes([g(8), g(9)])),
+            x: u16::from_le_bytes([g(10), g(11)]),
+            y: u16::from_le_bytes([g(12), g(13)]),
+        });
+    }
+}
+
+// ---------- ⑭ term surface 体编解码（fuzz_term_codec） ----------
+
+/// ⑭ surface v4 体（fuzz_term_codec）：不 panic + decode→再 encode 字节相等
+/// （harness 预检 ≠ 库守卫；库守卫 = F10 的 `guard_dims`/`MAX_GUNZIP_OUT`，由单测钉住）。
+#[test]
+#[ignore = "fuzz 全量档"]
+fn fuzz_term_codec() {
+    use homeway_core::term::codec;
+    use homeway_core::term::vt;
+    const DIM_CAP: u64 = 200_000;
+    let mut rng = Rng(seed() ^ 0x0e0e);
+    let sd = term_seeds();
+    for _ in 0..ITER {
+        let b = gen_input(&mut rng, &sd);
+        // 自产网格往返（字节相等；decode 派生 width/wraps ⇒ 结构体相等会假红）
+        let cols = 1 + (b.first().copied().unwrap_or(0) as usize % 40);
+        let rows = 1 + (b.get(1).copied().unwrap_or(0) as usize % 8);
+        let mut chunks = b.chunks(4);
+        let synth: Vec<vt::Row> = (0..rows)
+            .map(|y| vt::Row {
+                y: y as u16,
+                dirty: false,
+                wraps: false,
+                cells: (0..cols)
+                    .map(|x| {
+                        let sym: String = chunks
+                            .next()
+                            .unwrap_or(&[])
+                            .iter()
+                            .filter(|c| c.is_ascii_graphic())
+                            .map(|c| *c as char)
+                            .collect();
+                        vt::Cell {
+                            symbol: if sym.is_empty() { "x".to_string() } else { sym },
+                            width: 1,
+                            skip: (x + y) % 5 == 0,
+                            fg: vt::Color::Palette((x % 256) as u8),
+                            bg: vt::Color::None,
+                            attr: ((x * 7 + y * 13) & 0x0fff) as u16,
+                        }
+                    })
+                    .collect(),
+            })
+            .collect();
+        let grid = codec::encode_grid(cols as u16, rows as u16, &synth);
+        let (c, r, decoded) = codec::decode_grid(&grid).expect("自产网格必可解");
+        assert_eq!(codec::encode_grid(c, r, &decoded), grid, "往返字节相等");
+        let rows_enc = codec::encode_rows(&synth);
+        let dr = codec::decode_rows(&rows_enc, rows, cols).expect("自产行序列必可解");
+        assert_eq!(codec::encode_rows(&dr), rows_enc, "行序列往返字节相等");
+        // 原始输入解析面（按布局派生维度预检）
+        if b.len() >= 5 {
+            let gc = u16::from_le_bytes([b[1], b[2]]) as u64;
+            let gr = u16::from_le_bytes([b[3], b[4]]) as u64;
+            if gc.saturating_mul(gr) <= DIM_CAP {
+                let _ = codec::decode_grid(&b);
+            }
+        }
+        if b.len() >= 4 {
+            let rc = u16::from_le_bytes([b[0], b[1]]) as u64;
+            let rn = u16::from_le_bytes([b[2], b[3]]) as u64;
+            if rc.saturating_mul(rn) <= DIM_CAP {
+                let _ = codec::decode_rows(&b[4..], rn as usize, rc as usize);
+            }
+        }
+        if b.len() >= 9 {
+            let bc = u16::from_le_bytes([b[5], b[6]]) as u64;
+            let br = u16::from_le_bytes([b[7], b[8]]) as u64;
+            if bc.saturating_mul(br) <= DIM_CAP {
+                let _ = codec::dec_snapshot_body(&b);
+                let _ = codec::dec_diff_body(&b);
+            }
+        }
+        let _ = codec::gunzip_bytes(&b);
+        let _ = codec::dec_fetch_rows_req(&b);
+        let _ = codec::dec_fetch_rows_reply(&b);
+        let _ = codec::dec_fragment(&b);
+        let _ = codec::dec_theme(&b);
+        let _ = codec::dec_clipboard(&b);
+        let _ = codec::dec_notify(&b);
+        let mut asm = codec::FragAssembler::default();
+        for frag in b.chunks(64) {
+            let _ = asm.push(frag);
+        }
+        let _ = codec::fragment_payload(&b);
+    }
+}
+
 // ---------- ⑪ 迭代预算（quick 档可见——第二道门 低-15：≥100k 的量级在仓库内可断言） ----------
 
 #[test]
 fn fuzz_iteration_budget() {
-    // 九个重放目标的量级门（编译期断言——ITER 是常量；下调预算必须显式改这里）：
+    // 十二个重放目标的量级门（编译期断言——ITER 是常量；下调预算必须显式改这里）：
     // cargo test --ignored 跑的就是这个 ITER，R5 判据口径 ≥100k。
+    // Q-D 批新增 ⑫⑬⑭（term 帧/vt/codec）——codec 目标带自产网格往返，
+    // 全量档预计 +2-4 min（见 tools/ci-local.sh 注释）。
     const _: () = assert!(ITER >= 100_000, "fuzz 重放轨预算 < 100k（R5 判据口径）");
 }

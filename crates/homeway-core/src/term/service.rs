@@ -65,6 +65,7 @@ use super::session::LegKind;
 use super::session::LegView;
 use super::session::SessionRegistry;
 use super::session::TermError;
+use super::size::Size;
 use super::vt::ClipEvt;
 use super::vt::SessionVt;
 use super::wire::FrameIo;
@@ -89,12 +90,29 @@ const QUEUE_BYTES: usize = 8 << 20;
 /// 差分合并窗（design D2 的 16–33ms）。
 const MERGE_WINDOW_MIN: Duration = Duration::from_millis(16);
 const MERGE_WINDOW_MAX: Duration = Duration::from_millis(33);
-/// SNAPSHOT 附带的回滚镜像窗口（视口数的倍数）。
-const MIRROR_VIEWPORTS: usize = 10;
+/// 快照镜像窗口的**行数预算**（F1c；按 48 B/格保守折算成字节口径）：材质 `Vec<Row>`
+/// 在旧口径（`rows × MIRROR_VIEWPORTS` = 10 视口）下上限处最坏 5000 行 × 1000 列
+/// ≈ 120 MiB（24 B/格）且反复 RESIZE 可反复触发 ⇒ 改为按列反推行数。
+///
+/// 口径注记（Q-D 代码门 M2/A3）：① 48 B/格只对**常态内容**保守（空白/短 symbol）；
+/// 病态内容（F5 截断后单格 127 B 字素簇）材质可达 ~127 B/格 ⇒ 本预算在极端形态下
+/// 低估，兜底 = 发送侧 `pending_cap`（超限快照打回重试，不会 abort）。② 组帧峰值
+/// ≈3× 材质（`enc_snapshot_body` 的 grid/mirror `clone()` + gzip 临时缓冲，见
+/// `flush_surface` 的 `snapshot_mat`）。
+const MIRROR_BYTES_BUDGET: usize = 32 << 20;
 /// 单次 FETCH-ROWS 行数上限。
 const FETCH_ROWS_MAX: u16 = 512;
 /// 剪贴板读缓存上限（与 Go 的 clipMaxBytes 同值：载荷 u16 长度域的精确上限）。
 const CLIP_MAX_BYTES: usize = super::frames::MAX_PAYLOAD - 3;
+
+/// 快照镜像窗口行数预算（F1c）：`MIRROR_BYTES_BUDGET / (cols × 48)`，下限 64 行。
+/// 与视口的 `rows × MIRROR_VIEWPORTS` 取 min 在调用点（[`mirror_window_rows`]）。
+/// 下限 64 是**纯防御**：仅 `cols > ~10922` 才触发，生产被 `Size::MAX_COLS`（1000）
+/// 封住 ⇒ 恒不触发（留给直连调用点/未来放宽上限）。窄屏（80/100 列）结果与旧行为
+/// 一致；宽屏变小——客户端仍可经 FETCH-ROWS 按需拉更多（规格场景不变）。
+fn mirror_rows_budget(cols: usize) -> usize {
+    (MIRROR_BYTES_BUDGET / (cols.max(1) * 48)).max(64)
+}
 
 /// 会话名词法（Go `termNameRx` 同串面）。
 fn valid_name(name: &str) -> bool {
@@ -256,40 +274,167 @@ fn now_ms() -> u64 {
 }
 
 // ---------------------------------------------------------------------------
+// 线程 panic 兜底（F7）：角色 → 处置表 + 统一 catch
+// ---------------------------------------------------------------------------
+
+/// 生产线程角色（处置表按 enum 匹配；评审 5.2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ThreadRole {
+    /// 服务级 1s 采样（按会话 catch——单会话 panic 不停摆全线）。
+    Sample,
+    /// 每连接线程（GREETING/HELLO/读循环）。
+    Conn,
+    /// 每腿写者（raw/surface）。
+    LegWriter,
+    /// 每会话 PTY 泵。
+    Pump,
+    /// 每会话应答写者。
+    Resp,
+    /// 每会话 surface 投递。
+    Surface,
+}
+
+impl ThreadRole {
+    const fn as_str(self) -> &'static str {
+        match self {
+            ThreadRole::Sample => "term-sample",
+            ThreadRole::Conn => "term-conn",
+            ThreadRole::LegWriter => "term-leg-writer",
+            ThreadRole::Pump => "term-pump",
+            ThreadRole::Resp => "term-resp",
+            ThreadRole::Surface => "term-surface",
+        }
+    }
+}
+
+/// panic 后的处置（F7 处置表；纯函数——单测钉住）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PanicAction {
+    /// pump：走既有收尾（wait_bounded + finalize_exit）——无 reader 的会话必死，不留僵尸。
+    FinalizePump,
+    /// leg writer：裸断该腿（leg_write_failed），单腿失败不拖垮会话。
+    BreakLeg,
+    /// surface：全 surface 腿 finish_quit + 裸断（app 见断连可重连）。
+    DropSurface,
+    /// resp：线程退出（查询应答降级），会话主体不受影响。
+    DropResp,
+    /// conn：单连接隔离（drop conn）。
+    DropConn,
+    /// sample：跳过该会话本拍，下一拍继续。
+    SkipSession,
+}
+
+fn panic_action(role: ThreadRole) -> PanicAction {
+    match role {
+        ThreadRole::Pump => PanicAction::FinalizePump,
+        ThreadRole::LegWriter => PanicAction::BreakLeg,
+        ThreadRole::Surface => PanicAction::DropSurface,
+        ThreadRole::Resp => PanicAction::DropResp,
+        ThreadRole::Conn => PanicAction::DropConn,
+        ThreadRole::Sample => PanicAction::SkipSession,
+    }
+}
+
+/// panic 载荷 → 一行文本（String/&str 都吃；其余给占位）。
+fn panic_payload_text(p: &(dyn std::any::Any + Send)) -> String {
+    if let Some(s) = p.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = p.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        "非字符串载荷".to_string()
+    }
+}
+
+/// 线程体包装（参考 `facade/tun_exec.rs:1243-1258` 先例）：捕获 panic → 日志 →
+/// 返回处置（None = 正常退出）。**处理器自身不得 panic**（只做 downcast + 日志）。
+/// 前提已核：全链无 `panic = "abort"`（根 manifest / `.cargo/config.toml` / capi crate /
+/// tier `build-core.sh` 全无）。
+fn guard_thread(role: ThreadRole, ctx: &str, logf: &Logf, body: impl FnOnce()) -> Option<PanicAction> {
+    match std::panic::catch_unwind(std::panic::AssertUnwindSafe(body)) {
+        Ok(()) => None,
+        Err(p) => {
+            logf(&format!(
+                "term: {ctx}{} 线程 panic（已兜住）：{}",
+                role.as_str(),
+                panic_payload_text(&*p)
+            ));
+            Some(panic_action(role))
+        }
+    }
+}
+
+/// 测试注入点（`#[cfg(test)]`）：命中 `(role, 会话名)` 即 panic，**单次消费**；
+/// 会话名用既有 `tmp_name` 唯一化。生产构建 = 空函数。
+#[cfg(test)]
+mod panic_inject {
+    use super::ThreadRole;
+    use std::sync::Mutex;
+
+    static INJECT: Mutex<Vec<(ThreadRole, String)>> = Mutex::new(Vec::new());
+
+    pub(super) fn arm(role: ThreadRole, name: &str) {
+        INJECT.lock().unwrap_or_else(|e| e.into_inner()).push((role, name.to_string()));
+    }
+
+    pub(super) fn hit(role: ThreadRole, name: &str) {
+        let mut g = INJECT.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(i) = g.iter().position(|(r, n)| *r == role && n == name) {
+            g.remove(i);
+            drop(g);
+            panic!("测试注入 panic（{}）", role.as_str());
+        }
+    }
+}
+
+#[cfg(test)]
+fn maybe_inject_panic(role: ThreadRole, name: &str) {
+    panic_inject::hit(role, name);
+}
+
+#[cfg(not(test))]
+#[inline]
+fn maybe_inject_panic(_role: ThreadRole, _name: &str) {}
+
+// ---------------------------------------------------------------------------
 // PTY 共享面（reader 归 pump 线程独占；master/writer/child 在独立小锁内）
 // ---------------------------------------------------------------------------
 
+/// PTY 小锁的中毒恢复口径（F7③，与 `lock_state` 统一）：持锁线程 panic 后
+/// `PtySession` 的**可接受不一致面**（例：writer 半写后中断）不影响其余调用可用；
+/// 处置保守——上层把「写失败/尺寸应用失败」按既有失败路径处理（断腿/重试），
+/// 而不是让整个 term 面级联崩溃。
 struct PtyShared {
     inner: Mutex<PtySession>,
 }
 
 impl PtyShared {
     fn resize(&self, cols: u16, rows: u16) {
-        let _ = self.inner.lock().expect("pty").resize(cols, rows);
+        let _ = self.inner.lock().unwrap_or_else(|e| e.into_inner()).resize(cols, rows);
     }
 
     fn write_input(&self, p: &[u8]) -> bool {
-        self.inner.lock().expect("pty").write_input(p).is_ok()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).write_input(p).is_ok()
     }
 
     fn foreground_pgid(&self) -> i32 {
-        self.inner.lock().expect("pty").foreground_pgid()
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).foreground_pgid()
     }
 
     fn pid(&self) -> i32 {
-        self.inner.lock().expect("pty").pid
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).pid
     }
 
     fn kill_start(&self) {
-        self.inner.lock().expect("pty").kill_start();
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).kill_start();
     }
 
     fn kill_force(&self) {
-        self.inner.lock().expect("pty").kill_force();
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).kill_force();
     }
 
     fn wait_bounded(&self, grace: Duration) -> i32 {
-        self.inner.lock().expect("pty").wait_bounded(grace)
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).wait_bounded(grace)
     }
 }
 
@@ -438,6 +583,16 @@ struct OutBucket {
     n: i64,
 }
 
+/// 每会话 PTY 注入队列的条目（F3）：查询应答（FIX-25）与焦点 nudge 共用
+/// `resp_tx` 这一**每会话唯一 PTY 写者**——队列序 = 状态迁移序。
+enum PtyInject {
+    /// 查询应答字节（服务端代答；让位规则见 pump 的 suppress）。
+    Resp(Vec<u8>),
+    /// 焦点 nudge（`\x1b[I`/`\x1b[O`；写失败的行文与旧实现同串）。
+    /// `&'static [u8]` 而非 `Vec<u8>`——两个字节常量零堆分配（代码门 L3）。
+    Nudge(&'static [u8]),
+}
+
 /// 会话运行态。
 struct SessRt {
     name: String,
@@ -466,8 +621,13 @@ struct SessRt {
     last_notified: String,
     /// active 腿上报的剪贴板读缓存（OSC 52 读请求的应答源）。
     clip_cache: Option<String>,
-    resp_tx: SyncSender<Vec<u8>>,
+    resp_tx: SyncSender<PtyInject>,
+    /// 观测面（F6）：查询应答/剪贴板写/PTY 注入（nudge）的丢弃计数（队列满）。
     resp_dropped: Arc<AtomicU64>,
+    clip_dropped: Arc<AtomicU64>,
+    nudge_dropped: Arc<AtomicU64>,
+    /// `RESIZE 0×0` 忽略计数（F1a 的 0 值面观测；节流日志用）。
+    zero_resize_ignored: u64,
     /// surface 唤醒（pump/attach → 投递线程；u32 代数 + Condvar）。
     surf_wake: Arc<(Mutex<u32>, Condvar)>,
     /// 剪贴板写投递（vt 事件面 → surface 投递线程；只发 surface 腿）。
@@ -510,13 +670,13 @@ impl SessRt {
         cv.notify_all();
     }
 
-    /// 会话当前尺寸（epoch 表尾——note_size 恒在尺寸变化时记录）。
-    fn size(&self) -> (u16, u16) {
+    /// 会话当前尺寸（epoch 表尾——note_size 恒在尺寸变化时记录；类型保证非 0 且在限内）。
+    fn size(&self) -> Size {
         self.ring
             .epochs
             .last()
-            .map(|e| (e.cols, e.rows))
-            .unwrap_or((80, 24))
+            .map(|e| e.size)
+            .unwrap_or(Size::DEFAULT)
     }
 }
 
@@ -550,6 +710,17 @@ pub struct TermService {
     logf: Logf,
     state: Mutex<State>,
     stop: Arc<AtomicBool>,
+    /// 测试身份（panic 注入表按服务唯一化——并发测试的其它服务 tick 不会误消费；
+    /// 生产构建无此字段）。
+    #[cfg(test)]
+    svc_id: u64,
+}
+
+/// 测试服务的身份发号器（`#[cfg(test)]`）。
+#[cfg(test)]
+fn next_svc_id() -> u64 {
+    static N: AtomicU64 = AtomicU64::new(1);
+    N.fetch_add(1, Ordering::Relaxed)
 }
 
 impl TermService {
@@ -583,6 +754,8 @@ impl TermService {
             next_sess_gen: 1,
             }),
             stop: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            svc_id: next_svc_id(),
         });
         // sample 线程（服务级 1s 一拍；Go sampleLoop）
         let tick_svc = Arc::clone(&svc);
@@ -629,7 +802,12 @@ impl TermService {
                     let svc = Arc::clone(self);
                     std::thread::Builder::new()
                         .name("term-conn".into())
-                        .spawn(move || svc.serve_conn(stream))
+                        .spawn(move || {
+                            // F7：单连接隔离——panic 只 drop 该连接（stream 随闭包 drop）
+                            let _ = guard_thread(ThreadRole::Conn, "", &svc.logf, || {
+                                svc.serve_conn(stream)
+                            });
+                        })
                         .ok();
                 }
                 Err(_) => return, // listener 已关
@@ -667,7 +845,12 @@ impl TermService {
                     let svc = Arc::clone(self);
                     std::thread::Builder::new()
                         .name("term-conn".into())
-                        .spawn(move || svc.serve_conn(stream))
+                        .spawn(move || {
+                            // F7：单连接隔离——panic 只 drop 该连接（stream 随闭包 drop）
+                            let _ = guard_thread(ThreadRole::Conn, "", &svc.logf, || {
+                                svc.serve_conn(stream)
+                            });
+                        })
                         .ok();
                 }
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
@@ -850,25 +1033,39 @@ impl TermService {
                 return;
             }
         }
-        // 尺寸归一（Go spawnLocked 的 80/24 缺省；HELLO 0x0 不产生退化几何——评审 L8）
-        let (cols, rows) = (cols_or_default(cols), rows_or_default(rows));
+        // 尺寸归一（Go spawnLocked 的 80/24 缺省；HELLO 0x0 不产生退化几何——评审 L8；
+        // 超限**夹取** = F1a/P0-3：`HELLO 65535x65535` 不再让 alacritty 发起 96 GiB 起
+        // 的分配——分配失败走 handle_alloc_error（abort），必须在入径拦下）
+        let size = Size::normalized(cols, rows);
+        let clamped = !Size::is_exact(cols, rows);
         // 注册腿（全序：同实例替换 → 接管 → 腾位 → 入表即活动）
         let desc = LegDescriptor {
             client_id: ht.client_id.clone(),
             surface,
             raw_capable,
-            cols,
-            rows,
+            size,
         };
         let (out, hs, reg, sess_gen) = {
             let mut guard = self.lock_state();
             let st = &mut *guard;
             // ATTACHED/回放计划用**选举前**的会话尺寸（Go registerLegLocked 同序）
-            let prev_size = st.registry.session(&name).map(|s| (s.cols, s.rows)).unwrap_or((cols, rows));
+            let prev_size = st.registry.session(&name).map(|s| s.size).unwrap_or(size);
             let Some(sess_gen) = st.sessions.get(&name).map(|rt| rt.gen) else {
                 return;
             };
-            let regres = st.registry.register_leg(&name, desc, takeover, now_ms());
+            // 实时停滞快照（F4：淘汰排序真源 = 各腿 LegOut；服务锁内取——锁序
+            // state → legout 与 end_leg 的既有取序一致，无死锁环）
+            let stalled: Vec<(LegKey, Duration)> = st
+                .sessions
+                .get(&name)
+                .map(|rt| {
+                    rt.legs
+                        .iter()
+                        .filter_map(|l| l.out.stalled_snapshot().map(|d| (l.key, d)))
+                        .collect()
+                })
+                .unwrap_or_default();
+            let regres = st.registry.register_leg(&name, desc, takeover, now_ms(), &stalled);
             let reg = match regres {
                 Ok(o) => o,
                 Err(e) => {
@@ -898,17 +1095,32 @@ impl TermService {
                 clip_cache: None,
             });
             self.logf(&reg.log);
+            // 夹取日志（评审 1.4：只在**真发生夹取且尺寸真被应用**时打——同一超限值重复
+            // 上报走「尺寸未变 ⇒ size_applied=None」天然不刷屏）
+            if clamped && reg.size_applied.is_some() {
+                self.logf(&format!(
+                    "term: 会话 {name} 尺寸夹取 {cols}x{rows} → {size}（上限 {}x{}）",
+                    Size::MAX_COLS,
+                    Size::MAX_ROWS
+                ));
+            }
             // 接入即活动的尺寸应用（H2：注册表只改记账，PTY/vt/环 epoch 在这里跟上；
             // 哨兵不在注册路径注入——stream 统一一次）
-            if let Some((c, r)) = reg.size_applied {
-                apply_size_locked(rt, c, r);
+            if let Some(sz) = reg.size_applied {
+                apply_size_locked(rt, sz);
             }
             // 活动切换的主题/剪贴板回落（评审 P3：注册即活动——Go noteActivityLocked
             // 内建；新腿无上报时把会话缓存清成它的（空）值）
             apply_active_theme_locked(rt, st.registry.session(&name).and_then(|sm| sm.active));
             // ATTACHED/握手计划（锁内构建；ATTACHED 先入队——此刻腿已在表内且锁在手）
-            let attached =
-                frames::enc_attached(prev_size.0, prev_size.1, rt.scan.modes(), rt.agent, rt.state_v2, &rt.name);
+            let attached = frames::enc_attached(
+                prev_size.cols(),
+                prev_size.rows(),
+                rt.scan.modes(),
+                rt.agent,
+                rt.state_v2,
+                &rt.name,
+            );
             let hs = if surface {
                 out.enqueue(WriteItem::new(Op::ATTACHED, attached), 0);
                 if let Some(s) = rt.legs.last_mut().and_then(|l| l.surface.as_mut()) {
@@ -957,10 +1169,22 @@ impl TermService {
             std::thread::Builder::new()
                 .name("term-leg-writer".into())
                 .spawn(move || {
-                    if let Some(hs) = hs {
-                        svc.run_raw_writer(&tname, sess_gen, tkey, wio, tout, hs);
-                    } else {
-                        svc.run_surface_writer(&tname, sess_gen, tkey, wio, tout);
+                    let ctx = format!("会话 {tname} ");
+                    let svc2 = Arc::clone(&svc);
+                    let tname2 = tname.clone();
+                    let body = move || {
+                        if let Some(hs) = hs {
+                            svc2.run_raw_writer(&tname2, sess_gen, tkey, wio, tout, hs);
+                        } else {
+                            svc2.run_surface_writer(&tname2, sess_gen, tkey, wio, tout);
+                        }
+                    };
+                    if let Some(action) = guard_thread(ThreadRole::LegWriter, &ctx, &svc.logf, body) {
+                        debug_assert_eq!(action, PanicAction::BreakLeg);
+                        // 裸断该腿（单腿失败不拖垮会话）+ 写者计数回收
+                        // （panic 可能发生在 writer_exited 之前，不补会让运行态永驻）
+                        svc.leg_write_failed(&tname, tkey, "panicked");
+                        svc.writer_exited(&tname, sess_gen);
                     }
                 })
         };
@@ -1018,7 +1242,7 @@ impl TermService {
                         }
                         apply_active_theme_locked(rt, active);
                         if let Some(sz) = sz {
-                            apply_size_locked(rt, sz.0, sz.1);
+                            apply_size_locked(rt, sz);
                             self.sentinel_repaint_locked(rt);
                         }
                         Arc::clone(&rt.pty)
@@ -1035,15 +1259,40 @@ impl TermService {
                             continue;
                         }
                     };
+                    // F1b：`RESIZE 0×0` 忽略本次上报（Go 的会话尺寸写点在 0 门**之后**；
+                    // 旧实现先写会话几何再被 apply 的 0 门放空 ⇒ 几何被污染成 0×0，
+                    // LIST/ATTACHED/surface 体全 0 而格流仍按 vt 宽编 = 客户端错位）。
+                    // 超限夹取（F1a）：不发起巨型分配。
+                    let Some(size) = Size::from_report(cols, rows) else {
+                        let mut st = self.lock_state();
+                        if let Some(rt) = rt_of_mut(&mut st, name, sess_gen) {
+                            rt.zero_resize_ignored += 1;
+                            let n = rt.zero_resize_ignored;
+                            if n <= 3 || n.is_multiple_of(100) {
+                                self.logf(&format!(
+                                    "term: 会话 {name} 忽略 RESIZE 0×0 上报 {n} 次（会话几何保持）"
+                                ));
+                            }
+                        }
+                        continue;
+                    };
+                    let clamped = !Size::is_exact(cols, rows);
                     let mut st = self.lock_state();
-                    let _ = st.registry.leg_resize(name, key, cols, rows);
+                    let _ = st.registry.leg_resize(name, key, size);
                     let sz = st.registry.note_activity(name, key, now_ms());
                     let active = st.registry.session(name).and_then(|s| s.active);
                     if let Some(rt) = rt_of_mut(&mut st, name, sess_gen) {
                         apply_active_theme_locked(rt, active);
                         if let Some(sz) = sz {
-                            apply_size_locked(rt, sz.0, sz.1);
+                            apply_size_locked(rt, sz);
                             self.sentinel_repaint_locked(rt);
+                            if clamped {
+                                self.logf(&format!(
+                                    "term: 会话 {name} 尺寸夹取 {cols}x{rows} → {sz}（上限 {}x{}）",
+                                    Size::MAX_COLS,
+                                    Size::MAX_ROWS
+                                ));
+                            }
                         }
                     }
                 }
@@ -1133,7 +1382,7 @@ impl TermService {
             apply_active_theme_locked(rt, active);
             if let Some(sz) = sz {
                 // 输入也可能改会话尺寸（另一条不同尺寸的腿刚改过——FIX-26），但不注入哨兵
-                apply_size_locked(rt, sz.0, sz.1);
+                apply_size_locked(rt, sz);
             }
             if rt.stopped.load(Ordering::Relaxed) {
                 return;
@@ -1246,7 +1495,7 @@ impl TermService {
             if rt.stopped.load(Ordering::Relaxed) {
                 None
             } else if let Some(vt) = rt.vt.as_mut() {
-                let (cols, rows) = st.registry.session(name).map(|s| (s.cols, s.rows)).unwrap_or((80, 24));
+                let geom = st.registry.session(name).map(|s| s.size).unwrap_or(Size::DEFAULT);
                 let rev = rt
                     .legs
                     .iter()
@@ -1255,12 +1504,12 @@ impl TermService {
                     .map(|s| s.revision)
                     .unwrap_or(0);
                 let rows_enc = super::codec::encode_rows(&vt.rows_at(req.from, req.count as usize));
-                Some((cols, rows, rev, rows_enc))
+                Some((geom, rev, rows_enc))
             } else {
                 None
             }
         };
-        let Some((cols, rows, rev, rows_enc)) = built else {
+        let Some((geom, rev, rows_enc)) = built else {
             out.enqueue(
                 WriteItem::new(Op::ERROR, frames::enc_error("surface_unavailable", "本会话没有服务端 vt")),
                 0,
@@ -1269,8 +1518,8 @@ impl TermService {
         };
         let reply = super::codec::FetchRowsReply {
             revision: rev,
-            cols,
-            rows,
+            cols: geom.cols(),
+            rows: geom.rows(),
             from: req.from,
             count: req.count,
             row_bytes: rows_enc,
@@ -1322,7 +1571,7 @@ impl TermService {
     // ---- 会话生命周期 ----
 
     /// HELLO 接入语义（Go attachOrCreate 四象限；创建路径先起运行态再进注册表，
-    /// spawn 失败不留半截状态）。
+    /// spawn 失败不留半截状态）。尺寸入径已归一（[`Size::normalized`]）。
     fn attach_or_create(
         self: &Arc<Self>,
         name: &str,
@@ -1331,7 +1580,7 @@ impl TermService {
         create: bool,
         only_if_absent: bool,
     ) -> Result<(), TermError> {
-        let (cols, rows) = (cols_or_default(cols), rows_or_default(rows));
+        let size = Size::normalized(cols, rows);
         let mut st = self.lock_state();
         if st.registry.session(name).is_none() && create {
             if st.registry.session_names().len() >= self.cfg.max_sessions {
@@ -1340,11 +1589,11 @@ impl TermService {
                     format!("会话数已达上限 {}，请先关闭一些会话", self.cfg.max_sessions),
                 ));
             }
-            self.spawn_session_locked(&mut st, name, cols, rows)?;
+            self.spawn_session_locked(&mut st, name, size)?;
             // 注册表建立（80x24 归一——Go spawnLocked 同款；此后腿接入尺寸归选举）
-            return st.registry.attach_or_create(name, cols, rows, true, false).map(|_| ());
+            return st.registry.attach_or_create(name, size, true, false).map(|_| ());
         }
-        st.registry.attach_or_create(name, cols, rows, create, only_if_absent).map(|_| ())
+        st.registry.attach_or_create(name, size, create, only_if_absent).map(|_| ())
     }
 
     /// `CREATE` 不接入（Go createOnly，`new -d`）：不动尺寸、不产生腿、不触发哨兵/焦点。
@@ -1356,8 +1605,8 @@ impl TermService {
         if st.registry.session_names().len() >= self.cfg.max_sessions {
             return st.registry.create_only(name, false);
         }
-        self.spawn_session_locked(&mut st, name, 0, 0)?;
-        let r = st.registry.attach_or_create(name, 80, 24, true, false).map(|_| ());
+        self.spawn_session_locked(&mut st, name, Size::DEFAULT)?;
+        let r = st.registry.attach_or_create(name, Size::DEFAULT, true, false).map(|_| ());
         if r.is_ok() {
             self.logf(&format!("term: 创建会话 {name}（不接入，默认尺寸）"));
         }
@@ -1369,9 +1618,9 @@ impl TermService {
         self: &Arc<Self>,
         st: &mut State,
         name: &str,
-        cols: u16,
-        rows: u16,
+        size: Size,
     ) -> Result<(), TermError> {
+        let (cols, rows) = (size.cols(), size.rows());
         let spawned = super::pty::spawn(name, cols, rows, self.cfg.shell.as_deref()).map_err(|e| {
             TermError::new(super::session::TermErrorCode::SpawnFailed, e)
         })?;
@@ -1383,7 +1632,7 @@ impl TermService {
         let reader = std::mem::replace(&mut inner.reader, Box::new(std::io::empty()));
         let pty = Arc::new(PtyShared { inner: Mutex::new(inner) });
 
-        let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel(RESP_QUEUE_LEN);
+        let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel::<PtyInject>(RESP_QUEUE_LEN);
         let (clip_tx, clip_rx) = std::sync::mpsc::sync_channel::<String>(8);
         let vt = if vt_disabled_by_env() {
             self.logf(&format!("term: 会话 {name} 无服务端 vt（HOMEWAY_TERM_VT=off）→ 该会话仅 legacy 原始字节模式"));
@@ -1391,6 +1640,9 @@ impl TermService {
         } else {
             match SessionVt::new(cols, rows, self.cfg.scrollback_lines) {
                 Ok(v) => Some(v),
+                // 归一后本分支**不可达**（`Size::normalized` 入径 + `pty::spawn` 的 0→80/24
+                // 归一回填）：设计 §2 F1a（评审 1.7）的 legacy-only 退化只对**未来直连
+                // 调用点**是活路径；组件层硬拒由 vt.rs 单测直接覆盖（代码门 M1）。
                 Err(e) => {
                     self.logf(&format!("term: 会话 {name} 无服务端 vt（{e}）→ 该会话仅 legacy 原始字节模式"));
                     None
@@ -1424,11 +1676,14 @@ impl TermService {
             clip_cache: None,
             resp_tx,
             resp_dropped: Arc::new(AtomicU64::new(0)),
+            clip_dropped: Arc::new(AtomicU64::new(0)),
+            nudge_dropped: Arc::new(AtomicU64::new(0)),
+            zero_resize_ignored: 0,
             surf_wake: Arc::new((Mutex::new(0), Condvar::new())),
             clip_tx,
             stopped: Arc::new(AtomicBool::new(false)),
         };
-        rt.ring.note_size(cols, rows);
+        rt.ring.note_size(Size::normalized(cols, rows));
         let surf_wake = Arc::clone(&rt.surf_wake);
         let stopped = Arc::clone(&rt.stopped);
         st.sessions.insert(name.to_string(), rt);
@@ -1441,7 +1696,17 @@ impl TermService {
         let tname = name.to_string();
         let pump_spawn = std::thread::Builder::new()
             .name("term-pump".into())
-            .spawn(move || svc.pump_loop(&tname, sess_gen, reader));
+            .spawn(move || {
+                let ctx = format!("会话 {tname} ");
+                if let Some(action) = guard_thread(ThreadRole::Pump, &ctx, &svc.logf, || {
+                    svc.pump_loop(&tname, sess_gen, reader)
+                }) {
+                    debug_assert_eq!(action, PanicAction::FinalizePump);
+                    // 主动收尾：无 reader 的会话必死（子进程可能未真退出——wait_bounded
+                    // 超时内含 kill_force 兜底），不留僵尸；客户端可重建会话
+                    svc.finalize_panicked_pump(&tname, sess_gen);
+                }
+            });
         if pump_spawn.is_err() {
             self.logf(&format!("term: 会话 {name} pump 线程起不来——立即回收"));
             st.sessions.remove(name);
@@ -1457,9 +1722,21 @@ impl TermService {
         }
         let resp_pty = Arc::clone(&pty);
         let resp_stopped = Arc::clone(&stopped);
+        let resp_logf = Arc::clone(&self.logf);
+        let resp_name = name.to_string();
         if std::thread::Builder::new()
             .name("term-resp".into())
-            .spawn(move || Self::response_writer_loop(resp_rx, resp_pty, resp_stopped))
+            .spawn(move || {
+                let ctx = format!("会话 {resp_name} ");
+                let inner_logf = Arc::clone(&resp_logf);
+                let inner_name = resp_name.clone();
+                if let Some(action) = guard_thread(ThreadRole::Resp, &ctx, &resp_logf, || {
+                    Self::response_writer_loop(resp_rx, resp_pty, resp_stopped, inner_logf, inner_name)
+                }) {
+                    debug_assert_eq!(action, PanicAction::DropResp);
+                    // 线程退出：查询应答降级（会话主体不受影响）
+                }
+            })
             .is_err()
         {
             self.logf(&format!("term: 会话 {name} 应答写者线程起不来（查询应答将不代答）"));
@@ -1468,7 +1745,17 @@ impl TermService {
         let tname = name.to_string();
         if std::thread::Builder::new()
             .name("term-surface".into())
-            .spawn(move || svc.surface_loop(&tname, sess_gen, clip_rx, surf_wake, stopped))
+            .spawn(move || {
+                let ctx = format!("会话 {tname} ");
+                if let Some(action) = guard_thread(ThreadRole::Surface, &ctx, &svc.logf, || {
+                    svc.surface_loop(&tname, sess_gen, clip_rx, surf_wake, stopped)
+                }) {
+                    debug_assert_eq!(action, PanicAction::DropSurface);
+                    // surface 唯一投递面已死：全 surface 腿 finish_quit + 裸断（无 ENDED），
+                    // 线程退出——app 见断连可重连
+                    svc.surface_panicked(&tname, sess_gen);
+                }
+            })
             .is_err()
         {
             self.logf(&format!("term: 会话 {name} surface 投递线程起不来（surface 腿不可用）"));
@@ -1494,7 +1781,8 @@ impl TermService {
             return;
         }
         rt.sentinel_count += 1; // 低7 判据计数器：一次 attach 只应 +1
-        let (cols, rows) = rt.size();
+        let size = rt.size();
+        let (cols, rows) = (size.cols(), size.rows());
         let sentinel = if cols > 1 { cols - 1 } else { cols + 1 };
         rt.pty.resize(sentinel, rows);
         rt.pty.resize(cols, rows);
@@ -1535,7 +1823,11 @@ impl TermService {
         }
         // afterLegsChanged 派生面
         if outcome.focus_out {
-            self.focus_nudge_locked(rt, false); // 末腿离开 → focus-out（TUI 停动画）
+            // 末腿离开 → focus-out（TUI 停动画）。F3：入每会话 PTY 注入队列（锁内 try_send，
+            // 顺序 = 状态迁移序；实际写在 response_writer_loop 锁外做——锁内不做阻塞 I/O）
+            if let Some(bytes) = Self::focus_nudge_bytes(rt, false) {
+                enqueue_pty_inject(rt, bytes, &self.logf);
+            }
         }
         // 摘腿重选举 ⇒ 新 active 腿的主题/剪贴板回落（评审 P3：re_elected 的读者；
         // 旧腿已摘出 rt.legs，正好取到新 active）
@@ -1548,20 +1840,25 @@ impl TermService {
             apply_active_theme_locked(rt, active);
         }
         if let Some(sz) = outcome.size_applied {
-            apply_size_locked(rt, sz.0, sz.1);
+            apply_size_locked(rt, sz);
             self.sentinel_repaint_locked(rt);
         }
     }
 
-    /// 焦点事件注入（仅当 TUI 开了 ?1004——不开的程序读到这些字节只会当普通输入）。
-    fn focus_nudge_locked(&self, rt: &SessRt, focus_in: bool) {
-        if rt.stopped.load(Ordering::Relaxed) || rt.scan.modes() & super::codec::mode_bits::FOCUS == 0 {
-            return;
-        }
-        let seq: &[u8] = if focus_in { b"\x1b[I" } else { b"\x1b[O" };
-        if !rt.pty.write_input(seq) {
-            self.logf(&format!("term: 会话 {} focus nudge 写入失败", rt.name));
-        }
+    /// 焦点事件注入的**判据**（调用方持锁）：需要注入时返回字节（F3）。
+    ///
+    /// 仅当 TUI 开了 `?1004`（不开的程序读到这些字节只会当普通输入）。字节**不在这里写**
+    /// ——写经每会话 PTY 注入队列（`resp_tx`，由 `response_writer_loop` 锁外消费），
+    /// 入队由调用方在锁内 `try_send`（非阻塞）⇒ 队列序 = 状态迁移序（消除「出锁写」的
+    /// 时序竞态：末腿 focus-out 与并发 attach 的 focus-in 不会交错）。
+    /// 队列满时丢弃并计数（F6 观测面）；focus-in 被丢的降级 = 尺寸哨兵兜底
+    /// （少数 TUI 需按键恢复），focus-out 被丢只影响省电语义。
+    fn focus_nudge_bytes(rt: &SessRt, focus_in: bool) -> Option<&'static [u8]> {
+        nudge_bytes_for(
+            rt.stopped.load(Ordering::Relaxed),
+            rt.scan.modes() & super::codec::mode_bits::FOCUS != 0,
+            focus_in,
+        )
     }
 
     /// kill 主动结束（SIGHUP → 宽限 → SIGKILL）；ENDED 由 pump 收尾路径发。
@@ -1646,6 +1943,32 @@ impl TermService {
         self.finish_session(name, reason);
     }
 
+    /// pump 线程 panic 后的主动收尾（F7 处置表）：无 reader 的会话必死——有界收尸
+    /// （超时内含 SIGKILL 兜底）后走统一 finish（ENDED 经各腿写者送达），不留僵尸。
+    fn finalize_panicked_pump(self: &Arc<Self>, name: &str, sess_gen: u64) {
+        let pty = {
+            let st = self.lock_state();
+            rt_of(&st, name, sess_gen).map(|rt| Arc::clone(&rt.pty))
+        };
+        let Some(pty) = pty else { return };
+        let code = pty.wait_bounded(Duration::from_secs(2));
+        self.finalize_exit(name, code);
+    }
+
+    /// surface 投递线程 panic 后的收尾（F7 处置表）：surface 唯一投递面已死 ⇒
+    /// 全 surface 腿 finish_quit + 裸断（无 ENDED——客户端见断连可重连），线程退出。
+    fn surface_panicked(&self, name: &str, sess_gen: u64) {
+        let keys: Vec<LegKey> = {
+            let st = self.lock_state();
+            rt_of(&st, name, sess_gen)
+                .map(|rt| rt.legs.iter().filter(|l| l.surface.is_some()).map(|l| l.key).collect())
+                .unwrap_or_default()
+        };
+        for key in keys {
+            self.leg_write_failed(name, key, "panicked");
+        }
+    }
+
     /// 写者退出计数；会话已收尾且这是最后一个写者 ⇒ 释放运行态（r5 M1：ENDED 前排干
     /// 窗口里环还在）。
     fn writer_exited(&self, name: &str, sess_gen: u64) {
@@ -1671,13 +1994,20 @@ impl TermService {
                 Ok(n) => n,
                 Err(_) => break,
             };
+            // 注入点放在首次读**成功之后**：测试要求腿已接入（ENDED 可达）才触发
+            maybe_inject_panic(ThreadRole::Pump, name);
             let mut responses: Vec<Vec<u8>> = Vec::new();
             let mut clip_store: Option<String> = None;
             type ClipLoad = Arc<dyn Fn(&str) -> String + Send + Sync>;
             let mut clip_loads: Vec<ClipLoad> = Vec::new();
             #[allow(unused_assignments)]
             let mut clip_cache: Option<String> = None;
-            let (clip_tx, resp_tx, resp_dropped): (SyncSender<String>, SyncSender<Vec<u8>>, Arc<AtomicU64>) = {
+            let (clip_tx, resp_tx, resp_dropped, clip_dropped): (
+                SyncSender<String>,
+                SyncSender<PtyInject>,
+                Arc<AtomicU64>,
+                Arc<AtomicU64>,
+            ) = {
                 let mut guard = self.lock_state();
                 let st = &mut *guard;
                 let Some(rt) = rt_of_mut(st, name, sess_gen) else { break };
@@ -1706,7 +2036,12 @@ impl TermService {
                     }
                 }
                 clip_cache = rt.clip_cache.clone();
-                let txs = (rt.clip_tx.clone(), rt.resp_tx.clone(), Arc::clone(&rt.resp_dropped));
+                let txs = (
+                    rt.clip_tx.clone(),
+                    rt.resp_tx.clone(),
+                    Arc::clone(&rt.resp_dropped),
+                    Arc::clone(&rt.clip_dropped),
+                );
                 rt.content_seq += 1;
                 let now = now_ms();
                 rt.count_out(n, now);
@@ -1739,13 +2074,18 @@ impl TermService {
                 }
                 txs
             };
-            // 锁外投递：查询应答（FIX-25）+ 剪贴板读应答 + 剪贴板写转发
-            let send = |bytes: Vec<u8>| match resp_tx.try_send(bytes) {
-                Ok(()) => {}
-                Err(TrySendError::Full(_)) => {
-                    resp_dropped.fetch_add(1, Ordering::Relaxed);
-                }
-                Err(TrySendError::Disconnected(_)) => {}
+            // 锁外投递：查询应答（FIX-25）+ 剪贴板读应答 + 剪贴板写转发。
+            // F6：队列满 ⇒ 计数 + 节流日志（原实现只写不读，观测面接上）
+            let send = |bytes: Vec<u8>| {
+                try_send_or_count(
+                    &resp_tx,
+                    PtyInject::Resp(bytes),
+                    &resp_dropped,
+                    &self.logf,
+                    name,
+                    "查询应答",
+                    "（队列满）",
+                );
             };
             for r in responses {
                 send(r);
@@ -1756,7 +2096,10 @@ impl TermService {
                 }
             }
             if let Some(text) = clip_store {
-                let _ = clip_tx.try_send(text); // 满/无消费者：宁可拒绝，也不阻塞 VT 流
+                // 满/无消费者：宁可拒绝，也不阻塞 VT 流（F6：丢弃计数 + 节流日志）
+                if clip_tx.try_send(text).is_err() {
+                    count_drop(&clip_dropped, &self.logf, name, "剪贴板写", "");
+                }
             }
         }
         // 子进程退出 / PTY 关闭：收尸 → 统一收尾（ENDED + 回收四步）
@@ -1771,12 +2114,27 @@ impl TermService {
         self.finalize_exit(name, code);
     }
 
-    /// 应答写者（FIX-25）：独占消费应答队列写 PTY。退出 = 会话收工或 PTY 写失败。
-    fn response_writer_loop(rx: Receiver<Vec<u8>>, pty: Arc<PtyShared>, stopped: Arc<AtomicBool>) {
+    /// 应答写者（FIX-25）：独占消费每会话 PTY 注入队列（查询应答 + 焦点 nudge，F3）。
+    /// 退出 = 会话收工或 PTY 写失败。nudge 写失败的日志行文与旧实现同串（判据面不变）。
+    fn response_writer_loop(
+        rx: Receiver<PtyInject>,
+        pty: Arc<PtyShared>,
+        stopped: Arc<AtomicBool>,
+        logf: Logf,
+        name: String,
+    ) {
         loop {
             match rx.recv_timeout(SAMPLE_PERIOD) {
-                Ok(bytes) => {
-                    if !pty.write_input(&bytes) {
+                Ok(item) => {
+                    let is_nudge = matches!(item, PtyInject::Nudge(_));
+                    let ok = match &item {
+                        PtyInject::Resp(b) => pty.write_input(b),
+                        PtyInject::Nudge(b) => pty.write_input(b),
+                    };
+                    if !ok {
+                        if is_nudge {
+                            logf(&format!("term: 会话 {name} focus nudge 写入失败"));
+                        }
                         return;
                     }
                 }
@@ -1894,13 +2252,13 @@ impl TermService {
             if st.registry.session(name).is_none_or(|s| s.done) {
                 return;
             }
-            let geom = st.registry.session(name).map(|s| (s.cols, s.rows)).unwrap_or((80, 24));
+            let geom = st.registry.session(name).map(|s| s.size).unwrap_or(Size::DEFAULT);
             let Some(rt) = rt_of_mut(st, name, sess_gen) else { return };
             if !rt.any_surface() {
                 return;
             }
             let Some(vt) = rt.vt.as_mut() else { return };
-            let (cols, rows) = geom;
+            let (cols, rows) = (geom.cols(), geom.rows());
             let title = rt.scan.title().to_string();
             // 回滚回落检测（noteScrollbar 在 takeSnapshotFlag 之前——本拍消费）
             let cur_sb = ScrollbarWire::from(vt.scrollbar());
@@ -1940,8 +2298,10 @@ impl TermService {
                 }
                 if force {
                     let mat = snapshot_mat.get_or_insert_with(|| {
-                        let grid = super::codec::encode_grid(cols, rows, &vt.rows());
-                        let mirror_rows = vt.mirror_rows(rows as usize * MIRROR_VIEWPORTS);
+                        // F2：快照材质提交全屏指纹（下发成功后增量不再重复带已发过的行）
+                        let grid = super::codec::encode_grid(cols, rows, &vt.rows_and_commit());
+                        // F1c：镜像窗口 = min(rows × MIRROR_VIEWPORTS, 字节预算反推的行数)
+                        let mirror_rows = vt.mirror_rows(mirror_window_rows(cols, rows));
                         let mirror = if mirror_rows.is_empty() {
                             Vec::new()
                         } else {
@@ -2084,6 +2444,7 @@ impl TermService {
         out: Arc<LegOut>,
         hs: RawHandshake,
     ) {
+        maybe_inject_panic(ThreadRole::LegWriter, name);
         if !self.raw_write_frame(name, key, &mut io, &out, Op::ATTACHED, &hs.attached) {
             self.writer_exited(name, sess_gen);
             return;
@@ -2144,10 +2505,13 @@ impl TermService {
             off = sent;
         }
         if hs.nudge_focus {
-            // 首腿：回放完成后注入 focus-in，逼 TUI 立即全屏重绘
+            // 首腿：回放完成后注入 focus-in，逼 TUI 立即全屏重绘。F3：锁内入队即回
+            //（try_send 非阻塞），实际 PTY 写在 response_writer_loop 锁外做。
             let mut st = self.lock_state();
             if let Some(rt) = rt_of_mut(&mut st, name, sess_gen) {
-                self.focus_nudge_locked(rt, true);
+                if let Some(bytes) = Self::focus_nudge_bytes(rt, true) {
+                    enqueue_pty_inject(rt, bytes, &self.logf);
+                }
             }
         }
         // 实时循环：控制帧（STATE/ERROR/ENDED）优先、字节环随后。
@@ -2394,6 +2758,7 @@ impl TermService {
 
     /// surface 腿写者：出队 → 写 → 收尾（写失败/超时 = 断腿，任务 4.3 只对 raw 引入停滞语义）。
     fn run_surface_writer(self: &Arc<Self>, name: &str, sess_gen: u64, key: LegKey, mut io: FrameIo, out: Arc<LegOut>) {
+        maybe_inject_panic(ThreadRole::LegWriter, name);
         loop {
             let (items, ended, quit) = out.take();
             for it in &items {
@@ -2461,8 +2826,8 @@ impl TermService {
                 .into_iter()
                 .map(|l: LegView| ClientEntryJson {
                     kind: l.kind.as_str(),
-                    cols: l.cols,
-                    rows: l.rows,
+                    cols: l.size.cols(),
+                    rows: l.size.rows(),
                     since_ms: l.since_ms as i64,
                     active: reg.active == Some(l.key),
                 })
@@ -2482,8 +2847,8 @@ impl TermService {
                 state_v2: frames::state_v2::name(rt.state_v2),
                 title: rt.scan.title().to_string(),
                 cwd,
-                cols: reg.cols,
-                rows: reg.rows,
+                cols: reg.size.cols(),
+                rows: reg.size.rows(),
                 pid: rt.pty.pid(),
                 clients,
             });
@@ -2592,12 +2957,23 @@ impl TermService {
     }
 
     /// 服务锁获取（中毒恢复口径统一：任一持锁线程 panic 不该让整个 term 面殉葬——
-    /// 数据可能不一致，但 term 是可选服务，锁内无跨调用不变量，恢复优于级联崩溃）。
+    /// **锁安全 ≠ 状态一致**：恢复后可能读到半更新字段，处置保守优于级联崩溃。
+    /// 后果口径（Q-D 代码门 H1）：最坏 = 一拍脏数据——采样写入的
+    /// `state_v2/last_scan_seq/prev_cpu/prev_quiet` 每拍全量重算，`content_seq` 随
+    /// 每批 PTY 输出自增 ⇒ 屏扫短路会随下次输出自愈；`Hygiene` 的 `pending_idle`
+    /// 按墙钟过期。真正不可自愈的只有单字段漂移类（例 `LegOut.qbytes`），其处置
+    /// 路径保守：该腿持续「超限入队失败 → needSnapshot」）。
     fn lock_state(&self) -> std::sync::MutexGuard<'_, State> {
         self.state.lock().unwrap_or_else(|e| e.into_inner())
     }
 
     // ---- 采样：agent / 任务状态（Go sampleLoop/sampleOnce/sample）----
+
+    /// tick 级注入键（测试唯一化；见 `svc_id`）。
+    #[cfg(test)]
+    fn tick_inject_key(&self) -> String {
+        format!("tick:{}", self.svc_id)
+    }
 
     fn sample_loop(&self) {
         loop {
@@ -2608,24 +2984,41 @@ impl TermService {
             if !self.cfg.detect {
                 continue;
             }
-            let procs = agent::read_procs();
-            // 快照（名字, 代）：同名重建的瞬间不用旧 procs 刷新会话（评审 P8——
-            // Go sampleOnce 持的是会话指针快照）
-            let named: Vec<(String, u64)> = {
-                let st = self.lock_state();
-                st.registry
-                    .session_names()
-                    .into_iter()
-                    .filter_map(|n| st.sessions.get(n).map(|rt| (n.to_string(), rt.gen)))
-                    .collect()
-            };
-            for (name, gen) in named {
-                self.sample_once(&name, gen, &procs);
+            // F7（代码门 A2）：一拍**整体**兜底——`read_procs`（/proc 或 ps）与会话名快照
+            // 记账 panic 不得让**服务级**检测线程停摆（按会话的 catch 只保「单会话不停摆」，
+            // 设计 §2 F7 给 sample 的理由正是「不能全线停摆」——整拍门在此补齐）
+            let _ = guard_thread(ThreadRole::Sample, "", &self.logf, || self.sample_tick());
+        }
+    }
+
+    /// 采样一拍（进程表 + 逐会话 [`TermService::sample_once`]）。
+    fn sample_tick(&self) {
+        #[cfg(test)]
+        maybe_inject_panic(ThreadRole::Sample, &self.tick_inject_key());
+        let procs = agent::read_procs();
+        // 快照（名字, 代）：同名重建的瞬间不用旧 procs 刷新会话（评审 P8——
+        // Go sampleOnce 持的是会话指针快照）
+        let named: Vec<(String, u64)> = {
+            let st = self.lock_state();
+            st.registry
+                .session_names()
+                .into_iter()
+                .filter_map(|n| st.sessions.get(n).map(|rt| (n.to_string(), rt.gen)))
+                .collect()
+        };
+        for (name, gen) in named {
+            // F7：采样是服务级线程——按会话 catch，单会话 panic 只跳本拍
+            let ctx = format!("会话 {name} ");
+            if let Some(action) =
+                guard_thread(ThreadRole::Sample, &ctx, &self.logf, || self.sample_once(&name, gen, &procs))
+            {
+                debug_assert_eq!(action, PanicAction::SkipSession);
             }
         }
     }
 
     fn sample_once(&self, name: &str, sess_gen: u64, procs: &[ProcInfo]) {
+        maybe_inject_panic(ThreadRole::Sample, name);
         let now = now_ms();
         let mut guard = self.lock_state();
         let st = &mut *guard;
@@ -2769,17 +3162,20 @@ fn apply_active_theme_locked(rt: &mut SessRt, active: Option<LegKey>) {
 
 /// 尺寸应用（applySizeLocked）：PTY setsize + epoch + vt 重排 + 全 surface 腿标记全量
 /// （被动腿会拒收几何不符的差分，任务 3.1 的连带义务）。
-fn apply_size_locked(rt: &mut SessRt, cols: u16, rows: u16) {
-    if cols == 0 || rows == 0 || rt.stopped.load(Ordering::Relaxed) {
+///
+/// 入参是 [`Size`]——非 0 且在限内由类型保证（入径归一 + [`super::vt::SessionVt`] 硬拒
+/// 之外的门移到编译期）；`RESIZE 0×0` 在入径已被拦下（F1b），这里不再需要 0 判断。
+fn apply_size_locked(rt: &mut SessRt, size: Size) {
+    if rt.stopped.load(Ordering::Relaxed) {
         return;
     }
-    if rt.size() == (cols, rows) {
+    if rt.size() == size {
         return;
     }
-    rt.pty.resize(cols, rows);
-    rt.ring.note_size(cols, rows);
+    rt.pty.resize(size.cols(), size.rows());
+    rt.ring.note_size(size);
     if let Some(vt) = rt.vt.as_mut() {
-        let _ = vt.resize(cols, rows);
+        let _ = vt.resize(size.cols(), size.rows());
     }
     for l in &mut rt.legs {
         if let Some(s) = l.surface.as_mut() {
@@ -2789,6 +3185,60 @@ fn apply_size_locked(rt: &mut SessRt, cols: u16, rows: u16) {
     if rt.any_surface() {
         rt.wake_surface();
     }
+}
+
+/// 焦点 nudge 字节的纯判据（F3 三态单测面）：会话已收工 / 程序未开 `?1004` ⇒ None。
+fn nudge_bytes_for(stopped: bool, focus_mode: bool, focus_in: bool) -> Option<&'static [u8]> {
+    if stopped || !focus_mode {
+        return None;
+    }
+    Some(if focus_in { b"\x1b[I" } else { b"\x1b[O" })
+}
+
+/// 快照镜像窗口的实际行数（F1c 调用点口径）：`min(rows × MIRROR_VIEWPORTS, 行数预算)`。
+fn mirror_window_rows(cols: u16, rows: u16) -> usize {
+    (rows as usize * super::codec::MIRROR_VIEWPORTS).min(mirror_rows_budget(cols as usize))
+}
+
+/// 非阻塞投递一条到每会话 PTY 注入队列；队列满 ⇒ 计数 + 节流日志（F6）。
+/// 调用方可以在**锁内**调（`try_send` 不阻塞——F3 的顺序保证）。
+fn try_send_or_count(
+    tx: &SyncSender<PtyInject>,
+    item: PtyInject,
+    counter: &AtomicU64,
+    logf: &Logf,
+    name: &str,
+    what: &str,
+    tail: &str,
+) {
+    match tx.try_send(item) {
+        Ok(()) => {}
+        Err(TrySendError::Full(_)) => count_drop(counter, logf, name, what, tail),
+        // 消费者已退出（resp 线程 spawn 失败/写失败退出/收工退出）：同样是丢弃，
+        // 但归因不同（代码门 M3——原实现静默，F6 观测面对这一面是盲区）
+        Err(TrySendError::Disconnected(_)) => count_drop(counter, logf, name, what, "（消费者已退出）"),
+    }
+}
+
+/// 丢弃计数 + 节流日志（首 3 次 + 每 100 次；沿用 Q-C F6 形态——防刷屏又不丢首现）。
+fn count_drop(counter: &AtomicU64, logf: &Logf, name: &str, what: &str, tail: &str) {
+    let n = counter.fetch_add(1, Ordering::Relaxed) + 1;
+    if n <= 3 || n.is_multiple_of(100) {
+        logf(&format!("term: 会话 {name} {what}丢弃 {n} 条{tail}"));
+    }
+}
+
+/// PTY 注入入队（F3：调用方持锁，非阻塞——队列序 = 状态迁移序）。
+fn enqueue_pty_inject(rt: &SessRt, bytes: &'static [u8], logf: &Logf) {
+    try_send_or_count(
+        &rt.resp_tx,
+        PtyInject::Nudge(bytes),
+        &rt.nudge_dropped,
+        logf,
+        &rt.name,
+        "PTY 注入",
+        "（队列满）",
+    );
 }
 
 /// 屏幕证据（Go screenEvidenceLocked）：身份选表 → 空闲短路 → 求值。
@@ -2848,15 +3298,6 @@ fn state_v2_from_manifest(s: manifest::State) -> u8 {
         manifest::State::Idle => frames::state_v2::IDLE,
         manifest::State::Unknown => frames::state_v2::UNKNOWN,
     }
-}
-
-/// HELLO 尺寸归一（Go spawnLocked 的 80/24 缺省——0x0 不产生退化几何）。
-fn cols_or_default(c: u16) -> u16 {
-    if c == 0 { 80 } else { c }
-}
-
-fn rows_or_default(r: u16) -> u16 {
-    if r == 0 { 24 } else { r }
 }
 
 fn dec_name_or(f: &Frame) -> Result<String, Vec<u8>> {
@@ -3093,6 +3534,8 @@ mod tests {
                 next_sess_gen: 1,
             }),
             stop: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            svc_id: next_svc_id(),
         });
         let tick = Arc::clone(&s);
         std::thread::Builder::new()
@@ -3750,6 +4193,433 @@ mod tests {
         assert!(leg.note_scrollbar(sb(70, 55, 10))); // 距底 15 ≠ 10
         assert_eq!(leg.stats.trims, 2);
         assert!(leg.need_snapshot);
+    }
+
+    /// F1c：镜像窗口预算（宽屏行数 ≤ 预算；窄屏与既有 golden 尺寸不变）。
+    #[test]
+    fn mirror_window_rows_budget() {
+        // 预算 = 32MiB / (cols × 48B/格)
+        assert_eq!(mirror_rows_budget(1000), 699, "1000 列 ⇒ 699 行（32MiB/(1000×48)）");
+        assert_eq!(mirror_rows_budget(80), 8738, "80 列 ⇒ 预算行数远大于 rows×10");
+        assert_eq!(mirror_rows_budget(u16::MAX as usize), 64, "下限 64 行（极窄/极大列都不退化）");
+        // 调用点口径 = min(rows × MIRROR_VIEWPORTS, 预算)
+        assert_eq!(mirror_window_rows(80, 24), 240, "窄屏不变（既有行为）");
+        assert_eq!(mirror_window_rows(100, 32), 320, "golden 尺寸不变");
+        assert_eq!(mirror_window_rows(1000, 500), 699, "宽屏上限处被预算夹住");
+        assert_eq!(mirror_window_rows(1000, 50), 500, "宽屏但行数少 ⇒ 不夹（500 < 699）");
+        assert_eq!(mirror_window_rows(1, 500), 5000, "极窄屏不受预算影响");
+    }
+
+    /// F3：nudge 判据三态（stopped / 未开 ?1004 / 正常）。
+    #[test]
+    fn nudge_bytes_for_three_states() {
+        assert_eq!(nudge_bytes_for(true, true, true), None, "会话收工 ⇒ 不注入");
+        assert_eq!(nudge_bytes_for(false, false, false), None, "未开 ?1004 ⇒ 不注入");
+        assert_eq!(nudge_bytes_for(false, true, true), Some(&b"\x1b[I"[..]), "focus-in");
+        assert_eq!(nudge_bytes_for(false, true, false), Some(&b"\x1b[O"[..]), "focus-out");
+    }
+
+    /// F6：丢弃计数 + 节流日志（首 3 次 + 每 100 次）。
+    #[test]
+    fn drop_counters_and_throttled_log() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let logf: Logf = {
+            let lines = Arc::clone(&lines);
+            Arc::new(move |m: &str| lines.lock().unwrap().push(m.to_string()))
+        };
+        let (tx, _rx) = std::sync::mpsc::sync_channel::<PtyInject>(1);
+        let dropped = AtomicU64::new(0);
+        try_send_or_count(&tx, PtyInject::Resp(vec![1]), &dropped, &logf, "t1", "查询应答", "（队列满）");
+        assert_eq!(dropped.load(Ordering::Relaxed), 0, "首条入队成功");
+        for _ in 0..4 {
+            try_send_or_count(&tx, PtyInject::Resp(vec![2]), &dropped, &logf, "t1", "查询应答", "（队列满）");
+        }
+        assert_eq!(dropped.load(Ordering::Relaxed), 4, "队列满 ⇒ 计数增长");
+        {
+            let logs = lines.lock().unwrap();
+            let n = logs.iter().filter(|l| l.contains("查询应答丢弃")).count();
+            assert_eq!(n, 3, "首 3 次各一条（第 4 次被节流）：{logs:?}");
+            assert!(logs.iter().any(|l| l.contains("term: 会话 t1 查询应答丢弃 1 条（队列满）")));
+        }
+        // M3（代码门）：消费者退出 ⇒ Disconnected 分支独立归因（原实现静默）
+        let (tx2, rx2) = std::sync::mpsc::sync_channel::<PtyInject>(1);
+        drop(rx2);
+        let d2 = AtomicU64::new(0);
+        try_send_or_count(&tx2, PtyInject::Resp(vec![1]), &d2, &logf, "t1", "查询应答", "（队列满）");
+        assert_eq!(d2.load(Ordering::Relaxed), 1, "消费者退出也计入丢弃");
+        assert!(
+            lines.lock().unwrap().iter().any(|l| l.contains("查询应答丢弃 1 条（消费者已退出）")),
+            "Disconnected 归因文案：{:?}",
+            lines.lock().unwrap()
+        );
+        // 剪贴板写 / PTY 注入：独立计数，同一节流形态
+        let cd = AtomicU64::new(0);
+        count_drop(&cd, &logf, "t1", "剪贴板写", "");
+        let nd = AtomicU64::new(0);
+        count_drop(&nd, &logf, "t1", "PTY 注入", "（队列满）");
+        let logs = lines.lock().unwrap();
+        assert!(logs.iter().any(|l| l.contains("term: 会话 t1 剪贴板写丢弃 1 条")));
+        assert!(logs.iter().any(|l| l.contains("term: 会话 t1 PTY 注入丢弃 1 条（队列满）")));
+    }
+
+    /// F7：处置表（panic → 动作）纯函数。
+    #[test]
+    fn panic_action_table() {
+        assert_eq!(panic_action(ThreadRole::Pump), PanicAction::FinalizePump);
+        assert_eq!(panic_action(ThreadRole::LegWriter), PanicAction::BreakLeg);
+        assert_eq!(panic_action(ThreadRole::Surface), PanicAction::DropSurface);
+        assert_eq!(panic_action(ThreadRole::Resp), PanicAction::DropResp);
+        assert_eq!(panic_action(ThreadRole::Conn), PanicAction::DropConn);
+        assert_eq!(panic_action(ThreadRole::Sample), PanicAction::SkipSession);
+    }
+
+    /// F7③：服务锁中毒恢复（持锁线程 panic 后其余调用不殉葬）。
+    #[test]
+    fn poisoned_service_lock_recovers() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let svc = svc_with(TermConfig::default(), lines);
+        let svc2 = Arc::clone(&svc);
+        let h = std::thread::spawn(move || {
+            let _g = svc2.state.lock().unwrap();
+            panic!("poison");
+        });
+        assert!(h.join().is_err(), "持锁线程 panic");
+        let json = svc.list_json();
+        assert!(json.contains("sessions"), "毒锁恢复后 list_json 可用：{json}");
+        svc.close();
+    }
+
+    /// F7：guard_thread 捕获 panic 并落日志（载荷取 &str）。
+    #[test]
+    fn guard_thread_logs_and_reports_action() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let logf: Logf = {
+            let lines = Arc::clone(&lines);
+            Arc::new(move |m: &str| lines.lock().unwrap().push(m.to_string()))
+        };
+        assert_eq!(guard_thread(ThreadRole::Resp, "", &logf, || {}), None, "正常退出 ⇒ None");
+        let a = guard_thread(ThreadRole::Pump, "会话 t9 ", &logf, || panic!("boom"));
+        assert_eq!(a, Some(PanicAction::FinalizePump));
+        let logs = lines.lock().unwrap();
+        assert!(
+            logs.iter().any(|l| l == "term: 会话 t9 term-pump 线程 panic（已兜住）：boom"),
+            "兜住日志行文：{logs:?}"
+        );
+    }
+
+    /// F1a/F1b 集成：RESIZE 0×0 忽略（几何保持）、极端尺寸夹取（LIST/ATTACHED/vt/环四方
+    /// 一致，进程存活可继续输入输出）。**绝不让 96 GiB 分配发生**——夹取在入径完成。
+    #[test]
+    fn resize_clamp_and_zero_ignore() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let cfg = TermConfig { shell: Some("cat".into()), ..TermConfig::default() };
+        let svc = svc_with(cfg, Arc::clone(&lines));
+        let (ln, path) = start_listener();
+        {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || svc.serve(ln));
+        }
+        let name = tmp_name("t-clamp");
+        let mut c = Client::connect(&path);
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "cl");
+        c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, &name, &tail));
+        c.expect(Op::ATTACHED, 5);
+        c.expect(Op::REPLAY_DONE, 5);
+        // 合法 RESIZE 生效（基线）
+        c.send(Op::RESIZE, &frames::enc_resize(120, 40));
+        let v = poll_list_until(&path, |v| v["sessions"][0]["cols"].as_u64() == Some(120), 5);
+        assert_eq!(
+            (v["sessions"][0]["cols"].as_u64(), v["sessions"][0]["rows"].as_u64()),
+            (Some(120), Some(40))
+        );
+        // F1b：RESIZE 0×0 ⇒ 忽略本次上报（等忽略计数落地后断言几何保持；修复前 = 0×0）
+        c.send(Op::RESIZE, &frames::enc_resize(0, 0));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let n = svc.lock_state().sessions.get(&name).map(|rt| rt.zero_resize_ignored).unwrap_or(0);
+            if n > 0 {
+                break;
+            }
+            assert!(Instant::now() < deadline, "0×0 上报未被处理（忽略计数未增）");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let v = poll_list_until(&path, |_| true, 5);
+        assert_eq!(
+            (v["sessions"][0]["cols"].as_u64(), v["sessions"][0]["rows"].as_u64()),
+            (Some(120), Some(40)),
+            "0×0 不得改会话几何（F1b）"
+        );
+        // F1a：极端 RESIZE ⇒ 夹取 1000×500（修复前会原样进 alacritty ⇒ 96 GiB 起分配）
+        c.send(Op::RESIZE, &frames::enc_resize(u16::MAX, u16::MAX));
+        let v = poll_list_until(&path, |v| v["sessions"][0]["cols"].as_u64() == Some(1000), 5);
+        assert_eq!(
+            (v["sessions"][0]["cols"].as_u64(), v["sessions"][0]["rows"].as_u64()),
+            (Some(1000), Some(500))
+        );
+        {
+            let st = svc.lock_state();
+            let rt = st.sessions.get(&name).expect("会话在");
+            assert_eq!(rt.vt.as_ref().unwrap().size(), (1000, 500), "vt 几何跟随夹取");
+            assert_eq!((rt.size().cols(), rt.size().rows()), (1000, 500), "环 epoch 跟随");
+        }
+        c.send(Op::DATA, b"CLAMP-OK");
+        let got = c.drain_data_until(|d| has_bytes(&window_bytes(d), b"CLAMP-OK"), 8);
+        assert!(has_bytes(&window_bytes(&got), b"CLAMP-OK"), "夹取后会话仍可用");
+        // 夹取日志（只在真夹取时打——重复上报不刷屏）
+        let logs = lines.lock().unwrap().join("\n");
+        assert!(logs.contains("尺寸夹取 65535x65535 → 1000x500"), "夹取日志：{logs}");
+        // F1a：HELLO 极端尺寸同样夹取（ATTACHED 即报夹取后的几何）
+        let name2 = tmp_name("t-clamp2");
+        let mut c2 = Client::connect(&path);
+        let tail2 = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "cl2");
+        c2.send(Op::HELLO, &frames::enc_hello(u16::MAX, u16::MAX, hello_flags::CREATE, &name2, &tail2));
+        let f = c2.expect(Op::ATTACHED, 5);
+        let (cols, rows, _m, _a, _s, _n) = frames::dec_attached(&f.payload).unwrap();
+        assert_eq!((cols, rows), (1000, 500), "HELLO 极端尺寸夹取（F1a）");
+        drop(c2);
+        svc.close();
+    }
+
+    /// F3 集成：焦点 nudge 走每会话 PTY 注入队列——首腿 focus-in 先于末腿 focus-out
+    /// （顺序 = 状态迁移序），锁内不写 PTY（写由 response_writer_loop 在锁外做）。
+    #[test]
+    fn focus_nudge_queue_order() {
+        let marker = std::env::temp_dir().join(tmp_name("hwterm-nudge"));
+        let _ = std::fs::remove_file(&marker);
+        // 子进程：先开 ?1004（扫描器从输出解析 FOCUS 位），再关 canonical/echo 把收到的
+        // PTY 注入原样落盘（\x1b[I / \x1b[O 都无换行，canonical 下不会落盘）
+        let cmd = format!("printf '\\033[?1004h'; stty -icanon -echo; cat > {}", marker.display());
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let cfg = TermConfig { shell: Some(cmd), ..TermConfig::default() };
+        let svc = svc_with(cfg, Arc::clone(&lines));
+        let (ln, path) = start_listener();
+        {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || svc.serve(ln));
+        }
+        let name = tmp_name("t-nudge");
+        let read_marker = |p: &std::path::Path| std::fs::read(p).unwrap_or_default();
+        // 先建会话（不接入）：等子进程吐出 ?1004 被扫描器吃进 modes——首腿 attach 的
+        // focus-in 判据必须在写者到达 nudge 点**之前**就位（否则竞态漏注入）
+        let mut c0 = Client::connect(&path);
+        c0.send(Op::CREATE, &frames::enc_create(0, &name));
+        c0.expect(Op::OK, 5);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let focus_on = {
+                let st = svc.lock_state();
+                st.sessions
+                    .get(&name)
+                    .is_some_and(|rt| rt.scan.modes() & super::super::codec::mode_bits::FOCUS != 0)
+            };
+            if focus_on {
+                break;
+            }
+            assert!(Instant::now() < deadline, "?1004 未被扫描器识别");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "n1");
+        let mut a = Client::connect(&path);
+        a.send(Op::HELLO, &frames::enc_hello(80, 24, 0, &name, &tail));
+        a.expect(Op::ATTACHED, 5);
+        a.expect(Op::REPLAY_DONE, 5);
+        // 首腿 focus-in（回放后注入）→ 落盘
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !read_marker(&marker).windows(3).any(|w| w == b"\x1b[I") {
+            assert!(
+                Instant::now() < deadline,
+                "focus-in 未到 PTY（落盘：{:?}）",
+                String::from_utf8_lossy(&read_marker(&marker))
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // 第二条腿（非首腿 ⇒ 无 focus-in）→ 摘 A（非末腿 ⇒ 无 focus-out）→ 摘 B（末腿 ⇒ focus-out）
+        let mut b = Client::connect(&path);
+        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "n2");
+        b.send(Op::HELLO, &frames::enc_hello(80, 24, 0, &name, &tail_b));
+        b.expect(Op::ATTACHED, 5);
+        b.expect(Op::REPLAY_DONE, 5);
+        drop(a);
+        std::thread::sleep(Duration::from_millis(200));
+        drop(b);
+        let deadline = Instant::now() + Duration::from_secs(8);
+        while !read_marker(&marker).windows(3).any(|w| w == b"\x1b[O") {
+            assert!(
+                Instant::now() < deadline,
+                "focus-out 未到 PTY（落盘：{:?}）",
+                String::from_utf8_lossy(&read_marker(&marker))
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let data = read_marker(&marker);
+        let i = data.windows(3).position(|w| w == b"\x1b[I").expect("I 在");
+        let o = data.windows(3).position(|w| w == b"\x1b[O").expect("O 在");
+        assert!(i < o, "注入顺序 = 状态迁移序（focus-in 先于 focus-out）");
+        assert_eq!(data.windows(3).filter(|w| *w == b"\x1b[I").count(), 1, "首腿恰一次 focus-in");
+        svc.close();
+        let _ = std::fs::remove_file(&marker);
+    }
+
+    /// F7 注入：pump panic ⇒ 进程存活 + 会话收尾（ENDED 达）+ 日志含「线程 panic（已兜住）」。
+    #[test]
+    fn pump_panic_finalizes_session() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let cfg = TermConfig { shell: Some("cat".into()), ..TermConfig::default() };
+        let svc = svc_with(cfg, Arc::clone(&lines));
+        let (ln, path) = start_listener();
+        {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || svc.serve(ln));
+        }
+        let name = tmp_name("t-ppanic");
+        panic_inject::arm(ThreadRole::Pump, &name);
+        let mut c = Client::connect(&path);
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "pp");
+        c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, &name, &tail));
+        c.expect(Op::ATTACHED, 5);
+        c.expect(Op::REPLAY_DONE, 5);
+        c.send(Op::DATA, b"x"); // 触发 pump 首次读 ⇒ 注入 panic
+        let f = c.expect(Op::ENDED, 10);
+        let (code, _) = frames::dec_ended(&f.payload);
+        assert_eq!(code, -1, "pump 主动收尾：wait_bounded 超时 SIGKILL ⇒ 信号死 -1");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !lines.lock().unwrap().iter().any(|l| l.contains("term-pump 线程 panic（已兜住）")) {
+            assert!(Instant::now() < deadline, "兜住日志缺失：{:?}", lines.lock().unwrap());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        // 会话出表（不留僵尸）；服务仍可用
+        poll_list_until(&path, |v| v["sessions"].as_array().is_some_and(|a| a.is_empty()), 8);
+        svc.close();
+    }
+
+    /// F7 注入：leg writer panic ⇒ 只断该腿（裸断），会话存活可再接入。
+    #[test]
+    fn leg_writer_panic_breaks_leg_only() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let cfg = TermConfig { shell: Some("cat".into()), ..TermConfig::default() };
+        let svc = svc_with(cfg, Arc::clone(&lines));
+        let (ln, path) = start_listener();
+        {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || svc.serve(ln));
+        }
+        let name = tmp_name("t-lw");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "lw1");
+        let mut a = Client::connect(&path);
+        a.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, &name, &tail));
+        a.expect(Op::ATTACHED, 5);
+        a.expect(Op::REPLAY_DONE, 5);
+        // 给 B 的写者线程入口埋雷（A 的写者已过入口）
+        panic_inject::arm(ThreadRole::LegWriter, &name);
+        let mut b = Client::connect(&path);
+        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "lw2");
+        b.send(Op::HELLO, &frames::enc_hello(80, 24, 0, &name, &tail_b));
+        // B 不会收到 ATTACHED（写者入口即 panic ⇒ 裸断）；等兜住日志 + 腿数回落
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !lines.lock().unwrap().iter().any(|l| l.contains("term-leg-writer 线程 panic（已兜住）")) {
+            assert!(Instant::now() < deadline, "兜住日志缺失：{:?}", lines.lock().unwrap());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let v = poll_list_until(
+            &path,
+            |v| v["sessions"][0]["clients"].as_array().is_some_and(|a| a.len() == 1),
+            5,
+        );
+        assert_eq!(v["sessions"].as_array().map(Vec::len), Some(1), "会话存活");
+        assert!(
+            lines.lock().unwrap().iter().any(|l| l.contains("原因=panicked")),
+            "腿断开归因 panicked：{:?}",
+            lines.lock().unwrap()
+        );
+        // 会话仍可接入新腿（写者计数回收正确——否则收尾时运行态永驻）
+        let mut c = Client::connect(&path);
+        let tail_c = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "lw3");
+        c.send(Op::HELLO, &frames::enc_hello(80, 24, 0, &name, &tail_c));
+        c.expect(Op::ATTACHED, 5);
+        c.expect(Op::REPLAY_DONE, 5);
+        drop(c);
+        drop(b);
+        drop(a);
+        svc.close();
+    }
+
+    /// F7（代码门 A2）：采样**整拍**（锁外 `read_procs`/记账）panic 也不得停摆服务级线程
+    /// ——tick 级注入（键 = 空会话名）命中两次即证明循环存活。
+    #[test]
+    fn sample_tick_panic_keeps_loop_alive() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let svc = svc_with(TermConfig::default(), Arc::clone(&lines));
+        let count_line = |lines: &Arc<Mutex<Vec<String>>>| -> usize {
+            lines.lock().unwrap().iter().filter(|l| l.contains("term-sample 线程 panic（已兜住）")).count()
+        };
+        let key = svc.tick_inject_key();
+        panic_inject::arm(ThreadRole::Sample, &key);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while count_line(&lines) < 1 {
+            assert!(Instant::now() < deadline, "tick 级兜住日志缺失：{:?}", lines.lock().unwrap());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        panic_inject::arm(ThreadRole::Sample, &key);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while count_line(&lines) < 2 {
+            assert!(Instant::now() < deadline, "tick 级 panic 后循环停摆（第二轮未命中）");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        svc.close();
+    }
+
+    /// F7 注入：sample panic ⇒ 只跳该会话本拍（采样线程继续，其余会话不受影响）。
+    #[test]
+    fn sample_panic_skips_only_that_session() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let svc = svc_with(TermConfig::default(), Arc::clone(&lines));
+        let (ln, path) = start_listener();
+        {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || svc.serve(ln));
+        }
+        let n1 = tmp_name("t-sp1");
+        let n2 = tmp_name("t-sp2");
+        for n in [&n1, &n2] {
+            let mut c = Client::connect(&path);
+            c.send(Op::CREATE, &frames::enc_create(0, n));
+            c.expect(Op::OK, 5);
+        }
+        panic_inject::arm(ThreadRole::Sample, &n1);
+        let count_line = |lines: &Arc<Mutex<Vec<String>>>| -> usize {
+            lines.lock().unwrap().iter().filter(|l| l.contains("term-sample 线程 panic（已兜住）")).count()
+        };
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while count_line(&lines) < 1 {
+            assert!(Instant::now() < deadline, "采样兜住日志缺失：{:?}", lines.lock().unwrap());
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // 再埋一次 ⇒ 第二轮仍被命中（采样循环没有停摆）
+        panic_inject::arm(ThreadRole::Sample, &n1);
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while count_line(&lines) < 2 {
+            assert!(Instant::now() < deadline, "第二轮采样未继续（循环停摆）");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // 两个会话都还在
+        poll_list_until(&path, |v| v["sessions"].as_array().is_some_and(|a| a.len() == 2), 5);
+        svc.close();
+    }
+
+    /// 轮询 LIST 直到谓词命中（LIST 一锤子——每轮新连接；超时 panic 带现场）。
+    fn poll_list_until(path: &std::path::Path, pred: impl Fn(&serde_json::Value) -> bool, secs: u64) -> serde_json::Value {
+        let deadline = Instant::now() + Duration::from_secs(secs);
+        loop {
+            let mut c = Client::connect(path);
+            c.send(Op::LIST, &[]);
+            let f = c.expect(Op::LIST, 5);
+            let v: serde_json::Value = serde_json::from_slice(&f.payload).unwrap();
+            if pred(&v) {
+                return v;
+            }
+            assert!(Instant::now() < deadline, "LIST 谓词超时：{v}");
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 
     /// 找子串的窗口（回放流里 PTY 字节可能跨 DATA 帧分片——拼接后再找）。

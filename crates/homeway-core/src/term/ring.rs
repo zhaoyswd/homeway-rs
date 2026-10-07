@@ -5,6 +5,8 @@
 //! `start = written - min(written, cap)` 是最旧可用字节。回放起点选择：
 //! 尾部优先（回放上限）→ 行边界 → ESC 起点 → 原样；epoch 表（≤64）记尺寸变化点。
 
+use super::size::Size;
+
 /// 起点对齐时最多前看的字节数。
 pub const REPLAY_TRIM: usize = 4096;
 
@@ -12,8 +14,8 @@ pub const REPLAY_TRIM: usize = 4096;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Epoch {
     pub off: u64,
-    pub cols: u16,
-    pub rows: u16,
+    /// 变化后的尺寸（已归一——类型保证非 0 且在限内）。
+    pub size: Size,
 }
 
 /// 回放起点的「尺寸变化策略」。
@@ -97,9 +99,9 @@ impl OutputRing {
         out
     }
 
-    /// 记一次尺寸变化（同时进 epoch 表；超 64 截旧）。
-    pub fn note_size(&mut self, cols: u16, rows: u16) {
-        self.epochs.push(Epoch { off: self.written, cols, rows });
+    /// 记一次尺寸变化（同时进 epoch 表；超 64 截旧）。入参已归一（[`Size`]）。
+    pub fn note_size(&mut self, size: Size) {
+        self.epochs.push(Epoch { off: self.written, size });
         if self.epochs.len() > 64 {
             let drop = self.epochs.len() - 64;
             self.epochs.drain(..drop);
@@ -147,6 +149,10 @@ impl OutputRing {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn sz(cols: u16, rows: u16) -> Size {
+        Size::normalized(cols, rows)
+    }
 
     #[test]
     fn ring_append_read_wraparound() {
@@ -205,7 +211,7 @@ mod tests {
     fn replay_start_tail_window_and_epoch() {
         let mut r = OutputRing::new(1024);
         r.append(&[b'x'; 600]);
-        r.note_size(100, 32); // epoch @600
+        r.note_size(sz(100, 32)); // epoch @600
         r.append(&[b'y'; 100]);
         // 尾部窗口 50：起点 = 700-50，truncated
         let (start, trunc) = r.replay_start(50, ReplayEpoch::Whole);
@@ -226,12 +232,12 @@ mod tests {
     fn epochs_table_caps_at_64() {
         let mut r = OutputRing::new(1024);
         for i in 0..80 {
-            r.note_size(80 + i as u16, 24);
+            r.note_size(sz(80 + i as u16, 24));
             r.append(b"z");
         }
         assert_eq!(r.epochs.len(), 64);
         // 最旧的被截掉：首条 epoch 的 off = 第 16 次变化（=16 字节处）
         assert_eq!(r.epochs[0].off, 16);
-        assert_eq!(r.epochs[0].cols, 96);
+        assert_eq!(r.epochs[0].size.cols(), 96);
     }
 }

@@ -20,6 +20,7 @@
 //! - [`pty`]：会话子进程装配（登录 shell 解析链/环境白名单/spawn/resize/尺寸哨兵/
 //!   SIGHUP→SIGKILL）；
 //! - [`ring`]：有界输出环（定长环/绝对偏移读/回放起点对齐/epoch 表）；
+//! - [`size`]：网格尺寸值对象（非 0 + 上限 1000×500 的不变量进类型——P0-3 夹取面）；
 //! - [`session`]：会话注册表与腿接入语义（多腿注册序/ENDED 词表应用/活动选举；
 //!   纯状态机——PTY/泵/写者接线在 6f）；
 //! - 其余模块（service/leg/surface——会话装配与投递编排）按拆步 6f-3b 陆续就位。
@@ -38,6 +39,7 @@ pub mod responder;
 pub mod ring;
 pub mod scan;
 pub mod service;
+pub mod size;
 pub mod vt;
 pub mod wire;
 

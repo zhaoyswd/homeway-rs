@@ -10,7 +10,8 @@
 #   5. tools/check-vocab.sh               词表三方门
 #   6. cargo build --release -p homeway-cli           smoke 前置（G-10）
 #   7. tools/matrix.sh --smoke            RRR 基础段冒烟
-# 全量档：--full 加 cargo test --ignored（fuzz_replay 9 目标 × 100k）。
+# 全量档：--full 加 cargo test --ignored（fuzz_replay **12** 目标 × 100k；Q-D 批新增
+# ⑫⑬⑭ term 面——codec 目标带自产网格往返，全量档预计 **+2-4 min**）。
 # 预算（实测口径，2026-10-07 Q-A 修订）：**冒烟档快步 ≈399s ≈ 6.6 分钟**（R5-5f 收口
 # 实测值，热 target）；**冷构建首轮显著更长**（依赖全量编译，未见分钟级上界）。另：
 # 第 7 步依赖 bin/homeway-go（bin 为 gitignore）——干净 clone 先
@@ -29,7 +30,7 @@ echo "==> [1/7] 基线门（check-baseline.sh）"
 echo "==> [2/7] 单测 + 集成测试（fuzz_replay 全量档跳过）"
 (cd "$REPO_ROOT" && cargo test --workspace) || fail 2 "cargo test"
 if (( FULL )); then
-  echo "  --full：fuzz_replay 全量档（9 目标 × 100k）+ 性能 harness（串行——R8-3 r2-5.1："
+  echo "  --full：fuzz_replay 全量档（12 目标 × 100k；term 三目标 +2-4 min）+ 性能 harness（串行——R8-3 r2-5.1："
   echo "        ignored 面含墙钟令牌续水的性能臂，并行跑互相拖拍频会把批形态打歪、硬门随机红）"
   (cd "$REPO_ROOT" && cargo test --workspace --ignored -- --test-threads=1) || fail 2 "fuzz_replay"
 fi

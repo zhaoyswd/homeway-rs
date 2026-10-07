@@ -64,6 +64,15 @@ impl Default for LegOut {
 }
 
 impl LegOut {
+    /// 锁获取（中毒恢复口径统一，F7③）：持锁线程 panic 后队列状态可能半更新——
+    /// **可接受的不一致面 + 处置保守**（例：`enqueue` 的 `qbytes += len` 与
+    /// `push_back` 之间 panic 会让 `qbytes` 永久漂移；现实无 panic 点——分配失败是
+    /// abort），后果 = 该腿持续「超限入队失败 → needSnapshot」，处置路径保守（断腿/全量），
+    /// 而不是让整个 term 面级联崩溃。
+    fn lock(&self) -> std::sync::MutexGuard<'_, OutState> {
+        self.st.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     pub fn new() -> Self {
         LegOut {
             st: Mutex::new(OutState {
@@ -89,7 +98,7 @@ impl LegOut {
     /// 入队一帧。surface 腿受 `cap_bytes`（>0）封顶——超限返回 false（调用方
     /// 标记需全量）；raw 腿控制帧传 0（latest-wins 通道，不会堆积）。收尾后一律拒绝。
     pub fn enqueue(&self, it: WriteItem, cap_bytes: usize) -> bool {
-        let mut st = self.st.lock().expect("legout");
+        let mut st = self.lock();
         if st.closed_for_prod {
             return false;
         }
@@ -109,7 +118,7 @@ impl LegOut {
             return true;
         }
         let total: usize = items.iter().map(|i| i.payload.len()).sum();
-        let mut st = self.st.lock().expect("legout");
+        let mut st = self.lock();
         if st.closed_for_prod {
             return false;
         }
@@ -125,7 +134,7 @@ impl LegOut {
 
     /// 入队 STATE 帧（latest-wins：丢掉还在排队的旧 STATE——状态只有最新值有意义）。
     pub fn enqueue_state(&self, it: WriteItem) {
-        let mut st = self.st.lock().expect("legout");
+        let mut st = self.lock();
         if st.closed_for_prod {
             return;
         }
@@ -146,7 +155,7 @@ impl LegOut {
 
     /// 安排收尾帧（ENDED）：写者排空队列后发出、再关 conn。
     pub fn finish_ended(&self, ended: WriteItem) {
-        let mut st = self.st.lock().expect("legout");
+        let mut st = self.lock();
         st.closed_for_prod = true;
         st.tail = Tail::Ended(ended.payload);
         drop(st);
@@ -155,7 +164,7 @@ impl LegOut {
 
     /// 立即收尾（不发 ENDED）：排空即关。
     pub fn finish_quit(&self) {
-        let mut st = self.st.lock().expect("legout");
+        let mut st = self.lock();
         st.closed_for_prod = true;
         st.tail = Tail::Quit;
         drop(st);
@@ -164,7 +173,7 @@ impl LegOut {
 
     /// ENDED 载荷（breakLeg 后调用方直发用；无收尾帧返回 None）。
     pub fn ended_payload(&self) -> Option<Vec<u8>> {
-        match &self.st.lock().expect("legout").tail {
+        match &self.lock().tail {
             Tail::Ended(p) => Some(p.clone()),
             _ => None,
         }
@@ -172,13 +181,13 @@ impl LegOut {
 
     /// 是否已安排收尾（ENDED 或 QUIT）。
     pub fn is_finishing(&self) -> bool {
-        self.st.lock().expect("legout").closed_for_prod
+        self.lock().closed_for_prod
     }
 
     /// 取走待发队列；ENDED 只在队列排空时交出（保证 ENDED 之前不再插帧）。
     /// 返回 (items, ended_payload, quit)。
     pub fn take(&self) -> (Vec<WriteItem>, Option<Vec<u8>>, bool) {
-        let mut st = self.st.lock().expect("legout");
+        let mut st = self.lock();
         if matches!(st.tail, Tail::Quit) {
             return (Vec::new(), None, true);
         }
@@ -195,16 +204,16 @@ impl LegOut {
 
     /// 阻塞等新事件（队列空时）。带超时轮询上限（服务关停位的检查节拍）。
     pub fn wait(&self, max: Duration) {
-        let st = self.st.lock().expect("legout");
+        let st = self.lock();
         if !st.queue.is_empty() || !matches!(st.tail, Tail::None) {
             return;
         }
-        let _ = self.wake.wait_timeout(st, max).expect("legout");
+        let _ = self.wake.wait_timeout(st, max).unwrap_or_else(|e| e.into_inner());
     }
 
     /// 记一次写停滞/恢复；返回停滞是否已连续超过 limit（= 该断腿了）。
     pub fn note_stall(&self, stalled: bool, limit: Duration) -> bool {
-        let mut st = self.st.lock().expect("legout");
+        let mut st = self.lock();
         if stalled {
             let since = *st.stalled_since.get_or_insert_with(Instant::now);
             st.stalled_since = Some(since);
@@ -214,14 +223,21 @@ impl LegOut {
         false
     }
 
+    /// 实时停滞快照（F4）：单次持锁取 `(是否停滞, 已停滞时长)`——消
+    /// `is_stalled().then(stalled_for)` 两次取锁的 TOCTOU；未停滞返回 None。
+    /// 淘汰排序的**唯一真源**（Go `evictForSlotLocked` 读实时 `isStalled/stalledFor` 同义）。
+    pub fn stalled_snapshot(&self) -> Option<Duration> {
+        self.lock().stalled_since.map(|s| s.elapsed())
+    }
+
     /// 当前是否停滞（上限淘汰策略用）。
     pub fn is_stalled(&self) -> bool {
-        self.st.lock().expect("legout").stalled_since.is_some()
+        self.lock().stalled_since.is_some()
     }
 
     /// 已停滞多久（淘汰排序用；未停滞 = 0）。
     pub fn stalled_for(&self) -> Duration {
-        match self.st.lock().expect("legout").stalled_since {
+        match self.lock().stalled_since {
             Some(s) => s.elapsed(),
             None => Duration::ZERO,
         }
@@ -276,6 +292,38 @@ mod tests {
         out.finish_quit();
         let (_, _, quit) = out.take();
         assert!(quit);
+    }
+
+    /// F7③：毒锁恢复——持锁线程 panic 后队列仍可用（其余调用不级联崩溃）。
+    #[test]
+    fn poisoned_lock_recovers() {
+        use std::sync::Arc;
+        let out = Arc::new(LegOut::new());
+        let o2 = Arc::clone(&out);
+        let h = std::thread::spawn(move || {
+            let _g = o2.st.lock().unwrap();
+            panic!("poison");
+        });
+        assert!(h.join().is_err(), "持锁线程 panic");
+        assert!(out.enqueue(item(Op::DATA, 3), 0), "毒锁恢复后仍可入队");
+        let (items, _, _) = out.take();
+        assert_eq!(items.len(), 1);
+        assert!(!out.is_stalled());
+        out.finish_quit();
+        let (_, _, quit) = out.take();
+        assert!(quit);
+    }
+
+    /// F4：单次持锁的停滞快照（TOCTOU 消除版）；未停滞 = None。
+    #[test]
+    fn stalled_snapshot_single_lock() {
+        let out = LegOut::new();
+        assert!(out.stalled_snapshot().is_none(), "未停滞 ⇒ None");
+        assert!(!out.note_stall(true, Duration::from_secs(60)));
+        let d = out.stalled_snapshot().expect("停滞中 ⇒ Some");
+        assert!(d < Duration::from_secs(60));
+        assert!(!out.note_stall(false, Duration::from_secs(60)));
+        assert!(out.stalled_snapshot().is_none(), "恢复 ⇒ None");
     }
 
     /// 停滞记账：超限判定 + 恢复清零。

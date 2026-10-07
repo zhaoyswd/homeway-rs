@@ -162,12 +162,27 @@ pub fn surface_modes_of(m: &vt::Modes) -> (u32, u8, u8) {
 // ---------------------------------------------------------------------------
 
 /// 格流标记字节。
-mod marker {
+///
+/// `SYM_LEN_MASK` 是**代码级单一真源**（F5）：编码侧长度域 7 位、解码侧同掩码；
+/// `vt::cell_of` 也直接引用本常量做截断——注释不是真源，常量是。
+pub(crate) mod marker {
     pub const BLANK_RUN: u8 = 0x00;
     pub const CELL: u8 = 0x01;
     pub const REPEAT: u8 = 0x02;
     pub const SYM_LEN_MASK: u8 = 0x7f;
     pub const CELL_SKIP_BIT: u8 = 0x80;
+}
+
+/// 按 UTF-8 边界取 `s` 的 ≤`max` 字节前缀（F5：截断绝不落在半个码点中间）。
+pub(crate) fn symbol_prefix(s: &str, max: usize) -> &str {
+    if s.len() <= max {
+        return s;
+    }
+    let mut n = max;
+    while n > 0 && !s.is_char_boundary(n) {
+        n -= 1;
+    }
+    &s[..n]
 }
 
 /// 颜色 kind（与 vt::Color 的 wire 形态一一对应）。
@@ -250,9 +265,31 @@ fn append_row_cells(out: &mut Vec<u8>, cells: &[vt::Cell]) {
     flush_repeat(out, &mut repeat_run);
 }
 
+/// 编一格（`[hdr][symbol][fg][bg][attr]`；hdr 低 7 位 = symbol 字节长，bit7 = skip）。
+///
+/// **副门（F5）**：symbol 超 `SYM_LEN_MASK`（=127 B）时按 UTF-8 边界截断 + debug 期
+/// `debug_assert!(false)` 可闻（上游 `vt::cell_of` 已截断，走到这里说明不变量破了）。
+/// release/cargo-fuzz（`debug_assertions` 关闭）下仍保正确性——线协议绝不能出
+/// 长度域回绕的错位帧；运行时哨兵由 fuzz 目标 `fuzz_term_vt` 的
+/// 「`dirty_rows()` 每格 `symbol.len() <= 127`」断言兜。
 fn append_cell(out: &mut Vec<u8>, c: &vt::Cell) {
     let sym = c.symbol.as_bytes();
-    let mut hdr = (sym.len() & 0x7f) as u8;
+    if sym.len() > marker::SYM_LEN_MASK as usize {
+        debug_assert!(false, "cell symbol 超上限（{} B > 127）——上游应在 UTF-8 边界截断", sym.len());
+        append_cell_truncated(out, c);
+        return;
+    }
+    append_cell_exact(out, c, sym);
+}
+
+/// 超限格的截断写入（与快路径同字段序；单测直调——debug_assert 在 [`append_cell`] 主门）。
+fn append_cell_truncated(out: &mut Vec<u8>, c: &vt::Cell) {
+    let sym = symbol_prefix(&c.symbol, marker::SYM_LEN_MASK as usize).as_bytes();
+    append_cell_exact(out, c, sym);
+}
+
+fn append_cell_exact(out: &mut Vec<u8>, c: &vt::Cell, sym: &[u8]) {
+    let mut hdr = (sym.len() & marker::SYM_LEN_MASK as usize) as u8;
     if c.skip {
         hdr |= marker::CELL_SKIP_BIT;
     }
@@ -295,6 +332,7 @@ pub fn decode_grid(b: &[u8]) -> Result<(u16, u16, Vec<vt::Row>), CodecError> {
     }
     let cols = u16::from_le_bytes([b[1], b[2]]);
     let rows = u16::from_le_bytes([b[3], b[4]]);
+    guard_dims(cols as u64, rows as u64)?;
     let mut off = 5usize;
     let mut out = Vec::with_capacity(rows as usize);
     for _ in 0..rows {
@@ -312,6 +350,7 @@ pub fn decode_grid(b: &[u8]) -> Result<(u16, u16, Vec<vt::Row>), CodecError> {
 
 /// 解行序列（count = 行数；cols = 每格列数）。
 pub fn decode_rows(b: &[u8], count: usize, cols: usize) -> Result<Vec<vt::Row>, CodecError> {
+    guard_dims(cols as u64, count as u64)?;
     let mut out = Vec::with_capacity(count);
     let mut off = 0usize;
     for _ in 0..count {
@@ -325,6 +364,20 @@ pub fn decode_rows(b: &[u8], count: usize, cols: usize) -> Result<Vec<vt::Row>, 
         out.push(vt::Row { y, dirty: false, wraps: false, cells });
     }
     Ok(out)
+}
+
+/// 解码维度守卫（F10）：`cols ≤ Size::MAX_COLS` 且 `rows/count ≤ Size::MAX_ROWS ×
+/// (1 + MIRROR_VIEWPORTS)`。
+///
+/// 为什么必须有：`BLANK_RUN`/`REPEAT` 的 `min(n, cols-len)` 只挡「单行内跑长」，
+/// 挡不住「5 字节头 + 极短体 ⇒ 4.29e9 格」的放大（每个空行仍会 `Vec::with_capacity(cols)`
+/// 分配）——合法帧上界 = 编码侧上限 × 镜像倍数，本守卫只拒非法放大。
+fn guard_dims(cols: u64, rows: u64) -> Result<(), CodecError> {
+    let max_rows = (super::size::Size::MAX_ROWS as u64) * (1 + MIRROR_VIEWPORTS as u64);
+    if cols > super::size::Size::MAX_COLS as u64 || rows > max_rows {
+        return Err(CodecError::BadGrid("解码维度超上限"));
+    }
+    Ok(())
 }
 
 /// 解一段格流。返回 `(cells, 消费字节数)`。
@@ -789,11 +842,24 @@ pub fn gzip_bytes(p: &[u8]) -> Vec<u8> {
     enc.finish().expect("in-memory gzip")
 }
 
+/// 解压输出上限（F10）：防 gzip 炸弹（几十 KB 压出 GB 级）。
+///
+/// **与发送侧 `HOMEWAY_TERM_PENDING_CAP_BYTES` 解耦**（评审 8 小注）：那侧是运维可调的
+/// 单帧未压缩体上限（默认 4 MiB），本上限是**解码侧**独立的安全边界。口径说明：合法体
+/// 的理论最坏（`1000×5500` 格全带 127B 字素簇 ≈ 数百 MiB）实际不可达——发送侧
+/// `pending_cap` 门（默认 4 MiB）先一步把超大快照打回全量重试；若运维把 pending_cap
+/// 调到 >64 MiB，需同批复核本上限。
+pub const MAX_GUNZIP_OUT: usize = 64 << 20;
+
 /// 解压。
 pub fn gunzip_bytes(p: &[u8]) -> Result<Vec<u8>, CodecError> {
-    let mut dec = flate2::read::GzDecoder::new(p);
+    let dec = flate2::read::GzDecoder::new(p);
     let mut out = Vec::new();
-    dec.read_to_end(&mut out)?;
+    // take(上限+1) 才能区分「恰在上限」与「超限」（read_to_end 无界 = 炸弹面）
+    dec.take(MAX_GUNZIP_OUT as u64 + 1).read_to_end(&mut out)?;
+    if out.len() > MAX_GUNZIP_OUT {
+        return Err(CodecError::BadGrid("解压超上限"));
+    }
     Ok(out)
 }
 
@@ -1425,6 +1491,113 @@ mod tests {
         let style = testutil::fnv_hex(testutil::style_of(&rows, cols as usize).as_bytes());
         assert_eq!(text, row[5], "{}: 文本 digest", what);
         assert_eq!(style, row[15], "{}: 样式向量 digest", what);
+    }
+
+    /// F5②：含超长字素簇格的网格 encode → decode → 再 encode **字节相等**
+    /// （decode 会派生 width/wraps，结构体相等不可用作断言——评审 7.2）。
+    #[test]
+    fn surface_symbol_truncation_roundtrip() {
+        let mut vt = SessionVt::new(10, 3, 100).unwrap();
+        let mut seq = String::from("a");
+        for _ in 0..200 {
+            seq.push('\u{301}');
+        }
+        vt.write(seq.as_bytes());
+        let rows = vt.rows();
+        assert!(rows[0].cells[0].symbol.len() <= 127, "上游已截断");
+        let grid = encode_grid(10, 3, &rows);
+        let (cols, n, decoded) = decode_grid(&grid).expect("解码");
+        assert_eq!((cols, n as usize), (10, 3));
+        assert_eq!(encode_grid(cols, n, &decoded), grid, "往返字节相等（无错位）");
+    }
+
+    /// F5③：副门截断写入的字段对齐（手工 130 B symbol ⇒ 输出 ≤127+5 且颜色/属性字段
+    /// 紧跟在截断后的 symbol 之后）。
+    #[test]
+    fn append_cell_secondary_gate_alignment() {
+        let c = vt::Cell {
+            symbol: "x".repeat(130),
+            width: 1,
+            skip: false,
+            fg: vt::Color::Palette(5),
+            bg: vt::Color::None,
+            attr: 0x1234,
+        };
+        let mut out = Vec::new();
+        append_cell_truncated(&mut out, &c);
+        // hdr 1 + sym 127 + fg 2（kind+idx）+ bg 1（kind）+ attr 2
+        assert_eq!(out.len(), 1 + 127 + 2 + 1 + 2, "截断写入长度");
+        let (dec, n) = decode_cell(&out).expect("解码截断格");
+        assert_eq!(n, out.len(), "解码恰好耗尽（字段对齐）");
+        assert_eq!(dec.symbol.len(), 127);
+        assert_eq!(dec.fg, vt::Color::Palette(5));
+        assert_eq!(dec.bg, vt::Color::None);
+        assert_eq!(dec.attr, 0x1234);
+    }
+
+    /// F5 副门：debug/测试构建下超限 symbol 走 debug_assert（可闻预期）；
+    /// release 由 `append_cell_truncated` 保正确性（cargo-fuzz 的运行时哨兵见 fuzz_term_vt）。
+    #[test]
+    #[should_panic(expected = "cell symbol 超上限")]
+    fn append_cell_oversize_panics_in_debug() {
+        let row = Row {
+            y: 0,
+            dirty: false,
+            wraps: false,
+            cells: vec![vt::Cell { symbol: "x".repeat(130), width: 1, ..Default::default() }],
+        };
+        let _ = encode_rows(&[row]);
+    }
+
+    /// F10：解码维度守卫——伪造头（超大 cols/rows）返回 Err（形状断言，不只「不 OOM」）。
+    #[test]
+    fn decode_dims_guard_rejects_oversize() {
+        // cols = 0xffff（5 字节头 + 空体 ⇒ 旧实现会按 4.29e9 格放大）
+        let head = [CELL_CODEC_VERSION, 0xff, 0xff, 0x01, 0x00];
+        match decode_grid(&head) {
+            Err(CodecError::BadGrid(m)) => assert_eq!(m, "解码维度超上限"),
+            other => panic!("超限 cols 应被守卫拒：{other:?}"),
+        }
+        // rows 超镜像倍数上界（500 × (1+10) = 5500）
+        let head = [CELL_CODEC_VERSION, 0x01, 0x00, 0xff, 0xff];
+        match decode_grid(&head) {
+            Err(CodecError::BadGrid(m)) => assert_eq!(m, "解码维度超上限"),
+            other => panic!("超限 rows 应被守卫拒：{other:?}"),
+        }
+        // decode_rows：cols 参数与 count 同门
+        match decode_rows(&[], 1, (super::super::size::Size::MAX_COLS as usize) + 1) {
+            Err(CodecError::BadGrid(m)) => assert_eq!(m, "解码维度超上限"),
+            other => panic!("超限 cols 参数应被拒：{other:?}"),
+        }
+        match decode_rows(&[], 5501, 80) {
+            Err(CodecError::BadGrid(m)) => assert_eq!(m, "解码维度超上限"),
+            other => panic!("超限 count 应被拒：{other:?}"),
+        }
+        // 边界内合法：5500 行过守卫（体截断才报别的错——证明不是守卫误伤）
+        match decode_rows(&[], 5500, 1) {
+            Err(CodecError::BadGrid(m)) => assert_eq!(m, "行号截断"),
+            other => panic!("合法维度应过守卫（体截断报错）：{other:?}"),
+        }
+    }
+
+    /// F10：gzip 炸弹（高压缩比 > 64 MiB 输出）⇒ Err（上限 +1 才能区分恰满与超限）。
+    #[test]
+    fn gunzip_bomb_rejected() {
+        use std::io::Read as _;
+        let mut enc = flate2::read::GzEncoder::new(
+            std::io::repeat(0u8).take((MAX_GUNZIP_OUT + (4 << 20)) as u64),
+            flate2::Compression::new(9),
+        );
+        let mut bomb = Vec::new();
+        enc.read_to_end(&mut bomb).expect("压缩");
+        assert!(bomb.len() < 1 << 20, "炸弹压缩后应很小（实得 {} B）", bomb.len());
+        match gunzip_bytes(&bomb) {
+            Err(CodecError::BadGrid("解压超上限")) => {}
+            other => panic!("炸弹应被上限拒：{other:?}"),
+        }
+        // 上限内正常解压不受影响
+        let ok = gzip_bytes(b"ok-payload");
+        assert_eq!(gunzip_bytes(&ok).unwrap(), b"ok-payload");
     }
 
     /// 模式位/光标单一映射：全字段形态（位不重叠 + 形状枚举数值）。

@@ -73,3 +73,21 @@ name = "fuzz_upnp"
 path = "fuzz_targets/fuzz_upnp.rs"
 test = false
 doc = false
+
+[[bin]]
+name = "fuzz_term_frames"
+path = "fuzz_targets/fuzz_term_frames.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_term_vt"
+path = "fuzz_targets/fuzz_term_vt.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "fuzz_term_codec"
+path = "fuzz_targets/fuzz_term_codec.rs"
+test = false
+doc = false
