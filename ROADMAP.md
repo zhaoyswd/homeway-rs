@@ -85,7 +85,9 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
    `docs/reviews/AUDIT-2026-10-07.md` + `docs/REVIEW-ROADMAP.md`（跨批进度真源，含每批
    两道评审门的执行协议）。**Q-A（文档与治理对齐）已完成**（2026-10-07）；**Q-B（拦截层与
    出口数据面加固）已完成**（2026-10-07，设计门 + 代码门两轮 dsh 评审通过，提交 `9e37445` +
-   `0b37246` + `8a51c2a`，记录见 `docs/reviews/QB-design.md` / `QB.md`）；**Q-C…Q-J 等用户
+   `0b37246` + `8a51c2a`，记录见 `docs/reviews/QB-design.md` / `QB.md`）；**Q-C（入口安全与资源上限：
+   wtransport / 中继 / 设备表）已完成**（2026-10-07，两轮 dsh 评审通过，提交 `07e32ca` + `7f81285` +
+   `50ababa` + `181923e`，记录见 `docs/reviews/QC-design.md` / `QC.md`）；**Q-D…Q-J 等用户
    指令逐批开工**（建议顺序 Q-A → Q-B → … → Q-J，用户可重排）。
 3. **Q 批完成后**：本节随 `docs/REVIEW-ROADMAP.md` 状态总览同步更新（由该表指定下一批，
    本指针不再单列）。
