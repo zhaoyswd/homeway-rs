@@ -87,10 +87,14 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
    （Q-J 记录 = `docs/reviews/QJ.md`，设计 = `QJ-design.md`）。
 3. **Q 批之后的未开批（等用户指令）与待裁决**：`Q-F-B`（portfwd 实装监听器；交接真源 =
    `docs/reviews/QF.md` §7）+ `Q-I-DNS`（DNS TTL 缓存小批；取证与建议 = `docs/reviews/QIt.md` §7.1）；
-   Q-J 上报项：tier spec 偏离 5 条（含 A-any ↔ `exit-upnp-port-mapping` MUST 的 **opt-in 等价偏离**）、
-   App 需置 HELLO caps `KEY_ALT_ESC_PREFIX`、**A-any 与 tier MUST 的二选一裁决**——全部为用户触点
-   或 tier 侧动作，见 `docs/reviews/QJ.md` §6。此后新任务直接看 `docs/REVIEW-ROADMAP.md` 状态总览
-   与各批记录的「需上报项」节（本指针不再单列下一批）。
+   Q-J 上报项：tier spec 偏离 5 条、App 需置 HELLO caps `KEY_ALT_ESC_PREFIX`——全部为用户触点
+   或 tier 侧动作，见 `docs/reviews/QJ.md` §6。
+   **A-any ↔ tier `exit-upnp-port-mapping:32-35` MUST 的二选一已由主会话裁定（2026-10-08）= 选项①
+   「维持实现 + 登记为 opt-in 等价偏离 + 请 tier 确认」**——理由：该偏离已按本仓判据政策显式登记
+   （登记即合法），限定为「被路由器拒绝」子形态会把 `AddAnyPortMapping` 的主要收益削掉（端口被他人
+   占用时才是它最有用的场景），且 tier spec 是跨仓文档，正确动作是**知会 tier**（用户触点）而非
+   静默收窄实现。此后新任务直接看 `docs/REVIEW-ROADMAP.md` 状态总览与各批记录的「需上报项」节
+   （本指针不再单列下一批）。
 
 **B0-1 部署阻塞集修复（2026-10-05 完成，GAP-AUDIT P0-1 部署最小面/P0-2/P0-3/P1-2）**：
 v6 双栈族全链（钉卡两族 + 出口/客户端 socket 双栈化 + stun6 消费 + v6 公布判据行族 + token v6 条目）、
