@@ -158,13 +158,15 @@ mod tests {
     }
 
     /// F0 carve-out：空值两形态（等号形/空格形）返回空串（stun/stun6/relay/ddns 四站点共用）；
-    /// 非空值原样透传。
+    /// 非空值原样透传。Q-L L3 扩第五个站点（`bind-interface`，空 = auto）。
     #[test]
     fn empty_value_carveout_forms() {
         assert_eq!(take_value_empty_ok_or_exit("stun", Some(""), None), "");
         assert_eq!(take_value_empty_ok_or_exit("stun", None, Some("")), "");
         assert_eq!(take_value_empty_ok_or_exit("relay", None, Some("")), "");
         assert_eq!(take_value_empty_ok_or_exit("ddns", Some(""), None), "");
+        assert_eq!(take_value_empty_ok_or_exit("bind-interface", Some(""), None), "");
+        assert_eq!(take_value_empty_ok_or_exit("bind-interface", None, Some("")), "");
         assert_eq!(take_value_empty_ok_or_exit("stun6", Some("h:1"), None), "h:1");
         // 非 carve-out flag 的空值仍判 `Empty`（parser 站点据此 exit 2）
         assert_eq!(take_value(Some(""), None, false), Val::Empty);

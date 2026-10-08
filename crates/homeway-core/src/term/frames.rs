@@ -303,6 +303,12 @@ pub fn dec_greeting(p: &[u8]) -> Result<(u8, u32), FrameError> {
 }
 
 /// HELLO 载荷：`[cols:2LE][rows:2LE][flags:1][nameLen:1][name]` + 尾随块。
+///
+/// **nameLen 域（Q-L L5 判死，零行为加固注记）**：`name.len() as u8` 无钳制会静默截断/回绕，
+/// 但**仓内不可达**——会话名双侧 ≤64（CLI `term_cli.rs` `validate_name` + 服务端
+/// `service.rs` `valid_name`），且 Go 同形（`pkg/term/frames.go` `encHelloFlags` 的
+/// `p[5] = byte(len(name))` 亦无钳制，`termMaxNameLen=64` 只作用于 `encName`）⇒ 判死不做，
+/// 不加 `debug_assert`（收益为零、测试面误炸风险）。
 pub fn enc_hello(cols: u16, rows: u16, flags: u8, name: &str, tail: &[u8]) -> Vec<u8> {
     let mut p = Vec::with_capacity(6 + name.len() + tail.len());
     p.extend_from_slice(&cols.to_le_bytes());

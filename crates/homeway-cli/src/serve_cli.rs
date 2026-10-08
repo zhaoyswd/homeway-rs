@@ -410,6 +410,7 @@ fn serve_usage() {
     eprintln!("       [--relay rl1…|ip:port] [--peer-ttl 168h] [--max-peers N] [--public-endpoint ip:port,ip:port]");
     eprintln!("       [--dns-port P] [--files-root DIR] [--ddns 裸域名] [--verbose]");
     eprintln!("  --stun= / --stun6= / --relay= 空值 = 关（Go flag 空串同义，F0 carve-out）；");
+    eprintln!("  --bind-interface= 空值 = auto（Go ResolveBind(\"\") 同义，Q-L carve-out）；");
     eprintln!("  = 前台单出口（Ctrl-C 收工）；启停/查询用 `homeway-cli serve start|stop|restart|status|token`（控制面）。");
 }
 
@@ -455,7 +456,11 @@ fn parse_serve_flags(args: &[String]) -> Result<ServeFlags, CliErr> {
                 take_next(&mut adv);
             }
             "bind-interface" => {
-                f.bind_interface = Some(cli_flags::take_value_or_exit("bind-interface", inline, next, false));
+                // Q-L L3 carve-out（第五个）：`--bind-interface=`/`--bind-interface ""` 空值
+                // Go = auto（`ResolveBind("")` 先 TrimSpace 再判空 ⇒ `BindAuto`，
+                // `baseline/homeway/internal/server/cli.go:190-198`）——修前 Rust exit 2。
+                f.bind_interface =
+                    Some(cli_flags::take_value_empty_ok_or_exit("bind-interface", inline, next));
                 take_next(&mut adv);
             }
             "upnp" => {
@@ -735,15 +740,20 @@ pub fn assemble(args: &[String]) -> ServeConfig {
     }
 }
 
+/// `--bind-interface` 值 → 绑定模式（Go `ResolveBind` 同口径，`cli.go:190-207`）：
+/// **先 `TrimSpace` 再判**——空值/auto ⇒ `Auto`；none/off/no（大小写不敏感）⇒ `Off`；
+/// IP 字面量 ⇒ 单栈绑地址；其余按**网卡名**（保原大小写，只去首尾空白——Go
+/// `net.InterfaceByName(v)` 吃的是 trim 后的原串）⇒ `Explicit`（存在性在引擎运行期查，
+/// 找不到告警退回 auto，`engine.rs:309-338`）。
 fn parse_bind_iface(v: &str) -> BindMode {
-    match v {
-        "auto" => BindMode::Auto,
+    let t = v.trim();
+    match t.to_ascii_lowercase().as_str() {
+        // Go `ResolveBind("")` ⇒ BindAuto（Q-L L3：空值 carve-out 的落点）
+        "" | "auto" => BindMode::Auto,
         "none" | "off" | "no" => BindMode::Off,
-        // IP 字面量 = 单栈绑地址（Go `ResolveBind` 的 BindAddr 分支：历史上绕开
-        // Surge 抢路由的形态；无钉卡无看护）
-        other => match other.parse::<std::net::IpAddr>() {
+        _ => match t.parse::<std::net::IpAddr>() {
             Ok(ip) => BindMode::Addr(ip),
-            Err(_) => BindMode::Explicit(other.to_owned()),
+            Err(_) => BindMode::Explicit(t.to_owned()),
         },
     }
 }
@@ -1367,6 +1377,49 @@ mod tests {
         assert_eq!(cfg.stun, "", "显式空 stun = 关");
         assert!(cfg.ddns.is_empty(), "显式空 ddns = 清空 config 全部条目（Go 同义）");
         let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// Q-L L3：`--bind-interface=` 空值 carve-out（第五个）——Go `ResolveBind("")` 先
+    /// TrimSpace 再判空 ⇒ auto；同时钉 **trim/lowercase 枚举形态**（`" AUTO "`/`NONE`
+    /// 修前漂到 `Explicit` 打伪告警）与**网卡名保原大小写**（只去首尾空白——Go
+    /// `InterfaceByName(v)` 吃 trim 后的原串）。
+    #[test]
+    fn bind_interface_empty_and_enum_forms() {
+        // flag 层两形态空值都收（修前 exit 2）
+        let f = parse_serve_flags(&["--bind-interface=".to_owned()]).unwrap();
+        assert_eq!(f.bind_interface.as_deref(), Some(""));
+        let f = parse_serve_flags(&["--bind-interface".to_owned(), "".to_owned()]).unwrap();
+        assert_eq!(f.bind_interface.as_deref(), Some(""));
+        // 经 assemble_result 落 BindMode::Auto（flag 形态 + config 形态同 parse 层）
+        let d = tmp_state("bindempty");
+        let state = d.display().to_string();
+        let cfg = assemble_result(&[
+            "--state".to_owned(),
+            state.clone(),
+            "--bind-interface=".to_owned(),
+        ])
+        .expect("--bind-interface= 不得报错");
+        assert_eq!(cfg.bind_iface, BindMode::Auto, "空值 ⇒ auto（Go ResolveBind(\"\")）");
+        write_cfg(&d, "[serve]\nbind_interface = \"\"\n");
+        let cfg = assemble_result(&["--state".to_owned(), state]).unwrap();
+        assert_eq!(cfg.bind_iface, BindMode::Auto, "config 空串 ⇒ auto（不再打伪告警）");
+        let _ = std::fs::remove_dir_all(&d);
+        // 枚举形态：trim + 大小写不敏感（关键词判定用 lower）
+        assert_eq!(parse_bind_iface(""), BindMode::Auto);
+        assert_eq!(parse_bind_iface("  "), BindMode::Auto);
+        assert_eq!(parse_bind_iface(" AUTO "), BindMode::Auto);
+        assert_eq!(parse_bind_iface("NONE"), BindMode::Off);
+        assert_eq!(parse_bind_iface("Off"), BindMode::Off);
+        assert_eq!(parse_bind_iface("no"), BindMode::Off);
+        // 网卡名保原大小写（只去首尾空白）
+        assert_eq!(parse_bind_iface("en0"), BindMode::Explicit("en0".to_owned()));
+        assert_eq!(parse_bind_iface("en0 "), BindMode::Explicit("en0".to_owned()));
+        assert_eq!(parse_bind_iface(" EN0"), BindMode::Explicit("EN0".to_owned()));
+        // IP 字面量按 trim 后解析
+        assert_eq!(
+            parse_bind_iface(" 192.0.2.7 "),
+            BindMode::Addr("192.0.2.7".parse().unwrap())
+        );
     }
 
     /// F15：前台默认 state 与统一进程一致。

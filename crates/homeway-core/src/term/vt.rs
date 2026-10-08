@@ -17,6 +17,7 @@
 
 use alacritty_terminal::event::Event;
 use alacritty_terminal::event::EventListener;
+use alacritty_terminal::grid::Cursor as AlacGridCursor;
 use alacritty_terminal::grid::Dimensions;
 use alacritty_terminal::index::{Column, Line, Point};
 use alacritty_terminal::term::cell::{Cell as AlacCell, Flags as AlacFlags};
@@ -200,6 +201,14 @@ pub enum Dirty {
     Full,
 }
 
+/// 会话 vt 构造/改尺寸错误（仓规第 1 条：thiserror 类型；Display 文本与收敛前**逐字相同**
+/// ——`service.rs` 把 `{e}` 拼进会话日志行，见单测 `vt_error_display_verbatim`）。
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum VtError {
+    #[error("vt: 尺寸非法 {cols}x{rows}（须为 1..={}×1..={}）", Size::MAX_COLS, Size::MAX_ROWS)]
+    BadSize { cols: u16, rows: u16 },
+}
+
 /// 一个会话的服务端仿真器。
 pub struct SessionVt {
     term: Term<ClipSink>,
@@ -237,6 +246,12 @@ pub struct SessionVt {
     /// hook/put/unhook ⇒ 这两族在解析器里被静默丢弃；扫描器在喂入前按字节流识别，
     /// 尾巴 = 上一批结尾处「可能是模式前缀」的未决字节）。
     scan_tail: Vec<u8>,
+    /// 47/1047 进入备用屏前捕获的**主屏 DECSC 槽**（Q-L L2）：alacritty 的公开
+    /// `Term::swap_alt()` 在进入时会把主屏 `grid.saved_cursor` 覆盖成当前光标（那是
+    /// 1049 的实现痕迹），而 ghostty 的 47/1047 从不 `saveCursor`（`Terminal.zig:4800-4869`）。
+    /// 公开 API 只能写**活动** grid ⇒ 进入前捕获存本字段、退出切回主屏后还原
+    /// （设计门 B-2「进入前捕获、退出后还原」）。
+    alt47_saved_decsc: Option<AlacGridCursor<AlacCell>>,
     /// OSC 52 事件积压（`write_collecting` 内同步产生；会话层在喂入后取走处理）。
     clip_events: Arc<std::sync::Mutex<Vec<ClipEvt>>>,
 }
@@ -297,13 +312,9 @@ impl SessionVt {
     /// 分配**且无上限——实测 `65535×65535` ≈96 GiB 起（分配失败 = abort，不是 unwind），
     /// 所以这里**在发起分配之前**拒绝。会话层的 [`Size`] 已保证入参合法，本门是组件层的
     /// 兜底（测试/未来调用点直连时同样安全）。
-    pub fn new(cols: u16, rows: u16, scrollback: usize) -> Result<Self, String> {
+    pub fn new(cols: u16, rows: u16, scrollback: usize) -> Result<Self, VtError> {
         if !Size::is_exact(cols, rows) {
-            return Err(format!(
-                "vt: 尺寸非法 {cols}x{rows}（须为 1..={}×1..={}）",
-                Size::MAX_COLS,
-                Size::MAX_ROWS
-            ));
+            return Err(VtError::BadSize { cols, rows });
         }
         let scrollback = if scrollback == 0 { DEFAULT_SCROLLBACK_LINES } else { scrollback };
         let config = Config {
@@ -336,6 +347,7 @@ impl SessionVt {
             scroll_top: 0,
             scroll_bottom: rows as i32 - 1,
             scan_tail: Vec::new(),
+            alt47_saved_decsc: None,
             clip_events,
         })
     }
@@ -419,6 +431,7 @@ impl SessionVt {
             mouse_format: &mut self.mouse_format,
             scroll_top: &mut self.scroll_top,
             scroll_bottom: &mut self.scroll_bottom,
+            alt47_saved_decsc: &mut self.alt47_saved_decsc,
             responses,
         };
         self.processor.advance(&mut probe, bytes);
@@ -434,13 +447,9 @@ impl SessionVt {
     /// 改尺寸（含主屏回滚重排；备用屏不重排——alacritty 语义与 ghostty 一致）。
     /// 尺寸未变时空操作。行列变化 ⇒ `flushed` 指纹表整体重置（下拍 `update()` 仍会
     /// Full——resize 走全量路径）。入参走与 [`SessionVt::new`] 相同的硬拒门（F1a）。
-    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), String> {
+    pub fn resize(&mut self, cols: u16, rows: u16) -> Result<(), VtError> {
         if !Size::is_exact(cols, rows) {
-            return Err(format!(
-                "vt: 尺寸非法 {cols}x{rows}（须为 1..={}×1..={}）",
-                Size::MAX_COLS,
-                Size::MAX_ROWS
-            ));
+            return Err(VtError::BadSize { cols, rows });
         }
         let (cols, rows) = (cols as usize, rows as usize);
         if self.cols == cols && self.rows == rows {
@@ -1240,8 +1249,25 @@ struct TermProbe<'a, T> {
     mouse_format: &'a mut MouseFormat,
     scroll_top: &'a mut i32,
     scroll_bottom: &'a mut i32,
+    /// 47/1047 进入备用屏前捕获的主屏 DECSC 槽（Q-L L2；详见 [`SessionVt::alt47_saved_decsc`]）。
+    alt47_saved_decsc: &'a mut Option<AlacGridCursor<AlacCell>>,
     /// 本次 write 的应答分片（流中收集、批末由 [`SessionVt::write_collecting`] 投递）。
     responses: &'a mut Vec<Vec<u8>>,
+}
+
+impl<T: EventListener> TermProbe<'_, T> {
+    /// Q-L L2（代码门 高1）：还原捕获的主屏 DECSC 槽——**先按当前尺寸钳制**。捕获是跨
+    /// resize 的克隆（alacritty 的 `Grid::resize` 只钳制 grid 内的 `cursor`/`saved_cursor`），
+    /// 缩小后把未钳制的点写回会让后续 `ESC 8`（`restore_cursor_position` → `damage_cursor`）
+    /// 越界 panic；ghostty `restoreCursor` 同为钳制口径（`Terminal.zig:2045-2048`）。
+    fn restore_alt47_saved_decsc(&mut self) {
+        let Some(mut saved) = self.alt47_saved_decsc.take() else { return };
+        let max_line = self.term.screen_lines().saturating_sub(1) as i32;
+        let max_col = self.term.columns().saturating_sub(1);
+        saved.point.line = Line(saved.point.line.0.min(max_line));
+        saved.point.column = Column(saved.point.column.0.min(max_col));
+        self.term.grid_mut().saved_cursor = saved;
+    }
 }
 
 impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, T> {
@@ -1350,6 +1376,8 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
         *self.palette_mirror = [None; 256];
         *self.scroll_top = 0;
         *self.scroll_bottom = self.term.screen_lines() as i32 - 1;
+        // RIS 全复位（含 alacritty 的 `grid.reset()` 清 DECSC 槽）⇒ 47/1047 的捕获作废
+        *self.alt47_saved_decsc = None;
         self.term.reset_state();
     }
     #[inline]
@@ -1401,9 +1429,18 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
             match n {
                 9 => *self.mouse_tracking = MouseTracking::X10,
                 1015 => *self.mouse_format = MouseFormat::Urxvt,
-                47 | 1047 => {
-                    // B6 登记残余：alacritty 无公开 swap-alt API，备用屏内容面暂不可达
-                    // （wire Alt 位与 DECRQM 报告面已记账；真 TUI 多用 1049 不受影响）。
+                // Q-L L2：备用屏内容面（B6 登记残余收口）。ghostty 语义真源
+                // `Terminal.zig:4800-4869`：47/1047 = **真切屏**、不清屏、进出双向拷光标
+                // （1047 另有「退出时在 alt 上 eraseDisplay(complete)」——见 unset 分支）。
+                // vte 0.15 只把 1049 收进 `NamedPrivateMode`，47/1047 落 `PrivateMode::Unknown`
+                // 被 alacritty 忽略（`term/mod.rs:1936-1940`）⇒ 切屏由本分支驱动公开
+                // `Term::swap_alt()`（`term/mod.rs:714`）。
+                47 | 1047 if !self.term.mode().contains(TermMode::ALT_SCREEN) => {
+                    // alacritty 进入时会用当前光标覆盖主屏 `grid.saved_cursor`（DECSC 槽，
+                    // `term/mod.rs:723` 的 1049 痕迹）；ghostty 的 47/1047 从不 saveCursor
+                    // ⇒ 进入前捕获、退出后还原（见 unset 分支）。
+                    *self.alt47_saved_decsc = Some(self.term.grid().saved_cursor.clone());
+                    self.term.swap_alt(); // 公开 API：alt 光标 ← 主屏光标（ghostty 同向）
                 }
                 _ => {}
             }
@@ -1464,11 +1501,30 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
             match n {
                 9 => *self.mouse_tracking = MouseTracking::None,
                 1015 => *self.mouse_format = MouseFormat::Default,
+                // Q-L L2：47/1047 退出（ghostty `Terminal.zig:4800-4869`）——切回主屏 +
+                // 把 alt 的**整个光标**（含 SGR 样式；ghostty `cursorCopy` 除 hyperlink）
+                // 拷回主屏（两个方向都拷，不能只拷 point）。1047 的「退出前在 alt 上
+                // `eraseDisplay(complete)`」由 alacritty 下次进入时复位 alt 内容等价覆盖
+                // （`swap_alt` 进入分支 `reset_region`；alt 无回滚历史）——该等价性依赖
+                // 「进入即复位」这一登记差异（见 INTEROP-CRITERIA 已知口径注记）。
+                47 | 1047 if self.term.mode().contains(TermMode::ALT_SCREEN) => {
+                    let c = self.term.grid().cursor.clone();
+                    self.term.swap_alt();
+                    self.term.grid_mut().cursor = c;
+                    self.restore_alt47_saved_decsc();
+                }
                 _ => {}
             }
             self.dec_modes.set(n, false);
         }
         self.term.unset_private_mode(mode);
+        // Q-L L2（混合形态防陈旧）：1049 退出时若 47/1047 的捕获仍待还原（= 曾以 47h 进入、
+        // 未走 47l 就经 1049 退出），把主屏 DECSC 槽还回「未被 47 污染」的值——ghostty 的
+        // 47/1047 从不 saveCursor，1049 退出语义应以该槽为准（alacritty 的 1049 退出只换屏、
+        // 不读槽，故此处显式补；正常 1049 会话捕获为 None ⇒ 零影响）。
+        if let PrivateMode::Named(NamedPrivateMode::SwapScreenAndSetRestoreCursor) = mode {
+            self.restore_alt47_saved_decsc();
+        }
     }
     /// 应答器（6c）：DECRQM 按自管全模式表（alacritty 只认它有位的模式且自答格式不同）。
     fn report_private_mode(&mut self, _mode: alac_ansi::PrivateMode) {
@@ -1895,7 +1951,7 @@ mod tests {
     fn vt_size_gate_rejects_oversize_and_zero() {
         for (c, r) in [(0u16, 24u16), (80, 0), (0, 0), (1001, 24), (80, 501), (u16::MAX, u16::MAX)] {
             let err = SessionVt::new(c, r, 100).err().unwrap_or_else(|| panic!("{c}x{r} 应被拒"));
-            assert!(err.contains("尺寸非法"), "{c}x{r}: 错误文案：{err}");
+            assert!(err.to_string().contains("尺寸非法"), "{c}x{r}: 错误文案：{err}");
         }
         // 边界合法值原样接受（上限内不夹取）
         let mut vt = SessionVt::new(1000, 500, 100).expect("上限值合法");
@@ -1906,6 +1962,27 @@ mod tests {
         assert_eq!(vt.size(), (1000, 500), "被拒的 resize 不得改尺寸");
         assert!(vt.resize(999, 499).is_ok());
         assert_eq!(vt.size(), (999, 499));
+    }
+
+    /// Q-L L1：`VtError` 的 Display 文本与 thiserror 收敛前**逐字相同**——`service.rs`
+    /// 把 `{e}` 拼进会话日志行（`term: 会话 {name} 无服务端 vt（{e}）…`），文本漂移 = 日志行漂移。
+    #[test]
+    fn vt_error_display_verbatim() {
+        let e = VtError::BadSize { cols: 0, rows: 0 };
+        assert_eq!(
+            e.to_string(),
+            "vt: 尺寸非法 0x0（须为 1..=1000×1..=500）",
+            "Display 逐字（收敛前格式串）"
+        );
+        assert_eq!(VtError::BadSize { cols: 65535, rows: 65535 }.to_string(),
+            "vt: 尺寸非法 65535x65535（须为 1..=1000×1..=500）");
+        // 生产构造点同源：new/resize 拒时返回同变体同字段
+        assert!(matches!(
+            SessionVt::new(80, 0, 100),
+            Err(VtError::BadSize { cols: 80, rows: 0 })
+        ));
+        let mut vt = SessionVt::new(80, 24, 100).unwrap();
+        assert!(matches!(vt.resize(0, 24), Err(VtError::BadSize { cols: 0, rows: 24 })));
     }
 
     /// F2 回归（证据 B 转正）：1Hz 采样（screen_text）插在 update 与 dirty_rows 之间，
@@ -1990,6 +2067,181 @@ mod tests {
         vt.write(b"\x1b[?1049l");
         let t = vt.plain_text();
         assert!(t.contains("primary-text"), "退出备用屏恢复主屏口径：{t:?}");
+    }
+
+    /// Q-L L2 ①（内容面）：`?47h` **真切屏**（修前落 `PrivateMode::Unknown` 被 alacritty
+    /// 忽略 ⇒ 屏不切、内容留主屏）；写入落 alt、主屏内容原样保留（47 不清屏——
+    /// ghostty `Terminal.zig:4800-4869`）；`?47l` 回主屏且主屏内容逐字还在。
+    #[test]
+    fn vt_alt47_switch_and_content() {
+        let mut vt = SessionVt::new(20, 5, 100).unwrap();
+        vt.write(b"primary-line");
+        vt.write(b"\x1b[?47h");
+        assert_eq!(vt.modes().screen, Screen::Alternate, "47h 须真切屏（修前屏不切）");
+        vt.write(b"alt-line");
+        let t = vt.plain_text();
+        assert!(t.contains("alt-line"), "47h 后写入落 alt：{t:?}");
+        assert!(!t.contains("primary-line"), "备用屏只格式化活动屏：{t:?}");
+        vt.write(b"\x1b[?47l");
+        assert_eq!(vt.modes().screen, Screen::Primary, "47l 须切回主屏");
+        let t = vt.plain_text();
+        assert!(t.contains("primary-line"), "主屏内容原样保留（47 不清屏）：{t:?}");
+        assert!(!t.contains("alt-line"), "退出后活动屏 = 主屏：{t:?}");
+    }
+
+    /// Q-L L2 ②（光标面）：进出**双向整光标拷贝**（含 SGR 样式；ghostty `cursorCopy`
+    /// 除 hyperlink）——进入时主屏→alt，退出时 alt→主屏（不能只拷 point）。
+    #[test]
+    fn vt_alt47_cursor_copy_both_ways() {
+        let mut vt = SessionVt::new(20, 5, 100).unwrap();
+        vt.write(b"abc\x1b[31m"); // 主屏落红笔（cursor template fg=Red）
+        vt.write(b"\x1b[?47h");
+        assert_eq!(
+            vt.term.grid().cursor.template.fg,
+            AlacColor::Named(NamedColor::Red),
+            "进入时主屏 → alt 拷样式"
+        );
+        assert_eq!((vt.cursor().x, vt.cursor().y), (3, 0), "进入时主屏 → alt 拷位置");
+        // alt 上改样式 + 移光标（CUP 2;4 ⇒ 0-based (1,3)）
+        vt.write(b"\x1b[2;4H\x1b[44m");
+        vt.write(b"\x1b[?47l");
+        assert_eq!((vt.cursor().x, vt.cursor().y), (3, 1), "退出时 alt → 主屏 拷位置");
+        assert_eq!(
+            vt.term.grid().cursor.template.bg,
+            AlacColor::Named(NamedColor::Blue),
+            "退出时 alt → 主屏 拷样式（ghostty 整光标口径）"
+        );
+    }
+
+    /// Q-L L2 ③（幂等守卫）：连续 `47h` 不二次切换（不重入复位）；不在 alt 时 `47l` no-op。
+    #[test]
+    fn vt_alt47_idempotent_guards() {
+        let mut vt = SessionVt::new(20, 5, 100).unwrap();
+        vt.write(b"MAIN");
+        // 不在 alt 时 47l = no-op（无守卫会误走「进入」分支）
+        vt.write(b"\x1b[?47l");
+        assert_eq!(vt.modes().screen, Screen::Primary, "主屏上 47l 不得切屏");
+        assert!(vt.plain_text().contains("MAIN"));
+        // 连续 47h：第二次不得切回主屏、也不得复位 alt 内容
+        vt.write(b"\x1b[?47h");
+        vt.write(b"ALT-KEEP");
+        vt.write(b"\x1b[?47h");
+        assert_eq!(vt.modes().screen, Screen::Alternate, "重复 47h 不二次切换");
+        assert!(vt.plain_text().contains("ALT-KEEP"), "重复 47h 不复位 alt 内容");
+        // 连续 47l：第二次不得误切进 alt
+        vt.write(b"\x1b[?47l");
+        vt.write(b"\x1b[?47l");
+        assert_eq!(vt.modes().screen, Screen::Primary, "重复 47l 不二次切换");
+    }
+
+    /// Q-L L2 ④（DECSC 槽钉子）：`47h` 不得覆盖主屏 DECSC 槽——先 `ESC 7` 定位，再 47h/47l，
+    /// `ESC 8` 须回到原位置（alacritty `swap_alt` 进入时会把 `grid.saved_cursor` 覆盖成当前
+    /// 光标〔1049 痕迹〕；本实现进入前捕获、退出后还原——设计门 B-2）。
+    #[test]
+    fn vt_alt47_preserves_primary_decsc_slot() {
+        let mut vt = SessionVt::new(20, 5, 100).unwrap();
+        vt.write(b"AAAA\r\nBBBB\r\n\x1b[3;2H"); // 光标 (1,2)
+        vt.write(b"\x1b7"); // DECSC：主屏 saved_cursor = (1,2)
+        vt.write(b"\x1b[H"); // 挪走光标（进入 47h 时的「当前光标」= (0,0)）
+        vt.write(b"\x1b[?47h");
+        vt.write(b"\x1b[?47l");
+        vt.write(b"\x1b8"); // DECRC ⇒ 须回 ESC 7 的位置，而非 47h 时的光标
+        assert_eq!(
+            (vt.cursor().x, vt.cursor().y),
+            (1, 2),
+            "47h/47l 不得覆盖主屏 DECSC 槽（修前被 swap_alt 覆盖成 (0,0)）"
+        );
+    }
+
+    /// Q-L L2 ⑤（1047 族）：`1047h/l` 同 ①/②（切屏 + 双向整光标 + 主屏保留）；**重入清空**
+    /// 为登记差异的钉子——alacritty 进入即复位 alt 内容（ghostty 的 47 重入保留旧内容；
+    /// 1047 的「退出前在 alt 上 eraseDisplay(complete)」由该复位等价覆盖）。
+    #[test]
+    fn vt_alt1047_same_and_reentry_clears() {
+        let mut vt = SessionVt::new(20, 5, 100).unwrap();
+        vt.write(b"P1");
+        vt.write(b"\x1b[?1047h");
+        assert_eq!(vt.modes().screen, Screen::Alternate, "1047h 真切屏");
+        vt.write(b"ALT-ONE\x1b[32m");
+        assert!(vt.plain_text().contains("ALT-ONE"));
+        vt.write(b"\x1b[?1047l");
+        assert_eq!(vt.modes().screen, Screen::Primary);
+        assert!(vt.plain_text().contains("P1"), "1047 退出后主屏内容保留");
+        assert_eq!(
+            vt.term.grid().cursor.template.fg,
+            AlacColor::Named(NamedColor::Green),
+            "1047 退出同拷整光标（含样式）"
+        );
+        // 重入：alacritty 进入即复位 alt 内容（登记差异钉子）
+        vt.write(b"\x1b[?1047h");
+        assert!(
+            !vt.plain_text().contains("ALT-ONE"),
+            "重入清空（alacritty 进入复位；ghostty 的 47 重入保留旧内容——已登记差异）"
+        );
+    }
+
+    /// Q-L L2 ⑧（代码门 高1 回归）：捕获的 DECSC 槽跨 resize 缩小后还原必须**按当前尺寸
+    /// 钳制**——修前直接写回未钳制的捕获点，后续 `ESC 8`（`restore_cursor_position` →
+    /// `damage_cursor`）越界 panic（会话被终结）。行缩小/列缩小各一。
+    #[test]
+    fn vt_alt47_decsc_restore_clamped_after_resize_shrink() {
+        // 行缩小：ESC 7 在末行 ⇒ 47h ⇒ resize 缩到 5 行 ⇒ 47l ⇒ ESC 8
+        let mut vt = SessionVt::new(80, 24, 100).unwrap();
+        vt.write(b"\x1b[24;80H\x1b7");
+        vt.write(b"\x1b[?47h");
+        vt.resize(20, 5).unwrap();
+        vt.write(b"\x1b[?47l");
+        vt.write(b"\x1b8"); // 修前：damage 越界 panic（len 5 / index 23）
+        let c = vt.cursor();
+        assert!(c.y < 5 && c.x < 20, "还原须按当前尺寸钳制（实得 {}x{}）", c.x, c.y);
+        // 列缩小：同形态窄屏（列钳制面）
+        let mut vt = SessionVt::new(80, 24, 100).unwrap();
+        vt.write(b"\x1b[24;80H\x1b7");
+        vt.write(b"\x1b[?47h");
+        vt.resize(10, 24).unwrap();
+        vt.write(b"\x1b[?47l");
+        vt.write(b"\x1b8");
+        let c = vt.cursor();
+        assert!(c.x < 10, "列须钳到新宽（实得 x={}）", c.x);
+    }
+
+    /// Q-L L2 ⑦（混合形态防陈旧）：`47h → 1049l` 把槽还回「未被 47 污染」的值；
+    /// `1049h → 47l` 的 47 退出不得把 1049 保存的槽改坏（捕获按不变量此时已为 None）。
+    #[test]
+    fn vt_alt47_capture_not_stale_across_1049() {
+        let mut vt = SessionVt::new(20, 5, 100).unwrap();
+        vt.write(b"\x1b[1;1H\x1b7"); // ESC 7 @ (0,0)
+        vt.write(b"\x1b[5;5H"); // 光标 (4,4)
+        vt.write(b"\x1b[?47h"); // 捕获 (0,0)；进 alt
+        vt.write(b"\x1b[?1049l"); // 经 1049 回主屏（此时槽应还原为 (0,0)）
+        vt.write(b"\x1b8");
+        assert_eq!((vt.cursor().x, vt.cursor().y), (0, 0), "47h → 1049l 后槽 = 未被 47 污染的值");
+        vt.write(b"\x1b[3;3H"); // 光标 (2,2)
+        vt.write(b"\x1b[?1049h"); // 1049：保存 (2,2) + 清屏 + 进 alt（陈旧捕获作废）
+        vt.write(b"\x1b[1;1H"); // alt 上挪走
+        vt.write(b"\x1b[?47l"); // 47 退出：不得还原陈旧捕获 (0,0)
+        vt.write(b"\x1b8"); // DECRC ⇒ 须回 1049 保存的 (2,2)
+        assert_eq!(
+            (vt.cursor().x, vt.cursor().y),
+            (2, 2),
+            "陈旧捕获不得覆盖 1049 保存的 DECSC 槽"
+        );
+    }
+
+    /// Q-L L2 ⑥（1049 路径回归）：`1049h/l` 语义不受本批影响——进入保存光标 + 清屏，
+    /// 退出恢复主屏内容与保存的光标（既有 `vt_plain_text_alternate_screen` 与
+    /// session-styles golden 同族钉住）。
+    #[test]
+    fn vt_alt1049_path_unaffected_by_l2() {
+        let mut vt = SessionVt::new(20, 5, 100).unwrap();
+        vt.write(b"MAIN\r\n\r\n\x1b[3;5H"); // 光标 (2,4)
+        vt.write(b"\x1b[?1049h");
+        assert_eq!(vt.modes().screen, Screen::Alternate);
+        assert!(!vt.plain_text().contains("MAIN"), "1049 进入清屏");
+        vt.write(b"\x1b[?1049l");
+        assert_eq!(vt.modes().screen, Screen::Primary);
+        assert!(vt.plain_text().contains("MAIN"), "1049 退出恢复主屏内容");
+        assert_eq!((vt.cursor().x, vt.cursor().y), (4, 2), "1049 退出恢复保存的光标");
     }
 
     /// F8②：滚入回滚的软折行段在 plain_text 里合并为单条逻辑行（wraps 位随行读）。
