@@ -20,7 +20,10 @@
 set -uo pipefail
 
 REPO_ROOT="${0:h:A:h}"
-BIN="$REPO_ROOT/target/release/homeway-cli"
+# Q-I 尾段 F7：二进制覆盖（A/B 臂切换用——`HOMEWAY_BIN=/path/to/homeway-cli`；
+# 缺省 = 仓内 release 产物）。注：F0 修复前的二进制不认 `--stun=` 空值，需用
+# `tools/qi-ab.sh` 的免 flag 形态起出口。
+BIN="${HOMEWAY_BIN:-$REPO_ROOT/target/release/homeway-cli}"
 GO_BIN="${HOMEWAY_GO:-$REPO_ROOT/bin/homeway-go}"
 
 cmd="${1:-help}"; n="${2:-1}"
