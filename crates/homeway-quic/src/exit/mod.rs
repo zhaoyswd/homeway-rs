@@ -38,6 +38,7 @@ use std::time::{Duration, Instant};
 
 use quinn::{Connection, Endpoint, EndpointConfig};
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::task::JoinSet;
 
 use crate::cmd::Logf;
 use crate::rpk::{Ed25519Seed, RpkPublicKey};
@@ -50,11 +51,45 @@ pub(crate) const REAP_THREAD: &str = "hw-quic-exit-reap";
 /// 驱动循环回看节拍（stop 位 + 连接巡检；无事件时周期性回看，不做忙等）。
 const TICK: Duration = Duration::from_millis(250);
 
+/// 并发握手上限（M1 设计 §9.3 Q-O；**保守资源上限**——M2 才有抗放大/Retry/限流）。
+pub const DEFAULT_HANDSHAKE_CAP: usize = 64;
+/// 握手期限（同上：超时不完成即弃——拦「占着槽位不完成」的形态，不替代 M2 的防放大。
+/// 副作用登记：期限内未完成的握手丢掉后，对端重传 Initial 会再触发一轮 ⇒ 单源可反复
+/// 触发（**上限仍受并发握手闸约束**），M2 的 Retry/限流面承接）。
+pub const DEFAULT_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
+/// 记行节流（仓内既有口径「首 3 + 每 100」——`relay/mod.rs` 的 `reject_log_due` 同款）。
+fn log_due(n: u64) -> bool {
+    n <= 3 || n.is_multiple_of(100)
+}
+
 /// 出口 QUIC 面配置（**全 std 类型 + 本岛 newtype**：同步面可见面，不夹带异步栈类型）。
 pub struct ExitQuicConfig {
     /// 出口 RPK 私钥种子（**出口身份**：`HKDF(后端静态私钥, "homeway/quic-rpk")`，
     /// 由 `homeway-core` 的装配点派生——见 M1 设计 §1.3/§12-②）。
     pub rpk_seed: Ed25519Seed,
+    /// 设备表上限（连接总数上限 = `2 × max_devices`，§9.3 Q-O）。
+    pub max_devices: usize,
+    /// 并发握手上限（缺省 [`DEFAULT_HANDSHAKE_CAP`]；测试调小以钉死拒绝路径）。
+    pub handshake_cap: usize,
+    /// 握手期限（缺省 [`DEFAULT_HANDSHAKE_DEADLINE`]；同上）。
+    pub handshake_deadline: Duration,
+}
+
+impl ExitQuicConfig {
+    /// 生产缺省（seed 与设备表上限由调用侧给；Q-O 的两个上限取设计定值）。
+    pub fn new(rpk_seed: Ed25519Seed, max_devices: usize) -> Self {
+        Self {
+            rpk_seed,
+            max_devices,
+            handshake_cap: DEFAULT_HANDSHAKE_CAP,
+            handshake_deadline: DEFAULT_HANDSHAKE_DEADLINE,
+        }
+    }
+
+    /// 连接总数上限（`2 × max_devices`，§9.3 Q-O；饱和乘防溢出）。
+    fn conn_cap(&self) -> usize {
+        self.max_devices.saturating_mul(2)
+    }
 }
 
 /// 起点失败（类型化；`#[non_exhaustive]` 防下游穷举）。
@@ -78,8 +113,16 @@ pub struct ExitQuicSnapshot {
     pub admitted: u64,
     /// 观测到的路径变更次数（`remote_address()` 变化——S1b 的 E-q2 行前身）。
     pub path_changes: u64,
-    /// 握手失败次数（错 RPK / 对端放弃 / 期限到点各归各的细分口径见下）。
+    /// 握手失败次数（对端放弃 / 协议错；期限到点单列 [`Self::handshake_timeouts`]）。
     pub handshake_failed: u64,
+    /// 当前在途握手数（已收到 Initial、尚未完成）。
+    pub handshakes_in_flight: u64,
+    /// 因**并发握手超限**拒绝的次数（§9.3 Q-O）。
+    pub handshake_refused: u64,
+    /// 因**连接总数超限**拒绝的次数（§9.3 Q-O）。
+    pub conn_refused: u64,
+    /// 因**握手期限**到点放弃的次数（§9.3 Q-O）。
+    pub handshake_timeouts: u64,
 }
 
 /// 计量面（原子直读——**反应式**，不必等巡检拍；`snapshot()` 由它组装）。
@@ -89,6 +132,10 @@ struct ExitStats {
     admitted: AtomicU64,
     path_changes: AtomicU64,
     handshake_failed: AtomicU64,
+    handshakes_in_flight: AtomicU64,
+    handshake_refused: AtomicU64,
+    conn_refused: AtomicU64,
+    handshake_timeouts: AtomicU64,
 }
 
 impl ExitStats {
@@ -98,6 +145,10 @@ impl ExitStats {
             admitted: self.admitted.load(Ordering::SeqCst),
             path_changes: self.path_changes.load(Ordering::SeqCst),
             handshake_failed: self.handshake_failed.load(Ordering::SeqCst),
+            handshakes_in_flight: self.handshakes_in_flight.load(Ordering::SeqCst),
+            handshake_refused: self.handshake_refused.load(Ordering::SeqCst),
+            conn_refused: self.conn_refused.load(Ordering::SeqCst),
+            handshake_timeouts: self.handshake_timeouts.load(Ordering::SeqCst),
         }
     }
 }
@@ -269,6 +320,13 @@ struct LiveConn {
     remote: SocketAddr,
 }
 
+/// 在途握手的结果（三态：采纳 / 失败 / 期限到点——各自的计数与记行口径不同）。
+enum HandshakeOutcome {
+    Accepted(SocketAddr, Connection),
+    Failed(SocketAddr),
+    Deadline(SocketAddr),
+}
+
 /// 端点到点前的装配与主循环（**全在专用线程的 `current_thread` runtime 内**）。
 fn run_exit(
     socket: UdpSocket,
@@ -326,25 +384,80 @@ fn run_exit(
         }
 
         let mut conns: Vec<LiveConn> = Vec::new();
+        // 在途握手（并发上限与期限都挂在这张表上；`JoinSet` 保证收工时全部 abort）
+        let mut handshakes: JoinSet<HandshakeOutcome> = JoinSet::new();
+        let conn_cap = cfg.conn_cap();
         loop {
             tokio::select! {
                 _ = stop_rx.recv() => break,
                 inc = endpoint.accept() => match inc {
-                    // 已登记连接（S1b 起为 `hr-reg3` 登记+绑定；本棒只采纳与保活）
-                    Some(incoming) => match incoming.await {
-                        Ok(conn) => {
+                    Some(incoming) => {
+                        let peer = incoming.remote_address();
+                        // 闸①：连接总数（**口径收紧一档**：存活连接 + 在途握手一起算——
+                        // 否则「在途握手转正」会把上限撑破；§9.3 Q-O 的原义只写了连接总数）
+                        let held = (conns.len() + handshakes.len()) as u64;
+                        if held >= conn_cap as u64 {
+                            incoming.refuse();
+                            let n = stats.conn_refused.fetch_add(1, Ordering::SeqCst) + 1;
+                            if log_due(n) {
+                                (*logf)(&format!(
+                                    "quic: 拒新连接（连接总数 {held}/{conn_cap} 超限，来自 {peer}；第 {n} 次）"
+                                ));
+                            }
+                        } else if handshakes.len() >= cfg.handshake_cap {
+                            // 闸②：并发握手上限（Q-O 的 64；M2 的抗放大面还没来）
+                            incoming.refuse();
+                            let n = stats.handshake_refused.fetch_add(1, Ordering::SeqCst) + 1;
+                            if log_due(n) {
+                                (*logf)(&format!(
+                                    "quic: 拒新连接（并发握手 {}/{cap} 超限，来自 {peer}；第 {n} 次）",
+                                    handshakes.len(),
+                                    cap = cfg.handshake_cap
+                                ));
+                            }
+                        } else {
+                            // 闸③：握手期限（到点即弃；丢 `Connecting` = quinn 侧关连接）
+                            let deadline = cfg.handshake_deadline;
+                            stats.handshakes_in_flight.fetch_add(1, Ordering::SeqCst);
+                            handshakes.spawn(async move {
+                                match incoming.accept() {
+                                    Ok(connecting) => match tokio::time::timeout(deadline, connecting).await {
+                                        Ok(Ok(conn)) => HandshakeOutcome::Accepted(peer, conn),
+                                        Ok(Err(_e)) => HandshakeOutcome::Failed(peer),
+                                        Err(_) => HandshakeOutcome::Deadline(peer),
+                                    },
+                                    Err(_e) => HandshakeOutcome::Failed(peer),
+                                }
+                            });
+                        }
+                    }
+                    None => break,
+                },
+                Some(joined) = handshakes.join_next(), if !handshakes.is_empty() => {
+                    stats.handshakes_in_flight.fetch_sub(1, Ordering::SeqCst);
+                    match joined {
+                        Ok(HandshakeOutcome::Accepted(_peer, conn)) => {
                             stats.admitted.fetch_add(1, Ordering::SeqCst);
                             conns.push(LiveConn { remote: conn.remote_address(), conn });
                             stats.connections.store(conns.len() as u64, Ordering::SeqCst);
                         }
-                        // 握手失败（错 RPK / 对端放弃 / 期限到点）：明细记行与四类丢弃
-                        // 计数归 S1b 的 E-q3——本棒只留总计数（客户端钉定判据的证据面）
-                        Err(_e) => {
+                        // 握手失败（错 RPK / 对端放弃）：明细记行与四类丢弃计数归 S1b 的
+                        // E-q3——本棒只留总计数（客户端钉定判据的证据面）
+                        Ok(HandshakeOutcome::Failed(_peer)) => {
                             stats.handshake_failed.fetch_add(1, Ordering::SeqCst);
                         }
-                    },
-                    None => break,
-                },
+                        Ok(HandshakeOutcome::Deadline(peer)) => {
+                            let n = stats.handshake_timeouts.fetch_add(1, Ordering::SeqCst) + 1;
+                            if log_due(n) {
+                                (*logf)(&format!(
+                                    "quic: 握手期限（{peer} 未在 {deadline:?} 内完成，已弃；第 {n} 次）",
+                                    deadline = cfg.handshake_deadline
+                                ));
+                            }
+                        }
+                        Err(_join_err) => {} // 任务被 abort（收工路径）——不计
+                    }
+                }
                 _ = tokio::time::sleep(TICK) => {}
             }
             // 巡检（每拍）：清死连接 + 观测路径变更（E-q2 行的前身；S1b 起接 dev 归属）
@@ -358,7 +471,8 @@ fn run_exit(
                 }
             }
         }
-        // ---- 收工：先关端点（对各连接发 CONNECTION_CLOSE），再丢弃连接句柄 ----
+        // ---- 收工：先在途握手全弃（JoinSet drop 即 abort）→ 关端点 → 丢弃连接句柄 ----
+        drop(handshakes);
         endpoint.close(0u32.into(), b"exit stopping");
         drop(conns);
         drop(endpoint);

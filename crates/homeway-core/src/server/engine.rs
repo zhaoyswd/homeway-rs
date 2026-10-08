@@ -435,7 +435,7 @@ impl ServeEngine {
                     let seed = crate::server::quic_rpk_seed(&priv_key);
                     match homeway_quic::ExitQuic::start(
                         sock,
-                        homeway_quic::ExitQuicConfig { rpk_seed: seed },
+                        homeway_quic::ExitQuicConfig::new(seed, cfg.max_devices),
                         Arc::clone(&logf),
                     ) {
                         Ok(q) => {
@@ -684,7 +684,6 @@ impl ServeEngine {
                 let itc_stats = Arc::clone(&itc_stats);
                 let pub_kick_tx = pub_kick_tx.clone();
                 let driver_alive_t = Arc::clone(&driver_alive); // move 闭包独占一份（外层留给兜底线/构造面）
-                let quic_face = quic_face; // 驱动线程独占（收工链在它手里，§1.7 顺序）
                 move || {
                     // 在世守卫：线程体任何出口（含 panic 展开）都清零——supervisor 据此
                     // 判角色终结（守卫必须活在闭包体内——外层 spawn 参数块在闭包构造

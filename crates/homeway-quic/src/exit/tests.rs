@@ -5,6 +5,7 @@
 //! 「对 pin/错 pin 握手」与资源上限用例随 S1a 的后续工作单元进本文件。
 
 use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -66,7 +67,7 @@ fn endpoint_logs_e_q1_ready_line_with_actual_port() {
     let (logf, rx) = sink();
     let quic = ExitQuic::start(
         sock,
-        ExitQuicConfig { rpk_seed: seed(1) },
+        ExitQuicConfig::new(seed(1), 32),
         Arc::clone(&logf),
     )
     .expect("端点可起");
@@ -96,7 +97,7 @@ fn stop_releases_the_udp_port() {
     let sock = loopback_socket();
     let addr: SocketAddr = sock.local_addr().unwrap();
     let (logf, _rx) = sink();
-    let quic = ExitQuic::start(sock, ExitQuicConfig { rpk_seed: seed(2) }, logf).expect("端点可起");
+    let quic = ExitQuic::start(sock, ExitQuicConfig::new(seed(2), 32), logf).expect("端点可起");
     assert!(quic.stop_within(Instant::now() + BUDGET));
     drop(quic);
     // 同端口可再绑 = socket 真已释放（UDP 无 TIME_WAIT）
@@ -107,7 +108,7 @@ fn stop_releases_the_udp_port() {
 #[test]
 fn stop_within_is_idempotent() {
     let (logf, _rx) = sink();
-    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig { rpk_seed: seed(3) }, logf)
+    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(3), 32), logf)
         .expect("端点可起");
     assert!(quic.stop_within(Instant::now() + BUDGET));
     assert!(quic.stop_within(Instant::now() + BUDGET), "重入即 true");
@@ -153,7 +154,7 @@ async fn wait_until(mut cond: impl FnMut() -> bool, wait: Duration) -> bool {
 #[tokio::test]
 async fn rpk_pin_mismatch_aborts_handshake() {
     let (logf, _rx) = sink();
-    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig { rpk_seed: seed(11) }, logf)
+    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(11), 32), logf)
         .expect("端点可起");
     let good = quic.rpk_public_key();
     let wrong = RpkPublicKey::from_bytes([0xEE; 32]);
@@ -193,7 +194,7 @@ async fn rpk_pin_mismatch_aborts_handshake() {
 #[tokio::test]
 async fn rpk_pin_match_connects_with_1_2_transport_readings() {
     let (logf, _rx) = sink();
-    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig { rpk_seed: seed(12) }, logf)
+    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(12), 32), logf)
         .expect("端点可起");
     let pin = quic.rpk_public_key();
 
@@ -237,7 +238,7 @@ async fn rpk_pin_match_connects_with_1_2_transport_readings() {
 #[tokio::test]
 async fn rebind_keeps_connection_and_surfaces_path_change() {
     let (logf, _rx) = sink();
-    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig { rpk_seed: seed(13) }, logf)
+    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(13), 32), logf)
         .expect("端点可起");
     let pin = quic.rpk_public_key();
     let (client, cfg, _sock) = client_endpoint_and_config(pin);
@@ -267,4 +268,192 @@ async fn rebind_keeps_connection_and_surfaces_path_change() {
     assert_eq!(quic.snapshot().connections, 1, "迁移不新增连接（§1.7/E-q2 的判读面）");
     assert!(conn.close_reason().is_none(), "迁移后连接不得被关");
     assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+// ---------- Q-O：保守资源上限（并发握手 ≤64 / 连接总数 ≤2×max_devices / 握手期限 10s） ----------
+
+/// **单向中继**：把客户端包转给出口、**不回**出口的应答 ⇒ 出口侧留下一个永不完成的
+/// 握手（确定性造「在途握手」；不 sleep、不钉端口——用读超时轮看 stop 位）。
+struct OneWayRelay {
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl OneWayRelay {
+    /// `exit_addr` = 出口地址（作「哪些包是回程」的判据：来自出口地址的一律丢）。
+    fn start(exit_addr: SocketAddr) -> OneWayRelay {
+        let sock = loopback_socket();
+        let addr = sock.local_addr().unwrap();
+        sock.set_read_timeout(Some(Duration::from_millis(20))).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_t = Arc::clone(&stop);
+        let thread = std::thread::spawn(move || {
+            let mut buf = [0u8; 2048];
+            while !stop_t.load(Ordering::SeqCst) {
+                match sock.recv_from(&mut buf) {
+                    Ok((n, from)) if from != exit_addr => {
+                        let _ = sock.send_to(&buf[..n], exit_addr);
+                    }
+                    // 出口回程：丢（这就是「不回」）；超时/错误：下一轮再看 stop 位
+                    Ok(_) | Err(_) => {}
+                }
+            }
+        });
+        OneWayRelay { addr, stop, thread: Some(thread) }
+    }
+}
+
+impl Drop for OneWayRelay {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// Q-O 闸①：连接总数 = `2 × max_devices`——`max_devices=1` ⇒ 第 3 条被拒（计数 + 记行）。
+#[tokio::test]
+async fn connection_cap_refuses_beyond_two_max_devices() {
+    let (logf, rx) = sink();
+    let quic = ExitQuic::start(
+        loopback_socket(),
+        ExitQuicConfig::new(seed(21), 1), // conn_cap = 2
+        logf,
+    )
+    .expect("端点可起");
+    let pin = quic.rpk_public_key();
+
+    let mut clients = Vec::new();
+    for _ in 0..2 {
+        let (client, cfg, sock) = client_endpoint_and_config(pin);
+        let conn = tokio::time::timeout(
+            WAIT,
+            client
+                .connect_with(cfg, quic.local_addr(), super::rpk::client_pin::SERVER_NAME)
+                .expect("connect 调用面"),
+        )
+        .await
+        .expect("握手预算内")
+        .expect("上限内应连上");
+        clients.push((client, conn, sock));
+    }
+    assert!(wait_until(|| quic.snapshot().connections >= 2, WAIT).await, "两条都采纳");
+
+    // 第 3 条：上限命中 ⇒ 拒（客户端拿到握手期错误）
+    let (client3, cfg3, _s3) = client_endpoint_and_config(pin);
+    let r3 = tokio::time::timeout(
+        WAIT,
+        client3
+            .connect_with(cfg3, quic.local_addr(), super::rpk::client_pin::SERVER_NAME)
+            .expect("connect 调用面"),
+    )
+    .await
+    .expect("拒绝必须在预算内定音");
+    assert!(r3.is_err(), "超限连接不得连上");
+    assert!(
+        wait_until(|| quic.snapshot().conn_refused >= 1, WAIT).await,
+        "应有连接总数拒绝计数：{:?}",
+        quic.snapshot()
+    );
+    assert_eq!(quic.snapshot().connections, 2, "存活连接数不因拒绝而变");
+    drain_until(&rx, "quic: 拒新连接（连接总数", WAIT); // 记行面（节流首条必打）
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+    drop(clients);
+}
+
+/// Q-O 闸②：并发握手上限——上限调成 1：一条卡住（单向中继）后，第二条被拒。
+#[tokio::test]
+async fn handshake_cap_refuses_extra_in_flight() {
+    let (logf, rx) = sink();
+    let quic = ExitQuic::start(
+        loopback_socket(),
+        ExitQuicConfig {
+            handshake_cap: 1,
+            ..ExitQuicConfig::new(seed(22), 32)
+        },
+        logf,
+    )
+    .expect("端点可起");
+    let pin = quic.rpk_public_key();
+    let relay = OneWayRelay::start(quic.local_addr());
+
+    // ① 经单向中继：Initial 到得了出口、握手完不成 ⇒ 占住唯一的在途槽位
+    let (stalled_client, stalled_cfg, _s1) = client_endpoint_and_config(pin);
+    let stalled = stalled_client
+        .connect_with(stalled_cfg, relay.addr, super::rpk::client_pin::SERVER_NAME)
+        .expect("connect 调用面");
+    assert!(
+        wait_until(|| quic.snapshot().handshakes_in_flight >= 1, WAIT).await,
+        "应有在途握手：{:?}",
+        quic.snapshot()
+    );
+
+    // ② 直连（不经中继）：在途槽位已满 ⇒ 拒
+    let (client2, cfg2, _s2) = client_endpoint_and_config(pin);
+    let r2 = tokio::time::timeout(
+        WAIT,
+        client2
+            .connect_with(cfg2, quic.local_addr(), super::rpk::client_pin::SERVER_NAME)
+            .expect("connect 调用面"),
+    )
+    .await
+    .expect("拒绝必须在预算内定音");
+    assert!(r2.is_err(), "并发握手超限时不得连上");
+    assert!(
+        wait_until(|| quic.snapshot().handshake_refused >= 1, WAIT).await,
+        "应有并发握手拒绝计数：{:?}",
+        quic.snapshot()
+    );
+    drain_until(&rx, "quic: 拒新连接（并发握手", WAIT);
+    drop(stalled); // 卡住的客户端放掉（服务端那条在途握手随期限/收工清）
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// Q-O 闸③：握手期限——期限调成 300ms：卡住的握手到点被弃（计数 + 记行）。
+#[tokio::test]
+async fn handshake_deadline_drops_stalled_handshake() {
+    let (logf, rx) = sink();
+    let quic = ExitQuic::start(
+        loopback_socket(),
+        ExitQuicConfig {
+            handshake_deadline: Duration::from_millis(300),
+            ..ExitQuicConfig::new(seed(23), 32)
+        },
+        logf,
+    )
+    .expect("端点可起");
+    let pin = quic.rpk_public_key();
+    let relay = OneWayRelay::start(quic.local_addr());
+
+    let (client, cfg, _s) = client_endpoint_and_config(pin);
+    let stalled = client
+        .connect_with(cfg, relay.addr, super::rpk::client_pin::SERVER_NAME)
+        .expect("connect 调用面");
+
+    assert!(
+        wait_until(|| quic.snapshot().handshake_timeouts >= 1, WAIT).await,
+        "期限到点应有计数：{:?}",
+        quic.snapshot()
+    );
+    let snap = quic.snapshot();
+    assert_eq!(snap.admitted, 0, "卡住的握手不得被采纳：{snap:?}");
+    assert_eq!(snap.connections, 0, "卡住的握手不得留下连接：{snap:?}");
+    drain_until(&rx, "quic: 握手期限", WAIT);
+    drop(stalled);
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// 缺省上限 = 设计定值（64 并发 / 10s 期限；Q-O）——防实现期被悄悄改小/改大。
+#[test]
+fn qo_defaults_match_design() {
+    let cfg = ExitQuicConfig::new(seed(24), 32);
+    assert_eq!(cfg.handshake_cap, 64, "并发握手 ≤64（§9.3 Q-O）");
+    assert_eq!(
+        cfg.handshake_deadline,
+        Duration::from_secs(10),
+        "握手期限 10s（§9.3 Q-O）"
+    );
+    assert_eq!(cfg.conn_cap(), 64, "连接总数 = 2 × max_devices");
 }
