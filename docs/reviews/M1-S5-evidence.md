@@ -336,3 +336,21 @@ tools/local-rust-exit.sh stop 2 && tools/local-rust-relay.sh stop 2
 
 产物目录：`/tmp/m1s5-res/{quic-ab,quic-ab-cpu2,mem-*,size,e2e}/`（`summary.txt` / `loadavg.tsv` /
 逐轮 `.json` / `*.log`）。**S5 期间起过的本地私有实例已在收口前停掉**（不碰现役出口/中继）。
+
+---
+
+## 8. 收口门（本切片的测试与纪律门）
+
+| 门 | 结果 | 证据 |
+|---|---|---|
+| `cargo test --workspace` | **全绿**（复跑）：`homeway-core --lib` **688 passed / 0 failed / 4 ignored**；其余 9 个测试二进制全 ok | `/tmp/m1s5-res/final-workspace-test2.log` |
+| （首跑的 2 条红） | **均为在册 flake**（M1 设计 §0.1 的同两条 `daemon::tests::*` 时序族）：①`handshake_deadline_beats_slow_drip` 首跑红 → **隔离单跑绿**；②`server_bad_frame_gets_goodbye_and_disconnect` 首跑红 → 隔离复跑 **1 红 2 绿**（读窗与 goodbye 写竞态；`Finished in 0.00s` 的红即"只收到 welcome"）。**无 M1 相关回归**（flake 口径④：红了先隔离单跑再判回归） | `/tmp/m1s5-res/final-workspace-test.log` + 隔离复跑输出 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | **0 告警** | 同批次日志（`Finished dev profile`） |
+| `tools/check-quic-isolation.sh` | **五条全绿**（异步边界 / 阻塞面 / aws-lc / 跳过验证） | 本切片收口运行；`crates/**` 零改动（S5 只动 `tools/`） |
+| `tools/check-vocab.sh` | **PASS** | 同上 |
+| 红线自查 | 本切片三个 commit 的文件面 = `tools/**` + `Cargo.toml`(exclude) + `docs/reviews/M1-S5-evidence.md`；**`crates/**` 零命中**（`git diff --name-only 3c8c5e0^..HEAD`）⇒ `relay/**`、`relaywire.rs`、`server/intercept/**`、`wtransport/**` 全未触碰 | `git diff --name-only 3c8c5e0^..HEAD` |
+| 仓内副作用残留 | `git status --porcelain` = **空**（干净）；本地私有出口/中继实例 **0 个在跑** | 收口前实测 |
+
+**建议 S6 承接（本切片不做）**：①窄路径注入用例（`HOMEWAY_QUIC_MTU` < 内层 MTU ⇒ 「窄路径不可用」+ `超限` 计数，设计 §12-① 的 S5-1 项）；②出口腿表行（§5 N5）；
+③产品形态内存的归因 profiling（§4.2 处置建议③）；④WG 档把 `tun fd` 的 `ENOBUFS` 当硬失败这条**形态核对**（§5 L5）。
+
