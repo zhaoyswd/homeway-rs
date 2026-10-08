@@ -155,9 +155,15 @@ impl Island {
 
     /// 有界收工：到点放弃 join，把 `JoinHandle` 交**收割线程** `hw-quic-reap` 收口。
     ///
-    /// 返回 `false` = 到点 detach（岛线程可能存活到自行退出，持 runtime + 连接端点——
-    /// 残余登记见设计 §8.1：老世代可能在收尾后继续发包、`CONNECTION_CLOSE` 晚到）。
-    /// 返回 `true` = 岛线程确已退出（并在本线程 join 收口，panic 行由本分支记）。
+    /// **返回值语义（写清，防 M1 收尾链误读）**：
+    /// - `true` = 本次调用确认「收工已完成」——含两种情形：①本次等到岛线程退出并在本线程
+    ///   join 收口（panic 行由本分支记）；②**重入**：此前已有人收过工（stop 位已置，本调用
+    ///   不做任何等待即返 `true`）；无句柄（理论窗口）同此。
+    /// - `false` = 本次**到点 detach**（岛线程可能存活到自行退出，持 runtime + 连接端点——
+    ///   残余登记见设计 §8.1：老世代可能在收尾后继续发包、`CONNECTION_CLOSE` 晚到）。
+    ///   ⚠️ 形态提醒（镜像 `wgcore::Client::stop_within`）：detach 后再调用会因重入而返
+    ///   `true`——「`true`」是「收工流程已了结」，不是「线程必已退出」；判线程是否真退出
+    ///   用 [`Self::is_finished`]。
     pub fn stop_within(&self, deadline: Instant) -> bool {
         if self.stop.swap(true, Ordering::SeqCst) {
             return true; // 重入：已有人收过工（不重复等待）
@@ -197,6 +203,12 @@ impl Island {
 }
 
 impl Drop for Island {
+    /// 兜底收工（**无界 join**——镜像 `Drop for Client`）。
+    ///
+    /// ⚠️ 前提：仅当**从未**走到「到点 detach」时才会在此真等；一旦 `stop_within` 已置 stop 位
+    /// （含 detach 形态），本兜底立即返回、不会挂死调用方。若有人不调 `stop_within` 直接 drop
+    /// 而岛又卡死，则本 Drop 会一直等（与既有的 `Drop for Client` 同形，M1 收尾链一律先走
+    /// 有界版）。
     fn drop(&mut self) {
         self.stop();
     }

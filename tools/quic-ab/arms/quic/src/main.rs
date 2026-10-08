@@ -17,7 +17,7 @@
 
 use quic_ab_common::{cpu_now_us, env_num, ipv4, JsonLine};
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr};
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -119,7 +119,6 @@ fn server(expect: u64) -> io::Result<()> {
     let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
     let endpoint = Endpoint::server(sc, addr)?;
     println!("PORT {}", endpoint.local_addr()?.port());
-    println!("MAX_DATAGRAM_SIZE_AT_MTU {}", env_num("MTU", 1400u16));
     use std::io::Write as _;
     io::stdout().flush()?;
 
@@ -341,5 +340,4 @@ fn main() {
         .unwrap();
     let oneway = args.iter().any(|a| a == "--oneway");
     client(port, n, oneway).unwrap();
-    let _ = Ipv4Addr::LOCALHOST;
 }

@@ -3,11 +3,11 @@ name = "quic-ab-size"
 version.workspace = true
 edition.workspace = true
 
-# 体积探针（OHOS cdylib）：转入自 `/tmp/quic-lab/size-probe2`（lib 143 行 + real_quic 116 行）。
-# 四档口径（M0 设计 §4.3/§5.1）由 feature 切换 + profile 切换实现：
-#   ① 空壳 cdylib            = 无 feature（boringtun/smoltcp 声明但不引用 ⇒ 死码消除）
-#   ② 空壳 + QUIC 全栈        = `--features quic-shallow`（只做 size_of 类浅引用）
-#   ③ base + 真实引用全路径    = `--features quic`（ProbeRunQuic 真自连一次）
+# 体积探针（OHOS cdylib）：转入自 `/tmp/quic-lab/size-probe2`（lib + real_quic bin）。
+# 四档矩阵的分工（M0 设计 §4.3/§5.1；**由两个探针包 + profile 切换实现**）：
+#   ① 空壳 cdylib            = `size-shell` 无 feature
+#   ② 空壳 + QUIC 全栈        = `size-shell --features quic`（浅引用 ⇒ 死码消除后）
+#   ③ base + 真实引用全路径    = **本包** `--features quic`（boringtun+smoltcp 在场 + ProbeRunQuic 真自连）
 #   ④ 现役 .so 对照           = 主检出产物（只读，由 harness 量取）
 [lib]
 name = "clientcore2"
@@ -24,10 +24,8 @@ tokio = { version = "1", features = ["rt", "net", "time", "io-util"], optional =
 bytes = "1"
 
 [features]
-# 浅引用档：QUIC 依赖全在，但只被 size_of/常量级引用 ⇒ 量「依赖在场」的死码消除后成本
-quic-shallow = ["dep:quinn", "dep:rustls", "dep:tokio"]
-# 真引用档：全路径可达（含自连握手）
-quic = ["quic-shallow"]
+# 真引用档：QUIC 全栈 + 全路径可达（含自连握手）——①② 两格由 `size-shell` 提供
+quic = ["dep:quinn", "dep:rustls", "dep:tokio"]
 
 [[bin]]
 name = "real_quic"

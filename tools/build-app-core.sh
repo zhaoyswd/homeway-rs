@@ -51,6 +51,11 @@ fi
 # ring 的 C 代码找不到 assert.h 当场断（实测）。**真构建走真 sysroot：不带 -nostdlibinc**
 # （check-only 垫片只属于 ci.yml / ci-local 的 check 档，见 tools/cc-check-shim/stdlib.h）。----
 export CC_aarch64_unknown_linux_ohos="${NDK}/llvm/bin/aarch64-unknown-linux-ohos-clang"
+# fail-closed：check-only 档的 flags **绝不允许**进真构建（M0 设计 §2.3/§8.2 R-D 的口子）
+if [ -n "${CFLAGS_aarch64_unknown_linux_ohos:-}" ] && [[ "${CFLAGS_aarch64_unknown_linux_ohos}" == *nostdlibinc* ]]; then
+  echo "error: CFLAGS_aarch64_unknown_linux_ohos 含 -nostdlibinc（check-only 垫片档）——真构建必须用真 sysroot；请 unset 后重跑" >&2
+  exit 1
+fi
 if [ ! -x "${CC_aarch64_unknown_linux_ohos}" ]; then
   echo "error: 找不到 NDK 包装 clang（${CC_aarch64_unknown_linux_ohos}）——真构建必须有真 sysroot" >&2
   exit 1

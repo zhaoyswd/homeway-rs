@@ -35,6 +35,7 @@ MTU=1400
 PROFILE="lab"
 MODE="steady"
 CONNS=5
+CONNS_POINTS=""    # 空 = 由 --conns 推（1,3,5,… 奇数序列）
 ARM_LIST=("${(@s:,:)ARMS}")
 
 while (( $# )); do
@@ -47,6 +48,7 @@ while (( $# )); do
     --profile) PROFILE="$2"; shift 2 ;;
     --mode) MODE="$2"; shift 2 ;;
     --conns) CONNS="$2"; shift 2 ;;
+    --conns-points) CONNS_POINTS="$2"; shift 2 ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "!! 未知参数：$1" >&2; exit 2 ;;
   esac
@@ -65,8 +67,18 @@ cleanup() {
 }
 trap cleanup EXIT INT TERM
 
+# certs：`arms/quic` 是**编译期** include_bytes(certs/*.der) ⇒ 干净 clone 上必须先现场生成
+# （DER/PEM 不入库；缺 openssl 即显式红，不静默）
+ensure_certs() {
+  [[ -f "$AB_ROOT/certs/cert.der" && -f "$AB_ROOT/certs/key.der" ]] && return 0
+  command -v openssl >/dev/null 2>&1 || die "缺 certs/*.der 且系统无 openssl——先装 openssl 或手工跑 tools/quic-ab/certs/gen_certs.sh"
+  log "现场生成自签证书（tools/quic-ab/certs/gen_certs.sh）…"
+  "$AB_ROOT/certs/gen_certs.sh" > /dev/null || die "证书生成失败"
+}
+
 mkdir -p "$OUT"
 : > "$OUT/loadavg.tsv"
+ensure_certs
 # loadavg 1Hz 采样（带时间戳；轮首/轮末由 mark() 打标记）
 mark() { printf -- '-- %s\n' "$1" >> "$OUT/loadavg.tsv"; }
 (
@@ -95,7 +107,15 @@ runner() {  # runner <档目录> <臂> → 二进制路径
     *) die "未知臂：$2" ;;
   esac
 }
-profile_dir() { [[ "$1" == "lab" ]] && echo "release" || echo "product"; }
+profile_dir() {  # 显式映射；未知档位即红（防 `--profile lab,product` 之类静默跑成 product）
+  case "$1" in
+    lab) echo "release" ;;
+    product) echo "product" ;;
+    *) die "未知 --profile 档位：$1（只认 lab / product）" ;;
+  esac
+}
+# `--profile` 允许逗号列表（例：lab,product）：cpu/overhead/mem 用**第一个**；size 逐个跑。
+PROFILES=("${(@s:,:)PROFILE}")
 
 # 等服务端打印 PORT（内核分配端口后读回——**全程无固定端口**），回显端口
 wait_port() {  # wait_port <log> [timeout_ds=100]
@@ -147,6 +167,15 @@ build_probe() {  # build_probe <prof-dir 名> → 构建两 workspace 的探针�
   if grep -qi 'profiles for the non root package will be ignored' "$OUT/build-arms-$p.log" "$OUT/build-shim-$p.log"; then
     die "构建日志出现「非根 profile 被忽略」——档位会静默失效"
   fi
+  # 执行用二进制指纹（**构建时**快照——收尾重算会与「本次真正跑的那批」不一致，代码门 L4）
+  {
+    echo "=== 档位 $p / $(date '+%Y-%m-%d %H:%M:%S')（本次执行用二进制快照）==="
+    for f in "$ARMS_DIR/target/$p/raw" "$ARMS_DIR/target/$p/wg" "$ARMS_DIR/target/$p/wg_size" \
+             "$ARMS_DIR/target/$p/quic" "$ARMS_DIR/target/$p/multiconn" "$SHIM_DIR/target/$p/wg"; do
+      [[ -f "$f" ]] && shasum -a 256 "$f"
+    done
+  } >> "$OUT/bins.sha256"
+
   # 档位记录（**cargo metadata 不暴露 profile 值** ⇒ 记 manifest 原文 + 两档尺寸差对照，
   # 见 size 子命令；两者合起来即「档位没静默失效」的证据）
   {
@@ -183,7 +212,7 @@ run_arm_cpu() {  # run_arm_cpu <arm> <round> <prof-dir>
 }
 
 cmd_cpu() {
-  local p=""; p=$(profile_dir "$PROFILE")
+  local p=""; p=$(profile_dir "${PROFILES[1]}")
   build_probe "$p"
   local med=()
   for r in $(seq 1 $ROUNDS); do
@@ -209,7 +238,7 @@ cmd_cpu() {
 
 # ---------- overhead ----------
 cmd_overhead() {
-  local p=""; p=$(profile_dir "$PROFILE")
+  local p=""; p=$(profile_dir "${PROFILES[1]}")
   build_probe "$p"
   local out="$OUT/overhead.txt"; : > "$out"
   mark "overhead start"
@@ -252,26 +281,36 @@ cmd_size() {
   local out="$OUT/size-matrix.txt"; : > "$out"
   # lab 档三格（M0 设计 §4.3/§5.1）：①② 来自空壳探针（v1 形态，无 boringtun/smoltcp），
   # ③ 来自 v2 形态探针（boringtun+smoltcp 在场 + 真引用全路径）。第④格 = 现役 .so 对照。
+  # `--profile` 列表逐档全跑（lab = target/release；product = target/product）；
+  # 注意 `lab_so` 取的是**最后一个 real 档**的值，两档尺寸差只在 lab∈列表时打印。
   local lab_so=""
   local -a cfgs=(
-    "shell:quic-ab-size-shell:target/$OHOS_TARGET/release/libclientcore.so:"
-    "shell-quic:quic-ab-size-shell:target/$OHOS_TARGET/release/libclientcore.so:--features quic"
-    "real:quic-ab-size:target/$OHOS_TARGET/release/libclientcore2.so:--features quic"
+    "shell:quic-ab-size-shell:libclientcore.so:"
+    "shell-quic:quic-ab-size-shell:libclientcore.so:--features quic"
+    "real:quic-ab-size:libclientcore2.so:--features quic"
   )
+  for prof in "${PROFILES[@]}"; do
+  local pdir=""; pdir=$(profile_dir "$prof")
   for cfg in "${cfgs[@]}"; do
     local name="${cfg%%:*}"
     local rest="${cfg#*:}"; local pkg="${rest%%:*}"
-    rest="${rest#*:}"; local rel="${rest%%:*}"; local feats="${rest#*:}"
+    rest="${rest#*:}"; local so_base="${rest%%:*}"; local feats="${rest#*:}"
     local args=()
-    [[ -n "$feats" ]] && args=(${(s: :)feats})
-    ( cd "$ARMS_DIR" && cargo build --release --target "$OHOS_TARGET" -p "$pkg" "${args[@]}" > "$OUT/size-$name.log" 2>&1 ) || { tail -20 "$OUT/size-$name.log"; die "size 构建失败（$name）"; }
-    local bn="${rel:t}"; bn="${bn%.so}"          # zsh 参数修饰符不做 `//` 替换 ⇒ 分两步
-    local stripped="$OUT/${bn}-$name.so"
+    [[ -n "$feats" ]] && args=("${(@s: :)feats}")
+    if [[ "$pdir" == "release" ]]; then
+      ( cd "$ARMS_DIR" && cargo build --release --target "$OHOS_TARGET" -p "$pkg" "${args[@]}" > "$OUT/size-$name.log" 2>&1 ) || { tail -20 "$OUT/size-$name.log"; die "size 构建失败（$name）"; }
+    else
+      ( cd "$ARMS_DIR" && cargo build --profile product --target "$OHOS_TARGET" -p "$pkg" "${args[@]}" > "$OUT/size-$name.log" 2>&1 ) || { tail -20 "$OUT/size-$name.log"; die "size 构建失败（$name，product 档）"; }
+    fi
+    local rel="target/$OHOS_TARGET/$pdir/${so_base}"
+    local bn="${so_base%.so}"
+    local stripped="$OUT/${bn}-$name-$prof.so"
     cp "$ARMS_DIR/$rel" "$stripped"
     "$NDK_STRIP" "$stripped"
     local sz=""; sz=$(wc -c < "$stripped" | tr -d ' ')
-    printf 'lab 档 %-11s %12s B（%s %s）\n' "$name" "$sz" "$pkg" "$feats" | tee -a "$out" "$OUT/summary.txt"
+    printf '%-8s %-11s %12s B（%s %s）\n' "$prof 档" "$name" "$sz" "$pkg" "$feats" | tee -a "$out" "$OUT/summary.txt"
     [[ "$name" == "real" ]] && lab_so="$sz"
+  done
   done
   # 第四格：现役 .so 对照（主检出只读；不存在则显式登记缺位）
   local main_so="${HOMEWAY_MAIN_SO:-$REPO_ROOT/../homeway-rs/target/$OHOS_TARGET/release/libclientcore.so}"
@@ -288,8 +327,10 @@ cmd_size() {
   local pso="$ARMS_DIR/target/$OHOS_TARGET/product/libclientcore2.so"
   local psz=""; psz=$(wc -c < "$pso" | tr -d ' ')
   printf 'product 档 real %8s B（探针；只登记）\n' "$psz" | tee -a "$out" "$OUT/summary.txt"
-  if [[ -n "$lab_so" ]]; then
+  if (( ${PROFILES[(I)lab]} )) && [[ -n "$lab_so" ]]; then
     printf '两档尺寸差（real 档）：lab=%s B vs product=%s B（差 %s B，档位有效）\n' "$lab_so" "$psz" "$(( psz - lab_so ))" | tee -a "$out" "$OUT/summary.txt"
+  else
+    printf '两档尺寸差：未同时跑 lab 与 product（--profile=%s）⇒ 跳过对照\n' "$PROFILE" | tee -a "$out" "$OUT/summary.txt"
   fi
   # 真产品面：build-app-core.sh（product 档 + NDK strip）= M0 硬判据的产物 + 增量
   if [[ -x "$REPO_ROOT/tools/build-app-core.sh" ]]; then
@@ -334,7 +375,7 @@ start_idle_client() {  # start_idle_client <arm> <prof-dir> <idle_secs> <srvlog>
 }
 
 cmd_mem() {
-  local p=""; p=$(profile_dir "$PROFILE")
+  local p=""; p=$(profile_dir "${PROFILES[1]}")
   build_probe "$p"
   local out="$OUT/mem-$MODE.txt"; : > "$out"
   mark "mem($MODE) start"
@@ -403,12 +444,23 @@ mem_load() {  # peak_probe.sh 口径：N=300000 传输中每 250ms 采样 max + 
   done
 }
 
-mem_conns() {  # multiconn：N=1,3,5 点 → base + 每连接边际（服务端 footprint）
+mem_conns() {  # multiconn：点集拟合 base + 每连接边际（服务端 footprint）
+  # 口径（设计 §4.3）：默认点集 = 1,3,5（三点）；`--conns N` ⇒ 取 1,3,5,… 到 N（奇数序列）；
+  # `--conns-points "1,2,3,4,5"` 显式指定（供「5 点拟合」这类补测**可复现**——代码门 M2）。
   local p="$1" out="$2"
   local bin=""; bin=$(runner "$p" multiconn)
   [[ -x "$bin" ]] || die "multiconn 探针不在：$bin"
   local pts=()
-  for n in 1 3 5; do
+  local fit_pts=()
+  if [[ -n "$CONNS_POINTS" ]]; then
+    pts=("${(@s:,:)CONNS_POINTS}")
+  else
+    local n=1
+    while (( n <= CONNS )); do pts+=($n); (( n += 2 )); done
+    (( ${#pts} >= 1 )) || pts=(1)
+  fi
+  echo "点集：${(j:, :)pts}（--conns=$CONNS${CONNS_POINTS:+ --conns-points=$CONNS_POINTS}）" | tee -a "$out"
+  for n in "${pts[@]}"; do
     local slog="$OUT/conns-$n-srv.out"
     "$bin" server "$n" > "$slog" 2>&1 &   # multiconn 的 server 读 argv[2]（不用 env）
     local spid=$!; KIDS+=($spid)
@@ -426,12 +478,23 @@ mem_conns() {  # multiconn：N=1,3,5 点 → base + 每连接边际（服务端 
     local m=""; m=$(lower_median "${vals[@]}")
     pts+=("$n $m")
     printf '  conns=%s: 服务端 footprint=%sK\n' "$n" "$m"
+    fit_pts+=("$n $m")
     kill "$cpid" "$spid" 2>/dev/null || true
     sleep 0.5
   done
-  local fit=""; fit=$(printf '%s\n' "${pts[@]}" | awk 'NR==1{x1=$1;y1=$2} NR==2{x2=$1;y2=$2} {xn=$1;yn=$2} END{ if (x2==x1) {print "拟合失败"; exit} slope=(y2-y1)/(x2-x1); base=y1-slope*x1; printf "base=%.1fK 每连接边际=%.2fK（点：%s）", base, slope, "N/medK 见表" }')
+  # 拟合：**全点最小二乘**（斜率 = Σ(x-x̄)(y-ȳ)/Σ(x-x̄)²）+ 端点斜率（供对照）
+  local fit=""; fit=$(printf '%s\n' "${fit_pts[@]}" | awk '
+    {x[NR]=$1; y[NR]=$2; sx+=$1; sy+=$2; n=NR}
+    END{
+      if (n<2) {print "点不足（<2）"; exit}
+      mx=sx/n; my=sy/n; sxy=0; sxx=0;
+      for(i=1;i<=n;i++){ sxy+=(x[i]-mx)*(y[i]-my); sxx+=(x[i]-mx)*(x[i]-mx) }
+      slope = (sxx==0 ? 0 : sxy/sxx); base = my - slope*mx;
+      printf "base=%.1fK 每连接边际=%.2fK（全点最小二乘，%d 点）", base, slope, n
+      if (n>=2) printf "；端点斜率=%.2fK", (y[n]-y[1])/(x[n]-x[1])
+    }')
   echo "multiconn（服务端）：$fit" | tee -a "$out" "$OUT/summary.txt"
-  printf '%s\n' "${pts[@]}" | tee -a "$out"
+  printf '%s\n' "${fit_pts[@]}" | tee -a "$out"
 }
 
 mem_rss() {  # **诊断档，不作判据**（lab 已证：同机两臂差 4.3MB 而二进制差 176B）
@@ -463,16 +526,10 @@ mem_rss() {  # **诊断档，不作判据**（lab 已证：同机两臂差 4.3MB
 
 # ---------- 收束：bins 指纹 + 读数 ----------
 finalize() {
-  : > "$OUT/bins.sha256"
-  for f in "$ARMS_DIR/target/release/raw" "$ARMS_DIR/target/release/wg" "$ARMS_DIR/target/release/wg_size" \
-           "$ARMS_DIR/target/release/quic" "$ARMS_DIR/target/release/multiconn" \
-           "$SHIM_DIR/target/release/wg"; do
-    [[ -f "$f" ]] && shasum -a 256 "$f" >> "$OUT/bins.sha256"
-  done
   {
     echo ""
-    echo "=== bins.sha256（$(date '+%Y-%m-%d %H:%M:%S')；全文见 bins.sha256）==="
-    cat "$OUT/bins.sha256"
+    echo "=== bins.sha256（构建时快照；全文见 bins.sha256）==="
+    if [[ -f "$OUT/bins.sha256" ]]; then cat "$OUT/bins.sha256"; else echo "（本次未构建探针——size 子命令不含臂二进制）"; fi
     echo ""
     echo "=== 环境 ==="
     echo "host: $(uname -a)"

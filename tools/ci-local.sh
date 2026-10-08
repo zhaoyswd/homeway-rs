@@ -62,8 +62,18 @@ fi
 BAD_FLAG="$(grep -- '-nostdlibinc' /tmp/ci-local-ccohos.log | grep -v -- '-ring-' || true)"
 [[ -z "$BAD_FLAG" ]] || fail 3 "-nostdlibinc 落到非 ring 的 C 依赖上：$BAD_FLAG"
 
+# ring 的 C 侧产物**正向自校准**（代码门 ③-2：热缓存下 -nostdlibinc 断言会「空过」——
+# 没有编译器调用行可查 ⇒ 用「产物在位」补一条正向证据）
+RING_A=( "$REPO_ROOT"/target/aarch64-unknown-linux-ohos/debug/build/ring-*/out/libring_core_*.a(N) )
+if (( ${#RING_A} > 0 )); then
+  echo "  -- ring 的 C 侧产物在位：${RING_A[1]:t}"
+else
+  echo "  ⚠️ ring 的 C 侧产物不在（热清缓存后首次 check 会重建；本步不判红，靠 check 自身）"
+fi
+
 echo "  -- OHOS 真链路构建（tools/build-app-core.sh；档位：$OHOS_CC_TIER）"
 if [[ -x "$NDK_CC" ]]; then
+  unset CFLAGS_aarch64_unknown_linux_ohos   # 真构建必须真 sysroot（M7：不靠人肉纪律）
   "$REPO_ROOT/tools/build-app-core.sh" > /tmp/ci-local-appcore.log 2>&1 || { tail -20 /tmp/ci-local-appcore.log; fail 3 "OHOS 真链路（build-app-core.sh）"; }
   grep -E '^\[(sym|ver|size)\]' /tmp/ci-local-appcore.log || true
 else

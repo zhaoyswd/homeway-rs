@@ -11,6 +11,10 @@ use std::sync::Arc;
 /// **M0 只有三条成员**（骨架真落地、真被测；不带未构造变体——那会触发 `dead_code`）。
 /// M1–M4 的命令面（`Connect`/`Migrate`/`SetCandidates`/`SetOnUnhealthy`/`SetOnEvent`/
 /// `StreamOpen`/… ）由各期设计门定稿后增补；新增成员**必须**写明「带 reply 与否 + 理由」。
+///
+/// `#[non_exhaustive]`（AGENTS 工程原则 1：协议帧类型；本枚举是**明确会长的跨 crate 消费面**
+/// ——消费侧必须留通配臂，M1 加成员不会硬断下游）。
+#[non_exhaustive]
 pub enum Cmd {
     /// L3 直通 attach（M1 起语义 = `wgcore::attach_tun`：**fd 所有权在扩展，岛从不 close**）。
     TunAttach {

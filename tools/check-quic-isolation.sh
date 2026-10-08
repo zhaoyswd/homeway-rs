@@ -55,35 +55,37 @@ ISLAND_MANIFEST_HITS="$(hits_toml "$ISLAND/Cargo.toml" '(^|[^A-Za-z0-9_-])(quinn
 (( ISLAND_MANIFEST_HITS >= 3 )) || fail "岛的 manifest 未声明全三条异步依赖（仅 ${ISLAND_MANIFEST_HITS} 条命中）"
 echo "  ① 通过：异步栈依赖只在 crates/homeway-quic/Cargo.toml（其余三个 manifest 零命中）"
 
-# ---------- ② 异步名字只在 driver.rs ----------
+# ---------- ② 异步名字只在 driver.rs（**递归**：M1 起 src/ 会长出子目录） ----------
 BAD_SRC=""
 SCANNED=0
-for f in "$SRC"/*.rs; do
+for f in "${(@f)$(find "$SRC" -name '*.rs' | sort)}"; do
   [[ "${f:t}" == "driver.rs" ]] && continue
   SCANNED=$(( SCANNED + 1 ))
   h="$(hits_rs "$f" 'tokio::|quinn|rustls|async fn|\.await')"
   [[ -n "$h" ]] && BAD_SRC+="${f}:"$'\n'"${h}"$'\n'
 done
 [[ -z "$BAD_SRC" ]] || fail $'岛内公面/协议/小件文件出现异步栈名字（只许 driver.rs）：\n'"$BAD_SRC"
+# 自校准（fail-closed）：扫描面不得为空/被截断（新增文件漏扫时本门必须红）
+(( SCANNED >= 4 )) || fail "扫描到的源文件数异常（${SCANNED} < 4）——检查 find/排除逻辑，门可能空过"
 DRIVER_HITS="$(hits_rs "$SRC/driver.rs" 'tokio::' | wc -l | tr -d ' ')"
 (( DRIVER_HITS >= 1 )) || fail "driver.rs 零 tokio:: 命中——门自身失准（宿主必须用 runtime）"
-echo "  ② 通过：tokio/quinn/rustls/async/.await 只出现在 src/driver.rs（其余 ${SCANNED} 个文件零命中）"
+echo "  ② 通过：tokio/quinn/rustls/async/.await 只出现在 src/driver.rs（递归扫过 ${SCANNED} 个文件，零命中）"
 
 # ---------- ③ 阻塞面：零 sleep；block_on 只在 driver.rs ----------
 BAD_SLEEP=""
-for f in "$SRC"/*.rs; do
+for f in "${(@f)$(find "$SRC" -name '*.rs' | sort)}"; do
   h="$(hits_rs "$f" 'std::thread::sleep|thread::sleep\(')"
   [[ -n "$h" ]] && BAD_SLEEP+="${f}:"$'\n'"${h}"$'\n'
 done
 [[ -z "$BAD_SLEEP" ]] || fail $'岛内出现阻塞 sleep（异步上下文禁阻塞）：\n'"$BAD_SLEEP"
 BAD_BLOCK=""
-for f in "$SRC"/*.rs; do
+for f in "${(@f)$(find "$SRC" -name '*.rs' | sort)}"; do
   [[ "${f:t}" == "driver.rs" ]] && continue
   h="$(hits_rs "$f" 'block_on')"
   [[ -n "$h" ]] && BAD_BLOCK+="${f}:"$'\n'"${h}"$'\n'
 done
 [[ -z "$BAD_BLOCK" ]] || fail $'block_on 只许出现在 driver.rs：\n'"$BAD_BLOCK"
-echo "  ③ 通过：岛内零阻塞 sleep；block_on 只在 src/driver.rs"
+echo "  ③ 通过：岛内零阻塞 sleep；block_on 只在 src/driver.rs（递归扫描）"
 
 # ---------- ④ aws-lc 零命中 ----------
 for m in "$REPO_ROOT/Cargo.toml" "$ISLAND/Cargo.toml" "$CRATES/homeway-core/Cargo.toml"; do

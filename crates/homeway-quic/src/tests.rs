@@ -251,11 +251,24 @@ fn island_panic_is_classified_in_place_and_surfaces_as_engine_gone() {
     );
     assert!(t0.elapsed() < CAP, "收工不得越过上界（实测 {:?}）", t0.elapsed());
 
-    // ④ join 分支的 panic 记行（本测只经 stop_within 收工 ⇒ 该行必出自该分支）
+    // ④ join 分支的 panic 记行。**非恒真断言**（代码门 M5 整改）：
+    //   · 命中行必须带本测的注入文案（= 出自岛内 panic 载荷，不是别的行）；
+    //   · 必须**同时**存在岛内就地分类行（`岛内 panic`）——两条分工不同（§3.6-4）；
+    //   · 必须**没有**收割线程行（`hw-quic-reap`）——本测走预算内收工，行只能出自
+    //     `stop_within` 的 join 分支（若谁把行改到收割线程，本断言即红）。
     let lines = drain_until(&logs, "本世代 QUIC 面已死", Duration::from_secs(2));
+    let join_lines: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("岛线程 panic") && l.contains(seams::MARK_PANIC))
+        .collect();
+    assert_eq!(join_lines.len(), 1, "join 侧恰一行且带注入文案：{lines:?}");
     assert!(
-        lines.iter().any(|l| l.contains("岛线程 panic")),
-        "join 分支必须记 panic 行：{lines:?}"
+        lines.iter().any(|l| l.contains("岛内 panic")),
+        "岛内就地分类行必须在（§3.6-1）：{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("hw-quic-reap")),
+        "预算内收工不得出现收割线程行（行归属 = stop_within 的 join 分支）：{lines:?}"
     );
 }
 
@@ -286,9 +299,16 @@ fn stuck_island_panic_line_comes_from_reaper() {
             .any(|l| l.contains("hw-quic-reap") && l.contains("到点 detach")),
         "收割线程必须先留接手行：{lines:?}"
     );
+    // **非恒真断言**（代码门 M5 整改）：命中行必须带**卡死**注入文案（证明是「卡死窗过后
+    // 的 panic」被收割线程 join 到时记的），且恰一行；岛内就地分类行也应在。
+    let join_lines: Vec<&String> = lines
+        .iter()
+        .filter(|l| l.contains("岛线程 panic") && l.contains(seams::MARK_STALL))
+        .collect();
+    assert_eq!(join_lines.len(), 1, "收割线程的 join 侧恰一行且带卡死文案：{lines:?}");
     assert!(
-        lines.iter().any(|l| l.contains("岛线程 panic")),
-        "收割线程的 join 分支必须记 panic 行：{lines:?}"
+        lines.iter().any(|l| l.contains("岛内 panic")),
+        "岛内就地分类行必须在（§3.6-1）：{lines:?}"
     );
 }
 

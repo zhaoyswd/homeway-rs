@@ -1,12 +1,13 @@
 //! 体积探针：在 boringtun + smoltcp 已在场的前提下，量 QUIC 栈的**边际增量**。
 //!
-//! 注意（口径登记）：真迁移中 ring-shim 会随 WG 删除退役，故本探针（含垫片依赖）的
-//! 增量是**上界**；转入自 `/tmp/quic-lab/size-probe2/src/lib.rs`。
+//! 口径登记（**与 lab 有差，别照搬 lab 的注释**）：lab 的 `size-probe2` 带
+//! `[patch] ring = ring-shim`（boringtun 的 0.16.20 走垫片）；`tools/quic-ab/arms`
+//! **不带 patch** ⇒ 本探针的 boringtun 走 crates.io 真 ring 0.16.20。故 lab 那句
+//! 「含垫片 ⇒ 增量是上界」在本仓**不成立**：对「M5 后 shim 退役」的形态本探针更贴近，
+//! 对「现役手机形态（shim）」则少算垫片那部分（垫片很小）。四档矩阵的分工见 Cargo.toml。
 //!
-//! 三档导出面（供 harness 的四档矩阵）：
-//!   · 无 feature      = 空壳（只 ClientCore2Version）
-//!   · `quic-shallow`  = 浅引用（QUIC 类型/常量级 —— 量死码消除后的在场成本）
-//!   · `quic`          = 真引用（ProbeRunQuic 同进程自连一次）
+//! 导出面：`ClientCore2Version` + `ProbeWgTouch`（base 引用保活）+ `ProbeRealQuic`
+//! （lab 同款占位导出）+ `--features quic` 下的 `ProbeRunQuic`（真自连）。
 
 use std::ffi::CString;
 
@@ -27,21 +28,6 @@ pub extern "C" fn ProbeWgTouch() -> usize {
     cfg.random_seed = 42;
     let _medi = &mut smoltcp::phy::Loopback::new(smoltcp::phy::Medium::Ip);
     std::mem::size_of_val(&cfg) + cfg.random_seed as usize
-}
-
-/// 浅引用档：触碰 QUIC 栈的公共面但不跑全路径（死码消除后仍被链接的部分即此档增量）。
-#[cfg(feature = "quic-shallow")]
-#[no_mangle]
-pub extern "C" fn SizeProbeQuicTouch() -> usize {
-    use quinn::{TransportConfig, VarInt};
-    let mut t = TransportConfig::default();
-    t.datagram_send_buffer_size(1 << 20);
-    t.max_concurrent_bidi_streams(VarInt::from_u32(0));
-    let _ = rustls::crypto::ring::default_provider();
-    std::mem::size_of_val(&t)
-        + std::mem::size_of::<tokio::runtime::Runtime>()
-        + rustls::crypto::ring::default_provider().cipher_suites.len()
-        + bytes::Bytes::from_static(b"size-probe").len()
 }
 
 #[cfg(feature = "quic")]
@@ -180,3 +166,9 @@ mod quicreal {
 }
 #[cfg(feature = "quic")]
 pub use quicreal::ProbeRunQuic;
+
+/// 空壳导出（lab 同款占位：cdylib 至少需要一个导出；真实面在 bin 里）
+#[no_mangle]
+pub extern "C" fn ProbeRealQuic() -> i32 {
+    0
+}

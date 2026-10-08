@@ -72,6 +72,9 @@ jobs:
           # （防将来新引入的 C 依赖静默继承 check 档 flag）
           bad="$(grep -- '-nostdlibinc' /tmp/cc.log | grep -v -- '-ring-' || true)"
           [ -z "$bad" ] || { echo "!! -nostdlibinc 落到非 ring 的 C 依赖上："; echo "$bad"; exit 1; }
+          # 正向自校准（代码门 ③-2）：热缓存下断言会「空过」（无编译器调用行）⇒ 再查 ring 的
+          # C 侧产物确实为本目标产出过（`cargo check` 执行 build script 但不链接）
+          ls target/${{ matrix.target }}/debug/build/ring-*/out/libring_core_0_17_14_.a
         env:
           CC_aarch64_unknown_linux_ohos: clang
           CFLAGS_aarch64_unknown_linux_ohos: -nostdlibinc -DRING_CORE_NOSTDLIBINC -isystem ${{ github.workspace }}/tools/cc-check-shim

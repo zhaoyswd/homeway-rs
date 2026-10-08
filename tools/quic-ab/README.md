@@ -23,6 +23,20 @@
 | `wg-shim` | boringtun 0.6 + 本仓 `tools/ring-shim`（RustCrypto 垫片） | **手机上现役形态** | `wg-shim/target/release/wg` |
 | `quic` | quinn 0.11 + rustls(ring 0.17) + tokio，QUIC DATAGRAM | QUIC 每包成本（相对地板） | `arms/target/release/quic` |
 
+**口径微漂登记（代码门 L9/L5，如实列，勿当"逐项照搬"的完美复制）**：
+
+- lab 矩阵的 QUIC 臂用 `NQ=40000`（`/tmp/quic-lab/run_matrix.sh`），本 harness 统一 `--n 60000`
+  （设计 §4.2 的默认口径）——差异对每包 CPU 无影响（比值口径），但读数次数不同；
+- `mem --mode load` 的采样窗 = 120×250ms = **30s**（lab `peak_probe.sh` 为 60×250ms = 15s）
+  ——覆盖更完整，代价是单臂更久；
+- `mem --mode conns` 的点集：默认 `1,3,5`（设计 §4.3 口径，`--conns 5` ⇒ 1,3,5；
+  `--conns N` ⇒ 1,3,5,… 到 N），可用 `--conns-points "1,2,3,4,5"` 显式指定（5 点拟合可复现）；
+  拟合 = **全点最小二乘**（旧 lab 的手抄 37.6K/连接为 5 点口径，原始采样未留存）；
+- `arms/size`（四档第三格）的 ring 来源与 lab 的 `size-probe2` **不同**：lab 带
+  `[patch] ring = ring-shim`（boringtun 走垫片），本 harness 的 arms 无 patch ⇒ boringtun 走
+  crates.io **真 ring 0.16.20**。故 lab 注释里"含垫片 ⇒ 增量是上界"在本仓不成立
+  （实测仍在 ±10% 带内：−4.9%）。
+
 **口径订正（必须照搬，勿重犯——M0 设计 §0.3）**：
 
 1. `wg-ring` 臂的 ring 是 **0.16.20**（crates.io 真版，boringtun 0.6 自身声明）——**不是 0.17**。
@@ -44,8 +58,8 @@
 | `cpu` | 多臂每包 CPU 矩阵（默认 `raw,wg-shim,quic`） | `--arms a,b,c`（含 `wg-ring` 诊断臂）、`--payload 1280`、`--n 60000`、`--rounds 3`、`--mtu 1400`、`--profile lab\|product` |
 | `overhead` | 线开销（WG 侧 = `wg_size` 探针的 encapsulate 线上字节；QUIC 侧 = oneway 服务端 `udp_rx` 口径）+ `max_datagram_size` 精确打印（MTU1200→1162 / MTU1400→1362） | `--n 60000`、`--mtu 1400` |
 | `size` | OHOS cdylib 体积矩阵（lab 档三格 + 现役对照 + product 档增量） | `--profile lab,product`（默认两档都跑） |
-| `mem` | footprint 采样 | `--mode steady\|load\|conns\|rss`、`--rounds 3`、`--conns 5` |
-| `all` | 顺序跑 `cpu → overhead → size → mem` | 透传上述 |
+| `mem` | footprint 采样 | `--mode steady\|load\|conns\|rss`、`--rounds 3`、`--conns 5`、`--conns-points "1,2,3,4,5"` |
+| `all` | 顺序跑 `cpu → overhead → size → mem` | 透传上述；`--profile` 为逗号列表时 `size` 逐档跑（其余子命令取第一个档） |
 
 ## 判据（附录 A ±10%；M0 设计 §4.5）
 
