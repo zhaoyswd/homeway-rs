@@ -84,7 +84,7 @@
 
 | 门 | 命令 | 结果 |
 |---|---|---|
-| 测试 | `cargo test --workspace` | **lib 642 passed / 0 failed / 4 ignored** + 其余目标全绿（E2E `qh_config_failfast` 5 passed，含本批新增 2 例） |
+| 测试 | `cargo test --workspace` | **lib 642 passed / 0 failed / 4 ignored** + 其余目标全绿（E2E `qh_config_failfast` 5 passed，含本批新增 2 例）；收口后复跑三轮 = 642/0、641/1（在册 flake，见 §2.4）、642/0 |
 | 静态 | `cargo clippy --workspace --all-targets -- -D warnings` | **clean**（`-D` 置于 `--` 后；仓内惯例写法） |
 | 交叉 | `cargo check --target x86_64-unknown-linux-musl --all-targets -p homeway-core -p homeway-cli`；`--target aarch64-unknown-linux-musl`；`--target aarch64-unknown-linux-ohos -p homeway-core -p homeway-cli -p homeway-capi` | **全过**（含 `#[cfg(target_os="linux")]` 测试面 = 防 Q-H H1 同型「linux 下 `--all-targets` 编译失败」；唯一告警 = 既有 `libc::time_t` deprecated，非本批） |
 | 词表 | `zsh tools/check-vocab.sh` | **PASS**（5 单元/26 值；ledger sha256 一致） |
@@ -123,6 +123,7 @@
 |---|---|---|
 | `daemon::tests::server_bad_frame_gets_goodbye_and_disconnect`（**在册**） | 全量轮首跑红（`daemon/tests.rs:696` 空读）；本树隔离 **5 跑 3 红 2 绿**（同一二进制红绿翻转）；**基线 `git stash` 隔离 8 跑 3 红 5 绿**（可复现）；与改动面零交集（`daemon/**` 未改） | **flake**（三项齐：隔离红绿翻转 + 无交集 + 基线复现）；后续全量轮未再命中 |
 | `server::bind::tests::dual_stack_listen_and_unmap`（**新登记**，代码门 dsh 观察） | 与另一 `cargo test` 并发时红（200×5ms 轮询窗）、隔离 5/5 绿；`bind.rs` 未改 | **flake**（已补进 `REVIEW-ROADMAP.md` 已知 flake 表） |
+| `term::service::tests::attach_size_applies_to_pty`（**在册**） | 收口后全量复跑三轮：一轮 642/0 绿、一轮 641/1 红（本用例 60s 硬期限超时，整轮 67.8s）、一轮 642/0 绿——**同一二进制跨轮红绿翻转**；隔离 3/3 绿（0.85s/次）；该轮以来的提交均为文档（代码与 642 全绿轮逐字节相同） | **flake**（在册条目「PTY 时序；隔离恒绿、并发/高负载下超时红」的原样再现） |
 
 ---
 
