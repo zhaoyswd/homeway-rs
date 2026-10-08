@@ -294,17 +294,11 @@ pub struct EndpointInputs {
 /// - 「token 端点 %q 端口非法（跳过）」（域名字面量端口非 1-65535）
 /// - 「token 端点 %s 解析为 %d 个地址（%s）」
 ///
-/// **M1 S1c：QUIC 类端点在此被过滤掉**（设计 §2.1 末段「候选按 transport 过滤——两族候选
-/// 不得互相投喂」）：本函数是 **WG 面**的候选展开（`wtransport::Bind` / 客户端的 WG 栈），
-/// QUIC 类端点的端口是 QUIC 端口（与 WG 端口不同，§1.1），当 WG 候选只会产出「握手超时」
-/// 噪声与赛跑结算失真。QUIC 档的候选由 S2 的岛从同一 token 里按 `kind==Quic` 取。
+/// **入参须已按 transport 过滤**（M1 §2.1 末段「两族候选不得互相投喂」）：WG 面的调用方
+/// 传 `token::wg_endpoint_refs(...)`（滤掉 QUIC 类端点——QUIC 端口与 WG 端口不同，§1.1，
+/// 当 WG 候选只会产出「握手超时」噪声与赛跑结算失真）；QUIC 档的候选由 S2 的岛按
+/// `kind==Quic` 取。过滤放在 `token` 侧（本文件属 `wtransport/**`，M1 S1c 的红线面）。
 pub fn split_and_resolve(eps: &[EndpointRef<'_>], logf: &Logf) -> EndpointInputs {
-    let eps: Vec<EndpointRef<'_>> = eps
-        .iter()
-        .copied()
-        .filter(|e| e.kind != EndpointKind::Quic)
-        .collect();
-    let eps: &[EndpointRef<'_>] = &eps;
     let mut out = Vec::with_capacity(eps.len());
     let mut seen: Vec<SocketAddr> = Vec::new(); // 全局去重（token 内跨组同址：先到先得）
     let mut seen_static: Vec<SocketAddr> = Vec::new();
@@ -609,35 +603,6 @@ mod tests {
         assert!(!got.candidates[0].relay, "先到的直连形态保留");
         assert!(got.candidates[1].relay);
         assert!(got.domains.is_empty());
-    }
-
-    /// **判据（M1 S1c 的「WG 档不吃 QUIC 端点」）**：QUIC 类端点**不进** WG 候选
-    /// （地址/端口都不是 WG 面）；同时其余两类的行为逐字不变（含 relay 位与去重序）。
-    #[test]
-    fn quic_endpoints_are_filtered_from_wg_candidates() {
-        let (logf, _lines) = mem_logf();
-        let eps = vec![
-            EndpointRef::new("1.2.3.4:41641", EndpointKind::Direct),
-            EndpointRef::new("1.2.3.4:41652", EndpointKind::Quic), // 同址不同口 = QUIC 端口
-            EndpointRef::new("5.6.7.8:41741", EndpointKind::Relay),
-        ];
-        let got = split_and_resolve(&eps, &logf);
-        assert_eq!(got.candidates.len(), 2, "QUIC 端点被滤掉（只留 WG 两类）");
-        assert!(
-            got.candidates.iter().all(|c| c.addr.port() != 41652),
-            "QUIC 端口不得进 WG 候选：{:?}",
-            got.candidates.iter().map(|c| c.addr).collect::<Vec<_>>()
-        );
-        assert!(got.static_base.iter().all(|c| c.addr.port() != 41652));
-        assert!(got.domains.is_empty() && got.domain_initial.is_empty());
-        // 反向对照：把 QUIC 条目「当成 Direct」喂进去 ⇒ 它**会**进候选（证明本用例的
-        // 过滤真在起作用，不是「本来就空」）
-        let mislabeled = vec![
-            EndpointRef::new("1.2.3.4:41652", EndpointKind::Direct),
-        ];
-        let got2 = split_and_resolve(&mislabeled, &logf);
-        assert_eq!(got2.candidates.len(), 1, "同类目（Direct）时同一地址会进候选");
-        assert_eq!(got2.candidates[0].addr.port(), 41652);
     }
 
     /// 域名端点（localhost）展开 + 首解析记行 + 域名条目保留。

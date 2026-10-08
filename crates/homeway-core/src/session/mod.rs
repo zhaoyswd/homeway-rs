@@ -264,12 +264,9 @@ impl Session {
         // 端点解析：直连 + 中继（type=1）都进候选——中继是直连的后备（DirectFirst 窗口）。
         // 域名条目按 P0-4 展开（split_and_resolve：IP 字面量直入 + 域名建会话解析一次
         // + 原文保留给重解析）。
-        let ep_refs: Vec<crate::token::EndpointRef> = cfg
-            .token
-            .endpoints
-            .iter()
-            .map(|e| crate::token::EndpointRef::new(e.addr.as_str(), e.kind))
-            .collect();
+        // M1 S1c：WG 档候选**不吃 QUIC 类端点**（§2.1 末段）——过滤在
+        // `token::wg_endpoint_refs`（与 tun_exec / daemon reach 共用同一条规则）。
+        let ep_refs: Vec<crate::token::EndpointRef> = crate::token::wg_endpoint_refs(&cfg.token.endpoints);
         let inputs = crate::wtransport::domain_eps::split_and_resolve(&ep_refs, &logf);
         let candidates: Vec<Candidate> = inputs.candidates;
         let domain_eps = inputs.domains;

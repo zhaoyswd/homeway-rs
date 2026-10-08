@@ -626,9 +626,9 @@ fn reach(token_raw: &str) -> ReachReport {
     // 只取首个 A 会让多记录域名的活路径被误判不可达）；跨端点同址去重。
     let mut eps: Vec<(std::net::SocketAddr, bool)> = Vec::new();
     for ep in &tok.endpoints {
-        // M1 S1c：QUIC 类端点不是 WG 端点（连端口都不同）——`host reach` 是 WG 面探测
-        // ⇒ 与 `wtransport::domain_eps::split_and_resolve` 同规则过滤。
-        if ep.kind == EndpointKind::Quic {
+        // M1 S1c：WG 档不吃 QUIC 类端点（§2.1 末段）——`host reach` 是 WG 面探测，
+        // 判据与 `token::wg_endpoint_refs` 同源（`EndpointKind::is_wg`）。
+        if !ep.kind.is_wg() {
             continue;
         }
         let relay = ep.kind == EndpointKind::Relay;

@@ -915,12 +915,9 @@ fn gen_loop(
     let stop = Arc::new(AtomicBool::new(false));
     shared.set_stop_flag_if_current(gen, Arc::clone(&stop));
     // P0-4：域名端点展开（IP 字面量直入 + 域名建会话解析一次 + 原文留给重解析）。
-    let ep_refs: Vec<crate::token::EndpointRef> = cfg
-        .token
-        .endpoints
-        .iter()
-        .map(|e| crate::token::EndpointRef::new(e.addr.as_str(), e.kind))
-        .collect();
+    // M1 S1c：WG 档候选**不吃 QUIC 类端点**（§2.1 末段「两族候选不得互相投喂」）——
+    // 过滤在 `token::wg_endpoint_refs`（同规则被 daemon `host reach` 与 session 面共用）
+    let ep_refs: Vec<crate::token::EndpointRef> = crate::token::wg_endpoint_refs(&cfg.token.endpoints);
     let inputs = crate::wtransport::domain_eps::split_and_resolve(&ep_refs, &logf);
     let candidates: Vec<Candidate> = inputs.candidates;
     let domain_eps = inputs.domains;
