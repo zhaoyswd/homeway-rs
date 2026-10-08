@@ -237,7 +237,13 @@ Q-B F7 由 Q-K 注销、Q-I 尾段第一靶点由 Q-I 尾段 F1 落地）。
 2. `relay::tests::ctl_keepalive_echo`（代码门复核轮观察：`Os{54,ConnectionReset}` @ `relay/mod.rs:2051`）
    ——隔离复跑 3/3 绿、同树第二次全量 767/0 绿、与改动面零交集（未动 `relay/**`）⇒ 判 flake，
    已入册。
-3. 本批**无新增 flake**；在册 flake 本轮全量跑均未触发（767/0）。
+3. 本批**无新增 flake**；安静树全量跑 767/0（在册 flake 未触发）。
+
+**收口后复跑记录（push 后，如实留痕）**：push 后两次复跑遇**兄弟 worktree 的并发 `cargo test`
+仍在跑**（`ps` 直证 3–6 个实例）⇒ 分别红 1 条：① `daemon::carriers::forward::tests::per_host_cap_cascade_and_corrupt_file`
+（`EADDRINUSE` 20010——即上表机制 1）；② 跳过固定端口族后 `term::service::tests::attach_size_applies_to_pty`
+（在册 flake：PTY 时序，隔离复跑 **3/3 绿** 0.87–0.88s）。两次红的**全部**落在在册 flake 表内、
+与改动面零交集、隔离复跑绿 ⇒ 判 flake，非回归；安静树终态证据 = 上述 767/0 全量跑。
 
 ---
 
