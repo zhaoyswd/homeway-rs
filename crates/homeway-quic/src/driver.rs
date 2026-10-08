@@ -754,6 +754,8 @@ async fn handle_cmd(
             let _ = reply.send(Ok(()));
         }
         Cmd::TunPacket(pkt) => {
+            // 在途名额交还（§6.4 的有界通道等价实现：读线程占名额、岛消费即还）
+            ctx.counters.done_send();
             // 发送路径（S2-4）：①准入窗由结构保证（`Live` 只在 REG_SETTLE 之后存在）；
             // ②/③ 检包 + 缓冲预检 + 分类计数 = `client::dataplane::send_datagram_checked`
             // （**唯一**的 `send_datagram` 调用点）；无连接 ⇒ 归 `未登记`（登记前丢弃）。

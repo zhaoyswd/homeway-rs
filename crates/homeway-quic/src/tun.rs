@@ -32,6 +32,20 @@ pub(crate) const WRITE_THREAD: &str = "homeway-tun-write";
 /// 回程队列上限（设计 §6.4 矩阵：**2048 条**≈2.6MB @1280B；满 ⇒ 丢新 + 计数）。
 pub(crate) const RETURN_QUEUE_MAX: usize = 2048;
 
+/// TUN 读线程 → 岛的**在途上限**（设计 §6.4 矩阵：**有界通道 4096 条**≈5MB @1280B；
+/// 满 ⇒ **丢新 + 计数**（归 `未登记`——「投递不进」面；TUN 读线程**不阻塞**）。
+///
+/// 落法（**形态偏离，语义等价**，见 commit 偏离说明）：岛的命令通道是 M0 的 unbounded
+/// `Cmd` 通道（控制面命令也要走它、必须不阻塞），把整条通道改成有界会波及控制面；这里
+/// 在**生产侧**用一枚原子计数器把 `Cmd::TunPacket` 的在途条数卡在 4096（单生产者 +
+/// 岛侧消费即减 ⇒ 计数精确、无竞态），满则丢新。**等价于一个容量 4096 的有界队列**。
+pub(crate) const CMD_INFLIGHT_MAX: usize = 4096;
+
+/// 丢弃上报的**批量**粒度：读线程每攒够这么多条 `丢新` 才投一条 `DatagramDropped`
+/// （前提见 [`CMD_INFLIGHT_MAX`] 的等价性说明）；计数仍精确，尾批（≤63 条）在岛收工后
+/// 无人可报（丢失，登记在案）。
+const DROP_REPORT_BATCH: u64 = 64;
+
 /// poll 片长（镜像 `wgcore::POLL_SLICE`；stop/退出判定的粒度就是它）。
 const POLL_SLICE: Duration = Duration::from_millis(500);
 /// 空读判死的确认片（镜像 `wgcore::DEAD_CONFIRM_DELAY` 的量级；用 poll 而非 sleep）。
@@ -56,6 +70,8 @@ pub(crate) struct TunCounters {
     /// 同一时刻的单调相对读数（自进程起点的 ns；下推器 D4 的时基——评审核对
     /// `wgcore` 的 r2-H1 口径：单调面与 unix 面分离）。
     pub(crate) last_outbound_mono_ns: AtomicI64,
+    /// `Cmd::TunPacket` 在途条数（**有界通道的等价实现**；见 [`CMD_INFLIGHT_MAX`]）。
+    inflight: AtomicU64,
 }
 
 impl TunCounters {
@@ -71,6 +87,39 @@ impl TunCounters {
     /// 取走并清零 App 出站包计数（镜像 `wgcore::Client::swap_out_pkts` 的语义）。
     pub(crate) fn swap_out_pkts(&self) -> i64 {
         self.out_pkts.swap(0, Ordering::Relaxed)
+    }
+
+    /// 占一个在途名额（满 ⇒ `false` = **丢新**；调用方计数不投递）。
+    pub(crate) fn try_begin_send(&self) -> bool {
+        let mut cur = self.inflight.load(Ordering::Relaxed);
+        loop {
+            if cur as usize >= CMD_INFLIGHT_MAX {
+                return false;
+            }
+            match self
+                .inflight
+                .compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed)
+            {
+                Ok(_) => return true,
+                Err(now) => cur = now,
+            }
+        }
+    }
+
+    /// 交还在途名额（岛侧消费掉一条 `TunPacket`，或读线程投递失败）。
+    pub(crate) fn done_send(&self) {
+        let mut cur = self.inflight.load(Ordering::Relaxed);
+        while cur > 0 {
+            match self.inflight.compare_exchange_weak(
+                cur,
+                cur - 1,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
+                Ok(_) => return,
+                Err(now) => cur = now,
+            }
+        }
     }
 
     /// 最近出站包时刻（**单调面**换算；`None` = 本世代从未有过应用出站）——
@@ -228,6 +277,7 @@ fn write_fd_all(fd: i32, mut buf: &[u8]) -> io::Result<()> {
 /// - fd 读错 ⇒ 记行 + `TunFdDead`（岛侧打 `fd` 分类）+ 退出。
 fn read_loop(fd: i32, tx: IslandTx, counters: Arc<TunCounters>, logf: Logf) {
     let mut buf = vec![0u8; 65535];
+    let mut pending_drops: u64 = 0;
     loop {
         let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
         if n < 0 {
@@ -235,12 +285,17 @@ fn read_loop(fd: i32, tx: IslandTx, counters: Arc<TunCounters>, logf: Logf) {
             match e.kind() {
                 io::ErrorKind::Interrupted => continue,
                 io::ErrorKind::WouldBlock => {
-                    // 非阻塞 fd 的常态：等 POLLIN 一片（片界即退出判定点）
-                    if poll_fd(fd, libc::POLLIN, Instant::now() + POLL_SLICE).is_err() {
-                        let msg = "tun fd poll 失败（标记隧道不健康）";
-                        (logf)(msg);
-                        let _ = tx.send(Cmd::TunFdDead { msg: msg.into() });
-                        return;
+                    // 非阻塞 fd 的常态：等 POLLIN 一片（片界即退出判定点）。
+                    // 三分处置（镜像 `wgcore`）：片到（TimedOut）= 继续；poll 出错 = 判死。
+                    match poll_fd(fd, libc::POLLIN, Instant::now() + POLL_SLICE) {
+                        Ok(_ready) => {} // 可读优先（含 POLLIN|POLLHUP 同置：先读，下一轮定性）
+                        Err(pe) if pe.kind() == io::ErrorKind::TimedOut => {}
+                        Err(pe) => {
+                            let msg = format!("tun fd poll 失败：{pe}（标记隧道不健康）");
+                            (logf)(&msg);
+                            let _ = tx.send(Cmd::TunFdDead { msg });
+                            return;
+                        }
                     }
                 }
                 _ => {
@@ -262,10 +317,11 @@ fn read_loop(fd: i32, tx: IslandTx, counters: Arc<TunCounters>, logf: Logf) {
                 Err(_) => (true, false),
             };
             let dead = if dead {
-                matches!(
-                    poll_fd(fd, libc::POLLIN, Instant::now() + DEAD_CONFIRM_DELAY),
-                    Ok(r) if r.hup || r.err || r.nval
-                )
+                match poll_fd(fd, libc::POLLIN, Instant::now() + DEAD_CONFIRM_DELAY) {
+                    Ok(r) => r.hup || r.err || r.nval,
+                    Err(pe) if pe.kind() == io::ErrorKind::TimedOut => false,
+                    Err(_) => true, // poll 本身失败（EBADF/EIO…）⇒ 判死
+                }
             } else {
                 false
             };
@@ -306,10 +362,31 @@ fn read_loop(fd: i32, tx: IslandTx, counters: Arc<TunCounters>, logf: Logf) {
             process_mono_start().elapsed().as_nanos() as i64,
             Ordering::Relaxed,
         );
+        // 在途闸（设计 §6.4 的「有界通道 4096 条」等价实现）：满 ⇒ **丢新 + 计数**，
+        // 读线程**不阻塞**（丢的包由端到端 TCP 重传吸收）。
+        if !counters.try_begin_send() {
+            pending_drops += 1;
+            if pending_drops >= DROP_REPORT_BATCH {
+                let _ = tx.send(Cmd::DatagramDropped {
+                    reason: crate::cmd::DropReason::Unregistered,
+                    n: pending_drops,
+                });
+                pending_drops = 0;
+            }
+            continue;
+        }
         if tx.send(Cmd::TunPacket(pkt)).is_err() {
             // 岛已收工（通道断）——读线程自退（不重试、不挂死）
+            counters.done_send();
             (logf)("homeway-tun-read: 投递失败（岛已收工）—— 读线程退出");
             return;
+        }
+        if pending_drops > 0 {
+            let _ = tx.send(Cmd::DatagramDropped {
+                reason: crate::cmd::DropReason::Unregistered,
+                n: pending_drops,
+            });
+            pending_drops = 0;
         }
     }
 }
@@ -382,6 +459,30 @@ mod tests {
         }
         assert_eq!(counters.write_pkts(), 2, "回程包计数（快照 packets_out 的源）");
         assert_eq!(counters.write_bytes.load(Ordering::Relaxed), 68);
+    }
+
+    /// **判据（设计 §6.4 矩阵：TUN 读线程 → 岛的「有界通道 4096 条」）**：在途闸满 ⇒
+    /// `try_begin_send` 恒 `false`（读线程据此**丢新 + 计数**，不阻塞）；消费/失败交还
+    /// 名额后恢复（计数精确 —— 单生产者 + 岛侧消费即还）。
+    #[test]
+    fn tun_inflight_is_bounded_and_reopens_after_release() {
+        let c = TunCounters::new();
+        for i in 0..CMD_INFLIGHT_MAX {
+            assert!(c.try_begin_send(), "第 {} 个名额应可占", i + 1);
+        }
+        assert!(
+            !c.try_begin_send(),
+            "第 {} 个必须被拒（上限 {CMD_INFLIGHT_MAX}）",
+            CMD_INFLIGHT_MAX + 1
+        );
+        c.done_send();
+        assert!(c.try_begin_send(), "交还一个名额后应可再占");
+        // 交还到 0 后不越界（`done_send` 幂等保护：0 不再减）
+        for _ in 0..(CMD_INFLIGHT_MAX + 8) {
+            c.done_send();
+        }
+        assert_eq!(c.inflight.load(Ordering::Relaxed), 0, "在途计数不得下溢");
+        assert!(c.try_begin_send(), "归零后仍可用");
     }
 
     /// 队列满：`try_push` 非阻塞返 `false`（岛侧据此计 `回程队列满`）。

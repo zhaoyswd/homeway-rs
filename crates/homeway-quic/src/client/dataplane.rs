@@ -104,6 +104,9 @@ pub(crate) async fn pump_return(conn: Connection, ret: Arc<ReturnPath>, note: Dr
             Ok(d) => d,
             Err(_) => return, // 连接死/被替换：本任务收口（新连接会另起一枚）
         };
+        // 拷贝一手的理由（**不是**零拷贝的地方）：`read_datagram` 给的 `Bytes` 是 quinn
+        // 接收池缓冲的切片，直接入队会把池块按队列长度钉住（内存面不可预测）；拷进自有
+        // `Vec` 后队列内存 = ≤ 上限 × 包长（与设计 §6.3/§6.4 的预算口径一致）。
         if !ret.try_push(dg.to_vec()) {
             note(
                 DropReason::ReturnQueueFull,
