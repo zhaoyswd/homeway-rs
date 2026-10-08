@@ -102,7 +102,7 @@ QUIC MTU 1400 + DPLPMTUD，窄路径超限丢弃 + 计数；⑤中继零改动�
 
 | 期 | 内容 | 状态 | 进度 |
 |---|---|---|---|
-| **M0** | 骨架与依赖面（quinn/rustls/tokio 落地 + QUIC 岛设计 + 实验台转正 + 基线登记） | 未开工 | 0/4 |
+| **M0** | 骨架与依赖面（quinn/rustls/tokio 落地 + QUIC 岛设计 + 实验台转正 + 基线登记） | **已完成**（worktree 分支 `quic`，待用户指令合回 main） | 4/4 |
 | **M1** | QUIC 承载 + 全局代理（DATAGRAM + 迁移/赛跑） | 未开工 | 0/4 |
 | **M2** | 身份、设备表与准入（RPK + token 证明 + 抗放大） | 未开工 | 0/4 |
 | **M3** | 服务流迁移（STREAM tag；客户端 stackb 退役） | 未开工 | 0/4 |
@@ -115,10 +115,17 @@ QUIC MTU 1400 + DPLPMTUD，窄路径超限丢弃 + 计数；⑤中继零改动�
 
 > **本节 = 唯一的「现在该干什么」指针。** 主会话只认这里。
 
-1. **程序未开工**——M0 等待用户「开工」指令（本程序节奏 = **逐期等指令**，与 Q 批同款；
-   每期收口后停一条等指令，不自动接棒）。
-2. 开工前置：并发在途批（`Q-K` / `Q-L`）落地并复验工作树；`cargo test --workspace` 绿基线。
-3. M0 首棒任务书 = 「M0 骨架与依赖面」节 + 「每期执行协议」。
+1. **M0 已收口**（`docs/reviews/M0.md` = 实现 + 代码门 r11 记录；设计门 = `docs/reviews/M0-design.md`
+   + dsh r10；三基线登记 = `docs/QUIC-BASELINE.md`；实验台 = `tools/quic-ab.sh`）。**M1 等待用户
+   「开工」指令**（本程序节奏 = **逐期等指令**，与 Q 批同款；每期收口后停一条等指令，不自动接棒）。
+2. **交付位置（用户触点）**：M0 全部工作在**独立 worktree** `~/Documents/projects/homeway-rs-quic`
+   的分支 `quic` 上（设计门 `3f16471` + 实现/代码门 `5ecf63a`…`17d1b3e`，共 8 commit）；
+   **合回 main / push / 发 tag 均等用户显式指令**（主检出留给并发批 Q-K/Q-L，未受本程序影响）。
+3. M1 开工前置复验：并发在途批（`Q-K` / `Q-L`）落地并复验工作树；`cargo test --workspace` 绿基线
+   （M0 收口时实测 735 passed / 17 ignored）。
+4. M1 设计门**须先裁决**两件 M0 遗留（登记在 `docs/reviews/M0.md` §6）：①每连接内存边际的拟合口径
+   （M0 实测 77–96K vs 附录 A 手抄 37.6K ⇒ 「每设备 ≤64K」偏紧）；②OHOS **运行期**（tokio/mio/epoll）
+   与 `panic = "abort"` 跨仓约束的复核（设计 §3.6-5，M7 tier 触点）。
 
 ## 每期执行协议（子代理按此跑，主会话按此核对）
 
@@ -180,6 +187,28 @@ QUIC MTU 1400 + DPLPMTUD，窄路径超限丢弃 + 计数；⑤中继零改动�
 
 **判据**：`cargo test --workspace` 全绿（行为零改动）；clippy 0；OHOS/musl/linux 三目标 check
 全绿；`tools/quic-ab.sh` 一键复现附录 A 数字（±10%）；体积/内存基线入册。
+
+**M0 收口证据（2026-10-08，实现棒 + 代码门 dsh r11）**：`cargo test --workspace` = 735 passed /
+0 failed / 17 ignored；clippy `-D warnings` = 0；三目标 `cargo check` 全绿（物证 = ring 0.17.14
+为三目标各产真 ELF 目标对象）；`tools/build-app-core.sh` 出 `.so`（20/20 符号 + 版本注入过，
+2,339,344 B）；**M0 增量 ≤ 128 B**（产物内 `ring_core_0_17_14` / `tokio` / `quinn` / `rustls`
+符号计数全 0 = 死码消除的构造性证据）；`tools/quic-ab.sh all` 一键复现附录 A（每包 CPU 偏差
+−0.1%…+1.3%、线开销 WG 精确 / QUIC −0.013%、体积 −0.03%…−4.9%、footprint ±1.7% 内）；
+本地-only 门（基线/向量/种子/词表/矩阵冒烟）在 **worktree 内**全绿（设计 §6 的 R-J 前提已失效
+——`baseline/` / `bin/` 已就位于 worktree）；判据行零变更（词表门 PASS）。**三基线登记 =
+`docs/QUIC-BASELINE.md`**（数字已按 harness 实测**重新登记**，附录 A 旧值只作量级对照）。
+
+**交付形态**：依赖落地 + `crates/homeway-quic` 岛骨架（**零接线**——`homeway-core` / `cli` / `capi`
+源码零 `homeway_quic::` 引用，行为零改动）+ `tools/quic-ab.sh` 实验台 + 三基线入册；设计门
+`docs/reviews/M0-design.md`（dsh r10，39 条意见全处置）、代码门 `docs/reviews/M0.md`（dsh r11，
+23 条：7 中全整改 + 13 低整改 + 3 低登记豁免）。
+
+**范围登记（设计门 9.3 + 实现棒补四条，非范围扩张 = 必要细化）**：①`tools/cc-check-shim/stdlib.h`
+（本节只写「补 CC」，未写「C 侧无 sysroot 怎么办」；该头仅用于 check-only 目标，**不进真实构建**）；
+②`tools/quic-ab/` 用**两个独立 workspace**（`[patch]` 是 workspace 级，一个 workspace 装不下
+「真 ring」与「垫片」两臂）；③新建 `docs/QUIC-BASELINE.md`（三基线的落点）；④`tools/check-quic-isolation.sh`
+（隔离门）；⑤`tools/build-app-core.sh` / `ci-local.sh` 的 CC 导出与真实 OHOS link 门（App 出包路径
+不修就断——设计 §2.5 的必修项）。
 
 **评审过程**：
 
@@ -376,7 +405,7 @@ fixtures 向量逐字节不变；客户端依赖树不再含 smoltcp（脚本验
 | **DC/CA 族** | DC14/DC15（term 远程）、CA1/CA4/CA5（forward/socks） | M3 | 复核（应用面行为保留，行文可能不变） |
 | **fixtures** | identity / psk / reg / endpointcache | M5 | 退役（登记）；`tunnel_addr` 部分样本（栈 B 地址）退役；relay / stun / term / files / surface 保留 |
 | **tier 文档** | `connection-lifecycle.md`（恢复阶梯节） | M3/M7 | 重写（连接策略变更须同步——tier 侧触点） |
-| **词表** | `tools/check-vocab.sh` 五族 | M0 | 预判不受影响（传输面不在五族内）——M0 实测确认 |
+| **词表** | `tools/check-vocab.sh` 五族 | M0 | **已完成：PASS**（Rust 声明 5 单元 / 26 值；ledger sha256 与 `docs/BASELINE.md` 锚定一致；缺席表 4 项在册）——预判「不受影响」已实测确认 |
 
 ## 性能 / 体积 / 内存门槛（预登记；方法 = PERF-AB 口径 + `quic-ab.sh`）
 
@@ -396,8 +425,21 @@ fixtures 向量逐字节不变；客户端依赖树不再含 smoltcp（脚本验
 - **随 M5 删除除名**：`wgcore::stackb::*`（墙钟断言）——WG 退役后该测试移除；
 - **沿用有效**：`daemon::tests::*` 时序族、`term::service::tests::attach_size_applies_to_pty`、
   双 `cargo test` 并发撞固定端口族（判回归前先隔离复跑 + 看 loadavg）；
-- **本程序新增（实现时登记）**：QUIC 岛测试（tokio 单线程 + 回环端口 + 时间断言）的 flake 口径；
-  DPLPMTUD / 迁移用例的墙钟依赖。
+- **本程序新增（M0 实现时登记，2026-10-08）**：QUIC 岛（`crates/homeway-quic`）与 `tools/quic-ab.sh`
+  的 flake 口径五条：
+  ① **不钉固定端口**：岛内一切回环端点 `bind("127.0.0.1:0")` + 读回实际端口；harness 四臂同样全 `:0`；
+  ② **时间断言禁精确墙钟**：只断言上界（`elapsed < 预算 × 4`）与「预算内收工」形态；panic/卡死注入
+     用例不设墙钟下界（只判「回执不挂死 + 记行到达 + 返回值形态」）；**纯定时语义用例（M1 起）用
+     `tokio::time` + `start_paused`，并同批给 tokio 加 dev-dependency `["test-util"]`**（M0 未引入
+     ——当时无用例，防「声明了不用」）；
+  ③ **不依赖 loadavg**：岛内零吞吐断言（性能判据全在 `tools/quic-ab.sh`，用每包 CPU 口径）；
+     ⚠️ harness 复现判据时**须独占机器**——与交叉编译并发那一轮实测四臂整体上抬（wg-ring +12.1%，
+     越出 ±10% 带），读数一律对照同目录 `loadavg.tsv`；
+  ④ **隔离复跑纪律**：红了先隔离单跑（`--test-threads=1` 独占）再判回归；`daemon::tests::*` 时序族与
+     双 `cargo test` 并发撞固定端口族（本批实测：并发会话跑 `cargo test -p homeway-core` 会让
+     `daemon::carriers::forward::tests::*` 报 `bind 127.0.0.1:20004/20010 already in use`）不与本程序混判；
+  ⑤ **登记动作**：以上四条随 `docs/QUIC-BASELINE.md` / `tools/quic-ab/README.md` 同源，变更须同批更新。
+  另（M0 移植事实，非 flake）：DPLPMTUD / 迁移用例的墙钟依赖仍属 M1 起的登记面。
 
 ## 附录 A：实验台与原始数据（2026-10-08）
 
@@ -409,6 +451,10 @@ fixtures 向量逐字节不变；客户端依赖树不再含 smoltcp（脚本验
 - 复现要点：① `CC_aarch64_unknown_linux_ohos` 必须显式设 NDK clang；②主指标用每包 CPU
   （墙钟受 loadavg 漂移，PERF-AB §9.15.1 教训）；③内存口径用 `vmmap` physical footprint
   （`ps RSS` 在同机两臂差 4.3MB 而二进制仅差 176B——该口径不可用）。
+- **M0 复测订正（2026-10-08）**：附录 A 的四位数已在 `tools/quic-ab.sh` 下复测并**重新登记**于
+  `docs/QUIC-BASELINE.md`（本附录旧值只作量级对照）；两处口径订正随 M0 落库：①CPU 基线的原始
+  证据链只有手抄 `SUMMARY.md`（`m-*.out` 全为 11 字节空壳；第二份独立测量 = `/tmp/pk-*-cli.out`，
+  N=300k，与手抄值差 1.3–5.9%）；②`wg-ring` 臂的 ring 实为 **0.16.20**（非 0.17）。
 
 ## 附录 B：删码 / 改码规模盘点（2026-10-08 实测行数）
 
