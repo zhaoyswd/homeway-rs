@@ -389,7 +389,8 @@ enum Job {
         result: Result<Duration, IslandErr>,
     },
     /// 回程泵（常驻任务：DATAGRAM → 有界队列 → TUN 写线程；`Ok(())` = 连接结束/收工）。
-    Return,
+    /// 参数 = 该泵所属连接的 `stable_id()`（复位防重位时按身份比对，见 `pump_conn`）。
+    Return(usize),
 }
 
 /// TUN 面（数据面的 fd 侧；`TunAttach` 时装配，随岛收工/连接结束而弃）。
@@ -423,8 +424,11 @@ struct DriverState {
     patrol: Duration,
     /// TUN 面（数据面；未附加 = `None`）。
     tun: Option<TunPlane>,
-    /// 回程泵是否已起（连接/隧道面任一后到都能补起；连接死时复位）。
-    pump_up: bool,
+    /// 回程泵防重位：记的是**在跑泵所属连接的 `stable_id()`**（`None` = 无泵在跑）。
+    /// 用连接身份而非裸 bool 的理由（代码门 r13 的 M1）：`adopt` 换连接时旧泵必然随旧
+    /// 连接（已 `close`）退出，裸 bool 会残留 `true` ⇒ 现任连接**永不起泵**（回程黑洞）；
+    /// 改成身份比对后，「被替换连接的老泵退出」不会复位现任泵的位（只有身份相同才复位）。
+    pump_conn: Option<usize>,
     /// 「窄路径不可用」行的去重位（记的是当时观测到的 `mds`）。
     narrow_logged: Option<u32>,
 }
@@ -465,7 +469,7 @@ fn run_driver(
             na_logged: false,
             patrol,
             tun: None,
-            pump_up: false,
+            pump_conn: None,
             narrow_logged: None,
         };
         let mut jobs: JoinSet<Job> = JoinSet::new();
@@ -499,9 +503,13 @@ fn run_driver(
                         Ok(Job::Probe { reply, result }) => {
                             let _ = reply.send(result);
                         }
-                        // 回程泵结束（连接死/隧道面收工）：连接死面由 housekeeping 统一处置
-                        Ok(Job::Return) => {
-                            st.pump_up = false;
+                        // 回程泵结束（连接死/隧道面收工）：连接死面由 housekeeping 统一处置。
+                        // **只有"现任连接"的那枚泵**才复位防重位——被替换连接的老泵退出时
+                        // 若一并复位，会误判"无泵"（代码门 r13 的 M1）。
+                        Ok(Job::Return(conn)) => {
+                            if st.pump_conn == Some(conn) {
+                                st.pump_conn = None;
+                            }
                         }
                         // 任务被 abort（收工路径）：其回执口随之 drop ⇒ 调用侧归 EngineGone
                         Err(_aborted) => {}
@@ -517,26 +525,27 @@ fn run_driver(
     });
 }
 
-/// 起回程泵（每连接一枚常驻任务；`pump_up` 防重、连接死时复位）：
+/// 起回程泵（每连接一枚常驻任务；`pump_conn` 按**连接身份**防重、连接死时复位）：
 /// `read_datagram` → 有界队列 → TUN 写线程（满 ⇒ 丢 + 计 `回程队列满`）。
 ///
 /// 形态取「任务」而不是驱动循环的 select 分支：与出口面的 `conn::datagrams` 同构，
 /// 且不依赖 `read_datagram` 的取消安全面（任务是独占的、只在连接死或被 abort 时结束）。
 fn maybe_start_pump(st: &mut DriverState, ctx: &IslandCtx, jobs: &mut JoinSet<Job>) {
-    if st.pump_up {
-        return;
-    }
     let (Some(live), Some(tun)) = (st.live.as_ref(), st.tun.as_ref()) else {
         return;
     };
-    let note = drop_note(ctx);
     let conn = live.conn.clone();
+    let conn_id = conn.stable_id();
+    if st.pump_conn == Some(conn_id) {
+        return; // 现任连接的回程泵已在跑
+    }
+    let note = drop_note(ctx);
     let ret = Arc::clone(&tun.ret);
     jobs.spawn(async move {
         dataplane::pump_return(conn, ret, note).await;
-        Job::Return
+        Job::Return(conn_id)
     });
-    st.pump_up = true;
+    st.pump_conn = Some(conn_id);
 }
 
 /// 采纳胜者（§2.2 的现任裁决：**旧的已登记连接显式关闭**；N-a 行只在首个连接时打一次）。
@@ -613,7 +622,9 @@ async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx, seam: 
         (*ctx.logf)("quic: 连接已断 —— 等上层重连/重赛跑（阶梯接线 = 世代层）");
         st.live = None;
         st.watch = None;
-        st.pump_up = false; // 回程泵随连接结束自退；新连接另起
+        // 连接死 ⇒ 其回程泵随 `read_datagram` 出错自退（`Job::Return` 按身份复位）；
+        // 这里同步清掉防重位只为「新连接可在同一拍内起泵」。
+        st.pump_conn = None;
         ctx.unhealthy(REASON_PATROL);
     }
     // ② 刷新到点（C15'；写失败 = 连接已断）
@@ -622,7 +633,7 @@ async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx, seam: 
             (*ctx.logf)("quic: 注册刷新写失败 —— 判连接已断");
             st.live = None;
             st.watch = None;
-            st.pump_up = false;
+            st.pump_conn = None;
             ctx.unhealthy(REASON_PATROL);
         }
     }
@@ -793,7 +804,9 @@ async fn handle_cmd(
             (*ctx.logf)(&format!("quic: {msg}"));
             ctx.unhealthy(REASON_FD);
             st.tun = None;
-            st.pump_up = false;
+            // 旧泵的消费者（写线程）已退：它在下一包 `try_push` 归 `Gone` 时自退（S6 的 A3）；
+            // 清防重位让"同连接再附加"能起新泵（老泵已不可写，不会与新泵争抢同一队列）。
+            st.pump_conn = None;
         }
         Cmd::SetOnUnhealthy { h } => {
             *lock_unpoison(&ctx.on_unhealthy) = h;

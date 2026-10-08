@@ -1450,7 +1450,8 @@ mod tests {
 
     /// probe 应答路径：HWQ → HWR（同 nonce/build/flags）；列表段受 pad 契约约束。
     #[test]
-    fn probe_responds_on_socket_path() {        let mut b = ServerBind::open(0, "rust-exit-test", noop_logf()).unwrap();
+    fn probe_responds_on_socket_path() {
+        let mut b = ServerBind::open(0, "rust-exit-test", noop_logf()).unwrap();
         let nonce = [9u8; 8];
         let req = crate::probe::encode_request(crate::probe::TYPE_PING, &nonce, 200);
         let src: SocketAddr = "127.0.0.1:5002".parse().unwrap();

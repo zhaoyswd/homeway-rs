@@ -16,7 +16,7 @@
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::os::fd::AsRawFd;
-use std::os::unix::net::UnixDatagram;
+use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -1462,6 +1462,78 @@ async fn oversize_tun_packet_is_dropped_and_counted() {
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
 
+/// **判据（代码门 r13 的 M1 修复）**：岛内**第二次采纳**（换连接）后回程必须仍有泵。
+///
+/// 时序：采纳连接 A（泵 A 在跑）→ 同岛内再赛跑并采纳连接 B（`adopt` 关闭 A）⇒ 泵 A 随 A
+/// 收口。防重位若按**裸 bool**（旧形态），`adopt` 结束时它仍为真 ⇒ B **永不起泵**；随后泵 A
+/// 退出把位复位，但已无人再触发 ⇒ **B 期间所有回程无人读**（quinn 接收缓冲静默淘汰 = 回程
+/// 黑洞，且无计数）。本用例断言：二次采纳后经 B 的回程仍逐字节到达 TUN fd。
+///
+/// **为什么 B 走第二枚出口**（本用例必须能**确定性**判红旧形态）：若 B 登记到同一出口，
+/// 出口会在 B 入册时**先**关闭 A ⇒ 泵 A 可能在 `adopt(B)` 之前就被轮询到并复位防重位，
+/// 于是旧形态也能起泵 B（`select!` 的就绪分支次序决定成败 ⇒ 50/50 假绿）。换成第二枚出口
+/// 后，A 直到 `adopt(B)` 内部才被 `close`（`adopt` 是同步函数，其间无 await ⇒ 泵 A 不可能
+/// 被轮询）⇒ 旧形态下 `maybe_start_pump` 必然早退、B 必然无泵。
+#[tokio::test]
+async fn return_pump_restarts_after_connection_replacement() {
+    let quic = exit_face(22);
+    let stub = Stub::new();
+    let island = island_with(Duration::from_secs(60), quic.rpk_public_key());
+    let (tun, peer) = tun_pair();
+    assert!(matches!(attach(&island, tun.as_raw_fd(), 1280, BUDGET), Ok(())));
+
+    // 连接 A（出口 #1）：基线（回程可用）
+    connect_direct(&island, &stub, &quic).await;
+    let back = inner_pkt(TUNNEL_IP, TUN_IP);
+    assert_eq!(
+        quic.send_to_pub(&PUBKEY, &back),
+        crate::ExitSend::Handled,
+        "A 期内出口侧出站必须已绑定"
+    );
+    assert_eq!(
+        read_tun(&peer, WAIT).as_deref(),
+        Some(back.as_slice()),
+        "A 的回程（基线）"
+    );
+
+    // 连接 B（出口 #2）：岛内二次赛跑 + 二次采纳（A 由 `adopt` 就地 close）。
+    // 出口 #2 用**同一枚 RPK seed**（`exit_face(22)` 再起一枚 socket）——岛的钉定是
+    // 「按 token 里的公钥钉死」，换 key 会在握手中止（那正是 S1a 的判据，不是本用例的面）。
+    let quic2 = exit_face(22);
+    let stub2 = Stub::new();
+    let addr2 = connectable(&quic2);
+    let _ = send_wait(
+        &island,
+        &stub2,
+        &quic2,
+        |reply| Cmd::Connect {
+            cands: vec![direct(addr2)],
+            budget: WAIT,
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .expect("第二次登记成功（出口 #2）");
+    assert!(
+        wait_for(&stub2, &quic2, || island.snapshot().connections == 1, WAIT).await,
+        "二次采纳后仍只有 1 条在用连接（替换语义）"
+    );
+    assert_eq!(
+        quic2.send_to_pub(&PUBKEY, &back),
+        crate::ExitSend::Handled,
+        "B 期内出口侧出站必须已绑定"
+    );
+    assert_eq!(
+        read_tun(&peer, WAIT).as_deref(),
+        Some(back.as_slice()),
+        "二次采纳后回程必须仍有泵（旧泵退出不得让现任连接失去回程面）"
+    );
+
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
 /// **判据（S3-1 / 设计 §12-① ④⑤，MTU 上限旋钮）**：`mtu_cap` 压到 **1200**（区间
 /// `[1320,1400]` 之外——**只有测试缝能给这个值**，区间内 `mds ≥ 1282` 产不出
 /// 「mds < 内层 MTU」）⇒ `max_datagram_size()` < 1280 且「**窄路径不可用**」行出现
@@ -1493,16 +1565,24 @@ async fn mtu_cap_below_inner_mtu_marks_narrow_path() {
 
 /// **判据（S2-4 的「回程队列满丢 + 计数」）**：应用侧不读 TUN ⇒ 写线程阻塞 ⇒ 有界队列
 /// （2048 条）填满 ⇒ 后续回程包**丢新 + 计 `回程队列满`**（不静默；TCP 会重传）。
+///
+/// **fd 形态（代码门 r13 的 A3 连带修正）**：本用例用**阻塞 stream** socketpair 当 TUN fd。
+/// 旧形态用 `UnixDatagram`，其「对端不读」在 darwin/Linux 上会以 **ENOBUFS** 立刻返回
+/// （不是 `WouldBlock`）⇒ `write_fd_all` 归类为硬失败 ⇒ 写线程**退出**（投 `TunFdDead`）——
+/// 于是本用例当时命中的其实是「消费者已死」而不是「队列满」（A3 的误归因正是这条路径）。
+/// 阻塞 stream 上「对端不读」表现为内核内阻塞（无 ENOBUFS）⇒ 写线程活着卡住 ⇒ 队列真填满
+/// ⇒ 命中 `Full` 语义。消费者已死的路径由下一条用例（`…_reports_write_thread_gone…`）覆盖。
 #[tokio::test]
 async fn return_queue_full_is_dropped_and_counted() {
     let quic = exit_face(22);
     let stub = Stub::new();
     let island = island_with(Duration::from_secs(60), quic.rpk_public_key());
-    let (tun, _peer) = tun_pair(); // **不读**：写线程会卡住（_peer 保持打开）
+    // **不读** 且保持打开：写线程卡在内核缓冲上（阻塞 stream ⇒ 不返 ENOBUFS）
+    let (tun, _peer) = UnixStream::pair().expect("socketpair(STREAM)");
     assert!(matches!(attach(&island, tun.as_raw_fd(), 1280, BUDGET), Ok(())));
     connect_direct(&island, &stub, &quic).await;
 
-    // 先灌一批（把内核 socket 缓冲喂满 ⇒ 写线程阻塞在第一包上），再补足队列上限
+    // 灌一批（喂满内核缓冲 ⇒ 写线程阻塞）→ 补足队列上限
     let pkt = inner_pkt(TUNNEL_IP, TUN_IP);
     for _ in 0..(crate::tun::RETURN_QUEUE_MAX + 512) {
         let _ = quic.send_to_pub(&PUBKEY, &pkt);
@@ -1516,12 +1596,78 @@ async fn return_queue_full_is_dropped_and_counted() {
             &stub,
             &quic,
             || island.snapshot().drops.return_queue_full >= 1,
-            Duration::from_secs(4)
+            WAIT
         )
         .await,
         "回程队列满必须计 `回程队列满`（实测 drops={:?}）",
         island.snapshot().drops
     );
+    assert_eq!(
+        island.snapshot().drops.unregistered,
+        0,
+        "写线程仍在（阻塞 stream）⇒ 不得走「消费者已死」面"
+    );
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（代码门 r13 的 A3）**：TUN 写线程已退（消费者消失）⇒ 回程泵**如实归因并收口**：
+/// ① 记一行真因（`回程面已终止（TUN 写线程已退）`）；② 丢弃归 `未登记`（**不**误报
+/// `回程队列满`——队列没满，是没有消费者）；③ 泵返回后**不再逐包计数**（一次性）。
+#[tokio::test]
+async fn return_pump_reports_write_thread_gone_and_stops() {
+    let quic = exit_face(23);
+    let stub = Stub::new();
+    let (logf, logs) = sink();
+    let island = island_with_log(
+        Duration::from_secs(60),
+        quic.rpk_public_key(),
+        Arc::clone(&logf),
+    );
+    let (tun, peer) = tun_pair();
+    assert!(matches!(attach(&island, tun.as_raw_fd(), 1280, BUDGET), Ok(())));
+    connect_direct(&island, &stub, &quic).await;
+    // 消费者对端消失 ⇒ 写线程下一次写必失败（跟 unix DGRAM 的 EPIPE/ECONNREFUSED，
+    // 与平台无关的确定性构造）⇒ `write_loop` 投 `TunFdDead` 后退出
+    drop(peer);
+
+    let pkt = inner_pkt(TUNNEL_IP, TUN_IP);
+    for _ in 0..64 {
+        let _ = quic.send_to_pub(&PUBKEY, &pkt);
+    }
+    assert!(
+        wait_for(
+            &stub,
+            &quic,
+            || island.snapshot().drops.unregistered >= 1,
+            WAIT
+        )
+        .await,
+        "写线程已退 ⇒ 回程丢弃须归 `未登记`（实测 drops={:?}）",
+        island.snapshot().drops
+    );
+    assert_eq!(
+        island.snapshot().drops.return_queue_full,
+        0,
+        "不得把「消费者已死」误报成「队列满」（A3）"
+    );
+    let lines = logs_until(&logs, "回程面已终止", WAIT).await;
+    assert!(
+        lines.iter().any(|l| l.contains("回程面已终止")),
+        "必须记一行真因（写线程已退）：{lines:?}"
+    );
+    // 泵已收口 ⇒ 再灌一批，计数不增长（一次性，不逐包空转）
+    let n_after = island.snapshot().drops.unregistered;
+    for _ in 0..64 {
+        let _ = quic.send_to_pub(&PUBKEY, &pkt);
+    }
+    let _ = wait_for(&stub, &quic, || false, Duration::from_millis(300)).await;
+    assert_eq!(
+        island.snapshot().drops.unregistered,
+        n_after,
+        "泵返回后不得继续逐包计数"
+    );
+
     assert!(island.stop_within(Instant::now() + BUDGET));
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }

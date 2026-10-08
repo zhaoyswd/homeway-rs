@@ -142,9 +142,24 @@ fn process_mono_start() -> Instant {
 /// 回程通道（岛 → TUN）：有界队列的**生产者面**（消费者 = 写线程）。
 ///
 /// 生产者 = 岛线程内的回程泵（[`crate::client::dataplane::pump_return`]）；`try_push`
-/// **非阻塞**（满 ⇒ `false` + 调用方计 `回程队列满`；绝不把阻塞传染进岛 runtime）。
+/// **非阻塞**（绝不把阻塞传染进岛 runtime）。
 pub(crate) struct ReturnPath {
     tx: SyncSender<Box<[u8]>>,
+}
+
+/// 投递结果（**两种失败必须可分**：满 = 队列在但来不及排空；Gone = 消费者已死）。
+///
+/// 为什么分开（代码门 r13 的 A3）：写线程因 fd 失效退出后（`write_loop` 投 `Cmd::TunFdDead`），
+/// 队列仍在、`try_push` 恒失败——若与「队列满」同归一类，日志会写成
+/// `回程队列满（上限 2048 条）`，与事实（没有消费者）不符，误导排障；且泵会一直空转
+/// 拷贝 + 丢弃。`Gone` 让泵**收口并如实记因**。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum PushOutcome {
+    Pushed,
+    /// 队列满（丢新；调用方计 `回程队列满`）。
+    Full,
+    /// 写线程已退（fd 失效/收工）：泵应收口，不再逐包计 `回程队列满`。
+    Gone,
 }
 
 impl ReturnPath {
@@ -162,13 +177,13 @@ impl ReturnPath {
         Ok(Arc::new(Self { tx: queue_tx }))
     }
 
-    /// 投一包（满 ⇒ `false`，不阻塞）。
-    pub(crate) fn try_push(&self, pkt: Vec<u8>) -> bool {
+    /// 投一包（满 ⇒ `Full`，消费者已死 ⇒ `Gone`；两者都不阻塞）。
+    pub(crate) fn try_push(&self, pkt: Vec<u8>) -> PushOutcome {
         match self.tx.try_send(pkt.into_boxed_slice()) {
-            Ok(()) => true,
-            Err(TrySendError::Full(_)) => false,
-            // 写线程已退（fd 失效/收工）：归「队列满」的同一个丢失面（丢弃语义相同）
-            Err(TrySendError::Disconnected(_)) => false,
+            Ok(()) => PushOutcome::Pushed,
+            Err(TrySendError::Full(_)) => PushOutcome::Full,
+            // 写线程已退（fd 失效/收工）：**单独一类**（丢弃语义同「丢」，但归因不同——见 PushOutcome）
+            Err(TrySendError::Disconnected(_)) => PushOutcome::Gone,
         }
     }
 }
@@ -444,8 +459,8 @@ mod tests {
         let counters = TunCounters::new();
         let ret =
             ReturnPath::new(a.as_raw_fd(), cmd_tx(), Arc::clone(&counters), logf).expect("写线程可起");
-        assert!(ret.try_push(vec![1, 2, 3, 4]));
-        assert!(ret.try_push(vec![9; 64]));
+        assert_eq!(ret.try_push(vec![1, 2, 3, 4]), PushOutcome::Pushed);
+        assert_eq!(ret.try_push(vec![9; 64]), PushOutcome::Pushed);
         let mut got = [0u8; 4];
         (&b).read_exact(&mut got).expect("读到第一包");
         assert_eq!(got, [1, 2, 3, 4]);
@@ -485,10 +500,10 @@ mod tests {
         assert!(c.try_begin_send(), "归零后仍可用");
     }
 
-    /// 队列满：`try_push` 非阻塞返 `false`（岛侧据此计 `回程队列满`）。
+    /// 队列满：`try_push` 非阻塞返 `Full`（岛侧据此计 `回程队列满`）。
     ///
     /// 构造：socketpair 的读端**不读**且先灌满内核缓冲 ⇒ 写线程阻塞在第一包上 ⇒
-    /// 队列被填满至上限，此后 `try_push` 恒 `false`（不阻塞、不覆盖最旧）。
+    /// 队列被填满至上限，此后 `try_push` 恒 `Full`（不阻塞、不覆盖最旧）。
     #[test]
     fn return_queue_full_is_non_blocking() {
         let (a, b) = UnixStream::pair().expect("socketpair");
@@ -515,7 +530,7 @@ mod tests {
         let ret = ReturnPath::new(a.as_raw_fd(), cmd_tx(), counters, logf).expect("写线程可起");
         let mut pushed = 0usize;
         for _ in 0..(RETURN_QUEUE_MAX + 16) {
-            if ret.try_push(vec![0u8; 8]) {
+            if ret.try_push(vec![0u8; 8]) == PushOutcome::Pushed {
                 pushed += 1;
             }
         }
@@ -524,10 +539,36 @@ mod tests {
             "队列应被填满（RETURN_QUEUE_MAX={RETURN_QUEUE_MAX}，实际入队 {pushed}）"
         );
         // 上限面：写线程最多再取走 1 条（取走后卡在 write 上）⇒ 接受数 ≤ 上限 + 1；
-        // 其余 `try_push` 必须**非阻塞返 false**（岛侧据此计 `回程队列满`）。
+        // 其余 `try_push` 必须**非阻塞返 `Full`**（岛侧据此计 `回程队列满`）。
         assert!(
             pushed <= RETURN_QUEUE_MAX + 1,
             "队列不得越过上限（RETURN_QUEUE_MAX={RETURN_QUEUE_MAX}，实际入队 {pushed}）"
+        );
+    }
+
+    /// **判据（代码门 r13 的 A3）**：消费者（写线程）已退 ⇒ `try_push` 归 `Gone`（**不是**
+    /// `Full`）——岛侧据此收口回程泵并如实记因，不把「没有消费者」误报成「队列满」。
+    ///
+    /// 构造：socketpair 读端先 drop ⇒ 写线程首次 `write_fd_all` 得 EPIPE ⇒ `write_loop`
+    /// 记行 + 投 `TunFdDead` + `return`（`rx` 随之 drop）⇒ 队列进入 `Disconnected`。
+    #[test]
+    fn return_push_reports_gone_when_consumer_exits() {
+        let (a, b) = UnixStream::pair().expect("socketpair");
+        drop(b); // 读端消失：写线程下一次写必然失败
+        let (logf, _rx) = (Arc::new(|_s: &str| {}) as Logf, ());
+        let counters = TunCounters::new();
+        let ret = ReturnPath::new(a.as_raw_fd(), cmd_tx(), counters, logf).expect("写线程可起");
+        // 首包进队（写线程随后取走并失败退出）；之后必须观测到 `Gone`（有界轮询上界）
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut outcome = ret.try_push(vec![0u8; 8]);
+        while outcome != PushOutcome::Gone && Instant::now() < deadline {
+            std::thread::yield_now();
+            outcome = ret.try_push(vec![0u8; 8]);
+        }
+        assert_eq!(
+            outcome,
+            PushOutcome::Gone,
+            "写线程已退 ⇒ 必须归 `Gone`（不得与「队列满」混同）"
         );
     }
 }

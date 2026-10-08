@@ -1,6 +1,6 @@
 [package]
 name = "homeway-quic"
-description = "QUIC 岛：单线程 runtime 宿主 + 同步/异步边界（对同步面只暴露命令通道；M0 骨架，零接线）"
+description = "QUIC 岛：单线程 runtime 宿主 + 同步/异步边界 + 出口 QUIC 面 + 客户端连接/数据面（对同步面只暴露命令通道；M1 起已接线）"
 version.workspace = true
 edition.workspace = true
 

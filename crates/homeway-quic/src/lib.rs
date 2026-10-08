@@ -1,8 +1,12 @@
-//! QUIC 岛（M0 骨架，**零接线**）：单线程 runtime 宿主 + 同步/异步边界的构造性承载。
+//! QUIC 岛（M1 起**已接线**）：单线程 runtime 宿主 + 同步/异步边界 + 出口 QUIC 面 +
+//! 客户端连接面/数据面。
 //!
-//! 真源：`docs/QUIC-ROADMAP.md`「目标架构」+ `docs/reviews/M0-design.md` §3。
-//! 本批**不被任何生产路径构造**（`homeway-core` 的依赖表里有本 crate，但源码零引用；
-//! 判据见设计 §3.5 的三条「行为零改动」）。
+//! 真源：`docs/QUIC-ROADMAP.md`「目标架构」+ `docs/reviews/M0-design.md` §3 +
+//! `docs/reviews/M1-design.md`（M1 实现期真源，含 §12 拍板与 §12.6 订正）。
+//!
+//! **接线状态（M0 → M1 的变更，勿照旧读）**：`homeway-core` 在 M1 起**真构造**本岛
+//! （`facade/tun_exec.rs` 的 `start_island`；出口侧由 `server/engine.rs` 起 `exit::ExitQuic`）
+//! ——M0 的「零接线/不被任何生产路径构造」只描述 M0 状态，已作废。
 //!
 //! ## 边界契约（写死，逐条由 `tools/check-quic-isolation.sh` 断言）
 //!

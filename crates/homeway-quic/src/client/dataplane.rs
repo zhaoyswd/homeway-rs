@@ -27,7 +27,7 @@ use bytes::Bytes;
 use quinn::{Connection, SendDatagramError};
 
 use crate::cmd::DropReason;
-use crate::tun::ReturnPath;
+use crate::tun::{PushOutcome, ReturnPath};
 
 /// 丢弃上报口（岛宿主注入：入快照 + N-c 行 + 事件回调）。
 pub(crate) type DropNote = Arc<dyn Fn(DropReason, &str) + Send + Sync + 'static>;
@@ -96,7 +96,8 @@ pub(crate) fn send_datagram_checked(
 
 /// 回程泵（每连接一枚 `JoinSet` 任务）：`read_datagram` → 有界队列 → std 写线程。
 ///
-/// 退出：连接死（`read_datagram` 出错）/ 任务被 abort（收工）/ 写线程消失。
+/// 退出：连接死（`read_datagram` 出错）/ **写线程已退（`PushOutcome::Gone`——S6 的 A3）** /
+/// 任务被 abort（收工）。
 /// 队列满 ⇒ 丢 + 计 `回程队列满`（丢新——与出口的 ring「队尾丢」语义同向：TCP 会重传）。
 pub(crate) async fn pump_return(conn: Connection, ret: Arc<ReturnPath>, note: DropNote) {
     loop {
@@ -107,11 +108,24 @@ pub(crate) async fn pump_return(conn: Connection, ret: Arc<ReturnPath>, note: Dr
         // 拷贝一手的理由（**不是**零拷贝的地方）：`read_datagram` 给的 `Bytes` 是 quinn
         // 接收池缓冲的切片，直接入队会把池块按队列长度钉住（内存面不可预测）；拷进自有
         // `Vec` 后队列内存 = ≤ 上限 × 包长（与设计 §6.3/§6.4 的预算口径一致）。
-        if !ret.try_push(dg.to_vec()) {
-            note(
-                DropReason::ReturnQueueFull,
-                &format!("回程队列满（上限 {} 条）", crate::tun::RETURN_QUEUE_MAX),
-            );
+        match ret.try_push(dg.to_vec()) {
+            PushOutcome::Pushed => {}
+            PushOutcome::Full => {
+                note(
+                    DropReason::ReturnQueueFull,
+                    &format!("回程队列满（上限 {} 条）", crate::tun::RETURN_QUEUE_MAX),
+                );
+            }
+            // 消费者（TUN 写线程）已退：**不**把它计成「队列满」（队列没满，是没人收）——
+            // 记一行真因后收口。数据面此刻已不可信（fd 失效 ⇒ 世代层按 `fd` 分类重建），
+            // 继续空转只会逐包拷贝 + 误计。
+            PushOutcome::Gone => {
+                note(
+                    DropReason::Unregistered,
+                    "回程面已终止（TUN 写线程已退）—— 回程泵收口",
+                );
+                return;
+            }
         }
     }
 }

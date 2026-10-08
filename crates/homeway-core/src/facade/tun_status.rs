@@ -520,7 +520,8 @@ mod tests {
 
     /// runner 缺席 ⇒ stats/exitIp/link/portForwards/bridge 全缺（failed/prepare 期形态）。
     #[test]
-    fn no_runner_keys_absent() {        let input = TunStatusInput {
+    fn no_runner_keys_absent() {
+        let input = TunStatusInput {
             stage: stage_in(TunStage::Failed, "core", "新栈启动失败：token 解析失败", false, ""),
             running: false,
             demand: DemandState { active: false, reason: String::new(), at_ms: 0 },

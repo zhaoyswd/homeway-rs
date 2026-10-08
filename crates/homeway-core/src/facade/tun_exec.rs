@@ -2527,8 +2527,17 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
         //    皆败；蜂窝下 LAN 候选 ENETUNREACH 但中继发得出去 ⇒ 不算全失败）——
         //    覆盖非采纳（赛跑）态下采纳路径粘性信号够不着的盲区；
         // ② 采纳路径粘性（15s 尾窗）——① 不成立时的回看窗。
+        //
+        // **两路都只属 WG 承载**（设计 §2.5 的「反向保护」：判据 = 只以**当前承载**的
+        // 探活结论驱动处置，另一条腿的失败只记行）。quic 档 `SwapSendStats` 无岛侧
+        // 等价物（① 恒 (0,0)）⇒ ②**必须**同款按档分流：`last_local_send_err` 是 **WG
+        // 腿**的本地发送面（`wtransport::Bind`），双栈期它在换网时同样会持续报错
+        // （LAN 候选 ENETUNREACH）——拿它当 quic 档的噪声源会把 QUIC 的巡检失败门控成
+        // 「环境噪声」（`evidence_gate` 清零 `fail_streak`），最长压到 `NOISE_ESCALATE_AFTER`
+        // （180s）才逃逸 ⇒ 直接与 M1 判据「断线恢复 ≤3.5s」冲突。与 `pusher_loop`
+        // （本文件同款判断，`has_fresh_local_err` 已带 `!run.l3_on_island()`）保持同构。
         let mut local_noise = send_tries > 0 && send_local_fails == send_tries;
-        if !local_noise {
+        if !local_noise && !run.l3_on_island() {
             local_noise = client
                 .snapshot()
                 .last_local_send_err

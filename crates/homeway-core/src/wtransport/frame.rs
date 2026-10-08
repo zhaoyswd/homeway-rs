@@ -246,7 +246,8 @@ mod tests {
     }
 
     #[test]
-    fn relay_id_is_sha256_prefix() {        // Go：RelayID = sha256(pubkey)[:8]
+    fn relay_id_is_sha256_prefix() {
+        // Go：RelayID = sha256(pubkey)[:8]
         let id = relay_id(&[0u8; 32]);
         let sum = Sha256::digest([0u8; 32]);
         assert_eq!(id, &sum[..8]);
