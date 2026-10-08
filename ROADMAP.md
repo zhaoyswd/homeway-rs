@@ -85,8 +85,11 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
    发现清单 = `docs/reviews/AUDIT-2026-10-07.md`（条目已逐批勾选），跨批真源与各批结论 =
    `docs/REVIEW-ROADMAP.md` 状态总览（含 Q-J 收官行）+ 各批记录 `docs/reviews/Q<X>.md`
    （Q-J 记录 = `docs/reviews/QJ.md`，设计 = `QJ-design.md`）。
-3. **Q 批之后的未开批（等用户指令）与待裁决**：`Q-F-B`（portfwd 实装监听器；交接真源 =
-   `docs/reviews/QF.md` §7）+ `Q-I-DNS`（DNS TTL 缓存小批；取证与建议 = `docs/reviews/QIt.md` §7.1）；
+3. **Q 批之后的批次与待裁决**：**`Q-F-B`（portfwd 实装监听器）已完成**（2026-10-08，用户授权补齐；
+   两门通过，提交 `129f1c4`+`08a0f62`+`11800a7`；tier `port-forwarding` 的 SHALL/MUST 已由
+   「已知不达标」转**达标**，记录 = `docs/reviews/QFB.md`）；**`Q-K`（出口侧有界 IPv4 分片重组）
+   与 `Q-L`（账实对账 + 挂空小项）进行中/待做**；`Q-I-DNS`（DNS TTL 缓存小批；取证与建议 =
+   `docs/reviews/QIt.md` §7.1）仍待指令。
    Q-J 上报项：tier spec 偏离 5 条、App 需置 HELLO caps `KEY_ALT_ESC_PREFIX`——全部为用户触点
    或 tier 侧动作，见 `docs/reviews/QJ.md` §6。
    **A-any ↔ tier `exit-upnp-port-mapping:32-35` MUST 的二选一已由主会话裁定（2026-10-08）= 选项①
