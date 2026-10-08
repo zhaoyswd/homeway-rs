@@ -234,3 +234,237 @@ fn island_connects_registers_and_survives_rebind_against_local_exit() {
     assert!(island.stop_within(Instant::now() + Duration::from_secs(2)), "预算内收工");
     println!("[e2e] island.stopped=true");
 }
+
+// ---------------------------------------------------------------------------
+// M1 S2b：经中继全链 + 数据面双向
+// ---------------------------------------------------------------------------
+
+/// 内层 IPv4 + UDP 包的校验和（S1c 的活教训：留 0 会被出口的 smoltcp 栈**静默丢**）。
+fn inet_checksum(buf: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    let mut i = 0;
+    while i + 1 < buf.len() {
+        sum += u16::from_be_bytes([buf[i], buf[i + 1]]) as u32;
+        i += 2;
+    }
+    if i < buf.len() {
+        sum += (buf[i] as u32) << 8;
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
+/// 内层 IPv4 + UDP 包（IPv4 头校验和 + UDP 校验和**真算**）。
+fn inner_udp(src: Ipv4Addr, dst: Ipv4Addr, sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
+    let mut p = vec![0u8; 20 + 8 + payload.len()];
+    p[0] = 0x45;
+    p[2..4].copy_from_slice(&((20 + 8 + payload.len()) as u16).to_be_bytes());
+    p[8] = 64; // TTL
+    p[9] = 17; // UDP
+    p[12..16].copy_from_slice(&src.octets());
+    p[16..20].copy_from_slice(&dst.octets());
+    let ip_sum = inet_checksum(&p[..20]);
+    p[10..12].copy_from_slice(&ip_sum.to_be_bytes());
+    p[20..22].copy_from_slice(&sport.to_be_bytes());
+    p[22..24].copy_from_slice(&dport.to_be_bytes());
+    p[24..26].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+    p[28..].copy_from_slice(payload);
+    let mut pseudo = Vec::with_capacity(12 + 8 + payload.len());
+    pseudo.extend_from_slice(&src.octets());
+    pseudo.extend_from_slice(&dst.octets());
+    pseudo.push(0);
+    pseudo.push(17);
+    pseudo.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+    pseudo.extend_from_slice(&p[20..]);
+    let mut udp_sum = inet_checksum(&pseudo);
+    if udp_sum == 0 {
+        udp_sum = 0xffff; // RFC 768
+    }
+    p[26..28].copy_from_slice(&udp_sum.to_be_bytes());
+    p
+}
+
+/// 写一包进「应用侧」（= 岛的 TUN 读线程会读到）。
+fn write_tun(peer: &std::os::unix::net::UnixDatagram, pkt: &[u8]) {
+    peer.send(pkt).expect("写 TUN 一包");
+}
+
+/// 从「应用侧」读一包（有界；`None` = 上界内没读到）。
+fn read_tun(peer: &std::os::unix::net::UnixDatagram, wait: Duration) -> Option<Vec<u8>> {
+    peer.set_read_timeout(Some(wait)).ok()?;
+    let mut buf = vec![0u8; 4096];
+    match peer.recv(&mut buf) {
+        Ok(n) => Some(buf[..n].to_vec()),
+        Err(_) => None,
+    }
+}
+
+/// **判据（M1 S2b 的端到端）**：岛客户端经 **Rust 中继全链**（`local-rust-relay.sh`）连上
+/// 本地 Rust 出口，并把**真内层流量**双向推过 TUN fd：
+///
+/// ① `via=Relay{label}`（label = `sha256(peerId)[:8]`）胜出 + 出口 `peer: +`（真设备表）；
+/// ② 数据面双向：TUN fd 投内层 UDP（IPv4/UDP 校验和真算）→ 岛 → **中继** → 出口 intercept
+///    → transit 到本机 UDP echo → 回程 → 中继 → 岛 → TUN fd（载荷逐字节）；
+/// ③ 忽略面：中继推的 hint 控制帧（非 kind=5）被忽略并计数（`rx_ignored`）。
+///
+/// 环境契约（`tools/quic-island-e2e.sh` 装配）：
+/// `HOMEWAY_ISLAND_E2E_TOKEN`（含 relay 类端点的出口 token）/ `HOMEWAY_ISLAND_E2E_EXIT_LOG` /
+/// `HOMEWAY_ISLAND_E2E_RELAY`（选填 `ip:port`；缺省取 token 的 Relay 类端点）。
+#[test]
+#[ignore = "端到端（经中继 + 数据面）：需本地中继与出口在跑（tools/quic-island-e2e.sh 驱动）"]
+fn island_uses_relay_and_pushes_traffic_through_tun() {
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixDatagram;
+
+    let token_str = std::env::var("HOMEWAY_ISLAND_E2E_TOKEN").expect("须给 HOMEWAY_ISLAND_E2E_TOKEN");
+    let exit_log = PathBuf::from(
+        std::env::var("HOMEWAY_ISLAND_E2E_EXIT_LOG").expect("须给 HOMEWAY_ISLAND_E2E_EXIT_LOG"),
+    );
+    let log0 = log_lines(&exit_log);
+    let tok = token::decode(&token_str).expect("token 可解");
+    let rpk = tok.rpk.expect("M1 的 token 必带出口 RPK");
+
+    // 中继候选：`label = sha256(peerId)[:8]`（真源 `wtransport::frame::relay_id`）
+    let label = homeway_core::wtransport::frame::relay_id(tok.peer_id.as_bytes());
+    let relay_addr: SocketAddrV4 = match std::env::var("HOMEWAY_ISLAND_E2E_RELAY") {
+        Ok(v) => v.parse().expect("HOMEWAY_ISLAND_E2E_RELAY 形如 ip:port"),
+        Err(_) => tok
+            .endpoints
+            .iter()
+            .find(|e| e.kind == EndpointKind::Relay)
+            .expect("token 必须带中继类端点（出口 `serve --relay <rl1…>` 注册过腿）")
+            .addr
+            .parse()
+            .expect("中继端点地址可解"),
+    };
+
+    let id = Identity::ephemeral().expect("临时身份");
+    let pubkey = id.public_key();
+    let secret = tok.secret.clone();
+    // 设备派生地址（真源 `homeway_core::tunnel_addr`）：内层包 src 必须 ∈ {tunnel_ip, tun_ip}
+    let tun_ip = homeway_core::tunnel_addr::derive_tun_ip(&secret, &pubkey);
+    let mut cfg = IslandConfig::new(IslandCredential::new(
+        TokenSecret::from_bytes(*secret.as_bytes()),
+        pubkey,
+        *id.dev_tag().as_bytes(),
+        RpkPublicKey::from_bytes(*rpk.as_bytes()),
+    ));
+    cfg.bind = Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    cfg.patrol = Duration::from_secs(2);
+
+    // 本机 UDP echo（出口 intercept 的 **transit** 目标：同一台机器 ⇒ 回环可达）
+    let echo = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("echo 可绑");
+    let echo_addr = match echo.local_addr().expect("echo 地址") {
+        std::net::SocketAddr::V4(v) => v,
+        std::net::SocketAddr::V6(_) => unreachable!(),
+    };
+    let echo_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let echo_thread = {
+        let stop = std::sync::Arc::clone(&echo_stop);
+        let sock = echo.try_clone().expect("echo 克隆");
+        std::thread::spawn(move || {
+            sock.set_read_timeout(Some(Duration::from_millis(50))).ok();
+            let mut buf = [0u8; 2048];
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                if let Ok((n, from)) = sock.recv_from(&mut buf) {
+                    let _ = sock.send_to(&buf[..n], from);
+                }
+            }
+        })
+    };
+
+    let island = Island::start(logf(), noop_unhealthy(), cfg).expect("岛可起（含 QUIC 端点）");
+    // TUN 面 = 数据报 socketpair（一端当 fd 交给岛，另一端当「应用」）
+    let (tun, peer) = UnixDatagram::pair().expect("socketpair(DGRAM)");
+    let attached = cmd(
+        &island,
+        |reply| Cmd::TunAttach {
+            fd: tun.as_raw_fd(),
+            mtu: 1280,
+            reply,
+        },
+        Duration::from_secs(5),
+    );
+    assert!(attached.is_ok(), "隧道面必须附加：{attached:?}");
+
+    // ---- ① 赛跑（**只给中继候选** ⇒ 证明信封路径本身可用）----
+    let outcome: RaceOutcome = cmd(
+        &island,
+        |reply| Cmd::Connect {
+            cands: vec![Candidate {
+                addr: relay_addr,
+                via: Via::Relay { label },
+            }],
+            budget: Duration::from_secs(5),
+            reply,
+        },
+        Duration::from_secs(15),
+    )
+    .expect("中继候选必须经信封握手成功");
+    println!("[e2e2] race.winner={}", outcome.winner);
+    println!("[e2e2] race.via={:?}", outcome.via);
+    println!("[e2e2] relay.label={}", label.iter().map(|b| format!("{b:02x}")).collect::<String>());
+    assert_eq!(outcome.winner, relay_addr, "胜者 = 中继候选");
+    assert_eq!(outcome.via, Via::Relay { label }, "via 必须如实带回中继类别");
+    let peer_line = wait_log_from(&exit_log, log0, "peer: +", None, WAIT)
+        .expect("出口必须打 `peer: +`（真登记；本轮新增行）");
+    println!("[e2e2] exit.peer_line={peer_line}");
+
+    // ---- ② 数据面双向（经中继；出口 intercept transit → 回环 echo）----
+    let payload = b"hw-m1-s2b-echo";
+    let inner = inner_udp(
+        tun_ip,
+        Ipv4Addr::LOCALHOST,
+        40000,
+        echo_addr.port(),
+        payload,
+    );
+    write_tun(&peer, &inner);
+    let deadline = Instant::now() + WAIT;
+    let mut back: Option<Vec<u8>> = None;
+    while Instant::now() < deadline {
+        if let Some(p) = read_tun(&peer, Duration::from_millis(200)) {
+            // 回程 = 出口 intercept 回投的内层包（IPv4+UDP+载荷；载荷 = 同一 payload）
+            if p.len() >= 28 + payload.len() && p[28..].starts_with(payload) {
+                back = Some(p);
+                break;
+            }
+        }
+    }
+    let back = back.expect("回程必须经中继回到 TUN fd（内层载荷逐字节）");
+    println!(
+        "[e2e2] tun.uplink={}B tun.downlink={}B payload={:?}",
+        inner.len(),
+        back.len(),
+        String::from_utf8_lossy(&back[28..])
+    );
+    println!(
+        "[e2e2] exit.transit_line={}",
+        wait_log_from(&exit_log, log0, "transit", None, Duration::from_secs(3))
+            .unwrap_or_else(|| "（无 transit 行；以回程载荷为准）".into())
+    );
+
+    // ---- ③ 读数（快照面）----
+    let snap = island.snapshot();
+    println!("[e2e2] island.via={:?}", snap.via);
+    println!("[e2e2] island.packets_in={}", snap.packets_in);
+    println!("[e2e2] island.packets_out={}", snap.packets_out);
+    println!("[e2e2] island.relay_tx={}", snap.relay_tx);
+    println!("[e2e2] island.rx_ignored={}", snap.rx_ignored);
+    println!("[e2e2] island.drops={:?}", snap.drops);
+    println!("[e2e2] island.mtu={:?} current_mtu={}", snap.mtu, snap.current_mtu);
+    assert!(snap.packets_out >= 1, "回程包计数（packets_out）必须真计");
+    assert!(snap.relay_tx >= 1, "中继上行包封计数必须 > 0");
+    assert!(
+        snap.rx_ignored >= 1,
+        "中继推的 hint 控制帧（非 kind=5）必须被忽略并计数"
+    );
+    assert_eq!(snap.drops.too_large, 0, "本用例不注入超限");
+
+    assert!(island.stop_within(Instant::now() + Duration::from_secs(2)), "预算内收工");
+    echo_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = echo_thread.join();
+    println!("[e2e2] island.stopped=true");
+}
