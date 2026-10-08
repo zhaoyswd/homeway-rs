@@ -1,0 +1,372 @@
+//! 岛骨架单测（设计 §9.1 的 10 条口径；**全部走公面**）。
+//!
+//! flake 口径（设计 §9.2 五条，写进用例形态）：
+//! 1. **不钉固定端口**——本文件零固定端口（回环端口只在用例 8 里以 `:0` 交内核分配）；
+//! 2. **时间断言禁精确墙钟**——只断言**上界**（`elapsed < 预算 × 4`）与「预算内收工」形态；
+//! 3. **不依赖 loadavg**——岛内无吞吐断言（性能判据全在 `tools/quic-ab.sh`）；
+//! 4. **隔离复跑纪律**——本文件红了先 `--test-threads=1` 独占复跑再判是否回归；
+//! 5. **登记动作**——五条口径写进路线文件「已知 flake 登记」（主会话插入，见 `docs/reviews/M0.md`）。
+//!
+//! 用例 4/5b 的「到点 detach」把岛线程留在卡死态（镜像 `wgcore` 的 detach 用例形态）：
+//! 测试进程结束时该线程随进程消失；`Island::drop` 因 stop 位已置而不等待。
+
+use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+
+use crate::cmd::{Cmd, IslandErr, IslandSnapshot};
+use crate::driver::seams;
+use crate::{Island, IslandTx, Logf, OnUnhealthy};
+
+/// 收工预算（与 `wgcore::CLIENT_CLOSE_BUDGET` 同量级 = 2s）。
+const BUDGET: Duration = Duration::from_secs(2);
+/// 上界断言口径（flake 口径 2②：只判上界，不判区间）。
+const CAP: Duration = Duration::from_secs(8);
+
+/// 日志落点 + 收集端（断言记行面）。
+fn sink() -> (Logf, Receiver<String>) {
+    let (tx, rx) = channel();
+    (
+        Arc::new(move |s: &str| {
+            let _ = tx.send(s.to_owned());
+        }),
+        rx,
+    )
+}
+
+/// 不健康回调 + 收集端（断言分类面）。
+fn unhealthy_sink() -> (OnUnhealthy, Receiver<String>) {
+    let (tx, rx) = channel();
+    (
+        Arc::new(move |r: &str| {
+            let _ = tx.send(r.to_owned());
+        }),
+        rx,
+    )
+}
+
+fn noop_unhealthy() -> OnUnhealthy {
+    Arc::new(|_r: &str| {})
+}
+
+fn island_of(logf: Logf) -> Island {
+    Island::start(logf, noop_unhealthy()).expect("岛可起（专用线程 + 单线程 runtime）")
+}
+
+/// 有界取回回执 —— **实现设计 §3.6-2① 的映射**：通道断开（岛死/线程 panic ⇒ 栈上
+/// reply sender 被 drop） ⇒ [`IslandErr::EngineGone`]，**禁 `unwrap()`**；
+/// 超时在测试里是「挂死」的证据 ⇒ 判红（不是 flake 宽容面）。
+fn recv_reply<T>(rx: &Receiver<Result<T, IslandErr>>, wait: Duration) -> Result<T, IslandErr> {
+    match rx.recv_timeout(wait) {
+        Ok(v) => v,
+        Err(RecvTimeoutError::Disconnected) => Err(IslandErr::EngineGone),
+        Err(RecvTimeoutError::Timeout) => panic!("回执超时（岛未应答 ⇒ 挂死）"),
+    }
+}
+
+fn attach(island: &Island, fd: i32, mtu: u32, wait: Duration) -> Result<(), IslandErr> {
+    let (rtx, rrx) = channel();
+    island
+        .tx()
+        .send(Cmd::TunAttach { fd, mtu, reply: rtx })
+        .map_err(|_| IslandErr::EngineGone)?;
+    recv_reply(&rrx, wait)
+}
+
+/// 投一条带 reply 的 attach 命令但**不等回执**（注入缝用例的触发命令：岛在处置点
+/// 卡死/panic ⇒ 回执永不到；receiver 留在栈上，岛侧 send 失败被忽略）。
+fn put_attach_command(island: &Island) {
+    let (rtx, _rrx) = channel();
+    island
+        .tx()
+        .send(Cmd::TunAttach {
+            fd: -1,
+            mtu: 1280,
+            reply: rtx,
+        })
+        .expect("命令投递（注入触发）");
+}
+
+/// 投一包（热路径无回执）。
+fn put_packet(island: &Island, len: usize) {
+    island
+        .tx()
+        .send(Cmd::TunPacket(vec![0u8; len].into_boxed_slice()))
+        .expect("投包不阻塞（unbounded）");
+}
+
+/// 有界收集日志行直到出现含 `needle` 的行；返回「截至命中（含）的全部行」。
+/// 先用它滚动再断言，避免多行都在时必须分次消费（无轮询 `sleep`——用 `recv_timeout` 当等待）。
+fn drain_until(rx: &Receiver<String>, needle: &str, wait: Duration) -> Vec<String> {
+    let deadline = Instant::now() + wait;
+    let mut lines = Vec::new();
+    while Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match rx.recv_timeout(left.max(Duration::from_millis(1))) {
+            Ok(line) => {
+                let hit = line.contains(needle);
+                lines.push(line);
+                if hit {
+                    return lines;
+                }
+            }
+            Err(RecvTimeoutError::Timeout) | Err(RecvTimeoutError::Disconnected) => break,
+        }
+    }
+    panic!("日志未在 {wait:?} 内出现「{needle}」（已收 {} 行：{lines:?}）", lines.len());
+}
+
+// ---------- 1 ----------
+
+/// 起岛 → `Stop` → `stop_within(now+2s)` = true；线程已 join（`is_finished()`）。
+#[test]
+fn island_starts_and_stops_within_budget() {
+    let (logf, _logs) = sink();
+    let island = island_of(logf);
+    let t0 = Instant::now();
+    assert!(
+        island.stop_within(Instant::now() + BUDGET),
+        "岛必须在收工预算内退出（true）"
+    );
+    assert!(
+        t0.elapsed() < CAP,
+        "收工不得越过上界（flake 口径 2②；实测 {:?}）",
+        t0.elapsed()
+    );
+    assert!(island.is_finished(), "线程已 join 收口（exit 位可见）");
+}
+
+// ---------- 2 ----------
+
+/// 首次 attach → `Ok(())`；二次 → `Err(TunAlreadyAttached)`。
+#[test]
+fn tun_attach_replies_and_rejects_second() {
+    let (logf, _logs) = sink();
+    let island = island_of(logf);
+    assert!(
+        matches!(attach(&island, 7, 1280, BUDGET), Ok(())),
+        "首次 attach 必须 Ok"
+    );
+    assert!(
+        matches!(
+            attach(&island, 8, 1400, BUDGET),
+            Err(IslandErr::TunAlreadyAttached)
+        ),
+        "二次 attach 必须 TunAlreadyAttached"
+    );
+    assert!(island.snapshot().attached, "快照 attached 置位");
+    assert!(island.stop_within(Instant::now() + BUDGET), "正常收工");
+}
+
+// ---------- 3 ----------
+
+/// 投 `TunPacket` 后仍可正常收工（热路径不阻塞、无回执通道需求），且计数 +1。
+///
+/// **有界观测**（设计门 4.2 的要求）：无 reply ⇒ 用**同通道保序**的屏障命令（再来一次
+/// attach）的回执当观测点——回执到 = 其前的包必已被处置；回执取回本身有界（2s）。
+/// 该形态比「轮询快照 + sleep」确定（零 flake），也满足「必须给有界等待」的口径。
+#[test]
+fn tun_packet_is_accepted_without_reply() {
+    let (logf, _logs) = sink();
+    let island = island_of(logf);
+    assert!(matches!(attach(&island, -1, 1280, BUDGET), Ok(())));
+    put_packet(&island, 64);
+    assert!(
+        matches!(
+            attach(&island, -1, 1280, BUDGET),
+            Err(IslandErr::TunAlreadyAttached)
+        ),
+        "屏障命令的回执必须在 TunPacket 之后到达（同通道保序）"
+    );
+    assert_eq!(island.snapshot().packets_in, 1, "投递计数 +1");
+    assert!(
+        island.stop_within(Instant::now() + BUDGET),
+        "投包后仍可正常收工"
+    );
+}
+
+// ---------- 4 ----------
+
+/// 卡死注入（`#[cfg(test)]` 缝）⇒ 到点返回 **false** + 收割线程 `hw-quic-reap` 接手。
+#[test]
+fn stop_within_detaches_when_island_stuck() {
+    let (logf, logs) = sink();
+    let island = Island::start_with_seam(logf, noop_unhealthy(), seams::HANG)
+        .expect("岛可起（卡死注入缝）");
+    // 触发注入：投一条命令（其回执永不到——岛在处置点卡死）
+    put_attach_command(&island);
+    // 确定性同步点：注入缝先记「注入开始」再卡死 —— 见到该行 = 岛已消费命令并进入卡死态
+    // （驱动循环头判 stop 位就退出，队列里的命令会被丢弃 ⇒ 不先同步会有竞态）。
+    drain_until(&logs, seams::MARK_HANG, BUDGET);
+    assert!(
+        !island.stop_within(Instant::now() + Duration::from_millis(200)),
+        "卡死岛到点必须返回 false（detach）"
+    );
+    let lines = drain_until(&logs, "hw-quic-reap", Duration::from_secs(2));
+    assert!(
+        lines.iter().any(|l| l.contains("到点 detach")),
+        "收割线程必须接手并留证：{lines:?}"
+    );
+}
+
+// ---------- 5a ----------
+
+/// panic 面专项：①不健康回调**立即**收到 `"panic"`（不等收尾）；②在途命令的
+/// `reply` 归 `IslandErr::EngineGone`（**不挂死**）；③`stop_within` 返回 **true**
+/// （panic 后线程已 finished——false 只属"卡死"）；④panic 记行由 `stop_within` 的
+/// join 分支产生（设计 §3.6-4 分工表）。
+#[test]
+fn island_panic_is_classified_in_place_and_surfaces_as_engine_gone() {
+    let (logf, logs) = sink();
+    let (on_unhealthy, reasons) = unhealthy_sink();
+    let island = Island::start_with_seam(logf, on_unhealthy, seams::PANIC)
+        .expect("岛可起（panic 注入缝）");
+
+    // 在途命令：带 reply 的 attach 到点即 panic（回执 sender 随栈解开被 drop）。
+    let (rtx, rrx) = channel();
+    island
+        .tx()
+        .send(Cmd::TunAttach {
+            fd: -1,
+            mtu: 1280,
+            reply: rtx,
+        })
+        .expect("命令投递");
+    assert!(
+        matches!(recv_reply(&rrx, BUDGET), Err(IslandErr::EngineGone)),
+        "岛死 ⇒ 在途命令必须归 EngineGone（不得挂死）"
+    );
+
+    // ① 即时分类：不调用收工面就能收到不健康原因。
+    match reasons.recv_timeout(BUDGET) {
+        Ok(r) => assert_eq!(r, "panic", "不健康原因必须是 panic（判据语义取值集）"),
+        Err(e) => panic!("岛内 panic 未即时分类上报：{e:?}"),
+    }
+
+    // ③ panic（unwind）后线程已 finished ⇒ 预算内收工返 true
+    let t0 = Instant::now();
+    assert!(
+        island.stop_within(Instant::now() + BUDGET),
+        "panic 后必须预算内收工（true）"
+    );
+    assert!(t0.elapsed() < CAP, "收工不得越过上界（实测 {:?}）", t0.elapsed());
+
+    // ④ join 分支的 panic 记行（本测只经 stop_within 收工 ⇒ 该行必出自该分支）
+    let lines = drain_until(&logs, "本世代 QUIC 面已死", Duration::from_secs(2));
+    assert!(
+        lines.iter().any(|l| l.contains("岛线程 panic")),
+        "join 分支必须记 panic 行：{lines:?}"
+    );
+}
+
+// ---------- 5b ----------
+
+/// 卡死注入（延迟 panic）⇒ 到点 **false** + `hw-quic-reap` 接手 + **panic 行由收割线程
+/// 的 join 分支产生**（与 5a 的"谁记行"口径成对）。
+#[test]
+fn stuck_island_panic_line_comes_from_reaper() {
+    let (logf, logs) = sink();
+    let island = Island::start_with_seam(logf, noop_unhealthy(), seams::STALL_THEN_PANIC)
+        .expect("岛可起（延迟 panic 缝）");
+    // 触发注入：投一条命令（岛在处置点先卡死 1.2s，再 panic——回执永不到）
+    put_attach_command(&island);
+    // 确定性同步点：见到「注入开始」= 岛已消费命令并进入卡死窗（1.2s）
+    drain_until(&logs, seams::MARK_STALL, BUDGET);
+    // 到点（200ms ≪ 卡死窗 1.2s）⇒ detach（join 侧交接给收割线程）
+    assert!(
+        !island.stop_within(Instant::now() + Duration::from_millis(200)),
+        "卡死窗内必须 detach（false）"
+    );
+    // 卡死窗过后岛内 panic ⇒ 只有收割线程的 join 分支能产生这行（stop_within 已 detach，
+    // 本线程从未 join 过该句柄）
+    let lines = drain_until(&logs, "本世代 QUIC 面已死", Duration::from_secs(5));
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("hw-quic-reap") && l.contains("到点 detach")),
+        "收割线程必须先留接手行：{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("岛线程 panic")),
+        "收割线程的 join 分支必须记 panic 行：{lines:?}"
+    );
+}
+
+// ---------- 6 ----------
+
+/// 收工后 `snapshot()` 可读（不 panic、值冻结）。
+#[test]
+fn snapshot_is_pollable_after_stop() {
+    let (logf, _logs) = sink();
+    let island = island_of(logf);
+    assert!(matches!(attach(&island, 3, 1280, BUDGET), Ok(())));
+    put_packet(&island, 32);
+    assert!(island.stop_within(Instant::now() + BUDGET), "正常收工");
+    let s: IslandSnapshot = island.snapshot();
+    assert!(s.attached, "收工后快照仍可读且值冻结");
+    assert_eq!(s.packets_in, 1, "收工后计数冻结");
+    assert_eq!(island.snapshot().packets_in, s.packets_in, "重复读取稳定");
+}
+
+// ---------- 7 ----------
+
+/// 层 2：**可搬运性断言**（如实在此标注——一切异步类型都满足 `Send + 'static`，
+/// 故本测对「公面夹带」检出率为 0，它保的是「同步面搬得动」；夹带检出靠层 3 源码门）。
+#[test]
+fn public_types_are_send_static() {
+    fn assert_send_static<T: Send + 'static>() {}
+    fn assert_send_sync_static<T: Send + Sync + 'static>() {}
+    assert_send_static::<Cmd>();
+    assert_send_static::<IslandTx>();
+    assert_send_static::<IslandErr>();
+    assert_send_static::<IslandSnapshot>();
+    assert_send_static::<Island>();
+    assert_send_sync_static::<IslandTx>();
+    assert_send_sync_static::<Logf>();
+    assert_send_sync_static::<OnUnhealthy>();
+}
+
+// ---------- 8 ----------
+
+/// 依赖面活体证据（设计 §9.1 用例 8 的 `dep_face_alive_quinn_client_endpoint`）：
+/// `current_thread` runtime 内建回环客户端端点并读回端口后丢弃（时序侧在 `driver.rs` 的
+/// `#[cfg(test)]` 面——异步栈名字只允许出现在那里）。**函数名省去 crate 名**：本文件也受
+/// 隔离门层 3 的 ② 条约束（代码里零异步栈名字），设计给的用例名只保留在文档里。
+#[test]
+fn dep_face_alive_client_endpoint() {
+    let addr = crate::driver::dep_face_alive_endpoint().expect("依赖面活着：端点可建");
+    assert!(addr.ip().is_loopback(), "只绑回环：{addr}");
+    assert_ne!(addr.port(), 0, "回环端口由内核分配（flake 口径 1：不钉固定端口）");
+}
+
+// ---------- 10 ----------
+
+/// 公面签名钉定（编译期）：显式 std 类型签名——一旦公面夹带异步栈类型即编译失败。
+#[test]
+fn public_surface_signatures_are_pinned() {
+    let _: fn(Logf, OnUnhealthy) -> std::io::Result<Island> = Island::start;
+    let _: fn(&Island) -> IslandTx = Island::tx;
+    let _: fn(&Island) -> IslandSnapshot = Island::snapshot;
+    let _: fn(&Island) -> bool = Island::is_finished;
+    let _: fn(&Island) = Island::stop;
+    let _: fn(&Island, Instant) -> bool = Island::stop_within;
+    let _: fn(&IslandTx, Cmd) -> Result<(), IslandErr> = IslandTx::send;
+    // 线程名常量（写死供 M1 生命周期对接复用）
+    let _: &str = crate::driver::ISLAND_THREAD;
+    let _: &str = crate::driver::REAP_THREAD;
+    // 兜底面：`Drop for Island`（镜像 `Drop for Client`）——句柄是拥有型值，可被 drop
+    let _: fn(Island) = |i: Island| drop(i);
+}
+
+/// 10 条的「第 9 条」= 源码门 `tools/check-quic-isolation.sh`（非单测，见设计 §3.4 层 3）；
+/// 本用例只钉「该门在位」这一句，防将来误删调用点（门本体由 CI/ci-local 跑）。
+#[test]
+fn source_gate_reference_is_pinned() {
+    let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("../../tools/check-quic-isolation.sh");
+    assert!(
+        script.is_file(),
+        "源码门脚本在位（设计 §3.4 层 3）：{}",
+        script.display()
+    );
+}

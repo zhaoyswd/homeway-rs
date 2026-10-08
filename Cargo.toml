@@ -1,7 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/homeway-core", "crates/homeway-cli", "crates/homeway-capi"]
-exclude = ["fuzz"]  # fuzz 独立 workspace（nightly + cargo-fuzz；不进 cargo test --workspace——G-10）
+members = ["crates/homeway-core", "crates/homeway-cli", "crates/homeway-capi", "crates/homeway-quic"]
+# 两个独立 workspace 的排除项：
+#   fuzz           = nightly + cargo-fuzz（不进 cargo test --workspace——G-10）
+#   tools/quic-ab  = QUIC 实验台探针（**必需**：它自带 [patch] ring 的真 ring 臂，
+#                    不被根 [patch] 换垫片，否则「真 ring 诊断臂」当场失真——M0 设计 §4.4）
+exclude = ["fuzz", "tools/quic-ab"]
 
 [workspace.package]
 version = "0.2.3"
@@ -37,6 +41,21 @@ portable-pty = "0.9"
 flate2 = "1"
 fnv = "1"
 regex = "1"
+# ---- M0 传输层换代（WG → QUIC）依赖面：只被 crates/homeway-quic（岛）消费 ----
+# 纪律（M0 设计 §3.4 层 0/层 1）：homeway-core / homeway-cli / homeway-capi 一律不声明
+# 这三条——「同步面写不出异步代码」靠此成为编译期事实（写 `use tokio::…` 直接 E0433），
+# 并由 tools/check-quic-isolation.sh 逐条断言。
+# quinn：默认 features 全关（platform-verifier/bloom/log 都不要——M2 走 RPK 钉定，
+#        logf 自有一切判据行）；rustls-ring 明确选 ring 后端，runtime-tokio = tokio 后端。
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
+# rustls：**默认 features 必须关**（默认含 aws_lc_rs + prefer-post-quantum ⇒ 拉
+#        aws-lc-sys = BoringSSL 派生 + cmake，OHOS 不可行）；tls12/logging 不需要
+#        （QUIC 恒 TLS1.3）。
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# tokio：rt = current_thread 宿主；time = 预算/节拍；sync = 命令通道；macros = select!
+#        （**只为 select!**——仍不用 #[tokio::main]，单线程不变量不受影响）。
+#        不启 rt-multi-thread（单线程是结构不变量，不启用即编译期约束）。
+tokio = { version = "1", default-features = false, features = ["rt", "time", "sync", "macros"] }
 
 [patch.crates-io]
 ring = { path = "tools/ring-shim" }

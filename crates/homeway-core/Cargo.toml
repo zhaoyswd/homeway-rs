@@ -27,6 +27,9 @@ portable-pty.workspace = true
 flate2.workspace = true
 fnv.workspace = true
 regex.workspace = true
+# M0 传输层换代：QUIC 岛（异步栈自持在岛内；本 crate **不声明**它，故同步面写不出
+# 异步代码——源码零引用，M1 才接线。见 docs/reviews/M0-design.md §3.4 层 0/层 1）
+homeway-quic = { path = "../homeway-quic" }
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }

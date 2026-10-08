@@ -1,0 +1,14 @@
+[package]
+name = "homeway-quic"
+description = "QUIC 岛：单线程 runtime 宿主 + 同步/异步边界（对同步面只暴露命令通道；M0 骨架，零接线）"
+version.workspace = true
+edition.workspace = true
+
+# 纪律（M0 设计 §3.1/§3.4）：本 crate 是**叶子**（leaf-ward）——**不得**依赖
+# homeway-core（否则依赖成环 + 边界失效）。异步栈（quinn/rustls/tokio）只在这里声明，
+# 消费侧 homeway-core 只加一条路径依赖、不声明它们 ⇒ 同步面里 `use tokio::…` = E0433。
+[dependencies]
+quinn.workspace = true
+rustls.workspace = true
+tokio.workspace = true
+thiserror.workspace = true
