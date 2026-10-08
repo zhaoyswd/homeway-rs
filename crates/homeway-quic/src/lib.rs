@@ -38,13 +38,15 @@
 //!
 //! 模块边界（设计 §3.1；M1 起长出口侧 `exit/`）：[`cmd`] = 命令通道协议（全 std 类型）；
 //! [`driver`] = 岛宿主（客户端侧异步面）；`exit/` = **出口 QUIC 面**（异步面：端点 +
-//! TransportConfig + RPK 身份，M1 设计 §1.1/§1.2/§1.7）；`rpk` = RFC 7250 的**纯 std**
-//! 字节小件（种子/PKCS#8/SPKI——同步面也读得懂）；`sync_util` = 线程卫生小件。
+//! TransportConfig + RPK 身份 + 准入/数据面，M1 设计 §1.1/§1.2/§1.3/§1.4/§1.7）；`rpk` =
+//! RFC 7250 的**纯 std** 字节小件（种子/PKCS#8/SPKI——同步面也读得懂）；`reg3` = `hr-reg3`
+//! 注册帧的**纯 std** 字节层（`hmac`/`sha2` 非异步栈）；`sync_util` = 线程卫生小件。
 //! **异步栈名字只允许出现在 `driver.rs` 与 `exit/**`**（隔离门层 3 断言）。
 
 mod cmd;
 mod driver;
 mod exit;
+mod reg3;
 mod rpk;
 mod sync_util;
 
@@ -53,5 +55,9 @@ mod tests;
 
 pub use cmd::{Cmd, IslandErr, IslandReply, IslandSnapshot, Logf, OnUnhealthy};
 pub use driver::{Island, IslandTx};
-pub use exit::{ExitQuic, ExitQuicConfig, ExitQuicErr, ExitQuicSnapshot};
+pub use exit::{
+    ExitInbound, ExitQuic, ExitQuicConfig, ExitQuicErr, ExitQuicSnapshot, ExitSend, Reg3Request,
+    Reg3Verdict,
+};
+pub use reg3::Reg3Frame;
 pub use rpk::{Ed25519Seed, RpkErr, RpkPublicKey};

@@ -219,6 +219,29 @@ impl DeviceTable {
         (self.cfg.max_devices, self.cfg.ttl, self.cfg.grace)
     }
 
+    /// **reg3（连接绑定版）的 MAC 匹配**（M1 设计 §1.3）：逐条试 token secret，命中即返回
+    /// 该 secret。**纯校验**——不做时间窗、不走吊销钩子、不计数、不打行：三者全部留给
+    /// [`Self::register`] 的同一条路径（命中后调用方用该 secret 重建 v2 报文再走 register）
+    /// ⇒ `register` 的语义与判据行逐字不变，本方法只是「哪条 secret 认得这一帧」。
+    ///
+    /// 换连接重放 ⇒ `exporter` 不同 ⇒ 恒不命中（这正是 reg3 存在的理由，见
+    /// `homeway_quic::Reg3Frame`）。
+    pub(crate) fn match_reg3(
+        &self,
+        frame: &homeway_quic::Reg3Frame,
+        exporter32: &[u8; 32],
+    ) -> Option<[u8; 32]> {
+        self.secrets.iter().copied().find(|s| frame.mac_matches(s, exporter32))
+    }
+
+    /// 某设备的派生地址（QUIC 出口面的源校验 + 绑定面；M1 设计 §1.3/§1.4）。
+    ///
+    /// 为什么需要读口：`register` 的 **refresh** 不产 `DevOp`（表内只刷 lastReg）⇒ 刷新帧
+    /// 的裁决拿不到地址，必须回表里读（Add/Rotated 也能读，取表内当前值为准）。
+    pub(crate) fn device_addrs(&self, dev: &[u8; 8]) -> Option<(Ipv4Addr, Ipv4Addr)> {
+        self.entries.get(dev).map(|e| (e.ip, e.tun_ip))
+    }
+
     /// 设备表 brief（serve.status 观测面：dev = devTag 全 16hex、隧道 /32、最近注册
     /// 与距今毫秒——Go DeviceTable.Briefs 同形）。
     pub fn briefs(&self) -> Vec<(String, Ipv4Addr, i64, i64)> {

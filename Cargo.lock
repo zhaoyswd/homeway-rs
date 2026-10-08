@@ -617,8 +617,10 @@ name = "homeway-quic"
 version = "0.2.3"
 dependencies = [
  "bytes",
+ "hmac",
  "quinn",
  "rustls",
+ "sha2",
  "thiserror 2.0.21",
  "tokio",
 ]

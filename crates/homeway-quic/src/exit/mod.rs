@@ -14,13 +14,15 @@
 //! [`ExitQuic::stop_within`] 有界预算内退出（到点 detach + 收割线程 `hw-quic-exit-reap`）。
 //!
 //! 本棒（S1a）范围 = 端点 + TransportConfig + 出口 RPK 身份 + E-q1 就绪行；
-//! **准入（`hr-reg3`）与数据面（DATAGRAM↔intercept）是 S1b**，中继承载（`kind=5` +
-//! 自定义 `AsyncUdpSocket`）、UPnP 与 token 端点类是 S1c。故本模块当前只到「端点在、
-//! 能采纳连接、能观测、能收工」，**未接引擎数据面**。
+//! **S1b** 补准入（`hr-reg3` 连接绑定 → `table.register`）、数据面（DATAGRAM ⇄ 引擎
+//! `intercept.on_plain`）与出站分流；中继承载（`kind=5` + 自定义 `AsyncUdpSocket`）、
+//! UPnP 与 token 端点类是 S1c。
 //!
 //! 隔离：本目录（`src/exit/**`）属**异步面**——`tools/check-quic-isolation.sh` 第 ② 条
 //! 的白名单与 `driver.rs` 同款（其余 `src/` 文件零异步栈名字）。
 
+mod bridge;
+mod conn;
 mod rpk;
 mod transport;
 
@@ -29,6 +31,8 @@ mod tests;
 
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
+use std::os::fd::RawFd;
+use std::os::unix::net::UnixStream;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -37,12 +41,24 @@ use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use quinn::{Connection, Endpoint, EndpointConfig};
-use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
+use tokio::sync::mpsc::{self as tmpsc, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinSet;
 
 use crate::cmd::Logf;
 use crate::rpk::{Ed25519Seed, RpkPublicKey};
 use crate::sync_util::{lock_unpoison, log_spawn_failed, ExitSignal};
+
+use bridge::{DropKind, ExitBridge, Outbound, OUTBOUND_QUEUE_MAX};
+
+/// 两向边界的公面（引擎消费面）：入站事件 + 准入请求/裁决 + 出站投递结果。
+pub use bridge::{ExitInbound, ExitSend, Reg3Request, Reg3Verdict};
+
+/// 出口面线程内共享上下文（端点主循环 + 每连接任务）。
+pub(crate) struct FaceCtx {
+    pub(crate) stats: Arc<ExitStats>,
+    pub(crate) bridge: Arc<ExitBridge>,
+    pub(crate) logf: Logf,
+}
 
 /// QUIC 面线程名（与岛 `homeway-quic` 区分：这是**出口侧**的那一枚）。
 pub(crate) const EXIT_THREAD: &str = "homeway-quic-exit";
@@ -58,7 +74,7 @@ pub const DEFAULT_HANDSHAKE_CAP: usize = 64;
 /// 触发（**上限仍受并发握手闸约束**），M2 的 Retry/限流面承接）。
 pub const DEFAULT_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 /// 记行节流（仓内既有口径「首 3 + 每 100」——`relay/mod.rs` 的 `reject_log_due` 同款）。
-fn log_due(n: u64) -> bool {
+pub(crate) fn log_due(n: u64) -> bool {
     n <= 3 || n.is_multiple_of(100)
 }
 
@@ -123,11 +139,23 @@ pub struct ExitQuicSnapshot {
     pub conn_refused: u64,
     /// 因**握手期限**到点放弃的次数（§9.3 Q-O）。
     pub handshake_timeouts: u64,
+    /// 准入通过（绑定成功）的连接/刷新次数（S1-3）。
+    pub regs_accepted: u64,
+    /// 准入被拒次数（MAC 不符含换连接重放 / 时间窗 / 表满 / 冲突——含刷新帧）。
+    pub regs_rejected: u64,
+    /// 丢弃：超限（内层包 > `max_datagram_size()`）。
+    pub drop_too_large: u64,
+    /// 丢弃：发送缓冲满（per-conn 预检不过 ∨ 引擎→面出站队列满）。
+    pub drop_send_buffer_full: u64,
+    /// 丢弃：未登记（未登记连接的数据报 / 入境队列满 / 出站目标无绑定）。
+    pub drop_unregistered: u64,
+    /// 丢弃：源校验拒（复刻 `device.rs` 的 `src_allowed`）。
+    pub drop_src_rejected: u64,
 }
 
 /// 计量面（原子直读——**反应式**，不必等巡检拍；`snapshot()` 由它组装）。
 #[derive(Default)]
-struct ExitStats {
+pub(crate) struct ExitStats {
     connections: AtomicU64,
     admitted: AtomicU64,
     path_changes: AtomicU64,
@@ -136,6 +164,12 @@ struct ExitStats {
     handshake_refused: AtomicU64,
     conn_refused: AtomicU64,
     handshake_timeouts: AtomicU64,
+    regs_accepted: AtomicU64,
+    regs_rejected: AtomicU64,
+    drop_too_large: AtomicU64,
+    drop_send_buffer_full: AtomicU64,
+    drop_unregistered: AtomicU64,
+    drop_src_rejected: AtomicU64,
 }
 
 impl ExitStats {
@@ -149,11 +183,17 @@ impl ExitStats {
             handshake_refused: self.handshake_refused.load(Ordering::SeqCst),
             conn_refused: self.conn_refused.load(Ordering::SeqCst),
             handshake_timeouts: self.handshake_timeouts.load(Ordering::SeqCst),
+            regs_accepted: self.regs_accepted.load(Ordering::SeqCst),
+            regs_rejected: self.regs_rejected.load(Ordering::SeqCst),
+            drop_too_large: self.drop_too_large.load(Ordering::SeqCst),
+            drop_send_buffer_full: self.drop_send_buffer_full.load(Ordering::SeqCst),
+            drop_unregistered: self.drop_unregistered.load(Ordering::SeqCst),
+            drop_src_rejected: self.drop_src_rejected.load(Ordering::SeqCst),
         }
     }
 }
 
-/// 出口 QUIC 面句柄（同步面）：地址/公开身份/读数/收工（幂等）。
+/// 出口 QUIC 面句柄（同步面）：地址/公开身份/读数/两向投递/收工（幂等）。
 pub struct ExitQuic {
     local_addr: SocketAddr,
     rpk_public_key: RpkPublicKey,
@@ -161,6 +201,7 @@ pub struct ExitQuic {
     exit: Arc<ExitSignal>,
     handle: Mutex<Option<JoinHandle<()>>>,
     stats: Arc<ExitStats>,
+    bridge: Arc<ExitBridge>,
     logf: Logf,
 }
 
@@ -178,9 +219,21 @@ impl ExitQuic {
         // runtime 上下文）；起点失败的两种情形（runtime 建不出来 / 端点或身份建不出来）
         // 都必须在 `start` 返回前定音——不留「起了但死的面」。
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(SocketAddr, RpkPublicKey), ExitQuicErr>>();
-        let (stop_tx, stop_rx) = unbounded_channel::<()>();
+        let (stop_tx, stop_rx) = tmpsc::unbounded_channel::<()>();
         let exit = Arc::new(ExitSignal::new());
         let stats = Arc::new(ExitStats::default());
+        // ---- 两向边界（M1 §1.7）：唤醒 self-pipe + 出站队列（引擎侧 try_send 非阻塞）----
+        let (wake_tx, wake_rx) = UnixStream::pair().map_err(ExitQuicErr::Endpoint)?;
+        wake_tx.set_nonblocking(true).map_err(ExitQuicErr::Endpoint)?;
+        wake_rx.set_nonblocking(true).map_err(ExitQuicErr::Endpoint)?;
+        let (out_tx, out_rx) = tmpsc::channel::<Outbound>(OUTBOUND_QUEUE_MAX);
+        let bridge = Arc::new(ExitBridge::new(
+            Arc::clone(&stats),
+            Arc::clone(&logf),
+            wake_tx,
+            wake_rx,
+            out_tx,
+        ));
 
         let handle = thread::Builder::new()
             .name(EXIT_THREAD.into())
@@ -188,7 +241,8 @@ impl ExitQuic {
                 let logf = Arc::clone(&logf);
                 let exit = Arc::clone(&exit);
                 let stats = Arc::clone(&stats);
-                move || thread_body(socket, cfg, logf, ready_tx, stop_rx, exit, stats)
+                let bridge = Arc::clone(&bridge);
+                move || thread_body(socket, cfg, logf, ready_tx, stop_rx, exit, stats, bridge, out_rx)
             })
             .map_err(|e| {
                 log_spawn_failed(&logf, EXIT_THREAD, &e, "出口 QUIC 面缺席（WG 面不受影响）");
@@ -203,6 +257,7 @@ impl ExitQuic {
                 exit,
                 handle: Mutex::new(Some(handle)),
                 stats,
+                bridge,
                 logf,
             }),
             Ok(Err(e)) => {
@@ -232,6 +287,38 @@ impl ExitQuic {
     /// 运行读数（轮询；无阻塞——原子直读，不含锁等待）。
     pub fn snapshot(&self) -> ExitQuicSnapshot {
         self.stats.snapshot()
+    }
+
+    /// 唤醒 fd（**引擎 poll 集**用它：入站队列非空时此 fd 可读；§1.4）。
+    ///
+    /// 所有权在句柄（引擎**不得 close**；句柄 drop 后该 fd 失效——引擎须同生命周期持有）。
+    pub fn wake_fd(&self) -> RawFd {
+        self.bridge.wake_fd()
+    }
+
+    /// 排空唤醒字节 + 入站事件（引擎 poll 醒来后调；无事件时是「读空管道 + 空队列」的
+    /// 常量开销）。回调在队列锁外执行（引擎侧工作不攥着锁）。
+    pub fn drain_inbound(&self, mut f: impl FnMut(ExitInbound)) {
+        self.bridge.drain_wake();
+        for item in self.bridge.take_inbound() {
+            f(item);
+        }
+    }
+
+    /// 引擎出站面（M1 §1.5）：把内层明文包交给该设备的 QUIC 连接。
+    ///
+    /// - [`ExitSend::Handled`]：QUIC 面承接（入队；队列满 = 已丢 + 计数）；
+    /// - [`ExitSend::Unbound`]：该设备无绑定（或面已死）⇒ 调用方按 WG 原样走。
+    pub fn send_to_pub(&self, pubkey: &[u8; 32], pkt: &[u8]) -> ExitSend {
+        if self.exit.is_exited() {
+            return ExitSend::Unbound; // 面已死：出站回落 WG（不黑洞）
+        }
+        self.bridge.send_to_pub(pubkey, pkt)
+    }
+
+    /// 摘某设备的绑定并关闭其连接（设备被摘除/身份轮换的 WG 侧路径；§1.3 撤销/轮换）。
+    pub fn unbind_pub(&self, pubkey: &[u8; 32]) {
+        self.bridge.unbind_pub(pubkey);
     }
 
     /// QUIC 面线程是否已退出。
@@ -293,6 +380,7 @@ fn join_and_log(h: JoinHandle<()>, logf: &Logf) {
 }
 
 /// QUIC 面线程体：`catch_unwind` ⇒ 记行 ⇒ 置退出位（不复用该线程）。
+#[allow(clippy::too_many_arguments)] // 线程起点一次性移交全部状态（同 `driver_loop` 的口径）
 fn thread_body(
     socket: UdpSocket,
     cfg: ExitQuicConfig,
@@ -301,9 +389,11 @@ fn thread_body(
     stop_rx: UnboundedReceiver<()>,
     exit: Arc<ExitSignal>,
     stats: Arc<ExitStats>,
+    bridge: Arc<ExitBridge>,
+    out_rx: tmpsc::Receiver<Outbound>,
 ) {
     let res = catch_unwind(AssertUnwindSafe(|| {
-        run_exit(socket, cfg, &logf, ready_tx, stop_rx, &stats)
+        run_exit(socket, cfg, &logf, ready_tx, stop_rx, &stats, &bridge, out_rx)
     }));
     if let Err(payload) = res {
         let msg = crate::driver::panic_msg(payload.as_ref());
@@ -317,6 +407,7 @@ fn thread_body(
 /// 一个存活连接 + 最近观测到的远端地址（路径变更观测面：`remote_address()` 变化）。
 struct LiveConn {
     conn: Connection,
+    conn_id: u64,
     remote: SocketAddr,
 }
 
@@ -328,6 +419,7 @@ enum HandshakeOutcome {
 }
 
 /// 端点到点前的装配与主循环（**全在专用线程的 `current_thread` runtime 内**）。
+#[allow(clippy::too_many_arguments)] // 线程起点单参化无收益（同 `thread_body`）
 fn run_exit(
     socket: UdpSocket,
     cfg: ExitQuicConfig,
@@ -335,6 +427,8 @@ fn run_exit(
     ready_tx: Sender<Result<(SocketAddr, RpkPublicKey), ExitQuicErr>>,
     mut stop_rx: UnboundedReceiver<()>,
     stats: &Arc<ExitStats>,
+    bridge: &Arc<ExitBridge>,
+    mut out_rx: tmpsc::Receiver<Outbound>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
@@ -386,6 +480,14 @@ fn run_exit(
         let mut conns: Vec<LiveConn> = Vec::new();
         // 在途握手（并发上限与期限都挂在这张表上；`JoinSet` 保证收工时全部 abort）
         let mut handshakes: JoinSet<HandshakeOutcome> = JoinSet::new();
+        // 每连接任务（控制流登记 + 数据报收包；`JoinSet` 同款收工 abort）
+        let mut tasks: JoinSet<()> = JoinSet::new();
+        let mut next_conn_id: u64 = 1;
+        let ctx = Arc::new(FaceCtx {
+            stats: Arc::clone(stats),
+            bridge: Arc::clone(bridge),
+            logf: Arc::clone(logf),
+        });
         let conn_cap = cfg.conn_cap();
         loop {
             tokio::select! {
@@ -438,11 +540,16 @@ fn run_exit(
                     match joined {
                         Ok(HandshakeOutcome::Accepted(_peer, conn)) => {
                             stats.admitted.fetch_add(1, Ordering::SeqCst);
-                            conns.push(LiveConn { remote: conn.remote_address(), conn });
+                            let conn_id = next_conn_id;
+                            next_conn_id += 1;
+                            // 每连接两枚任务（§1.3 控制流登记 / §1.4 数据报收包）
+                            tasks.spawn(conn::control(conn.clone(), conn_id, Arc::clone(&ctx)));
+                            tasks.spawn(conn::datagrams(conn.clone(), conn_id, Arc::clone(&ctx)));
+                            conns.push(LiveConn { remote: conn.remote_address(), conn, conn_id });
                             stats.connections.store(conns.len() as u64, Ordering::SeqCst);
                         }
-                        // 握手失败（错 RPK / 对端放弃）：明细记行与四类丢弃计数归 S1b 的
-                        // E-q3——本棒只留总计数（客户端钉定判据的证据面）
+                        // 握手失败（错 RPK / 对端放弃）：明细记行与四类丢弃计数归 E-q3——
+                        // 握手面失败留在本总计数（客户端钉定判据的证据面）
                         Ok(HandshakeOutcome::Failed(_peer)) => {
                             stats.handshake_failed.fetch_add(1, Ordering::SeqCst);
                         }
@@ -458,20 +565,45 @@ fn run_exit(
                         Err(_join_err) => {} // 任务被 abort（收工路径）——不计
                     }
                 }
+                Some(out) = out_rx.recv() => {
+                    // 引擎 → 出口面：内层包交给对应连接（§1.5）
+                    match bridge.conn_of_pub(&out.pubkey) {
+                        Some(conn) => {
+                            let _ = conn::send_datagram_checked(&conn, out.pkt, &ctx);
+                        }
+                        // 绑定在「引擎判有绑定」与「面侧取连接」之间消失（设备摘除/连接死）
+                        None => bridge.note_drop(DropKind::Unregistered, "出站目标无绑定"),
+                    }
+                }
                 _ = tokio::time::sleep(TICK) => {}
             }
-            // 巡检（每拍）：清死连接 + 观测路径变更（E-q2 行的前身；S1b 起接 dev 归属）
-            conns.retain(|c| c.conn.close_reason().is_none());
+            // 巡检（每拍）：清死连接（摘绑定）+ 观测路径变更（E-q2 行）
+            conns.retain(|c| {
+                let alive = c.conn.close_reason().is_none();
+                if !alive {
+                    bridge.unbind_conn(c.conn_id);
+                }
+                alive
+            });
             stats.connections.store(conns.len() as u64, Ordering::SeqCst);
             for c in conns.iter_mut() {
                 let now = c.conn.remote_address();
                 if now != c.remote {
+                    let from = c.remote;
                     c.remote = now;
                     stats.path_changes.fetch_add(1, Ordering::SeqCst);
+                    match bridge.dev_of_conn(c.conn_id) {
+                        Some(dev) => (*logf)(&format!(
+                            "quic: 路径变更 dev={} {from} → {now}",
+                            bridge::dev_short(&dev)
+                        )),
+                        None => (*logf)(&format!("quic: 路径变更（未登记连接）{from} → {now}")),
+                    }
                 }
             }
         }
-        // ---- 收工：先在途握手全弃（JoinSet drop 即 abort）→ 关端点 → 丢弃连接句柄 ----
+        // ---- 收工：先在途握手/每连接任务全弃（JoinSet drop 即 abort）→ 关端点 → 丢句柄 ----
+        drop(tasks);
         drop(handshakes);
         endpoint.close(0u32.into(), b"exit stopping");
         drop(conns);

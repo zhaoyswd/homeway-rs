@@ -15,6 +15,11 @@ thiserror.workspace = true
 # DATAGRAM 载荷类型（M1 设计 §1.5：`send_datagram` 只收 `bytes::Bytes`；quinn 并不
 # re-export bytes ⇒ 消费侧必须直接声明——M0 已登记「M1 必需」）。
 bytes.workspace = true
+# `hr-reg3` 的 MAC（M1 设计 §1.3：`HMAC-SHA256(secret, "hr-reg3"‖pubkey‖devTag‖ts‖exporter)`）
+# ——**非异步栈**（隔离门只约束 tokio/quinn/rustls 名字）；出口面（校验）与客户端岛
+# （S2-6 的登记/刷新，组帧）共用同一个字节层 ⇒ 两侧不会各写一份标签顺序而静默错位。
+hmac.workspace = true
+sha2.workspace = true
 
 # 测试依赖：出口面用例走**真线程 + 真回环 IO**（连接/迁移/上限注入），不钉端口、只判
 # 上界（M0 设计 §9.2 flake 口径①②）。`macros` = `#[tokio::test]`；本批**不用**
