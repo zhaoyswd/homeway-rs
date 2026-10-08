@@ -1097,7 +1097,9 @@ fn listen_with_fallback(port: u16) -> io::Result<UdpSocket> {
     listen_with_fallback_addr(port, None)
 }
 
-fn listen_with_fallback_addr(port: u16, ip: Option<IpAddr>) -> io::Result<UdpSocket> {
+/// `pub(crate)`：M1 的 QUIC 端口**复用同一条退让语义**（`serve.quic_listen` 缺省
+/// `listen+1`，被占用 +1…+9 → 随机；M1 设计 §1.1）。
+pub(crate) fn listen_with_fallback_addr(port: u16, ip: Option<IpAddr>) -> io::Result<UdpSocket> {
     let try_one = |p: u16| -> io::Result<UdpSocket> {
         match ip {
             // 双栈优先；无 v6 环境回退 v4（Go 在纯 v4 平台同样回落 AF_INET）

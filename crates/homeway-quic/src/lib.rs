@@ -36,11 +36,16 @@
 //! - panic 分工（设计 §3.6）：岛内**就地**分类（记行 + 不健康回调 `"panic"`）⇒ 线程退出；
 //!   预算内收工由 `stop_within` 的 join 分支记 panic 行，到点 detach 由收割线程记。
 //!
-//! 模块边界（设计 §3.1）：[`cmd`] = 命令通道协议（全 std 类型）；[`driver`] = 宿主
-//! （**唯一允许出现异步栈名字的文件**）；`sync_util` = 岛侧线程卫生小件。
+//! 模块边界（设计 §3.1；M1 起长出口侧 `exit/`）：[`cmd`] = 命令通道协议（全 std 类型）；
+//! [`driver`] = 岛宿主（客户端侧异步面）；`exit/` = **出口 QUIC 面**（异步面：端点 +
+//! TransportConfig + RPK 身份，M1 设计 §1.1/§1.2/§1.7）；`rpk` = RFC 7250 的**纯 std**
+//! 字节小件（种子/PKCS#8/SPKI——同步面也读得懂）；`sync_util` = 线程卫生小件。
+//! **异步栈名字只允许出现在 `driver.rs` 与 `exit/**`**（隔离门层 3 断言）。
 
 mod cmd;
 mod driver;
+mod exit;
+mod rpk;
 mod sync_util;
 
 #[cfg(test)]
@@ -48,3 +53,5 @@ mod tests;
 
 pub use cmd::{Cmd, IslandErr, IslandReply, IslandSnapshot, Logf, OnUnhealthy};
 pub use driver::{Island, IslandTx};
+pub use exit::{ExitQuic, ExitQuicConfig, ExitQuicErr, ExitQuicSnapshot};
+pub use rpk::{Ed25519Seed, RpkErr, RpkPublicKey};

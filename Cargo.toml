@@ -15,6 +15,9 @@ edition = "2021"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 toml = "0.8"
+# QUIC DATAGRAM 载荷类型（M1 必需：`quinn::send_datagram` 只收 `bytes::Bytes`，
+# 而 quinn **不 re-export** bytes ⇒ 消费侧必须直接声明，见 M1 设计 §1.5）。
+bytes = "1"
 homeway-core = { path = "crates/homeway-core" }
 thiserror = "2"
 base64 = "0.22"

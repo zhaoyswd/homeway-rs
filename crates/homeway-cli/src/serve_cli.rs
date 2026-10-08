@@ -39,6 +39,9 @@ pub(crate) struct FileServe {
     pub(crate) enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) listen: Option<u16>,
+    /// QUIC 独立 UDP 端口（M1 §1.1）：缺省 = `serve.listen + 1`；被占用按 WG 同款退让。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) quic_listen: Option<u16>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) bind_interface: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -101,6 +104,7 @@ impl FileServe {
         FileServe {
             enabled: false,
             listen: None,
+            quic_listen: None,
             bind_interface: None,
             upnp: None,
             stun: None,
@@ -192,6 +196,11 @@ fn validate_file(path: &Path, f: &FileConfig) -> Result<(), String> {
     if let Some(v) = f.serve.listen {
         if v == 0 {
             return bad("serve.listen", format!("{v} 非法（合法值域 1–65535）"));
+        }
+    }
+    if let Some(v) = f.serve.quic_listen {
+        if v == 0 {
+            return bad("serve.quic_listen", format!("{v} 非法（合法值域 1–65535）"));
         }
     }
     // dns_port：Option<u16> 天然等价 Go 的 0–65535（登记为「已等价」）。
@@ -559,6 +568,9 @@ pub(crate) fn serve_config_of(fc: &FileConfig, state_dir: &Path) -> Result<Serve
     };
     if let Some(v) = fc.serve.listen {
         cfg.listen_port = v;
+    }
+    if let Some(v) = fc.serve.quic_listen {
+        cfg.quic_listen_port = Some(v);
     }
     if let Some(v) = &fc.serve.bind_interface {
         cfg.bind_iface = parse_bind_iface(v);
@@ -1199,6 +1211,7 @@ mod tests {
         let d = tmp_state("domain");
         let cases: &[(&str, &str)] = &[
             ("[serve]\nlisten = 0\n", "serve.listen"),
+            ("[serve]\nquic_listen = 0\n", "serve.quic_listen"),
             ("[serve]\nbind_interface = \"en0:1\"\n", "serve.bind_interface"),
             ("[serve]\npublic_endpoint = \"1.2.3.4\"\n", "serve.public_endpoint"),
             ("[serve]\npeer_ttl = \"abc\"\n", "serve.peer_ttl"),
@@ -1232,7 +1245,7 @@ mod tests {
             assert!(e.contains("config.toml"), "错误必须带路径，实得：{e}");
         }
         // 好值往返：serde 序列化后再严格读仍 Ok（写回面共用本函数）。
-        let good = "[serve]\nenabled = true\nlisten = 41641\nbind_interface = \"auto\"\n\
+        let good = "[serve]\nenabled = true\nlisten = 41641\nquic_listen = 41642\nbind_interface = \"auto\"\n\
                     peer_ttl = \"168h\"\npublic_endpoint = \"1.2.3.4:41641\"\nrelay = \"\"\n\
                     dns_port = 5300\n[relay]\nenabled = false\nlisten = \":41741\"\nadvertise = \"\"\n";
         write_cfg(&d, good);
@@ -1241,6 +1254,7 @@ mod tests {
         write_cfg(&d, &body);
         let fc2 = load_config_strict(&d).unwrap();
         assert_eq!(fc2.serve.listen, Some(41641));
+        assert_eq!(fc2.serve.quic_listen, Some(41642), "M1：QUIC 端口键往返");
         assert_eq!(fc2.relay.listen.as_deref(), Some(":41741"));
         let _ = std::fs::remove_dir_all(&d);
     }

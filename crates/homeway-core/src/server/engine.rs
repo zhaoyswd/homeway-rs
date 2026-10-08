@@ -61,6 +61,9 @@ pub enum BindMode {
 pub struct ServeConfig {
     pub state_dir: PathBuf,
     pub listen_port: u16,
+    /// QUIC 端口（M1 §1.1）：`None` = 缺省 `listen_port + 1`；被占用按 WG 同款退让
+    /// 换端口（实际端口见 `cache/quic_listen_port.txt` 与 `ServeEngine::quic_local_addr`）。
+    pub quic_listen_port: Option<u16>,
     pub tunnel_ip: Ipv4Addr,
     pub files_port: u16,
     pub term_port: u16,
@@ -106,6 +109,7 @@ impl Default for ServeConfig {
         Self {
             state_dir: PathBuf::from("."),
             listen_port: DEFAULT_LISTEN_PORT,
+            quic_listen_port: None,
             tunnel_ip: DEFAULT_TUNNEL_IP,
             files_port: DEFAULT_FILES_PORT,
             term_port: DEFAULT_TERM_PORT,
@@ -132,6 +136,13 @@ impl Default for ServeConfig {
             tx_shape_cfg: None,
         }
     }
+}
+
+/// QUIC 端口定案（M1 §1.1）：显式 `serve.quic_listen` 优先，缺省 = `serve.listen + 1`。
+/// 单独成函数是为了可测（端口算术 + 边界）且与「退让」解耦（退让在 socket 绑定层）。
+fn quic_listen_port(cfg: &ServeConfig) -> u16 {
+    cfg.quic_listen_port
+        .unwrap_or_else(|| cfg.listen_port.saturating_add(1))
 }
 
 /// 停机宽限（Go StopGrace 同值——「stop 后还能通最多 10s」的显式语义）。
@@ -205,6 +216,10 @@ pub struct ServeEngine {
     /// 拦截计数共享原子（status 观测面直读——不占驱动线程）。
     itc_stats: Arc<super::intercept::Stats>,
     pub local_port: u16,
+    /// QUIC 端点实际地址（`None` = 本世代 QUIC 面未起；M1 §1.1 的「实际端口有去处」）。
+    pub quic_local_addr: Option<SocketAddr>,
+    /// 出口 RPK 公钥（进 token 的 32B；M1 §12-②）。
+    pub quic_rpk_public_key: Option<homeway_quic::RpkPublicKey>,
     stop_flags: Vec<Arc<AtomicBool>>,
     term_srv: Option<Arc<crate::term::service::TermService>>,
     pub state_dir: PathBuf,
@@ -408,6 +423,53 @@ impl ServeEngine {
         let mut bind = ServerBind::open_bound(cfg.listen_port, &cfg.build, bind_addr, resolved.as_ref().map(|i| (i.index, i.name.clone())), Arc::clone(&logf))?;
         let local_port = bind.local_port();
         std::fs::write(cache_dir.join("listen_port.txt"), format!("{local_port}\n"))?;
+        // ---- QUIC 面（M1 §1.1/§1.7：独立 UDP 端口 + 专用线程 + RPK 身份）----
+        // 端口：`serve.quic_listen`（缺省 = serve.listen + 1）；被占用按 WG 同款**退让**
+        // 语义换端口（+1…+9 → 随机），实际端口落 `cache/quic_listen_port.txt` 并由
+        // `ServeEngine::quic_local_addr` 暴露（token/UPnP/status 的唯一来源，§1.1）。
+        // 起不来 = **fail-soft**：WG 面与服务面照常（QUIC 档缺席要在行里看得见）。
+        let mut quic_brief: Option<(SocketAddr, homeway_quic::RpkPublicKey)> = None;
+        let quic_face = match crate::server::bind::listen_with_fallback_addr(quic_listen_port(&cfg), bind_addr) {
+            Ok(sock) => match sock.set_nonblocking(true) {
+                Ok(()) => {
+                    let seed = crate::server::quic_rpk_seed(&priv_key);
+                    match homeway_quic::ExitQuic::start(
+                        sock,
+                        homeway_quic::ExitQuicConfig { rpk_seed: seed },
+                        Arc::clone(&logf),
+                    ) {
+                        Ok(q) => {
+                            // L3 可弃缓存（与 listen_port.txt 同语义）：写失败不致命
+                            let _ = std::fs::write(
+                                cache_dir.join("quic_listen_port.txt"),
+                                format!("{}\n", q.local_addr().port()),
+                            );
+                            quic_brief = Some((q.local_addr(), q.rpk_public_key()));
+                            Some(q)
+                        }
+                        Err(e) => {
+                            (logf)(&format!(
+                                "⚠️ quic: 端点未起（{e}）—— QUIC 档不可用（WG 面与服务面不受影响）"
+                            ));
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    (logf)(&format!(
+                        "⚠️ quic: 端点未起（socket 置非阻塞失败：{e}）—— QUIC 档不可用（WG 面不受影响）"
+                    ));
+                    None
+                }
+            },
+            Err(e) => {
+                (logf)(&format!(
+                    "⚠️ quic: 端点未起（端口 {} 退让 +1…+9 与随机端口全失败：{e}）—— QUIC 档不可用（WG 面不受影响）",
+                    quic_listen_port(&cfg)
+                ));
+                None
+            }
+        };
         // 公布口径的 pinned 判据 = **运行期事实**（socket 钉卡成功与否 + 绑地址），
         // 看护循环重钉后更新（Go `pinnedNow`/`PinnedIface` 同义）。
         let pinned_flag = Arc::new(AtomicBool::new(bind.pinned.is_some() || bind_addr.is_some()));
@@ -622,6 +684,7 @@ impl ServeEngine {
                 let itc_stats = Arc::clone(&itc_stats);
                 let pub_kick_tx = pub_kick_tx.clone();
                 let driver_alive_t = Arc::clone(&driver_alive); // move 闭包独占一份（外层留给兜底线/构造面）
+                let quic_face = quic_face; // 驱动线程独占（收工链在它手里，§1.7 顺序）
                 move || {
                     // 在世守卫：线程体任何出口（含 panic 展开）都清零——supervisor 据此
                     // 判角色终结（守卫必须活在闭包体内——外层 spawn 参数块在闭包构造
@@ -635,7 +698,7 @@ impl ServeEngine {
                     let _alive_guard = AliveGuard(driver_alive_t);
                     driver_loop(
                         cfg, bind, &mut device, &mut table, &mut intercept, dns.as_ref(), &st,
-                        &revoked_set, cmd_rx, &dlogf, &itc_stats, pub_kick_tx,
+                        &revoked_set, cmd_rx, &dlogf, &itc_stats, pub_kick_tx, quic_face,
                     );
                 }
             })
@@ -816,6 +879,8 @@ impl ServeEngine {
             driver_alive: driver_alive_ctor,
             itc_stats: Arc::clone(&itc_stats),
             local_port,
+            quic_local_addr: quic_brief.as_ref().map(|(a, _)| *a),
+            quic_rpk_public_key: quic_brief.as_ref().map(|(_, k)| *k),
             stop_flags,
             term_srv,
             state_dir: cfg.state_dir.clone(),
@@ -1017,6 +1082,9 @@ fn driver_loop(
     dlogf: &Logf,
     _itc_stats: &Arc<ItcStats>,
     pub_kick_tx: std::sync::mpsc::SyncSender<()>,
+    // 出口 QUIC 面句柄（`None` = 未起）：**收工链在驱动线程手里**（M1 §1.7——关闭前
+    // 还要把尾包投给 intercept，故必须停在 `intercept.close()` **之前**）。
+    quic_face: Option<homeway_quic::ExitQuic>,
 ) {
     let udp_fd = bind.udp_fd();
     // GC 节拍（10min ±10% 抖动）与吊销跟随（1s mtime）/DNS 统计（60s）
@@ -1309,6 +1377,16 @@ fn driver_loop(
     // drain-then-exit 语义保证宽限期尾入队的密文排空后才退）。在 intercept.close
     // 之前（close 的 teardown 不再产出出站包——现状码序）。
     bind.tx_shutdown(dlogf);
+    // QUIC 面收工（M1 §1.7 的收工链：`bind.shutdown_legs()` → `intercept.halt_new()`
+    // → **QUIC 面 stop_within(CLOSE_BUDGET)** → `intercept.close()`）。位置：宽限循环
+    // 之后（尾包该投的已投）、intercept teardown 之前；到点 detach 由收割线程接手
+    // （不阻塞收工链）。
+    if let Some(q) = quic_face {
+        const QUIC_CLOSE_BUDGET: Duration = Duration::from_secs(2);
+        if !q.stop_within(Instant::now() + QUIC_CLOSE_BUDGET) {
+            (dlogf)("quic: 出口 QUIC 面未在收工预算内退出 —— 已 detach（收割线程接手）");
+        }
+    }
     // 到期：teardown（在途 TCP 立即拆——close 内逐条 teardown + 判据行）
     intercept.close();
 }
@@ -1961,6 +2039,34 @@ mod tests {
 
     fn now() -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)
+    }
+
+    /// M1 §1.1：QUIC 端口定案——显式优先，缺省 = `serve.listen + 1`（饱和：65535 不绕回）。
+    #[test]
+    fn quic_listen_port_defaults_to_listen_plus_one() {
+        let mut cfg = ServeConfig { listen_port: 41641, ..ServeConfig::default() };
+        assert_eq!(quic_listen_port(&cfg), 41642, "缺省 = listen + 1");
+        cfg.quic_listen_port = Some(50000);
+        assert_eq!(quic_listen_port(&cfg), 50000, "显式值优先");
+        cfg.quic_listen_port = None;
+        cfg.listen_port = u16::MAX;
+        assert_eq!(quic_listen_port(&cfg), u16::MAX, "饱和不回绕（不得撞 0）");
+    }
+
+    /// M1 §12-② 的「出口侧产出」：RPK 种子从后端静态私钥**确定性**派生（重启不变 ⇒
+    /// 客户端 token 里的钉定值不失效），且**不同私钥给不同种子**（域分离真在起作用）。
+    #[test]
+    fn quic_rpk_seed_is_deterministic_and_identity_bound() {
+        let a = x25519_dalek::StaticSecret::from([0x11u8; 32]);
+        let b = x25519_dalek::StaticSecret::from([0x22u8; 32]);
+        let sa = crate::server::quic_rpk_seed(&a);
+        let sa2 = crate::server::quic_rpk_seed(&a);
+        let sb = crate::server::quic_rpk_seed(&b);
+        assert_eq!(sa.as_bytes(), sa2.as_bytes(), "同身份 ⇒ 同种子");
+        assert_ne!(sa.as_bytes(), sb.as_bytes(), "异身份 ⇒ 异种子");
+        // 与 psk 域的分离：同输入不同标签必不同（防标签复制粘贴错）
+        let psk = crate::psk::Psk::from(crate::token::Secret::from(a.to_bytes()));
+        assert_ne!(sa.as_bytes(), psk.as_bytes(), "RPK 种子 ≠ WG PSK（标签不同）");
     }
 
     fn now_unix() -> u64 {

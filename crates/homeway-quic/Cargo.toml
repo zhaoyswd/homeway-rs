@@ -12,3 +12,12 @@ quinn.workspace = true
 rustls.workspace = true
 tokio.workspace = true
 thiserror.workspace = true
+# DATAGRAM 载荷类型（M1 设计 §1.5：`send_datagram` 只收 `bytes::Bytes`；quinn 并不
+# re-export bytes ⇒ 消费侧必须直接声明——M0 已登记「M1 必需」）。
+bytes.workspace = true
+
+# 测试依赖：出口面用例走**真线程 + 真回环 IO**（连接/迁移/上限注入），不钉端口、只判
+# 上界（M0 设计 §9.2 flake 口径①②）。`macros` = `#[tokio::test]`；本批**不用**
+# `test-util`（无 `start_paused` 虚拟时钟断言——时限面全是真 IO）。
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros"] }

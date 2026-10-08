@@ -616,6 +616,7 @@ dependencies = [
 name = "homeway-quic"
 version = "0.2.3"
 dependencies = [
+ "bytes",
  "quinn",
  "rustls",
  "thiserror 2.0.21",

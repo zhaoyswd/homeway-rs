@@ -19,7 +19,7 @@
 use std::any::Any;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -27,7 +27,7 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{self, UnboundedReceiver, UnboundedSender};
 
 use crate::cmd::{Cmd, IslandErr, IslandSnapshot, Logf, OnUnhealthy};
-use crate::sync_util::{lock_unpoison, log_spawn_failed};
+use crate::sync_util::{lock_unpoison, log_spawn_failed, ExitSignal};
 
 /// 驱动线程名（镜像 `homeway-wg`）。
 pub(crate) const ISLAND_THREAD: &str = "homeway-quic";
@@ -308,56 +308,14 @@ fn join_and_classify(h: JoinHandle<()>, logf: &Logf, on_unhealthy: &OnUnhealthy)
 }
 
 /// panic 载荷取文案（`&str`/`String` 两形态；其余载荷不臆测内容）。
-fn panic_msg(payload: &(dyn Any + Send)) -> String {
+/// `pub(crate)`：出口 QUIC 面（`exit/`）的线程体共用同一条 panic 记行口径。
+pub(crate) fn panic_msg(payload: &(dyn Any + Send)) -> String {
     if let Some(s) = payload.downcast_ref::<&'static str>() {
         (*s).to_string()
     } else if let Some(s) = payload.downcast_ref::<String>() {
         s.clone()
     } else {
         "非字符串 panic 载荷".to_string()
-    }
-}
-
-/// 岛线程退出信号：幂等置位 + 有界等待（**不轮询、不 `sleep`**——层 3 门禁）。
-struct ExitSignal {
-    gate: Mutex<bool>,
-    cv: Condvar,
-}
-
-impl ExitSignal {
-    fn new() -> Self {
-        Self {
-            gate: Mutex::new(false),
-            cv: Condvar::new(),
-        }
-    }
-
-    /// 岛线程退出时置位并唤醒等待者（正常退出与 panic 路径都走——panic 路径在
-    /// `resume_unwind` **之前**调用，故 join 侧不会等满预算）。
-    fn mark_exited(&self) {
-        *lock_unpoison(&self.gate) = true;
-        self.cv.notify_all();
-    }
-
-    fn is_exited(&self) -> bool {
-        *lock_unpoison(&self.gate)
-    }
-
-    /// 有界等待：期限内退出返回 `true`；到点返回 `false`（调用侧转 detach + 交收割线程）。
-    fn wait_exit(&self, deadline: Instant) -> bool {
-        let mut g = lock_unpoison(&self.gate);
-        while !*g {
-            let now = Instant::now();
-            if now >= deadline {
-                return false;
-            }
-            let (g2, _to) = self
-                .cv
-                .wait_timeout(g, deadline - now)
-                .unwrap_or_else(|e| e.into_inner());
-            g = g2;
-        }
-        true
     }
 }
 
