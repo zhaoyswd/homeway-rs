@@ -81,16 +81,16 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
    见 GAP-AUDIT K-14、⑤归 R8-3 整形批、⑥⑦随各批收口）；R8 收官触点批的剩余项为
    **历史登记**（见「用户触点清单」与 `docs/reviews/R8.md`），不再是开工前提。
    R8 后批次（B0-1/B0-2a/B0-2b/D-1/D-2/P1/P2/reactor 简化）亦均已收官（状态总览表末行）。
-2. **当前活跃 = Q 批整改**：2026-10-07 全面评审的发现清单与分批整改方案 =
-   `docs/reviews/AUDIT-2026-10-07.md` + `docs/REVIEW-ROADMAP.md`（跨批进度真源，含每批
-   两道评审门的执行协议）。**Q-A（文档与治理对齐）已完成**（2026-10-07）；**Q-B（拦截层与
-   出口数据面加固）已完成**（2026-10-07，设计门 + 代码门两轮 dsh 评审通过，提交 `9e37445` +
-   `0b37246` + `8a51c2a`，记录见 `docs/reviews/QB-design.md` / `QB.md`）；**Q-C（入口安全与资源上限：
-   wtransport / 中继 / 设备表）已完成**（2026-10-07，两轮 dsh 评审通过，提交 `07e32ca` + `7f81285` +
-   `50ababa` + `181923e`，记录见 `docs/reviews/QC-design.md` / `QC.md`）；**Q-D…Q-J 等用户
-   指令逐批开工**（建议顺序 Q-A → Q-B → … → Q-J，用户可重排）。
-3. **Q 批完成后**：本节随 `docs/REVIEW-ROADMAP.md` 状态总览同步更新（由该表指定下一批，
-   本指针不再单列）。
+2. **Q 批整改已全批收官**（Q-A…Q-J，2026-10-07/08；每批 = 设计门 + 代码门两道 dsh 外部评审）：
+   发现清单 = `docs/reviews/AUDIT-2026-10-07.md`（条目已逐批勾选），跨批真源与各批结论 =
+   `docs/REVIEW-ROADMAP.md` 状态总览（含 Q-J 收官行）+ 各批记录 `docs/reviews/Q<X>.md`
+   （Q-J 记录 = `docs/reviews/QJ.md`，设计 = `QJ-design.md`）。
+3. **Q 批之后的未开批（等用户指令）与待裁决**：`Q-F-B`（portfwd 实装监听器；交接真源 =
+   `docs/reviews/QF.md` §7）+ `Q-I-DNS`（DNS TTL 缓存小批；取证与建议 = `docs/reviews/QIt.md` §7.1）；
+   Q-J 上报项：tier spec 偏离 5 条（含 A-any ↔ `exit-upnp-port-mapping` MUST 的 **opt-in 等价偏离**）、
+   App 需置 HELLO caps `KEY_ALT_ESC_PREFIX`、**A-any 与 tier MUST 的二选一裁决**——全部为用户触点
+   或 tier 侧动作，见 `docs/reviews/QJ.md` §6。此后新任务直接看 `docs/REVIEW-ROADMAP.md` 状态总览
+   与各批记录的「需上报项」节（本指针不再单列下一批）。
 
 **B0-1 部署阻塞集修复（2026-10-05 完成，GAP-AUDIT P0-1 部署最小面/P0-2/P0-3/P1-2）**：
 v6 双栈族全链（钉卡两族 + 出口/客户端 socket 双栈化 + stun6 消费 + v6 公布判据行族 + token v6 条目）、
