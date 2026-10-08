@@ -336,6 +336,27 @@ v6 路径）+ Rust 统一进程出口 42680（upnp=true 同号映射成立 ⇒ v
   调用方预算耗尽即回 TimedOut）；阻塞获取的等待计调用方预算，获取耗时同计（`budget - 获取耗时`
   才是 worker 期限，总耗时不得 ≈2× 预算）；**Go 无上限**（每调用新 goroutine）。
   `resolve_domains` 对每个域名条目各用整份预算（N×budget）的既有形态不变。
+- **【Q-G 批，2026-10-08】TUN fd 失效判据（F2）**：`poll_fd` 现在区分「可读/可写/HUP/ERR/NVAL」并
+  **把 HUP/ERR/NVAL 当异常**（判死条件**只看 `hup||err||nval`**——不依赖「readable 为假」：darwin 上
+  管道 EOF 恒返 `POLLIN|POLLHUP`，实测见设计 §0.4）；**超时不判死**；读侧**可读优先**（不丢最后一包）、
+  判死前**确认一拍（真睡眠 50ms 后复 poll）**；`n==0` 的**非判死**路径在「poll 立返可读但空」形态下加
+  **地板睡眠**（`DEAD_CONFIRM_DELAY`，代码门③——防该形态 100% CPU 热自旋；超时/HUP 形态不走此路）。
+  Go 基线（`tunfd_unix.go`）在 EAGAIN 分支同样不看 revents ⇒ 本项为**偏离 Go 的加固**；可见差异仅在
+  「fd 已死」的极端形态（Go 静默转，Rust 上报并触发重建）。残余：OHOS VPN fd 的精确内核语义本仓不可
+  取证（capi 只收 App 传入的裸 fd）；**持续型 HUP** 的健康 fd（若存在）会被确认拍放行误判——如实登记。
+- **【Q-G 批，2026-10-08】fd 继承纪律（F1）**：全仓**自建** fd 一律 CLOEXEC（`sysfd` 单源：linux/OHOS
+  走 `SOCK_CLOEXEC`/`pipe2(O_CLOEXEC)` 原子位，darwin 建后立即 fcntl）；**App 传入的 tun fd 不改 flags**
+  （所有权在扩展）。真实继承面 = 3 处 std `Command` exec（`ps` / `dscl` / daemon 自 exec；已实测证实 std 会
+  继承未设 CLOEXEC 的 fd）；PTY shell 由 portable-pty 的 `close_random_fds()` 净化（库行为，依赖 `/dev/fd`，
+  **非本仓保证**——本仓不再把它当豁免理由）。残余：darwin「创建→fcntl」窗口（无原子位可用；窗口 ≈ 数十
+  纳秒）；linux 原子路径无本机运行期验证（三目标编译探针 + 交叉 check 为准）。
+- **【Q-G 批，2026-10-08】权限口径（F4）**：普通文件「**创建即 0600**（`.mode`）+ 拿到 handle 后 fchmod
+  归一（防 umask 掩码）+ 失败告警」——与 Go 的原子 `os.WriteFile(...,0o600)` / `os.OpenFile(...,0o600)`
+  同义（`server/state.rs` 的身份私钥与 token 台账是**移植回退**修复：旧形态 chmod 失败会让私钥永久 0644
+  且无告警）；目录「`DirBuilder::mode(0o700)` + create 后无条件 chmod 0700 + 失败告警」（mkdir 同样受 umask
+  掩码）；UDS 因 `bind()` 无 mode 参数，采用「**目录先 0700（bind 之前）** + bind→chmod 0600 + 失败告警」，
+  **同用户窗口为已知残余**（跨用户暴露面由目录权限关闭；Go `chmodTighten` 同为 bind 后 chmod + 告警）。
+  **权限面定性 = 修缺陷（对齐 Go）⇒ 不登记为判据变更**（本节仅记口径）。
 
 ## daemon/控制面族实采（B0-2b 第 1 棒，2026-10-05；统一进程本地实例 /tmp/hw-ctl-unified——serve/relay 初始停用，control.sock 0600；出口 = local-rust-exit.sh 实例 1/2〔42651/42652，隔离端口绝不触生产 41641〕）
 
@@ -463,13 +484,16 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 | 2026-10-08（Q-F 批落地） | **服务会话巡检失败行**（`巡检失败（连续 %d）：探测超时`——**非 C1–C17 判据行**） | `巡检失败（连续 %d）：探测超时`（**恒写「探测超时」**）→ `巡检失败（连续 %d）：<探测的真实错误>`（`ConnErr` 的 Display 原文；超时形态实渲染 `巡检失败（连续 2）：连接超时`——与隧道域同族行 `对端巡检失败 2/3: 连接超时` 同串形态） | F8c：归因写死 = 报错信息失真（`probe_ok` 在 `session/mod.rs` 由 `.is_ok()` 丢弃了错误） | `session/mod.rs` 巡检失败行、grep 该行排障的脚本；**成功拍/门控行不变**（`巡检失败被门控拦下（…）`、`巡检恢复：门控态结束（成功拍清零）` 等逐字保留） |
 | 2026-10-08（Q-F 批落地） | **服务会话收工等待行**（非编号判据行；**既有行文变更**） | `收工等待巡检线程超时（STOP_WAIT）——放行自退` → per-thread 形态（`收工等待 <线程名> 超时（STOP_WAIT）——放行自退`；五段覆盖：巡检线程 / hint 线程 / 缓存落盘线程 / 缓存终写跳过（`收工缓存终写跳过（锁被在途落盘占用）——去抖线程近期写已在盘上`）/ client 线程（尾缀 `（引擎线程由收割线程收口）`）） | F6b：五段共用一个 6s 预算（此前仅巡检有界——hint/save/client 的 join 无上界） | `session/mod.rs`；C17「已收工（state=%s）」的 **idle 形态逐字不变**（`已收工（state=idle）`）；`已收工（state=failed 终态保留）` 是失败终态的另一条行（HEAD 同串，本批由死代码转为活路径——见注记） |
 | 2026-10-08（Q-F 批落地） | **`portForwards[]` 状态文案与 `ClientCoreTunSetPortForwards` 返回码**（**契约面行为变更**，非编号判据行） | ① `state`：恒 `"listening"` → `"failed"`；② `err`：空 → `"手机核未提供端口转发监听（127.0.0.1:<listen> 未监听）——该映射在当前版本不可用，不影响隧道"`；③ `code`：空（不变）+ **失败映射带枚举 code 的 spec MUST 被有意偏离**（空码走 App 登记的空码兜底，`bind_failed` 是假归因）；④ `target`：`":0"`/`":port"` → `pf_target_text` 四形态（`主机（同端口）`/`主机:N`/`IP:<listen>`/`IP:N`）；⑤ rc：`0` → `-1` | F1（P0 假成功 + 假状态）：本核无监听器 ⇒ 原 `listening`+rc 0 是谎报；对照 Go 真 bind 与 tier spec（SHALL 监听）——**功能缺口挂账见 `docs/reviews/QF.md`「portfwd-B 交接」** | `tier:openspec/specs/port-forwarding`（**已知不达标**）、`tier:pages/PortForwardsPage.ets`（`:484` 提示失义）、`tier:…/TierVpnExtensionAbility.ets:1010`（rc 日志文案失义）、`facade/tun_exec.rs`/`facade/portfwd.rs` 单测；**`fixtures/` 无 portForwards 夹具 ⇒ 无字节夹具变更**；`tools/check-vocab.sh` 不受影响（`bind_failed` 仍声明） |
+| 2026-10-08（Q-G 批落地） | **`sun_path` 上限**（三处错误串：`路径超长（%d 字节 ≥ 100，sun_path 上限）` / `socket 路径超长（… ≥ 100 …）` / `桥路径超长（%d ≥ 100 字节…）`） | 判据 `len >= 100`（Go 同形）→ **`len > SUN_PATH_MAX`**（= 拒 104+/108+，**放行 103/107**；`SUN_PATH_MAX` = darwin 103 / linux·OHOS 107，编译期单源 `size_of − offset_of − 1`）；文案「≥ 100」→「> {SUN_PATH_MAX}（sun_path 上限〔平台值〕）」；量法统一为 `as_os_str().len()` 字节口径（旧 `display()` 是 lossy 字符串） | F4.3：深 state 路径被**误拒**（审计 P2；darwin 实测 104+ 才真超限；tier `transport.cpp:268` 的阈值 `>= sizeof(addr.sun_path)` 与本条同义——允许 103） | `daemon/listen.rs`（判定 + 文案）、`files_server.rs::listen_local_service`、`facade/bridge_host.rs`（`MAX_UNIX_SOCKET_PATH` = `sysfd::SUN_PATH_MAX`，用点两处）+ 两处「已平台正确」点注明同源（`bridge_host.rs::connect_budget`、`intercept/mod.rs` 的 UDS 打包——**不字面改调**，避免 off-by-one 静默收紧）；单测 `listen_control_path_limit_boundary`；**已核无脚本/文档消费方**；**行为放宽**（Go 仍拒 100–107） |
+| 2026-10-08（Q-G 批落地） | **`relay stop` 后 `relay start` 的 broken 路径行消失**（`role relay: 失败（relay run 线程退出（异常终结））——退避 … 后进程内重建`） | 修前：`relay start` 后 run 立即自退 ⇒ 该行**无限刷**（500ms/1s/5s/30s…，设计 §0.5 实测）→ 修后：不出现（重启后正常驻留；手工脚本复跑 `state=running`、该行计数 0） | F3：`STOP_PIPE` 单例复用已关写端（停管道改 per-proc `StopPipe`，两端归 `RelayProc`，幂等 `shutdown`） | `relay_cli.rs`/`unified_cli.rs`（supervisor）；排障脚本若 grep 该行需知它「不是常态」；Q-H 条目「`relay stop` 后 `relay start` 不可恢复」**由本批 F3 修根因**（Q-H 收口时勾选，防重开同一修——见 `docs/reviews/QG.md`） |
 
 > **上表 E12/decr_flow 两行 = 2026-10-07 Q-B 批落地登记**（Q-A 批预登记的占位条目已按本政策补全
 > 「从 → 到」实际行文并去掉「占位」标注，同批 commit）；**其下两行 = 2026-10-07 Q-C 批落地登记**；
 > **再下两行 = 2026-10-08 Q-D 批落地登记**（E16a/E16b 尺寸字段 + surface symLen 域）。
 > **再下三行 = 2026-10-08 Q-F 批落地登记**（服务会话巡检失败行真因 / 收工等待行 per-thread / portfwd 状态与 rc 契约面）。
+> **再下两行 = 2026-10-08 Q-G 批落地登记**（`sun_path` 上限放宽与文案 / relay broken 路径行消失）。
 > 登记生效后，E12 关闭行与 flows 计数按新行文验收（旧行文不再要求同串）；Q-D 的尺寸面按
-> 「正常尺寸逐字节同串、极端输入按登记」验收。
+> 「正常尺寸逐字节同串、极端输入按登记」验收；Q-G 的 UDS 路径面按「`> SUN_PATH_MAX`（平台值）」验收。
 
 ### 计数输入集 / 数值语义变化（**行文不变**，登记留痕）
 
@@ -505,3 +529,7 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 | 2026-10-08（Q-F） | **`LadderRc::Deadline` 的记账语义** | `Deadline` **不计入** `LadderRc → exhausted`（`Deadline` 不是「阶梯走完未恢复」的证据，单源判据 `recover::exhausted_delta`）；等待方到点返回时**跳过** merge 后的重建决策（既有「merge 返回即本轮结束」的结构不变） | F3/D12（设计门 C4）：防「调用方预算紧张把会话推向 REBUILD」与「在途轮未完被 rebuild 掉 Client」 | `session/mod.rs`（`note_ladder_result` 与 `session_recover` 两处埋点）、`tun_exec.rs`（隧道域无 exhausted 面，仅 rc） |
 | 2026-10-08（Q-F） | **`healing_dial_*` 所有调用方的最长等待** | 从「首试 + 尾试各受预算约束（阶梯可越界 ≈4×，实测 15s 预算 → 最坏 ≈64s）」→「首试 + 阶梯（含闸等待） + 尾试合计受同一预算约束」；残余越界上界 = 一个动作预算（2s）；预算表不变：服务桥/tun 桥 15s、`files.rs` 调用方预算、CLI `portfwd` 15s、daemon `budget.min(15s)` / 30s | F3（**偏离 Go 的加固**：Go 的阶梯与闸等待不受调用方预算约束） | daemon 拨号（Q-H 面，最长等待缩短）、files/term/speedtest 桥、CLI `portfwd` |
 | 2026-10-08（Q-F） | **域名解析并发上限（F8e）** | 无上限 → **分档令牌池**（critical 4 = 建会话 + daemon `host reach` / background 4 = 巡检刷新）；**额度 = 在飞解析**（随 worker 生命周期，调用方超时不归还）⇒ 黑洞下该档**有界地失败**（第 N+1 个调用按预算 TimedOut），不是「不会失效」；获取等待计调用方预算；`resolve_domains` 对每个域名条目各用整份预算（N×budget）的既有形态不变 | F8e（两轮设计门 3.3/3.3'/C6）：黑洞下每分钟可漏 N 枚卡死线程；进程级单桶会让后台刷新饿死用户可见路径 | `wtransport/domain_eps.rs`、建会话路径、巡检刷新、daemon `host reach`（用户可见结论面） |
+| 2026-10-08（Q-G） | **`unhealthyReason=fd` 触发集与时机**（取值集不变，仍 = {patrol, fd, panic, stop}） | 「读错误型（EBADF/EIO）」→ 新增 **HUP/ERR/NVAL 型**（TUN fd 失效/EOF 现在被**确认一拍**〔真睡眠 50ms 后复 poll〕后上报；判死**只看 hup/err/nval**，不看 readable——darwin EOF 恒带 POLLIN）；同一会话内**更早/更准**报。**残余（代码门④）**：确认拍只滤**瞬时** HUP——若某平台健康 fd **持续**报 HUP（OHOS VPN fd 语义本仓不可取证），两拍都判死 ⇒ 健康隧道被反复拆世代（如实登记） | F2：`poll_fd` 返回 revents 派生 `Ready` 掩码；读侧可读优先（不丢最后一包）+ 写侧 HUP/ERR/NVAL 立即出线 + 期限检查写死循环顶 | `facade/tun_exec.rs`（`on_error → mark_unhealthy_if_current("fd")`）、App `FailGate` **重建频率**（更早/更准，极端形态下也可能更频繁——如实写明）；`wgcore/mod.rs` 单测 `tun_read_loop_n0_with_hup_reports_dead`/`poll_fd_ready_masks` |
+| 2026-10-08（Q-G） | **TUN 写侧预算语义**（`write_fd_all`，非判据行） | 修前：期限只在 `poll_fd` 入口检查 ⇒ 预算到点前**允许最后一次写入重试**；修后：**循环顶硬停** ⇒ 「恰好到点变可写」的那一次写入被放弃、直接 `TimedOut`（→ 卸源 + `unhealthyReason=fd` 重建） | F2/U1：期限检查落点写死循环顶（防「无睡眠死循环」退化） | 极端形态（长期不可写且无 HUP）下的重建时点前移一拍；正常形态（可写/超时）逐字不变 |
+| 2026-10-08（Q-G） | **隧道域世代收尾等待上界** | 无界 → **≤2s/处**（`CLIENT_CLOSE_BUDGET`；五处：`request_stop` 的 Preparing 分支 / `Finish::drop` / `gen_loop` 装配窗口 / `rebuild_session` 的 new·old；`Drop for Client` 兜底**仍无界**，设计 §3-D3） | F5（Q-F 移交）：五处 `Client::stop()` 无界 join 会拖死 `tun_stop` 等待 | `facade/tun_exec.rs`/`session/mod.rs`；`tun_stop` 的 `-2 强制放锁` 频率；**注**：Q-F §7-5 的「4s 串行上界 > `STOP_WAIT=3s`」**只减不消** |
+| 2026-10-08（Q-G） | **新增 additive 观测** | 无 → 有：`files` UDS `chmod 0600` 失败告警（Go 有、本仓原为静默 `let _ =`）；`state.rs` 的 key/台账/目录收紧失败告警 + **存量 key.bin 读路径归一告警**（原静默；代码门① 补强）；`nodestate` config 模板 / `carriers::save_json_atomic` / `daemon_cli` spawn 日志 / `endpoint_cache` 端点缓存 的收紧失败告警（代码门② 统一为告警不阻断）；F5 的 detach 记行（`等待 client 线程收工超时（CLIENT_CLOSE_BUDGET）——放行自退（引擎线程由收割线程收口）`） | F4/F5：静默失败改可观测 | 各日志族读者；**非编号判据行** |
