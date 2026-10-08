@@ -52,6 +52,8 @@ pub(crate) const REAP_THREAD: &str = "hw-quic-reap";
 const TICK: Duration = Duration::from_millis(250);
 /// 不健康原因（判据语义取值集 `{patrol, fd, panic, stop}` 的一员）。
 const REASON_PANIC: &str = "panic";
+/// QUIC 承载的巡检判死分类（设计 §2.5：**归既有取值 `patrol`**，不新增枚举值）。
+const REASON_PATROL: &str = "patrol";
 /// TUN fd 面判死分类（镜像 `wgcore::TunFdDead → markUnhealthy("fd")`；既有取值集的一员）。
 const REASON_FD: &str = "fd";
 /// 无注入（**生产路径恒取此值**；注入缝只在 `#[cfg(test)]` 的 `seams` 面里活）。
@@ -276,6 +278,21 @@ impl Island {
             return true;
         }
         // 到点 detach（设计 §3.6-4：到点 detach ⇒ panic 行/卡死记录由收割线程的 join 分支产生）
+        //
+        // M0 §8.1 残余项的**可观测面**（设计 §10 S2-5 判据）：detach 后老世代仍持 runtime
+        // + quinn `Endpoint`（UDP fd + 缓冲），可能继续对出口发包 ⇒ 就地打一行**计数行**
+        // （UDP 源端口 + 在用连接数），快照同源可轮询（`IslandSnapshot::{local,connections}`）。
+        let (local, conns) = {
+            let s = lock_unpoison(&self.snapshot);
+            (s.local, s.connections)
+        };
+        (*self.logf)(&format!(
+            "quic: 到点 detach —— 老世代仍持 UDP 源端口 {}、连接 {} 条（可能继续对出口发包；M0 §8.1 残余）",
+            local
+                .map(|a| a.to_string())
+                .unwrap_or_else(|| "（未就绪）".to_owned()),
+            conns
+        ));
         let logf = Arc::clone(&self.logf);
         let on_unhealthy = Arc::clone(&self.on_unhealthy);
         let spawned = thread::Builder::new()
@@ -478,7 +495,7 @@ fn run_driver(
                 }
                 () = tokio::time::sleep(TICK) => {}
             }
-            housekeeping(&mut st, &face, ctx).await;
+            housekeeping(&mut st, &face, ctx, seam).await;
         }
         // 收工：长任务全 abort（JoinSet drop）→ 连接面/端点随 face drop 关闭
         drop(jobs);
@@ -575,7 +592,7 @@ fn check_narrow_path(st: &mut DriverState, ctx: &IslandCtx) {
 ///   WG 面的巡检失败（世代层的事）不会经岛触发任何动作。
 /// - **不误伤**：探活失败/超时（连接仍在）**不**触发分类——那是世代层阶梯的输入
 ///   （`Cmd::Probe` 的结论由世代层消费；岛不抢跑）。
-async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx) {
+async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx, seam: u8) {
     let patrol = st.patrol;
     // ① 连接死（对端关闭/空闲回收）：清面 + 记行 + **归 `patrol` 分类**（S2-6 判据）
     if st.live.as_ref().is_some_and(|l| !l.alive()) {
@@ -583,6 +600,7 @@ async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx) {
         st.live = None;
         st.watch = None;
         st.pump_up = false; // 回程泵随连接结束自退；新连接另起
+        ctx.unhealthy(REASON_PATROL);
     }
     // ② 刷新到点（C15'；写失败 = 连接已断）
     if let Some(live) = st.live.as_mut() {
@@ -591,6 +609,7 @@ async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx) {
             st.live = None;
             st.watch = None;
             st.pump_up = false;
+            ctx.unhealthy(REASON_PATROL);
         }
     }
     // ③ 迁移保持检测（N-b / 未确认；判据本体在 `client::migration`）
@@ -617,6 +636,9 @@ async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx) {
             ));
             lock_unpoison(&ctx.snapshot).migration_unconfirmed = true;
             st.watch = None;
+            // 未确认 = 新路径不可用（协议侧要等 `max_idle_timeout` 30s 才定音）⇒ 与
+            // 连接死同面：**立刻**给世代层 `patrol` 分类（回落动作在世代层；设计 §2.3）。
+            ctx.unhealthy(REASON_PATROL);
         }
         None => {}
     }
@@ -653,6 +675,12 @@ async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx) {
     }
     // ⑤ 「窄路径不可用」判据（mds 变小/连接换过都要重判；S2-4）
     check_narrow_path(st, ctx);
+    // 测试注入缝（仅 `#[cfg(test)]`；生产构建里是空函数）：连接在位后卡死——测
+    // 「detach 后老世代 UDP 源端口/连接数可观测」（M0 §8.1 残余项）。
+    #[cfg(test)]
+    seams::apply_if_live(seam, st.live.is_some(), &ctx.logf);
+    #[cfg(not(test))]
+    let _ = seam;
 }
 
 /// 单条命令处置（岛线程内；带 await 的只有赛跑/探活的任务投出与换绑）。
@@ -964,6 +992,12 @@ pub(crate) mod seams {
     pub(crate) const PANIC: u8 = 1;
     /// 命令处置点永久卡死（测到点 detach + 收割线程接手）。
     pub(crate) const HANG: u8 = 2;
+    /// 连接在位后的拍内务里**永久卡死**（测「detach 后老世代 UDP 源端口/连接数可观测」；
+    /// 与 `HANG` 的区别：本模式**先让岛真的连上**再卡，故 detach 时确有在用连接）。
+    pub(crate) const HANG_WITH_LIVE: u8 = 4;
+    /// 连接在位卡死的「注入开始」记行（用例的确定性同步点）。
+    pub(crate) const MARK_HANG_LIVE: &str = "测试注入：连接后在拍内务卡死";
+
     /// 命令处置点卡死约 3s 后再 panic（测「到点 detach 后，panic 行由收割线程记」）。
     /// **窗长 3s（不是 1.2s）**：用例在「见到 MARK_STALL」后才起 200ms 的 `stop_within` 预算，
     /// 若测试线程在两步之间被调度延迟 > 窗长，岛已 panic ⇒ `wait_exit` 立即为真 ⇒「必须 detach」
@@ -992,6 +1026,14 @@ pub(crate) mod seams {
                 panic!("{MARK_STALL}");
             }
             _ => {}
+        }
+    }
+
+    /// 连接在位 ⇒ 记行 + 永久卡死（`HANG_WITH_LIVE` 的拍内务落点）。
+    pub(crate) fn apply_if_live(mode: u8, live: bool, logf: &Logf) {
+        if mode == HANG_WITH_LIVE && live {
+            (*logf)(MARK_HANG_LIVE);
+            block_forever();
         }
     }
 

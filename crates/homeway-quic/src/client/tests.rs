@@ -29,6 +29,7 @@ use crate::cmd::{
     OnUnhealthy, Via,
 };
 use crate::config::{IslandConfig, IslandCredential, TokenSecret};
+use crate::driver::seams;
 use crate::exit::{ExitInbound, ExitQuic, ExitQuicConfig, Reg3Verdict};
 use crate::rpk::{Ed25519Seed, RpkPublicKey};
 use crate::{Island, IslandTx};
@@ -91,6 +92,12 @@ fn island_cfg(patrol: Duration, pin: RpkPublicKey) -> IslandConfig {
 fn island_with_unhealthy(patrol: Duration, pin: RpkPublicKey, h: OnUnhealthy) -> Island {
     let (logf, _rx) = sink();
     Island::start(logf, h, island_cfg(patrol, pin)).expect("岛可起（含 QUIC 端点）")
+}
+
+/// 岛侧测试入口（挂注入缝；测 detach 面）。
+fn island_with_seam(patrol: Duration, pin: RpkPublicKey, logf: Logf, seam: u8) -> Island {
+    Island::start_with_seam(logf, Arc::new(|_r: &str| {}), island_cfg(patrol, pin), seam)
+        .expect("岛可起（含注入缝）")
 }
 
 fn island_with_log(patrol: Duration, pin: RpkPublicKey, logf: Logf) -> Island {
@@ -1515,5 +1522,95 @@ async fn tun_fd_death_classifies_fd() {
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
 
-// ---------- 7. 巡检接线（S2-6）与生命周期（S2-5）【本 commit 不含：见下一 commit】 ----------
+// ---------- 7. 巡检接线（S2-6）与生命周期（S2-5） ----------
 
+/// **判据（S2-6 / 设计 §2.5）**：**QUIC 连接被人为关闭 ⇒ 不健康分类 `patrol` 可达**
+/// （分类值 ∈ 既有取值集 `{patrol,fd,panic,stop}`）；且**探活失败（连接仍在）不触发分类**
+/// ——只以当前承载的结论驱动判定、瞬时失败不拆世代（反向腿/瞬时面的保护）。
+#[tokio::test]
+async fn connection_death_classifies_patrol_but_probe_timeout_does_not() {
+    let quic = exit_face(25);
+    let stub = Stub::new();
+    let (on_unhealthy, reasons) = unhealthy_sink();
+    let island = island_with_unhealthy(Duration::from_secs(60), quic.rpk_public_key(), on_unhealthy);
+    connect_direct(&island, &stub, &quic).await;
+    assert_eq!(stub.accepted(), 1, "登记成功（真出口侧绑定）");
+
+    // ① 预算极小的探活：回环下可能成功、也可能 ProbeNoResponse——**两种情况都不该分类**
+    let _ = send_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::Probe {
+            budget: Duration::from_millis(1),
+            reply,
+        },
+        Duration::from_secs(2),
+    )
+    .await;
+    tokio::time::sleep(Duration::from_millis(600)).await; // 让拍内务至少跑两拍
+    assert!(
+        wait_reason(&reasons, Duration::from_millis(50))
+            .await
+            .is_none(),
+        "探活失败/超时不得触发分类（不误伤、不拆世代）"
+    );
+
+    // ② 人为关闭：出口摘绑定 ⇒ CONNECTION_CLOSE ⇒ 岛拍内务即时归 `patrol`
+    quic.unbind_pub(&PUBKEY);
+    let got = wait_reason(&reasons, WAIT).await;
+    assert_eq!(got.as_deref(), Some("patrol"), "连接死必须归既有取值 `patrol`");
+    assert!(
+        island.snapshot().connections == 0,
+        "连接死后面子清空（等世代层重连/重赛跑）"
+    );
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（S2-5 / M0 §8.1 残余项）**：`stop_within` **到点 detach** 后，老世代仍持
+/// UDP 源端口与连接数——两件都**可观测**（快照 + detach 计数行；岛线程卡死、命令面已不可用，
+/// 故可观测面必须是轮询面）。
+#[tokio::test]
+async fn detach_keeps_old_generation_observable() {
+    let quic = exit_face(26);
+    let stub = Stub::new();
+    let (logf, logs) = sink();
+    let island = island_with_seam(
+        Duration::from_secs(60),
+        quic.rpk_public_key(),
+        Arc::clone(&logf),
+        seams::HANG_WITH_LIVE,
+    );
+    let (tun, _peer) = tun_pair();
+    assert!(matches!(attach(&island, tun.as_raw_fd(), 1280, BUDGET), Ok(())));
+    connect_direct(&island, &stub, &quic).await;
+    // 确定性同步点：连接在位后的拍内务里卡死（先见到注入行，再起 detach 预算）
+    let lines = logs_until(&logs, seams::MARK_HANG_LIVE, WAIT).await;
+    assert!(
+        lines.iter().any(|l| l.contains(seams::MARK_HANG_LIVE)),
+        "注入缝必须先在拍内务里留证：{lines:?}"
+    );
+
+    assert!(
+        !island.stop_within(Instant::now() + Duration::from_millis(200)),
+        "卡死岛到点必须返回 false（detach）"
+    );
+    // detach 计数行（UDP 源端口 + 连接数）
+    let lines = logs_until(&logs, "到点 detach", Duration::from_secs(2)).await;
+    let line = lines
+        .iter()
+        .find(|l| l.contains("老世代仍持 UDP 源端口"))
+        .expect("detach 计数行在")
+        .clone();
+    // 快照（老世代句柄仍可读：可观测面本体）
+    let snap = island.snapshot();
+    let local = snap.local.expect("UDP 源端口可观测（detach 后亦然）");
+    assert_ne!(local.port(), 0, "源端口由内核分配：{local}");
+    assert_eq!(snap.connections, 1, "连接数可观测（老世代仍持 1 条）");
+    assert!(
+        line.contains(&local.to_string()) && line.contains("连接 1 条"),
+        "计数行与快照同源：{line}"
+    );
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
