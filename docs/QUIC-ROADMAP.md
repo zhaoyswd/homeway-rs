@@ -103,7 +103,7 @@ QUIC MTU 1400 + DPLPMTUD，窄路径超限丢弃 + 计数；⑤中继零改动�
 | 期 | 内容 | 状态 | 进度 |
 |---|---|---|---|
 | **M0** | 骨架与依赖面（quinn/rustls/tokio 落地 + QUIC 岛设计 + 实验台转正 + 基线登记） | **已完成**（worktree 分支 `quic`，待用户指令合回 main） | 4/4 |
-| **M1** | QUIC 承载 + 全局代理（DATAGRAM + 迁移/赛跑） | **进行中**（设计门已过；含用户拍板：出口 RPK 身份提前到 M1） | 1/4 |
+| **M1** | QUIC 承载 + 全局代理（DATAGRAM + 迁移/赛跑） | **已完成**（实现 + 代码门 r13 有条件通过；**1 格未过已上报**：产品形态单连接内存；待用户指令合回 main） | 4/4 |
 | **M2** | 身份、设备表与准入（RPK + token 证明 + 抗放大） | 未开工 | 0/4 |
 | **M3** | 服务流迁移（STREAM tag；客户端 stackb 退役） | 未开工 | 0/4 |
 | **M4** | portfwd 承载适配（dial 缝换 STREAM；spec 不回退） | 未开工 | 0/3 |
@@ -115,19 +115,19 @@ QUIC MTU 1400 + DPLPMTUD，窄路径超限丢弃 + 计数；⑤中继零改动�
 
 > **本节 = 唯一的「现在该干什么」指针。** 主会话只认这里。
 
-1. **M1 进行中（设计门已过，2026-10-08）**：设计 = `docs/reviews/M1-design.md`（+ §12 用户拍板四项）；
-   实施按该文档 **§10 的六切片**推进（S1 出口 QUIC 面 → S2 客户端岛 → S3 观测面与 A/B + S4 判据行
-   登记 → S5 门槛实测 → S6 代码门）。**下一棒 = S1**。
-2. **M1 的真机项不可本地验**（层 0 全通 / WiFi→蜂窝迁移 / 真机吞吐 / OHOS 运行期）——设计 §10.1
-   给了操作脚本草案，落地时须走**硬件/用户触点**；S5 门槛实测**必须独占机器**（harness 读数纪律，
-   对照 `loadavg.tsv`）；S6 代码门用 dsh 第二轮。
-3. **M0 两件遗留已裁决**（记于 `docs/reviews/M1-design.md` §9）：①每连接内存——口径改五点拟合 +
-   门槛四条修订（已获用户拍板，本文件「性能/体积/内存门槛」表已同步）；②OHOS 运行期——可选 Linux
-   冒烟（epoll 同族）作代理留证，其余登记真机触点；`panic="abort"` 跨仓约束 M7 tier 触点复核。
-4. **交付位置（用户触点）**：M0 + M1 全部工作在**独立 worktree** `~/Documents/projects/homeway-rs-quic`
-   的分支 `quic` 上（M0 = `3f16471`…`1de72a2`；M1 从 `M1 设计门` 起续）。**合回 main / push / 发 tag
-   均等用户显式指令**——注意主检出现由并发批（Q-K 已收口 / Q-L 在途）占用，合回时机要与它错开。
-5. M2 之后的期开工前置照旧：复验工作树 + `cargo test --workspace` 绿基线。
+1. **M1 已收口**（实现 + 代码门记录 = `docs/reviews/M1.md`；规格 = `docs/reviews/M1-design.md`（含 §12
+   拍板与 §12.6/§12.7 订正）；门槛读数 = `docs/reviews/M1-S5-evidence.md`）。**两件待用户裁决**：
+   ①产品形态单连接内存格未过（+496K/+608K vs ≤+320K）——修订门槛 / 降级登记 / 限期归因 profiling；
+   ②双栈期体积 1.2264× 于 3.8MB（按设计属 M5 判，删码余量 ~0.86MB **未实测**）。
+   **M2 等待用户「开工」指令**（本程序节奏 = 逐期等指令，不自动接棒）。
+2. M2 开工前置：M1 的 `docs/INTEROP-CRITERIA.md` 补登条目与 `docs/reviews/M1.md` 的差异登记**必读**；
+   真机面七项仍归用户/硬件触点（`docs/reviews/M1.md` §3.6 清单：层 0 全通 / WiFi→蜂窝 / 真机吞吐 /
+   路径 MTU·丢包·NAT / OHOS 运行期 / UPnP 真 IGD / `panic="abort"` 跨仓）。
+3. **交付位置（用户触点）**：M0 + M1 全部工作在**独立 worktree** `~/Documents/projects/homeway-rs-quic`
+   的分支 `quic` 上（M0 = `3f16471`…`1de72a2`；M1 = 设计门 `cabc762` 起至本收口 commit，共 30+ 实施
+   commit）。**合回 main / push / 发 tag 均等用户显式指令**——主检出的 Q 批已全部收官（Q-L 收口
+   `4841b20`），合回已无在途冲突（`git merge-tree` 只读预检过）。
+4. M2 之后的期开工前置照旧：复验工作树 + `cargo test --workspace` 绿基线。
 
 ## 每期执行协议（子代理按此跑，主会话按此核对）
 
@@ -271,6 +271,26 @@ dsh `--profile headless` 轮次 `r12.CrR3qv`，意见 **52 条**（高 14〔含 
 S4 判据登记} → S5 门槛实测〔须独占机器〕→ S6 代码门）。
 
 **退出口**：全局代理等价 + 迁移通过 + 三项性能门过（或差异登记）；A/B 一键回退 WG 可用。
+
+**M1 收口证据（2026-10-09，实现棒 + 代码门 dsh r13）**：`cargo test --workspace` = 688 passed /
+0 failed / 4 ignored（`homeway-core --lib`）+ `homeway-quic` 76 passed（**全绿**）；clippy `-D warnings` = 0；
+三目标 `cargo check` 全绿（OHOS 真链路档 + musl 双架构 clang 垫片档；OHOS 档 1 条**既有**
+`libc::time_t` deprecated 警告，非 M1 面）；`tools/build-app-core.sh` 三道门过（20/20 符号 + 版本注入 +
+`.so` = **4,660,320 B**，对 3.8MB 阈值 **1.2264×**，按设计属 **M5 判**）；`tools/check-quic-isolation.sh`
+**九条全绿**（M1 S6 由五条扩到九条：裸 `send_datagram(` / `send_datagram_wait` / 中继整文件零异步名 /
+单线程前提三条可判定事实 + harness `SECURITY` 标记；新断言已用四形态负例验证各自确定性红）；
+`tools/check-vocab.sh` PASS（词表面零改动）。
+判据行 = `docs/INTEROP-CRITERIA.md` 的 M1 S3/S4 批 **17 条 + 计数输入集 3 行**，**S6 代码门补登 7 + 1 行**
+（Q-O 三闸拒绝族 / 准入被拒族 / 装配·生命周期归因行族 / N-c 节流文案订正 / `L3Bearer` 接受集 /
+隔离门断言面扩展 / S6 整改两条实现偏离）；`_wg` 档**逐字节回退**（token 逐字节 + C 族原串 +
+`quic:` 族零输出）。门槛实测 = `docs/reviews/M1-S5-evidence.md`（每包 CPU **0.895×**、线开销 30.152B、
+每连接边际 80.0K/84.0K、32 设备 1.44MiB、负载态 +704K、中继下行 A/B **1.00×**、迁移 `migrations=1`
+腿峰值 2）——**10 格通过 / 1 格未过**（产品形态单连接内存 +496K/+608K vs ≤+320K，**已上报待裁决**）
++ 1 格按设计属 M5 判（体积）。代码门 = `docs/reviews/M1.md`（r13，`/tmp/dsh-review/r13.i3rMst/`，
+exit 0，有条件通过 → 条件 C1/C3 已整改、C2 上报；28 条意见 高 2 / 中 12 / 低 11，**不认同 0**，
+高危 H1 = 噪声门控误读 WG 腿信号已修）。
+**真机面七项未验**（层 0 / WiFi→蜂窝 / 真机吞吐 / 路径 MTU·丢包·NAT / OHOS 运行期 / UPnP 真 IGD /
+`panic="abort"` 跨仓）⇒ **M1 不宣称已验证**。
 
 ## M2 身份、设备表与准入（估 3–5 会话日）
 
@@ -446,6 +466,14 @@ fixtures 向量逐字节不变；客户端依赖树不再含 smoltcp（脚本验
 | 丢包可观测 | DATAGRAM 超限 / 丢弃有计数行，不静默 | 窄路径注入（MTU<1340） |
 | 中继承载 | **同刻 A/B 相对判据**（经中继 vs 直连的比值；绝对吞吐数字只作登记、标注不可比）——并同时记 `congestion_events`/`lost_packets`（分辨「限速器静默丢被 QUIC 当拥塞」）〔M1 设计门 + 用户拍板 2026-10-08〕 | 本地中继（`tools/local-rust-relay.sh`）+ 真机复测 |
 
+- **门槛表（内存/体积行）的 M1 状态指针**：M1 判据按 `docs/reviews/M1-design.md` §9.1 的四条修订 +
+  §12-③ 用户拍板执行（每设备 ≤96K / 单连接 ≤+320K / 32 设备 ≤+3.1MiB / 负载态 ≤64MiB+队列）；
+  **产品形态单连接格实测未过**（+496K/+608K，见 `docs/reviews/M1.md` §3.1）⇒ 该格数值**待用户裁决**，
+  **勿按旧值复述**；体积行按设计属 M5 判（M1 双栈期实测 4,660,320 B = 1.2264× 于 3.8MB，
+  **M5 删码余量 ≈0.86MB 未实测**——M5 设计门须先实测删码余量再判）。
+
+---
+
 ## 已知 flake 登记（沿用 Q 批表；本程序增量）
 
 - **随 M5 删除除名**：`wgcore::stackb::*`（墙钟断言）——WG 退役后该测试移除；
@@ -466,6 +494,13 @@ fixtures 向量逐字节不变；客户端依赖树不再含 smoltcp（脚本验
      `daemon::carriers::forward::tests::*` 报 `bind 127.0.0.1:20004/20010 already in use`）不与本程序混判；
   ⑤ **登记动作**：以上四条随 `docs/QUIC-BASELINE.md` / `tools/quic-ab/README.md` 同源，变更须同批更新。
   另（M0 移植事实，非 flake）：DPLPMTUD / 迁移用例的墙钟依赖仍属 M1 起的登记面。
+- **本程序新增（M1 实现时登记，2026-10-09）**：`wtransport::bind::tests` 的**实 socket 时序族**
+  （S2b 实测 `mirror_then_adopt_then_single_send` 一次、M1 S3/S4 批全量并行跑 `relay_envelope_and_adoption`
+  一次；均 `--test-threads=1` 隔离复跑绿），与既登记族两例（`daemon::tests::handshake_deadline_beats_slow_drip`、
+  `term::service::tests::attach_size_applies_to_pty`）同批登记；代码门 r13 又实测 `daemon::tests::*` 一例
+  （隔离复跑绿、与 M1 改动面无交集）。**flake 口径照 M0 §9.2 ④**（红了先隔离单跑再判回归；**不静默重跑**）。
+  另：M1 收口期间新增的两条用例（岛回程泵身份防重 / 消费者已退归因）已做**负例有效性**验证
+  （旧语义确定性红），不属 flake 面。
 
 ## 附录 A：实验台与原始数据（2026-10-08）
 
@@ -481,6 +516,10 @@ fixtures 向量逐字节不变；客户端依赖树不再含 smoltcp（脚本验
   `docs/QUIC-BASELINE.md`（本附录旧值只作量级对照）；两处口径订正随 M0 落库：①CPU 基线的原始
   证据链只有手抄 `SUMMARY.md`（`m-*.out` 全为 11 字节空壳；第二份独立测量 = `/tmp/pk-*-cli.out`，
   N=300k，与手抄值差 1.3–5.9%）；②`wg-ring` 臂的 ring 实为 **0.16.20**（非 0.17）。
+- **M1 复测（2026-10-09）**：每包 CPU `quic` **12.895µs**（对 M0 基线 +1.8%）/ 线开销 **30.152B** /
+  `mds` 1162·1362 精确——逐格对照见 `docs/reviews/M1-S5-evidence.md` §1（含首轮 wg-ring 越界
+  = 测量窗口污染的归因与复跑消解）。设计 §5.1 的「下行 1402B」实测不可达（实得 **1322B**）=
+  **算术上界**，已按 M1 设计 §12.7-1 补记。
 
 ## 附录 B：删码 / 改码规模盘点（2026-10-08 实测行数）
 
