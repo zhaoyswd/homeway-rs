@@ -228,8 +228,11 @@ impl Carriers {
 // ---------- 局部共享件 ----------
 
 /// 0600 原子写（tmp + rename；hosts.json 同口径）。目录缺失即建（0700）。
+/// Q-G F4/A7：**创建即 0600**（`.mode`）+ handle 后 fchmod 归一——旧形态
+/// 「默认权限建 → 静默 chmod」有 0644 短窗口且 chmod 失败无告警。
 pub(super) fn save_json_atomic(path: &std::path::Path, body: &[u8]) -> Result<(), String> {
     use std::io::Write as _;
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let dir = path.parent().unwrap_or(std::path::Path::new("."));
     std::fs::create_dir_all(dir).map_err(|e| format!("建目录 {}：{e}", dir.display()))?;
     let tmp = path.with_extension("json.tmp");
@@ -237,12 +240,13 @@ pub(super) fn save_json_atomic(path: &std::path::Path, body: &[u8]) -> Result<()
         .create(true)
         .write(true)
         .truncate(true)
+        .mode(0o600)
         .open(&tmp)
         .map_err(|e| format!("建 {}：{e}", tmp.display()))?;
-    {
-        // 创建即收紧到 0600（hosts-2 同款：避免 umask 面上的 0644 窗口）。
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    // 失败**告警不阻断**（代码门②：与 A1–A5 的告警形态一致——硬失败会把
+    // 「状态落盘成功」变成报错并留下 .tmp，行为变化不值得）
+    if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+        eprintln!("homeway: ⚠️ {} 收紧 0600 失败（{e}）——建议手工 chmod", tmp.display());
     }
     f.write_all(body).and_then(|_| f.write(b"\n")).map_err(|e| format!("写 {}：{e}", tmp.display()))?;
     drop(f);

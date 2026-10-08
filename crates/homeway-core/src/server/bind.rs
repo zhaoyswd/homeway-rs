@@ -27,7 +27,7 @@
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-use std::os::fd::AsRawFd as _;
+use std::os::fd::{AsRawFd as _, IntoRawFd as _};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -804,15 +804,15 @@ impl ServerBind {
     pub fn tx_start(&mut self, sock: UdpSocket, burst_bytes: usize, dlogf: crate::Logf) {
         // socketpair（fd 生命周期锚 ServerBind；SOCK_DGRAM + MSG_NOSIGNAL——本仓
         // main 已把 SIGPIPE 恢复默认处置，裸写死管道会打死进程〔评审 p1a-G-1〕；
-        // Darwin 无 pipe2 绑定，socketpair 全平台可用〔p1a-G-3〕）
-        let mut fds = [-1i32; 2];
-        let rc = unsafe { libc::socketpair(libc::AF_UNIX, libc::SOCK_DGRAM, 0, fds.as_mut_ptr()) };
-        if rc != 0 {
-            panic!(
-                "发送线程：socketpair 失败（{}）——发送线程是唯一发送路径，起不来即出口起不来",
-                io::Error::last_os_error()
-            );
-        }
+        // F1：创建即带 CLOEXEC（linux/OHOS 原子位；darwin 建后立即补）——出口发送
+        // 线程的唤醒通道不得随 exec 继承（daemon 自 exec 是真实继承面）。
+        let (fds0, fds1) = match crate::sysfd::socketpair_cloexec(libc::AF_UNIX, libc::SOCK_DGRAM, 0) {
+            Ok(v) => v,
+            Err(e) => panic!(
+                "发送线程：socketpair 失败（{e}）——发送线程是唯一发送路径，起不来即出口起不来"
+            ),
+        };
+        let fds = [fds0.into_raw_fd(), fds1.into_raw_fd()];
         let (producer, consumer) = txring::txring_new();
         let pending = Arc::new(AtomicBool::new(false));
         let stop = Arc::new(AtomicBool::new(false));

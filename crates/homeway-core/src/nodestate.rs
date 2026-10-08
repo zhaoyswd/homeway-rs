@@ -22,7 +22,7 @@
 //! 不同时在世）。时间前缀与 Go `logTimePrefix` 同形（本地时区）。
 
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::{FileExt as _, OpenOptionsExt as _, PermissionsExt as _};
+use std::os::unix::fs::{DirBuilderExt as _, FileExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use crate::logfile::{RotatingWriter, DEBUG_BACKUPS, DEBUG_MAX_BYTES, EVENTS_BACKUPS, EVENTS_MAX_BYTES};
@@ -51,8 +51,13 @@ impl InstanceLock {
     /// （unified/serve/relay），失败读持有者报 `Held`。
     pub fn acquire(state_dir: &Path, form: &str) -> Result<Self, LockError> {
         // state 根收紧 0700（Go MkdirAll(dir, 0o700)；chmod 失败只告警不阻断——
-        // r1-W2：create_dir_all 的默认权限不该留一个 0755 的 state 根）
-        if let Err(e) = std::fs::create_dir_all(state_dir)
+        // r1-W2：create_dir_all 的默认权限不该留一个 0755 的 state 根）。
+        // Q-G F4/A4：`DirBuilder::mode` 创建即收紧 + 保留告警（umask 掩码仍可能
+        // 压掉 mode ⇒ 后置 chmod 仍需执行）。
+        if let Err(e) = std::fs::DirBuilder::new()
+            .recursive(true)
+            .mode(0o700)
+            .create(state_dir)
             .and_then(|_| std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)))
         {
             eprintln!("homeway: ⚠️ state 目录 {} 建立/收紧 0700 失败（{e}）——建议手工 chmod", state_dir.display());
@@ -288,13 +293,16 @@ pub struct NodeState {
 }
 
 pub fn open_node_state(dir: &Path) -> std::io::Result<NodeState> {
-    std::fs::create_dir_all(dir)?;
+    // Q-G F4/A5：`DirBuilder::mode(0o700)` 创建即收紧（create_dir_all 的默认权限
+    // 会留一个 0755 的 state 根）——**仍随后无条件 chmod 归一**（mkdir 同样受
+    // umask 掩码）+ 失败告警（保留既有告警形态）。
+    std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
     if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
         eprintln!("homeway: ⚠️ state 目录 {} 收紧 0700 失败（{e}）——建议手工 chmod", dir.display());
     }
     for sub in ["serve", "relay", "client", "cache"] {
         let p = dir.join(sub);
-        std::fs::create_dir_all(&p)?;
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&p)?;
         if let Err(e) = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)) {
             eprintln!("homeway: ⚠️ state 子目录 {} 收紧 0700 失败（{e}）——建议手工 chmod", p.display());
         }
@@ -302,10 +310,23 @@ pub fn open_node_state(dir: &Path) -> std::io::Result<NodeState> {
     let cfg_path = dir.join("config.toml");
     let mut generated = false;
     if !cfg_path.exists() {
-        // 原子写（tmp+rename——中断不留半文件）
+        // 原子写（tmp+rename——中断不留半文件）。Q-G F4/A6：**创建即 0600** +
+        // handle 后 fchmod 归一（旧形态默认权限建 → 静默 chmod，chmod 失败无告警）。
+        use std::io::Write as _;
         let tmp = dir.join(".config.toml.tmp");
-        std::fs::write(&tmp, DEFAULT_CONFIG_TOML)?;
-        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)?;
+        // 失败**告警不阻断**（代码门②：配置模板不含密钥，不得为权限归一牺牲进程可
+        // 启动性；与 A1–A5 的告警形态一致）
+        if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+            eprintln!("homeway: ⚠️ config 模板 {} 收紧 0600 失败（{e}）——建议手工 chmod", tmp.display());
+        }
+        f.write_all(DEFAULT_CONFIG_TOML.as_bytes())?;
+        drop(f);
         std::fs::rename(&tmp, &cfg_path)?;
         generated = true;
     }

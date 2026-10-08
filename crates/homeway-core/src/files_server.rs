@@ -960,12 +960,25 @@ impl Drop for ConnReservation {
     }
 }
 
-/// UDS 监听（exit-service-uds：死/活判别 + chmod 0600；路径 ≥100B 拒绝）。
+/// UDS 监听（exit-service-uds：死/活判别 + chmod 0600；路径 **> `SUN_PATH_MAX`** 拒绝）。
+///
+/// **契约（Q-G F4.2）**：`dir` 必须是**本仓 state 布局持有的目录**（三个生产调用点
+/// 都传 `serve_dir`：`engine.rs` 的 files/speedtest/term 三处）——函数在 bind 之前
+/// 会把 `dir` 收紧 0700（失败**告警不阻断**），这是 UDS 无法原子 0600 的补偿面
+/// （`bind()` 无 mode 参数，跨用户暴露面由目录权限关闭；同用户窗口为已知残余）。
 pub fn listen_local_service(dir: &Path, name: &str, logf: &crate::Logf) -> std::io::Result<UnixListener> {
     let sock = dir.join(name);
-    let s = sock.display().to_string();
-    if s.len() >= 100 {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidInput, format!("路径超长（{} 字节 ≥ 100，sun_path 上限）", s.len())));
+    // 量法统一为**字节口径**（`as_os_str().len()`——旧 `display()` 是 lossy 字符串，
+    // 与判据不同源；Q-G F4.3）。
+    let s_len = sock.as_os_str().len();
+    if s_len > crate::sysfd::SUN_PATH_MAX {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "路径超长（{s_len} 字节 > {}，sun_path 上限〔平台值〕）",
+                crate::sysfd::SUN_PATH_MAX
+            ),
+        ));
     }
     // 活实例占用判别：拨得通 = 有人（报占用）；ENOENT/ECONNREFUSED = 死残留（可清）
     if let Ok(c) = UnixStream::connect(&sock) {
@@ -973,9 +986,21 @@ pub fn listen_local_service(dir: &Path, name: &str, logf: &crate::Logf) -> std::
         return Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, "socket 已被另一个活实例占用（同 state 双实例？）"));
     }
     let _ = std::fs::remove_file(&sock);
+    // 目录先 0700（bind 之前；失败告警不阻断——socket 0600 那层还兜着）
+    if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
+        logf(&format!(
+            "⚠️ state 目录 {} 收紧 0700 失败（{e}）——socket 0600 仍是边界",
+            dir.display()
+        ));
+    }
     let ln = UnixListener::bind(&sock)?;
-    let _ = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600));
-    let _ = logf;
+    // chmod 0600：**失败告警**（旧形态静默 `let _ =`；Go `chmodTighten` 会告警）
+    if let Err(e) = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)) {
+        logf(&format!(
+            "⚠️ {} chmod 0600 失败（{e}）—— 纵深加固未生效，state 目录权限仍是边界",
+            sock.display()
+        ));
+    }
     Ok(ln)
 }
 
@@ -1631,16 +1656,25 @@ mod tests {
         conns.store(0, std::sync::atomic::Ordering::Release);
     }
 
-    /// UDS 监听面：bind + chmod 0600 + 活实例占用判别。
+    /// UDS 监听面：bind + chmod 0600 + 活实例占用判别 + **目录先 0700**（Q-G F4）。
+    /// **登记**：chmod 失败告警路径不可确定构造（chmod 只需属主身份、不需要目录写
+    /// 权限 ⇒ 只读目录也成功；非属主构造在本仓测试不可行）——按设计 §2-F4 测试计划
+    /// 如实降级为「代码面复核」。
     #[test]
     fn uds_listen_and_occupancy() {
         let dir = tmpdir("uds");
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
         let logf = noop_logf();
         let ln = listen_local_service(&dir, "files.sock", &logf).unwrap();
         let sock = dir.join("files.sock");
         assert!(sock.exists());
         let mode = sock.metadata().unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "socket 权限应收紧 0600");
+        assert_eq!(
+            std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "bind 之前目录已收紧 0700（F4：目录面是 UDS 的补偿边界）"
+        );
         // 活占用：一个 listener 在听 → 第二个 bind 报占用
         let r = listen_local_service(&dir, "files.sock", &logf);
         assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::AddrInUse);

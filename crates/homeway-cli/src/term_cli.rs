@@ -1312,12 +1312,20 @@ impl Clone for SigPipe {
 }
 
 fn install_signal_pipes() -> SigPipe {
-    let mut fds = [0i32; 2];
-    if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-        let e = std::io::Error::last_os_error();
-        eprintln!("homeway term: 信号管道建立失败（{e}）——退出");
-        std::process::exit(1);
-    }
+    // Q-G F1：管道经 `sysfd` 建（两端 CLOEXEC——term 会真 exec 用户 shell；虽
+    // portable-pty 的 `close_random_fds()` 会净化，但本仓不依赖第三方库行为）→
+    // 立即 `into_raw_fd()` 交既有 i32 字段（生命周期由 `drop_signal_pipes` 收口）。
+    let (r, w) = match homeway_core::sysfd::pipe_cloexec() {
+        Ok(v) => (
+            std::os::fd::IntoRawFd::into_raw_fd(v.0),
+            std::os::fd::IntoRawFd::into_raw_fd(v.1),
+        ),
+        Err(e) => {
+            eprintln!("homeway term: 信号管道建立失败（{e}）——退出");
+            std::process::exit(1);
+        }
+    };
+    let fds = [r, w];
     SIG_W.store(fds[1], Ordering::SeqCst);
     unsafe {
         let h_winch = on_sigwinch as extern "C" fn(i32) as libc::sighandler_t;
@@ -1418,14 +1426,22 @@ fn attach_run(
 
     // 数据到达管道（读腿 poke —— 主循环 poll 面的第三源）。写端非阻塞（评审
     // r2-7/r2-12：满管 EAGAIN 丢弃无害；建立失败 = 可行动错误退出——裸 -1 会把
-    // SIG_W/poke 指到 fd 0〔stdin〕）。
-    let mut poke_fds = [0i32; 2];
-    if unsafe { libc::pipe(poke_fds.as_mut_ptr()) } != 0 {
-        let e = std::io::Error::last_os_error();
-        conn.close();
-        let _ = tty.restore();
-        return Err(format!("poke 管道建立失败：{e}"));
-    }
+    // SIG_W/poke 指到 fd 0〔stdin〕）。Q-G F1：CLOEXEC 创建即落（两端）。
+    let (poke_r, poke_w) = match homeway_core::sysfd::pipe_cloexec() {
+        Ok(v) => (
+            std::os::fd::IntoRawFd::into_raw_fd(v.0),
+            std::os::fd::IntoRawFd::into_raw_fd(v.1),
+        ),
+        Err(e) => {
+            // Q-G F1（N7）：早退路径必须补 `drop_signal_pipes`（SIG_W 留在活 fd 上
+            // + 两 fd 泄漏——对照下方 split 失败路径的既有收口）
+            drop_signal_pipes(pipes);
+            conn.close();
+            let _ = tty.restore();
+            return Err(format!("poke 管道建立失败：{e}"));
+        }
+    };
+    let poke_fds = [poke_r, poke_w];
     unsafe {
         let fl = libc::fcntl(poke_fds[1], libc::F_GETFL);
         libc::fcntl(poke_fds[1], libc::F_SETFL, fl | libc::O_NONBLOCK);
@@ -1435,6 +1451,10 @@ fn attach_run(
         Ok(v) => v,
         Err(e) => {
             drop_signal_pipes(pipes);
+            unsafe {
+                libc::close(poke_fds[0]);
+                libc::close(poke_fds[1]);
+            }
             let _ = tty.restore();
             return Err(e);
         }

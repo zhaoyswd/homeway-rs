@@ -22,7 +22,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use crate::go_fmt::{fmt_duration_go_ms, fmt_duration_go_secs};
 use crate::identity::{self, Identity, IdentitySource};
 use crate::token::Token;
-use crate::wgcore::{Client, ConnErr, CoreConfig};
+use crate::wgcore::{Client, ConnErr, CoreConfig, CLIENT_CLOSE_BUDGET};
 use crate::wtransport::endpoint_cache::{EndpointCache, EndpointSource};
 use crate::wtransport::{Candidate, Via};
 
@@ -1346,7 +1346,10 @@ fn rebuild_session(shared: &Arc<Shared>, reason: &str) {
             let new = Arc::new(new);
             // 孤儿守卫（Go FIX-04 同义；评审低-14）：构建窗口内收工 ⇒ 新会话弃用
             if sh.stop.load(Ordering::SeqCst) {
-                new.stop();
+                // Q-G F5：有界收工（到点 detach——引擎线程自行退出）
+                if !new.stop_within(Instant::now() + CLIENT_CLOSE_BUDGET) {
+                    (logf)("等待 client 线程收工超时（CLIENT_CLOSE_BUDGET）——放行自退（引擎线程由收割线程收口）");
+                }
                 (logf)("REBUILD 会话已在构建窗口内收工——新会话弃用（防孤儿）");
                 return;
             }
@@ -1360,7 +1363,10 @@ fn rebuild_session(shared: &Arc<Shared>, reason: &str) {
             if shared.relay_lock {
                 shared.current().set_relay_only(); // 测试缝随世代重装
             }
-            old.stop();
+            // Q-G F5：旧会话有界收工（build 期间可能挂在引擎 RPC 上——到点 detach）
+            if !old.stop_within(Instant::now() + CLIENT_CLOSE_BUDGET) {
+                (logf)("等待 client 线程收工超时（CLIENT_CLOSE_BUDGET）——放行自退（引擎线程由收割线程收口）");
+            }
             (logf)("REBUILD 新会话已换入（首个出站包将重新注册+赛跑）");
         }
         Err(e) => {

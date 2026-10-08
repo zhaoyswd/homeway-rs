@@ -12,13 +12,15 @@ use std::io::ErrorKind;
 use std::os::unix::net::UnixListener;
 use std::path::{Path, PathBuf};
 
+use crate::sysfd::SUN_PATH_MAX;
+
 /// state 目录下的控制面 socket 文件名。
 pub const CONTROL_SOCK_NAME: &str = "control.sock";
 
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ListenError {
-    #[error("socket 路径超长（{0} 字节 ≥ 100，sun_path 上限）")]
+    #[error("socket 路径超长（{0} 字节 > {SUN_PATH_MAX}，sun_path 上限〔平台值〕）")]
     PathTooLong(usize),
     #[error("control.sock 已被另一个活实例占用（同 state 双实例？）")]
     Occupied,
@@ -34,14 +36,16 @@ pub enum ListenError {
     Io(#[from] std::io::Error),
 }
 
-/// 在 state 目录监听 control.sock：残留探测 → 清除/报错 → bind → 显式 chmod 0600
-/// （不依赖 umask 的偶然值）→ 目录收紧 0700（双层防御：第二层同时护住 state 里的
-/// 身份密钥等非 socket 文件）。
+/// 在 state 目录监听 control.sock：残留探测 → 清除/报错 → **目录收紧 0700（bind
+/// 之前）** → bind → 显式 chmod 0600（不依赖 umask 的偶然值）。
+///
+/// Q-G F4：目录 0700 从 bind 之后**前置**到 bind 之前（跨用户暴露面在 socket 存在
+/// 之前就关闭）；第二层防御语义不变（同时护住 state 里的身份密钥等非 socket 文件）。
 pub fn listen_control(state_dir: &Path) -> Result<(PathBuf, UnixListener), ListenError> {
     let sock = state_dir.join(CONTROL_SOCK_NAME);
     let sock_len = sock.as_os_str().len();
-    if sock_len >= 100 {
-        // sockaddr_un.sun_path 保守上限（darwin 104 / linux 108）。
+    if sock_len > SUN_PATH_MAX {
+        // sun_path 平台真实可用长度（darwin 103 / linux·OHOS 107——单源 `sysfd`）。
         return Err(ListenError::PathTooLong(sock_len));
     }
     // 残留探测：连通 = 活实例占用。
@@ -60,21 +64,21 @@ pub fn listen_control(state_dir: &Path) -> Result<(PathBuf, UnixListener), Liste
         Err(e) if e.kind() == ErrorKind::NotFound => {}
         Err(e) => return Err(ListenError::RemoveFailed(e.to_string())),
     }
-    let ln = UnixListener::bind(&sock).map_err(|e| ListenError::Bind(e.to_string()))?;
-    // listen 后显式 chmod 0600（0600 即拦非属主 connect；不依赖 umask）。
-    if let Err(e) = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)) {
-        let msg = e.to_string();
-        drop(ln);
-        let _ = std::fs::remove_file(&sock);
-        return Err(ListenError::ChmodSock(msg));
-    }
-    // 目录 0700（第二层；OpenNodeState 已建，这里幂等再收紧并作为装配断言）。
+    // 目录 0700（**bind 之前**；OpenNodeState 已建，这里幂等再收紧并作为装配断言）。
     // 与 Go 口径一致：目录收紧失败告警不阻断（socket 0600 那层还兜着）。
     if let Err(e) = std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)) {
         eprintln!(
             "homeway: ⚠️ state 目录 {} 收紧 0700 失败（{e}）——socket 0600 仍是边界",
             state_dir.display()
         );
+    }
+    let ln = UnixListener::bind(&sock).map_err(|e| ListenError::Bind(e.to_string()))?;
+    // bind 后显式 chmod 0600（0600 即拦非属主 connect；不依赖 umask）。
+    if let Err(e) = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)) {
+        let msg = e.to_string();
+        drop(ln);
+        let _ = std::fs::remove_file(&sock);
+        return Err(ListenError::ChmodSock(msg));
     }
     Ok((sock, ln))
 }
@@ -114,5 +118,58 @@ mod tests {
         let (path2, _ln2) = listen_control(&dir).unwrap();
         assert_eq!(path2, sock);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Q-G F4：**目录 0700 前置**——在 0755 目录上调 `listen_control`，返回后目录
+    /// 已是 0700（旧形态在 bind 之后才收紧）。
+    #[test]
+    fn listen_control_tightens_dir_to_0700() {
+        let dir = std::env::temp_dir().join(format!("hw-ctl-dir-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        let (_, ln) = listen_control(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode();
+        assert_eq!(mode & 0o777, 0o700, "目录必须在 bind 之前/之后恒为 0700");
+        drop(ln);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Q-G F4.3：深路径正例/负例——**按完整 socket 路径长度**构造（`state_dir` +
+    /// `/control.sock` 后缀 13 B 含分隔符）：`== SUN_PATH_MAX` 可 bind；
+    /// `== SUN_PATH_MAX + 1` 必 `PathTooLong`（off-by-one 已订正：放行 103/107）。
+    #[test]
+    fn listen_control_path_limit_boundary() {
+        fn dir_with_full_len(total: usize) -> PathBuf {
+            let base = std::env::temp_dir();
+            let want_dir = total - (CONTROL_SOCK_NAME.len() + 1);
+            let base_len = base.as_os_str().len();
+            assert!(want_dir > base_len + 1, "临时目录太深，构造不出目标长度");
+            let pad = want_dir - base_len - 1;
+            let mut name = String::from("q");
+            name.push_str(&"g".repeat(pad));
+            let d = base.join(name);
+            assert_eq!(d.as_os_str().len(), want_dir);
+            d
+        }
+
+        // 正例：完整路径 == SUN_PATH_MAX（darwin 103 / linux 107）可 bind。
+        let ok_dir = dir_with_full_len(SUN_PATH_MAX);
+        let _ = std::fs::remove_dir_all(&ok_dir);
+        std::fs::create_dir_all(&ok_dir).unwrap();
+        let (p, ln) = listen_control(&ok_dir).expect("SUN_PATH_MAX 长度必须可 bind");
+        assert_eq!(p.as_os_str().len(), SUN_PATH_MAX);
+        drop(ln);
+        let _ = std::fs::remove_dir_all(&ok_dir);
+
+        // 负例：完整路径 == SUN_PATH_MAX + 1 必拒。
+        let bad_dir = dir_with_full_len(SUN_PATH_MAX + 1);
+        let _ = std::fs::remove_dir_all(&bad_dir);
+        std::fs::create_dir_all(&bad_dir).unwrap();
+        match listen_control(&bad_dir) {
+            Err(ListenError::PathTooLong(n)) => assert_eq!(n, SUN_PATH_MAX + 1),
+            other => panic!("超限路径必须 PathTooLong，得 {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&bad_dir);
     }
 }

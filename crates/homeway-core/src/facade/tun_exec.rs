@@ -30,7 +30,7 @@ use crate::session::recover::{
     self, Action, ActionError, LadderRc, LadderTransport, Level, RecoverGate, RefreshRegOutcome,
 };
 use crate::token::Token;
-use crate::wgcore::{Client, ConnErr, CoreConfig};
+use crate::wgcore::{Client, ConnErr, CoreConfig, CLIENT_CLOSE_BUDGET};
 use crate::wtransport::endpoint_cache::{EndpointCache, EndpointSource};
 use crate::wtransport::{Candidate, Via};
 use crate::Logf;
@@ -634,7 +634,11 @@ impl TunExecutor for TunnelExec {
                 // 关客户端是最可靠的第二条打断路径（Go tunStopWait 同义）。
                 if run.tun_shared.stage.snapshot().stage == TunStage::Preparing {
                     if let Some(c) = run.current_client() {
-                        c.stop();
+                        // Q-G F5：**有界**收工（暖机探测可能挂在引擎 RPC 上——到点
+                        // detach，wake fd 交收割线程；无界会拖死 tun_stop 的等待）
+                        if !c.stop_within(Instant::now() + CLIENT_CLOSE_BUDGET) {
+                            (run.logf)("等待 client 线程收工超时（CLIENT_CLOSE_BUDGET）——放行自退（引擎线程由收割线程收口）");
+                        }
                     }
                 }
                 return;
@@ -986,7 +990,11 @@ fn gen_loop(
                 .unwrap_or_else(|e| e.into_inner())
                 .take()
             {
-                c.stop();
+                // Q-G F5：有界收工（Drop 里 spawn 收割线程允许——Q-F 段⑤先例；
+                // 到点 detach，引擎线程自行退出）
+                if !c.stop_within(Instant::now() + CLIENT_CLOSE_BUDGET) {
+                    (self.run.logf)("等待 client 线程收工超时（CLIENT_CLOSE_BUDGET）——放行自退（引擎线程由收割线程收口）");
+                }
             }
             // 缓存终写（我-2③：世代收尾前把学到/验证过的端点落盘——Go closeClientOnce
             // 路径的 save 同义；进程被杀时由去抖线程的先前行兜底）
@@ -1037,7 +1045,11 @@ fn gen_loop(
     let client = Arc::new(client);
     // 装配窗口内收到 stop（评审 r2-M2 的窗口收口）：停在装配完成点，不进暖机
     if run.stop.load(Ordering::Acquire) {
-        client.stop();
+        // Q-G F5：有界收工（本处在世代线程内联执行——预算语义 = 「本线程不无限等」，
+        // 与 `session::rebuild_session` 的两处一致）
+        if !client.stop_within(Instant::now() + CLIENT_CLOSE_BUDGET) {
+            (logf)("等待 client 线程收工超时（CLIENT_CLOSE_BUDGET）——放行自退（引擎线程由收割线程收口）");
+        }
         shared
             .stage
             .set_if_current(gen, TunStage::Idle, "stopped", "被停止请求中断", false);

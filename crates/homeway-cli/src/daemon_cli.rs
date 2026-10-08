@@ -171,14 +171,18 @@ fn start_spawned_process(state_dir: &std::path::Path) -> Result<u32, String> {
     if let Some(dir) = log.parent() {
         std::fs::create_dir_all(dir).map_err(|e| format!("建 {}: {e}", dir.display()))?;
     }
+    // Q-G F4（A8）：**创建即 0600**（`.mode` + 拿到 handle 后 fchmod 归一，防 umask
+    // 掩码）——旧形态是「默认权限建 → 静默 chmod」，存在短窗口且失败无告警。
+    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let mut lf = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(&log)
         .map_err(|e| e.to_string())?;
-    {
-        use std::os::unix::fs::PermissionsExt as _;
-        let _ = std::fs::set_permissions(&log, std::fs::Permissions::from_mode(0o600));
+    // 失败**告警不阻断**（代码门②：与 state.rs 的告警形态一致；spawn 日志不含凭据）
+    if let Err(e) = lf.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+        eprintln!("homeway: ⚠️ spawn 日志 {} 收紧 0600 失败（{e}）——建议手工 chmod", log.display());
     }
     // 分隔行（Go spawn.go 同形态——多次拉起的失败原因累积可查）。
     {
@@ -1309,13 +1313,20 @@ extern "C" fn on_watch_sig(_sig: i32) {
 }
 
 fn install_status_watch_signals() -> WatchSigPipe {
-    let mut fds = [0i32; 2];
-    let r = unsafe { libc::pipe(fds.as_mut_ptr()) };
-    if r != 0 {
-        let e = std::io::Error::last_os_error();
-        eprintln!("homeway: 信号管道建立失败（{e}）——watch 退出");
-        std::process::exit(1);
-    }
+    // Q-G F1：管道经 `sysfd` 建（两端 CLOEXEC）→ 立即 `into_raw_fd()` 交既有 i32
+    // 字段（生命周期由 `drop_status_watch_signals` 收口）。arm/disarm 形态已是
+    // 正确先例（先 `store(-1)` 再 close），本批只补标志。
+    let (r, w) = match homeway_core::sysfd::pipe_cloexec() {
+        Ok(v) => (
+            std::os::fd::IntoRawFd::into_raw_fd(v.0),
+            std::os::fd::IntoRawFd::into_raw_fd(v.1),
+        ),
+        Err(e) => {
+            eprintln!("homeway: 信号管道建立失败（{e}）——watch 退出");
+            std::process::exit(1);
+        }
+    };
+    let fds = [r, w];
     // 读端非阻塞（评审 r2-1：阻塞读端曾令主循环每轮末尾挂死——事件/断开全冻结）。
     unsafe {
         let fl = libc::fcntl(fds[0], libc::F_GETFL);

@@ -102,9 +102,14 @@ pub fn parse_listen(v: &str) -> Option<SocketAddr> {
     v.parse().ok()
 }
 
-/// relay 角色装配产物（统一进程与前台单角色共用）：停止位 fd + 运行线程句柄。
+/// relay 角色装配产物（统一进程与前台单角色共用）：停止管道（两端 RAII）+ 运行线程句柄。
+///
+/// Q-G F3：**每次装配新建管道**（去 `OnceLock` 单例——单例复用已关写端是「stop 后
+/// start 起来即自退」的根因，实测复现见 `docs/reviews/QG-design.md` §0.5）；
+/// `shutdown` 幂等（`stop()`/`Drop` 共用，`Option::take` 保证不可重入 ⇒ 结构上
+/// 消除「写已复用 fd 号」与「double-close」）。
 pub struct RelayProc {
-    stop_w: i32,
+    stop: Option<homeway_core::relay::StopPipe>,
     join: Option<std::thread::JoinHandle<()>>,
     /// run 线程在世位（线程出口清零——panic 也清；统一进程 supervisor 的运行期
     /// 失败判据）。
@@ -112,13 +117,54 @@ pub struct RelayProc {
 }
 
 impl RelayProc {
-    /// 停止并收线程（确定性 closeAll——Ctrl-C/SIGTERM 的统一收口）。
+    /// 停止并收线程（确定性 closeAll——Ctrl-C/SIGTERM 的统一收口；幂等）。
     pub fn stop(mut self) {
-        unsafe { libc::write(self.stop_w, b"x".as_ptr().cast(), 1) };
+        self.shutdown();
+    }
+
+    /// 收口（`stop()` 与 `Drop` 共用）：disarm（`STOP_FD = -1`）→ 恢复信号处置
+    /// （仅当本 proc 曾 arm——见下）→ 写停止字节 → join → 关两端。
+    ///
+    /// **不变式（借用契约）**：`run` 借用读端裸值（[`StopPipe::read_fd`]）且从不
+    /// close ⇒ 必须**先 join 再关两端**（本函数顺序即此）。
+    ///
+    /// **SIG_DFL 恢复的适用范围**（实现期对设计 §2-F3.2 的收窄，双处登记见
+    /// `docs/reviews/QG.md` §2 与 §4）：只在本 proc 曾 `arm_signal`（前台单角色形态）
+    /// 时恢复——统一进程不装 relay 自己的 handler（宿主统一安装），无条件恢复会
+    /// **打掉宿主的 SIGINT/SIGTERM handler**（Ctrl-C 从「优雅收工」退化为「默认处置」）。
+    /// 注：SIG_DFL 防的是**后续**信号；in-flight handler 的窗口由「`swap(-1)` 先于
+    /// close + `join` 先于 close」兜住（N9 的原归因在此订正——见 QG.md §4）。
+    fn shutdown(&mut self) {
+        let Some(stop) = self.stop.take() else {
+            return; // 已收口（幂等）
+        };
+        // disarm：先断 handler 的写面（handler 里 `fd >= 0` 才写）
+        let armed_here = STOP_FD.swap(-1, std::sync::atomic::Ordering::SeqCst) >= 0;
+        if armed_here {
+            unsafe {
+                libc::signal(libc::SIGTERM, libc::SIG_DFL);
+                libc::signal(libc::SIGINT, libc::SIG_DFL);
+            }
+        }
+        stop.signal();
         if let Some(h) = self.join.take() {
             let _ = h.join();
         }
-        unsafe { libc::close(self.stop_w) };
+        // 两端随 StopPipe drop 关（join 已完成、handler 已 disarm ⇒ 关闭顺序无副作用）。
+        // **窗口归因订正（代码门⑤）**：in-flight handler 的「写已关号」窗口由
+        // 「`swap(-1)` 先于 close + join 先于 close」这对顺序兜住；SIG_DFL 只防
+        // **后续**信号落到宿主/relay handler 上（不是关 in-flight 窗口的手段）。
+    }
+
+    /// 把停止管道写端交给信号 handler（**只在前台单角色调用**；armed 状态由
+    /// `STOP_FD >= 0` 单源表达——不设 `armed` 布尔字段）。
+    /// 未 armed 窗口（装配后 ~ 本调用前）由前台循环的「`exited()` 判失败 +
+    /// `SIGNAL_HIT` 判信号」兜底，不会漏 Ctrl-C。
+    pub fn arm_signal(&self) {
+        STOP_FD.store(
+            self.stop.as_ref().map(|s| s.write_fd()).unwrap_or(-1),
+            std::sync::atomic::Ordering::SeqCst,
+        );
     }
 
     /// 在世位的共享句柄（supervisor 看护用——proc 本体留在宿主表内被 stop 消费；
@@ -135,15 +181,9 @@ impl RelayProc {
 
 impl Drop for RelayProc {
     /// 兜底收口（评审 r2-E：无 Drop 时宿主覆盖/丢弃表项 = stop 管道 fd 泄漏；
-    /// 显式 stop() 先走、Drop 幂等——write 对已关 fd 只 EBADF）。
+    /// F3：与 `stop()` 共用幂等 `shutdown`——不再有 double-write/double-close）。
     fn drop(&mut self) {
-        unsafe {
-            libc::write(self.stop_w, b"x".as_ptr().cast(), 1);
-            if let Some(h) = self.join.take() {
-                let _ = h.join();
-            }
-            libc::close(self.stop_w);
-        }
+        self.shutdown();
     }
 }
 
@@ -209,8 +249,12 @@ pub fn assemble_relay(
         }
     };
     // 只建 pipe、不装信号 handler（统一进程形态：信号 handler 由宿主统一安装——
-    // 装配期覆盖宿主 handler 会造成「relay 收工、主线程挂等」的半死窗口，评审 r1-Z5）
-    let (stop_r, stop_w) = new_stop_pipe();
+    // 装配期覆盖宿主 handler 会造成「relay 收工、主线程挂等」的半死窗口，评审 r1-Z5）。
+    // Q-G F3：管道**每次装配新建**（去单例）；读端裸值交 run（借用契约），
+    // 两端所有权归 RelayProc（shutdown 先 join 再关）。
+    let stop = homeway_core::relay::StopPipe::new()
+        .map_err(|e| format!("relay stop 管道建立失败：{e}"))?;
+    let stop_r = stop.read_fd();
     let exited = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let exited_t = Arc::clone(&exited);
     let join = std::thread::Builder::new()
@@ -231,7 +275,7 @@ pub fn assemble_relay(
             }
         })
         .expect("spawn relay");
-    Ok(RelayProc { stop_w, join: Some(join), exited })
+    Ok(RelayProc { stop: Some(stop), join: Some(join), exited })
 }
 
 /// `homeway-cli relay [...]`：前台中继（Ctrl-C / SIGTERM 收工——确定性 closeAll）。
@@ -298,29 +342,24 @@ pub fn cmd_relay(args: &[String]) {
         }
     };
     println!("（relay 前台运行中——Ctrl-C 收工）");
-    stop_pipe(); // 装 handler（前台形态；pipe 已在装配时建好）
+    // 前台形态：装 handler（**单通道**——信号 → 写 stop 管道 → run 醒 → 收工；
+    // F3 删掉「前台另读同一根管道」的双读者竞态），随后把写端交给 handler。
+    install_relay_stop_signal();
+    proc.arm_signal();
     // 评审 r2-4：run 失败不再 exit(1) 后，前台等待必须双看——只等信号会把
     // 「run 早失败」退化成无输出挂死（RelayLog::logf 只进 relay.log 不进终端）。
-    // 形态：poll stop 管道（非阻塞）+ exited 位；任一先到即收。
-    {
-        let (r, _) = *STOP_PIPE.get().expect("stop_pipe 已装");
-        unsafe {
-            let fl = libc::fcntl(r, libc::F_GETFL);
-            libc::fcntl(r, libc::F_SETFL, fl | libc::O_NONBLOCK);
+    // Q-G F3：等待面 = 信号标志 + `exited()` 位（不再 poll stop 管道——那是 run
+    // 的通道，双读者会抢字节）。
+    loop {
+        if SIGNAL_HIT.load(std::sync::atomic::Ordering::SeqCst) {
+            break; // 正常 Ctrl-C/SIGTERM 路径（run 侧已由 handler 写醒）
         }
-        loop {
-            let mut b = [0u8; 8];
-            let n = unsafe { libc::read(r, b.as_mut_ptr().cast(), b.len()) };
-            if n > 0 {
-                break; // 信号
-            }
-            if proc.exited() {
-                eprintln!("relay: 运行失败已收线（细节见 cache/relay.log）——前台退出");
-                proc.stop();
-                std::process::exit(1);
-            }
-            std::thread::sleep(std::time::Duration::from_millis(200));
+        if proc.exited() {
+            eprintln!("relay: 运行失败已收线（细节见 cache/relay.log）——前台退出");
+            proc.stop();
+            std::process::exit(1);
         }
+        std::thread::sleep(std::time::Duration::from_millis(200));
     }
     proc.stop();
 }
@@ -358,7 +397,13 @@ fn parse_relay_section(body: &str) -> Result<FileConfig, String> {
 
 static STOP_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
+/// 前台形态收到 SIGINT/SIGTERM 的标志（单通道形态的「正常收工」判据——handler
+/// 与前台等待循环的唯一共享面；统一进程不装该 handler，故此标志恒 false）。
+static SIGNAL_HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 extern "C" fn on_stop_signal(_sig: i32) {
+    // handler 只做两件事：置命中标志 + （若已 armed）写停止字节。
+    SIGNAL_HIT.store(true, std::sync::atomic::Ordering::SeqCst);
     let fd = STOP_FD.load(std::sync::atomic::Ordering::SeqCst);
     if fd >= 0 {
         unsafe {
@@ -368,25 +413,47 @@ extern "C" fn on_stop_signal(_sig: i32) {
     }
 }
 
-static STOP_PIPE: std::sync::OnceLock<(i32, i32)> = std::sync::OnceLock::new();
-
-/// 建 stop pipe（不装 handler——装配与信号安装分离，见 assemble_relay 注释）。
-fn new_stop_pipe() -> (i32, i32) {
-    *STOP_PIPE.get_or_init(|| unsafe {
-        let mut fds = [0i32; 2];
-        libc::pipe(fds.as_mut_ptr());
-        (fds[0], fds[1])
-    })
-}
-
-/// 前台单角色形态：装信号 handler（Ctrl-C/SIGTERM → relay stop pipe）。
-fn stop_pipe() -> (i32, i32) {
-    let (r, w) = new_stop_pipe();
-    STOP_FD.store(w, std::sync::atomic::Ordering::SeqCst);
+/// 前台单角色形态：装信号 handler（Ctrl-C/SIGTERM → relay stop 管道）。
+/// **统一进程不调用**（handler 由宿主统一安装——装配期覆盖宿主 handler 会造成
+/// 「relay 收工、主线程挂等」的半死窗口，评审 r1-Z5）。停止管道本体在
+/// `assemble_relay` 建（`RelayProc` 持有），此处只把写端交给 handler。
+fn install_relay_stop_signal() {
     unsafe {
         let h = on_stop_signal as extern "C" fn(i32) as libc::sighandler_t;
         libc::signal(libc::SIGTERM, h);
         libc::signal(libc::SIGINT, h);
     }
-    (r, w)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::Ordering as AOrd;
+
+    /// Q-G F3（CLI 层）：`STOP_FD` 的 arm/disarm 单源 + `shutdown` 幂等。
+    ///
+    /// - `arm_signal()` → `STOP_FD == 写端号`；
+    /// - `shutdown()` → `STOP_FD == -1`（disarm，且此后 handler 写面关闭）；
+    /// - 再 `shutdown()`（幂等）与随后的 `drop` 不 panic、不双写不双关。
+    ///
+    /// **单函数内跑**：`STOP_FD`/`SIGNAL_HIT` 是进程级 static（拆两个测试会互踩）。
+    #[test]
+    fn relay_proc_shutdown_is_idempotent_and_disarms_stop_fd() {
+        let stop = homeway_core::relay::StopPipe::new().unwrap();
+        let w_fd = stop.write_fd();
+        let mut proc = RelayProc {
+            stop: Some(stop),
+            join: None, // 无 run 线程：只测 arm/shutdown 结构面
+            exited: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+        };
+        proc.arm_signal();
+        assert_eq!(STOP_FD.load(AOrd::SeqCst), w_fd, "arm 后 STOP_FD = 写端号");
+        assert!(proc.exited(), "exited 位透传");
+        proc.shutdown();
+        assert_eq!(STOP_FD.load(AOrd::SeqCst), -1, "shutdown 后必须 disarm");
+        assert!(proc.stop.is_none(), "两端已 take（结构断言，不用 F_GETFD 判 EBADF）");
+        proc.shutdown(); // 幂等：再来一次不 panic
+        drop(proc); // Drop 走同一 shutdown：同样幂等
+        assert_eq!(STOP_FD.load(AOrd::SeqCst), -1);
+    }
 }

@@ -198,7 +198,24 @@ impl EndpointCache {
             std::process::id(),
             now.duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0),
         ));
-        std::fs::write(&tmp, &raw)?;
+        // Q-G F4（B 组新增）：**创建即 0600** + fchmod 归一——旧形态是裸
+        // `fs::write`（完全无权限收紧）；Go = `os.WriteFile(tmp, raw, 0o600)`
+        // （`endpointcache.go:290`）⇒ 移植回退面收口（内容 = 学到的候选端点）。
+        // 失败**告警不阻断**（代码门②：与 state.rs 的告警形态一致）。
+        {
+            use std::io::Write as _;
+            use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?;
+            if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+                eprintln!("homeway: ⚠️ 端点缓存 {} 收紧 0600 失败（{e}）——建议手工 chmod", tmp.display());
+            }
+            f.write_all(&raw)?;
+        }
         match std::fs::rename(&tmp, &p) {
             Ok(()) => {
                 self.last_raw = String::from_utf8_lossy(&raw).into_owned();
@@ -578,6 +595,29 @@ mod tests {
         c2.merge_disk();
         assert_eq!(c2.entries.len(), 1, "merge_disk 自身必须 trim（真断言）");
         assert!(c2.entries(t0 + Duration::from_secs(31)).len() <= 1, "出口截断兜底");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Q-G F4（B 组新增）：端点缓存落盘文件 = **0600**（旧形态裸 `fs::write` 无权限
+    /// 收紧；Go = `os.WriteFile(tmp, raw, 0o600)`）。
+    #[test]
+    fn save_artifact_is_0600() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = std::env::temp_dir().join(format!("hw-epc-perm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let peer = crate::token::PeerId::from([0x22u8; 32]);
+        let mut c = EndpointCache::open(&dir, peer);
+        c.observe(addr(7), EndpointSource::Probe, t0);
+        c.save(t0 + Duration::from_secs(1)).unwrap();
+        let p = c.path().expect("有 dir");
+        assert!(p.exists(), "缓存文件应在 {}", p.display());
+        assert_eq!(
+            std::fs::metadata(&p).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "端点缓存产物必须 0600"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

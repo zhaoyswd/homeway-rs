@@ -23,7 +23,7 @@ pub mod rltoken;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
-use std::os::fd::AsRawFd as _;
+use std::os::fd::{AsRawFd as _, OwnedFd};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -265,6 +265,66 @@ fn bump_sock_bufs(sock: &UdpSocket) {
     }
 }
 
+/// relay 停止管道的 RAII 具名形态（Q-G F3）：**每次新建**（去 `OnceLock` 单例——
+/// 单例复用已关写端是「stop 后 start 立即自退」的根因，实测复现见设计 §0.5）。
+///
+/// 所有权：两端都归本结构；`read_fd()` 只把**裸值**交给 `Relay::run`（该处是
+/// 「借用、不 close」契约——`BorrowedFd` 过不了 `thread::spawn` 的 `'static`）。
+/// 收工不变式：**先 join 再关两端**（调用方 `RelayProc::shutdown` 保证）。
+pub struct StopPipe {
+    r: OwnedFd,
+    w: OwnedFd,
+}
+
+impl StopPipe {
+    /// 新建（两端 CLOEXEC——`sysfd::pipe_cloexec`）。
+    pub fn new() -> io::Result<Self> {
+        let (r, w) = crate::sysfd::pipe_cloexec()?;
+        Ok(Self { r, w })
+    }
+
+    /// 读端裸值（交 `Relay::run` 的 `stop_fd`——所有权仍在本结构）。
+    pub fn read_fd(&self) -> i32 {
+        self.r.as_raw_fd()
+    }
+
+    /// 写端裸值（CLI 的信号 handler 把 `STOP_FD` 指向它——arm/disarm 面）。
+    pub fn write_fd(&self) -> i32 {
+        self.w.as_raw_fd()
+    }
+
+    /// 写一个停止字节（EAGAIN/EBADF 忽略——合并位语义，写满即已有待收信号）。
+    pub fn signal(&self) {
+        unsafe { libc::write(self.w.as_raw_fd(), b"x".as_ptr().cast(), 1) };
+    }
+}
+
+/// wake 写端的**共享所有权**（Q-G F3）：握手线程持 `Arc` 克隆，写与关都经同一把
+/// 锁 ⇒ 消「i32 值拷贝裸写」与「写已复用 fd 号」；`take()` 保证关恰好一次。
+struct WakeHandle {
+    fd: std::sync::Mutex<Option<OwnedFd>>,
+}
+
+impl WakeHandle {
+    fn new(fd: OwnedFd) -> Self {
+        Self { fd: std::sync::Mutex::new(Some(fd)) }
+    }
+
+    /// 写唤醒字节（写端非阻塞——N3：合关位语义下 EAGAIN 丢弃无害，且不会阻塞
+    /// 在锁内）。
+    fn wake(&self) {
+        let g = crate::syncutil::lock_unpoison(&self.fd);
+        if let Some(fd) = g.as_ref() {
+            unsafe { libc::write(fd.as_raw_fd(), b"x".as_ptr().cast(), 1) };
+        }
+    }
+
+    /// 关写端（幂等：`take()` 后 `wake()` 是空操作，不再写、不再关）。
+    fn close(&self) {
+        let _ = crate::syncutil::lock_unpoison(&self.fd).take();
+    }
+}
+
 /// 中继实例（`run` = 驱动线程本体，阻塞到 stop）。
 pub struct Relay {
     cfg: Config,
@@ -281,7 +341,6 @@ pub struct Relay {
     handshaking: Arc<AtomicI32>,
     established: Arc<AtomicI32>,
     msg_tx: mpsc::Sender<Msg>,
-    wake_w: i32,
     /// poll 集成员已变（会话/连接/腿的增删）——下一轮重建。
     poll_dirty: bool,
     /// 控制面（TCP 同号口）是否就绪（F10：bind 失败 = 纯 UDP 降级，探针 flags 报降级位）。
@@ -314,7 +373,6 @@ impl Relay {
             handshaking: Arc::new(AtomicI32::new(0)),
             established: Arc::new(AtomicI32::new(0)),
             msg_tx,
-            wake_w: -1,
             poll_dirty: false,
             ctl_ok: false,
             reject_log: HashMap::new(),
@@ -347,6 +405,11 @@ impl Relay {
     /// 驱动线程本体：监听并服务直到 stop 信号（stop_fd 上可读字节）。
     /// `on_ready(实际端口)` 在 UDP 绑定成功后回调一次（token 必须在**实际端口**
     /// 确定后生成——Go RunWithReady 同义）。
+    ///
+    /// **`stop_fd` 借用契约**（Q-G F3/U3）：本函数只 poll/读它，**绝不 close**
+    /// ——所有权在调用方的 `StopPipe`；收工不变式 = 「先 join 本线程、再关两端」
+    /// （`relay_cli::RelayProc::shutdown`）。`BorrowedFd` 过不了 `thread::spawn`
+    /// 的 `'static`，故这里收裸值。
     pub fn run(mut self, stop_fd: i32, on_ready: impl FnOnce(u16)) -> io::Result<()> {
         let udp = Self::listen_with_fallback(self.cfg.listen, &self.cfg.logf)?;
         bump_sock_bufs(&udp);
@@ -396,15 +459,22 @@ impl Relay {
             self.cfg.max_legs
         ));
 
-        // 唤醒管道（握手线程交接 / 测试注入）
-        let mut wake_fds = [0i32; 2];
-        unsafe {
-            if libc::pipe(wake_fds.as_mut_ptr()) != 0 {
-                return Err(io::Error::last_os_error());
+        // 唤醒管道（握手线程交接 / 测试注入）。
+        // F1：CLOEXEC 创建即落（linux/OHOS 原子 `pipe2`；darwin 建后立即补）。
+        // F3：读端 = 局部 `OwnedFd`（随 `run` 作用域 RAII 关——替代手写 close）；
+        // 写端 = `Arc<WakeHandle>`（握手线程持克隆，锁内写/关——消 i32 值拷贝裸写）。
+        let (wake_r, wake_w) = crate::sysfd::pipe_cloexec()?;
+        // 读端非阻塞（排空循环）；写端非阻塞（N3：写满即丢弃——合并位语义，且
+        // `WakeHandle::wake` 持锁写不得阻塞）。
+        for fd in [wake_r.as_raw_fd(), wake_w.as_raw_fd()] {
+            unsafe {
+                let fl = libc::fcntl(fd, libc::F_GETFL);
+                if fl < 0 || libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
+                    return Err(io::Error::last_os_error());
+                }
             }
-            libc::fcntl(wake_fds[0], libc::F_SETFL, libc::O_NONBLOCK);
         }
-        self.wake_w = wake_fds[1];
+        let wake = Arc::new(WakeHandle::new(wake_w));
         let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
         self.msg_tx = msg_tx;
 
@@ -432,7 +502,7 @@ impl Relay {
                     sources.push(src);
                 };
                 push(stop_fd, PollSource::Stop);
-                push(wake_fds[0], PollSource::Wakeup);
+                push(wake_r.as_raw_fd(), PollSource::Wakeup);
                 push(udp.as_raw_fd(), PollSource::Udp);
                 if let Some(ln) = &ctl_ln {
                     push(ln.as_raw_fd(), PollSource::TcpListener);
@@ -466,7 +536,10 @@ impl Relay {
             events.clear();
             let mut stop = false;
             for (pf, src) in pollfds.iter().zip(&sources) {
-                if pf.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0 {
+                // F3 防御一行：`POLLNVAL` 同样算事件（读端若先被关，poll 立返 NVAL
+                // 而不匹配任何位 ⇒ 满核忙转）——stop 管道与唤醒管道都在此覆盖。
+                if pf.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+                {
                     if *src == PollSource::Stop {
                         stop = true;
                     } else {
@@ -478,7 +551,7 @@ impl Relay {
                 match src {
                     PollSource::Wakeup => {
                         let mut b = [0u8; 64];
-                        while unsafe { libc::read(wake_fds[0], b.as_mut_ptr().cast(), 64) } > 0 {}
+                        while unsafe { libc::read(wake_r.as_raw_fd(), b.as_mut_ptr().cast(), 64) } > 0 {}
                         while let Ok(m) = msg_rx.try_recv() {
                             match m {
                                 Msg::HandshakeDone(r) => self.handshake_done(r),
@@ -500,7 +573,7 @@ impl Relay {
                     PollSource::TcpListener => {
                         if let Some(ln) = &ctl_ln {
                             while let Ok((s, remote)) = ln.accept() {
-                                self.accept_ctl(s, remote);
+                                self.accept_ctl(s, remote, &wake);
                             }
                         }
                     }
@@ -578,12 +651,10 @@ impl Relay {
         for (label, sid) in release_list {
             self.release_session(label, sid);
         }
-        // 收工关两端（评审 低-13：只关写端会泄读端 fd + 在飞握手线程可能写到
-        // 已复用的 fd 号上）
-        unsafe {
-            libc::close(wake_fds[1]);
-            libc::close(wake_fds[0]);
-        }
+        // 收工关唤醒写端（F3：`WakeHandle::close()` 锁内 take——在飞握手线程此后
+        // 不再写、不再关；替代旧「手写 double close」）。**必须在读端 drop 之前**：
+        // 先断写端 ⇒ 无「写无读者管道」的 SIGPIPE 面。读端随本函数作用域 RAII 关。
+        wake.close();
         Ok(())
     }
 
@@ -1142,7 +1213,9 @@ impl Relay {
     // ---------- 控制面 ----------
 
     /// TCP 接入：握手并发槽检查 → spawn 短命握手线程（RAII 槽）。
-    fn accept_ctl(&mut self, stream: std::net::TcpStream, remote: SocketAddr) {
+    /// `wake` = wake 写端共享句柄（F3：握手线程持 `Arc` 克隆——所有权共享，
+    /// 收工由 `WakeHandle::close()` 统一收口，无「写已复用 fd 号」面）。
+    fn accept_ctl(&mut self, stream: std::net::TcpStream, remote: SocketAddr, wake: &Arc<WakeHandle>) {
         match ctlface::HandshakeSlot::acquire(&self.handshaking) {
             Some(mut slot) => {
                 let secret = self.cfg.secret;
@@ -1150,7 +1223,7 @@ impl Relay {
                 let max_ctl = self.cfg.max_ctl_conns;
                 let logf = Arc::clone(&self.cfg.logf);
                 let tx = self.msg_tx.clone();
-                let wake_w = self.wake_w;
+                let wake = Arc::clone(wake);
                 std::thread::Builder::new()
                     .name("relay-hs".into())
                     .stack_size(512 * 1024)
@@ -1158,7 +1231,7 @@ impl Relay {
                         let r = ctlface::run_handshake(stream, secret, &established, max_ctl, &mut slot, &logf)
                             .map_err(|e| (remote, e));
                         let _ = tx.send(Msg::HandshakeDone(r));
-                        unsafe { libc::write(wake_w, b"x".as_ptr().cast(), 1) };
+                        wake.wake();
                     })
                     .ok();
             }
@@ -1593,21 +1666,101 @@ mod tests {
         }
     }
 
+    /// Q-G F3：**单例语义复刻**——同一根管道（写端已关）交给 `Relay::run`，run 必须
+    /// **立即退出**（poll 立返 `POLLHUP` ⇒ `PollSource::Stop`）。这是 §0.5 生产机制
+    /// （stop 后 start 复用同对 fd ⇒ 起来即退）的代码面复刻；per-proc 实现后该形态
+    /// 不再由生产路径产生，故本测试定位 = 机制复刻 + 文档化（真前红在 CLI 层与手工脚本）。
+    #[test]
+    fn relay_run_exits_immediately_when_stop_pipe_write_end_already_closed() {
+        let StopPipe { r, w } = StopPipe::new().unwrap();
+        let stop_r = r.as_raw_fd();
+        drop(w); // **只关写端**（读端仍开）= §0.5 的残留形态：读端处于 EOF
+        let relay = Relay::new(Config::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            None,
+            noop_logf(),
+        ));
+        let (done_tx, done_rx) = mpsc::channel::<()>();
+        let h = std::thread::Builder::new()
+            .name("relay-stop-replica".into())
+            .spawn(move || {
+                let _ = relay.run(stop_r, |_p| {});
+                let _ = done_tx.send(());
+            })
+            .unwrap();
+        assert!(
+            done_rx.recv_timeout(Duration::from_secs(3)).is_ok(),
+            "读端 EOF ⇒ run 应立返（超时 = 未收工）"
+        );
+        let _ = h.join();
+        let _ = r; // 读端所有权在本测试（run 借用不 close——见 run 文档）
+    }
+
+    /// Q-G F3：`StopPipe` **每 instanc 新建**（修前 `OnceLock` 单例恒返同一对 fd ⇒ 红），
+    /// 写端 `signal()` 后读端可读；`WakeHandle::close()` 后 `wake()` 不写不 panic，且
+    /// **号复用对抗**：close 后立刻新建管道（大概率占同号），再 `wake()`，新管道须仍空。
+    #[test]
+    fn stop_pipe_is_per_instance_and_wake_handle_never_writes_after_close() {
+        use std::os::fd::AsRawFd as _;
+
+        let a = StopPipe::new().unwrap();
+        let b = StopPipe::new().unwrap();
+        assert_ne!(
+            (a.read_fd(), a.write_fd()),
+            (b.read_fd(), b.write_fd()),
+            "两次新建必须得到不同 fd 对（单例残留 = 已关写端被复用）"
+        );
+        a.signal();
+        let mut buf = [0u8; 8];
+        let n = unsafe { libc::read(a.read_fd(), buf.as_mut_ptr().cast(), buf.len()) };
+        assert_eq!(n, 1, "signal 后读端应有 1 字节");
+        drop((a, b));
+
+        // WakeHandle：close 后 wake 不写（含 fd 号复用对抗）
+        let (r, w) = crate::sysfd::pipe_cloexec().unwrap();
+        let wake = WakeHandle::new(w);
+        wake.wake();
+        let mut b1 = [0u8; 8];
+        assert_eq!(
+            unsafe { libc::read(r.as_raw_fd(), b1.as_mut_ptr().cast(), 8) },
+            1,
+            "close 前 wake 应写入 1 字节"
+        );
+        let w_num = {
+            let g = crate::syncutil::lock_unpoison(&wake.fd);
+            g.as_ref().unwrap().as_raw_fd()
+        };
+        wake.close();
+        // 占号：新建管道（大概率复用刚关掉的写端号）+ 读端非阻塞（空读判据）
+        let (r2, w2) = crate::sysfd::pipe_cloexec().unwrap();
+        let r2_num = r2.as_raw_fd();
+        unsafe {
+            let fl = libc::fcntl(r2_num, libc::F_GETFL);
+            libc::fcntl(r2_num, libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+        wake.wake(); // close 后必须是空操作（旧 i32 值拷贝形态会写进复用号）
+        let mut b2 = [0u8; 8];
+        let n2 = unsafe { libc::read(r2_num, b2.as_mut_ptr().cast(), 8) };
+        assert_eq!(
+            (n2, std::io::Error::last_os_error().kind()),
+            (-1, std::io::ErrorKind::WouldBlock),
+            "close 后的 wake 不得写进任何 fd（写端号 {w_num} → 新管道读端 {r2_num}）"
+        );
+        let _ = w2;
+    }
+
     /// 测试形态的中继（run 在独立线程；Drop 停）。
     struct TestRelay {
         port: u16,
-        stop_w: i32,
+        stop: Option<StopPipe>,
         join: Option<std::thread::JoinHandle<()>>,
     }
 
     impl TestRelay {
         fn start(cfg: Config) -> Self {
             let (ready_tx, ready_rx) = mpsc::channel();
-            let (stop_r, stop_w) = {
-                let mut fds = [0i32; 2];
-                unsafe { libc::pipe(fds.as_mut_ptr()) };
-                (fds[0], fds[1])
-            };
+            let stop = StopPipe::new().expect("stop 管道");
+            let stop_r = stop.read_fd();
             let relay = Relay::new(cfg);
             let join = std::thread::Builder::new()
                 .name("relay-test".into())
@@ -1618,15 +1771,16 @@ mod tests {
                 })
                 .unwrap();
             let port = ready_rx.recv_timeout(Duration::from_secs(5)).expect("relay 起不来");
-            Self { port, stop_w, join: Some(join) }
+            Self { port, stop: Some(stop), join: Some(join) }
         }
 
         fn stop(&mut self) {
-            unsafe { libc::write(self.stop_w, b"x".as_ptr().cast(), 1) };
+            let Some(stop) = self.stop.take() else { return }; // 幂等
+            stop.signal();
             if let Some(h) = self.join.take() {
                 let _ = h.join();
             }
-            unsafe { libc::close(self.stop_w) };
+            // 两端随 StopPipe drop 关（先 join 再关——借用契约）
         }
     }
 

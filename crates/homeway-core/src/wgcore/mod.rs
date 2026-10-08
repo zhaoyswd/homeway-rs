@@ -50,6 +50,17 @@ pub type OnTunError = Box<dyn Fn(&str) + Send>;
 pub use crate::tunnel_addr::SERVER_TUNNEL_IP;
 /// poll 等待上限（smoltcp poll_delay 的封顶；延迟 ACK 10ms 一类栈定时器的到点保障）。
 const POLL_CAP: i32 = 250;
+/// TUN fd 的 poll 单片时长（Q-G F2）——与 Go `tunfd_unix.go` 的 poll 节拍同值。
+/// 触底语义：片到无事件 = `Ready::default()`（**不判死**——超时是健康形态）。
+pub(crate) const POLL_SLICE: Duration = Duration::from_millis(500);
+/// TUN fd 判死前的**确认拍**（Q-G F2；`n==0` 分支）。取值依据是「同一观察重复一次」
+/// 而非精确时延：HUP 下 poll 立返，不真睡就复 poll 等于没确认；50ms 足以让
+/// 「EOF 与读空交错」的瞬时形态自证（真失效的 fd 50ms 后仍报 HUP/ERR/NVAL）。
+pub(crate) const DEAD_CONFIRM_DELAY: Duration = Duration::from_millis(50);
+/// 隧道域**世代收尾**的 `Client` 停止预算（Q-G F5）：与 Q-F 的 `EXIT_RPC_BUDGET`
+/// 同值（收工链既有量级）。显式 5 处 `stop_within` 用它；`Drop for Client` 兜底
+/// 保持无界（设计 §3-D3）。
+pub(crate) const CLIENT_CLOSE_BUDGET: Duration = Duration::from_secs(2);
 /// 8s 密集 ACK 时钟：有界 drain 的**栈字节阈值**（D-3；设计 docs/reviews/R8.md
 /// §十二）。背景：smoltcp 0.14 的 ACK 策略已内建 RFC5681/Linux 风格（未确认 >
 /// 1×remote_mss ⇒ 立即 ACK；10ms delayed 兜底）且「每 poll 每 socket 至多一个
@@ -1092,11 +1103,14 @@ impl Client {
             Arc::clone(&cfg.logf),
         )?;
 
-        let mut fds = [0i32; 2];
-        if unsafe { libc::pipe(fds.as_mut_ptr()) } != 0 {
-            return Err(io::Error::last_os_error());
-        }
-        let (wake_r, wake_w) = (fds[0], fds[1]);
+        // F1：wake 管道走 sysfd 单源（linux/OHOS 原子 `pipe2(O_CLOEXEC)`；darwin 建后
+        // 立即补）——daemon 自 exec 是真实继承面（std `Command` 会继承未设 CLOEXEC 的
+        // fd，已实测）。生命周期仍是既有 i32 形状（driver 关读端、stop 关写端）。
+        let (wake_r, wake_w) = crate::sysfd::pipe_cloexec()?;
+        let (wake_r, wake_w) = (
+            std::os::fd::IntoRawFd::into_raw_fd(wake_r),
+            std::os::fd::IntoRawFd::into_raw_fd(wake_w),
+        );
         unsafe {
             libc::fcntl(wake_r, libc::F_SETFL, libc::O_NONBLOCK);
             libc::fcntl(wake_w, libc::F_SETFL, libc::O_NONBLOCK);
@@ -1496,8 +1510,10 @@ impl Client {
     }
 
     /// 收工（幂等；Drop 同义——不显式 stop 也能停线程关 fd，评审中-11）。
-    /// **无界 join**（跟随引擎自然退出）——收工预算面走 [`Self::stop_within`]
-    /// （Q-F F6-4 段 5；隧道域三条 `c.stop()` 不在五段预算内，见设计 §7-4/§7-5 登记）。
+    /// **无界 join**（跟随引擎自然退出）——收工预算面走 [`Self::stop_within`]。
+    /// 调用面（Q-G F5 起）：`Session::stop` 五段预算（Q-F F6-4 段 5）+ 隧道域五处
+    /// 显式收尾（`request_stop`/`Finish::drop`/`gen_loop` 装配窗/`rebuild_session`
+    /// 的 new·old）一律走有界版；**本无界版只留 `Drop for Client` 兜底**（设计 §3-D3）。
     /// 锁一律 `lock_unpoison`（Drop → stop 链上零 panic 面）。
     pub fn stop(&self) {
         if self.stop.swap(true, Ordering::SeqCst) {
@@ -1625,23 +1641,56 @@ fn driver(mut engine: Engine, wake_r: i32, stop: Arc<AtomicBool>) {
     let _ = io::stdout().flush();
 }
 
+/// 单 fd poll 的 **revents 派生就绪掩码**（Q-G F2）——`poll_fd` 的返回形态。
+///
+/// 三态语义（设计 §2-F2）：
+/// - `readable`/`writable` = 请求的位就绪；
+/// - `hup`/`err`/`nval` = **异常位**（判死只看这三个——darwin 上管道 EOF 恒带
+///   `POLLIN|POLLHUP` 同置，判死**不得**依赖「readable 为假」，实测见设计 §0.4）；
+/// - 全 false = **超时**（健康形态，不判死）。
+#[derive(Default, Clone, Copy, Debug)]
+struct Ready {
+    readable: bool,
+    writable: bool,
+    hup: bool,
+    err: bool,
+    nval: bool,
+}
+
 /// TUN fd 全量写（部分写回补——包写入原子性由内核 tun 语义保证，这里兜短写）。
 /// EAGAIN：OHOS 的 VPN fd 是**非阻塞**的（Go tunfd_unix.go 同款真机实证）——
 /// poll(POLLOUT) 等可写再续写。POLLOUT 等待有**总预算**（评审 r2-我-5：此前在
 /// 唯一 driver 线程里无界重试——fd 长期不可写时 Cmd::Stop 处理不了、Client::stop
 /// 的 join 挂死；超预算按超时错误收 ⇒ 卸源 + 停止位 + 错误回调）。
+///
+/// Q-G F2：预算检查**写死在循环顶**（不能只靠 `poll_fd` 的内部期限——`poll_fd`
+/// 在片到即返 `Ok`，缺了循环顶检查就会退化成无睡眠死循环）；`hup|err|nval` 就绪
+/// 即**立即出线**（不再烧满 5s 预算——理由不是 SIGPIPE：本函数唯一调用点写的是
+/// tun 字符设备，SIGPIPE 只在写「无读者的 pipe/socket」时产生）。
 fn write_fd_all(fd: i32, mut buf: &[u8]) -> io::Result<()> {
     const WRITE_BUDGET: Duration = Duration::from_secs(5);
     let deadline = Instant::now() + WRITE_BUDGET;
     while !buf.is_empty() {
+        if Instant::now() >= deadline {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                "tun fd 写等待超预算",
+            ));
+        }
         let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
         if n < 0 {
             let e = io::Error::last_os_error();
             match e.kind() {
                 io::ErrorKind::Interrupted => continue,
                 io::ErrorKind::WouldBlock => {
-                    poll_fd(fd, libc::POLLOUT, deadline)?;
-                    continue;
+                    let r = poll_fd(fd, libc::POLLOUT, deadline)?;
+                    if r.hup || r.err || r.nval {
+                        return Err(io::Error::new(
+                            io::ErrorKind::BrokenPipe,
+                            "tun fd 已失效（POLLHUP/POLLERR/POLLNVAL）——立即出线",
+                        ));
+                    }
+                    continue; // writable 或超时 ⇒ 回循环顶复检期限
                 }
                 _ => return Err(e),
             }
@@ -1651,14 +1700,16 @@ fn write_fd_all(fd: i32, mut buf: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
-/// 单 fd poll 等待（500ms 片——与 Go tunfd 的 poll 节拍同值；EINTR 重试；到总预算
-/// 返回 TimedOut）。
-fn poll_fd(fd: i32, events: i16, deadline: Instant) -> io::Result<()> {
+/// 单 fd poll 等待（片长 `POLL_SLICE`；EINTR 内部重试；到 `deadline` 返 `TimedOut`；
+/// 片到无事件 = `Ready::default()`）。`r > 0` 但只有未知位（`POLLPRI`/`POLLRDHUP`
+/// 等）⇒ 保守按 `err` 处置（Q-G F2：比忙转安全）。
+fn poll_fd(fd: i32, events: libc::c_short, deadline: Instant) -> io::Result<Ready> {
     loop {
-        if Instant::now() >= deadline {
+        let now = Instant::now();
+        if now >= deadline {
             return Err(io::Error::new(
                 io::ErrorKind::TimedOut,
-                "tun fd 等待可写超预算",
+                "tun fd 等待超预算",
             ));
         }
         let mut pfd = libc::pollfd {
@@ -1666,24 +1717,48 @@ fn poll_fd(fd: i32, events: i16, deadline: Instant) -> io::Result<()> {
             events,
             revents: 0,
         };
-        let r = unsafe { libc::poll(&mut pfd, 1, 500) };
+        let slice = POLL_SLICE.min(deadline.saturating_duration_since(now));
+        let ms = slice.as_millis().min(i32::MAX as u128) as i32;
+        let r = unsafe { libc::poll(&mut pfd, 1, ms) };
         if r < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
-                continue;
+                continue; // EINTR 内部重试（调用方不感知——读/写两侧都无此分支）
             }
             return Err(e);
         }
-        return Ok(());
+        if r == 0 {
+            return Ok(Ready::default()); // 片到无事件：超时，不判死
+        }
+        let rev = pfd.revents;
+        let mut ready = Ready {
+            readable: rev & libc::POLLIN != 0,
+            writable: rev & libc::POLLOUT != 0,
+            hup: rev & libc::POLLHUP != 0,
+            err: rev & libc::POLLERR != 0,
+            nval: rev & libc::POLLNVAL != 0,
+        };
+        if !ready.readable && !ready.writable && !ready.hup && !ready.err && !ready.nval {
+            ready.err = true; // 只认出未知位 ⇒ 保守异常
+        }
+        return Ok(ready);
     }
 }
 
 /// TUN 读循环（应用出站方向）：裸 read → 计数 → 投 TunPacket 给 driver encap。
 /// **OHOS 的 VPN fd 是非阻塞的**（Go tunfd_unix.go 真机实证——裸读立即返回
-/// EAGAIN，被当错误上报会当场把健康隧道判死）：EAGAIN → poll(POLLIN, 500ms) →
+/// EAGAIN，被当错误上报会当场把健康隧道判死）：EAGAIN → poll(POLLIN, 一片) →
 /// 再读；stop 位在 poll 片界检查（引擎收工后 ≤~500ms 内退出）。
 /// 投包后**写 wake 管道**（我-4：driver 的 poll 超时上限 250ms——不写管道时上行
 /// 每串包最长排队一拍；Go 是 channel 直接唤醒 wireguard-go 读循环，无此延迟）。
+///
+/// Q-G F2 语义（v3）：
+/// - **判死只看 `hup||err||nval`**（不看 readable——darwin 上 EOF 恒带 `POLLIN`）；
+/// - EAGAIN 分支**可读优先**（`readable` ⇒ 立即回读，不丢最后一包；HUP/ERR 不
+///   在这里判死，落到下一轮 `read` 由既有两条路径定性）；
+/// - `n==0` 分支判死前**确认一拍**（真睡眠 `DEAD_CONFIRM_DELAY` 后复 poll）；
+/// - 超时（片到无事件）一律 continue（健康形态）。
+///
 /// 退出路径：fd 失效报错（EBADF/EINVAL = 扩展 destroy）/ stop 位 / channel 断
 /// （driver 已死）。
 fn tun_read_loop(
@@ -1706,20 +1781,23 @@ fn tun_read_loop(
                     }
                 }
                 io::ErrorKind::WouldBlock => {
-                    // 非阻塞 fd 的常态：等 POLLIN（500ms 片——stop 位在片界检查）
-                    if let Err(pe) = poll_fd(
-                        fd,
-                        libc::POLLIN,
-                        Instant::now() + Duration::from_millis(500),
-                    ) {
-                        if pe.kind() == io::ErrorKind::Interrupted {
-                            continue;
+                    // 非阻塞 fd 的常态：等 POLLIN（片界检查 stop）。
+                    match poll_fd(fd, libc::POLLIN, Instant::now() + POLL_SLICE) {
+                        // 可读优先（含 POLLIN|POLLHUP 同置：先读，下一轮 read 返 0
+                        // 才走确认拍）；hup/err/nval 也不在此判死——回循环顶再 read
+                        // 一次，由 read 的返回值（数据 / 0 / errno）定性；片到无事件
+                        // （`Ready::default()`）同样继续。
+                        Ok(_ready) => {}
+                        Err(pe) if pe.kind() == io::ErrorKind::TimedOut => {
+                            // 片到（含 EINTR 重试耗尽片）：超时不判死
                         }
-                        logf(&format!("tun fd poll 失败：{pe}（标记隧道不健康）"));
-                        let _ = cmd_tx.send(Cmd::TunFdDead {
-                            msg: format!("tun fd poll 失败：{pe}"),
-                        });
-                        return;
+                        Err(pe) => {
+                            logf(&format!("tun fd poll 失败：{pe}（标记隧道不健康）"));
+                            let _ = cmd_tx.send(Cmd::TunFdDead {
+                                msg: format!("tun fd poll 失败：{pe}"),
+                            });
+                            return;
+                        }
                     }
                     if stop.load(Ordering::SeqCst) {
                         return;
@@ -1737,15 +1815,41 @@ fn tun_read_loop(
             continue;
         }
         if n == 0 {
-            // n==0 不判死（评审 r2-我-8：Go 是 continue——TUN 设备的 0 字节读是可
-            // 复现的空读形态，静默 return 会「看着健康、上行全丢」；随后 poll 一片
-            // 防非阻塞 fd 上的热自旋）
-            poll_fd(
-                fd,
-                libc::POLLIN,
-                Instant::now() + Duration::from_millis(500),
-            )
-            .ok();
+            // n==0：EOF/空读形态。判死**只看 hup||err||nval**（darwin 上 EOF 恒带
+            // POLLIN——旧「且无 readable」条件永不成立 ⇒ 热自旋），且判死前**确认
+            // 一拍**（真睡眠后复 poll：HUP 下 poll 立返，不真睡等于没确认）。
+            let first = poll_fd(fd, libc::POLLIN, Instant::now() + POLL_SLICE);
+            let (dead, readable) = match &first {
+                Ok(r) => (r.hup || r.err || r.nval, r.readable),
+                Err(pe) if pe.kind() == io::ErrorKind::TimedOut => (false, false),
+                Err(_) => (true, false), // poll 本身失败（EBADF/EIO…）⇒ 判死
+            };
+            let dead = if dead {
+                std::thread::sleep(DEAD_CONFIRM_DELAY);
+                match poll_fd(fd, libc::POLLIN, Instant::now() + POLL_SLICE) {
+                    Ok(r) => r.hup || r.err || r.nval,
+                    Err(pe) if pe.kind() == io::ErrorKind::TimedOut => false,
+                    Err(_) => true,
+                }
+            } else {
+                false
+            };
+            if dead {
+                let msg = "tun fd 已失效（POLLHUP/POLLERR/POLLNVAL，确认一拍后仍成立）";
+                logf(&format!("{msg}（标记隧道不健康）"));
+                let _ = cmd_tx.send(Cmd::TunFdDead { msg: msg.to_owned() });
+                return;
+            }
+            // **地板睡眠**（代码门③）：「read 返 0 且 poll 立返 POLLIN（可读但空）」
+            // 的形态若无睡眠就是 100% CPU 热自旋（旧形态同样如此；OHOS VPN fd 的
+            // 空读语义本仓不可取证 ⇒ 一行成本兜底）。超时形态（poll 已睡满片）与
+            // HUP 形态不走这里。
+            if readable {
+                std::thread::sleep(DEAD_CONFIRM_DELAY);
+            }
+            if stop.load(Ordering::SeqCst) {
+                return;
+            }
             continue;
         }
         let mut n = n as usize;
@@ -1790,6 +1894,222 @@ fn now_unix_nanos() -> i64 {
 mod tests {
     use super::*;
     use boringtun::x25519::StaticSecret;
+
+    // ---------- Q-G F2：poll_fd / write_fd_all / tun_read_loop 语义 ----------
+
+    fn noop_logf() -> Arc<dyn Fn(&str) + Send + Sync> {
+        Arc::new(|_s: &str| {})
+    }
+
+    fn pipe_pair() -> (i32, i32) {
+        let (r, w) = crate::sysfd::pipe_cloexec().unwrap();
+        (
+            std::os::fd::IntoRawFd::into_raw_fd(r),
+            std::os::fd::IntoRawFd::into_raw_fd(w),
+        )
+    }
+
+    fn set_nonblocking(fd: i32) {
+        unsafe {
+            let fl = libc::fcntl(fd, libc::F_GETFL);
+            libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+    }
+
+    /// F2：`Ready` 四态掩码——超时全 false；**数据可读 ⇒ `readable`**；**空管道
+    /// （可写）⇒ `writable`**（正向断言——两个位不得是装饰字段）；关写端后读端
+    /// `hup`（**只断言 hup**，darwin 上 `readable` 恒真）；`nval` 用**高位号**
+    /// 构造（低位号会被并行测试复用 ⇒ 假红）。
+    #[test]
+    fn poll_fd_ready_masks() {
+        // ① 空管道（写端在）⇒ 超时 = 全 false（健康形态，不判死）
+        let (r, w) = pipe_pair();
+        let ready = poll_fd(r, libc::POLLIN, Instant::now() + Duration::from_millis(120)).unwrap();
+        assert_eq!(
+            (ready.readable, ready.writable, ready.hup, ready.err, ready.nval),
+            (false, false, false, false, false),
+            "空管道超时必须是全 false 掩码"
+        );
+
+        // ①b 正向位：空管道写端 ⇒ writable=true；有数据读端 ⇒ readable=true
+        let ready = poll_fd(w, libc::POLLOUT, Instant::now() + Duration::from_millis(500)).unwrap();
+        assert!(ready.writable, "空管道写端必须报 writable（got {ready:?}）");
+        assert!(
+            unsafe { libc::write(w, b"x".as_ptr().cast(), 1) } == 1,
+            "写 1 字节"
+        );
+        let ready = poll_fd(r, libc::POLLIN, Instant::now() + Duration::from_millis(500)).unwrap();
+        assert!(ready.readable, "有数据的读端必须报 readable（got {ready:?}）");
+
+        // ② 关写端 ⇒ 读端 hup（darwin：EOF 与 POLLIN 同置——不断言 readable 假）
+        unsafe { libc::close(w) };
+        let ready = poll_fd(r, libc::POLLIN, Instant::now() + Duration::from_millis(500)).unwrap();
+        assert!(ready.hup, "关写端后读端必须报 hup（got {ready:?}）");
+
+        // ③ 写满管道 ⇒ 写端 writable（EAGAIN 形态）
+        let (r2, w2) = pipe_pair();
+        set_nonblocking(w2);
+        let chunk = [0u8; 4096];
+        let mut guard = 0;
+        loop {
+            let n = unsafe { libc::write(w2, chunk.as_ptr().cast(), chunk.len()) };
+            if n < 0 {
+                break; // EAGAIN：已满
+            }
+            guard += 1;
+            assert!(guard < 10_000, "管道写不满？");
+        }
+        let ready = poll_fd(w2, libc::POLLOUT, Instant::now() + Duration::from_millis(200)).unwrap();
+        // 写满且读端不读 ⇒ 既非 writable 也无 hup/err ⇒ 超时（全 false）是合法形态；
+        // 但**不得**报 hup/err/nval（否则写侧会立即误出线）。
+        assert!(
+            !ready.hup && !ready.err && !ready.nval,
+            "满管道写端不得报异常位（got {ready:?}）"
+        );
+        unsafe {
+            libc::close(r2);
+            libc::close(w2);
+        }
+
+        // ④ nval：dup2 到高位号（≥900）→ 关它 → poll 该号
+        let (r3, w3) = pipe_pair();
+        let hi = 900;
+        assert!(unsafe { libc::dup2(r3, hi) } >= 0, "dup2 到高位号");
+        unsafe { libc::close(hi) };
+        let ready = poll_fd(hi, libc::POLLIN, Instant::now() + Duration::from_millis(200)).unwrap();
+        assert!(ready.nval, "已关的高位 fd 必须报 nval（got {ready:?}）");
+        unsafe {
+            libc::close(r3);
+            libc::close(w3);
+        }
+    }
+
+    /// F2（U1 守卫用例）：**永不可写且无 HUP** 的 fd（读端不读、写端不关的满管道）
+    /// ⇒ `write_fd_all` 在 `WRITE_BUDGET`（5s）内返 `TimedOut`。
+    ///
+    /// **定性（代码门⑧）**：本用例是**预算上界回归守卫**（拦「把 `poll_fd` 的期限
+    /// 参数改成固定片长」一类改法），**不是**「无睡眠死循环」的判别用例——现状
+    /// `poll_fd` 自身收 deadline，故修前也绿（如实登记 `docs/reviews/QG.md` §4）。
+    #[test]
+    fn write_all_deadline_returns_timedout() {
+        let (r, w) = pipe_pair();
+        set_nonblocking(w);
+        let buf = vec![0u8; 1 << 20]; // 远大于管道容量 ⇒ 必进 EAGAIN 分支
+        let t0 = Instant::now();
+        let e = write_fd_all(w, &buf).expect_err("不可写且无 HUP ⇒ 必须超时出线");
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
+        let el = t0.elapsed();
+        assert!(
+            el >= Duration::from_secs(4) && el < Duration::from_secs(8),
+            "必须在 5s 预算到点返回（实耗 {el:?}）"
+        );
+        unsafe {
+            libc::close(r);
+            libc::close(w);
+        }
+    }
+
+    /// F2：写侧在**死 fd** 上必须立即出线（不得烧满 5s 预算）。
+    /// 关读端的管道上内核直接给 `EPIPE`（Rust 测试进程 SIGPIPE 为忽略）⇒ 走
+    /// `_ => return Err` 分支，**到不了** `POLLHUP/POLLERR-first` 那一支（内核先行）。
+    /// 本用例钉的是**可观测上界**（< 1s 返 Err）——`hup|err|nval` 分支是纵深防御，
+    /// **非判别用例**（代码门⑧ 已登记，见 `docs/reviews/QG.md` §4）。
+    #[test]
+    fn write_all_dead_fd_returns_promptly() {
+        let (r, w) = pipe_pair();
+        unsafe { libc::close(r) }; // 关读端 ⇒ 写必死
+        let t0 = Instant::now();
+        let e = write_fd_all(w, &[0u8; 8192]).expect_err("死 fd 必须返 Err");
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "必须立即出线（实耗 {:?}，err={e}）",
+            t0.elapsed()
+        );
+        unsafe { libc::close(w) };
+    }
+
+    /// F2（N1，darwin 必须实测通过）：`n==0` + `POLLHUP` ⇒ 读线程 ≤1s 退出并上报
+    /// `TunFdDead`。修前：判死条件含「且无 readable」在 darwin 上永不成立 ⇒ 热自旋
+    /// 不退出（修前红）。
+    #[test]
+    fn tun_read_loop_n0_with_hup_reports_dead() {
+        let (r, w) = pipe_pair();
+        set_nonblocking(r);
+        unsafe { libc::close(w) }; // 写端已关 ⇒ read 恒 0 + poll 恒 POLLIN|POLLHUP
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
+        let wake: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let counters = Arc::new(TunCounters::default());
+        let h = thread::Builder::new()
+            .name("tun-read-hup-test".into())
+            .spawn(move || tun_read_loop(r, cmd_tx, wake, stop, counters, noop_logf()))
+            .unwrap();
+        let t0 = Instant::now();
+        let mut dead = false;
+        while t0.elapsed() < Duration::from_secs(1) {
+            if let Ok(Cmd::TunFdDead { msg }) = cmd_rx.recv_timeout(Duration::from_millis(100)) {
+                assert!(msg.contains("POLLHUP") || msg.contains("失效"), "{msg}");
+                dead = true;
+                break;
+            }
+        }
+        assert!(dead, "n==0 + HUP 必须在 1s 内上报 TunFdDead（修前：热自旋不退出）");
+        let t_join = Instant::now();
+        while !h.is_finished() && t_join.elapsed() < Duration::from_secs(2) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(h.is_finished(), "读线程必须退出");
+        let _ = h.join();
+    }
+
+    /// F2：**可读优先**——写端关闭但缓冲区有数据 ⇒ 先把数据读出（不丢最后一包），
+    /// 下一轮才判死上报。
+    #[test]
+    fn read_side_prefers_readable_on_hup_with_data() {
+        let (r, w) = pipe_pair();
+        set_nonblocking(r);
+        unsafe { libc::write(w, b"last-packet".as_ptr().cast(), 11) };
+        unsafe { libc::close(w) }; // 关写端：数据仍在管道里
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
+        let wake: Arc<Mutex<Option<i32>>> = Arc::new(Mutex::new(None));
+        let stop = Arc::new(AtomicBool::new(false));
+        let counters = Arc::new(TunCounters::default());
+        let h = thread::Builder::new()
+            .name("tun-read-pref-test".into())
+            .spawn(move || tun_read_loop(r, cmd_tx, wake, stop, counters, noop_logf()))
+            .unwrap();
+        // 第一条消息必须是数据包（可读优先）
+        match cmd_rx.recv_timeout(Duration::from_secs(1)) {
+            Ok(Cmd::TunPacket(p)) => assert_eq!(p, b"last-packet"),
+            Ok(_) => panic!("必须先读到最后一包，得非数据命令"),
+            Err(e) => panic!("必须先读到最后一包，得 {e}"),
+        }
+        // 随后才是 TunFdDead
+        let t0 = Instant::now();
+        let mut dead = false;
+        while t0.elapsed() < Duration::from_secs(1) {
+            if let Ok(Cmd::TunFdDead { .. }) = cmd_rx.recv_timeout(Duration::from_millis(100)) {
+                dead = true;
+                break;
+            }
+        }
+        assert!(dead, "排空后必须判死");
+        let _ = h.join();
+    }
+
+    /// F2（U8）：`poll_fd` 层「`readable` 且无 hup」不是判死输入——用 `Ready` 掩码
+    /// 直接钉判死谓词（n==0 健康形态构造不出，见设计 §2-F2.3）。
+    #[test]
+    fn ready_masks_dead_predicate_only_uses_hup_err_nval() {
+        let readable_only = Ready { readable: true, ..Default::default() };
+        let writable_only = Ready { writable: true, ..Default::default() };
+        let timeout = Ready::default();
+        for r in [readable_only, writable_only, timeout] {
+            assert!(!(r.hup || r.err || r.nval), "非异常位不得进判死集（{r:?}）");
+        }
+        let dead = Ready { readable: true, hup: true, ..Default::default() };
+        assert!(dead.hup || dead.err || dead.nval, "HUP 与 readable 同置仍判死");
+    }
 
     /// Q-F F6-4 段 5（代码门新增覆盖）：到点 detach ⇒ `wake_wr` **本线程不再持有**
     /// （Option 已 take），由收割线程 `hw-engine-reap` 在引擎 join 后关闭——

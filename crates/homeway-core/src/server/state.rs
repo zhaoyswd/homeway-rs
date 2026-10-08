@@ -7,9 +7,9 @@
 //!
 //! 台账 JSON 与 Go 字节对齐（字段名 PascalCase / 声明序 / id omitempty / RFC3339 时间）。
 
-use std::fs::{self, File};
+use std::fs::{self, OpenOptions};
 use std::io::Write as _;
-use std::os::unix::fs::PermissionsExt;
+use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -126,10 +126,17 @@ pub struct LedgerEntry {
 }
 
 impl State {
-    /// 打开（建目录 0700；既有目录收紧 0700 尽力而为——chmod 失败只告警不阻断）。
+    /// 打开（目录 **0700**：`DirBuilder::mode` 创建即收紧 + create 后无条件 chmod
+    /// 归一——`mkdir` 同样受 umask 掩码，只靠 `.mode` 不够；chmod 失败**告警**，
+    /// 对齐 `nodestate.rs` 的口径。Q-G F4/A3）。
     pub fn open(dir: &Path) -> std::io::Result<Self> {
-        fs::create_dir_all(dir)?;
-        let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o700));
+        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+        if let Err(e) = fs::set_permissions(dir, fs::Permissions::from_mode(0o700)) {
+            eprintln!(
+                "homeway: ⚠️ state 目录 {} 收紧 0700 失败（{e}）——建议手工 chmod",
+                dir.display()
+            );
+        }
         Ok(Self { dir: dir.to_path_buf() })
     }
 
@@ -146,16 +153,44 @@ impl State {
     }
 
     /// 身份私钥（不存在则生成；重启不变是 token 稳定性的前提）。
+    ///
+    /// **Q-G F4/A1（高危面）**：Go 是原子 `os.WriteFile(...,0o600)`（`state.go:70`）；
+    /// 旧形态「默认权限建 → **静默** chmod」在 chmod 失败时会让**身份私钥永久 0644**
+    /// 且无任何告警 ⇒ 本处改「创建即 0600（`.mode`）+ 拿到 handle 后 fchmod 归一
+    /// （防 umask 掩码）+ 失败告警」。
+    ///
+    /// **代码门① 补强**：**读路径**（既有 key.bin）也做一次 best-effort 归一——
+    /// 否则「已命中旧 chmod 失败、磁盘上就是 0644」的存量私钥**永远不会**被修复
+    /// （本批只覆盖未来）；读语义不变（失败只告警）。
     pub fn private_key(&self) -> Result<StaticSecret, StateError> {
         if let Ok(b) = fs::read(self.key_path()) {
             let n = b.len();
             let arr: [u8; 32] = b.try_into().map_err(|_| StateError::BadKeyLen(n))?;
+            if let Ok(f) = OpenOptions::new().read(true).open(self.key_path()) {
+                if let Err(e) = f.set_permissions(fs::Permissions::from_mode(0o600)) {
+                    eprintln!(
+                        "homeway: ⚠️ 存量身份私钥 {} 收紧 0600 失败（{e}）——建议手工 chmod",
+                        self.key_path().display()
+                    );
+                }
+            }
             return Ok(StaticSecret::from(arr));
         }
         let mut seed = [0u8; 32];
         getrandom::getrandom(&mut seed).expect("系统随机源不可用");
-        fs::write(self.key_path(), seed)?;
-        let _ = fs::set_permissions(self.key_path(), fs::Permissions::from_mode(0o600));
+        let mut f = OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(self.key_path())?;
+        if let Err(e) = f.set_permissions(fs::Permissions::from_mode(0o600)) {
+            eprintln!(
+                "homeway: ⚠️ 身份私钥 {} 收紧 0600 失败（{e}）——文件权限未归一，建议手工 chmod",
+                self.key_path().display()
+            );
+        }
+        f.write_all(&seed)?;
         Ok(StaticSecret::from(seed))
     }
 
@@ -406,16 +441,22 @@ fn decode_secret_b64(s: &str) -> Result<[u8; 32], StateError> {
     raw.try_into().map_err(|_| StateError::BadSecret)
 }
 
+/// 台账追加入口（Q-G F4/A2）：`create|append` **创建即 0600**（`.mode`）+ handle 后
+/// fchmod 归一 + 失败告警——旧形态的双层静默 `let _`（连 `metadata()` 错误都吞）
+/// 会让 token/吊销台账在 chmod 失败时永久 0644。Go 侧为原子
+/// `os.OpenFile(..., O_CREATE|O_APPEND, 0o600)`（`state.go:181/221`）。
 fn append_file(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
-    let mut f = File::options()
+    let mut f = OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(path)?;
-    let _ = f.metadata().map(|m| {
-        let mut perms = m.permissions();
-        perms.set_mode(0o600);
-        fs::set_permissions(path, perms)
-    });
+    if let Err(e) = f.set_permissions(fs::Permissions::from_mode(0o600)) {
+        eprintln!(
+            "homeway: ⚠️ 台账 {} 收紧 0600 失败（{e}）——文件权限未归一，建议手工 chmod",
+            path.display()
+        );
+    }
     f.write_all(bytes)?;
     Ok(())
 }
@@ -456,6 +497,43 @@ mod tests {
         vec![
             Endpoint { addr: "127.0.0.1:42641".into(), kind: EndpointKind::Direct },
         ]
+    }
+
+    /// Q-G F4（A1/A2/A3，高危面回归守卫）：**全新** state 目录上——
+    /// `State::open` 目录 = 0700；`key.bin` = 0600；`tokens.jsonl`/`revoked.jsonl`
+    /// = 0600。**注**：正常 umask 下修前最终 mode 也是 0600（旧后置 chmod 会执行），
+    /// 故这是**回归守卫 + 代码面复核**，不是修前红（设计 §4.2 已降级登记）。
+    #[test]
+    fn permissions_are_atomic_0600_and_dir_0700() {
+        use std::os::unix::fs::PermissionsExt as _;
+        // 目录刻意先建成 0755（模拟 umask 宽松的 state 根）
+        let dir = tmpdir("perm");
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o755)).unwrap();
+        let st = State::open(&dir).unwrap();
+        assert_eq!(
+            fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+            0o700,
+            "State::open 后目录必须 0700"
+        );
+        let _k = st.private_key().unwrap();
+        assert_eq!(
+            fs::metadata(st.key_path()).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "key.bin（身份私钥）必须 0600"
+        );
+        st.issue_token(eps()).unwrap();
+        assert_eq!(
+            fs::metadata(st.tokens_path()).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "tokens.jsonl（token 台账）必须 0600"
+        );
+        st.revoke(&st.secrets().unwrap()[0], "perm").unwrap();
+        assert_eq!(
+            fs::metadata(st.revoked_path()).unwrap().permissions().mode() & 0o777,
+            0o600,
+            "revoked.jsonl（吊销台账）必须 0600"
+        );
+        let _ = fs::remove_dir_all(&dir);
     }
 
     /// 台账一行制：issue 追加；append_token 同值不追加、变化才追加；末行 = 在用。

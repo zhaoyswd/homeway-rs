@@ -37,6 +37,8 @@ pub mod session_lock;
 pub mod speedtest;
 pub mod speedtest_server;
 pub mod status_json;
+/// 平台系统事实单源（fd 标志 / `sockaddr_un` 上限）——Q-G F1/F4；CLI crate 复用。
+pub mod sysfd;
 pub mod term;
 pub mod token;
 pub mod tunnel_addr;

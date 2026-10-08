@@ -92,8 +92,8 @@ const PROBE_BUDGET: Duration = Duration::from_millis(200);
 /// connect 本身（对端 backlog 满正是要防的形态）。超时 = TimedOut）。
 /// pub(crate)：files/term/speedtest 桥消费方共用（工单④：UDS 拨号加 connect 预算）。
 pub(crate) fn connect_budget(path: &Path, budget: Duration) -> std::io::Result<UnixStream> {
-    use std::os::fd::FromRawFd;
-    // sockaddr_un 组装（路径长度由调用侧的 MAX_UNIX_SOCKET_PATH 预检兜）
+    use std::os::fd::AsRawFd as _;
+    // sockaddr_un 组装（路径长度由调用侧的 SUN_PATH_MAX 预检兜）
     let mut addr: libc::sockaddr_un = unsafe { std::mem::zeroed() };
     addr.sun_family = libc::AF_UNIX as libc::sa_family_t;
     let bytes = path.as_os_str().as_encoded_bytes();
@@ -105,27 +105,19 @@ pub(crate) fn connect_budget(path: &Path, budget: Duration) -> std::io::Result<U
     }
     addr.sun_path[..bytes.len()]
         .copy_from_slice(unsafe { std::slice::from_raw_parts(bytes.as_ptr().cast(), bytes.len()) });
-    let fd = unsafe { libc::socket(libc::AF_UNIX, libc::SOCK_STREAM, 0) };
-    if fd < 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    // 非阻塞 + cloexec 经 fcntl（darwin 无 SOCK_NONBLOCK/SOCK_CLOEXEC 类型位——
-    // apple 的 socket() 第二参只认类型；linux/ohos 走 fcntl 同样成立）
+    // F1：socket 走 sysfd 单源（linux/OHOS 原子 SOCK_CLOEXEC；darwin 建后立即补）——
+    // 与非阻塞设置合并为一次 flags 收口；出错路径 fd 随 OwnedFd drop 关。
+    let fd = crate::sysfd::socket_cloexec(libc::AF_UNIX, libc::SOCK_STREAM, 0)?;
+    let raw = fd.as_raw_fd();
     unsafe {
-        let fl = libc::fcntl(fd, libc::F_GETFL);
-        if fl < 0
-            || libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) < 0
-            || libc::fcntl(fd, libc::F_SETFD, libc::FD_CLOEXEC) < 0
-        {
-            let e = std::io::Error::last_os_error();
-            libc::close(fd);
-            return Err(e);
+        let fl = libc::fcntl(raw, libc::F_GETFL);
+        if fl < 0 || libc::fcntl(raw, libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
+            return Err(std::io::Error::last_os_error());
         }
     }
-    // 出错路径统一关 fd（成功则所有权移交 UnixStream）
     let r = unsafe {
         libc::connect(
-            fd,
+            raw,
             &addr as *const _ as *const libc::sockaddr,
             std::mem::size_of::<libc::sockaddr_un>() as libc::socklen_t,
         )
@@ -135,56 +127,50 @@ pub(crate) fn connect_budget(path: &Path, budget: Duration) -> std::io::Result<U
         // EINPROGRESS = 非阻塞连接已发起（darwin/linux 同码）；其余（ENOENT/ECONNREFUSED/
         // EACCES…）是即时结果，直接回
         if e.raw_os_error() != Some(libc::EINPROGRESS) {
-            unsafe { libc::close(fd) };
             return Err(e);
         }
         let mut pfd = libc::pollfd {
-            fd,
+            fd: raw,
             events: libc::POLLOUT,
             revents: 0,
         };
         let t = budget.as_millis().clamp(1, i32::MAX as u128) as i32;
         let pr = unsafe { libc::poll(&mut pfd, 1, t) };
         if pr < 0 {
-            let pe = std::io::Error::last_os_error();
-            unsafe { libc::close(fd) };
-            return Err(pe);
+            return Err(std::io::Error::last_os_error());
         }
         if pr == 0 {
-            unsafe { libc::close(fd) };
             return Err(std::io::Error::new(ErrorKind::TimedOut, "探测连接超时"));
         }
         // 连接结果经 SO_ERROR 取（POLLERR 也走这里拿真实 errno）
         let mut err: libc::c_int = 0;
         let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        unsafe {
-            if libc::getsockopt(
-                fd,
+        if unsafe {
+            libc::getsockopt(
+                raw,
                 libc::SOL_SOCKET,
                 libc::SO_ERROR,
                 &mut err as *mut _ as *mut _,
                 &mut len,
-            ) != 0
-            {
-                let ge = std::io::Error::last_os_error();
-                libc::close(fd);
-                return Err(ge);
-            }
+            )
+        } != 0
+        {
+            return Err(std::io::Error::last_os_error());
         }
         if err != 0 {
-            unsafe { libc::close(fd) };
             return Err(std::io::Error::from_raw_os_error(err));
         }
     }
-    let s = unsafe { UnixStream::from_raw_fd(fd) };
+    let s = UnixStream::from(fd);
     s.set_nonblocking(false)?;
     Ok(s)
 }
 
 /// 桥 socket 的子目录（`<dir>/bridge/`）。
 const BRIDGE_DIR: &str = "bridge";
-/// sockaddr_un.sun_path 的保守上限（darwin 104 / linux 108）。
-const MAX_UNIX_SOCKET_PATH: usize = 100;
+/// sun_path 上限**单源**（darwin 103 / linux·OHOS 107——`sysfd::SUN_PATH_MAX`，
+/// 判据统一 `len > SUN_PATH_MAX`；Q-G F4.3）。
+const MAX_UNIX_SOCKET_PATH: usize = crate::sysfd::SUN_PATH_MAX;
 /// 桥鉴权魔数（16 字节；只在本模块与状态 JSON 的 blob 里存在——消费方拿到的是
 /// 「魔数+令牌」完整 blob，无需复刻常量）。
 const BRIDGE_AUTH_MAGIC: &[u8; 16] = b"TIERBRIDGEAUTH01";
@@ -488,9 +474,9 @@ impl BridgeHost {
         // 测速桥路径比 files 长 4 字节——极端下「files 能用、测速超长」只跳过测速
         // 自己，不连累 files/term。
         let files = bridge_socket_path(&dir, "files");
-        if files.as_os_str().len() >= MAX_UNIX_SOCKET_PATH {
+        if files.as_os_str().len() > MAX_UNIX_SOCKET_PATH {
             (self.logf)(&format!(
-                "{}: 桥路径超长（{} ≥ {MAX_UNIX_SOCKET_PATH} 字节，sun_path 上限）—— files/term 本轮不可用；把 filesDir 挪短或反馈",
+                "{}: 桥路径超长（{} > {MAX_UNIX_SOCKET_PATH} 字节，sun_path 上限〔平台值〕）—— files/term 本轮不可用；把 filesDir 挪短或反馈",
                 self.what,
                 files.as_os_str().len()
             ));
@@ -513,9 +499,9 @@ impl BridgeHost {
             },
         ];
         let speed_path = bridge_socket_path(&dir, "speedtest");
-        if speed_path.as_os_str().len() >= MAX_UNIX_SOCKET_PATH {
+        if speed_path.as_os_str().len() > MAX_UNIX_SOCKET_PATH {
             (self.logf)(&format!(
-                "{}: 测速桥路径超长（{} ≥ {MAX_UNIX_SOCKET_PATH} 字节）—— 测速本轮不可用（files/term 不受影响）",
+                "{}: 测速桥路径超长（{} > {MAX_UNIX_SOCKET_PATH} 字节，sun_path 上限〔平台值〕）—— 测速本轮不可用（files/term 不受影响）",
                 self.what,
                 speed_path.as_os_str().len()
             ));

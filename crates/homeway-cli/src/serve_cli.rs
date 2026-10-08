@@ -500,10 +500,19 @@ extern "C" fn on_stop_signal(_sig: i32) {
 static STOP_PIPE: std::sync::OnceLock<(i32, i32)> = std::sync::OnceLock::new();
 
 pub fn install_stop_signals() {
-    let (r, w) = *STOP_PIPE.get_or_init(|| unsafe {
-        let mut fds = [0i32; 2];
-        libc::pipe(fds.as_mut_ptr());
-        (fds[0], fds[1])
+    // Q-G F1：管道经 `sysfd` 建（两端 CLOEXEC）→ 立即 `into_raw_fd()` 交既有 i32
+    // 字段（生命周期仍由 `wait_stop_pipe`/进程存活期收口——本批不改结构，单次
+    // 生命周期、无 restart 面）。建立失败 = 可行动错误退出（旧形态忽略 rc 会让
+    // handler 写 fd 0）。
+    let (r, w) = *STOP_PIPE.get_or_init(|| match homeway_core::sysfd::pipe_cloexec() {
+        Ok((r, w)) => (
+            std::os::fd::IntoRawFd::into_raw_fd(r),
+            std::os::fd::IntoRawFd::into_raw_fd(w),
+        ),
+        Err(e) => {
+            eprintln!("homeway: serve 停止管道建立失败（{e}）——退出");
+            std::process::exit(1);
+        }
     });
     STOP_FD.store(w, std::sync::atomic::Ordering::SeqCst);
     unsafe {

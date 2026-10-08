@@ -751,7 +751,8 @@ impl UnifiedRoles {
                 Ok((proc, token, listen)) => {
                     let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
                     if inner.relay_epoch != epoch || inner.relay.is_some() || !inner.cfg.relay.enabled {
-                        // 窗口内被接管：停掉刚建的 run 线程（RelayProc 无 Drop——评审 r2-E），静默退。
+                        // 窗口内被接管：停掉刚建的 run 线程（`RelayProc` 有幂等 Drop
+                        // 兜底——评审 r2-E 的 fd 泄漏面；此处显式 stop 走同一收口），静默退。
                         drop(inner);
                         proc.stop();
                         return;

@@ -75,11 +75,16 @@ pub fn acquire(identity_dir: &Path, verb: &str) -> Result<SessionLock, LockError
         .create(identity_dir)
         .map_err(|e| LockError::Io(LockIo { path: identity_dir.to_owned(), err: e }))?;
     let path = identity_dir.join(LOCK_NAME);
+    // Q-G F4（B 组新增）：锁文件**创建即 0600**（Go = `os.OpenFile(lockFile,
+    // O_CREATE|O_RDWR, 0o600)`，`identity_store_unix.go:21`）——内容含 pid/动词，
+    // 非凭据；目录 0700 之外本无兜底，一行 `.mode` 对齐。
+    use std::os::unix::fs::OpenOptionsExt as _;
     let file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
+        .mode(0o600)
         .open(&path)
         .map_err(|e| LockError::Io(LockIo { path: path.clone(), err: e }))?;
     // flock EX|NB：内核级持有者判活（进程死 = 自动释放）——不依赖 pid 探测

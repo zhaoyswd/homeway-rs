@@ -28,6 +28,7 @@ use std::net::SocketAddr;
 use std::net::SocketAddrV4;
 use std::net::SocketAddrV6;
 use std::net::UdpSocket;
+#[cfg(not(target_os = "linux"))]
 use std::os::fd::FromRawFd;
 use std::os::fd::RawFd;
 
@@ -38,14 +39,14 @@ use std::os::fd::RawFd;
 /// 设（bind 后再设无效），std 的 `UdpSocket::bind` 一体化创建插不进 setsockopt ⇒
 /// libc 手建。
 pub(crate) fn bind_dual_stack(port: u16) -> io::Result<UdpSocket> {
+    // F1：CLOEXEC 创建即落（linux/OHOS 走 `SOCK_CLOEXEC` 原子位；darwin 建后立即补）
+    // ——失败路径 fd 随 OwnedFd drop 关，无需手写 close。
+    let fd = crate::sysfd::socket_cloexec(libc::AF_INET6, libc::SOCK_DGRAM, 0)?;
+    let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
     unsafe {
-        let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0);
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
         let off: libc::c_int = 0;
         let _ = libc::setsockopt(
-            fd,
+            raw,
             libc::IPPROTO_IPV6,
             libc::IPV6_V6ONLY,
             &off as *const _ as *const libc::c_void,
@@ -60,30 +61,27 @@ pub(crate) fn bind_dual_stack(port: u16) -> io::Result<UdpSocket> {
             sin6.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
         }
         let r = libc::bind(
-            fd,
+            raw,
             &sin6 as *const _ as *const libc::sockaddr,
             std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
         );
         if r != 0 {
-            let e = io::Error::last_os_error();
-            libc::close(fd);
-            return Err(e);
+            return Err(io::Error::last_os_error());
         }
-        Ok(UdpSocket::from_raw_fd(fd))
     }
+    Ok(UdpSocket::from(fd))
 }
 
 /// v6 **单栈** UDP socket（IP 字面量绑定的 v6 形态——Go `ListenUDP("udp6", …)` 显式
 /// `IPV6_V6ONLY=1` 同义：std bind 的 v6 socket 用系统默认（多为 0），须显式设 1）。
 pub(crate) fn bind_v6_only(ip: std::net::Ipv6Addr, port: u16) -> io::Result<UdpSocket> {
+    // F1：CLOEXEC 创建即落（分派同 bind_dual_stack）。
+    let fd = crate::sysfd::socket_cloexec(libc::AF_INET6, libc::SOCK_DGRAM, 0)?;
+    let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
     unsafe {
-        let fd = libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0);
-        if fd < 0 {
-            return Err(io::Error::last_os_error());
-        }
         let on: libc::c_int = 1;
         let _ = libc::setsockopt(
-            fd,
+            raw,
             libc::IPPROTO_IPV6,
             libc::IPV6_V6ONLY,
             &on as *const _ as *const libc::c_void,
@@ -98,17 +96,15 @@ pub(crate) fn bind_v6_only(ip: std::net::Ipv6Addr, port: u16) -> io::Result<UdpS
             sin6.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
         }
         let r = libc::bind(
-            fd,
+            raw,
             &sin6 as *const _ as *const libc::sockaddr,
             std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
         );
         if r != 0 {
-            let e = io::Error::last_os_error();
-            libc::close(fd);
-            return Err(e);
+            return Err(io::Error::last_os_error());
         }
-        Ok(UdpSocket::from_raw_fd(fd))
     }
+    Ok(UdpSocket::from(fd))
 }
 
 /// socket 是否为 v6 双栈（AF_INET6 且 `IPV6_V6ONLY=0`——getsockopt 运行期检测；

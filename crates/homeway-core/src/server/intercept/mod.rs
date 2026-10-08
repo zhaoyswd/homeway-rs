@@ -24,7 +24,7 @@ pub mod nat;
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
-use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+use std::os::fd::{AsFd as _, AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -221,12 +221,10 @@ enum DialOutcome {
 fn dial_nonblocking(target: &DialTarget) -> std::io::Result<DialOutcome> {
     let (domain, ty, addr, len, bind_any) = target_sockaddr(target)?;
     unsafe {
-        let raw = libc::socket(domain, ty, 0);
-        if raw < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-        let fd = OwnedFd::from_raw_fd(raw);
-        set_fd_nonblocking(&fd)?;
+        // F1：CLOEXEC 在**创建时**落下（linux/OHOS 走 `SOCK_CLOEXEC` 原子位；darwin
+        // 建后立即补）——Go 侧 `net.Dialer` 的 fd 天然 CLOEXEC，此为移植回退面收口。
+        let fd = crate::sysfd::socket_cloexec(domain, ty, 0)?;
+        set_fd_flags(fd.as_fd(), true)?;
         if let Some((baddr, blen)) = bind_any {
             // UDP：先绑临时端口（Go「bind ephemeral + connect」同形态）
             if libc::bind(fd.as_raw_fd(), &baddr as *const _ as *const libc::sockaddr, blen) != 0 {
@@ -302,7 +300,10 @@ fn target_sockaddr(target: &DialTarget) -> std::io::Result<SockAddrPack> {
         }
         DialTarget::Unix(path) => {
             // 装配约定 UDS 路径 < 100B（R3 §4.1 LocalServices 组装边界）；上界按
-            // 平台结构判（macOS sun_path=104B、Linux=108B——写死 108 会越界）
+            // 平台结构判（macOS sun_path=104B、Linux=108B——写死 108 会越界）。
+            // **与 `sysfd::SUN_PATH_MAX` 同源同义**（`len >= sun_path.len()` ≡
+            // `len > SUN_PATH_MAX`）——只注明，不字面改调（照字面改会因 off-by-one
+            // 静默收紧；Q-G F4.3）。
             let bytes = path.as_bytes();
             let mut ss: libc::sockaddr_un = unsafe { std::mem::zeroed() };
             if bytes.len() >= ss.sun_path.len() {
@@ -336,13 +337,20 @@ fn target_sockaddr(target: &DialTarget) -> std::io::Result<SockAddrPack> {
     }
 }
 
-/// fcntl 建非阻塞（`SOCK_NONBLOCK` 在 libc 的 apple 目标未定义——唯一形态）。
+/// fcntl 建非阻塞 + `FD_CLOEXEC`（`SOCK_NONBLOCK`/`SOCK_CLOEXEC` 在 libc 的 apple
+/// 目标均未定义——darwin 唯一形态；linux/OHOS 创建期已走原子位，此处幂等重设）。
 /// 失败按 Err 返回（「循环内禁阻塞」的防御闭合：置不上非阻塞的 fd 会阻塞驱动
-/// 线程——评审 r2-低6）。
-fn set_fd_nonblocking(fd: &OwnedFd) -> std::io::Result<()> {
+/// 线程——评审 r2-低6；CLOEXEC 缺失 = 子进程继承悬挂 fd——Q-G F1）。
+fn set_fd_flags(fd: std::os::fd::BorrowedFd<'_>, nonblocking: bool) -> std::io::Result<()> {
     unsafe {
-        let fl = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
-        if fl < 0 || libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
+        if nonblocking {
+            let fl = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
+            if fl < 0 || libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+        }
+        let fc = libc::fcntl(fd.as_raw_fd(), libc::F_GETFD);
+        if fc < 0 || libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, fc | libc::FD_CLOEXEC) < 0 {
             return Err(std::io::Error::last_os_error());
         }
     }
@@ -2899,6 +2907,7 @@ mod tests {
     use smoltcp::socket::tcp::Socket as TcpSocket;
     use smoltcp::time::Instant as SmolInstant;
     use std::io::{Read, Write as _};
+    use std::os::fd::FromRawFd;
     use std::os::unix::net::UnixListener;
 
     fn noop_logf() -> Logf {
@@ -3545,9 +3554,18 @@ mod tests {
                 }
             })
         };
-        let mut fds = [-1i32; 2];
+        // Q-G F1（测试态顺手）：socketpair 也走 sysfd 单源（CLOEXEC）——断言不变。
+        let (sock_a, sock_b) = crate::sysfd::socketpair_cloexec(
+            libc::AF_UNIX,
+            libc::SOCK_STREAM,
+            0,
+        )
+        .expect("socketpair");
+        let fds = [
+            std::os::fd::IntoRawFd::into_raw_fd(sock_a),
+            std::os::fd::IntoRawFd::into_raw_fd(sock_b),
+        ];
         unsafe {
-            assert_eq!(libc::socketpair(libc::AF_UNIX, libc::SOCK_STREAM, 0, fds.as_mut_ptr()), 0);
             let sz: libc::c_int = 8 * 1024;
             libc::setsockopt(
                 fds[0],
@@ -3573,7 +3591,7 @@ mod tests {
         };
         let flow = itc.alloc_flow(&v, Kind::Exempt, Proto::Tcp, Vec::new());
         let fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-        set_fd_nonblocking(&fd).unwrap(); // place_io 契约：fd 已非阻塞（dial_nonblocking 平时的保证）
+        set_fd_flags(fd.as_fd(), true).unwrap(); // place_io 契约：fd 已非阻塞（dial_nonblocking 平时的保证）
         itc.place_io(flow, fd, false, None, Instant::now());
         if let Some(io) = itc.flows.get_mut(&flow).and_then(|f| f.io.as_mut()) {
             io.out_tcp.push(&vec![0x5au8; 1024 * 1024]);
