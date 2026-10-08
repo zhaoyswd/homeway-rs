@@ -65,6 +65,8 @@ run_one() {
 
 run_one island_connects_registers_and_survives_rebind_against_local_exit "$RES/island-e2e.log" || rc=1
 run_one island_uses_relay_and_pushes_traffic_through_tun "$RES/relay-e2e.log" || rc=1
+# M1 S3-1：**世代级**（真产品路径）——ClientCore prepare/attach + TUN 流量经 QUIC DATAGRAM
+run_one generation_l3_rides_quic_datagram_against_local_exit "$RES/generation-e2e.log" || rc=1
 
 # 出口侧本轮新增行（含 `peer: +` / `quic: 连接采纳` / `quic: 路径变更`）
 tail -n +"$((LOG0 + 1))" "$EXIT_LOG" > "$RES/exit-lines.txt" 2>/dev/null || true
@@ -73,17 +75,17 @@ if [[ -f "$RELAY_LOG" ]]; then
 fi
 
 {
-  echo "# M1 S2b 岛侧端到端读数（$(date '+%F %T')）"
+  echo "# M1 S2b/S3-1 岛侧端到端读数（$(date '+%F %T')）"
   echo "# 出口实例 = $EXIT_STATE（日志：$EXIT_LOG）；中继实例 = $RELAY_STATE（日志：$RELAY_LOG）"
   echo "# 拓扑：岛(quic 客户端) → Rust 中继 127.0.0.1:$((42780 + n)) → Rust 出口（挂中继腿）"
-  echo "## 用例结论（run_one 汇总 exit code = $rc；0 = 两条都过）"
+  echo "## 用例结论（run_one 汇总 exit code = $rc；0 = 三条都过）"
   grep -E "^\[e2e|^test |^test result" "$RES/island-e2e.log" "$RES/relay-e2e.log" 2>/dev/null || true
   echo "## 出口侧证据行（本轮新增）"
   grep -E "peer: \+|quic: 连接采纳|quic: 路径变更|quic: 端点就绪|中继控制面|transit" "$RES/exit-lines.txt" 2>/dev/null || true
   echo "## 中继侧行（本轮新增；腿/会话/丢弃）"
   grep -E "中继|会话|腿|丢弃|转发" "$RES/relay-lines.txt" 2>/dev/null | tail -20 || true
   echo "## 岛侧判据行（S2a + S2b）"
-  grep -hE "quic: |island\]" "$RES/island-e2e.log" "$RES/relay-e2e.log" 2>/dev/null | grep -v "^\[e2e" | head -60 || true
+  grep -hE "quic: |island\]" "$RES/island-e2e.log" "$RES/relay-e2e.log" "$RES/generation-e2e.log" 2>/dev/null | grep -v "^\[e2e" | head -60 || true
 } > "$RES/SUMMARY.txt"
 
 echo "==> 读数落 $RES/（SUMMARY.txt / island-e2e.log / relay-e2e.log / exit-lines.txt / relay-lines.txt）"

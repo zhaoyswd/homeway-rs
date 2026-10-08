@@ -468,3 +468,169 @@ fn island_uses_relay_and_pushes_traffic_through_tun() {
     let _ = echo_thread.join();
     println!("[e2e2] island.stopped=true");
 }
+
+// ---------------------------------------------------------------------------
+// M1 S3-1：**世代级**接线（真产品路径）——TUN 流量经 QUIC DATAGRAM
+// ---------------------------------------------------------------------------
+
+/// **判据（S3-1 的核心：M1 的「TUN 流量经 QUIC DATAGRAM」在真产品路径上成立）**：
+/// 走 `ClientCore::tun_prepare(transport=quic)` + `tun_attach(fd)` 的**世代装配**，
+/// 断言 ①N-d 行声明 quic 档 ②C2'（`quic: 隧道侧就绪…`）在场 ③状态 JSON 的 `quic` 段
+/// 在场（via/mtu/丢弃四类）④TUN fd 投真内层 UDP ⇒ 经 EXIT 的 intercept transit 回环
+/// 回程（载荷逐字节）⑤无「回落 WG」行（岛真在用）。
+#[test]
+#[ignore = "端到端（世代级 L3 over QUIC）：需本地 QUIC 出口在跑（tools/quic-island-e2e.sh 驱动）"]
+fn generation_l3_rides_quic_datagram_against_local_exit() {
+    use homeway_core::facade::demand::DemandSignals;
+    use homeway_core::facade::tun_exec::TunnelExec;
+    use homeway_core::facade::ClientCore;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::net::UnixDatagram;
+
+    let token_str = std::env::var("HOMEWAY_ISLAND_E2E_TOKEN").expect("须给 HOMEWAY_ISLAND_E2E_TOKEN");
+    let exit_log = PathBuf::from(
+        std::env::var("HOMEWAY_ISLAND_E2E_EXIT_LOG").expect("须给 HOMEWAY_ISLAND_E2E_EXIT_LOG"),
+    );
+    let log0 = log_lines(&exit_log);
+    let _tok = token::decode(&token_str).expect("token 可解（世代层自解析，这里只证可解）");
+    // 状态面读一次 JSON（`tunIp` 的源；见下方 L3 段的说明）
+    let snap_json = |core: &std::sync::Arc<homeway_core::facade::ClientCore>| {
+        serde_json::from_str::<serde_json::Value>(&core.tun_status()).expect("tun_status 是 JSON")
+    };
+
+    let dir = std::env::temp_dir().join(format!("hw-m1s3-gen-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("临时目录可建");
+    let out = dir.join("gen.log");
+    let ident_dir = dir.join("identity");
+    let _ = std::fs::remove_file(&out);
+    let cfg = format!(
+        r#"{{"token":"{token_str}","out":"{}","identityDir":"{}","transport":"quic"}}"#,
+        out.display(),
+        ident_dir.display()
+    );
+    let demand = std::sync::Arc::new(DemandSignals::new());
+    let exec = TunnelExec::new(std::sync::Arc::clone(&demand));
+    let core = std::sync::Arc::new(ClientCore::with_shared(exec, demand));
+    assert_eq!(core.tun_prepare(&cfg, true), 0, "prepare 受理");
+    let deadline = Instant::now() + WAIT;
+    while !core.tun_status().contains("\"state\":\"ready\"") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let st = core.tun_status();
+    println!("[e2e3] tun.status.ready={}", st.contains("\"state\":\"ready\""));
+    assert!(st.contains("\"state\":\"ready\""), "世代须 ready：{st}");
+
+    // ① N-d（档位行）+ ② C2'（L3 承载面就绪）
+    let log = std::fs::read_to_string(&out).unwrap_or_default();
+    let nd = log
+        .lines()
+        .find(|l| l.contains("transport: 本世代 L3 承载 ="))
+        .unwrap_or("（缺）")
+        .to_owned();
+    println!("[e2e3] N-d={nd}");
+    assert!(nd.contains("= quic"), "N-d 须声明 quic 档：{nd}");
+    let c2 = log
+        .lines()
+        .find(|l| l.contains("quic: 隧道侧就绪（L3 直通；"))
+        .unwrap_or("（缺）")
+        .to_owned();
+    println!("[e2e3] C2'={c2}");
+    assert!(c2.contains("核心自连经 WG 拨隧道 IP"), "C2' 末句须为「经 WG」：{c2}");
+    assert!(
+        log.contains("warmup pong: 就绪（判据=quic）"),
+        "暖机判据位须为 quic（C8 值域扩展）"
+    );
+    assert!(!log.contains("本世代回落 WG 承载"), "本用例不得回落 WG（岛真在用）：{log}");
+    assert!(!log.contains("quic: 岛未就用"), "岛必须起来：{log}");
+
+    // ③ 状态 JSON 的 quic 段
+    let v: serde_json::Value = serde_json::from_str(&st).expect("tun_status 是 JSON");
+    let q = v.get("quic").expect("quic 段须在场");
+    println!("[e2e3] quic.via={} mtu={} current_mtu={} candidates={}",
+        q["via"], q["mtu"], q["current_mtu"], q["candidates"]);
+    assert_eq!(q["drops"]["too_large"], 0, "本用例不注入超限");
+    assert!(q["mtu"].as_u64().unwrap_or(0) >= 1280, "mds 须 ≥ 内层 MTU：{q}");
+    assert!(q["connections"].as_u64().unwrap_or(0) >= 1, "岛须持有连接：{q}");
+    assert!(q["via"] == "direct" || q["via"] == "relay", "via 词表：{q}");
+
+    // ④ L3（QUIC DATAGRAM）：TUN fd 投内层 UDP → 出口 transit → 回环 echo → 回程
+    let echo = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("echo 可绑");
+    let echo_addr = match echo.local_addr().expect("echo 地址") {
+        std::net::SocketAddr::V4(v) => v,
+        std::net::SocketAddr::V6(_) => unreachable!(),
+    };
+    let echo_stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let echo_thread = {
+        let stop = std::sync::Arc::clone(&echo_stop);
+        let sock = echo.try_clone().expect("echo 克隆");
+        std::thread::spawn(move || {
+            sock.set_read_timeout(Some(Duration::from_millis(50))).ok();
+            let mut buf = [0u8; 2048];
+            while !stop.load(std::sync::atomic::Ordering::SeqCst) {
+                if let Ok((n, from)) = sock.recv_from(&mut buf) {
+                    let _ = sock.send_to(&buf[..n], from);
+                }
+            }
+        })
+    };
+    let (tun, peer) = UnixDatagram::pair().expect("socketpair(DGRAM)");
+    assert_eq!(
+        core.tun_attach(tun.as_raw_fd(), 1280),
+        0,
+        "attach 受理（fd 交岛）"
+    );
+    let deadline = Instant::now() + WAIT;
+    while !core.tun_status().contains("\"state\":\"attached\"") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let payload = b"hw-m1-s3-quic";
+    // src = 状态面公布的**本设备派生地址**（出口 `src_allowed` 判据面；不能拿 token 的
+    // peerId 自己推——那是后端公钥）
+    let tun_ip: Ipv4Addr = snap_json(&core)["tunIp"]
+        .as_str()
+        .expect("状态面须公布 tunIp")
+        .parse()
+        .expect("tunIp 是 IPv4");
+    println!("[e2e3] tun_ip={tun_ip}");
+    let inner = inner_udp(tun_ip, Ipv4Addr::LOCALHOST, 40002, echo_addr.port(), payload);
+    write_tun(&peer, &inner);
+    let deadline = Instant::now() + WAIT;
+    let mut back: Option<Vec<u8>> = None;
+    while Instant::now() < deadline {
+        if let Some(p) = read_tun(&peer, Duration::from_millis(200)) {
+            if p.len() >= 28 + payload.len() && p[28..].starts_with(payload) {
+                back = Some(p);
+                break;
+            }
+        }
+    }
+    let back = back.expect("L3 回程必须经 QUIC DATAGRAM 回到 TUN fd（载荷逐字节）");
+    println!(
+        "[e2e3] tun.uplink={}B tun.downlink={}B payload={:?}",
+        inner.len(),
+        back.len(),
+        String::from_utf8_lossy(&back[28..])
+    );
+    let transit = wait_log_from(&exit_log, log0, "udp intercept:", Some("transit 建立"), WAIT)
+        .unwrap_or_else(|| "（无 transit 行）".into());
+    println!("[e2e3] exit.transit_line={transit}");
+    assert!(transit.contains("transit 建立"), "出口须建 transit 会话：{transit}");
+
+    // 快照读数（留证）
+    let snap2: serde_json::Value =
+        serde_json::from_str(&core.tun_status()).expect("tun_status 是 JSON");
+    println!(
+        "[e2e3] quic.packets_in={} packets_out={} local={} relay_tx={} rx_ignored={}",
+        snap2["quic"]["packets_in"],
+        snap2["quic"]["packets_out"],
+        snap2["quic"]["local"],
+        snap2["quic"]["relay_tx"],
+        snap2["quic"]["rx_ignored"]
+    );
+    println!("[e2e3] link={}", snap2["link"]);
+    let _ = core.tun_stop();
+    echo_stop.store(true, std::sync::atomic::Ordering::SeqCst);
+    let _ = echo_thread.join();
+    println!("[e2e3] done");
+}
+
