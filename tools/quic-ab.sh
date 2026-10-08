@@ -9,7 +9,10 @@
 #   tools/quic-ab.sh cpu      [--arms raw,wg-shim,quic] [--payload 1280] [--n 60000] [--rounds 3] [--mtu 1400] [--profile lab|product]
 #   tools/quic-ab.sh overhead [--n 60000] [--mtu 1400] [--payload 1280] [--profile lab|product]
 #   tools/quic-ab.sh size     [--profile lab,product]
-#   tools/quic-ab.sh mem      [--mode steady|load|conns|rss] [--arms ...] [--rounds 3] [--conns 5]
+#   tools/quic-ab.sh mem      [--mode steady|load|conns|conns-load|rss] [--arms ...] [--rounds 3]
+#                             [--conns N（奇数序列 1,3,5,…，N=连接数上界）]
+#                             [--conns-points "1,2,3,4,5"（显式点集；缺省 = 五点口径）]
+#                             [conns-load 档环境旋钮：CONNS_LOAD_N/RATE/SIZE/AFTER/SAMPLES]
 #   tools/quic-ab.sh all      （顺序跑 cpu → overhead → size → mem）
 #
 # 产物：${QUIC_AB_DIR:-/tmp/quic-ab/<时间戳>}/（逐轮原始件 + summary.txt + bins.sha256 + loadavg.tsv）
@@ -35,7 +38,13 @@ MTU=1400
 PROFILE="lab"
 MODE="steady"
 CONNS=5
-CONNS_POINTS=""    # 空 = 由 --conns 推（1,3,5,… 奇数序列）
+CONNS_POINTS=""    # 空 = 缺省点集（见下方 mem_conns）；显式 `--conns-points` 优先
+CONNS_GIVEN=0      # `--conns N` 显式给出 ⇒ 回到「1,3,5,… 到 N」的奇数序列口径
+# 缺省点集（M1 S5-1a：**三点 → 五点**，依据 `docs/reviews/M1-design.md` §9.1-1 的裁决
+# 「拟合口径改五点（N=1..5）+ 三点仅作对照」——三点拟合的 base 截距与斜率对 16K 页粒度
+# 台阶极敏感（M0 同一份数据 96.0K vs 81.6K 的差就来自采样密度）。
+# 三点对照的复现命令：`mem --mode conns --conns-points 1,3,5`。
+DEFAULT_CONNS_POINTS="1,2,3,4,5"
 ARM_LIST=("${(@s:,:)ARMS}")
 
 while (( $# )); do
@@ -47,7 +56,7 @@ while (( $# )); do
     --mtu) MTU="$2"; shift 2 ;;
     --profile) PROFILE="$2"; shift 2 ;;
     --mode) MODE="$2"; shift 2 ;;
-    --conns) CONNS="$2"; shift 2 ;;
+    --conns) CONNS="$2"; CONNS_GIVEN=1; shift 2 ;;
     --conns-points) CONNS_POINTS="$2"; shift 2 ;;
     -h|--help) sed -n '2,20p' "$0"; exit 0 ;;
     *) echo "!! 未知参数：$1" >&2; exit 2 ;;
@@ -383,6 +392,7 @@ cmd_mem() {
     steady)  mem_steady "$p" "$out" ;;
     load)    mem_load "$p" "$out" ;;
     conns)   mem_conns "$p" "$out" ;;
+    conns-load) mem_conns_load "$p" "$out" ;;
     rss)     mem_rss "$p" "$out" ;;
     *) die "未知 --mode：$MODE" ;;
   esac
@@ -445,21 +455,30 @@ mem_load() {  # peak_probe.sh 口径：N=300000 传输中每 250ms 采样 max + 
 }
 
 mem_conns() {  # multiconn：点集拟合 base + 每连接边际（服务端 footprint）
-  # 口径（设计 §4.3）：默认点集 = 1,3,5（三点）；`--conns N` ⇒ 取 1,3,5,… 到 N（奇数序列）；
-  # `--conns-points "1,2,3,4,5"` 显式指定（供「5 点拟合」这类补测**可复现**——代码门 M2）。
+  # 口径（M1 S5-1a 裁决，`docs/reviews/M1-design.md` §9.1-1）：
+  #   缺省 = **五点**（`DEFAULT_CONNS_POINTS`，1,2,3,4,5 —— M1 起生效；三点对照片
+  #   用 `--conns-points 1,3,5` 显式指定）；
+  #   `--conns N` ⇒ 取 1,3,5,… 到 N（奇数序列，M0 旧口径的**显式**形态，供 32 连接扩展）；
+  #   `--conns-points "…"` 显式指定（优先于 --conns）。
   local p="$1" out="$2"
   local bin=""; bin=$(runner "$p" multiconn)
   [[ -x "$bin" ]] || die "multiconn 探针不在：$bin"
   local pts=()
   local fit_pts=()
+  local pts_src=""
   if [[ -n "$CONNS_POINTS" ]]; then
     pts=("${(@s:,:)CONNS_POINTS}")
-  else
+    pts_src="--conns-points（显式）"
+  elif (( CONNS_GIVEN )); then
     local n=1
     while (( n <= CONNS )); do pts+=($n); (( n += 2 )); done
     (( ${#pts} >= 1 )) || pts=(1)
+    pts_src="--conns=$CONNS（奇数序列）"
+  else
+    pts=("${(@s:,:)DEFAULT_CONNS_POINTS}")
+    pts_src="缺省五点口径（M1 §9.1-1）"
   fi
-  echo "点集：${(j:, :)pts}（--conns=$CONNS${CONNS_POINTS:+ --conns-points=$CONNS_POINTS}）" | tee -a "$out"
+  echo "点集：${(j:, :)pts}（口径 = $pts_src${CONNS_POINTS:+；--conns-points=$CONNS_POINTS}）" | tee -a "$out"
   for n in "${pts[@]}"; do
     local slog="$OUT/conns-$n-srv.out"
     "$bin" server "$n" > "$slog" 2>&1 &   # multiconn 的 server 读 argv[2]（不用 env）
@@ -497,8 +516,7 @@ mem_conns() {  # multiconn：点集拟合 base + 每连接边际（服务端 foo
   printf '%s\n' "${fit_pts[@]}" | tee -a "$out"
 }
 
-mem_rss() {  # **诊断档，不作判据**（lab 已证：同机两臂差 4.3MB 而二进制差 176B）
-  local p="$1" out="$2"
+mem_rss() {  # **诊断档，不作判据**（lab 已证：同机两臂差 4.3MB 而二进制差 176B）  local p="$1" out="$2"
   for arm in "${ARM_LIST[@]}"; do
     local rounds=()
     for r in $(seq 1 $ROUNDS); do
@@ -524,6 +542,52 @@ mem_rss() {  # **诊断档，不作判据**（lab 已证：同机两臂差 4.3MB
   done
 }
 
+# ---------- 负载态（M1 §9.1-4）：N 连接 + 持续流量的服务端 footprint ----------
+# 判据（`docs/reviews/M1-design.md` §9.1-4）：「出口 32 连接 + 持续流量 ⇒ footprint 增量
+# ≤ 64 MiB + 自有队列上限」（64 MiB = 32 × (1 MiB send + 1 MiB recv)，§6.3 裁决）。
+# 同一轮里先采**空转**（建链后 start-after 窗内）再采**负载态**（流量窗内）⇒ 增量可直接算。
+mem_conns_load() {
+  local p="$1" out="$2"
+  local bin=""; bin=$(runner "$p" multiconn)
+  [[ -x "$bin" ]] || die "multiconn 探针不在：$bin"
+  local n="${CONNS_LOAD_N:-32}"
+  local rate="${CONNS_LOAD_RATE:-200}"   # 每连接 pps（N×rate = 总入流）
+  local size="${CONNS_LOAD_SIZE:-1280}"
+  local after="${CONNS_LOAD_AFTER:-6}"   # 空转相位长度（秒）
+  local samples="${CONNS_LOAD_SAMPLES:-40}"  # 负载相位采样数（×0.5s）
+  local dur=$(( after + samples / 2 + 6 ))
+  local slog="$OUT/connsload-$n-srv.out"
+  local clog="$OUT/connsload-$n-cli.out"
+  echo "负载态档：N=$n 每连接 $rate pps × $size B；空转相位 ${after}s，负载相位 $(( samples / 2 ))s" | tee -a "$out"
+  "$bin" server "$n" --load > "$slog" 2>&1 &
+  local spid=$!; KIDS+=($spid)
+  local i=0 port=""
+  while (( i < 100 )); do
+    port=$(grep -m1 '^PORT ' "$slog" 2>/dev/null | awk '{print $2}')
+    [[ -n "$port" ]] && break
+    sleep 0.1; (( i++ ))
+  done
+  [[ -n "$port" ]] || die "multiconn 服务端未报 PORT（conns-load）"
+  "$bin" "$port" "$n" --load --rate "$rate" --size "$size" --dur "$dur" --start-after "$after" > "$clog" 2>&1 &
+  local cpid=$!; KIDS+=($cpid)
+  sleep 2.5
+  local idle=(${(f)"$(sample_footprint "$spid" 4)"})
+  local idle_med=""; idle_med=$(lower_median "${idle[@]}")
+  sleep $(( after - 2 ))
+  local vals=(${(f)"$(sample_footprint "$spid" $samples)"})
+  local load_med=""; load_med=$(lower_median "${vals[@]}")
+  local peak=0 v
+  for v in $vals; do (( v > peak )) && peak=$v; done
+  local delta=$(( load_med - idle_med ))
+  local limit=65536   # 64 MiB（K）
+  local verdict="过"
+  (( delta > limit )) && verdict="不过"
+  printf 'multiconn 负载态（N=%s）：空转=%sK；负载态中位=%sK 峰值=%sK；增量=%sK（门槛 ≤%sK=64MiB；判=%s）\n' \
+    "$n" "$idle_med" "$load_med" "$peak" "$delta" "$limit" "$verdict" | tee -a "$out" "$OUT/summary.txt"
+  echo "（负载相位逐次采样，K）：${(j:, :)vals}" >> "$out"
+  kill "$cpid" "$spid" 2>/dev/null || true
+}
+
 # ---------- 收束：bins 指纹 + 读数 ----------
 finalize() {
   {
@@ -534,7 +598,7 @@ finalize() {
     echo "=== 环境 ==="
     echo "host: $(uname -a)"
     echo "loadavg（首/末）: $(head -1 "$OUT/loadavg.tsv") / $(tail -1 "$OUT/loadavg.tsv")"
-    echo "args: arms=$ARMS payload=$PAYLOAD n=$N rounds=$ROUNDS mtu=$MTU profile=$PROFILE mode=$MODE"
+    echo "args: arms=$ARMS payload=$PAYLOAD n=$N rounds=$ROUNDS mtu=$MTU profile=$PROFILE mode=$MODE conns=$CONNS conns_points=${CONNS_POINTS:-（缺省 1,2,3,4,5）}"
     echo "rustc: $(rustc --version)"
   } >> "$OUT/summary.txt"
   log "完成：产物在 $OUT（summary.txt / loadavg.tsv / 逐轮原始件）"

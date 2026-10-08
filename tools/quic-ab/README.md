@@ -29,8 +29,12 @@
   （设计 §4.2 的默认口径）——差异对每包 CPU 无影响（比值口径），但读数次数不同；
 - `mem --mode load` 的采样窗 = 120×250ms = **30s**（lab `peak_probe.sh` 为 60×250ms = 15s）
   ——覆盖更完整，代价是单臂更久；
-- `mem --mode conns` 的点集：默认 `1,3,5`（设计 §4.3 口径，`--conns 5` ⇒ 1,3,5；
-  `--conns N` ⇒ 1,3,5,… 到 N），可用 `--conns-points "1,2,3,4,5"` 显式指定（5 点拟合可复现）；
+- `mem --mode conns` 的点集（**M1 S5-1a 起：缺省 = 五点 `1,2,3,4,5`**——依据
+  `docs/reviews/M1-design.md` §9.1-1 的裁决「拟合口径改五点（N=1..5）+ 三点仅作对照」；
+  三点拟合的 base 截距/斜率对 16K 页粒度台阶极敏感，M0 同一份数据的 96.0K vs 81.6K 即
+  采样密度差异）：缺省五点；`--conns N` ⇒ 1,3,5,… 到 N（奇数序列 = M0 旧口径的显式形态，
+  供 32 连接扩展用）；`--conns-points "…"` 显式指定（优先于 `--conns`；三点对照片
+  用 `--conns-points 1,3,5`）；
   拟合 = **全点最小二乘**（旧 lab 的手抄 37.6K/连接为 5 点口径，原始采样未留存）；
 - `arms/size`（四档第三格）的 ring 来源与 lab 的 `size-probe2` **不同**：lab 带
   `[patch] ring = ring-shim`（boringtun 走垫片），本 harness 的 arms 无 patch ⇒ boringtun 走
