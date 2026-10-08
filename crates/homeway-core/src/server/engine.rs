@@ -1256,7 +1256,7 @@ fn driver_loop(
         } else {
             intercept.pump()
         };
-        route_encap(&tx, device, &mut bind, &mut out);
+        route_encap(&tx, device, &mut bind, &mut out, quic_face.as_ref());
         // ④ WG 定时器（握手重传/keepalive/服务端主动握手的产出面）
         device.tick_timers(&mut out);
         bind.send_wire(&out); // P1 定位批回退全量 Queued（设计 v2 形态——控制面同队；
@@ -1384,7 +1384,7 @@ fn driver_loop(
     loop {
         let tx = intercept.pump_grace(deadline);
         let mut out2 = InboundOut::default();
-        route_encap(&tx, device, &mut bind, &mut out2);
+        route_encap(&tx, device, &mut bind, &mut out2, quic_face.as_ref());
         out2.wire.clear();
         // 评审 r2-1.1 兜底：滞留未清空不提前收摊（流表空但尾数据还在整形队列——
         // 主修在 pump_grace 的全量释放面，这里是宽限循环侧的第二道闸）。
@@ -1542,13 +1542,35 @@ fn pub_short(p: &[u8; 32]) -> String {
     p.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
-/// 拦截层出站明文包 → 按目的地址查 peer → encap → 腿帧发出。
-fn route_encap(tx: &[Vec<u8>], device: &mut Device, bind: &mut ServerBind, out: &mut InboundOut) {
+/// 拦截层出站明文包 → 按目的地址分流（M1 设计 §1.5）：
+/// `dst == 设备 tun_ip`（`hw-app`）且该设备已在 QUIC 面登记 ⇒ **DATAGRAM**（QUIC 出站队列；
+/// 满 = 丢 + 计数，§6.4）；其余（`tunnel_ip` = 服务面自带连接、QUIC 档未登记的 WG 设备、
+/// 未知 dst）⇒ **WG `device.encapsulate` 原样**。
+///
+/// 为什么 `tunnel_ip` 必须留在 WG（§1.5）：客户端核的 `bridge_host` 拨号走
+/// `session_connect_target → gen_client.connect_deadline`（今天就是 WG/栈 B）——M1 把
+/// 服务面留在 WG，M3 才换 `STREAM[tag]`。分出的 QUIC 包**不进 `out.wire`**（否则
+/// `bind.send_wire` 会把同一包再发一遍给 WG peer）。
+fn route_encap(
+    tx: &[Vec<u8>],
+    device: &mut Device,
+    bind: &mut ServerBind,
+    out: &mut InboundOut,
+    quic: Option<&homeway_quic::ExitQuic>,
+) {
     for pkt in tx {
-        let dst: Option<IpAddr> = intercept::nat_view_dst(pkt).map(IpAddr::V4);
-        match dst {
-            Some(d) => device.encapsulate(&d, pkt, out),
-            None => continue, // 畸形：静默丢（拦截层产出恒可解析——防御位）
+        let Some(IpAddr::V4(d)) = intercept::nat_view_dst(pkt).map(IpAddr::V4) else {
+            continue; // 畸形：静默丢（拦截层产出恒可解析——防御位）
+        };
+        let mut via_wg = true;
+        if let Some(q) = quic {
+            if let Some(key) = device.tun_ip_owner(&d) {
+                // `Unbound` = 该设备没有 QUIC 连接（wg 档/未登记/面已死）⇒ 回落 WG 原样
+                via_wg = q.send_to_pub(&key, pkt) != homeway_quic::ExitSend::Handled;
+            }
+        }
+        if via_wg {
+            device.encapsulate(&IpAddr::V4(d), pkt, out);
         }
     }
     bind.send_wire(out);
@@ -2498,6 +2520,64 @@ mod tests {
         q.extend_from_slice(&1u16.to_be_bytes()); // A
         q.extend_from_slice(&1u16.to_be_bytes()); // IN
         q
+    }
+
+    /// **判据（S1-5 的判定面）**：出站按 dst 分流——`tun_ip` 归 QUIC 档键、`tunnel_ip`
+    /// 与未知地址不归（⇒ WG 原样）。QUIC 侧的真投递在 `homeway-quic` 的出口面用例里断言。
+    #[test]
+    fn tun_ip_owner_is_the_quic_split_key() {
+        let mut device = dev();
+        let pubkey = [0x61u8; 32];
+        device.add_peer(PeerConfig {
+            pubkey,
+            psk: [0x62; 32],
+            tunnel_ip: Ipv4Addr::new(100, 64, 3, 1),
+            tun_ip: Ipv4Addr::new(100, 64, 3, 2),
+        });
+        assert_eq!(
+            device.tun_ip_owner(&Ipv4Addr::new(100, 64, 3, 2)),
+            Some(pubkey),
+            "tun_ip（hw-app）⇒ QUIC 档键"
+        );
+        assert_eq!(
+            device.tun_ip_owner(&Ipv4Addr::new(100, 64, 3, 1)),
+            None,
+            "tunnel_ip（hw-tun，服务面自带连接）⇒ 不归 QUIC（WG 原样）"
+        );
+        assert_eq!(device.tun_ip_owner(&Ipv4Addr::new(100, 64, 3, 9)), None, "未知 ⇒ 不归");
+    }
+
+    /// **判据（S1-5 的回落面）**：`route_encap` 在 QUIC 面**无绑定**时回落 WG 原样——
+    /// 真起一枚出口面（未登记任何设备）作桩：`tun_ip` 目的的包仍走 `device.encapsulate`
+    /// （⇒ 无 endpoint 计数 +1），而不是被静默吞掉。
+    #[test]
+    fn route_encap_falls_back_to_wg_when_unbound() {
+        let (_, logf) = line_sink();
+        let quic = homeway_quic::ExitQuic::start(
+            std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("回环可绑"),
+            homeway_quic::ExitQuicConfig::new(homeway_quic::Ed25519Seed::from_bytes([0x11; 32]), 4),
+            Arc::clone(&logf),
+        )
+        .expect("端点可起");
+        let mut device = dev();
+        let pk = [0x71u8; 32];
+        device.add_peer(PeerConfig {
+            pubkey: pk,
+            psk: [0x72; 32],
+            tunnel_ip: Ipv4Addr::new(100, 64, 4, 1),
+            tun_ip: Ipv4Addr::new(100, 64, 4, 2),
+        });
+        let mut bind =
+            ServerBind::open_bound(0, "", None, None, Arc::clone(&logf)).expect("bind 可起");
+        let mut out = InboundOut::default();
+        let dst = Ipv4Addr::new(100, 64, 4, 2);
+        let tx = vec![udp_pkt(dst, dst, 40000, 53, b"x")];
+        route_encap(&tx, &mut device, &mut bind, &mut out, Some(&quic));
+        assert!(
+            device.no_endpoint_drops >= 1,
+            "无绑定 ⇒ QUIC 面报 Unbound ⇒ 回落 WG encap（未学 endpoint ⇒ 计数 +1）"
+        );
+        assert!(quic.stop_within(Instant::now() + Duration::from_secs(2)), "面应能收工");
     }
 
     /// P0-2 端到端不变量：表满淘汰后 `apply_dev_ops` **真摘掉** victim 的 peer——
