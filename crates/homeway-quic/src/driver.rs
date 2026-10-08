@@ -23,7 +23,6 @@
 
 use std::any::Any;
 use std::io;
-use std::net::SocketAddrV4;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -34,13 +33,15 @@ use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{self as tmpsc, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinSet;
 
+use crate::client::dataplane::{self, DropNote};
 use crate::client::{self, Face, Live, MigrationEvent, Watch};
 use crate::cmd::{
     Candidate, Cmd, DropReason, IslandErr, IslandEvent, IslandSnapshot, Logf, OnEvent, OnUnhealthy,
-    RaceOutcome,
+    RaceOutcome, Via,
 };
 use crate::config::IslandConfig;
 use crate::sync_util::{lock_unpoison, log_spawn_failed, ExitSignal};
+use crate::tun::{self, ReturnPath, TunCounters};
 
 /// 驱动线程名（镜像 `homeway-wg`）。
 pub(crate) const ISLAND_THREAD: &str = "homeway-quic";
@@ -51,6 +52,8 @@ pub(crate) const REAP_THREAD: &str = "hw-quic-reap";
 const TICK: Duration = Duration::from_millis(250);
 /// 不健康原因（判据语义取值集 `{patrol, fd, panic, stop}` 的一员）。
 const REASON_PANIC: &str = "panic";
+/// TUN fd 面判死分类（镜像 `wgcore::TunFdDead → markUnhealthy("fd")`；既有取值集的一员）。
+const REASON_FD: &str = "fd";
 /// 无注入（**生产路径恒取此值**；注入缝只在 `#[cfg(test)]` 的 `seams` 面里活）。
 const NO_SEAM: u8 = 0;
 
@@ -84,8 +87,11 @@ struct IslandCtx {
     logf: Logf,
     /// 不健康回调（可被 `SetOnUnhealthy` 运行时替换 ⇒ 锁内只放 `Arc<dyn Fn>` 的搬运）。
     on_unhealthy: Mutex<OnUnhealthy>,
-    /// 事件回调（`SetOnEvent` 安装；未装 = 只入快照 + 行）。
-    on_event: Mutex<Option<OnEvent>>,
+    /// 事件回调（`SetOnEvent` 安装；未装 = 只入快照 + 行）。`Arc` 形态：数据面任务
+    /// （回程泵）也要经同一条计数面上报。
+    on_event: Arc<Mutex<Option<OnEvent>>>,
+    /// TUN 面的共享计数（读线程/写线程两写、同步面读——`wgcore::TunCounters` 语义）。
+    counters: Arc<TunCounters>,
 }
 
 impl IslandCtx {
@@ -107,6 +113,8 @@ pub struct Island {
     exit: Arc<ExitSignal>,
     /// 状态快照（同步面轮询）。
     snapshot: Arc<Mutex<IslandSnapshot>>,
+    /// TUN 面计数（需求信号读面：`swap_out_pkts`/`last_outbound_at` 与 `wgcore` 同接口）。
+    counters: Arc<TunCounters>,
     logf: Logf,
     on_unhealthy: OnUnhealthy,
 }
@@ -144,6 +152,7 @@ impl Island {
         let snapshot = Arc::new(Mutex::new(IslandSnapshot::default()));
         let stop = Arc::new(AtomicBool::new(false));
         let exit = Arc::new(ExitSignal::new());
+        let counters = TunCounters::new();
         let patrol = cfg.patrol;
 
         let ctx = IslandCtx {
@@ -152,11 +161,15 @@ impl Island {
             exit: Arc::clone(&exit),
             logf: Arc::clone(&logf),
             on_unhealthy: Mutex::new(Arc::clone(&on_unhealthy)),
-            on_event: Mutex::new(None),
+            on_event: Arc::new(Mutex::new(None)),
+            counters: Arc::clone(&counters),
         };
+        let tier_tx = IslandTx(tx.clone()); // 岛线程侧的命令口（TUN 线程也各持一份）
         let handle = thread::Builder::new()
             .name(ISLAND_THREAD.into())
-            .spawn(move || thread_body(rt, rx, ctx, cfg, patrol, ready_tx, seam))?;
+            .spawn(move || {
+                thread_body(rt, rx, tier_tx, ctx, cfg, patrol, ready_tx, seam)
+            })?;
 
         // 端点/身份的就绪握手（失败 → join 取回证据 → 报错，不留半起态）
         match ready_rx.recv() {
@@ -177,6 +190,7 @@ impl Island {
             handle: Mutex::new(Some(handle)),
             exit,
             snapshot,
+            counters,
             logf,
             on_unhealthy,
         })
@@ -188,8 +202,34 @@ impl Island {
     }
 
     /// 状态快照（轮询；无阻塞）。
+    ///
+    /// 计数面（`packets_out`）**原子直读**（与出口面的 `ExitStats::snapshot` 同款：反应式、
+    /// 不必等巡检拍）——每连接/每包的计数不该有 250ms 的快照延迟。
     pub fn snapshot(&self) -> IslandSnapshot {
-        lock_unpoison(&self.snapshot).clone()
+        let mut s = lock_unpoison(&self.snapshot).clone();
+        s.packets_out = self.counters.write_pkts();
+        s
+    }
+
+    /// 取走并清零 App 出站包计数（**需求信号的生产者面**；设计 §2.5 的「接口不变、来源
+    /// 切换」——名字/语义与 `wgcore::Client::swap_out_pkts` 同形，quic 档的消费点
+    /// （`session/recover` 的 rearm/heal）改读本方法）。
+    pub fn swap_out_pkts(&self) -> i64 {
+        self.counters.swap_out_pkts()
+    }
+
+    /// 最近出站包时刻（**单调面**换算；语义与 `wgcore::Client::last_outbound_at` 同形：
+    /// 0 = 本世代从未有过应用出站）。
+    pub fn last_outbound_at(&self) -> Option<Instant> {
+        self.counters.last_outbound_at()
+    }
+
+    /// 最近出站包时刻（unix 毫秒；0 = 从未）——`wgcore::Client::last_outbound_unix_ms` 同形。
+    pub fn last_outbound_unix_ms(&self) -> i64 {
+        self.counters
+            .last_outbound_ns
+            .load(std::sync::atomic::Ordering::Relaxed)
+            / 1_000_000
     }
 
     /// 岛线程是否已退出（`ExitSignal` 置位面；收工后判定与 M1 排障用）。
@@ -279,9 +319,11 @@ impl Drop for Island {
 /// 为什么 `resume_unwind`：设计 §3.6-3 要求 join 侧能识别「岛线程 panic」（记行 +
 /// 再走一次不健康回调），而 §3.6-1 要求分类**即时**（不等收尾）。二者同时成立只有
 /// 「先就地处置、再把 panic 交还 join」一条路——`resume_unwind` 不会重放 panic hook。
+#[allow(clippy::too_many_arguments)] // 线程起点一次性移交全部状态（同 `exit::thread_body` 口径）
 fn thread_body(
     rt: Runtime,
     rx: UnboundedReceiver<Cmd>,
+    tx: IslandTx,
     ctx: IslandCtx,
     cfg: IslandConfig,
     patrol: Duration,
@@ -289,7 +331,7 @@ fn thread_body(
     seam: u8,
 ) {
     let res = catch_unwind(AssertUnwindSafe(|| {
-        run_driver(&rt, rx, &ctx, cfg, patrol, ready_tx, seam)
+        run_driver(&rt, rx, tx, &ctx, cfg, patrol, ready_tx, seam)
     }));
     if let Err(payload) = res {
         let msg = panic_msg(payload.as_ref());
@@ -315,6 +357,19 @@ enum Job {
         reply: crate::cmd::IslandReply<Duration>,
         result: Result<Duration, IslandErr>,
     },
+    /// 回程泵（常驻任务：DATAGRAM → 有界队列 → TUN 写线程；`Ok(())` = 连接结束/收工）。
+    Return,
+}
+
+/// TUN 面（数据面的 fd 侧；`TunAttach` 时装配，随岛收工/连接结束而弃）。
+///
+/// 只留「数据面需要读的两件」：内层 MTU（窄路径判据）与回程队列（回程泵的落点）。
+/// fd 本身由两枚线程持有（读/写各一），岛线程**不再碰 fd**（所有权在扩展）。
+struct TunPlane {
+    /// 内层 MTU（N-a 行与「窄路径不可用」判据的输入；1280）。
+    mtu: u32,
+    /// 回程队列（岛 → 写线程；有界 2048 条）。
+    ret: Arc<ReturnPath>,
 }
 
 /// 岛线程独占的驱动状态（不上锁——只有本线程碰它）。
@@ -335,15 +390,23 @@ struct DriverState {
     na_logged: bool,
     /// 巡检节拍（刷新 + 迁移保持判据；构造期定案，运行期不改）。
     patrol: Duration,
+    /// TUN 面（数据面；未附加 = `None`）。
+    tun: Option<TunPlane>,
+    /// 回程泵是否已起（连接/隧道面任一后到都能补起；连接死时复位）。
+    pump_up: bool,
+    /// 「窄路径不可用」行的去重位（记的是当时观测到的 `mds`）。
+    narrow_logged: Option<u32>,
 }
 
 /// 驱动循环：命令 / 长任务回口 / 巡检拍**三源** `select!`（M1 设计 §2.1 的驱动循环形态）。
 ///
 /// 与 `wgcore` 的 `poll(2)` 形态同义：命令到点即处置（无需回执的热路径直落），
 /// 无命令则按 [`TICK] 回看 stop 位并做拍内务。
+#[allow(clippy::too_many_arguments)] // 同 `thread_body`：线程起点单参化无收益
 fn run_driver(
     rt: &Runtime,
     mut rx: UnboundedReceiver<Cmd>,
+    tx: IslandTx,
     ctx: &IslandCtx,
     cfg: IslandConfig,
     patrol: Duration,
@@ -351,7 +414,7 @@ fn run_driver(
     seam: u8,
 ) {
     rt.block_on(async move {
-        let mut face = match Face::open(cfg) {
+        let mut face = match Face::open(cfg, Arc::clone(&ctx.logf)) {
             Ok(f) => f,
             Err(e) => {
                 let _ = ready_tx.send(Err(e));
@@ -370,6 +433,9 @@ fn run_driver(
             watch: None,
             na_logged: false,
             patrol,
+            tun: None,
+            pump_up: false,
+            narrow_logged: None,
         };
         let mut jobs: JoinSet<Job> = JoinSet::new();
         loop {
@@ -379,7 +445,7 @@ fn run_driver(
             tokio::select! {
                 cmd = rx.recv() => match cmd {
                     Some(Cmd::Stop) => break,
-                    Some(c) => handle_cmd(c, &mut st, &mut face, ctx, &mut jobs, seam).await,
+                    Some(c) => handle_cmd(c, &mut st, &mut face, ctx, &mut jobs, &tx, seam).await,
                     // 所有投递口掉光（实践里非主退出路径——同步面的岛句柄持 sender；
                     // 主路径是 `Cmd::Stop`／stop 位，见设计 §3.2）
                     None => break,
@@ -390,7 +456,7 @@ fn run_driver(
                             st.racing = false;
                             match result {
                                 Ok((est, outcome)) => {
-                                    adopt(&mut st, ctx, face.local(), est);
+                                    adopt(&mut st, ctx, &face, est, &mut jobs);
                                     let _ = reply.send(Ok(outcome));
                                 }
                                 Err(e) => {
@@ -401,6 +467,10 @@ fn run_driver(
                         }
                         Ok(Job::Probe { reply, result }) => {
                             let _ = reply.send(result);
+                        }
+                        // 回程泵结束（连接死/隧道面收工）：连接死面由 housekeeping 统一处置
+                        Ok(Job::Return) => {
+                            st.pump_up = false;
                         }
                         // 任务被 abort（收工路径）：其回执口随之 drop ⇒ 调用侧归 EngineGone
                         Err(_aborted) => {}
@@ -416,13 +486,49 @@ fn run_driver(
     });
 }
 
+/// 起回程泵（每连接一枚常驻任务；`pump_up` 防重、连接死时复位）：
+/// `read_datagram` → 有界队列 → TUN 写线程（满 ⇒ 丢 + 计 `回程队列满`）。
+///
+/// 形态取「任务」而不是驱动循环的 select 分支：与出口面的 `conn::datagrams` 同构，
+/// 且不依赖 `read_datagram` 的取消安全面（任务是独占的、只在连接死或被 abort 时结束）。
+fn maybe_start_pump(st: &mut DriverState, ctx: &IslandCtx, jobs: &mut JoinSet<Job>) {
+    if st.pump_up {
+        return;
+    }
+    let (Some(live), Some(tun)) = (st.live.as_ref(), st.tun.as_ref()) else {
+        return;
+    };
+    let note = drop_note(ctx);
+    let conn = live.conn.clone();
+    let ret = Arc::clone(&tun.ret);
+    jobs.spawn(async move {
+        dataplane::pump_return(conn, ret, note).await;
+        Job::Return
+    });
+    st.pump_up = true;
+}
+
 /// 采纳胜者（§2.2 的现任裁决：**旧的已登记连接显式关闭**；N-a 行只在首个连接时打一次）。
-fn adopt(st: &mut DriverState, ctx: &IslandCtx, local: SocketAddrV4, est: client::Established) {
+fn adopt(
+    st: &mut DriverState,
+    ctx: &IslandCtx,
+    face: &Face,
+    est: client::Established,
+    jobs: &mut JoinSet<Job>,
+) {
     let patrol = st.patrol;
+    let local = face.local();
+    // S2-7：中继候选的（地址 → label）在采纳时**钉住**（后续 `SetCandidates` 不该把
+    // 现任连接的条目抹掉——否则在用的中继连接上行会突然变裸包）。
+    if let Via::Relay { label } = est.via {
+        face.relays().pin(est.ep, label);
+    }
     let adopted = Live::new(est, patrol);
     if let Some(old) = st.live.replace(adopted) {
         old.conn.close(quinn::VarInt::from_u32(0), b"replaced by newer race");
-        (*ctx.logf)("quic: 替换旧连接（旧连接已 CONNECTION_CLOSE）");
+        if !st.na_logged {
+            (*ctx.logf)("quic: 替换旧连接（旧连接已 CONNECTION_CLOSE）");
+        }
     }
     if !st.na_logged {
         st.na_logged = true;
@@ -433,17 +539,50 @@ fn adopt(st: &mut DriverState, ctx: &IslandCtx, local: SocketAddrV4, est: client
             live.mds().unwrap_or(0)
         ));
     }
+    // 「窄路径不可用」行（设计 §12-① ⑤：`mds < 内层MTU` 时除计数外再打一条）：1280
+    // 内层包在窄路径上**每一个都会被丢**（端到端 TCP 反复重传同尺寸段 ⇒ 用户感知是断），
+    // 故必须**显式**告知，而不是靠计数行让人猜。
+    check_narrow_path(st, ctx);
+    // 数据面：隧道面已附加 ⇒ 起回程泵（S2-4）
+    maybe_start_pump(st, ctx, jobs);
+}
+
+/// 「窄路径不可用」判据（`mds < 内层 MTU`；同一 `mds` 只打一次——连接换了再判）。
+fn check_narrow_path(st: &mut DriverState, ctx: &IslandCtx) {
+    let (Some(live), Some(tun)) = (st.live.as_ref(), st.tun.as_ref()) else {
+        return;
+    };
+    let Some(mds) = live.mds() else { return };
+    if mds >= tun.mtu || st.narrow_logged == Some(mds) {
+        return;
+    }
+    st.narrow_logged = Some(mds);
+    (*ctx.logf)(&format!(
+        "quic: 窄路径不可用 —— max_datagram_size={mds}B < 内层 MTU={}B，1280 内层包将全部被丢（丢 + 计数不静默；MTU 降级旋钮 = HOMEWAY_QUIC_MTU）",
+        tun.mtu
+    ));
 }
 
 /// 拍内务（无命令时每 [`TICK`] 一次）：连接死 → 刷新 → 迁移保持检测 → 快照同步。
+///
+/// **巡检接线（设计 §2.5，S2-6 的判据面）**：
+/// - QUIC 连接死（`Connection::closed()` 的可观测等价面 = `close_reason()` 非空）⇒
+///   **即时**归既有分类 `patrol`（`mark_unhealthy_if_current(gen,"patrol")` 的岛侧落点）；
+///   「即时」而非「等下一拍探活 3 连败」的理由：岛内没有恢复阶梯（阶梯在世代层，
+///   M1 不动），连接死是**确定性**判据、不是抖动 ⇒ 让上层立刻有信号（M1 的「断线恢复
+///   ≤3.5s」判据靠它，等 3×60s 的巡检拍毫无意义）。
+/// - **反向腿失败不拆世代**：岛只看得见 QUIC 这条腿 ⇒ 只有 QUIC 连接的死驱动分类；
+///   WG 面的巡检失败（世代层的事）不会经岛触发任何动作。
+/// - **不误伤**：探活失败/超时（连接仍在）**不**触发分类——那是世代层阶梯的输入
+///   （`Cmd::Probe` 的结论由世代层消费；岛不抢跑）。
 async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx) {
     let patrol = st.patrol;
-    // ① 连接死（对端关闭/空闲回收）：清面 + 记行。不健康分类与恢复阶梯 = S2b 接线
-    //    （设计 §2.5：QUIC 连接死归既有 `patrol` 分类；此处只留可观测面）。
+    // ① 连接死（对端关闭/空闲回收）：清面 + 记行 + **归 `patrol` 分类**（S2-6 判据）
     if st.live.as_ref().is_some_and(|l| !l.alive()) {
-        (*ctx.logf)("quic: 连接已断 —— 等上层重连/重赛跑（阶梯接线 = S2b）");
+        (*ctx.logf)("quic: 连接已断 —— 等上层重连/重赛跑（阶梯接线 = 世代层）");
         st.live = None;
         st.watch = None;
+        st.pump_up = false; // 回程泵随连接结束自退；新连接另起
     }
     // ② 刷新到点（C15'；写失败 = 连接已断）
     if let Some(live) = st.live.as_mut() {
@@ -451,6 +590,7 @@ async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx) {
             (*ctx.logf)("quic: 注册刷新写失败 —— 判连接已断");
             st.live = None;
             st.watch = None;
+            st.pump_up = false;
         }
     }
     // ③ 迁移保持检测（N-b / 未确认；判据本体在 `client::migration`）
@@ -480,11 +620,14 @@ async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx) {
         }
         None => {}
     }
-    // ④ 快照同步（via/ep/rtt/mtu/candidates 一律由驱动态派生）
+    // ④ 快照同步（via/ep/rtt/mtu/candidates 一律由驱动态派生；local 取端点现值）
     {
         let mut s = lock_unpoison(&ctx.snapshot);
         s.candidates = st.cands.len();
         s.mirrors = st.mirrors;
+        s.local = Some(face.local());
+        s.connections = u64::from(st.live.is_some());
+        s.packets_out = ctx.counters.write_pkts();
         match st.live.as_ref() {
             Some(l) => {
                 s.via = Some(l.via);
@@ -492,6 +635,9 @@ async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx) {
                 s.rtt_ms = l.rtt_ms();
                 s.mtu = l.mds();
                 s.current_mtu = l.current_mtu();
+                let (lost, cong) = l.path_stats();
+                s.lost_packets = lost;
+                s.congestion_events = cong;
             }
             None => {
                 s.via = None;
@@ -501,16 +647,23 @@ async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx) {
                 s.current_mtu = 0;
             }
         }
+        let (relay_tx, rx_ignored, _rx_dgrams, _tx_dgrams) = face.sock_stats();
+        s.relay_tx = relay_tx;
+        s.rx_ignored = rx_ignored;
     }
+    // ⑤ 「窄路径不可用」判据（mds 变小/连接换过都要重判；S2-4）
+    check_narrow_path(st, ctx);
 }
 
 /// 单条命令处置（岛线程内；带 await 的只有赛跑/探活的任务投出与换绑）。
+#[allow(clippy::too_many_arguments)] // 宿主单入口（参数即句柄集；同 `exit::run_exit`）
 async fn handle_cmd(
     cmd: Cmd,
     st: &mut DriverState,
     face: &mut Face,
     ctx: &IslandCtx,
     jobs: &mut JoinSet<Job>,
+    tx: &IslandTx,
     seam: u8,
 ) {
     #[cfg(test)]
@@ -531,25 +684,73 @@ async fn handle_cmd(
             };
             if already {
                 let _ = reply.send(Err(IslandErr::TunAlreadyAttached));
-            } else {
-                // M1 S2a：只登记（读 fd/mtu 入行；TUN 读线程/写线程 = S2-4）
-                (*ctx.logf)(&format!(
-                    "quic: 隧道面已附加（fd={fd}, mtu={mtu}；fd 所有权在扩展，岛从不 close）"
-                ));
-                let _ = reply.send(Ok(()));
+                return;
             }
+            // 数据面（S2-4）：①读线程（`Cmd::TunPacket` 生产者，投递失败自退）；
+            // ②有界回程队列 + 写线程（`ReturnPath`）。fd 所有权在扩展：岛从不 close。
+            let ret = match ReturnPath::new(
+                fd,
+                tx.clone(),
+                Arc::clone(&ctx.counters),
+                Arc::clone(&ctx.logf),
+            ) {
+                Ok(r) => r,
+                Err(e) => {
+                    lock_unpoison(&ctx.snapshot).attached = false; // 半起态不留
+                    (*ctx.logf)(&format!("homeway-tun-write 启动失败（{e}）—— 数据面不可用"));
+                    let _ = reply.send(Err(IslandErr::TunAttach(e)));
+                    return;
+                }
+            };
+            if let Err(e) = tun::spawn_reader(
+                fd,
+                tx.clone(),
+                Arc::clone(&ctx.counters),
+                Arc::clone(&ctx.logf),
+            ) {
+                lock_unpoison(&ctx.snapshot).attached = false;
+                log_spawn_failed(&ctx.logf, tun::READ_THREAD, &e, "应用出站方向不可用（回程面照常）");
+                let _ = reply.send(Err(IslandErr::TunAttach(e)));
+                return;
+            }
+            (*ctx.logf)(&format!(
+                "quic: 隧道面已附加（fd={fd}, mtu={mtu}；数据面已接线：读线程 + 回程队列 {} 条 + 写线程；fd 所有权在扩展，岛从不 close）",
+                tun::RETURN_QUEUE_MAX
+            ));
+            st.tun = Some(TunPlane {
+                mtu,
+                ret,
+            });
+            check_narrow_path(st, ctx);
+            maybe_start_pump(st, ctx, jobs);
+            let _ = reply.send(Ok(()));
         }
         Cmd::TunPacket(pkt) => {
-            // 本切片只计数；**发送路径 = S2-4**。无已登记连接时按 §6.4 归 `未登记`
-            // （「登记前丢弃」）——有连接但尚未接线发送的窗口由 S2-4 落地，不留静默面。
-            let n = pkt.len();
+            // 发送路径（S2-4）：①准入窗由结构保证（`Live` 只在 REG_SETTLE 之后存在）；
+            // ②/③ 检包 + 缓冲预检 + 分类计数 = `client::dataplane::send_datagram_checked`
+            // （**唯一**的 `send_datagram` 调用点）；无连接 ⇒ 归 `未登记`（登记前丢弃）。
             lock_unpoison(&ctx.snapshot).packets_in += 1;
-            if st.live.is_none() {
-                note_drop(ctx, DropReason::Unregistered, 1, "无已登记连接（发送面未接线）", Some(n as u64));
+            match st.live.as_ref() {
+                Some(live) => {
+                    let note = drop_note(ctx);
+                    dataplane::send_datagram_checked(&live.conn, pkt, &note);
+                }
+                None => {
+                    let n = pkt.len();
+                    note_drop(ctx, DropReason::Unregistered, 1, "无已登记连接", Some(n as u64));
+                }
             }
         }
         // 循环侧处置（幂等；重入无害）
         Cmd::Stop => {}
+        Cmd::TunFdDead { msg } => {
+            // 镜像 `wgcore` 的 `TunFdDead`：记行 + 既有取值 `fd` 的分类 + 卸面
+            // （数据面已不可信；连接面留给世代层按阶梯处置）。
+            (*ctx.logf)(&format!("quic: {msg}"));
+            ctx.unhealthy(REASON_FD);
+            st.tun = None;
+            st.pump_up = false;
+        }
         Cmd::SetOnUnhealthy { h } => {
             *lock_unpoison(&ctx.on_unhealthy) = h;
         }
@@ -558,6 +759,9 @@ async fn handle_cmd(
         }
         Cmd::SetCandidates { cands } => {
             let n = cands.len();
+            // S2-7：候选面同时喂 socket 的中继表（发送侧包封的路由键——必须在任何
+            // `connect` 之前装配，否则中继候选的握手包会以裸包发出）
+            face.relays().set(&cands);
             st.cands = cands;
             lock_unpoison(&ctx.snapshot).candidates = n;
             (*ctx.logf)(&format!("quic: 候选清单已更新（{n} 条）"));
@@ -583,6 +787,8 @@ async fn handle_cmd(
             st.race_gate.reset();
             let log_c4 = st.race_gate.due(Instant::now());
             st.mirrors += list.len() as u64;
+            // S2-7：本轮候选（含中继类）先入 socket 的中继表，再发赛跑任务
+            face.relays().set(&list);
             let endpoint = face.endpoint();
             let ccfg = face.client_config();
             let cred = Arc::clone(face.credential());
@@ -628,8 +834,21 @@ async fn handle_cmd(
 
 /// 记一次丢弃（四类计数 + N-c 行 + 事件回调；`ext` = 本次明细里的包长/条数补充）。
 fn note_drop(ctx: &IslandCtx, reason: DropReason, n: u64, detail: &str, ext: Option<u64>) {
+    note_drop_shared(&ctx.snapshot, &ctx.logf, &ctx.on_event, reason, n, detail, ext);
+}
+
+/// 计数上报的**共享件**（岛线程与数据面任务走同一份：一处字段序、一处节流口径）。
+fn note_drop_shared(
+    snapshot: &Mutex<IslandSnapshot>,
+    logf: &Logf,
+    on_event: &Mutex<Option<OnEvent>>,
+    reason: DropReason,
+    n: u64,
+    detail: &str,
+    ext: Option<u64>,
+) {
     let (total, line) = {
-        let mut s = lock_unpoison(&ctx.snapshot);
+        let mut s = lock_unpoison(snapshot);
         let total = s.drops.bump(reason, n);
         let d = s.drops;
         (
@@ -642,15 +861,25 @@ fn note_drop(ctx: &IslandCtx, reason: DropReason, n: u64, detail: &str, ext: Opt
     };
     if log_due(total) {
         let ext = ext.map(|v| format!("，字节/条数={v}")).unwrap_or_default();
-        (*ctx.logf)(&format!(
+        (*logf)(&format!(
             "quic: 丢弃 {line}（本次：{} ×{n} {detail}{ext}；计数行首 3 + 每 100）",
             reason.text()
         ));
     }
-    let ev = lock_unpoison(&ctx.on_event).clone();
+    let ev = lock_unpoison(on_event).clone();
     if let Some(h) = ev {
         h(IslandEvent::DatagramDropped { reason, n });
     }
+}
+
+/// 数据面任务的丢弃上报口（`Arc<dyn Fn>`：常驻任务需要 `'static`——故三件共享件都克隆）。
+fn drop_note(ctx: &IslandCtx) -> DropNote {
+    let snapshot = Arc::clone(&ctx.snapshot);
+    let logf = Arc::clone(&ctx.logf);
+    let on_event = Arc::clone(&ctx.on_event);
+    Arc::new(move |reason, detail| {
+        note_drop_shared(&snapshot, &logf, &on_event, reason, 1, detail, None)
+    })
 }
 
 // ---------- 收工/分类小件 ----------
@@ -696,6 +925,17 @@ impl Island {
 /// 建一枚回环客户端端点、读回内核分配的端口后丢弃——**不建连接、不做身份**。
 ///
 /// 放在本文件而不是 `tests.rs`：异步栈名字只允许出现在异步面（隔离门层 3）。
+#[cfg(test)]
+impl IslandTx {
+    /// 测试缝：一枚**无接收者**的投递口（`send` 恒 `EngineGone`——与「岛已收工」同面）。
+    /// 生产路径的命令口**恒**由 [`Island::tx`] 给出（构造面不开在这个缝上）。
+    pub(crate) fn dead_for_test() -> IslandTx {
+        let (tx, rx) = tmpsc::unbounded_channel::<Cmd>();
+        drop(rx);
+        IslandTx(tx)
+    }
+}
+
 #[cfg(test)]
 pub(crate) fn dep_face_alive_endpoint() -> std::io::Result<std::net::SocketAddr> {
     let rt = tokio::runtime::Builder::new_current_thread()

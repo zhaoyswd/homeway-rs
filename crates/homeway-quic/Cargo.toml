@@ -26,6 +26,10 @@ bytes.workspace = true
 # （S2-6 的登记/刷新，组帧）共用同一个字节层 ⇒ 两侧不会各写一份标签顺序而静默错位。
 hmac.workspace = true
 sha2.workspace = true
+# TUN 面的裸 fd 语义（M1 S2-4：读线程 `read`/`poll`、回程写线程 `write`/`poll`——
+# 形态镜像 `homeway-core::wgcore`，两侧同口径）。**非异步栈名字**（隔离门只约束
+# tokio/quinn/rustls），且不引入新的传递依赖（core 已在用同一版本）。
+libc.workspace = true
 
 # 测试依赖：出口面/客户端面用例走**真线程 + 真回环 IO**（连接/迁移/上限注入），不钉端口、
 # 只判上界（M0 设计 §9.2 flake 口径①②）。`macros` = `#[tokio::test]`；**`test-util`**

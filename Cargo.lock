@@ -618,6 +618,7 @@ version = "0.2.3"
 dependencies = [
  "bytes",
  "hmac",
+ "libc",
  "quinn",
  "rustls",
  "sha2",

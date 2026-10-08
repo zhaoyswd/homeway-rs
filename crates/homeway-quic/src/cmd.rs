@@ -68,6 +68,15 @@ pub enum Cmd {
     /// 同源）并回调 [`OnEvent`]。**无 reply**（热路径；计数丢一次只是少记，不静默面靠
     /// 行 + 快照兜底）。
     DatagramDropped { reason: DropReason, n: u64 },
+    /// TUN fd 判死（S2-4；**形态镜像 `wgcore::Cmd::TunFdDead`**，故同为 `String` 载荷 +
+    /// 无 reply）。岛侧处置 = 记行 + 不健康分类 **`fd`**（既有取值集
+    /// `{patrol,fd,panic,stop}` 的 `fd` 位；与 `wgcore` 的 `TunFdDead → markUnhealthy("fd")`
+    /// 逐字同义）。
+    ///
+    /// 为什么需要它（超出设计 §2.1 六成员的**最小增补**）：QUIC 档的 L3 承载在岛上，
+    /// fd 死了若只记行、不分类，App 侧就没有任何重建信号（等价面在 WG 档由 `wgcore`
+    /// 提供）⇒「功能等价全局代理」不成立。
+    TunFdDead { msg: String },
 }
 
 /// 岛 → 同步面的单次回执口（每命令一条）。
@@ -109,6 +118,10 @@ pub enum IslandErr {
     /// 重绑本地 socket 失败（绑定/非阻塞/换绑）。
     #[error("重绑本地 socket 失败（{0}）")]
     Rebind(#[source] std::io::Error),
+    /// TUN 面装配失败（数据面的读/写线程起不来；`attach` 失败即无数据面——
+    /// 与「半起态不留」同一条纪律）。
+    #[error("TUN 面装配失败（{0}）")]
+    TunAttach(#[source] std::io::Error),
 }
 
 /// 候选的承载类别（设计 §2.1 的 `Via`：候选 = 地址 + 承载类别；中继候选必须带 label
@@ -240,14 +253,16 @@ pub type OnEvent = Arc<dyn Fn(IslandEvent) + Send + Sync + 'static>;
 /// 岛侧状态快照（同步面轮询；**无阻塞**）。
 ///
 /// M1 S2a 起为设计 §2.1 的增补形态（`via/ep/rtt/mirrors/packets_in,out/drops/mtu`），
-/// 另加两条本切片的判据位（`migrations`/`migration_unconfirmed`，见 `Rebind` 的文档）。
+/// 另加设计 §10 的 S2-4/S2-5/S2-7 三条判据位：`local`/`connections`（M0 §8.1 残余项
+/// 「detach 后老世代 UDP 源端口/连接数可观测」）、`relay_tx`/`rx_ignored`（S2-7 的
+/// 「非 kind=5 帧忽略」与中继包封读数）。
 #[derive(Clone, Debug, Default)]
 pub struct IslandSnapshot {
     /// 隧道面是否已 attach。
     pub attached: bool,
     /// `TunPacket` 投递计数（**收到的**包数；是否发送/丢弃见 `drops`）。
     pub packets_in: u64,
-    /// 回程包计数（岛 → TUN）。数据面接线 = S2-4；本切片恒 0。
+    /// 回程包计数（岛 → TUN；写线程成功写入 TUN 的包数，S2-4 起真计数）。
     pub packets_out: u64,
     /// 当前路径承载类别（`None` = 未建连）。
     pub via: Option<Via>,
@@ -267,9 +282,23 @@ pub struct IslandSnapshot {
     pub drops: Drops,
     /// 迁移**完成**次数（重绑后收到对端回包 = 路径确认；设计 §2.3 的 N-b 行）。
     pub migrations: u64,
-    /// 迁移**未确认**位（重绑后一个巡检节拍内无回包 ⇒ 置位；回落重连/重赛跑由上层发起，
-    /// M1 的真阶梯 = S2b 的生命周期接线）。
+    /// 迁移**未确认**位（重绑后一个巡检节拍内无回包 ⇒ 置位）。回落「重连/重赛跑」的
+    /// **动作**在世代层（岛只出判据：本字段 + `patrol` 分类回调；设计 §2.3）。
     pub migration_unconfirmed: bool,
+    /// 当前本地地址（**UDP 源端口**；未就绪 = `None`）。detach 后仍可读 ⇒ M0 §8.1 残余项
+    /// 「老世代 UDP 源端口可观测」的落点。
+    pub local: Option<SocketAddrV4>,
+    /// 在用连接数（0/1；岛单连接结构）。detach 后仍可读 ⇒ 同上「连接数可观测」。
+    pub connections: u64,
+    /// 丢失包计数（`PathStats::lost_packets`；设计 §12-④ 的 A/B 判据读数）。
+    pub lost_packets: u64,
+    /// 拥塞事件计数（`PathStats::congestion_events`；与 `lost_packets` 配对分辨
+    /// 「限速器静默丢被 QUIC 当拥塞」与链路真丢）。
+    pub congestion_events: u64,
+    /// 上行包封次数（中继路径；S2-7 的读数面）。
+    pub relay_tx: u64,
+    /// 收到的腿帧中**非 kind=5** 的条数（忽略面；S2-7 判据的可观测位）。
+    pub rx_ignored: u64,
 }
 
 /// 日志落点（与同步面同形：`Arc<dyn Fn(&str) + Send + Sync>`；域前缀由调用方自带）。

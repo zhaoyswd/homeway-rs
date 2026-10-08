@@ -15,7 +15,9 @@
 //! - 丢弃四类计数 + 事件回调 + N-c 行（`DatagramDropped`）。
 
 use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::os::fd::AsRawFd;
+use std::os::unix::net::UnixDatagram;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -23,7 +25,8 @@ use std::time::{Duration, Instant};
 use tokio::time::Instant as TokioInstant;
 
 use crate::cmd::{
-    Candidate, Cmd, DropReason, IslandErr, IslandEvent, IslandReply, IslandSnapshot, Logf, Via,
+    Candidate, Cmd, DropReason, IslandErr, IslandEvent, IslandReply, IslandSnapshot, Logf,
+    OnUnhealthy, Via,
 };
 use crate::config::{IslandConfig, IslandCredential, TokenSecret};
 use crate::exit::{ExitInbound, ExitQuic, ExitQuicConfig, Reg3Verdict};
@@ -61,7 +64,18 @@ fn island_with(patrol: Duration, pin: RpkPublicKey) -> Island {
     island_with_log(patrol, pin, logf)
 }
 
-fn island_with_log(patrol: Duration, pin: RpkPublicKey, logf: Logf) -> Island {
+/// 不健康回调 + 收集端（断言分类面：`patrol`/`fd` 的取值可达性）。
+fn unhealthy_sink() -> (OnUnhealthy, Receiver<String>) {
+    let (tx, rx) = channel();
+    (
+        Arc::new(move |r: &str| {
+            let _ = tx.send(r.to_owned());
+        }),
+        rx,
+    )
+}
+
+fn island_cfg(patrol: Duration, pin: RpkPublicKey) -> IslandConfig {
     let mut cfg = IslandConfig::new(IslandCredential::new(
         TokenSecret::from_bytes(SECRET),
         PUBKEY,
@@ -70,7 +84,189 @@ fn island_with_log(patrol: Duration, pin: RpkPublicKey, logf: Logf) -> Island {
     ));
     cfg.bind = Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
     cfg.patrol = patrol;
-    Island::start(logf, Arc::new(|_r: &str| {}), cfg).expect("岛可起（含 QUIC 端点）")
+    cfg
+}
+
+/// 岛侧测试入口（带不健康回调；判据：分类值 ∈ 既有取值集）。
+fn island_with_unhealthy(patrol: Duration, pin: RpkPublicKey, h: OnUnhealthy) -> Island {
+    let (logf, _rx) = sink();
+    Island::start(logf, h, island_cfg(patrol, pin)).expect("岛可起（含 QUIC 端点）")
+}
+
+fn island_with_log(patrol: Duration, pin: RpkPublicKey, logf: Logf) -> Island {
+    Island::start(logf, Arc::new(|_r: &str| {}), island_cfg(patrol, pin))
+        .expect("岛可起（含 QUIC 端点）")
+}
+
+/// TUN 面的测试替身：**数据报**语义的 socketpair（一端当 fd 交给岛、另一端当「应用」）。
+/// 用 `UnixDatagram` 而不是 `UnixStream`：写一次 = 一个数据报 ⇒ 读侧不会把两包黏成一包
+/// （TUN fd 的对表语义本来就按包）。
+fn tun_pair() -> (UnixDatagram, UnixDatagram) {
+    UnixDatagram::pair().expect("socketpair(DGRAM)")
+}
+
+/// 把内层包写进「应用侧」（= 岛的 TUN 读线程会读到）。
+fn write_tun(peer: &UnixDatagram, pkt: &[u8]) {
+    peer.send(pkt).expect("写 TUN 一包");
+}
+
+/// 从「应用侧」读回程（有界：读超时即 `None`；只判上界，flake 口径②）。
+fn read_tun(peer: &UnixDatagram, wait: Duration) -> Option<Vec<u8>> {
+    peer.set_read_timeout(Some(wait)).ok()?;
+    let mut buf = vec![0u8; 4096];
+    match peer.recv(&mut buf) {
+        Ok(n) => Some(buf[..n].to_vec()),
+        Err(_) => None,
+    }
+}
+
+/// attach 隧道面（带 reply 的有界等待）。
+fn attach(island: &Island, fd: i32, mtu: u32, wait: Duration) -> Result<(), IslandErr> {
+    let (tx, rx) = channel();
+    island
+        .tx()
+        .send(Cmd::TunAttach { fd, mtu, reply: tx })
+        .map_err(|_| IslandErr::EngineGone)?;
+    match rx.recv_timeout(wait) {
+        Ok(v) => v,
+        Err(_) => panic!("attach 回执超时（岛未应答 ⇒ 挂死）"),
+    }
+}
+
+/// 有界取一条不健康分类（std 通道 + 异步等待；只判上界）。
+async fn wait_reason(rx: &Receiver<String>, wait: Duration) -> Option<String> {
+    let deadline = Instant::now() + wait;
+    loop {
+        match rx.try_recv() {
+            Ok(v) => return Some(v),
+            Err(TryRecvError::Disconnected) => return None,
+            Err(TryRecvError::Empty) => {}
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+}
+
+/// 有界等引擎桩收到一份长度 `len` 的包（每轮 pump；返回包体）。
+async fn wait_packet(
+    stub: &Stub,
+    quic: &ExitQuic,
+    len: usize,
+    wait: Duration,
+) -> Option<Vec<u8>> {
+    let deadline = Instant::now() + wait;
+    loop {
+        stub.pump(quic);
+        if let Some(p) = stub.take_packet(len) {
+            return Some(p);
+        }
+        if Instant::now() >= deadline {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// 「假中继」= S2-7 的**信封/剥壳仪器**（透明 UDP 代理 + 帧转换；**不含**中继控制面：
+/// leg 注册/会话/限速都不实现——S2-7 的判据是信封字节，中继协议本体由 S1c 与全链 E2E 覆盖）。
+///
+/// 两件事与真中继在 QUIC 面上同形：
+/// ① 上行 `[0xAA][label8]‖[0xBB][5]‖pkt` ⇒ 剥全部信封、**裸包**转发给出口（源 = 本代理，
+///    故出口看到的对端就是「中继地址」= 候选地址）；
+/// ② 出口的裸回包 ⇒ 包成 `[0xBB][5]‖pkt` 发回客户端；另推一帧 **hint**（`[0xBB][1]`，
+///    非 kind=5）——真中继会推控制帧（S1c 探针实测 `rx_ignored=4`），客户端必须忽略。
+struct FakeRelay {
+    addr: SocketAddrV4,
+    uplink_frames: Arc<AtomicU64>,
+    bad_label: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl FakeRelay {
+    fn start(exit: SocketAddrV4, label: [u8; 8]) -> FakeRelay {
+        let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("假中继可绑");
+        sock.set_read_timeout(Some(Duration::from_millis(20)))
+            .expect("读超时可设（片界回看停止位；不用 sleep）");
+        let addr = match sock.local_addr().expect("可读地址") {
+            SocketAddr::V4(v) => v,
+            SocketAddr::V6(_) => unreachable!(),
+        };
+        let stop = Arc::new(AtomicBool::new(false));
+        let uplink_frames = Arc::new(AtomicU64::new(0));
+        let bad_label = Arc::new(AtomicBool::new(false));
+        let (stop2, up2, bad2) = (
+            Arc::clone(&stop),
+            Arc::clone(&uplink_frames),
+            Arc::clone(&bad_label),
+        );
+        let handle = std::thread::Builder::new()
+            .name("fake-relay".into())
+            .spawn(move || {
+                let exit = SocketAddr::V4(exit);
+                let mut client: Option<SocketAddr> = None;
+                let mut buf = vec![0u8; 4096];
+                let mut hinted = false;
+                while !stop2.load(Ordering::SeqCst) {
+                    let (n, src) = match sock.recv_from(&mut buf) {
+                        Ok(v) => v,
+                        Err(_) => continue, // 片到：回看停止位
+                    };
+                    if src == exit {
+                        // 下行：裸 QUIC 包 ⇒ 包帧 `[0xBB][5]` 发回客户端
+                        if let Some(c) = client {
+                            let mut f = Vec::with_capacity(n + 2);
+                            f.push(0xBB);
+                            f.push(5);
+                            f.extend_from_slice(&buf[..n]);
+                            let _ = sock.send_to(&f, c);
+                        }
+                        continue;
+                    }
+                    // 上行：信封 `[0xAA][label8]‖[0xBB][5]‖pkt` ⇒ 剥全部 ⇒ 裸包转发出口
+                    client = Some(src);
+                    up2.fetch_add(1, Ordering::SeqCst);
+                    if n >= 11 && buf[0] == 0xAA && buf[9] == 0xBB && buf[10] == 5 {
+                        if buf[1..9] != label {
+                            bad2.store(true, Ordering::SeqCst);
+                        }
+                        let _ = sock.send_to(&buf[11..n], exit);
+                    } else {
+                        bad2.store(true, Ordering::SeqCst); // 非信封形态（上行必须封）
+                    }
+                    if !hinted {
+                        hinted = true;
+                        // hint 控制帧（kind=1，非 kind=5）：客户端必须忽略且不喂 quinn
+                        let _ = sock.send_to(&[0xBB, 1, b'h', b'i'], src);
+                    }
+                }
+            })
+            .expect("假中继线程可起");
+        FakeRelay {
+            addr,
+            uplink_frames,
+            bad_label,
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn uplink_frames(&self) -> u64 {
+        self.uplink_frames.load(Ordering::SeqCst)
+    }
+
+    fn clean(&self) -> bool {
+        !self.bad_label.load(Ordering::SeqCst)
+    }
+
+    fn stop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(h) = self.handle.take() {
+            let _ = h.join();
+        }
+    }
 }
 
 /// 测试用出口（**真出口面**：`ExitQuic` 自身；引擎侧由 [`Stub`] 扮演）。
@@ -143,6 +339,18 @@ impl Stub {
     fn rejected(&self) -> u64 {
         self.rejected.load(Ordering::SeqCst)
     }
+
+    /// 取走一份长度 `len` 的内层包（数据面判据用；找不到返回 `None`）。
+    fn take_packet(&self, len: usize) -> Option<Vec<u8>> {
+        let mut q = self.packets.lock().unwrap();
+        let idx = q.iter().position(|p| p.len() == len)?;
+        Some(q.remove(idx))
+    }
+
+    /// 收到的内层包总数（负判据用：不该到的包）。
+    fn packets_len(&self) -> usize {
+        self.packets.lock().unwrap().len()
+    }
 }
 
 /// 有界轮询（每轮先 pump；只判上界）。
@@ -203,6 +411,25 @@ async fn logs_until(rx: &Receiver<String>, needle: &str, wait: Duration) -> Vec<
         tokio::time::sleep(Duration::from_millis(10)).await;
     }
     lines
+}
+
+/// 连上真出口的单直连候选（S2-4/S2-5/S2-6 用例的公共前段）。
+async fn connect_direct(island: &Island, stub: &Stub, quic: &ExitQuic) -> SocketAddrV4 {
+    let addr = connectable(quic);
+    let _ = send_wait(
+        island,
+        stub,
+        quic,
+        |reply| Cmd::Connect {
+            cands: vec![direct(addr)],
+            budget: WAIT,
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .expect("登记成功（真出口 + 引擎桩）");
+    addr
 }
 
 fn direct(addr: SocketAddrV4) -> Candidate {
@@ -367,38 +594,52 @@ async fn race_picks_first_completer_among_dead_candidates() {
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
 
-/// **判据（S2-1 候选类别 / §2.7）**：赛跑对**两类候选**都能发起——中继类候选的
-/// 信封/剥壳 = S2-7（本切片没有信封 socket，故中继候选在 S2a 走的是裸包），但 `via`
-/// 必须如实带回类别并进判据行/快照；混合赛跑里「死的中继候选」如实进未完成清单。
+/// **判据（S2-7）**：直连 + 中继**混合候选赛跑**；中继候选的信封上行（`[0xAA][label8]‖
+/// `[0xBB][5]‖pkt`）与下行剥壳（`[0xBB][5]‖pkt`）逐字节正确；**非 kind=5 帧不入 quinn**
+/// （计数面 `rx_ignored`）；登记与数据面双向在网络层经「中继」中转。
+///
+/// 仪器 = [`FakeRelay`]：真中继在 QUIC 面上的两件事（信封上行剥标签 + 裸包下行包帧）
+/// 的透明代理；**不实现**中继控制面（leg 注册/会话）——S2-7 的判据是信封/剥壳，
+/// 中继协议本体由 S1c（出口侧）与全链 E2E（`tools/quic-island-e2e.sh`）覆盖。
 #[tokio::test]
-async fn race_initiates_relay_class_candidates_and_reports_via() {
+async fn relay_candidate_wins_through_envelope_and_downlink_is_stripped() {
     let quic = exit_face(14);
     let stub = Stub::new();
     let (logf, logs) = sink();
     // 短巡检节拍：让刷新行（C15' 的「中继=」位）也在本用例窗口内出现
-    let island = island_with_log(Duration::from_millis(300), quic.rpk_public_key(), Arc::clone(&logf));
-    let addr = connectable(&quic);
-    // label = sha256(peerId)[:8] 的占位（真值由 S2-7 的候选来源给；本用例只验类别通路）
+    let island = island_with_log(
+        Duration::from_millis(300),
+        quic.rpk_public_key(),
+        Arc::clone(&logf),
+    );
     let label = [0xA1u8; 8];
-    let relay_alive = Candidate {
-        addr,
-        via: Via::Relay { label },
-    };
+    let mut relay = FakeRelay::start(connectable(&quic), label);
+    let (tun, tun_peer) = tun_pair();
+    assert!(matches!(attach(&island, tun.as_raw_fd(), 1280, BUDGET), Ok(())));
+
+    // 混合赛跑：死直连 + 活中继 ⇒ 中继胜（且必须**经信封**才能胜——裸包打到假中继上
+    // 不会被转发，握手不会完成）
+    let (_dead, dead) = dead_candidate();
     let outcome = send_wait(
         &island,
         &stub,
         &quic,
         |reply| Cmd::Connect {
-            cands: vec![relay_alive],
-            budget: WAIT,
+            cands: vec![dead, Candidate { addr: relay.addr, via: Via::Relay { label } }],
+            budget: Duration::from_secs(5),
             reply,
         },
         WAIT,
     )
     .await
-    .expect("中继类候选必须能被发起并完成握手（信封 socket = S2-7）");
+    .expect("中继类候选必须能经信封完成握手");
+    assert_eq!(outcome.winner, relay.addr, "胜者 = 中继候选");
     assert_eq!(outcome.via, Via::Relay { label }, "via 如实带回类别");
     assert_eq!(island.snapshot().via, Some(Via::Relay { label }));
+    assert!(relay.uplink_frames() > 0, "假中继必须收到过信封帧（上行包封已生效）");
+    assert!(relay.clean(), "上行必须恒为合规信封（label 逐字节一致）");
+    assert_eq!(stub.accepted(), 1, "登记帧经中继到达出口（引擎桩裁决通过）");
+
     let lines = logs_until(&logs, "quic: 赛跑结算：胜出 中继", WAIT).await;
     let settle = lines
         .iter()
@@ -406,7 +647,7 @@ async fn race_initiates_relay_class_candidates_and_reports_via() {
         .expect("C5' 行按类别取值（胜出 中继）")
         .clone();
     assert!(
-        settle.contains(&addr.to_string()) && settle.contains("未完成="),
+        settle.contains(&relay.addr.to_string()) && settle.contains("未完成="),
         "C5' 行含胜者地址与清单：{settle}"
     );
     // C15'（刷新）行里的「中继=」位也按类别取值
@@ -416,29 +657,36 @@ async fn race_initiates_relay_class_candidates_and_reports_via() {
         "刷新行的中继位如实：{refresh:?}"
     );
 
-    // 混合赛跑：死的中继候选 + 活的直连候选 ⇒ 直连胜出，中继候选进未完成清单
-    let (_dead, dead_direct) = dead_candidate();
-    let relay_dead = Candidate {
-        addr: dead_direct.addr,
-        via: Via::Relay { label: [0xB2; 8] },
-    };
-    let outcome = send_wait(
-        &island,
-        &stub,
-        &quic,
-        |reply| Cmd::Connect {
-            cands: vec![relay_dead, direct(addr)],
-            budget: Duration::from_secs(3),
-            reply,
-        },
-        WAIT,
-    )
-    .await
-    .expect("混合类别赛跑必须胜出");
-    assert_eq!(outcome.via, Via::Direct, "胜者 = 直连候选");
-    assert_eq!(outcome.unfinished, vec![relay_dead.addr], "死的中继候选进未完成清单");
+    // ---- 数据面双向（经中继）----
+    // 上行：TUN fd → 岛 → 信封 → 假中继 → 出口（引擎桩收包，逐字节）
+    let inner = inner_pkt(TUN_IP, Ipv4Addr::new(10, 0, 0, 7));
+    write_tun(&tun_peer, &inner);
+    let got = wait_packet(&stub, &quic, inner.len(), WAIT).await;
+    assert_eq!(got.as_deref(), Some(inner.as_slice()), "上行包经中继逐字节到达出口");
+
+    // 下行：出口 → 裸包 → 假中继包帧 → 岛剥壳 → TUN fd（逐字节）
+    let back = inner_pkt(TUNNEL_IP, TUN_IP);
+    assert_eq!(
+        quic.send_to_pub(&PUBKEY, &back),
+        crate::ExitSend::Handled,
+        "出口侧回程必须已在 QUIC 面绑定"
+    );
+    let echoed = read_tun(&tun_peer, WAIT).expect("回程必须写到 TUN fd");
+    assert_eq!(echoed, back, "下行剥壳后逐字节还原");
+
+    // 非 kind=5 帧（假中继推 hint）⇒ 忽略 + 计数；quinn 不受影响
+    assert!(
+        wait_for(&stub, &quic, || island.snapshot().rx_ignored >= 1, WAIT).await,
+        "非 kind=5 帧必须被忽略并计数（假中继推了 hint）"
+    );
+    assert!(
+        island.snapshot().relay_tx > 0,
+        "中继上行包封计数（快照 relay_tx）"
+    );
+
     assert!(island.stop_within(Instant::now() + BUDGET));
     assert!(quic.stop_within(Instant::now() + BUDGET));
+    relay.stop();
 }
 
 /// **判据（S2-2 的失败面）**：全候选失败 ⇒ `IslandErr::NoCandidate`（且快照无 path）。
@@ -1069,6 +1317,13 @@ fn snapshot_default_is_empty_path() {
     assert_eq!(s.drops.unregistered, 0);
     assert_eq!(s.migrations, 0);
     assert!(!s.migration_unconfirmed);
+    assert_eq!(s.local, None, "未起端点前无本地地址");
+    assert_eq!(s.connections, 0);
+    assert_eq!(s.packets_out, 0);
+    assert_eq!(s.relay_tx, 0);
+    assert_eq!(s.rx_ignored, 0);
+    assert_eq!(s.lost_packets, 0);
+    assert_eq!(s.congestion_events, 0);
 }
 
 /// reg3 帧的**连接绑定**在客户端侧的字节面复核（S1-3 的对偶）：同 secret 同字段但
@@ -1089,3 +1344,176 @@ fn reg3_frame_binds_to_exporter() {
     assert_eq!(&a[2..34], &PUBKEY);
     assert_eq!(&a[34..42], &DEV);
 }
+
+// ---------- 6. 数据面（S2-4）：TUN ⇄ DATAGRAM + 四类计数 ----------
+
+/// **判据（S2-4 主干）**：数据面双向逐字节 —— TUN fd → DATAGRAM（`send_datagram_checked`）
+/// 与 DATAGRAM → TUN fd（有界队列 → 写线程）；`packets_in/out` 真计数；需求信号
+/// （`swap_out_pkts`/`last_outbound_*`）与 `wgcore` 同接口。
+#[tokio::test]
+async fn tun_dataplane_is_bidirectional_and_counts() {
+    let quic = exit_face(20);
+    let stub = Stub::new();
+    let island = island_with(Duration::from_secs(60), quic.rpk_public_key());
+    let (tun, peer) = tun_pair();
+    assert!(matches!(attach(&island, tun.as_raw_fd(), 1280, BUDGET), Ok(())));
+
+    // 连接前投的包 ⇒ 归 `未登记`（登记前丢弃；准入窗的窗口面）
+    let early = inner_pkt(TUN_IP, Ipv4Addr::new(10, 0, 0, 9));
+    write_tun(&peer, &early);
+    assert!(
+        wait_for(&stub, &quic, || island.snapshot().drops.unregistered >= 1, WAIT).await,
+        "无已登记连接时投的包必须计 `未登记`"
+    );
+
+    connect_direct(&island, &stub, &quic).await;
+
+    // ① 上行：TUN fd → DATAGRAM（登记已过准入窗 ⇒ 不再丢）
+    let before = island.snapshot().drops.unregistered;
+    let inner = inner_pkt(TUN_IP, Ipv4Addr::new(10, 0, 0, 7));
+    write_tun(&peer, &inner);
+    let got = wait_packet(&stub, &quic, inner.len(), WAIT)
+        .await
+        .expect("出口引擎桩必须收到上行包");
+    assert_eq!(got, inner, "TUN → DATAGRAM 逐字节");
+    assert_eq!(
+        island.snapshot().drops.unregistered,
+        before,
+        "有登记连接后不再计 `未登记`"
+    );
+
+    // ② 下行：DATAGRAM → TUN fd（有界队列 → 写线程；逐字节）
+    let back = inner_pkt(TUNNEL_IP, TUN_IP);
+    assert_eq!(
+        quic.send_to_pub(&PUBKEY, &back),
+        crate::ExitSend::Handled,
+        "出口侧出站必须已在 QUIC 面绑定"
+    );
+    let echoed = read_tun(&peer, WAIT).expect("回程必须写到 TUN fd");
+    assert_eq!(echoed, back, "DATAGRAM → TUN 逐字节");
+    assert!(
+        wait_for(&stub, &quic, || island.snapshot().packets_out >= 1, WAIT).await,
+        "packets_out 必须是真计数（写线程成功写入 TUN 的包数）"
+    );
+
+    // ③ 计数与需求信号（demand-driven 的生产者面：岛 = 生产者，接口与 wgcore 同形）
+    let snap = island.snapshot();
+    assert_eq!(snap.packets_in, 2, "TUN 读线程投递 2 包（早期 1 + 上行 1）");
+    assert_eq!(snap.connections, 1, "在用连接数可观测");
+    assert_eq!(island.swap_out_pkts(), 2, "出站包计数取走清零");
+    assert_eq!(island.swap_out_pkts(), 0, "取走后归零");
+    assert!(island.last_outbound_at().is_some(), "单调面可读");
+    assert!(island.last_outbound_unix_ms() > 0, "unix 面可读");
+
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（S2-4 的「超限丢 + 计数」，设计 §6.4/§12-①）**：内层包 > `max_datagram_size()`
+/// ⇒ **丢 + 计 `超限` + 节流记行**（不静默）；该包不得到达出口。
+///
+/// 注入形态：本机 mds = 1362（MTU 1400 − 38B），投一个 1500B 的「内层包」即越限。
+/// （真「窄路径」= mds < 1280 需要改客户端 MTU 的旋钮 `HOMEWAY_QUIC_MTU`——那是 S3-1 的
+/// 配置面 + S5-1 的实测面；本用例验的是**判据本体** `len > mds`。）
+#[tokio::test]
+async fn oversize_tun_packet_is_dropped_and_counted() {
+    let quic = exit_face(21);
+    let stub = Stub::new();
+    let island = island_with(Duration::from_secs(60), quic.rpk_public_key());
+    let (tun, peer) = tun_pair();
+    assert!(matches!(attach(&island, tun.as_raw_fd(), 1280, BUDGET), Ok(())));
+    connect_direct(&island, &stub, &quic).await;
+    let mds = island.snapshot().mtu.expect("已建连 ⇒ mds 可读");
+    assert!(mds < 1500, "本机 mds={mds}（MTU 1400 − 38B）⇒ 1500B 必越限");
+
+    let oversize = vec![0x45u8; 1500];
+    write_tun(&peer, &oversize);
+    assert!(
+        wait_for(&stub, &quic, || island.snapshot().drops.too_large >= 1, WAIT).await,
+        "超限包必须计 `超限`（不静默）"
+    );
+    // 负判据：超限包不得被发出去（也不得写回 TUN）
+    assert_eq!(stub.packets_len(), 0, "超限包不得到达出口");
+    assert!(read_tun(&peer, Duration::from_millis(200)).is_none(), "无回程");
+
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（S2-4 的「回程队列满丢 + 计数」）**：应用侧不读 TUN ⇒ 写线程阻塞 ⇒ 有界队列
+/// （2048 条）填满 ⇒ 后续回程包**丢新 + 计 `回程队列满`**（不静默；TCP 会重传）。
+#[tokio::test]
+async fn return_queue_full_is_dropped_and_counted() {
+    let quic = exit_face(22);
+    let stub = Stub::new();
+    let island = island_with(Duration::from_secs(60), quic.rpk_public_key());
+    let (tun, _peer) = tun_pair(); // **不读**：写线程会卡住（_peer 保持打开）
+    assert!(matches!(attach(&island, tun.as_raw_fd(), 1280, BUDGET), Ok(())));
+    connect_direct(&island, &stub, &quic).await;
+
+    // 先灌一批（把内核 socket 缓冲喂满 ⇒ 写线程阻塞在第一包上），再补足队列上限
+    let pkt = inner_pkt(TUNNEL_IP, TUN_IP);
+    for _ in 0..(crate::tun::RETURN_QUEUE_MAX + 512) {
+        let _ = quic.send_to_pub(&PUBKEY, &pkt);
+        if island.snapshot().drops.return_queue_full > 0 {
+            break;
+        }
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        wait_for(
+            &stub,
+            &quic,
+            || island.snapshot().drops.return_queue_full >= 1,
+            Duration::from_secs(4)
+        )
+        .await,
+        "回程队列满必须计 `回程队列满`（实测 drops={:?}）",
+        island.snapshot().drops
+    );
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（S2-4 的「TUN 读线程投递失败自退」，M0 §3.6-2④）**：岛收工后投递失败 ⇒
+/// 读线程**自行退出**（记行留证；不重试、不挂死）。
+#[tokio::test]
+async fn tun_read_thread_exits_when_island_stops() {
+    let quic = exit_face(23);
+    let stub = Stub::new();
+    let (logf, logs) = sink();
+    let island = island_with_log(Duration::from_secs(60), quic.rpk_public_key(), Arc::clone(&logf));
+    let (tun, peer) = tun_pair();
+    assert!(matches!(attach(&island, tun.as_raw_fd(), 1280, BUDGET), Ok(())));
+    connect_direct(&island, &stub, &quic).await;
+    assert!(island.stop_within(Instant::now() + BUDGET), "预算内收工");
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+
+    // 岛已收工（命令通道断）：投一包 ⇒ 读线程读到、投递失败 ⇒ 自退 + 记行
+    write_tun(&peer, &inner_pkt(TUN_IP, Ipv4Addr::new(10, 0, 0, 8)));
+    let lines = logs_until(&logs, "读线程退出", WAIT).await;
+    assert!(
+        lines.iter().any(|l| l.contains("homeway-tun-read")),
+        "投递失败必须由读线程自行退出并留证：{lines:?}"
+    );
+}
+
+/// **判据（S2-4 / `fd` 分类，镜像 `wgcore::TunFdDead`）**：TUN fd 不可读 ⇒ 岛打既有
+/// 取值 `fd` 的分类（同步面据此走 App 重建；分类值 ∈ `{patrol,fd,panic,stop}`）。
+#[tokio::test]
+async fn tun_fd_death_classifies_fd() {
+    let quic = exit_face(24);
+    let stub = Stub::new();
+    let (on_unhealthy, reasons) = unhealthy_sink();
+    let island = island_with_unhealthy(Duration::from_secs(60), quic.rpk_public_key(), on_unhealthy);
+    connect_direct(&island, &stub, &quic).await;
+    // fd = -1：读线程必然 EBADF（确定性的「fd 不可读」注入；生产形态由 Ohos fd 回收触发）
+    assert!(matches!(attach(&island, -1, 1280, BUDGET), Ok(())));
+    let got = wait_reason(&reasons, WAIT).await;
+    assert_eq!(got.as_deref(), Some("fd"), "fd 面判死必须归既有取值 `fd`");
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+// ---------- 7. 巡检接线（S2-6）与生命周期（S2-5）【本 commit 不含：见下一 commit】 ----------
+

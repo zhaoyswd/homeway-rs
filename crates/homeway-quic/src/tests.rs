@@ -87,6 +87,11 @@ fn recv_reply<T>(rx: &Receiver<Result<T, IslandErr>>, wait: Duration) -> Result<
     }
 }
 
+/// attach 隧道面。
+///
+/// ⚠️ 多数用例传 `fd = -1`（**故意无效**）：S2-4 起 attach 会真起 TUN 读/写线程，
+/// 而本骨架用例只验 attach 语义 ⇒ 给一个必然 EBADF 的 fd，免得读线程去读测试进程里
+/// 恰好存在的 fd（那会把别的用例的数据读走——同进程并发用例的隐性干扰）。
 fn attach(island: &Island, fd: i32, mtu: u32, wait: Duration) -> Result<(), IslandErr> {
     let (rtx, rrx) = channel();
     island
@@ -148,7 +153,7 @@ fn island_starts_and_stops_within_budget() {
     let island = island_of(logf);
     // 先做一次 attach 往返：证明「岛线程已进入命令循环」再起预算计时——否则预算里还含线程
     // 首次调度的时间，重载下会让「预算内收工」断言偶发红。
-    assert!(matches!(attach(&island, 5, 1280, BUDGET), Ok(())));
+    assert!(matches!(attach(&island, -1, 1280, BUDGET), Ok(())));
     let t0 = Instant::now();
     assert!(
         island.stop_within(Instant::now() + BUDGET),
@@ -170,12 +175,12 @@ fn tun_attach_replies_and_rejects_second() {
     let (logf, _logs) = sink();
     let island = island_of(logf);
     assert!(
-        matches!(attach(&island, 7, 1280, BUDGET), Ok(())),
+        matches!(attach(&island, -1, 1280, BUDGET), Ok(())),
         "首次 attach 必须 Ok"
     );
     assert!(
         matches!(
-            attach(&island, 8, 1400, BUDGET),
+            attach(&island, -1, 1400, BUDGET),
             Err(IslandErr::TunAlreadyAttached)
         ),
         "二次 attach 必须 TunAlreadyAttached"
@@ -345,14 +350,14 @@ fn stuck_island_panic_line_comes_from_reaper() {
 fn snapshot_is_pollable_after_stop() {
     let (logf, _logs) = sink();
     let island = island_of(logf);
-    assert!(matches!(attach(&island, 3, 1280, BUDGET), Ok(())));
+    assert!(matches!(attach(&island, -1, 1280, BUDGET), Ok(())));
     put_packet(&island, 32);
     // **屏障**（同用例 3，代码门整改复验时实测到的竞态）：`stop_within` 会置 stop 位，而驱动
     // 循环**在循环头判位即退出** ⇒ 不等屏障就收工，队列里的 TunPacket 可能被丢（计数 0）——
     // 那不是缺陷，是停止语义；本用例要断言「冻结值 = 1」，故须先确认包已被消费（同通道保序）。
     assert!(
         matches!(
-            attach(&island, 3, 1280, BUDGET),
+            attach(&island, -1, 1280, BUDGET),
             Err(IslandErr::TunAlreadyAttached)
         ),
         "屏障命令回执 = 其前的 TunPacket 必已被处置"
@@ -412,6 +417,10 @@ fn public_surface_signatures_are_pinned() {
     let _: fn(&Island) -> bool = Island::is_finished;
     let _: fn(&Island) = Island::stop;
     let _: fn(&Island, Instant) -> bool = Island::stop_within;
+    // 需求信号读面（M1 S2-4：与 `wgcore::Client` 同名同义——设计 §2.5「接口不变、来源切换」）
+    let _: fn(&Island) -> i64 = Island::swap_out_pkts;
+    let _: fn(&Island) -> Option<Instant> = Island::last_outbound_at;
+    let _: fn(&Island) -> i64 = Island::last_outbound_unix_ms;
     let _: fn(&IslandTx, Cmd) -> Result<(), IslandErr> = IslandTx::send;
     // 线程名常量（写死供 M1 生命周期对接复用）
     let _: &str = crate::driver::ISLAND_THREAD;
@@ -466,6 +475,10 @@ fn cmd_member_field_types_are_pinned() {
                 let _: DropReason = reason;
                 let _: u64 = n;
             }
+            // M1 S2-4 增补（镜像 `wgcore::Cmd::TunFdDead`：fd 面的 `fd` 分类落点）
+            Cmd::TunFdDead { msg } => {
+                let _: String = msg;
+            }
         }
     }
     let _: fn(Cmd) = pin;
@@ -496,6 +509,10 @@ fn island_err_variants_are_pinned() {
             IslandErr::ProbeNoResponse => {}
             IslandErr::Rebind(io_err) => {
                 // 载荷必须是 std 的 io::Error（异步栈错误无处可藏）
+                let _: std::io::Error = io_err;
+            }
+            // M1 S2-4 增补：TUN 面装配失败（同「std 载荷」契约）
+            IslandErr::TunAttach(io_err) => {
                 let _: std::io::Error = io_err;
             }
         }

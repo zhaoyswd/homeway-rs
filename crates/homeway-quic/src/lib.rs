@@ -43,7 +43,8 @@
 //! 端点 + TransportConfig + RPK 身份 + 准入/数据面，M1 设计 §1.1/§1.2/§1.3/§1.4/§1.7）；
 //! `rpk` = RFC 7250 的**纯 std** 字节小件（种子/PKCS#8/SPKI——同步面也读得懂）；
 //! `reg3` = `hr-reg3` 注册帧的**纯 std** 字节层（`hmac`/`sha2` 非异步栈）；
-//! `sync_util` = 线程卫生小件。
+//! `sync_util` = 线程卫生小件；`tun` = 数据面的 **TUN fd 侧**（读线程 + 有界回程队列 +
+//! 写线程——全 std + libc，**零异步栈名字** ⇒ 不占异步面白名单，M1 S2-4）。
 //! **异步栈名字只允许出现在 `driver.rs`、`client/**` 与 `exit/**`**（隔离门层 3 断言；
 //! 白名单同步扩了 `client/**`——见 `tools/check-quic-isolation.sh` 的注释与 commit 说明）。
 
@@ -55,6 +56,7 @@ mod exit;
 mod reg3;
 mod rpk;
 mod sync_util;
+mod tun;
 
 #[cfg(test)]
 mod tests;

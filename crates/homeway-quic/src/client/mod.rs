@@ -15,18 +15,20 @@
 //! 单线程前提（同出口面）：本 crate 的岛 runtime 是 `current_thread`，且发送路径的
 //! 「预检 → 发送」之间无 `await` ⇒ 不存在被别处插入的窗口（S6-2 的代码门条）。
 
+pub(crate) mod dataplane;
 mod migration;
 mod race;
 mod register;
+mod relay_sock;
 #[cfg(test)]
 mod tests;
 
 use std::io;
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-use std::sync::Arc;
+use std::net::SocketAddrV4;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use quinn::{Connection, Endpoint, RecvStream, SendStream, VarInt};
+use quinn::{Connection, Endpoint, EndpointConfig, RecvStream, SendStream, VarInt};
 use tokio::time::Instant as TokioInstant;
 
 use crate::cmd::{Candidate, IslandErr, Logf, RaceOutcome, Via};
@@ -35,6 +37,13 @@ use crate::reg3;
 
 pub(crate) use migration::{MigrationEvent, Watch};
 pub(crate) use race::LogGate;
+pub(crate) use relay_sock::{ClientSock, RelayTable, SockStats};
+
+/// 记行节流（仓内既有口径「首 3 + 每 100」——与 `driver::log_due` 同值同义；两处各一份
+/// 是为了让 socket 层（异步面）不反向依赖宿主。）
+pub(crate) fn log_due(n: u64) -> bool {
+    n <= 3 || n.is_multiple_of(100)
+}
 
 /// 钉定用的服务端名（RPK 体系里名字无语义；两端取值只需一致且稳定）。
 pub(crate) fn server_name() -> &'static str {
@@ -49,30 +58,41 @@ pub(crate) struct Face {
     endpoint: Arc<Endpoint>,
     cfg: quinn::ClientConfig,
     cred: Arc<IslandCredential>,
+    /// 中继候选表（发送侧包封的路由键；岛在 `SetCandidates`/`Connect`/`adopt` 时装配）。
+    relays: Arc<RelayTable>,
+    /// socket 读数（非 kind=5 帧忽略计数等；快照面读）。
+    stats: Arc<Mutex<SockStats>>,
+    /// 记行口（socket 层的忽略计数行用；与宿主同一个 `Logf`）。
+    logf: Logf,
     /// 当前本地地址（`rebind` 后就地更新；判据行 N-b 的「旧 → 新」源）。
     local: SocketAddrV4,
 }
 
 impl Face {
-    /// 起端点（含 RPK 钉定 + §1.2 的 TransportConfig）。
+    /// 起端点（含 RPK 钉定 + §1.2 的 TransportConfig + **S2-7 的包封/剥壳 socket**）。
     ///
-    /// ⚠️ 必须在 runtime 上下文里调（`Endpoint::client` 取运行时的 IO 驱动）。
-    pub(crate) fn open(cfg: IslandConfig) -> io::Result<Face> {
+    /// ⚠️ 必须在 runtime 上下文里调（`ClientSock::open` 的 `from_std` 与 `Endpoint::new_with_abstract_socket`
+    /// 都要 IO 驱动）。
+    ///
+    /// 为什么不用 `Endpoint::client`（内建 socket）：S2-7 要求「同一连接既能走直连裸包、
+    /// 也能走中继信封」——包封键是**发送目的地址**，只有自定义 socket 才看得见它；两条
+    /// 物理路径也必须是**同一枚本地 socket**（连接路径身份唯一，见 `relay_sock` 模块头）。
+    pub(crate) fn open(cfg: IslandConfig, logf: Logf) -> io::Result<Face> {
         let IslandConfig {
             credential,
             bind,
             patrol: _,
         } = cfg;
-        let bind: SocketAddr = bind
-            .map(SocketAddr::V4)
-            .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
-        let endpoint = Endpoint::client(bind)?;
-        let local = match endpoint.local_addr()? {
-            SocketAddr::V4(v4) => v4,
-            SocketAddr::V6(_) => {
-                return Err(io::Error::other("端点本地地址不是 IPv4（形态异常）"));
-            }
-        };
+        let relays = RelayTable::new();
+        let stats = Arc::new(Mutex::new(SockStats::default()));
+        let (sock, local) =
+            ClientSock::open(bind, Arc::clone(&relays), Arc::clone(&stats), Arc::clone(&logf))?;
+        let endpoint = Endpoint::new_with_abstract_socket(
+            EndpointConfig::default(),
+            None,
+            sock,
+            Arc::new(quinn::TokioRuntime),
+        )?;
         let mut client_cfg = quinn::ClientConfig::new(
             crate::exit::rpk::client_pin::client_crypto_config(credential.pin())
                 .map_err(io::Error::other)?,
@@ -82,6 +102,9 @@ impl Face {
             endpoint: Arc::new(endpoint),
             cfg: client_cfg,
             cred: Arc::new(credential),
+            relays,
+            stats,
+            logf,
             local,
         })
     }
@@ -101,24 +124,36 @@ impl Face {
         &self.cred
     }
 
+    /// 中继候选表（S2-7 的发送侧路由；宿主在候选装配/采纳时写）。
+    pub(crate) fn relays(&self) -> &Arc<RelayTable> {
+        &self.relays
+    }
+
+    /// socket 读数（快照面读：非 kind=5 帧忽略计数等）。
+    pub(crate) fn sock_stats(&self) -> (u64, u64, u64, u64) {
+        let s = crate::sync_util::lock_unpoison(&self.stats);
+        (s.relay_tx, s.rx_ignored, s.rx_dgrams, s.tx_dgrams)
+    }
+
     /// 换本地 socket（迁移原语；设计 §2.3）。
     ///
     /// 返回值 = 新本地地址。**注意语义**：成功只代表 socket 换绑完成——路径是否真的
     /// 可用要等对端回包（保持检测见 [`Watch`]；对端不可达**没有专用错误**）。
+    ///
+    /// 形态：新 socket 仍是 S2-7 的包封/剥壳 socket（共享同一张中继表与读数）——
+    /// **不能**用 `Endpoint::rebind(stdio_socket)`（那会退回 quinn-udp 内建 socket，
+    /// 中继路径当场失去信封语义）。
     pub(crate) fn rebind(&mut self, local: Option<SocketAddrV4>) -> Result<SocketAddrV4, IslandErr> {
-        let bind: SocketAddr = local
-            .map(SocketAddr::V4)
-            .unwrap_or_else(|| SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)));
-        let sock = UdpSocket::bind(bind).map_err(IslandErr::Rebind)?;
-        sock.set_nonblocking(true).map_err(IslandErr::Rebind)?;
-        self.endpoint.rebind(sock).map_err(IslandErr::Rebind)?;
-        let now = self.endpoint.local_addr().map_err(IslandErr::Rebind)?;
-        let SocketAddr::V4(v4) = now else {
-            // 端点恒为 IPv4（候选是 SocketAddrV4、绑定地址也由 V4 给出）
-            return Err(IslandErr::Rebind(io::Error::other(
-                "端点本地地址不是 IPv4（形态异常）",
-            )));
-        };
+        let (sock, v4) = ClientSock::open(
+            local,
+            Arc::clone(&self.relays),
+            Arc::clone(&self.stats),
+            Arc::clone(&self.logf),
+        )
+        .map_err(IslandErr::Rebind)?;
+        self.endpoint
+            .rebind_abstract(sock)
+            .map_err(IslandErr::Rebind)?;
         self.local = v4;
         Ok(v4)
     }
@@ -209,6 +244,13 @@ impl Live {
     /// 收到的 UDP 报文计数（迁移保持判据的「对端回包」信号源；单调增）。
     pub(crate) fn udp_rx(&self) -> u64 {
         self.conn.stats().udp_rx.datagrams
+    }
+
+    /// 路径统计（设计 §6.2-3/§12-④：`lost_packets`/`congestion_events` 进状态 JSON 与
+    /// S5 的证据包——「限速器静默丢被 QUIC 当拥塞」的分辨面）。
+    pub(crate) fn path_stats(&self) -> (u64, u64) {
+        let p = self.conn.stats().path;
+        (p.lost_packets, p.congestion_events)
     }
 
     /// 刷新到点则写一帧 `hr-reg3`（C15' 行；节拍 = 巡检节拍）。
