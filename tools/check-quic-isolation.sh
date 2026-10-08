@@ -5,8 +5,8 @@
 #   ① 异步栈名字只出现在 crates/homeway-quic/Cargo.toml —— homeway-core / homeway-cli /
 #      homeway-capi 的 manifest 零命中（防同步面拿到异步依赖 ⇒ 层 0 的 E0433 保证失效）；
 #   ② crates/homeway-quic/src/** 里 `tokio::|quinn|rustls|async fn|.await` **只在异步面**
-#      （`driver.rs` = 岛宿主；`exit/**` = 出口 QUIC 面，M1 §1.7）——公面/协议/小件文件
-#      零命中（公面夹带 = 泄漏面本体）；
+#      （`driver.rs` = 岛宿主；`client/**` = 客户端连接面，M1 §2.2/§2.3/§2.6；
+#       `exit/**` = 出口 QUIC 面，M1 §1.7）——公面/协议/小件文件零命中（公面夹带 = 泄漏面本体）；
 #   ③ 岛内 `std::thread::sleep` 零命中（异步上下文禁阻塞）、`block_on` 只在异步面；
 #   ④ `aws-lc` 在 manifest 与 Cargo.lock 零命中（防 rustls 默认 features 回归——
 #      默认含 aws_lc_rs ⇒ 拉 aws-lc-sys = BoringSSL 派生 + cmake，OHOS 不可行）；
@@ -34,10 +34,13 @@ CRATES="$REPO_ROOT/crates"
 ISLAND="$CRATES/homeway-quic"
 SRC="$ISLAND/src"
 LOCK="$REPO_ROOT/Cargo.lock"
-# 异步面白名单（相对 $SRC）：岛宿主 + 出口 QUIC 面子树。**新增即改门**（有意为之：
-# 每一处新增的异步面都要显式过一次门）。
+# 异步面白名单（相对 $SRC）：岛宿主 + 客户端连接面 + 出口 QUIC 面两棵子树。**新增即改门**
+# （有意为之：每一处新增的异步面都要显式过一次门）。
+# `client` 子树 = M1 S2a 的客户端连接面（端点/赛跑/登记刷新/迁移保持检测）——与 `exit/**`
+# 同款理由：这里的名字本来就是异步栈的；`cmd.rs`/`config.rs`/`rpk.rs`/`reg3.rs` 仍是公面
+# 与小件（全 std），本条断言覆盖它们。
 ASYNC_FILES=( "driver.rs" )
-ASYNC_DIRS=( "exit" )
+ASYNC_DIRS=( "client" "exit" )
 # 第 ⑤ 条：RPK 钉定的唯一合法文件（相对 $REPO_ROOT），及其「真做签名验证」证据。
 RPK_VERIFIER_FILE="crates/homeway-quic/src/exit/rpk.rs"
 RPK_PROOF_PATTERN='verify_tls13_signature_with_raw_key'
@@ -96,13 +99,13 @@ for f in "${(@f)$(find "$SRC" -name '*.rs' | sort)}"; do
   h="$(hits_rs "$f" 'tokio::|quinn|rustls|async fn|\.await')"
   [[ -n "$h" ]] && BAD_SRC+="${f}:"$'\n'"${h}"$'\n'
 done
-[[ -z "$BAD_SRC" ]] || fail $'岛内公面/协议/小件文件出现异步栈名字（只许 driver.rs 与 exit/**）：\n'"$BAD_SRC"
+[[ -z "$BAD_SRC" ]] || fail $'岛内公面/协议/小件文件出现异步栈名字（只许 driver.rs、client/** 与 exit/**）：\n'"$BAD_SRC"
 # 自校准（fail-closed）：扫描面不得为空/被截断（新增文件漏扫时本门必须红）
 (( SCANNED >= 4 )) || fail "扫描到的源文件数异常（${SCANNED} < 4）——检查 find/排除逻辑，门可能空过"
 (( ASYNC_SCANNED >= 2 )) || fail "异步面文件数异常（${ASYNC_SCANNED} < 2）——白名单可能被改窄成空过"
 DRIVER_HITS="$(hits_rs "$SRC/driver.rs" 'tokio::' | wc -l | tr -d ' ')"
 (( DRIVER_HITS >= 1 )) || fail "driver.rs 零 tokio:: 命中——门自身失准（宿主必须用 runtime）"
-echo "  ② 通过：tokio/quinn/rustls/async/.await 只出现在异步面（异步面 ${ASYNC_SCANNED} 个文件：driver.rs + exit/**；公面递归扫过 ${SCANNED} 个文件，零命中）"
+echo "  ② 通过：tokio/quinn/rustls/async/.await 只出现在异步面（异步面 ${ASYNC_SCANNED} 个文件：driver.rs + client/** + exit/**；公面递归扫过 ${SCANNED} 个文件，零命中）"
 
 # ---------- ③ 阻塞面：零 sleep；block_on 只在 driver.rs ----------
 BAD_SLEEP=""
@@ -117,8 +120,8 @@ for f in "${(@f)$(find "$SRC" -name '*.rs' | sort)}"; do
   h="$(hits_rs "$f" 'block_on')"
   [[ -n "$h" ]] && BAD_BLOCK+="${f}:"$'\n'"${h}"$'\n'
 done
-[[ -z "$BAD_BLOCK" ]] || fail $'block_on 只许出现在异步面（driver.rs / exit/**）：\n'"$BAD_BLOCK"
-echo "  ③ 通过：岛内零阻塞 sleep；block_on 只在异步面（driver.rs / exit/**；递归扫描）"
+[[ -z "$BAD_BLOCK" ]] || fail $'block_on 只许出现在异步面（driver.rs / client/** / exit/**）：\n'"$BAD_BLOCK"
+echo "  ③ 通过：岛内零阻塞 sleep；block_on 只在异步面（driver.rs / client/** / exit/**；递归扫描）"
 
 # ---------- ④ aws-lc 零命中 ----------
 for m in "$REPO_ROOT/Cargo.toml" "$ISLAND/Cargo.toml" "$CRATES/homeway-core/Cargo.toml"; do

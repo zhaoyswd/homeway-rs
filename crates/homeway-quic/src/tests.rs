@@ -14,9 +14,17 @@ use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::cmd::{Cmd, IslandErr, IslandSnapshot};
+use std::net::SocketAddrV4;
+
+use crate::cmd::{
+    Candidate, Cmd, DropReason, Drops, IslandErr, IslandEvent, IslandReply, IslandSnapshot,
+    RaceOutcome, Via,
+};
 use crate::driver::seams;
-use crate::{Island, IslandTx, Logf, OnUnhealthy};
+use crate::{
+    Island, IslandConfig, IslandCredential, IslandTx, Logf, OnEvent, OnUnhealthy, RpkPublicKey,
+    TokenSecret,
+};
 
 /// 收工预算（与 `wgcore::CLIENT_CLOSE_BUDGET` 同量级 = 2s）。
 const BUDGET: Duration = Duration::from_secs(2);
@@ -49,8 +57,23 @@ fn noop_unhealthy() -> OnUnhealthy {
     Arc::new(|_r: &str| {})
 }
 
+/// 测试用凭据（secret/pubkey/devTag/pin 全为构造值；M0 的用例不建连，pin 对不上无妨）。
+fn test_credential() -> IslandCredential {
+    IslandCredential::new(
+        TokenSecret::from_bytes([0x5A; 32]),
+        [0x11; 32],
+        [0x22; 8],
+        RpkPublicKey::from_bytes([0x33; 32]),
+    )
+}
+
+fn test_config() -> IslandConfig {
+    IslandConfig::new(test_credential())
+}
+
 fn island_of(logf: Logf) -> Island {
-    Island::start(logf, noop_unhealthy()).expect("岛可起（专用线程 + 单线程 runtime）")
+    Island::start(logf, noop_unhealthy(), test_config())
+        .expect("岛可起（专用线程 + 单线程 runtime + QUIC 端点）")
 }
 
 /// 有界取回回执 —— **实现设计 §3.6-2① 的映射**：通道断开（岛死/线程 panic ⇒ 栈上
@@ -194,7 +217,7 @@ fn tun_packet_is_accepted_without_reply() {
 #[test]
 fn stop_within_detaches_when_island_stuck() {
     let (logf, logs) = sink();
-    let island = Island::start_with_seam(logf, noop_unhealthy(), seams::HANG)
+    let island = Island::start_with_seam(logf, noop_unhealthy(), test_config(), seams::HANG)
         .expect("岛可起（卡死注入缝）");
     // 触发注入：投一条命令（其回执永不到——岛在处置点卡死）
     put_attach_command(&island);
@@ -222,7 +245,7 @@ fn stop_within_detaches_when_island_stuck() {
 fn island_panic_is_classified_in_place_and_surfaces_as_engine_gone() {
     let (logf, logs) = sink();
     let (on_unhealthy, reasons) = unhealthy_sink();
-    let island = Island::start_with_seam(logf, on_unhealthy, seams::PANIC)
+    let island = Island::start_with_seam(logf, on_unhealthy, test_config(), seams::PANIC)
         .expect("岛可起（panic 注入缝）");
 
     // 在途命令：带 reply 的 attach 到点即 panic（回执 sender 随栈解开被 drop）。
@@ -282,7 +305,7 @@ fn island_panic_is_classified_in_place_and_surfaces_as_engine_gone() {
 #[test]
 fn stuck_island_panic_line_comes_from_reaper() {
     let (logf, logs) = sink();
-    let island = Island::start_with_seam(logf, noop_unhealthy(), seams::STALL_THEN_PANIC)
+    let island = Island::start_with_seam(logf, noop_unhealthy(), test_config(), seams::STALL_THEN_PANIC)
         .expect("岛可起（延迟 panic 缝）");
     // 触发注入：投一条命令（岛在处置点先卡死 1.2s，再 panic——回执永不到）
     put_attach_command(&island);
@@ -378,9 +401,12 @@ fn dep_face_alive_client_endpoint() {
 // ---------- 10 ----------
 
 /// 公面签名钉定（编译期）：显式 std 类型签名——一旦公面夹带异步栈类型即编译失败。
+///
+/// M1 S2a 起随成员同步（设计 §10 S2-1 的验收口径）：新增的 `Cmd` 成员/回执类型/配置面
+/// 全部在这里逐字段写出类型；**加成员必须同步加臂**（下面没有通配臂 —— 少一条就编译红）。
 #[test]
 fn public_surface_signatures_are_pinned() {
-    let _: fn(Logf, OnUnhealthy) -> std::io::Result<Island> = Island::start;
+    let _: fn(Logf, OnUnhealthy, IslandConfig) -> std::io::Result<Island> = Island::start;
     let _: fn(&Island) -> IslandTx = Island::tx;
     let _: fn(&Island) -> IslandSnapshot = Island::snapshot;
     let _: fn(&Island) -> bool = Island::is_finished;
@@ -392,6 +418,95 @@ fn public_surface_signatures_are_pinned() {
     let _: &str = crate::driver::REAP_THREAD;
     // 兜底面：`Drop for Island`（镜像 `Drop for Client`）——句柄是拥有型值，可被 drop
     let _: fn(Island) = |i: Island| drop(i);
+}
+
+/// `Cmd` 成员的**字段类型**逐条钉定（编译期）：M0 三成员 + M1 S2a 的六个新成员。
+#[test]
+fn cmd_member_field_types_are_pinned() {
+    fn pin(cmd: Cmd) {
+        match cmd {
+            // M0 三成员
+            Cmd::TunAttach { fd, mtu, reply } => {
+                let _: i32 = fd;
+                let _: u32 = mtu;
+                let _: IslandReply<()> = reply;
+            }
+            Cmd::TunPacket(pkt) => {
+                let _: Box<[u8]> = pkt;
+            }
+            Cmd::Stop => {}
+            // M1 S2a 增补（设计 §2.1 表）
+            Cmd::SetOnUnhealthy { h } => {
+                let _: OnUnhealthy = h;
+            }
+            Cmd::SetOnEvent { h } => {
+                let _: OnEvent = h;
+            }
+            Cmd::SetCandidates { cands } => {
+                let _: Vec<Candidate> = cands;
+            }
+            Cmd::Connect {
+                cands,
+                budget,
+                reply,
+            } => {
+                let _: Vec<Candidate> = cands;
+                let _: Duration = budget;
+                let _: IslandReply<RaceOutcome> = reply;
+            }
+            Cmd::Rebind { local, reply } => {
+                let _: Option<SocketAddrV4> = local;
+                let _: IslandReply<SocketAddrV4> = reply;
+            }
+            Cmd::Probe { budget, reply } => {
+                let _: Duration = budget;
+                let _: IslandReply<Duration> = reply;
+            }
+            Cmd::DatagramDropped { reason, n } => {
+                let _: DropReason = reason;
+                let _: u64 = n;
+            }
+        }
+    }
+    let _: fn(Cmd) = pin;
+    // 候选/承载/结算/丢弃/事件（设计 §2.1 的「类型承担不变量」）
+    let _: Candidate = Candidate {
+        addr: "127.0.0.1:1".parse::<SocketAddrV4>().unwrap(),
+        via: Via::Relay { label: [0u8; 8] },
+    };
+    let _: Drops = Drops::default();
+    let _: IslandEvent = IslandEvent::DatagramDropped {
+        reason: DropReason::Unregistered,
+        n: 1,
+    };
+}
+
+/// `IslandErr` 变体逐条钉定（错误面也是公面：`source()` 不得返回异步栈错误）。
+#[test]
+fn island_err_variants_are_pinned() {
+    fn pin(e: IslandErr) {
+        match e {
+            IslandErr::EngineGone => {}
+            IslandErr::TunAlreadyAttached => {}
+            IslandErr::NoCandidate => {}
+            IslandErr::RaceInFlight => {}
+            IslandErr::NotConnected => {}
+            IslandErr::ConnectionLost => {}
+            IslandErr::RegistrationFailed => {}
+            IslandErr::ProbeNoResponse => {}
+            IslandErr::Rebind(io_err) => {
+                // 载荷必须是 std 的 io::Error（异步栈错误无处可藏）
+                let _: std::io::Error = io_err;
+            }
+        }
+    }
+    let _: fn(IslandErr) = pin;
+    // 构造配置面（凭据/绑定/节拍）
+    let cfg = test_config();
+    let _: IslandCredential = cfg.credential;
+    let _: Option<SocketAddrV4> = cfg.bind;
+    let _: Duration = cfg.patrol;
+    let _: fn(TokenSecret) = |s: TokenSecret| drop(s);
 }
 
 /// 10 条的「第 9 条」= 源码门 `tools/check-quic-isolation.sh`（非单测，见设计 §3.4 层 3）；

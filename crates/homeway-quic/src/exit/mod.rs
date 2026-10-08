@@ -23,9 +23,9 @@
 
 mod bridge;
 mod conn;
-mod rpk;
+pub(crate) mod rpk;
 mod socket;
-mod transport;
+pub(crate) mod transport;
 
 #[cfg(test)]
 mod tests;

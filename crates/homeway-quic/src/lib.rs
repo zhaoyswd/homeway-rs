@@ -36,14 +36,20 @@
 //! - panic 分工（设计 §3.6）：岛内**就地**分类（记行 + 不健康回调 `"panic"`）⇒ 线程退出；
 //!   预算内收工由 `stop_within` 的 join 分支记 panic 行，到点 detach 由收割线程记。
 //!
-//! 模块边界（设计 §3.1；M1 起长出口侧 `exit/`）：[`cmd`] = 命令通道协议（全 std 类型）；
-//! [`driver`] = 岛宿主（客户端侧异步面）；`exit/` = **出口 QUIC 面**（异步面：端点 +
-//! TransportConfig + RPK 身份 + 准入/数据面，M1 设计 §1.1/§1.2/§1.3/§1.4/§1.7）；`rpk` =
-//! RFC 7250 的**纯 std** 字节小件（种子/PKCS#8/SPKI——同步面也读得懂）；`reg3` = `hr-reg3`
-//! 注册帧的**纯 std** 字节层（`hmac`/`sha2` 非异步栈）；`sync_util` = 线程卫生小件。
-//! **异步栈名字只允许出现在 `driver.rs` 与 `exit/**`**（隔离门层 3 断言）。
+//! 模块边界（设计 §3.1；M1 起长出口侧 `exit/` 与客户端侧 `client/`）：[`cmd`] = 命令通道协议
+//! （全 std 类型）；[`config`] = 构造配置（凭据/绑定/巡检节拍，全 std 类型）；[`driver`] =
+//! 岛宿主（客户端侧异步面）；[`client`] = 客户端连接面（异步面：端点 + 赛跑 + 登记控制流/
+//! 刷新 + 迁移保持检测，M1 设计 §2.2/§2.3/§2.6）；`exit/` = **出口 QUIC 面**（异步面：
+//! 端点 + TransportConfig + RPK 身份 + 准入/数据面，M1 设计 §1.1/§1.2/§1.3/§1.4/§1.7）；
+//! `rpk` = RFC 7250 的**纯 std** 字节小件（种子/PKCS#8/SPKI——同步面也读得懂）；
+//! `reg3` = `hr-reg3` 注册帧的**纯 std** 字节层（`hmac`/`sha2` 非异步栈）；
+//! `sync_util` = 线程卫生小件。
+//! **异步栈名字只允许出现在 `driver.rs`、`client/**` 与 `exit/**`**（隔离门层 3 断言；
+//! 白名单同步扩了 `client/**`——见 `tools/check-quic-isolation.sh` 的注释与 commit 说明）。
 
+mod client;
 mod cmd;
+mod config;
 mod driver;
 mod exit;
 mod reg3;
@@ -53,7 +59,11 @@ mod sync_util;
 #[cfg(test)]
 mod tests;
 
-pub use cmd::{Cmd, IslandErr, IslandReply, IslandSnapshot, Logf, OnUnhealthy};
+pub use cmd::{
+    Candidate, Cmd, DropReason, Drops, IslandErr, IslandEvent, IslandReply, IslandSnapshot, Logf,
+    OnEvent, OnUnhealthy, RaceOutcome, Via,
+};
+pub use config::{IslandConfig, IslandCredential, TokenSecret, DEFAULT_PATROL};
 pub use driver::{Island, IslandTx};
 pub use exit::{
     ExitInbound, ExitQuic, ExitQuicConfig, ExitQuicErr, ExitQuicSnapshot, ExitSend, Reg3Request,

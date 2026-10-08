@@ -3,17 +3,18 @@
 //! 形态对齐今日 `wgcore` 的单驱动线程（设计 §3.2/§3.3）：投递不阻塞（unbounded，
 //! 无需回执）；带 `reply` 的命令由岛在事件到点时应答；状态走 `Arc<Mutex<…>>` 轮询。
 
+use std::net::SocketAddrV4;
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
+use std::time::Duration;
 
 /// 同步面 → 岛。
 ///
-/// **M0 只有三条成员**（骨架真落地、真被测；不带未构造变体——那会触发 `dead_code`）。
-/// M1–M4 的命令面（`Connect`/`Migrate`/`SetCandidates`/`SetOnUnhealthy`/`SetOnEvent`/
-/// `StreamOpen`/… ）由各期设计门定稿后增补；新增成员**必须**写明「带 reply 与否 + 理由」。
+/// **M0 三条成员**（骨架真落地、真被测）+ **M1 S2a 增补**（逐条照设计 §2.1 表，
+/// 成员各自写明「带 reply 与否 + 理由」）。**新增成员必须照此写理由**。
 ///
 /// `#[non_exhaustive]`（AGENTS 工程原则 1：协议帧类型；本枚举是**明确会长的跨 crate 消费面**
-/// ——消费侧必须留通配臂，M1 加成员不会硬断下游）。
+/// ——消费侧必须留通配臂，后续加成员不会硬断下游）。
 #[non_exhaustive]
 pub enum Cmd {
     /// L3 直通 attach（M1 起语义 = `wgcore::attach_tun`：**fd 所有权在扩展，岛从不 close**）。
@@ -22,16 +23,56 @@ pub enum Cmd {
         mtu: u32,
         reply: IslandReply<()>,
     },
-    /// 应用出站包（热路径，**无 reply**——与 `wgcore::Cmd::TunPacket` 同形；
-    /// 队列上限与丢弃计数是 M1 项，见设计 §8.2 R-H）。
+    /// 应用出站包（热路径，**无 reply**——与 `wgcore::Cmd::TunPacket` 同形；队列上限与
+    /// 丢弃计数口径见设计 §6.4 矩阵）。
     TunPacket(Box<[u8]>),
     /// 收工（幂等；重入无害）。
     Stop,
+    /// 替换不健康回调（设计 §2.1：`mark_unhealthy_if_current(gen, …)` 家族信号）。
+    /// **无 reply**：与构造期的 `on_unhealthy` 同一通话面——回调在岛线程内执行，
+    /// 丢一次无害（下次信号/世代重建再装）。
+    SetOnUnhealthy { h: OnUnhealthy },
+    /// 安装事件回调（岛 → 同步面的分类计数事件；M0 声明面预留的 `SetOnEvent` 位）。
+    /// **无 reply**：同上（安装是单向状态；`SetOnUnhealthy` 同形）。
+    SetOnEvent { h: OnEvent },
+    /// 更新候选清单（设计 §2.1：与 `wgcore::Cmd::SetCandidates` 同形——高频、无回执、
+    /// 丢一次无害）。`Connect` 的 `cands` 为空时用它。
+    SetCandidates { cands: Vec<Candidate> },
+    /// 赛跑接上（设计 §2.1/§2.2）。**带 reply**：赛跑结果是同步面要等的一次性结论
+    /// （via/ep/rtt 入状态面），失败必须可归因（[`IslandErr::NoCandidate`]）。
+    /// `budget` = **整轮预算**（不是每候选）：到点未完成者按 drop 收。
+    Connect {
+        cands: Vec<Candidate>,
+        budget: Duration,
+        reply: IslandReply<RaceOutcome>,
+    },
+    /// 换本地 socket（迁移；设计 §2.1/§2.3）。**带 reply**：迁移是用户可见事件
+    /// （C 系列行 + 状态面），失败必须可回报（否则同步面只能靠超时猜）。
+    /// `local = None` ⇒ 通配重绑（`0.0.0.0:0`）。
+    ///
+    /// ⚠️ `Endpoint::rebind` 是 **endpoint 粒度**（影响该端点全部连接），旧 socket 只
+    /// 续收片刻，**对端不可达没有专用错误** ⇒ 保持检测与回落判据在岛内另算
+    /// （[`IslandSnapshot::migration_unconfirmed`]，节拍 = `IslandConfig::patrol`）。
+    Rebind {
+        local: Option<SocketAddrV4>,
+        reply: IslandReply<SocketAddrV4>,
+    },
+    /// 巡检判活（替代 `path_probe` 的连接级判据；设计 §2.5）。**带 reply**：判活要结论；
+    /// `budget` = 本次判活预算（由调用方给——巡检节拍/threshold 沿用既有常数）。
+    Probe {
+        budget: Duration,
+        reply: IslandReply<Duration>,
+    },
+    /// 数据面丢弃上报（设计 §2.1 的 `DatagramDropped` 事件位）：TUN 读线程/回程线程把
+    /// 自己的丢弃分类计数报进岛，岛据此入 `IslandSnapshot::drops`（N-c 行 + 状态 JSON
+    /// 同源）并回调 [`OnEvent`]。**无 reply**（热路径；计数丢一次只是少记，不静默面靠
+    /// 行 + 快照兜底）。
+    DatagramDropped { reason: DropReason, n: u64 },
 }
 
 /// 岛 → 同步面的单次回执口（每命令一条）。
 ///
-/// **取回纪律**（设计 §3.6-2①，M1 消费侧照此）：`rx.recv().map_err(|_| IslandErr::EngineGone)`
+/// **取回纪律**（设计 §3.6-2①，消费侧照此）：`rx.recv().map_err(|_| IslandErr::EngineGone)`
 /// ——岛线程 panic 时栈上的 reply sender 被 drop ⇒ `RecvError` ⇒ 立刻归错；**禁止 `unwrap()`**
 /// （否则一次岛死会把同步面挂死）。
 pub type IslandReply<T> = Sender<Result<T, IslandErr>>;
@@ -46,15 +87,189 @@ pub enum IslandErr {
     /// 隧道面已附加（重复 attach 拒绝）。
     #[error("隧道面已附加")]
     TunAlreadyAttached,
+    /// 全候选失败（设计 §2.2 的失败面）：预算内没有任何候选完成握手。
+    #[error("无候选可用（全候选未在预算内完成握手）")]
+    NoCandidate,
+    /// 已有赛跑在途：赛跑结论是一次性的，调用方等前一轮回执再发。
+    #[error("已有赛跑在途（等前一轮回执再发）")]
+    RaceInFlight,
+    /// 岛未持有连接（该命令要求已建连）。
+    #[error("岛未持有连接")]
+    NotConnected,
+    /// 连接已断（对端关闭 / 空闲回收）。
+    #[error("连接已断")]
+    ConnectionLost,
+    /// 登记窗内连接关闭：出口拒绝（坏 MAC/表满/吊销）或链路断——客户端侧不可区分，
+    /// 出口侧归因行在出口日志。
+    #[error("登记失败（连接在登记窗内关闭）")]
+    RegistrationFailed,
+    /// 探活在预算内未获对端证据——**不误报活**（无证据即失败）。
+    #[error("探活预算内无对端证据")]
+    ProbeNoResponse,
+    /// 重绑本地 socket 失败（绑定/非阻塞/换绑）。
+    #[error("重绑本地 socket 失败（{0}）")]
+    Rebind(#[source] std::io::Error),
 }
 
-/// 岛侧状态快照（同步面轮询；**无阻塞**）。M1 起增补字段/方法。
+/// 候选的承载类别（设计 §2.1 的 `Via`：候选 = 地址 + 承载类别；中继候选必须带 label
+/// 才能组信封帧 `[0xAA][label8]‖[0xBB][5]‖pkt`）。
+///
+/// **包封/剥壳的落地 = S2-7**：S2a 只把类别带进赛跑/快照/判据行，两类候选都发起
+/// `connect`（中继候选在 S2a 没有信封 socket，其连接不会完成——S2-7 换 socket 后补齐）。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[non_exhaustive]
+pub enum Via {
+    /// 直连（裸 QUIC 包）。
+    Direct,
+    /// 中继（`label = sha256(peerId)[:8]`，信封帧用）。
+    Relay { label: [u8; 8] },
+}
+
+impl Via {
+    /// 判据行取值（与既有 C 系列同词：`直连`/`中继`）。
+    pub(crate) fn text(self) -> &'static str {
+        match self {
+            Via::Direct => "直连",
+            Via::Relay { .. } => "中继",
+        }
+    }
+
+    /// 中继判别（判据行 `中继=true/false` 字段）。
+    pub(crate) fn is_relay(self) -> bool {
+        matches!(self, Via::Relay { .. })
+    }
+}
+
+/// 一个候选端点（设计 §2.1；`homeway-core` 侧在边界转换成此形态）。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct Candidate {
+    /// 端点地址（QUIC 端口；中继候选 = 该中继的 QUIC 形）。
+    pub addr: SocketAddrV4,
+    /// 承载类别（决定上行形态，见 [`Via`]）。
+    pub via: Via,
+}
+
+/// 赛跑结算（设计 §2.2 的 C5'：胜者 + 候选数 + 耗时 + 完成/未完成清单）。
+///
+/// 「完成」清单保留**端点**而不是布尔：排障要看得见"哪个候选没起来"（r12 专2-3）。
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RaceOutcome {
+    /// 胜出候选（首个完成握手者）。
+    pub winner: SocketAddrV4,
+    /// 胜者承载类别。
+    pub via: Via,
+    /// 胜者握手完成时的 RTT（ms）。
+    pub rtt_ms: u64,
+    /// 本轮完成握手的候选（含胜者；并行候选在胜出瞬间已完成的也会列在这里并被关闭）。
+    pub completed: Vec<SocketAddrV4>,
+    /// 未完成/失败的候选（含被 drop 的在途握手）。
+    pub unfinished: Vec<SocketAddrV4>,
+    /// 本轮耗时（ms）。
+    pub elapsed_ms: u64,
+}
+
+/// 丢弃归类（设计 §2.4/§6.4 四类；**enum 而非裸计数**——AGENTS 原则 1）。
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+#[non_exhaustive]
+pub enum DropReason {
+    /// 超限（内层包 > `max_datagram_size()`，含 MTU 变小后自有队列的超限包）。
+    TooLarge,
+    /// 发送缓冲满（per-conn 预检不过 ∨ 出站队列满）。
+    SendBufferFull,
+    /// 回程队列满（岛 → TUN 写线程的有界队列）。
+    ReturnQueueFull,
+    /// 未登记（登记前丢弃：连接未就绪/未登记/已断；含 TUN 读线程投递不进面）。
+    Unregistered,
+}
+
+impl DropReason {
+    /// N-c 行的字段名与顺序（`超限/发送缓冲满/回程队列满/未登记`）。
+    pub(crate) fn field(self) -> usize {
+        match self {
+            DropReason::TooLarge => 0,
+            DropReason::SendBufferFull => 1,
+            DropReason::ReturnQueueFull => 2,
+            DropReason::Unregistered => 3,
+        }
+    }
+
+    pub(crate) fn text(self) -> &'static str {
+        match self {
+            DropReason::TooLarge => "超限",
+            DropReason::SendBufferFull => "发送缓冲满",
+            DropReason::ReturnQueueFull => "回程队列满",
+            DropReason::Unregistered => "未登记",
+        }
+    }
+}
+
+/// 四类丢弃计数（设计 §2.4；N-c 行与状态 JSON 同源）。
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct Drops {
+    pub too_large: u64,
+    pub send_buffer_full: u64,
+    pub return_queue_full: u64,
+    pub unregistered: u64,
+}
+
+impl Drops {
+    /// 记一次/多次丢弃，返回**该类**的累计值（节流记行用它）。
+    pub(crate) fn bump(&mut self, reason: DropReason, n: u64) -> u64 {
+        let slot = match reason.field() {
+            0 => &mut self.too_large,
+            1 => &mut self.send_buffer_full,
+            2 => &mut self.return_queue_full,
+            _ => &mut self.unregistered,
+        };
+        *slot = slot.saturating_add(n);
+        *slot
+    }
+}
+
+/// 岛 → 同步面的事件（**分类计数事件**；`#[non_exhaustive]`：会随观测面生长）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub enum IslandEvent {
+    /// 丢弃计数变化（`n` = 本次增量；累计值见 [`IslandSnapshot::drops`]）。
+    DatagramDropped { reason: DropReason, n: u64 },
+}
+
+/// 事件回调（**岛线程内**执行；只允许内存操作/通道投递——同 [`OnUnhealthy`] 纪律）。
+pub type OnEvent = Arc<dyn Fn(IslandEvent) + Send + Sync + 'static>;
+
+/// 岛侧状态快照（同步面轮询；**无阻塞**）。
+///
+/// M1 S2a 起为设计 §2.1 的增补形态（`via/ep/rtt/mirrors/packets_in,out/drops/mtu`），
+/// 另加两条本切片的判据位（`migrations`/`migration_unconfirmed`，见 `Rebind` 的文档）。
 #[derive(Clone, Debug, Default)]
 pub struct IslandSnapshot {
     /// 隧道面是否已 attach。
     pub attached: bool,
-    /// `TunPacket` 投递计数（丢弃/超限计数是 M1 项）。
+    /// `TunPacket` 投递计数（**收到的**包数；是否发送/丢弃见 `drops`）。
     pub packets_in: u64,
+    /// 回程包计数（岛 → TUN）。数据面接线 = S2-4；本切片恒 0。
+    pub packets_out: u64,
+    /// 当前路径承载类别（`None` = 未建连）。
+    pub via: Option<Via>,
+    /// 当前路径端点（胜出候选）。
+    pub ep: Option<SocketAddrV4>,
+    /// 当前路径 RTT（ms；未建连 = 0）。
+    pub rtt_ms: u64,
+    /// 赛跑投出的候选总数（累计；= C5' 的「候选 N 个」输入）。
+    pub mirrors: u64,
+    /// 最近一次 `SetCandidates`/`Connect` 登记的候选条数。
+    pub candidates: usize,
+    /// `max_datagram_size()` 现值（未建连 = `None`）。
+    pub mtu: Option<u32>,
+    /// `current_mtu` 现值（DPLPMTUD 面；未建连 = 0）。
+    pub current_mtu: u16,
+    /// 四类丢弃计数（N-c 行与状态 JSON 同源）。
+    pub drops: Drops,
+    /// 迁移**完成**次数（重绑后收到对端回包 = 路径确认；设计 §2.3 的 N-b 行）。
+    pub migrations: u64,
+    /// 迁移**未确认**位（重绑后一个巡检节拍内无回包 ⇒ 置位；回落重连/重赛跑由上层发起，
+    /// M1 的真阶梯 = S2b 的生命周期接线）。
+    pub migration_unconfirmed: bool,
 }
 
 /// 日志落点（与同步面同形：`Arc<dyn Fn(&str) + Send + Sync>`；域前缀由调用方自带）。
@@ -63,3 +278,4 @@ pub type Logf = Arc<dyn Fn(&str) + Send + Sync + 'static>;
 /// 不健康回调（**岛线程内**执行；只允许内存操作/通道投递——M1 起 =
 /// `mark_unhealthy_if_current(gen, reason)`；取值集 `{patrol, fd, panic, stop}` 是判据语义）。
 pub type OnUnhealthy = Arc<dyn Fn(&str) + Send + Sync + 'static>;
+

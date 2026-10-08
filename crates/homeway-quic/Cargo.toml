@@ -14,7 +14,9 @@ rustls.workspace = true
 # poll/try 面——直连端口 + 腿表 + 注入队列，M1 设计 §1.6）；其余 features 见 workspace：
 # `rt` = current_thread 宿主、`time` = 预算/节拍、`sync` = 命令通道 + 注入队列、
 # `macros` = select!（**只为 select!**——仍不用 `#[tokio::main]`）。
-tokio = { workspace = true, features = ["net"] }
+# `io-util`（M1 S2a 增开）：控制流写的 `AsyncWriteExt::write_all`（登记/刷新帧）与
+# 异步面单测的 `tokio::io::duplex`（60s 刷新节拍的 `start_paused` 用例，设计 §10 S2-6）。
+tokio = { workspace = true, features = ["net", "io-util"] }
 thiserror.workspace = true
 # DATAGRAM 载荷类型（M1 设计 §1.5：`send_datagram` 只收 `bytes::Bytes`；quinn 并不
 # re-export bytes ⇒ 消费侧必须直接声明——M0 已登记「M1 必需」）。
@@ -25,8 +27,8 @@ bytes.workspace = true
 hmac.workspace = true
 sha2.workspace = true
 
-# 测试依赖：出口面用例走**真线程 + 真回环 IO**（连接/迁移/上限注入），不钉端口、只判
-# 上界（M0 设计 §9.2 flake 口径①②）。`macros` = `#[tokio::test]`；本批**不用**
-# `test-util`（无 `start_paused` 虚拟时钟断言——时限面全是真 IO）。
+# 测试依赖：出口面/客户端面用例走**真线程 + 真回环 IO**（连接/迁移/上限注入），不钉端口、
+# 只判上界（M0 设计 §9.2 flake 口径①②）。`macros` = `#[tokio::test]`；**`test-util`**
+# = 纯定时语义用例的 `start_paused` 虚拟时钟（设计 §10 S2-6 点名同批加）。
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros"] }
+tokio = { workspace = true, features = ["macros", "test-util"] }

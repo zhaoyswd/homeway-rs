@@ -71,12 +71,11 @@ pub(crate) fn server_config(seed: &Ed25519Seed) -> Result<(quinn::ServerConfig, 
     Ok((scfg, pubkey))
 }
 
-/// 客户端钉定面（**M1 S1a 尚未接线**：消费方 = S2 的客户端岛接线；本批由 `exit::tests`
-/// 以真握手断言其行为——错 pin ⇒ 握手中止、对 pin ⇒ 连通且 `max_datagram_size()`=1362）。
+/// 客户端钉定面（**消费方 = 岛侧的 `client::Face::open`**：S2a 起接线，故本模块不再需要
+/// dead-code 豁免——`#[allow(dead_code)]` 已按 §12.6-3④ 的约定删除）。
 ///
-/// **dead-code 处置**（M0 设计 §3.7：不用 `#[allow(dead_code)]` 静默）：模块级 allow 带
-/// 理由在此声明，并在 commit message 的「偏离说明」登记——S2 接线后即可删掉本 allow。
-#[allow(dead_code)]
+/// 行为由 `exit::tests` 与 `client::tests` 双侧以真握手断言：错 pin ⇒ 握手中止、
+/// 对 pin ⇒ 连通且 `max_datagram_size()`=1362。
 pub(crate) mod client_pin {
     use std::sync::Arc;
 
