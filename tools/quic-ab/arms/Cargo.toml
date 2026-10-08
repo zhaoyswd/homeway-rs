@@ -1,0 +1,29 @@
+[workspace]
+resolver = "2"
+# 探针独立 workspace（根 Cargo.toml 的 exclude 已排除 tools/quic-ab）：
+#   · 本 workspace **不带** [patch]，故 wg-ring 臂用的是 crates.io 真 ring（上游 asm，诊断臂）；
+#   · 垫片臂（wg-shim）必须是另一个 workspace（`[patch]` 是 workspace 级——M0 设计 §4.4）。
+#   size-shell = 空壳档探针（四档矩阵的前两格；转入自 lab 的 size-probe v1 形态）
+members = ["common", "raw", "wg-ring", "quic", "size", "size-shell"]
+
+[workspace.package]
+version = "0.0.0"
+edition = "2021"
+
+# ---- lab 档（= /tmp/quic-lab 的口径：release + LTO + panic=abort + strip）----
+# **必须写在 workspace 根**：cargo 忽略非根包的 [profile]（只打一条 warning）——M0 设计 §4.4。
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# ---- product 档（跟随仓内 workspace 的默认 release：无 LTO / unwind / cgu=16 / 无 strip）----
+# 用 `cargo build --profile product` 构建；档位断言 + 两档尺寸差对照见 tools/quic-ab.sh。
+[profile.product]
+inherits = "release"
+lto = false
+panic = "unwind"
+codegen-units = 16
+strip = "none"

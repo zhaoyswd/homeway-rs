@@ -1,0 +1,22 @@
+[package]
+name = "quic-ab-size-shell"
+version.workspace = true
+edition.workspace = true
+
+# **空壳探针**（转入自 `/tmp/quic-lab/size-probe`，v1 形态）：无 boringtun/smoltcp，
+# 只有「空壳 cdylib」与「空壳 + QUIC 全栈（浅引用 ⇒ 死码消除后）」两档
+# ——这正是 M0 设计 §4.3/§5.1 四档矩阵的前两格（实测复现 323,632 / 778,272 B，
+# 2026-10-08 本轮复验：逐字节一致）。
+# 与 `size/`（v2 形态：boringtun+smoltcp 在场 + 真引用全路径）合起来构成四档。
+[lib]
+name = "clientcore"
+crate-type = ["cdylib", "rlib"]
+
+# 依赖集逐档对照（用 feature 切换；**与 lab 逐字同**——含 logging/tls12 与 log）
+[dependencies]
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio", "log"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "logging", "tls12"], optional = true }
+tokio = { version = "1", features = ["rt", "net", "time", "io-util"], optional = true }
+
+[features]
+quic = ["dep:quinn", "dep:rustls", "dep:tokio"]
