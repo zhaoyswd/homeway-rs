@@ -367,6 +367,80 @@ async fn race_picks_first_completer_among_dead_candidates() {
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
 
+/// **判据（S2-1 候选类别 / §2.7）**：赛跑对**两类候选**都能发起——中继类候选的
+/// 信封/剥壳 = S2-7（本切片没有信封 socket，故中继候选在 S2a 走的是裸包），但 `via`
+/// 必须如实带回类别并进判据行/快照；混合赛跑里「死的中继候选」如实进未完成清单。
+#[tokio::test]
+async fn race_initiates_relay_class_candidates_and_reports_via() {
+    let quic = exit_face(14);
+    let stub = Stub::new();
+    let (logf, logs) = sink();
+    // 短巡检节拍：让刷新行（C15' 的「中继=」位）也在本用例窗口内出现
+    let island = island_with_log(Duration::from_millis(300), quic.rpk_public_key(), Arc::clone(&logf));
+    let addr = connectable(&quic);
+    // label = sha256(peerId)[:8] 的占位（真值由 S2-7 的候选来源给；本用例只验类别通路）
+    let label = [0xA1u8; 8];
+    let relay_alive = Candidate {
+        addr,
+        via: Via::Relay { label },
+    };
+    let outcome = send_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::Connect {
+            cands: vec![relay_alive],
+            budget: WAIT,
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .expect("中继类候选必须能被发起并完成握手（信封 socket = S2-7）");
+    assert_eq!(outcome.via, Via::Relay { label }, "via 如实带回类别");
+    assert_eq!(island.snapshot().via, Some(Via::Relay { label }));
+    let lines = logs_until(&logs, "quic: 赛跑结算：胜出 中继", WAIT).await;
+    let settle = lines
+        .iter()
+        .find(|l| l.contains("quic: 赛跑结算：胜出 中继 "))
+        .expect("C5' 行按类别取值（胜出 中继）")
+        .clone();
+    assert!(
+        settle.contains(&addr.to_string()) && settle.contains("未完成="),
+        "C5' 行含胜者地址与清单：{settle}"
+    );
+    // C15'（刷新）行里的「中继=」位也按类别取值
+    let refresh = logs_until(&logs, "quic: 注册刷新 → ", WAIT).await;
+    assert!(
+        refresh.iter().any(|l| l.contains("中继=true")),
+        "刷新行的中继位如实：{refresh:?}"
+    );
+
+    // 混合赛跑：死的中继候选 + 活的直连候选 ⇒ 直连胜出，中继候选进未完成清单
+    let (_dead, dead_direct) = dead_candidate();
+    let relay_dead = Candidate {
+        addr: dead_direct.addr,
+        via: Via::Relay { label: [0xB2; 8] },
+    };
+    let outcome = send_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::Connect {
+            cands: vec![relay_dead, direct(addr)],
+            budget: Duration::from_secs(3),
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .expect("混合类别赛跑必须胜出");
+    assert_eq!(outcome.via, Via::Direct, "胜者 = 直连候选");
+    assert_eq!(outcome.unfinished, vec![relay_dead.addr], "死的中继候选进未完成清单");
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
 /// **判据（S2-2 的失败面）**：全候选失败 ⇒ `IslandErr::NoCandidate`（且快照无 path）。
 #[tokio::test]
 async fn race_all_dead_reports_no_candidate() {
