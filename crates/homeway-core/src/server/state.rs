@@ -204,6 +204,7 @@ impl State {
             peer_id: crate::token::PeerId::from(PublicKey::from(&privkey).to_bytes()),
             secret: Secret::from(secret),
             endpoints: eps,
+            rpk: None, // M1 S1a：RPK 字段已进 token 格式；铸造/台账接线随端点表同批（S1c）
         };
         self.append_record(secret, &tok.endpoints)?;
         Ok(tok)
@@ -368,6 +369,7 @@ impl State {
             peer_id: crate::token::PeerId::from(PublicKey::from(&self.private_key()?).to_bytes()),
             secret: Secret::from(rec.secret),
             endpoints: rec.endpoints,
+            rpk: None, // 台账记录不含 RPK（S1c 决定是否入台账；见 M1 设计 §3.6 token 登记条）
         }))
     }
 

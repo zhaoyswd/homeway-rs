@@ -1015,6 +1015,7 @@ fn token_reveal(args: &[String]) {
         peer_id: &tok.peer_id,
         secret: &tok.secret,
         endpoints: &eps,
+        rpk: tok.rpk.as_ref(),
     }) {
         Ok(s) => s,
         Err(e) => {

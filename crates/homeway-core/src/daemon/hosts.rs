@@ -786,6 +786,7 @@ mod tests {
             peer_id: &token::PeerId::from([0u8; 32]),
             secret: &token::Secret::from([7u8; 32]),
             endpoints: &[token::EndpointRef::new("127.0.0.1:1", token::EndpointKind::Direct)],
+            rpk: None,
         };
         token::encode(&spec).unwrap()
     }

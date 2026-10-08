@@ -357,6 +357,7 @@ impl UnifiedRoles {
                     peer_id: &t.peer_id,
                     secret: &t.secret,
                     endpoints: &eps_ref,
+                    rpk: t.rpk.as_ref(),
                 })
                 .unwrap_or_default();
                 let eps = t
@@ -935,6 +936,7 @@ impl RoleHost for UnifiedRoles {
                     peer_id: &tok.peer_id,
                     secret: &tok.secret,
                     endpoints: &eps_ref,
+                    rpk: tok.rpk.as_ref(),
                 })
                 .map_err(|e| BackendErr::Other(format!("token 编码失败：{e}")))?;
                 let eps: Vec<String> =

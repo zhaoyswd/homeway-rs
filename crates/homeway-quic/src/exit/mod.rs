@@ -30,6 +30,7 @@ mod tests;
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -77,6 +78,28 @@ pub struct ExitQuicSnapshot {
     pub admitted: u64,
     /// 观测到的路径变更次数（`remote_address()` 变化——S1b 的 E-q2 行前身）。
     pub path_changes: u64,
+    /// 握手失败次数（错 RPK / 对端放弃 / 期限到点各归各的细分口径见下）。
+    pub handshake_failed: u64,
+}
+
+/// 计量面（原子直读——**反应式**，不必等巡检拍；`snapshot()` 由它组装）。
+#[derive(Default)]
+struct ExitStats {
+    connections: AtomicU64,
+    admitted: AtomicU64,
+    path_changes: AtomicU64,
+    handshake_failed: AtomicU64,
+}
+
+impl ExitStats {
+    fn snapshot(&self) -> ExitQuicSnapshot {
+        ExitQuicSnapshot {
+            connections: self.connections.load(Ordering::SeqCst),
+            admitted: self.admitted.load(Ordering::SeqCst),
+            path_changes: self.path_changes.load(Ordering::SeqCst),
+            handshake_failed: self.handshake_failed.load(Ordering::SeqCst),
+        }
+    }
 }
 
 /// 出口 QUIC 面句柄（同步面）：地址/公开身份/读数/收工（幂等）。
@@ -86,7 +109,7 @@ pub struct ExitQuic {
     stop_tx: UnboundedSender<()>,
     exit: Arc<ExitSignal>,
     handle: Mutex<Option<JoinHandle<()>>>,
-    snapshot: Arc<Mutex<ExitQuicSnapshot>>,
+    stats: Arc<ExitStats>,
     logf: Logf,
 }
 
@@ -106,15 +129,15 @@ impl ExitQuic {
         let (ready_tx, ready_rx) = mpsc::channel::<Result<(SocketAddr, RpkPublicKey), ExitQuicErr>>();
         let (stop_tx, stop_rx) = unbounded_channel::<()>();
         let exit = Arc::new(ExitSignal::new());
-        let snapshot = Arc::new(Mutex::new(ExitQuicSnapshot::default()));
+        let stats = Arc::new(ExitStats::default());
 
         let handle = thread::Builder::new()
             .name(EXIT_THREAD.into())
             .spawn({
                 let logf = Arc::clone(&logf);
                 let exit = Arc::clone(&exit);
-                let snapshot = Arc::clone(&snapshot);
-                move || thread_body(socket, cfg, logf, ready_tx, stop_rx, exit, snapshot)
+                let stats = Arc::clone(&stats);
+                move || thread_body(socket, cfg, logf, ready_tx, stop_rx, exit, stats)
             })
             .map_err(|e| {
                 log_spawn_failed(&logf, EXIT_THREAD, &e, "出口 QUIC 面缺席（WG 面不受影响）");
@@ -128,7 +151,7 @@ impl ExitQuic {
                 stop_tx,
                 exit,
                 handle: Mutex::new(Some(handle)),
-                snapshot,
+                stats,
                 logf,
             }),
             Ok(Err(e)) => {
@@ -155,9 +178,9 @@ impl ExitQuic {
         self.rpk_public_key
     }
 
-    /// 运行读数（轮询；无阻塞）。
+    /// 运行读数（轮询；无阻塞——原子直读，不含锁等待）。
     pub fn snapshot(&self) -> ExitQuicSnapshot {
-        lock_unpoison(&self.snapshot).clone()
+        self.stats.snapshot()
     }
 
     /// QUIC 面线程是否已退出。
@@ -226,10 +249,10 @@ fn thread_body(
     ready_tx: Sender<Result<(SocketAddr, RpkPublicKey), ExitQuicErr>>,
     stop_rx: UnboundedReceiver<()>,
     exit: Arc<ExitSignal>,
-    snapshot: Arc<Mutex<ExitQuicSnapshot>>,
+    stats: Arc<ExitStats>,
 ) {
     let res = catch_unwind(AssertUnwindSafe(|| {
-        run_exit(socket, cfg, &logf, ready_tx, stop_rx, &snapshot)
+        run_exit(socket, cfg, &logf, ready_tx, stop_rx, &stats)
     }));
     if let Err(payload) = res {
         let msg = crate::driver::panic_msg(payload.as_ref());
@@ -253,7 +276,7 @@ fn run_exit(
     logf: &Logf,
     ready_tx: Sender<Result<(SocketAddr, RpkPublicKey), ExitQuicErr>>,
     mut stop_rx: UnboundedReceiver<()>,
-    snapshot: &Arc<Mutex<ExitQuicSnapshot>>,
+    stats: &Arc<ExitStats>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
@@ -303,8 +326,6 @@ fn run_exit(
         }
 
         let mut conns: Vec<LiveConn> = Vec::new();
-        let mut admitted: u64 = 0;
-        let mut path_changes: u64 = 0;
         loop {
             tokio::select! {
                 _ = stop_rx.recv() => break,
@@ -312,33 +333,29 @@ fn run_exit(
                     // 已登记连接（S1b 起为 `hr-reg3` 登记+绑定；本棒只采纳与保活）
                     Some(incoming) => match incoming.await {
                         Ok(conn) => {
-                            admitted += 1;
+                            stats.admitted.fetch_add(1, Ordering::SeqCst);
                             conns.push(LiveConn { remote: conn.remote_address(), conn });
+                            stats.connections.store(conns.len() as u64, Ordering::SeqCst);
                         }
-                        Err(_e) => {} // 握手失败（坏 RPK/超时/对端放弃）：计数与记行归 S1b 的 E-q3
+                        // 握手失败（错 RPK / 对端放弃 / 期限到点）：明细记行与四类丢弃
+                        // 计数归 S1b 的 E-q3——本棒只留总计数（客户端钉定判据的证据面）
+                        Err(_e) => {
+                            stats.handshake_failed.fetch_add(1, Ordering::SeqCst);
+                        }
                     },
                     None => break,
                 },
                 _ = tokio::time::sleep(TICK) => {}
             }
             // 巡检（每拍）：清死连接 + 观测路径变更（E-q2 行的前身；S1b 起接 dev 归属）
-            let before = conns.len();
             conns.retain(|c| c.conn.close_reason().is_none());
-            let mut changes = 0u64;
+            stats.connections.store(conns.len() as u64, Ordering::SeqCst);
             for c in conns.iter_mut() {
                 let now = c.conn.remote_address();
                 if now != c.remote {
                     c.remote = now;
-                    changes += 1;
+                    stats.path_changes.fetch_add(1, Ordering::SeqCst);
                 }
-            }
-            path_changes += changes;
-            if conns.len() != before || changes > 0 {
-                *lock_unpoison(snapshot) = ExitQuicSnapshot {
-                    connections: conns.len() as u64,
-                    admitted,
-                    path_changes,
-                };
             }
         }
         // ---- 收工：先关端点（对各连接发 CONNECTION_CLOSE），再丢弃连接句柄 ----

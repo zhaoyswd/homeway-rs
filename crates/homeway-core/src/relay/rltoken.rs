@@ -35,6 +35,7 @@ pub fn encode_relay_token(secret: &[u8; 32], endpoints: &[Endpoint]) -> Result<S
         peer_id: &token::PeerId::from(relay_secret_id(secret)),
         secret: &token::Secret::from(*secret),
         endpoints: &eps,
+        rpk: None, // M1：服务端 RPK 只随出口 token 走（中继 token 不涉 QUIC 端点，S1c）
     })?;
     // 前缀替换：encode 产 hmw1…，rl1 布局同体
     Ok(format!("{}{}", PREFIX, &s[token::PREFIX.len()..]))

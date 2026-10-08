@@ -172,7 +172,12 @@ fn cmd_token(args: &[String]) {
         }
         let eps: Vec<token::EndpointRef<'_>> =
             t.endpoints.iter().map(|e| token::EndpointRef::new(&e.addr, e.kind)).collect();
-        let spec = token::TokenSpec { peer_id: &t.peer_id, secret: &t.secret, endpoints: &eps };
+        let spec = token::TokenSpec {
+            peer_id: &t.peer_id,
+            secret: &t.secret,
+            endpoints: &eps,
+            rpk: t.rpk.as_ref(),
+        };
         match token::encode(&spec) {
             Ok(out) => {
                 println!("{out}");
@@ -207,7 +212,12 @@ fn cmd_token(args: &[String]) {
         }
         let eps: Vec<token::EndpointRef<'_>> =
             t.endpoints.iter().map(|e| token::EndpointRef::new(&e.addr, e.kind)).collect();
-        let spec = token::TokenSpec { peer_id: &t.peer_id, secret: &t.secret, endpoints: &eps };
+        let spec = token::TokenSpec {
+            peer_id: &t.peer_id,
+            secret: &t.secret,
+            endpoints: &eps,
+            rpk: t.rpk.as_ref(),
+        };
         match token::encode(&spec) {
             Ok(out) => {
                 println!("{out}");

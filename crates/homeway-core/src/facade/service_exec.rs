@@ -622,6 +622,7 @@ mod tests {
             peer_id: &peer,
             secret: &secret,
             endpoints: &eps,
+            rpk: None,
         })
         .expect("空端点 token 可编码");
         format!(r#"{{"token":"{tok}"}}"#)

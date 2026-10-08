@@ -120,6 +120,7 @@ mod tests {
                 addr: "192.168.3.12:41641",
                 kind: EndpointKind::Direct,
             }],
+            rpk: None,
         };
         token::encode(&spec).unwrap()
     }
@@ -142,6 +143,7 @@ mod tests {
             peer_id: &PeerId::from([1u8; 32]),
             secret: &Secret::from([2u8; 32]),
             endpoints: &[token::EndpointRef { addr: "r.example:41741", kind: EndpointKind::Relay }],
+            rpk: None,
         };
         let raw = token::encode(&spec).unwrap();
         let v: Value = serde_json::from_str(&probe_addr_json(&raw)).unwrap();

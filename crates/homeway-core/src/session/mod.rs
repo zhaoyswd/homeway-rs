@@ -788,6 +788,7 @@ impl Session {
                 peer_id: peer_pub,
                 secret: secret.clone(),
                 endpoints: vec![],
+                rpk: None,
             },
             &ident,
             &[Candidate {
@@ -1455,6 +1456,8 @@ fn token_of(sh: &Shared) -> Token {
         peer_id: crate::token::PeerId::from(sh.peer_pub),
         secret: sh.secret.clone(),
         endpoints: vec![],
+        // 重建路径不消费 RPK（钉定值是岛侧输入，S2 接线时随 token 解析带过）
+        rpk: None,
     }
 }
 

@@ -1857,6 +1857,9 @@ fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
         peer_id: &peer_id,
         secret: &secret,
         endpoints: &ep_refs,
+        // M1 S1a：RPK 字段与出口公钥产出已在位（`ServeEngine::quic_rpk_public_key`）；
+        // 把它接进铸造 = 端点表/台账同批动作（S1c）——本批不提前改 token 内容。
+        rpk: None,
     }) {
         Ok(s) => s,
         Err(e) => {

@@ -10,9 +10,18 @@
 #   ③ 岛内 `std::thread::sleep` 零命中（异步上下文禁阻塞）、`block_on` 只在异步面；
 #   ④ `aws-lc` 在 manifest 与 Cargo.lock 零命中（防 rustls 默认 features 回归——
 #      默认含 aws_lc_rs ⇒ 拉 aws-lc-sys = BoringSSL 派生 + cmake，OHOS 不可行）；
-#   ⑤ `crates/` 内 `dangerous()` / `with_custom_certificate_verifier` 零命中
-#      （harness 的跳过验证永不得进产品面；唯一合法位置 = tools/quic-ab/，且带
-#      `// SECURITY: harness-only` 标记——设计 §3.4 层 3 第 5 条 / §8.2 R-L）。
+#   ⑤ `crates/` 内 `dangerous()` / `with_custom_certificate_verifier` 只许出现在 RPK
+#      钉定的单一文件（`src/exit/rpk.rs`），且该文件必须**真做签名验证**——
+#      `verify_tls13_signature_with_raw_key` 同文件零命中即判红；其余文件仍**零命中**
+#      （harness 的跳过验证永不得进产品面；harness 侧唯一合法位置 = tools/quic-ab/，
+#      且带 `// SECURITY: harness-only` 标记——设计 §3.4 层 3 第 5 条 / §8.2 R-L）。
+#
+# **M1 起对第 ⑤ 条的收窄说明（偏离设计原文，见 commit message 的偏离说明）**：
+# RFC 7250 RPK 的客户端钉定在 rustls 公开面里**只能**经
+# `dangerous().with_custom_certificate_verifier(...)` 安装（`with_webpki_verifier` 只收
+# `WebPkiServerVerifier` 具体类型）——故「crates/ 内 `dangerous()` 零命中」对 RPK 档不可能
+# 同时成立。替代形态**更强**：允许面收窄到一个文件，且要求该文件出现原始公钥验签调用
+# （钉定 ≠ 跳过验证）。
 #
 # 判据取的是**代码**：`//` 行注释先剥离（文档允许点名这些 crate，代码不许命名）。
 # 注释剥离的副作用：字符串里的 `http://` 会被截断——本门只做名字/模式匹配，无碍。
@@ -29,6 +38,9 @@ LOCK="$REPO_ROOT/Cargo.lock"
 # 每一处新增的异步面都要显式过一次门）。
 ASYNC_FILES=( "driver.rs" )
 ASYNC_DIRS=( "exit" )
+# 第 ⑤ 条：RPK 钉定的唯一合法文件（相对 $REPO_ROOT），及其「真做签名验证」证据。
+RPK_VERIFIER_FILE="crates/homeway-quic/src/exit/rpk.rs"
+RPK_PROOF_PATTERN='verify_tls13_signature_with_raw_key'
 
 fail() { echo "!! QUIC 隔离门失败：$1" >&2; exit 1; }
 
@@ -117,13 +129,19 @@ N_AWSLC="$(grep -c 'aws-lc' "$LOCK" || true)"
 [[ "$N_AWSLC" == "0" ]] || fail "Cargo.lock 出现 aws-lc（计数 ${N_AWSLC}）——rustls 必须 default-features=false"
 echo "  ④ 通过：aws-lc 在 manifest 与 Cargo.lock 零命中（grep -c = 0）"
 
-# ---------- ⑤ 产品面零跳过验证 ----------
+# ---------- ⑤ 产品面零跳过验证（RPK 钉定唯一豁免，且须自证真验签） ----------
+# 豁免面自证（fail-closed，顺序在前）：文件在、且真做原始公钥验签
+[[ -f "$REPO_ROOT/$RPK_VERIFIER_FILE" ]] || fail "RPK 豁免文件不在：$RPK_VERIFIER_FILE（豁免面不得指向空气）"
+RPK_PROOF="$(hits_rs "$REPO_ROOT/$RPK_VERIFIER_FILE" "$RPK_PROOF_PATTERN" | wc -l | tr -d ' ')"
+(( RPK_PROOF >= 1 )) || fail "RPK 豁免文件未出现原始公钥验签（$RPK_PROOF_PATTERN）——豁免不得退化成「跳过验证」"
 BAD_DANGER=""
 while IFS= read -r f; do
+  rel="${f#$REPO_ROOT/}"
+  [[ "$rel" == "$RPK_VERIFIER_FILE" ]] && continue
   h="$(hits_rs "$f" 'dangerous\(\)|with_custom_certificate_verifier')"
   [[ -n "$h" ]] && BAD_DANGER+="${f}:"$'\n'"${h}"$'\n'
 done < <(find "$CRATES" -name '*.rs' -not -path '*/target/*' | sort)
-[[ -z "$BAD_DANGER" ]] || fail $'产品面出现跳过证书验证（唯一合法位置 = tools/quic-ab/，须带 SECURITY 标记）：\n'"$BAD_DANGER"
-echo "  ⑤ 通过：crates/ 内 dangerous()/with_custom_certificate_verifier 零命中"
+[[ -z "$BAD_DANGER" ]] || fail $'产品面出现跳过证书验证（唯一合法位置 = tools/quic-ab/（SECURITY 标记）/ RPK 钉定文件 '"$RPK_VERIFIER_FILE"'）：\n'"$BAD_DANGER"
+echo "  ⑤ 通过：dangerous()/with_custom_certificate_verifier 只在 RPK 钉定文件（含 $RPK_PROOF_PATTERN）；其余 crates/ 零命中"
 
 echo "QUIC 隔离门全绿（五条断言：异步边界 / 阻塞面 / aws-lc / 跳过验证）"
