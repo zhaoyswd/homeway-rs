@@ -19,6 +19,19 @@ use crate::rpk::RpkPublicKey;
 /// 巡检节拍缺省值（= 既有 `PATROL_INTERVAL`；判据行 C15 的 60s 刷新同源）。
 pub const DEFAULT_PATROL: Duration = Duration::from_secs(60);
 
+/// QUIC MTU 上限旋钮的缺省 / 有效区间（M1 设计 §12-① 的实现契约）。
+///
+/// 缺省 1400；有效区间 `[1320,1400]`——低于 1320 时 `max_datagram_size()` < 1280，
+/// 1280 内层包**每一个**都会被丢（端到端 TCP 反复重传同尺寸段 ⇒ 用户感知是断），
+/// 故区间下限与出口侧 `min_mtu` 同值。**区间内产不出 `mds < 1280`**
+/// （1320 ⇒ mds 1282）⇒「窄路径不可用」行的注入只能走测试缝（直接给
+/// [`IslandConfig::mtu_cap`] 更小的值，见 `client/tests.rs` 的用例）。
+pub const QUIC_MTU_CAP_DEFAULT: u16 = 1400;
+/// 有效区间下限（= `exit::transport::MIN_MTU`）。
+pub const QUIC_MTU_CAP_MIN: u16 = 1320;
+/// 有效区间上限（= `exit::transport::INITIAL_MTU`；上探被信封头寸锁死，见 §1.2）。
+pub const QUIC_MTU_CAP_MAX: u16 = 1400;
+
 /// token secret（32B）——**敏感材料**。
 ///
 /// 纪律照 `crate::rpk::Ed25519Seed` 与 `homeway-core::token::Secret`：Debug 全脱敏、
@@ -117,15 +130,23 @@ pub struct IslandConfig {
     pub bind: Option<SocketAddrV4>,
     /// 巡检节拍（刷新 + 迁移保持判据；缺省 [`DEFAULT_PATROL`]）。
     pub patrol: Duration,
+    /// QUIC MTU 上限（`initial_mtu` 与 DPLPMTUD `upper_bound` 同值；缺省
+    /// [`QUIC_MTU_CAP_DEFAULT`]）。
+    ///
+    /// 生产取值由世代层从 `HOMEWAY_QUIC_MTU` / `tunConfig.quicMtuCap` 解析并**夹到**
+    /// `[QUIC_MTU_CAP_MIN, QUIC_MTU_CAP_MAX]`（facade 侧）；本字段不再夹——测试缝
+    /// （窄路径注入）需要能给出区间外的值。
+    pub mtu_cap: u16,
 }
 
 impl IslandConfig {
-    /// 生产缺省（绑定 `0.0.0.0:0`、节拍 60s）。
+    /// 生产缺省（绑定 `0.0.0.0:0`、节拍 60s、MTU 上限 1400）。
     pub fn new(credential: IslandCredential) -> Self {
         Self {
             credential,
             bind: None,
             patrol: DEFAULT_PATROL,
+            mtu_cap: QUIC_MTU_CAP_DEFAULT,
         }
     }
 }
@@ -162,5 +183,11 @@ mod tests {
         assert!(cfg.bind.is_none(), "缺省不钉绑定地址");
         assert_eq!(cfg.patrol, DEFAULT_PATROL);
         assert_eq!(DEFAULT_PATROL, Duration::from_secs(60));
+        assert_eq!(cfg.mtu_cap, QUIC_MTU_CAP_DEFAULT, "缺省 MTU 上限 = 1400");
+        assert_eq!(QUIC_MTU_CAP_DEFAULT, 1400);
+        assert_eq!(QUIC_MTU_CAP_MIN, 1320, "有效区间下限 = 出口 min_mtu 同值");
+        // 区间自洽（编译期断言——常量关系不允许漂移）
+        const { assert!(QUIC_MTU_CAP_MIN <= QUIC_MTU_CAP_DEFAULT) };
+        const { assert!(QUIC_MTU_CAP_DEFAULT <= QUIC_MTU_CAP_MAX) };
     }
 }

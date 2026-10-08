@@ -82,6 +82,7 @@ impl Face {
             credential,
             bind,
             patrol: _,
+            mtu_cap,
         } = cfg;
         let relays = RelayTable::new();
         let stats = Arc::new(Mutex::new(SockStats::default()));
@@ -97,7 +98,8 @@ impl Face {
             crate::exit::rpk::client_pin::client_crypto_config(credential.pin())
                 .map_err(io::Error::other)?,
         );
-        client_cfg.transport_config(crate::exit::transport::transport_config());
+        // S3-1：MTU 上限旋钮（`HOMEWAY_QUIC_MTU` / `tunConfig.quicMtuCap` 的落地位）
+        client_cfg.transport_config(crate::exit::transport::transport_config_with_mtu(mtu_cap));
         Ok(Face {
             endpoint: Arc::new(endpoint),
             cfg: client_cfg,

@@ -55,10 +55,23 @@ pub(crate) const MIGRATION: bool = true;
 
 /// 组装定稿 `TransportConfig`（幂等；每次调用新建——`Arc` 交 quinn 后不可变）。
 pub(crate) fn transport_config() -> Arc<TransportConfig> {
+    // 缺省档 = 设计定值；`upper_bound` 与 `initial_mtu` 同值（上探构造性关闭，
+    // 见 [`MTU_UPPER_BOUND`]）——两条常量必须始终相等。
+    debug_assert_eq!(MTU_UPPER_BOUND, INITIAL_MTU);
+    transport_config_with_mtu(INITIAL_MTU)
+}
+
+/// 带 MTU 上限旋钮的组装（S3-1：`HOMEWAY_QUIC_MTU` / `tunConfig.quicMtuCap`）。
+///
+/// `mtu` 同时是 `initial_mtu` 与 DPLPMTUD `upper_bound`（`upper == initial` ⇒ 上探仍
+/// 构造性关闭，黑障检测仍活——见 [`MTU_UPPER_BOUND`]）。`min_mtu` 取
+/// `min(MIN_MTU, mtu)`：quinn 的 `get_initial_mtu() = initial.max(min)`，测试缝给
+/// 1200（窄路径注入）时 min 必须一起降，否则 initial 被抬回 1320 ⇒ 缝失效。
+pub(crate) fn transport_config_with_mtu(mtu: u16) -> Arc<TransportConfig> {
     let mut t = TransportConfig::default();
-    t.initial_mtu(INITIAL_MTU).min_mtu(MIN_MTU);
+    t.initial_mtu(mtu).min_mtu(mtu.min(MIN_MTU));
     let mut md = MtuDiscoveryConfig::default();
-    md.upper_bound(MTU_UPPER_BOUND);
+    md.upper_bound(mtu);
     t.mtu_discovery_config(Some(md));
     t.datagram_send_buffer_size(DATAGRAM_BUFFER);
     t.datagram_receive_buffer_size(Some(DATAGRAM_BUFFER));

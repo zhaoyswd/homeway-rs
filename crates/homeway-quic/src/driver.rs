@@ -234,6 +234,20 @@ impl Island {
             / 1_000_000
     }
 
+    /// TUN fd 字节对表（读=应用出站方向累计、写=应用入站方向累计）——
+    /// **接口与语义镜像** `wgcore::Client::tun_stats`（世代层 runner 块换源用：
+    /// quic 档的 `stats{fdReadBytes,fdWriteBytes}` 取自岛）。
+    pub fn tun_stats(&self) -> (u64, u64) {
+        (
+            self.counters
+                .read_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+            self.counters
+                .write_bytes
+                .load(std::sync::atomic::Ordering::Relaxed),
+        )
+    }
+
     /// 岛线程是否已退出（`ExitSignal` 置位面；收工后判定与 M1 排障用）。
     pub fn is_finished(&self) -> bool {
         self.exit.is_exited()

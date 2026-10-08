@@ -65,7 +65,10 @@ pub use cmd::{
     Candidate, Cmd, DropReason, Drops, IslandErr, IslandEvent, IslandReply, IslandSnapshot, Logf,
     OnEvent, OnUnhealthy, RaceOutcome, Via,
 };
-pub use config::{IslandConfig, IslandCredential, TokenSecret, DEFAULT_PATROL};
+pub use config::{
+    IslandConfig, IslandCredential, TokenSecret, DEFAULT_PATROL, QUIC_MTU_CAP_DEFAULT,
+    QUIC_MTU_CAP_MAX, QUIC_MTU_CAP_MIN,
+};
 pub use driver::{Island, IslandTx};
 pub use exit::{
     ExitInbound, ExitQuic, ExitQuicConfig, ExitQuicErr, ExitQuicSnapshot, ExitSend, Reg3Request,

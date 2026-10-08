@@ -94,6 +94,15 @@ pub struct TunConfigJson {
     pub token: String,
     #[serde(default)]
     pub port_forwards: Vec<portfwd::PortForwardRule>,
+    /// L3 承载档（M1 §4.1 的 config 面）：`"quic"`（缺省，缺键同义）| `"wg"`。
+    /// **世代级**（每次世代装配读一次；改后下次重建生效）；env `HOMEWAY_TRANSPORT`
+    /// 优先级更高。非法值 = 记行 + 按缺省（quic）走（见 `tun_exec::resolve_bearer`）。
+    #[serde(default)]
+    pub transport: String,
+    /// QUIC MTU 上限旋钮（M1 §12-① 的 config 面；0/缺键 = 缺省 1400，有效区间
+    /// [1320,1400]）。env `HOMEWAY_QUIC_MTU` 优先级更高。
+    #[serde(default)]
+    pub quic_mtu_cap: i64,
 }
 
 /// warmup 的类型化错误（工单⑤ r1-F27：字符串错误改枚举；code 即 tun_status 的
@@ -147,6 +156,12 @@ pub trait TunExecutor: Send + Sync {
     /// 健康位/分类在 `TunShared`（不走本 trait——世代共享面）。
     fn runner(&self) -> Option<RunnerIn>;
     fn transport(&self) -> Option<TransportIn>;
+    /// QUIC 岛快照段（M1 S3-2；**缺省 `None`** = 本世代非 quic 档/岛不在 ⇒ JSON 整段缺席）。
+    /// 为什么走 trait 而不是塞进 `RunnerIn`：设计 §4.3 定的是**平级段**（`quic{…}`），
+    /// 且它只在 quic 档存在——塞进 runner 会污染所有既有读者的键面。
+    fn quic_status(&self) -> Option<tun_status::QuicIn> {
+        None
+    }
     /// portfwd 整表热替换承载（默认 -1：无承载 = 改动随下次连接的 tunConfig 生效）。
     fn request_port_forwards(&self, _rules: Vec<portfwd::PortForwardRule>) -> i32 {
         -1
@@ -385,6 +400,7 @@ impl ClientCore {
             unhealthy_reason: (!why.is_empty()).then_some(why),
             runner: exec.runner(),
             transport: exec.transport(),
+            quic: exec.quic_status(),
         };
         tun_status::tun_status_json(&input)
     }

@@ -139,8 +139,9 @@ pub enum Via {
 }
 
 impl Via {
-    /// 判据行取值（与既有 C 系列同词：`直连`/`中继`）。
-    pub(crate) fn text(self) -> &'static str {
+    /// 判据行取值（与既有 C 系列同词：`直连`/`中继`）——`pub` 因为世代层的交接行
+    /// （`quic: 岛已建连…`）也要用同一份词表。
+    pub fn text(self) -> &'static str {
         match self {
             Via::Direct => "直连",
             Via::Relay { .. } => "中继",
@@ -150,6 +151,18 @@ impl Via {
     /// 中继判别（判据行 `中继=true/false` 字段）。
     pub(crate) fn is_relay(self) -> bool {
         matches!(self, Via::Relay { .. })
+    }
+
+    /// link/JSON 面的 via 词表（`direct|relay`——与既有三态词表的非 `none` 两值同形）。
+    ///
+    /// 为什么映射在本 crate 内：本枚举 `#[non_exhaustive]`，**跨 crate 匹配必须带通配臂**
+    /// （会给未来新增成员留一个静默归错的口子）；这里做同 crate 穷尽匹配 ⇒ 加成员时
+    /// 编译期就在本处被点名。
+    pub fn link_text(self) -> &'static str {
+        match self {
+            Via::Direct => "direct",
+            Via::Relay { .. } => "relay",
+        }
     }
 }
 

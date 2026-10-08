@@ -1426,7 +1426,12 @@ async fn tun_dataplane_is_bidirectional_and_counts() {
 async fn oversize_tun_packet_is_dropped_and_counted() {
     let quic = exit_face(21);
     let stub = Stub::new();
-    let island = island_with(Duration::from_secs(60), quic.rpk_public_key());
+    let (logf, logs) = sink();
+    let island = island_with_log(
+        Duration::from_secs(60),
+        quic.rpk_public_key(),
+        Arc::clone(&logf),
+    );
     let (tun, peer) = tun_pair();
     assert!(matches!(attach(&island, tun.as_raw_fd(), 1280, BUDGET), Ok(())));
     connect_direct(&island, &stub, &quic).await;
@@ -1442,6 +1447,45 @@ async fn oversize_tun_packet_is_dropped_and_counted() {
     // 负判据：超限包不得被发出去（也不得写回 TUN）
     assert_eq!(stub.packets_len(), 0, "超限包不得到达出口");
     assert!(read_tun(&peer, Duration::from_millis(200)).is_none(), "无回程");
+
+    // S3-3 的「行 ↔ 计数同源」：N-c 行由**同一份** `IslandSnapshot::drops` 渲染
+    // （`note_drop_shared` 一处），故计数 +1 必伴随行里的 `超限=1`
+    let lines = logs_until(&logs, "quic: 丢弃 ", WAIT).await;
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("超限=1") && l.contains("回程队列满=0")),
+        "N-c 行须与 JSON 同源（超限=1）：{lines:?}"
+    );
+
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（S3-1 / 设计 §12-① ④⑤，MTU 上限旋钮）**：`mtu_cap` 压到 **1200**（区间
+/// `[1320,1400]` 之外——**只有测试缝能给这个值**，区间内 `mds ≥ 1282` 产不出
+/// 「mds < 内层 MTU」）⇒ `max_datagram_size()` < 1280 且「**窄路径不可用**」行出现
+/// （除计数外显式告知：1280 内层包会被全丢，用户感知是断）。
+#[tokio::test]
+async fn mtu_cap_below_inner_mtu_marks_narrow_path() {
+    let quic = exit_face(25);
+    let stub = Stub::new();
+    let (logf, logs) = sink();
+    let mut cfg = island_cfg(Duration::from_secs(60), quic.rpk_public_key());
+    cfg.mtu_cap = 1200; // 测试缝（区间外；生产由世代层夹到 [1320,1400]）
+    let island = Island::start(Arc::clone(&logf), Arc::new(|_r: &str| {}), cfg).expect("岛可起");
+    let (tun, _peer) = tun_pair();
+    assert!(matches!(attach(&island, tun.as_raw_fd(), 1280, BUDGET), Ok(())));
+    connect_direct(&island, &stub, &quic).await;
+
+    let mds = island.snapshot().mtu.expect("已建连 ⇒ mds 可读");
+    assert!(mds < 1280, "MTU 1200 ⇒ mds 应 < 1280（实测 {mds}）");
+    assert!(mds >= 1160, "MTU 1200 ⇒ mds ≈ 1162（实测 {mds}）");
+    let lines = logs_until(&logs, "窄路径不可用", WAIT).await;
+    assert!(
+        lines.iter().any(|l| l.contains("窄路径不可用")),
+        "`mds < 内层 MTU` 必须另打「窄路径不可用」行：{lines:?}"
+    );
 
     assert!(island.stop_within(Instant::now() + BUDGET));
     assert!(quic.stop_within(Instant::now() + BUDGET));

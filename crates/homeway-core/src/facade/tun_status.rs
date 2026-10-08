@@ -96,6 +96,45 @@ pub struct TunStatusInput {
     pub unhealthy_reason: Option<String>,
     pub runner: Option<RunnerIn>,
     pub transport: Option<TransportIn>,
+    /// QUIC 岛快照段（M1 S3-2；**additive 平级段**——`None` = 本世代非 quic 档/岛不在）。
+    pub quic: Option<QuicIn>,
+}
+
+/// 四类丢弃计数（M1 S3-3：N-c 行与 JSON **同源**——同一份 `IslandSnapshot::drops`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuicDropsIn {
+    pub too_large: u64,
+    pub send_buffer_full: u64,
+    pub return_queue_full: u64,
+    pub unregistered: u64,
+}
+
+/// QUIC 岛快照（M1 S3-2 的 `quic` 段；字段清单 = S2b 交下的 `IslandSnapshot` 全量，
+/// **键名照抄**——本段是 M1 新增面（无 Go 对照），键名即契约，改动须登记）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuicIn {
+    /// `max_datagram_size()` 现值（0 = 未建连）。
+    pub mtu: u32,
+    /// `current_mtu`（DPLPMTUD/黑障后的现值）。
+    pub current_mtu: u16,
+    pub lost_packets: u64,
+    pub congestion_events: u64,
+    pub migrations: u64,
+    pub migration_unconfirmed: bool,
+    pub drops: QuicDropsIn,
+    /// `direct|relay|none`（与 link 段同一词表）。
+    pub via: String,
+    pub ep: String,
+    pub rtt_ms: u64,
+    pub packets_in: u64,
+    pub packets_out: u64,
+    /// 当前本地地址（UDP 源端口；空串 = 未就绪）——detach 后仍可读（M0 §8.1 残余面）。
+    pub local: String,
+    pub connections: u64,
+    pub relay_tx: u64,
+    pub rx_ignored: u64,
+    pub candidates: u64,
+    pub mirrors: u64,
 }
 
 /// 快照 → tunStatusJSON（Go tunStatusJSON 逐键对齐；键序 = 字典序）。
@@ -193,6 +232,44 @@ pub fn tun_status_json(input: &TunStatusInput) -> String {
         if let Some(ip) = &t.tun_ip {
             m.insert("tunIp".into(), Value::String(ip.clone()));
         }
+    }
+
+    // M1 S3-2：`quic` 段（**additive 平级段**；岛不在 = 整段缺席 ⇒ 旧读者零影响）
+    if let Some(q) = &input.quic {
+        let mut qm = Map::new();
+        qm.insert("mtu".into(), Value::from(q.mtu));
+        qm.insert("current_mtu".into(), Value::from(q.current_mtu));
+        qm.insert("lost_packets".into(), Value::from(q.lost_packets));
+        qm.insert("congestion_events".into(), Value::from(q.congestion_events));
+        qm.insert("migrations".into(), Value::from(q.migrations));
+        qm.insert(
+            "migration_unconfirmed".into(),
+            Value::from(q.migration_unconfirmed),
+        );
+        let mut d = Map::new();
+        d.insert("too_large".into(), Value::from(q.drops.too_large));
+        d.insert(
+            "send_buffer_full".into(),
+            Value::from(q.drops.send_buffer_full),
+        );
+        d.insert(
+            "return_queue_full".into(),
+            Value::from(q.drops.return_queue_full),
+        );
+        d.insert("unregistered".into(), Value::from(q.drops.unregistered));
+        qm.insert("drops".into(), Value::Object(d));
+        qm.insert("via".into(), Value::String(q.via.clone()));
+        qm.insert("ep".into(), Value::String(q.ep.clone()));
+        qm.insert("rtt_ms".into(), Value::from(q.rtt_ms));
+        qm.insert("packets_in".into(), Value::from(q.packets_in));
+        qm.insert("packets_out".into(), Value::from(q.packets_out));
+        qm.insert("local".into(), Value::String(q.local.clone()));
+        qm.insert("connections".into(), Value::from(q.connections));
+        qm.insert("relay_tx".into(), Value::from(q.relay_tx));
+        qm.insert("rx_ignored".into(), Value::from(q.rx_ignored));
+        qm.insert("candidates".into(), Value::from(q.candidates));
+        qm.insert("mirrors".into(), Value::from(q.mirrors));
+        m.insert("quic".into(), Value::Object(qm));
     }
 
     Value::Object(m).to_string()
@@ -344,6 +421,7 @@ mod tests {
                 outbound_at_ms: Some(1696000009000),
                 local_err: Some((0, 0)),
             }),
+            quic: None,
         };
         let json = tun_status_json(&input);
         let v: Value = serde_json::from_str(&json).unwrap();
@@ -372,10 +450,77 @@ mod tests {
         assert_eq!(dk, vec!["active", "at", "fg", "localErrAdopted", "localErrTotal", "outboundAt", "reason"]);
     }
 
+    /// **判据（M1 S3-2）**：`quic` 段 = **additive 平级段**——①字段齐（S2b 交下的
+    /// 全量清单）；②岛不在（`None`）= 整段缺席，既有键面/键序逐字不变（旧读者零影响）。
+    #[test]
+    fn quic_section_is_additive_and_complete() {
+        // ② 缺席形态：既有键面不变（对照 full_key_face_attached 的键表——无 `quic`）
+        let bare = TunStatusInput {
+            stage: stage_in(TunStage::Attached, "", "", true, "wg"),
+            running: true,
+            demand: DemandState { active: false, reason: String::new(), at_ms: 0 },
+            demand_fg: false,
+            runner: None,
+            transport: None,
+            unhealthy_reason: None,
+            quic: None,
+        };
+        let v: Value = serde_json::from_str(&tun_status_json(&bare)).unwrap();
+        assert!(v.get("quic").is_none(), "岛不在 ⇒ 整段缺席");
+
+        // ① 在场形态：字段齐 + 键序（serde_json Map = 字典序）
+        let input = TunStatusInput {
+            quic: Some(QuicIn {
+                mtu: 1362,
+                current_mtu: 1400,
+                lost_packets: 3,
+                congestion_events: 1,
+                migrations: 2,
+                migration_unconfirmed: true,
+                drops: QuicDropsIn {
+                    too_large: 1,
+                    send_buffer_full: 2,
+                    return_queue_full: 3,
+                    unregistered: 4,
+                },
+                via: "relay".into(),
+                ep: "192.168.3.12:42652".into(),
+                rtt_ms: 12,
+                packets_in: 5,
+                packets_out: 6,
+                local: "192.168.3.12:54123".into(),
+                connections: 1,
+                relay_tx: 7,
+                rx_ignored: 8,
+                candidates: 4,
+                mirrors: 9,
+            }),
+            ..bare
+        };
+        let v: Value = serde_json::from_str(&tun_status_json(&input)).unwrap();
+        let qk: Vec<&str> = v["quic"].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(
+            qk,
+            vec![
+                "candidates", "congestion_events", "connections", "current_mtu", "drops", "ep",
+                "local", "lost_packets", "migration_unconfirmed", "migrations", "mirrors", "mtu",
+                "packets_in", "packets_out", "relay_tx", "rtt_ms", "rx_ignored", "via",
+            ]
+        );
+        let dk: Vec<&str> = v["quic"]["drops"].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(
+            dk,
+            vec!["return_queue_full", "send_buffer_full", "too_large", "unregistered"]
+        );
+        assert_eq!(v["quic"]["drops"]["too_large"], 1);
+        assert_eq!(v["quic"]["migration_unconfirmed"], true);
+        assert_eq!(v["quic"]["mtu"], 1362);
+        assert_eq!(v["quic"]["via"], "relay");
+    }
+
     /// runner 缺席 ⇒ stats/exitIp/link/portForwards/bridge 全缺（failed/prepare 期形态）。
     #[test]
-    fn no_runner_keys_absent() {
-        let input = TunStatusInput {
+    fn no_runner_keys_absent() {        let input = TunStatusInput {
             stage: stage_in(TunStage::Failed, "core", "新栈启动失败：token 解析失败", false, ""),
             running: false,
             demand: DemandState { active: false, reason: String::new(), at_ms: 0 },
