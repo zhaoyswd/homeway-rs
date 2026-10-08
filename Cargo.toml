@@ -1,11 +1,14 @@
 [workspace]
 resolver = "2"
 members = ["crates/homeway-core", "crates/homeway-cli", "crates/homeway-capi", "crates/homeway-quic"]
-# 两个独立 workspace 的排除项：
+# 独立 workspace 的排除项：
 #   fuzz           = nightly + cargo-fuzz（不进 cargo test --workspace——G-10）
 #   tools/quic-ab  = QUIC 实验台探针（**必需**：它自带 [patch] ring 的真 ring 臂，
 #                    不被根 [patch] 换垫片，否则「真 ring 诊断臂」当场失真——M0 设计 §4.4）
-exclude = ["fuzz", "tools/quic-ab"]
+#   tools/quic-probe = M1 S1c 的探针客户端（harness-only：RPK 钉定自定义 verifier 的
+#                    `dangerous()` 安装点 + relay 信封组帧）；产品面隔离门只扫 crates/，
+#                    独立 workspace 让它与产品面隔离（同 tools/quic-ab 先例）
+exclude = ["fuzz", "tools/quic-ab", "tools/quic-probe"]
 
 [workspace.package]
 version = "0.2.3"
