@@ -27,6 +27,32 @@ use std::os::fd::{AsRawFd as _, BorrowedFd, FromRawFd as _, OwnedFd};
 pub const SUN_PATH_MAX: usize =
     std::mem::size_of::<libc::sockaddr_un>() - std::mem::offset_of!(libc::sockaddr_un, sun_path) - 1;
 
+/// 本地 TCP 连接的 RST 收口（`SO_LINGER(l_onoff=1, l_linger=0)`——close 时不再走
+/// 优雅 FIN 队列而是直接复位；尽力而为，失败静默）。
+///
+/// 为什么收在这里（Q-F-B F2-3/D13）：这是**失败路径收口**的共享语义——「连接已建立
+/// 但上游不可达」时必须 RST（优雅 FIN 会让客户端把「连上后立刻 EOF」当成响应结束而
+/// 静默挂住）。daemon 承载面（forward/socks）三处调用点与 portfwd 拨号失败面共用同一
+/// 单源（此前只有 `daemon::carriers` 的一份私有副本，pf 会成第四份）。
+///
+/// **只设选项、不关 fd**：fd 的生命周期归调用方（drop 即 close ⇒ 生效）。
+pub(crate) fn rst_close_tcp(stream: &std::net::TcpStream) {
+    use std::os::fd::AsRawFd as _;
+    unsafe {
+        let linger = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        let _ = libc::setsockopt(
+            stream.as_raw_fd(),
+            libc::SOL_SOCKET,
+            libc::SO_LINGER,
+            &linger as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::linger>() as libc::socklen_t,
+        );
+    }
+}
+
 /// 给 fd 打 `FD_CLOEXEC`（幂等——`F_SETFD` 的 flags 字只有这一位）。
 pub fn set_cloexec(fd: BorrowedFd<'_>) -> io::Result<()> {
     if unsafe { libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, libc::FD_CLOEXEC) } < 0 {

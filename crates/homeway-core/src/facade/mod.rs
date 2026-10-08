@@ -475,8 +475,9 @@ impl ClientCore {
 
     // ---- ⑩ ClientCoreTunSetPortForwards ----
 
-    /// 运行中整表热替换（不重连隧道）：0 已应用 / -1 无已接管世代（改动随下次连接
-    /// 的 tunConfig 自然生效）/ -2 JSON 非法或校验不过。
+    /// 运行中整表热替换（不重连隧道）：0 已应用（**真装表**）/ -1 无已接管世代
+    /// （改动随下次连接的 tunConfig 自然生效）/ -2 JSON 非法或校验不过
+    /// （Q-F-B 起含条数上限 8）。
     pub fn tun_set_port_forwards(&self, cfg: &str) -> i32 {
         let rules = match portfwd::parse_rules_json(cfg) {
             Ok(r) => r,
@@ -778,7 +779,9 @@ mod tests {
         assert_eq!(core.tun_set_foreground(true), 0); // 再度转变踢
     }
 
-    /// portfwd 热替换门：attached 才收（Noop 执行体恒 -1）；校验失败 -2。
+    /// portfwd 热替换门：attached 才收（Noop/Fake 执行体恒 -1——**无承载 = 真话**；
+    /// 真承载执行体（`TunnelExec`）的 `0` 在 `tun_exec` 侧覆盖）；校验失败 -2
+    /// （含 Q-F-B 新增的**条数上限**）。
     #[test]
     fn port_forwards_gate() {
         let core = core_with(true, true);
@@ -790,6 +793,19 @@ mod tests {
                 r#"{"portForwards":[{"listen":0,"targetIp":"","targetPort":80}]}"#
             ),
             -2
+        );
+        // 条数超过上限（9 条 > 8）→ -2（Q-F-B F5-2）
+        let nine: String = format!(
+            r#"{{"portForwards":[{}]}}"#,
+            (0..9)
+                .map(|i| format!(r#"{{"listen":{},"targetIp":"","targetPort":80}}"#, 18080 + i))
+                .collect::<Vec<_>>()
+                .join(",")
+        );
+        assert_eq!(
+            core.tun_set_port_forwards(&nine),
+            -2,
+            "超条数 = -2（NAPI 门；装配期旁路另有逐条防御）"
         );
         // 未 attached → -1
         assert_eq!(

@@ -61,6 +61,14 @@ impl WriteHalf for UnixStream {
     }
 }
 
+/// 本机 TCP 流的半关闭（Q-F-B F2-3/N3：portfwd 的本地监听口是 `TcpStream`，泵复用
+/// 需要它也能传播 FIN——`shutdown(Write)` 与 UDS 形态同义）。
+impl WriteHalf for std::net::TcpStream {
+    fn close_write(&mut self) {
+        let _ = self.shutdown(std::net::Shutdown::Write);
+    }
+}
+
 /// 会话流的读写两半统一包装面（读半纯 `dyn Read`；写半 `dyn WriteHalf`）。
 impl WriteHalf for Box<dyn WriteHalf + Send> {
     fn close_write(&mut self) {
@@ -671,7 +679,7 @@ impl BridgeHost {
                             .name("hw-bridge-pump".into())
                             .spawn(move || {
                                 let _g = g1;
-                                pump(&mut local_r, &mut *remote_w, &logf1, "up");
+                                pump(&mut local_r, &mut *remote_w, &logf1, "桥泵", "up", true);
                             })
                         {
                             (self.logf)(&format!(
@@ -682,7 +690,7 @@ impl BridgeHost {
                             .name("hw-bridge-pump".into())
                             .spawn(move || {
                                 let _g = g2;
-                                pump(&mut *remote_r, &mut local_w, &logf2, "down");
+                                pump(&mut *remote_r, &mut local_w, &logf2, "桥泵", "down", true);
                             })
                         {
                             (self.logf)(&format!(
@@ -788,22 +796,36 @@ impl BridgeHost {
 /// 单向泵：读尽即关对侧写端（EOF 传播——半关闭语义，FIN 穿透）；错误亦收口。
 /// 两侧为 trait 对象（工单⑤：远端是会话流/本机 UDS 的统一拆半面；桥连接非
 /// 热路径，dyn 派发开销可忽略）。
-fn pump(r: &mut dyn Read, w: &mut dyn WriteHalf, logf: &crate::Logf, dir: &'static str) {
+///
+/// Q-F-B F2-4：`label` = 行文前缀（桥 = "桥泵"，旧行文逐字不变；portfwd =
+/// "port-forward"），`eof_log` = 读尽（EOF）时是否记行——桥要（排障面），portfwd
+/// 不记（对齐 Go `pkg/netpipe`：只对**非 EOF** 错误记行，浏览器关连接是常态）。
+pub(crate) fn pump(
+    r: &mut dyn Read,
+    w: &mut dyn WriteHalf,
+    logf: &crate::Logf,
+    label: &'static str,
+    dir: &'static str,
+    eof_log: bool,
+) {
     let mut buf = [0u8; 16 * 1024];
     let mut dbg_n = 0u64;
     let mut dbg_ok = 0u64;
     loop {
         match r.read(&mut buf) {
             Ok(0) => {
-                if dbg_n > 0 {
-                    (logf)(&format!("桥泵[{dir}] EOF（累计 {dbg_n}B / {dbg_ok} 次）"));
+                if eof_log && dbg_n > 0 {
+                    (logf)(&format!("{label}[{dir}] EOF（累计 {dbg_n}B / {dbg_ok} 次）"));
                 }
                 break;
             }
             Err(_) => {
-                if dbg_n > 0 {
+                // 门槛：桥侧保持既有「有流量才记」（旧行文逐字不变）；portfwd 侧
+                // （`eof_log=false`）**无条件记行**——对齐 Go `pkg/netpipe` 的错误口径
+                //（`logf("pipe %v: %v after %dB")`，n 可为 0；零字节 RST 也要有迹可循）。
+                if !eof_log || dbg_n > 0 {
                     (logf)(&format!(
-                        "桥泵[{dir}] 读错误（累计 {dbg_n}B / {dbg_ok} 次）"
+                        "{label}[{dir}] 读错误（累计 {dbg_n}B / {dbg_ok} 次）"
                     ));
                 }
                 break;
@@ -811,7 +833,7 @@ fn pump(r: &mut dyn Read, w: &mut dyn WriteHalf, logf: &crate::Logf, dir: &'stat
             Ok(n) => {
                 dbg_n += n as u64;
                 if let Err(e) = w.write_all(&buf[..n]) {
-                    (logf)(&format!("桥泵[{dir}] 写失败 after {dbg_n}B：{e}"));
+                    (logf)(&format!("{label}[{dir}] 写失败 after {dbg_n}B：{e}"));
                     break;
                 }
                 dbg_ok += 1;
@@ -1198,5 +1220,141 @@ mod tests {
         assert_eq!(after.auth_hex, before.auth_hex, "auth_hex 不变");
         assert!(!after.term_sock.is_empty(), "其它桥不受影响");
         host.stop();
+    }
+
+    // ---- Q-F-B F2-4：`pump` 的 label/eof_log 参数化（桥侧行文逐字不变；pf 侧 EOF 零日志）----
+
+    /// 假读端（按脚本给数据/EOF/错误）；假写端（记录写入 + `close_write` 被调）。
+    struct MockRead {
+        chunks: std::collections::VecDeque<Vec<u8>>,
+        err: Option<std::io::ErrorKind>,
+    }
+    impl Read for MockRead {
+        fn read(&mut self, out: &mut [u8]) -> std::io::Result<usize> {
+            // 有数据先给数据（错误只在脚本耗尽后生效——pump 的「零字节不记行」口径
+            // 需要真有流量才判读错误行）
+            if let Some(c) = self.chunks.pop_front() {
+                let n = c.len().min(out.len());
+                out[..n].copy_from_slice(&c[..n]);
+                return Ok(n);
+            }
+            match self.err.take() {
+                Some(k) => Err(std::io::Error::from(k)),
+                None => Ok(0),
+            }
+        }
+    }
+    struct MockWrite {
+        closed: Arc<AtomicBool>,
+        written: Vec<u8>,
+    }
+    impl Write for MockWrite {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.written.extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    impl WriteHalf for MockWrite {
+        fn close_write(&mut self) {
+            self.closed.store(true, Ordering::SeqCst);
+        }
+    }
+
+    /// 桥形（label="桥泵"、eof_log=true）：有流量时 EOF 记行（**旧行文逐字不变**）。
+    #[test]
+    fn pump_bridge_label_and_eof_line() {
+        let (logf, lines) = log_silent();
+        let mut r = MockRead {
+            chunks: std::collections::VecDeque::from(vec![b"abc".to_vec()]),
+            err: None,
+        };
+        let closed = Arc::new(AtomicBool::new(false));
+        let mut w = MockWrite {
+            closed: Arc::clone(&closed),
+            written: Vec::new(),
+        };
+        pump(&mut r, &mut w, &logf, "桥泵", "up", true);
+        assert_eq!(w.written, b"abc");
+        assert!(closed.load(Ordering::SeqCst), "EOF ⇒ 关对侧写端（FIN 传播）");
+        assert!(
+            lines.lock().unwrap().iter().any(|l| l == "桥泵[up] EOF（累计 3B / 1 次）"),
+            "桥侧 EOF 行文逐字不变：{:?}",
+            lines.lock().unwrap()
+        );
+    }
+
+    /// pf 形（label="port-forward"、eof_log=false）：**EOF 零日志**（对齐 Go netpipe——
+    /// 浏览器关连接是常态）；读错误仍记行且带 port-forward 标签。
+    #[test]
+    fn pump_pf_label_eof_silent_errors_logged() {
+        let (logf, lines) = log_silent();
+        // 有流量 + EOF：零日志
+        let mut r = MockRead {
+            chunks: std::collections::VecDeque::from(vec![b"xyz".to_vec()]),
+            err: None,
+        };
+        let closed = Arc::new(AtomicBool::new(false));
+        let mut w = MockWrite {
+            closed: Arc::clone(&closed),
+            written: Vec::new(),
+        };
+        pump(&mut r, &mut w, &logf, "port-forward", "down", false);
+        assert_eq!(w.written, b"xyz");
+        assert!(closed.load(Ordering::SeqCst));
+        assert!(lines.lock().unwrap().is_empty(), "pf 侧 EOF 零日志：{:?}", lines.lock().unwrap());
+        // 读错误：记行（带 label）
+        let mut r2 = MockRead {
+            chunks: std::collections::VecDeque::from(vec![b"q".to_vec()]),
+            err: Some(ErrorKind::ConnectionReset),
+        };
+        let mut w2 = MockWrite {
+            closed: Arc::new(AtomicBool::new(false)),
+            written: Vec::new(),
+        };
+        pump(&mut r2, &mut w2, &logf, "port-forward", "down", false);
+        assert!(
+            lines
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("port-forward[down] 读错误（累计 1B / 1 次）")),
+            "{:?}",
+            lines.lock().unwrap()
+        );
+        // 零字节读错误：pf 侧**无条件记行**（Go netpipe 口径；桥侧保留旧门槛）
+        lines.lock().unwrap().clear();
+        let mut r3 = MockRead {
+            chunks: std::collections::VecDeque::new(),
+            err: Some(ErrorKind::ConnectionReset),
+        };
+        let mut w3 = MockWrite {
+            closed: Arc::new(AtomicBool::new(false)),
+            written: Vec::new(),
+        };
+        pump(&mut r3, &mut w3, &logf, "port-forward", "up", false);
+        assert!(
+            lines
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("port-forward[up] 读错误（累计 0B / 0 次）")),
+            "零字节错误也要有迹可循：{:?}",
+            lines.lock().unwrap()
+        );
+        // 桥侧同形态：保留旧门槛（零字节不记行——行文逐字不变）
+        lines.lock().unwrap().clear();
+        let mut r4 = MockRead {
+            chunks: std::collections::VecDeque::new(),
+            err: Some(ErrorKind::ConnectionReset),
+        };
+        let mut w4 = MockWrite {
+            closed: Arc::new(AtomicBool::new(false)),
+            written: Vec::new(),
+        };
+        pump(&mut r4, &mut w4, &logf, "桥泵", "up", true);
+        assert!(lines.lock().unwrap().is_empty(), "桥侧旧门槛不变");
     }
 }

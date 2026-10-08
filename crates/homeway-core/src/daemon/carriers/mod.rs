@@ -288,21 +288,9 @@ fn canonical_host_hex(host: &str) -> String {
     }
 }
 
-/// 本地 TCP 连接 RST 收口（SO_LINGER 0——尽力而为；失败路径专用，优雅 FIN 会让
-/// 浏览器/客户端静默挂住）。
-pub(super) fn rst_close_tcp(stream: &std::net::TcpStream) {
-    use std::os::unix::io::AsRawFd as _;
-    unsafe {
-        let linger = libc::linger { l_onoff: 1, l_linger: 0 };
-        let _ = libc::setsockopt(
-            stream.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_LINGER,
-            &linger as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::linger>() as u32,
-        );
-    }
-}
+/// 本地 TCP 连接 RST 收口——**单源上移到 `crate::sysfd`**（Q-F-B F2-3/D13：portfwd
+/// 拨号失败面同用，不再有第四份私有副本）。本重导出保住本模块三处既有调用点零改动。
+pub(super) use crate::sysfd::rst_close_tcp;
 
 /// TCP 双向透传的半关闭单实现（Go pkg/netpipe.Both 同义：任一向 EOF 只收该向写端，
 /// 两向都收工才关两端；RST 只属于失败路径，由调用方负责）。
