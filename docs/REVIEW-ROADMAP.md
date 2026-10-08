@@ -71,6 +71,7 @@
 | `term::service::tests::attach_size_applies_to_pty`（2026-10-08 复跑观察） | PTY 时序（0.87s 隔离） | 隔离恒绿、并发/高负载下超时红 |
 | `daemon::tests::handshake_deadline_beats_slow_drip`（2026-10-08 Q-I 尾段复跑观察） | 握手期限 vs 慢滴水的墙钟竞态 | 隔离 3/3 绿；高载轮红 |
 | **同一工作树并发跑两个 `cargo test`**（2026-10-08 Q-F 复跑观察） | `daemon::carriers::forward::{add_roundtrip_remove_and_rebuild, per_host_cap_cascade_and_corrupt_file}` 用固定端口（19990/20001）互撞 ⇒ `EADDRINUSE` 红 | 串行/隔离恒绿；两个实例同时跑必红——**不是回归**，判回归前先确认没有第二个 `cargo test` 在跑 |
+| `server::bind::tests::dual_stack_listen_and_unmap`（2026-10-08 Q-J 代码门观察） | 200×5ms 轮询窗内收 2 包（高载/并发下窗口内跑不完） | 隔离 5/5 绿、与两 `cargo test` 并发时红；`bind.rs` 未动（判非回归）；判回归前先确认没有第二个 `cargo test` 在跑 |
 
 > 判据：**隔离复跑绿 + 与改动面无交集 + 基线可复现** ⇒ 判 flake，不算回归；三者缺一就不许当 flake
 > 放过（Q-E 批 `serve_send_end_to_end` 即按此口径甄别：隔离 3/3 绿 + 全量两轮 590 passed/0 failed）。
