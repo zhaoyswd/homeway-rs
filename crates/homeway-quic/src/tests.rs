@@ -123,6 +123,9 @@ fn drain_until(rx: &Receiver<String>, needle: &str, wait: Duration) -> Vec<Strin
 fn island_starts_and_stops_within_budget() {
     let (logf, _logs) = sink();
     let island = island_of(logf);
+    // 先做一次 attach 往返：证明「岛线程已进入命令循环」再起预算计时——否则预算里还含线程
+    // 首次调度的时间，重载下会让「预算内收工」断言偶发红。
+    assert!(matches!(attach(&island, 5, 1280, BUDGET), Ok(())));
     let t0 = Instant::now();
     assert!(
         island.stop_within(Instant::now() + BUDGET),
@@ -321,7 +324,20 @@ fn snapshot_is_pollable_after_stop() {
     let island = island_of(logf);
     assert!(matches!(attach(&island, 3, 1280, BUDGET), Ok(())));
     put_packet(&island, 32);
-    assert!(island.stop_within(Instant::now() + BUDGET), "正常收工");
+    // **屏障**（同用例 3，代码门整改复验时实测到的竞态）：`stop_within` 会置 stop 位，而驱动
+    // 循环**在循环头判位即退出** ⇒ 不等屏障就收工，队列里的 TunPacket 可能被丢（计数 0）——
+    // 那不是缺陷，是停止语义；本用例要断言「冻结值 = 1」，故须先确认包已被消费（同通道保序）。
+    assert!(
+        matches!(
+            attach(&island, 3, 1280, BUDGET),
+            Err(IslandErr::TunAlreadyAttached)
+        ),
+        "屏障命令回执 = 其前的 TunPacket 必已被处置"
+    );
+    assert!(
+        island.stop_within(Instant::now() + BUDGET),
+        "正常收工（投包后）"
+    );
     let s: IslandSnapshot = island.snapshot();
     assert!(s.attached, "收工后快照仍可读且值冻结");
     assert_eq!(s.packets_in, 1, "收工后计数冻结");

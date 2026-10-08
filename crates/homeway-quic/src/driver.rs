@@ -407,13 +407,16 @@ pub(crate) mod seams {
     pub(crate) const PANIC: u8 = 1;
     /// 命令处置点永久卡死（测到点 detach + 收割线程接手）。
     pub(crate) const HANG: u8 = 2;
-    /// 命令处置点卡死约 1.2s 后再 panic（测「到点 detach 后，panic 行由收割线程记」）。
+    /// 命令处置点卡死约 3s 后再 panic（测「到点 detach 后，panic 行由收割线程记」）。
+    /// **窗长 3s（不是 1.2s）**：用例在「见到 MARK_STALL」后才起 200ms 的 `stop_within` 预算，
+    /// 若测试线程在两步之间被调度延迟 > 窗长，岛已 panic ⇒ `wait_exit` 立即为真 ⇒「必须 detach」
+    /// 的断言会偶发假红（本棒实测 1/30）。窗给足即消除该不确定性。
     pub(crate) const STALL_THEN_PANIC: u8 = 3;
 
     /// 注入开始的记行标记（用例的确定性同步点；与上面的模式码一一对应）。
     pub(crate) const MARK_PANIC: &str = "测试注入：岛内 panic";
     pub(crate) const MARK_HANG: &str = "测试注入：永久卡死";
-    pub(crate) const MARK_STALL: &str = "测试注入：卡死 1.2s 后 panic";
+    pub(crate) const MARK_STALL: &str = "测试注入：卡死 3s 后 panic";
 
     /// 命令到点时的注入动作（岛线程内、异步上下文里执行；先记行再动作）。
     pub(crate) fn apply(mode: u8, logf: &Logf) {
@@ -428,7 +431,7 @@ pub(crate) mod seams {
             }
             STALL_THEN_PANIC => {
                 (*logf)(MARK_STALL);
-                block_briefly(Duration::from_millis(1200));
+                block_briefly(Duration::from_millis(3000));
                 panic!("{MARK_STALL}");
             }
             _ => {}
