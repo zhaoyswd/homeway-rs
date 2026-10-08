@@ -42,6 +42,11 @@ pub(crate) struct FileServe {
     /// QUIC 独立 UDP 端口（M1 §1.1）：缺省 = `serve.listen + 1`；被占用按 WG 同款退让。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) quic_listen: Option<u16>,
+    /// QUIC 面总开关（M1 S3-4）：缺省 = **true**。`false` ⇒ 不监听 QUIC 端口、不打
+    /// E-q1/E-q4 行、token **不带** QUIC 端点与 `rpk` 尾字段（⇒ token 串与 M1 前逐字节
+    /// 相同——Go 客户端 × Rust 出口的全量矩阵行 L4/L5 的可保命形态）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) quic: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) bind_interface: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -105,6 +110,7 @@ impl FileServe {
             enabled: false,
             listen: None,
             quic_listen: None,
+            quic: None,
             bind_interface: None,
             upnp: None,
             stun: None,
@@ -398,6 +404,8 @@ struct ServeFlags {
     listen: Option<u16>,
     bind_interface: Option<String>,
     upnp: Option<bool>,
+    /// QUIC 面总开关（`--quic[=bool]`；M1 S3-4——本地/CI 起 WG-only 出口用）。
+    quic: Option<bool>,
     stun: Option<String>,
     stun6: Option<String>,
     peer_ttl: Option<Duration>,
@@ -415,7 +423,7 @@ struct ServeFlags {
 }
 
 fn serve_usage() {
-    eprintln!("用法：homeway-cli serve [--state DIR] [--listen P] [--bind-interface M] [--upnp[=bool]] [--stun H:P] [--stun6 H:P]");
+    eprintln!("用法：homeway-cli serve [--state DIR] [--listen P] [--bind-interface M] [--upnp[=bool]] [--quic[=bool]] [--stun H:P] [--stun6 H:P]");
     eprintln!("       [--relay rl1…|ip:port] [--peer-ttl 168h] [--max-peers N] [--public-endpoint ip:port,ip:port]");
     eprintln!("       [--dns-port P] [--files-root DIR] [--ddns 裸域名] [--verbose]");
     eprintln!("  --stun= / --stun6= / --relay= 空值 = 关（Go flag 空串同义，F0 carve-out）；");
@@ -469,6 +477,9 @@ fn parse_serve_flags(args: &[String]) -> Result<ServeFlags, CliErr> {
             }
             "upnp" => {
                 f.upnp = Some(cli_flags::take_bool_or_exit("upnp", inline, true));
+            }
+            "quic" => {
+                f.quic = Some(cli_flags::take_bool_or_exit("quic", inline, true));
             }
             "stun" => {
                 // F0 carve-out：空值 = 关公网 STUN 观测（Go flag 空串同义；实测
@@ -571,6 +582,9 @@ pub(crate) fn serve_config_of(fc: &FileConfig, state_dir: &Path) -> Result<Serve
     }
     if let Some(v) = fc.serve.quic_listen {
         cfg.quic_listen_port = Some(v);
+    }
+    if let Some(v) = fc.serve.quic {
+        cfg.quic = v;
     }
     if let Some(v) = &fc.serve.bind_interface {
         cfg.bind_iface = parse_bind_iface(v);
@@ -690,6 +704,9 @@ pub(crate) fn assemble_result(args: &[String]) -> Result<ServeConfig, CliErr> {
     }
     if let Some(v) = f.upnp {
         cfg.upnp = v;
+    }
+    if let Some(v) = f.quic {
+        cfg.quic = v;
     }
     if let Some(v) = f.stun {
         cfg.stun = v;
@@ -1246,7 +1263,7 @@ mod tests {
             assert!(e.contains("config.toml"), "错误必须带路径，实得：{e}");
         }
         // 好值往返：serde 序列化后再严格读仍 Ok（写回面共用本函数）。
-        let good = "[serve]\nenabled = true\nlisten = 41641\nquic_listen = 41642\nbind_interface = \"auto\"\n\
+        let good = "[serve]\nenabled = true\nlisten = 41641\nquic_listen = 41642\nquic = false\nbind_interface = \"auto\"\n\
                     peer_ttl = \"168h\"\npublic_endpoint = \"1.2.3.4:41641\"\nrelay = \"\"\n\
                     dns_port = 5300\n[relay]\nenabled = false\nlisten = \":41741\"\nadvertise = \"\"\n";
         write_cfg(&d, good);
@@ -1256,6 +1273,7 @@ mod tests {
         let fc2 = load_config_strict(&d).unwrap();
         assert_eq!(fc2.serve.listen, Some(41641));
         assert_eq!(fc2.serve.quic_listen, Some(41642), "M1：QUIC 端口键往返");
+        assert_eq!(fc2.serve.quic, Some(false), "M1 S3-4：QUIC 面开关键往返");
         assert_eq!(fc2.relay.listen.as_deref(), Some(":41741"));
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -1342,6 +1360,32 @@ mod tests {
         assert!(!f.verbose);
         let f = parse_serve_flags(&["--upnp".to_owned()]).unwrap();
         assert_eq!(f.upnp, Some(true));
+    }
+
+    /// **M1 S3-4：`serve.quic` 双面**（config 键 + `--quic[=bool]` flag）——缺省 true；
+    /// `false` 经两条面各自落到 `ServeConfig.quic=false`（flag 优先于 config）。
+    #[test]
+    fn quic_switch_config_key_and_flag() {
+        // 缺省（不写键）= true
+        let d = tmp_state("quicdef");
+        let state = d.display().to_string();
+        let cfg = assemble_result(&["--state".to_owned(), state.clone()]).unwrap();
+        assert!(cfg.quic, "缺省 = true（QUIC 面常开）");
+        // config 键
+        write_cfg(&d, "[serve]\nquic = false\n");
+        let cfg = assemble_result(&["--state".to_owned(), state.clone()]).unwrap();
+        assert!(!cfg.quic, "config serve.quic=false 生效");
+        // flag 覆盖 config（body 里是 true，flag 给 false）
+        write_cfg(&d, "[serve]\nquic = true\n");
+        let cfg = assemble_result(&["--state".to_owned(), state.clone(), "--quic=false".to_owned()])
+            .unwrap();
+        assert!(!cfg.quic, "flag 优先于 config");
+        let cfg = assemble_result(&["--state".to_owned(), state, "--quic".to_owned()]).unwrap();
+        assert!(cfg.quic, "`--quic` 无值形 = true");
+        // 键往返（写回面共用 load_config_strict）
+        let f = parse_serve_flags(&["--quic=false".to_owned()]).unwrap();
+        assert_eq!(f.quic, Some(false));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// F0（Q-I 尾段）：空值 carve-out 四 flag（stun/stun6/relay/ddns）——等号形/空格形
@@ -1466,6 +1510,8 @@ mod tests {
         const SERVE_KEYS: &[&str] = &[
             "enabled", "listen", "bind_interface", "upnp", "stun", "stun6", "relay", "max_peers",
             "peer_ttl", "dns_port", "files_root", "public_endpoint",
+            // M1：QUIC 面（总开关 + 独立端口）
+            "quic_listen", "quic",
             // Q-J F2 五键
             "dns_upstream", "dns_fallback", "ddns_resolver", "dns_probe_target", "stun_probe_target",
         ];
@@ -1477,7 +1523,7 @@ mod tests {
             );
         }
         // 逐键「能被 schema 接受」复核：把每个键以合法值形态喂进去必须 Ok。
-        let served = "[serve]\nenabled = true\nlisten = 41641\nbind_interface = \"auto\"\nupnp = false\n\
+        let served = "[serve]\nenabled = true\nlisten = 41641\nquic = true\nbind_interface = \"auto\"\nupnp = false\n\
              stun = \"\"\nstun6 = \"\"\nrelay = \"\"\nmax_peers = 32\npeer_ttl = \"168h\"\n\
              dns_port = 5300\nfiles_root = \"\"\npublic_endpoint = \"\"\n\
              dns_upstream = [\"1.1.1.1\", \"9.9.9.9:5353\"]\ndns_fallback = \"223.5.5.5\"\n\

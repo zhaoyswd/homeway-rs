@@ -65,6 +65,10 @@ pub struct ServeConfig {
     /// QUIC 端口（M1 §1.1）：`None` = 缺省 `listen_port + 1`；被占用按 WG 同款退让
     /// 换端口（实际端口见 `cache/quic_listen_port.txt` 与 `ServeEngine::quic_local_addr`）。
     pub quic_listen_port: Option<u16>,
+    /// QUIC 面总开关（M1 S3-4）：缺省 **true**。`false` ⇒ 不监听 QUIC 端口、不打
+    /// E-q1/E-q4 行、token 不带 QUIC 端点与 `rpk` 尾字段（⇒ token 串与 M1 前**逐字节
+    /// 相同**；WG 面与服务面零变化）。
+    pub quic: bool,
     pub tunnel_ip: Ipv4Addr,
     pub files_port: u16,
     pub term_port: u16,
@@ -111,6 +115,7 @@ impl Default for ServeConfig {
             state_dir: PathBuf::from("."),
             listen_port: DEFAULT_LISTEN_PORT,
             quic_listen_port: None,
+            quic: true,
             tunnel_ip: DEFAULT_TUNNEL_IP,
             files_port: DEFAULT_FILES_PORT,
             term_port: DEFAULT_TERM_PORT,
@@ -431,8 +436,14 @@ impl ServeEngine {
         // 语义换端口（+1…+9 → 随机），实际端口落 `cache/quic_listen_port.txt` 并由
         // `ServeEngine::quic_local_addr` 暴露（token/UPnP/status 的唯一来源，§1.1）。
         // 起不来 = **fail-soft**：WG 面与服务面照常（QUIC 档缺席要在行里看得见）。
+        // **S3-4 开关**：`serve.quic=false` ⇒ 整个面不建（无端口监听、无 E-q1/E-q4 行、
+        // token 无 QUIC 端点与 `rpk` 尾字段 ⇒ 逐字节回落 M1 前形态）。
         let mut quic_brief: Option<(SocketAddr, homeway_quic::RpkPublicKey)> = None;
-        let quic_face = match crate::server::bind::listen_with_fallback_addr(quic_listen_port(&cfg), bind_addr) {
+        let quic_face = if !cfg.quic {
+            (logf)("quic: 面未启用（serve.quic=false）—— 不监听 QUIC 端口、token 不带 QUIC 端点（客户端将回落 WG）");
+            None
+        } else {
+            match crate::server::bind::listen_with_fallback_addr(quic_listen_port(&cfg), bind_addr) {
             Ok(sock) => match sock.set_nonblocking(true) {
                 Ok(()) => {
                     let seed = crate::server::quic_rpk_seed(&priv_key);
@@ -471,6 +482,7 @@ impl ServeEngine {
                     quic_listen_port(&cfg)
                 ));
                 None
+            }
             }
         };
         // 公布口径的 pinned 判据 = **运行期事实**（socket 钉卡成功与否 + 绑地址），

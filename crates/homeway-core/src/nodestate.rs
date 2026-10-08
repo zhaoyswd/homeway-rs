@@ -254,7 +254,9 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# homeway 配置（L1 意图层，唯�
 # 身份密钥不进本文件（key 与 token 台账同居 <state>/serve|relay/，L2）。
 # 改动经重启生效（不热更）。
 # 键表（省略即默认）：
-#   [serve] enabled / listen(1-65535) / bind_interface(auto|none|网卡|IP) /
+#   [serve] enabled / listen(1-65535) / quic(true|false；M1 的 QUIC 面总开关：关 =
+#           不监听 QUIC 端口 + token 不公布 QUIC 端点/RPK ⇒ 该 token 的客户端回落 WG) /
+#           quic_listen(1-65535；缺省 = listen+1) / bind_interface(auto|none|网卡|IP) /
 #           upnp / stun / stun6 / relay(rl1… 或 IP:port) / max_peers /
 #           peer_ttl(时长串，"0s"=关) / dns_port(0=关；非 0 = 客户端解析腿端口，缺省 5300) /
 #           files_root(空=$HOME) / public_endpoint(逗号分隔 ip:port；空=推断) /
@@ -270,6 +272,7 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# homeway 配置（L1 意图层，唯�
 [serve]
 enabled = true
 listen = 41641
+quic = true
 bind_interface = "auto"
 upnp = true
 stun = "stun.cloudflare.com:3478"
@@ -430,6 +433,9 @@ mod tests {
         struct FileServe {
             #[serde(default)] enabled: bool,
             #[serde(default)] listen: Option<u16>,
+            // M1：QUIC 面（总开关 + 独立端口）——模板与 schema 漂移由本镜像捕获
+            #[serde(default)] quic: Option<bool>,
+            #[serde(default)] quic_listen: Option<u16>,
             #[serde(default)] bind_interface: Option<String>,
             #[serde(default)] upnp: Option<bool>,
             #[serde(default)] stun: Option<String>,
