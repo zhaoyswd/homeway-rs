@@ -289,8 +289,16 @@ S4 判据登记} → S5 门槛实测〔须独占机器〕→ S6 代码门）。
 + 1 格按设计属 M5 判（体积）。代码门 = `docs/reviews/M1.md`（r13，`/tmp/dsh-review/r13.i3rMst/`，
 exit 0，有条件通过 → 条件 C1/C3 已整改、C2 上报；28 条意见 高 2 / 中 12 / 低 11，**不认同 0**，
 高危 H1 = 噪声门控误读 WG 腿信号已修）。
-**真机面七项未验**（层 0 / WiFi→蜂窝 / 真机吞吐 / 路径 MTU·丢包·NAT / OHOS 运行期 / UPnP 真 IGD /
-`panic="abort"` 跨仓）⇒ **M1 不宣称已验证**。
+**真机面（2026-10-09 补验，OHOS 设备 `FMR0224116011480` / ALN-AL00，读数 `/tmp/m1dev-res/`）**：
+**层 0 全通 ✓ 已验**（设备浏览器经 QUIC 隧道渲染 example.com；核侧 `warmup pong: 就绪（判据=quic）` /
+`attached（数据面已接管 fd=94）` / `link: via=direct ep=192.168.3.12:42652 rtt=26ms`，出口侧
+`quic: 连接采纳` + `intercept: tcp transit …（dialok）`）；**OHOS 运行期 ✓ 已验**（tokio/mio/epoll 在
+设备上可用；4 个世代起停全干净、零 panic）；**真机吞吐 部分**（App 测速口径同刻 A/B 无数量级回退：
+上行比 1.03 / 下行比 1.00；TUN 口径全量与冷/热门未做）；**未验**：WiFi→蜂窝（阻塞：设备无蜂窝 IPv4 +
+本地出口无蜂窝可达端点）、NAT 重绑、UPnP 真 IGD、`panic="abort"` 跨仓（已取当前事实：构建路径
+**无** `[profile.release]` ⇒ 缺省 unwind，岛内 `catch_unwind` 当前有效）⇒ 余项归 M6/M7 触点。
+**另登记两条真机发现**：①出口 `quic: 源校验拒` 在首次 QUIC attach 后约 1s 出现 ≥3 次（之后未见；
+核侧 drops 全 0 ⇒ 出口侧单向计数，归属待包级探针）；②经中继未在本轮真机覆盖（本地出口形态无公网端点）。
 
 ## M2 身份、设备表与准入（估 3–5 会话日）
 
