@@ -74,14 +74,23 @@ fn cred_id(secret: &[u8; 32]) -> String {
 }
 
 /// 台账行的 endpoints 段（与 Go `proto.Endpoint` 的 JSON 形态字节对齐）。
+///
+/// **M1 S1c 的 additive 字段（`"Quic"`）**：QUIC 类端点（设计 §1.1/§3.6）需要与
+/// WG/中继区分——`"Relay"` 保持「是否中继」原义（QUIC 端点恒 `false`），另加 `"Quic": true`
+/// **仅在为真时出现**（`skip_serializing_if`）⇒ 既有行**逐字节不变**；读侧缺键 = 非 QUIC。
+/// 登记：S4 的判据登记条「token 端点表新增 QUIC 类 + RPK 字段」须点名本字段（台账格式面）。
 fn endpoint_json(eps: &[Endpoint]) -> serde_json::Value {
     serde_json::Value::Array(
         eps.iter()
             .map(|e| {
-                serde_json::json!({
+                let mut obj = serde_json::json!({
                     "Addr": e.addr,
                     "Relay": matches!(e.kind, EndpointKind::Relay),
-                })
+                });
+                if e.kind == EndpointKind::Quic {
+                    obj["Quic"] = serde_json::Value::Bool(true);
+                }
+                obj
             })
             .collect(),
     )
@@ -90,9 +99,14 @@ fn endpoint_json(eps: &[Endpoint]) -> serde_json::Value {
 fn endpoint_from_json(v: &serde_json::Value) -> Option<Endpoint> {
     let addr = v.get("Addr")?.as_str()?.to_string();
     let relay = v.get("Relay").and_then(|b| b.as_bool()).unwrap_or(false);
+    let quic = v.get("Quic").and_then(|b| b.as_bool()).unwrap_or(false);
     Some(Endpoint {
         addr,
-        kind: if relay { EndpointKind::Relay } else { EndpointKind::Direct },
+        kind: match (relay, quic) {
+            (_, true) => EndpointKind::Quic,
+            (true, false) => EndpointKind::Relay,
+            (false, false) => EndpointKind::Direct,
+        },
     })
 }
 
@@ -103,6 +117,11 @@ struct TokenRecord {
     secret: String,
     endpoints: serde_json::Value,
     issued: String,
+    /// M1 S1c：出口 RPK 裸公钥（base64url-nopad 32B）——**追加在末位**（既有四个字段的
+    /// 位置/形态零漂移）。`None`（无 QUIC 面/未铸出）= 该键**不出现** ⇒ 旧行逐字节不变。
+    /// 登记同 `endpoint_json` 的 `Quic` 条（S4）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    rpk: Option<String>,
 }
 
 #[derive(Serialize, Deserialize)]
@@ -196,7 +215,13 @@ impl State {
 
     /// 生成新 token：随机 secret、追加台账（IssueToken 同义——**不复用于 AppendToken**：
     /// 这里每次新签发 secret）。
-    pub fn issue_token(&self, eps: Vec<Endpoint>) -> Result<Token, StateError> {
+    ///
+    /// `rpk` = 出口 RPK 裸公钥（M1 S1c：有 QUIC 面才给；`None` = 台账不打该字段）。
+    pub fn issue_token(
+        &self,
+        eps: Vec<Endpoint>,
+        rpk: Option<[u8; 32]>,
+    ) -> Result<Token, StateError> {
         let privkey = self.private_key()?;
         let mut secret = [0u8; 32];
         getrandom::getrandom(&mut secret).expect("系统随机源不可用");
@@ -204,16 +229,21 @@ impl State {
             peer_id: crate::token::PeerId::from(PublicKey::from(&privkey).to_bytes()),
             secret: Secret::from(secret),
             endpoints: eps,
-            rpk: None, // M1 S1a：RPK 字段已进 token 格式；铸造/台账接线随端点表同批（S1c）
+            rpk: rpk.map(crate::token::RpkPubKey::from),
         };
-        self.append_record(secret, &tok.endpoints)?;
+        self.append_record(secret, &tok.endpoints, rpk)?;
         Ok(tok)
     }
 
     /// 台账写入纪律的追加入口（AppendToken 同义）：与末行**不同**才追加（secret 与
     /// endpoints 序都相同 = 无变化）；**已吊销的 secret 一律拒写**（否则吊销后端点变化轮
     /// 会把死凭证的新一轮写进台账，末行不再代表有效 token）。
-    pub fn append_token(&self, secret: &[u8; 32], eps: &[Endpoint]) -> Result<(), StateError> {
+    pub fn append_token(
+        &self,
+        secret: &[u8; 32],
+        eps: &[Endpoint],
+        rpk: Option<[u8; 32]>,
+    ) -> Result<(), StateError> {
         let revoked = self.revoked_secrets()?;
         if revoked.contains(secret) {
             return Err(StateError::SecretRevoked);
@@ -221,24 +251,27 @@ impl State {
         if let Some(last) = self.last_record()? {
             let same = last.secret == *secret
                 && last.endpoints.len() == eps.len()
-                && last
-                    .endpoints
-                    .iter()
-                    .zip(eps.iter())
-                    .all(|(a, b)| a == b);
+                && last.endpoints.iter().zip(eps.iter()).all(|(a, b)| a == b)
+                && last.rpk == rpk;
             if same {
                 return Ok(()); // 无变化不追加
             }
         }
-        self.append_record(*secret, eps)
+        self.append_record(*secret, eps, rpk)
     }
 
-    fn append_record(&self, secret: [u8; 32], eps: &[Endpoint]) -> Result<(), StateError> {
+    fn append_record(
+        &self,
+        secret: [u8; 32],
+        eps: &[Endpoint],
+        rpk: Option<[u8; 32]>,
+    ) -> Result<(), StateError> {
         let rec = TokenRecord {
             id: cred_id(&secret),
             secret: B64.encode(secret),
             endpoints: endpoint_json(eps),
             issued: now_utc(),
+            rpk: rpk.map(|k| B64.encode(k)),
         };
         let mut line = serde_json::to_string(&rec).expect("台账行恒可序列化");
         line.push('\n');
@@ -369,7 +402,9 @@ impl State {
             peer_id: crate::token::PeerId::from(PublicKey::from(&self.private_key()?).to_bytes()),
             secret: Secret::from(rec.secret),
             endpoints: rec.endpoints,
-            rpk: None, // 台账记录不含 RPK（S1c 决定是否入台账；见 M1 设计 §3.6 token 登记条）
+            // M1 S1c：台账行带 RPK ⇒ 末行重铸的 token 也带它（否则 `serve token` 会打印
+            // 一枚与运行中出口不一致的串——客户端钉定会用错身份）
+            rpk: rec.rpk.map(crate::token::RpkPubKey::from),
         }))
     }
 
@@ -399,6 +434,7 @@ impl State {
                 TokenRecordOwned {
                     secret: decode_secret_b64(&rec.secret)?,
                     endpoints,
+                    rpk: rec.rpk.as_deref().map(decode_secret_b64).transpose()?,
                 },
                 i,
             )));
@@ -436,6 +472,8 @@ impl State {
 struct TokenRecordOwned {
     secret: [u8; 32],
     endpoints: Vec<Endpoint>,
+    /// 台账行里的 RPK（M1 S1c；旧行无该键 = `None`）。
+    rpk: Option<[u8; 32]>,
 }
 
 fn decode_secret_b64(s: &str) -> Result<[u8; 32], StateError> {
@@ -523,7 +561,7 @@ mod tests {
             0o600,
             "key.bin（身份私钥）必须 0600"
         );
-        st.issue_token(eps()).unwrap();
+        st.issue_token(eps(), None).unwrap();
         assert_eq!(
             fs::metadata(st.tokens_path()).unwrap().permissions().mode() & 0o777,
             0o600,
@@ -544,19 +582,19 @@ mod tests {
         let dir = tmpdir("append");
         let st = State::open(&dir).unwrap();
         assert!(st.secrets().unwrap().is_empty(), "空台账");
-        let _tok = st.issue_token(eps()).unwrap();
+        let _tok = st.issue_token(eps(), None).unwrap();
         let secrets = st.secrets().unwrap();
         assert_eq!(secrets.len(), 1);
         let s0 = secrets[0];
         // 同值不追加
-        st.append_token(&s0, &eps()).unwrap();
+        st.append_token(&s0, &eps(), None).unwrap();
         assert_eq!(st.secrets().unwrap().len(), 1);
         // 变化才追加（端点变）
         let eps2 = vec![
             Endpoint { addr: "127.0.0.1:42641".into(), kind: EndpointKind::Direct },
             Endpoint { addr: "192.168.3.12:42641".into(), kind: EndpointKind::Direct },
         ];
-        st.append_token(&s0, &eps2).unwrap();
+        st.append_token(&s0, &eps2, None).unwrap();
         let ledger = st.ledger().unwrap();
         assert_eq!(ledger.len(), 2, "变化应追加");
         assert_eq!(ledger[1].endpoints.len(), 2);
@@ -571,13 +609,13 @@ mod tests {
     fn revoke_filters_and_blocks_append() {
         let dir = tmpdir("revoke");
         let st = State::open(&dir).unwrap();
-        st.issue_token(eps()).unwrap();
+        st.issue_token(eps(), None).unwrap();
         let s0 = st.secrets().unwrap()[0];
         assert!(!st.revoke(&s0, "泄漏测试").unwrap(), "首次吊销非幂等命中");
         assert!(st.revoke(&s0, "再吊").unwrap(), "重复吊销幂等");
         assert!(st.secrets().unwrap().is_empty(), "吊销后无有效凭证");
         assert!(matches!(
-            st.append_token(&s0, &eps()),
+            st.append_token(&s0, &eps(), None),
             Err(StateError::SecretRevoked)
         ));
         let _ = fs::remove_dir_all(&dir);
@@ -604,7 +642,7 @@ mod tests {
     fn ledger_line_shape_matches_go() {
         let dir = tmpdir("shape");
         let st = State::open(&dir).unwrap();
-        st.issue_token(eps()).unwrap();
+        st.issue_token(eps(), None).unwrap();
         let raw = fs::read_to_string(dir.join("tokens.jsonl")).unwrap();
         let line = raw.lines().next().unwrap();
         // 键序：id → secret → endpoints → issued（Go 结构体字段序）
@@ -615,6 +653,54 @@ mod tests {
         assert!(id_pos < sec_pos && sec_pos < eps_pos && eps_pos < iss_pos);
         assert!(line.contains("\"Addr\":\"127.0.0.1:42641\",\"Relay\":false"), "端点字段形态");
         assert!(line.contains("\"issued\":\"2"), "RFC3339 年头");
+        // M1 S1c additive 字段：无 QUIC 面时**两个新键都不出现**（旧行逐字节不变）
+        assert!(!line.contains("\"Quic\""), "非 QUIC 端点不得出现 Quic 键");
+        assert!(!line.contains("\"rpk\""), "无 RPK 时不得出现 rpk 键");
+        let _ = fs::remove_dir_all(&dir);
+    }
+
+    /// **判据（M1 S1c 的台账 additive 字段）**：QUIC 端点 ⇒ `"Quic": true`（端点对象内）；
+    /// 带 RPK ⇒ 记录末位 `"rpk"`（记录级键名风格 = 既有四键的小写）；读回后
+    /// `last_token()` 的端点类别与 rpk 全还原；**既有四键的位置与形态不变**。
+    ///
+    /// 加字段的显式决定（任务书要求登记）：新增 `Quic`（端点级，仅真时出现）与 `Rpk`
+    /// （记录级，仅带时出现）两个 additive 键——旧行不出现它们 ⇒ 逐字节不变；
+    /// S4 的登记条须点名（token 端点表 + RPK 字段条）。
+    #[test]
+    fn ledger_quic_and_rpk_fields_are_additive() {
+        let dir = tmpdir("quic-rpk");
+        let st = State::open(&dir).unwrap();
+        let eps = vec![
+            Endpoint { addr: "127.0.0.1:42641".into(), kind: EndpointKind::Direct },
+            Endpoint { addr: "10.0.0.5:42642".into(), kind: EndpointKind::Quic },
+            Endpoint { addr: "198.51.100.212:41741".into(), kind: EndpointKind::Relay },
+        ];
+        let rpk = [0xA7u8; 32];
+        st.issue_token(eps.clone(), Some(rpk)).unwrap();
+        let raw = fs::read_to_string(dir.join("tokens.jsonl")).unwrap();
+        let line = raw.lines().next().unwrap();
+        assert!(
+            line.contains("\"Addr\":\"10.0.0.5:42642\",\"Quic\":true,\"Relay\":false"),
+            "QUIC 端点形态（端点对象的键序 = serde_json::Map 字典序，既有行本就是这个口径）：{line}"
+        );
+        assert!(line.contains("\"Addr\":\"127.0.0.1:42641\",\"Relay\":false}"), "WG 端点形态不变：{line}");
+        // 键序：id → secret → endpoints → issued → rpk（Rpk 追加在末位）
+        let iss_pos = line.find("\"issued\":").unwrap();
+        let rpk_pos = line.find("\"rpk\":").unwrap();
+        assert!(iss_pos < rpk_pos, "rpk 必须在既有四键之后（位置零漂移）");
+
+        // 读回：端点类别与 rpk 全还原
+        let tok = st.last_token().unwrap().unwrap();
+        assert_eq!(tok.endpoints.len(), 3);
+        assert_eq!(tok.endpoints[1].kind, EndpointKind::Quic);
+        assert_eq!(tok.endpoints[2].kind, EndpointKind::Relay);
+        assert_eq!(tok.rpk.map(|k| *k.as_bytes()), Some(rpk), "末行重铸必须带上 rpk");
+        // 追加纪律把 rpk 也算进「同值」判据（否则同端点同 rpk 会重复追加）
+        let sec = *tok.secret.as_bytes();
+        st.append_token(&sec, &eps, Some(rpk)).unwrap();
+        assert_eq!(st.ledger().unwrap().len(), 1, "同 secret/端点/rpk ⇒ 不追加");
+        st.append_token(&sec, &eps, None).unwrap();
+        assert_eq!(st.ledger().unwrap().len(), 2, "rpk 变了（撤下）⇒ 追加");
         let _ = fs::remove_dir_all(&dir);
     }
 }

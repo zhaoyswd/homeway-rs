@@ -21,12 +21,16 @@ fn err_json(msg: &str) -> String {
 }
 
 /// 端点呈现（relay 加前缀；ProbeAddr/ProbeReach 共用）。
+///
+/// M1 起 QUIC 类端点加 `quic:` 前缀（**additive**：`relay:` 与裸地址两种既有形态不变；
+/// App 侧只透传字符串——登记条见 M1 设计 §3.6 的 token 端点表条）。
 fn endpoints_of(token: &Token) -> Vec<String> {
     token
         .endpoints
         .iter()
         .map(|ep| match ep.kind {
             EndpointKind::Relay => format!("relay:{}", ep.addr),
+            EndpointKind::Quic => format!("quic:{}", ep.addr),
             EndpointKind::Direct => ep.addr.clone(),
         })
         .collect()

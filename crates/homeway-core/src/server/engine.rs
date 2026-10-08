@@ -253,8 +253,10 @@ impl ServeEngine {
         let st = Arc::new(State::open(&serve_dir)?);
         let mut secrets = st.secrets().map_err(io_other)?;
         if secrets.is_empty() {
-            // 零参首启或凭证全被吊销：先签发一条并落台账（否则打印的 token 生来无效）
-            st.issue_token(vec![]).map_err(io_other)?;
+            // 零参首启或凭证全被吊销：先签发一条并落台账（否则打印的 token 生来无效）。
+            // 此处的 rpk = None：QUIC 面在后文才起（有 QUIC 面时的 token 由
+            // `print_client_token` 铸出，带端点与 rpk——M1 S1c）。
+            st.issue_token(vec![], None).map_err(io_other)?;
             (logf)("凭证：现有凭证全部不可用（首启或已吊销）——已铸出新凭证（客户端需重新粘贴新 token）");
             secrets = st.secrets().map_err(io_other)?;
             if secrets.is_empty() {
@@ -732,6 +734,8 @@ impl ServeEngine {
             pinned_flag: Arc::clone(&pinned_flag),
             ddns_checks: Arc::clone(&ddns_checks),
             ddns_resolvers: cfg.ddns_resolver.iter().copied().map(SocketAddr::V4).collect(),
+            quic_ep: quic_brief.as_ref().map(|(a, _)| *a),
+            quic_rpk: quic_brief.as_ref().map(|(_, k)| crate::token::RpkPubKey::from(*k.as_bytes())),
         });
         let pub_enabled = cfg.upnp || !cfg.stun.is_empty() || !cfg.public_endpoint.is_empty();
         if pub_enabled {
@@ -1624,6 +1628,9 @@ struct TokenPrintState {
     last_token: String,
     revoked_logged: bool,
     last_published: Vec<String>,
+    /// QUIC 端口的公网端点（M1 S1c / E-q4：UPnP 映射成功后由 `refresh_quic_public` 写入；
+    /// `None` = 未映射/未启用/无 QUIC 面 ⇒ token 只出 LAN 与中继 QUIC 端点）。
+    quic_pub: Option<SocketAddr>,
 }
 
 
@@ -1658,6 +1665,11 @@ struct TokenCtx {
     ddns_checks: super::ddnscheck::DdnsChecks,
     /// DDNS 自检直查解析器（F2：`serve.ddns_resolver` 装配期为 `SocketAddr` 形态）。
     ddns_resolvers: Vec<SocketAddr>,
+    /// 出口 QUIC 面的**实际监听地址**（退让后的真实端口；M1 S1c——token 的 QUIC 端点与
+    /// E-q4 的 UPnP 映射都用它）。`None` = QUIC 面未起（`serve.quic=false` 或起失败）。
+    quic_ep: Option<SocketAddr>,
+    /// 出口 RPK 公钥（进 token 的 32B；`None` = 无 QUIC 面 ⇒ 该字段不打）。
+    quic_rpk: Option<crate::token::RpkPubKey>,
 }
 
 /// 公网端点循环：成功 10min / 失败 2min 一轮；显式端点配置覆盖最高优先（FIX-61）。
@@ -1987,8 +1999,26 @@ fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
             add(Endpoint { addr: format!("{a}:{}", ctx.local_port), kind: EndpointKind::Direct }, "内网");
         }
     }
+    // QUIC 内网端点（M1 S1c：独立端口 = 退让后的**实际** QUIC 监听口；类别 Quic ⇒
+    // WG 档不吃它——`wtransport::domain_eps` 的过滤）。与 WG 内网端点同址不同口 ⇒
+    // `add` 的去重键（addr 串）不会误合并。
+    if let Some(q) = ctx.quic_ep {
+        for ifi in egress::physical_candidates() {
+            for a in ifi.addrs {
+                add(
+                    Endpoint { addr: format!("{a}:{}", q.port()), kind: EndpointKind::Quic },
+                    "QUIC 内网",
+                );
+            }
+        }
+    }
     for p in published {
         add(Endpoint { addr: p.clone(), kind: EndpointKind::Direct }, "公网");
+    }
+    // QUIC 公网端点（E-q4 的 UPnP 映射产物；未映射/未启用 ⇒ 缺席 = fail-visible，
+    // 与 E-q4 行同步）。
+    if let Some(qp) = ctx.inner.lock().map(|i| i.quic_pub).unwrap_or(None) {
+        add(Endpoint { addr: qp.to_string(), kind: EndpointKind::Quic }, "QUIC 公网");
     }
     // DDNS 域名条目（多条，叠加不踢除——B-1 拍板）：端口口径 = 已公布公网 v4 端点的
     // 外部端口；无公网观测时回退实际监听口（让位退让后的真实口）。
@@ -2029,9 +2059,9 @@ fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
         peer_id: &peer_id,
         secret: &secret,
         endpoints: &ep_refs,
-        // M1 S1a：RPK 字段与出口公钥产出已在位（`ServeEngine::quic_rpk_public_key`）；
-        // 把它接进铸造 = 端点表/台账同批动作（S1c）——本批不提前改 token 内容。
-        rpk: None,
+        // M1 S1c：出口 RPK 公钥进 token（additive 尾字段；S2 的岛按它钉定服务端身份）。
+        // 无 QUIC 面 ⇒ None ⇒ 串与 M1 之前逐字节同。
+        rpk: ctx.quic_rpk.as_ref(),
     }) {
         Ok(s) => s,
         Err(e) => {
@@ -2042,7 +2072,10 @@ fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
     let eps_count = eps.len();
     // 台账写入纪律：与末行不同即追加（无变化不追加）；吊销拒写（分支告警——Go
     // printClientToken 的 ErrSecretRevoked 专用行，P1-5 收口）
-    if let Err(e) = ctx.st.append_token(&ctx.secret, &eps) {
+    if let Err(e) = ctx
+        .st
+        .append_token(&ctx.secret, &eps, ctx.quic_rpk.as_ref().map(|k| *k.as_bytes()))
+    {
         match e {
             crate::server::state::StateError::SecretRevoked => {
                 (ctx.logf)(&format!(
@@ -2214,6 +2247,120 @@ mod tests {
 
     fn now() -> SystemTime {
         SystemTime::UNIX_EPOCH + Duration::from_secs(1_800_000_000)
+    }
+
+    /// 测试用 `TokenCtx`（M1 S1c：token 铸造 / E-q4 两条面的最小装配——只放本模块测试
+    /// 需要的字段；state 落在独立临时目录，跑完即删）。
+    fn token_ctx(
+        upnp: bool,
+        quic_ep: Option<SocketAddr>,
+        quic_rpk: Option<[u8; 32]>,
+        logf: Logf,
+        rx: &std::sync::mpsc::Receiver<String>,
+    ) -> (Arc<TokenCtx>, std::path::PathBuf) {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let dir = std::env::temp_dir().join(format!(
+            "hw-eng-tokctx-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        let st = Arc::new(State::open(&dir).expect("state 可开"));
+        let cfg = ServeConfig {
+            state_dir: dir.clone(),
+            upnp,
+            ..ServeConfig::default()
+        };
+        let dlog = Arc::clone(&logf);
+        let ctx = Arc::new(TokenCtx {
+            cfg,
+            st,
+            secret: [0x3Cu8; 32],
+            backend_priv: x25519_dalek::StaticSecret::from([0x3Du8; 32]),
+            local_port: 42650,
+            logf,
+            revoked: Arc::new(Mutex::new(HashSet::new())),
+            inner: Mutex::new(TokenPrintState::default()),
+            relay_ep: None,
+            relay_wanted: false,
+            dlogf: dlog,
+            tokf: Arc::new(|_: &str| {}),
+            log_paths: None,
+            pinned_flag: Arc::new(AtomicBool::new(false)),
+            ddns_checks: Arc::new(std::collections::HashMap::new().into()),
+            ddns_resolvers: Vec::new(),
+            quic_ep,
+            quic_rpk: quic_rpk.map(crate::token::RpkPubKey::from),
+        });
+        let _ = rx;
+        (ctx, dir)
+    }
+
+    fn log_sink() -> (Logf, std::sync::mpsc::Receiver<String>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (Arc::new(move |s: &str| {
+            let _ = tx.send(s.to_owned());
+        }), rx)
+    }
+
+    /// **判据（S1-8）**：铸造的 token **含 QUIC 类端点**（内网 + 公网）与 **RPK 字段**，
+    /// 且 WG 端点（Direct/Relay 类）语义不变；E3 行（`端点：…`）带 `（QUIC 内网/公网）`。
+    #[test]
+    fn minted_token_carries_quic_endpoints_and_rpk() {
+        let (logf, rx) = log_sink();
+        let qep: SocketAddr = "127.0.0.1:42652".parse().unwrap();
+        let rpk = [0x5Eu8; 32];
+        let (ctx, dir) = token_ctx(false, Some(qep), Some(rpk), logf, &rx);
+        ctx.inner.lock().unwrap().quic_pub = Some("203.0.113.7:42652".parse().unwrap());
+        // published（公网 WG 端点）由参数给（真实来源 = UPnP/STUN 观测）
+        print_client_token(&ctx, &["203.0.113.7:42650".to_owned()]);
+
+        let lines: Vec<String> = rx.try_iter().collect();
+        let tok_line = lines
+            .iter()
+            .find(|l| l.contains("客户端 token（"))
+            .expect("E3 行必打");
+        let eps_line = lines.iter().find(|l| l.starts_with("端点：")).expect("端点行必打");
+        assert!(eps_line.contains("（QUIC 内网）"), "端点行含 QUIC 内网：{eps_line}");
+        assert!(eps_line.contains("（QUIC 公网）"), "端点行含 QUIC 公网：{eps_line}");
+        assert!(
+            eps_line.contains("203.0.113.7:42650（公网）"),
+            "WG 公网端点行文不变：{eps_line}"
+        );
+
+        // 解出 token：QUIC 类 = 独立端口；rpk = 出口公钥；WG 端点类别/地址不变
+        let tok_str = tok_line.split("：").last().unwrap().trim().to_owned();
+        let t = crate::token::decode(&tok_str).expect("铸出的 token 必可解");
+        assert_eq!(t.rpk.map(|k| *k.as_bytes()), Some(rpk), "RPK 字段进 token");
+        let quic: Vec<&str> = t
+            .endpoints
+            .iter()
+            .filter(|e| e.kind == EndpointKind::Quic)
+            .map(|e| e.addr.as_str())
+            .collect();
+        assert!(quic.contains(&"203.0.113.7:42652"), "公网 QUIC 端点：{quic:?}");
+        assert!(
+            quic.iter().all(|a| a.ends_with(":42652")),
+            "QUIC 端点必须用 QUIC 端口（缺省 listen+1 = 42651？此处显式 42652）：{quic:?}"
+        );
+        let wg_public = t
+            .endpoints
+            .iter()
+            .find(|e| e.addr == "203.0.113.7:42650")
+            .expect("WG 公网端点仍在");
+        assert_eq!(wg_public.kind, EndpointKind::Direct, "WG 公网端点类别不变");
+        // 既有 WG 端点的**地址与类别**逐条不变：Direct 类端口的端口恒 = local_port
+        for e in t.endpoints.iter().filter(|e| e.kind == EndpointKind::Direct) {
+            assert!(
+                e.addr.ends_with(":42650"),
+                "Direct 类端点必须仍是 WG 端口（既有端点语义不变）：{}",
+                e.addr
+            );
+        }
+        // 台账也带 rpk（serve token 走末行重铸 ⇒ 与运行期串一致）
+        let back = ctx.st.last_token().unwrap().unwrap();
+        assert_eq!(back.rpk.map(|k| *k.as_bytes()), Some(rpk), "台账末行带 rpk");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// M1 §1.1：QUIC 端口定案——显式优先，缺省 = `serve.listen + 1`（饱和：65535 不绕回）。
