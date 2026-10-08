@@ -88,7 +88,9 @@
 `resolver_*`（等待按预算收敛，阈值 ≥2×）；`stop_within` detach 用 `F_GETFD` 事件断言而非墙钟。
 
 **已知 flake 甄别**：`daemon::tests::server_bad_frame_gets_goodbye_and_disconnect` 在基线跑红（在册 flake；隔离复跑绿、
-与改动面无交集）⇒ 判 flake 不算回归。**新增登记**（代码门观察，非本批代码问题）：同一工作树并发跑两个
+与改动面无交集）⇒ 判 flake 不算回归。**四表在册 flake 的隔离复跑（本树，提交后）**：
+`wgcore::stackb` / `daemon::server_bad_frame` / `speedtest_server::serve_send_end_to_end` /
+`term::service::attach_size_applies_to_pty` —— **4/4 单跑绿**（分别 0.13s / 0.06s / 0.00s / 0.87s）。**新增登记**（代码门观察，非本批代码问题）：同一工作树并发跑两个
 `cargo test` 时 `daemon::carriers::forward::*` 固定端口（19990/20001）互撞 ⇒ `EADDRINUSE` 红——已写入
 `REVIEW-ROADMAP.md`「已知 flake 登记」表。
 
@@ -112,6 +114,25 @@
 ---
 
 ## 4. 代码门（r14）意见与逐条处置
+
+### 4.0 设计门两轮意见摘要（r12 / r13；全文见 `QF-design.md` §6）
+
+> 设计门属**第 1 棒（设计）**的门，本记录只留摘要与去向；评审原文（逐条编号）在 `QF-design.md` §6.2/§6.6。
+
+- **第一轮 `dsh r12.kyMDLA`（exit=0）**：34 条意见 = **3 组高危** + 14 条中危 + 13 条低危（+ 记录项）。
+  高危：**1.1** F2 的「App 侧恒 ready」描述与源码相反（真正后果 = rc 面谎报 + 不可重建 + 无自愈）；
+  **2.1/3.1** F6「Drop 路径禁 panic」不完整（`wgcore::Client::stop` 的 expect 在 Drop 链上）+ 收工
+  6s 上界可被击穿（其后 `cache.save` 与 `Client::stop()` 无界）；**4.1/5.1** F2 若清槽会丢用户可见
+  失败原因（建议改采 Go 同形「失败保留 + 可替换」）。**本棒 34 条全部认同**（0 条不认同），整改为 v2。
+- **第二轮复校 `dsh r13.4ux4qT`（exit=0）**：三条高危方案骨架**全部正确**（H2/H3 到位、H1 三个具名洞
+  已覆盖），但 H1 的强声明仍有两处反例 + 5 条新发现（**C1** 段④锁/IO 无界、**C2** `stop_within` 的
+  `wake_wr` 归属未定义、**C3** F2 伪码三处不自洽、**C4** 等待方提前返回改变重建时序、**C5** F7b 标志位
+  置不上、**C6** F8e 漏第三消费面）+ **C7a–j** 记账 + **D3** 新窗口（`fully_stopped` 弱于 Go `isDone()`）；
+  结论 = 「只差一轮回写式小修（v3），不需要第三轮评审」。**v3 全部处置**（C1/C3/C5/C6 回写设计；
+  C2/C4/C7/D3 并入 + 登记）⇒ 设计门判过，进实现棒。
+- **本批实现与设计门的对应**：三条硬约定（① 不把 C1/C3/C5 的旧写法带进代码；② 判据行变更同批 commit；
+  ③ 发现设计与代码矛盾不静默降级）**逐条遵守**——① 见 §1 F6/F2/F7 落点；② 见 §3（commit `273bb88`）；
+  ③ 见 §8-2（`Session::stop` 的 failed 终态保留矛盾，已上报并双处登记）。
 
 > 轮次目录 **`/tmp/dsh-review/r14.pE8g8w`**（`exit=0`；`output.md` 156 行，**已用 Read 全文读完**）。
 > 评审独立做的事：三门复跑（`cargo test --workspace` / `clippy -D warnings` / `check-vocab.sh`）、全量读 `git diff`
