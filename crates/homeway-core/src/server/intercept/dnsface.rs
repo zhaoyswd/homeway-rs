@@ -22,6 +22,7 @@ use smoltcp::socket::tcp::{self, Socket as TcpSocket};
 use smoltcp::socket::udp::{self, Socket as UdpSocket};
 use smoltcp::wire::IpEndpoint;
 
+use super::VecDequeLite;
 use crate::server::dnsproxy::{DnsProxy, SubmitOutcome};
 
 /// TCP 客户端面（隧道内可达）连接上限（Go maxTCPConns；两端口合计）。
@@ -34,6 +35,8 @@ const LISTEN_BACKLOG: usize = 2;
 const CONN_BUF: usize = 128 * 1024;
 /// UDP 查询面缓冲（代答栈内 socket 的收包粒度）。
 const UDP_RX: usize = 64 * 1024;
+/// 连接读单块粒度（F3：缓冲由调用方穿参复用，不再每尝试栈上 8KB 零初始化）。
+const FACE_READ_CHUNK: usize = 8192;
 /// UDP 面的收/发槽数与字节容量（F4d：与在途上限对齐——修前各 64 槽 / 64KB）。
 ///
 /// - **tx**：`drain_dns` 每拍排空回投通道，超过容量即 `send_slice` 失败 ⇒
@@ -97,12 +100,15 @@ struct TcpFace {
 }
 
 struct TcpConn {
-    /// 分帧积攒缓冲（跨读保留不完整帧）。
-    rx: Vec<u8>,
+    /// 分帧积攒缓冲（跨读保留不完整帧）。Q-I F4：`VecDequeLite` 前缀偏移消费
+    /// （消 `drain` 尾部整搬；与拦截腿 `tx_backlog` 同物种）。内存包络：不变式
+    /// `len < 2*remaining` ⇒ 单连接 backing 最坏 `CONN_BUF` 128KiB → ≈256KiB
+    ///（×MAX_TCP_CONNS 64 ⇒ ≤ +8MiB 最坏，已在批记录登记）。
+    rx: VecDequeLite,
     /// 待写字节队列（F8：RFC1035 整帧入队——2B BE 长度 + 正文；部分写余量续传）。
     /// 帧边界天然保持（字节流前缀消费），与拦截腿 `tx_backlog` + `flush_backlog` 同构；
     /// 隧道 TCP 面 tx buffer 仅 16KB，>16KB 的应答必须分多次续写才能送达（Go 阻塞写等价）。
-    tx: Vec<u8>,
+    tx: VecDequeLite,
     last: Instant,
 }
 
@@ -135,6 +141,10 @@ pub struct DnsFaces {
     resolve: Option<TcpFace>,
     pending: HashMap<u64, DnsRoute>,
     next_tag: u64,
+    /// UDP 查询收包缓冲（Q-I F1：attach 期一次分配，消每拍 64KB 栈零初始化。
+    /// 复用安全：`recv_slice` 只写 `0..n`，下游一律 `buf[..n]`/`to_vec()`；
+    /// 缓冲由驱动线程独占，无别名面）。
+    udp_rx: Vec<u8>,
 }
 
 impl DnsFaces {
@@ -153,6 +163,7 @@ impl DnsFaces {
             resolve: None,
             pending: HashMap::new(),
             next_tag: 1,
+            udp_rx: vec![0u8; UDP_RX],
         };
         let rx_meta: Vec<udp::PacketMetadata> = (0..UDP_META).map(|_| udp::PacketMetadata::EMPTY).collect();
         let tx_meta: Vec<udp::PacketMetadata> = (0..UDP_META).map(|_| udp::PacketMetadata::EMPTY).collect();
@@ -194,12 +205,14 @@ impl DnsFaces {
     }
 
     /// 服务拍：读 UDP 查询 / 推进监听池 / 读 TCP 连接帧——全部 submit（非阻塞）。
-    pub fn service(&mut self, dns: &Arc<DnsProxy>, sockets: &mut SocketSet) {
+    /// `scratch` = TCP 连接读缓冲（F3 穿参：调用方 `Interceptor.rx_scratch` 复用，
+    /// 消每连接×每 recv 尝试的 8KB 栈零初始化；`len` ≥ 1 即可用）。
+    pub fn service(&mut self, dns: &Arc<DnsProxy>, sockets: &mut SocketSet, scratch: &mut [u8]) {
         if let Some(h) = self.udp53 {
-            let mut buf = [0u8; UDP_RX];
-            while let Ok((n, meta)) = sockets.get_mut::<UdpSocket>(h).recv_slice(&mut buf) {
+            // F1：复用字段缓冲（`recv_slice` 只写 `0..n`；下游 `buf[..n].to_vec()` 防别名）。
+            while let Ok((n, meta)) = sockets.get_mut::<UdpSocket>(h).recv_slice(&mut self.udp_rx) {
                 let tag = self.route_tag(DnsRoute::Udp53(meta.endpoint));
-                if dns.submit_udp(tag, buf[..n].to_vec()) == SubmitOutcome::Dropped {
+                if dns.submit_udp(tag, self.udp_rx[..n].to_vec()) == SubmitOutcome::Dropped {
                     // F2：丢弃路径回收 tag（否则 pending 项永不回收）
                     self.take_route(tag);
                 }
@@ -207,15 +220,21 @@ impl DnsFaces {
         }
         // face 从 self 摘出处理（tag 登记与 face 推进的借用分离）
         let mut tcp53 = std::mem::take(&mut self.tcp53);
-        self.service_face(&mut tcp53, dns, sockets);
+        self.service_face(&mut tcp53, dns, sockets, scratch);
         self.tcp53 = tcp53;
         if let Some(mut resolve) = self.resolve.take() {
-            self.service_face(&mut resolve, dns, sockets);
+            self.service_face(&mut resolve, dns, sockets, scratch);
             self.resolve = Some(resolve);
         }
     }
 
-    fn service_face(&mut self, face: &mut TcpFace, dns: &Arc<DnsProxy>, sockets: &mut SocketSet) {
+    fn service_face(
+        &mut self,
+        face: &mut TcpFace,
+        dns: &Arc<DnsProxy>,
+        sockets: &mut SocketSet,
+        scratch: &mut [u8],
+    ) {
         // ① 监听池推进：非 Listen（含 Established）转连接表，随后补位
         let promoted: Vec<SocketHandle> = face
             .listeners
@@ -227,22 +246,26 @@ impl DnsFaces {
         for h in promoted {
             face.conns.insert(
                 h,
-                TcpConn { rx: Vec::new(), tx: Vec::new(), last: Instant::now() },
+                TcpConn { rx: VecDequeLite::new(), tx: VecDequeLite::new(), last: Instant::now() },
             );
         }
         face.top_up(self.tunnel_ip, sockets);
         // ② 连接读：可读字节进分帧缓冲 → 完整帧逐条 submit
         let handles: Vec<SocketHandle> = face.conns.keys().copied().collect();
+        // 契约（代码门 L3）：`scratch` 非空——空 slice ⇒ `chunk_len == 0` ⇒ 本函数**静默不读**
+        // 任何连接（无进展但无报错）。唯一生产调用点传 `Interceptor.rx_scratch`（恒定 64KiB）。
+        debug_assert!(!scratch.is_empty(), "service_face scratch 不得为空（调用方契约）");
+        let chunk_len = scratch.len().min(FACE_READ_CHUNK);
         for h in handles {
             // ②' 待写续写（F8：按 send_slice 余量推进——部分写余量留住，帧边界保持）
             if let Some(c) = face.conns.get_mut(&h) {
-                if !c.tx.is_empty() {
+                if !c.tx.remaining().is_empty() {
                     let w = sockets
                         .get_mut::<TcpSocket>(h)
-                        .send_slice(&c.tx)
+                        .send_slice(c.tx.remaining())
                         .unwrap_or(0);
                     if w > 0 {
-                        c.tx.drain(..w);
+                        c.tx.consume(w);
                         c.last = Instant::now();
                     }
                 }
@@ -253,20 +276,19 @@ impl DnsFaces {
             let read_gated = face
                 .conns
                 .get(&h)
-                .map(|c| c.tx.len() >= CONN_TX_GATE)
+                .map(|c| c.tx.remaining().len() >= CONN_TX_GATE)
                 .unwrap_or(false);
-            if !read_gated {
+            if !read_gated && chunk_len > 0 {
                 loop {
-                    let mut chunk = [0u8; 8192];
-                    match sockets.get_mut::<TcpSocket>(h).recv_slice(&mut chunk) {
+                    match sockets.get_mut::<TcpSocket>(h).recv_slice(&mut scratch[..chunk_len]) {
                         Ok(0) | Err(_) => break,
                         Ok(n) => {
                             let Some(c) = face.conns.get_mut(&h) else { break };
-                            if c.rx.len() + n > CONN_BUF {
+                            if c.rx.remaining().len() + n > CONN_BUF {
                                 dead = true; // 分帧积攒超限：对端异常，收线
                                 break;
                             }
-                            c.rx.extend_from_slice(&chunk[..n]);
+                            c.rx.push(&scratch[..n]);
                             c.last = Instant::now();
                         }
                     }
@@ -282,7 +304,7 @@ impl DnsFaces {
             loop {
                 let msg = {
                     let Some(c) = face.conns.get_mut(&h) else { break };
-                    match decode_tcp_frame(&c.rx) {
+                    match decode_tcp_frame(c.rx.remaining()) {
                         None => break,           // 帧未到齐（含 <2B）
                         Some(m) if m.is_empty() => {
                             // len=0：Go「空 TCP 消息」判异常收线
@@ -292,7 +314,7 @@ impl DnsFaces {
                             break;
                         }
                         Some(m) => {
-                            c.rx.drain(..2 + m.len());
+                            c.rx.consume(2 + m.len());
                             m
                         }
                     }
@@ -334,20 +356,22 @@ impl DnsFaces {
         //（`CONN_TX_GATE`）让正常慢读走背压、极少触发本分支；本分支保证**内存有界**。
         let over_cap = self
             .conn_mut(h)
-            .map(|c| c.tx.len() + 2 + resp.len() > CONN_TX_CAP)
+            .map(|c| c.tx.remaining().len() + 2 + resp.len() > CONN_TX_CAP)
             .unwrap_or(false);
         if over_cap {
             self.drop_conn(sockets, h);
             return;
         }
         let Some(c) = self.conn_mut(h) else { return };
-        c.tx.extend_from_slice(&(resp.len() as u16).to_be_bytes());
-        c.tx.extend_from_slice(resp);
+        let mut frame = [0u8; 2];
+        frame.copy_from_slice(&(resp.len() as u16).to_be_bytes());
+        c.tx.push(&frame);
+        c.tx.push(resp);
         c.last = Instant::now();
         // 本拍即试写（余量由 service_face 续写）
-        let w = sockets.get_mut::<TcpSocket>(h).send_slice(&c.tx).unwrap_or(0);
+        let w = sockets.get_mut::<TcpSocket>(h).send_slice(c.tx.remaining()).unwrap_or(0);
         if w > 0 {
-            c.tx.drain(..w);
+            c.tx.consume(w);
         }
     }
 
@@ -453,7 +477,7 @@ mod tests {
         faces
             .tcp53
             .conns
-            .insert(h, TcpConn { rx: Vec::new(), tx: Vec::new(), last: Instant::now() });
+            .insert(h, TcpConn { rx: VecDequeLite::new(), tx: VecDequeLite::new(), last: Instant::now() });
         h
     }
 
@@ -531,10 +555,44 @@ mod tests {
         let h = conn_with(&mut sockets, &mut faces);
         // 预置接近上限的积压（未建立连接 ⇒ send_slice 写不进，全留队）
         if let Some(c) = faces.conn_mut(h) {
-            c.tx.resize(CONN_TX_CAP - 100, 0);
+            c.tx.push(&vec![0u8; CONN_TX_CAP - 100]);
         }
         faces.deliver_tcp(&mut sockets, h, &vec![0u8; 5000]);
         assert!(!faces.tcp_conn_live(h), "积压超上限 → 收线（有界）");
+    }
+
+    /// F4：`VecDequeLite` 前缀消费与 `Vec+drain` 参照实现逐字节等价——帧式 push
+    ///（2B 长度 + 正文）与部分写消费交错进行；每次消费后余量与参照一致（帧边界
+    /// 不错位；`consume` 有 `debug_assert` 兜超量）。
+    #[test]
+    fn tcp_conn_buffer_matches_vec_reference() {
+        let mut lite = VecDequeLite::new();
+        let mut refv: Vec<u8> = Vec::new();
+        let mut off = 0usize;
+        for i in 0..40usize {
+            let n = (i * 37) % 500 + 1;
+            let mut f = (n as u16).to_be_bytes().to_vec();
+            f.extend((0..n).map(|k| (k as u8).wrapping_add(i as u8)));
+            lite.push(&f);
+            refv.extend_from_slice(&f);
+            let w = ((i * 13) % 97).min(lite.remaining().len());
+            lite.consume(w);
+            off += w;
+            assert_eq!(lite.remaining(), &refv[off..], "第 {i} 帧后余量逐字节等价");
+        }
+        // 整帧消费序列（服务面形态）：逐帧 push + 按 2B 长度整帧 consume——消费后
+        // 缓冲恒为空（帧边界不错位、无残留）。
+        let mut buf2 = VecDequeLite::new();
+        for i in 0..20usize {
+            let n = (i * 29) % 300 + 1;
+            let mut f = (n as u16).to_be_bytes().to_vec();
+            f.extend((0..n).map(|k| (k as u8).wrapping_add(i as u8)));
+            buf2.push(&f);
+            let m = decode_tcp_frame(buf2.remaining()).expect("帧应完整");
+            assert_eq!(m.len(), n);
+            buf2.consume(2 + m.len());
+            assert!(buf2.is_empty(), "整帧消费后无残留（第 {i} 帧）");
+        }
     }
 
     /// F8：整帧入队——2B BE 长度前缀 + 正文（无错位）；余量留待 service_face 续写。
@@ -553,8 +611,9 @@ mod tests {
         faces.deliver_tcp(&mut sockets, h, &resp);
         let c = faces.tcp53.conns.get(&h).expect("连接在册");
         // 未建立连接 → send_slice 无效态写不进 ⇒ 全帧留在待写队列
-        assert_eq!(c.tx.len(), 2 + 20000, "整帧（2B 长度 + 正文）入队");
-        assert_eq!(u16::from_be_bytes([c.tx[0], c.tx[1]]) as usize, 20000, "长度前缀正确");
-        assert!(c.tx[2..].iter().all(|&b| b == 0xAB));
+        let queued = c.tx.remaining();
+        assert_eq!(queued.len(), 2 + 20000, "整帧（2B 长度 + 正文）入队");
+        assert_eq!(u16::from_be_bytes([queued[0], queued[1]]) as usize, 20000, "长度前缀正确");
+        assert!(queued[2..].iter().all(|&b| b == 0xAB));
     }
 }

@@ -235,47 +235,54 @@ pub struct Upstreams {
 struct UpstreamsState {
     last_check: Instant,
     mtime: Option<SystemTime>,
-    list: Vec<String>,
+    /// 上游列表**快照**（Q-I F5：`Arc` 换新不原地改——`list()` 的 clone 退化为引用
+    /// 计数，且在途查询恒读到一致快照，不会「读一半被换」）。
+    list: Arc<Vec<String>>,
 }
 
 impl Upstreams {
     pub fn new(path: &str) -> Self {
-        let mut st = UpstreamsState { last_check: Instant::now(), mtime: None, list: Vec::new() };
+        let mut st = UpstreamsState {
+            last_check: Instant::now(),
+            mtime: None,
+            list: Arc::new(Vec::new()),
+        };
         if let Ok(md) = std::fs::metadata(path) {
             if let Some(list) = parse_resolv_nameservers(path) {
                 if !list.is_empty() {
                     st.mtime = md.modified().ok();
-                    st.list = list;
+                    st.list = Arc::new(list);
                 }
             }
         }
         Self { path: path.to_owned(), state: Mutex::new(st) }
     }
 
-    /// 当前 nameserver 列表（host 形式——resolv.conf 的 nameserver 都是 IP）。
-    pub fn list(&self) -> Vec<String> {
+    /// 当前 nameserver 列表**快照**（host 形式——resolv.conf 的 nameserver 都是 IP）。
+    /// 返回 `Arc`：clone = 引用计数（F5 起，此前是 `Vec<String>` 深拷贝/查询）。
+    pub fn list(&self) -> Arc<Vec<String>> {
         let mut st = self.state.lock().expect("上游表锁中毒");
         if st.last_check.elapsed() < CHECK_INTERVAL {
-            return st.list.clone();
+            return Arc::clone(&st.list);
         }
         st.last_check = Instant::now();
         if !st.list.is_empty() {
             if let Ok(md) = std::fs::metadata(&self.path) {
                 if md.modified().ok() == st.mtime {
-                    return st.list.clone(); // 未变：保留 last-good
+                    return Arc::clone(&st.list); // 未变：保留 last-good
                 }
             }
         }
         if let Some(list) = parse_resolv_nameservers(&self.path) {
             if !list.is_empty() {
                 st.mtime = std::fs::metadata(&self.path).and_then(|m| m.modified()).ok();
-                st.list = list;
+                st.list = Arc::new(list); // 换新 Arc（在途查询持旧快照）
             }
         }
-        st.list.clone()
+        Arc::clone(&st.list)
     }
 
-    /// 上游列表的逗连摘要（E4 判据行用）。
+    /// 上游列表的逗连摘要（E4 判据行用）。**行文/语义不变**（F5 只换持有形态）。
     pub fn text(&self) -> String {
         self.list().join(", ")
     }
@@ -434,12 +441,17 @@ impl DnsProxy {
             match std::thread::Builder::new()
                 .name("homeway-dns".into())
                 .stack_size(512 * 1024)
-                .spawn(move || loop {
-                    let job = { job_rx2.lock().expect("作业队列锁中毒").recv() };
-                    let Ok(job) = job else { return };
-                    let resp = c2.respond(&job.query, job.is_tcp);
-                    let _ = job.reply_to.send(DnsReply { tag: job.tag, resp });
-                    in_flight2.fetch_sub(1, Ordering::Relaxed);
+                .spawn(move || {
+                    // Q-I F5：worker 自持读缓冲（懒分配——首次 `exchange` 用到才
+                    // `vec![0u8; UDP_BUF]`；常态空闲 worker 零占用）。
+                    let mut scratch: Vec<u8> = Vec::new();
+                    loop {
+                        let job = { job_rx2.lock().expect("作业队列锁中毒").recv() };
+                        let Ok(job) = job else { return };
+                        let resp = c2.respond(&job.query, job.is_tcp, &mut scratch);
+                        let _ = job.reply_to.send(DnsReply { tag: job.tag, resp });
+                        in_flight2.fetch_sub(1, Ordering::Relaxed);
+                    }
                 }) {
                 Ok(_) => started += 1,
                 Err(e) => {
@@ -571,7 +583,9 @@ impl ResponderCore {
     /// 单查询处理。None = 不回包（畸形）。
     /// is_tcp：TCP 客户端正是为「取全量」而来（UDP 截断后的重试），不受 1232 的
     /// TUN 单包约束（无条件截断 = 永远拿不到全量的死循环）。
-    fn respond(&self, query: &[u8], is_tcp: bool) -> Option<Vec<u8>> {
+    /// `scratch`：worker 自持上游读缓冲（F5：每查询每腿省一次 64KB alloc+零初始化；
+    /// 懒分配在 `exchange` 内，交付仍 `to_vec()` 保 owned 语义）。
+    fn respond(&self, query: &[u8], is_tcp: bool, scratch: &mut Vec<u8>) -> Option<Vec<u8>> {
         let Some(qt) = qtype(query) else {
             self.stats.malformed.fetch_add(1, Ordering::Relaxed);
             return None;
@@ -580,7 +594,7 @@ impl ResponderCore {
             self.stats.filtered.fetch_add(1, Ordering::Relaxed);
             return empty_response(query);
         }
-        let mut resp = match self.forward(query) {
+        let mut resp = match self.forward(query, scratch) {
             Some(r) => r,
             None => {
                 self.stats.fail.fetch_add(1, Ordering::Relaxed);
@@ -605,11 +619,11 @@ impl ResponderCore {
     /// 按序尝试 nameserver 列表 + 末位兜底，共享单查询总预算。
     /// 每次尝试的预算 = min(剩余, 800ms)；末次尝试不吃上限（「慢但活着」的唯一上游
     /// 能用满剩余预算，而不是提前 SERVFAIL 白扔）。
-    fn forward(&self, query: &[u8]) -> Option<Vec<u8>> {
+    fn forward(&self, query: &[u8], scratch: &mut Vec<u8>) -> Option<Vec<u8>> {
         let deadline = Instant::now() + self.budget;
         let ups = self.ups.list();
         let attempts = ups.len() + 1; // nameservers + 兜底
-        let try_one = |addr: &str, i: usize| -> Option<Vec<u8>> {
+        let mut try_one = |addr: &str, i: usize| -> Option<Vec<u8>> {
             let remain = deadline.saturating_duration_since(Instant::now());
             if remain.is_zero() {
                 return None;
@@ -618,7 +632,7 @@ impl ResponderCore {
             if i < attempts - 1 && per_try > MAX_PER_TRY {
                 per_try = MAX_PER_TRY;
             }
-            exchange(addr, query, per_try, deadline)
+            exchange(addr, query, per_try, deadline, scratch)
         };
         for (i, up) in ups.iter().enumerate() {
             if let Some(resp) = try_one(&dial_addr(up), i) {
@@ -652,7 +666,15 @@ impl ResponderCore {
 /// `recv` 前按剩余重设读超时——`SO_RCVTIMEO` 是 per-syscall，灌不匹配包的坏上游
 /// 此前可让该 worker **永不返回**（配合 worker 数少 = 全通道瘫痪）。
 /// 全局 `deadline` **仍只喂 TC→TCP 分支**（不改 `MAX_PER_TRY` 与上游回退序语义）。
-fn exchange(addr: &str, query: &[u8], budget: Duration, deadline: Instant) -> Option<Vec<u8>> {
+/// `scratch`：调用方（worker）自持的读缓冲（F5 复用；懒分配 = 首次用到才 64KB 零
+/// 初始化。`UDP_BUF`(64KiB) ≥ UDP 最大载荷 ⇒ 无短读风险）。
+fn exchange(
+    addr: &str,
+    query: &[u8],
+    budget: Duration,
+    deadline: Instant,
+    scratch: &mut Vec<u8>,
+) -> Option<Vec<u8>> {
     if budget.is_zero() {
         return None;
     }
@@ -670,7 +692,10 @@ fn exchange(addr: &str, query: &[u8], budget: Duration, deadline: Instant) -> Op
     conn.set_read_timeout(Some(budget)).ok()?; // 初值（循环顶按本腿剩余重设）
     conn.send(&q).ok()?;
     let qend = skip_name(&q, 12)?;
-    let mut buf = vec![0u8; UDP_BUF];
+    // F5：复用调用方缓冲（懒分配一次；`recv` 只写 `0..n`，下游一律 `&buf[..n]`）。
+    if scratch.len() < UDP_BUF {
+        scratch.resize(UDP_BUF, 0);
+    }
     loop {
         // 每轮按本腿剩余重设（绝对期限收敛——continue 不续命）
         let remain = attempt_deadline.saturating_duration_since(Instant::now());
@@ -678,11 +703,11 @@ fn exchange(addr: &str, query: &[u8], budget: Duration, deadline: Instant) -> Op
             return None;
         }
         conn.set_read_timeout(Some(remain)).ok()?;
-        let n = conn.recv(&mut buf).ok()?;
+        let n = conn.recv(&mut scratch[..]).ok()?;
         if n < 12 {
             continue;
         }
-        let resp = &buf[..n];
+        let resp = &scratch[..n];
         if u16::from_be_bytes([resp[0], resp[1]]) != new_id {
             continue; // 事务 ID 不匹配：丢弃（伪造/迟到应答）
         }
@@ -982,13 +1007,13 @@ mod tests {
             dlogf,
         };
         let q = a_query("fake.test", 0xABCD);
-        let resp = core.respond(&q, false).unwrap();
+        let resp = core.respond(&q, false, &mut Vec::new()).unwrap();
         assert_eq!(&resp[..2], &0xABCDu16.to_be_bytes(), "原始 ID 应回填");
         assert_eq!(core.stats.resp.load(Ordering::Relaxed), 1);
         let rdoff = resp.len() - 10;
         assert_eq!(u32::from_be_bytes(resp[rdoff..rdoff + 4].try_into().unwrap()), MAX_TTL);
         // 过滤面：AAAA 查询回空应答（不经上游——QD=1/无 answer）
-        let r2 = core.respond(&aaaa_query("fake.test"), false).unwrap();
+        let r2 = core.respond(&aaaa_query("fake.test"), false, &mut Vec::new()).unwrap();
         assert_eq!(u16::from_be_bytes([r2[4], r2[5]]), 1);
         assert_eq!(u16::from_be_bytes([r2[6], r2[7]]), 0, "空应答无 answer");
         assert_eq!(core.stats.filtered.load(Ordering::Relaxed), 1);
@@ -1023,7 +1048,7 @@ mod tests {
             logf,
             dlogf,
         };
-        let resp = core.respond(&a_query("fb.test", 0x4242), false).unwrap();
+        let resp = core.respond(&a_query("fb.test", 0x4242), false, &mut Vec::new()).unwrap();
         assert_eq!(&resp[..2], &0x4242u16.to_be_bytes());
         assert_eq!(core.stats.fallback.load(Ordering::Relaxed), 1);
         // 全死（兜底也指死端口）→ SERVFAIL
@@ -1037,7 +1062,7 @@ mod tests {
             logf: Arc::new(|_| {}),
             dlogf: Arc::new(|_| {}),
         };
-        let resp = core2.respond(&a_query("dead.test", 1), false).unwrap();
+        let resp = core2.respond(&a_query("dead.test", 1), false, &mut Vec::new()).unwrap();
         assert_eq!(resp[3] & 0x0F, 2, "SERVFAIL");
         assert_eq!(core2.stats.fail.load(Ordering::Relaxed), 1);
         let _ = std::fs::remove_dir_all(&dir);
@@ -1225,6 +1250,7 @@ mod tests {
             &q,
             Duration::from_millis(200),
             Instant::now() + Duration::from_millis(2500),
+            &mut Vec::new(),
         );
         let dt = t0.elapsed();
         assert!(r.is_none(), "灌包下必须按本腿期限判负（得 {r:?}）");
@@ -1366,16 +1392,40 @@ mod tests {
         let f = dir.join("resolv.conf");
         std::fs::write(&f, "nameserver 10.0.0.1\n").unwrap();
         let ups = Upstreams::new(f.to_string_lossy().as_ref());
-        assert_eq!(ups.list(), vec!["10.0.0.1"]);
+        assert_eq!(ups.list().join(","), "10.0.0.1");
         std::fs::write(&f, "nameserver 10.0.0.2\n").unwrap();
-        assert_eq!(ups.list(), vec!["10.0.0.1"], "节流窗内保持 last-good");
+        assert_eq!(ups.list().join(","), "10.0.0.1", "节流窗内保持 last-good");
         std::thread::sleep(CHECK_INTERVAL + Duration::from_millis(50));
-        assert_eq!(ups.list(), vec!["10.0.0.2"], "窗口后跟随变更");
+        assert_eq!(ups.list().join(","), "10.0.0.2", "窗口后跟随变更");
         // 解析失败（写垃圾）保留 last-good
         std::thread::sleep(CHECK_INTERVAL + Duration::from_millis(50));
         std::fs::write(&f, "not a nameserver line\n").unwrap();
         std::thread::sleep(CHECK_INTERVAL + Duration::from_millis(50));
-        assert_eq!(ups.list(), vec!["10.0.0.2"], "坏文件保留 last-good");
+        assert_eq!(ups.list().join(","), "10.0.0.2", "坏文件保留 last-good");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F5：上游列表 **Arc 快照**语义——未变窗口内 `Arc::ptr_eq`（clone = 引用计数，
+    /// 不再每查询深拷贝）；变更时**换新 Arc**（在途查询持旧快照读到一致内容，
+    /// 不被「读一半被换」）。
+    #[test]
+    fn upstream_list_is_arc_snapshot() {
+        let dir = std::env::temp_dir().join(format!("homeway-rs-dnsarc-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("resolv.conf");
+        std::fs::write(&f, "nameserver 10.1.1.1\n").unwrap();
+        let ups = Upstreams::new(f.to_string_lossy().as_ref());
+        let a1 = ups.list();
+        let a2 = ups.list();
+        assert!(Arc::ptr_eq(&a1, &a2), "节流窗内 clone = 同一快照（引用计数）");
+        assert_eq!(a1.join(","), "10.1.1.1");
+        // 变更（跨节流窗）⇒ 换新 Arc；旧快照内容不变（在途查询一致性）
+        std::thread::sleep(CHECK_INTERVAL + Duration::from_millis(50));
+        std::fs::write(&f, "nameserver 10.1.1.2\n").unwrap();
+        let b = ups.list();
+        assert!(!Arc::ptr_eq(&a1, &b), "变更后必须换新 Arc（不原地改）");
+        assert_eq!(a1.join(","), "10.1.1.1", "旧快照内容逐字不变");
+        assert_eq!(b.join(","), "10.1.1.2");
         let _ = std::fs::remove_dir_all(&dir);
     }
 }

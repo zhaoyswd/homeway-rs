@@ -151,7 +151,9 @@ struct Response {
 /// 的 net.Conn 读由运行时推进，同模型）。
 pub struct Stream<'a> {
     io: StreamIo<'a>,
-    buf: Vec<u8>,
+    /// 行/帧解析缓冲（Q-I F6.2：偏移式消费——`VecDequeLite` 前缀偏移 + 摊还压缩，
+    /// 消 `Vec::drain` 的尾部整搬；追加 `push`，余量 `remaining()`）。
+    buf: crate::server::intercept::VecDequeLite,
     /// 读线程交付通道（线程在 EOF/错误/通道断开时退出）。
     rx: std::sync::mpsc::Receiver<Result<Vec<u8>, ConnErr>>,
     /// 问候帧带来的根与版本（诊断/展示用）。
@@ -192,7 +194,7 @@ impl<'a> Stream<'a> {
                 sess: unsafe { &*(std::ptr::NonNull::<Session>::dangling().as_ptr()) },
                 id: u64::MAX,
             },
-            buf: Vec::new(),
+            buf: crate::server::intercept::VecDequeLite::new(),
             rx,
             root: String::new(),
             ver: 0,
@@ -230,7 +232,7 @@ impl<'a> Stream<'a> {
         Stream::handshake(
             Stream {
                 io: StreamIo::Local { sess, id },
-                buf: Vec::with_capacity(16 * 1024),
+                buf: crate::server::intercept::VecDequeLite::with_capacity(16 * 1024),
                 rx,
                 root: String::new(),
                 ver: 0,
@@ -273,7 +275,7 @@ impl<'a> Stream<'a> {
         Stream::handshake(
             Stream {
                 io: StreamIo::Remote { client, st },
-                buf: Vec::with_capacity(16 * 1024),
+                buf: crate::server::intercept::VecDequeLite::with_capacity(16 * 1024),
                 rx,
                 root: String::new(),
                 ver: 0,
@@ -326,8 +328,10 @@ impl<'a> Stream<'a> {
 
     fn read_line_opt(&mut self, deadline: Option<Instant>) -> Result<Vec<u8>, FilesError> {
         loop {
-            if let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
-                let mut line: Vec<u8> = self.buf.drain(..=pos).collect();
+            if let Some(pos) = self.buf.remaining().iter().position(|&b| b == b'\n') {
+                // F6.2：前缀偏移消费（旧 `drain(..=pos)` 尾部整搬）。
+                let mut line: Vec<u8> = self.buf.remaining()[..=pos].to_vec();
+                self.buf.consume(pos + 1);
                 while matches!(line.last(), Some(b'\n') | Some(b'\r')) {
                     line.pop();
                 }
@@ -337,7 +341,7 @@ impl<'a> Stream<'a> {
                 Some(d) => self.next_chunk_timeout(d)?,
                 None => self.next_chunk()?,
             };
-            self.buf.extend_from_slice(&chunk);
+            self.buf.push(&chunk);
         }
     }
 
@@ -432,24 +436,24 @@ impl<'a> Stream<'a> {
 
     /// 读一个数据帧：`Ok(Some(payload))`；终止帧 = `Ok(None)`。
     fn read_frame(&mut self) -> Result<Option<Vec<u8>>, FilesError> {
-        while self.buf.len() < 4 {
+        while self.buf.remaining().len() < 4 {
             let chunk = self.next_chunk()?;
-            self.buf.extend_from_slice(&chunk);
+            self.buf.push(&chunk);
         }
-        let pre = decode_prefix(&self.buf)?;
+        let pre = decode_prefix(self.buf.remaining())?;
         let n = match pre {
             Prefix::Terminated => {
-                self.buf.drain(..4);
+                self.buf.consume(4);
                 return Ok(None);
             }
             Prefix::Frame { len } => len,
         };
-        while self.buf.len() < 4 + n {
+        while self.buf.remaining().len() < 4 + n {
             let chunk = self.next_chunk()?;
-            self.buf.extend_from_slice(&chunk);
+            self.buf.push(&chunk);
         }
-        let payload = self.buf[4..4 + n].to_vec();
-        self.buf.drain(..4 + n);
+        let payload = self.buf.remaining()[4..4 + n].to_vec();
+        self.buf.consume(4 + n);
         Ok(Some(payload))
     }
 

@@ -314,6 +314,7 @@ fn serve_usage() {
     eprintln!("用法：homeway-cli serve [--state DIR] [--listen P] [--bind-interface M] [--upnp[=bool]] [--stun H:P] [--stun6 H:P]");
     eprintln!("       [--relay rl1…|ip:port] [--peer-ttl 168h] [--max-peers N] [--public-endpoint ip:port,ip:port]");
     eprintln!("       [--dns-port P] [--files-root DIR] [--ddns 裸域名] [--verbose]");
+    eprintln!("  --stun= / --stun6= / --relay= 空值 = 关（Go flag 空串同义，F0 carve-out）；");
     eprintln!("  = 前台单出口（Ctrl-C 收工）；启停/查询用 `homeway-cli serve start|stop|restart|status|token`（控制面）。");
 }
 
@@ -366,11 +367,13 @@ fn parse_serve_flags(args: &[String]) -> Result<ServeFlags, CliErr> {
                 f.upnp = Some(cli_flags::take_bool_or_exit("upnp", inline, true));
             }
             "stun" => {
-                f.stun = Some(cli_flags::take_value_or_exit("stun", inline, next, false));
+                // F0 carve-out：空值 = 关公网 STUN 观测（Go flag 空串同义；实测
+                // `bin/homeway-go serve --stun=` 正常起服）。缺值仍 fail-fast。
+                f.stun = Some(cli_flags::take_value_empty_ok_or_exit("stun", inline, next));
                 take_next(&mut adv);
             }
             "stun6" => {
-                f.stun6 = Some(cli_flags::take_value_or_exit("stun6", inline, next, false));
+                f.stun6 = Some(cli_flags::take_value_empty_ok_or_exit("stun6", inline, next));
                 take_next(&mut adv);
             }
             "peer-ttl" => {
@@ -413,11 +416,16 @@ fn parse_serve_flags(args: &[String]) -> Result<ServeFlags, CliErr> {
                 take_next(&mut adv);
             }
             "relay" => {
-                f.relay = Some(cli_flags::take_value_or_exit("relay", inline, next, false));
+                // F0 carve-out：空值 = 显式关掉注册腿（config 开了想用 CLI 关的形态；
+                // Go flag 空串同义，实测 `bin/homeway-go serve --relay=` 正常起服）。
+                f.relay = Some(cli_flags::take_value_empty_ok_or_exit("relay", inline, next));
                 take_next(&mut adv);
             }
             "ddns" => {
-                let v = cli_flags::take_value_or_exit("ddns", inline, next, false);
+                // F0 carve-out（代码门 M1 扩面）：空值 = 清空 config 的全部条目
+                // （Go `cli.go:127-135` 同义；`bin/homeway-go serve --ddns=` 实测 STARTED）
+                // ——此前该分支（下方 `if v.is_empty()`）不可达，现与注释一致。
+                let v = cli_flags::take_value_empty_ok_or_exit("ddns", inline, next);
                 take_next(&mut adv);
                 if v.contains(':') || v.contains('/') || v.contains(' ') {
                     // Go cli.go:55 同校验同串
@@ -1114,6 +1122,46 @@ mod tests {
         assert!(!f.verbose);
         let f = parse_serve_flags(&["--upnp".to_owned()]).unwrap();
         assert_eq!(f.upnp, Some(true));
+    }
+
+    /// F0（Q-I 尾段）：空值 carve-out 四 flag（stun/stun6/relay/ddns）——等号形/空格形
+    /// 空值都收，语义 = 关/清空；且经 `assemble_result` 落到 `ServeConfig`
+    /// （stun/stun6 空串、relay 显式 None、ddns 空表）。
+    /// 边界：`--state=`/`--public-endpoint=` 等**不在** carve-out（`take_value` 层仍判 Empty，
+    /// parser 站点仍 exit 2）；生产调用点各自有 `--flag=` 形态的 E2E（本文件下方与 qh E2E）。
+    #[test]
+    fn empty_value_carveout_flags_accept_empty() {
+        let f = parse_serve_flags(&[
+            "--stun=".to_owned(),
+            "--stun6".to_owned(),
+            "".to_owned(),
+            "--relay=".to_owned(),
+            "--ddns=".to_owned(),
+            "--public-endpoint=127.0.0.1:42659".to_owned(),
+        ])
+        .unwrap();
+        assert_eq!(f.stun.as_deref(), Some(""));
+        assert_eq!(f.stun6.as_deref(), Some(""));
+        assert_eq!(f.relay.as_deref(), Some(""));
+        assert_eq!(f.ddns.as_deref(), Some(""));
+        // 空值形态不再 exit 2（回归面：Q-H 后本地 harness 全起不来）
+        let d = tmp_state("emptyok");
+        // 裸 IP:port = 合法 relay 值域（开放模式；rl1 token 需要真 token，测试不用）
+        write_cfg(&d, "[serve]\nrelay = \"127.0.0.1:41741\"\nstun = \"stun.example:3478\"\n");
+        let state = d.display().to_string();
+        write_cfg(&d, "[serve]\nrelay = \"127.0.0.1:41741\"\nstun = \"stun.example:3478\"\nddns = [{ domain = \"a.example\" }]\n");
+        let cfg = assemble_result(&[
+            "--state".to_owned(),
+            state,
+            "--relay=".to_owned(),
+            "--stun=".to_owned(),
+            "--ddns=".to_owned(),
+        ])
+        .expect("空值 carve-out 形态不得报错");
+        assert_eq!(cfg.relay, None, "显式空 relay = 关注册腿（覆盖 config）");
+        assert_eq!(cfg.stun, "", "显式空 stun = 关");
+        assert!(cfg.ddns.is_empty(), "显式空 ddns = 清空 config 全部条目（Go 同义）");
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// F15：前台默认 state 与统一进程一致。

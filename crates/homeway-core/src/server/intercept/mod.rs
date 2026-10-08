@@ -148,29 +148,36 @@ fn interests_for(io: &ReactorIo, backlog: usize) -> Option<libc::c_short> {
 }
 
 /// 简洁起见用 Vec 做字节写缓冲（块级追加；头部消费）。
-struct VecDequeLite {
+///
+/// Q-I 尾段起 `pub(crate)`：`files` 客户端 `Stream.buf`（F6.2）复用同一偏移式实现
+/// （消 `Vec::drain` 尾部整搬；摊还压缩阈值见 `consume`）。
+pub(crate) struct VecDequeLite {
     buf: Vec<u8>,
     off: usize,
 }
 
 impl VecDequeLite {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self { buf: Vec::new(), off: 0 }
     }
-    fn push(&mut self, data: &[u8]) {
+    /// 预分配形态（files 客户端沿用旧 `Vec::with_capacity(16KiB)` 的分配预期）。
+    pub(crate) fn with_capacity(n: usize) -> Self {
+        Self { buf: Vec::with_capacity(n), off: 0 }
+    }
+    pub(crate) fn push(&mut self, data: &[u8]) {
         if self.off > 0 && self.off == self.buf.len() {
             self.buf.clear();
             self.off = 0;
         }
         self.buf.extend_from_slice(data);
     }
-    fn remaining(&self) -> &[u8] {
+    pub(crate) fn remaining(&self) -> &[u8] {
         &self.buf[self.off..]
     }
-    fn is_empty(&self) -> bool {
+    pub(crate) fn is_empty(&self) -> bool {
         self.off >= self.buf.len()
     }
-    fn consume(&mut self, n: usize) {
+    pub(crate) fn consume(&mut self, n: usize) {
         // Q-I 代码门 L1：消费量不得超余量（旧 `Vec::drain(..w)` 越界会 panic；
         // 静默多消费 = 上游字节流错位——调试构建在此暴露误用）。调用点恒满足。
         debug_assert!(
@@ -1882,7 +1889,8 @@ impl Interceptor {
             return;
         };
         if let Some(faces) = self.dns_faces.as_mut() {
-            faces.service(&dns, &mut self.sockets);
+            // F3：TCP 连接读缓冲穿参——`dns_faces`/`sockets`/`rx_scratch` 是不相交字段。
+            faces.service(&dns, &mut self.sockets, &mut self.rx_scratch[..]);
             faces.reap(&mut self.sockets);
         }
     }
@@ -1911,6 +1919,12 @@ impl Interceptor {
     /// reactor 一拍（reactor-design §一/§二）：Retry 重拨 → 建兴趣集 → poll(0) →
     /// 就绪分发。就绪集是提示不是契约（fd 全非阻塞 + 电平触发：漏看下拍重报、误看
     /// 读出 EAGAIN 跳过）；每拍处理全部就绪 fd——无饥饿不依赖序。
+    ///
+    /// **Q-I 尾段 F2 尝试与回退**（2026-10-08）：曾把兴趣集并入引擎唯一 poll
+    /// （快照直派）以消本函数每拍的零超时 poll syscall——实测**负收益**（合并后上游
+    /// fd 就绪成为引擎唤醒源 ⇒ 拍频 13.2k→21.4k/s，每拍全量 pump 的固定成本被放大；
+    /// 两项 poll 样本合计 +18%、进程 CPU +14.5%、up 吞吐 −5.9%），按设计 §4.3 止损
+    /// 闸门（<20% 即回退）**整条回退**，恢复本形态。证据见 `docs/reviews/QIt.md`。
     fn reactor_turn(&mut self) {
         let t0 = Instant::now();
         // ① Retry 态重拨（EAGAIN 形态不占 poll 位——评审 R-2）
@@ -3229,6 +3243,47 @@ mod tests {
             proxy.stats_line()
         );
         assert!(proxy.stats_line().contains("resp=2"));
+        // ③ Q-I F1 回归：同一拍连投两条不同载荷的 UDP 查询（共享收包缓冲 `udp_rx` 的
+        // 复用点）——断言各自应答的 ID 与 question 段逐字节对应（防复用缓冲残留/别名）。
+        let mk_q = |id: u16, label: &str| -> Vec<u8> {
+            let mut q = Vec::new();
+            q.extend_from_slice(&id.to_be_bytes());
+            q.extend_from_slice(&[0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
+            for l in [label, "com"] {
+                q.push(l.len() as u8);
+                q.extend_from_slice(l.as_bytes());
+            }
+            q.push(0);
+            q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
+            q
+        };
+        let qa = mk_q(0x7788, "alpha");
+        let qb = mk_q(0x99AA, "beta");
+        itc.on_plain(nat::build_udp(Ipv4Addr::new(100, 64, 10, 9), 52002, tunnel, 53, &qa));
+        itc.on_plain(nat::build_udp(Ipv4Addr::new(100, 64, 10, 9), 52003, tunnel, 53, &qb));
+        let (mut got_a, mut got_b) = (false, false);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !(got_a && got_b) {
+            for p in itc.pump() {
+                let Some(v) = Ipv4View::parse(&p) else { continue };
+                if v.proto != 17 || v.dst != Ipv4Addr::new(100, 64, 10, 9) || v.src != tunnel {
+                    continue;
+                }
+                let r = v.payload;
+                if r.len() < 12 {
+                    continue;
+                }
+                if r[..2] == qa[..2] {
+                    assert_eq!(r[12..qa.len()], qa[12..], "alpha 应答 question 应逐字节对应");
+                    got_a = true;
+                } else if r[..2] == qb[..2] {
+                    assert_eq!(r[12..qb.len()], qb[12..], "beta 应答 question 应逐字节对应");
+                    got_b = true;
+                }
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(got_a && got_b, "同拍两包各自应答（got_a={got_a} got_b={got_b}）");
         let _ = SI::from_millis(0i64);
         let _ = CUdp::new(
             smoltcp::socket::udp::PacketBuffer::new(vec![], vec![]),

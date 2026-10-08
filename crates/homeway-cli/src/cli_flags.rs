@@ -60,6 +60,20 @@ pub(crate) fn take_value_or_exit(
     }
 }
 
+/// 取值或 fail-fast——**空值 carve-out**（Q-I 尾段 F0）：`--flag=` / `--flag ""`
+/// 的空值返回 `Ok(String::new())` 而非 exit。**只给空串有明确语义的 flag 用**
+/// （Go 基线文档化「空 = 关」且实测接受：`--stun`/`--stun6`（空 = 关公网观测）、
+/// `--relay`（空 = 不用中继/关注册腿）——`bin/homeway-go` 实跑三形态均正常起服；
+/// `--public-endpoint=` 空值 Go **同拒**（`--public-endpoint "" 非法`），不属本
+/// carve-out）。缺值（末尾 / 下一个是 flag）与其它取值纪律不变，仍 fail-fast。
+pub(crate) fn take_value_empty_ok_or_exit(name: &str, inline: Option<&str>, next: Option<&str>) -> String {
+    match take_value(inline, next, false) {
+        Val::Ok(v) => v,
+        Val::Empty => String::new(),
+        Val::Missing(why) => fail(name, &format!("缺值（{why}）")),
+    }
+}
+
 /// `--state` 专用取值（fail-fast；`Value` 形）：
 /// `--state --json` ⇒ `--state 缺值（下一个是 --json）`；`--state=` ⇒ `--state 空值`。
 pub(crate) fn take_state_or_exit(name: &str, inline: Option<&str>, next: Option<&str>) -> PathBuf {
@@ -141,6 +155,19 @@ mod tests {
     #[test]
     fn take_state_returns_pathbuf() {
         assert_eq!(take_state_or_exit("state", Some("/tmp/c"), None), PathBuf::from("/tmp/c"));
+    }
+
+    /// F0 carve-out：空值两形态（等号形/空格形）返回空串（stun/stun6/relay/ddns 四站点共用）；
+    /// 非空值原样透传。
+    #[test]
+    fn empty_value_carveout_forms() {
+        assert_eq!(take_value_empty_ok_or_exit("stun", Some(""), None), "");
+        assert_eq!(take_value_empty_ok_or_exit("stun", None, Some("")), "");
+        assert_eq!(take_value_empty_ok_or_exit("relay", None, Some("")), "");
+        assert_eq!(take_value_empty_ok_or_exit("ddns", Some(""), None), "");
+        assert_eq!(take_value_empty_ok_or_exit("stun6", Some("h:1"), None), "h:1");
+        // 非 carve-out flag 的空值仍判 `Empty`（parser 站点据此 exit 2）
+        assert_eq!(take_value(Some(""), None, false), Val::Empty);
     }
 
     /// F7b：布尔六档（缺值=裸 flag / 非法 / =false / =0 / =true / 裸 flag）。

@@ -683,13 +683,16 @@ impl FilesServer {
         let mut total = 0u64;
         let dir = part.parent().unwrap_or(&self.root);
         let mut next_check = UPLOAD_RECHECK_BYTES;
+        // Q-I F6.1：帧缓冲**每连接自持、循环外提**——每帧只零填增量（等长帧第二帧起
+        // 零成本；旧形态每帧 `vec![0u8; n]` 整段零填充）。
+        let mut frame_buf: Vec<u8> = Vec::new();
         loop {
-            match read_frame(r) {
-                Ok(Some(payload)) => {
-                    if f.write_all(&payload).is_err() {
+            match read_frame_into(r, &mut frame_buf) {
+                Ok(Some(n)) => {
+                    if f.write_all(&frame_buf[..n]).is_err() {
                         return Err(Self::map_io_err("write", &req.path, std::io::Error::other("写临时文件失败")));
                     }
-                    total += payload.len() as u64;
+                    total += n as u64;
                     // F3a 进行中门：每累计 8 MiB 复查可用空间（跌破保留量即中止——
                     // 走既有 Err(resp) 清理路径删 .tierpart，目标文件不变）。
                     if total >= next_check {
@@ -830,7 +833,20 @@ fn write_frame(w: &mut UnixStream, payload: &[u8]) -> std::io::Result<()> {
     w.write_all(payload)
 }
 
+/// 测试壳（Q-I F6.1 起生产路径走 `read_frame_into`）：每帧新分配 + 一次拷贝。
+#[cfg(test)]
 fn read_frame(r: &mut BufReader<UnixStream>) -> std::io::Result<Option<Vec<u8>>> {
+    let mut buf = Vec::new();
+    Ok(read_frame_into(r, &mut buf)?.map(|n| {
+        buf.truncate(n);
+        buf
+    }))
+}
+
+/// 读一帧进**调用方缓冲**（Q-I F6.1）：`None` = 终止帧；`Some(n)` = 载荷在 `buf[..n]`。
+/// 缓冲由调用方跨帧持有（**每连接自持，不跨连接共享**）⇒ 帧长不超历史最大时**零成本**
+/// （旧形态每帧 `vec![0u8; n]` 整段零填充，≤MAX_CHUNK=256KiB）。
+fn read_frame_into(r: &mut BufReader<UnixStream>, buf: &mut Vec<u8>) -> std::io::Result<Option<usize>> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len)?;
     // 前缀判定与客户端共用单一真源（files::decode_prefix——R5 第二道门 高-4 整改：
@@ -838,9 +854,11 @@ fn read_frame(r: &mut BufReader<UnixStream>) -> std::io::Result<Option<Vec<u8>>>
     match crate::files::decode_prefix(&len) {
         Ok(crate::files::Prefix::Terminated) => Ok(None),
         Ok(crate::files::Prefix::Frame { len: n }) => {
-            let mut buf = vec![0u8; n];
-            r.read_exact(&mut buf)?;
-            Ok(Some(buf))
+            if buf.len() < n {
+                buf.resize(n, 0); // 只零填增量（等长帧第二帧起零成本）
+            }
+            r.read_exact(&mut buf[..n])?;
+            Ok(Some(n))
         }
         Err(e) => Err(std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string())),
     }
@@ -1043,6 +1061,39 @@ mod tests {
         let resp: serde_json::Value = serde_json::from_slice(&read_line(&mut r).unwrap()).unwrap();
         assert_eq!(resp["code"], serde_json::json!("server_busy"));
         assert!(resp["msg"].as_str().unwrap().contains("并发流已满"));
+    }
+
+    /// Q-I F6.1：`read_frame_into` 复用缓冲——帧长交替（小帧↔大帧↔等长帧）内容不错位；
+    /// 等长帧第二帧起**不 resize**（不重复零填：ptr/len 稳定）。
+    #[test]
+    fn read_frame_into_reuses_buffer() {
+        let (a, b) = UnixStream::pair().unwrap();
+        let mut w = b;
+        let small: Vec<u8> = (0..7u8).collect();
+        let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
+        let (small2, big2) = (small.clone(), big.clone());
+        // 写端独立线程（socketpair 缓冲有限：不边写边读会阻塞）
+        let writer = std::thread::spawn(move || {
+            write_frame(&mut w, &small2).unwrap();
+            write_frame(&mut w, &big2).unwrap();
+            write_frame(&mut w, &big2).unwrap(); // 等长帧（第二帧起零成本路径）
+            write_frame(&mut w, &small2).unwrap();
+            write_frame(&mut w, &[]).unwrap();
+        });
+        let mut r = BufReader::new(a);
+        let mut buf: Vec<u8> = Vec::new();
+        assert_eq!(read_frame_into(&mut r, &mut buf).unwrap(), Some(small.len()));
+        assert_eq!(&buf[..small.len()], &small[..]);
+        assert_eq!(read_frame_into(&mut r, &mut buf).unwrap(), Some(big.len()));
+        assert_eq!(&buf[..big.len()], &big[..]);
+        let (ptr, len) = (buf.as_ptr(), buf.len());
+        assert_eq!(read_frame_into(&mut r, &mut buf).unwrap(), Some(big.len()));
+        assert_eq!(&buf[..big.len()], &big[..], "等长第二帧内容仍正确");
+        assert_eq!((buf.as_ptr(), buf.len()), (ptr, len), "等长帧不 resize（不重复零填）");
+        assert_eq!(read_frame_into(&mut r, &mut buf).unwrap(), Some(small.len()));
+        assert_eq!(&buf[..small.len()], &small[..], "回小帧不沾大帧残尾");
+        assert_eq!(read_frame_into(&mut r, &mut buf).unwrap(), None, "终止帧");
+        writer.join().unwrap();
     }
 
     /// 内存对拍：客户端请求（R2 同协议形态）→ 服务端响应。**每命令一对 pair**
