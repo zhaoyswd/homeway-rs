@@ -405,14 +405,14 @@ pub struct TxShape {
 
 /// config.toml `[serve.tx_shape]` 节（D-3 反过拟合约束 3：参数 config 化；env 臂
 /// 保留为测试缝，覆盖序 **env > config > 产品默认**）。deny_unknown = typo 保护。
-#[derive(serde::Deserialize, Default, Clone, Copy, Debug)]
+#[derive(serde::Deserialize, serde::Serialize, Default, Clone, Copy, Debug)]
 #[serde(deny_unknown_fields)]
 pub struct TxShapeCfg {
     /// 桶均值钳制速率（MiB/s，默认 200——~2× 层 0 天花板；家宽/无线出口按默认即可）。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rate_mbps: Option<u64>,
     /// 单拍放行上界/桶容量（KiB，默认 256）。
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub burst_kb: Option<usize>,
 }
 

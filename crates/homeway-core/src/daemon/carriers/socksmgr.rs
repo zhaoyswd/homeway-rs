@@ -529,6 +529,55 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// Q-H F4：accept 烧尽 ⇒ dead 落账（此前恒 None）→ status 按 off 呈现 + err
+    /// 如实可查 → `socks on` 不再被幂等短路、可重建（端口不变）。
+    /// 注入缝 = `PollListener::inject_accept_failure`（不硬关真 fd——设计门 B7）。
+    #[test]
+    fn socks_dead_is_recorded_and_rebuildable() {
+        let dir = temp_dir("skm-dead");
+        let dial = FakeDial::new();
+        let (logf, warnf) = nop_log();
+        let m = SocksManager::open(&dir, &dial.carrier_dial(), &logf, &warnf).unwrap();
+        let host = hex_host(3);
+        let port = m.on(&host, 20811).unwrap();
+        assert!(m.status()[0].on);
+        // 注入 accept 失败（下一次 accept 直返 Failed）——serve 线程随即按 off 收口。
+        {
+            let entries = m.entries.lock().unwrap_or_else(|e| e.into_inner());
+            let srv = entries[0].srv.as_ref().expect("on 后 srv 在位");
+            srv.inject_accept_failure("连续失败（9 次）：注入的 accept 失效");
+        }
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let st = m.status();
+            if !st[0].on {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "dead 未落账（status 仍 on=true）：{st:?}"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let st = m.status();
+        assert!(!st[0].on, "accept 烧尽后 on 必须 false（此前谎报 true）");
+        assert!(st[0].err.contains("注入"), "err 如实可查：{:?}", st[0].err);
+        // 重建：缺省 on 沿用记忆端口（幂等短路已失效 ⇒ 真走换新路径）。
+        assert_eq!(m.on(&host, 0).unwrap(), port, "重建端口不变（记忆保留）");
+        let st = m.status();
+        assert!(st[0].on, "重建后 on=true");
+        assert!(st[0].err.is_empty(), "重建后 err 清空：{:?}", st[0].err);
+        {
+            let entries = m.entries.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(
+                entries[0].srv.as_ref().unwrap().dead_reason().is_none(),
+                "新 srv 的 dead 位必须归零"
+            );
+        }
+        drop(m);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 端口被外占：add 拒绝；持久化里的 on 条目重建失败按 off 呈现 + err。
     #[test]
     fn occupied_and_rebuild_failed() {

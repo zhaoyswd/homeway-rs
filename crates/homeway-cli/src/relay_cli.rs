@@ -12,37 +12,31 @@ use homeway_core::relay::logfile::RelayLog;
 use homeway_core::relay::rltoken;
 use homeway_core::relay::{Config, Relay};
 
-/// config.toml 的 [relay] 节（与 serve_cli 同 schema；deny_unknown 同口径）。
-#[derive(serde::Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct FileRelay {
-    #[serde(default)]
-    #[allow(dead_code)]
-    enabled: bool,
-    #[serde(default)]
-    listen: Option<String>,
-    #[serde(default)]
-    advertise: Option<String>,
+use crate::cli_flags;
+use crate::serve_cli::{load_config_strict, FileConfig};
+
+/// relay 装配参数（config 单表映射；Q-H F1——relay 侧不再有分节私表，
+/// `FileServeIgnore`/`parse_relay_section` 随之删除；值域已在 `load_config_strict` 层）。
+pub(crate) struct RelayCfg {
+    pub listen: SocketAddr,
+    pub listen_str: String,
+    pub advertise: String,
 }
 
-#[derive(serde::Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct FileConfig {
-    #[serde(default)]
-    _serve: FileServeIgnore,
-    #[serde(default)]
-    relay: FileRelay,
+/// 纯映射：`FileConfig` → relay 装配参数（listen 缺省 `:41741`）。
+pub(crate) fn relay_config_of(fc: &FileConfig) -> Result<RelayCfg, String> {
+    let listen_str = fc.relay.listen.clone().unwrap_or_else(|| ":41741".to_owned());
+    let listen = parse_listen(&listen_str)
+        .filter(|a| a.port() >= 1)
+        .ok_or_else(|| format!("relay.listen {listen_str:?} 非法（[host:]port，端口 1–65535，如 \":41741\"）"))?;
+    Ok(RelayCfg {
+        listen,
+        listen_str,
+        advertise: fc.relay.advertise.clone().unwrap_or_default(),
+    })
 }
 
-/// serve 节整节忽略（本命令只读 [relay]；serve 的键表由 serve 命令自己校验）。
-#[derive(serde::Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct FileServeIgnore {
-    #[serde(default)]
-    #[serde(rename = "*")]
-    _rest: (),
-}
-
+#[derive(Default)]
 struct RelayFlags {
     state: Option<PathBuf>,
     listen: Option<String>,
@@ -52,44 +46,55 @@ struct RelayFlags {
     extra: Vec<String>,
 }
 
-fn parse_flags(args: &[String]) -> RelayFlags {
-    let mut f = RelayFlags { state: None, listen: None, advertise: None, open: false, no_hints: false, extra: Vec::new() };
+fn relay_usage() {
+    eprintln!("用法：homeway-cli relay [--state DIR] [--listen :41741] [--advertise IP:port] [--open] [--no-hints]");
+    eprintln!("  = 前台单中继（Ctrl-C 收工）；启停/查询用 `homeway-cli relay start|stop|restart|status|token`（控制面）。");
+}
+
+fn parse_flags(args: &[String]) -> Result<RelayFlags, String> {
+    let mut f = RelayFlags::default();
     let mut i = 0;
     while i < args.len() {
-        let stripped = args[i].strip_prefix("--").or_else(|| args[i].strip_prefix('-'));
-        let Some(body) = stripped else {
-            f.extra.push(args[i].clone());
+        let a = args[i].as_str();
+        let Some((name, inline)) = cli_flags::split_flag(a) else {
+            f.extra.push(a.to_owned());
             i += 1;
             continue;
         };
-        let (name, inline) = match body.split_once('=') {
-            Some((k, v)) => (k.to_owned(), Some(v.to_owned())),
-            None => (body.to_owned(), None),
-        };
-        let take_val = |i: &mut usize| -> Option<String> {
-            if let Some(v) = inline.clone() {
-                return Some(v);
+        let next = args.get(i + 1).map(String::as_str);
+        let mut adv = 1usize;
+        match name {
+            "state" => {
+                f.state = Some(cli_flags::take_state_or_exit("state", inline, next));
+                if inline.is_none() {
+                    adv = 2;
+                }
             }
-            *i += 1;
-            args.get(*i).cloned()
-        };
-        let mut j = i;
-        match name.as_str() {
-            "state" => f.state = take_val(&mut j).map(PathBuf::from),
-            "listen" => f.listen = take_val(&mut j),
-            "advertise" => f.advertise = take_val(&mut j),
+            "listen" => {
+                f.listen = Some(cli_flags::take_value_or_exit("listen", inline, next, false));
+                if inline.is_none() {
+                    adv = 2;
+                }
+            }
+            "advertise" => {
+                f.advertise = Some(cli_flags::take_value_or_exit("advertise", inline, next, false));
+                if inline.is_none() {
+                    adv = 2;
+                }
+            }
             // 测试形态开关（不进生产命令面文档——FIX-89 同款「显式开放」哲学）
-            "open" => f.open = true,
+            "open" => f.open = cli_flags::take_bool_or_exit("open", inline, true),
             // 测试形态：不递送 hint（升级条纹的中继驻留前提；见 Config::no_hints 注释）
-            "no-hints" => f.no_hints = true,
-            other => {
-                eprintln!("未知参数：--{other}");
-                std::process::exit(2);
+            "no-hints" => f.no_hints = cli_flags::take_bool_or_exit("no-hints", inline, true),
+            "help" | "h" => {
+                relay_usage();
+                std::process::exit(0);
             }
+            other => return Err(format!("未知参数：--{other}")),
         }
-        i = j + 1;
+        i += adv;
     }
-    f
+    Ok(f)
 }
 
 /// 解析监听地址（":41741"/"127.0.0.1:41741"——缺 host = 全卡 v4）。
@@ -280,59 +285,55 @@ pub fn assemble_relay(
 
 /// `homeway-cli relay [...]`：前台中继（Ctrl-C / SIGTERM 收工——确定性 closeAll）。
 pub fn cmd_relay(args: &[String]) {
-    let f = parse_flags(args);
+    let f = match parse_flags(args) {
+        Ok(f) => f,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(2);
+        }
+    };
     if !f.extra.is_empty() {
         eprintln!("relay 不接受位置参数（得 {:?}）——启停/查询命令组不在本 CLI 裁剪面", f.extra);
         std::process::exit(2);
     }
-    let state_dir = f.state.clone().unwrap_or_else(|| PathBuf::from("."));
+    let state_dir = f.state.clone().unwrap_or_else(crate::unified_cli::default_state_dir);
     // 单实例锁（Go 全形态共用 <state>/lock；form=relay）
     let _lock = acquire_lock_or_exit(&state_dir, "relay");
 
-    // config.toml（存在即解析 [relay] 节；缺失 = 内置默认）
-    let mut listen_str = ":41741".to_owned();
-    let mut advertise = String::new();
-    let cfg_path = state_dir.join("config.toml");
-    if cfg_path.exists() {
-        let body = match std::fs::read_to_string(&cfg_path) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("{}: 读取失败：{e}", cfg_path.display());
-                std::process::exit(1);
-            }
-        };
-        // 只取 [relay] 节（serve 节键表不归本命令校验——手工切片避免整表 deny_unknown 拒启）
-        let fc: FileConfig = match parse_relay_section(&body) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("{}: {e}", cfg_path.display());
-                std::process::exit(1);
-            }
-        };
-        if let Some(v) = fc.relay.listen {
-            listen_str = v;
-        }
-        if let Some(v) = fc.relay.advertise {
-            advertise = v;
-        }
-    }
-    if let Some(v) = &f.listen {
-        listen_str = v.clone();
-    }
-    if let Some(v) = &f.advertise {
-        advertise = v.clone();
-    }
-    let listen = match parse_listen(&listen_str) {
-        Some(a) => a,
-        None => {
-            eprintln!("--listen {listen_str:?} 不是合法监听地址（:port / ip:port）");
-            std::process::exit(2);
+    // config.toml：Q-H F1 单表**严格读**（缺省 = 默认；整文件非法 = 拒启——Go
+    // nodeconfig.Load 同形；此前只手工切 [relay] 节，serve 节的键表不归本命令校验）。
+    let fc = match load_config_strict(&state_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("{e}");
+            std::process::exit(1);
         }
     };
+    let mut rc = match relay_config_of(&fc) {
+        Ok(v) => v,
+        Err(e) => {
+            eprintln!("{}: {e}", state_dir.join("config.toml").display());
+            std::process::exit(1);
+        }
+    };
+    if let Some(v) = &f.listen {
+        rc.listen_str = v.clone();
+        rc.listen = match parse_listen(&rc.listen_str) {
+            Some(a) => a,
+            None => {
+                eprintln!("--listen {:?} 不是合法监听地址（:port / ip:port）", rc.listen_str);
+                std::process::exit(2);
+            }
+        };
+    }
+    if let Some(v) = &f.advertise {
+        rc.advertise = v.clone();
+    }
+    let listen = rc.listen;
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
     let proc = match assemble_relay(
         &state_dir,
-        RelayAssemble { listen, advertise, no_hints: f.no_hints, open: f.open },
+        RelayAssemble { listen, advertise: rc.advertise, no_hints: f.no_hints, open: f.open },
         Arc::clone(&logf),
     ) {
         Ok(p) => p,
@@ -373,24 +374,6 @@ pub fn acquire_lock_or_exit(state_dir: &std::path::Path, form: &str) -> homeway_
             std::process::exit(1);
         }
     }
-}
-
-/// 手工抽 [relay] 节（避免整文件反序列化时被 serve 节的键表拒启——serve 键归 serve 校验）。
-fn parse_relay_section(body: &str) -> Result<FileConfig, String> {
-    let mut in_relay = false;
-    let mut section = String::from("[relay]\n");
-    for line in body.lines() {
-        let t = line.trim();
-        if t.starts_with('[') {
-            in_relay = t == "[relay]";
-            continue;
-        }
-        if in_relay && !t.is_empty() && !t.starts_with('#') {
-            section.push_str(line);
-            section.push('\n');
-        }
-    }
-    toml::from_str(&section).map_err(|e| format!("[relay] 节解析失败：{e}"))
 }
 
 // ---------- stop 管道（与 serve_cli 同款形态） ----------

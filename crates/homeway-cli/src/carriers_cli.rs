@@ -43,7 +43,8 @@ impl CarrierArgs {
 
 }
 
-/// 解析（`--flag value` 与 `--flag=value` 等价；未知 flag 报错退出 2）。
+/// 解析（`--flag value` 与 `--flag=value` 等价；未知 flag 报错退出 2；Q-H F2：取值
+/// 全走 `cli_flags` 唯一取值器——缺值/空值/吞 flag fail-fast）。
 fn parse_carrier_args(usage: &str, args: &[String], value_flags: &[&str]) -> CarrierArgs {
     let mut out = CarrierArgs {
         state: crate::unified_cli::default_state_dir(),
@@ -56,35 +57,23 @@ fn parse_carrier_args(usage: &str, args: &[String], value_flags: &[&str]) -> Car
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
-        if !a.starts_with('-') {
+        let Some((name, inline)) = crate::cli_flags::split_flag(a) else {
             out.positional.push(a.to_owned());
             i += 1;
             continue;
-        }
-        let body = a.trim_start_matches('-');
-        let (name, inline) = match body.split_once('=') {
-            Some((k, v)) => (k.to_owned(), Some(v.to_owned())),
-            None => (body.to_owned(), None),
         };
-        match name.as_str() {
+        let next = args.get(i + 1).map(String::as_str);
+        let mut adv = 1usize;
+        match name {
             "state" => {
-                let v = inline.clone().or_else(|| args.get(i + 1).cloned());
-                match v {
-                    Some(v) => {
-                        out.state = v.into();
-                        if inline.is_none() {
-                            i += 1;
-                        }
-                    }
-                    None => {
-                        eprintln!("--state 需要目录参数（{usage}）");
-                        std::process::exit(2);
-                    }
+                out.state = crate::cli_flags::take_state_or_exit("state", inline, next);
+                if inline.is_none() {
+                    adv = 2;
                 }
             }
-            "no-spawn" => out.no_spawn = true,
-            "json" => out.json = true,
-            "quiet" => out.quiet = true,
+            "no-spawn" => out.no_spawn = crate::cli_flags::take_bool_or_exit("no-spawn", inline, true),
+            "json" => out.json = crate::cli_flags::take_bool_or_exit("json", inline, true),
+            "quiet" => out.quiet = crate::cli_flags::take_bool_or_exit("quiet", inline, true),
             "h" | "help" => {
                 // 低-5① 整改：--help 打用法退 0（此前被吞 → 子命令带缺参错误继续执行）。
                 eprintln!("用法：{usage}");
@@ -92,18 +81,12 @@ fn parse_carrier_args(usage: &str, args: &[String], value_flags: &[&str]) -> Car
             }
             other => {
                 if let Some(vf) = value_flags.iter().find(|f| **f == other) {
-                    let v = inline.clone().or_else(|| args.get(i + 1).cloned());
-                    match v {
-                        Some(v) => {
-                            out.values.push(((*vf).to_owned(), v));
-                            if inline.is_none() {
-                                i += 1;
-                            }
-                        }
-                        None => {
-                            eprintln!("--{other} 需要值（{usage}）");
-                            std::process::exit(2);
-                        }
+                    out.values.push((
+                        (*vf).to_owned(),
+                        crate::cli_flags::take_value_or_exit(other, inline, next, false),
+                    ));
+                    if inline.is_none() {
+                        adv = 2;
                     }
                 } else {
                     eprintln!("未知参数：{a}（{usage}）");
@@ -111,7 +94,7 @@ fn parse_carrier_args(usage: &str, args: &[String], value_flags: &[&str]) -> Car
                 }
             }
         }
-        i += 1;
+        i += adv;
     }
     out
 }
@@ -581,7 +564,17 @@ fn socks_on(args: &[String]) {
         eprintln!("homeway: socks on 需要 --host <ref>（homeway-cli host list 查看在表主机）");
         std::process::exit(2);
     };
-    let listen = p.value_of("listen").and_then(|v| v.parse::<u16>().ok()).unwrap_or(0);
+    // Q-H F7a：`--listen` 非法值 fail-fast（此前静默回落 0 = 沿用记忆端口）。
+    let listen = match p.value_of("listen") {
+        None => 0,
+        Some(v) => match v.parse::<u16>() {
+            Ok(n) => n,
+            Err(_) => {
+                eprintln!("homeway: --listen {v:?} 非法（端口数字 1024–65535；缺省 = 沿用该主机记忆端口）");
+                std::process::exit(2);
+            }
+        },
+    };
     if listen != 0 && listen < homeway_core::facade::portfwd::MIN_PORT {
         eprintln!("homeway: --listen {listen} 越界（监听端口须在 1024–65535，与 forward 同一条）");
         std::process::exit(2);

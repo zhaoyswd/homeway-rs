@@ -512,6 +512,15 @@ impl ParsedTermArgs {
     }
 }
 
+/// 取值（Result 形态——term 的解析器返回 Err 而不 exit；错误文案与 `cli_flags` 一致）。
+fn take_arg(name: &str, inline: Option<&str>, next: Option<&str>) -> Result<String, String> {
+    match crate::cli_flags::take_value(inline, next, false) {
+        crate::cli_flags::Val::Ok(v) => Ok(v),
+        crate::cli_flags::Val::Missing(why) => Err(format!("--{name} 缺值（{why}）")),
+        crate::cli_flags::Val::Empty => Err(format!("--{name} 空值（`=` 后为空）")),
+    }
+}
+
 /// 通用 flag 位解析（--state/--host/--timeout + 已知 flag 白名单 + 带值 flag；unknown flag 报错）。
 fn parse_term_args(
     args: &[String],
@@ -528,32 +537,63 @@ fn parse_term_args(
     let mut i = 0;
     while i < args.len() {
         let a = args[i].clone();
-        let take = |i: &mut usize, flag: &str| -> Result<String, String> {
-            *i += 1;
-            args.get(*i).cloned().ok_or_else(|| format!("{flag} 后面缺参数"))
+        let Some((name, inline)) = crate::cli_flags::split_flag(&a) else {
+            // 位置参数（会话名）——唯一形态。
+            if !allow_name {
+                return Err(format!(
+                    "list 不接受会话名（{a:?}）；省略名字接入最近活跃会话请用 attach"
+                ));
+            }
+            if !out.name.is_empty() {
+                return Err(format!("只能给一个会话名（已有 {:?}）", out.name));
+            }
+            out.name = a;
+            i += 1;
+            continue;
         };
-        match a.as_str() {
-            "--state" => out.common.state_dir = Some(PathBuf::from(take(&mut i, &a)?)),
-            "--host" => {
-                let v = take(&mut i, &a)?;
+        let next = args.get(i + 1).map(String::as_str);
+        let mut adv = 1usize;
+        match name {
+            // Q-H F2：`--state` 全形态 fail-fast（含等号形——此前 term 对
+            // `--state=DIR` 是硬报错「未知 flag」，接入后变成接受＝放宽，已登记）。
+            "state" => {
+                out.common.state_dir = Some(PathBuf::from(take_arg("state", inline, next)?));
+                if inline.is_none() {
+                    adv = 2;
+                }
+            }
+            "host" => {
+                let v = take_arg("host", inline, next)?;
+                if inline.is_none() {
+                    adv = 2;
+                }
                 if v.trim().is_empty() {
                     return Err("--host 需要主机名或 ID（homeway-cli host list 查看在表主机）".to_owned());
                 }
                 out.common.host_ref = v;
             }
-            "--timeout" => {
-                let v = take(&mut i, &a)?;
+            "timeout" => {
+                let v = take_arg("timeout", inline, next)?;
+                if inline.is_none() {
+                    adv = 2;
+                }
                 out.common.timeout = Some(parse_duration(&v).filter(|d| !d.is_zero()).ok_or_else(
                     || format!("--timeout {v:?} 不是合法时长（如 10s、1500ms）"),
                 )?);
             }
-            "--no-spawn" => out.common.no_spawn = true,
-            other if value_flags.contains(&other) => {
-                let v = take(&mut i, other)?;
-                out.values.push((other.to_owned(), v));
+            "no-spawn" => {
+                out.common.no_spawn = crate::cli_flags::take_bool_or_exit("no-spawn", inline, true)
             }
-            other if other.starts_with('-') => {
-                if !known_flags.contains(&other) {
+            // 白名单按**原形**比对（含前缀：`-d` / `--detach-key`——历史契约）。
+            _ if value_flags.contains(&a.as_str()) => {
+                let v = take_arg(name, inline, next)?;
+                if inline.is_none() {
+                    adv = 2;
+                }
+                out.values.push((a.clone(), v));
+            }
+            _ => {
+                if !known_flags.contains(&a.as_str()) {
                     let mut usable = String::from("--state <dir>、--host <name|id>、--timeout <时长>、--no-spawn");
                     if !known_flags.is_empty() {
                         usable.push_str(&format!("、{}", known_flags.join("、")));
@@ -561,23 +601,12 @@ fn parse_term_args(
                     if !value_flags.is_empty() {
                         usable.push_str(&format!("、{}", value_flags.join("、")));
                     }
-                    return Err(format!("不认识的参数 {other:?}（可用：{usable}）"));
+                    return Err(format!("不认识的参数 {a:?}（可用：{usable}）"));
                 }
-                out.flags.push(other.to_owned());
-            }
-            other => {
-                if !allow_name {
-                    return Err(format!(
-                        "list 不接受会话名（{other:?}）；省略名字接入最近活跃会话请用 attach"
-                    ));
-                }
-                if !out.name.is_empty() {
-                    return Err(format!("只能给一个会话名（已有 {:?}）", out.name));
-                }
-                out.name = other.to_owned();
+                out.flags.push(a.clone());
             }
         }
-        i += 1;
+        i += adv;
     }
     Ok(out)
 }
@@ -1720,37 +1749,48 @@ fn cli_explain(args: &[String]) -> Result<(), String> {
     let mut i = 0;
     while i < args.len() {
         let a = args[i].clone();
-        let take = |i: &mut usize, flag: &str| -> Result<String, String> {
-            *i += 1;
-            args.get(*i).cloned().ok_or_else(|| format!("{flag} 后面缺参数"))
+        let Some((name, inline)) = crate::cli_flags::split_flag(&a) else {
+            if !session.is_empty() {
+                return Err(format!("只能给一个会话名（已有 {session:?}）"));
+            }
+            session = a;
+            i += 1;
+            continue;
         };
-        match a.as_str() {
-            "--file" => file = take(&mut i, &a)?,
-            "--agent" => agent = take(&mut i, &a)?,
-            "--state" => common.state_dir = Some(PathBuf::from(take(&mut i, &a)?)),
-            "--host" => {
-                let v = take(&mut i, &a)?;
+        let next = args.get(i + 1).map(String::as_str);
+        let mut adv = 1usize;
+        match name {
+            "file" => {
+                file = take_arg("file", inline, next)?;
+                if inline.is_none() { adv = 2; }
+            }
+            "agent" => {
+                agent = take_arg("agent", inline, next)?;
+                if inline.is_none() { adv = 2; }
+            }
+            "state" => {
+                common.state_dir = Some(PathBuf::from(take_arg("state", inline, next)?));
+                if inline.is_none() { adv = 2; }
+            }
+            "host" => {
+                let v = take_arg("host", inline, next)?;
+                if inline.is_none() { adv = 2; }
                 if v.trim().is_empty() {
                     return Err("--host 需要主机名或 ID（homeway-cli host list 查看在表主机）".to_owned());
                 }
                 common.host_ref = v;
             }
-            "--timeout" => {
-                let v = take(&mut i, &a)?;
+            "timeout" => {
+                let v = take_arg("timeout", inline, next)?;
+                if inline.is_none() { adv = 2; }
                 common.timeout = Some(parse_duration(&v).filter(|d| !d.is_zero()).ok_or_else(|| {
                     format!("--timeout {v:?} 不是合法时长（如 10s、1500ms）")
                 })?);
             }
-            "--json" => json_out = true,
-            other if other.starts_with('-') => return Err(format!("不认识的参数 {other:?}")),
-            other => {
-                if !session.is_empty() {
-                    return Err(format!("只能给一个会话名（已有 {session:?}）"));
-                }
-                session = other.to_owned();
-            }
+            "json" => json_out = crate::cli_flags::take_bool_or_exit("json", inline, true),
+            other => return Err(format!("不认识的参数 --{other}")),
         }
-        i += 1;
+        i += adv;
     }
     if !file.is_empty() {
         if !common.host_ref.is_empty() {

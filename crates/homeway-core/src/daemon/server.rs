@@ -42,6 +42,12 @@ use super::{Backend, RoleOp, RoleOpOut};
 // 默认连接参数（Go server.go design D5；不改契约形状）。
 /// 每连接在册流上限（超限 stream_refused）。
 pub const DEFAULT_MAX_STREAMS: usize = 8;
+/// 控制面并发连接上限（Q-H F5 加固；**改名避撞** `socks_srv::DEFAULT_MAX_CONNS`）。
+/// Go 无上限（goroutine 天然轻）——Rust 每连接 4 线程 ⇒ 64 ≈ 256 线程峰值；超限
+/// 接受后立即关闭（既有连接不受影响）。
+pub const DEFAULT_MAX_CONTROL_CONNS: usize = 64;
+/// 握手期限（Q-H F5）：连接建立后未 hello 超此期限 ⇒ 断开（合法前端毫秒级握手）。
+pub const DEFAULT_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
 /// 连接写停滞看门狗（前端整体不读的病态兜底）。
 pub const WRITE_STALL_TIMEOUT: Duration = Duration::from_secs(30);
 /// 控制帧队列容量（在途请求 + 生命周期帧；告别帧不受此界——尽力送达语义）。
@@ -63,6 +69,10 @@ pub struct ServerConfig {
     pub bus: Arc<Bus>,
     pub backend: Arc<dyn Backend>,
     pub logf: Arc<dyn Fn(&str) + Send + Sync>,
+    /// 并发连接上限（Q-H F5；测试注入用——生产 = `DEFAULT_MAX_CONTROL_CONNS`）。
+    pub max_conns: usize,
+    /// 握手期限（Q-H F5；测试注入用——生产 = `DEFAULT_HANDSHAKE_DEADLINE`）。
+    pub handshake_deadline: Duration,
 }
 
 /// 控制面服务器。`serve()` 阻塞跑接入循环（瞬态 accept 错误有界退避重试、永久
@@ -73,6 +83,8 @@ pub struct ControlServer {
     bus: Arc<Bus>,
     backend: Arc<dyn Backend>,
     logf: Arc<dyn Fn(&str) + Send + Sync>,
+    max_conns: usize,
+    handshake_deadline: Duration,
     conns: Mutex<Vec<Arc<ConnShared>>>,
     conn_threads: Mutex<Vec<std::thread::JoinHandle<()>>>,
     shutdown_flag: AtomicBool,
@@ -86,6 +98,8 @@ impl ControlServer {
             bus: cfg.bus,
             backend: cfg.backend,
             logf: cfg.logf,
+            max_conns: cfg.max_conns,
+            handshake_deadline: cfg.handshake_deadline,
             conns: Mutex::new(Vec::new()),
             conn_threads: Mutex::new(Vec::new()),
             shutdown_flag: AtomicBool::new(false),
@@ -113,6 +127,18 @@ impl ControlServer {
             match ln.accept() {
                 Ok((stream, _)) => {
                     retry = Duration::ZERO;
+                    // Q-H F5：先回收已结束的连接线程句柄（此前只增不减——
+                    // shutdown 才 drain）；随后按并发上限裁决。
+                    self.reap_conn_threads();
+                    let live = self.conns.lock().unwrap_or_else(|e| e.into_inner()).len();
+                    if live >= self.max_conns {
+                        (self.logf)(&format!(
+                            "control: 连接拒绝（并发上限 {}）",
+                            self.max_conns
+                        ));
+                        drop(stream); // 接受后立即关闭（握手前不发帧；既有连接不受影响）
+                        continue;
+                    }
                     match self.spawn_conn(stream) {
                         Some(peer) => {
                             self.conns.lock().unwrap_or_else(|e| e.into_inner()).push(peer);
@@ -152,6 +178,20 @@ impl ControlServer {
         }
     }
 
+    /// 回收已结束的连接线程句柄（Q-H F5；`JoinHandle::is_finished` 不阻塞）。
+    fn reap_conn_threads(&self) {
+        self.conn_threads
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .retain(|h| !h.is_finished());
+    }
+
+    /// 【测试缝】在册连接线程句柄数（Q-H F5 的 joiner 回收断言）。
+    #[cfg(test)]
+    pub(crate) fn conn_threads_len(&self) -> usize {
+        self.conn_threads.lock().unwrap_or_else(|e| e.into_inner()).len()
+    }
+
     /// 低-1（D-2 收敛）：连接线程/fd 克隆失败（资源耗尽级）= **该连接降级关闭**，
     /// 不带走进程（原 expect 形态把外部可触发的 EMFILE 变成整进程 panic）。任一步
     /// 失败：已起的线程随 conn.close 的收工语义自灭，接入循环继续。
@@ -177,6 +217,7 @@ impl ControlServer {
         let conn = Arc::new(ConnShared {
             srv: Arc::clone(self),
             ctl_sock: Mutex::new(ctl_sock),
+            accepted_at: Instant::now(),
             closed: AtomicBool::new(false),
             handshook: AtomicBool::new(false),
             inflight: AtomicI32::new(0),
@@ -304,6 +345,8 @@ struct ConnShared {
     srv: Arc<ControlServer>,
     /// 收工用的第三句柄（shutdown 解阻塞 reader 的阻塞读）。
     ctl_sock: Mutex<std::os::unix::net::UnixStream>,
+    /// 连接建立时刻（Q-H F5：未握手超期的判据基点）。
+    accepted_at: Instant,
     closed: AtomicBool,
     handshook: AtomicBool,
     inflight: AtomicI32,
@@ -390,11 +433,26 @@ impl ConnShared {
     fn reader_main(&self, mut sock: std::os::unix::net::UnixStream) {
         let mut buf: Vec<u8> = Vec::new(); // 半帧缓冲（读超时中断后的续读面）
         loop {
-            let head = match read_head(&mut sock, &mut buf) {
+            // Q-H F5：握手期限的读侧期限（**慢滴水防御**——半帧/半体持续有进展时
+            // 内层续读循环不会回到本层，只在拍上判期限会被「每 <500ms 1 字节」绕过）。
+            let hs_deadline = if self.handshook.load(Ordering::SeqCst) {
+                None
+            } else {
+                Some(self.accepted_at + self.srv.handshake_deadline)
+            };
+            let head = match read_head_deadline(&mut sock, &mut buf, hs_deadline) {
                 Ok(Some(h)) => h,
                 Ok(None) => {
-                    // 读超时节拍（500ms）：复检收工，否则继续。
+                    // 读超时节拍（500ms）或握手期限到点。
                     if self.is_closed() {
+                        return;
+                    }
+                    if hs_deadline.is_some_and(|d| Instant::now() >= d) {
+                        (self.srv.logf)(&format!(
+                            "control: 连接握手超时（{}s 未 hello）——断开",
+                            self.srv.handshake_deadline.as_secs()
+                        ));
+                        self.close("");
                         return;
                     }
                     continue;
@@ -405,8 +463,22 @@ impl ConnShared {
                 }
                 Err(_) => return, // EOF/IO 错误 = 连接结束
             };
-            let body = match read_body_buf(&mut sock, &mut buf, head) {
-                Ok(b) => b,
+            let body = match read_body_buf_deadline(&mut sock, &mut buf, head, hs_deadline) {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    if self.is_closed() {
+                        return;
+                    }
+                    if hs_deadline.is_some_and(|d| Instant::now() >= d) {
+                        (self.srv.logf)(&format!(
+                            "control: 连接握手超时（{}s 未 hello）——断开",
+                            self.srv.handshake_deadline.as_secs()
+                        ));
+                        self.close("");
+                        return;
+                    }
+                    continue; // 半体续读（缓冲保留）
+                }
                 Err(_) => return, // 半帧（声明了 body 却断流）= 连接结束
             };
             let Some(op) = Op::from_code(head.op) else {
@@ -1578,12 +1650,17 @@ fn map_backend_err(e: super::proto::BackendErr) -> OpError {
 
 // ---------- 半帧缓冲读写（reader 的读超时节拍与 read_exact 组合；client 复用） ----------
 
-/// 从 socket + 残余缓冲读 5 字节帧头。Ok(None) = 读超时节拍（无进展）。
-pub(super) fn read_head(
+/// 从 socket + 残余缓冲读 5 字节帧头。Ok(None) = 读超时节拍（无进展）或
+/// `deadline` 到点（Q-H F5 的读侧期限——慢滴水防御；调用方负责归因/断开）。
+pub(super) fn read_head_deadline(
     sock: &mut std::os::unix::net::UnixStream,
     buf: &mut Vec<u8>,
+    deadline: Option<Instant>,
 ) -> Result<Option<frame::FrameHead>, FrameError> {
     while buf.len() < 5 {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Ok(None);
+        }
         if !fill(sock, buf)? {
             return Ok(None);
         }
@@ -1600,17 +1677,39 @@ pub(super) fn read_head(
     Ok(Some(fh))
 }
 
+/// 无期限薄壳（客户端与其他既有调用面）。
+pub(super) fn read_head(
+    sock: &mut std::os::unix::net::UnixStream,
+    buf: &mut Vec<u8>,
+) -> Result<Option<frame::FrameHead>, FrameError> {
+    read_head_deadline(sock, buf, None)
+}
+
 pub(super) fn read_body_buf(
     sock: &mut std::os::unix::net::UnixStream,
     buf: &mut Vec<u8>,
     head: frame::FrameHead,
 ) -> Result<Vec<u8>, FrameError> {
+    Ok(read_body_buf_deadline(sock, buf, head, None)?
+        .expect("无期限形态不会返回 None"))
+}
+
+/// 带期限的半体续读（Q-H F5；Ok(None) = 期限到点——半体缓冲**保留**，调用方归因）。
+pub(super) fn read_body_buf_deadline(
+    sock: &mut std::os::unix::net::UnixStream,
+    buf: &mut Vec<u8>,
+    head: frame::FrameHead,
+    deadline: Option<Instant>,
+) -> Result<Option<Vec<u8>>, FrameError> {
     while (buf.len() as u64) < head.n as u64 {
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            return Ok(None);
+        }
         if !fill(sock, buf)? {
             // 读超时不算断流（等下一拍）；EOF（真断）在 fill 里报错。
         }
     }
-    Ok(buf.drain(..head.n as usize).collect())
+    Ok(Some(buf.drain(..head.n as usize).collect()))
 }
 
 /// 填一块；false = 本拍无数据（读超时节拍——10ms 缓冲后返回，防忙等）。

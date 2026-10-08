@@ -18,6 +18,7 @@ use homeway_core::token;
 use homeway_core::wgcore::ConnErr;
 
 mod carriers_cli;
+mod cli_flags;
 mod daemon_cli;
 mod relay_cli;
 mod serve_cli;
@@ -105,7 +106,19 @@ fn main() {
     }
 }
 
+/// Q-H F8/CA13（代码门 L1）：动词形态的 `--help`/`-h` 短路判据（**任意位置**——
+/// 非首位也应短路；此前只认 args[0]）。
+fn wants_help(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--help" || a == "-h")
+}
+
 fn cmd_token(args: &[String]) {
+    // Q-H F8/CA13：`--help`/`-h` 短路（用法 + exit 0；任意位置）。
+    if wants_help(args) {
+        eprintln!("用法：homeway-cli token <hmw1…> [--dead-direct] [--loopback-only] [--v6-only]");
+        eprintln!("  无 flag = 解析并打印 peer_id/secret/端点；--dead-direct = Direct 端点改死端口（矩阵中继段注入缝）。");
+        std::process::exit(0);
+    }
     // `token <hmw1…> --dead-direct`：解析后把 Direct 端点改指 127.0.0.1:1 重编码输出
     //（矩阵中继段的 Go 客户端注入缝——Go host add 无 dead-direct flag；crc4 无密钥
     // 重算即被两侧接受，评审确认可行）。与 --token 的注入语义一致（connect 侧）。
@@ -113,12 +126,29 @@ fn cmd_token(args: &[String]) {
     // 对照实验缝：同机拓扑里客户端赛跑可能采纳本机 LAN IP，出口发往它的 UDP 走
     // en0 环回路径——实测 18.3µs/包 vs lo0 5.5µs/包（3.3 倍），强制回环可分离
     //「endpoint 路径成本」与「实现栈成本」）。
-    let dead_direct = args.iter().any(|a| a == "--dead-direct");
-    let loopback_only = args.iter().any(|a| a == "--loopback-only");
+    let mut dead_direct = false;
+    let mut loopback_only = false;
     // v6-only：Direct 的 **v4** 端点改死端口（v6 保留）——压出「只有 v6 直连可达」
     // 形态（B0-1 验证缝：v6 路径不被 LAN v4 赛跑掩盖；中继端点不动）
-    let v6_only = args.iter().any(|a| a == "--v6-only");
-    let input = args.iter().find(|a| !a.starts_with("--")).cloned();
+    let mut v6_only = false;
+    let mut input: Option<String> = None;
+    for a in args {
+        let Some((name, inline)) = cli_flags::split_flag(a) else {
+            if input.is_none() {
+                input = Some(a.clone());
+            }
+            continue;
+        };
+        match name {
+            // Q-H F7b：布尔显式值真生效/非法值 fail-fast（此前 `=false` 被静默忽略）。
+            "dead-direct" => dead_direct = cli_flags::take_bool_or_exit("dead-direct", inline, true),
+            "loopback-only" => {
+                loopback_only = cli_flags::take_bool_or_exit("loopback-only", inline, true)
+            }
+            "v6-only" => v6_only = cli_flags::take_bool_or_exit("v6-only", inline, true),
+            _ => {}
+        }
+    }
     let Some(s) = input else {
         eprintln!("用法：homeway-cli token <hmw1…> [--dead-direct] [--loopback-only] [--v6-only]");
         std::process::exit(2);
@@ -243,61 +273,96 @@ fn parse_connect(args: &[String]) -> ConnectArgs {
     };
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "--token" => {
-                i += 1;
-                a.tok = args.get(i).cloned();
+        let raw = args[i].as_str();
+        let Some((name, inline)) = cli_flags::split_flag(raw) else {
+            eprintln!("未知参数：{raw}");
+            std::process::exit(2);
+        };
+        let next = args.get(i + 1).map(String::as_str);
+        let mut adv = 1usize;
+        let take_next = |adv: &mut usize| {
+            if inline.is_none() {
+                *adv = 2;
             }
-            "--identity-dir" => {
-                i += 1;
-                a.identity_dir = args.get(i).map(PathBuf::from);
+        };
+        match name {
+            "token" => {
+                a.tok = Some(cli_flags::take_value_or_exit("token", inline, next, false));
+                take_next(&mut adv);
             }
-            "--endpoint-cache-dir" => {
-                i += 1;
-                a.cache_dir = args.get(i).map(PathBuf::from);
+            "identity-dir" => {
+                a.identity_dir = Some(PathBuf::from(cli_flags::take_value_or_exit(
+                    "identity-dir",
+                    inline,
+                    next,
+                    false,
+                )));
+                take_next(&mut adv);
             }
-            "--speedtest" => a.do_speedtest = true,
-            "--dial" => {
-                i += 1;
-                a.dial = args.get(i).and_then(|s| s.parse().ok());
+            "endpoint-cache-dir" => {
+                a.cache_dir = Some(PathBuf::from(cli_flags::take_value_or_exit(
+                    "endpoint-cache-dir",
+                    inline,
+                    next,
+                    false,
+                )));
+                take_next(&mut adv);
+            }
+            "speedtest" => a.do_speedtest = cli_flags::take_bool_or_exit("speedtest", inline, true),
+            "dial" => {
+                let v = cli_flags::take_value_or_exit("dial", inline, next, false);
+                take_next(&mut adv);
+                a.dial = v.parse().ok();
                 if a.dial.is_none() {
                     eprintln!("--dial 需要 <ipv4:port>（如 192.168.3.12:9999）");
                     std::process::exit(2);
                 }
             }
-            "--hold" => {
-                i += 1;
-                a.hold = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            // Q-H F7a：数值 flag 非法/缺值 fail-fast（此前静默回退 0）。
+            "hold" => {
+                a.hold = cli_flags::take_num_or_exit::<u64>("hold", inline, next, "秒数，如 30");
+                take_next(&mut adv);
             }
-            "--probe" => {
-                i += 1;
-                a.probe = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            "probe" => {
+                a.probe = cli_flags::take_num_or_exit::<u32>("probe", inline, next, "次数，如 1");
+                take_next(&mut adv);
             }
-            "--status-json" => a.status_json = true,
-            "--recover-from" => {
-                i += 1;
-                a.recover_from = args.get(i).and_then(|s| s.parse().ok());
+            "status-json" => a.status_json = cli_flags::take_bool_or_exit("status-json", inline, true),
+            "recover-from" => {
+                let v = cli_flags::take_value_or_exit("recover-from", inline, next, false);
+                take_next(&mut adv);
+                a.recover_from = match v.parse::<i64>() {
+                    Ok(n) => Some(n),
+                    Err(_) => {
+                        eprintln!("--recover-from {v:?} 非法（档位数字 1/2/3）");
+                        std::process::exit(2);
+                    }
+                };
             }
-            "--recover-delay" => {
-                i += 1;
-                a.recover_delay = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(0);
+            "recover-delay" => {
+                a.recover_delay =
+                    cli_flags::take_num_or_exit::<u64>("recover-delay", inline, next, "秒数，如 5");
+                take_next(&mut adv);
             }
-            "--recover-cause" => {
-                i += 1;
-                a.recover_cause = args.get(i).cloned().unwrap_or_else(|| "测试注入".into());
+            // carve-out（§6-12）：自由文本，值可以 '-' 开头。
+            "recover-cause" => {
+                a.recover_cause = cli_flags::take_value_or_exit("recover-cause", inline, next, true);
+                take_next(&mut adv);
             }
-            "--dead-direct" => a.dead_direct = true,
-            "--no-session-lock" => a.no_session_lock = true,
-            "--inject" => {
-                i += 1;
-                a.inject = args.get(i).cloned();
+            "dead-direct" => a.dead_direct = cli_flags::take_bool_or_exit("dead-direct", inline, true),
+            "no-session-lock" => {
+                a.no_session_lock = cli_flags::take_bool_or_exit("no-session-lock", inline, true)
+            }
+            "inject" => {
+                a.inject = Some(cli_flags::take_value_or_exit("inject", inline, next, false));
+                take_next(&mut adv);
             }
             other => {
-                eprintln!("未知参数：{other}");
+                eprintln!("未知参数：--{other}");
                 std::process::exit(2);
             }
         }
-        i += 1;
+        i += adv;
     }
     a
 }
@@ -320,14 +385,25 @@ fn session_lock_or_exit(identity_dir: &Option<PathBuf>, verb: &str) -> Option<ho
             eprintln!("   先停掉在跑的会话；或 --identity-dir 指别的目录；或确知无害时 --no-session-lock。");
             std::process::exit(1);
         }
-        Err(e) => {
-            eprintln!("会话锁失败（继续，不阻塞）：{e}");
-            None
+        // Q-H F9：**IO 失败 fail-fast**（只读/异常 identity 目录下锁拿不到 =
+        // 「同 identity 不并发」防线静默消失——Rust 独有防线的静默降级正是本批
+        // 禁的形态；Go 无对应物）。`--no-session-lock` 仍是显式逃生口。
+        Err(homeway_core::session_lock::LockError::Io(io)) => {
+            eprintln!("identity 会话锁不可用（{verb}）：{io}");
+            eprintln!("   拿不到锁 = 防「同 identity 并发会话互踢 keypair」的防线缺失——拒绝继续（不静默降级）。");
+            eprintln!("   把 --identity-dir 指到可写目录，或确知无害时 --no-session-lock。");
+            std::process::exit(1);
         }
     }
 }
 
 fn cmd_connect(args: &[String]) {
+    // Q-H F8/CA13：`--help`/`-h` 短路（用法 + exit 0；任意位置）。
+    if wants_help(args) {
+        eprintln!("用法：homeway-cli connect --token <hmw1…> [--identity-dir D] [--endpoint-cache-dir D] [--speedtest] [--dial <ip:port>]");
+        eprintln!("       [--hold S] [--probe N] [--status-json] [--recover-from 1|2|3 [--recover-cause S] [--recover-delay S]] [--inject poison-socket|relay-lock] [--dead-direct] [--no-session-lock]");
+        std::process::exit(0);
+    }
     let a = parse_connect(args);
     let Some(tok) = a.tok.clone() else {
         eprintln!("用法：homeway-cli connect --token <hmw1…> […]");
@@ -531,7 +607,9 @@ fn transit_dial(session: &Session, dst: SocketAddrV4) -> Result<usize, ConnErr> 
 /// 会话内 N 轮）；无 `--token` = 守护托管形态（D-1：`homeway speedtest` 的 Go 对齐
 /// 面——runner 状态机 + 全主机轮转 + 双口径输出）。
 fn cmd_speedtest_dispatch(args: &[String]) {
-    if args.iter().any(|a| a == "--token") {
+    // 等号形也算直连形态（Q-H 代码门 M4：只认空格形会让 `--token=hmw1…` 落守护托管 →
+    // 「未知参数」exit 2）。
+    if args.iter().any(|a| a == "--token" || a.starts_with("--token=")) {
         cmd_speedtest(args);
     } else {
         carriers_cli::cmd_speedtest_hosted(args);
@@ -542,6 +620,12 @@ fn cmd_speedtest_dispatch(args: &[String]) {
 ///  [--rounds N] [--hold]`——建一次会话跑 N 轮（每轮自带 2s warmup，与 Go daemon
 /// `speedtest --state -host` 常驻同会话口径一致）。`--hold` = 跑完保持会话（RSS 采样）。
 fn cmd_speedtest(args: &[String]) {
+    // Q-H F8/CA13：`--help`/`-h` 短路（用法 + exit 0；守护托管形态的 help 在 carriers_cli）。
+    if wants_help(args) {
+        eprintln!("用法：homeway-cli speedtest --token <hmw1…> [--identity-dir D] [--endpoint-cache-dir D] [--rounds N] [--hold] [--dead-direct] [--no-session-lock]");
+        eprintln!("  无 --token = 守护托管形态（homeway-cli speedtest [--host <ref>] [--json] …）。");
+        std::process::exit(0);
+    }
     let mut tok: Option<String> = None;
     let mut identity_dir: Option<PathBuf> = None;
     let mut cache_dir: Option<PathBuf> = None;
@@ -551,17 +635,39 @@ fn cmd_speedtest(args: &[String]) {
     let mut no_session_lock = false;
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "--token" => { i += 1; tok = args.get(i).cloned(); }
-            "--identity-dir" => { i += 1; identity_dir = args.get(i).map(PathBuf::from); }
-            "--endpoint-cache-dir" => { i += 1; cache_dir = args.get(i).map(PathBuf::from); }
-            "--rounds" => { i += 1; rounds = args.get(i).and_then(|s| s.parse().ok()).unwrap_or(3); }
-            "--hold" => hold = true,
-            "--dead-direct" => dead_direct = true,
-            "--no-session-lock" => no_session_lock = true,
-            other => { eprintln!("未知参数：{other}"); std::process::exit(2); }
+        let raw = args[i].as_str();
+        let Some((name, inline)) = cli_flags::split_flag(raw) else {
+            eprintln!("未知参数：{raw}");
+            std::process::exit(2);
+        };
+        let next = args.get(i + 1).map(String::as_str);
+        let mut adv = 1usize;
+        match name {
+            "token" => {
+                tok = Some(cli_flags::take_value_or_exit("token", inline, next, false));
+                if inline.is_none() { adv = 2; }
+            }
+            "identity-dir" => {
+                identity_dir = Some(PathBuf::from(cli_flags::take_value_or_exit("identity-dir", inline, next, false)));
+                if inline.is_none() { adv = 2; }
+            }
+            "endpoint-cache-dir" => {
+                cache_dir = Some(PathBuf::from(cli_flags::take_value_or_exit("endpoint-cache-dir", inline, next, false)));
+                if inline.is_none() { adv = 2; }
+            }
+            "rounds" => {
+                // Q-H F7a：非法/缺值 fail-fast（此前静默回落 3 轮）。
+                rounds = cli_flags::take_num_or_exit::<u32>("rounds", inline, next, "轮数，如 3");
+                if inline.is_none() { adv = 2; }
+            }
+            "hold" => hold = cli_flags::take_bool_or_exit("hold", inline, true),
+            "dead-direct" => dead_direct = cli_flags::take_bool_or_exit("dead-direct", inline, true),
+            "no-session-lock" => {
+                no_session_lock = cli_flags::take_bool_or_exit("no-session-lock", inline, true)
+            }
+            other => { eprintln!("未知参数：--{other}"); std::process::exit(2); }
         }
-        i += 1;
+        i += adv;
     }
     let Some(tok) = tok else {
         eprintln!("用法：homeway-cli speedtest --token <hmw1…> [--identity-dir D] [--endpoint-cache-dir D] [--rounds N] [--hold]");
@@ -628,6 +734,12 @@ fn cmd_speedtest(args: &[String]) {
 // ---------- files 动词（每命令一条流；拨号走 healing） ----------
 
 fn cmd_files(args: &[String]) {
+    // Q-H F8/CA13：`--help`/`-h` 短路（用法 + exit 0；任意位置）。
+    if wants_help(args) {
+        eprintln!("用法：homeway-cli files <list|stat|mkdir|read|get|put|download|upload> --token <hmw1…> […] <路径> [<本地>]");
+        eprintln!("  远程形态：homeway-cli files <verb> --host <ref> [--state D] [--timeout T] <远端路径> [<本地路径>]");
+        std::process::exit(0);
+    }
     // files <verb> --token <hmw1> [--identity-dir D] [--dead-direct] [--inject no-hint]
     //   [--rate-limit <bytes/s>] <path> [<local>]（--rate-limit 缺省 2MiB/s 发送端速率
     //   义务；0 = 不限、风险自担——对齐 Go files-cli 1.4）
@@ -647,64 +759,69 @@ fn cmd_files(args: &[String]) {
     let mut rest: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "--token" => {
-                i += 1;
-                tok = args.get(i).cloned();
+        let raw = args[i].as_str();
+        let Some((name, inline)) = cli_flags::split_flag(raw) else {
+            rest.push(raw.to_owned());
+            i += 1;
+            continue;
+        };
+        let next = args.get(i + 1).map(String::as_str);
+        let mut adv = 1usize;
+        match name {
+            "token" => {
+                tok = Some(cli_flags::take_value_or_exit("token", inline, next, false));
+                if inline.is_none() { adv = 2; }
             }
-            "--identity-dir" => {
-                i += 1;
-                identity_dir = args.get(i).map(PathBuf::from);
+            "identity-dir" => {
+                identity_dir = Some(PathBuf::from(cli_flags::take_value_or_exit(
+                    "identity-dir", inline, next, false)));
+                if inline.is_none() { adv = 2; }
             }
-            "--dead-direct" => dead_direct = true,
-            "--inject" => {
-                i += 1;
-                inject_what = args.get(i).cloned();
+            "dead-direct" => dead_direct = cli_flags::take_bool_or_exit("dead-direct", inline, true),
+            "inject" => {
+                inject_what = Some(cli_flags::take_value_or_exit("inject", inline, next, false));
+                if inline.is_none() { adv = 2; }
             }
-            "--no-session-lock" => no_session_lock = true,
-            "--host" => {
-                i += 1;
-                host_ref = args.get(i).cloned();
-                if host_ref.is_none() {
-                    eprintln!("--host 需要值（<name|id>——homeway-cli host list 查看在表主机）");
-                    std::process::exit(2);
-                }
+            "no-session-lock" => {
+                no_session_lock = cli_flags::take_bool_or_exit("no-session-lock", inline, true)
             }
-            "--state" => {
-                i += 1;
-                host_state = args.get(i).map(PathBuf::from);
-                if host_state.is_none() {
-                    eprintln!("--state 需要目录参数（统一 state 根〔control.sock 所在〕）");
-                    std::process::exit(2);
-                }
+            "host" => {
+                host_ref = Some(cli_flags::take_value_or_exit("host", inline, next, false));
+                if inline.is_none() { adv = 2; }
             }
-            "--timeout" => {
-                i += 1;
-                host_timeout = args.get(i).and_then(|v| term_cli::parse_duration(v));
+            "state" => {
+                host_state = Some(cli_flags::take_state_or_exit("state", inline, next));
+                if inline.is_none() { adv = 2; }
+            }
+            "timeout" => {
+                let v = cli_flags::take_value_or_exit("timeout", inline, next, false);
+                if inline.is_none() { adv = 2; }
+                host_timeout = term_cli::parse_duration(&v);
                 if host_timeout.is_none() {
-                    eprintln!("--timeout 需要时长（如 10s / 1500ms）");
+                    eprintln!("--timeout {v:?} 不是时长（如 10s / 1500ms）");
                     std::process::exit(2);
                 }
             }
-            "--no-spawn" => no_spawn = true,
-            "--rate-limit" => {
-                i += 1;
-                let v = args.get(i).and_then(|v| v.parse::<i64>().ok());
-                match v {
-                    Some(n) if n >= 0 => rate_limit = Some(n),
-                    Some(_) => {
+            "no-spawn" => no_spawn = cli_flags::take_bool_or_exit("no-spawn", inline, true),
+            "rate-limit" => {
+                let v = cli_flags::take_value_or_exit("rate-limit", inline, next, false);
+                if inline.is_none() { adv = 2; }
+                match v.parse::<i64>() {
+                    Ok(n) if n >= 0 => rate_limit = Some(n),
+                    Ok(_) => {
                         eprintln!("--rate-limit 不接受负值（Go 同款拒绝）——0 = 不限、正数 = bytes/s");
                         std::process::exit(2);
                     }
-                    None => {
+                    Err(_) => {
                         eprintln!("--rate-limit 需要非负整数 bytes/s（如 250000；0 = 不限）");
                         std::process::exit(2);
                     }
                 }
             }
-            other => rest.push(other.to_owned()),
+            // 动词级 flag（如 `-o`）与位置参数留在 rest 交二段解析。
+            _ => rest.push(raw.to_owned()),
         }
-        i += 1;
+        i += adv;
     }
     if tok.is_none() && host_ref.is_none() {
         eprintln!("用法：homeway-cli files <list|stat|mkdir|read|get|put|download|upload> --token <hmw1> [--identity-dir D] [--rate-limit B/s（缺省 2MiB/s；0 不限）] <远端路径> [<本地路径>]");
@@ -730,15 +847,21 @@ fn cmd_files(args: &[String]) {
                     "-o" => {
                         i += 1;
                         match rest.get(i) {
-                            Some(v) => o_local = Some(v.clone()),
-                            None => {
-                                eprintln!("-o 需要本地路径（get <远端> [-o 本地] [--force] [--quiet]）");
+                            Some(v) if !v.starts_with('-') => o_local = Some(v.clone()),
+                            _ => {
+                                eprintln!("-o 需要本地路径（get <远端> [-o 本地] [--force] [--quiet]；下一个是 flag/已到末尾）");
                                 std::process::exit(2);
                             }
                         }
                     }
-                    "--force" => force = true,
-                    "--quiet" => {} // 接受（Rust 进度本就走 stderr）
+                    _ if a == "--force" || a.starts_with("--force=") => {
+                        let inline = cli_flags::split_flag(a).and_then(|(_, v)| v);
+                        force = cli_flags::take_bool_or_exit("force", inline, true);
+                    }
+                    _ if a == "--quiet" || a.starts_with("--quiet=") => {
+                        let inline = cli_flags::split_flag(a).and_then(|(_, v)| v);
+                        let _ = cli_flags::take_bool_or_exit("quiet", inline, true);
+                    }
                     other if other.starts_with('-') => {
                         eprintln!("未知参数：{other}（get 认 -o <本地>、--force、--quiet）");
                         std::process::exit(2);
@@ -785,7 +908,10 @@ fn cmd_files(args: &[String]) {
             while i < rest.len() {
                 let a = rest[i].as_str();
                 match a {
-                    "--quiet" => {} // 接受（--rate-limit 由通用预解析收走，动词前后都行）
+                    _ if a == "--quiet" || a.starts_with("--quiet=") => {
+                        let inline = cli_flags::split_flag(a).and_then(|(_, v)| v);
+                        let _ = cli_flags::take_bool_or_exit("quiet", inline, true);
+                    }
                     other if other.starts_with('-') => {
                         eprintln!("未知参数：{other}（put 认 --rate-limit <bytes/s>、--quiet）");
                         std::process::exit(2);
@@ -1107,6 +1233,11 @@ fn files_stream_open_err_text(e: &homeway_core::daemon::proto::OpError) -> Strin
 ///   udp53：隧道 IP:53 UDP（手机声明的 DNS——栈内 listener 面，q 计数）
 ///   leg：8.8.8.8:53 UDP（非隧道 IP 的 :53——拦截层进程内腿 + E12 dns 会话行）
 fn cmd_dnstest(args: &[String]) {
+    // Q-H F8/CA13：`--help`/`-h` 短路（用法 + exit 0；任意位置）。
+    if wants_help(args) {
+        eprintln!("用法：homeway-cli dnstest --token <hmw1…> [--identity-dir D] [--mode tcp5300|udp53|leg] <域名>");
+        std::process::exit(0);
+    }
     let mut tok: Option<String> = None;
     let mut identity_dir: Option<PathBuf> = None;
     let mut mode = "tcp5300".to_owned();
@@ -1114,27 +1245,36 @@ fn cmd_dnstest(args: &[String]) {
     let mut no_session_lock = false;
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "--token" => {
-                i += 1;
-                tok = args.get(i).cloned();
+        let raw = args[i].as_str();
+        let Some((fname, inline)) = cli_flags::split_flag(raw) else {
+            name = raw.to_owned();
+            i += 1;
+            continue;
+        };
+        let next = args.get(i + 1).map(String::as_str);
+        let mut adv = 1usize;
+        match fname {
+            "token" => {
+                tok = Some(cli_flags::take_value_or_exit("token", inline, next, false));
+                if inline.is_none() { adv = 2; }
             }
-            "--identity-dir" => {
-                i += 1;
-                identity_dir = args.get(i).map(PathBuf::from);
+            "identity-dir" => {
+                identity_dir = Some(PathBuf::from(cli_flags::take_value_or_exit("identity-dir", inline, next, false)));
+                if inline.is_none() { adv = 2; }
             }
-            "--mode" => {
-                i += 1;
-                mode = args.get(i).cloned().unwrap_or_else(|| "tcp5300".into());
+            "mode" => {
+                mode = cli_flags::take_value_or_exit("mode", inline, next, false);
+                if inline.is_none() { adv = 2; }
             }
-            "--no-session-lock" => no_session_lock = true,
-            other if !other.starts_with('-') => name = other.to_owned(),
+            "no-session-lock" => {
+                no_session_lock = cli_flags::take_bool_or_exit("no-session-lock", inline, true)
+            }
             other => {
-                eprintln!("未知参数：{other}");
+                eprintln!("未知参数：--{other}");
                 std::process::exit(2);
             }
         }
-        i += 1;
+        i += adv;
     }
     let Some(tok) = tok else {
         eprintln!("用法：homeway-cli dnstest --token <hmw1…> [--mode tcp5300|udp53|leg] <域名>");
@@ -1295,25 +1435,40 @@ fn unsafe_client(c: &homeway_core::wgcore::Client) -> &'static homeway_core::wgc
 // ---------- portfwd（本地 127.0.0.1 监听 → 经隧道拨目标；CLI 测试动词） ----------
 
 fn cmd_portfwd(args: &[String]) {
+    // Q-H F8/CA13：`--help`/`-h` 短路（用法 + exit 0；任意位置）。
+    if wants_help(args) {
+        eprintln!("用法：homeway-cli portfwd --token <hmw1…> --map 15432:5432 [--map 15433:1.2.3.4:5432] [--identity-dir D] [--no-session-lock]");
+        std::process::exit(0);
+    }
     let mut tok: Option<String> = None;
     let mut identity_dir: Option<PathBuf> = None;
     let mut maps: Vec<(u16, Option<SocketAddrV4>)> = Vec::new();
     let mut no_session_lock = false;
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "--token" => {
-                i += 1;
-                tok = args.get(i).cloned();
+        let raw = args[i].as_str();
+        let Some((name, inline)) = cli_flags::split_flag(raw) else {
+            eprintln!("未知参数：{raw}");
+            std::process::exit(2);
+        };
+        let next = args.get(i + 1).map(String::as_str);
+        let mut adv = 1usize;
+        match name {
+            "token" => {
+                tok = Some(cli_flags::take_value_or_exit("token", inline, next, false));
+                if inline.is_none() { adv = 2; }
             }
-            "--identity-dir" => {
-                i += 1;
-                identity_dir = args.get(i).map(PathBuf::from);
+            "identity-dir" => {
+                identity_dir = Some(PathBuf::from(cli_flags::take_value_or_exit(
+                    "identity-dir", inline, next, false)));
+                if inline.is_none() { adv = 2; }
             }
-            "--no-session-lock" => no_session_lock = true,
-            "--map" => {
-                i += 1;
-                let spec = args.get(i).cloned().unwrap_or_default();
+            "no-session-lock" => {
+                no_session_lock = cli_flags::take_bool_or_exit("no-session-lock", inline, true)
+            }
+            "map" => {
+                let spec = cli_flags::take_value_or_exit("map", inline, next, false);
+                if inline.is_none() { adv = 2; }
                 let parts: Vec<&str> = spec.split(':').collect();
                 let parsed = match parts.as_slice() {
                     [l, tport] => (
@@ -1338,11 +1493,11 @@ fn cmd_portfwd(args: &[String]) {
                 }
             }
             other => {
-                eprintln!("未知参数：{other}");
+                eprintln!("未知参数：--{other}");
                 std::process::exit(2);
             }
         }
-        i += 1;
+        i += adv;
     }
     let Some(tok) = tok else {
         eprintln!("用法：homeway-cli portfwd --token <hmw1> --map 15432:5432 [--map 15433:1.2.3.4:5432]");

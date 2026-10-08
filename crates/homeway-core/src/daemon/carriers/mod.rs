@@ -143,9 +143,10 @@ impl Carriers {
     }
 
     /// 建转发规则（全局端口检查 + 委托 ForwardManager::add——当场监听失败 = 错误
-    /// 返回、不入表）。
-    pub fn add_forward(&self, rule: ForwardRule) -> Result<(), CarrierErr> {
+    /// 返回、不入表）。Q-H F11：host 入口 canonical 化（大小写等价）。
+    pub fn add_forward(&self, mut rule: ForwardRule) -> Result<(), CarrierErr> {
         let _g = self.add_mu.lock().unwrap_or_else(|e| e.into_inner());
+        rule.host = canonical_host_hex(&rule.host);
         self.member_check(&rule.host)?;
         if let Some(owner) = self.fwd.port_owner(rule.listen) {
             return Err(CarrierErr::PortTaken { port: rule.listen, owner });
@@ -157,9 +158,9 @@ impl Carriers {
         self.fwd.add(rule)
     }
 
-    /// 删规则（不强关在世连接）。
+    /// 删规则（不强关在世连接）。Q-H F11：host 入口 canonical 化。
     pub fn remove_forward(&self, host: &str, listen: u16) -> Result<(), CarrierErr> {
-        self.fwd.remove(host, listen)
+        self.fwd.remove(&canonical_host_hex(host), listen)
     }
 
     /// 规则表快照（host 空 = 全部；按 host/listen 稳定排序）。
@@ -168,26 +169,28 @@ impl Carriers {
     }
 
     /// 开 SOCKS 监听（listen 0 = 沿用记忆/缺省 1080）；全局端口检查后委托。
-    /// 返回实际端口。
+    /// 返回实际端口。Q-H F11：host 入口 canonical 化。
     pub fn socks_on(&self, host: &str, listen: u16) -> Result<u16, CarrierErr> {
         let _g = self.add_mu.lock().unwrap_or_else(|e| e.into_inner());
-        self.member_check(host)?;
+        let host = canonical_host_hex(host);
+        self.member_check(&host)?;
         // socks×socks 的跨主机冲突（含记忆端口、文案含另选提示）由 SocksManager::on
         // 自带；这里只补 forward 侧的占用检查——按**解析后的端口**判（exec-r1 B1：
         // 此前 listen==0 时整个跳过，靠 On 恒落 1080 的〔错误〕假设兜着）。
-        let port = if listen == 0 { self.sks.default_listen(host) } else { listen };
+        let port = if listen == 0 { self.sks.default_listen(&host) } else { listen };
         if port != 0 {
             if let Some(owner) = self.fwd.port_owner(port) {
                 return Err(CarrierErr::PortTaken { port, owner });
             }
         }
         let _ = &self.fwd;
-        self.sks.on(host, listen)
+        self.sks.on(&host, listen)
     }
 
     /// 关监听（显式关在世连接；端口记忆保留）。返回记忆端口（CLI 文案数据源）。
+    /// Q-H F11：host 入口 canonical 化。
     pub fn socks_off(&self, host: &str) -> Result<u16, CarrierErr> {
-        self.sks.off(host)
+        self.sks.off(&canonical_host_hex(host))
     }
 
     /// socks 承载态快照（按 host 排序稳定输出）。
@@ -195,17 +198,18 @@ impl Carriers {
         self.sks.status()
     }
 
-    /// speedtest 三面（per-host 单飞 + runner 状态机承载等待）。
+    /// speedtest 三面（per-host 单飞 + runner 状态机承载等待）。Q-H F11：host
+    /// 入口 canonical 化（大小写等价；未知主机仍走各自 NoHost/无记录语义）。
     pub fn speedtest_start(&self, host: &str, p: SpeedtestParams) -> speedrun::SpeedtestAck {
-        self.spd.start(host, p)
+        self.spd.start(&canonical_host_hex(host), p)
     }
 
     pub fn speedtest_status(&self, host: &str) -> Option<SpeedtestStatus> {
-        self.spd.status(host)
+        self.spd.status(&canonical_host_hex(host))
     }
 
     pub fn speedtest_cancel(&self, host: &str) {
-        self.spd.cancel(host)
+        self.spd.cancel(&canonical_host_hex(host))
     }
 
     /// host.remove 级联（**调用方须已持 add_mu**——cascade_lock）：forward 规则
@@ -259,11 +263,28 @@ pub(super) fn describe_listen_err(port: u16, e: &std::io::Error) -> String {
 }
 
 /// peerID hex 的短形态（日志/错误文案用；Go shortHost 同串）。
+///
+/// **Q-H F6 口径**：Go `shortHost`（`baseline:clientcore/facade/forward.go:410-415`）
+/// 是**字节**截断——对**非法输入**（非 ASCII）会产出非法 UTF-8 前缀；Rust 改字符
+/// 截断后对非法输入返回整串。**「与 Go 同串」只对合法 hex（ASCII）成立**（逐字节
+/// 不变）；非法输入面 Rust 取「不 panic + 整串」的自定义语义（消除外部可触发的
+/// dispatcher panic 面）。
 pub(super) fn short_host(host: &str) -> String {
-    if host.len() > 8 {
-        format!("{}…", &host[..8])
+    if host.chars().count() > 8 {
+        format!("{}…", host.chars().take(8).collect::<String>())
     } else {
         host.to_owned()
+    }
+}
+
+/// host 串 canonical 化（Q-H F11）：hex 解码成功 ⇒ 小写 canonical；失败 ⇒ 原样。
+/// 承载面入口统一经此归一（**只规范化，不改错误分类**——add/on 的 NoHost 与
+/// remove/off 的 NoRule 语义不变），保证「大写 hex 能过成员检查却存成大写入表」
+/// 的级联漏删不再发生（`daemon/mod.rs` 的 remove_host 级联按小写查）。
+fn canonical_host_hex(host: &str) -> String {
+    match super::hosts::decode_peer_id_pub(host) {
+        Some(id) => id.iter().map(|b| format!("{b:02x}")).collect(),
+        None => host.to_owned(),
     }
 }
 
@@ -390,6 +411,10 @@ pub(super) struct PollListener {
     /// accept 瞬态错误的有界线性退避（Go serveAcceptRetry*：一次瞬态错误即退 =
     /// 无人受理的僵尸监听；烧尽 = 上抛按监听失效收口）。
     backoff: u32,
+    /// 【测试注入缝】下一次 accept 直返 Failed（不碰真 fd——见 socks_srv
+    /// `inject_accept_failure`）。
+    #[cfg(test)]
+    fail_next: Option<String>,
 }
 
 pub(super) const ACCEPT_RETRY_MAX: u32 = 8;
@@ -408,10 +433,25 @@ pub(super) enum PollAccept {
 impl PollListener {
     pub fn new(ln: std::net::TcpListener) -> PollListener {
         let _ = ln.set_nonblocking(true);
-        PollListener { ln: Some(ln), backoff: 0 }
+        PollListener {
+            ln: Some(ln),
+            backoff: 0,
+            #[cfg(test)]
+            fail_next: None,
+        }
+    }
+
+    /// 【测试注入缝】下一次 `accept()` 直返 `Failed(msg)`（Q-H F4）。
+    #[cfg(test)]
+    pub(super) fn inject_accept_failure(&mut self, msg: &str) {
+        self.fail_next = Some(msg.to_owned());
     }
 
     pub fn accept(&mut self) -> PollAccept {
+        #[cfg(test)]
+        if let Some(msg) = self.fail_next.take() {
+            return PollAccept::Failed(msg);
+        }
         let Some(ln) = self.ln.as_ref() else { return PollAccept::Closed };
         match ln.accept() {
             Ok((stream, _)) => {
@@ -457,3 +497,77 @@ impl PollListener {
     }
 }
 
+
+#[cfg(test)]
+mod tests {
+    use super::testutil::{temp_dir, FakeDial};
+    use super::*;
+
+    #[test]
+    fn short_host_char_safe() {
+        // ASCII 两档（与 Go 逐字节同串）。
+        assert_eq!(short_host("abc"), "abc");
+        assert_eq!(short_host("12345678"), "12345678");
+        assert_eq!(short_host("123456789"), "12345678…");
+        assert_eq!(short_host("abcdef0123456789"), "abcdef01…");
+        // 多字节：字节切片旧形态必 panic；字符截断 = 不 panic（≤8 字符原样）。
+        assert_eq!(short_host("中文中文中文"), "中文中文中文"); // 6 字符 / 18 字节
+        assert_eq!(short_host("字字字字"), "字字字字"); // 恰在字节 8 边界断裂的 3 字节字符
+        assert_eq!(short_host("😀😀"), "😀😀"); // 4 字节 emoji
+        assert_eq!(short_host("字字字字字字字字字"), "字字字字字字字字…");
+        assert_eq!(short_host("😀😀😀😀😀😀😀😀😀"), "😀😀😀😀😀😀😀😀…");
+    }
+
+    fn hex_host(tag: u8) -> String {
+        format!("{tag:0>64x}")
+    }
+
+    fn nop() -> Arc<dyn Fn(&str) + Send + Sync> {
+        Arc::new(|_| {})
+    }
+
+    /// Q-H F11：大写 hex 全链（add/delete/on/off 命中 + remove_host 级联删净）——
+    /// 入表 host 必须 canonical 小写（`remove_host` 级联按小写查）。
+    #[test]
+    fn uppercase_host_canonicalized_full_chain() {
+        let dir = temp_dir("carr-canon");
+        let dial = FakeDial::new();
+        let id = hex_host(7);
+        let exists: HostExists = Arc::new(|_x: &[u8; 32]| true);
+        let c = Carriers::open(&dir, dial.carrier_dial(), nop(), nop(), exists).unwrap();
+        let upper = id.to_uppercase();
+        // forward：大写 add → 表内小写 → 大写 delete 命中。
+        c.add_forward(ForwardRule {
+            host: upper.clone(),
+            listen: 20911,
+            target_ip: String::new(),
+            target_port: 0,
+        })
+        .unwrap();
+        let list = c.forward_states("");
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].rule.host, id, "入表 host 必须 canonical 小写");
+        c.remove_forward(&upper, 20911).expect("大写 delete 必须命中");
+        assert!(c.forward_states("").is_empty());
+        // socks：大写 on/off 命中；级联删净（本测试的条目均经 canonical 入口写入；
+        // **盘上遗留的旧大写条目不在本批迁移范围**——见 QH.md §5.2 残余）。
+        assert_eq!(c.socks_on(&upper, 20912).unwrap(), 20912);
+        assert_eq!(c.socks_states()[0].host, id);
+        c.socks_off(&upper).expect("大写 off 必须命中");
+        c.socks_on(&upper, 20913).unwrap();
+        {
+            let _g = c.cascade_lock();
+            c.remove_host_cascade_locked(&id);
+        }
+        assert!(c.socks_states().is_empty(), "级联必须删净 socks 条目");
+        assert!(c.forward_states("").is_empty(), "级联必须删净 forward 规则");
+        // 表外/坏 hex：错误分类不变（add/on = NoHost；remove/off = NoRule）。
+        assert!(matches!(
+            c.add_forward(ForwardRule { host: "ZZ".into(), listen: 20914, target_ip: String::new(), target_port: 0 }),
+            Err(CarrierErr::NoHost)
+        ));
+        assert!(matches!(c.socks_on("ZZ", 0), Err(CarrierErr::NoHost)));
+        drop(c);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+}

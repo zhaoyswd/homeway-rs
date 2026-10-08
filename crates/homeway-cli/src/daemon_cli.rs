@@ -15,6 +15,7 @@ use homeway_core::daemon::client::ControlClient;
 use homeway_core::daemon::proto::OpError;
 use homeway_core::daemon::vocab;
 
+use crate::cli_flags;
 use crate::unified_cli::default_state_dir;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
@@ -145,6 +146,15 @@ fn detect_launchd_agent() -> Option<String> {
     None
 }
 
+/// 是否应在「未运行」时等 launchd KeepAlive 重拉（Q-H F14）：**仅默认 state**。
+///
+/// 依据：临时/自定义 state 的探测会命中**别的**部署形态的 launchd 代理（KeepAlive
+/// 触发会把那份部署拉起）——非默认 state 直接自拉起（plist 级精确匹配〔多实例/
+/// 多 label/自定义 state 的 launchd 形态〕留 Q-J，登记见 `AUDIT` Q-J 节）。
+pub(crate) fn launchd_relaunch_relevant(state: &std::path::Path) -> bool {
+    state == default_state_dir()
+}
+
 /// 拉起子进程 stdio 落点（`<state>/cache/spawn.log`，追加 + 0600）。
 fn spawn_log_path(state_dir: &std::path::Path) -> std::path::PathBuf {
     state_dir.join("cache/spawn.log")
@@ -256,16 +266,24 @@ pub fn dial_control_spawn(
                     state_dir.display()
                 ));
             }
-            // launchd 托管形态：先短轮询等 KeepAlive 重拉（CLI 自 exec 出的进程
-            // 不归 launchd 管，KeepAlive 会反复重拉自己的实例撞锁）。
-            if let Some(label) = detect_launchd_agent() {
-                eprintln!("守护进程未运行（launchd 代理 {label} 在册）——等 KeepAlive 重拉…");
-                if wait_control_ready(state_dir, SPAWN_KEEPALIVE_WAIT) {
-                    if let Ok((c, _)) = ControlClient::dial(&sock, "cli", name) {
-                        return Ok(c);
+            // launchd 托管形态（Q-H F14）：**只在默认 state** 下先短轮询等 KeepAlive
+            // 重拉（CLI 自 exec 出的进程不归 launchd 管，KeepAlive 会反复重拉自己的
+            // 实例撞锁）；非默认 state = 不等（防临时 state 触发别的部署的 KeepAlive）。
+            if launchd_relaunch_relevant(state_dir) {
+                if let Some(label) = detect_launchd_agent() {
+                    eprintln!("守护进程未运行（launchd 代理 {label} 在册）——等 KeepAlive 重拉…");
+                    if wait_control_ready(state_dir, SPAWN_KEEPALIVE_WAIT) {
+                        if let Ok((c, _)) = ControlClient::dial(&sock, "cli", name) {
+                            return Ok(c);
+                        }
                     }
+                    eprintln!("KeepAlive {}s 内未重拉——改为自行拉起", SPAWN_KEEPALIVE_WAIT.as_secs());
                 }
-                eprintln!("KeepAlive {}s 内未重拉——改为自行拉起", SPAWN_KEEPALIVE_WAIT.as_secs());
+            } else {
+                eprintln!(
+                    "（state={} 非默认 state——不等 launchd KeepAlive，直接拉起）",
+                    state_dir.display()
+                );
             }
             let pid = start_spawned_process(state_dir)
                 .map_err(|e| format!("拉起统一进程失败：{e}"))?;
@@ -375,60 +393,77 @@ fn parse_args(usage: &str, args: &[String]) -> ParsedArgs {
     let mut i = 0;
     while i < args.len() {
         let a = args[i].as_str();
-        let (name, inline) = match a.strip_prefix("--").unwrap_or(a).split_once('=') {
-            Some((k, v)) => (k.to_owned(), Some(v.to_owned())),
-            None => (a.trim_start_matches('-').to_owned(), None),
+        let Some((name, inline)) = cli_flags::split_flag(a) else {
+            out.positional.push(a.to_owned());
+            i += 1;
+            continue;
         };
-        match name.as_str() {
+        let next = args.get(i + 1).map(String::as_str);
+        let mut adv = 1usize;
+        match name {
             "state" => {
-                if let Some(v) = inline {
-                    out.state = PathBuf::from(v);
-                } else {
-                    i += 1;
-                    let Some(v) = args.get(i) else {
-                        eprintln!("--state 需要目录参数");
-                        std::process::exit(2);
-                    };
-                    out.state = PathBuf::from(v.clone());
+                out.state = cli_flags::take_state_or_exit("state", inline, next);
+                if inline.is_none() {
+                    adv = 2;
                 }
             }
-            "json" => out.json = true,
-            "yes" => out.yes = true,
-            "stdin" => out.stdin = true,
-            "force" => out.force = true,
-            "no-spawn" => out.no_spawn = true,
+            "json" => out.json = cli_flags::take_bool_or_exit("json", inline, true),
+            "yes" => out.yes = cli_flags::take_bool_or_exit("yes", inline, true),
+            "stdin" => out.stdin = cli_flags::take_bool_or_exit("stdin", inline, true),
+            "force" => out.force = cli_flags::take_bool_or_exit("force", inline, true),
+            "no-spawn" => out.no_spawn = cli_flags::take_bool_or_exit("no-spawn", inline, true),
             "name" => {
-                i += 1;
-                let Some(v) = args.get(i) else {
-                    eprintln!("--name 需要值");
-                    std::process::exit(2);
-                };
-                out.name = Some(v.clone());
+                out.name = Some(cli_flags::take_value_or_exit("name", inline, next, false));
+                if inline.is_none() {
+                    adv = 2;
+                }
             }
-            "h" | "help" => {}
-            _other => {
+            "h" | "help" => {
+                // Q-H F8/CA13：`--help`/`-h` = 用法 + exit 0（此前静默吞掉、动作照跑
+                // ——`serve stop --help` 会真停出口）。
+                eprintln!("用法：{usage}");
+                std::process::exit(0);
+            }
+            other => {
                 if a.starts_with('-') {
                     eprintln!("未知参数：{a}（{usage}）");
                     std::process::exit(2);
                 }
-                out.positional.push(a.to_owned());
+                out.positional.push(other.to_owned());
             }
         }
-        i += 1;
+        i += adv;
     }
     out
 }
 
 /// 主机寻址（Go resolveHostTarget 同义：空串拒绝、名称/唯一前缀、歧义列候选、
-/// 全长 64 hex 直用——CLI-2 整改：`starts_with("")` 恒真曾可静默删第一台；
-/// term/files `--host` 与 host delete 同规则同文案——r2-17 收敛：单一定义）。
+/// 全长 64 hex 必须在表内——Q-H F10：CLI-2 整改的 `starts_with("")` 恒真曾可静默删
+/// 第一台；F10 起 64-hex 分支改「解码 → 小写 canonical → 与表内 id 比对」，
+/// 表外/大写未命中 = **就地报错**（Go `host_cli.go:419-427`：全长 64 hex 必须与
+/// 表内 ID 精确相等，否则 `主机 %s 不存在`）；term/files `--host` 与 host delete
+/// 共用同一份规则文案）。
 pub fn resolve_host(briefs: &serde_json::Value, want: &str) -> Result<String, String> {
     if want.is_empty() {
         return Err("寻址串为空（给 name、id 前缀或全长 id）".to_owned());
     }
     let hosts = briefs["hosts"].as_array().cloned().unwrap_or_default();
     if want.len() == 64 && want.bytes().all(|c| c.is_ascii_hexdigit()) {
-        return Ok(want.to_owned());
+        // canonical 小写（大小写等价；承载面 F11 同规则）——命中返回**表内** id。
+        let canon = homeway_core::daemon::hosts::decode_peer_id_pub(want).map(|id| {
+            id.iter().map(|b| format!("{b:02x}")).collect::<String>()
+        });
+        if let Some(c) = canon {
+            if let Some(b) = hosts.iter().find(|b| {
+                b["id"]
+                    .as_str()
+                    .map(|s| s.eq_ignore_ascii_case(&c))
+                    .unwrap_or(false)
+            }) {
+                return Ok(b["id"].as_str().unwrap_or(&c).to_owned());
+            }
+        }
+        return Err(format!("没有匹配 {want:?} 的主机（host list 看全表）"));
     }
     let mut hits: Vec<String> = hosts
         .iter()
@@ -474,6 +509,12 @@ pub fn cmd_host(args: &[String]) {
         "list" => host_list(&args[1..]),
         "status" => host_status(&args[1..]),
         "delete" => host_delete(&args[1..]),
+        // Q-H F8/CA13：裸名词 --help 短路（此前落「不认识的子命令」exit 2）。
+        "--help" | "-h" => {
+            eprintln!("用法：homeway-cli host <add|list|status|delete> …");
+            eprintln!("  add [--name N] [--force] <token> / list [--json] / status [name] / delete <name|id> [--yes]（均可 --state DIR --no-spawn）");
+            std::process::exit(0);
+        }
         other => {
             eprintln!("host 不认识的子命令 {other:?}（可用：add / list / status / delete）");
             std::process::exit(2);
@@ -677,13 +718,18 @@ fn host_delete(args: &[String]) {
 
 pub fn cmd_status(args: &[String]) {
     // --watch 只属 status（评审 r2-14：进共享 flag 表会让 host list --watch 被静默
-    // 吞——先本地剥再走共享解析）。
-    let watch = args.iter().any(|a| a == "--watch" || a == "--watch=true");
-    let rest: Vec<String> = args
-        .iter()
-        .filter(|a| **a != "--watch" && !a.starts_with("--watch="))
-        .cloned()
-        .collect();
+    // 吞——先本地剥再走共享解析）。Q-H F7b：`--watch=false` 真生效（此前 =true 恒开）。
+    let mut watch = false;
+    let mut rest: Vec<String> = Vec::new();
+    for a in args {
+        if let Some((name, inline)) = cli_flags::split_flag(a) {
+            if name == "watch" {
+                watch = cli_flags::take_bool_or_exit("watch", inline, true);
+                continue;
+            }
+        }
+        rest.push(a.clone());
+    }
     let p = parse_args("status [--json] [--watch] [--state DIR]", &rest);
     let json = p.json;
     let state = p.state.clone();
@@ -755,6 +801,13 @@ pub fn cmd_serve_group(args: &[String]) {
         "restart" => vocab::OpName::ServeRestart,
         "status" => vocab::OpName::ServeStatus,
         "token" => vocab::OpName::ServeToken,
+        // Q-H F8/CA13：裸名词 --help 短路（此前落「不认识的动词」exit 2）。
+        "--help" | "-h" => {
+            eprintln!("用法：homeway-cli serve <start|stop|restart|status|token|relay|ddns> [--state DIR]");
+            eprintln!("  start/stop/restart = 角色期望态（写 config serve.enabled + 控制面启停）；status/token 纯读不拉起。");
+            eprintln!("  relay set <token>|clear / ddns add <域名>|delete <域名>|list（纯配置写，需 restart 生效）。");
+            std::process::exit(0);
+        }
         // 一次性直跑（纯文件操作——servegroup_cli.go「serve relay set/clear 与 ddns」
         // 同框：写完打「需 restart 生效」提示）。
         "relay" | "ddns" => {
@@ -776,8 +829,12 @@ pub fn cmd_serve_group(args: &[String]) {
     // 读 config；stop 未跑 = 直改 config 即达期望态；start/restart 才走拉起缝）。
     if op == vocab::OpName::ServeStatus {
         let Some(c) = try_dial_control_named(&state, "homeway-serve") else {
-            let enabled = crate::unified_cli::config_role_enabled(&state, "serve");
-            println!("serve：进程未运行（本命令纯读不拉起）；config serve.enabled={enabled}");
+            // Q-H F1：坏 config = 如实报读失败（Go `degradedServe` 的
+            // 「config 读取失败：<err>」同形；此前静默按默认 enabled=true 呈现）。
+            match crate::unified_cli::config_role_enabled(&state, "serve") {
+                Ok(enabled) => println!("serve：进程未运行（本命令纯读不拉起）；config serve.enabled={enabled}"),
+                Err(e) => println!("serve：进程未运行（本命令纯读不拉起）；config 读取失败：{e}"),
+            }
             return;
         };
         render_serve_status(&c);
@@ -875,6 +932,12 @@ pub fn cmd_relay_group(args: &[String]) {
         "restart" => vocab::OpName::RelayRestart,
         "status" => vocab::OpName::RelayStatus,
         "token" => vocab::OpName::RelayToken,
+        // Q-H F8/CA13：裸名词 --help 短路。
+        "--help" | "-h" => {
+            eprintln!("用法：homeway-cli relay <start|stop|restart|status|token> [--state DIR]");
+            eprintln!("  = 本机中继角色的控制面命令组（前台单中继 = `homeway-cli relay [flags]`）。");
+            std::process::exit(0);
+        }
         other => {
             eprintln!("relay 不认识的动词 {other:?}（可用：start / stop / restart / status / token）");
             std::process::exit(2);
@@ -889,8 +952,10 @@ pub fn cmd_relay_group(args: &[String]) {
     // 纯读/直改族不拉起（中-5——与 serve 组同款）。
     if op == vocab::OpName::RelayStatus {
         let Some(c) = try_dial_control_named(&state, "homeway-relay") else {
-            let enabled = crate::unified_cli::config_role_enabled(&state, "relay");
-            println!("relay：进程未运行（本命令纯读不拉起）；config relay.enabled={enabled}");
+            match crate::unified_cli::config_role_enabled(&state, "relay") {
+                Ok(enabled) => println!("relay：进程未运行（本命令纯读不拉起）；config relay.enabled={enabled}"),
+                Err(e) => println!("relay：进程未运行（本命令纯读不拉起）；config 读取失败：{e}"),
+            }
             return;
         };
         let v = c.request(op.as_str(), Some(serde_json::json!({})), TIMEOUT).unwrap_or_else(|e| exit_op_err(&e));
@@ -931,51 +996,44 @@ fn render_relay_status(v: &serde_json::Value) {
 
 // ---------- export / import / reset（状态工件面；P1-6） ----------
 
-/// 工件族三动词的参数归一（评审 r2-5：手写解析只认 `--state DIR`，`--state=DIR`
-/// 会落进位置参数——CLI-1 同款；统一在入口拆等号形态）。
-fn normalize_flag_eq(args: &[String]) -> Vec<String> {
-    let mut out = Vec::with_capacity(args.len());
-    for a in args {
-        if let Some(rest) = a.strip_prefix("--") {
-            if let Some((k, v)) = rest.split_once('=') {
-                if !k.is_empty() && !v.is_empty() {
-                    out.push(format!("--{k}"));
-                    out.push(v.to_owned());
-                    continue;
-                }
-            }
-        }
-        out.push(a.clone());
+/// 工件族三动词的 `--state` 取值（Q-H F2：`--state=DIR` 等号形与空格形等价、缺值/
+/// 空值/吞 flag = fail-fast；N2 修复：旧 `normalize_flag_eq` 对 `--state=` **空值**
+/// 不归一 ⇒ `homeway export --state=` 会把 `--state=` 当目标文件名）。
+fn export_import_state(
+    args: &[String],
+    i: &mut usize,
+) -> Option<std::path::PathBuf> {
+    let a = args[*i].as_str();
+    let (name, inline) = cli_flags::split_flag(a)?;
+    if name != "state" {
+        return None;
     }
-    out
+    let v = cli_flags::take_state_or_exit("state", inline, args.get(*i + 1).map(String::as_str));
+    if inline.is_none() {
+        *i += 1;
+    }
+    Some(v)
 }
 
 
 /// `homeway export [--state D] [dest.tar]`——一次性直跑（不连控制面；语义真源
 /// internal/daemon/artifact_cli.go）。默认名 homeway-export-<ts>.tar 于当前目录。
 pub fn cmd_export(args: &[String]) {
-    let args = &normalize_flag_eq(args);
     let mut state: Option<std::path::PathBuf> = None;
-    let mut dest = None;
+    let mut dest: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "--state" => {
-                i += 1;
-                state = args.get(i).map(std::path::PathBuf::from);
-                if state.is_none() {
-                    eprintln!("--state 后面缺参数");
-                    std::process::exit(2);
-                }
-            }
-            other => {
-                if dest.is_some() {
-                    eprintln!("export 至多一个位置参数（目标文件），got {other:?}");
-                    std::process::exit(2);
-                }
-                dest = Some(other.to_owned());
-            }
+        if let Some(v) = export_import_state(args, &mut i) {
+            state = Some(v);
+            i += 1;
+            continue;
         }
+        let other = args[i].as_str();
+        if dest.is_some() {
+            eprintln!("export 至多一个位置参数（目标文件），got {other:?}");
+            std::process::exit(2);
+        }
+        dest = Some(other.to_owned());
         i += 1;
     }
     let state_dir = state.unwrap_or_else(crate::unified_cli::default_state_dir);
@@ -990,28 +1048,21 @@ pub fn cmd_export(args: &[String]) {
 /// `homeway import <file> [--state D]`——布局校验 + 安全解包 + 落位序（目标进程
 /// 必须在停——锁试探拒绝）。
 pub fn cmd_import(args: &[String]) {
-    let args = &normalize_flag_eq(args);
     let mut state: Option<std::path::PathBuf> = None;
     let mut file: Option<String> = None;
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "--state" => {
-                i += 1;
-                state = args.get(i).map(std::path::PathBuf::from);
-                if state.is_none() {
-                    eprintln!("--state 后面缺参数");
-                    std::process::exit(2);
-                }
-            }
-            other => {
-                if file.is_some() {
-                    eprintln!("import 只接受一个位置参数（工件文件），got {other:?}");
-                    std::process::exit(2);
-                }
-                file = Some(other.to_owned());
-            }
+        if let Some(v) = export_import_state(args, &mut i) {
+            state = Some(v);
+            i += 1;
+            continue;
         }
+        let other = args[i].as_str();
+        if file.is_some() {
+            eprintln!("import 只接受一个位置参数（工件文件），got {other:?}");
+            std::process::exit(2);
+        }
+        file = Some(other.to_owned());
         i += 1;
     }
     let Some(file) = file else {
@@ -1028,7 +1079,6 @@ pub fn cmd_import(args: &[String]) {
 
 /// `homeway reset cache [--state D]`（两词动词；v1 唯一动词 = cache）。
 pub fn cmd_reset(args: &[String]) {
-    let args = &normalize_flag_eq(args);
     let Some(verb) = args.first() else {
         eprintln!("用法：homeway reset cache [--state D]（清可弃层 cache/；进程在跑拒绝）");
         eprintln!("homeway: reset 需要动词：cache");
@@ -1041,21 +1091,13 @@ pub fn cmd_reset(args: &[String]) {
     let mut state: Option<std::path::PathBuf> = None;
     let mut i = 1;
     while i < args.len() {
-        match args[i].as_str() {
-            "--state" => {
-                i += 1;
-                state = args.get(i).map(std::path::PathBuf::from);
-                if state.is_none() {
-                    eprintln!("--state 后面缺参数");
-                    std::process::exit(2);
-                }
-            }
-            other => {
-                eprintln!("reset cache 不接受位置参数（got {other:?}）");
-                std::process::exit(2);
-            }
+        if let Some(v) = export_import_state(args, &mut i) {
+            state = Some(v);
+            i += 1;
+            continue;
         }
-        i += 1;
+        eprintln!("reset cache 不接受位置参数（got {:?}）", args[i]);
+        std::process::exit(2);
     }
     let state_dir = state.unwrap_or_else(crate::unified_cli::default_state_dir);
     if let Err(e) = homeway_core::artifact::reset_cache(&state_dir) {
@@ -1481,20 +1523,10 @@ fn serve_ddns_list(args: &[String]) {
     }
 }
 
-/// CLI 侧 relay token 形态校验（与 config 校验同口径：rl1 前缀必须可解码，否则裸
-/// IP:port——Go ValidateRelayArg 同义）。
+/// CLI 侧 relay token 形态校验（Q-H F1 收敛：单一实现 = `serve_cli::validate_relay_arg`
+/// ——config 值域与 CLI 写前校验共用同一口径）。
 fn validate_relay_arg(tok: &str) -> Result<(), String> {
-    if tok.starts_with("rl1") {
-        return homeway_core::relay::rltoken::decode_relay_token(tok)
-            .map(|_| ())
-            .map_err(|e| format!("rl1 token 解码失败：{e}"));
-    }
-    if let Ok(ap) = tok.parse::<std::net::SocketAddr>() {
-        if ap.port() != 0 {
-            return Ok(());
-        }
-    }
-    Err(format!("relay 参数非法：{tok:?}（rl1… token 或 IP:port）"))
+    crate::serve_cli::validate_relay_arg(tok)
 }
 
 fn serve_relay_set(args: &[String]) {
@@ -1567,5 +1599,43 @@ fn mask_for_hint(tok: &str) -> String {
     } else {
         let head: String = tok.chars().take(12).collect();
         format!("{head}…")
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Q-H F14：只有**默认 state** 才等 launchd KeepAlive（非默认 = 直接自拉起，
+    /// 防临时 state 的探测触发别的部署的 KeepAlive）。
+    #[test]
+    fn launchd_relaunch_only_for_default_state() {
+        assert!(launchd_relaunch_relevant(&default_state_dir()));
+        assert!(!launchd_relaunch_relevant(std::path::Path::new("/tmp/hw-not-default")));
+    }
+
+    /// Q-H F10：resolve_host 全长 hex 四档（表内小写/表内大写/表外 hex/64 非 hex）
+    /// + 名称/前缀仍可用。
+    #[test]
+    fn resolve_host_full_hex_forms() {
+        let id_a = "ab".repeat(32);
+        let id_b = "11".repeat(32);
+        let briefs = serde_json::json!({"hosts": [
+            {"id": id_a, "name": "exit1"},
+            {"id": id_b, "name": "exit2"},
+        ]});
+        assert_eq!(resolve_host(&briefs, &id_a).unwrap(), id_a, "表内小写命中");
+        assert_eq!(
+            resolve_host(&briefs, &id_a.to_uppercase()).unwrap(),
+            id_a,
+            "表内大写 → canonical 小写返回表内 id"
+        );
+        let e = resolve_host(&briefs, &"cd".repeat(32)).unwrap_err();
+        assert!(e.contains("没有匹配"), "表外 hex 必须就地报错：{e}");
+        let e = resolve_host(&briefs, &"z".repeat(64)).unwrap_err();
+        assert!(e.contains("没有匹配"), "64 非 hex 同样无命中：{e}");
+        // 名称/唯一前缀路径不受影响。
+        assert_eq!(resolve_host(&briefs, "exit2").unwrap(), id_b);
+        assert_eq!(resolve_host(&briefs, "ab").unwrap(), id_a);
     }
 }

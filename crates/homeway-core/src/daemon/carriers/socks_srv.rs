@@ -102,6 +102,24 @@ impl SocksServer {
         self.dead.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
+    /// 落账「监听失效」（Q-H F4）：accept 瞬态错误烧尽 ⇒ 状态面按 off 呈现 +
+    /// err 如实可查（`socks on` 因此不再被幂等短路，可重建）。`close()` **不清**
+    /// 本姿态——off 后 `EntryRt` 换新对象自然归零（`socksmgr` 注释同义）。
+    fn mark_dead(&self, reason: &str) {
+        *self.dead.lock().unwrap_or_else(|e| e.into_inner()) = Some(reason.to_owned());
+    }
+
+    /// 【测试注入缝】下一次 `accept()` 直返 `Failed(msg)`（生产触发面 = `PollListener`
+    /// 的瞬态错误烧尽分支；本缝只覆盖 serve→mark_dead→消费面接线，不硬关真 fd——
+    /// 硬关会与 `PollListener::close()`/Drop 构成二次 close 同号风险，设计门 B7）。
+    #[cfg(test)]
+    pub(crate) fn inject_accept_failure(&self, msg: &str) {
+        let mut g = self.ln.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(pl) = g.as_mut() {
+            pl.inject_accept_failure(msg);
+        }
+    }
+
     pub(super) fn serve(self: &Arc<Self>) -> Result<(), String> {
         loop {
             if self.closed.load(Ordering::Acquire) {
@@ -148,7 +166,12 @@ impl SocksServer {
                 }
                 PollAccept::Idle => {} // 节拍在 PollListener::accept 的 WouldBlock 分支内（高-1）
                 PollAccept::Closed => return Ok(()),
-                PollAccept::Failed(err) => return Err(err),
+                PollAccept::Failed(err) => {
+                    // Q-H F4：先落账（dead）再上抛——状态面按 off + err 如实呈现；
+                    // 此前 `dead` 恒 None ⇒ accept 烧尽后 status 谎报 on、socks on 幂等短路。
+                    self.mark_dead(&err);
+                    return Err(err);
+                }
             }
         }
     }

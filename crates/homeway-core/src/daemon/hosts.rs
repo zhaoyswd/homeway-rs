@@ -425,7 +425,13 @@ impl HostTable {
             (e.rec.token.clone(), e.rec.id.clone())
         };
         let Some(tok) = token::decode(&token_raw).ok() else {
-            return; // 装载路径已校验 id；token 损坏按构造失败处理（登记在案）
+            // Q-H F12：token 解码失败不再静默 return（Rust 独有缺口——Go 无此分支）；
+            // 状态面仍如实记为 failed/session_not_built（不加重建环：构造期错误源
+            // 非瞬态，重建走 token 刷新/进程重启——Go `facade/table.go` 同形）。
+            (self.logf)(&format!(
+                "hosts: {host_log} 会话构造失败：台账 token 解码失败（重新 host add 刷 token 可修复）"
+            ));
+            return;
         };
         let logf = {
             let host = host_log.clone();
@@ -783,4 +789,31 @@ mod tests {
         };
         token::encode(&spec).unwrap()
     }
+/// Q-H F12（代码门 M5 补测）：坏 token 记录不再静默 return——补日志行 + 状态面
+/// `failed/session_not_built`（装载面可查、可行动）。
+#[test]
+fn bad_token_record_logs_and_reports_failed() {
+    use std::sync::Mutex;
+    let dir = tmp_dir("f12-badtoken");
+    let id = "ab".repeat(32);
+    let recs = serde_json::json!([{"id": id, "name": "bad", "token": "不是 token", "addedAt": 1}]);
+    std::fs::write(dir.join(HOSTS_FILE_NAME), serde_json::to_string_pretty(&recs).unwrap()).unwrap();
+    let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let l2 = Arc::clone(&logs);
+    let logf: Arc<dyn Fn(&str) + Send + Sync> =
+        Arc::new(move |s: &str| l2.lock().unwrap_or_else(|e| e.into_inner()).push(s.to_owned()));
+    let t = HostTable::open(&dir, &dir.join("identity"), &dir.join("eps"), logf, Arc::new(Bus::new()))
+        .unwrap();
+    let joined = logs.lock().unwrap_or_else(|e| e.into_inner()).join("\n");
+    assert!(
+        joined.contains("会话构造失败：台账 token 解码失败"),
+        "坏 token 必须记行（修前静默 return）：{joined}"
+    );
+    let st = t.states();
+    assert_eq!(st.len(), 1, "记录仍在表（不因构造失败丢登记）");
+    assert_eq!(st[0].state, "failed");
+    assert_eq!(st[0].reason.as_deref(), Some("session_not_built"));
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 }

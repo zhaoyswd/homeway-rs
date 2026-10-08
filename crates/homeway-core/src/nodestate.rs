@@ -257,9 +257,9 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# homeway 配置（L1 意图层，唯�
 #   [serve] enabled / listen(1-65535) / bind_interface(auto|none|网卡|IP) /
 #           upnp / stun / stun6 / relay(rl1… 或 IP:port) / max_peers /
 #           peer_ttl(时长串，"0s"=关) / dns_port(0=关；非 0 = 客户端解析腿端口，缺省 5300) /
-#           files_root(空=$HOME)
+#           files_root(空=$HOME) / public_endpoint(逗号分隔 ip:port；空=推断)
 #   [[serve.ddns]] domain = "裸域名"（可多条；出口只读解析，记录由外部 DDNS 维护）
-#   [serve.tx_shape] 发送整形（rate_mbps/burst_kib；缺省 = 产品默认 200MiB/s+256KiB，HOMEWAY_TX_SHAPING=off 整套关）
+#   [serve.tx_shape] 发送整形（rate_mbps/burst_kb；缺省 = 产品默认 200MiB/s+256KiB，HOMEWAY_TX_SHAPING=off 整套关）
 #   [relay] enabled / listen(":41741") / advertise(逗号分隔，空=自动探测)
 # 客户端角色无配置节（随进程常开）；host 表在 <state>/client/hosts.json（不进 config）。
 

@@ -278,6 +278,11 @@ impl Session {
         if candidates.is_empty() {
             return Err(SessionErr::NoCandidates);
         }
+        // C14 参照点探测目标（设计门 A3 + 代码门 M6：抽纯函数以钉住**站点接线**——
+        // Go `cands[0]` 同义项 = 首个已解析的 token 端点候选；不是 `static_cands[0]`
+        // 〔只装 IP 字面量〕，也不是 `merged_candidates()[0]`〔含学习缓存条目〕）。
+        // 借用早收：C14 站点不再借 candidates。
+        let probe_target = c14_probe_target(&candidates);
         #[allow(unused_variables)]
         let direct_cands: Vec<SocketAddr> =
             candidates.iter().filter(|c| !c.relay).map(|c| c.addr).collect();
@@ -412,7 +417,10 @@ impl Session {
             let parts: Vec<String> = merged
                 .iter()
                 .map(|c| {
-                    let known = shared.static_cands.iter().any(|s| s.addr == c.addr);
+                    // 代码门 M3：「在 token 候选里」= Go `DescribeCandidatesWithLearned(list, cands)`
+                    // 的 `cands`（token 序，IP 字面量 **+ 域名首解**）——此前用
+                    // `static_cands`（只装 IP 字面量）⇒ 域名解析出的候选被误打 `·学习`。
+                    let known = candidates.iter().any(|s| s.addr == c.addr);
                     let learned = if known { "" } else { "·学习" };
                     let tag = if c.relay {
                         "中继"
@@ -427,6 +435,30 @@ impl Session {
                 merged.len(),
                 parts.join("、")
             ));
+        }
+
+        // ---- C14 出口能力（Q-H F17；Go hostsession/session.go:252-280 同位置同语义）----
+        // 一次性参照点探测（明文一问一答，5s 预算，旁路纪律——不参与健康判定）；
+        // spawn 失败 = 记行不静默（Q-F F7 纪律）。
+        if let Some(target) = probe_target {
+            let logf_c14 = Arc::clone(&logf);
+            match std::thread::Builder::new()
+                .name("homeway-caps".into())
+                .stack_size(256 * 1024)
+                .spawn(move || {
+                    match crate::probe::ping_ex(target, 16, Duration::from_secs(5)) {
+                        Ok(r) => (logf_c14)(&format_outbound_caps_line(&r)),
+                        Err(e) => (logf_c14)(&format_outbound_caps_fail(&e)),
+                    }
+                })
+            {
+                Ok(_) => {}
+                Err(e) => (logf)(
+                    &format!("出口能力探测线程启动失败（{e}）——本轮无出口能力行"),
+                ),
+            }
+        } else {
+            (logf)("出口能力：无已解析候选（token 端点全部不可解析）——跳过参照点探测");
         }
 
         // ---- hint 回调（驱动线程执行——只投队列，重活在处理线程）+ 两个后台线程 ----
@@ -811,6 +843,47 @@ impl Session {
             save: Mutex::new(None),
         }
     }
+}
+
+/// C14 出口能力行（Q-H F17；**纯函数**便于单测）：成功形态逐字对齐 Go
+/// `hostsession/session.go:269` 的格式串——
+/// `出口能力：构建 %s ｜ 默认路径 UDP：DNS:53 %s / 通用（非 53）%s / 实测 %s ｜ 探测往返 %v`
+/// （`build` 空 ⇒ `（未标注）`；位映射 = udpcap bit0/bit1/bit2/bit4，与出口
+/// `engine.rs` 的 UDPCAP_* 及 Go 常量逐位一致；`rtt` = Go `Duration.Round(ms)` 形态）。
+pub(crate) fn format_outbound_caps_line(r: &crate::probe::PingResult) -> String {
+    const UDPCAP_DNS: u8 = 1 << 0;
+    const UDPCAP_GENERIC: u8 = 1 << 1;
+    const UDPCAP_OBSERVED: u8 = 1 << 2;
+    const UDPCAP_SEEN: u8 = 1 << 4;
+    let build = if r.build.is_empty() { "（未标注）" } else { r.build.as_str() };
+    let dns = if r.flags & UDPCAP_DNS != 0 { "可用" } else { "不可用" };
+    let gen = if r.flags & UDPCAP_GENERIC != 0 { "可用" } else { "不可用" };
+    let saw = if r.flags & UDPCAP_OBSERVED != 0 {
+        "有回包（可用）"
+    } else if r.flags & UDPCAP_SEEN != 0 {
+        "无回包 —— 这条路不回这类 UDP，QUIC 会超时回落 TCP"
+    } else {
+        "还没实测样本（这台出口还没转发过 UDP）"
+    };
+    format!(
+        "出口能力：构建 {build} ｜ 默认路径 UDP：DNS:53 {dns} / 通用（非 53）{gen} / 实测 {saw} ｜ 探测往返 {}",
+        crate::go_fmt::fmt_duration_go_ms(r.rtt)
+    )
+}
+
+/// C14 探测目标（Q-H F17 + 代码门 M6；**纯函数**——站点必须经它取目标，单测因此
+/// 能钉住「首项 = token 序首个已解析候选」而非只钉数据源形状）：
+/// `None` = 无候选（入口已由 `NoCandidates` 早退保证，实现仍不索引）。
+pub(crate) fn c14_probe_target(
+    candidates: &[crate::wtransport::Candidate],
+) -> Option<std::net::SocketAddr> {
+    candidates.first().map(|c| c.addr)
+}
+
+/// C14 失败形态（Q-H F17；纯函数便于单测）：`%v` = Rust io 错误文案——**平台文案
+/// 差异已登记**（与 E20a 的「Rust 按断点分两类」同类纪律；不伪造 Go 错误串）。
+pub(crate) fn format_outbound_caps_fail(e: &std::io::Error) -> String {
+    format!("出口能力：参照点探测失败（{e}）—— 本机网络到出口的 UDP 不通或出口未应答")
 }
 
 fn build_client(
@@ -1649,5 +1722,113 @@ mod upgrade_streak_tests {
         assert!(!relay_upgrade_due(Via::Relay, 4));
         assert!(relay_upgrade_due(Via::Relay, 5));
         assert!(!relay_upgrade_due(Via::Direct, 100));
+    }
+
+    // ---------- Q-H F17：C14 出口能力行 ----------
+
+    /// 本地 UDP 桩：收请求 → `probe::respond_ex` 应答（build/flags 注入）。
+    fn ping_stub(build: &str, flags: u8) -> std::net::SocketAddr {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = sock.local_addr().unwrap();
+        let build = build.to_owned();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 512];
+            if let Ok((n, from)) = sock.recv_from(&mut buf) {
+                if let Some(resp) = crate::probe::respond_ex(&buf[..n], &build, flags, &[]) {
+                    let _ = sock.send_to(&resp, from);
+                }
+            }
+        });
+        addr
+    }
+
+    /// ① 纯函数：四组位组合 + 空 build + rtt 两档（含 C14 真实样例逐字）。
+    #[test]
+    fn c14_line_format_matches_go() {
+        use crate::probe::PingResult;
+        let r = |flags: u8, build: &str, rtt: Duration| PingResult {
+            rtt,
+            build: build.to_owned(),
+            flags,
+            endpoints: Vec::new(),
+        };
+        // C14 真实样例（INTEROP-CRITERIA C14 行）逐字同串。
+        assert_eq!(
+            format_outbound_caps_line(&r(0b0011, "homewayd-dev", Duration::ZERO)),
+            "出口能力：构建 homewayd-dev ｜ 默认路径 UDP：DNS:53 可用 / 通用（非 53）可用 / 实测 还没实测样本（这台出口还没转发过 UDP） ｜ 探测往返 0s"
+        );
+        // bit2 = 有回包（实测可用）。
+        assert!(format_outbound_caps_line(&r(0b0111, "b", Duration::from_millis(3)))
+            .contains("实测 有回包（可用）"));
+        // bit4 = 有转发会话但无回包。
+        assert!(format_outbound_caps_line(&r(0b10000, "b", Duration::from_millis(3)))
+            .contains("实测 无回包 —— 这条路不回这类 UDP，QUIC 会超时回落 TCP"));
+        // 无位 = 还没实测样本；DNS 无位 = 不可用。
+        let l = format_outbound_caps_line(&r(0, "", Duration::from_micros(1500)));
+        assert!(l.contains("构建 （未标注） ｜"), "{l}");
+        assert!(l.contains("DNS:53 不可用 / 通用（非 53）不可用"), "{l}");
+        assert!(l.ends_with("探测往返 2ms"), "1.5ms Round(ms) = 2ms：{l}");
+    }
+
+    /// ② 本地 UDP 桩端到端：整行同串（前缀段）且 rtt 域名面 = 毫秒形态。
+    #[test]
+    fn c14_line_end_to_end_against_local_stub() {
+        let addr = ping_stub("homewayd-test", 0b0011);
+        let r = crate::probe::ping_ex(addr, 16, Duration::from_secs(2)).expect("本地桩必须应答");
+        let line = format_outbound_caps_line(&r);
+        assert!(
+            line.starts_with(
+                "出口能力：构建 homewayd-test ｜ 默认路径 UDP：DNS:53 可用 / 通用（非 53）可用 / 实测 还没实测样本（这台出口还没转发过 UDP） ｜ 探测往返 "
+            ),
+            "{line}"
+        );
+    }
+
+    /// ③ 失败形态（无应答、50ms 预算）：错误 + 失败行文案。
+    #[test]
+    fn c14_failure_line_on_no_response() {
+        let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = sock.local_addr().unwrap(); // 绑而不答
+        let e = crate::probe::ping_ex(addr, 16, Duration::from_millis(50)).unwrap_err();
+        let line = format_outbound_caps_fail(&e);
+        assert!(line.starts_with("出口能力：参照点探测失败（"), "{line}");
+        assert!(line.ends_with("）—— 本机网络到出口的 UDP 不通或出口未应答"), "{line}");
+    }
+
+    /// ④ 目标选取（设计门 A3 + 代码门 M6）：**站点经 `c14_probe_target` 取目标**
+    /// （纯函数单测钉接线——只钉 split_and_resolve 形状时，把站点改回
+    /// `static_cands.first()` 也不会红）。
+    #[test]
+    fn c14_target_is_first_resolved_candidate() {
+        use crate::token::{EndpointKind, EndpointRef};
+        use crate::wtransport::Candidate as WC;
+        let logf: crate::Logf = Arc::new(|_| {});
+        // 空表 ⇒ None（不索引）。
+        assert!(c14_probe_target(&[]).is_none());
+        // 纯静态列表 ⇒ 首项（这是**可以**命中的场景，但域名-only 下不可用它）。
+        let statics = [
+            WC { addr: "10.1.2.3:40003".parse().unwrap(), relay: false },
+            WC { addr: "10.1.2.4:40004".parse().unwrap(), relay: false },
+        ];
+        assert_eq!(c14_probe_target(&statics).unwrap().port(), 40003);
+        // 域名-only token（static_base 空）：候选非空且首项 = 域名解析地址。
+        let dom = EndpointRef::new("localhost:40001", EndpointKind::Direct);
+        let inputs = crate::wtransport::domain_eps::split_and_resolve(&[dom], &logf);
+        assert!(inputs.static_base.is_empty(), "域名条目不进 static_base（旧 A3 误取面）");
+        let t = c14_probe_target(&inputs.candidates).expect("域名首解必须有候选");
+        assert!(t.ip().is_loopback(), "目标 = 域名解析地址：{t}");
+        assert_eq!(t.port(), 40001);
+        // 混合（域名在前）：目标 = 域名解析地址，不是后面的静态 IP。
+        let mixed = [
+            EndpointRef::new("localhost:40002", EndpointKind::Direct),
+            EndpointRef::new("10.1.2.3:40003", EndpointKind::Direct),
+        ];
+        let inputs2 = crate::wtransport::domain_eps::split_and_resolve(&mixed, &logf);
+        let t2 = c14_probe_target(&inputs2.candidates).unwrap();
+        assert_eq!(t2.port(), 40002, "目标 = token 序首个已解析候选");
+        assert!(t2.ip().is_loopback());
+        // C13（M3）：·学习 判定集 = token 已解析候选（域名首解也算 known）。
+        let known = |addr: std::net::SocketAddr| inputs2.candidates.iter().any(|c| c.addr == addr);
+        assert!(known(t2), "域名首解候选必须在 known 集里（Go cands 同义）");
     }
 }

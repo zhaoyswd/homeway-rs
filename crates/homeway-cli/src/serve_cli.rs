@@ -4,87 +4,256 @@
 //!
 //! 配置覆盖序 = flag 显式设值 > config.toml（`<state>/config.toml`，[serve] 节同
 //! schema）> 内置默认（nodeconfig 口径）。`--state` 是引导 flag，不进 config。
+//!
+//! **Q-H F1（config 单表）**：本文件的 `FileConfig` 是**唯一 schema**（统一进程与
+//! relay 侧同表复用）；`load_config_strict` 是**唯一读点**（缺失 = 默认；存在即
+//! 「TOML 严格解析（deny_unknown）+ Go `validateFile` 全量值域」）；`serve_config_of`
+//! 是纯映射（无打印/无 exit）。`process::exit` 只允许出现在**最前台**（flag parser
+//! 的 exit(2) 与前台壳的 exit(1)）——控制面路径与角色装配路径零 exit。
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
 use homeway_core::server::engine::{BindMode, ServeConfig, ServeEngine};
 
-/// config.toml 的 [serve] 节（fileServe 子集；deny_unknown = Go 的 typo 保护同口径）。
-#[derive(serde::Deserialize, Default)]
+use crate::cli_flags;
+
+// ---------- config.toml 单表（Q-H F1；唯一 schema） ----------
+
+fn default_enabled_true() -> bool {
+    true
+}
+
+/// config.toml 的 `[serve]` 节（fileServe 子集；deny_unknown = Go 的 typo 保护同口径）。
+///
+/// **缺省语义（Go `nodeconfig.Default()` 同义）**：`serve.enabled` 缺省 = **true**
+/// （手编省略该键 = 启用）；`relay.enabled` 缺省 = false。手写 `impl Default` 而非
+/// derive——serde 的 `default = fn` 只在反序列化时生效，`FileConfig::default()`（缺失
+/// 文件路径）也必须同义。
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
-struct FileServe {
-    #[serde(default)]
-    #[allow(dead_code)]
-    enabled: bool,
-    #[serde(default)]
-    listen: Option<u16>,
-    #[serde(default)]
-    bind_interface: Option<String>,
-    #[serde(default)]
-    upnp: Option<bool>,
-    #[serde(default)]
-    stun: Option<String>,
-    #[serde(default)]
-    stun6: Option<String>,
-    #[serde(default)]
-    relay: Option<String>,
-    #[serde(default)]
-    max_peers: Option<usize>,
-    #[serde(default)]
-    peer_ttl: Option<String>,
-    #[serde(default)]
-    public_endpoint: Option<String>,
-    #[serde(default)]
-    dns_port: Option<u16>,
-    #[serde(default)]
-    files_root: Option<String>,
+pub(crate) struct FileServe {
+    /// 缺省 = true（Go `nodeconfig.Default()` 同义——手编省略该键 = 启用）。
+    #[serde(default = "default_enabled_true")]
+    pub(crate) enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) listen: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) bind_interface: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) upnp: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) stun: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) stun6: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) relay: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) max_peers: Option<usize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) peer_ttl: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) public_endpoint: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) dns_port: Option<u16>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) files_root: Option<String>,
     /// Go 键表含 `[[serve.ddns]]`（serve ddns add 写出）——P0-4 起消费：token
     /// 叠加域名条目 + 自检。
-    #[serde(default)]
-    ddns: Option<Vec<FileDdns>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ddns: Option<Vec<FileDdns>>,
     /// 发送整形/pacing（D-3 反过拟合约束 3：参数 config 化——键表 =
     /// `homeway_core::server::intercept::TxShapeCfg`；覆盖序 env > config > 默认）。
-    #[serde(default)]
-    tx_shape: Option<homeway_core::server::intercept::TxShapeCfg>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) tx_shape: Option<homeway_core::server::intercept::TxShapeCfg>,
 }
 
-#[derive(serde::Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct FileDdns {
-    #[serde(default)]
-    domain: String,
+impl Default for FileServe {
+    fn default() -> Self {
+        FileServe { enabled: true, ..FileServe::empty() }
+    }
 }
 
-#[derive(serde::Deserialize, Default)]
-#[serde(deny_unknown_fields)]
-struct FileRelay {
-    #[serde(default)]
-    #[allow(dead_code)]
-    enabled: bool,
-    #[serde(default)]
-    #[allow(dead_code)]
-    listen: Option<String>,
-    #[serde(default)]
-    #[allow(dead_code)]
-    advertise: Option<String>,
+impl FileServe {
+    /// 全字段零值（仅内部装配用；对外缺省见 `Default`）。
+    fn empty() -> FileServe {
+        FileServe {
+            enabled: false,
+            listen: None,
+            bind_interface: None,
+            upnp: None,
+            stun: None,
+            stun6: None,
+            relay: None,
+            max_peers: None,
+            peer_ttl: None,
+            public_endpoint: None,
+            dns_port: None,
+            files_root: None,
+            ddns: None,
+            tx_shape: None,
+        }
+    }
 }
 
-#[derive(serde::Deserialize, Default)]
+#[derive(serde::Deserialize, serde::Serialize, Default, Clone, Debug)]
 #[serde(deny_unknown_fields)]
-struct FileConfig {
+pub(crate) struct FileDdns {
     #[serde(default)]
-    serve: FileServe,
-    /// relay 节由统一进程/`homeway-cli relay` 消费；serve 命令只须**接受**该节
-    ///（整文件 deny_unknown 的键表完整性——不拒启同 state 的双角色配置）。
+    pub(crate) domain: String,
+}
+
+#[derive(serde::Deserialize, serde::Serialize, Default, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FileRelay {
     #[serde(default)]
-    #[allow(dead_code)]
-    relay: FileRelay,
+    pub(crate) enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) listen: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) advertise: Option<String>,
+}
+
+/// config.toml 全键面（serve/relay 双节；deny_unknown——typo 保护）。
+#[derive(serde::Deserialize, serde::Serialize, Default, Clone, Debug)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FileConfig {
+    #[serde(default)]
+    pub(crate) serve: FileServe,
+    #[serde(default)]
+    pub(crate) relay: FileRelay,
+}
+
+/// 严格读 config（**唯一读点**；Q-H F1）：缺失 = 默认；存在即「TOML 严格解析 +
+/// Go `validateFile` 全量值域」——错误文案 = `config.toml 绝对路径: 字段：值域`
+/// （Go `Error.String` 同形）。写回面与启动期共用本函数（坏 config 拒写/拒启）。
+pub(crate) fn load_config_strict(state_dir: &Path) -> Result<FileConfig, String> {
+    let path = state_dir.join("config.toml");
+    let body = match std::fs::read_to_string(&path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(FileConfig::default()),
+        Err(e) => return Err(format!("{}: 读取失败：{e}", path.display())),
+    };
+    let fc: FileConfig = toml::from_str(&body).map_err(|e| format!("{}: {e}", path.display()))?;
+    validate_file(&path, &fc)?;
+    Ok(fc)
+}
+
+/// Go `validateFile`（`baseline:internal/nodeconfig/config.go:254-292`）全量值域，
+/// 逐条对齐（本批补齐 5 项：serve.listen / bind_interface / public_endpoint /
+/// serve.relay / relay.listen）。
+fn validate_file(path: &Path, f: &FileConfig) -> Result<(), String> {
+    let p = path.display();
+    let bad = |field: &str, detail: String| Err(format!("{p}: {field}：{detail}"));
+    if let Some(v) = f.serve.listen {
+        if v == 0 {
+            return bad("serve.listen", format!("{v} 非法（合法值域 1–65535）"));
+        }
+    }
+    // dns_port：Option<u16> 天然等价 Go 的 0–65535（登记为「已等价」）。
+    if let Some(v) = &f.serve.bind_interface {
+        validate_bind_interface(v).map_err(|e| {
+            format!("{p}: serve.bind_interface：{e}")
+        })?;
+    }
+    if let Some(v) = &f.serve.public_endpoint {
+        if !v.is_empty() {
+            for line in v.split(',') {
+                let t = line.trim();
+                if let Err(e) = t.parse::<std::net::SocketAddr>() {
+                    return bad(
+                        "serve.public_endpoint",
+                        format!("{line:?} 非法（{e}；须为逗号分隔的 ip:port）"),
+                    );
+                }
+            }
+        }
+    }
+    if let Some(v) = &f.serve.peer_ttl {
+        if parse_go_duration(v).is_none() {
+            return bad(
+                "serve.peer_ttl",
+                format!("{v:?} 非法（时长串，如 \"168h\"；须 ≥ 0，0 = 关闭 TTL 回收）"),
+            );
+        }
+    }
+    if let Some(list) = &f.serve.ddns {
+        for d in list {
+            // 代码门 L7：Go `validateFile` 查**未 trim 的原串**（`" x"` 因含空格被拒）——
+            // 此处不 trim 再查（存储面仍按 trim 后落 cfg，接受集与 Go 等价）。
+            let dom = d.domain.as_str();
+            if dom.is_empty() {
+                return bad("serve.ddns.domain", "空域名非法".to_owned());
+            }
+            if dom.contains(':') || dom.contains('/') || dom.contains(' ') {
+                return bad(
+                    "serve.ddns.domain",
+                    format!("{dom:?} 非法（只要裸域名，不带端口/路径）"),
+                );
+            }
+        }
+    }
+    if let Some(v) = &f.serve.relay {
+        validate_relay_arg(v).map_err(|e| format!("{p}: serve.relay：{e}"))?;
+    }
+    let listen = f.relay.listen.as_deref().unwrap_or(":41741");
+    validate_relay_listen(listen).map_err(|e| format!("{p}: relay.listen：{e}"))?;
+    Ok(())
+}
+
+/// serve.relay 取值（CLI 与 config 同口径；Go `validateRelayToken` 同义）：
+/// 空 = 不用中继；`rl1` 前缀 = 必须能解码；其余 = 裸 IP:port 开放模式。
+pub(crate) fn validate_relay_arg(tok: &str) -> Result<(), String> {
+    let t = tok.trim();
+    if t.is_empty() {
+        return Ok(());
+    }
+    if t.starts_with("rl1") {
+        return homeway_core::relay::rltoken::decode_relay_token(t)
+            .map(|_| ())
+            .map_err(|e| format!("rl1 token 解码失败：{e}"));
+    }
+    if let Ok(ap) = t.parse::<std::net::SocketAddr>() {
+        if ap.port() != 0 {
+            return Ok(());
+        }
+    }
+    Err(format!("{tok:?} 非法（rl1… token 或裸 IP:port；域名不支持）"))
+}
+
+/// relay.listen 形态（`[host:]port`，端口 1–65535；Go `validateUDPAddr` 同义——
+/// 复用 relay 装配期的 `parse_listen`，验收集与装配面一致）。
+pub(crate) fn validate_relay_listen(v: &str) -> Result<(), String> {
+    if v.is_empty() {
+        return Err("空地址非法（如 \":41741\"）".to_owned());
+    }
+    match crate::relay_cli::parse_listen(v) {
+        Some(a) if a.port() >= 1 => Ok(()),
+        Some(a) => Err(format!("端口 {} 非法（合法值域 1–65535）", a.port())),
+        None => Err(format!("{v:?} 非法（[host:]port 形态，如 \":41741\"）")),
+    }
+}
+
+/// Go `validateBindInterface`：空/auto/none/off/no（大小写不敏感）、IP 字面量、
+/// 其余按网卡名放行（含 `:/ \t` 拒）。
+fn validate_bind_interface(v: &str) -> Result<(), String> {
+    let t = v.trim();
+    match t.to_ascii_lowercase().as_str() {
+        "" | "auto" | "none" | "off" | "no" => return Ok(()),
+        _ => {}
+    }
+    if t.parse::<std::net::IpAddr>().is_ok() {
+        return Ok(());
+    }
+    if t.contains(':') || t.contains('/') || t.contains(' ') || t.contains('\t') {
+        return Err(format!("{v:?} 非法（auto / none / 网卡名 / IP 字面量）"));
+    }
+    Ok(())
 }
 
 /// Go 时长串（"15s"/"168h"/"0s"；支持 s/m/h 组合）。
-fn parse_go_duration(s: &str) -> Option<Duration> {
+pub(crate) fn parse_go_duration(s: &str) -> Option<Duration> {
     let s = s.trim();
     if s == "0" || s == "0s" {
         return Some(Duration::ZERO);
@@ -110,6 +279,16 @@ fn parse_go_duration(s: &str) -> Option<Duration> {
     Some(total)
 }
 
+// ---------- flag 解析（前台面；exit(2) 允许——最前台） ----------
+
+/// CLI 层错误分类：Usage ⇒ 前台 exit 2；Config ⇒ 前台 exit 1（控制面路径不调用本层）。
+#[derive(Debug)]
+pub(crate) enum CliErr {
+    Usage(String),
+    Config(String),
+}
+
+#[derive(Default)]
 struct ServeFlags {
     state: Option<PathBuf>,
     listen: Option<u16>,
@@ -131,229 +310,209 @@ struct ServeFlags {
     extra: Vec<String>,
 }
 
-fn parse_serve_flags(args: &[String]) -> ServeFlags {
-    let mut f = ServeFlags {
-        state: None,
-        listen: None,
-        bind_interface: None,
-        upnp: None,
-        stun: None,
-        stun6: None,
-        peer_ttl: None,
-        max_peers: None,
-        public_endpoint: None,
-        dns_port: None,
-        files_root: None,
-        verbose: false,
-        relay: None,
-        ddns: None,
-        extra: Vec::new(),
-    };
+fn serve_usage() {
+    eprintln!("用法：homeway-cli serve [--state DIR] [--listen P] [--bind-interface M] [--upnp[=bool]] [--stun H:P] [--stun6 H:P]");
+    eprintln!("       [--relay rl1…|ip:port] [--peer-ttl 168h] [--max-peers N] [--public-endpoint ip:port,ip:port]");
+    eprintln!("       [--dns-port P] [--files-root DIR] [--ddns 裸域名] [--verbose]");
+    eprintln!("  = 前台单出口（Ctrl-C 收工）；启停/查询用 `homeway-cli serve start|stop|restart|status|token`（控制面）。");
+}
+
+fn parse_serve_flags(args: &[String]) -> Result<ServeFlags, CliErr> {
+    let mut f = ServeFlags::default();
     let mut i = 0;
     while i < args.len() {
-        // Go flag 风格：--flag value / --flag=value；布尔 flag 可 --flag=false
-        let stripped = args[i].strip_prefix("--").or_else(|| args[i].strip_prefix('-'));
-        let Some(body) = stripped else {
-            f.extra.push(args[i].clone());
+        let a = args[i].as_str();
+        let Some((name, inline)) = cli_flags::split_flag(a) else {
+            f.extra.push(a.to_owned());
             i += 1;
             continue;
         };
-        let (name, inline) = match body.split_once('=') {
-            Some((k, v)) => (k.to_owned(), Some(v.to_owned())),
-            None => (body.to_owned(), None),
-        };
-        // 值形 flag：内联取值（--flag=value）或吞下一参；布尔 flag 可 --flag=false
-        // （裸布尔不吞下一参——Go flag 同形）。
-        let take_val = |i: &mut usize| -> Option<String> {
-            if let Some(v) = inline.clone() {
-                return Some(v);
+        let next = args.get(i + 1).map(String::as_str);
+        let mut adv = 1usize;
+        // 取值 flag：取下一个 token（内联形态不消费）——缺值/空值由 cli_flags fail-fast。
+        let take_next = |adv: &mut usize| {
+            if inline.is_none() {
+                *adv = 2;
             }
-            *i += 1;
-            args.get(*i).cloned()
         };
-        let mut j = i;
-        match name.as_str() {
-            "state" => f.state = take_val(&mut j).map(PathBuf::from),
+        match name {
+            "state" => {
+                f.state = Some(cli_flags::take_state_or_exit("state", inline, next));
+                take_next(&mut adv);
+            }
             // 数值 flag 非法即报错退出（Go flag 包同语义）——静默回退默认值会让
-            // 「--listen 127.0.0.1:42671」这类形态占到非预期端口（R6.5 E2E P2-3 实录）
+            // 「--listen 127.0.0.1:42671」这类形态占到非预期端口
             "listen" => {
-                let Some(v) = take_val(&mut j) else {
-                    eprintln!("--listen 缺值（端口数字，如 41641）");
-                    std::process::exit(2);
-                };
-                match v.parse::<u16>() {
-                    Ok(p) if p >= 1 => f.listen = Some(p),
-                    _ => {
-                        eprintln!("--listen 非法（{v:?}——仅收端口数字 1-65535，如 41641；不收 ip:port；0 不收——Go 同口径）");
-                        std::process::exit(2);
-                    }
+                let v = cli_flags::take_num_or_exit::<u16>(
+                    "listen",
+                    inline,
+                    next,
+                    "仅收端口数字 1-65535，如 41641；不收 ip:port；0 不收——Go 同口径",
+                );
+                if v == 0 {
+                    return Err(CliErr::Usage(
+                        "--listen 非法（0——仅收端口数字 1-65535，如 41641；不收 ip:port；0 不收——Go 同口径）"
+                            .to_owned(),
+                    ));
                 }
+                f.listen = Some(v);
+                take_next(&mut adv);
             }
-            "bind-interface" => f.bind_interface = take_val(&mut j),
+            "bind-interface" => {
+                f.bind_interface = Some(cli_flags::take_value_or_exit("bind-interface", inline, next, false));
+                take_next(&mut adv);
+            }
             "upnp" => {
-                f.upnp = match inline.as_deref() {
-                    Some("false") | Some("0") => Some(false),
-                    Some("true") | Some("1") | None => Some(true), // 裸布尔 flag
-                    Some(_) => Some(true),
-                };
+                f.upnp = Some(cli_flags::take_bool_or_exit("upnp", inline, true));
             }
-            "stun" => f.stun = take_val(&mut j),
-            "stun6" => f.stun6 = take_val(&mut j),
+            "stun" => {
+                f.stun = Some(cli_flags::take_value_or_exit("stun", inline, next, false));
+                take_next(&mut adv);
+            }
+            "stun6" => {
+                f.stun6 = Some(cli_flags::take_value_or_exit("stun6", inline, next, false));
+                take_next(&mut adv);
+            }
             "peer-ttl" => {
-                if let Some(v) = take_val(&mut j) {
-                    f.peer_ttl = parse_go_duration(&v);
-                    if f.peer_ttl.is_none() {
-                        eprintln!("--peer-ttl 非法（{v:?}——时长串，如 15s / 168h；0 = 关闭）");
-                        std::process::exit(2);
+                let v = cli_flags::take_value_or_exit("peer-ttl", inline, next, false);
+                take_next(&mut adv);
+                match parse_go_duration(&v) {
+                    Some(d) => f.peer_ttl = Some(d),
+                    None => {
+                        return Err(CliErr::Usage(format!(
+                            "--peer-ttl 非法（{v:?}——时长串，如 15s / 168h；0 = 关闭）"
+                        )));
                     }
                 }
             }
             "max-peers" => {
-                let Some(v) = take_val(&mut j) else {
-                    eprintln!("--max-peers 缺值（非负整数，如 32）");
-                    std::process::exit(2);
-                };
-                match v.parse::<usize>() {
-                    Ok(n) => f.max_peers = Some(n),
-                    Err(_) => {
-                        eprintln!("--max-peers 非法（{v:?}——非负整数，如 32）");
-                        std::process::exit(2);
-                    }
-                }
+                f.max_peers = Some(cli_flags::take_num_or_exit::<usize>(
+                    "max-peers",
+                    inline,
+                    next,
+                    "非负整数，如 32",
+                ));
+                take_next(&mut adv);
             }
-            "public-endpoint" => f.public_endpoint = take_val(&mut j),
+            "public-endpoint" => {
+                f.public_endpoint =
+                    Some(cli_flags::take_value_or_exit("public-endpoint", inline, next, false));
+                take_next(&mut adv);
+            }
             "dns-port" => {
-                let Some(v) = take_val(&mut j) else {
-                    eprintln!("--dns-port 缺值（端口数字，0 = 关闭代答）");
-                    std::process::exit(2);
-                };
-                match v.parse::<u16>() {
-                    Ok(p) => f.dns_port = Some(p),
-                    Err(_) => {
-                        eprintln!("--dns-port 非法（{v:?}——端口数字，0 = 关闭代答）");
-                        std::process::exit(2);
-                    }
-                }
+                f.dns_port = Some(cli_flags::take_num_or_exit::<u16>(
+                    "dns-port",
+                    inline,
+                    next,
+                    "端口数字，0 = 关闭代答",
+                ));
+                take_next(&mut adv);
             }
-            "files-root" => f.files_root = take_val(&mut j),
-            "relay" => f.relay = take_val(&mut j),
+            "files-root" => {
+                f.files_root = Some(cli_flags::take_value_or_exit("files-root", inline, next, false));
+                take_next(&mut adv);
+            }
+            "relay" => {
+                f.relay = Some(cli_flags::take_value_or_exit("relay", inline, next, false));
+                take_next(&mut adv);
+            }
             "ddns" => {
-                let Some(v) = take_val(&mut j) else {
-                    eprintln!("--ddns 缺值（裸域名，如 home.example.com）");
-                    std::process::exit(2);
-                };
+                let v = cli_flags::take_value_or_exit("ddns", inline, next, false);
+                take_next(&mut adv);
                 if v.contains(':') || v.contains('/') || v.contains(' ') {
                     // Go cli.go:55 同校验同串
-                    eprintln!("--ddns 只要裸域名（不带端口/路径）：{v:?}");
-                    std::process::exit(2);
+                    return Err(CliErr::Usage(format!(
+                        "--ddns 只要裸域名（不带端口/路径）：{v:?}"
+                    )));
                 }
                 f.ddns = Some(v);
             }
-            "verbose" => f.verbose = true,
+            "verbose" => f.verbose = cli_flags::take_bool_or_exit("verbose", inline, true),
+            "help" | "h" => {
+                serve_usage();
+                std::process::exit(0);
+            }
             other => {
-                eprintln!("未知参数：--{other}");
-                std::process::exit(2);
+                return Err(CliErr::Usage(format!("未知参数：--{other}")));
             }
         }
-        i = j + 1;
+        i += adv;
     }
-    f
+    Ok(f)
 }
 
-/// 组装 ServeConfig（flag > config.toml > 默认）。
-pub fn assemble(args: &[String]) -> ServeConfig {
-    let f = parse_serve_flags(args);
-    if !f.extra.is_empty() {
-        eprintln!("serve 不接受位置参数（得 {:?}）", f.extra);
-        std::process::exit(2);
-    }
-    let state_dir = f.state.clone().unwrap_or_else(|| PathBuf::from("."));
+/// 前台默认 state（Q-H F15/N1·L7）：与统一进程同一默认（`~/.config/homeway`，
+/// Go 前台单角色 `internal/server/cli.go:30` 同义）。
+fn default_state_or(f: &ServeFlags) -> PathBuf {
+    f.state.clone().unwrap_or_else(crate::unified_cli::default_state_dir)
+}
+
+/// 纯映射：`FileConfig` → `ServeConfig`（无值域校验——已在校验层；只做字段搬运与
+/// `parse_bind_iface` 这类纯变换）。控制面装配路径直接用它（零 exit）。
+pub(crate) fn serve_config_of(fc: &FileConfig, state_dir: &Path) -> Result<ServeConfig, String> {
     let mut cfg = ServeConfig {
-        state_dir,
-        verbose: f.verbose,
+        state_dir: state_dir.to_owned(),
         ..Default::default()
     };
-    // config.toml（存在即解析——非法报错退出，不静默按默认；缺失 = 内置默认）
-    let cfg_path = cfg.state_dir.join("config.toml");
-    if cfg_path.exists() {
-        let body = match std::fs::read_to_string(&cfg_path) {
-            Ok(b) => b,
-            Err(e) => {
-                eprintln!("{}: 读取失败：{e}", cfg_path.display());
-                std::process::exit(1);
-            }
-        };
-        let fc: FileConfig = match toml::from_str(&body) {
-            Ok(v) => v,
-            Err(e) => {
-                eprintln!("{}: {e}", cfg_path.display());
-                std::process::exit(1);
-            }
-        };
-        if let Some(v) = fc.serve.listen {
-            cfg.listen_port = v;
-        }
-        if let Some(v) = &fc.serve.bind_interface {
-            cfg.bind_iface = parse_bind_iface(v);
-        }
-        if let Some(v) = fc.serve.upnp {
-            cfg.upnp = v;
-        }
-        if let Some(v) = &fc.serve.stun {
-            cfg.stun = v.clone();
-        }
-        if let Some(v) = fc.serve.stun6 {
-            cfg.stun6 = v; // 空串 = 显式关 v6 校验（config 显式写 "" 才覆盖默认）
-        }
-        if let Some(v) = fc.serve.max_peers {
-            cfg.max_devices = v;
-        }
-        if let Some(v) = &fc.serve.peer_ttl {
-            match parse_go_duration(v) {
-                Some(d) => cfg.peer_ttl = d,
-                None => {
-                    eprintln!("{}: serve.peer_ttl {v:?} 非法（时长串，如 \"168h\"；须 ≥ 0，0 = 关闭 TTL 回收）", cfg_path.display());
-                    std::process::exit(1);
-                }
-            }
-        }
-        if let Some(v) = &fc.serve.public_endpoint {
-            cfg.public_endpoint = v.clone();
-        }
-        if let Some(v) = fc.serve.dns_port {
-            cfg.dns_port = v;
-        }
-        if let Some(v) = &fc.serve.files_root {
-            cfg.files_root = Some(PathBuf::from(v));
-        }
-        // [serve.tx_shape]（D-3）：解析与 env 覆盖在 tx_shape_resolve（engine 装配点）。
-        cfg.tx_shape_cfg = fc.serve.tx_shape;
-        // serve.relay：注册腿端点（rl1 token / 裸 host:port——R4-4c 接线）
-        if let Some(v) = fc.serve.relay {
-            if !v.is_empty() {
-                cfg.relay = Some(v);
-            }
-        }
-        // [[serve.ddns]]：域名条目（P0-4）。校验口径同 Go nodeconfig（空域名/带端口
-        // 路径 = 非法——`serve.ddns.domain` 键名同串）。
-        if let Some(list) = fc.serve.ddns {
-            for d in &list {
-                let dom = d.domain.trim();
-                if dom.is_empty() {
-                    eprintln!("{}: serve.ddns.domain 空域名非法", cfg_path.display());
-                    std::process::exit(1);
-                }
-                if dom.contains(':') || dom.contains('/') || dom.contains(' ') {
-                    eprintln!(
-                        "{}: serve.ddns.domain {dom:?} 非法（只要裸域名，不带端口/路径）",
-                        cfg_path.display()
-                    );
-                    std::process::exit(1);
-                }
-            }
-            cfg.ddns = list.into_iter().map(|d| d.domain.trim().to_owned()).collect();
+    if let Some(v) = fc.serve.listen {
+        cfg.listen_port = v;
+    }
+    if let Some(v) = &fc.serve.bind_interface {
+        cfg.bind_iface = parse_bind_iface(v);
+    }
+    if let Some(v) = fc.serve.upnp {
+        cfg.upnp = v;
+    }
+    if let Some(v) = &fc.serve.stun {
+        cfg.stun = v.clone();
+    }
+    if let Some(v) = &fc.serve.stun6 {
+        cfg.stun6 = v.clone(); // 空串 = 显式关 v6 校验（config 显式写 "" 才覆盖默认）
+    }
+    if let Some(v) = fc.serve.max_peers {
+        cfg.max_devices = v;
+    }
+    if let Some(v) = &fc.serve.peer_ttl {
+        cfg.peer_ttl = parse_go_duration(v)
+            .ok_or_else(|| format!("serve.peer_ttl {v:?} 非法（时长串，如 \"168h\"）"))?;
+    }
+    if let Some(v) = &fc.serve.public_endpoint {
+        cfg.public_endpoint = v.clone();
+    }
+    if let Some(v) = fc.serve.dns_port {
+        cfg.dns_port = v;
+    }
+    if let Some(v) = &fc.serve.files_root {
+        cfg.files_root = Some(PathBuf::from(v));
+    }
+    // [serve.tx_shape]（D-3）：解析与 env 覆盖在 tx_shape_resolve（engine 装配点）。
+    cfg.tx_shape_cfg = fc.serve.tx_shape;
+    // serve.relay：注册腿端点（rl1 token / 裸 host:port——R4-4c 接线）
+    if let Some(v) = &fc.serve.relay {
+        if !v.is_empty() {
+            cfg.relay = Some(v.clone());
         }
     }
+    if let Some(list) = &fc.serve.ddns {
+        cfg.ddns = list.iter().map(|d| d.domain.trim().to_owned()).collect();
+    }
+    Ok(cfg)
+}
+
+/// 组装 ServeConfig（flag > config.toml > 默认）的**非 exit** 形态（Q-H F1）：
+/// flag 解析失败 = `CliErr::Usage`；config 层失败 = `CliErr::Config`。
+pub(crate) fn assemble_result(args: &[String]) -> Result<ServeConfig, CliErr> {
+    let f = parse_serve_flags(args)?;
+    if !f.extra.is_empty() {
+        return Err(CliErr::Usage(format!(
+            "serve 不接受位置参数（得 {:?}）",
+            f.extra
+        )));
+    }
+    let state_dir = default_state_or(&f);
+    let fc = load_config_strict(&state_dir).map_err(CliErr::Config)?;
+    let mut cfg = serve_config_of(&fc, &state_dir).map_err(CliErr::Config)?;
+    cfg.verbose = f.verbose;
     // flag 覆盖
     if let Some(v) = f.listen {
         cfg.listen_port = v;
@@ -402,7 +561,22 @@ pub fn assemble(args: &[String]) -> ServeConfig {
             vec![v.clone()]
         };
     }
-    cfg
+    Ok(cfg)
+}
+
+/// 组装 ServeConfig（**前台薄壳**：exit(2)/exit(1) 只在这里）。
+pub fn assemble(args: &[String]) -> ServeConfig {
+    match assemble_result(args) {
+        Ok(cfg) => cfg,
+        Err(CliErr::Usage(m)) => {
+            eprintln!("{m}");
+            std::process::exit(2);
+        }
+        Err(CliErr::Config(m)) => {
+            eprintln!("{m}");
+            std::process::exit(1);
+        }
+    }
 }
 
 fn parse_bind_iface(v: &str) -> BindMode {
@@ -477,7 +651,10 @@ pub fn cmd_serve(args: &[String]) {
     // SIGTERM/SIGINT → 有序收工（D5 + UPnP 退出缩租）
     install_stop_signals();
     println!("（serve 前台运行中——Ctrl-C 收工）");
-    let _ = wait_stop_pipe();
+    match wait_stop_pipe() {
+        StopWait::Signaled => {}
+        StopWait::PipeErr(e) => eprintln!("homeway: {e}——按收到停止处理（收工）"),
+    }
     if upnp_used {
         homeway_core::server::engine::shrink_upnp_lease(&engine, &logf);
     }
@@ -523,30 +700,100 @@ pub fn install_stop_signals() {
     let _ = r;
 }
 
-pub fn wait_stop_pipe() -> bool {
-    let (r, _) = *STOP_PIPE.get_or_init(|| (0, 0));
+/// 注入缝形（Q-H 代码门 H1：不碰 errno 的可测面；`__error` 在 linux 上不存在）。
+type ReadFn<'a> = dyn FnMut(i32, &mut [u8]) -> Result<usize, std::io::Error> + 'a;
+
+/// 停止等待结果（Q-H F16：返回值自此有语义——不再是无意义 `bool`）。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum StopWait {
+    /// 收到停止字节 / 管道 EOF / 信号路径。
+    Signaled,
+    /// 管道不可用（未安装/IO 失败）——**不读 fd 0**；调用方按「收到停止」收工。
+    PipeErr(String),
+}
+
+/// 纯逻辑（可单测）：fd < 0/未安装 ⇒ Err；read 循环：Ok(n>0) ⇒ Signaled；Ok(0)(EOF)
+/// ⇒ Signaled；`Interrupted`（EINTR）⇒ 重试；其它 Err ⇒ Err（可读文案）。
+///
+/// 注入缝形 = `Result<usize, std::io::Error>`（**不碰 errno**——`libc::__error` 只在
+/// apple/bsd 存在，linux 面是 `__errno_location`；用 errno 注入会让 ubuntu CI 的
+/// `--all-targets` 编译失败，代码门 H1）。
+fn read_stop_signal_with(fd: i32, read_fn: &mut ReadFn<'_>) -> Result<StopWait, String> {
+    if fd < 0 {
+        return Err("停止管道未安装（fd 无效）——本函数不会去读 fd 0（stdin）".to_owned());
+    }
     let mut b = [0u8; 1];
-    unsafe { libc::read(r, b.as_mut_ptr().cast(), 1) >= 0 }
+    loop {
+        match read_fn(fd, &mut b) {
+            Ok(0) => return Ok(StopWait::Signaled), // EOF（写端已关）= 收工
+            Ok(_) => return Ok(StopWait::Signaled),
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue, // EINTR：重试
+            Err(e) => return Err(format!("读停止管道失败：{e}")),
+        }
+    }
+}
+
+pub(crate) fn read_stop_signal(fd: i32) -> Result<StopWait, String> {
+    read_stop_signal_with(fd, &mut |fd, buf| {
+        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if n >= 0 {
+            Ok(n as usize)
+        } else {
+            Err(std::io::Error::last_os_error())
+        }
+    })
+}
+
+/// 等待停止（壳；**不 exit**——可进程内断言）：未安装 ⇒ 不读 fd 0，返回 `PipeErr`。
+pub fn wait_stop_pipe() -> StopWait {
+    let fd = match STOP_PIPE.get() {
+        Some((r, _)) => *r,
+        None => -1,
+    };
+    match read_stop_signal(fd) {
+        Ok(v) => v,
+        Err(e) => StopWait::PipeErr(e),
+    }
 }
 
 // ---------- serve token [list|revoke]（纯读/纯文件操作） ----------
 
+fn token_usage() {
+    eprintln!("用法：homeway-cli serve token [list | revoke <id>] [--state DIR] [--reason S]");
+    eprintln!("  无动词 = reveal（完整凭证只经本命令族；来源 = 台账末行）");
+}
+
+/// token 族的状态目录（`--state` 全形态；缺省 = 统一进程默认 state——Q-H F15）。
+fn token_state_dir(args: &[String]) -> PathBuf {
+    let mut i = 0;
+    while i < args.len() {
+        if let Some((name, inline)) = cli_flags::split_flag(&args[i]) {
+            if name == "state" {
+                return cli_flags::take_state_or_exit(
+                    "state",
+                    inline,
+                    args.get(i + 1).map(String::as_str),
+                );
+            }
+        }
+        i += 1;
+    }
+    crate::unified_cli::default_state_dir()
+}
+
 pub fn cmd_serve_token(args: &[String]) {
+    // Q-H F8/CA13：`--help` 短路（此前会落进 rest 后照跑）。
+    if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h")) {
+        token_usage();
+        std::process::exit(0);
+    }
     // flag 之后的第一个非 flag 位置参数 = 动词（list / revoke <id>；无动词 = reveal）
     let mut verb: Option<String> = None;
     let mut rest: Vec<String> = Vec::new();
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
-        if a == "--state" {
-            rest.push(a.clone());
-            if let Some(v) = args.get(i + 1) {
-                rest.push(v.clone());
-            }
-            i += 2;
-            continue;
-        }
-        if a == "--reason" {
+        if a == "--state" || a == "--reason" {
             rest.push(a.clone());
             if let Some(v) = args.get(i + 1) {
                 rest.push(v.clone());
@@ -575,17 +822,6 @@ pub fn cmd_serve_token(args: &[String]) {
             std::process::exit(2);
         }
     }
-}
-
-fn token_state_dir(args: &[String]) -> PathBuf {
-    let mut i = 0;
-    while i < args.len() {
-        if args[i] == "--state" {
-            return args.get(i + 1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-        }
-        i += 1;
-    }
-    PathBuf::from(".")
 }
 
 /// reveal：完整凭证只经本命令族（来源注记 = 台账末行——写入纪律下末行 = 最近在用）。
@@ -683,25 +919,44 @@ fn mask_secret(s: &str) -> String {
 
 /// 吊销一枚凭证 id（写吊销表；对在跑出口经跟随读秒级对新注册生效）。
 fn token_revoke(args: &[String]) {
-    let mut state = PathBuf::from(".");
+    let mut state: Option<PathBuf> = None;
     let mut reason = "manual".to_owned();
     let mut id = String::new();
     let mut i = 0;
     while i < args.len() {
-        match args[i].as_str() {
-            "--state" => {
-                state = args.get(i + 1).map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
-                i += 1; // 值参跳过
+        let a = args[i].as_str();
+        let Some((name, inline)) = cli_flags::split_flag(a) else {
+            id = a.to_owned();
+            i += 1;
+            continue;
+        };
+        match name {
+            "state" => {
+                state = Some(cli_flags::take_state_or_exit(
+                    "state",
+                    inline,
+                    args.get(i + 1).map(String::as_str),
+                ));
+                if inline.is_none() {
+                    i += 1;
+                }
             }
-            "--reason" => {
-                reason = args.get(i + 1).cloned().unwrap_or_else(|| "manual".into());
-                i += 1;
+            "reason" => {
+                reason = cli_flags::take_value_or_exit(
+                    "reason",
+                    inline,
+                    args.get(i + 1).map(String::as_str),
+                    false,
+                );
+                if inline.is_none() {
+                    i += 1;
+                }
             }
-            other if !other.starts_with('-') => id = other.to_owned(),
             _ => {}
         }
         i += 1;
     }
+    let state = state.unwrap_or_else(crate::unified_cli::default_state_dir);
     if id.is_empty() {
         eprintln!("serve token revoke 需要 <id>（先 `homeway-cli serve token list` 查）");
         std::process::exit(2);
@@ -747,5 +1002,215 @@ fn token_revoke(args: &[String]) {
             eprintln!("吊销失败：{e}");
             std::process::exit(1);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn write_cfg(dir: &Path, body: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("config.toml"), body).unwrap();
+    }
+
+    fn tmp_state(tag: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "hw-servecli-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// F1：缺失 config = 默认（serve.enabled 缺省 true）。
+    #[test]
+    fn strict_load_missing_is_default() {
+        let d = tmp_state("missing");
+        let fc = load_config_strict(&d).unwrap();
+        assert!(fc.serve.enabled);
+        assert!(fc.serve.listen.is_none());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// F1 值域表逐行坏值（每行 1 例）+ 好值往返。
+    #[test]
+    fn strict_load_value_domain_per_row() {
+        let d = tmp_state("domain");
+        let cases: &[(&str, &str)] = &[
+            ("[serve]\nlisten = 0\n", "serve.listen"),
+            ("[serve]\nbind_interface = \"en0:1\"\n", "serve.bind_interface"),
+            ("[serve]\npublic_endpoint = \"1.2.3.4\"\n", "serve.public_endpoint"),
+            ("[serve]\npeer_ttl = \"abc\"\n", "serve.peer_ttl"),
+            ("[serve]\nddns = [{ domain = \"\" }]\n", "serve.ddns.domain"),
+            ("[serve]\nddns = [{ domain = \"a/b\" }]\n", "serve.ddns.domain"),
+            ("[serve]\nrelay = \"垃圾串\"\n", "serve.relay"),
+            ("[relay]\nlisten = \"41741\"\n", "relay.listen"),
+            ("[relay]\nlisten = \":0\"\n", "relay.listen"),
+            ("[serve]\nlisten = 99999\n", "config.toml"),
+            ("[serve]\n不认识的键 = 1\n", "config.toml"),
+            ("[serve]\ntx_shape = { rate_mbps = \"200\" }\n", "config.toml"),
+        ];
+        for (body, want_field) in cases {
+            write_cfg(&d, body);
+            let e = load_config_strict(&d).unwrap_err();
+            assert!(
+                e.contains(want_field),
+                "body={body:?} 应报 {want_field}，实得：{e}"
+            );
+            assert!(e.contains("config.toml"), "错误必须带路径，实得：{e}");
+        }
+        // 好值往返：serde 序列化后再严格读仍 Ok（写回面共用本函数）。
+        let good = "[serve]\nenabled = true\nlisten = 41641\nbind_interface = \"auto\"\n\
+                    peer_ttl = \"168h\"\npublic_endpoint = \"1.2.3.4:41641\"\nrelay = \"\"\n\
+                    dns_port = 5300\n[relay]\nenabled = false\nlisten = \":41741\"\nadvertise = \"\"\n";
+        write_cfg(&d, good);
+        let fc = load_config_strict(&d).unwrap();
+        let body = toml::to_string_pretty(&fc).unwrap();
+        write_cfg(&d, &body);
+        let fc2 = load_config_strict(&d).unwrap();
+        assert_eq!(fc2.serve.listen, Some(41641));
+        assert_eq!(fc2.relay.listen.as_deref(), Some(":41741"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// F1：assemble_result 不 exit（Err 分类：Usage vs Config）。
+    #[test]
+    fn assemble_result_classifies_without_exit() {
+        let d = tmp_state("classify");
+        write_cfg(&d, "[serve]\npeer_ttl = \"abc\"\n");
+        let state = d.display().to_string();
+        match assemble_result(&["--state".to_owned(), state.clone()]) {
+            Err(CliErr::Config(_)) => {}
+            other => panic!("坏 config 应 CliErr::Config，实得 {:?}", other.err().map(|e| format!("{e:?}"))),
+        }
+        match assemble_result(&["--state".to_owned(), state, "--nope".to_owned()]) {
+            Err(CliErr::Usage(_)) => {}
+            other => panic!("未知 flag 应 CliErr::Usage，实得 {:?}", other.err().map(|e| format!("{e:?}"))),
+        }
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// F2：`--state` 全形态（等号形正例 + 缺值/空值 fail-fast 的**非 exit** 面——
+    /// fail-fast 路径由 exit 承担，这里只钉取值器分类）。
+    #[test]
+    fn state_flag_forms() {
+        let f = parse_serve_flags(&["--state=/tmp/a".to_owned()]).unwrap();
+        assert_eq!(f.state, Some(PathBuf::from("/tmp/a")));
+        let f = parse_serve_flags(&["--state".to_owned(), "/tmp/b".to_owned()]).unwrap();
+        assert_eq!(f.state, Some(PathBuf::from("/tmp/b")));
+    }
+
+    /// F7b：布尔显式值（`--upnp=false` / `--verbose=false` 真生效）。
+    #[test]
+    fn bool_flags_explicit_values() {
+        let f = parse_serve_flags(&["--upnp=false".to_owned()]).unwrap();
+        assert_eq!(f.upnp, Some(false));
+        let f = parse_serve_flags(&["--verbose=false".to_owned()]).unwrap();
+        assert!(!f.verbose);
+        let f = parse_serve_flags(&["--upnp".to_owned()]).unwrap();
+        assert_eq!(f.upnp, Some(true));
+    }
+
+    /// F15：前台默认 state 与统一进程一致。
+    #[test]
+    fn default_state_matches_unified() {
+        let f = ServeFlags::default();
+        assert_eq!(default_state_or(&f), crate::unified_cli::default_state_dir());
+        assert_eq!(
+            token_state_dir(&[]),
+            crate::unified_cli::default_state_dir()
+        );
+    }
+
+    /// F16：read_stop_signal 四档（字节/EOF/未安装/EINTR 注入重试）。
+    #[test]
+    fn read_stop_signal_cases() {
+        // 未安装（fd < 0）⇒ Err（绝不读 fd 0）。
+        assert!(read_stop_signal(-1).is_err());
+        // 真管道：写 1 字节 ⇒ Signaled；关写端（EOF）⇒ Signaled。
+        let (r, w) = homeway_core::sysfd::pipe_cloexec().unwrap();
+        let rfd = std::os::fd::IntoRawFd::into_raw_fd(r);
+        let wfd = std::os::fd::IntoRawFd::into_raw_fd(w);
+        unsafe { libc::write(wfd, b"x".as_ptr().cast(), 1) };
+        assert_eq!(read_stop_signal(rfd).unwrap(), StopWait::Signaled);
+        // 关写端 ⇒ 读到 0 字节 EOF ⇒ 同样 Signaled（不关写端会阻塞——先关再读）。
+        unsafe { libc::close(wfd) };
+        assert_eq!(read_stop_signal(rfd).unwrap(), StopWait::Signaled); // EOF
+        unsafe { libc::close(rfd) };
+        // EINTR：注入 read 先返 Interrupted 再返 1（用注入缝——进程级 raise(SIGUSR1)
+        // 在 cargo test 并发下有误伤面，且 macOS 的 raise 是线程定向、不保证命中
+        // 在途 read ⇒ 形态脆弱；注入缝钉的是同一段重试逻辑，且**不碰 errno**
+        // 〔libc::__error 只存在于 apple/bsd——用了会让 linux CI 编译失败〕）。
+        let mut calls = 0;
+        let mut fake = |_fd: i32, buf: &mut [u8]| {
+            calls += 1;
+            if calls == 1 {
+                return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "注入 EINTR"));
+            }
+            buf[0] = b'x';
+            Ok(1)
+        };
+        assert_eq!(read_stop_signal_with(3, &mut fake).unwrap(), StopWait::Signaled);
+        assert_eq!(calls, 2, "EINTR 后必须重试一次");
+        // 其它错误 ⇒ Err（可读文案），不重试。
+        let mut calls2 = 0;
+        let mut bad = |_fd: i32, _b: &mut [u8]| {
+            calls2 += 1;
+            Err(std::io::Error::other("注入 IO 错"))
+        };
+        let e = read_stop_signal_with(3, &mut bad).unwrap_err();
+        assert!(e.contains("读停止管道失败"), "{e}");
+        assert_eq!(calls2, 1, "非 EINTR 不重试");
+    }
+
+    /// 壳：未安装时 wait_stop_pipe 返回 PipeErr（不 exit、不读 fd 0）。
+    #[test]
+    fn wait_stop_pipe_shell_reports_pipe_err() {
+        match wait_stop_pipe() {
+            StopWait::PipeErr(e) => assert!(e.contains("未安装"), "{e}"),
+            other => panic!("未安装应 PipeErr，实得 {other:?}"),
+        }
+    }
+
+    /// F13：默认 config 模板同时过「serde 严格表 + load_config_strict 值域层」，
+    /// 且注释键表与 schema 字段名一致（防未来漂移）。
+    #[test]
+    fn default_config_template_passes_strict() {
+        let tpl = homeway_core::nodestate::DEFAULT_CONFIG_TOML;
+        // ① serde 严格表可解析。
+        let fc: FileConfig = toml::from_str(tpl).expect("模板必须能被唯一 schema 解析");
+        // ② 落盘后过 load_config_strict（含值域）。
+        let d = tmp_state("tpl");
+        write_cfg(&d, tpl);
+        let fc2 = load_config_strict(&d).expect("模板必须过严格读（含值域）");
+        assert_eq!(fc2.serve.listen, fc.serve.listen);
+        let _ = std::fs::remove_dir_all(&d);
+        // ③ 注释键名：burst_kb（不是 burst_kib）+ public_endpoint 在表。
+        assert!(tpl.contains("burst_kb"), "注释键必须写 burst_kb");
+        assert!(!tpl.contains("burst_kib"), "burst_kib 是错键（Q-A 遗留）");
+        assert!(tpl.contains("public_endpoint"), "注释键表须列 public_endpoint");
+        // ④ 注释键表逐键 = 本断言清单（schema 字段漂移时先破这里）。
+        const SERVE_KEYS: &[&str] = &[
+            "enabled", "listen", "bind_interface", "upnp", "stun", "stun6", "relay", "max_peers",
+            "peer_ttl", "dns_port", "files_root", "public_endpoint",
+        ];
+        const RELAY_KEYS: &[&str] = &["enabled", "listen", "advertise"];
+        for k in SERVE_KEYS.iter().chain(RELAY_KEYS.iter()) {
+            assert!(
+                tpl.contains(k),
+                "模板注释键表缺 {k}"
+            );
+        }
+        // 逐键「能被 schema 接受」复核：把每个键以合法值形态喂进去必须 Ok。
+        let served = "[serve]\nenabled = true\nlisten = 41641\nbind_interface = \"auto\"\nupnp = false\n\
+             stun = \"\"\nstun6 = \"\"\nrelay = \"\"\nmax_peers = 32\npeer_ttl = \"168h\"\n\
+             dns_port = 5300\nfiles_root = \"\"\npublic_endpoint = \"\"\n\
+             [relay]\nenabled = false\nlisten = \":41741\"\nadvertise = \"\"\n";
+        assert!(toml::from_str::<FileConfig>(served).is_ok());
     }
 }

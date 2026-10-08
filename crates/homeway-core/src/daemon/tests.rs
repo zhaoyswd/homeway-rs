@@ -478,6 +478,8 @@ fn start_server(tag: &str, backend: Arc<dyn Backend>) -> (Arc<ControlServer>, Pa
         bus: Arc::clone(&bus),
         backend,
         logf: Arc::new(|_| {}),
+        max_conns: super::server::DEFAULT_MAX_CONTROL_CONNS,
+        handshake_deadline: super::server::DEFAULT_HANDSHAKE_DEADLINE,
     });
     let s2 = Arc::clone(&srv);
     let h = std::thread::spawn(move || {
@@ -714,6 +716,8 @@ fn server_request_overrun_disconnects() {
         bus,
         backend: Arc::new(slow_backend),
         logf: Arc::new(|_| {}),
+        max_conns: super::server::DEFAULT_MAX_CONTROL_CONNS,
+        handshake_deadline: super::server::DEFAULT_HANDSHAKE_DEADLINE,
     });
     let s2 = Arc::clone(&srv);
     let h = std::thread::spawn(move || {
@@ -900,6 +904,8 @@ fn slow_dial_counts_inflight_and_overruns() {
         bus: Arc::new(super::bus::Bus::new()),
         backend: Arc::new(SlowDial(())),
         logf: Arc::new(|_| {}),
+        max_conns: super::server::DEFAULT_MAX_CONTROL_CONNS,
+        handshake_deadline: super::server::DEFAULT_HANDSHAKE_DEADLINE,
     });
     let s2 = Arc::clone(&srv);
     let h = std::thread::spawn(move || {
@@ -1099,4 +1105,191 @@ fn carrier_ops_server_roundtrip() {
     let _ = c.goodbye();
     srv.shutdown();
     let _ = serve_h.join();
+}
+
+// ---------- Q-H F5：控制面资源上限 / 握手期限 / 线程句柄回收 ----------
+
+/// 起一台带自定义配置的服务器（cap/deadline 注入面；返回日志收集器）。
+#[allow(clippy::type_complexity)]
+fn start_server_cfg(
+    tag: &str,
+    max_conns: usize,
+    handshake_deadline: Duration,
+) -> (
+    Arc<ControlServer>,
+    PathBuf,
+    Arc<Mutex<Vec<String>>>,
+    std::thread::JoinHandle<()>,
+) {
+    let dir = std::env::temp_dir().join(format!("hw-ctl-f5-{tag}-{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).unwrap();
+    let (sock, ln) = super::listen::listen_control(&dir).unwrap();
+    let logs: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let l2 = Arc::clone(&logs);
+    let srv = ControlServer::new(ServerConfig {
+        server_version: "t".into(),
+        bus: Arc::new(super::bus::Bus::new()),
+        backend: MockBackend::new(),
+        logf: Arc::new(move |s: &str| l2.lock().unwrap().push(s.to_owned())),
+        max_conns,
+        handshake_deadline,
+    });
+    let s2 = Arc::clone(&srv);
+    let h = std::thread::spawn(move || {
+        let _ = s2.serve(ln);
+    });
+    (srv, sock, logs, h)
+}
+
+fn hello_frame() -> Vec<u8> {
+    encode_json_frame(
+        Op::Hello,
+        &HelloBody {
+            proto_version: 1,
+            frontend: FrontendInfo { kind: "cli".into(), name: "t".into(), version: "0".into() },
+        },
+    )
+}
+
+/// F5-cap：`max_conns = 2` 注入——前两条正常握手；第 3 条**接受后立即关闭**
+/// （读到 EOF/错误，无 welcome），且服务端日志出现拒绝行。
+#[test]
+fn server_conn_cap_rejects_extra_conns() {
+    let (srv, sock, logs, serve_h) = start_server_cfg("cap", 2, super::server::DEFAULT_HANDSHAKE_DEADLINE);
+    let (c1, _w1) = ControlClient::dial(&sock, "cli", "t1").unwrap();
+    let (c2, _w2) = ControlClient::dial(&sock, "cli", "t2").unwrap();
+    // 第 3 条：裸连接 + hello → 立即被关（无数据 / EOF / 错误）。
+    use std::io::{Read, Write};
+    let mut c3 = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    c3.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+    let _ = c3.write_all(&hello_frame());
+    let mut buf = [0u8; 64];
+    let r = c3.read(&mut buf);
+    assert!(
+        matches!(r, Ok(0)) || r.is_err(),
+        "超限连接应被立即关闭（无 welcome），实得 {r:?}"
+    );
+    let joined = logs.lock().unwrap().join("\n");
+    assert!(
+        joined.contains("连接拒绝（并发上限 2）"),
+        "服务端须记拒绝行，实得日志：{joined}"
+    );
+    // 既有连接不受影响（c1 仍可往返）。
+    let v = c1.request("daemon.status", None, short()).unwrap();
+    assert!(v["roles"].is_array(), "cap 拒新不拒旧：{v}");
+    c1.close();
+    c2.close();
+    srv.shutdown();
+    let _ = serve_h.join();
+    let _ = std::fs::remove_dir_all(sock.parent().unwrap());
+}
+
+/// F5-deadline：`handshake_deadline = 80ms` 注入——不发 hello 的连接被断开并记行；
+/// 已握手的连接不受影响。
+#[test]
+fn server_handshake_deadline_disconnects_silent_conn() {
+    let (srv, sock, logs, serve_h) =
+        start_server_cfg("hs", 8, Duration::from_millis(80));
+    // 正常握手的一条（不受期限影响）。
+    let (c1, _w1) = ControlClient::dial(&sock, "cli", "t1").unwrap();
+    // 静默连接：只连不 hello → 期限到点被断。
+    use std::io::Read;
+    let mut quiet = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    quiet.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+    let mut buf = [0u8; 16];
+    let r = quiet.read(&mut buf);
+    assert!(
+        matches!(r, Ok(0)) || r.is_err(),
+        "未握手连接应在期限后被断开（不许收到任何帧），实得 {r:?}"
+    );
+    let joined = logs.lock().unwrap().join("\n");
+    assert!(joined.contains("连接握手超时"), "须记超时行，实得：{joined}");
+    // 已握手的连接照常。
+    let v = c1.request("daemon.status", None, short()).unwrap();
+    assert!(v["roles"].is_array());
+    c1.close();
+    srv.shutdown();
+    let _ = serve_h.join();
+    let _ = std::fs::remove_dir_all(sock.parent().unwrap());
+}
+
+/// F5-reap：连接起落若干轮后 `conn_threads` 回落（不随连接数只增——
+/// accept 前 retain 已结束句柄）。
+#[test]
+fn conn_threads_are_reaped_after_rounds() {
+    let (srv, sock, _logs, serve_h) =
+        start_server_cfg("reap", 8, super::server::DEFAULT_HANDSHAKE_DEADLINE);
+    for _ in 0..3 {
+        let (c, _w) = ControlClient::dial(&sock, "cli", "t").unwrap();
+        c.close();
+    }
+    std::thread::sleep(Duration::from_millis(300)); // 让 joiner 收尾
+    // 每次新连接 = 一次 accept = 一次 retain；断言在册句柄收敛到「本连接 + 至多
+    // 一个未及回收」——修前形态会持续增长到 4+。
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut ok = false;
+    let mut last = 0usize;
+    while !ok {
+        let (c, _w) = ControlClient::dial(&sock, "cli", "t").unwrap();
+        last = srv.conn_threads_len();
+        c.close();
+        ok = last <= 2;
+        if !ok {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "conn_threads 未回收（在册 {last}——只增不减回归）"
+            );
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    }
+    assert!(last <= 2, "在册线程句柄应收敛，实得 {last}");
+    srv.shutdown();
+    let _ = serve_h.join();
+    let _ = std::fs::remove_dir_all(sock.parent().unwrap());
+}
+
+/// F5 慢滴水（M2 交办）：每 40ms 发 1 字节、永不完成帧——期限仍必须生效
+/// （判据在带期限的半帧/半体读内，读侧期限不是「拍上才查」）。
+#[test]
+fn handshake_deadline_beats_slow_drip() {
+    let (srv, sock, logs, serve_h) =
+        start_server_cfg("drip", 8, Duration::from_millis(120));
+    use std::io::{Read, Write};
+    let mut c = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+    c.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
+    // 持续滴水（每 40ms 1 字节；5 字节头永远凑不满——第一字节恒为 Req 码也无所谓，
+    // head 未完成即不进入 op 分发）。
+    let mut w = c.try_clone().unwrap();
+    let stop = Arc::new(AtomicBool::new(false));
+    let stop2 = Arc::clone(&stop);
+    let drip = std::thread::spawn(move || {
+        while !stop2.load(Ordering::SeqCst) {
+            if w.write_all(&[0u8]).is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(40));
+        }
+    });
+    // 期限（120ms）后连接必须被服务端断开：读到 0/错误，且**远早于** 4s 读超时
+    // （否则「读到 Err」可由测试自己的读超时伪造——判据必须钉断开时刻）。
+    let mut buf = [0u8; 16];
+    let t0 = std::time::Instant::now();
+    let r = c.read(&mut buf);
+    let dt = t0.elapsed();
+    stop.store(true, Ordering::SeqCst);
+    let _ = drip.join();
+    assert!(
+        matches!(r, Ok(0)) || r.is_err(),
+        "慢滴水连接必须在握手期限后被断开，实得 {r:?}"
+    );
+    assert!(
+        dt < Duration::from_secs(2),
+        "断开必须由期限触发（≤2s），不是测试自己的 4s 读超时：{dt:?}"
+    );
+    let joined = logs.lock().unwrap().join("\n");
+    assert!(joined.contains("连接握手超时"), "须记超时行：{joined}");
+    srv.shutdown();
+    let _ = serve_h.join();
+    let _ = std::fs::remove_dir_all(sock.parent().unwrap());
 }

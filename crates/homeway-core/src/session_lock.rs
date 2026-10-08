@@ -184,6 +184,36 @@ mod tests {
         drop(lock);
     }
 
+    /// Q-H F9：不可写 identity 目录 ⇒ `LockError::Io`（分类 + path 字段）——调用点
+    /// （main.rs）据此 fail-fast（此前"仅告警继续" = 防线静默消失）。
+    #[test]
+    fn unwritable_dir_is_lock_io_with_path() {
+        use std::os::unix::fs::PermissionsExt;
+        // root 绕过权限位 ⇒ 该形态在 root 下不可构造（CI 容器可能以 root 跑：
+        // 代码门 L3——跳过而非假红）。
+        if unsafe { libc::geteuid() } == 0 {
+            return;
+        }
+        let dir = tmp_dir("ro");
+        let ro = dir.join("ro-identity");
+        std::fs::create_dir_all(&ro).unwrap();
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let r = acquire(&ro, "connect");
+        // 先恢复权限再断言/清理（失败面也要能清干净）。
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o700)).unwrap();
+        match r {
+            Err(LockError::Io(io)) => {
+                let msg = format!("{io}");
+                assert!(
+                    msg.contains(&ro.display().to_string()),
+                    "Io 文案必须带 path 字段：{msg}"
+                );
+            }
+            other => panic!("不可写目录应 LockIo，实得 {other:?}"),
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// 目录自动创建（identity 目录可不存在）。
     #[test]
     fn dir_created() {

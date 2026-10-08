@@ -32,8 +32,9 @@ use homeway_core::daemon::{DaemonCore, RoleOp, RoleOpOut, RoleHost};
 use homeway_core::nodestate::{open_node_state, DebugLog, EventsLog, InstanceLock};
 use homeway_core::server::engine::{shrink_upnp_lease, ServeEngine};
 
+use crate::cli_flags;
 use crate::relay_cli::{assemble_relay, RelayAssemble, RelayProc};
-use crate::serve_cli::assemble as assemble_serve_cfg;
+use crate::serve_cli::{load_config_strict, serve_config_of, FileConfig, FileDdns};
 
 /// 默认 state 根（Go `DefaultStateDir` 同义：`~/.config/homeway`）。
 pub fn default_state_dir() -> PathBuf {
@@ -43,119 +44,21 @@ pub fn default_state_dir() -> PathBuf {
     PathBuf::from("./homeway-state")
 }
 
-/// config.toml 全键面（serve/relay 双节，deny_unknown——typo 保护；与 serve_cli/
-/// relay_cli 的分节 schema 同表）。Serialize 面 = serve/relay start/stop 写回
-/// 期望态（enabled 位）——手编注释会丢（Go nodeconfig.Write 同形态）。
-#[derive(serde::Deserialize, serde::Serialize, Default, Clone)]
-#[serde(deny_unknown_fields)]
-#[allow(dead_code)] // 键表完整性守卫（消费经 assemble_serve_cfg 走 serve_cli 的同表解析）
-struct FileServe {
-    /// 缺省 = true（Go nodeconfig.Default 同义——手编省略该键 = 启用；CLI-5 整改）。
-    #[serde(default = "default_enabled_true")]
-    enabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    listen: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    bind_interface: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    upnp: Option<bool>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    stun: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    stun6: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    relay: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    max_peers: Option<usize>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    peer_ttl: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    public_endpoint: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    dns_port: Option<u16>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    files_root: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    ddns: Option<Vec<FileDdns>>,
-    /// 发送整形（D-3）：与 serve_cli::FileServe 同键——镜像表漏键会让统一进程
-    /// 读到该键即 TOML parse error 退出（P2-r2-H1 实测形态；本表是键表完整性
-    /// 守卫，serve_cli 加键必须同批进这里）。本表只做「键被接受」（消费与类型
-    /// 校验经 assemble_serve 走 serve_cli 的同表解析），故用 toml::Value 承载
-    /// 〔TxShapeCfg 未实现 Serialize，本表 derive 了写回面〕。
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    tx_shape: Option<toml::Value>,
-}
-
-#[derive(serde::Deserialize, serde::Serialize, Default, Clone)]
-#[serde(deny_unknown_fields)]
-struct FileDdns {
-    #[serde(default)]
-    domain: String,
-}
-
-fn default_enabled_true() -> bool {
-    true
-}
-
-#[derive(serde::Deserialize, serde::Serialize, Default, Clone)]
-#[serde(deny_unknown_fields)]
-struct FileRelay {
-    #[serde(default)]
-    enabled: bool,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    listen: Option<String>,
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    advertise: Option<String>,
-}
-
-#[derive(serde::Deserialize, serde::Serialize, Default, Clone)]
-#[serde(deny_unknown_fields)]
-struct FileConfig {
-    #[serde(default)]
-    serve: FileServe,
-    #[serde(default)]
-    relay: FileRelay,
-}
-
-fn load_config(state_dir: &std::path::Path) -> FileConfig {
-    let cfg_path = state_dir.join("config.toml");
-    match std::fs::read_to_string(&cfg_path)
-        .map_err(|e| e.to_string())
-        .and_then(|b| toml::from_str(&b).map_err(|e| format!("{cfg_path:?}: {e}")))
-    {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("{e}");
-            std::process::exit(1);
-        }
-    }
-}
+// config 单表（Q-H F1）：schema 收敛到 `serve_cli` 的唯一表（FileConfig/FileServe/
+// FileRelay/FileDdns + `load_config_strict`/`serve_config_of`）——本模块不再有弱表
+// （曾用 `Option<toml::Value>` 承载 tx_shape，弱表放行的类型/值域非法会在控制面
+// handler 线程里经严格表 exit(1) ⇒ 打崩统一进程；审计 P1 实测两形态）。
 
 /// 期望态写回（CLI-4 整改：**重读现文件 → 只翻 enabled** → 同目录 tmp + rename
 /// 原子替换、创建即 0600——盲写启动期内存快照会把运行期手编意图静默回滚）。
-/// 重读失败（手编坏 config）= 拒绝写入（Go nodeconfig.Update 同纪律）。
-/// 重读 config（角色 op 内刷新内存快照；失败 = 沿用旧值——写回路径已先行校验）。
-fn load_config_quiet(state_dir: &std::path::Path) -> FileConfig {
-    std::fs::read_to_string(state_dir.join("config.toml"))
-        .ok()
-        .and_then(|b| toml::from_str(&b).ok())
-        .unwrap_or_default()
-}
-
-/// 读 config 的角色 enabled 位（纯读降级面用；坏/缺 config = 默认 true——Go 同款）。
-pub(crate) fn config_role_enabled(state_dir: &std::path::Path, role: &str) -> bool {
-    let cfg = load_config_quiet(state_dir);
-    if role == "serve" {
-        cfg.serve.enabled
-    } else {
-        cfg.relay.enabled
-    }
-}
-
-pub(crate) fn write_config_enabled(state_dir: &std::path::Path, serve: Option<bool>, relay: Option<bool>) -> Result<(), String> {
-    let path = state_dir.join("config.toml");
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("重读 {path:?}：{e}"))?;
-    let mut cfg: FileConfig = toml::from_str(&raw).map_err(|e| format!("config 解析失败（拒绝写入，先修复）：{e}"))?;
+/// 重读走严格表（Q-H F1；Go `nodeconfig.Update` 同纪律：坏 config = 拒绝写入）。
+pub(crate) fn write_config_enabled(
+    state_dir: &std::path::Path,
+    serve: Option<bool>,
+    relay: Option<bool>,
+) -> Result<(), String> {
+    let mut cfg = load_config_strict(state_dir)
+        .map_err(|e| format!("config 读取失败（拒绝写入，先修复）：{e}"))?;
     if let Some(v) = serve {
         cfg.serve.enabled = v;
     }
@@ -163,6 +66,13 @@ pub(crate) fn write_config_enabled(state_dir: &std::path::Path, serve: Option<bo
         cfg.relay.enabled = v;
     }
     write_config_file(state_dir, &cfg)
+}
+
+/// 读 config 的角色 enabled 位（纯读降级面用；Q-H F1：坏 config = 如实报错——
+/// Go `degradedServe` 的「config 读取失败：<err>」同形，不再静默按默认 true）。
+pub(crate) fn config_role_enabled(state_dir: &std::path::Path, role: &str) -> Result<bool, String> {
+    let cfg = load_config_strict(state_dir)?;
+    Ok(if role == "serve" { cfg.serve.enabled } else { cfg.relay.enabled })
 }
 
 /// 纯配置写命令的通用改写壳（`serve ddns add/delete`、`serve relay set/clear`
@@ -184,9 +94,8 @@ pub(crate) enum DdnsWrite {
 }
 
 pub(crate) fn update_config(state_dir: &std::path::Path, edit: ConfigEdit) -> Result<DdnsWrite, String> {
-    let path = state_dir.join("config.toml");
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("读取 {path:?}：{e}"))?;
-    let mut cfg: FileConfig = toml::from_str(&raw).map_err(|e| format!("config 解析失败（拒绝写入，先修复）：{e}"))?;
+    let mut cfg = load_config_strict(state_dir)
+        .map_err(|e| format!("config 读取失败（拒绝写入，先修复）：{e}"))?;
     let out = match edit {
         ConfigEdit::DdnsAdd(domain) => {
             let list = cfg.serve.ddns.get_or_insert_with(Vec::new);
@@ -222,12 +131,10 @@ pub(crate) fn update_config(state_dir: &std::path::Path, edit: ConfigEdit) -> Re
     Ok(out)
 }
 
-/// 读 [[serve.ddns]] 域名表（`serve ddns list` 纯读；坏/缺 config = 空表 + 报错面
-/// 由调用方处理）。
+/// 读 [[serve.ddns]] 域名表（`serve ddns list` 纯读；坏/缺 config = 如实报错——
+/// Q-H F1 起走严格读）。
 pub(crate) fn config_serve_ddns(state_dir: &std::path::Path) -> Result<Vec<String>, String> {
-    let path = state_dir.join("config.toml");
-    let raw = std::fs::read_to_string(&path).map_err(|e| format!("读取 {path:?}：{e}"))?;
-    let cfg: FileConfig = toml::from_str(&raw).map_err(|e| format!("config 解析失败：{e}"))?;
+    let cfg = load_config_strict(state_dir)?;
     Ok(cfg
         .serve
         .ddns
@@ -259,40 +166,42 @@ fn write_config_file(state_dir: &std::path::Path, cfg: &FileConfig) -> Result<()
     std::fs::rename(state_dir.join("config.toml.tmp"), &path).map_err(|e| format!("原子替换 {path:?}：{e}"))
 }
 
-/// 统一进程入口（零参/仅全局 flag 形态）。
-pub fn cmd_unified(args: &[String]) {
-    // 预扫描拒收角色 flag（Go RunUnified 同义——**先于**正式解析，给可行动提示）。
-    // 只认 --state <dir> / --state=DIR / --verbose / --help：内联与空格两种取值形态
-    // 等价（评审 r1-H2：等号形态曾被静默忽略→跑在默认 state 上）；未知 flag 精确
-    // 匹配报错（评审 r1-Z1：前缀匹配曾把 --stateful 当 --state 收下）。
+/// 统一进程参数（零参/仅全局 flag）。
+pub(crate) enum UnifiedInvocation {
+    /// 运行（默认 state 或显式 `--state`）。
+    Run { state_dir: PathBuf, verbose: bool },
+    /// `--help`/`-h`：用法已打印，调用方直接返回。
+    Help,
+}
+
+/// 统一进程参数解析（Q-H F2：`--state` 全形态 fail-fast——缺值/空值/吞 flag 都是
+/// exit 2 + 可行动文案；取值器 = `cli_flags` 唯一实现）。
+pub(crate) fn parse_unified_args(args: &[String]) -> UnifiedInvocation {
     let mut state_dir = default_state_dir();
     let mut verbose = false;
     let mut i = 0;
     while i < args.len() {
         let a = &args[i];
-        if !a.starts_with('-') {
+        let Some((name, inline)) = cli_flags::split_flag(a) else {
             eprintln!("统一进程不接受位置参数（{a:?}）——角色命令见 `homeway-cli serve` / `homeway-cli relay` / 客户端域命令");
             std::process::exit(2);
-        }
-        let body = a.trim_start_matches('-');
-        let (name, inline) = match body.split_once('=') {
-            Some((k, v)) => (k.to_owned(), Some(v.to_owned())),
-            None => (body.to_owned(), None),
         };
-        match name.as_str() {
+        match name {
             "state" => {
-                if let Some(v) = inline {
-                    state_dir = PathBuf::from(v);
-                } else if let Some(v) = args.get(i + 1) {
-                    state_dir = PathBuf::from(v.clone());
+                state_dir = cli_flags::take_state_or_exit(
+                    "state",
+                    inline,
+                    args.get(i + 1).map(String::as_str),
+                );
+                if inline.is_none() {
                     i += 1; // --state 的值位
                 }
             }
-            "verbose" => verbose = true,
+            "verbose" => verbose = cli_flags::take_bool_or_exit("verbose", inline, true),
             "help" | "h" => {
                 println!("homeway-cli [统一进程] —— 零参起；只认 --state <dir> / --verbose（角色参数写 config.toml，或用 serve/relay 前台单角色形态）");
                 println!("子命令形态：homeway-cli <serve|relay|status|host|term|files|connect|speedtest|token|dnstest|portfwd> …（无子命令 = 统一进程）");
-                return;
+                return UnifiedInvocation::Help;
             }
             other => {
                 eprintln!("统一进程只认 --state/--verbose（--{other} 是角色 flag）——角色参数请写 {} 的 config.toml，或用 `homeway-cli serve` / `homeway-cli relay` 前台单角色形态",
@@ -302,7 +211,15 @@ pub fn cmd_unified(args: &[String]) {
         }
         i += 1;
     }
-    run_unified_state(state_dir, verbose);
+    UnifiedInvocation::Run { state_dir, verbose }
+}
+
+/// 统一进程入口（零参/仅全局 flag 形态）。
+pub fn cmd_unified(args: &[String]) {
+    match parse_unified_args(args) {
+        UnifiedInvocation::Help => {}
+        UnifiedInvocation::Run { state_dir, verbose } => run_unified_state(state_dir, verbose),
+    }
 }
 
 // ---------- serve/relay 角色管理面（RoleHost 实现：期望态写 config + 动态启停） ----------
@@ -363,18 +280,12 @@ impl UnifiedRoles {
         inner.relay.is_some()
     }
 
-    /// 装配 serve 角色（config 真源——文件即意图层）。**装配前重读校验**（CLI-3
-    /// 整改：serve_cli 的 flag/config 解析失败路径含 process::exit——在控制面
-    /// handler 线程里触发会把整个统一进程带走；先以同表 schema 严格校验，坏
-    /// config 在这里就回 Err）。
+    /// 装配 serve 角色（config 真源——文件即意图层）。**装配前严格读**（Q-H F1：
+    /// 值域/类型非法在这里回 Err；控制面 handler 线程内**零 exit**——旧形态经
+    /// `serve_cli::assemble` 的 exit(1) 会打崩整个统一进程，审计 P1 实测两形态）。
     fn assemble_serve(&self) -> Result<(Arc<ServeEngine>, bool), String> {
-        let raw = std::fs::read_to_string(self.state_dir.join("config.toml"))
-            .map_err(|e| format!("config 重读失败：{e}"))?;
-        toml::from_str::<FileConfig>(&raw).map_err(|e| format!("config 非法（先修复再 start）：{e}"))?;
-        let cfg = assemble_serve_cfg(&[
-            "--state".to_owned(),
-            self.state_dir.display().to_string(),
-        ]);
+        let fc = load_config_strict(&self.state_dir)?;
+        let cfg = serve_config_of(&fc, &self.state_dir)?;
         let upnp = cfg.upnp;
         let engine = ServeEngine::start(
             cfg,
@@ -847,17 +758,24 @@ impl RoleHost for UnifiedRoles {
         match op {
             // ---- serve 五件 ----
             R::ServeStart => {
+                // Q-H F1：op 顺序固定「严格读 → 写回 → 改内存 → 装配」，任一步 Err ⇒
+                // 拒绝 + **零副作用**（内存/文件均不变；Go lifecycleStart→Update 同形——
+                // `roleops.go:161-176`：Update 失败直接返回、角色不动、期望态不写）。
+                // **代码门 M1**：严格读/写回**先于** `already` 短路（Go 的 Update 也在
+                // before 判定之前）——「角色在跑 + config 被手编坏」⇒ 拒绝（不再 rc=0）。
+                let mut cfg = load_config_strict(&self.state_dir)
+                    .map_err(|e| BackendErr::Other(format!("config 非法（拒绝 start，先修复）：{e}")))?;
+                write_config_enabled(&self.state_dir, Some(true), None)
+                    .map_err(|e| BackendErr::Other(format!("写 config：{e}")))?;
+                cfg.serve.enabled = true;
+                inner.cfg = cfg;
                 if Self::serve_running(&inner) {
                     return Ok(RoleOpOut::Action(RoleActionResult { action: "already".into() }));
                 }
-                inner.cfg.serve.enabled = true;
-                write_config_enabled(&self.state_dir, Some(true), None)
-                    .map_err(|e| BackendErr::Other(format!("写 config：{e}")))?;
                 // 串行化：等上一轮 stop 的收尾线程（端口/socket 释放净）再装配。
                 if let Some(h) = inner.serve_stop_join.take() {
                     let _ = h.join();
                 }
-                inner.cfg = load_config_quiet(&self.state_dir);
                 let started = match self.assemble_serve() {
                     Ok((engine, upnp)) => {
                         inner.serve_epoch += 1;
@@ -895,9 +813,14 @@ impl RoleHost for UnifiedRoles {
                 }
             }
             R::ServeStop => {
-                inner.cfg.serve.enabled = false;
+                // Q-H F1：同上顺序（Stop 现状同病——先翻内存再写回）；坏 config ⇒
+                // 拒绝 + 零副作用（不翻期望态、不停引擎）。
+                let mut cfg = load_config_strict(&self.state_dir)
+                    .map_err(|e| BackendErr::Other(format!("config 非法（拒绝 stop，先修复）：{e}")))?;
                 write_config_enabled(&self.state_dir, Some(false), None)
                     .map_err(|e| BackendErr::Other(format!("写 config：{e}")))?;
+                cfg.serve.enabled = false;
+                inner.cfg = cfg;
                 if let Some(engine) = inner.serve.take() {
                     inner.serve_epoch += 1;
                     inner.serve_reason.clear(); // 停用 = stopped 收面（评审 r2-11：failed 残留 reason 会把停用态误呈 failed）
@@ -926,6 +849,12 @@ impl RoleHost for UnifiedRoles {
                 if !Self::serve_running(&inner) && inner.serve_reason.is_empty() {
                     return Err(BackendErr::Other("serve 未在运行（先 start）——restart 无重建对象".into()));
                 }
+                // Q-H F1：restart **不变期望态**（Go `lifecycleRestart` 不调 Update——
+                // `roleops.go:194-203`）⇒ 只做严格读（坏 config = 拒绝 + 零副作用）；
+                // 装配期失败（合法 config 但绑定失败等）仍走 failed + 退避重建。
+                let cfg = load_config_strict(&self.state_dir)
+                    .map_err(|e| BackendErr::Other(format!("config 非法（拒绝 restart，先修复）：{e}")))?;
+                inner.cfg = cfg;
                 // failed 态可 restart（Go RestartRole 同义：跳过剩余退避立即重建——
                 // 评审 r2-11：failed 变常态后「先 start」文案不可行动）。
                 // 与 stop 同款：旧引擎异步收尾（join 后再装配——串行化防端口退让）。
@@ -1018,13 +947,16 @@ impl RoleHost for UnifiedRoles {
             }
             // ---- relay 五件 ----
             R::RelayStart => {
+                // Q-H F1 + 代码门 M1：与 serve 同序，且严格读/写回**先于** already 短路。
+                let mut cfg = load_config_strict(&self.state_dir)
+                    .map_err(|e| BackendErr::Other(format!("config 非法（拒绝 start，先修复）：{e}")))?;
+                write_config_enabled(&self.state_dir, None, Some(true))
+                    .map_err(|e| BackendErr::Other(format!("写 config：{e}")))?;
+                cfg.relay.enabled = true;
+                inner.cfg = cfg;
                 if Self::relay_running(&inner) {
                     return Ok(RoleOpOut::Action(RoleActionResult { action: "already".into() }));
                 }
-                inner.cfg.relay.enabled = true;
-                write_config_enabled(&self.state_dir, None, Some(true))
-                    .map_err(|e| BackendErr::Other(format!("写 config：{e}")))?;
-                inner.cfg = load_config_quiet(&self.state_dir);
                 let started = match self.assemble_relay_role(&inner.cfg) {
                     Ok((proc, token, listen)) => {
                         inner.relay_epoch += 1;
@@ -1064,9 +996,13 @@ impl RoleHost for UnifiedRoles {
                 }
             }
             R::RelayStop => {
-                inner.cfg.relay.enabled = false;
+                // Q-H F1：严格读先于任何副作用（坏 config = 拒绝 + 零副作用）。
+                let mut cfg = load_config_strict(&self.state_dir)
+                    .map_err(|e| BackendErr::Other(format!("config 非法（拒绝 stop，先修复）：{e}")))?;
                 write_config_enabled(&self.state_dir, None, Some(false))
                     .map_err(|e| BackendErr::Other(format!("写 config：{e}")))?;
+                cfg.relay.enabled = false;
+                inner.cfg = cfg;
                 if let Some(proc) = inner.relay.take() {
                     inner.relay_epoch += 1;
                     inner.relay_reason.clear(); // 停用 = stopped 收面（评审 r2-11）
@@ -1081,6 +1017,10 @@ impl RoleHost for UnifiedRoles {
                 if !Self::relay_running(&inner) && inner.relay_reason.is_empty() {
                     return Err(BackendErr::Other("relay 未在运行（先 start）——restart 无重建对象".into()));
                 }
+                // Q-H F1：与 serve 同款——restart 不变期望态，只严格读（拒坏 config）。
+                let cfg = load_config_strict(&self.state_dir)
+                    .map_err(|e| BackendErr::Other(format!("config 非法（拒绝 restart，先修复）：{e}")))?;
+                inner.cfg = cfg;
                 // failed 态可 restart（同 serve——评审 r2-11）。
                 if let Some(proc) = inner.relay.take() {
                     inner.relay_epoch += 1;
@@ -1236,8 +1176,16 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
         ns.events.eventf("config.toml 缺失——已生成默认（serve.enabled=true）");
     }
 
-    // ③ 读 config（fail-fast：非法 = 可行动错误拒启，不静默按默认）
-    let cfg = load_config(&state_dir);
+    // ③ 读 config（fail-fast：非法 = 可行动错误**拒启**——Go `nodeconfig.Load` 同形，
+    //    发生在任何角色/control 装配之前；Q-H F1 起 = 唯一严格表 + 全量值域，
+    //    含 [relay] 段整文件校验）
+    let cfg = match load_config_strict(&state_dir) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!("homeway: config 非法——拒绝启动（先修复再启动）：{e}");
+            std::process::exit(1);
+        }
+    };
 
     // serve 侧日志 tee（engine 的摘要判据行进 cache/events.log；细节进 cache/debug.log；
     // P1-1）。tokf = token 端点变化轮流（events 文件只写 + verbose 回显）。
@@ -1424,6 +1372,10 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
         bus: Arc::clone(core.bus()),
         backend: core.clone(),
         logf: Arc::clone(&daemon_dlogf),
+        // Q-H F5：控制面资源收口（连接上限 64 + 握手期限 10s；Rust 形态加固，
+        // Go 无对应约束——登记见 INTEROP-CRITERIA 判据变更记录）。
+        max_conns: homeway_core::daemon::server::DEFAULT_MAX_CONTROL_CONNS,
+        handshake_deadline: homeway_core::daemon::server::DEFAULT_HANDSHAKE_DEADLINE,
     });
     {
         let s2 = Arc::clone(&srv);
@@ -1454,7 +1406,12 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
     ));
 
     println!("（homeway 统一进程前台运行中——Ctrl-C 收工）");
-    let _ = crate::serve_cli::wait_stop_pipe();
+    match crate::serve_cli::wait_stop_pipe() {
+        crate::serve_cli::StopWait::Signaled => {}
+        crate::serve_cli::StopWait::PipeErr(e) => {
+            eprintln!("homeway: {e}——按收到停止处理（收工）")
+        }
+    }
     println!("homeway: 收到信号，收工");
 
     // 按序停：control（断连接 goodbye）→ client（停全部会话）→ serve（D5 有序收工 +
@@ -1481,8 +1438,10 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
 
 #[cfg(test)]
 mod tests {
-    /// --state=DIR 与 --state DIR 等价（r1-H2 回归钉）——解析逻辑单测面（预扫描
-    /// 是 cmd_unified 内联闭包，这里以同构断言钉住两种形态的取值路径不回退）。
+    use super::*;
+
+    /// --state=DIR 与 --state DIR 等价（r1-H2 回归钉）——Q-H F2 起走 `cli_flags`
+    /// 唯一取值器（解析逻辑抽为 `parse_unified_args` 可测）。
     #[test]
     fn state_flag_forms_equivalent() {
         for (args, want) in [
@@ -1491,27 +1450,83 @@ mod tests {
             (vec!["-state", "/tmp/c"], "/tmp/c"),
             (vec!["--verbose", "--state=/tmp/d"], "/tmp/d"),
         ] {
-            let mut state_dir = "/default".to_owned();
-            let mut i = 0;
-            while i < args.len() {
-                let a = args[i];
-                let body = a.trim_start_matches('-');
-                let (name, inline) = match body.split_once('=') {
-                    Some((k, v)) => (k.to_owned(), Some(v.to_owned())),
-                    None => (body.to_owned(), None),
-                };
-                if name == "state" {
-                    if let Some(v) = inline {
-                        state_dir = v.to_owned();
-                    } else if let Some(v) = args.get(i + 1) {
-                        state_dir = v.to_string();
-                        i += 1;
-                    }
+            let args: Vec<String> = args.iter().map(|s| s.to_string()).collect();
+            match parse_unified_args(&args) {
+                UnifiedInvocation::Run { state_dir, .. } => {
+                    assert_eq!(state_dir, PathBuf::from(want), "args={args:?}")
                 }
-                i += 1;
+                UnifiedInvocation::Help => panic!("不应是 help：{args:?}"),
             }
-            assert_eq!(state_dir, want, "args={args:?}");
         }
+    }
+
+    /// F7b：`--verbose=false` 真生效（此前显式值被忽略、恒 true）。
+    #[test]
+    fn verbose_false_takes_effect() {
+        match parse_unified_args(&["--verbose=false".to_owned()]) {
+            UnifiedInvocation::Run { verbose, .. } => assert!(!verbose),
+            UnifiedInvocation::Help => panic!("不应是 help"),
+        }
+    }
+
+    /// F1：op 顺序 =「严格读 → 写回 → 改内存 → 装配」——坏 config 时 **零副作用**
+    /// （文件逐字节不变、内存 enabled 不变、状态面 stopped）。用临时 state 直接
+    /// 构造 UnifiedRoles（控制面 handler 的宿主），不装配任何角色。
+    #[test]
+    fn role_op_rejects_bad_config_with_zero_side_effects() {
+        let dir = std::env::temp_dir().join(format!(
+            "hw-unified-op-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let good = "[serve]\nenabled = false\nlisten = 41641\n[relay]\nenabled = false\n";
+        std::fs::write(dir.join("config.toml"), good).unwrap();
+        let cfg = load_config_strict(&dir).unwrap();
+        let roles = Arc::new(UnifiedRoles {
+            state_dir: dir.clone(),
+            me: Mutex::new(None),
+            logf: Arc::new(|_| {}),
+            eventf: Arc::new(|_| {}),
+            dlogf: Arc::new(|_| {}),
+            tokf: Arc::new(|_| {}),
+            log_paths: None,
+            inner: Mutex::new(RolesInner {
+                cfg,
+                serve: None,
+                serve_upnp: false,
+                relay: None,
+                serve_epoch: 0,
+                relay_epoch: 0,
+                relay_token: None,
+                relay_listen: None,
+                serve_restarts: 0,
+                relay_restarts: 0,
+                serve_reason: String::new(),
+                relay_reason: String::new(),
+                serve_stop_join: None,
+            }),
+        });
+        // 注入坏 config（内存 = 上一份好值）。
+        let bad = "[serve]\nenabled = false\npeer_ttl = \"abc\"\n";
+        std::fs::write(dir.join("config.toml"), bad).unwrap();
+        let e = RoleHost::role_op(&*roles, RoleOp::ServeStart).unwrap_err();
+        assert!(format!("{e}").contains("peer_ttl"), "{e}");
+        assert!(format!("{e}").contains("config.toml"), "{e}");
+        // 文件未变（零副作用）。
+        assert_eq!(std::fs::read_to_string(dir.join("config.toml")).unwrap(), bad);
+        // 内存未变 + 状态面 stopped（不谎报 enabled）。
+        let inner = roles.inner.lock().unwrap();
+        assert!(!inner.cfg.serve.enabled);
+        assert!(inner.serve.is_none());
+        drop(inner);
+        let st = roles.statuses();
+        let srv = st.iter().find(|r| r.name == "serve").unwrap();
+        assert_eq!(srv.state, "stopped");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// 掩码形态（Go maskToken 同串）。
