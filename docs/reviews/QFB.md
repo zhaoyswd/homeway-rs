@@ -211,6 +211,7 @@
 
 | commit | 内容 |
 |---|---|
-| `（见 git log）` | 实现 F1–F9 + 代码门 r27 整改（6 文件） |
-| `（见 git log）` | 判据登记（`INTEROP-CRITERIA.md`：变更记录 +1 / 计数输入集 +4 / 注记 A·B） |
-| `（见 git log）` | 批记录（本文）+ 设计文档 v3 入库 |
+| `129f1c4` | 实现 F1–F9 + 代码门 r27 整改（6 文件：`facade/portfwd.rs`/`tun_exec.rs`/`bridge_host.rs`/`mod.rs`、`sysfd.rs`、`daemon/carriers/mod.rs`） |
+| `08a0f62` | 判据登记（`INTEROP-CRITERIA.md`：判据变更记录 +1 / 计数输入集 +4 / 注记 A·B + Q-F 收口指针） |
+| `11800a7` | 批记录（本文）+ 设计文档 v3 入库 |
+| `（本行 commit）` | 批记录补：§8 填 commit hash（三件套入库后回填） |
