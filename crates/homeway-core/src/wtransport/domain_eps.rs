@@ -293,11 +293,6 @@ pub struct EndpointInputs {
 /// - 「token 端点 %q 域名解析失败（跳过）：%v」
 /// - 「token 端点 %q 端口非法（跳过）」（域名字面量端口非 1-65535）
 /// - 「token 端点 %s 解析为 %d 个地址（%s）」
-///
-/// **入参须已按 transport 过滤**（M1 §2.1 末段「两族候选不得互相投喂」）：WG 面的调用方
-/// 传 `token::wg_endpoint_refs(...)`（滤掉 QUIC 类端点——QUIC 端口与 WG 端口不同，§1.1，
-/// 当 WG 候选只会产出「握手超时」噪声与赛跑结算失真）；QUIC 档的候选由 S2 的岛按
-/// `kind==Quic` 取。过滤放在 `token` 侧（本文件属 `wtransport/**`，M1 S1c 的红线面）。
 pub fn split_and_resolve(eps: &[EndpointRef<'_>], logf: &Logf) -> EndpointInputs {
     let mut out = Vec::with_capacity(eps.len());
     let mut seen: Vec<SocketAddr> = Vec::new(); // 全局去重（token 内跨组同址：先到先得）

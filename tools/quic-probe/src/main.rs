@@ -75,6 +75,13 @@ struct Args {
     json: bool,
     hold: u64,
     wait_ms: u64,
+    /// 发 reg3 之后、发数据报之前的等待（ms）：准入是「引擎裁决 + 回执 + 绑定」三步，
+    /// 立刻发数据报会被判「未登记连接的数据报」丢掉（§1.3 的准入面）。
+    reg_wait: u64,
+    /// 内层包的目的地址（`ip:port`；缺省 = DNS 形态走隧道 IP:53，否则哑载荷走 10.0.0.1:30000）
+    dst: Option<String>,
+    /// push 模式的发送节拍（pps；0 = 尽快发——用于触中继 200pps 闸的 B2 形态）
+    rate: u32,
     cmd: String,
 }
 
@@ -95,6 +102,9 @@ impl Args {
             json: false,
             hold: 0,
             wait_ms: 3000,
+            reg_wait: 400,
+            dst: None,
+            rate: 0,
             cmd: "conn".to_owned(),
         };
         let mut i = 1;
@@ -116,6 +126,9 @@ impl Args {
                 "--size" => a.size = next(&mut i)?.parse().map_err(|e| format!("--size: {e}"))?,
                 "--hold" => a.hold = next(&mut i)?.parse().map_err(|e| format!("--hold: {e}"))?,
                 "--wait-ms" => a.wait_ms = next(&mut i)?.parse().map_err(|e| format!("--wait-ms: {e}"))?,
+                "--reg-wait" => a.reg_wait = next(&mut i)?.parse().map_err(|e| format!("--reg-wait: {e}"))?,
+                "--dst" => a.dst = Some(next(&mut i)?),
+                "--rate" => a.rate = next(&mut i)?.parse().map_err(|e| format!("--rate: {e}"))?,
                 "--dns" => a.dns = true,
                 "--json" => a.json = true,
                 "conn" | "push" => a.cmd = v.to_owned(),
@@ -259,7 +272,28 @@ fn reg3_frame(
 
 // ---------- 内层包（合成 IP 流） ----------
 
+/// 互联网校验和（IPv4 头 / UDP 伪头用）。
+fn inet_checksum(words: &[u8]) -> u16 {
+    let mut sum: u32 = 0;
+    for i in (0..words.len()).step_by(2) {
+        let w = if i + 1 < words.len() {
+            u16::from_be_bytes([words[i], words[i + 1]])
+        } else {
+            u16::from(words[i]) << 8
+        };
+        sum += u32::from(w);
+    }
+    while (sum >> 16) != 0 {
+        sum = (sum & 0xffff) + (sum >> 16);
+    }
+    !(sum as u16)
+}
+
 /// 内层 IPv4 + UDP 包（DNS 查询或哑载荷）。
+///
+/// 校验和**必须算**：内层包会被推给出口的 smoltcp 栈（`intercept.device.rx_push`），
+/// 而 smoltcp 对 IPv4 头校验和是**强制**校验的（0 = 坏包静默丢）——探针起初留 0
+/// 导致 DNS 面收不到查询（现场：出口 `dns: q=0`，排查记录见 M1.md 的本批读数）。
 fn inner_pkt(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, payload: &[u8]) -> Vec<u8> {
     let mut p = vec![0u8; 20 + 8 + payload.len()];
     p[0] = 0x45;
@@ -268,10 +302,25 @@ fn inner_pkt(src: [u8; 4], dst: [u8; 4], sport: u16, dport: u16, payload: &[u8])
     p[9] = 17; // UDP
     p[12..16].copy_from_slice(&src);
     p[16..20].copy_from_slice(&dst);
+    let ip_sum = inet_checksum(&p[..20]);
+    p[10..12].copy_from_slice(&ip_sum.to_be_bytes());
     p[20..22].copy_from_slice(&sport.to_be_bytes());
     p[22..24].copy_from_slice(&dport.to_be_bytes());
     p[24..26].copy_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
     p[28..].copy_from_slice(payload);
+    // UDP 校验和（伪头 + UDP 头 + 载荷；IPv4 允许 0，但真实栈都会算）
+    let mut pseudo = Vec::with_capacity(12 + 8 + payload.len());
+    pseudo.extend_from_slice(&src);
+    pseudo.extend_from_slice(&dst);
+    pseudo.push(0);
+    pseudo.push(17);
+    pseudo.extend_from_slice(&((8 + payload.len()) as u16).to_be_bytes());
+    pseudo.extend_from_slice(&p[20..]);
+    let mut udp_sum = inet_checksum(&pseudo);
+    if udp_sum == 0 {
+        udp_sum = 0xffff; // RFC 768：算出 0 时置全 1
+    }
+    p[26..28].copy_from_slice(&udp_sum.to_be_bytes());
     p
 }
 
@@ -546,10 +595,11 @@ fn run() -> Result<(), String> {
         let mut eps: Vec<String> = Vec::new();
         for (typ, addr) in &info.endpoints {
             eps.push(format!("{}={}（{}）", kind_name(*typ), addr, typ));
-            match *typ {
-                2 if quic_ep.is_none() => quic_ep = addr.parse().ok(),
-                1 if relay_ep.is_none() => relay_ep = addr.parse().ok(),
-                _ => {}
+            // 只有 QUIC 类端点自动取用（token 里唯一能直连的 QUIC 地址）；中继端点
+            // **必须显式 `--relay <addr>`**——`via=relay` 会改变整条 socket 的封壳语义，
+            // 隐式切换会让「直连读数」被误当直连（探针的读数口径必须显式）。
+            if *typ == 2 && quic_ep.is_none() {
+                quic_ep = addr.parse().ok();
             }
         }
         println!("token: peer={} label={} 端点[{}]", hex8(&info.peer_id), hex8(&label.unwrap()), eps.join(" "));
@@ -625,11 +675,22 @@ fn run() -> Result<(), String> {
         let frame = reg3_frame(&secret, &pubkey, &devtag, &exporter);
         let (mut send, _recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
         send.write_all(&frame).await.map_err(|e| format!("写 reg3: {e}"))?;
-        println!("reg3: 已发 {}B（dev={}）", frame.len(), hex8(&devtag));
+        println!("reg3: 已发 {}B（dev={}）；等 {}ms 让出口完成准入（引擎裁决→回执→绑定）",
+            frame.len(), hex8(&devtag), args.reg_wait);
+        tokio::time::sleep(Duration::from_millis(args.reg_wait)).await;
 
         // ---- 数据面 ----
-        let dport: u16 = if args.dns { 53 } else { 30000 };
-        let dst = if args.dns { SERVER_TUNNEL_IP } else { [10, 0, 0, 1] };
+        let (dst, dport): ([u8; 4], u16) = match &args.dst {
+            Some(v) => {
+                let sa: SocketAddr = v.parse().map_err(|e| format!("--dst: {e}"))?;
+                match sa.ip() {
+                    std::net::IpAddr::V4(ip) => (ip.octets(), sa.port()),
+                    std::net::IpAddr::V6(_) => return Err("内层包只支持 IPv4（探针面）".into()),
+                }
+            }
+            None if args.dns => (SERVER_TUNNEL_IP, 53),
+            None => ([10, 0, 0, 1], 30000),
+        };
         let mk = |size: usize| -> Vec<u8> {
             if args.dns {
                 inner_pkt(tun_ip, dst, 40000, 53, &dns_query("probe.homeway.test"))
@@ -662,19 +723,73 @@ fn run() -> Result<(), String> {
                 Err(_) => println!("回程：{}ms 内无应答（出口可能未登记/未代答）", args.wait_ms),
             }
         } else {
-            // 上行灌包（B1/B2）：按 200pps 预算节奏发（relay 限速 200pps/源）
-            let gap = Duration::from_millis(5); // 200pps
-            let t1 = Instant::now();
-            for i in 0..args.n {
-                if i % 50 == 0 && i > 0 {
-                    tokio::time::sleep(gap * 50).await;
+            // 上行灌包（B1/B2）：回程读侧并发跑（UDP 回显形态——回程包尺寸也要读数）
+            let replies = Arc::new(AtomicU64::new(0));
+            let reply_bytes = Arc::new(AtomicU64::new(0));
+            let reply_max = Arc::new(AtomicU64::new(0));
+            let drained = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let (r, rb, rm, dr) = (
+                Arc::clone(&replies),
+                Arc::clone(&reply_bytes),
+                Arc::clone(&reply_max),
+                Arc::clone(&drained),
+            );
+            let conn_r = conn.clone();
+            let reader = tokio::spawn(async move {
+                while let Ok(dg) = conn_r.read_datagram().await {
+                    r.fetch_add(1, Ordering::SeqCst);
+                    rb.fetch_add(dg.len() as u64, Ordering::SeqCst);
+                    rm.fetch_max(dg.len() as u64, Ordering::SeqCst);
                 }
-                if let Err(e) = conn.send_datagram(bytes::Bytes::from(pkt0.clone())) {
-                    println!("push: 第 {i} 个发送失败：{e}");
-                    break;
+                dr.store(true, Ordering::SeqCst);
+            });
+            let t1 = Instant::now();
+            let mut sent = 0usize;
+            let mut buf_full = 0usize;
+            for i in 0..args.n {
+                if args.rate > 0 {
+                    // 节拍发送（µs 粒度：gap = 1e6/rate）
+                    let due = t1 + Duration::from_micros(1_000_000 * (i as u64 + 1) / u64::from(args.rate));
+                    let now = Instant::now();
+                    if due > now {
+                        tokio::time::sleep(due - now).await;
+                    }
+                }
+                // 预检（M1 §0.3 P4 / §1.5：**裸 `send_datagram` 在缓冲满时静默淘汰最旧**，
+                // 恒返 Ok）——探针也不许静默：缓冲不够就丢 + 计数，不假装发出去
+                let need = pkt0.len();
+                if conn.datagram_send_buffer_space() < need {
+                    buf_full += 1;
+                    if buf_full == 1 {
+                        println!("push: 发送缓冲满 ⇒ 丢 + 计数（裸 send_datagram 在这里会静默淘汰最旧并返 Ok）");
+                    }
+                    continue;
+                }
+                match conn.send_datagram(bytes::Bytes::from(pkt0.clone())) {
+                    Ok(()) => sent += 1,
+                    Err(e) => {
+                        println!("push: 第 {i} 个发送失败：{e}");
+                        break;
+                    }
                 }
             }
-            println!("push: 已发 {} 个（{}B/个，用时 {:.2}s）", args.n, pkt0.len(), t1.elapsed().as_secs_f64());
+            let send_elapsed = t1.elapsed().as_secs_f64();
+            println!(
+                "push: 已发 {sent}/{} 个（{}B/个，用时 {send_elapsed:.2}s，均 {:.0}pps；缓冲满丢 {buf_full}）",
+                args.n,
+                pkt0.len(),
+                sent as f64 / send_elapsed.max(1e-6)
+            );
+            // 收尾窗（等回程把 ACK/回显排空）
+            tokio::time::sleep(Duration::from_millis(1500)).await;
+            println!(
+                "push: 回程 {} 包 / {}B / 最大 {}B（reader 结束={}）",
+                replies.load(Ordering::SeqCst),
+                reply_bytes.load(Ordering::SeqCst),
+                reply_max.load(Ordering::SeqCst),
+                drained.load(Ordering::SeqCst)
+            );
+            reader.abort();
         }
         if args.hold > 0 {
             tokio::time::sleep(Duration::from_secs(args.hold)).await;
