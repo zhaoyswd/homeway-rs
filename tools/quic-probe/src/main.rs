@@ -82,6 +82,10 @@ struct Args {
     dst: Option<String>,
     /// push 模式的发送节拍（pps；0 = 尽快发——用于触中继 200pps 闸的 B2 形态）
     rate: u32,
+    /// 本地绑定地址（M1 S5-3 B2 的**源桶分离**：中继限流按 `src.ip()` 计桶，而
+    /// 本地出口与探针同为 `127.0.0.1` ⇒ 共桶（200pps 被两边分）；把探针绑到
+    /// `127.0.0.2` 即得独立桶——形态差异照设计 §7.2 B2/r12 专4-5 登记）。
+    bind: String,
     cmd: String,
 }
 
@@ -105,13 +109,13 @@ impl Args {
             reg_wait: 400,
             dst: None,
             rate: 0,
+            bind: "0.0.0.0:0".into(),
             cmd: "conn".to_owned(),
         };
         let mut i = 1;
         while i < argv.len() {
             let v = argv[i].as_str();
-            let next = |i: &mut usize| -> Result<String, String> {
-                *i += 1;
+            let next = |i: &mut usize| -> Result<String, String> {                *i += 1;
                 argv.get(*i).cloned().ok_or_else(|| format!("{v} 缺参数"))
             };
             match v {
@@ -129,6 +133,7 @@ impl Args {
                 "--reg-wait" => a.reg_wait = next(&mut i)?.parse().map_err(|e| format!("--reg-wait: {e}"))?,
                 "--dst" => a.dst = Some(next(&mut i)?),
                 "--rate" => a.rate = next(&mut i)?.parse().map_err(|e| format!("--rate: {e}"))?,
+                "--bind" => a.bind = next(&mut i)?.parse().map_err(|e| format!("--bind: {e}"))?,
                 "--dns" => a.dns = true,
                 "--json" => a.json = true,
                 "conn" | "push" => a.cmd = v.to_owned(),
@@ -639,7 +644,7 @@ fn run() -> Result<(), String> {
         .map_err(|e| format!("runtime: {e}"))?;
     rt.block_on(async move {
         let stats = Arc::new(SockStats::default());
-        let sock = std::net::UdpSocket::bind("0.0.0.0:0").map_err(|e| format!("bind: {e}"))?;
+        let sock = std::net::UdpSocket::bind(&args.bind).map_err(|e| format!("bind（{}）: {e}", args.bind))?;
         sock.set_nonblocking(true).map_err(|e| format!("非阻塞: {e}"))?;
         let local = sock.local_addr().map_err(|e| format!("local_addr: {e}"))?;
         let io = tokio::net::UdpSocket::from_std(sock).map_err(|e| format!("from_std: {e}"))?;

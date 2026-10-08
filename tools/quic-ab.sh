@@ -556,9 +556,11 @@ mem_conns_load() {
   local after="${CONNS_LOAD_AFTER:-6}"   # 空转相位长度（秒）
   local samples="${CONNS_LOAD_SAMPLES:-40}"  # 负载相位采样数（×0.5s）
   local dur=$(( after + samples / 2 + 6 ))
+  local nread=()   # CONNS_LOAD_NO_READ=1 ⇒ 客户端不读回程（顶满服务端发送缓冲的最坏面）
+  [[ "${CONNS_LOAD_NO_READ:-0}" == "1" ]] && nread=(--no-read)
   local slog="$OUT/connsload-$n-srv.out"
   local clog="$OUT/connsload-$n-cli.out"
-  echo "负载态档：N=$n 每连接 $rate pps × $size B；空转相位 ${after}s，负载相位 $(( samples / 2 ))s" | tee -a "$out"
+  echo "负载态档：N=$n 每连接 $rate pps × $size B；空转相位 ${after}s，负载相位 $(( samples / 2 ))s；no_read=${CONNS_LOAD_NO_READ:-0}" | tee -a "$out"
   "$bin" server "$n" --load > "$slog" 2>&1 &
   local spid=$!; KIDS+=($spid)
   local i=0 port=""
@@ -568,7 +570,7 @@ mem_conns_load() {
     sleep 0.1; (( i++ ))
   done
   [[ -n "$port" ]] || die "multiconn 服务端未报 PORT（conns-load）"
-  "$bin" "$port" "$n" --load --rate "$rate" --size "$size" --dur "$dur" --start-after "$after" > "$clog" 2>&1 &
+  "$bin" "$port" "$n" --load --rate "$rate" --size "$size" --dur "$dur" --start-after "$after" "${nread[@]}" > "$clog" 2>&1 &
   local cpid=$!; KIDS+=($cpid)
   sleep 2.5
   local idle=(${(f)"$(sample_footprint "$spid" 4)"})

@@ -177,6 +177,8 @@ fn spawn_sender(conn: quinn::Connection, size: usize, rate: u32, dur: Duration, 
 }
 
 /// 接收面（客户端负载档）：把回程读空（否则服务端发送缓冲会顶住）。
+/// `--no-read` 时不启本 task —— 用来把**服务端发送缓冲顶满**（最坏缓冲面，
+/// §6.3 的「每连接 1 MiB send」上界要真被用起来才叫测过）。
 fn spawn_reader(conn: quinn::Connection, st: Arc<LoadStats>) {
     tokio::spawn(async move {
         while let Ok(dg) = conn.read_datagram().await {
@@ -195,6 +197,8 @@ struct Flags {
     /// 负载**开跑延时**（客户端侧）：先建链 → 空转 `start_after` 秒 → 再开流量。
     /// 用途 = 同一轮里拿到「空转 footprint」与「负载态 footprint」两读数（增量可直接算）。
     start_after: Duration,
+    /// 客户端**不读回程**（顶满服务端发送缓冲的最坏面；见 `spawn_reader` 注释）。
+    no_read: bool,
 }
 
 fn parse_flags(args: &[String]) -> Flags {
@@ -204,11 +208,13 @@ fn parse_flags(args: &[String]) -> Flags {
         size: 1280,
         dur: Duration::from_secs(600),
         start_after: Duration::ZERO,
+        no_read: false,
     };
     let mut i = 0;
     while i < args.len() {
         match args[i].as_str() {
             "--load" => f.load = true,
+            "--no-read" => f.no_read = true,
             "--rate" => {
                 if let Some(v) = args.get(i + 1).and_then(|v| v.parse().ok()) {
                     f.rate = v;
@@ -314,9 +320,10 @@ fn main() {
         }
         let who = if flags.load { "cli-load" } else { "cli-idle" };
         eprintln!(
-            "客户端已建 {} 连接，hold（load={} size={} rate={} dur={}s）",
+            "客户端已建 {} 连接，hold（load={} no_read={} size={} rate={} dur={}s）",
             conns.len(),
             flags.load,
+            flags.no_read,
             flags.size,
             flags.rate,
             flags.dur.as_secs()
@@ -329,7 +336,9 @@ fn main() {
                 eprintln!("客户端开跑负载（size={} rate={} dur={}s）", flags.size, flags.rate, flags.dur.as_secs());
             }
             for c in &conns {
-                spawn_reader(c.clone(), Arc::clone(&st));
+                if !flags.no_read {
+                    spawn_reader(c.clone(), Arc::clone(&st));
+                }
                 spawn_sender(
                     c.clone(),
                     flags.size,

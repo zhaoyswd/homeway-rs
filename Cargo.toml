@@ -8,7 +8,10 @@ members = ["crates/homeway-core", "crates/homeway-cli", "crates/homeway-capi", "
 #   tools/quic-probe = M1 S1c 的探针客户端（harness-only：RPK 钉定自定义 verifier 的
 #                    `dangerous()` 安装点 + relay 信封组帧）；产品面隔离门只扫 crates/，
 #                    独立 workspace 让它与产品面隔离（同 tools/quic-ab 先例）
-exclude = ["fuzz", "tools/quic-ab", "tools/quic-probe"]
+#   tools/m1-ab    = M1 S5-2/S5-3 的**产品路径**端到端吞吐台（harness-only：把
+#                    homeway-core::facade / homeway-quic 当库驱动——只用它们的公开面，
+#                    不含产品代码改动；独立 workspace 同 tools/quic-probe 先例）
+exclude = ["fuzz", "tools/quic-ab", "tools/quic-probe", "tools/m1-ab"]
 
 [workspace.package]
 version = "0.2.3"
