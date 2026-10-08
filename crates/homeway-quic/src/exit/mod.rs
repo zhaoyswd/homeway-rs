@@ -24,6 +24,7 @@
 mod bridge;
 mod conn;
 mod rpk;
+mod socket;
 mod transport;
 
 #[cfg(test)]
@@ -49,9 +50,14 @@ use crate::rpk::{Ed25519Seed, RpkPublicKey};
 use crate::sync_util::{lock_unpoison, log_spawn_failed, ExitSignal};
 
 use bridge::{DropKind, ExitBridge, Outbound, OUTBOUND_QUEUE_MAX};
+use socket::{ExitSock, LegTable};
 
 /// 两向边界的公面（引擎消费面）：入站事件 + 准入请求/裁决 + 出站投递结果。
 pub use bridge::{ExitInbound, ExitSend, Reg3Request, Reg3Verdict};
+/// 腿帧 kind=5（QUIC 载荷）的线字节：真源 = `homeway-core` 的
+/// `wtransport::frame::FrameKind::Quic`；本 crate 是叶子、按字节复刻，跨 crate 一致性由
+/// `homeway-core` 侧的断言钉住（见 `socket` 模块头）。
+pub use socket::FRAME_KIND_QUIC;
 
 /// 出口面线程内共享上下文（端点主循环 + 每连接任务）。
 pub(crate) struct FaceCtx {
@@ -202,6 +208,10 @@ pub struct ExitQuic {
     handle: Mutex<Option<JoinHandle<()>>>,
     stats: Arc<ExitStats>,
     bridge: Arc<ExitBridge>,
+    /// 中继腿表（发送侧路由；M1 §1.6）：引擎线程写、QUIC 线程读。
+    legs: Arc<LegTable>,
+    /// 引擎 → QUIC 面的注入队列（腿上的 kind=5 载荷；引擎线程 `try_send` 非阻塞）。
+    inject_tx: socket::InjectTx,
     logf: Logf,
 }
 
@@ -234,6 +244,10 @@ impl ExitQuic {
             wake_rx,
             out_tx,
         ));
+        // ---- 中继承载（M1 §1.6）：腿表 + 引擎注入队列 ----
+        // 注入队列与「面 → 引擎」的入站队列同上限（8192 条，§6.4）：满 ⇒ 丢 + 计数。
+        let legs = Arc::new(LegTable::default());
+        let (inject_tx, inject_rx) = tmpsc::channel::<socket::InjPkt>(bridge::INBOUND_QUEUE_MAX);
 
         let handle = thread::Builder::new()
             .name(EXIT_THREAD.into())
@@ -242,7 +256,13 @@ impl ExitQuic {
                 let exit = Arc::clone(&exit);
                 let stats = Arc::clone(&stats);
                 let bridge = Arc::clone(&bridge);
-                move || thread_body(socket, cfg, logf, ready_tx, stop_rx, exit, stats, bridge, out_rx)
+                let legs = Arc::clone(&legs);
+                move || {
+                    thread_body(
+                        socket, cfg, logf, ready_tx, stop_rx, exit, stats, bridge, legs, out_rx,
+                        inject_rx,
+                    )
+                }
             })
             .map_err(|e| {
                 log_spawn_failed(&logf, EXIT_THREAD, &e, "出口 QUIC 面缺席（WG 面不受影响）");
@@ -258,6 +278,8 @@ impl ExitQuic {
                 handle: Mutex::new(Some(handle)),
                 stats,
                 bridge,
+                legs,
+                inject_tx,
                 logf,
             }),
             Ok(Err(e)) => {
@@ -319,6 +341,38 @@ impl ExitQuic {
     /// 摘某设备的绑定并关闭其连接（设备被摘除/身份轮换的 WG 侧路径；§1.3 撤销/轮换）。
     pub fn unbind_pub(&self, pubkey: &[u8; 32]) {
         self.bridge.unbind_pub(pubkey);
+    }
+
+    // ---- 中继承载（M1 §1.6）：腿表 + 注入队列的同步面 ============================
+
+    /// 登记一条中继腿的**发送句柄**（`sock` = 该腿 socket 的 `try_clone`；引擎线程调）。
+    /// 同远端重复登记 = 替换句柄并撤「最近摘除」标记（`register_leg` 的重建语义）。
+    pub fn leg_open(&self, remote: SocketAddr, sock: UdpSocket) {
+        self.legs.open(remote, sock);
+    }
+
+    /// 摘除一条腿（保留「最近摘除」窗：窗内对该远端的发送**丢**而不回落直连）。
+    pub fn leg_close(&self, remote: SocketAddr) {
+        self.legs.close(remote);
+    }
+
+    /// 当前腿远端集（引擎侧差分的读面）。
+    pub fn leg_remotes(&self) -> Vec<SocketAddr> {
+        self.legs.remotes()
+    }
+
+    /// 该腿远端是否已登记（引擎侧差分的读面）。
+    pub fn has_leg(&self, remote: &SocketAddr) -> bool {
+        self.legs.has(remote)
+    }
+
+    /// 注入一条腿上的 QUIC 报文（引擎线程；`src` = 该腿的远端地址）。返回 `false` =
+    /// 面已收工（调用方不必再注入）；队列满 = 已丢 + 计数（§6.4），仍返回 `true`。
+    pub fn inject_leg(&self, src: SocketAddr, payload: Vec<u8>) -> bool {
+        if self.exit.is_exited() {
+            return false;
+        }
+        ExitSock::inject(&self.inject_tx, &self.bridge, src, payload)
     }
 
     /// QUIC 面线程是否已退出。
@@ -390,10 +444,12 @@ fn thread_body(
     exit: Arc<ExitSignal>,
     stats: Arc<ExitStats>,
     bridge: Arc<ExitBridge>,
+    legs: Arc<LegTable>,
     out_rx: tmpsc::Receiver<Outbound>,
+    inject_rx: socket::InjectRx,
 ) {
     let res = catch_unwind(AssertUnwindSafe(|| {
-        run_exit(socket, cfg, &logf, ready_tx, stop_rx, &stats, &bridge, out_rx)
+        run_exit(socket, cfg, &logf, ready_tx, stop_rx, &stats, &bridge, &legs, out_rx, inject_rx)
     }));
     if let Err(payload) = res {
         let msg = crate::driver::panic_msg(payload.as_ref());
@@ -428,7 +484,9 @@ fn run_exit(
     mut stop_rx: UnboundedReceiver<()>,
     stats: &Arc<ExitStats>,
     bridge: &Arc<ExitBridge>,
+    legs: &Arc<LegTable>,
     mut out_rx: tmpsc::Receiver<Outbound>,
+    inject_rx: socket::InjectRx,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
@@ -446,21 +504,43 @@ fn run_exit(
                 return;
             }
         };
-        // ---- 端点（socket 已在调用侧绑定：退让语义 = WG 同款）----
-        let endpoint = match Endpoint::new(
-            EndpointConfig::default(),
-            Some(server_cfg),
-            socket,
-            Arc::new(quinn::TokioRuntime),
-        ) {
-            Ok(ep) => ep,
+        // ---- 自定义 socket（M1 §1.6）：直连端口 socket + 腿表 + 引擎注入队列 ----
+        // `UdpSocket::from_std` 需要 runtime 上下文（本函数在 `rt.block_on` 内）。
+        let local_addr = match socket.local_addr() {
+            Ok(a) => a,
             Err(e) => {
                 let _ = ready_tx.send(Err(ExitQuicErr::Endpoint(e)));
                 return;
             }
         };
-        let local_addr = match endpoint.local_addr() {
-            Ok(a) => a,
+        // 非阻塞是 `tokio::net::UdpSocket::from_std` 的前置（调用侧通常已设——引擎装配
+        // 时就设过；这里幂等地再保一次，让「直接把 std socket 交给面」的调用形态也成立）。
+        if let Err(e) = socket.set_nonblocking(true) {
+            let _ = ready_tx.send(Err(ExitQuicErr::Endpoint(e)));
+            return;
+        }
+        let direct = match tokio::net::UdpSocket::from_std(socket) {
+            Ok(s) => s,
+            Err(e) => {
+                let _ = ready_tx.send(Err(ExitQuicErr::Endpoint(e)));
+                return;
+            }
+        };
+        let abs = Arc::new(ExitSock::new(
+            direct,
+            local_addr,
+            Arc::clone(legs),
+            inject_rx,
+            Arc::clone(bridge),
+        ));
+        // ---- 端点（抽象 socket：直连 + 腿两条物理路径，见 `socket` 模块头）----
+        let endpoint = match Endpoint::new_with_abstract_socket(
+            EndpointConfig::default(),
+            Some(server_cfg),
+            abs,
+            Arc::new(quinn::TokioRuntime),
+        ) {
+            Ok(ep) => ep,
             Err(e) => {
                 let _ = ready_tx.send(Err(ExitQuicErr::Endpoint(e)));
                 return;

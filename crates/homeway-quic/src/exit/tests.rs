@@ -896,3 +896,269 @@ fn test_face_ctx(logf: Logf) -> Arc<FaceCtx> {
     let bridge = Arc::new(ExitBridge::new(Arc::clone(&stats), logf, wake_tx, wake_rx, out_tx));
     Arc::new(FaceCtx { stats, bridge, logf: Arc::new(|_| {}) })
 }
+
+// ---------- S1-6：中继承载（kind=5 + 自定义 AsyncUdpSocket） ----------
+
+/// 测试用**最小中继 + 「引擎」双子**（`relay/mod.rs` 拨腿模式的等价物）：
+///
+/// ```text
+/// 客户端 ──裸 QUIC──▶ [R]（中继数据口）
+///   [R] 收客户端 ⇒ 包腿帧 [0xBB][5] ⇒ 送腿 socket（出口侧）
+///   [腿 socket 读侧 = 「引擎」] ⇒ ExitQuic::inject_leg(R, 载荷) ⇒ quinn
+///   quinn 回程 ⇒ Transmit.destination = R ⇒ 腿表命中 ⇒ 包 [0xBB][5] ⇒ 腿 socket
+///   [R] 收腿帧（src = 腿本地地址）⇒ 剥壳 ⇒ 裸 QUIC 回客户端
+/// ```
+///
+/// 三条职责刻意分开（与产品路径一一对应）：`R` = 中继（kind 原样透传）、腿 socket 的
+/// **读侧** = 引擎（唯一读者 → 注入）、**写侧**（QUIC 面的 `try_clone` 句柄）= 腿表。
+/// 客户端的包封/剥壳（S2-7）在此由 `R` 代劳（测试客户端说裸 QUIC）。
+struct MiniRelay {
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    injected: Arc<AtomicU64>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl MiniRelay {
+    fn start(quic: Arc<ExitQuic>) -> MiniRelay {
+        let r = loopback_socket(); // 中继数据口（客户端直连目标 = QUIC 眼里的对端）
+        let r_addr = r.local_addr().expect("已绑定");
+        let leg = loopback_socket(); // 出口腿（connect 到 R）
+        leg.connect(r_addr).expect("腿 socket connect");
+        leg.set_nonblocking(true).expect("腿 socket 非阻塞");
+        let leg_addr = leg.local_addr().expect("已绑定");
+        // 出口 QUIC 面的腿表：远端 = R ⇒ 发送走这条腿并包 [0xBB][5]
+        quic.leg_open(r_addr, leg.try_clone().expect("腿 socket 可克隆"));
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop_t = Arc::clone(&stop);
+        let injected = Arc::new(AtomicU64::new(0));
+        let injected_t = Arc::clone(&injected);
+        let thread = std::thread::spawn(move || {
+            let r_clone = r.try_clone().expect("R 可克隆");
+            // 阻塞读 + 读超时（**不用 sleep**：隔离门 ③ 对 `std::thread::sleep` 零豁免，
+            // 测试线程也一样；5ms 超时让两个方向轮流被服务，延迟影响 ≪ WAIT 预算）。
+            let tick = Some(Duration::from_millis(5));
+            leg.set_read_timeout(tick).expect("设读超时");
+            r_clone.set_read_timeout(tick).expect("设读超时");
+            let mut client: Option<SocketAddr> = None;
+            let mut buf = [0u8; 4096];
+            while !stop_t.load(Ordering::SeqCst) {
+                // 「引擎」侧：读腿 socket（唯一读者）→ 剥壳后注入 QUIC 面（src = 腿远端 R）
+                if let Ok((n, _src)) = leg.recv_from(&mut buf) {
+                    if n >= 2 && buf[0] == 0xBB && buf[1] == 5 {
+                        injected_t.fetch_add(1, Ordering::SeqCst);
+                        quic.inject_leg(r_addr, buf[2..n].to_vec());
+                    }
+                }
+                // 中继侧
+                if let Ok((n, src)) = r_clone.recv_from(&mut buf) {
+                    if src == leg_addr {
+                        // 出口腿 → 客户端：剥壳（腿帧 [0xBB][5]）
+                        if n >= 2 && buf[0] == 0xBB && buf[1] == 5 {
+                            if let Some(c) = client {
+                                let _ = r_clone.send_to(&buf[2..n], c);
+                            }
+                        }
+                    } else {
+                        // 客户端 → 出口腿：包壳（兼 S2-7 的客户端组帧）
+                        client = Some(src);
+                        let mut out = Vec::with_capacity(n + 2);
+                        out.push(0xBB);
+                        out.push(5);
+                        out.extend_from_slice(&buf[..n]);
+                        let _ = r_clone.send_to(&out, leg_addr);
+                    }
+                }
+            }
+        });
+        MiniRelay { addr: r_addr, stop, injected, thread: Some(thread) }
+    }
+
+    fn injected(&self) -> u64 {
+        self.injected.load(Ordering::SeqCst)
+    }
+}
+
+impl Drop for MiniRelay {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// **判据（S1-6 最小原型，§1.6/Q-G）**：一条 quinn 连接**完全经中继腿**跑通——
+/// ①握手（入口 = 腿帧 `[0xBB][5]` 注入）；②`hr-reg3` 准入（绑定在腿连接上）；
+/// ③入站数据报（注入 → 源校验 → 引擎桩）；④出站数据报（腿表命中 → 包 `[0xBB][5]`）；
+/// ⑤同端点**直连路径并存**（另一条连接直连 QUIC 端口照常）。
+///
+/// 顺带钉住：`max_datagram_size() == 1362` 在腿路径上**与直连同值**（信封加在外层，
+/// 不减内层容量——设计 §5.1 的不变量）。
+#[tokio::test]
+async fn relay_leg_carries_quic_handshake_and_datagrams() {
+    let (logf, rx) = sink();
+    let quic = Arc::new(
+        ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(41), 32), logf)
+            .expect("端点可起"),
+    );
+    let stub = Stub::new(SECRET);
+    let relay = MiniRelay::start(Arc::clone(&quic));
+
+    // ① 经腿握手：客户端连到中继数据口 R（只有 [0xBB][5] 一条路能到出口）
+    let (client, cfg, _sock) = client_endpoint_and_config(quic.rpk_public_key());
+    let conn = tokio::time::timeout(
+        WAIT,
+        client
+            .connect_with(cfg, relay.addr, super::rpk::client_pin::SERVER_NAME)
+            .expect("connect 调用面"),
+    )
+    .await
+    .expect("腿路径握手必须在预算内定音")
+    .expect("经腿应连上");
+    assert!(
+        wait_until(|| quic.snapshot().admitted >= 1, WAIT).await,
+        "服务端应采纳经腿的连接：{:?}",
+        quic.snapshot()
+    );
+    assert!(relay.injected() >= 1, "腿帧必须真被注入（实得 {}）", relay.injected());
+    assert_eq!(conn.max_datagram_size(), Some(1362), "腿路径 mds 与直连同值（信封在外层）");
+
+    // ② 准入：reg3 走腿路径（绑定 peer = 腿远端 R）
+    let pubkey = [0xD1u8; 32];
+    let dev = [0xD2u8; 8];
+    let (_send, _frame) = send_reg3(&conn, &SECRET, &pubkey, &dev).await;
+    pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=d2d2d2d2", WAIT).await;
+    assert!(quic.snapshot().regs_accepted >= 1, "腿路径准入应通过：{:?}", quic.snapshot());
+
+    // ③ 入站：客户端数据报 → 中继包壳 → 注入 → 源校验 → 引擎桩（字节级一致）
+    let pkt = inner_pkt(TUN_IP, Ipv4Addr::new(8, 8, 8, 8));
+    conn.send_datagram(bytes::Bytes::from(pkt.clone())).expect("客户端发数据报");
+    assert!(
+        pump_until(&stub, &quic, || !stub.packets().is_empty(), WAIT).await,
+        "腿路径入站应到引擎桩"
+    );
+    assert_eq!(stub.packets()[0], pkt, "腿路径 DATAGRAM 字节级一致");
+
+    // ④ 出站：引擎 → 该设备 = 腿帧 [0xBB][5] → 中继剥壳 → 客户端读回同字节
+    assert_eq!(quic.send_to_pub(&pubkey, &pkt), crate::ExitSend::Handled);
+    let got = tokio::time::timeout(WAIT, conn.read_datagram())
+        .await
+        .expect("预算内应收到")
+        .expect("连接活着");
+    assert_eq!(got.as_ref(), &pkt[..], "腿路径出站 DATAGRAM 字节级一致");
+
+    // ⑤ 直连路径并存：另一条连接直连 QUIC 端口照常（同一端点、同一抽象 socket）
+    let (_c2, conn2, _s2) = client_conn(&quic).await;
+    assert!(conn2.max_datagram_size().is_some(), "直连连接照常可用");
+
+    let s = quic.snapshot();
+    assert_eq!(
+        (s.drop_too_large, s.drop_send_buffer_full, s.drop_unregistered, s.drop_src_rejected),
+        (0, 0, 0, 0),
+        "腿路径主干不得有丢弃：{s:?}"
+    );
+    drop(relay);
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（S1-6，§1.6 发送侧路由的兜底）**：腿摘除后对该远端的发送**丢 + 计数**、
+/// **不回落直连端口**（照 `server/bind.rs` 的 #17：打到中继数据口只会污染别的会话）。
+///
+/// 直接驱动 `ExitSock`（不建 quinn 连接——该行为与连接状态无关，只由腿表决定）；
+/// 「摘腿后仍要发包」的时序由 `Transmit` 直驱模拟。
+#[tokio::test]
+async fn removed_leg_does_not_fall_back_to_direct_socket() {
+    use crate::exit::socket::{ExitSock, LegTable};
+    use quinn::udp::Transmit;
+    use quinn::AsyncUdpSocket as _;
+
+    let stats = Arc::new(ExitStats::default());
+    let (wake_tx, wake_rx) = std::os::unix::net::UnixStream::pair().expect("self-pipe 可建");
+    wake_tx.set_nonblocking(true).unwrap();
+    wake_rx.set_nonblocking(true).unwrap();
+    let (out_tx, _out_rx) = tokio::sync::mpsc::channel(1);
+    let bridge = Arc::new(ExitBridge::new(
+        Arc::clone(&stats),
+        Arc::new(|_: &str| {}),
+        wake_tx,
+        wake_rx,
+        out_tx,
+    ));
+    // 直连面：本 socket 的「直连端口」+ 观察者（收它发出的裸包）
+    let observer = loopback_socket();
+    observer.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    let observer_addr = observer.local_addr().unwrap();
+    let direct = loopback_socket();
+    let direct_addr = direct.local_addr().unwrap();
+    direct.set_nonblocking(true).expect("from_std 前置");
+    // 腿面：R = 中继数据口；腿 socket connect 到 R
+    let relay = loopback_socket();
+    relay.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
+    let relay_addr = relay.local_addr().unwrap();
+    let leg = loopback_socket();
+    leg.connect(relay_addr).expect("腿 socket connect");
+
+    let legs = Arc::new(LegTable::default());
+    legs.open(relay_addr, leg.try_clone().expect("腿 socket 可克隆"));
+    let (_inject_tx, inject_rx) = tokio::sync::mpsc::channel(4);
+    let sock = ExitSock::new(
+        tokio::net::UdpSocket::from_std(direct).expect("进 runtime 面"),
+        direct_addr,
+        Arc::clone(&legs),
+        inject_rx,
+        Arc::clone(&bridge),
+    );
+    let tx = |dest: SocketAddr, body: &'static [u8]| Transmit {
+        destination: dest,
+        ecn: None,
+        contents: body,
+        segment_size: None,
+        src_ip: None,
+    };
+    // 直连面首发可能撞 tokio 的「就绪缓存未起」WouldBlock（产品路径由 quinn 的
+    // io_poller 等待重试）——测试按同一形态重试。
+    async fn send_ready(sock: &ExitSock, t: &Transmit<'_>) {
+        for _ in 0..200 {
+            match sock.try_send(t) {
+                Ok(()) => return,
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
+                    tokio::time::sleep(Duration::from_millis(2)).await;
+                }
+                Err(e) => panic!("发送失败：{e}"),
+            }
+        }
+        panic!("重试预算内仍 WouldBlock");
+    }
+    let mut buf = [0u8; 64];
+
+    // ① 腿命中 ⇒ 包 [0xBB][5] 走腿 socket（R 收到），观察者零收
+    send_ready(&sock, &tx(relay_addr, b"quic-pkt")).await;
+    let (n, _src) = relay.recv_from(&mut buf).expect("腿 socket 应收到");
+    assert_eq!(&buf[..n], b"\xBB\x05quic-pkt", "腿帧 = [0xBB][5]‖QUIC 报文");
+    assert!(observer.recv_from(&mut buf).is_err(), "腿命中不得回落直连");
+
+    // ② 非腿目的地 ⇒ 直连端口原样发（裸 QUIC 包，无壳）
+    send_ready(&sock, &tx(observer_addr, b"direct-pkt")).await;
+    let (n, _src) = observer.recv_from(&mut buf).expect("直连应收到");
+    assert_eq!(&buf[..n], b"direct-pkt", "直连路径不加壳");
+
+    // ③ 摘腿 ⇒ 丢 + 计数，**不**回落直连（#17）
+    legs.close(relay_addr);
+    assert!(!legs.has(&relay_addr), "腿已摘");
+    let before = stats.snapshot().drop_unregistered;
+    send_ready(&sock, &tx(relay_addr, b"stale-leg")).await;
+    assert_eq!(
+        stats.snapshot().drop_unregistered,
+        before + 1,
+        "摘腿后的发送必须计 `未登记`（丢 + 计数，不静默）"
+    );
+    assert!(observer.recv_from(&mut buf).is_err(), "摘腿后不得回落直连");
+    assert!(relay.recv_from(&mut buf).is_err(), "摘腿后不得到达腿 socket");
+
+    // ④ 同远端重登记（中继 assoc 重建）：撤「最近摘除」标记，腿路径恢复
+    legs.open(relay_addr, leg.try_clone().expect("腿 socket 可克隆"));
+    send_ready(&sock, &tx(relay_addr, b"again")).await;
+    let (n, _src) = relay.recv_from(&mut buf).expect("重登记后腿路径应恢复");
+    assert_eq!(&buf[..n], b"\xBB\x05again");
+}

@@ -57,7 +57,7 @@ pub use cmd::{Cmd, IslandErr, IslandReply, IslandSnapshot, Logf, OnUnhealthy};
 pub use driver::{Island, IslandTx};
 pub use exit::{
     ExitInbound, ExitQuic, ExitQuicConfig, ExitQuicErr, ExitQuicSnapshot, ExitSend, Reg3Request,
-    Reg3Verdict,
+    Reg3Verdict, FRAME_KIND_QUIC,
 };
 pub use reg3::Reg3Frame;
 pub use rpk::{Ed25519Seed, RpkErr, RpkPublicKey};

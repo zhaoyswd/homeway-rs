@@ -10,7 +10,11 @@ edition.workspace = true
 [dependencies]
 quinn.workspace = true
 rustls.workspace = true
-tokio.workspace = true
+# `net`（M1 S1c 增开）：出口 QUIC 面的**自定义抽象 socket**（`tokio::net::UdpSocket` 的
+# poll/try 面——直连端口 + 腿表 + 注入队列，M1 设计 §1.6）；其余 features 见 workspace：
+# `rt` = current_thread 宿主、`time` = 预算/节拍、`sync` = 命令通道 + 注入队列、
+# `macros` = select!（**只为 select!**——仍不用 `#[tokio::main]`）。
+tokio = { workspace = true, features = ["net"] }
 thiserror.workspace = true
 # DATAGRAM 载荷类型（M1 设计 §1.5：`send_datagram` 只收 `bytes::Bytes`；quinn 并不
 # re-export bytes ⇒ 消费侧必须直接声明——M0 已登记「M1 必需」）。
