@@ -1714,7 +1714,76 @@ fn public_endpoint_loop(
     }
 }
 
+/// QUIC 端口的公网可达性（M1 S1c / S1-7）：**UPnP 映射 + 实际外口写进 token 的 QUIC 类
+/// 端点**；结果成/败都打 **E-q4** 行（`UPnP：QUIC 端口 %d 映射 %s`），失败时 token 只公布
+/// LAN/中继 QUIC 端点（fail-visible）。
+///
+/// 与 WG 端口映射的关系：**各自独立一条映射**（两端口不同，M1 §1.1）——本函数只在
+/// `quic_ep` 存在（QUIC 面已起）时跑；无 QUIC 面 ⇒ **不打行**（没有端口可映射，不假装）。
+/// WG 侧的映射逻辑与行文**零改动**（本函数不碰它）。
+///
+/// `--upnp=false`：明文打失败行（设计 §10 S1-7 的判据形态）——「失败可见」而不是静默缺席。
+fn refresh_quic_public(ctx: &Arc<TokenCtx>) {
+    let Some(q) = ctx.quic_ep else { return };
+    let port = q.port();
+    let set_pub = |v: Option<SocketAddr>| {
+        if let Ok(mut inner) = ctx.inner.lock() {
+            inner.quic_pub = v;
+        }
+    };
+    if !ctx.cfg.upnp {
+        set_pub(None);
+        (ctx.logf)(&format!(
+            "UPnP：QUIC 端口 {port} 映射 未启用（--upnp=false）——公网 QUIC 端点不公布（LAN/中继 QUIC 端点照常）"
+        ));
+        return;
+    }
+    let cands = crate::server::upnp::local_ipv4_candidates();
+    if cands.is_empty() {
+        set_pub(None);
+        (ctx.logf)(&format!("UPnP：QUIC 端口 {port} 映射 失败（找不到内网 IPv4 候选）"));
+        return;
+    }
+    let logf2: Logf = Arc::clone(&ctx.logf);
+    let deadline = std::time::Instant::now() + crate::server::upnp::UPNP_TOTAL_BUDGET;
+    match crate::server::upnp::ensure_port_mapping(&cands, port, &*logf2, &*logf2, deadline) {
+        Err(e) => {
+            set_pub(None);
+            (ctx.logf)(&format!(
+                "UPnP：QUIC 端口 {port} 映射 失败（{e}）——出口在 NAT 后时可在路由器上手动把 UDP {port} 转发到本机（候选 {:?}）；公网 QUIC 端点不公布",
+                cands
+            ));
+        }
+        Ok((ext, used)) => {
+            // 外网 IP 与 WG 侧同源（IGD 的 ExternalIPAddress；非公网地址不公布）
+            let wan = crate::server::upnp::discover_igd(used, deadline)
+                .ok()
+                .and_then(|g| g.external_ip().ok())
+                .filter(|ip| egress::is_public_addr(IpAddr::V4(*ip)));
+            match wan {
+                Some(ip) => {
+                    let pub_ep = SocketAddr::new(IpAddr::V4(ip), ext);
+                    set_pub(Some(pub_ep));
+                    (ctx.logf)(&format!(
+                        "UPnP：QUIC 端口 {port} 映射 外部 UDP {ext} → {used}:{port}（公布 {pub_ep}；重启时从路由器表认领）"
+                    ));
+                }
+                None => {
+                    set_pub(None);
+                    (ctx.logf)(&format!(
+                        "UPnP：QUIC 端口 {port} 映射 已建立（外部 UDP {ext}）但外网 IP 不可得/非公网——公网 QUIC 端点不公布"
+                    ));
+                }
+            }
+        }
+    }
+}
+
 fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> bool {
+    // QUIC 端口的公网映射（M1 S1c / S1-7：**E-q4 行成/败都打**，且 `--upnp=false`
+    // 形态也打失败行 = fail-visible）。放在本轮最前：本函数末尾的
+    // `print_client_token` 才能读到本轮的公网 QUIC 端点。
+    refresh_quic_public(ctx);
     let endpoint_file = ctx.cfg.state_dir.join("cache").join("public_endpoint.txt");
     let manual = ctx.cfg.public_endpoint.trim().to_owned();
     if !manual.is_empty() {
@@ -2301,6 +2370,33 @@ mod tests {
         (Arc::new(move |s: &str| {
             let _ = tx.send(s.to_owned());
         }), rx)
+    }
+
+    /// **判据（S1-7 的失败形态 / E-q4）**：`--upnp=false` ⇒ 打**失败行**（不静默缺席）
+    /// 且公网 QUIC 端点被清空（token 只出 LAN/中继 QUIC 端点）。
+    #[test]
+    fn quic_upnp_disabled_prints_failure_line_and_clears_public() {
+        let (logf, rx) = log_sink();
+        let qep: SocketAddr = "127.0.0.1:42652".parse().unwrap();
+        let (ctx, dir) = token_ctx(false, Some(qep), None, logf, &rx);
+        // 先塞一个「上一轮的公网端点」——本函数必须把它清掉（映射未启用 = 不公布）
+        ctx.inner.lock().unwrap().quic_pub = Some("203.0.113.7:42652".parse().unwrap());
+        refresh_quic_public(&ctx);
+        let lines: Vec<String> = rx.try_iter().collect();
+        assert_eq!(lines.len(), 1, "失败行必须打（且只此一行）：{lines:?}");
+        assert!(
+            lines[0].contains("UPnP：QUIC 端口 42652 映射 未启用（--upnp=false）"),
+            "E-q4 失败行形态：{}",
+            lines[0]
+        );
+        assert_eq!(ctx.inner.lock().unwrap().quic_pub, None, "未映射 ⇒ 公网 QUIC 端点缺席");
+        // 无 QUIC 面（quic_ep=None）⇒ 不打行（没有端口可映射，不假装）
+        let (logf2, rx2) = log_sink();
+        let (ctx2, dir2) = token_ctx(false, None, None, logf2, &rx2);
+        refresh_quic_public(&ctx2);
+        assert_eq!(rx2.try_iter().count(), 0, "无 QUIC 面时不打 E-q4 行");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 
     /// **判据（S1-8）**：铸造的 token **含 QUIC 类端点**（内网 + 公网）与 **RPK 字段**，
