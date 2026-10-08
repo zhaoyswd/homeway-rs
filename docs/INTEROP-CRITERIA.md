@@ -501,6 +501,9 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 | 2026-10-08（Q-H 批落地） | **承载面 host 串 canonical 化（大小写等价）** | 大写 hex 能过成员检查却按原串存表 → `remove_host` 级联按小写找不到（**级联漏删：转发规则 + 监听器残留**）；改为入口 `decode→canonical 小写` 后再委托（**只规范化，不改错误分类**——add/on 仍 NoHost、remove/off 仍 NoRule）（speedtest 三面同批） | F11：`daemon/mod.rs` 只规范化级联一处，`add/remove/off` 原样（设计门复核确认根因成立） | `carriers/mod.rs`（`canonical_host_hex`）；CA3/CA6 成功文案不变；控制面直连客户端（App/矩阵）的输入等价化；单测 `uppercase_host_canonicalized_full_chain` |
 | 2026-10-08（Q-H 批落地） | **session 锁 IO 失败 fail-fast** | 只读/异常 identity 目录下 `LockError::Io` 仅告警继续（**互踢 keypair 防线静默消失**）→ 可行动错误 + exit 1（`--no-session-lock` 仍为逃生口；`Held` 文案不变） | F9：审计 P2；Rust 独有防线的静默降级 | `main.rs`（connect/files/speedtest/dnstest/portfwd 五调用点）；只读环境从「降级继续」变「拒跑」；单测 `unwritable_dir_is_lock_io_with_path` |
 | 2026-10-08（Q-H 批落地） | **短串截断面（非判据行，行为注记）** | `short_host` 由**字节**切片（`&host[..8]`——非法输入〔非 ASCII〕panic）→ **字符**截断（不 panic；非法输入返回整串） | F6：外部可触发的 dispatcher panic 面（`forward remove`/`socks off` 的 `NoRule(short_host(host))`；`server.rs` 只查非空不做 hex 校验） | 「与 Go 同串」**只对合法 hex 成立**（逐字节不变；Go `shortHost` 是字节截断，非法输入会产出非法 UTF-8 前缀——Rust 取自定义语义）；单测 `short_host_char_safe`；同时 F11 从入口消除该形态 |
+| 2026-10-08（Q-I 尾段批落地） | **取值 flag 纪律的局部回退：空值 carve-out（`--stun`/`--stun6`/`--relay`/`--ddns`）**（对照 Q-H「取值 flag 纪律」行） | Q-H 口径「`--flag=`/`--flag ""` 空值 ⇒ fail-fast（唯一 carve-out `--recover-cause`）」→ **追加四 flag 的空值 carve-out**：`--stun`/`--stun6`（空 = 关公网观测）、`--relay`（空 = 关注册腿）、**`--ddns`（空 = 清空 config 全部条目；代码门 M1 扩面——`serve_cli.rs` 原本已有该分支但不可达）** 接受空值并按语义处理；**`--public-endpoint=` 仍拒**（Go 基线实测同拒：`homeway: --public-endpoint "" 非法（not an ip:port…）` rc=1）；其余取值 flag 纪律不变（缺值/吞 flag 仍 fail-fast） | **F0（Q-I 尾段）**：Q-H 泛化纪律把 Go 文档化「空 = 关」（`baseline/homeway/internal/server/cli.go:36-37` + `explicit["stun"]` 分支；`--ddns` 见 `:38/55/127-135` `explicit["ddns"]` ∧ 空 ⇒ nil）拒绝 ⇒ `tools/local-rust-exit.sh`/`perf-ab.sh`/`matrix.sh` 的 Rust 出口**全部起不来**（R5 起本地测量面全瘫）；`bin/homeway-go` 实跑四 flag 空值形态正常起服（Rust 侧属对 Go 的回归） | `cli_flags.rs`（新 `take_value_empty_ok_or_exit`）、`serve_cli.rs`（stun/stun6/relay/ddns 四站点 + 用法行）；单测 `empty_value_carveout_forms`/`empty_value_carveout_flags_accept_empty`；E2E 冒烟（`local-rust-exit.sh start 9` + Go 客户端「就绪（会话在位）」）；**已知残留（非 carve-out）**：`--bind-interface=` 空值 Go = auto（`ResolveBind("")`）而 Rust 拒——有等价写法（`--bind-interface auto`）⇒ 登记不扩；排障脚本若按「空值一律 exit 2」写断言须改 |
+| 2026-10-08（Q-I 尾段批落地） | **DNS 面缓冲复用（行为注记，非判据行）** | 无行文变化；`DnsFaces` UDP 收包缓冲改字段复用（F1）、DNS-TCP 连接读缓冲穿参复用（F3）、`TcpConn.rx/tx` 改 `VecDequeLite` 前缀偏移（F4）、dnsproxy 上游列表改 `Arc` 快照 + worker 懒分配读缓冲（F5） | Q-I 尾段性能项：每拍/每查询固定税消除（E22/E4 行文与数值语义零变化） | 无判据行/夹具变更；`DnsFaces` UDP 收包缓冲**复用不残留**（`recv_slice` 只写 `0..n` + 下游 `to_vec()`；新增同拍多包回归断言）；**F4 内存包络（代码门 M2 订正：rx/tx 同形）**：DNS-TCP 单连接 rx backing 最坏 128KiB → ≈256KiB（×64 ⇒ ≤+8MiB），**tx backing 同形 2× `CONN_TX_CAP`(256KiB) ⇒ 相对旧形态增量 ≤256KiB/连接（×64 ⇒ ≤+16MiB 最坏；实测未现）**，RSS 判据（≤A×1.1）已核 |
+| 2026-10-08（Q-I 尾段批落地） | **F2（reactor 并入引擎 poll）尝试后回退——零残留（登记留痕）** | 曾实现「reactor 兴趣集并入引擎唯一 poll（快照直派）+ `intercept: reactor 观测 … 兜底=N` 字段 + 两条唤醒时点行为变更」→ **实测负收益后整条回退**（代码与判据面回到 Q-H 形态；`兜底=` 字段与两条行为变更**未落地、不登记**） | F2 止损闸门（设计 §4.3）：两项 poll 样本合计 **+18%**（不降反升）、进程 CPU **+14.5%**、up 吞吐 **−5.9%**；机制 = 上游 fd 就绪成为引擎唤醒源 ⇒ 拍频 13.2k→21.4k/s、每拍全量 pump 的固定成本放大 | **本行不涉任何判据行/wire/夹具变更**；证据与数字见 `docs/reviews/QIt.md` 性能节 + `docs/PERF-AB.md`；`server/engine.rs`/`server/intercept/mod.rs` 内注释留痕（`reactor_turn` 文档注释） |
 
 > **上表 E12/decr_flow 两行 = 2026-10-07 Q-B 批落地登记**（Q-A 批预登记的占位条目已按本政策补全
 > 「从 → 到」实际行文并去掉「占位」标注，同批 commit）；**其下两行 = 2026-10-07 Q-C 批落地登记**；
@@ -510,8 +513,13 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 > **其下十四行 = 2026-10-08 Q-H 批落地登记**（非法 config 路径 / 值域补齐 / CA13 覆盖面与形态 / C14 实装 /
 > 取值 flag 与布尔纪律 / N1·L7 默认 state / daemon 上限与 SOCKS dead / CA11 与 CA12 同族 / 承载面大小写等价 /
 > session 锁 IO fail-fast / short_host 字符语义）；计数输入集表 = Q-H 两行（state 分布移动 + additive 日志）。
+> **其下两行 = 2026-10-08 Q-I 尾段批落地登记**（F0 空值 carve-out 局部回退 / DNS 面缓冲复用行为注记 +
+> F2 尝试后回退的零残留留痕行）；Q-I 尾段批**零编号判据行变更、零 wire 变更**（F2 的 `兜底=N` 行文变更与
+> 两条唤醒时点行为变更**随 F2 回退而未落地**，不属生效登记）。
 > 登记生效后，E12 关闭行与 flows 计数按新行文验收（旧行文不再要求同串）；Q-D 的尺寸面按
-> 「正常尺寸逐字节同串、极端输入按登记」验收；Q-G 的 UDS 路径面按「`> SUN_PATH_MAX`（平台值）」验收。
+> 「正常尺寸逐字节同串、极端输入按登记」验收；Q-G 的 UDS 路径面按「`> SUN_PATH_MAX`（平台值）」验收；
+> Q-I 尾段的 `--stun=`/`--stun6=`/`--relay=`/`--ddns=` 空值形态按「接受并按 Go 语义处理」验收；
+> `--public-endpoint=`/`--bind-interface=` 空值形态**不在** carve-out（前者 Go 同拒、后者登记为已知识别差异）。
 
 ### 计数输入集 / 数值语义变化（**行文不变**，登记留痕）
 
