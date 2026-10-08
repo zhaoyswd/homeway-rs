@@ -122,10 +122,18 @@ fn wait_control_ready(state_dir: &std::path::Path, d: Duration) -> bool {
     false
 }
 
-/// launchd 托管形态检测（darwin）：LaunchAgents 目录里任意 homeway 代理 plist
-/// （按文件名泛化——模板 label 与现役 label 都覆盖）。命中返回 label；无 = None
-/// （Linux/未安装场景恒 None——直接自 exec）。
-fn detect_launchd_agent() -> Option<String> {
+/// launchd 托管形态检测（darwin，Q-J F6）：LaunchAgents 目录里与**请求 state 相关**的
+/// homeway 代理 plist——判定依据是 **plist 内容**（`ProgramArguments` 里的 `--state`），
+/// 不再是 Q-H F14 的「仅默认 state」粗判。命中返回 label（**仍取文件名去 `.plist`
+/// 后缀**，对齐 Go/现状）；无 = None（Linux/未安装场景恒 None——直接自 exec）。
+///
+/// 匹配规则（纯函数见 [`detect_in_dirs`]）：
+/// - plist 提及该 state（`--state DIR` / `--state=DIR`，两侧同一 normalize）⇒ 相关；
+/// - 未提及任何 state（零参形态）且请求 state == 默认 ⇒ 相关（= Q-H F14 旧判据；
+///   **不引入 argv[0] 谓词**——现行对任何 `*homeway*.plist` 都等 4s，加谓词属未登记收窄）；
+/// - 未知形态（二进制 plist / 解析失败）⇒ 保守退化：默认 state ⇒ 相关，否则不相关；
+/// - 非默认 state + plist 提及的是**别的** state ⇒ 不相关（F14 偏差的修复面）。
+pub(crate) fn detect_launchd_agent_for_state(state: &std::path::Path) -> Option<String> {
     if !cfg!(target_os = "macos") {
         return None;
     }
@@ -134,25 +142,159 @@ fn detect_launchd_agent() -> Option<String> {
         std::path::PathBuf::from(&home).join("Library/LaunchAgents"),
         std::path::PathBuf::from("/Library/LaunchAgents"),
     ];
+    detect_in_dirs(&dirs, state, &default_state_dir())
+}
+
+/// [`detect_launchd_agent_for_state`] 的可注入纯函数（目录清单与默认 state 均可注入
+/// ——单测不依赖本机 LaunchAgents；多命中取首个并记行）。
+fn detect_in_dirs(
+    dirs: &[std::path::PathBuf],
+    state: &std::path::Path,
+    default_state: &std::path::Path,
+) -> Option<String> {
+    let want_default = normalize_state(state) == normalize_state(default_state);
+    let mut hits: Vec<String> = Vec::new();
     for d in dirs {
-        let Ok(ents) = std::fs::read_dir(&d) else { continue };
-        for e in ents.flatten() {
-            let n = e.file_name().to_string_lossy().to_string();
-            if n.contains("homeway") && n.ends_with(".plist") {
-                return Some(n.trim_end_matches(".plist").to_owned());
+        let Ok(ents) = std::fs::read_dir(d) else { continue };
+        let mut names: Vec<String> = ents
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        names.sort(); // 稳定序（多命中取首个）
+        for n in names {
+            if !n.contains("homeway") || !n.ends_with(".plist") {
+                continue;
+            }
+            let label = n.trim_end_matches(".plist").to_owned();
+            let Ok(raw) = std::fs::read_to_string(d.join(&n)) else {
+                if want_default {
+                    hits.push(label); // 读失败 = 未知形态 ⇒ 保守退化
+                }
+                continue;
+            };
+            match parse_program_arguments(&raw) {
+                Ok(args) => {
+                    if plist_mentions_state(&args, state) {
+                        hits.push(label);
+                    } else if !plist_mentions_any_state(&args) && want_default {
+                        hits.push(label); // 零参形态 + 默认 state ⇒ 相关（Q-H F14 旧判据）
+                    }
+                }
+                Err(()) => {
+                    if want_default {
+                        hits.push(label); // 未知形态保守退化 = Q-H 行为
+                    }
+                }
             }
         }
     }
-    None
+    if hits.len() > 1 {
+        eprintln!(
+            "（多个 launchd 代理提及 state={}——取首个 {}）",
+            state.display(),
+            hits[0]
+        );
+    }
+    hits.into_iter().next()
 }
 
-/// 是否应在「未运行」时等 launchd KeepAlive 重拉（Q-H F14）：**仅默认 state**。
-///
-/// 依据：临时/自定义 state 的探测会命中**别的**部署形态的 launchd 代理（KeepAlive
-/// 触发会把那份部署拉起）——非默认 state 直接自拉起（plist 级精确匹配〔多实例/
-/// 多 label/自定义 state 的 launchd 形态〕留 Q-J，登记见 `AUDIT` Q-J 节）。
-pub(crate) fn launchd_relaunch_relevant(state: &std::path::Path) -> bool {
-    state == default_state_dir()
+/// state 路径归一（两侧共用——Q-J F6）：`canonicalize` 成功用其值；失败退化字面 +
+/// 去尾 `/`（两侧必须走同一函数，否则「相对路径/尾斜杠」形态会漏配）。
+fn normalize_state(p: &std::path::Path) -> String {
+    if let Ok(c) = std::fs::canonicalize(p) {
+        return c.to_string_lossy().into_owned();
+    }
+    p.to_string_lossy().trim_end_matches('/').to_owned()
+}
+
+/// plist 的 ProgramArguments 是否**提及**该 state（`--state DIR` / `--state=DIR`）。
+fn plist_mentions_state(args: &[String], state: &std::path::Path) -> bool {
+    let want = normalize_state(state);
+    let mut i = 0;
+    while i < args.len() {
+        let a = &args[i];
+        if a == "--state" {
+            if let Some(v) = args.get(i + 1) {
+                if normalize_state(std::path::Path::new(v)) == want {
+                    return true;
+                }
+            }
+            i += 2;
+            continue;
+        }
+        if let Some(v) = a.strip_prefix("--state=") {
+            if normalize_state(std::path::Path::new(v)) == want {
+                return true;
+            }
+        }
+        i += 1;
+    }
+    false
+}
+
+/// plist 是否提及**任何** state（零参形态判据）。
+fn plist_mentions_any_state(args: &[String]) -> bool {
+    args.iter().any(|a| a == "--state" || a.starts_with("--state="))
+}
+
+/// 手写 XML 子集：从 `<key>ProgramArguments</key>` 取 `<array>` 的 `<string>` 序列。
+/// **白名单纪律**（评审判定合法才收，其余一律 `Err` = 未知形态 ⇒ 调用方保守退化）：
+/// 二进制 plist 头、自闭合 `<string/>`、CDATA、注释、嵌套 `<array>`、未定义实体、
+/// 非 `<string>` 标签的内容一律拒。
+fn parse_program_arguments(plist: &str) -> Result<Vec<String>, ()> {
+    if plist.trim_start().starts_with("bplist") {
+        return Err(()); // 二进制 plist
+    }
+    let key = "<key>ProgramArguments</key>";
+    let i = plist.find(key).ok_or(())?;
+    let rest = &plist[i + key.len()..];
+    let arr = rest.find("<array>").ok_or(())?;
+    if !rest[..arr].trim().is_empty() {
+        return Err(()); // key 与 array 之间有注释/未知片段
+    }
+    let body_start = arr + "<array>".len();
+    let body_end = rest[body_start..].find("</array>").ok_or(())? + body_start;
+    let body = &rest[body_start..body_end];
+    let mut out = Vec::new();
+    let mut cur = body;
+    loop {
+        let t = cur.trim_start();
+        if t.is_empty() {
+            break;
+        }
+        let Some(after) = t.strip_prefix("<string>") else {
+            return Err(()); // <string/>、CDATA、注释、嵌套 array、未知标签
+        };
+        let end = after.find("</string>").ok_or(())?;
+        out.push(decode_xml_text(&after[..end])?);
+        cur = &after[end + "</string>".len()..];
+    }
+    Ok(out)
+}
+
+/// XML 文本解码（五预定义实体；其余实体/裸 `<` 一律 `Err`）。
+fn decode_xml_text(raw: &str) -> Result<String, ()> {
+    if raw.contains('<') {
+        return Err(()); // 标签/CDATA 痕迹
+    }
+    let mut out = String::with_capacity(raw.len());
+    let mut rest = raw;
+    while let Some(i) = rest.find('&') {
+        out.push_str(&rest[..i]);
+        let tail = &rest[i..];
+        let semi = tail.find(';').ok_or(())?;
+        out.push(match &tail[1..semi] {
+            "amp" => '&',
+            "lt" => '<',
+            "gt" => '>',
+            "quot" => '"',
+            "apos" => '\'',
+            _ => return Err(()), // 未定义/数字实体 ⇒ 未知形态
+        });
+        rest = &tail[semi + 1..];
+    }
+    out.push_str(rest);
+    Ok(out)
 }
 
 /// 拉起子进程 stdio 落点（`<state>/cache/spawn.log`，追加 + 0600）。
@@ -266,22 +408,23 @@ pub fn dial_control_spawn(
                     state_dir.display()
                 ));
             }
-            // launchd 托管形态（Q-H F14）：**只在默认 state** 下先短轮询等 KeepAlive
-            // 重拉（CLI 自 exec 出的进程不归 launchd 管，KeepAlive 会反复重拉自己的
-            // 实例撞锁）；非默认 state = 不等（防临时 state 触发别的部署的 KeepAlive）。
-            if launchd_relaunch_relevant(state_dir) {
-                if let Some(label) = detect_launchd_agent() {
-                    eprintln!("守护进程未运行（launchd 代理 {label} 在册）——等 KeepAlive 重拉…");
-                    if wait_control_ready(state_dir, SPAWN_KEEPALIVE_WAIT) {
-                        if let Ok((c, _)) = ControlClient::dial(&sock, "cli", name) {
-                            return Ok(c);
-                        }
+            // launchd 托管形态（Q-J F6：plist **内容**精确匹配该 state）：相关才先短
+            // 轮询等 KeepAlive 重拉（CLI 自 exec 出的进程不归 launchd 管，KeepAlive 会
+            // 反复重拉自己的实例撞锁）；不相关（含未在册/提及别的 state）= 直接自拉起。
+            if let Some(label) = detect_launchd_agent_for_state(state_dir) {
+                eprintln!("守护进程未运行（launchd 代理 {label} 在册）——等 KeepAlive 重拉…");
+                if wait_control_ready(state_dir, SPAWN_KEEPALIVE_WAIT) {
+                    if let Ok((c, _)) = ControlClient::dial(&sock, "cli", name) {
+                        return Ok(c);
                     }
-                    eprintln!("KeepAlive {}s 内未重拉——改为自行拉起", SPAWN_KEEPALIVE_WAIT.as_secs());
                 }
-            } else {
+                eprintln!("KeepAlive {}s 内未重拉——改为自行拉起", SPAWN_KEEPALIVE_WAIT.as_secs());
+            } else if cfg!(target_os = "macos") {
+                // 文案改写（Q-J F6）：旧文案在「默认 state 但无相关 plist」时**会说假话**。
+                // 仅 darwin 打（代码门 L4：Linux 无 launchd，旧形态该情形是本行也没有的
+                // 无输出——保持平台条件句）。
                 eprintln!(
-                    "（state={} 非默认 state——不等 launchd KeepAlive，直接拉起）",
+                    "（未在册 launchd 代理提及 state={}——不等 launchd KeepAlive，直接拉起）",
                     state_dir.display()
                 );
             }
@@ -1606,12 +1749,135 @@ fn mask_for_hint(tok: &str) -> String {
 mod tests {
     use super::*;
 
-    /// Q-H F14：只有**默认 state** 才等 launchd KeepAlive（非默认 = 直接自拉起，
-    /// 防临时 state 的探测触发别的部署的 KeepAlive）。
+    // ---------- Q-J F6：launchd 探测精确化（plist 内容匹配）----------
+
+    /// 生产实机形态逐字夹具（评审 4-7 实采；经 DOCTYPE + 制表符缩进）。
+    const PROD_PLIST: &str = r#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Label</key>
+	<string>me.zhaozhe.homeway-exit</string>
+	<key>ProgramArguments</key>
+	<array>
+		<string>/Users/zhaozhe/bin/homeway-rs</string>
+		<string>--state</string>
+		<string>/Users/zhaozhe/.config/homeway-rs</string>
+	</array>
+</dict>
+</plist>
+"#;
+
+    fn write_plist(dir: &std::path::Path, name: &str, body: &str) {
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join(name), body).unwrap();
+    }
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        let d = std::env::temp_dir().join(format!(
+            "hw-launchd-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    /// F6 纯函数四态：提及本 state / 提及别的 state / 零参 + 默认 / 零参 + 非默认。
     #[test]
-    fn launchd_relaunch_only_for_default_state() {
-        assert!(launchd_relaunch_relevant(&default_state_dir()));
-        assert!(!launchd_relaunch_relevant(std::path::Path::new("/tmp/hw-not-default")));
+    fn plist_state_matching_four_states() {
+        let d = tmp_dir("four");
+        let agents = d.join("LaunchAgents");
+        // ① 提及本 state ⇒ 相关（生产夹具逐字）
+        write_plist(&agents, "me.zhaozhe.homeway-exit.plist", PROD_PLIST);
+        let state = std::path::PathBuf::from("/Users/zhaozhe/.config/homeway-rs");
+        assert_eq!(
+            detect_in_dirs(std::slice::from_ref(&agents), &state, std::path::Path::new("/nope/default")),
+            Some("me.zhaozhe.homeway-exit".to_owned()),
+            "生产夹具（--state 自定义路径）应命中"
+        );
+        // ② 提及别的 state + 请求非默认 ⇒ 不相关（F14 偏差修复面）
+        assert_eq!(
+            detect_in_dirs(std::slice::from_ref(&agents), std::path::Path::new("/tmp/other-state"), std::path::Path::new("/nope/default")),
+            None
+        );
+        // ③ 零参形态 + 请求默认 state ⇒ 相关（Q-H F14 旧判据保留）
+        let d2 = tmp_dir("zeroarg");
+        let a2 = d2.join("LaunchAgents");
+        let zero = PROD_PLIST.replace("<string>--state</string>\n\t\t<string>/Users/zhaozhe/.config/homeway-rs</string>", "<string>--run</string>");
+        write_plist(&a2, "me.zhaozhe.homeway.plist", &zero);
+        let def = d2.join("default-state");
+        std::fs::create_dir_all(&def).unwrap();
+        assert_eq!(
+            detect_in_dirs(std::slice::from_ref(&a2), &def, &def),
+            Some("me.zhaozhe.homeway".to_owned()),
+            "零参 + 默认 state ⇒ 相关"
+        );
+        // ④ 零参形态 + 请求非默认 ⇒ 不相关
+        assert_eq!(
+            detect_in_dirs(std::slice::from_ref(&a2), std::path::Path::new("/tmp/other"), &def),
+            None
+        );
+        let _ = std::fs::remove_dir_all(&d);
+        let _ = std::fs::remove_dir_all(&d2);
+    }
+
+    /// F6 退化两态：二进制 plist / 坏 XML ⇒ 默认 state 相关、非默认不相关（= Q-H 行为）。
+    #[test]
+    fn plist_unknown_shape_conservative_fallback() {
+        let d = tmp_dir("unknown");
+        let a = d.join("LaunchAgents");
+        write_plist(&a, "me.homeway-bin.plist", "bplist00\x00garbage");
+        write_plist(&a, "me.homeway-broken.plist", "<plist><dict><key>ProgramArguments</key></dict></plist>");
+        let def = d.join("default");
+        std::fs::create_dir_all(&def).unwrap();
+        let hits = detect_in_dirs(std::slice::from_ref(&a), &def, &def);
+        assert!(hits.is_some(), "默认 state + 未知形态 ⇒ 保守相关");
+        assert_eq!(
+            detect_in_dirs(std::slice::from_ref(&a), std::path::Path::new("/tmp/other"), &def),
+            None,
+            "非默认 state + 未知形态 ⇒ 不相关（不放大行为变化）"
+        );
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// F6：`--state` 空格分隔 / 等号分隔 / 相对路径 normalize（两侧共用）。
+    #[test]
+    fn plist_state_separator_and_normalize_forms() {
+        assert!(parse_program_arguments(PROD_PLIST).is_ok());
+        let args = parse_program_arguments(PROD_PLIST).unwrap();
+        assert_eq!(
+            args,
+            vec![
+                "/Users/zhaozhe/bin/homeway-rs".to_owned(),
+                "--state".to_owned(),
+                "/Users/zhaozhe/.config/homeway-rs".to_owned()
+            ]
+        );
+        // 等号形
+        let eq = PROD_PLIST.replace("<string>--state</string>\n\t\t<string>/Users/zhaozhe/.config/homeway-rs</string>", "<string>--state=/Users/zhaozhe/.config/homeway-rs</string>");
+        let args_eq = parse_program_arguments(&eq).unwrap();
+        assert!(plist_mentions_state(&args_eq, std::path::Path::new("/Users/zhaozhe/.config/homeway-rs")));
+        // 尾斜杠形态（normalize 去尾 `/`）
+        assert!(plist_mentions_state(&args, std::path::Path::new("/Users/zhaozhe/.config/homeway-rs/")));
+        assert!(!plist_mentions_state(&args, std::path::Path::new("/Users/zhaozhe/.config/other")));
+        // 白名单纪律：自闭合 <string/>、CDATA、注释、嵌套 array、未定义实体 ⇒ 未知形态
+        for bad in [
+            "<key>ProgramArguments</key><array><string/></array>",
+            "<key>ProgramArguments</key><array><string><![CDATA[x]]></string></array>",
+            "<key>ProgramArguments</key><!-- c --><array><string>x</string></array>",
+            "<key>ProgramArguments</key><array><array><string>x</string></array></array>",
+            "<key>ProgramArguments</key><array><string>a&#38;b</string></array>",
+            "bplist00xyz",
+        ] {
+            assert!(parse_program_arguments(bad).is_err(), "{bad:?} 应判未知形态");
+        }
+        // 合法实体解码 + 制表/换行容忍
+        let ok = "<key>ProgramArguments</key>\n\t<array>\n\t\t<string>a&amp;b</string>\n\t</array>";
+        assert_eq!(parse_program_arguments(ok).unwrap(), vec!["a&b".to_owned()]);
     }
 
     /// Q-H F10：resolve_host 全长 hex 四档（表内小写/表内大写/表外 hex/64 非 hex）

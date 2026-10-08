@@ -594,13 +594,16 @@ fn fuzz_term_vt() {
         let _ = vt.rows_at(0, 64);
         let _ = vt.mirror_rows(32);
         let g = |i: usize| b.get(i).copied().unwrap_or(0);
-        let _ = vt.encode_key(&keyenc::KeyEvent {
-            key: keyenc::Key(u16::from_le_bytes([g(0), g(1)])),
-            action: keyenc::KeyAction::from_wire(g(2) % 3).unwrap_or_default(),
-            mods: keyenc::Mods(u16::from_le_bytes([g(3), g(4)])),
-            text: "",
-            composing: g(5) & 1 != 0,
-        });
+        let _ = vt.encode_key(
+            &keyenc::KeyEvent {
+                key: keyenc::Key(u16::from_le_bytes([g(0), g(1)])),
+                action: keyenc::KeyAction::from_wire(g(2) % 3).unwrap_or_default(),
+                mods: keyenc::Mods(u16::from_le_bytes([g(3), g(4)])),
+                text: "",
+                composing: g(5) & 1 != 0,
+            },
+            keyenc::KeyFlavor::host_default(),
+        );
         let _ = vt.encode_mouse(&keyenc::MouseEvent {
             action: keyenc::MouseAction::from_wire(g(6) % 3).unwrap_or_default(),
             button: keyenc::MouseButton(g(7)),

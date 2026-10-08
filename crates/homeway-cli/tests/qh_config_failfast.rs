@@ -120,6 +120,9 @@ fn config_failfast_does_not_kill_unified() {
             "[serve]\nenabled = false\n\n[serve.tx_shape]\nrate_mbps = \"200\"\n",
             "rate_mbps",
         ),
+        // Q-J F2（代码门 M3③）：新键值域同走 fail-fast + 零副作用 + 进程存活
+        ("[serve]\nenabled = false\ndns_fallback = \"\"\n", "dns_fallback"),
+        ("[serve]\nenabled = false\ndns_probe_target = [\"1.2.3.4:0\"]\n", "dns_probe_target"),
     ];
     for (bad, marker) in cases {
         let state = mktemp("failfast");

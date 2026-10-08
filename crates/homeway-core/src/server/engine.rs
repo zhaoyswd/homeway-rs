@@ -12,7 +12,7 @@
 //! 有界宽限（Drain）→ ④ 关 WG UDP → ⑤ DNS/观测收工 + UPnP 缩租 + 服务收工。
 
 use std::collections::HashSet;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -82,6 +82,20 @@ pub struct ServeConfig {
     /// DDNS 裸域名（可多条，`[[serve.ddns]]` / `--ddns`）：token 叠加 `域:端口` 条目
     /// （不解析不踢除；域名记录由用户 DDNS 设施维护）+ 自检随公网端点探测同拍跑。
     pub ddns: Vec<String>,
+    /// DNS 显式上游覆盖（F2 `serve.dns_upstream`，**opt-in**；空 = 跟随
+    /// `/etc/resolv.conf` 的今日语义——tier `wg-native-dns:40` MUST 的默认面不动）。
+    pub dns_upstream: Vec<SocketAddr>,
+    /// 兜底上游（F2 `serve.dns_fallback`；默认 = `223.5.5.5`，仅连接层失败触发）。
+    /// 空串 = 拒启（值域层），此处不再为空。
+    pub dns_fallback: String,
+    /// DDNS 自检直查解析器（F2 `serve.ddns_resolver`；默认 = 常量表投影）。
+    pub ddns_resolver: Vec<SocketAddrV4>,
+    /// 挑卡 / 健康探针 / udpcap `DNS:53` 能力位目标（F2 `serve.dns_probe_target`；
+    /// 默认 = `default_probe_targets()`；**一键喂三路是显式登记的耦合**）。
+    pub dns_probe_target: Vec<SocketAddrV4>,
+    /// 通用 UDP（非 53）能力位目标（F2 `serve.stun_probe_target`；默认 =
+    /// `default_stun_targets()`）。
+    pub stun_probe_target: Vec<SocketAddrV4>,
     /// 发送整形的 config 覆盖（D-3 反过拟合约束 3：`[serve.tx_shape]` 节；
     /// None = 全默认。env 测试缝的优先级在 `tx_shape_resolve` 内——env > config > 默认）。
     pub tx_shape_cfg: Option<crate::server::intercept::TxShapeCfg>,
@@ -109,6 +123,12 @@ impl Default for ServeConfig {
             build: "homeway-rs-dev".to_owned(),
             relay: None,
             ddns: Vec::new(),
+            // F2 五键默认 = 修前硬编值（逐值不变——缺省行为兼容既有部署）
+            dns_upstream: Vec::new(),
+            dns_fallback: crate::server::dnsproxy::DEFAULT_FALLBACK.to_owned(),
+            ddns_resolver: crate::server::ddnscheck::default_resolvers_v4(),
+            dns_probe_target: egress::default_probe_targets(),
+            stun_probe_target: egress::default_stun_targets(),
             tx_shape_cfg: None,
         }
     }
@@ -262,7 +282,7 @@ impl ServeEngine {
             BindMode::Auto => {
                 let cands = egress::physical_candidates();
                 let d2 = Arc::clone(&dlogf);
-                let r = egress::select_best(&cands, &[], Duration::from_secs(2), &move |s: &str| {
+                let r = egress::select_best(&cands, &cfg.dns_probe_target, Duration::from_secs(2), &move |s: &str| {
                     (d2)(s);
                 });
                 match r {
@@ -294,7 +314,7 @@ impl ServeEngine {
                         ));
                         let cands = egress::physical_candidates();
                         let d2 = Arc::clone(&dlogf);
-                        match egress::select_best(&cands, &[], Duration::from_secs(2), &move |s: &str| {
+                        match egress::select_best(&cands, &cfg.dns_probe_target, Duration::from_secs(2), &move |s: &str| {
                             (d2)(s);
                         }) {
                             Ok(best) => {
@@ -315,7 +335,13 @@ impl ServeEngine {
         // ---- DNS 代答（E4）----
         let dns_enabled = cfg.dns_port != 0;
         let (dns, dns_events_rx) = if dns_enabled {
-            let (p, rx) = DnsProxy::spawn(DnsConfig::default(), Arc::clone(&logf), Arc::clone(&dlogf));
+            // F2：上游覆盖（opt-in）+ 兜底键（默认 = 修前常量，逐值不变）
+            let dns_cfg = DnsConfig {
+                upstreams: cfg.dns_upstream.clone(),
+                fallback_dns: cfg.dns_fallback.clone(),
+                ..DnsConfig::default()
+            };
+            let (p, rx) = DnsProxy::spawn(dns_cfg, Arc::clone(&logf), Arc::clone(&dlogf));
             (Some(p), Some(rx))
         } else {
             (None, None)
@@ -642,6 +668,7 @@ impl ServeEngine {
             log_paths,
             pinned_flag: Arc::clone(&pinned_flag),
             ddns_checks: Arc::clone(&ddns_checks),
+            ddns_resolvers: cfg.ddns_resolver.iter().copied().map(SocketAddr::V4).collect(),
         });
         let pub_enabled = cfg.upnp || !cfg.stun.is_empty() || !cfg.public_endpoint.is_empty();
         if pub_enabled {
@@ -729,9 +756,11 @@ impl ServeEngine {
             let cmd_tx2 = cmd_tx.clone();
             let dlogf = Arc::clone(&dlogf);
             let itc_stats = Arc::clone(&itc_stats);
+            let dns_targets = cfg.dns_probe_target.clone();
+            let stun_targets = cfg.stun_probe_target.clone();
             std::thread::Builder::new()
                 .name("homeway-udpcap".into())
-                .spawn(move || udpcap_loop(cmd_tx2, itc_stats, &dlogf, udpcap_kick_rx))
+                .spawn(move || udpcap_loop(cmd_tx2, itc_stats, &dlogf, udpcap_kick_rx, dns_targets, stun_targets))
                 .ok();
         }
 
@@ -752,7 +781,8 @@ impl ServeEngine {
             let stop = spawn_service_stop_flag(&mut stop_flags);
             super::bindwatch::spawn_watcher(super::bindwatch::WatcherArgs {
                 explicit_name,
-                probe_targets: super::bindwatch::probe_targets_from_env(),
+                probe_targets: super::bindwatch::health_probe_targets_from_env(&cfg.dns_probe_target),
+                pick_targets: super::bindwatch::pick_targets(&cfg.dns_probe_target),
                 cmd_tx: cmd_tx.clone(),
                 pinned_flag: Arc::clone(&pinned_flag),
                 pub_kick: pub_kick_tx.clone(),
@@ -896,7 +926,7 @@ pub fn shrink_upnp_lease(engine: &ServeEngine, logf: &Logf) {
     let port = engine.local_port;
     let cands = crate::server::upnp::local_ipv4_candidates();
     let deadline = std::time::Instant::now() + crate::server::upnp::UPNP_SHRINK_TOTAL_BUDGET;
-    match crate::server::upnp::shrink_lease_before(&cands, port, deadline) {
+    match crate::server::upnp::shrink_lease_before(&cands, port, deadline, &**logf) {
         crate::server::upnp::ShrinkOutcome::Shrunk { ext } => {
             (logf)(&format!("UPnP：退出前把映射 外部 {ext} 的租期缩到 5 分钟（快速重启仍会沿用这个端口）"));
         }
@@ -1376,6 +1406,8 @@ struct TokenCtx {
     pinned_flag: Arc<AtomicBool>,
     /// DDNS 自检的滚动状态（按域名一域一份；探测线程写 / status 快照读——P0-4）。
     ddns_checks: super::ddnscheck::DdnsChecks,
+    /// DDNS 自检直查解析器（F2：`serve.ddns_resolver` 装配期为 `SocketAddr` 形态）。
+    ddns_resolvers: Vec<SocketAddr>,
 }
 
 /// 公网端点循环：成功 10min / 失败 2min 一轮；显式端点配置覆盖最高优先（FIX-61）。
@@ -1401,6 +1433,7 @@ fn public_endpoint_loop(
                 &ctx.ddns_checks,
                 &ctx.cfg.ddns,
                 &published,
+                &ctx.ddns_resolvers,
                 &*ctx.logf,
             );
         }
@@ -1804,13 +1837,16 @@ fn udpcap_loop(
     stats: Arc<ItcStats>,
     logf: &Logf,
     kick_rx: mpsc::Receiver<()>,
+    dns_targets: Vec<SocketAddrV4>,
+    stun_targets: Vec<SocketAddrV4>,
 ) {
     let mut last = "?".to_owned();
     let mut prev_replied: u64 = 0;
     let mut prev_no_reply: u64 = 0;
     loop {
         // 先探一轮再进周期（Go startUDPCapProbe 同序）
-        let (dns_note, generic_note, saw, hint, flags) = probe_once(&stats, &mut prev_replied, &mut prev_no_reply);
+        let (dns_note, generic_note, saw, hint, flags) =
+            probe_once(&stats, &mut prev_replied, &mut prev_no_reply, &dns_targets, &stun_targets);
         let _ = cmd_tx.send(EngineCmd::SetCaps(flags));
         let cur = format!("0x{flags:02x}");
         if cur != last || saw != "本轮没有转发的 UDP 会话" {
@@ -1845,9 +1881,11 @@ fn probe_once(
     stats: &Arc<ItcStats>,
     prev_replied: &mut u64,
     prev_no_reply: &mut u64,
+    dns_targets: &[SocketAddrV4],
+    stun_targets: &[SocketAddrV4],
 ) -> (String, String, String, String, u8) {
     let mut flags: u8 = 0;
-    let dns_note = match egress::probe_default(&[], Duration::from_secs(2)) {
+    let dns_note = match egress::probe_default(dns_targets, Duration::from_secs(2)) {
         Ok(rtt) => {
             flags |= UDPCAP_DNS;
             format!("可用（往返 {}ms）", rtt.as_millis())
@@ -1858,7 +1896,7 @@ fn probe_once(
     let mut gen_note = String::new();
     let mut generic_ok = false;
     for _ in 0..2 {
-        match egress::probe_stun(None, &[], Duration::from_secs(3)) {
+        match egress::probe_stun(None, stun_targets, Duration::from_secs(3)) {
             Ok((mapped, rtt)) => {
                 flags |= UDPCAP_GENERIC;
                 gen_note = format!("有可校验应答（往返 {}ms，映射 {mapped}）", rtt.as_millis());
@@ -1932,6 +1970,59 @@ mod tests {
     /// Q-I F7（主判据）：`udpcap_loop` 等待三态——Ok(kick) 与 Timeout 立即重探
     /// （旧形态对 Timeout 再睡一个 interval ⇒ bindwatch 在位时实际周期 ~600s）；
     /// Disconnected 补睡一个节拍（防自旋，`--bind-interface none` 形态不变）。
+    /// F2（代码门 M3②）：`probe_once` 用**配置目标**探——本地 UDP 桩同时答 DNS 探针与
+    /// STUN Binding ⇒ flags 必含 `DNS:53` + 通用（非 53）+ PROBED（注入面真到消费点）。
+    #[test]
+    fn probe_once_uses_injected_targets() {
+        let stub = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let stub_port = stub.local_addr().unwrap().port();
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            loop {
+                let Ok((n, from)) = stub.recv_from(&mut buf) else { return };
+                let req = &buf[..n];
+                if n >= 20 && u16::from_be_bytes([req[0], req[1]]) == 0x0001 {
+                    // STUN Binding Request → Success Response + XOR-MAPPED-ADDRESS(v4 127.0.0.1)
+                    let txid = &req[8..20];
+                    let cookie = 0x2112_A442u32.to_be_bytes();
+                    let mut attr = vec![0x00, 0x01];
+                    attr.extend_from_slice(&(stub_port ^ 0x2112).to_be_bytes());
+                    let ip = [127u8, 0, 0, 1];
+                    for (i, b) in ip.iter().enumerate() {
+                        attr.push(b ^ cookie[i]);
+                    }
+                    let mut resp = Vec::new();
+                    resp.extend_from_slice(&0x0101u16.to_be_bytes());
+                    resp.extend_from_slice(&((attr.len() + 4) as u16).to_be_bytes());
+                    resp.extend_from_slice(&cookie);
+                    resp.extend_from_slice(txid);
+                    resp.extend_from_slice(&0x0020u16.to_be_bytes());
+                    resp.extend_from_slice(&(attr.len() as u16).to_be_bytes());
+                    resp.extend_from_slice(&attr);
+                    let _ = stub.send_to(&resp, from);
+                } else {
+                    // DNS 探针：只要求 ID 匹配 + 来源正确 ⇒ 回 12 字节头（ID 回显）
+                    let mut resp = vec![0u8; 12];
+                    if n >= 2 {
+                        resp[0] = req[0];
+                        resp[1] = req[1];
+                    }
+                    resp[2] = 0x81;
+                    resp[3] = 0x80;
+                    let _ = stub.send_to(&resp, from);
+                }
+            }
+        });
+        let target: SocketAddrV4 = format!("127.0.0.1:{stub_port}").parse().unwrap();
+        let stats = Arc::new(ItcStats::default());
+        let (dns_note, gen_note, _, _, flags) =
+            probe_once(&stats, &mut 0, &mut 0, &[target], &[target]);
+        assert_eq!(flags & UDPCAP_DNS, UDPCAP_DNS, "DNS:53 位应置（{dns_note}）");
+        assert_eq!(flags & UDPCAP_GENERIC, UDPCAP_GENERIC, "通用位应置（{gen_note}）");
+        assert_eq!(flags & UDPCAP_PROBED, UDPCAP_PROBED, "PROBED 位恒置");
+        assert!(!dns_note.contains("不可用"), "配置目标应探通：{dns_note}");
+    }
+
     #[test]
     fn udpcap_wait_three_states() {
         assert!(

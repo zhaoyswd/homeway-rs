@@ -484,8 +484,10 @@ impl SessionVt {
     }
 
     /// 键编码（Go `Terminal.EncodeKey` 等价：选项按当前模式态现取现用）。
-    pub fn encode_key(&self, ev: &keyenc::KeyEvent) -> Vec<u8> {
-        keyenc::encode_key(ev, &self.key_options())
+    /// `flavor` = 本腿平台口径（Q-J F1：由客户端 HELLO caps 声明，未声明 = 宿主推断；
+    /// 必收参——无默认值，防「默认宿主隐式回潮」）。
+    pub fn encode_key(&self, ev: &keyenc::KeyEvent, flavor: keyenc::KeyFlavor) -> Vec<u8> {
+        keyenc::encode_key(ev, &self.key_options(), flavor)
     }
 
     /// 鼠标编码（Go `Terminal.EncodeMouse` 等价：B5 单值 + 1×1 虚拟网格几何）。

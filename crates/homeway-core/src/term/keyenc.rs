@@ -11,10 +11,13 @@
 //! - **composing 恒由 wire 载荷携带**（Go 同名 bool 直传）；
 //! - **consumed_mods 不存在**（Go 不设 ⇒ effective mods ≡ 全量 mods）。
 //!
-//! 平台分支（D-10，ghostty 编译期分支的同形物）：macOS 上 super 抑制文本直发、
-//! option-as-alt 恒 `.false`（wire 无该配置面 ⇒ alt 前缀/mok2 alt 位按 darwin 口径剥离）；
-//! Linux 上 alt 前缀生效（1036 默认 on）。**向量由 darwin 宿主产出**——本机测试在
-//! darwin 上逐字节对拍；linux 分支无向量判据（6g 补，登记 D-10）。
+//! **平台口径（Q-J F1）**：ghostty 的四处编译期 darwin 门（alt 前缀/super 抑制文本/
+//! mok2 alt 位/kitty 关联文本）改为由 [`KeyFlavor`] 承载——出口侧按**客户端 HELLO
+//! 声明**选口径（`caps::KEY_ALT_ESC_PREFIX`/`KEY_ALT_NO_ESC_PREFIX`），未声明/歧义
+//! ⇒ [`KeyFlavor::host_default`] 宿主推断（唯一 `cfg!(target_os)` 残留点 = 缺省兼容
+//! 推断，取代 D-10 的「按出口编译宿主恒选」）。**向量由 darwin 宿主产出**——parity
+//! 对拍显式用 `AltNoEscPrefix`（全平台可跑）；非 darwin 口径无夹具，真源 = vendored
+//! ghostty 源码行级 + 本文件 `non_darwin_flavor_expectations` 期望表（显式登记）。
 //!
 //! 鼠标编码面消费 [`crate::term::vt`] 的 **B5 last-set 单值**
 //! （`MouseTracking`/`MouseFormat`，ghostty `flags.mouse_event/format` 语义），
@@ -130,8 +133,38 @@ impl KeyOptions {
     };
 }
 
-/// 服务端编码器固定按宿主平台走 ghostty 的编译期分支（D-10）。
-const IS_DARWIN: bool = cfg!(target_os = "macos");
+/// 键编码的平台口径（ghostty 编译期分支的语义等价物；F1）。
+///
+/// - [`KeyFlavor::AltNoEscPrefix`]：等价 libghostty **darwin 编译分支**——`option_as_alt
+///   ≡ .false`：alt 不产 ESC 前缀、mok2 剥 alt 位、kitty 关联文本不因 alt 抑制、
+///   super 抑制文本直发；
+/// - [`KeyFlavor::AltEscPrefix`]：等价 libghostty **非 darwin 编译分支**——alt 产 ESC
+///   前缀、mok2 保留 alt 位、kitty 关联文本被 alt 抑制、super 不抑制文本。
+///
+/// 由客户端 HELLO caps 声明（`frames::caps::KEY_ALT_*`）；未声明/歧义 =
+/// [`KeyFlavor::host_default`]（缺省兼容既有部署）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeyFlavor {
+    AltEscPrefix,
+    AltNoEscPrefix,
+}
+
+impl KeyFlavor {
+    /// 宿主推断（**唯一** `cfg!(target_os)` 残留点）：darwin ⇒ `AltNoEscPrefix`，
+    /// 其余 ⇒ `AltEscPrefix`（与今日 `IS_DARWIN` 逐字节同值——缺省兼容）。
+    pub const fn host_default() -> KeyFlavor {
+        if cfg!(target_os = "macos") {
+            KeyFlavor::AltNoEscPrefix
+        } else {
+            KeyFlavor::AltEscPrefix
+        }
+    }
+
+    /// 本口径下 alt 是否不产 ESC 前缀（darwin 分支语义）。
+    pub const fn alt_no_esc_prefix(self) -> bool {
+        matches!(self, KeyFlavor::AltNoEscPrefix)
+    }
+}
 
 /// kitty 协议标志位（disambiguate 位不单独门任何编码分支——只贡献「kitty 开」
 /// 的判定，见 encode_key 的 flags != 0 检查）。
@@ -692,13 +725,13 @@ fn ctrl_seq(key: Key, text: &str, mods: Mods) -> Option<u8> {
     ctrl_c0(char)
 }
 
-/// alt 前缀（`legacyAltPrefix`；macos_option_as_alt ≡ false ⇒ darwin 恒无前缀，
+/// alt 前缀（`legacyAltPrefix`；`AltNoEscPrefix` ⇒ option-as-alt ≡ false ⇒ 恒无前缀，
 /// unshifted ≡ 0 ⇒ 无「仅码点」分支——两条简化都有向量/源码依据）。
-fn legacy_alt_prefix(out: &mut Vec<u8>, binding: Mods, text: &str, opts: &KeyOptions) -> bool {
+fn legacy_alt_prefix(out: &mut Vec<u8>, binding: Mods, text: &str, opts: &KeyOptions, flavor: KeyFlavor) -> bool {
     if !binding.alt() || !opts.alt_esc_prefix {
         return false;
     }
-    if IS_DARWIN {
+    if flavor.alt_no_esc_prefix() {
         return false; // option-as-alt = .false（wire 无该配置面）
     }
     if text.is_empty() {
@@ -725,19 +758,20 @@ fn single_codepoint(text: &str) -> Option<char> {
 // ---------------------------------------------------------------------------
 
 /// 键编码（`key_encode.encode`）：kitty 开 ⇒ kitty 路径，否则 legacy。
+/// `flavor` = 本腿平台口径（**必收参**——无默认值，F1 编译期强制传递）。
 /// 无输出（模式抑制/纯修饰等）返回空 Vec。
-pub fn encode_key(ev: &KeyEvent, opts: &KeyOptions) -> Vec<u8> {
+pub fn encode_key(ev: &KeyEvent, opts: &KeyOptions, flavor: KeyFlavor) -> Vec<u8> {
     let mut out = Vec::with_capacity(16);
     if opts.kitty_flags != 0 {
-        kitty_encode(&mut out, ev, opts);
+        kitty_encode(&mut out, ev, opts, flavor);
     } else {
-        legacy_encode(&mut out, ev, opts);
+        legacy_encode(&mut out, ev, opts, flavor);
     }
     out
 }
 
 /// legacy 路径（传统终端 + xterm modifyOtherKeys + fixterms CSI u 的组合）。
-fn legacy_encode(out: &mut Vec<u8>, ev: &KeyEvent, opts: &KeyOptions) {
+fn legacy_encode(out: &mut Vec<u8>, ev: &KeyEvent, opts: &KeyOptions, flavor: KeyFlavor) {
     let all_mods = ev.mods;
     let binding = all_mods.binding();
 
@@ -774,9 +808,9 @@ fn legacy_encode(out: &mut Vec<u8>, ev: &KeyEvent, opts: &KeyOptions) {
     // ② modifyOtherKeys mode 2：CSI 27（在 ctrl→C0 之前——mode 2 也编码这些键）
     if opts.modify_other_keys_state_2 {
         if let Some(cp) = single_codepoint(ev.text) {
-            // darwin + option-as-alt=false ⇒ alt 不进 modcode（向量 mok2 ctrl+alt 钉死）
+            // AltNoEscPrefix + option-as-alt=false ⇒ alt 不进 modcode（向量 mok2 ctrl+alt 钉死）
             let mut m = binding.0 as u8;
-            if IS_DARWIN {
+            if flavor.alt_no_esc_prefix() {
                 m &= !MB_A; // option-as-alt ≡ false ⇒ alt 不进 modcode
             }
             let cpn = cp as u32;
@@ -803,7 +837,7 @@ fn legacy_encode(out: &mut Vec<u8>, ev: &KeyEvent, opts: &KeyOptions) {
 
     // ④ 无文本：只剩 alt 前缀可能
     if ev.text.is_empty() {
-        legacy_alt_prefix(out, binding, ev.text, opts);
+        legacy_alt_prefix(out, binding, ev.text, opts, flavor);
         return;
     }
 
@@ -831,12 +865,12 @@ fn legacy_encode(out: &mut Vec<u8>, ev: &KeyEvent, opts: &KeyOptions) {
     }
 
     // ⑥ alt 前缀（文本形态）
-    if legacy_alt_prefix(out, binding, ev.text, opts) {
+    if legacy_alt_prefix(out, binding, ev.text, opts, flavor) {
         return;
     }
 
-    // ⑦ darwin 上 super+键不产文本；其余直发
-    if IS_DARWIN && all_mods.super_() {
+    // ⑦ AltNoEscPrefix（darwin 分支）上 super+键不产文本；其余直发
+    if flavor.alt_no_esc_prefix() && all_mods.super_() {
         return;
     }
     out.extend_from_slice(ev.text.as_bytes());
@@ -927,7 +961,7 @@ impl KittySeq {
     }
 }
 
-fn kitty_encode(out: &mut Vec<u8>, ev: &KeyEvent, opts: &KeyOptions) {
+fn kitty_encode(out: &mut Vec<u8>, ev: &KeyEvent, opts: &KeyOptions, flavor: KeyFlavor) {
     let flags = opts.kitty_flags;
     let report_events = flags & KF_REPORT_EVENTS != 0;
     let report_all = flags & KF_REPORT_ALL != 0;
@@ -1068,8 +1102,8 @@ fn kitty_encode(out: &mut Vec<u8>, ev: &KeyEvent, opts: &KeyOptions) {
     }
 
     if report_associated && seq.event != 3 {
-        // darwin + option-as-alt=false ⇒ alt 不阻文本（D-10 darwin 口径）
-        let alt_prevents_text = !IS_DARWIN;
+        // AltNoEscPrefix + option-as-alt=false ⇒ alt 不阻文本（darwin 分支口径）
+        let alt_prevents_text = !flavor.alt_no_esc_prefix();
         let prevents = (seq.mods & 0b10 != 0 && alt_prevents_text)
             || seq.mods & 0b100 != 0
             || seq.mods & 0b1000 != 0;
@@ -1321,12 +1355,10 @@ mod tests {
     }
 
     /// 6c 判据：键编码 387 案逐字节对拍（喂 SessionVt 模式序列 → encode_key）。
-    /// **仅 darwin 面**：编码器按宿主平台走 ghostty 编译期分支（D-10，IS_DARWIN——
-    /// alt 是否阻文本等 8 案随平台分叉），向量是 macOS 基线上生成的 darwin 形态；
-    /// linux 面跑 darwin 向量必然差这 8 案（转正 A 批 ubuntu CI 实测抓出）。
-    /// 非 darwin 面的编码行为由本文件 IS_DARWIN 分支单测（mok2_modifier_matrix_codes
-    /// 等）钉住——两平台各自对齐 ghostty 语义，不互相对拍。
-    #[cfg(target_os = "macos")]
+    /// **全平台可跑（F1）**：显式传 `KeyFlavor::AltNoEscPrefix`（= 向量宿主的 darwin
+    /// 口径）——修前 `#[cfg(target_os = "macos")]` 门去掉，Linux/musl CI 也能跑 darwin
+    /// 形态向量。非 darwin 口径（`AltEscPrefix`）无夹具，由 `non_darwin_flavor_expectations`
+    /// 期望表钉死（真源 = vendored ghostty 源码行级；登记见 INTEROP-CRITERIA）。
     #[test]
     fn keyenc_parity_with_go_vectors() {
         use crate::term::vt::SessionVt;
@@ -1353,7 +1385,7 @@ mod tests {
                 text: e.get("text").and_then(|x| x.as_str()).unwrap_or(""),
                 composing: e.get("composing").and_then(|x| x.as_bool()).unwrap_or(false),
             };
-            let got = vt.encode_key(&ev);
+            let got = vt.encode_key(&ev, KeyFlavor::AltNoEscPrefix);
             let got_hex = got.iter().map(|b| format!("{b:02x}")).collect::<String>();
             let want = c.get("out_hex").and_then(|x| x.as_str()).unwrap_or("");
             if got_hex != want {
@@ -1414,45 +1446,47 @@ mod tests {
         assert!(failures.is_empty(), "鼠标 parity 失败 {} 案:\n{}", failures.len(), failures.join("\n"));
     }
 
-    /// mok2 矩阵码抽查（向量之外的组合；对照 zig `modifiers` 序）。
+    /// mok2 矩阵码抽查（向量之外的组合；对照 zig `modifiers` 序）。两口径都显式断言
+    /// （F1：平台口径不再靠编译宿主决定）。
     #[test]
     fn mok2_modifier_matrix_codes() {
         let opts = KeyOptions { modify_other_keys_state_2: true, ..KeyOptions::DEFAULT };
-        // ctrl（第 4 项 ⇒ 码 5）
+        let darwin = KeyFlavor::AltNoEscPrefix;
+        let other = KeyFlavor::AltEscPrefix;
+        // ctrl（第 4 项 ⇒ 码 5）——两条口径同值
         let ev = KeyEvent { key: Key(20), action: KeyAction::Press, mods: Mods(2), text: "a", composing: false };
-        assert_eq!(hx(&encode_key(&ev, &opts)), hex("\x1b[27;5;97~"));
+        assert_eq!(hx(&encode_key(&ev, &opts, darwin)), hex("\x1b[27;5;97~"));
+        assert_eq!(hx(&encode_key(&ev, &opts, other)), hex("\x1b[27;5;97~"));
         // shift+alt+ctrl+super（darwin 剥 alt ⇒ shift+ctrl+super 第 13 项码 14；
         // 非 darwin 全四修饰 = 第 15 项码 16）
         let ev = KeyEvent { key: Key(20), action: KeyAction::Press, mods: Mods(0b1111), text: "a", composing: false };
-        if IS_DARWIN {
-            assert_eq!(hx(&encode_key(&ev, &opts)), hex("\x1b[27;14;97~"));
-        } else {
-            assert_eq!(hx(&encode_key(&ev, &opts)), hex("\x1b[27;16;97~"));
-        }
-        // darwin：alt 位不进 modcode（ctrl+alt ⇒ 只叠 ctrl）
+        assert_eq!(hx(&encode_key(&ev, &opts, darwin)), hex("\x1b[27;14;97~"));
+        assert_eq!(hx(&encode_key(&ev, &opts, other)), hex("\x1b[27;16;97~"));
+        // darwin：alt 位不进 modcode（ctrl+alt ⇒ 只叠 ctrl）；非 darwin：alt 进（码 7）
         let ev = KeyEvent { key: Key(20), action: KeyAction::Press, mods: Mods(0b0110), text: "a", composing: false };
-        if IS_DARWIN {
-            assert_eq!(hx(&encode_key(&ev, &opts)), hex("\x1b[27;5;97~"));
-        }
+        assert_eq!(hx(&encode_key(&ev, &opts, darwin)), hex("\x1b[27;5;97~"));
+        assert_eq!(hx(&encode_key(&ev, &opts, other)), hex("\x1b[27;7;97~"));
     }
 
     /// DECBKM 翻转（backspace 的 sequence_decbkm）。
     #[test]
     fn backarrow_mode_flips_backspace() {
+        let hd = KeyFlavor::host_default();
         let off = KeyOptions::DEFAULT;
         let on = KeyOptions { backarrow_key_mode: true, ..KeyOptions::DEFAULT };
         let ev = KeyEvent { key: Key(53), action: KeyAction::Press, mods: Mods::NONE, text: "\x7f", composing: false };
-        assert_eq!(encode_key(&ev, &off), b"\x7f");
-        assert_eq!(encode_key(&ev, &on), b"\x08");
+        assert_eq!(encode_key(&ev, &off, hd), b"\x7f");
+        assert_eq!(encode_key(&ev, &on, hd), b"\x08");
         let ctrl = KeyEvent { key: Key(53), action: KeyAction::Press, mods: Mods(2), text: "", composing: false };
-        assert_eq!(encode_key(&ctrl, &off), b"\x08");
-        assert_eq!(encode_key(&ctrl, &on), b"\x7f");
+        assert_eq!(encode_key(&ctrl, &off, hd), b"\x08");
+        assert_eq!(encode_key(&ctrl, &on, hd), b"\x7f");
     }
 
     /// 小键盘应用模式（DECKPAM + 1035 复位）——ghostty 语义：1035 默认 on 时
     /// keypad 恒数值模式。
     #[test]
     fn keypad_1035_gates_application_mode() {
+        let hd = KeyFlavor::host_default();
         let deckpam = KeyOptions { keypad_key_application: true, ..KeyOptions::DEFAULT };
         let deckpam_1035_off = KeyOptions {
             keypad_key_application: true,
@@ -1461,25 +1495,90 @@ mod tests {
         };
         let ev = KeyEvent { key: Key(81), action: KeyAction::Press, mods: Mods::NONE, text: "1", composing: false };
         // 1035 on（默认）⇒ 数值模式
-        assert_eq!(encode_key(&ev, &deckpam), b"1");
+        assert_eq!(encode_key(&ev, &deckpam, hd), b"1");
         // 1035 off + DECKPAM ⇒ application 模式 SS3
-        assert_eq!(encode_key(&ev, &deckpam_1035_off), b"\x1bOq");
+        assert_eq!(encode_key(&ev, &deckpam_1035_off, hd), b"\x1bOq");
         // 无文本的 numpad_enter：表匹配 `\x1bOM`（kpDefault）
         let ev = KeyEvent { key: Key(97), action: KeyAction::Press, mods: Mods::NONE, text: "", composing: false };
-        assert_eq!(encode_key(&ev, &deckpam_1035_off), b"\x1bOM");
-        assert_eq!(encode_key(&ev, &deckpam), b"\r");
+        assert_eq!(encode_key(&ev, &deckpam_1035_off, hd), b"\x1bOM");
+        assert_eq!(encode_key(&ev, &deckpam, hd), b"\r");
     }
 
     /// kitty 的 `:1` 规则：字母终止符族 press 带 `:1`、u/~ 族不带（实测形态）。
     #[test]
     fn kitty_press_event_colon_one_rules() {
+        let hd = KeyFlavor::host_default();
         let opts = KeyOptions { kitty_flags: KF_DISAMBIGUATE | KF_REPORT_EVENTS, ..KeyOptions::DEFAULT };
         let arrow = KeyEvent { key: Key(76), action: KeyAction::Press, mods: Mods::NONE, text: "", composing: false };
-        assert_eq!(encode_key(&arrow, &opts), b"\x1b[1;1:1D");
+        assert_eq!(encode_key(&arrow, &opts, hd), b"\x1b[1;1:1D");
         let f5 = KeyEvent { key: Key(125), action: KeyAction::Press, mods: Mods(2), text: "", composing: false };
-        assert_eq!(encode_key(&f5, &opts), b"\x1b[15;5~");
+        assert_eq!(encode_key(&f5, &opts, hd), b"\x1b[15;5~");
         let enter = KeyEvent { key: Key(58), action: KeyAction::Press, mods: Mods(2), text: "\r", composing: false };
-        assert_eq!(encode_key(&enter, &opts), b"\x1b[13;5u");
+        assert_eq!(encode_key(&enter, &opts, hd), b"\x1b[13;5u");
+    }
+
+    /// **F1 非 darwin 口径期望表（8 案分叉面）**：真源 = vendored ghostty
+    /// `input/key_encode.zig:300-308/402-410/545-547/565-575` 四处 darwin 门 +
+    /// fixterms `:489`（无平台门，与 Rust `:812-829` 同形）。
+    /// **显式登记：非 darwin 口径无夹具（向量由 darwin 宿主产出），仅源码行级真源。**
+    /// 每案同时钉 darwin 口径（= 向量宿主形态）以证明"分叉面 = 这 8 案"。
+    #[test]
+    fn non_darwin_flavor_expectations() {
+        let darwin = KeyFlavor::AltNoEscPrefix; // ghostty darwin 编译分支
+        let other = KeyFlavor::AltEscPrefix; // ghostty 非 darwin 编译分支
+        let mok2 = KeyOptions { modify_other_keys_state_2: true, ..KeyOptions::DEFAULT };
+        let kitty_assoc = KeyOptions {
+            kitty_flags: KF_DISAMBIGUATE | KF_REPORT_ASSOCIATED,
+            ..KeyOptions::DEFAULT
+        };
+        // ① alt+a（legacy 文本路径）：darwin 直发文本 / 非 darwin ESC 前缀
+        let alt_a = KeyEvent { key: Key(20), action: KeyAction::Press, mods: Mods(4), text: "a", composing: false };
+        assert_eq!(encode_key(&alt_a, &KeyOptions::DEFAULT, darwin), b"a");
+        assert_eq!(encode_key(&alt_a, &KeyOptions::DEFAULT, other), b"\x1ba");
+        // ② alt+"ab"（多码点文本同上）
+        let alt_ab = KeyEvent { key: Key(20), action: KeyAction::Press, mods: Mods(4), text: "ab", composing: false };
+        assert_eq!(encode_key(&alt_ab, &KeyOptions::DEFAULT, darwin), b"ab");
+        assert_eq!(encode_key(&alt_ab, &KeyOptions::DEFAULT, other), b"\x1bab");
+        // ③ mok2 + alt（darwin 剥 alt ⇒ m=0 无表项 ⇒ 落文本直发；非 darwin m=4 ⇒ 码 3）
+        let alt_only = KeyEvent { key: Key(20), action: KeyAction::Press, mods: Mods(4), text: "a", composing: false };
+        assert_eq!(encode_key(&alt_only, &mok2, darwin), b"a");
+        assert_eq!(encode_key(&alt_only, &mok2, other), b"\x1b[27;3;97~");
+        // ④ mok2 + ctrl+alt：darwin 码 5（只叠 ctrl）/ 非 darwin 码 7（alt 进）
+        let ctrl_alt = KeyEvent { key: Key(20), action: KeyAction::Press, mods: Mods(0b0110), text: "a", composing: false };
+        assert_eq!(encode_key(&ctrl_alt, &mok2, darwin), b"\x1b[27;5;97~");
+        assert_eq!(encode_key(&ctrl_alt, &mok2, other), b"\x1b[27;7;97~");
+        // ⑤ mok2 + shift+alt+ctrl：darwin m=0b0011（第 5 项码 6）/ 非 darwin m=0b0111（第 7 项码 8）
+        let sac = KeyEvent { key: Key(20), action: KeyAction::Press, mods: Mods(0b0111), text: "a", composing: false };
+        assert_eq!(encode_key(&sac, &mok2, darwin), b"\x1b[27;6;97~");
+        assert_eq!(encode_key(&sac, &mok2, other), b"\x1b[27;8;97~");
+        // ⑥ super+a（legacy ⑦ 门）：darwin 无输出 / 非 darwin 直发文本
+        let sup_a = KeyEvent { key: Key(20), action: KeyAction::Press, mods: Mods(8), text: "a", composing: false };
+        assert_eq!(encode_key(&sup_a, &KeyOptions::DEFAULT, darwin), b"");
+        assert_eq!(encode_key(&sup_a, &KeyOptions::DEFAULT, other), b"a");
+        // ⑦ kitty REPORT_ASSOCIATED + alt+numpad_0（关联文本 "0" 非控制码——控制码文本
+        // 会被文本段剔除、见 ⑧ 前的实现）：darwin 文本保留（`u` 族文本段 `;48`）/
+        // 非 darwin alt 阻文本（纯序列）——字母终止符族（[P 等）不含文本段，只有
+        // `u`/`~` 族能观察该分叉。
+        let ka = KeyEvent { key: Key(80), action: KeyAction::Press, mods: Mods(4), text: "0", composing: false };
+        assert_eq!(encode_key(&ka, &kitty_assoc, darwin), b"\x1b[57399;3;48u");
+        assert_eq!(encode_key(&ka, &kitty_assoc, other), b"\x1b[57399;3u");
+        // ⑧ kitty REPORT_ASSOCIATED + super+numpad_0：super 两口径都阻文本（ctrl 同）——
+        // 对照 ⑦ 证明分叉只在 alt 维
+        let ks = KeyEvent { key: Key(80), action: KeyAction::Press, mods: Mods(8), text: "0", composing: false };
+        assert_eq!(encode_key(&ks, &kitty_assoc, darwin), b"\x1b[57399;9u");
+        assert_eq!(encode_key(&ks, &kitty_assoc, other), b"\x1b[57399;9u");
+    }
+
+    /// F1：`host_default()` 为缺省口径——与今日 `IS_DARWIN` 逐字节同值（编译期二分）。
+    #[test]
+    fn host_default_matches_legacy_is_darwin() {
+        let expect = if cfg!(target_os = "macos") {
+            KeyFlavor::AltNoEscPrefix
+        } else {
+            KeyFlavor::AltEscPrefix
+        };
+        assert_eq!(KeyFlavor::host_default(), expect);
+        assert_eq!(KeyFlavor::host_default().alt_no_esc_prefix(), cfg!(target_os = "macos"));
     }
 
     /// 焦点/粘贴编码面。

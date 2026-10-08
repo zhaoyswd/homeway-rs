@@ -89,6 +89,17 @@ pub mod hello_flags {
 pub mod caps {
     pub const SURFACE: u8 = 1 << 0;
     pub const RAW_TERMINAL: u8 = 1 << 1;
+    /// Q-J F1：客户端声明「本端 alt **不**产 ESC 前缀」= libghostty **darwin 编译分支**
+    /// 语义（`option_as_alt ≡ .false`；附随：mok2 剥 alt 位、kitty 关联文本不因 alt 抑制、
+    /// super 抑制文本）。与 [`KEY_ALT_ESC_PREFIX`] **互斥**。
+    pub const KEY_ALT_NO_ESC_PREFIX: u8 = 1 << 2;
+    /// Q-J F1：客户端声明「本端 alt 产 ESC 前缀」= libghostty **非 darwin 编译分支**语义
+    /// （附随：mok2 保留 alt 位、kitty alt 阻文本）。与 [`KEY_ALT_NO_ESC_PREFIX`] **互斥**。
+    /// **两位全不置 = 未声明 ⇒ 宿主推断**（缺省兼容，逐字节同今日）。
+    /// **两位同置 = 歧义 ⇒ 按未声明处理（fail-soft）+ 计数 + 一次性告警，绝不拒腿**——
+    /// 「裸 ID 尾随块」按 caps 解析出 `caps=0x7F`（恰含 bit2|bit3），拒绝面会把今天
+    /// 可服务的腿变成 `bad_capability`（格式固有属性，见 `dec_hello_tail` 既有测试）。
+    pub const KEY_ALT_ESC_PREFIX: u8 = 1 << 3;
     /// FIX-29：caps 带此位 ⇒ caps 块后跟 1 字节协议版本。
     pub const PROTO_VER: u8 = 1 << 7;
 }

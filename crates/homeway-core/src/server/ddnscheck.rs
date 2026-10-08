@@ -24,7 +24,7 @@
 
 use std::collections::HashMap;
 use std::io;
-use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -63,11 +63,23 @@ fn is_false(b: &bool) -> bool {
     !*b
 }
 
-/// 公共解析器回退列表（`ddnsResolvers` 同值；测试经 env/参数注入本地假服务器）。
+/// 公共解析器回退列表（`ddnsResolvers` 同值；默认值 = 配置 `serve.ddns_resolver` 缺省；
+/// 测试经参数注入本地假服务器）。
 pub const DDNS_RESOLVERS: [SocketAddr; 2] = [
     SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::new(223, 5, 5, 5), 53)),
     SocketAddr::V4(std::net::SocketAddrV4::new(Ipv4Addr::new(119, 29, 29, 29), 53)),
 ];
+
+/// 默认直查解析器的 v4 投影（`serve.ddns_resolver` 缺省值单源——F2；常量表恒 v4）。
+pub fn default_resolvers_v4() -> Vec<SocketAddrV4> {
+    DDNS_RESOLVERS
+        .iter()
+        .filter_map(|s| match s {
+            SocketAddr::V4(v4) => Some(*v4),
+            SocketAddr::V6(_) => None,
+        })
+        .collect()
+}
 
 /// 单查询的问答预算（`ddnsQueryTimeout` 同值 2s）。
 const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
@@ -76,16 +88,8 @@ const CHECK_BUDGET: Duration = Duration::from_secs(15);
 /// 单次收集的地址上限（防畸形应答灌爆；正常 DDNS 1-2 条）。
 const MAX_ANSWERS: usize = 16;
 
-/// fake-IP 段（RFC 2544 benchmark 198.18.0.0/15——Surge 等代理的假地址面）。
-fn is_fake_ip(ip: IpAddr) -> bool {
-    match ip {
-        IpAddr::V4(v4) => {
-            let o = v4.octets();
-            o[0] == 198 && (o[1] & 0xFE) == 18
-        }
-        IpAddr::V6(_) => false,
-    }
-}
+// fake-IP 卫兵段：**单一实现位于 `egress::is_fake_ip`**（Q-J F3 迁入，dnsproxy 的
+// 交付应答计数共用）——本模块只调用，不再自带实现（两处各有一条「单一实现」断言）。
 
 /// 卫兵两档错误（自检按档分文案）。
 #[derive(Debug, thiserror::Error)]
@@ -106,13 +110,14 @@ pub fn run_ddns_self_check(
     checks: &Mutex<HashMap<String, DdnsCheckState>>,
     domains: &[String],
     published: &[String],
+    resolvers: &[SocketAddr],
     logf: &dyn Fn(&str),
 ) {
     if domains.is_empty() || published.is_empty() {
         return;
     }
     for domain in domains {
-        check_one(checks, domain, published, logf);
+        check_one(checks, domain, published, resolvers, logf);
     }
 }
 
@@ -120,9 +125,10 @@ fn check_one(
     checks: &Mutex<HashMap<String, DdnsCheckState>>,
     domain: &str,
     published: &[String],
+    resolvers: &[SocketAddr],
     logf: &dyn Fn(&str),
 ) {
-    let addrs = match resolve_ddns(domain, CHECK_BUDGET) {
+    let addrs = match resolve_ddns(domain, CHECK_BUDGET, resolvers) {
         Ok(a) => a,
         Err(e) => {
             let mut m = checks.lock().expect("ddns 状态锁中毒");
@@ -214,10 +220,12 @@ fn check_one(
 
 /// 解析 host 的 A+AAAA，只返回通过卫兵的全球单播地址（`resolveDDNS` 同义）。
 /// 解析器按序回退；单查询失败不拖垮另一族；全部失败返回错误（调用方跳过本轮自检）。
-pub fn resolve_ddns(host: &str, budget: Duration) -> Result<Vec<IpAddr>, DdnsErr> {
+/// `resolvers` = 直查解析器列表（F2：`serve.ddns_resolver`；空 = 默认常量表）。
+pub fn resolve_ddns(host: &str, budget: Duration, resolvers: &[SocketAddr]) -> Result<Vec<IpAddr>, DdnsErr> {
+    let resolvers: &[SocketAddr] = if resolvers.is_empty() { &DDNS_RESOLVERS } else { resolvers };
     let deadline = Instant::now() + budget;
     let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| DdnsErr::Io(format!("解析 socket 建立失败：{e}")))?;
-    for sv in DDNS_RESOLVERS {
+    for sv in resolvers.iter().copied() {
         let mut got: Vec<IpAddr> = Vec::new();
         let mut poisoned = false;
         for qtype in [QTYPE_A, QTYPE_AAAA] {
@@ -233,11 +241,14 @@ pub fn resolve_ddns(host: &str, budget: Duration) -> Result<Vec<IpAddr>, DdnsErr
             continue; // 该解析器没给出可用应答：试下一个
         }
         for a in &got {
-            if is_fake_ip(*a) {
+            if egress::is_fake_ip(*a) {
                 poisoned = true;
             }
         }
-        let out: Vec<IpAddr> = got.into_iter().filter(|a| egress::is_public_addr(*a) && !is_fake_ip(*a)).collect();
+        let out: Vec<IpAddr> = got
+            .into_iter()
+            .filter(|a| egress::is_public_addr(*a) && !egress::is_fake_ip(*a))
+            .collect();
         if !out.is_empty() {
             return Ok(out);
         }
@@ -247,7 +258,7 @@ pub fn resolve_ddns(host: &str, budget: Duration) -> Result<Vec<IpAddr>, DdnsErr
         }
         return Err(DdnsErr::Unroutable);
     }
-    Err(DdnsErr::AllFailed(DDNS_RESOLVERS.len()))
+    Err(DdnsErr::AllFailed(resolvers.len()))
 }
 
 const QTYPE_A: u16 = 1;
@@ -438,13 +449,15 @@ pub type DdnsChecks = Arc<Mutex<HashMap<String, DdnsCheckState>>>;
 mod tests {
     use super::*;
 
-    /// fake-IP 卫兵段判定（198.18.0.0/15 两段：198.18.x / 198.19.x）。
+    /// F3「单一实现」断言：本模块的 fake-IP 卫兵段 = `egress::is_fake_ip`（唯一实现；
+    /// dnsproxy 交付计数同源），此处只钉语义与归属。
     #[test]
-    fn fake_ip_range() {
-        assert!(is_fake_ip("198.18.0.1".parse().unwrap()));
-        assert!(is_fake_ip("198.19.255.255".parse().unwrap()));
-        assert!(!is_fake_ip("198.20.0.1".parse().unwrap()));
-        assert!(!is_fake_ip("223.5.5.5".parse().unwrap()));
+    fn fake_ip_single_source() {
+        use crate::server::egress::is_fake_ip as guard;
+        assert!(guard("198.18.0.1".parse().unwrap()));
+        assert!(guard("198.19.255.255".parse().unwrap()));
+        assert!(!guard("198.20.0.1".parse().unwrap()));
+        assert!(!guard("223.5.5.5".parse().unwrap()));
     }
 
     /// 查询报文形态（A 与 AAAA 的 QTYPE 差）。
@@ -503,6 +516,35 @@ mod tests {
         assert!(st.is_empty());
         drop(st);
         let _ = (&published, &dom, &logf);
+    }
+
+    /// F2（代码门 M3①）：`resolve_ddns` 的**注入解析器**直测——`resolvers` 参数真到
+    /// 消费点（mock UDP 答 A）；死解析器 ⇒ `AllFailed(注入表长度)`（输入集 = 注入表）。
+    #[test]
+    fn resolve_ddns_uses_injected_resolvers() {
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let srv = sock.local_addr().unwrap();
+        let h = std::thread::spawn(move || {
+            // 只答一次（A 查询）：AAAA 腿随预算超时，但 A 已够返回
+            let mut buf = [0u8; 512];
+            let Ok((n, from)) = sock.recv_from(&mut buf) else { return };
+            let q = &buf[..n];
+            let mut r = vec![0u8; 12];
+            r[0..2].copy_from_slice(&q[0..2]);
+            r[2] = 0x80;
+            r[4..6].copy_from_slice(&q[4..6]);
+            r[6..8].copy_from_slice(&1u16.to_be_bytes());
+            r.extend_from_slice(&q[12..q.len()]);
+            r.extend_from_slice(b"\xc0\x0c\x00\x01\x00\x01\x00\x00\x00\x3c\x00\x04\x09\x09\x09\x09");
+            let _ = sock.send_to(&r, from);
+        });
+        let got = resolve_ddns("inject.example", Duration::from_millis(700), &[srv]).expect("注入解析器应答");
+        assert_eq!(got, vec!["9.9.9.9".parse::<IpAddr>().unwrap()]);
+        let _ = h.join();
+        // 死解析器（注入表长度 = 1）⇒ AllFailed(1)（不是默认表长度）
+        let dead: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let e = resolve_ddns("dead.example", Duration::from_millis(150), &[dead]).unwrap_err();
+        assert!(matches!(e, DdnsErr::AllFailed(1)), "{e}");
     }
 
     /// mock DNS 服务器：应答 A 记录（回显事务 ID）——查询构造→发→收→解析全链

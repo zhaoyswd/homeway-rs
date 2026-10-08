@@ -14,15 +14,16 @@
 //! 只做「读查询 → 投队列」与「收应答 → 写回栈内 socket」（应答经 `DnsReply` 回投通道
 //! 异步到达，tag = 提交方的路由键）。
 
-use std::net::{SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpStream, ToSocketAddrs, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
 use crate::Logf;
 
-/// 全部 nameserver 连接层失败时的末位兜底（Go defaultFallback）。
-const DEFAULT_FALLBACK: &str = "223.5.5.5";
+/// 全部 nameserver 连接层失败时的末位兜底（Go defaultFallback；`serve.dns_fallback`
+/// 的缺省值单源——F2）。
+pub(crate) const DEFAULT_FALLBACK: &str = "223.5.5.5";
 /// 单查询总预算（主/兜共享）。
 const DEFAULT_BUDGET: Duration = Duration::from_millis(2500);
 /// 在途查询上限（超限丢弃计数；`dnsface` 回投容量与之对齐——见 F4d）。
@@ -57,6 +58,9 @@ const TYPE_ANY: u16 = 255;
 const TYPE_OPT: u16 = 41;
 /// TSIG：TTL 必须为 0，不可钳制。
 const TYPE_TSIG: u16 = 250;
+
+/// A 记录（fake-IP 交付计数扫的 type 面）。
+const TYPE_A: u16 = 1;
 
 /// 该 qtype 是否被代答过滤（回空应答）。
 pub fn filtered_qtype(qt: u16) -> bool {
@@ -153,6 +157,36 @@ pub fn count_aaaa(resp: &[u8]) -> usize {
     n
 }
 
+/// 交付应答的答案段是否含 fake-IP（198.18.0.0/15）A 记录（F3；每应答 ≤+1）。
+/// 与 [`count_aaaa`] 同解析纪律（畸形/截断 = 就地停），实现共用 [`egress::is_fake_ip`]
+/// ——**单一实现**（ddnscheck 卫兵同源）。
+pub fn has_fake_a(resp: &[u8]) -> bool {
+    if resp.len() < 12 {
+        return false;
+    }
+    let Some(mut off) = skip_name(resp, 12) else { return false };
+    off += 4;
+    let count = u16::from_be_bytes([resp[6], resp[7]]) as usize; // ANCOUNT
+    for _ in 0..count {
+        let Some(p) = skip_name(resp, off) else { return false };
+        if p + 10 > resp.len() {
+            return false;
+        }
+        let rdlen = u16::from_be_bytes([resp[p + 8], resp[p + 9]]) as usize;
+        if p + 10 + rdlen > resp.len() {
+            return false;
+        }
+        if u16::from_be_bytes([resp[p], resp[p + 1]]) == TYPE_A && rdlen == 4 {
+            let ip = Ipv4Addr::new(resp[p + 10], resp[p + 11], resp[p + 12], resp[p + 13]);
+            if crate::server::egress::is_fake_ip(IpAddr::V4(ip)) {
+                return true;
+            }
+        }
+        off = p + 10 + rdlen;
+    }
+    false
+}
+
 /// 把应答截到 ≤max 字节：保留 header + question + 尽可能多条完整 answer（不留半条），
 /// 按实存记录修三计数、置 TC。authority/additional（含 OPT）整体丢弃——客户端按 TC
 /// 语义走 TCP 取全量。已 ≤max 或无法解析时原样返回。
@@ -227,8 +261,13 @@ fn skip_name(msg: &[u8], mut off: usize) -> Option<usize> {
 
 /// /etc/resolv.conf nameserver 列表的跟随器：mtime 检查 1s 节流；变了重解析替换；
 /// 读取/解析失败保留 last-good；空表每节流窗口强制重读（启动竞态里文件可能原地出现）。
+///
+/// **F2 静态覆盖**：`fixed` 非空（`serve.dns_upstream` 配置了显式上游）时 `list()`
+/// 恒返回该静态列表——**不做 mtime 跟随**（覆盖语义：用户显式指定，主机 resolv.conf
+/// 变化不再影响）。空 = 今日的跟随语义**逐字不变**（spec `wg-native-dns:40` 的默认面）。
 pub struct Upstreams {
     path: String,
+    fixed: Option<Arc<Vec<String>>>,
     state: Mutex<UpstreamsState>,
 }
 
@@ -242,25 +281,37 @@ struct UpstreamsState {
 
 impl Upstreams {
     pub fn new(path: &str) -> Self {
+        Self::with_static(path, Vec::new())
+    }
+
+    /// F2：显式上游覆盖（`serve.dns_upstream`；空 = 跟随 resolv.conf）。
+    pub fn with_static(path: &str, upstreams: Vec<String>) -> Self {
         let mut st = UpstreamsState {
             last_check: Instant::now(),
             mtime: None,
             list: Arc::new(Vec::new()),
         };
-        if let Ok(md) = std::fs::metadata(path) {
-            if let Some(list) = parse_resolv_nameservers(path) {
-                if !list.is_empty() {
-                    st.mtime = md.modified().ok();
-                    st.list = Arc::new(list);
+        if upstreams.is_empty() {
+            if let Ok(md) = std::fs::metadata(path) {
+                if let Some(list) = parse_resolv_nameservers(path) {
+                    if !list.is_empty() {
+                        st.mtime = md.modified().ok();
+                        st.list = Arc::new(list);
+                    }
                 }
             }
+            return Self { path: path.to_owned(), fixed: None, state: Mutex::new(st) };
         }
-        Self { path: path.to_owned(), state: Mutex::new(st) }
+        Self { path: path.to_owned(), fixed: Some(Arc::new(upstreams)), state: Mutex::new(st) }
     }
 
     /// 当前 nameserver 列表**快照**（host 形式——resolv.conf 的 nameserver 都是 IP）。
     /// 返回 `Arc`：clone = 引用计数（F5 起，此前是 `Vec<String>` 深拷贝/查询）。
     pub fn list(&self) -> Arc<Vec<String>> {
+        // F2：静态覆盖优先（不做 mtime 跟随）
+        if let Some(f) = &self.fixed {
+            return Arc::clone(f);
+        }
         let mut st = self.state.lock().expect("上游表锁中毒");
         if st.last_check.elapsed() < CHECK_INTERVAL {
             return Arc::clone(&st.list);
@@ -321,13 +372,15 @@ pub struct DnsStats {
     dropped: AtomicU64,
     malformed: AtomicU64,
     aaaa_mixed: AtomicU64,
+    /// F3：交付应答（truncate 后）答案段含 fake-IP A 记录的应答数（每应答 ≤+1）。
+    fakeip: AtomicU64,
 }
 
 impl DnsStats {
     /// E22 判据行（debug 级周期输出）。
     pub fn line(&self) -> String {
         format!(
-            "dns: q={} qtcp={} resp={} filter={} trunc={} fallback={} fail={} drop={} malformed={} aaaa-mixed={}",
+            "dns: q={} qtcp={} resp={} filter={} trunc={} fallback={} fail={} drop={} malformed={} aaaa-mixed={} fakeip={}",
             self.q.load(Ordering::Relaxed),
             self.qtcp.load(Ordering::Relaxed),
             self.resp.load(Ordering::Relaxed),
@@ -338,6 +391,7 @@ impl DnsStats {
             self.dropped.load(Ordering::Relaxed),
             self.malformed.load(Ordering::Relaxed),
             self.aaaa_mixed.load(Ordering::Relaxed),
+            self.fakeip.load(Ordering::Relaxed),
         )
     }
 }
@@ -353,6 +407,8 @@ pub struct DnsReply {
 pub struct DnsConfig {
     pub resolv_path: String,
     pub fallback_dns: String,
+    /// F2 `serve.dns_upstream`：显式上游覆盖（空 = 跟随 `resolv_path`）。
+    pub upstreams: Vec<SocketAddr>,
     pub budget: Duration,
     pub max_in_flight: usize,
     /// worker 池线程数（0 = `DEFAULT_WORKERS`；测试注入小值以钉并发语义）。
@@ -364,6 +420,7 @@ impl Default for DnsConfig {
         Self {
             resolv_path: "/etc/resolv.conf".to_owned(),
             fallback_dns: DEFAULT_FALLBACK.to_owned(),
+            upstreams: Vec::new(),
             budget: DEFAULT_BUDGET,
             max_in_flight: MAX_IN_FLIGHT,
             workers: DEFAULT_WORKERS,
@@ -422,15 +479,28 @@ impl DnsProxy {
         let (job_tx, job_rx) = mpsc::sync_channel::<DnsJob>(cfg.max_in_flight);
         let (reply_tx, reply_rx) = mpsc::channel::<DnsReply>();
         let core = Arc::new(ResponderCore {
-            ups: Upstreams::new(&cfg.resolv_path),
+            ups: Upstreams::with_static(
+                &cfg.resolv_path,
+                cfg.upstreams.iter().map(ToString::to_string).collect(),
+            ),
             stats: Arc::new(DnsStats::default()),
             fb_once: AtomicBool::new(false),
+            fakeip_once: AtomicBool::new(false),
             budget: cfg.budget,
             fallback_dns: cfg.fallback_dns.clone(),
             max_in_flight: cfg.max_in_flight,
             logf,
             dlogf,
         });
+        // M1（代码门）：`dns_upstream` 覆盖生效 ⇒ 一次性告警——覆盖成公共解析器后，
+        // fake-ip 主机上手机拿的是**真实 IP**、与主 nameserver 不再一致，出口代理的
+        // 域名规则对该流量失效（设计 F2 风险③ / 判据登记承诺的可观测面）。
+        if !cfg.upstreams.is_empty() {
+            (core.logf)(&format!(
+                "⚠️ dns: 已按 serve.dns_upstream 覆盖上游（{}）——不经系统解析配置；fake-ip 型代理主机上手机将拿到真实 IP，与主 nameserver 不再一致（该主机的域名规则对这些流量失效）",
+                cfg.upstreams.iter().map(ToString::to_string).collect::<Vec<_>>().join(", ")
+            ));
+        }
         let in_flight = Arc::new(AtomicUsize::new(0));
         let job_rx = Arc::new(Mutex::new(job_rx));
         let mut started = 0usize;
@@ -572,6 +642,8 @@ struct ResponderCore {
     stats: Arc<DnsStats>,
     /// 兜底首次触发的摘要位（每进程一次）。
     fb_once: AtomicBool,
+    /// F3：fake-IP 交付首次告警位（每进程一次）。
+    fakeip_once: AtomicBool,
     budget: Duration,
     fallback_dns: String,
     max_in_flight: usize,
@@ -611,6 +683,21 @@ impl ResponderCore {
         if !is_tcp && resp.len() > MAX_DNS_PAYLOAD_53 {
             resp = truncate(&resp, MAX_DNS_PAYLOAD_53);
             self.stats.trunc.fetch_add(1, Ordering::Relaxed);
+        }
+        // F3：计数落点 = **交付**应答（clamp/truncate 之后——截断掉的记录不算）。
+        // 只计数 + 每进程一次性告警：**不改应答一个字节**（tier `wg-native-dns:50`
+        // MUST「含 fake-ip 地址」的一致性要求）；fake-IP 也**不触发**换上游/兜底。
+        if has_fake_a(&resp) {
+            self.stats.fakeip.fetch_add(1, Ordering::Relaxed);
+            if self
+                .fakeip_once
+                .compare_exchange(false, true, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                (self.logf)(
+                    "⚠️ dns: 交付应答出现 fake-IP（198.18.0.0/15）——本机可能运行 fake-ip 型代理（透传为常态，本计数不区分「正常透传」与「上游被污染」；配了 dns_upstream 覆盖时 fakeip=0 也不代表环境干净）",
+                );
+            }
         }
         self.stats.resp.fetch_add(1, Ordering::Relaxed);
         Some(resp)
@@ -1000,6 +1087,7 @@ mod tests {
             ups: Upstreams::new(&dir.join("resolv.conf").to_string_lossy()),
             stats: Arc::new(DnsStats::default()),
             fb_once: AtomicBool::new(false),
+            fakeip_once: AtomicBool::new(false),
             budget: DEFAULT_BUDGET,
             fallback_dns: DEFAULT_FALLBACK.to_owned(),
             max_in_flight: MAX_IN_FLIGHT,
@@ -1042,6 +1130,7 @@ mod tests {
             ups: Upstreams::new(&dir.join("resolv.conf").to_string_lossy()),
             stats: Arc::new(DnsStats::default()),
             fb_once: AtomicBool::new(false),
+            fakeip_once: AtomicBool::new(false),
             budget: Duration::from_secs(1),
             fallback_dns: format!("127.0.0.1:{fb_port}"),
             max_in_flight: MAX_IN_FLIGHT,
@@ -1056,6 +1145,7 @@ mod tests {
             ups: Upstreams::new(&dir.join("resolv.conf").to_string_lossy()),
             stats: Arc::new(DnsStats::default()),
             fb_once: AtomicBool::new(false),
+            fakeip_once: AtomicBool::new(false),
             budget: Duration::from_millis(300),
             fallback_dns: "127.0.0.1:1".to_owned(),
             max_in_flight: MAX_IN_FLIGHT,
@@ -1382,6 +1472,191 @@ mod tests {
         let serial = run(1, 3, &up);
         // 单 worker：3 条 × 300ms = 900ms 理论；断言 ≥ 600ms（≥2× 余量，防串行臂被误判并行）
         assert!(serial >= Duration::from_millis(600), "单 worker 形态应串行（实 {serial:?}）");
+    }
+
+    /// F3：交付应答含 fake-IP ⇒ **逐字节透传**（不被改写）+ `fakeip` 计数 + 一次性告警；
+    /// 非 fake 应答不计数。
+    #[test]
+    fn fakeip_counted_on_delivered_response_only() {
+        let up = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let up_addr = format!("127.0.0.1:{}", up.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            loop {
+                let Ok((_n, from)) = up.recv_from(&mut buf) else { return };
+                let id = u16::from_be_bytes([buf[0], buf[1]]);
+                // 首条 = fake-IP（198.18.0.1），次条 = 普通公网
+                let r = a_response("fake.test", id, 10, &[0xC612_0001, 0x7F00_0001]);
+                let _ = up.send_to(&r, from);
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("homeway-rs-dnsfake-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("resolv.conf"), format!("nameserver {up_addr}\n")).unwrap();
+        let lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let l2 = Arc::clone(&lines);
+        let logf: Logf = Arc::new(move |m: &str| l2.lock().unwrap().push(m.to_owned()));
+        let (proxy, _events) = DnsProxy::spawn(
+            DnsConfig {
+                resolv_path: dir.join("resolv.conf").to_string_lossy().into_owned(),
+                fallback_dns: up_addr.clone(),
+                ..Default::default()
+            },
+            logf,
+            Arc::new(|_| {}),
+        );
+        let q = a_query("fake.test", 0x1234);
+        let resp = proxy.answer_sync(&q).expect("应答应到达");
+        // 逐字节透传：仅 ID 回填（TTL 10 < 60 不钳、体积 < 1232 不截）——与 mock 应答全等
+        let want = a_response("fake.test", 0x1234, 10, &[0xC612_0001, 0x7F00_0001]);
+        assert_eq!(resp, want, "fake-IP 应答必须逐字节透传（不改一个字节）");
+        assert!(proxy.stats_line().contains("fakeip=1"), "{}", proxy.stats_line());
+        // 第二条（同形态）⇒ 计数 +1，但告警**恰一次**
+        let _ = proxy.answer_sync(&q).unwrap();
+        assert!(proxy.stats_line().contains("fakeip=2"), "{}", proxy.stats_line());
+        let joined = lines.lock().unwrap().join("\n");
+        assert_eq!(joined.matches("交付应答出现 fake-IP").count(), 1, "告警应恰一次：{joined}");
+        // 非 fake 应答（普通公网 A）⇒ 计数不动
+        let up2 = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let up2_addr = format!("127.0.0.1:{}", up2.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            loop {
+                let Ok((_n, from)) = up2.recv_from(&mut buf) else { return };
+                let id = u16::from_be_bytes([buf[0], buf[1]]);
+                let r = a_response("clean.test", id, 10, &[0x7F00_0001]);
+                let _ = up2.send_to(&r, from);
+            }
+        });
+        let dir2 = dir.join("clean");
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(dir2.join("resolv.conf"), format!("nameserver {up2_addr}\n")).unwrap();
+        let (proxy2, _e2) = DnsProxy::spawn(
+            DnsConfig {
+                resolv_path: dir2.join("resolv.conf").to_string_lossy().into_owned(),
+                fallback_dns: up2_addr.clone(),
+                ..Default::default()
+            },
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+        );
+        let _ = proxy2.answer_sync(&a_query("clean.test", 1)).unwrap();
+        assert!(proxy2.stats_line().contains("fakeip=0"), "{}", proxy2.stats_line());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F3：计数落点 = **交付**（`clamp_ttl`/`truncate` 之后）——被截断掉的 fake 记录不计。
+    #[test]
+    fn fakeip_counts_only_surviving_records() {
+        // 120 条 A（答案段 1920B）> 1232 ⇒ 截断；fake 放末位 ⇒ 交付报文里没有它
+        let mut tail_fake = vec![0x0A00_0001u32; 119];
+        tail_fake.push(0xC612_0001);
+        let big = a_response("big.test", 0x2222, 10, &tail_fake);
+        let cut = truncate(&big, MAX_DNS_PAYLOAD_53);
+        assert!(cut.len() < big.len(), "应发生截断");
+        assert!(!has_fake_a(&cut), "被截掉的 fake 记录不得计数（口径 = 交付后报文）");
+        // fake 放首位 ⇒ 幸存 ⇒ 命中
+        let mut head_fake = tail_fake.clone();
+        head_fake.swap(0, 119);
+        let big2 = a_response("big.test", 0x3333, 10, &head_fake);
+        let cut2 = truncate(&big2, MAX_DNS_PAYLOAD_53);
+        assert!(has_fake_a(&big2), "未截断形态命中");
+        assert!(has_fake_a(&cut2), "幸存记录命中");
+    }
+
+    /// F3：「单一实现」断言——本模块的 fake-IP 判定 = `egress::is_fake_ip`（ddnscheck 同源）。
+    #[test]
+    fn fakeip_guard_single_source() {
+        use crate::server::egress::is_fake_ip;
+        let fake = a_response("s.test", 1, 5, &[0xC613_FFFF]); // 198.19.255.255
+        assert!(has_fake_a(&fake));
+        assert!(is_fake_ip("198.19.255.255".parse().unwrap()));
+        let clean = a_response("s.test", 1, 5, &[0xC614_0001]); // 198.20.0.1
+        assert!(!has_fake_a(&clean));
+    }
+
+    /// F2：`dns_upstream` 静态覆盖生效 + **不做 mtime 跟随**（resolv.conf 变更不影响）。
+    #[test]
+    fn static_upstream_override_no_follow() {
+        let up = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let up_addr = format!("127.0.0.1:{}", up.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            loop {
+                let Ok((_n, from)) = up.recv_from(&mut buf) else { return };
+                let id = u16::from_be_bytes([buf[0], buf[1]]);
+                let r = a_response("ov.test", id, 10, &[0x7F00_0001]);
+                let _ = up.send_to(&r, from);
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("homeway-rs-dnsov-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let rc = dir.join("resolv.conf");
+        std::fs::write(&rc, "nameserver 127.0.0.1:1\n").unwrap(); // 真源是死地址
+        let log_lines: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+        let lc = Arc::clone(&log_lines);
+        let logf: Logf = Arc::new(move |m: &str| lc.lock().unwrap().push(m.to_owned()));
+        let (proxy, _events) = DnsProxy::spawn(
+            DnsConfig {
+                resolv_path: rc.to_string_lossy().into_owned(),
+                fallback_dns: "127.0.0.1:1".to_owned(),
+                upstreams: vec![up_addr.parse().unwrap()], // 显式覆盖
+                ..Default::default()
+            },
+            logf,
+            Arc::new(|_| {}),
+        );
+        // M1：覆盖生效一次性告警（恰一行）
+        {
+            let joined = log_lines.lock().unwrap().join("\n");
+            assert_eq!(joined.matches("已按 serve.dns_upstream 覆盖上游").count(), 1, "覆盖告警应恰一次：{joined}");
+            assert!(joined.contains("域名规则对这些流量失效"), "告警须含已知代价：{joined}");
+        }
+        assert_eq!(proxy.upstreams_text(), up_addr, "E4 upstream= 应显示配置列表");
+        assert!(proxy.answer_sync(&a_query("ov.test", 5)).is_some(), "覆盖上游应可答");
+        assert!(!proxy.stats_line().contains("fallback=1"), "不该走兜底：{}", proxy.stats_line());
+        // resolv.conf 变更（跨节流窗）不影响静态覆盖（无 mtime 跟随）
+        std::thread::sleep(CHECK_INTERVAL + Duration::from_millis(50));
+        std::fs::write(&rc, "nameserver 127.0.0.1:2\n").unwrap();
+        assert_eq!(proxy.upstreams_text(), up_addr, "静态覆盖不跟随 resolv.conf");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F2：`dns_fallback` 配置生效（nameserver 全死 ⇒ 兜底 + 计数）。
+    #[test]
+    fn fallback_from_config() {
+        let fb = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let fb_addr = format!("127.0.0.1:{}", fb.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            loop {
+                let Ok((_n, from)) = fb.recv_from(&mut buf) else { return };
+                let id = u16::from_be_bytes([buf[0], buf[1]]);
+                let r = a_response("fbcfg.test", id, 10, &[0x7F00_0002]);
+                let _ = fb.send_to(&r, from);
+            }
+        });
+        let (proxy, _events) = DnsProxy::spawn(
+            DnsConfig {
+                resolv_path: "/nonexistent-resolv.conf".to_owned(),
+                fallback_dns: fb_addr,
+                budget: Duration::from_secs(1),
+                ..Default::default()
+            },
+            Arc::new(|_| {}),
+            Arc::new(|_| {}),
+        );
+        assert!(proxy.answer_sync(&a_query("fbcfg.test", 7)).is_some());
+        assert!(proxy.stats_line().contains("fallback=1"), "{}", proxy.stats_line());
+    }
+
+    /// F2 缺省回归：不配置任何新键 ⇒ 五字段逐值与修前常量相等。
+    #[test]
+    fn defaults_unchanged_by_new_keys() {
+        let c = DnsConfig::default();
+        assert!(c.upstreams.is_empty(), "缺省 = 跟随 resolv.conf");
+        assert_eq!(c.fallback_dns, DEFAULT_FALLBACK);
+        assert_eq!(c.resolv_path, "/etc/resolv.conf");
     }
 
     /// 上游跟随：文件变更后 1s 节流窗内取 last-good、窗口后跟随。

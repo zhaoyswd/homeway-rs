@@ -94,6 +94,20 @@ fn is_ula(v6: std::net::Ipv6Addr) -> bool {
     (v6.segments()[0] & 0xfe00) == 0xfc00
 }
 
+/// fake-IP 段（RFC 2544 benchmark 198.18.0.0/15——Surge 等 TUN 型代理的假地址面）。
+///
+/// **单一实现（Q-J F3，从 `ddnscheck` 迁入）**：ddnscheck 的卫兵与 dnsproxy 的
+/// 交付应答计数共用本函数——两处各留一条「单一实现」断言，防口径漂移。
+pub(crate) fn is_fake_ip(ip: IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            o[0] == 198 && (o[1] & 0xFE) == 18
+        }
+        IpAddr::V6(_) => false,
+    }
+}
+
 /// 名字像隧道/虚拟网卡吗（ifaceutil.IsVirtual 的前缀并集——多跳过一张虚拟卡只会让
 /// 候选少一张，不会选错上行）。
 pub fn is_virtual_iface(name: &str) -> bool {
@@ -110,9 +124,11 @@ pub fn is_virtual_iface(name: &str) -> bool {
 pub struct IfaceInfo {
     pub name: String,
     pub index: u32,
-    /// `index` 是否可用（`if_nametoindex` 非 0）。F12：0 时**不可钉卡**——darwin 上
-    /// `IP_BOUND_IF=0` 是「解绑」且 `setsockopt` 会成功，若不守卫就会把「解绑」误报成
-    /// 「已钉卡」（判据反向）。E21 判据行仍按既有形态渲染 `index=0`（不改取值路径）。
+    /// `index` 是否可用（`if_nametoindex` 非 0）。**平台语义（Q-J F5）**：
+    /// darwin 上 index 参与钉卡（`IP_BOUND_IF`），0 = 解绑 ⇒ `index_ok=false`
+    /// **不可钉**；linux 走 `SO_BINDTODEVICE` 按名绑定、index 不参与 ⇒ 0 仍可按名钉
+    /// （`index_ok` 只是诊断值，不蕴含「不可钉」）。E21 判据行仍按既有形态渲染
+    /// `index=0`（取值路径不变）。
     pub index_ok: bool,
     pub addrs: Vec<Ipv4Addr>,
     /// `ip/prefix` 形态（netmask 换算——E21 判据行的 `addrs=[192.168.3.12/24]` 面）。
@@ -170,14 +186,19 @@ pub fn interfaces() -> Vec<IfaceInfo> {
                 std::ffi::CString::new(e.name.as_bytes()).expect("网卡名无 NUL").as_ptr(),
             );
             e.index = idx;
-            // F12 最小守卫：返 0 不静默——记告警并把该卡标为「无 index / 不可钉」，
-            // **不进入「已钉卡」成功路径**（完整语义〔降级策略/AddAnyMapping/平台假设〕
-            // 挂 Q-J）。E21 `index=` 仍按 0 渲染（取值路径形态不变）。
+            // F12 最小守卫 + F5 平台化：返 0 不静默——记告警并把该卡标为「无 index」。
+            // 平台差异（F5）：darwin 上 index=0 = 解绑 ⇒ 不可钉（不进入「已钉卡」路径）；
+            // linux 走 SO_BINDTODEVICE 按名绑定、index 不参与 ⇒ 仍可按名钉卡。
+            // E21 `index=` 仍按 0 渲染（取值路径形态不变）。
             if idx == 0 {
                 e.index_ok = false;
                 let errno = std::io::Error::last_os_error();
+                #[cfg(target_os = "macos")]
+                let why = "darwin 按 index 钉卡（IP_BOUND_IF=0 是解绑）——该卡不可钉";
+                #[cfg(not(target_os = "macos"))]
+                let why = "linux/其它按名钉卡（SO_BINDTODEVICE，index 不参与）——仍可按名钉";
                 eprintln!(
-                    "⚠️ 绑卡：网卡 {} 取不到 index（if_nametoindex 返 0：{errno}）—— 该卡不可钉（不会进入「已钉卡」路径）",
+                    "⚠️ 绑卡：网卡 {} 取不到 index（if_nametoindex 返 0：{errno}）—— {why}",
                     e.name
                 );
             } else {
@@ -189,11 +210,36 @@ pub fn interfaces() -> Vec<IfaceInfo> {
 }
 
 /// 候选上行网卡（up、非回环、非虚拟、至少有一个 IPv4——PhysicalCandidates）。
+/// **F5 平台分档**：darwin 上 `index` 不可用（`index_ok=false`）= 不可钉 ⇒ 不参与候选
+/// （挑到也钉不上）；linux 按名钉卡、index 不参与 ⇒ 不过滤（多一张候选）。
 pub fn physical_candidates() -> Vec<IfaceInfo> {
     interfaces()
         .into_iter()
         .filter(|i| i.up && !i.loopback && !is_virtual_iface(&i.name) && !i.addrs.is_empty())
+        .filter(candidate_pinnable)
         .collect()
+}
+
+/// 该卡在本平台能否进入候选（钉卡面判据——F5；纯函数便于单测两平台语义）。
+fn candidate_pinnable(i: &IfaceInfo) -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        i.index_ok
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = i;
+        true
+    }
+}
+
+/// 同一张网卡吗（F5 单源 helper）：名字相等优先；名字不等时 index **仅双方都有效
+/// （非 0）**时作补充——index=0 的多卡不互撞（`if_nametoindex` 失败形态）。
+pub(crate) fn iface_same(a: &IfaceInfo, b: &IfaceInfo) -> bool {
+    if a.name == b.name {
+        return true;
+    }
+    a.index != 0 && b.index != 0 && a.index == b.index
 }
 
 /// 把 UDP socket 钉在网卡上（darwin IP_BOUND_IF+IPV6_BOUND_IF 两族 / linux
@@ -206,13 +252,16 @@ pub fn physical_candidates() -> Vec<IfaceInfo> {
 /// 「v6 钉卡失败拖死 v4」（GAP-AUDIT P0-2 的根因），两族独立容错后 v6 路径可用性
 /// 不再受 v4 面牵连（反之亦然）。
 pub fn pin_socket_to_iface(fd: std::os::fd::RawFd, index: u32, name: &str) -> io::Result<()> {
-    // F12 最小守卫：index=0（if_nametoindex 失败/无该卡）**不可钉**——darwin 上
-    // `IP_BOUND_IF=0` 语义是「解绑」且 setsockopt 成功，直接下发会把「解绑」误报成
-    // 「已钉卡」（判据反向）。此处硬拒，让调用方走「钉不上卡」的既有降级路径。
+    // F5 平台语义（取代 F12 的全平台硬拒）：
+    // - darwin：**按 index 钉卡**（`IP_BOUND_IF`）；index=0 = 解绑且 setsockopt 会成功
+    //   ⇒ 必须硬拒（否则把「解绑」误报成「已钉卡」，判据反向）；
+    // - linux：**按名钉卡**（`SO_BINDTODEVICE`，index 不参与）⇒ 不按 index 拒；
+    //   index 仅诊断值（`if_nametoindex` 失败不影响按名绑定）。
+    #[cfg(target_os = "macos")]
     if index == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "网卡 index 为 0（if_nametoindex 失败/无该卡）—— 不可钉卡",
+            "网卡 index 为 0（if_nametoindex 失败/无该卡）—— darwin 上不可钉卡（IP_BOUND_IF=0 是解绑）",
         ));
     }
     unsafe {
@@ -247,6 +296,14 @@ pub fn pin_socket_to_iface(fd: std::os::fd::RawFd, index: u32, name: &str) -> io
         #[cfg(target_os = "linux")]
         {
             let _ = index; // linux 走 SO_BINDTODEVICE（按名），index 不参与
+            // 代码门 L1：空名 ⇒ `SO_BINDTODEVICE(optlen=0)` 在内核里是「**解绑**且成功」
+            // ——与 darwin `IP_BOUND_IF=0` 同型的「解绑误报成已钉卡」；按名面在同型缺口上补门。
+            if name.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "网卡名为空——按名绑定（SO_BINDTODEVICE）会退化为解绑",
+                ));
+            }
             let cname = std::ffi::CString::new(name)
                 .map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "网卡名含 NUL"))?;
             let r = libc::setsockopt(
@@ -280,9 +337,11 @@ pub fn iface_for_addr(ip: IpAddr) -> Option<IfaceInfo> {
 }
 
 /// 系统默认路由会从哪张卡出去（UDP dial 只做路由查询，不发包）；拿不到 None。
-pub fn preferred_iface() -> Option<IfaceInfo> {
+/// `route_probe` = 路由查询目标（F2：配置 `dns_probe_target` 首项；默认 = 探针默认
+/// 首项 `223.5.5.5:53`，与修前硬编逐值等价）。
+pub fn preferred_iface(route_probe: SocketAddrV4) -> Option<IfaceInfo> {
     let s = UdpSocket::bind("0.0.0.0:0").ok()?;
-    s.connect("223.5.5.5:53").ok()?;
+    s.connect(route_probe).ok()?;
     let local = match s.local_addr() {
         Ok(SocketAddr::V4(v4)) => *v4.ip(),
         _ => return None,
@@ -547,7 +606,9 @@ pub fn select_best(
     if cands.is_empty() {
         return Err(EgressError::NoCandidates);
     }
-    let prefer = preferred_iface();
+    // 路由探针目标 = 配置目标首项（F2；空 = 默认首项，与修前硬编 223.5.5.5:53 等价）
+    let route_probe = targets.first().copied().unwrap_or_else(|| default_probe_targets()[0]);
+    let prefer = preferred_iface(route_probe);
     let mut results: Vec<(IfaceInfo, Result<Duration, EgressError>)> = Vec::new();
     std::thread::scope(|scope| {
         let mut handles = Vec::new();
@@ -570,7 +631,8 @@ pub fn select_best(
             Ok(rtt) => {
                 details.push(format!("{} 通（{}ms）", ifi.name, rtt.as_millis()));
                 if let Some(p) = &prefer {
-                    if p.index == ifi.index {
+                    // F5：name 优先（index=0 的多卡不互撞）
+                    if iface_same(p, &ifi) {
                         prefer_hit = Some(ifi.clone());
                     }
                 }
@@ -766,18 +828,84 @@ mod tests {
         assert!(rtt < Duration::from_secs(3));
     }
 
-    /// F12：`if_nametoindex` 返 0（不存在网卡名）⇒ 不静默——标「不可钉」且钉卡硬拒
-    /// （不进入「已钉卡」成功路径）；E21 `index=` 取值路径形态不变（仍渲染 0）。
+    /// F12+F5：`if_nametoindex` 返 0 不静默（`index_ok` 与 index 一致）；钉卡守卫
+    /// **平台分档**——darwin 硬拒（IP_BOUND_IF=0 = 解绑），linux 按名（index 无关）。
     #[test]
-    fn if_nametoindex_zero_is_not_pinned() {
+    fn if_nametoindex_zero_platform_split() {
         let ifaces = interfaces();
         for i in &ifaces {
             assert_eq!(i.index_ok, i.index != 0, "index_ok 必须与 index 一致：{i:?}");
         }
-        // 不存在的网卡名 ⇒ index=0 ⇒ 硬拒（不误报「已钉卡」）
-        let fd = std::os::fd::AsRawFd::as_raw_fd(&UdpSocket::bind("127.0.0.1:0").unwrap());
-        let e = pin_socket_to_iface(fd, 0, "hw-no-such-iface").unwrap_err();
-        assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        // darwin：index=0 + 任意名 ⇒ InvalidInput（不误报「已钉卡」）
+        #[cfg(target_os = "macos")]
+        {
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&UdpSocket::bind("127.0.0.1:0").unwrap());
+            let e = pin_socket_to_iface(fd, 0, "hw-no-such-iface").unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
+        }
+        // linux：index=0 不按 index 拒——按名绑定，坏名 = ENODEV（内核先查名）；空名
+        // 按名面拒（L1：内核 optlen=0 是「解绑且成功」）
+        #[cfg(target_os = "linux")]
+        {
+            let fd = std::os::fd::AsRawFd::as_raw_fd(&UdpSocket::bind("127.0.0.1:0").unwrap());
+            let e = pin_socket_to_iface(fd, 0, "hw-no-such-iface").unwrap_err();
+            assert_eq!(e.raw_os_error(), Some(libc::ENODEV), "按名绑定坏名 = ENODEV：{e}");
+            let e = pin_socket_to_iface(fd, 6, "").unwrap_err();
+            assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput, "空名不得退化为解绑：{e}");
+        }
+    }
+
+    /// F5：候选过滤平台分档（darwin 排不可钉卡；linux 不按 index 过滤）——用合成单测
+    /// 钉纯谓词（不依赖机器真有 index 失败的卡）。
+    #[test]
+    fn candidate_filter_platform_split() {
+        let mk = |name: &str, index: u32, index_ok: bool| IfaceInfo {
+            name: name.to_owned(),
+            index,
+            index_ok,
+            addrs: vec![Ipv4Addr::new(192, 0, 2, 1)],
+            cidrs: vec!["192.0.2.1/24".to_owned()],
+            up: true,
+            loopback: false,
+        };
+        let bad = mk("en9", 0, false);
+        #[cfg(target_os = "macos")]
+        assert!(!candidate_pinnable(&bad), "darwin：index 不可用 ⇒ 不可钉 ⇒ 不进候选");
+        #[cfg(not(target_os = "macos"))]
+        assert!(candidate_pinnable(&bad), "linux：按名钉卡 ⇒ index 不参与候选过滤");
+        assert!(candidate_pinnable(&mk("en0", 6, true)));
+    }
+
+    /// F5：`iface_same` 三态——同名（index 不同也同一张）／异名同有效 index／
+    /// index=0 的多卡不互撞。
+    #[test]
+    fn iface_same_three_states() {
+        let mk = |name: &str, index: u32| IfaceInfo {
+            name: name.to_owned(),
+            index,
+            index_ok: index != 0,
+            addrs: vec![],
+            cidrs: vec![],
+            up: true,
+            loopback: false,
+        };
+        assert!(iface_same(&mk("en0", 6), &mk("en0", 9)), "同名 ⇒ 同一张（name 优先）");
+        assert!(iface_same(&mk("en0", 6), &mk("en0-alias", 6)), "异名同有效 index ⇒ 视为同一张");
+        assert!(!iface_same(&mk("en0", 0), &mk("en1", 0)), "index=0 的多卡不得互撞");
+        assert!(!iface_same(&mk("en0", 0), &mk("en1", 7)));
+        assert!(!iface_same(&mk("en0", 6), &mk("en1", 7)));
+    }
+
+    /// F3：`is_fake_ip` 单一实现（198.18.0.0/15 两段；198.20/199 与 v6 恒假；
+    /// CGNAT 不误判）——ddnscheck 侧另有引用断言。
+    #[test]
+    fn fake_ip_boundaries_single_source() {
+        for yes in ["198.18.0.0", "198.18.0.1", "198.19.255.255"] {
+            assert!(is_fake_ip(yes.parse().unwrap()), "{yes} 应判 fake-IP");
+        }
+        for no in ["198.17.255.255", "198.20.0.1", "199.19.0.1", "100.64.0.1", "223.5.5.5", "::ffff:198.18.0.1"] {
+            assert!(!is_fake_ip(no.parse().unwrap()), "{no} 不应判 fake-IP");
+        }
     }
 
 /// 测试面：解析请求拿 txid。

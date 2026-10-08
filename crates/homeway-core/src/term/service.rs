@@ -569,6 +569,9 @@ struct LegRt {
     /// HELLO 尾随声明了 capsRawTerminal（应答让位判据——与 surface 位无关，
     /// surface+rawCapable 组合同样让位；Go rawTermLegs 计数器同义，评审 M4）。
     raw_capable: bool,
+    /// **本腿**键编码平台口径（Q-J F1）：由 HELLO caps 声明（`KEY_ALT_*`），未声明/
+    /// 歧义 = 宿主推断。按腿存放——同会话两条不同声明的腿各按各自口径编码。
+    key_flavor: super::keyenc::KeyFlavor,
     out: Arc<LegOut>,
     surface: Option<SurfaceLeg>,
     theme_known: bool,
@@ -710,6 +713,12 @@ pub struct TermService {
     logf: Logf,
     state: Mutex<State>,
     stop: Arc<AtomicBool>,
+    /// F1 观测面：HELLO caps 两位同置（歧义，含「裸 ID 尾随块」既有形态）的计数与
+    /// 一次性告警位——语义按「未声明（宿主推断）」处理，绝不拒腿。
+    key_flavor_ambiguous: AtomicU64,
+    key_flavor_ambiguous_warned: AtomicBool,
+    /// F1 观测面：`handle_input` 查不到腿（`end_leg` 竞态）而丢弃输入的计数。
+    leg_missing_input_drops: AtomicU64,
     /// 测试身份（panic 注入表按服务唯一化——并发测试的其它服务 tick 不会误消费；
     /// 生产构建无此字段）。
     #[cfg(test)]
@@ -754,6 +763,9 @@ impl TermService {
             next_sess_gen: 1,
             }),
             stop: Arc::new(AtomicBool::new(false)),
+            key_flavor_ambiguous: AtomicU64::new(0),
+            key_flavor_ambiguous_warned: AtomicBool::new(false),
+            leg_missing_input_drops: AtomicU64::new(0),
             #[cfg(test)]
             svc_id: next_svc_id(),
         });
@@ -1000,6 +1012,8 @@ impl TermService {
         }
         let surface = ht.caps_present && ht.caps & frames::caps::SURFACE != 0;
         let raw_capable = ht.caps_present && ht.caps & frames::caps::RAW_TERMINAL != 0;
+        // F1：键编码平台口径（与本块 surface/raw 判定同域——`dec_hello_tail` 只做形状）
+        let key_flavor = self.key_flavor_from_caps(ht.caps, ht.caps_present);
         if !valid_name(&name) {
             let _ = io.write_frame(
                 Op::ERROR,
@@ -1088,6 +1102,7 @@ impl TermService {
                 key: reg.key,
                 kind: LegKind::of(surface, raw_capable),
                 raw_capable,
+                key_flavor,
                 out: Arc::clone(&out),
                 surface: surface.then(SurfaceLeg::new),
                 theme_known: false,
@@ -1387,19 +1402,36 @@ impl TermService {
             if rt.stopped.load(Ordering::Relaxed) {
                 return;
             }
+            // F1：按腿取本腿键编码口径（与 `leg_is_surface` 同形态）。查不到腿 =
+            // `end_leg` 竞态 ⇒ 丢弃该输入 + 计数；**任何路径不得回落 `host_default()`**
+            //（防「默认宿主隐式回潮」——纪律见设计 F1-③）。
+            let leg_flavor = rt.legs.iter().find(|l| l.key == key).map(|l| l.key_flavor);
+            let Some(leg_flavor) = leg_flavor else {
+                // 代码门 L5：丢弃面可观测（首 1 次 + 每 100 次——有界、可归因）
+                let n = self.leg_missing_input_drops.fetch_add(1, Ordering::Relaxed) + 1;
+                if n == 1 || n.is_multiple_of(100) {
+                    self.logf(&format!(
+                        "term: 会话 {name} 收到无主腿输入（腿已断——end_leg 竞态），已丢弃 n={n}"
+                    ));
+                }
+                return;
+            };
             let Some(vt) = rt.vt.as_ref() else { return };
             let enc = match &ev {
                 frames::InputEvent::Key { key, mods, action, text } => {
                     let Some(action) = super::keyenc::KeyAction::from_wire(*action) else {
                         return;
                     };
-                    vt.encode_key(&super::keyenc::KeyEvent {
-                        key: super::keyenc::Key(*key),
-                        action,
-                        mods: super::keyenc::Mods(*mods),
-                        text,
-                        composing: false,
-                    })
+                    vt.encode_key(
+                        &super::keyenc::KeyEvent {
+                            key: super::keyenc::Key(*key),
+                            action,
+                            mods: super::keyenc::Mods(*mods),
+                            text,
+                            composing: false,
+                        },
+                        leg_flavor,
+                    )
                 }
                 frames::InputEvent::Text { flags, text } => {
                     let paste = flags & frames::text_bits::PASTE != 0;
@@ -2952,6 +2984,35 @@ impl TermService {
             .is_some_and(|l| l.surface.is_some())
     }
 
+    /// HELLO caps → 本腿键编码平台口径（Q-J F1）：`KEY_ALT_*` 两位互斥声明；
+    /// 未声明（两位全不置）= 宿主推断（缺省兼容，逐字节同今日）。
+    /// **两位同置 = 歧义 ⇒ 按未声明处理（fail-soft）+ 计数 + 一次性告警，绝不拒腿**——
+    /// 「裸 ID 尾随块」按 caps 解析出 `caps=0x7F` 恰含 bit2|bit3（`frames::dec_hello_tail`
+    /// 既有测试钉死），任何拒绝面都会把今天可服务的腿变成 `bad_capability`。
+    fn key_flavor_from_caps(&self, caps: u8, caps_present: bool) -> super::keyenc::KeyFlavor {
+        use super::keyenc::KeyFlavor;
+        if !caps_present {
+            return KeyFlavor::host_default();
+        }
+        let no_esc = caps & frames::caps::KEY_ALT_NO_ESC_PREFIX != 0;
+        let esc = caps & frames::caps::KEY_ALT_ESC_PREFIX != 0;
+        match (no_esc, esc) {
+            (true, false) => KeyFlavor::AltNoEscPrefix,
+            (false, true) => KeyFlavor::AltEscPrefix,
+            (false, false) => KeyFlavor::host_default(),
+            (true, true) => {
+                self.key_flavor_ambiguous.fetch_add(1, Ordering::Relaxed);
+                if !self.key_flavor_ambiguous_warned.swap(true, Ordering::Relaxed) {
+                    self.logf(
+                        "⚠️ term: 客户端 caps 同时声明 KEY_ALT_ESC_PREFIX 与 KEY_ALT_NO_ESC_PREFIX\
+（歧义——含「裸 ID 尾随块」既有形态）—— 按未声明处理（宿主推断），不拒腿；本形态计数已开启",
+                    );
+                }
+                KeyFlavor::host_default()
+            }
+        }
+    }
+
     fn logf(&self, msg: &str) {
         (self.logf)(msg);
     }
@@ -3534,6 +3595,9 @@ mod tests {
                 next_sess_gen: 1,
             }),
             stop: Arc::new(AtomicBool::new(false)),
+            key_flavor_ambiguous: AtomicU64::new(0),
+            key_flavor_ambiguous_warned: AtomicBool::new(false),
+            leg_missing_input_drops: AtomicU64::new(0),
             #[cfg(test)]
             svc_id: next_svc_id(),
         });
@@ -4620,6 +4684,165 @@ mod tests {
             assert!(Instant::now() < deadline, "LIST 谓词超时：{v}");
             std::thread::sleep(Duration::from_millis(50));
         }
+    }
+
+    // ---------- Q-J F1：HELLO caps 键编码平台口径 ----------
+
+    /// F1 集成：两条腿（两种声明）各发 `alt+Z` ⇒ 各按本腿口径编码写 PTY。
+    /// 观测面 = 同会话的 **raw 腿**（PTY 输出走 DATA 帧；surface 腿收的是快照族）。
+    /// `stty raw -echo; printf READY; cat` 让 PTY 回显**精确字节**（否则 `\x1b` 被
+    /// ECHOCTL 渲染成 `^[`）；READY 标记保证 raw 已生效再发输入。
+    #[test]
+    fn alt_flavor_declared_per_leg() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let cfg = TermConfig { shell: Some("stty raw -echo; printf READY; cat".into()), ..TermConfig::default() };
+        let svc = svc_with(cfg, Arc::clone(&lines));
+        let (ln, path) = start_listener();
+        {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || svc.serve(ln));
+        }
+        let alt_z = frames::enc_input(&frames::InputEvent::Key {
+            key: 45, // key_z
+            mods: 4, // alt
+            action: 1,
+            text: "Z".into(),
+        });
+        // 单会话两轮：raw 腿（观察面）+ surface 腿（输入面，带待测声明）
+        let run = |name: &str, surf_caps: u8| -> Vec<u8> {
+            let mut observer = Client::connect(&path);
+            let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "obs");
+            observer.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, name, &tail));
+            observer.expect(Op::ATTACHED, 5);
+            observer.expect(Op::REPLAY_DONE, 5);
+            observer.drain_data_until(|d| has_bytes(d, b"READY"), 8); // raw 已生效
+            let mut inputter = Client::connect(&path);
+            let tail = frames::enc_hello_tail(surf_caps, true, "app");
+            inputter.send(Op::HELLO, &frames::enc_hello(80, 24, 0, name, &tail));
+            inputter.expect(Op::ATTACHED, 5);
+            inputter.send(Op::INPUT, &alt_z);
+            observer.drain_data_until(|d| has_bytes(d, b"Z"), 8)
+        };
+        // ① 声明 KEY_ALT_ESC_PREFIX（= 非 darwin 口径）：alt 产 ESC 前缀
+        let got1 = run("f1-esc", frames::caps::SURFACE | frames::caps::KEY_ALT_ESC_PREFIX);
+        assert!(
+            has_bytes(&got1, b"\x1bZ"),
+            "声明 KEY_ALT_ESC_PREFIX ⇒ PTY 应收到 ESC+文本：{:?}",
+            String::from_utf8_lossy(&got1)
+        );
+        // ② 声明 KEY_ALT_NO_ESC_PREFIX（= darwin 口径）：alt 不产前缀
+        let got2 = run("f1-noesc", frames::caps::SURFACE | frames::caps::KEY_ALT_NO_ESC_PREFIX);
+        assert!(
+            !has_bytes(&got2, b"\x1bZ"),
+            "声明 KEY_ALT_NO_ESC_PREFIX ⇒ PTY 不得出现 ESC 前缀：{:?}",
+            String::from_utf8_lossy(&got2)
+        );
+        assert!(has_bytes(&got2, b"Z"), "文本本体仍应到达：{:?}", String::from_utf8_lossy(&got2));
+        svc.close();
+    }
+
+    /// F1：HELLO 声明五态（未声明 / 两种单声明 / 两位同置 / 裸 ID 形态）——**都不拒腿**；
+    /// 歧义（含裸 ID 形态的 `caps=0x7F`）按未声明处理 + 计数 + 一次性告警（B1 回归钉）。
+    #[test]
+    fn hello_caps_flavor_ambiguity_is_fail_soft() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let cfg = TermConfig { shell: Some("cat".into()), ..TermConfig::default() };
+        let svc = svc_with(cfg, Arc::clone(&lines));
+        let (ln, path) = start_listener();
+        {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || svc.serve(ln));
+        }
+        let attach = |path: &std::path::Path, name: &str, tail: &[u8]| {
+            let mut c = Client::connect(path);
+            c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, name, tail));
+            c.expect(Op::ATTACHED, 5); // ATTACHED = 腿已入表的证明（不拒腿）
+            c // 保持连接（腿在位）
+        };
+        // 未声明（caps 块无新位）：合法
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "a");
+        let c1 = attach(&path, "f1-none", &tail);
+        assert_eq!(svc.key_flavor_ambiguous.load(Ordering::Relaxed), 0, "未声明不算歧义");
+        // 单声明两位：合法、不计数
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, true, "b");
+        let c2 = attach(&path, "f1-noesc", &tail);
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_ESC_PREFIX, true, "c");
+        let c3 = attach(&path, "f1-esc", &tail);
+        assert_eq!(svc.key_flavor_ambiguous.load(Ordering::Relaxed), 0, "单声明不算歧义");
+        // 两位同置：不拒腿（能拿到 ATTACHED）+ 计数
+        let tail = frames::enc_hello_tail(
+            frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_ESC_PREFIX | frames::caps::KEY_ALT_NO_ESC_PREFIX,
+            true,
+            "d",
+        );
+        let c4 = attach(&path, "f1-amb", &tail);
+        assert_eq!(svc.key_flavor_ambiguous.load(Ordering::Relaxed), 1, "同置计一次");
+        // 裸 ID 尾随块形态 `[4,'h','o','s','t']` ⇒ caps=0x7F（恰含 bit2|bit3）——既有
+        // 容忍形态，**绝不拒腿**（修前若按「同置 ⇒ 拒」实现，此腿会变 bad_capability）
+        let c5 = attach(&path, "f1-bare", &[4, b'h', b'o', b's', b't']);
+        assert_eq!(svc.key_flavor_ambiguous.load(Ordering::Relaxed), 2, "裸 ID 形态同样按歧义计数");
+        // 一次性告警：恰一行（第二次歧义不重复）
+        let logs = lines.lock().unwrap().join("\n");
+        assert_eq!(
+            logs.matches("KEY_ALT_ESC_PREFIX 与 KEY_ALT_NO_ESC_PREFIX").count(),
+            1,
+            "歧义告警应恰一次：{logs}"
+        );
+        drop((c1, c2, c3, c4, c5));
+        svc.close();
+    }
+
+    /// F1：`handle_input` 查不到腿（`end_leg` 竞态）⇒ 丢弃 + 计数，**不回落宿主口径**
+    /// （注入缝：先让腿断开，再用旧 LegKey 直调 handle_input）。
+    #[test]
+    fn input_for_missing_leg_dropped_with_count() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let cfg = TermConfig { shell: Some("cat".into()), ..TermConfig::default() };
+        let svc = svc_with(cfg, Arc::clone(&lines));
+        let (ln, path) = start_listener();
+        {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || svc.serve(ln));
+        }
+        let mut c = Client::connect(&path);
+        let tail = frames::enc_hello_tail(frames::caps::SURFACE, true, "x");
+        c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, "f1-drop", &tail));
+        c.expect(Op::ATTACHED, 5); // surface 腿无 REPLAY_DONE（快照族另路）
+        let (name, gen, key) = {
+            let st = svc.lock_state();
+            let rt = st.sessions.get("f1-drop").expect("会话在位");
+            (rt.name.clone(), rt.gen, rt.legs.first().expect("腿在位").key)
+        };
+        drop(c); // 断开 ⇒ 写者线程 end_leg
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            if svc.lock_state().sessions.get("f1-drop").is_some_and(|rt| rt.legs.is_empty()) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(
+            svc.lock_state().sessions.get("f1-drop").is_some_and(|rt| rt.legs.is_empty()),
+            "腿应在断开后出表"
+        );
+        let payload = frames::enc_input(&frames::InputEvent::Key {
+            key: 20,
+            mods: 4,
+            action: 1,
+            text: "a".into(),
+        });
+        let out = Arc::new(LegOut::new());
+        svc.handle_input(&name, gen, key, &payload, &out);
+        assert_eq!(svc.leg_missing_input_drops.load(Ordering::Relaxed), 1, "查不到腿应计一次");
+        let logs = lines.lock().unwrap().join("\n");
+        assert_eq!(logs.matches("收到无主腿输入").count(), 1, "首次丢弃应记一行（L5）：{logs}");
+        // 第二、三次丢弃不刷屏（首 1 次 + 每 100 次）
+        svc.handle_input(&name, gen, key, &payload, &out);
+        svc.handle_input(&name, gen, key, &payload, &out);
+        assert_eq!(svc.leg_missing_input_drops.load(Ordering::Relaxed), 3);
+        let logs = lines.lock().unwrap().join("\n");
+        assert_eq!(logs.matches("收到无主腿输入").count(), 1, "节流：前三跳只首跳出声");
+        svc.close();
     }
 
     /// 找子串的窗口（回放流里 PTY 字节可能跨 DATA 帧分片——拼接后再找）。

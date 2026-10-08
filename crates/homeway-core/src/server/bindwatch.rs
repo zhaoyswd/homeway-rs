@@ -145,7 +145,8 @@ pub(crate) fn watch_tick(st: &mut WatchState, d: &mut impl WatchDeps) {
         Ok(next) => {
             let nfp = d.state_of(&next);
             if let Some(cur) = &st.cur {
-                if cur.index == next.index && nfp == st.cur_fp {
+                // F5：name 优先的同一张卡判定（index=0 的多卡不互撞）
+                if egress::iface_same(cur, &next) && nfp == st.cur_fp {
                     return;
                 }
             }
@@ -166,7 +167,11 @@ pub(crate) fn watch_tick(st: &mut WatchState, d: &mut impl WatchDeps) {
 /// 生产实现：真网卡探针 + EngineCmd::Repin 重钉 + kick 公网端点/udpcap。
 struct RealDeps {
     explicit_name: Option<String>,
+    /// 健康探针目标（env 缝 > config > 默认——诊断注入面，见模块头）。
     probe_targets: Vec<SocketAddrV4>,
+    /// **挑卡**目标（F2 纪律：恒吃 config/默认，**不吃 env**——与 `bindwatch.rs` 的
+    /// 「挑卡恒用真目标」不变量逐字一致；env 只模拟健康探针退化）。
+    pick_targets: Vec<SocketAddrV4>,
     cmd_tx: Sender<EngineCmd>,
     pinned_flag: Arc<AtomicBool>,
     pub_kick: std::sync::mpsc::SyncSender<()>,
@@ -182,10 +187,10 @@ impl WatchDeps for RealDeps {
                 .find(|i| &i.name == name)
                 .ok_or_else(|| format!("网卡 {name} 当前不可用"));
         }
-        // 挑卡恒用真目标（probe 注入只模拟健康探针退化——挑卡同死会误触「不绑」）
+        // 挑卡恒用 config/默认目标（probe/env 注入只模拟健康探针退化——挑卡同死会误触「不绑」）
         let cands = egress::physical_candidates();
         let logf = Arc::clone(&self.logf);
-        egress::select_best(&cands, &[], Duration::from_secs(2), &move |s| {
+        egress::select_best(&cands, &self.pick_targets, Duration::from_secs(2), &move |s| {
             (logf)(s);
         })
         .map_err(|e| e.to_string())
@@ -197,12 +202,10 @@ impl WatchDeps for RealDeps {
 
     fn state_of(&mut self, ifi: &IfaceInfo) -> IfaceFingerprint {
         // live 读（Go stateOf 每拍 ifi.Addrs() 查内核——指纹变化/网卡 down 是
-        // 看护的触发面，快照会让分支恒不触发，评审 r1-M2）：按 index 重枚举，
-        // 卡消失 = down + 空地址集（触发重挑）。
-        match egress::interfaces().into_iter().find(|i| i.index == ifi.index) {
-            Some(live) => fingerprint_of(&live),
-            None => IfaceFingerprint { index: ifi.index, up: false, addrs: Vec::new() },
-        }
+        // 看护的触发面，快照会让分支恒不触发，评审 r1-M2）：按 **name** 回查
+        // （F5：index 键面纠偏——`if_nametoindex` 失败的多卡不串键），卡消失 =
+        // down + 空地址集（触发重挑）。
+        state_of_from(&egress::interfaces(), ifi)
     }
 
     fn repin(&mut self, index: u32, name: &str) -> Result<(), String> {
@@ -237,8 +240,10 @@ pub struct WatcherArgs {
     /// 显式网卡名（--bind-interface <网卡名>）：只按名重解析；None = auto（每轮重挑）。
     pub explicit_name: Option<String>,
     /// 健康探针目标（诊断缝 HOMEWAY_BINDWATCH_PROBE 注入死地址 = 真机采
-    /// 「探针失败→重挑卡」判据行）。
+    /// 「探针失败→重挑卡」判据行；缺省 = config `serve.dns_probe_target`）。
     pub probe_targets: Vec<SocketAddrV4>,
+    /// 挑卡目标（F2：恒 = config `serve.dns_probe_target`，**不吃 env**）。
+    pub pick_targets: Vec<SocketAddrV4>,
     pub cmd_tx: Sender<EngineCmd>,
     pub pinned_flag: Arc<AtomicBool>,
     pub pub_kick: std::sync::mpsc::SyncSender<()>,
@@ -252,6 +257,7 @@ pub fn spawn_watcher(args: WatcherArgs) {
     let WatcherArgs {
         explicit_name,
         probe_targets,
+        pick_targets,
         cmd_tx,
         pinned_flag,
         pub_kick,
@@ -266,6 +272,7 @@ pub fn spawn_watcher(args: WatcherArgs) {
             let mut d = RealDeps {
                 explicit_name,
                 probe_targets,
+                pick_targets,
                 cmd_tx,
                 pinned_flag,
                 pub_kick,
@@ -280,9 +287,9 @@ pub fn spawn_watcher(args: WatcherArgs) {
         .ok();
 }
 
-/// 健康探针/挑卡目标（默认 anycast DNS；`HOMEWAY_BINDWATCH_PROBE` 诊断缝注入——
-/// 死地址（TEST-NET）= 真机模拟拔线采「探针失败→重挑卡」判据行）。
-pub fn probe_targets_from_env() -> Vec<SocketAddrV4> {
+/// 健康探针目标：`HOMEWAY_BINDWATCH_PROBE` 诊断缝（注入死地址 TEST-NET = 真机模拟
+/// 拔线采「探针失败→重挑卡」判据行）> config/默认（`serve.dns_probe_target`）。
+pub fn health_probe_targets_from_env(cfg_targets: &[SocketAddrV4]) -> Vec<SocketAddrV4> {
     if let Some(v) = std::env::var_os("HOMEWAY_BINDWATCH_PROBE") {
         let parsed: Vec<SocketAddrV4> = v
             .to_string_lossy()
@@ -293,7 +300,22 @@ pub fn probe_targets_from_env() -> Vec<SocketAddrV4> {
             return parsed;
         }
     }
-    egress::default_probe_targets()
+    pick_targets(cfg_targets)
+}
+
+/// **挑卡**目标 = config/默认值（F2 纪律：挑卡不吃 env 缝；缺省 = 修前的
+/// `egress::default_probe_targets()` 形态——engine 装配时以 `ServeConfig` 默认填充）。
+pub(crate) fn pick_targets(cfg_targets: &[SocketAddrV4]) -> Vec<SocketAddrV4> {
+    cfg_targets.to_vec()
+}
+
+/// live 网卡表里按 **name** 回查 `want` 的指纹（F5 纯函数注入缝：消除「直连内核无
+/// 注入缝」；名字找不到 = down + 空地址集——index 保留 want 值供判据渲染）。
+pub(crate) fn state_of_from(live: &[IfaceInfo], want: &IfaceInfo) -> IfaceFingerprint {
+    match live.iter().find(|i| i.name == want.name) {
+        Some(l) => fingerprint_of(l),
+        None => IfaceFingerprint { index: want.index, up: false, addrs: Vec::new() },
+    }
 }
 
 #[cfg(test)]
@@ -472,6 +494,65 @@ mod tests {
         let all = joined(&d.logs);
         assert!(all.contains("网卡 en0 index=6 up addrs=[192.0.2.6/24] → index=6 up addrs=[198.51.100.7/24]"), "{}", all);
         assert_eq!(d.repins.len(), 2);
+    }
+
+    /// F5：`state_of_from` 纯函数三态——两张 index=0 卡按 **name** 不串键；名字消失
+    /// = down + 空地址集（触发重挑）；换 index（同 name）⇒ 指纹变（重钉信号不丢）。
+    #[test]
+    fn state_of_from_name_keyed() {
+        let a = Script::iface(0, "en0");
+        let b = Script::iface(0, "en1");
+        let live = vec![a.clone(), b.clone()];
+        assert_eq!(state_of_from(&live, &a), fingerprint_of(&a), "index=0 的两卡不得互撞");
+        assert_eq!(state_of_from(&live, &b), fingerprint_of(&b));
+        // 名字消失 ⇒ down + 空地址集（index 保留 want 值供判据渲染）
+        let ghost = Script::iface(0, "en9");
+        assert_eq!(
+            state_of_from(&live, &ghost),
+            IfaceFingerprint { index: 0, up: false, addrs: Vec::new() }
+        );
+        // 换 index（同 name）⇒ 指纹变（「换 index ⇒ 重钉」信号不丢）
+        let renamed = Script::iface(7, "en0");
+        assert_ne!(state_of_from(&[renamed], &a), fingerprint_of(&a));
+    }
+
+    /// F2 纪律（代码门 M3④：**真注入** env）：健康探针吃 `HOMEWAY_BINDWATCH_PROBE`
+    /// 、**挑卡目标不吃**。env 是进程级——本仓只有本测试读写该变量（无并发互踩点）。
+    #[test]
+    fn pick_targets_ignore_env_seam() {
+        let cfg = vec![SocketAddrV4::new(std::net::Ipv4Addr::new(223, 5, 5, 5), 53)];
+        assert_eq!(pick_targets(&cfg), cfg, "挑卡目标 = config 值原样");
+        assert_eq!(health_probe_targets_from_env(&cfg), cfg, "无 env = config/默认");
+        std::env::set_var("HOMEWAY_BINDWATCH_PROBE", "203.0.113.1:53,203.0.113.2:53");
+        let got = health_probe_targets_from_env(&cfg);
+        std::env::remove_var("HOMEWAY_BINDWATCH_PROBE");
+        assert_eq!(
+            got,
+            vec!["203.0.113.1:53".parse::<SocketAddrV4>().unwrap(), "203.0.113.2:53".parse().unwrap()],
+            "env 缝真生效于健康探针（死地址注入形态）"
+        );
+        assert_eq!(pick_targets(&cfg), cfg, "env 注入不得改变挑卡目标");
+        assert_eq!(health_probe_targets_from_env(&cfg), cfg, "env 摘除后回落 config");
+    }
+
+    /// F5：重挑回**同一张卡**（name 同、index 翻转 0→6）仍算维持现状——`iface_same`
+    /// name 优先（修前 `cur.index == next.index` 会把同卡误判成换卡 → 多余重钉）。
+    #[test]
+    fn repick_same_name_with_index_flap_stays() {
+        let mut st = WatchState::default();
+        let mut d = Script::new();
+        d.resolves = vec![Ok(Script::iface(0, "en0"))];
+        watch_tick(&mut st, &mut d);
+        assert_eq!(d.repins.len(), 1, "首拍钉上");
+        d.logs.clear();
+        // 触发挑卡：当前卡地址漂移；重挑回**同名卡**（live index 字段形态不变 = 旧指纹同值）
+        d.fps.insert(0, Script::fp(0, true, "198.51.100.7/24"));
+        d.fps.insert(6, Script::fp(0, true, "192.0.2.0/24"));
+        d.resolves = vec![Ok(Script::iface(6, "en0"))];
+        watch_tick(&mut st, &mut d);
+        assert_eq!(d.repins.len(), 1, "同名同指纹 ⇒ 维持现状（不重钉）");
+        assert!(!joined(&d.logs).contains("WG socket 钉在"), "无重钉行：{}", joined(&d.logs));
+        assert_eq!(st.cur.as_ref().map(|i| i.index), Some(0), "当前卡不被同名重挑改写");
     }
 
     /// 重挑挑到**别的卡**：重钉 + 「WG socket 钉在 %s」 + on_change；重钉失败：打行、

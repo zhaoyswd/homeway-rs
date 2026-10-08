@@ -63,6 +63,26 @@ pub(crate) struct FileServe {
     /// 叠加域名条目 + 自检。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) ddns: Option<Vec<FileDdns>>,
+    /// Q-J F2：DNS 显式上游覆盖（`ip` 或 `ip:port` 列表；缺省/空列表 = 跟随
+    /// `/etc/resolv.conf`——spec MUST 的默认面不动；**opt-in 偏离登记**见
+    /// `docs/INTEROP-CRITERIA.md`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) dns_upstream: Option<Vec<String>>,
+    /// Q-J F2：兜底上游（`ip` 或 `ip:port`；缺省 `223.5.5.5`；**空串 = 拒启**——
+    /// 「空 = 关兜底」不是本键语义）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) dns_fallback: Option<String>,
+    /// Q-J F2：DDNS 自检直查解析器（IPv4 `ip[:port]` 列表；空 = 默认常量表）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) ddns_resolver: Option<Vec<String>>,
+    /// Q-J F2：挑卡/健康探针/udpcap `DNS:53` 能力位目标（IPv4 `ip[:port]` 列表；
+    /// 空 = 默认常量表；**一键喂三路是显式登记的耦合**）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) dns_probe_target: Option<Vec<String>>,
+    /// Q-J F2：通用 UDP（非 53）能力位目标（IPv4 `ip:port` 列表——**须显式带端口**；
+    /// 空 = 默认常量表）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) stun_probe_target: Option<Vec<String>>,
     /// 发送整形/pacing（D-3 反过拟合约束 3：参数 config 化——键表 =
     /// `homeway_core::server::intercept::TxShapeCfg`；覆盖序 env > config > 默认）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -92,6 +112,11 @@ impl FileServe {
             dns_port: None,
             files_root: None,
             ddns: None,
+            dns_upstream: None,
+            dns_fallback: None,
+            ddns_resolver: None,
+            dns_probe_target: None,
+            stun_probe_target: None,
             tx_shape: None,
         }
     }
@@ -138,6 +163,24 @@ pub(crate) fn load_config_strict(state_dir: &Path) -> Result<FileConfig, String>
     let fc: FileConfig = toml::from_str(&body).map_err(|e| format!("{}: {e}", path.display()))?;
     validate_file(&path, &fc)?;
     Ok(fc)
+}
+
+/// `ip` 或 `ip:port` → `SocketAddr`（缺端口补 `default_port`；非法 None）。F2 配置面
+/// 的边界解析单源（**不用 `filter_map(parse().ok())` 静默丢项**——非法即拒启）。
+fn parse_addr_with_default_port(s: &str, default_port: u16) -> Option<std::net::SocketAddr> {
+    let t = s.trim();
+    if let Ok(ip) = t.parse::<std::net::IpAddr>() {
+        return Some(std::net::SocketAddr::new(ip, default_port));
+    }
+    t.parse::<std::net::SocketAddr>().ok()
+}
+
+/// `ip[:port]` → `SocketAddrV4`（F2 三个 IPv4-only 键：v6/非法一律 None）。
+fn parse_v4_addr(s: &str, default_port: u16) -> Option<std::net::SocketAddrV4> {
+    match parse_addr_with_default_port(s, default_port)? {
+        std::net::SocketAddr::V4(v4) => Some(v4),
+        std::net::SocketAddr::V6(_) => None,
+    }
 }
 
 /// Go `validateFile`（`baseline:internal/nodeconfig/config.go:254-292`）全量值域，
@@ -196,6 +239,58 @@ fn validate_file(path: &Path, f: &FileConfig) -> Result<(), String> {
     }
     if let Some(v) = &f.serve.relay {
         validate_relay_arg(v).map_err(|e| format!("{p}: serve.relay：{e}"))?;
+    }
+    // ---- Q-J F2 五键值域（非法即拒启 + 可行动文案）----
+    if let Some(list) = &f.serve.dns_upstream {
+        for (i, item) in list.iter().enumerate() {
+            if !matches!(parse_addr_with_default_port(item, 53), Some(a) if a.port() != 0) {
+                return bad(
+                    "serve.dns_upstream",
+                    format!("第 {} 项 {item:?} 非法（ip 或 ip:port 且端口非 0；空列表 = 跟随 /etc/resolv.conf）", i + 1),
+                );
+            }
+        }
+    }
+    if let Some(v) = &f.serve.dns_fallback {
+        if v.trim().is_empty() {
+            return bad(
+                "serve.dns_fallback",
+                "空串非法（删掉该键 = 默认 223.5.5.5；空串不表示「关兜底」）".to_owned(),
+            );
+        }
+        if !matches!(parse_addr_with_default_port(v, 53), Some(a) if a.port() != 0) {
+            return bad("serve.dns_fallback", format!("{v:?} 非法（ip 或 ip:port 且端口非 0）"));
+        }
+    }
+    if let Some(list) = &f.serve.ddns_resolver {
+        for (i, item) in list.iter().enumerate() {
+            if !matches!(parse_v4_addr(item, 53), Some(a) if a.port() != 0) {
+                return bad(
+                    "serve.ddns_resolver",
+                    format!("第 {} 项 {item:?} 非法（IPv4 ip 或 ip:port 且端口非 0；空列表 = 默认常量表）", i + 1),
+                );
+            }
+        }
+    }
+    if let Some(list) = &f.serve.dns_probe_target {
+        for (i, item) in list.iter().enumerate() {
+            if !matches!(parse_v4_addr(item, 53), Some(a) if a.port() != 0) {
+                return bad(
+                    "serve.dns_probe_target",
+                    format!("第 {} 项 {item:?} 非法（IPv4 ip 或 ip:port 且端口非 0；空列表 = 默认常量表）", i + 1),
+                );
+            }
+        }
+    }
+    if let Some(list) = &f.serve.stun_probe_target {
+        for (i, item) in list.iter().enumerate() {
+            if !matches!(item.trim().parse::<std::net::SocketAddrV4>(), Ok(a) if a.port() != 0) {
+                return bad(
+                    "serve.stun_probe_target",
+                    format!("第 {} 项 {item:?} 非法（IPv4 **ip:port** 且端口非 0——须显式带端口，如 162.159.207.1:3478）", i + 1),
+                );
+            }
+        }
     }
     let listen = f.relay.listen.as_deref().unwrap_or(":41741");
     validate_relay_listen(listen).map_err(|e| format!("{p}: relay.listen：{e}"))?;
@@ -503,6 +598,59 @@ pub(crate) fn serve_config_of(fc: &FileConfig, state_dir: &Path) -> Result<Serve
     }
     if let Some(list) = &fc.serve.ddns {
         cfg.ddns = list.iter().map(|d| d.domain.trim().to_owned()).collect();
+    }
+    // ---- Q-J F2 五键（边界已解析成型：这里只做类型搬运，非法值在校验层已拒）----
+    // 空列表 = 取默认（等价不配置）——cfg 已由 ServeConfig::default() 填好默认值。
+    if let Some(list) = &fc.serve.dns_upstream {
+        if !list.is_empty() {
+            let mut v = Vec::with_capacity(list.len());
+            for item in list {
+                v.push(
+                    parse_addr_with_default_port(item, 53)
+                        .ok_or_else(|| format!("serve.dns_upstream {item:?} 非法（ip 或 ip:port）"))?,
+                );
+            }
+            cfg.dns_upstream = v;
+        }
+    }
+    if let Some(v) = &fc.serve.dns_fallback {
+        if parse_addr_with_default_port(v, 53).is_none() {
+            return Err(format!("serve.dns_fallback {v:?} 非法（ip 或 ip:port）"));
+        }
+        cfg.dns_fallback = v.trim().to_owned();
+    }
+    if let Some(list) = &fc.serve.ddns_resolver {
+        if !list.is_empty() {
+            let mut v = Vec::with_capacity(list.len());
+            for item in list {
+                v.push(parse_v4_addr(item, 53).ok_or_else(|| format!("serve.ddns_resolver {item:?} 非法（IPv4 ip 或 ip:port）"))?);
+            }
+            cfg.ddns_resolver = v;
+        }
+    }
+    if let Some(list) = &fc.serve.dns_probe_target {
+        if !list.is_empty() {
+            let mut v = Vec::with_capacity(list.len());
+            for item in list {
+                v.push(
+                    parse_v4_addr(item, 53)
+                        .ok_or_else(|| format!("serve.dns_probe_target {item:?} 非法（IPv4 ip 或 ip:port）"))?,
+                );
+            }
+            cfg.dns_probe_target = v;
+        }
+    }
+    if let Some(list) = &fc.serve.stun_probe_target {
+        if !list.is_empty() {
+            let mut v = Vec::with_capacity(list.len());
+            for item in list {
+                let Ok(a) = item.trim().parse::<std::net::SocketAddrV4>() else {
+                    return Err(format!("serve.stun_probe_target {item:?} 非法（IPv4 ip:port，须显式带端口）"));
+                };
+                v.push(a);
+            }
+            cfg.stun_probe_target = v;
+        }
     }
     Ok(cfg)
 }
@@ -1057,6 +1205,17 @@ mod tests {
             ("[serve]\nddns = [{ domain = \"\" }]\n", "serve.ddns.domain"),
             ("[serve]\nddns = [{ domain = \"a/b\" }]\n", "serve.ddns.domain"),
             ("[serve]\nrelay = \"垃圾串\"\n", "serve.relay"),
+            ("[serve]\ndns_fallback = \"\"\n", "serve.dns_fallback"),
+            ("[serve]\ndns_fallback = \"不是地址\"\n", "serve.dns_fallback"),
+            ("[serve]\ndns_upstream = [\"垃圾\"]\n", "serve.dns_upstream"),
+            ("[serve]\nddns_resolver = [\"::1\"]\n", "serve.ddns_resolver"),
+            ("[serve]\ndns_probe_target = [\"1.2.3.4:99999\"]\n", "serve.dns_probe_target"),
+            ("[serve]\nstun_probe_target = [\"1.2.3.4\"]\n", "serve.stun_probe_target"),
+            ("[serve]\ndns_fallback = \"1.2.3.4:0\"\n", "serve.dns_fallback"),
+            ("[serve]\ndns_upstream = [\"1.2.3.4:0\"]\n", "serve.dns_upstream"),
+            ("[serve]\nddns_resolver = [\"1.2.3.4:0\"]\n", "serve.ddns_resolver"),
+            ("[serve]\ndns_probe_target = [\"223.5.5.5:0\"]\n", "serve.dns_probe_target"),
+            ("[serve]\nstun_probe_target = [\"1.2.3.4:0\"]\n", "serve.stun_probe_target"),
             ("[relay]\nlisten = \"41741\"\n", "relay.listen"),
             ("[relay]\nlisten = \":0\"\n", "relay.listen"),
             ("[serve]\nlisten = 99999\n", "config.toml"),
@@ -1085,6 +1244,52 @@ mod tests {
         assert_eq!(fc2.relay.listen.as_deref(), Some(":41741"));
         let _ = std::fs::remove_dir_all(&d);
     }
+
+    /// F2 缺省回归：不配置任何新键 ⇒ 五值与修前常量**逐值相等**（缺省行为兼容既有部署）。
+    #[test]
+    fn f2_keys_defaults_unchanged() {
+        use homeway_core::server::{ddnscheck, egress};
+        let d = tmp_state("f2default");
+        let state = d.display().to_string();
+        let cfg = assemble_result(&["--state".to_owned(), state]).unwrap();
+        assert!(cfg.dns_upstream.is_empty(), "缺省 = 跟随 /etc/resolv.conf");
+        assert_eq!(cfg.dns_fallback, "223.5.5.5");
+        assert_eq!(cfg.dns_probe_target, egress::default_probe_targets());
+        assert_eq!(cfg.stun_probe_target, egress::default_stun_targets());
+        assert_eq!(cfg.ddns_resolver, ddnscheck::default_resolvers_v4());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// F2：五键配置生效（边界即解析成型——`ip` 补默认端口，`ip:port` 原样）。
+    #[test]
+    fn f2_keys_take_effect() {
+        let d = tmp_state("f2eff");
+        write_cfg(
+            &d,
+            "[serve]\ndns_upstream = [\"1.1.1.1\", \"9.9.9.9:5353\"]\ndns_fallback = \"8.8.4.4\"\n\
+             ddns_resolver = [\"223.5.5.5\", \"119.29.29.29:5353\"]\n\
+             dns_probe_target = [\"1.1.1.1\", \"9.9.9.9:53\"]\n\
+             stun_probe_target = [\"162.159.207.1:3478\"]\n",
+        );
+        let state = d.display().to_string();
+        let cfg = assemble_result(&["--state".to_owned(), state]).unwrap();
+        assert_eq!(cfg.dns_upstream.len(), 2);
+        assert_eq!(cfg.dns_upstream[0].to_string(), "1.1.1.1:53", "裸 ip 补 :53");
+        assert_eq!(cfg.dns_upstream[1].to_string(), "9.9.9.9:5353");
+        assert_eq!(cfg.dns_fallback, "8.8.4.4");
+        assert_eq!(cfg.ddns_resolver[1].to_string(), "119.29.29.29:5353");
+        assert_eq!(cfg.dns_probe_target[0].to_string(), "1.1.1.1:53");
+        assert_eq!(cfg.stun_probe_target, vec!["162.159.207.1:3478".parse().unwrap()]);
+        // 空列表 = 取默认（等价不配置）
+        use homeway_core::server::egress;
+        write_cfg(&d, "[serve]\ndns_probe_target = []\nstun_probe_target = []\nddns_resolver = []\ndns_upstream = []\n");
+        let cfg = assemble_result(&["--state".to_owned(), d.display().to_string()]).unwrap();
+        assert_eq!(cfg.dns_probe_target, egress::default_probe_targets());
+        assert_eq!(cfg.stun_probe_target, egress::default_stun_targets());
+        assert!(cfg.dns_upstream.is_empty());
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
 
     /// F1：assemble_result 不 exit（Err 分类：Usage vs Config）。
     #[test]
@@ -1246,6 +1451,8 @@ mod tests {
         const SERVE_KEYS: &[&str] = &[
             "enabled", "listen", "bind_interface", "upnp", "stun", "stun6", "relay", "max_peers",
             "peer_ttl", "dns_port", "files_root", "public_endpoint",
+            // Q-J F2 五键
+            "dns_upstream", "dns_fallback", "ddns_resolver", "dns_probe_target", "stun_probe_target",
         ];
         const RELAY_KEYS: &[&str] = &["enabled", "listen", "advertise"];
         for k in SERVE_KEYS.iter().chain(RELAY_KEYS.iter()) {
@@ -1258,6 +1465,9 @@ mod tests {
         let served = "[serve]\nenabled = true\nlisten = 41641\nbind_interface = \"auto\"\nupnp = false\n\
              stun = \"\"\nstun6 = \"\"\nrelay = \"\"\nmax_peers = 32\npeer_ttl = \"168h\"\n\
              dns_port = 5300\nfiles_root = \"\"\npublic_endpoint = \"\"\n\
+             dns_upstream = [\"1.1.1.1\", \"9.9.9.9:5353\"]\ndns_fallback = \"223.5.5.5\"\n\
+             ddns_resolver = [\"223.5.5.5\"]\ndns_probe_target = [\"223.5.5.5:53\"]\n\
+             stun_probe_target = [\"162.159.207.1:3478\"]\n\
              [relay]\nenabled = false\nlisten = \":41741\"\nadvertise = \"\"\n";
         assert!(toml::from_str::<FileConfig>(served).is_ok());
     }

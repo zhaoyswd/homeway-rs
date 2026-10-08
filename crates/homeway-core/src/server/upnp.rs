@@ -21,7 +21,10 @@ use std::time::Duration;
 use super::egress::{interfaces, is_virtual_iface};
 
 const SSDP_ADDR: &str = "239.255.255.250:1900";
-const SSDP_ST: &str = "urn:schemas-upnp-org:device:InternetGatewayDevice:1";
+/// SSDP 每轮固定三发的 ST（F4-1）：IGD:1 → IGD:2 → rootdevice 兜底。
+const SSDP_ST_IGD1: &str = "urn:schemas-upnp-org:device:InternetGatewayDevice:1";
+const SSDP_ST_IGD2: &str = "urn:schemas-upnp-org:device:InternetGatewayDevice:2";
+const SSDP_ST_ROOT: &str = "upnp:rootdevice";
 /// 映射描述前缀（路由器表里「我们的映射」的认领判据）。
 pub const UPNP_MAP_DESC: &str = "homeway-exit";
 const UPNP_TIMEOUT: Duration = Duration::from_secs(5);
@@ -87,9 +90,10 @@ pub enum UpnpError {
     BudgetExhausted,
 }
 
-/// M-SEARCH 报文（形状真源——ssdpLocation；`MX: 2` + IGD ST）。
-pub fn msearch_message() -> String {
-    format!("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: {SSDP_ST}\r\n\r\n")
+/// M-SEARCH 报文（形状真源——ssdpLocation；`MX: 2` 不变——设备允许 2s 内随机延迟
+/// 应答 ⇒ 不能在单个 1200ms 内层窗口结束就下结论；ST 参数化，F4-1）。
+pub fn msearch_message(st: &str) -> String {
+    format!("M-SEARCH * HTTP/1.1\r\nHOST: 239.255.255.250:1900\r\nMAN: \"ssdp:discover\"\r\nMX: 2\r\nST: {st}\r\n\r\n")
 }
 
 /// 一个可用的 WAN 连接服务（WANIPConnection / WANPPPConnection）。
@@ -172,7 +176,23 @@ pub fn udp_port_in_use(port: u16) -> bool {
 
 /// SSDP socket 的组播三件套（M8）：IP_MULTICAST_IF + TTL=2 + IP_BOUND_IF 钉卡。
 /// 网卡定位 = 源地址所在的物理卡（egress::interfaces 按 IP 反查）。
-fn pin_multicast(conn: &UdpSocket, local_ip: Ipv4Addr) -> Result<(), UpnpError> {
+///
+/// F4-4：③ 钉卡**尽力而为**——失败记一行继续（发送已由 IP_MULTICAST_IF 钉在源卡，
+/// 只是接收可能被默认路由/TUN 抢走）；与 `bind.rs` 的「钉不上卡不致命」先例同义
+/// （Linux 无 `CAP_NET_RAW` 时 EPERM）。**不终止候选**。
+fn pin_multicast(conn: &UdpSocket, local_ip: Ipv4Addr, logf: Option<&dyn Fn(&str)>) -> Result<(), UpnpError> {
+    pin_multicast_with(conn, local_ip, logf, &|fd, index, name| {
+        crate::server::egress::pin_socket_to_iface(fd, index, name)
+    })
+}
+
+/// [`pin_multicast`] 的可注入形态（单测注入失败钉卡，钉降级语义）。
+fn pin_multicast_with(
+    conn: &UdpSocket,
+    local_ip: Ipv4Addr,
+    logf: Option<&dyn Fn(&str)>,
+    pin: &dyn Fn(std::os::fd::RawFd, u32, &str) -> std::io::Result<()>,
+) -> Result<(), UpnpError> {
     let ifi = crate::server::egress::interfaces()
         .into_iter()
         .find(|i| i.addrs.contains(&local_ip));
@@ -205,10 +225,16 @@ fn pin_multicast(conn: &UdpSocket, local_ip: Ipv4Addr) -> Result<(), UpnpError> 
     if r != 0 {
         return Err(UpnpError::Io(std::io::Error::last_os_error()));
     }
-    // ③ 钉卡（网卡在系统表里找得到才钉——Go ifaceForIP 同义找不到就跳过）
+    // ③ 钉卡（网卡在系统表里找得到才钉——Go ifaceForIP 同义找不到就跳过；F4-4 降级）
     if let Some(ifi) = ifi {
-        crate::server::egress::pin_socket_to_iface(fd, ifi.index, &ifi.name)
-            .map_err(UpnpError::from)?;
+        if let Err(e) = pin(fd, ifi.index, &ifi.name) {
+            if let Some(l) = logf {
+                l(&format!(
+                    "UPnP：SSDP socket 钉卡 {} 失败（{e}）—— 发送已由 IP_MULTICAST_IF 钉在 {}，但接收可能被默认路由/TUN 抢走（组播应答收不到），继续尝试",
+                    ifi.name, ifi.name
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -239,12 +265,46 @@ fn ssdp_response_ok(from: &std::net::SocketAddr, status_and_headers: &str) -> bo
     header_value(status_and_headers, "LOCATION").map(|v| !v.is_empty()).unwrap_or(false)
 }
 
+/// IGD 设备类型精确段匹配（F4-2）：ST 整串等于 IGD:1/2，**或 USN 的 `::` 后段**
+/// 等于 IGD:1/2（USN 形如 `uuid:…::urn:…:InternetGatewayDevice:1`）。
+/// 精确相等 ⇒ `:1` 不会误命中 `:10`（`…Device:10` 不是本族；无该形态但按段比更稳）。
+pub(crate) fn ssdp_is_igd_type(status_and_headers: &str) -> bool {
+    let is_igd = |v: &str| v == SSDP_ST_IGD1 || v == SSDP_ST_IGD2;
+    if let Some(st) = header_value(status_and_headers, "ST") {
+        if is_igd(&st) {
+            return true;
+        }
+    }
+    if let Some(usn) = header_value(status_and_headers, "USN") {
+        let seg = usn.rsplit("::").next().unwrap_or("");
+        if is_igd(seg) {
+            return true;
+        }
+    }
+    false
+}
+
 /// 发一次 SSDP M-SEARCH，取第一个 IGD 的 LOCATION（重试 3 次：家用路由器/交换机的
 /// IGMP 收敛有几秒抖动）。local_ip 用于绑源地址（多网卡机器只有与路由器同网段的那张能用）。
 ///
 /// F10：收 `deadline`（**全局**预算），内部期限 = `min(deadline, now + UPNP_TIMEOUT)`
 /// ——修前 SSDP 腿自带 5s 独立期限、不受调用方预算约束（停机路径最坏 ≈ N×(5s+8s)）。
 pub fn ssdp_location(local_ip: Option<Ipv4Addr>, deadline: std::time::Instant) -> Result<String, UpnpError> {
+    ssdp_location_with(local_ip, deadline, None)
+}
+
+/// [`ssdp_location`] 的带日志形态（F4-4：钉卡降级行；`logf=None` = 不记）。
+///
+/// **应答判定表（F4-2）**：三条件满足（来源 + `HTTP/1.x 200` + 非空 LOCATION）且
+/// ST/USN 精确匹配 IGD 设备类型 ⇒ **IGD 型：立即采信返回**；三条件满足但非 IGD 型
+/// ⇒ **待定**（记首个，继续读；**只在 SSDP 腿期限到点后**才回退采信——不在各轮窗口
+/// 尽头提前返回，否则会抢在 MX=2 的真 IGD 应答之前并吃掉 attempt 2/3 的重发）；
+/// 三条件不满足 ⇒ 拒（继续读，既有 F8 语义）。
+pub fn ssdp_location_with(
+    local_ip: Option<Ipv4Addr>,
+    deadline: std::time::Instant,
+    logf: Option<&dyn Fn(&str)>,
+) -> Result<String, UpnpError> {
     let bind: std::net::SocketAddr = match local_ip {
         Some(ip) => SocketAddrV4::new(ip, 0).into(),
         None => "0.0.0.0:0".parse().expect("合法字面量"),
@@ -260,20 +320,35 @@ pub fn ssdp_location(local_ip: Option<Ipv4Addr>, deadline: std::time::Instant) -
     // 同款已知问题）：单测只证 setsockopt 调用成功，真机判据留 R7（登记进
     // INTEROP-CRITERIA）。
     if let Some(ip) = local_ip {
-        pin_multicast(&conn, ip)?;
+        pin_multicast(&conn, ip, logf)?;
     }
     conn.set_read_timeout(Some(Duration::from_millis(1200)))?;
-    let msg = msearch_message();
+    // F4-1：每轮固定三发（IGD:1 → IGD:2 → rootdevice），同一 socket
+    let msgs = [
+        msearch_message(SSDP_ST_IGD1),
+        msearch_message(SSDP_ST_IGD2),
+        msearch_message(SSDP_ST_ROOT),
+    ];
     let deadline = deadline.min(std::time::Instant::now() + UPNP_TIMEOUT);
     let mut last_err = String::new();
     let mut buf = [0u8; 4096];
     let mut attempt = 0;
+    // F4-2 待定：三条件满足但非 IGD 型的首个 LOCATION——腿期限到点才回退采信
+    let mut pending: Option<String> = None;
     while attempt < 3 && std::time::Instant::now() < deadline {
         attempt += 1;
-        if let Err(e) = conn.send_to(msg.as_bytes(), SSDP_ADDR) {
-            // 发送失败重试（Go upnp.go:150-154——IGMP 收敛抖动下 sendto 偶发
-            // no route to host，重发一次通常就通）
-            last_err = format!("发送 M-SEARCH: {e}");
+        let mut sent = false;
+        let mut send_err = String::new();
+        for msg in &msgs {
+            match conn.send_to(msg.as_bytes(), SSDP_ADDR) {
+                Ok(_) => sent = true,
+                // 发送失败重试（Go upnp.go:150-154——IGMP 收敛抖动下 sendto 偶发
+                // no route to host，重发一次通常就通）
+                Err(e) => send_err = format!("发送 M-SEARCH: {e}"),
+            }
+        }
+        if !sent {
+            last_err = send_err;
             let remain = deadline.saturating_duration_since(std::time::Instant::now());
             std::thread::sleep(remain.min(Duration::from_millis(500)));
             continue;
@@ -288,10 +363,15 @@ pub fn ssdp_location(local_ip: Option<Ipv4Addr>, deadline: std::time::Instant) -
             match conn.recv_from(&mut buf) {
                 Ok((n, from)) => {
                     let text = String::from_utf8_lossy(&buf[..n]).into_owned();
-                    // F8：来源 + 状态行 + 非空 LOCATION 三条件（不满足继续读）
+                    // F8 三条件（不满足继续读）+ F4-2 判定表
                     if ssdp_response_ok(&from, &text) {
                         if let Some(loc) = header_value(&text, "LOCATION") {
-                            return Ok(loc);
+                            if ssdp_is_igd_type(&text) {
+                                return Ok(loc); // IGD 型：快路径立即采信
+                            }
+                            if pending.is_none() {
+                                pending = Some(loc); // 待定：继续读（不提前返回）
+                            }
                         }
                     }
                 }
@@ -303,6 +383,10 @@ pub fn ssdp_location(local_ip: Option<Ipv4Addr>, deadline: std::time::Instant) -
         }
         let remain = deadline.saturating_duration_since(std::time::Instant::now());
         std::thread::sleep(remain.min(Duration::from_millis(500)));
+    }
+    // 腿期限到点（或三重试耗尽，已无更晚窗口）：待定者此时才回退采信
+    if let Some(loc) = pending {
+        return Ok(loc);
     }
     Err(UpnpError::NoIgdResponse(last_err))
 }
@@ -533,7 +617,16 @@ pub fn xml_tag(body: &str, tag: &str) -> Option<String> {
 /// SSDP 找到网关的 UPnP 描述并解析出 WAN 连接服务的控制地址（discoverIGD）。
 /// `deadline` = **全局**预算（F10：穿透到 SSDP 腿——内部取 `min(deadline, 5s)`）。
 pub fn discover_igd(local_ip: Ipv4Addr, deadline: std::time::Instant) -> Result<Igd, UpnpError> {
-    let loc = ssdp_location(Some(local_ip), deadline)?;
+    discover_igd_with(local_ip, deadline, None)
+}
+
+/// [`discover_igd`] 的带日志形态（F4-4 钉卡降级行透传）。
+pub(crate) fn discover_igd_with(
+    local_ip: Ipv4Addr,
+    deadline: std::time::Instant,
+    logf: Option<&dyn Fn(&str)>,
+) -> Result<Igd, UpnpError> {
+    let loc = ssdp_location_with(Some(local_ip), deadline, logf)?;
     igd_from_location_deadline(&loc, deadline)
 }
 
@@ -646,6 +739,63 @@ impl Igd {
             ],
         )?;
         Ok(())
+    }
+
+    /// `AddAnyPortMapping`（F4-3：**仅末位兜底**，不进缩租路径）：把**期望端口**
+    /// 交给路由器改派并**回报** `NewReservedPort` 为准（不依赖「0 = 通配」这一未证实
+    /// 解释）。假成功判定：必须 200（soap 已兜）+ `NewReservedPort` 可解析且 ≠ 0。
+    /// 租期镜像 [`Self::add_with_lease`] 的 3600 → 0 回退（只吃 0 租期的机型上兜底
+    /// 才不形同虚设）。SOAP 形态与 `add_with_lease` 同序同 case，发往同一个已发现的
+    /// WAN 控制 URL、service_type 取自**发现结果**（若发现的是 `WANIPConnection:1`
+    /// 而设备不支持本动作，路由器回 401/500 ⇒ 判失败）。
+    fn add_any_port_mapping(
+        &self,
+        want: u16,
+        internal_ip: Ipv4Addr,
+        internal_port: u16,
+        logf: &dyn Fn(&str),
+    ) -> Result<u16, UpnpError> {
+        match self.try_add_any_port_mapping(want, internal_ip, internal_port, 3600) {
+            Ok(ext) => Ok(ext),
+            Err(first) => match self.try_add_any_port_mapping(want, internal_ip, internal_port, 0) {
+                Ok(ext) => {
+                    logf(&format!(
+                        "UPnP：路由器不接受 AddAnyPortMapping 的 1 小时租期（{first}），已按**永久（0）**重试并成功"
+                    ));
+                    Ok(ext)
+                }
+                Err(_) => Err(first),
+            },
+        }
+    }
+
+    fn try_add_any_port_mapping(
+        &self,
+        want: u16,
+        internal_ip: Ipv4Addr,
+        internal_port: u16,
+        lease: u32,
+    ) -> Result<u16, UpnpError> {
+        let body = self.soap(
+            "AddAnyPortMapping",
+            &[
+                ("NewRemoteHost", String::new()),
+                ("NewExternalPort", want.to_string()),
+                ("NewProtocol", "UDP".to_owned()),
+                ("NewInternalPort", internal_port.to_string()),
+                ("NewInternalClient", internal_ip.to_string()),
+                ("NewEnabled", "1".to_owned()),
+                ("NewPortMappingDescription", UPNP_MAP_DESC.to_owned()),
+                ("NewLeaseDuration", lease.to_string()),
+            ],
+        )?;
+        match xml_tag(&body, "NewReservedPort").and_then(|v| v.trim().parse::<u16>().ok()) {
+            Some(p) if p != 0 => Ok(p),
+            _ => Err(UpnpError::Soap {
+                action: "AddAnyPortMapping".to_owned(),
+                msg: "应答缺 NewReservedPort（或为 0）—— 按失败处理（假成功判定）".to_owned(),
+            }),
+        }
     }
 
     /// 删一条（不存在时路由器报 714——忽略语义由调用方按 body 判定）。
@@ -858,8 +1008,14 @@ pub enum ShrinkOutcome {
 }
 
 /// 缩租（shrinkUPnPClease 的纯逻辑面）：**全局 8s 预算**贯穿候选与 SSDP/描述腿。
-pub fn shrink_lease_before(cands: &[Ipv4Addr], listen_port: u16, deadline: std::time::Instant) -> ShrinkOutcome {
-    let Ok((g, ip)) = pick_igd_before(cands, deadline, discover_igd) else {
+pub fn shrink_lease_before(
+    cands: &[Ipv4Addr],
+    listen_port: u16,
+    deadline: std::time::Instant,
+    logf: &dyn Fn(&str),
+) -> ShrinkOutcome {
+    let disc = |ip: Ipv4Addr, dl: std::time::Instant| discover_igd_with(ip, dl, Some(logf));
+    let Ok((g, ip)) = pick_igd_before(cands, deadline, disc) else {
         return ShrinkOutcome::NoIgd;
     };
     let table = g.list_mappings();
@@ -883,7 +1039,9 @@ pub fn ensure_port_mapping(
     dlogf: &dyn Fn(&str),
     deadline: std::time::Instant,
 ) -> Result<(u16, Ipv4Addr), UpnpError> {
-    let (g, local_ip) = pick_igd_before(candidates, deadline, discover_igd)?;
+    // F4-4：SSDP 钉卡降级行经同一 logf（`discover_igd_with` 透传）
+    let disc = |ip: Ipv4Addr, dl: std::time::Instant| discover_igd_with(ip, dl, Some(logf));
+    let (g, local_ip) = pick_igd_before(candidates, deadline, disc)?;
     let ext = mapping_round(&g, internal_port, local_ip, logf, dlogf)?;
     Ok((ext, local_ip))
 }
@@ -918,12 +1076,17 @@ fn mapping_round(
     if n > 0 {
         dlogf(&format!("UPnP：清掉 {n} 条本机同前缀的旧映射（换端口或上次退出的遗留）"));
     }
-    select_external_port(g, &table, internal_port, prefer, local_ip, verify, logf)
+    select_external_port(g, &table, internal_port, prefer, local_ip, verify, logf, dlogf)
 }
 
 /// 候选端口逐个申请（**先加后删** + 所有权门 `allow_evict`；映射表枚举失败/残缺/含
 /// 归属不明条目时 fail-open 直接申请——把它当 foreign 会让自己的映射每轮 +1 漂移直到
 /// 候选让尽）。`allow_evict = verify && 快照中该 ext 条目存在且 classify == Ours`。
+/// **F4-3**：显式候选（prefer → internal → +1…+9）**全部失败之后**才走 `AddAnyPortMapping`
+/// 末位兜底（成功路径零变化；不进缩租路径）。
+// 8 参（含两路日志面）：与既有调用链（mapping_round/ensure_port_mapping）同签名族，
+// 拆结构体只会把同样的字段在四个函数间搬运——显式豁免（同 engine.rs 的既有先例）。
+#[allow(clippy::too_many_arguments)]
 pub fn select_external_port(
     g: &Igd,
     table: &MappingTable,
@@ -932,6 +1095,7 @@ pub fn select_external_port(
     local_ip: Ipv4Addr,
     verify: bool,
     logf: &dyn Fn(&str),
+    dlogf: &dyn Fn(&str),
 ) -> Result<u16, UpnpError> {
     let taken: std::collections::HashMap<u16, &UpnpMapping> = table
         .list
@@ -1007,7 +1171,20 @@ pub fn select_external_port(
             }
         }
     }
-    Err(UpnpError::NoPortAvailable { occupied, refused })
+    // ---- F4-3 末位兜底：显式候选全失败才轮到 AddAnyPortMapping ----
+    let want = if prefer != 0 { prefer } else { internal_port };
+    match g.add_any_port_mapping(want, local_ip, internal_port, logf) {
+        Ok(ext) => {
+            logf(&format!(
+                "UPnP：显式候选全失败，改用 AddAnyPortMapping 由路由器选端口 {ext} → 内网 {internal_port}"
+            ));
+            Ok(ext)
+        }
+        Err(e) => {
+            dlogf(&format!("UPnP：AddAnyPortMapping 兜底失败（{e}）—— 回落 NoPortAvailable"));
+            Err(UpnpError::NoPortAvailable { occupied, refused })
+        }
+    }
 }
 
 /// 本机可能用于 UPnP 的内网 IPv4 候选（过滤回环/虚拟网卡与公网地址——真正判据仍是
@@ -1035,15 +1212,61 @@ mod tests {
     use std::sync::Arc;
 
     /// M-SEARCH 报文形状（SSDP 真网关判据不可本地测——形状钉死 + mock HTTP 生命周期）。
+    /// F4-1：每轮三态（IGD:1 / IGD:2 / rootdevice），MX 保持 2。
     #[test]
-    fn msearch_shape() {
-        let m = msearch_message();
-        assert!(m.starts_with("M-SEARCH * HTTP/1.1\r\n"));
-        assert!(m.contains("HOST: 239.255.255.250:1900\r\n"));
-        assert!(m.contains("MAN: \"ssdp:discover\"\r\n"));
-        assert!(m.contains("MX: 2\r\n"));
-        assert!(m.contains(&format!("ST: {SSDP_ST}\r\n")));
-        assert!(m.ends_with("\r\n\r\n"));
+    fn msearch_shape_three_states() {
+        for st in [SSDP_ST_IGD1, SSDP_ST_IGD2, SSDP_ST_ROOT] {
+            let m = msearch_message(st);
+            assert!(m.starts_with("M-SEARCH * HTTP/1.1\r\n"));
+            assert!(m.contains("HOST: 239.255.255.250:1900\r\n"));
+            assert!(m.contains("MAN: \"ssdp:discover\"\r\n"));
+            assert!(m.contains("MX: 2\r\n"));
+            assert!(m.contains(&format!("ST: {st}\r\n")));
+            assert!(m.ends_with("\r\n\r\n"));
+        }
+        assert_eq!(SSDP_ST_IGD1, "urn:schemas-upnp-org:device:InternetGatewayDevice:1");
+        assert_eq!(SSDP_ST_IGD2, "urn:schemas-upnp-org:device:InternetGatewayDevice:2");
+        assert_eq!(SSDP_ST_ROOT, "upnp:rootdevice");
+    }
+
+    /// F4-2：IGD 型判定四态——ST 整串 / USN `::` 后段 / `:10` 不误命中 / 缺 ST+USN 非 IGD。
+    #[test]
+    fn ssdp_igd_type_matching() {
+        let ok1 = format!("HTTP/1.1 200 OK\r\nST: {SSDP_ST_IGD1}\r\nLOCATION: http://192.168.3.1/x\r\n\r\n");
+        assert!(ssdp_is_igd_type(&ok1));
+        let ok2 = format!("HTTP/1.1 200 OK\r\nST: {SSDP_ST_IGD2}\r\nLOCATION: http://192.168.3.1/x\r\n\r\n");
+        assert!(ssdp_is_igd_type(&ok2));
+        // USN 形态（`uuid:…::urn:…:1`）——取 `::` 后段
+        let usn = "HTTP/1.1 200 OK\r\nUSN: uuid:abcd::urn:schemas-upnp-org:device:InternetGatewayDevice:1\r\nLOCATION: http://192.168.3.1/x\r\n\r\n";
+        assert!(ssdp_is_igd_type(usn));
+        // `:10` 不得被 `:1` 命中（精确相等）
+        let bad10 = "HTTP/1.1 200 OK\r\nST: urn:schemas-upnp-org:device:InternetGatewayDevice:10\r\nLOCATION: http://192.168.3.1/x\r\n\r\n";
+        assert!(!ssdp_is_igd_type(bad10));
+        // 缺 ST+USN（rootdevice 应答形态）⇒ 非 IGD（待定）
+        let root = "HTTP/1.1 200 OK\r\nST: upnp:rootdevice\r\nUSN: uuid:abcd::upnp:rootdevice\r\nLOCATION: http://192.168.3.1/x\r\n\r\n";
+        assert!(!ssdp_is_igd_type(root));
+        assert!(!ssdp_is_igd_type("HTTP/1.1 200 OK\r\nLOCATION: http://192.168.3.1/x\r\n\r\n"));
+    }
+
+    /// F4-4：SSDP 钉卡失败 ⇒ **降级继续**（不终止候选）：返回 Ok、记一行、①② 已生效。
+    #[test]
+    fn multicast_pin_failure_degrades() {
+        let Some(ifi) = crate::server::egress::physical_candidates().into_iter().find(|i| !i.addrs.is_empty()) else {
+            eprintln!("（无物理 IPv4 网卡——F4-4 钉卡降级单测跳过）");
+            return;
+        };
+        let ip = ifi.addrs[0];
+        let conn = UdpSocket::bind(SocketAddrV4::new(ip, 0)).expect("绑源地址");
+        let lines: std::sync::Arc<std::sync::Mutex<Vec<String>>> = Default::default();
+        let l2 = std::sync::Arc::clone(&lines);
+        let logf = move |s: &str| l2.lock().unwrap().push(s.to_owned());
+        let fail_pin = |_fd: std::os::fd::RawFd, _i: u32, _n: &str| {
+            Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied, "注入钉卡失败"))
+        };
+        pin_multicast_with(&conn, ip, Some(&logf), &fail_pin).expect("钉卡失败不得终止（降级继续）");
+        let joined = lines.lock().unwrap().join("\n");
+        assert!(joined.contains("SSDP socket 钉卡"), "应有降级告警行：{joined}");
+        assert!(joined.contains("继续尝试"), "文案要求（发送已钉 / 接收可能被抢）：{joined}");
     }
 
     /// M8 三件套：组播 socket option 在真实网卡 IP 上调用成功（只证 setsockopt
@@ -1057,7 +1280,7 @@ mod tests {
         };
         let ip = ifi.addrs[0];
         let conn = UdpSocket::bind(SocketAddrV4::new(ip, 0)).expect("绑源地址");
-        pin_multicast(&conn, ip).expect("三件套 setsockopt 应全部成功（真实网卡 IP）");
+        pin_multicast(&conn, ip, None).expect("三件套 setsockopt 应全部成功（真实网卡 IP）");
     }
 
     /// headerValue（大小写不敏感 + 冒号后取值）。
@@ -1194,7 +1417,7 @@ mod tests {
         assert_eq!(g.find_our_mapping(&table, UPNP_MAP_DESC, other, 42641), None);
 
         // select_external_port：prefer 沿用（verify=true，条目 Ours ⇒ allow_evict）
-        let ext = select_external_port(&g, &table, 42641, 42641, client, true, &logf).unwrap();
+        let ext = select_external_port(&g, &table, 42641, 42641, client, true, &logf, &logf).unwrap();
         assert_eq!(ext, 42641);
 
         // clean：自己的清掉（skip=None）
@@ -1408,6 +1631,23 @@ mod tests {
         no_tail: bool,
         refuse_ext: Option<u16>,
         delete_noop: bool,
+        /// F4-3：AddAnyPortMapping 的 mock 语义（默认 Unsupported = 既有形态不触发兜底）。
+        any_mode: AnyMode,
+        any_calls: usize,
+        any_leases: Vec<u32>,
+    }
+
+    /// F4-3 mock：AddAnyPortMapping 四态。
+    #[derive(Clone, Copy, PartialEq)]
+    enum AnyMode {
+        /// 不支持（401/500）——默认（既有测试的候选成功路径不触发；全失败 ⇒ 既有 NoPortAvailable）
+        Unsupported,
+        /// 成功：路由器改派到该端口（回报 NewReservedPort）
+        Ok(u16),
+        /// 200 但缺 NewReservedPort（假成功形态）
+        MissingReserved,
+        /// 只接受 0 租期（3600 ⇒ 718；0 ⇒ 成功改派）
+        LeaseZeroOnly(u16),
     }
 
     fn start_mock() -> (u16, Arc<std::sync::Mutex<MockState>>) {
@@ -1423,6 +1663,9 @@ mod tests {
             no_tail: false,
             refuse_ext: None,
             delete_noop: false,
+            any_mode: AnyMode::Unsupported,
+            any_calls: 0,
+            any_leases: Vec::new(),
         }));
         let st2 = Arc::clone(&st);
         std::thread::spawn(move || {
@@ -1455,7 +1698,9 @@ mod tests {
                     continue;
                 }
                 let ext = xml_tag(&req, "NewExternalPort").and_then(|v| v.parse::<u16>().ok()).unwrap_or(0);
-                let action = if req.contains("AddPortMapping") {
+                let action = if req.contains("AddAnyPortMapping") {
+                    "AddAnyPortMapping"
+                } else if req.contains("AddPortMapping") {
                     "AddPortMapping"
                 } else if req.contains("DeletePortMapping") {
                     "DeletePortMapping"
@@ -1467,6 +1712,41 @@ mod tests {
                 let mut s = st2.lock().unwrap();
                 s.actions.push(format!("{action}:{ext}"));
                 let resp: String = match action {
+                    "AddAnyPortMapping" => {
+                        s.any_calls += 1;
+                        let lease = xml_tag(&req, "NewLeaseDuration").and_then(|v| v.parse().ok()).unwrap_or(0);
+                        let int_p = xml_tag(&req, "NewInternalPort").and_then(|v| v.parse().ok()).unwrap_or(0);
+                        let client = xml_tag(&req, "NewInternalClient").unwrap_or_default();
+                        s.any_leases.push(lease);
+                        let mode = s.any_mode;
+                        match mode {
+                            AnyMode::Unsupported => {
+                                let fault = "<s:Fault><detail><UPnPError><errorCode>401</errorCode><errorDescription>InvalidAction</errorDescription></UPnPError></detail></s:Fault>";
+                                format!("HTTP/1.1 500 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{fault}", fault.len())
+                            }
+                            AnyMode::MissingReserved => {
+                                "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".to_owned()
+                            }
+                            AnyMode::LeaseZeroOnly(_) if lease != 0 => {
+                                let fault = "<s:Fault><detail><UPnPError><errorCode>718</errorCode><errorDescription>ConflictInMappingEntry</errorDescription></UPnPError></detail></s:Fault>";
+                                format!("HTTP/1.1 500 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{fault}", fault.len())
+                            }
+                            AnyMode::Ok(p) | AnyMode::LeaseZeroOnly(p) => {
+                                s.entries.retain(|m| !(m.external_port == p && m.protocol == "UDP"));
+                                s.entries.push(UpnpMapping {
+                                    external_port: p,
+                                    protocol: "UDP".to_owned(),
+                                    internal_port: int_p,
+                                    internal_client: client,
+                                    enabled: true,
+                                    description: UPNP_MAP_DESC.to_owned(),
+                                    lease_duration: lease,
+                                });
+                                let body = format!("<u:AddAnyPortMappingResponse><NewReservedPort>{p}</NewReservedPort></u:AddAnyPortMappingResponse>");
+                                format!("HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: {}\r\n\r\n{body}", body.len())
+                            }
+                        }
+                    }
                     "AddPortMapping" => {
                         s.add_calls += 1;
                         let int_p = xml_tag(&req, "NewInternalPort").and_then(|v| v.parse().ok()).unwrap_or(0);
@@ -1644,6 +1924,112 @@ mod tests {
         let s = st.lock().unwrap();
         let tries = s.actions.iter().filter(|a| *a == "AddPortMapping:42641").count();
         assert_eq!(tries, 1, "同值候选只试一次（修前 prefer==internal_port 会试两次）：{:?}", s.actions);
+    }
+
+    /// F4-3：`AddAnyPortMapping` **末位兜底**——显式候选全失败才触发；四态 + 租期
+    /// 回退 + 观测行 + **缩租路径不受影响**。
+    #[test]
+    fn add_any_port_mapping_last_resort() {
+        let client: Ipv4Addr = "192.168.3.12".parse().unwrap();
+        let lines: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let l2 = Arc::clone(&lines);
+        let logf = move |line: &str| l2.lock().unwrap().push(line.to_owned());
+        // ① 成功：显式候选（internal_port=65535 ⇒ 候选表只有它）被拒 ⇒ A-any 回报改派端口
+        let (port, st) = start_mock();
+        let g = mock_igd(port);
+        {
+            let mut s = st.lock().unwrap();
+            s.refuse_ext = Some(65535);
+            s.any_mode = AnyMode::Ok(51000);
+            s.no_tail = true; // 枚举残缺 ⇒ verify=false（不删既有映射，走让位）
+        }
+        let ext = select_external_port(&g, &g.list_mappings(), 65535, 0, client, false, &logf, &logf)
+            .expect("A-any 兜底应成功");
+        assert_eq!(ext, 51000, "外部端口由路由器改派");
+        {
+            let s = st.lock().unwrap();
+            assert_eq!(s.any_calls, 1, "只试一次（3600 租期一次成功）");
+            assert_eq!(s.any_leases, vec![3600], "先按 1 小时租期");
+            assert!(
+                s.actions.iter().any(|a| a == "AddAnyPortMapping:65535"),
+                "SOAP 的 NewExternalPort = 期望端口（prefer=0 ⇒ internal_port）：{:?}",
+                s.actions
+            );
+        }
+        assert!(
+            lines
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("显式候选全失败，改用 AddAnyPortMapping 由路由器选端口 51000")),
+            "成功观测行缺失"
+        );
+        // ② 假成功（200 但缺 NewReservedPort）⇒ 判失败 ⇒ 既有 NoPortAvailable
+        let (port2, st2) = start_mock();
+        let g2 = mock_igd(port2);
+        {
+            let mut s = st2.lock().unwrap();
+            s.refuse_ext = Some(65535);
+            s.any_mode = AnyMode::MissingReserved;
+        }
+        let quiet = |_: &str| {};
+        let e = select_external_port(&g2, &g2.list_mappings(), 65535, 0, client, false, &quiet, &quiet)
+            .expect_err("假成功应按失败处理");
+        assert!(matches!(e, UpnpError::NoPortAvailable { .. }), "{e}");
+        // ③ 不支持（401/500）⇒ 回落 NoPortAvailable
+        let (port3, st3) = start_mock();
+        let g3 = mock_igd(port3);
+        {
+            let mut s = st3.lock().unwrap();
+            s.refuse_ext = Some(65535);
+            s.any_mode = AnyMode::Unsupported;
+        }
+        let e = select_external_port(&g3, &g3.list_mappings(), 65535, 0, client, false, &quiet, &quiet)
+            .expect_err("不支持应回落");
+        assert!(matches!(e, UpnpError::NoPortAvailable { .. }), "{e}");
+        // ④ 租期回退：只吃 0 租期 ⇒ 3600 失败后按 0 重试成功
+        let (port4, st4) = start_mock();
+        let g4 = mock_igd(port4);
+        {
+            let mut s = st4.lock().unwrap();
+            s.refuse_ext = Some(65535);
+            s.any_mode = AnyMode::LeaseZeroOnly(52000);
+        }
+        let lines4: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let l4 = Arc::clone(&lines4);
+        let logf4 = move |line: &str| l4.lock().unwrap().push(line.to_owned());
+        let ext = select_external_port(&g4, &g4.list_mappings(), 65535, 0, client, false, &logf4, &logf4)
+            .expect("0 租期应成功");
+        assert_eq!(ext, 52000);
+        {
+            let s = st4.lock().unwrap();
+            assert_eq!(s.any_leases, vec![3600, 0], "3600 → 0 租期回退（镜像 add_with_lease）");
+        }
+        assert!(
+            lines4
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("不接受 AddAnyPortMapping 的 1 小时租期")),
+            "回退应出声"
+        );
+    }
+
+    /// F4-3：**缩租路径不受 A-any 影响**（缩租走 `re_add_short_lease`，不经
+    /// `select_external_port`）。
+    #[test]
+    fn shrink_path_unaffected_by_any_mapping() {
+        let (port, st) = start_mock();
+        let g = mock_igd(port);
+        let client: Ipv4Addr = "192.168.3.12".parse().unwrap();
+        {
+            let mut s = st.lock().unwrap();
+            s.entries = vec![ours(42641, client, 42641)];
+        }
+        g.re_add_short_lease(42641, client, 42641, 300).expect("缩租成功");
+        let s = st.lock().unwrap();
+        assert_eq!(s.any_calls, 0, "缩租不得触发 AddAnyPortMapping：{:?}", s.actions);
+        assert_eq!(s.entries[0].lease_duration, 300);
     }
 
     /// F9：缩租「先 add(300) → 718 才 delete + add(300)」；加不回去时原映射仍在。
