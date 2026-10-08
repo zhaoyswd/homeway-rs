@@ -516,7 +516,8 @@ mem_conns() {  # multiconn：点集拟合 base + 每连接边际（服务端 foo
   printf '%s\n' "${fit_pts[@]}" | tee -a "$out"
 }
 
-mem_rss() {  # **诊断档，不作判据**（lab 已证：同机两臂差 4.3MB 而二进制差 176B）  local p="$1" out="$2"
+mem_rss() {  # **诊断档，不作判据**（lab 已证：同机两臂差 4.3MB 而二进制差 176B）
+  local p="$1" out="$2"
   for arm in "${ARM_LIST[@]}"; do
     local rounds=()
     for r in $(seq 1 $ROUNDS); do
