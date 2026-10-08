@@ -90,6 +90,18 @@ fn ack_drain_bytes() -> usize {
             .unwrap_or(ACK_DRAIN_BYTES)
     })
 }
+/// UDP 载荷上限门（Q-K F5-b，纯函数面）：`20 + 8 + len > 65535` ⇒ 结构性不可发
+/// （IPv4 `total_len` 是 u16），必须在**调用侧可见地失败**——此前该形态是
+/// 「`send_slice` 返 Ok 但报文被 smoltcp 的分片缓冲静默丢」。区间 `(1253, 65507]`
+/// **不报错**（那是正常可发：F5-a 起由栈真分片）。
+fn udp_payload_gate(len: usize) -> Result<(), ConnErr> {
+    if 20 + 8 + len > 65535 {
+        Err(ConnErr::DatagramTooLarge(len))
+    } else {
+        Ok(())
+    }
+}
+
 /// WG 网络包缓冲上界（握手 148 / 数据 = 明文 + 32B 开销）。
 const WG_BUF: usize = 65536 + 148;
 /// 连接的建立期限（engine 侧；主线程另有自己的 RPC 超时）。
@@ -109,6 +121,10 @@ pub enum ConnErr {
     Closed,
     #[error("通道已断（引擎收工）")]
     EngineGone,
+    /// UDP 数据报超过 IPv4 可承载上限（载荷 > 65507 = 65535 − IP 20 − UDP 8；Q-K F5-b）。
+    /// 此前该形态是「send_slice 返 Ok 但报文被静默丢」——**结构性不可发**必须在调用侧可见。
+    #[error("UDP 数据报过大（载荷 {0} 字节 > 65507）")]
+    DatagramTooLarge(usize),
     #[error(transparent)]
     Dial(#[from] DialError),
 }
@@ -677,6 +693,7 @@ impl Engine {
         if dst.ip().is_loopback() {
             return Err(ConnErr::Dial(DialError::LoopbackRejected));
         }
+        udp_payload_gate(data.len())?;
         let Some(u) = self.udp.get(&id) else {
             return Err(ConnErr::Closed);
         };
@@ -2269,5 +2286,21 @@ mod tests {
         );
         assert!(t0.elapsed() < Duration::from_secs(3), "测试期限超支");
         client.stop();
+    }
+
+    /// Q-K T36：UDP 载荷上限门（F5-b）——`send_slice` 静默丢的区间在调用侧可见地失败：
+    /// `> 65507` ⇒ `DatagramTooLarge`；`(1253, 65507]` **不报错**（F5-a 起由栈真分片）。
+    #[test]
+    fn udp_payload_gate_boundaries() {
+        assert!(udp_payload_gate(0).is_ok());
+        assert!(udp_payload_gate(1252).is_ok(), "MTU 内");
+        assert!(udp_payload_gate(1253).is_ok(), ">MTU：F5-a 起可发（回归 R4 的静默丢）");
+        assert!(udp_payload_gate(65500).is_ok());
+        assert!(udp_payload_gate(65507).is_ok(), "上限内（20+8+65507 = 65535）");
+        let e = udp_payload_gate(65508).unwrap_err();
+        assert!(matches!(e, ConnErr::DatagramTooLarge(65508)), "越界可见失败：{e:?}");
+        assert!(matches!(udp_payload_gate(70000), Err(ConnErr::DatagramTooLarge(_))));
+        // 文案可用（错误链非空串）
+        assert!(!ConnErr::DatagramTooLarge(65508).to_string().is_empty());
     }
 }

@@ -362,6 +362,20 @@ pub struct ServeInterceptBits {
     pub shape_drop: u64,
     #[serde(rename = "fragDrop", default)]
     pub frag_drop: u64,
+    /// Q-K 新增（F1/F2/F5-d；additive——旧载荷缺省 0）。单位：`fragReasm` = 报文数，
+    /// 其余 = 分片包数（恒等式 `fragDrop == fragBad + fragLimit + fragTimeout + fragOverlap`）。
+    #[serde(rename = "fragReasm", default)]
+    pub frag_reasm: u64,
+    #[serde(rename = "fragBad", default)]
+    pub frag_bad: u64,
+    #[serde(rename = "fragOverlap", default)]
+    pub frag_overlap: u64,
+    #[serde(rename = "fragTimeout", default)]
+    pub frag_timeout: u64,
+    #[serde(rename = "fragLimit", default)]
+    pub frag_limit: u64,
+    #[serde(rename = "txFragDrop", default)]
+    pub tx_frag_drop: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -734,5 +748,34 @@ mod tests {
         assert_eq!(OpError::code("bad_request").to_string(), "bad_request");
         assert_eq!(OpError::with_detail("bad_request", "x").to_string(), "bad_request: x");
         assert_eq!(OpError::with_detail("bad_request", "x").detail(), "x");
+    }
+
+    /// Q-K T27：`serve.status` 的 intercept 段含 6 个新键（camelCase）；**旧载荷**
+    /// （无 6 键）反序列化成功且取 0（additive 兼容）。
+    #[test]
+    fn intercept_bits_new_keys_and_backward_compat() {
+        let b = ServeInterceptBits {
+            frag_drop: 3,
+            frag_reasm: 1,
+            frag_bad: 2,
+            frag_overlap: 3,
+            frag_timeout: 4,
+            frag_limit: 5,
+            tx_frag_drop: 6,
+            ..Default::default()
+        };
+        let s = serde_json::to_string(&b).unwrap();
+        for k in ["fragReasm", "fragBad", "fragOverlap", "fragTimeout", "fragLimit", "txFragDrop"] {
+            assert!(s.contains(&format!("\"{k}\":")), "序列化含 {k}：{s}");
+        }
+        // 旧载荷（Q-B 形态：只有 dialOk/dialFail/reject/flows/udpDrop/shapeDrop/fragDrop）
+        let old = r#"{"dialOk":1,"dialFail":2,"reject":3,"flows":4,"udpDrop":5,"shapeDrop":6,"fragDrop":7}"#;
+        let d: ServeInterceptBits = serde_json::from_str(old).unwrap();
+        assert_eq!((d.dial_ok, d.frag_drop), (1, 7));
+        assert_eq!(
+            (d.frag_reasm, d.frag_bad, d.frag_overlap, d.frag_timeout, d.frag_limit, d.tx_frag_drop),
+            (0, 0, 0, 0, 0, 0),
+            "旧载荷 6 键缺省 0"
+        );
     }
 }

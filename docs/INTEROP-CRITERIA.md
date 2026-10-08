@@ -206,6 +206,30 @@ v6 路径）+ Rust 统一进程出口 42680（upnp=true 同号映射成立 ⇒ v
   `fragDrop`——**拒绝 Go/gVisor 会重组的形态**（>1280 的 UDP 被分片后，本层不再当独立会话
   处理）。后果：被分片的 UDP（少见）不转发，客户端按超时/不可达重试；出口侧分片重组**未实现**
   （另议）。DF-only（flags=0x4000、off=0、MF=0）不算分片，照常处理。
+  **⚠️【Q-K 批，2026-10-08 收口】本条已注销**——见下条 Q-K 条目：出口侧已实装**有界重组**，
+  该「接受的差异」转为「已重组交付」。
+- **【Q-K 批，2026-10-08】IPv4 分片处置（F1/F4/F5-a~d，**取代**上条 Q-B F7 的「接受的差异」）**：
+  ① 拦截层在建会话之前对入站 IPv4 分片做**有界重组**（30s 超时〔按 `created` 计、**不续期**〕/
+  64 上下文 / 每源 4 / 64 片 / 4 MiB / 单报文 ≤65535 字节），重组成功的报文走**与正常包完全
+  相同**的 `route_plain` 路径（结构上无分片旁路；**分片自身不建会话**——Q-B F7 的性质保持，
+  `route_plain` 内的原 F7 分支改 `debug_assert` 绊线）。② 非法（偏移越界 / 非末片非 8 倍 /
+  空片）、部分重叠、**内含重叠**、同区间不同字节（冲突）、越过末片边界 ⇒ **整条丢弃**
+  （末尾两项比 gVisor 严、与 Linux 一致——**有意更严**）。③ 同区间**同字节**重复 ⇒ 静默忽略
+  （不计数，与 Go 一致）。④ 超时且**首片在位** ⇒ 回 ICMP type 11 code 1（载荷 8B =
+  原 IP 头 + 前 8 字节，**与 gVisor 的 RFC 1812 ≤548B 有意不同**）；抑制集 = 源 `0.0.0.0` /
+  目的组播 / `255.255.255.255`。⑤ **出口 TX 侧反重写新增分片感知**（F5-d）：非首片只改 IP 源 +
+  IP 校验和；首片用 **RFC 1624 增量更新** L4 校验和（UDP 原值 0 保持 0）；TX 分片表
+  `(dst, ident, proto)` 末片精确回收 + 10s TTL + 上限 64，**表未命中 ⇒ 丢片 + 计 `txFragDrop`**
+  （不发坏片）。⑥ 客户端侧：`fragmentation-buffer-size-65536`（恢复 Go 能力——修前 >1472
+  载荷在客户端 TX **静默丢**）+ `reassembly-buffer-count-8`（并发重组槽 8）+ `udp_send` 对
+  `> 65507` 载荷回 `ConnErr::DatagramTooLarge`（`(1253, 65507]` 不报错——那是正常可发）。
+  **负面事实（必须知悉）**：本仓 Rust 客户端**看不到**上述 ICMP（smoltcp 的 `process_icmpv4`
+  只处理 Echo、其余丢弃；客户端核无 `icmp` socket）——该 ICMP 的价值是**出口侧可观测**
+  （tcpdump/日志）+ 与历史 Go 行为同形，**不是**「客户端大 UDP 失败现在可观测了」。
+  **前提假设**：片数上限 64 以「对端 IP MTU = 1280」为前提（合法最坏 53 片）——异种 MTU
+  对端（如 576 ⇒ 123 片）会被 `fragLimit` 拒（**有意更严**，行文带片数维度可观测）。
+  **残余**：客户端入站重组超时仍是 smoltcp 的 60s（F6，不改）；内存压力淘汰**无低水位滞回**
+  （逐条淘汰，gVisor/Linux 是 4MiB→3MiB 滞回）；ICMP 只在**超时**发（内存压力淘汰不发）。
 - **【Q-B 批，2026-10-07】非 TCP/UDP 协议不建会话（F9，接受的差异）**：ICMP 等非 6/17 协议
   在 `on_plain` 直接丢弃——**不产出 Go netstack 会回的 ICMP 不可达**（`build_icmp_unreachable`
   现仅对 UDP 生效，扩展面另议）；收益 = 移除每包 `socket/bind/connect` 开销与 `dialfail` 计数
@@ -557,6 +581,7 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 | 2026-10-08（Q-J 批落地） | **F2 五配置键（additive）+ 两处 spec opt-in 偏离 + config.toml 对 Go 单向** | 无 → 有（`[serve]` 五键，默认 = 修前硬编值逐值不变）：`dns_upstream`（显式上游覆盖；空 = 跟随 `/etc/resolv.conf`）、`dns_fallback`（缺省 `223.5.5.5`；**空串 = 拒启**，不是「关兜底」）、`ddns_resolver`（缺省 `223.5.5.5:53`/`119.29.29.29:53`）、`dns_probe_target`（缺省 `223.5.5.5:53`/`1.1.1.1:53`；**一键喂挑卡/健康探针/udpcap 三路 = 显式登记耦合**）、`stun_probe_target`（缺省 CF/Google；**须显式带端口**）。**两处 opt-in 偏离**（默认面不动）：`dns_upstream` ↔ tier `wg-native-dns:40` MUST（系统解析配置跟随）；`dns_fallback` ↔ `:77` SHALL（223.5.5.5）——仅显式配置时偏离。**env 缝纪律**：`HOMEWAY_BINDWATCH_PROBE` 只影响健康探针，挑卡恒吃 config/默认。`dns_upstream` 覆盖生效行（进 E4 取值）另告警**恰一次**（`DnsProxy::spawn`：fake-ip 主机上手机拿真实 IP、域名规则失效——代码门 M1 补齐，含测试断言）；**五键端口 0 一律拒启**（值域，代码门 L2）。**不加 CLI flag**（配置面足够，登记「不加」）。新键使 config.toml 对 Go 侧（`Undecoded()` 检查）**单向不兼容**（Go 已退役，仅影响回滚/对照） | F2（P1：DNS 上游/探针目标硬编码 CN 段 + fake-IP 无卫兵；「统一」落点按 tier spec 收窄——dnsproxy 侧**不得**做拒绝式卫兵，见 F3） | `serve_cli.rs`（五键 + 值域 + 边界解析）、`engine.rs`（`ServeConfig` 五字段 + 装配）、`dnsproxy.rs`（`Upstreams::with_static` 静态覆盖不做 mtime 跟随）、`ddnscheck.rs`（`resolvers` 穿参）、`egress.rs`（`preferred_iface(route_probe)`）、`bindwatch.rs`（`pick_targets`/`health_probe_targets_from_env`）、`nodestate.rs`（模板键表）；单测 `f2_keys_defaults_unchanged`/`f2_keys_take_effect`/`static_upstream_override_no_follow`/`fallback_from_config`/`defaults_unchanged_by_new_keys`/`pick_targets_ignore_env_seam`；**上报项**：两处 spec 偏离需 tier 知会/修订 |
 | 2026-10-08（Q-I 尾段批落地） | **F2（reactor 并入引擎 poll）尝试后回退——零残留（登记留痕）** | 曾实现「reactor 兴趣集并入引擎唯一 poll（快照直派）+ `intercept: reactor 观测 … 兜底=N` 字段 + 两条唤醒时点行为变更」→ **实测负收益后整条回退**（代码与判据面回到 Q-H 形态；`兜底=` 字段与两条行为变更**未落地、不登记**） | F2 止损闸门（设计 §4.3）：两项 poll 样本合计 **+18%**（不降反升）、进程 CPU **+14.5%**、up 吞吐 **−5.9%**；机制 = 上游 fd 就绪成为引擎唤醒源 ⇒ 拍频 13.2k→21.4k/s、每拍全量 pump 的固定成本放大 | **本行不涉任何判据行/wire/夹具变更**；证据与数字见 `docs/reviews/QIt.md` 性能节 + `docs/PERF-AB.md`；`server/engine.rs`/`server/intercept/mod.rs` 内注释留痕（`reactor_turn` 文档注释） |
 | 2026-10-08（Q-F-B 批落地） | **`portForwards[]` 状态文案与 `ClientCoreTunSetPortForwards` 返回码**（契约面行为变更，非编号判据行；**接续 Q-F 该条**——Q-F-B = Q-F 的 portfwd 挂账项收口批） | ① `state`：恒 `"failed"`（Q-F 诚实态）→ **`"listening"`（真 bind 成功且 accept 线程在位）/ `"failed"`（真 bind 失败 / 装配期破损配置 / accept 致命错误的迟到失败）**；② `err`：恒「手机核未提供端口转发监听（127.0.0.1:<listen> 未监听）——该映射在当前版本不可用，不影响隧道」→ **空串（成功）/ 真 bind 失败 `errno` 原文（失败）/ 装配期精确 err（破损配置）/ accept 致命错误原文（迟到失败）**；③ `code`：空 → **`bind_failed`（真值，tier 渲染「端口被占用」）**；空码**只剩非常态面**（装配期破损配置 / 迟到失败——spec 的空码兜底路径）；④ `conns`：恒 0 → **真连接数**（accept 准入 +1、连接结束 −1）；⑤ **未 attach / 未装表期 与 收工后**：`portForwards` 为空数组（tier 显示「启动中…」）——HEAD 是「失败 · 未提供…」；⑥ rc：恒 `-1` → **`0`（有承载：已受理并真装表）/ `-1`（无世代或世代已收口——改动随下次连接的 tunConfig 生效）/ `-2`（JSON/校验不过，含新增条数上限 8）** | Q-F-B：实装真监听器（Q-F 挂账项收口）。`bind_failed` 由「具体化假归因」转**真值**（真 `bind()` 失败），spec「失败原因 MUST 携带稳定枚举 code」由「有意偏离」转**达标**（限定语：除非常态空码面） | `tier:openspec/specs/port-forwarding`「端口映射的建立与访问」SHALL 由**已知不达标**转**达标**、「映射状态可见」失败码 MUST 转**达标**；tier 两处失义文案（`PortForwardsPage.ets` 的 `dirty` 兜底提示 / `TierVpnExtensionAbility.ets` 的 rc 日志）**随本批自愈**；`facade/portfwd.rs`（`PfRuntime`）/`facade/tun_exec.rs` 单测；**`fixtures/` 无 portForwards 夹具 ⇒ 无字节夹具变更**；`tools/check-vocab.sh` **零改动**（声明集/缺席表/manifest/tier 码表四处不动） |
+| 2026-10-08（Q-K 批落地） | **IPv4 分片处置**（Q-B F7 的「接受的差异」条目；**非编号判据行**——DC18/E12/E22 行文与数值语义均不动） | 「拦截层丢弃入站 IPv4 分片（非首片 `frag_off>0` 或 MF 置位）并计 `fragDrop`——**拒绝 Go/gVisor 会重组的形态**；出口侧分片重组未实现」 → 「① 拦截层在建会话之前对入站 IPv4 分片做**有界重组**（30s 超时〔按 `created` 计、不续期〕/ 64 上下文 / 每源 4 / 64 片 / 4 MiB / 单报文 ≤65535），重组成功的报文走**与正常包完全相同**的 `route_plain` 路径（分片自身**不建会话**——F7 性质保持）；② 部分重叠、**内含重叠**、同区间不同字节、越界、非 8 倍、空片 ⇒ **整条丢弃**（两处比 Go 严、与 Linux 一致）；③ 超时且首片在位 ⇒ 回 ICMP type 11 code 1（**载荷 8B，与 gVisor 的 RFC 1812 ≤548B 有意不同**；本仓客户端**看不到**它）；④ **出口 TX 侧反重写新增分片感知**（非首片只改 IP 源；首片用 RFC 1624 增量更新 L4 校验和）」 | Q-K：恢复 Go/gVisor 的重组能力（对齐），同时保持 F7 修掉的「不占会话表 / 不污染载荷」性质；并修复设计门查出的**对称缺陷**（TX 侧 `on_tx` 无分片门 ⇒ 首片 UDP 校验和被按首片长度重算覆盖、非首片概率性改写另一条流的 IP 源与载荷前 2 字节——**返向 1253–1472 大 UDP 修前根本不通**） | `crates/homeway-core/src/server/intercept/{mod.rs,reasm.rs,nat.rs}`、`crates/homeway-core/src/wgcore/mod.rs`（F5-b 门）、根 `Cargo.toml`（smoltcp features）；`docs/INTEROP-CRITERIA.md` §已知口径注记的 Q-B F7 条目已**注销指针**（历史记录保留）；Q-B 的 `docs/reviews/QB.md`/`QB-design.md` 不追改（历史记录）；单测 T1–T38（`reasm.rs`/`intercept::tests`/`wgcore::tests`/`daemon::proto::tests`） |
 
 > **上表 E12/decr_flow 两行 = 2026-10-07 Q-B 批落地登记**（Q-A 批预登记的占位条目已按本政策补全
 > 「从 → 到」实际行文并去掉「占位」标注，同批 commit）；**其下两行 = 2026-10-07 Q-C 批落地登记**；
@@ -576,6 +601,14 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 > **最新一行 = 2026-10-08 Q-F-B 批落地登记**（`portForwards[]` 状态文案与热替换 rc 的契约面收口——
 > 接续 Q-F 同族行；**本批零编号判据行变更、零 wire/夹具变更**，词表门四处不动）；计数输入集表 = Q-F-B 四行
 > （`pfAccepted`/`pfFails`、`portForwards[].conns`、`stats:` 行 pf 两位、additive 观测行 10 条）。
+> **再下一行 = 2026-10-08 Q-K 批落地登记**（**IPv4 分片处置**——Q-B F7 的「接受的差异」由「拦截层一律
+> 丢弃」转「有界重组交付 + TX 分片感知」；**本批零编号判据行变更、零 wire 夹具变更**——线上包形态变化
+> 〔1 报文变 N 包〕属计数输入集表登记项，见下；词表门零改动）；计数输入集表 = Q-K 三行
+> （`fragDrop` 重定义 + 6 新计数 + 出口→客户端线上包形态）；**additive 观测行 2 条**（非编号判据行）：
+> `intercept: 分片重组超上限（上下文 …，源 …）——新报文暂不可重组（累计丢 N 片）` 与
+> `intercept: 分片重组超时（N 片，30s）——整条丢弃（累计 M）`——**键 = 纯 kind（不含 `src`；
+> `src` 只进行文）**、两个封闭具名字段（无 HashMap）、节流 = 首行 + 每 100 次一条；
+> **重叠/冲突/非法不记行**（可被对端逐包诱发，纯计数——有意取舍）。
 > 登记生效后，E12 关闭行与 flows 计数按新行文验收（旧行文不再要求同串）；Q-D 的尺寸面按
 > 「正常尺寸逐字节同串、极端输入按登记」验收；Q-G 的 UDS 路径面按「`> SUN_PATH_MAX`（平台值）」验收；
 > Q-I 尾段的 `--stun=`/`--stun6=`/`--relay=`/`--ddns=` 空值形态按「接受并按 Go 语义处理」验收；
@@ -629,3 +662,6 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 | 2026-10-08（Q-J） | **E21** 绑卡族（行文与渲染形态**不变**） | ① linux 上 `index=0` **不再蕴含「不可钉」**（钉卡守卫改平台分档：darwin 拒 `index==0`〔`IP_BOUND_IF=0`=解绑〕，linux 按名 `SO_BINDTODEVICE`、index 不参与）；② darwin 候选面**排除** `!index_ok`（不可钉不参与挑卡），linux 不过滤；③ 三处 index 键面改 **name 优先**（`bindwatch::state_of_from` 纯函数 / 重挑比较 `iface_same` / `select_best` 的默认路由偏好）；`IfaceFingerprint` 仍保留 index 字段（「换 index ⇒ 重钉」信号不丢） | F5：`if_nametoindex` 失败静默 index=0 的完整语义（macOS 0=解绑但 `setsockopt` 成功 ⇒ 「已钉卡」判据反向；linux 按名绑定与 index 无关，旧硬拒属误伤） | E21 取值路径不变（`index=%d` 渲染形态不动）、`egress.rs`（`candidate_pinnable`/`iface_same`/`pin_socket_to_iface` 平台守卫）、`bindwatch.rs`（`state_of_from`）；单测 `if_nametoindex_zero_platform_split`/`candidate_filter_platform_split`/`iface_same_three_states`/`state_of_from_name_keyed`/`repick_same_name_with_index_flap_stays`；**linux 语义放宽**（旧硬拒不再发生）；**平台分档补门（代码门 L1）**：linux 空网卡名 ⇒ `SO_BINDTODEVICE(optlen=0)` 是内核级「解绑且成功」——与 darwin `IP_BOUND_IF=0` 同型，按名面补硬拒（现调用方不可达，属不变量结构化） |
 | 2026-10-08（Q-J） | **E4** `dns 代答就绪：… upstream=%s`（行文**不变**） | 取值来源扩展：`serve.dns_upstream` 配置生效时 `upstream=` = **配置列表**（静态、**不做 mtime 跟随**）；缺省/空 = 今日的 `/etc/resolv.conf` nameserver 列表（跟随语义不动） | F2：显式上游覆盖（opt-in；macOS 出口的 resolv.conf 非真源，覆盖是等价能力收口） | E4 取值（行文不变）、`dnsproxy.rs`（`Upstreams::with_static`/`text()`）、单测 `static_upstream_override_no_follow` |
 | 2026-10-08（Q-J） | **C14** + 未编号行 `UDP 默认路径：…`（行文**逐字不变**） | **取值来源变**：`serve.dns_probe_target`/`stun_probe_target` 配置生效时，udpcap 探针目标 = 配置值（修前硬编 `&[]` = 默认常量）；默认逐值不变。**耦合写明**：`dns_probe_target` 一键喂**挑卡 / 健康探针 / udpcap DNS:53 三路**——把该键指到诊断死地址会同时影响挑卡、健康探针与 C14 取值 | F2：探针目标可配置（默认 = 修前硬编值） | C14 取值（行文不变）、`engine.rs`（`probe_once(dns_targets, stun_targets)`）、`bindwatch.rs`（挑卡 `pick_targets` 不吃 env）、`serve_cli.rs` 值域；单测 `pick_targets_ignore_env_seam`/`f2_keys_take_effect` |
+| 2026-10-08（Q-K） | **`fragDrop`**（intercept 计数；Q-B 起既有键） | 「入站分片被**整包丢弃**的片数（唯一来源 = F7 的 `return`）」→「被丢弃的分片包**总数**：非法（越界/非 8 倍/空片）+ 重叠冲突连带 + 超时连带 + 超限拒绝/淘汰」；恒等式 **`fragDrop == fragBad + fragLimit + fragTimeout + fragOverlap`**（**四项全部可独立读**，不需作差反推）；单位仍是**包**（向下兼容） | Q-K F1/F2：分片不再一律丢，`fragDrop` 需覆盖重组的各条失败路径 | `serve.status` intercept 段、`EngineInterceptBits`、`homeway-cli` 取值点；在「已能走通」的流量上数值**降为 0**（此前该流量根本走不通）；键序与 `snapshot()` 索引 `[8]` 不变 |
+| 2026-10-08（Q-K） | **新增计数** `fragReasm` / `fragBad` / `fragOverlap` / `fragTimeout` / `fragLimit` / `txFragDrop`（`Stats::snapshot()` **追加末位**，数组 9 → 15） | 无 → 有 | Q-K F1/F2/F5-d：重组的成功 / 畸形 / 攻击 / 丢包 / 资源五类信号 + TX 侧无首片丢片，全部可观测 | additive：① `snapshot()` 索引 `[0..=8]` 与键查找语义不变；② 经 `serve.status` 载荷 `ServeInterceptBits` 暴露（6 键，serde `default` 兼容旧载荷）；**DC18 人读行文不变**（`daemon_cli` 仍只渲染 dialOk/dialFail/reject/flows）；③ **单位差异**：`fragReasm` = **报文数**（datagram），其余五者 = **分片包数**；④ `fragDrop` 是 **RX** 侧总数、`txFragDrop` 是 **TX** 侧总数（两面独立、不可混加） |
+| 2026-10-08（Q-K） | **出口→客户端方向的线上包形态** + `tx_deferred`/`shape_drop`/`tx_win_released` 的输入集 | ① 出口栈对大 UDP 回复：1253–1472 载荷 ⇒ 分成 2 片发出，但**返向实际不可用**（首片 UDP 校验和被 `on_tx` 写坏 ⇒ 客户端静默丢）；≥1473 载荷 ⇒ 出口 TX **静默丢弃**（分片缓冲 1500 字节钳制）。② **`on_tx` 分片感知 + `fragmentation-buffer-size-65536`** 之后：1253–1472 正常发 2 片、**≥1473 现在真的分片发出**（**1 报文变 N 包**）；③ 按包计数的面（`tx_win_released`/`tx_win_pumps` 等）随之变化：1 报文 ≠ 1 包 | Q-K F5-a + F5-d：恢复返向大 UDP（对齐 Go），并修复设计门查出的校验和破坏缺陷 | 出口整形面（`TX_DEFER_MAX_BYTES` 按字节，口径不变；`tx_win_released` 按包，数值变大）、`tx_deferred` 深度（同字节量下包数变多）；**客户端入站重组并发 = 8**（`reassembly-buffer-count-8`，F5-c；修前为 1）⇒ 并发大回复不再互斥；客户端侧 `udp_send` 对 >65507 载荷新回 `ConnErr::DatagramTooLarge`（`(1253, 65507]` 不报错）；新增计数 `txFragDrop`（F5-d 的无首片丢片） |

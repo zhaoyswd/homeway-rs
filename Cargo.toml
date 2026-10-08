@@ -27,7 +27,18 @@ boringtun = "0.6"
 # 增长律，迁移后由上游 RFC 合规实现替代）。R8-2 加开 reno feature：真机归因消融
 # 对照臂（HOMEWAY_CC=reno——Go gVisor 默认 Reno，同机 A/B 消除算法差；不设即恒
 # CUBIC，产品行为不变）。
-smoltcp = { version = "0.14", features = ["socket-tcp-cubic", "socket-tcp-reno"] }
+# Q-K F5-a/F5-c（2026-10-08）：`fragmentation-buffer-size-65536` 把 TX 分片缓冲从
+# 默认 1500 抬到 64 KiB（恢复 Go 能力——此前 >1472 载荷在客户端 TX 被静默丢，R4）；
+# `reassembly-buffer-count-8` 把入站重组并发槽从默认 1 抬到 8（并发大回复，F5-c）。
+# **同一编译单元**下出口拦截栈的分片缓冲同步抬高 ⇒ 出口→客户端方向的大 UDP 回复
+# 真的开始分片（线上形态 1 包变 N 包——登记见 INTEROP-CRITERIA）；这要求同批落地
+# F5-d（出口 TX 反重写分片感知），否则只是把「静默丢」换成「分片后校验和被写坏」。
+smoltcp = { version = "0.14", features = [
+    "socket-tcp-cubic",
+    "socket-tcp-reno",
+    "fragmentation-buffer-size-65536",
+    "reassembly-buffer-count-8",
+] }
 libc = "0.2"
 # ---- R6 term 服务面：alacritty_terminal 0.26 = 仿真+Damage+kitty 模式位
 # （应答器与键/鼠标/焦点编码器自建，设计见 docs/reviews/R6-design.md）；

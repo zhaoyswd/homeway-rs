@@ -389,6 +389,12 @@ impl UnifiedRoles {
                         udp_drop: i.udp_drop,
                         shape_drop: i.shape_drop,
                         frag_drop: i.frag_drop,
+                        frag_reasm: i.frag_reasm,
+                        frag_bad: i.frag_bad,
+                        frag_overlap: i.frag_overlap,
+                        frag_timeout: i.frag_timeout,
+                        frag_limit: i.frag_limit,
+                        tx_frag_drop: i.tx_frag_drop,
                     },
                     d,
                 )

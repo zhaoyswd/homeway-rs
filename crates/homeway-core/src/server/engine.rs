@@ -194,6 +194,14 @@ pub struct EngineInterceptBits {
     pub udp_drop: u64,
     pub shape_drop: u64,
     pub frag_drop: u64,
+    /// Q-K 新增（F1/F2/F5-d）：分片重组的成功/畸形/攻击/丢包/资源五类信号 + TX 侧无首片
+    /// 丢片。**单位差异**：`frag_reasm` = 报文数（datagram），其余 = 分片包数。
+    pub frag_reasm: u64,
+    pub frag_bad: u64,
+    pub frag_overlap: u64,
+    pub frag_timeout: u64,
+    pub frag_limit: u64,
+    pub tx_frag_drop: u64,
 }
 
 /// 出口引擎句柄（装配线程持有；stop 收工）。
@@ -903,6 +911,12 @@ impl ServeEngine {
                 udp_drop: get("udpDrop"),
                 shape_drop: get("shapeDrop"),
                 frag_drop: get("fragDrop"),
+                frag_reasm: get("fragReasm"),
+                frag_bad: get("fragBad"),
+                frag_overlap: get("fragOverlap"),
+                frag_timeout: get("fragTimeout"),
+                frag_limit: get("fragLimit"),
+                tx_frag_drop: get("txFragDrop"),
             },
             ddns,
         )

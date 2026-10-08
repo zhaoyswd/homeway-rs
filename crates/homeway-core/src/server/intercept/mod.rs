@@ -21,6 +21,7 @@
 
 pub mod dnsface;
 pub mod nat;
+pub mod reasm;
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
@@ -40,6 +41,7 @@ use crate::Logf;
 
 use self::dnsface::{DnsFaces, DnsRoute};
 use self::nat::Ipv4View;
+use self::reasm::{DropReason, Dropped, Reassembler};
 use crate::server::dnsproxy::{DnsProxy, DnsReply, SubmitOutcome};
 
 /// TCP 并发上限（serve 装配层覆盖包内默认 4096——FIX-63 生产值）。
@@ -400,6 +402,26 @@ pub const TX_SHAPE_BURST: usize = 256 * 1024;
 /// 见 `docs/reviews/QB.md`）。
 const TX_DEFER_MAX_BYTES: usize = 16 * TX_SHAPE_BURST;
 
+// ---- Q-K F5-d：出口 TX 侧分片表（反重写的分片感知）----
+
+/// TX 分片表上限（正常态 ≤1 项——smoltcp 的 `Fragmenter` 是单缓冲：一个 Interface
+/// 同时只有 1 条在途分片报文，剩余片在后续 poll 续发；TTL/上限只兜异常）。
+const TX_FRAG_MAX: usize = 64;
+/// TX 分片表 TTL（跨 poll 续发的片间隔 1–5ms，10s 是量级余量；超时兜「首片丢失」）。
+const TX_FRAG_TTL: Duration = Duration::from_secs(10);
+
+/// TX 分片表键：`dst` = 客户端隧道 IP（每 peer 唯一）、`ident` = smoltcp 的
+/// `next_ipv4_frag_ident()`（按 Interface 递增 ⇒ 一个在途报文内唯一）、`proto`。
+type TxFragKey = (Ipv4Addr, u16, u8);
+
+/// TX 分片表值：首片命中反重写时登记的值——`orig` = 该报文的原始目的（`None` =
+/// 本就不需重写，如真 listener 应答）；后续片按它取**同一个改写后 IP 源**
+/// （同报文全部分片必须携带同一 IP 源，否则客户端重组键分裂）。
+struct TxFragVal {
+    orig: Option<(Ipv4Addr, u16)>,
+    created: Instant,
+}
+
 /// 出口发送整形参数（字节令牌桶——团块钳制面；v0.2.2 简洁化批起逐包时刻表
 /// 已删除，只剩令牌桶本体 + `HOMEWAY_TX_SHAPING` 逃生口）。
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -540,8 +562,23 @@ pub struct Stats {
     udp_drop: AtomicU64,
     /// 发送整形滞留上限丢新（F4：无窗流并入会超 `TX_DEFER_MAX_BYTES` 时丢新）。
     shape_drop: AtomicU64,
-    /// IPv4 分片丢弃（F7：非首片/MF 置位——拒绝 Go/gVisor 会重组的形态）。
+    // ---- Q-K（F1/F2/F5-d）：分片面 ----
+    /// **重定义**（Q-K）：被丢弃的分片包**总数**（RX 侧）。恒等式
+    /// **`fragDrop == fragBad + fragLimit + fragTimeout + fragOverlap`** 由
+    /// `note_frag_drop` 的单次记账结构保证（四处独立自增会漂移）。
     frag_drop: AtomicU64,
+    /// 成功重组并交付的**报文（datagram）数**——唯一非「片」单位。
+    frag_reasm: AtomicU64,
+    /// 非法分片包（偏移越界 / 非末片非 8 倍 / 空片）连带丢弃数。
+    frag_bad: AtomicU64,
+    /// 重叠/冲突整条丢弃所连带的分片包数（攻击面信号）。
+    frag_overlap: AtomicU64,
+    /// 超时淘汰所连带的分片包数（丢包/占用信号）。
+    frag_timeout: AtomicU64,
+    /// 上限（上下文数 / 每源 / 片数 / 字节）拒绝或淘汰所连带的分片包数。
+    frag_limit: AtomicU64,
+    /// **TX 侧**（F5-d）：无首片对应 / TX 分片表未命中而丢弃的分片包数（对照面）。
+    tx_frag_drop: AtomicU64,
 }
 
 impl Stats {
@@ -579,12 +616,28 @@ impl Stats {
     fn incr_shape_drop(&self) {
         self.shape_drop.fetch_add(1, Ordering::Relaxed);
     }
-    /// IPv4 分片丢弃（F7）。
-    fn incr_frag_drop(&self) {
-        self.frag_drop.fetch_add(1, Ordering::Relaxed);
+    /// 分片包丢弃的**唯一记账点**（Q-K F2）：`fragDrop` 与四分类计数在**同一次调用**
+    /// 内自增 ⇒ 恒等式 `fragDrop == fragBad + fragLimit + fragTimeout + fragOverlap`
+    /// 结构成立（调用方不得绕开本函数直改任一计数）。
+    pub(crate) fn note_frag_drop(&self, reason: DropReason, packets: u64) {
+        self.frag_drop.fetch_add(packets, Ordering::Relaxed);
+        match reason {
+            DropReason::Bad => self.frag_bad.fetch_add(packets, Ordering::Relaxed),
+            DropReason::Overlap => self.frag_overlap.fetch_add(packets, Ordering::Relaxed),
+            DropReason::Timeout => self.frag_timeout.fetch_add(packets, Ordering::Relaxed),
+            DropReason::Limit => self.frag_limit.fetch_add(packets, Ordering::Relaxed),
+        };
+    }
+    /// 成功重组交付计数（F2：单位 = 报文，非片）。
+    pub(crate) fn incr_frag_reasm(&self) {
+        self.frag_reasm.fetch_add(1, Ordering::Relaxed);
+    }
+    /// TX 侧分片丢片计数（F5-d：表未命中/无首片）。
+    pub(crate) fn incr_tx_frag_drop(&self) {
+        self.tx_frag_drop.fetch_add(1, Ordering::Relaxed);
     }
     /// 观测快照（键名 = 观测面契约；新增计数一律**追加末位**——保既有索引断言）。
-    pub fn snapshot(&self) -> [(&'static str, u64); 9] {
+    pub fn snapshot(&self) -> [(&'static str, u64); 15] {
         [
             ("dialok", self.dial_ok.load(Ordering::Relaxed)),
             ("dialfail", self.dial_fail.load(Ordering::Relaxed)),
@@ -595,6 +648,12 @@ impl Stats {
             ("udpDrop", self.udp_drop.load(Ordering::Relaxed)),
             ("shapeDrop", self.shape_drop.load(Ordering::Relaxed)),
             ("fragDrop", self.frag_drop.load(Ordering::Relaxed)),
+            ("fragReasm", self.frag_reasm.load(Ordering::Relaxed)),
+            ("fragBad", self.frag_bad.load(Ordering::Relaxed)),
+            ("fragOverlap", self.frag_overlap.load(Ordering::Relaxed)),
+            ("fragTimeout", self.frag_timeout.load(Ordering::Relaxed)),
+            ("fragLimit", self.frag_limit.load(Ordering::Relaxed)),
+            ("txFragDrop", self.tx_frag_drop.load(Ordering::Relaxed)),
         ]
     }
 }
@@ -833,6 +892,17 @@ pub struct Interceptor {
     /// 键 = (kind, 原始目的)——**不含源端点**：手机核自连探测每次换临时源端口，
     /// 键含源则每条都成「首行」，降噪失效（评审 r1 低危整改）。
     dial_fail_seen: HashMap<DialFailKey, (u64, bool)>,
+    // ---- Q-K：分片重组（F1）与出口 TX 分片感知（F5-d）----
+    /// RX 分片重组器（驱动线程独占；超时清扫在 `pump`/`pump_hold` 每拍开头）。
+    reasm: Reassembler,
+    /// TX 分片表（首片登记 / 末片精确回收 / TTL + 上限兜底）。
+    tx_frag: HashMap<TxFragKey, TxFragVal>,
+    /// 分片限频日志表（F2：键 = **纯 kind**——不含 `src`、**不用 HashMap**（两个封闭
+    /// 具名字段从结构上杜绝无界增长）；节流 = 首行 + 每 100 次一条累计行，与
+    /// `dial_fail_seen` 同节奏）。重叠/冲突/非法**不记行**（可被对端逐包诱发——
+    /// 逐条记行 = 自我放大；有意取舍，已登记）。
+    frag_limit_seen: (u64, bool),
+    frag_timeout_seen: (u64, bool),
     /// CC 观测行的上次打印时刻。
     last_cc_stats: Option<Instant>,
     /// 观测行上一窗快照（8n；流 id → 累计快照——差分本窗增量）。
@@ -914,6 +984,10 @@ impl Interceptor {
             dns_rx,
             udp_seq: 0,
             dial_fail_seen: HashMap::new(),
+            reasm: Reassembler::new(),
+            tx_frag: HashMap::new(),
+            frag_limit_seen: (0, false),
+            frag_timeout_seen: (0, false),
             last_cc_stats: None,
             obs_snaps: HashMap::new(),
             time0: Instant::now(),
@@ -943,19 +1017,133 @@ impl Interceptor {
         self.smol_now
     }
 
+    /// 分片丢弃的统一处置点（F2/F4）：记账（恒等式结构保证）→ 限频日志（仅超限/超时）
+    /// → 超时且首片在位 ⇒ 产 ICMP type 11 code 1。
+    fn note_frag_drop(&mut self, d: Dropped) {
+        self.stats.note_frag_drop(d.reason, d.packets);
+        match d.reason {
+            DropReason::Limit => self.log_frag_limit(d.src),
+            DropReason::Timeout => {
+                self.log_frag_timeout(d.packets);
+                if let Some(orig) = d.icmp_orig.as_deref() {
+                    // 只回已认证 peer（走 tx_out → route_encap 的隧道路径，不经公网）。
+                    if let Some(icmp) = nat::build_icmp_reassembly_timeout(orig) {
+                        self.tx_out.push(icmp);
+                    }
+                }
+            }
+            // 重叠/冲突/非法：**纯计数不记行**（可被对端逐包诱发——自我放大；已登记）
+            DropReason::Overlap | DropReason::Bad => {}
+        }
+    }
+
+    /// 超限日志（节流：首行 + 每 100 次一条；键 = 纯 kind——**src 只进行文不进键**）。
+    fn log_frag_limit(&mut self, src: Ipv4Addr) {
+        let ctxs = self.reasm.len();
+        let per = self.reasm.count_src(src);
+        let (log, seen) = {
+            let e = &mut self.frag_limit_seen;
+            e.0 += 1;
+            let log = !e.1 || e.0.is_multiple_of(100);
+            e.1 = true;
+            (log, e.0)
+        };
+        if log {
+            (self.cfg.logf)(&format!(
+                "intercept: 分片重组超上限（上下文 {ctxs}/{}，源 {src} {per}/{}）——新报文暂不可重组（累计丢 {seen} 片）",
+                reasm::REASM_MAX_CTX,
+                reasm::REASM_MAX_PER_SRC,
+            ));
+        }
+    }
+
+    /// 超时日志（节流同款；`secs` = 超时窗，供排障直接读）。
+    fn log_frag_timeout(&mut self, packets: u64) {
+        let (log, seen) = {
+            let e = &mut self.frag_timeout_seen;
+            e.0 += 1;
+            let log = !e.1 || e.0.is_multiple_of(100);
+            e.1 = true;
+            (log, e.0)
+        };
+        if log {
+            (self.cfg.logf)(&format!(
+                "intercept: 分片重组超时（{packets} 片，{}s）——整条丢弃（累计 {seen}）",
+                reasm::REASM_TIMEOUT.as_secs(),
+            ));
+        }
+    }
+
+    /// 重组超时清扫（F1.5）：`pump`/`pump_hold` **每拍开头**各一次（上下文 ≤64 ⇒ 线性
+    /// 扫可忽略）+ TX 分片表的 TTL/上限兜底。`close()` 走 `reasm.clear()`（静默）。
+    fn sweep_reasm(&mut self, now: Instant) {
+        for d in self.reasm.sweep(now) {
+            self.note_frag_drop(d);
+        }
+        self.sweep_tx_frag(now);
+    }
+
+    /// TX 分片表清扫（F5-d）：TTL（首片丢失时兜底）+ 上限（淘汰最老）。正常态表内 ≤1 项。
+    fn sweep_tx_frag(&mut self, now: Instant) {
+        self.tx_frag
+            .retain(|_, v| now.duration_since(v.created) < TX_FRAG_TTL);
+        while self.tx_frag.len() > TX_FRAG_MAX {
+            if !self.evict_oldest_tx_frag() {
+                break;
+            }
+        }
+    }
+
+    /// 淘汰最老的 TX 分片表项（返回是否真淘汰）。
+    fn evict_oldest_tx_frag(&mut self) -> bool {
+        let oldest = self.tx_frag.iter().min_by_key(|(_, v)| v.created).map(|(k, _)| *k);
+        match oldest {
+            Some(k) => {
+                self.tx_frag.remove(&k);
+                true
+            }
+            None => false,
+        }
+    }
+
     /// RX：WG decap 出的明文包（源校验已过）。
+    ///
+    /// Q-K F1：分片语义的**唯一入口**——只解 IP 头（`Ipv4FragHdr`，不碰 L4）：
+    /// - 畸形 ⇒ 静默丢（现状口径）；
+    /// - 非分片（含 DF-only） ⇒ [`Self::route_plain`]（与现状逐字节同路径）；
+    /// - 分片 ⇒ 有界重组；**完成**的整包**走同一个** `route_plain`（结构上不存在
+    ///   「分片旁路」）；未完成/被丢弃 ⇒ 只碰 `self.reasm` 与计数。
+    ///
+    /// Q-B F7 的性质在此**保持**：分片自身绝不进入 demux / `by_five` / 建流——建流
+    /// 唯一入口仍是 `route_plain` 的 `tcp_new`/`udp_new`。
     pub fn on_plain(&mut self, pkt: Vec<u8>) {
+        let Some(frag) = nat::Ipv4FragHdr::parse(&pkt) else {
+            return; // 畸形：静默丢（IP 层）
+        };
+        if !frag.hdr.is_fragment() {
+            self.route_plain(pkt);
+            return;
+        }
+        let res = self.reasm.push(frag, Instant::now());
+        for d in res.dropped {
+            self.note_frag_drop(d);
+        }
+        if let Some(full) = res.done {
+            self.stats.incr_frag_reasm();
+            self.route_plain(full);
+        }
+    }
+
+    /// `on_plain` 的另一半：原 `on_plain` 的 parse 之后**全部逻辑**（demux → `by_five`
+    /// → `rewrite_dst` → 新建）——**唯一投递入口**（正常包与重组完成的整包同路）。
+    fn route_plain(&mut self, pkt: Vec<u8>) {
         let Some(v) = Ipv4View::parse(&pkt) else {
             return; // 畸形：静默丢（IP 层）
         };
-        // F7：分片（非首片 `frag_off>0` 或 MF 置位）**在 demux 与 by_five 查表之前**丢弃。
-        // 分片与正常包共享五元组——若落在查表之后，非首片会被当独立会话（`body[0..4]`
-        // 被读成端口）、首片被 `rewrite_dst` 污染分片载荷。丢弃即拒绝 Go/gVisor 会重组的
-        // 形态（行为差异登记）；DF-only（off=0、MF=0）不算分片。
-        if v.is_fragment() {
-            self.stats.incr_frag_drop();
-            return;
-        }
+        // F7 分支已上移到 `on_plain` 的 `Ipv4FragHdr` 门（唯一分片判定点）。此断言是
+        // **绊线**（测试期暴露不一致，release 无行为）：两处读的是同一对字节
+        // `pkt[6..8]`、判定式同为 `off != 0 || mf`。
+        debug_assert!(!v.is_fragment(), "route_plain 收到分片（分片门在 on_plain）");
         let l4_off = if v.proto == 6 {
             20
         } else if v.proto == 17 {
@@ -1543,6 +1731,8 @@ impl Interceptor {
     /// 驱动拍：reactor 就绪处理 → DNS 应答回投 → 栈 poll → TX 反重写 → idle/水位 →
     /// DNS 面服务 → 返回出站明文包（引擎 encap）。
     pub fn pump(&mut self) -> Vec<Vec<u8>> {
+        // ⓪ 分片超时清扫（F1.5：每拍开头；本拍起的重组判定看到的是已回收的槽位状态）
+        self.sweep_reasm(Instant::now());
         // ① reactor 拍（upstream fd：Retry 重拨/读/写续传/connect 验收/EOF）
         self.reactor_turn();
         // ①' DNS 应答回投（DnsProxy worker 异步产出；H3——驱动线程只做路由写回）
@@ -1583,6 +1773,8 @@ impl Interceptor {
     /// 发送 ring 的满丢成为最后兜底。整形关臂（无 FIFO）保持直通——该臂满丢
     /// 即唯一兜底（消融态接受）。
     pub fn pump_hold(&mut self) -> Vec<Vec<u8>> {
+        // ⓪ 分片清扫（与 pump 同拍序）
+        self.sweep_reasm(Instant::now());
         // ① reactor 拍
         self.reactor_turn();
         self.drain_dns();
@@ -1895,10 +2087,49 @@ impl Interceptor {
         }
     }
 
+    /// TX：出口包反重写（Q-K F5-d 起**分片感知**）。
+    ///
+    /// 三分支（设计 §2-F5-d）：
+    /// - **非分片**（`off == 0 && !mf`）⇒ 现状逐字节不变（`by_rw_port` 查找 +
+    ///   `rewrite_src` 全量重算）；
+    /// - **首片**（`off == 0 && mf`）⇒ 现行查找；命中则改 IP 源 + UDP 源端口，L4 校验和
+    ///   用 **RFC 1624 增量更新**（整报文载荷不在本片内——不能全量重算）；随后登记
+    ///   TX 分片表；未命中（真 listener 应答）⇒ 不改写、同样登记（值 = 不重写）；
+    /// - **非首片**（`off > 0`）⇒ **只改 IP 源 + IP 校验和**（L4 头不在此片）；源地址取值
+    ///   查 TX 分片表（同报文全部分片必须携带**同一个**改写后 IP 源，否则客户端重组键
+    ///   分裂）。**表未命中 ⇒ 丢片 + 计数**（首片既丢，报文本就无法重组；继续发只会占
+    ///   客户端重组槽——丢片比发坏片干净）。
+    ///
+    /// 修复的缺陷（设计门【高-1】）：修复前无分片门 ⇒ 首片被 `fix_l4_checksum` 按
+    /// **首片长度**重算覆盖（校验和坏 ⇒ 客户端静默丢）；非首片的 `src_port` 是载荷
+    /// 垃圾、命中流表时会把 IP 源改成**另一条流的原始目的**（重组键分裂 + 载荷前
+    /// 2 字节被改写）。
     fn on_tx(&mut self, mut pkt: Vec<u8>) {
-        let Some(v) = Ipv4View::parse(&pkt) else {
+        // 头解析先取**副本**（`Ipv4FragHdr` 是 Copy）——随后要可变借用整包做重写。
+        let hdr = nat::Ipv4FragHdr::parse(&pkt).map(|f| f.hdr);
+        let keep = match hdr {
+            None => true,
+            Some(h) if !h.is_fragment() => {
+                self.tx_rewrite_whole(&mut pkt);
+                true
+            }
+            Some(h) if h.frag_off == 0 => {
+                self.tx_rewrite_first_frag(&mut pkt, &h);
+                true
+            }
+            // 非首片：表未命中 ⇒ 丢片（不发坏片）
+            Some(h) => self.tx_rewrite_later_frag(&mut pkt, &h),
+        };
+        if keep {
             self.tx_out.push(pkt);
-            return;
+        }
+    }
+
+    /// 非分片（含 `Ipv4FragHdr` 通过但 `Ipv4View` 不可解的形态——**与修复前逐字节
+    /// 同行为**：parse 失败原样 push）。
+    fn tx_rewrite_whole(&mut self, pkt: &mut [u8]) {
+        let Some(v) = Ipv4View::parse(pkt) else {
+            return; // 调用方照原样 push（现状口径）
         };
         // 反重写：src=(隧道IP, rw_port) 命中 → src=(orig_dst)；真 listener 应答不重写
         if v.src == self.cfg.tunnel_ip && self.by_rw_port.contains_key(&v.src_port) {
@@ -1909,11 +2140,63 @@ impl Interceptor {
                         f.obs.note_tx_seg(&v);
                     }
                     let (ip, port) = f.orig_dst;
-                    nat::rewrite_src(&mut pkt, ip, port);
+                    nat::rewrite_src(pkt, ip, port);
                 }
             }
         }
-        self.tx_out.push(pkt);
+    }
+
+    /// 分片首片：反重写（IP 源 + UDP 源端口 + RFC 1624 增量校验和）+ 登记 TX 分片表。
+    /// 仅 `proto == 17` 触发重写（TCP 永不触发——MSS 由 MTU 推导，R8；ICMP 等无
+    /// 流可命中）；未命中/未重写一律登记 `orig = None`（后续片按「不重写」直通，
+    /// 不丢片）。
+    fn tx_rewrite_first_frag(&mut self, pkt: &mut [u8], hdr: &nat::Ipv4FragHdr) {
+        let mut orig = None;
+        if hdr.proto == 17 {
+            if let Some(v) = Ipv4View::parse(pkt) {
+                if v.src == self.cfg.tunnel_ip && v.proto == 17 {
+                    if let Some(&flow) = self.by_rw_port.get(&v.src_port) {
+                        if let Some(f) = self.flows.get(&flow) {
+                            let (ip, port) = f.orig_dst;
+                            nat::rewrite_src_first_fragment(pkt, ip, port);
+                            orig = Some((ip, port));
+                        }
+                    }
+                }
+            }
+        }
+        let key = (hdr.dst, hdr.ident, hdr.proto);
+        if !self.tx_frag.contains_key(&key) && self.tx_frag.len() >= TX_FRAG_MAX {
+            // 上限兜底（正常态 ≤1 项；淘汰最老——不拒新）。**先清 TTL、再淘汰到
+            // < 上限**（为本次 insert 留位——否则 insert 后瞬时可达 上限+1）。
+            self.sweep_tx_frag(Instant::now());
+            while self.tx_frag.len() >= TX_FRAG_MAX {
+                if !self.evict_oldest_tx_frag() {
+                    break;
+                }
+            }
+        }
+        self.tx_frag.insert(key, TxFragVal { orig, created: Instant::now() });
+    }
+
+    /// 分片非首片：**只改 IP 源 + IP 校验和**（L4 头不在此片——不碰端口、不碰 L4
+    /// 校验和：整报文校验和已由首片的增量更新改好，本片只贡献载荷字节）。返回
+    /// `false` = 表未命中（丢片 + 计数）。
+    fn tx_rewrite_later_frag(&mut self, pkt: &mut [u8], hdr: &nat::Ipv4FragHdr) -> bool {
+        let key = (hdr.dst, hdr.ident, hdr.proto);
+        let Some(val) = self.tx_frag.get(&key) else {
+            self.stats.incr_tx_frag_drop();
+            return false;
+        };
+        if let Some((ip, _port)) = val.orig {
+            pkt[12..16].copy_from_slice(&ip.octets());
+            nat::fix_ip_checksum(pkt);
+        }
+        if !hdr.mf {
+            // 末片：精确回收（该报文最后一片——不再有后续片需要表项）
+            self.tx_frag.remove(&key);
+        }
+        true
     }
 
     /// reactor 一拍（reactor-design §一/§二）：Retry 重拨 → 建兴趣集 → poll(0) →
@@ -2868,6 +3151,10 @@ impl Interceptor {
         for flow in flows {
             self.teardown_flow(flow);
         }
+        // Q-K F1.5：重组上下文与 TX 分片表整体清空（**静默**——收工面不发 ICMP、
+        // 不计入 fragDrop/fragTimeout）。
+        self.reasm.clear();
+        self.tx_frag.clear();
         if let Some(faces) = self.dns_faces.as_mut() {
             faces.close_all(&mut self.sockets);
         }
@@ -4832,31 +5119,41 @@ mod tests {
         assert_eq!(snap_of(&stats, "shapeDrop"), (80 - kept.len()) as u64, "短包不计数");
     }
 
-    /// F7：分片（MF/非首片）在 parse 后、会话查表前丢弃+计数；DF-only 不误判（照常处理）。
+    /// Q-K T18/T20：分片**不建会话**（F7 性质保持）+ DF-only 不误判。
+    /// 分片现在进重组器（不丢、不计数），但绝不落 `by_five`/`flows`。
     #[test]
-    fn fragment_packet_dropped_no_session() {
+    fn fragments_never_touch_flow_table() {
         let tunnel = Ipv4Addr::new(100, 64, 255, 1);
         let stats = Arc::new(Stats::default());
         let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::clone(&stats));
-        let mk = || nat::build_udp(Ipv4Addr::new(100, 64, 10, 1), 50000, tunnel, 47999, b"frag");
-        // MF 首片
+        let mk = || nat::build_udp(Ipv4Addr::new(100, 64, 10, 1), 50000, tunnel, 47999, &[0u8; 8]);
+        // MF 首片（body 16B = 8 的倍数 ⇒ 合法非末片）⇒ 进重组器（不建会话、不算丢弃）
         let mut p = mk();
         p[6] = 0x20;
         itc.on_plain(p);
-        assert_eq!(snap_of(&stats, "fragDrop"), 1, "MF 首片丢弃计数");
         assert_eq!(itc.flow_count(), 0, "分片不建会话");
-        // 非首片
+        assert_eq!(snap_of(&stats, "fragDrop"), 0, "未完成的片不是丢弃");
+        assert_eq!(itc.reasm.len(), 1, "首片进重组器");
+        // 非首片（同键）⇒ 仍不建会话
         let mut p2 = mk();
-        p2[7] = 0x08;
+        p2[6] = 0x20;
+        p2[7] = 0x02; // off = 16 字节（同键的次片）
         itc.on_plain(p2);
-        assert_eq!(snap_of(&stats, "fragDrop"), 2, "非首片丢弃计数");
         assert_eq!(itc.flow_count(), 0, "非首片不建会话");
+        assert_eq!(itc.reasm.len(), 1, "同键进同一上下文");
         // DF-only 不误判（照常处理——豁免到回环端口，不出网）
         let mut p3 = mk();
         p3[6] = 0x40;
         itc.on_plain(p3);
-        assert_eq!(snap_of(&stats, "fragDrop"), 2, "DF-only 不计数");
-        assert!(itc.flow_count() >= 1, "DF-only 照常处理");
+        assert_eq!(snap_of(&stats, "fragDrop"), 0, "DF-only 不计数");
+        assert_eq!(itc.reasm.len(), 1, "DF-only 不进重组器");
+        // 非末片但片长非 8 倍数（9 字节 body、MF=1）⇒ 非法 ⇒ 丢弃该片并清上下文
+        let mut p4 = nat::build_udp(Ipv4Addr::new(100, 64, 10, 1), 50000, tunnel, 47999, &[0u8; 1]);
+        p4[6] = 0x20; // MF=1 且片载荷 9 字节（非 8 倍）——RFC 791 §3.1 违规
+        itc.on_plain(p4);
+        assert_eq!(itc.reasm.len(), 0, "非法片清掉整条上下文");
+        assert_eq!(snap_of(&stats, "fragBad"), 3, "非法片连带已收 2 片（1 + 2）");
+        assert_eq!(snap_of(&stats, "fragDrop"), 3, "恒等式：fragDrop = fragBad");
     }
 
     /// F9：非 TCP/UDP 协议（ICMP 等）不再当 UDP 建端口 0 会话——丢弃、不产 dialfail 噪声。
@@ -5297,10 +5594,10 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// F7（[门-B6] 计划②）：**已有流存在**时喂同五元组的 MF 首片 → 仍被丢弃（不重写、
-    /// 不注入）——证明分片判定落在 `by_five` 查表之前。
+    /// Q-B F7（[门-B6] 计划②）性质保持（Q-K 复审）：**已有流存在**时喂同五元组的 MF
+    /// 首片 → 仍不得注入既有流（进重组器、不碰 flow 表）。
     #[test]
-    fn fragment_dropped_even_with_existing_flow() {
+    fn fragment_never_injected_into_existing_flow() {
         let echo = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
         let port = echo.local_addr().unwrap().port();
         let echo_thread = std::thread::spawn(move || {
@@ -5321,13 +5618,655 @@ mod tests {
         let flows_before = itc.flow_count();
         assert!(flows_before >= 1, "正常包建会话");
         let frag_before = snap_of(&stats, "fragDrop");
-        // 同五元组的 MF 首片 → 丢弃（不得注入既有流）
-        let mut frag = nat::build_udp(client, src_port, dst, port, b"frag");
+        // 同五元组的 MF 首片 → 进重组器（不注入既有流、不建新流、不计数）
+        let mut frag = nat::build_udp(client, src_port, dst, port, &[0u8; 8]);
         frag[6] = 0x20;
         itc.on_plain(frag);
-        assert_eq!(snap_of(&stats, "fragDrop"), frag_before + 1, "分片被丢弃");
+        assert_eq!(snap_of(&stats, "fragDrop"), frag_before, "入重组器不计数");
         assert_eq!(itc.flow_count(), flows_before, "既有流不受影响（无新会话/无注入）");
+        assert_eq!(itc.reasm.len(), 1, "进重组器");
         drop(echo_thread);
+    }
+
+    // ---------- Q-K 批（F1 重组 / F2 计数 / F4 ICMP / F5-d TX 分片）回归面 ----------
+
+    /// 把一整包手工切成两片（首片 `first_body` 字节、MF=1；末片 MF=0）。
+    /// `first_body` 必须是 8 的倍数且小于 body 长（RFC 791 §3.1）。
+    fn split_in_two(full: &[u8], first_body: usize) -> (Vec<u8>, Vec<u8>) {
+        let ihl = (full[0] & 0x0f) as usize * 4;
+        let ident = u16::from_be_bytes([full[4], full[5]]);
+        let total = u16::from_be_bytes([full[2], full[3]]) as usize;
+        let body = &full[ihl..total];
+        let mk = |off: usize, data: &[u8], mf: bool| -> Vec<u8> {
+            let mut p = full[..ihl].to_vec();
+            p[4..6].copy_from_slice(&ident.to_be_bytes());
+            p[2..4].copy_from_slice(&((ihl + data.len()) as u16).to_be_bytes());
+            let flags = if mf { 0x2000u16 } else { 0 } | ((off / 8) as u16);
+            p[6..8].copy_from_slice(&flags.to_be_bytes());
+            p.extend_from_slice(data);
+            nat::fix_ip_checksum(&mut p);
+            p
+        };
+        (
+            mk(0, &body[..first_body], true),
+            mk(first_body, &body[first_body..], false),
+        )
+    }
+
+    /// 16 位字折叠和（校验和自洽断言：整段折叠 == 0xFFFF）。
+    fn sum16(data: &[u8]) -> u32 {
+        let mut sum = 0u32;
+        let mut i = 0;
+        while i + 1 < data.len() {
+            sum += u16::from_be_bytes([data[i], data[i + 1]]) as u32;
+            i += 2;
+        }
+        if i < data.len() {
+            sum += (data[i] as u32) << 8;
+        }
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        sum
+    }
+
+    /// 客户端栈上的 UDP socket（测试面）。
+    fn client_udp_socket(client: &mut StackB, port: u16) -> SocketHandle {
+        use smoltcp::socket::udp;
+        let sock = udp::Socket::new(
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 64 * 1024]),
+            udp::PacketBuffer::new(vec![udp::PacketMetadata::EMPTY; 8], vec![0u8; 64 * 1024]),
+        );
+        let h = client.sockets.add(sock);
+        client
+            .sockets
+            .get_mut::<udp::Socket>(h)
+            .bind(IpEndpoint::new(client.tunnel_ip.into(), port))
+            .unwrap();
+        h
+    }
+
+    /// 造一条 transit UDP 会话（TX 侧测试用）：rw_port 由分配器给（首个 = 20000）。
+    fn make_udp_flow(
+        itc: &mut Interceptor,
+        client: Ipv4Addr,
+        client_port: u16,
+        orig: (Ipv4Addr, u16),
+    ) -> u64 {
+        let v = View5 {
+            src: client,
+            src_port: client_port,
+            dst: orig.0,
+            dst_port: orig.1,
+            proto: 17,
+            tcp_flags: 0,
+            tcp_seq: 0,
+            tcp_ack: 0,
+            udp_payload: (28, 28),
+        };
+        let flow = itc.alloc_flow(&v, Kind::Transit, Proto::Udp, vec![]);
+        itc.ensure_udp_socket(flow);
+        flow
+    }
+
+    /// 泵到某报文的分片全部出完（smoltcp 的 `Fragmenter` 单缓冲：剩余片在后续 poll
+    /// 续发），返回沿途产出的全部分片包。
+    fn pump_all_fragments(itc: &mut Interceptor) -> Vec<Vec<u8>> {
+        let mut out: Vec<Vec<u8>> = Vec::new();
+        for _ in 0..64 {
+            for p in itc.pump() {
+                if nat::Ipv4FragHdr::parse(&p).is_some_and(|f| f.hdr.is_fragment()) {
+                    out.push(p);
+                }
+            }
+            if out
+                .iter()
+                .any(|p| nat::Ipv4FragHdr::parse(p).is_some_and(|f| !f.hdr.mf))
+            {
+                break;
+            }
+        }
+        out
+    }
+
+    /// T1/T19/T24/T37（端到端）：客户端 1300B → 真分片 → 出口**重组** → 过境拨号（原目的
+    /// 端口）→ 回环 echo 原样回显 → 出口 TX 真分片（F5-a）+ 反重写（F5-d）→ 客户端重组收全。
+    #[test]
+    fn large_udp_roundtrip_both_directions() {
+        let echo = std::net::UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let port = echo.local_addr().unwrap().port();
+        let (tx_seen, rx_seen) = std::sync::mpsc::channel::<usize>();
+        let echo_thread = std::thread::spawn(move || {
+            let mut buf = vec![0u8; 65536];
+            while let Ok((n, from)) = echo.recv_from(&mut buf) {
+                let _ = tx_seen.send(n);
+                if echo.send_to(&buf[..n], from).is_err() {
+                    break;
+                }
+            }
+        });
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let stats = Arc::new(Stats::default());
+        let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::clone(&stats));
+        let mut client = StackB::new(
+            Ipv4Addr::new(100, 64, 10, 61),
+            tunnel,
+            SmolInstant::from_millis(0),
+        );
+        let h = client_udp_socket(&mut client, 46000);
+        let payload: Vec<u8> = (0..1300u32).map(|i| (i % 251) as u8).collect();
+        client
+            .sockets
+            .get_mut::<smoltcp::socket::udp::Socket>(h)
+            .send_slice(
+                &payload,
+                IpEndpoint::new(Ipv4Addr::LOCALHOST.into(), port),
+            )
+            .unwrap();
+        let mut tick = 0i64;
+        let mut max_client_frags = 0usize;
+        let mut tx_frag_pkts = 0usize;
+        let mut got: Option<Vec<u8>> = None;
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            tick += 5;
+            let t = SmolInstant::from_millis(tick);
+            client.iface.poll(t, &mut client.device, &mut client.sockets);
+            let mut out = Vec::new();
+            client.device.drain_tx(&mut out);
+            max_client_frags = max_client_frags.max(out.len());
+            for p in out {
+                itc.on_plain(p);
+            }
+            for p in itc.pump() {
+                if nat::Ipv4FragHdr::parse(&p).is_some_and(|f| f.hdr.is_fragment()) {
+                    tx_frag_pkts += 1;
+                }
+                client.inject(&p);
+            }
+            let mut buf = vec![0u8; 65536];
+            let n = client
+                .sockets
+                .get_mut::<smoltcp::socket::udp::Socket>(h)
+                .recv_slice(&mut buf)
+                .map(|(n, _)| n)
+                .unwrap_or(0);
+            if n > 0 {
+                got = Some(buf[..n].to_vec());
+            }
+            if got.is_some() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(got.as_deref(), Some(&payload[..]), "1300B 大 UDP 双向逐字节往返");
+        assert_eq!(
+            rx_seen.recv_timeout(Duration::from_secs(2)).unwrap_or(0),
+            1300,
+            "上游收到原长度（过境拨号到原目的端口 = rewrite_dst 生效）"
+        );
+        assert!(
+            max_client_frags >= 2,
+            "客户端 >1252 载荷真分片（R4 回归：得 {max_client_frags}）"
+        );
+        assert!(tx_frag_pkts >= 2, "出口 TX 大回复真分片（F5-a；得 {tx_frag_pkts}）");
+        assert_eq!(snap_of(&stats, "fragReasm"), 1, "出口 RX 重组成功交付 1 报文");
+        assert_eq!(snap_of(&stats, "fragDrop"), 0, "无分片丢弃");
+        assert_eq!(snap_of(&stats, "txFragDrop"), 0, "TX 无丢片（表命中）");
+        drop(echo_thread);
+    }
+
+    /// T21：TCP 分片（SYN 切成两片）⇒ 重组后照常建流（协议无关重组，对齐 Go）。
+    #[test]
+    fn reasm_tcp_fragments_deliver() {
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let accepted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let acc2 = Arc::clone(&accepted);
+        let t = std::thread::spawn(move || {
+            if let Ok((mut c, _)) = listener.accept() {
+                acc2.store(true, Ordering::SeqCst);
+                let _ = c.write_all(b"ok");
+            }
+        });
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let stats = Arc::new(Stats::default());
+        let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::clone(&stats));
+        let syn = nat::build_tcp_syn(
+            Ipv4Addr::new(100, 64, 10, 62),
+            40000,
+            Ipv4Addr::LOCALHOST,
+            port,
+            1234,
+        );
+        // 44B 总长（IP20 + TCP24）⇒ body 24B：首片 16B（不足 TCP 头 20B——正因如此
+        // 分片判定不得依赖 L4 可解析性）、次片 8B。
+        let (f0, f1) = split_in_two(&syn, 16);
+        itc.on_plain(f1); // 乱序：末片先到
+        itc.on_plain(f0);
+        assert_eq!(snap_of(&stats, "fragReasm"), 1, "重组交付 1 报文");
+        assert_eq!(itc.flow_count(), 1, "重组后建流（走 route_plain 同一路径）");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline && !accepted.load(Ordering::SeqCst) {
+            for _ in itc.pump() {}
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(accepted.load(Ordering::SeqCst), "上游收到拨号（transit 过境）");
+        let _ = t.join();
+    }
+
+    /// T22：超时且首片在位 ⇒ `tx_out` 出 ICMP type 11 code 1（载荷 = 首片头 + 8B、
+    /// src/dst 反转、双校验和自洽）。
+    #[test]
+    fn icmp_time_exceeded_on_timeout() {
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let stats = Arc::new(Stats::default());
+        let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::clone(&stats));
+        let udp = nat::build_udp(
+            Ipv4Addr::new(100, 64, 10, 63),
+            41000,
+            Ipv4Addr::new(8, 8, 8, 8),
+            4444,
+            &vec![0u8; 1256],
+        );
+        let (f0, _f1) = split_in_two(&udp, 1256);
+        let f0_ref = f0.clone();
+        itc.on_plain(f0);
+        assert!(itc.tx_out.is_empty(), "未超时不产 ICMP");
+        itc.sweep_reasm(Instant::now() + Duration::from_secs(31));
+        assert_eq!(snap_of(&stats, "fragTimeout"), 1);
+        assert_eq!(snap_of(&stats, "fragDrop"), 1, "恒等式左侧同步");
+        assert_eq!(snap_of(&stats, "fragBad") + snap_of(&stats, "fragLimit") + snap_of(&stats, "fragOverlap"), 0);
+        let icmp = itc.tx_out.pop().expect("超时 ⇒ 产 ICMP");
+        assert_eq!((icmp[20], icmp[21]), (11, 1), "type 11 code 1");
+        assert_eq!(&icmp[12..16], &[8, 8, 8, 8], "src = 首片目的");
+        assert_eq!(&icmp[16..20], &[100, 64, 10, 63], "dst = 首片源");
+        assert_eq!(&icmp[28..48], &f0_ref[..20], "载荷 = 首片 IP 头");
+        assert_eq!(&icmp[48..56], &f0_ref[20..28], "载荷 = 前 8 字节");
+        assert_eq!(sum16(&icmp[..20]), 0xFFFF, "IP 校验和自洽");
+        assert_eq!(sum16(&icmp[20..]), 0xFFFF, "ICMP 校验和自洽");
+        assert!(itc.tx_out.is_empty());
+    }
+
+    /// T23：无首片 ⇒ 不产 ICMP（对齐 gVisor `if pkt != nil`）；T24：抑制集三态。
+    #[test]
+    fn icmp_not_sent_without_first_fragment_or_suppressed() {
+        // ① 无首片
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let stats = Arc::new(Stats::default());
+        let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::clone(&stats));
+        let udp = nat::build_udp(
+            Ipv4Addr::new(100, 64, 10, 64),
+            41001,
+            Ipv4Addr::new(8, 8, 8, 8),
+            4444,
+            &vec![0u8; 1256],
+        );
+        let (_f0, f1) = split_in_two(&udp, 1256);
+        itc.on_plain(f1);
+        itc.sweep_reasm(Instant::now() + Duration::from_secs(31));
+        assert_eq!(snap_of(&stats, "fragTimeout"), 1);
+        assert!(itc.tx_out.is_empty(), "无首片不发 ICMP");
+        // ② 抑制集：源 0.0.0.0 / 目的组播 / 目的 255.255.255.255
+        for (name, patch) in [
+            ("src=0.0.0.0", 0u8),
+            ("dst=224.0.0.1", 1),
+            ("dst=255.255.255.255", 2),
+        ] {
+            let mut p = udp.clone();
+            match patch {
+                0 => p[12..16].copy_from_slice(&[0, 0, 0, 0]),
+                1 => p[16..20].copy_from_slice(&[224, 0, 0, 1]),
+                _ => p[16..20].copy_from_slice(&[255, 255, 255, 255]),
+            }
+            nat::fix_ip_checksum(&mut p);
+            let (f0, _) = split_in_two(&p, 1256);
+            let stats2 = Arc::new(Stats::default());
+            let mut itc2 = Interceptor::attach(cfg_base(tunnel), Arc::clone(&stats2));
+            itc2.on_plain(f0);
+            itc2.sweep_reasm(Instant::now() + Duration::from_secs(31));
+            assert_eq!(snap_of(&stats2, "fragTimeout"), 1, "{name}：仍计数");
+            assert!(itc2.tx_out.is_empty(), "{name}：不发 ICMP（抑制集）");
+        }
+    }
+
+    /// T25：内核无 proto 门——TCP 分片超时也发 11/1；薄封装 type3/code3 仍只对 UDP。
+    #[test]
+    fn icmp_covers_non_udp_proto() {
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let stats = Arc::new(Stats::default());
+        let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::clone(&stats));
+        let syn = nat::build_tcp_syn(
+            Ipv4Addr::new(100, 64, 10, 65),
+            40001,
+            Ipv4Addr::new(93, 184, 216, 34),
+            443,
+            7,
+        );
+        let (f0, _f1) = split_in_two(&syn, 16);
+        itc.on_plain(f0);
+        itc.sweep_reasm(Instant::now() + Duration::from_secs(31));
+        let icmp = itc.tx_out.pop().expect("TCP 分片超时也发（内核无 proto 门）");
+        assert_eq!((icmp[20], icmp[21]), (11, 1));
+        assert_eq!(&icmp[12..16], &[93, 184, 216, 34]);
+        assert!(nat::build_icmp_unreachable(&syn).is_none(), "type3/code3 仍只对 UDP");
+    }
+
+    /// T26：`snapshot()` 长度 15、既有键索引 `[0..=8]` 不变；**恒等式**
+    /// `fragDrop == fragBad + fragLimit + fragTimeout + fragOverlap`。
+    #[test]
+    fn stats_snapshot_shape_and_frag_identity() {
+        let s = Stats::default();
+        let snap = s.snapshot();
+        assert_eq!(snap.len(), 15, "数组 9 → 15（追加末位）");
+        assert_eq!(
+            snap[..9].iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec![
+                "dialok", "dialfail", "flows", "rejected", "udpReplied", "udpNoReply", "udpDrop",
+                "shapeDrop", "fragDrop"
+            ],
+            "既有索引语义不变"
+        );
+        assert_eq!(
+            snap[9..].iter().map(|(n, _)| *n).collect::<Vec<_>>(),
+            vec!["fragReasm", "fragBad", "fragOverlap", "fragTimeout", "fragLimit", "txFragDrop"]
+        );
+        s.note_frag_drop(DropReason::Bad, 2);
+        s.note_frag_drop(DropReason::Overlap, 3);
+        s.note_frag_drop(DropReason::Timeout, 1);
+        s.note_frag_drop(DropReason::Limit, 4);
+        s.incr_frag_reasm();
+        s.incr_tx_frag_drop();
+        let snap = s.snapshot();
+        let of = |k: &str| snap.iter().find(|(n, _)| *n == k).unwrap().1;
+        assert_eq!(of("fragDrop"), 10);
+        assert_eq!(
+            of("fragDrop"),
+            of("fragBad") + of("fragLimit") + of("fragTimeout") + of("fragOverlap"),
+            "恒等式"
+        );
+        assert_eq!((of("fragReasm"), of("txFragDrop")), (1, 1));
+    }
+
+    /// T28/T29（真分片）：出口 TX 生成的真分片——IP 源全片一致 = 原目的；重组后的
+    /// UDP 校验和 == **独立全量重算**路径（`rewrite_src`）的值。
+    #[test]
+    fn tx_frag_incremental_checksum_matches_full_recompute() {
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let client = Ipv4Addr::new(100, 64, 10, 71);
+        let stats = Arc::new(Stats::default());
+        let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::clone(&stats));
+        let orig = (Ipv4Addr::new(93, 184, 216, 34), 443);
+        let flow = make_udp_flow(&mut itc, client, 47000, orig);
+        let rw = itc.flows[&flow].rw_port;
+        let payload: Vec<u8> = (0..3000u32).map(|i| (i % 199) as u8).collect();
+        itc.udp_send_to_client(flow, &payload);
+        let frs = pump_all_fragments(&mut itc);
+        assert!(frs.len() >= 3, "3000B ⇒ ≥3 片（得 {}）", frs.len());
+        for p in &frs {
+            let f = nat::Ipv4FragHdr::parse(p).unwrap();
+            assert_eq!(f.hdr.src, orig.0, "全片 IP 源一致 = 原目的（否则客户端重组键分裂）");
+            assert_eq!(f.hdr.dst, client);
+        }
+        // 真分片重组 → 校验和
+        let mut r = reasm::Reassembler::new();
+        let mut full = None;
+        for p in &frs {
+            let f = nat::Ipv4FragHdr::parse(p).unwrap();
+            if let Some(done) = r.push(f, Instant::now()).done {
+                full = Some(done);
+            }
+        }
+        let full = full.expect("真分片应能重组（含乱序/顺序两态）");
+        assert_eq!(&full[28..28 + payload.len()], &payload[..], "载荷逐字节");
+        // UDP 校验和自洽（伪头 + 段折叠 == 0xFFFF）
+        let l4 = &full[20..];
+        let pseudo = [
+            full[12], full[13], full[14], full[15], full[16], full[17], full[18], full[19], 0, 17,
+            (l4.len() >> 8) as u8,
+            l4.len() as u8,
+        ];
+        let mut sum = sum16(&pseudo);
+        sum += sum16(l4);
+        while sum >> 16 != 0 {
+            sum = (sum & 0xffff) + (sum >> 16);
+        }
+        assert_eq!(sum, 0xFFFF, "重组包 UDP 校验和自洽（RFC 1624 增量更新正确）");
+        // 独立对照：同一载荷的未分片包走全量重算路径，校验和应逐字节相等
+        let mut ref_pkt = nat::build_udp(tunnel, rw, client, 47000, &payload);
+        nat::rewrite_src(&mut ref_pkt, orig.0, orig.1);
+        assert_eq!(&full[26..28], &ref_pkt[26..28], "增量 == 全量重算");
+        assert_eq!(sum16(&ref_pkt[..20]), 0xFFFF);
+        assert_eq!(snap_of(&stats, "txFragDrop"), 0, "表命中：零丢片");
+        assert!(itc.tx_frag.is_empty(), "末片精确回收");
+    }
+
+    /// T30/T31：非首片**只改 IP 源 + IP 校验和**（载荷逐字节不变、L4 校验和字段不动），
+    /// 且载荷前 2 字节即使**恰好等于在册 rw_port** 也不得触发误改写（走表路径）。
+    #[test]
+    fn tx_non_first_fragment_touches_only_ip_source() {
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let client = Ipv4Addr::new(100, 64, 10, 72);
+        let stats = Arc::new(Stats::default());
+        let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::clone(&stats));
+        let orig = (Ipv4Addr::new(1, 2, 3, 4), 999);
+        let flow = make_udp_flow(&mut itc, client, 47001, orig);
+        let rw = itc.flows[&flow].rw_port;
+        assert_eq!(rw, 20000, "首个 rw_port（分配器起点）");
+        // 非首片（末片）：off = 8、16 字节载荷，**前 2 字节 = 在册 rw_port**（若走
+        // by_rw_port 查表就会误改写成另一个流的原始目的 + 改写载荷——R15-2 的形态）
+        let mut frag = nat::build_udp(tunnel, rw, client, 47001, &[0u8; 16]);
+        frag[6..8].copy_from_slice(&1u16.to_be_bytes()); // off = 8 字节、mf = 0（末片）
+        frag[20..22].copy_from_slice(&rw.to_be_bytes()); // 载荷前 2 字节 = rw_port（垃圾）
+        nat::fix_ip_checksum(&mut frag);
+        // 登记表项（模拟首片已过 on_tx，值 = 本报文的原始目的）
+        itc.tx_frag
+            .insert((client, 0x4321, 17), TxFragVal { orig: Some(orig), created: Instant::now() });
+        let mut frag2 = frag.clone();
+        frag2[4..6].copy_from_slice(&0x4321u16.to_be_bytes()); // 键 ident 对齐
+        let before = frag2.clone();
+        itc.on_tx(frag2);
+        let out = itc.tx_out.pop().expect("应发出（表命中）");
+        assert_eq!(&out[12..16], &orig.0.octets(), "IP 源 = 表内原始目的");
+        for i in 0..out.len() {
+            if (10..16).contains(&i) {
+                continue; // 只允许 IP 校验和 + IP 源变
+            }
+            assert_eq!(out[i], before[i], "字节 {i} 不得变（L4 头/校验和/载荷）");
+        }
+        assert_eq!(&out[20..22], &rw.to_be_bytes(), "载荷前 2 字节不被误改写（垃圾端口不命中）");
+        assert_eq!(sum16(&out[..20]), 0xFFFF, "IP 校验和自洽");
+        assert!(itc.tx_frag.is_empty(), "末片（mf=0）⇒ 精确回收");
+        assert_eq!(snap_of(&stats, "txFragDrop"), 0);
+    }
+
+    /// T32：TX 分片表未命中 ⇒ 丢片 + `txFragDrop`（不发坏片）。
+    #[test]
+    fn tx_frag_missing_entry_drops_and_counts() {
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let stats = Arc::new(Stats::default());
+        let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::clone(&stats));
+        let mut frag = nat::build_udp(
+            tunnel,
+            20000,
+            Ipv4Addr::new(100, 64, 10, 73),
+            47002,
+            &[0u8; 16],
+        );
+        frag[6..8].copy_from_slice(&(0x2000u16 | 1).to_be_bytes()); // 非首片
+        nat::fix_ip_checksum(&mut frag);
+        itc.on_tx(frag);
+        assert!(itc.tx_out.is_empty(), "表未命中 ⇒ 丢片（不发坏片）");
+        assert_eq!(snap_of(&stats, "txFragDrop"), 1);
+        assert_eq!(snap_of(&stats, "fragDrop"), 0, "RX 面不受影响");
+    }
+
+    /// T33：TX 分片表的 TTL 与上限兜底（淘汰最老）。
+    #[test]
+    fn tx_frag_table_ttl_and_cap() {
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::new(Stats::default()));
+        let client = Ipv4Addr::new(100, 64, 10, 74);
+        let now = Instant::now();
+        // TTL：11s 前的条目被清
+        itc.tx_frag.insert(
+            (client, 1, 17),
+            TxFragVal { orig: None, created: now - Duration::from_secs(11) },
+        );
+        itc.tx_frag
+            .insert((client, 2, 17), TxFragVal { orig: None, created: now });
+        itc.sweep_tx_frag(now);
+        assert_eq!(itc.tx_frag.len(), 1, "TTL 清最老");
+        assert!(itc.tx_frag.contains_key(&(client, 2, 17)));
+        // 上限：超 TX_FRAG_MAX ⇒ 淘汰最老
+        for i in 0..(TX_FRAG_MAX as u16 + 10) {
+            itc.tx_frag.insert(
+                (client, 100 + i, 17),
+                TxFragVal { orig: None, created: now + Duration::from_millis(i as u64) },
+            );
+        }
+        itc.sweep_tx_frag(now);
+        assert_eq!(itc.tx_frag.len(), TX_FRAG_MAX, "上限兜底");
+        assert!(!itc.tx_frag.contains_key(&(client, 100, 17)), "淘汰最老");
+        assert!(itc.tx_frag.contains_key(&(client, 100 + TX_FRAG_MAX as u16 + 9, 17)));
+    }
+
+    /// T33 补：**插入路径**的上限（评审低-2——表满且条目全新鲜时，首片登记必须为
+    /// 本次 insert 留位，修前会瞬时到 上限+1）。
+    #[test]
+    fn tx_frag_table_cap_on_insert_path() {
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let client = Ipv4Addr::new(100, 64, 10, 78);
+        let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::new(Stats::default()));
+        let now = Instant::now();
+        for i in 0..TX_FRAG_MAX as u16 {
+            itc.tx_frag.insert((client, 100 + i, 17), TxFragVal { orig: None, created: now });
+        }
+        assert_eq!(itc.tx_frag.len(), TX_FRAG_MAX);
+        // 首片（MF=1；src 非隧道 IP ⇒ 未命中流表、登记 orig=None）
+        let mut frag = nat::build_udp(Ipv4Addr::new(1, 1, 1, 1), 5000, client, 47005, &[0u8; 8]);
+        frag[6] = 0x20;
+        nat::fix_ip_checksum(&mut frag);
+        itc.on_tx(frag);
+        assert_eq!(itc.tx_frag.len(), TX_FRAG_MAX, "insert 后仍 ≤ 上限");
+        assert!(itc.tx_frag.contains_key(&(client, 0, 17)), "新键已登记（不拒新）");
+    }
+
+    /// T34：非分片路径与修复前**逐字节同行为**（反重写仍全量重算）；畸形包原样放行。
+    #[test]
+    fn tx_non_fragment_path_unchanged() {
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let client = Ipv4Addr::new(100, 64, 10, 75);
+        let stats = Arc::new(Stats::default());
+        let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::clone(&stats));
+        let orig = (Ipv4Addr::new(8, 8, 4, 4), 53);
+        let flow = make_udp_flow(&mut itc, client, 47003, orig);
+        let rw = itc.flows[&flow].rw_port;
+        // 非分片（DF-only 也不算分片）：全量反重写
+        let mut pkt = nat::build_udp(tunnel, rw, client, 47003, b"reply");
+        pkt[6] = 0x40; // DF-only
+        nat::fix_ip_checksum(&mut pkt);
+        itc.on_tx(pkt);
+        let out = itc.tx_out.pop().unwrap();
+        let v = Ipv4View::parse(&out).unwrap();
+        assert_eq!((v.src, v.src_port), orig, "全量反重写（src → orig_dst）");
+        assert_eq!(v.payload, b"reply");
+        assert_eq!(sum16(&out[..20]), 0xFFFF);
+        // 畸形（parse 失败）原样放行
+        itc.on_tx(vec![1, 2, 3]);
+        assert_eq!(itc.tx_out.pop().unwrap(), vec![1u8, 2, 3]);
+    }
+
+    /// T38（F5-c）：客户端**并发**重组两条大回复（`reassembly-buffer-count-8`）。
+    /// 手工交错注入两报文的真分片——`REASSEMBLY_BUFFER_COUNT=1` 的旧形态下第二条
+    /// 报文的首片会顶掉第一条的上下文（本用例即判别面）。
+    #[test]
+    fn client_multi_concurrent_reasm() {
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let stats = Arc::new(Stats::default());
+        let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::clone(&stats));
+        let cip = Ipv4Addr::new(100, 64, 10, 77);
+        let mut client = StackB::new(cip, tunnel, SmolInstant::from_millis(0));
+        let ha = client_udp_socket(&mut client, 47010);
+        let hb = client_udp_socket(&mut client, 47011);
+        let fa = make_udp_flow(&mut itc, cip, 47010, (Ipv4Addr::new(8, 8, 8, 8), 53));
+        let fb = make_udp_flow(&mut itc, cip, 47011, (Ipv4Addr::new(9, 9, 9, 9), 53));
+        let pa: Vec<u8> = (0..3000u32).map(|i| (i % 197) as u8).collect();
+        let pb: Vec<u8> = (0..2600u32).map(|i| (i % 193) as u8).collect();
+        itc.udp_send_to_client(fa, &pa);
+        let frs_a = pump_all_fragments(&mut itc);
+        itc.udp_send_to_client(fb, &pb);
+        let frs_b = pump_all_fragments(&mut itc);
+        assert!(frs_a.len() >= 3 && frs_b.len() >= 3, "两报文各 ≥3 片");
+        let mut tick = 0i64;
+        for i in 0..frs_a.len().max(frs_b.len()) {
+            for p in [frs_a.get(i), frs_b.get(i)].into_iter().flatten() {
+                client.inject(p);
+                tick += 5;
+                client.iface.poll(
+                    SmolInstant::from_millis(tick),
+                    &mut client.device,
+                    &mut client.sockets,
+                );
+            }
+        }
+        let get = |client: &mut StackB, h: SocketHandle| -> Option<Vec<u8>> {
+            let mut buf = vec![0u8; 65536];
+            let n = client
+                .sockets
+                .get_mut::<smoltcp::socket::udp::Socket>(h)
+                .recv_slice(&mut buf)
+                .map(|(n, _)| n)
+                .unwrap_or(0);
+            (n > 0).then(|| buf[..n].to_vec())
+        };
+        assert_eq!(get(&mut client, ha).as_deref(), Some(&pa[..]), "报文 A 并发重组成功");
+        assert_eq!(get(&mut client, hb).as_deref(), Some(&pb[..]), "报文 B 并发重组成功");
+    }
+
+    /// T35：客户端发侧 R4 回归——4096B 与 65000B 载荷都真分片发出（此前 >1472 静默丢）。
+    #[test]
+    fn client_udp_fragments_up_to_64k() {
+        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
+        let mut client = StackB::new(
+            Ipv4Addr::new(100, 64, 10, 76),
+            tunnel,
+            SmolInstant::from_millis(0),
+        );
+        let h = client_udp_socket(&mut client, 47004);
+        for (size, payload) in [(4096usize, vec![0x71u8; 4096]), (65000, vec![0x72u8; 65000])] {
+            client
+                .sockets
+                .get_mut::<smoltcp::socket::udp::Socket>(h)
+                .send_slice(
+                    &payload,
+                    IpEndpoint::new(Ipv4Addr::new(1, 1, 1, 1).into(), 9999),
+                )
+                .expect("send_slice 进栈 tx 缓冲");
+            let mut frags: Vec<Vec<u8>> = Vec::new();
+            let mut tick = 0i64;
+            for _ in 0..64 {
+                tick += 5;
+                client
+                    .iface
+                    .poll(SmolInstant::from_millis(tick), &mut client.device, &mut client.sockets);
+                let mut out = Vec::new();
+                client.device.drain_tx(&mut out);
+                frags.extend(out);
+                if frags
+                    .iter()
+                    .any(|p| nat::Ipv4FragHdr::parse(p).is_some_and(|f| !f.hdr.mf))
+                {
+                    break;
+                }
+            }
+            assert!(frags.len() >= 2, "{size}B 载荷应真分片（得 {} 片）", frags.len());
+            let bytes: usize = frags
+                .iter()
+                .map(|p| nat::Ipv4FragHdr::parse(p).map(|f| f.payload.len()).unwrap_or(0))
+                .sum();
+            assert_eq!(bytes, size + 8, "{size}B：线上分片总载荷 = UDP 头 + 载荷");
+        }
     }
 }
 
