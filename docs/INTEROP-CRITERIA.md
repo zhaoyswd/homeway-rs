@@ -285,6 +285,57 @@ v6 路径）+ Rust 统一进程出口 42680（upnp=true 同号映射成立 ⇒ v
   `tx_deferred` 滞留超 `TX_DEFER_MAX_BYTES`（非 TCP 包）时**丢新 + 计数**（`udpDrop`/`shapeDrop`）。
   Go 侧对应面是内核 rcvbuf 界定 / 无界 channel——本层以显式上限换取内存有界，代价是压力下丢新
   率上升（`udpNoReply` 观测漂移）。**TCP 恒不丢**（字节流丢字节 = 流错位）。
+- **【Q-F 批，2026-10-08】portfwd 诚实态（F1，行为差异 + 功能缺口）**：手机核**未实装**端口转发
+  监听器，映射状态由恒 `listening` 改为恒 `failed` + 明确 err（空 `code`），热替换 rc 由 `0`
+  改为 `-1`。Go 基线真 bind（`app_portfwd.go:77-113`）⇒ **功能缺口如实化**；`target` 文案收敛到
+  `pf_target_text` 单一真源（CLI `cmd_portfwd` 第三份拷贝同批收敛）。**CLI 附带行为变更**：
+  `--map L:<ip>:0` 的**实际拨号端口由 0 改为 L**（`port==0 ⇒ port=listen`，与 Go 桌面 facade
+  `forward.go:318-325` 同义；旧行为拨 `ip:0` 必失败）——CLI 是 Rust 独有测试动词（baseline 无对应
+  命令，Go `clientcore` 的 `pfDial` 对 `TargetIp != ""` 原样拨 `TargetPort`），方向已核、登记在案。
+  挂账、实现轮廓与交接块见 `docs/reviews/QF.md`「portfwd-B 交接」（tier `port-forwarding` spec 的
+  SHALL 处于**已知不达标**）。
+- **【Q-F 批，2026-10-08】桥状态诚实性（F7b，本批加固 ≠ Go 同形）**：桥的 accept 线程 spawn 失败
+  或 `listen_path` 重试耗尽时，`bridgeFilesSock/bridgeTermSock/bridgeSpeedSock` 由「上报路径」改为
+  **空串**——**Go 的 `sockJSON` 不这么做**（只要 token 在就返回路径，`app_bridge.go:388-395`）⇒
+  **偏离 Go 的加固**；`bridgeAuth` 不变；`start()` 到 listen 结论之间的短暂非空窗口为已知形态。
+- **【Q-F 批，2026-10-08】服务会话暖机硬失败（F2，行为差异）**：`Session::start` 返回 Ok 但快照
+  `state=failed` 时：① rc 面不再「幂等返 0」（域态写 Failed ⇒ 下次 `service_start` 走新受理）；
+  ② 失败实例**保留**在运行槽（`service_status` 继续报 `failed`+原因；tier `bridgeHostOf` 的
+  `SVC_FAILED → BRIDGE_MODE_SERVICE/BRIDGE_HEALTH_FAILED` 保持一致）；③ `fully_stopped` 置位后
+  `start` 可**替换**该实例（Go `svcStateFailed && isDone()` 同形）。此前行为 = rc 面谎报 +
+  不可重建 + 无巡检。**实现注记**：`Session::stop()` 的「failed 终态保留」此前被
+  `set_state(Stopping)` 覆盖（分支恒不可达）⇒ 本批先读后写（`was_failed` 判定移到写 Stopping
+  之前）——该分支由死代码转活，失败原因在收工后仍可读（C17 行文不变）。**F2-3 小修（已采）**：
+  槽空 + 域 `Failed` 时 `service_status` 由 `{"state":"idle"}` 改为 `{"state":"failed","reason":…}`
+  （覆盖 `Session::start` 返 `Err` 的清槽路径——此前状态面与 rc 门自相矛盾）。**tier 可见后果**：
+  `ServiceSession.ets` 把 `state=failed` 映射为 `mode=SERVICE/health=FAILED`，`BridgeRules.ets`
+  对 `SERVICE+FAILED` 返回 `BRIDGE_ACTION_HEAL_HOST`（请求自愈拉起）⇒ 一次暖机失败的
+  `service_start` 之后 App 会**自动再拉起一次服务会话**（此前 idle ⇒ `NONE/ABSENT`、不拉起）。
+  这是有意为之（状态面与 rc 门一致；再拉起受 App 侧既有预算约束），如需改变表达另开批。
+- **【Q-F 批，2026-10-08】桥拨号期限（F3，本批加固 ≠ Go 同形）**：带预算的桥拨号把**恢复阶梯与
+  阶梯等待**计入同一预算（此前可越界 ≈4×）；**Go 的阶梯与闸等待同样不受调用方预算约束** ⇒
+  偏离式加固。两域巡检与 NAPI `tun_recover` 不受影响（`deadline=None`，行为逐字不变）；
+  `LadderRc::Deadline` 对外映射 `-1`（不是 -3——tier 对 -3 渲染「本机网络栈没准备好」= 错误归因）
+  且不计入耗尽；残余越界上界 = 一个动作预算（`ACTION`=2s，动作不可中断）。
+- **【Q-F 批，2026-10-08】收工等待（F6，行为差异 + 残余）**：服务会话 `stop()` 的**五段**（巡检
+  join / hint join / 缓存落盘线程 join / 缓存终写（`try_lock` 快跳）/ `Client::stop_within`）共用
+  一个 6s 预算；到点放行自退 + per-thread 新行（§5.1 登记）。**范围声明**：本预算只覆盖
+  `session::Session::stop()`——不含隧道域 `Finish::drop`/`request_stop` 的 `c.stop()` 与
+  `rebuild_session→old.stop()`（残余登记，设计 §7-4/§7-5）。**残余**：`stop_within` 到点 detach 后
+  引擎线程可能存活到自行退出（由收割线程 `hw-engine-reap` join 后关 wake fd；收割线程起不来时
+  fd 泄漏一枚、保持打开——提前 close 会让驱动 `poll` 忙转）；`fully_stopped` 因此**弱于** Go 的
+  `isDone()` ⇒ `start` 替换窗口内旧引擎线程可能仍在（缓解：`Cmd::Stop` 已投递、新引擎新 UDP 口、
+  出口按 `peer_id` 覆盖注册）。锁纪律：session/recover/tun_exec/`wgcore::Client` 面一律走
+  `crate::syncutil::lock_unpoison`（Drop 链零 panic；分配失败 = abort 为明示 carve-out）。
+  **段④残余（代码门 ②-2 订正）**：`try_lock` 只保证「不等锁」——拿到锁后的落盘 I/O
+  （`EndpointCache::save` 的读盘/建目录/写/rename，无 fsync、raw 未变时早退）仍**无期限**；
+  锁空闲 + 卡文件系统形态下 6s 仍可被击穿（登记为残余，不宣称「不再有任何无界段」）。
+- **【Q-F 批，2026-10-08】域名解析并发上限（F8e，本批加固）**：`lookup_host` 的**在飞解析**分档
+  上限（critical 4 / background 4；额度随 worker 生命周期——**调用方等待超时返回不归还额度**，
+  卡在 `getaddrinfo` 里的 detach 线程继续占用 ⇒ 到上限后该档**有界地失败**：第 N+1 个调用等到
+  调用方预算耗尽即回 TimedOut）；阻塞获取的等待计调用方预算，获取耗时同计（`budget - 获取耗时`
+  才是 worker 期限，总耗时不得 ≈2× 预算）；**Go 无上限**（每调用新 goroutine）。
+  `resolve_domains` 对每个域名条目各用整份预算（N×budget）的既有形态不变。
 
 ## daemon/控制面族实采（B0-2b 第 1 棒，2026-10-05；统一进程本地实例 /tmp/hw-ctl-unified——serve/relay 初始停用，control.sock 0600；出口 = local-rust-exit.sh 实例 1/2〔42651/42652，隔离端口绝不触生产 41641〕）
 
@@ -409,9 +460,14 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 
 | 2026-10-08（Q-D 批落地） | **E16a/E16b 尺寸字段**（`新建会话 … 80x24` / `腿接入（kind=… 80x24 …）`；同族面 = LIST JSON 的 `cols`/`rows` 与 ATTACHED 的 `cols`/`rows`） | 任意 u16 尺寸原样接受（`RESIZE/HELLO 65535×65535` ⇒ alacritty 按 `rows×cols` 即时分配两屏，实测 ≈96–192 GiB，分配失败 = abort）→ **>1000×500 夹取到上限**；`RESIZE 0×0` **忽略本次上报**（会话几何保持旧值，对齐 Go 的 0 门在尺寸写点之前） | **修复型变更**（P0-3，实测锚）：尺寸入径此前无上限（alacritty 无 MAX，`MIN_COLUMNS` 全库零引用）；`RESIZE 0×0` 曾把会话几何污染成 0×0 而格流仍按 vt 宽编（客户端错位）——Rust 独有移植偏差 | `docs/INTEROP-CRITERIA.md` E16a/E16b 行、`service.rs`（HELLO/RESIZE 入径 + LIST/ATTACHED 路径）、`term/size.rs`、单测 `vt_size_gate_rejects_oversize_and_zero`/`resize_clamp_and_zero_ignore`/`normalized_boundaries`/`report_gate_zero_and_clamp`；**正常尺寸（≤1000×500 且非 0）逐字节不变**；raw CLI 不回读几何 ⇒ 夹取对它是静默的（残余登记见 `docs/reviews/QD.md`） |
 | 2026-10-08（Q-D 批落地） | **surface cell 流 symLen 域**（`[hdr]` 低 7 位 = symbol 字节长） | >127 B 字素簇编码为**错位字节流**（hdr 写 `len & 0x7f` 而体写全量 ⇒ 后续颜色/属性字段全部错位）→ 按 **UTF-8 边界截断到 ≤127 B**（真源 = `codec::marker::SYM_LEN_MASK`，`vt::cell_of` 主截 + `codec::append_cell` 副门） | **修复型变更**：alacritty `push_zerowidth` 无上限（200+ 组合字符可达），7 位长度域约定下现状即错乱帧 | `codec.rs`/`vt.rs`、单测 `vt_symbol_cluster_truncated_at_boundary`/`surface_symbol_truncation_roundtrip`/`append_cell_secondary_gate_alignment`、fuzz 哨兵 `fuzz_term_vt`（每格 ≤127）；**fixtures/vectors 无该形态 ⇒ 无夹具变更** |
+| 2026-10-08（Q-F 批落地） | **服务会话巡检失败行**（`巡检失败（连续 %d）：探测超时`——**非 C1–C17 判据行**） | `巡检失败（连续 %d）：探测超时`（**恒写「探测超时」**）→ `巡检失败（连续 %d）：<探测的真实错误>`（`ConnErr` 的 Display 原文；超时形态实渲染 `巡检失败（连续 2）：连接超时`——与隧道域同族行 `对端巡检失败 2/3: 连接超时` 同串形态） | F8c：归因写死 = 报错信息失真（`probe_ok` 在 `session/mod.rs` 由 `.is_ok()` 丢弃了错误） | `session/mod.rs` 巡检失败行、grep 该行排障的脚本；**成功拍/门控行不变**（`巡检失败被门控拦下（…）`、`巡检恢复：门控态结束（成功拍清零）` 等逐字保留） |
+| 2026-10-08（Q-F 批落地） | **服务会话收工等待行**（非编号判据行；**既有行文变更**） | `收工等待巡检线程超时（STOP_WAIT）——放行自退` → per-thread 形态（`收工等待 <线程名> 超时（STOP_WAIT）——放行自退`；五段覆盖：巡检线程 / hint 线程 / 缓存落盘线程 / 缓存终写跳过（`收工缓存终写跳过（锁被在途落盘占用）——去抖线程近期写已在盘上`）/ client 线程（尾缀 `（引擎线程由收割线程收口）`）） | F6b：五段共用一个 6s 预算（此前仅巡检有界——hint/save/client 的 join 无上界） | `session/mod.rs`；C17「已收工（state=%s）」的 **idle 形态逐字不变**（`已收工（state=idle）`）；`已收工（state=failed 终态保留）` 是失败终态的另一条行（HEAD 同串，本批由死代码转为活路径——见注记） |
+| 2026-10-08（Q-F 批落地） | **`portForwards[]` 状态文案与 `ClientCoreTunSetPortForwards` 返回码**（**契约面行为变更**，非编号判据行） | ① `state`：恒 `"listening"` → `"failed"`；② `err`：空 → `"手机核未提供端口转发监听（127.0.0.1:<listen> 未监听）——该映射在当前版本不可用，不影响隧道"`；③ `code`：空（不变）+ **失败映射带枚举 code 的 spec MUST 被有意偏离**（空码走 App 登记的空码兜底，`bind_failed` 是假归因）；④ `target`：`":0"`/`":port"` → `pf_target_text` 四形态（`主机（同端口）`/`主机:N`/`IP:<listen>`/`IP:N`）；⑤ rc：`0` → `-1` | F1（P0 假成功 + 假状态）：本核无监听器 ⇒ 原 `listening`+rc 0 是谎报；对照 Go 真 bind 与 tier spec（SHALL 监听）——**功能缺口挂账见 `docs/reviews/QF.md`「portfwd-B 交接」** | `tier:openspec/specs/port-forwarding`（**已知不达标**）、`tier:pages/PortForwardsPage.ets`（`:484` 提示失义）、`tier:…/TierVpnExtensionAbility.ets:1010`（rc 日志文案失义）、`facade/tun_exec.rs`/`facade/portfwd.rs` 单测；**`fixtures/` 无 portForwards 夹具 ⇒ 无字节夹具变更**；`tools/check-vocab.sh` 不受影响（`bind_failed` 仍声明） |
+
 > **上表 E12/decr_flow 两行 = 2026-10-07 Q-B 批落地登记**（Q-A 批预登记的占位条目已按本政策补全
 > 「从 → 到」实际行文并去掉「占位」标注，同批 commit）；**其下两行 = 2026-10-07 Q-C 批落地登记**；
 > **再下两行 = 2026-10-08 Q-D 批落地登记**（E16a/E16b 尺寸字段 + surface symLen 域）。
+> **再下三行 = 2026-10-08 Q-F 批落地登记**（服务会话巡检失败行真因 / 收工等待行 per-thread / portfwd 状态与 rc 契约面）。
 > 登记生效后，E12 关闭行与 flows 计数按新行文验收（旧行文不再要求同串）；Q-D 的尺寸面按
 > 「正常尺寸逐字节同串、极端输入按登记」验收。
 
@@ -443,3 +499,9 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 | 2026-10-08（Q-E） | **UPnP 映射表枚举次数**（`GetGenericPortMappingEntry` SOAP 往返，非判据行） | 每轮 `3 × (N+1)` → **`(N+1)`** 次往返（N = 表长；第 N+1 次取表尾 713） | F9a：枚举一次缓存（**优化，偏离 Go 的 3 次**） | 路由器负载、UPnP 轮次耗时；日志行文不变（`enumerate_once_per_round`） |
 | 2026-10-08（Q-E） | **新增观测行（additive）** | 无 → 有：`files`/`speedtest` accept **瞬态错误退避**行（首 3 + 每 100）、accept **Fatal 退工**行（含 engine 侧「服务线程退工」）、`files` 会话线程/busy 线程起不来行、files **水位检查失败 fail-open 告警**（首 3 + 每 100）与**上传中止**行、UPnP「枚举一次 / 未经核验不删（让位）」行、缩租 `ShrinkOutcome` 归因行（NoIgd/NoMapping/Shrunk/Failed）、`http_call` 三条新错误串（超限/长度不符/预算耗尽） | F3a/F5/F6c/F7/F9/F10：静默路径改可观测 | 各日志族读者；**非编号判据行** |
 | 2026-10-08（Q-I 前段） | **udpcap 探测周期 / caps 新鲜度**（`UDP 默认路径：…` 行 = 本表 udpcap 的 `—` 行，**行文与语义均不变**） | 频次：**bindwatch 在位形态**（auto 挑卡/显式绑卡 = 生产形态）周期 `~600s`（`recv_timeout(300s)` 超时后又 `sleep(300s)`，等于每拍睡两次）→ **`~300s`**（超时即重探；对齐 Go `udpcap.go:26` 5min ticker + kick，`udpcap.go:140-152`）；**`--bind-interface none` 形态本已 ~300s（不变）**。喂客户端 C14 的 caps 位新鲜度：`≤10min` → **`≤5min`**（kick 面即时重探不变） | Q-I F7：`recv_timeout` 的 Timeout 与 Disconnected 未区分（多睡一拍） | `UDP 默认路径` 行频次（行文不变）、caps 新鲜度、`server/engine.rs` 纯函数 `udpcap_disconnected_backoff` + 单测 `udpcap_wait_three_states`；**非**编号判据行（无 R1–R13/E* 行文变更） |
+| 2026-10-08（Q-F） | **`stats.pfAccepted`/`stats.pfFails`** 与 `stats:` 行的 `pf=a/f` | 值不变（恒 0）——**语义由「未接线的占位」改为「真值：无监听器 ⇒ 无 accept/失败」** | F1/N4：读数的人不得据此以为端口转发在跑（映射状态见 `portForwards[]` 的 failed + err） | `facade/tun_exec.rs::runner_of`、`stats_loop`；tier 无消费（只校验键存在） |
+| 2026-10-08（Q-F） | **新增观测行（additive）** | 无 → 有：① 桥 `<桥名> accept 线程启动失败（{e}）—— 该桥本轮不可用`（accept/conn/pump 三面各一行）；② 隧道域/服务域各派生线程 `启动失败（{e}）—— …`（含「本世代失去自愈巡检」）；③ `服务会话暖机硬失败（原因=…）——不发布就绪`；④ `RECOVER 预算耗尽（起跑=%s，原因=%s，预算已用尽）—— 放弃等待`；⑤ `域名解析并发已达上限（N），本次等待超时`；⑥ `homeway-svc-reap 启动失败（{e}）—— 收尾线程起不来——本次 stop 就地同步收尾`；⑦ 服务域 `巡检线程 panic（已兜住）—— 本会话失去自愈巡检`；⑧ 服务域 `会话线程 panic（已兜住）—— 会话失败收工（清槽 + 域 Failed）` | F2/F3/F6/F7/F8e：静默路径改可观测（审计明文要求「spawn 失败落判据行」） | 各日志族读者；**非编号判据行** |
+| 2026-10-08（Q-F） | **`unhealthyReason` 取值集不变** | 仍 = {patrol, fd, panic, stop}；**既有**巡检 3 连败 + 阶梯耗尽 ⇒ `mark_unhealthy_if_current(gen,"patrol")` **原样保留**；新增的 spawn 失败处置**不**新增该面（只记行 + 残余登记） | F7/D6：`unhealthy` 会经 App `FailGate` 触发整套重建，代价大于收益（两域数据面都不依赖 patrol） | `facade/tun_exec.rs`；tier `FailGate` 判据不变 |
+| 2026-10-08（Q-F） | **`LadderRc::Deadline` 的记账语义** | `Deadline` **不计入** `LadderRc → exhausted`（`Deadline` 不是「阶梯走完未恢复」的证据，单源判据 `recover::exhausted_delta`）；等待方到点返回时**跳过** merge 后的重建决策（既有「merge 返回即本轮结束」的结构不变） | F3/D12（设计门 C4）：防「调用方预算紧张把会话推向 REBUILD」与「在途轮未完被 rebuild 掉 Client」 | `session/mod.rs`（`note_ladder_result` 与 `session_recover` 两处埋点）、`tun_exec.rs`（隧道域无 exhausted 面，仅 rc） |
+| 2026-10-08（Q-F） | **`healing_dial_*` 所有调用方的最长等待** | 从「首试 + 尾试各受预算约束（阶梯可越界 ≈4×，实测 15s 预算 → 最坏 ≈64s）」→「首试 + 阶梯（含闸等待） + 尾试合计受同一预算约束」；残余越界上界 = 一个动作预算（2s）；预算表不变：服务桥/tun 桥 15s、`files.rs` 调用方预算、CLI `portfwd` 15s、daemon `budget.min(15s)` / 30s | F3（**偏离 Go 的加固**：Go 的阶梯与闸等待不受调用方预算约束） | daemon 拨号（Q-H 面，最长等待缩短）、files/term/speedtest 桥、CLI `portfwd` |
+| 2026-10-08（Q-F） | **域名解析并发上限（F8e）** | 无上限 → **分档令牌池**（critical 4 = 建会话 + daemon `host reach` / background 4 = 巡检刷新）；**额度 = 在飞解析**（随 worker 生命周期，调用方超时不归还）⇒ 黑洞下该档**有界地失败**（第 N+1 个调用按预算 TimedOut），不是「不会失效」；获取等待计调用方预算；`resolve_domains` 对每个域名条目各用整份预算（N×budget）的既有形态不变 | F8e（两轮设计门 3.3/3.3'/C6）：黑洞下每分钟可漏 N 枚卡死线程；进程级单桶会让后台刷新饿死用户可见路径 | `wtransport/domain_eps.rs`、建会话路径、巡检刷新、daemon `host reach`（用户可见结论面） |
