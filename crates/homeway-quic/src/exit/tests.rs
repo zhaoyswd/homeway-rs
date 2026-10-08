@@ -1220,6 +1220,124 @@ async fn binding_indexes_stay_consistent_across_bind_replace_unbind() {
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
 
+/// **判据（S1-3 / §2.2 门禁）**：未认证（四帧未完成）连接的数据报**直接丢 + 计数 +1**
+/// （`未登记`）+ E-q3 行——**不触碰引擎、不产生绑定**（「未认证连接不占额度」的数据面）。
+#[tokio::test]
+async fn datagram_from_unregistered_connection_is_dropped_and_counted() {
+    let (logf, rx) = sink();
+    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(34), 32), logf)
+        .expect("端点可起");
+    let stub = Stub::new(SECRET);
+    let (_c, conn, _s) = client_conn(&quic).await; // **不注册**
+    conn.send_datagram(bytes::Bytes::from(inner_pkt(TUN_IP, Ipv4Addr::new(8, 8, 8, 8))))
+        .expect("客户端发数据报");
+
+    assert!(
+        pump_until(&stub, &quic, || quic.snapshot().drop_unregistered >= 1, WAIT).await,
+        "未登记数据报应被丢且计数：{:?}",
+        quic.snapshot()
+    );
+    assert_eq!(stub.packets().len(), 0, "未登记连接的包不得进引擎面");
+    assert_eq!(
+        quic.snapshot().drop_unregistered, 1,
+        "只应计一次（连接的其余流量不存在）"
+    );
+    assert_eq!(quic.snapshot().challenges_issued, 0, "未认证连接请求不到挑战之外的任何东西");
+    assert_eq!(
+        quic.send_to_pub(&[0xABu8; 32], b"x"),
+        crate::ExitSend::Unbound,
+        "未认证连接不得产生绑定（出站回落 WG）"
+    );
+    drain_until(&rx, "quic: 丢弃 超限=0 发送缓冲满=0 未登记=1 源校验拒=0", WAIT); // E-q3 行
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（S1 的门禁面 · §2.2-1）**：**准入未完成**（Hello/Challenge 在途、Proof 未到）的连接
+/// 发来的数据报同样被门禁拦下（丢 + `未登记`）；四帧走完后同一连接的报文照常到达
+/// （门禁随裁决面开合）。
+#[tokio::test]
+async fn datagram_is_gated_until_admission_completes() {
+    let (logf, rx) = sink();
+    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(51), 32), logf)
+        .expect("端点可起");
+    let stub = Stub::new(SECRET);
+    let pubkey = [0x71u8; 32];
+    let dev = [0x72u8; 8];
+    let (_c, conn, _s) = client_conn(&quic).await;
+
+    // ① 未认证（连 Hello 都还没发）：数据报丢弃 + 计数
+    let early = inner_pkt(TUN_IP, Ipv4Addr::new(8, 8, 8, 8));
+    conn.send_datagram(bytes::Bytes::from(early)).expect("发数据报");
+    assert!(
+        pump_until(&stub, &quic, || quic.snapshot().drop_unregistered >= 1, WAIT).await,
+        "未认证连接的数据报必须丢 + 计数：{:?}",
+        quic.snapshot()
+    );
+    assert_eq!(stub.packets().len(), 0, "未认证连接的包不得进引擎面");
+
+    // ② 四帧走完（门禁开）⇒ 同形数据报照常到达
+    let (_send, _recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
+    pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=72727272", WAIT).await;
+    let good = inner_pkt(TUN_IP, Ipv4Addr::new(8, 8, 8, 8));
+    conn.send_datagram(bytes::Bytes::from(good.clone())).expect("发数据报");
+    assert!(
+        pump_until(&stub, &quic, || !stub.packets().is_empty(), WAIT).await,
+        "准入完成后数据报应到达引擎面"
+    );
+    assert_eq!(stub.packets()[0], good);
+    assert_eq!(
+        quic.snapshot().drop_unregistered,
+        1,
+        "只应计未认证那一次：{:?}",
+        quic.snapshot()
+    );
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（S1-4）**：源非法包（src ∉ {tunnel_ip, tun_ip}）⇒ 丢 + `源校验拒` 计数 + E-q3 行；
+/// 同连接随后的合法包照常投递（拒的是包不是连接）。明细行含**实际 src**（设计 §9.1-1 的
+/// 增强：M1 真机发现①的「无法一眼定性」在这里关闭）。
+#[tokio::test]
+async fn datagram_with_illegal_source_is_dropped_and_counted() {
+    let (logf, rx) = sink();
+    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(35), 32), logf)
+        .expect("端点可起");
+    let stub = Stub::new(SECRET);
+    let (_c, conn, _s) = client_conn(&quic).await;
+    let pubkey = [0x99u8; 32];
+    let dev = [0xAAu8; 8];
+    let (_send, _recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
+    pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=aaaaaaaa", WAIT).await;
+
+    // 源非法（9.9.9.9 不在 {tunnel_ip, tun_ip}）
+    conn.send_datagram(bytes::Bytes::from(inner_pkt(
+        Ipv4Addr::new(9, 9, 9, 9),
+        Ipv4Addr::new(8, 8, 8, 8),
+    )))
+    .expect("发数据报");
+    assert!(
+        pump_until(&stub, &quic, || quic.snapshot().drop_src_rejected >= 1, WAIT).await,
+        "源非法包应计 `源校验拒`：{:?}",
+        quic.snapshot()
+    );
+    assert_eq!(stub.packets().len(), 0, "源非法包不得进引擎面");
+    let ls = drain_until(&rx, "quic: 丢弃 超限=0 发送缓冲满=0 未登记=0 源校验拒=1", WAIT);
+    assert!(
+        ls.iter().any(|l| l.contains("src=9.9.9.9")),
+        "E-q3 行的明细必须含实际 src（否则真机上仍无法定性）：{ls:?}"
+    );
+
+    // 合法（tunnel_ip 源）照常投递
+    let good = inner_pkt(TUNNEL_IP, Ipv4Addr::new(8, 8, 8, 8));
+    conn.send_datagram(bytes::Bytes::from(good.clone())).expect("发数据报");
+    assert!(
+        pump_until(&stub, &quic, || !stub.packets().is_empty(), WAIT).await,
+        "合法包仍应投递"
+    );
+    assert_eq!(stub.packets()[0], good);
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
 /// **判据（S1-5）**：缓冲满 ⇒ **计数 +1 且不静默**。
 ///
 /// 注入形态（确定性）：客户端**同步**连发（循环内无 `await` ⇒ quinn 的驱动任务拿不到运行
