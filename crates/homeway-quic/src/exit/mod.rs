@@ -14,7 +14,7 @@
 //! [`ExitQuic::stop_within`] 有界预算内退出（到点 detach + 收割线程 `hw-quic-exit-reap`）。
 //!
 //! 本棒（S1a）范围 = 端点 + TransportConfig + 出口 RPK 身份 + E-q1 就绪行；
-//! **S1b** 补准入（`hr-reg3` 连接绑定 → `table.register`）、数据面（DATAGRAM ⇄ 引擎
+//! **S1b** 补准入（`hr-reg4` 连接绑定 → `table.register`）、数据面（DATAGRAM ⇄ 引擎
 //! `intercept.on_plain`）与出站分流；中继承载（`kind=5` + 自定义 `AsyncUdpSocket`）、
 //! UPnP 与 token 端点类是 S1c。
 //!
@@ -53,7 +53,7 @@ use bridge::{DropKind, ExitBridge, Outbound, OUTBOUND_QUEUE_MAX};
 use socket::{ExitSock, LegTable};
 
 /// 两向边界的公面（引擎消费面）：入站事件 + 准入请求/裁决 + 出站投递结果。
-pub use bridge::{ExitInbound, ExitSend, Reg3Request, Reg3Verdict};
+pub use bridge::{ExitInbound, ExitSend, Reg4Request, Reg4Verdict, RejectWhy};
 /// 腿帧 kind=5（QUIC 载荷）的线字节：真源 = `homeway-core` 的
 /// `wtransport::frame::FrameKind::Quic`；本 crate 是叶子、按字节复刻，跨 crate 一致性由
 /// `homeway-core` 侧的断言钉住（见 `socket` 模块头）。
@@ -64,6 +64,12 @@ pub(crate) struct FaceCtx {
     pub(crate) stats: Arc<ExitStats>,
     pub(crate) bridge: Arc<ExitBridge>,
     pub(crate) logf: Logf,
+    /// 准入总期限（连接被采纳起；§1.3 的 `ADMIT_DEADLINE`）。
+    pub(crate) admit_deadline: Duration,
+    /// nonce 有效期（Challenge 起；§1.3 的 `NONCE_TTL`）。
+    pub(crate) nonce_ttl: Duration,
+    /// 连接总数上限（`2 × max_devices`；挑战行的「在途未认证 n/cap」分母）。
+    pub(crate) conn_cap: usize,
 }
 
 /// QUIC 面线程名（与岛 `homeway-quic` 区分：这是**出口侧**的那一枚）。
@@ -79,6 +85,19 @@ pub const DEFAULT_HANDSHAKE_CAP: usize = 64;
 /// 副作用登记：期限内未完成的握手丢掉后，对端重传 Initial 会再触发一轮 ⇒ 单源可反复
 /// 触发（**上限仍受并发握手闸约束**），M2 的 Retry/限流面承接）。
 pub const DEFAULT_HANDSHAKE_DEADLINE: Duration = Duration::from_secs(10);
+/// **准入总期限**（M2 设计 §1.3 / 设计门 r14 F3）：连接被采纳起 10s 内未走完 `hr-reg4`
+/// 四帧 ⇒ 拒 + 关连接。
+///
+/// 为什么必须有这一条：`max_idle_timeout=30s` + `keep_alive_interval=10s`（`transport.rs`）
+/// 的组合下，只要对端 ACK 服务端的 PING，**「握手完成但不发 Hello」的连接永不自然过期**；
+/// 而握手闸只管 `Connecting` 阶段、`pending` 只在收到 Hello 后才存在 ⇒ 单攻击者用
+/// `conn_cap` 条这种连接即可长期占满连接槽。本期限把「未认证状态」的生命周期变成有界的。
+pub const DEFAULT_ADMIT_DEADLINE: Duration = Duration::from_secs(10);
+/// **nonce 有效期**（M2 设计 §1.3）：出口发出 Challenge 起 5s 内未收到 Proof ⇒ 弃连接。
+///
+/// 计量用**服务端 `Instant`** ⇒ 与客户端时钟解耦（时钟偏移容忍不新增面）。它只需覆盖
+/// 「收 Challenge → 回 Proof」的 1 RTT（客户端总预算是它的数倍 ⇒ 不冲突）。
+pub const DEFAULT_NONCE_TTL: Duration = Duration::from_secs(5);
 /// 记行节流（仓内既有口径「首 3 + 每 100」——`relay/mod.rs` 的 `reject_log_due` 同款）。
 pub(crate) fn log_due(n: u64) -> bool {
     n <= 3 || n.is_multiple_of(100)
@@ -95,16 +114,22 @@ pub struct ExitQuicConfig {
     pub handshake_cap: usize,
     /// 握手期限（缺省 [`DEFAULT_HANDSHAKE_DEADLINE`]；同上）。
     pub handshake_deadline: Duration,
+    /// 准入总期限（缺省 [`DEFAULT_ADMIT_DEADLINE`]；M2 §1.3 的双期限之一，测试调短以钉死回收路径）。
+    pub admit_deadline: Duration,
+    /// nonce 有效期（缺省 [`DEFAULT_NONCE_TTL`]；M2 §1.3 的双期限之二，同上）。
+    pub nonce_ttl: Duration,
 }
 
 impl ExitQuicConfig {
-    /// 生产缺省（seed 与设备表上限由调用侧给；Q-O 的两个上限取设计定值）。
+    /// 生产缺省（seed 与设备表上限由调用侧给；Q-O 的两个上限与 M2 的双期限取设计定值）。
     pub fn new(rpk_seed: Ed25519Seed, max_devices: usize) -> Self {
         Self {
             rpk_seed,
             max_devices,
             handshake_cap: DEFAULT_HANDSHAKE_CAP,
             handshake_deadline: DEFAULT_HANDSHAKE_DEADLINE,
+            admit_deadline: DEFAULT_ADMIT_DEADLINE,
+            nonce_ttl: DEFAULT_NONCE_TTL,
         }
     }
 
@@ -147,8 +172,20 @@ pub struct ExitQuicSnapshot {
     pub handshake_timeouts: u64,
     /// 准入通过（绑定成功）的连接/刷新次数（S1-3）。
     pub regs_accepted: u64,
-    /// 准入被拒次数（MAC 不符含换连接重放 / 时间窗 / 表满 / 冲突——含刷新帧）。
+    /// 准入被拒次数（**含刷新帧**：帧非法/版本不符/再准入/nonce 类/MAC 类/引擎拒绝/未绑定刷新）。
     pub regs_rejected: u64,
+    /// 已发出的 Challenge（`C4`）帧数（M2 §1.6；挑战行的计数源）。
+    pub challenges_issued: u64,
+    /// **未发挑战**的准入拒绝数（帧非法/版本不符/已绑定再准入/未绑定刷新/重复 Hello——
+    /// 设计 §1.1 的「更便宜的拒绝面」在本期的可观测落点）。
+    pub challenges_refused: u64,
+    /// Proof 阶段的拒绝数（nonce 缺失/过期/已消费、MAC 不符、引擎裁决拒绝、刷新身份不符）。
+    pub proof_rejected: u64,
+    /// pending 过期（Challenge 已发、`NONCE_TTL` 内未收到 Proof ⇒ 弃连接）。
+    pub pending_expired: u64,
+    /// 准入总期限到点（连接被采纳起 `ADMIT_DEADLINE` 内未走完四帧 ⇒ 弃连接——含
+    /// 「握手完成但不发 Hello」，设计门 r14 F3）。
+    pub admit_timeouts: u64,
     /// 丢弃：超限（内层包 > `max_datagram_size()`）。
     pub drop_too_large: u64,
     /// 丢弃：发送缓冲满（per-conn 预检不过 ∨ 引擎→面出站队列满）。
@@ -172,6 +209,11 @@ pub(crate) struct ExitStats {
     handshake_timeouts: AtomicU64,
     regs_accepted: AtomicU64,
     regs_rejected: AtomicU64,
+    challenges_issued: AtomicU64,
+    challenges_refused: AtomicU64,
+    proof_rejected: AtomicU64,
+    pending_expired: AtomicU64,
+    admit_timeouts: AtomicU64,
     drop_too_large: AtomicU64,
     drop_send_buffer_full: AtomicU64,
     drop_unregistered: AtomicU64,
@@ -191,6 +233,11 @@ impl ExitStats {
             handshake_timeouts: self.handshake_timeouts.load(Ordering::SeqCst),
             regs_accepted: self.regs_accepted.load(Ordering::SeqCst),
             regs_rejected: self.regs_rejected.load(Ordering::SeqCst),
+            challenges_issued: self.challenges_issued.load(Ordering::SeqCst),
+            challenges_refused: self.challenges_refused.load(Ordering::SeqCst),
+            proof_rejected: self.proof_rejected.load(Ordering::SeqCst),
+            pending_expired: self.pending_expired.load(Ordering::SeqCst),
+            admit_timeouts: self.admit_timeouts.load(Ordering::SeqCst),
             drop_too_large: self.drop_too_large.load(Ordering::SeqCst),
             drop_send_buffer_full: self.drop_send_buffer_full.load(Ordering::SeqCst),
             drop_unregistered: self.drop_unregistered.load(Ordering::SeqCst),
@@ -563,12 +610,15 @@ fn run_exit(
         // 每连接任务（控制流登记 + 数据报收包；`JoinSet` 同款收工 abort）
         let mut tasks: JoinSet<()> = JoinSet::new();
         let mut next_conn_id: u64 = 1;
+        let conn_cap = cfg.conn_cap();
         let ctx = Arc::new(FaceCtx {
             stats: Arc::clone(stats),
             bridge: Arc::clone(bridge),
             logf: Arc::clone(logf),
+            admit_deadline: cfg.admit_deadline,
+            nonce_ttl: cfg.nonce_ttl,
+            conn_cap,
         });
-        let conn_cap = cfg.conn_cap();
         loop {
             tokio::select! {
                 _ = stop_rx.recv() => break,

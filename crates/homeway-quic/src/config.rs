@@ -2,7 +2,7 @@
 //!
 //! 为什么凭据在**构造期**注入（S2a 的实现决定，理由写在这里；设计 §2.1 未给凭据命令面）：
 //!
-//! - 岛的登记面必须持有 token secret（`hr-reg3` 的 MAC 输入之一，`reg3::Reg3Frame::encode`）；
+//! - 岛的登记面必须持有 token secret（`hr-reg4` 的 MAC 输入之一，`reg4::ProofFrame::encode`）；
 //! - 服务端身份钉定（出口 RPK）必须**在建端点之前**定案（`exit::rpk::client_pin`）；
 //! - 形态照出口面的 `ExitQuicConfig`（一次装配，不留「半初始化岛」这种可表达态）。
 //!
@@ -45,7 +45,7 @@ impl TokenSecret {
         Self(b)
     }
 
-    /// 借视图（喂 `hr-reg3` 的 MAC；不拷贝出所有权）。
+    /// 借视图（喂 `hr-reg4` 的 MAC；不拷贝出所有权）。
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0
     }

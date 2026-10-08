@@ -168,11 +168,9 @@ pub(crate) async fn run(
         ep
     ));
 
-    // ---- 登记（§2.6）：本连接的 exporter + 首条 bidi 控制流 + 准入窗 ----
+    // ---- 准入（§1.7）：本连接的 exporter + 首条 bidi 控制流上的 `hr-reg4` 四帧 ----
     let exporter = register::exporter_of(&conn)?;
-    let (send, recv) =
-        register::register_on_control_stream(&conn, &cred, &exporter, logf, ep, via.is_relay())
-            .await?;
+    let (send, recv) = register::register_on_control_stream(&conn, &cred, &exporter, logf).await?;
     let outcome = RaceOutcome {
         winner: ep,
         via,

@@ -21,11 +21,15 @@ thiserror.workspace = true
 # DATAGRAM 载荷类型（M1 设计 §1.5：`send_datagram` 只收 `bytes::Bytes`；quinn 并不
 # re-export bytes ⇒ 消费侧必须直接声明——M0 已登记「M1 必需」）。
 bytes.workspace = true
-# `hr-reg3` 的 MAC（M1 设计 §1.3：`HMAC-SHA256(secret, "hr-reg3"‖pubkey‖devTag‖ts‖exporter)`）
-# ——**非异步栈**（隔离门只约束 tokio/quinn/rustls 名字）；出口面（校验）与客户端岛
-# （S2-6 的登记/刷新，组帧）共用同一个字节层 ⇒ 两侧不会各写一份标签顺序而静默错位。
+# `hr-reg4` 的 MAC（M2 设计 §1.2：`HMAC-SHA256(secret, "hr-reg4"‖pubkey‖devTag‖ts‖nonce‖exporter)`
+# 与刷新域的 `hr-reg4-refresh`）——**非异步栈**（隔离门只约束 tokio/quinn/rustls 名字）；
+# 出口面（校验）与客户端岛（登记/刷新，组帧）共用同一个字节层 ⇒ 两侧不会各写一份标签
+# 顺序而静默错位。
 hmac.workspace = true
 sha2.workspace = true
+# Challenge/nonce 的 CSPRNG（M2 设计 §1.3：出口每连接取 16B 新鲜值）——**非异步栈名字**，
+# 且 workspace 既有依赖（零新版本面）。
+getrandom.workspace = true
 # TUN 面的裸 fd 语义（M1 S2-4：读线程 `read`/`poll`、回程写线程 `write`/`poll`——
 # 形态镜像 `homeway-core::wgcore`，两侧同口径）。**非异步栈名字**（隔离门只约束
 # tokio/quinn/rustls），且不引入新的传递依赖（core 已在用同一版本）。

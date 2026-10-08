@@ -46,7 +46,8 @@
 //! 刷新 + 迁移保持检测，M1 设计 §2.2/§2.3/§2.6）；`exit/` = **出口 QUIC 面**（异步面：
 //! 端点 + TransportConfig + RPK 身份 + 准入/数据面，M1 设计 §1.1/§1.2/§1.3/§1.4/§1.7）；
 //! `rpk` = RFC 7250 的**纯 std** 字节小件（种子/PKCS#8/SPKI——同步面也读得懂）；
-//! `reg3` = `hr-reg3` 注册帧的**纯 std** 字节层（`hmac`/`sha2` 非异步栈）；
+//! `reg4` = `hr-reg4` 客户端证明协议（四帧 + 刷新帧）的**纯 std** 字节层
+//! （`hmac`/`sha2`/`getrandom` 非异步栈名字 ⇒ 不占异步面白名单）；
 //! `sync_util` = 线程卫生小件；`tun` = 数据面的 **TUN fd 侧**（读线程 + 有界回程队列 +
 //! 写线程——全 std + libc，**零异步栈名字** ⇒ 不占异步面白名单，M1 S2-4）。
 //! **异步栈名字只允许出现在 `driver.rs`、`client/**` 与 `exit/**`**（隔离门层 3 断言；
@@ -57,7 +58,7 @@ mod cmd;
 mod config;
 mod driver;
 mod exit;
-mod reg3;
+mod reg4;
 mod rpk;
 mod sync_util;
 mod tun;
@@ -75,8 +76,10 @@ pub use config::{
 };
 pub use driver::{Island, IslandTx};
 pub use exit::{
-    ExitInbound, ExitQuic, ExitQuicConfig, ExitQuicErr, ExitQuicSnapshot, ExitSend, Reg3Request,
-    Reg3Verdict, FRAME_KIND_QUIC,
+    ExitInbound, ExitQuic, ExitQuicConfig, ExitQuicErr, ExitQuicSnapshot, ExitSend, Reg4Request,
+    Reg4Verdict, RejectWhy, FRAME_KIND_QUIC,
 };
-pub use reg3::Reg3Frame;
+// 帧层的**构造面**（组帧/解帧真源）：出口面校验与客户端组帧共用它；同步面（`homeway-core`
+// 的引擎与其测试）也用它——**不得**在消费侧另写一份标签顺序。
+pub use reg4::{Nonce, ProofFrame, RefreshFrame, Reg4Frame};
 pub use rpk::{Ed25519Seed, RpkErr, RpkPublicKey};

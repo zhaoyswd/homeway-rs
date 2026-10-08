@@ -219,16 +219,19 @@ impl DeviceTable {
         (self.cfg.max_devices, self.cfg.ttl, self.cfg.grace)
     }
 
-    /// **reg3（连接绑定版）的 MAC 匹配**（M1 设计 §1.3）：逐条试 token secret，命中即返回
+    /// **`hr-reg4` 的 MAC 匹配**（M2 设计 §1.4 步骤 4.2）：逐条试 token secret，命中即返回
     /// 该 secret。**纯校验**——不做时间窗、不走吊销钩子、不计数、不打行：三者全部留给
     /// [`Self::register`] 的同一条路径（命中后调用方用该 secret 重建 v2 报文再走 register）
     /// ⇒ `register` 的语义与判据行逐字不变，本方法只是「哪条 secret 认得这一帧」。
     ///
-    /// 换连接重放 ⇒ `exporter` 不同 ⇒ 恒不命中（这正是 reg3 存在的理由，见
-    /// `homeway_quic::Reg3Frame`）。
-    pub(crate) fn match_reg3(
+    /// 两类帧（准入 Proof / 刷新帧）的 **MAC 域标签不同**（`hr-reg4` / `hr-reg4-refresh`）
+    /// ——由 [`homeway_quic::Reg4Frame`] 的类型分派选域，本方法不重复判定（否则两处名单会漂移）。
+    ///
+    /// 换连接重放 ⇒ `exporter` 不同 ⇒ 恒不命中（这正是连接绑定存在的理由，见
+    /// `homeway_quic::reg4` 的模块头）。
+    pub(crate) fn match_proof(
         &self,
-        frame: &homeway_quic::Reg3Frame,
+        frame: &homeway_quic::Reg4Frame,
         exporter32: &[u8; 32],
     ) -> Option<[u8; 32]> {
         self.secrets.iter().copied().find(|s| frame.mac_matches(s, exporter32))

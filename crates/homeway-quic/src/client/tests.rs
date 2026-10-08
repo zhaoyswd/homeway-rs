@@ -2,7 +2,7 @@
 //! 上界——M0 设计 §9.2 flake 口径①②）。
 //!
 //! 本文件在异步面白名单内（`client/**`）⇒ 可以用 quinn/tokio 名字组装「测试用出口」与
-//! 「引擎桩」（裁决语义真源 = `homeway-core` 的 `admit_reg3`：MAC + **本连接** exporter）。
+//! 「引擎桩」（裁决语义真源 = `homeway-core` 的 `admit_reg4`：MAC + **本连接** exporter）。
 //!
 //! 覆盖的判据（设计 §10 的 S2-1/S2-2/S2-3/S2-6）：
 //! - 公面成员的行为面（命令→回执/快照/行文）；
@@ -30,7 +30,8 @@ use crate::cmd::{
 };
 use crate::config::{IslandConfig, IslandCredential, TokenSecret};
 use crate::driver::seams;
-use crate::exit::{ExitInbound, ExitQuic, ExitQuicConfig, Reg3Verdict};
+use crate::exit::{ExitInbound, ExitQuic, ExitQuicConfig, Reg4Verdict, RejectWhy};
+use crate::reg4::{EXPORTER_LABEL, EXPORTER_LEN, ProofFrame, RefreshFrame};
 use crate::rpk::{Ed25519Seed, RpkPublicKey};
 use crate::{Island, IslandTx};
 
@@ -305,7 +306,7 @@ fn inner_pkt(src: Ipv4Addr, dst: Ipv4Addr) -> Vec<u8> {
 }
 
 /// 测试侧「引擎桩」：只经**真接口**（`drain_inbound`）拿事件，裁决语义 = 核心侧
-/// `admit_reg3` 的 MAC 判定（secret + 本连接 exporter）。
+/// `admit_reg4` 的 MAC 判定（secret + 本连接 exporter；准入/刷新两域）。
 struct Stub {
     accepted: AtomicU64,
     rejected: AtomicU64,
@@ -326,13 +327,13 @@ impl Stub {
             ExitInbound::Reg(req) => {
                 if req.frame.mac_matches(&SECRET, &req.exporter) {
                     self.accepted.fetch_add(1, Ordering::SeqCst);
-                    req.reply(Reg3Verdict::Accepted {
+                    req.reply(Reg4Verdict::Accepted {
                         tunnel_ip: TUNNEL_IP,
                         tun_ip: TUN_IP,
                     });
                 } else {
                     self.rejected.fetch_add(1, Ordering::SeqCst);
-                    req.reply(Reg3Verdict::Rejected);
+                    req.reply(Reg4Verdict::Rejected { why: RejectWhy::MacMismatch });
                 }
             }
             ExitInbound::Packet { pkt, .. } => self.packets.lock().unwrap().push(pkt),
@@ -486,8 +487,9 @@ fn dead_candidate() -> (UdpSocket, Candidate) {
 
 // ---------- 1. 端点就绪 + 登记（真出口 + 引擎桩） ----------
 
-/// **判据（S2-6 主干）**：岛连上真出口 ⇒ 首条 bidi 控制流登记 ⇒ 出口侧引擎桩收到合法
-/// `hr-reg3`（= 真出口 `peer: +` 的等价面：绑定成功）⇒ N-a/C4'/C5'/C6' 行齐。
+/// **判据（S2-6 主干 / M2 §1.7）**：岛连上真出口 ⇒ 首条 bidi 控制流**四帧准入** ⇒
+/// 出口侧引擎桩收到合法 Proof（= 真出口 `peer: +` 的等价面：绑定成功）⇒ N-a/C4'/C5'/C6'
+/// + `准入已发起`/`准入完成` 行齐。
 #[tokio::test]
 async fn connect_registers_on_control_stream_and_logs_criteria_lines() {
     let quic = exit_face(1);
@@ -527,14 +529,15 @@ async fn connect_registers_on_control_stream_and_logs_criteria_lines() {
     assert!(snap.current_mtu >= 1320, "current_mtu ≥ min_mtu：{}", snap.current_mtu);
     assert_eq!(snap.mirrors, 1, "投出的候选数累计");
 
-    let lines = logs_until(&logs, "quic: 登记已发", WAIT).await;
+    let lines = logs_until(&logs, "quic: 准入完成", WAIT).await;
     for needle in [
         "quic: 端点就绪（本地 ",
         "quic: 赛跑投出 1 个候选（直连 1 / 中继 0；本行每轮限 3 条）",
         "quic: 赛跑结算：胜出 直连 ",
         "quic: 路径确立：直连 ",
         "（首个完成握手）",
-        "quic: 登记已发",
+        "quic: 准入已发起（dev=22222222，Hello 50B；等挑战/回执）",
+        "quic: 准入完成（dev=22222222，耗时 ",
     ] {
         assert!(
             lines.iter().any(|l| l.contains(needle)),
@@ -856,7 +859,8 @@ async fn refresh_timer_ticks_one_frame_per_patrol_in_virtual_time() {
     assert_eq!(fired, 3, "60s 节拍：3 拍恰 3 次");
 }
 
-/// **判据（S2-6）**：刷新帧字节级到达对端（`hr-reg3` + 本连接 exporter），行文 = C15'。
+/// **判据（M2 §1.8 的客户端半边）**：刷新帧（`R4` + 本连接 exporter）字节级到达对端，
+/// 行文 = C15'（M1 已登记，**一字不改**）。
 /// 岛侧节拍用短值（集成面不判精确墙钟——只判「按拍发生且逐帧合法」）。
 #[tokio::test]
 async fn refresh_frames_reach_peer_and_log_c15_prime() {
@@ -1333,23 +1337,24 @@ fn snapshot_default_is_empty_path() {
     assert_eq!(s.congestion_events, 0);
 }
 
-/// reg3 帧的**连接绑定**在客户端侧的字节面复核（S1-3 的对偶）：同 secret 同字段但
-/// exporter 不同 ⇒ 帧不同（换连接重放必败的客户端侧根据）。
+/// `hr-reg4` 帧的**连接绑定**在客户端侧的字节面复核（S1-1 的对偶）：同 secret 同字段但
+/// exporter 不同 ⇒ 帧不同（换连接重放必败的客户端侧根据）；Proof 与刷新帧**域分隔**。
 #[test]
-fn reg3_frame_binds_to_exporter() {
-    let cred = IslandCredential::new(
-        TokenSecret::from_bytes(SECRET),
-        PUBKEY,
-        DEV,
-        RpkPublicKey::from_bytes([0x33; 32]),
-    );
-    let a = register::frame_now(&cred, &[0xA1; 32]);
-    let b = register::frame_now(&cred, &[0xB2; 32]);
-    assert_ne!(a, b, "exporter 不同 ⇒ 帧不同");
-    assert_eq!(&a[..2], b"H3", "魔数 = H3");
-    assert_eq!(a.len(), crate::reg3::LEN);
-    assert_eq!(&a[2..34], &PUBKEY);
-    assert_eq!(&a[34..42], &DEV);
+fn reg4_frames_bind_to_exporter_and_are_domain_separated() {
+    let nonce = crate::reg4::Nonce::from_bytes([0x77; 16]);
+    let proof_a = ProofFrame::encode(&SECRET, &PUBKEY, &DEV, 1_800_000_000, &nonce, &[0xA1; EXPORTER_LEN]);
+    let proof_b = ProofFrame::encode(&SECRET, &PUBKEY, &DEV, 1_800_000_000, &nonce, &[0xB2; EXPORTER_LEN]);
+    assert_ne!(proof_a, proof_b, "exporter 不同 ⇒ Proof 不同");
+    assert_eq!(&proof_a[..2], b"P4", "魔数 = P4");
+    assert_eq!(proof_a.len(), crate::reg4::PROOF_LEN);
+    assert_eq!(&proof_a[2..34], &PUBKEY);
+    assert_eq!(&proof_a[34..42], &DEV);
+    // 刷新帧：另一域（同 exporter、同字段，但 MAC 不同 ⇒ 不可互冒）
+    let refresh = RefreshFrame::encode(&SECRET, &PUBKEY, &DEV, 1_800_000_000, &[0xA1; EXPORTER_LEN]);
+    assert_eq!(&refresh[..2], b"R4");
+    assert_eq!(refresh.len(), crate::reg4::REFRESH_LEN);
+    assert_ne!(&refresh[50..66], &proof_a[66..82], "两域 MAC 必须不同（域分隔）");
+    let _ = (register::now_unix(), EXPORTER_LABEL);
 }
 
 // ---------- 6. 数据面（S2-4）：TUN ⇄ DATAGRAM + 四类计数 ----------

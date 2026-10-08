@@ -13,7 +13,7 @@
 //! 断言面（每条一行 `key=value` 读数，供 `docs/reviews/M1.md` 摘抄）：
 //! ①`Connect` Ok（赛跑胜出 + 登记）；②出口日志 `peer: +`（真设备表登记）；
 //! ③`Probe` Ok（判活）；④`Rebind` Ok ⇒ 出口 `quic: 路径变更`（E-q2）+ 岛 `migrations=1`
-//! （保持窗内收到对端回包 ⇒ 迁移完成）+ 出口再收一帧刷新（`quic: 连接采纳` ← **新源**）
+//! （保持窗内收到对端回包 ⇒ 迁移完成）+ 出口再收一帧刷新（表内 E8 行 ← **新源**）
 //! 证「收发继续」。
 
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
@@ -77,6 +77,24 @@ fn wait_log_from(
                 .find(|l| l.contains(needle) && also.is_none_or(|a| l.contains(a)))
             {
                 return Some(l.to_owned());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    None
+}
+
+/// 有界等待：日志里出现 `needle`，且它**位于**含 `after` 的那一行之后（行序 = 时间序；
+/// 用「同一次运行内的新行」判时序，不引入墙钟断言——flake 口径②）。
+fn wait_log_after(path: &PathBuf, skip: usize, needle: &str, after: &str, wait: Duration) -> Option<String> {
+    let deadline = Instant::now() + wait;
+    while Instant::now() < deadline {
+        if let Ok(s) = std::fs::read_to_string(path) {
+            let lines: Vec<&str> = s.lines().skip(skip).collect();
+            if let Some(pos) = lines.iter().position(|l| l.contains(after)) {
+                if let Some(l) = lines[pos + 1..].iter().find(|l| l.contains(needle)) {
+                    return Some((*l).to_owned());
+                }
             }
         }
         std::thread::sleep(Duration::from_millis(50));
@@ -222,12 +240,24 @@ fn island_connects_registers_and_survives_rebind_against_local_exit() {
     assert!(!snap.migration_unconfirmed, "不得判未确认");
     assert_eq!(snap.via, Some(Via::Direct), "连接保持（via 未清）");
 
-    // 「收发继续」的客户端 → 出口方向：刷新帧（节拍 2s）必须从**新源**到达出口
-    // ⇒ 出口打 `quic: 连接采纳 … ← <新源>`（bind 行带当前 remote_address）
-    let new_ip = to.ip().to_string();
-    let adopt_line = wait_log_from(&exit_log, log0, "quic: 连接采纳", Some(&new_ip), WAIT)
-        .expect("刷新帧必须从新源到达出口（client → exit 继续；本轮新增行）");
-    println!("[e2e] exit.adopt_on_new_path={adopt_line}");
+    // 「收发继续」的客户端 → 出口方向：刷新帧（节拍 2s）必须从**新源**到达出口并被采纳。
+    //
+    // ⚠️ M2 §1.8 / r14 F11：刷新成功**不重绑、不打 E-q2**（`quic: 连接采纳` 只在首次准入打）
+    // ⇒ 服务端侧的到达证据 = 表内 E8 行 `peer: ~ dev=… refresh (idle=…)`（**原串不变**，
+    // M1 已登记），且必须落在**路径变更行之后**（本轮新行序 = 时间序）。
+    let refresh_line = wait_log_after(&exit_log, log0, "refresh (idle=", "quic: 路径变更", WAIT)
+        .expect("刷新帧必须从新源到达出口（client → exit 继续；E8 原串）");
+    println!("[e2e] exit.refresh_on_new_path={refresh_line}");
+    // 反向断言（r14 F11 的判据）：整轮**只有一条**采纳行（= 首次准入），刷新不再产生
+    let run_log = std::fs::read_to_string(&exit_log).unwrap_or_default();
+    let adopt_lines: Vec<&str> =
+        run_log.lines().skip(log0).filter(|l| l.contains("quic: 连接采纳")).collect();
+    assert_eq!(
+        adopt_lines.len(),
+        1,
+        "刷新成功不得再打采纳行（M2 §1.8）：{adopt_lines:?}"
+    );
+    let _ = to; // 迁移后的本地地址（读数已打印；判据靠路径变更行 + E8 行序）
 
     // 连接未断（快照仍有路径 + 岛未退出）
     assert!(!island.is_finished(), "岛必须还活着");

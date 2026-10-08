@@ -1499,10 +1499,10 @@ fn sync_quic_legs(bind: &mut ServerBind, quic: Option<&homeway_quic::ExitQuic>) 
     }
 }
 
-/// 出口 QUIC 面的入站事件消化（**引擎线程内**；M1 设计 §1.3/§1.4 的接线点）。
+/// 出口 QUIC 面的入站事件消化（**引擎线程内**；M2 设计 §1.4 的接线点）。
 ///
-/// - `Reg`：准入裁决（reg3 连接绑定 MAC → **原样走 `table.register`**）并**必须回执**
-///   （回执非阻塞：oneshot `send` 是普通内存操作）；
+/// - `Reg`：准入/刷新裁决（`hr-reg4` 连接绑定 MAC → **原样走 `table.register`**）并**必须回执**
+///   （回执非阻塞：oneshot `send` 是普通内存操作；拒绝原因**类型化**回传——r14 F7）；
 /// - `Packet`：源校验已在出口面做完 ⇒ 直投 `intercept.on_plain`（与 WG 入站的明文面同址
 ///   ——`device.rs` 的 `StepOut::PlainV4` 投递点语义等价）。
 fn on_quic_inbound(
@@ -1515,7 +1515,7 @@ fn on_quic_inbound(
 ) {
     match item {
         homeway_quic::ExitInbound::Reg(req) => {
-            let verdict = admit_reg3(&req.frame, &req.exporter, device, table, quic, dlogf);
+            let verdict = admit_reg4(&req.frame, &req.exporter, device, table, quic, dlogf);
             req.reply(verdict);
         }
         homeway_quic::ExitInbound::Packet { pkt, .. } => intercept.on_plain(pkt),
@@ -1524,49 +1524,57 @@ fn on_quic_inbound(
     }
 }
 
-/// 准入裁决（M1 设计 §1.3）：reg3 的 MAC（连接绑定）校验 ⇒ **用命中的 secret 重建 v2 报文
-/// ⇒ `table.register`**。
+/// 准入裁决（M2 设计 §1.4 步骤 4.2）：`hr-reg4` 两帧（Proof / 刷新帧）的 MAC（连接绑定）
+/// 校验 ⇒ **用命中的 secret 重建 v2 报文 ⇒ `table.register`**。
 ///
 /// 为什么重建 v2 而不是给表加「已验」入口：`register` 的语义（时间窗 ±90s / 吊销跟随 /
 /// 表满淘汰 / 地址冲突 / `peer: +`·`~`·`-` 判据行与拒绝计数）必须**逐字不变**——重建报文
-/// 让这些全部走原路径，reg3 只多一层「哪条 secret 认得这一帧、且这一帧绑在本连接上」。
-fn admit_reg3(
-    frame: &homeway_quic::Reg3Frame,
+/// 让这些全部走原路径，`hr-reg4` 只多一层「哪条 secret 认得这一帧、且这一帧绑在本连接上」。
+///
+/// **拒绝原因类型化**（r14 F7）：MAC 试秘在本函数内，出口面拿不到原因 ⇒ 由 verdict 携带
+/// （否则出口面打不出 `hr-reg4 MAC 不符` 这条归因行）。两类落点（r14 F1）：
+/// `MacMismatch` ⇒ 出口面 `hr-reg4 MAC 不符`；`EngineRejected` ⇒ 出口面 `引擎裁决拒绝` +
+/// **表内自己的归因行**（`no-token`/`revoked`/`table-full`/`ip-conflict`；`ts` 超 ±90s 窗
+/// 属于这一类——MAC 验过、窗拒，表内打 `reason=no-token`）。
+fn admit_reg4(
+    frame: &homeway_quic::Reg4Frame,
     exporter: &[u8; 32],
     device: &mut Device,
     table: &mut DeviceTable,
     quic: Option<&homeway_quic::ExitQuic>,
     dlogf: &Logf,
-) -> homeway_quic::Reg3Verdict {
-    let Some(secret) = table.match_reg3(frame, exporter) else {
+) -> homeway_quic::Reg4Verdict {
+    use homeway_quic::{Reg4Verdict, RejectWhy};
+
+    let Some(secret) = table.match_proof(frame, exporter) else {
         // MAC 不符：不是本出口的 token，或**同一帧换了连接**（重放——exporter 变了）。
         // 两种情形同面（不可区分，也不该区分）：都拒。
         (dlogf)(&format!(
-            "quic: 准入被拒（dev={} pub={}；hr-reg3 MAC 不符——含换连接重放）",
-            dev_short(&frame.dev_tag),
-            pub_short(&frame.pubkey)
+            "quic: 准入被拒（dev={} pub={}；hr-reg4 MAC 不符——含换连接重放）",
+            dev_short(&frame.dev_tag()),
+            pub_short(&frame.pubkey())
         ));
-        return homeway_quic::Reg3Verdict::Rejected;
+        return Reg4Verdict::Rejected { why: RejectWhy::MacMismatch };
     };
     let mut reg2 = Vec::with_capacity(reg::REG_LEN);
     reg::encode_reg_parts(
         &crate::token::Secret::from(secret),
-        &frame.pubkey,
-        &frame.dev_tag,
-        frame.ts,
+        &frame.pubkey(),
+        &frame.dev_tag(),
+        frame.ts(),
         &mut reg2,
     );
     match table.register(&reg2, SystemTime::now()) {
         Ok((_action, ops)) => {
             apply_dev_ops(ops, device, quic);
-            match table.device_addrs(&frame.dev_tag) {
-                Some((tunnel_ip, tun_ip)) => homeway_quic::Reg3Verdict::Accepted { tunnel_ip, tun_ip },
+            match table.device_addrs(&frame.dev_tag()) {
+                Some((tunnel_ip, tun_ip)) => Reg4Verdict::Accepted { tunnel_ip, tun_ip },
                 // 理论不可达（刚注册成功必在表内）；真出现即拒（宁可让客户端重连）
-                None => homeway_quic::Reg3Verdict::Rejected,
+                None => Reg4Verdict::Rejected { why: RejectWhy::EngineRejected },
             }
         }
         // 表内已打拒绝归因行 + 计数（no-token/revoked/table-full/ip-conflict），此处不重复
-        Err(_reason) => homeway_quic::Reg3Verdict::Rejected,
+        Err(_reason) => Reg4Verdict::Rejected { why: RejectWhy::EngineRejected },
     }
 }
 
@@ -2580,9 +2588,9 @@ mod tests {
         Device::new(x25519_dalek::StaticSecret::from([0x5Au8; 32]), logf)
     }
 
-    // ---------- S1b：准入（hr-reg3 连接绑定）/ 入站接线 / 出站分流 ----------
+    // ---------- S1b/M2 S1：准入（hr-reg4 四帧 + 连接绑定）/ 入站接线 / 出站分流 ----------
 
-    /// reg3 用 secret（与既有 reg2 用例的 secret 无关，避免互相干扰）。
+    /// `hr-reg4` 用 secret（与既有 reg2 用例的 secret 无关，避免互相干扰）。
     const REG3_SECRET: [u8; 32] = [0x6Au8; 32];
 
     /// 行收集器（断言判据行）。
@@ -2599,7 +2607,7 @@ mod tests {
         lines.lock().unwrap().clone()
     }
 
-    fn reg3_table(logf: &Logf) -> DeviceTable {
+    fn reg4_table(logf: &Logf) -> DeviceTable {
         DeviceTable::new(
             vec![REG3_SECRET],
             TableConfig { max_devices: 4, ..Default::default() },
@@ -2607,7 +2615,7 @@ mod tests {
         )
     }
 
-    /// 墙钟（`admit_reg3` 内部取 `SystemTime::now()`——时间窗用例必须用真时刻，
+    /// 墙钟（`admit_reg4` 内部取 `SystemTime::now()`——时间窗用例必须用真时刻，
     /// 不能用既有用例的固定 1_800_000_000）。
     fn real_now_unix() -> u64 {
         SystemTime::now()
@@ -2616,37 +2624,55 @@ mod tests {
             .as_secs()
     }
 
-    /// 组 + 解一帧 `hr-reg3`（走本仓唯一的组帧实现——测试不另写一份标签顺序）。
-    fn reg3_frame(
+    /// 组 + 解一帧 `hr-reg4` 准入 Proof（走本仓唯一的组帧实现——测试不另写一份标签顺序）。
+    fn reg4_proof(
         secret: &[u8; 32],
         pubkey: &[u8; 32],
         dev_tag: &[u8; 8],
         exporter: &[u8; 32],
-    ) -> homeway_quic::Reg3Frame {
+        ts: u64,
+    ) -> homeway_quic::Reg4Frame {
+        let nonce = homeway_quic::Nonce::from_bytes([0x5C; 16]);
         let raw =
-            homeway_quic::Reg3Frame::encode(secret, pubkey, dev_tag, real_now_unix(), exporter);
-        homeway_quic::Reg3Frame::parse(&raw).expect("本仓组帧必可解")
+            homeway_quic::ProofFrame::encode(secret, pubkey, dev_tag, ts, &nonce, exporter);
+        homeway_quic::Reg4Frame::Proof(
+            homeway_quic::ProofFrame::parse(&raw).expect("本仓组帧必可解"),
+        )
     }
 
-    /// **判据（S1-3）**：合法 reg3 ⇒ 采纳（`Accepted` + 派生地址回填）+ `peer: +` 判据行
+    /// 组 + 解一帧 `hr-reg4` 刷新帧（另一 MAC 域）。
+    fn reg4_refresh(
+        secret: &[u8; 32],
+        pubkey: &[u8; 32],
+        dev_tag: &[u8; 8],
+        exporter: &[u8; 32],
+        ts: u64,
+    ) -> homeway_quic::Reg4Frame {
+        let raw = homeway_quic::RefreshFrame::encode(secret, pubkey, dev_tag, ts, exporter);
+        homeway_quic::Reg4Frame::Refresh(
+            homeway_quic::RefreshFrame::parse(&raw).expect("本仓组帧必可解"),
+        )
+    }
+
+    /// **判据（S1-3）**：合法 Proof ⇒ 采纳（`Accepted` + 派生地址回填）+ `peer: +` 判据行
     /// + `device` 侧真加上 peer（`table.register` 的原路径）。
     #[test]
-    fn admit_reg3_accepts_valid_frame() {
+    fn admit_reg4_accepts_valid_frame() {
         let (lines, logf) = line_sink();
-        let mut table = reg3_table(&logf);
+        let mut table = reg4_table(&logf);
         let mut device = dev();
         let pubkey = [0x21u8; 32];
         let dev_tag = [0x22u8; 8];
         let exporter = [0x23u8; 32];
-        let frame = reg3_frame(&REG3_SECRET, &pubkey, &dev_tag, &exporter);
+        let frame = reg4_proof(&REG3_SECRET, &pubkey, &dev_tag, &exporter, real_now_unix());
 
-        match admit_reg3(&frame, &exporter, &mut device, &mut table, None, &logf) {
-            homeway_quic::Reg3Verdict::Accepted { tunnel_ip, tun_ip } => {
+        match admit_reg4(&frame, &exporter, &mut device, &mut table, None, &logf) {
+            homeway_quic::Reg4Verdict::Accepted { tunnel_ip, tun_ip } => {
                 let sec = crate::token::Secret::from(REG3_SECRET);
                 assert_eq!(tunnel_ip, crate::tunnel_addr::derive_tunnel_ip(&sec, &pubkey));
                 assert_eq!(tun_ip, crate::tunnel_addr::derive_tun_ip(&sec, &pubkey));
             }
-            _ => panic!("合法 reg3 必须采纳"),
+            other => panic!("合法 Proof 必须采纳：{other:?}"),
         }
         assert!(device.has_peer(&pubkey), "ops 已落 device");
         assert_eq!(table.len(), 1);
@@ -2657,27 +2683,31 @@ mod tests {
         );
     }
 
-    /// **判据（S1-3 的核心）**：**同帧换连接（重放）必须失败**——MAC 混入了该连接的
-    /// TLS exporter，换连接后 exporter 不同 ⇒ 校验不过 ⇒ 拒绝且**不产生任何登记副作用**；
+    /// **判据（S1-3/S1-7 的核心）**：**同帧换连接（重放）必须失败**——MAC 混入了该连接的
+    /// TLS exporter，换连接后 exporter 不同 ⇒ 校验不过 ⇒ `why=MacMismatch`（**类型化**，
+    /// 出口面据此打 `hr-reg4 MAC 不符`）且**不产生任何登记副作用**；
     /// 对照：同一帧在原连接上（exporter 一致）⇒ 通过。
     #[test]
-    fn admit_reg3_rejects_frame_replayed_on_another_connection() {
+    fn admit_reg4_rejects_frame_replayed_on_another_connection() {
         let (lines, logf) = line_sink();
         let pubkey = [0x31u8; 32];
         let dev_tag = [0x32u8; 8];
         let exporter_a = [0xA1u8; 32];
-        let frame = reg3_frame(&REG3_SECRET, &pubkey, &dev_tag, &exporter_a);
+        let frame = reg4_proof(&REG3_SECRET, &pubkey, &dev_tag, &exporter_a, real_now_unix());
 
         // 重放：同一帧换到 exporter_b（另一条连接）上验
-        let mut table = reg3_table(&logf);
+        let mut table = reg4_table(&logf);
         let mut device = dev();
-        let v = admit_reg3(&frame, &[0xB2u8; 32], &mut device, &mut table, None, &logf);
-        assert!(matches!(v, homeway_quic::Reg3Verdict::Rejected), "重放必须被拒");
+        let v = admit_reg4(&frame, &[0xB2u8; 32], &mut device, &mut table, None, &logf);
+        assert!(
+            matches!(v, homeway_quic::Reg4Verdict::Rejected { why: homeway_quic::RejectWhy::MacMismatch }),
+            "重放必须归 MacMismatch（出口面按它打归因行）：{v:?}"
+        );
         assert_eq!(device.peer_count(), 0, "被拒不得落 peer");
         assert_eq!(table.len(), 0, "被拒不得进设备表");
         let ls = lines_of(&lines);
         assert!(
-            ls.iter().any(|l| l.contains("hr-reg3 MAC 不符")),
+            ls.iter().any(|l| l.contains("hr-reg4 MAC 不符")),
             "应有归因行（MAC 不符——含换连接重放）：{ls:?}"
         );
         assert!(
@@ -2686,61 +2716,121 @@ mod tests {
         );
 
         // 对照：原连接（exporter_a）⇒ 通过
-        let mut table2 = reg3_table(&logf);
-        let v2 = admit_reg3(&frame, &exporter_a, &mut dev(), &mut table2, None, &logf);
+        let mut table2 = reg4_table(&logf);
+        let v2 = admit_reg4(&frame, &exporter_a, &mut dev(), &mut table2, None, &logf);
         assert!(
-            matches!(v2, homeway_quic::Reg3Verdict::Accepted { .. }),
-            "同连接上同一帧应通过"
+            matches!(v2, homeway_quic::Reg4Verdict::Accepted { .. }),
+            "同连接上同一帧应通过：{v2:?}"
         );
     }
 
-    /// 坏 MAC（错 secret / 篡改字段）⇒ 拒绝 + 归因行；不得留下任何登记副作用。
+    /// 坏 MAC（错 secret / 篡改字段）⇒ `MacMismatch` + 归因行；不得留下任何登记副作用。
     #[test]
-    fn admit_reg3_rejects_bad_mac() {
+    fn admit_reg4_rejects_bad_mac() {
         let (lines, logf) = line_sink();
-        let mut table = reg3_table(&logf);
+        let mut table = reg4_table(&logf);
         let mut device = dev();
         // ① 别的 secret 组帧（不是本出口的 token）
-        let other = reg3_frame(&[0x99u8; 32], &[0x41; 32], &[0x42; 8], &[0x43; 32]);
+        let other = reg4_proof(&[0x99u8; 32], &[0x41; 32], &[0x42; 8], &[0x43; 32], real_now_unix());
         assert!(matches!(
-            admit_reg3(&other, &[0x43u8; 32], &mut device, &mut table, None, &logf),
-            homeway_quic::Reg3Verdict::Rejected
+            admit_reg4(&other, &[0x43u8; 32], &mut device, &mut table, None, &logf),
+            homeway_quic::Reg4Verdict::Rejected { why: homeway_quic::RejectWhy::MacMismatch }
         ));
         // ② 合法帧篡改 mac 一位
-        let mut tampered = reg3_frame(&REG3_SECRET, &[0x44; 32], &[0x45; 8], &[0x46; 32]);
+        let mut tampered =
+            match reg4_proof(&REG3_SECRET, &[0x44; 32], &[0x45; 8], &[0x46; 32], real_now_unix()) {
+                homeway_quic::Reg4Frame::Proof(f) => f,
+                other => panic!("本仓组帧必是 Proof：{other:?}"),
+            };
         tampered.mac[0] ^= 1;
         assert!(matches!(
-            admit_reg3(&tampered, &[0x46u8; 32], &mut device, &mut table, None, &logf),
-            homeway_quic::Reg3Verdict::Rejected
+            admit_reg4(
+                &homeway_quic::Reg4Frame::Proof(tampered),
+                &[0x46u8; 32],
+                &mut device,
+                &mut table,
+                None,
+                &logf
+            ),
+            homeway_quic::Reg4Verdict::Rejected { why: homeway_quic::RejectWhy::MacMismatch }
         ));
         assert_eq!(device.peer_count(), 0);
         assert_eq!(table.len(), 0);
-        assert!(lines_of(&lines).iter().filter(|l| l.contains("hr-reg3 MAC 不符")).count() >= 2);
+        assert!(lines_of(&lines).iter().filter(|l| l.contains("hr-reg4 MAC 不符")).count() >= 2);
     }
 
-    /// 时间窗**仍由 `table.register` 原路径承载**（重建 v2 报文的意义）：超窗的 reg3
-    /// MAC 验得过、但登记被拒（归因行来自表内）——证明 reg3 没绕开任何既有语义。
+    /// **判据（S1-1 的域分隔，引擎面）**：把准入 Proof 的字节当**刷新帧**送去验 ⇒ 域标签
+    /// 不同 ⇒ `MacMismatch`（两帧不可互相冒充）；真刷新帧 ⇒ 采纳。
     #[test]
-    fn admit_reg3_still_enforces_reg_window() {
+    fn admit_reg4_separates_proof_and_refresh_domains() {
         let (lines, logf) = line_sink();
-        let mut table = reg3_table(&logf);
+        let pubkey = [0x61u8; 32];
+        let dev_tag = [0x62u8; 8];
+        let exporter = [0x63u8; 32];
+        let ts = real_now_unix();
+        // 先让设备在册（刷新帧的语义前提）
+        let mut table = reg4_table(&logf);
+        let mut device = dev();
+        let proof = reg4_proof(&REG3_SECRET, &pubkey, &dev_tag, &exporter, ts);
+        assert!(matches!(
+            admit_reg4(&proof, &exporter, &mut device, &mut table, None, &logf),
+            homeway_quic::Reg4Verdict::Accepted { .. }
+        ));
+
+        // ① 把 Proof 的 MAC 塞进刷新帧（同字段同 exporter）⇒ 域不符 ⇒ 拒
+        let homeway_quic::Reg4Frame::Proof(pf) = proof else { panic!("Proof 变体") };
+        let mut raw = homeway_quic::RefreshFrame::encode(&REG3_SECRET, &pubkey, &dev_tag, ts, &exporter);
+        raw[50..66].copy_from_slice(&pf.mac);
+        let forged = homeway_quic::Reg4Frame::Refresh(
+            homeway_quic::RefreshFrame::parse(&raw).expect("可解"),
+        );
+        let v = admit_reg4(&forged, &exporter, &mut device, &mut table, None, &logf);
+        assert!(
+            matches!(v, homeway_quic::Reg4Verdict::Rejected { why: homeway_quic::RejectWhy::MacMismatch }),
+            "Proof 的 MAC 不得在刷新域成立：{v:?}"
+        );
+
+        // ② 真刷新帧 ⇒ 采纳（同 devTag 同 pubkey ⇒ 表内 Refreshed 路径）
+        let refresh = reg4_refresh(&REG3_SECRET, &pubkey, &dev_tag, &exporter, ts);
+        let v2 = admit_reg4(&refresh, &exporter, &mut device, &mut table, None, &logf);
+        assert!(matches!(v2, homeway_quic::Reg4Verdict::Accepted { .. }), "{v2:?}");
+        assert_eq!(table.len(), 1, "刷新不新增设备");
+        assert!(
+            lines_of(&lines).iter().any(|l| l.contains("refresh (idle=")),
+            "刷新走表内 `peer: ~` 原路径"
+        );
+    }
+
+    /// 时间窗**仍由 `table.register` 原路径承载**（重建 v2 报文的意义）：超窗的 Proof
+    /// MAC 验得过、但登记被拒 ⇒ `why=EngineRejected`（**出口面据此打「引擎裁决拒绝」**）
+    /// + 表内 `peer: ! reject reason=no-token`（r14 F1 的双面断言）。
+    #[test]
+    fn admit_reg4_still_enforces_reg_window() {
+        let (lines, logf) = line_sink();
+        let mut table = reg4_table(&logf);
         let pubkey = [0x51u8; 32];
         let dev_tag = [0x52u8; 8];
         let exporter = [0x53u8; 32];
         let stale_ts = real_now_unix() - 3600; // 远超 ±90s
-        let raw =
-            homeway_quic::Reg3Frame::encode(&REG3_SECRET, &pubkey, &dev_tag, stale_ts, &exporter);
-        let frame = homeway_quic::Reg3Frame::parse(&raw).unwrap();
+        let frame = reg4_proof(&REG3_SECRET, &pubkey, &dev_tag, &exporter, stale_ts);
         assert!(
             frame.mac_matches(&REG3_SECRET, &exporter),
             "MAC 覆盖域含 ts——超窗帧的 MAC 仍成立"
         );
-        let v = admit_reg3(&frame, &exporter, &mut dev(), &mut table, None, &logf);
-        assert!(matches!(v, homeway_quic::Reg3Verdict::Rejected), "超窗必须被拒");
-        assert_eq!(table.len(), 0);
+        let v = admit_reg4(&frame, &exporter, &mut dev(), &mut table, None, &logf);
         assert!(
-            lines_of(&lines).iter().any(|l| l.contains("reject reason=no-token")),
-            "超窗归因走表内原路径（no-token——与今日 reg2 同归因）"
+            matches!(v, homeway_quic::Reg4Verdict::Rejected { why: homeway_quic::RejectWhy::EngineRejected }),
+            "超窗必须归 EngineRejected（MAC 过、窗拒）：{v:?}"
+        );
+        assert_eq!(table.len(), 0);
+        let ls = lines_of(&lines);
+        assert!(
+            ls.iter().any(|l| l.contains("reject reason=no-token")),
+            "超窗归因走表内原路径（no-token——与今日 reg2 同归因）：{ls:?}"
+        );
+        assert!(
+            !ls.iter().any(|l| l.contains("hr-reg4 MAC 不符")),
+            "超窗不是 MAC 类拒绝（归因必须可分辨）：{ls:?}"
         );
     }
 

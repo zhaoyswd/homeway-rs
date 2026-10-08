@@ -116,7 +116,7 @@ impl L3Bearer {
     }
 }
 
-/// 岛侧赛跑预算（世代装配期一次；覆盖 LAN/中继握手 + `hr-reg3` 登记窗）。
+/// 岛侧赛跑预算（世代装配期一次；覆盖 LAN/中继握手 + `hr-reg4` 四帧准入）。
 const QUIC_CONNECT_BUDGET: Duration = Duration::from_secs(5);
 /// 岛侧同步命令（TunAttach / Rebind）的等待预算（岛内短路径，超时 = 异常）。
 const QUIC_RPC_BUDGET: Duration = Duration::from_secs(5);
