@@ -835,6 +835,39 @@ async fn reg4_proof_replay_on_another_connection_is_rejected() {
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
 
+/// **判据（S1-2 的 nonce 门 · 错 nonce）**：secret/exporter/字段全对，但 nonce 不是本连接
+/// 出口发的那一枚 ⇒ 出口面在**投引擎之前**拒（`nonce 缺失/过期/已消费`）——引擎桩零帧、
+/// 零设备表副作用、连接被关。（真机上无法构造，设计 §7 明列：错 nonce 只本地注入。）
+#[tokio::test]
+async fn wrong_nonce_is_rejected_before_engine() {
+    let (logf, rx) = sink();
+    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(52), 32), logf)
+        .expect("端点可起");
+    let stub = Stub::new(SECRET);
+    let pubkey = [0x81u8; 32];
+    let dev = [0x82u8; 8];
+    let (_c, conn, _s) = client_conn(&quic).await;
+    let (mut send, _recv, nonce) = hello_and_challenge(&conn, &pubkey, &dev).await;
+
+    // 造一枚**不同**的 nonce（同长度、非零、!= 出口那枚）
+    let mut wrong = *nonce.as_bytes();
+    wrong[0] ^= 0xFF;
+    let wrong = crate::reg4::Nonce::from_bytes(wrong);
+    assert!(!wrong.ct_eq(&nonce), "用例自身有效：两枚 nonce 必须不同");
+    let frame = ProofFrame::encode(&SECRET, &pubkey, &dev, TS, &wrong, &exporter_of(&conn));
+    send.write_all(&frame).await.expect("写错 nonce 的 Proof");
+
+    pump_until_line(&stub, &quic, &rx, "nonce 缺失/过期/已消费", WAIT).await;
+    assert_eq!(stub.proofs(), 0, "错 nonce 不得投到引擎（门在试秘之前）");
+    assert_eq!(quic.snapshot().proof_rejected, 1, "拒绝归到 Proof 段");
+    assert_eq!(quic.snapshot().regs_accepted, 0, "不得采纳");
+    assert!(
+        pump_until(&stub, &quic, || conn.close_reason().is_some(), WAIT).await,
+        "错 nonce 必须关连接"
+    );
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
 /// **判据（S1-1 的连接绑定）**：持 secret 但**用别的连接的值算 MAC**（exporter 不符）
 /// ⇒ 引擎试秘全不命中 ⇒ `MacMismatch` ⇒ 出口面打 `hr-reg4 MAC 不符——含换连接重放`。
 #[tokio::test]
