@@ -52,26 +52,30 @@ fn cmd<T>(island: &Island, make: impl FnOnce(IslandReply<T>) -> Cmd, wait: Durat
     }
 }
 
-/// 有界等待日志文件出现某行（返回命中的行）。
-fn wait_log(path: &PathBuf, needle: &str, wait: Duration) -> Option<String> {
-    let deadline = Instant::now() + wait;
-    while Instant::now() < deadline {
-        if let Ok(s) = std::fs::read_to_string(path) {
-            if let Some(l) = s.lines().find(|l| l.contains(needle)) {
-                return Some(l.to_owned());
-            }
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    None
+/// 当前日志行数（本轮基线的起点——断言只认同一次运行里**新增**的行，
+/// 否则上一轮的 `peer: +` 会让本轮断言假绿）。
+fn log_lines(path: &PathBuf) -> usize {
+    std::fs::read_to_string(path)
+        .map(|s| s.lines().count())
+        .unwrap_or(0)
 }
 
-/// 有界等待日志文件里出现 `needle`（且可要求同时含 `also`）。
-fn wait_log_both(path: &PathBuf, needle: &str, also: &str, wait: Duration) -> Option<String> {
+/// 有界等待日志文件**第 `skip` 行之后**出现 `needle`（可选同时含 `also`；返回命中的行）。
+fn wait_log_from(
+    path: &PathBuf,
+    skip: usize,
+    needle: &str,
+    also: Option<&str>,
+    wait: Duration,
+) -> Option<String> {
     let deadline = Instant::now() + wait;
     while Instant::now() < deadline {
         if let Ok(s) = std::fs::read_to_string(path) {
-            if let Some(l) = s.lines().find(|l| l.contains(needle) && l.contains(also)) {
+            if let Some(l) = s
+                .lines()
+                .skip(skip)
+                .find(|l| l.contains(needle) && also.is_none_or(|a| l.contains(a)))
+            {
                 return Some(l.to_owned());
             }
         }
@@ -116,6 +120,7 @@ fn island_connects_registers_and_survives_rebind_against_local_exit() {
     let exit_log = PathBuf::from(
         std::env::var("HOMEWAY_ISLAND_E2E_EXIT_LOG").expect("须给 HOMEWAY_ISLAND_E2E_EXIT_LOG"),
     );
+    let log0 = log_lines(&exit_log); // 本轮基线：断言只认本次运行新增的行
     let tok = token::decode(&token_str).expect("token 可解（serve token 的输出里抽 hmw1…）");
     let rpk = tok.rpk.expect("M1 的 token 必带出口 RPK（S1-9 的 additive 字段）");
 
@@ -170,7 +175,8 @@ fn island_connects_registers_and_survives_rebind_against_local_exit() {
     println!("[e2e] race.completed={:?}", outcome.completed);
 
     // ---- ② 出口侧 `peer: +`（真设备表登记；engine 的判据行）----
-    let peer_line = wait_log(&exit_log, "peer: +", WAIT).expect("出口必须打 `peer: +`（真登记）");
+    let peer_line = wait_log_from(&exit_log, log0, "peer: +", None, WAIT)
+        .expect("出口必须打 `peer: +`（真登记；本轮新增行）");
     println!("[e2e] exit.peer_line={peer_line}");
 
     // ---- ③ 判活 ----
@@ -197,8 +203,8 @@ fn island_connects_registers_and_survives_rebind_against_local_exit() {
     .expect("rebind 必须成功");
     println!("[e2e] rebind.to={to}");
 
-    let change = wait_log(&exit_log, "quic: 路径变更", WAIT)
-        .expect("出口必须观测到路径变更（E-q2：remote_address() 变化）");
+    let change = wait_log_from(&exit_log, log0, "quic: 路径变更", None, WAIT)
+        .expect("出口必须观测到路径变更（E-q2：remote_address() 变化；本轮新增行）");
     println!("[e2e] exit.path_change_line={change}");
 
     // 迁移完成（保持窗内收到对端回包 ⇒ N-b）；轮询快照
@@ -219,8 +225,8 @@ fn island_connects_registers_and_survives_rebind_against_local_exit() {
     // 「收发继续」的客户端 → 出口方向：刷新帧（节拍 2s）必须从**新源**到达出口
     // ⇒ 出口打 `quic: 连接采纳 … ← <新源>`（bind 行带当前 remote_address）
     let new_ip = to.ip().to_string();
-    let adopt_line = wait_log_both(&exit_log, "quic: 连接采纳", &new_ip, WAIT)
-        .expect("刷新帧必须从新源到达出口（client → exit 继续）");
+    let adopt_line = wait_log_from(&exit_log, log0, "quic: 连接采纳", Some(&new_ip), WAIT)
+        .expect("刷新帧必须从新源到达出口（client → exit 继续；本轮新增行）");
     println!("[e2e] exit.adopt_on_new_path={adopt_line}");
 
     // 连接未断（快照仍有路径 + 岛未退出）
