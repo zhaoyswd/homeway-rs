@@ -941,3 +941,27 @@ pub enum Via { Direct, Relay { label: [u8; 8] } }
 
 - **不在拍板范围、按本设计原样执行**：①②③④ 以外的全部设计决策（§1–§11）——包括但不限于：独立 QUIC 端口与 token 端点类（§1.1）、`kind=5` + 自定义 `AsyncUdpSocket`（§1.6）、出站按 `tun_ip`/`tunnel_ip` 分流与"服务面留在 WG"（§1.5）、A/B 开关 `HOMEWAY_TRANSPORT`/`tunConfig.transport`（§4）、丢弃四类计数与矩阵（§6.4）、中继零改动红线（§7.1）、判据行登记 13 条（§3.6）。
 - **明确不做（拍板后仍不做）**：候选 B/C 的 MTU 机制；M2 的客户端证明/抗放大/威胁模型（M1 只做保守资源上限）；M3 的服务流迁移与栈 B 退役；任何中继代码改动；`docs/QUIC-ROADMAP.md` 与 `docs/INTEROP-CRITERIA.md` 的本棒改动（前者 = 主会话触点；后者 = 实现棒与代码同批落库）。
+
+### 12.6 实施期订正（主会话裁定，2026-10-08；**后到的切片以本节为准**）
+
+> 纪律依据：路线文件「每期执行协议」第 6 条——「实测/源码与设计矛盾 → **先在设计文档登记再改**」。
+
+1. **隔离门第 ⑤ 条形态变更（原文不可能成立，替代形态更强）**：§1.3/§12-② 写的「`crates/` 内
+   `dangerous()`/`SkipVerify` 零命中」与「客户端 RPK 钉定」**不能同时成立**——rustls 0.23 公开面里
+   装自定义 verifier **只能**经 `dangerous().with_custom_certificate_verifier(...)`
+   （`with_webpki_verifier` 只收 `WebPkiServerVerifier` 具体类型）。
+   **裁定（接受 S1a 的替代形态）**：允许面收窄到**单一文件**（`crates/homeway-quic/src/exit/rpk.rs`），
+   且该文件必须出现 `verify_tls13_signature_with_raw_key`（钉定 ≠ 跳过验证）——**其余 `crates/` 仍零命中**；
+   `tools/check-quic-isolation.sh` 第 ⑤ 条按此改（已改，白名单 + 同文件自证，fail-closed）。
+   语义：**「产品面不得出现跳过验证」这条纪律没有放松，放松的只是"哪个 API 能承载钉定"这个实现形态**。
+   ⇒ **S4 登记**须把本条一并记入（隔离门口径变更）。
+2. **M1 中间态被接受（S1a→S1b→S1c 之间）**：S1a 之后 `serve` 已监听 QUIC 端口、握手可完成，但
+   **准入（S1-3）与数据面（S1-4/5）尚未接线**，`serve.quic` 开关（S3-4）也还没来 ⇒ 该端口在此窗口内
+   **无实际数据能力**。裁定：**接受**（分支开发态；M1 收口前 S1b/S1c/S3 补齐；**合回 main 前必须
+   开关可用**——列入 M1 收口核对项）。
+3. **S1a 的其余偏离（一并接受）**：①Q-O 闸①口径收紧为「存活连接 + 在途握手」合计（比 §9.3 Q-O 原文严）；
+   ②`handshake_cap`/`handshake_deadline` 做成可配（缺省 = 设计定值 64 / 10s，仅为让拒绝路径可确定性测）；
+   ③`crates/homeway-core/src/relay/rltoken.rs` +1 行 `rpk: None`（token 加字段后编译器强制；**relay 语义与
+   字节零变化**，红线未破）；④`client_pin` 暂挂 `#[allow(dead_code)]`（消费方 = S2 岛接线，S2 落地即删）。
+4. **本节的登记归属**：第 1 条进 S4 的 `INTEROP-CRITERIA.md` 登记条目；第 2 条进 M1 收口核对项
+   （`docs/reviews/M1.md`）；第 3 条随 S1a 各 commit 的偏离说明留档。
