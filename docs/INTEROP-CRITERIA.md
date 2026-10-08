@@ -294,6 +294,53 @@ v6 路径）+ Rust 统一进程出口 42680（upnp=true 同号映射成立 ⇒ v
   命令，Go `clientcore` 的 `pfDial` 对 `TargetIp != ""` 原样拨 `TargetPort`），方向已核、登记在案。
   挂账、实现轮廓与交接块见 `docs/reviews/QF.md`「portfwd-B 交接」（tier `port-forwarding` spec 的
   SHALL 处于**已知不达标**）。
+  **已收口（2026-10-08，Q-F-B 批）**：真监听器已实装（见下方「【Q-F-B 批】portfwd 真监听器」注记
+  与「判据变更记录」同族行）——本注记的「未实装 / 已知不达标 / 假归因」不再成立（**保留历史原文 + 收口指针**）。
+- **【Q-F-B 批，2026-10-08】portfwd 真监听器（含**偏离 Go** 的四处）**：每条映射在 `127.0.0.1:<listen>`
+  （**地址硬编码，无配置面、无 `0.0.0.0` 退路** ⇒ 局域网不可达由绑定地址保证）真 bind + accept 线程
+  （`poll(2)` ≤50ms，连接就绪即接）+ 入站连接经**裸拨**（`Client::connect_deadline`，**不复用
+  `healing_dial`**——目标常态拒绝不许触发 R2 恢复阶梯；恢复仍由 `patrol` 独立驱动）与双向泵
+  （复用 `bridge_host::pump`，EOF 零日志对齐 Go `pkg/netpipe`）转发到目标。守卫：规则 **≤8**、
+  并发流阀 **256**、拨号期限 = `dialMs`（缺省 15s）、每连接线程显式 **256 KiB** 栈
+  （**实现注记（代码门 r27 P6）：设计 v3 写 128 KiB，实现取 256 KiB**——与本仓全部会话面线程同档
+  〔`session`/`domain_eps`/`daemon/carriers/forward` 均 256K〕，pf 的 conn/泵线程跑的就是同一批
+  `SessionStream` 代码；Rust 栈溢出 = **进程 abort**，「省虚拟内存」的收益可忽略）；`SO_REUSEADDR`
+  显式（Go `net.Listen` 默认）、backlog 固定 **128**（Go Linux=`somaxconn`/darwin=128）、
+  `SOCK_CLOEXEC` 经 `sysfd`；拨号失败 **RST 收口**复用 `sysfd::rst_close_tcp`（单源上移，daemon 三处
+  调用点零改动）；accept 瞬态错误退避重试（复用 Q-E F5 分类件）。
+  **偏离 Go 四处**：① **阀值 256 vs Go `maxTCPFlows=4096`**——口径 = 手机内存预算（引擎每连接
+  2×1 MiB 缓冲、`stackb.rs` 的 `TCP_BUF` 无上限 ⇒ 256 ⇒ 最坏 ≈512 MiB；Go 的自证注释称「与 gVisor
+  流共用」**已陈旧**，其读写只在端口转发面）；② **accept 致命错误 ⇒ 记行 + 该条状态转 `failed`**（空码 +
+  精确 err）——Go 留 `listening` 且**不关 fd**（端口仍绑、只是无人 accept）；Rust 的 fd 单属 accept
+  线程 ⇒ 退工即释放端口，留 `listening` 就是「监听中但连不上」的谎报（D15）；③ **装配期破损配置不 bind**
+  （见下注记）；④ **收工序**：Rust 取 **pf 先停、桥后停**（Go 的 defer LIFO 实为桥先停——两序都在
+  client 关闭之前；Rust 取更早释放端口）。**热替换**：install 两阶段（只 take 旧 `lns` + 旧 `states`
+  原地保留至单次换入 ⇒ 读侧只见「全旧」或「全新」，Go 持 `pfMu` 的等价语义）+ 旧监听器**退出 ack**
+  （共享 400ms；`Disconnected` = 线程已退 = fd 已关，不是超时）+ 未 ack 端口的 3×50ms 重试 bind
+  （仍失败 ⇒ 双记行，**不许把内部竞态伪装成「端口被占用」**）；已建立连接不被替换打断（Go 同形）。
+- **【Q-F-B 批，2026-10-08】portfwd 非常态面 + 残余（10 条）**：① **`tunConfig` 旁路破损配置**
+  （`listen` 非法 / `target_ip` 非法 / 超条数 ⇒ **不 bind** + `failed` + **空码** + 精确 err；
+  **表单路径不可达**——`parsePortForwards` 只丢 id/端口 0 的条目、`HostStore.updateForwards` 不重复
+  校验 ⇒ **手改/损坏的持久化记录可达**；Go 对 `listen=0` 会绑随机端口 ⇒ **偏离 Go 的加固**）；
+  ② 环回/`0.0.0.0` 目标映射为「出口本机」（`ExitPort`）——Go 经出口过境重拨到出口的 `127.0.0.1`
+  （实现路径不同、语义同；本栈显式拒环回，不映射就是「监听中但连不上」）；③ **`target_port == 0`**
+  旁路形态走 `dial_target` 折叠语义（IP 分支折 `listen`；**空 IP 分支 `ExitPort(0)`**——Go `pfDial`
+  原样拨 0；NAPI 门拒 0 ⇒ 仅旁路可达）；④ 跨世代换代的同端口瞬时 `EADDRINUSE` 窄窗（Go 同形）；
+  ⑤ **收工预算叠加**：`stop_all` ack ≤200ms（到点 detach 自退，fd 随线程退出关）+ 派生线程 join ≤2s +
+  桥 ≤2s vs `STOP_WAIT`=3s ⇒ 极端形态走既有 -2 强制放锁路径（Q-F §7-5 同族，挂 Q-G）；
+  ⑥ 已建立连接无空闲回收/无速率整形（Go 同形）；⑦ **无鉴权**（本机任意进程可连，Go 同形）；
+  ⑧ 引擎侧连接表无独立上限（阀是唯一界；`stackb::DialError::TooManyConns` 是死变体，本批不接线）；
+  ⑨ **出口配额全局共享**：`intercept::MAX_CONNS=1024` 覆盖所有客户端与所有腿 ⇒ pf 达阀会挤压
+  桥/files/term 与其它客户端（客户端阀 256 已低于该配额一个量级）。⑩ **`install` 中途 panic 的孤儿
+  窗口收口**：阶段 3 已 spawn 但未换入 `inner` 的监听器由**暂存守卫（RAII）**在 drop 时置停止位自退
+  ⇒ 孤儿窗口为 0；**设计 v3 §1-F1-3 的「万一仍 panic…由 `Finish::drop → stop_all` 清 states 收口」
+  该句据此订正**（实际收口机制 = 暂存守卫 + 世代停止位；代码门 r27 P3，实现注记见
+  `docs/reviews/QFB.md`）。**另**：`stats_loop` 的 tick 下限 5s 不变（`stats_line` 纯函数解决可测性）；
+  accept 线程/conn 线程/泵线程 spawn 失败按「只记行 + 该条/该连接收口」处置（不新增
+  `unhealthyReason` 面）；accept 线程**异常退出（panic 展开）**由退出守卫置迟到失败（failed + 空码）
+  ——与「致命 accept 错误」同族（代码门 r27 P2）；世代停止位（`gen_stop`）让 accept 线程 ≤1 拍自退并
+  关 fd，而状态表在 `stop_all` 之前仍是旧表（Go「`stopPortForwards` 之前不动作」同义；窗口 = 世代主线程
+  ≤200ms 的停止位轮询）——**不**在此期间打 `failed`（免正常收工闪失败文案）。
 - **【Q-F 批，2026-10-08】桥状态诚实性（F7b，本批加固 ≠ Go 同形）**：桥的 accept 线程 spawn 失败
   或 `listen_path` 重试耗尽时，`bridgeFilesSock/bridgeTermSock/bridgeSpeedSock` 由「上报路径」改为
   **空串**——**Go 的 `sockJSON` 不这么做**（只要 token 在就返回路径，`app_bridge.go:388-395`）⇒
@@ -509,6 +556,7 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 | 2026-10-08（Q-J 批落地） | **UPnP 协议面（F4）——与 Go 的四条有意分歧 + E20 族数值语义** | ① SSDP 钉卡失败：硬失败终止候选 → **降级继续**（记行；发送已由 IP_MULTICAST_IF 钉在源卡，接收可能被默认路由/TUN 抢走）；② M-SEARCH ST：单发 `IGD:1` → **每轮固定三发 `IGD:1`/`IGD:2`/`upnp:rootdevice`**（MX=2 不变）；③ 应答采纳：「首应答即信（不看 ST/USN）」→ **判定表**（三条件 + ST/USN 精确段匹配 IGD 型 ⇒ 立即采信；非 IGD 型 ⇒ 待定，**只在 SSDP 腿期限到点后**回退采信）；④ 新增 **`AddAnyPortMapping` 末位兜底**（显式候选 prefer→internal→+1…+9 全失败后：期望端口交路由器改派、`NewReservedPort` 可解析且 ≠0 才算成功、租期 3600→0 回退；成功 ⇒ 外部端口由路由器选择——修前该形态 `NoPortAvailable`）。**既有成功路径零变化**；新增两行 additive 告警（钉卡降级 / A-any 成功）。**spec 偏离补记（代码门 M2）**：A-any 的触发条件与 tier `exit-upnp-port-mapping:32-35` 的 MUST（「候选全被占用/拒绝时 MUST 走映射失败路径 + 打『未取得端口映射』行」）WHEN **完全重合**——A-any **成功**时不再走该失败路径、外部端口改由路由器决定 ⇒ 定性与 `dns_upstream`/`dns_fallback` 同为「**opt-in 等价偏离**」（仅当路由器支持该动作时生效；不支持/失败 ⇒ 原失败路径与计数不变）；与 F6↔`role-management:184-188` 的 spec 张力同批上报（`docs/reviews/QJ.md` 上报项） | F4（超 Go 加固，逐条登记）：Go 基线 `internal/server/upnp.go:29/138-139/161-163/122-131` 同形旧形态 | E20 族数值语义（A-any 成功形态）、`upnp.rs`（ST 三态/`ssdp_is_igd_type`/`ssdp_location_with` 待定回退/`add_any_port_mapping`/`pin_multicast_with` 降级）、单测 `msearch_shape_three_states`/`ssdp_igd_type_matching`/`add_any_port_mapping_last_resort`/`shrink_path_unaffected_by_any_mapping`/`multicast_pin_failure_degrades`；**失效形态影响**：多候选/混答 LAN 与 A-any 消耗共享 40s 预算（`QJ-design.md` F4 风险②③） |
 | 2026-10-08（Q-J 批落地） | **F2 五配置键（additive）+ 两处 spec opt-in 偏离 + config.toml 对 Go 单向** | 无 → 有（`[serve]` 五键，默认 = 修前硬编值逐值不变）：`dns_upstream`（显式上游覆盖；空 = 跟随 `/etc/resolv.conf`）、`dns_fallback`（缺省 `223.5.5.5`；**空串 = 拒启**，不是「关兜底」）、`ddns_resolver`（缺省 `223.5.5.5:53`/`119.29.29.29:53`）、`dns_probe_target`（缺省 `223.5.5.5:53`/`1.1.1.1:53`；**一键喂挑卡/健康探针/udpcap 三路 = 显式登记耦合**）、`stun_probe_target`（缺省 CF/Google；**须显式带端口**）。**两处 opt-in 偏离**（默认面不动）：`dns_upstream` ↔ tier `wg-native-dns:40` MUST（系统解析配置跟随）；`dns_fallback` ↔ `:77` SHALL（223.5.5.5）——仅显式配置时偏离。**env 缝纪律**：`HOMEWAY_BINDWATCH_PROBE` 只影响健康探针，挑卡恒吃 config/默认。`dns_upstream` 覆盖生效行（进 E4 取值）另告警**恰一次**（`DnsProxy::spawn`：fake-ip 主机上手机拿真实 IP、域名规则失效——代码门 M1 补齐，含测试断言）；**五键端口 0 一律拒启**（值域，代码门 L2）。**不加 CLI flag**（配置面足够，登记「不加」）。新键使 config.toml 对 Go 侧（`Undecoded()` 检查）**单向不兼容**（Go 已退役，仅影响回滚/对照） | F2（P1：DNS 上游/探针目标硬编码 CN 段 + fake-IP 无卫兵；「统一」落点按 tier spec 收窄——dnsproxy 侧**不得**做拒绝式卫兵，见 F3） | `serve_cli.rs`（五键 + 值域 + 边界解析）、`engine.rs`（`ServeConfig` 五字段 + 装配）、`dnsproxy.rs`（`Upstreams::with_static` 静态覆盖不做 mtime 跟随）、`ddnscheck.rs`（`resolvers` 穿参）、`egress.rs`（`preferred_iface(route_probe)`）、`bindwatch.rs`（`pick_targets`/`health_probe_targets_from_env`）、`nodestate.rs`（模板键表）；单测 `f2_keys_defaults_unchanged`/`f2_keys_take_effect`/`static_upstream_override_no_follow`/`fallback_from_config`/`defaults_unchanged_by_new_keys`/`pick_targets_ignore_env_seam`；**上报项**：两处 spec 偏离需 tier 知会/修订 |
 | 2026-10-08（Q-I 尾段批落地） | **F2（reactor 并入引擎 poll）尝试后回退——零残留（登记留痕）** | 曾实现「reactor 兴趣集并入引擎唯一 poll（快照直派）+ `intercept: reactor 观测 … 兜底=N` 字段 + 两条唤醒时点行为变更」→ **实测负收益后整条回退**（代码与判据面回到 Q-H 形态；`兜底=` 字段与两条行为变更**未落地、不登记**） | F2 止损闸门（设计 §4.3）：两项 poll 样本合计 **+18%**（不降反升）、进程 CPU **+14.5%**、up 吞吐 **−5.9%**；机制 = 上游 fd 就绪成为引擎唤醒源 ⇒ 拍频 13.2k→21.4k/s、每拍全量 pump 的固定成本放大 | **本行不涉任何判据行/wire/夹具变更**；证据与数字见 `docs/reviews/QIt.md` 性能节 + `docs/PERF-AB.md`；`server/engine.rs`/`server/intercept/mod.rs` 内注释留痕（`reactor_turn` 文档注释） |
+| 2026-10-08（Q-F-B 批落地） | **`portForwards[]` 状态文案与 `ClientCoreTunSetPortForwards` 返回码**（契约面行为变更，非编号判据行；**接续 Q-F 该条**——Q-F-B = Q-F 的 portfwd 挂账项收口批） | ① `state`：恒 `"failed"`（Q-F 诚实态）→ **`"listening"`（真 bind 成功且 accept 线程在位）/ `"failed"`（真 bind 失败 / 装配期破损配置 / accept 致命错误的迟到失败）**；② `err`：恒「手机核未提供端口转发监听（127.0.0.1:<listen> 未监听）——该映射在当前版本不可用，不影响隧道」→ **空串（成功）/ 真 bind 失败 `errno` 原文（失败）/ 装配期精确 err（破损配置）/ accept 致命错误原文（迟到失败）**；③ `code`：空 → **`bind_failed`（真值，tier 渲染「端口被占用」）**；空码**只剩非常态面**（装配期破损配置 / 迟到失败——spec 的空码兜底路径）；④ `conns`：恒 0 → **真连接数**（accept 准入 +1、连接结束 −1）；⑤ **未 attach / 未装表期 与 收工后**：`portForwards` 为空数组（tier 显示「启动中…」）——HEAD 是「失败 · 未提供…」；⑥ rc：恒 `-1` → **`0`（有承载：已受理并真装表）/ `-1`（无世代或世代已收口——改动随下次连接的 tunConfig 生效）/ `-2`（JSON/校验不过，含新增条数上限 8）** | Q-F-B：实装真监听器（Q-F 挂账项收口）。`bind_failed` 由「具体化假归因」转**真值**（真 `bind()` 失败），spec「失败原因 MUST 携带稳定枚举 code」由「有意偏离」转**达标**（限定语：除非常态空码面） | `tier:openspec/specs/port-forwarding`「端口映射的建立与访问」SHALL 由**已知不达标**转**达标**、「映射状态可见」失败码 MUST 转**达标**；tier 两处失义文案（`PortForwardsPage.ets` 的 `dirty` 兜底提示 / `TierVpnExtensionAbility.ets` 的 rc 日志）**随本批自愈**；`facade/portfwd.rs`（`PfRuntime`）/`facade/tun_exec.rs` 单测；**`fixtures/` 无 portForwards 夹具 ⇒ 无字节夹具变更**；`tools/check-vocab.sh` **零改动**（声明集/缺席表/manifest/tier 码表四处不动） |
 
 > **上表 E12/decr_flow 两行 = 2026-10-07 Q-B 批落地登记**（Q-A 批预登记的占位条目已按本政策补全
 > 「从 → 到」实际行文并去掉「占位」标注，同批 commit）；**其下两行 = 2026-10-07 Q-C 批落地登记**；
@@ -525,6 +573,9 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 > CA11 launchd 触发集与文案 / UPnP 四条与 Go 有意分歧 + E20 族数值语义 / F2 五配置键 + 两处 spec opt-in 偏离）；
 > 计数输入集表 = Q-J 三行（E21 平台分档语义订正 / E4 取值来源扩展 / C14 + `UDP 默认路径` 取值来源变化）。
 > Q-J 的**默认缺省面逐字节/逐值不变**（F1 宿主推断、F2 默认常量、F5 平台分档的 linux 放宽属纠偏）。
+> **最新一行 = 2026-10-08 Q-F-B 批落地登记**（`portForwards[]` 状态文案与热替换 rc 的契约面收口——
+> 接续 Q-F 同族行；**本批零编号判据行变更、零 wire/夹具变更**，词表门四处不动）；计数输入集表 = Q-F-B 四行
+> （`pfAccepted`/`pfFails`、`portForwards[].conns`、`stats:` 行 pf 两位、additive 观测行 10 条）。
 > 登记生效后，E12 关闭行与 flows 计数按新行文验收（旧行文不再要求同串）；Q-D 的尺寸面按
 > 「正常尺寸逐字节同串、极端输入按登记」验收；Q-G 的 UDS 路径面按「`> SUN_PATH_MAX`（平台值）」验收；
 > Q-I 尾段的 `--stun=`/`--stun6=`/`--relay=`/`--ddns=` 空值形态按「接受并按 Go 语义处理」验收；
@@ -571,6 +622,10 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 | 2026-10-08（Q-H） | **C13** `候选端点（%d 条，标记·学习=…）` 的 `·学习` 判定集 | 判定「是否在 token 候选里」由 `static_cands`（只装 IP 字面量）→ **token 序已解析候选**（IP 字面量 + 域名首解；= Go `DescribeCandidatesWithLearned(list, cands)` 的 `cands`，`bind.go:208-226`） | 代码门 M3：域名 token 下域名首解候选被误打 `·学习`（Go 不打）——**行文不变、输入集修正** | C13 数值、`session/mod.rs`（C13 块 `known` 判据）、C14 目标选取测试（同源断言） |
 | 2026-10-08（Q-H） | **控制面新增日志行（additive，非判据行）** | 无 → 有：`control: 连接拒绝（并发上限 64）`；`control: 连接握手超时（10s 未 hello）——断开`；非默认 state 的 `（state=… 非默认 state——不等 launchd KeepAlive，直接拉起）`；C14 的失败行/无候选行（见 C14 登记） | F5/F14/F17：拒绝/超时/跳过路径改可观测 | 各日志族读者；`reject`/`dialFail` 等既有计数不受影响（新行不进状态面） |
 | 2026-10-08（Q-G） | **新增 additive 观测** | 无 → 有：`files` UDS `chmod 0600` 失败告警（Go 有、本仓原为静默 `let _ =`）；`state.rs` 的 key/台账/目录收紧失败告警 + **存量 key.bin 读路径归一告警**（原静默；代码门① 补强）；`nodestate` config 模板 / `carriers::save_json_atomic` / `daemon_cli` spawn 日志 / `endpoint_cache` 端点缓存 的收紧失败告警（代码门② 统一为告警不阻断）；F5 的 detach 记行（`等待 client 线程收工超时（CLIENT_CLOSE_BUDGET）——放行自退（引擎线程由收割线程收口）`） | F4/F5：静默失败改可观测 | 各日志族读者；**非编号判据行** |
+| 2026-10-08（Q-F-B） | **`stats.pfAccepted`/`stats.pfFails`**（`tunStatusJSON.runner.stats` 两键 + `stats:` 日志行同源） | 「恒 0 的占位真值（无监听器 ⇒ 无 accept/失败）」→ **真计数**：`pfAccepted` = accept 准入数（阀拒绝不计、拨号失败仍计）、`pfFails` = 拨号失败数（RST 收口那些；阀拒绝与线程启动失败不计） | Q-F-B F1/F3：实装真监听器（Go `app_portfwd.go` 的 `pfAccepted`/`pfFails` 同语义） | `facade/tun_exec.rs::runner_of`、`facade/portfwd.rs::PfCounters`；tier 只校验键存在（无消费） |
+| 2026-10-08（Q-F-B） | **`portForwards[].conns`** | 恒 0 → **真连接数**（accept 准入 +1；conn 线程与两枚泵线程全结束才 −1——RAII `FlowGuard` 随最后一枚 `Arc` 持有者 drop 回退） | 同上（Go `st.conns` 的 `defer` 同义） | tier「监听中 · N 条连接」真实可用；`install` 换表后旧表的在途连接不再计入新表（Go 同形——连接与快照同属一次装表） |
+| 2026-10-08（Q-F-B） | **`stats:` 日志行**（`stats: fdReadBytes=%dB fdWriteBytes=%dB ｜ pf=a/f`） | 恒 `pf=0/0` → **真值**（**行文形态逐字不变**；抽 `stats_line` 纯函数） | 同上 | 世代日志读者；`facade/tun_exec.rs::stats_line` 单测 |
+| 2026-10-08（Q-F-B） | **新增观测行（additive，非判据行）** | 无 → 有（10 类）：① `port-forward: 监听 127.0.0.1:{listen} 失败（{e}）——该条映射不可用，不影响隧道`（**Go 逐字**）；② `port-forward: 127.0.0.1:{listen} -> {target} 监听中`（**Go 逐字**）；③ `port-forward: 已停止全部监听器（{n} 个）`（**Go 逐字**）；④ `port-forward {listen}: 并发流已达上限 {max}，拒绝（累计拒绝 {r}）`（**Go 逐字**，节流 `<=5 ∥ %50`）；⑤ `port-forward: {listen} -> {target} 拨号失败 #{n}: {e}`（**Go 逐字**，节流 `<=5 ∥ %20`）；⑥ 装配期防御面三条（`listen` 非法 / 超条数 / `target_ip` 非法——err 原文直记）；⑦ 旧监听器 `未在预算内退出——已在后台自退`（install/stop_all detach）+ `{listen} 旧监听器未在预算内释放——已重试 bind 仍失败`（双记行）；⑧ accept 瞬态/致命（复用 Q-E F5 分类件行文 + **该条状态转 failed** 的置位行）；⑨ 监听线程/conn 线程/泵线程 spawn 失败行 + **转发流拆半失败 / 本地 fd 复制失败行** + **pf 泵的读错误/写失败行**（`port-forward[up\|down] …`——桥侧 `桥泵[up\|down]` 的行文与「有流量才记」门槛**逐字/逐条不变**；pf 侧读错误**无条件记行**〔零字节 RST 也留痕，对齐 Go `pkg/netpipe` 的错误口径〕、EOF 仍零日志）；⑩ 装配期装表后 stale 复查撤回行 | Q-F-B F1/F4/F8：监听器全生命周期可观测（Q-F「spawn 失败不静默」纪律延伸）；①–⑤ 与 Go 行文**逐字同形**（`app_portfwd.go` 的监听/停表/阀/拨号四行 + `pfAccept` 的失败行），其余为 Rust 侧新增面 | 世代日志读者；**非编号判据行**（无 E*/C*/R* 行文变更）；`facade/portfwd.rs`/`facade/tun_exec.rs` 单测逐字断言 |
 | 2026-10-08（Q-J） | **E21** 绑卡族（行文与渲染形态**不变**） | ① linux 上 `index=0` **不再蕴含「不可钉」**（钉卡守卫改平台分档：darwin 拒 `index==0`〔`IP_BOUND_IF=0`=解绑〕，linux 按名 `SO_BINDTODEVICE`、index 不参与）；② darwin 候选面**排除** `!index_ok`（不可钉不参与挑卡），linux 不过滤；③ 三处 index 键面改 **name 优先**（`bindwatch::state_of_from` 纯函数 / 重挑比较 `iface_same` / `select_best` 的默认路由偏好）；`IfaceFingerprint` 仍保留 index 字段（「换 index ⇒ 重钉」信号不丢） | F5：`if_nametoindex` 失败静默 index=0 的完整语义（macOS 0=解绑但 `setsockopt` 成功 ⇒ 「已钉卡」判据反向；linux 按名绑定与 index 无关，旧硬拒属误伤） | E21 取值路径不变（`index=%d` 渲染形态不动）、`egress.rs`（`candidate_pinnable`/`iface_same`/`pin_socket_to_iface` 平台守卫）、`bindwatch.rs`（`state_of_from`）；单测 `if_nametoindex_zero_platform_split`/`candidate_filter_platform_split`/`iface_same_three_states`/`state_of_from_name_keyed`/`repick_same_name_with_index_flap_stays`；**linux 语义放宽**（旧硬拒不再发生）；**平台分档补门（代码门 L1）**：linux 空网卡名 ⇒ `SO_BINDTODEVICE(optlen=0)` 是内核级「解绑且成功」——与 darwin `IP_BOUND_IF=0` 同型，按名面补硬拒（现调用方不可达，属不变量结构化） |
 | 2026-10-08（Q-J） | **E4** `dns 代答就绪：… upstream=%s`（行文**不变**） | 取值来源扩展：`serve.dns_upstream` 配置生效时 `upstream=` = **配置列表**（静态、**不做 mtime 跟随**）；缺省/空 = 今日的 `/etc/resolv.conf` nameserver 列表（跟随语义不动） | F2：显式上游覆盖（opt-in；macOS 出口的 resolv.conf 非真源，覆盖是等价能力收口） | E4 取值（行文不变）、`dnsproxy.rs`（`Upstreams::with_static`/`text()`）、单测 `static_upstream_override_no_follow` |
 | 2026-10-08（Q-J） | **C14** + 未编号行 `UDP 默认路径：…`（行文**逐字不变**） | **取值来源变**：`serve.dns_probe_target`/`stun_probe_target` 配置生效时，udpcap 探针目标 = 配置值（修前硬编 `&[]` = 默认常量）；默认逐值不变。**耦合写明**：`dns_probe_target` 一键喂**挑卡 / 健康探针 / udpcap DNS:53 三路**——把该键指到诊断死地址会同时影响挑卡、健康探针与 C14 取值 | F2：探针目标可配置（默认 = 修前硬编值） | C14 取值（行文不变）、`engine.rs`（`probe_once(dns_targets, stun_targets)`）、`bindwatch.rs`（挑卡 `pick_targets` 不吃 env）、`serve_cli.rs` 值域；单测 `pick_targets_ignore_env_seam`/`f2_keys_take_effect` |
