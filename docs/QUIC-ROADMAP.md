@@ -502,9 +502,10 @@ fixtures 向量逐字节不变；客户端依赖树不再含 smoltcp（脚本验
      `daemon::carriers::forward::tests::*` 报 `bind 127.0.0.1:20004/20010 already in use`）不与本程序混判；
   ⑤ **登记动作**：以上四条随 `docs/QUIC-BASELINE.md` / `tools/quic-ab/README.md` 同源，变更须同批更新。
   另（M0 移植事实，非 flake）：DPLPMTUD / 迁移用例的墙钟依赖仍属 M1 起的登记面。
-- **本程序新增（M1 实现时登记，2026-10-09）**：`wtransport::bind::tests` 的**实 socket 时序族**
+- **本程序新增（M1 实现时登记，2026-10-09；M2 S1 补一例）**：`wtransport::bind::tests` 的**实 socket 时序族**
   （S2b 实测 `mirror_then_adopt_then_single_send` 一次、M1 S3/S4 批全量并行跑 `relay_envelope_and_adoption`
-  一次；均 `--test-threads=1` 隔离复跑绿），与既登记族两例（`daemon::tests::handshake_deadline_beats_slow_drip`、
+  一次、**M2 S1 批全量并行跑 `unknown_source_hint_filtered` 一次**；均 `--test-threads=1` 隔离复跑绿、
+  相关文件零 diff），与既登记族两例（`daemon::tests::handshake_deadline_beats_slow_drip`、
   `term::service::tests::attach_size_applies_to_pty`）同批登记；代码门 r13 又实测 `daemon::tests::*` 一例
   （隔离复跑绿、与 M1 改动面无交集）。**flake 口径照 M0 §9.2 ④**（红了先隔离单跑再判回归；**不静默重跑**）。
   另：M1 收口期间新增的两条用例（岛回程泵身份防重 / 消费者已退归因）已做**负例有效性**验证
