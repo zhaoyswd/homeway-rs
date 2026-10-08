@@ -9,9 +9,11 @@
 //! 1. **S2-7 的包封/剥壳**（设计 §1.6 末段）：`via=relay` 时上行 = `[0xAA][label8]‖
 //!    `[0xBB][kind=5]‖quic_pkt`、下行收 `[0xBB][5]‖quic_pkt` 剥壳；非 kind=5 帧**忽略**
 //!    （中继会推 hint 控制帧）。`via=direct` 时两端都裸 QUIC 包。
-//! 2. **`hr-reg3` 组帧**（真源 `homeway-quic::reg3`）：`"H3"‖pubkey32‖devTag8‖ts8‖mac16`,
-//!    `mac = HMAC-SHA256(secret, "hr-reg3"‖pubkey‖devTag‖ts‖exporter32)[:16]`，
-//!    `exporter32 = conn.export_keying_material(b"hw-quic-reg", b"")[:32]`（**连接绑定**）。
+//! 2. **`hr-reg4` 四帧准入**（真源 `homeway-quic::reg4`，M2 §1.2）：Hello（`"H4"`）→
+//!    Challenge（`"C4"`+nonce16）→ Proof（`"P4"`；
+//!    `mac = HMAC-SHA256(secret, "hr-reg4"‖pubkey‖devTag‖ts‖nonce‖exporter32)[:16]`）→
+//!    Accept（`"A4"`）；`exporter32 = conn.export_keying_material(b"hw-quic-reg", b"")[:32]`
+//!    （**连接绑定**）。
 //! 3. **服务端 RPK 钉定**（真源 `homeway-quic::exit::rpk::client_pin`）：先比对服务端出示
 //!    的 SPKI 与 token 里的 32B 公钥（换成的 44B SPKI），再走
 //!    `verify_tls13_signature_with_raw_key` 真验签——**不是**跳过验证。
@@ -23,7 +25,7 @@
 //! 用法（读数为机器可解析的 `key=value` 行；`--json` 时合成一行 JSON）：
 //!
 //! ```text
-//! quic-probe --token <hmw1…> [--via relay --relay <ip:port>] conn    # 握手 + reg3 + DNS 一问一答
+//! quic-probe --token <hmw1…> [--via relay --relay <ip:port>] conn    # 握手 + 四帧准入 + DNS 一问一答
 //! quic-probe --token <hmw1…> [--via relay] push --n 2000 --size 1280 # 上行灌包（B1/B2 读数）
 //! ```
 //!
@@ -52,9 +54,13 @@ const FRAME_MAGIC: u8 = 0xBB;
 const FRAME_KIND_QUIC: u8 = 5;
 const RELAY_TAG_LEN: usize = 9; // [0xAA][label8]
 const ENV_UP: usize = 2; // [0xBB][kind]
-const REG3_LEN: usize = 66;
+const HELLO_LEN: usize = 50;
+const CHALLENGE_LEN: usize = 18;
+const PROOF_LEN: usize = 82;
+const ACCEPT_LEN: usize = 2;
 const EXPORTER_LABEL: &[u8] = b"hw-quic-reg";
-const REG3_MAC_LABEL: &[u8] = b"hr-reg3";
+/// 准入 Proof 的 MAC 域标签（M2 §1.2 的 `hr-reg4`；刷新帧是另一域，探针面不需要）。
+const PROOF_MAC_LABEL: &[u8] = b"hr-reg4";
 const SERVER_NAME: &str = "homeway";
 const SERVER_TUNNEL_IP: [u8; 4] = [100, 64, 255, 1];
 const INNER_MTU: usize = 1280;
@@ -250,28 +256,43 @@ fn relay_label(peer_id: &[u8; 32]) -> [u8; 8] {
     Sha256::digest(peer_id)[..8].try_into().unwrap()
 }
 
-// ---------- hireg3 组帧 ----------
+// ---------- hr-reg4 组帧（M2 §1.2：Hello / Proof / 刷新帧） ----------
 
-fn reg3_frame(
-    secret: &[u8; 32],
-    pubkey: &[u8; 32],
-    devtag: &[u8; 8],
-    exporter: &[u8; 32],
-) -> [u8; REG3_LEN] {
-    let ts = SystemTime::now().duration_since(UNIX_EPOCH).expect("钟").as_secs();
-    let mut m = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC 任意长密钥");
-    m.update(REG3_MAC_LABEL);
-    m.update(pubkey);
-    m.update(devtag);
-    m.update(&ts.to_be_bytes());
-    m.update(exporter);
-    let mac = m.finalize().into_bytes();
-    let mut out = [0u8; REG3_LEN];
-    out[..2].copy_from_slice(b"H3");
+/// Hello（50B）：`"H4"‖pubkey32‖devTag8‖ts8`。
+fn hello_frame(pubkey: &[u8; 32], devtag: &[u8; 8], ts: u64) -> [u8; HELLO_LEN] {
+    let mut out = [0u8; HELLO_LEN];
+    out[..2].copy_from_slice(b"H4");
     out[2..34].copy_from_slice(pubkey);
     out[34..42].copy_from_slice(devtag);
     out[42..50].copy_from_slice(&ts.to_be_bytes());
-    out[50..66].copy_from_slice(&mac[..16]);
+    out
+}
+
+/// Proof（82B）：`"P4"‖pubkey32‖devTag8‖ts8‖nonce16‖mac16`，
+/// `mac = HMAC-SHA256(secret, "hr-reg4"‖pubkey‖devTag‖ts‖nonce‖exporter32)[:16]`。
+fn proof_frame(
+    secret: &[u8; 32],
+    pubkey: &[u8; 32],
+    devtag: &[u8; 8],
+    ts: u64,
+    nonce: &[u8; 16],
+    exporter: &[u8; 32],
+) -> [u8; PROOF_LEN] {
+    let mut m = Hmac::<Sha256>::new_from_slice(secret).expect("HMAC 任意长密钥");
+    m.update(PROOF_MAC_LABEL);
+    m.update(pubkey);
+    m.update(devtag);
+    m.update(&ts.to_be_bytes());
+    m.update(nonce);
+    m.update(exporter);
+    let mac = m.finalize().into_bytes();
+    let mut out = [0u8; PROOF_LEN];
+    out[..2].copy_from_slice(b"P4");
+    out[2..34].copy_from_slice(pubkey);
+    out[34..42].copy_from_slice(devtag);
+    out[42..50].copy_from_slice(&ts.to_be_bytes());
+    out[50..66].copy_from_slice(nonce);
+    out[66..82].copy_from_slice(&mac[..16]);
     out
 }
 
@@ -673,16 +694,35 @@ fn run() -> Result<(), String> {
         let mds = conn.max_datagram_size();
         println!("max_datagram_size={:?} current_mtu={}", mds, conn.stats().path.current_mtu);
 
-        // ---- hr-reg3（连接绑定）----
+        // ---- hr-reg4 四帧准入（M2 §1.2）：Hello → 等 C4 → Proof → 等 A4 ----
         let mut exporter = [0u8; 32];
         conn.export_keying_material(&mut exporter, EXPORTER_LABEL, b"")
             .map_err(|e| format!("exporter: {e:?}"))?;
-        let frame = reg3_frame(&secret, &pubkey, &devtag, &exporter);
-        let (mut send, _recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
-        send.write_all(&frame).await.map_err(|e| format!("写 reg3: {e}"))?;
-        println!("reg3: 已发 {}B（dev={}）；等 {}ms 让出口完成准入（引擎裁决→回执→绑定）",
-            frame.len(), hex8(&devtag), args.reg_wait);
-        tokio::time::sleep(Duration::from_millis(args.reg_wait)).await;
+        let ts = SystemTime::now().duration_since(UNIX_EPOCH).expect("钟").as_secs();
+        let (mut send, mut recv) = conn.open_bi().await.map_err(|e| format!("open_bi: {e}"))?;
+        let hello = hello_frame(&pubkey, &devtag, ts);
+        send.write_all(&hello).await.map_err(|e| format!("写 Hello: {e}"))?;
+        println!("准入: Hello 已发 {}B（dev={}）；等 Challenge", hello.len(), hex8(&devtag));
+        let mut ch = [0u8; CHALLENGE_LEN];
+        recv.read_exact(&mut ch).await.map_err(|e| format!("等 Challenge: {e}"))?;
+        if &ch[..2] != b"C4" {
+            return Err(format!("Challenge 魔数不符：{:02x?}", &ch[..2]));
+        }
+        let nonce: [u8; 16] = ch[2..18].try_into().expect("16B");
+        let proof = proof_frame(&secret, &pubkey, &devtag, ts, &nonce, &exporter);
+        send.write_all(&proof).await.map_err(|e| format!("写 Proof: {e}"))?;
+        println!("准入: Challenge 收到（nonce 非零={}），Proof 已发 {}B；等 Accept",
+            nonce.iter().any(|b| *b != 0), proof.len());
+        let mut acc = [0u8; ACCEPT_LEN];
+        recv.read_exact(&mut acc).await.map_err(|e| format!("等 Accept（出口拒？）: {e}"))?;
+        if &acc != b"A4" {
+            return Err(format!("Accept 魔数不符：{:02x?}", &acc));
+        }
+        println!("准入: A4 收到（四帧走通；绑定已建立）");
+        // `--reg-wait` 保留（脚本面契约不变）：A4 之后的额外静置窗，排障用
+        if args.reg_wait > 0 {
+            tokio::time::sleep(Duration::from_millis(args.reg_wait)).await;
+        }
 
         // ---- 数据面 ----
         let (dst, dport): ([u8; 4], u16) = match &args.dst {
