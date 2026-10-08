@@ -58,4 +58,32 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - run: rustup target add ${{ matrix.target }}
-      - run: cargo check --target ${{ matrix.target }} --locked -p homeway-core -p homeway-cli -p homeway-capi
+      # C 侧前置（M0 设计 §2.6）：ring 0.17 的 build script 在 `cargo check` 下也会编
+      # C/汇编（check 只跳过 Rust 后端的 codegen 与链接）。ubuntu-latest 当前自带 clang；
+      # 镜像会演进 ⇒ 缺则显式装（R-E）。
+      - name: 交叉 check 的 C 侧前置（clang）
+        run: which clang || sudo apt-get install -y clang
+      - name: 交叉 check（-p 清单含新 crate）+ `-nostdlibinc` 落点断言
+        run: |
+          set -eo pipefail
+          cargo check -v --target ${{ matrix.target }} --locked \
+            -p homeway-core -p homeway-cli -p homeway-capi -p homeway-quic 2>&1 | tee /tmp/cc.log
+          # 设计门 3.2（R-K）：每条含 -nostdlibinc 的命令行都必须来自 ring
+          # （防将来新引入的 C 依赖静默继承 check 档 flag）
+          bad="$(grep -- '-nostdlibinc' /tmp/cc.log | grep -v -- '-ring-' || true)"
+          [ -z "$bad" ] || { echo "!! -nostdlibinc 落到非 ring 的 C 依赖上："; echo "$bad"; exit 1; }
+        env:
+          CC_aarch64_unknown_linux_ohos: clang
+          CFLAGS_aarch64_unknown_linux_ohos: -nostdlibinc -DRING_CORE_NOSTDLIBINC -isystem ${{ github.workspace }}/tools/cc-check-shim
+          CC_aarch64_unknown_linux_musl: clang
+          CC_x86_64_unknown_linux_musl: clang
+          CFLAGS_x86_64_unknown_linux_musl: -nostdlibinc -DRING_CORE_NOSTDLIBINC -isystem ${{ github.workspace }}/tools/cc-check-shim
+
+  check-quic-isolation:
+    name: QUIC 岛隔离源码门（异步/同步边界）
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      # 门是 zsh 脚本（仓内 tools/ 惯例）；镜像若缺 zsh 则显式装
+      - run: which zsh || sudo apt-get install -y zsh
+      - run: zsh tools/check-quic-isolation.sh

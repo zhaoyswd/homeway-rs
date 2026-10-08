@@ -15,3 +15,11 @@ fuzz/artifacts/
 fuzz/target/
 fuzz/coverage/
 fuzz/rust-toolchain.toml.tmpl
+
+# QUIC 实验台探针（tools/quic-ab/**，两个独立 workspace）：
+#   · 探针 target 不入库（带尾斜杠——避免误伤同名文件；根 /target 只管根目录）
+#   · 自签证书**全部现场生成物**不入库（gen_certs.sh 生成 DER + PEM；PEM 里是私钥，
+#     与 DER 同理——只入库生成脚本 certs/gen_certs.sh；*.so/*.a 两条粗门不覆盖这些）
+tools/quic-ab/**/target/
+tools/quic-ab/certs/*.der
+tools/quic-ab/certs/*.pem

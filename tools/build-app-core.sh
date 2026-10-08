@@ -46,6 +46,17 @@ if [ ! -x "${NM}" ]; then
   exit 1
 fi
 
+# ---- C 侧前置（M0 必修，设计 §2.5/§8.2 R-A）：ring 0.17 的 build script 会编 C/汇编，
+# 而 cc-rs **不读** .cargo/config.toml 的 linker ⇒ 必须显式给 CC，否则用系统 cc，
+# ring 的 C 代码找不到 assert.h 当场断（实测）。**真构建走真 sysroot：不带 -nostdlibinc**
+# （check-only 垫片只属于 ci.yml / ci-local 的 check 档，见 tools/cc-check-shim/stdlib.h）。----
+export CC_aarch64_unknown_linux_ohos="${NDK}/llvm/bin/aarch64-unknown-linux-ohos-clang"
+if [ ! -x "${CC_aarch64_unknown_linux_ohos}" ]; then
+  echo "error: 找不到 NDK 包装 clang（${CC_aarch64_unknown_linux_ohos}）——真构建必须有真 sysroot" >&2
+  exit 1
+fi
+echo "[cc] CC_aarch64_unknown_linux_ohos=${CC_aarch64_unknown_linux_ohos}（真 sysroot；不带 -nostdlibinc）"
+
 # 版本注入串：核源 SHA（+dirty 标记）——与 tier build-core.sh 的注入口径同形。
 # dirty 判定路径集与 tier 侧闸门一致（复核 r3-F9：crates/tools/fixtures/Cargo.*/
 # .cargo/rust-toolchain.toml——两侧不一致会让 dev 模式的 +dirty 标记错位）

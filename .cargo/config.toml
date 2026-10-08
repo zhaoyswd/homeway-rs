@@ -2,5 +2,14 @@
 # 配方源自 tier:tools/spikes/rust-ohos-poc/rust/.cargo/config.toml（PoC 实测一次过）：
 # DevEco NDK 自带的目标包装 clang，自带 sysroot。
 # 首次构建：rustup target add aarch64-unknown-linux-ohos && cargo build --target aarch64-unknown-linux-ohos
+#
+# ⚠️ 口径（M0 实测钉定）：本文件的 `linker` **只作用于链接期**，cc-rs 不读它——
+# 凡要编 C/汇编的依赖（今 = ring 0.17）必须由**环境变量**提供 C 编译器：
+#   · 真构建（真 sysroot）：`CC_aarch64_unknown_linux_ohos=<NDK>/llvm/bin/aarch64-unknown-linux-ohos-clang`
+#     ——tools/build-app-core.sh 与 tools/ci-local.sh 导出；**不带** `-nostdlibinc`；
+#   · check-only 门（无 sysroot，只需 C 前端过完）：`CC=clang` +
+#     `CFLAGS_aarch64_unknown_linux_ohos="-nostdlibinc -DRING_CORE_NOSTDLIBINC -isystem tools/cc-check-shim"`
+#     ——只在 ci.yml 交叉 check job 里给（垫片用途见 tools/cc-check-shim/stdlib.h）。
+# **本文件不加 `[env]`**：路径机器相关（会污染 CI），且会把 check 档 flag 泄漏进真实构建。
 [target.aarch64-unknown-linux-ohos]
 linker = "/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native/llvm/bin/aarch64-unknown-linux-ohos-clang"

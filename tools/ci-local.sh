@@ -4,7 +4,9 @@
 # 编排（步骤 **1–7 + 4.5**，共八步；顺序，前者失败即停）：
 #   1. tools/check-baseline.sh            基线门（克隆 HEAD == BASELINE.md 锚定）
 #   2. cargo test --workspace             单测+集成（fuzz_replay #[ignore] 跳过——quick 档）
-#   3. cargo clippy --all-targets -D warnings + OHOS 交叉 check（r1-F18）
+#   3. cargo clippy --all-targets -D warnings + OHOS 交叉 check（r1-F18）+ **OHOS 真链路
+#      构建**（M0 设计 §2.4：tools/build-app-core.sh——全仓唯一能发现「OHOS 不可链接」
+#      的路径；NDK 缺 ⇒ 显式 SKIP 并打档位，不静默绿）+ **QUIC 岛隔离门**（M0 §3.4 层 3）
 #   4. tools/gen-vectors.sh + shasum -c + git diff   向量确定性门（含 SUMS 校验——G-11）
 #   4.5 tools/gen-fuzz-seeds.sh + 摘要对账  fuzz 种子展开门（第二道门 中-13 整改）
 #   5. tools/check-vocab.sh               词表三方门
@@ -13,7 +15,8 @@
 # 全量档：--full 加 cargo test --ignored（fuzz_replay **12** 目标 × 100k；Q-D 批新增
 # ⑫⑬⑭ term 面——codec 目标带自产网格往返，全量档预计 **+2-4 min**）。
 # 预算（实测口径，2026-10-07 Q-A 修订）：**冒烟档快步 ≈399s ≈ 6.6 分钟**（R5-5f 收口
-# 实测值，热 target）；**冷构建首轮显著更长**（依赖全量编译，未见分钟级上界）。另：
+# 实测值，热 target）；**冷构建首轮显著更长**（依赖全量编译，未见分钟级上界）。M0 起
+# 第 3 步多跑一条 OHOS 真链路（NDK 在：+≈1-2 min 增量构建）。另：
 # 第 7 步依赖 bin/homeway-go（bin 为 gitignore）——干净 clone 先
 # tools/local-exit.sh start 1 触发构建。
 set -uo pipefail
@@ -35,9 +38,40 @@ if (( FULL )); then
   (cd "$REPO_ROOT" && cargo test --workspace --ignored -- --test-threads=1) || fail 2 "fuzz_replay"
 fi
 
-echo "==> [3/7] clippy（-D warnings）+ OHOS 交叉面（评审 r1-F18：macOS 编译不到 sendmmsg 支——交叉 check 补覆盖）"
+echo "==> [3/7] clippy（-D warnings）+ OHOS 交叉面（评审 r1-F18：macOS 编译不到 sendmmsg 支——交叉 check 补覆盖）+ 真 OHOS link + QUIC 岛隔离门"
 (cd "$REPO_ROOT" && cargo clippy --workspace --all-targets -- -D warnings) || fail 3 "clippy"
-(cd "$REPO_ROOT" && cargo check --target aarch64-unknown-linux-ohos -p homeway-core -p homeway-cli -p homeway-capi) || fail 3 "OHOS 交叉 check"
+
+# ---- C 侧前置（M0 设计 §2.5/§2.6）：ring 0.17 的 build script 在 check 与 build 下都编 C。
+#   · 真构建/真链接：走 NDK 包装 clang（真 sysroot，**不带** -nostdlibinc）；
+#   · NDK 不在：退到 §2.2 的 check-only 配方（clang + -nostdlibinc + 仓内 stdlib 垫片），
+#     并在输出里**显式标注档位**（fail-loud，不静默降级）。
+OHOS_NDK="${OHOS_NDK:-/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native}"
+NDK_CC="${OHOS_NDK}/llvm/bin/aarch64-unknown-linux-ohos-clang"
+SHIM="$REPO_ROOT/tools/cc-check-shim"
+if [[ -x "$NDK_CC" ]]; then
+  export CC_aarch64_unknown_linux_ohos="$NDK_CC"
+  OHOS_CC_TIER="真链路（NDK clang 真 sysroot；无 -nostdlibinc）"
+else
+  export CC_aarch64_unknown_linux_ohos=clang
+  export CFLAGS_aarch64_unknown_linux_ohos="-nostdlibinc -DRING_CORE_NOSTDLIBINC -isystem $SHIM"
+  OHOS_CC_TIER="check-only 档（clang + -nostdlibinc + 垫片；NDK 缺失）"
+  echo "  ⚠️ 档位：$OHOS_CC_TIER"
+fi
+(cd "$REPO_ROOT" && cargo check -v --target aarch64-unknown-linux-ohos -p homeway-core -p homeway-cli -p homeway-capi -p homeway-quic 2>&1 | tee /tmp/ci-local-ccohos.log | tail -3) || fail 3 "OHOS 交叉 check"
+# fail-closed 断言（同 ci.yml）：-nostdlibinc 只许落在 ring 的命令行上
+BAD_FLAG="$(grep -- '-nostdlibinc' /tmp/ci-local-ccohos.log | grep -v -- '-ring-' || true)"
+[[ -z "$BAD_FLAG" ]] || fail 3 "-nostdlibinc 落到非 ring 的 C 依赖上：$BAD_FLAG"
+
+echo "  -- OHOS 真链路构建（tools/build-app-core.sh；档位：$OHOS_CC_TIER）"
+if [[ -x "$NDK_CC" ]]; then
+  "$REPO_ROOT/tools/build-app-core.sh" > /tmp/ci-local-appcore.log 2>&1 || { tail -20 /tmp/ci-local-appcore.log; fail 3 "OHOS 真链路（build-app-core.sh）"; }
+  grep -E '^\[(sym|ver|size)\]' /tmp/ci-local-appcore.log || true
+else
+  echo "  SKIP：OHOS NDK 不在（$NDK_CC）⇒ 真链路构建未跑（**显式登记，不静默绿**；见 M0 设计 R3.1）"
+fi
+
+echo "  -- QUIC 岛隔离源码门（五条断言）"
+"$REPO_ROOT/tools/check-quic-isolation.sh" || fail 3 "QUIC 岛隔离门"
 
 echo "==> [4/7] 向量确定性门（gen-vectors + SUMS + git diff）"
 "$REPO_ROOT/tools/gen-vectors.sh" >/dev/null || fail 4 "向量生成"
