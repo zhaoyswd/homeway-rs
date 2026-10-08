@@ -75,8 +75,12 @@ fn lock_host<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
 }
 
 /// 桥拨号闭包面（工单⑤ dial_port 接缝的类型别名）。
-pub type DialFn =
-    Box<dyn Fn(u16, Duration) -> std::io::Result<Box<dyn BridgeStream>> + Send + Sync>;
+///
+/// Q-F F4：**单个 `Arc`**——`handle_conn` 从锁里克隆 Arc 后**出锁拨号**（此前持锁
+/// 跨 15s 拨号，`status()`/`set_dial` 同锁被同步阻塞；原注释的「换轨窗口防半换」
+/// 理由在两处生产路径都不成立：隧道域构造即注入真闭包、服务域只在 `start()` 内换
+/// 一次，换轨时无在途拨号）。不留 `Arc<Mutex<…>>` 退路。
+pub type DialFn = Arc<dyn Fn(u16, Duration) -> std::io::Result<Box<dyn BridgeStream>> + Send + Sync>;
 
 /// 现有 socket 路径是否无主的探测预算（工单②：本地 UDS connect 一般即成，
 /// 但对端 backlog 满时会挂——200ms 内连不上按「有活主人」处理，不误删）。
@@ -281,6 +285,17 @@ struct BridgeSock {
     /// （评审 r2-L8：listener 恒 None 的死字段已删——监听器由 accept 线程独占持有，
     /// stop 的收口 = stopped 位 + 100ms 节拍轮询 + 2s 有界等待，不靠关 fd。）
     own: Option<(u64, u64)>,
+    /// Q-F F7b（N2 同族「假状态」）：accept 线程起不来或 listen 重试耗尽 ⇒ 置位，
+    /// `status()` 对该桥**返回空路径**（App 拿不到非空路径就连接不上的谎报）。
+    /// **置位点 = spawn 点与 listen 结论点**（不能放 accept_loop 入口——spawn 失败
+    /// 时那里根本不执行，设计门 C5）。**本批加固：偏离 Go**（Go 的 `sockJSON` 只要
+    /// token 在就上报路径，`app_bridge.go:388-395`）——登记见 §5.3。
+    ///
+    /// 已知形态：`start()` 到 listen 有结论之间的短暂非空窗口（异步窗口）——不是
+    /// 回归，消费方按路径存在但连不上时的既有重试语义处理。
+    /// （代码门 ⑥-1：本字段的全部读写都在 `Mutex<HostInner>` 内 ⇒ 普通 `bool`
+    /// 足够，不用 atomic。）
+    unavailable: bool,
 }
 
 impl BridgeSock {
@@ -430,6 +445,7 @@ impl BridgeHost {
     }
 
     /// 换拨号面（服务桥形态：构造时给占位，会话建好后换真拨号；幂等替换）。
+    /// F4：原子换 `Arc`（在途拨号持旧 Arc 跑完，换轨不阻塞、不半换）。
     pub fn set_dial(&self, f: DialFn) {
         *lock_host(&self.dial_port) = f;
     }
@@ -486,12 +502,14 @@ impl BridgeHost {
                 port: port::FILES,
                 path: files,
                 own: None,
+                unavailable: false,
             },
             BridgeSock {
                 name: "term-bridge",
                 port: term_port(),
                 path: bridge_socket_path(&dir, "term"),
                 own: None,
+                unavailable: false,
             },
         ];
         let speed_path = bridge_socket_path(&dir, "speedtest");
@@ -507,6 +525,7 @@ impl BridgeHost {
                 port: port::SPEEDTEST,
                 path: speed_path,
                 own: None,
+                unavailable: false,
             });
         }
         // 令牌（32B 随机；生成失败宁可不 exposing 桥——鉴权是硬要求，不做明文回退）
@@ -525,10 +544,26 @@ impl BridgeHost {
         // 每座桥一个 accept 线程（一座端口被占重试不拖另一座）
         for idx in 0..3 {
             let host = Arc::clone(self);
-            std::thread::Builder::new()
+            let spawned = std::thread::Builder::new()
                 .name("hw-bridge-accept".into())
-                .spawn(move || host.accept_loop(idx))
-                .ok();
+                .spawn(move || host.accept_loop(idx));
+            if let Err(e) = spawned {
+                // F7-4①：置位点在 spawn 点（accept_loop 在 spawn 失败时根本不会跑）
+                let (name, logf) = {
+                    let mut inner = lock_host(&self.inner);
+                    let name = inner.socks.get(idx).map(|s| s.name).unwrap_or("bridge");
+                    if let Some(s) = inner.socks.get_mut(idx) {
+                        s.unavailable = true;
+                    }
+                    (name, Arc::clone(&self.logf))
+                };
+                crate::syncutil::log_spawn_failed(
+                    &logf,
+                    &format!("{name} accept 线程"),
+                    &e,
+                    "该桥本轮不可用",
+                );
+            }
         }
         (self.logf)(&format!("{}: 桥宿主启动（三座桥后台就位中）", self.what));
     }
@@ -555,6 +590,13 @@ impl BridgeHost {
                 ln
             });
         let Some(ln) = ln else {
+            // F7-4②：listen 重试耗尽 ⇒ 置位（status 面返回空路径——不再谎报可用）
+            {
+                let mut inner = lock_host(&self.inner);
+                if let Some(s) = inner.socks.get_mut(idx) {
+                    s.unavailable = true;
+                }
+            }
             return self.live_leave();
         };
 
@@ -563,9 +605,15 @@ impl BridgeHost {
                 Ok((conn, _)) => {
                     conn.set_nonblocking(false).ok();
                     let host = Arc::clone(&self);
-                    let _ = std::thread::Builder::new()
+                    // F7-1：conn 线程 spawn 失败不静默（只记行——该连接收口，监听面照常）
+                    if let Err(e) = std::thread::Builder::new()
                         .name("hw-bridge-conn".into())
-                        .spawn(move || host.handle_conn(name, port, conn));
+                        .spawn(move || host.handle_conn(name, port, conn))
+                    {
+                        (self.logf)(&format!(
+                            "{name}: 连接处理线程启动失败（{e}）—— 该连接收口（监听面不受影响）"
+                        ));
+                    }
                 }
                 Err(e) if e.kind() == ErrorKind::WouldBlock => {
                     std::thread::sleep(Duration::from_millis(100));
@@ -609,12 +657,10 @@ impl BridgeHost {
             self.live_leave();
             return;
         }
-        // 预算先取（短临界区）——dial_port 的锁在拨号全程持有（换轨窗口里 set_dial
-        // 排队等在途拨号，防半换状态）
+        // 预算与拨号面都**克隆出锁**再拨（F4：短临界区；拨号本身最长 15s，不得持锁）
         let budget = *lock_host(&self.dial_timeout);
-        let dial = lock_host(&self.dial_port);
+        let dial = Arc::clone(&lock_host(&self.dial_port));
         let r = dial(port, budget);
-        drop(dial);
         match r {
             Ok(remote) => {
                 // 双向泵（两条线程；任一方向断即整体收口；守卫随最后一泵结束销票）。
@@ -633,20 +679,30 @@ impl BridgeHost {
                         let logf1 = Arc::clone(&self.logf);
                         let logf2 = Arc::clone(&self.logf);
                         drop(guard);
-                        std::thread::Builder::new()
+                        // F7-1：泵线程 spawn 失败不静默——该方向收口（对侧泵照常，
+                        // 连接随会话关闭自然断）
+                        if let Err(e) = std::thread::Builder::new()
                             .name("hw-bridge-pump".into())
                             .spawn(move || {
                                 let _g = g1;
                                 pump(&mut local_r, &mut *remote_w, &logf1, "up");
                             })
-                            .ok();
-                        std::thread::Builder::new()
+                        {
+                            (self.logf)(&format!(
+                                "{name}: 泵线程（up）启动失败（{e}）—— 该方向收口"
+                            ));
+                        }
+                        if let Err(e) = std::thread::Builder::new()
                             .name("hw-bridge-pump".into())
                             .spawn(move || {
                                 let _g = g2;
                                 pump(&mut *remote_r, &mut local_w, &logf2, "down");
                             })
-                            .ok();
+                        {
+                            (self.logf)(&format!(
+                                "{name}: 泵线程（down）启动失败（{e}）—— 该方向收口"
+                            ));
+                        }
                     }
                     (Err(_), _) => {
                         (self.logf)(&format!("{name}: 桥接流拆半失败——连接收口"));
@@ -709,11 +765,13 @@ impl BridgeHost {
         let Some(tok) = inner.token else {
             return BridgeStatus::default();
         };
+        // F7b：该桥本轮不可用（accept 起不来 / listen 耗尽）⇒ 空路径（不谎报）
         let pick = |name: &str| {
             inner
                 .socks
                 .iter()
                 .find(|s| s.path.ends_with(format!("{name}.sock")))
+                .filter(|s| !s.unavailable)
                 .map(|s| s.path.display().to_string())
                 .unwrap_or_default()
         };
@@ -849,7 +907,7 @@ mod tests {
             "测试桥",
             Some(dir.clone()),
             logf,
-            Box::new(|_, _| Err(std::io::Error::new(ErrorKind::ConnectionRefused, "无会话"))),
+            Arc::new(|_, _| Err(std::io::Error::new(ErrorKind::ConnectionRefused, "无会话"))),
         ));
         host.start();
         // 等 listen 就位（auth_hex 在 start 同步段就有；socket 文件在后台线程落盘）
@@ -897,7 +955,7 @@ mod tests {
             "测试桥",
             Some(dir),
             logf,
-            Box::new(move |port, _| {
+            Arc::new(move |port, _| {
                 tx.send(port).unwrap();
                 Err(std::io::Error::new(ErrorKind::ConnectionRefused, "拒"))
             }),
@@ -972,7 +1030,7 @@ mod tests {
             "测试桥",
             None,
             logf,
-            Box::new(|_, _| unreachable!()),
+            Arc::new(|_, _| unreachable!()),
         ));
         host.start();
         assert_eq!(host.status(), BridgeStatus::default());
@@ -996,7 +1054,7 @@ mod tests {
             "测试桥",
             Some(dir),
             logf,
-            Box::new(|_, _| Err(std::io::Error::new(ErrorKind::ConnectionRefused, "无"))),
+            Arc::new(|_, _| Err(std::io::Error::new(ErrorKind::ConnectionRefused, "无"))),
         ));
         host.start();
         let deadline = std::time::Instant::now() + Duration::from_secs(3);
@@ -1053,5 +1111,106 @@ mod tests {
         let p = bridge_socket_path(Path::new("/data/f"), "files");
         assert_eq!(p, Path::new("/data/f/bridge/files.sock"));
         assert_eq!(term_port(), 7724);
+    }
+
+    /// F4：dial 出锁——A 阻塞在拨号体内时，B **已能进入**拨号（旧形态持锁跨拨号 ⇒
+    /// B 被挡在锁外）；且换拨号面（`set_dial`）不被在途拨号阻塞。
+    #[test]
+    fn dial_port_lock_not_held_during_dial() {
+        let dir = tmp_dir("dialout");
+        let (logf, _lines) = log_silent();
+        let entered = Arc::new(AtomicU64::new(0));
+        let e2 = Arc::clone(&entered);
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let release_rx = Arc::new(Mutex::new(release_rx));
+        let rx2 = Arc::clone(&release_rx);
+        let host = Arc::new(BridgeHost::new(
+            "测试桥",
+            Some(dir),
+            logf,
+            Arc::new(move |_p, _b| {
+                let n = e2.fetch_add(1, Ordering::SeqCst);
+                if n == 0 {
+                    // 第一发「拨号」阻塞（模拟 15s 拨号在途）
+                    let _ = rx2.lock().unwrap().recv();
+                }
+                Err(std::io::Error::new(ErrorKind::ConnectionRefused, "拒"))
+            }),
+        ));
+        let dial_of = |h: &Arc<BridgeHost>| Arc::clone(&lock_host(&h.dial_port));
+        let a = {
+            let d = dial_of(&host);
+            std::thread::spawn(move || d(7802, Duration::from_secs(5)))
+        };
+        // 等 A 进入拨号
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while entered.load(Ordering::SeqCst) == 0 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(entered.load(Ordering::SeqCst), 1, "A 已进入拨号");
+        // B：A 未返回时进入拨号（出锁拨号的直接证据）
+        let b = {
+            let d = dial_of(&host);
+            std::thread::spawn(move || d(7724, Duration::from_secs(5)))
+        };
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while entered.load(Ordering::SeqCst) < 2 && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(
+            entered.load(Ordering::SeqCst),
+            2,
+            "B 必须在 A 未返回时就进入拨号（锁不得跨拨号持有）"
+        );
+        // 换拨号面：不得被在途拨号阻塞（Arc 原子替换）
+        let t0 = std::time::Instant::now();
+        host.set_dial(Arc::new(|_, _| {
+            Err(std::io::Error::new(ErrorKind::ConnectionRefused, "换面后"))
+        }));
+        assert!(
+            t0.elapsed() < Duration::from_millis(300),
+            "set_dial 不得等在途拨号（实耗 {:?}）",
+            t0.elapsed()
+        );
+        let _ = release_tx.send(());
+        assert!(a.join().unwrap().is_err());
+        assert!(b.join().unwrap().is_err());
+    }
+
+    /// F7b：accept 起不来 / listen 耗尽 ⇒ `unavailable` 置位 ⇒ `status()` 对该桥返回
+    /// **空路径**（不再谎报可用）；`auth_hex` 不变。
+    #[test]
+    fn unavailable_bridge_reports_empty_path() {
+        let dir = tmp_dir("unavail");
+        let (logf, _lines) = log_silent();
+        let host = Arc::new(BridgeHost::new(
+            "测试桥",
+            Some(dir.clone()),
+            logf,
+            Arc::new(|_, _| Err(std::io::Error::new(ErrorKind::ConnectionRefused, "无会话"))),
+        ));
+        host.start();
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        while host.status().files_sock.is_empty() && std::time::Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let before = host.status();
+        assert!(!before.files_sock.is_empty(), "前置：正常态有路径");
+        assert_eq!(before.auth_hex.len(), 96);
+        // 直置位（F7-4 置位点在生产路径 = spawn 点 / listen 结论点）
+        {
+            let mut inner = lock_host(&host.inner);
+            let s = inner
+                .socks
+                .iter_mut()
+                .find(|s| s.name == "files-bridge")
+                .expect("files 桥在册");
+            s.unavailable = true;
+        }
+        let after = host.status();
+        assert_eq!(after.files_sock, "", "不可用 ⇒ 空路径（不谎报）");
+        assert_eq!(after.auth_hex, before.auth_hex, "auth_hex 不变");
+        assert!(!after.term_sock.is_empty(), "其它桥不受影响");
+        host.stop();
     }
 }

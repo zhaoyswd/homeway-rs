@@ -78,6 +78,11 @@ const MTU_DEFAULT: i64 = 1280;
 /// 的 dialMs 热传入 BridgeHost）。
 const DIAL_MS_DEFAULT: i64 = 15000;
 
+/// 退出路径 RPC 的预算（Q-F F3b/N1：close_write / SharedConn::drop 走在**必须退出**
+/// 的收工链上——引擎卡死时无界等待会把桥泵与世代收工钉住。2s = 阶梯动作预算同刻度，
+/// 正常引擎回执即时）。
+const EXIT_RPC_BUDGET: Duration = Duration::from_secs(2);
+
 // ---------------------------------------------------------------------------
 // 会话流适配器（桥远端——工单⑤ dial_port 接缝：流 id ≠ fd，适配成 Read/Write 两半）
 // ---------------------------------------------------------------------------
@@ -90,7 +95,9 @@ struct SharedConn {
 
 impl Drop for SharedConn {
     fn drop(&mut self) {
-        let _ = self.client.close(self.id);
+        // Q-F F3b/N1：关流走在必须退出的收工链上（桥泵收口）——用有界面，引擎卡死
+        // 时不让 Drop 挂死线程（代价：极端形态下引擎内槽位滞留，由引擎收工统一回收）
+        let _ = self.client.close_bounded(self.id, EXIT_RPC_BUDGET);
     }
 }
 
@@ -134,14 +141,17 @@ impl Write for SessionWriteHalf {
     /// 桥泵据此拆连接 ⇒ 上行 bulk 一进慢链路（缓冲被 cwnd 门限速填满）就整轮断流
     /// （真机实测：4 会话请求后 <1s 全 EOF；R7 E2E 的「上行帧中途断」同根因——
     /// host 形态 CLI 走 ClientConn 的零进展重试环，此桥路径裸露）。这里把 Ok(0)
-    /// 展开成**有界等待重试**（Go net.Conn.Write 的阻塞语义）：重试节拍 2ms（RPC
-    /// 风暴防护——停滞期 ~500 次/s），无进展上限 10s（远大于窗口时长，防死锁兜底）。
+    /// 展开成**有界等待重试**（Go net.Conn.Write 的阻塞语义）：重试节拍**分级退避**
+    /// （F8a：前 50 拍 2ms ⇒ 其后 10ms ⇒ 100 拍后 20ms 封顶——停滞期不再固定
+    /// ~500 次/s 的 `client.write` RPC 唤醒税），无进展上限 10s（远大于窗口时长，
+    /// 防死锁兜底）。
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         if data.is_empty() {
             return Ok(0); // 空写短路（评审 r1-补1：send_slice(&[]) 恒 Ok(0) 会被
                           // 背压环当「缓冲满」空转 10s——io::Write 约定空写返 Ok(0)）
         }
         let no_progress = Instant::now();
+        let mut attempt: u32 = 0;
         // R8-3 F12：零接纳时引擎把原 Vec 带回（WriteOut.back）——背压重试环不再
         // 每拍重拷整段（此前 data.to_vec() 在循环内，2ms 节拍 × 整段 = 停滞期
         // 常驻拷贝面）。
@@ -160,7 +170,8 @@ impl Write for SessionWriteHalf {
                             "写通道长时间无进展（栈内发送缓冲不排空）",
                         ));
                     }
-                    std::thread::sleep(Duration::from_millis(2));
+                    std::thread::sleep(write_retry_backoff(attempt));
+                    attempt = attempt.saturating_add(1);
                 }
                 Ok(w) => return Ok(w.n),
                 Err(e) => return Err(io::Error::other(e.to_string())),
@@ -172,9 +183,22 @@ impl Write for SessionWriteHalf {
     }
 }
 
+/// 背压重试节拍（F8a 纯函数）：前 50 拍 2ms、51–100 拍 10ms、其后 20ms 封顶。
+/// 10s 无进展上界与「空写短路」语义不随本表变化。
+fn write_retry_backoff(attempt: u32) -> Duration {
+    if attempt < 50 {
+        Duration::from_millis(2)
+    } else if attempt < 100 {
+        Duration::from_millis(10)
+    } else {
+        Duration::from_millis(20)
+    }
+}
+
 impl WriteHalf for SessionWriteHalf {
     fn close_write(&mut self) {
-        let _ = self.shared.client.shutdown(self.shared.id);
+        // Q-F F3b/N1：半关走在桥泵收口路径上——有界（同 EXIT_RPC_BUDGET）
+        let _ = self.shared.client.shutdown_bounded(self.shared.id, EXIT_RPC_BUDGET);
     }
 }
 
@@ -232,20 +256,44 @@ impl BridgeStream for SessionStream {
 /// 恢复感知拨号（Session::healing_dial 的隧道域内联版：4s 首试 → 阶梯 R2 → 余预算）。
 /// 错误归因类型化（评审 r2-M9）：Refused → io ErrorKind::ConnectionRefused——桥宿主
 /// 的「出口活着、端口没服务」判定只认 kind，不再字符串嗅探。
+///
+/// Q-F F3（设计门 D4/D9/C4）：**阶梯与阶梯等待计入调用方同一预算**——`deadline`
+/// 透给恢复闸（等待到点 ⇒ `(Deadline,false)`，不发布不清闸）；首试与尾试各按剩余
+/// 夹取。残余越界上界 = 一个动作预算（`recover::ACTION`=2s，动作不可中断）。
 fn healing_dial(
     client: &Arc<Client>,
     run: &GenRun,
     dst: SocketAddrV4,
     budget: Duration,
 ) -> io::Result<u64> {
-    const FIRST_TRY: Duration = Duration::from_secs(4);
+    dial_with_recover(client, dst, budget, FIRST_TRY, |lvl, deadline, cause| {
+        run.recover_until(lvl, cause, deadline)
+    })
+}
+
+/// 阶梯首试预算（隧道域；服务域用 `session::DIAL_FIRST_TRY` 同值）。
+const FIRST_TRY: Duration = Duration::from_secs(4);
+
+/// 恢复感知拨号的可测主体（两域共用形；单测注入「阻塞到期限」的桩闭包 ⇒ 断言
+/// 预算内返回——预算须 > `first_try` 且断言桩被调用过，否则假绿）。
+fn dial_with_recover<F>(
+    client: &Arc<Client>,
+    dst: SocketAddrV4,
+    budget: Duration,
+    first_try: Duration,
+    recover: F,
+) -> io::Result<u64>
+where
+    F: FnOnce(Level, Option<Instant>, &str) -> (LadderRc, bool),
+{
     let t0 = Instant::now();
+    let deadline = t0 + budget;
     let conn_err_to_io = |e: ConnErr| match e {
         ConnErr::Refused => io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()),
         ConnErr::Timeout => io::Error::new(io::ErrorKind::TimedOut, e.to_string()),
         other => io::Error::other(other.to_string()),
     };
-    match client.connect_deadline(dst, FIRST_TRY) {
+    match client.connect_deadline(dst, first_try.min(budget)) {
         Ok(id) => return Ok(id),
         Err(e) => {
             if t0.elapsed() >= budget {
@@ -253,18 +301,24 @@ fn healing_dial(
             }
         }
     }
-    // 拨号失败 → 阶梯（世代还在就恢复它；引擎收工 = 如实报错）
-    let rc = run.recover(Level::R2, "拨号失败");
-    if matches!(rc, LadderRc::Recovered(_)) {
-        let remain = budget
-            .saturating_sub(t0.elapsed())
-            .max(Duration::from_millis(1));
-        return client.connect_deadline(dst, remain).map_err(conn_err_to_io);
+    // 拨号失败 → 阶梯（世代还在就恢复它；引擎收工 = 如实报错）；期限随调用方预算
+    let (rc, _waited) = recover(Level::R2, Some(deadline), "拨号失败");
+    match rc {
+        LadderRc::Recovered(_) => {
+            let remain = budget
+                .saturating_sub(t0.elapsed())
+                .max(Duration::from_millis(1));
+            client.connect_deadline(dst, remain).map_err(conn_err_to_io)
+        }
+        LadderRc::Deadline => Err(io::Error::new(
+            io::ErrorKind::TimedOut,
+            "拨号失败且恢复预算耗尽（放弃等待）",
+        )),
+        other => Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            format!("拨号失败且阶梯未恢复（rc={:?}）", other.as_rc()),
+        )),
     }
-    Err(io::Error::new(
-        io::ErrorKind::NotConnected,
-        format!("拨号失败且阶梯未恢复（rc={:?}）", rc.as_rc()),
-    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -298,8 +352,9 @@ pub struct GenRun {
     domain_cands: Mutex<Vec<Candidate>>,
     /// 域名重解析编排（无域名条目 = None；Rearm/RearmSoft/旁路探测拍触发）。
     domain_refresher: RwLock<Option<Arc<crate::wtransport::domain_eps::DomainRefresher>>>,
-    /// 重建材料（Token 的身份面；候选 = static_cands 另存）。
-    secret: [u8; 32],
+    /// 重建材料（Token 的身份面；候选 = static_cands 另存）。Secret 非 Copy
+    /// （F8d）——持有者唯一、Drop 擦除。
+    secret: crate::token::Secret,
     #[allow(dead_code)]
     // 重建材料位（对齐 Go tunRun 的会话材料；隧道域不 rebuild——阶梯失败交扩展）
     peer_pub: [u8; 32],
@@ -341,8 +396,21 @@ impl GenRun {
 
     /// 恢复入口（gate 单飞；隧道域 rc 契约）。
     pub fn recover(&self, from: Level, cause: &str) -> LadderRc {
+        self.recover_until(from, cause, None).0
+    }
+
+    /// 带期限的恢复入口（Q-F F3-1/F3-2）：`deadline` 透到阶梯本体（每档起点/动作前
+    /// 检查）与闸等待（等待方到点返回 `(Deadline,false)`，在途轮照常跑完）。
+    /// 第二返回值 = 是否等到了结果（执行方恒 true）。
+    pub fn recover_until(
+        &self,
+        from: Level,
+        cause: &str,
+        deadline: Option<Instant>,
+    ) -> (LadderRc, bool) {
         let sh = self;
-        sh.gate.merge(from, |lvl| run_round(sh, lvl, cause))
+        sh.gate
+            .merge_until(from, deadline, |lvl, d| run_round(sh, lvl, cause, d))
     }
 
     fn merged_candidates(&self) -> Vec<Candidate> {
@@ -391,7 +459,7 @@ impl GenRun {
 }
 
 /// 阶梯一轮（EngineTransport 的隧道域版——Client 动作面 + 候选重投）。
-fn run_round(run: &GenRun, from: Level, cause: &str) -> LadderRc {
+fn run_round(run: &GenRun, from: Level, cause: &str, deadline: Option<Instant>) -> LadderRc {
     let Some(client) = run.current_client() else {
         // 装配期窗口（评审 r2-M2）：本地动作面不在——按本地动作失败收轮（-4），
         // 不让恢复闸挂死
@@ -411,6 +479,7 @@ fn run_round(run: &GenRun, from: Level, cause: &str) -> LadderRc {
         logf: &|s: &str| (run.logf)(s),
         pre_probe: recover::PRE_PROBE,
         verify: recover::VERIFY,
+        deadline,
     };
     recover::run_ladder(&mut deps, from, cause)
 }
@@ -599,31 +668,67 @@ impl TunExecutor for TunnelExec {
         Some(transport_of(self.gen_run()?.as_ref()))
     }
 
+    /// portfwd 整表热替换（Q-F F1-3 诚实语义）：表**照存**（状态面要如实呈现每条
+    /// 映射），但返回值改 **-1**——本核没有承载端口转发数据面的执行体，「0 已应用」
+    /// 是谎报（rc 读法 = 「没有已接管（端口转发）数据面的世代」= 事实；tier 只把 rc
+    /// 写日志，页面状态来自 status 面）。
     fn request_port_forwards(&self, rules: Vec<PortForwardRule>) -> i32 {
         if let Some(run) = self.gen_run() {
             *lock_unpoison(&run.pf_rules) = rules;
-            return 0;
+            return -1;
         }
         -1
     }
 }
 
-fn portfwd_states(run: &GenRun) -> Vec<super::tun_status::PfStateIn> {
-    lock_unpoison(&run.pf_rules)
-        .iter()
-        .map(|r| super::tun_status::PfStateIn {
-            listen: r.listen,
-            target: if r.target_ip.is_empty() {
-                format!(":{}", r.target_port)
-            } else {
-                format!("{}:{}", r.target_ip, r.target_port)
-            },
-            state: "listening".into(),
-            err: String::new(),
-            code: String::new(),
-            conns: 0,
+/// `portForwards[]` 元素组装（Q-F F1-6：**纯函数**——不依赖 GenRun，单测直喂四形态；
+/// 组装唯一入口 = `portfwd::pf_states` → `PfState::snapshot()`）。
+fn portfwd_states(rules: &[PortForwardRule]) -> Vec<super::tun_status::PfStateIn> {
+    super::portfwd::pf_states(rules)
+}
+
+/// 【test-seams】最小世代（Q-F F1 状态面集成 + 热替换 rc 断言用）：真惰性 Client +
+/// 空桥/空缓存/空域名面——`runner_of` 与 `request_port_forwards` 直喂。
+#[cfg(test)]
+impl GenRun {
+    pub(crate) fn synthetic_for_test(logf: Logf) -> GenRun {
+        let ident = crate::identity::Identity::ephemeral().expect("临时身份");
+        let client = Client::start(CoreConfig {
+            peer_id: crate::token::PeerId::from([1u8; 32]),
+            secret: crate::token::Secret::from([2u8; 32]),
+            identity: ident.clone(),
+            candidates: vec![Candidate {
+                addr: "203.0.113.1:41641".parse().unwrap(),
+                relay: false,
+            }],
+            logf: Arc::clone(&logf),
         })
-        .collect()
+        .expect("惰性客户端可起");
+        let (ev_tx, _ev_rx) = mpsc::sync_channel::<GenEvent>(8);
+        GenRun {
+            gen: 1,
+            stop: Arc::new(AtomicBool::new(false)),
+            ev_tx,
+            client: RwLock::new(Some(Arc::new(client))),
+            gate: RecoverGate::new(),
+            cache: None,
+            static_cands: vec![],
+            domain_cands: Mutex::new(vec![]),
+            domain_refresher: RwLock::new(None),
+            secret: crate::token::Secret::from([2u8; 32]),
+            peer_pub: [3u8; 32],
+            identity: ident,
+            link: Mutex::new(None),
+            bridge: Mutex::new(None),
+            logf,
+            tun_shared: Arc::new(TunShared::new()),
+            demand: Arc::new(DemandSignals::new()),
+            pf_rules: Mutex::new(vec![]),
+            started: Instant::now(),
+            save_tx: None,
+            last_punch: Mutex::new(None),
+        }
+    }
 }
 
 /// runner 块的组装（TunnelExec::runner 与对账快照共用——评审 r2-M11 的完全对齐：
@@ -652,11 +757,14 @@ pub(crate) fn runner_of(run: &GenRun) -> RunnerIn {
     RunnerIn {
         fd_read_bytes: rd,
         fd_write_bytes: wr,
+        // 端口转发计数（F1/N4 语义标注）：**真值恒 0**——本核无监听器 ⇒ 无 accept、
+        // 无失败；读数的人不得据此以为端口转发在跑（映射状态见 port_forwards[]
+        // 的 failed + err）。Q-F-B 实装监听器后接真计数（行文不变）。
         pf_accepted: 0,
         pf_fails: 0,
         exit_ip: crate::wgcore::SERVER_TUNNEL_IP.to_string(),
         link,
-        port_forwards: portfwd_states(run),
+        port_forwards: portfwd_states(&lock_unpoison(&run.pf_rules)),
         bridge,
     }
 }
@@ -697,11 +805,7 @@ struct GenCfg {
 
 impl GenRun {
     fn tun_ip_string(&self) -> String {
-        crate::tunnel_addr::derive_tun_ip(
-            &crate::token::Secret::from(self.secret),
-            &self.identity.public_key(),
-        )
-        .to_string()
+        crate::tunnel_addr::derive_tun_ip(&self.secret, &self.identity.public_key()).to_string()
     }
 }
 
@@ -803,7 +907,7 @@ fn gen_loop(
         gate: RecoverGate::new(),
         cache: cache.map(Mutex::new),
         static_cands: inputs_static_base,
-        secret: *cfg.token.secret.as_bytes(),
+        secret: cfg.token.secret.clone(),
         peer_pub: *cfg.token.peer_id.as_bytes(),
         identity: ident.clone(),
         link: Mutex::new(None),
@@ -845,9 +949,9 @@ fn gen_loop(
             Arc::new(move || {
                 if let Some(r) = w3.upgrade() {
                     if let Some(c) = r.current_client() {
-                        let _ = c.rearm_soft();
+                        let _ = c.rearm_soft_bounded(recover::ACTION);
                         if let Some(ec) = &r.cache {
-                            ec.lock().expect("缓存锁中毒").note_rearm();
+                            lock_unpoison(ec).note_rearm();
                         }
                         let merged = r.merged_candidates();
                         c.set_candidates(merged);
@@ -912,7 +1016,8 @@ fn gen_loop(
 
     let client = match Client::start(CoreConfig {
         peer_id: cfg.token.peer_id,
-        secret: cfg.token.secret,
+        // Secret 非 Copy（F8d）：cfg.token 在下方 derive_tunnel_ip 仍要借 secret
+        secret: cfg.token.secret.clone(),
         identity: ident.clone(),
         candidates: candidates.clone(),
         logf: Arc::clone(&logf),
@@ -1140,7 +1245,7 @@ fn gen_loop(
         Arc::clone(&logf),
         {
             let run2 = Arc::clone(&run);
-            Box::new(move |port, budget| session_connect(&run2, port, budget))
+            Arc::new(move |port, budget| session_connect(&run2, port, budget))
         },
     ));
     // 桥拨号预算随 tunConfig（dialMs——评审 r2-L5：此前是死字段 + 常量 15s）
@@ -1155,7 +1260,8 @@ fn gen_loop(
         let run2 = Arc::clone(&run);
         let shared2 = Arc::clone(&shared);
         let demand2 = Arc::clone(&demand);
-        let _ = std::thread::Builder::new()
+        let logf2 = Arc::clone(&logf);
+        let spawned = std::thread::Builder::new()
             .name("homeway-status-dump".into())
             .spawn(move || {
                 std::thread::sleep(Duration::from_millis(1500));
@@ -1183,17 +1289,38 @@ fn gen_loop(
                     super::tun_status::tun_status_json(&input)
                 ));
             });
+        // F7-1：spawn 失败不静默（只记行——对账快照缺失不动数据面，也不标 unhealthy：
+        // unhealthy 会经 App FailGate 触发整套重建，代价大于收益，设计门 D6）
+        if let Err(e) = spawned {
+            crate::syncutil::log_spawn_failed(
+                &logf2,
+                "homeway-status-dump",
+                &e,
+                "本世代无 tunStatusJSON 对账快照（不影响数据面）",
+            );
+        }
     }
 
     // ---- 巡检 / stats / demand pusher（评审 r2-L3：线程体套 catch_unwind——Go 各
     // goroutine 有 recover，panic 分类可达）----
-    let patrol_handle = spawn_derived("homeway-patrol", Arc::clone(&run), move |r| {
-        patrol_loop(r, ev_rx)
-    });
-    let pusher_handle = spawn_derived("homeway-demand-push", Arc::clone(&run), demand_pusher_loop);
-    let stats_handle = spawn_derived("homeway-stats", Arc::clone(&run), move |r| {
-        stats_loop(r, cfg.stats_secs, cfg.diag_fd_secs)
-    });
+    let patrol_handle = spawn_derived(
+        "homeway-patrol",
+        Arc::clone(&run),
+        "本世代失去自愈巡检（数据面不受影响）",
+        move |r| patrol_loop(r, ev_rx),
+    );
+    let pusher_handle = spawn_derived(
+        "homeway-demand-push",
+        Arc::clone(&run),
+        "本世代无需求下推（退化为巡检节拍）",
+        demand_pusher_loop,
+    );
+    let stats_handle = spawn_derived(
+        "homeway-stats",
+        Arc::clone(&run),
+        "本世代无统计行（对账缺一段观测）",
+        move |r| stats_loop(r, cfg.stats_secs, cfg.diag_fd_secs),
+    );
 
     // ---- 等 stop（世代主线程的最后一段；_finish guard 在 return 时统一收尾）----
     loop {
@@ -1233,12 +1360,18 @@ fn gen_loop(
 /// 派生线程（巡检/pusher/stats）的统一 spawn：线程体套 catch_unwind——panic 不
 /// 穿透（c-shared 宿主进程里 panic = 扩展进程死），落日志 + markUnhealthy("panic")
 /// 交扩展重建（Go recover 后调 t.markUnhealthy("panic") 同义）。
+///
+/// F7-1：**spawn 失败不再静默**——只记行（`consequence` = 本派生的降级后果），不标
+/// unhealthy（设计门 D6：unhealthy 会触发 App 整套重建，代价大于收益；两域数据面都
+/// 不依赖巡检）。残余 = 本世代无自愈巡检（登记）。
 fn spawn_derived(
     name: &'static str,
     run: Arc<GenRun>,
+    consequence: &'static str,
     body: impl FnOnce(Arc<GenRun>) + Send + 'static,
 ) -> Option<std::thread::JoinHandle<()>> {
-    std::thread::Builder::new()
+    let logf = Arc::clone(&run.logf);
+    match std::thread::Builder::new()
         .name(name.into())
         .spawn(move || {
             let r2 = Arc::clone(&run);
@@ -1250,8 +1383,13 @@ fn spawn_derived(
                 ));
                 r2.tun_shared.mark_unhealthy_if_current(gen, "panic");
             }
-        })
-        .ok()
+        }) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            crate::syncutil::log_spawn_failed(&logf, name, &e, consequence);
+            None
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1270,7 +1408,8 @@ fn install_tunnel_hint(client: &Arc<Client>, hint_tx: mpsc::SyncSender<SocketAdd
 
 /// hint 处理线程（Go Transport 的 hint 链路：观察 → 候选重投 → 落盘信号 → 打洞）。
 fn spawn_tunnel_hint_handler(run: Arc<GenRun>, rx: mpsc::Receiver<SocketAddr>) {
-    let _ = std::thread::Builder::new()
+    let logf = Arc::clone(&run.logf);
+    let spawned = std::thread::Builder::new()
         .name("homeway-tun-hint".into())
         .spawn(move || {
             while !run.stop.load(Ordering::Acquire) {
@@ -1290,10 +1429,22 @@ fn spawn_tunnel_hint_handler(run: Arc<GenRun>, rx: mpsc::Receiver<SocketAddr>) {
                 tunnel_punch_to(&run, addr);
             }
         });
+    if let Err(e) = spawned {
+        crate::syncutil::log_spawn_failed(
+            &logf,
+            "homeway-tun-hint",
+            &e,
+            "本世代不做 hint 打洞（候选仍按巡检刷新）",
+        );
+    }
 }
 
 /// 收到对端地址线索后打一发「握手兼打洞」（Go punchTo：节流 5s + RearmSoft + 拨 :1）。
 fn tunnel_punch_to(run: &Arc<GenRun>, addr: SocketAddr) {
+    // F6-5：停机中不发起新探测（在途成本收窄——path_probe 5s 预算不改）
+    if run.stop.load(Ordering::Acquire) {
+        return;
+    }
     {
         let mut lp = lock_unpoison(&run.last_punch);
         if lp.is_some_and(|t| t.elapsed() < Duration::from_secs(5)) {
@@ -1304,9 +1455,10 @@ fn tunnel_punch_to(run: &Arc<GenRun>, addr: SocketAddr) {
     let Some(client) = run.current_client() else {
         return;
     };
-    let _ = client.rearm_soft();
+    // F3b/N1：hint 线程必须能退出——无界 RPC 改有界（recover::ACTION 同刻度）
+    let _ = client.rearm_soft_bounded(recover::ACTION);
     if let Some(c) = &run.cache {
-        c.lock().expect("缓存锁中毒").note_rearm();
+        lock_unpoison(c).note_rearm();
     }
     run.domain_refresh_async();
     (run.logf)(&format!(
@@ -1333,7 +1485,8 @@ fn tunnel_punch_to(run: &Arc<GenRun>, addr: SocketAddr) {
 
 /// 缓存落盘去抖（Go FIX-16：信号合并 + 1s 去抖窗；收口终写在 Finish guard）。
 fn spawn_tunnel_save_loop(run: Arc<GenRun>, rx: mpsc::Receiver<()>) {
-    let _ = std::thread::Builder::new()
+    let logf = Arc::clone(&run.logf);
+    let spawned = std::thread::Builder::new()
         .name("homeway-tun-cache-save".into())
         .spawn(move || {
             loop {
@@ -1352,6 +1505,14 @@ fn spawn_tunnel_save_loop(run: Arc<GenRun>, rx: mpsc::Receiver<()>) {
                 }
             }
         });
+    if let Err(e) = spawned {
+        crate::syncutil::log_spawn_failed(
+            &logf,
+            "homeway-tun-cache-save",
+            &e,
+            "端点缓存只靠世代收工终写（无去抖落盘）",
+        );
+    }
 }
 
 fn log_identity(
@@ -1493,9 +1654,9 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
                     "RELAY-UPGRADE：已在中继停留 {}，重新武装赛跑试直连（下一发出站包镜像到全部候选）",
                     crate::go_fmt::fmt_duration_go_secs(RELAY_UPGRADE_EVERY * PATROL_INTERVAL)
                 ));
-                let _ = client.rearm_soft();
+                let _ = client.rearm_soft_bounded(recover::ACTION);
                 if let Some(c) = &run.cache {
-                    c.lock().expect("缓存锁中毒").note_rearm();
+                    lock_unpoison(c).note_rearm();
                 }
                 let merged = run.merged_candidates();
                 client.set_candidates(merged);
@@ -1522,7 +1683,7 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
         }
         // 周期补注册（失败拍也发——注册走原始 UDP，不依赖 WG 会话与探测结果）
         if last_reg.is_none_or(|t| now.duration_since(t) >= REG_REFRESH_EVERY)
-            && client.refresh_reg_result().unwrap_or(false)
+            && client.refresh_reg_result_bounded(recover::ACTION).unwrap_or(false)
         {
             last_reg = Some(now);
         }
@@ -1764,11 +1925,12 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
 // stats 线程（与设备 /proc/net/dev vpn-tun 行对表）
 // ---------------------------------------------------------------------------
 
-fn stats_loop(run: Arc<GenRun>, stats_secs: i64, diag_fd_secs: i64) {
+/// `diag_fd_secs` = 配置面字段（`tunConfig.diagFdSecs`）：**本核无消费**——fd 快照面在
+/// OHOS 沙箱受限（Go 侧 `/proc/self/fd` 快照读不到有意义的东西），Q-F F8b 删掉
+/// 「基线一行 + 周期快照」的死分支（分支体只改两个账面变量、无任何观测产出）；
+/// 字段保留（删字段会动 `TunConfigJson` serde 面与 Go 配置对齐——登记 §7-9）。
+fn stats_loop(run: Arc<GenRun>, stats_secs: i64, _diag_fd_secs: i64) {
     let tick = Duration::from_secs(stats_secs.max(STATS_SECS_MIN) as u64);
-    let mut elapsed: i64 = 0;
-    let mut base_done = false;
-    let mut last_diag: i64 = 0;
     loop {
         // 分片等待（评审 r2-H3：整段 sleep(tick)〔默认 60s〕让收工 join 白烧满预算
         // ⇒ tun_stop 常态化 -2 强制放锁——Go 统计 goroutine 的 select{tick, stop} 同义）
@@ -1781,19 +1943,14 @@ fn stats_loop(run: Arc<GenRun>, stats_secs: i64, diag_fd_secs: i64) {
                 Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now()));
             std::thread::sleep(nap);
         }
-        elapsed += stats_secs.max(STATS_SECS_MIN);
         let (rd, wr) = run
             .current_client()
             .map(|c| c.tun_stats())
             .unwrap_or((0, 0));
+        // pf 两位 = 真值恒 0（F1/N4：无监听器 ⇒ 无 accept/失败；行文不变，语义登记 §5.2）
         (run.logf)(&format!(
             "stats: fdReadBytes={rd}B fdWriteBytes={wr}B ｜ pf=0/0"
         ));
-        // 基线一行 + 可选周期快照（fd 快照面 OHOS 沙箱受限——不打，登记）
-        if !base_done || (diag_fd_secs > 0 && elapsed - last_diag >= diag_fd_secs) {
-            base_done = true;
-            last_diag = elapsed;
-        }
     }
 }
 
@@ -1862,7 +2019,169 @@ fn now_unix_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::facade::{ClientCore, TunStage};
+    use crate::identity::Identity;
     use crate::token::{self, EndpointRef, PeerId, Secret, TokenSpec};
+    use crate::wtransport::Candidate;
+
+    /// TEST-NET-3 黑洞 Client（惰性：只起引擎线程，镜像包无人应答——镜像
+    /// `wgcore::tests::engine_probe_blackhole_times_out` 的可行构造）。
+    fn blackhole_client() -> Arc<Client> {
+        let ident = Identity::ephemeral().expect("临时身份");
+        let logf: Logf = Arc::new(|_s: &str| {});
+        Arc::new(
+            Client::start(CoreConfig {
+                peer_id: PeerId::from([1u8; 32]),
+                secret: Secret::from([2u8; 32]),
+                identity: ident,
+                candidates: vec![Candidate {
+                    addr: "203.0.113.1:41641".parse().unwrap(),
+                    relay: false,
+                }],
+                logf,
+            })
+            .expect("黑洞客户端可起"),
+        )
+    }
+
+    /// F8a：写退避分级表（前 50 拍 2ms ⇒ 其后 10ms ⇒ 100 拍后 20ms 封顶）。
+    #[test]
+    fn write_backoff_schedule() {
+        assert_eq!(write_retry_backoff(0), Duration::from_millis(2));
+        assert_eq!(write_retry_backoff(49), Duration::from_millis(2));
+        assert_eq!(write_retry_backoff(50), Duration::from_millis(10));
+        assert_eq!(write_retry_backoff(99), Duration::from_millis(10));
+        assert_eq!(write_retry_backoff(100), Duration::from_millis(20));
+        assert_eq!(write_retry_backoff(u32::MAX), Duration::from_millis(20));
+    }
+
+    /// F1-6 接线自证：`tun_exec::portfwd_states` 与 `portfwd::pf_states` 同源同物
+    /// （组装唯一入口 = PfState::snapshot）。
+    #[test]
+    fn portfwd_states_matches_pure_source() {
+        let rules = vec![PortForwardRule {
+            listen: 18080,
+            target_ip: String::new(),
+            target_port: 0,
+        }];
+        assert_eq!(portfwd_states(&rules), super::super::portfwd::pf_states(&rules));
+        assert_eq!(portfwd_states(&rules)[0].state, "failed");
+        assert_eq!(portfwd_states(&rules)[0].target, "主机（同端口）");
+    }
+
+    /// F3：拨号预算把**阶梯等待**纳入同一上界——桩闭包阻塞到期限，`dial_with_recover`
+    /// 仍在调用方预算内返回 TimedOut（首试预算注入缩短，无需 4s 真等）。
+    #[test]
+    fn dial_with_recover_bounded_by_caller_budget() {
+        let client = blackhole_client();
+        let called = Arc::new(AtomicBool::new(false));
+        let called2 = Arc::clone(&called);
+        let saw_deadline = Arc::new(AtomicBool::new(false));
+        let saw2 = Arc::clone(&saw_deadline);
+        let dst: SocketAddrV4 = "10.7.0.1:7802".parse().unwrap();
+        let budget = Duration::from_millis(600);
+        let t0 = Instant::now();
+        let r = dial_with_recover(
+            &client,
+            dst,
+            budget,
+            Duration::from_millis(50), // 首试（注入；生产 = FIRST_TRY 4s）
+            move |lvl, deadline, _cause| {
+                called2.store(true, Ordering::Release);
+                saw2.store(deadline.is_some(), Ordering::Release);
+                assert_eq!(lvl, Level::R2, "拨号失败后从 R2 起跑");
+                // 桩「阻塞到期限」：执行方模拟阶梯跑满调用方预算
+                std::thread::sleep(Duration::from_millis(400));
+                (LadderRc::Deadline, false)
+            },
+        );
+        assert!(called.load(Ordering::Acquire), "桩必须被调用（否则本测假绿）");
+        assert!(saw_deadline.load(Ordering::Acquire), "期限必须透给阶梯");
+        let e = r.expect_err("预算耗尽 ⇒ Err");
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
+        assert!(
+            t0.elapsed() < Duration::from_secs(3),
+            "预算内返回（实耗 {:?}）",
+            t0.elapsed()
+        );
+        client.stop();
+    }
+
+    /// F3：`Deadline` 的边界映射 = -1（不是 -3：tier 对 -3 渲染「本机网络栈没准备好」
+    /// = 错误归因）。
+    #[test]
+    fn ladder_deadline_maps_to_minus_one() {
+        assert_eq!(LadderRc::Deadline.as_rc(), -1);
+    }
+
+    /// F1 状态面集成（经 `runner_of` + 真 GenRun）：`portForwards[]` 报诚实态
+    /// （failed + 明确 err + 空 code + pf_target_text 目标），且 pf 计数为真值 0。
+    #[test]
+    fn runner_of_reports_honest_port_forwards() {
+        let (logf, _lines) = {
+            let (tx, rx) = mpsc::channel::<String>();
+            let l: Logf = Arc::new(move |s: &str| {
+                let _ = tx.send(s.to_owned());
+            });
+            (l, rx)
+        };
+        let run = GenRun::synthetic_for_test(logf);
+        *lock_unpoison(&run.pf_rules) = vec![
+            PortForwardRule {
+                listen: 18080,
+                target_ip: String::new(),
+                target_port: 0,
+            },
+            PortForwardRule {
+                listen: 18081,
+                target_ip: "10.0.0.9".into(),
+                target_port: 8080,
+            },
+        ];
+        let r = runner_of(&run);
+        assert_eq!(r.pf_accepted, 0);
+        assert_eq!(r.pf_fails, 0);
+        assert_eq!(r.port_forwards.len(), 2);
+        let f0 = &r.port_forwards[0];
+        assert_eq!(f0.state, "failed", "不得谎报 listening");
+        assert_eq!(f0.code, "", "空码（不假归因 bind_failed）");
+        assert_eq!(f0.target, "主机（同端口）");
+        assert!(f0.err.contains("127.0.0.1:18080 未监听"), "{}", f0.err);
+        assert_eq!(r.port_forwards[1].target, "10.0.0.9:8080");
+        // 收尾：停合成世代的引擎线程
+        if let Some(c) = run.current_client() {
+            c.stop();
+        }
+    }
+
+    /// F1-3：热替换 rc 恒 -1（无承载数据面 ⇒ 不谎报 0）且**表照存**（状态面据此更新）。
+    #[test]
+    fn request_port_forwards_stores_table_and_reports_minus_one() {
+        let (logf, _lines) = {
+            let (tx, rx) = mpsc::channel::<String>();
+            let l: Logf = Arc::new(move |s: &str| {
+                let _ = tx.send(s.to_owned());
+            });
+            (l, rx)
+        };
+        let demand = Arc::new(DemandSignals::new());
+        let exec = TunnelExec::new(Arc::clone(&demand));
+        let rules = vec![PortForwardRule {
+            listen: 18080,
+            target_ip: String::new(),
+            target_port: 0,
+        }];
+        // 无世代 ⇒ -1（诚实：没有已接管数据面的世代）
+        assert_eq!(exec.request_port_forwards(rules.clone()), -1);
+        // 有世代 ⇒ 仍 -1，但表已存（状态面随之更新）
+        let run = Arc::new(GenRun::synthetic_for_test(logf));
+        *lock_unpoison(&exec.state) = Some(Arc::clone(&run));
+        assert_eq!(exec.request_port_forwards(rules.clone()), -1);
+        assert_eq!(*lock_unpoison(&run.pf_rules), rules, "表照存");
+        assert_eq!(runner_of(&run).port_forwards.len(), 1);
+        if let Some(c) = run.current_client() {
+            c.stop();
+        }
+    }
 
     /// 复核 r3-F1：空候选早退路径（token 端点列表空 ⇒ 候选空）必须放单飞锁——下一次
     /// prepare 可受理。回归背景：EarlyFinish 守卫引入前该路径漏 finish_generation ⇒

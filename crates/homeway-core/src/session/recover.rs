@@ -69,6 +69,10 @@ pub enum LadderRc {
     Stale,
     /// 走完 R3 仍有界探测失败——交上层整会话重建（Go -1）。
     Exhausted,
+    /// 调用方预算耗尽（Q-F F3）：阶梯**没走完**就被期限中止——**不是**「走完仍未
+    /// 恢复」的证据，故不计入耗尽记账（设计门 C4/D12）。对外映射 -1（设计门 D9：
+    /// gate 与 NAPI 共用，-3 会被 tier 渲染成「本机网络栈没准备好」= 错误归因）。
+    Deadline,
     /// 本地动作超时（挂起期/低功耗/路由表空；Go -3）。
     ActionTimeout,
     /// 本地动作立即失败（Go -4）。
@@ -80,7 +84,9 @@ impl LadderRc {
     pub fn as_rc(&self) -> i32 {
         match self {
             LadderRc::Recovered(_) | LadderRc::Stale => 0,
-            LadderRc::Exhausted => -1,
+            // Deadline 与 Exhausted 同为「网络侧已尽力」-1（归因不撒谎：Deadline 是
+            // 「预算用尽放弃等待」，比 -3「本机网络栈没准备好」更贴近事实）
+            LadderRc::Exhausted | LadderRc::Deadline => -1,
             LadderRc::ActionTimeout => -3,
             LadderRc::ActionFailed(_) => -4,
         }
@@ -134,9 +140,34 @@ pub struct LadderDeps<'a> {
     /// 先行/验证两段预算（测试缩短用；动作预算在动作面实现侧）。
     pub pre_probe: Duration,
     pub verify: Duration,
+    /// 调用方期限（Q-F F3：带预算的桥拨号把阶梯纳入同一预算；巡检/NAPI = None
+    /// ⇒ 行为逐字不变）。到点返回 [`LadderRc::Deadline`]；**残余越界上界 = 一个
+    /// 动作预算**（`ACTION`=2s，动作本身不可中断）。
+    pub deadline: Option<Instant>,
 }
 
-/// 阶梯本体（Go runRecoverLadder 逐行对齐）。
+/// 期限检查（到点 ⇒ 打出「预算耗尽」行并返回 Deadline；未到点 ⇒ None 继续）。
+fn deadline_hit(deps: &LadderDeps, from: Level, cause: &str) -> Option<LadderRc> {
+    let deadline = deps.deadline?;
+    if Instant::now() < deadline {
+        return None;
+    }
+    (deps.logf)(&format!(
+        "RECOVER 预算耗尽（起跑={}，原因={cause}，预算已用尽）—— 放弃等待",
+        from.name(),
+    ));
+    Some(LadderRc::Deadline)
+}
+
+/// 探测预算按剩余夹取（下界 1ms——probe 预算为 0 会被引擎当立即超时）。
+fn clamp_probe(deps: &LadderDeps, want: Duration) -> Duration {
+    match deps.deadline {
+        Some(d) => want.min(d.saturating_duration_since(Instant::now()).max(Duration::from_millis(1))),
+        None => want,
+    }
+}
+
+/// 阶梯本体（Go runRecoverLadder 逐行对齐；`deadline=None` 时逐字同旧行为）。
 pub fn run_ladder(deps: &mut LadderDeps, from: Level, cause: &str) -> LadderRc {
     let started = Instant::now();
     // 本轮已执行过的档（档位推进只做增量；直入高档时把低档动作补齐）。
@@ -145,9 +176,14 @@ pub fn run_ladder(deps: &mut LadderDeps, from: Level, cause: &str) -> LadderRc {
         if lvl < from {
             continue;
         }
+        // 档位起点期限检查（F3-1：每档起点、每个动作前各一次）
+        if let Some(rc) = deadline_hit(deps, from, cause) {
+            return rc;
+        }
         // 探测先行：已恢复（或上一档动作的应答迟到了一拍）则不再加码。复探通过时
         // 归因到上一档（Go P2-1：否则把治愈记到起查头上）。
-        if (deps.probe)(deps.pre_probe) {
+        let pre = clamp_probe(deps, deps.pre_probe);
+        if (deps.probe)(pre) {
             deps.tr.note_path_alive();
             let elapsed = fmt_duration_go_ms(started.elapsed());
             if lvl > from {
@@ -168,6 +204,9 @@ pub fn run_ladder(deps: &mut LadderDeps, from: Level, cause: &str) -> LadderRc {
         // R1 动作（补注册 + 丢会话；所有 ≥R1 的档都先补齐它）
         if !did.contains(&Level::R1) {
             did.insert(Level::R1);
+            if let Some(rc) = deadline_hit(deps, from, cause) {
+                return rc;
+            }
             if let Err(rc) = run_r1_actions(deps, cause) {
                 return rc;
             }
@@ -175,6 +214,9 @@ pub fn run_ladder(deps: &mut LadderDeps, from: Level, cause: &str) -> LadderRc {
         // R2 动作（换本地 socket）
         if lvl >= Level::R2 && !did.contains(&Level::R2) {
             did.insert(Level::R2);
+            if let Some(rc) = deadline_hit(deps, from, cause) {
+                return rc;
+            }
             if let Err(e) = deps.tr.apply(Action::Rebind) {
                 return local_fail(deps, Level::R2, cause, &e);
             }
@@ -183,13 +225,17 @@ pub fn run_ladder(deps: &mut LadderDeps, from: Level, cause: &str) -> LadderRc {
         // R3 动作（清采纳重赛跑）
         if lvl >= Level::R3 && !did.contains(&Level::R3) {
             did.insert(Level::R3);
+            if let Some(rc) = deadline_hit(deps, from, cause) {
+                return rc;
+            }
             if let Err(e) = deps.tr.apply(Action::Rearm) {
                 return local_fail(deps, Level::R3, cause, &e);
             }
             (deps.logf)(&format!("RECOVER R3 重赛跑（原因={cause}）：清采纳，学习缓存候选兜底"));
         }
-        // 动作后验证探测
-        if (deps.probe)(deps.verify) {
+        // 动作后验证探测（预算按剩余夹取）
+        let verify = clamp_probe(deps, deps.verify);
+        if (deps.probe)(verify) {
             (deps.logf)(&format!(
                 "RECOVER 恢复于 {}（原因={cause}，起跑={}，耗时 {}）",
                 lvl.name(),
@@ -198,6 +244,10 @@ pub fn run_ladder(deps: &mut LadderDeps, from: Level, cause: &str) -> LadderRc {
             ));
             return LadderRc::Recovered(lvl);
         }
+    }
+    // 走完三档：期限已到 ⇒ Deadline（不是「走完仍未恢复」的证据）；否则 Exhausted
+    if let Some(rc) = deadline_hit(deps, from, cause) {
+        return rc;
     }
     (deps.logf)(&format!(
         "RECOVER 走完 R1→R3 仍未恢复（起跑={}，原因={cause}，耗时 {}）—— 交上层升级",
@@ -259,6 +309,22 @@ fn prev_level(l: Level) -> Level {
     }
 }
 
+/// 耗尽记账的**单源**判据（Q-F F3-3 / 设计门 C4）：`None` = 本轮不动计数。
+///
+/// 语义：
+/// - `Recovered` ⇒ 清零（Some(false)）；
+/// - `Deadline` ⇒ **不动**——调用方预算耗尽不构成「阶梯走完仍未恢复」的证据
+///   （否则连续几轮预算紧张会把会话推向 REBUILD）；
+/// - `Stale` ⇒ 不动（入口防陈旧，本轮没跑）；
+/// - 其余（Exhausted/ActionTimeout/ActionFailed）⇒ 计数 +1（Some(true)）。
+pub fn exhausted_delta(rc: &LadderRc) -> Option<bool> {
+    match rc {
+        LadderRc::Recovered(_) => Some(false),
+        LadderRc::Deadline | LadderRc::Stale => None,
+        _ => Some(true),
+    }
+}
+
 // ---------- 单飞与触发合并（Go recoverGate；per-round rc + panic 兜底，评审中-9/10） ----------
 
 struct Round {
@@ -269,18 +335,35 @@ struct Round {
 }
 
 impl Round {
-    fn wait(&self) -> LadderRc {
-        let mut st = self.state.lock().expect("gate 锁中毒");
+    /// 有界等待（Q-F F3-2）：到点返回 None——**不发布、不清闸**（在途轮继续跑，
+    /// 其最终结果照常 publish；等待方提前离场不影响执行方的单飞不变量）。
+    fn wait_until(&self, deadline: Option<Instant>) -> Option<LadderRc> {
+        let mut st = crate::syncutil::lock_unpoison(&self.state);
         loop {
             if let Some(rc) = st.clone() {
-                return rc;
+                return Some(rc);
             }
-            st = self.cv.wait(st).expect("gate 锁中毒");
+            let Some(d) = deadline else {
+                st = self
+                    .cv
+                    .wait(st)
+                    .unwrap_or_else(|e| e.into_inner());
+                continue;
+            };
+            let left = d.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                return None;
+            }
+            let (g, _to) = self
+                .cv
+                .wait_timeout(st, left)
+                .unwrap_or_else(|e| e.into_inner());
+            st = g;
         }
     }
 
     fn publish(&self, rc: LadderRc) {
-        let mut st = self.state.lock().expect("gate 锁中毒");
+        let mut st = crate::syncutil::lock_unpoison(&self.state);
         if st.is_none() {
             *st = Some(rc);
         }
@@ -309,7 +392,7 @@ impl RecoverGate {
     }
 
     fn enter(&self) -> GateSlot {
-        let mut cur = self.cur.lock().expect("gate 锁中毒");
+        let mut cur = crate::syncutil::lock_unpoison(&self.cur);
         if let Some(round) = cur.clone() {
             return GateSlot::Wait(round);
         }
@@ -322,7 +405,7 @@ impl RecoverGate {
     }
 
     fn leave(&self, round: &Arc<Round>) {
-        let mut cur = self.cur.lock().expect("gate 锁中毒");
+        let mut cur = crate::syncutil::lock_unpoison(&self.cur);
         if cur.as_ref().is_some_and(|r| Arc::ptr_eq(r, round)) {
             *cur = None;
         }
@@ -335,17 +418,34 @@ impl RecoverGate {
     where
         F: FnOnce(Level) -> LadderRc,
     {
+        // 旧签名的薄壳（F3-2）：deadline=None、第二返回值恒 true（必等到结果）
+        self.merge_until(from, None, |lvl, _| run(lvl)).0
+    }
+
+    /// 带期限的单飞入口（Q-F F3-2）：`deadline` 三态——
+    /// - `None`：与 [`Self::merge`] 逐字同旧行为；
+    /// - `Some(d)` 且本调用是**等待方**：`cv.wait_timeout(remaining)` 到点返回
+    ///   `(LadderRc::Deadline, false)`——**不发布、不清闸**；
+    /// - `Some(d)` 且本调用是**执行方**：把期限透给 `run` 回调（两域轮实现传进
+    ///   `run_ladder`），返回值第二项恒 true（真跑了一轮）。
+    pub fn merge_until<F>(&self, from: Level, deadline: Option<Instant>, run: F) -> (LadderRc, bool)
+    where
+        F: FnOnce(Level, Option<Instant>) -> LadderRc,
+    {
         match self.enter() {
-            GateSlot::Wait(round) => round.wait(),
+            GateSlot::Wait(round) => match round.wait_until(deadline) {
+                Some(rc) => (rc, true),
+                None => (LadderRc::Deadline, false),
+            },
             GateSlot::Execute(round) => {
                 let mut guard = RunGuard {
                     round: Arc::clone(&round),
                     gate: self,
                     completed: false,
                 };
-                let rc = run(from);
+                let rc = run(from, deadline);
                 guard.complete(rc.clone());
-                rc
+                (rc, true)
             }
         }
     }
@@ -437,6 +537,7 @@ mod tests {
             logf,
             pre_probe: Duration::from_millis(1),
             verify: Duration::from_millis(1),
+            deadline: None,
         }
     }
 
@@ -671,5 +772,107 @@ mod tests {
         // 闸已清 + 失败态可读
         let rc = gate.merge(Level::R2, LadderRc::Recovered);
         assert_eq!(rc, LadderRc::Recovered(Level::R2), "panic 后闸必须可用");
+    }
+
+    // ---------- Q-F F3：期限（run_ladder deadline / merge_until / Deadline 记账） ----------
+
+    /// 期限已到：阶梯在档位起点即放弃，行文与 rc 正名（-1）。
+    #[test]
+    fn ladder_deadline_refuses_at_level_start() {
+        let (logf, logs) = log_sink();
+        let mut tr = FakeTransport::default();
+        let mut probes = 0u32;
+        let mut probe = |_: Duration| {
+            probes += 1;
+            true
+        };
+        let mut d = deps(&mut probe, &mut tr, logf.as_ref());
+        d.deadline = Some(Instant::now());
+        let rc = run_ladder(&mut d, Level::R1, "拨号失败");
+        assert_eq!(rc, LadderRc::Deadline);
+        assert_eq!(rc.as_rc(), -1, "Deadline 边界映射 -1（不是 -3）");
+        assert_eq!(probes, 0, "到点不得再发探测");
+        assert!(tr.actions.is_empty(), "到点不得再发动作");
+        let all: Vec<String> = logs.try_iter().collect();
+        assert!(
+            all.iter().any(|l| l.starts_with(
+                "RECOVER 预算耗尽（起跑=R1 重握手，原因=拨号失败，预算已用尽）—— 放弃等待"
+            )),
+            "{all:?}"
+        );
+    }
+
+    /// 期限在动作后到点：走了一段就中止（复探通过时仍算 Recovered——期限只拦
+    /// 「再开新动作」）。
+    #[test]
+    fn ladder_deadline_midway_still_allows_recovery() {
+        let (logf, _logs) = log_sink();
+        let mut tr = FakeTransport::default();
+        let mut probe = |_: Duration| true;
+        let mut d = deps(&mut probe, &mut tr, logf.as_ref());
+        d.deadline = Some(Instant::now());
+        // 首档起点的界限命中 ⇒ Deadline（上面用例已钉）；这里钉 None 期限不改行为
+        d.deadline = None;
+        assert_eq!(
+            run_ladder(&mut d, Level::R1, "拨号失败"),
+            LadderRc::Recovered(Level::R1)
+        );
+    }
+
+    /// Deadline 的耗尽记账：不计数（设计门 C4/D12）。
+    #[test]
+    fn deadline_not_counted_as_exhausted() {
+        assert_eq!(exhausted_delta(&LadderRc::Deadline), None, "预算中止不计数");
+        assert_eq!(exhausted_delta(&LadderRc::Stale), None, "入口防陈旧不计数");
+        assert_eq!(exhausted_delta(&LadderRc::Recovered(Level::R1)), Some(false));
+        assert_eq!(exhausted_delta(&LadderRc::Exhausted), Some(true));
+        assert_eq!(exhausted_delta(&LadderRc::ActionTimeout), Some(true));
+        assert_eq!(
+            exhausted_delta(&LadderRc::ActionFailed("x".into())),
+            Some(true)
+        );
+    }
+
+    /// merge_until 三形态：① 等待方到点 → (Deadline,false) 且**在途轮继续**（随后
+    /// publish 正常、闸正常清）；② NAPI 与带期限轮并发时等待方 rc=-1（H3 回归）；
+    /// ③ deadline=None 逐字同旧行为。
+    #[test]
+    fn merge_until_three_forms() {
+        let gate = Arc::new(RecoverGate::new());
+        let (release_tx, release_rx) = mpsc::channel::<()>();
+        let g1 = Arc::clone(&gate);
+        // ① 执行方（无期限），等待方带 100ms 期限
+        let exec = std::thread::spawn(move || {
+            g1.merge(Level::R2, |_| {
+                let _ = release_rx.recv();
+                LadderRc::Recovered(Level::R2)
+            })
+        });
+        std::thread::sleep(Duration::from_millis(50)); // 等置位
+        let g2 = Arc::clone(&gate);
+        let (rc, got) = g2.merge_until(
+            Level::R3,
+            Some(Instant::now() + Duration::from_millis(100)),
+            |_lvl, _d| panic!("等待方不得自跑"),
+        );
+        assert_eq!(rc, LadderRc::Deadline);
+        assert!(!got, "到点 ⇒ 是否等到结果 = false");
+        assert_eq!(rc.as_rc(), -1, "NAPI 面读到的归因 = -1（H3 回归）");
+        // 在途轮继续：放行后执行方照常拿到自己的 rc、闸照常清
+        let _ = release_tx.send(());
+        assert_eq!(exec.join().unwrap(), LadderRc::Recovered(Level::R2));
+        // ③ deadline=None 逐字旧行为：执行方真跑
+        let (rc, got) = gate.merge_until(Level::R1, None, |lvl, d| {
+            assert!(d.is_none(), "None 期限透传给回调的是 None");
+            LadderRc::Recovered(lvl)
+        });
+        assert_eq!((rc, got), (LadderRc::Recovered(Level::R1), true));
+        // ② 执行方带期限并到点 ⇒ 结果 Deadline 且第二项 true（真跑了一轮）
+        let (rc, got) = gate.merge_until(
+            Level::R1,
+            Some(Instant::now() - Duration::from_millis(1)),
+            |_lvl, _d| LadderRc::Deadline,
+        );
+        assert_eq!((rc, got), (LadderRc::Deadline, true));
     }
 }

@@ -1382,24 +1382,23 @@ fn cmd_portfwd(args: &[String]) {
     // 状态、不阻断其它映射——Go setPortForwards 同义）
     let sess: &'static Session = Box::leak(Box::new(session));
     for (listen, target) in maps {
-        let target = target.map(|t| {
-            if t.ip() == &homeway_core::wgcore::SERVER_TUNNEL_IP && t.port() == 0 {
-                SocketAddrV4::new(homeway_core::wgcore::SERVER_TUNNEL_IP, listen)
-            } else {
-                t
-            }
-        });
-        let target_text = match target {
-            Some(t) if t.ip() != &homeway_core::wgcore::SERVER_TUNNEL_IP => format!("{}:{}", t.ip(), t.port()),
-            Some(t) => {
-                if t.port() == listen {
-                    "主机（同端口）".to_owned()
-                } else {
-                    format!("主机:{}", t.port())
-                }
-            }
-            None => "主机（同端口）".to_owned(),
+        // N7（Q-F F1-5）：目标文案收敛到 `pf_target_text` 单一真源——此前这里第三份
+        // 拷贝与 Go `pfTargetText` 有两处不等（`L:IP:0` 打 `IP:0`；`L:PORT` 打
+        // 「主机（同端口）」）；语义：出口自己（空 ip）⇒「主机…」，port 0 ⇒ 同监听端口。
+        let rule = homeway_core::facade::portfwd::PortForwardRule {
+            listen,
+            target_ip: match &target {
+                Some(t) if t.ip() != &homeway_core::wgcore::SERVER_TUNNEL_IP => t.ip().to_string(),
+                _ => String::new(),
+            },
+            target_port: target.as_ref().map(|t| t.port()).unwrap_or(0),
         };
+        let target_text = homeway_core::facade::portfwd::pf_target_text(&rule);
+        let target = target.map(|t| {
+            // port 0 = 同监听端口（文案与拨号目标同一语义）
+            let port = if t.port() == 0 { listen } else { t.port() };
+            SocketAddrV4::new(*t.ip(), port)
+        });
         let listener = match std::net::TcpListener::bind(("127.0.0.1", listen)) {
             Ok(l) => l,
             Err(e) => {

@@ -299,7 +299,9 @@ fn make_tunn(identity_key: &StaticSecret, secret: &Secret, peer_pub: &[u8; 32]) 
     Tunn::new(
         identity_key.clone(),
         boringtun::x25519::PublicKey::from(*peer_pub),
-        Some(*Psk::from(*secret).as_bytes()),
+        // Secret 非 Copy（F8d）：PSK 派生面按引用克隆一份（派生后即被 Psk 吸收，
+        // 原 Secret 的副本随本次调用结束被 Drop 擦除）
+        Some(*Psk::from(secret.clone()).as_bytes()),
         None, // persistent_keepalive：对齐 Go 客户端（不设；保活 = probe 拍）
         rand_index(),
         None, // rate_limiter 勿改——Some 会让客户端对出口握手应答回 cookie（§2 勿改清单）
@@ -1039,7 +1041,7 @@ impl Engine {
         let (rx, tx) = self.bind.rx_tx();
         let (tries, fails) = self.bind.send_stats_pending();
         let local_err = self.bind.local_err_counters();
-        let mut s = self.snapshot.lock().expect("快照锁中毒");
+        let mut s = crate::syncutil::lock_unpoison(&self.snapshot);
         s.via = st.via;
         s.ep = st.ep;
         s.mirrored = st.mirrored;
@@ -1080,7 +1082,8 @@ impl Client {
         let bind = Bind::open(
             &cfg.candidates,
             Some(RegCtx {
-                secret: cfg.secret,
+                // Secret 非 Copy（F8d）：持有者各自持一份（Drop 各自擦除）
+                secret: cfg.secret.clone(),
                 pubkey,
                 dev_tag: *cfg.identity.dev_tag().as_bytes(),
             }),
@@ -1169,7 +1172,7 @@ impl Client {
 
     fn send(&self, cmd: Cmd) {
         if self.cmd_tx.send(cmd).is_ok() {
-            if let Some(fd) = *self.wake_wr.lock().expect("wake 锁中毒") {
+            if let Some(fd) = *crate::syncutil::lock_unpoison(&self.wake_wr) {
                 unsafe {
                     libc::write(fd, b"x".as_ptr().cast(), 1);
                 }
@@ -1177,7 +1180,7 @@ impl Client {
         }
     }
     pub fn snapshot(&self) -> Snapshot {
-        self.snapshot.lock().expect("快照锁中毒").clone()
+        crate::syncutil::lock_unpoison(&self.snapshot).clone()
     }
 
     /// 建连（阻塞到 Established / refused / 超时；默认期限）。
@@ -1295,10 +1298,25 @@ impl Client {
         rx.recv().map_err(|_| ConnErr::EngineGone)?
     }
 
+    /// 有界关流（Q-F F3b/N1）：`SessionWriteHalf::close_write` 与 `SharedConn::drop`
+    /// 走在**必须退出**的收工链上——引擎卡死时无界 `rx.recv()` 会把它们钉住。
+    pub fn shutdown_bounded(&self, id: u64, d: Duration) -> Result<(), ConnErr> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::Shutdown { id, reply: tx });
+        rx.recv_timeout(d).map_err(|_| ConnErr::Timeout)?
+    }
+
     pub fn close(&self, id: u64) -> Result<(), ConnErr> {
         let (tx, rx) = mpsc::channel();
         self.send(Cmd::Close { id, reply: tx });
         rx.recv().map_err(|_| ConnErr::EngineGone)?
+    }
+
+    /// 有界关流（同 `shutdown_bounded`；`SharedConn::drop` 面）。
+    pub fn close_bounded(&self, id: u64, d: Duration) -> Result<(), ConnErr> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::Close { id, reply: tx });
+        rx.recv_timeout(d).map_err(|_| ConnErr::Timeout)?
     }
 
     /// 补注册（fire-and-forget：patrol 暖机/周期刷新用）。
@@ -1313,17 +1331,26 @@ impl Client {
         rx.recv().map_err(|_| ConnErr::EngineGone)
     }
 
+    /// 有界补注册（Q-F F3b/N1）：调用点全在必须退出的线程（巡检拍）——引擎卡死
+    /// 时无界等待会让 STOp 预算在结构上不可保。
+    pub fn refresh_reg_result_bounded(&self, d: Duration) -> Result<bool, ConnErr> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::RefreshReg { reply: Some(tx) });
+        match rx.recv_timeout(d) {
+            Ok(v) => Ok(v),
+            Err(mpsc::RecvTimeoutError::Timeout) => Err(ConnErr::Timeout),
+            Err(mpsc::RecvTimeoutError::Disconnected) => Err(ConnErr::EngineGone),
+        }
+    }
+
     /// 全候选发送统计的「取走清零」面（拍板①：Go SwapSendStats——巡检拍头消费；
     /// 返回 (尝试数, 本地失败数) = 本次快照累计 − 上次取走值（Bind 计数器随引擎
     /// 生命周期单调，差分等价 Go 的 swap-reset）。
     pub fn swap_send_stats(&self) -> (i64, i64) {
-        let cur = self
-            .snapshot
-            .lock()
-            .expect("快照锁中毒")
+        let cur = crate::syncutil::lock_unpoison(&self.snapshot)
             .bind_stats
             .unwrap_or((0, 0));
-        let mut last = self.last_send_swap.lock().expect("发送统计基线锁中毒");
+        let mut last = crate::syncutil::lock_unpoison(&self.last_send_swap);
         let delta = (cur.0 - last.0, cur.1 - last.1);
         *last = cur;
         delta
@@ -1332,7 +1359,7 @@ impl Client {
     /// 本地发送错误累计（tunStatusJSON demand.localErr* 两键源；Go
     /// adoptedLocalErrCount/localErrCount——拍板①补全）。
     pub fn local_err_counters(&self) -> (u64, u64) {
-        self.snapshot.lock().expect("快照锁中毒").local_err
+        crate::syncutil::lock_unpoison(&self.snapshot).local_err
     }
 
     /// 清采纳、重启赛跑（阶梯 R3 档动作）。
@@ -1347,6 +1374,15 @@ impl Client {
         let (tx, rx) = mpsc::channel();
         self.send(Cmd::RearmSoft { reply: tx });
         rx.recv().map_err(|_| ConnErr::EngineGone)?
+    }
+
+    /// 有界软赛跑（Q-F F3b/N1）：调用点全在必须退出的线程（hint 处理 / 巡检 /
+    /// 域名刷新回调）——引擎卡死时无界等待会长期占住这些线程（域名刷新的单飞位
+    /// 被占则本会话所有重解析静默停摆）。
+    pub fn rearm_soft_bounded(&self, d: Duration) -> Result<(), ConnErr> {
+        let (tx, rx) = mpsc::channel();
+        self.send(Cmd::RearmSoft { reply: tx });
+        rx.recv_timeout(d).map_err(|_| ConnErr::Timeout)?
     }
 
     /// 装 hint 回调（回调在驱动线程执行——只做内存操作/通道投递）。
@@ -1460,19 +1496,68 @@ impl Client {
     }
 
     /// 收工（幂等；Drop 同义——不显式 stop 也能停线程关 fd，评审中-11）。
+    /// **无界 join**（跟随引擎自然退出）——收工预算面走 [`Self::stop_within`]
+    /// （Q-F F6-4 段 5；隧道域三条 `c.stop()` 不在五段预算内，见设计 §7-4/§7-5 登记）。
+    /// 锁一律 `lock_unpoison`（Drop → stop 链上零 panic 面）。
     pub fn stop(&self) {
         if self.stop.swap(true, Ordering::SeqCst) {
             return; // 已收工（幂等，防 double-close fd）
         }
         self.send(Cmd::Stop);
-        if let Some(h) = self.handle.lock().expect("join 锁中毒").take() {
+        if let Some(h) = crate::syncutil::lock_unpoison(&self.handle).take() {
             let _ = h.join();
         }
-        if let Some(fd) = self.wake_wr.lock().expect("wake 锁中毒").take() {
+        if let Some(fd) = crate::syncutil::lock_unpoison(&self.wake_wr).take() {
             unsafe {
                 libc::close(fd);
             }
         }
+    }
+
+    /// 有界收工（Q-F F6-4 段 5）：到点放弃 join，把「JoinHandle + wake 写端」交给
+    /// 一枚**收割线程**（`hw-engine-reap`）收口——`wake_wr` 只在引擎线程确认退出
+    /// 后关闭（提前关会让驱动 `poll` 立刻 POLLHUP 忙转——`driver` 只判 POLLIN）。
+    ///
+    /// 不变式：`wake_wr` 不得留在 Option 里无人关（要么本次关、要么收割线程关；
+    /// `Option::take` 天然防 double-close）。返回 `false` = 到点 detach（引擎线程
+    /// 可能存活到自行退出，持 UDP fd/缓冲——残余登记见设计 §7-6）。
+    pub fn stop_within(&self, deadline: Instant) -> bool {
+        if self.stop.swap(true, Ordering::SeqCst) {
+            return true; // 重入：已有人收过工（不重复等待/不重复关 fd）
+        }
+        self.send(Cmd::Stop);
+        let h = crate::syncutil::lock_unpoison(&self.handle).take();
+        let h = match h {
+            None => return true, // 无句柄（理论窗口）：收工请求已发，视同已收
+            Some(h) => h,
+        };
+        if crate::syncutil::wait_finished(&h, deadline) {
+            let _ = h.join();
+            if let Some(fd) = crate::syncutil::lock_unpoison(&self.wake_wr).take() {
+                unsafe {
+                    libc::close(fd);
+                }
+            }
+            return true;
+        }
+        // 到点：wake 写端随 JoinHandle 交收割线程（本线程不再持有）
+        let fd = crate::syncutil::lock_unpoison(&self.wake_wr).take();
+        let spawned = std::thread::Builder::new()
+            .name("hw-engine-reap".into())
+            .spawn(move || {
+                let _ = h.join();
+                if let Some(fd) = fd {
+                    unsafe {
+                        libc::close(fd);
+                    }
+                }
+            });
+        if spawned.is_err() {
+            // 极端形态（线程资源耗尽）：收割线程起不来 ⇒ 放弃 close（fd 泄漏一枚，
+            // 保持打开——提前 close 会让尚在运行的驱动 poll 忙转）。JoinHandle
+            // 随 drop 分离，引擎线程自行退出。
+        }
+        false
     }
 }
 
@@ -1686,7 +1771,7 @@ fn tun_read_loop(
             return; // driver 已死
         }
         // 唤醒 driver（我-4：与 Client::send 同一管道——写入 1 字节即触发 POLLIN）
-        if let Some(wfd) = *wake.lock().expect("wake 锁中毒") {
+        if let Some(wfd) = *crate::syncutil::lock_unpoison(&*wake) {
             unsafe {
                 libc::write(wfd, b"x".as_ptr().cast(), 1);
             }
@@ -1705,6 +1790,55 @@ fn now_unix_nanos() -> i64 {
 mod tests {
     use super::*;
     use boringtun::x25519::StaticSecret;
+
+    /// Q-F F6-4 段 5（代码门新增覆盖）：到点 detach ⇒ `wake_wr` **本线程不再持有**
+    /// （Option 已 take），由收割线程 `hw-engine-reap` 在引擎 join 后关闭——
+    /// 提前 close 会让驱动 `poll` 立刻 POLLHUP 忙转，故只在引擎确认退出后关。
+    #[test]
+    fn stop_within_detaches_and_reaper_closes_wake_fd() {
+        let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|_s: &str| {});
+        let client = Client::start(CoreConfig {
+            peer_id: PeerId::from([5u8; 32]),
+            secret: Secret::from([6u8; 32]),
+            identity: Identity::ephemeral().expect("临时身份"),
+            candidates: vec![],
+            logf,
+        })
+        .expect("客户端可起");
+        let fd = crate::syncutil::lock_unpoison(&client.wake_wr).expect("wake 写端在册");
+        // 前置：引擎线程确未结束（否则 `wait_finished` 立即为真 ⇒ 走 join 分支，
+        // 本测就测不到 detach——代码门 r15 新增 5）
+        assert!(
+            crate::syncutil::lock_unpoison(&client.handle)
+                .as_ref()
+                .is_some_and(|h| !h.is_finished()),
+            "前置：引擎线程仍在跑（空候选形态刚起，不会立刻退出）"
+        );
+        // 期限已过 ⇒ 到点 detach（引擎线程可能还在退出路径上）
+        assert!(
+            !client.stop_within(Instant::now() - Duration::from_millis(1)),
+            "到点必须返回 false（detach）"
+        );
+        assert!(
+            crate::syncutil::lock_unpoison(&client.wake_wr).is_none(),
+            "wake 写端已交收割线程（不得留在 Option 里无人关）"
+        );
+        // 收割线程 join 引擎后关 fd：F_GETFD 探测（EBADF = 已关）。
+        // 已知限制（备案）：裸 fd 号探测存在 fd 复用（ABA）假活的理论可能——本测在
+        // detach 后立即开始轮询（引擎 ≤~250ms 即退），复用窗口极小；真出现按 flake 记。
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let r = unsafe { libc::fcntl(fd, libc::F_GETFD) };
+            if r < 0 {
+                break; // EBADF：fd 已被收割线程关闭
+            }
+            assert!(
+                Instant::now() < deadline,
+                "收割线程应在 5s 内关闭 wake fd（引擎收工很快）"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    }
 
     fn random_key() -> StaticSecret {
         let mut b = [0u8; 32];

@@ -151,8 +151,8 @@ struct Shared {
     logf: Arc<dyn Fn(&str) + Send + Sync>,
     stop: AtomicBool,
     /// 重建用的装配材料（token 的端点展开 = static_cands；Token 本体不存——
-    /// 重建只消费身份材料 + 候选表）。
-    secret: [u8; 32],
+    /// 重建只消费身份材料 + 候选表）。Secret 非 Copy（F8d）：持有者唯一、Drop 擦除。
+    secret: crate::token::Secret,
     peer_pub: [u8; 32],
     identity: Identity,
     tunnel_ip: std::net::Ipv4Addr,
@@ -170,7 +170,7 @@ struct Shared {
 
 impl Shared {
     fn current(&self) -> Arc<Client> {
-        self.client.read().expect("世代锁中毒").clone()
+        crate::syncutil::read_unpoison(&self.client).clone()
     }
 
     fn gen_now(&self) -> u64 {
@@ -178,14 +178,28 @@ impl Shared {
     }
 
     fn set_state(&self, state: SessState, reason: &str) {
-        let mut s = self.snapshot.lock().expect("快照锁中毒");
+        let mut s = crate::syncutil::lock_unpoison(&self.snapshot);
         s.state = state;
         s.reason = reason.to_owned();
         s.since = Instant::now();
     }
 
+    /// **除非当前是 Failed** 才置态（同一临界区内判定 + 写；返回是否写入）——Q-F F6：
+    /// `stop()` 的入口（Stopping）与末尾（Idle）都用它，「读—写」两次取锁之间的窗口
+    /// 由此闭合（Failed 终态保留是设计约定；代码门 r15 新增 4）。
+    fn set_state_unless_failed(&self, state: SessState, reason: &str) -> bool {
+        let mut s = crate::syncutil::lock_unpoison(&self.snapshot);
+        if s.state == SessState::Failed {
+            return false;
+        }
+        s.state = state;
+        s.reason = reason.to_owned();
+        s.since = Instant::now();
+        true
+    }
+
     fn set_link(&self, via: Via, ep: Option<SocketAddr>, rtt: Duration) {
-        let mut s = self.snapshot.lock().expect("快照锁中毒");
+        let mut s = crate::syncutil::lock_unpoison(&self.snapshot);
         s.link = Some(LinkSnapshot {
             via: via.as_str().to_owned(),
             ep: ep.map(|a| a.to_string()).unwrap_or_default(),
@@ -195,12 +209,12 @@ impl Shared {
     }
 
     fn merged_candidates(&self) -> Vec<Candidate> {
-        let domain = self.domain_cands.lock().expect("域名候选锁中毒").clone();
+        let domain = crate::syncutil::lock_unpoison(&self.domain_cands).clone();
         let mut base = self.static_cands.clone();
         base.extend(domain);
         match &self.cache {
             Some(c) => {
-                let c = c.lock().expect("缓存锁中毒");
+                let c = crate::syncutil::lock_unpoison(c);
                 c.merge(&base, SystemTime::now())
             }
             None => base,
@@ -215,7 +229,7 @@ impl Shared {
             } else {
                 EndpointSource::Hint
             };
-            c.lock().expect("缓存锁中毒").mark_verified(addr, src, SystemTime::now());
+            crate::syncutil::lock_unpoison(c).mark_verified(addr, src, SystemTime::now());
         }
     }
 }
@@ -338,7 +352,7 @@ impl Session {
             domain_refresher: RwLock::new(None),
             logf: Arc::clone(&logf),
             stop: AtomicBool::new(false),
-            secret: *cfg.token.secret.as_bytes(),
+            secret: cfg.token.secret.clone(),
             peer_pub: *cfg.token.peer_id.as_bytes(),
             identity: ident,
             tunnel_ip,
@@ -358,7 +372,7 @@ impl Session {
                 Arc::clone(&logf),
                 Arc::new(move |fresh: &[Candidate]| {
                     if let Some(sh) = w1.upgrade() {
-                        *sh.domain_cands.lock().expect("域名候选锁中毒") = fresh.to_vec();
+                        *crate::syncutil::lock_unpoison(&sh.domain_cands) = fresh.to_vec();
                         let merged = sh.merged_candidates();
                         sh.current().set_candidates(merged);
                     }
@@ -374,16 +388,17 @@ impl Session {
                 }),
                 Arc::new(move || {
                     if let Some(sh) = w3.upgrade() {
-                        let _ = sh.current().rearm_soft();
+                        // F3b/N1：域名刷新回调线程必须能退出——有界（动作预算同刻度）
+                        let _ = sh.current().rearm_soft_bounded(recover::ACTION);
                         if let Some(c) = &sh.cache {
-                            c.lock().expect("缓存锁中毒").note_rearm();
+                            crate::syncutil::lock_unpoison(c).note_rearm();
                         }
                         let merged = sh.merged_candidates();
                         sh.current().set_candidates(merged);
                     }
                 }),
             ));
-            *shared.domain_refresher.write().expect("重解析器锁中毒") = Some(rf);
+            *crate::syncutil::write_unpoison(&shared.domain_refresher) = Some(rf);
         }
         // C3（第二字段 = 本设备派生隧道地址——评审中-4）
         (logf)(&format!(
@@ -450,17 +465,33 @@ impl Session {
         (logf)("就绪（会话在位，无桥直通）"); // C16（CLI 形态无桥）
 
         // ---- 巡检线程（controller）----
+        // F7-1/F7-2：spawn 失败不静默（只记行）；线程体套 catch_unwind——落空行为
+        // 定死（设计门 C7h）：记行 + **不改域态**（服务域无 unhealthy 通道；不把可用
+        // 会话打成 Failed——数据面不依赖巡检）。
         let sh = Arc::clone(&shared);
-        let patrol = std::thread::Builder::new()
+        let logf2 = Arc::clone(&logf);
+        let patrol = match std::thread::Builder::new()
             .name("homeway-patrol".into())
-            .spawn(move || patrol_loop(sh))
-            .ok();
+            .spawn(move || {
+                let sh2 = Arc::clone(&sh);
+                if std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || patrol_loop(sh)))
+                    .is_err()
+                {
+                    (sh2.logf)("巡检线程 panic（已兜住）—— 本会话失去自愈巡检");
+                }
+            }) {
+            Ok(h) => Some(h),
+            Err(e) => {
+                crate::syncutil::log_spawn_failed(&logf2, "巡检线程", &e, "本会话失去自愈巡检");
+                None
+            }
+        };
 
         Ok(Session { shared, patrol: Mutex::new(patrol), hint: Mutex::new(hint_handle), save: Mutex::new(save_handle) })
     }
 
     pub fn snapshot(&self) -> SessionSnapshot {
-        let mut s = self.shared.snapshot.lock().expect("快照锁中毒").clone();
+        let mut s = crate::syncutil::lock_unpoison(&self.shared.snapshot).clone();
         // stats 现读现给（随世代清零）
         let e = self.shared.current().snapshot();
         s.stats = Some((e.rx, e.tx));
@@ -488,13 +519,29 @@ impl Session {
     /// 耗尽记账在 gate 的 run 回调内（每轮恰好一次——被合并的等待者不重复记账，
     /// Go noteLadderResult 同位；评审中-1）；重建决策在 merge 之后（临界区外）。
     pub fn recover(&self, from: Level, cause: &str) -> LadderRc {
-        let rc = self.shared.gate.merge(from, |lvl| {
-            let rc = self.recover_round(lvl, cause);
+        self.recover_until(from, cause, None).0
+    }
+
+    /// 带期限的恢复入口（Q-F F3-1/F3-2）：
+    /// - `deadline` 透到阶梯本体与闸等待（等待到点 ⇒ `(Deadline, false)`）；
+    /// - **等待方到点时不触发重建决策**（设计门 C4：在途轮未完就 `rebuild_session →
+    ///   old.stop()` 会拆掉在途轮正持有的 Client）；
+    /// - `Deadline` 不计入耗尽（[`recover::exhausted_delta`] 单源）。
+    pub fn recover_until(
+        &self,
+        from: Level,
+        cause: &str,
+        deadline: Option<Instant>,
+    ) -> (LadderRc, bool) {
+        let (rc, waited) = self.shared.gate.merge_until(from, deadline, |lvl, d| {
+            let rc = self.recover_round_until(lvl, cause, d);
             self.note_ladder_result(&rc);
             rc
         });
-        self.maybe_rebuild_if_exhausted();
-        rc
+        if waited {
+            self.maybe_rebuild_if_exhausted();
+        }
+        (rc, waited)
     }
 
     /// 陈旧会话恢复（拨号失败/巡检连败/挂起空窗共用；**R2 起跑**）。
@@ -507,23 +554,38 @@ impl Session {
         self.recover(Level::R2, cause)
     }
 
-    /// gate 的 run 回调（每轮恰好执行一次——耗尽记账在 merge 返回后，Go 同位）。
-    fn recover_round(&self, from: Level, cause: &str) -> LadderRc {
-        session_recover_round(&self.shared, from, cause)
+    /// 带期限的陈旧会话恢复（healing_dial 面；F3）。
+    pub fn recover_stale_until(
+        &self,
+        gen: u64,
+        cause: &str,
+        deadline: Option<Instant>,
+    ) -> (LadderRc, bool) {
+        if self.shared.gen_now() != gen {
+            return (LadderRc::Recovered(Level::R2), true);
+        }
+        self.recover_until(Level::R2, cause, deadline)
     }
 
+    /// gate 的 run 回调（每轮恰好执行一次——耗尽记账在 merge 返回后，Go 同位）。
+    fn recover_round_until(&self, from: Level, cause: &str, deadline: Option<Instant>) -> LadderRc {
+        session_recover_round(&self.shared, from, cause, deadline)
+    }
+
+    /// 耗尽记账（单源判据 `recover::exhausted_delta`；`Deadline`/`Stale` 不动计数）。
     fn note_ladder_result(&self, rc: &LadderRc) {
-        let mut st = self.shared.ladder.lock().expect("阶梯锁中毒");
-        match rc {
-            LadderRc::Recovered(_) => st.exhausted = 0,
-            _ => st.exhausted += 1,
+        let mut st = crate::syncutil::lock_unpoison(&self.shared.ladder);
+        match recover::exhausted_delta(rc) {
+            Some(false) => st.exhausted = 0,
+            Some(true) => st.exhausted += 1,
+            None => {}
         }
     }
 
     /// 耗尽计数到阈值整会话重建（触发即归零；限频在 rebuild 内）。
     fn maybe_rebuild_if_exhausted(&self) {
         let n = {
-            let mut st = self.shared.ladder.lock().expect("阶梯锁中毒");
+            let mut st = crate::syncutil::lock_unpoison(&self.shared.ladder);
             if st.exhausted < LADDER_EXHAUST_REBUILD {
                 return;
             }
@@ -544,10 +606,14 @@ impl Session {
         self.healing_dial(dst, budget)
     }
 
+    /// 拨号主体（Q-F F3：首试 + 阶梯（含等待） + 尾试合计受调用方同一预算约束）。
+    /// 与隧道域共用形状（`tun_exec::dial_with_recover` 的可测主体——本函数是服务域
+    /// 版本，错误面是 [`ConnErr`] 而非 io::Error）。
     fn healing_dial(&self, dst: SocketAddrV4, budget: Duration) -> Result<u64, ConnErr> {
         let t0 = Instant::now();
+        let deadline = t0 + budget;
         let gen = self.shared.gen_now();
-        match self.shared.current().connect_deadline(dst, DIAL_FIRST_TRY) {
+        match self.shared.current().connect_deadline(dst, DIAL_FIRST_TRY.min(budget)) {
             Ok(id) => {
                 self.mark_session_ready();
                 return Ok(id);
@@ -559,7 +625,10 @@ impl Session {
                 }
             }
         }
-        self.recover_stale(gen, "拨号失败");
+        let (rc, _waited) = self.recover_stale_until(gen, "拨号失败", Some(deadline));
+        if matches!(rc, LadderRc::Deadline) {
+            return Err(ConnErr::Timeout);
+        }
         let remain = budget
             .checked_sub(t0.elapsed())
             .unwrap_or(Duration::from_millis(1));
@@ -578,39 +647,71 @@ impl Session {
         }
     }
 
-    /// 收工（幂等）：置 stop → join 三线程（patrol 有界 STOP_WAIT——中-3）→
-    /// 缓存终写 → 停当前世代 → Idle（failed 终态保留——低-15：失败原因在状态面不丢）。
+    /// 收工（幂等）：置 stop → **五段共用一个 6s 预算**（Q-F F6-4）→ Idle
+    /// （failed 终态保留——低-15：失败原因在状态面不丢）。
+    ///
+    /// 五段（顺序即证据面）：① 巡检 join；② hint join；③ 缓存落盘线程 join；
+    /// ④ 缓存终写（**`try_lock` 快跳**）；⑤ `Client::stop_within`（到点 detach，
+    /// wake fd 交收割线程——设计门 C2/D3）。到点一律**记行 + 放行自退**。
+    /// **残余（登记）**：五段都不再等待**锁/线程**（此前 hint/save/client 的 join
+    /// 无上界），但段④拿到锁后的落盘 I/O 仍无期限（`EndpointCache::save` 的读盘/
+    /// 写/rename——锁空闲 + 卡文件系统形态下 6s 仍可被击穿）。
+    ///
+    /// 预算**范围声明**：本预算只覆盖 `session::Session::stop()`——不含隧道域
+    /// `Finish::drop`/`request_stop` 的 `c.stop()` 与 `rebuild_session→old.stop()`
+    /// （残余登记，设计 §7-4/§7-5）。
     pub fn stop(&self) {
         if self.shared.stop.swap(true, Ordering::SeqCst) {
             return;
         }
-        self.shared.set_state(SessState::Stopping, "");
+        // failed 终态保留（低-15）：置 Stopping 走「除非 Failed」（否则 set_state 会把
+        // failed 覆盖掉，失败实例入槽后 status 面就再也读不到失败原因——F2 依赖）。
+        self.shared.set_state_unless_failed(SessState::Stopping, "");
+        let deadline = Instant::now() + STOP_WAIT;
+        // ① 巡检线程
         if let Some(h) = self.patrol.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let deadline = Instant::now() + STOP_WAIT;
-            while !h.is_finished() && Instant::now() < deadline {
-                std::thread::sleep(Duration::from_millis(50));
-            }
-            if h.is_finished() {
-                let _ = h.join();
-            } else {
+            if !crate::syncutil::join_bounded(h, deadline) {
                 // 有界等待放弃（patrol 卡在长阶梯/探测里——Go serviceStopWait 同义；
                 // 线程随后自行退出，JoinHandle 析构即分离）
                 (self.shared.logf)("收工等待巡检线程超时（STOP_WAIT）——放行自退");
             }
         }
+        // ② hint 处理线程
         if let Some(h) = self.hint.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = h.join();
+            if !crate::syncutil::join_bounded(h, deadline) {
+                (self.shared.logf)("收工等待 hint 线程超时（STOP_WAIT）——放行自退");
+            }
         }
+        // ③ 缓存落盘线程
         if let Some(h) = self.save.lock().unwrap_or_else(|e| e.into_inner()).take() {
-            let _ = h.join();
+            if !crate::syncutil::join_bounded(h, deadline) {
+                (self.shared.logf)("收工等待缓存落盘线程超时（STOP_WAIT）——放行自退");
+            }
         }
+        // ④ 缓存终写：**try_lock 快跳**（设计门 C1——`EndpointCache::save` 持锁做
+        // 读盘/建目录/写/rename，全无期限；拿不到锁说明去抖线程正在写 ⇒ 不等待也不
+        // 越预算，去抖线程近期已落盘，终写尽力而为）。**残余**：拿到锁后的 I/O 仍
+        // 无期限（登记 §5.3）
         if let Some(c) = &self.shared.cache {
-            let _ = c.lock().expect("缓存锁中毒").save(SystemTime::now());
+            match c.try_lock() {
+                Ok(mut g) => {
+                    let _ = g.save(SystemTime::now());
+                }
+                Err(std::sync::TryLockError::Poisoned(e)) => {
+                    let _ = e.into_inner().save(SystemTime::now());
+                }
+                Err(std::sync::TryLockError::WouldBlock) => {
+                    (self.shared.logf)("收工缓存终写跳过（锁被在途落盘占用）——去抖线程近期写已在盘上");
+                }
+            }
         }
-        self.shared.current().stop();
-        let was_failed = self.shared.snapshot.lock().expect("快照锁中毒").state == SessState::Failed;
-        if !was_failed {
-            self.shared.set_state(SessState::Idle, "已收工");
+        // ⑤ 停当前世代（有界；到点 detach ⇒ wake fd 交收割线程）
+        if !self.shared.current().stop_within(deadline) {
+            (self.shared.logf)("收工等待 client 线程超时（STOP_WAIT）——放行自退（引擎线程由收割线程收口）");
+        }
+        // 终态：同一临界区内判「除非 Failed」（收工窗口内巡检/重建可能把会话打成
+        // Failed——失败原因不得被 Idle 覆盖；HEAD 的窗口语义保留）
+        if self.shared.set_state_unless_failed(SessState::Idle, "已收工") {
             (self.shared.logf)(&format!("已收工（state={}）", SessState::Idle.as_str()));
         } else {
             (self.shared.logf)("已收工（state=failed 终态保留）");
@@ -624,6 +725,94 @@ impl Drop for Session {
     }
 }
 
+/// 【test-seams】合成会话（Q-F F2：ServiceExec 的 Ok-but-failed / Ready 分支测试用）。
+///
+/// 形态：真**惰性** Client（黑洞候选——只起引擎线程，不发包；镜像
+/// `wgcore::tests::engine_probe_blackhole_times_out` 的可行构造）+ 快照直置目标态。
+/// 只有 `cfg(test)` 可见（生产 API 零改动；本批消费方 `service_exec` 单测在 crate 内）。
+#[cfg(test)]
+impl Session {
+    pub(crate) fn synthetic_failed_for_test(reason: &str) -> Session {
+        Session::synthetic_for_test(SessState::Failed, reason, None, None)
+    }
+
+    pub(crate) fn synthetic_ready_for_test() -> Session {
+        Session::synthetic_for_test(SessState::Ready, "", None, None)
+    }
+
+    /// 完整注入形态（F6-4 段 4 断言用：缓存目录 + 日志面）。
+    pub(crate) fn synthetic_for_test(
+        state: SessState,
+        reason: &str,
+        cache_dir: Option<PathBuf>,
+        logf: Option<crate::Logf>,
+    ) -> Session {
+        let ident = Identity::ephemeral().expect("临时身份");
+        let secret = crate::token::Secret::from([0x2a; 32]);
+        let peer_pub = crate::token::PeerId::from([0x3b; 32]);
+        let logf: Arc<dyn Fn(&str) + Send + Sync> = logf.unwrap_or_else(|| Arc::new(|_s: &str| {}));
+        let client = build_client(
+            &Token {
+                peer_id: peer_pub,
+                secret: secret.clone(),
+                endpoints: vec![],
+            },
+            &ident,
+            &[Candidate {
+                // TEST-NET-3 不可达地址：起得来、发不出（惰性）
+                addr: "203.0.113.1:41641".parse().unwrap(),
+                relay: false,
+            }],
+            &logf,
+        )
+        .expect("合成会话的惰性客户端可起");
+        let tunnel_ip = crate::tunnel_addr::derive_tunnel_ip(&secret, &ident.public_key());
+        let cache = cache_dir.map(|dir| {
+            let mut c = EndpointCache::open(&dir, peer_pub);
+            c.set_logger(Arc::clone(&logf));
+            Mutex::new(c)
+        });
+        let (hint_tx, _hint_rx) = std::sync::mpsc::channel::<SocketAddr>();
+        let (save_tx, _save_rx) = std::sync::mpsc::channel::<()>();
+        let shared = Arc::new(Shared {
+            client: RwLock::new(Arc::new(client)),
+            hint_tx,
+            save_tx,
+            last_punch: Mutex::new(None),
+            gen: AtomicU64::new(1),
+            snapshot: Mutex::new(SessionSnapshot {
+                state,
+                reason: reason.to_owned(),
+                since: Instant::now(),
+                link: None,
+                identity: Some((ident.short_dev(), ident.short_pub())),
+                stats: Some((0, 0)),
+            }),
+            gate: recover::RecoverGate::new(),
+            ladder: Mutex::new(LadderState::default()),
+            cache,
+            static_cands: vec![],
+            domain_cands: Mutex::new(vec![]),
+            domain_refresher: RwLock::new(None),
+            logf,
+            stop: AtomicBool::new(false),
+            secret,
+            peer_pub: *peer_pub.as_bytes(),
+            identity: ident,
+            tunnel_ip,
+            #[cfg(feature = "test-seams")]
+            suppress_hints: std::sync::atomic::AtomicBool::new(false),
+            relay_lock: false,
+        });
+        Session {
+            shared,
+            patrol: Mutex::new(None),
+            hint: Mutex::new(None),
+            save: Mutex::new(None),
+        }
+    }
+}
+
 fn build_client(
     token: &Token,
     ident: &Identity,
@@ -632,7 +821,8 @@ fn build_client(
 ) -> Result<Client, SessionErr> {
     Client::start(CoreConfig {
         peer_id: token.peer_id,
-        secret: token.secret,
+        // Secret 非 Copy（F8d）：调用方持有 &Token ⇒ 克隆一份交引擎
+        secret: token.secret.clone(),
         identity: ident.clone(),
         candidates: candidates.to_vec(),
         logf: Arc::clone(logf),
@@ -664,12 +854,8 @@ impl recover::LadderTransport for EngineTransport<'_> {
                 // 域名重解析并发另跑（P0-4：Rearm 动作本体零 DNS 等待——恢复阶梯的
                 // 动作预算 2s 有界，塞进 5s DNS 预算会把蜂窝下常态 DNS 空等打成
                 // rc=-3 误升整套重建）。
-                if let Some(rf) = self
-                    .shared
-                    .domain_refresher
-                    .read()
-                    .expect("重解析器锁中毒")
-                    .clone()
+                if let Some(rf) =
+                    crate::syncutil::read_unpoison(&self.shared.domain_refresher).clone()
                 {
                     rf.refresh_async();
                 }
@@ -728,7 +914,8 @@ fn install_hint_callback(shared: &Arc<Shared>) {
 /// 驱动线程只投队列；RPC（set_candidates/rearm_soft）与落盘信号都在这里做。
 /// 退出 = stop 标志（recv_timeout 轮询——中-4：通道因 Shared 环引用不会自然关闭）。
 fn spawn_hint_handler(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<SocketAddr>) -> Option<JoinHandle<()>> {
-    std::thread::Builder::new()
+    let logf = Arc::clone(&shared.logf);
+    match std::thread::Builder::new()
         .name("homeway-hint".into())
         .spawn(move || {
             while !shared.stop.load(Ordering::SeqCst) {
@@ -737,8 +924,7 @@ fn spawn_hint_handler(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<SocketA
                 };
                 // 缓存观察（最新鲜的不可信线索）
                 if let Some(c) = &shared.cache {
-                    c.lock()
-                        .expect("缓存锁中毒")
+                    crate::syncutil::lock_unpoison(c)
                         .observe(addr, EndpointSource::Hint, SystemTime::now());
                 }
                 // 候选重投（学习到的地址进赛跑集）
@@ -747,32 +933,38 @@ fn spawn_hint_handler(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<SocketA
                 let _ = shared.save_tx.send(());
                 punch_to(&shared, addr);
             }
-        })
-        .ok()
+        }) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            // F7-1：spawn 失败不静默（只记行——hint 通路缺失不动数据面）
+            crate::syncutil::log_spawn_failed(&logf, "hint 处理线程", &e, "本会话不做 hint 打洞（候选仍按巡检刷新）");
+            None
+        }
+    }
 }
 
 /// 收到对端地址线索后打一发「握手兼打洞」（Go punchTo：节流 5s + RearmSoft + 拨 :1）。
 /// 不碰 wireguard 内部：软赛跑清采纳重武装后，出站包镜像到全部候选（含刚学到的
 /// hint 地址），那发 WG 握手同时充当打洞包；拨 :1 拿 RST = 路径通了。
 fn punch_to(shared: &Arc<Shared>, addr: SocketAddr) {
+    // F6-5：停机中不发起新探测（在途成本收窄——path_probe 5s 预算不改）
+    if shared.stop.load(Ordering::SeqCst) {
+        return;
+    }
     {
-        let mut lp = shared.last_punch.lock().expect("punch 锁中毒");
+        let mut lp = crate::syncutil::lock_unpoison(&shared.last_punch);
         if lp.is_some_and(|t| t.elapsed() < Duration::from_secs(5)) {
             return;
         }
         *lp = Some(Instant::now());
     }
     let client = shared.current();
-    let _ = client.rearm_soft();
+    // F3b/N1：hint 线程必须能退出——无界 RPC 改有界（动作预算同刻度）
+    let _ = client.rearm_soft_bounded(recover::ACTION);
     if let Some(c) = &shared.cache {
-        c.lock().expect("缓存锁中毒").note_rearm();
+        crate::syncutil::lock_unpoison(c).note_rearm();
     }
-    if let Some(rf) = shared
-        .domain_refresher
-        .read()
-        .expect("重解析器锁中毒")
-        .clone()
-    {
+    if let Some(rf) = crate::syncutil::read_unpoison(&shared.domain_refresher).clone() {
         rf.refresh_async();
     }
     (shared.logf)(&format!("中继 hint {addr} → 重新武装候选赛跑，打一发握手兼打洞"));
@@ -796,7 +988,8 @@ fn punch_to(shared: &Arc<Shared>, addr: SocketAddr) {
 /// 缓存落盘去抖（Go FIX-16：信号合并 + 1s 去抖窗；收口由 Session::stop 终写）。
 /// 退出 = stop 标志（中-4）。
 fn spawn_save_loop(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<()>) -> Option<JoinHandle<()>> {
-    std::thread::Builder::new()
+    let logf = Arc::clone(&shared.logf);
+    match std::thread::Builder::new()
         .name("homeway-cache-save".into())
         .spawn(move || {
             loop {
@@ -809,13 +1002,19 @@ fn spawn_save_loop(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<()>) -> Op
                 std::thread::sleep(Duration::from_secs(1)); // 去抖窗（窗内信号合并）
                 while rx.try_recv().is_ok() {}
                 if let Some(c) = &shared.cache {
-                    if let Err(e) = c.lock().expect("缓存锁中毒").save(SystemTime::now()) {
+                    if let Err(e) = crate::syncutil::lock_unpoison(c).save(SystemTime::now()) {
                         (shared.logf)(&format!("端点缓存落盘失败：{e}"));
                     }
                 }
             }
-        })
-        .ok()
+        }) {
+        Ok(h) => Some(h),
+        Err(e) => {
+            // F7-1：spawn 失败不静默（端点缓存只靠收工终写兜底）
+            crate::syncutil::log_spawn_failed(&logf, "缓存落盘线程", &e, "端点缓存只靠收工终写（无去抖落盘）");
+            None
+        }
+    }
 }
 
 /// 旁路探测候选（Go ProbeCandidates：只打直连条目——探测中继端点拿到的是中继自己的
@@ -823,14 +1022,9 @@ fn spawn_save_loop(shared: Arc<Shared>, rx: std::sync::mpsc::Receiver<()>) -> Op
 fn run_probe_candidates(shared: &Arc<Shared>) {
     // 域名同步重解析（Go ProbeCandidates：3s 预算，等待有界——DNS 慢不能拖死探测
     // 本身；单飞由调用频度〔60s 巡检拍〕天然限住）。
-    if let Some(rf) = shared
-        .domain_refresher
-        .read()
-        .expect("重解析器锁中毒")
-        .clone()
-    {
+    if let Some(rf) = crate::syncutil::read_unpoison(&shared.domain_refresher).clone() {
         if let Some(fresh) = rf.refresh_sync(crate::wtransport::domain_eps::PROBE_SYNC_BUDGET) {
-            *shared.domain_cands.lock().expect("域名候选锁中毒") = fresh;
+            *crate::syncutil::lock_unpoison(&shared.domain_cands) = fresh;
             let merged = shared.merged_candidates();
             shared.current().set_candidates(merged);
         }
@@ -848,8 +1042,7 @@ fn run_probe_candidates(shared: &Arc<Shared>) {
     let sh = Arc::clone(shared);
     let mut on_ep = move |ep: SocketAddr| {
         if let Some(c) = &sh.cache {
-            c.lock()
-                .expect("缓存锁中毒")
+            crate::syncutil::lock_unpoison(c)
                 .observe(ep, EndpointSource::Probe, SystemTime::now());
         }
         let merged = sh.merged_candidates();
@@ -924,12 +1117,17 @@ fn patrol_loop(shared: Arc<Shared>) {
 
         // 本拍探测（10s）
         let started = Instant::now();
-        let probe_ok = client.path_probe(PROBE_TIMEOUT).is_ok();
+        // F8c：保留真因（此前 `.is_ok()` 丢弃错误 ⇒ 失败行恒写「探测超时」= 归因失真；
+        // 对齐隧道域同族行 `probe.unwrap_err()` 形态）
+        let probe = client.path_probe(PROBE_TIMEOUT);
+        let probe_ok = probe.is_ok();
         let rtt = started.elapsed();
 
         // 补注册（5min；成功才推进时刻）
         if should_refresh_reg(beat.last_reg, now)
-            && client.refresh_reg_result().unwrap_or(false) {
+            && client
+                .refresh_reg_result_bounded(recover::ACTION)
+                .unwrap_or(false) {
                 beat.last_reg = Some(now);
             }
 
@@ -942,7 +1140,7 @@ fn patrol_loop(shared: Arc<Shared>) {
             let snap = client.snapshot();
             shared.set_link(snap.via, snap.ep, rtt);
             // 耗尽计数清零（巡检确认健康——很久以前的一次耗尽不得与之后拼对）
-            shared.ladder.lock().expect("阶梯锁中毒").exhausted = 0;
+            crate::syncutil::lock_unpoison(&shared.ladder).exhausted = 0;
             (shared.logf)(&format!(
                 "link: via={} ep={} rtt={}ms（服务会话巡检）",
                 snap.via.as_str(),
@@ -961,17 +1159,14 @@ fn patrol_loop(shared: Arc<Shared>) {
                         "RELAY-UPGRADE：已在中继停留 {}，重新武装赛跑试直连（下一发出站包镜像到全部候选）",
                         fmt_duration_go_secs(RELAY_UPGRADE_EVERY * PATROL_INTERVAL)
                     ));
-                    let _ = client.rearm_soft();
+                    let _ = client.rearm_soft_bounded(recover::ACTION);
                     if let Some(c) = &shared.cache {
-                        c.lock().expect("缓存锁中毒").note_rearm();
+                        crate::syncutil::lock_unpoison(c).note_rearm();
                     }
                     let merged = shared.merged_candidates();
                     shared.current().set_candidates(merged);
-                    if let Some(rf) = shared
-                        .domain_refresher
-                        .read()
-                        .expect("重解析器锁中毒")
-                        .clone()
+                    if let Some(rf) =
+                        crate::syncutil::read_unpoison(&shared.domain_refresher).clone()
                     {
                         rf.refresh_async();
                     }
@@ -999,8 +1194,23 @@ fn patrol_loop(shared: Arc<Shared>) {
             // 8s 看门狗——超时放弃本轮，探测线程自行收尾）
             {
                 let sh = Arc::clone(&shared);
-                let h = std::thread::spawn(move || run_probe_candidates(&sh));
-                let _ = h.join().map_err(|_| ()); // 看门狗：探测线程内部有 4s/候选预算
+                let logf2 = Arc::clone(&shared.logf);
+                match std::thread::Builder::new()
+                    .name("homeway-probe-cands".into())
+                    .spawn(move || run_probe_candidates(&sh))
+                {
+                    // 看门狗：探测线程内部有 4s/候选预算
+                    Ok(h) => {
+                        let _ = h.join().map_err(|_| ());
+                    }
+                    // F7-1/N6：spawn 失败=panic 面 ⇒ 改记行（本拍无旁路探测，不影响健康判定）
+                    Err(e) => crate::syncutil::log_spawn_failed(
+                        &logf2,
+                        "homeway-probe-cands",
+                        &e,
+                        "本拍无旁路候选探测（只影响端点新鲜度学习）",
+                    ),
+                }
             }
             continue;
         }
@@ -1041,7 +1251,11 @@ fn patrol_loop(shared: Arc<Shared>) {
             (shared.logf)("需求恢复（无需求）：巡检失败重新计入证据");
         }
         beat.last_counted = Some(now);
-        (shared.logf)(&format!("巡检失败（连续 {n}）：探测超时"));
+        // F8c（§5.1 判据变更记录）：归因写真实错误（此前恒「探测超时」）
+        (shared.logf)(&format!(
+            "巡检失败（连续 {n}）：{}",
+            probe.as_ref().err().map(|e| e.to_string()).unwrap_or_default()
+        ));
         if n >= FAIL_STREAK_RESET {
             session_recover(&shared, gen, "巡检连续失败");
             (shared.logf)(&format!(
@@ -1052,22 +1266,26 @@ fn patrol_loop(shared: Arc<Shared>) {
     }
 }
 
+/// 巡检/挂起路径的恢复入口（`deadline=None`——巡检不受调用方预算约束，逐字同旧
+/// 行为；带期限的拨号路径走 `Session::recover_until`）。
 fn session_recover(shared: &Arc<Shared>, gen: u64, cause: &str) -> LadderRc {
     if shared.gen_now() != gen {
         return LadderRc::Stale;
     }
-    let rc = shared.gate.merge(Level::R2, |lvl| {
-        let rc = session_recover_round(shared, lvl, cause);
-        // 记账在 run 回调内（每轮恰好一次——合并等待者不重复 +1；评审中-1）
-        let mut st = shared.ladder.lock().expect("阶梯锁中毒");
-        match rc {
-            LadderRc::Recovered(_) => st.exhausted = 0,
-            _ => st.exhausted += 1,
+    let (rc, _waited) = shared.gate.merge_until(Level::R2, None, |lvl, deadline| {
+        let rc = session_recover_round(shared, lvl, cause, deadline);
+        // 记账在 run 回调内（每轮恰好一次——合并等待者不重复 +1；评审中-1）；
+        // Deadline/Stale 不计数（F3-3/C4：单源判据）
+        let mut st = crate::syncutil::lock_unpoison(&shared.ladder);
+        match recover::exhausted_delta(&rc) {
+            Some(false) => st.exhausted = 0,
+            Some(true) => st.exhausted += 1,
+            None => {}
         }
         rc
     });
     let rebuild = {
-        let mut st = shared.ladder.lock().expect("阶梯锁中毒");
+        let mut st = crate::syncutil::lock_unpoison(&shared.ladder);
         if st.exhausted >= LADDER_EXHAUST_REBUILD {
             (true, std::mem::take(&mut st.exhausted))
         } else {
@@ -1080,7 +1298,12 @@ fn session_recover(shared: &Arc<Shared>, gen: u64, cause: &str) -> LadderRc {
     rc
 }
 
-fn session_recover_round(shared: &Arc<Shared>, from: Level, cause: &str) -> LadderRc {
+fn session_recover_round(
+    shared: &Arc<Shared>,
+    from: Level,
+    cause: &str,
+    deadline: Option<Instant>,
+) -> LadderRc {
     let client = shared.current();
     let mut tr = EngineTransport { shared, client: &client };
     let mut probe = |d: Duration| client.path_probe(d).is_ok();
@@ -1090,6 +1313,7 @@ fn session_recover_round(shared: &Arc<Shared>, from: Level, cause: &str) -> Ladd
         logf: shared.logf.as_ref(),
         pre_probe: recover::PRE_PROBE,
         verify: recover::VERIFY,
+        deadline,
     };
     recover::run_ladder(&mut deps, from, cause)
 }
@@ -1099,7 +1323,7 @@ fn session_recover_round(shared: &Arc<Shared>, from: Level, cause: &str) -> Ladd
 fn rebuild_session(shared: &Arc<Shared>, reason: &str) {
     let (logf, sh) = (&shared.logf, &**shared);
     {
-        let mut st = sh.ladder.lock().expect("阶梯锁中毒");
+        let mut st = crate::syncutil::lock_unpoison(&sh.ladder);
         if st.rebuild_at.is_some_and(|t| t.elapsed() < REBUILD_COOLDOWN) {
             (logf)(&format!(
                 "REBUILD 整会话重建被限频（{} 内已重建过，继续观察）：原因={reason}",
@@ -1113,7 +1337,7 @@ fn rebuild_session(shared: &Arc<Shared>, reason: &str) {
         "REBUILD 整会话重建（{reason}）：拆旧会话换新（force-stop 同机理，进程内完成）"
     ));
     if let Some(c) = &sh.cache {
-        if let Err(e) = c.lock().expect("缓存锁中毒").save(SystemTime::now()) {
+        if let Err(e) = crate::syncutil::lock_unpoison(c).save(SystemTime::now()) {
             (logf)(&format!("端点缓存落盘失败：{e}"));
         }
     }
@@ -1127,7 +1351,7 @@ fn rebuild_session(shared: &Arc<Shared>, reason: &str) {
                 return;
             }
             let old = {
-                let mut w = sh.client.write().expect("世代锁中毒");
+                let mut w = crate::syncutil::write_unpoison(&sh.client);
                 let old = std::mem::replace(&mut *w, Arc::clone(&new));
                 sh.gen.fetch_add(1, Ordering::Release);
                 old
@@ -1150,7 +1374,7 @@ fn rebuild_session(shared: &Arc<Shared>, reason: &str) {
 fn token_of(sh: &Shared) -> Token {
     Token {
         peer_id: crate::token::PeerId::from(sh.peer_pub),
-        secret: crate::token::Secret::from(sh.secret),
+        secret: sh.secret.clone(),
         endpoints: vec![],
     }
 }
@@ -1240,6 +1464,164 @@ mod tests {
         assert!(should_refresh_reg(None, base), "无基线首拍即补");
         assert!(!should_refresh_reg(Some(base), base + REG_REFRESH_EVERY - Duration::from_secs(1)));
         assert!(should_refresh_reg(Some(base), base + REG_REFRESH_EVERY));
+    }
+
+    // ---------- Q-F F3 / F6 / F2 的会话面回归 ----------
+
+    /// F3：期限已到 ⇒ 阶梯立即放弃（Deadline）、**不计入 exhausted**、无重建。
+    #[test]
+    fn recover_deadline_not_counted_and_no_rebuild() {
+        let s = Session::synthetic_failed_for_test("出口不可达：合成");
+        let (rc, waited) = s.recover_until(
+            Level::R2,
+            "拨号失败",
+            Some(Instant::now() - Duration::from_millis(1)),
+        );
+        assert_eq!(rc, LadderRc::Deadline);
+        assert!(waited, "执行方真跑了一轮（第二返回值 = true）");
+        assert_eq!(
+            crate::syncutil::lock_unpoison(&s.shared.ladder).exhausted,
+            0,
+            "Deadline 不计耗尽（设计门 C4/D12）"
+        );
+        assert!(
+            crate::syncutil::lock_unpoison(&s.shared.ladder).rebuild_at.is_none(),
+            "不得触发整会话重建"
+        );
+        s.stop();
+    }
+
+    /// F3：等待方到点 ⇒ 跳过重建决策（在途轮未完不得被 rebuild 拆掉 Client）。
+    #[test]
+    fn recover_wait_timeout_skips_rebuild() {
+        let s = Arc::new(Session::synthetic_failed_for_test("出口不可达：合成"));
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        // 占住闸：模拟「在途轮」（无期限，等释放）
+        let s2 = Arc::clone(&s);
+        let exec = std::thread::spawn(move || {
+            s2.shared.gate.merge_until(Level::R2, None, move |_lvl, _d| {
+                let _ = release_rx.recv();
+                // 在途轮结果 = 耗尽（若等待方到点仍触发重建决策，这里就会把
+                // exhausted 顶到阈值以上）
+                LadderRc::Exhausted
+            })
+        });
+        std::thread::sleep(Duration::from_millis(50)); // 等置位
+        let (rc, waited) = s.recover_until(
+            Level::R3,
+            "拨号失败",
+            Some(Instant::now() + Duration::from_millis(100)),
+        );
+        assert_eq!(rc, LadderRc::Deadline);
+        assert!(!waited, "等待方到点 ⇒ 第二返回值 false");
+        assert!(
+            crate::syncutil::lock_unpoison(&s.shared.ladder).rebuild_at.is_none(),
+            "等待到点不得触发重建（在途轮未完）"
+        );
+        assert_eq!(
+            crate::syncutil::lock_unpoison(&s.shared.ladder).exhausted,
+            0,
+            "等待方不记账"
+        );
+        let _ = release_tx.send(());
+        let (rc_exec, waited_exec) = exec.join().unwrap();
+        assert_eq!((rc_exec, waited_exec), (LadderRc::Exhausted, true));
+        s.stop();
+    }
+
+    /// F6-4 段 4（设计门 C1）：缓存锁被在途落盘占住 ⇒ `stop()` **快跳不等待**
+    /// （`try_lock`）+ 记行跳过终写；failed 终态保留（F2 依赖）。
+    #[test]
+    fn stop_skips_cache_final_write_when_lock_busy() {
+        let dir = std::env::temp_dir().join(format!("hw-qf-sess-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let (logf, logs) = {
+            let (tx, rx) = std::sync::mpsc::channel::<String>();
+            let l: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(move |s: &str| {
+                let _ = tx.send(s.to_owned());
+            });
+            (l, rx)
+        };
+        let s = Arc::new(Session::synthetic_for_test(
+            SessState::Failed,
+            "出口不可达：合成",
+            Some(dir.clone()),
+            Some(logf),
+        ));
+        let cache = Arc::clone(&s.shared);
+        std::thread::scope(|scope| {
+            // 持缓存锁 1.2s（阻塞获取会等满它；try_lock 必须快跳）
+            scope.spawn(|| {
+                let guard = crate::syncutil::lock_unpoison(cache.cache.as_ref().unwrap());
+                std::thread::sleep(Duration::from_millis(1200));
+                drop(guard);
+            });
+            std::thread::sleep(Duration::from_millis(120)); // 确保锁已被持有
+            let t0 = Instant::now();
+            s.stop();
+            assert!(
+                t0.elapsed() < Duration::from_millis(600),
+                "锁忙时 stop 必须快跳（实耗 {:?}）",
+                t0.elapsed()
+            );
+        });
+        let lines: Vec<String> = logs.try_iter().collect();
+        assert!(
+            lines.iter().any(|l| l.contains("收工缓存终写跳过（锁被在途落盘占用）")),
+            "跳过终写必须记行：{lines:?}"
+        );
+        // failed 终态保留（F2：失败实例入槽后 status 面仍读得到 failed+原因）
+        let snap = s.snapshot();
+        assert_eq!(snap.state, SessState::Failed);
+        assert_eq!(snap.reason, "出口不可达：合成");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// F6-4 段 5：`stop_within` 的**正常路径**（期限内收工 ⇒ true，wake fd 本次关）
+    /// 与**重入**（已收工 ⇒ 直接 true，不重复等待/不重复关 fd）。
+    /// 到点 detach + 收割线程收口 fd 的覆盖在 `wgcore::tests::
+    /// stop_within_detaches_and_reaper_closes_wake_fd`（需 Client 私有字段访问）。
+    #[test]
+    fn stop_within_normal_path_and_reentrant() {
+        use crate::wgcore::{Client, CoreConfig};
+        let ident = Identity::ephemeral().expect("临时身份");
+        let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|_s: &str| {});
+        let client = Arc::new(
+            Client::start(CoreConfig {
+                peer_id: crate::token::PeerId::from([9u8; 32]),
+                secret: crate::token::Secret::from([8u8; 32]),
+                identity: ident,
+                candidates: vec![],
+                logf,
+            })
+            .expect("客户端可起"),
+        );
+        // 正常路径：期限内收工 ⇒ true 且本次关 fd（wake_wr 已被取空）
+        assert!(
+            client.stop_within(Instant::now() + Duration::from_secs(5)),
+            "引擎正常退出 ⇒ 期限内收工"
+        );
+        // 重入调用：直接 true（不重复等待/不重复关 fd）
+        assert!(client.stop_within(Instant::now() + Duration::from_millis(1)));
+    }
+
+    /// F6-3：Drop 路径零 panic（毒锁 + drop 会话 ⇒ catch_unwind 必须 Ok）。
+    #[test]
+    fn drop_session_never_panics() {
+        let s = Session::synthetic_failed_for_test("出口不可达：合成");
+        // 毒掉快照锁（持锁线程 panic）
+        {
+            let sh = Arc::clone(&s.shared);
+            let _ = std::thread::spawn(move || {
+                let _g = sh.snapshot.lock().unwrap();
+                panic!("毒锁注入");
+            })
+            .join();
+        }
+        assert!(s.shared.snapshot.is_poisoned(), "前置：锁确已中毒");
+        let r = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || drop(s)));
+        assert!(r.is_ok(), "Drop 链不得 panic（锁中毒 + 收工全链）");
     }
 }
 

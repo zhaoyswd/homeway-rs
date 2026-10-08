@@ -17,16 +17,13 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex};
 
 use super::stage::{StageMachine, TunStage};
 
-/// 锁中毒不 panic（工单⑥ panic 策略：c-shared 宿主进程里 panic = 扩展进程死；
-/// 持锁线程 panic 后锁数据仍可用——into_inner 取出继续，一致性问题交给该锁的
-/// 语义面自愈）。facade 全域统一走这一件。
-pub(crate) fn lock_unpoison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
+/// 锁中毒不 panic（Q-F F6-1：单源上移到 `crate::syncutil`——session / wgcore /
+/// recover gate 与本处共用同一件；facade 内的既有调用点经本重导出零改动）。
+pub(crate) use crate::syncutil::lock_unpoison;
 
 /// tun 域的世代共享面（Arc 交给执行体）。
 pub struct TunShared {

@@ -14,6 +14,10 @@ pub type Logf = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
 /// 进程级 env 开关缓存（Q-I F4：热路径 getenv 归零）。
 pub(crate) mod envflag;
 
+/// 同步与线程卫生的单源小件（Q-F F6/F7：lock_unpoison / join_bounded / spawn 失败
+/// 记行——facade 经 `facade::tun_shared` 重导出，facade 内既有调用点零改动）。
+pub(crate) mod syncutil;
+
 pub mod facade;
 pub mod artifact;
 pub mod daemon;

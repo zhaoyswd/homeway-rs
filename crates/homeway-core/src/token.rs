@@ -88,10 +88,12 @@ impl EndpointKind {
     }
 }
 
-macro_rules! byte_array_newtype {
-    ($(#[$doc:meta])* $name:ident, $redacted:expr) => {
+/// 32B 定长 newtype 的展开骨架（`PeerId` 与 `Secret` 共用；差异只在 `$copy` 与
+/// Drop——见下面两个入口宏）。
+macro_rules! byte_array_newtype_common {
+    ($(#[$doc:meta])* $name:ident) => {
         $(#[$doc])*
-        #[derive(Clone, Copy, PartialEq, Eq, Hash)]
+        #[derive(PartialEq, Eq, Hash)]
         pub struct $name([u8; 32]);
 
         impl From<[u8; 32]> for $name {
@@ -106,6 +108,20 @@ macro_rules! byte_array_newtype {
                 &self.0
             }
         }
+    };
+}
+
+/// 公开材料（可 `Copy`：多份副本无擦除义务）。
+macro_rules! byte_array_newtype {
+    ($(#[$doc:meta])* $name:ident, $redacted:expr) => {
+        byte_array_newtype_common!($(#[$doc])* $name);
+
+        impl Clone for $name {
+            fn clone(&self) -> Self {
+                *self
+            }
+        }
+        impl Copy for $name {}
 
         impl fmt::Debug for $name {
             fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -123,17 +139,60 @@ macro_rules! byte_array_newtype {
     };
 }
 
+/// 敏感材料 newtype（**不 `Copy`** + `Drop` 擦除——F8d）。
+///
+/// 为什么去 `Copy`：`Copy` 使每处传参/赋值都留下**无法追踪的栈副本**，Drop 只能擦到
+/// 自己这一份（审计 P2「`Secret` 未 zeroize」的根因形态）。去 `Copy` 后持有者唯一，
+/// 引用面走 `&Secret`/`as_bytes()`（wgcore/bind/reg 全是借用面，不受影响）。
+macro_rules! secret_newtype {
+    ($(#[$doc:meta])* $name:ident) => {
+        byte_array_newtype_common!($(#[$doc])* $name);
+
+        impl Clone for $name {
+            fn clone(&self) -> Self {
+                Self(self.0)
+            }
+        }
+
+        impl fmt::Debug for $name {
+            fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+                // 敏感材料：不落任何指纹（连前缀都不出——跨实例可关联）
+                write!(f, concat!(stringify!($name), "(<redacted>)"))
+            }
+        }
+
+        impl Drop for $name {
+            fn drop(&mut self) {
+                wipe_bytes(&mut self.0);
+            }
+        }
+    };
+}
+
+/// 敏感字节擦除（volatile 写 + 编译器栅栏；**不引新依赖**）。
+///
+/// 形状取 zeroize 的最小等价面：逐字节 `write_volatile` 防「写后即死」被优化掉，
+/// 末尾 `compiler_fence` 防重排。栈上中间量（例：`Secret::from([..])` 的临时数组）
+/// 不在此面——见 `docs/INTEROP-CRITERIA.md` 的 F8d 残余登记。
+pub(crate) fn wipe_bytes(b: &mut [u8; 32]) {
+    for x in b.iter_mut() {
+        // SAFETY: 引用来源合法；volatile 写只保证不被消除，不引入未定义行为
+        unsafe { std::ptr::write_volatile(x, 0) };
+    }
+    std::sync::atomic::compiler_fence(std::sync::atomic::Ordering::SeqCst);
+}
+
 byte_array_newtype!(
     /// 后端静态 WG 公钥（token 载荷首 32B；设备身份按它派生）。
     PeerId,
     false
 );
-byte_array_newtype!(
+secret_newtype!(
     /// 凭证种子（注册 HMAC / WG PSK / 隧道地址派生输入）。
     ///
-    /// 敏感材料：Debug 全脱敏；R2 接入 zeroize（Drop 擦除）——R0 阶段保持 Copy 便于向量对账。
-    Secret,
-    true
+    /// 敏感材料：Debug 全脱敏；**不 `Copy`** + Drop 擦除（F8d）。`PeerId` 与它
+    /// 同宏族但保持 `Copy`（公开材料无擦除义务——设计门 7.2 的拆宏要求）。
+    Secret
 );
 
 /// 借用形态端点：地址直接来自载荷字节，零拷贝。
@@ -488,6 +547,14 @@ mod tests {
         let d = format!("{s:?}");
         assert_eq!(d, "Secret(<redacted>)");
         assert!(!d.contains("abab"));
+    }
+
+    /// F8d：`wipe_bytes` 擦除（填 0xAB → 逐字节 0）。
+    #[test]
+    fn wipe_bytes_zeroes_all() {
+        let mut b = [0xABu8; 32];
+        wipe_bytes(&mut b);
+        assert_eq!(b, [0u8; 32]);
     }
 
     #[test]

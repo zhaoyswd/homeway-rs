@@ -549,7 +549,7 @@ impl ClientCore {
     }
 
     pub fn service_status(&self) -> String {
-        self.service_exec.status()
+        self.service_exec.status(&self.service)
     }
 }
 

@@ -103,29 +103,57 @@ impl PortForwardRule {
 }
 
 /// 一条映射的运行态（pfState；tunStatusJSON.portForwards[] 的数据源）。
-/// Clone/Eq 不含 conns（原子计数非快照面——比较走 `snapshot()`）。
+///
+/// Q-F F1：本核**未实装监听器**（诚实语义）⇒ 生产组装走 [`PfState::unavailable`]
+/// （state=`failed`、`code` 空、err 明确）；[`PfState::listening`] 留给 Q-F-B 的
+/// 监听器版（`bind_failed` 等真失败态由 [`PfState::failed`] 承担）。
+///
+/// `snapshot()` 是 `portForwards[]` 元素的**唯一组装点**（Q-F F1-2 接线后：
+/// `tun_exec::portfwd_states` 经它产出，不再有第二份手工拼装）。
 #[derive(Debug)]
 pub struct PfState {
     pub listen: u16,
     pub target: String,
-    /// listening | failed。
-    pub state: &'static str,
+    pub state: PfStateKind,
     pub err: String,
-    /// 失败映射的稳定错误码（portfwd/err 词表；成功/listening 为空串）。
-    pub code: &'static str,
+    /// 失败映射的稳定错误码（portfwd/err 词表）；成功态与「不适用」态为 None
+    /// （空串 = App 空码兜底路径——不误归因，见 spec「不误归因」与设计门 D2）。
+    pub code: Option<PortfwdErr>,
     /// 当前活跃转发连接数（accept 成功 +1、连接结束 -1）。
     pub conns: std::sync::atomic::AtomicI64,
 }
 
+/// 映射状态（enum 承担词面不变量——设计门 7.3 的 `PfState.state` 收敛）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PfStateKind {
+    /// 监听器在位（Q-F-B 实装后的成功态）。
+    Listening,
+    /// 监听失败（真 bind 失败；带 `code`）。
+    Failed,
+    /// 本核不提供该能力（诚实态：未实装监听器）。
+    Unavailable,
+}
+
+impl PfStateKind {
+    /// 线上词面（tier 页面按它分派渲染）。
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PfStateKind::Listening => "listening",
+            PfStateKind::Failed => "failed",
+            PfStateKind::Unavailable => "failed",
+        }
+    }
+}
+
 impl PfState {
-    /// 成功监听态。
+    /// 成功监听态（Q-F-B 监听器版；本批不产出）。
     pub fn listening(listen: u16, target: String) -> Self {
         PfState {
             listen,
             target,
-            state: "listening",
+            state: PfStateKind::Listening,
             err: String::new(),
-            code: "",
+            code: None,
             conns: std::sync::atomic::AtomicI64::new(0),
         }
     }
@@ -135,9 +163,23 @@ impl PfState {
         PfState {
             listen,
             target,
-            state: "failed",
+            state: PfStateKind::Failed,
             err,
-            code: PortfwdErr::BindFailed.as_str(),
+            code: Some(PortfwdErr::BindFailed),
+            conns: std::sync::atomic::AtomicI64::new(0),
+        }
+    }
+
+    /// **不适用态**（Q-F F1 诚实语义）：手机核未提供端口转发监听 ⇒ 如实报 failed +
+    /// 明确 err，**不带 code**（`bind_failed` 是「端口被占用」的假归因；空码走 App
+    /// 登记的空码兜底路径原样展示 err——设计门 D2）。
+    pub fn unavailable(listen: u16, target: String, err: String) -> Self {
+        PfState {
+            listen,
+            target,
+            state: PfStateKind::Unavailable,
+            err,
+            code: None,
             conns: std::sync::atomic::AtomicI64::new(0),
         }
     }
@@ -147,12 +189,32 @@ impl PfState {
         super::tun_status::PfStateIn {
             listen: self.listen,
             target: self.target.clone(),
-            state: self.state.to_owned(),
+            state: self.state.as_str().to_owned(),
             err: self.err.clone(),
-            code: self.code.to_owned(),
+            code: self.code.map(|c| c.as_str().to_owned()).unwrap_or_default(),
             conns: self.conns.load(std::sync::atomic::Ordering::Relaxed),
         }
     }
+}
+
+/// 「本核未实装端口转发监听器」的失败文案（F1：**同一语义单源**——状态组装、
+/// 单测与 Q-F-B 交接都以它为准；`{listen}` = 该条映射的本地监听端口）。
+pub fn unavailable_err_text(listen: u16) -> String {
+    format!(
+        "手机核未提供端口转发监听（127.0.0.1:{listen} 未监听）——该映射在当前版本不可用，不影响隧道"
+    )
+}
+
+/// 整表 → `portForwards[]` 元素（**纯函数**：不依赖 GenRun，单测直喂四形态——
+/// Q-F F1-6）。
+pub fn pf_states(rules: &[PortForwardRule]) -> Vec<super::tun_status::PfStateIn> {
+    rules
+        .iter()
+        .map(|r| {
+            PfState::unavailable(r.listen, pf_target_text(r), unavailable_err_text(r.listen))
+                .snapshot()
+        })
+        .collect()
 }
 
 /// `{"portForwards":[…]}` 的信封解析。
@@ -218,7 +280,7 @@ mod tests {
         );
     }
 
-    /// 失败态的 code = bind_failed（portfwd/err 词面）；成功态空串。
+    /// 失败态的 code = bind_failed（portfwd/err 词面）；成功态与不适用态空串。
     #[test]
     fn state_codes() {
         let ok = PfState::listening(18080, "主机:8080".into());
@@ -229,5 +291,45 @@ mod tests {
         assert_eq!(snap.code, "bind_failed");
         assert_eq!(snap.state, "failed");
         assert_eq!(snap.err, "bind: address in use");
+    }
+
+    /// F1 诚实态四元组（state/code/err/conns）+ 词表 MUST 的有意偏离（空码）。
+    #[test]
+    fn unavailable_state_snapshot() {
+        let st = PfState::unavailable(18080, "主机:8080".into(), unavailable_err_text(18080));
+        let snap = st.snapshot();
+        assert_eq!(snap.state, "failed", "不谎报 listening");
+        assert_eq!(snap.code, "", "空码（不能假归因 bind_failed）");
+        assert_eq!(
+            snap.err,
+            "手机核未提供端口转发监听（127.0.0.1:18080 未监听）——该映射在当前版本不可用，不影响隧道"
+        );
+        assert_eq!(snap.conns, 0);
+    }
+
+    /// F1-6：`portForwards[]` 纯函数组装——四形态目标文案 + 诚实态。
+    #[test]
+    fn pf_states_reports_unavailable_with_target_text() {
+        let rules = [
+            rule(18080, "", 0),          // 空 ip/port 0
+            rule(18081, "", 8080),       // 空 ip/port N
+            rule(18082, "1.2.3.4", 0),   // ip/port 0
+            rule(18083, "1.2.3.4", 80),  // ip/port N
+        ];
+        let states = pf_states(&rules);
+        assert_eq!(states.len(), 4);
+        let targets: Vec<&str> = states.iter().map(|s| s.target.as_str()).collect();
+        assert_eq!(
+            targets,
+            vec!["主机（同端口）", "主机:8080", "1.2.3.4:18082", "1.2.3.4:80"],
+            "target 一律走 pf_target_text（消灭 :0 与缺「主机」措辞）"
+        );
+        for (i, s) in states.iter().enumerate() {
+            assert_eq!(s.listen, rules[i].listen);
+            assert_eq!(s.state, "failed");
+            assert_eq!(s.code, "");
+            assert!(s.err.contains("未提供端口转发监听"), "{}", s.err);
+            assert_eq!(s.conns, 0);
+        }
     }
 }
