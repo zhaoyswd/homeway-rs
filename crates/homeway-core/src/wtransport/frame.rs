@@ -8,9 +8,15 @@
 //! 容器帧（type=4）: [0xBB][4] + 消息序列 [type(1)][len(2 BE)][payload]*
 //! ```
 //!
-//! type：0=数据（不透明 WG 包）1=控制（hint）2=reg 3=中继控制 4=容器。
+//! type：0=数据（不透明 WG 包）1=控制（hint）2=reg 3=中继控制 4=容器 5=QUIC 载荷（M1）。
 //! 接收方 MUST 忽略未知 type 且不中断会话（前向兼容挂在格式上）——`decode_frame`
 //! 对未知 type 原样返回 kind 字节，由调用方决定忽略。
+//!
+//! **kind=5（M1 S1c，设计 §1.6）**：QUIC 报文作为**不透明载荷**走腿（中继 `forward_up`
+//! 保 kind 原样透传、`decode_tagged` 只校验魔数 ⇒ **中继零改动**）；出口侧由驱动线程按
+//! `FrameKind::Quic` 分流到 QUIC 面（`server/bind.rs` 的 kind 分支 + `Inbound.quic`），
+//! 客户端侧包封/剥壳 = S2-7。**唯一硬约束 = 线字节 5**：本条与 `homeway-quic` 的
+//! `FRAME_KIND_QUIC`（叶子 crate 按字节复刻，不依赖本 crate）由本文件测试断言一致。
 //!
 //! 魔数 0xAA/0xBB 与 WG 报文类型（1–4）不冲突。例外（明文非腿）：STUN 与参照点探测。
 
@@ -31,6 +37,8 @@ pub enum FrameKind {
     Reg,
     /// 容器（一个数据报携带多条消息——首个握手包 [reg][data] 保 1 RTT）。
     Batch,
+    /// QUIC 载荷（M1 S1c；不透明 QUIC 报文——中继原样透传，出口按此分流到 QUIC 面）。
+    Quic,
 }
 
 impl FrameKind {
@@ -40,6 +48,7 @@ impl FrameKind {
             FrameKind::Control => 1,
             FrameKind::Reg => 2,
             FrameKind::Batch => 4,
+            FrameKind::Quic => 5,
         }
     }
 }
@@ -215,9 +224,29 @@ mod tests {
         assert!(decode_batch(&[0, 0, 1, b'x', 0]).is_none()); // 第二条头不足
     }
 
+    /// **kind=5 的线字节是跨 crate 契约**（M1 §1.6）：本条 = 真源，`homeway-quic` 按字节
+    /// 复刻（叶子 crate 不得依赖本 crate）——两处一旦漂移，经中继的 QUIC 帧就会被当作
+    /// 未知 kind 静默丢弃（症状 = 「直连通、经中继不通」），故用一条断言钉住。
     #[test]
-    fn relay_id_is_sha256_prefix() {
-        // Go：RelayID = sha256(pubkey)[:8]
+    fn quic_kind_wire_byte_matches_island_constant() {
+        assert_eq!(FrameKind::Quic.to_wire(), 5, "kind=5（设计 §1.6）");
+        assert_eq!(
+            FrameKind::Quic.to_wire(),
+            homeway_quic::FRAME_KIND_QUIC,
+            "与 homeway-quic 的复刻常量必须一致"
+        );
+        // 与既有 type 不撞（0/1/2/4 各有主）
+        for k in [FrameKind::Data, FrameKind::Control, FrameKind::Reg, FrameKind::Batch] {
+            assert_ne!(k.to_wire(), FrameKind::Quic.to_wire());
+        }
+        // 腿帧往返：中继按 kind 原样透传（decode_frame 只解壳）
+        let raw = frame_bytes(FrameKind::Quic, b"quic-initial");
+        assert_eq!(raw, vec![0xBB, 5, b'q', b'u', b'i', b'c', b'-', b'i', b'n', b'i', b't', b'i', b'a', b'l']);
+        assert_eq!(decode_frame(&raw).unwrap().0, FrameKind::Quic.to_wire());
+    }
+
+    #[test]
+    fn relay_id_is_sha256_prefix() {        // Go：RelayID = sha256(pubkey)[:8]
         let id = relay_id(&[0u8; 32]);
         let sum = Sha256::digest([0u8; 32]);
         assert_eq!(id, &sum[..8]);

@@ -127,6 +127,18 @@ pub struct Inbound {
     pub data: Option<(SocketAddr, Vec<u8>)>,
     /// reg 帧载荷（驱动线程先于 data 应用到设备表）。
     pub regs: Vec<(Vec<u8>, SocketAddr)>,
+    /// 腿上的 QUIC 载荷（`kind=5`；M1 S1c §1.6）——驱动线程交给 QUIC 面注入。
+    pub quic: Option<QuicLegPkt>,
+}
+
+/// 一条腿上的 QUIC 报文（`[0xBB][5][payload]` 的解析产物；M1 S1c §1.6）。
+///
+/// `src` = **该腿的远端地址**（= QUIC 眼里的对端地址：中继数据口）。口必须是腿远端而
+/// 不是包的来源字段——腿 socket 是 `connect` 的，中继就是靠「腿 socket ↔ assoc」对应，
+/// 出口 QUIC 面的腿表也按同一地址做发送路由（`Transmit.destination`）。
+pub struct QuicLegPkt {
+    pub src: SocketAddr,
+    pub payload: Vec<u8>,
 }
 
 /// hint 帧回调（装配层接；Go OnHint 语义——src 校验归接线方：hint 源 IP = 中继 IP）。
@@ -173,6 +185,10 @@ pub struct ServerBind {
     /// 曾当过一次腿的远端地址（Send 兜底丢弃判据；不受 5min 窗限制——#17）。
     leg_ports: HashSet<SocketAddr>,
     leg_dropped: u64,
+    /// 腿面上收到的 kind=5（QUIC 载荷）报文数（M1 S1c §1.6）。
+    quic_leg_pkts: u64,
+    /// 因 QUIC 面不可用而丢掉的 kind=5 报文数（丢可见面）。
+    quic_leg_undelivered: u64,
     /// STUN 观测等待者（事务 ID + 应答回执通道——同 socket 观测「监听端口的 NAT 映射」）。
     stun_wait_txid: Option<[u8; 12]>,
     stun_wait_result: Option<std::sync::mpsc::Sender<Option<SocketAddr>>>,
@@ -280,6 +296,8 @@ impl ServerBind {
             leg_recent: HashMap::new(),
             leg_ports: HashSet::new(),
             leg_dropped: 0,
+            quic_leg_pkts: 0,
+            quic_leg_undelivered: 0,
             stun_wait_txid: None,
             stun_wait_result: None,
             rx_bytes: 0,
@@ -385,6 +403,7 @@ impl ServerBind {
                     return Some(Inbound {
                         data: Some((src, payload.to_vec())),
                         regs: Vec::new(),
+                        quic: None,
                     });
                 }
                 k if k == FrameKind::Reg.to_wire() => {
@@ -392,6 +411,7 @@ impl ServerBind {
                     return Some(Inbound {
                         data: None,
                         regs: vec![(payload.to_vec(), src)],
+                        quic: None,
                     });
                 }
                 k if k == FrameKind::Control.to_wire() => {
@@ -405,6 +425,17 @@ impl ServerBind {
                 }
                 k if k == FrameKind::Batch.to_wire() => {
                     return self.handle_batch(buf, payload, src)
+                }
+                k if k == FrameKind::Quic.to_wire() => {
+                    // QUIC 载荷（M1 S1c §1.6）：**不记新源行**（Q-P——设计 §3.4 E23 条：
+                    // 每个 kind 分支都会调 `note_new_src`，QUIC 档必须显式跳过；该档的
+                    // 「换源」语义由 E-q2（`quic: 路径变更`）承接）。载荷原样交给 QUIC 面。
+                    self.quic_leg_pkts += 1;
+                    return Some(Inbound {
+                        data: None,
+                        regs: Vec::new(),
+                        quic: Some(QuicLegPkt { src, payload: payload.to_vec() }),
+                    });
                 }
                 k if k == crate::relaywire::FRAME_TYPE_RELAY_REG => {
                     // 中继控制帧：转发给 relay-leg 线程（解析/源校验不进驱动线程）
@@ -466,7 +497,7 @@ impl ServerBind {
             return None;
         }
         self.note_new_src(src, "容器数据", raw.len());
-        Some(Inbound { data: d, regs })
+        Some(Inbound { data: d, regs, quic: None })
     }
 
     // ---------- 腿表（relay-backend-dial；驱动线程独占） ----------
@@ -613,6 +644,50 @@ impl ServerBind {
             .values()
             .map(|lg| lg.sock.as_raw_fd())
             .collect()
+    }
+
+    /// 当前腿远端集（M1 §1.6：驱动线程用它给 QUIC 面腿表做差分——新腿登记发送句柄、
+    /// 摘除的腿摘句柄）。
+    pub fn leg_remotes(&self) -> Vec<SocketAddr> {
+        self.leg_by_id.values().map(|lg| lg.remote).collect()
+    }
+
+    /// 某腿的**发送句柄**（`try_clone` 的 fd 副本）：与读侧共享同一 socket、同一本地
+    /// 端口，故中继仍认成同一条腿；QUIC 面按远端地址路由发送（`Transmit.destination`）。
+    /// None = 该远端没有腿 / 克隆失败（失败只记行，不影响 WG 面）。
+    pub fn leg_send_handle(&mut self, remote: &SocketAddr) -> Option<UdpSocket> {
+        let lg = self.leg_by_id.values().find(|lg| lg.remote == *remote)?;
+        match lg.sock.try_clone() {
+            Ok(s) => Some(s),
+            Err(e) => {
+                (self.logf)(&format!(
+                    "quic: 腿（→ {remote}）发送句柄克隆失败（{e}）—— 该腿上的 QUIC 报文将无法回程"
+                ));
+                None
+            }
+        }
+    }
+
+    /// kind=5 帧**投不进 QUIC 面**（面缺席/已死）的计数 + 节流记行（首 3 + 每 100——
+    /// 仓内既有口径）。M1 §6.4 的「丢弃可观测、不静默」在出口腿面的落点。
+    pub fn note_quic_leg_undelivered(&mut self, n: usize) {
+        self.quic_leg_undelivered += 1;
+        let c = self.quic_leg_undelivered;
+        if c <= 3 || c.is_multiple_of(100) {
+            (self.logf)(&format!(
+                "quic: 腿上的 QUIC 报文无法投递（出口 QUIC 面不可用：未起/已收工）——已丢 {c} 个（最近 {n} 字节）"
+            ));
+        }
+    }
+
+    /// 腿面上收到的 kind=5 报文数（测试/观测面）。
+    pub fn quic_leg_pkts(&self) -> u64 {
+        self.quic_leg_pkts
+    }
+
+    /// 因 QUIC 面不可用而丢掉的 kind=5 报文数（测试/观测面）。
+    pub fn quic_leg_undelivered(&self) -> u64 {
+        self.quic_leg_undelivered
     }
 
     /// 收工：拆全部腿（不打卡日志——收工路径）。
@@ -1149,6 +1224,14 @@ mod tests {
         Arc::new(|_| {})
     }
 
+    /// 收集型日志（行级断言用；`try_iter` 读累积行）。
+    fn log_sink() -> (crate::Logf, std::sync::mpsc::Receiver<String>) {
+        let (tx, rx) = std::sync::mpsc::channel();
+        (Arc::new(move |s: &str| {
+            let _ = tx.send(s.to_owned());
+        }), rx)
+    }
+
     /// 双栈监听 + 源地址归一：v4 与 v6 客户端都能打到同一 socket（Go
     /// `ListenUDP("udp", nil)` 双栈语义）；v4 包的 v4-mapped 源被 unmap 回纯 v4
     /// （新源表形态断言）、v6 源保持原样。
@@ -1283,10 +1366,91 @@ mod tests {
         assert_eq!(got[0], hello_payload, "hello 载荷应字节原样透传");
     }
 
+    // ---------- M1 S1c：kind=5（QUIC 载荷）分派 + Q-P（不走 note_new_src） ----------
+
+    /// **判据（S1-6 的 ① 半边）**：`kind=5` 帧 ⇒ `Inbound.quic` 承载（src = 腿远端、
+    /// 载荷字节原样）；**不**产 data/regs（QUIC 载荷不是 WG 包、也不是 reg）。
+    #[test]
+    fn quic_kind_frame_carries_leg_packet() {
+        let mut b = ServerBind::open(0, "t", noop_logf()).unwrap();
+        let src: SocketAddr = "127.0.0.1:5101".parse().unwrap();
+        let payload = b"\x40\x01\x02\x03quic-initial-bytes";
+        let wire = frame::frame_bytes(FrameKind::Quic, payload);
+        let got = b.process_packet(&wire, src).expect("kind=5 应产 Inbound");
+        let q = got.quic.expect("QUIC 载荷在 `quic` 字段");
+        assert_eq!(q.src, src, "src = 腿远端（QUIC 眼里的对端地址）");
+        assert_eq!(q.payload, payload, "载荷字节原样（零解释）");
+        assert!(got.data.is_none(), "kind=5 不是 WG 数据包");
+        assert!(got.regs.is_empty(), "kind=5 不是 reg 帧");
+        assert_eq!(b.quic_leg_pkts(), 1, "收面计数 +1");
+    }
+
+    /// **判据（Q-P，设计 §9.3 / §3.4 E23 条）**：**kind=5 分支显式跳过 `note_new_src`**
+    /// ——QUIC 腿的「新源」语义由 E-q2（`quic: 路径变更`）承接，E23 行对 QUIC 腿不适用。
+    ///
+    /// 反证（同一 socket、同一 src）：kind=0（数据）**必须**照旧记新源行 ⇒ 证明本用例的
+    /// 「不记」不是「没在记账」而是「只有 kind=5 不记」。`src_seen` 正是 `note_new_src`
+    /// 的去重表（私有字段，同模块测试直读）。
+    #[test]
+    fn quic_kind_frame_does_not_note_new_src() {
+        let mut b = ServerBind::open(0, "t", noop_logf()).unwrap();
+        let src: SocketAddr = "127.0.0.1:5102".parse().unwrap();
+        // kind=5：不记
+        let wire = frame::frame_bytes(FrameKind::Quic, b"quic");
+        assert!(b.process_packet(&wire, src).is_some(), "kind=5 有产出");
+        assert!(
+            !b.src_seen.contains_key(&src),
+            "Q-P：kind=5 分支不得调 note_new_src（E23 对 QUIC 腿不适用）"
+        );
+        // kind=5 重复来也不记（同 src 多帧仍零记录）
+        for _ in 0..3 {
+            assert!(b.process_packet(&wire, src).is_some());
+        }
+        assert!(!b.src_seen.contains_key(&src), "kind=5 多帧后仍零记录");
+        // 反证：kind=0（数据）同 src ⇒ 记（既有行为未被动到）
+        let data = frame::frame_bytes(FrameKind::Data, b"wg");
+        assert!(b.process_packet(&data, src).is_some());
+        assert!(b.src_seen.contains_key(&src), "kind=0 照旧记新源行（对照）");
+    }
+
+    /// QUIC 面不可用（未起/已收工）时的丢面：计数 + 节流记行（首 3 + 每 100——不静默）。
+    #[test]
+    fn quic_leg_undelivered_is_counted_with_throttled_log() {
+        let (logf, rx) = log_sink();
+        let mut b = ServerBind::open(0, "t", logf).unwrap();
+        for _ in 0..4 {
+            b.note_quic_leg_undelivered(1400);
+        }
+        assert_eq!(b.quic_leg_undelivered(), 4, "四次全计数");
+        // 只看本用例关心的行（装配期可能有端口退让告警行）
+        let lines: Vec<String> = rx
+            .try_iter()
+            .filter(|l| l.contains("腿上的 QUIC 报文无法投递"))
+            .collect();
+        assert_eq!(lines.len(), 3, "首 3 次各一行（第 4 次被节流）：{lines:?}");
+        assert!(lines[0].contains("已丢 1 个（最近 1400 字节）"), "行文可检索：{}", lines[0]);
+    }
+
+    /// 腿表读面：`leg_remotes` / `leg_send_handle`（QUIC 面差分同步的输入）。
+    #[test]
+    fn leg_send_handle_and_remotes_expose_leg_table() {
+        let mut b = ServerBind::open(0, "t", noop_logf()).unwrap();
+        let r1: SocketAddr = "127.0.0.1:5103".parse().unwrap();
+        b.register_leg(11, r1, b"LEGUP").expect("拨腿");
+        assert_eq!(b.leg_remotes(), vec![r1]);
+        let h = b.leg_send_handle(&r1).expect("发送句柄可得");
+        assert_ne!(h.local_addr().unwrap().port(), 0, "句柄是同一 socket 的副本（本地端口相同）");
+        assert!(
+            b.leg_send_handle(&"127.0.0.1:5999".parse().unwrap()).is_none(),
+            "不存在的腿 ⇒ None"
+        );
+        b.remove_leg(11);
+        assert!(b.leg_remotes().is_empty(), "摘腿后集合空");
+    }
+
     /// probe 应答路径：HWQ → HWR（同 nonce/build/flags）；列表段受 pad 契约约束。
     #[test]
-    fn probe_responds_on_socket_path() {
-        let mut b = ServerBind::open(0, "rust-exit-test", noop_logf()).unwrap();
+    fn probe_responds_on_socket_path() {        let mut b = ServerBind::open(0, "rust-exit-test", noop_logf()).unwrap();
         let nonce = [9u8; 8];
         let req = crate::probe::encode_request(crate::probe::TYPE_PING, &nonce, 200);
         let src: SocketAddr = "127.0.0.1:5002".parse().unwrap();

@@ -1165,6 +1165,8 @@ fn driver_loop(
                 EngineCmd::LegsClear => bind.clear_legs(),
             }
         }
+        // 腿表 → QUIC 面（M1 §1.6）：命令面刚改过腿表 ⇒ 同拍同步（新腿的回程包不能等下一拍）
+        sync_quic_legs(&mut bind, quic_face.as_ref());
         // ② UDP 收包（等待原语两档；reactor 批起 = wait_hint 扩档）：
         //    - 整形滞留非空 ∨ reactor 存在等待者（connect 在途/待写缓冲非空）：1ms 拍
         //     （每拍续水 rate×1ms、线上团块细化；上游事件最晚 1ms 被发现）；
@@ -1206,13 +1208,16 @@ fn driver_loop(
             .filter(|pf| pf.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0)
             .map(|pf| pf.fd)
             .collect();
-        // 腿 fd 可读（与主 socket 同一消费管线——data 进 device / reg 进设备表）
+        // 腿 fd 可读（与主 socket 同一消费管线——data 进 device / reg 进设备表 /
+        // kind=5 进 QUIC 面）
         for fd in readable_legs {
             let (_alive, inbound) = bind.leg_readable(fd);
             if let Some(inbound) = inbound {
                 handle_inbound(inbound, device, table, intercept, &mut bind, &mut out, &cfg, quic_face.as_ref());
             }
         }
+        // 腿读错误会摘腿 ⇒ 同拍把摘除同步给 QUIC 面（面侧保留「最近摘除」窗）
+        sync_quic_legs(&mut bind, quic_face.as_ref());
         // QUIC 入站（M1 §1.3/§1.4）：poll 唤醒后 drain（唤醒字节 + 入站队列）——
         // 准入请求在此裁决（回执非阻塞）、明文包直投 `intercept.on_plain`。
         if let Some(q) = quic_face.as_ref() {
@@ -1275,6 +1280,8 @@ fn driver_loop(
         if now.duration_since(last_leg_sweep) > crate::server::bind::RELAY_LEG_SWEEP_PUB {
             last_leg_sweep = now;
             bind.sweep_legs();
+            // 空闲回收摘了腿 ⇒ 同步给 QUIC 面（同拍）
+            sync_quic_legs(&mut bind, quic_face.as_ref());
         }
         if now.duration_since(last_revoked_check) > Duration::from_secs(1) {
             last_revoked_check = now;
@@ -1439,6 +1446,39 @@ fn handle_inbound(
         out.wire.clear();
         for p in out.plain.drain(..) {
             intercept.on_plain(p);
+        }
+    }
+    // 腿上的 QUIC 载荷（kind=5，M1 §1.6）：交给出口 QUIC 面注入（`src` = 腿远端）。
+    // 面不可用（未起 / 已收工）⇒ 丢 + 计数 + 节流记行（`bind` 侧的可见面，不静默）。
+    if let Some(pkt) = inbound.quic {
+        let n = pkt.payload.len();
+        match quic {
+            Some(q) if q.inject_leg(pkt.src, pkt.payload) => {}
+            _ => bind.note_quic_leg_undelivered(n),
+        }
+    }
+}
+
+/// 腿表 → QUIC 面腿表的**差分同步**（M1 §1.6 发送侧路由）：新腿登记发送句柄（该腿
+/// socket 的 `try_clone` 副本）、已摘的腿从 QUIC 面摘掉（面侧保留「最近摘除」窗 ⇒
+/// 不再回落直连端口）。
+///
+/// 调点（三处，每处都是「腿表刚被改过」之后）：①命令面处理完（LegRegister/LegRemove/
+/// LegsClear）——同拍生效，消掉「腿刚拨好、QUIC 回程还找不到腿」的窗口；②腿读循环后
+/// （读错误会摘腿）；③`bind.sweep_legs()` 后（空闲回收）。开销 = 腿表 ≤64 条的小遍历。
+fn sync_quic_legs(bind: &mut ServerBind, quic: Option<&homeway_quic::ExitQuic>) {
+    let Some(q) = quic else { return };
+    let cur = bind.leg_remotes();
+    for remote in q.leg_remotes() {
+        if !cur.contains(&remote) {
+            q.leg_close(remote);
+        }
+    }
+    for remote in cur {
+        if !q.has_leg(&remote) {
+            if let Some(sock) = bind.leg_send_handle(&remote) {
+                q.leg_open(remote, sock);
+            }
         }
     }
 }
