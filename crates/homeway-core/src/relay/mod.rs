@@ -345,6 +345,10 @@ pub struct Relay {
     poll_dirty: bool,
     /// 控制面（TCP 同号口）是否就绪（F10：bind 失败 = 纯 UDP 降级，探针 flags 报降级位）。
     ctl_ok: bool,
+    /// 监听 socket 是 AF_INET6（S7a：任意地址形态走双栈 `[::]`）⇒ 回包给 v4 对端时
+    /// 目的地址必须映射成 v4-mapped（见 [`Relay::send_peer`]）。绑定后在 `run` 里按
+    /// socket 事实设置；单栈 v4 监听恒 false（`xmit_addr` 原样返回）。
+    listen_v6: bool,
     /// 拒绝类日志的每原因节流计数（F6）。
     reject_log: HashMap<RejectLog, u64>,
     /// Q-I F6-1：`forward_up` 直发路径的复用编帧缓冲（消每包 alloc/free；
@@ -375,6 +379,7 @@ impl Relay {
             msg_tx,
             poll_dirty: false,
             ctl_ok: false,
+            listen_v6: false,
             reject_log: HashMap::new(),
             frame_scratch: Vec::new(),
         }
@@ -385,21 +390,35 @@ impl Relay {
     }
 
     /// 实际监听地址（run 之后由 on_ready 回调给出；测试用）。
+    ///
+    /// **任意地址形态 = v6 双栈**（S7a / Q2）：`0.0.0.0`（`parse_listen(":port")` 的产物）
+    /// 与 `::` 都视作「任意地址」，走 [`crate::udpbatch::bind_dual_stack`]（AF_INET6 +
+    /// `IPV6_V6ONLY=0`）——v4/v6 客户端同端口可达，与 Go `net.ListenUDP("udp", 通配)`
+    /// 的双栈语义对齐（`relay.go:289-319`）。**显式地址（含 127.0.0.1）仍绑族内单栈**：
+    /// Go 对显式 IP 同样不放宽（`favoriteAddrFamily`：非通配 ⇒ 按 IP 族建 socket），
+    /// 放宽到全卡会破坏「只听回环」的部署语义与本地私有实例的隔离面。
     fn listen_with_fallback(want: SocketAddr, logf: &Logf) -> io::Result<UdpSocket> {
-        if let Ok(s) = UdpSocket::bind(want) {
+        let bind_want = |ip: IpAddr, port: u16| -> io::Result<UdpSocket> {
+            if ip.is_unspecified() {
+                crate::udpbatch::bind_dual_stack(port)
+            } else {
+                UdpSocket::bind(SocketAddr::new(ip, port))
+            }
+        };
+        if let Ok(s) = bind_want(want.ip(), want.port()) {
             return Ok(s);
         }
         logf(&format!("⚠️ 监听端口 {} 被占用 —— 自动往后找", want.port()));
         if want.port() == 0 {
-            return UdpSocket::bind(SocketAddr::new(want.ip(), 0));
+            return bind_want(want.ip(), 0);
         }
         for p in want.port().saturating_add(1)..=want.port().saturating_add(9) {
-            if let Ok(c) = UdpSocket::bind(SocketAddr::new(want.ip(), p)) {
+            if let Ok(c) = bind_want(want.ip(), p) {
                 logf(&format!("中继改用端口 {p}（token 里写的就是它）"));
                 return Ok(c);
             }
         }
-        UdpSocket::bind(SocketAddr::new(want.ip(), 0))
+        bind_want(want.ip(), 0)
     }
 
     /// 驱动线程本体：监听并服务直到 stop 信号（stop_fd 上可读字节）。
@@ -412,6 +431,8 @@ impl Relay {
     /// 的 `'static`，故这里收裸值。
     pub fn run(mut self, stop_fd: i32, on_ready: impl FnOnce(u16)) -> io::Result<()> {
         let udp = Self::listen_with_fallback(self.cfg.listen, &self.cfg.logf)?;
+        // 族事实定一次（回包映射用）：任意地址形态 = 双栈 AF_INET6（S7a/Q2）。
+        self.listen_v6 = matches!(udp.local_addr()?, SocketAddr::V6(_));
         bump_sock_bufs(&udp);
         udp.set_nonblocking(true)?;
         let actual_port = udp.local_addr()?.port();
@@ -660,6 +681,16 @@ impl Relay {
 
     // ---------- UDP 面 ----------
 
+    /// 监听面回包（族适配**单点收口**）：监听 socket 为 AF_INET6（双栈）时，发给 v4
+    /// 对端的目的地址必须映射成 v4-mapped——Linux/OHOS 上 AF_INET6 socket 的
+    /// `msg_name` 用 `sockaddr_in` 会 EAFNOSUPPORT（`udpbatch::xmit_addr` 同义；
+    /// macOS 宽松但**不能依赖**，本机 e2e 看不出差异、真机才炸）。对端地址在收包处
+    /// 已 `unmap` 成纯 v4（与 Go `readLoop` 同义）⇒ 每个「发给客户端/后端」的出口都
+    /// 走本函数，防新增出口点漏映射。单栈 v4 监听时 `xmit_addr` 原样返回。
+    fn send_peer(&self, udp: &UdpSocket, buf: &[u8], dst: SocketAddr) -> io::Result<usize> {
+        udp.send_to(buf, crate::udpbatch::xmit_addr(dst, self.listen_v6))
+    }
+
     /// 一个入站 UDP 包的分派（限流 → probe → tagged → 腿控制/转发）。
     fn handle_udp_packet(&mut self, udp: &UdpSocket, src: SocketAddr, pkt: &[u8]) {
         if !self.rate_ok(src.ip()) {
@@ -669,7 +700,7 @@ impl Relay {
         // 参照点探测（无状态一问一答；防放大 ≤ req+45B；合法探测不进任何计数）。
         // F10：flags 报「控制面降级」位（serve 侧 flags=caps 不动；中继 flags 命名空间）。
         if let Some(resp) = crate::probe::respond_ex(pkt, self.build_str(), self.relay_flags(), &[]) {
-            let _ = udp.send_to(&resp, src);
+            let _ = self.send_peer(udp, &resp, src);
             return;
         }
         let Some((label, kind, payload)) = legframe::decode_tagged(pkt) else {
@@ -751,7 +782,7 @@ impl Relay {
                 rw::FRAME_TYPE_RELAY_REG,
                 &rw::encode_challenge(eph_pub.as_bytes(), &nonce_out),
             );
-            let _ = udp.send_to(&resp, src);
+            let _ = self.send_peer(udp, &resp, src);
             return;
         }
         if sub == rw::sub::PROOF {
@@ -865,23 +896,23 @@ impl Relay {
                 self.logf(&format!("中继：后端 {} 注册成功（腿 {}）", hex(&label), src));
             }
             let resp = legframe::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::ok_bytes());
-            let _ = udp.send_to(&resp, src);
+            let _ = self.send_peer(udp, &resp, src);
             return;
         }
         if sub == rw::sub::KEEPALIVE {
             let resp_again = legframe::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::again_bytes());
             let Some(lg) = self.legs.get(&label) else {
                 // 腿不在了：明确让后端重注册（否则它以为还在，两边永远对不上）
-                let _ = udp.send_to(&resp_again, src);
+                let _ = self.send_peer(udp, &resp_again, src);
                 return;
             };
             if !lg.admitted() {
-                let _ = udp.send_to(&resp_again, src);
+                let _ = self.send_peer(udp, &resp_again, src);
                 return;
             }
             if lg.addr.is_some_and(|a| a != src) {
                 // 换了地址的保活不算数：要求重新走一遍注册（防地址冒用）
-                let _ = udp.send_to(&resp_again, src);
+                let _ = self.send_peer(udp, &resp_again, src);
                 return;
             }
             if lg.addr.is_none() {
@@ -890,7 +921,7 @@ impl Relay {
                     .and_then(|id| self.ctl_conns.get(&id))
                     .map(|c| c.remote.ip() == src.ip());
                 if same_ip != Some(true) {
-                    let _ = udp.send_to(&resp_again, src);
+                    let _ = self.send_peer(udp, &resp_again, src);
                     return;
                 }
                 // 有活控制连接且同 IP：静默续命
@@ -998,7 +1029,7 @@ impl Relay {
             // hint（唯一推送点 = 建会话，两端各一次；测试形态可关）
             if !self.cfg.no_hints {
                 if let Some(addr) = leg_addr {
-                    let _ = udp.send_to(&legframe::hint_bytes(&addr.to_string()), client);
+                    let _ = self.send_peer(udp, &legframe::hint_bytes(&addr.to_string()), client);
                 }
                 if let Some(b) = self.assocs.get(&key).and_then(|a| a.backend) {
                     let a = self.assocs.get(&key).expect("已判在");
@@ -1199,7 +1230,7 @@ impl Relay {
         }
         // FIX-91：出口恒发腿帧——原样转发（未知/畸形包由客户端按解码失败丢弃）。
         // F8：只计成功。
-        match udp.send_to(pkt, key.client) {
+        match self.send_peer(udp, pkt, key.client) {
             Ok(_) => self.stats.forwarded_down += 1,
             Err(e) => {
                 self.stats.send_fail_down += 1;
@@ -1625,6 +1656,7 @@ fn unmap(ap: SocketAddr) -> SocketAddr {
 mod tests {
     use super::*;
     use std::io::Write as _;
+    use std::sync::Mutex;
 
     fn rand_secret() -> x25519_dalek::StaticSecret {
         let mut b = [0u8; 32];
@@ -1634,6 +1666,37 @@ mod tests {
 
     fn noop_logf() -> Logf {
         Arc::new(|_| {})
+    }
+
+    /// 日志捕获（S7a 面：R1 行形态断言用）——`on_ready` 回调**先于**「中继就绪」行，
+    /// 故按行轮询而非一次读取；锁中毒容忍（测试线程 panic 不影响 relay 线程写日志）。
+    fn capture_logf() -> (Logf, Arc<Mutex<Vec<String>>>) {
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let l2 = Arc::clone(&lines);
+        let logf: Logf = Arc::new(move |s: &str| {
+            l2.lock().unwrap_or_else(|e| e.into_inner()).push(s.to_owned())
+        });
+        (logf, lines)
+    }
+
+    fn wait_log_line(
+        lines: &Arc<Mutex<Vec<String>>>,
+        needle: &str,
+        secs: u64,
+    ) -> Option<String> {
+        for _ in 0..(secs * 100) {
+            let hit = lines
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .iter()
+                .find(|l| l.contains(needle))
+                .cloned();
+            if hit.is_some() {
+                return hit;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        None
     }
 
     /// Q-I F6-1：scratch 复用编帧（`clear` + `encode_frame`）与 `frame_bytes` 逐字节
@@ -2325,6 +2388,72 @@ mod tests {
         let (n2, _) = cl.recv_from(&mut buf).unwrap();
         let r2 = crate::probe::decode_response(&buf[..n2], &nonce).unwrap();
         assert_eq!(r2.flags, 0, "正常形态 flags 应为 0");
+    }
+
+    /// S7a（Q2）：**任意地址形态 = v6 双栈**。三条一起断：①R1 行的监听地址形态是
+    /// `[::]:port`（双栈事实）而非 `0.0.0.0:port`；②v4 与 v6 客户端在**同一 socket**
+    /// 上都拿到探测应答（v4 老路无回退 = 回包族适配真走通；Linux/OHOS 上若漏映射，
+    /// v4 应答发不出去）；③完整注册腿（HELLO→CHALLENGE→PROOF→OK，label 帧不改）在 v6 上走通。
+    #[test]
+    fn wildcard_listen_binds_dual_stack_and_serves_v4_and_v6() {
+        let (logf, lines) = capture_logf();
+        let tr = TestRelay::start(Config::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0),
+            None,
+            logf,
+        ));
+        let ready = wait_log_line(&lines, "中继就绪", 5).expect("R1 行必须打出");
+        assert!(
+            ready.starts_with(&format!("中继就绪：[::]:{}（", tr.port)),
+            "任意地址监听应出双栈形态（R1 行）：{ready}"
+        );
+
+        let nonce = [9u8; 8];
+        let req = crate::probe::encode_request(crate::probe::TYPE_PING, &nonce, 16);
+        for (bind, ip, tag) in [
+            ("127.0.0.1:0", IpAddr::V4(Ipv4Addr::LOCALHOST), "v4"),
+            ("[::1]:0", IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), "v6"),
+        ] {
+            let cl = UdpSocket::bind(bind).unwrap();
+            cl.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            cl.send_to(&req, SocketAddr::new(ip, tr.port)).unwrap();
+            let mut buf = [0u8; 512];
+            let (n, _) = cl
+                .recv_from(&mut buf)
+                .unwrap_or_else(|e| panic!("{tag} 客户端未收到探测应答（回包族适配断）：{e}"));
+            crate::probe::decode_response(&buf[..n], &nonce)
+                .unwrap_or_else(|e| panic!("{tag} 应答解码失败：{e:?}"));
+        }
+
+        let be = UdpSocket::bind("[::1]:0").unwrap();
+        let priv_ = rand_secret();
+        let pub_ = PublicKey::from(&priv_);
+        let label = relay_id(pub_.as_bytes());
+        register_open(
+            &be,
+            SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), tr.port),
+            &priv_,
+            &pub_,
+            &label,
+        );
+    }
+
+    /// S7a（Q2）**反向断言**：显式地址**不放宽**——`127.0.0.1:port` 仍按族内单栈绑
+    /// （R1 行保持 `127.0.0.1:…`；Go 对显式 IP 同样不放宽）。若实现改成无条件
+    /// `bind_dual_stack`，本用例必红（监听面被放宽到全卡 = 部署语义破坏）。
+    #[test]
+    fn explicit_loopback_listen_stays_single_stack() {
+        let (logf, lines) = capture_logf();
+        let tr = TestRelay::start(Config::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
+            None,
+            logf,
+        ));
+        let ready = wait_log_line(&lines, "中继就绪", 5).expect("R1 行必须打出");
+        assert!(
+            ready.starts_with(&format!("中继就绪：127.0.0.1:{}（", tr.port)),
+            "显式回环地址应保持单栈形态：{ready}"
+        );
     }
 
     fn register_open(be: &UdpSocket, relay_addr: SocketAddr, priv_: &x25519_dalek::StaticSecret, pub_: &PublicKey, label: &[u8; 8]) {

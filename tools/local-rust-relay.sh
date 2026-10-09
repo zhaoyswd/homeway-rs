@@ -6,7 +6,9 @@
 #   实例号 n 缺省 1；中继 state = /tmp/homeway-rs-rustrelay-n，UDP 监听 = 42780+n。
 #
 # 命令：
-#   start [n]        起 Rust 中继（release 构建；--advertise 127.0.0.1:PORT）
+#   start [n]        起 Rust 中继（release 构建；缺省 --listen/--advertise 127.0.0.1:PORT）
+#                    S7a：`RELAY_LISTEN` / `RELAY_ADVERTISE` 可覆盖（如 `RELAY_LISTEN=":42781"`
+#                    出 v6 双栈监听、`RELAY_ADVERTISE="[::1]:42781"` 出 v6 token 端点）
 #   stop [n]         停中继
 #   token [n]        打印 rl1 token（grep 终端输出——与 Go 中继同纪律：启动时打一轮）
 #   status [n]       pid / 端口 / 注册腿与控制面判据行采样
@@ -53,9 +55,15 @@ start)
   if our_pid "$RELAY_PIDFILE"; then echo "Rust 中继 #$n 已在跑（pid=$REPLY_PID）"; exit 0; fi
   [[ -x "$BIN" ]] || build_bin
   mkdir -p "$RELAY_STATE/cache" || exit 1
-  echo "==> 起 Rust 中继 #$n：state=$RELAY_STATE udp=127.0.0.1:$RELAY_PORT"
+  # S7a（Q2）面：监听/公布形态覆盖（缺省 = 回环单栈，隔离语义不变）。
+  #   RELAY_LISTEN=":PORT"        → 任意地址（v6 双栈，R1 行出 [::]:PORT）
+  #   RELAY_ADVERTISE="[::1]:PORT" → token 端点走 v6（全链 v6 读数用）
+  # 只影响本脚本起的**私有**实例；现役/生产实例不经本脚本。
+  local listen_spec="${RELAY_LISTEN:-127.0.0.1:$RELAY_PORT}"
+  local advertise_spec="${RELAY_ADVERTISE:-127.0.0.1:$RELAY_PORT}"
+  echo "==> 起 Rust 中继 #$n：state=$RELAY_STATE udp=$listen_spec（公布 $advertise_spec）"
   nohup "$BIN" relay --state "$RELAY_STATE" \
-    --listen "127.0.0.1:$RELAY_PORT" --advertise "127.0.0.1:$RELAY_PORT" \
+    --listen "$listen_spec" --advertise "$advertise_spec" \
     >> "$RELAY_STATE/stdout.log" 2>&1 &
   echo $! > "$RELAY_PIDFILE"
   sleep 1

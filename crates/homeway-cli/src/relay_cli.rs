@@ -97,7 +97,12 @@ fn parse_flags(args: &[String]) -> Result<RelayFlags, String> {
     Ok(f)
 }
 
-/// 解析监听地址（":41741"/"127.0.0.1:41741"——缺 host = 全卡 v4）。
+/// 解析监听地址（":41741"/"127.0.0.1:41741"——缺 host = **任意地址**）。
+///
+/// `:port` 形态产出 `0.0.0.0:port` 作**占位**语义（"任意地址"），族由绑定层决定：
+/// [`homeway_core::relay`] 的 listen 面对 `is_unspecified()` 走 v6 双栈
+/// （`IPV6_V6ONLY=0`，v4/v6 客户端同端口可达；S7a/Q2 对齐 Go `relay.go:289-319`）。
+/// 显式 IP（含 `127.0.0.1`）保持族内单栈——与 Go 对显式地址不放宽同义。
 pub fn parse_listen(v: &str) -> Option<SocketAddr> {
     let v = v.trim();
     if let Some(port) = v.strip_prefix(':') {
@@ -438,5 +443,29 @@ mod tests {
         proc.shutdown(); // 幂等：再来一次不 panic
         drop(proc); // Drop 走同一 shutdown：同样幂等
         assert_eq!(STOP_FD.load(AOrd::SeqCst), -1);
+    }
+
+    /// S7a（Q2）：`:port` 形态 = **任意地址占位**（`0.0.0.0` 字面 + `is_unspecified()`
+    /// ⇒ 绑定层判特例走 v6 双栈）；显式 v4/v6 字面量原样解析（族内单栈，不放宽）。
+    #[test]
+    fn parse_listen_wildcard_is_unspecified_placeholder() {
+        let any = parse_listen(":41741").expect(":port 形态合法");
+        assert_eq!(any, SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 41741));
+        assert!(any.ip().is_unspecified(), "任意地址占位（绑定层据此走双栈）");
+        assert_eq!(parse_listen(":0").unwrap().port(), 0, "0 = 内核选口（退让路径用）");
+
+        assert_eq!(
+            parse_listen("127.0.0.1:42781"),
+            Some(SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 42781))
+        );
+        assert_eq!(
+            parse_listen("[::1]:42781").unwrap().ip(),
+            IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            "显式 v6 字面量原样（不转 v4 占位）"
+        );
+
+        assert!(parse_listen(":70000").is_none(), "端口越界不合法");
+        assert!(parse_listen("").is_none(), "空串不合法");
+        assert!(parse_listen("nonsense").is_none(), "非地址串不合法");
     }
 }
