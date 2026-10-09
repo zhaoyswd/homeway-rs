@@ -154,6 +154,8 @@ pub trait TunExecutor: Send + Sync {
     /// 请求世代收工（幂等信号；要能打断暖机中的阻塞调用）。
     fn request_stop(&self);
     /// 恢复阶梯入口（from 起跑档位；rc 契约见 session::LadderRc::as_rc）。
+    /// **M4 §5.3**：实现按 `l3_on_island()` 分档（岛档 = 快探+复探 ⇒ `0/-1`；见
+    /// `tun_exec::recover_downpush_on_island` 与 `ClientCore::tun_recover` 的 doc）。
     fn recover(&self, from: i64, cause: &str) -> i32;
     /// runner/transport 状态块（tunStatusJSON 的条件键源；None = 无 runner 期）。
     /// 健康位/分类在 `TunShared`（不走本 trait——世代共享面）。
@@ -454,6 +456,12 @@ impl ClientCore {
     /// 恢复阶梯下推入口（from 钳位 R1..=R3；rc 契约见 facade 头注释）。cause 文案
     /// 用**档位名**（评审 r2-L6：`扩展下推(R1 重握手)`——会进 RECOVER 判据行，
     /// Go 同串）。
+    ///
+    /// **M4 §5.3 分档（登记 §8 行 13）**：执行体按 `l3_on_island()` 分档——
+    /// `true`（本世代 L3 真在岛上）⇒ 岛快探 + 一次复探 ⇒ **只产 `0/-1/-2`**
+    /// （`-2` = 无 attached/stale **或**岛不在；`-3/-4` 在该世代不可达）；
+    /// `false`（WG 档 / 岛未就的回落世代）⇒ WG 阶梯原路（`-1/-3/-4` 仍可达）。
+    /// tier 侧决策（`rc===0` 跳过整套重建 / 其余落重建）**不变**。
     pub fn tun_recover(&self, from: i64) -> i32 {
         let lvl = crate::session::recover::Level::clamp(from);
         self.executor()

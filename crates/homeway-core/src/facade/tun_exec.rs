@@ -938,6 +938,13 @@ impl TunExecutor for TunnelExec {
         if run.gen != run.tun_shared.gen.load(Ordering::Acquire) {
             return -2;
         }
+        // **M4 §5.3（§15-1 裁定「本期修」）：按有效承载分档**——判据 = `l3_on_island()`
+        // （**不是** `bearer`：`bearer=Quic` 但岛未就的世代按 WG 跑，用 bearer 会（a）对一条
+        // 确实 attached 的 WG 隧道谎报「无 attached」、（b）在「QUIC 分支」里经 `l3_probe`
+        // 回落 `path_probe` ⇒ 分支里跑 WG 动作）。
+        if run.l3_on_island() {
+            return recover_downpush_on_island(&run, cause);
+        }
         let lvl = Level::clamp(from);
         run.recover(lvl, cause).as_rc()
     }
@@ -2341,6 +2348,59 @@ fn l3_probe(run: &Arc<GenRun>, budget: Duration) -> Result<(), ProbeFail> {
     c.path_probe(budget).map_err(|e| ProbeFail::Detail(e.to_string()))
 }
 
+/// **QUIC 档（`l3_on_island() == true` 的世代）的 NAPI 恢复下推**（M4 §5.3；§15-1 裁定
+/// 「本期修」）：**快探 + 一次复探**（`FAST_BUDGET` 700ms × `REPROBE_FACTOR` 2 = 1.4s，
+/// 与**岛内快探阶梯同一判负粒度**）⇒ 通过 = `0`，两次都失败 = `-1`（「走完未恢复」⇒
+/// tier 整套重建）。
+///
+/// **为什么不跑 WG 阶梯**（设计 §5.3 的「最强理由」）：本世代 L3 在岛上，而
+/// `run.recover` 的 `TunnelTransport` 持的是 WG `Client`——它返回的 `0/-1` 既不能证明也
+/// 不能证伪岛上的连通性（**错误证据源**，不是「可用但不够好」）。本档**不产 C11
+/// （`RECOVER R1/R2/R3`）族行**、不做任何 WG 动作。
+///
+/// **为什么不是「什么都不做返 0」**：返 0 而零证据 = 谎报「某档通过」（本仓纪律：不谎报）；
+/// 一次 700ms 快探（+ 复探）是**最便宜的真话**（M3 §3.2：快探 = 3.5s 内定音的唯一判据）。
+///
+/// **时间上界（实测 + 如实订正设计口径）**：正常形态 = 探段 700ms（首次探通）或
+/// 700ms + 1.4s = 2.1s（复探才通/两次都败）；`l3_probe` 的 RPC 等待 = `budget +
+/// QUIC_RPC_BUDGET(5s)`。设计 §5.3 记的「最坏 ≈2.1s + 5s = **7.1s**」**只计了一次 RPC
+/// 余量**；按代码算的真实最坏 = (0.7s + 5s) + (1.4s + 5s) = **12.1s**（只有「岛 RPC 两次
+/// 都卡满」的错配形态可达；首次探通时 = 0.7s + 5s = 5.7s）。**实施期订正（不静默降级）**：
+/// 报主会话 + 落 `M4.md` 的 S6 登记补充（预登记 falsify 指标只对**实测**值设 8s 门）。
+/// tier 侧是 `clientCoreTunRecoverAsync`（异步导出）⇒ 不占 JS 线程。
+///
+/// **rc 可达集（§8 行 13 登记）**：本档只产 `0/-1/-2`（`-2` = 既有的「无 attached/stale」
+/// 前置，语义扩到「岛不在/未 attach」）；`-3/-4` 在本档**不可达**（回落世代仍可达——它走
+/// WG 原路）。
+///
+/// **归因行（additive，新行非改写）**：`quic: 恢复下推（%s）——按承载分档（岛快探%s：%s）`。
+fn recover_downpush_on_island(run: &Arc<GenRun>, cause: &str) -> i32 {
+    use homeway_quic::tuning::probe_defaults::{FAST_BUDGET, REPROBE_FACTOR};
+    // 不设 `deadline`（NAPI 面无线）；探段自带预算，RPC 等待亦为 `budget + QUIC_RPC_BUDGET`。
+    let first = l3_probe(run, FAST_BUDGET);
+    let (tag, verdict, rc) = match first {
+        Ok(()) => ("", "通过".to_owned(), 0),
+        Err(e1) => {
+            // 一次复探（与岛内阶梯同粒度：`ladder.rs:222` 的 `fast_budget × reprobe_factor`）
+            let budget = FAST_BUDGET.saturating_mul(REPROBE_FACTOR);
+            match l3_probe(run, budget) {
+                Ok(()) => ("+复探", "通过".to_owned(), 0),
+                Err(e2) => (
+                    "+复探",
+                    format!("失败（{e1}；复探：{e2}）"),
+                    -1,
+                ),
+            }
+        }
+    };
+    (run.logf)(&format!(
+        "quic: 恢复下推（{cause}）——按承载分档（岛快探{tag}：{verdict}）"
+    ));
+    // 耗时口径：实测值（正常形态 0.7s / 2.1s 两档）由用例与真机读数钉（M4.md §S4）；
+    // 上界只在**实测**面设门（预登记指标 ≤8s），不在此处断言（见函数头的订正）。
+    rc
+}
+
 // ---------------------------------------------------------------------------
 // 巡检（隧道域：demand 门控 + 失败当拍 R1 + 3 连败 R2 + 不健康交扩展）
 // ---------------------------------------------------------------------------
@@ -3137,6 +3197,127 @@ mod tests {
         drop(run);
         let e = err_of(pf_dial_via_run(&w, dst, budget));
         assert!(e.to_string().contains("世代已收工（拨号放弃）"), "{e}");
+    }
+
+    /// 起一枚「只绑回环 :0、**不建连**」的岛（合成世代用；S2/S4 用例共用构造）。
+    fn idle_island(run: &Arc<GenRun>) -> Arc<homeway_quic::Island> {
+        let ident = crate::identity::Identity::ephemeral().expect("临时身份");
+        let cred = homeway_quic::IslandCredential::new(
+            homeway_quic::TokenSecret::from_bytes([7u8; 32]),
+            ident.public_key(),
+            *ident.dev_tag().as_bytes(),
+            homeway_quic::RpkPublicKey::from_bytes([9u8; 32]),
+        );
+        let mut icfg = homeway_quic::IslandConfig::new(cred);
+        icfg.bind = Some(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0));
+        Arc::new(
+            homeway_quic::Island::start(Arc::clone(&run.logf), Arc::new(|_r: &str| {}), icfg)
+                .expect("岛可起（只绑回环 :0，不建连）"),
+        )
+    }
+
+    /// 起一枚带日志收集的合成世代（返回世代 + 行收集端）。
+    fn gen_with_lines(tag: &str) -> (Arc<GenRun>, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel::<String>();
+        let _ = tag;
+        let logf: Logf = Arc::new(move |s: &str| {
+            let _ = tx.send(s.to_owned());
+        });
+        (Arc::new(GenRun::synthetic_for_test(logf)), rx)
+    }
+
+    /// 抽干行收集端（返回本次新增的全部行）。
+    fn drain_lines(rx: &mpsc::Receiver<String>) -> Vec<String> {
+        let mut out = Vec::new();
+        while let Ok(l) = rx.try_recv() {
+            out.push(l);
+        }
+        out
+    }
+
+    /// **S4（M4 §5.3；§15-1 裁定「本期修」）**：NAPI `ClientCoreTunRecover` 的承载分档——
+    /// 判据 = `l3_on_island()`（**非** `bearer`）。
+    ///
+    /// ① 无世代 ⇒ `-2`；陈世代 ⇒ `-2`（两条既有前置，逐字）；
+    /// ② `l3_on_island()==true` ⇒ **岛快探 + 一次复探**：无 live 连接 ⇒ 两次探都失败 ⇒
+    ///    `-1`（= 「走完未恢复」⇒ tier 整套重建）+ **additive 行逐字**；本世代**零**
+    ///    `RECOVER` 族行（= 不跑 WG 阶梯、不做 WG 动作）；
+    /// ③ 岛在场但 `l3_on_island()==false`（**回落世代**）⇒ **WG 原路**：rc 与直接调
+    ///    `run.recover(Level::clamp(from), cause).as_rc()` 相等，且**零** `quic: 恢复下推` 行。
+    #[test]
+    fn recover_downpush_branches_on_l3_on_island() {
+        let demand = Arc::new(DemandSignals::new());
+        let exec = TunnelExec::new(Arc::clone(&demand));
+        // ① 无世代（executor 无 run）⇒ -2
+        assert_eq!(exec.recover(3, "扩展下推(R3 重赛跑)"), -2, "无 attached 隧道");
+
+        // ② 岛档：`l3_on_island() == true`
+        let (run, lines) = gen_with_lines("island");
+        let island = idle_island(&run);
+        run.set_island(Arc::clone(&island));
+        run.set_l3_on_island(true);
+        assert!(run.l3_on_island(), "两条件齐 ⇒ 走岛档");
+        *lock_unpoison(&exec.state) = Some(Arc::clone(&run));
+        let t0 = Instant::now();
+        let rc = exec.recover(3, "扩展下推(R3 重赛跑)");
+        let elapsed = t0.elapsed();
+        println!("[s4] island-档 rc={rc} elapsed={elapsed:?}");
+        assert_eq!(rc, -1, "两次探都失败 ⇒ -1（不是 0/-3/-4）");
+        let line =
+            "quic: 恢复下推（扩展下推(R3 重赛跑)）——按承载分档（岛快探+复探：失败（";
+        let seen = drain_lines(&lines);
+        let hit = seen.iter().find(|l| l.starts_with(line));
+        assert!(
+            hit.is_some(),
+            "additive 归因行须逐字在场（首缀 {line:?}）：{seen:?}"
+        );
+        println!("[s4] island-档 行 = {}", hit.expect("上面已断言"));
+        assert_eq!(
+            seen.iter().filter(|l| l.starts_with("RECOVER ")).count(),
+            0,
+            "岛档**零** RECOVER 族行（不跑 WG 阶梯）：{seen:?}"
+        );
+
+        // ③ 回落世代：岛在场、标志位为假 ⇒ WG 原路（对照 = 同参直接调世代方法）
+        let (run2, lines2) = gen_with_lines("fallback");
+        let island2 = idle_island(&run2);
+        run2.set_island(Arc::clone(&island2));
+        assert!(!run2.l3_on_island(), "标志位为假 ⇒ 判据为假（回落世代按 WG 跑）");
+        *lock_unpoison(&exec.state) = Some(Arc::clone(&run2));
+        // 停掉引擎 ⇒ WG 阶梯的动作面立即失败（**不可达于岛档的 -4**：证明走的是 WG 原路）
+        if let Some(c) = run2.current_client() {
+            c.stop();
+        }
+        let t1 = Instant::now();
+        let rc2 = exec.recover(3, "扩展下推(R3 重赛跑)");
+        let seen2 = drain_lines(&lines2);
+        println!(
+            "[s4] 回落世代 rc={rc2} elapsed={:?} lines={seen2:?}",
+            t1.elapsed()
+        );
+        assert_eq!(rc2, -4, "回落世代仍可达 -4（WG 动作面失败）⇒ 走的是 WG 原路");
+        assert_eq!(
+            seen2.iter().filter(|l| l.contains("quic: 恢复下推")).count(),
+            0,
+            "回落世代不得产岛档行"
+        );
+        assert!(
+            seen2.iter().filter(|l| l.starts_with("RECOVER ")).count() > 0,
+            "回落世代必须走 WG 阶梯（RECOVER 族行在场）：{seen2:?}"
+        );
+
+        // ④ 陈世代 ⇒ -2（既有前置；与判据无关）
+        run2.tun_shared.gen.store(99, Ordering::Release);
+        assert_eq!(exec.recover(3, "扩展下推(R3 重赛跑)"), -2, "陈世代 -2");
+
+        *lock_unpoison(&exec.state) = None;
+        run.set_l3_on_island(false);
+        run.take_island();
+        island.stop();
+        island2.stop();
+        if let Some(c) = run.current_client() {
+            c.stop();
+        }
     }
 
     /// Q-F-B F4-4：热替换 rc 回 Go 语义——活世代 ⇒ `0`（**真装表**）；无世代 / 换代
