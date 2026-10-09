@@ -2589,3 +2589,144 @@ async fn flood_keeps_bounds_and_spares_admitted_connection() {
 }
 
 
+
+// ---------------------------------------------------------------------------
+// M3 S1：服务流受理（tag 分发的最小面 —— probe 回显 / 拒码 / 行）
+// ---------------------------------------------------------------------------
+
+/// **判据（M3 §1.1/§1.2/§1.6 + §11-S1 的「复位码/未知 tag」）**：已绑定连接上
+/// ① tag ∉ {1..5} ⇒ `reset(0x21)`；② tag ∈ {1..4}（S2 接线前）⇒ `reset(0x22)`；
+/// ③ tag=5（probe）⇒ **逐字节回显**，客户端半关（FIN）⇒ 出口 `finish()`（对端读到 EOF）；
+/// ④ 三条 E-q5 行（受理/拒/结束）面齐。
+#[tokio::test]
+async fn service_stream_tag_dispatch_refusals_and_probe_echo() {
+    let (logf, rx) = sink();
+    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(0x51), 32), logf)
+        .expect("端点可起");
+    let stub = Stub::new(SECRET);
+    let (_client, conn, _sock) = client_conn(&quic).await;
+    let (pubkey, dev) = ([0x51u8; 32], [0x52u8; 8]);
+    let (_ctl_send, _ctl_recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
+
+    // ① 未知 tag ⇒ 0x21（读侧拿到 `ReadError::Reset(0x21)`；§1.6 的码表）
+    {
+        let (mut s, mut r) = conn.open_bi().await.expect("open_bi");
+        s.write_all(&[0x99]).await.expect("写未知 tag");
+        let e = r
+            .read_chunk(32, true)
+            .await
+            .expect_err("未知 tag 必须被 reset");
+        match e {
+            quinn::ReadError::Reset(code) => assert_eq!(code.into_inner(), 0x21, "复位码 = TAG_UNKNOWN"),
+            other => panic!("期望 Reset(0x21)，实得 {other:?}"),
+        }
+    }
+    // ② files（tag=1）⇒ 0x22（S2 接线前的事实：QUIC 档不提供该服务）
+    {
+        let (mut s, mut r) = conn.open_bi().await.expect("open_bi");
+        s.write_all(&[1]).await.expect("写 tag=1");
+        let e = r
+            .read_chunk(32, true)
+            .await
+            .expect_err("tag=1 在 S2 接线前必须被拒");
+        match e {
+            quinn::ReadError::Reset(code) => {
+                assert_eq!(code.into_inner(), 0x22, "复位码 = SERVICE_DISABLED")
+            }
+            other => panic!("期望 Reset(0x22)，实得 {other:?}"),
+        }
+    }
+    // ③ probe 回显：写 3B ⇒ 收 3B（逐字节）；再写 2B ⇒ 再收 2B（持久流语义）；半关 ⇒ EOF
+    {
+        let (mut s, mut r) = conn.open_bi().await.expect("open_bi");
+        s.write_all(&[5, b'a', b'b', b'c']).await.expect("写 tag+载荷");
+        let mut buf = [0u8; 3];
+        r.read_exact(&mut buf).await.expect("回显 3B");
+        assert_eq!(&buf, b"abc", "逐字节回显（§1.2 的 probe 契约）");
+        s.write_all(b"de").await.expect("同流再写");
+        let mut buf2 = [0u8; 2];
+        r.read_exact(&mut buf2).await.expect("回显 2B");
+        assert_eq!(&buf2, b"de", "同流多次往返");
+        s.finish().expect("客户端半关");
+        // 出口读到 FIN ⇒ `copy` 收 EOF ⇒ `finish()` ⇒ 我方读到 EOF（不是 reset）
+        let tail = tokio::time::timeout(WAIT, r.read_chunk(8, true))
+            .await
+            .expect("半关后应收 EOF（出口 finish）")
+            .expect("不得是错误（正常收工走 FIN，不用 reset，§1.3）");
+        assert!(tail.is_none(), "EOF ⇒ Ok(None)：{tail:?}");
+    }
+    // ④ 行面（E-q5 族；首 3 条必出，节流只压后续）
+    let lines = drain_until(&rx, "服务流结束", WAIT);
+    assert!(
+        lines.iter().any(|l| l.contains("服务流拒") && l.contains("未知 tag") && l.contains("0x21")),
+        "未知 tag 的归因行：{:?}",
+        lines.iter().filter(|l| l.contains("服务流拒")).collect::<Vec<_>>()
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("服务流拒") && l.contains("tag=files") && l.contains("0x22")),
+        "tag=1 的归因行：{:?}",
+        lines.iter().filter(|l| l.contains("服务流拒")).collect::<Vec<_>>()
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("服务流已受理（tag=probe") && l.contains("dev=")),
+        "受理行（含 dev 短指纹）：{:?}",
+        lines.iter().filter(|l| l.contains("服务流已受理")).collect::<Vec<_>>()
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("服务流结束（tag=probe") && l.contains("↑5B ↓5B")),
+        "结束行（字节数）：{:?}",
+        lines.iter().filter(|l| l.contains("服务流结束")).collect::<Vec<_>>()
+    );
+    // 出口侧计数（快照面；`serve status --json` 的 `quic` 段在 S2 接）
+    let snap = quic.snapshot();
+    assert_eq!(snap.streams_open, 1, "受理 1 条（probe）");
+    assert!(snap.stream_refused >= 2, "两条拒（0x21/0x22）：{}", snap.stream_refused);
+    assert_eq!(snap.stream_bytes, 5, "回显搬运 5B（上行 5 计一次）");
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（§1.3 的半关 + 服务流受理的卫生面）**：对端开流后**立刻半关（无 tag）**⇒
+/// 出口**静默收**（不计拒绝、不留槽、不打拒行）；随后同一连接上的 probe 流仍能受理并回显
+/// （= 受理循环没被前一条畸形流卡住）。
+///
+/// 为什么不是「读 tag 超时（0x27）到点」用例：QUIC 的流开通 = 对端**首个 STREAM 帧**
+/// （`open_bi()` 不通知对端，本用例实测确认）⇒ 1B 的 tag 不存在「部分到达」形态，0x27
+/// 臂在正常客户端下不可构造（`exit/serve.rs` 的 `handle_stream` 文档已如实登记）；
+/// **客户端侧**的 `0x27 ⇒ StreamErr::BadTag` 分类由 `crate::stream` 的单测钉住。
+#[tokio::test]
+async fn stream_closed_without_tag_is_absorbed_silently() {
+    let (logf, rx) = sink();
+    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(0x52), 32), logf)
+        .expect("端点可起");
+    let stub = Stub::new(SECRET);
+    let (_client, conn, _sock) = client_conn(&quic).await;
+    let (pubkey, dev) = ([0x51u8; 32], [0x52u8; 8]);
+    let (_ctl_send, _ctl_recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
+
+    // ① 开流即半关（0B FIN）：出口侧必须静默收（读到 `FinishedEarly(0)`）
+    {
+        let (mut s, _r) = conn.open_bi().await.expect("open_bi");
+        s.finish().expect("立即半关（不发 tag）");
+    }
+    // ② 同一连接的下一条流必须照常受理（回显 1B）——「前一条畸形流不得卡住受理循环」
+    {
+        let (mut s, mut r) = conn.open_bi().await.expect("open_bi");
+        s.write_all(&[5, 0x5A]).await.expect("写 tag + 1B");
+        let mut buf = [0u8; 1];
+        tokio::time::timeout(WAIT, r.read_exact(&mut buf))
+            .await
+            .expect("后续流必须被受理（受理循环未被前一条卡住）")
+            .expect("回显 1B");
+        assert_eq!(buf, [0x5A], "逐字节回显");
+    }
+    // ③ 无 tag 的那条**不得**计拒（静默收 ≠ 拒绝）
+    let lines = collect_for(&rx, Duration::from_millis(300));
+    assert!(
+        !lines.iter().any(|l| l.contains("服务流拒")),
+        "无 tag 的 FIN 不是拒绝形态：{lines:?}"
+    );
+    let snap = quic.snapshot();
+    assert_eq!(snap.stream_refused, 0, "不得计拒：{snap:?}");
+    assert_eq!(snap.streams_open, 1, "只有 probe 那条被受理");
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}

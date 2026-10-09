@@ -62,6 +62,7 @@ fn certified_key(seed: &Ed25519Seed) -> Result<(CertifiedKey, RpkPublicKey), Rpk
 pub(crate) fn server_config(
     seed: &Ed25519Seed,
     retry_token_lifetime: std::time::Duration,
+    streams: crate::tuning::StreamLimits,
 ) -> Result<(quinn::ServerConfig, RpkPublicKey), RpkErr> {
     let (certified, pubkey) = certified_key(seed)?;
     let rcfg = rustls::ServerConfig::builder_with_provider(provider())
@@ -74,7 +75,9 @@ pub(crate) fn server_config(
     let quic_cfg = QuicServerConfig::try_from(rcfg).map_err(RpkErr::material)?;
     let mut scfg = quinn::ServerConfig::with_crypto(Arc::new(quic_cfg));
     scfg.migration(transport::MIGRATION);
-    scfg.transport_config(transport::transport_config());
+    // M3 §1.7：流面限制与客户端**同一份组装**（`TransportConfig` 是 TP 的来源；两端
+    // 各写一份值域必然漂移）
+    scfg.transport_config(transport::transport_config_with(transport::INITIAL_MTU, streams));
     scfg.retry_token_lifetime(retry_token_lifetime);
     Ok((scfg, pubkey))
 }

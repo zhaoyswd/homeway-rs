@@ -36,6 +36,7 @@ use std::net::{SocketAddr, SocketAddrV4};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
+use std::time::Instant;
 
 use quinn::udp::{RecvMeta, Transmit};
 use quinn::{AsyncUdpSocket, UdpPoller};
@@ -135,6 +136,9 @@ impl RelayTable {
 }
 
 /// socket 读数（非原子化不必要——本 crate 的单线程结构不变量；计数在岛线程内读写）。
+///
+/// M3 §3.1-N5 增补：`send_errs*` / `last_local_send_err_at` = **本机发送面信号**（阶梯
+/// 重写的 M/R 判别输入；S4 消费）。计数点写死在 [`note_send_err`]（**唯一**入口）。
 #[derive(Default, Debug)]
 pub(crate) struct SockStats {
     /// 上行包封次数（中继路径）。
@@ -144,6 +148,79 @@ pub(crate) struct SockStats {
     /// 收包总数（含被忽略的腿帧）与发包容貌（排障读数）。
     pub(crate) rx_dgrams: u64,
     pub(crate) tx_dgrams: u64,
+    /// `try_send` 的**非 `WouldBlock`** 错误总数（N5 的第一层计数）。
+    pub(crate) send_errs: u64,
+    /// 其中命中 errno 白名单的条数（= 「M（本机发送面错误）」的证据；`rebind` 清零）。
+    pub(crate) send_errs_local: u64,
+    /// 末次**白名单**错误的时刻（新鲜度窗的源；`rebind` 清零 ⇒ `None`）。
+    pub(crate) last_local_send_err_at: Option<std::time::Instant>,
+}
+
+impl SockStats {
+    /// 换网清零（§3.1-N5：`Arc` 跨 socket 共享 ⇒ 必须显式清「上一次网络环境」的错误）。
+    ///
+    /// 清的是**白名单命中面**（M 判据的输入）；`send_errs` 总量保留（它是累计读数，
+    /// 供快照/排障；拿它做判据会跨 rebind 混两个网络环境）。
+    pub(crate) fn clear_local_send_err(&mut self) {
+        self.send_errs_local = 0;
+        self.last_local_send_err_at = None;
+    }
+
+    /// 本机发送面是否**新鲜报错**（M 判据；`now` 由调用方给——纯函数可测）。
+    pub(crate) fn local_send_err_fresh(
+        &self,
+        now: std::time::Instant,
+        window: std::time::Duration,
+    ) -> bool {
+        match self.last_local_send_err_at {
+            Some(t) => now.saturating_duration_since(t) <= window,
+            None => false,
+        }
+    }
+}
+
+/// 发送面错误的归类（§3.1-N5 的**纯分类**；计数与判别的单源）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum SendErrClass {
+    /// `WouldBlock`：quinn 契约下的**正常回执**（「发送缓冲满，回去等 poller」）——
+    /// **不算错误**（计进去会把上行拥塞误判成「本机发送面错误」，而拥塞恰好也是快探
+    /// 失败的时刻 ⇒ 会优先选 M（Rebind 对死对端无用）——正是设计门 4-1① 要消灭的误判）。
+    WouldBlock,
+    /// errno 白名单命中：`{ENETUNREACH, EHOSTUNREACH, EADDRNOTAVAIL, ENETDOWN, EINVAL}`
+    /// ⇒ 判 M（本机发送面错误；换本地 socket 可能救）。
+    Local,
+    /// 其余错误（含 `ECONNREFUSED`/`EMSGSIZE` 等）：只计数 + 节流记行，**不进 M/R 判别**。
+    Other,
+}
+
+/// 错误归类（纯函数；`WouldBlock` 与 errno 白名单的单源都在这）。
+pub(crate) fn classify_send_err(e: &std::io::Error) -> SendErrClass {
+    if e.kind() == std::io::ErrorKind::WouldBlock {
+        return SendErrClass::WouldBlock;
+    }
+    match e.raw_os_error() {
+        Some(libc::ENETUNREACH)
+        | Some(libc::EHOSTUNREACH)
+        | Some(libc::EADDRNOTAVAIL)
+        | Some(libc::ENETDOWN)
+        | Some(libc::EINVAL) => SendErrClass::Local,
+        _ => SendErrClass::Other,
+    }
+}
+
+/// 计数落点（`try_send` 的**唯一**错误入口；返回本次归类供节流记行判定）。
+pub(crate) fn note_send_err(st: &mut SockStats, e: &std::io::Error, now: std::time::Instant) -> SendErrClass {
+    let class = classify_send_err(e);
+    match class {
+        SendErrClass::WouldBlock => {} // 正常回执：零计数（N5 的负例判据就是这条）
+        SendErrClass::Local => {
+            st.send_errs += 1;
+            st.send_errs_local += 1;
+            st.last_local_send_err_at = Some(now);
+        }
+        SendErrClass::Other => st.send_errs += 1,
+    }
+    class
 }
 
 /// 岛侧抽象 socket（`quinn::AsyncUdpSocket`）：直连裸包 + 中继包封/剥壳。
@@ -218,21 +295,37 @@ impl AsyncUdpSocket for ClientSock {
             }
             return Ok(());
         }
-        match self.relays.label_of(&transmit.destination) {
-            Some(label) => {
-                let framed = wrap_uplink(label, transmit.contents);
-                self.io.try_send_to(&framed, transmit.destination).map(|_| ())?;
+        let framed = self.relays.label_of(&transmit.destination).map(|label| {
+            let mut out = Vec::with_capacity(RELAY_TAG_LEN + ENV_LEN + transmit.contents.len());
+            out.extend_from_slice(&wrap_uplink(label, transmit.contents));
+            out
+        });
+        let (payload, relayed): (&[u8], bool) = match &framed {
+            Some(f) => (f.as_slice(), true),
+            None => (transmit.contents, false),
+        };
+        match self.io.try_send_to(payload, transmit.destination) {
+            Ok(_) => {
                 let mut st = lock_unpoison(&self.stats);
-                st.relay_tx += 1;
                 st.tx_dgrams += 1;
+                if relayed {
+                    st.relay_tx += 1;
+                }
                 Ok(())
             }
-            None => {
-                self.io
-                    .try_send_to(transmit.contents, transmit.destination)
-                    .map(|_| ())?;
-                lock_unpoison(&self.stats).tx_dgrams += 1;
-                Ok(())
+            Err(e) => {
+                // §3.1-N5：**非 `WouldBlock`** 才计数；`WouldBlock` 是正常回执（零计数）
+                let (class, n) = {
+                    let mut st = lock_unpoison(&self.stats);
+                    let class = note_send_err(&mut st, &e, Instant::now());
+                    (class, st.send_errs)
+                };
+                if class != SendErrClass::WouldBlock && log_due(n) {
+                    (self.logf)(&format!(
+                        "quic: 上行发送面错误（{class:?}；{e}；第 {n} 次；计数行首 3 + 每 100）"
+                    ));
+                }
+                Err(e)
             }
         }
     }
@@ -387,5 +480,79 @@ mod tests {
         }]);
         assert_eq!(t.label_of(&SocketAddr::V4(a)), None, "旧候选已替换");
         assert_eq!(t.label_of(&SocketAddr::V4(b)), Some(lb), "现任条目必须留存");
+    }
+
+    /// **判据（§3.1-N5 的负例；S1 完成判据点名）**：上行拥塞（`WouldBlock` 高频）下
+    /// `sock_send_errs` **不增长**——`WouldBlock` 是 quinn 契约下的正常回执
+    /// （「发送缓冲满，回去等 poller」），把它计进「本机发送面错误」会在拥塞时刻
+    /// 把 M（Rebind）误选成首选动作（设计门 4-1①）。
+    #[test]
+    fn would_block_never_grows_send_errs() {
+        let mut st = SockStats::default();
+        let now = Instant::now();
+        for _ in 0..10_000 {
+            let class = note_send_err(
+                &mut st,
+                &io::Error::from(io::ErrorKind::WouldBlock),
+                now,
+            );
+            assert_eq!(class, SendErrClass::WouldBlock);
+        }
+        assert_eq!(st.send_errs, 0, "WouldBlock 绝不进任何计数");
+        assert_eq!(st.send_errs_local, 0);
+        assert!(st.last_local_send_err_at.is_none(), "不得留新鲜度位");
+        assert!(!st.local_send_err_fresh(now, std::time::Duration::from_secs(5)));
+    }
+
+    /// **判据（§3.1-N5 的正例与判别面）**：errno 白名单 ⇒ `Local`（M 判据）；
+    /// 其余 ⇒ `Other`（只计数）；新鲜度窗按「末次白名单错误」算；`rebind` 清零。
+    #[test]
+    fn local_send_err_whitelist_freshness_and_reset() {
+        let mut st = SockStats::default();
+        let t0 = Instant::now();
+        // 白名单五项全部归 Local
+        for errno in [
+            libc::ENETUNREACH,
+            libc::EHOSTUNREACH,
+            libc::EADDRNOTAVAIL,
+            libc::ENETDOWN,
+            libc::EINVAL,
+        ] {
+            assert_eq!(
+                classify_send_err(&io::Error::from_raw_os_error(errno)),
+                SendErrClass::Local,
+                "errno {errno} 必须在白名单"
+            );
+        }
+        // 非白名单 ⇒ Other（含 ECONNREFUSED / 无 errno 的 Other 类）
+        assert_eq!(
+            classify_send_err(&io::Error::from_raw_os_error(libc::ECONNREFUSED)),
+            SendErrClass::Other
+        );
+        assert_eq!(
+            classify_send_err(&io::Error::other("x")),
+            SendErrClass::Other
+        );
+
+        // 计数 + 新鲜度：t0 命中 ⇒ 5s 窗内新鲜；6s 后不新鲜
+        let class = note_send_err(&mut st, &io::Error::from_raw_os_error(libc::ENETUNREACH), t0);
+        assert_eq!(class, SendErrClass::Local);
+        assert_eq!(st.send_errs, 1);
+        assert_eq!(st.send_errs_local, 1);
+        let win = std::time::Duration::from_secs(5);
+        assert!(st.local_send_err_fresh(t0 + std::time::Duration::from_secs(4), win));
+        assert!(!st.local_send_err_fresh(t0 + std::time::Duration::from_secs(6), win));
+
+        // Other 只涨总量（不进 M 判据）
+        note_send_err(&mut st, &io::Error::from_raw_os_error(libc::ECONNREFUSED), t0);
+        assert_eq!(st.send_errs, 2);
+        assert_eq!(st.send_errs_local, 1, "Other 不进白名单计数");
+
+        // rebind 清零：白名单面归零（新鲜度位 None），总量保留（累计读数是排障面）
+        st.clear_local_send_err();
+        assert_eq!(st.send_errs_local, 0);
+        assert!(st.last_local_send_err_at.is_none());
+        assert!(!st.local_send_err_fresh(t0, win), "清零后不得再判新鲜");
+        assert_eq!(st.send_errs, 2, "总量是累计读数（不清）");
     }
 }

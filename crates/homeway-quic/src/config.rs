@@ -15,6 +15,7 @@ use std::net::SocketAddrV4;
 use std::time::Duration;
 
 use crate::rpk::RpkPublicKey;
+use crate::tuning::{ProbeTuning, StreamLimits};
 
 /// 巡检节拍缺省值（= 既有 `PATROL_INTERVAL`；判据行 C15 的 60s 刷新同源）。
 pub const DEFAULT_PATROL: Duration = Duration::from_secs(60);
@@ -137,16 +138,27 @@ pub struct IslandConfig {
     /// `[QUIC_MTU_CAP_MIN, QUIC_MTU_CAP_MAX]`（facade 侧）；本字段不再夹——测试缝
     /// （窄路径注入）需要能给出区间外的值。
     pub mtu_cap: u16,
+    /// **流面限制**（M3 §1.7 / §15-3）：并发上限、每流接收窗、连接级发送窗、每流待发队列。
+    ///
+    /// 缺省 = 设计定值（[`StreamLimits::design`]）；启动时按 `HOMEWAY_QUIC_STREAMS` /
+    /// `HOMEWAY_QUIC_STREAM_WINDOW` / `HOMEWAY_QUIC_SEND_WINDOW` /
+    /// `HOMEWAY_QUIC_STREAM_PENDING` 覆盖（env 优先，非法项按缺省 + 记行）。
+    pub streams: StreamLimits,
+    /// **快探/恢复参数**（M3 §15-2；S4 消费）：首探预算/复探倍数/待机节拍/抖动与 B 门阈值/
+    /// 发送面新鲜度窗。缺省 = 设计初值；启动时按 `HOMEWAY_QUIC_PROBE_*` 族覆盖。
+    pub probe: ProbeTuning,
 }
 
 impl IslandConfig {
-    /// 生产缺省（绑定 `0.0.0.0:0`、节拍 60s、MTU 上限 1400）。
+    /// 生产缺省（绑定 `0.0.0.0:0`、节拍 60s、MTU 上限 1400、流面与快探取设计定值）。
     pub fn new(credential: IslandCredential) -> Self {
         Self {
             credential,
             bind: None,
             patrol: DEFAULT_PATROL,
             mtu_cap: QUIC_MTU_CAP_DEFAULT,
+            streams: StreamLimits::design(),
+            probe: ProbeTuning::design(),
         }
     }
 }
@@ -184,6 +196,10 @@ mod tests {
         assert_eq!(cfg.patrol, DEFAULT_PATROL);
         assert_eq!(DEFAULT_PATROL, Duration::from_secs(60));
         assert_eq!(cfg.mtu_cap, QUIC_MTU_CAP_DEFAULT, "缺省 MTU 上限 = 1400");
+        // M3 §15-3：流面/快探缺省 = 设计定值（env 覆盖在 `Island::start` 施加）
+        assert_eq!(cfg.streams, crate::tuning::StreamLimits::design());
+        assert_eq!(cfg.probe, crate::tuning::ProbeTuning::design());
+        assert_eq!(cfg.streams.service_capacity(), 62, "N14：64 − 2");
         assert_eq!(QUIC_MTU_CAP_DEFAULT, 1400);
         assert_eq!(QUIC_MTU_CAP_MIN, 1320, "有效区间下限 = 出口 min_mtu 同值");
         // 区间自洽（编译期断言——常量关系不允许漂移）

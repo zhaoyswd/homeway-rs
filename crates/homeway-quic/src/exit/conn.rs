@@ -139,8 +139,15 @@ pub(crate) async fn control(conn: Connection, conn_id: u64, ctx: Arc<FaceCtx>) {
     let Some((send, mut recv)) = streams else { return }; // `Bound` 必有流；防御位
     // 发送半边保持打开（不写、不 reset）：提前 drop 会给对端发 RESET_STREAM（无谓噪声）。
     let _keepalive_send = send;
-    // 阶段 ②：已绑定连接的刷新循环（**无期限**——空闲是常态，最长等 max_idle_timeout）。
-    refresh_loop(&conn, conn_id, &ctx, &mut recv).await;
+    // 阶段 ②：已绑定连接的刷新循环（**无期限**——空闲是常态，最长等 max_idle_timeout）
+    // **+ M3 §2.1 的服务流受理循环**（同任务 `join!`，不新增任务/线程）。
+    //
+    // 为什么受理必须**在准入之后**才起：`hr-reg4` 把**首条 bidi 流**固定为控制流，
+    // 准入的 `accept_bi` 与受理循环的 `accept_bi` 并发 = 两条消费者抢同一条流
+    // （受理赢了就把控制流吃掉 ⇒ 准入永久卡住）。`join!` 的形态同时保证：连接结束
+    // （刷新循环 `read_head` 出错返回）时受理循环随 accept 失败退出，两个都收。
+    let serve = super::serve::serve_streams(conn.clone(), conn_id, Arc::clone(&ctx));
+    tokio::join!(refresh_loop(&conn, conn_id, &ctx, &mut recv), serve);
 }
 
 /// 准入阶段的期限包装（设计 §1.3 的 `ADMIT_DEADLINE`）：**包住「等首帧（`accept_bi`）+

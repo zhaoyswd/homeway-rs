@@ -34,14 +34,17 @@ use tokio::sync::mpsc::{self as tmpsc, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinSet;
 
 use crate::client::dataplane::{self, DropNote};
+use crate::client::streams::{self, StreamStats, Streams};
 use crate::client::{self, Face, Live, MigrationEvent, Watch};
 use crate::cmd::{
     Candidate, Cmd, DropReason, IslandErr, IslandEvent, IslandSnapshot, Logf, OnEvent, OnUnhealthy,
     RaceOutcome, Via,
 };
 use crate::config::IslandConfig;
+use crate::stream::{StreamErr, OPEN_BUDGET};
 use crate::sync_util::{lock_unpoison, log_spawn_failed, ExitSignal};
 use crate::tun::{self, ReturnPath, TunCounters};
+use crate::tuning::{apply_probe_env, apply_stream_env, ProbeTuning, StreamLimits};
 
 /// 驱动线程名（镜像 `homeway-wg`）。
 pub(crate) const ISLAND_THREAD: &str = "homeway-quic";
@@ -94,6 +97,9 @@ struct IslandCtx {
     on_event: Arc<Mutex<Option<OnEvent>>>,
     /// TUN 面的共享计数（读线程/写线程两写、同步面读——`wgcore::TunCounters` 语义）。
     counters: Arc<TunCounters>,
+    /// **服务流面计数**（M3 S1：写者/读任务在岛线程外加，快照装配读；同一枚 `Arc`
+    /// 同时交给 `Streams` 与 `Island`）。
+    stream_stats: Arc<StreamStats>,
 }
 
 impl IslandCtx {
@@ -119,6 +125,11 @@ pub struct Island {
     counters: Arc<TunCounters>,
     logf: Logf,
     on_unhealthy: OnUnhealthy,
+    /// **已解决的流面限制**（env 覆盖后的生效值；判据/标定读数面——S8 门槛与 S7 登记条
+    /// 都读它，避免「配置里写的」与「运行时用的」两套值）。
+    streams: StreamLimits,
+    /// **已解决的快探参数**（同上；S4 消费）。
+    probe: ProbeTuning,
 }
 
 impl Island {
@@ -140,9 +151,36 @@ impl Island {
     fn start_inner(
         logf: Logf,
         on_unhealthy: OnUnhealthy,
-        cfg: IslandConfig,
+        mut cfg: IslandConfig,
         seam: u8,
     ) -> std::io::Result<Island> {
+        // ---- M3 §15-2/§15-3：流面与快探参数的 env 消融臂（照 `HOMEWAY_QUIC_MTU` 先例：
+        // env 优先 → 显式配置 → 设计缺省；非法/越界 ⇒ 不改该项 + 记行）----
+        let n_streams = apply_stream_env(&mut cfg.streams, &logf);
+        let n_probe = apply_probe_env(&mut cfg.probe, &logf);
+        let lim = cfg.streams;
+        (*logf)(&format!(
+            "quic: 流面参数（bidi={} uni={} recv_window={}B send_window={}B 待发={}B；有效服务流 {}；env 覆盖 {n_streams} 项）",
+            lim.max_bidi,
+            lim.max_uni,
+            lim.recv_window,
+            lim.send_window,
+            lim.pending_bytes,
+            lim.service_capacity()
+        ));
+        let pt = cfg.probe;
+        (*logf)(&format!(
+            "quic: 快探参数（首探 {:?}，复探 ×{}，待机 {:?}，抖动阈值 {}，B 门 连续 {}/窗 {:?}，发送面新鲜度窗 {:?}；env 覆盖 {n_probe} 项）",
+            pt.fast_budget,
+            pt.reprobe_factor,
+            pt.idle_interval,
+            pt.jitter_streak,
+            pt.reconnect_streak,
+            pt.rebuild_window,
+            pt.send_err_fresh
+        ));
+        let resolved_streams = cfg.streams;
+        let resolved_probe = cfg.probe;
         // runtime 在**起线程前**建：建不出来就别起（失败即报错，不留"起了但死的岛"）。
         // `current_thread` = 单线程结构不变量（`rt-multi-thread` feature 不启用）；
         // `enable_all()` 开时间驱动，IO 驱动由异步栈的 runtime 后端 feature 统一带入。
@@ -155,6 +193,7 @@ impl Island {
         let stop = Arc::new(AtomicBool::new(false));
         let exit = Arc::new(ExitSignal::new());
         let counters = TunCounters::new();
+        let stream_stats = Arc::new(StreamStats::default());
         let patrol = cfg.patrol;
 
         let ctx = IslandCtx {
@@ -165,6 +204,7 @@ impl Island {
             on_unhealthy: Mutex::new(Arc::clone(&on_unhealthy)),
             on_event: Arc::new(Mutex::new(None)),
             counters: Arc::clone(&counters),
+            stream_stats: Arc::clone(&stream_stats),
         };
         let tier_tx = IslandTx(tx.clone()); // 岛线程侧的命令口（TUN 线程也各持一份）
         let handle = thread::Builder::new()
@@ -195,6 +235,8 @@ impl Island {
             counters,
             logf,
             on_unhealthy,
+            streams: resolved_streams,
+            probe: resolved_probe,
         })
     }
 
@@ -246,6 +288,16 @@ impl Island {
                 .write_bytes
                 .load(std::sync::atomic::Ordering::Relaxed),
         )
+    }
+
+    /// **生效的流面限制**（env 覆盖后；M3 §15-3 的标定读数面）。
+    pub fn stream_limits(&self) -> StreamLimits {
+        self.streams
+    }
+
+    /// **生效的快探参数**（env 覆盖后；M3 §15-2，S4 消费）。
+    pub fn probe_tuning(&self) -> ProbeTuning {
+        self.probe
     }
 
     /// 岛线程是否已退出（`ExitSignal` 置位面；收工后判定与 M1 排障用）。
@@ -391,6 +443,9 @@ enum Job {
     /// 回程泵（常驻任务：DATAGRAM → 有界队列 → TUN 写线程；`Ok(())` = 连接结束/收工）。
     /// 参数 = 该泵所属连接的 `stable_id()`（复位防重位时按身份比对，见 `pump_conn`）。
     Return(usize),
+    /// 服务流任务结束（写者任务 / 读任务；**记账已在任务内落**——见
+    /// `client::streams::{writer_task,read_task}`，本变体只让 `JoinSet` 的收割口有名字）。
+    StreamDone,
 }
 
 /// TUN 面（数据面的 fd 侧；`TunAttach` 时装配，随岛收工/连接结束而弃）。
@@ -431,6 +486,10 @@ struct DriverState {
     pump_conn: Option<usize>,
     /// 「窄路径不可用」行的去重位（记的是当时观测到的 `mds`）。
     narrow_logged: Option<u32>,
+    /// **服务流注册表**（M3 S1；`Arc` 因为写者/读任务各持一份）。
+    streams: Arc<Streams>,
+    /// 已解决的快探参数（读快照/发送面新鲜度窗用；S4 的阶梯消费同一份）。
+    probe: ProbeTuning,
 }
 
 /// 驱动循环：命令 / 长任务回口 / 巡检拍**三源** `select!`（M1 设计 §2.1 的驱动循环形态）。
@@ -448,6 +507,9 @@ fn run_driver(
     ready_tx: mpsc::Sender<io::Result<()>>,
     seam: u8,
 ) {
+    // 流面限制/快探参数要在 `cfg` 被 `Face::open` 吃掉之前取出（`Streams` 与快照面共用）
+    let stream_limits = cfg.streams;
+    let probe_tuning = cfg.probe;
     rt.block_on(async move {
         let mut face = match Face::open(cfg, Arc::clone(&ctx.logf)) {
             Ok(f) => f,
@@ -471,6 +533,13 @@ fn run_driver(
             tun: None,
             pump_conn: None,
             narrow_logged: None,
+            streams: Arc::new(Streams::new(
+                stream_limits,
+                Arc::clone(&ctx.stream_stats),
+                Arc::clone(&ctx.logf),
+                Arc::clone(&ctx.on_event),
+            )),
+            probe: probe_tuning,
         };
         let mut jobs: JoinSet<Job> = JoinSet::new();
         loop {
@@ -511,6 +580,10 @@ fn run_driver(
                                 st.pump_conn = None;
                             }
                         }
+                        // 服务流任务结束：槽侧记账已在任务内落（`writer_finished` /
+                        // 读任务回执），这里无需动作——变体存在的意义是让 abort/panic
+                        // 与正常结束在同一处可见（排障时 `JoinSet` 的收割口有名字）。
+                        Ok(Job::StreamDone) => {}
                         // 任务被 abort（收工路径）：其回执口随之 drop ⇒ 调用侧归 EngineGone
                         Err(_aborted) => {}
                     }
@@ -565,6 +638,14 @@ fn adopt(
     }
     let adopted = Live::new(est, patrol);
     if let Some(old) = st.live.replace(adopted) {
+        // 换连接 = 旧连接上的**服务流全部作废**（读回 EOF/写快速失败，§1.6 的 EOF 同形性）；
+        // 不清就会留下「挂在死连接上的在册流」——`files` 那一侧会一直等不到回显。
+        let n = st.streams.clear_on_connection_loss();
+        if n > 0 {
+            (*ctx.logf)(&format!(
+                "quic: 换连接 —— 旧连接上的 {n} 条服务流按 EOF 收（调用方按需重开）"
+            ));
+        }
         old.conn.close(quinn::VarInt::from_u32(0), b"replaced by newer race");
         if !st.na_logged {
             (*ctx.logf)("quic: 替换旧连接（旧连接已 CONNECTION_CLOSE）");
@@ -620,6 +701,12 @@ async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx, seam: 
     // ① 连接死（对端关闭/空闲回收）：清面 + 记行 + **归 `patrol` 分类**（S2-6 判据）
     if st.live.as_ref().is_some_and(|l| !l.alive()) {
         (*ctx.logf)("quic: 连接已断 —— 等上层重连/重赛跑（阶梯接线 = 世代层）");
+        // M3：在册服务流一并作废（读回 EOF / 写快速失败；§1.6 的 EOF 同形性——
+        // 与今天 `stackb` 在连接死时的表现一致，调用方按需重开）
+        let n = st.streams.clear_on_connection_loss();
+        if n > 0 {
+            (*ctx.logf)(&format!("quic: 连接断 —— {n} 条在册服务流按 EOF 收"));
+        }
         st.live = None;
         st.watch = None;
         // 连接死 ⇒ 其回程泵随 `read_datagram` 出错自退（`Job::Return` 按身份复位）；
@@ -700,6 +787,20 @@ async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx, seam: 
         let (relay_tx, rx_ignored, _rx_dgrams, _tx_dgrams) = face.sock_stats();
         s.relay_tx = relay_tx;
         s.rx_ignored = rx_ignored;
+        // M3 S1：服务流面计数（`quic` 段的岛侧子集，§8.2-12）
+        let sc = st.streams.counters();
+        s.streams_open = sc.open;
+        s.streams_active = st.streams.active() as u64;
+        s.streams_refused = sc.refused;
+        s.stream_bytes_out = sc.bytes_out;
+        s.stream_bytes_in = sc.bytes_in;
+        s.stream_backpressure_events = sc.backpressure;
+        // M3 S1 / §3.1-N5：本机发送面信号（M/R 判别的输入；新鲜度按已解决的快探窗现算）
+        let ev = face.send_err_view(st.probe.send_err_fresh);
+        s.sock_send_errs = ev.total;
+        s.sock_send_errs_local = ev.local;
+        s.sock_send_err_age_ms = ev.age.map(|d| d.as_millis() as u64);
+        s.sock_send_err_local_fresh = ev.fresh;
     }
     // ⑤ 「窄路径不可用」判据（mds 变小/连接换过都要重判；S2-4）
     check_narrow_path(st, ctx);
@@ -887,12 +988,79 @@ async fn handle_cmd(
             }
             Some(live) => {
                 let conn = live.conn.clone();
+                let probe = Arc::clone(live.probe_slot());
                 jobs.spawn(async move {
-                    let result = client::probe(&conn, budget).await;
+                    let result = client::probe(&conn, &probe, budget).await;
                     Job::Probe { reply, result }
                 });
             }
         },
+        // ---------- M3 S1：服务流族（设计 §1.4/§1.5/§1.6/§1.7） ----------
+        //
+        // **命令循环零写等待**（本切片的可判定事实，隔离门第 ⑩ 条同款断言）：
+        // 下面五条臂里唯一的 await 是 `StreamOpen` 的 `open_bi`（受 OPEN_BUDGET 有界、
+        // 且自记账通过后不阻塞）；`StreamWrite` 走同步的 `Streams::write`（非阻塞接纳），
+        // 真正的 `write_all().await` 全在写者任务里。
+        Cmd::StreamOpen { tag, reply } => {
+            let Some(live) = st.live.as_ref() else {
+                st.streams.note_refused(tag, StreamErr::ConnectionLost);
+                let _ = reply.send(Err(StreamErr::ConnectionLost));
+                return;
+            };
+            // 自记账配额（§1.6：额度耗尽 = 快速失败，不等 open_bi 阻塞/超时）
+            if !st.streams.has_capacity() {
+                st.streams.note_refused(tag, StreamErr::Busy);
+                let _ = reply.send(Err(StreamErr::Busy));
+                return;
+            }
+            match tokio::time::timeout(OPEN_BUDGET, live.conn.open_bi()).await {
+                Ok(Ok((send, recv))) => {
+                    let slot = st.streams.register(tag, recv);
+                    let id = slot.id();
+                    let streams = Arc::clone(&st.streams);
+                    jobs.spawn(async move {
+                        streams::writer_task(send, slot, streams).await;
+                        Job::StreamDone
+                    });
+                    let _ = reply.send(Ok(id));
+                }
+                Ok(Err(_)) => {
+                    // 连接在开流途中死掉（对端 CONNECTION_CLOSE / 本地关闭）
+                    st.streams.note_refused(tag, StreamErr::ConnectionLost);
+                    let _ = reply.send(Err(StreamErr::ConnectionLost));
+                }
+                Err(_) => {
+                    // 对端 TP 与自记账不一致（错配）⇒ 快速失败而非挂死命令循环
+                    st.streams.note_refused(tag, StreamErr::Busy);
+                    let _ = reply.send(Err(StreamErr::Busy));
+                }
+            }
+        }
+        Cmd::StreamWrite { id, data, reply } => {
+            // **同步**：非阻塞接纳（`n` 由待发队列余量给出）⇒ 绝不 await 到写满
+            let r = st.streams.write(id, data);
+            let _ = reply.send(r);
+        }
+        Cmd::StreamRead { id, reply } => match st.streams.slot_of(id) {
+            Some(slot) => {
+                let streams = Arc::clone(&st.streams);
+                jobs.spawn(async move {
+                    streams::read_task(slot, reply, streams).await;
+                    Job::StreamDone
+                });
+            }
+            None => {
+                let _ = reply.send(Err(StreamErr::Closed));
+            }
+        },
+        Cmd::StreamShutdown { id, reply } => {
+            let r = st.streams.shutdown(id).map(|_tag| ());
+            let _ = reply.send(r);
+        }
+        Cmd::StreamClose { id, reply } => {
+            let r = st.streams.close(id).map(|_slot| ());
+            let _ = reply.send(r);
+        }
     }
 }
 

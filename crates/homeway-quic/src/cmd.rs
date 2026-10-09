@@ -8,6 +8,8 @@ use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::stream::{StreamErr, StreamId, StreamTag, StreamWriteOut};
+
 /// 同步面 → 岛。
 ///
 /// **M0 三条成员**（骨架真落地、真被测）+ **M1 S2a 增补**（逐条照设计 §2.1 表，
@@ -77,6 +79,55 @@ pub enum Cmd {
     /// fd 死了若只记行、不分类，App 侧就没有任何重建信号（等价面在 WG 档由 `wgcore`
     /// 提供）⇒「功能等价全局代理」不成立。
     TunFdDead { msg: String },
+
+    // ---------- M3 S1：服务流族（STREAM tag；设计 §1.4/§1.5/§1.6） ----------
+    /// 开一条服务流（§1.1：一条 bidi 流 = 一个服务会话）。
+    ///
+    /// **首字节 tag 由岛写**（不交给调用方）——tag 常量是 [`StreamTag`] 的单源，调用侧
+    /// 拼字节就等于开了第二个真相面（协议面错位是静默的）。
+    ///
+    /// **带 reply**：开流是调用方要等的结论；失败必须可归因（额度耗尽/未建连/对端错配）。
+    /// 岛侧**先查自记账容量**再 `open_bi`（§1.6：额度耗尽 = 快速失败，不等 5s 超时）。
+    StreamOpen {
+        tag: StreamTag,
+        reply: StreamReply<StreamId>,
+    },
+    /// 服务流写（§1.4：`n` 由**非阻塞**判定给出——有界待发队列余量；**命令循环绝不
+    /// `await` 到写满**）。
+    ///
+    /// **带 reply**：回执本身就是背压信号（[`StreamWriteOut`] 与 `wgcore::WriteOut`
+    /// 逐字段同形；`n=0` 走仓内既有的 Ok(0) 分级退避环，**不得**按 `io::Write` 的
+    /// 「`Ok(0)` = 通道关」处理）。
+    StreamWrite {
+        id: StreamId,
+        data: Vec<u8>,
+        reply: StreamReply<StreamWriteOut>,
+    },
+    /// 服务流读（§1.5：**无限期挂起**——files 空闲 5min、term 腿可挂数小时，**不得**套
+    /// `QUIC_RPC_BUDGET`；取消只经 [`Cmd::StreamClose`]）。
+    ///
+    /// **带 reply**：每次读返回一块给本条命令的回执（**按需拉取**：岛侧不主动排空
+    /// `RecvStream` 进无界通道，§1.4-①）。对端 FIN ⇒ `Err(StreamErr::Closed)`（= 今天的
+    /// EOF 语义）。
+    StreamRead {
+        id: StreamId,
+        reply: StreamReply<Vec<u8>>,
+    },
+    /// 半关写半边（FIN；对端仍可发——与 `wgcore::Cmd::Shutdown` 同义，§1.3/§1.5）。
+    ///
+    /// **带 reply**：入队即回执（FIN 的实际发出在写者任务里，与 `wgcore` 的
+    /// 「`sock.close()` 后即答」同形；有界变体由调用方在回执等待上夹）。
+    StreamShutdown {
+        id: StreamId,
+        reply: StreamReply<()>,
+    },
+    /// 关流/复位（abort；**同时取消在途读**——§1.5 的取消面），并从在册表摘除。
+    ///
+    /// **带 reply**：与 `wgcore::Cmd::Close` 同形（摘表 + 复位即答）。
+    StreamClose {
+        id: StreamId,
+        reply: StreamReply<()>,
+    },
 }
 
 /// 岛 → 同步面的单次回执口（每命令一条）。
@@ -85,6 +136,12 @@ pub enum Cmd {
 /// ——岛线程 panic 时栈上的 reply sender 被 drop ⇒ `RecvError` ⇒ 立刻归错；**禁止 `unwrap()`**
 /// （否则一次岛死会把同步面挂死）。
 pub type IslandReply<T> = Sender<Result<T, IslandErr>>;
+
+/// **服务流**命令的回执口（M3 §1.6：流面错误是 typed [`StreamErr`]，不挤进 [`IslandErr`]）。
+///
+/// 「岛已收工」不在此枚举里：岛退出/任务被 abort 时 reply sender 随栈 drop ⇒ 调用方
+/// `rx.recv()` 得 `RecvError` ⇒ 与 [`IslandReply`] 同一条纪律归 `EngineGone`。
+pub type StreamReply<T> = Sender<Result<T, StreamErr>>;
 
 /// 岛侧错误（**不得**携带非 std 载荷；`source()` **不得**返回异步栈错误——本枚举即封印面）。
 #[derive(Debug, thiserror::Error)]
@@ -258,6 +315,10 @@ impl Drops {
 pub enum IslandEvent {
     /// 丢弃计数变化（`n` = 本次增量；累计值见 [`IslandSnapshot::drops`]）。
     DatagramDropped { reason: DropReason, n: u64 },
+    /// 服务流已开（M3 §8.2-11 的 C19 族输入；`tag` = 服务类别）。
+    StreamOpened { tag: StreamTag },
+    /// 服务流已关（FIN/复位/本端 `close`；同上）。
+    StreamClosed { tag: StreamTag },
 }
 
 /// 事件回调（**岛线程内**执行；只允许内存操作/通道投递——同 [`OnUnhealthy`] 纪律）。
@@ -317,6 +378,33 @@ pub struct IslandSnapshot {
     /// （`exit::transport::DATAGRAM_BUFFER` = 1 MiB）。瞬时量（不是累计计数）——
     /// TUN 上行的每包路径与巡检拍都会刷新它。
     pub send_buffer_used: u64,
+
+    // ---------- M3 S1：服务流面（设计 §8.2-12 的 `quic` 段子集；出口侧计数在 S2 落） ----------
+    /// 累计**开流成功**条数。
+    pub streams_open: u64,
+    /// **当前在册**服务流条数（瞬时量；关流/连接死即减）。
+    pub streams_active: u64,
+    /// 岛内**拒开**计数（额度耗尽/未建连/对端错配超时——`StreamErr::{Busy,ConnectionLost}`）。
+    pub streams_refused: u64,
+    /// 经 QUIC 流**发出**的应用字节（写者任务成功写出的量）。
+    pub stream_bytes_out: u64,
+    /// 从 QUIC 流**读回**的应用字节（读任务交付的量）。
+    pub stream_bytes_in: u64,
+    /// 背压事件计数（`StreamWriteOut{n:0}` 回执次数；§1.4 的 Ok(0) 面）。
+    pub stream_backpressure_events: u64,
+    /// `try_send` 的**非 `WouldBlock`** 错误计数（§3.1-N5；本机发送面信号）。
+    pub sock_send_errs: u64,
+    /// 其中命中 **errno 白名单**的计数（`{ENETUNREACH,EHOSTUNREACH,EADDRNOTAVAIL,
+    /// ENETDOWN,EINVAL}` ⇒ M/R 判别里的「M（本机发送面错误）」证据；`rebind` 清零）。
+    pub sock_send_errs_local: u64,
+    /// **新鲜的**白名单命中（落在 `ProbeTuning::send_err_fresh` 窗内）⇒ **M（Rebind）**
+    /// 动作的判据位（§3.1 的 M/R 判别：本机发送面报错 ⇒ M；无错 ⇒ R）。
+    pub sock_send_err_local_fresh: bool,
+    /// 末次**白名单**错误距本快照的毫秒数（`None` = 无/已随 rebind 清零）。
+    ///
+    /// 新鲜度窗由消费侧（S4）按 `ProbeTuning::send_err_fresh` 判——本字段只出「多久以前」，
+    /// 不让快照面替阶梯做判定。
+    pub sock_send_err_age_ms: Option<u64>,
 }
 
 /// 日志落点（与同步面同形：`Arc<dyn Fn(&str) + Send + Sync>`；域前缀由调用方自带）。

@@ -72,7 +72,7 @@ mod tests;
 
 pub use cmd::{
     Candidate, Cmd, DropReason, Drops, IslandErr, IslandEvent, IslandReply, IslandSnapshot, Logf,
-    OnEvent, OnUnhealthy, RaceOutcome, Via,
+    OnEvent, OnUnhealthy, RaceOutcome, StreamReply, Via,
 };
 pub use config::{
     IslandConfig, IslandCredential, TokenSecret, DEFAULT_PATROL, QUIC_MTU_CAP_DEFAULT,

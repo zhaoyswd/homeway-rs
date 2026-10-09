@@ -1985,3 +1985,357 @@ async fn detach_keeps_old_generation_observable() {
     );
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
+
+// ---------------------------------------------------------------------------
+// M3 S1：服务流族（岛侧 API 判据：半关 / 背压 / 配额 / 取消 / 错误面）
+// ---------------------------------------------------------------------------
+
+/// 服务流命令的投递 + 有界回执（形态同 [`send_wait`]，但回执口是 `StreamReply`）。
+async fn stream_wait<T>(
+    island: &Island,
+    stub: &Stub,
+    quic: &ExitQuic,
+    make: impl FnOnce(crate::cmd::StreamReply<T>) -> Cmd,
+    wait: Duration,
+) -> Result<T, crate::stream::StreamErr> {
+    let (tx, rx) = channel();
+    island.tx().send(make(tx)).expect("命令投递（unbounded）");
+    let deadline = Instant::now() + wait;
+    loop {
+        stub.pump(quic);
+        match rx.try_recv() {
+            Ok(v) => return v,
+            Err(TryRecvError::Disconnected) => panic!("岛已收工（回执口断开）"),
+            Err(TryRecvError::Empty) => {}
+        }
+        assert!(Instant::now() < deadline, "服务流命令回执超时（岛未应答 ⇒ 挂死）");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
+/// **判据（§1.2/§1.3/§1.4 的主干）**：岛侧流面 API 全链——`StreamOpen`（tag 由岛写）⇒
+/// `StreamWrite`（有界回执 + 非阻塞接纳）⇒ `StreamRead`（**按需拉取**，回显逐字节相同）
+/// ⇒ 同流多次往返 ⇒ `StreamShutdown`（半关 = FIN；对端收工 ⇒ 读回 EOF）⇒ `StreamClose`。
+/// 快照计数（open/active/bytes）与事件回调同批断言。
+#[tokio::test]
+async fn stream_open_write_read_echo_half_close_and_close() {
+    let quic = exit_face(0x31);
+    let stub = Stub::new();
+    let (logf, logs) = sink();
+    let island = island_with_log(Duration::from_secs(60), quic.rpk_public_key(), Arc::clone(&logf));
+    let (ev_tx, ev_rx) = channel();
+    island
+        .tx()
+        .send(Cmd::SetOnEvent {
+            h: Arc::new(move |e: IslandEvent| {
+                let _ = ev_tx.send(e);
+            }),
+        })
+        .expect("装事件回调");
+    let _ = connect_direct(&island, &stub, &quic).await;
+
+    // ① 开流（tag=probe：唯一被出口受理的类别）
+    let id = stream_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::StreamOpen {
+            tag: crate::StreamTag::Probe,
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .expect("已登记连接必须能开流");
+    assert_eq!(
+        ev_rx.recv_timeout(WAIT).expect("开流事件"),
+        IslandEvent::StreamOpened {
+            tag: crate::StreamTag::Probe
+        }
+    );
+
+    // ② 写 ⇒ 回显逐字节相同（非阻塞接纳：5B 全额入队）
+    let out = stream_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::StreamWrite {
+            id,
+            data: b"hello".to_vec(),
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .expect("写回执");
+    assert_eq!(out.n, 5, "全额接纳");
+    assert!(out.back.is_none(), "全额接纳不回带");
+    let got = stream_wait(&island, &stub, &quic, |reply| Cmd::StreamRead { id, reply }, WAIT)
+        .await
+        .expect("读回显");
+    assert_eq!(got, b"hello", "出口逐字节回显（§1.2 的 probe 契约）");
+
+    // ③ 同流再往返（持久流语义：不每拍开新流）
+    let _ = stream_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::StreamWrite {
+            id,
+            data: b"again".to_vec(),
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .expect("二次写");
+    let got2 = stream_wait(&island, &stub, &quic, |reply| Cmd::StreamRead { id, reply }, WAIT)
+        .await
+        .expect("二次读");
+    assert_eq!(got2, b"again");
+
+    // ④ 半关（FIN）：出口读到 EOF ⇒ `finish()` ⇒ 我方读回 EOF（`Closed` = 今天的 EOF 语义）
+    stream_wait(&island, &stub, &quic, |reply| Cmd::StreamShutdown { id, reply }, WAIT)
+        .await
+        .expect("半关入队即答");
+    let eof = stream_wait(&island, &stub, &quic, |reply| Cmd::StreamRead { id, reply }, WAIT)
+        .await;
+    assert_eq!(eof, Err(crate::stream::StreamErr::Closed), "对端 FIN ⇒ 读回 EOF");
+
+    // ⑤ 关流（复位 + 摘表）：重复关 ⇒ `Closed`（未知/已关 id）
+    stream_wait(&island, &stub, &quic, |reply| Cmd::StreamClose { id, reply }, WAIT)
+        .await
+        .expect("关流即答");
+    let again = stream_wait(&island, &stub, &quic, |reply| Cmd::StreamClose { id, reply }, WAIT)
+        .await;
+    assert_eq!(again, Err(crate::stream::StreamErr::Closed), "重入关流必须快速失败");
+    let w = stream_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::StreamWrite {
+            id,
+            data: vec![1],
+            reply,
+        },
+        WAIT,
+    )
+    .await;
+    assert_eq!(w, Err(crate::stream::StreamErr::Closed), "关流后写必须失败");
+
+    // ⑥ 快照计数（在册归零、字节数累计）——轮询到点上界（housekeeping 拍）
+    let deadline = Instant::now() + WAIT;
+    while island.snapshot().streams_active != 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let snap = island.snapshot();
+    assert_eq!(snap.streams_open, 1, "{snap:?}");
+    assert_eq!(snap.streams_active, 0, "关流后在册必须归零：{snap:?}");
+    assert!(snap.stream_bytes_out >= 10, "↑ 累计 ≥ 10B：{snap:?}");
+    assert!(snap.stream_bytes_in >= 10, "↓ 累计 ≥ 10B：{snap:?}");
+    assert_eq!(
+        ev_rx.recv_timeout(WAIT).expect("关流事件"),
+        IslandEvent::StreamClosed {
+            tag: crate::StreamTag::Probe
+        }
+    );
+    // ⑦ 行面（C19 族的开/关行；首 3 条必出）
+    let lines = logs_until(&logs, "服务流已关", WAIT).await;
+    assert!(
+        lines.iter().any(|l| l.contains("quic: 服务流已开（tag=probe")),
+        "开流行：{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("quic: 服务流已关（id=1 tag=probe，↑10B ↓10B")),
+        "关流行（含字节数）：{lines:?}"
+    );
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（§1.5 的取消面）**：`StreamRead` **无限期挂起**（无预算——本用例 300ms 内必须
+/// 无回执）；**取消只经 `Cmd::StreamClose`**：关闭后挂起的读立即回 `Closed`，
+/// 且关流后的再次读/写快速失败。
+#[tokio::test]
+async fn stream_read_hangs_until_close_cancels_it() {
+    let quic = exit_face(0x32);
+    let stub = Stub::new();
+    let island = island_with(Duration::from_secs(60), quic.rpk_public_key());
+    let _ = connect_direct(&island, &stub, &quic).await;
+    let id = stream_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::StreamOpen {
+            tag: crate::StreamTag::Probe,
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .expect("开流");
+
+    // ① 不发数据 ⇒ 读挂起（**不得**有任何回执，也不得被预算打断）
+    let (tx, rx) = channel();
+    island
+        .tx()
+        .send(Cmd::StreamRead { id, reply: tx })
+        .expect("投读命令");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert!(
+        matches!(rx.try_recv(), Err(TryRecvError::Empty)),
+        "读必须无限期挂起（无预算，§1.5）"
+    );
+
+    // ② 关流 ⇒ 在途读被取消（回 `Closed`）
+    stream_wait(&island, &stub, &quic, |reply| Cmd::StreamClose { id, reply }, WAIT)
+        .await
+        .expect("关流即答");
+    let cancelled = rx.recv_timeout(WAIT).expect("取消必须唤醒在途读");
+    assert_eq!(
+        cancelled,
+        Err(crate::stream::StreamErr::Closed),
+        "取消 ⇒ Closed（EOF 同面）"
+    );
+
+    // ③ 关闭后的读：未知 id ⇒ 立即 `Closed`（不等、不挂）
+    let after = stream_wait(&island, &stub, &quic, |reply| Cmd::StreamRead { id, reply }, WAIT)
+        .await;
+    assert_eq!(after, Err(crate::stream::StreamErr::Closed));
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（§1.6/§1.7 的配额快速失败）**：自记账容量 = `max_bidi − 2`（N14：控制流 +
+/// probe 各占 1）；额度耗尽 ⇒ **快速失败** `Busy`（不等 `open_bi` 阻塞/5s 超时），
+/// 且失败行附「本机在册 n/cap」。
+#[tokio::test]
+async fn stream_quota_exhausts_and_fails_fast_with_busy() {
+    let quic = exit_face(0x33);
+    let stub = Stub::new();
+    let (logf, logs) = sink();
+    // 测试缝：把上限压到 4 ⇒ 有效服务容量 2（小配置跑出同一判定）
+    let mut cfg = island_cfg(Duration::from_secs(60), quic.rpk_public_key());
+    cfg.streams.max_bidi = 4;
+    let island = crate::Island::start(logf, Arc::new(|_r: &str| {}), cfg).expect("岛可起");
+    let _ = connect_direct(&island, &stub, &quic).await;
+
+    let open = |reply| Cmd::StreamOpen {
+        tag: crate::StreamTag::Probe,
+        reply,
+    };
+    let _a = stream_wait(&island, &stub, &quic, open, WAIT).await.expect("第 1 条");
+    let _b = stream_wait(&island, &stub, &quic, open, WAIT).await.expect("第 2 条");
+    let t0 = Instant::now();
+    let third = stream_wait(&island, &stub, &quic, open, WAIT).await;
+    assert_eq!(
+        third,
+        Err(crate::stream::StreamErr::Busy),
+        "额度耗尽必须快速失败（不是 5s 超时）"
+    );
+    assert!(
+        t0.elapsed() < Duration::from_secs(1),
+        "快速失败的时延上界（实测 {:?}）",
+        t0.elapsed()
+    );
+    let lines = logs_until(&logs, "服务流失败", WAIT).await;
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("服务流失败（tag=probe；入口队列满；本机在册 2/2")),
+        "失败行必须附在册读数：{lines:?}"
+    );
+    // 关一条 ⇒ 立即腾出额度（重新可开）
+    let id = stream_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::StreamOpen {
+            tag: crate::StreamTag::Probe,
+            reply,
+        },
+        WAIT,
+    )
+    .await;
+    assert_eq!(id, Err(crate::stream::StreamErr::Busy), "在册未减时仍拒");
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（§1.4 背压：`n=0` + 原 Vec 带回）**：对端读取停滞（回显被我们的接收窗卡住）
+/// ⇒ 待发队列填满 ⇒ `StreamWrite` 回 `n=0` 且 `back` 携带原载荷（调用方走 Ok(0) 退避环）；
+/// 快照 `stream_backpressure_events` 与「服务流背压」行同批可见。
+#[tokio::test]
+async fn stream_write_reports_backpressure_with_original_buffer() {
+    let quic = exit_face(0x34);
+    let stub = Stub::new();
+    let (logf, logs) = sink();
+    // 测试缝：待发队列 4 KiB（下界）＋我方接收窗 32 KiB（让出口回显尽早阻塞）
+    let mut cfg = island_cfg(Duration::from_secs(60), quic.rpk_public_key());
+    cfg.streams.pending_bytes = 4096;
+    cfg.streams.recv_window = 32 * 1024;
+    let island = crate::Island::start(logf, Arc::new(|_r: &str| {}), cfg).expect("岛可起");
+    let _ = connect_direct(&island, &stub, &quic).await;
+    let id = stream_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::StreamOpen {
+            tag: crate::StreamTag::Probe,
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .expect("开流");
+
+    // 只写不读：出口回显填满我方接收窗（32 KiB）⇒ 出口的 echo 阻塞 ⇒ 我方流控窗
+    // （对端广告 256 KiB）与待发队列（4 KiB）依次填满 ⇒ 必然出现 `n=0`。
+    let chunk = vec![0xEEu8; 8 * 1024];
+    let mut saw_back = false;
+    for _ in 0..160 {
+        let out = stream_wait(
+            &island,
+            &stub,
+            &quic,
+            |reply| Cmd::StreamWrite {
+                id,
+                data: chunk.clone(),
+                reply,
+            },
+            WAIT,
+        )
+        .await
+        .expect("写回执");
+        if out.n == 0 {
+            assert_eq!(
+                out.back.as_deref(),
+                Some(chunk.as_slice()),
+                "零接纳必须**原样带回**（不重拷、不丢）"
+            );
+            saw_back = true;
+            break;
+        }
+    }
+    assert!(saw_back, "对端停读 + 小队列 ⇒ 必须有背压回执（n=0）");
+    let lines = logs_until(&logs, "服务流背压", WAIT).await;
+    assert!(
+        lines.iter().any(|l| l.contains("quic: 服务流背压（id=1 tag=probe")),
+        "背压行（含 id/tag/队列容量）：{lines:?}"
+    );
+    let deadline = Instant::now() + WAIT;
+    while island.snapshot().stream_backpressure_events == 0 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        island.snapshot().stream_backpressure_events >= 1,
+        "快照的背压计数：{:?}",
+        island.snapshot().stream_backpressure_events
+    );
+    // 关流收口（写者任务随之退；不判定它何时退——只要求命令面立即应答）
+    stream_wait(&island, &stub, &quic, |reply| Cmd::StreamClose { id, reply }, WAIT)
+        .await
+        .expect("关流即答");
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}

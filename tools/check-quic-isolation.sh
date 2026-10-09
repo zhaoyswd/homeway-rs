@@ -29,6 +29,11 @@
 #      (a) 岛内 `new_multi_thread` 零命中；(b) 岛 manifest 与 workspace manifest 的 tokio
 #      features 不含 `rt-multi-thread`；(c) 两个 `send_datagram_checked` 都**不是 `async fn`**
 #      且函数体内零 `.await`（「预检 → 发送」之间在单线程 runtime 上无插入窗口）。
+#   ⑩ **命令循环零写等待**（M3 S1 / 设计 §1.4）：三件可判定事实——
+#      (a) `driver.rs`（命令循环所在）剥注释后 `write_all|\.feed\(|\.flush\(` 零命中；
+#      (b) `client/streams.rs`（写者任务所在）`write_all` 命中 ≥ 1（防 (a) 空过）；
+#      (c) `client/streams.rs` 的 `fn write`（命令循环调用的唯一写入口）不是 `async fn`
+#      且体内零 `.await`（背压不落命令循环）。
 #
 # **M1 起对第 ⑤ 条的收窄说明（偏离设计原文，见 commit message 与
 # `docs/INTEROP-CRITERIA.md` 判据变更记录）**：RFC 7250 RPK 的客户端钉定在 rustls 公开面里
@@ -60,8 +65,9 @@ ASYNC_FILES=(
   "driver.rs"
   "client/mod.rs" "client/race.rs" "client/register.rs"
   "client/dataplane.rs" "client/relay_sock.rs" "client/tests.rs"
+  "client/streams.rs"
   "exit/mod.rs" "exit/conn.rs" "exit/socket.rs" "exit/bridge.rs"
-  "exit/rpk.rs" "exit/transport.rs" "exit/tests.rs"
+  "exit/rpk.rs" "exit/transport.rs" "exit/serve.rs" "exit/tests.rs"
 )
 # 异步名的判定式（②条、豁免自证、扫描器自校准**共用同一串**——三处不同步 = 门自相矛盾）。
 # **代码门 r15 G1 整改**：`client/migration.rs` 原在清单里但它**零异步名**（纯逻辑小件，
@@ -368,4 +374,24 @@ done
 [[ -z "$BAD_WRAP_ASYNC" ]] || fail $'send_datagram_checked 必须是同步 fn 且体内零 .await（单线程前提的承载形态）：\n'"$BAD_WRAP_ASYNC"
 echo "  ⑨ 通过：岛内零 new_multi_thread；tokio 未开 rt-multi-thread；两处 DATAGRAM 包装均为同步 fn 且体内零 .await"
 
-echo "QUIC 隔离门全绿（九条断言：异步边界 / 阻塞面 / aws-lc / 跳过验证 / DATAGRAM 纪律 / 中继零异步名 / 单线程前提）"
+# ---------- ⑩ 命令循环零写等待（M3 S1；三件可判定事实） ----------
+STREAM_WRITER="crates/homeway-quic/src/client/streams.rs"
+[[ -f "$REPO_ROOT/$STREAM_WRITER" ]] || fail "流写者面缺失：$STREAM_WRITER（M3 S1 的写路径真源）"
+BAD_LOOP_WRITE=""
+h="$(hits_rs "$SRC/driver.rs" 'write_all|\.feed\(|\.flush\(')"
+[[ -z "$h" ]] || BAD_LOOP_WRITE+="  driver.rs（命令循环所在）："$'\n'"${h}"$'\n'
+[[ -z "$BAD_LOOP_WRITE" ]] || fail $'命令循环出现流写等待（背压必须落在写者任务里，设计 §1.4）：\n'"$BAD_LOOP_WRITE"
+WRITER_HITS="$(hits_rs "$REPO_ROOT/$STREAM_WRITER" 'write_all' | wc -l | tr -d ' ')"
+(( WRITER_HITS >= 1 )) || fail "流写者任务缺 write_all（${WRITER_HITS} 命中）——⑩(a) 的零命中可能整体空过"
+LC_ALL=C awk -v pat='fn write' '
+  index($0, pat) > 0 { inb = 1 }
+  inb { print NR": "$0 }
+  inb && /^    \}/ { exit }' "$REPO_ROOT/$STREAM_WRITER" > /tmp/.hw-write.$$ || true
+grep -qE 'async fn write' /tmp/.hw-write.$$ && fail "站内写入口是 async fn（背压会落回命令循环）：$STREAM_WRITER"
+grep -qE '\.await' /tmp/.hw-write.$$ && fail "站内写入口体内出现 .await（命令循环会被写满挂住）：$STREAM_WRITER"
+WCALL="$(wc -l < /tmp/.hw-write.$$ | tr -d ' ')"
+rm -f /tmp/.hw-write.$$
+(( WCALL >= 3 )) || fail "站内写入口抽出的行数异常（${WCALL} < 3）——⑩(c) 的判据可能空过"
+echo "  ⑩ 通过：driver.rs 零 write_all/feed/flush；client/streams.rs 写者任务有 write_all（${WRITER_HITS} 处）；流写入口为同步 fn 且体内零 .await"
+
+echo "QUIC 隔离门全绿（十条断言：异步边界 / 阻塞面 / aws-lc / 跳过验证 / DATAGRAM 纪律 / 中继零异步名 / 单线程前提 / 命令循环零写等待）"

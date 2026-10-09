@@ -25,6 +25,7 @@ pub(crate) mod admit;
 mod bridge;
 mod conn;
 pub(crate) mod rpk;
+mod serve;
 mod socket;
 pub(crate) mod transport;
 
@@ -49,6 +50,7 @@ use tokio::task::JoinSet;
 use crate::cmd::Logf;
 use crate::rpk::{Ed25519Seed, RpkPublicKey};
 use crate::sync_util::{lock_unpoison, log_spawn_failed, ExitSignal};
+use crate::tuning::StreamLimits;
 
 use bridge::{DropKind, ExitBridge, Outbound, OUTBOUND_QUEUE_MAX};
 use socket::{ExitSock, LegTable};
@@ -134,6 +136,12 @@ pub struct ExitQuicConfig {
     pub proof_fail_threshold: u32,
     /// Retry 策略（缺省 [`RetryPolicy::Pressure`] = 压力触发，M2 §3.1 推荐档）。
     pub retry_policy: RetryPolicy,
+    /// **流面限制**（M3 §1.7 / §15-3）：并发上限 / 每流接收窗 / 连接级发送窗。
+    ///
+    /// 与客户端**同一份值域**（`crate::tuning::StreamLimits`）：quinn 的 TP 是「本端接收
+    /// 对方开流的上限」⇒ 出口广告 `64` 才允许一条设备连接开 64 条服务流；两端值不同 =
+    /// 岛侧自记账与对端信用不一致（§1.7 的账全错）。
+    pub streams: StreamLimits,
 }
 
 impl ExitQuicConfig {
@@ -152,6 +160,7 @@ impl ExitQuicConfig {
             per_src_window: admit::PER_SRC_WINDOW_DEFAULT,
             proof_fail_threshold: admit::PROOF_FAIL_THRESHOLD_DEFAULT,
             retry_policy: RetryPolicy::Pressure,
+            streams: StreamLimits::design(),
         }
     }
 
@@ -251,6 +260,13 @@ pub struct ExitQuicSnapshot {
     pub drop_unregistered: u64,
     /// 丢弃：源校验拒（复刻 `device.rs` 的 `src_allowed`）。
     pub drop_src_rejected: u64,
+    // ---------- M3 S1：服务流面（出口侧；§8.2-7 的 E-q5 行与 §8.2-12 的 `quic` 段） ----------
+    /// 已受理的服务流条数（本期 = probe 回显；S2 起含 files/term/speedtest）。
+    pub streams_open: u64,
+    /// 服务流拒绝条数（`0x21` 未知 tag / `0x22` 服务不可用 / `0x27` tag 读取超时）。
+    pub stream_refused: u64,
+    /// 服务流搬运的应用字节（回显面 = 上下行各计一次；S2 的泵会按方向拆细）。
+    pub stream_bytes: u64,
 }
 
 /// 计量面（原子直读——**反应式**，不必等巡检拍；`snapshot()` 由它组装）。
@@ -279,6 +295,9 @@ pub(crate) struct ExitStats {
     drop_send_buffer_full: AtomicU64,
     drop_unregistered: AtomicU64,
     drop_src_rejected: AtomicU64,
+    streams_open: AtomicU64,
+    stream_refused: AtomicU64,
+    stream_bytes: AtomicU64,
 }
 
 impl ExitStats {
@@ -307,6 +326,9 @@ impl ExitStats {
             drop_send_buffer_full: self.drop_send_buffer_full.load(Ordering::SeqCst),
             drop_unregistered: self.drop_unregistered.load(Ordering::SeqCst),
             drop_src_rejected: self.drop_src_rejected.load(Ordering::SeqCst),
+            streams_open: self.streams_open.load(Ordering::SeqCst),
+            stream_refused: self.stream_refused.load(Ordering::SeqCst),
+            stream_bytes: self.stream_bytes.load(Ordering::SeqCst),
         }
     }
 }
@@ -632,7 +654,12 @@ fn run_exit(
     rt.block_on(async move {
         // ---- 服务端身份（出口 RPK：RFC 7250；私钥种子 → PKCS#8 → SPKI 出示）----
         // `retry_token_lifetime` 随服务端配置下发（§3.1：收自 quinn 缺省 15s 到 5s）。
-        let (server_cfg, rpk_public_key) = match rpk::server_config(&cfg.rpk_seed, cfg.retry_token_lifetime) {
+        // M3 §15-3：流面限制随 `TransportConfig` 下发（两端同一份值域）。
+        let (server_cfg, rpk_public_key) = match rpk::server_config(
+            &cfg.rpk_seed,
+            cfg.retry_token_lifetime,
+            cfg.streams,
+        ) {
             Ok(v) => v,
             Err(e) => {
                 let _ = ready_tx.send(Err(ExitQuicErr::Identity(e)));
@@ -689,6 +716,10 @@ fn run_exit(
             transport::DATAGRAM_BUFFER
         ));
         // ---- 抗放大面生效值（§3.2；`always` 档的代价记行 = §5-11 登记项）----
+        (*logf)(&format!(
+            "quic: 流面参数（bidi={} uni={} recv_window={}B send_window={}B）",
+            cfg.streams.max_bidi, cfg.streams.max_uni, cfg.streams.recv_window, cfg.streams.send_window
+        ));
         (*logf)(&format!(
             "quic: 抗放大面（retry={}；retry_token_lifetime={:?}；每源 {}/{:?}；证明失败闸 {}）",
             cfg.retry_policy.text(),
@@ -840,7 +871,11 @@ fn run_exit(
                             stats.admitted.fetch_add(1, Ordering::SeqCst);
                             let conn_id = next_conn_id;
                             next_conn_id += 1;
-                            // 每连接两枚任务（§1.3 控制流登记 / §1.4 数据报收包）
+                            // 每连接两枚任务（§1.3 控制流登记 / §1.4 数据报收包）。
+                            // **服务流受理不在这里起**：首条 bidi 流被准入协议固定为控制流
+                            // （`conn::admit` 的 `accept_bi`）⇒ 两个 `accept_bi` 并发会抢流；
+                            // 受理循环由控制流任务在**准入通过之后**随刷新循环一起跑
+                            // （`conn::control` 的 `join!`，见该函数注释）。
                             tasks.spawn(conn::control(conn.clone(), conn_id, Arc::clone(&ctx)));
                             tasks.spawn(conn::datagrams(conn.clone(), conn_id, Arc::clone(&ctx)));
                             conns.push(LiveConn { remote: conn.remote_address(), conn, conn_id });

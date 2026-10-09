@@ -479,6 +479,28 @@ fn cmd_member_field_types_are_pinned() {
             Cmd::TunFdDead { msg } => {
                 let _: String = msg;
             }
+            // M3 S1 增补（服务流族；设计 §1.4/§1.5——`StreamReply` 承载 typed `StreamErr`）
+            Cmd::StreamOpen { tag, reply } => {
+                let _: crate::StreamTag = tag;
+                let _: crate::StreamReply<crate::StreamId> = reply;
+            }
+            Cmd::StreamWrite { id, data, reply } => {
+                let _: crate::StreamId = id;
+                let _: Vec<u8> = data;
+                let _: crate::StreamReply<crate::StreamWriteOut> = reply;
+            }
+            Cmd::StreamRead { id, reply } => {
+                let _: crate::StreamId = id;
+                let _: crate::StreamReply<Vec<u8>> = reply;
+            }
+            Cmd::StreamShutdown { id, reply } => {
+                let _: crate::StreamId = id;
+                let _: crate::StreamReply<()> = reply;
+            }
+            Cmd::StreamClose { id, reply } => {
+                let _: crate::StreamId = id;
+                let _: crate::StreamReply<()> = reply;
+            }
         }
     }
     let _: fn(Cmd) = pin;

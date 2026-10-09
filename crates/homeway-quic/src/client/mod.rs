@@ -20,6 +20,7 @@ mod migration;
 mod race;
 mod register;
 mod relay_sock;
+pub(crate) mod streams;
 #[cfg(test)]
 mod tests;
 
@@ -28,12 +29,14 @@ use std::net::SocketAddrV4;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use quinn::{Connection, Endpoint, EndpointConfig, RecvStream, SendStream, VarInt};
+use quinn::{Connection, Endpoint, EndpointConfig, ReadExactError, RecvStream, SendStream};
+use tokio::sync::Mutex as TokioMutex;
 use tokio::time::Instant as TokioInstant;
 
 use crate::cmd::{Candidate, IslandErr, Logf, RaceOutcome, Via};
 use crate::config::{IslandConfig, IslandCredential};
 use crate::reg4;
+use crate::stream::StreamTag;
 
 pub(crate) use migration::{MigrationEvent, Watch};
 pub(crate) use race::LogGate;
@@ -50,8 +53,25 @@ pub(crate) fn server_name() -> &'static str {
     crate::exit::rpk::client_pin::SERVER_NAME
 }
 
-/// 探活的轮询节拍（预算内的最小等待步长）。
-const PROBE_POLL: Duration = Duration::from_millis(20);
+/// 发送面错误的读数视图（快照面；`fresh` = 白名单命中且落在新鲜度窗内 ⇒ M 判据的证据）。
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SendErrView {
+    /// 累计非 `WouldBlock` 错误数。
+    pub total: u64,
+    /// 累计白名单命中数（`rebind` 清零）。
+    pub local: u64,
+    /// 末次白名单错误距今（`None` = 无/已清零）。
+    pub age: Option<Duration>,
+    /// 是否**新鲜**（窗内命中 ⇒ M（本机发送面错误）成立的证据）。
+    pub fresh: bool,
+}
+
+/// 快探的回显载荷（1B；§3.2「写 1B + 等 1B 回显」）。
+///
+/// 出口侧（`exit::serve`）**原样回显**，不解释该字节——它的唯一作用是「让应用层证据
+/// 双向可核」：客户端写出 1B、收到 1B（且逐字节相同）才判活（传输层未察觉的对端死亡
+/// 只能由这种端到端回显定音，§13-T2 实测首 34 条 `PROBE_FAIL_REASON=None`）。
+const PROBE_BYTE: u8 = 0x50; // 'P'
 
 /// 岛持有的连接面（岛线程独占 ⇒ 无锁；端点用 `Arc` 只为让赛跑任务持一份）。
 pub(crate) struct Face {
@@ -69,7 +89,8 @@ pub(crate) struct Face {
 }
 
 impl Face {
-    /// 起端点（含 RPK 钉定 + §1.2 的 TransportConfig + **S2-7 的包封/剥壳 socket**）。
+    /// 起端点（含 RPK 钉定 + §1.2 的 TransportConfig + **S2-7 的包封/剥壳 socket** +
+    /// **M3 §1.7 的流面限制**）。
     ///
     /// ⚠️ 必须在 runtime 上下文里调（`ClientSock::open` 的 `from_std` 与 `Endpoint::new_with_abstract_socket`
     /// 都要 IO 驱动）。
@@ -83,6 +104,8 @@ impl Face {
             bind,
             patrol: _,
             mtu_cap,
+            streams: stream_limits,
+            probe: _,
         } = cfg;
         let relays = RelayTable::new();
         let stats = Arc::new(Mutex::new(SockStats::default()));
@@ -99,7 +122,11 @@ impl Face {
                 .map_err(io::Error::other)?,
         );
         // S3-1：MTU 上限旋钮（`HOMEWAY_QUIC_MTU` / `tunConfig.quicMtuCap` 的落地位）
-        client_cfg.transport_config(crate::exit::transport::transport_config_with_mtu(mtu_cap));
+        // + M3：流窗口/并发（`StreamLimits`，与出口面同一份 `exit::transport` 组装）
+        client_cfg.transport_config(crate::exit::transport::transport_config_with(
+            mtu_cap,
+            stream_limits,
+        ));
         Ok(Face {
             endpoint: Arc::new(endpoint),
             cfg: client_cfg,
@@ -137,6 +164,23 @@ impl Face {
         (s.relay_tx, s.rx_ignored, s.rx_dgrams, s.tx_dgrams)
     }
 
+    /// 发送面错误读数（§3.1-N5 的岛侧信号；新鲜度按 `window` 现算——窗值来自
+    /// `ProbeTuning::send_err_fresh`，判定的单源在 `SockStats::local_send_err_fresh`）。
+    ///
+    /// 未命中白名单的错误只进第一个计数（**不进 M/R 判别**——`WouldBlock` 是
+    /// 「发送缓冲满，回去等 poller」的**正常回执**，计进去就会把上行拥塞误判成
+    /// 「本机发送面错误」）。
+    pub(crate) fn send_err_view(&self, window: Duration) -> SendErrView {
+        let s = crate::sync_util::lock_unpoison(&self.stats);
+        let now = std::time::Instant::now();
+        SendErrView {
+            total: s.send_errs,
+            local: s.send_errs_local,
+            age: s.last_local_send_err_at.map(|t| now.saturating_duration_since(t)),
+            fresh: s.local_send_err_fresh(now, window),
+        }
+    }
+
     /// 换本地 socket（迁移原语；设计 §2.3）。
     ///
     /// 返回值 = 新本地地址。**注意语义**：成功只代表 socket 换绑完成——路径是否真的
@@ -157,6 +201,9 @@ impl Face {
             .rebind_abstract(sock)
             .map_err(IslandErr::Rebind)?;
         self.local = v4;
+        // §3.1-N5：**换网即清**发送面错误（`stats` 的 `Arc` 刻意跨 socket 共享——不清就会
+        // 用换网前的陈旧 errno 决定下一步动作）。清零是「M/R 判别只看本网环境」的前提。
+        crate::sync_util::lock_unpoison(&self.stats).clear_local_send_err();
         Ok(v4)
     }
 
@@ -208,6 +255,17 @@ pub(crate) struct Live {
     pub(crate) ep: SocketAddrV4,
     /// 刷新节拍（巡检拍驱动；`Instant` = runtime 时钟，与 `tokio::time` 同源）。
     refresh: register::RefreshTimer,
+    /// **快探持久流**（§3.2：连接建立后常驻——每次探活写 1B 等 1B 回显，不每拍开新流；
+    /// 失败时置 `None`，下一拍重开）。`TokioMutex` 串行化并发探活（同刻只许一条在途）。
+    probe: Arc<TokioMutex<Option<ProbeStream>>>,
+}
+
+/// 快探持久流的两半边（`SendStream`+`RecvStream` 不可 `Clone` ⇒ 整体持在 `Live` 的槽里）。
+///
+/// `pub(crate)`：类型名要出现在 [`probe`] 的签名上（`driver.rs` 把槽搬进探活任务）。
+pub(crate) struct ProbeStream {
+    send: SendStream,
+    recv: RecvStream,
 }
 
 impl Live {
@@ -221,7 +279,13 @@ impl Live {
             via: e.via,
             ep: e.ep,
             refresh: register::RefreshTimer::new(patrol),
+            probe: Arc::new(TokioMutex::new(None)),
         }
+    }
+
+    /// 快探槽（探活任务经它写/读；`Arc` 克隆进任务）。
+    pub(crate) fn probe_slot(&self) -> &Arc<TokioMutex<Option<ProbeStream>>> {
+        &self.probe
     }
 
     /// 连接是否仍活（`close_reason` 为空）。
@@ -288,17 +352,23 @@ impl Live {
     }
 }
 
-/// 连接级判活（替代 `path_probe` 的连接面判据；设计 §2.5）。
+/// **快探（真回显；M3 §3.2 / §1.7-N13）**：`STREAM[probe]`（tag=5）持久流上「写 1B +
+/// 等 1B 回显」，预算内拿到**逐字节相同**的回显 ⇒ 判活并回实测往返。
 ///
-/// 语义（**不误报活**）：连接已关 ⇒ [`IslandErr::ConnectionLost`]；否则做一次
-/// **ack-eliciting 的最小写**（开一条 uni 流立即 reset：纯流面信号，对端应用面零语义、
-/// 不占流槽、不污染出口的四类丢弃计数），再在 `budget` 内等**对端回包**证据
-/// （`udp_rx` 增长 ⇒ ACK/数据到达）。预算内无证据 ⇒ [`IslandErr::ProbeNoResponse`]。
-///
-/// ⚠️ 端到端**回显**（今天 `path_probe` 探 `tunnel_ip:1` 的语义）需要服务流面 +
-/// 数据面（S2-4/S2b、M3 的 `STREAM[probe]`）——本切片给的是「连接与路径活着」的
-/// 协议级结论，够 patrol 判活/归因用，不够判「隧道内目标可达」。
-pub(crate) async fn probe(conn: &Connection, budget: Duration) -> Result<Duration, IslandErr> {
+/// 语义（**不误报活**）：
+/// - 连接已关 ⇒ [`IslandErr::ConnectionLost`]；
+/// - 回显流首次使用时**懒开**（写 tag 首字节），此后跨拍常驻；任一步失败 ⇒ **丢弃该流**
+///   （下一拍重开）并回 [`IslandErr::ProbeNoResponse`]——**不**回落到「连接级判据」
+///   （§13-T2 的承重结论：传输层在对端进程死亡后 40s 才定音，60s 巡检拍解释不了真机
+///   的 32s/41s；只有应用层回显能在 0.7s 级定音）；
+/// - 与旧实现（`open_uni + reset` + 等 `udp_rx`）的关系：**这就是 §1.7-N13 要求的
+///   「`uni=0` 与 probe 换真回显同切片」**——旧的 `open_uni` 在 `max_concurrent_uni_streams=0`
+///   下会被流控永久挂起（对端广告 0 ⇒ 无信用），故两者必须一起换。
+pub(crate) async fn probe(
+    conn: &Connection,
+    slot: &Arc<TokioMutex<Option<ProbeStream>>>,
+    budget: Duration,
+) -> Result<Duration, IslandErr> {
     fn check(c: &Connection) -> Result<(), IslandErr> {
         if c.close_reason().is_some() {
             return Err(IslandErr::ConnectionLost);
@@ -306,29 +376,65 @@ pub(crate) async fn probe(conn: &Connection, budget: Duration) -> Result<Duratio
         Ok(())
     }
     check(conn)?;
-    let rx0 = conn.stats().udp_rx.datagrams;
-    let outcome = tokio::time::timeout(budget, async {
-        // 主动一步：ack-eliciting 的最小写（有界——流控信用耗尽时宁可超时也不挂死）
-        if let Ok(mut s) = conn.open_uni().await {
-            let _ = s.reset(VarInt::from_u32(0));
+    let deadline = TokioInstant::now() + budget;
+    // 并发探活串行化（同刻只许一条在途；拿锁本身也在预算内——否则一条卡死的探活会把
+    // 后续探活拖出预算）。
+    let mut guard = match tokio::time::timeout(budget, slot.lock()).await {
+        Ok(g) => g,
+        Err(_) => return Err(IslandErr::ProbeNoResponse),
+    };
+    if guard.is_none() {
+        let left = deadline.saturating_duration_since(TokioInstant::now());
+        match tokio::time::timeout(left, open_probe(conn)).await {
+            Ok(Ok(ps)) => *guard = Some(ps),
+            Ok(Err(e)) => return Err(e),
+            Err(_) => return Err(IslandErr::ProbeNoResponse),
         }
-        let deadline = TokioInstant::now() + budget;
-        loop {
-            check(conn)?;
-            if conn.stats().udp_rx.datagrams > rx0 {
-                return Ok(conn.rtt());
-            }
-            if TokioInstant::now() >= deadline {
-                return Err(IslandErr::ProbeNoResponse);
-            }
-            tokio::time::sleep(PROBE_POLL).await;
+    }
+    let left = deadline.saturating_duration_since(TokioInstant::now());
+    let ps = guard.as_mut().expect("上面已保证 Some");
+    match tokio::time::timeout(left, echo_once(ps, conn)).await {
+        Ok(Ok(rtt)) => Ok(rtt),
+        Ok(Err(e)) => {
+            *guard = None; // 流面已坏：丢弃，下一拍重开（**不**回落连接级判据）
+            Err(e)
         }
-    })
-    .await;
-    match outcome {
-        Ok(v) => v,
-        // 外层超时兜底（内层 deadline 已覆盖——双保险，保证回执有界）
-        Err(_) => check(conn).and(Err(IslandErr::ProbeNoResponse)),
+        Err(_) => {
+            *guard = None;
+            check(conn).and(Err(IslandErr::ProbeNoResponse))
+        }
+    }
+}
+
+/// 懒开快探持久流（tag 首字节由**岛**写——`StreamTag` 是 tag 的单源，见 `stream.rs`）。
+async fn open_probe(conn: &Connection) -> Result<ProbeStream, IslandErr> {
+    let (mut send, recv) = conn.open_bi().await.map_err(|_| IslandErr::ConnectionLost)?;
+    send.write_all(&[StreamTag::Probe.as_byte()])
+        .await
+        .map_err(|_| IslandErr::ConnectionLost)?;
+    Ok(ProbeStream { send, recv })
+}
+
+/// 一次「写 1B + 读 1B 回显」；回显必须**逐字节相同**（否则按失败收——见 [`PROBE_BYTE`]）。
+async fn echo_once(ps: &mut ProbeStream, conn: &Connection) -> Result<Duration, IslandErr> {
+    let t0 = TokioInstant::now();
+    ps.send
+        .write_all(&[PROBE_BYTE])
+        .await
+        .map_err(|_| IslandErr::ProbeNoResponse)?;
+    let mut one = [0u8; 1];
+    match ps.recv.read_exact(&mut one).await {
+        Ok(()) if one[0] == PROBE_BYTE => Ok(t0.elapsed()),
+        Ok(()) => Err(IslandErr::ProbeNoResponse), // 回显内容不符（不是本探针的回波）
+        Err(ReadExactError::FinishedEarly(0)) => Err(IslandErr::ProbeNoResponse),
+        Err(_) => {
+            // 对端复位/连接死：区分「连接真死」与「服务面卡死」
+            if conn.close_reason().is_some() {
+                Err(IslandErr::ConnectionLost)
+            } else {
+                Err(IslandErr::ProbeNoResponse)
+            }
+        }
     }
 }
 

@@ -53,21 +53,28 @@ pub(crate) const KEEP_ALIVE_INTERVAL: Duration = Duration::from_secs(10);
 /// 当陌生包丢弃、上行全死，M1 设计 §0.3 P8 的反例实测）。
 pub(crate) const MIGRATION: bool = true;
 
+// 流面限制（M3 §1.7 的账；值域与 env 覆盖见 `crate::tuning`）：
+// 为什么在 `TransportConfig` 里显式设置（而不是吃 quinn 缺省）——quinn 缺省
+// `100 bidi + 100 uni × 1.19 MiB` ⇒ 最坏接收窗 **≈238 MB/连接**（quinn 自身文档警告）；
+// 产品内存账（§7）取 `64 × 256 KiB = 16 MiB` 上界。**两端共用同一个组装函数**
+// （[`transport_config_with`]）⇒ 值域不会各写一份。
+use crate::tuning::StreamLimits;
+
 /// 组装定稿 `TransportConfig`（幂等；每次调用新建——`Arc` 交 quinn 后不可变）。
+///
+/// 缺省档 = 设计定值（生产面恒走 [`transport_config_with`]——流面限制是配置面；
+/// 本函数是**测试面**的缺省入口，`exit/tests.rs` 用它建对照客户端）。
+/// `upper_bound` 与 `initial_mtu` 同值（上探构造性关闭，见 [`MTU_UPPER_BOUND`]）。
+#[cfg(test)]
 pub(crate) fn transport_config() -> Arc<TransportConfig> {
-    // 缺省档 = 设计定值；`upper_bound` 与 `initial_mtu` 同值（上探构造性关闭，
-    // 见 [`MTU_UPPER_BOUND`]）——两条常量必须始终相等。
     debug_assert_eq!(MTU_UPPER_BOUND, INITIAL_MTU);
-    transport_config_with_mtu(INITIAL_MTU)
+    transport_config_with(INITIAL_MTU, StreamLimits::design())
 }
 
-/// 带 MTU 上限旋钮的组装（S3-1：`HOMEWAY_QUIC_MTU` / `tunConfig.quicMtuCap`）。
-///
-/// `mtu` 同时是 `initial_mtu` 与 DPLPMTUD `upper_bound`（`upper == initial` ⇒ 上探仍
-/// 构造性关闭，黑障检测仍活——见 [`MTU_UPPER_BOUND`]）。`min_mtu` 取
-/// `min(MIN_MTU, mtu)`：quinn 的 `get_initial_mtu() = initial.max(min)`，测试缝给
-/// 1200（窄路径注入）时 min 必须一起降，否则 initial 被抬回 1320 ⇒ 缝失效。
-pub(crate) fn transport_config_with_mtu(mtu: u16) -> Arc<TransportConfig> {
+/// 全参组装（**两端共用**）：MTU 旋钮 + 流面限制（M3 §1.7/§15-3）。
+pub(crate) fn transport_config_with(mtu: u16, streams: StreamLimits) -> Arc<TransportConfig> {
+    // DPLPMTUD 上界常量的唯一作用点：旋钮**不得超过**设计上界（1400）；测试缝给更小值合法
+    debug_assert!(mtu <= MTU_UPPER_BOUND, "MTU 旋钮超过设计上界常量 {MTU_UPPER_BOUND}");
     let mut t = TransportConfig::default();
     t.initial_mtu(mtu).min_mtu(mtu.min(MIN_MTU));
     let mut md = MtuDiscoveryConfig::default();
@@ -81,6 +88,12 @@ pub(crate) fn transport_config_with_mtu(mtu: u16) -> Arc<TransportConfig> {
             .expect("30s 在 IdleTimeout 值域内（≤ 2^62 ms），不可达"),
     ));
     t.keep_alive_interval(Some(KEEP_ALIVE_INTERVAL));
+    // ---- M3 §1.7：流面（**两端的 TP 都出这些值**——接收方向的对端据此自律）----
+    t.max_concurrent_bidi_streams(VarInt::from_u32(streams.max_bidi));
+    t.max_concurrent_uni_streams(VarInt::from_u32(streams.max_uni));
+    t.stream_receive_window(VarInt::from_u32(streams.recv_window));
+    // `send_window` = **连接级**（多流共享）；quinn 缺省 = 8×RWND=10 MB（§13.5 的账）。
+    t.send_window(u64::from(streams.send_window));
     let mut ack = AckFrequencyConfig::default();
     ack.ack_eliciting_threshold(VarInt::from_u32(ACK_ELICITING_THRESHOLD));
     ack.max_ack_delay(Some(MAX_ACK_DELAY));
