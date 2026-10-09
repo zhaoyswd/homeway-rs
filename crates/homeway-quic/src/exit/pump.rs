@@ -141,7 +141,14 @@ async fn upstream(recv: &mut RecvStream, sw: &mut WriteHalf<tokio::net::UnixStre
                 let _ = sw.shutdown().await; // 客户端 FIN ⇒ 服务侧见 EOF（§1.3 半关）
                 return n;
             }
-            Err(_) => return n, // 对端 reset / 连接死
+            Err(_) => {
+                // 对端 reset / 连接死：**关 socketpair 的服务侧读向**（§2.2-N12 的
+                // 「普通 close」在泵侧的落点）——否则服务侧会**永远阻塞在 read 上**
+                // （它无从知道客户端已经走了；今天 UDS 形态下这个信号由 close 给出）。
+                // 只 `shutdown(WRITE)` 不 drop：读半边仍归下行任务（服务收线那半仍要传播）。
+                let _ = sw.shutdown().await;
+                return n;
+            }
         }
     }
 }

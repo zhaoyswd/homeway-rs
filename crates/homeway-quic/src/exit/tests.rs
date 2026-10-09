@@ -3009,3 +3009,47 @@ async fn service_streams_route_each_tag_to_its_own_intake() {
     assert_eq!(quic.snapshot().streams_open, 2);
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
+
+/// **判据（§2.2-N12：复位 = 关 socketpair（普通 close），错误码不跨 socketpair）**：
+/// 客户端 `reset(0)`（不是 FIN）⇒ 泵的**上行**收错即停 ⇒ socketpair 关闭 ⇒ 服务侧
+/// `read_to_end` 立即收线（读到 EOF/错误，**不挂死**）；泵两向收工 ⇒ `streams_closed` +1。
+#[tokio::test]
+async fn service_stream_client_reset_closes_socketpair_like_plain_close() {
+    let (files_intake, files_tx) = crate::ServiceIntake::quic_only(4).expect("intake");
+    // 桩服务：读问候写完就 `read_to_end`（只在**对端收线**时才返回——复位路径的探针）
+    let svc = std::thread::spawn(move || {
+        use std::io::{Read as _, Write as _};
+        let mut conn = files_intake.accept().expect("受理");
+        conn.write_all(b"HI\n").expect("问候");
+        let mut rest = Vec::new();
+        let _ = conn.read_to_end(&mut rest);
+        rest
+    });
+    let (quic, _rx, _client, conn, _stub, _pubkey, _dev) = exit_with_intakes(
+        0x66,
+        crate::ServiceIntakes {
+            files: Some(files_tx),
+            ..Default::default()
+        },
+    )
+    .await;
+    let (mut s, mut r) = conn.open_bi().await.expect("open_bi");
+    s.write_all(&[1]).await.expect("tag=files");
+    let mut greet = [0u8; 3];
+    r.read_exact(&mut greet).await.expect("问候");
+    assert_eq!(&greet, b"HI\n");
+    // 复位（**不是** FIN）：quinn 的对端语义 = 读侧 `ReadError::Reset(0)`
+    s.reset(quinn::VarInt::from_u32(0)).expect("客户端 reset");
+    let rest = tokio::task::spawn_blocking(move || svc.join().expect("桩线程退出"))
+        .await
+        .expect("join 不 panic");
+    assert!(rest.is_empty(), "复位 ⇒ 服务侧读到 EOF/错误且**无残留字节**：{rest:?}");
+    assert!(
+        wait_until(|| quic.snapshot().streams_closed == 1, WAIT).await,
+        "复位后泵须收工（两向都收）"
+    );
+    let snap = quic.snapshot();
+    assert_eq!(snap.streams_open, 1, "受理计数不受复位影响：{snap:?}");
+    assert_eq!(snap.stream_refused, 0, "复位不是拒入形态：{snap:?}");
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
