@@ -57,7 +57,6 @@ type SharedQueue = Arc<Mutex<VecDeque<Vec<u8>>>>;
 pub struct TunDevice {
     rx_queue: VecDeque<Vec<u8>>,
     tx_out: SharedQueue,
-    rx_dropped: u64,
     /// 内层 MTU（caps 面——恒 MTU；Interface::new 构造期快照消费）。
     mtu: usize,
 }
@@ -73,7 +72,6 @@ impl TunDevice {
         Self {
             rx_queue: VecDeque::with_capacity(QUEUE_CAP),
             tx_out: Arc::new(Mutex::new(VecDeque::with_capacity(QUEUE_CAP))),
-            rx_dropped: 0,
             mtu: MTU,
         }
     }
@@ -83,10 +81,11 @@ impl TunDevice {
         self.mtu
     }
 
-    /// WG 解密出的明文包入队（hub 判据后的投递面）。
+    /// 明文包入队（出口 intercept 的投递面）。
     pub fn rx_push(&mut self, pkt: &[u8]) {
         if self.rx_queue.len() >= QUEUE_CAP {
-            self.rx_dropped += 1;
+            // 溢出静默丢（M5 C3：R8-2 的归因计数消费者随 WG 面退役 ⇒ 不再计数；
+            // 丢包语义不变）。
             return;
         }
         self.rx_queue.push_back(pkt.to_vec());
@@ -96,11 +95,6 @@ impl TunDevice {
     #[cfg(test)]
     pub fn rx_queue_len(&self) -> usize {
         self.rx_queue.len()
-    }
-
-    /// 收队列溢出丢弃的累计计数（R8-2 归因插桩——驱动线程节流记行消费）。
-    pub(crate) fn rx_dropped(&self) -> u64 {
-        self.rx_dropped
     }
 
     /// 测试面：TX 出站队列长度（拦截层排障用）。

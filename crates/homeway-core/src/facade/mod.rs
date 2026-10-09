@@ -28,7 +28,7 @@
 //! 收工放锁"`——Go 生产路径同串，C-5 向量重产对齐）。
 //!
 //! tun 域的数据面执行体经 [`TunExecutor`] 注入；本仓实现 = `tun_exec::TunnelExec`
-//! （真 wgcore hub：TUN fd → L3 直通）。
+//! （真 hub：QUIC 岛 + TUN fd → L3 直通）。
 
 pub mod bridge_host;
 pub mod demand;
@@ -100,11 +100,6 @@ pub struct TunConfigJson {
     pub token: String,
     #[serde(default)]
     pub port_forwards: Vec<portfwd::PortForwardRule>,
-    /// L3 承载档（M1 §4.1 的 config 面）：`"quic"`（缺省，缺键同义）| `"wg"`。
-    /// **世代级**（每次世代装配读一次；改后下次重建生效）；env `HOMEWAY_TRANSPORT`
-    /// 优先级更高。非法值 = 记行 + 按缺省（quic）走（见 `tun_exec::resolve_bearer`）。
-    #[serde(default)]
-    pub transport: String,
     /// QUIC MTU 上限旋钮（M1 §12-① 的 config 面；0/缺键 = 缺省 1400，有效区间
     /// [1320,1400]）。env `HOMEWAY_QUIC_MTU` 优先级更高。
     #[serde(default)]
@@ -156,7 +151,8 @@ pub trait TunExecutor: Send + Sync {
         -> Result<(), TunError>;
     /// 请求世代收工（幂等信号；要能打断暖机中的阻塞调用）。
     fn request_stop(&self);
-    /// 恢复阶梯入口（from 起跑档位；rc 契约见 session::LadderRc::as_rc）。
+    /// 恢复下推入口（from = 档位入参，rc 契约见 `host_session::Level` 与
+    /// `TunExecutor::recover` 的注释）。
     /// **M4 §5.3**：实现按 `l3_on_island()` 分档（岛档 = 快探+复探 ⇒ `0/-1`；见
     /// `tun_exec::recover_downpush_on_island` 与 `ClientCore::tun_recover` 的 doc）。
     fn recover(&self, from: i64, cause: &str) -> i32;
@@ -456,23 +452,18 @@ impl ClientCore {
 
     // ---- ⑥ ClientCoreTunRecover ----
 
-    /// 恢复阶梯下推入口（from 钳位 R1..=R3；rc 契约见 facade 头注释）。cause 文案
-    /// 用**档位名**（评审 r2-L6：`扩展下推(R1 重握手)`——会进 RECOVER 判据行，
-    /// Go 同串）。
+    /// 恢复下推入口（`from` 钳位 1..=3；rc 契约见 facade 头注释）。cause 文案带档位号
+    /// （**M5 C3**：档位名「R1 重握手」一族随 WG 阶梯删除；`from` 只作入参留痕/契约面）。
     ///
-    /// **M4 §5.3 分档（登记 §8 行 13）**：执行体按 `l3_on_island()` 分档——
-    /// `true`（本世代 L3 真在岛上）⇒ 岛快探 + 一次复探 ⇒ **只产 `0/-1/-2`**
-    /// （`-3/-4` 在该世代不可达）；`false`（WG 档 / 岛未就的回落世代）⇒ WG 阶梯原路
-    /// （`-1/-3/-4` 仍可达）。
-    /// **`-2` 的构成（代码门 r21 F1 订正）**：**只**来自既有两条前置——「无世代」与「陈世代」
-    /// （`tun_exec.rs::recover` 的前两个 `return -2`），**不含**「岛不在/未 attach」：那种形态
-    /// `l3_on_island()==false` ⇒ 走 WG 原路（`-1/-3/-4`）——设计 §5.3 原文曾把 `-2` 写宽，
-    /// 已在 `docs/INTEROP-CRITERIA.md` 追加更正行（登记只可追加）。
+    /// **M4 §5.3（登记 §8 行 13）+ M5 C3 单承载**：执行体恒走岛档（岛快探 + 一次复探）
+    /// ⇒ **只产 `0/-1/-2`**（`-3/-4` 不可达——WG 阶梯已随 WG 面删除）。
+    /// **`-2` 的构成（代码门 r21 F1 订正）**：**只**来自既有两条前置——「无世代」与
+    /// 「陈世代」（`tun_exec.rs::recover` 的前两个 `return -2`）。
     /// tier 侧决策（`rc===0` 跳过整套重建 / 其余落重建）**不变**。
     pub fn tun_recover(&self, from: i64) -> i32 {
-        let lvl = crate::session::recover::Level::clamp(from);
+        let lvl = host_session::Level::clamp(from);
         self.executor()
-            .recover(from, &format!("扩展下推({})", lvl.name()))
+            .recover(from, &format!("扩展下推(档位 {})", lvl.raw()))
     }
 
     // ---- ⑦ ClientCoreTunRunning ----

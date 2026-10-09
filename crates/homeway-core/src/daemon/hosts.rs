@@ -4,7 +4,7 @@
 //!
 //! 会话 = 仓内 `facade::host_session::HostSession`（M5 C2 换源：QUIC 岛承接的
 //! 「无 TUN 服务会话」——暖机/巡检/恢复阶梯/整会话重建都在会话内，「每记录自持」
-//! 天然成立，无 Go 侧 recGate 镜像需求；WG 档 `session::Session` 在 C3 随删）。
+//! 天然成立，无 Go 侧 recGate 镜像需求；WG 档 `session::Session` 已于 M5 C3 删除）。
 //!
 //! **B0-2b 第 1 棒注记**：Go hostsession 的 Observer/LinkChanged 钩子在 Rust
 //! Session 无对应面——事件面（session.state_changed / link.changed）由 1s 差分
@@ -638,7 +638,7 @@ fn reach(token_raw: &str) -> ReachReport {
     let mut eps: Vec<(std::net::SocketAddr, bool)> = Vec::new();
     for ep in &tok.endpoints {
         // **M5 §2.6-G5（订正）**：过滤键 = `Quic | Relay`（与 `quic_candidates` 同源）——
-        // 旧键 `!is_wg()`（= 只吃 `Quic`）在两端都错：①WG 端点（`Direct`）不再是承载，
+        // 旧键「只吃 `Quic`」（WG 档的 `is_wg` 反过滤；M5 C3 已随 WG 面删除）在两处都错：①WG 端点（`Direct`）不再是承载，
         // ②**`Relay` 也是 QUIC 的合法承载**（relay-only token 会被整条漏掉 ⇒ reach 恒
         // `none` ⇒ `DC3` 三档结论不可达）。reach 的复绿还依赖出口侧「参照点探测明文
         // 应答」在新落点可用（设计 §1.2-M4 的 S3a 迁址面）。

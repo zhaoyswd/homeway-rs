@@ -614,7 +614,7 @@ impl ServeEngine {
         let mut quic_brief: Option<(SocketAddr, homeway_quic::RpkPublicKey)> = None;
         let mut quic_stats: Option<homeway_quic::ExitStatsHandle> = None;
         let quic_face = if !cfg.quic {
-            (logf)("quic: 面未启用（serve.quic=false）—— 不监听 QUIC 端口、token 不带 QUIC 端点（客户端将回落 WG）");
+            (logf)("quic: 面未启用（serve.quic=false）—— 不监听 QUIC 端口、token 不带 QUIC 端点（该 token 的客户端无 QUIC 面可用）");
             None
         } else {
             match crate::server::bind::listen_with_fallback_addr(quic_listen_port(&cfg), bind_addr) {

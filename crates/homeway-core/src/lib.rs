@@ -6,7 +6,11 @@
 //!
 //! 模块划分按 Rust 惯例，不映射 Go 包结构 1:1；各期落位：
 //! - `token`：hmw1 凭证（R0，pkg/proto/token.go 语义）
-//! - 后续：`identity`（R1）、`wtransport`/`wgcore`（R1–R2）、`intercept`（R3）…
+//! - `identity`（R1）、`intercept`（R3）…
+//!
+//! **M5 C3（WG 面删除）**：`wtransport`/`wgcore`/`session` 三模块（WG 档的候选赛跑、
+//! 栈 B 引擎、服务会话）已整件退役——QUIC 岛单承载（`crate::facade::host_session`
+//! 承接服务会话，`crate::stackb`/`crate::legframe`/`crate::reg2` 为其保留件）。
 
 /// 日志面（跨线程共享的判据行输出；Session 在其上加前缀）。
 pub type Logf = std::sync::Arc<dyn Fn(&str) + Send + Sync>;
@@ -34,9 +38,9 @@ pub mod identity;
 pub mod hostdns;
 /// 腿帧线格式（`[0xAA][peerId]` 前导 + `[0xBB][type][payload]` 封装）。
 ///
-/// M5 S0 迁址（设计 §1.2-M1）：原 `wtransport::frame` —— 中继（红线面）与 `relaywire`
-/// 直接用它在用，**不可随 WG 面删除**；`wtransport` 的 WG 消费者退役后本模块留在 crate 根
-/// （QUIC 载荷 kind=5 与 `homeway-quic` 的 `FRAME_KIND_QUIC` 按字节复刻互锚）。
+/// M5 S0 迁址（设计 §1.2-M1）→ M5 C3 随 `wtransport` 退役而定居 crate 根：中继
+/// （红线面）与 `relaywire` 直接用它在用（QUIC 载荷 kind=5 与 `homeway-quic` 的
+/// `FRAME_KIND_QUIC` 按字节复刻互锚）。
 pub mod legframe;
 pub mod logfile;
 pub mod nodestate;
@@ -44,22 +48,20 @@ pub mod probe;
 pub mod psk;
 /// 注册报文 v2（`"H2" ‖ pubkey ‖ devTag ‖ ts ‖ mac`，MAC 标签 `hr-reg2`）的编码面。
 ///
-/// M5 S0 迁址（设计 §1.2-M3）：原 `wtransport::reg` —— 出口 `admit_reg4` 用它**重建 v2
-/// 报文**再喂 `table.register`（时间窗/吊销/淘汰语义逐字不变），`server/table` 测试交叉验
-/// 同源；出口准入不随 WG 面退役 ⇒ 留 crate 根（名 `reg2` = 报文版本 v2 的编码面）。
+/// M5 S0 迁址（设计 §1.2-M3）→ M5 C3 随 `wtransport` 退役而定居 crate 根：出口
+/// `admit_reg4` 用它**重建 v2 报文**再喂 `table.register`（时间窗/吊销/淘汰语义逐字
+/// 不变），`server/table` 测试交叉验同源。
 pub mod reg2;
 pub mod relay;
 pub mod relaywire;
 pub mod server;
-pub mod session;
 pub mod session_lock;
 pub mod speedtest;
 pub mod speedtest_server;
 /// 栈 B（smoltcp 用户态栈）：`TunDevice`（`phy::Device`）+ `StackB` + `MTU`。
 ///
-/// M5 S0 迁址（设计 §1.2-M2）：原 `wgcore::stackb` —— 出口 intercept **生产面在用**
-/// （`TunDevice` 字段 + `TunDevice::new()`）与 intercept E2E 测试泵（`StackB`）⇒ 不随
-/// 客户端 WG 面删除；客户端生产消费者退役后留 crate 根（生产消费者 = intercept）。
+/// M5 S0 迁址（设计 §1.2-M2）→ M5 C3 后**唯一消费者 = 出口 intercept**（生产面
+/// `TunDevice` + E2E 测试泵 `StackB`）：客户端生产消费者已随 WG 面退役。
 pub mod stackb;
 pub mod status_json;
 /// 平台系统事实单源（fd 标志 / `sockaddr_un` 上限）——Q-G F1/F4；CLI crate 复用。
@@ -68,8 +70,6 @@ pub mod term;
 pub mod token;
 pub mod tunnel_addr;
 pub mod udpbatch;
-pub mod wgcore;
-pub mod wtransport;
 
 /// 构建标记（探针应答 `build` 字段 / 出口能力行的单一真源）。中继与出口共用——
 /// 中继此前 `Config.build` 全仓无赋值 ⇒ 恒 `"relay-dev"`（F9：探针应答上报真实构建）。

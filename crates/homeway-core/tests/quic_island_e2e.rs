@@ -550,27 +550,32 @@ fn generation_l3_rides_quic_datagram_against_local_exit() {
     println!("[e2e3] tun.status.ready={}", st.contains("\"state\":\"ready\""));
     assert!(st.contains("\"state\":\"ready\""), "世代须 ready：{st}");
 
-    // ① N-d（档位行）+ ② C2'（L3 承载面就绪）
+    // ① N-d（承载开关行）**已删**（M5 C3 单承载）+ ② C2'（L3 承载面就绪）
     let log = std::fs::read_to_string(&out).unwrap_or_default();
-    let nd = log
-        .lines()
-        .find(|l| l.contains("transport: 本世代 L3 承载 ="))
-        .unwrap_or("（缺）")
-        .to_owned();
-    println!("[e2e3] N-d={nd}");
-    assert!(nd.contains("= quic"), "N-d 须声明 quic 档：{nd}");
+    assert!(
+        !log.contains("transport: 本世代 L3 承载 ="),
+        "A/B 开关行（N-d）必须已删除：{log}"
+    );
+    assert!(
+        !log.contains("回落 WG") && !log.contains("尝试 WG 兜底"),
+        "单承载后不得有回落/兜底话术：{log}"
+    );
     let c2 = log
         .lines()
         .find(|l| l.contains("quic: 隧道侧就绪（L3 直通；"))
         .unwrap_or("（缺）")
         .to_owned();
     println!("[e2e3] C2'={c2}");
-    assert!(c2.contains("核心自连经 WG 拨隧道 IP"), "C2' 末句须为「经 WG」：{c2}");
+    assert!(
+        !c2.contains("经 WG"),
+        "C2' 末半句（核心自连经 WG）随 WG 面删除：{c2}"
+    );
+    assert!(c2.contains("后端隧道 IP"), "C2' 字段面保留：{c2}");
     assert!(
         log.contains("warmup pong: 就绪（判据=quic）"),
         "暖机判据位须为 quic（C8 值域扩展）"
     );
-    assert!(!log.contains("本世代回落 WG 承载"), "本用例不得回落 WG（岛真在用）：{log}");
+    assert!(!log.contains("回落 WG"), "本用例不得回落（单承载）：{log}");
     assert!(!log.contains("quic: 岛未就用"), "岛必须起来：{log}");
 
     // ③ 状态 JSON 的 quic 段
@@ -951,7 +956,7 @@ fn service_stream_rides_quic_through_app_core_bridge_against_local_exit() {
     // 世代日志：QUIC 档在场（判据 ⑤ 的前半）
     let log = std::fs::read_to_string(&out).unwrap_or_default();
     assert!(log.contains("quic: 隧道侧就绪（L3 直通；"), "QUIC 档须在场：{log}");
-    assert!(!log.contains("本世代回落 WG 承载"), "本用例不得回落 WG：{log}");
+    assert!(!log.contains("回落 WG"), "单承载后不得有回落话术：{log}");
 
     // ① 桥面（状态 JSON 的 bridgeAuth/bridgeFilesSock）
     let v: serde_json::Value = serde_json::from_str(&core.tun_status()).expect("tun_status 是 JSON");

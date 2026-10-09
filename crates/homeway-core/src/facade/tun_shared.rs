@@ -21,7 +21,7 @@ use std::sync::{Arc, Condvar, Mutex};
 
 use super::stage::{StageMachine, TunStage};
 
-/// 锁中毒不 panic（Q-F F6-1：单源上移到 `crate::syncutil`——session / wgcore /
+/// 锁中毒不 panic（Q-F F6-1：单源上移到 `crate::syncutil`——facade 面 /
 /// recover gate 与本处共用同一件；facade 内的既有调用点经本重导出零改动）。
 pub(crate) use crate::syncutil::lock_unpoison;
 

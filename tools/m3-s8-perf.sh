@@ -1,11 +1,10 @@
 #!/bin/zsh
 # m3-s8-perf.sh — M3 S8 **服务流吞吐相对门槛**本地 A/B（设计 §7/§15-3）。
 #
-# 做什么：同一台机器、同一个本地私有出口实例、**同一服务操作**（files 下载同一文件），
-# 两臂**唯一变量 = 承载**：
-#   · quic 臂 = App 核世代（transport=quic）→ STREAM[tag=files] → intake → 泵 → FilesServer
-#   · wg   臂 = App 核世代（transport=wg）→ WG 会话 → intercept 豁免 → UDS → 同一 FilesServer
-# 判据（§7）：quic/wg ≥ 0.95×（相对门槛）；读数逐轮落盘。
+# 做什么：同一台机器、同一个本地私有出口实例、**同一服务操作**（files 下载同一文件）：
+#   · quic 臂 = App 核世代 → STREAM[tag=files] → intake → 泵 → FilesServer
+# **M5 C3 单臂化（设计 §9.2 默认 (c)）**：原 A/B 的 wg 参照臂（WG 会隖 → intercept 豁免
+# → UDS）随 WG 面退役 ⇒ 相对门槛（quic/wg ≥ 0.95×）失去参照臂，只采绝对读数（逐轮落盘）。
 #
 # 用法：tools/m3-s8-perf.sh [实例号=5] [轮数=3] [文件字节=67108864]
 # 读数：/tmp/m3s8-res/perf/（SUMMARY.txt / perf-<arm>-r<N>.log / exit-lines.txt）
@@ -53,8 +52,8 @@ run_one() {
 
 rc=0
 for r in $(seq 1 "$ROUNDS"); do
-  # 轮序平衡：奇数轮 quic→wg，偶数轮 wg→quic
-  if (( r % 2 == 1 )); then order=(quic wg); else order=(wg quic); fi
+  # M5 C3：WG 参照臂退役 ⇒ 单臂（只跑 quic）
+  order=(quic)
   for arm in "${order[@]}"; do
     echo "==> 轮 $r / 臂 $arm"
     run_one "$arm" "$r" || rc=1

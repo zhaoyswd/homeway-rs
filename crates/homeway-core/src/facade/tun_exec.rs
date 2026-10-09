@@ -1,25 +1,29 @@
-//! 隧道域真执行体（语义真源 `baseline:clientcore/cmd/clientcore/tunmode.go` 的
-//! runTun2Tailcat + 巡检 goroutine + startDemandPusher + stats ticker + 隧道桥）。
+//! 隧道域真执行体（QUIC 岛单承载；语义真源 `baseline:clientcore/cmd/clientcore/tunmode.go`
+//! 的 runTun2Tailcat + 巡检 goroutine + startDemandPusher + stats ticker + 隧道桥）。
+//!
+//! **M5 C3 换型（设计 §4.3③）**：L3 承载恒 QUIC 岛（无 A/B 开关、无回落档）——
+//! 本文件与 `wgcore`/`wtransport`/`session` 的 WG 面同批删除；岛装配失败即本世代
+//! 失败（fail-visible：`岛未就用（…）` 归因行，设计 §2.6-G9）。
 //!
 //! 生命周期（工单①世代生命周期，Go 单 goroutine 生命线的 Rust 等价）：
 //!
 //! ```text
 //! prepare（启动即返）→ 世代线程:
-//!   起会话（identity + Client）→ 暖机 PathProbe（20s 软失败）
+//!   身份装配 → 岛构造 + 赛跑（准入）→ 暖机探活（岛 STREAM[probe]，20s 软失败）
 //!   → stage ready → 等 attach fd（60s 死线 → idle/"attach-timeout" 自收工）
-//!   → attach（fd 交 WG 引擎，L3 直通）→ stage attached
+//!   → attach（fd 交岛，L3 直通）→ stage attached
 //!   → portfwd 装表（Go 同序：桥之前）+ stale 复查
 //!   → 起桥（三座）+ 巡检 + demand pusher + stats
-//!   → 等 stop → 收工（pf 停 → 桥停 → client 停）→ finish_generation
+//!   → 等 stop → 收工（pf 停 → 桥停 → 岛停）→ finish_generation
 //! ```
 //!
 //! 一切退出路径都过 `finish_generation`（终态/放锁/done——防单飞锁泄漏）。
-//! 巡检语义对齐**隧道域**（与 `crate::session` 的服务域不同）：失败当拍 R1
-//! （补注册+丢会话）、3 连败 R2 起跑、阶梯失败 markUnhealthy("patrol") 交扩展
-//! 重建、demand 门控、挂起空窗 R1、中继升直连 5 拍。
+//! 巡检语义：失败当拍**只留痕**（动作面 = 岛内快探阶梯，M3 S4 §3.1——岛的动作快
+//! 240×，世代层不重复动作不抢跑），3 连败 markUnhealthy("patrol") 交扩展重建；
+//! demand 门控、挂起空窗留痕。（WG 档的 R1/R2/R3 阶梯与中继升直连条纹随 WG 删除。）
 
-use std::io::{self, Read, Write};
-use std::net::{SocketAddr, SocketAddrV4};
+use std::io;
+use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
@@ -27,16 +31,11 @@ use std::sync::{Arc, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::identity::{self, Identity};
-use crate::session::recover::{
-    self, Action, ActionError, LadderRc, LadderTransport, Level, RecoverGate, RefreshRegOutcome,
-};
 use crate::token::Token;
-use crate::wgcore::{Client, ConnErr, CoreConfig, CLIENT_CLOSE_BUDGET};
-use crate::wtransport::endpoint_cache::{EndpointCache, EndpointSource};
-use crate::wtransport::{Candidate, Via};
+use crate::tunnel_addr::SERVER_TUNNEL_IP;
 use crate::Logf;
 
-use super::bridge_host::{BridgeHost, BridgeStream, WriteHalf};
+use super::bridge_host::{BridgeHost, BridgeStream};
 use super::demand::{self, DemandSignals};
 use super::portfwd::{PfLimits, PfRuntime, PfSetup, PortForwardRule};
 use super::stage::TunStage;
@@ -54,99 +53,37 @@ const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 const FAIL_STREAK_LADDER: u32 = 3;
 /// 巡检连败证据时间窗（相邻计入失败的间隔超过它 ⇒ 计数作废）。
 const PATROL_FAIL_WINDOW: Duration = Duration::from_secs(600);
-/// 巡检失败拍的本地噪声回看窗（10s 探测 + 5s 尾窗）。
-const NOISE_WINDOW: Duration = Duration::from_secs(15);
-/// 本地错误长停逃逸阈值。
-const NOISE_ESCALATE_AFTER: Duration = Duration::from_secs(180);
-/// 补注册周期（出口设备表按最近注册判活跃）。
-const REG_REFRESH_EVERY: Duration = Duration::from_secs(300);
-/// 中继停留升直连的拍数。
-const RELAY_UPGRADE_EVERY: u32 = 5;
 /// demand pusher 节拍（D4：App 出站新鲜 + 接收静默 → 立即下推，不等巡检拍）。
 const PUSHER_TICK: Duration = Duration::from_secs(1);
 /// stats 周期的下限（防 cfg.stats_secs 填 0 打爆日志；Go normalize 同义下限）。
 const STATS_SECS_MIN: i64 = 5;
 /// stats 周期缺省（Go normalizeTunConfig 的 StatsSecs 缺省 60）。
 const STATS_SECS_DEFAULT: i64 = 60;
-/// 旁路探测预算（endpoint-freshness；结果只进缓存与日志——Go 8s 同值，
-/// 评审 r2-L5 对齐）。
-const PROBE_CANDIDATES_BUDGET: Duration = Duration::from_secs(8);
 /// mtu 缺省（Go Normalize：MTU ≤0 → 1280）。cfg.mtu 只进日志行（running /
-/// wgcore 应用面就绪），数据面恒 1280——P2 升档门已随 v0.2.2 简洁化批删除
+/// 应用面就绪），数据面恒 1280——P2 升档门已随 v0.2.2 简洁化批删除
 ///（docs/BASELINE.md 偏离表的 clamp 条目同批撤销）。
 const MTU_DEFAULT: i64 = 1280;
 /// 桥拨号预算缺省（Go Normalize：DialMs ≤0 → 15000——评审 r2-L5；随 tunConfig
 /// 的 dialMs 热传入 BridgeHost）。
 const DIAL_MS_DEFAULT: i64 = 15000;
 
-/// 退出路径 RPC 的预算（Q-F F3b/N1：close_write / SharedConn::drop 走在**必须退出**
-/// 的收工链上——引擎卡死时无界等待会把桥泵与世代收工钉住。2s = 阶梯动作预算同刻度，
-/// 正常引擎回执即时）。**M3 S3**：QUIC 档服务流的 `StreamShared::drop`/`close_write`
-/// 同预算同理由（`facade/quic_stream.rs`）。
+/// 退出路径 RPC 的预算（Q-F F3b/N1：close_write / `StreamShared::drop` 走在**必须退出**
+/// 的收工链上——引擎卡死时无界等待会把桥泵与世代收工钉住。2s = 动作预算同刻度，
+/// 正常引擎回执即时）。消费点 = QUIC 服务流（`facade/quic_stream.rs`）。
 pub(crate) const EXIT_RPC_BUDGET: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
-// M1 S3-1：L3 承载档（A/B 开关）与 QUIC 岛接线
+// 单承载常量（M5 C3：A/B 开关三键与回落档一并删除，设计 §4.3）
 // ---------------------------------------------------------------------------
-
-/// L3 承载档（M1 设计 §4.1：开关**只决定 L3 承载**——服务面与核自连在 M1 恒走 WG）。
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub(crate) enum L3Bearer {
-    /// WG（回退档：岛不构造、`quic:` 族行零输出，判据行全部回落今日原串）。
-    Wg,
-    /// QUIC 岛（缺省；岛构造 + 装配失败/全候选失败时**回落 WG**）。
-    Quic,
-}
-
-impl L3Bearer {
-    pub(crate) fn as_str(self) -> &'static str {
-        match self {
-            L3Bearer::Wg => "wg",
-            L3Bearer::Quic => "quic",
-        }
-    }
-
-    /// 取值解析（`quic`（缺省）/`wg`；同时接受 `1`/`0` 两形，`1`=quic——设计 §4.1）。
-    /// `None` = 非法值（调用方记行 + 按缺省走）。
-    fn parse(s: &str) -> Option<L3Bearer> {
-        match s.trim().to_ascii_lowercase().as_str() {
-            "" | "quic" | "1" | "true" => Some(L3Bearer::Quic),
-            "wg" | "0" | "false" => Some(L3Bearer::Wg),
-            _ => None,
-        }
-    }
-}
 
 /// 岛侧赛跑预算（世代装配期一次；覆盖 LAN/中继握手 + `hr-reg4` 四帧准入）。
 const QUIC_CONNECT_BUDGET: Duration = Duration::from_secs(5);
 /// 岛侧同步命令（TunAttach / Rebind）的等待预算（岛内短路径，超时 = 异常）。
 const QUIC_RPC_BUDGET: Duration = Duration::from_secs(5);
-
-/// 承载档解析：**env 优先**（`HOMEWAY_TRANSPORT`，首读缓存）→ config（`tunConfig.transport`）
-/// → 缺省 `quic`。非法值 ⇒ **记行 + 按缺省走**（fail-visible 不 fail-fast：这是排障
-/// 开关，不该把隧道打进死路——设计 §4.1）。
-fn resolve_bearer(cfg_value: &str, logf: &Logf) -> L3Bearer {
-    if let Some(raw) = crate::envflag::transport_raw() {
-        return match L3Bearer::parse(raw) {
-            Some(b) => b,
-            None => {
-                (logf)(&format!(
-                    "transport: HOMEWAY_TRANSPORT={raw:?} 非法（合法：quic|wg|1|0）——按缺省 quic 走"
-                ));
-                L3Bearer::Quic
-            }
-        };
-    }
-    match L3Bearer::parse(cfg_value) {
-        Some(b) => b,
-        None => {
-            (logf)(&format!(
-                "transport: tunConfig.transport={cfg_value:?} 非法（合法：quic|wg）——按缺省 quic 走"
-            ));
-            L3Bearer::Quic
-        }
-    }
-}
+/// 世代收尾的**岛**停止预算（Q-G F5：有界收工——到点 detach，不让收工链挂死）。
+/// 名与值沿 WG 档（2s）——相关行文（`等待岛线程收工超时（CLIENT_CLOSE_BUDGET）`）
+/// 是既有注册串面，改名等于无谓改写判据行。
+const CLIENT_CLOSE_BUDGET: Duration = Duration::from_secs(2);
 
 /// MTU 上限解析（设计 §12-①）：**env 优先**（`HOMEWAY_QUIC_MTU`）→ config
 /// （`tunConfig.quicMtuCap`，≤0 = 未设）→ 缺省 1400；有效区间 `[1320,1400]`。
@@ -174,114 +111,25 @@ fn resolve_mtu_cap(cfg_value: i64, logf: &Logf) -> u16 {
     QUIC_MTU_CAP_DEFAULT
 }
 
-/// link 段 via 词表（`direct|relay|none`）——岛侧 `Via` 的判据行取值是中文（C4'/C5'），
-/// link/JSON 面必须用既有三态词（C10 行文与键面零改动，只换来源）。
-fn link_via(v: Option<homeway_quic::Via>) -> &'static str {
+/// link 段 via 词表（`direct|relay|none`）——岛侧 `Via` 的**判据行**取值是中文
+/// （C4'/C5'），link/JSON 面必须用既有三态词（C10 行文与键面零改动，只换来源）。
+/// `none` 的落点 = 「岛未建连/未采纳」（`IslandSnapshot::via == None`）⇒ 由调用方
+/// 给字面量（本函数只管「有 via 时的两态」）。
+fn link_via(v: homeway_quic::Via) -> &'static str {
+    v.link_text()
+}
+
+/// link 段 via 词表全三态（`IslandSnapshot::via` 直投）。
+fn link_via_opt(v: Option<homeway_quic::Via>) -> &'static str {
     match v {
         None => "none",
-        Some(v) => v.link_text(),
+        Some(v) => link_via(v),
     }
 }
 
 // ---------------------------------------------------------------------------
 // 会话流适配器（桥远端——工单⑤ dial_port 接缝：流 id ≠ fd，适配成 Read/Write 两半）
 // ---------------------------------------------------------------------------
-
-/// 经会话的流连接（`Arc<Client>` + 流 id）。整体 drop 时关流（防半开连接累积）。
-struct SharedConn {
-    client: Arc<Client>,
-    id: u64,
-}
-
-impl Drop for SharedConn {
-    fn drop(&mut self) {
-        // Q-F F3b/N1：关流走在必须退出的收工链上（桥泵收口）——用有界面，引擎卡死
-        // 时不让 Drop 挂死线程（代价：极端形态下引擎内槽位滞留，由引擎收工统一回收）
-        let _ = self.client.close_bounded(self.id, EXIT_RPC_BUDGET);
-    }
-}
-
-/// 读半：`client.read(id)` 阻塞到有数据；`Err(Closed)` = EOF。
-pub struct SessionReadHalf {
-    shared: Arc<SharedConn>,
-    buf: Vec<u8>,
-    off: usize,
-}
-
-impl Read for SessionReadHalf {
-    fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.off < self.buf.len() {
-            let n = (self.buf.len() - self.off).min(out.len());
-            out[..n].copy_from_slice(&self.buf[self.off..self.off + n]);
-            self.off += n;
-            return Ok(n);
-        }
-        match self.shared.client.read(self.shared.id) {
-            Ok(data) => {
-                let n = data.len().min(out.len());
-                out[..n].copy_from_slice(&data[..n]);
-                self.buf = data;
-                self.off = n;
-                Ok(n)
-            }
-            Err(ConnErr::Closed) => Ok(0),
-            Err(e) => Err(io::Error::other(e.to_string())),
-        }
-    }
-}
-
-/// 写半：`client.write(id, data)`（栈缓冲满时阻塞回压）；close_write = FIN。
-pub struct SessionWriteHalf {
-    shared: Arc<SharedConn>,
-}
-
-impl Write for SessionWriteHalf {
-    /// 背压语义（R8-8b 上行 bulk 断流根因修复）：栈内 tx 缓冲满时 `send_slice` 返回
-    /// **Ok(0)**——io::Write 契约里 Ok(0) = 通道关（`write_all` 随即以 WriteZero 报错），
-    /// 桥泵据此拆连接 ⇒ 上行 bulk 一进慢链路（缓冲被 cwnd 门限速填满）就整轮断流
-    /// （真机实测：4 会话请求后 <1s 全 EOF；R7 E2E 的「上行帧中途断」同根因——
-    /// host 形态 CLI 走 ClientConn 的零进展重试环，此桥路径裸露）。这里把 Ok(0)
-    /// 展开成**有界等待重试**（Go net.Conn.Write 的阻塞语义）：重试节拍**分级退避**
-    /// （F8a：前 50 拍 2ms ⇒ 其后 10ms ⇒ 100 拍后 20ms 封顶——停滞期不再固定
-    /// ~500 次/s 的 `client.write` RPC 唤醒税），无进展上限 10s（远大于窗口时长，
-    /// 防死锁兜底）。
-    fn write(&mut self, data: &[u8]) -> io::Result<usize> {
-        if data.is_empty() {
-            return Ok(0); // 空写短路（评审 r1-补1：send_slice(&[]) 恒 Ok(0) 会被
-                          // 背压环当「缓冲满」空转 10s——io::Write 约定空写返 Ok(0)）
-        }
-        let no_progress = Instant::now();
-        let mut attempt: u32 = 0;
-        // R8-3 F12：零接纳时引擎把原 Vec 带回（WriteOut.back）——背压重试环不再
-        // 每拍重拷整段（此前 data.to_vec() 在循环内，2ms 节拍 × 整段 = 停滞期
-        // 常驻拷贝面）。
-        let mut pending: Option<Vec<u8>> = Some(data.to_vec());
-        loop {
-            let chunk = match pending.take() {
-                Some(v) => v,
-                None => data.to_vec(), // 防御面：回执未带（不发生——引擎零接纳必带）
-            };
-            match self.shared.client.write(self.shared.id, chunk) {
-                Ok(w) if w.n == 0 => {
-                    pending = w.back;
-                    if no_progress.elapsed() > Duration::from_secs(10) {
-                        return Err(io::Error::new(
-                            io::ErrorKind::TimedOut,
-                            "写通道长时间无进展（栈内发送缓冲不排空）",
-                        ));
-                    }
-                    std::thread::sleep(write_retry_backoff(attempt));
-                    attempt = attempt.saturating_add(1);
-                }
-                Ok(w) => return Ok(w.n),
-                Err(e) => return Err(io::Error::other(e.to_string())),
-            }
-        }
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
-    }
-}
 
 /// 背压重试节拍（F8a 纯函数）：前 50 拍 2ms、51–100 拍 10ms、其后 20ms 封顶。
 /// 10s 无进展上界与「空写短路」语义不随本表变化。**M3 S3**：QUIC 档写半
@@ -297,73 +145,12 @@ pub(crate) fn write_retry_backoff(attempt: u32) -> Duration {
     }
 }
 
-impl WriteHalf for SessionWriteHalf {
-    fn close_write(&mut self) {
-        // Q-F F3b/N1：半关走在桥泵收口路径上——有界（同 EXIT_RPC_BUDGET）
-        let _ = self.shared.client.shutdown_bounded(self.shared.id, EXIT_RPC_BUDGET);
-    }
-}
-
-/// 恢复感知的会话流拨号（Go DialTCPPort 的等价面：healing_dial_port——首段短试 →
-/// 阶梯 R2 → 余预算重试）。隧道域**桥**消费（pf 走 [`session_connect_target`] 裸拨
-/// ——D11：桥的首试失败要触发恢复，pf 的常态拒绝不许）。
-pub fn session_connect(
-    run: &GenRun,
-    port: u16,
-    budget: Duration,
-) -> io::Result<Box<dyn BridgeStream>> {
-    let dst = SocketAddrV4::new(crate::wgcore::SERVER_TUNNEL_IP, port);
-    let gen_client = run.current_client();
-    // 装配期拨号（世代在世但 Client 未起——理论窗口；桥 attached 后才有，防御性收口）
-    let gen_client = gen_client
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "世代装配中（数据面未就绪）"))?;
-    let id = healing_dial(&gen_client, run, dst, budget)?;
-    Ok(Box::new(SessionStream::shared(gen_client, id)))
-}
-
-/// **裸拨**（Go `DialTCPPort`/`DialTCP` 的等价面 = `Client::connect_deadline` 直接建连）。
-///
-/// Q-F-B F2-1/D11：portfwd 的入站连接**不复用** `healing_dial`——「目标拒绝」是端口
-/// 转发的常态（浏览器探测、目标服务没起），复用会把常态失败升级成 R2 恢复动作并刷
-/// 未节流的 RECOVER 行。恢复能力不因此丢失：`patrol` 派生线程独立驱动恢复（设计门
-/// 第二轮已核）。
-pub fn session_connect_target(
-    run: &GenRun,
-    dst: SocketAddrV4,
-    budget: Duration,
-) -> io::Result<Box<dyn BridgeStream>> {
-    // **环回归一（M4 §1.3 裁决 D-1 在 WG 腿内的落点）**：`PfDialTarget::ExitPort` 的 wire
-    // 语义 M4 起是「出口回环」（`portfwd::PfDialTarget::resolve`），而 WG 档的「出口本机」
-    // 只能经**隧道 IP** 表达（出口 intercept 的豁免臂 `dst == tunnel_ip ⇒ 出口 127.0.0.1`）
-    // ⇒ 环回目标在本腿替换；A1① 的「客户端不得把 127/8 当隧道内目标」约束**只在 WG 腿内**
-    // 继承，wire 语义不外泄。
-    let dst = wg_dial_addr(dst);
-    let gen_client = run.current_client();
-    // 装配期拨号（同上——pf 的 accept 线程只活在 attached 后，防御性收口）
-    let gen_client = gen_client
-        .ok_or_else(|| io::Error::new(io::ErrorKind::NotConnected, "世代装配中（数据面未就绪）"))?;
-    let id = gen_client.connect_deadline(dst, budget).map_err(conn_err_to_io)?;
-    Ok(Box::new(SessionStream::shared(gen_client, id)))
-}
-
-/// WG 腿的目标归一：**环回 ⇒ 出口隧道 IP 的该端口**，其余原样。
-///
-/// **双栈期临时物（M4 §10-W10）**：M5 删 [`session_connect_target`] 时一并删——那时
-/// 「出口本机」只由 QUIC 档的 `127.0.0.1:p` 表达，本函数不再有调用点。
-fn wg_dial_addr(dst: SocketAddrV4) -> SocketAddrV4 {
-    if dst.ip().is_loopback() {
-        SocketAddrV4::new(crate::wgcore::SERVER_TUNNEL_IP, dst.port())
-    } else {
-        dst
-    }
-}
-
 /// portfwd 拨号缝的生产实现（`PfRuntime` 全注入面——闭包持 `Weak<GenRun>` 防 Arc 环：
 /// 世代收工后 `upgrade()` 失败 = 拨号失败如实收口（conn 线程记 fails + RST + 行））。
 ///
-/// **分派（M4 §2.1）**：判据 = `l3_on_island()`（与桥拨号 `tun_exec.rs` 的 `BridgeHost`
-/// 构造处**同源同形**）——岛在世且 L3 在岛上 ⇒ QUIC 档（`STREAM[dial]`）；其余（WG 档 /
-/// 岛未就 / 岛已收回 / 单测合成世代）⇒ WG 腿。
+/// **单腿（M5 C3）**：判据 = `l3_on_island()`（与桥拨号 `BridgeHost` 构造处**同源同形**）
+/// ——岛在世且 L3 在岛上 ⇒ `STREAM[dial]`；否则（岛不在/已收回/合成世代的拨号桩）
+/// 如实归因「岛不在」，**不留第二条腿**。
 ///
 /// **阀 / 两阶段 install / `FlowGuard` / 计数逐字保留（§2.3）**：承载差异**止于此闭包**
 /// （`PfDialFn` 签名与语义不变 ⇒ `admit_conn` 与 `pf_conn_thread` 一行不改）。
@@ -378,118 +165,18 @@ fn pf_dial_via_run(
             "世代已收工（拨号放弃）",
         ));
     };
-    if r.l3_on_island() {
-        super::quic_stream::dial_target(&r, dst, budget)
-    } else {
-        session_connect_target(&r, dst, budget)
+    if !r.l3_on_island() {
+        return Err(io::Error::new(
+            io::ErrorKind::NotConnected,
+            "岛不在（L3 未承接）——端口转发无法拨号",
+        ));
     }
+    super::quic_stream::dial_target(&r, dst, budget)
 }
 
-/// `ConnErr` → `io::Error` 的类型归因（评审 r2-M9：桥宿主的「出口活着、端口没服务」
-/// 判定只认 kind，不做字符串嗅探）。
-fn conn_err_to_io(e: ConnErr) -> io::Error {
-    match e {
-        ConnErr::Refused => io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string()),
-        ConnErr::Timeout => io::Error::new(io::ErrorKind::TimedOut, e.to_string()),
-        other => io::Error::other(other.to_string()),
-    }
-}
-
-/// 会话流整体（实现 BridgeStream：拆两半给泵）。
-pub(crate) struct SessionStream {
-    shared: Arc<SharedConn>,
-}
-
-impl SessionStream {
-    /// 从会话句柄 + 流 id 构造（服务桥消费——dial_via_run）。
-    pub(crate) fn shared(client: Arc<Client>, id: u64) -> Self {
-        SessionStream {
-            shared: Arc::new(SharedConn { client, id }),
-        }
-    }
-}
-
-impl BridgeStream for SessionStream {
-    fn into_halves(
-        self: Box<Self>,
-    ) -> io::Result<(Box<dyn Read + Send>, Box<dyn WriteHalf + Send>)> {
-        Ok((
-            Box::new(SessionReadHalf {
-                shared: Arc::clone(&self.shared),
-                buf: Vec::new(),
-                off: 0,
-            }),
-            Box::new(SessionWriteHalf {
-                shared: Arc::clone(&self.shared),
-            }),
-        ))
-    }
-}
-
-/// 恢复感知拨号（Session::healing_dial 的隧道域内联版：4s 首试 → 阶梯 R2 → 余预算）。
-/// 错误归因类型化（评审 r2-M9）：Refused → io ErrorKind::ConnectionRefused——桥宿主
-/// 的「出口活着、端口没服务」判定只认 kind，不再字符串嗅探。
-///
-/// Q-F F3（设计门 D4/D9/C4）：**阶梯与阶梯等待计入调用方同一预算**——`deadline`
-/// 透给恢复闸（等待到点 ⇒ `(Deadline,false)`，不发布不清闸）；首试与尾试各按剩余
-/// 夹取。残余越界上界 = 一个动作预算（`recover::ACTION`=2s，动作不可中断）。
-fn healing_dial(
-    client: &Arc<Client>,
-    run: &GenRun,
-    dst: SocketAddrV4,
-    budget: Duration,
-) -> io::Result<u64> {
-    dial_with_recover(client, dst, budget, FIRST_TRY, |lvl, deadline, cause| {
-        run.recover_until(lvl, cause, deadline)
-    })
-}
-
-/// 阶梯首试预算（隧道域；服务域用 `session::DIAL_FIRST_TRY` 同值）。
-/// **M3 S3**：QUIC 档服务流拨号的首试同值（`facade/quic_stream.rs`——两端「首试」的
+/// 拨号首试预算（隧道域；宿主会话的服务域用 `host_session` 的同值档——两端「首试」的
 /// 语义面一致，便于对照读数）。
 pub(crate) const FIRST_TRY: Duration = Duration::from_secs(4);
-
-/// 恢复感知拨号的可测主体（两域共用形；单测注入「阻塞到期限」的桩闭包 ⇒ 断言
-/// 预算内返回——预算须 > `first_try` 且断言桩被调用过，否则假绿）。
-fn dial_with_recover<F>(
-    client: &Arc<Client>,
-    dst: SocketAddrV4,
-    budget: Duration,
-    first_try: Duration,
-    recover: F,
-) -> io::Result<u64>
-where
-    F: FnOnce(Level, Option<Instant>, &str) -> (LadderRc, bool),
-{
-    let t0 = Instant::now();
-    let deadline = t0 + budget;
-    match client.connect_deadline(dst, first_try.min(budget)) {
-        Ok(id) => return Ok(id),
-        Err(e) => {
-            if t0.elapsed() >= budget {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, e.to_string()));
-            }
-        }
-    }
-    // 拨号失败 → 阶梯（世代还在就恢复它；引擎收工 = 如实报错）；期限随调用方预算
-    let (rc, _waited) = recover(Level::R2, Some(deadline), "拨号失败");
-    match rc {
-        LadderRc::Recovered(_) => {
-            let remain = budget
-                .saturating_sub(t0.elapsed())
-                .max(Duration::from_millis(1));
-            client.connect_deadline(dst, remain).map_err(conn_err_to_io)
-        }
-        LadderRc::Deadline => Err(io::Error::new(
-            io::ErrorKind::TimedOut,
-            "拨号失败且恢复预算耗尽（放弃等待）",
-        )),
-        other => Err(io::Error::new(
-            io::ErrorKind::NotConnected,
-            format!("拨号失败且阶梯未恢复（rc={:?}）", other.as_rc()),
-        )),
-    }
-}
 
 // ---------------------------------------------------------------------------
 // 世代运行态（Go tunRun）
@@ -509,35 +196,15 @@ pub struct GenRun {
     pub stop: Arc<AtomicBool>,
     /// 世代事件通道（stop/kick 的唤醒面）。
     pub ev_tx: mpsc::SyncSender<GenEvent>,
-    /// **本世代 L3 承载档**（装配期定案，世代内不变——设计 §4.1 的世代级粒度）。
-    pub(crate) bearer: L3Bearer,
-    /// QUIC 岛（quic 档构造；`None` = 未构造/已收回/回落 WG）。
-    ///
-    /// 构造点 = `gen_loop` 内 `Client::start` 之后同区段（设计 §2.6）；**同世代内两条
-    /// 传输并存**（WG 客户端照常承载服务面与核自连）。
+    /// QUIC 岛（世代装配期构造；`None` = 未构造/已收回）。**M5 C3 单承载**：
+    /// 岛装配失败即本世代失败（无回落档，设计 §4.3③）。
     island: RwLock<Option<Arc<homeway_quic::Island>>>,
-    /// L3 实际落在岛上（quic 档 + 岛建连成功；岛装配失败/全候选失败 ⇒ false = 回落 WG）。
+    /// L3 是否已承接（装配期置位；`l3_on_island()` 的另一半判据）。
     l3_on_island: AtomicBool,
-    /// 当前数据面（rebuild 换代；拨号/恢复自动落新世代）。**装配期后填**
-    /// （评审 r2-M2：GenRun 在 identity/Client::start 之前就建好登记——窗口内
-    /// request_stop/recover 打得到世代句柄，Go beginTunRun 时序同构）。
-    client: RwLock<Option<Arc<Client>>>,
-    /// 恢复闸（按世代隔离）。
-    gate: RecoverGate,
-    /// 端点学习缓存（None = 不落盘不学）。
-    cache: Option<Mutex<EndpointCache>>,
-    static_cands: Vec<Candidate>,
-    /// 域名条目候选（最近一次解析产物；静态面 = static_cands + 本组——P0-4）。
-    domain_cands: Mutex<Vec<Candidate>>,
-    /// 域名重解析编排（无域名条目 = None；Rearm/RearmSoft/旁路探测拍触发）。
-    domain_refresher: RwLock<Option<Arc<crate::wtransport::domain_eps::DomainRefresher>>>,
-    /// 重建材料（Token 的身份面；候选 = static_cands 另存）。Secret 非 Copy
-    /// （F8d）——持有者唯一、Drop 擦除。
-    secret: crate::token::Secret,
-    #[allow(dead_code)]
-    // 重建材料位（对齐 Go tunRun 的会话材料；隧道域不 rebuild——阶梯失败交扩展）
-    peer_pub: [u8; 32],
+    /// 身份面（世代归因）。
     identity: Identity,
+    /// 本世代隧道地址（`transport.tunIp` 的源；装配期一次派生）。
+    tun_ip: String,
     /// 链路快照（runner link 段数据源；巡检写）。
     pub link: Mutex<Option<LinkIn>>,
     /// 隧道桥（attached 后起；None = 未起/已停）。
@@ -553,28 +220,10 @@ pub struct GenRun {
     pub pf: PfRuntime,
     /// 世代时间起点（elapsed 面板用）。
     pub started: Instant,
-    /// 缓存落盘信号（hint/探测观察到新端点时投；save 线程去抖消费——我-2③）。
-    save_tx: Option<mpsc::SyncSender<()>>,
-    /// hint 打洞节流（Go punchTo 的 5s 节流位）。
-    last_punch: Mutex<Option<Instant>>,
 }
 
 impl GenRun {
-    /// 当前数据面（装配期 = None——评审 r2-M2 的窗口语义；拨号/巡检等
-    /// 后装配路径不会被踩到，调用方按各自语义处理 None）。
-    pub fn current_client(&self) -> Option<Arc<Client>> {
-        self.client
-            .read()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
-    }
-
-    /// 数据面回填（Client::start 成功后；一次性）。
-    fn set_client(&self, c: Arc<Client>) {
-        *self.client.write().unwrap_or_else(|e| e.into_inner()) = Some(c);
-    }
-
-    /// 当前岛（quic 档且已构造；已收回 = None）。
+    /// 当前岛（已构造且在位；已收回 = None）。
     pub fn current_island(&self) -> Option<Arc<homeway_quic::Island>> {
         self.island
             .read()
@@ -595,7 +244,7 @@ impl GenRun {
             .take()
     }
 
-    /// L3 是否落在岛上（判据 = quic 档 + 岛建连成功；见 `l3_on_island`）。
+    /// L3 是否落在岛上（判据 = 承接位 + 岛在位；装配期/收回后为假）。
     pub fn l3_on_island(&self) -> bool {
         self.l3_on_island.load(Ordering::Acquire)
             && self
@@ -609,216 +258,68 @@ impl GenRun {
         self.l3_on_island.store(v, Ordering::Release);
     }
 
+    /// 岛在位且已承接 ⇒ 一切 L3 取数的**唯一**来源（单承载：无第二条腿）。
+    /// 取数点按它解构（缺失 ⇒ `None`/零值），不再有「按档分派」。
+    fn engaged_island(&self) -> Option<Arc<homeway_quic::Island>> {
+        if !self.l3_on_island() {
+            return None;
+        }
+        self.current_island()
+    }
+
     // ---- L3 承载面的同接口取数（设计 §2.5「接口不变、来源切换」）----
 
     /// TUN fd 字节对表（stats 行与 `runner.stats` 的源）。
     fn l3_tun_stats(&self) -> (u64, u64) {
-        match (self.l3_on_island(), self.current_island()) {
-            (true, Some(i)) => i.tun_stats(),
-            _ => self.current_client().map(|c| c.tun_stats()).unwrap_or((0, 0)),
-        }
+        self.engaged_island()
+            .map(|i| i.tun_stats())
+            .unwrap_or((0, 0))
     }
 
     /// 取走并清零 App 出站包计数（巡检拍的需求信号源）。
     fn l3_swap_out_pkts(&self) -> i64 {
-        match (self.l3_on_island(), self.current_island()) {
-            (true, Some(i)) => i.swap_out_pkts(),
-            _ => self.current_client().map(|c| c.swap_out_pkts()).unwrap_or(0),
-        }
+        self.engaged_island()
+            .map(|i| i.swap_out_pkts())
+            .unwrap_or(0)
     }
 
     /// 最近出站包时刻（单调面；下推器时基）。
     fn l3_last_outbound_at(&self) -> Option<Instant> {
-        match (self.l3_on_island(), self.current_island()) {
-            (true, Some(i)) => i.last_outbound_at(),
-            _ => self.current_client().and_then(|c| c.last_outbound_at()),
-        }
+        self.engaged_island().and_then(|i| i.last_outbound_at())
     }
 
     /// 最近出站包时刻（unix 毫秒；`transport.outboundAt` 的源）。
     fn l3_last_outbound_unix_ms(&self) -> i64 {
-        match (self.l3_on_island(), self.current_island()) {
-            (true, Some(i)) => i.last_outbound_unix_ms(),
-            _ => self
-                .current_client()
-                .map(|c| c.last_outbound_unix_ms())
-                .unwrap_or(0),
-        }
+        self.engaged_island()
+            .map(|i| i.last_outbound_unix_ms())
+            .unwrap_or(0)
     }
 
-    /// 「对端来的包」计数（下推器的接收静默判据；WG 面 = `Snapshot::rx`，岛面 =
-    /// 已写回 TUN 的包数——两者都是「对端方向有流量」的可观测等价面）。
+    /// 「对端来的包」计数（下推器的接收静默判据；= 已写回 TUN 的包数）。
     fn l3_rx(&self) -> u64 {
-        match (self.l3_on_island(), self.current_island()) {
-            (true, Some(i)) => i.snapshot().packets_out,
-            _ => self.current_client().map(|c| c.snapshot().rx).unwrap_or(0),
-        }
+        self.engaged_island()
+            .map(|i| i.snapshot().packets_out)
+            .unwrap_or(0)
     }
 
     /// 岛侧链路快照 `(via, ep, rtt_ms)`——C10 快照形态与 `link{via,ep,rttMs,at}` 的
-    /// **来源切换**（设计 §4.3；`None` = 岛不在 ⇒ 调用方走 WG 既有路径）。
+    /// **来源**（`None` = 岛不在/未承接 ⇒ 调用方按空快照处理）。
     fn island_link(&self) -> Option<(String, String, i64)> {
-        if !self.l3_on_island() {
-            return None;
-        }
-        let s = self.current_island()?.snapshot();
+        let s = self.engaged_island()?.snapshot();
         Some((
-            link_via(s.via).to_owned(),
+            link_via_opt(s.via).to_owned(),
             s.ep.map(|a| a.to_string()).unwrap_or_default(),
             s.rtt_ms as i64,
         ))
     }
 
-    /// 恢复入口（gate 单飞；隧道域 rc 契约）。
-    pub fn recover(&self, from: Level, cause: &str) -> LadderRc {
-        self.recover_until(from, cause, None).0
-    }
-
-    /// 带期限的恢复入口（Q-F F3-1/F3-2）：`deadline` 透到阶梯本体（每档起点/动作前
-    /// 检查）与闸等待（等待方到点返回 `(Deadline,false)`，在途轮照常跑完）。
-    /// 第二返回值 = 是否等到了结果（执行方恒 true）。
-    pub fn recover_until(
-        &self,
-        from: Level,
-        cause: &str,
-        deadline: Option<Instant>,
-    ) -> (LadderRc, bool) {
-        let sh = self;
-        sh.gate
-            .merge_until(from, deadline, |lvl, d| run_round(sh, lvl, cause, d))
-    }
-
-    fn merged_candidates(&self) -> Vec<Candidate> {
-        let domain = lock_unpoison(&self.domain_cands).clone();
-        let mut base = self.static_cands.clone();
-        base.extend(domain);
-        match &self.cache {
-            Some(c) => {
-                let c = lock_unpoison(c);
-                c.merge(&base, SystemTime::now())
-            }
-            None => base,
-        }
-    }
-
-    /// 域名重解析触发（Rearm/RearmSoft 面——无域名 = no-op）。
-    fn domain_refresh_async(&self) {
-        if let Some(rf) = self
-            .domain_refresher
-            .read()
-            .map(|g| g.clone())
-            .unwrap_or(None)
-        {
-            rf.refresh_async();
-        }
-    }
-
-    /// 真实往返落已验证（来源 = static 内 → Token 否则 Hint）。
-    fn mark_round_trip(&self, addr: SocketAddr) {
-        if let Some(c) = &self.cache {
-            let src = if self.static_cands.iter().any(|c| c.addr == addr) {
-                EndpointSource::Token
-            } else {
-                EndpointSource::Hint
-            };
-            lock_unpoison(c).mark_verified(addr, src, SystemTime::now());
-        }
-    }
-
-    /// 请求缓存落盘（去抖窗由 save 线程合并——我-2③；无缓存/无线程时静默）。
-    fn schedule_save(&self) {
-        if let Some(tx) = &self.save_tx {
-            let _ = tx.try_send(());
-        }
-    }
-}
-
-/// 阶梯一轮（EngineTransport 的隧道域版——Client 动作面 + 候选重投）。
-fn run_round(run: &GenRun, from: Level, cause: &str, deadline: Option<Instant>) -> LadderRc {
-    let Some(client) = run.current_client() else {
-        // 装配期窗口（评审 r2-M2）：本地动作面不在——按本地动作失败收轮（-4），
-        // 不让恢复闸挂死
-        (run.logf)(&format!(
-            "RECOVER {cause}：世代装配中（数据面未起），本地动作失败收轮"
-        ));
-        return LadderRc::ActionFailed("世代装配中".into());
-    };
-    let mut tr = TunnelTransport {
-        run,
-        client: &client,
-    };
-    let mut probe = |d: Duration| client.path_probe(d).is_ok();
-    let mut deps = recover::LadderDeps {
-        probe: &mut probe,
-        tr: &mut tr,
-        logf: &|s: &str| (run.logf)(s),
-        pre_probe: recover::PRE_PROBE,
-        verify: recover::VERIFY,
-        deadline,
-    };
-    recover::run_ladder(&mut deps, from, cause)
-}
-
-struct TunnelTransport<'a> {
-    run: &'a GenRun,
-    client: &'a Client,
-}
-
-impl LadderTransport for TunnelTransport<'_> {
-    fn apply(&mut self, a: Action) -> Result<(), ActionError> {
-        match a {
-            Action::ResetPeerSession => self
-                .client
-                .reset_peer_session_bounded(recover::ACTION)
-                .map_err(action_err),
-            Action::Rebind => self
-                .client
-                .rebind_bounded(recover::ACTION)
-                .map_err(action_err),
-            Action::Rearm => {
-                // R3 = 清采纳重赛跑 + 候选重投（Go Transport.Rearm 复合）+ 域名重解析
-                // 并发另跑（P0-4：动作本体零 DNS 等待）。
-                self.client
-                    .rearm_bounded(recover::ACTION)
-                    .map_err(action_err)?;
-                let cands = self.run.merged_candidates();
-                self.client.set_candidates(cands);
-                self.run.domain_refresh_async();
-                Ok(())
-            }
-        }
-    }
-
-    fn refresh_reg(&mut self) -> Result<RefreshRegOutcome, ActionError> {
-        match self.client.refresh_reg_bounded(recover::ACTION) {
-            Ok(true) => Ok(RefreshRegOutcome::Sent),
-            Ok(false) => Ok(RefreshRegOutcome::Skipped),
-            Err(e) => Err(action_err(e)),
-        }
-    }
-
-    fn note_path_alive(&mut self) {
-        let snap = self.client.snapshot();
-        if snap.via == Via::Direct {
-            if let Some(ep) = snap.ep {
-                self.run.mark_round_trip(ep);
-            }
-        }
-    }
-}
-
-fn action_err(e: ConnErr) -> ActionError {
-    match e {
-        ConnErr::Timeout => ActionError::Timeout,
-        other => ActionError::Failed(other.to_string()),
-    }
 }
 
 // ---------------------------------------------------------------------------
 // TunnelExec（TunExecutor 真实现）
 // ---------------------------------------------------------------------------
 
-/// 隧道域执行体（真 hub：Client + L3 直通 + 巡检 + 桥）。
+/// 隧道域执行体（真 hub：岛 + L3 直通 + 巡检 + 桥）。
 /// 世代登记经 `Arc<Mutex<Option<Arc<GenRun>>>>`（世代线程构建后写回——warmup 是
 /// `&self`，不持自引用）；identity 装配窗口的停止请求经 TunShared 的旗标中继
 /// （评审 r2-M2：warmup 时记下共享面，request_stop 在世代句柄就位前也有落点）。
@@ -879,11 +380,8 @@ impl TunExecutor for TunnelExec {
                 DIAL_MS_DEFAULT
             },
             identity_dir: (!cfg.identity_dir.is_empty()).then(|| PathBuf::from(&cfg.identity_dir)),
-            endpoint_cache_dir: (!cfg.endpoint_cache_dir.is_empty())
-                .then(|| PathBuf::from(&cfg.endpoint_cache_dir)),
             port_forwards: cfg.port_forwards.clone(),
-            // M1 S3-1：承载档 + MTU 上限（**世代级读一次**；非法值在这里记行、行随本世代日志）
-            bearer: resolve_bearer(&cfg.transport, &raw_logf),
+            // MTU 上限（**世代级读一次**；非法值在这里记行、行随本世代日志）
             mtu_cap: resolve_mtu_cap(cfg.quic_mtu_cap, &raw_logf),
         };
         // 共享面记下（request_stop 的窗口中继位——评审 r2-M2）
@@ -908,14 +406,14 @@ impl TunExecutor for TunnelExec {
             if run.gen == run.tun_shared.gen.load(Ordering::Acquire) {
                 run.stop.store(true, Ordering::Release);
                 let _ = run.ev_tx.try_send(GenEvent::Stop);
-                // preparing 阶段没有 fd 循环可打断，暖机探测可能挂在引擎 RPC 上——
-                // 关客户端是最可靠的第二条打断路径（Go tunStopWait 同义）。
+                // preparing 阶段没有 fd 循环可打断，暖机探测可能挂在岛 RPC 上——
+                // 停岛是最可靠的第二条打断路径（Go tunStopWait 同义）。
                 if run.tun_shared.stage.snapshot().stage == TunStage::Preparing {
-                    if let Some(c) = run.current_client() {
-                        // Q-G F5：**有界**收工（暖机探测可能挂在引擎 RPC 上——到点
-                        // detach，wake fd 交收割线程；无界会拖死 tun_stop 的等待）
-                        if !c.stop_within(Instant::now() + CLIENT_CLOSE_BUDGET) {
-                            (run.logf)("等待 client 线程收工超时（CLIENT_CLOSE_BUDGET）——放行自退（引擎线程由收割线程收口）");
+                    if let Some(i) = run.take_island() {
+                        // Q-G F5：**有界**收工（暖机探测可能挂在岛 RPC 上——到点
+                        // detach；无界会拖死 tun_stop 的等待）
+                        if !i.stop_within(Instant::now() + CLIENT_CLOSE_BUDGET) {
+                            (run.logf)("等待岛线程收工超时（CLIENT_CLOSE_BUDGET）——到点 detach");
                         }
                     }
                 }
@@ -929,7 +427,9 @@ impl TunExecutor for TunnelExec {
         }
     }
 
-    fn recover(&self, from: i64, cause: &str) -> i32 {
+    /// **M5 C3 单承载**：恢复下推恒走岛档（`from` 的档位名只进归因行文本——rc 契约
+    /// 面仍由 `facade::host_session::Level` 的 `clamp` 定；见 `facade/mod.rs`）。
+    fn recover(&self, _from: i64, cause: &str) -> i32 {
         let Some(run) = self.gen_run() else {
             return -2; // 没有 attached 隧道（不构成网络结论）
         };
@@ -938,15 +438,7 @@ impl TunExecutor for TunnelExec {
         if run.gen != run.tun_shared.gen.load(Ordering::Acquire) {
             return -2;
         }
-        // **M4 §5.3（§15-1 裁定「本期修」）：按有效承载分档**——判据 = `l3_on_island()`
-        // （**不是** `bearer`：`bearer=Quic` 但岛未就的世代按 WG 跑，用 bearer 会（a）对一条
-        // 确实 attached 的 WG 隧道谎报「无 attached」、（b）在「QUIC 分支」里经 `l3_probe`
-        // 回落 `path_probe` ⇒ 分支里跑 WG 动作）。
-        if run.l3_on_island() {
-            return recover_downpush_on_island(&run, cause);
-        }
-        let lvl = Level::clamp(from);
-        run.recover(lvl, cause).as_rc()
+        recover_downpush_on_island(&run, cause)
     }
 
     fn runner(&self) -> Option<RunnerIn> {
@@ -986,24 +478,14 @@ impl TunExecutor for TunnelExec {
     }
 }
 
-/// 【test-seams】最小世代（Q-F F1 状态面集成 + 热替换 rc 断言用）：真惰性 Client +
-/// 空桥/空缓存/空域名面 + portfwd 运行时（拨号桩恒失败——本缝不建隧道）。
+/// 【test-seams】最小世代（Q-F F1 状态面集成 + 热替换 rc 断言用）：**无岛**（岛不在 ⇒
+/// L3 未承接；需要岛面的用例自行 `set_island`，见 `idle_island`）+ portfwd 运行时
+/// （拨号桩恒失败——本缝不建隧道）。
 /// `tun_shared.gen` 与 `run.gen` 对齐（否则 stale 复查恒 `-1`，正例不可测）。
 #[cfg(test)]
 impl GenRun {
     pub(crate) fn synthetic_for_test(logf: Logf) -> GenRun {
         let ident = crate::identity::Identity::ephemeral().expect("临时身份");
-        let client = Client::start(CoreConfig {
-            peer_id: crate::token::PeerId::from([1u8; 32]),
-            secret: crate::token::Secret::from([2u8; 32]),
-            identity: ident.clone(),
-            candidates: vec![Candidate {
-                addr: "203.0.113.1:41641".parse().unwrap(),
-                relay: false,
-            }],
-            logf: Arc::clone(&logf),
-        })
-        .expect("惰性客户端可起");
         let (ev_tx, _ev_rx) = mpsc::sync_channel::<GenEvent>(8);
         let tun_shared = Arc::new(TunShared::new());
         tun_shared.begin_generation(1);
@@ -1014,18 +496,14 @@ impl GenRun {
             gen: 1,
             stop: Arc::clone(&stop),
             ev_tx,
-            bearer: L3Bearer::Wg,
             island: RwLock::new(None),
             l3_on_island: AtomicBool::new(false),
-            client: RwLock::new(Some(Arc::new(client))),
-            gate: RecoverGate::new(),
-            cache: None,
-            static_cands: vec![],
-            domain_cands: Mutex::new(vec![]),
-            domain_refresher: RwLock::new(None),
-            secret: crate::token::Secret::from([2u8; 32]),
-            peer_pub: [3u8; 32],
-            identity: ident,
+            identity: ident.clone(),
+            tun_ip: crate::tunnel_addr::derive_tun_ip(
+                &crate::token::Secret::from([2u8; 32]),
+                &ident.public_key(),
+            )
+            .to_string(),
             link: Mutex::new(None),
             bridge: Mutex::new(None),
             logf: Arc::clone(&logf),
@@ -1044,8 +522,6 @@ impl GenRun {
                 limits: PfLimits::default(),
             }),
             started: Instant::now(),
-            save_tx: None,
-            last_punch: Mutex::new(None),
         }
     }
 }
@@ -1076,7 +552,7 @@ pub(crate) fn runner_of(run: &GenRun) -> RunnerIn {
         // 端口转发计数（Q-F-B F3-1）：**真值**——accept 准入数 / 拨号失败数。
         pf_accepted: run.pf.counters().accepted(),
         pf_fails: run.pf.counters().fails(),
-        exit_ip: crate::wgcore::SERVER_TUNNEL_IP.to_string(),
+        exit_ip: SERVER_TUNNEL_IP.to_string(),
         link,
         port_forwards: run.pf.snapshot_states(),
         bridge,
@@ -1085,31 +561,21 @@ pub(crate) fn runner_of(run: &GenRun) -> RunnerIn {
 
 /// transport 块的组装（同 runner_of 的共享件）。
 pub(crate) fn transport_of(run: &GenRun) -> TransportIn {
-    let client = run.current_client();
     TransportIn {
         identity: Some((run.identity.short_dev(), run.identity.short_pub())),
         tun_ip: Some(run.tun_ip_string()),
         outbound_at_ms: Some(run.l3_last_outbound_unix_ms()).filter(|v| *v != 0),
-        // bind 全候选发送统计面（拍板①：采纳/累计本地错误数——tunStatusJSON 的
-        // demand.localErr* 两键源；装配期 = None）。quic 档该面缺席（WG bind 的
-        // 本地发送统计没有岛侧等价物 ⇒ 两键缺省，additive 兼容）。
-        local_err: if run.l3_on_island() {
-            None
-        } else {
-            client.as_ref().map(|c| c.local_err_counters())
-        },
+        // `demand.localErr*` 两键的源（WG bind 的全候选发送统计）随 WG 面退役：
+        // 岛无该面 ⇒ 两键**恒缺席**（additive 兼容；登记 = M5 观测面收窄）。
+        local_err: None,
     }
 }
 
-/// `quic` 段快照（M1 S3-2；`None` = 岛不在 ⇒ JSON 整段缺席）。
+/// `quic` 段快照（`None` = 岛不在 ⇒ JSON 整段缺席）。
 pub(crate) fn quic_status_of(run: &GenRun) -> Option<QuicIn> {
-    // 段存在判据 = **本世代 quic 档 且 岛已构造**（M3 S5 订正：**不再**要求「L3 落在岛上」）。
-    // 理由（§4）：岛建连失败（含准入被拒）时本世代回落 WG，而「为什么走了 WG」正是 App
-    // 需要的归因——旧判据下该段整段缺席，黑洞期设备侧不可见（M2 真机发现①）。
-    // 语义变化登记（S7）：`quic` 段 = 「本世代 quic 档的岛实况」（含未建连/被拒形态）。
-    if run.bearer != L3Bearer::Quic {
-        return None;
-    }
+    // 段存在判据 = **岛已构造**（含未建连/被拒形态——「为什么没连上」正是 App 需要的
+    // 归因；M3 S5 起不再要求「L3 已在岛上」）。单承载后「本世代是不是 quic 档」不再是
+    // 变量（设计 §4.3③）。
     let s = run.current_island()?.snapshot();
     Some(quic_in_of(&s))
 }
@@ -1130,7 +596,7 @@ pub(crate) fn quic_in_of(s: &homeway_quic::IslandSnapshot) -> QuicIn {
             return_queue_full: s.drops.return_queue_full,
             unregistered: s.drops.unregistered,
         },
-        via: link_via(s.via).to_owned(),
+        via: link_via_opt(s.via).to_owned(),
         ep: s.ep.map(|a| a.to_string()).unwrap_or_default(),
         rtt_ms: s.rtt_ms,
         packets_in: s.packets_in,
@@ -1167,10 +633,7 @@ struct GenCfg {
     /// 评审 r2-L5：此前是死字段）
     dial_ms: i64,
     identity_dir: Option<PathBuf>,
-    endpoint_cache_dir: Option<PathBuf>,
     port_forwards: Vec<PortForwardRule>,
-    /// L3 承载档（M1 S3-1：`HOMEWAY_TRANSPORT` > `tunConfig.transport` > 缺省 quic）。
-    bearer: L3Bearer,
     /// QUIC MTU 上限（M1 §12-①：`HOMEWAY_QUIC_MTU` > `tunConfig.quicMtuCap` > 1400；
     /// 有效区间 [1320,1400]，非法 ⇒ 记行 + 缺省）。
     mtu_cap: u16,
@@ -1178,7 +641,7 @@ struct GenCfg {
 
 impl GenRun {
     fn tun_ip_string(&self) -> String {
-        crate::tunnel_addr::derive_tun_ip(&self.secret, &self.identity.public_key()).to_string()
+        self.tun_ip.clone()
     }
 }
 
@@ -1197,12 +660,7 @@ fn gen_loop(
         let l = Arc::clone(&raw_logf);
         Arc::new(move |s: &str| l(&format!("tier-core: {s}")))
     };
-    (logf)("传输：新栈（wg-native-stack）");
-    // N-d（M1 §3.3）：世代装配时一行——观测面一致性的锚（A/B 开关 + 回退档判据）。
-    (logf)(&format!(
-        "transport: 本世代 L3 承载 = {}（A/B 开关：env HOMEWAY_TRANSPORT / tunConfig.transport；回退 = wg）",
-        cfg.bearer.as_str()
-    ));
+    (logf)("传输：新栈（QUIC 岛）");
 
     // ---- 装配（identity/Client/缓存——Go startSession 段判据行同串）----
     // 早段收尾守卫（复核 r3-F1：GenRun/Finish 挂上**之前**的失败路径〔空候选/身份
@@ -1229,27 +687,6 @@ fn gen_loop(
     // TunShared 的旗标中继，装配完成点统一收口（评审 r2-M2 的窗口语义）。
     let stop = Arc::new(AtomicBool::new(false));
     shared.set_stop_flag_if_current(gen, Arc::clone(&stop));
-    // P0-4：域名端点展开（IP 字面量直入 + 域名建会话解析一次 + 原文留给重解析）。
-    // M1 S1c：WG 档候选**不吃 QUIC 类端点**（§2.1 末段「两族候选不得互相投喂」）——
-    // 过滤在 `token::wg_endpoint_refs`（同规则被 daemon `host reach` 与 session 面共用）
-    let ep_refs: Vec<crate::token::EndpointRef> = crate::token::wg_endpoint_refs(&cfg.token.endpoints);
-    let inputs = crate::wtransport::domain_eps::split_and_resolve(&ep_refs, &logf);
-    let candidates: Vec<Candidate> = inputs.candidates;
-    let domain_eps = inputs.domains;
-    // 静态基座 = 仅 IP 字面量（评审 4.3：域名首解析产物进 domain_cands 组——
-    // 否则旧解析地址永不退场、且与 domain 组在 merged_candidates 里重复）。
-    let inputs_static_base = inputs.static_base;
-    let domain_initial = inputs.domain_initial;
-    if candidates.is_empty() {
-        shared.stage.set_if_current(
-            gen,
-            TunStage::Failed,
-            "core",
-            "token 里没有任何可用端点",
-            false,
-        );
-        return;
-    }
     let (ident, src, warn) =
         match identity::load_or_create(cfg.identity_dir.as_deref(), &cfg.token.peer_id) {
             Ok(v) => v,
@@ -1265,16 +702,7 @@ fn gen_loop(
             }
         };
     log_identity(&logf, &ident, src, warn, &cfg.identity_dir);
-    // 缓存先开（Client 起来前的候选合并要用——我-2①）。**借开不搬**（`cfg` 在下方
-    // 岛构造/MTU 面仍要整体借用——搬字段会让 `cfg` 半移动）。
-    let cache = cfg.endpoint_cache_dir.as_ref().map(|dir| {
-        let mut c = EndpointCache::open(dir, cfg.token.peer_id);
-        c.set_logger(Arc::clone(&logf));
-        c
-    });
     let (ev_tx, ev_rx) = mpsc::sync_channel::<GenEvent>(8);
-    let (hint_tx, hint_rx) = mpsc::sync_channel::<SocketAddr>(8);
-    let (save_tx, save_rx) = mpsc::sync_channel::<()>(1);
     // portfwd 运行时先建材料（拨号闭包经 `Arc::new_cyclic` 拿 `Weak<GenRun>`——
     // 运行时结构上不依赖 GenRun，但生产实现要回指它；Weak 破环 = 世代可回收，D7）。
     let pf_budget = Duration::from_millis(cfg.dial_ms.max(1) as u64);
@@ -1284,16 +712,11 @@ fn gen_loop(
             gen,
             stop: Arc::clone(&stop),
             ev_tx,
-            bearer: cfg.bearer,
             island: RwLock::new(None),
             l3_on_island: AtomicBool::new(false),
-            client: RwLock::new(None),
-            gate: RecoverGate::new(),
-            cache: cache.map(Mutex::new),
-            static_cands: inputs_static_base,
-            secret: cfg.token.secret.clone(),
-            peer_pub: *cfg.token.peer_id.as_bytes(),
             identity: ident.clone(),
+            tun_ip: crate::tunnel_addr::derive_tun_ip(&cfg.token.secret, &ident.public_key())
+                .to_string(),
             link: Mutex::new(None),
             bridge: Mutex::new(None),
             logf: Arc::clone(&logf),
@@ -1307,55 +730,9 @@ fn gen_loop(
                 limits: PfLimits::default(),
             }),
             started: Instant::now(),
-            save_tx: Some(save_tx),
-            last_punch: Mutex::new(None),
-            domain_cands: Mutex::new(domain_initial.clone()),
-            domain_refresher: RwLock::new(None),
         }
     });
-    // P0-4：域名重解析编排装配（回调持 Weak 回指 GenRun）。
-    if !domain_eps.is_empty() {
-        let w1 = Arc::downgrade(&run);
-        let w2 = Arc::downgrade(&run);
-        let w3 = Arc::downgrade(&run);
-        let rf = Arc::new(crate::wtransport::domain_eps::DomainRefresher::new(
-            domain_eps,
-            domain_initial,
-            Arc::clone(&logf),
-            Arc::new(move |fresh: &[Candidate]| {
-                if let Some(r) = w1.upgrade() {
-                    *lock_unpoison(&r.domain_cands) = fresh.to_vec();
-                    if let Some(c) = r.current_client() {
-                        let merged = r.merged_candidates();
-                        c.set_candidates(merged);
-                    }
-                }
-            }),
-            Arc::new(move || {
-                let r = w2.upgrade()?;
-                let c = r.current_client()?;
-                let snap = c.snapshot();
-                if snap.via == Via::Relay { snap.ep } else { None }
-            }),
-            Arc::new(move || {
-                if let Some(r) = w3.upgrade() {
-                    if let Some(c) = r.current_client() {
-                        let _ = c.rearm_soft_bounded(recover::ACTION);
-                        if let Some(ec) = &r.cache {
-                            lock_unpoison(ec).note_rearm();
-                        }
-                        let merged = r.merged_candidates();
-                        c.set_candidates(merged);
-                    }
-                }
-            }),
-        ));
-        *run
-            .domain_refresher
-            .write()
-            .unwrap_or_else(|e| e.into_inner()) = Some(rf);
-    }
-    // ---- 世代句柄登记（Client::start **之前**——评审 r2-M2：窗口内 request_stop/
+    // ---- 世代句柄登记（岛装配**之前**——评审 r2-M2：窗口内 request_stop/
     // recover/runner 打得到世代；Go beginTunRun 在 goroutine 之前建好世代句柄）----
     *lock_unpoison(&state) = Some(Arc::clone(&run));
 
@@ -1374,31 +751,13 @@ fn gen_loop(
             // 收工段停过；这里的第二次调用是 no-op。清 states = Go
             // stopPortForwards 语义：停止之后不许残留 listening）
             self.run.pf.stop_all();
-            // 岛停（M1 §2.6 的收尾链**同址同序**：pf → bridge → 岛 stop_within → 缓存
-            // 终写 → finish_generation；正常路径已在收工段停过 ⇒ 这里是幂等兜底，
+            // 岛停（§2.6 的收尾链**同址同序**：pf → bridge → 岛 stop_within →
+            // finish_generation；正常路径已在收工段停过 ⇒ 这里是幂等兜底，
             // 覆盖 panic/早退路径不留孤儿岛）。
             if let Some(i) = self.run.take_island() {
                 if !i.stop_within(Instant::now() + CLIENT_CLOSE_BUDGET) {
                     (self.run.logf)("等待岛线程收工超时（CLIENT_CLOSE_BUDGET）——到点 detach（M0 §8.1 残余：老世代可能继续发包）");
                 }
-            }
-            if let Some(c) = self
-                .run
-                .client
-                .write()
-                .unwrap_or_else(|e| e.into_inner())
-                .take()
-            {
-                // Q-G F5：有界收工（Drop 里 spawn 收割线程允许——Q-F 段⑤先例；
-                // 到点 detach，引擎线程自行退出）
-                if !c.stop_within(Instant::now() + CLIENT_CLOSE_BUDGET) {
-                    (self.run.logf)("等待 client 线程收工超时（CLIENT_CLOSE_BUDGET）——放行自退（引擎线程由收割线程收口）");
-                }
-            }
-            // 缓存终写（我-2③：世代收尾前把学到/验证过的端点落盘——Go closeClientOnce
-            // 路径的 save 同义；进程被杀时由去抖线程的先前行兜底）
-            if let Some(c) = self.run.cache.as_ref() {
-                let _ = lock_unpoison(c).save(SystemTime::now());
             }
             // 登记槽清理（复核 r3-F2：只清自己——ptr_eq 防误清接管者；清掉后新世代的
             // 装配窗口里 gen_run() 返回 None ⇒ request_stop 走共享面旗标中继〔M-2
@@ -1421,64 +780,30 @@ fn gen_loop(
     // 收尾义务交接给真 Finish（早段守卫 disarm——见 EarlyFinish 注释）
     _early.disarmed = true;
 
-    let client = match Client::start(CoreConfig {
-        peer_id: cfg.token.peer_id,
-        // Secret 非 Copy（F8d）：cfg.token 在下方 derive_tunnel_ip 仍要借 secret
-        secret: cfg.token.secret.clone(),
-        identity: ident.clone(),
-        candidates: candidates.clone(),
-        logf: Arc::clone(&logf),
-    }) {
-        Ok(c) => c,
-        Err(e) => {
+    let tunnel_ip = crate::tunnel_addr::derive_tunnel_ip(&cfg.token.secret, &ident.public_key());
+    // ---- QUIC 岛装配（单承载：岛成 ⇒ 本世代唯一承载；岛不成 ⇒ 本世代失败）----
+    // 失败路径 = **可见失败**（设计 §2.6-G9：无 QUIC/中继端点的 token〔`serve.quic=false`
+    // 形态 / 旧 token〕、无 RPK、岛起不来、赛跑未成——四条同一归因锚 `岛未就用（…）`；
+    // M5 起无回落承载，故 stage 直接落 failed，不再有「按 WG 跑」的第二态）。
+    match start_island(&run, &cfg, &ident, &logf) {
+        Ok(()) => {
+            run.set_l3_on_island(true);
+            // C2'（设计 §3.3）：L3 承载面就绪的那一行（去末半句「经 WG」——半句已随
+            // WG 面删除而不成立）。
+            (logf)(&format!(
+                "隧道侧就绪（L3 直通；隧道地址 {tunnel_ip}，后端隧道 IP {SERVER_TUNNEL_IP}）"
+            ));
+        }
+        Err(note) => {
+            (logf)(&format!("quic: 岛未就用（{note}）"));
             shared.stage.set_if_current(
                 gen,
                 TunStage::Failed,
                 "core",
-                &format!("新栈启动失败：数据面装配失败：{e}"),
+                &format!("岛未就用（{note}）"),
                 false,
             );
             return;
-        }
-    };
-    let client = Arc::new(client);
-    // 装配窗口内收到 stop（评审 r2-M2 的窗口收口）：停在装配完成点，不进暖机
-    if run.stop.load(Ordering::Acquire) {
-        // Q-G F5：有界收工（本处在世代线程内联执行——预算语义 = 「本线程不无限等」，
-        // 与 `session::rebuild_session` 的两处一致）
-        if !client.stop_within(Instant::now() + CLIENT_CLOSE_BUDGET) {
-            (logf)("等待 client 线程收工超时（CLIENT_CLOSE_BUDGET）——放行自退（引擎线程由收割线程收口）");
-        }
-        shared
-            .stage
-            .set_if_current(gen, TunStage::Idle, "stopped", "被停止请求中断", false);
-        (logf)("装配期间收到停止信号，收工（不进暖机）");
-        return;
-    }
-    run.set_client(Arc::clone(&client));
-    let tunnel_ip = crate::tunnel_addr::derive_tunnel_ip(&cfg.token.secret, &ident.public_key());
-    // ---- M1 S3-1：QUIC 岛构造（设计 §2.6 的构造点 = `Client::start` 之后同区段）----
-    // 同世代内两条传输并存：WG 客户端照常承载**服务面与核自连**（§1.5/§4.1），岛只在
-    // quic 档并且**只承载 L3**。装配失败/全候选失败 ⇒ 记行 + **回落 WG**（配置不一致
-    // 形态的裁决面：`serve.quic=false` × `transport=quic` ⇒ token 无 QUIC 端点/RPK ⇒
-    // 岛起不来 ⇒ 这一代按 WG 跑，隧道功能不丢）。
-    if cfg.bearer == L3Bearer::Quic {
-        match start_island(&run, &cfg, &ident, &logf) {
-            Ok(()) => {
-                run.set_l3_on_island(true);
-                // C2 的 QUIC 档形态（设计 §3.3 C2'）：L3 承载面就绪的那一行。
-                // 末句「经 WG」= 事实（M1 的核自连仍在 WG/栈 B 上，M3 才退役栈 B）。
-                (logf)(&format!(
-                    "quic: 隧道侧就绪（L3 直通；隧道地址 {tunnel_ip}，后端隧道 IP {}，核心自连经 WG 拨隧道 IP）",
-                    crate::wgcore::SERVER_TUNNEL_IP
-                ));
-            }
-            Err(note) => {
-                (logf)(&format!(
-                    "quic: 岛未就用（{note}）——本世代回落 WG 承载（L3 与判据行按 WG 档；下一世代重试）"
-                ));
-                run.set_l3_on_island(false);
-            }
         }
     }
     (logf)(&format!(
@@ -1487,45 +812,19 @@ fn gen_loop(
         tunnel_ip
     ));
 
-    // ---- 端点学习缓存接线（我-2 三缺的修复面）----
-    // ① 首次候选合并喂给 bind（学习缓存里的历史端点进赛跑集——Go Transport 构造
-    //    里的 bind.SetCandidates(Merge(static))）
-    client.set_candidates(run.merged_candidates());
-    // ② hint 链路（中继观察的对端地址线索 → 缓存 + 候选重投 + 打洞 + 落盘信号）
-    // ③ 落盘去抖线程（信号合并 + 1s 去抖窗；终写在上面的 Finish guard）
-    if run.cache.is_some() {
-        install_tunnel_hint(&client, hint_tx);
-        spawn_tunnel_hint_handler(Arc::clone(&run), hint_rx);
-        spawn_tunnel_save_loop(Arc::clone(&run), save_rx);
-    } else {
-        drop(hint_rx);
-        drop(save_rx);
+    // ---- 暖机（20s；软失败继续——判据 = 岛 STREAM[probe] 回显）----
+    // C8：单承载后判据位恒 `quic`（值域 `{wg,quic}` 收窄为 `{quic}`；设计 §8.1-C8）。
+    // 装配窗口内收到 stop 的收口（评审 r2-M2）：岛已在位但 fd 未 attach——直接走
+    // 「暖机前停止」收工段（与下方的停止检查同语义）。
+    if run.stop.load(Ordering::Acquire) {
+        shared
+            .stage
+            .set_if_current(gen, TunStage::Idle, "stopped", "被停止请求中断", false);
+        (logf)("装配期间收到停止信号，收工（不进暖机）");
+        return;
     }
-
-    // 候选清单（标记·学习）
-    {
-        let merged = run.merged_candidates();
-        let parts: Vec<String> = merged
-            .iter()
-            .map(|c| {
-                let known = run.static_cands.iter().any(|s| s.addr == c.addr);
-                let learned = if known { "" } else { "·学习" };
-                let tag = crate::wtransport::bind::candidate_tag(c.addr, c.relay);
-                format!("{}（{tag}{learned}）", c.addr)
-            })
-            .collect();
-        (logf)(&format!(
-            "候选端点（{} 条，标记·学习=来自巡检缓存/中继 hint）：{}",
-            merged.len(),
-            parts.join("、")
-        ));
-    }
-
-    // ---- 暖机（20s；软失败继续——判据 = 隧道内 RST 探测）----
-    // **判据位随档位**（M1 设计 §3.3 C8）：quic 档 = 岛 `Cmd::Probe`（QUIC STREAM 回显）
-    // ⇒ `判据=quic`、`readyBy=quic`；wg 档原样 `判据=wg`。
     let warm_started = Instant::now();
-    let meowed = if run.l3_on_island() {
+    let meowed = {
         match l3_probe(&run, WARM_TIMEOUT) {
             Ok(()) => {
                 let rtt = warm_started.elapsed();
@@ -1542,7 +841,7 @@ fn gen_loop(
                 true
             }
             Err(ProbeFail::IslandGone(m)) => {
-                // 岛线程已退出（= WG 面的 EngineGone 同面）：stop 打断或异常退出
+                // 岛线程已退出：stop 打断或异常退出
                 if run.stop.load(Ordering::Acquire) {
                     shared.stage.set_if_current(
                         gen,
@@ -1565,69 +864,13 @@ fn gen_loop(
                 return;
             }
             Err(e) => {
-                // 其余（探活无证据/命令超时/连接未就绪）= 软失败，与 WG 档的
-                // `ConnErr::Timeout` 同处置（attach 后由流量触发重试注册）
+                // 其余（探活无证据/命令超时/连接未就绪）= **软失败**：净空 fwd 后由
+                // 流量触发岛内重试注册（M3 起的常态路径）
                 (logf)(&format!(
                     "暖机 {} 内未获岛探活证据（{e}）：按软失败继续（attach 后由流量触发重试注册）",
                     crate::go_fmt::fmt_duration_go_ms(WARM_TIMEOUT)
                 ));
                 false
-            }
-        }
-    } else {
-        match client.path_probe(WARM_TIMEOUT) {
-            Ok(()) => {
-                let rtt = warm_started.elapsed();
-                let snap = client.snapshot();
-                *lock_unpoison(&run.link) = Some(LinkIn {
-                    via: snap.via.as_str().to_owned(),
-                    ep: snap.ep.map(|a| a.to_string()).unwrap_or_default(),
-                    rtt_ms: rtt.as_millis() as i64,
-                    at_ms: now_unix_ms(),
-                });
-                shared.stage.set_ready_by("wg");
-                (logf)("warmup pong: 就绪（判据=wg）");
-                true
-            }
-            Err(ConnErr::Timeout) => {
-                (logf)(&format!(
-                    "暖机 {} 内未收到 meowed：按软失败继续（attach 后由流量触发重试注册）",
-                    crate::go_fmt::fmt_duration_go_ms(WARM_TIMEOUT)
-                ));
-                false
-            }
-            Err(ConnErr::EngineGone) => {
-                // stop 打断（request_stop 关了客户端）或引擎异常退出
-                if run.stop.load(Ordering::Acquire) {
-                    shared.stage.set_if_current(
-                        gen,
-                        TunStage::Idle,
-                        "stopped",
-                        "被停止请求中断",
-                        false,
-                    );
-                    (logf)("暖机期间收到停止信号，收工（不等 attach）");
-                } else {
-                    shared.stage.set_if_current(
-                        gen,
-                        TunStage::Failed,
-                        "core",
-                        "暖机期间引擎异常退出",
-                        false,
-                    );
-                }
-                return;
-            }
-            Err(e) => {
-                (logf)(&format!("warmup ping: {e}"));
-                shared.stage.set_if_current(
-                    gen,
-                    TunStage::Failed,
-                    "core",
-                    &format!("建立隧道会话失败：{e}"),
-                    false,
-                );
-                return;
             }
         }
     };
@@ -1694,76 +937,28 @@ fn gen_loop(
         }
     };
 
-    // fd 所有权在扩展（坑 50）：attach 失败不 close，由扩展 destroy 回收。
-    // fd 错误回调 → markUnhealthy_if_current("fd")（写序：先 why 后 healthy；世代
-    // 守卫在 TunShared 内——评审 r2-M1：旧世代 fd 被 destroy 后报错是必然事件）。
-    {
-        let sh = Arc::clone(&shared);
-        let raw = Arc::clone(&raw_logf);
-        client.set_on_tun_error(Box::new(move |msg: &str| {
-            raw(&format!("tier-core: {msg}"));
-            sh.mark_unhealthy_if_current(gen, "fd");
-        }));
-    }
-    // L3 承载面装配：quic 档且岛在位 ⇒ **fd 交岛**（`TunAttach`；WG 客户端本世代不 attach
-    // ——服务面/核自连不经 TUN fd，见 §1.5）；其余（含岛装配失败回落）⇒ WG 原路径。
-    // 岛路径失败 ⇒ **WG 兜底**（fd 未被消费，仍可用）= 回落档；两路都失败才 Fail。
-    let attach: Result<(), AttachFail> = if run.l3_on_island() {
-        match run.current_island() {
-            Some(island) => attach_island(&island, fd, cfg.mtu),
-            None => Err(AttachFail::Island("岛句柄不在".to_owned())),
-        }
-    } else {
-        attach_wg(&run, fd, cfg.mtu)
+    // L3 承载面装配（**单腿**：fd 交岛；岛不在 ⇒ 失败，无第二条腿）。fd 所有权在扩展
+    // （坑 50）：attach 失败不 close，由扩展 destroy 回收。
+    let attach: Result<(), String> = match run.current_island() {
+        Some(island) => attach_island(&island, fd, cfg.mtu),
+        None => Err("岛句柄不在（世代已收回？）".to_owned()),
     };
-    if let Err(e) = attach {
-        match e {
-            AttachFail::Island(note) => {
-                (logf)(&format!("quic: 岛附加失败（{note}）—— 尝试 WG 兜底"));
-                match attach_wg(&run, fd, cfg.mtu) {
-                    Ok(()) => {
-                        run.set_l3_on_island(false);
-                        (logf)("quic: 本世代 L3 回落 WG 承载（判据行/观测面随档位切换）");
-                    }
-                    Err(AttachFail::Wg(wg_note) | AttachFail::Island(wg_note)) => {
-                        if run.stop.load(Ordering::Acquire) {
-                            shared.stage.set_if_current(
-                                gen,
-                                TunStage::Idle,
-                                "stopped",
-                                "被停止请求中断",
-                                false,
-                            );
-                            return;
-                        }
-                        shared.stage.set_if_current(
-                            gen,
-                            TunStage::Failed,
-                            "attach",
-                            &format!("attach 失败：{wg_note}"),
-                            false,
-                        );
-                        return;
-                    }
-                }
-            }
-            AttachFail::Wg(note) => {
-                if run.stop.load(Ordering::Acquire) {
-                    shared
-                        .stage
-                        .set_if_current(gen, TunStage::Idle, "stopped", "被停止请求中断", false);
-                    return;
-                }
-                shared.stage.set_if_current(
-                    gen,
-                    TunStage::Failed,
-                    "attach",
-                    &format!("attach 失败：{note}"),
-                    false,
-                );
-                return;
-            }
+    if let Err(note) = attach {
+        if run.stop.load(Ordering::Acquire) {
+            shared
+                .stage
+                .set_if_current(gen, TunStage::Idle, "stopped", "被停止请求中断", false);
+            return;
         }
+        (logf)(&format!("岛附加失败（{note}）"));
+        shared.stage.set_if_current(
+            gen,
+            TunStage::Failed,
+            "attach",
+            &format!("attach 失败：{note}"),
+            false,
+        );
+        return;
     }
     shared
         .stage
@@ -1783,31 +978,22 @@ fn gen_loop(
 
     // ---- 隧道桥（attached 后才起——「会话在桥在」）----
     //
-    // **M3 S3 换轨（设计 §3/§5.1 第 1/3–4 项）**：`DialFn` 签名不变，实现按**承载档**分派——
-    // - QUIC 档（岛建连成功）⇒ 开 `STREAM[tag]`（虚拟端口 → tag 见 `quic_stream::tag_for_port`），
-    //   应用层帧逐字节不变；**该分支不触 WG 会话**（S6 的「QUIC 档路径不得再可达 stackb::」）；
-    // - 其余（WG 档 / 岛未就用回落 / 岛已收回）⇒ 既有 `session_connect`（WG 会话 + 恢复阶梯，
-    //   逐字保留——D1 裁定：本体与 WG 档消费点保留，随 M5 与 `wgcore` 同批删除）。
-    //
-    // QUIC 档下**未知端口**（不在 7802/7724/7803 三个服务端口内）不再回落 WG：那是协议面
-    // 无法表达的拨号（本期限定三个服务 tag），静默走 WG 会把「QUIC 档零 stackb」变成条件成立。
+    // **M5 C3 单腿**：`DialFn` 签名不变，实现恒开 `STREAM[tag]`（虚拟端口 → tag 见
+    // `quic_stream::tag_for_port`），应用层帧逐字节不变；**未知端口**（不在
+    // 7802/7724/7803 三个服务端口内）不回落任何第二条腿：那是协议面无法表达的拨号
+    // （本期限定三个服务 tag）。
     let bridge = Arc::new(BridgeHost::new(
         "隧道桥",
         cfg.identity_dir.clone(),
         Arc::clone(&logf),
         {
             let run2 = Arc::clone(&run);
-            Arc::new(move |port, budget| {
-                if run2.l3_on_island() {
-                    return match super::quic_stream::tag_for_port(port) {
-                        Some(tag) => super::quic_stream::dial(&run2, tag, budget),
-                        None => Err(io::Error::new(
-                            io::ErrorKind::Unsupported,
-                            format!("QUIC 档无该虚拟端口的服务 tag（port={port}）"),
-                        )),
-                    };
-                }
-                session_connect(&run2, port, budget)
+            Arc::new(move |port, budget| match super::quic_stream::tag_for_port(port) {
+                Some(tag) => super::quic_stream::dial(&run2, tag, budget),
+                None => Err(io::Error::new(
+                    io::ErrorKind::Unsupported,
+                    format!("无该虚拟端口的服务 tag（port={port}）"),
+                )),
             })
         },
     ));
@@ -1917,15 +1103,14 @@ fn gen_loop(
     if let Some(b) = bridge {
         b.stop();
     }
-    // 岛停（M1 §2.6：与 WG 客户端 `stop_within` **同址同序**——pf → bridge → 岛 →
-    // 缓存终写 → finish_generation；岛停在此处显式做，`Finish::drop` 的兜底覆盖
-    // panic/早退路径）。
+    // 岛停（§2.6 的收尾链：pf → bridge → 岛 stop_within → finish_generation；
+    // 岛停在此处显式做，`Finish::drop` 的兜底覆盖 panic/早退路径）。
     if let Some(i) = run.take_island() {
         if !i.stop_within(Instant::now() + CLIENT_CLOSE_BUDGET) {
             (run.logf)("等待岛线程收工超时（CLIENT_CLOSE_BUDGET）——到点 detach（老世代可能继续发包，M0 §8.1 残余）");
         }
     }
-    // _finish（Drop）：client.stop() + 缓存终写 + finish_generation
+    // _finish（Drop）：岛停兜底 + finish_generation
 }
 
 // ---------------------------------------------------------------------------
@@ -1964,131 +1149,6 @@ fn spawn_derived(
             crate::syncutil::log_spawn_failed(&logf, name, &e, consequence);
             None
         }
-    }
-}
-
-// ---------------------------------------------------------------------------
-// hint 链路 + 缓存落盘（我-2：隧道域端点学习缓存三缺的修复件——服务域 session/mod.rs
-// 的 spawn_hint_handler/spawn_save_loop 的隧道域对应物）
-// ---------------------------------------------------------------------------
-
-/// hint 回调安装（回调纪律：驱动线程内只投通道——解析失败静默丢）。
-fn install_tunnel_hint(client: &Arc<Client>, hint_tx: mpsc::SyncSender<SocketAddr>) {
-    client.set_on_hint(Arc::new(move |addr: &str| {
-        if let Ok(ap) = addr.parse::<SocketAddr>() {
-            // 地址键归一（M2 代码门 G3，同类 D1）：hint 串是**学习集/候选集的入口**
-            // （缓存键、Merge 候选键、日志）——mapped 与纯 v4 两形态不得各占一份。
-            let _ = hint_tx.try_send(crate::udpbatch::unmap_v4_in6(ap));
-        }
-    }));
-}
-
-/// hint 处理线程（Go Transport 的 hint 链路：观察 → 候选重投 → 落盘信号 → 打洞）。
-fn spawn_tunnel_hint_handler(run: Arc<GenRun>, rx: mpsc::Receiver<SocketAddr>) {
-    let logf = Arc::clone(&run.logf);
-    let spawned = std::thread::Builder::new()
-        .name("homeway-tun-hint".into())
-        .spawn(move || {
-            while !run.stop.load(Ordering::Acquire) {
-                let Ok(addr) = rx.recv_timeout(Duration::from_millis(500)) else {
-                    continue;
-                };
-                // 缓存观察（最新鲜的不可信线索）
-                if let Some(c) = run.cache.as_ref() {
-                    lock_unpoison(c).observe(addr, EndpointSource::Hint, SystemTime::now());
-                }
-                // 候选重投（学习到的地址进赛跑集）
-                let merged = run.merged_candidates();
-                if let Some(cl) = run.current_client() {
-                    cl.set_candidates(merged);
-                }
-                run.schedule_save();
-                tunnel_punch_to(&run, addr);
-            }
-        });
-    if let Err(e) = spawned {
-        crate::syncutil::log_spawn_failed(
-            &logf,
-            "homeway-tun-hint",
-            &e,
-            "本世代不做 hint 打洞（候选仍按巡检刷新）",
-        );
-    }
-}
-
-/// 收到对端地址线索后打一发「握手兼打洞」（Go punchTo：节流 5s + RearmSoft + 拨 :1）。
-fn tunnel_punch_to(run: &Arc<GenRun>, addr: SocketAddr) {
-    // F6-5：停机中不发起新探测（在途成本收窄——path_probe 5s 预算不改）
-    if run.stop.load(Ordering::Acquire) {
-        return;
-    }
-    {
-        let mut lp = lock_unpoison(&run.last_punch);
-        if lp.is_some_and(|t| t.elapsed() < Duration::from_secs(5)) {
-            return;
-        }
-        *lp = Some(Instant::now());
-    }
-    let Some(client) = run.current_client() else {
-        return;
-    };
-    // F3b/N1：hint 线程必须能退出——无界 RPC 改有界（recover::ACTION 同刻度）
-    let _ = client.rearm_soft_bounded(recover::ACTION);
-    if let Some(c) = &run.cache {
-        lock_unpoison(c).note_rearm();
-    }
-    run.domain_refresh_async();
-    (run.logf)(&format!(
-        "中继 hint {addr} → 重新武装候选赛跑，打一发握手兼打洞"
-    ));
-    // 打洞探测（5s 预算；refused = 路径通——RST 说明握手与路径都通了）
-    match client.path_probe(Duration::from_secs(5)) {
-        Ok(()) => {
-            (run.logf)("打洞后探测成功：会话可能已漂移到直连（看 link 行确认）");
-            let snap = client.snapshot();
-            if snap.via == Via::Direct {
-                if let Some(ep) = snap.ep {
-                    run.mark_round_trip(ep);
-                }
-            }
-        }
-        Err(e) => {
-            (run.logf)(&format!(
-                "打洞后探测未成功（{e}）—— 继续停留在原路径（中继/旧直连）"
-            ));
-        }
-    }
-}
-
-/// 缓存落盘去抖（Go FIX-16：信号合并 + 1s 去抖窗；收口终写在 Finish guard）。
-fn spawn_tunnel_save_loop(run: Arc<GenRun>, rx: mpsc::Receiver<()>) {
-    let logf = Arc::clone(&run.logf);
-    let spawned = std::thread::Builder::new()
-        .name("homeway-tun-cache-save".into())
-        .spawn(move || {
-            loop {
-                if run.stop.load(Ordering::Acquire) {
-                    return;
-                }
-                let Ok(()) = rx.recv_timeout(Duration::from_millis(500)) else {
-                    continue;
-                };
-                std::thread::sleep(Duration::from_secs(1)); // 去抖窗（窗内信号合并）
-                while rx.try_recv().is_ok() {}
-                if let Some(c) = run.cache.as_ref() {
-                    if let Err(e) = lock_unpoison(c).save(SystemTime::now()) {
-                        (run.logf)(&format!("端点缓存落盘失败：{e}"));
-                    }
-                }
-            }
-        });
-    if let Err(e) = spawned {
-        crate::syncutil::log_spawn_failed(
-            &logf,
-            "homeway-tun-cache-save",
-            &e,
-            "端点缓存只靠世代收工终写（无去抖落盘）",
-        );
     }
 }
 
@@ -2150,13 +1210,6 @@ enum QuicFail {
     /// 赛跑未成（全候选未在预算内完成握手 + 登记）。
     #[error("赛跑未成：{0}")]
     Race(String),
-}
-
-/// 隧道面附加的失败归因（岛路径 / WG 路径两类——岛失败要能触发 WG 兜底）。
-#[derive(Debug)]
-enum AttachFail {
-    Island(String),
-    Wg(String),
 }
 
 /// 岛侧命令回执的有界等待失败。
@@ -2267,6 +1320,17 @@ fn start_island(
         return Err(QuicFail::NoRpk);
     };
     let cands = quic_candidates(&cfg.token)?;
+    // C13（设计 §8.1 改写面）：候选清单一行——单承载后「标记·学习」面退役（岛候选恒来自
+    // token，无学习缓存/hint），形态收窄为 `候选端点（%d 条）：%s`。
+    (logf)(&format!(
+        "候选端点（{} 条）：{}",
+        cands.len(),
+        cands
+            .iter()
+            .map(|c| format!("{}（{}）", c.addr, c.via.text()))
+            .collect::<Vec<_>>()
+            .join("、")
+    ));
     let cred = homeway_quic::IslandCredential::new(
         homeway_quic::TokenSecret::from_bytes(*cfg.token.secret.as_bytes()),
         ident.public_key(),
@@ -2282,7 +1346,7 @@ fn start_island(
     );
     run.set_island(Arc::clone(&island));
     // 「立即 SetOnUnhealthy」（S2b 接线清单）：构造期回调已是同一份，这一发是**显式面**
-    // （与 `wgcore::Client::set_on_tun_error` 同款：运行期可替换、此处即刻装定）。
+    // （运行期可替换、此处即刻装定）。
     let h = island_unhealthy(run);
     let _ = island
         .tx()
@@ -2311,41 +1375,28 @@ fn start_island(
 }
 
 /// 岛侧隧道面附加（fd 所有权在扩展：岛从不 close）。
-fn attach_island(island: &homeway_quic::Island, fd: i32, mtu: u32) -> Result<(), AttachFail> {
+fn attach_island(island: &homeway_quic::Island, fd: i32, mtu: u32) -> Result<(), String> {
     island_cmd(
         island,
         |reply| homeway_quic::Cmd::TunAttach { fd, mtu, reply },
         QUIC_RPC_BUDGET,
     )
-    .map_err(|e| AttachFail::Island(e.to_string()))
+    .map_err(|e| e.to_string())
 }
 
-/// WG 侧隧道面附加（原路径）。
-fn attach_wg(run: &Arc<GenRun>, fd: i32, mtu: u32) -> Result<(), AttachFail> {
-    match run.current_client() {
-        Some(c) => c.attach_fd(fd, mtu).map_err(|e| AttachFail::Wg(e.to_string())),
-        None => Err(AttachFail::Wg("数据面不在".to_owned())),
-    }
-}
-
-/// L3 承载面的判活（quic 档 = 岛 `Cmd::Probe`（QUIC STREAM 回显）；WG 档 = `path_probe`）。
-/// **只以当前承载的结论驱动健康判定**（设计 §2.5 的反向保护）。
+/// L3 承载面的判活（恒岛：`Cmd::Probe` = QUIC `STREAM[probe]` 回显）。
 fn l3_probe(run: &Arc<GenRun>, budget: Duration) -> Result<(), ProbeFail> {
-    if run.l3_on_island() {
-        let island = run.current_island().ok_or(ProbeFail::NoFace)?;
-        return island_cmd(
-            &island,
-            |reply| homeway_quic::Cmd::Probe { budget, reply },
-            budget + QUIC_RPC_BUDGET,
-        )
-        .map(|_rtt| ())
-        .map_err(|e| match e {
-            IslandRpc::Gone(m) => ProbeFail::IslandGone(m),
-            other => ProbeFail::Detail(other.to_string()),
-        });
-    }
-    let c = run.current_client().ok_or(ProbeFail::NoFace)?;
-    c.path_probe(budget).map_err(|e| ProbeFail::Detail(e.to_string()))
+    let island = run.current_island().ok_or(ProbeFail::NoFace)?;
+    island_cmd(
+        &island,
+        |reply| homeway_quic::Cmd::Probe { budget, reply },
+        budget + QUIC_RPC_BUDGET,
+    )
+    .map(|_rtt| ())
+    .map_err(|e| match e {
+        IslandRpc::Gone(m) => ProbeFail::IslandGone(m),
+        other => ProbeFail::Detail(other.to_string()),
+    })
 }
 
 /// **QUIC 档（`l3_on_island() == true` 的世代）的 NAPI 恢复下推**（M4 §5.3；§15-1 裁定
@@ -2353,10 +1404,8 @@ fn l3_probe(run: &Arc<GenRun>, budget: Duration) -> Result<(), ProbeFail> {
 /// 与**岛内快探阶梯同一判负粒度**）⇒ 通过 = `0`，两次都失败 = `-1`（「走完未恢复」⇒
 /// tier 整套重建）。
 ///
-/// **为什么不跑 WG 阶梯**（设计 §5.3 的「最强理由」）：本世代 L3 在岛上，而
-/// `run.recover` 的 `TunnelTransport` 持的是 WG `Client`——它返回的 `0/-1` 既不能证明也
-/// 不能证伪岛上的连通性（**错误证据源**，不是「可用但不够好」）。本档**不产 C11
-/// （`RECOVER R1/R2/R3`）族行**、不做任何 WG 动作。
+/// **为什么只快探**（M4 §5.3 的原理由 + M5 C3）：动作面**只在岛内快探阶梯**——L3 在岛上
+/// ⇒ 探活结论必须出自岛（世代层不做任何动作）。本档**不产 C11 族行**（该族已随 WG 阶梯删除）。
 ///
 /// **为什么不是「什么都不做返 0」**：返 0 而零证据 = 谎报「某档通过」（本仓纪律：不谎报）；
 /// 一次 700ms 快探（+ 复探）是**最便宜的真话**（M3 §3.2：快探 = 3.5s 内定音的唯一判据）。
@@ -2373,7 +1422,8 @@ fn l3_probe(run: &Arc<GenRun>, budget: Duration) -> Result<(), ProbeFail> {
 /// 前置，语义扩到「岛不在/未 attach」）；`-3/-4` 在本档**不可达**（回落世代仍可达——它走
 /// WG 原路）。
 ///
-/// **归因行（additive，新行非改写）**：`quic: 恢复下推（%s）——按承载分档（岛快探%s：%s）`。
+/// **归因行（additive；M5 C3 去掉「按承载分档」半句——单承载下无第二档可指）**：
+/// `quic: 恢复下推（%s）——岛快探%s：%s`。
 fn recover_downpush_on_island(run: &Arc<GenRun>, cause: &str) -> i32 {
     use homeway_quic::tuning::probe_defaults::{FAST_BUDGET, REPROBE_FACTOR};
     // 不设 `deadline`（NAPI 面无线）；探段自带预算，RPC 等待亦为 `budget + QUIC_RPC_BUDGET`。
@@ -2393,9 +1443,7 @@ fn recover_downpush_on_island(run: &Arc<GenRun>, cause: &str) -> i32 {
             }
         }
     };
-    (run.logf)(&format!(
-        "quic: 恢复下推（{cause}）——按承载分档（岛快探{tag}：{verdict}）"
-    ));
+    (run.logf)(&format!("quic: 恢复下推（{cause}）——岛快探{tag}：{verdict}"));
     // 耗时口径：实测值（正常形态 0.7s / 2.1s 两档）由用例与真机读数钉（M4.md §S4）；
     // 上界只在**实测**面设门（预登记指标 ≤8s），不在此处断言（见函数头的订正）。
     rc
@@ -2407,12 +1455,9 @@ fn recover_downpush_on_island(run: &Arc<GenRun>, cause: &str) -> i32 {
 
 fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
     let mut fail_streak: u32 = 0;
-    let mut relay_streak: u32 = 0;
-    let mut last_reg: Option<Instant> = None;
     let mut last_loop_at = Instant::now();
     let mut last_counted: Option<Instant> = None;
     let mut gated = false;
-    let mut noise_since: Option<Instant> = None;
     let mut probe_now = true; // attach 完就立即探（界面链路条不必空等第一个间隔）
     loop {
         if !probe_now {
@@ -2445,9 +1490,9 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
             (run.logf)("链路巡检退出（隧道已停止）");
             return;
         }
-        // 挂起空窗检测（>2×间隔 = 进程被冻结过）：不等本拍探测失败，直接 R1 起跑
-        // （quic 档：动作 = 岛内快探阶梯的 **M→R**（§3.1/§3.2-3）——岛的拍内务同样看得见
-        //   挂起空窗（`Ladder::due` 的 gap 判据）并立刻探活；本行只作世代层的现场留痕）
+        // 挂起空窗检测（>2×间隔 = 进程被冻结过）：动作 = 岛内快探阶梯的 **M→R**
+        //（§3.1/§3.2-3）——岛的拍内务同样看得见挂起空窗（`Ladder::due` 的 gap 判据）
+        // 并立刻探活；本行只作世代层的现场留痕（世代层不再发动作）。
         let now = Instant::now();
         let gap = now.duration_since(last_loop_at);
         last_loop_at = now;
@@ -2456,156 +1501,35 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
                 "巡检空窗 {}（判为进程被挂起）→ 阶梯恢复",
                 crate::go_fmt::fmt_duration_go_secs(gap)
             ));
-            if !run.l3_on_island() {
-                let run2 = Arc::clone(&run);
-                let _ = std::thread::spawn(move || {
-                    run2.recover(Level::R1, "挂起唤醒");
-                });
-            }
         }
-        // 拍头取走 App 出站计数（自上一拍以来的出站 = 本拍需求的 TUN 位；quic 档 =
-        // **岛的同名接口**——设计 §2.5 的「接口不变、来源切换」）+ 全候选发送统计
-        // （拍板①：Go SwapSendStats——quic 档无等价物 ⇒ (0,0)，环境噪声判据回落下一路）
-        let Some(client) = run.current_client() else {
-            return; // 数据面不在（装配窗口——巡检只活在 attached 后，防御性收口）
-        };
+        // 拍头取走 App 出站计数（自上一拍以来的出站 = 本拍需求的 TUN 位）——岛的
+        // 同名接口（巡检只活在 attached 后；岛不在 ⇒ 防御性收口）。
+        if run.current_island().is_none() {
+            return;
+        }
         let out_pkts = run.l3_swap_out_pkts();
-        let (send_tries, send_local_fails) = if run.l3_on_island() {
-            (0, 0)
-        } else {
-            client.swap_send_stats()
-        };
-        // 本拍探测（10s；quic 档 = 岛 `Cmd::Probe`——设计 §2.5 的巡检接线）
-        let started = Instant::now();
+        // 本拍探测（10s；岛 `Cmd::Probe` = `STREAM[probe]` 回显）
         let probe = l3_probe(&run, PROBE_TIMEOUT);
-        let rtt = started.elapsed();
-        // 旁路观测（endpoint-freshness：只写缓存与日志，不影响健康判定）——**WG 面专用**
-        // （§2.7 收窄：quic 档不吃学习缓存/hint ⇒ 该档不做）
-        if !run.l3_on_island() {
-            let run2 = Arc::clone(&run);
-            let _ = std::thread::spawn(move || run_probe_candidates(&run2));
-        }
-        // 成功面：链路快照 + 落已验证 + 中继升直连条纹
+        // 成功面：链路快照（C10 形态；来源 = 岛快照）
         if let Ok(()) = probe {
-            if run.l3_on_island() {
-                // C10 快照形态：来源切到**岛快照**（行文零改动，设计 §4.3）
-                if let Some((via, ep, rtt_ms)) = run.island_link() {
-                    *lock_unpoison(&run.link) = Some(LinkIn {
-                        via: via.clone(),
-                        ep: ep.clone(),
-                        rtt_ms,
-                        at_ms: now_unix_ms(),
-                    });
-                    (run.logf)(&format!(
-                        "link: via={via} ep={ep} rtt={rtt_ms}ms（新栈状态快照）"
-                    ));
-                }
-                // 中继升直连条纹（RELAY-UPGRADE）在 quic 档**不发生**（§2.7 收窄）
-                relay_streak = 0;
-            } else {
-                let snap = client.snapshot();
-                if snap.via == Via::Direct {
-                    if let Some(ep) = snap.ep {
-                        run.mark_round_trip(ep);
-                    }
-                }
+            if let Some((via, ep, rtt_ms)) = run.island_link() {
+                (run.logf)(&format!(
+                    "link: via={via} ep={ep} rtt={rtt_ms}ms（新栈状态快照）"
+                ));
                 *lock_unpoison(&run.link) = Some(LinkIn {
-                    via: snap.via.as_str().to_owned(),
-                    ep: snap.ep.map(|a| a.to_string()).unwrap_or_default(),
-                    rtt_ms: rtt.as_millis() as i64,
+                    via,
+                    ep,
+                    rtt_ms,
                     at_ms: now_unix_ms(),
                 });
-                (run.logf)(&format!(
-                    "link: via={} ep={} rtt={}ms（新栈状态快照）",
-                    snap.via.as_str(),
-                    snap.ep.map(|a| a.to_string()).unwrap_or_default(),
-                    rtt.as_millis()
-                ));
-                relay_streak = relay_upgrade_streak(snap.via, relay_streak);
             }
-            // RELAY-UPGRADE（只属 WG 面：§2.7 收窄——quic 档不吃学习候选/打洞升级）
-            let via_before = client.snapshot().via;
-            if relay_upgrade_due(via_before, relay_streak) && !run.l3_on_island() {
-                relay_streak = 0;
-                (run.logf)(&format!(
-                    "RELAY-UPGRADE：已在中继停留 {}，重新武装赛跑试直连（下一发出站包镜像到全部候选）",
-                    crate::go_fmt::fmt_duration_go_secs(RELAY_UPGRADE_EVERY * PATROL_INTERVAL)
-                ));
-                let _ = client.rearm_soft_bounded(recover::ACTION);
-                if let Some(c) = &run.cache {
-                    lock_unpoison(c).note_rearm();
-                }
-                let merged = run.merged_candidates();
-                client.set_candidates(merged);
-                run.domain_refresh_async();
-                let ustarted = Instant::now();
-                if client.path_probe(PROBE_TIMEOUT).is_ok() {
-                    let st2 = client.snapshot();
-                    if st2.via != via_before {
-                        (run.logf)(&format!(
-                            "RELAY-UPGRADE：升级成功 → via={} ep={} rtt={}ms",
-                            st2.via.as_str(),
-                            st2.ep.map(|a| a.to_string()).unwrap_or_default(),
-                            ustarted.elapsed().as_millis()
-                        ));
-                        *lock_unpoison(&run.link) = Some(LinkIn {
-                            via: st2.via.as_str().to_owned(),
-                            ep: st2.ep.map(|a| a.to_string()).unwrap_or_default(),
-                            rtt_ms: ustarted.elapsed().as_millis() as i64,
-                            at_ms: now_unix_ms(),
-                        });
-                    }
-                }
-            }
-        }
-        // 周期补注册（失败拍也发——注册走原始 UDP，不依赖 WG 会话与探测结果）。
-        // **quic 档不走这里**：登记刷新在岛内按同一节拍自治（C15' 行由岛打，设计 §3.3）。
-        if !run.l3_on_island()
-            && last_reg.is_none_or(|t| now.duration_since(t) >= REG_REFRESH_EVERY)
-            && client.refresh_reg_result_bounded(recover::ACTION).unwrap_or(false)
-        {
-            last_reg = Some(now);
         }
         // ---- 失败证据的需求门控（demand-driven-recovery）----
         let (demand_active, demand_why) = run.demand.patrol_demand(out_pkts, Instant::now());
         run.demand
             .note_demand(demand_active, demand_why, now_unix_ms());
-        // 环境噪声双信号（Go tunmode.go:1024-1027 同构——拍板①补全）：
-        // ① 全候选发送统计：尝试>0 且全部本地失败 = 环境性禁发（挂起 EPERM 全候选
-        //    皆败；蜂窝下 LAN 候选 ENETUNREACH 但中继发得出去 ⇒ 不算全失败）——
-        //    覆盖非采纳（赛跑）态下采纳路径粘性信号够不着的盲区；
-        // ② 采纳路径粘性（15s 尾窗）——① 不成立时的回看窗。
-        //
-        // **两路都只属 WG 承载**（设计 §2.5 的「反向保护」：判据 = 只以**当前承载**的
-        // 探活结论驱动处置，另一条腿的失败只记行）。quic 档 `SwapSendStats` 无岛侧
-        // 等价物（① 恒 (0,0)）⇒ ②**必须**同款按档分流：`last_local_send_err` 是 **WG
-        // 腿**的本地发送面（`wtransport::Bind`），双栈期它在换网时同样会持续报错
-        // （LAN 候选 ENETUNREACH）——拿它当 quic 档的噪声源会把 QUIC 的巡检失败门控成
-        // 「环境噪声」（`evidence_gate` 清零 `fail_streak`），最长压到 `NOISE_ESCALATE_AFTER`
-        // （180s）才逃逸 ⇒ 直接与 M1 判据「断线恢复 ≤3.5s」冲突。与 `pusher_loop`
-        // （本文件同款判断，`has_fresh_local_err` 已带 `!run.l3_on_island()`）保持同构。
-        let mut local_noise = send_tries > 0 && send_local_fails == send_tries;
-        if !local_noise && !run.l3_on_island() {
-            local_noise = client
-                .snapshot()
-                .last_local_send_err
-                .is_some_and(|t| t.elapsed() < NOISE_WINDOW);
-        }
-        let (esc, ns) = noise_escalated(local_noise, noise_since, now);
-        let local_noise = if esc {
-            (run.logf)(&format!(
-                "本地发送错误持续 {}（长停逃逸）：按质量失败计，进入正常升级链",
-                crate::go_fmt::fmt_duration_go_secs(NOISE_ESCALATE_AFTER)
-            ));
-            noise_since = ns;
-            false
-        } else {
-            noise_since = ns;
-            local_noise
-        };
         let probe_ok = probe.is_ok();
         let (new_streak, counted) = evidence_gate(
-            local_noise,
             demand_active,
             fail_streak,
             last_counted,
@@ -2615,15 +1539,10 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
         fail_streak = new_streak;
         if !probe_ok {
             if !counted {
-                // 环境噪声（挂起禁发）/ 零流量需求期：该拍失败不构成路径质量证据
+                // 零流量需求期：该拍失败不构成路径质量证据
                 if !gated {
                     gated = true;
-                    let why = if local_noise {
-                        "本地发送错误（环境噪声）"
-                    } else {
-                        demand_why
-                    };
-                    (run.logf)(&format!("巡检失败被门控拦下（{why}）→ 计数清零仅记录"));
+                    (run.logf)(&format!("巡检失败被门控拦下（{demand_why}）→ 计数清零仅记录"));
                 }
             } else {
                 if gated {
@@ -2637,22 +1556,9 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
                     FAIL_STREAK_LADDER,
                     probe.unwrap_err()
                 ));
-                // 失败当拍进 R1（补注册 + 丢会话，保采纳）——出口重启/记录被回收时
-                // 手机侧没有别的信号，原本要等 3 连败，现在本次巡检内就能恢复。
-                // **quic 档**：动作面**只在岛内快探阶梯**（§3.1：快探 700ms/背靠背 →
-                // 复探 → M/R → B）——本拍只留痕（不重复动作、不抢跑；岛的动作快 240×）。
-                if run.l3_on_island() {
-                    (run.logf)(
-                        "quic: 巡检失败 —— 动作面在岛内快探阶梯（§3.1；本拍不重复动作）",
-                    );
-                } else {
-                    let rc = run.recover(Level::R1, "巡检失败");
-                    if matches!(rc, LadderRc::Recovered(_)) {
-                        (run.logf)("巡检失败后阶梯已恢复（不用等 3 连败）");
-                        fail_streak = 0;
-                        continue;
-                    }
-                }
+                // 动作面**只在岛内快探阶梯**（§3.1：快探 700ms/背靠背 → 复探 →
+                // M/R → B）——本拍只留痕（不重复动作、不抢跑；岛的动作快 240×）。
+                (run.logf)("巡检失败 —— 动作面在岛内快探阶梯（§3.1；本拍不重复动作）");
             }
         } else if gated {
             // 成功拍：门控态结束的边沿（期间静默；计数已由纯函数清零）
@@ -2660,33 +1566,22 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
             (run.logf)("巡检恢复：门控态结束（成功拍清零）");
         }
         if fail_streak >= FAIL_STREAK_LADDER {
-            if run.l3_on_island() {
-                // quic 档：动作面 = 岛内快探阶梯（§3.1 的 M/R/B）；本支路只是**兜底**
-                // （岛的 B 门 = 连续 2 次 R 失败 + 窗 ≥10s ⇒ 10s 量级就会上报；走到这里
-                //   说明岛面也异常）⇒ 如实上报 `patrol` 交世代重建，不再做 Rebind 动作。
-                (run.logf)(
-                    "quic: 对端连续 3 次巡检不可达（岛内阶梯未见自愈）—— 兜底上报不健康，交扩展重建",
-                );
-            } else {
-                (run.logf)("对端连续 3 次不可达，进恢复阶梯（R2 换源起跑，不拆隧道）");
-                let rc = run.recover(Level::R2, "巡检3连败");
-                if matches!(rc, LadderRc::Recovered(_)) {
-                    (run.logf)("阶梯恢复成功（巡检 3 连败后），对端恢复可达，继续巡检");
-                    fail_streak = 0;
-                    probe_now = true;
-                    continue;
-                }
-            }
-            (run.logf)("阶梯未恢复，标记隧道不健康（交给扩展重建）");
+            // 动作面 = 岛内快探阶梯（§3.1 的 M/R/B）；本支路只是**兜底**
+            //（岛的 B 门 = 连续 2 次 R 失败 + 窗 ≥10s ⇒ 10s 量级就会上报；走到这里
+            //  说明岛面也异常）⇒ 如实上报 `patrol` 交世代重建。
+            (run.logf)(
+                "对端连续 3 次巡检不可达（岛内阶梯未见自愈）—— 兜底上报不健康，交扩展重建",
+            );
             run.tun_shared.mark_unhealthy_if_current(run.gen, "patrol");
             return;
         }
     }
 }
 
-/// 证据门（hostsession.PatrolEvidenceGate 六分支：成功拍清零）。
+/// 证据门（hostsession.PatrolEvidenceGate 的分支：成功拍清零 / 零需求期不计证据）。
+/// **M5 C3**：WG 档的「本地发送错误（环境噪声）」信号随 WG 面退役（无生产者）⇒ 该分支
+/// 与 `noise_escalated` 一并删除；剩下的门控维度 = 需求位。
 fn evidence_gate(
-    local_noise: bool,
     demand: bool,
     fail_streak: u32,
     last_counted: Option<Instant>,
@@ -2696,7 +1591,7 @@ fn evidence_gate(
     if probe_ok {
         return (0, false);
     }
-    if local_noise || !demand {
+    if !demand {
         return (0, false);
     }
     let fail_streak = if fail_streak > 0
@@ -2707,72 +1602,6 @@ fn evidence_gate(
         fail_streak
     };
     (fail_streak + 1, true)
-}
-
-fn noise_escalated(noise: bool, since: Option<Instant>, now: Instant) -> (bool, Option<Instant>) {
-    if !noise {
-        return (false, None);
-    }
-    match since {
-        None => (false, Some(now)),
-        Some(t) if now.duration_since(t) >= NOISE_ESCALATE_AFTER => (true, None),
-        Some(t) => (false, Some(t)),
-    }
-}
-
-fn relay_upgrade_streak(via: Via, streak: u32) -> u32 {
-    if via == Via::Relay {
-        streak + 1
-    } else {
-        0
-    }
-}
-
-fn relay_upgrade_due(via: Via, streak: u32) -> bool {
-    via == Via::Relay && streak >= RELAY_UPGRADE_EVERY
-}
-
-/// 旁路探测候选（只打直连条目——探测中继端点拿到的是中继自己的列表，污染候选表）。
-fn run_probe_candidates(run: &Arc<GenRun>) {
-    // 域名同步重解析（Go ProbeCandidates 的 3s 有界形态——单飞由 60s 巡检拍限住）。
-    if let Some(rf) = run
-        .domain_refresher
-        .read()
-        .map(|g| g.clone())
-        .unwrap_or(None)
-    {
-        if let Some(fresh) =
-            rf.refresh_sync(crate::wtransport::domain_eps::PROBE_SYNC_BUDGET)
-        {
-            *lock_unpoison(&run.domain_cands) = fresh;
-            if let Some(cl) = run.current_client() {
-                let merged = run.merged_candidates();
-                cl.set_candidates(merged);
-            }
-        }
-    }
-    let targets: Vec<SocketAddr> = run
-        .merged_candidates()
-        .into_iter()
-        .filter(|c| !c.relay)
-        .map(|c| c.addr)
-        .collect();
-    if targets.is_empty() {
-        return;
-    }
-    let sh = Arc::clone(run);
-    let logf = Arc::clone(&run.logf);
-    let mut on_ep = move |ep: SocketAddr| {
-        if let Some(c) = &sh.cache {
-            lock_unpoison(c).observe(ep, EndpointSource::Probe, SystemTime::now());
-        }
-        let merged = sh.merged_candidates();
-        if let Some(cl) = sh.current_client() {
-            cl.set_candidates(merged);
-        }
-        sh.schedule_save(); // 我-2③：探测线索也触发落盘去抖
-    };
-    crate::probe::probe_candidates(&targets, PROBE_CANDIDATES_BUDGET, logf.as_ref(), &mut on_ep);
 }
 
 // ---------------------------------------------------------------------------
@@ -2797,10 +1626,10 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
                 Duration::from_millis(100).min(next.saturating_duration_since(Instant::now())),
             );
         }
-        let Some(client) = run.current_client() else {
+        if run.current_island().is_none() {
             continue;
-        };
-        // 需求信号（quic 档 = 岛的**同名接口/快照面**——§2.5「接口不变、来源切换」）
+        }
+        // 需求信号（岛的**同名接口/快照面**）
         let rx = run.l3_rx();
         if rx != last_rx {
             last_rx = rx;
@@ -2810,30 +1639,17 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
         // 换算——减出 56 年前的时刻 ⇒ should_push 恒 false、D4 整条静默失效。现改
         // TunCounters 的相对单调读数，unix ns 只留给 JSON 面）
         let out_at = run.l3_last_outbound_at();
-        // 噪声窗 = 出站新鲜窗（评审 r2-L7：Go shouldPush 用 outboundFresh(5s)——
-        // 此前误用巡检的 15s 尾窗）。**quic 档该信号缺席**（WG bind 的本地发送统计没有
-        // 岛侧等价物 ⇒ 按 false；quic 档的失败面由巡检的岛探活承担）。
-        let has_fresh_local_err = !run.l3_on_island()
-            && client
-                .snapshot()
-                .last_local_send_err
-                .is_some_and(|t| t.elapsed() < demand::OUTBOUND_FRESH);
+        // 噪声窗 = 出站新鲜窗（评审 r2-L7：Go shouldPush 用 outboundFresh(5s)）。
+        // **M5 C3**：WG 档的「采纳路径本地错误」信号随 WG 面退役（无生产者）⇒ 该维
+        // 恒 `false`（`demand::should_push` 的入参保留：它是 Go `shouldPush` 判据链的
+        // 逐条对照面；删维等于改判据语义 ⇒ 登记为观测面收窄）。
         let since = last_push.map(|t| t.elapsed());
-        if demand::should_push(out_at, recv_at, Instant::now(), has_fresh_local_err, since) {
+        if demand::should_push(out_at, recv_at, Instant::now(), false, since) {
             last_push = Some(Instant::now());
             (run.logf)("待发包下推：App 出站新鲜且接收静默 → 立即下推阶梯（不等巡检拍）");
-            let run2 = Arc::clone(&run);
-            let _ = std::thread::spawn(move || {
-                if run2.l3_on_island() {
-                    // quic 档：下推动作 = 岛内快探阶梯（§3.1：在用档 700ms/背靠背 ⇒ 岛自己
-                    // 就是「立即下推」；世代层不再重复动作）——本支路只留痕。
-                    (run2.logf)(
-                        "quic: 待发包下推 —— 岛内快探阶梯为准（§3.1；本拍不重复动作）",
-                    );
-                } else {
-                    run2.recover(Level::R1, "待发包下推");
-                }
-            });
+            // 下推动作 = 岛内快探阶梯（§3.1：在用档 700ms/背靠背 ⇒ 岛自己就是
+            //「立即下推」；世代层不再重复动作）——本支路只留痕。
+            (run.logf)("待发包下推 —— 岛内快探阶梯为准（§3.1；本拍不重复动作）");
         }
     }
 }
@@ -2931,34 +1747,11 @@ fn now_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::facade::{ClientCore, TunStage};
-    use crate::identity::Identity;
-    use crate::token::{self, EndpointRef, PeerId, Secret, TokenSpec};
-    use crate::wtransport::Candidate;
-
-    /// TEST-NET-3 黑洞 Client（惰性：只起引擎线程，镜像包无人应答——镜像
-    /// `wgcore::tests::engine_probe_blackhole_times_out` 的可行构造）。
-    fn blackhole_client() -> Arc<Client> {
-        let ident = Identity::ephemeral().expect("临时身份");
-        let logf: Logf = Arc::new(|_s: &str| {});
-        Arc::new(
-            Client::start(CoreConfig {
-                peer_id: PeerId::from([1u8; 32]),
-                secret: Secret::from([2u8; 32]),
-                identity: ident,
-                candidates: vec![Candidate {
-                    addr: "203.0.113.1:41641".parse().unwrap(),
-                    relay: false,
-                }],
-                logf,
-            })
-            .expect("黑洞客户端可起"),
-        )
-    }
+    use crate::token::{self, EndpointRef, PeerId, RpkPubKey, Secret, TokenSpec};
 
     /// F8a：写退避分级表（前 50 拍 2ms ⇒ 其后 10ms ⇒ 100 拍后 20ms 封顶）。
     #[test]
@@ -2988,6 +1781,14 @@ mod tests {
         }
     }
 
+    fn line_logf() -> (Logf, mpsc::Receiver<String>) {
+        let (tx, rx) = mpsc::channel::<String>();
+        let l: Logf = Arc::new(move |s: &str| {
+            let _ = tx.send(s.to_owned());
+        });
+        (l, rx)
+    }
+
     /// Q-F-B F3-2：`stats:` 行的**纯函数**（形态逐字不变 + 真值直喂）。
     #[test]
     fn stats_line_reports_real_pf_counts() {
@@ -3006,21 +1807,13 @@ mod tests {
     /// `listening`（真监听）/ `bind_failed`（占端口条）/ `code` 空 vs `bind_failed` / 真 target。
     #[test]
     fn runner_of_reports_real_pf_state() {
-        let (logf, _lines) = {
-            let (tx, rx) = mpsc::channel::<String>();
-            let l: Logf = Arc::new(move |s: &str| {
-                let _ = tx.send(s.to_owned());
-            });
-            (l, rx)
-        };
+        let (logf, _lines) = line_logf();
         let run = GenRun::synthetic_for_test(logf);
         let ok_port = free_port();
         let squatter = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let busy_port = squatter.local_addr().unwrap().port();
-        run.pf.install(&[
-            rule(ok_port, "", 0),
-            rule(busy_port, "10.0.0.9", 8080),
-        ]);
+        run.pf
+            .install(&[rule(ok_port, "", 0), rule(busy_port, "10.0.0.9", 8080)]);
         let r = runner_of(&run);
         assert_eq!(r.pf_accepted, 0, "尚无连接（真值 0）");
         assert_eq!(r.pf_fails, 0);
@@ -3033,30 +1826,23 @@ mod tests {
         assert_eq!(f0.conns, 0);
         let f1 = &r.port_forwards[1];
         assert_eq!(f1.state, "failed");
-        assert_eq!(f1.code, "bind_failed", "真 bind 失败 = 真值（tier 渲染「端口被占用」）");
+        assert_eq!(
+            f1.code, "bind_failed",
+            "真 bind 失败 = 真值（tier 渲染「端口被占用」）"
+        );
         assert_eq!(f1.target, "10.0.0.9:8080");
-        // 收尾：停监听器 + 停合成世代的引擎线程
+        // 收尾：停监听器
         run.pf.stop_all();
         assert!(runner_of(&run).port_forwards.is_empty(), "收工后空表");
         drop(squatter);
-        if let Some(c) = run.current_client() {
-            c.stop();
-        }
     }
 
     /// Q-F-B F4-3/§5.2 #15：**世代收工**的两条通路——① 停止位（`gen_stop` = `run.stop`）
     /// 让 accept 线程 ≤1 拍自退 ⇒ 端口立即释放（无孤儿监听器）；② `stop_all` 清表
-    /// （收工序 / `Finish::drop` 兜底调的就是它）。设计 §1-F1-3 的 panic 收口句据此订正：
-    /// 未换入的监听器由 `install` 的暂存守卫置停止位，不依赖 `stop_all` 的视野。
+    /// （收工序 / `Finish::drop` 兜底调的就是它）。
     #[test]
     fn generation_stop_flag_releases_ports_and_teardown_clears_states() {
-        let (logf, _lines) = {
-            let (tx, rx) = mpsc::channel::<String>();
-            let l: Logf = Arc::new(move |s: &str| {
-                let _ = tx.send(s.to_owned());
-            });
-            (l, rx)
-        };
+        let (logf, _lines) = line_logf();
         let run = GenRun::synthetic_for_test(logf);
         let port = free_port();
         run.pf.install(&[rule(port, "", 0)]);
@@ -3075,131 +1861,14 @@ mod tests {
             assert!(Instant::now() < deadline, "停止位未让 accept 线程释放端口");
             std::thread::sleep(Duration::from_millis(10));
         }
-        // 状态表在 stop_all 之前仍是旧表（Go「stopPortForwards 之前不动作」同义；
-        // 窗口 = 世代主线程 ≤200ms 的停止位轮询）
+        // 状态表在 stop_all 之前仍是旧表（Go「stopPortForwards 之前不动作」同义）
         assert_eq!(runner_of(&run).port_forwards.len(), 1);
         // ② 收工清表（gen_loop 收工段与 Finish::drop 兜底都调它）
         run.pf.stop_all();
         assert!(runner_of(&run).port_forwards.is_empty(), "收工后空表");
-        if let Some(c) = run.current_client() {
-            c.stop();
-        }
     }
 
-    /// **判据（M4 §1.3 裁决 D-1 的 WG 腿归一）**：环回 ⇒ **出口隧道 IP 的该端口**（WG 档的
-    /// 「出口本机」只能经隧道 IP 表达——出口 intercept 的豁免臂 `dst == tunnel_ip`）；其余
-    /// （含 `0.0.0.0`、私网、公网）**原样**——归一**不得加宽**（加宽 = 打死真目标）。
-    #[test]
-    fn wg_dial_addr_replaces_loopback_only() {
-        let tun = crate::wgcore::SERVER_TUNNEL_IP;
-        assert_eq!(
-            wg_dial_addr("127.0.0.1:8080".parse().unwrap()),
-            SocketAddrV4::new(tun, 8080),
-            "环回 ⇒ 隧道 IP（ExitPort 的 wire 语义在 WG 腿内的落点）"
-        );
-        assert_eq!(
-            wg_dial_addr("127.9.8.7:0".parse().unwrap()),
-            SocketAddrV4::new(tun, 0),
-            "127/8 任意地址 + 端口 0 原样带过（端口 0 的拒入是出口侧 A8 的面）"
-        );
-        for keep in ["0.0.0.0:1", "10.1.2.3:9", "8.8.8.8:53", "100.64.255.1:1"] {
-            let dst: SocketAddrV4 = keep.parse().unwrap();
-            assert_eq!(wg_dial_addr(dst), dst, "{keep} 必须原样（归一不加宽）");
-        }
-    }
-
-    /// **判据（M4 §2.1 的承载分派）**：`pf_dial_via_run` 按 `l3_on_island()` 走两条腿——
-    /// ① `false`（WG 档 / 岛未就 / 岛已收回 / 合成世代）⇒ **WG 腿**：错误面与
-    /// `session_connect_target` 逐字相同（且**不含** QUIC 腿的文本）；
-    /// ② `true` 且岛不在（`current_island() == None`：装配窗口）⇒ **QUIC 腿**：错误文本 =
-    /// 「QUIC 档端口转发无法拨号」⇒ 分派真按判据走，且 QUIC 分支**不触 WG 会话**。
-    ///
-    /// 结构化前提（§2.3）：两条腿的都只经 `PfDialFn` 与 pf 运行时接触 ⇒ 本用例的注入面
-    /// 就是 `pf` 生产闭包本身。
-    #[test]
-    fn pf_dial_dispatch_follows_l3_on_island() {
-        let (logf, _lines) = {
-            let (tx, rx) = mpsc::channel::<String>();
-            let l: Logf = Arc::new(move |s: &str| {
-                let _ = tx.send(s.to_owned());
-            });
-            (l, rx)
-        };
-        let run = Arc::new(GenRun::synthetic_for_test(logf));
-        let w = Arc::downgrade(&run);
-        let dst: SocketAddrV4 = "127.0.0.1:8080".parse().unwrap();
-        let budget = Duration::from_millis(20);
-        // `Box<dyn BridgeStream>` 不是 `Debug`（`expect_err` 用不了）⇒ 显式取错
-        fn err_of(r: io::Result<Box<dyn super::BridgeStream>>) -> io::Error {
-            match r {
-                Ok(_) => panic!("本用例的一切拨号都必须失败"),
-                Err(e) => e,
-            }
-        }
-
-        // ① WG 腿（默认 `l3_on_island = false`）：与 `session_connect_target` 同一条链
-        assert!(!run.l3_on_island(), "合成世代默认不在岛上");
-        let via_pf = err_of(pf_dial_via_run(&w, dst, budget));
-        let direct = err_of(session_connect_target(&run, dst, budget));
-        assert_eq!(
-            via_pf.to_string(),
-            direct.to_string(),
-            "WG 腿 = `session_connect_target` 逐字（承载差异只有那一行分派）"
-        );
-        assert!(
-            !via_pf.to_string().contains("QUIC 服务流"),
-            "WG 腿不得说 QUIC 面的话：{via_pf}"
-        );
-
-        // ② **岛在世但 `l3_on_island = false`**（岛未承接 L3 = 回落世代）⇒ 仍走 WG 腿
-        //    （判据 `l3_on_island()` = 标志位 **且** 岛在场；只有标志位为真才换轨）
-        let ident = crate::identity::Identity::ephemeral().expect("临时身份");
-        let cred = homeway_quic::IslandCredential::new(
-            homeway_quic::TokenSecret::from_bytes([7u8; 32]),
-            ident.public_key(),
-            *ident.dev_tag().as_bytes(),
-            homeway_quic::RpkPublicKey::from_bytes([9u8; 32]),
-        );
-        let mut icfg = homeway_quic::IslandConfig::new(cred);
-        icfg.bind = Some(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0));
-        let island = Arc::new(
-            homeway_quic::Island::start(
-                Arc::clone(&run.logf),
-                Arc::new(|_r: &str| {}),
-                icfg,
-            )
-            .expect("岛可起（只绑回环 :0，不建连）"),
-        );
-        run.set_island(Arc::clone(&island));
-        assert!(
-            !run.l3_on_island(),
-            "岛在场但标志位为假 ⇒ 判据仍为假（回落世代按 WG 跑）"
-        );
-        let e = err_of(pf_dial_via_run(&w, dst, budget));
-        assert_eq!(e.to_string(), direct.to_string(), "回落世代 ⇒ WG 腿逐字");
-
-        // ③ QUIC 腿（标志位为真 **且** 岛在场）：开流走真岛的命令面——无 live 连接 ⇒
-        //    `StreamErr::ConnectionLost` ⇒ QUIC 面归因（与 WG 面可区分 ⇒ 分派真的发生）
-        run.set_l3_on_island(true);
-        assert!(run.l3_on_island(), "两条件齐 ⇒ 判据为真");
-        let e = err_of(pf_dial_via_run(&w, dst, budget));
-        assert_eq!(e.kind(), io::ErrorKind::Other, "{e:?}");
-        assert!(
-            e.to_string().contains("QUIC 服务流"),
-            "QUIC 腿的归因串：{e}"
-        );
-        assert_ne!(e.to_string(), direct.to_string(), "两条腿可区分（分派真的发生）");
-        run.set_l3_on_island(false);
-        run.take_island();
-        island.stop();
-
-        // ④ 世代收工（Weak 升级失败）：既有语义逐字保留（不触任何承载）
-        drop(run);
-        let e = err_of(pf_dial_via_run(&w, dst, budget));
-        assert!(e.to_string().contains("世代已收工（拨号放弃）"), "{e}");
-    }
-
-    /// 起一枚「只绑回环 :0、**不建连**」的岛（合成世代用；S2/S4 用例共用构造）。
+    /// 起一枚「只绑回环 :0、**不建连**」的岛（合成世代用；单承载用例共用构造）。
     fn idle_island(run: &Arc<GenRun>) -> Arc<homeway_quic::Island> {
         let ident = crate::identity::Identity::ephemeral().expect("临时身份");
         let cred = homeway_quic::IslandCredential::new(
@@ -3214,6 +1883,48 @@ mod tests {
             homeway_quic::Island::start(Arc::clone(&run.logf), Arc::new(|_r: &str| {}), icfg)
                 .expect("岛可起（只绑回环 :0，不建连）"),
         )
+    }
+
+    /// **判据（M5 C3 单腿）**：`pf_dial_via_run` 只有一条腿——
+    /// ① 岛未承接 ⇒ 归因「岛不在」（**不含**任何 WG 措辞）；
+    /// ② 岛承接 ⇒ QUIC 面归因（无 live 连接 ⇒ `StreamErr` 文本含 `QUIC 服务流`）；
+    /// ③ 世代收工（Weak 升级失败）⇒ 既有语义逐字保留。
+    #[test]
+    fn pf_dial_requires_island() {
+        let (logf, _lines) = line_logf();
+        let run = Arc::new(GenRun::synthetic_for_test(logf));
+        let w = Arc::downgrade(&run);
+        let dst: SocketAddrV4 = "127.0.0.1:8080".parse().unwrap();
+        let budget = Duration::from_millis(20);
+        // `Box<dyn BridgeStream>` 不是 `Debug`（`expect_err` 用不了）⇒ 显式取错
+        fn err_of(r: io::Result<Box<dyn super::BridgeStream>>) -> io::Error {
+            match r {
+                Ok(_) => panic!("本用例的一切拨号都必须失败"),
+                Err(e) => e,
+            }
+        }
+
+        // ① 岛不在（合成世代默认）：归因「岛不在」，不得说 WG
+        assert!(!run.l3_on_island(), "合成世代默认不在岛上");
+        let e = err_of(pf_dial_via_run(&w, dst, budget));
+        assert!(e.to_string().contains("岛不在"), "{e}");
+        assert!(!e.to_string().contains("WG"), "单腿后不得有 WG 措辞：{e}");
+
+        // ② 岛承接（标志位真 + 岛在场）：开流走真岛命令面 —— 无 live 连接 ⇒ QUIC 面归因
+        let island = idle_island(&run);
+        run.set_island(Arc::clone(&island));
+        run.set_l3_on_island(true);
+        assert!(run.l3_on_island(), "两条件齐 ⇒ 判据为真");
+        let e = err_of(pf_dial_via_run(&w, dst, budget));
+        assert!(e.to_string().contains("QUIC 服务流"), "{e}");
+        run.set_l3_on_island(false);
+        run.take_island();
+        island.stop();
+
+        // ③ 世代收工（Weak 升级失败）：既有语义逐字保留
+        drop(run);
+        let e = err_of(pf_dial_via_run(&w, dst, budget));
+        assert!(e.to_string().contains("世代已收工（拨号放弃）"), "{e}");
     }
 
     /// 起一枚带日志收集的合成世代（返回世代 + 行收集端）。
@@ -3235,102 +1946,54 @@ mod tests {
         out
     }
 
-    /// **S4（M4 §5.3；§15-1 裁定「本期修」）**：NAPI `ClientCoreTunRecover` 的承载分档——
-    /// 判据 = `l3_on_island()`（**非** `bearer`）。
-    ///
-    /// ① 无世代 ⇒ `-2`；陈世代 ⇒ `-2`（两条既有前置，逐字）；
-    /// ② `l3_on_island()==true` ⇒ **岛快探 + 一次复探**：无 live 连接 ⇒ 两次探都失败 ⇒
-    ///    `-1`（= 「走完未恢复」⇒ tier 整套重建）+ **additive 行逐字**；本世代**零**
-    ///    `RECOVER` 族行（= 不跑 WG 阶梯、不做 WG 动作）；
-    /// ③ 岛在场但 `l3_on_island()==false`（**回落世代**）⇒ **WG 原路**：rc 与直接调
-    ///    `run.recover(Level::clamp(from), cause).as_rc()` 相等，且**零** `quic: 恢复下推` 行。
+    /// **S4（M4 §5.3；§15-1 裁定「本期修」）+ M5 C3 单腿**：NAPI `ClientCoreTunRecover`
+    /// 的 rc 契约——
+    /// ① 无世代 ⇒ `-2`；② 陈世代 ⇒ `-2`（两条既有前置，逐字）；
+    /// ③ 岛承接 ⇒ **岛快探 + 一次复探**：无 live 连接 ⇒ 两次探都失败 ⇒ `-1`
+    ///    （=「走完未恢复」⇒ tier 整套重建）+ **additive 行逐字**；且本世代**零**
+    ///    `RECOVER` 族行（WG 阶梯已随 S2 删除 ⇒ 不存在第二条恢复路径）。
     #[test]
-    fn recover_downpush_branches_on_l3_on_island() {
+    fn recover_downpush_single_leg_rc_contract() {
         let demand = Arc::new(DemandSignals::new());
         let exec = TunnelExec::new(Arc::clone(&demand));
         // ① 无世代（executor 无 run）⇒ -2
-        assert_eq!(exec.recover(3, "扩展下推(R3 重赛跑)"), -2, "无 attached 隧道");
+        assert_eq!(exec.recover(3, "扩展下推(档位 3)"), -2, "无 attached 隧道");
 
-        // ② 岛档：`l3_on_island() == true`
+        // ③ 岛承接：`l3_on_island() == true`
         let (run, lines) = gen_with_lines("island");
         let island = idle_island(&run);
         run.set_island(Arc::clone(&island));
         run.set_l3_on_island(true);
-        assert!(run.l3_on_island(), "两条件齐 ⇒ 走岛档");
         *lock_unpoison(&exec.state) = Some(Arc::clone(&run));
-        let t0 = Instant::now();
-        let rc = exec.recover(3, "扩展下推(R3 重赛跑)");
-        let elapsed = t0.elapsed();
-        println!("[s4] island-档 rc={rc} elapsed={elapsed:?}");
+        let rc = exec.recover(3, "扩展下推(档位 3)");
         assert_eq!(rc, -1, "两次探都失败 ⇒ -1（不是 0/-3/-4）");
-        let line =
-            "quic: 恢复下推（扩展下推(R3 重赛跑)）——按承载分档（岛快探+复探：失败（";
         let seen = drain_lines(&lines);
-        let hit = seen.iter().find(|l| l.starts_with(line));
+        let line = "quic: 恢复下推（扩展下推(档位 3)）——岛快探+复探：失败（";
         assert!(
-            hit.is_some(),
+            seen.iter().any(|l| l.starts_with(line)),
             "additive 归因行须逐字在场（首缀 {line:?}）：{seen:?}"
         );
-        println!("[s4] island-档 行 = {}", hit.expect("上面已断言"));
         assert_eq!(
             seen.iter().filter(|l| l.starts_with("RECOVER ")).count(),
             0,
-            "岛档**零** RECOVER 族行（不跑 WG 阶梯）：{seen:?}"
+            "零 RECOVER 族行（WG 阶梯已删除）：{seen:?}"
         );
 
-        // ③ 回落世代：岛在场、标志位为假 ⇒ WG 原路（对照 = 同参直接调世代方法）
-        let (run2, lines2) = gen_with_lines("fallback");
-        let island2 = idle_island(&run2);
-        run2.set_island(Arc::clone(&island2));
-        assert!(!run2.l3_on_island(), "标志位为假 ⇒ 判据为假（回落世代按 WG 跑）");
-        *lock_unpoison(&exec.state) = Some(Arc::clone(&run2));
-        // 停掉引擎 ⇒ WG 阶梯的动作面立即失败（**不可达于岛档的 -4**：证明走的是 WG 原路）
-        if let Some(c) = run2.current_client() {
-            c.stop();
-        }
-        let t1 = Instant::now();
-        let rc2 = exec.recover(3, "扩展下推(R3 重赛跑)");
-        let seen2 = drain_lines(&lines2);
-        println!(
-            "[s4] 回落世代 rc={rc2} elapsed={:?} lines={seen2:?}",
-            t1.elapsed()
-        );
-        assert_eq!(rc2, -4, "回落世代仍可达 -4（WG 动作面失败）⇒ 走的是 WG 原路");
-        assert_eq!(
-            seen2.iter().filter(|l| l.contains("quic: 恢复下推")).count(),
-            0,
-            "回落世代不得产岛档行"
-        );
-        assert!(
-            seen2.iter().filter(|l| l.starts_with("RECOVER ")).count() > 0,
-            "回落世代必须走 WG 阶梯（RECOVER 族行在场）：{seen2:?}"
-        );
-
-        // ④ 陈世代 ⇒ -2（既有前置；与判据无关）
-        run2.tun_shared.gen.store(99, Ordering::Release);
-        assert_eq!(exec.recover(3, "扩展下推(R3 重赛跑)"), -2, "陈世代 -2");
+        // ② 陈世代 ⇒ -2（既有前置；与判据无关）
+        run.tun_shared.gen.store(99, Ordering::Release);
+        assert_eq!(exec.recover(3, "扩展下推(档位 3)"), -2, "陈世代 -2");
 
         *lock_unpoison(&exec.state) = None;
         run.set_l3_on_island(false);
         run.take_island();
         island.stop();
-        island2.stop();
-        if let Some(c) = run.current_client() {
-            c.stop();
-        }
     }
 
     /// Q-F-B F4-4：热替换 rc 回 Go 语义——活世代 ⇒ `0`（**真装表**）；无世代 / 换代
     /// （gen 不符）/ 收口（stop 位）⇒ `-1` 且**无孤儿监听器**。
     #[test]
     fn request_port_forwards_rc_zero_with_live_gen_stale_minus_one() {
-        let (logf, _lines) = {
-            let (tx, rx) = mpsc::channel::<String>();
-            let l: Logf = Arc::new(move |s: &str| {
-                let _ = tx.send(s.to_owned());
-            });
-            (l, rx)
-        };
+        let (logf, _lines) = line_logf();
         let demand = Arc::new(DemandSignals::new());
         let exec = TunnelExec::new(Arc::clone(&demand));
         let port = free_port();
@@ -3348,10 +2011,13 @@ mod tests {
             std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(),
             "热替换后监听口真可连"
         );
-        // 収口（stop 位）⇒ -1 且撤回监听器（不留孤儿）
+        // 收口（stop 位）⇒ -1 且撤回监听器（不留孤儿）
         run.stop.store(true, Ordering::Release);
         assert_eq!(exec.request_port_forwards(rules.clone()), -1);
-        assert!(runner_of(&run).port_forwards.is_empty(), "无孤儿监听器（states 已清）");
+        assert!(
+            runner_of(&run).port_forwards.is_empty(),
+            "无孤儿监听器（states 已清）"
+        );
         assert!(
             std::net::TcpListener::bind(("127.0.0.1", port)).is_ok(),
             "端口已释放"
@@ -3363,106 +2029,7 @@ mod tests {
         assert!(runner_of(&run).port_forwards.is_empty(), "陈旧世代不装表");
         run.tun_shared.gen.store(1, Ordering::Release);
         run.pf.stop_all();
-        if let Some(c) = run.current_client() {
-            c.stop();
-        }
     }
-
-    /// F3：拨号预算把**阶梯等待**纳入同一上界——桩闭包阻塞到期限，`dial_with_recover`
-    /// 仍在调用方预算内返回 TimedOut（首试预算注入缩短，无需 4s 真等）。
-    #[test]
-    fn dial_with_recover_bounded_by_caller_budget() {
-        let client = blackhole_client();
-        let called = Arc::new(AtomicBool::new(false));
-        let called2 = Arc::clone(&called);
-        let saw_deadline = Arc::new(AtomicBool::new(false));
-        let saw2 = Arc::clone(&saw_deadline);
-        let dst: SocketAddrV4 = "10.7.0.1:7802".parse().unwrap();
-        let budget = Duration::from_millis(600);
-        let t0 = Instant::now();
-        let r = dial_with_recover(
-            &client,
-            dst,
-            budget,
-            Duration::from_millis(50), // 首试（注入；生产 = FIRST_TRY 4s）
-            move |lvl, deadline, _cause| {
-                called2.store(true, Ordering::Release);
-                saw2.store(deadline.is_some(), Ordering::Release);
-                assert_eq!(lvl, Level::R2, "拨号失败后从 R2 起跑");
-                // 桩「阻塞到期限」：执行方模拟阶梯跑满调用方预算
-                std::thread::sleep(Duration::from_millis(400));
-                (LadderRc::Deadline, false)
-            },
-        );
-        assert!(called.load(Ordering::Acquire), "桩必须被调用（否则本测假绿）");
-        assert!(saw_deadline.load(Ordering::Acquire), "期限必须透给阶梯");
-        let e = r.expect_err("预算耗尽 ⇒ Err");
-        assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e}");
-        assert!(
-            t0.elapsed() < Duration::from_secs(3),
-            "预算内返回（实耗 {:?}）",
-            t0.elapsed()
-        );
-        client.stop();
-    }
-
-    /// F3：`Deadline` 的边界映射 = -1（不是 -3：tier 对 -3 渲染「本机网络栈没准备好」
-    /// = 错误归因）。
-    #[test]
-    fn ladder_deadline_maps_to_minus_one() {
-        assert_eq!(LadderRc::Deadline.as_rc(), -1);
-    }
-
-    /// 复核 r3-F1：空候选早退路径（token 端点列表空 ⇒ 候选空）必须放单飞锁——下一次
-    /// prepare 可受理。回归背景：EarlyFinish 守卫引入前该路径漏 finish_generation ⇒
-    /// tun_prepare 之后恒 -1、tun_stop 恒 -2（接线即坏同形态）。
-    /// 注（P0-4 起）：域名端点不再天然构成空候选（建会话时解析一次、失败跳过）——
-    /// 空候选的确定性构造改用空端点列表。
-    #[test]
-    fn tunnel_empty_candidates_releases_lock() {
-        let peer = PeerId::from([1u8; 32]);
-        let secret = Secret::from([2u8; 32]);
-        let eps: [EndpointRef; 0] = [];
-        let tok = token::encode(&TokenSpec {
-            peer_id: &peer,
-            secret: &secret,
-            endpoints: &eps,
-            rpk: None,
-        })
-        .expect("空端点 token 可编码");
-        let demand = Arc::new(DemandSignals::new());
-        let exec = TunnelExec::new(Arc::clone(&demand));
-        let core = ClientCore::with_shared(exec, demand);
-        assert_eq!(
-            core.tun_prepare(&format!(r#"{{"token":"{tok}"}}"#), true),
-            0
-        );
-        // 等世代线程走到 failed 终态（放锁发生在 finish_generation）
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while core.tun_status().contains("\"state\":\"preparing\"") {
-            assert!(Instant::now() < deadline, "空候选应在 3s 内落 failed 终态");
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert!(
-            core.tun_status().contains("\"state\":\"failed\""),
-            "空候选 = failed 终态"
-        );
-        // 锁已放：下一次 prepare 可受理（不是 -1 忙）
-        assert_eq!(
-            core.tun_prepare(&format!(r#"{{"token":"{tok}"}}"#), true),
-            0
-        );
-        // 收尾：等第二次也落终态再停（避免测试进程留下游离世代线程）
-        let deadline = Instant::now() + Duration::from_secs(3);
-        while core.tun_status().contains("\"state\":\"preparing\"") {
-            assert!(Instant::now() < deadline);
-            std::thread::sleep(Duration::from_millis(20));
-        }
-        assert_eq!(core.tun_stop(), 0, "失败终态后 stop 应即收 0");
-        let _ = TunStage::Idle; // 引用 stage 枚举（保持 import）
-    }
-
-    // ---------- M1 S3-1：A/B 开关与世代装配（设计 §4.1/§4.2） ----------
 
     /// 世代日志读取上界（flake 口径②：只判上界）。
     fn wait_lines(path: &std::path::Path, needle: &str, wait: Duration) -> Vec<String> {
@@ -3480,15 +2047,15 @@ mod tests {
 
     /// 临时世代日志路径（**每用例唯一**——并发跑测试不互撞；不进仓）。
     fn gen_log_path(tag: &str) -> std::path::PathBuf {
-        let dir = std::env::temp_dir().join(format!("hw-m1s3-{tag}-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hw-m5c3-{tag}-{}", std::process::id()));
         std::fs::create_dir_all(&dir).expect("临时目录可建");
         dir.join("gen.log")
     }
 
     /// 装配一个世代（启动即返；调用方轮询日志/状态）。
-    fn prepare_gen(core: &ClientCore, tok: &str, out: &std::path::Path, transport: &str) -> i32 {
+    fn prepare_gen(core: &ClientCore, tok: &str, out: &std::path::Path) -> i32 {
         let cfg = format!(
-            r#"{{"token":"{tok}","out":"{}","transport":"{transport}"}}"#,
+            r#"{{"token":"{tok}","out":"{}"}}"#,
             out.display()
         );
         core.tun_prepare(&cfg, true)
@@ -3501,35 +2068,6 @@ mod tests {
             std::thread::sleep(Duration::from_millis(30));
         }
         let _ = core.tun_stop();
-    }
-
-    /// **判据（S3-1 ②）**：承载档取值解析——`quic`（缺省/`1`）/`wg`（`0`）各自成立；
-    /// 非法值 ⇒ **记行 + 按缺省 quic 走**（fail-visible 不 fail-fast，设计 §4.1）。
-    #[test]
-    fn bearer_switch_parses_values_and_defaults_on_garbage() {
-        assert_eq!(L3Bearer::parse(""), Some(L3Bearer::Quic), "缺省 = quic");
-        assert_eq!(L3Bearer::parse("quic"), Some(L3Bearer::Quic));
-        assert_eq!(L3Bearer::parse("1"), Some(L3Bearer::Quic));
-        assert_eq!(L3Bearer::parse("wg"), Some(L3Bearer::Wg));
-        assert_eq!(L3Bearer::parse("0"), Some(L3Bearer::Wg));
-        assert_eq!(L3Bearer::parse(" QUIC "), Some(L3Bearer::Quic), "大小写/空白容忍");
-        assert_eq!(L3Bearer::parse("bogus"), None);
-        assert_eq!(L3Bearer::as_str(L3Bearer::Wg), "wg");
-
-        // env 未设时：config 面非法值 ⇒ 记行 + 缺省 quic
-        if crate::envflag::transport_raw().is_none() {
-            let (tx, rx) = mpsc::channel::<String>();
-            let logf: Logf = Arc::new(move |s: &str| {
-                let _ = tx.send(s.to_owned());
-            });
-            assert_eq!(resolve_bearer("bogus", &logf), L3Bearer::Quic);
-            let lines: Vec<String> = rx.try_iter().collect();
-            assert!(
-                lines.iter().any(|l| l.contains("tunConfig.transport=\"bogus\"") && l.contains("非法")),
-                "非法值必须记行：{lines:?}"
-            );
-            assert_eq!(resolve_bearer("wg", &logf), L3Bearer::Wg, "合法值原样生效");
-        }
     }
 
     /// **判据（S3-1 ②，MTU 旋钮）**：有效区间 `[1320,1400]` 内原样生效；区间外/非数字 ⇒
@@ -3545,8 +2083,16 @@ mod tests {
             assert_eq!(resolve_mtu_cap(0, &logf), QUIC_MTU_CAP_DEFAULT, "未设 = 1400");
             assert_eq!(resolve_mtu_cap(1400, &logf), 1400);
             assert_eq!(resolve_mtu_cap(1320, &logf), 1320, "区间下限");
-            assert_eq!(resolve_mtu_cap(1200, &logf), QUIC_MTU_CAP_DEFAULT, "区间外 ⇒ 缺省");
-            assert_eq!(resolve_mtu_cap(1500, &logf), QUIC_MTU_CAP_DEFAULT, "区间外 ⇒ 缺省");
+            assert_eq!(
+                resolve_mtu_cap(1200, &logf),
+                QUIC_MTU_CAP_DEFAULT,
+                "区间外 ⇒ 缺省"
+            );
+            assert_eq!(
+                resolve_mtu_cap(1500, &logf),
+                QUIC_MTU_CAP_DEFAULT,
+                "区间外 ⇒ 缺省"
+            );
             let lines: Vec<String> = rx.try_iter().collect();
             assert_eq!(
                 lines.iter().filter(|l| l.contains("非法或越界")).count(),
@@ -3556,15 +2102,14 @@ mod tests {
         }
     }
 
-    /// **判据（S3-1 ③⑤）**：`transport=wg` ⇒ 岛**不构造**、`quic:` 族行**零输出**、状态
-    /// JSON 无 `quic` 段；`transport=quic` × 无 QUIC 端点的 token（=`serve.quic=false`
-    /// 形态）⇒ 记行 + **回落 WG**（隧道功能不丢）。
+    /// **判据（§2.6-G9 的负例实测；M5 C3）**：token 只带 **WG 类端点**（`serve.quic=false`
+    /// 形态 / 旧 token）⇒ 岛候选为空 ⇒ **可见失败**：`岛未就用（…候选为空）` 归因行 +
+    /// `failed` 终态 + **单飞锁已放**（下一次 prepare 可受理）。**不得**有任何回落兜底。
     #[test]
-    fn wg_mode_has_zero_quic_lines_and_quic_mode_falls_back_without_endpoints() {
+    fn wg_only_token_fails_visibly_without_fallback() {
         let peer = PeerId::from([1u8; 32]);
         let secret = Secret::from([2u8; 32]);
-        let rpk = crate::token::RpkPubKey::from([7u8; 32]);
-        // 只有 WG 直连端点（+RPK）——「出口关了 QUIC 面」的 token 形态
+        let rpk = RpkPubKey::from([7u8; 32]);
         let eps = [EndpointRef::new("203.0.113.1:41641", token::EndpointKind::Direct)];
         let tok = token::encode(&TokenSpec {
             peer_id: &peer,
@@ -3574,74 +2119,54 @@ mod tests {
         })
         .expect("token 可编码");
 
-        // ---- wg 档：岛不构造、quic: 族行零输出 ----
-        let wg_log = gen_log_path("wg");
-        let _ = std::fs::remove_file(&wg_log);
-        {
-            let demand = Arc::new(DemandSignals::new());
-            let exec = TunnelExec::new(Arc::clone(&demand));
-            let core = ClientCore::with_shared(exec, demand);
-            assert_eq!(prepare_gen(&core, &tok, &wg_log, "wg"), 0);
-            let lines = wait_lines(&wg_log, "transport: 本世代 L3 承载 = wg", Duration::from_secs(5));
-            assert!(
-                lines.iter().any(|l| l.contains("本世代 L3 承载 = wg")),
-                "N-d 行须声明 wg 档：{lines:?}"
-            );
-            assert!(
-                !lines.iter().any(|l| l.contains("quic:")),
-                "回退档下 `quic:` 族行必须零输出：{lines:?}"
-            );
-            assert!(
-                !core.tun_status().contains("\"quic\""),
-                "wg 档状态 JSON 不得含 quic 段：{}",
-                core.tun_status()
-            );
-            settle_or_stop(&core);
+        let log = gen_log_path("wgonly");
+        let _ = std::fs::remove_file(&log);
+        let demand = Arc::new(DemandSignals::new());
+        let exec = TunnelExec::new(Arc::clone(&demand));
+        let core = ClientCore::with_shared(exec, demand);
+        assert_eq!(prepare_gen(&core, &tok, &log), 0);
+        let lines = wait_lines(&log, "岛未就用", Duration::from_secs(5));
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("quic: 岛未就用") && l.contains("候选为空")),
+            "无 QUIC/中继端点必须记行归因（候选为空）：{lines:?}"
+        );
+        let joined = lines.join("\n");
+        assert!(
+            !joined.contains("回落") && !joined.contains("兜底"),
+            "单承载后不得有任何回落/兜底话术：{joined}"
+        );
+        assert!(
+            !joined.contains("本世代 L3 承载"),
+            "A/B 开关行（N-d）必须已删除：{joined}"
+        );
+        // failed 终态 + 可见归因
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while core.tun_status().contains("\"state\":\"preparing\"") {
+            assert!(Instant::now() < deadline, "空候选应在 3s 内落 failed 终态");
+            std::thread::sleep(Duration::from_millis(20));
         }
-
-        // ---- quic 档 × 无 QUIC 端点（配置不一致形态）：记行 + 回落 WG ----
-        let q_log = gen_log_path("q");
-        let _ = std::fs::remove_file(&q_log);
-        {
-            let demand = Arc::new(DemandSignals::new());
-            let exec = TunnelExec::new(Arc::clone(&demand));
-            let core = ClientCore::with_shared(exec, demand);
-            assert_eq!(prepare_gen(&core, &tok, &q_log, "quic"), 0);
-            let lines = wait_lines(&q_log, "回落 WG 承载", Duration::from_secs(5));
-            assert!(
-                lines.iter().any(|l| l.contains("本世代 L3 承载 = quic")),
-                "N-d 行须声明 quic 档：{lines:?}"
-            );
-            assert!(
-                lines
-                    .iter()
-                    .any(|l| l.contains("quic: 岛未就用") && l.contains("候选为空")),
-                "无 QUIC 端点必须记行归因（候选为空）：{lines:?}"
-            );
-            assert!(
-                lines.iter().any(|l| l.contains("本世代回落 WG 承载")),
-                "必须回落 WG（隧道功能不丢）：{lines:?}"
-            );
-            assert!(
-                !lines.iter().any(|l| l.contains("quic: 隧道侧就绪")),
-                "未成岛不得打 C2'（L3 承载面就绪行）：{lines:?}"
-            );
-            assert!(
-                !core.tun_status().contains("\"quic\""),
-                "回落档状态 JSON 不得含 quic 段"
-            );
-            settle_or_stop(&core);
-        }
+        let st = core.tun_status();
+        assert!(st.contains("\"state\":\"failed\""), "空候选 = failed 终态：{st}");
+        assert!(
+            st.contains("岛未就用"),
+            "失败归因必须进 status reason（用户可见）：{st}"
+        );
+        // 锁已放：下一次 prepare 可受理（不是 -1 忙）
+        assert_eq!(prepare_gen(&core, &tok, &log), 0);
+        settle_or_stop(&core);
+        let _ = TunStage::Idle; // 引用 stage 枚举（保持 import）
     }
 
-    /// **判据（S3-1 ①）**：`transport=quic` × token 带 QUIC 类端点 ⇒ **岛真构造**
-    /// （`quic: 赛跑投出` 行 = 岛起的端点真发了候选）；黑洞候选 ⇒ 赛跑未成 ⇒ 记行 + 回落 WG
-    /// （同一用例覆盖「构造」与「失败面」两侧）。
+    /// **判据（S3-1 ①，M5 C3 改写）**：token 带 QUIC 类端点 ⇒ **岛真构造**（`quic: 赛跑投出`
+    /// 行 = 岛起的端点真发了候选）；黑洞候选 ⇒ 赛跑未成 ⇒ **记行 + failed 终态**（单承载：
+    /// 无回落档，失败即本世代结束）。
     #[test]
     fn quic_mode_constructs_island_and_reports_race_failure() {
         let peer = PeerId::from([1u8; 32]);
         let secret = Secret::from([2u8; 32]);
-        let rpk = crate::token::RpkPubKey::from([7u8; 32]);
+        let rpk = RpkPubKey::from([7u8; 32]);
         let eps = [
             EndpointRef::new("203.0.113.1:41641", token::EndpointKind::Direct),
             // 黑洞 QUIC 候选（本机回环未监听端口 ⇒ 握手无应答 ⇒ 预算到点收场）
@@ -3660,19 +2185,42 @@ mod tests {
         let demand = Arc::new(DemandSignals::new());
         let exec = TunnelExec::new(Arc::clone(&demand));
         let core = ClientCore::with_shared(exec, demand);
-        assert_eq!(prepare_gen(&core, &tok, &log, "quic"), 0);
+        assert_eq!(prepare_gen(&core, &tok, &log), 0);
         let lines = wait_lines(&log, "岛未就用", Duration::from_secs(20));
         assert!(
             lines.iter().any(|l| l.contains("quic: 赛跑投出")),
             "岛必须真构造并发起赛跑（C4' 行）：{lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.contains("quic: 岛未就用") && l.contains("赛跑未成")),
-            "黑洞候选 ⇒ 赛跑未成须归因：{lines:?}"
+            lines
+                .iter()
+                .any(|l| l.contains("候选端点（1 条）") && l.contains("（直连）")),
+            "C13 候选清单（岛候选来源 = QUIC 类端点；学习标记面退役）：{lines:?}"
         );
         assert!(
-            lines.iter().any(|l| l.contains("本世代回落 WG 承载")),
-            "赛跑失败 ⇒ 回落 WG：{lines:?}"
+            !lines.iter().any(|l| l.contains("·学习")),
+            "单承载后学习标记面不得再现：{lines:?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("quic: 岛未就用") && l.contains("赛跑未成")),
+            "黑洞候选 ⇒ 赛跑未成须归因：{lines:?}"
+        );
+        let joined = lines.join("\n");
+        assert!(
+            !joined.contains("回落") && !joined.contains("兜底"),
+            "单承载后不得有任何回落/兜底话术：{joined}"
+        );
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while core.tun_status().contains("\"state\":\"preparing\"") {
+            assert!(Instant::now() < deadline, "赛跑失败应在 3s 内落 failed 终态");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert!(
+            core.tun_status().contains("\"state\":\"failed\""),
+            "赛跑失败 = failed 终态：{}",
+            core.tun_status()
         );
         settle_or_stop(&core);
     }
@@ -3722,25 +2270,20 @@ mod tests {
         assert_eq!(q.mirrors, 8);
     }
 
-    /// **判据（S3-3 的装配面）**：`quic` 段的存在条件 = 本世代 quic 档 **且** 岛在位
-    /// （wg 档/岛缺席 ⇒ 整段缺席）。
+    /// **判据（S3-3 的装配面；M5 C3 单承载）**：`quic` 段的存在条件 = **岛在位**
+    /// （岛缺席 ⇒ 整段缺席）。「是不是 quic 档」不再是变量（无 A/B 开关）。
     #[test]
-    fn quic_section_requires_quic_bearer_and_island() {
-        let (logf, _rx) = {
-            let (tx, rx) = mpsc::channel::<String>();
-            let l: Logf = Arc::new(move |s: &str| {
-                let _ = tx.send(s.to_owned());
-            });
-            (l, rx)
-        };
-        let run = GenRun::synthetic_for_test(logf);
-        assert_eq!(run.bearer, L3Bearer::Wg, "合成世代 = wg 档");
+    fn quic_section_requires_island() {
+        let (logf, _rx) = line_logf();
+        let run = Arc::new(GenRun::synthetic_for_test(logf));
+        assert!(quic_status_of(&run).is_none(), "岛不在 ⇒ quic 段缺席");
+        let island = idle_island(&run);
+        run.set_island(Arc::clone(&island));
         assert!(
-            quic_status_of(&run).is_none(),
-            "wg 档（岛不在）⇒ quic 段缺席"
+            quic_status_of(&run).is_some(),
+            "岛在位 ⇒ quic 段在场（含未建连形态——归因面）"
         );
-        if let Some(c) = run.current_client() {
-            c.stop();
-        }
+        run.take_island();
+        island.stop();
     }
 }

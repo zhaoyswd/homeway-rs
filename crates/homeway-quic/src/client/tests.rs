@@ -640,12 +640,12 @@ async fn admission_rejection_carries_code_line_and_snapshot_fields() {
             .clone();
         assert_eq!(
             l,
-            format!("quic: 准入回执（code=0x{want:02x} {text}）——本世代回落 WG 承载"),
+            format!("quic: 准入回执（code=0x{want:02x} {text}）——本世代未建连"),
             "归因行逐字"
         );
         assert!(!l.contains("准入被拒"), "客户端行不得用出口前缀（脚本 grep 会混淆）：{l}");
 
-        // ③ 快照两字段（App 状态面的「为什么走了 WG」）
+        // ③ 快照两字段（App 状态面的「为什么没连上」）
         let snap = island.snapshot();
         assert_eq!(snap.admit_reject_code, Some(want), "{class:?} 的码面");
         assert_eq!(snap.admit_reject_text.as_deref(), Some(text), "{class:?} 的短语面");

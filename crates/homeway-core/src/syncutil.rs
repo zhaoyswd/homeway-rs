@@ -13,7 +13,7 @@
 //! carve-out（Q-F F6-3 明示）：**分配失败 = abort**（`handle_alloc_error`）不在本
 //! 模块可处置面——进程级 abort 无栈可退，任何「不 panic」纪律都覆盖不到它。
 
-use std::sync::{Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
@@ -23,22 +23,14 @@ use crate::Logf;
 /// 问题交给该锁的语义面自愈）。
 ///
 /// **单源范围（如实口径，代码门 ⑥-1）**：本批收敛的是 `expect("…锁中毒")` 一族与
-/// facade 内三份私有 `LockUnpoison` trait（`.lup()`）——session / recover /
-/// `facade::tun_exec` / `wgcore::Client` 面 / 本模块调用点全走本件。**等价内联副本
-/// 仍在**（`unwrap_or_else(|e| e.into_inner())` 直写，约 5 个文件 ~39 处；语义完全
-/// 一致），未纳入本批。
+/// facade 内三份私有 `LockUnpoison` trait（`.lup()`）——`facade::tun_exec` / 本模块
+/// 调用点全走本件。**等价内联副本仍在**（`unwrap_or_else(|e| e.into_inner())` 直写，
+/// 约 5 个文件 ~39 处；语义完全一致），未纳入本批。
+///
+/// **M5 C3**：`read_unpoison`/`write_unpoison`（RwLock 两件）的唯一消费者是 WG 档的
+/// `session`/`wgcore` 面 ⇒ 随三模块删除（死件不留守）。
 pub(crate) fn lock_unpoison<T>(m: &Mutex<T>) -> MutexGuard<'_, T> {
     m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
-/// [`RwLock`] 读侧的同义件（session 的世代/域名重解析锁）。
-pub(crate) fn read_unpoison<T>(m: &RwLock<T>) -> RwLockReadGuard<'_, T> {
-    m.read().unwrap_or_else(|e| e.into_inner())
-}
-
-/// [`RwLock`] 写侧的同义件。
-pub(crate) fn write_unpoison<T>(m: &RwLock<T>) -> RwLockWriteGuard<'_, T> {
-    m.write().unwrap_or_else(|e| e.into_inner())
 }
 
 /// JoinHandle 的有界等待：到点返回 false 并**放弃 join**（句柄析构即分离，线程自行

@@ -29,7 +29,7 @@
 //!
 //! 有意缺口（设计 §2.6；S2a 内逐条处置）：
 //! - **G5**（`daemon host reach` 过滤键）：本模块只提供会话；过滤键修正落在
-//!   `daemon/hosts.rs`（`is_wg()` → `Quic|Relay`）。
+//!   `daemon/hosts.rs`（WG 档的 `is_wg()` 反过滤 → `Quic|Relay`）。
 //! - **G6**（`dnstest` 的 UDP 服务面无替代）：岛只有 STREAM + L3，无 UDP socket 服务
 //!   ⇒ **登记退役**（排障工具，非产品四件套；`homeway-cli` 侧同批处置）。
 //! - **G7**（出口 `:5300` 解析腿在宿主会话无 tag 承载）：**登记缺口**（承接 = 出口侧
@@ -253,13 +253,9 @@ impl Level {
         }
     }
 
-    /// 档位名（**仅供日志留痕**；C11 族已删，不产判据行）。
-    pub fn name(self) -> &'static str {
-        match self {
-            Level::R1 => "R1 重握手",
-            Level::R2 => "R2 换源",
-            Level::R3 => "R3 重赛跑",
-        }
+    /// 档位数值（**仅供日志留痕**；档位名与 C11 族已随 WG 阶梯删除，不产判据行）。
+    pub fn raw(self) -> i64 {
+        self as i64
     }
 }
 
@@ -498,8 +494,8 @@ impl HostSession {
             }
         };
         (self.inner.logf)(&format!(
-            "宿主会话恢复下推（{cause}；入参={}）：岛快探{tag} → {verdict}",
-            from.name()
+            "宿主会话恢复下推（{cause}；入参=档位 {}）：岛快探{tag} → {verdict}",
+            from.raw()
         ));
         rc
     }

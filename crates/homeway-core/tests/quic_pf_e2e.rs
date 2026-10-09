@@ -571,7 +571,7 @@ fn recover_downpush_on_island_satisfies_falsify_metrics() {
     // 岛档归因行在场（每轮两推 ⇒ ≥ 2×RECOVER_ROUNDS 条）
     let push_lines: Vec<&String> = lines
         .iter()
-        .filter(|l| l.contains("quic: 恢复下推（扩展下推(R3 重赛跑)）——按承载分档（岛快探+复探：失败（"))
+        .filter(|l| l.contains("quic: 恢复下推（扩展下推(档位 3)）——岛快探+复探：失败（"))
         .collect();
     println!("[pf-e2e] s4：岛档归因行 = {} 条", push_lines.len());
     assert!(
@@ -593,7 +593,7 @@ fn recover_downpush_on_island_satisfies_falsify_metrics() {
     let rc = core.tun_recover(3);
     println!("[pf-e2e] s4：康复后下推 rc={rc} elapsed={:?}", t2.elapsed());
     assert_eq!(rc, 0, "路径通 ⇒ 0（快探通过）");
-    let ok_line = "quic: 恢复下推（扩展下推(R3 重赛跑)）——按承载分档（岛快探：通过）";
+    let ok_line = "quic: 恢复下推（扩展下推(档位 3)）——岛快探：通过";
     assert!(
         gen_lines(&gen_log).iter().any(|l| l.contains(ok_line)),
         "首探通过 ⇒ 行文不带「+复探」（逐字）：{ok_line}"

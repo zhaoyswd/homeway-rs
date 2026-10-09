@@ -102,24 +102,6 @@ impl EndpointKind {
         }
     }
 
-    /// 该类别是否属于 **WG 面**（M1 §2.1 末段「候选按 transport 过滤」的判据）：
-    /// QUIC 类**不是**——WG 档不吃它（端口都不同，§1.1），吃到只会产出握手超时噪声与
-    /// 赛跑结算失真。S2 的岛按 `!is_wg()` 取 QUIC 档候选。
-    pub fn is_wg(self) -> bool {
-        !matches!(self, EndpointKind::Quic)
-    }
-}
-
-/// WG 面候选的端点过滤（M1 §2.1 末段）：滤掉 QUIC 类端点，其余类别与顺序原样。
-///
-/// 为什么放在这里而不是 `wtransport::domain_eps`：①规则住在 `EndpointKind` 的家乡
-/// （一处定义、两侧引用）；②`wtransport/**` 是 M1 S1c 的红线面（候选展开函数保持零改动，
-/// 由调用方喂已过滤的入参——见 `domain_eps::split_and_resolve` 的文档）。
-pub fn wg_endpoint_refs(eps: &[Endpoint]) -> Vec<EndpointRef<'_>> {
-    eps.iter()
-        .filter(|e| e.kind.is_wg())
-        .map(|e| EndpointRef::new(e.addr.as_str(), e.kind))
-        .collect()
 }
 
 /// 32B 定长 newtype 的展开骨架（`PeerId` 与 `Secret` 共用；差异只在 `$copy` 与
@@ -783,28 +765,6 @@ mod tests {
         assert_eq!(EndpointKind::Quic.to_wire(), 2);
     }
 
-    /// **判据（M1 S1c 的「WG 档不吃 QUIC 端点」，§2.1 末段）**：`wg_endpoint_refs` 滤掉
-    /// QUIC 类（地址/端口都不是 WG 面），其余类别与顺序原样；反向对照：把同址标成
-    /// Direct ⇒ 会留下（证明过滤真在起作用）。
-    #[test]
-    fn wg_endpoint_refs_filters_quic_class() {
-        let eps = vec![
-            Endpoint { addr: "1.2.3.4:41641".into(), kind: EndpointKind::Direct },
-            Endpoint { addr: "1.2.3.4:41652".into(), kind: EndpointKind::Quic },
-            Endpoint { addr: "5.6.7.8:41741".into(), kind: EndpointKind::Relay },
-            Endpoint { addr: "203.0.113.7:41652".into(), kind: EndpointKind::Quic },
-        ];
-        let wg = wg_endpoint_refs(&eps);
-        assert_eq!(wg.len(), 2, "QUIC 类全滤掉：{wg:?}");
-        assert!(wg.iter().all(|e| e.kind.is_wg()));
-        assert_eq!(wg[0].addr, "1.2.3.4:41641");
-        assert_eq!(wg[1].addr, "5.6.7.8:41741");
-        assert_eq!(wg[1].kind, EndpointKind::Relay, "中继位原样");
-        // 反向对照：同址标成 Direct ⇒ 留下
-        let mislabeled = vec![Endpoint { addr: "1.2.3.4:41652".into(), kind: EndpointKind::Direct }];
-        assert_eq!(wg_endpoint_refs(&mislabeled).len(), 1);
-        assert!(!EndpointKind::Quic.is_wg() && EndpointKind::Direct.is_wg());
-    }
 
     /// **判据（S1-8）**：QUIC 类端点 encode/decode 往返 + **既有 WG 端点逐字节不变**。
     ///
@@ -812,7 +772,7 @@ mod tests {
     /// 含 QUIC 条目的那串**逐字节相同**（QUIC 只追加自己的段，不动前文）；同时
     /// `direct_endpoints`/`relay_endpoints` 的过滤结果不受 QUIC 条目影响。
     #[test]
-    fn quic_endpoint_kind_round_trips_and_keeps_wg_bytes() {
+    fn quic_endpoint_kind_round_trips_and_keeps_direct_bytes() {
         let peer_id = PeerId::from([0x51; 32]);
         let secret = Secret::from([0x52; 32]);
         let wg = [
@@ -824,7 +784,7 @@ mod tests {
             EndpointRef::new("192.168.3.12:42652", EndpointKind::Quic),
             EndpointRef::new("203.0.113.7:42652", EndpointKind::Quic),
         ];
-        let tok_wg = encode(&TokenSpec { peer_id: &peer_id, secret: &secret, endpoints: &wg, rpk: None })
+        let tok_direct = encode(&TokenSpec { peer_id: &peer_id, secret: &secret, endpoints: &wg, rpk: None })
             .expect("编码");
         let tok_quic = encode(&TokenSpec {
             peer_id: &peer_id,
@@ -846,7 +806,7 @@ mod tests {
             }
             b[65..off].to_vec()
         };
-        assert_eq!(segs(&body(&tok_wg), 2), segs(&body(&tok_quic), 2), "WG 段逐字节不变");
+        assert_eq!(segs(&body(&tok_direct), 2), segs(&body(&tok_quic), 2), "直连段逐字节不变");
         assert_eq!(body(&tok_quic)[64], 4, "端点计数 = 4（含 2 条 QUIC）");
 
         // ② 往返：类别与地址逐条还原；过滤函数各归各族

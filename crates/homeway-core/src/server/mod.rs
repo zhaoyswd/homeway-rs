@@ -2,7 +2,7 @@
 //!
 //! 对应 Go 侧 `internal/server/` + `pkg/servercore/` + `pkg/intercept/` + `pkg/dns/` 的 Rust 平移；
 //! 模块划分按 Rust 惯例（`bind.rs` 对应 `servercore.ServerBind`——与客户端
-//! `wtransport::bind`（对应 `wtransport.Bind`）同名是「同一协议两端各一个 Bind」的
+//! 客户端 `wtransport::bind`（对应 `wtransport.Bind`；**M5 C3 已随 WG 面删除**）同名是「同一协议两端各一个 Bind」的
 //! 对称结构，全路径区分）。
 
 pub mod bind;

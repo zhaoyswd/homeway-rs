@@ -1,10 +1,12 @@
-//! M3 S8 门槛：**服务流吞吐相对门槛**（设计 §7/§15-3）——**同刻同承载、同一服务操作**
-//! 的 files 下载吞吐：QUIC 档（服务流经 `STREAM[tag=files]`）vs WG 档（服务腿经
-//! intercept 豁免 → UDS → 同一 FilesServer）。
+//! M3 S8 门槛：**服务流吞吐**（设计 §7/§15-3）——files 下载吞吐（服务流经
+//! `STREAM[tag=files]`）。
+//!
+//! **M5 C3 单臂化（设计 §9.2 默认 (c)）**：原 A/B 对照臂（`transport=wg`：WG 会隖 →
+//! intercept 豁免 → UDS）随 WG 面退役 ⇒ 本用例只跑 QUIC 臂（相对门槛的**参照臂消失**
+//! 已登记；绝对读数继续入册）。
 //!
 //! 与既有 e2e 的关系：本用例复用 `[e2e5]`（App 核形态 + 真世代 + 隧道桥 + 真 FilesServer）
-//! 的同一条产品路径，只把「list」换成「download 大文件 + 计时」，两臂**唯一变量 = 承载**
-//! （`transport=quic|wg`）。
+//! 的同一条产品路径，只把「list」换成「download 大文件 + 计时」。
 //!
 //! 驱动：`tools/m3-s8-perf.sh`（起本地私有出口 → 灌 token → 逐臂跑本用例）。
 //! 读数（stdout 一行）：`[perf] transport=… file=… bytes=… secs=… mibps=…`。
@@ -43,21 +45,25 @@ fn read_exact(r: &mut BufReader<UnixStream>, n: usize, wait: Duration) -> std::i
 #[ignore = "性能读数：需本地出口在跑（tools/m3-s8-perf.sh 驱动）"]
 fn stream_files_download_throughput_by_bearer() {
     let token = std::env::var("HOMEWAY_PERF_TOKEN").expect("须给 HOMEWAY_PERF_TOKEN");
-    let transport = std::env::var("HOMEWAY_PERF_TRANSPORT").unwrap_or_else(|_| "quic".into());
-    assert!(transport == "quic" || transport == "wg", "承载取值：quic|wg");
+    // M5 C3：WG 参照臂退役——`HOMEWAY_PERF_TRANSPORT` 只接受 `quic`（旧脚本给 `wg`
+    // 一律 fail-fast，不静默出空读数）。
+    if let Ok(t) = std::env::var("HOMEWAY_PERF_TRANSPORT") {
+        assert_eq!(t, "quic", "WG 参照臂已随 WG 面退役（M5 C3；只支持 quic）");
+    }
+    let transport = "quic";
     let file = std::env::var("HOMEWAY_PERF_FILE").unwrap_or_else(|_| "perf-64m.bin".into());
     let expect_bytes: usize = std::env::var("HOMEWAY_PERF_BYTES")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(0);
 
-    let dir = std::env::temp_dir().join(format!("hw-m3s8-perf-{}-{}", transport, std::process::id()));
+    let dir = std::env::temp_dir().join(format!("hw-m3s8-perf-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("临时目录可建");
     let out = dir.join("gen.log");
     let ident_dir = dir.join("identity");
     let _ = std::fs::remove_file(&out);
     let cfg = format!(
-        r#"{{"token":"{token}","out":"{}","identityDir":"{}","transport":"{transport}"}}"#,
+        r#"{{"token":"{token}","out":"{}","identityDir":"{}"}}"#,
         out.display(),
         ident_dir.display()
     );
@@ -80,15 +86,8 @@ fn stream_files_download_throughput_by_bearer() {
     assert!(core.tun_status().contains("\"state\":\"attached\""), "世代须 attached");
 
     let log = std::fs::read_to_string(&out).unwrap_or_default();
-    if transport == "quic" {
-        assert!(log.contains("quic: 隧道侧就绪（L3 直通；"), "QUIC 档须在场：{log}");
-        assert!(!log.contains("本世代回落 WG 承载"), "本臂不得回落 WG：{log}");
-    } else {
-        assert!(
-            !log.contains("quic: 岛已建连"),
-            "WG 臂不得起 QUIC 岛（本臂是 WG/UDS 档）：{log}"
-        );
-    }
+    assert!(log.contains("quic: 隧道侧就绪（L3 直通；"), "岛须在场：{log}");
+    assert!(!log.contains("回落 WG"), "单承载后不得有回落话术：{log}");
 
     let v: serde_json::Value = serde_json::from_str(&core.tun_status()).expect("tun_status 是 JSON");
     let auth = v["bridgeAuth"].as_str().unwrap_or_default().to_owned();
@@ -178,7 +177,9 @@ fn download_once(
 #[ignore = "性能读数：需本地出口在跑（tools/m3-s9-bulk.sh 驱动）"]
 fn stream_files_parallel_download() {
     let token = std::env::var("HOMEWAY_PERF_TOKEN").expect("须给 HOMEWAY_PERF_TOKEN");
-    let transport = std::env::var("HOMEWAY_PERF_TRANSPORT").unwrap_or_else(|_| "quic".into());
+    if let Ok(t) = std::env::var("HOMEWAY_PERF_TRANSPORT") {
+        assert_eq!(t, "quic", "WG 参照臂已随 WG 面退役（M5 C3；只支持 quic）");
+    }
     let file = std::env::var("HOMEWAY_PERF_FILE").unwrap_or_else(|_| "perf-64m.bin".into());
     let streams: usize = std::env::var("HOMEWAY_PERF_PARALLEL")
         .ok()
@@ -199,7 +200,7 @@ fn stream_files_parallel_download() {
     let ident_dir = dir.join("identity");
     let _ = std::fs::remove_file(&out);
     let cfg = format!(
-        r#"{{"token":"{token}","out":"{}","identityDir":"{}","transport":"{transport}"}}"#,
+        r#"{{"token":"{token}","out":"{}","identityDir":"{}"}}"#,
         out.display(),
         ident_dir.display()
     );

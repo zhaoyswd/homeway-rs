@@ -26,21 +26,21 @@ fn vocab_dump() {
         "portfwd/err\t{}\n",
         homeway_core::PortfwdErr::BindFailed.as_str()
     ));
-    // event-payload/via（faces: napi+cp——Via::as_str 全集）
-    for v in [
-        homeway_core::wtransport::Via::Direct,
-        homeway_core::wtransport::Via::Relay,
-        homeway_core::wtransport::Via::None,
-    ] {
-        out.push_str(&format!("event-payload/via\t{}\n", v.as_str()));
+    // event-payload/via（faces: napi+cp——岛 `Via` 的两态 + 「未采纳」的 `none`）
+    // M5 C3：`wtransport::Via` 随 WG 面退役 ⇒ 词表源改为 `homeway_quic::Via`（`link_text`）
+    // + 三态里的 `none`（= `IslandSnapshot::via == None` 的 link 段字面；词表值域不变）。
+    for v in [homeway_quic::Via::Direct, homeway_quic::Via::Relay { label: [0u8; 8] }] {
+        out.push_str(&format!("event-payload/via\t{}\n", v.link_text()));
     }
-    // event-payload/state（faces: napi+cp——SessState::as_str 全集）
+    out.push_str("event-payload/via\tnone\n");
+    // event-payload/state（faces: napi+cp——宿主会话 `SessState::as_str` 全集；
+    // M5 C3：源从 `session::SessState` 迁到 `facade::host_session::SessState`，串面逐字不变）
     for v in [
-        homeway_core::session::SessState::Starting,
-        homeway_core::session::SessState::Ready,
-        homeway_core::session::SessState::Failed,
-        homeway_core::session::SessState::Stopping,
-        homeway_core::session::SessState::Idle,
+        homeway_core::facade::host_session::SessState::Starting,
+        homeway_core::facade::host_session::SessState::Ready,
+        homeway_core::facade::host_session::SessState::Failed,
+        homeway_core::facade::host_session::SessState::Stopping,
+        homeway_core::facade::host_session::SessState::Idle,
     ] {
         out.push_str(&format!("event-payload/state\t{}\n", v.as_str()));
     }
