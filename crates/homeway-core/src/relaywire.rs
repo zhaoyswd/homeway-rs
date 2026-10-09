@@ -16,7 +16,7 @@
 use hmac::{Hmac, Mac};
 use sha2::Sha256;
 
-use crate::wtransport::frame::{decode_frame, encode_frame};
+use crate::legframe::{decode_frame, encode_frame};
 
 /// 帧类型：中继控制（注册挑战/证明/心跳）。
 pub const FRAME_TYPE_RELAY_REG: u8 = 3;
@@ -469,7 +469,7 @@ mod tests {
         assert_eq!(sub, sub::HELLO);
         assert_eq!(body, &PUB[..]);
         // 非 type=3 / 空载荷
-        assert!(decode_relay_reg_frame(&crate::wtransport::frame::frame_bytes(crate::wtransport::frame::FrameKind::Data, b"x")).is_none());
+        assert!(decode_relay_reg_frame(&crate::legframe::frame_bytes(crate::legframe::FrameKind::Data, b"x")).is_none());
         assert!(decode_relay_reg_frame(&frame_bytes(&[])).is_none());
     }
 

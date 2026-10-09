@@ -20,7 +20,7 @@ use std::time::{Duration, Instant};
 use x25519_dalek::PublicKey;
 
 use crate::relaywire as rw;
-use crate::wtransport::frame::relay_id;
+use crate::legframe::relay_id;
 
 use super::Logf;
 

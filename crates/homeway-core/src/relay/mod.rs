@@ -32,7 +32,7 @@ use x25519_dalek::PublicKey;
 
 use crate::go_fmt::fmt_duration_go_secs;
 use crate::relaywire as rw;
-use crate::wtransport::frame::{self, relay_id};
+use crate::legframe::{self, relay_id};
 
 pub use ctlface::CTL_READ_TIMEOUT;
 
@@ -672,7 +672,7 @@ impl Relay {
             let _ = udp.send_to(&resp, src);
             return;
         }
-        let Some((label, kind, payload)) = frame::decode_tagged(pkt) else {
+        let Some((label, kind, payload)) = legframe::decode_tagged(pkt) else {
             self.stats.dropped += 1;
             return;
         };
@@ -747,7 +747,7 @@ impl Relay {
                 label,
                 PendingLeg { pubkey: pub_, eph_priv: eph, nonce: nonce_out, chall_at: now },
             );
-            let resp = frame::frame_bytes(
+            let resp = legframe::frame_bytes(
                 rw::FRAME_TYPE_RELAY_REG,
                 &rw::encode_challenge(eph_pub.as_bytes(), &nonce_out),
             );
@@ -864,12 +864,12 @@ impl Relay {
             } else {
                 self.logf(&format!("中继：后端 {} 注册成功（腿 {}）", hex(&label), src));
             }
-            let resp = frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::ok_bytes());
+            let resp = legframe::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::ok_bytes());
             let _ = udp.send_to(&resp, src);
             return;
         }
         if sub == rw::sub::KEEPALIVE {
-            let resp_again = frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::again_bytes());
+            let resp_again = legframe::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::again_bytes());
             let Some(lg) = self.legs.get(&label) else {
                 // 腿不在了：明确让后端重注册（否则它以为还在，两边永远对不上）
                 let _ = udp.send_to(&resp_again, src);
@@ -998,13 +998,13 @@ impl Relay {
             // hint（唯一推送点 = 建会话，两端各一次；测试形态可关）
             if !self.cfg.no_hints {
                 if let Some(addr) = leg_addr {
-                    let _ = udp.send_to(&frame::hint_bytes(&addr.to_string()), client);
+                    let _ = udp.send_to(&legframe::hint_bytes(&addr.to_string()), client);
                 }
                 if let Some(b) = self.assocs.get(&key).and_then(|a| a.backend) {
                     let a = self.assocs.get(&key).expect("已判在");
                     let _ = a
                         .sock
-                        .send_to(&frame::hint_bytes(&client.to_string()), crate::udpbatch::xmit_addr(b, a.dual));
+                        .send_to(&legframe::hint_bytes(&client.to_string()), crate::udpbatch::xmit_addr(b, a.dual));
                 }
             }
             if has_ctl {
@@ -1040,7 +1040,7 @@ impl Relay {
         if a.dial_up {
             if a.pend.len() < CTL_PEND_MAX {
                 // 等腿窗：帧跨拍持有 ⇒ owned（慢路径，非热面）
-                a.pend.push(frame::frame_bytes(kind, payload));
+                a.pend.push(legframe::frame_bytes(kind, payload));
                 self.stats.forwarded_up += 1;
             } else {
                 self.stats.dropped += 1;
@@ -1053,7 +1053,7 @@ impl Relay {
             // Q-I F6-1：复用 scratch 编帧（消每包 alloc/free；memcpy 保留）——
             // 同调用内 send_to 即返回，无重入。
             self.frame_scratch.clear();
-            frame::encode_frame(kind, payload, &mut self.frame_scratch);
+            legframe::encode_frame(kind, payload, &mut self.frame_scratch);
             match a.sock.send_to(&self.frame_scratch, crate::udpbatch::xmit_addr(dst, a.dual)) {
                 Ok(_) => self.stats.forwarded_up += 1,
                 Err(e) => {
@@ -1649,16 +1649,16 @@ mod tests {
             &[0u8; 65535][..],
         ] {
             for kind in [
-                frame::FrameKind::Data,
-                frame::FrameKind::Control,
-                frame::FrameKind::Reg,
-                frame::FrameKind::Batch,
+                legframe::FrameKind::Data,
+                legframe::FrameKind::Control,
+                legframe::FrameKind::Reg,
+                legframe::FrameKind::Batch,
             ] {
                 scratch.clear();
-                frame::encode_frame(kind, payload, &mut scratch);
+                legframe::encode_frame(kind, payload, &mut scratch);
                 assert_eq!(
                     scratch,
-                    frame::frame_bytes(kind, payload),
+                    legframe::frame_bytes(kind, payload),
                     "kind={kind:?} len={}",
                     payload.len()
                 );
@@ -1820,19 +1820,19 @@ mod tests {
         let label = relay_id(pub_.as_bytes());
 
         // Hello（错 label → 无应答；对 label → Challenge）
-        let bad = frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::encode_hello(pub_.as_bytes()));
+        let bad = legframe::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::encode_hello(pub_.as_bytes()));
         let mut tagged = Vec::new();
-        frame::encode_tagged_frame(&[9u8; 8], &bad, &mut tagged);
+        legframe::encode_tagged_frame(&[9u8; 8], &bad, &mut tagged);
         be.send_to(&tagged, relay_addr).unwrap();
         be.set_read_timeout(Some(Duration::from_millis(300))).unwrap();
         assert!(be.recv_from(&mut [0u8; 64]).is_err(), "错 label 不应答");
 
         let mut tagged = Vec::new();
-        frame::encode_tagged_frame(&label, &bad, &mut tagged);
+        legframe::encode_tagged_frame(&label, &bad, &mut tagged);
         be.send_to(&tagged, relay_addr).unwrap();
         let mut buf = [0u8; 128];
         let (n, _) = be.recv_from(&mut buf).unwrap();
-        let (kind, payload) = frame::decode_frame(&buf[..n]).unwrap();
+        let (kind, payload) = legframe::decode_frame(&buf[..n]).unwrap();
         assert_eq!(kind, rw::FRAME_TYPE_RELAY_REG);
         let (eph_pub, nonce) = rw::decode_challenge(payload).unwrap();
 
@@ -1840,17 +1840,17 @@ mod tests {
         let dh = priv_.diffie_hellman(&PublicKey::from(eph_pub));
         let proof = rw::encode_proof(&nonce, dh.as_bytes(), pub_.as_bytes(), None);
         let mut tagged = Vec::new();
-        frame::encode_tagged_frame(&label, &frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &proof), &mut tagged);
+        legframe::encode_tagged_frame(&label, &legframe::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &proof), &mut tagged);
         be.send_to(&tagged, relay_addr).unwrap();
         let (n, _) = be.recv_from(&mut buf).unwrap();
-        let (kind, payload) = frame::decode_frame(&buf[..n]).unwrap();
+        let (kind, payload) = legframe::decode_frame(&buf[..n]).unwrap();
         assert_eq!(kind, rw::FRAME_TYPE_RELAY_REG);
         assert_eq!(payload, &rw::ok_bytes()[..], "应回 OK");
 
         // Keepalive 续命（同源）——无应答即成功（换了地址才回 Again）
-        let ka = frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::keepalive_bytes());
+        let ka = legframe::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::keepalive_bytes());
         let mut tagged = Vec::new();
-        frame::encode_tagged_frame(&label, &ka, &mut tagged);
+        legframe::encode_tagged_frame(&label, &ka, &mut tagged);
         be.send_to(&tagged, relay_addr).unwrap();
         be.set_read_timeout(Some(Duration::from_millis(200))).unwrap();
         assert!(be.recv_from(&mut buf).is_err(), "同源保活静默续命");
@@ -1876,9 +1876,9 @@ mod tests {
         register_open(&be, relay_addr, &priv_, &pub_, &label);
 
         // 客户端发一条数据帧（标签信封）
-        let data = frame::frame_bytes(frame::FrameKind::Data, b"wg-payload");
+        let data = legframe::frame_bytes(legframe::FrameKind::Data, b"wg-payload");
         let mut tagged = Vec::new();
-        frame::encode_tagged_frame(&label, &data, &mut tagged);
+        legframe::encode_tagged_frame(&label, &data, &mut tagged);
         cl.send_to(&tagged, relay_addr).unwrap();
 
         // 后端收到：hint 帧（control）+ 转发帧——逐包按长度解码直到见数据
@@ -1887,8 +1887,8 @@ mod tests {
         let mut got_data = false;
         for _ in 0..4 {
             let Ok((n, _)) = be.recv_from(&mut buf) else { break };
-            if let Some((kind, payload)) = frame::decode_frame(&buf[..n]) {
-                if kind == frame::FrameKind::Data.to_wire() && payload == b"wg-payload" {
+            if let Some((kind, payload)) = legframe::decode_frame(&buf[..n]) {
+                if kind == legframe::FrameKind::Data.to_wire() && payload == b"wg-payload" {
                     got_data = true;
                     break;
                 }
@@ -1901,10 +1901,10 @@ mod tests {
         let assoc_src = {
             cl.send_to(&tagged, relay_addr).unwrap();
             let (n2, src) = be.recv_from(&mut buf).unwrap();
-            assert_eq!(&buf[..n2], &frame::frame_bytes(frame::FrameKind::Data, b"wg-payload")[..]);
+            assert_eq!(&buf[..n2], &legframe::frame_bytes(legframe::FrameKind::Data, b"wg-payload")[..]);
             src
         };
-        let back = frame::frame_bytes(frame::FrameKind::Data, b"down-payload");
+        let back = legframe::frame_bytes(legframe::FrameKind::Data, b"down-payload");
         be.send_to(&back, assoc_src).unwrap();
         // 客户端先收 hint（建会话时经主监听 socket 直达）再收回程帧——逐包按长度判
         let mut got_down = false;
@@ -1934,20 +1934,20 @@ mod tests {
         let pub_ = PublicKey::from(&priv_);
         let label = relay_id(pub_.as_bytes());
         // Hello → Challenge
-        let hello = frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::encode_hello(pub_.as_bytes()));
+        let hello = legframe::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::encode_hello(pub_.as_bytes()));
         let mut tagged = Vec::new();
-        frame::encode_tagged_frame(&label, &hello, &mut tagged);
+        legframe::encode_tagged_frame(&label, &hello, &mut tagged);
         be.send_to(&tagged, relay_addr).unwrap();
         let mut buf = [0u8; 128];
         let (n, _) = be.recv_from(&mut buf).unwrap();
-        let (_, payload) = frame::decode_frame(&buf[..n]).unwrap();
+        let (_, payload) = legframe::decode_frame(&buf[..n]).unwrap();
         let (eph_pub, nonce) = rw::decode_challenge(payload).unwrap();
         // 错密钥的 PSK
         let dh = priv_.diffie_hellman(&PublicKey::from(eph_pub));
         let bad_psk = rw::auth_mac(&[0x00u8; 32], &nonce, pub_.as_bytes());
         let proof = rw::encode_proof(&nonce, dh.as_bytes(), pub_.as_bytes(), Some(&bad_psk));
         let mut tagged = Vec::new();
-        frame::encode_tagged_frame(&label, &frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &proof), &mut tagged);
+        legframe::encode_tagged_frame(&label, &legframe::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &proof), &mut tagged);
         be.send_to(&tagged, relay_addr).unwrap();
         assert!(be.recv_from(&mut buf).is_err(), "PSK 不过应静默拒绝");
     }
@@ -1997,9 +1997,9 @@ mod tests {
         // 客户端：发一条数据帧 → 触发拨腿会话（SESSION 通告）
         let cl = UdpSocket::bind("127.0.0.1:0").unwrap();
         cl.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
-        let data = frame::frame_bytes(frame::FrameKind::Data, b"hello-dialup");
+        let data = legframe::frame_bytes(legframe::FrameKind::Data, b"hello-dialup");
         let mut tagged = Vec::new();
-        frame::encode_tagged_frame(&label, &data, &mut tagged);
+        legframe::encode_tagged_frame(&label, &data, &mut tagged);
         cl.send_to(&tagged, relay_addr).unwrap();
 
         // 后端控制面收 SESSION
@@ -2021,7 +2021,7 @@ mod tests {
         assert_eq!(&buf[..n], &data[..], "等腿缓冲应放行首包");
 
         // 下行：腿 socket → 客户端原样
-        let down = frame::frame_bytes(frame::FrameKind::Data, b"down-via-leg");
+        let down = legframe::frame_bytes(legframe::FrameKind::Data, b"down-via-leg");
         leg_sock.send_to(&down, data_port_addr).unwrap();
         let (n, _) = cl.recv_from(&mut buf).unwrap();
         assert_eq!(&buf[..n], &down[..]);
@@ -2092,9 +2092,9 @@ mod tests {
         let pub_ = PublicKey::from(&priv_);
         let label = relay_id(pub_.as_bytes());
         register_open(&be, relay_addr, &priv_, &pub_, &label);
-        let data = frame::frame_bytes(frame::FrameKind::Data, b"x");
+        let data = legframe::frame_bytes(legframe::FrameKind::Data, b"x");
         let mut tagged = Vec::new();
-        frame::encode_tagged_frame(&label, &data, &mut tagged);
+        legframe::encode_tagged_frame(&label, &data, &mut tagged);
         cl.send_to(&tagged, relay_addr).unwrap();
         std::thread::sleep(Duration::from_millis(600));
         // 后端观察：再发包不再有转发（会话已回收 → 新会话重建——仍能通，收到的源端口变了）
@@ -2104,8 +2104,8 @@ mod tests {
         let mut last_src = None;
         for _ in 0..4 {
             if let Ok((n, src)) = be.recv_from(&mut buf) {
-                if frame::decode_frame(&buf[..n]).is_some_and(|(k, p)| {
-                    k == frame::FrameKind::Data.to_wire() && p == b"x"
+                if legframe::decode_frame(&buf[..n]).is_some_and(|(k, p)| {
+                    k == legframe::FrameKind::Data.to_wire() && p == b"x"
                 }) {
                     last_src = Some(src);
                 }
@@ -2130,9 +2130,9 @@ mod tests {
             let p = rand_secret();
             let pk = PublicKey::from(&p);
             let label = relay_id(pk.as_bytes());
-            let hello = frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::encode_hello(pk.as_bytes()));
+            let hello = legframe::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::encode_hello(pk.as_bytes()));
             let mut tagged = Vec::new();
-            frame::encode_tagged_frame(&label, &hello, &mut tagged);
+            legframe::encode_tagged_frame(&label, &hello, &mut tagged);
             be.send_to(&tagged, relay_addr).unwrap();
             let _ = be.recv_from(&mut [0u8; 128]); // 吃掉 CHALLENGE
         }
@@ -2157,9 +2157,9 @@ mod tests {
             let p = rand_secret();
             let pk = PublicKey::from(&p);
             let label = relay_id(pk.as_bytes());
-            let hello = frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::encode_hello(pk.as_bytes()));
+            let hello = legframe::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::encode_hello(pk.as_bytes()));
             let mut tagged = Vec::new();
-            frame::encode_tagged_frame(&label, &hello, &mut tagged);
+            legframe::encode_tagged_frame(&label, &hello, &mut tagged);
             be.send_to(&tagged, relay_addr).unwrap();
             let _ = be.recv_from(&mut [0u8; 128]);
         }
@@ -2185,18 +2185,18 @@ mod tests {
         let p2 = rand_secret();
         let pub2 = PublicKey::from(&p2);
         let label2 = relay_id(pub2.as_bytes());
-        let hello = frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::encode_hello(pub2.as_bytes()));
+        let hello = legframe::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::encode_hello(pub2.as_bytes()));
         let mut tagged = Vec::new();
-        frame::encode_tagged_frame(&label2, &hello, &mut tagged);
+        legframe::encode_tagged_frame(&label2, &hello, &mut tagged);
         be.send_to(&tagged, relay_addr).unwrap();
         let mut buf = [0u8; 128];
         let (n, _) = be.recv_from(&mut buf).unwrap();
-        let (_, payload) = frame::decode_frame(&buf[..n]).unwrap();
+        let (_, payload) = legframe::decode_frame(&buf[..n]).unwrap();
         let (eph_pub, nonce) = rw::decode_challenge(payload).unwrap();
         let dh = p2.diffie_hellman(&PublicKey::from(eph_pub));
         let proof = rw::encode_proof(&nonce, dh.as_bytes(), pub2.as_bytes(), None);
         let mut tagged = Vec::new();
-        frame::encode_tagged_frame(&label2, &frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &proof), &mut tagged);
+        legframe::encode_tagged_frame(&label2, &legframe::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &proof), &mut tagged);
         be.send_to(&tagged, relay_addr).unwrap();
         assert!(be.recv_from(&mut buf).is_err(), "legs 满 ⇒ 不应回 OK");
     }
@@ -2217,9 +2217,9 @@ mod tests {
         let pub_ = PublicKey::from(&p);
         let label = relay_id(pub_.as_bytes());
         register_open(&be, relay_addr, &p, &pub_, &label);
-        let data = frame::frame_bytes(frame::FrameKind::Data, b"up");
+        let data = legframe::frame_bytes(legframe::FrameKind::Data, b"up");
         let mut tagged = Vec::new();
-        frame::encode_tagged_frame(&label, &data, &mut tagged);
+        legframe::encode_tagged_frame(&label, &data, &mut tagged);
         cl.send_to(&tagged, relay_addr).unwrap();
         be.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut buf = [0u8; 256];
@@ -2227,8 +2227,8 @@ mod tests {
             let mut src = None;
             for _ in 0..4 {
                 let Ok((n, s)) = be.recv_from(&mut buf) else { break };
-                if frame::decode_frame(&buf[..n])
-                    .is_some_and(|(k, pl)| k == frame::FrameKind::Data.to_wire() && pl == b"up")
+                if legframe::decode_frame(&buf[..n])
+                    .is_some_and(|(k, pl)| k == legframe::FrameKind::Data.to_wire() && pl == b"up")
                 {
                     src = Some(s);
                     break;
@@ -2238,9 +2238,9 @@ mod tests {
         };
         // 未知源下行 ⇒ 丢弃；合法后端下行 ⇒ 到达
         let intruder = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let bad = frame::frame_bytes(frame::FrameKind::Data, b"forged-down");
+        let bad = legframe::frame_bytes(legframe::FrameKind::Data, b"forged-down");
         intruder.send_to(&bad, assoc_src).unwrap();
-        let good = frame::frame_bytes(frame::FrameKind::Data, b"good-down");
+        let good = legframe::frame_bytes(legframe::FrameKind::Data, b"good-down");
         be.send_to(&good, assoc_src).unwrap();
         let mut got: Vec<Vec<u8>> = Vec::new();
         for _ in 0..4 {
@@ -2274,9 +2274,9 @@ mod tests {
         );
         // 客户端地址用广播地址：下行 sendto 在本机必失败（无 SO_BROADCAST）
         let client: SocketAddr = "255.255.255.255:9".parse().unwrap();
-        let data = frame::frame_bytes(frame::FrameKind::Data, b"x");
+        let data = legframe::frame_bytes(legframe::FrameKind::Data, b"x");
         let mut tagged = Vec::new();
-        frame::encode_tagged_frame(&label, &data, &mut tagged);
+        legframe::encode_tagged_frame(&label, &data, &mut tagged);
         relay.handle_udp_packet(&udp, client, &tagged);
         assert_eq!(relay.assocs.len(), 1, "应建一条 assoc");
         let key = AssocKey { label, client };
@@ -2328,22 +2328,22 @@ mod tests {
     }
 
     fn register_open(be: &UdpSocket, relay_addr: SocketAddr, priv_: &x25519_dalek::StaticSecret, pub_: &PublicKey, label: &[u8; 8]) {
-        let hello = frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::encode_hello(pub_.as_bytes()));
+        let hello = legframe::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::encode_hello(pub_.as_bytes()));
         let mut tagged = Vec::new();
-        frame::encode_tagged_frame(label, &hello, &mut tagged);
+        legframe::encode_tagged_frame(label, &hello, &mut tagged);
         be.send_to(&tagged, relay_addr).unwrap();
         be.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut buf = [0u8; 128];
         let (n, _) = be.recv_from(&mut buf).unwrap();
-        let (_, payload) = frame::decode_frame(&buf[..n]).unwrap();
+        let (_, payload) = legframe::decode_frame(&buf[..n]).unwrap();
         let (eph_pub, nonce) = rw::decode_challenge(payload).unwrap();
         let dh = priv_.diffie_hellman(&PublicKey::from(eph_pub));
         let proof = rw::encode_proof(&nonce, dh.as_bytes(), pub_.as_bytes(), None);
         let mut tagged = Vec::new();
-        frame::encode_tagged_frame(label, &frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &proof), &mut tagged);
+        legframe::encode_tagged_frame(label, &legframe::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &proof), &mut tagged);
         be.send_to(&tagged, relay_addr).unwrap();
         let (n, _) = be.recv_from(&mut buf).unwrap();
-        let (_, payload) = frame::decode_frame(&buf[..n]).unwrap();
+        let (_, payload) = legframe::decode_frame(&buf[..n]).unwrap();
         assert_eq!(payload, &rw::ok_bytes()[..]);
     }
 }
