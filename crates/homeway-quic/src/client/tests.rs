@@ -2009,7 +2009,9 @@ async fn stream_wait<T>(
             Err(TryRecvError::Empty) => {}
         }
         assert!(Instant::now() < deadline, "服务流命令回执超时（岛未应答 ⇒ 挂死）");
-        tokio::time::sleep(Duration::from_millis(10)).await;
+        // 1ms 轮询：流命令是**同步入队即答**（背压在 `n` 上，不在回执时延上）⇒ 细粒度
+        // 轮询只影响测试自身的观测开销（10ms 轮询会把 bulk 用例的读数打成 harness 噪声）
+        tokio::time::sleep(Duration::from_millis(1)).await;
     }
 }
 
@@ -2336,6 +2338,173 @@ async fn stream_write_reports_backpressure_with_original_buffer() {
     stream_wait(&island, &stub, &quic, |reply| Cmd::StreamClose { id, reply }, WAIT)
         .await
         .expect("关流即答");
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（§1.4-N14 的自记账容量；标定证据）**：**设计缺省**（`max_bidi=64`）下
+/// 恰好能开 **62** 条服务流（= 上限 − 控制流 1 − probe 1），第 63 条被**自记账**拒
+/// （`Busy`）——即「自记账域 = {控制流, probe, 服务流}」与 quinn 的并发信用同域；
+/// 同时验证 62 条在册流都真被出口受理（不是本地假成功）。
+#[tokio::test]
+async fn stream_capacity_is_max_bidi_minus_two_at_design_defaults() {
+    let quic = exit_face(0x35);
+    let stub = Stub::new();
+    let island = island_with(Duration::from_secs(60), quic.rpk_public_key());
+    let _ = connect_direct(&island, &stub, &quic).await;
+    let cap = island.stream_limits().service_capacity();
+    assert_eq!(cap, 62, "设计缺省：64 − 2（N14）");
+    let mut ids = Vec::with_capacity(cap);
+    for i in 0..cap {
+        let id = stream_wait(
+            &island,
+            &stub,
+            &quic,
+            |reply| Cmd::StreamOpen {
+                tag: crate::StreamTag::Probe,
+                reply,
+            },
+            WAIT,
+        )
+        .await
+        .unwrap_or_else(|e| panic!("第 {} 条必须可开（容量 {cap}）：{e:?}", i + 1));
+        ids.push(id);
+    }
+    // 第 63 条：**自记账**拒（不是等 quinn 信用耗尽/5s 超时）
+    let t0 = Instant::now();
+    let sixty_third = stream_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::StreamOpen {
+            tag: crate::StreamTag::Probe,
+            reply,
+        },
+        WAIT,
+    )
+    .await;
+    assert_eq!(sixty_third, Err(crate::stream::StreamErr::Busy));
+    assert!(t0.elapsed() < Duration::from_secs(1), "必须快速失败");
+    // 在册计数与容量一致（housekeeping 拍内同步）
+    let deadline = Instant::now() + WAIT;
+    while island.snapshot().streams_active != cap as u64 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert_eq!(island.snapshot().streams_active, cap as u64);
+    // 出口侧真受理：每条开流都发了 tag 首字节（探活流在出口的 echo 等待读）——
+    // 用「关掉一条 ⇒ 立刻能再开一条」证明额度是真回收（而非记假账）
+    stream_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::StreamClose {
+            id: ids[0],
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .expect("关流");
+    let again = stream_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::StreamOpen {
+            tag: crate::StreamTag::Probe,
+            reply,
+        },
+        WAIT,
+    )
+    .await;
+    assert!(again.is_ok(), "关一条腾一格：{again:?}");
+    for id in ids.iter().skip(1) {
+        let _ = stream_wait(&island, &stub, &quic, |reply| Cmd::StreamClose { id: *id, reply }, WAIT).await;
+    }
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **标定读数（§7/§15-3）**：1 MiB 走 `STREAM[probe]` 的**逐块往返**（16 KiB 块 × 64 轮，
+/// 每轮一写一读）——判据面 = ①字节逐段相同 ②「1 MiB 总量 > 双方各自的接收窗
+/// （256 KiB）」证明**窗口更新在重负载下不死锁** ③**只判上界**（flake 口径②；本用例
+/// 的读数是**回程往返 + RPC 轮询**的复合量，**不是**产品 bulk 吞吐口径——§7-N15 的
+/// 服务流吞吐相对门槛（≥0.95× WG/UDS 档）要到 S8 用 S2 的 socketpair 泵 + 同刻同承载
+/// 对照来测；此处只证明「初值下能持续搬运、窗口/队列不卡」。
+#[tokio::test]
+async fn stream_bulk_echo_throughput_is_calibration_evidence() {
+    let quic = exit_face(0x36);
+    let stub = Stub::new();
+    let island = island_with(Duration::from_secs(60), quic.rpk_public_key());
+    let _ = connect_direct(&island, &stub, &quic).await;
+    let id = stream_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::StreamOpen {
+            tag: crate::StreamTag::Probe,
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .expect("开流");
+    const CHUNK: usize = 16 * 1024;
+    const ROUNDS: usize = 64; // 1 MiB
+    let t0 = Instant::now();
+    let mut done = 0usize;
+    for round in 0..ROUNDS {
+        let payload: Vec<u8> = (0..CHUNK).map(|i| (i as u8) ^ (round as u8)).collect();
+        // 写满额（队列 64 KiB ⇒ 16 KiB 块必全额接纳；若遇背压按契约重发余量）
+        let mut off = 0usize;
+        while off < payload.len() {
+            let rest = payload[off..].to_vec();
+            let out = stream_wait(
+                &island,
+                &stub,
+                &quic,
+                |reply| Cmd::StreamWrite {
+                    id,
+                    data: rest.clone(),
+                    reply,
+                },
+                WAIT,
+            )
+            .await
+            .expect("写回执");
+            if out.n == 0 {
+                // 背压：等一拍重试（与 `SessionWriteHalf` 的 Ok(0) 退避环同款）
+                tokio::time::sleep(Duration::from_millis(2)).await;
+                continue;
+            }
+            off += out.n;
+            done += out.n;
+        }
+        // 逐段读回（回显必须逐字节相同）
+        let mut got = vec![0u8; payload.len()];
+        let mut filled = 0usize;
+        while filled < got.len() {
+            let part = stream_wait(&island, &stub, &quic, |reply| Cmd::StreamRead { id, reply }, WAIT)
+                .await
+                .expect("读回显");
+            assert!(!part.is_empty(), "回显不得空块（EOF 会回 Closed）");
+            got[filled..filled + part.len()].copy_from_slice(&part);
+            filled += part.len();
+        }
+        assert_eq!(got, payload, "第 {round} 轮逐字节相同");
+    }
+    let elapsed = t0.elapsed();
+    let mib_s = (done as f64 / (1024.0 * 1024.0)) / elapsed.as_secs_f64();
+    println!(
+        "[标定] STREAM[probe] 逐块往返 1 MiB（16 KiB × {ROUNDS}，含 RPC 轮询开销）：耗时 {:?}，复合吞吐 {mib_s:.2} MiB/s",
+        elapsed
+    );
+    assert_eq!(done, ROUNDS * CHUNK, "总字节数");
+    // 上界给足（flake 口径：只判上界；本仓全量测试并行跑时 CPU 争用会让该读数抖动）
+    assert!(
+        elapsed < Duration::from_secs(30),
+        "上界：1 MiB 逐块往返必须在 30s 内跑完（flake 口径：只判上界）"
+    );
+    let _ = stream_wait(&island, &stub, &quic, |reply| Cmd::StreamClose { id, reply }, WAIT).await;
     assert!(island.stop_within(Instant::now() + BUDGET));
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
