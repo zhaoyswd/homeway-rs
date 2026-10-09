@@ -45,7 +45,9 @@ pub fn now_ms() -> i64 {
 /// close 幂等）。
 ///
 /// 写停滞预算在实现内承载（Go streamUpTimeout 30s / upWorker 停滞 30s 的合并面：
-/// 单写无进展上限，超时回 `TimedOut` → 收流 gone）。
+/// 单写无进展上限，超时回 `TimedOut` → 收流 gone）。**M5 C2**：生产实现 =
+/// 宿主会话的 [`crate::facade::host_session::HostStream`]（implemented below）；
+/// WG 档 `TunnelConn` 已退役。
 pub trait StreamConn: Send + Sync {
     /// 阻塞读一块；Ok(空 Vec) = EOF（对端关）。
     fn read_chunk(&self) -> std::io::Result<Vec<u8>>;
@@ -58,62 +60,23 @@ pub trait StreamConn: Send + Sync {
     fn close(&self);
 }
 
-/// 隧道端口拨号的流腿适配器（Go streamConn 语义）：恢复感知拨号建连后的
-/// `(client, conn_id)` 包装——read 阻塞到数据/EOF，写带背压重试与 30s 无进展预算。
-pub struct TunnelConn {
-    client: Arc<crate::wgcore::Client>,
-    id: u64,
-}
-
-impl TunnelConn {
-    pub fn new(client: Arc<crate::wgcore::Client>, id: u64) -> TunnelConn {
-        TunnelConn { client, id }
-    }
-}
-
-const WRITE_STALL: std::time::Duration = std::time::Duration::from_secs(30);
-
-impl StreamConn for TunnelConn {
+impl StreamConn for crate::facade::host_session::HostStream {
     fn read_chunk(&self) -> std::io::Result<Vec<u8>> {
-        use crate::wgcore::ConnErr;
-        match self.client.read(self.id) {
-            Ok(v) => Ok(v),
-            Err(ConnErr::Closed) => Ok(Vec::new()), // 对端 FIN
-            Err(e) => Err(std::io::Error::other(e.to_string())),
-        }
+        // EOF（对端 FIN）由 `HostStream::read_chunk` 折成 Ok(空 Vec)——与本 trait
+        // 约定逐字同形（§2.7 R-4：io kind 映射只在新模块一处写）。
+        crate::facade::host_session::HostStream::read_chunk(self)
     }
 
     fn write_chunk(&self, data: &[u8]) -> std::io::Result<usize> {
-        use crate::wgcore::ConnErr;
-        let t0 = std::time::Instant::now();
-        let mut off = 0usize;
-        while off < data.len() {
-            match self.client.write(self.id, data[off..].to_vec()) {
-                Ok(w) if w.n > 0 => off += w.n,
-                Ok(_) => {
-                    // 零接纳 = 栈 B 背压：等空位（2ms 节拍；无进展预算兜底）。
-                    if t0.elapsed() > WRITE_STALL {
-                        return Err(std::io::Error::new(
-                            std::io::ErrorKind::TimedOut,
-                            "隧道写无进展超 30s（后端不读）",
-                        ));
-                    }
-                    std::thread::sleep(std::time::Duration::from_millis(2));
-                }
-                Err(ConnErr::Closed) => return Err(std::io::Error::other("连接已关闭")),
-                Err(e) => return Err(std::io::Error::other(e.to_string())),
-            }
-        }
-        Ok(data.len())
-    }
-
-    fn close(&self) {
-        let _ = self.client.close(self.id);
+        crate::facade::host_session::HostStream::write_chunk(self, data)
     }
 
     fn shutdown_write(&self) {
-        // 半关（FIN）：对端仍可发——Client::shutdown 是引擎原生半关面。
-        let _ = self.client.shutdown(self.id);
+        crate::facade::host_session::HostStream::shutdown_write(self)
+    }
+
+    fn close(&self) {
+        crate::facade::host_session::HostStream::close(self)
     }
 }
 
@@ -283,18 +246,24 @@ impl DaemonCore {
     }
 }
 
-/// 承载面拨号缝的表侧实现（Go carrierDialOf：Host 查表 + healing 拨号；预算 =
+/// 承载面拨号缝的表侧实现（Go carrierDialOf：Host 查表 + 宿主会话拨号；预算 =
 /// Go DialPort 的 15s 档）。
+///
+/// **M5 C2 换源**：拨号 = `HostSession::connect(ServicePort)`（QUIC 岛 `STREAM[tag]`）
+/// / `HostSession::dial_addr`（`STREAM[dial]` + 6B 目标）；错误面 = `HostErr`
+/// （§2.5：`wgcore::ConnErr` 不迁入新面）。
 fn carriers_dial_of(hosts: &Arc<hosts::HostTable>) -> carriers::CarrierDial {
     let h1 = Arc::clone(hosts);
     let dial_port = Arc::new(
         move |host: &str, port: u16, budget: std::time::Duration| -> Result<carriers::CarrierConn, carriers::DialErr> {
             let id = hosts::decode_peer_id_pub(host).ok_or(carriers::DialErr::NoHost)?;
             let sess = h1.session(&id).ok_or(carriers::DialErr::NoSession)?;
-            let conn_id =
-                sess.healing_dial_port(port, budget.min(std::time::Duration::from_secs(15)))
-                    .map_err(map_dial_err)?;
-            Ok(carrier_conn_of(sess.client(), conn_id))
+            let sp = crate::facade::host_session::ServicePort::from_bridge_port(port)
+                .ok_or(carriers::DialErr::Refused)?;
+            let stream = sess
+                .connect(sp, budget.min(std::time::Duration::from_secs(15)))
+                .map_err(map_dial_err)?;
+            Ok(carrier_conn_of(stream))
         },
     );
     let h2 = Arc::clone(hosts);
@@ -305,28 +274,33 @@ fn carriers_dial_of(hosts: &Arc<hosts::HostTable>) -> carriers::CarrierDial {
               -> Result<carriers::CarrierConn, carriers::DialErr> {
             let id = hosts::decode_peer_id_pub(host).ok_or(carriers::DialErr::NoHost)?;
             let sess = h2.session(&id).ok_or(carriers::DialErr::NoSession)?;
-            let conn_id =
-                sess.healing_dial_addr(dst, budget.min(std::time::Duration::from_secs(15)))
-                    .map_err(map_dial_err)?;
-            Ok(carrier_conn_of(sess.client(), conn_id))
+            let stream = sess
+                .dial_addr(dst, budget.min(std::time::Duration::from_secs(15)))
+                .map_err(map_dial_err)?;
+            Ok(carrier_conn_of(stream))
         },
     );
     carriers::CarrierDial { dial_port, dial }
 }
 
-fn map_dial_err(e: crate::wgcore::ConnErr) -> carriers::DialErr {
+/// `HostErr` → 承载面归因（§2.5 的换型面）：服务级拒绝 = refused（runner 的
+/// not_supported 判据）；无面/未就绪 = 会话不在（重建窗口）；预算 = other。
+fn map_dial_err(e: crate::facade::host_session::HostErr) -> carriers::DialErr {
+    use crate::facade::host_session::HostErr;
     match e {
-        crate::wgcore::ConnErr::Refused => carriers::DialErr::Refused,
-        crate::wgcore::ConnErr::EngineGone => carriers::DialErr::NoSession,
+        HostErr::Refused => carriers::DialErr::Refused,
+        HostErr::NoFace | HostErr::NotReady(_) => carriers::DialErr::NoSession,
+        HostErr::Closed(_) => carriers::DialErr::NoSession,
         other => carriers::DialErr::Other(other.to_string()),
     }
 }
 
-/// 同一隧道连接的两种承载面（TunnelConn 透传腿 + speedtest 引擎腿）。
-fn carrier_conn_of(client: Arc<crate::wgcore::Client>, id: u64) -> carriers::CarrierConn {
+/// 同一宿主流的两种承载面（StreamConn 透传腿 + speedtest 引擎腿）。
+fn carrier_conn_of(stream: crate::facade::host_session::HostStream) -> carriers::CarrierConn {
+    let stream = Arc::new(stream);
     carriers::CarrierConn {
-        io: Arc::new(TunnelConn::new(Arc::clone(&client), id)),
-        speed: crate::speedtest::engine_conn(client, id),
+        io: Arc::clone(&stream) as Arc<dyn StreamConn>,
+        speed: crate::speedtest::engine_conn_host(stream),
     }
 }
 
@@ -388,17 +362,20 @@ impl Backend for DaemonCore {
             // （stream_refused）而非 NoHost（hosts-3 整改）。
             return Err(BackendErr::NoSession);
         };
-        // 恢复感知的隧道端口拨号（Go healingDial 同义；30s = Go dialTimeout）。
-        let conn_id = sess
-            .healing_dial_port(port, std::time::Duration::from_secs(30))
+        // 宿主会话拨号（QUIC 岛 `STREAM[tag]`；30s 预算 = Go dialTimeout）。
+        let sp = crate::facade::host_session::ServicePort::from_bridge_port(port)
+            .ok_or_else(|| BackendErr::BadStreamKind(kind.to_owned()))?;
+        let stream = sess
+            .connect(sp, std::time::Duration::from_secs(30))
             .map_err(|e| match e {
-                crate::wgcore::ConnErr::Timeout | crate::wgcore::ConnErr::Refused => {
-                    BackendErr::Other(format!("隧道拨号 {kind}（{port}）失败：{e}"))
-                }
-                crate::wgcore::ConnErr::EngineGone => BackendErr::NoSession,
+                crate::facade::host_session::HostErr::Refused => BackendErr::Other(format!(
+                    "隧道拨号 {kind}（{port}）失败：{e}"
+                )),
+                crate::facade::host_session::HostErr::NoFace
+                | crate::facade::host_session::HostErr::NotReady(_) => BackendErr::NoSession,
                 other => BackendErr::Other(format!("隧道拨号 {kind}（{port}）失败：{other}")),
             })?;
-        Ok(Arc::new(TunnelConn::new(sess.client(), conn_id)))
+        Ok(Arc::new(stream))
     }
 
     fn not_ready(&self) -> bool {

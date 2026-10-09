@@ -765,10 +765,6 @@ impl Session {
         Session::synthetic_for_test(SessState::Failed, reason, None, None)
     }
 
-    pub(crate) fn synthetic_ready_for_test() -> Session {
-        Session::synthetic_for_test(SessState::Ready, "", None, None)
-    }
-
     /// 完整注入形态（F6-4 段 4 断言用：缓存目录 + 日志面）。
     pub(crate) fn synthetic_for_test(
         state: SessState,

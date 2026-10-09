@@ -25,15 +25,13 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 
-use crate::session::Session;
-use crate::wgcore::ConnErr;
+use crate::facade::host_session::{HostErr, HostSession, HostStream, ServicePort};
 
-/// files 服务端口（隧道 IP 上；出口按 LocalServices 转投 files.sock）。
+/// files 服务端口（虚拟端口面；出口按 `STREAM[tag=1]` 转投 files.sock）。
 ///
-/// **M3 口径**：本模块的动词面（`list/stat/read/…`）只被 **CLI 本地形态**消费
-/// （`homeway-cli` 的 files 命令 + `Session` 拨号 = WG 承载，D1 下不变）；App 核的
-/// files 面走桥 UDS（`facade/files_op.rs`）——QUIC 档在桥那头按本端口选 `STREAM[tag=1]`
-/// （`facade/quic_stream.rs::tag_for_port`），**不再拨本端口**。
+/// **M5 C2 口径**：本模块的本地承载 = **宿主会话**（QUIC 岛 `STREAM[tag=1]`，
+/// `ServicePort::files()`）；远程形态（`*_remote`）走 daemon 控制面流腿不变。App 核的
+/// files 面走桥 UDS（`facade/files_op.rs`）。
 pub const FILES_PORT: u16 = 7802;
 /// 请求行上限（一行 JSON）。
 pub const MAX_REQUEST_LINE: usize = 64 * 1024;
@@ -67,9 +65,9 @@ pub enum FilesError {
     /// 传输/协议层失败（连接、帧、JSON）。
     #[error("files 传输失败：{0}")]
     Transport(String),
-    /// 连接建立失败（healing dial 用尽预算）。
-    #[error(transparent)]
-    Conn(#[from] ConnErr),
+    /// 连接建立失败（宿主会话拨号；§2.5 的换型面：`wgcore::ConnErr` 不迁入）。
+    #[error("files 连接失败：{0}")]
+    Conn(#[from] HostErr),
 }
 
 impl FilesError {
@@ -154,51 +152,48 @@ struct Response {
 /// 暂停（写盘等）不再暂停隧道读。暂停会让出口侧 gVisor 写阻塞升级为连接拆毁
 /// （实测：帧边界暂停的下载在第一帧后即被 FIN；连续读形态全量收满——Go 客户端
 /// 的 net.Conn 读由运行时推进，同模型）。
-pub struct Stream<'a> {
-    io: StreamIo<'a>,
+pub struct Stream {
+    io: StreamIo,
     /// 行/帧解析缓冲（Q-I F6.2：偏移式消费——`VecDequeLite` 前缀偏移 + 摊还压缩，
     /// 消 `Vec::drain` 的尾部整搬；追加 `push`，余量 `remaining()`）。
     buf: crate::server::intercept::VecDequeLite,
-    /// 读线程交付通道（线程在 EOF/错误/通道断开时退出）。
-    rx: std::sync::mpsc::Receiver<Result<Vec<u8>, ConnErr>>,
+    /// 读线程交付通道（线程在 EOF/错误/通道断开时退出；`Ok(空 Vec)` = EOF）。
+    rx: std::sync::mpsc::Receiver<io::Result<Vec<u8>>>,
     /// 问候帧带来的根与版本（诊断/展示用）。
     pub root: String,
     pub ver: i64,
 }
 
-/// 一条命令流的承载（Go pkg/files 的 net.Conn 注入缝——本地 = Session 隧道拨号；
+/// 一条命令流的承载（Go pkg/files 的 net.Conn 注入缝——本地 = **宿主会话的岛服务流**；
 /// 远程 = daemon 控制面 stream.open{kind:files} 的透传腿，files 协议端到端原样承载）。
-enum StreamIo<'a> {
-    Local { sess: &'a Session, id: u64 },
+enum StreamIo {
+    /// 本地：一条已拨通的岛服务流（M5 C2 换源）。
+    Local(std::sync::Arc<HostStream>),
+    /// 【test-seams】受控读通道（不拨号；写/关为无操作）——`Stream::from_rx` 用。
+    #[cfg(test)]
+    TestRx,
     Remote {
         client: std::sync::Arc<crate::daemon::client::ControlClient>,
         st: std::sync::Arc<crate::daemon::client::ClientStream>,
     },
 }
 
-impl Drop for Stream<'_> {
+impl Drop for Stream {
     fn drop(&mut self) {
         // 关流即语义：上传未提交（未发终止帧）= 取消（服务端删 .tierpart）。
         // 远程形态的收口由调用方关 ControlClient 承载（整连接关 = 流终结）。
-        if let StreamIo::Local { sess, id } = &self.io {
-            // 测试构造（id=u64::MAX）跳过——dangling Session 不可解引用。
-            if *id != u64::MAX {
-                let _ = sess.client().close(*id);
-            }
+        if let StreamIo::Local(stream) = &self.io {
+            stream.close();
         }
     }
 }
 
-impl<'a> Stream<'a> {
-    /// 测试构造：受控读通道驱动（不拨号；close 走真实路径——Session 由 PhantomData
-    /// 借用形参规避）。
+impl Stream {
+    /// 测试构造：受控读通道驱动（不拨号；写/关为无操作）。
     #[cfg(test)]
-    fn from_rx(rx: std::sync::mpsc::Receiver<Result<Vec<u8>, ConnErr>>) -> Stream<'static> {
+    fn from_rx(rx: std::sync::mpsc::Receiver<io::Result<Vec<u8>>>) -> Stream {
         Stream {
-            io: StreamIo::Local {
-                sess: unsafe { &*(std::ptr::NonNull::<Session>::dangling().as_ptr()) },
-                id: u64::MAX,
-            },
+            io: StreamIo::TestRx,
             buf: crate::server::intercept::VecDequeLite::new(),
             rx,
             root: String::new(),
@@ -207,25 +202,30 @@ impl<'a> Stream<'a> {
     }
 
     /// 起一条流并读问候帧（`stream_open` 只在这一段——此后请求可能已送达，
-    /// 重放有重复副作用风险）。拨号走 healing（4s 首试 → 阶梯 → 重试）。
-    pub fn open(sess: &'a Session, budget: Duration) -> Result<Stream<'a>, FilesError> {
-        let id = sess.healing_dial_port(FILES_PORT, budget)?;
-        let client = sess.client();
-        let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, ConnErr>>();
+    /// 重放有重复副作用风险）。拨号 = 宿主会话 `STREAM[tag=1]`（首试 + 一次重试
+    /// 由 `quic_stream::dial_with` 的策略收口——服务级拒绝不重试）。
+    pub fn open(sess: &HostSession, budget: Duration) -> Result<Stream, FilesError> {
+        let stream = std::sync::Arc::new(sess.connect(ServicePort::files(), budget)?);
+        let rd = std::sync::Arc::clone(&stream);
+        let (tx, rx) = std::sync::mpsc::channel::<io::Result<Vec<u8>>>();
         std::thread::Builder::new()
             .name("homeway-files-rd".into())
             .spawn(move || {
                 loop {
-                    match client.read(id) {
+                    match rd.read_chunk() {
                         Ok(chunk) if !chunk.is_empty() => {
                             if tx.send(Ok(chunk)).is_err() {
                                 break; // 消费侧 drop
                             }
                         }
-                        r => {
-                            // EOF/错误：交付一次后退出（评审中-7——连接已被引擎回收，
+                        Ok(_) => {
+                            // EOF（对端 FIN / 本端关流）：交付一次后退出（评审中-7——
                             // 继续循环只会紧转 + 无界通道堆积）
-                            let _ = tx.send(r);
+                            let _ = tx.send(Ok(Vec::new()));
+                            break;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e));
                             break;
                         }
                     }
@@ -236,7 +236,7 @@ impl<'a> Stream<'a> {
         // Go files-cli「连接+首响应两段各 --timeout」同义）；到点关流打断挂死的读。
         Stream::handshake(
             Stream {
-                io: StreamIo::Local { sess, id },
+                io: StreamIo::Local(stream),
                 buf: crate::server::intercept::VecDequeLite::with_capacity(16 * 1024),
                 rx,
                 root: String::new(),
@@ -253,8 +253,8 @@ impl<'a> Stream<'a> {
         client: std::sync::Arc<crate::daemon::client::ControlClient>,
         st: std::sync::Arc<crate::daemon::client::ClientStream>,
         greet_budget: Duration,
-    ) -> Result<Stream<'static>, FilesError> {
-        let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, ConnErr>>();
+    ) -> Result<Stream, FilesError> {
+        let (tx, rx) = std::sync::mpsc::channel::<io::Result<Vec<u8>>>();
         let rd_st = std::sync::Arc::clone(&st);
         std::thread::Builder::new()
             .name("homeway-files-rr".into())
@@ -267,8 +267,8 @@ impl<'a> Stream<'a> {
                             }
                         }
                         None => {
-                            // 流终结（closed|gone|conn）——映射引擎 Closed 面（EOF 语义）。
-                            let _ = tx.send(Err(ConnErr::Closed));
+                            // 流终结（closed|gone|conn）——EOF 语义（空块标记）。
+                            let _ = tx.send(Ok(Vec::new()));
                             break;
                         }
                     }
@@ -293,7 +293,7 @@ impl<'a> Stream<'a> {
     /// 期限**（dial 返回起一次性），到点关流打断阻塞中的问候帧读——对端不应答时
     /// 不会永久挂死；问候帧返回后不再受此预算约束，传输期无期限——传输中的流
     /// 不会被首响应预算误杀）。
-    fn handshake(mut s: Stream<'_>, budget: Duration) -> Result<Stream<'_>, FilesError> {
+    fn handshake(mut s: Stream, budget: Duration) -> Result<Stream, FilesError> {
         let deadline = Instant::now() + budget;
         let line = s.read_line_deadline(deadline).map_err(|e| FilesError::Code {
             code: CODE_STREAM_OPEN.to_owned(),
@@ -313,7 +313,8 @@ impl<'a> Stream<'a> {
     fn next_chunk(&mut self) -> Result<Vec<u8>, FilesError> {
         match self.rx.recv() {
             Ok(Ok(chunk)) if !chunk.is_empty() => Ok(chunk),
-            Ok(_) => Err(transport("流已到尾（EOF）")),
+            Ok(Ok(_)) => Err(transport("流已到尾（EOF）")),
+            Ok(Err(e)) => Err(transport(format!("读线程：{e}"))),
             Err(_) => Err(transport("读线程已退出")),
         }
     }
@@ -377,11 +378,9 @@ impl<'a> Stream<'a> {
     /// 看门到点的关流动作（两面统一；幂等——drop 的收口路径重复关无害）。
     fn abort_stream(&self) {
         match &self.io {
-            StreamIo::Local { sess, id } => {
-                if *id != u64::MAX {
-                    let _ = sess.client().close(*id);
-                }
-            }
+            StreamIo::Local(stream) => stream.close(),
+            #[cfg(test)]
+            StreamIo::TestRx => {}
             StreamIo::Remote { client, st } => {
                 let _ = client.stream_close(st, Duration::from_secs(3));
             }
@@ -393,32 +392,21 @@ impl<'a> Stream<'a> {
     /// 传输错误）。
     fn write_all(&mut self, data: &[u8]) -> Result<(), FilesError> {
         match &self.io {
-            StreamIo::Local { sess, id } => {
-                let client = sess.client();
+            // 岛服务流写半：`write_chunk` 内部带「`n=0` 分级退避环 + 10s 无进展上界」
+            // （与 `SessionWriteHalf`/`QuicWriteHalf` 同款）⇒ 这里只做部分写累进。
+            StreamIo::Local(stream) => {
                 let mut off = 0;
-                let mut zero_streak = 0u32;
-                // R8-3 F12：零接纳时引擎带回原 Vec——重试环不重拷。
-                let mut pending: Option<Vec<u8>> = None;
                 while off < data.len() {
-                    let chunk = match pending.take() {
-                        Some(v) => v,
-                        None => data[off..].to_vec(),
-                    };
-                    let w = client.write(*id, chunk).map_err(transport)?;
-                    if w.n == 0 {
-                        pending = w.back;
-                        zero_streak += 1;
-                        if zero_streak > 1_000_000 {
-                            return Err(transport("写通道长时间无进展"));
-                        }
-                        std::thread::yield_now();
-                        continue;
+                    let n = stream.write_chunk(&data[off..]).map_err(transport)?;
+                    if n == 0 {
+                        return Err(transport("写通道长时间无进展"));
                     }
-                    zero_streak = 0;
-                    off += w.n;
+                    off += n;
                 }
                 Ok(())
             }
+            #[cfg(test)]
+            StreamIo::TestRx => Ok(()),
             StreamIo::Remote { client, st } => client
                 .stream_send(st, data)
                 .map_err(|e| transport(e.to_string())),
@@ -499,19 +487,19 @@ pub fn decode_prefix(buf: &[u8]) -> Result<Prefix, FilesError> {
 // ---------- 动词（每命令一条流；承载 = 本地 Session 拨号或远程控制面流腿） ----------
 
 /// 列目录。
-pub fn list(sess: &Session, budget: Duration, path: &str) -> Result<Vec<Entry>, FilesError> {
+pub fn list(sess: &HostSession, budget: Duration, path: &str) -> Result<Vec<Entry>, FilesError> {
     let mut s = Stream::open(sess, budget)?;
     list_at(&mut s, path)
 }
 
 /// 单条目信息。
-pub fn stat(sess: &Session, budget: Duration, path: &str) -> Result<Entry, FilesError> {
+pub fn stat(sess: &HostSession, budget: Duration, path: &str) -> Result<Entry, FilesError> {
     let mut s = Stream::open(sess, budget)?;
     stat_at(&mut s, path)
 }
 
 /// 新建目录。
-pub fn mkdir(sess: &Session, budget: Duration, path: &str) -> Result<(), FilesError> {
+pub fn mkdir(sess: &HostSession, budget: Duration, path: &str) -> Result<(), FilesError> {
     let mut s = Stream::open(sess, budget)?;
     mkdir_at(&mut s, path)
 }
@@ -601,17 +589,17 @@ where
 
 // ——已建立流上的动词主体（本地/远程共用）——
 
-pub(crate) fn list_at(s: &mut Stream<'_>, path: &str) -> Result<Vec<Entry>, FilesError> {
+pub(crate) fn list_at(s: &mut Stream, path: &str) -> Result<Vec<Entry>, FilesError> {
     let resp = s.call(&Request { op: "list", path, max_bytes: 0, mode: None, size: 0 })?;
     Ok(resp.entries)
 }
 
-pub(crate) fn stat_at(s: &mut Stream<'_>, path: &str) -> Result<Entry, FilesError> {
+pub(crate) fn stat_at(s: &mut Stream, path: &str) -> Result<Entry, FilesError> {
     let resp = s.call(&Request { op: "stat", path, max_bytes: 0, mode: None, size: 0 })?;
     resp.entry.ok_or_else(|| FilesError::Code { code: CODE_OP_FAILED.into(), msg: "响应缺 entry".into() })
 }
 
-pub(crate) fn mkdir_at(s: &mut Stream<'_>, path: &str) -> Result<(), FilesError> {
+pub(crate) fn mkdir_at(s: &mut Stream, path: &str) -> Result<(), FilesError> {
     s.call(&Request { op: "mkdir", path, max_bytes: 0, mode: None, size: 0 })?;
     Ok(())
 }
@@ -624,14 +612,14 @@ pub struct ReadResult {
     pub truncated: bool,
 }
 
-pub fn read(sess: &Session, budget: Duration, path: &str, mode: &str, max_bytes: i64) -> Result<ReadResult, FilesError> {
+pub fn read(sess: &HostSession, budget: Duration, path: &str, mode: &str, max_bytes: i64) -> Result<ReadResult, FilesError> {
     let mut s = Stream::open(sess, budget)?;
     let resp = s.call(&Request { op: "read", path, max_bytes, mode: Some(mode), size: 0 })?;
     Ok(ReadResult { text: resp.text, base64: resp.base64, truncated: resp.truncated })
 }
 
 pub(crate) fn download_at<W, F>(
-    s: &mut Stream<'_>,
+    s: &mut Stream,
     path: &str,
     w: &mut W,
     on_size: F,
@@ -666,7 +654,7 @@ where
 }
 
 pub(crate) fn upload_at<R, F>(
-    s: &mut Stream<'_>,
+    s: &mut Stream,
     path: &str,
     r: &mut R,
     size: i64,
@@ -708,7 +696,7 @@ where
 /// 大文件下载：载荷帧原样写进 `w`，返回总字节数。`on_size` 收到响应行声明的
 /// 大小（进度分母）。**断读收口**（FIX-40）：终止帧到达时对照声明——少收一律
 /// 报错（提前终止被静默当成功会落半截文件）；多收容忍（下载生长中的文件合法）。
-pub fn download<W, F>(sess: &Session, budget: Duration, path: &str, w: &mut W, on_size: F) -> Result<u64, FilesError>
+pub fn download<W, F>(sess: &HostSession, budget: Duration, path: &str, w: &mut W, on_size: F) -> Result<u64, FilesError>
 where
     W: io::Write + ?Sized,
     F: FnOnce(i64),
@@ -832,7 +820,7 @@ fn sleep_sliced(mut secs: f64) {
 /// 大文件上传：请求 → 服务端 ready → 帧 → 终止帧（提交）→ 读提交结果。
 /// **错误/提前 drop = 关流不发终止帧 ⇒ 服务端删 .tierpart**（目标不变）。
 /// `limiter` = 发送端速率义务（None = 不限；CLI 缺省 2MiB/s——对齐 Go files-cli）。
-pub fn upload<R, F>(sess: &Session, budget: Duration, path: &str, r: &mut R, size: i64, on_progress: F, limiter: Option<&mut UploadLimiter>) -> Result<u64, FilesError>
+pub fn upload<R, F>(sess: &HostSession, budget: Duration, path: &str, r: &mut R, size: i64, on_progress: F, limiter: Option<&mut UploadLimiter>) -> Result<u64, FilesError>
 where
     R: io::Read + ?Sized,
     F: FnMut(u64),
@@ -861,7 +849,7 @@ mod tests {
         }
         stream.extend_from_slice(&0u32.to_be_bytes());
         for chunk_size in [1usize, 7, 64, 1024, 65536] {
-            let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, ConnErr>>();
+            let (tx, rx) = std::sync::mpsc::channel::<io::Result<Vec<u8>>>();
             let chunks: Vec<Vec<u8>> = stream.chunks(chunk_size).map(|c| c.to_vec()).collect();
             std::thread::spawn(move || {
                 for c in chunks {
@@ -907,7 +895,7 @@ mod tests {
         for line in [big, text_line] {
             let mut stream = line.into_bytes();
             stream.push(b'\n');
-            let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, ConnErr>>();
+            let (tx, rx) = std::sync::mpsc::channel::<io::Result<Vec<u8>>>();
             std::thread::spawn(move || {
                 let _ = tx.send(Ok(stream));
             });
@@ -1050,7 +1038,7 @@ mod greeting_watchdog_tests {
     fn greeting_deadline_fires_on_silent_peer() {
         // 静默对端的等价形态：读线程从未投递（通道有发送方但从不发、也未断开——
         // Disconnected 走另一分支，这里钉 Timeout 分支）。
-        let (_tx_keepalive, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, ConnErr>>();
+        let (_tx_keepalive, rx) = std::sync::mpsc::channel::<io::Result<Vec<u8>>>();
         let mut s = Stream::from_rx(rx);
         let t0 = std::time::Instant::now();
         let r = s.read_line_deadline(std::time::Instant::now() + Duration::from_millis(200));
@@ -1067,7 +1055,7 @@ mod greeting_watchdog_tests {
     /// 问候帧正常返回的路径不受预算影响（预算内完成 handshake）。
     #[test]
     fn greeting_arrives_within_budget() {
-        let (tx, rx) = std::sync::mpsc::channel::<Result<Vec<u8>, ConnErr>>();
+        let (tx, rx) = std::sync::mpsc::channel::<io::Result<Vec<u8>>>();
         tx.send(Ok(br#"{"ok":true,"root":"/tmp","ver":1}
 "#.to_vec())).unwrap();
         let s = Stream::from_rx(rx);

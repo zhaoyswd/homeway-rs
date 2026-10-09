@@ -363,7 +363,8 @@ pub(crate) fn dial(
 ///   App 测速桥的 `link_down` 分流）；
 /// - **新分支**（§1.6 要求有用例）：`Busy`/`Unbound`/`BadTag` ⇒ `ErrorKind::Other`；
 /// - `Timeout` ⇒ `TimedOut`（与 `conn_err_to_io` 同款）；
-/// - `Closed`/`ConnectionLost` ⇒ `Other`（与今天 `ConnErr::{Closed,EngineGone}` 的落点同形）。
+/// - `Closed`/`ConnectionLost` ⇒ `Other`（M5 C2：WG 档的 `ConnErr::{Closed,EngineGone}`
+///   落点由本映射**同形承继**——CLI/daemon 的判定链只认 kind，不信类型名）。
 fn stream_err_to_io(e: StreamErr) -> io::Error {
     let kind = match e {
         StreamErr::NotSupported | StreamErr::Refused => io::ErrorKind::ConnectionRefused,

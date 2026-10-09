@@ -200,7 +200,7 @@ impl crate::speedtest::SpeedConn for BridgeSpeedConn {
         while off < data.len() {
             let remain = self.op_timeout();
             if remain.is_err() {
-                return Err(SpeedtestError::Conn(crate::wgcore::ConnErr::Timeout));
+                return Err(SpeedtestError::Timeout);
             }
             self.raw.set_write_timeout(remain.unwrap()).ok();
             match w.write(&data[off..]) {
@@ -214,7 +214,7 @@ impl crate::speedtest::SpeedConn for BridgeSpeedConn {
                     if e.kind() == std::io::ErrorKind::WouldBlock
                         || e.kind() == std::io::ErrorKind::TimedOut =>
                 {
-                    return Err(SpeedtestError::Conn(crate::wgcore::ConnErr::Timeout));
+                    return Err(SpeedtestError::Timeout);
                 }
                 Err(e) => return Err(SpeedtestError::Frame(format!("测速桥写失败：{e}"))),
             }
@@ -227,7 +227,7 @@ impl crate::speedtest::SpeedConn for BridgeSpeedConn {
         let mut buf = [0u8; 128 * 1024];
         let remain = self.op_timeout();
         if let Err(_e) = remain {
-            return Err(SpeedtestError::Conn(crate::wgcore::ConnErr::Timeout));
+            return Err(SpeedtestError::Timeout);
         }
         self.raw.set_read_timeout(remain.unwrap()).ok();
         match r.read(&mut buf) {
@@ -237,7 +237,7 @@ impl crate::speedtest::SpeedConn for BridgeSpeedConn {
                 if e.kind() == std::io::ErrorKind::WouldBlock
                     || e.kind() == std::io::ErrorKind::TimedOut =>
             {
-                Err(SpeedtestError::Conn(crate::wgcore::ConnErr::Timeout))
+                Err(SpeedtestError::Timeout)
             }
             Err(e) => Err(SpeedtestError::Frame(format!("测速桥读失败：{e}"))),
         }

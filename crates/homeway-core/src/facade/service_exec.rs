@@ -2,10 +2,11 @@
 //! 的 Service 生命周期 + 桥挂接——openspec app-service-session）。
 //!
 //! rc 门与状态机在 [`super::service_op::ServiceDomain`]（纯逻辑）；本模块做接线：
-//! - `start`：解析 cfg → 打开日志（-2）→ spawn 会话线程（`crate::session::Session`
-//!   ——服务域形态：无 TUN、暖机 12s、60s 巡检、恢复阶梯、整会话重建）→ 桥三座
-//!   （dial 经会话流——SessionConn）→ 状态机推进 starting→ready/failed；
-//! - `stop`：桥停 → 会话停（≤6s）→ 端点缓存落盘由 Session 收尾 → idle；
+//! - `start`：解析 cfg → 打开日志（-2）→ spawn 会话线程（**宿主会话**
+//!   [`crate::facade::host_session::HostSession`]——M5 C2 换源：QUIC 岛承接的
+//!   无 TUN 服务会话，暖机/巡检/岛内阶梯/失败终态语义逐条同形）→ 桥三座
+//!   （dial 经会话流——`HostStream`）→ 状态机推进 starting→ready/failed；
+//! - `stop`：桥停 → 会话停（≤6s；岛收工在 `HostSession::stop` 内有界收口）→ idle；
 //! - `status`：`crate::status_json::snapshot_json` + bridge 四键（`bridgeAuth`…
 //!   ——Go serviceSnapshotJSON 的桥段）。
 //!
@@ -19,13 +20,13 @@ use std::time::Duration;
 
 use serde::Deserialize;
 
-use crate::session::{Session, SessionConfig};
+use crate::facade::host_session::{HostErr, HostSession, HostSessionConfig, ServicePort, SessState};
 use crate::token;
 use crate::Logf;
 
 use super::bridge_host::{BridgeHost, BridgeStream};
+use super::host_session::NO_SUCH_SERVICE;
 use super::service_op::{ServiceDomain, ServiceState};
-use super::tun_exec::SessionStream;
 
 /// serviceConfig（app_service.go 同形；camelCase——App 实发键面）。
 #[derive(Debug, Default, Deserialize)]
@@ -45,7 +46,7 @@ pub struct ServiceConfigJson {
 struct ServiceRun {
     /// Arc 形态（M-10②：桥的拨号闭包从锁里**克隆出来**再拨——此前持锁 15s 拨号，
     /// status() 同锁 ⇒ App 轮询面被同步阻塞）。
-    session: Mutex<Option<Arc<Session>>>,
+    session: Mutex<Option<Arc<HostSession>>>,
     bridge: Arc<BridgeHost>,
     /// 会话线程的状态推进面（快照读 + state 写回 ServiceDomain）。
     domain: Arc<ServiceDomain>,
@@ -54,10 +55,10 @@ struct ServiceRun {
     since: std::time::Instant,
     /// 收工请求位（复核 r3-F6③：warmup 期 stop——会话线程建好后不得再发布 Ready）。
     stopping: std::sync::atomic::AtomicBool,
-    /// 日志面（与 Session 同一个 Arc；F2 的「暖机硬失败」行经它打——`open_service_log`
+    /// 日志面（与会话同一个 Arc；F2 的「暖机硬失败」行经它打——`open_service_log`
     /// 已带 `服务会话: ` 前缀）。
     logf: Logf,
-    /// 收尾**完成**信号（复核 r3-F6①：Session::stop 真正收完才置位——重试 stop 等
+    /// 收尾**完成**信号（复核 r3-F6①：会话 stop 真正收完才置位——重试 stop 等
     /// 它而不是等「空转线程」，同钥双会话窗口真正闭合；Go 等的是会话自己的 done）。
     ///
     /// Q-F F2/D10：本位同时是「运行槽可替换」的门（对齐 Go `svcStateFailed &&
@@ -85,16 +86,17 @@ impl ServiceRun {
 pub struct ServiceExec {
     /// Arc 包一层：会话线程失败时要能清槽（L-11②：failed 后 run 槽未清 ⇒ start 恒 -1）。
     run: Arc<Mutex<Option<Arc<ServiceRun>>>>,
-    /// 【test-seams】会话工厂（Q-F F2 测试缝：`start()` 今日硬编码 `Session::start`——
-    /// 不加工厂就无法注入合成会话）。**不改生产 API**：`new()` 留空 = 走真 `Session::start`。
+    /// 【test-seams】会话工厂（Q-F F2 测试缝：`start()` 今日硬编码 `HostSession::start`——
+    /// 不加工厂就无法注入合成会话）。**不改生产 API**：`new()` 留空 = 走真
+    /// `HostSession::start`。
     #[cfg(test)]
     session_factory: Option<SessionFactory>,
 }
 
 /// 会话工厂形参（测试缝的类型别名——type_complexity 收口；生产恒 None ⇒ 走真
-/// `Session::start`，`ServiceExec::new()` 的公开签名不变）。
+/// `HostSession::start`，`ServiceExec::new()` 的公开签名不变）。
 type SessionFactory =
-    Arc<dyn Fn(SessionConfig) -> Result<Session, crate::session::SessionErr> + Send + Sync>;
+    Arc<dyn Fn(HostSessionConfig) -> Result<HostSession, HostErr> + Send + Sync>;
 
 impl Default for ServiceExec {
     fn default() -> Self {
@@ -200,7 +202,7 @@ impl ServiceExec {
             fully_stopped: Arc::new((Mutex::new(false), std::sync::Condvar::new())),
         });
 
-        // 会话线程（Session::start 阻塞暖机 ~12s——不占调用线程；失败时清 run 槽
+        // 会话线程（HostSession::start 阻塞暖机 ~12s——不占调用线程；失败时清 run 槽
         // 〔L-11②：failed 后槽未清 ⇒ 下次 start 恒 -1〕+ 停桥）。
         // **线程体套 catch_unwind**（Q-F F7 同族：panic 不穿透——否则线程死掉后域态
         // 永久停在 Starting，`service_start` 恒 0、status 恒 starting；落空 = 记行 +
@@ -256,7 +258,7 @@ impl ServiceExec {
     }
 
     /// ClientCoreServiceStop：0 已收工 / -1 等待超时（调用方重试；期间 start 恒 -1）。
-    /// 顺序 = 桥 → 会话 → （缓存落盘由 Session::stop 内完成）。
+    /// 顺序 = 桥 → 会话 → （岛收尾由 `HostSession::stop` 内完成）。
     /// **超时不提前清槽**（评审 r2-M-10①：旧实现超时前已 take ⇒ 第二次 stop 见空槽
     /// 直接置 Idle 返回 0 ⇒ start 放行 ⇒ 同钥双会话窗口；现 run 槽留到真正收完）。
     pub fn stop(&self, domain: &ServiceDomain) -> i32 {
@@ -276,7 +278,7 @@ impl ServiceExec {
         // 会话句柄取走（重试 stop 时已取空 ⇒ 只等完成信号；桥停幂等）
         let sess = run.session.lock().unwrap_or_else(|e| e.into_inner()).take();
         // warmup 期 sess=None ⇒ 先等会话线程过 stopping 检查点（它建好后自查自收），
-        // 上界 2s——超界按已收尾处理（Session::start 仍在跑的极端形态交给进程收口）
+        // 上界 2s——超界按已收尾处理（HostSession::start 仍在跑的极端形态交给进程收口）
         if sess.is_none() {
             let warm_deadline = std::time::Instant::now() + Duration::from_secs(2);
             while run
@@ -347,7 +349,7 @@ impl ServiceExec {
     }
 
     /// ClientCoreServiceStatus：无实例 = idle 短路（**域态 Failed 时改报 failed+原因**
-    /// ——Q-F F2-3 可选小修，覆盖 `Session::start` 返 Err 的清槽路径：此前槽空即
+    /// ——Q-F F2-3 可选小修，覆盖 `HostSession::start` 返 Err 的清槽路径：此前槽空即
     /// idle，而域态是 Failed+原因 ⇒ 状态面与 rc 门自相矛盾）；有实例 = snapshot + bridge 四键。
     pub fn status(&self, domain: &ServiceDomain) -> String {
         let guard = self.run.lock().unwrap_or_else(|e| e.into_inner());
@@ -431,33 +433,33 @@ fn slot_is_same(slot: &Arc<Mutex<Option<Arc<ServiceRun>>>>, expect: &Arc<Service
         .is_some_and(|cur| Arc::ptr_eq(cur, expect))
 }
 
-/// 发布判定纯函数（Q-F F2-4）：`Session::start` 返回 Ok 后**只有快照已 ready** 才发布；
-/// `stopping` 竞态由外层分支处理（不并入本函数）。
-fn publish_ready(state: crate::session::SessState) -> bool {
-    state == crate::session::SessState::Ready
+/// 发布判定纯函数（Q-F F2-4）：`HostSession::start` 返回 Ok 后**只有快照已 ready**
+/// 才发布；`stopping` 竞态由外层分支处理（不并入本函数）。
+fn publish_ready(state: SessState) -> bool {
+    state == SessState::Ready
 }
 
-/// 会话线程体（`Session::start` + Q-F F2-1 三分支；由 `catch_unwind` 包裹）。
+/// 会话线程体（`HostSession::start` + Q-F F2-1 三分支；由 `catch_unwind` 包裹）。
 fn session_thread_body(
     run2: Arc<ServiceRun>,
     run_slot: Arc<Mutex<Option<Arc<ServiceRun>>>>,
     tk: crate::token::Token,
     identity_dir: Option<PathBuf>,
-    endpoint_cache_dir: Option<PathBuf>,
+    _endpoint_cache_dir: Option<PathBuf>,
     logf: Logf,
     factory: Option<SessionFactory>,
 ) {
-    let sess_cfg = SessionConfig {
+    // M5 C2 换源：宿主会话配置（端点缓存面随 WG 档退役——§1.6-G-1；`ServiceConfigJson`
+    // 的 `endpointCacheDir` 键面保留但不再被消费）。
+    let sess_cfg = HostSessionConfig {
         token: tk,
         identity_dir,
-        endpoint_cache_dir,
         logf: Arc::clone(&logf),
-        relay_only: false,
     };
-    // 生产 = 真 Session::start；测试可注入合成会话（cfg(test) 工厂）
+    // 生产 = 真 HostSession::start；测试可注入合成会话（cfg(test) 工厂）
     let sess = match &factory {
         Some(f) => f(sess_cfg),
-        None => Session::start(sess_cfg),
+        None => HostSession::start(sess_cfg),
     };
     match sess {
         Ok(s) => {
@@ -520,7 +522,7 @@ fn session_thread_body(
 /// 清槽 + 域 Idle——不留**永久 Stopping**（否则此后 `service_start` 恒 -1）。
 fn settle_inline(
     run: &Arc<ServiceRun>,
-    sess: Option<&Arc<Session>>,
+    sess: Option<&Arc<HostSession>>,
     slot: &Arc<Mutex<Option<Arc<ServiceRun>>>>,
     domain: &ServiceDomain,
 ) {
@@ -574,15 +576,12 @@ fn dial_via_run(
             "服务会话未就绪",
         ));
     };
-    let id = s.healing_dial_port(port, budget).map_err(|e| match e {
-        crate::wgcore::ConnErr::Refused => {
-            io::Error::new(io::ErrorKind::ConnectionRefused, e.to_string())
-        }
-        crate::wgcore::ConnErr::Timeout => io::Error::new(io::ErrorKind::TimedOut, e.to_string()),
-        other => io::Error::other(other.to_string()),
-    })?;
-    let client = s.client();
-    Ok(Box::new(SessionStream::shared(client, id)))
+    // 端口 → 服务 tag 单源（未知端口 = 归因「无此服务」——拨号前）；
+    // 错误面：`HostErr` → `io::Error`（§2.7 R-4 的单处映射）。
+    let sp = ServicePort::from_bridge_port(port)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::ConnectionRefused, NO_SUCH_SERVICE))?;
+    let stream = s.connect(sp, budget).map_err(io::Error::from)?;
+    Ok(Box::new(stream))
 }
 
 fn open_service_log(out: &str) -> Result<Logf, String> {
@@ -640,7 +639,7 @@ mod tests {
     /// F2-4：发布判定真值表（只有 Ready 发布）。
     #[test]
     fn publish_ready_truth_table() {
-        use crate::session::SessState;
+        use crate::facade::host_session::SessState;
         assert!(publish_ready(SessState::Ready));
         for s in [
             SessState::Starting,
@@ -661,7 +660,10 @@ mod tests {
         let c2 = Arc::clone(&calls);
         let exec = ServiceExec::with_session_factory(Arc::new(move |_cfg| {
             c2.fetch_add(1, Ordering::SeqCst);
-            Ok(Session::synthetic_failed_for_test("出口不可达：测试硬失败"))
+            Ok(HostSession::synthetic_for_test(
+                SessState::Failed,
+                "出口不可达：测试硬失败",
+            ))
         }));
         assert_eq!(exec.start(&cfg_json(), &domain), 0);
         wait_for("域态 Failed", Duration::from_secs(5), || {
@@ -710,7 +712,7 @@ mod tests {
             while !*g {
                 g = cv.wait(g).unwrap_or_else(|e| e.into_inner());
             }
-            Ok(Session::synthetic_ready_for_test())
+            Ok(HostSession::synthetic_for_test(SessState::Ready, ""))
         })));
         assert_eq!(exec.start(&cfg_json(), &domain), 0);
         std::thread::sleep(Duration::from_millis(100));

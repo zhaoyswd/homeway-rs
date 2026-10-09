@@ -2,8 +2,9 @@
 //! 迁入的表语义真源）：hosts.json 原子落盘、同键刷新（同后端重签发）、carried
 //! 保真、先落盘再起会话（落盘失败零副作用）、每记录自持会话。
 //!
-//! 会话 = 仓内 `session::Session`（R2 的服务会话形态：暖机/巡检/恢复阶梯/整会话
-//! 重建都在 Session 内——「每记录自持」天然成立，无 Go 侧 recGate 镜像需求）。
+//! 会话 = 仓内 `facade::host_session::HostSession`（M5 C2 换源：QUIC 岛承接的
+//! 「无 TUN 服务会话」——暖机/巡检/恢复阶梯/整会话重建都在会话内，「每记录自持」
+//! 天然成立，无 Go 侧 recGate 镜像需求；WG 档 `session::Session` 在 C3 随删）。
 //!
 //! **B0-2b 第 1 棒注记**：Go hostsession 的 Observer/LinkChanged 钩子在 Rust
 //! Session 无对应面——事件面（session.state_changed / link.changed）由 1s 差分
@@ -18,7 +19,7 @@ use std::time::{Duration, Instant};
 use super::bus::Bus;
 use super::proto::{BackendErr, HostAddResult, HostBrief, HostReach, HostState, ReachTested};
 use super::vocab::{self, EventPayload};
-use crate::session::{Session, SessionConfig};
+use crate::facade::host_session::{HostSession, HostSessionConfig};
 use crate::token::{self, EndpointKind};
 
 /// 主机表持久化文件（0600）。
@@ -45,7 +46,7 @@ pub struct HostRecord {
 
 struct HostEntry {
     rec: HostRecord,
-    sess: Option<Arc<Session>>,
+    sess: Option<Arc<HostSession>>,
 }
 
 struct Inner {
@@ -56,7 +57,7 @@ struct Inner {
 }
 
 /// 状态差分的一拍快照项（host 记录 + 其会话）。
-type HostSnap = (HostRecord, Option<Arc<Session>>);
+type HostSnap = (HostRecord, Option<Arc<HostSession>>);
 
 /// 事件差分线程的「上一拍」状态指纹（state 值 + link 四元组）。
 type LastSeen = (String, Option<(String, String, i64, i64)>);
@@ -65,7 +66,6 @@ type LastSeen = (String, Option<(String, String, i64, i64)>);
 pub struct HostTable {
     client_dir: PathBuf,
     identity_dir: PathBuf,
-    endpoint_cache_dir: PathBuf,
     logf: Arc<dyn Fn(&str) + Send + Sync>,
     bus: Arc<Bus>,
     /// 表变更（Add/Remove/Close）的串行化（Go opMu）：临界区覆盖锁外的会话停止。
@@ -78,17 +78,18 @@ pub struct HostTable {
 impl HostTable {
     /// 打开主机表（读 hosts.json——缺失 = 空表；损坏 = 备份后空表 + 告警）并按表
     /// 逐后端拉会话（「重启按表恢复」）。半途失败返回错误（表不挂载）。
+    /// `endpoint_cache_dir`：**WG 档装配参数，M5 C2 起本模块零消费**（设计
+    /// §1.6-G-1：岛候选来自 token，无学习缓存面）——保留形参只为零改装配面。
     pub fn open(
         client_dir: &Path,
         identity_dir: &Path,
-        endpoint_cache_dir: &Path,
+        _endpoint_cache_dir: &Path,
         logf: Arc<dyn Fn(&str) + Send + Sync>,
         bus: Arc<Bus>,
     ) -> Result<Arc<HostTable>, String> {
         let table = HostTable {
             client_dir: client_dir.to_owned(),
             identity_dir: identity_dir.to_owned(),
-            endpoint_cache_dir: endpoint_cache_dir.to_owned(),
             logf,
             bus,
             change_mu: Mutex::new(()),
@@ -340,7 +341,7 @@ impl HostTable {
         let drained: Vec<HostRecord> = {
             let mut in_ = self.inner.lock().unwrap_or_else(|e| e.into_inner());
             let recs: Vec<HostRecord> = in_.hosts.values().map(|e| e.rec.clone()).collect();
-            let sesses: Vec<Option<Arc<Session>>> =
+            let sesses: Vec<Option<Arc<HostSession>>> =
                 in_.hosts.values_mut().map(|e| e.sess.take()).collect();
             in_.hosts.clear();
             drop(in_);
@@ -397,7 +398,7 @@ impl HostTable {
     }
 
     /// 取一台主机的会话（流腿/状态面用；不在表 = None）。
-    pub fn session(&self, id: &[u8; 32]) -> Option<Arc<Session>> {
+    pub fn session(&self, id: &[u8; 32]) -> Option<Arc<HostSession>> {
         self.inner
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -412,7 +413,7 @@ impl HostTable {
         self.inner.lock().unwrap_or_else(|e| e.into_inner()).hosts.contains_key(id)
     }
 
-    pub fn session_by_hex(&self, id_hex: &str) -> Option<Arc<Session>> {
+    pub fn session_by_hex(&self, id_hex: &str) -> Option<Arc<HostSession>> {
         decode_peer_id(id_hex).and_then(|id| self.session(&id))
     }
 
@@ -438,12 +439,12 @@ impl HostTable {
             let base = Arc::clone(&self.logf);
             Arc::new(move |s: &str| base(&format!("hosts: {host} {s}"))) as Arc<dyn Fn(&str) + Send + Sync>
         };
-        match Session::start(SessionConfig {
+        // M5 C2 换源：宿主会话（QUIC 岛）。端点缓存目录（装配参数）随 WG 档退役
+        // （设计 §1.6-G-1：岛候选来自 token，无学习缓存）——本模块不再消费它。
+        match HostSession::start(HostSessionConfig {
             token: tok,
             identity_dir: Some(self.identity_dir.clone()),
-            endpoint_cache_dir: Some(self.endpoint_cache_dir.clone()),
             logf,
-            relay_only: false,
         }) {
             Ok(sess) => {
                 let mut in_ = self.inner.lock().unwrap_or_else(|e| e.into_inner());
@@ -461,7 +462,7 @@ impl HostTable {
 }
 
 /// 状态面单条（Go hostStateOf 同义：会话对象不在 = failed/session_not_built）。
-fn host_state_of(rec: &HostRecord, sess: Option<&Session>) -> HostState {
+fn host_state_of(rec: &HostRecord, sess: Option<&HostSession>) -> HostState {
     let Some(sess) = sess else {
         return HostState {
             id: rec.id.clone(),

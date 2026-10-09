@@ -10,7 +10,9 @@
 
 use serde_json::{Map, Value};
 
-use crate::session::SessionSnapshot;
+// K13（M5 C2/S2a）：快照类型面随会话承载换到宿主会话（`facade/host_session.rs`）的
+// **同形重建**——键面与键序零改动（WG 档 `session::SessionSnapshot` 在 C3 随删）。
+use crate::facade::host_session::SessionSnapshot;
 
 /// 无实例形态（Go `serviceCur == nil` 短路——逐字节）。
 pub fn idle_json() -> &'static str {
@@ -53,7 +55,7 @@ pub fn snapshot_json(s: &SessionSnapshot) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::session::{LinkSnapshot, SessState};
+    use crate::facade::host_session::{LinkSnapshot, SessState};
     use std::time::Instant;
 
     /// 键序 = 字典序（Go json.Marshal(map) 同序）；identity 随 link 出现。

@@ -1,21 +1,25 @@
 //! homeway-cli —— 测试/运维命令面。
 //!
-//! R2 实装 `connect`（Session 服务会话形态：暖机/巡检/恢复阶梯/整会话重建都在
-//! Session 内）+ 故障注入与时间窗测试钩子（`--inject`/`--recover-from`，test-seams）。
+//! R2 实装 `connect`（M5 C2 起 = **宿主会话**形态：QUIC 岛承接的
+//! `facade::host_session::HostSession`——暖机/巡检/岛内阶梯都在会话内）
+//! + 故障注入与时间窗测试钩子（`--inject`/`--recover-from`，test-seams）。
 //!
-//! 判据行输出对齐 `docs/INTEROP-CRITERIA.md`（模板逐串）；**Session 的一切行带
+//! 判据行输出对齐 `docs/INTEROP-CRITERIA.md`（模板逐串）；**会话的一切行带
 //! `服务会话: ` 前缀**（R2 前缀口径硬规则——与 Go 客户端真日志逐字一致）；C8
-//! （`warmup pong: 就绪（判据=wg）`）是 APP 核形态文案，按 R1 登记在 CLI 层打出。
+//! （`warmup pong: 就绪（判据=quic）`）是 APP 核形态文案，按 R1 登记在 CLI 层打出
+//! （M5 C2：CLI 会话承载已换 QUIC ⇒ 判据位由 `wg` 收窄为 `quic`——设计 §8.1-C8 的
+//! 终值；登记归 D 棒 S5）。
 
 use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use homeway_core::session::{Level, Session, SessionConfig, SessState};
+use homeway_core::facade::host_session::{
+    HostSession, HostSessionConfig, Level, ProbeOutcome, SessState,
+};
 use homeway_core::speedtest::{self, Params};
 use homeway_core::token;
-use homeway_core::wgcore::ConnErr;
 
 mod carriers_cli;
 mod cli_flags;
@@ -95,11 +99,10 @@ fn main() {
         Some("socks") => carriers_cli::cmd_socks(&args[2..]),
         Some("speedtest") => cmd_speedtest_dispatch(&args[2..]),
         Some("files") => cmd_files(&args[2..]),
-        Some("dnstest") => cmd_dnstest(&args[2..]),
         Some("portfwd") => cmd_portfwd(&args[2..]),
         _ => {
             eprintln!(
-"homeway-cli——可用：\n  零参 = 统一进程（--state DIR / --verbose；client/control 恒开 + serve/relay 按期望态）\n  host add [--name N] [--force] <token> / host list [--json] / host status [name] / host delete <name|id> [--yes]\n  status [--json] [--watch]（daemon.status 聚合面）\n  term <list|new|attach|delete|explain> […]（本地面 term.sock；--host <ref> = 经控制面远程接入）\n  export [dest.tar] / import <file> / reset cache [--state D]（状态工件面：不变量四件打包/落位/清 cache）\n  serve <start|stop|restart|status|token> / relay <start|stop|restart|status|token>（控制面命令组）\n  serve [flags]（前台单角色）/ relay [flags]（前台单角色）\n  token <hmw1…> [--dead-direct]（改写输出：Direct 端点 → 死端口——矩阵中继段注入缝）\n  connect --token <hmw1…> [--identity-dir <dir>] [--endpoint-cache-dir <dir>]\n      [--speedtest] [--dial <ip:port>] [--hold <secs>] [--probe N] [--status-json]\n      [--recover-from <1|2|3> [--recover-cause <s>]] [--inject poison-socket|relay-lock]（注入需 test-seams 构建）\n  speedtest [--host <ref>] [--json] [--down/--up 10s] [--streams 4] [--wait 60s]（守护托管：全主机轮转或单台；Ctrl-C 终止轮转）\n  speedtest --token <hmw1…> [--identity-dir D] [--endpoint-cache-dir D] [--rounds N] [--hold]（直连形态：同会话 N 轮——A/B 轮次口径）\n  forward <add|list|delete> / socks <on|off|status>（承载面：端口转发规则/SOCKS5 监听，--state 恒指 daemon state）"
+"homeway-cli——可用：\n  零参 = 统一进程（--state DIR / --verbose；client/control 恒开 + serve/relay 按期望态）\n  host add [--name N] [--force] <token> / host list [--json] / host status [name] / host delete <name|id> [--yes]\n  status [--json] [--watch]（daemon.status 聚合面）\n  term <list|new|attach|delete|explain> […]（本地面 term.sock；--host <ref> = 经控制面远程接入）\n  export [dest.tar] / import <file> / reset cache [--state D]（状态工件面：不变量四件打包/落位/清 cache）\n  serve <start|stop|restart|status|token> / relay <start|stop|restart|status|token>（控制面命令组）\n  serve [flags]（前台单角色）/ relay [flags]（前台单角色）\n  token <hmw1…> [--dead-direct]（改写输出：非中继端点 → 死端口——矩阵中继段注入缝）\n  connect --token <hmw1…> [--identity-dir <dir>]\n      [--speedtest] [--dial <ip:port>] [--hold <secs>] [--probe N] [--status-json]\n      [--recover-from <1|2|3> [--recover-cause <s>]] [--inject relay-lock|no-hint]\n  speedtest [--host <ref>] [--json] [--down/--up 10s] [--streams 4] [--wait 60s]（守护托管：全主机轮转或单台；Ctrl-C 终止轮转）\n  speedtest --token <hmw1…> [--identity-dir D] [--rounds N] [--hold]（直连形态：同会话 N 轮——A/B 轮次口径）\n  forward <add|list|delete> / socks <on|off|status>（承载面：端口转发规则/SOCKS5 监听，--state 恒指 daemon state）"
             );
             std::process::exit(2);
         }
@@ -112,14 +115,49 @@ fn wants_help(args: &[String]) -> bool {
     args.iter().any(|a| a == "--help" || a == "-h")
 }
 
+/// `--dead-direct`（矩阵中继段注入缝）的**承载无关**语义：让**直连路径不可达**——
+/// `Direct`（WG 档）与 `Quic`（QUIC 档）两类端点一律改指死端口 `127.0.0.1:1`，
+/// 中继端点原样（只剩它可达）。M5 C2 承载换 QUIC 后，只改 `Direct` 会让注入静默失效。
+fn kill_direct_endpoints(t: &mut token::Token) {
+    for e in &mut t.endpoints {
+        if e.kind != token::EndpointKind::Relay {
+            e.addr = "127.0.0.1:1".to_owned();
+        }
+    }
+}
+
+/// `--loopback-only`（同机 perf 形态）的承载无关语义：非中继端点改指本机回环**同端口**
+/// （v4 字面量才动；v6 端点原样——本缝只针对同机 LAN 形态）。
+fn loopback_endpoints(t: &mut token::Token) {
+    for e in &mut t.endpoints {
+        if e.kind == token::EndpointKind::Relay {
+            continue;
+        }
+        if let Some((_, port)) = e.addr.rsplit_once(':') {
+            if e.addr.split('.').count() == 4 && !e.addr.starts_with("127.0.0.1:") {
+                e.addr = format!("127.0.0.1:{port}");
+            }
+        }
+    }
+}
+
+/// `--endpoint-cache-dir`：随 WG 档端点缓存退役（设计 §1.6-G-1；M5 C2）——
+/// 显式 fail-fast（不静默吞值：吞了 = 用户以为缓存仍在生效）。
+fn cache_flag_retired() -> ! {
+    eprintln!(
+        "--endpoint-cache-dir 已退役（M5 C2：端点学习缓存随 WG 档退役，设计 §1.6-G-1）——QUIC 档候选恒来自 token，请移除该 flag"
+    );
+    std::process::exit(2);
+}
+
 fn cmd_token(args: &[String]) {
     // Q-H F8/CA13：`--help`/`-h` 短路（用法 + exit 0；任意位置）。
     if wants_help(args) {
         eprintln!("用法：homeway-cli token <hmw1…> [--dead-direct] [--loopback-only] [--v6-only]");
-        eprintln!("  无 flag = 解析并打印 peer_id/secret/端点；--dead-direct = Direct 端点改死端口（矩阵中继段注入缝）。");
+        eprintln!("  无 flag = 解析并打印 peer_id/secret/端点；--dead-direct = 全部**非中继**端点改死端口（矩阵中继段注入缝——M5 C2 起覆盖 Direct 与 Quic 两类）。");
         std::process::exit(0);
     }
-    // `token <hmw1…> --dead-direct`：解析后把 Direct 端点改指 127.0.0.1:1 重编码输出
+    // `token <hmw1…> --dead-direct`：解析后把**非中继**端点改指 127.0.0.1:1 重编码输出
     //（矩阵中继段的 Go 客户端注入缝——Go host add 无 dead-direct flag；crc4 无密钥
     // 重算即被两侧接受，评审确认可行）。与 --token 的注入语义一致（connect 侧）。
     // `--loopback-only`：Direct 端点的非回环 IPv4 换 127.0.0.1 同端口（R6 前置批 ⑤
@@ -166,7 +204,9 @@ fn cmd_token(args: &[String]) {
             }
         };
         for e in &mut t.endpoints {
-            if e.kind == token::EndpointKind::Direct && e.addr.parse::<std::net::SocketAddr>().is_ok_and(|a| a.is_ipv4()) {
+            if e.kind == token::EndpointKind::Direct
+                && e.addr.parse::<std::net::SocketAddr>().is_ok_and(|a| a.is_ipv4())
+            {
                 e.addr = "127.0.0.1:1".to_owned();
             }
         }
@@ -197,18 +237,10 @@ fn cmd_token(args: &[String]) {
                 std::process::exit(1);
             }
         };
-        for e in &mut t.endpoints {
-            if e.kind == token::EndpointKind::Direct {
-                if dead_direct {
-                    e.addr = "127.0.0.1:1".to_owned();
-                } else if let Some((_, port)) = e.addr.rsplit_once(':') {
-                    // 非回环 IPv4 → 127.0.0.1 同端口；IPv6 端点（含 ':'）不动——本缝
-                    // 只针对同机 LAN 形态
-                    if e.addr.split('.').count() == 4 && !e.addr.starts_with("127.0.0.1:") {
-                        e.addr = format!("127.0.0.1:{port}");
-                    }
-                }
-            }
+        if dead_direct {
+            kill_direct_endpoints(&mut t);
+        } else {
+            loopback_endpoints(&mut t);
         }
         let eps: Vec<token::EndpointRef<'_>> =
             t.endpoints.iter().map(|e| token::EndpointRef::new(&e.addr, e.kind)).collect();
@@ -247,7 +279,6 @@ fn cmd_token(args: &[String]) {
 struct ConnectArgs {
     tok: Option<String>,
     identity_dir: Option<PathBuf>,
-    cache_dir: Option<PathBuf>,
     do_speedtest: bool,
     dial: Option<SocketAddrV4>,
     hold: u64,
@@ -268,7 +299,6 @@ fn parse_connect(args: &[String]) -> ConnectArgs {
     let mut a = ConnectArgs {
         tok: None,
         identity_dir: None,
-        cache_dir: None,
         do_speedtest: false,
         dial: None,
         hold: 0,
@@ -309,15 +339,8 @@ fn parse_connect(args: &[String]) -> ConnectArgs {
                 )));
                 take_next(&mut adv);
             }
-            "endpoint-cache-dir" => {
-                a.cache_dir = Some(PathBuf::from(cli_flags::take_value_or_exit(
-                    "endpoint-cache-dir",
-                    inline,
-                    next,
-                    false,
-                )));
-                take_next(&mut adv);
-            }
+            // M5 C2：端点缓存随 WG 档退役（设计 §1.6-G-1）——显式 fail-fast（不静默吞值）。
+            "endpoint-cache-dir" => cache_flag_retired(),
             "speedtest" => a.do_speedtest = cli_flags::take_bool_or_exit("speedtest", inline, true),
             "dial" => {
                 let v = cli_flags::take_value_or_exit("dial", inline, next, false);
@@ -410,8 +433,8 @@ fn session_lock_or_exit(identity_dir: &Option<PathBuf>, verb: &str) -> Option<ho
 fn cmd_connect(args: &[String]) {
     // Q-H F8/CA13：`--help`/`-h` 短路（用法 + exit 0；任意位置）。
     if wants_help(args) {
-        eprintln!("用法：homeway-cli connect --token <hmw1…> [--identity-dir D] [--endpoint-cache-dir D] [--speedtest] [--dial <ip:port>]");
-        eprintln!("       [--hold S] [--probe N] [--status-json] [--recover-from 1|2|3 [--recover-cause S] [--recover-delay S]] [--inject poison-socket|relay-lock] [--dead-direct] [--no-session-lock]");
+        eprintln!("用法：homeway-cli connect --token <hmw1…> [--identity-dir D] [--speedtest] [--dial <ip:port>]");
+        eprintln!("       [--hold S] [--probe N] [--status-json] [--recover-from 1|2|3 [--recover-cause S] [--recover-delay S]] [--inject relay-lock|no-hint] [--dead-direct] [--no-session-lock]");
         std::process::exit(0);
     }
     let a = parse_connect(args);
@@ -426,23 +449,22 @@ fn cmd_connect(args: &[String]) {
             std::process::exit(1);
         }
     };
-    if a.dead_direct {
-        for e in &mut t.endpoints {
-            if e.kind == token::EndpointKind::Direct {
-                e.addr = "127.0.0.1:1".to_owned();
-            }
-        }
-        println!("inject: token 直连端点已改指死端口（127.0.0.1:1）——只有中继可达");
-    }
     let _session_lock = (!a.no_session_lock).then(|| session_lock_or_exit(&a.identity_dir, "connect"));
 
+    // ---- 故障注入（M5 C2：QUIC 档的注入面 = 端点改写——须在装配前生效）----
+    if let Some(what) = &a.inject {
+        inject_token(&mut t, what);
+    }
+    if a.dead_direct {
+        kill_direct_endpoints(&mut t);
+        println!("inject: token 直连端点已改指死端口（127.0.0.1:1）——只有中继可达");
+    }
+
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
-    let session = match Session::start(SessionConfig {
+    let session = match HostSession::start(HostSessionConfig {
         token: t,
         identity_dir: a.identity_dir.clone().or_else(|| Some(PathBuf::from("identity"))),
-        endpoint_cache_dir: a.cache_dir.clone(),
         logf: Arc::clone(&logf),
-        relay_only: a.inject.as_deref() == Some("relay-lock"),
     }) {
         Ok(s) => s,
         Err(e) => {
@@ -455,15 +477,11 @@ fn cmd_connect(args: &[String]) {
         eprintln!("会话失败收工：{}", snap.reason);
         std::process::exit(1);
     }
-    // C8（APP 核形态判据，按 R1 登记在 CLI 层打出、一次会话一次）
-    println!("warmup pong: 就绪（判据=wg）");
+    // C8（APP 核形态判据，按 R1 登记在 CLI 层打出、一次会话一次）——M5 C2 起 CLI 会话
+    // 承载 = QUIC 岛 ⇒ 判据位 `quic`（设计 §8.1-C8 的终值）
+    println!("warmup pong: 就绪（判据=quic）");
 
-    // ---- 故障注入（test-seams 构建；普通构建给出可判定错误）----
-    if let Some(what) = &a.inject {
-        inject(&session, what);
-    }
-
-    // ---- 恢复钩子（时间窗实测：阶梯直测面；delay = 先给外部注入留窗口）----
+    // ---- 恢复钩子（时间窗实测：岛内阶梯直测面；delay = 先给外部注入留窗口）----
     if let Some(from) = a.recover_from {
         if a.recover_delay > 0 {
             println!("recover: 等待 {}s 后起跑（注入窗口）", a.recover_delay);
@@ -473,9 +491,9 @@ fn cmd_connect(args: &[String]) {
         let t0 = Instant::now();
         let rc = session.recover(lvl, &a.recover_cause);
         println!(
-            "recover: from={} rc={} 耗时={}ms（ladder 判据行见上）",
+            "recover: from={} rc={} 耗时={}ms（宿主会话：快探+一次复探；岛内阶梯动作见上）",
             from,
-            rc.as_rc(),
+            rc,
             t0.elapsed().as_millis()
         );
     }
@@ -487,9 +505,12 @@ fn cmd_connect(args: &[String]) {
 
     // ---- 手动探测拍（恢复性验证用）----
     for _ in 0..a.probe {
-        match session.client().path_probe(Duration::from_secs(10)) {
-            Ok(()) => println!("probe: ok"),
-            Err(e) => println!("probe: 失败（{e}）"),
+        match session.path_probe(Duration::from_secs(10)) {
+            ProbeOutcome::Ok { rtt } => println!("probe: ok（rtt={}ms）", rtt.as_millis()),
+            ProbeOutcome::Timeout => println!("probe: 失败（预算内无对端证据）"),
+            ProbeOutcome::NoFace => println!("probe: 失败（无连接面）"),
+            // `ProbeOutcome` 是 `#[non_exhaustive]`（AGENTS 原则 1）⇒ 跨 crate 匹配留通配臂
+            _ => println!("probe: 失败（未识别结论）"),
         }
     }
 
@@ -501,10 +522,9 @@ fn cmd_connect(args: &[String]) {
         }
     }
 
-    // ---- speedtest（可选；直连面，不走 healing）----
+    // ---- speedtest（可选；岛 STREAM[tag=3] 承载）----
     if a.do_speedtest {
-        let client = session.client();
-        match speedtest::run(&client, Params::default(), &|s| println!("{s}")) {
+        match speedtest::run_session(&session, Params::default(), &|s| println!("{s}")) {
             Ok(r) => {
                 println!(
                     "speedtest: 摘要 down={:.0}Mbps up={:.0}Mbps",
@@ -528,86 +548,88 @@ fn cmd_connect(args: &[String]) {
         }
     }
 
-    let e = session.client().snapshot();
-    println!("收工：WG 传输层累计 rx={}B tx={}B", e.rx, e.tx);
+    let e = session.snapshot();
+    match e.stats {
+        // 宿主会话 stats = 岛**服务流**字节累计（§2.4-A-2 语义面①：无 L3/TUN 面；
+        // 键位不变、来源随承载换——登记见 `docs/reviews/M5.md`）。
+        Some((rx, tx)) => println!("收工：服务流累计 rx={rx}B tx={tx}B"),
+        None => println!("收工：服务流累计不可读（岛快照缺席）"),
+    }
     session.stop();
 }
 
-fn inject(session: &Session, what: &str) {
+/// 故障注入缝（M5 C2：**注入面 = token 端点改写**，全部在装配前生效）。
+///
+/// - `relay-lock`：把 QUIC 类直连端点改指死端口 ⇒ 候选只剩中继（与 WG 档的
+///   「非中继源按从未到达处理」同义——QUIC 岛的对应物就是「没有直连候选」）；
+/// - `poison-socket`：WG 档的 socket 毒化缝在 QUIC 岛**无对应物**（登记退役，
+///   见 `docs/reviews/M5.md`）⇒ fail-fast，不静默。
+fn inject_token(t: &mut token::Token, what: &str) {
     match what {
-        "poison-socket" => {
-            #[cfg(feature = "test-seams")]
-            {
-                session.client().debug_poison_socket();
-                println!("inject: UDP socket 已置为失效形态（EBADF 模拟）");
-            }
-            #[cfg(not(feature = "test-seams"))]
-            {
-                let _ = session;
-                eprintln!("inject: 需要 test-seams 构建（cargo build -p homeway-cli --features homeway-core/test-seams）");
-                std::process::exit(2);
-            }
-        }
         "relay-lock" => {
-            #[cfg(feature = "test-seams")]
-            {
-                session.debug_suppress_hints();
-                println!("inject: 中继锁定（非中继源按从未到达处理——模拟直连全断的真机中继形态）");
-            }
-            #[cfg(not(feature = "test-seams"))]
-            {
-                let _ = session;
-                eprintln!("inject: 需要 test-seams 构建（cargo build -p homeway-cli --features homeway-core/test-seams）");
-                std::process::exit(2);
-            }
+            kill_direct_endpoints(t);
+            println!("inject: 中继锁定（直连端点改死端口——候选只剩中继）");
+        }
+        "no-hint" => {
+            // WG 档的 hint 抑制缝：岛无 hint 概念（G-1 登记）⇒ 无操作但如实告知。
+            println!("inject: no-hint 在 QUIC 档无对应面（岛无 hint 通路，G-1 登记）——无操作");
+        }
+        "poison-socket" => {
+            eprintln!(
+                "inject: poison-socket 已退役（QUIC 档无 socket 毒化缝——M5 C2 登记，见 docs/reviews/M5.md）"
+            );
+            std::process::exit(2);
         }
         other => {
-            eprintln!("未知注入：{other}（可用：poison-socket / relay-lock）");
+            eprintln!("未知注入：{other}（QUIC 档可用：relay-lock / no-hint）");
             std::process::exit(2);
         }
     }
 }
 
-/// 经隧道拨任意 v4 目标（transit 判据产出步骤）：建连 → 读到对端数据或 EOF 即证通。
-fn transit_dial(session: &Session, dst: SocketAddrV4) -> Result<usize, ConnErr> {
-    let id = session.client().connect(dst)?;
+/// 经宿主会话拨任意 v4 目标（transit 判据产出步骤；M5 C2：`STREAM[dial]` + 6B 目标
+/// ——出口 dial 腿直拨）：建连 → 读到对端数据或 EOF 即证通。
+fn transit_dial(session: &HostSession, dst: SocketAddrV4) -> Result<usize, std::io::Error> {
+    let stream = session.dial_addr(dst, Duration::from_secs(15))?;
     // 先写一段载荷：echo 类目标只在收到数据后回显（只 connect+read 会一直阻塞——
     // R1 旧形态的目标是主动发横幅的服务）；写完读首块回显即证通收工
     let probe = b"transit-probe-payload-64b-0123456789abcdef0123456789abcdef";
     let mut off = 0usize;
     let mut zero = 0u32;
     while off < probe.len() {
-        match session.client().write(id, probe[off..].to_vec()) {
-            Ok(w) if w.n > 0 => off += w.n,
+        match stream.write_chunk(&probe[off..]) {
+            Ok(n) if n > 0 => off += n,
             // Err 不重试直接失败（评审 r2-自补2：回执超时的那笔可能仍在引擎队列里
             // 并最终执行——重试会双投；零接纳（Ok(0)）才重试）。
             Ok(_) => {
                 zero += 1;
                 if zero > 100_000 {
                     eprintln!("transit: 写探测载荷无进展");
-                    let _ = session.client().close(id);
-                    return Err(ConnErr::Timeout);
+                    stream.close();
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "transit 写探测载荷无进展",
+                    ));
                 }
                 std::thread::yield_now();
             }
             Err(e) => {
                 eprintln!("transit: 写探测载荷失败（{e}）");
-                let _ = session.client().close(id);
+                stream.close();
                 return Err(e);
             }
         }
     }
-    // 证通即收：echo 类目标不主动 EOF——读到首块回显（或对端 FIN）就关（原「读到
-    // 16MB 或 EOF」形态在 echo 目标上会阻塞到会话收工，E11 关闭行拖 5 分钟）
-    let got = match session.client().read(id) {
+    // 证通即收：echo 类目标不主动 EOF——读到首块回显（或对端 FIN：空块 = EOF，计 0）
+    // 就关（原「读到 16MB 或 EOF」形态在 echo 目标上会阻塞到会话收工）
+    let got = match stream.read_chunk() {
         Ok(chunk) => chunk.len(),
-        Err(ConnErr::Closed) => 0, // 对端 FIN——连接本身已证通
         Err(e) => {
-            let _ = session.client().close(id);
+            stream.close();
             return Err(e);
         }
     };
-    let _ = session.client().close(id);
+    stream.close();
     Ok(got)
 }
 
@@ -626,19 +648,18 @@ fn cmd_speedtest_dispatch(args: &[String]) {
     }
 }
 
-/// `homeway-cli speedtest --token <hmw1…> [--identity-dir D] [--endpoint-cache-dir D]
+/// `homeway-cli speedtest --token <hmw1…> [--identity-dir D]
 ///  [--rounds N] [--hold]`——建一次会话跑 N 轮（每轮自带 2s warmup，与 Go daemon
 /// `speedtest --state -host` 常驻同会话口径一致）。`--hold` = 跑完保持会话（RSS 采样）。
 fn cmd_speedtest(args: &[String]) {
     // Q-H F8/CA13：`--help`/`-h` 短路（用法 + exit 0；守护托管形态的 help 在 carriers_cli）。
     if wants_help(args) {
-        eprintln!("用法：homeway-cli speedtest --token <hmw1…> [--identity-dir D] [--endpoint-cache-dir D] [--rounds N] [--hold] [--dead-direct] [--no-session-lock]");
+        eprintln!("用法：homeway-cli speedtest --token <hmw1…> [--identity-dir D] [--rounds N] [--hold] [--dead-direct] [--no-session-lock]");
         eprintln!("  无 --token = 守护托管形态（homeway-cli speedtest [--host <ref>] [--json] …）。");
         std::process::exit(0);
     }
     let mut tok: Option<String> = None;
     let mut identity_dir: Option<PathBuf> = None;
-    let mut cache_dir: Option<PathBuf> = None;
     let mut rounds: u32 = 3;
     let mut hold = false;
     let mut dead_direct = false;
@@ -661,10 +682,8 @@ fn cmd_speedtest(args: &[String]) {
                 identity_dir = Some(PathBuf::from(cli_flags::take_value_or_exit("identity-dir", inline, next, false)));
                 if inline.is_none() { adv = 2; }
             }
-            "endpoint-cache-dir" => {
-                cache_dir = Some(PathBuf::from(cli_flags::take_value_or_exit("endpoint-cache-dir", inline, next, false)));
-                if inline.is_none() { adv = 2; }
-            }
+            // M5 C2：端点缓存随 WG 档退役（设计 §1.6-G-1）——显式 fail-fast。
+            "endpoint-cache-dir" => cache_flag_retired(),
             "rounds" => {
                 // Q-H F7a：非法/缺值 fail-fast（此前静默回落 3 轮）。
                 rounds = cli_flags::take_num_or_exit::<u32>("rounds", inline, next, "轮数，如 3");
@@ -680,7 +699,7 @@ fn cmd_speedtest(args: &[String]) {
         i += adv;
     }
     let Some(tok) = tok else {
-        eprintln!("用法：homeway-cli speedtest --token <hmw1…> [--identity-dir D] [--endpoint-cache-dir D] [--rounds N] [--hold]");
+        eprintln!("用法：homeway-cli speedtest --token <hmw1…> [--identity-dir D] [--rounds N] [--hold]");
         std::process::exit(2);
     };
     let mut t = match token::decode(&tok) {
@@ -688,21 +707,15 @@ fn cmd_speedtest(args: &[String]) {
         Err(e) => { eprintln!("token 解析失败：{e}"); std::process::exit(1); }
     };
     if dead_direct {
-        for e in &mut t.endpoints {
-            if e.kind == token::EndpointKind::Direct {
-                e.addr = "127.0.0.1:1".to_owned();
-            }
-        }
+        kill_direct_endpoints(&mut t);
         println!("inject: token 直连端点已改指死端口（127.0.0.1:1）——只有中继可达");
     }
     let _session_lock = (!no_session_lock).then(|| session_lock_or_exit(&identity_dir, "speedtest"));
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
-    let session = match Session::start(SessionConfig {
+    let session = match HostSession::start(HostSessionConfig {
         token: t,
         identity_dir: identity_dir.or_else(|| Some(PathBuf::from("identity"))),
-        endpoint_cache_dir: cache_dir,
         logf: Arc::clone(&logf),
-        relay_only: false,
     }) {
         Ok(s) => s,
         Err(e) => { eprintln!("会话建立失败：{e}"); std::process::exit(1); }
@@ -711,10 +724,10 @@ fn cmd_speedtest(args: &[String]) {
         eprintln!("会话失败收工");
         std::process::exit(1);
     }
-    println!("warmup pong: 就绪（判据=wg）");
-    let client = session.client();
+    // C8：M5 C2 起 CLI 会话承载 = QUIC 岛 ⇒ 判据位 `quic`
+    println!("warmup pong: 就绪（判据=quic）");
     for r in 1..=rounds {
-        match speedtest::run(&client, Params::default(), &|s| println!("{s}")) {
+        match speedtest::run_session(&session, Params::default(), &|s| println!("{s}")) {
             Ok(res) => {
                 println!(
                     "round {}/{}: down={:.0}Mbps up={:.0}Mbps",
@@ -736,12 +749,14 @@ fn cmd_speedtest(args: &[String]) {
             std::thread::sleep(Duration::from_secs(3600));
         }
     }
-    let e = session.client().snapshot();
-    println!("收工：WG 传输层累计 rx={}B tx={}B", e.rx, e.tx);
+    match session.snapshot().stats {
+        Some((rx, tx)) => println!("收工：服务流累计 rx={rx}B tx={tx}B"),
+        None => println!("收工：服务流累计不可读（岛快照缺席）"),
+    }
     session.stop();
 }
 
-// ---------- files 动词（每命令一条流；拨号走 healing） ----------
+// ---------- files 动词（每命令一条流；拨号走 HostSession 服务流） ----------
 
 fn cmd_files(args: &[String]) {
     // Q-H F8/CA13：`--help`/`-h` 短路（用法 + exit 0；任意位置）。
@@ -750,7 +765,7 @@ fn cmd_files(args: &[String]) {
         eprintln!("  远程形态：homeway-cli files <verb> --host <ref> [--state D] [--timeout T] <远端路径> [<本地路径>]");
         std::process::exit(0);
     }
-    // files <verb> --token <hmw1> [--identity-dir D] [--dead-direct] [--inject no-hint]
+    // files <verb> --token <hmw1> [--identity-dir D] [--dead-direct] [--inject relay-lock|no-hint]
     //   [--rate-limit <bytes/s>] <path> [<local>]（--rate-limit 缺省 2MiB/s 发送端速率
     //   义务；0 = 不限、风险自担——对齐 Go files-cli 1.4）
     // files <verb> --host <ref> [--state D] [--timeout T] [--no-spawn] <path> [<local>]
@@ -998,21 +1013,19 @@ fn cmd_files(args: &[String]) {
         }
     };
     if dead_direct {
-        for e in &mut t.endpoints {
-            if e.kind == token::EndpointKind::Direct {
-                e.addr = "127.0.0.1:1".to_owned();
-            }
-        }
+        kill_direct_endpoints(&mut t);
         println!("inject: token 直连端点已改指死端口（127.0.0.1:1）——只有中继可达");
     }
     let _session_lock = (!no_session_lock).then(|| session_lock_or_exit(&identity_dir, "files"));
+    // 故障注入（M5 C2：注入面 = token 端点改写——装配前生效）
+    if let Some(what) = &inject_what {
+        inject_token(&mut t, what);
+    }
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
-    let session = match Session::start(SessionConfig {
+    let session = match HostSession::start(HostSessionConfig {
         token: t,
         identity_dir: identity_dir.or_else(|| Some(PathBuf::from("identity"))),
-        endpoint_cache_dir: None,
         logf: Arc::clone(&logf),
-        relay_only: inject_what.as_deref() == Some("relay-lock"),
     }) {
         Ok(s) => s,
         Err(e) => {
@@ -1020,9 +1033,6 @@ fn cmd_files(args: &[String]) {
             std::process::exit(1);
         }
     };
-    if let Some(what) = &inject_what {
-        inject(&session, what);
-    }
     if session.snapshot().state == SessState::Failed {
         eprintln!("会话失败收工");
         std::process::exit(1);
@@ -1236,211 +1246,12 @@ fn files_stream_open_err_text(e: &homeway_core::daemon::proto::OpError) -> Strin
     }
 }
 
-// ---------- dnstest（DNS 代答实测 + E12 出口 UDP 面采样；R3-3f 判据产出步骤） ----------
-
-/// `homeway-cli dnstest --token <hmw1> [--identity-dir D] [--mode tcp5300|udp53|leg] <域名>`
-///   tcp5300：隧道 IP:<解析腿端口> TCP（客户端远程解析腿——qtcp 计数面）
-///   udp53：隧道 IP:53 UDP（手机声明的 DNS——栈内 listener 面，q 计数）
-///   leg：8.8.8.8:53 UDP（非隧道 IP 的 :53——拦截层进程内腿 + E12 dns 会话行）
-fn cmd_dnstest(args: &[String]) {
-    // Q-H F8/CA13：`--help`/`-h` 短路（用法 + exit 0；任意位置）。
-    if wants_help(args) {
-        eprintln!("用法：homeway-cli dnstest --token <hmw1…> [--identity-dir D] [--mode tcp5300|udp53|leg] <域名>");
-        std::process::exit(0);
-    }
-    let mut tok: Option<String> = None;
-    let mut identity_dir: Option<PathBuf> = None;
-    let mut mode = "tcp5300".to_owned();
-    let mut name = String::new();
-    let mut no_session_lock = false;
-    let mut i = 0;
-    while i < args.len() {
-        let raw = args[i].as_str();
-        let Some((fname, inline)) = cli_flags::split_flag(raw) else {
-            name = raw.to_owned();
-            i += 1;
-            continue;
-        };
-        let next = args.get(i + 1).map(String::as_str);
-        let mut adv = 1usize;
-        match fname {
-            "token" => {
-                tok = Some(cli_flags::take_value_or_exit("token", inline, next, false));
-                if inline.is_none() { adv = 2; }
-            }
-            "identity-dir" => {
-                identity_dir = Some(PathBuf::from(cli_flags::take_value_or_exit("identity-dir", inline, next, false)));
-                if inline.is_none() { adv = 2; }
-            }
-            "mode" => {
-                mode = cli_flags::take_value_or_exit("mode", inline, next, false);
-                if inline.is_none() { adv = 2; }
-            }
-            "no-session-lock" => {
-                no_session_lock = cli_flags::take_bool_or_exit("no-session-lock", inline, true)
-            }
-            other => {
-                eprintln!("未知参数：--{other}");
-                std::process::exit(2);
-            }
-        }
-        i += adv;
-    }
-    let Some(tok) = tok else {
-        eprintln!("用法：homeway-cli dnstest --token <hmw1…> [--mode tcp5300|udp53|leg] <域名>");
-        std::process::exit(2);
-    };
-    if name.is_empty() {
-        eprintln!("dnstest 需要 <域名>（如 example.com）");
-        std::process::exit(2);
-    }
-    let t = match token::decode(&tok) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("token 解析失败：{e}");
-            std::process::exit(1);
-        }
-    };
-    let _session_lock = (!no_session_lock).then(|| session_lock_or_exit(&identity_dir, "dnstest"));
-    let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
-    let session = match homeway_core::session::Session::start(homeway_core::session::SessionConfig {
-        token: t,
-        identity_dir: identity_dir.or_else(|| Some(PathBuf::from("identity"))),
-        endpoint_cache_dir: None,
-        logf: Arc::clone(&logf),
-        relay_only: false,
-    }) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("会话建立失败：{e}");
-            std::process::exit(1);
-        }
-    };
-    if session.snapshot().state == SessState::Failed {
-        eprintln!("会话失败收工");
-        std::process::exit(1);
-    }
-    // 构造 A 查询
-    let mut q = Vec::new();
-    q.extend_from_slice(&0x1234u16.to_be_bytes());
-    q.extend_from_slice(&[0x01, 0x00, 0x00, 0x01, 0, 0, 0, 0, 0, 0]);
-    for label in name.split('.') {
-        q.push(label.len() as u8);
-        q.extend_from_slice(label.as_bytes());
-    }
-    q.push(0);
-    q.extend_from_slice(&[0x00, 0x01, 0x00, 0x01]);
-
-    let client = session.client();
-    let r = match mode.as_str() {
-        "tcp5300" => dns_tcp(&client, &q),
-        "udp53" => dns_udp(&client, &q, homeway_core::wgcore::SERVER_TUNNEL_IP, 53),
-        "leg" => dns_udp(&client, &q, std::net::Ipv4Addr::new(8, 8, 8, 8), 53),
-        other => {
-            eprintln!("未知 --mode {other:?}（可用：tcp5300 / udp53 / leg）");
-            session.stop();
-            std::process::exit(2);
-        }
-    };
-    session.stop();
-    match r {
-        Ok(resp) => {
-            let rcode = resp.get(3).map(|b| b & 0x0F).unwrap_or(9);
-            let anc = resp.get(6).and_then(|h| resp.get(7).map(|l| (u16::from(*h) << 8) | u16::from(*l))).unwrap_or(0);
-            println!("dnstest[{mode}] {name}: rcode={rcode} answers={anc} bytes={}", resp.len());
-            if rcode == 0 && anc > 0 {
-                println!("（出口侧应见 dns: 计数行——E22 判据）");
-            }
-        }
-        Err(e) => {
-            eprintln!("dnstest[{mode}] 失败：{e}");
-            std::process::exit(1);
-        }
-    }
-}
-
-fn dns_tcp(client: &homeway_core::wgcore::Client, q: &[u8]) -> Result<Vec<u8>, String> {
-    let dst = SocketAddrV4::new(homeway_core::wgcore::SERVER_TUNNEL_IP, 5300);
-    let id = client.connect(dst).map_err(|e| e.to_string())?;
-    let mut frame = Vec::with_capacity(2 + q.len());
-    frame.extend_from_slice(&(q.len() as u16).to_be_bytes());
-    frame.extend_from_slice(q);
-    // 写
-    let mut off = 0;
-    while off < frame.len() {
-        let n = client.write(id, frame[off..].to_vec()).map_err(|e| e.to_string())?;
-        if n.n == 0 {
-            std::thread::yield_now();
-            continue;
-        }
-        off += n.n;
-    }
-    // 读：2B 长度 + 报文
-    let mut buf = Vec::new();
-    let deadline = Instant::now() + Duration::from_secs(6);
-    while buf.len() < 2 && Instant::now() < deadline {
-        match client.read(id) {
-            Ok(chunk) if !chunk.is_empty() => buf.extend_from_slice(&chunk),
-            Err(homeway_core::wgcore::ConnErr::Closed) => break,
-            _ => std::thread::sleep(Duration::from_millis(20)),
-        }
-    }
-    if buf.len() < 2 {
-        let _ = client.close(id);
-        return Err("6s 内未读到响应长度前缀".into());
-    }
-    let mlen = u16::from_be_bytes([buf[0], buf[1]]) as usize;
-    while buf.len() < 2 + mlen && Instant::now() < deadline {
-        match client.read(id) {
-            Ok(chunk) if !chunk.is_empty() => buf.extend_from_slice(&chunk),
-            Err(homeway_core::wgcore::ConnErr::Closed) => break,
-            _ => std::thread::sleep(Duration::from_millis(20)),
-        }
-    }
-    let _ = client.close(id);
-    if buf.len() < 2 + mlen {
-        return Err(format!("响应不完整（{}/{}）", buf.len() - 2, mlen));
-    }
-    Ok(buf[2..2 + mlen].to_vec())
-}
-
-fn dns_udp(
-    client: &homeway_core::wgcore::Client,
-    q: &[u8],
-    ip: std::net::Ipv4Addr,
-    port: u16,
-) -> Result<Vec<u8>, String> {
-    let (id, local_port) = client.udp_open().map_err(|e| e.to_string())?;
-    println!("dnstest: UDP 源端口 {local_port} → {ip}:{port}");
-    client
-        .udp_send(id, SocketAddrV4::new(ip, port), q.to_vec())
-        .map_err(|e| e.to_string())?;
-    // 收（整体预算 6s——recv 阻塞面由看门狗线程兜）
-    let (tx, rx) = std::sync::mpsc::channel();
-    let c2 = unsafe_client(client);
-    std::thread::spawn(move || {
-        let r = c2.udp_recv(id).map_err(|e| e.to_string());
-        let _ = tx.send(r);
-    });
-    match rx.recv_timeout(Duration::from_secs(6)) {
-        Ok(Ok((data, from))) => {
-            let _ = client.udp_close(id);
-            println!("dnstest: 应答来自 {from}（{} 字节）", data.len());
-            Ok(data)
-        }
-        Ok(Err(e)) => Err(e),
-        Err(_) => {
-            let _ = client.udp_close(id);
-            Err("6s 内无应答".into())
-        }
-    }
-}
-
-/// udp_recv 的跨线程调用面（Client 是 & 引用——Send 边界用原始指针横传；调用方
-/// 保证生命周期（session 活到函数尾）——测试动词专用，不进 core）。
-fn unsafe_client(c: &homeway_core::wgcore::Client) -> &'static homeway_core::wgcore::Client {
-    unsafe { &*(c as *const _) }
-}
+// ---------- dnstest：**已退役（M5 G6）** ----------
+//
+// `dnstest`（DNS 代答实测 + E12 出口 UDP 面采样）依赖 WG 栈 B 的 **UDP socket 面**
+// （`udp_open/udp_send/udp_recv/udp_close`）——QUIC 岛只有 STREAM + L3，无 UDP socket
+// 服务面（设计 §2.6-G6 的有意缺口）。登记退役：排障工具、非产品四件套；`tools/matrix.sh`
+// 的 DNS 行同批改为登记态（不再调本动词）。
 
 // ---------- portfwd（本地 127.0.0.1 监听 → 经隧道拨目标；CLI 测试动词） ----------
 
@@ -1484,7 +1295,7 @@ fn cmd_portfwd(args: &[String]) {
                     [l, tport] => (
                         l.parse().ok(),
                         tport.parse().ok().map(|p: u16| {
-                            SocketAddrV4::new(homeway_core::wgcore::SERVER_TUNNEL_IP, p)
+                            SocketAddrV4::new(homeway_core::tunnel_addr::SERVER_TUNNEL_IP, p)
                         }),
                     ),
                     // v6 形态暂不支持（本地实例恒 v4 字面量；`ip:port` 已由 3 段分支覆盖）
@@ -1526,12 +1337,10 @@ fn cmd_portfwd(args: &[String]) {
     };
     let _session_lock = (!no_session_lock).then(|| session_lock_or_exit(&identity_dir, "portfwd"));
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
-    let session = match Session::start(SessionConfig {
+    let session = match HostSession::start(HostSessionConfig {
         token: t,
         identity_dir: identity_dir.or_else(|| Some(PathBuf::from("identity"))),
-        endpoint_cache_dir: None,
         logf: Arc::clone(&logf),
-        relay_only: false,
     }) {
         Ok(s) => s,
         Err(e) => {
@@ -1543,9 +1352,9 @@ fn cmd_portfwd(args: &[String]) {
         eprintln!("会话失败收工");
         std::process::exit(1);
     }
-    // CLI 测试动词形态：Session 泄漏成 'static（本命令永不返回；单条失败只记
-    // 状态、不阻断其它映射——Go setPortForwards 同义）
-    let sess: &'static Session = Box::leak(Box::new(session));
+    // CLI 测试动词形态：会话泄漏成 'static（本命令永不返回；单条失败只记状态、
+    // 不阻断其它映射——Go setPortForwards 同义）
+    let sess: &'static HostSession = Box::leak(Box::new(session));
     for (listen, target) in maps {
         // N7（Q-F F1-5）：目标文案收敛到 `pf_target_text` 单一真源——此前这里第三份
         // 拷贝与 Go `pfTargetText` 有两处不等（`L:IP:0` 打 `IP:0`；`L:PORT` 打
@@ -1553,7 +1362,7 @@ fn cmd_portfwd(args: &[String]) {
         let rule = homeway_core::facade::portfwd::PortForwardRule {
             listen,
             target_ip: match &target {
-                Some(t) if t.ip() != &homeway_core::wgcore::SERVER_TUNNEL_IP => t.ip().to_string(),
+                Some(t) if t.ip() != &homeway_core::tunnel_addr::SERVER_TUNNEL_IP => t.ip().to_string(),
                 _ => String::new(),
             },
             target_port: target.as_ref().map(|t| t.port()).unwrap_or(0),
@@ -1579,17 +1388,20 @@ fn cmd_portfwd(args: &[String]) {
                     Ok(c) => c,
                     Err(_) => continue,
                 };
-                // 拨远端（恢复感知；15s = Go portfwd dialTimeout）
-                let Ok(remote_id) = sess.healing_dial_addr(dst, Duration::from_secs(15)) else {
+                // 拨远端（`STREAM[dial]`；15s = Go portfwd dialTimeout）
+                let Ok(remote) = sess.dial_addr(dst, Duration::from_secs(15)) else {
                     continue;
                 };
                 let w_conn = match local_conn.try_clone() {
                     Ok(c) => c,
                     Err(_) => {
-                        let _ = sess.client().close(remote_id);
+                        remote.close();
                         continue;
                     }
                 };
+                let remote = Arc::new(remote);
+                let r_up = Arc::clone(&remote);
+                let r_dn = Arc::clone(&remote);
                 // 上行：本地 → 隧道
                 std::thread::spawn(move || {
                     let mut lc = local_conn;
@@ -1597,14 +1409,14 @@ fn cmd_portfwd(args: &[String]) {
                     loop {
                         match std::io::Read::read(&mut lc, &mut buf) {
                             Ok(0) | Err(_) => {
-                                let _ = sess.client().shutdown(remote_id);
+                                r_up.shutdown_write();
                                 return;
                             }
                             Ok(n) => {
                                 let mut off = 0;
                                 while off < n {
-                                    match sess.client().write(remote_id, buf[off..n].to_vec()) {
-                                        Ok(w) if w.n > 0 => off += w.n,
+                                    match r_up.write_chunk(&buf[off..n]) {
+                                        Ok(w) if w > 0 => off += w,
                                         _ => {
                                             let _ = lc.shutdown(std::net::Shutdown::Both);
                                             return;
@@ -1619,20 +1431,22 @@ fn cmd_portfwd(args: &[String]) {
                 std::thread::spawn(move || {
                     let mut wc = w_conn;
                     loop {
-                        match sess.client().read(remote_id) {
+                        match r_dn.read_chunk() {
                             Ok(chunk) if !chunk.is_empty() => {
                                 let mut off = 0;
                                 while off < chunk.len() {
                                     match std::io::Write::write(&mut wc, &chunk[off..]) {
                                         Ok(w) if w > 0 => off += w,
                                         _ => {
-                                            let _ = sess.client().close(remote_id);
+                                            r_dn.close();
                                             return;
                                         }
                                     }
                                 }
                             }
                             _ => {
+                                // EOF/错误：隧道侧收口 + 本地半关
+                                r_dn.close();
                                 let _ = wc.shutdown(std::net::Shutdown::Both);
                                 return;
                             }

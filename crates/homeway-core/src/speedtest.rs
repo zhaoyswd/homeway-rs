@@ -14,16 +14,13 @@
 //!   长度端序 LE；上行收口只认 report 帧。
 
 use std::collections::HashMap;
-use std::net::SocketAddrV4;
 use std::time::{Duration, Instant};
-
-use crate::wgcore::{Client, ConnErr};
 
 /// speedtest 服务端口（隧道 IP 上；出口按 LocalServices 转投）。
 ///
-/// **M3 口径（D1）**：本模块的跑测面只被 **CLI 本地形态**消费（`Session` 拨号 = WG 承载，
-/// 不变）；App 核的测速走桥 UDS（`facade/speedtest_op.rs`）——QUIC 档在桥那头按本端口选
-/// `STREAM[tag=3]`（`facade/quic_stream.rs::tag_for_port`），**不再拨本端口**。
+/// **M5 C2 口径**：本模块的跑测面承载 = **宿主会话**（QUIC 岛 `STREAM[tag=3]`；
+/// `facade/host_session.rs` 的 `ServicePort::speedtest()`）——本地/守护两形态同源。
+/// 端口常量保留为**服务标识**（`ServicePort::from_bridge_port` 的真源之一）。
 pub const SPEEDTEST_PORT: u16 = 7803;
 pub(crate) const MAGIC: [u8; 4] = *b"SPED";
 pub(crate) const HEADER: usize = 15;
@@ -102,8 +99,14 @@ pub const REASON_INVALID_ARG: &str = "invalid_arg";
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SpeedtestError {
+    /// 连接建立/承载失败（M5 C2 载荷换型：`wgcore::ConnErr` → 宿主会话 `HostErr`；
+    /// §2.5：WG 版错误类型不迁入新面）。
     #[error("测速连接失败：{0}")]
-    Conn(#[from] ConnErr),
+    Conn(#[from] crate::facade::host_session::HostErr),
+    /// 期限到点（桥面/承载面超时——M5 C2 新增变体，§2.5 定稿：不再借
+    /// `Conn(ConnErr::Timeout)` 表达；`reason()` 恒 `timeout`）。
+    #[error("测速超时（预算内无对端证据）")]
+    Timeout,
     #[error("帧协议错误：{0}")]
     Frame(String),
     #[error("服务端报告错误：{0}")]
@@ -140,7 +143,7 @@ impl SpeedtestError {
             SpeedtestError::Report(_) => REASON_INTERRUPTED,
             SpeedtestError::NotSupported => REASON_NOT_SUPPORTED,
             SpeedtestError::Frame(_) => REASON_INTERRUPTED,
-            SpeedtestError::Conn(ConnErr::Timeout) => REASON_TIMEOUT,
+            SpeedtestError::Timeout => REASON_TIMEOUT,
             SpeedtestError::Conn(_) => REASON_INTERRUPTED,
             SpeedtestError::InvalidArg(_) => REASON_INVALID_ARG,
             SpeedtestError::Bridge(code, _) => code,
@@ -256,56 +259,97 @@ pub trait SpeedConn: Send + Sync {
 /// 请求发出后每连接的读写硬期限裕量（Go connBudget = 15s，engine.go:72 同值）。
 const CONN_BUDGET: Duration = Duration::from_secs(15);
 
-/// CLI 形态承载（Arc<Client> + 流 id）。
-struct ClientConn {
-    client: std::sync::Arc<Client>,
-    id: u64,
+/// 宿主会话（QUIC 岛）承载的测速连接（M5 C2：`ClientConn` 的岛版）。
+///
+/// `HostStream` 的 `&self` chunk 面语义与本 trait 逐条对齐：读空块 = EOF、写返回
+/// 本次接纳字节数（内部分级退避环）、`kill` = 关流（幂等）。
+struct HostConn {
+    stream: std::sync::Arc<crate::facade::host_session::HostStream>,
 }
 
-/// 由既有引擎连接构造 SpeedConn（daemon 承载面 speedtest runner 的拨号腿——
-/// 会话侧 healing 拨号拿到 conn id 后经本面交给引擎；与 CLI 形态同一承载实现）。
-pub fn engine_conn(client: std::sync::Arc<Client>, id: u64) -> std::sync::Arc<dyn SpeedConn> {
-    std::sync::Arc::new(ClientConn { client, id })
+/// 由宿主会话流构造 SpeedConn（daemon 承载面 speedtest runner / CLI 形态的拨号腿——
+/// 会话侧 `HostSession::connect(ServicePort::speedtest())` 拿到流后经本面交给引擎）。
+pub fn engine_conn_host(
+    stream: std::sync::Arc<crate::facade::host_session::HostStream>,
+) -> std::sync::Arc<dyn SpeedConn> {
+    std::sync::Arc::new(HostConn { stream })
 }
 
-impl SpeedConn for ClientConn {
+impl SpeedConn for HostConn {
     fn write_frame(&self, data: &[u8]) -> Result<(), SpeedtestError> {
         let mut off = 0;
-        let mut zero_streak = 0u32;
-        // R8-3 F12：零接纳时引擎带回原 Vec——重试环不重拷（与 SessionWriteHalf 同款）。
-        let mut pending: Option<Vec<u8>> = None;
         while off < data.len() {
-            let chunk = match pending.take() {
-                Some(v) => v,
-                None => data[off..].to_vec(),
-            };
-            let w = self.client.write(self.id, chunk).map_err(SpeedtestError::Conn)?;
-            if w.n == 0 {
-                pending = w.back;
-                zero_streak += 1;
-                if zero_streak > 1_000_000 {
-                    return Err(SpeedtestError::Frame("写通道长时间无进展".into()));
-                }
-                std::thread::yield_now();
-                continue;
+            // `write_chunk` 内部已带 `n=0` 分级退避环与 10s 无进展上界（与
+            // `SessionWriteHalf` 同款）⇒ 这里只做部分写的累进。
+            let n = self
+                .stream
+                .write_chunk(&data[off..])
+                .map_err(io_to_speedtest)?;
+            if n == 0 {
+                return Err(SpeedtestError::Frame("写通道长时间无进展".into()));
             }
-            zero_streak = 0;
-            off += w.n;
+            off += n;
         }
         Ok(())
     }
+
     fn read_some(&self) -> Result<Vec<u8>, SpeedtestError> {
-        match self.client.read(self.id) {
-            Ok(v) => Ok(v),
-            Err(ConnErr::Closed) => Ok(Vec::new()), // EOF
-            Err(e) => Err(SpeedtestError::Conn(e)),
-        }
+        // 空 Vec = EOF（`HostStream::read_chunk` 在 Closed 面给空块——与本 trait 同义）。
+        self.stream.read_chunk().map_err(io_to_speedtest)
     }
+
     fn kill(&self) {
-        let _ = self.client.close(self.id);
+        self.stream.close();
     }
 }
 
+/// `io::Error`（宿主会话流的终态面）→ 测速归因：kind 已是语义面（§2.7 R-4 单处
+/// 映射的产物）⇒ 本层只做类型搬运，不再嗅探文案。
+fn io_to_speedtest(e: std::io::Error) -> SpeedtestError {
+    match e.kind() {
+        std::io::ErrorKind::TimedOut => SpeedtestError::Timeout,
+        std::io::ErrorKind::ConnectionRefused => SpeedtestError::NotSupported,
+        _ => SpeedtestError::Frame(format!("宿主会话流：{e}")),
+    }
+}
+
+/// 由宿主会话拨一条测速流（本地/守护两形态共用的拨号腿）。
+///
+/// 归因（§2.5）：出口无该服务（`HostErr::Refused`）⇒ `NotSupported`（与首帧前
+/// EOF 的既有 not_supported 判据同族）；预算耗尽 ⇒ `Timeout`；其余 ⇒ `Conn`。
+pub fn dial_host_stream(
+    sess: &crate::facade::host_session::HostSession,
+    budget: Duration,
+) -> Result<std::sync::Arc<dyn SpeedConn>, SpeedtestError> {
+    match sess.connect(
+        crate::facade::host_session::ServicePort::speedtest(),
+        budget,
+    ) {
+        Ok(stream) => Ok(engine_conn_host(std::sync::Arc::new(stream))),
+        Err(e @ crate::facade::host_session::HostErr::Refused) => {
+            let _ = e;
+            Err(SpeedtestError::NotSupported)
+        }
+        Err(crate::facade::host_session::HostErr::Budget) => Err(SpeedtestError::Timeout),
+        Err(e) => Err(SpeedtestError::Conn(e)),
+    }
+}
+
+/// 跑完整一轮（下行 → 上行；读数由服务端 report 报）。拨号 = 宿主会话
+/// `STREAM[tag=3]`（每流一条服务流）。
+pub fn run_session(
+    sess: &crate::facade::host_session::HostSession,
+    params: Params,
+    logf: &dyn Fn(&str),
+) -> Result<SpeedtestResult, SpeedtestError> {
+    let dial = || dial_host_stream(sess, DIAL_BUDGET);
+    run_dial(&dial, params, logf, None, None)
+}
+
+/// 单流拨号预算（与守护 runner 的 `DIAL_BUDGET` 同值；引擎每轮拨 1–6 流）。
+const DIAL_BUDGET: Duration = Duration::from_secs(10);
+
+/// report 帧载荷的手解（pub = fuzz 可达面——服务端回包的自由 JSON 文本面）。
 enum FrameIn {
     /// data 帧：载荷已在读侧消耗丢弃，只回长度（下行零拷贝读路径）。
     Data {
@@ -485,7 +529,6 @@ pub(crate) fn unescape_minimal(s: &str) -> String {
     out
 }
 
-/// report 帧载荷的手解（pub = fuzz 可达面——服务端回包的自由 JSON 文本面）。
 pub fn parse_report(payload: &[u8]) -> Result<Report, SpeedtestError> {
     // 极小 JSON 面（三数字 + 可选 error 串）——手解避免 serde_json 进 core（依赖纪律）。
     let s = std::str::from_utf8(payload)
@@ -648,28 +691,6 @@ fn watchdog_cancellable(
     }
 }
 
-/// 跑完整一轮（下行 → 上行；读数由服务端 report 报）。拨号目标恒隧道 IP:7803。
-pub fn run(
-    client: &std::sync::Arc<Client>,
-    params: Params,
-    logf: &dyn Fn(&str),
-) -> Result<SpeedtestResult, SpeedtestError> {
-    // CLI 形态：拨号闭包 = ClientConn（每流一连接，直连引擎）；无进度出口消费方
-    let dial = || -> Result<std::sync::Arc<dyn SpeedConn>, SpeedtestError> {
-        let id = client
-            .connect(SocketAddrV4::new(
-                crate::wgcore::SERVER_TUNNEL_IP,
-                SPEEDTEST_PORT,
-            ))
-            .map_err(SpeedtestError::Conn)?;
-        Ok(std::sync::Arc::new(ClientConn {
-            client: std::sync::Arc::clone(client),
-            id,
-        }))
-    };
-    run_dial(&dial, params, logf, None, None)
-}
-
 /// App/CLI 双入口的引擎主体（拨号闭包形态——Go speed.Start(ctx, dial, params) 同构；
 /// 工单⑤ speedtest 接桥：App 形态的 dial = 本机测速桥〔UDS + 鉴权首包〕）。
 /// `cancel`：外部取消位（Cancel 导出面置位 → 看门狗分片轮询发现 → kill 全部连接，
@@ -729,7 +750,7 @@ pub fn run_dial(
     if timed_out.load(std::sync::atomic::Ordering::Acquire) {
         if let Err(e) = &body {
             if matches!(e, SpeedtestError::Conn(_) | SpeedtestError::Frame(_)) {
-                return Err(SpeedtestError::Conn(ConnErr::Timeout));
+                return Err(SpeedtestError::Timeout);
             }
         }
     }
@@ -811,7 +832,11 @@ fn run_phases(
                             if first_frame
                                 && matches!(
                                     e,
-                                    SpeedtestError::Conn(ConnErr::Closed)
+                                    SpeedtestError::Conn(
+                                        crate::facade::host_session::HostErr::Closed(_)
+                                    ) | SpeedtestError::Conn(
+                                        crate::facade::host_session::HostErr::NoFace
+                                    )
                                         | SpeedtestError::Frame(_)
                                 )
                             {
@@ -1127,7 +1152,7 @@ mod tests {
                         Some(t) => {
                             let now = Instant::now();
                             if now >= t {
-                                return Err(SpeedtestError::Conn(ConnErr::Timeout));
+                                return Err(SpeedtestError::Timeout);
                             }
                             std::thread::sleep(((t - now) / 4).max(Duration::from_millis(5)));
                         }
@@ -1166,11 +1191,11 @@ mod tests {
             None,
         );
         match r {
-            Err(SpeedtestError::Conn(ConnErr::Timeout)) => {}
+            Err(SpeedtestError::Timeout) => {}
             Err(SpeedtestError::NotSupported) => {
                 panic!("期限到点冒充 not_supported（Go exec-r1 L4 同款 bug）")
             }
-            other => panic!("形态一 hold：期望 Conn(Timeout)，实得 {other:?}"),
+            other => panic!("形态一 hold：期望 Timeout，实得 {other:?}"),
         }
 
         // 形态二 halfhold：下行正常收场（REPORT 即回），上行收口 report 缺席到点。
@@ -1194,11 +1219,11 @@ mod tests {
             )
         };
         match r2 {
-            Err(SpeedtestError::Conn(ConnErr::Timeout)) => {}
+            Err(SpeedtestError::Timeout) => {}
             Err(SpeedtestError::NotSupported) => {
                 panic!("收口期限到点冒充 not_supported（Go exec-r1 L4 同款 bug）")
             }
-            other => panic!("形态二 halfhold：期望 Conn(Timeout)，实得 {other:?}"),
+            other => panic!("形态二 halfhold：期望 Timeout，实得 {other:?}"),
         }
     }
 

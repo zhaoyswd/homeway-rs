@@ -4,10 +4,12 @@
 //! 状态机在 wait_ms 预算内承载（默认 60s，覆盖恢复阶梯最坏 ≈45s；长等待不占用控制面
 //! 请求）；引擎数据腿 = 拨号缝拨出口 7803 直连隧道（MUST NOT 经控制面流）。
 //!
-//! 注入缝错误契约：refused-like 判定与归因归本 runner——拨号错误按 `ConnErr::Refused`
-//! 哨兵分类产 `not_supported`（出口无 state 目录时 7803 不在 LocalServices、拦截回
-//! RST、连接未建立，MUST NOT 落进「链路未就绪 = 等 waitMs」一支空烧预算）；会话不在/
-//! 重建窗口 = link_down（waitMs 预算内保持 waiting 重试）。引擎只透传错误面。
+//! 注入缝错误契约：refused-like 判定与归因归本 runner——拨号错误按 `DialErr::Refused`
+//! 分类产 `not_supported`（出口无 state 目录时 7803 不在 LocalServices、拦截回
+//! RST/服务级拒绝、连接未建立，MUST NOT 落进「链路未就绪 = 等 waitMs」一支空烧预算）；
+//! 会话不在/重建窗口 = link_down（waitMs 预算内保持 waiting 重试）。引擎只透传错误面
+//! （M5 C2：`DialErr` 的映射源由 `ConnErr` 换为宿主会话 `HostErr`，见 `daemon/mod.rs`
+//! 的 `map_dial_err`）。
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, Ordering};
