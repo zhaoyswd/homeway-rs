@@ -139,6 +139,11 @@ struct Pending {
 /// 快探阶梯（§3.1/§3.2；岛线程独占——无锁）。
 pub(crate) struct Ladder {
     tun: ProbeTuning,
+    /// 阶梯起始时刻（**待机档首探的节拍基准**；§3.2-2：待机档 `PATROL_INTERVAL` 一拍）。
+    ///
+    /// 代码门 r18 ②-3 的修法：原实现把首拍判据写成 `in_use`（`last_round_at == None` 时
+    /// 只有在用档才探）⇒ **从未有出站流量的岛永不探首拍**，「待机档 60s 巡检」实质不存在。
+    started_at: TokioInstant,
     /// 上一拍（挂起空窗检测；§3.2-3）。
     last_tick: TokioInstant,
     /// 上一轮探活的开始时刻（节拍基准）。
@@ -178,6 +183,7 @@ impl Ladder {
     pub(crate) fn new(tun: ProbeTuning) -> Self {
         Self {
             tun,
+            started_at: TokioInstant::now(),
             last_tick: TokioInstant::now(),
             last_round_at: None,
             inflight: false,
@@ -244,8 +250,10 @@ impl Ladder {
     /// **挂起空窗**（拍间 > 2×待机节拍）= 进程被冻结过 ⇒ 立即探（§3.2-3 的「主动恢复」；
     /// 其动作由失败链给 M→R，与世代层的「挂起唤醒」行同拍）。
     ///
-    /// **首拍**：在用档**立即**探（用户在用时不该空等一个节拍）；待机档等满一个 60s 节拍
-    /// （照 §3.2-2 的电池口径；也避免「挂上 TUN 但无流量」的岛在后台被探活链扰动）。
+    /// **首拍**：在用档**立即**探（用户在用时不该空等一个节拍）；待机档自阶梯起算满一个
+    /// 60s 节拍即探（§3.2-2 的 `PATROL_INTERVAL` 口径）。**代码门 r18 ②-3 的修法**：
+    /// 旧实现写成 `None => in_use`（首拍只在用档才探）⇒「挂上 TUN 但无流量」的岛**永不探首拍**，
+    /// 待机档 60s 巡检实质不存在（与该注释声称的行为相反，且是真机待机长尾的成因之一）。
     pub(crate) fn due(&mut self, now: TokioInstant, in_use: bool) -> Option<(Round, Duration)> {
         let gap = now.saturating_duration_since(self.last_tick);
         self.last_tick = now;
@@ -261,7 +269,7 @@ impl Ladder {
             self.tun.idle_interval
         };
         let due = match self.last_round_at {
-            None => in_use,
+            None => in_use || now.saturating_duration_since(self.started_at) >= wait,
             Some(at) => now.saturating_duration_since(at) >= wait,
         };
         due.then_some((Round::First, self.tun.fast_budget))
@@ -397,6 +405,63 @@ impl Ladder {
         self.fail_step("连接已断".to_owned(), now, send, logf)
     }
 
+    /// **确认探活不可执行**（动作已做完，但岛上已无连接可探）⇒ 按「该动作失败」收线。
+    ///
+    /// **为什么必须单列（代码门 r18 ②-1 的修法）**：[`Self::on_link_dead`] 的 `inflight`
+    /// 早退是给「真在途的探活/动作」用的（让它自己收线，不并发动作）；但**动作已完成、
+    /// 只是确认轮发不出去**时，早退会让阶梯停在 `inflight=true` 且 `pending` 不清 ⇒
+    /// `due()` 恒 `None`、housekeeping 又因 `live == None` 不再命中 ⇒ **永久卡死**
+    /// （动作链再无出口，B 门不可达）。可达链：连接确定性死亡 ⇒ 首动作 R 失败 ⇒ 翻转 M
+    /// ⇒ `rebind` 成功（换本地 socket 恒成功）⇒ 确认探活无连接可发。
+    ///
+    /// 语义 = 「**确认不可执行 = 确认失败**」：M 在途 ⇒ 迁移未确认 ⇒ 走 R；
+    /// R 在途 ⇒ `r_failed`（进 B 门）。两者都不回 `Probe`（活性：动作仍必出）。
+    pub(crate) fn on_confirm_unavailable(
+        &mut self,
+        now: TokioInstant,
+        send: SendFace,
+        logf: &Logf,
+    ) -> Step {
+        match self.pending.take() {
+            Some(Pending {
+                action: Action::Migrate,
+                ..
+            }) => {
+                self.probe_ok = 0; // 无回显：清零仅为读数一致（不计成功）
+                self.next_action = Action::Reconnect;
+                self.go_action(
+                    Action::Reconnect,
+                    "迁移未确认（无连接可确认）".to_owned(),
+                    true,
+                    now,
+                    logf,
+                )
+            }
+            Some(Pending {
+                action: Action::Reconnect,
+                why,
+                ..
+            }) => self.r_failed(format!("{why}（无连接可确认）"), now, logf),
+            // 无在途动作（动作间隙的连接死）：按普通失败收（不新增面）
+            None => self.fail_step("无连接可确认".to_owned(), now, send, logf),
+        }
+    }
+
+    /// **动作链过长**的收线（代码门 r18 ②-1 的活性安全网）：一次**同步**执行链步数超限 ⇒
+    /// 判结构性问题（可构造：候选清单为空 × M/R 轮转，两者都在同步路径上，若不收线会变成
+    /// 岛线程自旋）⇒ 按 B 收（置休眠 + 保 `inflight=false`），宿主走既有 `Step::Rebuild`
+    /// 分支（上报不健康交世代层）。
+    pub(crate) fn force_rebuild(&mut self, steps: u32) -> Step {
+        self.dormant = true;
+        self.inflight = false;
+        self.pending = None;
+        self.last_action = "rebuild";
+        Step::Rebuild {
+            why: format!("动作链过长（同步 {steps} 步，连接/候选面结构性异常）"),
+            r_fails: self.r_fail_streak,
+        }
+    }
+
     /// M（Rebind）的结论回灌（宿主执行完 `Face::rebind` 后调）。
     ///
     /// ⚠️ 成败两分支的记账差别：**成功 ⇒ 保留 `pending`**（确认探活要认领它，从而分辨
@@ -420,10 +485,18 @@ impl Ladder {
     }
 
     /// R（新连接）的结论回灌（宿主起完连接任务后调）。
+    ///
+    /// **耗时口径（代码门 r18 ②-6 的修法）**：成功时**保留** `go_action` 记下的 `pending.at`
+    /// （= R 的**发起**时刻），不重设为完成时刻——C18 的 `链路重连完成（原因=…，耗时 %v）`
+    /// 要报的是「R 全周期（握手 + 四帧准入 + 确认探活）」，旧实现只报确认探活那一段
+    /// （落纸成 `耗时 0s`/`1ms`，排障会读成「重连只要 1ms」）。
     pub(crate) fn on_reconnect_result(&mut self, ok: bool, why: String, now: TokioInstant, logf: &Logf) -> Step {
         if ok {
             self.inflight = true; // 确认探活在途
-            self._set_pending(Action::Reconnect, why, now);
+            match self.pending.as_mut() {
+                Some(p) if p.action == Action::Reconnect => p.why = why,
+                _ => self._set_pending(Action::Reconnect, why, now),
+            }
             Step::Probe {
                 round: Round::Confirm,
                 budget: self.tun.fast_budget,
@@ -726,6 +799,129 @@ mod tests {
         // ④ R 失败 ⇒ 另一动作 M（翻转）
         let s = l2.on_reconnect_result(false, "对端不可达".to_owned(), t0, &logf2);
         assert!(matches!(s, Step::Migrate { .. }), "R 失败 ⇒ M（实得 {s:?}）");
+    }
+
+    /// **判据（待机档首探，§3.2-2；代码门 r18 ②-3 的修法）**：从未有出站流量（`in_use=false`）
+    /// 的岛，自阶梯起算满一个待机节拍（60s）**必须**探首拍；未到点不探。
+    /// 旧实现（`None => in_use`）下这一支恒 `None` ⇒ 待机档 60s 巡检不存在。
+    #[test]
+    fn standby_first_probe_fires_after_one_idle_interval() {
+        let mut l = Ladder::new(tuning());
+        let t0 = TokioInstant::now();
+        assert!(l.due(t0 + Duration::from_secs(59), false).is_none(), "未满一拍不探");
+        let due = l
+            .due(t0 + Duration::from_secs(60), false)
+            .expect("待机档满 60s 首探（§3.2-2）");
+        assert_eq!(due.0, Round::First);
+        assert_eq!(due.1, Duration::from_millis(700));
+        // 在用档仍**立即**探（首拍不空等）
+        let mut l2 = Ladder::new(tuning());
+        let t1 = TokioInstant::now();
+        assert!(l2.due(t1, true).is_some(), "在用档首拍立即探");
+        // 待机档按 60s 续拍（首探完成后进入节拍面）
+        l.note_round(Round::First, t0 + Duration::from_secs(60));
+        let _ = l.on_round(
+            Round::First,
+            ok(),
+            t0 + Duration::from_secs(60),
+            SendFace::default(),
+            &lines().0,
+        );
+        assert!(
+            l.due(t0 + Duration::from_secs(119), false).is_none(),
+            "待机档续拍仍按 60s"
+        );
+        assert!(l.due(t0 + Duration::from_secs(120), false).is_some(), "续拍到点");
+    }
+
+    /// **判据（确认探活不可执行 ⇒ 按动作失败收线；代码门 r18 ②-1）**：
+    /// ① 在途 M（`rebind` 成功但已无连接可确认）⇒ **迁移未确认** ⇒ 走 R（且该 R 承
+    ///    「迁移未确认」而来）；
+    /// ② 在途 R ⇒ 计 R 失败（进 B 门）；
+    /// ③ 无在途动作 ⇒ 按普通失败收（不得静默停在单飞态）。
+    #[test]
+    fn confirm_unavailable_is_accounted_as_action_failure() {
+        let (logf, _log) = lines();
+        let t0 = TokioInstant::now();
+        // ① M 在途（构造：直接置 pending + inflight，等价于 `on_migrate_result(true)` 之后）
+        let mut l = Ladder::new(tuning());
+        l.inflight = true;
+        l._set_pending(Action::Migrate, "连接已断".to_owned(), t0);
+        let s = l.on_confirm_unavailable(
+            t0 + Duration::from_millis(700),
+            SendFace::default(),
+            &logf,
+        );
+        match s {
+            Step::Reconnect {
+                after_migration_unconfirmed,
+                ..
+            } => assert!(after_migration_unconfirmed, "该 R 承「迁移未确认」而来"),
+            other => panic!("M 不可确认 ⇒ R，实得 {other:?}"),
+        }
+        assert!(l.inflight, "R 在途：单飞位须在位");
+        assert!(matches!(l.pending.as_ref().map(|p| p.action), Some(Action::Reconnect)));
+        // ② R 在途 ⇒ 计 R 失败（此处窗未满 ⇒ 走另一动作，但 r_fail_streak 必须增）
+        let s = l.on_confirm_unavailable(t0 + Duration::from_millis(800), SendFace::default(), &logf);
+        assert!(
+            matches!(s, Step::Migrate { .. } | Step::Rebuild { .. }),
+            "R 不可确认 ⇒ 计入 R 失败链（实得 {s:?}）"
+        );
+        assert_eq!(l.r_fail_streak, 1, "R 失败计数");
+        // ③ 无在途动作 ⇒ 普通失败（产物 = 动作，绝不是 Idle）
+        let mut l3 = Ladder::new(tuning());
+        assert!(!l3.inflight && l3.pending.is_none());
+        let s = l3.on_confirm_unavailable(t0, SendFace::default(), &logf);
+        assert!(
+            matches!(s, Step::Reconnect { .. } | Step::Migrate { .. } | Step::Rebuild { .. }),
+            "无在途动作也必须出动作（不得 Idle 静默），实得 {s:?}"
+        );
+    }
+
+    /// **判据（同步链安全网，代码门 r18 ②-1 的配套）**：`force_rebuild` ⇒ `Step::Rebuild`
+    /// + 休眠态（`due` 不再起轮、`on_link_dead` 不再动作）。
+    #[test]
+    fn chain_guard_forces_rebuild_and_stands_down() {
+        let mut l = Ladder::new(tuning());
+        let t0 = TokioInstant::now();
+        match l.force_rebuild(9) {
+            Step::Rebuild { why, .. } => assert!(why.contains("动作链过长"), "{why}"),
+            other => panic!("实得 {other:?}"),
+        }
+        assert!(!l.inflight, "不得留在单飞态");
+        assert!(l.due(t0 + Duration::from_secs(1), true).is_none(), "休眠：不再起轮");
+        assert_eq!(
+            l.on_link_dead(t0, SendFace::default(), &lines().0),
+            Step::Idle,
+            "休眠期连接死也不再动作（等世代重建/rearm）"
+        );
+    }
+
+    /// **判据（C18「耗时」口径，代码门 r18 ②-6）**：R 的耗时 = **发起 → 确认成功**
+    /// （不是确认探活那一段）；旧实现重设 `pending.at` 为完成时刻 ⇒ 落纸恒 `0s`/`1ms`。
+    #[test]
+    fn reconnect_elapsed_covers_dispatch_to_confirm() {
+        let (logf, log) = lines();
+        let mut l = Ladder::new(tuning());
+        let t0 = TokioInstant::now();
+        // go_action(R) 在 t0 发起（`pending.at = t0`）
+        let s = l.go_action(Action::Reconnect, "探活无回显".to_owned(), false, t0, &logf);
+        assert!(matches!(s, Step::Reconnect { .. }));
+        let at = l.pending.as_ref().expect("R 在途").at;
+        // 300ms 后连接完成 ⇒ 确认探活通过（用同一时间线）
+        let s = l.on_reconnect_result(true, "探活无回显".to_owned(), at, &logf);
+        assert!(matches!(s, Step::Probe { round: Round::Confirm, .. }));
+        assert_eq!(l.pending.as_ref().expect("确认在途").at, at, "发起时刻不得被覆盖");
+        l.note_round(Round::Confirm, at);
+        let _ = l.on_round(Round::Confirm, ok(), at + Duration::from_millis(300), SendFace::default(), &logf);
+        assert!(
+            log.lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.starts_with("quic: 链路重连完成（原因=探活无回显，耗时 300ms）")),
+            "耗时须覆盖「发起 → 确认成功」：{:?}",
+            log.lock().unwrap()
+        );
     }
 
     /// **判据（B 门，§3.1）**：**连续 2 次 R 失败 且 累计失败窗 ≥10s** ⇒ 世代重建；

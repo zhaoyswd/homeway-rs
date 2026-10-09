@@ -168,10 +168,11 @@ impl Island {
         let n_probe = apply_probe_env(&mut cfg.probe, &logf);
         let lim = cfg.streams;
         (*logf)(&format!(
-            "quic: 流面参数（bidi={} uni={} recv_window={}B send_window={}B 待发={}B；有效服务流 {}；env 覆盖 {n_streams} 项）",
+            "quic: 流面参数（bidi={} uni={} recv_window={}B conn_recv_window={}B send_window={}B 待发={}B；有效服务流 {}；env 覆盖 {n_streams} 项）",
             lim.max_bidi,
             lim.max_uni,
             lim.recv_window,
+            lim.conn_recv_window,
             lim.send_window,
             lim.pending_bytes,
             lim.service_capacity()
@@ -1254,15 +1255,25 @@ fn ladder_step(
     jobs: &mut JoinSet<Job>,
     mut step: LadderStep,
 ) {
+    // **同步链步数安全网**（代码门 r18 ②-1 的配套）：正常链 ≤2 步（M/R ⇒ 确认），但
+    // 「候选为空 × M/R 轮转」这类结构性异常会在同步路径上环回 ⇒ 超限即按 B 收（上报
+    // 不健康交世代层），**不得**让岛线程自旋或停在单飞态。
+    let mut steps: u32 = 0;
     loop {
+        steps += 1;
+        if steps > 8 {
+            step = st.ladder.force_rebuild(steps);
+        }
         match step {
             LadderStep::Idle => return,
             LadderStep::Probe { round, budget } => {
                 let Some(live) = st.live.as_ref() else {
-                    // 无连接（链路已死/动作间隙）：探活不可执行 ⇒ 按链路死收线，
-                    // 防「阶梯停在单飞态」（活性：动作仍必出）
+                    // 无连接（链路已死/动作间隙）：探活**不可执行** ⇒ 按该动作失败收线。
+                    // **不得**回灌 `on_link_dead`（其 `inflight` 早退会把阶梯永久停在
+                    // `inflight=true` 且 `pending` 不清 ⇒ `due()` 恒 None、housekeeping 又
+                    // 无 live 可命中 ⇒ 岛内动作链死绝——代码门 r18 ②-1 的正是此链）。
                     let send = send_face(face, st.ladder.tuning().send_err_fresh);
-                    step = st.ladder.on_link_dead(TokioInstant::now(), send, &ctx.logf);
+                    step = st.ladder.on_confirm_unavailable(TokioInstant::now(), send, &ctx.logf);
                     continue;
                 };
                 let conn = live.conn.clone();
