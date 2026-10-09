@@ -1,4 +1,0 @@
-{
-  "comment": "端点缓存落盘 JSON 字节钉子（与 Go endpointFile 序列化逐字节一致：键序=声明序、verifiedAt omitempty、i64 毫秒）。语义真源 baseline clientcore/internal/wtransport/endpointcache.go。",
-  "json": "{\"peer\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"entries\":[{\"endpoint\":\"203.0.113.9:41641\",\"source\":\"hint\",\"learnedAt\":1700000000123,\"verifiedAt\":1700000099876},{\"endpoint\":\"[2001:db8::1]:41641\",\"source\":\"probe\",\"learnedAt\":1700000099876}]}"
-}
