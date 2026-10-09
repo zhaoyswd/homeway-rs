@@ -47,11 +47,16 @@
 #          `wgcore|stackb|connect_deadline|healing_dial|Session` 零命中；且 `tun_exec.rs`
 #          的**桥拨号闭包块**（`BridgeHost::new(` → `set_dial_timeout(`）剥注释后
 #          `stackb::|wgcore::|connect_deadline|healing_dial` 零命中（块内自校准 =
-#          `quic_stream::dial` ≥1 且 `session_connect` ≥1——QUIC 分支与 WG 分支都在，
-#          QUIC 分支不触 WG 会话）；
+#          `quic_stream::dial` ≥1 **且** 端口→tag 缝 `tag_for_port` ≥1——块抽取范围对上了）；
+#          **M5 C3**：原「WG 分支在块内」的锚（`session_connect` ≥1）随 WG 面删除而删除
+#          ——单承载后块内只有一条腿，「零 WG 面引用」由 (c) 的零命中面直接判；
 #      (d) **pf 拨号缝块**（M4 §2.5）：`tun_exec.rs` 的 `fn pf_dial_via_run(` → 下一个行首 `}`
 #          剥注释后同上零命中；块内自校准 = `quic_stream::dial_target` ≥1 **且**
-#          `session_connect_target` ≥1（防「QUIC 分支不在」的空过）+ 块行数下界。
+#          分派判据 `l3_on_island()` ≥1（防「分派不在」的空过）+ 块行数下界；
+#      (e) **M5 C3 新增**：`stackb` 的**消费者面收窄**（设计 §7.1-⑦ 的 ⑪ 改写）——
+#          正向锚：`server/intercept/mod.rs` 必须真用 `stackb`（`TunDevice` 生产面）；
+#          反向：`crates/**` 其余文件（除 `stackb.rs` 本体、`lib.rs` 模块表与 `server/intercept/**`）
+#          剥注释后 `stackb` **零命中**（证明客户端生产消费者真退役，不是「还在用但没人提」）。
 #      **双向负例自检**：管线在 mktemp 样本上自校准（代码里的 `stackb::` 判得出 /
 #      注释里的判不出）；S6 另在真文件上注入一处可见引用复核「确定红」（记录见
 #      `docs/reviews/M3.md` S6 节）；M4 S3 同法复核 pf 拨号缝块（记录见 `M4.md`）。
@@ -474,10 +479,10 @@ BLOCK_LINES="$(wc -l < "$BLOCK_RAW" | tr -d ' ')"
 h="$(strip_rs "$BLOCK_RAW" | grep -nE "$STACKB_BLOCK_PATTERN" || true)"
 [[ -z "$h" ]] || fail $'桥拨号闭包块（QUIC 分支所在）出现 WG 面引用（剥注释后）：\n'"$h"
 B_QUIC="$(strip_rs "$BLOCK_RAW" | grep -cE 'quic_stream::dial' || true)"
-B_WG="$(strip_rs "$BLOCK_RAW" | grep -cE 'session_connect' || true)"
+B_TAG="$(strip_rs "$BLOCK_RAW" | grep -cE 'tag_for_port' || true)"
 rm -f "$BLOCK_RAW"
-(( B_QUIC >= 1 )) || fail "桥拨号闭包块内零 quic_stream::dial——QUIC 分支不在（⑪(c) 空过）"
-(( B_WG >= 1 )) || fail "桥拨号闭包块内零 session_connect——WG 保留分支不在（块抽取范围漂了）"
+(( B_QUIC >= 1 )) || fail "桥拨号闭包块内零 quic_stream::dial——服务流分支不在（⑪(c) 空过）"
+(( B_TAG >= 1 )) || fail "桥拨号闭包块内零 tag_for_port——块抽取范围漂了（⑪(c) 空过）"
 
 # (d) M4 S3：**pf 拨号缝块**（`fn pf_dial_via_run(` → 下一个行首 `}`）——零 WG 面引用；
 #     自校准 = 块内 QUIC 分支（`quic_stream::dial_target`）与 WG 分支（`session_connect_target`）
@@ -491,10 +496,24 @@ PF_LINES="$(wc -l < "$PF_BLOCK_RAW" | tr -d ' ')"
 h="$(strip_rs "$PF_BLOCK_RAW" | grep -nE "$STACKB_BLOCK_PATTERN" || true)"
 [[ -z "$h" ]] || fail $'pf 拨号缝块（M4 S2 的承载分派所在）出现 WG 面引用（剥注释后）：\n'"$h"
 P_QUIC="$(strip_rs "$PF_BLOCK_RAW" | grep -cE 'quic_stream::dial_target' || true)"
-P_WG="$(strip_rs "$PF_BLOCK_RAW" | grep -cE 'session_connect_target' || true)"
+P_DISPATCH="$(strip_rs "$PF_BLOCK_RAW" | grep -cE 'l3_on_island\(\)' || true)"
 rm -f "$PF_BLOCK_RAW"
-(( P_QUIC >= 1 )) || fail "pf 拨号缝块内零 quic_stream::dial_target——QUIC 分支不在（⑪(d) 空过）"
-(( P_WG >= 1 )) || fail "pf 拨号缝块内零 session_connect_target——WG 保留分支不在（块抽取范围漂了）"
+(( P_QUIC >= 1 )) || fail "pf 拨号缝块内零 quic_stream::dial_target——服务流分支不在（⑪(d) 空过）"
+(( P_DISPATCH >= 1 )) || fail "pf 拨号缝块内零 l3_on_island() 判据——块抽取范围漂了（⑪(d) 空过）"
+
+# (e) M5 C3：`stackb` 消费者面收窄——正向锚（intercept 真用）+ 反向（其余 crates 零命中）。
+SB_INTERCEPT_FILE="crates/homeway-core/src/server/intercept/mod.rs"
+SB_INTERCEPT="$(hits_rs "$REPO_ROOT/$SB_INTERCEPT_FILE" 'stackb::|TunDevice' | wc -l | tr -d ' ')"
+(( SB_INTERCEPT >= 1 )) || fail "intercept 面未消费 stackb（${SB_INTERCEPT} 命中）——⑪(e) 的正向锚空过（stackb 保留面消失？）"
+SB_STRAY=""
+while IFS= read -r f; do
+  case "$f" in
+    "$CRATES/homeway-core/src/stackb.rs"|"$CRATES/homeway-core/src/lib.rs"|"$CRATES/homeway-core/src/server/intercept/"*) continue ;;
+  esac
+  h="$(hits_rs "$f" 'stackb')"
+  [[ -n "$h" ]] && SB_STRAY+="${f}:"$'\n'"${h}"$'\n'
+done < <(all_crates_rs)
+[[ -z "$SB_STRAY" ]] || fail $'stackb 出现 intercept 之外的消费者（M5 C3 后生产消费者只应剩 intercept）：\n'"$SB_STRAY"
 
 # 管线自校准（fail-closed；双向）：代码里的 `stackb::` 判得出 / 注释里的判不出。
 STACKB_SAMPLE="$(mktemp -t hw-iso-stackb.XXXXXX)" || fail "mktemp 失败（⑪ 自校准无法进行）"
@@ -505,6 +524,6 @@ printf '// crate::wgcore::stackb::MTU 只出现在注释里\nfn doc_only() {}\n'
 h="$(hits_rs "$STACKB_SAMPLE" "$STACKB_ISLAND_PATTERN")"
 [[ -z "$h" ]] || fail $'⑪ 自校准失败：注释里的 stackb 被误判（剥注释状态机坏了）：\n'"$h"
 rm -f "$STACKB_SAMPLE"
-echo "  ⑪ 通过：QUIC 档零 stackb:: 可达引用（岛 manifest 零 homeway-core/stackb；岛源码 ${ISLAND_SRC_SCANNED} 文件剥注释后零 stackb|wgcore〔raw 面 ${ISLAND_RAW_HITS} 处注释引用自校准〕；拨号缝 quic_stream.rs + tun_exec 桥闭包块〔${BLOCK_LINES} 行；dial=${B_QUIC}/session_connect=${B_WG}〕+ pf 拨号缝块〔${PF_LINES} 行；dial_target=${P_QUIC}/session_connect_target=${P_WG}〕零 WG 面引用；管线自校准 2/2）"
+echo "  ⑪ 通过：QUIC 档零 stackb:: 可达引用（岛 manifest 零 homeway-core/stackb；岛源码 ${ISLAND_SRC_SCANNED} 文件剥注释后零 stackb|wgcore〔raw 面 ${ISLAND_RAW_HITS} 处注释引用自校准〕；拨号缝 quic_stream.rs + tun_exec 桥闭包块〔${BLOCK_LINES} 行；dial=${B_QUIC}/tag=${B_TAG}〕+ pf 拨号缝块〔${PF_LINES} 行；dial_target=${P_QUIC}/dispatch=${P_DISPATCH}〕零 WG 面引用；stackb 消费者收窄〔intercept ${SB_INTERCEPT} 处 / 其余 crates 零命中〕；管线自校准 2/2）"
 
 echo "QUIC 隔离门全绿（十一条断言：异步边界 / 阻塞面 / aws-lc / 跳过验证 / DATAGRAM 纪律 / 中继零异步名 / 单线程前提 / 命令循环零写等待 / QUIC 档零 stackb:: 可达引用）"

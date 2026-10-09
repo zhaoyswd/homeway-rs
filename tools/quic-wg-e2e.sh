@@ -1,26 +1,27 @@
 #!/bin/zsh
-# quic-wg-e2e.sh — M1 S3-1/S3-4 的本地全链证据（**本地私有出口，绝不碰现役实例**）。
+# quic-wg-e2e.sh — **单承载失败路径**的本地全链证据（**本地私有出口，绝不碰现役实例**）。
+#
+# **M5 C3 改写**：原「`_wg` 档全链」（A/B 开关的价值面）随 WG 面删除而退役；本脚本改为
+# 走**设计 §2.6-G9 的负例实测**——`--quic=false` 的出口发不出 QUIC 端点/RPK ⇒ 该 token
+# 在单承载下**必然失败**，且失败必须**可见**（不得静默、不得回落）。
 #
 # 做什么：
 #   ①起本地 Rust 出口（`EXIT_EXTRA_FLAGS=--quic=false`：QUIC 面**关闭**）；
 #   ②取出口 token，断言 **QUIC 面确实没起**（无 `quic: 端点就绪`/`UPnP：QUIC` 行、
 #     `cache/quic_listen_port.txt` 不存在）；
-#   ③跑 `crates/homeway-core/tests/quic_wg_e2e.rs` 两条 `#[ignore]` 用例（**串行**）：
-#     · `wg_bearer_full_chain_keeps_original_criterion_lines`：`transport=wg` 全链——
-#       L3 内层流量经 WG → 出口 intercept transit → 回环 echo → 回程；服务面（term 桥）
-#       经 WG 会话拨出口 `tunnel_ip:7724`（出口 `intercept: tcp exempt …（dialok）`）；
-#       C2/C4/C5/C6/C10/C15 **原串**在场、`quic:` 族行零输出；
-#     · `serve_quic_false_token_is_byte_identical_to_pre_m1`：token 无 QUIC 类/无 rpk
-#       尾字段 + 再编码逐字节等于原串（M1 前形态）。
+#   ③跑 `crates/homeway-core/tests/quic_wg_e2e.rs` 的 `#[ignore]` 用例：
+#     · `wg_only_token_generation_fails_visibly_without_fallback`：世代日志必须出现
+#       `quic: 岛未就用（…候选为空）`、状态面 `state=failed`、**零**回落/兜底话术、
+#       **零** A/B 开关行；failed 后 `tun_stop` 即收 0（放锁）。
 #   ④读数与证据行留到 /tmp（**仓外**，不污染工作树）。
 #
 # 用法：tools/quic-wg-e2e.sh [实例号]（缺省 1）
-# 读数：/tmp/m1s3-res/（SUMMARY.txt / wg-e2e.log / token-proof.log / exit-lines.txt / …）
+# 读数：/tmp/m5c3-g9-res/（SUMMARY.txt / g9-e2e.log / exit-lines.txt / quic-off-assert.txt）
 set -uo pipefail
 
 REPO_ROOT="${0:h:A:h}"
 n="${1:-1}"
-RES=/tmp/m1s3-res
+RES=/tmp/m5c3-g9-res
 EXIT_STATE="/tmp/homeway-rs-rustexit-$n"
 EXIT_LOG="$EXIT_STATE/stdout.log"
 QUIC_PORT_FILE="$EXIT_STATE/cache/quic_listen_port.txt"
@@ -85,29 +86,28 @@ run_one() {
       cargo test -p homeway-core --test quic_wg_e2e "$name" -- --ignored --nocapture --test-threads=1 ) \
     > "$out" 2>&1
   local r=$?
-  grep -E "^\[wg|^\[quic=false|^test result" "$out" || true
+  grep -E "^\[g9|^test result" "$out" || true
   return $r
 }
 
-run_one wg_bearer_full_chain_keeps_original_criterion_lines "$RES/wg-e2e.log" || rc=1
-run_one serve_quic_false_token_is_byte_identical_to_pre_m1 "$RES/token-proof.log" || rc=1
+run_one wg_only_token_generation_fails_visibly_without_fallback "$RES/g9-e2e.log" || rc=1
 
 # 出口侧本轮新增行（含 `peer: +` / `intercept: tcp exempt …`）
 tail -n +"$((LOG0 + 1))" "$EXIT_LOG" > "$RES/exit-lines.txt" 2>/dev/null || true
 
 {
-  echo "# M1 S3-1/S3-4 本地全链读数（$(date '+%F %T')）"
+  echo "# M5 C3 G9 负例实测（$(date '+%F %T')）"
   echo "# 出口实例 = $EXIT_STATE（日志：$EXIT_LOG；**--quic=false** 形态）"
-  echo "# 拓扑：ClientCore(tun, transport=wg) → WG 会话 → 出口（intercept/transit/term）"
-  echo "## serve.quic=false 断言"
+  echo "# 拓扑：ClientCore(tun) → 岛装配（候选=空）⇒ 可见失败（无回落承载）"
+  echo "## serve.quic=false 断言（出口侧：QUIC 面确实没起）"
   cat "$RES/quic-off-assert.txt"
-  echo "## 用例结论（run_one 汇总 exit code = $rc；0 = 两条都过；QUIC 面关闭断言 rc=$RC_OFF）"
-  grep -E "^\[wg|^\[quic=false|^test |^test result" "$RES/wg-e2e.log" "$RES/token-proof.log" 2>/dev/null || true
+  echo "## 用例结论（run_one 汇总 exit code = $rc；0 = 过；QUIC 面关闭断言 rc=$RC_OFF）"
+  grep -E "^\[g9|^test |^test result" "$RES/g9-e2e.log" 2>/dev/null || true
   echo "## 出口侧证据行（本轮新增）"
   grep -E "peer: \+|intercept: tcp|udp intercept|serve 就绪|quic: 面未启用" "$RES/exit-lines.txt" 2>/dev/null | head -20 || true
 } > "$RES/SUMMARY.txt"
 
-echo "==> 读数落 $RES/（SUMMARY.txt / wg-e2e.log / token-proof.log / exit-lines.txt / quic-off-assert.txt）"
+echo "==> 读数落 $RES/（SUMMARY.txt / g9-e2e.log / exit-lines.txt / quic-off-assert.txt）"
 cat "$RES/SUMMARY.txt"
 [[ $RC_OFF -eq 0 ]] || exit 1
 exit $rc

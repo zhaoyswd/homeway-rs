@@ -789,9 +789,10 @@ fn gen_loop(
         Ok(()) => {
             run.set_l3_on_island(true);
             // C2'（设计 §3.3）：L3 承载面就绪的那一行（去末半句「经 WG」——半句已随
-            // WG 面删除而不成立）。
+            // WG 面删除而不成立）。**`quic: ` 前缀保留**：去前缀是 §4.4 的批量条目
+            // （S4），本棒只改正文。
             (logf)(&format!(
-                "隧道侧就绪（L3 直通；隧道地址 {tunnel_ip}，后端隧道 IP {SERVER_TUNNEL_IP}）"
+                "quic: 隧道侧就绪（L3 直通；隧道地址 {tunnel_ip}，后端隧道 IP {SERVER_TUNNEL_IP}）"
             ));
         }
         Err(note) => {

@@ -43,9 +43,9 @@ getrandom = { version = "0.2", features = ["std"] }
 #  tier:tools/spikes/rust-ohos-poc/ring-shim/，**依赖组合勿改**——PoC 已实测）
 boringtun = "0.6"
 # 0.14 起 TCP 拥塞控制按算法 feature 门控（R8-8a：CUBIC——R6.6 的 CC 垫片即 CUBIC
-# 增长律，迁移后由上游 RFC 合规实现替代）。R8-2 加开 reno feature：真机归因消融
-# 对照臂（HOMEWAY_CC=reno——Go gVisor 默认 Reno，同机 A/B 消除算法差；不设即恒
-# CUBIC，产品行为不变）。
+# 增长律，迁移后由上游 RFC 合规实现替代）。R8-2 曾加开 reno feature 做真机归因消融
+# 对照臂（HOMEWAY_CC=reno）——该 env 已在 R8 收尾批删除、`crates/**` 零引用 ⇒ **M5 C3
+# 删除死 feature**（A 棒复核结论；CUBIC 为唯一算法，与 Go gVisor 的 Reno 差异为登记差异）。
 # Q-K F5-a/F5-c（2026-10-08）：`fragmentation-buffer-size-65536` 把 TX 分片缓冲从
 # 默认 1500 抬到 64 KiB（恢复 Go 能力——此前 >1472 载荷在客户端 TX 被静默丢，R4）；
 # `reassembly-buffer-count-8` 把入站重组并发槽从默认 1 抬到 8（并发大回复，F5-c）。
@@ -54,7 +54,6 @@ boringtun = "0.6"
 # F5-d（出口 TX 反重写分片感知），否则只是把「静默丢」换成「分片后校验和被写坏」。
 smoltcp = { version = "0.14", features = [
     "socket-tcp-cubic",
-    "socket-tcp-reno",
     "fragmentation-buffer-size-65536",
     "reassembly-buffer-count-8",
 ] }

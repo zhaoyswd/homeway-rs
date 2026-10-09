@@ -237,11 +237,15 @@ fn port_forward_rides_stream_dial_against_local_exit() {
         !tail.contains("intercept: tcp exempt"),
         "QUIC 档的 dial 流不得经 WG 服务腿（intercept 豁免臂）：{tail}"
     );
-    // 世代日志侧：N-d 档位行 = quic（本用例走真 QUIC 承载）+ pf 无失败
+    // 世代日志侧（M5 C3 单承载）：A/B 开关行（N-d）已删除 ⇒ 判据改「岛在位」+ 无回落话术
     let gen = std::fs::read_to_string(&gen_log).unwrap_or_default();
     assert!(
-        gen.lines().any(|l| l.contains("transport: 本世代 L3 承载 =") && l.contains("quic")),
-        "N-d 须声明 quic 档"
+        !gen.contains("transport: 本世代 L3 承载 ="),
+        "A/B 开关行（N-d）必须已删除"
+    );
+    assert!(
+        gen.contains("quic: 隧道侧就绪（L3 直通；") && !gen.contains("回落 WG"),
+        "岛须在位且不得有回落话术：{gen}"
     );
     let v: serde_json::Value = serde_json::from_str(&core.tun_status()).expect("JSON");
     assert_eq!(v["stats"]["pfAccepted"], 1, "准入 1 次：{v}");
