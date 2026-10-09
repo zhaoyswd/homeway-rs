@@ -90,14 +90,20 @@ pub enum RejectWhy {
     MacMismatch,
     /// 引擎裁决拒绝（时间窗 ±90s / 吊销 / 表满 / 地址冲突）——表内已打归因行 + 计数。
     EngineRejected,
+    /// **刷新帧的第三道前置**（设计 §1.4 步骤 6 ② / 设计门 r14 F25）：MAC 未验之前先看
+    /// 「表内仍在册」——设备已被淘汰（TTL/表满/显式摘除）时刷新帧必须被拒，否则表里一有
+    /// 空位它就会把设备重新 `Added`（**resurrect**：淘汰语义被一个刷新帧抹平）。
+    /// 本道拒绝**不落表、不进表内拒绝计数**（设备的淘汰归因已由 TTL/表满路径打过）。
+    RefreshNotRegistered,
 }
 
 impl RejectWhy {
-    /// 出口面 `准入被拒` 行的 `why` 文案（设计 §1.4-4.3 的两类落点）。
+    /// 出口面 `准入被拒` 行的 `why` 文案（设计 §1.4-4.3 的两类落点 + 刷新第三道前置）。
     pub fn text(self) -> &'static str {
         match self {
             Self::MacMismatch => "hr-reg4 MAC 不符——含换连接重放",
             Self::EngineRejected => "引擎裁决拒绝（见引擎侧归因行）",
+            Self::RefreshNotRegistered => "刷新帧但设备不在册（已淘汰，不 resurrect）",
         }
     }
 }

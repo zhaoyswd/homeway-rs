@@ -508,6 +508,10 @@ struct Stub {
     /// 收到的**帧类型**计数（proof / refresh——「nonce 类拒绝不投引擎」的负判据面）。
     proofs: AtomicU64,
     refreshes: AtomicU64,
+    /// 刷新帧的裁决改成「设备不在册」（S2-2 第三道前置的出口面接线用例：引擎侧的那道
+    /// 判定由真引擎用例 `admit_reg4_refresh_does_not_resurrect_evicted_device` 覆盖，
+    /// 这里只注入它的**裁决结果**）。
+    evict_refresh: AtomicBool,
     packets: Mutex<Vec<Vec<u8>>>,
 }
 
@@ -519,24 +523,42 @@ impl Stub {
             rejected: AtomicU64::new(0),
             proofs: AtomicU64::new(0),
             refreshes: AtomicU64::new(0),
+            evict_refresh: AtomicBool::new(false),
             packets: Mutex::new(Vec::new()),
         })
+    }
+
+    /// 注入「引擎判 = 刷新帧但设备不在册（已淘汰）」（S2-2 用例专用）。
+    fn evict_refresh(&self) {
+        self.evict_refresh.store(true, Ordering::SeqCst);
     }
 
     fn pump(&self, quic: &ExitQuic) {
         quic.drain_inbound(|item| match item {
             ExitInbound::Reg(req) => {
-                match req.frame {
-                    crate::Reg4Frame::Proof(_) => &self.proofs,
-                    crate::Reg4Frame::Refresh(_) => &self.refreshes,
+                let is_refresh = match req.frame {
+                    crate::Reg4Frame::Proof(_) => false,
+                    crate::Reg4Frame::Refresh(_) => true,
+                };
+                if is_refresh {
+                    self.refreshes.fetch_add(1, Ordering::SeqCst);
+                } else {
+                    self.proofs.fetch_add(1, Ordering::SeqCst);
                 }
-                .fetch_add(1, Ordering::SeqCst);
-                if req.frame.mac_matches(&self.secret, &req.exporter) {
+                // 第三道前置的注入：刷新帧一律按「设备不在册」拒（**不看 MAC**——该判定在
+                // 真引擎里先于 MAC 试秘，本桩复刻同一序）
+                let evicted = is_refresh && self.evict_refresh.load(Ordering::SeqCst);
+                if !evicted && req.frame.mac_matches(&self.secret, &req.exporter) {
                     self.accepted.fetch_add(1, Ordering::SeqCst);
                     req.reply(Reg4Verdict::Accepted { tunnel_ip: TUNNEL_IP, tun_ip: TUN_IP });
                 } else {
                     self.rejected.fetch_add(1, Ordering::SeqCst);
-                    req.reply(Reg4Verdict::Rejected { why: RejectWhy::MacMismatch });
+                    let why = if evicted {
+                        RejectWhy::RefreshNotRegistered
+                    } else {
+                        RejectWhy::MacMismatch
+                    };
+                    req.reply(Reg4Verdict::Rejected { why });
                 }
             }
             ExitInbound::Packet { pkt, .. } => self.packets.lock().unwrap().push(pkt),
@@ -1108,6 +1130,40 @@ async fn refresh_on_unbound_connection_is_rejected() {
     assert!(
         pump_until(&stub, &quic, || conn.close_reason().is_some(), WAIT).await,
         "未绑定刷新必须关连接"
+    );
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（S2-2 的第三道前置，出口面半边）**：引擎判「刷新帧但设备不在册（已淘汰）」⇒
+/// 出口面 ①按类型化 `why` 打归因行（可辨、fail-visible）②**关连接**（不 resurrect：连接
+/// 不会活着等下一拍刷新）；拒绝不计入 `regs_accepted`。
+#[tokio::test]
+async fn refresh_of_evicted_device_is_rejected_with_reason_and_closed() {
+    let (logf, rx) = sink();
+    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(49), 32), logf)
+        .expect("端点可起");
+    let stub = Stub::new(SECRET);
+    stub.evict_refresh();
+    let pubkey = [0xF3u8; 32];
+    let dev = [0xF4u8; 8];
+    let (_c, conn, _s) = client_conn(&quic).await;
+    // 准入（Proof 帧不受第三道前置约束）⇒ 绑定
+    let (mut send, _recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
+    assert_eq!(quic.snapshot().regs_accepted, 1, "准入那一次采纳");
+
+    // 刷新帧（帧内身份 == 绑定、MAC 合法）⇒ 仍被第三道前置拒
+    send_refresh(&conn, &mut send, &SECRET, &pubkey, &dev).await;
+    pump_until_line(&stub, &quic, &rx, "刷新帧但设备不在册", WAIT).await;
+    assert_eq!(
+        quic.snapshot().regs_accepted,
+        1,
+        "被拒刷新不得计入采纳（regs_accepted 不动）"
+    );
+    assert_eq!(stub.accepted(), 1, "只有准入那一次");
+    assert_eq!(stub.rejected(), 1, "刷新被拒一次");
+    assert!(
+        pump_until(&stub, &quic, || conn.close_reason().is_some(), WAIT).await,
+        "刷新被拒必须关连接（不 resurrect）"
     );
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }

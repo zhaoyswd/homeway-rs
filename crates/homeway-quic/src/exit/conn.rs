@@ -299,7 +299,8 @@ async fn admit(
 /// 在位；C15' 行由客户端面打（行文不变，M1 已登记）。
 ///
 /// **前置两道（零设备表查询）**：①连接已在本连接号上绑定 ②帧内 `pub/devTag` == 绑定。
-/// （设计 §1.4 步骤 6 的第三道「表内仍在册」在引擎侧裁决——`table.register` 的原路径。）
+/// 第三道「表内仍在册」（设计 §1.4 步骤 6 ② / r14 F25）需要设备表 ⇒ 在**引擎裁决**里判
+/// （`admit_reg4` 的 `Refresh` 分支，MAC 试秘之前），本条只负责把拒绝的 `why` 打出来 + 关连接。
 async fn refresh_loop(conn: &Connection, conn_id: u64, ctx: &FaceCtx, recv: &mut quinn::RecvStream) {
     let mut buf = [0u8; reg4::REFRESH_LEN];
     loop {

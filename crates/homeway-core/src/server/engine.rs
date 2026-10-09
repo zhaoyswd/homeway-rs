@@ -1531,6 +1531,9 @@ fn on_quic_inbound(
 /// 表满淘汰 / 地址冲突 / `peer: +`·`~`·`-` 判据行与拒绝计数）必须**逐字不变**——重建报文
 /// 让这些全部走原路径，`hr-reg4` 只多一层「哪条 secret 认得这一帧、且这一帧绑在本连接上」。
 ///
+/// **刷新帧多一道前置**（S2-2 / r14 F25）：`Refresh` 帧必须**表内仍在册**才继续（`device_addrs`
+/// 非空）——防「刷新帧跨过淘汰把设备 resurrect」；`Proof` 帧不走本道（完整准入 = 合法复位）。
+///
 /// **拒绝原因类型化**（r14 F7）：MAC 试秘在本函数内，出口面拿不到原因 ⇒ 由 verdict 携带
 /// （否则出口面打不出 `hr-reg4 MAC 不符` 这条归因行）。两类落点（r14 F1）：
 /// `MacMismatch` ⇒ 出口面 `hr-reg4 MAC 不符`；`EngineRejected` ⇒ 出口面 `引擎裁决拒绝` +
@@ -1544,7 +1547,17 @@ fn admit_reg4(
     quic: Option<&homeway_quic::ExitQuic>,
     dlogf: &Logf,
 ) -> homeway_quic::Reg4Verdict {
-    use homeway_quic::{Reg4Verdict, RejectWhy};
+    use homeway_quic::{Reg4Frame, Reg4Verdict, RejectWhy};
+
+    // **刷新帧的第三道前置（设计 §1.4 步骤 6 ② / 设计门 r14 F25）：表内仍在册。**
+    // 已淘汰（TTL/表满/显式摘除）设备的刷新帧若照走 `table.register`，表里一旦有空位它就会
+    // 把设备重新 `Added`——**resurrect**：淘汰语义被一个刷新帧抹平。故本道在 MAC 试秘之前
+    // （先问「还有没有这个设备」，再问「是不是你」），且拒绝**不落表、不进表内拒绝计数**
+    // （该设备的淘汰归因已由 TTL/表满路径打过，重复计数会污染 E9 的输入集）。
+    // 对照：完整准入（`Proof`）不受本道约束——那是**合法复位**路径（重新走四帧 + 判定）。
+    if matches!(frame, Reg4Frame::Refresh(_)) && table.device_addrs(&frame.dev_tag()).is_none() {
+        return Reg4Verdict::Rejected { why: RejectWhy::RefreshNotRegistered };
+    }
 
     let Some(secret) = table.match_proof(frame, exporter) else {
         // MAC 不符：不是本出口的 token，或**同一帧换了连接**（重放——exporter 变了）。
@@ -2799,6 +2812,77 @@ mod tests {
             lines_of(&lines).iter().any(|l| l.contains("refresh (idle=")),
             "刷新走表内 `peer: ~` 原路径"
         );
+    }
+
+    /// **判据（S2-2 的第三道前置 / 设计 §1.4 步骤 6 ② / r14 F25）**：刷新帧必须**表内仍在册**
+    /// ——已淘汰（GC 摘除）设备的刷新帧（MAC 完全合法、exporter 一致、ts 新鲜）必须被拒，
+    /// 且**不得把设备重新 Add 回表**（淘汰语义不被一个刷新帧抹平）；对照：完整准入（`Proof`）
+    /// 是**合法复位**路径，同一设备重新走四帧仍可登记。
+    #[test]
+    fn admit_reg4_refresh_does_not_resurrect_evicted_device() {
+        let (lines, logf) = line_sink();
+        let pubkey = [0x71u8; 32];
+        let dev_tag = [0x72u8; 8];
+        let exporter = [0x73u8; 32];
+        let ts = real_now_unix();
+        // 表：ttl = 1ms（能真回收），容量 4（不触发表满路径）
+        let mut table = DeviceTable::new(
+            vec![REG3_SECRET],
+            TableConfig { max_devices: 4, ttl: Duration::from_millis(1), ..Default::default() },
+            Arc::clone(&logf),
+        );
+        let mut device = dev();
+        let proof = reg4_proof(&REG3_SECRET, &pubkey, &dev_tag, &exporter, ts);
+        assert!(matches!(
+            admit_reg4(&proof, &exporter, &mut device, &mut table, None, &logf),
+            homeway_quic::Reg4Verdict::Accepted { .. }
+        ));
+        assert_eq!(table.len(), 1);
+
+        // 淘汰（TTL 回收）：表内已无该设备
+        let evicted = table.gc(SystemTime::now() + Duration::from_secs(1));
+        assert_eq!(evicted.len(), 1, "GC 必须真回收一条：{evicted:?}");
+        assert_eq!(table.len(), 0, "设备已不在册");
+
+        // 刷新帧（同 secret / 同 exporter / ts 在 ±90s 窗内）⇒ 仍必须被拒 + 不 resurrect
+        // （记行基线：只断言**本道拒绝**不新增表内行——`peer: +`/`peer: -` 是前两步的合法行）
+        let lines_before = lines_of(&lines).len();
+        let refresh = reg4_refresh(&REG3_SECRET, &pubkey, &dev_tag, &exporter, ts);
+        assert!(
+            refresh.mac_matches(&REG3_SECRET, &exporter),
+            "MAC 必须成立——本用例证的是「MAC 之外还有一道」"
+        );
+        let v = admit_reg4(&refresh, &exporter, &mut device, &mut table, None, &logf);
+        assert!(
+            matches!(
+                v,
+                homeway_quic::Reg4Verdict::Rejected {
+                    why: homeway_quic::RejectWhy::RefreshNotRegistered
+                }
+            ),
+            "已淘汰设备的刷新帧必须归 RefreshNotRegistered：{v:?}"
+        );
+        assert_eq!(table.len(), 0, "刷新帧不得把设备 Add 回表（resurrect）");
+        assert!(
+            table.reject_counts().is_empty(),
+            "本道拒绝不进表内拒绝计数（E9 输入集不被污染）：{:?}",
+            table.reject_counts()
+        );
+        let new_lines = lines_of(&lines)[lines_before.min(lines_of(&lines).len())..].to_vec();
+        assert!(
+            !new_lines
+                .iter()
+                .any(|l| l.starts_with("peer: + ") || l.contains("refresh (idle=")),
+            "被拒刷新不得打表内登记行（新增行应为空）：{new_lines:?}"
+        );
+
+        // 对照：**完整准入**（Proof）是合法复位路径 ⇒ 同一设备可重新登记
+        let v2 = admit_reg4(&proof, &exporter, &mut dev(), &mut table, None, &logf);
+        assert!(
+            matches!(v2, homeway_quic::Reg4Verdict::Accepted { .. }),
+            "完整准入必须仍可登记（resurrect 只许经四帧准入，不许经刷新帧）：{v2:?}"
+        );
+        assert_eq!(table.len(), 1, "完整准入后设备重新在册");
     }
 
     /// 时间窗**仍由 `table.register` 原路径承载**（重建 v2 报文的意义）：超窗的 Proof
