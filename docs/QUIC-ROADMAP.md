@@ -585,6 +585,14 @@ fixtures 向量逐字节不变；**客户端 QUIC 档零 `stackb::` 可达引用
 
 **退出口**：删除清单全清；判据登记全量同步；体积 / 内存终值入册。
 
+**红线首次触碰登记（2026-10-09，M5 A 棒）：**「中继零改动」在本程序期内**首次显式扩范围**——
+M5 的 S0/S0b 迁址连带触碰 `relay/**`：`relay/mod.rs`（import 1 + 同文件 74 处路径限定符
+`frame::`→`legframe::`）+ `relay/ctlface.rs`（import 1）+ `relaywire.rs`（import + 1 处测试内全路径）
+= **+64/−64 行，除路径限定符外零改动**（未碰组帧/`parse_listen`/`rl1`）；独立 commit `0c42d9e`
+（`docs/reviews/M5.md` §2.2 有逐行佐证）。另：S0 连带触碰 `server/intercept/**` 的 **2 个 import 行**
+（`wgcore::stackb` → `stackb`，迁址必连改动），除这 2 行外 intercept 零改动。**Q2 中继 v6 双栈仍按
+设计走 B 棒 S7a（独立小批 + `R1` 行登记）。**
+
 **§0 删码余量实测（2026-10-09，M5 设计门前置实验；读数仓外 `/tmp/m5lab/`）**：
 三 `git worktree` × 同一 `build-app-core.sh`/NDK strip 口径，四格矩阵（均有 20/20 符号门，评审独立复现）：
 
