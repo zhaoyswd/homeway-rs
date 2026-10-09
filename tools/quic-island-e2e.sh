@@ -67,8 +67,10 @@ run_one island_connects_registers_and_survives_rebind_against_local_exit "$RES/i
 run_one island_uses_relay_and_pushes_traffic_through_tun "$RES/relay-e2e.log" || rc=1
 # M1 S3-1：**世代级**（真产品路径）——ClientCore prepare/attach + TUN 流量经 QUIC DATAGRAM
 run_one generation_l3_rides_quic_datagram_against_local_exit "$RES/generation-e2e.log" || rc=1
+# M3 S2：**服务流**（tag=1 files）经真出口分发 → intake → 泵 → 真 FilesServer
+run_one service_stream_files_over_quic_against_local_exit "$RES/service-stream-e2e.log" || rc=1
 
-# 出口侧本轮新增行（含 `peer: +` / `quic: 连接采纳` / `quic: 路径变更`）
+# 出口侧本轮新增行（含 `peer: +` / `quic: 连接采纳` / `quic: 路径变更` / `quic: 服务流*`）
 tail -n +"$((LOG0 + 1))" "$EXIT_LOG" > "$RES/exit-lines.txt" 2>/dev/null || true
 if [[ -f "$RELAY_LOG" ]]; then
   tail -n +"$((RELAY_LOG0 + 1))" "$RELAY_LOG" > "$RES/relay-lines.txt" 2>/dev/null || true

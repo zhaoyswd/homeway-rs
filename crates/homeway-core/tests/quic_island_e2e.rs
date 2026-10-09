@@ -25,7 +25,7 @@ use homeway_core::identity::Identity;
 use homeway_core::token::{self, EndpointKind};
 use homeway_quic::{
     Candidate, Cmd, Island, IslandConfig, IslandCredential, IslandReply, RaceOutcome, RpkPublicKey,
-    TokenSecret, Via,
+    StreamErr, StreamId, StreamReply, StreamTag, TokenSecret, Via,
 };
 
 /// 日志/状态轮询上界（只判上界——flake 口径②）。
@@ -664,3 +664,198 @@ fn generation_l3_rides_quic_datagram_against_local_exit() {
     println!("[e2e3] done");
 }
 
+
+// ---------------------------------------------------------------------------
+// M3 S2：出口服务流受理（真出口实例上的 tag 分发 → intake → 泵 → 真服务）
+// ---------------------------------------------------------------------------
+
+/// 建一枚已连上本地出口的岛（S2a 的连接段的抽取版；只有本用例用它）。
+fn connect_local_exit() -> (Island, Vec<u8>) {
+    let token_str = std::env::var("HOMEWAY_ISLAND_E2E_TOKEN").expect("须给 HOMEWAY_ISLAND_E2E_TOKEN");
+    let tok = token::decode(&token_str).expect("token 可解");
+    let rpk = tok.rpk.expect("M1 的 token 必带出口 RPK");
+    let cands: Vec<Candidate> = tok
+        .endpoints
+        .iter()
+        .filter(|e| e.kind == EndpointKind::Quic)
+        .map(|e| {
+            let raw: SocketAddrV4 = e.addr.parse().expect("QUIC 端点地址可解");
+            Candidate {
+                addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw.port()),
+                via: Via::Direct,
+            }
+        })
+        .collect();
+    assert!(!cands.is_empty(), "token 必须带 QUIC 类端点");
+    let id = Identity::ephemeral().expect("临时身份");
+    let cred = IslandCredential::new(
+        TokenSecret::from_bytes(*tok.secret.as_bytes()),
+        id.public_key(),
+        *id.dev_tag().as_bytes(),
+        RpkPublicKey::from_bytes(*rpk.as_bytes()),
+    );
+    let mut cfg = IslandConfig::new(cred);
+    cfg.bind = Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    let island = Island::start(logf(), noop_unhealthy(), cfg).expect("岛可起");
+    let outcome: RaceOutcome = cmd(
+        &island,
+        |reply| Cmd::Connect {
+            cands,
+            budget: Duration::from_secs(5),
+            reply,
+        },
+        Duration::from_secs(10),
+    )
+    .expect("赛跑必须胜出（本地出口的 QUIC 端点）");
+    println!("[e2e4] race.winner={}", outcome.winner);
+    let dev = *id.dev_tag().as_bytes();
+    (island, dev.to_vec())
+}
+
+/// 发一条**流族**命令并**有界**取回（流族回执口是 `StreamReply<T>` = `Result<T, StreamErr>`，
+/// 与普通 `IslandReply` 不同型 ⇒ 独立小件；超时/岛死归 `StreamErr::Timeout`/`ConnectionLost`）。
+fn cmd_stream<T>(
+    island: &Island,
+    make: impl FnOnce(StreamReply<T>) -> Cmd,
+    wait: Duration,
+) -> Result<T, StreamErr> {
+    let (tx, rx) = mpsc::channel();
+    island
+        .tx()
+        .send(make(tx))
+        .map_err(|_| StreamErr::ConnectionLost)?;
+    match rx.recv_timeout(wait) {
+        Ok(Ok(v)) => Ok(v),
+        Ok(Err(e)) => Err(e),
+        Err(mpsc::RecvTimeoutError::Timeout) => Err(StreamErr::Timeout),
+        Err(mpsc::RecvTimeoutError::Disconnected) => Err(StreamErr::ConnectionLost),
+    }
+}
+
+/// 读服务流直到累积出完整一行（`\n` 结尾）；返回行（含 `\n`）。
+fn read_stream_line(island: &Island, id: StreamId, wait: Duration) -> Vec<u8> {
+    let deadline = Instant::now() + wait;
+    let mut acc: Vec<u8> = Vec::new();
+    while Instant::now() < deadline {
+        let left = deadline.saturating_duration_since(Instant::now());
+        match cmd_stream(
+            island,
+            |reply| Cmd::StreamRead { id, reply },
+            left.max(Duration::from_millis(50)),
+        ) {
+            Ok(chunk) => {
+                acc.extend_from_slice(&chunk);
+                if acc.contains(&b'\n') {
+                    return acc;
+                }
+            }
+            Err(e) => panic!("服务流读失败/超时：{e}（已收 {}B）", acc.len()),
+        }
+    }
+    panic!("服务流未在 {wait:?} 内给出完整行（已收 {}B）", acc.len());
+}
+
+/// **M3 S2 判据（真实出口实例上的服务流全链）**：岛经 QUIC 开 `STREAM[tag=files]` ⇒
+/// 出口分发（每流 task）→ socketpair 泵 → **真 FilesServer** ⇒ 问候行/应答行逐字节回到
+/// 客户端；客户端半关（`StreamShutdown`）⇒ 服务侧收线 ⇒ 客户端读得 EOF
+/// （`StreamErr::Closed`，= 今天的 EOF 语义）；出口日志新增 E-q5 行（受理/结束）。
+///
+/// 这条用例是 S3 换轨前的**出口侧真实入口**验收（客户端侧的服务流缝 S3 才接；本用例直接
+/// 驱动岛的命令面 `Cmd::StreamOpen/Write/Read/Shutdown`——协议面与 S3 将走的完全同一条）。
+#[test]
+#[ignore = "端到端：需本地出口在跑（tools/quic-island-e2e.sh 驱动）"]
+fn service_stream_files_over_quic_against_local_exit() {
+    let exit_log = PathBuf::from(
+        std::env::var("HOMEWAY_ISLAND_E2E_EXIT_LOG").expect("须给 HOMEWAY_ISLAND_E2E_EXIT_LOG"),
+    );
+    let log0 = log_lines(&exit_log);
+    let (island, dev) = connect_local_exit();
+
+    // ① 开 STREAM[tag=files]（tag 由岛写——协议面单源）
+    let id = cmd_stream(
+        &island,
+        |reply| Cmd::StreamOpen {
+            tag: StreamTag::Files,
+            reply,
+        },
+        WAIT,
+    )
+    .expect("开 tag=files 流");
+    println!("[e2e4] stream.id={id}");
+    // ② 问候行（服务端先发；逐字节）
+    let greet = read_stream_line(&island, id, WAIT);
+    let g: serde_json::Value = serde_json::from_slice(&greet).expect("问候行是 JSON");
+    assert_eq!(g["ok"], serde_json::json!(true), "问候：{g}");
+    assert_eq!(g["ver"], serde_json::json!(1), "files 协议版本：{g}");
+    assert!(
+        g["root"].as_str().is_some_and(|r| !r.is_empty()),
+        "问候须带 root：{g}"
+    );
+    println!("[e2e4] files.greeting={}", String::from_utf8_lossy(&greet).trim_end());
+
+    // ③ 一条 list 请求 ⇒ 应答行（同一流上；真服务在泵的另一端）
+    let req = br#"{"op":"list","path":""}"#;
+    let mut req_line = req.to_vec();
+    req_line.push(b'\n');
+    let mut sent = 0usize;
+    while sent < req_line.len() {
+        let out = cmd_stream(
+            &island,
+            |reply| Cmd::StreamWrite {
+                id,
+                data: req_line[sent..].to_vec(),
+                reply,
+            },
+            WAIT,
+        )
+        .expect("写请求行");
+        assert!(out.n > 0, "背压回执 n=0 不该在空闲流上出现");
+        sent += out.n;
+    }
+    let resp = read_stream_line(&island, id, WAIT);
+    let r: serde_json::Value = serde_json::from_slice(&resp).expect("应答行是 JSON");
+    assert_eq!(r["ok"], serde_json::json!(true), "list 应答：{r}");
+    assert!(r["entries"].is_array(), "list 应答须带 entries：{r}");
+    println!(
+        "[e2e4] files.list_entries={}",
+        r["entries"].as_array().map(|a| a.len()).unwrap_or(0)
+    );
+
+    // ④ 半关（客户端 FIN）⇒ 服务侧 read_line 收线 ⇒ 我方读到 EOF
+    cmd_stream(&island, |reply| Cmd::StreamShutdown { id, reply }, WAIT).expect("半关写半边");
+    let eof = cmd_stream(
+        &island,
+        |reply| Cmd::StreamRead { id, reply },
+        Duration::from_secs(10),
+    );
+    assert!(
+        matches!(eof, Err(StreamErr::Closed)),
+        "半关后应收 EOF（StreamErr::Closed），实得 {eof:?}"
+    );
+    cmd_stream(&island, |reply| Cmd::StreamClose { id, reply }, WAIT).expect("关流");
+
+    // ⑤ 出口侧 E-q5 行（受理 + 结束）与本设备短指纹
+    let dev4 = hex4(&dev);
+    let accepted = wait_log_from(&exit_log, log0, "服务流已受理（tag=files", Some(&dev4), WAIT)
+        .unwrap_or_else(|| "（无受理行）".into());
+    assert!(accepted.contains("tag=files"), "出口须记受理行：{accepted}");
+    println!("[e2e4] exit.accepted_line={accepted}");
+    let closed = wait_log_from(&exit_log, log0, "服务流结束（tag=files", None, WAIT)
+        .unwrap_or_else(|| "（无结束行）".into());
+    assert!(closed.contains("↑"), "结束行须带逐向字节：{closed}");
+    println!("[e2e4] exit.closed_line={closed}");
+
+    // ⑥ 关流后的岛快照（服务流计数面；`Island::snapshot` 是同步轮询口）
+    let snap: homeway_quic::IslandSnapshot = island.snapshot();
+    println!(
+        "[e2e4] island.streams_open={} streams_refused={} bytes_in={} bytes_out={}",
+        snap.streams_open, snap.streams_refused, snap.stream_bytes_in, snap.stream_bytes_out
+    );
+    assert!(snap.streams_open >= 1, "岛侧在册服务流计数：{snap:?}");
+    println!("[e2e4] done");
+}
+
+/// 8B devTag 的前 4B hex（与出口行 `dev=%s` 同款——`bridge::dev_short` 同口径）。
+fn hex4(dev: &[u8]) -> String {
+    dev.iter().take(4).map(|b| format!("{b:02x}")).collect()
+}
