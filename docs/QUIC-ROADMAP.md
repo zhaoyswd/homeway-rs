@@ -510,6 +510,15 @@ fixtures 向量逐字节不变；客户端依赖树不再含 smoltcp（脚本验
   （隔离复跑绿、与 M1 改动面无交集）。**flake 口径照 M0 §9.2 ④**（红了先隔离单跑再判回归；**不静默重跑**）。
   另：M1 收口期间新增的两条用例（岛回程泵身份防重 / 消费者已退归因）已做**负例有效性**验证
   （旧语义确定性红），不属 flake 面。
+- **本程序新增（M2 实现时登记，2026-10-09）**：`client::tests::send_buffer_used_grows_under_load`
+  （S2-5 新增用例；全量并行跑红 2/2 含干净树基线、隔离复跑 13 次 1 红 ⇒ 负载/时序敏感，
+  **不作回归判据**，红了先隔离复跑）。既登记族复现：`daemon::tests::server_bad_frame_gets_goodbye_and_disconnect`
+  （M2 S2 批实测 1 红、隔离复跑同二进制内翻转 = 已在册签名）。
+- **工具坑登记（M2 实测，防后续棒踩）**：①`tools/quic-island-e2e.sh` 与 `tools/quic-wg-e2e.sh`
+  **共用实例号 state**（`/tmp/homeway-rs-rustexit-1`）且 `serve token` 读台账末行 ⇒ 先跑 island
+  再跑 wg 会读到上一轮铸的 token 而**假红**；解法 = wg 跑前先 `tools/local-rust-exit.sh wipe 1`。
+  ②`tools/local-rust-exit.sh start` 在 `target/release/homeway-cli` 存在时**不重建** ⇒ 改完核必须先
+  `cargo build --release -p homeway-cli` 再起实例，否则跑到旧二进制（现象 = 新行/新配置缺席）。
 
 ## 附录 A：实验台与原始数据（2026-10-08）
 
