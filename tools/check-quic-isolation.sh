@@ -58,11 +58,15 @@ LOCK="$REPO_ROOT/Cargo.lock"
 # 同目录下的纯 std 文件（如 `exit/transport.rs`、`client/migration.rs`），故不用。
 ASYNC_FILES=(
   "driver.rs"
-  "client/mod.rs" "client/race.rs" "client/register.rs" "client/migration.rs"
+  "client/mod.rs" "client/race.rs" "client/register.rs"
   "client/dataplane.rs" "client/relay_sock.rs" "client/tests.rs"
   "exit/mod.rs" "exit/conn.rs" "exit/socket.rs" "exit/bridge.rs"
   "exit/rpk.rs" "exit/transport.rs" "exit/tests.rs"
 )
+# 异步名的判定式（②条、豁免自证、扫描器自校准**共用同一串**——三处不同步 = 门自相矛盾）。
+# **代码门 r15 G1 整改**：`client/migration.rs` 原在清单里但它**零异步名**（纯逻辑小件，
+# 与 `exit/transport.rs` 不同）⇒ 移出清单，改由 ② 条真扫描（移出后 ② 仍绿 ⇒ 证明它确实纯 std）。
+ASYNC_NAME_PATTERN='tokio::|quinn|rustls|async fn|\.await'
 # 第 ⑤/⑥ 条：RPK 钉定的唯一合法文件（相对 $REPO_ROOT）、其「真做签名验证」证据，
 # 以及两个 `send_datagram_checked` 包装（相对 $REPO_ROOT）。
 RPK_VERIFIER_FILE="crates/homeway-quic/src/exit/rpk.rs"
@@ -193,7 +197,7 @@ for f in "${(@f)$(find "$SRC" -name '*.rs' | sort)}"; do
     continue
   fi
   SCANNED=$(( SCANNED + 1 ))
-  h="$(hits_rs "$f" 'tokio::|quinn|rustls|async fn|\.await')"
+  h="$(hits_rs "$f" "$ASYNC_NAME_PATTERN")"
   [[ -n "$h" ]] && BAD_SRC+="${f}:"$'\n'"${h}"$'\n'
 done
 [[ -z "$BAD_SRC" ]] || fail $'岛内公面/协议/小件文件出现异步栈名字（只许清单内的异步面文件）：\n'"$BAD_SRC"
@@ -202,12 +206,35 @@ for rel in "${ASYNC_FILES[@]}"; do
   [[ -f "$SRC/$rel" ]] || NOT_LISTED+="  $rel"$'\n'
 done
 [[ -z "$NOT_LISTED" ]] || fail $'异步面清单指向不存在的文件（改名/删除后必须同批改门）：\n'"$NOT_LISTED"
+# **豁免自证**（fail-closed；代码门 r15 G1 整改，= 设计 S2-4「双向负例自检」的第①向）：
+# 清单里的每个文件必须**真含**异步栈名字——否则「往白名单塞一个纯 std 文件」= 静默放宽
+# （原门只查存在性与计数下限，往清单里加 `exit/admit.rs` 实测**仍全绿**）。纯 std 文件
+# 必须移出清单、由 ② 条真扫描。
+BAD_EXEMPT=""
+for rel in "${ASYNC_FILES[@]}"; do
+  n="$(hits_rs "$SRC/$rel" "$ASYNC_NAME_PATTERN" | wc -l | tr -d ' ')"
+  (( n >= 1 )) || BAD_EXEMPT+="  $rel"$'\n'
+done
+[[ -z "$BAD_EXEMPT" ]] || fail $'异步面清单里的文件零异步名（豁免只许给真异步文件；纯 std 文件须移出清单受 ② 条扫描）：\n'"$BAD_EXEMPT"
+# 扫描器自校准（fail-closed）：同一 strip+regex 管线必须「判得出真异步名、放过纯 std、
+# 不认注释里的名字」——否则 ② 条可能整体空过（如剥注释状态机坏了 ⇒ 全员零命中）。
+SELFTEST_RS="$(mktemp -t hw-iso-selftest.XXXXXX)" || fail "mktemp 失败（自校准无法进行）"
+printf 'fn pure_std() { let _ = std::collections::HashMap::new(); }\n' > "$SELFTEST_RS"
+h="$(hits_rs "$SELFTEST_RS" "$ASYNC_NAME_PATTERN")"
+[[ -z "$h" ]] || fail $'扫描器自校准失败：纯 std 样本被误判：\n'"$h"
+printf 'fn uses_async() { let _ = tokio::runtime::Runtime::new(); }\n' > "$SELFTEST_RS"
+h="$(hits_rs "$SELFTEST_RS" "$ASYNC_NAME_PATTERN")"
+[[ -n "$h" ]] || fail "扫描器自校准失败：含 tokio:: 的样本未被判出（②条可能空过）"
+printf '// 注释里的 tokio:: 不算名字\nfn doc_only() {}\n' > "$SELFTEST_RS"
+h="$(hits_rs "$SELFTEST_RS" "$ASYNC_NAME_PATTERN")"
+[[ -z "$h" ]] || fail $'扫描器自校准失败：注释中的异步名被误判（剥注释状态机坏了）：\n'"$h"
+rm -f "$SELFTEST_RS"
 # 扫描面下限自校准（防空过；M1 S6-2 由 4/2 上调到实测量级）
 (( SCANNED >= 8 )) || fail "扫描到的公面源文件数异常（${SCANNED} < 8）——检查 find/排除逻辑，门可能空过"
 (( ASYNC_SCANNED >= 12 )) || fail "异步面文件数异常（${ASYNC_SCANNED} < 12）——清单可能被改窄成空过"
 DRIVER_HITS="$(hits_rs "$SRC/driver.rs" 'tokio::' | wc -l | tr -d ' ')"
 (( DRIVER_HITS >= 1 )) || fail "driver.rs 零 tokio:: 命中——门自身失准（宿主必须用 runtime）"
-echo "  ② 通过：tokio/quinn/rustls/async/.await 只出现在异步面（异步面清单 ${ASYNC_SCANNED} 个文件；公面递归扫过 ${SCANNED} 个文件，零命中）"
+echo "  ② 通过：tokio/quinn/rustls/async/.await 只出现在异步面（异步面清单 ${ASYNC_SCANNED} 个文件；公面递归扫过 ${SCANNED} 个文件，零命中；豁免自证 ${#ASYNC_FILES[@]}/${#ASYNC_FILES[@]}、扫描器自校准 3/3）"
 
 # ---------- ③ 阻塞面：零 sleep；block_on 只在异步面 ----------
 BAD_SLEEP=""
