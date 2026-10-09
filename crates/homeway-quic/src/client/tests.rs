@@ -1941,7 +1941,10 @@ async fn return_pump_reports_write_thread_gone_and_stops() {
     drop(peer);
 
     let pkt = inner_pkt(TUNNEL_IP, TUN_IP);
-    for _ in 0..64 {
+    // ⚠️ 包量必须**压满 TUN socketpair 缓冲**：否则写线程前若干次写全部成功（被缓冲吸收）、
+    // 不报错也不退出 ⇒ 本用例的前提（消费者已死）在慢/高负载 runner 上不成立（macOS CI 实测红）。
+    // 2,048 × 1,280B ≈ 2.6MB ≫ 缓冲（典型 200KB 级）⇒ 写必失败、写线程必退，平台/负载无关。
+    for _ in 0..2048 {
         let _ = quic.send_to_pub(&PUBKEY, &pkt);
     }
     assert!(
