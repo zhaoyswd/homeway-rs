@@ -154,6 +154,9 @@ pub(crate) struct SockStats {
     pub(crate) send_errs_local: u64,
     /// 末次**白名单**错误的时刻（新鲜度窗的源；`rebind` 清零 ⇒ `None`）。
     pub(crate) last_local_send_err_at: Option<std::time::Instant>,
+    /// 末次**白名单**错误的 **errno**（`kind` 的落纸形态：N5 要求「末次错误 kind/时刻」
+    /// 可读——判据行/快照都能说清是 `ENETUNREACH` 还是 `EADDRNOTAVAIL`；`rebind` 清零）。
+    pub(crate) last_local_send_err_errno: Option<i32>,
 }
 
 impl SockStats {
@@ -164,6 +167,7 @@ impl SockStats {
     pub(crate) fn clear_local_send_err(&mut self) {
         self.send_errs_local = 0;
         self.last_local_send_err_at = None;
+        self.last_local_send_err_errno = None;
     }
 
     /// 本机发送面是否**新鲜报错**（M 判据；`now` 由调用方给——纯函数可测）。
@@ -217,6 +221,7 @@ pub(crate) fn note_send_err(st: &mut SockStats, e: &std::io::Error, now: std::ti
             st.send_errs += 1;
             st.send_errs_local += 1;
             st.last_local_send_err_at = Some(now);
+            st.last_local_send_err_errno = e.raw_os_error();
         }
         SendErrClass::Other => st.send_errs += 1,
     }
@@ -548,10 +553,12 @@ mod tests {
         assert_eq!(st.send_errs, 2);
         assert_eq!(st.send_errs_local, 1, "Other 不进白名单计数");
 
-        // rebind 清零：白名单面归零（新鲜度位 None），总量保留（累计读数是排障面）
+        assert_eq!(st.last_local_send_err_errno, Some(libc::ENETUNREACH), "末次 errno 可读（N5 的 kind）");
+        // rebind 清零：白名单面归零（新鲜度位与 errno 都 None），总量保留（累计读数是排障面）
         st.clear_local_send_err();
         assert_eq!(st.send_errs_local, 0);
         assert!(st.last_local_send_err_at.is_none());
+        assert!(st.last_local_send_err_errno.is_none());
         assert!(!st.local_send_err_fresh(t0, win), "清零后不得再判新鲜");
         assert_eq!(st.send_errs, 2, "总量是累计读数（不清）");
     }

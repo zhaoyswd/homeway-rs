@@ -800,6 +800,7 @@ async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx, seam: 
         s.sock_send_errs = ev.total;
         s.sock_send_errs_local = ev.local;
         s.sock_send_err_age_ms = ev.age.map(|d| d.as_millis() as u64);
+        s.sock_send_err_last_errno = ev.last_errno;
         s.sock_send_err_local_fresh = ev.fresh;
     }
     // ⑤ 「窄路径不可用」判据（mds 变小/连接换过都要重判；S2-4）

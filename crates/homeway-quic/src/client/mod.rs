@@ -62,6 +62,8 @@ pub(crate) struct SendErrView {
     pub local: u64,
     /// 末次白名单错误距今（`None` = 无/已清零）。
     pub age: Option<Duration>,
+    /// 末次白名单错误的 **errno**（`kind` 的落纸形态；判据行/快照用）。
+    pub last_errno: Option<i32>,
     /// 是否**新鲜**（窗内命中 ⇒ M（本机发送面错误）成立的证据）。
     pub fresh: bool,
 }
@@ -177,6 +179,7 @@ impl Face {
             total: s.send_errs,
             local: s.send_errs_local,
             age: s.last_local_send_err_at.map(|t| now.saturating_duration_since(t)),
+            last_errno: s.last_local_send_err_errno,
             fresh: s.local_send_err_fresh(now, window),
         }
     }

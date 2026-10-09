@@ -400,6 +400,8 @@ pub struct IslandSnapshot {
     /// **新鲜的**白名单命中（落在 `ProbeTuning::send_err_fresh` 窗内）⇒ **M（Rebind）**
     /// 动作的判据位（§3.1 的 M/R 判别：本机发送面报错 ⇒ M；无错 ⇒ R）。
     pub sock_send_err_local_fresh: bool,
+    /// 末次**白名单**错误的 errno（N5 的「末次错误 kind」；`None` = 无/已随 rebind 清零）。
+    pub sock_send_err_last_errno: Option<i32>,
     /// 末次**白名单**错误距本快照的毫秒数（`None` = 无/已随 rebind 清零）。
     ///
     /// 新鲜度窗由消费侧（S4）按 `ProbeTuning::send_err_fresh` 判——本字段只出「多久以前」，
