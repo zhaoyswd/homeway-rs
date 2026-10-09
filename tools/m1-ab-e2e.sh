@@ -192,9 +192,12 @@ kill "$ECHO_PID" 2>/dev/null || true
 # M1 收口用产品形态（岛 + 客户端）复测」⇒ 本段：同进程（m1-ab = ClientCore 世代）
 # 两档各采一次 vmmap physical footprint（**不是 ps RSS**，M0 口径），增量 = 岛边际。
 sample_fp() {
+  # **单位归一到 K**（S5 L1 修复）：`vmmap` 在 ≥10MB 时打 `10.3M`、否则 `1234K`——
+  # 只 strip 非数字会把 10.3M 读成 103。本段目标（m1-ab 产品形态）实测 2–3MB < 10MB
+  # ⇒ 走 K 分支，**已登记读数逐字节不变**；归一只为防目标涨到 10MB+ 时误读。
   local pid="$1" n="$2"; local -a s=(); local f
   for _ in $(seq 1 $n); do
-    f=$(vmmap -summary "$pid" 2>/dev/null | awk '/Physical footprint:/{gsub(/[^0-9]/,"",$3); print $3; exit}')
+    f=$(vmmap -summary "$pid" 2>/dev/null | awk '/Physical footprint:/{v=$3; if (v ~ /M$/) { gsub(/M$/,"",v); printf "%.0f", v*1024 } else { gsub(/K$/,"",v); printf "%.0f", v }; exit}')
     [[ -n "$f" ]] && s+=("$f")
     sleep 0.5
   done

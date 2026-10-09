@@ -349,15 +349,28 @@ cmd_size() {
 }
 
 # ---------- mem ----------
+# footprint 采样器（**单位归一到 K**）：`vmmap -summary` 在 <10MB 时打 `1234K`、≥10MB 时打
+# `10.3M` ⇒ 「strip 非数字」会把 10.3M 读成 103（S5 L1 实测踩过：产品出口 10MB+）。
+# 本函数对两种单位都归一为 K。**不影响已登记读数**：M0/M1/M2 的 quic-ab 各臂目标
+# （探针档 raw/wg/wg-ring/quic、multiconn 32 点、conns-load）footprint 全 <10MB（最大
+# 3616K）⇒ 走的是 K 分支，数值逐字节不变（S6 复验见 docs/reviews/M2.md）。
 sample_footprint() {  # sample_footprint <pid> <n> → 采样 K 值（换行分隔）
   local pid="$1" n="$2" s=()
   for _ in $(seq 1 $n); do
     local f=""
-    f=$(vmmap -summary "$pid" 2>/dev/null | awk '/Physical footprint:/{gsub(/[^0-9]/,"",$3); print $3; exit}')
+    f=$(footprint_k "$pid")
     [[ -n "$f" ]] && s+=("$f")
     sleep 0.5
   done
   printf '%s\n' "${s[@]}"
+}
+# vmmap -summary 的 Physical footprint（**非 peak**）→ K 值；parse 失败回显空。
+footprint_k() {
+  vmmap -summary "$1" 2>/dev/null | awk '/Physical footprint:/{v=$3; if (v ~ /M$/) { gsub(/M$/,"",v); printf "%.0f", v*1024 } else { gsub(/K$/,"",v); printf "%.0f", v }; exit}'
+}
+# 同上但取 `Physical footprint (peak):`（第 4 字段）——mem-load 臂用。
+footprint_peak_k() {
+  vmmap -summary "$1" 2>/dev/null | awk '/Physical footprint \(peak\):/{v=$4; if (v ~ /M$/) { gsub(/M$/,"",v); printf "%.0f", v*1024 } else { gsub(/K$/,"",v); printf "%.0f", v }; exit}'
 }
 start_idle_client() {  # start_idle_client <arm> <prof-dir> <idle_secs> <srvlog> → 回显 "pid port"
   local arm="$1" p="$2" idle="$3" srvlog="$4"
@@ -442,8 +455,8 @@ mem_load() {  # peak_probe.sh 口径：N=300000 传输中每 250ms 采样 max + 
       sleep 0.25
       ps -o rss= -p "$cpid" >/dev/null 2>&1 || break
       local f="" pk=""
-      f=$(vmmap -summary "$cpid" 2>/dev/null | awk '/Physical footprint:/{gsub(/[^0-9]/,"",$3); print $3; exit}')
-      pk=$(vmmap -summary "$cpid" 2>/dev/null | awk '/Physical footprint \(peak\):/{gsub(/[^0-9]/,"",$4); print $4; exit}')
+      f=$(footprint_k "$cpid")
+      pk=$(footprint_peak_k "$cpid")
       [[ -n "$f" ]] && (( f > max )) && max=$f
       [[ -n "$pk" ]] && (( pk > peak )) && peak=$pk
     done
