@@ -201,4 +201,170 @@ TUN socketpair + 合成 UDP 流，`--rate 0 --window 64 --secs 8` = 容量档）
 
 ---
 
-<!--PART2 待 S8 第二 commit 追加（真机 R1–R7 + 收口门 + 副作用）-->
+## 3. S8-C 真机验证（R1–R7；设备 `FMR0224116011480`）
+
+### 3.0 前置（出包/装机/承载/版本事实）
+
+| 项 | 值 / 证据 |
+|---|---|
+| 核版本 | `fc2bb50db4b5-rust`（build-core 版本注入校验 + `[size] 4,850,272`）|
+| tier 出包 | `build-core.sh` 的 pin 门（HEAD 是 pin `cbd45f0439e6` 的后代）**放行**；**log-index 门红**（既存，M1 已登记）⇒ 按手册逃生口**手工双落盘** `.so`（两处 md5 一致 `0e562e6511bd738d25fbe35f0764f4f9`；4,850,272 B） |
+| 包 | `entry-default-signed.hap` 2,724,698 B / `tailcat-default-signed.hsp` **2,889,328 B**（HSP 内 `libs/arm64-v8a/libclientcore.so` = 4,850,272 B）/ `terminal-default-signed.hsp` 4,166,072 B（三个 hvigor 目标 BUILD SUCCESSFUL） |
+| 装机 | `bm install -p /data/local/tmp/mod` → `install bundle successfully.`（覆盖装）|
+| 连接链 | `aa start --ps host_token '<hmw1…>'`（免点屏）→ `uitest uiInput click 1086 778` 点 VPN 开关 → 核日志 `transport: 本世代 L3 承载 = quic` / `quic: 准入完成` / `岛已建连…L3 承载 = 岛` / `warmup pong: 就绪（判据=quic）` / `link: via=direct ep=192.168.3.12:42653 rtt=…` |
+| **M3 在场证据（M2 无此三行）** | `quic: 流面参数（bidi=64 uni=0 recv_window=262144B send_window=2097152B 待发=65536B；有效服务流 62；env 覆盖 0 项）` / `quic: 快探参数（首探 700ms，拍间 250ms，复探 ×2，待机 60s，抖动阈值 3，B 门 连续 2/窗 10s，发送面新鲜度窗 5s，在用窗 5s；env 覆盖 0 项）` / `quic: 准入回执（…）` |
+| 真机 `.so` 加载面 | 扩展进程 `me.zhaozhe.tier:vpn`：`VmRSS 127,148 kB / VmHWM 131,676 kB / Threads 30`（口径：进程级，含 OHOS 运行时 + 三座桥 + 扩展壳，**非核独占**；对照 M1 同格 134,984/137,292/37） |
+
+### 3.1 R1 files（**部分过**：列目录 ✓ / 下载 ✓ / 上传 ✗ 自动化受阻）
+
+| 步 | 结果 | 两侧原文证据 |
+|---|---|---|
+| **列目录** | **过** | 核：`quic: 服务流已开（tag=files；第 1 条）` / `已关（id=1 tag=files，↑0B ↓44B）`、`（第 2 条，↑25B ↓8766B）`（根目录 8.7 KB 应答，条目与 Mac `$HOME` 实况一致：`.0m3s8/.Huawei/.Trash/.acme.sh…`）；截图见 `/tmp/m3s8-ui5.json|ui6.json`（`.0m3s8` 行在行首＝字节序排序语义在位） |
+| **下载** | **过（sha256 一致）** | 出口：`quic: 服务流已受理（tag=files dev=aca645d3 第 3 次）`（15:54:51.281）+ `服务流结束（tag=files，↑41B ↓1048715B）`；核：`桥泵[down] EOF（累计 1048715B / 783 次）`；**设备侧缓存件 sha256 `3bf2151a…b528` = 源件 sha256 `3bf2151a…b528`**（1,048,576 B；`/tmp/m3s8-dl-recv2.bin` vs `~/.0m3s8/dl.bin`） |
+| **上传** | **✗ 未做（自动化受阻，如实登记）** | 系统文档选择器**可驱动到「已选 1/1」**（`uitest uiInput click` 选中文件行），但**点「完成」不产生回传**：选择器关闭、App 未收到 URI（`doc.select()` 走 `uris.length===0` 的静默分支）⇒ 无 upload 流、无出口行、Mac 侧无文件。缺的一环 = **系统 picker 的完成按钮不接受注入点击**（tier `docs/agents/uitest.md` §3.3 已登记「系统文档选择器不自动化」）。**替代证据**（不冒充 R1）：上传方向由真机 speedtest 的 uplink 与本地 `[e2e4]` 的 files 帧面覆盖 |
+
+### 3.2 R2 term（**过**；分离用 App 的返回语义替代 `Ctrl-b d`）
+
+| 步 | 结果 | 两侧原文证据 |
+|---|---|---|
+| 起会话 | **过** | App：`终端 → 新建会话` 进入终端页（`term-btn-bar`/`term-btn-kb` 在位）；出口：`term: 新建会话 90878f9d（pid=85867 49x34 shell=/bin/zsh）` + `term: 会话 90878f9d 腿接入（kind=app 49x34 id=4f273b3068220976 首腿=true）n=1/8` |
+| 回显 | **过（截图逐字节）** | 键入 `echo m3s8-term-ok`：屏幕 `zhaozhe@zhaozhedeMac-mini-6 ~ % echo m3s8-term-ok` → `m3s8-term-ok` → 新提示符（`/tmp/m3s8-scr7.jpeg`）；出口：`term: 会话 90878f9d 状态 shell/idle` |
+| 分离 | **过（形态替代）** | 设备键盘栏**只有 ESC/TAB/退格/回车/粘贴/Copy —— 无 Ctrl 键** ⇒ `Ctrl-b d` 无法注入；改用 App 自身的分离面（返回键）：出口 `term: 会话 90878f9d 腿断开（kind=app 原因=client_closed）｜快照=1 差分=19 降级=0 背压=0 队列溢出=0 编码失败=0 分片=21 下行=2461B FETCH 命中=0 落空=0` |
+| re-attach | **过（内容回放 + 同会话号）** | 会话列表仍在（`sessions-row-90878f9d · Shell · 刚刚 · 空闲`）→ 点回：出口 `term: 会话 90878f9d 腿接入（kind=app 49x33 id=4f273b3068220976 首腿=true）n=1/8`（**同一会话号**）；屏幕恢复出分离前的命令与输出（`/tmp/m3s8-scr8.jpeg`） |
+
+- 未做（登记）：**跨世代重建的 re-attach**（断开-重连后恢复）——本切片未构造「term 会话在跑时
+  世代重建」的相位；出口侧会话持存已由上面的「腿断开→腿接入」与 §3.4 的世代重建读数间接支撑。
+
+### 3.3 R3 speedtest（**过**；含一次**出口进程死亡**事件，见 §4-1）
+
+| 轮 | 出口侧证据（原文节选） | 核侧证据 |
+|---|---|---|
+| 第 1 次（15:57:10，**异常轮**） | `speedtest: 会话 #1..#4 role=recv warmup=2s window=10s`；**无结算行**（进程随后死亡，§4-1） | 核 `桥泵[down] 写失败 after ~74.8MB：Broken pipe` ×4 ⇒ 服务流侧 300 MB 级 bulk |
+| 第 2 次（16:00:24，**正常轮**） | `quic: 服务流已受理（tag=speedtest dev=aca645d3 第 2/3 次）`；结算 `speedtest: 会话 #4 role=recv bytes=91814535（含预热 16252680）用时=12007ms` + 归因 `下行逐秒MB=[8.8/9.1/9.2/9.1/9.2/9.4/8.7/7.4/8.0/8.6] 尾3片=67Mbps`（四会话各 ≈91–92 MB / 12 s ⇒ **≈9.0 MB/s/流、四流合计 ≈36 MB/s**） | `quic: 服务流已开（tag=speedtest；第 1/2/3 条）` + `桥泵[down] EOF（累计 ~1.08×10⁸ B / 8 万次）` ×4；**出口进程存活**（RSS 14.5 MB → 20.2 MB） |
+
+- 判据「出口 E13 结算行在场 + 核 `tag=speedtest` 受理行」⇒ **过**（第 2 次为判据面；
+  第 1 次因 §4-1 事件中断，其结算行缺席已如实登记）。
+- 与 M2 同档对照：口径不同（M2 = App 卡片文本步进 1 MB/s；本轮 = 出口结算字节/用时），
+  仅登记不判死；**注意**：本读数 ≈36 MB/s 与 M1 真机卡片读数（↑33–35 MB/s）**同带** ⇒ 无数量级回退。
+
+### 3.4 R4 恢复 ≤3.5s（**过**；并用样登记了「待机档」的长尾）
+
+**判据面（在用档 = App 前台 + 浏览器导航持续产流）**，`kill -9` 本地出口（`/tmp/m3s8-r4i-{A,B}/`）：
+
+| 相位 | kill 时刻 | `快探失败`（T_detect） | 出口重新监听（E1 `serve 就绪`） | `链路重连完成` | **T_recv** | 判据 |
+|---|---|---|---|---|---|---|
+| A（立刻重启；停机 ≈0.07s） | 15:52:42.341 | +2.319s | 15:52:42.415 | 15:52:44.711 | **2,296 ms** | ≤3500 ✓ |
+| B（停机 5s） | 15:53:16.935 | +2.393s | 15:53:22.041 | 15:53:22.888 | **847 ms** | ≤3500 ✓ |
+
+- 相位 B 的完整链（原文）：`链路重连中（第 1 次）` → `赛跑小结：无胜者（候选 1 个，耗时 2.803s）`
+  → `链路重连失败（…第 1 次）—— 交世代重建` → `交另一动作（M↔R；窗 2.807s / 门 2 次未到）`
+  → `本地 socket 已换绑` → `迁移未确认（…700ms 内无对端回包）` → `链路重连中（第 2 次）`
+  → `赛跑结算：胜出 直连 192.168.3.12:42653（耗时 33ms）` → `准入完成（15ms）` → `链路重连完成（耗时 5ms）`
+- 与本地读数对照：本地（S4）T_recv **2455 / 1315 ms**、T_detect **2514 / 2520 ms**；
+  真机 T_detect **2319 / 2393 ms**、T_recv **2296 / 847 ms** ⇒ 同带、无退化。
+- **待机档反例读数（重要，如实登记）**：同一设备在**无 TUN 流量**（App 前台但无出站流量、
+  in-use 窗口失效 ⇒ 快探走 60s 待机拍）时，`kill -9` 出口后**首个失败信号在 +32.06s**
+  （15:49:38.3 → 15:49:57.917，原因=`探活无回显`；重连本身仍只需 6ms）。
+  ⇒ **≤3.5s 的门限口径 = 在用档**（设计 §9 R4 前置列「App 前台/有流量」）；待机档的恢复时间由
+  **QUIC 空闲回收 30s + keep_alive 相位**支配（与 §15-5 的根因订正同源），**不是 M3 阶梯回归**。
+
+### 3.5 R5 瞬时黑洞（**未做——缺一环，如实登记**）
+
+- 设计要的形态：把设备侧 QUIC 端点指向 `tools/quic-wedge-proxy.py` 再投放 1.5s 丢窗。
+- **缺的一环**：**token 的 QUIC 端点改写面**——产品 CLI 的 `token` 只有 `--dead-direct`
+  （WG/Direct 端点）；`--quic-ep` 只存在于 **harness** `tools/m1-ab`（其 `token_rewrite` 不外露
+  成可注入 App 的子命令）。设备侧 env 不可设（§3.7）⇒ 无法把设备引到楔子上。
+- **替代证据（不冒充）**：本地 `tools/quic-ladder-e2e.sh 2` 的负向①「瞬时黑洞 1.5s ⇒ 只记抖动、
+  不动作」已过（S4 记录：抖动 1 条、`action=""`）；真机侧未复跑。
+
+### 3.6 R6 准入失败归因（**过**）
+
+形态：**篡改 token 的 secret 一字节 + 重算 CRC（SHA-256(前文)[:4]）**（token 格式见
+`crates/homeway-core/src/token.rs:7`），经 `--ps host_token` 注入 ⇒ 客户端的 4 帧准入 Proof MAC 必错。
+
+| 侧 | 原文证据 |
+|---|---|
+| 核 | `quic: 准入已发起（dev=aca645d3，Hello 50B；等挑战/回执）` → **`quic: 准入失败（登记失败（准入被拒（code=0x11））；预算 4.971s）—— 连接已显式关闭（不留悬挂）`** → **`quic: 准入回执（code=0x11 凭证不被接受）——本世代回落 WG 承载`** → `quic: 赛跑未成（准入被拒（code=0x11））` → `岛未就用（…）——本世代回落 WG 承载（L3 与判据行按 WG 档；下一世代重试）` |
+| 负例（顺手采到） | 只改 CRC 不改 secret ⇒ 客户端侧 **`token 解析失败：homeway/token: 校验失败（串被截断或损坏）`**（App 日志），不进入准入面 ⇒ 「解析失败 ≠ 准入被拒」两分在位 |
+
+### 3.7 R7 服务面不外溢（A/B；**本地**，`serve.quic=false` 档）
+
+- 执行面 = `tools/quic-wg-e2e.sh 1`（`--quic=false` 出口 + 两条用例）——**归 §5 收口门读数**。
+
+---
+
+## 4. S8-D 新发现（真机专有 / 与本地不一致；按重要性排序）
+
+### 4-1 **本地出口进程在一次真机 speedtest（下行 bulk）中死亡（单次，未复现）**——交 S9/M5
+
+- **现象**：出口 pid 72134（15:53:22 起）在 15:57:17.216 后再无日志（末行 = `intercept: reactor 观测…`，
+  即**运行中突然终止**）；`local-rust-exit.sh status` = 「未在跑」。当时设备侧正在跑 speedtest
+  下行（4 条 STREAM，出口侧已推 ~75 MB/流）。
+- **两侧原文**：设备核 15:57:20.391 `桥泵[down] 写失败 after 74867251B / 75092704B / 75044341B / 74928051B：Broken pipe`；
+  此后 15:57:25.928 起 `链路重连中` ×4 全败（`赛跑小结：无胜者（耗时 ~2.8s）`）→ 15:57:39.278
+  `世代重建（…连续重连失败 4）` → 新世代 `赛跑未成` ⇒ `回落 WG 承载`。
+- **已排除/已查**：出口日志**无 panic 文本**、**无收工行**（`收到停止信号` 缺席）、
+  `~/Library/Logs/DiagnosticReports/` **无新 .ips**、统一日志该窗口无 termination 记录。
+- **未复现证据（同规格复跑）**：16:00:24 同一 App/同设备/同出口身份，speedtest 4 流
+  **各 ≈91–92 MB 全部结算**，出口存活（RSS 14.5→20.2 MB，见 §3.3 第 2 次）。
+- **归因未定（如实）**：候选 = ①单机资源/内存面（speedtest 内存收发）；②本棒沙箱环境对
+  「非本会话启动的 homeway-cli」的处置（本会话另有 ASP 拒绝新 homeway-cli 启动的记录，
+  见 §6）；③M3 服务入口换轨（intake/泵）下的某条资源面。**M3 侧无一条读数能证明或证伪**
+  ⇒ 需 S9 代码门 + M5/M6 专门构造（建议：真机 speedtest 与出口 RSS 采样同跑）。
+- **影响面**：真机 speedtest 期间出口死亡 ⇒ 世代重建 + 回落 WG（**用户可见的断流 ~40s**）。
+  与本切片的其它判据不冲突（R3 第 2 次已过），但**必须记入 M5 风险**。
+
+### 4-2 **服务流吞吐低于 WG/UDS 档 46%（相对门槛未过）**——见 §2.1
+
+- 本地 24 MiB/s vs 51 MiB/s（同刻交替 3 轮，轮序平衡）；真机 speedtest 9 MB/s/流 交叉印证。
+- 与 §2.2「共存不拖累」并存 ⇒ 瓶颈是**服务流管道自身**，不是与 L3 争用。
+
+### 4-3 **待机档恢复长尾 32s**（见 §3.4）：≤3.5s 只在**在用档**成立；`QUIC 空闲回收 30s + keep_alive`
+
+### 4-4 **R1 上传的系统 picker 完成按钮不可注入**（见 §3.1）：真机「上传」面**当前不可自动化**，
+需 tier 侧补一条**非 picker 的注入缝**（或用户手工一次）。
+
+### 4-5 C19/E-q5 节流窗**跨 tag 共享**（probe 占位）在真机复现：出口重启后 probe 先占「第 1 次」，
+本轮 files 的受理行落在「第 2/3 次」（`首 3` 用尽后即静默）⇒ 判读脚本必须按「或」形态
+（与 S4/S6 的登记一致，本切片拿到真机实证）。
+
+---
+
+## 5. S8-E 收口门（本切片实测）
+
+| 门 | 命令 | 读数 |
+|---|---|---|
+| 全量测试 | `cargo test --workspace` | **18 个测试目标全 ok / 0 failed**；`homeway-core --lib` **708 passed / 4 ignored**；`homeway-quic --lib` **178 passed**（新增 `quic_stream_perf` = 0 passed / 1 ignored，符合 `#[ignore]` 形态）。**零 flake 复现**（S6/S7 的两例 load-sensitive flake 本轮未出现） |
+| clippy | `cargo clippy --workspace --all-targets -- -D warnings` | **0 警告（rc=0）** |
+| 三目标 check | OHOS = `CC=NDK clang`；musl×2 = `CC=clang` + `-nostdlibinc -DRING_CORE_NOSTDLIBINC -isystem tools/cc-check-shim`（照 `.github/workflows/ci.yml:81-83`） | 三目标 **0 error**；仅余**既存**警告（`go_fmt.rs:69` 的 `libc::time_t` deprecated + musl 的 cdylib 提示）。**首轮本机 harness 漏设 musl 的 `CC_*` env ⇒ ring 构建脚本失败（rc=101）——harness 环境缺陷（非代码回归），补 CI env 后复跑 0 error（如实登记）** |
+| app 核构建 | `tools/build-app-core.sh` | `[sym] 20/20`；`[ver] fc2bb50db4b5+dirty-rust`（dirty = 本切片未提交文件；提交后复跑为干净串，见 §6）；`[size] **4,850,272 B**` |
+| 隔离门 | `tools/check-quic-isolation.sh` | **11/11 全绿**（⑪「QUIC 档零 `stackb::`」：岛 32 文件剥注释零命中 / raw 67 自校准；拨号缝桥闭包块 22 行 `dial=1/session_connect=1`；管线自校准 2/2） |
+| 词表门 | `tools/check-vocab.sh` | **PASS**（Rust 声明 5 单元 / 26 值；ledger sha256 一致；缺席表 4 项在册） |
+| 岛侧 e2e | `tools/quic-island-e2e.sh 1`（先 `wipe 1`） | **五条全绿 rc=0**；含 `[e2e5] exit.exempt_lines=0（换轨负判据）`（服务流不再经 WG 服务腿） |
+| `_wg` e2e（**R7 判据面**） | `tools/quic-wg-e2e.sh 1`（先 `wipe 1`） | **两条全绿 rc=0**；C2/C4/C5/C6/C10/C15 **原串在场**、`quic_lines=0`、`intercept: tcp exempt 100.64.255.1:7724 ← 100.64.77.234:43301（dialok）`（WG 服务腿 UDS 入口在位）⇒ **R7（D1 形态）全绿** |
+| 阶梯 e2e | `tools/quic-ladder-e2e.sh 2`（先 `wipe 2`） | **四条全绿 rc=0**：相位A `T_recv=**2472ms**`（`T_detect=2512ms`）/ 相位B `T_recv=**1317ms**` / 负向①只记抖动（`action=""`）/ 负向②动作落纸（`action=migrate`） |
+
+来源：`/tmp/m3s8-gates/{workspace-test.log,clippy.log,check-*.log,isolation.log,vocab.log,build-app-core.log,e2e-*.log}` 与 `/tmp/m1s2b-res/`、`/tmp/m1s3-res/`、`/tmp/m3s4-res/`；汇总见 `/tmp/m3s8-gates-run.log`。
+
+---
+
+## 6. 仓内副作用残留（如实登记）
+
+- 新增（本切片）：`crates/homeway-core/tests/quic_stream_perf.rs`、`tools/m3-s8-perf.sh`、
+  `tools/m3-s8-coexist.sh`、`docs/reviews/M3-S8-evidence.md`（本文件）。
+- `/tmp`（仓外）：`/tmp/m3s8-res/`（cpu/overhead/size/mem-*/perf/coexist 全部原始件）、
+  `/tmp/m3s8-*.{log,json,jpeg,txt}`（真机证据）、`/tmp/m3s8-gates/`（收口门读数）、
+  `/tmp/m3s8-dl-recv*.bin`、`~/m3s8-perf.bin`（64 MiB 源件）、`~/.0m3s8/`（真机 R1 用目录）、
+  `~/m3s8-dl.bin`。
+- 设备侧：App 覆盖装为 **M3 版**（`.so` 4,850,272 B）；VPN 世代状态与主机表条目（本棒注入
+  1 台正常 token + 1 台伪造 token「主机 109」）**留档**；`Download/m3s8-up.bin`（3 MB，上传尝试用）
+  与 App 缓存 `cache/tier-files/dl.bin`（1 MiB）留在设备。
+- 本地私有实例：#2（真机对端，**跑完仍在跑**）、#5（吞吐 A/B）、#1（e2e）；**现役出口 pid 33667 全程未碰**。
+- tier：`git status --porcelain` **前后对比 = 仅 `?? openspec/changes/term-local-scrollback/` 一条
+  untracked**（开工前即存在）：
+
+  ```
+  开工前 /Users/zhaozhe/Documents/projects/tier status：
+  ?? openspec/changes/term-local-scrollback/
+  收工后：同一条（零新增脏文件；`.so` 双落盘与 build 产物均 untracked）
+  ```
