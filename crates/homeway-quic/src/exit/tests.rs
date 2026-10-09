@@ -1749,7 +1749,7 @@ async fn datagram_from_unregistered_connection_is_dropped_and_counted() {
     assert_eq!(
         quic.send_to_pub(&[0xABu8; 32], b"x"),
         crate::ExitSend::Unbound,
-        "未认证连接不得产生绑定（出站回落 WG）"
+        "未认证连接不得产生绑定（出站报 Unbound ⇒ 丢 + 计数）"
     );
     drain_until(&rx, "quic: 丢弃 超限=0 发送缓冲满=0 未登记=1 源校验拒=0", WAIT); // E-q3 行
     assert!(quic.stop_within(Instant::now() + BUDGET));
@@ -1893,7 +1893,7 @@ async fn send_buffer_full_is_counted_not_silent() {
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
 
-/// 无绑定（含出口面已死）⇒ `Unbound`（调用方回落 WG 原样，不黑洞）。
+/// 无绑定（含出口面已死）⇒ `Unbound`（调用方丢 + 计数，不黑洞）。
 #[test]
 fn send_to_pub_is_unbound_without_binding() {
     let (logf, _rx) = sink();
@@ -1908,7 +1908,7 @@ fn send_to_pub_is_unbound_without_binding() {
     assert_eq!(
         quic.send_to_pub(&[0x11u8; 32], b"x"),
         crate::ExitSend::Unbound,
-        "面已死也必须报 Unbound（出站回落 WG，不黑洞）"
+        "面已死也必须报 Unbound（调用方丢 + 计数，不黑洞）"
     );
 }
 

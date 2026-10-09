@@ -1196,7 +1196,7 @@ fn log_identity(
 // ---------------------------------------------------------------------------
 
 /// 岛路径失败说明（**enum 而非字符串**——AGENTS 原则 1；变体只为记行归因，不承担错误
-/// 类型面的语义：真正的失败面对上层只有「回落 WG」一种处置）。
+/// 类型面的语义：真正的失败面对上层只有「本世代未建连」一种处置——M5 单承载后无回落档）。
 #[derive(Debug, thiserror::Error)]
 enum QuicFail {
     /// token 缺 RPK 尾字段（`serve.quic=false` 形态的出口 token ⇒ 无法钉定服务端身份）。
@@ -1310,7 +1310,7 @@ fn quic_unhealthy_signal(run: &Arc<GenRun>, reason: &str) {
 }
 
 /// 岛的建立（凭据 → 候选 → 起岛 → SetOnUnhealthy/SetCandidates → 赛跑）。
-/// 任一环失败 ⇒ `Err(QuicFail)`（调用方记行 + **回落 WG**）。
+/// 任一环失败 ⇒ `Err(QuicFail)`（调用方记行 + **本世代未建连**——M5 单承载后无回落档）。
 fn start_island(
     run: &Arc<GenRun>,
     cfg: &GenCfg,

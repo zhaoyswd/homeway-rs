@@ -10,8 +10,8 @@
 //!
 //! 1. **本文件零 WG 引用**（S6 的机械断言面）：不出现 `wgcore`/`stackb`/`Session`/
 //!    `connect_deadline` —— 服务流拨号只走岛的 STREAM 命令面（M5 C3 单承载后是唯一
-//!    路径）。历史（WG 档）与
-//!    「岛不在 ⇒ 回落 WG」的派发在 `tun_exec` 的桥构造处（那里调 `session_connect`）。
+//!    路径）。历史（WG 档）的「岛不在 ⇒ 回落 WG」派发已随 WG 面删除（`session_connect`
+//!    与 WG 桥一并不存在）。
 //! 2. **阶梯豁免集**（§1.6 设计门 3-3）：服务级拒绝（[`StreamErr::is_ladder_exempt`]：
 //!    `NotSupported/Busy/Unbound/BadTag`）**不是连接故障** ⇒ 立即收口、不进恢复；
 //!    连接面失败（`Closed/Timeout/ConnectionLost`）在调用方预算内**重试一次**。

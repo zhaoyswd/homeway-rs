@@ -577,7 +577,7 @@ impl ExitQuic {
     /// - [`ExitSend::Unbound`]：该设备无绑定（或面已死）⇒ 调用方按 WG 原样走。
     pub fn send_to_pub(&self, pubkey: &[u8; 32], pkt: &[u8]) -> ExitSend {
         if self.exit.is_exited() {
-            return ExitSend::Unbound; // 面已死：出站回落 WG（不黑洞）
+            return ExitSend::Unbound; // 面已死：出站报 Unbound（调用方丢 + 计数；无第二承载）
         }
         self.bridge.send_to_pub(pubkey, pkt)
     }

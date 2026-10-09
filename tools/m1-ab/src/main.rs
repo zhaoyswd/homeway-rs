@@ -1,7 +1,7 @@
 //! `tools/m1-ab` —— M1 S5-2 / S5-3③④ 的**产品路径**端到端吞吐与迁移台（harness-only）。
 //!
 //! 为什么需要它（真源 = `docs/reviews/M1-design.md` §8 门槛表 + §10 的 S5-2/S5-3）：
-//! - **S5-2**：`HOMEWAY_TRANSPORT=wg` vs `=quic` 的端到端 A/B 必须走**产品路径**
+//! - **S5-2**（历史叙事；M5 C4 后只剩 quic 单臂）：承载开关两档的端到端 A/B 必须走**产品路径**
 //!   （本地出口 + 世代装配的客户端核 + 合成 IP 流）——`tools/quic-probe` 是 quinn 直连
 //!   的旁路（不是产品路径），`tools/quic-ab.sh cpu` 测的是内建 socket（丢 GSO 的
 //!   Q-K 风险面）。本工具 = 那条产品路径的最小驱动面。
@@ -650,8 +650,15 @@ fn run_product_ab(a: &Args) -> Result<(), String> {
     } else {
         a.token.clone()
     };
-    // env 与 config 两面同值（`HOMEWAY_TRANSPORT` 优先级高——真源 facade::resolve_bearer）
-    std::env::set_var("HOMEWAY_TRANSPORT", &a.transport);
+    // M5 C4：承载开关 `HOMEWAY_TRANSPORT` 已删（设计 §4 三键全删）；WG 臂随 boringtun/
+    // WG 面退役 ⇒ `--transport` 只剩 `quic` 一个合法值（`wg` fail-fast，不静默出空读数）。
+    if a.transport != "quic" {
+        eprintln!(
+            "m1-ab: --transport {} 已退役（M5 C4：WG 承载与开关删除）——只用 quic",
+            a.transport
+        );
+        std::process::exit(2);
+    }
 
     // 回显目标（出口 intercept 的 transit 目标；同机 127.0.0.1）
     // `--dst` 给了就用外置回显（内部不绑 socket；诊断/对照面）。

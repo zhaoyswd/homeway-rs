@@ -14,14 +14,19 @@
 - 产物落 `${QUIC_AB_DIR:-/tmp/quic-ab/<时间戳>}/`：逐轮原始件 + `summary.txt` + `bins.sha256`
   + `loadavg.tsv`（1Hz 带时间戳 + 轮首/轮末标记）。
 
-## 四臂与口径（逐项照搬 `/tmp/quic-lab`，勿漂）
+## 两臂与口径（**M5 C4 收窄**：WG 两臂退役）
 
 | 臂 | 构造 | 回答 | 二进制 |
 |---|---|---|---|
 | `raw` | 纯 UDP `sendto`/`recv_from`（地板） | 传输/内核成本 | `arms/target/release/raw` |
-| `wg-ring` | boringtun 0.6 + crates.io **真 ring 0.16.20**（上游 asm；**诊断臂**） | WG 加密成本（上游 asm） | `arms/target/release/wg` |
-| `wg-shim` | boringtun 0.6 + 本仓 `tools/ring-shim`（RustCrypto 垫片） | **手机上现役形态** | `wg-shim/target/release/wg` |
 | `quic` | quinn 0.11 + rustls(ring 0.17) + tokio，QUIC DATAGRAM | QUIC 每包成本（相对地板） | `arms/target/release/quic` |
+
+**WG 两臂（`wg-ring` = boringtun + crates.io 真 ring 0.16.20 / `wg-shim` = boringtun + 本仓
+`tools/ring-shim`）随 WG 面退役删除**（M5 C4 / S1b：`boringtun` 依赖、`tools/ring-shim`、
+`[patch.crates-io]` 与 `arms/wg-ring`、`wg-shim/` 全部移除）。连带后果（登记）：门槛表的
+「每包 CPU ≤ 现役 WG+shim ×1.0」「线开销 ≤40B」两条**失去参照臂**——设计 §9.2 默认 (c)：
+保留**绝对列**（M1/M2 历史的 12.895µs / 12.250µs 等作历史锚并标档位）+ 本文件的历史读数
+**跨期不可互引**。`overhead` 子命令的 WG 线上字节条同批退役（只给 QUIC 绝对列）。
 
 **口径微漂登记（代码门 L9/L5，如实列，勿当"逐项照搬"的完美复制）**：
 
@@ -36,18 +41,14 @@
   供 32 连接扩展用）；`--conns-points "…"` 显式指定（优先于 `--conns`；三点对照片
   用 `--conns-points 1,3,5`）；
   拟合 = **全点最小二乘**（旧 lab 的手抄 37.6K/连接为 5 点口径，原始采样未留存）；
-- `arms/size`（四档第三格）的 ring 来源与 lab 的 `size-probe2` **不同**：lab 带
-  `[patch] ring = ring-shim`（boringtun 走垫片），本 harness 的 arms 无 patch ⇒ boringtun 走
-  crates.io **真 ring 0.16.20**。故 lab 注释里"含垫片 ⇒ 增量是上界"在本仓不成立
-  （实测仍在 ±10% 带内：−4.9%）。
+- `arms/size`（四档第三格）**M5 C4 起 base 由 `boringtun+smoltcp` 改为 `smoltcp`**（WG 依赖
+  退役）⇒ 该格与 M0–M4 的读数**不可直接互引**（base 变小）；①② 两格（空壳 / 空壳+QUIC）零改。
 
-**口径订正（必须照搬，勿重犯——M0 设计 §0.3）**：
+**口径订正（历史叙述保留；M5 C4 起 WG 两臂已删）**：
 
-1. `wg-ring` 臂的 ring 是 **0.16.20**（crates.io 真版，boringtun 0.6 自身声明）——**不是 0.17**。
-   本仓早期文档与 lab 的 `SUMMARY.md` 写「真 ring 0.17」是错的；0.17.14 只出现在 `quic` 臂
-   （rustls/quinn-proto 侧）。核对命令：
-   `grep -A3 'name = "ring"' tools/quic-ab/arms/Cargo.lock`（应见 0.16.20 与 0.17.14 两条，
-   前者服务于 boringtun/`arms`，后者服务于 quinn/rustls）。
+1. （历史）`wg-ring` 臂的 ring 是 **0.16.20**（crates.io 真版，boringtun 0.6 自身声明）——
+   **不是 0.17**；0.17.14 只出现在 `quic` 臂（rustls/quinn-proto 侧）。现仓内 `ring` 只有
+   0.17.14 一条（`grep -A3 'name = "ring"' Cargo.lock`）。
 2. aws-lc 的唯一开关 = **本仓 `rustls` 声明关默认 features**（quinn 侧默认关不关都不影响
    这条）；`quinn` 关默认是另一件事（去 `platform-verifier`/`bloom`/`log`）。
 3. CPU 基线的原始证据链：lab 的 `m-*.out` 只有 11 字节（客户端 JSON 未落盘），四个数只在

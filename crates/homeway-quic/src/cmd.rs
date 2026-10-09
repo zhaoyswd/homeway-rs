@@ -446,8 +446,8 @@ pub struct IslandSnapshot {
     // ---------- M3 S5：准入失败归因（设计 §4；`quic` JSON 段的两个新键） ----------
     /// 末次**准入被拒**的应用码（`None` = 未发生过）。
     ///
-    /// 单向递增语义：一旦记录即保持（世代内最后一次拒绝的归因）——回落 WG 的世代里它是
-    /// App 回答「为什么走了 WG」的唯一依据（设计 §4）。
+    /// 单向递增语义：一旦记录即保持（世代内最后一次拒绝的归因）——单承载（M5）下它是
+    /// App 回答「准入为什么没成」的唯一依据（设计 §4）。
     pub admit_reject_code: Option<u64>,
     /// 上者的稳定短语（与 [`crate::admit_close::text`] 同源；`None` = 未发生/未知码）。
     pub admit_reject_text: Option<String>,

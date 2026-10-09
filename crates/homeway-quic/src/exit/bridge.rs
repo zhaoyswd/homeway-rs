@@ -160,9 +160,10 @@ pub(crate) struct Outbound {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ExitSend {
     /// 已由 QUIC 面承接：入队成功，**或**队列满 ⇒ 已**丢 + 计数**（§6.4）。
-    /// 两种情形都不得回落 WG 二次投递（否则同一包两条栈各发一次）。
+    /// 两种情形都**不得二次投递**（同一包两条路径各发一次 = 重复）。
     Handled,
-    /// 该设备在 QUIC 面**无绑定**（含出口面已死）：调用方按 WG `encapsulate` 原样走。
+    /// 该设备在 QUIC 面**无绑定**（含出口面已死）：调用方按「丢 + 计数 + 记行」处置
+    /// （M5 §3.2-bis ②：原「按 WG `encapsulate` 原样走」的兜底面已随 WG 删除）。
     Unbound,
 }
 
@@ -342,7 +343,7 @@ impl ExitBridge {
                 self.note_drop(DropKind::SendBufferFull, "出站队列满（8192 条）");
                 ExitSend::Handled
             }
-            // 出口面已收工：回落 WG（面已不在，QUIC 档设备用它自己的 WG 面兜底）
+            // 出口面已收工：报 Unbound（无第二承载可落——调用方丢 + 计数）
             Err(mpsc::error::TrySendError::Closed(_)) => ExitSend::Unbound,
         }
     }

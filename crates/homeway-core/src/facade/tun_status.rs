@@ -139,7 +139,7 @@ pub struct QuicIn {
     /// **瞬时量**：无连接 = 0，满 = 1 MiB）。黑洞期「已入缓冲的 1 MiB」的可观测面。
     pub send_buffer_used: u64,
     /// **末次准入被拒的关闭码**（M3 §4；`0` = 未发生过）。与 `admit_reject_text` 成对——
-    /// 回落 WG 的世代里 App 据此回答「为什么走了 WG」（M2 真机发现①的黑洞面）。
+    /// App 据此回答「准入为什么没成」（M2 真机发现①的黑洞面；单承载后无第二档可指）。
     pub admit_reject_code: u64,
     /// 上者的稳定短语（空串 = 未发生/未知码）。
     pub admit_reject_text: String,
