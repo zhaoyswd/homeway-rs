@@ -337,7 +337,7 @@ TUN socketpair + 合成 UDP 流，`--rate 0 --window 64 --secs 8` = 容量档）
 | 全量测试 | `cargo test --workspace` | **18 个测试目标全 ok / 0 failed**；`homeway-core --lib` **708 passed / 4 ignored**；`homeway-quic --lib` **178 passed**（新增 `quic_stream_perf` = 0 passed / 1 ignored，符合 `#[ignore]` 形态）。**零 flake 复现**（S6/S7 的两例 load-sensitive flake 本轮未出现） |
 | clippy | `cargo clippy --workspace --all-targets -- -D warnings` | **0 警告（rc=0）** |
 | 三目标 check | OHOS = `CC=NDK clang`；musl×2 = `CC=clang` + `-nostdlibinc -DRING_CORE_NOSTDLIBINC -isystem tools/cc-check-shim`（照 `.github/workflows/ci.yml:81-83`） | 三目标 **0 error**；仅余**既存**警告（`go_fmt.rs:69` 的 `libc::time_t` deprecated + musl 的 cdylib 提示）。**首轮本机 harness 漏设 musl 的 `CC_*` env ⇒ ring 构建脚本失败（rc=101）——harness 环境缺陷（非代码回归），补 CI env 后复跑 0 error（如实登记）** |
-| app 核构建 | `tools/build-app-core.sh` | `[sym] 20/20`；`[ver] fc2bb50db4b5+dirty-rust`（dirty = 本切片未提交文件；提交后复跑为干净串，见 §6）；`[size] **4,850,272 B**` |
+| app 核构建 | `tools/build-app-core.sh` | `[sym] 20/20`；`[ver] fc2bb50db4b5+dirty-rust`（dirty = 本切片未提交文件）；`[size] **4,850,272 B**`。**提交后干净树复跑**（HEAD `66c306b`）：`[ver] **66c306b49a31-rust**` + `[sym] 20/20` + `[size] **4,850,272 B**`（同值）⇒ 本切片**零产品代码改动**，体积面不动 |
 | 隔离门 | `tools/check-quic-isolation.sh` | **11/11 全绿**（⑪「QUIC 档零 `stackb::`」：岛 32 文件剥注释零命中 / raw 67 自校准；拨号缝桥闭包块 22 行 `dial=1/session_connect=1`；管线自校准 2/2） |
 | 词表门 | `tools/check-vocab.sh` | **PASS**（Rust 声明 5 单元 / 26 值；ledger sha256 一致；缺席表 4 项在册） |
 | 岛侧 e2e | `tools/quic-island-e2e.sh 1`（先 `wipe 1`） | **五条全绿 rc=0**；含 `[e2e5] exit.exempt_lines=0（换轨负判据）`（服务流不再经 WG 服务腿） |
@@ -359,7 +359,11 @@ TUN socketpair + 合成 UDP 流，`--rate 0 --window 64 --secs 8` = 容量档）
 - 设备侧：App 覆盖装为 **M3 版**（`.so` 4,850,272 B）；VPN 世代状态与主机表条目（本棒注入
   1 台正常 token + 1 台伪造 token「主机 109」）**留档**；`Download/m3s8-up.bin`（3 MB，上传尝试用）
   与 App 缓存 `cache/tier-files/dl.bin`（1 MiB）留在设备。
-- 本地私有实例：#2（真机对端，**跑完仍在跑**）、#5（吞吐 A/B）、#1（e2e）；**现役出口 pid 33667 全程未碰**。
+- 本地私有实例：#1（e2e）/ #2（真机对端 + 阶梯 e2e）/ #5（吞吐 A/B）**收工时已全部 `stop`**；
+  **现役出口 pid 33667 全程未碰**（收工复核仍在跑）。
+- 设备收工状态：`aa force-stop me.zhaozhe.tier`（VPN 世代与扩展进程随之收工）；App 内主机表留下
+  本棒注入的 2 条（正常 token 1 条 + 伪造 token「主机 109」1 条，**留档勿删**——它是 R6 的复现件）。
+- `$HOME` 测试件已清（`~/.0m3s8/`、`~/m3s8-dl.bin`、`~/m3s8-perf.bin` 64 MiB）；`/tmp` 读数按惯例留档。
 - tier：`git status --porcelain` **前后对比 = 仅 `?? openspec/changes/term-local-scrollback/` 一条
   untracked**（开工前即存在）：
 
