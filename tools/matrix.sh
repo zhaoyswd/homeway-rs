@@ -53,7 +53,7 @@ if (( SMOKE )); then LINKS=(RRR); fi
 # · L2/L3 = {Go 出口} × {Rust 客户端}：Go 出口的 token 不带 QUIC 端点/RPK ⇒ QUIC-only 的
 #   Rust 客户端**必然失败**（C3 实测三判据 FAIL）。
 # · L4/L5 = {Rust 出口} × {Go 客户端}：**本棒实测**（M5 C4）——Go 客户端**连 token 都解不开**：
-#   `homeway: token 非法（hmw1…）：格式非法`（M1 起 Rust 出口的 token 携带 `Quic` 类端点，
+#   `homeway: token 非法（hmw2…）：格式非法`（M1 起 Rust 出口的 token 携带 `Quic` 类端点，
 #   Go 侧解析器不认；且 WG 面已随 M5 删除）⇒ C-ready/MP-n2/RL-via 三判据 FAIL。
 # 按「无兼容包袱」口径（2026-10-09 用户重申）这两个组合都不存在：Go 出口已于 2026-10-05
 # 整体退役、Go 客户端为 WG-only ⇒ 退役行**跳过 + 说明**（不判红）。**可一行回退**（删掉
@@ -444,7 +444,7 @@ run_link() {
 
 base_segment() {
   local link="$1" E="$2" C="$3" st="$MATRIX/$link"
-  local TOK=$(exit_token "$link" "$E" | grep -o 'hmw1[A-Za-z0-9+/=_-]*' | head -1)
+  local TOK=$(exit_token "$link" "$E" | grep -o 'hmw2[A-Za-z0-9+/=_-]*' | head -1)
   [[ -n "$TOK" ]] || { record "$link" token "FAIL" "取不到出口 token"; return 1; }
 
   if [[ "$C" == go ]]; then
@@ -740,7 +740,7 @@ multi_peer_segment() {
   local link="$1" E="$2" C="$3" st="$MATRIX/$link"
   # 副客户端 = 异实现
   local SUB; [[ "$C" == go ]] && SUB=rust || SUB=go
-  local TOK=$(exit_token "$link" "$E" | grep -o 'hmw1[A-Za-z0-9+/=_-]*' | head -1)
+  local TOK=$(exit_token "$link" "$E" | grep -o 'hmw2[A-Za-z0-9+/=_-]*' | head -1)
   local EL0=$(log_lines "$st/exit/stdout.log")
   if [[ "$SUB" == go ]]; then
     local SST="$st/c-sub"
@@ -788,11 +788,11 @@ relay_segment() {
     local ELx=$(log_lines "$st/exit/stdout.log")
     wait_line_from "$st/exit/stdout.log" '中继：注册成功' "$ELx" 25 >/dev/null 2>&1 || true
   fi
-  local TOK=$(exit_token "$link" "$E" | grep -o 'hmw1[A-Za-z0-9+/=_-]*' | head -1)
+  local TOK=$(exit_token "$link" "$E" | grep -o 'hmw2[A-Za-z0-9+/=_-]*' | head -1)
   # 段级 cache 隔离（①-2）：主客户端清 cache 重连（变体 token）
   local DEAD
   if [[ "$C" == go ]]; then
-    DEAD=$("$RUST_BIN" token "$TOK" --dead-direct | grep -o 'hmw1[A-Za-z0-9+/=_-]*' | head -1)
+    DEAD=$("$RUST_BIN" token "$TOK" --dead-direct | grep -o 'hmw2[A-Za-z0-9+/=_-]*' | head -1)
     [[ -n "$DEAD" ]] || { record "$link" RL-via "FAIL" "dead-direct 变体铸造失败"; return 1; }
     clear_go_client_cache "$link"
     local CL0=$(log_lines "$st/c-main/cache/client.log")

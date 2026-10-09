@@ -44,7 +44,7 @@ if ! "$REPO_ROOT/tools/local-exit.sh" status "$N" >/dev/null 2>&1; then
   sleep 1
   "$REPO_ROOT/tools/local-exit.sh" status "$N" >/dev/null 2>&1 || { echo "!! 出口起后即退（环境竞态）——重跑一次通常即愈" >&2; exit 2; }
 fi
-TOK=$("$REPO_ROOT/tools/local-exit.sh" token "$N" | grep -o 'hmw1[A-Za-z0-9+/=_-]*' | head -1)
+TOK=$("$REPO_ROOT/tools/local-exit.sh" token "$N" | grep -o 'hmw2[A-Za-z0-9+/=_-]*' | head -1)
 [[ -n "$TOK" ]] || { echo "!! 取不到 token" >&2; exit 2; }
 
 EXIT_LOG="/tmp/homeway-rs-exit-$N/stdout.log"

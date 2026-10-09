@@ -115,8 +115,8 @@ fn seeds() -> Vec<Vec<u8>> {
     // STUN 骨架
     v.push(homeway_core::server::egress::stun_request(&[3u8; 12], "fuzz"));
     // token 串
-    v.push(b"hmw1".to_vec());
-    v.push(b"hmw1AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_vec());
+    v.push(b"hmw2".to_vec());
+    v.push(b"hmw2AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_vec());
     // HTTP/SSDP 文本面
     v.push(b"HTTP/1.1 200 OK\r\nLOCATION: http://192.168.3.1:49152/root.xml\r\n\r\n".to_vec());
     v.push(b"<root><service><serviceType>WANIPConnection</serviceType><controlURL>/ctrlu</controlURL></service></root>".to_vec());
@@ -451,7 +451,10 @@ fn fuzz_fixture_expectations() {
     let hex_str = |b: &[u8]| -> String { b.iter().map(|x| format!("{x:02x}")).collect() };
     // token 正样本：逐字段比对（第二道门 中-11 整改——只数 n_ok 会被「什么都接受」
     // 的解析器骗过；peer_id/secret/endpoints 全对 + 哨兵负例按码拒）
-    let p = format!("{}/../../fixtures/vectors/token.json", env!("CARGO_MANIFEST_DIR"));
+    let p = format!(
+        "{}/../../fixtures/vectors/token_hmw2.json",
+        env!("CARGO_MANIFEST_DIR")
+    );
     let v: serde_json::Value = serde_json::from_str(&std::fs::read_to_string(p).unwrap()).unwrap();
     for c in v["cases"].as_array().unwrap() {
         let tok = c["token"].as_str().unwrap();

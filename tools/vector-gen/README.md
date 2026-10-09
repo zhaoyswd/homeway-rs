@@ -16,7 +16,7 @@ token/隧道地址族经公开包 `pkg/proto`（同模块内直接 import）。
 
 | 文件 | 族 | 覆盖 |
 |---|---|---|
-| `token.json` | hmw1 token | 编解码 5 案（0 端点下界 / 单端点 / 直连+域名+中继混合 / 255B 地址上界 / TrimSpace 契约）＋错误 7 案（hmw2 版本 / 缺前缀 / CRC 翻转 / 截断 / base64 填充尾缀 FIX-89 / len=0 / 尾部多字节——三类哨兵 corrupted/unsupported_version/malformed 与 `pkg/proto/token.go:33-37` 一一对应） |
+| ~~`token.json`~~ | **已退役（M5 S5t）** | Go 冻结向量是 **hmw1 布局**的 oracle；M5 换 `hmw2` 段容器（无兼容包袱）⇒ 本管线**不再产出**。新向量 = **本仓自产** `fixtures/vectors/token_hmw2.json`（生成器 = `crates/homeway-core/tests/token_vectors.rs::bless_token_hmw2_vectors`）；登记见 `docs/INTEROP-CRITERIA.md` 判据变更记录 |
 | `tunnel_addr.json` | 隧道地址 | DeriveTunnelIP（hw-tun）/ DeriveTunIP（hw-app）＋**守卫命中样本**（搜索 ~65k 次 HMAC 得到撞 v 输入，钉死 hw-app.N 再散列路径） |
 | `identity.json` | 设备身份 | master+peerID → WG 私钥（HKDF，未钳位）/公钥（ScalarBaseMult，钳位在乘内部）；master → devTag 8B；4 组隔离性样本（同同/同换/换同/烟囱真钥）＋ store 全路径交叉验证 |
 

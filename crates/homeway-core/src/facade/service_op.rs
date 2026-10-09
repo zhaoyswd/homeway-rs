@@ -144,14 +144,14 @@ mod tests {
         let d = ServiceDomain::new();
         assert_eq!(d.start("{oops"), -3);
         assert_eq!(d.start(r#"{"mtu":1280}"#), -4);
-        assert_eq!(d.start(r#"{"token":"hmw1-x"}"#), 0);
+        assert_eq!(d.start(r#"{"token":"hmw2-x"}"#), 0);
         // starting/ready 幂等 0
-        assert_eq!(d.start(r#"{"token":"hmw1-x"}"#), 0);
+        assert_eq!(d.start(r#"{"token":"hmw2-x"}"#), 0);
         d.set_state(ServiceState::Ready);
-        assert_eq!(d.start(r#"{"token":"hmw1-x"}"#), 0);
+        assert_eq!(d.start(r#"{"token":"hmw2-x"}"#), 0);
         // 收工中 -1（防双持钥）
         d.set_state(ServiceState::Stopping);
-        assert_eq!(d.start(r#"{"token":"hmw1-x"}"#), -1);
+        assert_eq!(d.start(r#"{"token":"hmw2-x"}"#), -1);
     }
 
     /// stop：idle 0；ready → 0 归位；failed 可重启。
@@ -159,11 +159,11 @@ mod tests {
     fn stop_contract() {
         let d = ServiceDomain::new();
         assert_eq!(d.stop(), 0);
-        d.start(r#"{"token":"hmw1-x"}"#);
+        d.start(r#"{"token":"hmw2-x"}"#);
         assert_eq!(d.stop(), 0);
         assert_eq!(d.stop(), 0);
         d.set_state(ServiceState::Failed);
-        assert_eq!(d.start(r#"{"token":"hmw1-x"}"#), 0); // failed 可重新受理
+        assert_eq!(d.start(r#"{"token":"hmw2-x"}"#), 0); // failed 可重新受理
     }
 
     /// 状态 JSON：无产出面 = idle 短路逐字节；挂面后透传。

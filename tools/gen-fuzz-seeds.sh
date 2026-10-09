@@ -45,9 +45,9 @@ def write(target, name, data: bytes):
         f.write(data)
 
 n = 0
-# token：正样本串 + 负例串（errors[].input 是整串 token——第二道门 中-12 整改：
+# token（M5 S5t：Go 冻结向量 token.json 退役 ⇒ 读**本仓自产**的 token_hmw2.json）：正样本串 + 负例串（errors[].input 是整串 token——第二道门 中-12 整改：
 # 原读 body_b64 字段恒空转，负例种子一条都没产）
-t = json.load(open(os.path.join(vec, "token.json")))
+t = json.load(open(os.path.join(vec, "token_hmw2.json")))
 for i, c in enumerate(t.get("cases", [])):
     if "token" in c:
         write("fuzz_token", f"tok{i}", c["token"].encode())

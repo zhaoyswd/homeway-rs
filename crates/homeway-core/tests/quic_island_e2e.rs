@@ -6,7 +6,7 @@
 //! `tools/quic-island-e2e.sh`（起出口 → 取 token → 设环境 → 跑本用例 → 留证到 /tmp）。
 //!
 //! 环境契约：
-//! - `HOMEWAY_ISLAND_E2E_TOKEN`：出口 token（`serve token` 的输出里抽 `hmw1…`）
+//! - `HOMEWAY_ISLAND_E2E_TOKEN`：出口 token（`serve token` 的输出里抽 `hmw2…`）
 //! - `HOMEWAY_ISLAND_E2E_EXIT_LOG`：出口 stdout 日志（查 `peer: +` / `quic: 路径变更`）
 //! - `HOMEWAY_ISLAND_E2E_ALT_BIND`（选填）：rebind 目标 `ip:port`（缺省自动挑一个本地地址）
 //!
@@ -139,7 +139,7 @@ fn island_connects_registers_and_survives_rebind_against_local_exit() {
         std::env::var("HOMEWAY_ISLAND_E2E_EXIT_LOG").expect("须给 HOMEWAY_ISLAND_E2E_EXIT_LOG"),
     );
     let log0 = log_lines(&exit_log); // 本轮基线：断言只认本次运行新增的行
-    let tok = token::decode(&token_str).expect("token 可解（serve token 的输出里抽 hmw1…）");
+    let tok = token::decode(&token_str).expect("token 可解（serve token 的输出里抽 hmw2…）");
     let rpk = tok.rpk.expect("M1 的 token 必带出口 RPK（S1-9 的 additive 字段）");
 
     // 候选 = token 的 QUIC 类端点（M1 §2.7 的收窄：quic 档只吃 QUIC 类）。

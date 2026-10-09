@@ -18,7 +18,7 @@ EXIT_STATE="/tmp/homeway-rs-rustexit-$n"
 AB="$REPO_ROOT/tools/m1-ab/target/release/m1-ab"
 mkdir -p "$RES" || exit 1
 
-TOKEN="$("$REPO_ROOT/tools/local-rust-exit.sh" token "$n" 2>/dev/null | grep -oE 'hmw1[A-Za-z0-9_=+/-]+' | head -1)"
+TOKEN="$("$REPO_ROOT/tools/local-rust-exit.sh" token "$n" 2>/dev/null | grep -oE 'hmw2[A-Za-z0-9_=+/-]+' | head -1)"
 [[ -n "$TOKEN" ]] || { echo "!! token 取不到（出口 #$n 未在跑？）" >&2; exit 1; }
 print -r -- "$TOKEN" > "$RES/token.txt"
 WORK="$RES/m1ab-work"; rm -rf "$WORK"; mkdir -p "$WORK"

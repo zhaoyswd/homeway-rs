@@ -118,7 +118,7 @@ setup_stack_rust_client() { # <side> <ep>
   local side="$1" ep="$2"
   local st="$BASE/$side"
   local TOK
-  TOK=$("$RUST_BIN" serve token --state "$st/exit" | grep -o 'hmw1[A-Za-z0-9+/=_-]*' | head -1)
+  TOK=$("$RUST_BIN" serve token --state "$st/exit" | grep -o 'hmw2[A-Za-z0-9+/=_-]*' | head -1)
   TOK=$("$RUST_BIN" token "$TOK" --loopback-only)
   nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$st/client/identity" --no-session-lock --hold 3600 >> "$st/client.log" 2>&1 &
   echo $! > "$st/client.pid"
@@ -143,7 +143,7 @@ setup_stack_rust_client rrr 42667
 sleep 2
 
 # Go 客户端 host add（token 同铸 loopback-only——两侧同走 lo0 的公平对照，见上）
-GGG_TOK=$("$GO_BIN" serve token --state "$BASE/ggg/exit" | grep -o 'hmw1[A-Za-z0-9+/=_-]*' | head -1)
+GGG_TOK=$("$GO_BIN" serve token --state "$BASE/ggg/exit" | grep -o 'hmw2[A-Za-z0-9+/=_-]*' | head -1)
 GGG_TOK=$("$RUST_BIN" token "$GGG_TOK" --loopback-only)
 "$GO_BIN" host add --state "$BASE/ggg/client" --name perf "$GGG_TOK" || { echo "!! GGG host add 失败" >&2; }
 sleep 3

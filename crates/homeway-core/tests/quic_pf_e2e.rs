@@ -16,7 +16,7 @@
 //!    `n <= 5 || n % 20 == 0`）⇒ 只有 #60/#80 这类行可见；80 > 62 幅度更大，等效且可读。
 //!
 //! **环境契约**（与 `quic_island_e2e.rs` 同一套；驱动脚本 `tools/quic-pf-e2e.sh` = S5 交付）：
-//! - `HOMEWAY_ISLAND_E2E_TOKEN`：出口 token（`tools/local-rust-exit.sh token N` 的输出里抽 `hmw1…`）
+//! - `HOMEWAY_ISLAND_E2E_TOKEN`：出口 token（`tools/local-rust-exit.sh token N` 的输出里抽 `hmw2…`）
 //! - `HOMEWAY_ISLAND_E2E_EXIT_LOG`：出口 stdout 日志
 //!
 //! **本机禁网提示（设计 §0.4-2）**：本机 `utun4` 上有 fake-IP 代理且是默认路由 ⇒

@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn probe_addr_err_shape() {
-        let v: Value = serde_json::from_str(&probe_addr_json("hmw1-garbage")).unwrap();
+        let v: Value = serde_json::from_str(&probe_addr_json("hmw2-garbage")).unwrap();
         assert!(v.get("error").is_some() && v.get("ok").is_none());
     }
 

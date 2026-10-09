@@ -755,7 +755,7 @@ mod tests {
         let recs = vec![HostRecord {
             id: "zz-not-hex".to_owned(),
             name: Some("broken".to_owned()),
-            token: "hmw1whatever".to_owned(),
+            token: "hmw2whatever".to_owned(),
             added_at: 123,
         }];
         std::fs::write(dir.join(HOSTS_FILE_NAME), serde_json::to_string(&recs).unwrap()).unwrap();

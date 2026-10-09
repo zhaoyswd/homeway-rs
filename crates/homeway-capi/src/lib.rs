@@ -404,7 +404,7 @@ mod tests {
     /// ProbeReach：坏 token → {"error":…} 信封（不 panic、不 NULL）。
     #[test]
     fn probe_reach_error_envelope() {
-        let p = ClientCoreProbeReach(ret_cstring("hmw1-garbage"));
+        let p = ClientCoreProbeReach(ret_cstring("hmw2-garbage"));
         unsafe {
             let s = CStr::from_ptr(p).to_string_lossy().into_owned();
             libc::free(p as *mut _);

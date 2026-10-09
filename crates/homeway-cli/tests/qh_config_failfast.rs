@@ -281,7 +281,7 @@ fn state_flag_forms_failfast_and_eq_form_accepted() {
 fn numeric_and_bool_flags_failfast() {
     let state = mktemp("flags");
     // 数值：`--rounds abc`（此前静默回落 3）。
-    let out = cli(&state, &["speedtest", "--token", "hmw1xxx", "--rounds", "abc"]);
+    let out = cli(&state, &["speedtest", "--token", "hmw2xxx", "--rounds", "abc"]);
     let t = text(&out);
     assert_eq!(out.status.code(), Some(2), "{t}");
     assert!(t.contains("--rounds"), "{t}");
@@ -293,18 +293,18 @@ fn numeric_and_bool_flags_failfast() {
     // 代码门 M4：等号形真的落到直连形态（此前 `speedtest --token=X` 判成守护托管 →
     // 「未知参数：--token」exit 2；现在应走 token 解码 → rc=1「token 解析失败」）。
     // 注：speedtest 直连/portfwd 不吃 `--state`（身份面是 --identity-dir）——按原样调用。
-    let out = raw_cli(&state, &["speedtest", "--token=hmw1xxx"]);
+    let out = raw_cli(&state, &["speedtest", "--token=hmw2xxx"]);
     let t = text(&out);
     assert_eq!(out.status.code(), Some(1), "等号形应走直连形态：{t}");
     assert!(t.contains("token 解析失败"), "{t}");
     // 代码门 M4：portfwd 等号形同样生效（此前死代码 + 未知参数）。
-    let out = raw_cli(&state, &["portfwd", "--token=hmw1xxx", "--map", "15432:5432"]);
+    let out = raw_cli(&state, &["portfwd", "--token=hmw2xxx", "--map", "15432:5432"]);
     let t = text(&out);
     assert_eq!(out.status.code(), Some(1), "{t}");
     assert!(t.contains("token 解析失败"), "{t}");
     // 代码门 M4：verb 级布尔显式值被接受（`--force=false` 不再「未知参数」；
     // 走到 token 解码失败 = 证明 get 解析面收下了该形态）。
-    let out = cli(&state, &["files", "get", "/tmp/qh-none", "--force=false", "--token=hmw1xxx"]);
+    let out = cli(&state, &["files", "get", "/tmp/qh-none", "--force=false", "--token=hmw2xxx"]);
     let t = text(&out);
     assert!(!t.contains("未知参数"), "--force=false 必须被收下：{t}");
     assert!(t.contains("token 解析失败"), "{t}");

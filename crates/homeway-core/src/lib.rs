@@ -5,7 +5,7 @@
 //! 克隆（基线 hash 与判据见 `docs/BASELINE.md` / `docs/INTEROP-CRITERIA.md`）。
 //!
 //! 模块划分按 Rust 惯例，不映射 Go 包结构 1:1；各期落位：
-//! - `token`：hmw1 凭证（R0，pkg/proto/token.go 语义）
+//! - `token`：hmw2 凭证（R0，pkg/proto/token.go 语义）
 //! - `identity`（R1）、`intercept`（R3）…
 //!
 //! **M5 C3（WG 面删除）**：`wtransport`/`wgcore`/`session` 三模块（WG 档的候选赛跑、

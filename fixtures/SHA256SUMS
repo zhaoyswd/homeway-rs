@@ -1,4 +1,4 @@
-2c80389a2c586949679b028486cfc276a66b882c6992f302ea5c600bd48f8c9f  ./MANIFEST.md
+439e130c8d046e036aba0c9d921995f6bae0c5741380140df6c1ac6ba1d3755e  ./MANIFEST.md
 664e1bacccf0fc0ce05655e53c1efac0f2e74492584121b354b3f20b395ab54c  ./control-cp-v1/decode_check.py
 d1acf3b973ff9e89a5a85922dfee54f587b9c2c845705ae25d44f1e3753817e3  ./control-cp-v1/frames.jsonl
 6ec8e50a7926bec06b28033e4385b192d31f4f954af47e9d6a827c97b87278fc  ./surface-golden/manifest.tsv
@@ -54,6 +54,6 @@ ec3b3b48e8d4b96849a60efecbe5a957c033a85e09bfe0ad66de2c3ce8b7a704  ./vectors/term
 d7d20954be56b8788b0e9f4fd008cb78abdd1751b6e6936bb5d36a6680120d17  ./vectors/term_mouseenc.json
 ebc20d0f031f6cdc8fc7dadc46d5fb00672076bb85a840737f65b21187194bfe  ./vectors/term_palette.json
 b2b82aa263572ea1a44303ea4306020010cfe89c2be789c862d738a8be8e05d9  ./vectors/term_responder.json
-1c5a087f82280e2ca56f3cc03e055a6f975d1f800fca31df870b507a4f1ea341  ./vectors/token.json
+cd0a0767b9947274b8115bb8195028202d23c0d3ea682b80ac0f06887a925348  ./vectors/token_hmw2.json
 4521f0ea623bf234bf19f4b11492c4d4a0dc4311723a9ce332aa6f0e2aef9b5f  ./vectors/tun_status.jsonl
 d065823d92a23c917b7afbe76623a1f196eb72a81e610c7943b09d77dfed049b  ./vectors/tunnel_addr.json

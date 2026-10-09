@@ -1,22 +1,25 @@
-//! hmw1 凭证（token）：可见前缀 + base64url(裸二进制)。
+//! 凭证（token）：可见版本前缀 + base64url(裸二进制段容器)。
 //!
-//! 布局（语义真源 `baseline:pkg/proto/token.go`，基线 621fe0e；M1 追加一段**可选**
-//! 尾字段——见下）：
+//! **M5 S5t（token 候选 B）：`hmw2` 段容器**（此前 = 定长顺序布局 + 按长度猜尾字段）。
+//! 布局（本文件 = wire 真源；旧 `hmw1` 布局的 body 仍以**冻结**形态保留给 `rl1`
+//! 中继 token，见 [`encode_v1_body`]）：
 //!
 //! ```text
-//! "hmw1" ‖ base64url-raw( peerId(32B) ‖ secret(32B) ‖ epCount(1B) ‖ [type(1B)+len(1B)+addr]* ‖ [rpk(32B)]? ‖ crc(4B) )
+//! "hmw2" ‖ base64url-raw( segCount(1) ‖ [segType(1) ‖ len(2 BE) ‖ body]* ‖ crc(4) )
 //! ```
 //!
-//! - `peerId` = 后端静态 WG 公钥；`secret` = 凭证种子；`type` 0=direct 1=relay
-//!   **2=QUIC（M1 新增类别）**；`crc` = SHA-256(前文)[:4]；base64 为**无填充** base64url
-//!   （尾缀 `=` 不容忍，FIX-89）。
-//! - 解析先 `trim`（Go `strings.TrimSpace` 同义：Unicode White_Space）。
-//!
-//! **M1 追加字段（`rpk`，可选 32B，additive）**：出口 Ed25519 **RPK 裸公钥**——客户端
-//! 钉定服务端身份用（M1 设计 §1.3/§12-②；登记条草案见 §3.6，落库 = S4 判据行批）。
-//! 形态取**尾部追加**：无该字段的串（全部既有 Go 向量与既有部署 token）逐字节不变；
-//! 带该字段的串 = 端点数之后恰 32B（其余尾长仍判 Malformed——不留「猜长度」的口子）。
-//! 旧解析器会拒带 rpk 的串（无兼容包袱：用户拍板①；M2 重写 token 时统一）。
+//! - **段类型**（`segType` 高位置 1 = **critical**：不认识则**整串拒**——防 fail-open）；
+//!   `peerId(32B)` / `secret(32B)` / `epList` / `rpk(32B, info = 可跳过)`；段的**出现顺序
+//!   不敏感**（写方按上表序产出；读方接受任意序）。
+//! - `epList` 段体沿用旧布局的字节含义（**零变化**）：`epCount(1) ‖ [type(1)+len(1)+addr]*`；
+//!   `type` 0=direct 1=relay **2=QUIC**；`addr` = host:port（UTF-8）。
+//! - `rpk` 段 = 出口 Ed25519 **RPK 裸公钥**（M1 起随 token 走；`info` 段 ⇒ 未来读方不认也
+//!   不拒整串，只丢该段——**这是容器化换来的能力**）。
+//! - `crc` = SHA-256(前文)[:4]；base64 为**无填充** base64url（尾缀 `=` 不容忍，FIX-89）；
+//!   解析先 `trim`（Go `strings.TrimSpace` 同义：Unicode White_Space），再剥内嵌 `\r`/`\n`
+//!   （Go base64 解码器行为）。
+//! - **版本面**：`hmw1…`（M5 前铸造的存量 token）与任何其它 `hmw*` ⇒
+//!   [`TokenError::UnsupportedVersion`]（**存量 token 一律失效**，无兼容包袱——设计 §5.3）。
 //!
 //! 与 Go 的**已登记差异**（均为对抗性输入面，正常铸造的 token 不受影响）：
 //! 1. Go `DecodeToken("hmw")` 会 panic（`s[:4]` 越界，已登记 Go 侧问题清单 G1）；本实现
@@ -36,11 +39,23 @@ use base64::Engine;
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
-/// 可见版本前缀（"hmw2" = 下一版；未知 hmw* 前缀报 [`TokenError::UnsupportedVersion`]）。
-pub const PREFIX: &str = "hmw1";
+/// 可见版本前缀（未知 hmw* 前缀报 [`TokenError::UnsupportedVersion`]）。
+pub const PREFIX: &str = "hmw2";
 
-/// 载荷下界：peerId(32) + secret(32) + epCount(1) + crc(4)。
-const MIN_BODY_LEN: usize = 32 + 32 + 1 + 4;
+/// 段类型（**高位置 1 = critical**：读方不认识 ⇒ 整串拒，防 fail-open）。
+const SEG_CRITICAL: u8 = 0x80;
+const SEG_PEER_ID: u8 = 0x01;
+const SEG_SECRET: u8 = 0x02;
+const SEG_ENDPOINTS: u8 = 0x03;
+/// `info` 段（读方不认识可跳过——`rpk` 走这一档）。
+const SEG_RPK: u8 = 0x04;
+
+/// 载荷下界：segCount(1) + peerId 段(1+2+32) + secret 段(1+2+32) + epList 段(1+2+1) + crc(4)。
+const MIN_BODY_LEN: usize = 1 + 35 + 35 + 4 + 4;
+/// 段头长度：segType(1) + len(2 BE)。
+const SEG_HEAD: usize = 3;
+/// 【冻结】v1 body 下界：peerId(32) + secret(32) + epCount(1) + crc(4)。
+const MIN_V1_BODY_LEN: usize = 32 + 32 + 1 + 4;
 
 /// base64url 引擎：与 Go `base64.RawURLEncoding` 同严格度——URL 字母表、**无填充**
 /// （编码不带 `=`、解码遇 `=` 即拒，FIX-89），且**容忍非规范尾位**（Go 默认不查尾位；
@@ -333,7 +348,7 @@ pub fn decode(input: &str) -> Result<Token, TokenError> {
     }
     if !s.starts_with(PREFIX) {
         return Err(TokenError::Malformed {
-            reason: "缺少 hmw1 前缀",
+            reason: "缺少 hmw2 前缀",
         });
     }
     // Go base64 解码器跳过任意位置的 \r\n（终端/聊天工具折行）；crate 引擎不做，先剥离对齐
@@ -346,7 +361,10 @@ pub fn decode(input: &str) -> Result<Token, TokenError> {
     Ok(parse_body(&raw)?.into())
 }
 
-/// 对已解码载荷借用解析（零拷贝核心；CRC 校验先行，与 Go `decodeTokenBytes` 同序）。
+/// 对已解码载荷借用解析（零拷贝核心；v2 段容器）。
+///
+/// 三段 critical（peerId / secret / epList）**必须齐**；`rpk` 为 `info` 段（可缺、可跳）；
+/// 不认识的 critical 段 ⇒ 整串拒（fail-closed）；不认识的 info 段 ⇒ 跳过。
 pub fn parse_body(raw: &[u8]) -> Result<TokenRef<'_>, TokenError> {
     if raw.len() < MIN_BODY_LEN {
         return Err(TokenError::Corrupted); // 截断（含 base64 解码后过短）
@@ -356,13 +374,85 @@ pub fn parse_body(raw: &[u8]) -> Result<TokenRef<'_>, TokenError> {
     if sum[..4] != *crc {
         return Err(TokenError::Corrupted);
     }
+    let (&seg_count, mut rest) = body.split_first().ok_or(TokenError::Corrupted)?; // 不可达（下界已含 1B）
 
-    let (peer_id, rest) = body.split_at(32);
-    let peer_id: [u8; 32] = peer_id.try_into().expect("split_at(32) 保证");
-    let (secret, rest) = rest.split_at(32);
-    let secret: [u8; 32] = secret.try_into().expect("split_at(32) 保证");
-    let (&ep_count, mut rest) = rest.split_first().ok_or(TokenError::Corrupted)?; // 不可达（MIN_BODY_LEN 已含 1B）
+    let mut peer_id: Option<[u8; 32]> = None;
+    let mut secret: Option<[u8; 32]> = None;
+    let mut endpoints: Option<Vec<EndpointRef<'_>>> = None;
+    let mut rpk: Option<RpkPubKey> = None;
 
+    for _ in 0..seg_count {
+        if rest.len() < SEG_HEAD {
+            return Err(TokenError::Malformed {
+                reason: "段头不足（声明段数与载荷不符）",
+            });
+        }
+        let (typ, len_b) = (rest[0], [rest[1], rest[2]]);
+        let len = u16::from_be_bytes(len_b) as usize;
+        rest = &rest[SEG_HEAD..];
+        if rest.len() < len {
+            return Err(TokenError::Malformed {
+                reason: "段体越界（长度声明大于余量）",
+            });
+        }
+        let (seg, tail) = rest.split_at(len);
+        rest = tail;
+        match typ {
+            t if t == SEG_PEER_ID | SEG_CRITICAL => {
+                peer_id = Some(seg.try_into().map_err(|_| TokenError::Malformed {
+                    reason: "peerId 段长度不为 32",
+                })?);
+            }
+            t if t == SEG_SECRET | SEG_CRITICAL => {
+                secret = Some(seg.try_into().map_err(|_| TokenError::Malformed {
+                    reason: "secret 段长度不为 32",
+                })?);
+            }
+            t if t == SEG_ENDPOINTS | SEG_CRITICAL => {
+                endpoints = Some(parse_endpoint_list(seg)?);
+            }
+            t if t == SEG_RPK => {
+                let b: [u8; 32] = seg.try_into().map_err(|_| TokenError::Malformed {
+                    reason: "rpk 段长度不为 32",
+                })?;
+                rpk = Some(RpkPubKey::from(b));
+            }
+            t if t & SEG_CRITICAL != 0 => {
+                // 不认识的 critical 段 ⇒ 拒整串（防 fail-open：只跳过会让新写方以为语义已生效）
+                return Err(TokenError::Malformed {
+                    reason: "不认识的 critical 段",
+                });
+            }
+            _ => {} // 不认识的 info 段：跳过（前向兼容的唯一通道）
+        }
+    }
+    if !rest.is_empty() {
+        return Err(TokenError::Malformed {
+            reason: "载荷尾部有多余字节",
+        });
+    }
+    let peer_id = peer_id.ok_or(TokenError::Malformed {
+        reason: "缺少 peerId 段",
+    })?;
+    let secret = secret.ok_or(TokenError::Malformed {
+        reason: "缺少 secret 段",
+    })?;
+    let endpoints = endpoints.ok_or(TokenError::Malformed {
+        reason: "缺少端点段",
+    })?;
+    Ok(TokenRef {
+        peer_id,
+        secret,
+        endpoints,
+        rpk,
+    })
+}
+
+/// `epList` 段体解析（字节含义与旧布局**零变化**：`epCount(1) ‖ [type(1)+len(1)+addr]*`）。
+fn parse_endpoint_list(seg: &[u8]) -> Result<Vec<EndpointRef<'_>>, TokenError> {
+    let (&ep_count, mut rest) = seg.split_first().ok_or(TokenError::Malformed {
+        reason: "端点段为空",
+    })?;
     let mut endpoints = Vec::with_capacity(usize::from(ep_count));
     for _ in 0..ep_count {
         if rest.len() < 2 {
@@ -388,26 +478,12 @@ pub fn parse_body(raw: &[u8]) -> Result<TokenRef<'_>, TokenError> {
             kind: EndpointKind::from_wire(typ),
         });
     }
-    // 可选尾字段：恰 32B = 出口 RPK 裸公钥（M1 追加）；其余尾长一律拒（不猜）。
-    let rpk = match rest.len() {
-        0 => None,
-        32 => {
-            let mut b = [0u8; 32];
-            b.copy_from_slice(rest);
-            Some(RpkPubKey::from(b))
-        }
-        _ => {
-            return Err(TokenError::Malformed {
-                reason: "载荷尾部有多余字节",
-            })
-        }
-    };
-    Ok(TokenRef {
-        peer_id,
-        secret,
-        endpoints,
-        rpk,
-    })
+    if !rest.is_empty() {
+        return Err(TokenError::Malformed {
+            reason: "端点段尾部有多余字节",
+        });
+    }
+    Ok(endpoints)
 }
 
 /// 端点地址合法性：镜像 Go `net.SplitHostPort` 的**结构规则**（纯切分器——端口非数字、
@@ -470,9 +546,18 @@ pub struct TokenSpec<'a> {
     pub rpk: Option<&'a RpkPubKey>,
 }
 
-/// 编码并 base64url（无填充）。校验与 Go `EncodeToken` 同面：端点地址须过 host:port
-/// 结构校验、长度 ≤255；端点数 ≤255。
+/// 编码并 base64url（无填充）。校验同旧面：端点地址须过 host:port 结构校验、长度 ≤255；
+/// 端点数 ≤255。
 pub fn encode(spec: &TokenSpec<'_>) -> Result<String, TokenError> {
+    let body = encode_body(spec)?;
+    let mut out = String::with_capacity(PREFIX.len() + body.len().div_ceil(3) * 4);
+    out.push_str(PREFIX);
+    out.push_str(&B64.encode(&body));
+    Ok(out)
+}
+
+/// v2 容器 body（`segCount ‖ 段* ‖ crc(4)`；**不含**版本前缀，供 `hmw2` 与本仓自产向量用）。
+pub fn encode_body(spec: &TokenSpec<'_>) -> Result<Vec<u8>, TokenError> {
     for e in spec.endpoints {
         validate_host_port(e.addr)?;
         if e.addr.len() > 255 {
@@ -486,8 +571,58 @@ pub fn encode(spec: &TokenSpec<'_>) -> Result<String, TokenError> {
             reason: "端点数超上限",
         });
     }
+    let mut eps = Vec::with_capacity(1 + spec.endpoints.len() * 3);
+    eps.push(spec.endpoints.len() as u8);
+    for e in spec.endpoints {
+        eps.push(e.kind.to_wire());
+        eps.push(e.addr.len() as u8);
+        eps.extend_from_slice(e.addr.as_bytes());
+    }
+    let mut segs = Vec::with_capacity(1 + 3 * 3 + eps.len() + 35 + 4);
+    segs.push(if spec.rpk.is_some() { 4u8 } else { 3 }); // segCount
+    push_segment(&mut segs, SEG_PEER_ID | SEG_CRITICAL, spec.peer_id.as_bytes());
+    push_segment(&mut segs, SEG_SECRET | SEG_CRITICAL, spec.secret.as_bytes());
+    push_segment(&mut segs, SEG_ENDPOINTS | SEG_CRITICAL, &eps);
+    if let Some(k) = spec.rpk {
+        push_segment(&mut segs, SEG_RPK, k.as_bytes());
+    }
+    let sum = Sha256::digest(&segs);
+    segs.extend_from_slice(&sum[..4]);
+    Ok(segs)
+}
 
-    let mut buf = Vec::with_capacity(MIN_BODY_LEN + spec.endpoints.len() * 3);
+/// 段写入（`segType(1) ‖ len(2 BE) ‖ body`；body 长度上界 = u16）。
+fn push_segment(out: &mut Vec<u8>, typ: u8, body: &[u8]) {
+    debug_assert!(body.len() <= u16::MAX as usize, "段体超 u16 上界（构造期已钳）");
+    out.push(typ);
+    out.extend_from_slice(&(body.len() as u16).to_be_bytes());
+    out.extend_from_slice(body);
+}
+
+// ---------------------------------------------------------------------------
+// 【冻结】v1 布局 body —— 只服务 `rl1` 中继 token（`relay/rltoken.rs`）
+// ---------------------------------------------------------------------------
+
+/// 【**冻结**：不得随 `hmw2` 演进】v1 布局 body：`peerId(32) ‖ secret(32) ‖ epCount(1) ‖
+/// [type(1)+len(1)+addr]* ‖ [rpk(32)]? ‖ crc(4)`（含 crc，**不含**版本前缀）。
+///
+/// 为什么保留：`rl1` 中继 token 的 body 冻结在 v1 布局（设计 §5.1-(c)）⇒ 中继 wire
+/// **零变化**（「中继零改动」红线）。本对函数是 rl1 的 wire 真源，修改即改中继格式。
+pub fn encode_v1_body(spec: &TokenSpec<'_>) -> Result<Vec<u8>, TokenError> {
+    for e in spec.endpoints {
+        validate_host_port(e.addr)?;
+        if e.addr.len() > 255 {
+            return Err(TokenError::Malformed {
+                reason: "端点地址过长",
+            });
+        }
+    }
+    if spec.endpoints.len() > 255 {
+        return Err(TokenError::Malformed {
+            reason: "端点数超上限",
+        });
+    }
+    let mut buf = Vec::with_capacity(32 + 32 + 1 + spec.endpoints.len() * 3 + 32 + 4);
     buf.extend_from_slice(spec.peer_id.as_bytes());
     buf.extend_from_slice(spec.secret.as_bytes());
     buf.push(spec.endpoints.len() as u8);
@@ -501,10 +636,80 @@ pub fn encode(spec: &TokenSpec<'_>) -> Result<String, TokenError> {
     }
     let sum = Sha256::digest(&buf);
     buf.extend_from_slice(&sum[..4]);
-    let mut out = String::with_capacity(PREFIX.len() + buf.len().div_ceil(3) * 4);
-    out.push_str(PREFIX);
-    out.push_str(&B64.encode(&buf));
-    Ok(out)
+    Ok(buf)
+}
+
+/// 【**冻结**】v1 body 的 base64url 解码 + 解析（`rl1` 用；入参 = 前缀**之后**的正文）。
+pub fn decode_v1_body(body_b64: &str) -> Result<Token, TokenError> {
+    let cleaned = body_b64.replace(['\r', '\n'], "");
+    let raw = B64
+        .decode(cleaned.as_bytes())
+        .map_err(|_| TokenError::Malformed {
+            reason: "base64url 解码失败",
+        })?;
+    Ok(parse_v1_body(&raw)?.into())
+}
+
+/// 【**冻结**】v1 body 借用解析（CRC 校验先行；布局见 [`encode_v1_body`]）。
+pub fn parse_v1_body(raw: &[u8]) -> Result<TokenRef<'_>, TokenError> {
+    if raw.len() < MIN_V1_BODY_LEN {
+        return Err(TokenError::Corrupted);
+    }
+    let (body, crc) = raw.split_at(raw.len() - 4);
+    let sum = Sha256::digest(body);
+    if sum[..4] != *crc {
+        return Err(TokenError::Corrupted);
+    }
+    let (peer_id, rest) = body.split_at(32);
+    let peer_id: [u8; 32] = peer_id.try_into().expect("split_at(32) 保证");
+    let (secret, rest) = rest.split_at(32);
+    let secret: [u8; 32] = secret.try_into().expect("split_at(32) 保证");
+    let (&ep_count, mut rest) = rest.split_first().ok_or(TokenError::Corrupted)?;
+    let mut endpoints = Vec::with_capacity(usize::from(ep_count));
+    for _ in 0..ep_count {
+        if rest.len() < 2 {
+            return Err(TokenError::Malformed {
+                reason: "端点数量声明与载荷不符（端点头不足）",
+            });
+        }
+        let (&typ, &addr_len) = (&rest[0], &rest[1]);
+        rest = &rest[2..];
+        if addr_len == 0 || rest.len() < usize::from(addr_len) {
+            return Err(TokenError::Malformed {
+                reason: "端点长度越界或为零",
+            });
+        }
+        let (addr_bytes, rest2) = rest.split_at(usize::from(addr_len));
+        rest = rest2;
+        let addr = core::str::from_utf8(addr_bytes).map_err(|_| TokenError::Malformed {
+            reason: "端点地址非 UTF-8",
+        })?;
+        validate_host_port(addr)?;
+        endpoints.push(EndpointRef {
+            addr,
+            kind: EndpointKind::from_wire(typ),
+        });
+    }
+    // 可选尾字段：恰 32B = 出口 RPK 裸公钥；其余尾长一律拒（不猜）。
+    let rpk = match rest.len() {
+        0 => None,
+        32 => {
+            let mut b = [0u8; 32];
+            b.copy_from_slice(rest);
+            Some(RpkPubKey::from(b))
+        }
+        _ => {
+            return Err(TokenError::Malformed {
+                reason: "载荷尾部有多余字节",
+            })
+        }
+    };
+    Ok(TokenRef {
+        peer_id,
+        secret,
+        endpoints,
+        rpk,
+    })
 }
 
 #[cfg(test)]
@@ -575,22 +780,121 @@ mod tests {
         assert_eq!(parse_body(&raw).unwrap().rpk(), Some(rpk));
     }
 
-    /// 尾字段**只认恰 32B**：1/31/33/64 字节一律 Malformed（不留「猜长度」的口子）。
+    /// **容器化换来的唯一新能力**：不认识的 **info** 段可跳过（前向兼容通道），
+    /// 不认识的 **critical** 段整串拒（fail-closed，防「新写方以为语义已生效」）。
     #[test]
-    fn rpk_field_rejects_other_trailing_lengths() {
+    fn unknown_segment_criticality_is_closed() {
+        let peer = PeerId::from([0x31; 32]);
+        let secret = Secret::from([0x32; 32]);
+        let base = encode_body(&TokenSpec {
+            peer_id: &peer,
+            secret: &secret,
+            endpoints: &[],
+            rpk: None,
+        })
+        .unwrap();
+
+        // info 段（0x05，高位 0）：跳过 + 其余字段照解
+        let mut with_info = base.clone();
+        with_info.truncate(with_info.len() - 4);
+        with_info[0] = 4; // segCount 3 → 4
+        with_info.push(0x05);
+        with_info.extend_from_slice(&3u16.to_be_bytes());
+        with_info.extend_from_slice(b"abc");
+        let sum = Sha256::digest(&with_info[..]);
+        with_info.extend_from_slice(&sum[..4]);
+        let t = parse_body(&with_info).expect("不认识的 info 段应可跳过");
+        assert_eq!(t.peer_id, [0x31u8; 32]);
+        assert_eq!(t.endpoints().len(), 0);
+
+        // critical 段（0x85）：整串拒
+        let mut with_crit = base;
+        with_crit.truncate(with_crit.len() - 4);
+        with_crit[0] = 4;
+        with_crit.push(0x85);
+        with_crit.extend_from_slice(&3u16.to_be_bytes());
+        with_crit.extend_from_slice(b"abc");
+        let sum = Sha256::digest(&with_crit[..]);
+        with_crit.extend_from_slice(&sum[..4]);
+        match parse_body(&with_crit) {
+            Err(TokenError::Malformed { reason }) => {
+                assert_eq!(reason, "不认识的 critical 段")
+            }
+            other => panic!("未知 critical 段应整串拒，实得 {other:?}"),
+        }
+    }
+
+    /// **v2 的「猜长度」口子已结构性消失**（段头自带 len）：①段体长度声明 > 余量 ⇒ Malformed；
+    /// ②段数声明与载荷不符 ⇒ Malformed；③rpk 段体长度 ≠ 32 ⇒ Malformed。
+    /// 【冻结】v1（rl1 路径）仍保留旧的「尾长只认恰 32B」纪律——同批钉住。
+    #[test]
+    fn malformed_declared_lengths_are_rejected() {
+        // ①段体越界：1 段声明 len=200 但只有 32B 体（余量另 40B 垫底——保证过下界门）
+        let mut body = vec![1u8]; // segCount = 1
+        body.push(SEG_PEER_ID | SEG_CRITICAL);
+        body.extend_from_slice(&200u16.to_be_bytes());
+        body.extend_from_slice(&[0xAA; 32]);
+        body.extend_from_slice(&[0x00; 40]);
+        let sum = Sha256::digest(&body);
+        body.extend_from_slice(&sum[..4]);
+        match parse_body(&body) {
+            Err(TokenError::Malformed { reason }) => assert_eq!(reason, "段体越界（长度声明大于余量）"),
+            other => panic!("段体越界应判 Malformed，实得 {other:?}"),
+        }
+        // ②段数声明 > 实际段数：声明 2 段，第 2 段的段头只给 2B（够不着 SEG_HEAD=3）
+        let mut body = vec![2u8];
+        body.push(SEG_ENDPOINTS | SEG_CRITICAL);
+        let addr = format!("127.0.0.1:{}", "9".repeat(245)); // 255B 地址（段体足够大 ⇒ 过下界门）
+        let mut ep = vec![1u8];
+        ep.push(EndpointKind::Quic.to_wire());
+        ep.push(addr.len() as u8);
+        ep.extend_from_slice(addr.as_bytes());
+        body.extend_from_slice(&(ep.len() as u16).to_be_bytes());
+        body.extend_from_slice(&ep);
+        body.extend_from_slice(&[SEG_SECRET | SEG_CRITICAL, 0x00]); // 截断的段头
+        let sum = Sha256::digest(&body);
+        body.extend_from_slice(&sum[..4]);
+        match parse_body(&body) {
+            Err(TokenError::Malformed { reason }) => {
+                assert_eq!(reason, "段头不足（声明段数与载荷不符）")
+            }
+            other => panic!("段数不符应判 Malformed，实得 {other:?}"),
+        }
+        // ③rpk 段体长度 ≠ 32
+        let peer = PeerId::from([0x11; 32]);
+        let secret = Secret::from([0x22; 32]);
+        let mut body = encode_body(&TokenSpec {
+            peer_id: &peer,
+            secret: &secret,
+            endpoints: &[],
+            rpk: None,
+        })
+        .unwrap();
+        body.truncate(body.len() - 4); // 去 CRC，改成乱段
+        body[0] = 4; // segCount：3 → 4（多一枚 rpk 段）
+        body.push(SEG_RPK);
+        body.extend_from_slice(&7u16.to_be_bytes());
+        body.extend_from_slice(&[0xAA; 7]);
+        let sum = Sha256::digest(&body);
+        body.extend_from_slice(&sum[..4]);
+        match parse_body(&body) {
+            Err(TokenError::Malformed { reason }) => assert_eq!(reason, "rpk 段长度不为 32"),
+            other => panic!("rpk 段长度错应判 Malformed，实得 {other:?}"),
+        }
+        // 【冻结】v1 尾长纪律（rl1 路径）
         for extra in [1usize, 31, 33, 64] {
-            let mut body = Vec::new();
-            body.extend_from_slice(&[0x01u8; 32]); // peer
-            body.extend_from_slice(&[0x02u8; 32]); // secret
-            body.push(0); // epCount = 0
-            body.extend(std::iter::repeat_n(0xAAu8, extra));
-            let sum = Sha256::digest(&body);
-            body.extend_from_slice(&sum[..4]);
-            match parse_body(&body) {
+            let mut v1 = Vec::new();
+            v1.extend_from_slice(&[0x01u8; 32]);
+            v1.extend_from_slice(&[0x02u8; 32]);
+            v1.push(0);
+            v1.extend(std::iter::repeat_n(0xAAu8, extra));
+            let sum = Sha256::digest(&v1);
+            v1.extend_from_slice(&sum[..4]);
+            match parse_v1_body(&v1) {
                 Err(TokenError::Malformed { reason }) => {
                     assert_eq!(reason, "载荷尾部有多余字节", "extra={extra}")
                 }
-                other => panic!("extra={extra} 应判 Malformed，实得 {other:?}"),
+                other => panic!("v1 extra={extra} 应判 Malformed，实得 {other:?}"),
             }
         }
     }
@@ -616,8 +920,8 @@ mod tests {
 
     #[test]
     fn decode_empty_and_short() {
-        // base64 解码后 < 69B → Corrupted（Go 同）
-        for s in ["hmw1", "hmw1AAAA"] {
+        // base64 解码后 < 79B（v2 下界）→ Corrupted（同旧语义）
+        for s in ["hmw2", "hmw2AAAA"] {
             assert_eq!(decode(s), Err(TokenError::Corrupted), "{s}");
         }
         // Go 侧此串 panic（已登记差异 G1）；seen 取不足 4 字符的全量
@@ -630,7 +934,7 @@ mod tests {
         assert_eq!(
             decode("rl1AAAA"),
             Err(TokenError::Malformed {
-                reason: "缺少 hmw1 前缀"
+                reason: "缺少 hmw2 前缀"
             })
         );
     }
@@ -675,7 +979,7 @@ mod tests {
             "homeway/token: 不支持的 token 版本: hmw2"
         );
         let m = TokenError::Malformed {
-            reason: "缺少 hmw1 前缀",
+            reason: "缺少 hmw2 前缀",
         }
         .to_string();
         assert!(m.starts_with("homeway/token: 格式非法: "), "{m}"); // ASCII 冒号空格
@@ -766,11 +1070,12 @@ mod tests {
     }
 
 
-    /// **判据（S1-8）**：QUIC 类端点 encode/decode 往返 + **既有 WG 端点逐字节不变**。
+    /// **判据（S1-8 / M5 S5t 改判）**：QUIC 类端点 encode/decode 往返 + **WG 条目字节不变**。
     ///
-    /// 「逐字节不变」的验法：同一端点表去掉 QUIC 条目后，载荷里的 **WG 段字节**必须与
-    /// 含 QUIC 条目的那串**逐字节相同**（QUIC 只追加自己的段，不动前文）；同时
-    /// `direct_endpoints`/`relay_endpoints` 的过滤结果不受 QUIC 条目影响。
+    /// v2 段容器下的「不变」口径 = **`epList` 段体内**前 N 条（`type|len|addr` 三段字节）
+    /// 逐字节相同（QUIC 只追加自己的条目，不动前文）——旧口径的「载荷里前 65B」在容器化
+    /// 后不再成立（头部多了 segCount 与段头），故按段定位；`direct_endpoints`/
+    /// `relay_endpoints` 的过滤结果不受 QUIC 条目影响（同旧）。
     #[test]
     fn quic_endpoint_kind_round_trips_and_keeps_direct_bytes() {
         let peer_id = PeerId::from([0x51; 32]);
@@ -794,20 +1099,33 @@ mod tests {
         })
         .expect("编码");
 
-        // ① WG 段字节不变：解出段序列的前两段（type+len+addr）逐字节相同
+        // ① WG 条目字节不变：解出 `epList` 段体，取前两段（type+len+addr）逐字节相同
         let body = |s: &str| -> Vec<u8> {
             B64.decode(s.strip_prefix(PREFIX).unwrap()).expect("base64")
         };
-        let segs = |b: &[u8], n: usize| -> Vec<u8> {
-            let mut off = 65; // peer(32)+secret(32)+count(1)
+        // epList 段体定位（段序 = peerId/secret/epList[/rpk]；见文件头布局）
+        let ep_list = |b: &[u8]| -> Vec<u8> {
+            let mut off = 1; // segCount
+            for _ in 0..b[0] {
+                let len = u16::from_be_bytes([b[off + 1], b[off + 2]]) as usize;
+                if b[off] == (SEG_ENDPOINTS | SEG_CRITICAL) {
+                    return b[off + SEG_HEAD..off + SEG_HEAD + len].to_vec();
+                }
+                off += SEG_HEAD + len;
+            }
+            panic!("epList 段不在");
+        };
+        let eps_of = |b: &[u8], n: usize| -> Vec<u8> {
+            let list = ep_list(b);
+            let mut off = 1; // epCount
             for _ in 0..n {
-                let ln = b[off + 1] as usize;
+                let ln = list[off + 1] as usize;
                 off += 2 + ln;
             }
-            b[65..off].to_vec()
+            list[1..off].to_vec()
         };
-        assert_eq!(segs(&body(&tok_direct), 2), segs(&body(&tok_quic), 2), "直连段逐字节不变");
-        assert_eq!(body(&tok_quic)[64], 4, "端点计数 = 4（含 2 条 QUIC）");
+        assert_eq!(eps_of(&body(&tok_direct), 2), eps_of(&body(&tok_quic), 2), "WG 条目逐字节不变");
+        assert_eq!(ep_list(&body(&tok_quic))[0], 4, "端点计数 = 4（含 2 条 QUIC）");
 
         // ② 往返：类别与地址逐条还原；过滤函数各归各族
         let t = decode(&tok_quic).expect("解析");

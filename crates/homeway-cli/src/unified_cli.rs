@@ -429,7 +429,7 @@ impl UnifiedRoles {
     }
 }
 
-/// hmw1… 掩码（Go server.MaskToken 同串：前 12 字符 + 总长）。
+/// hmw2… 掩码（Go server.MaskToken 同串：前 12 字符 + 总长）。
 fn mask_token(tok: &str) -> Option<String> {
     if tok.is_empty() {
         return None;
@@ -1548,9 +1548,9 @@ mod tests {
     /// 掩码形态（Go maskToken 同串）。
     #[test]
     fn token_mask_matches_go() {
-        let t = "hmw1abcdefghijklmnopqrstuvwxyz"; // 30 字符
-        assert_eq!(mask_token(t).unwrap(), "hmw1abcdefgh…（30 字符）"); // 前 12 字符 + 总长（Go 同串）
-        assert_eq!(mask_token("hmw1ab").unwrap(), "hmw1…");
+        let t = "hmw2abcdefghijklmnopqrstuvwxyz"; // 30 字符
+        assert_eq!(mask_token(t).unwrap(), "hmw2abcdefgh…（30 字符）"); // 前 12 字符 + 总长（Go 同串）
+        assert_eq!(mask_token("hmw2ab").unwrap(), "hmw2…");
         assert_eq!(mask_token(""), None);
     }
 

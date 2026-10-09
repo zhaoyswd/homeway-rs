@@ -422,7 +422,7 @@ mod tests {
         let ns = open_node_state(&d).unwrap();
         assert!(d.join("cache").join("events.log").exists(), "events.log 应建");
         assert!(d.join("cache").join("debug.log").exists(), "debug.log 应建");
-        ns.events.quietf("客户端 token（端点已变化…）：hmw1TEST", false);
+        ns.events.quietf("客户端 token（端点已变化…）：hmw2TEST", false);
         ns.debug.dlogf("peer: + dev=… n=1/32", false);
         let ev = std::fs::read_to_string(d.join("cache").join("events.log")).unwrap();
         assert!(ev.contains("端点已变化"), "quietf 落 events.log");

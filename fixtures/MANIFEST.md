@@ -8,7 +8,8 @@
 
 | 文件 | 族 | 生成方式 |
 |---|---|---|
-| `vectors/token.json` | hmw1 token 编解码 + 三类错误（corrupted/unsupported_version/malformed） | `tools/gen-vectors.sh`（模板 `tools/vector-gen/`，克隆内 `pkg/proto` 真源产出） |
+| ~~`vectors/token.json`~~ | **已退役（M5 S5t）**——Go 冻结向量是 **hmw1 布局**的 oracle；M5 换 `hmw2` 段容器（无兼容包袱）⇒ 不再是对齐面，登记为历史参照 | 原：`tools/gen-vectors.sh`（脚本已同批停产出该文件） |
+| `vectors/token_hmw2.json` | **hmw2 段容器** token 编解码 + 三类错误（**本仓自产**；锚 = 入库文件字节） | `cargo test -p homeway-core --test token_vectors bless_token_hmw2_vectors -- --ignored`（生成器 = `crates/homeway-core/tests/token_vectors.rs`） |
 | `vectors/tunnel_addr.json` | DeriveTunnelIP / DeriveTunIP（含守卫命中样本钉死 hw-app.N 再散列路径） | 同上 |
 | `vectors/identity.json` | master+peerID → WG 私钥/公钥；master → devTag（含 LoadOrCreateIdentity 全路径交叉验证） | 同上（克隆内直调 `clientcore/internal/wtransport` 未导出派生函数） |
 | `vectors/psk.json` | token secret → WG PSK（HKDF 域分离 `homeway/wg-psk`；R1 技术评审 S1 补——握手热路径派生错 = AEAD tag 失败难归因） | 同上（克隆内 `pkg/proto.DerivePSK` 真源产出） |

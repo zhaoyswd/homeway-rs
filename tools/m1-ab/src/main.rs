@@ -16,10 +16,10 @@
 //!
 //! 用法：
 //! ```text
-//! m1-ab run     --token <hmw1…> --transport wg|quic [--secs 8] [--rate 0] [--window 32]
+//! m1-ab run     --token <hmw2…> --transport wg|quic [--secs 8] [--rate 0] [--window 32]
 //!               [--req-size 60] [--reply-size 1252] [--reply-count 1]
 //!               [--force-relay] [--bind 127.0.0.2:0] [--tag N] [--workdir DIR]
-//! m1-ab migrate --token <hmw1…> [--secs 24] [--rate 100] [--window 8]
+//! m1-ab migrate --token <hmw2…> [--secs 24] [--rate 100] [--window 8]
 //!               [--migrate-after 8] [--alt-bind 127.0.0.2:0] [--relay ip:port]
 //! ```
 //! 读数形态 = `m1ab: key=value` 行（机器可解析）+ 逐秒表（`sec=N sent=… acked=…`）。
@@ -81,13 +81,13 @@ struct Args {
 
 fn usage() -> ! {
     eprintln!(
-        "用法：\n  m1-ab run --token <hmw1…> --transport wg|quic [--secs 8] [--rate 0] [--window 32]\n\
+        "用法：\n  m1-ab run --token <hmw2…> --transport wg|quic [--secs 8] [--rate 0] [--window 32]\n\
          \x20            [--req-size 60] [--reply-size 1252] [--reply-count 1]\n\
          \x20            [--force-relay（中继端点留、QUIC 直连改死）| --force-direct（中继改死）]\n\
          \x20            [--bind 127.0.0.2:0] [--tag N] [--workdir DIR]\n\
          \x20            [--mtu-cap 1200（**只 migrate 档**：岛缝窄路径注入；run 档走 facade ⇒ 旋钮 = HOMEWAY_QUIC_MTU）]\n\
          \x20            [--quic-ep 127.0.0.1:P（token 的 QUIC 端点统统改指此处——延迟代理注入）]\n\
-         \x20 m1-ab migrate --token <hmw1…> [--secs 24] [--rate 100] [--migrate-after 8]\n\
+         \x20 m1-ab migrate --token <hmw2…> [--secs 24] [--rate 100] [--migrate-after 8]\n\
          \x20            [--alt-bind 127.0.0.2:0] [--relay ip:port] [--workdir DIR]"
     );
     std::process::exit(2);

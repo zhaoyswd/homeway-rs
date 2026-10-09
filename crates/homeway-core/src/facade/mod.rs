@@ -713,7 +713,7 @@ mod tests {
     #[test]
     fn two_phase_lifecycle() {
         let core = core_with(true, true);
-        assert_eq!(core.tun_prepare(r#"{"token":"hmw1-x"}"#, true), 0);
+        assert_eq!(core.tun_prepare(r#"{"token":"hmw2-x"}"#, true), 0);
         wait_stage(&core, TunStage::Ready, Duration::from_secs(2));
         assert!(core.tun_status().contains("\"state\":\"ready\""));
         assert!(core.tun_status().contains("\"readyBy\":\"wg\""));
@@ -733,10 +733,10 @@ mod tests {
         let core = core_with(true, true);
         assert_eq!(core.tun_prepare("{oops", true), -3);
         assert_eq!(core.tun_prepare(r#"{"mtu":1280}"#, true), -3);
-        assert_eq!(core.tun_prepare(r#"{"token":"hmw1-x"}"#, false), -2);
-        assert_eq!(core.tun_prepare(r#"{"token":"hmw1-x"}"#, true), 0);
+        assert_eq!(core.tun_prepare(r#"{"token":"hmw2-x"}"#, false), -2);
+        assert_eq!(core.tun_prepare(r#"{"token":"hmw2-x"}"#, true), 0);
         // 在世世代：-1 忙
-        assert_eq!(core.tun_prepare(r#"{"token":"hmw1-x"}"#, true), -1);
+        assert_eq!(core.tun_prepare(r#"{"token":"hmw2-x"}"#, true), -1);
     }
 
     /// attach rc 契约：fd≤0 → -3 + failed；未 ready → -1；失败 → -4 + failed 终态保留。
@@ -750,7 +750,7 @@ mod tests {
         assert_eq!(core2.tun_attach(90, 1280), -1);
         // prepare 后 attach 失败：-4 + failed 终态保留 + 放锁（可再次 prepare）
         let core3 = core_with(true, false);
-        assert_eq!(core3.tun_prepare(r#"{"token":"hmw1-x"}"#, true), 0);
+        assert_eq!(core3.tun_prepare(r#"{"token":"hmw2-x"}"#, true), 0);
         wait_stage(&core3, TunStage::Ready, Duration::from_secs(2));
         assert_eq!(core3.tun_attach(90, 1280), -4);
         assert!(
@@ -759,7 +759,7 @@ mod tests {
         );
         assert_eq!(core3.tun_running(), 0);
         // failed 后锁已放：可重新 prepare
-        assert_eq!(core3.tun_prepare(r#"{"token":"hmw1-x"}"#, true), 0);
+        assert_eq!(core3.tun_prepare(r#"{"token":"hmw2-x"}"#, true), 0);
     }
 
     /// stop 契约：本就没跑 0；收工完成 0（终态由世代写——工单③）；收工卡死 →
@@ -768,24 +768,24 @@ mod tests {
     fn stop_rc_contract() {
         let core = core_with(true, true);
         assert_eq!(core.tun_stop(), 0); // 本就没跑
-        core.tun_prepare(r#"{"token":"hmw1-x"}"#, true);
+        core.tun_prepare(r#"{"token":"hmw2-x"}"#, true);
         // 世代线程挂住不收 stop（stop_tx 被 drop 前挂在 recv 上）⇒ 等 3s 后 -2 放锁
         // 受控执行体收 stop 即收尾 ⇒ 正常路径 0
         wait_stage(&core, TunStage::Ready, Duration::from_secs(2));
         assert_eq!(core.tun_stop(), 0);
         // 放锁后可重启（无 -1 忙）
-        assert_eq!(core.tun_prepare(r#"{"token":"hmw1-x"}"#, true), 0);
+        assert_eq!(core.tun_prepare(r#"{"token":"hmw2-x"}"#, true), 0);
     }
 
     /// 同步硬失败（warmup 返回 Err）：受理 0 + failed 终态可读 + 锁已放。
     #[test]
     fn sync_hard_fail_releases_lock() {
         let core = ClientCore::new(Arc::new(NoopTunExecutor));
-        assert_eq!(core.tun_prepare(r#"{"token":"hmw1-x"}"#, true), 0);
+        assert_eq!(core.tun_prepare(r#"{"token":"hmw2-x"}"#, true), 0);
         assert!(core.tun_status().contains("\"state\":\"failed\""));
         assert!(core.tun_status().contains("无执行体"));
         // 锁已放：可再次 prepare
-        assert_eq!(core.tun_prepare(r#"{"token":"hmw1-x"}"#, true), 0);
+        assert_eq!(core.tun_prepare(r#"{"token":"hmw2-x"}"#, true), 0);
     }
 
     /// SetForeground 返回上一状态；false→true 踢补探钩。
@@ -839,7 +839,7 @@ mod tests {
             ),
             -1
         );
-        core.tun_prepare(r#"{"token":"hmw1-x"}"#, true);
+        core.tun_prepare(r#"{"token":"hmw2-x"}"#, true);
         wait_stage(&core, TunStage::Ready, Duration::from_secs(2));
         core.tun_attach(90, 1280);
         wait_stage(&core, TunStage::Attached, Duration::from_secs(2));
@@ -857,7 +857,7 @@ mod tests {
     #[test]
     fn config_json_camelcase_rename() {
         let cfg: TunConfigJson = serde_json::from_str(
-            r#"{"mtu":1280,"out":"/l","dialMs":9000,"statsSecs":30,"endpointCacheDir":"/ec","identityDir":"/id","diagFdSecs":5,"tzOffsetMinutes":480,"token":"hmw1-x","portForwards":[{"listen":18080,"targetIp":"","targetPort":80}]}"#,
+            r#"{"mtu":1280,"out":"/l","dialMs":9000,"statsSecs":30,"endpointCacheDir":"/ec","identityDir":"/id","diagFdSecs":5,"tzOffsetMinutes":480,"token":"hmw2-x","portForwards":[{"listen":18080,"targetIp":"","targetPort":80}]}"#,
         )
         .unwrap();
         assert_eq!(cfg.mtu, 1280);
@@ -868,7 +868,7 @@ mod tests {
         assert_eq!(cfg.identity_dir, "/id");
         assert_eq!(cfg.diag_fd_secs, 5);
         assert_eq!(cfg.tz_offset_minutes, 480);
-        assert_eq!(cfg.token, "hmw1-x");
+        assert_eq!(cfg.token, "hmw2-x");
         assert_eq!(cfg.port_forwards.len(), 1);
         assert_eq!(cfg.port_forwards[0].listen, 18080);
         // speedtest 参数同面（r1-F08）
@@ -923,13 +923,13 @@ mod tests {
     #[test]
     fn log_open_minus2_resets_stage_to_idle() {
         let core = ClientCore::new(Arc::new(LogOpenExec));
-        assert_eq!(core.tun_prepare(r#"{"token":"hmw1-x"}"#, true), -2);
+        assert_eq!(core.tun_prepare(r#"{"token":"hmw2-x"}"#, true), -2);
         let st = core.tun_status();
         assert!(
             st.contains("\"state\":\"idle\""),
             "log -2 后不得停在 preparing：{st}"
         );
         // 锁已放：可再次受理
-        assert_eq!(core.tun_prepare(r#"{"token":"hmw1-x"}"#, true), -2);
+        assert_eq!(core.tun_prepare(r#"{"token":"hmw2-x"}"#, true), -2);
     }
 }

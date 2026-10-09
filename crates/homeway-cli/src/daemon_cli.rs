@@ -38,7 +38,7 @@ pub fn op_err_text(e: &OpError) -> String {
         "shutting_down" => format!("守护进程收工中{extra}"),
         "host_exists" => format!("该后端已在主机表（同 token 重复添加）{extra}"),
         "no_host" => format!("主机不在表中{extra}"),
-        "bad_token" => format!("token 非法{extra}（token 形如 hmw1…，从出口启动日志现场获取后重新粘贴）"),
+        "bad_token" => format!("token 非法{extra}（token 形如 hmw2…，从出口启动日志现场获取后重新粘贴）"),
         "host_unreachable" => format!("全部端点探测无应答（host 全不可达）{extra}；确认出口在跑，或用 --force 跳过验证直接入表"),
         "stream_refused" => format!("流打开被拒{extra}"),
         "cursor_stale" => format!("订阅游标过旧/代际失配（需全量重快照）{extra}"),
@@ -671,13 +671,13 @@ fn host_add(args: &[String]) {
     let force = p.force;
     let state = p.state.clone();
     if p.positional.len() != 1 {
-        eprintln!("host add 需要 <token>（token 形如 hmw1…，从出口日志现场获取）");
+        eprintln!("host add 需要 <token>（token 形如 hmw2…，从出口日志现场获取）");
         std::process::exit(2);
     }
     let token = p.positional[0].trim().to_owned();
     // ①本地语法校验前置（spec host-cli「token 非法就地报错」：不探测、不连 daemon、不入表）。
     if let Err(e) = homeway_core::token::decode(&token) {
-        eprintln!("token 非法：{e}（token 形如 hmw1…，从出口启动日志现场获取后重新粘贴）");
+        eprintln!("token 非法：{e}（token 形如 hmw2…，从出口启动日志现场获取后重新粘贴）");
         std::process::exit(1);
     }
     let c = dial_control(&state, p.no_spawn);

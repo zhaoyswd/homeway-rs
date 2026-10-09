@@ -12,6 +12,7 @@
 
 use std::net::SocketAddr;
 
+use base64::Engine as _;
 use sha2::Digest;
 
 use crate::server::egress;
@@ -25,20 +26,31 @@ pub fn relay_secret_id(secret: &[u8; 32]) -> [u8; 32] {
 /// rl1 前缀。
 pub const PREFIX: &str = "rl1";
 
+/// base64url 无填充引擎（与 `token.rs` 的 `B64` **同参数**——rl1 body 的字节面不允许两套口径）。
+/// 容忍非规范尾位（Go 解码器默认不查）、拒尾缀 `=`。
+static BASE64: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
+    &base64::alphabet::URL_SAFE,
+    base64::engine::GeneralPurposeConfig::new()
+        .with_decode_padding_mode(base64::engine::DecodePaddingMode::RequireNone)
+        .with_decode_allow_trailing_bits(true)
+        .with_encode_padding(false),
+);
+
 /// 铸一枚 rl1 token（中继启动时打印；端点 = 中继自己的地址，可多个）。
 pub fn encode_relay_token(secret: &[u8; 32], endpoints: &[Endpoint]) -> Result<String, token::TokenError> {
     let eps: Vec<token::EndpointRef<'_>> = endpoints
         .iter()
         .map(|e| token::EndpointRef::new(e.addr.as_str(), e.kind))
         .collect();
-    let s = token::encode(&token::TokenSpec {
+    // **冻结**（M5 S5t）：rl1 的 body 走 v1 布局（`token::encode_v1_body`），与出口
+    // token 的 `hmw2` 段容器**完全解耦** ⇒ 中继 wire 零变化（设计 §5.1-(c)）。
+    let buf = token::encode_v1_body(&token::TokenSpec {
         peer_id: &token::PeerId::from(relay_secret_id(secret)),
         secret: &token::Secret::from(*secret),
         endpoints: &eps,
-        rpk: None, // M1：服务端 RPK 只随出口 token 走（中继 token 不涉 QUIC 端点，S1c）
+        rpk: None, // 服务端 RPK 只随出口 token 走（中继 token 不涉 QUIC 端点）
     })?;
-    // 前缀替换：encode 产 hmw1…，rl1 布局同体
-    Ok(format!("{}{}", PREFIX, &s[token::PREFIX.len()..]))
+    Ok(format!("{}{}", PREFIX, BASE64.encode(&buf)))
 }
 
 /// 解析 rl1 token（后端 `--relay rl1…` 面）。
@@ -48,15 +60,8 @@ pub fn decode_relay_token(input: &str) -> Result<Token, token::TokenError> {
         return Err(token::TokenError::Malformed { reason: "缺少 rl1 前缀" });
     }
     let body = &s[PREFIX.len()..];
-    // 复用 hmw1 的 body 解码（剥内嵌 \r\n + base64url + CRC + 布局）
-    let raw = token::decode(&format!("{}{}", token::PREFIX, body))
-        .map_err(|e| match e {
-            token::TokenError::UnsupportedVersion { .. } => {
-                token::TokenError::Malformed { reason: "rl1 载荷版本形态不符" }
-            }
-            other => other,
-        })?;
-    Ok(raw)
+    // 【冻结】v1 body 解码（剥内嵌 \r\n + base64url + CRC + 旧布局）——与 hmw2 容器解耦
+    token::decode_v1_body(body)
 }
 
 /// relay.key：加载或生成（0600；重启不变 ⇒ token 稳定，后端不用跟着改）。

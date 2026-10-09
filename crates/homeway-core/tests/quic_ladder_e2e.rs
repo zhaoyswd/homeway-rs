@@ -14,7 +14,7 @@
 //! **落纸时刻**（`Logf` 回调就地取时）算「出口最后一次可达 → 复探失败定音」。
 //!
 //! 环境契约（`tools/quic-ladder-e2e.sh` 设定）：
-//! - `HOMEWAY_LADDER_TOKEN`：出口 token（`serve token` 抽 `hmw1…`）
+//! - `HOMEWAY_LADDER_TOKEN`：出口 token（`serve token` 抽 `hmw2…`）
 //! - `HOMEWAY_LADDER_EXIT_LOG`：出口 stdout 日志路径
 //! - `HOMEWAY_LADDER_PIDFILE`：出口 pidfile（kill -9 用）
 //! - `HOMEWAY_LADDER_RESTART`：重启命令（形如 `/bin/zsh <repo>/tools/local-rust-exit.sh start 2`，

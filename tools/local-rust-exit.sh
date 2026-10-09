@@ -132,7 +132,7 @@ EOF
     our_pid "$CLIENT_PIDFILE" || { echo "!! 客户端启动即退出，看 $CLIENT_LOG" >&2; exit 1; }
     echo "==> 客户端 pid=$REPLY_PID"
   fi
-  tok=$("$0" token "$n" | grep -o 'hmw1[A-Za-z0-9+/=_-]*' | head -1)
+  tok=$("$0" token "$n" | grep -o 'hmw2[A-Za-z0-9+/=_-]*' | head -1)
   [[ -n "$tok" ]] || { echo "!! 取不到 Rust 出口 #$n 的 token（先 start）" >&2; exit 1; }
   echo "==> host add（token 已掩码取用，长度 ${#tok}）"
   CL0=$(log_lines "$CLIENT_STATE/cache/client.log")

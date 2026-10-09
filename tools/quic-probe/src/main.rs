@@ -25,8 +25,8 @@
 //! 用法（读数为机器可解析的 `key=value` 行；`--json` 时合成一行 JSON）：
 //!
 //! ```text
-//! quic-probe --token <hmw1…> [--via relay --relay <ip:port>] conn    # 握手 + 四帧准入 + DNS 一问一答
-//! quic-probe --token <hmw1…> [--via relay] push --n 2000 --size 1280 # 上行灌包（B1/B2 读数）
+//! quic-probe --token <hmw2…> [--via relay --relay <ip:port>] conn    # 握手 + 四帧准入 + DNS 一问一答
+//! quic-probe --token <hmw2…> [--via relay] push --n 2000 --size 1280 # 上行灌包（B1/B2 读数）
 //! ```
 //!
 //! 读数口径（设计 §7.2 B1）：**尺寸取本 socket 的字节计数**（= 线上 UDP 载荷，含中继
@@ -171,7 +171,7 @@ impl Args {
     }
 }
 
-// ---------- 最小 token 解析（`hmw1`；真源 crates/homeway-core/src/token.rs） ----------
+// ---------- 最小 token 解析（`hmw2`；真源 crates/homeway-core/src/token.rs） ----------
 
 struct TokenInfo {
     peer_id: [u8; 32],
@@ -182,9 +182,9 @@ struct TokenInfo {
 
 fn parse_token(s: &str) -> Result<TokenInfo, String> {
     let s: String = s.chars().filter(|c| !c.is_whitespace()).collect();
-    let body = s.strip_prefix("hmw1").ok_or("缺少 hmw1 前缀")?;
+    let body = s.strip_prefix("hmw2").ok_or("缺少 hmw2 前缀")?;
     let raw = B64.decode(body).map_err(|e| format!("base64: {e}"))?;
-    if raw.len() < 32 + 32 + 1 + 4 {
+    if raw.len() < 1 + 35 + 35 + 4 + 4 {
         return Err("载荷过短".into());
     }
     // crc = SHA-256(前文)[:4]
@@ -193,33 +193,58 @@ fn parse_token(s: &str) -> Result<TokenInfo, String> {
     if sum[..4] != tail[..] {
         return Err("CRC 校验失败".into());
     }
-    let peer_id: [u8; 32] = head[0..32].try_into().unwrap();
-    let secret: [u8; 32] = head[32..64].try_into().unwrap();
-    let count = head[64] as usize;
-    let mut off = 65;
+    // v2 段容器（M5 S5t）：segCount ‖ [segType(1)+len(2BE)+body]*；高位置 1 = critical
+    let (seg_count, mut rest) = head.split_first().ok_or("载荷过短")?;
+    let mut peer_id = None;
+    let mut secret = None;
     let mut endpoints = Vec::new();
-    for _ in 0..count {
-        if off + 2 > head.len() {
-            return Err("端点段越界".into());
+    let mut rpk = None;
+    for _ in 0..*seg_count {
+        if rest.len() < 3 {
+            return Err("段头不足".into());
         }
-        let typ = head[off];
-        let n = head[off + 1] as usize;
-        off += 2;
-        if off + n > head.len() {
-            return Err("端点地址越界".into());
+        let (typ, len) = (rest[0], u16::from_be_bytes([rest[1], rest[2]]) as usize);
+        rest = &rest[3..];
+        if rest.len() < len {
+            return Err("段体越界".into());
         }
-        let addr = std::str::from_utf8(&head[off..off + n]).map_err(|_| "端点地址非 UTF-8")?.to_owned();
-        off += n;
-        endpoints.push((typ, addr));
+        let (seg, r) = rest.split_at(len);
+        rest = r;
+        match typ {
+            0x81 => peer_id = Some(seg.try_into().map_err(|_| "peerId 段长度不为 32")?),
+            0x82 => secret = Some(seg.try_into().map_err(|_| "secret 段长度不为 32")?),
+            0x83 => {
+                let (&count, mut e) = seg.split_first().ok_or("端点段为空")?;
+                for _ in 0..count {
+                    if e.len() < 2 {
+                        return Err("端点头不足".into());
+                    }
+                    let (t, n) = (e[0], e[1] as usize);
+                    e = &e[2..];
+                    if e.len() < n {
+                        return Err("端点地址越界".into());
+                    }
+                    let addr = std::str::from_utf8(&e[..n])
+                        .map_err(|_| "端点地址非 UTF-8")?
+                        .to_owned();
+                    e = &e[n..];
+                    endpoints.push((t, addr));
+                }
+            }
+            0x04 => rpk = Some(seg.try_into().map_err(|_| "rpk 段长度不为 32")?),
+            t if t & 0x80 != 0 => return Err(format!("不认识的 critical 段 0x{t:02x}")),
+            _ => {} // info 段：跳过
+        }
     }
-    // 尾字段：恰 32B = RPK（M1 additive）；其余长度判非法
-    let rest = &head[off..];
-    let rpk = match rest.len() {
-        0 => None,
-        32 => Some(rest.try_into().unwrap()),
-        n => return Err(format!("尾字段长度 {n} 非法（只允许 0 或 32）")),
-    };
-    Ok(TokenInfo { peer_id, secret, endpoints, rpk })
+    if !rest.is_empty() {
+        return Err("载荷尾部有多余字节".into());
+    }
+    Ok(TokenInfo {
+        peer_id: peer_id.ok_or("缺少 peerId 段")?,
+        secret: secret.ok_or("缺少 secret 段")?,
+        endpoints,
+        rpk,
+    })
 }
 
 /// 端点类别：0=direct（WG）1=relay **2=QUIC**（M1 additive；真源 `EndpointKind`）。

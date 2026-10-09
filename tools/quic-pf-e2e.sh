@@ -33,8 +33,8 @@ echo "==> 本地私有出口 #$n：wipe + start（绝不碰现役）"
 "$REPO_ROOT/tools/local-rust-exit.sh" start "$n" > "$RES/exit-start.txt" 2>&1 || {
   echo "!! 出口起不来（见 $RES/exit-start.txt）" >&2; exit 1; }
 
-echo "==> 取 token（serve token 输出里抽 hmw1…）"
-TOKEN="$("$REPO_ROOT/tools/local-rust-exit.sh" token "$n" 2>/dev/null | grep -oE 'hmw1[A-Za-z0-9_=+/-]+' | head -1)"
+echo "==> 取 token（serve token 输出里抽 hmw2…）"
+TOKEN="$("$REPO_ROOT/tools/local-rust-exit.sh" token "$n" 2>/dev/null | grep -oE 'hmw2[A-Za-z0-9_=+/-]+' | head -1)"
 if [[ -z "$TOKEN" ]]; then
   echo "!! token 取不到" >&2
   "$REPO_ROOT/tools/local-rust-exit.sh" token "$n" | head -5 >&2

@@ -432,21 +432,11 @@ func TestVecgenVectors(t *testing.T) {
 	if err := os.MkdirAll(out, 0o755); err != nil {
 		t.Fatal(err)
 	}
-	fmt.Println("==> 生成对照向量：")
-	tokCases, tokErrs := genTokenCases(t)
-	vecWriteJSON(t, filepath.Join(out, "token.json"), map[string]any{
-		"comment": "hmw1 编解码向量。布局：hmw1 ‖ base64url-raw( peerId(32) ‖ secret(32) ‖ epCount(1) ‖ [type(1)+len(1)+addr]* ‖ crc(4)=SHA256(body)[:4] )；type 0=direct 1=relay；DecodeToken 先 TrimSpace、base64 解码跳过内嵌 \\r\\n。语义真源 baseline pkg/proto/token.go。",
-		"sentinels": map[string]string{
-			"comment":              "三类哨兵错误的 Go Error() 原文（Display 文案经 NAPI 直达 App，Rust 侧须逐字对齐前缀段；malformed 的 reason 段按打点各异、Rust 侧仅对齐「homeway/token: 格式非法: 」前缀）",
-			"corrupted":            proto.ErrCorrupted.Error(),
-			"unsupported_version":  proto.ErrUnsupportedVersion.Error(),
-			"unsupported_wrapped":  fmt.Errorf("%w: hmw2", proto.ErrUnsupportedVersion).Error(),
-			"malformed":            proto.ErrMalformed.Error(),
-			"malformed_no_prefix":  fmt.Errorf("%w: 缺少 %s 前缀", proto.ErrMalformed, "hmw1").Error(),
-		},
-		"cases":  tokCases,
-		"errors": tokErrs,
-	})
+	// **M5 S5t：token.json 退役**——Go 冻结向量是 hmw1 布局的 oracle；M5 换 `hmw2`
+	// 段容器（本仓自产向量 = `fixtures/vectors/token_hmw2.json`，生成器 =
+	// `crates/homeway-core/tests/token_vectors.rs::bless_token_hmw2_vectors`）⇒ 本管线
+	// **不再产出 token.json**（登记见 `docs/INTEROP-CRITERIA.md` 判据变更记录 + MANIFEST）。
+	// `genTokenCases` 保留为历史参照（不再接线；接线回来 = 恢复 hmw1 oracle，无意义）。
 	vecWriteJSON(t, filepath.Join(out, "tunnel_addr.json"), map[string]any{
 		"comment": "隧道地址派生向量。tunnel_ip=HMAC-SHA256(secret,\"hw-tun\"‖pub) 取 sum[0:2] 映射 v∈[1,65534]；tun_ip 同型用 \"hw-app\" 取 sum[2:4]，与 tunnel_ip 撞车时按 hw-app.2..8 标签再散列。地址恒 100.64.(v>>8).v。语义真源 baseline pkg/proto/tunneladdr.go。",
 		"cases":   genAddrCases(t),

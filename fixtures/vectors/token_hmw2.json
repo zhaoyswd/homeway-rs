@@ -1,0 +1,282 @@
+{
+  "generated_by": "crates/homeway-core/tests/token_vectors.rs::bless_token_hmw2_vectors（M5 S5t 自产；旧 Go 冻结向量 token.json 已退役为历史参照）",
+  "sentinels": {
+    "corrupted": "homeway/token: 校验失败（串被截断或损坏）",
+    "unsupported_version": "homeway/token: 不支持的 token 版本: hmw1",
+    "unsupported_wrapped": "homeway/token: 不支持的 token 版本: hmw2",
+    "malformed": "homeway/token: 格式非法: 端点缺端口",
+    "malformed_no_prefix": "homeway/token: 格式非法: 缺少 hmw2 前缀"
+  },
+  "cases": [
+    {
+      "name": "min-zero-endpoint",
+      "input": {
+        "peer_id": "1111111111111111111111111111111111111111111111111111111111111111",
+        "secret": "1112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30",
+        "endpoints": [],
+        "rpk": ""
+      },
+      "token": "hmw2A4EAIBERERERERERERERERERERERERERERERERERERERERERggAgERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzCDAAEA-hsEhA",
+      "decoded": {
+        "peer_id": "1111111111111111111111111111111111111111111111111111111111111111",
+        "secret": "1112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f30",
+        "endpoints": [],
+        "rpk": ""
+      },
+      "body_b64": "A4EAIBERERERERERERERERERERERERERERERERERERERERERggAgERITFBUWFxgZGhscHR4fICEiIyQlJicoKSorLC0uLzCDAAEA-hsEhA",
+      "body_hex": "0381002011111111111111111111111111111111111111111111111111111111111111118200201112131415161718191a1b1c1d1e1f202122232425262728292a2b2c2d2e2f3083000100fa1b0484",
+      "crc_hex": "fa1b0484"
+    },
+    {
+      "name": "single-direct",
+      "input": {
+        "peer_id": "2222222222222222222222222222222222222222222222222222222222222222",
+        "secret": "22232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f4041",
+        "endpoints": [
+          {
+            "addr": "127.0.0.1:42641",
+            "kind": 0
+          }
+        ],
+        "rpk": ""
+      },
+      "token": "hmw2A4EAICIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiggAgIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEGDABIBAA8xMjcuMC4wLjE6NDI2NDHGB5jj",
+      "decoded": {
+        "peer_id": "2222222222222222222222222222222222222222222222222222222222222222",
+        "secret": "22232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f4041",
+        "endpoints": [
+          {
+            "addr": "127.0.0.1:42641",
+            "kind": 0
+          }
+        ],
+        "rpk": ""
+      },
+      "body_b64": "A4EAICIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiggAgIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEGDABIBAA8xMjcuMC4wLjE6NDI2NDHGB5jj",
+      "body_hex": "03810020222222222222222222222222222222222222222222222222222222222222222282002022232425262728292a2b2c2d2e2f303132333435363738393a3b3c3d3e3f404183001201000f3132372e302e302e313a3432363431c60798e3",
+      "crc_hex": "c60798e3"
+    },
+    {
+      "name": "mixed-direct-domain-relay-quic",
+      "input": {
+        "peer_id": "3333333333333333333333333333333333333333333333333333333333333333",
+        "secret": "333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152",
+        "endpoints": [
+          {
+            "addr": "192.168.3.12:42651",
+            "kind": 0
+          },
+          {
+            "addr": "exit.example.com:42651",
+            "kind": 0
+          },
+          {
+            "addr": "198.51.100.212:41741",
+            "kind": 1
+          },
+          {
+            "addr": "[2408:8207:2518:2550::1]:42680",
+            "kind": 2
+          }
+        ],
+        "rpk": ""
+      },
+      "token": "hmw2A4EAIDMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzggAgMzQ1Njc4OTo7PD0-P0BBQkNERUZHSElKS0xNTk9QUVKDAGMEABIxOTIuMTY4LjMuMTI6NDI2NTEAFmV4aXQuZXhhbXBsZS5jb206NDI2NTEBFDE5OC41MS4xMDAuMjEyOjQxNzQxAh5bMjQwODo4MjA3OjI1MTg6MjU1MDo6MV06NDI2ODBSiE9j",
+      "decoded": {
+        "peer_id": "3333333333333333333333333333333333333333333333333333333333333333",
+        "secret": "333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f505152",
+        "endpoints": [
+          {
+            "addr": "192.168.3.12:42651",
+            "kind": 0
+          },
+          {
+            "addr": "exit.example.com:42651",
+            "kind": 0
+          },
+          {
+            "addr": "198.51.100.212:41741",
+            "kind": 1
+          },
+          {
+            "addr": "[2408:8207:2518:2550::1]:42680",
+            "kind": 2
+          }
+        ],
+        "rpk": ""
+      },
+      "body_b64": "A4EAIDMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzMzggAgMzQ1Njc4OTo7PD0-P0BBQkNERUZHSElKS0xNTk9QUVKDAGMEABIxOTIuMTY4LjMuMTI6NDI2NTEAFmV4aXQuZXhhbXBsZS5jb206NDI2NTEBFDE5OC41MS4xMDAuMjEyOjQxNzQxAh5bMjQwODo4MjA3OjI1MTg6MjU1MDo6MV06NDI2ODBSiE9j",
+      "body_hex": "038100203333333333333333333333333333333333333333333333333333333333333333820020333435363738393a3b3c3d3e3f404142434445464748494a4b4c4d4e4f5051528300630400123139322e3136382e332e31323a34323635310016657869742e6578616d706c652e636f6d3a343236353101143139382e35312e3130302e3231323a3431373431021e5b323430383a383230373a323531383a323535303a3a315d3a343236383052884f63",
+      "crc_hex": "52884f63"
+    },
+    {
+      "name": "addr-255-upper-bound",
+      "input": {
+        "peer_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "secret": "4445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f60616263",
+        "endpoints": [
+          {
+            "addr": "127.0.0.1:77777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777",
+            "kind": 2
+          }
+        ],
+        "rpk": ""
+      },
+      "token": "hmw2A4EAIEREREREREREREREREREREREREREREREREREREREREREggAgREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2BhYmODAQIBAv8xMjcuMC4wLjE6Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3NzcJ0Hg-",
+      "decoded": {
+        "peer_id": "4444444444444444444444444444444444444444444444444444444444444444",
+        "secret": "4445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f60616263",
+        "endpoints": [
+          {
+            "addr": "127.0.0.1:77777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777777",
+            "kind": 2
+          }
+        ],
+        "rpk": ""
+      },
+      "body_b64": "A4EAIEREREREREREREREREREREREREREREREREREREREREREggAgREVGR0hJSktMTU5PUFFSU1RVVldYWVpbXF1eX2BhYmODAQIBAv8xMjcuMC4wLjE6Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3Nzc3NzcJ0Hg-",
+      "body_hex": "0381002044444444444444444444444444444444444444444444444444444444444444448200204445464748494a4b4c4d4e4f505152535455565758595a5b5c5d5e5f606162638301020102ff3132372e302e302e313a373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373737373709d0783e",
+      "crc_hex": "09d0783e"
+    },
+    {
+      "name": "with-rpk-info-segment",
+      "input": {
+        "peer_id": "5555555555555555555555555555555555555555555555555555555555555555",
+        "secret": "55565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f7071727374",
+        "endpoints": [
+          {
+            "addr": "198.51.100.7:42652",
+            "kind": 2
+          }
+        ],
+        "rpk": "7777777777777777777777777777777777777777777777777777777777777777"
+      },
+      "token": "hmw2BIEAIFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVggAgVVZXWFlaW1xdXl9gYWJjZGVmZ2hpamtsbW5vcHFyc3SDABUBAhIxOTguNTEuMTAwLjc6NDI2NTIEACB3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3dzFYdtE",
+      "decoded": {
+        "peer_id": "5555555555555555555555555555555555555555555555555555555555555555",
+        "secret": "55565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f7071727374",
+        "endpoints": [
+          {
+            "addr": "198.51.100.7:42652",
+            "kind": 2
+          }
+        ],
+        "rpk": "7777777777777777777777777777777777777777777777777777777777777777"
+      },
+      "body_b64": "BIEAIFVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVggAgVVZXWFlaW1xdXl9gYWJjZGVmZ2hpamtsbW5vcHFyc3SDABUBAhIxOTguNTEuMTAwLjc6NDI2NTIEACB3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3d3dzFYdtE",
+      "body_hex": "04810020555555555555555555555555555555555555555555555555555555555555555582002055565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f70717273748300150102123139382e35312e3130302e373a34323635320400207777777777777777777777777777777777777777777777777777777777777777315876d1",
+      "crc_hex": "315876d1"
+    },
+    {
+      "name": "quic-multi-endpoint-with-rpk",
+      "input": {
+        "peer_id": "6666666666666666666666666666666666666666666666666666666666666666",
+        "secret": "666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485",
+        "endpoints": [
+          {
+            "addr": "192.168.3.12:42652",
+            "kind": 2
+          },
+          {
+            "addr": "203.0.113.7:42652",
+            "kind": 2
+          }
+        ],
+        "rpk": "8888888888888888888888888888888888888888888888888888888888888888"
+      },
+      "token": "hmw2BIEAIGZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmggAgZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn-AgYKDhIWDACgCAhIxOTIuMTY4LjMuMTI6NDI2NTICETIwMy4wLjExMy43OjQyNjUyBAAgiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiJtEeR",
+      "decoded": {
+        "peer_id": "6666666666666666666666666666666666666666666666666666666666666666",
+        "secret": "666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f808182838485",
+        "endpoints": [
+          {
+            "addr": "192.168.3.12:42652",
+            "kind": 2
+          },
+          {
+            "addr": "203.0.113.7:42652",
+            "kind": 2
+          }
+        ],
+        "rpk": "8888888888888888888888888888888888888888888888888888888888888888"
+      },
+      "body_b64": "BIEAIGZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmggAgZmdoaWprbG1ub3BxcnN0dXZ3eHl6e3x9fn-AgYKDhIWDACgCAhIxOTIuMTY4LjMuMTI6NDI2NTICETIwMy4wLjExMy43OjQyNjUyBAAgiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiJtEeR",
+      "body_hex": "048100206666666666666666666666666666666666666666666666666666666666666666820020666768696a6b6c6d6e6f707172737475767778797a7b7c7d7e7f8081828384858300280202123139322e3136382e332e31323a343236353202113230332e302e3131332e373a3432363532040020888888888888888888888888888888888888888888888888888888888888888889b44791",
+      "crc_hex": "89b44791"
+    },
+    {
+      "name": "legacy-wg-only-endpoints",
+      "input": {
+        "peer_id": "9999999999999999999999999999999999999999999999999999999999999999",
+        "secret": "999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8",
+        "endpoints": [
+          {
+            "addr": "192.168.3.12:41641",
+            "kind": 0
+          },
+          {
+            "addr": "203.0.113.9:41741",
+            "kind": 1
+          }
+        ],
+        "rpk": ""
+      },
+      "token": "hmw2A4EAIJmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZggAgmZqbnJ2en6ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7iDACgCABIxOTIuMTY4LjMuMTI6NDE2NDEBETIwMy4wLjExMy45OjQxNzQx-SkxQg",
+      "decoded": {
+        "peer_id": "9999999999999999999999999999999999999999999999999999999999999999",
+        "secret": "999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b8",
+        "endpoints": [
+          {
+            "addr": "192.168.3.12:41641",
+            "kind": 0
+          },
+          {
+            "addr": "203.0.113.9:41741",
+            "kind": 1
+          }
+        ],
+        "rpk": ""
+      },
+      "body_b64": "A4EAIJmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZmZggAgmZqbnJ2en6ChoqOkpaanqKmqq6ytrq-wsbKztLW2t7iDACgCABIxOTIuMTY4LjMuMTI6NDE2NDEBETIwMy4wLjExMy45OjQxNzQx-SkxQg",
+      "body_hex": "038100209999999999999999999999999999999999999999999999999999999999999999820020999a9b9c9d9e9fa0a1a2a3a4a5a6a7a8a9aaabacadaeafb0b1b2b3b4b5b6b7b88300280200123139322e3136382e332e31323a343136343101113230332e302e3131332e393a3431373431f9293142",
+      "crc_hex": "f9293142"
+    }
+  ],
+  "errors": [
+    {
+      "name": "legacy-hmw1-token",
+      "input": "hmw1EREREREREREREREREREREREREREREREREREREREREREBAgMEBQYHCAkKCwwNDg8QERITFBUWFxgZGhscHR4fIADcQl7l",
+      "error": "unsupported_version"
+    },
+    {
+      "name": "no-prefix",
+      "input": "AAAA",
+      "error": "malformed"
+    },
+    {
+      "name": "crc-flipped",
+      "input": "hmw2A4EAICIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiggAgIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEGDABIBAA8xMjcuMC4wLjE6NDI2NDHGB5gc",
+      "error": "corrupted"
+    },
+    {
+      "name": "truncated",
+      "input": "hmw2A4EAICIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiggAgIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEGDABIBAA8xMjcuMC4wLjE6NDI2ND",
+      "error": "corrupted"
+    },
+    {
+      "name": "base64-padding-suffix",
+      "input": "hmw2A4EAICIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiggAgIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEGDABIBAA8xMjcuMC4wLjE6NDI2NDHGB5jj=",
+      "error": "malformed"
+    },
+    {
+      "name": "unknown-critical-segment",
+      "input": "hmw2BIEAICIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiggAgIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEGDABIBAA8xMjcuMC4wLjE6NDI2NDGFAAEA-LMpZw",
+      "error": "malformed"
+    },
+    {
+      "name": "segment-body-overruns-payload",
+      "input": "hmw2A4EA_yIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiIiggAgIiMkJSYnKCkqKywtLi8wMTIzNDU2Nzg5Ojs8PT4_QEGDABIBAA8xMjcuMC4wLjE6NDI2NDFnmui6",
+      "error": "malformed"
+    }
+  ]
+}

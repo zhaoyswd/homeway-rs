@@ -43,7 +43,7 @@ run_one() {
   local name="$1"
   # 每条前面重取 token（kill 重启后可能铸新 token）
   local tok
-  tok="$("$REPO_ROOT/tools/local-rust-exit.sh" token "$n" 2>/dev/null | grep -oE 'hmw1[A-Za-z0-9_=+/-]+' | head -1)"
+  tok="$("$REPO_ROOT/tools/local-rust-exit.sh" token "$n" 2>/dev/null | grep -oE 'hmw2[A-Za-z0-9_=+/-]+' | head -1)"
   if [[ -z "$tok" ]]; then
     echo "!! token 取不到" >&2; rc=1; return 1
   fi
