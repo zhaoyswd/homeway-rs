@@ -63,6 +63,12 @@ struct Args {
     dead_relay: bool,
     bind: Option<SocketAddrV4>,
     alt_bind: Option<SocketAddrV4>,
+    /// 岛 MTU 上限（M2 S5-5 的**窄路径注入缝**：`IslandConfig::mtu_cap`，
+    /// 区间外取值合法——生产层会把 env/config 夹到 `[1320,1400]`，本缝刻意不夹）。
+    mtu_cap: u16,
+    /// QUIC 端点改写（M2 S5-3 的 300ms RTT 缝）：token 里 QUIC 类端点统统改指本地址
+    /// （本地延迟代理），岛仍走产品路径。
+    quic_ep: Option<String>,
     /// 外置回显目标（`ip:port`）：给了就不起内置 echo（诊断/对照用）。
     dst: Option<SocketAddrV4>,
     /// 内置 echo 的绑定地址（缺省 `127.0.0.1:0`）；诊断端口域假设用。
@@ -78,7 +84,8 @@ fn usage() -> ! {
         "用法：\n  m1-ab run --token <hmw1…> --transport wg|quic [--secs 8] [--rate 0] [--window 32]\n\
          \x20            [--req-size 60] [--reply-size 1252] [--reply-count 1]\n\
          \x20            [--force-relay（中继端点留、QUIC 直连改死）| --force-direct（中继改死）]\n\
-         \x20            [--bind 127.0.0.2:0] [--tag N] [--workdir DIR]\n\
+         \x20            [--bind 127.0.0.2:0] [--tag N] [--workdir DIR] [--mtu-cap 1200（窄路径注入）]\n\
+         \x20            [--quic-ep 127.0.0.1:P（token 的 QUIC 端点统统改指此处——延迟代理注入）]\n\
          \x20 m1-ab migrate --token <hmw1…> [--secs 24] [--rate 100] [--migrate-after 8]\n\
          \x20            [--alt-bind 127.0.0.2:0] [--relay ip:port] [--workdir DIR]"
     );
@@ -104,6 +111,8 @@ fn parse_args() -> Args {
         dead_relay: false,
         bind: None,
         alt_bind: None,
+        mtu_cap: homeway_quic::QUIC_MTU_CAP_DEFAULT,
+        quic_ep: None,
         dst: None,
         echo_bind: None,
         migrate_after: 8,
@@ -142,6 +151,8 @@ fn parse_args() -> Args {
             }
             "--tag" => a.tag = next(&mut i),
             "--workdir" => a.workdir = PathBuf::from(next(&mut i)),
+            "--mtu-cap" => a.mtu_cap = next(&mut i).parse().unwrap_or_else(|_| usage()),
+            "--quic-ep" => a.quic_ep = Some(next(&mut i)),
             "--force-relay" => a.force_relay = true,
             "--force-direct" => a.dead_relay = true,
             "--dst" => {
@@ -577,15 +588,27 @@ fn relay_label_of(tok: &token::Token) -> [u8; 8] {
 /// 为什么本工具自己做而不用 `homeway-cli token --dead-direct`：那条只改写 **Direct**
 /// （WG，kind=0）端点——QUIC 类的死端口注入在产品 CLI 里没有对应开关，而 S5-3③ 的
 /// A/B 需要两档都经中继。**本函数只改 harness 侧送给岛的 token，不碰产品代码**。
-fn token_rewrite(tok: &token::Token, dead_quic: bool, dead_relay: bool) -> String {
+fn token_rewrite(
+    tok: &token::Token,
+    dead_quic: bool,
+    dead_relay: bool,
+    quic_override: Option<&str>,
+) -> String {
     let eps: Vec<token::EndpointRef<'_>> = tok
         .endpoints
         .iter()
         .map(|e| {
             let dead = (dead_quic && e.kind == token::EndpointKind::Quic)
                 || (dead_relay && e.kind == token::EndpointKind::Relay);
+            // `--quic-ep`（M2 S5-3 的 300ms RTT 注入缝）：把 QUIC 类端点改指本地延迟代理
+            // ⇒ 岛仍走**产品路径**（四帧准入 + 比赛跑），只是路径 RTT 变了。
             if dead {
                 token::EndpointRef::new("127.0.0.1:1", e.kind)
+            } else if e.kind == token::EndpointKind::Quic {
+                if let Some(ov) = quic_override {
+                    return token::EndpointRef::new(ov, e.kind);
+                }
+                token::EndpointRef::new(&e.addr, e.kind)
             } else {
                 token::EndpointRef::new(&e.addr, e.kind)
             }
@@ -621,8 +644,8 @@ fn run_product_ab(a: &Args) -> Result<(), String> {
     //   --force-relay  ⇒ QUIC 直连端点改死（只剩中继候选）
     //   --force-direct ⇒ 中继端点改死（只剩直连候选；否则本地回环下 QUIC 赛跑可能被
     //                    中继抢先——首跑实测：直连臂跑成了 relay）
-    let token_str = if a.force_relay || a.dead_relay {
-        token_rewrite(&tok, a.force_relay, a.dead_relay)
+    let token_str = if a.force_relay || a.dead_relay || a.quic_ep.is_some() {
+        token_rewrite(&tok, a.force_relay, a.dead_relay, a.quic_ep.as_deref())
     } else {
         a.token.clone()
     };
@@ -816,6 +839,9 @@ fn run_migrate(a: &Args) -> Result<(), String> {
             .unwrap_or_else(|| SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
     );
     cfg.patrol = Duration::from_secs(2);
+    // M2 S5-5 窄路径注入缝（`tools/m1-ab --mtu-cap`）：`IslandConfig::mtu_cap` 刻意不夹
+    // 区间（生产层在 facade 侧夹 [1320,1400]）⇒ 给 1200 即得 `mds=1162 < 内层 1280`。
+    cfg.mtu_cap = a.mtu_cap;
     let logf: homeway_quic::Logf =
         Arc::new(|s: &str| println!("[island] {s}"));
     let unhealthy: homeway_quic::OnUnhealthy = Arc::new(|r: &str| println!("[island][unhealthy] {r}"));

@@ -594,6 +594,7 @@ name = "homeway-quic"
 version = "0.2.3"
 dependencies = [
  "bytes",
+ "getrandom 0.2.17",
  "hmac",
  "libc",
  "quinn",

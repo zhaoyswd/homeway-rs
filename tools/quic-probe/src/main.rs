@@ -35,7 +35,7 @@
 use std::io::{self, IoSliceMut};
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -93,6 +93,17 @@ struct Args {
     /// `127.0.0.2` 即得独立桶——形态差异照设计 §7.2 B2/r12 专4-5 登记）。
     bind: String,
     cmd: String,
+    /// flood 档（M2 S5-3 判据 1/2 的注入面）：`pin-fail`（**错**钉定 ⇒ 握手级「未完成」，
+    /// 吃每源闸 ⇒ 判据 1）/ `no-hello`（正确钉定 + 握手完成 + 永不发 Hello ⇒ 占连接槽到
+    /// `ADMIT_DEADLINE` ⇒ 判据 2 后半）/ `stall`（正确钉定 + 黑洞 socket：首发之后不再收
+    /// ⇒ 服务端握手悬在**在途** ⇒ 判据 2 前半的并发握手面）。
+    mode: String,
+    /// flood 档尝试次数（`pin-fail` 顺序 K 次；`no-hello`/`stall` 并发 K 条）。
+    k: usize,
+    /// flood 档持有时长（秒；`no-hello` 需 > `ADMIT_DEADLINE`，`stall` > `handshake_deadline`）。
+    hold_secs: u64,
+    /// `pin-fail` 档的尝试间隔（ms；0 = 尽快。持续洪泛形态用它把 K 次摊到一段时间）。
+    interval_ms: u64,
 }
 
 impl Args {
@@ -117,6 +128,10 @@ impl Args {
             rate: 0,
             bind: "0.0.0.0:0".into(),
             cmd: "conn".to_owned(),
+            mode: "pin-fail".to_owned(),
+            k: 24,
+            hold_secs: 15,
+            interval_ms: 0,
         };
         let mut i = 1;
         while i < argv.len() {
@@ -140,9 +155,13 @@ impl Args {
                 "--dst" => a.dst = Some(next(&mut i)?),
                 "--rate" => a.rate = next(&mut i)?.parse().map_err(|e| format!("--rate: {e}"))?,
                 "--bind" => a.bind = next(&mut i)?.parse().map_err(|e| format!("--bind: {e}"))?,
+                "--mode" => a.mode = next(&mut i)?,
+                "--k" => a.k = next(&mut i)?.parse().map_err(|e| format!("--k: {e}"))?,
+                "--hold-secs" => a.hold_secs = next(&mut i)?.parse().map_err(|e| format!("--hold-secs: {e}"))?,
+                "--interval-ms" => a.interval_ms = next(&mut i)?.parse().map_err(|e| format!("--interval-ms: {e}"))?,
                 "--dns" => a.dns = true,
                 "--json" => a.json = true,
-                "conn" | "push" => a.cmd = v.to_owned(),
+                "conn" | "push" | "flood" => a.cmd = v.to_owned(),
                 other if other.starts_with("--") => return Err(format!("未知参数 {other}")),
                 other => return Err(format!("未知子命令 {other}")),
             }
@@ -388,6 +407,9 @@ struct ProbeSock {
     io: tokio::net::UdpSocket,
     label: Option<[u8; 8]>,
     stats: Arc<SockStats>,
+    /// 黑洞位（M2 S5-3 `flood --mode stall`）：置位后**只发不收**——入境包全部丢弃并
+    /// **不注册 waker**（握手就此悬住；服务端在 `handshake_deadline` 之前一直视为在途）。
+    blackhole: Arc<AtomicBool>,
 }
 
 impl AsyncUdpSocket for ProbeSock {
@@ -420,6 +442,19 @@ impl AsyncUdpSocket for ProbeSock {
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
         let buf = &mut bufs[0];
+        // 黑洞档（`flood --mode stall`）：把入境包全部收走丢掉，**返回 Pending 且不注册
+        // waker**（驱动由上层的重传定时器唤醒）⇒ 客户端的握手永远完不成。
+        if self.blackhole.load(Ordering::SeqCst) {
+            loop {
+                match self.io.try_recv_from(&mut buf[..]) {
+                    Ok(_) => {
+                        self.stats.rx_ignored.fetch_add(1, Ordering::SeqCst);
+                    }
+                    Err(e) if e.kind() == io::ErrorKind::WouldBlock => return Poll::Pending,
+                    Err(e) => return Poll::Ready(Err(e)),
+                }
+            }
+        }
         loop {
             match self.io.poll_recv_ready(cx) {
                 Poll::Ready(Ok(())) => {}
@@ -663,16 +698,29 @@ fn run() -> Result<(), String> {
         .worker_threads(2)
         .build()
         .map_err(|e| format!("runtime: {e}"))?;
+    let flood_mode = args.cmd == "flood";
+    // flood `pin-fail` 档：钉定换成一枚**故意错**的公钥（服务端证书永不匹配 ⇒ 客户端
+    // 校验失败 ⇒ 服务端侧落 `HandshakeOutcome::Failed` = 每源闸的「未完成」输入）。
+    let pin = if flood_mode && args.mode == "pin-fail" { [0xEEu8; 32] } else { rpk };
+    if flood_mode {
+        println!(
+            "flood: mode={} k={} bind={} hold={}s target={} pin={}",
+            args.mode, args.k, args.bind, args.hold_secs, target,
+            if args.mode == "pin-fail" { "错（0xEE×32）" } else { "正确（token 登记值）" }
+        );
+    }
     rt.block_on(async move {
         let stats = Arc::new(SockStats::default());
         let sock = std::net::UdpSocket::bind(&args.bind).map_err(|e| format!("bind（{}）: {e}", args.bind))?;
         sock.set_nonblocking(true).map_err(|e| format!("非阻塞: {e}"))?;
         let local = sock.local_addr().map_err(|e| format!("local_addr: {e}"))?;
         let io = tokio::net::UdpSocket::from_std(sock).map_err(|e| format!("from_std: {e}"))?;
+        let blackhole = Arc::new(AtomicBool::new(false));
         let abs = Arc::new(ProbeSock {
             io,
             label: if via_relay { label } else { None },
             stats: Arc::clone(&stats),
+            blackhole: Arc::clone(&blackhole),
         });
         let mut endpoint = quinn::Endpoint::new_with_abstract_socket(
             quinn::EndpointConfig::default(),
@@ -682,7 +730,11 @@ fn run() -> Result<(), String> {
         )
         .map_err(|e| format!("endpoint: {e}"))?;
         println!("probe: 本地 socket {local}（{}）", if via_relay { "relay 信封模式" } else { "裸 QUIC 模式" });
-        endpoint.set_default_client_config(client_config(&rpk));
+        endpoint.set_default_client_config(client_config(&pin));
+
+        if args.cmd == "flood" {
+            return flood_run(&args, target, &endpoint, &blackhole, &stats).await;
+        }
 
         let t0 = Instant::now();
         let conn = endpoint
@@ -872,6 +924,185 @@ fn run() -> Result<(), String> {
         endpoint.wait_idle().await;
         Ok::<(), String>(())
     })?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// flood 子命令（M2 S5-3 判据 1/2 的注入面；harness-only，读数走 key=value 行）
+// ---------------------------------------------------------------------------
+
+/// 连接建立失败的**可观测分类**（客户端侧口径：与出口侧的 `HandshakeOutcome` 对齐，
+/// 供判据 1 的「第 F+1..K 次全部被拒」逐位留证）。
+fn connect_err_kind(e: &quinn::ConnectionError) -> String {
+    use quinn::ConnectionError as CE;
+    match e {
+        CE::ConnectionClosed(cc) => format!("refused/closed(code={})", cc.error_code),
+        CE::ApplicationClosed(ac) => format!("app-closed(code={})", ac.error_code),
+        CE::TransportError(te) => {
+            // 紧凑（证书校验失败类消息很长；读数行要能一眼看出「哪一类」）
+            let t = te.code.to_string();
+            format!("transport[{}]", t.chars().take(28).collect::<String>())
+        }
+        CE::TimedOut => "timed-out".into(),
+        CE::LocallyClosed => "locally-closed".into(),
+        CE::Reset => "reset".into(),
+        CE::VersionMismatch => "version-mismatch".into(),
+        CE::CidsExhausted => "cids-exhausted".into(),
+    }
+}
+
+fn connect_call_err_kind(e: &quinn::ConnectError) -> String {
+    use quinn::ConnectError as CE;
+    match e {
+        CE::EndpointStopping => "endpoint-stopping".into(),
+        CE::CidsExhausted => "cids-exhausted".into(),
+        CE::InvalidServerName(s) => format!("invalid-server-name({s})"),
+        CE::InvalidRemoteAddress(a) => format!("invalid-remote-address({a})"),
+        CE::NoDefaultClientConfig => "no-default-client-config".into(),
+        CE::UnsupportedVersion => "unsupported-version".into(),
+    }
+}
+
+/// `flood` 主体（三种 mode；读数全部打 stdout，机器可解析）。
+async fn flood_run(
+    args: &Args,
+    target: SocketAddr,
+    endpoint: &quinn::Endpoint,
+    blackhole: &Arc<AtomicBool>,
+    stats: &Arc<SockStats>,
+) -> Result<(), String> {
+    match args.mode.as_str() {
+        // ---- 判据 1：单源 K 次「未完成」尝试 ⇒ 第 F+1 起全拒 --------------------------
+        "pin-fail" => {
+            let mut outcomes: Vec<String> = Vec::with_capacity(args.k);
+            let t0 = Instant::now();
+            for i in 0..args.k {
+                let a = Instant::now();
+                let r = endpoint.connect(target, SERVER_NAME);
+                let kind = match r {
+                    Err(e) => format!("call-err[{}]", connect_call_err_kind(&e)),
+                    Ok(connecting) => match tokio::time::timeout(Duration::from_secs(3), connecting).await {
+                        Ok(Ok(_conn)) => "connected".into(),
+                        Ok(Err(e)) => connect_err_kind(&e),
+                        Err(_) => "client-timeout".into(),
+                    },
+                };
+                println!("flood: attempt[{i}]={kind} elapsed_ms={}", a.elapsed().as_millis());
+                outcomes.push(kind);
+                if args.interval_ms > 0 && i + 1 < args.k {
+                    tokio::time::sleep(Duration::from_millis(args.interval_ms)).await;
+                }
+            }
+            let n = |p: &str| outcomes.iter().filter(|o| o.starts_with(p)).count();
+            println!(
+                "flood: k={} refused={} transport={} connected={} timeout={} total_ms={}",
+                args.k,
+                n("refused"),
+                n("transport"),
+                n("connected"),
+                outcomes.iter().filter(|o| *o == "client-timeout").count(),
+                t0.elapsed().as_millis()
+            );
+            // 逐位序列（判据 1 的「第 F+1..K 次全部被拒」直接留证）
+            println!("flood: outcomes={}", outcomes.join(","));
+        }
+        // ---- 判据 2（前半）：并发握手悬在在途（黑洞）--------------------------------
+        "stall" => {
+            blackhole.store(true, Ordering::SeqCst);
+            let mut conns = Vec::new();
+            let mut fail = 0usize;
+            for i in 0..args.k {
+                match endpoint.connect(target, SERVER_NAME) {
+                    Ok(connecting) => conns.push((i, connecting)),
+                    Err(e) => {
+                        fail += 1;
+                        println!("flood: connect[{i}] 调用失败 {}", connect_call_err_kind(&e));
+                    }
+                }
+            }
+            println!("flood: 已发起 {} 条（调用失败 {fail}）；黑洞档 = 只发不收，保持 {}s", conns.len(), args.hold_secs);
+            // 只在窗口内查看是否有握手「意外完成」（黑洞下应当 0）
+            let mut completed = 0usize;
+            let t0 = Instant::now();
+            for (i, connecting) in conns {
+                match tokio::time::timeout(Duration::from_millis(200), connecting).await {
+                    Ok(Ok(_c)) => {
+                        completed += 1;
+                        println!("flood: 意外完成握手 [{i}]");
+                    }
+                    _ => {}
+                }
+            }
+            println!(
+                "flood: stalled={} completed={completed} 在途窗={}ms（黑洞生效）",
+                args.k - fail - completed,
+                t0.elapsed().as_millis()
+            );
+            let remain = args.hold_secs.saturating_sub(t0.elapsed().as_secs());
+            tokio::time::sleep(Duration::from_secs(remain)).await;
+            println!("flood: stall 持有结束（{}s）", args.hold_secs);
+        }
+        // ---- 判据 2（后半）：握手完成但不发 Hello ------------------------------------
+        "no-hello" => {
+            let mut conns = Vec::new();
+            let mut fail = 0usize;
+            let t0 = Instant::now();
+            for i in 0..args.k {
+                match endpoint.connect(target, SERVER_NAME) {
+                    Ok(connecting) => match tokio::time::timeout(Duration::from_secs(8), connecting).await {
+                        Ok(Ok(c)) => conns.push((i, c)),
+                        Ok(Err(e)) => {
+                            fail += 1;
+                            println!("flood: 握手[{i}] 失败 {}", connect_err_kind(&e));
+                        }
+                        Err(_) => {
+                            fail += 1;
+                            println!("flood: 握手[{i}] 8s 未定音");
+                        }
+                    },
+                    Err(e) => {
+                        fail += 1;
+                        println!("flood: connect[{i}] 调用失败 {}", connect_call_err_kind(&e));
+                    }
+                }
+                // 定音一条就报一次（并发面：K 条在同一秒内涌入 ⇒ 出口侧在途/连接闸承压）
+                if i + 1 == args.k {
+                    println!("flood: 握手面 完成={} 失败={fail} 用时={}ms", conns.len(), t0.elapsed().as_millis());
+                }
+            }
+            println!("flood: 握手完成 {} 条（失败 {fail}）；**不发 Hello**，等出口侧到点回收", conns.len());
+            let n = conns.len();
+            let mut handles = Vec::new();
+            for (i, c) in conns {
+                handles.push(tokio::spawn(async move {
+                    let t = Instant::now();
+                    let why = c.closed().await;
+                    (i, t.elapsed().as_millis(), format!("{why:?}"))
+                }));
+            }
+            let mut saw = 0usize;
+            for h in handles {
+                match tokio::time::timeout(Duration::from_secs(args.hold_secs), h).await {
+                    Ok(Ok((i, ms, why))) => {
+                        saw += 1;
+                        println!("flood: 连接[{i}] 被出口关闭 after={ms}ms why={why}");
+                    }
+                    _ => {}
+                }
+            }
+            println!("flood: no-hello 结果 建立={n} 被关={saw}（持有窗 {}s）", args.hold_secs);
+        }
+        other => return Err(format!("未知 flood mode {other}（pin-fail|stall|no-hello）")),
+    }
+    let s = stats;
+    println!(
+        "flood: sock tx_dgrams={} rx_dgrams={} rx_ignored={}",
+        s.tx_dgrams.load(Ordering::SeqCst),
+        s.rx_dgrams.load(Ordering::SeqCst),
+        s.rx_ignored.load(Ordering::SeqCst)
+    );
+    endpoint.close(0u32.into(), b"flood done");
+    endpoint.wait_idle().await;
     Ok(())
 }
 
