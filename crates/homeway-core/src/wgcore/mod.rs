@@ -101,7 +101,11 @@ const CONNECT_DEADLINE: Duration = Duration::from_millis(400);
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum ConnErr {
-    #[error("连接被拒（对端 RST）")]
+    // M3 S3/A13 文案去 RST 化：QUIC 档的「服务不存在」不再以 RST 出现（`StreamErr::NotSupported`
+    // 在 `facade/quic_stream.rs` 里直接映射成 `ConnectionRefused` 语义），写死「对端 RST」会在
+    // QUIC 档说谎。本串只作排障文案（**非判据行**）——按错误 kind 判类的消费点不受影响
+    // （`bridge_host::is_refused_like` / `tun_exec::conn_err_to_io` 都只看 kind）。
+    #[error("连接被拒（对端无该服务）")]
     Refused,
     #[error("连接超时")]
     Timeout,

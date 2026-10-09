@@ -6,7 +6,8 @@
 //! 会话制：connect 拿 handle，其它操作带 handle；页面退出调 close。会话表 cap=4、
 //! 驱逐最久未用（防「页面忘了 close」漏会话），淘汰/关闭/取消都要打断在跑传输（FIX-42）。
 //!
-//! 传输承载 = 桥 UDS（`<filesDir>/bridge/files.sock` → 隧道 → 出口 7802）；
+//! 传输承载 = 桥 UDS（`<filesDir>/bridge/files.sock` → 出口 **files 服务**；QUIC 档 =
+//! `STREAM[tag=files]`，WG 档 = 隧道拨出口 7802——映射单源 `facade/quic_stream.rs`）；
 //! auth/sock 来自状态 JSON 的 bridgeAuth/bridgeFilesSock。线协议与 `crate::files`
 //! 同源（鉴权 blob + 问候 JSON 行 + 命令行 + 4B BE 帧）；`crate::files` 的动词面绑定
 //! 引擎 Session（CLI 形态），本模块自带 UDS 流——两个消费方两种承载，协议件

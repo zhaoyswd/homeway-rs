@@ -1665,9 +1665,12 @@ async fn datagram_is_gated_until_admission_completes() {
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
 
-/// **判据（S1-4）**：源非法包（src ∉ {tunnel_ip, tun_ip}）⇒ 丢 + `源校验拒` 计数 + E-q3 行；
-/// 同连接随后的合法包照常投递（拒的是包不是连接）。明细行含**实际 src**（设计 §9.1-1 的
-/// 增强：M1 真机发现①的「无法一眼定性」在这里关闭）。
+/// **判据（S1-4 + M3 §6 收窄）**：源非法包（src ∉ **{tun_ip}**）⇒ 丢 + `源校验拒` 计数 +
+/// E-q3 行；同连接随后的合法包照常投递（拒的是包不是连接）。明细行含**实际 src**（设计
+/// §9.1-1 的增强：M1 真机发现①的「无法一眼定性」在这里关闭）。
+///
+/// **M3 §6 的收窄负例**：`tunnel_ip`（`hw-tun` 派生 = 栈 B 的地址）在 QUIC 档**不再被接受**
+/// ——它在 QUIC 档没有任何合法来源（栈 B 数据面不在 QUIC 档），保留它只扩大可伪造面。
 #[tokio::test]
 async fn datagram_with_illegal_source_is_dropped_and_counted() {
     let (logf, rx) = sink();
@@ -1680,7 +1683,7 @@ async fn datagram_with_illegal_source_is_dropped_and_counted() {
     let (_send, _recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
     pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=aaaaaaaa", WAIT).await;
 
-    // 源非法（9.9.9.9 不在 {tunnel_ip, tun_ip}）
+    // 源非法（9.9.9.9 不在 {tun_ip}）
     conn.send_datagram(bytes::Bytes::from(inner_pkt(
         Ipv4Addr::new(9, 9, 9, 9),
         Ipv4Addr::new(8, 8, 8, 8),
@@ -1697,9 +1700,26 @@ async fn datagram_with_illegal_source_is_dropped_and_counted() {
         ls.iter().any(|l| l.contains("src=9.9.9.9")),
         "E-q3 行的明细必须含实际 src（否则真机上仍无法定性）：{ls:?}"
     );
+    // **M3 §6 判据（单元素接受集）**：明细打印收窄后的集合，不再出现 `tunnel_ip=`
+    assert!(
+        ls.iter().any(|l| l.contains("∉ {tun_ip=") && !l.contains("tunnel_ip=")),
+        "E-q3 明细须打印收窄后的单元素集：{ls:?}"
+    );
+    // 收窄负例：`tunnel_ip` 源（M3 §6 起不在接受集内）必须被拒、不得进引擎面
+    conn.send_datagram(bytes::Bytes::from(inner_pkt(
+        TUNNEL_IP,
+        Ipv4Addr::new(8, 8, 8, 8),
+    )))
+    .expect("发数据报");
+    assert!(
+        pump_until(&stub, &quic, || quic.snapshot().drop_src_rejected >= 2, WAIT).await,
+        "tunnel_ip 源必须被拒（§6 收窄）：{:?}",
+        quic.snapshot()
+    );
+    assert!(stub.packets().is_empty(), "tunnel_ip 源不得进引擎面");
 
-    // 合法（tunnel_ip 源）照常投递
-    let good = inner_pkt(TUNNEL_IP, Ipv4Addr::new(8, 8, 8, 8));
+    // 合法（tun_ip 源）照常投递
+    let good = inner_pkt(TUN_IP, Ipv4Addr::new(8, 8, 8, 8));
     conn.send_datagram(bytes::Bytes::from(good.clone())).expect("发数据报");
     assert!(
         pump_until(&stub, &quic, || !stub.packets().is_empty(), WAIT).await,

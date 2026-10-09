@@ -53,16 +53,23 @@ pub(crate) enum SendOutcome {
 }
 
 /// 入站内层包的源校验（**复刻** `homeway-core` 的 `server/device.rs` 的 `src_allowed`，
-/// M1 设计 §1.3/§1.4）：非 IPv4（短包或版本 ≠ 4）或 `src ∉ {tunnel_ip, tun_ip}` ⇒ 拒。
+/// M1 设计 §1.3/§1.4；**M3 §6 收窄**）：非 IPv4（短包或版本 ≠ 4）或 `src != tun_ip` ⇒ 拒。
 ///
 /// 为什么是复刻而不是调用：QUIC 入站**不经过** `device.rs`（本 crate 是叶子，不得依赖
 /// `homeway-core`）；行为必须逐字同（拒绝计数对应今日的 `src_rejects`）。
-fn src_allowed(pkt: &[u8], tunnel_ip: Ipv4Addr, tun_ip: Ipv4Addr) -> bool {
+///
+/// **收窄（M3 设计 §6；登记 = §8.2-6）**：接受集从 `{tunnel_ip, tun_ip}` → **`{tun_ip}`**。
+/// 理由：QUIC 档的内层包源恒为 **App 的 TUN 地址**（`hw-app` 派生地址，E-q2 行
+/// `tun=` 字段与绑定表同源），而 `tunnel_ip`（`hw-tun` 派生、栈 B 的地址）在 QUIC 档
+/// **没有合法来源**（栈 B 的数据面不在 QUIC 档上）⇒ 保留它只扩大可伪造面。
+/// 方向 = **安全面收紧**；`Bound.tunnel_ip` 字段按设计**保留**（不再参与源校验，
+/// 「值域/输入集变化」已登记）。
+fn src_allowed(pkt: &[u8], tun_ip: Ipv4Addr) -> bool {
     if pkt.len() < 20 || pkt[0] >> 4 != 4 {
         return false;
     }
     let src = Ipv4Addr::new(pkt[12], pkt[13], pkt[14], pkt[15]);
-    src == tunnel_ip || src == tun_ip
+    src == tun_ip
 }
 
 /// 出站内层包 → DATAGRAM：预检（`max_datagram_size` / 发送缓冲空余）⇒ 分类计数 ⇒ 才发。
@@ -552,17 +559,18 @@ pub(crate) async fn datagrams(conn: Connection, conn_id: u64, ctx: Arc<FaceCtx>)
             Err(_) => return, // 连接死/被替换
         };
         // 绑定查表（§1.3）：未登记连接的数据报**直接丢 + 计数**（含被替换的旧连接）
-        let Some(Bound { dev, tunnel_ip, tun_ip, .. }) = ctx.bridge.binding_of_conn(conn_id) else {
+        // （M3 §6 收窄后 `tunnel_ip` 不再参与判定——避免为读取它而引入无谓的解构）
+        let Some(Bound { dev, tun_ip, .. }) = ctx.bridge.binding_of_conn(conn_id) else {
             ctx.bridge
                 .note_drop(DropKind::Unregistered, "未登记连接的数据报");
             continue;
         };
-        // 源校验（复刻 `device.rs` 的 `src_allowed`；§1.3/§1.4）
-        if !src_allowed(&dg, tunnel_ip, tun_ip) {
+        // 源校验（复刻 `device.rs` 的 `src_allowed`；§1.3/§1.4；M3 §6 收窄为单元素集）
+        if !src_allowed(&dg, tun_ip) {
             ctx.bridge.note_drop(
                 DropKind::SrcRejected,
                 &format!(
-                    "src={} ∉ {{tunnel_ip={tunnel_ip},tun_ip={tun_ip}}}（dev={}）",
+                    "src={} ∉ {{tun_ip={tun_ip}}}（dev={}）",
                     src_text(&dg),
                     dev_short(&dev)
                 ),
