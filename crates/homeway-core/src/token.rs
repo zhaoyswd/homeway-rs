@@ -1,14 +1,22 @@
 //! hmw1 凭证（token）：可见前缀 + base64url(裸二进制)。
 //!
-//! 布局（语义真源 `baseline:pkg/proto/token.go`，基线 621fe0e）：
+//! 布局（语义真源 `baseline:pkg/proto/token.go`，基线 621fe0e；M1 追加一段**可选**
+//! 尾字段——见下）：
 //!
 //! ```text
-//! "hmw1" ‖ base64url-raw( peerId(32B) ‖ secret(32B) ‖ epCount(1B) ‖ [type(1B)+len(1B)+addr]* ‖ crc(4B) )
+//! "hmw1" ‖ base64url-raw( peerId(32B) ‖ secret(32B) ‖ epCount(1B) ‖ [type(1B)+len(1B)+addr]* ‖ [rpk(32B)]? ‖ crc(4B) )
 //! ```
 //!
-//! - `peerId` = 后端静态 WG 公钥；`secret` = 凭证种子；`type` 0=direct 1=relay；
-//!   `crc` = SHA-256(前文)[:4]；base64 为**无填充** base64url（尾缀 `=` 不容忍，FIX-89）。
+//! - `peerId` = 后端静态 WG 公钥；`secret` = 凭证种子；`type` 0=direct 1=relay
+//!   **2=QUIC（M1 新增类别）**；`crc` = SHA-256(前文)[:4]；base64 为**无填充** base64url
+//!   （尾缀 `=` 不容忍，FIX-89）。
 //! - 解析先 `trim`（Go `strings.TrimSpace` 同义：Unicode White_Space）。
+//!
+//! **M1 追加字段（`rpk`，可选 32B，additive）**：出口 Ed25519 **RPK 裸公钥**——客户端
+//! 钉定服务端身份用（M1 设计 §1.3/§12-②；登记条草案见 §3.6，落库 = S4 判据行批）。
+//! 形态取**尾部追加**：无该字段的串（全部既有 Go 向量与既有部署 token）逐字节不变；
+//! 带该字段的串 = 端点数之后恰 32B（其余尾长仍判 Malformed——不留「猜长度」的口子）。
+//! 旧解析器会拒带 rpk 的串（无兼容包袱：用户拍板①；M2 重写 token 时统一）。
 //!
 //! 与 Go 的**已登记差异**（均为对抗性输入面，正常铸造的 token 不受影响）：
 //! 1. Go `DecodeToken("hmw")` 会 panic（`s[:4]` 越界，已登记 Go 侧问题清单 G1）；本实现
@@ -64,28 +72,54 @@ pub enum TokenError {
 }
 
 /// 端点类别（载荷 `type` 字节的语义化形态）。
+///
+/// **M1 新增 `Quic`（wire 2，additive）**：QUIC 类端点（`serve.quic_listen` 的独立端口，
+/// M1 设计 §1.1）——**端口与 WG 端口不同**，故必须靠类别字节区分（地址本身看不出）。
+/// 消费面（候选过滤）见 `wtransport::domain_eps`：WG 档**不吃** QUIC 端点（设计 §2.1
+/// 末段「两族候选不得互相投喂」），S2 的岛只吃 QUIC 类 + 中继端点。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum EndpointKind {
     Direct,
     Relay,
+    Quic,
 }
 
 impl EndpointKind {
-    /// 线上字节：Direct=0、Relay=1。
+    /// 线上字节：Direct=0、Relay=1、Quic=2。
     pub fn to_wire(self) -> u8 {
         match self {
             EndpointKind::Direct => 0,
             EndpointKind::Relay => 1,
+            EndpointKind::Quic => 2,
         }
     }
-    /// 线上字节→类别。Go 同义宽松语义：**非 1 一律按 Direct 收**（不报错）。
+    /// 线上字节→类别。Go 同义宽松语义：**未知值一律按 Direct 收**（不报错）。
     pub fn from_wire(b: u8) -> Self {
-        if b == 1 {
-            EndpointKind::Relay
-        } else {
-            EndpointKind::Direct
+        match b {
+            1 => EndpointKind::Relay,
+            2 => EndpointKind::Quic,
+            _ => EndpointKind::Direct,
         }
     }
+
+    /// 该类别是否属于 **WG 面**（M1 §2.1 末段「候选按 transport 过滤」的判据）：
+    /// QUIC 类**不是**——WG 档不吃它（端口都不同，§1.1），吃到只会产出握手超时噪声与
+    /// 赛跑结算失真。S2 的岛按 `!is_wg()` 取 QUIC 档候选。
+    pub fn is_wg(self) -> bool {
+        !matches!(self, EndpointKind::Quic)
+    }
+}
+
+/// WG 面候选的端点过滤（M1 §2.1 末段）：滤掉 QUIC 类端点，其余类别与顺序原样。
+///
+/// 为什么放在这里而不是 `wtransport::domain_eps`：①规则住在 `EndpointKind` 的家乡
+/// （一处定义、两侧引用）；②`wtransport/**` 是 M1 S1c 的红线面（候选展开函数保持零改动，
+/// 由调用方喂已过滤的入参——见 `domain_eps::split_and_resolve` 的文档）。
+pub fn wg_endpoint_refs(eps: &[Endpoint]) -> Vec<EndpointRef<'_>> {
+    eps.iter()
+        .filter(|e| e.kind.is_wg())
+        .map(|e| EndpointRef::new(e.addr.as_str(), e.kind))
+        .collect()
 }
 
 /// 32B 定长 newtype 的展开骨架（`PeerId` 与 `Secret` 共用；差异只在 `$copy` 与
@@ -187,6 +221,15 @@ byte_array_newtype!(
     PeerId,
     false
 );
+byte_array_newtype!(
+    /// 出口 Ed25519 **RPK 裸公钥**（token 载荷可选尾字段，32B；M1 设计 §1.3/§12-②）。
+    ///
+    /// 谁消费：客户端钉定校验器（错公钥 ⇒ TLS 握手中止，不是「连上再拒」）。
+    /// 挂哪来：`homeway_quic::ExitQuic::rpk_public_key()`（出口身份 = `HKDF(后端
+    /// 静态私钥, "homeway/quic-rpk")` 的 Ed25519 公钥）。
+    RpkPubKey,
+    false
+);
 secret_newtype!(
     /// 凭证种子（注册 HMAC / WG PSK / 隧道地址派生输入）。
     ///
@@ -218,6 +261,8 @@ pub struct TokenRef<'a> {
     peer_id: [u8; 32],
     secret: [u8; 32],
     endpoints: Vec<EndpointRef<'a>>,
+    /// 服务端 RPK 公钥（M1 追加的可选尾字段；旧串 = `None`）。
+    rpk: Option<RpkPubKey>,
 }
 
 impl<'a> TokenRef<'a> {
@@ -229,6 +274,10 @@ impl<'a> TokenRef<'a> {
     }
     pub fn endpoints(&self) -> &[EndpointRef<'a>] {
         &self.endpoints
+    }
+    /// 服务端 RPK 公钥（`None` = 该 token 未携带——M1 之前的串与 Go 向量都是此形态）。
+    pub fn rpk(&self) -> Option<RpkPubKey> {
+        self.rpk
     }
     /// 直连端点（Go `DirectEndpoints`）。
     pub fn direct_endpoints(&self) -> impl Iterator<Item = EndpointRef<'a>> + '_ {
@@ -243,6 +292,13 @@ impl<'a> TokenRef<'a> {
             .iter()
             .copied()
             .filter(|e| e.kind == EndpointKind::Relay)
+    }
+    /// QUIC 类端点（M1 新增类别；S2 的岛按 transport 过滤候选时的输入集之一）。
+    pub fn quic_endpoints(&self) -> impl Iterator<Item = EndpointRef<'a>> + '_ {
+        self.endpoints
+            .iter()
+            .copied()
+            .filter(|e| e.kind == EndpointKind::Quic)
     }
 }
 
@@ -261,6 +317,8 @@ pub struct Token {
     pub peer_id: PeerId,
     pub secret: Secret,
     pub endpoints: Vec<Endpoint>,
+    /// 服务端 RPK 公钥（可选；见 [`RpkPubKey`]）。
+    pub rpk: Option<RpkPubKey>,
 }
 
 impl<'a> From<TokenRef<'a>> for Token {
@@ -276,6 +334,7 @@ impl<'a> From<TokenRef<'a>> for Token {
                     kind: e.kind,
                 })
                 .collect(),
+            rpk: t.rpk,
         }
     }
 }
@@ -347,15 +406,25 @@ pub fn parse_body(raw: &[u8]) -> Result<TokenRef<'_>, TokenError> {
             kind: EndpointKind::from_wire(typ),
         });
     }
-    if !rest.is_empty() {
-        return Err(TokenError::Malformed {
-            reason: "载荷尾部有多余字节",
-        });
-    }
+    // 可选尾字段：恰 32B = 出口 RPK 裸公钥（M1 追加）；其余尾长一律拒（不猜）。
+    let rpk = match rest.len() {
+        0 => None,
+        32 => {
+            let mut b = [0u8; 32];
+            b.copy_from_slice(rest);
+            Some(RpkPubKey::from(b))
+        }
+        _ => {
+            return Err(TokenError::Malformed {
+                reason: "载荷尾部有多余字节",
+            })
+        }
+    };
     Ok(TokenRef {
         peer_id,
         secret,
         endpoints,
+        rpk,
     })
 }
 
@@ -415,6 +484,8 @@ pub struct TokenSpec<'a> {
     pub peer_id: &'a PeerId,
     pub secret: &'a Secret,
     pub endpoints: &'a [EndpointRef<'a>],
+    /// 服务端 RPK 公钥（`None` = 不打该字段——WG 档/无 QUIC 档的形态）。
+    pub rpk: Option<&'a RpkPubKey>,
 }
 
 /// 编码并 base64url（无填充）。校验与 Go `EncodeToken` 同面：端点地址须过 host:port
@@ -443,6 +514,9 @@ pub fn encode(spec: &TokenSpec<'_>) -> Result<String, TokenError> {
         buf.push(e.addr.len() as u8);
         buf.extend_from_slice(e.addr.as_bytes());
     }
+    if let Some(k) = spec.rpk {
+        buf.extend_from_slice(k.as_bytes());
+    }
     let sum = Sha256::digest(&buf);
     buf.extend_from_slice(&sum[..4]);
     let mut out = String::with_capacity(PREFIX.len() + buf.len().div_ceil(3) * 4);
@@ -454,6 +528,90 @@ pub fn encode(spec: &TokenSpec<'_>) -> Result<String, TokenError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// M1：`rpk` 尾字段（32B，可选）——带它可往返、逐字节稳定；不带它（旧串）逐字节不变。
+    #[test]
+    fn rpk_field_is_optional_trailing_and_byte_stable() {
+        let peer = PeerId::from([0x11; 32]);
+        let secret = Secret::from([0x22; 32]);
+        let eps = [EndpointRef {
+            addr: "127.0.0.1:42641",
+            kind: EndpointKind::Direct,
+        }];
+        let rpk = RpkPubKey::from([0x33; 32]);
+        // 端点按解码结果重建（借用面不参与本用例的字节稳定性判据）
+        let eps_of = |t: &Token| -> Vec<EndpointRef<'static>> {
+            t.endpoints
+                .iter()
+                .map(|e| EndpointRef::new(Box::leak(e.addr.clone().into_boxed_str()), e.kind))
+                .collect()
+        };
+
+        // 不带 rpk：与 M1 之前同形（无尾字段）
+        let plain = encode(&TokenSpec {
+            peer_id: &peer,
+            secret: &secret,
+            endpoints: &eps,
+            rpk: None,
+        })
+        .unwrap();
+        let t = decode(&plain).unwrap();
+        assert_eq!(t.rpk, None, "无尾字段 ⇒ rpk = None");
+        assert_eq!(t.endpoints.len(), 1);
+        let eps_plain = eps_of(&t);
+        let back = encode(&TokenSpec {
+            peer_id: &t.peer_id,
+            secret: &t.secret,
+            endpoints: &eps_plain,
+            rpk: t.rpk.as_ref(),
+        })
+        .unwrap();
+        assert_eq!(back, plain, "无 rpk 路径逐字节稳定");
+
+        // 带 rpk：往返带上、再编码逐字节一致
+        let with = encode(&TokenSpec {
+            peer_id: &peer,
+            secret: &secret,
+            endpoints: &eps,
+            rpk: Some(&rpk),
+        })
+        .unwrap();
+        assert_ne!(with, plain, "带 rpk 的串必不同于不带（尾 32B + CRC 变化）");
+        let t2 = decode(&with).unwrap();
+        assert_eq!(t2.rpk, Some(rpk), "rpk 逐字节还原");
+        let eps2 = eps_of(&t2);
+        let back2 = encode(&TokenSpec {
+            peer_id: &t2.peer_id,
+            secret: &t2.secret,
+            endpoints: &eps2,
+            rpk: t2.rpk.as_ref(),
+        })
+        .unwrap();
+        assert_eq!(back2, with, "带 rpk 路径逐字节稳定");
+        // 借用面（parse_body）同判
+        let raw = B64.decode(&with.as_bytes()[PREFIX.len()..]).unwrap();
+        assert_eq!(parse_body(&raw).unwrap().rpk(), Some(rpk));
+    }
+
+    /// 尾字段**只认恰 32B**：1/31/33/64 字节一律 Malformed（不留「猜长度」的口子）。
+    #[test]
+    fn rpk_field_rejects_other_trailing_lengths() {
+        for extra in [1usize, 31, 33, 64] {
+            let mut body = Vec::new();
+            body.extend_from_slice(&[0x01u8; 32]); // peer
+            body.extend_from_slice(&[0x02u8; 32]); // secret
+            body.push(0); // epCount = 0
+            body.extend(std::iter::repeat_n(0xAAu8, extra));
+            let sum = Sha256::digest(&body);
+            body.extend_from_slice(&sum[..4]);
+            match parse_body(&body) {
+                Err(TokenError::Malformed { reason }) => {
+                    assert_eq!(reason, "载荷尾部有多余字节", "extra={extra}")
+                }
+                other => panic!("extra={extra} 应判 Malformed，实得 {other:?}"),
+            }
+        }
+    }
 
     #[test]
     fn validate_host_port_mirrors_go_structure_rules() {
@@ -505,6 +663,7 @@ mod tests {
                 addr: "127.0.0.1:42641",
                 kind: EndpointKind::Direct,
             }],
+            rpk: None,
         };
         let tok = encode(&spec).unwrap();
         for sep in ["\n", "\r\n", "\n\r"] {
@@ -583,6 +742,7 @@ mod tests {
             peer_id: &PeerId::from(peer),
             secret: &Secret::from(secret),
             endpoints: &eps,
+            rpk: None,
         };
         let tok = encode(&spec).unwrap();
         let decoded = decode(&tok).unwrap();
@@ -600,19 +760,120 @@ mod tests {
             peer_id: &parsed.peer_id(),
             secret: &parsed.secret(),
             endpoints: parsed.endpoints(),
+            rpk: None,
         };
         assert_eq!(encode(&spec2).unwrap(), tok);
         assert_eq!(parsed.direct_endpoints().count(), 1);
         assert_eq!(parsed.relay_endpoints().count(), 1);
     }
 
-    /// L3：线字节宽松语义——非 1 的 type 字节一律按 Direct（Go 同义）。
+    /// L3：线字节宽松语义——**未知** type 字节一律按 Direct（Go 同义）；M1 起 2 = QUIC 是
+    /// **已知名**（不再是未知值）⇒ 2 归 Quic，只有 >2 才是宽松面。
     #[test]
     fn endpoint_kind_from_wire_is_lenient_like_go() {
         assert_eq!(EndpointKind::from_wire(0), EndpointKind::Direct);
         assert_eq!(EndpointKind::from_wire(1), EndpointKind::Relay);
-        for odd in [2, 7, 0xff] {
+        assert_eq!(EndpointKind::from_wire(2), EndpointKind::Quic);
+        for odd in [3, 7, 0xff] {
             assert_eq!(EndpointKind::from_wire(odd), EndpointKind::Direct);
         }
+        // wire 字节（M1 定值；Go 侧未知值按 Direct 收 = 无兼容包袱，用户拍板①）
+        assert_eq!(EndpointKind::Direct.to_wire(), 0);
+        assert_eq!(EndpointKind::Relay.to_wire(), 1);
+        assert_eq!(EndpointKind::Quic.to_wire(), 2);
+    }
+
+    /// **判据（M1 S1c 的「WG 档不吃 QUIC 端点」，§2.1 末段）**：`wg_endpoint_refs` 滤掉
+    /// QUIC 类（地址/端口都不是 WG 面），其余类别与顺序原样；反向对照：把同址标成
+    /// Direct ⇒ 会留下（证明过滤真在起作用）。
+    #[test]
+    fn wg_endpoint_refs_filters_quic_class() {
+        let eps = vec![
+            Endpoint { addr: "1.2.3.4:41641".into(), kind: EndpointKind::Direct },
+            Endpoint { addr: "1.2.3.4:41652".into(), kind: EndpointKind::Quic },
+            Endpoint { addr: "5.6.7.8:41741".into(), kind: EndpointKind::Relay },
+            Endpoint { addr: "203.0.113.7:41652".into(), kind: EndpointKind::Quic },
+        ];
+        let wg = wg_endpoint_refs(&eps);
+        assert_eq!(wg.len(), 2, "QUIC 类全滤掉：{wg:?}");
+        assert!(wg.iter().all(|e| e.kind.is_wg()));
+        assert_eq!(wg[0].addr, "1.2.3.4:41641");
+        assert_eq!(wg[1].addr, "5.6.7.8:41741");
+        assert_eq!(wg[1].kind, EndpointKind::Relay, "中继位原样");
+        // 反向对照：同址标成 Direct ⇒ 留下
+        let mislabeled = vec![Endpoint { addr: "1.2.3.4:41652".into(), kind: EndpointKind::Direct }];
+        assert_eq!(wg_endpoint_refs(&mislabeled).len(), 1);
+        assert!(!EndpointKind::Quic.is_wg() && EndpointKind::Direct.is_wg());
+    }
+
+    /// **判据（S1-8）**：QUIC 类端点 encode/decode 往返 + **既有 WG 端点逐字节不变**。
+    ///
+    /// 「逐字节不变」的验法：同一端点表去掉 QUIC 条目后，载荷里的 **WG 段字节**必须与
+    /// 含 QUIC 条目的那串**逐字节相同**（QUIC 只追加自己的段，不动前文）；同时
+    /// `direct_endpoints`/`relay_endpoints` 的过滤结果不受 QUIC 条目影响。
+    #[test]
+    fn quic_endpoint_kind_round_trips_and_keeps_wg_bytes() {
+        let peer_id = PeerId::from([0x51; 32]);
+        let secret = Secret::from([0x52; 32]);
+        let wg = [
+            EndpointRef::new("192.168.3.12:41641", EndpointKind::Direct),
+            EndpointRef::new("198.51.100.212:41741", EndpointKind::Relay),
+        ];
+        let with_quic = [
+            wg[0], wg[1],
+            EndpointRef::new("192.168.3.12:42652", EndpointKind::Quic),
+            EndpointRef::new("203.0.113.7:42652", EndpointKind::Quic),
+        ];
+        let tok_wg = encode(&TokenSpec { peer_id: &peer_id, secret: &secret, endpoints: &wg, rpk: None })
+            .expect("编码");
+        let tok_quic = encode(&TokenSpec {
+            peer_id: &peer_id,
+            secret: &secret,
+            endpoints: &with_quic,
+            rpk: None,
+        })
+        .expect("编码");
+
+        // ① WG 段字节不变：解出段序列的前两段（type+len+addr）逐字节相同
+        let body = |s: &str| -> Vec<u8> {
+            B64.decode(s.strip_prefix(PREFIX).unwrap()).expect("base64")
+        };
+        let segs = |b: &[u8], n: usize| -> Vec<u8> {
+            let mut off = 65; // peer(32)+secret(32)+count(1)
+            for _ in 0..n {
+                let ln = b[off + 1] as usize;
+                off += 2 + ln;
+            }
+            b[65..off].to_vec()
+        };
+        assert_eq!(segs(&body(&tok_wg), 2), segs(&body(&tok_quic), 2), "WG 段逐字节不变");
+        assert_eq!(body(&tok_quic)[64], 4, "端点计数 = 4（含 2 条 QUIC）");
+
+        // ② 往返：类别与地址逐条还原；过滤函数各归各族
+        let t = decode(&tok_quic).expect("解析");
+        assert_eq!(t.endpoints[0].kind, EndpointKind::Direct);
+        assert_eq!(t.endpoints[1].kind, EndpointKind::Relay);
+        assert_eq!(t.endpoints[2].kind, EndpointKind::Quic);
+        assert_eq!(t.endpoints[3].addr, "203.0.113.7:42652");
+        let raw_quic = body(&tok_quic);
+        let t2 = parse_body(&raw_quic).expect("借用解析");
+        assert_eq!(t2.direct_endpoints().count(), 1);
+        assert_eq!(t2.relay_endpoints().count(), 1);
+        assert_eq!(t2.quic_endpoints().count(), 2);
+        assert_eq!(
+            t2.quic_endpoints().map(|e| e.addr).collect::<Vec<_>>(),
+            vec!["192.168.3.12:42652", "203.0.113.7:42652"]
+        );
+        // ③ 再编码逐字节稳定
+        let refs: Vec<EndpointRef<'_>> = t
+            .endpoints
+            .iter()
+            .map(|e| EndpointRef::new(e.addr.as_str(), e.kind))
+            .collect();
+        assert_eq!(
+            encode(&TokenSpec { peer_id: &t.peer_id, secret: &t.secret, endpoints: &refs, rpk: None })
+                .unwrap(),
+            tok_quic
+        );
     }
 }

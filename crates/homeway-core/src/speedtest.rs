@@ -20,6 +20,10 @@ use std::time::{Duration, Instant};
 use crate::wgcore::{Client, ConnErr};
 
 /// speedtest 服务端口（隧道 IP 上；出口按 LocalServices 转投）。
+///
+/// **M3 口径（D1）**：本模块的跑测面只被 **CLI 本地形态**消费（`Session` 拨号 = WG 承载，
+/// 不变）；App 核的测速走桥 UDS（`facade/speedtest_op.rs`）——QUIC 档在桥那头按本端口选
+/// `STREAM[tag=3]`（`facade/quic_stream.rs::tag_for_port`），**不再拨本端口**。
 pub const SPEEDTEST_PORT: u16 = 7803;
 pub(crate) const MAGIC: [u8; 4] = *b"SPED";
 pub(crate) const HEADER: usize = 15;

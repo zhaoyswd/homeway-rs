@@ -1,0 +1,677 @@
+//! 可配常量面（M3 §15-2/§15-3）：**流窗口 / 流并发 / 待发队列 / 快探参数 / 发送面新鲜度窗**。
+//!
+//! 形态照 `HOMEWAY_QUIC_MTU` 先例（M1 §12-①）：**env 优先 → 显式配置 → 设计缺省**；
+//! 非法或越界 ⇒ **不改该项** + 返回一行「按缺省走」说明（调用方按 `Logf` 落行）。
+//!
+//! 为什么这些是常量而不是「调优」：初值都带设计文档给的账（`M3-design.md` §1.4/§1.7/§7/
+//! §8.2-16），改动即偏离设计（须先登记再改——§15-3）；env 消融臂供 S8 门槛/真机标定。
+//!
+//! **本文件纯 std**（隔离门 ② 条扫描面：不得出现 `tokio::|quinn|rustls|async fn|.await`）
+//! ——两端（岛侧客户端面与出口面）与同步面（S7 的配置登记条）读同一份值域。
+
+use std::time::Duration;
+
+// ---------------------------------------------------------------------------
+// 流面限制（§1.7 的定值 + §8.2-16 的配置条）
+// ---------------------------------------------------------------------------
+
+/// 流窗口 / 并发 / 队列的**设计定值**（§1.7；初值与值域都不许悄悄漂）。
+pub mod stream_defaults {
+    /// `max_concurrent_bidi_streams`（quinn TP；§1.7：quinn 缺省 100 ⇒ 收窄到 64）。
+    pub const MAX_BIDI: u32 = 64;
+    /// `max_concurrent_uni_streams`（§1.7-N13：本期限定「反向不开流」⇒ **0**；
+    /// 与「`Cmd::Probe` 换 tag=5 真回显」**同切片**落地，否则巡检定音失效）。
+    pub const MAX_UNI: u32 = 0;
+    /// `stream_receive_window`（**每流接收窗**）。
+    ///
+    /// **S9 整改（2026-10-09；偏离 M3-design §1.7 的 256 KiB，依据 = S9 定位实验）**：
+    /// 出口泵的停等账实测——256 KiB 窗下 64 MiB 下载的 94% 墙钟（2512ms/2678ms）耗在
+    /// `SendStream::write_all` 的流控停等上，单次停等 ≈ 窗更新往返 9.8 ms
+    /// ⇒ 吞吐 = W/R_eff = 256 KiB/9.8 ms ≈ 25 MiB/s（与实测 23–25 MiB/s 逐值吻合；
+    /// 对照 WG/UDS 档 51 MiB/s ⇒ 0.46×，S8 的负面读数即此）。W=4 MiB 时停等降到 4–9%、
+    /// 吞吐 **71 MiB/s（= WG 的 1.39×）**。
+    ///
+    /// BDP 口径（quinn 对 `stream_receive_window` 的原话：应 ≥ 连接时延 × 期望吞吐）：
+    /// 4 MiB / 100 ms = 40 MB/s/流，覆盖真机 30–100 ms 档；本条只改**每流**窗，
+    /// 内存最坏面由 [`CONN_RECV_WINDOW`] 的聚合闸兜住（不随本条放大）。
+    pub const RECV_WINDOW: u32 = 4 * 1024 * 1024;
+    /// `receive_window`（**连接级接收窗 = 接收面聚合上界**；**S9 新增**）。
+    ///
+    /// 为什么必须显式给：quinn 缺省 `receive_window = VarInt::MAX`（无界）——设计 §7 的
+    /// 「64 流 × 每流窗 = 16 MiB/连接」账**只**由「每流窗 × 并发流数」兜底；每流窗抬到
+    /// 4 MiB 后该兜底会变成 256 MiB/连接（超设计账 16×）。显式 8 MiB ⇒ 单连接接收面最坏
+    /// **8 MiB**（比设计账 16 MiB 还低一半），同时单条 bulk 流仍可吃满 4 MiB 的每流窗
+    /// （两条 bulk 流各 4 MiB 亦容纳；>2 条并行时按聚合闸分摊）。
+    pub const CONN_RECV_WINDOW: u32 = 8 * 1024 * 1024;
+    /// `send_window`（**连接级发送缓冲**、多流共享；quinn 缺省 10 MB ⇒ 收窄到 2 MiB）。
+    ///
+    /// S9 实测：把出口侧本值抬到 8 MiB 对下行吞吐**零影响**（70.3/71.0 vs 70.0/71.9 MiB/s）
+    /// ⇒ 下行瓶颈不在发送缓冲；上传方向的发送侧缓冲同理属「在途未确认字节」闸，
+    /// 2 MiB 对 4 MiB 窗仍 ≥ 在途量级 ⇒ **本值不改**（保持设计 §1.7 的账）。
+    ///
+    /// **口径边界（代码门 r18 ③-3，如实登记）**：上面的「零影响」读数取自**回环**（RTT ≈0.1ms）；
+    /// 本值的语义 = 发送端本地「未确认保留字节」上界 ⇒ 可持续吞吐 ≲ `send_window / RTT`
+    /// （2 MiB / 100 ms ≈ 20 MB/s 量级）**只在真机 RTT 档才可能成为瓶颈** ⇒ 真机复测（M5）
+    /// 须**双向**采读数，并注意**出口进程不施加本组 env**（消融上传方向要在装配点接线）。
+    pub const SEND_WINDOW: u32 = 2 * 1024 * 1024;
+    /// 每流**待发队列**上界（§1.4：有界待发，懒分配）。
+    pub const PENDING_BYTES: usize = 64 * 1024;
+    /// 自记账域固定占用（§1.4-N14）：控制流 1 + probe 持久流 1。
+    pub const RESERVED_STREAMS: u32 = 2;
+}
+
+/// 流面限制（两端共用同一份值 ⇒ 写进 [`crate::exit::transport`] 的 `TransportConfig`）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct StreamLimits {
+    /// `max_concurrent_bidi_streams`（quinn TP）。
+    pub max_bidi: u32,
+    /// `max_concurrent_uni_streams`（本期 = 0）。
+    pub max_uni: u32,
+    /// `stream_receive_window`（每流接收窗，字节）。
+    pub recv_window: u32,
+    /// `receive_window`（**连接级**接收窗 = 接收面聚合上界，字节；S9 新增）。
+    pub conn_recv_window: u32,
+    /// `send_window`（字节；**连接级**发送缓冲）。
+    pub send_window: u32,
+    /// 每流待发队列上界（字节）。
+    pub pending_bytes: usize,
+}
+
+impl Default for StreamLimits {
+    fn default() -> Self {
+        Self {
+            max_bidi: stream_defaults::MAX_BIDI,
+            max_uni: stream_defaults::MAX_UNI,
+            recv_window: stream_defaults::RECV_WINDOW,
+            conn_recv_window: stream_defaults::CONN_RECV_WINDOW,
+            send_window: stream_defaults::SEND_WINDOW,
+            pending_bytes: stream_defaults::PENDING_BYTES,
+        }
+    }
+}
+
+impl StreamLimits {
+    /// 设计定值（= [`Default`]；具名入口供「配置条 vs 环境覆盖」两处读同一份）。
+    pub fn design() -> Self {
+        Self::default()
+    }
+
+    /// 有效服务流容量（§1.4-N14：自记账域 = {控制流, probe 持久流, 服务流}）。
+    pub const fn service_capacity(&self) -> usize {
+        self.max_bidi
+            .saturating_sub(stream_defaults::RESERVED_STREAMS) as usize
+    }
+
+    /// env 覆盖（key → 值域）：返回生效条数与「非法/越界 ⇒ 按缺省」说明行。
+    ///
+    /// 值域写在这里（**不是** env 解析处）：越界值会让 quinn 侧行为不可预期
+    /// （如 0 并发 = 服务流全开不出来），故必须挡在进 `TransportConfig` 之前。
+    pub fn apply_env(&mut self, get: &dyn Fn(&str) -> Option<String>) -> (usize, Vec<String>) {
+        let mut applied = 0;
+        let mut notes = Vec::new();
+        // `max_bidi`：下限 3（= 保留 2 + 至少 1 条服务流），上限 1024（quinn 面充裕）。
+        match parse_env_u64(get, ENV_STREAMS, 3, 1024) {
+            EnvOutcome::Value(v) => {
+                self.max_bidi = v as u32;
+                applied += 1;
+            }
+            EnvOutcome::Rejected(note) => notes.push(note),
+            EnvOutcome::Unset => {}
+        }
+        // 每流接收窗：32 KiB（小于此值 bulk 服务流会被窗口拖死）… 16 MiB（S9：上限随
+        // 设计缺省抬到 4 MiB 一并放宽——否则缺省值 = 旧上限，消融臂再无处可抬）。
+        match parse_env_u64(get, ENV_STREAM_WINDOW, 32 * 1024, 16 * 1024 * 1024) {
+            EnvOutcome::Value(v) => {
+                self.recv_window = v as u32;
+                applied += 1;
+            }
+            EnvOutcome::Rejected(note) => notes.push(note),
+            EnvOutcome::Unset => {}
+        }
+        // 连接级接收窗（接收面聚合上界）：256 KiB…64 MiB（S9 新增旋钮；缺省 8 MiB）。
+        match parse_env_u64(get, ENV_CONN_RECV_WINDOW, 256 * 1024, 64 * 1024 * 1024) {
+            EnvOutcome::Value(v) => {
+                self.conn_recv_window = v as u32;
+                applied += 1;
+            }
+            EnvOutcome::Rejected(note) => notes.push(note),
+            EnvOutcome::Unset => {}
+        }
+        // 连接级发送窗（多流共享）：256 KiB…64 MiB。
+        match parse_env_u64(get, ENV_SEND_WINDOW, 256 * 1024, 64 * 1024 * 1024) {
+            EnvOutcome::Value(v) => {
+                self.send_window = v as u32;
+                applied += 1;
+            }
+            EnvOutcome::Rejected(note) => notes.push(note),
+            EnvOutcome::Unset => {}
+        }
+        // 每流待发队列：4 KiB（小于单条 bulk 写 = 恒背压）…4 MiB（超过即单流可吃掉进程序列）。
+        match parse_env_u64(get, ENV_STREAM_PENDING, 4096, 4 * 1024 * 1024) {
+            EnvOutcome::Value(v) => {
+                self.pending_bytes = v as usize;
+                applied += 1;
+            }
+            EnvOutcome::Rejected(note) => notes.push(note),
+            EnvOutcome::Unset => {}
+        }
+        // 跨项关系（代码门 r18 ③-4）：**连接级接收窗必须 ≥ 每流接收窗**，否则连接窗是真界
+        // ⇒ 抬高的每流窗静默失效（quinn 不校验、不夹取；缺省值由单测钉住，但 env 组合能
+        // 构造出违例）。处置 = **抬连接窗到每流窗**（保证「所请求的每流窗可达」）并记一行。
+        if self.recv_window > self.conn_recv_window {
+            let was = self.conn_recv_window;
+            self.conn_recv_window = self.recv_window;
+            notes.push(format!(
+                "quic: ⚠️ 流面参数跨项关系 —— 连接级接收窗（{}B）< 每流接收窗（{}B）会让每流窗失效；连接窗按需抬到 {}B（照依赖库语义：连接级窗 = 接收面聚合上界）",
+                was, self.recv_window, self.conn_recv_window
+            ));
+        }
+        (applied, notes)
+    }
+}
+
+/// env 名（S7 的配置登记条读它；生产/消融两边不许各写一份）。
+pub const ENV_STREAMS: &str = "HOMEWAY_QUIC_STREAMS";
+/// env 名：每流接收窗（字节）。
+pub const ENV_STREAM_WINDOW: &str = "HOMEWAY_QUIC_STREAM_WINDOW";
+/// env 名：**连接级接收窗**（接收面聚合上界，字节；S9 新增）。
+pub const ENV_CONN_RECV_WINDOW: &str = "HOMEWAY_QUIC_RECV_WINDOW";
+/// env 名：连接级发送窗（字节）。
+pub const ENV_SEND_WINDOW: &str = "HOMEWAY_QUIC_SEND_WINDOW";
+/// env 名：每流待发队列（字节）。
+pub const ENV_STREAM_PENDING: &str = "HOMEWAY_QUIC_STREAM_PENDING";
+
+// ---------------------------------------------------------------------------
+// 出口服务入口（intake）与 socketpair（§1.7/§2.2/§15-3；M3 S2 消费）
+// ---------------------------------------------------------------------------
+
+/// 出口服务入口的设计定值（§1.7 设计门 2-4/2-5 + §2.2 的 B′ 形态）。
+///
+/// 三条一起构成「应用层 busy 路径在 STREAM 面可达」的构造性保证：**intake 容量 =
+/// 服务在册上限 + K** ⇒ 超限时先撞**服务自身的在册闸**（files `server_busy` /
+/// speedtest `error:"busy"` 逐字节保留），intake 满只在极端洪泛（> 在册上限 + K 并发）出现。
+pub mod service_defaults {
+    /// intake 容量余量 K（留给应用层 busy 路径；§1.7 设计门 2-5）。
+    pub const INTAKE_K: usize = 4;
+    /// socketpair 两向缓冲（§2.2：「显式 64 KiB/方向」，纳入内存账）。
+    ///
+    /// 注（平台事实，实测）：darwin 上 AF_UNIX 的 `SO_SNDBUF` 被内核夹到系统上限
+    /// （读回 4097）——产品平台（Linux/OHOS）按本值生效，读回为设定值的 2×（内核记账）。
+    pub const SOCKPAIR_BYTES: usize = 64 * 1024;
+
+    /// 某服务在册上限对应的 intake 容量（§8.2-16：files 20 / speedtest 16 / term 20）。
+    pub const fn intake_capacity(registered_max: usize) -> usize {
+        registered_max + INTAKE_K
+    }
+}
+
+// ---------------------------------------------------------------------------
+// 快探参数（§3.2/§15-2；S4 消费——S1 落值域与消融臂）
+// ---------------------------------------------------------------------------
+
+/// 快探/恢复的**初值**（§3.2 的三段节拍 + §3.1 的 B 门 + §14.4-1 的「待标定」项）。
+pub mod probe_defaults {
+    use std::time::Duration;
+
+    /// 在用档首探预算（§13-T2 实测：预算 700ms/间隔 0 ⇒ 706ms 定音）。
+    pub const FAST_BUDGET: Duration = Duration::from_millis(700);
+    /// 在用档**拍间**（§3.2-1「背靠背（拍间 ≤300ms，由 runtime 拍内务驱动）」——
+    /// 岛内拍 = `driver::TICK`（250ms）⇒ 取 250ms 与拍同拍，恒 ≤300ms）。
+    pub const FAST_GAP: Duration = Duration::from_millis(250);
+    /// 复探倍数（§3.1-2：首探失败 ⇒ 本拍内用加倍预算复探一次）。
+    pub const REPROBE_FACTOR: u32 = 2;
+    /// 「在用」判据的**出站新鲜窗**（§3.2-1「在用档（`demand > 0`，沿用 `demand.rs` 需求位）」）。
+    ///
+    /// 岛是叶子 crate（不得依赖 `homeway-core::demand`）⇒ 本窗口照抄
+    /// `demand::OUTBOUND_FRESH`（5s）的**包面语义**：岛按自己的 `TunCounters::last_outbound_at`
+    /// 判「有包在等」。**偏离登记**：亮屏位（`demand.rs` 的 activity 位）在岛内不可达
+    /// （它由扩展经 NAPI 推给 core）⇒ 本档位对「亮屏但无包」的设备按待机走（电池面更保守）。
+    pub const IN_USE_FRESH: Duration = Duration::from_secs(5);
+    /// 待机档节拍（= `PATROL_INTERVAL`，不变——保电池/CPU）。
+    pub const IDLE_INTERVAL: Duration = Duration::from_secs(60);
+    /// 抖动连续升格阈值（§3.1-③：防 fail-silent）。
+    pub const JITTER_STREAK: u32 = 3;
+    /// B 门：连续 R 失败次数（§3.1：连续 2 次且窗 ≥10s）。
+    pub const RECONNECT_STREAK: u32 = 2;
+    /// B 门：累计失败窗（同上）。
+    pub const REBUILD_WINDOW: Duration = Duration::from_secs(10);
+    /// 本机发送面错误的**新鲜度窗**（§3.1-N5：照 `demand::OUTBOUND_FRESH` 先例）。
+    pub const SEND_ERR_FRESH: Duration = Duration::from_secs(5);
+}
+
+/// 快探/恢复参数（S4 的阶梯重写消费；值域与 env 臂在 S1 落地）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct ProbeTuning {
+    /// 首探预算。
+    pub fast_budget: Duration,
+    /// 在用档拍间（背靠背；§3.2-1）。
+    pub fast_gap: Duration,
+    /// 复探倍数（≥1）。
+    pub reprobe_factor: u32,
+    /// 待机档节拍。
+    pub idle_interval: Duration,
+    /// 抖动连续升格阈值。
+    pub jitter_streak: u32,
+    /// B 门：连续 R 失败次数。
+    pub reconnect_streak: u32,
+    /// B 门：累计失败窗。
+    pub rebuild_window: Duration,
+    /// 本机发送面错误的新鲜度窗（N5；M/R 判别用）。
+    pub send_err_fresh: Duration,
+    /// 「在用档」判据的出站新鲜窗（§3.2-1；岛侧包面语义，见 `probe_defaults::IN_USE_FRESH`）。
+    pub in_use_fresh: Duration,
+}
+
+impl Default for ProbeTuning {
+    fn default() -> Self {
+        Self {
+            fast_budget: probe_defaults::FAST_BUDGET,
+            fast_gap: probe_defaults::FAST_GAP,
+            reprobe_factor: probe_defaults::REPROBE_FACTOR,
+            idle_interval: probe_defaults::IDLE_INTERVAL,
+            jitter_streak: probe_defaults::JITTER_STREAK,
+            reconnect_streak: probe_defaults::RECONNECT_STREAK,
+            rebuild_window: probe_defaults::REBUILD_WINDOW,
+            send_err_fresh: probe_defaults::SEND_ERR_FRESH,
+            in_use_fresh: probe_defaults::IN_USE_FRESH,
+        }
+    }
+}
+
+impl ProbeTuning {
+    /// 设计定值（= [`Default`]）。
+    pub fn design() -> Self {
+        Self::default()
+    }
+
+    /// env 覆盖（时长类 env 的单位一律 **ms**；照 `HOMEWAY_QUIC_MTU` 的「整数裸值」形态）。
+    pub fn apply_env(&mut self, get: &dyn Fn(&str) -> Option<String>) -> (usize, Vec<String>) {
+        let mut applied = 0;
+        let mut notes = Vec::new();
+        env_ms(get, ENV_PROBE_BUDGET, 50, 10_000, &mut self.fast_budget, &mut applied, &mut notes);
+        // 拍间允许 0（真背靠背：拍内务每次回看都探）…1s（不得超过首探预算的量级）。
+        env_ms(get, ENV_PROBE_GAP, 0, 1_000, &mut self.fast_gap, &mut applied, &mut notes);
+        env_u32(
+            get,
+            ENV_PROBE_REPROBE,
+            1,
+            4,
+            &mut self.reprobe_factor,
+            &mut applied,
+            &mut notes,
+        );
+        env_ms(get, ENV_PROBE_IDLE, 5_000, 600_000, &mut self.idle_interval, &mut applied, &mut notes);
+        env_u32(get, ENV_JITTER_STREAK, 1, 10, &mut self.jitter_streak, &mut applied, &mut notes);
+        env_u32(
+            get,
+            ENV_RECONNECT_STREAK,
+            1,
+            10,
+            &mut self.reconnect_streak,
+            &mut applied,
+            &mut notes,
+        );
+        env_ms(get, ENV_REBUILD_WINDOW, 1_000, 300_000, &mut self.rebuild_window, &mut applied, &mut notes);
+        env_ms(
+            get,
+            ENV_SEND_ERR_FRESH,
+            500,
+            60_000,
+            &mut self.send_err_fresh,
+            &mut applied,
+            &mut notes,
+        );
+        env_ms(
+            get,
+            ENV_IN_USE_FRESH,
+            500,
+            120_000,
+            &mut self.in_use_fresh,
+            &mut applied,
+            &mut notes,
+        );
+        (applied, notes)
+    }
+}
+
+/// env 名：首探预算（ms）。
+pub const ENV_PROBE_BUDGET: &str = "HOMEWAY_QUIC_PROBE_BUDGET";
+/// env 名：在用档拍间（ms；背靠背）。
+pub const ENV_PROBE_GAP: &str = "HOMEWAY_QUIC_PROBE_GAP";
+/// env 名：复探倍数。
+pub const ENV_PROBE_REPROBE: &str = "HOMEWAY_QUIC_PROBE_REPROBE";
+/// env 名：待机档节拍（ms）。
+pub const ENV_PROBE_IDLE: &str = "HOMEWAY_QUIC_PROBE_IDLE";
+/// env 名：抖动连续升格阈值。
+pub const ENV_JITTER_STREAK: &str = "HOMEWAY_QUIC_JITTER_STREAK";
+/// env 名：B 门连续失败次数。
+pub const ENV_RECONNECT_STREAK: &str = "HOMEWAY_QUIC_RECONNECT_STREAK";
+/// env 名：B 门失败窗（ms）。
+pub const ENV_REBUILD_WINDOW: &str = "HOMEWAY_QUIC_REBUILD_WINDOW";
+/// env 名：发送面错误新鲜度窗（ms）。
+pub const ENV_SEND_ERR_FRESH: &str = "HOMEWAY_QUIC_SEND_ERR_FRESH";
+/// env 名：「在用档」出站新鲜窗（ms）。
+pub const ENV_IN_USE_FRESH: &str = "HOMEWAY_QUIC_IN_USE_FRESH";
+
+// ---------------------------------------------------------------------------
+// env 解析小件（纯函数；测试直接喂 `get` 闭包，不碰进程环境）
+// ---------------------------------------------------------------------------
+
+/// 一次 env 读取的结论（**不改**调用侧值 ⇒ 未设/非法项按缺省走）。
+enum EnvOutcome {
+    /// env 未设（常态；不打行、不改值）。
+    Unset,
+    /// 合法值（在值域内）。
+    Value(u64),
+    /// 非法或越界：说明行（调用方落 `Logf`）。
+    Rejected(String),
+}
+
+/// 读一个「非负整数 + 闭区间」env（照 `HOMEWAY_QUIC_MTU` 的记行形态：**不夹取**）。
+fn parse_env_u64(get: &dyn Fn(&str) -> Option<String>, name: &str, min: u64, max: u64) -> EnvOutcome {
+    let Some(raw) = get(name) else {
+        return EnvOutcome::Unset;
+    };
+    match raw.trim().parse::<u64>() {
+        Ok(v) if (min..=max).contains(&v) => EnvOutcome::Value(v),
+        _ => EnvOutcome::Rejected(format!(
+            "quic: ⚠️ {name}={raw} 非法或越界（有效区间 [{min},{max}]）—— 该项按设计缺省走（照 HOMEWAY_QUIC_MTU 先例）"
+        )),
+    }
+}
+
+/// 生产 env 读取口（`std::env::var` 的唯一封装；测试用闭包替代）。
+pub fn env_get(name: &str) -> Option<String> {
+    std::env::var(name).ok()
+}
+
+/// 一项「毫秒数」env 的施加（未设 ⇒ 静默；非法/越界 ⇒ 不改值 + 一行说明）。
+fn env_ms(
+    get: &dyn Fn(&str) -> Option<String>,
+    name: &str,
+    min: u64,
+    max: u64,
+    slot: &mut Duration,
+    applied: &mut usize,
+    notes: &mut Vec<String>,
+) {
+    match parse_env_u64(get, name, min, max) {
+        EnvOutcome::Value(v) => {
+            *slot = Duration::from_millis(v);
+            *applied += 1;
+        }
+        EnvOutcome::Rejected(note) => notes.push(note),
+        EnvOutcome::Unset => {}
+    }
+}
+
+/// 一项 `u32` env 的施加（同 [`env_ms`]）。
+fn env_u32(
+    get: &dyn Fn(&str) -> Option<String>,
+    name: &str,
+    min: u64,
+    max: u64,
+    slot: &mut u32,
+    applied: &mut usize,
+    notes: &mut Vec<String>,
+) {
+    match parse_env_u64(get, name, min, max) {
+        EnvOutcome::Value(v) => {
+            *slot = v as u32;
+            *applied += 1;
+        }
+        EnvOutcome::Rejected(note) => notes.push(note),
+        EnvOutcome::Unset => {}
+    }
+}
+
+/// 施加 env 覆盖并按 `Logf` 落说明行的便捷口（岛/出口的启动路径共用）。
+///
+/// 返回生效条数（0 = 全缺省）。**未设**的项不打行；**非法**项打行后按缺省走。
+pub fn apply_stream_env(lim: &mut StreamLimits, logf: &crate::cmd::Logf) -> usize {
+    let (applied, notes) = lim.apply_env(&env_get);
+    for n in &notes {
+        (*logf)(n);
+    }
+    applied
+}
+
+/// 施加快探 env 覆盖（同 [`apply_stream_env`]）。
+pub fn apply_probe_env(t: &mut ProbeTuning, logf: &crate::cmd::Logf) -> usize {
+    let (applied, notes) = t.apply_env(&env_get);
+    for n in &notes {
+        (*logf)(n);
+    }
+    applied
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// 未设 env 的闭包（生产缺省路径）。
+    fn none(_: &str) -> Option<String> {
+        None
+    }
+
+    /// 固定表（测试用；避免碰进程环境）。
+    fn table(pairs: &'static [(&'static str, &'static str)]) -> impl Fn(&str) -> Option<String> {
+        move |k: &str| {
+            pairs
+                .iter()
+                .find(|(n, _)| *n == k)
+                .map(|(_, v)| (*v).to_owned())
+        }
+    }
+
+    /// **判据（§15-3 初值 = 设计定值；S9 修订后的值域）**：缺省逐值照设计（含 `uni=0`
+    /// 与 N14 的自记账域）；每流窗/连接级接收窗 = S9 整改值（4 MiB / 8 MiB，依据见
+    /// [`stream_defaults::RECV_WINDOW`] 的定位实验账）。
+    #[test]
+    fn stream_limits_default_to_design_values() {
+        let d = StreamLimits::design();
+        assert_eq!(d.max_bidi, 64, "§1.7 的并发上限");
+        assert_eq!(d.max_uni, 0, "§1.7-N13：本期 uni=0");
+        assert_eq!(d.recv_window, 4 * 1024 * 1024, "每流接收窗（S9：256 KiB→4 MiB）");
+        assert_eq!(
+            d.conn_recv_window,
+            8 * 1024 * 1024,
+            "连接级接收窗（S9 新增：接收面聚合上界 8 MiB ≤ 设计 §7 的 16 MiB 账）"
+        );
+        assert_eq!(d.send_window, 2 * 1024 * 1024, "连接级发送窗（不改）");
+        assert_eq!(d.pending_bytes, 64 * 1024, "每流待发队列");
+        // N14：有效服务流容量 = 上限 − 2（控制流 + probe 持久流）
+        assert_eq!(d.service_capacity(), 62);
+        assert_eq!(d, StreamLimits::default());
+        // S9 的构造性关系：聚合闸 ≥ 单流窗（否则单条 bulk 流吃不满自己的每流窗）
+        assert!(
+            d.conn_recv_window >= d.recv_window,
+            "连接级接收窗必须 ≥ 每流窗（S9 的账）"
+        );
+    }
+
+    /// **判据（服务入口定值，§1.7/§8.2-16）**：intake 容量 = 在册上限 + K；K=4；
+    /// socketpair 64 KiB/方向——三条都是设计点名的值（改动即偏离设计，须先登记）。
+    #[test]
+    fn service_intake_defaults_are_the_designed_values() {
+        use service_defaults as sd;
+        assert_eq!(sd::INTAKE_K, 4, "§1.7 设计门 2-5 的 K");
+        assert_eq!(sd::SOCKPAIR_BYTES, 64 * 1024, "§2.2 的「显式 64 KiB/方向」");
+        // §8.2-16 的三个实例值
+        assert_eq!(sd::intake_capacity(16), 20, "files：在册 16 + 4");
+        assert_eq!(sd::intake_capacity(12), 16, "speedtest：在册 12 + 4");
+        assert_eq!(sd::intake_capacity(16), 20, "term：会话上限 16 + 4");
+    }
+
+    /// **判据（env 消融臂，§15-2）**：合法值逐项生效；非法/越界 ⇒ 不改该项 + 一行说明。
+    #[test]
+    fn stream_env_overrides_apply_or_are_rejected_with_note() {
+        // ① 合法：五项全生效
+        let mut lim = StreamLimits::design();
+        let get = table(&[
+            ("HOMEWAY_QUIC_STREAMS", "32"),
+            ("HOMEWAY_QUIC_STREAM_WINDOW", "131072"),
+            ("HOMEWAY_QUIC_RECV_WINDOW", "2097152"),
+            ("HOMEWAY_QUIC_SEND_WINDOW", "1048576"),
+            ("HOMEWAY_QUIC_STREAM_PENDING", "16384"),
+        ]);
+        let (applied, notes) = lim.apply_env(&get);
+        assert_eq!(applied, 5, "五项都命中：{notes:?}");
+        assert!(notes.is_empty(), "合法值不产说明行：{notes:?}");
+        assert_eq!(lim.max_bidi, 32);
+        assert_eq!(lim.service_capacity(), 30);
+        assert_eq!(lim.recv_window, 131_072);
+        assert_eq!(lim.conn_recv_window, 2_097_152);
+        assert_eq!(lim.send_window, 1_048_576);
+        assert_eq!(lim.pending_bytes, 16_384);
+
+        // ② 非法（非数字/负数/越界）⇒ 该项按缺省 + 说明行；其余项不受影响
+        let mut lim = StreamLimits::design();
+        let get = table(&[
+            ("HOMEWAY_QUIC_STREAMS", "2"),         // 越界下限（< 3）
+            ("HOMEWAY_QUIC_STREAM_WINDOW", "abc"), // 非数字
+            ("HOMEWAY_QUIC_RECV_WINDOW", "65536"), // 越界下限（< 256 KiB）
+            ("HOMEWAY_QUIC_SEND_WINDOW", "-1"),    // 负数
+            ("HOMEWAY_QUIC_STREAM_PENDING", "4194305"), // 越界上限（> 4 MiB）
+        ]);
+        let (applied, notes) = lim.apply_env(&get);
+        assert_eq!(applied, 0);
+        assert_eq!(notes.len(), 5, "五条各自一行：{notes:?}");
+        assert_eq!(lim, StreamLimits::design(), "非法项一律不改值");
+        for n in &notes {
+            assert!(n.contains("非法或越界"), "说明行形态：{n}");
+            assert!(n.contains("按设计缺省走"), "说明行要点：{n}");
+        }
+
+        // ③ 未设 ⇒ 既不生效也不产行（常态路径零噪声）
+        let mut lim = StreamLimits::design();
+        let (applied, notes) = lim.apply_env(&none);
+        assert_eq!(applied, 0);
+        assert!(notes.is_empty(), "未设不打行：{notes:?}");
+
+        // ④ 边界值收（含 = 上下界）
+        let mut lim = StreamLimits::design();
+        let get = table(&[
+            ("HOMEWAY_QUIC_STREAMS", "3"),
+            ("HOMEWAY_QUIC_STREAM_WINDOW", "16777216"),
+        ]);
+        let (applied, _) = lim.apply_env(&get);
+        assert_eq!(applied, 2);
+        assert_eq!(lim.max_bidi, 3);
+        assert_eq!(lim.service_capacity(), 1, "下限 = 恰一条服务流容量");
+        assert_eq!(lim.recv_window, 16 * 1024 * 1024, "每流窗上限（S9 放宽到 16 MiB）");
+        // ⑤ S9 消融臂的承重档位：旧缺省（256 KiB）仍可显式指定（复现 S8 负面读数的臂）
+        let mut lim = StreamLimits::design();
+        assert_eq!(lim.apply_env(&table(&[("HOMEWAY_QUIC_STREAM_WINDOW", "262144")])).0, 1);
+        assert_eq!(lim.recv_window, 256 * 1024, "旧缺省档位可达（负向对照臂）");
+    }
+
+    /// **判据（跨项关系，代码门 r18 ③-4）**：连接级接收窗 < 每流接收窗 ⇒ **抬连接窗** +
+    /// 一行说明（否则每流窗静默失效：连接窗是真界）；合法组合不产说明行。
+    #[test]
+    fn env_cross_check_keeps_conn_window_above_stream_window() {
+        // 违例组合：每流 16 MiB（上限档）+ 连接窗缺省 8 MiB
+        let mut lim = StreamLimits::design();
+        let (applied, notes) = lim.apply_env(&table(&[("HOMEWAY_QUIC_STREAM_WINDOW", "16777216")]));
+        assert_eq!(applied, 1);
+        assert_eq!(lim.recv_window, 16 * 1024 * 1024);
+        assert_eq!(lim.conn_recv_window, 16 * 1024 * 1024, "连接窗被抬到每流窗");
+        assert_eq!(notes.len(), 1, "须有一行说明：{notes:?}");
+        assert!(notes[0].contains("连接级接收窗"), "{}", notes[0]);
+        // 合法组合（每流 1 MiB < 连接 8 MiB）⇒ 零说明行
+        let mut lim = StreamLimits::design();
+        let (applied, notes) = lim.apply_env(&table(&[("HOMEWAY_QUIC_STREAM_WINDOW", "1048576")]));
+        assert_eq!(applied, 1);
+        assert!(notes.is_empty(), "合法组合不产说明行：{notes:?}");
+        assert_eq!(lim.conn_recv_window, 8 * 1024 * 1024, "连接窗不动");
+        // 显式把连接窗设小、每流窗设大 ⇒ 仍按「抬到每流窗」收（连接窗是真界）
+        let mut lim = StreamLimits::design();
+        let (_, notes) = lim.apply_env(&table(&[
+            ("HOMEWAY_QUIC_STREAM_WINDOW", "4194304"),
+            ("HOMEWAY_QUIC_RECV_WINDOW", "262144"),
+        ]));
+        assert_eq!(notes.len(), 1);
+        assert_eq!(lim.conn_recv_window, 4 * 1024 * 1024);
+    }
+
+    /// **判据（快探参数初值 + 消融臂，§15-2/§3.2）**：缺省 = 设计值；env 命中逐项生效。
+    #[test]
+    fn probe_tuning_defaults_and_env_overrides() {
+        let d = ProbeTuning::design();
+        assert_eq!(d.fast_budget, Duration::from_millis(700), "§13-T2 的承重值");
+        assert_eq!(d.fast_gap, Duration::from_millis(250), "§3.2-1：拍间 ≤300ms");
+        assert!(d.fast_gap <= Duration::from_millis(300), "§3.2-1 的上界");
+        assert_eq!(d.reprobe_factor, 2);
+        assert_eq!(d.idle_interval, Duration::from_secs(60));
+        assert_eq!(d.jitter_streak, 3);
+        assert_eq!(d.reconnect_streak, 2, "B 门：连续 2");
+        assert_eq!(d.rebuild_window, Duration::from_secs(10), "B 门：窗 ≥10s");
+        assert_eq!(d.send_err_fresh, Duration::from_secs(5), "N5 新鲜度窗");
+        assert_eq!(d.in_use_fresh, Duration::from_secs(5), "= demand::OUTBOUND_FRESH");
+
+        let mut t = ProbeTuning::design();
+        let get = table(&[
+            ("HOMEWAY_QUIC_PROBE_BUDGET", "300"),
+            ("HOMEWAY_QUIC_PROBE_GAP", "100"),
+            ("HOMEWAY_QUIC_PROBE_REPROBE", "3"),
+            ("HOMEWAY_QUIC_PROBE_IDLE", "5000"),
+            ("HOMEWAY_QUIC_JITTER_STREAK", "5"),
+            ("HOMEWAY_QUIC_RECONNECT_STREAK", "4"),
+            ("HOMEWAY_QUIC_REBUILD_WINDOW", "30000"),
+            ("HOMEWAY_QUIC_SEND_ERR_FRESH", "1500"),
+            ("HOMEWAY_QUIC_IN_USE_FRESH", "2000"),
+        ]);
+        let (applied, notes) = t.apply_env(&get);
+        assert_eq!(applied, 9, "九项全命中：{notes:?}");
+        assert!(notes.is_empty());
+        assert_eq!(t.fast_budget, Duration::from_millis(300));
+        assert_eq!(t.fast_gap, Duration::from_millis(100));
+        assert_eq!(t.reprobe_factor, 3);
+        assert_eq!(t.idle_interval, Duration::from_secs(5));
+        assert_eq!(t.jitter_streak, 5);
+        assert_eq!(t.reconnect_streak, 4);
+        assert_eq!(t.rebuild_window, Duration::from_secs(30));
+        assert_eq!(t.send_err_fresh, Duration::from_millis(1500));
+        assert_eq!(t.in_use_fresh, Duration::from_secs(2));
+
+        // 越界（复探倍数 0 / 新鲜度窗 100ms）⇒ 不生效 + 两行说明
+        let mut t = ProbeTuning::design();
+        let get = table(&[
+            ("HOMEWAY_QUIC_PROBE_REPROBE", "0"),
+            ("HOMEWAY_QUIC_SEND_ERR_FRESH", "100"),
+        ]);
+        let (applied, notes) = t.apply_env(&get);
+        assert_eq!(applied, 0);
+        assert_eq!(notes.len(), 2);
+        assert_eq!(t, ProbeTuning::design());
+
+        // 拍间可到 0（真背靠背）；负值/超上界 ⇒ 按缺省
+        let mut t = ProbeTuning::design();
+        let get = table(&[("HOMEWAY_QUIC_PROBE_GAP", "0")]);
+        assert_eq!(t.apply_env(&get).0, 1);
+        assert_eq!(t.fast_gap, Duration::ZERO);
+        let mut t = ProbeTuning::design();
+        let get = table(&[("HOMEWAY_QUIC_PROBE_GAP", "1001")]);
+        assert_eq!(t.apply_env(&get).0, 0);
+        assert_eq!(t.fast_gap, probe_defaults::FAST_GAP);
+    }
+
+    /// env 名常量是**单源**（生产/消融/登记三处不许各写一份字面量）。
+    #[test]
+    fn env_names_are_the_single_source() {
+        assert_eq!(ENV_STREAMS, "HOMEWAY_QUIC_STREAMS");
+        assert_eq!(ENV_STREAM_WINDOW, "HOMEWAY_QUIC_STREAM_WINDOW");
+        assert_eq!(ENV_CONN_RECV_WINDOW, "HOMEWAY_QUIC_RECV_WINDOW");
+        assert_eq!(ENV_SEND_WINDOW, "HOMEWAY_QUIC_SEND_WINDOW");
+        assert_eq!(ENV_STREAM_PENDING, "HOMEWAY_QUIC_STREAM_PENDING");
+        assert_eq!(ENV_PROBE_BUDGET, "HOMEWAY_QUIC_PROBE_BUDGET");
+        assert_eq!(ENV_PROBE_GAP, "HOMEWAY_QUIC_PROBE_GAP");
+        assert_eq!(ENV_PROBE_REPROBE, "HOMEWAY_QUIC_PROBE_REPROBE");
+        assert_eq!(ENV_PROBE_IDLE, "HOMEWAY_QUIC_PROBE_IDLE");
+        assert_eq!(ENV_JITTER_STREAK, "HOMEWAY_QUIC_JITTER_STREAK");
+        assert_eq!(ENV_RECONNECT_STREAK, "HOMEWAY_QUIC_RECONNECT_STREAK");
+        assert_eq!(ENV_REBUILD_WINDOW, "HOMEWAY_QUIC_REBUILD_WINDOW");
+        assert_eq!(ENV_SEND_ERR_FRESH, "HOMEWAY_QUIC_SEND_ERR_FRESH");
+        assert_eq!(ENV_IN_USE_FRESH, "HOMEWAY_QUIC_IN_USE_FRESH");
+    }
+}

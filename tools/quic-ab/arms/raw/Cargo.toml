@@ -1,0 +1,12 @@
+[package]
+name = "quic-ab-raw"
+version.workspace = true
+edition.workspace = true
+
+[dependencies]
+quic-ab-common = { path = "../common" }
+libc = "0.2"
+
+[[bin]]
+name = "raw"
+path = "src/main.rs"

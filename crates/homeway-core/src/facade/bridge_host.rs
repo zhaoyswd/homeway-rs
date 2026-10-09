@@ -1,8 +1,9 @@
 //! 服务桥宿主（语义真源 `baseline:clientcore/cmd/clientcore/app_bridge.go`——
 //! openspec app-service-session / app-bridge-transport / tunnel-speedtest）。
 //!
-//! 三座沙箱内 UDS 桥（`<filesDir>/bridge/{files,term,speedtest}.sock` → 经会话拨
-//! 出口虚拟端口 7802/7724/7803），消费方（files 模块 / terminal HSP / term LIST-KILL /
+//! 三座沙箱内 UDS 桥（`<filesDir>/bridge/{files,term,speedtest}.sock` → 拨出口的
+//! **服务**：QUIC 档 = `STREAM[tag]`（`facade/quic_stream.rs`），WG 档 = 经会话拨
+//! 虚拟端口 7802/7724/7803），消费方（files 模块 / terminal HSP / term LIST-KILL /
 //! 测速）只连 socket 路径——桥 hosted 在哪个进程（隧道宿主/服务会话宿主）对它们透明。
 //!
 //! **首包令牌鉴权**（为什么仍然要：沙箱隔离挡的是「别的应用」，不是「本应用的别的
@@ -195,13 +196,15 @@ const LISTEN_BACKOFF: [Duration; 5] = [
 ];
 /// 经会话拨出口虚拟端口的预算。
 const DIAL_TIMEOUT: Duration = Duration::from_secs(15);
-/// 出口虚拟端口（桥那头要拨到的地方）。
+/// 出口虚拟端口（桥那头要拨到的**服务标识**；M3 起 QUIC 档不再拨端口，而是按
+/// 这些端口选出 `STREAM[tag]`——映射单源 = `facade/quic_stream.rs::tag_for_port`；
+/// 端口号本身仍是**配置面**（E1 的值域/字段不变）与 WG 档的拨号目标）。
 pub mod port {
-    /// files 原生协议（app_files_native.go filesNativePort）。
+    /// files 原生协议（app_files_native.go filesNativePort；QUIC 档 ⇒ `STREAM[tag=1]`）。
     pub const FILES: u16 = 7802;
-    /// term 服务（HOMEWAY_TERM_PORT 可改——与本常量同源环境变量）。
+    /// term 服务（HOMEWAY_TERM_PORT 可改——与本常量同源环境变量；QUIC 档 ⇒ `STREAM[tag=2]`）。
     pub const TERM: u16 = 7724;
-    /// speedtest 服务（app_speedtest.go speedtestServicePort）。
+    /// speedtest 服务（app_speedtest.go speedtestServicePort；QUIC 档 ⇒ `STREAM[tag=3]`）。
     pub const SPEEDTEST: u16 = 7803;
 }
 

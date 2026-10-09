@@ -110,6 +110,11 @@ fn term_dial(auth_hex: &str, sock: &str) -> Result<UnixStream, TermOpError> {
         )
     })?;
     if frame.op != Op::GREETING {
+        // 文案保持**逐字**（Go 真源 `baseline:app_term.go:125` 的
+        // `出口 %d 端口上不是终端服务（收到帧 0x%02x）`，端口 = `termServicePort()`）。
+        // M3 A13 逐条复核：本串不改——①它是 App 可见文本，Go 对齐面要求同串；
+        // ②QUIC 档虽不再拨端口，此处的「7724 端口」是**服务身份**的指代（用户可见的诊断语），
+        //   改字反而与基础词表脱钩。**登记在案**（不入判据行；如需去端口 = 跨仓词表批）。
         return Err(TermOpError::new(
             code::TERM_FOREIGN,
             format!("出口 7724 端口上不是终端服务（收到帧 0x{:02x}）", frame.op.0),

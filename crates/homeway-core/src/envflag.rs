@@ -22,6 +22,33 @@ pub(crate) fn wg_debug() -> bool {
     *V.get_or_init(|| std::env::var_os("HOMEWAY_WG_DEBUG").is_some())
 }
 
+/// `HOMEWAY_TRANSPORT`（M1 设计 §4.1 的 A/B 开关）**原始串**：`quic`（缺省）/`wg`。
+///
+/// 为什么交原始串给调用方：非法值要「记行 + 按默认走」，而记行需要世代日志面——
+/// 本模块只负责「首读缓存」这一件事（解析在 `facade::tun_exec` 的世代装配里做）。
+pub(crate) fn transport_raw() -> Option<&'static str> {
+    static V: OnceLock<Option<String>> = OnceLock::new();
+    V.get_or_init(|| std::env::var("HOMEWAY_TRANSPORT").ok())
+        .as_deref()
+}
+
+/// `HOMEWAY_QUIC_MTU`（M1 设计 §12-① 的 MTU 上限旋钮）**原始串**；解析/夹区间/记行
+/// 同在 `facade::tun_exec`（理由同 [`transport_raw`]）。
+pub(crate) fn quic_mtu_raw() -> Option<&'static str> {
+    static V: OnceLock<Option<String>> = OnceLock::new();
+    V.get_or_init(|| std::env::var("HOMEWAY_QUIC_MTU").ok())
+        .as_deref()
+}
+
+/// `HOMEWAY_QUIC_ADMIT_RETRY`（M2 设计 §3.2 表末的排障开关）**原始串**；解析/记行同在
+/// `server::quic_admit::resolve_retry_policy`（理由同 [`transport_raw`]：非法值要
+/// 「记行 + 按缺省走」，而记行需要世代日志面）。
+pub(crate) fn quic_admit_retry_raw() -> Option<&'static str> {
+    static V: OnceLock<Option<String>> = OnceLock::new();
+    V.get_or_init(|| std::env::var("HOMEWAY_QUIC_ADMIT_RETRY").ok())
+        .as_deref()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -47,5 +74,22 @@ mod tests {
             assert!(!wg_debug(), "未设置 = false");
         }
         assert_eq!(wg_debug(), wg_debug(), "重复读取同值（缓存语义）");
+    }
+
+    /// 两个新 env（M1 S3-1：A/B 开关 + MTU 上限）只会返回「原始串或 None」，且重复
+    /// 读取同值——解析/记行不在本模块（见函数文档）。
+    #[test]
+    fn transport_and_mtu_raw_are_cached_strings() {
+        // 原始串 = 当前 env 值（首读缓存；本仓测试不 set_var，两条路都成立）
+        assert_eq!(
+            transport_raw().map(str::to_owned),
+            std::env::var("HOMEWAY_TRANSPORT").ok()
+        );
+        assert_eq!(
+            quic_mtu_raw().map(str::to_owned),
+            std::env::var("HOMEWAY_QUIC_MTU").ok()
+        );
+        assert_eq!(transport_raw(), transport_raw(), "重复读取同值（缓存语义）");
+        assert_eq!(quic_mtu_raw(), quic_mtu_raw(), "重复读取同值（缓存语义）");
     }
 }

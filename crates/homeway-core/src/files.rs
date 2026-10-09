@@ -29,6 +29,11 @@ use crate::session::Session;
 use crate::wgcore::ConnErr;
 
 /// files 服务端口（隧道 IP 上；出口按 LocalServices 转投 files.sock）。
+///
+/// **M3 口径**：本模块的动词面（`list/stat/read/…`）只被 **CLI 本地形态**消费
+/// （`homeway-cli` 的 files 命令 + `Session` 拨号 = WG 承载，D1 下不变）；App 核的
+/// files 面走桥 UDS（`facade/files_op.rs`）——QUIC 档在桥那头按本端口选 `STREAM[tag=1]`
+/// （`facade/quic_stream.rs::tag_for_port`），**不再拨本端口**。
 pub const FILES_PORT: u16 = 7802;
 /// 请求行上限（一行 JSON）。
 pub const MAX_REQUEST_LINE: usize = 64 * 1024;

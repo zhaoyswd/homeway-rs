@@ -126,10 +126,14 @@ fn go_vectors_decode_byte_exact() {
 
         // 再编码：Go 串 ↔ Rust 编码逐字节一致（折行/空白案例取「trim + 剥内嵌换行」的
         // 规范形——编码器恒产规范形，与 Go 编码器一致）
+        // 旧向量（Go 产出）不含 M1 的 rpk 尾字段 ⇒ None；带上解析值才能保证
+        // 「再编码逐字节一致」在新字段加入后仍成立
+        let rpk = parsed.rpk();
         let spec = token::TokenSpec {
             peer_id: &parsed.peer_id(),
             secret: &parsed.secret(),
             endpoints: parsed.endpoints(),
+            rpk: rpk.as_ref(),
         };
         let re = token::encode(&spec).unwrap();
         let canonical: String = c

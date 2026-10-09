@@ -1,0 +1,43 @@
+[workspace]
+resolver = "2"
+# wg-shim 臂的独立 workspace（**必须独立**：`[patch]` 是 workspace 级——若与 arms 同
+# workspace，wg-ring 的「真 ring 诊断臂」会被一并换成垫片，当场失真；M0 设计 §4.4）。
+# 臂源码与 wg-ring **共用同一文件**（`../arms/wg-ring/src/main.rs`）：本段与 arms 的唯一
+# 差别 = ring 来源（垫片 vs crates.io 真版），这正是该对照臂要隔离的变量。
+members = ["."]
+
+[package]
+name = "quic-ab-wg-shim"
+version = "0.0.0"
+edition = "2021"
+
+[dependencies]
+boringtun = "0.6"
+x25519-dalek = { version = "=2.0.0-rc.3", features = ["static_secrets", "reusable_secrets"] }
+libc = "0.2"
+quic-ab-common = { path = "../arms/common" }
+
+# 本臂 ring = 本仓 tools/ring-shim（RustCrypto 实现）——**只读引用**，不改本仓。
+# 这正是手机上 libclientcore.so 现在跑的密码学路径。
+[patch.crates-io]
+ring = { path = "../../../tools/ring-shim" }
+
+[[bin]]
+name = "wg"
+path = "../arms/wg-ring/src/main.rs"
+
+# lab 档（= arms 侧同款；**必须写在 workspace 根**——非根 [profile] 会被 cargo 忽略）
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
+
+# product 档（跟随仓内默认 release：无 LTO / unwind / cgu=16 / 无 strip）
+[profile.product]
+inherits = "release"
+lto = false
+panic = "unwind"
+codegen-units = 16
+strip = "none"

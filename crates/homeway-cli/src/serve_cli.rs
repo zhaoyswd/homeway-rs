@@ -39,6 +39,14 @@ pub(crate) struct FileServe {
     pub(crate) enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) listen: Option<u16>,
+    /// QUIC 独立 UDP 端口（M1 §1.1）：缺省 = `serve.listen + 1`；被占用按 WG 同款退让。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) quic_listen: Option<u16>,
+    /// QUIC 面总开关（M1 S3-4）：缺省 = **true**。`false` ⇒ 不监听 QUIC 端口、不打
+    /// E-q1/E-q4 行、token **不带** QUIC 端点与 `rpk` 尾字段（⇒ token 串与 M1 前逐字节
+    /// 相同——Go 客户端 × Rust 出口的全量矩阵行 L4/L5 的可保命形态）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) quic: Option<bool>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) bind_interface: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -87,6 +95,82 @@ pub(crate) struct FileServe {
     /// `homeway_core::server::intercept::TxShapeCfg`；覆盖序 env > config > 默认）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tx_shape: Option<homeway_core::server::intercept::TxShapeCfg>,
+    /// 抗放大闸（M2 §3.2 的 `[serve.quic_admit]`；缺省 = 设计定值 ⇒ 缺省不改行为）。
+    /// **值域非法 ⇒ 拒启**（`serve` 节严格表纪律；与 env 面的「记行 + 缺省」不同面）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) quic_admit: Option<FileQuicAdmit>,
+}
+
+/// `[serve.quic_admit]` 节（M2 §3.2 表：**六行七键**——`per_src_fails`/`per_src_window`
+/// 同行两键）。时长照 `serve.peer_ttl` 的 Go 时长串口径（如 `"5s"`/`"1h"`）。
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FileQuicAdmit {
+    /// Retry token 有效期（`1s..=60s`；缺省 `5s`——收自 quinn 缺省 15s，M2 §3.1 登记）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retry_token_lifetime: Option<String>,
+    /// 每源滑动窗上限（`1..=1000`；缺省 **16**——M2 §14-1 裁决 `10 → 16`，真源 = `admit.rs`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) per_src_fails: Option<u32>,
+    /// 每源滑动窗窗长（`1s..=1h`；缺省 `10s`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) per_src_window: Option<String>,
+    /// nonce 有效期（`1s..=30s`；缺省 `5s`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) nonce_ttl: Option<String>,
+    /// 准入总期限（`1s..=60s`；缺省 `10s`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) admit_deadline: Option<String>,
+    /// 证明失败闸阈值（`0..=1000`；缺省 `10`；`0` = 关闭该闸）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) proof_fail_threshold: Option<u32>,
+    /// Retry 策略（枚举 `pressure`（缺省）| `always` | `never`；非法值 ⇒ 拒启）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retry_policy: Option<String>,
+}
+
+impl FileQuicAdmit {
+    /// 解析 + 值域校验 ⇒ `AdmitLimits`（**唯一收口点**：`validate_file` 与 `serve_config_of`
+    /// 都走它——语法错与越界都在这里变成拒启文案；值域真源 = `AdmitLimits::validate`）。
+    pub(crate) fn resolve(
+        &self,
+    ) -> Result<homeway_core::server::quic_admit::AdmitLimits, String> {
+        use homeway_core::server::quic_admit::{AdmitLimits, RetryPolicy};
+        let dur = |name: &str, raw: &str| -> Result<Duration, String> {
+            parse_go_duration(raw).ok_or_else(|| {
+                format!("serve.quic_admit.{name}：{raw:?} 非法（时长串，如 \"5s\"/\"10m\"/\"1h\"）")
+            })
+        };
+        let mut l = AdmitLimits::default();
+        if let Some(v) = &self.retry_token_lifetime {
+            l.retry_token_lifetime = dur("retry_token_lifetime", v)?;
+        }
+        if let Some(v) = self.per_src_fails {
+            l.per_src_fails = v;
+        }
+        if let Some(v) = &self.per_src_window {
+            l.per_src_window = dur("per_src_window", v)?;
+        }
+        if let Some(v) = &self.nonce_ttl {
+            l.nonce_ttl = dur("nonce_ttl", v)?;
+        }
+        if let Some(v) = &self.admit_deadline {
+            l.admit_deadline = dur("admit_deadline", v)?;
+        }
+        if let Some(v) = self.proof_fail_threshold {
+            l.proof_fail_threshold = v;
+        }
+        if let Some(v) = &self.retry_policy {
+            l.retry_policy = RetryPolicy::parse(v).ok_or_else(|| {
+                format!(
+                    "serve.quic_admit.retry_policy：{v:?} 非法（合法取值 {}）",
+                    RetryPolicy::VALUES.join("|")
+                )
+            })?;
+        }
+        l.validate()?;
+        Ok(l)
+    }
 }
 
 impl Default for FileServe {
@@ -101,6 +185,8 @@ impl FileServe {
         FileServe {
             enabled: false,
             listen: None,
+            quic_listen: None,
+            quic: None,
             bind_interface: None,
             upnp: None,
             stun: None,
@@ -118,6 +204,7 @@ impl FileServe {
             dns_probe_target: None,
             stun_probe_target: None,
             tx_shape: None,
+            quic_admit: None,
         }
     }
 }
@@ -194,6 +281,11 @@ fn validate_file(path: &Path, f: &FileConfig) -> Result<(), String> {
             return bad("serve.listen", format!("{v} 非法（合法值域 1–65535）"));
         }
     }
+    if let Some(v) = f.serve.quic_listen {
+        if v == 0 {
+            return bad("serve.quic_listen", format!("{v} 非法（合法值域 1–65535）"));
+        }
+    }
     // dns_port：Option<u16> 天然等价 Go 的 0–65535（登记为「已等价」）。
     if let Some(v) = &f.serve.bind_interface {
         validate_bind_interface(v).map_err(|e| {
@@ -220,6 +312,11 @@ fn validate_file(path: &Path, f: &FileConfig) -> Result<(), String> {
                 format!("{v:?} 非法（时长串，如 \"168h\"；须 ≥ 0，0 = 关闭 TTL 回收）"),
             );
         }
+    }
+    // [serve.quic_admit]（M2 §3.2）：语法 + 值域都在 `FileQuicAdmit::resolve` 内收口；
+    // 越界/非法 ⇒ **拒启**（`serve` 节严格表纪律——与 env 面的「记行 + 缺省」不同面）。
+    if let Some(q) = &f.serve.quic_admit {
+        q.resolve().map_err(|e| format!("{p}: {e}"))?;
     }
     if let Some(list) = &f.serve.ddns {
         for d in list {
@@ -389,6 +486,8 @@ struct ServeFlags {
     listen: Option<u16>,
     bind_interface: Option<String>,
     upnp: Option<bool>,
+    /// QUIC 面总开关（`--quic[=bool]`；M1 S3-4——本地/CI 起 WG-only 出口用）。
+    quic: Option<bool>,
     stun: Option<String>,
     stun6: Option<String>,
     peer_ttl: Option<Duration>,
@@ -406,7 +505,7 @@ struct ServeFlags {
 }
 
 fn serve_usage() {
-    eprintln!("用法：homeway-cli serve [--state DIR] [--listen P] [--bind-interface M] [--upnp[=bool]] [--stun H:P] [--stun6 H:P]");
+    eprintln!("用法：homeway-cli serve [--state DIR] [--listen P] [--bind-interface M] [--upnp[=bool]] [--quic[=bool]] [--stun H:P] [--stun6 H:P]");
     eprintln!("       [--relay rl1…|ip:port] [--peer-ttl 168h] [--max-peers N] [--public-endpoint ip:port,ip:port]");
     eprintln!("       [--dns-port P] [--files-root DIR] [--ddns 裸域名] [--verbose]");
     eprintln!("  --stun= / --stun6= / --relay= 空值 = 关（Go flag 空串同义，F0 carve-out）；");
@@ -465,6 +564,9 @@ fn parse_serve_flags(args: &[String]) -> Result<ServeFlags, CliErr> {
             }
             "upnp" => {
                 f.upnp = Some(cli_flags::take_bool_or_exit("upnp", inline, true));
+            }
+            "quic" => {
+                f.quic = Some(cli_flags::take_bool_or_exit("quic", inline, true));
             }
             "stun" => {
                 // F0 carve-out：空值 = 关公网 STUN 观测（Go flag 空串同义；实测
@@ -565,6 +667,12 @@ pub(crate) fn serve_config_of(fc: &FileConfig, state_dir: &Path) -> Result<Serve
     if let Some(v) = fc.serve.listen {
         cfg.listen_port = v;
     }
+    if let Some(v) = fc.serve.quic_listen {
+        cfg.quic_listen_port = Some(v);
+    }
+    if let Some(v) = fc.serve.quic {
+        cfg.quic = v;
+    }
     if let Some(v) = &fc.serve.bind_interface {
         cfg.bind_iface = parse_bind_iface(v);
     }
@@ -595,6 +703,11 @@ pub(crate) fn serve_config_of(fc: &FileConfig, state_dir: &Path) -> Result<Serve
     }
     // [serve.tx_shape]（D-3）：解析与 env 覆盖在 tx_shape_resolve（engine 装配点）。
     cfg.tx_shape_cfg = fc.serve.tx_shape;
+    // [serve.quic_admit]（M2 §3.2）：值域已在校验层收口；这里只做「时长串 → Duration」搬运
+    // （env `HOMEWAY_QUIC_ADMIT_RETRY` 的叠加在 engine 装配点）。
+    if let Some(q) = &fc.serve.quic_admit {
+        cfg.quic_admit = Some(q.resolve()?);
+    }
     // serve.relay：注册腿端点（rl1 token / 裸 host:port——R4-4c 接线）
     if let Some(v) = &fc.serve.relay {
         if !v.is_empty() {
@@ -683,6 +796,9 @@ pub(crate) fn assemble_result(args: &[String]) -> Result<ServeConfig, CliErr> {
     }
     if let Some(v) = f.upnp {
         cfg.upnp = v;
+    }
+    if let Some(v) = f.quic {
+        cfg.quic = v;
     }
     if let Some(v) = f.stun {
         cfg.stun = v;
@@ -1013,6 +1129,7 @@ fn token_reveal(args: &[String]) {
         peer_id: &tok.peer_id,
         secret: &tok.secret,
         endpoints: &eps,
+        rpk: tok.rpk.as_ref(),
     }) {
         Ok(s) => s,
         Err(e) => {
@@ -1209,6 +1326,7 @@ mod tests {
         let d = tmp_state("domain");
         let cases: &[(&str, &str)] = &[
             ("[serve]\nlisten = 0\n", "serve.listen"),
+            ("[serve]\nquic_listen = 0\n", "serve.quic_listen"),
             ("[serve]\nbind_interface = \"en0:1\"\n", "serve.bind_interface"),
             ("[serve]\npublic_endpoint = \"1.2.3.4\"\n", "serve.public_endpoint"),
             ("[serve]\npeer_ttl = \"abc\"\n", "serve.peer_ttl"),
@@ -1231,6 +1349,46 @@ mod tests {
             ("[serve]\nlisten = 99999\n", "config.toml"),
             ("[serve]\n不认识的键 = 1\n", "config.toml"),
             ("[serve]\ntx_shape = { rate_mbps = \"200\" }\n", "config.toml"),
+            // M2 S3-4：`[serve.quic_admit]` 七键——语法/值域非法一律**拒启**（§3.2 表）
+            (
+                "[serve.quic_admit]\nretry_token_lifetime = \"5\"\n",
+                "serve.quic_admit.retry_token_lifetime",
+            ),
+            (
+                "[serve.quic_admit]\nretry_token_lifetime = \"0s\"\n",
+                "serve.quic_admit.retry_token_lifetime",
+            ),
+            (
+                "[serve.quic_admit]\nretry_token_lifetime = \"61s\"\n",
+                "serve.quic_admit.retry_token_lifetime",
+            ),
+            ("[serve.quic_admit]\nper_src_fails = 0\n", "serve.quic_admit.per_src_fails"),
+            (
+                "[serve.quic_admit]\nper_src_fails = 1001\n",
+                "serve.quic_admit.per_src_fails",
+            ),
+            (
+                "[serve.quic_admit]\nper_src_window = \"2h\"\n",
+                "serve.quic_admit.per_src_window",
+            ),
+            ("[serve.quic_admit]\nnonce_ttl = \"31s\"\n", "serve.quic_admit.nonce_ttl"),
+            (
+                "[serve.quic_admit]\nadmit_deadline = \"0s\"\n",
+                "serve.quic_admit.admit_deadline",
+            ),
+            (
+                "[serve.quic_admit]\nadmit_deadline = \"61s\"\n",
+                "serve.quic_admit.admit_deadline",
+            ),
+            (
+                "[serve.quic_admit]\nproof_fail_threshold = 1001\n",
+                "serve.quic_admit.proof_fail_threshold",
+            ),
+            (
+                "[serve.quic_admit]\nretry_policy = \"恒开\"\n",
+                "serve.quic_admit.retry_policy",
+            ),
+            ("[serve.quic_admit]\n不认识的键 = 1\n", "config.toml"),
         ];
         for (body, want_field) in cases {
             write_cfg(&d, body);
@@ -1242,7 +1400,7 @@ mod tests {
             assert!(e.contains("config.toml"), "错误必须带路径，实得：{e}");
         }
         // 好值往返：serde 序列化后再严格读仍 Ok（写回面共用本函数）。
-        let good = "[serve]\nenabled = true\nlisten = 41641\nbind_interface = \"auto\"\n\
+        let good = "[serve]\nenabled = true\nlisten = 41641\nquic_listen = 41642\nquic = false\nbind_interface = \"auto\"\n\
                     peer_ttl = \"168h\"\npublic_endpoint = \"1.2.3.4:41641\"\nrelay = \"\"\n\
                     dns_port = 5300\n[relay]\nenabled = false\nlisten = \":41741\"\nadvertise = \"\"\n";
         write_cfg(&d, good);
@@ -1251,6 +1409,8 @@ mod tests {
         write_cfg(&d, &body);
         let fc2 = load_config_strict(&d).unwrap();
         assert_eq!(fc2.serve.listen, Some(41641));
+        assert_eq!(fc2.serve.quic_listen, Some(41642), "M1：QUIC 端口键往返");
+        assert_eq!(fc2.serve.quic, Some(false), "M1 S3-4：QUIC 面开关键往返");
         assert_eq!(fc2.relay.listen.as_deref(), Some(":41741"));
         let _ = std::fs::remove_dir_all(&d);
     }
@@ -1337,6 +1497,32 @@ mod tests {
         assert!(!f.verbose);
         let f = parse_serve_flags(&["--upnp".to_owned()]).unwrap();
         assert_eq!(f.upnp, Some(true));
+    }
+
+    /// **M1 S3-4：`serve.quic` 双面**（config 键 + `--quic[=bool]` flag）——缺省 true；
+    /// `false` 经两条面各自落到 `ServeConfig.quic=false`（flag 优先于 config）。
+    #[test]
+    fn quic_switch_config_key_and_flag() {
+        // 缺省（不写键）= true
+        let d = tmp_state("quicdef");
+        let state = d.display().to_string();
+        let cfg = assemble_result(&["--state".to_owned(), state.clone()]).unwrap();
+        assert!(cfg.quic, "缺省 = true（QUIC 面常开）");
+        // config 键
+        write_cfg(&d, "[serve]\nquic = false\n");
+        let cfg = assemble_result(&["--state".to_owned(), state.clone()]).unwrap();
+        assert!(!cfg.quic, "config serve.quic=false 生效");
+        // flag 覆盖 config（body 里是 true，flag 给 false）
+        write_cfg(&d, "[serve]\nquic = true\n");
+        let cfg = assemble_result(&["--state".to_owned(), state.clone(), "--quic=false".to_owned()])
+            .unwrap();
+        assert!(!cfg.quic, "flag 优先于 config");
+        let cfg = assemble_result(&["--state".to_owned(), state, "--quic".to_owned()]).unwrap();
+        assert!(cfg.quic, "`--quic` 无值形 = true");
+        // 键往返（写回面共用 load_config_strict）
+        let f = parse_serve_flags(&["--quic=false".to_owned()]).unwrap();
+        assert_eq!(f.quic, Some(false));
+        let _ = std::fs::remove_dir_all(&d);
     }
 
     /// F0（Q-I 尾段）：空值 carve-out 四 flag（stun/stun6/relay/ddns）——等号形/空格形
@@ -1504,24 +1690,59 @@ mod tests {
         const SERVE_KEYS: &[&str] = &[
             "enabled", "listen", "bind_interface", "upnp", "stun", "stun6", "relay", "max_peers",
             "peer_ttl", "dns_port", "files_root", "public_endpoint",
+            // M1：QUIC 面（总开关 + 独立端口）
+            "quic_listen", "quic",
             // Q-J F2 五键
             "dns_upstream", "dns_fallback", "ddns_resolver", "dns_probe_target", "stun_probe_target",
         ];
         const RELAY_KEYS: &[&str] = &["enabled", "listen", "advertise"];
-        for k in SERVE_KEYS.iter().chain(RELAY_KEYS.iter()) {
+        // M2 S3-4：`[serve.quic_admit]` 七键（六行——per_src_fails/per_src_window 同行）
+        const QUIC_ADMIT_KEYS: &[&str] = &[
+            "retry_token_lifetime", "per_src_fails", "per_src_window", "nonce_ttl",
+            "admit_deadline", "proof_fail_threshold", "retry_policy",
+        ];
+        for k in SERVE_KEYS
+            .iter()
+            .chain(RELAY_KEYS.iter())
+            .chain(QUIC_ADMIT_KEYS.iter())
+        {
             assert!(
                 tpl.contains(k),
                 "模板注释键表缺 {k}"
             );
         }
+        assert!(tpl.contains("[serve.quic_admit]"), "注释键表须列 quic_admit 节名");
         // 逐键「能被 schema 接受」复核：把每个键以合法值形态喂进去必须 Ok。
-        let served = "[serve]\nenabled = true\nlisten = 41641\nbind_interface = \"auto\"\nupnp = false\n\
+        // （含 M2 的 `[serve.quic_admit]` 全七键——显式配置当场过语法 + 值域。）
+        let served = "[serve]\nenabled = true\nlisten = 41641\nquic = true\nbind_interface = \"auto\"\nupnp = false\n\
              stun = \"\"\nstun6 = \"\"\nrelay = \"\"\nmax_peers = 32\npeer_ttl = \"168h\"\n\
              dns_port = 5300\nfiles_root = \"\"\npublic_endpoint = \"\"\n\
              dns_upstream = [\"1.1.1.1\", \"9.9.9.9:5353\"]\ndns_fallback = \"223.5.5.5\"\n\
              ddns_resolver = [\"223.5.5.5\"]\ndns_probe_target = [\"223.5.5.5:53\"]\n\
              stun_probe_target = [\"162.159.207.1:3478\"]\n\
+             [serve.quic_admit]\nretry_token_lifetime = \"5s\"\nper_src_fails = 16\n\
+             per_src_window = \"10s\"\nnonce_ttl = \"5s\"\nadmit_deadline = \"10s\"\n\
+             proof_fail_threshold = 10\nretry_policy = \"pressure\"\n\
              [relay]\nenabled = false\nlisten = \":41741\"\nadvertise = \"\"\n";
-        assert!(toml::from_str::<FileConfig>(served).is_ok());
+        let fc = toml::from_str::<FileConfig>(served).expect("全键（含 quic_admit 七键）可解析");
+        let limits = fc
+            .serve
+            .quic_admit
+            .as_ref()
+            .expect("quic_admit 节在")
+            .resolve()
+            .expect("显式值合法");
+        assert_eq!(
+            limits,
+            homeway_core::server::quic_admit::AdmitLimits::default(),
+            "显式写全的合法值 == 设计缺省（缺省不改行为的对照）"
+        );
+        // 缺省（不写 `[serve.quic_admit]`）⇒ 与设计缺省逐值同（不改行为）。
+        let bare: FileConfig = toml::from_str("[serve]\nenabled = true\n").unwrap();
+        assert!(bare.serve.quic_admit.is_none(), "缺省即无节");
+        assert_eq!(
+            bare.serve.quic_admit.unwrap_or_default().resolve().unwrap(),
+            homeway_core::server::quic_admit::AdmitLimits::default()
+        );
     }
 }

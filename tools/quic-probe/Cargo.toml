@@ -1,0 +1,23 @@
+[workspace]
+# 探针独立 workspace（与 tools/quic-ab 同款：根 Cargo.toml 的 exclude 已排除本目录）。
+# 为什么独立：本 crate 是**harness-only**（含「跳过/钉定 TLS 验证」的测试面与 relay
+# 信封组帧），不得进产品面（`tools/check-quic-isolation.sh` 只扫 `crates/`——放这里
+# 即与产品面隔离；`tools/quic-ab/` 是同一先例）。
+resolver = "2"
+members = ["."]
+
+[package]
+name = "quic-probe"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+# 与产品面同版本口径（关默认 features、显式 ring 后端、tokio 运行时）
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1", features = ["rt-multi-thread", "net", "time", "sync", "macros", "io-util"] }
+bytes = "1"
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.22"

@@ -12,6 +12,8 @@
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::{UnixListener, UnixStream};
+
+use homeway_quic::ServiceIntake;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -217,8 +219,14 @@ pub struct FilesServer {
 
 impl FilesServer {
     /// 打开根目录（rootDir 空 = 用户主目录）。不存在/不是目录 → 报错。
+    ///
+    /// **空串 = 未配置**（`Some("")` 与 `None` 同义；Go `files.Open("")` = `os.UserHomeDir()`，
+    /// `pkg/files/server.go:56-62`）。M3 S6 修复：统一进程的 `config.toml` 模板写
+    /// `files_root = ""`（键表注明「空=$HOME」），装配层搬过来的是 `Some(PathBuf::from(""))`
+    /// ⇒ 旧形态 `canonicalize()` 失败后 `is_dir()` 判负 ⇒ **恒打**「⚠️ files 根目录不可用」
+    /// （独立 `serve` 形态不生成模板故不受影响）。
     pub fn open(root: Option<&Path>, logf: crate::Logf) -> std::io::Result<Self> {
-        let root = match root {
+        let root = match root.filter(|p| !p.as_os_str().is_empty()) {
             Some(p) => p.to_path_buf(),
             None => std::env::var_os("HOME")
                 .map(PathBuf::from)
@@ -249,18 +257,26 @@ impl FilesServer {
         Ok(())
     }
 
-    /// 可停形态（引擎收工：非阻塞 accept + stop 轮询——② 关 UDS listeners 的执行面）。
+    /// 可停形态（引擎收工：两源 accept + stop 轮询——② 关服务入口的执行面）。
     /// accept 错误分类/退避/节流日志走共享件 `serve_stoppable_accepts`（F5：瞬态错误
     /// 不再摘服务；只 `Fatal` 才退工并由调用方记行）。
-    pub fn serve_stoppable(&self, ln: UnixListener, stop: std::sync::Arc<std::sync::atomic::AtomicBool>) -> std::io::Result<()> {
-        ln.set_nonblocking(true)?;
-        let accept = || {
-            ln.accept().map(|(conn, _)| {
-                let _ = conn.set_nonblocking(false);
-                conn
-            })
-        };
-        serve_stoppable_accepts(accept, |conn| self.spawn_conn(conn), stop, &self.logf, "files")
+    ///
+    /// **形参 M3 S2 起 = [`ServiceIntake`]**（设计 §2.2 方案 B′）：两源合一（UDS 监听器
+    /// 〔WG 服务腿/调试〕+ QUIC stream 队列〔tag=1 由出口泵入队〕）；`ServiceIntake::from_listener`
+    /// 即改前的单 UDS 形态（既有监听面测试走它）。**本函数以下的服务本体一行不改**——
+    /// 帧层 / 期限 / poll / `try_clone` / busy 路径全部照旧（§1.2 的「应用层零改动」）。
+    pub fn serve_stoppable(
+        &self,
+        intake: ServiceIntake,
+        stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<()> {
+        serve_stoppable_accepts(
+            || intake.accept(),
+            |conn| self.spawn_conn(conn),
+            stop,
+            &self.logf,
+            "files",
+        )
     }
 
     /// accept 后派发：在册 <16 走正常服务（结束时 release）；满则 busy 拒入
@@ -1025,6 +1041,7 @@ pub fn listen_local_service(dir: &Path, name: &str, logf: &crate::Logf) -> std::
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
 
     fn tmpdir(name: &str) -> PathBuf {
         let d = std::env::temp_dir().join(format!(
@@ -1038,6 +1055,99 @@ mod tests {
 
     fn noop_logf() -> crate::Logf {
         std::sync::Arc::new(|_| {})
+    }
+
+    /// **M3 S2 判据（服务入口承载面）**：① 同一请求序列在**两条入口**（UDS 监听器 /
+    /// QUIC socketpair 端）上的应答**逐字节相同**（「应用层零改动」的构造性钉法）；
+    /// ② 在册满 ⇒ **应用层 busy 路径在 intake 面仍可达**（第 17 条拿到 `server_busy`，
+    /// 而不是在入口就被拒）；③ 入口容量 = 在册上限 + K（装配点的算式与常量一致）。
+    #[test]
+    fn intake_two_sources_serve_identical_bytes_and_busy_stays_reachable() {
+        let dir = tmpdir("intake");
+        std::fs::write(dir.join("hello.txt"), b"hi").unwrap();
+        let root = dir.canonicalize().unwrap();
+        let logf = noop_logf();
+
+        // ---- 源① UDS（`from_listener` = 改前的单入口形态）----
+        let dir_a = dir.join("a");
+        std::fs::create_dir_all(&dir_a).unwrap();
+        let sock = dir_a.join("files.sock");
+        let ln = UnixListener::bind(&sock).unwrap();
+        let (uds_intake, _no_tx) = {
+            let intake = homeway_quic::ServiceIntake::from_listener(ln).unwrap();
+            (intake, ())
+        };
+        // ---- 源② QUIC（两源形态；容量 = 在册上限 + K）----
+        let capacity =
+            homeway_quic::tuning::service_defaults::intake_capacity(MAX_CONNS);
+        assert_eq!(capacity, 20, "files 入口容量 = 16 + 4（§8.2-16）");
+        let (quic_intake, tx) = homeway_quic::ServiceIntake::quic_only(capacity).unwrap();
+
+        let srv = Arc::new(FilesServer::open(Some(&root), Arc::clone(&logf)).unwrap());
+        let conns = Arc::clone(&srv.conns);
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        for intake in [uds_intake, quic_intake] {
+            let s2 = Arc::clone(&srv);
+            let st2 = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let _ = s2.serve_stoppable(intake, st2);
+            });
+        }
+
+        // 同一请求在两条入口上各跑一遍：问候行 + stat 应答**逐字节对比**
+        let request = serde_json::json!({"op": "stat", "path": "hello.txt"}).to_string();
+        let run = |stream: UnixStream| -> (Vec<u8>, Vec<u8>) {
+            let mut w = stream.try_clone().unwrap();
+            w.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut r = BufReader::new(stream);
+            let greet = read_line(&mut r).unwrap();
+            writeln!(w, "{request}").unwrap();
+            let resp = read_line(&mut r).unwrap();
+            (greet, resp)
+        };
+        let (g_uds, r_uds) = {
+            let c = UnixStream::connect(&sock).unwrap();
+            run(c)
+        };
+        let (svc_end, cli_end) = UnixStream::pair().unwrap();
+        tx.try_enqueue(svc_end).expect("入队");
+        let (g_quic, r_quic) = run(cli_end);
+        assert_eq!(g_quic, g_uds, "问候行逐字节相同（同一 root/ver ⇒ 同串）");
+        assert_eq!(r_quic, r_uds, "stat 应答逐字节相同：两源同协议面");
+        assert!(
+            String::from_utf8_lossy(&r_quic).contains("hello.txt"),
+            "应答内容面（防两源都回了个空壳）：{}",
+            String::from_utf8_lossy(&r_quic)
+        );
+
+        // ② 在册满（MAX_CONNS 条经 intake 的会话挂着不关）⇒ 第 17 条走应用层 busy
+        let mut holders = Vec::new();
+        for _ in 0..MAX_CONNS {
+            let (svc_end, cli_end) = UnixStream::pair().unwrap();
+            tx.try_enqueue(svc_end).expect("入队");
+            holders.push(cli_end); // 不读不关：会话线程挂在读请求行上（在册名额held）
+        }
+        // 等 16 条全部在册（上面两条 stat 会话已收工 ⇒ 名额已回收）
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while conns.load(std::sync::atomic::Ordering::Acquire) < MAX_CONNS {
+            assert!(std::time::Instant::now() < deadline, "在册数未达上限：{}", conns.load(std::sync::atomic::Ordering::Acquire));
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (svc_end, cli_end) = UnixStream::pair().unwrap();
+        tx.try_enqueue(svc_end).expect("第 17 条入队（入口未满——在册闸先触发）");
+        let (greet17, resp17) = run(cli_end);
+        let g17: serde_json::Value = serde_json::from_slice(&greet17).unwrap();
+        assert_eq!(g17["ok"], serde_json::json!(true), "busy 路径也先发问候（Go 同序）");
+        let r17: serde_json::Value = serde_json::from_slice(&resp17).unwrap();
+        assert_eq!(
+            r17["code"],
+            serde_json::json!("server_busy"),
+            "第 17 条必须在**应用层**被拒（intake 面可达）：{r17}"
+        );
+        assert!(r17["msg"].as_str().unwrap().contains("并发流已满"), "{r17}");
+        drop(holders);
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// G3：满员拒入（Go server.go:140-156 同序）——在册置满后第 17 条流拿到
@@ -1735,5 +1845,26 @@ mod tests {
         let ln2 = listen_local_service(&dir, "files.sock", &logf);
         assert!(ln2.is_ok(), "死残留应可清重建");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **M3 S6 修复判据（统一进程 config 模板面）**：`files_root = ""`（`DEFAULT_CONFIG_TOML`
+    /// 的缺省形态）装配出来的是 `Some(PathBuf::from(""))` ⇒ 必须与 `None` 同义（Go
+    /// `files.Open("")` = `os.UserHomeDir()`）——旧形态恒打「⚠️ files 根目录不可用」。
+    /// **负例**：空串归一**不得**放松「不存在/不是目录」判负。
+    #[test]
+    fn empty_root_is_treated_as_unconfigured() {
+        let home = std::env::var_os("HOME").expect("测试环境须有 HOME");
+        let home = std::fs::canonicalize(PathBuf::from(home)).expect("HOME 必须存在");
+        let s = FilesServer::open(Some(Path::new("")), noop_logf()).expect("空串必须回落 $HOME");
+        assert_eq!(s.root_dir(), home.as_path(), "空串 = 未配置（$HOME）");
+        let n = FilesServer::open(None, noop_logf()).expect("None = $HOME");
+        assert_eq!(n.root_dir(), s.root_dir(), "空串与 None 同义（同一条回落路径）");
+        // 负例：非空但不存在 ⇒ 仍判负（Kind = NotFound，与旧形态同）
+        let missing = Path::new("/nonexistent-homeway-m3s6-files-root");
+        assert!(!missing.exists(), "负例前提：该路径不得存在");
+        assert!(
+            matches!(FilesServer::open(Some(missing), noop_logf()), Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+            "空串归一不得放松「不是目录」判负"
+        );
     }
 }

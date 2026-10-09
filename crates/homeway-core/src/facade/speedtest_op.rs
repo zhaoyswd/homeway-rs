@@ -24,6 +24,9 @@ pub use crate::speedtest::Params as EngineParams;
 use super::term_op::write_auth;
 
 /// 出口测速服务端口（= 本仓 speedtest_server 的默认端口；桥拨号消费）。
+///
+/// **M3 口径**：QUIC 档不再拨它——桥按此端口选 `STREAM[tag=speedtest]`
+/// （`facade/quic_stream.rs::tag_for_port`）；WG 档照旧拨端口。值/字段面不变（E1）。
 pub const SPEEDTEST_SERVICE_PORT: u16 = 7803;
 
 /// Start 的入参（JSON；字段名与迁移前逐字一致——camelCase，评审 r1-F08 整改：

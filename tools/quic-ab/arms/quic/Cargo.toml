@@ -1,0 +1,23 @@
+[package]
+name = "quic-ab-quic"
+version.workspace = true
+edition.workspace = true
+
+# QUIC 臂：quinn 0.11 + rustls(ring) + tokio（DATAGRAM 承载）。
+# 口径与 lab 同：关 quinn 默认 features，显式 rustls-ring（真 ring 0.17 由 rustls/quinn-proto
+# 带入）+ runtime-tokio。本臂的 ring 不是 shim（本 workspace 无 [patch]）。
+[dependencies]
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio"] }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+tokio = { version = "1", features = ["rt", "net", "time", "io-util", "macros"] }
+bytes = "1"
+libc = "0.2"
+quic-ab-common = { path = "../common" }
+
+[[bin]]
+name = "quic"
+path = "src/main.rs"
+
+[[bin]]
+name = "multiconn"
+path = "src/bin/multiconn.rs"

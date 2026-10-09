@@ -96,6 +96,61 @@ pub struct TunStatusInput {
     pub unhealthy_reason: Option<String>,
     pub runner: Option<RunnerIn>,
     pub transport: Option<TransportIn>,
+    /// QUIC 岛快照段（M1 S3-2；**additive 平级段**——`None` = 本世代非 quic 档/岛不在）。
+    pub quic: Option<QuicIn>,
+}
+
+/// 四类丢弃计数（M1 S3-3：N-c 行与 JSON **同源**——同一份 `IslandSnapshot::drops`）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct QuicDropsIn {
+    pub too_large: u64,
+    pub send_buffer_full: u64,
+    pub return_queue_full: u64,
+    pub unregistered: u64,
+}
+
+/// QUIC 岛快照（M1 S3-2 的 `quic` 段；字段清单 = S2b 交下的 `IslandSnapshot` 全量，
+/// **键名照抄**——本段是 M1 新增面（无 Go 对照），键名即契约，改动须登记）。
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct QuicIn {
+    /// `max_datagram_size()` 现值（0 = 未建连）。
+    pub mtu: u32,
+    /// `current_mtu`（DPLPMTUD/黑障后的现值）。
+    pub current_mtu: u16,
+    pub lost_packets: u64,
+    pub congestion_events: u64,
+    pub migrations: u64,
+    pub migration_unconfirmed: bool,
+    pub drops: QuicDropsIn,
+    /// `direct|relay|none`（与 link 段同一词表）。
+    pub via: String,
+    pub ep: String,
+    pub rtt_ms: u64,
+    pub packets_in: u64,
+    pub packets_out: u64,
+    /// 当前本地地址（UDP 源端口；空串 = 未就绪）——detach 后仍可读（M0 §8.1 残余面）。
+    pub local: String,
+    pub connections: u64,
+    pub relay_tx: u64,
+    pub rx_ignored: u64,
+    pub candidates: u64,
+    pub mirrors: u64,
+    /// 已占用（未确认）的 DATAGRAM 发送缓冲字节数（M1 交下项 N8① / M2 S2-5；
+    /// **瞬时量**：无连接 = 0，满 = 1 MiB）。黑洞期「已入缓冲的 1 MiB」的可观测面。
+    pub send_buffer_used: u64,
+    /// **末次准入被拒的关闭码**（M3 §4；`0` = 未发生过）。与 `admit_reject_text` 成对——
+    /// 回落 WG 的世代里 App 据此回答「为什么走了 WG」（M2 真机发现①的黑洞面）。
+    pub admit_reject_code: u64,
+    /// 上者的稳定短语（空串 = 未发生/未知码）。
+    pub admit_reject_text: String,
+    /// **累计成功快探次数**（M3 S4 §3.1/§3.2；e2e 的 `T_recv` 观测位）。
+    pub ladder_probe_ok: u64,
+    /// 当前连续快探失败次数（成功即清零）。
+    pub ladder_fail_streak: u32,
+    /// 当前连续抖动次数（§3.1-2；≥ 阈值 ⇒ 升格为失败）。
+    pub ladder_jitter_streak: u32,
+    /// 最近一次阶梯动作（`""`/`migrate`/`reconnect`/`rebuild`）。
+    pub ladder_action: String,
 }
 
 /// 快照 → tunStatusJSON（Go tunStatusJSON 逐键对齐；键序 = 字典序）。
@@ -193,6 +248,59 @@ pub fn tun_status_json(input: &TunStatusInput) -> String {
         if let Some(ip) = &t.tun_ip {
             m.insert("tunIp".into(), Value::String(ip.clone()));
         }
+    }
+
+    // M1 S3-2：`quic` 段（**additive 平级段**；岛不在 = 整段缺席 ⇒ 旧读者零影响）
+    if let Some(q) = &input.quic {
+        let mut qm = Map::new();
+        qm.insert("mtu".into(), Value::from(q.mtu));
+        qm.insert("current_mtu".into(), Value::from(q.current_mtu));
+        qm.insert("lost_packets".into(), Value::from(q.lost_packets));
+        qm.insert("congestion_events".into(), Value::from(q.congestion_events));
+        qm.insert("migrations".into(), Value::from(q.migrations));
+        qm.insert(
+            "migration_unconfirmed".into(),
+            Value::from(q.migration_unconfirmed),
+        );
+        let mut d = Map::new();
+        d.insert("too_large".into(), Value::from(q.drops.too_large));
+        d.insert(
+            "send_buffer_full".into(),
+            Value::from(q.drops.send_buffer_full),
+        );
+        d.insert(
+            "return_queue_full".into(),
+            Value::from(q.drops.return_queue_full),
+        );
+        d.insert("unregistered".into(), Value::from(q.drops.unregistered));
+        qm.insert("drops".into(), Value::Object(d));
+        qm.insert("via".into(), Value::String(q.via.clone()));
+        qm.insert("ep".into(), Value::String(q.ep.clone()));
+        qm.insert("rtt_ms".into(), Value::from(q.rtt_ms));
+        qm.insert("packets_in".into(), Value::from(q.packets_in));
+        qm.insert("packets_out".into(), Value::from(q.packets_out));
+        qm.insert("local".into(), Value::String(q.local.clone()));
+        qm.insert("connections".into(), Value::from(q.connections));
+        qm.insert("relay_tx".into(), Value::from(q.relay_tx));
+        qm.insert("rx_ignored".into(), Value::from(q.rx_ignored));
+        qm.insert("candidates".into(), Value::from(q.candidates));
+        qm.insert("mirrors".into(), Value::from(q.mirrors));
+        qm.insert("send_buffer_used".into(), Value::from(q.send_buffer_used));
+        // M3 S5（§4/§8.2-12）：准入归因两键（additive；0/空串 = 未发生过）
+        qm.insert("admit_reject_code".into(), Value::from(q.admit_reject_code));
+        qm.insert(
+            "admit_reject_text".into(),
+            Value::String(q.admit_reject_text.clone()),
+        );
+        // M3 S4（§3.1/§3.2）：快探阶梯四个读数键（additive）
+        qm.insert("ladder_probe_ok".into(), Value::from(q.ladder_probe_ok));
+        qm.insert("ladder_fail_streak".into(), Value::from(q.ladder_fail_streak));
+        qm.insert("ladder_jitter_streak".into(), Value::from(q.ladder_jitter_streak));
+        qm.insert(
+            "ladder_action".into(),
+            Value::String(q.ladder_action.clone()),
+        );
+        m.insert("quic".into(), Value::Object(qm));
     }
 
     Value::Object(m).to_string()
@@ -344,6 +452,7 @@ mod tests {
                 outbound_at_ms: Some(1696000009000),
                 local_err: Some((0, 0)),
             }),
+            quic: None,
         };
         let json = tun_status_json(&input);
         let v: Value = serde_json::from_str(&json).unwrap();
@@ -370,6 +479,95 @@ mod tests {
         assert_eq!(v["demand"]["localErrAdopted"], 0);
         let dk: Vec<&str> = v["demand"].as_object().unwrap().keys().map(|k| k.as_str()).collect();
         assert_eq!(dk, vec!["active", "at", "fg", "localErrAdopted", "localErrTotal", "outboundAt", "reason"]);
+    }
+
+    /// **判据（M1 S3-2）**：`quic` 段 = **additive 平级段**——①字段齐（S2b 交下的
+    /// 全量清单）；②岛不在（`None`）= 整段缺席，既有键面/键序逐字不变（旧读者零影响）。
+    #[test]
+    fn quic_section_is_additive_and_complete() {
+        // ② 缺席形态：既有键面不变（对照 full_key_face_attached 的键表——无 `quic`）
+        let bare = TunStatusInput {
+            stage: stage_in(TunStage::Attached, "", "", true, "wg"),
+            running: true,
+            demand: DemandState { active: false, reason: String::new(), at_ms: 0 },
+            demand_fg: false,
+            runner: None,
+            transport: None,
+            unhealthy_reason: None,
+            quic: None,
+        };
+        let v: Value = serde_json::from_str(&tun_status_json(&bare)).unwrap();
+        assert!(v.get("quic").is_none(), "岛不在 ⇒ 整段缺席");
+
+        // ① 在场形态：字段齐 + 键序（serde_json Map = 字典序）
+        let input = TunStatusInput {
+            quic: Some(QuicIn {
+                mtu: 1362,
+                current_mtu: 1400,
+                lost_packets: 3,
+                congestion_events: 1,
+                migrations: 2,
+                migration_unconfirmed: true,
+                drops: QuicDropsIn {
+                    too_large: 1,
+                    send_buffer_full: 2,
+                    return_queue_full: 3,
+                    unregistered: 4,
+                },
+                via: "relay".into(),
+                ep: "192.168.3.12:42652".into(),
+                rtt_ms: 12,
+                packets_in: 5,
+                packets_out: 6,
+                local: "192.168.3.12:54123".into(),
+                connections: 1,
+                relay_tx: 7,
+                rx_ignored: 8,
+                candidates: 4,
+                mirrors: 9,
+                send_buffer_used: 4096,
+                // M3 S5（§8.2-12）：准入归因两键（additive）
+                admit_reject_code: 0x11,
+                admit_reject_text: "凭证不被接受".into(),
+                // M3 S4（§3.1/§3.2）：快探阶梯四键（additive）
+                ladder_probe_ok: 77,
+                ladder_fail_streak: 0,
+                ladder_jitter_streak: 1,
+                ladder_action: "reconnect".into(),
+            }),
+            ..bare
+        };
+        let v: Value = serde_json::from_str(&tun_status_json(&input)).unwrap();
+        let qk: Vec<&str> = v["quic"].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(
+            qk,
+            vec![
+                // M3 S5：`admit_reject_code`/`admit_reject_text` 两键 additive（字典序在首）
+                "admit_reject_code", "admit_reject_text", "candidates", "congestion_events",
+                "connections", "current_mtu", "drops", "ep", "ladder_action", "ladder_fail_streak",
+                "ladder_jitter_streak", "ladder_probe_ok", "local", "lost_packets",
+                "migration_unconfirmed", "migrations", "mirrors", "mtu", "packets_in",
+                "packets_out", "relay_tx", "rtt_ms", "rx_ignored", "send_buffer_used", "via",
+            ]
+        );
+        let dk: Vec<&str> = v["quic"]["drops"].as_object().unwrap().keys().map(|k| k.as_str()).collect();
+        assert_eq!(
+            dk,
+            vec!["return_queue_full", "send_buffer_full", "too_large", "unregistered"]
+        );
+        assert_eq!(v["quic"]["drops"]["too_large"], 1);
+        assert_eq!(v["quic"]["migration_unconfirmed"], true);
+        assert_eq!(v["quic"]["mtu"], 1362);
+        assert_eq!(v["quic"]["via"], "relay");
+        assert_eq!(v["quic"]["send_buffer_used"], 4096, "S2-5 的读数位进 JSON");
+        // M3 S5：准入归因（App 状态面「为什么走了 WG」的落点；0/空串 = 未发生）
+        assert_eq!(v["quic"]["admit_reject_code"], 0x11);
+        assert_eq!(v["quic"]["admit_reject_text"], "凭证不被接受");
+        // M3 S4：快探阶梯读数（e2e 的 T_recv 观测位 = ladder_probe_ok）
+        assert_eq!(v["quic"]["ladder_probe_ok"], 77);
+        assert_eq!(v["quic"]["ladder_fail_streak"], 0);
+        assert_eq!(v["quic"]["ladder_jitter_streak"], 1);
+        assert_eq!(v["quic"]["ladder_action"], "reconnect");
     }
 
     /// runner 缺席 ⇒ stats/exitIp/link/portForwards/bridge 全缺（failed/prepare 期形态）。

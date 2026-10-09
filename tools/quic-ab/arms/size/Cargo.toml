@@ -1,0 +1,33 @@
+[package]
+name = "quic-ab-size"
+version.workspace = true
+edition.workspace = true
+
+# 体积探针（OHOS cdylib）：转入自 `/tmp/quic-lab/size-probe2`（lib + real_quic bin）。
+# 四档矩阵的分工（M0 设计 §4.3/§5.1；**由两个探针包 + profile 切换实现**）：
+#   ① 空壳 cdylib            = `size-shell` 无 feature
+#   ② 空壳 + QUIC 全栈        = `size-shell --features quic`（浅引用 ⇒ 死码消除后）
+#   ③ base + 真实引用全路径    = **本包** `--features quic`（boringtun+smoltcp 在场 + ProbeRunQuic 真自连）
+#   ④ 现役 .so 对照           = 主检出产物（只读，由 harness 量取）
+[lib]
+name = "clientcore2"
+crate-type = ["cdylib"]
+
+[dependencies]
+# 近似产品依赖面（boringtun + smoltcp 是核里最大的两块；QUIC 增量在「它们已在场」时测）
+boringtun = "0.6"
+smoltcp = { version = "0.14", features = ["socket-tcp-cubic", "socket-tcp-reno"] }
+libc = "0.2"
+quinn = { version = "0.11", default-features = false, features = ["rustls-ring", "runtime-tokio"], optional = true }
+rustls = { version = "0.23", default-features = false, features = ["ring", "std"], optional = true }
+tokio = { version = "1", features = ["rt", "net", "time", "io-util"], optional = true }
+bytes = "1"
+
+[features]
+# 真引用档：QUIC 全栈 + 全路径可达（含自连握手）——①② 两格由 `size-shell` 提供
+quic = ["dep:quinn", "dep:rustls", "dep:tokio"]
+
+[[bin]]
+name = "real_quic"
+path = "src/bin/real_quic.rs"
+required-features = ["quic"]

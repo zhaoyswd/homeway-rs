@@ -254,7 +254,9 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# homeway 配置（L1 意图层，唯�
 # 身份密钥不进本文件（key 与 token 台账同居 <state>/serve|relay/，L2）。
 # 改动经重启生效（不热更）。
 # 键表（省略即默认）：
-#   [serve] enabled / listen(1-65535) / bind_interface(auto|none|网卡|IP) /
+#   [serve] enabled / listen(1-65535) / quic(true|false；M1 的 QUIC 面总开关：关 =
+#           不监听 QUIC 端口 + token 不公布 QUIC 端点/RPK ⇒ 该 token 的客户端回落 WG) /
+#           quic_listen(1-65535；缺省 = listen+1) / bind_interface(auto|none|网卡|IP) /
 #           upnp / stun / stun6 / relay(rl1… 或 IP:port) / max_peers /
 #           peer_ttl(时长串，"0s"=关) / dns_port(0=关；非 0 = 客户端解析腿端口，缺省 5300) /
 #           files_root(空=$HOME) / public_endpoint(逗号分隔 ip:port；空=推断) /
@@ -264,12 +266,21 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# homeway 配置（L1 意图层，唯�
 #           dns_probe_target 一键喂挑卡/健康探针/udpcap 三路；stun_probe_target 须带端口)
 #   [[serve.ddns]] domain = "裸域名"（可多条；出口只读解析，记录由外部 DDNS 维护）
 #   [serve.tx_shape] 发送整形（rate_mbps/burst_kb；缺省 = 产品默认 200MiB/s+256KiB，HOMEWAY_TX_SHAPING=off 整套关）
+#   [serve.quic_admit] 抗放大闸（M2 §3.2 六行七键；省略本节省略即不变——缺省 = 设计定值）：
+#           retry_token_lifetime(时长串 1s-60s，缺省 5s；Retry token 有效期) /
+#           per_src_fails(1-1000，缺省 16；每源滑动窗的未完成/被拒上限) /
+#           per_src_window(时长串 1s-1h，缺省 10s) / nonce_ttl(时长串 1s-30s，缺省 5s) /
+#           admit_deadline(时长串 1s-60s，缺省 10s) /
+#           proof_fail_threshold(0-1000，缺省 10；0 = 关闭该闸) /
+#           retry_policy(pressure|always|never，缺省 pressure；always = 常态每次建连 +1 RTT，仅排障)
+#           **值域非法 ⇒ 拒启**（serve 节严格表纪律）；env HOMEWAY_QUIC_ADMIT_RETRY 非法 ⇒ 记行 + 缺省
 #   [relay] enabled / listen(":41741") / advertise(逗号分隔，空=自动探测)
 # 客户端角色无配置节（随进程常开）；host 表在 <state>/client/hosts.json（不进 config）。
 
 [serve]
 enabled = true
 listen = 41641
+quic = true
 bind_interface = "auto"
 upnp = true
 stun = "stun.cloudflare.com:3478"
@@ -430,6 +441,9 @@ mod tests {
         struct FileServe {
             #[serde(default)] enabled: bool,
             #[serde(default)] listen: Option<u16>,
+            // M1：QUIC 面（总开关 + 独立端口）——模板与 schema 漂移由本镜像捕获
+            #[serde(default)] quic: Option<bool>,
+            #[serde(default)] quic_listen: Option<u16>,
             #[serde(default)] bind_interface: Option<String>,
             #[serde(default)] upnp: Option<bool>,
             #[serde(default)] stun: Option<String>,

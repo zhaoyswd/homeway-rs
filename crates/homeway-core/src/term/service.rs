@@ -27,9 +27,12 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::os::unix::net::UnixListener;
+
+use homeway_quic::ServiceIntake;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
+use std::sync::atomic::AtomicUsize;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::Receiver;
 use std::sync::mpsc::SyncSender;
@@ -719,10 +722,26 @@ pub struct TermService {
     key_flavor_ambiguous_warned: AtomicBool,
     /// F1 观测面：`handle_input` 查不到腿（`end_leg` 竞态）而丢弃输入的计数。
     leg_missing_input_drops: AtomicU64,
+    /// **连接级在册计数**（M3 §1.7 设计门 2-4 的闸；容量见 [`Self::conn_capacity`]）——
+    /// 占位在 accept 处原子取，线程退出（含 panic/隔离）即归还。
+    active_conns: Arc<AtomicUsize>,
+    /// 连接级超限被收线的累计（观测面；行文节流首 3 + 每 100）。
+    conn_over_cap: AtomicU64,
     /// 测试身份（panic 注入表按服务唯一化——并发测试的其它服务 tick 不会误消费；
     /// 生产构建无此字段）。
     #[cfg(test)]
     svc_id: u64,
+}
+
+/// 连接级名额的归还卫兵（线程退出即 `Drop`；`spawn` 失败时由调用侧显式归还）。
+struct ConnGuard {
+    n: Arc<AtomicUsize>,
+}
+
+impl Drop for ConnGuard {
+    fn drop(&mut self) {
+        self.n.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 /// 测试服务的身份发号器（`#[cfg(test)]`）。
@@ -766,6 +785,8 @@ impl TermService {
             key_flavor_ambiguous: AtomicU64::new(0),
             key_flavor_ambiguous_warned: AtomicBool::new(false),
             leg_missing_input_drops: AtomicU64::new(0),
+            active_conns: Arc::new(AtomicUsize::new(0)),
+            conn_over_cap: AtomicU64::new(0),
             #[cfg(test)]
             svc_id: next_svc_id(),
         });
@@ -776,6 +797,80 @@ impl TermService {
             .spawn(move || tick_svc.sample_loop())
             .ok();
         svc
+    }
+
+    /// 会话数上限（`HOMEWAY_TERM_MAX_SESSIONS`，缺省 16）——服务入口容量 = 它 + K
+    /// （M3 §1.7 设计门 2-4：term 今天**没有**连接级在册闸，入口容量按会话上限 + K 取，
+    /// 是**新引入的连接级上限**，行为变化见 `docs/reviews/M3-design.md` §8.2-16）。
+    pub fn max_sessions(&self) -> usize {
+        self.cfg.max_sessions
+    }
+
+    /// **连接级在册上限**（= 会话上限 + `INTAKE_K`，缺省 16+4=20；§1.7 设计门 2-4）。
+    ///
+    /// 代码门 r18（C2-1）的整改：S2 只把该值用作**出口 intake 的队列容量**（取出即释放名额），
+    /// 而 term 的 accept 循环对每条连接 spawn 一个 `term-conn` 线程、**从不计数** ⇒ 登记里
+    /// 「20 = 新引入的连接级上限，防一条设备开满 bidi 流把 term 线程数打成无界」当时是空头承诺。
+    /// 现在 accept 处**原子占名额**、线程退出即归还（含 panic），超限 ⇒ 收线 + 一行 + 计数。
+    pub fn conn_capacity(&self) -> usize {
+        homeway_quic::tuning::service_defaults::intake_capacity(self.cfg.max_sessions)
+    }
+
+    /// 当刻连接级在册数（观测面；测试判据同源）。
+    pub fn active_conns(&self) -> usize {
+        self.active_conns.load(Ordering::Relaxed)
+    }
+
+    /// 连接级超限被收线的累计（观测面）。
+    pub fn conn_over_cap(&self) -> u64 {
+        self.conn_over_cap.load(Ordering::Relaxed)
+    }
+
+    /// **受理一条连接**（两源共用；连接级闸先于 spawn）。
+    ///
+    /// 超限 ⇒ **收线**（普通 close：客户端见 EOF，与「服务未启用」同面）+ 节流行 + 计数；
+    /// 不排队（排队会把「已受理但无会话」的连接与在册语义搅在一起；QUIC 侧还有 intake
+    /// 队列作为第二道缓冲）。
+    fn serve_one(self: &Arc<Self>, stream: UnixStream) {
+        let cap = self.conn_capacity();
+        // 先占名额（占位发生在 spawn 之前 ⇒ 上限不被 spawn 延迟漏掉）
+        let mut cur = self.active_conns.load(Ordering::Relaxed);
+        loop {
+            if cur >= cap {
+                let n = self.conn_over_cap.fetch_add(1, Ordering::Relaxed) + 1;
+                if n <= 3 || n.is_multiple_of(100) {
+                    (*self.logf)(&format!(
+                        "term: ⚠️ 连接超限（在册 {cur}/{cap}）—— 收线（连接级上限；M3 §1.7 设计门 2-4；第 {n} 次）"
+                    ));
+                }
+                drop(stream); // 普通 close ⇒ 对端 EOF（不占线程、不占会话）
+                return;
+            }
+            if self
+                .active_conns
+                .compare_exchange_weak(cur, cur + 1, Ordering::Relaxed, Ordering::Relaxed)
+                .is_ok()
+            {
+                break;
+            }
+            cur = self.active_conns.load(Ordering::Relaxed);
+        }
+        let svc = Arc::clone(self);
+        let n = Arc::clone(&self.active_conns);
+        let spawned = std::thread::Builder::new()
+            .name("term-conn".into())
+            .spawn(move || {
+                // 名额随线程退出归还（含 panic / `guard_thread` 的单连接隔离面）
+                let _guard = ConnGuard { n };
+                // F7：单连接隔离——panic 只 drop 该连接（stream 随闭包 drop）
+                let _ = guard_thread(ThreadRole::Conn, "", &svc.logf, || {
+                    svc.serve_conn(stream)
+                });
+            });
+        if let Err(e) = spawned {
+            self.active_conns.fetch_sub(1, Ordering::Relaxed); // 线程未起 ⇒ 名额立即归还
+            crate::syncutil::log_spawn_failed(&self.logf, "term-conn", &e, "连接被丢弃（名额已归还）");
+        }
     }
 
     /// 登录 shell 文本（就绪行用）。
@@ -810,37 +905,33 @@ impl TermService {
                 return;
             }
             match conn {
-                Ok(stream) => {
-                    let svc = Arc::clone(self);
-                    std::thread::Builder::new()
-                        .name("term-conn".into())
-                        .spawn(move || {
-                            // F7：单连接隔离——panic 只 drop 该连接（stream 随闭包 drop）
-                            let _ = guard_thread(ThreadRole::Conn, "", &svc.logf, || {
-                                svc.serve_conn(stream)
-                            });
-                        })
-                        .ok();
-                }
+                Ok(stream) => self.serve_one(stream),
                 Err(_) => return, // listener 已关
             }
         }
     }
 
-    /// 同 [`Self::serve`]，但 accept 走非阻塞 + 停止位轮询——服务收工时监听线程
-    /// 可退出（不陪跑到进程结束；Go Shutdown 里的 `s.termLn.Close()` 同效）。
-    pub fn serve_stoppable(self: &Arc<Self>, ln: UnixListener, stop: Arc<AtomicBool>) {
-        use std::os::unix::io::AsRawFd as _;
-        let _ = ln.set_nonblocking(true);
-        let fd = ln.as_raw_fd();
+    /// 同 [`Self::serve`]，但 accept 走**两源入口**（[`ServiceIntake`]）+ 停止位轮询——
+    /// 服务收工时监听线程可退出（不陪跑到进程结束；Go Shutdown 里的 `s.termLn.Close()` 同效）。
+    ///
+    /// **M3 S2 的重写点（设计 §2.2）**：形参 `UnixListener → ServiceIntake`，poll 目标改成
+    /// intake 登记的**就绪 fd 集**（⑤：UDS 监听 fd + QUIC 唤醒读端）——两条性质逐条保住：
+    /// ①「poll 到达即 accept——**无 200ms 空闲延迟**」（评审 P7；唤醒面由 intake 的
+    /// 自唤醒管道承担，QUIC 入队写 1B 即刻可读）；②停止位在窗内可查（200ms 节拍不变）。
+    /// `ServiceIntake::from_listener` = 改前的单 UDS 形态（既有 P7 用例走它，语义零改）。
+    pub fn serve_stoppable(self: &Arc<Self>, intake: ServiceIntake, stop: Arc<AtomicBool>) {
         loop {
             if stop.load(Ordering::Relaxed) || self.stop.load(Ordering::Relaxed) {
                 return;
             }
-            // poll 等 POLLIN（连接**到达即返回**——纯 sleep 轮询会给空闲期连接加
+            // poll 就绪 fd 集（连接**到达即返回**——纯 sleep 轮询会给空闲期连接加
             // 平均 100ms 延迟；200ms 只是空闲醒来看停止位的节拍，评审 P7）
-            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-            let r = unsafe { libc::poll(&mut pfd, 1, 200) };
+            let mut pfds: Vec<libc::pollfd> = intake
+                .ready_fds()
+                .into_iter()
+                .map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
+                .collect();
+            let r = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 200) };
             if r < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::Interrupted {
@@ -851,20 +942,8 @@ impl TermService {
             if r == 0 {
                 continue; // 空闲：只查停止位
             }
-            match ln.accept() {
-                Ok((stream, _)) => {
-                    let _ = stream.set_nonblocking(false);
-                    let svc = Arc::clone(self);
-                    std::thread::Builder::new()
-                        .name("term-conn".into())
-                        .spawn(move || {
-                            // F7：单连接隔离——panic 只 drop 该连接（stream 随闭包 drop）
-                            let _ = guard_thread(ThreadRole::Conn, "", &svc.logf, || {
-                                svc.serve_conn(stream)
-                            });
-                        })
-                        .ok();
-                }
+            match intake.accept() {
+                Ok(stream) => self.serve_one(stream),
                 Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => continue,
                 Err(_) => return,
             }
@@ -3598,6 +3677,8 @@ mod tests {
             key_flavor_ambiguous: AtomicU64::new(0),
             key_flavor_ambiguous_warned: AtomicBool::new(false),
             leg_missing_input_drops: AtomicU64::new(0),
+            active_conns: Arc::new(AtomicUsize::new(0)),
+            conn_over_cap: AtomicU64::new(0),
             #[cfg(test)]
             svc_id: next_svc_id(),
         });
@@ -3635,7 +3716,12 @@ mod tests {
 
     impl Client {
         fn connect(path: &std::path::Path) -> Self {
-            let stream = UnixStream::connect(path).unwrap();
+            Self::from_stream(UnixStream::connect(path).unwrap())
+        }
+
+        /// 从**任意一条已连上的服务侧连接**起（M3 S2：QUIC 入口 = 出口泵交出的
+        /// socketpair 服务端；握手帧断言与 UDS 路径共用同一份）。
+        fn from_stream(stream: UnixStream) -> Self {
             let mut io = FrameIo::new(stream);
             let g = io.read_frame_deadline(Duration::from_secs(5)).unwrap();
             assert_eq!(g.op, Op::GREETING);
@@ -4155,6 +4241,109 @@ mod tests {
         svc.close();
     }
 
+    /// **M3 S2 判据（服务入口承载面）**：经 **QUIC 源（socketpair）** 的客户端与经
+    /// **UDS 源** 的客户端拿到**逐字节相同**的握手帧与 LIST 应答载荷（「应用层零改动」的
+    /// 构造性钉法——HSP 帧层一行未改）；且两源在同一入口上**并发可用**（QUIC 不断开流时
+    /// UDS 照常受理）。
+    #[test]
+    fn intake_two_sources_serve_term_protocol_byte_exact() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let svc = svc_with(TermConfig::default(), Arc::clone(&lines));
+        let (ln, path) = start_listener();
+        let capacity = homeway_quic::tuning::service_defaults::intake_capacity(16);
+        assert_eq!(capacity, 20, "term 入口容量 = 会话上限 16 + 4（§8.2-16）");
+        let (intake, tx) = homeway_quic::ServiceIntake::with_quic(ln, capacity).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let svc2 = Arc::clone(&svc);
+            let st2 = Arc::clone(&stop);
+            std::thread::spawn(move || svc2.serve_stoppable(intake, st2));
+        }
+        // 源①：UDS
+        let mut c1 = Client::connect(&path);
+        c1.send(Op::LIST, &[]);
+        let l1 = c1.expect(Op::LIST, 5);
+        // 源②：QUIC（socketpair 服务端）
+        let (svc_end, cli_end) = UnixStream::pair().unwrap();
+        tx.try_enqueue(svc_end).expect("入队");
+        let mut c2 = Client::from_stream(cli_end);
+        c2.send(Op::LIST, &[]);
+        let l2 = c2.expect(Op::LIST, 5);
+        assert_eq!(l2.op, l1.op, "LIST 帧类型");
+        assert_eq!(l2.payload, l1.payload, "LIST 应答载荷逐字节相同（两源同协议面）");
+        assert!(
+            String::from_utf8_lossy(&l2.payload).contains("\"sessions\""),
+            "内容面（防两源都回了空壳）：{}",
+            String::from_utf8_lossy(&l2.payload)
+        );
+        // 两源并发：QUIC 腿保持连接（c2 不收线）时 UDS 仍能受理
+        let mut c3 = Client::connect(&path);
+        c3.send(Op::LIST, &[]);
+        let _ = c3.expect(Op::LIST, 5);
+        drop((c1, c2, c3));
+        svc.close();
+        stop.store(true, Ordering::Relaxed);
+    }
+
+    /// **M3 代码门 r18（C2-1）判据：term 的连接级在册闸**（§1.7 设计门 2-4）。
+    ///
+    /// 在册满（= 会话上限 + `INTAKE_K`，此处 2+4=6）⇒ 第 7 条连接**被收线**（对端见 EOF，
+    /// 无 GREETING）+ 计数 + 一行；全部释放后名额归还（新连接照常受理）。
+    /// 旧实装（accept 处从不计数）下这一支不存在：注册里「20 = 新引入的连接级上限」是空头承诺。
+    #[test]
+    fn conn_level_cap_closes_over_capacity_and_releases_slots() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let svc = svc_with(
+            TermConfig { max_sessions: 2, ..TermConfig::default() },
+            Arc::clone(&lines),
+        );
+        assert_eq!(svc.conn_capacity(), 6, "2 + K(4)（与出口 intake 名额同源常量）");
+        let (ln, path) = start_listener();
+        {
+            let svc2 = Arc::clone(&svc);
+            std::thread::spawn(move || svc2.serve(ln));
+        }
+        // 占满：只连不发（不发 HELLO ⇒ 服务线程停在读帧上，名额被占）
+        let held: Vec<UnixStream> = (0..6).map(|_| UnixStream::connect(&path).unwrap()).collect();
+        let t0 = Instant::now();
+        while svc.active_conns() < 6 && t0.elapsed() < Duration::from_secs(5) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(svc.active_conns(), 6, "6 条全部在册（cap=6）");
+        // 第 7 条 ⇒ 收线（EOF；不写 GREETING）
+        let mut over = UnixStream::connect(&path).unwrap();
+        over.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut b = [0u8; 1];
+        assert_eq!(
+            over.read(&mut b).unwrap_or(0),
+            0,
+            "超限连接被收线（对端见 EOF，不是 GREETING）"
+        );
+        assert_eq!(svc.conn_over_cap(), 1, "超限计数");
+        assert!(
+            lines
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|l| l.contains("连接超限（在册 6/6）")),
+            "须有一行归因：{:?}",
+            lines.lock().unwrap()
+        );
+        // 全部释放 ⇒ 名额归还 0（对端 close ⇒ 服务线程即刻退出，不占 HELLO 预算 15s）
+        drop(held);
+        let t0 = Instant::now();
+        while svc.active_conns() > 0 && t0.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(svc.active_conns(), 0, "释放后名额归还");
+        // 归还后照常受理（拿到 GREETING + LIST 应答）
+        let mut c = Client::connect(&path);
+        c.send(Op::LIST, &[]);
+        let _ = c.expect(Op::LIST, 5);
+        drop(c);
+        svc.close();
+    }
+
     /// P7：serve_stoppable 置停止位后监听线程在窗内退出（engine 实际用的路径）。
     #[test]
     fn serve_stoppable_exits_on_stop() {
@@ -4164,7 +4353,9 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let s2 = Arc::clone(&svc);
         let st2 = Arc::clone(&stop);
-        let h = std::thread::spawn(move || s2.serve_stoppable(ln, st2));
+        // M3 S2：形参换成两源入口；`from_listener` = 改前的单 UDS 形态（语义零改）
+        let intake = ServiceIntake::from_listener(ln).expect("入口");
+        let h = std::thread::spawn(move || s2.serve_stoppable(intake, st2));
         // 连接可用（poll 到达即 accept——无 200ms 空闲延迟）
         let mut c = Client::connect(&path);
         c.send(Op::LIST, &[]);

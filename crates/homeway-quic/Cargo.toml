@@ -1,0 +1,42 @@
+[package]
+name = "homeway-quic"
+description = "QUIC 岛：单线程 runtime 宿主 + 同步/异步边界 + 出口 QUIC 面 + 客户端连接/数据面（对同步面只暴露命令通道；M1 起已接线）"
+version.workspace = true
+edition.workspace = true
+
+# 纪律（M0 设计 §3.1/§3.4）：本 crate 是**叶子**（leaf-ward）——**不得**依赖
+# homeway-core（否则依赖成环 + 边界失效）。异步栈（quinn/rustls/tokio）只在这里声明，
+# 消费侧 homeway-core 只加一条路径依赖、不声明它们 ⇒ 同步面里 `use tokio::…` = E0433。
+[dependencies]
+quinn.workspace = true
+rustls.workspace = true
+# `net`（M1 S1c 增开）：出口 QUIC 面的**自定义抽象 socket**（`tokio::net::UdpSocket` 的
+# poll/try 面——直连端口 + 腿表 + 注入队列，M1 设计 §1.6）；其余 features 见 workspace：
+# `rt` = current_thread 宿主、`time` = 预算/节拍、`sync` = 命令通道 + 注入队列、
+# `macros` = select!（**只为 select!**——仍不用 `#[tokio::main]`）。
+# `io-util`（M1 S2a 增开）：控制流写的 `AsyncWriteExt::write_all`（登记/刷新帧）与
+# 异步面单测的 `tokio::io::duplex`（60s 刷新节拍的 `start_paused` 用例，设计 §10 S2-6）。
+tokio = { workspace = true, features = ["net", "io-util"] }
+thiserror.workspace = true
+# DATAGRAM 载荷类型（M1 设计 §1.5：`send_datagram` 只收 `bytes::Bytes`；quinn 并不
+# re-export bytes ⇒ 消费侧必须直接声明——M0 已登记「M1 必需」）。
+bytes.workspace = true
+# `hr-reg4` 的 MAC（M2 设计 §1.2：`HMAC-SHA256(secret, "hr-reg4"‖pubkey‖devTag‖ts‖nonce‖exporter)`
+# 与刷新域的 `hr-reg4-refresh`）——**非异步栈**（隔离门只约束 tokio/quinn/rustls 名字）；
+# 出口面（校验）与客户端岛（登记/刷新，组帧）共用同一个字节层 ⇒ 两侧不会各写一份标签
+# 顺序而静默错位。
+hmac.workspace = true
+sha2.workspace = true
+# Challenge/nonce 的 CSPRNG（M2 设计 §1.3：出口每连接取 16B 新鲜值）——**非异步栈名字**，
+# 且 workspace 既有依赖（零新版本面）。
+getrandom.workspace = true
+# TUN 面的裸 fd 语义（M1 S2-4：读线程 `read`/`poll`、回程写线程 `write`/`poll`——
+# 形态镜像 `homeway-core::wgcore`，两侧同口径）。**非异步栈名字**（隔离门只约束
+# tokio/quinn/rustls），且不引入新的传递依赖（core 已在用同一版本）。
+libc.workspace = true
+
+# 测试依赖：出口面/客户端面用例走**真线程 + 真回环 IO**（连接/迁移/上限注入），不钉端口、
+# 只判上界（M0 设计 §9.2 flake 口径①②）。`macros` = `#[tokio::test]`；**`test-util`**
+# = 纯定时语义用例的 `start_paused` 虚拟时钟（设计 §10 S2-6 点名同批加）。
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "test-util"] }

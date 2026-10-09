@@ -104,6 +104,19 @@ pub enum RejectReason {
 }
 
 impl RejectReason {
+    /// **M3 §4 的准入关闭码分桶**（`homeway-quic::EngineRejectClass`）：
+    /// `no-token`/`revoked` ⇒ 凭证面；`table-full`/`ip-conflict`（表压）⇒ 资源面。
+    ///
+    /// 分桶只影响 `CONNECTION_CLOSE` 的应用码（粗粒度两桶，不给未认证对端更多 Oracle）；
+    /// 表内详细归因行（`peer: ! reject reason=…`）逐字不变。
+    pub fn engine_class(self) -> homeway_quic::EngineRejectClass {
+        use homeway_quic::EngineRejectClass as C;
+        match self {
+            RejectReason::NoToken | RejectReason::Revoked => C::Credential,
+            RejectReason::TableFull | RejectReason::IpConflict => C::Resource,
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             RejectReason::NoToken => "no-token",
@@ -217,6 +230,32 @@ impl DeviceTable {
 
     pub fn limits(&self) -> (usize, Duration, Duration) {
         (self.cfg.max_devices, self.cfg.ttl, self.cfg.grace)
+    }
+
+    /// **`hr-reg4` 的 MAC 匹配**（M2 设计 §1.4 步骤 4.2）：逐条试 token secret，命中即返回
+    /// 该 secret。**纯校验**——不做时间窗、不走吊销钩子、不计数、不打行：三者全部留给
+    /// [`Self::register`] 的同一条路径（命中后调用方用该 secret 重建 v2 报文再走 register）
+    /// ⇒ `register` 的语义与判据行逐字不变，本方法只是「哪条 secret 认得这一帧」。
+    ///
+    /// 两类帧（准入 Proof / 刷新帧）的 **MAC 域标签不同**（`hr-reg4` / `hr-reg4-refresh`）
+    /// ——由 [`homeway_quic::Reg4Frame`] 的类型分派选域，本方法不重复判定（否则两处名单会漂移）。
+    ///
+    /// 换连接重放 ⇒ `exporter` 不同 ⇒ 恒不命中（这正是连接绑定存在的理由，见
+    /// `homeway_quic::reg4` 的模块头）。
+    pub(crate) fn match_proof(
+        &self,
+        frame: &homeway_quic::Reg4Frame,
+        exporter32: &[u8; 32],
+    ) -> Option<[u8; 32]> {
+        self.secrets.iter().copied().find(|s| frame.mac_matches(s, exporter32))
+    }
+
+    /// 某设备的派生地址（QUIC 出口面的源校验 + 绑定面；M1 设计 §1.3/§1.4）。
+    ///
+    /// 为什么需要读口：`register` 的 **refresh** 不产 `DevOp`（表内只刷 lastReg）⇒ 刷新帧
+    /// 的裁决拿不到地址，必须回表里读（Add/Rotated 也能读，取表内当前值为准）。
+    pub(crate) fn device_addrs(&self, dev: &[u8; 8]) -> Option<(Ipv4Addr, Ipv4Addr)> {
+        self.entries.get(dev).map(|e| (e.ip, e.tun_ip))
     }
 
     /// 设备表 brief（serve.status 观测面：dev = devTag 全 16hex、隧道 /32、最近注册

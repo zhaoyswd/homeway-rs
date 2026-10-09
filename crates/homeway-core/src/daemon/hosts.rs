@@ -609,6 +609,16 @@ struct ReachReport {
     best_rtt_ms: Option<i64>,
 }
 
+/// token 端点的**字面量**展开（Go `resolveReachTarget` 的 IP 字面量分支同义）。
+///
+/// 地址归一（M2 代码门 G3，同类 D1；Go 同分支 `netip.AddrPortFrom(ip.Unmap(), port)`
+/// ——reach.go:215）：token 字面量允许写 `[::ffff:a.b.c.d]`，不归一时①与域名解析
+/// 产物/纯 v4 字面量**同址去重失配**（同一地址探两次）②回执 `ep` 串（用户可见）
+/// 是 mapped 形态。域名路径的 IP 已由 `lookup_host` 契约归一（v4-mapped → v4）。
+fn expand_literal(addr: &str) -> Option<std::net::SocketAddr> {
+    addr.parse::<std::net::SocketAddr>().ok().map(crate::udpbatch::unmap_v4_in6)
+}
+
 /// 对 token 端点全集做参照点探测：每端点独立线程、总预算 3.5s（父预算封顶——
 /// spec host-management 的 ≤3.5s MUST 由此成立）。只回报活端点；死端点静默。
 /// Tier：有直连应答 = direct；直连全无且中继有应答 = relay；全无 = none。
@@ -626,10 +636,13 @@ fn reach(token_raw: &str) -> ReachReport {
     // 只取首个 A 会让多记录域名的活路径被误判不可达）；跨端点同址去重。
     let mut eps: Vec<(std::net::SocketAddr, bool)> = Vec::new();
     for ep in &tok.endpoints {
+        // M1 S1c：WG 档不吃 QUIC 类端点（§2.1 末段）——`host reach` 是 WG 面探测，
+        // 判据与 `token::wg_endpoint_refs` 同源（`EndpointKind::is_wg`）。
+        if !ep.kind.is_wg() {
+            continue;
+        }
         let relay = ep.kind == EndpointKind::Relay;
-        let expanded: Vec<std::net::SocketAddr> = if let Ok(addr) =
-            ep.addr.parse::<std::net::SocketAddr>()
-        {
+        let expanded: Vec<std::net::SocketAddr> = if let Some(addr) = expand_literal(&ep.addr) {
             vec![addr]
         } else {
             let Some((host, port)) = crate::wtransport::domain_eps::split_host_port_pub(&ep.addr)
@@ -712,6 +725,21 @@ mod tests {
         Arc::new(|_: &str| {})
     }
 
+    /// M2 代码门 G3（D1 同类）：`host reach` 的字面量展开归一——mapped 与纯 v4
+    /// 同址（去重键/回执 `ep` 串恒为规范形态）；真 v6 原样；非 IP 走域名分支。
+    #[test]
+    fn reach_literal_normalizes_v4_mapped() {
+        let want: std::net::SocketAddr = "127.0.0.1:41641".parse().unwrap();
+        assert_eq!(expand_literal("[::ffff:127.0.0.1]:41641"), Some(want));
+        assert_eq!(expand_literal("127.0.0.1:41641"), Some(want));
+        assert_eq!(
+            expand_literal("[2001:db8::1]:41641"),
+            Some("[2001:db8::1]:41641".parse().unwrap())
+        );
+        assert_eq!(expand_literal("home.example.com:41641"), None);
+        assert_eq!(expand_literal("nonsense"), None);
+    }
+
     #[test]
     fn carried_and_roundtrip_persist() {
         let dir = tmp_dir("persist");
@@ -786,6 +814,7 @@ mod tests {
             peer_id: &token::PeerId::from([0u8; 32]),
             secret: &token::Secret::from([7u8; 32]),
             endpoints: &[token::EndpointRef::new("127.0.0.1:1", token::EndpointKind::Direct)],
+            rpk: None,
         };
         token::encode(&spec).unwrap()
     }

@@ -378,6 +378,105 @@ pub struct ServeInterceptBits {
     pub tx_frag_drop: u64,
 }
 
+/// 出口 QUIC 面的计数快照（M3 S2；M2 交下的 L4 项——`serve status --json` 的**平级
+/// additive 段**，面未起 = 整段缺席 ⇒ 旧载荷/旧读者零影响）。
+///
+/// 键名 = `homeway-quic` 的 `ExitQuicSnapshot` 字段名逐字（**单源**：`from_snapshot` 是
+/// 唯一构造面，加字段即编译红——防两处键表漂移）。口径与行内自带数同源（M2 §15-1）。
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct ServeQuicBits {
+    pub connections: u64,
+    pub admitted: u64,
+    #[serde(rename = "pathChanges")]
+    pub path_changes: u64,
+    #[serde(rename = "handshakeFailed")]
+    pub handshake_failed: u64,
+    #[serde(rename = "handshakePeerClosed")]
+    pub handshake_peer_closed: u64,
+    #[serde(rename = "handshakesInFlight")]
+    pub handshakes_in_flight: u64,
+    #[serde(rename = "handshakeRefused")]
+    pub handshake_refused: u64,
+    #[serde(rename = "connRefused")]
+    pub conn_refused: u64,
+    #[serde(rename = "handshakeTimeouts")]
+    pub handshake_timeouts: u64,
+    #[serde(rename = "regsAccepted")]
+    pub regs_accepted: u64,
+    #[serde(rename = "regsRejected")]
+    pub regs_rejected: u64,
+    #[serde(rename = "challengesIssued")]
+    pub challenges_issued: u64,
+    #[serde(rename = "challengesRefused")]
+    pub challenges_refused: u64,
+    #[serde(rename = "proofRejected")]
+    pub proof_rejected: u64,
+    #[serde(rename = "pendingExpired")]
+    pub pending_expired: u64,
+    #[serde(rename = "admitTimeouts")]
+    pub admit_timeouts: u64,
+    #[serde(rename = "retrySent")]
+    pub retry_sent: u64,
+    #[serde(rename = "floodRefused")]
+    pub flood_refused: u64,
+    #[serde(rename = "proofCooldowns")]
+    pub proof_cooldowns: u64,
+    #[serde(rename = "dropTooLarge")]
+    pub drop_too_large: u64,
+    #[serde(rename = "dropSendBufferFull")]
+    pub drop_send_buffer_full: u64,
+    #[serde(rename = "dropUnregistered")]
+    pub drop_unregistered: u64,
+    #[serde(rename = "dropSrcRejected")]
+    pub drop_src_rejected: u64,
+    #[serde(rename = "streamsOpen")]
+    pub streams_open: u64,
+    #[serde(rename = "streamRefused")]
+    pub stream_refused: u64,
+    #[serde(rename = "streamsClosed")]
+    pub streams_closed: u64,
+    #[serde(rename = "streamBytesIn")]
+    pub stream_bytes_in: u64,
+    #[serde(rename = "streamBytesOut")]
+    pub stream_bytes_out: u64,
+}
+
+impl ServeQuicBits {
+    /// 出口快照 → 状态段（**唯一构造面**；字段一对一，加字段即此处编译红）。
+    pub fn from_snapshot(s: &homeway_quic::ExitQuicSnapshot) -> Self {
+        Self {
+            connections: s.connections,
+            admitted: s.admitted,
+            path_changes: s.path_changes,
+            handshake_failed: s.handshake_failed,
+            handshake_peer_closed: s.handshake_peer_closed,
+            handshakes_in_flight: s.handshakes_in_flight,
+            handshake_refused: s.handshake_refused,
+            conn_refused: s.conn_refused,
+            handshake_timeouts: s.handshake_timeouts,
+            regs_accepted: s.regs_accepted,
+            regs_rejected: s.regs_rejected,
+            challenges_issued: s.challenges_issued,
+            challenges_refused: s.challenges_refused,
+            proof_rejected: s.proof_rejected,
+            pending_expired: s.pending_expired,
+            admit_timeouts: s.admit_timeouts,
+            retry_sent: s.retry_sent,
+            flood_refused: s.flood_refused,
+            proof_cooldowns: s.proof_cooldowns,
+            drop_too_large: s.drop_too_large,
+            drop_send_buffer_full: s.drop_send_buffer_full,
+            drop_unregistered: s.drop_unregistered,
+            drop_src_rejected: s.drop_src_rejected,
+            streams_open: s.streams_open,
+            stream_refused: s.stream_refused,
+            streams_closed: s.streams_closed,
+            stream_bytes_in: s.stream_bytes_in,
+            stream_bytes_out: s.stream_bytes_out,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ServeStatusResult {
     pub enabled: bool,
@@ -396,6 +495,10 @@ pub struct ServeStatusResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub ddns: Option<Vec<serde_json::Value>>,
     pub intercept: ServeInterceptBits,
+    /// 出口 QUIC 面计数（M3 S2 的 additive 平级段；**面未起/未装配 = 整段缺席**——
+    /// 旧载荷与旧读者逐字节零影响）。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quic: Option<ServeQuicBits>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -724,6 +827,65 @@ mod tests {
         let b = response_body(7, Some(serde_json::json!({"seq": 42})), None);
         let s = serde_json::to_string(&b).unwrap();
         assert_eq!(s, r#"{"corr":7,"ok":true,"result":{"seq":42}}"#);
+    }
+
+    /// **判据（M3 S2：出口 `serve status --json` 的 `quic` 段，M2 交下的 L4 项）**：
+    /// ① 段未装配（`None`）⇒ **整段缺席**（旧载荷逐字节零影响）；
+    /// ② 段在 ⇒ 键集与出口快照字段**一对一**（`from_snapshot` 是唯一构造面）；
+    /// ③ 计数原样透传（判据：同一份 `ExitQuicSnapshot` 读两次的读数一致）。
+    #[test]
+    fn serve_status_quic_segment_is_additive_and_one_to_one() {
+        let mut r = ServeStatusResult {
+            enabled: true,
+            state: "running".to_owned(),
+            reason: None,
+            listen_port: Some(42641),
+            published: None,
+            token_mask: None,
+            endpoints: None,
+            peers: Vec::new(),
+            ddns: None,
+            intercept: ServeInterceptBits::default(),
+            quic: None,
+        };
+        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
+        assert!(v.get("quic").is_none(), "面未起 ⇒ 整段缺席：{v}");
+
+        let s = homeway_quic::ExitQuicSnapshot {
+            connections: 2,
+            admitted: 9,
+            handshake_failed: 3,
+            challenges_issued: 7,
+            regs_accepted: 5,
+            regs_rejected: 1,
+            streams_open: 4,
+            stream_refused: 2,
+            streams_closed: 3,
+            stream_bytes_in: 1024,
+            stream_bytes_out: 2048,
+            ..Default::default()
+        };
+        r.quic = Some(ServeQuicBits::from_snapshot(&s));
+        let v: serde_json::Value = serde_json::to_value(&r).unwrap();
+        let q = v.get("quic").expect("段在");
+        assert_eq!(q["connections"], 2);
+        assert_eq!(q["admitted"], 9);
+        assert_eq!(q["pathChanges"], 0, "缺省 0（字段一对一，不留洞）");
+        assert_eq!(q["streamsOpen"], 4);
+        assert_eq!(q["streamRefused"], 2);
+        assert_eq!(q["streamsClosed"], 3);
+        assert_eq!(q["streamBytesIn"], 1024);
+        assert_eq!(q["streamBytesOut"], 2048);
+        // 键数 = 快照字段数（加字段忘了映射 = 本断言红）
+        let n = q.as_object().unwrap().len();
+        assert_eq!(n, 28, "键数 = ExitQuicSnapshot 字段数（实得 {n}）：{q}");
+        // 反序列化回环（旧载荷无 quic 键也能读：additive）
+        let back: ServeStatusResult = serde_json::from_value(v).unwrap();
+        assert_eq!(back.quic.unwrap().streams_open, 4);
+        let legacy: ServeStatusResult =
+            serde_json::from_str(r#"{"enabled":true,"state":"running","peers":[],"intercept":{"dialOk":0,"dialFail":0,"reject":0,"flows":0}}"#)
+                .unwrap();
+        assert!(legacy.quic.is_none(), "旧载荷零影响");
     }
 
     #[test]

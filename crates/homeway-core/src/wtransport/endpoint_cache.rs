@@ -94,6 +94,18 @@ fn now_ms(t: SystemTime) -> i64 {
         .unwrap_or(0)
 }
 
+/// 缓存键归一（M2 代码门 G3，同类 D1）：v4-mapped 先归纯 v4。
+///
+/// 缓存键 = `HashMap<SocketAddr, _>` 的地址，且 `merge` 的 relay 位反查、verified
+/// 保护档、条数上限/投喂配额都按它比对：不归一时同一地址的 mapped/纯 v4 两形态各占
+/// 一条（双计配额、双倍条数，中继位反查失配 ⇒ 候选按直连裸发），`verified` 只打在
+/// 其中一种形态上。四个入口（`load` / `merge_disk` / `observe` / `mark_verified`）
+/// 统一走本函数 ⇒ **「缓存键恒为规范纯 v4/v6」是类型不变量**（Go 侧无此归一，
+/// 属有意收口：规范输入逐字同行为）。
+fn canon(addr: SocketAddr) -> SocketAddr {
+    crate::udpbatch::unmap_v4_in6(addr)
+}
+
 impl Default for EndpointCache {
     fn default() -> Self {
         Self::new()
@@ -151,6 +163,7 @@ impl EndpointCache {
         };
         for e in f.entries {
             if let Ok(ap) = e.endpoint.parse::<SocketAddr>() {
+                let ap = canon(ap);
                 self.entries.insert(
                     ap,
                     LearnedEndpoint {
@@ -239,6 +252,7 @@ impl EndpointCache {
         let Ok(f) = serde_json::from_slice::<CacheFile>(&raw) else { return };
         for e in f.entries {
             if let Ok(ap) = e.endpoint.parse::<SocketAddr>() {
+                let ap = canon(ap);
                 self.entries.entry(ap).or_insert(LearnedEndpoint {
                     addr: ap,
                     source: e.source.into(),
@@ -254,6 +268,7 @@ impl EndpointCache {
     /// 返回 false = 被**投喂配额**拒绝（F4：本窗口新增未验证地址超限；刷新已有条目
     /// 不计配额、永不被拒）。
     pub fn observe(&mut self, addr: SocketAddr, source: EndpointSource, now: SystemTime) -> bool {
+        let addr = canon(addr);
         if !self.feed_allows(addr, source, now) {
             return false;
         }
@@ -275,6 +290,7 @@ impl EndpointCache {
     /// 标记「该地址上完成过一次成功认证会话」（缺记录时补建）。verified 是保护档，
     /// 不受投喂配额约束。
     pub fn mark_verified(&mut self, addr: SocketAddr, source: EndpointSource, now: SystemTime) {
+        let addr = canon(addr);
         let ts = now_ms(now);
         let e = self.entries.entry(addr).or_insert(LearnedEndpoint {
             addr,
@@ -503,6 +519,59 @@ mod tests {
         // 未验证的满 TTL 即失效
         let stale = t0 + Duration::from_secs(7 * 24 * 3600 + 1);
         assert!(c.entries(stale).iter().all(|e| e.addr != addr(1)));
+    }
+
+    /// M2 代码门 G3（D1 同类）：缓存键归一——同一地址的 mapped / 纯 v4 两形态算
+    /// **一条**（键恒为规范纯 v4；不归一时双计投喂配额、双倍条数、verified 只打在
+    /// 其中一种形态上）。
+    #[test]
+    fn keys_normalize_v4_mapped() {
+        let mut c = EndpointCache::new();
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let pure: SocketAddr = "198.51.100.7:41641".parse().unwrap();
+        let mapped: SocketAddr = "[::ffff:198.51.100.7]:41641".parse().unwrap();
+        assert!(c.observe(mapped, EndpointSource::Hint, t0));
+        assert!(c.observe(pure, EndpointSource::Probe, t0), "同址刷新（非新增）永不被配额拒");
+        let list = c.entries(t0);
+        assert_eq!(list.len(), 1, "mapped 与纯 v4 同址必须一条");
+        assert_eq!(list[0].addr, pure, "键 = 规范纯 v4");
+        assert_eq!(list[0].source, EndpointSource::Hint, "Hint/Probe 同强度：来源不改写（原语义）");
+        // 强来源升级仍生效（同一条记录）
+        assert!(c.observe(mapped, EndpointSource::Inband, t0));
+        assert_eq!(c.entries(t0)[0].source, EndpointSource::Inband, "来源按强度升级");
+        // mark_verified 以 mapped 形态入参 ⇒ 打在同一条上
+        c.mark_verified(mapped, EndpointSource::Probe, t0 + Duration::from_secs(1));
+        let list = c.entries(t0 + Duration::from_secs(1));
+        assert_eq!(list.len(), 1);
+        assert!(list[0].verified(), "verified 打在规范键那一条上");
+        // 真 v6 原样（不归一）
+        let v6: SocketAddr = "[2001:db8::2]:41641".parse().unwrap();
+        assert!(c.observe(v6, EndpointSource::Hint, t0));
+        assert!(c.entries(t0).iter().any(|e| e.addr == v6));
+    }
+
+    /// G3 同类：读盘也归一（旧文件里的 mapped 条目归到规范键，与纯 v4 条目去重）。
+    #[test]
+    fn load_normalizes_v4_mapped_keys() {
+        let dir = std::env::temp_dir().join(format!("hw-epc-norm-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::create_dir_all(&dir);
+        let peer = crate::token::PeerId::from([0x22u8; 32]);
+        let hex = hex_encode(peer.as_bytes());
+        let t0 = UNIX_EPOCH + Duration::from_secs(1_000_000);
+        let raw = format!(
+            "{{\"peer\":\"{hex}\",\"entries\":[\
+             {{\"endpoint\":\"[::ffff:198.51.100.7]:41641\",\"source\":\"hint\",\"learnedAt\":{}}},\
+             {{\"endpoint\":\"198.51.100.7:41641\",\"source\":\"probe\",\"learnedAt\":{}}}]}}",
+            now_ms(t0),
+            now_ms(t0) + 1
+        );
+        std::fs::write(dir.join(format!("{hex}.json")), raw).unwrap();
+        let c = EndpointCache::open(&dir, peer);
+        let list = c.entries(t0 + Duration::from_secs(10));
+        assert_eq!(list.len(), 1, "mapped 与纯 v4 同址读盘后一条");
+        assert_eq!(list[0].addr, "198.51.100.7:41641".parse::<SocketAddr>().unwrap());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

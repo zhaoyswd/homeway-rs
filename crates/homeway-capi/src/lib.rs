@@ -287,6 +287,8 @@ fn probe_reach_report(
             .iter()
             .map(|ep| match ep.kind {
                 token::EndpointKind::Relay => format!("relay:{}", ep.addr),
+                // M1 起 QUIC 类端点（additive：既有两形态不变；App 只透传字符串）
+                token::EndpointKind::Quic => format!("quic:{}", ep.addr),
                 token::EndpointKind::Direct => ep.addr.clone(),
             })
             .collect(),

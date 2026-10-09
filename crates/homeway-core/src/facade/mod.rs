@@ -36,6 +36,9 @@ pub mod events;
 pub mod files_op;
 pub mod portfwd;
 pub mod probe_json;
+/// QUIC 档服务流拨号缝（M3 S3：虚拟端口 → STREAM tag；**本文件零 WG 引用**——
+/// 该事实是 S6 的机械断言面：QUIC 档服务流路径不得再可达 `stackb::`）。
+pub mod quic_stream;
 pub mod service_exec;
 pub mod service_op;
 pub mod speedtest_op;
@@ -94,6 +97,15 @@ pub struct TunConfigJson {
     pub token: String,
     #[serde(default)]
     pub port_forwards: Vec<portfwd::PortForwardRule>,
+    /// L3 承载档（M1 §4.1 的 config 面）：`"quic"`（缺省，缺键同义）| `"wg"`。
+    /// **世代级**（每次世代装配读一次；改后下次重建生效）；env `HOMEWAY_TRANSPORT`
+    /// 优先级更高。非法值 = 记行 + 按缺省（quic）走（见 `tun_exec::resolve_bearer`）。
+    #[serde(default)]
+    pub transport: String,
+    /// QUIC MTU 上限旋钮（M1 §12-① 的 config 面；0/缺键 = 缺省 1400，有效区间
+    /// [1320,1400]）。env `HOMEWAY_QUIC_MTU` 优先级更高。
+    #[serde(default)]
+    pub quic_mtu_cap: i64,
 }
 
 /// warmup 的类型化错误（工单⑤ r1-F27：字符串错误改枚举；code 即 tun_status 的
@@ -142,11 +154,19 @@ pub trait TunExecutor: Send + Sync {
     /// 请求世代收工（幂等信号；要能打断暖机中的阻塞调用）。
     fn request_stop(&self);
     /// 恢复阶梯入口（from 起跑档位；rc 契约见 session::LadderRc::as_rc）。
+    /// **M4 §5.3**：实现按 `l3_on_island()` 分档（岛档 = 快探+复探 ⇒ `0/-1`；见
+    /// `tun_exec::recover_downpush_on_island` 与 `ClientCore::tun_recover` 的 doc）。
     fn recover(&self, from: i64, cause: &str) -> i32;
     /// runner/transport 状态块（tunStatusJSON 的条件键源；None = 无 runner 期）。
     /// 健康位/分类在 `TunShared`（不走本 trait——世代共享面）。
     fn runner(&self) -> Option<RunnerIn>;
     fn transport(&self) -> Option<TransportIn>;
+    /// QUIC 岛快照段（M1 S3-2；**缺省 `None`** = 本世代非 quic 档/岛不在 ⇒ JSON 整段缺席）。
+    /// 为什么走 trait 而不是塞进 `RunnerIn`：设计 §4.3 定的是**平级段**（`quic{…}`），
+    /// 且它只在 quic 档存在——塞进 runner 会污染所有既有读者的键面。
+    fn quic_status(&self) -> Option<tun_status::QuicIn> {
+        None
+    }
     /// portfwd 整表热替换承载（默认 -1：无承载 = 改动随下次连接的 tunConfig 生效）。
     fn request_port_forwards(&self, _rules: Vec<portfwd::PortForwardRule>) -> i32 {
         -1
@@ -385,6 +405,7 @@ impl ClientCore {
             unhealthy_reason: (!why.is_empty()).then_some(why),
             runner: exec.runner(),
             transport: exec.transport(),
+            quic: exec.quic_status(),
         };
         tun_status::tun_status_json(&input)
     }
@@ -435,6 +456,16 @@ impl ClientCore {
     /// 恢复阶梯下推入口（from 钳位 R1..=R3；rc 契约见 facade 头注释）。cause 文案
     /// 用**档位名**（评审 r2-L6：`扩展下推(R1 重握手)`——会进 RECOVER 判据行，
     /// Go 同串）。
+    ///
+    /// **M4 §5.3 分档（登记 §8 行 13）**：执行体按 `l3_on_island()` 分档——
+    /// `true`（本世代 L3 真在岛上）⇒ 岛快探 + 一次复探 ⇒ **只产 `0/-1/-2`**
+    /// （`-3/-4` 在该世代不可达）；`false`（WG 档 / 岛未就的回落世代）⇒ WG 阶梯原路
+    /// （`-1/-3/-4` 仍可达）。
+    /// **`-2` 的构成（代码门 r21 F1 订正）**：**只**来自既有两条前置——「无世代」与「陈世代」
+    /// （`tun_exec.rs::recover` 的前两个 `return -2`），**不含**「岛不在/未 attach」：那种形态
+    /// `l3_on_island()==false` ⇒ 走 WG 原路（`-1/-3/-4`）——设计 §5.3 原文曾把 `-2` 写宽，
+    /// 已在 `docs/INTEROP-CRITERIA.md` 追加更正行（登记只可追加）。
+    /// tier 侧决策（`rc===0` 跳过整套重建 / 其余落重建）**不变**。
     pub fn tun_recover(&self, from: i64) -> i32 {
         let lvl = crate::session::recover::Level::clamp(from);
         self.executor()

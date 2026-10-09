@@ -13,6 +13,8 @@
 
 use std::io::{BufReader, BufWriter, Read, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
+
+use homeway_quic::ServiceIntake;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -190,17 +192,18 @@ impl SpeedtestServer {
 
     /// 可停形态（引擎收工面）。accept 错误分类/退避/节流日志走共享件
     /// `files_server::serve_stoppable_accepts`（F5：瞬态错误不再摘服务）。
-    pub fn serve_stoppable(self: &Arc<Self>, ln: UnixListener, stop: Arc<std::sync::atomic::AtomicBool>) -> std::io::Result<()> {
-        ln.set_nonblocking(true)?;
-        let accept = || {
-            ln.accept().map(|(conn, _)| {
-                let _ = conn.set_nonblocking(false);
-                conn
-            })
-        };
+    ///
+    /// **形参 M3 S2 起 = [`ServiceIntake`]**（设计 §2.2 方案 B′；同 `FilesServer`）：
+    /// 两源合一（UDS + QUIC stream 队列〔tag=3〕）；`ServiceIntake::from_listener` = 改前的
+    /// 单 UDS 形态。**本函数以下的服务本体一行不改**（应用层帧逐字节不变，§1.2）。
+    pub fn serve_stoppable(
+        self: &Arc<Self>,
+        intake: ServiceIntake,
+        stop: Arc<std::sync::atomic::AtomicBool>,
+    ) -> std::io::Result<()> {
         let logf = self.logf.clone();
         let r = crate::files_server::serve_stoppable_accepts(
-            accept,
+            || intake.accept(),
             move |conn| {
                 let srv = Arc::clone(self);
                 let logf = logf.clone();
@@ -886,6 +889,84 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// **M3 S2 判据（服务入口承载面）**：① 同一请求（未知角色 ⇒ 定型错误帧）经**两条入口**
+    /// （UDS / QUIC socketpair）的应答**逐字节相同**（「应用层零改动」的构造性钉法）；
+    /// ② 在册满 ⇒ **应用层 busy 报表在 intake 面仍可达**（第 13 条拿到 `"error":"busy"`）；
+    /// ③ 入口容量 = 在册上限 + K（装配点的算式与常量一致）。
+    #[test]
+    fn intake_two_sources_serve_identical_bytes_and_busy_stays_reachable() {
+        let dir = std::env::temp_dir().join(format!("homeway-rs-spintake-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("speedtest.sock");
+        let _ = std::fs::remove_file(&sock);
+        let ln = UnixListener::bind(&sock).unwrap();
+        let logf: crate::Logf = Arc::new(|_| {});
+        let srv = Arc::new(SpeedtestServer::new(Arc::clone(&logf)));
+
+        let capacity = homeway_quic::tuning::service_defaults::intake_capacity(MAX_CONNS);
+        assert_eq!(capacity, 16, "speedtest 入口容量 = 12 + 4（§8.2-16）");
+        let uds_intake = homeway_quic::ServiceIntake::from_listener(ln).unwrap();
+        let (quic_intake, tx) = homeway_quic::ServiceIntake::quic_only(capacity).unwrap();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        for intake in [uds_intake, quic_intake] {
+            let s2 = Arc::clone(&srv);
+            let st2 = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                let _ = s2.serve_stoppable(intake, st2);
+            });
+        }
+
+        // 同一请求（未知角色 ⇒ `finish_with_error` 定型帧）在两条入口上跑：字节对比
+        let bad = br#"{"role":"bogus","warmup_ms":0,"window_ms":100}"#;
+        let run = |mut c: UnixStream| -> Vec<u8> {
+            write_control(&mut c, TYPE_REQUEST, bad).unwrap();
+            let mut r = BufReader::new(c);
+            let f = read_frame(&mut r).expect("错误报表帧");
+            assert_eq!(f.0, TYPE_REPORT);
+            f.1
+        };
+        let c_uds = UnixStream::connect(&sock).unwrap();
+        let rep_uds = run(c_uds);
+        let (svc_end, cli_end) = UnixStream::pair().unwrap();
+        tx.try_enqueue(svc_end).expect("入队");
+        let rep_quic = run(cli_end);
+        assert_eq!(rep_quic, rep_uds, "两源同协议面：应答帧逐字节相同");
+        assert!(
+            String::from_utf8_lossy(&rep_quic).contains("未知角色"),
+            "内容面（防两源都回了空壳）：{}",
+            String::from_utf8_lossy(&rep_quic)
+        );
+
+        // ② 在册满（12 条经 intake 的会话挂着）⇒ 第 13 条走应用层 busy
+        let mut holders = Vec::new();
+        for _ in 0..MAX_CONNS {
+            let (svc_end, cli_end) = UnixStream::pair().unwrap();
+            tx.try_enqueue(svc_end).expect("入队");
+            holders.push(cli_end); // 不写请求：会话线程挂在读请求帧上（名额持住）
+        }
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while srv.live() < MAX_CONNS {
+            assert!(Instant::now() < deadline, "在册数未达上限：{}", srv.live());
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let (svc_end, cli_end) = UnixStream::pair().unwrap();
+        tx.try_enqueue(svc_end).expect("第 13 条入队（入口未满——在册闸先触发）");
+        let mut c = cli_end;
+        write_control(&mut c, TYPE_REQUEST, br#"{"role":"recv","warmup_ms":100,"window_ms":200}"#).unwrap();
+        let mut r = BufReader::new(c);
+        let rep = read_frame(&mut r).expect("busy 报表应到达");
+        assert_eq!(rep.0, TYPE_REPORT);
+        assert_eq!(
+            String::from_utf8(rep.1).unwrap(),
+            r#"{"bytes":0,"warmup_bytes":0,"wall_ms":0,"error":"busy"}"#,
+            "busy 报表逐字节（Go 字段序）"
+        );
+        assert_eq!(srv.stats.rejected.load(Ordering::Relaxed), 1, "计拒 1 条");
+        drop(holders);
+        stop.store(true, Ordering::Relaxed);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// busy 路径：占满并发后新连接回 error=busy（reply_then_close 形态）。
     #[test]
     fn busy_rejection() {
@@ -1053,7 +1134,9 @@ mod tests {
             let srv2 = Arc::clone(&srv);
             let stop2 = Arc::clone(&stop);
             std::thread::spawn(move || {
-                let _ = srv2.serve_stoppable(ln, stop2);
+                // M3 S2：形参换成两源入口；`from_listener` = 改前的单 UDS 形态（语义零改）
+                let intake = ServiceIntake::from_listener(ln).expect("入口");
+                let _ = srv2.serve_stoppable(intake, stop2);
             });
         }
         let mut c1 = UnixStream::connect(&sock).unwrap();

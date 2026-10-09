@@ -338,11 +338,17 @@ impl UnifiedRoles {
             inner.serve.clone()
         };
         let bits = engine.as_ref().map(|e| e.status_bits());
+        // M3 S2（M2 交下的 L4 项）：出口 QUIC 面计数**原子直读**（不占驱动线程）。
+        // 映射在核心侧的单源构造面 `ServeQuicBits::from_snapshot` 里（键表不在此另写）。
+        let quic = engine
+            .as_ref()
+            .and_then(|e| e.quic_snapshot())
+            .map(|s| homeway_core::daemon::proto::ServeQuicBits::from_snapshot(&s));
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
-        self.serve_status_inner(&mut inner, bits)
+        self.serve_status_inner(&mut inner, bits, quic)
     }
 
-    fn serve_status_inner(&self, inner: &mut RolesInner, bits: Option<(Vec<homeway_core::server::engine::EnginePeerBrief>, homeway_core::server::engine::EngineInterceptBits, Vec<homeway_core::server::ddnscheck::DdnsBrief>)>) -> ServeStatusResult {
+    fn serve_status_inner(&self, inner: &mut RolesInner, bits: Option<(Vec<homeway_core::server::engine::EnginePeerBrief>, homeway_core::server::engine::EngineInterceptBits, Vec<homeway_core::server::ddnscheck::DdnsBrief>)>, quic: Option<homeway_core::daemon::proto::ServeQuicBits>) -> ServeStatusResult {
         // token 掩码/端点 = 台账末行（reveal 纪律：status 族只见掩码）。
         let st = homeway_core::server::state::State::open(&self.state_dir.join("serve")).ok();
         let last = st.and_then(|s| s.last_token().ok().flatten());
@@ -357,6 +363,7 @@ impl UnifiedRoles {
                     peer_id: &t.peer_id,
                     secret: &t.secret,
                     endpoints: &eps_ref,
+                    rpk: t.rpk.as_ref(),
                 })
                 .unwrap_or_default();
                 let eps = t
@@ -416,6 +423,8 @@ impl UnifiedRoles {
                     .collect::<Vec<_>>()
             }),
             intercept,
+            // M3 S2：出口 QUIC 面计数段（additive；面未起/未装配 = None ⇒ 整段缺席）
+            quic,
         }
     }
 }
@@ -941,6 +950,7 @@ impl RoleHost for UnifiedRoles {
                     peer_id: &tok.peer_id,
                     secret: &tok.secret,
                     endpoints: &eps_ref,
+                    rpk: tok.rpk.as_ref(),
                 })
                 .map_err(|e| BackendErr::Other(format!("token 编码失败：{e}")))?;
                 let eps: Vec<String> =

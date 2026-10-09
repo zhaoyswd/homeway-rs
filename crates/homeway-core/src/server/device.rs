@@ -339,6 +339,18 @@ impl Device {
             .map(|(k, _)| *k)
     }
 
+    /// 目的地址是否命中某设备的 **`tun_ip`**（`hw-app` 派生地址；M1 出站分流的 QUIC 档键，
+    /// 设计 §1.5）。返回持有该地址的 peer 公钥；`tunnel_ip`（服务面自带连接）**不**命中。
+    ///
+    /// 与 `route_out` 分开是为了让「tun_ip ⇒ QUIC / tunnel_ip ⇒ WG」这条分界有一处**唯一**
+    /// 的判定（地址语义真源 = `tunnel_addr.rs` 的两个派生函数）。
+    pub fn tun_ip_owner(&self, dst: &Ipv4Addr) -> Option<[u8; 32]> {
+        self.peers
+            .iter()
+            .find(|(_, p)| &p.tun_ip == dst)
+            .map(|(k, _)| *k)
+    }
+
     /// 对指定 peer 封装一个明文包（keepalive 用空载荷调用）。
     fn encap_peer(&mut self, key: &[u8; 32], plain: &[u8], out: &mut InboundOut) {
         let step = {

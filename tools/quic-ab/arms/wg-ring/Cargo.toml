@@ -1,0 +1,23 @@
+[package]
+name = "quic-ab-wg-ring"
+version.workspace = true
+edition.workspace = true
+
+# 诊断臂：boringtun 0.6 + crates.io **真 ring**（上游 asm）。
+# 注意：本 workspace 无 [patch] ⇒ ring 解析到 crates.io 的真版本（不是 tools/ring-shim）。
+# 实测该臂的 ring = **0.16.20**（boringtun 0.6 自身声明 ring 0.16；M0 设计 §0.3 订正 1：
+# 早期文档把本臂写成"ring 0.17"是错的）。确认命令见 tools/quic-ab/README.md。
+# profile 一律写在 workspace 根（arms/Cargo.toml）——非根 [profile] 会被 cargo 忽略。
+[dependencies]
+boringtun = "0.6"
+x25519-dalek = { version = "=2.0.0-rc.3", features = ["static_secrets", "reusable_secrets"] }
+libc = "0.2"
+quic-ab-common = { path = "../common" }
+
+[[bin]]
+name = "wg"
+path = "src/main.rs"
+
+[[bin]]
+name = "wg_size"
+path = "src/bin/wg_size.rs"
