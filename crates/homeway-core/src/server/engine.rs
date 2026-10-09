@@ -2600,7 +2600,23 @@ mod tests {
         assert!(quic.contains(&"203.0.113.7:42652"), "公网 QUIC 端点：{quic:?}");
         // M5：LAN 端点与 quic_pub 都走 QUIC 端口；已公布公网端点（published）也归 QUIC 类
         // （其端口在生产路径 = 同一 QUIC 端口；本用例的输入 42650 是显式给的字面值）
-        assert!(quic.contains(&"192.168.3.12:42652"), "LAN QUIC 端点用 QUIC 端口：{quic:?}");
+        // ⚠️ LAN 地址**不得写死**（开发机 192.168.3.12 / CI 10.1.0.126 各异）：断言
+        // 「存在一个 Quic 类端点，端口 = QUIC 端口，且既非回环也非已公布公网端点」。
+        let lan_quic: Vec<&str> = t
+            .endpoints
+            .iter()
+            .filter(|e| {
+                e.kind == EndpointKind::Quic
+                    && e.addr.ends_with(":42652")
+                    && e.addr != "203.0.113.7:42652"
+                    && !e.addr.starts_with("127.")
+            })
+            .map(|e| e.addr.as_str())
+            .collect();
+        assert!(
+            !lan_quic.is_empty(),
+            "须有 LAN QUIC 端点（非回环、非已公布；用 QUIC 端口 42652）：{quic:?}"
+        );
         assert!(quic.contains(&"203.0.113.7:42650"), "已公布公网端点入 QUIC 类：{quic:?}");
         // M5：Direct 类端点整体退役（WG 端口不存在）——铸出的 token 里零命中
         assert!(
