@@ -69,6 +69,9 @@ run_one island_uses_relay_and_pushes_traffic_through_tun "$RES/relay-e2e.log" ||
 run_one generation_l3_rides_quic_datagram_against_local_exit "$RES/generation-e2e.log" || rc=1
 # M3 S2：**服务流**（tag=1 files）经真出口分发 → intake → 泵 → 真 FilesServer
 run_one service_stream_files_over_quic_against_local_exit "$RES/service-stream-e2e.log" || rc=1
+# M3 S3：**客户端换轨**——App 核形态（真世代 + 隧道桥）的 files 请求经 STREAM 端到端；
+# 负判据 = 本轮出口日志零 `intercept: tcp exempt …:7802`（服务流不再走 WG 服务腿）
+run_one service_stream_rides_quic_through_app_core_bridge_against_local_exit "$RES/app-core-service-e2e.log" || rc=1
 
 # 出口侧本轮新增行（含 `peer: +` / `quic: 连接采纳` / `quic: 路径变更` / `quic: 服务流*`）
 tail -n +"$((LOG0 + 1))" "$EXIT_LOG" > "$RES/exit-lines.txt" 2>/dev/null || true
@@ -80,14 +83,16 @@ fi
   echo "# M1 S2b/S3-1 岛侧端到端读数（$(date '+%F %T')）"
   echo "# 出口实例 = $EXIT_STATE（日志：$EXIT_LOG）；中继实例 = $RELAY_STATE（日志：$RELAY_LOG）"
   echo "# 拓扑：岛(quic 客户端) → Rust 中继 127.0.0.1:$((42780 + n)) → Rust 出口（挂中继腿）"
-  echo "## 用例结论（run_one 汇总 exit code = $rc；0 = 三条都过）"
-  grep -E "^\[e2e|^test |^test result" "$RES/island-e2e.log" "$RES/relay-e2e.log" 2>/dev/null || true
+  echo "## 用例结论（run_one 汇总 exit code = $rc；0 = 五条都过）"
+  grep -E "^\[e2e|^test |^test result" "$RES/island-e2e.log" "$RES/relay-e2e.log" \
+    "$RES/generation-e2e.log" "$RES/service-stream-e2e.log" "$RES/app-core-service-e2e.log" 2>/dev/null || true
   echo "## 出口侧证据行（本轮新增）"
   grep -E "peer: \+|quic: 连接采纳|quic: 路径变更|quic: 端点就绪|中继控制面|transit" "$RES/exit-lines.txt" 2>/dev/null || true
   echo "## 中继侧行（本轮新增；腿/会话/丢弃）"
   grep -E "中继|会话|腿|丢弃|转发" "$RES/relay-lines.txt" 2>/dev/null | tail -20 || true
-  echo "## 岛侧判据行（S2a + S2b）"
-  grep -hE "quic: |island\]" "$RES/island-e2e.log" "$RES/relay-e2e.log" "$RES/generation-e2e.log" 2>/dev/null | grep -v "^\[e2e" | head -60 || true
+  echo "## 岛侧判据行（S2a + S2b + S3-1 + M3 S2/S3）"
+  grep -hE "quic: |island\]" "$RES/island-e2e.log" "$RES/relay-e2e.log" "$RES/generation-e2e.log" \
+    "$RES/service-stream-e2e.log" "$RES/app-core-service-e2e.log" 2>/dev/null | grep -v "^\[e2e" | head -80 || true
 } > "$RES/SUMMARY.txt"
 
 echo "==> 读数落 $RES/（SUMMARY.txt / island-e2e.log / relay-e2e.log / exit-lines.txt / relay-lines.txt）"

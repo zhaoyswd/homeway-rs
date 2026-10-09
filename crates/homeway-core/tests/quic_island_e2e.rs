@@ -859,3 +859,163 @@ fn service_stream_files_over_quic_against_local_exit() {
 fn hex4(dev: &[u8]) -> String {
     dev.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
+
+// ---------------------------------------------------------------------------
+// M3 S3：**客户端换轨**——App 核的服务流经 STREAM（隧道桥 DialFn 换实现）
+// ---------------------------------------------------------------------------
+
+/// 桥 UDS 上读一行（有界：到上界未出 `\n` ⇒ 空串——用例据此判失败而不挂死）。
+fn read_bridge_line(c: &mut std::os::unix::net::UnixStream, wait: Duration) -> Vec<u8> {
+    use std::io::Read as _;
+    c.set_read_timeout(Some(wait)).ok();
+    let mut acc: Vec<u8> = Vec::new();
+    let mut buf = [0u8; 4096];
+    while !acc.contains(&b'\n') {
+        match c.read(&mut buf) {
+            Ok(0) => break,
+            Ok(n) => acc.extend_from_slice(&buf[..n]),
+            Err(_) => break, // 读超时/连接断：交调用方按「已收 N B」判
+        }
+    }
+    acc
+}
+
+/// **M3 S3 判据（服务流经 STREAM 的 App 核端到端）**：`transport=quic` 的**真世代**
+/// （`TunnelExec` prepare → `tun_attach` → 隧道桥起）里，App 形态的 files 请求
+/// （`<identityDir>/bridge/files.sock` + 鉴权首包 + `{"op":"list"}` 行）**经 QUIC STREAM
+/// 端到端**走通：
+/// ①桥问候行/应答行逐字节（files 协议零改动）；②出口新增 `quic: 服务流已受理（tag=files`
+/// （E-q5）；③核日志有岛侧 `quic: 服务流已开（tag=files`；④**负判据**——本轮出口日志
+/// **不再出现** WG 服务腿的 `intercept: tcp exempt …:7802`（换轨的事实面：服务流没走栈 B）；
+/// ⑤世代未回落 WG（`quic: 隧道侧就绪（L3 直通；` 在场、`本世代回落 WG 承载` 不在）。
+#[test]
+#[ignore = "端到端（App 核服务流 over QUIC）：需本地 QUIC 出口在跑（tools/quic-island-e2e.sh 驱动）"]
+fn service_stream_rides_quic_through_app_core_bridge_against_local_exit() {
+    use homeway_core::facade::bridge_host::bridge_client_auth;
+    use homeway_core::facade::demand::DemandSignals;
+    use homeway_core::facade::tun_exec::TunnelExec;
+    use homeway_core::facade::ClientCore;
+    use std::io::Write as _;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::net::{UnixDatagram, UnixStream};
+
+    let token_str = std::env::var("HOMEWAY_ISLAND_E2E_TOKEN").expect("须给 HOMEWAY_ISLAND_E2E_TOKEN");
+    let exit_log = PathBuf::from(
+        std::env::var("HOMEWAY_ISLAND_E2E_EXIT_LOG").expect("须给 HOMEWAY_ISLAND_E2E_EXIT_LOG"),
+    );
+    let log0 = log_lines(&exit_log);
+
+    let dir = std::env::temp_dir().join(format!("hw-m3s3-bridge-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("临时目录可建");
+    let out = dir.join("gen.log");
+    let ident_dir = dir.join("identity");
+    let _ = std::fs::remove_file(&out);
+    let cfg = format!(
+        r#"{{"token":"{token_str}","out":"{}","identityDir":"{}","transport":"quic"}}"#,
+        out.display(),
+        ident_dir.display()
+    );
+    let demand = std::sync::Arc::new(DemandSignals::new());
+    let exec = TunnelExec::new(std::sync::Arc::clone(&demand));
+    let core = std::sync::Arc::new(ClientCore::with_shared(exec, demand));
+    assert_eq!(core.tun_prepare(&cfg, true), 0, "prepare 受理");
+    let deadline = Instant::now() + WAIT;
+    while !core.tun_status().contains("\"state\":\"ready\"") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(core.tun_status().contains("\"state\":\"ready\""), "世代须 ready");
+
+    let (tun, _peer) = UnixDatagram::pair().expect("socketpair(DGRAM)");
+    assert_eq!(core.tun_attach(tun.as_raw_fd(), 1280), 0, "attach 受理");
+    let deadline = Instant::now() + WAIT;
+    while !core.tun_status().contains("\"state\":\"attached\"") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(core.tun_status().contains("\"state\":\"attached\""), "世代须 attached（桥随之起）");
+
+    // 世代日志：QUIC 档在场（判据 ⑤ 的前半）
+    let log = std::fs::read_to_string(&out).unwrap_or_default();
+    assert!(log.contains("quic: 隧道侧就绪（L3 直通；"), "QUIC 档须在场：{log}");
+    assert!(!log.contains("本世代回落 WG 承载"), "本用例不得回落 WG：{log}");
+
+    // ① 桥面（状态 JSON 的 bridgeAuth/bridgeFilesSock）
+    let v: serde_json::Value = serde_json::from_str(&core.tun_status()).expect("tun_status 是 JSON");
+    let auth = v["bridgeAuth"].as_str().unwrap_or_default().to_owned();
+    let files_sock = v["bridgeFilesSock"].as_str().unwrap_or_default().to_owned();
+    assert!(!auth.is_empty() && !files_sock.is_empty(), "桥须在场：{v}");
+    // M3 S5 的正向面：本世代准入成功 ⇒ 快照归因两字段保持空（0/空串）
+    let q = v.get("quic").expect("quic 段须在场（本世代 quic 档）");
+    assert_eq!(q["admit_reject_code"], 0, "准入成功不得留准入码：{q}");
+    assert_eq!(q["admit_reject_text"], "", "准入成功不得留短语：{q}");
+    println!("[e2e5] bridge.files_sock={files_sock}");
+
+    let mut c = UnixStream::connect(&files_sock).expect("连 files 桥");
+    bridge_client_auth(&mut c, &auth).expect("桥鉴权首包可写");
+    let greet = read_bridge_line(&mut c, WAIT);
+    assert!(greet.ends_with(b"\n"), "问候行须完整收到（App 核服务流经 STREAM）");
+    let g: serde_json::Value = serde_json::from_slice(&greet).expect("问候行是 JSON");
+    assert_eq!(g["ok"], serde_json::json!(true), "问候：{g}");
+    assert_eq!(g["ver"], serde_json::json!(1), "files 协议版本：{g}");
+    println!("[e2e5] bridge.greeting={}", String::from_utf8_lossy(&greet).trim_end());
+
+    let mut req = br#"{"op":"list","path":""}"#.to_vec();
+    req.push(b'\n');
+    c.write_all(&req).expect("写 list 请求行");
+    let resp = read_bridge_line(&mut c, WAIT);
+    let r: serde_json::Value = serde_json::from_slice(&resp).expect("应答行是 JSON");
+    assert_eq!(r["ok"], serde_json::json!(true), "list 应答：{r}");
+    assert!(r["entries"].is_array(), "list 应答须带 entries：{r}");
+    println!(
+        "[e2e5] bridge.list_entries={}",
+        r["entries"].as_array().map(|a| a.len()).unwrap_or(0)
+    );
+    drop(c);
+
+    // ② 出口 E-q5 行（真出口上的 tag 分发）。**节流面**（首 3 + 每 100，同一出口实例
+    // 被本脚本的多个用例共享）⇒ 受理/结束**至少一条**在场即可（两条都被压时打印说明，
+    // 真正的判据是上面的字节路径 + 下面的负判据——它们不依赖日志节流）。
+    let accepted = wait_log_from(&exit_log, log0, "服务流已受理（tag=files", None, WAIT);
+    let closed = wait_log_from(&exit_log, log0, "服务流结束（tag=files", Some("↑"), WAIT);
+    assert!(
+        accepted.is_some() || closed.is_some(),
+        "出口须有本流的受理/结束行（节流窗内两条都被压时也应至少一条在场）"
+    );
+    println!(
+        "[e2e5] exit.accepted_line={}",
+        accepted.clone().unwrap_or_else(|| "（节流窗内被压）".into())
+    );
+    println!(
+        "[e2e5] exit.closed_line={}",
+        closed.clone().unwrap_or_else(|| "（节流窗内被压）".into())
+    );
+
+    // ③ 核日志的岛侧开流行
+    let opened = std::fs::read_to_string(&out)
+        .unwrap_or_default()
+        .lines()
+        .find(|l| l.contains("服务流已开（tag=files"))
+        .unwrap_or("（无开流行）")
+        .to_owned();
+    assert!(opened.contains("tag=files"), "核须记岛侧开流行：{opened}");
+    println!("[e2e5] core.opened_line={opened}");
+
+    // ④ 负判据：本轮出口日志**不得**出现 WG 服务腿的 exempt 行（换轨的事实面）
+    let new_lines: Vec<String> = std::fs::read_to_string(&exit_log)
+        .unwrap_or_default()
+        .lines()
+        .skip(log0)
+        .map(str::to_owned)
+        .collect();
+    let exempt: Vec<&String> = new_lines
+        .iter()
+        .filter(|l| l.contains("intercept: tcp exempt") && l.contains(":7802"))
+        .collect();
+    assert!(
+        exempt.is_empty(),
+        "QUIC 档服务流不得再经 WG 服务腿（exempt 行零命中），实得：{exempt:?}"
+    );
+    println!("[e2e5] exit.exempt_lines=0（换轨负判据）");
+
+    let _ = core.tun_stop();
+    println!("[e2e5] done");
+}
