@@ -61,6 +61,25 @@ fn drain_until(rx: &Receiver<String>, needle: &str, wait: Duration) -> Vec<Strin
     panic!("日志未在 {wait:?} 内出现「{needle}」（已收 {} 行：{lines:?}）", lines.len());
 }
 
+/// 有界收行（**异步轮询版**：本测试的客户端 quinn 端点驱动跑在同一枚 `current_thread`
+/// runtime 上——用阻塞版 `drain_until` 会把驱动一起冻住，「客户端刚写的字节还没上线」的
+/// 假红就出来了）。
+async fn drain_until_async(rx: &Receiver<String>, needle: &str, wait: Duration) -> Vec<String> {
+    let deadline = Instant::now() + wait;
+    let mut lines = Vec::new();
+    while Instant::now() < deadline {
+        while let Ok(line) = rx.try_recv() {
+            let hit = line.contains(needle);
+            lines.push(line);
+            if hit {
+                return lines;
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("日志未在 {wait:?} 内出现「{needle}」（已收 {} 行：{lines:?}）", lines.len());
+}
+
 /// 有界收行（**不要求命中**——「此窗口内不得出现 X」类断言用；到点即返已收行）。
 fn collect_for(rx: &Receiver<String>, wait: Duration) -> Vec<String> {
     let deadline = Instant::now() + wait;
@@ -3049,31 +3068,325 @@ async fn service_stream_intake_full_resets_0x23_with_depth() {
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
 
-/// **判据（§2.1 的 dial 本期限定）**：tag=4 + 6B `[4B IPv4][2B BE port]` ⇒ 出口**读得出
-/// 目标**（协议面成立，M4 换轨不再改帧）但仍 `reset(0x22)`；归因行带目标。
+/// **判据（M4 §3.2 的第 ④–⑦ 步：真拨号成功 + 回执 + 半关双向 + 计数/行）**：
+/// tag=4 + 6B 目标（本机回环上的真 echo）⇒ 出口读得出目标 ⇒ **真拨通** ⇒ 客户端首字节 =
+/// `DIAL_OK(0x01)` ⇒ 双向字节逐字往返；客户端 FIN ⇒ 目标见 EOF（半关传播）；目标半关 ⇒
+/// 客户端读 EOF（**FIN 不是 reset**）；`stream_bytes_*` **不含 1B 回执**；受理行/结束行逐字。
 #[tokio::test]
-async fn service_stream_dial_reads_target_then_refuses_0x22() {
+async fn service_stream_dial_ok_echo_round_trip_and_half_close() {
+    // 真 echo 目标（本机回环；`127.0.0.1` = 「出口本机」语义位，§1.3）
+    let (target_addr, target_rx) = spawn_echo_target();
     let (quic, rx, _client, conn, _stub, _pubkey, _dev) =
-        exit_with_intakes(0x63, crate::ServiceIntakes::default()).await;
-    let dst: std::net::SocketAddrV4 = "100.64.9.7:7802".parse().unwrap();
+        exit_with_intakes(0x65, crate::ServiceIntakes::default()).await;
     let (mut s, mut r) = conn.open_bi().await.expect("open_bi");
     s.write_all(&[4]).await.expect("tag=dial");
-    s.write_all(&crate::stream::dial_target(dst)).await.expect("6B 目标");
-    let e = r.read_chunk(32, true).await.expect_err("dial 本期一律拒");
+    s.write_all(&crate::stream::dial_target(target_addr))
+        .await
+        .expect("6B 目标");
+
+    // ⑤ 回执先于任何目标字节（首字节 = DIAL_OK）
+    let first = tokio::time::timeout(WAIT, r.read_chunk(64, true))
+        .await
+        .expect("回执必须到达")
+        .expect("不得是错误")
+        .expect("有数据");
+    assert_eq!(first.bytes[0], crate::stream::DIAL_OK, "首字节 = 拨号成功回执");
+    let mut got = first.bytes[1..].to_vec();
+
+    // 双向往返（帧后即裸字节）
+    s.write_all(b"ping-forward").await.expect("上行");
+    let deadline = Instant::now() + WAIT;
+    while got.len() < "ping-forward".len() && Instant::now() < deadline {
+        let c = tokio::time::timeout(WAIT, r.read_chunk(64, true))
+            .await
+            .expect("下行")
+            .expect("不得是错误")
+            .expect("有数据");
+        got.extend_from_slice(&c.bytes);
+    }
+    assert_eq!(got, b"ping-forward", "回显逐字节（回执后的裸字节流）");
+
+    // 客户端 FIN ⇒ 目标侧 read 见 EOF（半关传播；`copy(recv → tcp_w)` 的 `shutdown(WRITE)`）
+    s.finish().expect("客户端 FIN");
+    let (up, saw_eof) = await_echo_target(&target_rx, WAIT).await;
+    assert_eq!(up, b"ping-forward", "目标侧收到上行逐字节");
+    assert!(saw_eof, "客户端 FIN ⇒ 目标侧读到 EOF（半关传播）");
+    // 目标侧半关（WRITE）⇒ 客户端读 EOF（FIN 语义，**不是 reset**）
+    let tail = tokio::time::timeout(WAIT, r.read_chunk(8, true))
+        .await
+        .expect("目标半关后应读得 EOF")
+        .expect("不得是错误（收线走 FIN，§1.3）");
+    assert!(tail.is_none(), "EOF ⇒ Ok(None)：{tail:?}");
+
+    assert!(
+        wait_until(|| quic.snapshot().streams_closed == 1, WAIT).await,
+        "泵应在两侧收线后收工"
+    );
+    let snap = quic.snapshot();
+    assert_eq!(snap.streams_open, 1, "受理 1 条（受理语义 = 拨号成功）：{snap:?}");
+    assert_eq!(snap.stream_refused, 0, "无拒入：{snap:?}");
+    // 字节账口径（§3.3 写死）：`stream_bytes_*` = **泵搬运的字节**，**不含 1B 回执**
+    assert_eq!(snap.stream_bytes_in, 12, "↑ = ping-forward（不含回执）");
+    assert_eq!(snap.stream_bytes_out, 12, "↓ = 目标回显（不含回执）");
+    let lines = collect_for(&rx, Duration::from_millis(400));
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("服务流已受理（tag=dial") && l.contains("dev=")),
+        "受理行（语义 = 拨号成功）：{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("服务流结束（tag=dial") && l.contains("↑12B ↓12B")),
+        "结束行（含逐向字节）：{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.contains("服务流目标侧中断")),
+        "正常 FIN 收口不得产「目标侧中断」行：{lines:?}"
+    );
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（§3.2 第 ④ 步失败面：未监听目标 ⇒ `0x25`）**：回环上的死端口 ⇒ 出口
+/// `ECONNREFUSED` ⇒ `reset(0x25)` + 拒行（带 errno 原文）；**不写回执**（客户端读到的
+/// 是 reset 而不是 `0x01`）。
+#[tokio::test]
+async fn service_stream_dial_dead_target_resets_0x25_with_errno() {
+    let dead = free_loopback_addr();
+    let (quic, rx, _client, conn, _stub, _pubkey, _dev) =
+        exit_with_intakes(0x66, crate::ServiceIntakes::default()).await;
+    let (mut s, mut r) = conn.open_bi().await.expect("open_bi");
+    s.write_all(&[4]).await.expect("tag=dial");
+    s.write_all(&crate::stream::dial_target(dead))
+        .await
+        .expect("6B 目标");
+    let e = r.read_chunk(32, true).await.expect_err("死目标 ⇒ 必须被 reset");
     match e {
         quinn::ReadError::Reset(code) => {
-            assert_eq!(code.into_inner(), 0x22, "复位码 = SERVICE_DISABLED（M3 只定协议）")
+            assert_eq!(code.into_inner(), 0x25, "复位码 = DIAL_REFUSED")
         }
-        other => panic!("期望 Reset(0x22)，实得 {other:?}"),
+        other => panic!("期望 Reset(0x25)，实得 {other:?}"),
     }
     let lines = drain_until(&rx, "服务流拒", WAIT);
     assert!(
         lines.iter().any(|l| l.contains("tag=dial")
-            && l.contains("100.64.9.7:7802")
-            && l.contains("0x22")),
-        "dial 归因行须带解析出的目标：{lines:?}"
+            && l.contains(&format!("目标拨号失败（{dead}："))
+            && l.contains("0x25")),
+        "拒行须带目标与 errno 原文：{lines:?}"
+    );
+    let snap = quic.snapshot();
+    assert_eq!(snap.stream_refused, 1, "计拒 1 条：{snap:?}");
+    assert_eq!(snap.streams_open, 0, "失败拨号不记受理：{snap:?}");
+    assert_eq!(snap.stream_bytes_in, 0, "无字节搬运：{snap:?}");
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（A8 判定表：拒入类 ⇒ `0x25` + why 逐字）**：五类拒入（未指定 / 本网络 /
+/// 受限广播 / 组播 / 端口 0）各自在**拨号之前**被拒——why 串来自 `DialAddrClass::text()`
+/// 单源；**透传类（含私网/回环）不得被拒**（那一条由 echo 用例与 `dial.rs` 的单测覆盖）。
+#[tokio::test]
+async fn service_stream_dial_rejects_a8_classes_before_connecting() {
+    let (quic, rx, _client, conn, _stub, _pubkey, _dev) =
+        exit_with_intakes(0x67, crate::ServiceIntakes::default()).await;
+    let cases = [
+        ("0.0.0.0:1", "未指定 0.0.0.0"),
+        ("0.1.2.3:1", "本网络 0/8"),
+        ("255.255.255.255:1", "受限广播 255.255.255.255"),
+        ("224.0.0.1:1", "组播 224/4"),
+        ("127.0.0.1:0", "端口 0 不是可拨端口"),
+    ];
+    for (addr, _why) in cases {
+        let dst: std::net::SocketAddrV4 = addr.parse().expect("测试地址可解");
+        let (mut s, mut r) = conn.open_bi().await.expect("open_bi");
+        s.write_all(&[4]).await.expect("tag=dial");
+        s.write_all(&crate::stream::dial_target(dst))
+            .await
+            .expect("6B 目标");
+        let e = r.read_chunk(32, true).await.expect_err("拒入类必须被 reset");
+        match e {
+            quinn::ReadError::Reset(code) => {
+                assert_eq!(code.into_inner(), 0x25, "{addr} 的复位码")
+            }
+            other => panic!("{addr}：期望 Reset(0x25)，实得 {other:?}"),
+        }
+    }
+    let lines = collect_for(&rx, Duration::from_millis(300));
+    // **记行节流**（`log_due` = 首 3 + 每 100）⇒ 只有前三类有行；后两类的 why 由
+    // `exit/dial.rs` 的 `a8_address_table_row_by_row` 覆盖（协议面已逐行钉住）。
+    for (addr, why) in cases.iter().take(3) {
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("目标地址类不可拨") && l.contains(why) && l.contains(addr)),
+            "{addr} 的拒行须带 why「{why}」：{lines:?}"
+        );
+    }
+    assert_eq!(
+        lines.iter().filter(|l| l.contains("0x25")).count(),
+        3,
+        "记行节流口径（首 3 有声）：{lines:?}"
+    );
+    let snap = quic.snapshot();
+    assert_eq!(snap.stream_refused, cases.len() as u64, "五类各计一拒：{snap:?}");
+    assert_eq!(snap.streams_open, 0, "拒入不记受理：{snap:?}");
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（§3.2 第 ② 步的失败面：目标帧读不出 ⇒ `0x25` + 拒行）**：只发 tag 就收线 ⇒
+/// 「目标帧未读出」拒行（why 与其余两条可区分）；`read_exact` 的 `FinishedEarly` 形态。
+#[tokio::test]
+async fn service_stream_dial_short_frame_resets_0x25() {
+    let (quic, rx, _client, conn, _stub, _pubkey, _dev) =
+        exit_with_intakes(0x68, crate::ServiceIntakes::default()).await;
+    let (mut s, mut r) = conn.open_bi().await.expect("open_bi");
+    s.write_all(&[4, 1, 2]).await.expect("tag + 半截目标帧");
+    s.finish().expect("对端收线（帧不完整）");
+    let e = r.read_chunk(32, true).await.expect_err("短帧 ⇒ 必须被 reset");
+    match e {
+        quinn::ReadError::Reset(code) => {
+            assert_eq!(code.into_inner(), 0x25, "复位码 = DIAL_REFUSED")
+        }
+        other => panic!("期望 Reset(0x25)，实得 {other:?}"),
+    }
+    let lines = drain_until(&rx, "服务流拒", WAIT);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("tag=dial") && l.contains("目标帧未读出") && l.contains("0x25")),
+        "短帧拒行：{lines:?}"
     );
     assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（§3.3 的 additive 可观测面：目标侧异常结束 ⇒ 出口行）**：目标在读走上行后
+/// **带 `SO_LINGER(0)` 关闭**（= RST）⇒ 出口下行方向读错误 ⇒ `finish()` 收口 +
+/// **「目标侧中断」行**（客户端对白名单外复位码/FIN 都归 EOF ⇒ 这条行是把可观测面拉回
+/// 出口的唯一手段）。
+#[tokio::test]
+async fn service_stream_dial_target_reset_logs_the_additive_line() {
+    let (target_addr, _target_rx) = spawn_rst_target();
+    let (quic, rx, _client, conn, _stub, _pubkey, _dev) =
+        exit_with_intakes(0x69, crate::ServiceIntakes::default()).await;
+    let (mut s, mut r) = conn.open_bi().await.expect("open_bi");
+    s.write_all(&[4]).await.expect("tag=dial");
+    s.write_all(&crate::stream::dial_target(target_addr))
+        .await
+        .expect("6B 目标");
+    let first = tokio::time::timeout(WAIT, r.read_chunk(64, true))
+        .await
+        .expect("回执必须到达")
+        .expect("不得是错误")
+        .expect("有数据");
+    assert_eq!(first.bytes[0], crate::stream::DIAL_OK, "拨号成功回执");
+    // 目标在收到上行数据后立刻 RST ⇒ 出口下行读到 ECONNRESET
+    s.write_all(b"boom").await.expect("上行触发目标 RST");
+    let lines = drain_until_async(&rx, "服务流目标侧中断", WAIT).await;
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("tag=dial") && l.contains("down 方向")),
+        "目标侧中断行（additive）：{lines:?}"
+    );
+    // 客户端侧读得 EOF（finish 收口；白名单外 / FIN 都归 EOF）
+    let tail = tokio::time::timeout(WAIT, r.read_chunk(8, true))
+        .await
+        .expect("目标 RST 后客户端应读得 EOF")
+        .expect("不得是 typed 错误（出口用 finish 收口）");
+    assert!(tail.is_none(), "EOF ⇒ Ok(None)：{tail:?}");
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// 起一枚本机回环 echo 目标：读多少回多少，**读到 EOF 即半关（WRITE）**并把读数回传。
+/// 返回（目标地址，读数口）——读数口给（上行字节，是否读到 EOF）。
+fn spawn_echo_target() -> (std::net::SocketAddrV4, Receiver<(Vec<u8>, bool)>) {
+    let ln = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("echo 目标可绑");
+    let addr = match ln.local_addr().expect("echo 地址") {
+        std::net::SocketAddr::V4(v) => v,
+        std::net::SocketAddr::V6(_) => unreachable!(),
+    };
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        use std::io::{Read as _, Write as _};
+        let (mut c, _) = ln.accept().expect("目标被拨通");
+        let mut got = Vec::new();
+        let mut buf = [0u8; 1024];
+        let saw_eof = loop {
+            match c.read(&mut buf) {
+                Ok(0) => break true,
+                Ok(n) => {
+                    got.extend_from_slice(&buf[..n]);
+                    if c.write_all(&buf[..n]).is_err() {
+                        break false;
+                    }
+                }
+                Err(_) => break false,
+            }
+        };
+        let _ = c.shutdown(std::net::Shutdown::Write); // 目标侧半关 ⇒ 客户端读出 EOF
+        let _ = tx.send((got, saw_eof));
+    });
+    (addr, rx)
+}
+
+/// 等 echo 目标读数（异步轮询：保持 runtime 被驱动）。
+async fn await_echo_target(rx: &Receiver<(Vec<u8>, bool)>, wait: Duration) -> (Vec<u8>, bool) {
+    let deadline = Instant::now() + wait;
+    loop {
+        match rx.try_recv() {
+            Ok(v) => return v,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                assert!(Instant::now() < deadline, "echo 目标读数未在 {wait:?} 内到达");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => panic!("echo 目标线程死了"),
+        }
+    }
+}
+
+/// 起一枚「收到上行后 `SO_LINGER(0)` 关闭」的目标（= 对端读到 RST）。
+fn spawn_rst_target() -> (std::net::SocketAddrV4, Receiver<()>) {
+    let ln = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("RST 目标可绑");
+    let addr = match ln.local_addr().expect("RST 目标地址") {
+        std::net::SocketAddr::V4(v) => v,
+        std::net::SocketAddr::V6(_) => unreachable!(),
+    };
+    let (tx, rx) = channel();
+    std::thread::spawn(move || {
+        use std::io::Read as _;
+        let (mut c, _) = ln.accept().expect("RST 目标被拨通");
+        let mut buf = [0u8; 64];
+        let _ = c.read(&mut buf); // 收到上行后立刻 RST
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&c);
+        let l = libc::linger {
+            l_onoff: 1,
+            l_linger: 0,
+        };
+        // SAFETY：`setsockopt` 只读这 8 字节结构；失败也不影响「close 即 RST」的尽力语义
+        let _ = unsafe {
+            libc::setsockopt(
+                fd,
+                libc::SOL_SOCKET,
+                libc::SO_LINGER,
+                std::ptr::addr_of!(l).cast(),
+                std::mem::size_of_val(&l) as libc::socklen_t,
+            )
+        };
+        drop(c);
+        let _ = tx.send(());
+    });
+    (addr, rx)
+}
+
+/// 本机回环上的**空闲**端口（bind 后立即关 ⇒ 该端口此刻无监听；`ECONNREFUSED` 面）。
+fn free_loopback_addr() -> std::net::SocketAddrV4 {
+    let ln = std::net::TcpListener::bind(("127.0.0.1", 0)).expect("探测端口可绑");
+    let addr = match ln.local_addr().expect("探测地址") {
+        std::net::SocketAddr::V4(v) => v,
+        std::net::SocketAddr::V6(_) => unreachable!(),
+    };
+    drop(ln);
+    addr
 }
 
 /// **判据（§1.1 受理前置 ⇒ §1.6 的 `0x24`）**：绑定在受理窗内被摘除（设备摘除/轮换的

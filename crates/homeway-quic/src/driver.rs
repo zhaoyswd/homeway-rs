@@ -1180,7 +1180,13 @@ async fn handle_cmd(
                         streams::writer_task(send, slot, streams).await;
                         Job::StreamDone
                     });
-                    let _ = reply.send(Ok(id));
+                    // **回执投不出去 ⇒ 就地关流**（M4 §2.2 的 H1 残余窄窗）：调用方已放弃
+                    // （客户端 seam 拿不到 id ⇒ 它的 RAII 守卫也无从构造）时，这个流在岛内
+                    // **没有句柄可关**；不关就永久占一个槽（`has_capacity()` = `map.len() < 62`）
+                    // ——62 条之后同一连接上的全部服务流都会 `Busy`。
+                    if reply.send(Ok(id)).is_err() {
+                        let _ = st.streams.close(id);
+                    }
                 }
                 Ok(Err(_)) => {
                     // 连接在开流途中死掉（对端 CONNECTION_CLOSE / 本地关闭）

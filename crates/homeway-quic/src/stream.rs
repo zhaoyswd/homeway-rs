@@ -121,6 +121,16 @@ pub mod reset {
 /// 未 accept/未 reset 流不归还并发额度）。
 pub const TAG_READ_BUDGET: Duration = Duration::from_secs(5);
 
+/// `dial` 流的**拨号成功回执**（M4 §1.2；出口→客户端方向的**唯一 wire 增量**）。
+///
+/// 语义（写死，两侧共用这一枚常量；**不得**在任一侧另写字面量）：
+/// - 出口在 `TcpStream::connect` **成功之后、泵启动之前**写下它，随后才是目标侧裸字节流
+///   ⇒ 客户端读到的首块形如 `[0x01, payload…]`（**余量必须预置进读半缓冲**，§1.2 铁律）；
+/// - 失败路径**不写回执**（改为 `reset(0x25/0x26)`）⇒ 客户端不会把失败读成「成功但无数据」；
+/// - 必须存在的原因：拨号发生在**出口**，客户端 `open_bi + 写 6B` 之后无从知道拨号成败，
+///   无回执则 Q-F-B 钉住的「拨号失败 ⇒ 对端 `read` = `ConnectionReset`」语义会退化成静默 EOF。
+pub const DIAL_OK: u8 = 0x01;
+
 /// 岛侧开流的兜底预算（对端 TP 异常时快速失败而不是挂死命令循环）。
 ///
 /// **不是背压预算**：自记账（§1.4-N14 的容量）通过后 `open_bi` 只受对端
@@ -388,6 +398,24 @@ mod tests {
         assert_eq!(StreamErr::ConnectionLost.text(), "承载重连");
         // Display 与 text 同源（判据行与错误链不各写一份词表）
         assert_eq!(StreamErr::Unbound.to_string(), "未绑定");
+    }
+
+    /// **判据（dial 回执字节，M4 §1.2）**：`DIAL_OK` = `0x01` 且**不落在**复位码表区间里
+    /// （否则「回执字节」与「复位码」会共用值域 ⇒ 两侧读法歧义）；也不等于任何 tag 字节
+    /// （首字节含义在**方向**上区分：客户端→出口 = tag，出口→客户端 = 回执）。
+    #[test]
+    fn dial_ok_is_pinned_and_disjoint_from_other_byte_spaces() {
+        assert_eq!(DIAL_OK, 0x01);
+        assert!(
+            !(reset::WHITELIST_MIN..=reset::WHITELIST_MAX).contains(&(DIAL_OK as u64)),
+            "回执字节不得落在复位码白名单区间内"
+        );
+        assert_ne!(DIAL_OK, 0x00, "0x00 是传输层的「无应用错误码」默认值");
+        assert_eq!(
+            StreamTag::from_byte(DIAL_OK),
+            Some(StreamTag::Files),
+            "同一字节在「tag 面」有别的含义——两侧读数只按方向区分（本断言记录该事实）"
+        );
     }
 
     /// 写回执形态（`n=0` 必带 `back` 的约定由生产方保证；此处钉「零接纳带回原 Vec」的等价性）。

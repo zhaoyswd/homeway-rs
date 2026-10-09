@@ -22,6 +22,10 @@
 //! - **不新增线程**：泵是出口 `current_thread` runtime 上的一枚任务（§2.2 的准确说法：
 //!   服务自身的 handler 线程不变，泵只借岛 runtime）。
 //!
+//! **M4 §3.3 泛型化**：[`upstream`]/[`downstream`] 由「`UnixStream` 的两半」放宽为任意
+//! `AsyncWrite`/`AsyncRead` ⇒ **dial 腿（`exit/dial.rs`）复用同一份实现**（以 `TcpStream`
+//! 的两半为参数），本仓不写第四份泵拷贝（Q-F-B 残余③「三份泵拷贝」只减不增）。
+//!
 //! **本文件属异步面**（隔离门 ② 条的 `ASYNC_FILES` 显式清单；照 `exit/serve.rs` 先例）。
 
 use std::io;
@@ -30,7 +34,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use quinn::{RecvStream, SendStream};
-use tokio::io::{AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use super::{log_due, FaceCtx};
 use crate::stream::StreamTag;
@@ -97,17 +101,17 @@ pub(crate) async fn run(
         }
     };
     let (mut sr, mut sw) = tokio::io::split(io);
-    let (up_bytes, down_bytes) = tokio::join!(
+    let (up, down) = tokio::join!(
         upstream(&mut recv, &mut sw),
         downstream(&mut sr, &mut send),
     );
     // 计数与结束行（受理行在入队时已落——见 `serve.rs`）
     ctx.stats
         .stream_bytes_in
-        .fetch_add(up_bytes, std::sync::atomic::Ordering::SeqCst);
+        .fetch_add(up.bytes, std::sync::atomic::Ordering::SeqCst);
     ctx.stats
         .stream_bytes_out
-        .fetch_add(down_bytes, std::sync::atomic::Ordering::SeqCst);
+        .fetch_add(down.bytes, std::sync::atomic::Ordering::SeqCst);
     let n = ctx
         .stats
         .streams_closed
@@ -115,20 +119,36 @@ pub(crate) async fn run(
         + 1;
     if log_due(n) {
         (*ctx.logf)(&format!(
-            "quic: 服务流结束（tag={tag}，↑{up_bytes}B ↓{down_bytes}B，耗时 {:?}）",
+            "quic: 服务流结束（tag={tag}，↑{}B ↓{}B，耗时 {:?}）",
+            up.bytes,
+            down.bytes,
             t0.elapsed()
         ));
     }
 }
 
-/// 上行（客户端 → 服务）：QUIC 读 → socketpair 写。
+/// 一个方向的搬运结果（M4 §3.3：dial 腿的「目标侧中断」行需要**结束原因**）。
+///
+/// `bytes` = 本方向搬运字节数；`err` = **对端侧**异常结束的错误原文（`None` = 正常 FIN/EOF
+/// 或「本侧已收摊」）。socketpair 腿（[`run`]）**不读** `err`——它今天就是对 AF_UNIX 的
+/// 读错误静默 `finish()`（行为逐字保留）；dial 腿（`exit/dial.rs`）用它产出口可观测行。
+pub(crate) struct CopyEnd {
+    pub(crate) bytes: u64,
+    pub(crate) err: Option<io::Error>,
+}
+
+/// 上行（客户端 → 服务/目标）：QUIC 读 → 对端写。
 ///
 /// - 对端 FIN ⇒ `shutdown(WRITE)`（**半关传播**：服务侧读到 EOF 而不是错误）；
 /// - 对端 reset / 连接死 ⇒ 关 socketpair（§2.2-N12：普通 close，错误码不跨 socketpair）；
-/// - 服务侧已收线（写失败 `EPIPE`）⇒ 结束本方向（下行任务照常收尾）。
+/// - 对端侧已收线（写失败 `EPIPE`）⇒ 结束本方向（`err` 带回原文；socketpair 腿不用它，
+///   dial 腿落「目标侧中断」行），下行任务照常收尾。
 ///
-/// 返回本方向搬运字节数。
-async fn upstream(recv: &mut RecvStream, sw: &mut WriteHalf<tokio::net::UnixStream>) -> u64 {
+/// **泛型化（M4 §3.3）**：`sw` 由 `WriteHalf<UnixStream>` 放宽为任意 `AsyncWrite + Unpin`
+/// ——dial 腿以 `tokio::net::TcpStream` 的写半调用**同一份实现**（不写第四份泵拷贝）。
+///
+/// 返回本方向的搬运量与结束原因（见 [`CopyEnd`]）。
+pub(crate) async fn upstream<W: AsyncWrite + Unpin>(recv: &mut RecvStream, sw: &mut W) -> CopyEnd {
     let mut buf = vec![0u8; COPY_BUF];
     let mut n = 0u64;
     loop {
@@ -137,53 +157,54 @@ async fn upstream(recv: &mut RecvStream, sw: &mut WriteHalf<tokio::net::UnixStre
             Ok(Some(0)) => continue,
             Ok(Some(k)) => {
                 n += k as u64;
-                if sw.write_all(&buf[..k]).await.is_err() {
-                    return n; // 服务侧没了（EPIPE/ECONNRESET）：本方向收摊
+                if let Err(e) = sw.write_all(&buf[..k]).await {
+                    // 对端侧没了（EPIPE/ECONNRESET）：本方向收摊
+                    return CopyEnd { bytes: n, err: Some(e) };
                 }
             }
             Ok(None) => {
-                let _ = sw.shutdown().await; // 客户端 FIN ⇒ 服务侧见 EOF（§1.3 半关）
-                return n;
+                let _ = sw.shutdown().await; // 客户端 FIN ⇒ 对端见 EOF（§1.3 半关）
+                return CopyEnd { bytes: n, err: None };
             }
             Err(_) => {
-                // 对端 reset / 连接死：**关 socketpair 的服务侧读向**（§2.2-N12 的
-                // 「普通 close」在泵侧的落点）——否则服务侧会**永远阻塞在 read 上**
-                // （它无从知道客户端已经走了；今天 UDS 形态下这个信号由 close 给出）。
-                // 只 `shutdown(WRITE)` 不 drop：读半边仍归下行任务（服务收线那半仍要传播）。
+                // 对端 reset / 连接死：**关服务侧的写向**（§2.2-N12 的「普通 close」在泵侧
+                // 的落点）——否则服务侧会**永远阻塞在 read 上**（它无从知道客户端已经走了；
+                // 今天 UDS 形态下这个信号由 close 给出）。只 `shutdown(WRITE)` 不 drop：
+                // 读半边仍归下行任务（服务收线那半仍要传播）。
                 let _ = sw.shutdown().await;
-                return n;
+                return CopyEnd { bytes: n, err: None };
             }
         }
     }
 }
 
-/// 下行（服务 → 客户端）：socketpair 读 → QUIC 写。
+/// 下行（服务/目标 → 客户端）：对端读 → QUIC 写。
 ///
-/// 服务侧 EOF（或读错误——AF_UNIX 上「对端带未读数据关闭」）⇒ `finish()`：
-/// **不用 reset 做正常收口**（§1.3）；今天 UDS 形态下出口侧同样是普通 close。
+/// 对端侧 EOF ⇒ `finish()`：**不用 reset 做正常收口**（§1.3）；今天 UDS 形态下出口侧同样
+/// 是普通 close。对端**读错误**（AF_UNIX「对端带未读数据关闭」/ TCP RST）同样 `finish()`
+/// 收口，但把原文带回 `err`（dial 腿落「目标侧中断」行；socketpair 腿不读它 ⇒ 行为不变）。
 ///
-/// 返回本方向搬运字节数。
-async fn downstream(
-    sr: &mut ReadHalf<tokio::net::UnixStream>,
-    send: &mut SendStream,
-) -> u64 {
+/// 泛型化同 [`upstream`]（`sr` = `TcpStream` 读半）。
+///
+/// 返回本方向的搬运量与结束原因（见 [`CopyEnd`]）。
+pub(crate) async fn downstream<R: AsyncRead + Unpin>(sr: &mut R, send: &mut SendStream) -> CopyEnd {
     let mut buf = vec![0u8; COPY_BUF];
     let mut n = 0u64;
     loop {
         match sr.read(&mut buf).await {
             Ok(0) => {
                 let _ = send.finish();
-                return n;
+                return CopyEnd { bytes: n, err: None };
             }
             Ok(k) => {
                 n += k as u64;
                 if send.write_all(&buf[..k]).await.is_err() {
-                    return n; // 客户端已 reset/连接死
+                    return CopyEnd { bytes: n, err: None }; // 客户端已 reset/连接死
                 }
             }
-            Err(_) => {
-                let _ = send.finish(); // 服务侧收线（含 ECONNRESET 一档）⇒ 普通 FIN
-                return n;
+            Err(e) => {
+                let _ = send.finish(); // 对端收线（含 ECONNRESET 一档）⇒ 普通 FIN
+                return CopyEnd { bytes: n, err: Some(e) };
             }
         }
     }

@@ -12,7 +12,7 @@
 //!                 ├─ 服务未启用（无 intake）⇒ reset(0x22) + 行 + 计数
 //!                 ├─ 入口队列满 ⇒ reset(0x23) + 行 + 计数
 //!                 └─ tag 1/2/3 ⇒ socketpair + 入队 + 泵（[`super::pump`]）
-//!                    tag 4（dial）⇒ 读 6B 目标后 reset(0x22)（M3 只定协议，M4 换轨）
+//!                    tag 4（dial）⇒ 真拨号腿（[`super::dial`]；0x25/0x26 双码）
 //!                    tag 5（probe）⇒ 回显任务直连（**不进队列**，不占服务资源）
 //! ```
 //!
@@ -36,7 +36,7 @@ use std::time::Instant;
 use quinn::{ReadExactError, RecvStream, SendStream, VarInt};
 use tokio::task::JoinSet;
 
-use crate::stream::{dial_parse, reset, StreamTag, TAG_READ_BUDGET};
+use crate::stream::{reset, StreamTag, TAG_READ_BUDGET};
 use crate::tuning::service_defaults;
 
 use super::{log_due, FaceCtx};
@@ -94,9 +94,9 @@ async fn handle_stream(mut send: SendStream, mut recv: RecvStream, conn_id: u64,
     }
     match tag {
         StreamTag::Probe => echo(send, recv, conn_id, &ctx).await,
-        // M3 只定协议（§1.1/§12-4）：解析 6B `[4B IPv4][2B BE port]` 后一律 `0x22`；
-        // M4 换轨时只把这条臂换成真拨号，**帧不再改**。
-        StreamTag::Dial => dial_refuse(send, recv, conn_id, &ctx).await,
+        // M4 S1 换轨：这条臂换成真拨号腿（`exit/dial.rs`）——读 6B `[4B IPv4][2B BE port]`
+        // ⇒ 地址类判定 ⇒ 拨号 ⇒ 1B 回执 ⇒ 泛型泵。**帧不改**（M3 定稿沿用；§1.1）。
+        StreamTag::Dial => super::dial::dial_serve(send, recv, conn_id, &ctx).await,
         StreamTag::Files | StreamTag::Term | StreamTag::Speedtest => {
             serve_via_intake(send, recv, tag, conn_id, &ctx).await
         }
@@ -161,24 +161,6 @@ async fn serve_via_intake(
     super::pump::run(send, recv, pump_end, tag, conn_id, Arc::clone(ctx)).await;
 }
 
-/// `dial`（tag=4）本期限定形态（§2.1）：读 6B 目标 ⇒ `reset(0x22)` + 行。
-///
-/// 读得出目标 = 协议面成立（M4 换轨时 `dial_parse` 反向复用同一份帧，**帧不改**）；
-/// 读不出（对端只发 tag 就等 / 链路慢）也照样拒（本期出口没有 dial 能力）。
-async fn dial_refuse(mut send: SendStream, mut recv: RecvStream, conn_id: u64, ctx: &Arc<FaceCtx>) {
-    let mut frame = [0u8; 6];
-    let why = match tokio::time::timeout(TAG_READ_BUDGET, recv.read_exact(&mut frame)).await {
-        Ok(Ok(())) => match dial_parse(&frame) {
-            Some(dst) => format!("服务不可用（dial 目标 {dst}；M3 只定协议，M4 换轨）"),
-            // `read_exact(6)` 成功后长度必为 6 ⇒ 本臂不可达（留作帧格式变更的防线）
-            None => "服务不可用（dial 目标帧畸形；M3 只定协议，M4 换轨）".to_owned(),
-        },
-        _ => "服务不可用（dial 目标未读出；M3 只定协议，M4 换轨）".to_owned(),
-    };
-    let _ = send.reset(varint(reset::SERVICE_DISABLED));
-    refuse(ctx, conn_id, Some(StreamTag::Dial), reset::SERVICE_DISABLED, &why);
-}
-
 /// `probe` 回显（§1.2：**原样回显直到客户端半关**）。
 ///
 /// 用 `tokio::io::copy`（quinn 的 `RecvStream: AsyncRead` / `SendStream: AsyncWrite`）：
@@ -221,7 +203,10 @@ async fn echo(mut send: SendStream, mut recv: RecvStream, conn_id: u64, ctx: &Ar
 }
 
 /// 服务流拒绝：计数 + 归因行（E-q5 族，§8.2-7；出口排障的唯一可观测面）。
-fn refuse(ctx: &Arc<FaceCtx>, conn_id: u64, tag: Option<StreamTag>, code: u64, why: &str) {
+///
+/// `pub(super)`：dial 腿（`exit/dial.rs`）复用同一枚计数/行文实现（**拒绝行的单源**——
+/// 两处各写一份 `format!` 就是「行文与码各写一份」的漂移入口）。
+pub(super) fn refuse(ctx: &Arc<FaceCtx>, conn_id: u64, tag: Option<StreamTag>, code: u64, why: &str) {
     let n = ctx
         .stats
         .stream_refused
@@ -238,7 +223,9 @@ fn refuse(ctx: &Arc<FaceCtx>, conn_id: u64, tag: Option<StreamTag>, code: u64, w
 }
 
 /// 复位码 → `VarInt`（码表恒在 `VarInt` 值域内 ⇒ `expect` 是常量断言，不是运行期风险）。
-fn varint(code: u64) -> VarInt {
+///
+/// `pub(super)`：dial 腿（`exit/dial.rs`）写 `0x25/0x26` 时复用（同 `refuse` 的理由）。
+pub(super) fn varint(code: u64) -> VarInt {
     VarInt::try_from(code).expect("复位码在 VarInt 值域内")
 }
 
@@ -254,20 +241,26 @@ pub(crate) fn dev_of(ctx: &Arc<FaceCtx>, conn_id: u64) -> String {
 mod tests {
     use super::*;
 
-    /// 复位码与行文的关系（S2 起本文件会产出全部五码；改表即红——防「拒了但说不清」）。
+    /// 复位码与行文的关系（本文件 + `exit/dial.rs` 一起产出全部七码；改表即红——防「拒了
+    /// 但说不清」）。
     #[test]
     fn serve_only_emits_the_designed_codes() {
         assert_eq!(reset::TAG_UNKNOWN, 0x21);
         assert_eq!(reset::SERVICE_DISABLED, 0x22);
         assert_eq!(reset::INTAKE_FULL, 0x23);
         assert_eq!(reset::UNBOUND, 0x24);
+        assert_eq!(reset::DIAL_REFUSED, 0x25);
+        assert_eq!(reset::DIAL_TIMEOUT, 0x26);
         assert_eq!(reset::TAG_READ_TIMEOUT, 0x27);
-        // 白名单映射（对端读侧）与出口写侧同表：本文件写出的五个码都能被客户端识别成 typed 错误
+        // 白名单映射（对端读侧）与出口写侧同表：本文件（0x21–0x24/0x27）与 dial 腿
+        // （0x25/0x26）写出的七个码都能被客户端识别成 typed 错误。
         for code in [
             reset::TAG_UNKNOWN,
             reset::SERVICE_DISABLED,
             reset::INTAKE_FULL,
             reset::UNBOUND,
+            reset::DIAL_REFUSED,
+            reset::DIAL_TIMEOUT,
             reset::TAG_READ_TIMEOUT,
         ] {
             assert!(
@@ -275,11 +268,12 @@ mod tests {
                 "{code:#x} 必须在对端白名单里"
             );
         }
-        // M4 的两码本文件**不得**写出（本期没有 dial 目标面：`dial_refuse` 一律 0x22）
-        for code in [reset::DIAL_REFUSED, reset::DIAL_TIMEOUT] {
+        // M4 起**两码真产出**（`exit/dial.rs` 的拒（0x25）/超期（0x26））：白名单区间内每个码
+        // 都必须有写侧归属——区间里出现「无人写」的码 = 码表与实现漂移。
+        for code in reset::WHITELIST_MIN..=reset::WHITELIST_MAX {
             assert!(
                 crate::stream::StreamErr::from_reset_code(code).is_some(),
-                "{code:#x} 是 M4 的码（本文件不写，但白名单已备）"
+                "{code:#x} 在白名单区间内但无映射"
             );
         }
     }

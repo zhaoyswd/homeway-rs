@@ -91,6 +91,8 @@ ASYNC_FILES=(
   "exit/pump.rs"
   # M3 S4：快探阶梯（§3.1/§3.2——预算语义走 `tokio::time`，`start_paused` 用例要它）
   "client/ladder.rs"
+  # M4 S1：出口 dial 腿（tag=4 真拨号：`tokio::time::timeout` + `tokio::net::TcpStream`）
+  "exit/dial.rs"
 )
 # 异步名的判定式（②条、豁免自证、扫描器自校准**共用同一串**——三处不同步 = 门自相矛盾）。
 # **代码门 r15 G1 整改**：`client/migration.rs` 原在清单里但它**零异步名**（纯逻辑小件，

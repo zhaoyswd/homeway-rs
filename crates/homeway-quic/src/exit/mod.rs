@@ -24,6 +24,8 @@
 pub(crate) mod admit;
 mod bridge;
 mod conn;
+// M4 S1：dial 腿（tag=4 的真拨号；M4-design §1/§3）。**同批入隔离门 `ASYNC_FILES`**。
+mod dial;
 mod intake;
 mod pump;
 pub(crate) mod rpk;
