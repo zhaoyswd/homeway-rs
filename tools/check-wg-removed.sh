@@ -9,6 +9,9 @@
 #   ③ 行文面零 WG 冒充（字符串字面量；剥注释后字符串**保留** ⇒ 本条的命中面即字符串）
 #   ④ Cargo 依赖面：根 manifest 无 `boringtun` 依赖行、无 `[patch.crates-io]` 节；
 #      `Cargo.lock` 无 `ring 0.16`（计数 = 0）且 `ring 0.17` **仍在**（反向断言）
+#   ④-bis **tracked 锁文件全扫**（E 棒门整改）：全仓 tracked `Cargo.lock`（含 tools/**、fuzz/**
+#      独立 workspace）零 `boringtun` / 零 `ring 0.16` / 零 `quic-ab-wg*` 包条目
+#      （S1b 曾漏 `tools/quic-ab/arms/Cargo.lock` ——④ 原文只扫根 lock）
 #   ⑤ 禁止复活哨兵：`ring-shim` / `hmw1` / `_wg`（crates/** + tools/**；显式白名单文件）
 #   ⑥ **门自身校准（fail-closed）**：把三类样本注入临时文件 ⇒ 对应条确定性红；正常树绿
 #   ⑦ 隔离门 ⑪ 的改写仍在位（⑪(e) 的 stackb 消费者收窄锚 + 自校准锚存在）
@@ -114,6 +117,24 @@ ring17=$(awk '/^name = "ring"/{getline; print}' "$LOCK" | grep -c '^version = "0
 [[ "$ring16" == "0" ]] || fail "④ Cargo.lock 仍含 ring 0.16（$ring16 处）"
 [[ "$ring17" != "0" ]] || fail "④ 反向断言失败：Cargo.lock 无 ring 0.17（QUIC 用）"
 info "④ manifest 无 boringtun/无 [patch]；lock ring 0.16 = 0 / ring 0.17 = $ring17"
+
+# ④-bis **tracked 锁文件全扫**（M5 E 棒门整改：S1b 删 WG 实验臂时漏了
+# `tools/quic-ab/arms/Cargo.lock` 的依赖条目——它仍带 `boringtun` / `ring 0.16.20` /
+# `quic-ab-wg-ring`，而 ④ 原文只扫根 lock ⇒ 该残留无门可拦。本节把「WG 依赖零残留」
+# 扩到**全仓 tracked 的 Cargo.lock**（含 tools/** 与 fuzz/** 独立 workspace），
+# 扫的是**文件内容**（非 `git status`）⇒ 未提交的残留同样击红。）
+LOCKS=$(cd "$REPO_ROOT" && git ls-files '*Cargo.lock' 2>/dev/null)
+[[ -n "$LOCKS" ]] || fail "④-bis 拿不到 tracked Cargo.lock 清单（git ls-files 失败）——门 fail-closed"
+while IFS= read -r lk; do
+  [[ -n "$lk" ]] || continue
+  b=$(grep -c '^name = "boringtun"' "$REPO_ROOT/$lk" || true)
+  r16=$(awk '/^name = "ring"/{getline; print}' "$REPO_ROOT/$lk" | grep -c '^version = "0\.16' || true)
+  wgring=$(grep -c '^name = "quic-ab-wg' "$REPO_ROOT/$lk" || true)
+  [[ "$b" == "0" ]] || fail "④-bis $lk 仍含 boringtun（$b 处）"
+  [[ "$r16" == "0" ]] || fail "④-bis $lk 仍含 ring 0.16（$r16 处）"
+  [[ "$wgring" == "0" ]] || fail "④-bis $lk 仍含 WG 实验臂包（$wgring 处）"
+done <<< "$LOCKS"
+info "④-bis tracked Cargo.lock（$(printf '%s\n' "$LOCKS" | wc -l | tr -d ' ') 份）零 boringtun / 零 ring 0.16 / 零 WG 实验臂"
 
 # ---------- ⑤ 禁止复活哨兵 ----------
 PAT5='ring-shim|hmw1|_wg'
