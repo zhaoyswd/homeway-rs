@@ -44,8 +44,14 @@ pub const RETRY_TOKEN_LIFETIME_MIN: Duration = Duration::from_secs(1);
 /// `retry_token_lifetime` 值域上界（`1s..=60s`）。
 pub const RETRY_TOKEN_LIFETIME_MAX: Duration = Duration::from_secs(60);
 
-/// `per_src_fails` 缺省（§3.2-④：`10`）。
-pub const PER_SRC_FAILS_DEFAULT: u32 = 10;
+/// `per_src_fails` 缺省（**M2 §14-1 裁决：`10` → `16`**；窗保持 10s）。
+///
+/// 依据（S3 实测 + 主会话裁定）：3 候选同址赛跑在「客户端 abort 未完成候选」形态下，
+/// 单轮消耗 `(N−1)` 次失败预算（N=3 ⇒ 2 次/轮）⇒ 旧值 10 在第 4 轮就触发闸（实测
+/// `flood_refused=5` + 岛侧 `NoCandidate`）。**不放宽计数集**（攻击者同样能 abort ⇒
+/// 豁免 = 逃逸面），改为抬高预算：16 允许约 5 次 3 候选赛跑/窗（覆盖断网抖动期的恢复
+/// 节奏），同时仍把攻击者束在 **≤16 次握手/10s/源**（有界性不变）。值可配，**待真机标定**。
+pub const PER_SRC_FAILS_DEFAULT: u32 = 16;
 /// `per_src_fails` 值域下界（`1..=1000`）。
 pub const PER_SRC_FAILS_MIN: u32 = 1;
 /// `per_src_fails` 值域上界（`1..=1000`）。
@@ -89,7 +95,7 @@ pub const RETRY_INFLIGHT_DIVISOR: usize = 2;
 pub struct AdmitLimits {
     /// Retry token 有效期（`1s..=60s`；缺省 5s）。
     pub retry_token_lifetime: Duration,
-    /// 每源滑动窗上限（`1..=1000`；缺省 10）。
+    /// 每源滑动窗上限（`1..=1000`；缺省 16 = [`PER_SRC_FAILS_DEFAULT`]，M2 §14-1 裁决）。
     pub per_src_fails: u32,
     /// 每源滑动窗窗长（`1s..=1h`；缺省 10s）。
     pub per_src_window: Duration,

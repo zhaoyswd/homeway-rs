@@ -590,6 +590,9 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 | 2026-10-09（同上） | **配置新增段 `serve.quic_admit`（additive，七键 + 一 env）** | 无 → 有：`retry_token_lifetime`（缺省 5s；1s..=60s）/ `per_src_fails`（缺省 **16**；1..=1000——**缺省值变更见本表 S4 条**）/ `per_src_window`（缺省 10s；1s..=1h）/ `nonce_ttl`（缺省 5s；1s..=30s）/ `admit_deadline`（缺省 10s；1s..=60s）/ `proof_fail_threshold`（缺省 10；0..=1000，**0 = 关该闸**）/ `retry_policy`（pressure\|always\|never，缺省 pressure）+ env `HOMEWAY_QUIC_ADMIT_RETRY`（同三值）。**config 值域非法 ⇒ 拒启**（`serve` 节严格表纪律，Q-H 同款）；**env 非法 ⇒ 记行 + 缺省（不 fail-fast）**——两套纪律并存（设计 §3.2 表末写明） | §3.2：抗放大与限流的可配面（缺省即可用；`always` 档代价由启动告警行承担） | `crates/homeway-cli/src/serve_cli.rs`（键/值域/拒启）、`crates/homeway-core/src/server/quic_admit.rs`（env 叠加 + 记行）、`nodestate.rs`（模板键表）、`server/engine.rs`（`ServeConfig` 搬运）；config.toml 对 Go 侧**单向不兼容**（Go 已退役，仅影响回滚/对照） |
 | 2026-10-09（同上；**主会话裁定见设计 §13-1①**） | **token 载荷布局：本批未变更（登记留痕）** | `hmw1` 布局**保持不变**（M1 已登的 `type=2` QUIC 端点类 + 可选 `rpk(32B)` 尾字段照旧）；M2 **未**新增/未改任何 token 字节、未动 `PREFIX`；`rl1` 中继 token 不受影响 | §12-① 是**用户拍板项**，未获拍板 ⇒ 按设计兜底取**候选 A（本批不动 token）**；候选 B（`hmw2` 段容器）的窗口**未关闭**（前置条件 = 设计 §4.2.1 的 (a)(b)(c)，用户后续拍板 B 时执行） | `crates/homeway-core/src/token.rs` **零 diff**、`fixtures/vectors/token.json` **零改**、`tools/**` 的 `hmw1` 抽取面 **零改**（`tools/quic-wg-e2e.sh` 的 `_wg` 字节判据照旧成立） |
 | 2026-10-09（同上） | **E6/E7/E18 保留原串（M2 零差异登记）** | E6（`peer 表：设备表就绪（cap=%d，ttl=%v，grace=%v；按 devTag 记账/刷新/轮换）`）/ E7（`peer: + dev=%s pub=%s ip=%v n=%d/%d`）/ E18（`凭证台账：… 吊销即时对新注册生效`）**行文与语义零改动**；E8/E9 **行文一字不改**，差异只走「计数输入集」节的 M2 两行（refresh 输入集 = `R4`；`no-token` 输入集 = {MAC 过、窗超}） | 设计 §2.3：M2 的设备表面是**语义等价**实现（`table.rs` 零 diff——只换 MAC 入口名 `match_reg3` → `match_proof`）；显式登记「无变更」防后续读成漏登 | `crates/homeway-core/src/server/table.rs`（**零 diff**）；E6/E7/E8/E9/E18 按与 M1 末**逐字同**验收 |
+| 2026-10-09（**M2 S4 落地**；设计 §14-1② 裁定） | **每源闸阈值缺省 `serve.quic_admit.per_src_fails` 10 → 16（窗保持 10s）** | 缺省 `per_src_fails = 10` → **`16`**（值域 `1..=1000` 不变；`per_src_window` 缺省 10s 不变；**计数集不变**——仍计「同源未完成/被拒」） | **设计-实测冲突已裁（设计 §14-1②）**：3 候选同址赛跑在「客户端 abort 未完成候选」形态下单轮消耗 `(N−1)=2` 次失败预算 ⇒ 旧缺省 S3 实测第 4 轮 `flood_refused=5` + 岛侧 `NoCandidate`。**不放宽计数集**（攻击者同样能 abort ⇒ 豁免 = 逃逸面），改为抬高预算：16 允许约 5 次 3 候选赛跑/窗（覆盖断网抖动期恢复节奏），同时仍把攻击者束在 **≤16 次握手/10s/源**（有界性不变）。**待真机标定**（值可配） | `crates/homeway-quic/src/exit/admit.rs`（`PER_SRC_FAILS_DEFAULT`）、`exit/mod.rs`（缺省装配 + 启动行「抗放大面 … 每源 16/10s」取值）、`crates/homeway-core/src/nodestate.rs`（模板注释）、`crates/homeway-cli/src/serve_cli.rs`（缺省对照用例）；**按「每源 10/10s」写断言的读者须改**；证据 = `exit::tests::race_abort_form_stays_within_gate_budget`（3 候选 × 5 轮 ⇒ `flood_refused = 0`）+ 对照臂 `exit::tests::old_gate_budget_trips_on_next_attempt`（旧缺省下第 16 条尝试被拒） |
+| 2026-10-09（**M2 S4 落地**；设计 §14-1③ 裁定） | **「正常赛跑」判据措辞改写（设计 §3.3-6 / S3-2 的原判据）** | 「正常赛跑 ⇒ `retry_sent = 0` **且** `flood_refused = 0`」→ **「正常赛跑在阈值内 ⇒ 不触发闸（`retry_sent` 可为 0；`flood_refused` 只有在超过 `per_src_fails` 后才增长）」** | 设计 §3.1-② 的「正常赛跑会完成 ⇒ 不计数」只对「**完成后再被收掉**」的候选成立；「客户端在完成前 abort 输家」（`race::run` 的 `abort_all`）在出口侧落 `HandshakeOutcome::Failed` ⇒ 计入每源闸。计数语义按 §14-1① **保持**（改的是**判据措辞**，不是计数） | `crates/homeway-quic/src/exit/tests.rs`（`normal_races_do_not_trigger_retry_or_gate` 的形态注记改写 + 新增 abort 形态正面用例）；`docs/reviews/M2.md` 的差异登记（**S6 落**——该文件开工时不存在，S4 转交）；设计文档 §14-1 |
+| 2026-10-09（**M2 S4 落地**；设计 §14-1④ 承接） | **出口侧握手失败归因位（additive）** | 无 → 有：`ExitQuicSnapshot.handshake_peer_closed`（`handshake_failed` 的**子集**）。口径写死：`ConnectionClosed`/`ApplicationClosed`（收到对端关闭帧——含 TLS alert 类 crypto 错误）计入；`TimedOut`/`Reset`/`VersionMismatch`/`TransportError`/`LocallyClosed` **不计**（`TransportError` 无法反推对端是否发过帧 ⇒ 统一归「非主动关闭」，**如实注记**） | §14-1④：「出口侧能否区分『对端主动关闭』与『对端静默』」——**能**（以 quinn 的 `ConnectionError` 变体为据；此前 `Ok(Err(_e))` 丢弃错误值 ⇒ 不可归因）。**只作归因——两个闸的输入集不变**（§14-1①）。另订正 `client/race.rs` 模块头的旧口径（「输家 drop = 主动关闭」**不成立**：`Connecting` 无 close API，drop 只停止等待；实测 3 候选 abort 后出口侧仍见 2 条完成） | `crates/homeway-quic/src/exit/mod.rs`（`FailureKind`/`failure_kind` + 计数）、`client/race.rs`（注释订正，**零行为改动**；已建立输家的显式 close 不变）；证据 = `exit::tests::race_abort_form_stays_within_gate_budget`（错 pin 中止 ⇒ `handshake_peer_closed ≥ 8`）+ `exit::tests::rpk_pin_mismatch_aborts_handshake`（≥1）；该快照为**进程内**读面（未进 `quic` JSON 段） |
 
 
 > **上表 E12/decr_flow 两行 = 2026-10-07 Q-B 批落地登记**（Q-A 批预登记的占位条目已按本政策补全
@@ -635,19 +638,24 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 > 「正常尺寸逐字节同串、极端输入按登记」验收；Q-G 的 UDS 路径面按「`> SUN_PATH_MAX`（平台值）」验收；
 > Q-I 尾段的 `--stun=`/`--stun6=`/`--relay=`/`--ddns=` 空值形态按「接受并按 Go 语义处理」验收；
 > `--public-endpoint=`/`--bind-interface=` 空值形态**不在** carve-out（前者 Go 同拒、后者登记为已知识别差异）。
-> **其下十一行 = 2026-10-09 M2（WG → QUIC 传输层换代程序 **M2 身份、设备表与准入**，S1–S3 落地；S4 登记）**：
+> **其下十四行 = 2026-10-09 M2（WG → QUIC 传输层换代程序 **M2 身份、设备表与准入**，S1–S4）落地登记**：
 > ①准入协议版本（`hr-reg3` → `hr-reg4` 四帧；安全面 + 线协议面）②岛侧准入行改写 + 新增
 > ③出口侧准入/抗放大行族（九串 additive；含启动两行与 env 两行）④`why` 归因集扩展（十六串）
 > ⑤`ExitQuicSnapshot`/`quic` JSON 新增字段（含 S2-5 的 `send_buffer_used`）⑥引擎侧协议版本串（r14 F4）
 > ⑦E-q2 频率/输入集（r14 F11）⑧E-q3 明细 `src=%v` ⑨`serve.quic_admit` 七键 + env
-> ⑩token 未变更留痕（设计 §13-1① 取候选 A）⑪E6/E7/E18 保留原串（零差异登记；E8/E9 的差异走计数输入集条）。
+> ⑩token 未变更留痕（设计 §13-1① 取候选 A）⑪E6/E7/E18 保留原串（零差异登记；E8/E9 的差异走计数输入集条）
+> ⑫**S4**：`per_src_fails` 缺省 10 → 16（设计 §14-1②）⑬**S4**：「正常赛跑」判据措辞改写（设计 §14-1③）
+> ⑭**S4**：出口侧握手失败归因位 `handshake_peer_closed`（设计 §14-1④）。
 > **本批的策略 = 「行文改写 3 处 + 取值/归因集扩展 + additive 新行/新键/新配置」**（设计 §6.1）：
 > WG 族行**一条不改**；新增面向 tier 与排障脚本**均为 additive**（除点名的 3 处行文改写：
 > 岛侧 `登记已发`→`准入已发起`、引擎侧 `hr-reg3`→`hr-reg4`、E-q3 明细分行补 `src=`）；
 > `_wg` 档判据 = **与 M1 末逐字节同**（证据 = `tools/quic-wg-e2e.sh` 复跑，S4 读数见提交/回报）。
-> **计数输入集表 = M2 四行**（E8 / E9 / `未登记` / `准入被拒` 两分档）。
+> **计数输入集表 = M2 五行**（E8 / E9 / `未登记` / `准入被拒` 两分档 / `flood_refused`+`retry_sent`）。
 > **口径与设计文档对齐**：本批判据面变更逐条对应 `docs/reviews/M2-design.md` §6.2（草案）与
 > §13/§14（实施期订正）；**未在上表出现的行文改动 = 静默破坏对齐**（判据政策）。
+> **S4 的阈值裁决留痕（设计 §14-1）**：缺口径的不动 + 阈值 16 + 措辞改写三条已落表；其中
+> ①的**差异登记**（设计 vs 实测）按裁定已落 `docs/reviews/M2.md` §1（该文件由 S4 立，
+> **S6 续写** §2–§4 的代码门记录/威胁模型验证/判据行转交清单）。
 
 
 ### 计数输入集 / 数值语义变化（**行文不变**，登记留痕）
@@ -706,3 +714,4 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 | 2026-10-09（同上） | **E9** `peer: ! reject reason=…`（`no-token` 档） | QUIC 档 `no-token` 输入集 = **{MAC 已过、`ts` 超 ±90s 窗}**（`table.rs::verify` 把 `verify_reg` 的 `Expired` 归 `NoToken`）；**MAC/nonce 类拒绝不进本表**（在出口面计数，归 `quic: 准入被拒`）；`revoked`/`table-full`/`ip-conflict` 触发集不变 | **行文逐字不变**（r14 F1 订正了设计 v1 的「输入集为空」错论） | E9 数值、表内拒绝计数；双面呈现 = 表内 `reason=no-token` + 出口 `引擎裁决拒绝` |
 | 2026-10-09（同上） | **`quic: 丢弃 … 未登记=%d`（E-q3 四字段之一）** | 输入集增「**未完成 Proof / 未绑定**连接发来的数据报」（未认证门禁 + 双期限把窗口收窄 ⇒ 数值语义更准）；`源校验拒` 只对**已绑定**连接的入站包计数 | **行文与四字段序不变**（S4 只改明细文本，见登记表 E-q3 条） | N-c/E-q3 数值、`exit/{conn,bridge}.rs`、`quic` JSON 段的 `drops.unregistered` |
 | 2026-10-09（同上） | **`quic: 准入被拒`（`regs_rejected`）与两分档 `challenges_refused`/`proof_rejected`** | `regs_rejected` 输入集 = {帧非法 / 版本不符（H2/H3）/ 重复 Hello / 已绑定再准入 / 连接未绑定 / 刷新帧未绑定 / 刷新身份不符 / 刷新帧设备不在册 / nonce 类 / MAC 类 / 引擎裁决拒绝 / 冷却中拒 Hello}（逐串见登记表的 `why` 条）；`challenges_refused` = **未发 Challenge** 的拒绝，`proof_rejected` = **Proof 阶段**拒绝（nonce/MAC/引擎/身份不符） | r14 F7/F1 + 设计 §13-4 的拆细（fail-visible） | 出口排障读者；`exit/conn.rs` 的 `Counter::{BeforeChallenge,AtProof}` 分档 |
+| 2026-10-09（**M2 S4 落地**） | **`flood_refused` / `retry_sent`（每源闸与 Retry 的计数）** | 输入集 = 每源闸的「**未完成/被拒**」尝试：① 过闸即记账、**完成即销账**（`SrcGate::completed`）；② 被拒的尝试**仍计数**（`flood_refused = K − F`）；③ **对端主动关闭与对端静默都在同一输入集内**（设计 §14-1① **不豁免**——出口侧可区分二者，但只进 `handshake_peer_closed` **归因位**）；**缺省预算 10 → 16**（§14-1②；窗 10s 不变） | 「重连洪泛有界」的计数口径（S3 落地 + S4 裁决） | `exit/{mod,admit}.rs`；快照 `retry_sent`/`flood_refused`/`handshake_peer_closed`；启动行「抗放大面」取值 |

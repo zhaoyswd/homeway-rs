@@ -207,6 +207,13 @@ async fn rpk_pin_mismatch_aborts_handshake() {
     let snap = quic.snapshot();
     assert_eq!(snap.admitted, 0, "错 RPK 不得采纳任何连接：{snap:?}");
     assert_eq!(snap.connections, 0, "错 RPK 不得留下连接：{snap:?}");
+    // 归因位（M2 §14-1④）：客户端因 pin 不符**主动关**（TLS alert 的 CONNECTION_CLOSE）
+    // ⇒ 落 `handshake_peer_closed`（与「对端静默」可区分；计数集不放宽）。
+    assert!(
+        wait_until(|| quic.snapshot().handshake_peer_closed >= 1, WAIT).await,
+        "对端主动关闭应进归因位：{:?}",
+        quic.snapshot()
+    );
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
 
@@ -1928,15 +1935,16 @@ async fn pressure_arm_sends_retry_and_client_still_completes() {
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
 
-/// **判据（S3-2 / r14 F10 + §3.3-6）**：≥3 候选的正常赛跑连续 8 轮 ⇒ `retry_sent = 0`
-/// 且 `flood_refused = 0`（触发条件不得落进常态包络）。
+/// **判据（S3-2 / r14 F10 + §3.3-6；**措辞按 M2 §14-1③ 改写**）**：≥3 候选的正常赛跑连续 8 轮
+/// ⇒ `retry_sent = 0` 且 `flood_refused = 0`。
 ///
-/// ⚠️ **形态口径（实测登记，见 commit/回报）**：本用例走 §3.1-② 描述的模型形态——
-/// 「候选**完成**握手后被收掉」（回环上三候选都在同一 RTT 内完成）。**客户端在候选完成
-/// 前 abort 输家**的形态（`race::run` 的 `abort_all` 语义）在出口侧落进
-/// `HandshakeOutcome::Failed` ⇒ 计入每源闸（实测：真岛 3 候选，第 2 轮起 `retry_sent`
-/// 增长、第 4 轮 `flood_refused` 到 3 ⇒ `NoCandidate`）——该形态的处置属设计裁决面
-/// （§3.2-④ 计数集 / §2.2 赛跑收尾语义），不在本切片改。
+/// ⚠️ **形态口径（实测登记 + S4 裁决留痕）**：本用例走的是「候选**完成**握手后被收掉」的形态
+/// （回环上三候选都在同一 RTT 内完成 ⇒ 每条都销账）。**客户端在候选完成前 abort 输家**的形态
+/// （`race::run` 的 `abort_all` 语义）在出口侧落 `HandshakeOutcome::Failed` ⇒ 计入每源闸
+/// （实测：真岛 3 候选，第 2 轮起 `retry_sent` 增长、第 4 轮 `flood_refused=5` ⇒ `NoCandidate`）。
+/// **M2 §14-1 裁定**：①计数集**不放宽**（abort 同样可被攻击者使用）；②每源阈值缺省
+/// `10 → 16`（允许约 5 次 3 候选赛跑/窗）；③判据措辞改为「**正常赛跑在阈值内 ⇒ 不触发闸**」
+/// ——该 abort 形态的正面证据 = 下一条用例（`race_abort_form_stays_within_gate_budget`）。
 #[tokio::test]
 async fn normal_races_do_not_trigger_retry_or_gate() {
     let quic = exit_face_with(63, |c| c.per_src_window = Duration::from_secs(60));
@@ -1973,8 +1981,111 @@ async fn normal_races_do_not_trigger_retry_or_gate() {
     assert_eq!(snap.retry_sent, 0, "常态赛跑不得 Retry（r14 F10）：{snap:?}");
     assert_eq!(snap.flood_refused, 0, "常态赛跑不得撞每源闸：{snap:?}");
     // 回环上三候选**都会完成握手**（实测 admitted = 24/24：胜者留用、余者被 explicit close）
-    // ⇒ 每次完成都销账（否则 24 次尝试早把 per_src_fails=10 的窗口攒满 ⇒ 上面两条必红）。
+    // ⇒ 每次完成都销账（否则 24 次尝试早把 per_src_fails=16 的窗口攒满 ⇒ 上面两条必红）。
     assert!(snap.admitted >= ROUNDS, "每轮至少一个胜者：{snap:?}");
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// 「3 候选赛跑 × N 轮」的**abort 形态注入**（S4 阈值裁决的判据本体）：每轮 ① 一条对 pin 的
+/// 候选**完成**（销账）、② 两条错 pin 候选 = **对端在握手完成前中止**（出口侧落
+/// `HandshakeOutcome::Failed`，与真岛 `race::run` 的 abort 输家落同一条计数输入，且**绝不会**
+/// 销账 —— 比真岛更悲观）。`retry_policy = never` 只关 Retry 轴（Retry 会给每条「未完成」
+/// 再加一条重放尝试；放大面归既有的压力臂与 S5 真机标定），本注入只钉「每源闸预算够不够」。
+async fn race_abort_form_rounds(quic: &ExitQuic, rounds: u64) -> SocketAddr {
+    let pin = quic.rpk_public_key();
+    let addr = quic.local_addr();
+    for round in 0..rounds {
+        let (client, cfg, _sock) = client_endpoint_and_config(pin);
+        let conn = tokio::time::timeout(
+            WAIT,
+            client
+                .connect_with(cfg, addr, super::rpk::client_pin::SERVER_NAME)
+                .expect("connect 调用面"),
+        )
+        .await
+        .expect("预算内定音")
+        .expect("对 pin 的候选必须完成");
+        assert!(
+            wait_until(|| quic.snapshot().admitted > round, WAIT).await,
+            "第 {round} 轮胜者应被采纳：{:?}",
+            quic.snapshot()
+        );
+        for _ in 0..2 {
+            assert!(!wrong_pin_attempt(addr).await, "错 pin 尝试不得连上");
+        }
+        drop(conn);
+    }
+    addr
+}
+
+/// **判据（S4 / M2 §14-1 裁决②的正面证据）**：「3 候选赛跑 × 5 轮」在**新缺省**
+/// （`per_src_fails = 16`）下**仍在阈值内** ⇒ `flood_refused = 0`（每轮消耗 `N−1 = 2` 次
+/// 预算 ⇒ 窗内 10 ≤ 16）。措辞按 §14-1③ = 「**正常赛跑在阈值内 ⇒ 不触发闸**」。
+///
+/// 形态说明见 [`race_abort_form_rounds`]。**读数（如实登记，非断言）**：本形态
+/// `retry_sent = 0`（`retry_policy = never` 关掉了 Retry 轴）；真岛（pressure 档）同形态会因
+/// 每条「未完成」再叠一条重放尝试而更快接近阈值 ⇒ 缺省 16 **待 S5 真机标定**（§14-1②）。
+#[tokio::test]
+async fn race_abort_form_stays_within_gate_budget() {
+    let quic = exit_face_with(70, |c| {
+        c.per_src_window = Duration::from_secs(60);
+        c.retry_policy = RetryPolicy::Never;
+    });
+    let addr = race_abort_form_rounds(&quic, 5).await;
+    let snap = quic.snapshot();
+    assert_eq!(
+        snap.flood_refused, 0,
+        "3 候选 × 5 轮应在阈值内（缺省 16）：{snap:?}"
+    );
+    assert!(snap.admitted >= 5, "每轮至少一个胜者：{snap:?}");
+    assert!(
+        wait_until(|| quic.snapshot().handshake_failed >= 8, WAIT).await,
+        "输家的「未完成」应留下握手失败读数（口径：对端主动中止 = Failed）：{:?}",
+        quic.snapshot()
+    );
+    // 归因位（M2 §14-1④）：对端**主动关闭**（TLS alert ⇒ CONNECTION_CLOSE）落进
+    // `handshake_peer_closed` —— 这是「出口**能**区分『主动关闭』与『静默』」的代码证据
+    // （归因面；**不放宽**两个闸的输入集，§14-1①）。
+    assert!(
+        wait_until(|| quic.snapshot().handshake_peer_closed >= 8, WAIT).await,
+        "错 pin 中止 = 对端主动关闭，应进归因位：{:?}",
+        quic.snapshot()
+    );
+    // 阈值内的第 16 条尝试（= 第 5 轮后的下一条「未完成」）**仍放行**（窗内 10 < 16）。
+    assert!(!wrong_pin_attempt(addr).await, "错 pin 尝试不得连上");
+    let snap = quic.snapshot();
+    assert_eq!(
+        snap.flood_refused, 0,
+        "新缺省下第 16 条尝试仍应在阈值内（窗内 10 < 16）：{snap:?}"
+    );
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **对照臂（S4 / M2 §14-1 裁决②的承重证据）**：**旧缺省**（`per_src_fails = 10`）下的同一
+/// 形态（3 候选 × 5 轮）把窗**刚好填满**（10/10）⇒ 紧随其后的下一条「未完成」尝试
+/// （= 第 16 次尝试）**被拒**（`flood_refused` +1）。⇒ 缺省 10 → 16 的变更**是承重的**
+/// （旧值对 abort 形态零余量；真岛的 retry 放大面在旧值下第 4 轮就撞闸——S3 实测
+/// `flood_refused=5`）。
+#[tokio::test]
+async fn old_gate_budget_trips_on_next_attempt() {
+    let quic = exit_face_with(71, |c| {
+        c.per_src_fails = 10; // M2 §14-1 裁决前的缺省
+        c.per_src_window = Duration::from_secs(60);
+        c.retry_policy = RetryPolicy::Never;
+    });
+    let addr = race_abort_form_rounds(&quic, 5).await;
+    let snap = quic.snapshot();
+    assert_eq!(
+        snap.flood_refused, 0,
+        "5 轮刚好填满旧窗（10/10）但尚未超限：{snap:?}"
+    );
+    assert!(!wrong_pin_attempt(addr).await, "错 pin 尝试不得连上");
+    let snap = quic.snapshot();
+    assert!(
+        snap.flood_refused >= 1,
+        "旧缺省下第 16 条尝试应被拒（窗已满）：{snap:?}"
+    );
+    assert!(snap.admitted >= 5, "撞闸不得影响已完成的胜者：{snap:?}");
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
 
@@ -2240,3 +2351,5 @@ async fn flood_keeps_bounds_and_spares_admitted_connection() {
     assert_eq!(got.as_ref(), &pkt[..], "出站 DATAGRAM 字节级一致");
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
+
+

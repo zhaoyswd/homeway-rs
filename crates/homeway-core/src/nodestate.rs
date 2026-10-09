@@ -268,7 +268,7 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# homeway 配置（L1 意图层，唯�
 #   [serve.tx_shape] 发送整形（rate_mbps/burst_kb；缺省 = 产品默认 200MiB/s+256KiB，HOMEWAY_TX_SHAPING=off 整套关）
 #   [serve.quic_admit] 抗放大闸（M2 §3.2 六行七键；省略本节省略即不变——缺省 = 设计定值）：
 #           retry_token_lifetime(时长串 1s-60s，缺省 5s；Retry token 有效期) /
-#           per_src_fails(1-1000，缺省 10；每源滑动窗的未完成/被拒上限) /
+#           per_src_fails(1-1000，缺省 16；每源滑动窗的未完成/被拒上限) /
 #           per_src_window(时长串 1s-1h，缺省 10s) / nonce_ttl(时长串 1s-30s，缺省 5s) /
 #           admit_deadline(时长串 1s-60s，缺省 10s) /
 #           proof_fail_threshold(0-1000，缺省 10；0 = 关闭该闸) /

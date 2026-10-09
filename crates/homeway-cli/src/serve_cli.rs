@@ -1667,7 +1667,7 @@ mod tests {
              dns_upstream = [\"1.1.1.1\", \"9.9.9.9:5353\"]\ndns_fallback = \"223.5.5.5\"\n\
              ddns_resolver = [\"223.5.5.5\"]\ndns_probe_target = [\"223.5.5.5:53\"]\n\
              stun_probe_target = [\"162.159.207.1:3478\"]\n\
-             [serve.quic_admit]\nretry_token_lifetime = \"5s\"\nper_src_fails = 10\n\
+             [serve.quic_admit]\nretry_token_lifetime = \"5s\"\nper_src_fails = 16\n\
              per_src_window = \"10s\"\nnonce_ttl = \"5s\"\nadmit_deadline = \"10s\"\n\
              proof_fail_threshold = 10\nretry_policy = \"pressure\"\n\
              [relay]\nenabled = false\nlisten = \":41741\"\nadvertise = \"\"\n";

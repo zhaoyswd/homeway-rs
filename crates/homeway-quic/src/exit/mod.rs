@@ -126,7 +126,7 @@ pub struct ExitQuicConfig {
     /// Retry token 有效期（缺省 [`admit::RETRY_TOKEN_LIFETIME_DEFAULT`] = 5s，**收自 quinn
     /// 缺省 15s**，M2 §3.1 登记；值域 `1s..=60s`）。
     pub retry_token_lifetime: Duration,
-    /// 每源滑动窗上限（缺省 [`admit::PER_SRC_FAILS_DEFAULT`] = 10；值域 `1..=1000`）。
+    /// 每源滑动窗上限（缺省 [`admit::PER_SRC_FAILS_DEFAULT`] = 16，M2 §14-1 裁决；值域 `1..=1000`）。
     pub per_src_fails: u32,
     /// 每源滑动窗窗长（缺省 [`admit::PER_SRC_WINDOW_DEFAULT`] = 10s；值域 `1s..=1h`）。
     pub per_src_window: Duration,
@@ -197,6 +197,19 @@ pub struct ExitQuicSnapshot {
     pub path_changes: u64,
     /// 握手失败次数（对端放弃 / 协议错；期限到点单列 [`Self::handshake_timeouts`]）。
     pub handshake_failed: u64,
+    /// [`Self::handshake_failed`] 的**子集**：对端在握手期**主动关闭**的条数（M2 §14-1④ 的
+    /// 归因面——「出口侧能否区分『对端主动关闭』与『对端静默』」：**能**，以 quinn 的
+    /// `ConnectionError` 变体为据）。
+    ///
+    /// 口径写死在这里：`ConnectionClosed`（收到对端 CONNECTION_CLOSE 帧——含 TLS alert 类
+    /// crypto 错误）与 `ApplicationClosed`（对端应用层关闭）计入本计数；`TimedOut`（静默到
+    /// idle 超时）/`Reset`/`VersionMismatch`/`TransportError`/`LocallyClosed` **不计**。
+    /// 注记（如实）：`TransportError` 一档既可能来自「对端发了坏帧」也可能来自「本地 TLS 栈
+    /// 因对端 alert 报错」⇒ 从变体**无法**反推对端是否发过帧，故该档统一归「非主动关闭」。
+    ///
+    /// **计数集不放宽**（M2 §14-1① 裁定）：本字段只作**归因**，每源闸/证明失败闸的输入集
+    /// 不变（对端主动关闭同样计入「未完成」——攻击者也能主动 abort）。
+    pub handshake_peer_closed: u64,
     /// 当前在途握手数（已收到 Initial、尚未完成）。
     pub handshakes_in_flight: u64,
     /// 因**并发握手超限**拒绝的次数（§9.3 Q-O）。
@@ -247,6 +260,7 @@ pub(crate) struct ExitStats {
     admitted: AtomicU64,
     path_changes: AtomicU64,
     handshake_failed: AtomicU64,
+    handshake_peer_closed: AtomicU64,
     handshakes_in_flight: AtomicU64,
     handshake_refused: AtomicU64,
     conn_refused: AtomicU64,
@@ -274,6 +288,7 @@ impl ExitStats {
             admitted: self.admitted.load(Ordering::SeqCst),
             path_changes: self.path_changes.load(Ordering::SeqCst),
             handshake_failed: self.handshake_failed.load(Ordering::SeqCst),
+            handshake_peer_closed: self.handshake_peer_closed.load(Ordering::SeqCst),
             handshakes_in_flight: self.handshakes_in_flight.load(Ordering::SeqCst),
             handshake_refused: self.handshake_refused.load(Ordering::SeqCst),
             conn_refused: self.conn_refused.load(Ordering::SeqCst),
@@ -565,10 +580,32 @@ struct LiveConn {
 }
 
 /// 在途握手的结果（三态：采纳 / 失败 / 期限到点——各自的计数与记行口径不同）。
+///
+/// `Failed` 携带**归因位**（M2 §14-1④）：对端在握手期是否**主动关闭**（收到了关闭帧）。
+/// 该位只进 [`ExitQuicSnapshot::handshake_peer_closed`]（归因面），**不改**任何闸的输入集。
 enum HandshakeOutcome {
     Accepted(SocketAddr, Connection),
-    Failed(SocketAddr),
+    Failed(SocketAddr, FailureKind),
     Deadline(SocketAddr),
+}
+
+/// 握手失败的归因位（口径见 [`ExitQuicSnapshot::handshake_peer_closed`] 的文档）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum FailureKind {
+    /// 对端**主动关闭**（`ConnectionClosed`/`ApplicationClosed`）。
+    PeerClosed,
+    /// 静默或其他（`TimedOut`/`Reset`/`VersionMismatch`/`TransportError`/`LocallyClosed`）。
+    Other,
+}
+
+/// quinn 的握手错误 → 归因位（变体映射写死在此，随上游变体增删只改这一处）。
+fn failure_kind(e: &quinn::ConnectionError) -> FailureKind {
+    match e {
+        quinn::ConnectionError::ConnectionClosed(_) | quinn::ConnectionError::ApplicationClosed(_) => {
+            FailureKind::PeerClosed
+        }
+        _ => FailureKind::Other,
+    }
 }
 
 /// 端点到点前的装配与主循环（**全在专用线程的 `current_thread` runtime 内**）。
@@ -781,10 +818,10 @@ fn run_exit(
                                         match incoming.accept() {
                                             Ok(connecting) => match tokio::time::timeout(deadline, connecting).await {
                                                 Ok(Ok(conn)) => HandshakeOutcome::Accepted(peer, conn),
-                                                Ok(Err(_e)) => HandshakeOutcome::Failed(peer),
+                                                Ok(Err(e)) => HandshakeOutcome::Failed(peer, failure_kind(&e)),
                                                 Err(_) => HandshakeOutcome::Deadline(peer),
                                             },
-                                            Err(_e) => HandshakeOutcome::Failed(peer),
+                                            Err(e) => HandshakeOutcome::Failed(peer, failure_kind(&e)),
                                         }
                                     });
                                 }
@@ -812,8 +849,12 @@ fn run_exit(
                         // 握手失败（错 RPK / 对端放弃）：明细记行与四类丢弃计数归 E-q3——
                         // 握手面失败留在本总计数（客户端钉定判据的证据面）。
                         // 闸④：**未完成**的尝试留在窗内（不销账）——它们正是触发②/③的输入。
-                        Ok(HandshakeOutcome::Failed(_peer)) => {
+                        Ok(HandshakeOutcome::Failed(_peer, kind)) => {
                             stats.handshake_failed.fetch_add(1, Ordering::SeqCst);
+                            // M2 §14-1④：归因位（对端主动关闭 vs 静默）——**只归因，不豁免**
+                            if kind == FailureKind::PeerClosed {
+                                stats.handshake_peer_closed.fetch_add(1, Ordering::SeqCst);
+                            }
                         }
                         Ok(HandshakeOutcome::Deadline(peer)) => {
                             let n = stats.handshake_timeouts.fetch_add(1, Ordering::SeqCst) + 1;

@@ -5,10 +5,14 @@
 //!
 //! 1. **谁赢**：首个从 `Connecting` 转为已建连（1-RTT 可用）者。QUIC 握手完成即双向可用
 //!    （无 WG 的「响应过/首包」两段语义）。
-//! 2. **何时算输**：其余候选 `drop`。⚠️ quinn 的 drop **会**触发 `implicit_close()`
-//!    （最高可用密钥空间发 `APPLICATION_ERROR` CONNECTION_CLOSE）——所以口径是「输家被
-//!    主动关闭、岛不等待关闭完成」；对**已建立但未胜出**的连接另行显式 `close()`
-//!    （§2.2 的现任裁决）。
+//! 2. **何时算输**：其余候选 `drop`。⚠️ **口径订正（M2 S4 实测，主会话 §14-1④ 承接）**：
+//!    `Connecting`（**未完成**的候选）**没有** quinn 的 close API —— `drop` 只是停止等待，
+//!    连接驱动仍在跑（回环实测：3 候选 abort 后出口侧仍见到 2 条完成 ⇒ 销账）；因此**不能**
+//!    把「未完成输家」说成「被主动关闭」。对**已完成但未胜出**的连接另行显式 `close()`
+//!    （§2.2 的现任裁决，见下面的 drain 循环）；未完成输家的收口靠岛世代收摊（端点关）。
+//!    出口侧对此的归因面 = `ExitQuicSnapshot::handshake_peer_closed`（主动关）vs
+//!    `handshake_timeouts`/Failed-Other（静默/期限）——两档**都在每源闸的「未完成」输入集内**
+//!    （§14-1① 不放宽计数集）。
 //! 3. **预算**：`budget` = 整轮预算（不是每候选）；到点未完成者按 drop 收；全候选失败
 //!    ⇒ [`IslandErr::NoCandidate`]。**同一枚 `budget` 也划出准入段的可用量**（M2 §1.7）：
 //!    胜者产出后按 `max(剩余, ADMIT_MIN)` 给准入自带期限，失败/到点一律**显式关连接**
@@ -160,7 +164,8 @@ pub(crate) async fn run(
             Err(_aborted) => {}
         }
     }
-    // 余者：在途握手 → drop（quinn 侧 abort/关连接）；已完成的**显式关闭**（§2.2 现任裁决）
+    // 余者：**已完成的**候选在 drain 里**显式关闭**（§2.2 现任裁决）；**未完成的**（在途
+    // 握手）只能 abort——`Connecting` 无 close API（见模块头第 2 条，M2 S4 实测订正）。
     set.abort_all();
     while let Some(joined) = set.join_next().await {
         if let Ok((i, Ok(conn))) = joined {
