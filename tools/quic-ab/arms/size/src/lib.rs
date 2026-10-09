@@ -1,12 +1,11 @@
-//! 体积探针：在 boringtun + smoltcp 已在场的前提下，量 QUIC 栈的**边际增量**。
+//! 体积探针：在 **smoltcp**（M5 后核里最大的保留依赖块）已在场的前提下，量 QUIC 栈的
+//! **边际增量**。
 //!
-//! 口径登记（**与 lab 有差，别照搬 lab 的注释**）：lab 的 `size-probe2` 带
-//! `[patch] ring = ring-shim`（boringtun 的 0.16.20 走垫片）；`tools/quic-ab/arms`
-//! **不带 patch** ⇒ 本探针的 boringtun 走 crates.io 真 ring 0.16.20。故 lab 那句
-//! 「含垫片 ⇒ 增量是上界」在本仓**不成立**：对「M5 后 shim 退役」的形态本探针更贴近，
-//! 对「现役手机形态（shim）」则少算垫片那部分（垫片很小）。四档矩阵的分工见 Cargo.toml。
+//! 口径登记（M5 C4）：base 曾含 `boringtun`（WG 数据面），随 WG 面退役删除 ⇒ ③ 格口径由
+//! 「WG+QUIC 双栈 base」变为「单承载 base」——**与 M0–M4 的该格读数不可直接互引**（登记 =
+//! 设计 §9.2 默认 (c) 的臂退役条）。
 //!
-//! 导出面：`ClientCore2Version` + `ProbeWgTouch`（base 引用保活）+ `ProbeRealQuic`
+//! 导出面：`ClientCore2Version` + `ProbeBaseTouch`（base 引用保活）+ `ProbeRealQuic`
 //! （lab 同款占位导出）+ `--features quic` 下的 `ProbeRunQuic`（真自连）。
 
 use std::ffi::CString;
@@ -16,14 +15,9 @@ pub extern "C" fn ClientCore2Version() -> *mut std::os::raw::c_char {
     CString::new("size-probe2").unwrap().into_raw()
 }
 
-/// boringtun + smoltcp 保活（模拟核里的数据面引用）
+/// smoltcp 保活（模拟核里的拦截栈引用；M5 前还含 boringtun 的 WG 数据面引用）
 #[no_mangle]
-pub extern "C" fn ProbeWgTouch() -> usize {
-    use boringtun::x25519::{PublicKey, StaticSecret};
-    let sk = StaticSecret::from([7u8; 32]);
-    let pk = PublicKey::from(&sk);
-    let t = boringtun::noise::Tunn::new(sk, pk, None, None, 1, None).unwrap();
-    let _ = t;
+pub extern "C" fn ProbeBaseTouch() -> usize {
     let mut cfg = smoltcp::iface::Config::new(smoltcp::wire::HardwareAddress::Ip);
     cfg.random_seed = 42;
     let _medi = &mut smoltcp::phy::Loopback::new(smoltcp::phy::Medium::Ip);

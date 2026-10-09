@@ -1,10 +1,11 @@
 [workspace]
 resolver = "2"
-# 探针独立 workspace（根 Cargo.toml 的 exclude 已排除 tools/quic-ab）：
-#   · 本 workspace **不带** [patch]，故 wg-ring 臂用的是 crates.io 真 ring（上游 asm，诊断臂）；
-#   · 垫片臂（wg-shim）必须是另一个 workspace（`[patch]` 是 workspace 级——M0 设计 §4.4）。
+# 探针独立 workspace（根 Cargo.toml 的 exclude 已排除 tools/quic-ab）。
+# **M5 C4**：WG 两臂（`wg-ring`/`wg-shim` 与其 ring 垫片）随 WG 面退役删除——WG 加密栈
+# 已无产品消费者，参照臂同批退役（设计 §9.2 默认 (c)：「每包 CPU ≤ 现役 WG+shim ×1.0」
+# 「线开销 ≤40B」两条的 WG 相对列失去参照臂，保留绝对列）。
 #   size-shell = 空壳档探针（四档矩阵的前两格；转入自 lab 的 size-probe v1 形态）
-members = ["common", "raw", "wg-ring", "quic", "size", "size-shell"]
+members = ["common", "raw", "quic", "size", "size-shell"]
 
 [workspace.package]
 version = "0.0.0"

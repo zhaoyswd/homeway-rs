@@ -15,7 +15,6 @@ getrandom.workspace = true
 smoltcp.workspace = true
 libc.workspace = true
 # R1 数据面消费（noise 握手）；R0 先就位以验 ring 垫片 [patch] 组装
-boringtun.workspace = true
 # 端点缓存落盘（与 Go 字节对齐的持久化 JSON——键序/omitempty 语义面，R2）
 serde.workspace = true
 serde_json.workspace = true

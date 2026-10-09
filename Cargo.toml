@@ -3,8 +3,8 @@ resolver = "2"
 members = ["crates/homeway-core", "crates/homeway-cli", "crates/homeway-capi", "crates/homeway-quic"]
 # 独立 workspace 的排除项：
 #   fuzz           = nightly + cargo-fuzz（不进 cargo test --workspace——G-10）
-#   tools/quic-ab  = QUIC 实验台探针（**必需**：它自带 [patch] ring 的真 ring 臂，
-#                    不被根 [patch] 换垫片，否则「真 ring 诊断臂」当场失真——M0 设计 §4.4）
+#   tools/quic-ab  = QUIC 实验台探针（harness-only：把本仓核当库驱动的 lab 臂；
+#                    M5 C4 起根 workspace **不再有 [patch]**，故其 ring = crates.io 真版）
 #   tools/quic-probe = M1 S1c 的探针客户端（harness-only：RPK 钉定自定义 verifier 的
 #                    `dangerous()` 安装点 + relay 信封组帧）；产品面隔离门只扫 crates/，
 #                    独立 workspace 让它与产品面隔离（同 tools/quic-ab 先例）
@@ -38,10 +38,6 @@ hkdf = "0.12"
 # 不引 `reusable_secrets`）。
 x25519-dalek = { version = "2.0.0-rc.3", features = ["static_secrets"] }
 getrandom = { version = "0.2", features = ["std"] }
-# boringtun 0.6 钉 ring 0.16（无 OHOS 支持）⇒ 下方 [patch] 换同算法垫片
-# （R0 就位、R1 数据面消费；垫片源码 tools/ring-shim/，配方源自
-#  tier:tools/spikes/rust-ohos-poc/ring-shim/，**依赖组合勿改**——PoC 已实测）
-boringtun = "0.6"
 # 0.14 起 TCP 拥塞控制按算法 feature 门控（R8-8a：CUBIC——R6.6 的 CC 垫片即 CUBIC
 # 增长律，迁移后由上游 RFC 合规实现替代）。R8-2 曾加开 reno feature 做真机归因消融
 # 对照臂（HOMEWAY_CC=reno）——该 env 已在 R8 收尾批删除、`crates/**` 零引用 ⇒ **M5 C3
@@ -81,9 +77,6 @@ rustls = { version = "0.23", default-features = false, features = ["ring", "std"
 #        （**只为 select!**——仍不用 #[tokio::main]，单线程不变量不受影响）。
 #        不启 rt-multi-thread（单线程是结构不变量，不启用即编译期约束）。
 tokio = { version = "1", default-features = false, features = ["rt", "time", "sync", "macros"] }
-
-[patch.crates-io]
-ring = { path = "tools/ring-shim" }
 
 # ---- M5 S1 构建档位（设计 §0.3/§0.4 + §15-1 主会话裁决；登记 = §8.5-L-1） ----
 # 本仓**首次**引入 `[profile.*]`（M0–M4 全过程口径 = 无 profile 档）。

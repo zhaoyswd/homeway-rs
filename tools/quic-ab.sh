@@ -6,7 +6,7 @@
 # 只绑 127.0.0.1:0（内核分配端口后读回），无 state 目录/出口/token；收工**只按记录的 PID** kill。
 #
 # 用法：
-#   tools/quic-ab.sh cpu      [--arms raw,wg-shim,quic] [--payload 1280] [--n 60000] [--rounds 3] [--mtu 1400] [--profile lab|product]
+#   tools/quic-ab.sh cpu      [--arms raw,quic] [--payload 1280] [--n 60000] [--rounds 3] [--mtu 1400] [--profile lab|product]
 #   tools/quic-ab.sh overhead [--n 60000] [--mtu 1400] [--payload 1280] [--profile lab|product]
 #   tools/quic-ab.sh size     [--profile lab,product]
 #   tools/quic-ab.sh mem      [--mode steady|load|conns|conns-load|rss] [--arms ...] [--rounds 3]
@@ -21,7 +21,6 @@ set -uo pipefail
 REPO_ROOT="${0:h:A:h}"
 AB_ROOT="$REPO_ROOT/tools/quic-ab"
 ARMS_DIR="$AB_ROOT/arms"
-SHIM_DIR="$AB_ROOT/wg-shim"
 OUT="${QUIC_AB_DIR:-/tmp/quic-ab/$(date +%Y%m%d-%H%M%S)}"
 NDK="${OHOS_NDK:-/Applications/DevEco-Studio.app/Contents/sdk/default/openharmony/native}"
 NDK_CC="$NDK/llvm/bin/aarch64-unknown-linux-ohos-clang"
@@ -30,7 +29,10 @@ OHOS_TARGET="aarch64-unknown-linux-ohos"
 
 # ---------- 参数默认（口径见 README 判据表） ----------
 SUB="${1:-}"; shift 2>/dev/null || true
-ARMS="raw,wg-shim,quic"      # 默认三臂；wg-ring 是诊断臂（--arms 显式加）
+# M5 C4：WG 两臂（wg-shim / wg-ring）随 WG 面退役删除——默认只剩 raw,quic 两臂；
+# 门槛表的「每包 CPU ≤ 现役 WG+shim ×1.0」「线开销 ≤40B」两条相对列**失去参照臂**
+# （设计 §9.2 默认 (c)：保留绝对列 + 登记臂退役）。
+ARMS="raw,quic"
 PAYLOAD=1280
 N=60000
 ROUNDS=3
@@ -109,8 +111,6 @@ runner() {  # runner <档目录> <臂> → 二进制路径
   local p="$1"
   case "$2" in
     raw)     echo "$ARMS_DIR/target/$p/raw" ;;
-    wg|wg-ring) echo "$ARMS_DIR/target/$p/wg" ;;
-    wg-shim) echo "$SHIM_DIR/target/$p/wg" ;;
     quic)    echo "$ARMS_DIR/target/$p/quic" ;;
     multiconn) echo "$ARMS_DIR/target/$p/multiconn" ;;
     *) die "未知臂：$2" ;;
@@ -171,16 +171,15 @@ build_probe() {  # build_probe <prof-dir 名> → 构建两 workspace 的探针�
   [[ "$p" == "product" ]] && args=(--profile product) || args=(--release)
   log "构建探针（$p 档）…"
   ( cd "$ARMS_DIR" && cargo build "${args[@]}" --bins > "$OUT/build-arms-$p.log" 2>&1 ) || { tail -20 "$OUT/build-arms-$p.log"; die "arms 构建失败"; }
-  ( cd "$SHIM_DIR" && cargo build "${args[@]}" > "$OUT/build-shim-$p.log" 2>&1 ) || { tail -20 "$OUT/build-shim-$p.log"; die "wg-shim 构建失败"; }
+
   # 自检（M0 设计 §4.4）：非根 [profile] 会被 cargo 忽略（静默失效）⇒ 有该警告即红
-  if grep -qi 'profiles for the non root package will be ignored' "$OUT/build-arms-$p.log" "$OUT/build-shim-$p.log"; then
+  if grep -qi 'profiles for the non root package will be ignored' "$OUT/build-arms-$p.log"; then
     die "构建日志出现「非根 profile 被忽略」——档位会静默失效"
   fi
   # 执行用二进制指纹（**构建时**快照——收尾重算会与「本次真正跑的那批」不一致，代码门 L4）
   {
     echo "=== 档位 $p / $(date '+%Y-%m-%d %H:%M:%S')（本次执行用二进制快照）==="
-    for f in "$ARMS_DIR/target/$p/raw" "$ARMS_DIR/target/$p/wg" "$ARMS_DIR/target/$p/wg_size" \
-             "$ARMS_DIR/target/$p/quic" "$ARMS_DIR/target/$p/multiconn" "$SHIM_DIR/target/$p/wg"; do
+    for f in "$ARMS_DIR/target/$p/raw" "$ARMS_DIR/target/$p/quic" "$ARMS_DIR/target/$p/multiconn"; do
       [[ -f "$f" ]] && shasum -a 256 "$f"
     done
   } >> "$OUT/bins.sha256"
@@ -190,7 +189,6 @@ build_probe() {  # build_probe <prof-dir 名> → 构建两 workspace 的探针�
   {
     echo "=== profile 记录（$p 档，$(date '+%Y-%m-%d %H:%M:%S')）==="
     echo "-- $ARMS_DIR/Cargo.toml"; sed -n '/\[profile\./,$p' "$ARMS_DIR/Cargo.toml"
-    echo "-- $SHIM_DIR/Cargo.toml";  sed -n '/\[profile\./,$p' "$SHIM_DIR/Cargo.toml"
     echo ""
   } >> "$OUT/profile-record.txt"
 }
@@ -251,11 +249,9 @@ cmd_overhead() {
   build_probe "$p"
   local out="$OUT/overhead.txt"; : > "$out"
   mark "overhead start"
-  # ① WG 线上字节（wg_size 探针：会话建立后 encapsulate 一枚数据包的长度）
-  local wgsz="$ARMS_DIR/target/$p/wg_size"
-  [[ -x "$wgsz" ]] || die "wg_size 探针不在：$wgsz"
-  local wgjson=""; wgjson=$(PAYLOAD=$PAYLOAD "$wgsz")
-  echo "WG（$PAYLOAD B 载荷）: $wgjson" | tee -a "$out" "$OUT/summary.txt"
+  # ① WG 线上字节 = **退役**（M5 C4：`wg_size` 探针随 WG 面删除；门槛表的「线开销 ≤40B」
+  #    WG 相对列失去参照臂——设计 §9.2 默认 (c)：保留绝对列 + 登记臂退役）
+  echo "（WG 线开销条已退役——M5 C4 的 WG 臂删除；本档只给 QUIC 绝对列）" | tee -a "$out" "$OUT/summary.txt"
   # ② QUIC oneway（服务端 udp_rx 口径 = 线开销）
   local qbin=""; qbin=$(runner "$p" quic)
   local slog="$OUT/ow-srv.out"
@@ -288,8 +284,9 @@ cmd_size() {
   [[ "${CFLAGS_aarch64_unknown_linux_ohos:-}" != *nostdlibinc* ]] || die "CFLAGS 含 -nostdlibinc（check 档 flags 不得进真链接——M0 设计 §4.5 前置）"
   export CC_aarch64_unknown_linux_ohos="$NDK_CC"
   local out="$OUT/size-matrix.txt"; : > "$out"
-  # lab 档三格（M0 设计 §4.3/§5.1）：①② 来自空壳探针（v1 形态，无 boringtun/smoltcp），
-  # ③ 来自 v2 形态探针（boringtun+smoltcp 在场 + 真引用全路径）。第④格 = 现役 .so 对照。
+  # lab 档三格（M0 设计 §4.3/§5.1；**M5 C4 口径变更**）：①② 来自空壳探针（v1 形态），
+  # ③ 来自 v2 形态探针（**base 由 boringtun+smoltcp 改为 smoltcp**——WG 面退役）。
+  # 第④格 = 现役 .so 对照。⇒ ③ 格与 M0–M4 的该格读数**不可直接互引**（登记）。
   # `--profile` 列表逐档全跑（lab = target/release；product = target/product）；
   # 注意 `lab_so` 取的是**最后一个 real 档**的值，两档尺寸差只在 lab∈列表时打印。
   local lab_so=""
@@ -352,7 +349,7 @@ cmd_size() {
 # footprint 采样器（**单位归一到 K**）：`vmmap -summary` 在 <10MB 时打 `1234K`、≥10MB 时打
 # `10.3M` ⇒ 「strip 非数字」会把 10.3M 读成 103（S5 L1 实测踩过：产品出口 10MB+）。
 # 本函数对两种单位都归一为 K。**不影响已登记读数**：M0/M1/M2 的 quic-ab 各臂目标
-# （探针档 raw/wg/wg-ring/quic、multiconn 32 点、conns-load）footprint 全 <10MB（最大
+# （探针档 raw/quic、multiconn 32 点、conns-load）footprint 全 <10MB（最大
 # 3616K）⇒ 走的是 K 分支，数值逐字节不变（S6 复验见 docs/reviews/M2.md）。
 sample_footprint() {  # sample_footprint <pid> <n> → 采样 K 值（换行分隔）
   local pid="$1" n="$2" s=()

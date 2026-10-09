@@ -8,16 +8,14 @@ publish = false
 cargo-fuzz = true
 
 # 独立 workspace（根 Cargo.toml exclude）——fuzz 目标只在 nightly + cargo-fuzz 下构建，
-# 不进 cargo test --workspace（G-10）。[patch.crates-io] 与根一致（依赖组合不漂）。
+# 不进 cargo test --workspace（G-10）。**M5 C4**：`[patch.crates-io]`（ring 垫片）随
+# WG 面退役删除——本仓不再 patch 任何依赖。
 [workspace]
 members = ["."]
 
 [dependencies]
 libfuzzer-sys = "0.4"
 homeway-core = { path = "../crates/homeway-core" }
-
-[patch.crates-io]
-ring = { path = "../tools/ring-shim" }
 
 
 [[bin]]
