@@ -644,7 +644,7 @@ fn run() -> Result<(), String> {
     let args = Args::parse()?;
     // ---- 物料：token 或显式参数 ----
     let mut quic_ep = args.quic_ep;
-    let mut relay_ep = args.relay_ep;
+    let relay_ep = args.relay_ep; // 只读（存量 unused_mut，M2 S5 顺手清）
     let mut rpk: Option<[u8; 32]> = args.rpk_hex.as_deref().map(hex32).transpose()?;
     let mut secret: Option<[u8; 32]> = args.secret_hex.as_deref().map(hex32).transpose()?;
     let mut label: Option<[u8; 8]> = None;
