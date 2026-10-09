@@ -560,10 +560,15 @@ fixtures 向量逐字节不变；**客户端 QUIC 档零 `stackb::` 可达引用
 
 **范围**：
 
-- 删：`wgcore`（除 QUIC 岛共用类型）、`wtransport`（bind / frame / reg / endpoint_cache /
-  domain_eps）、`server/bind` 腿表族、`server/device.rs`、`server/relayleg.rs`、
-  `session/recover` 旧档、`tools/ring-shim`、fixtures（identity / psk / reg / endpointcache
-  退役登记；relay / stun 按实际改动画线）。
+- 删：`wgcore`（除 QUIC 岛共用类型）、`wtransport`（bind / reg / endpoint_cache / domain_eps ——
+  **`frame.rs` 不可删**：它是中继线协议（`relay/**` 在用）⇒ 迁址保留）、`server/device.rs`、
+  `session/recover` 旧档、`tools/ring-shim`、`udpbatch.rs`（Q10 补登）、`session_connect_target` /
+  `wg_dial_addr`（M4 交下）、fixtures（identity / psk / reg / endpointcache 退役登记；relay / stun 按实际
+  改动画线）。**`wgcore/stackb.rs` 不可删**（其 `TunDevice` 是 intercept 的生产件）⇒ 迁址保留。
+  **⚠️ 订正（M5 设计门 r22 A1 高危，2026-10-09）**：本行原文写的「删 `server/bind` 腿表族 +
+  `server/relayleg.rs`」是**事实错误**——腿表族是 **QUIC 经中继的唯一通路**（`homeway-quic/src/exit/socket.rs`
+  的两条物理路径 + `engine.rs::sync_quic_legs` + `relayleg.rs` 拨腿），整件删 = QUIC 经中继死，且补它
+  必须改中继（反破红线）⇒ 二者改**「裁剪」**（保留与 QUIC/中继相关的腿面，删 WG-only 分支），详见设计 §1.3。
 - intercept 收窄：DATAGRAM → 过境 + DNS 两径；`served_ports` 简化。
 - 观测面重写：`tunStatusJSON` / link 行 / 判据行按新语义定稿 + `INTEROP-CRITERIA` 全表登记
   （C/E/X/DC/CA 家族逐行：改/删/新增；见「判据与登记预算」节）。
@@ -579,6 +584,21 @@ fixtures 向量逐字节不变；**客户端 QUIC 档零 `stackb::` 可达引用
   假设，如源校验 / 漫游学习 / 腿回程）。
 
 **退出口**：删除清单全清；判据登记全量同步；体积 / 内存终值入册。
+
+**§0 删码余量实测（2026-10-09，M5 设计门前置实验；读数仓外 `/tmp/m5lab/`）**：
+三 `git worktree` × 同一 `build-app-core.sh`/NDK strip 口径，四格矩阵（均有 20/20 符号门，评审独立复现）：
+
+| 形态 | 无 `[profile.release]`（M0–M4 全程口径） | `lto=true`+`codegen-units=1` | 再 `opt-level="s"` |
+|---|---|---|---|
+| WG-only（`4841b20`） | 2,213,744 B | **1,685,144 B** | 未测 |
+| 双栈（HEAD `0cf68b4`） | **4,891,776 B** | **3,556,520 B** | **2,899,368 B** |
+
+**结论（与「删码才能达标」的预判不同）**：**3.8MB 判据的主杠杆是构建档位不是删码**——双栈 + LTO 已
+**3.39MB = 0.936× 判据**（**一行 WG 未删**）；叠加删码（符号归因：wgcore 163.7K / wtransport 77.7K /
+session 64.5K / boringtun 59.8K / service_exec 31.9K + facade 份额）预计终值 **≈3.0–3.25MB**。
+**若不改档位则判据不可达**（4.39–4.54MB > 3.8MB）⇒ **改发布档位是唯一低成本达标路径**（属构建口径
+变更，**待用户点头**）。不确定性已落纸：粗删终点直读缺失（`tun_exec` 的 WG 档与岛装配方法级纠缠、
+17 处编译点 ⇒ 全量删除即 S2/S3 实现本体）、符号归因 ≠ 删后读数、`opt-s` 是已实测的第二条路径。
 
 ## M6 真机与性能终验（估 2–4 会话日）
 
