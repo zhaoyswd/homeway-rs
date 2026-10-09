@@ -141,11 +141,18 @@ mod tests {
     #[test]
     fn listen_control_path_limit_boundary() {
         fn dir_with_full_len(total: usize) -> PathBuf {
-            let base = std::env::temp_dir();
+            // 尾分隔符归一：macOS 的 `TMPDIR` 带尾斜杠（`join` 不再补分隔符）、CI 的 `/tmp`
+            // 不带 —— 不归一则 `join` 后的长度差 1 B（ubuntu CI 实测左 95 / 右 94）。
+            let mut s = std::env::temp_dir().to_string_lossy().into_owned();
+            while s.len() > 1 && s.ends_with('/') {
+                s.pop();
+            }
+            let base = PathBuf::from(s); // 已去尾分隔符 ⇒ join 必补一个 "/"
             let want_dir = total - (CONTROL_SOCK_NAME.len() + 1);
             let base_len = base.as_os_str().len();
-            assert!(want_dir > base_len + 1, "临时目录太深，构造不出目标长度");
-            let pad = want_dir - base_len - 1;
+            // 目标长度 = base_len + 1（分隔符）+ name_len（1 + pad）
+            assert!(want_dir >= base_len + 2, "临时目录太深，构造不出目标长度");
+            let pad = want_dir - base_len - 2;
             let mut name = String::from("q");
             name.push_str(&"g".repeat(pad));
             let d = base.join(name);

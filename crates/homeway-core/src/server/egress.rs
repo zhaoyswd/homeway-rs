@@ -836,10 +836,14 @@ mod tests {
         for i in &ifaces {
             assert_eq!(i.index_ok, i.index != 0, "index_ok 必须与 index 一致：{i:?}");
         }
+        // socket 必须是**活值**：`as_raw_fd(&UdpSocket::bind(..))` 取的是临时值的 fd
+        // （语句结束即 drop ⇒ fd 关闭）。darwin 分支因 `index==0` 有前置拒、碰不到 fd 而
+        // 侥幸通过；linux 分支真发 `setsockopt` ⇒ EBADF（9）而非 ENODEV —— CI 实证。
+        let sock = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let fd = std::os::fd::AsRawFd::as_raw_fd(&sock);
         // darwin：index=0 + 任意名 ⇒ InvalidInput（不误报「已钉卡」）
         #[cfg(target_os = "macos")]
         {
-            let fd = std::os::fd::AsRawFd::as_raw_fd(&UdpSocket::bind("127.0.0.1:0").unwrap());
             let e = pin_socket_to_iface(fd, 0, "hw-no-such-iface").unwrap_err();
             assert_eq!(e.kind(), std::io::ErrorKind::InvalidInput);
         }
@@ -847,7 +851,6 @@ mod tests {
         // 按名面拒（L1：内核 optlen=0 是「解绑且成功」）
         #[cfg(target_os = "linux")]
         {
-            let fd = std::os::fd::AsRawFd::as_raw_fd(&UdpSocket::bind("127.0.0.1:0").unwrap());
             let e = pin_socket_to_iface(fd, 0, "hw-no-such-iface").unwrap_err();
             assert_eq!(e.raw_os_error(), Some(libc::ENODEV), "按名绑定坏名 = ENODEV：{e}");
             let e = pin_socket_to_iface(fd, 6, "").unwrap_err();
