@@ -570,15 +570,15 @@ async fn connect_registers_on_control_stream_and_logs_criteria_lines() {
     assert!(snap.current_mtu >= 1320, "current_mtu ≥ min_mtu：{}", snap.current_mtu);
     assert_eq!(snap.mirrors, 1, "投出的候选数累计");
 
-    let lines = logs_until(&logs, "quic: 准入完成", WAIT).await;
+    let lines = logs_until(&logs, "准入完成", WAIT).await;
     for needle in [
-        "quic: 端点就绪（本地 ",
-        "quic: 赛跑投出 1 个候选（直连 1 / 中继 0；本行每轮限 3 条）",
-        "quic: 赛跑结算：胜出 直连 ",
-        "quic: 路径确立：直连 ",
+        "端点就绪（本地 ",
+        "赛跑投出 1 个候选（直连 1 / 中继 0；本行每轮限 3 条）",
+        "赛跑结算：胜出 直连 ",
+        "路径确立：直连 ",
         "（首个完成握手）",
-        "quic: 准入已发起（dev=22222222，Hello 50B；等挑战/回执）",
-        "quic: 准入完成（dev=22222222，耗时 ",
+        "准入已发起（dev=22222222，Hello 50B；等挑战/回执）",
+        "准入完成（dev=22222222，耗时 ",
     ] {
         assert!(
             lines.iter().any(|l| l.contains(needle)),
@@ -640,7 +640,7 @@ async fn admission_rejection_carries_code_line_and_snapshot_fields() {
             .clone();
         assert_eq!(
             l,
-            format!("quic: 准入回执（code=0x{want:02x} {text}）——本世代未建连"),
+            format!("准入回执（code=0x{want:02x} {text}）——本世代未建连"),
             "归因行逐字"
         );
         assert!(!l.contains("准入被拒"), "客户端行不得用出口前缀（脚本 grep 会混淆）：{l}");
@@ -674,7 +674,7 @@ async fn post_admission_session_close_is_not_reported_as_admission() {
         "会话级关闭必须单独归因：{lines:?}"
     );
     assert!(
-        !lines.iter().any(|l| l.starts_with("quic: 准入回执（")),
+        !lines.iter().any(|l| l.starts_with("准入回执（")),
         "会话级关闭**不得**产生准入回执（设计门 F4）：{lines:?}"
     );
     let snap = island.snapshot();
@@ -783,10 +783,10 @@ async fn relay_candidate_wins_through_envelope_and_downlink_is_stripped() {
     assert!(relay.clean(), "上行必须恒为合规信封（label 逐字节一致）");
     assert_eq!(stub.accepted(), 1, "登记帧经中继到达出口（引擎桩裁决通过）");
 
-    let lines = logs_until(&logs, "quic: 赛跑结算：胜出 中继", WAIT).await;
+    let lines = logs_until(&logs, "赛跑结算：胜出 中继", WAIT).await;
     let settle = lines
         .iter()
-        .find(|l| l.contains("quic: 赛跑结算：胜出 中继 "))
+        .find(|l| l.contains("赛跑结算：胜出 中继 "))
         .expect("C5' 行按类别取值（胜出 中继）")
         .clone();
     assert!(
@@ -794,7 +794,7 @@ async fn relay_candidate_wins_through_envelope_and_downlink_is_stripped() {
         "C5' 行含胜者地址与清单：{settle}"
     );
     // C15'（刷新）行里的「中继=」位也按类别取值
-    let refresh = logs_until(&logs, "quic: 注册刷新 → ", WAIT).await;
+    let refresh = logs_until(&logs, "注册刷新 → ", WAIT).await;
     assert!(
         refresh.iter().any(|l| l.contains("中继=true")),
         "刷新行的中继位如实：{refresh:?}"
@@ -1040,10 +1040,10 @@ async fn admission_budget_floor_fails_with_explicit_close() {
         "不得拖到出口侧的 ADMIT_DEADLINE（10s）：{elapsed:?}"
     );
 
-    let lines = logs_until(&logs, "quic: 准入失败", WAIT).await;
+    let lines = logs_until(&logs, "准入失败", WAIT).await;
     let line = lines
         .iter()
-        .find(|l| l.contains("quic: 准入失败"))
+        .find(|l| l.contains("准入失败"))
         .expect("准入失败行在（失败必须可归因，不静默）")
         .clone();
     assert!(line.contains("预算 2s"), "行文须写明实际预算 = 下界：{line}");
@@ -1052,7 +1052,7 @@ async fn admission_budget_floor_fails_with_explicit_close() {
         "行文须写明显式收口（不留悬挂）：{line}"
     );
     assert!(
-        lines.iter().any(|l| l.contains("quic: 准入已发起")),
+        lines.iter().any(|l| l.contains("准入已发起")),
         "四帧已发起（Hello 已发）后才到点：{lines:?}"
     );
 
@@ -1128,10 +1128,10 @@ async fn refresh_frames_reach_peer_and_log_c15_prime() {
         stub.accepted()
     );
     assert_eq!(stub.rejected(), 0, "刷新帧不得被拒（exporter 复用正确）");
-    let lines = logs_until(&logs, "quic: 注册刷新 → ", WAIT).await;
+    let lines = logs_until(&logs, "注册刷新 → ", WAIT).await;
     let line = lines
         .iter()
-        .find(|l| l.contains("quic: 注册刷新 → "))
+        .find(|l| l.contains("注册刷新 → "))
         .expect("C15' 行在")
         .clone();
     assert!(line.contains(&addr.to_string()), "行含端点：{line}");
@@ -1215,10 +1215,10 @@ async fn rebind_keeps_connection_and_peer_observes_new_path() {
         "岛必须在保持窗内确认迁移（入站证据 ⇒ N-b）"
     );
 
-    let lines = logs_until(&logs, "quic: 迁移完成（", WAIT).await;
+    let lines = logs_until(&logs, "迁移完成（", WAIT).await;
     let line = lines
         .iter()
-        .find(|l| l.contains("quic: 迁移完成（"))
+        .find(|l| l.contains("迁移完成（"))
         .expect("N-b 行在")
         .clone();
     assert!(
@@ -1424,11 +1424,11 @@ async fn drop_counters_events_and_nc_line() {
             n: 2,
         })
         .expect("投递丢弃上报");
-    let lines = logs_until(&logs, "quic: 丢弃 超限=2", WAIT).await;
+    let lines = logs_until(&logs, "丢弃 超限=2", WAIT).await;
     assert!(
         lines
             .iter()
-            .any(|l| l.contains("quic: 丢弃 超限=2 发送缓冲满=0 回程队列满=0 未登记=0")),
+            .any(|l| l.contains("丢弃 超限=2 发送缓冲满=0 回程队列满=0 未登记=0")),
         "N-c 行四字段序固定：{lines:?}"
     );
     assert_eq!(
@@ -1688,7 +1688,7 @@ async fn oversize_tun_packet_is_dropped_and_counted() {
 
     // S3-3 的「行 ↔ 计数同源」：N-c 行由**同一份** `IslandSnapshot::drops` 渲染
     // （`note_drop_shared` 一处），故计数 +1 必伴随行里的 `超限=1`
-    let lines = logs_until(&logs, "quic: 丢弃 ", WAIT).await;
+    let lines = logs_until(&logs, "丢弃 ", WAIT).await;
     assert!(
         lines
             .iter()
@@ -2380,11 +2380,11 @@ async fn stream_open_write_read_echo_half_close_and_close() {
     // ⑦ 行面（C19 族的开/关行；首 3 条必出）
     let lines = logs_until(&logs, "服务流已关", WAIT).await;
     assert!(
-        lines.iter().any(|l| l.contains("quic: 服务流已开（tag=probe")),
+        lines.iter().any(|l| l.contains("服务流已开（tag=probe")),
         "开流行：{lines:?}"
     );
     assert!(
-        lines.iter().any(|l| l.contains("quic: 服务流已关（id=1 tag=probe，↑10B ↓10B")),
+        lines.iter().any(|l| l.contains("服务流已关（id=1 tag=probe，↑10B ↓10B")),
         "关流行（含字节数）：{lines:?}"
     );
     assert!(island.stop_within(Instant::now() + BUDGET));
@@ -2563,7 +2563,7 @@ async fn stream_write_reports_backpressure_with_original_buffer() {
     assert!(saw_back, "对端停读 + 小队列 ⇒ 必须有背压回执（n=0）");
     let lines = logs_until(&logs, "服务流背压", WAIT).await;
     assert!(
-        lines.iter().any(|l| l.contains("quic: 服务流背压（id=1 tag=probe")),
+        lines.iter().any(|l| l.contains("服务流背压（id=1 tag=probe")),
         "背压行（含 id/tag/队列容量）：{lines:?}"
     );
     let deadline = Instant::now() + WAIT;

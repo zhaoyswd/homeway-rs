@@ -384,7 +384,7 @@ impl HostSession {
         );
         match outcome {
             Ok(o) => (logf)(&format!(
-                "quic: 宿主会话已建连（候选 {n} 个，胜出 {} {}，耗时 {}ms）",
+                "宿主会话已建连（候选 {n} 个，胜出 {} {}，耗时 {}ms）",
                 o.via.text(),
                 o.winner,
                 o.elapsed_ms

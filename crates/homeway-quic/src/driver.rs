@@ -168,7 +168,7 @@ impl Island {
         let n_probe = apply_probe_env(&mut cfg.probe, &logf);
         let lim = cfg.streams;
         (*logf)(&format!(
-            "quic: 流面参数（bidi={} uni={} recv_window={}B conn_recv_window={}B send_window={}B 待发={}B；有效服务流 {}；env 覆盖 {n_streams} 项）",
+            "流面参数（bidi={} uni={} recv_window={}B conn_recv_window={}B send_window={}B 待发={}B；有效服务流 {}；env 覆盖 {n_streams} 项）",
             lim.max_bidi,
             lim.max_uni,
             lim.recv_window,
@@ -179,7 +179,7 @@ impl Island {
         ));
         let pt = cfg.probe;
         (*logf)(&format!(
-            "quic: 快探参数（首探 {:?}，拍间 {:?}，复探 ×{}，待机 {:?}，抖动阈值 {}，B 门 连续 {}/窗 {:?}，发送面新鲜度窗 {:?}，在用窗 {:?}；env 覆盖 {n_probe} 项）",
+            "快探参数（首探 {:?}，拍间 {:?}，复探 ×{}，待机 {:?}，抖动阈值 {}，B 门 连续 {}/窗 {:?}，发送面新鲜度窗 {:?}，在用窗 {:?}；env 覆盖 {n_probe} 项）",
             pt.fast_budget,
             pt.fast_gap,
             pt.reprobe_factor,
@@ -369,7 +369,7 @@ impl Island {
             (s.local, s.connections)
         };
         (*self.logf)(&format!(
-            "quic: 到点 detach —— 老世代仍持 UDP 源端口 {}、连接 {} 条（可能继续对出口发包；M0 §8.1 残余）",
+            "到点 detach —— 老世代仍持 UDP 源端口 {}、连接 {} 条（可能继续对出口发包；M0 §8.1 残余）",
             local
                 .map(|a| a.to_string())
                 .unwrap_or_else(|| "（未就绪）".to_owned()),
@@ -435,7 +435,7 @@ fn thread_body(
     if let Err(payload) = res {
         let msg = panic_msg(payload.as_ref());
         (ctx.logf)(&format!(
-            "quic: 岛内 panic（{msg}）—— 判不健康（panic），岛线程退出（不复用该线程）"
+            "岛内 panic（{msg}）—— 判不健康（panic），岛线程退出（不复用该线程）"
         ));
         ctx.unhealthy(REASON_PANIC);
         ctx.exit.mark_exited();
@@ -641,7 +641,7 @@ fn run_driver(
                                         s.admit_reject_text =
                                             crate::admit_close::text(*code).map(str::to_owned);
                                     }
-                                    (*ctx.logf)(&format!("quic: 赛跑未成（{e}）"));
+                                    (*ctx.logf)(&format!("赛跑未成（{e}）"));
                                     let _ = reply.send(Err(e));
                                 }
                             }
@@ -662,7 +662,7 @@ fn run_driver(
                             if round == Round::Confirm && ok {
                                 if let Some(note) = st.rebind.take() {
                                     (*ctx.logf)(&format!(
-                                        "quic: 迁移完成（{} → {}，耗时 {}）",
+                                        "迁移完成（{} → {}，耗时 {}）",
                                         note.from,
                                         note.to,
                                         client::fmt_dur(now.saturating_duration_since(note.at))
@@ -711,7 +711,7 @@ fn run_driver(
         }
         // 收工：长任务全 abort（JoinSet drop）→ 连接面/端点随 face drop 关闭
         drop(jobs);
-        (*ctx.logf)("quic: 岛收工（连接面随端点关闭）");
+        (*ctx.logf)("岛收工（连接面随端点关闭）");
     });
 }
 
@@ -772,19 +772,19 @@ fn adopt(
         let n = st.streams.clear_on_connection_loss();
         if n > 0 {
             (*ctx.logf)(&format!(
-                "quic: 换连接 —— 旧连接上的 {n} 条服务流按 EOF 收（调用方按需重开）"
+                "换连接 —— 旧连接上的 {n} 条服务流按 EOF 收（调用方按需重开）"
             ));
         }
         old.conn.close(quinn::VarInt::from_u32(0), b"replaced by newer race");
         if !st.na_logged {
-            (*ctx.logf)("quic: 替换旧连接（旧连接已 CONNECTION_CLOSE）");
+            (*ctx.logf)("替换旧连接（旧连接已 CONNECTION_CLOSE）");
         }
     }
     if !st.na_logged {
         st.na_logged = true;
         let live = st.live.as_ref().expect("刚放入");
         (*ctx.logf)(&format!(
-            "quic: 端点就绪（本地 {local}，MTU {}，max_datagram_size={}）",
+            "端点就绪（本地 {local}，MTU {}，max_datagram_size={}）",
             live.current_mtu(),
             live.mds().unwrap_or(0)
         ));
@@ -808,7 +808,7 @@ fn check_narrow_path(st: &mut DriverState, ctx: &IslandCtx) {
     }
     st.narrow_logged = Some(mds);
     (*ctx.logf)(&format!(
-        "quic: 窄路径不可用 —— max_datagram_size={mds}B < 内层 MTU={}B，1280 内层包将全部被丢（丢 + 计数不静默；MTU 降级旋钮 = HOMEWAY_QUIC_MTU）",
+        "窄路径不可用 —— max_datagram_size={mds}B < 内层 MTU={}B，1280 内层包将全部被丢（丢 + 计数不静默；MTU 降级旋钮 = HOMEWAY_QUIC_MTU）",
         tun.mtu
     ));
 }
@@ -839,19 +839,19 @@ async fn housekeeping(
         if let Some(l) = st.live.as_ref() {
             if let IslandErr::SessionClosed { reason } = client::session_closed(&l.conn) {
                 (*ctx.logf)(&format!(
-                    "quic: 会话被对端关闭（{reason}）——会话级归因（非准入面）"
+                    "会话被对端关闭（{reason}）——会话级归因（非准入面）"
                 ));
             }
         }
         if !st.dead_logged {
             st.dead_logged = true;
-            (*ctx.logf)("quic: 连接已断 —— 交快探阶梯（M/R/B；§3.1）保世代重连，不再就地拆世代");
+            (*ctx.logf)("连接已断 —— 交快探阶梯（M/R/B；§3.1）保世代重连，不再就地拆世代");
         }
         // M3：在册服务流一并作废（读回 EOF / 写快速失败；§1.6 的 EOF 同形性——
         // 与今天 `stackb` 在连接死时的表现一致，调用方按需重开）
         let n = st.streams.clear_on_connection_loss();
         if n > 0 {
-            (*ctx.logf)(&format!("quic: 连接断 —— {n} 条在册服务流按 EOF 收"));
+            (*ctx.logf)(&format!("连接断 —— {n} 条在册服务流按 EOF 收"));
         }
         st.live = None;
         st.watch = None;
@@ -874,7 +874,7 @@ async fn housekeeping(
     // ② 刷新到点（C15'；写失败 = 连接已断 ⇒ 交阶梯，判据同 ①）
     if let Some(live) = st.live.as_mut() {
         if !live.refresh_if_due(face.credential(), &ctx.logf).await {
-            (*ctx.logf)("quic: 注册刷新写失败 —— 判连接已断（交快探阶梯）");
+            (*ctx.logf)("注册刷新写失败 —— 判连接已断（交快探阶梯）");
             st.live = None;
             st.watch = None;
             st.pump_conn = None;
@@ -897,7 +897,7 @@ async fn housekeeping(
     match ev {
         Some((MigrationEvent::Confirmed { elapsed }, from, to)) => {
             (*ctx.logf)(&format!(
-                "quic: 迁移完成（{from} → {to}，耗时 {}）",
+                "迁移完成（{from} → {to}，耗时 {}）",
                 client::fmt_dur(elapsed)
             ));
             lock_unpoison(&ctx.snapshot).migrations += 1;
@@ -905,7 +905,7 @@ async fn housekeeping(
         }
         Some((MigrationEvent::Unconfirmed, from, to)) => {
             (*ctx.logf)(&format!(
-                "quic: 迁移未确认（{from} → {to}，{} 内无对端回包 ⇒ 回落重连/重赛跑）",
+                "迁移未确认（{from} → {to}，{} 内无对端回包 ⇒ 回落重连/重赛跑）",
                 client::fmt_dur(patrol)
             ));
             lock_unpoison(&ctx.snapshot).migration_unconfirmed = true;
@@ -1057,7 +1057,7 @@ async fn handle_cmd(
                 return;
             }
             (*ctx.logf)(&format!(
-                "quic: 隧道面已附加（fd={fd}, mtu={mtu}；数据面已接线：读线程 + 回程队列 {} 条 + 写线程；fd 所有权在扩展，岛从不 close）",
+                "隧道面已附加（fd={fd}, mtu={mtu}；数据面已接线：读线程 + 回程队列 {} 条 + 写线程；fd 所有权在扩展，岛从不 close）",
                 tun::RETURN_QUEUE_MAX
             ));
             st.tun = Some(TunPlane {
@@ -1095,7 +1095,7 @@ async fn handle_cmd(
         Cmd::TunFdDead { msg } => {
             // 镜像 `wgcore` 的 `TunFdDead`：记行 + 既有取值 `fd` 的分类 + 卸面
             // （数据面已不可信；连接面留给世代层按阶梯处置）。
-            (*ctx.logf)(&format!("quic: {msg}"));
+            (*ctx.logf)(&msg);
             ctx.unhealthy(REASON_FD);
             st.tun = None;
             // 旧泵的消费者（写线程）已退：它在下一包 `try_push` 归 `Gone` 时自退（S6 的 A3）；
@@ -1115,7 +1115,7 @@ async fn handle_cmd(
             face.relays().set(&cands);
             st.cands = cands;
             lock_unpoison(&ctx.snapshot).candidates = n;
-            (*ctx.logf)(&format!("quic: 候选清单已更新（{n} 条）"));
+            (*ctx.logf)(&format!("候选清单已更新（{n} 条）"));
         }
         Cmd::DatagramDropped { reason, n } => {
             note_drop(ctx, reason, n, "数据面上报", None);
@@ -1159,11 +1159,11 @@ async fn handle_cmd(
                         .as_ref()
                         .map(|l| Watch::start(from, to, l.udp_rx(), Instant::now()));
                     lock_unpoison(&ctx.snapshot).migration_unconfirmed = false;
-                    (*ctx.logf)(&format!("quic: 本地 socket 已换绑（{from} → {to}）"));
+                    (*ctx.logf)(&format!("本地 socket 已换绑（{from} → {to}）"));
                     let _ = reply.send(Ok(to));
                 }
                 Err(e) => {
-                    (*ctx.logf)(&format!("quic: 换绑失败（{from} → …；{e}）"));
+                    (*ctx.logf)(&format!("换绑失败（{from} → …；{e}）"));
                     let _ = reply.send(Err(e));
                 }
             }
@@ -1335,7 +1335,7 @@ fn ladder_step(
                 match face.rebind(None) {
                     Ok(to) => {
                         (*ctx.logf)(&format!(
-                            "quic: 本地 socket 已换绑（{from} → {to}）—— M 动作（原因={why}）"
+                            "本地 socket 已换绑（{from} → {to}）—— M 动作（原因={why}）"
                         ));
                         st.rebind = Some(RebindNote {
                             from,
@@ -1347,7 +1347,7 @@ fn ladder_step(
                             .on_migrate_result(true, TokioInstant::now(), &ctx.logf);
                     }
                     Err(e) => {
-                        (*ctx.logf)(&format!("quic: 换绑失败（{from} → …；{e}）"));
+                        (*ctx.logf)(&format!("换绑失败（{from} → …；{e}）"));
                         step = st
                             .ladder
                             .on_migrate_result(false, TokioInstant::now(), &ctx.logf);
@@ -1363,13 +1363,13 @@ fn ladder_step(
                     // 窗口 60s → ≤1 快探预算 = 语义登记项 S7）
                     match st.rebind.take() {
                         Some(note) => (*ctx.logf)(&format!(
-                            "quic: 迁移未确认（{} → {}，{} 内无对端回包 ⇒ 回落重连/重赛跑）",
+                            "迁移未确认（{} → {}，{} 内无对端回包 ⇒ 回落重连/重赛跑）",
                             note.from,
                             note.to,
                             client::fmt_dur(st.ladder.tuning().fast_budget)
                         )),
                         None => (*ctx.logf)(
-                            "quic: 迁移未确认（一个快探预算内无对端回包 ⇒ 回落重连/重赛跑）",
+                            "迁移未确认（一个快探预算内无对端回包 ⇒ 回落重连/重赛跑）",
                         ),
                     }
                     lock_unpoison(&ctx.snapshot).migration_unconfirmed = true;
@@ -1407,7 +1407,7 @@ fn ladder_step(
             }
             LadderStep::Rebuild { why, r_fails } => {
                 (*ctx.logf)(&format!(
-                    "quic: 快探阶梯走完 M/R（连续重连失败 {r_fails}，原因={why}）—— 上报不健康（交世代重建）"
+                    "快探阶梯走完 M/R（连续重连失败 {r_fails}，原因={why}）—— 上报不健康（交世代重建）"
                 ));
                 ctx.unhealthy(REASON_PATROL);
                 return;
@@ -1446,7 +1446,7 @@ fn note_drop_shared(
     if log_due(total) {
         let ext = ext.map(|v| format!("，字节/条数={v}")).unwrap_or_default();
         (*logf)(&format!(
-            "quic: 丢弃 {line}（本次：{} ×{n} {detail}{ext}；计数行首 3 + 每 100）",
+            "丢弃 {line}（本次：{} ×{n} {detail}{ext}；计数行首 3 + 每 100）",
             reason.text()
         ));
     }
@@ -1473,7 +1473,7 @@ fn drop_note(ctx: &IslandCtx) -> DropNote {
 fn join_and_classify(h: JoinHandle<()>, logf: &Logf, on_unhealthy: &OnUnhealthy) {
     if let Err(payload) = h.join() {
         let msg = panic_msg(payload.as_ref());
-        (*logf)(&format!("quic: 岛线程 panic（{msg}）—— 本世代 QUIC 面已死"));
+        (*logf)(&format!("岛线程 panic（{msg}）—— 本世代 QUIC 面已死"));
         (on_unhealthy)(REASON_PANIC);
     }
 }

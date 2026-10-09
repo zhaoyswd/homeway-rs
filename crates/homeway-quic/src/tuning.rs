@@ -162,7 +162,7 @@ impl StreamLimits {
             let was = self.conn_recv_window;
             self.conn_recv_window = self.recv_window;
             notes.push(format!(
-                "quic: ⚠️ 流面参数跨项关系 —— 连接级接收窗（{}B）< 每流接收窗（{}B）会让每流窗失效；连接窗按需抬到 {}B（照依赖库语义：连接级窗 = 接收面聚合上界）",
+                "⚠️ 流面参数跨项关系 —— 连接级接收窗（{}B）< 每流接收窗（{}B）会让每流窗失效；连接窗按需抬到 {}B（照依赖库语义：连接级窗 = 接收面聚合上界）",
                 was, self.recv_window, self.conn_recv_window
             ));
         }
@@ -375,7 +375,7 @@ fn parse_env_u64(get: &dyn Fn(&str) -> Option<String>, name: &str, min: u64, max
     match raw.trim().parse::<u64>() {
         Ok(v) if (min..=max).contains(&v) => EnvOutcome::Value(v),
         _ => EnvOutcome::Rejected(format!(
-            "quic: ⚠️ {name}={raw} 非法或越界（有效区间 [{min},{max}]）—— 该项按设计缺省走（照 HOMEWAY_QUIC_MTU 先例）"
+            "⚠️ {name}={raw} 非法或越界（有效区间 [{min},{max}]）—— 该项按设计缺省走（照 HOMEWAY_QUIC_MTU 先例）"
         )),
     }
 }

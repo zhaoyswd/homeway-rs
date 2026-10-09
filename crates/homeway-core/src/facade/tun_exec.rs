@@ -91,15 +91,22 @@ const CLIENT_CLOSE_BUDGET: Duration = Duration::from_secs(2);
 /// ——`>1400` 撞 IPv6 信封余量、`<1320` 必然全丢，按缺省最不易造成静默劣化）。
 fn resolve_mtu_cap(cfg_value: i64, logf: &Logf) -> u16 {
     use homeway_quic::{QUIC_MTU_CAP_DEFAULT, QUIC_MTU_CAP_MAX, QUIC_MTU_CAP_MIN};
+    // N-e（M5 S4 新增行，世代装配一次）：**生效值 + 来源**必须看得见——单承载后这是
+    // 唯一的窄路径旋钮（设计 §8.4；此前只有非法值一行）。
+    let announce = |v: u16, from: &str| {
+        (logf)(&format!("内层 MTU 上限 {v}（来源={from}）"));
+        v
+    };
     let pick = |raw_text: &str, from: &str| match raw_text.trim().parse::<i64>() {
         Ok(v) if (i64::from(QUIC_MTU_CAP_MIN)..=i64::from(QUIC_MTU_CAP_MAX)).contains(&v) => {
-            v as u16
+            let v = v as u16;
+            announce(v, from)
         }
         _ => {
             (logf)(&format!(
-                "quic: MTU 上限取值 {raw_text:?}（{from}）非法或越界（有效区间 [{QUIC_MTU_CAP_MIN},{QUIC_MTU_CAP_MAX}]）——按缺省 {QUIC_MTU_CAP_DEFAULT} 走"
+                "MTU 上限取值 {raw_text:?}（{from}）非法或越界（有效区间 [{QUIC_MTU_CAP_MIN},{QUIC_MTU_CAP_MAX}]）——按缺省 {QUIC_MTU_CAP_DEFAULT} 走"
             ));
-            QUIC_MTU_CAP_DEFAULT
+            announce(QUIC_MTU_CAP_DEFAULT, "缺省（非法值回退）")
         }
     };
     if let Some(raw) = crate::envflag::quic_mtu_raw() {
@@ -108,7 +115,7 @@ fn resolve_mtu_cap(cfg_value: i64, logf: &Logf) -> u16 {
     if cfg_value > 0 {
         return pick(&cfg_value.to_string(), "tunConfig.quicMtuCap");
     }
-    QUIC_MTU_CAP_DEFAULT
+    announce(QUIC_MTU_CAP_DEFAULT, "缺省")
 }
 
 /// link 段 via 词表（`direct|relay|none`）——岛侧 `Via` 的**判据行**取值是中文
@@ -792,11 +799,11 @@ fn gen_loop(
             // WG 面删除而不成立）。**`quic: ` 前缀保留**：去前缀是 §4.4 的批量条目
             // （S4），本棒只改正文。
             (logf)(&format!(
-                "quic: 隧道侧就绪（L3 直通；隧道地址 {tunnel_ip}，后端隧道 IP {SERVER_TUNNEL_IP}）"
+                "隧道侧就绪（L3 直通；隧道地址 {tunnel_ip}，后端隧道 IP {SERVER_TUNNEL_IP}）"
             ));
         }
         Err(note) => {
-            (logf)(&format!("quic: 岛未就用（{note}）"));
+            (logf)(&format!("岛未就用（{note}）"));
             shared.stage.set_if_current(
                 gen,
                 TunStage::Failed,
@@ -1304,7 +1311,7 @@ fn island_unhealthy(run: &Arc<GenRun>) -> homeway_quic::OnUnhealthy {
 /// 本函数不再做动作——收到信号即如实判不健康。
 fn quic_unhealthy_signal(run: &Arc<GenRun>, reason: &str) {
     if reason == "patrol" {
-        (run.logf)("quic: 岛上报不健康（patrol）—— 岛内快探阶梯已走完 M/R（B 门），交世代重建");
+        (run.logf)("岛上报不健康（patrol）—— 岛内快探阶梯已走完 M/R（B 门），交世代重建");
     }
     run.tun_shared.mark_unhealthy_if_current(run.gen, reason);
 }
@@ -1367,7 +1374,7 @@ fn start_island(
     )
     .map_err(|e| QuicFail::Race(e.to_string()))?;
     (logf)(&format!(
-        "quic: 岛已建连（候选 {n} 个，胜出 {} {}，耗时 {}ms）—— L3 承载 = 岛",
+        "岛已建连（候选 {n} 个，胜出 {} {}，耗时 {}ms）—— L3 承载 = 岛",
         outcome.via.text(),
         outcome.winner,
         outcome.elapsed_ms
@@ -1444,7 +1451,7 @@ fn recover_downpush_on_island(run: &Arc<GenRun>, cause: &str) -> i32 {
             }
         }
     };
-    (run.logf)(&format!("quic: 恢复下推（{cause}）——岛快探{tag}：{verdict}"));
+    (run.logf)(&format!("恢复下推（{cause}）——岛快探{tag}：{verdict}"));
     // 耗时口径：实测值（正常形态 0.7s / 2.1s 两档）由用例与真机读数钉（M4.md §S4）；
     // 上界只在**实测**面设门（预登记指标 ≤8s），不在此处断言（见函数头的订正）。
     rc
@@ -1969,7 +1976,7 @@ mod tests {
         let rc = exec.recover(3, "扩展下推(档位 3)");
         assert_eq!(rc, -1, "两次探都失败 ⇒ -1（不是 0/-3/-4）");
         let seen = drain_lines(&lines);
-        let line = "quic: 恢复下推（扩展下推(档位 3)）——岛快探+复探：失败（";
+        let line = "恢复下推（扩展下推(档位 3)）——岛快探+复探：失败（";
         assert!(
             seen.iter().any(|l| l.starts_with(line)),
             "additive 归因行须逐字在场（首缀 {line:?}）：{seen:?}"
@@ -2100,6 +2107,12 @@ mod tests {
                 2,
                 "两次越界各记一行：{lines:?}"
             );
+            // N-e（M5 S4）：每次解析都有一行「生效值 + 来源」
+            let ne: Vec<&String> = lines.iter().filter(|l| l.contains("内层 MTU 上限")).collect();
+            assert_eq!(ne.len(), 5, "五次解析各一行 N-e：{lines:?}");
+            assert!(ne[0].contains("来源=缺省"), "{:?}", ne[0]);
+            assert!(ne[1].contains("来源=tunConfig.quicMtuCap"), "{:?}", ne[1]);
+            assert!(ne[3].contains("来源=缺省（非法值回退）"), "{:?}", ne[3]);
         }
     }
 
@@ -2130,7 +2143,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("quic: 岛未就用") && l.contains("候选为空")),
+                .any(|l| l.contains("岛未就用") && l.contains("候选为空")),
             "无 QUIC/中继端点必须记行归因（候选为空）：{lines:?}"
         );
         let joined = lines.join("\n");
@@ -2189,7 +2202,7 @@ mod tests {
         assert_eq!(prepare_gen(&core, &tok, &log), 0);
         let lines = wait_lines(&log, "岛未就用", Duration::from_secs(20));
         assert!(
-            lines.iter().any(|l| l.contains("quic: 赛跑投出")),
+            lines.iter().any(|l| l.contains("赛跑投出")),
             "岛必须真构造并发起赛跑（C4' 行）：{lines:?}"
         );
         assert!(
@@ -2205,7 +2218,7 @@ mod tests {
         assert!(
             lines
                 .iter()
-                .any(|l| l.contains("quic: 岛未就用") && l.contains("赛跑未成")),
+                .any(|l| l.contains("岛未就用") && l.contains("赛跑未成")),
             "黑洞候选 ⇒ 赛跑未成须归因：{lines:?}"
         );
         let joined = lines.join("\n");

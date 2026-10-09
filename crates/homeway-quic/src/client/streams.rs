@@ -256,7 +256,7 @@ impl Streams {
         }
         if err == StreamErr::Busy && self.active() >= self.capacity() {
             (*self.logf)(&format!(
-                "quic: 服务流失败（tag={}；{}；本机在册 {}/{}；第 {n} 次）",
+                "服务流失败（tag={}；{}；本机在册 {}/{}；第 {n} 次）",
                 tag.text(),
                 err.text(),
                 self.active(),
@@ -264,7 +264,7 @@ impl Streams {
             ));
         } else {
             (*self.logf)(&format!(
-                "quic: 服务流失败（tag={}；{}；第 {n} 次）",
+                "服务流失败（tag={}；{}；第 {n} 次）",
                 tag.text(),
                 err.text()
             ));
@@ -300,7 +300,7 @@ impl Streams {
         drop(inner);
         if log_due(n) {
             // C19 族（§8.2-11）的开流行；耗时由调用方在打开路径上补（本行只报 tag）
-            (*self.logf)(&format!("quic: 服务流已开（tag={}；第 {n} 条）", tag.text()));
+            (*self.logf)(&format!("服务流已开（tag={}；第 {n} 条）", tag.text()));
         }
         self.emit(IslandEvent::StreamOpened { tag });
         slot
@@ -328,7 +328,7 @@ impl Streams {
             let n = self.stats.backpressure.fetch_add(1, Ordering::SeqCst) + 1;
             if log_due(n) {
                 (*self.logf)(&format!(
-                    "quic: 服务流背压（id={} tag={}；待发队列满 {}B；第 {n} 次——调用方走 Ok(0) 退避环）",
+                    "服务流背压（id={} tag={}；待发队列满 {}B；第 {n} 次——调用方走 Ok(0) 退避环）",
                     id,
                     slot.tag.text(),
                     self.limits.pending_bytes
@@ -409,7 +409,7 @@ impl Streams {
         let n = self.stats.close.fetch_add(1, Ordering::SeqCst) + 1;
         if log_due(n) {
             (*self.logf)(&format!(
-                "quic: 服务流已关（id={} tag={}，↑{out}B ↓{inn}B；第 {n} 条）",
+                "服务流已关（id={} tag={}，↑{out}B ↓{inn}B；第 {n} 条）",
                 slot.id,
                 slot.tag.text()
             ));

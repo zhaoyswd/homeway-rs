@@ -154,7 +154,7 @@ async fn serve_via_intake(
     let n = ctx.stats.streams_open.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
     if log_due(n) {
         (*ctx.logf)(&format!(
-            "quic: 服务流已受理（tag={tag} dev={} 第 {n} 次）",
+            "服务流已受理（tag={tag} dev={} 第 {n} 次）",
             dev_of(ctx, conn_id)
         ));
     }
@@ -176,7 +176,7 @@ async fn echo(mut send: SendStream, mut recv: RecvStream, conn_id: u64, ctx: &Ar
         + 1;
     if log_due(n) {
         (*ctx.logf)(&format!(
-            "quic: 服务流已受理（tag={} dev={} 第 {n} 次）",
+            "服务流已受理（tag={} dev={} 第 {n} 次）",
             StreamTag::Probe.text(),
             dev_of(ctx, conn_id)
         ));
@@ -195,7 +195,7 @@ async fn echo(mut send: SendStream, mut recv: RecvStream, conn_id: u64, ctx: &Ar
     if log_due(n) {
         // ↑ = 客户端上行（本端读到的量）、↓ = 下发给客户端的量——回显下两者相等
         (*ctx.logf)(&format!(
-            "quic: 服务流结束（tag={}，↑{bytes}B ↓{bytes}B，耗时 {:?}）",
+            "服务流结束（tag={}，↑{bytes}B ↓{bytes}B，耗时 {:?}）",
             StreamTag::Probe.text(),
             t0.elapsed()
         ));
@@ -217,7 +217,7 @@ pub(super) fn refuse(ctx: &Arc<FaceCtx>, conn_id: u64, tag: Option<StreamTag>, c
     }
     let tag_text = tag.map(|t| t.text()).unwrap_or("—");
     (*ctx.logf)(&format!(
-        "quic: 服务流拒（dev={} tag={tag_text}；{why}（0x{code:02x}）；第 {n} 次）",
+        "服务流拒（dev={} tag={tag_text}；{why}（0x{code:02x}）；第 {n} 次）",
         dev_of(ctx, conn_id)
     ));
 }

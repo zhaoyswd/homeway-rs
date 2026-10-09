@@ -86,7 +86,7 @@ fn stream_files_download_throughput_by_bearer() {
     assert!(core.tun_status().contains("\"state\":\"attached\""), "世代须 attached");
 
     let log = std::fs::read_to_string(&out).unwrap_or_default();
-    assert!(log.contains("quic: 隧道侧就绪（L3 直通；"), "岛须在场：{log}");
+    assert!(log.contains("隧道侧就绪（L3 直通；"), "岛须在场：{log}");
     assert!(!log.contains("回落 WG"), "单承载后不得有回落话术：{log}");
 
     let v: serde_json::Value = serde_json::from_str(&core.tun_status()).expect("tun_status 是 JSON");

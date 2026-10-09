@@ -3,7 +3,7 @@
 //!
 //! FIX-60 结构：监听面**在隧道栈内**——隧道 IP:53（UDP+TCP，手机声明的 DNS）与
 //! 隧道 IP:<解析腿端口>（TCP，客户端远程解析腿）是栈内真 listener，demux 优先投它
-//! （`Interceptor::on_plain` 的 served_ports 面），应答源地址即隧道 IP——没有「host
+//! （`Interceptor::on_plain` 的 dns_ports 面），应答源地址即隧道 IP——没有「host
 //! 端口被占 ⇒ 手机解析全断」的失败模式。
 //!
 //! 线程面（H3）：查询一律 `submit_*` 非阻塞投 DNS 专用 worker；应答经 `DnsReply`

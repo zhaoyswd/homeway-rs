@@ -116,7 +116,7 @@ fn endpoint_logs_e_q1_ready_line_with_actual_port() {
     )
     .expect("端点可起");
 
-    let lines = drain_until(&rx, "quic: 端点就绪", WAIT);
+    let lines = drain_until(&rx, "端点就绪", WAIT);
     let line = lines.last().expect("就绪行在").clone();
     assert!(line.contains(&want_port.to_string()), "行含实际端口：{line}");
     assert!(line.contains("migration=true"), "行含 migration：{line}");
@@ -125,6 +125,13 @@ fn endpoint_logs_e_q1_ready_line_with_actual_port() {
         line.contains("datagram 缓冲 1048576B"),
         "行含 datagram 缓冲（1 MiB）：{line}"
     );
+    // E-q6（M5 S4 新增行）：单承载语境的就绪行（面就绪 + 两个关键参数）
+    let eq6 = lines
+        .iter()
+        .find(|l| l.contains("出口 QUIC 面就绪（单承载；"))
+        .unwrap_or_else(|| panic!("E-q6 行须在场：{lines:?}"));
+    assert!(eq6.contains("migration=true"), "E-q6 含 migration：{eq6}");
+    assert!(eq6.contains("initial_mtu=1400"), "E-q6 含 initial_mtu：{eq6}");
     assert_eq!(quic.local_addr().port(), want_port, "local_addr = 真实绑定端口");
     assert_eq!(
         quic.rpk_public_key().as_bytes().len(),
@@ -409,7 +416,7 @@ async fn connection_cap_refuses_beyond_two_max_devices() {
         quic.snapshot()
     );
     assert_eq!(quic.snapshot().connections, 2, "存活连接数不因拒绝而变");
-    drain_until(&rx, "quic: 拒新连接（连接总数", WAIT); // 记行面（节流首条必打）
+    drain_until(&rx, "拒新连接（连接总数", WAIT); // 记行面（节流首条必打）
     assert!(quic.stop_within(Instant::now() + BUDGET));
     drop(clients);
 }
@@ -457,7 +464,7 @@ async fn handshake_cap_refuses_extra_in_flight() {
         "应有并发握手拒绝计数：{:?}",
         quic.snapshot()
     );
-    drain_until(&rx, "quic: 拒新连接（并发握手", WAIT);
+    drain_until(&rx, "拒新连接（并发握手", WAIT);
     drop(stalled); // 卡住的客户端放掉（服务端那条在途握手随期限/收工清）
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
@@ -491,7 +498,7 @@ async fn handshake_deadline_drops_stalled_handshake() {
     let snap = quic.snapshot();
     assert_eq!(snap.admitted, 0, "卡住的握手不得被采纳：{snap:?}");
     assert_eq!(snap.connections, 0, "卡住的握手不得留下连接：{snap:?}");
-    drain_until(&rx, "quic: 握手期限", WAIT);
+    drain_until(&rx, "握手期限", WAIT);
     drop(stalled);
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
@@ -847,7 +854,7 @@ async fn reg4_admission_binds_and_datagram_round_trip() {
     let (_send, _recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
 
     // ① 绑定：采纳行在（**行在 ⇒ 绑定表已插**——bind 先插后记行）+ 挑战行在
-    pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=44444444 tun=100.64.7.2", WAIT).await;
+    pump_until_line(&stub, &quic, &rx, "连接采纳 dev=44444444 tun=100.64.7.2", WAIT).await;
     let s = quic.snapshot();
     assert!(s.regs_accepted >= 1, "服务端应有采纳计数：{s:?}");
     assert_eq!(s.challenges_issued, 1, "挑战计数 +1：{s:?}");
@@ -902,7 +909,7 @@ async fn reg4_proof_replay_on_another_connection_is_rejected() {
     let (_send_a, _recv_a, nonce_a) = four_frames(&stub, &quic, &conn_a, &SECRET, &pubkey, &dev)
         .await
         .expect("A 应走通四帧");
-    pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=66666666", WAIT).await;
+    pump_until_line(&stub, &quic, &rx, "连接采纳 dev=66666666", WAIT).await;
 
     // B：发 Hello 拿自己的 nonce，然后**原样**送 A 的 Proof 字节（被动窃听者形态）
     let (_cb, conn_b, _sb) = client_conn(&quic).await;
@@ -1057,7 +1064,7 @@ async fn pending_expires_without_proof() {
     let s = quic.snapshot();
     assert_eq!((s.challenges_issued, s.pending_expired, s.admit_timeouts), (1, 1, 0), "{s:?}");
     assert_eq!(stub.proofs(), 0, "没有 Proof 到引擎");
-    drain_until(&rx, "quic: 认证超时", WAIT);
+    drain_until(&rx, "认证超时", WAIT);
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
 
@@ -1113,7 +1120,7 @@ async fn admit_deadline_reclaims_silent_connections() {
         wait_until(|| silent.iter().all(|(_, c, _)| c.close_reason().is_some()), WAIT).await,
         "静默连接必须被主动关闭（不等 max_idle_timeout=30s）"
     );
-    drain_until(&rx, "quic: 认证超时", WAIT);
+    drain_until(&rx, "认证超时", WAIT);
 
     // 槽位回收后：合法客户端照常走完四帧（连接总数上限已腾出）
     let stub = Stub::new(SECRET);
@@ -1139,7 +1146,7 @@ async fn bound_connection_re_admission_is_rejected() {
     let dev = [0xD2u8; 8];
     let (_c, conn, _s) = client_conn(&quic).await;
     let (mut send, _recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
-    pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=d2d2d2d2", WAIT).await;
+    pump_until_line(&stub, &quic, &rx, "连接采纳 dev=d2d2d2d2", WAIT).await;
 
     // 再发一个 Hello（另一台「设备」的身份）⇒ 必须被拒
     send.write_all(&HelloFrame::encode(&[0xE1u8; 32], &[0xE2u8; 8], TS))
@@ -1212,7 +1219,7 @@ async fn bound_connection_rejects_proof_re_admission() {
     let (mut send, _recv, nonce) = four_frames(&stub, &quic, &conn, &SECRET, &pubkey, &dev)
         .await
         .expect("四帧应走通");
-    pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=c2c2c2c2", WAIT).await;
+    pump_until_line(&stub, &quic, &rx, "连接采纳 dev=c2c2c2c2", WAIT).await;
 
     // 另一台「设备」的 Proof（nonce 是**本连接**的，MAC 也合法）⇒ 仍必须被拒
     let frame = ProofFrame::encode(
@@ -1246,7 +1253,7 @@ async fn bound_connection_rejects_non_refresh_frame() {
     let dev = [0xC4u8; 8];
     let (_c, conn, _s) = client_conn(&quic).await;
     let (mut send, _recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
-    pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=c4c4c4c4", WAIT).await;
+    pump_until_line(&stub, &quic, &rx, "连接采纳 dev=c4c4c4c4", WAIT).await;
 
     // `C4` 是出口→客户端的帧头；客户端发来即「不该出现的帧」
     send.write_all(&ChallengeFrame::encode(&Nonce::from_bytes([0x5Au8; 16])))
@@ -1278,10 +1285,10 @@ async fn binding_removed_midflight_closes_connection() {
     let dev = [0xC6u8; 8];
     let (_c, conn, _s) = client_conn(&quic).await;
     let (mut send, _recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
-    pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=c6c6c6c6", WAIT).await;
+    pump_until_line(&stub, &quic, &rx, "连接采纳 dev=c6c6c6c6", WAIT).await;
 
     quic.unbind_pub(&pubkey); // 摘绑定（引擎侧 Remove 的出口面动作）
-    pump_until_line(&stub, &quic, &rx, "quic: 拆连接（dev=c6c6c6c6", WAIT).await;
+    pump_until_line(&stub, &quic, &rx, "拆连接（dev=c6c6c6c6", WAIT).await;
     assert!(
         pump_until(&stub, &quic, || conn.close_reason().is_some(), WAIT).await,
         "摘绑定必须拆连接（被淘汰设备不得继续用旧连接）"
@@ -1379,7 +1386,7 @@ async fn post_admission_close_carries_no_admission_code() {
     let dev = [0xCCu8; 8];
     let (_c, conn, _s) = client_conn(&quic).await;
     let (_send, _recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
-    pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=cccccccc", WAIT).await;
+    pump_until_line(&stub, &quic, &rx, "连接采纳 dev=cccccccc", WAIT).await;
 
     quic.unbind_pub(&pubkey); // 设备摘除（会话级事件）
     assert!(
@@ -1407,7 +1414,7 @@ async fn refresh_identity_mismatch_is_rejected() {
     let dev = [0xC8u8; 8];
     let (_c, conn, _s) = client_conn(&quic).await;
     let (mut send, _recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
-    pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=c8c8c8c8", WAIT).await;
+    pump_until_line(&stub, &quic, &rx, "连接采纳 dev=c8c8c8c8", WAIT).await;
 
     // 帧内换成另一个 dev/pub（MAC 用同一 secret 照算 ⇒ 域标签/MAC 都合法）
     send_refresh(&conn, &mut send, &SECRET, &[0xC9u8; 32], &[0xCAu8; 8]).await;
@@ -1431,7 +1438,7 @@ async fn challenge_line_reports_inflight_and_cap() {
     let (_c, conn, _s) = client_conn(&quic).await;
     let (_send, _recv, _nonce) = hello_and_challenge(&conn, &[0x31u8; 32], &[0x32u8; 8]).await;
 
-    let line = drain_until(&rx, "quic: 准入挑战已发", WAIT);
+    let line = drain_until(&rx, "准入挑战已发", WAIT);
     let line = line
         .iter()
         .find(|l| l.contains("准入挑战已发"))
@@ -1479,7 +1486,7 @@ async fn cooling_reject_why_is_visible_in_log() {
     let (_c, conn, _s) = client_conn(&quic).await;
     let got = four_frames(&stub, &quic, &conn, &[0x00u8; 32], &pubkey, &dev).await;
     assert!(got.is_err(), "错 secret 必须被拒");
-    drain_until(&rx, "quic: 证明失败闸", WAIT);
+    drain_until(&rx, "证明失败闸", WAIT);
 
     // 冷却中：同 devTag 的 Hello ⇒ 拒（可辨归因串）
     let (_c2, conn2, _s2) = client_conn(&quic).await;
@@ -1504,7 +1511,7 @@ async fn refresh_on_bound_connection_does_not_rebind() {
     let dev = [0xF2u8; 8];
     let (_c, conn, _s) = client_conn(&quic).await;
     let (mut send, _recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
-    pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=f2f2f2f2", WAIT).await;
+    pump_until_line(&stub, &quic, &rx, "连接采纳 dev=f2f2f2f2", WAIT).await;
     let accepted0 = quic.snapshot().regs_accepted;
 
     send_refresh(&conn, &mut send, &SECRET, &pubkey, &dev).await;
@@ -1519,7 +1526,7 @@ async fn refresh_on_bound_connection_does_not_rebind() {
     // 记账面：刷新不计 E-q2（在收行窗口内找第二条采纳行）
     let lines = collect_for(&rx, Duration::from_millis(200));
     assert_eq!(
-        lines.iter().filter(|l| l.contains("quic: 连接采纳")).count(),
+        lines.iter().filter(|l| l.contains("连接采纳")).count(),
         0,
         "刷新成功不得再打采纳行：{lines:?}"
     );
@@ -1645,11 +1652,11 @@ async fn same_dev_tag_newer_registration_replaces_old_connection() {
 
     let (_ca, conn_a, _sa) = client_conn(&quic).await;
     let (_send_a, _recv_a) = admit(&stub, &quic, &conn_a, &SECRET, &pubkey, &dev).await;
-    pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=cccccccc", WAIT).await;
+    pump_until_line(&stub, &quic, &rx, "连接采纳 dev=cccccccc", WAIT).await;
 
     let (_cb, conn_b, _sb) = client_conn(&quic).await;
     let (_send_b, _recv_b) = admit(&stub, &quic, &conn_b, &SECRET, &pubkey, &dev).await;
-    pump_until_line(&stub, &quic, &rx, "quic: 替换旧连接（dev=cccccccc", WAIT).await;
+    pump_until_line(&stub, &quic, &rx, "替换旧连接（dev=cccccccc", WAIT).await;
     assert!(quic.snapshot().regs_accepted >= 2, "第二条（同 devTag）应被采纳：{:?}", quic.snapshot());
     assert!(
         pump_until(&stub, &quic, || conn_a.close_reason().is_some(), WAIT).await,
@@ -1683,18 +1690,18 @@ async fn binding_indexes_stay_consistent_across_bind_replace_unbind() {
     let (pub_b, dev_b) = ([0x12u8; 32], [0x22u8; 8]);
     let (_ca, conn_a, _sa) = client_conn(&quic).await;
     let (_sa_ctl, _ra) = admit(&stub, &quic, &conn_a, &SECRET, &pub_a, &dev_a).await;
-    pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=21212121", WAIT).await;
+    pump_until_line(&stub, &quic, &rx, "连接采纳 dev=21212121", WAIT).await;
     quic.bridge.assert_bindings_consistent();
     let (_cb, conn_b, _sb) = client_conn(&quic).await;
     let (_sb_ctl, _rb) = admit(&stub, &quic, &conn_b, &SECRET, &pub_b, &dev_b).await;
-    pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=22222222", WAIT).await;
+    pump_until_line(&stub, &quic, &rx, "连接采纳 dev=22222222", WAIT).await;
     quic.bridge.assert_bindings_consistent();
 
     // ② 同 devTag 换公钥（轮换）：后到者替换 ⇒ 旧连接关、三索引仍互指
     let pub_a2 = [0x13u8; 32];
     let (_cc, conn_c, _sc) = client_conn(&quic).await;
     let (_sc_ctl, _rc) = admit(&stub, &quic, &conn_c, &SECRET, &pub_a2, &dev_a).await;
-    pump_until_line(&stub, &quic, &rx, "quic: 替换旧连接（dev=21212121", WAIT).await;
+    pump_until_line(&stub, &quic, &rx, "替换旧连接（dev=21212121", WAIT).await;
     quic.bridge.assert_bindings_consistent();
     assert!(
         pump_until(&stub, &quic, || conn_a.close_reason().is_some(), WAIT).await,
@@ -1751,7 +1758,7 @@ async fn datagram_from_unregistered_connection_is_dropped_and_counted() {
         crate::ExitSend::Unbound,
         "未认证连接不得产生绑定（出站报 Unbound ⇒ 丢 + 计数）"
     );
-    drain_until(&rx, "quic: 丢弃 超限=0 发送缓冲满=0 未登记=1 源校验拒=0", WAIT); // E-q3 行
+    drain_until(&rx, "丢弃 超限=0 发送缓冲满=0 未登记=1 源校验拒=0", WAIT); // E-q3 行
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
 
@@ -1780,7 +1787,7 @@ async fn datagram_is_gated_until_admission_completes() {
 
     // ② 四帧走完（门禁开）⇒ 同形数据报照常到达
     let (_send, _recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
-    pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=72727272", WAIT).await;
+    pump_until_line(&stub, &quic, &rx, "连接采纳 dev=72727272", WAIT).await;
     let good = inner_pkt(TUN_IP, Ipv4Addr::new(8, 8, 8, 8));
     conn.send_datagram(bytes::Bytes::from(good.clone())).expect("发数据报");
     assert!(
@@ -1813,7 +1820,7 @@ async fn datagram_with_illegal_source_is_dropped_and_counted() {
     let pubkey = [0x99u8; 32];
     let dev = [0xAAu8; 8];
     let (_send, _recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
-    pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=aaaaaaaa", WAIT).await;
+    pump_until_line(&stub, &quic, &rx, "连接采纳 dev=aaaaaaaa", WAIT).await;
 
     // 源非法（9.9.9.9 不在 {tun_ip}）
     conn.send_datagram(bytes::Bytes::from(inner_pkt(
@@ -1827,7 +1834,7 @@ async fn datagram_with_illegal_source_is_dropped_and_counted() {
         quic.snapshot()
     );
     assert_eq!(stub.packets().len(), 0, "源非法包不得进引擎面");
-    let ls = drain_until(&rx, "quic: 丢弃 超限=0 发送缓冲满=0 未登记=0 源校验拒=1", WAIT);
+    let ls = drain_until(&rx, "丢弃 超限=0 发送缓冲满=0 未登记=0 源校验拒=1", WAIT);
     assert!(
         ls.iter().any(|l| l.contains("src=9.9.9.9")),
         "E-q3 行的明细必须含实际 src（否则真机上仍无法定性）：{ls:?}"
@@ -1889,7 +1896,7 @@ async fn send_buffer_full_is_counted_not_silent() {
         dropped,
         "`发送缓冲满` 计数必须与丢弃数一一对应（不静默：既不淘汰旧包也不返 Ok）"
     );
-    drain_until(&rx, "quic: 丢弃 超限=0 发送缓冲满=", WAIT); // E-q3 行（首 3 必打）
+    drain_until(&rx, "丢弃 超限=0 发送缓冲满=", WAIT); // E-q3 行（首 3 必打）
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
 
@@ -2064,7 +2071,7 @@ async fn relay_leg_carries_quic_handshake_and_datagrams() {
     let pubkey = [0xD1u8; 32];
     let dev = [0xD2u8; 8];
     let (_send, _recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
-    pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=d2d2d2d2", WAIT).await;
+    pump_until_line(&stub, &quic, &rx, "连接采纳 dev=d2d2d2d2", WAIT).await;
     assert!(quic.snapshot().regs_accepted >= 1, "腿路径准入应通过：{:?}", quic.snapshot());
 
     // ③ 入站：客户端数据报 → 中继包壳 → 注入 → 源校验 → 引擎桩（字节级一致）
@@ -2267,12 +2274,12 @@ async fn flood_same_source_is_refused_and_counted() {
     assert_eq!(snap.admitted, 0, "无一次完成（全是未完成尝试）");
     // 行与快照同源（§3.3-5）：洪泛拒绝行在场；节流口径 = 首 3 + 每 100 ⇒ 本次 K−F=5 条
     // 拒绝里只有前 3 条落行，且首条的「窗内第 k 次」= F+1 = 4（第 4 次尝试起全拒）。
-    let lines = drain_until(&rx, "quic: 握手洪泛拒绝", WAIT);
+    let lines = drain_until(&rx, "握手洪泛拒绝", WAIT);
     let more = collect_for(&rx, Duration::from_millis(300)); // 收尾：K−F 条拒绝已全在队列里
     let flood_lines: Vec<&String> = lines
         .iter()
         .chain(more.iter())
-        .filter(|l| l.contains("quic: 握手洪泛拒绝"))
+        .filter(|l| l.contains("握手洪泛拒绝"))
         .collect();
     assert_eq!(flood_lines.len(), 3, "节流口径 = 首 3 + 每 100（5 条拒绝只落 3 条）：{flood_lines:?}");
     assert!(
@@ -2313,7 +2320,7 @@ async fn pressure_arm_sends_retry_and_client_still_completes() {
         "应有 Retry：{:?}",
         quic.snapshot()
     );
-    let lines = drain_until(&rx, "quic: 地址校验挑战", WAIT);
+    let lines = drain_until(&rx, "地址校验挑战", WAIT);
     let line = lines.last().expect("地址校验挑战行在");
     assert!(line.contains("在途未认证"), "行文：{line}");
     assert!(
@@ -2645,7 +2652,7 @@ async fn proof_fail_gate_cools_bad_dev_and_spares_engine_rejected() {
         let got = four_frames(&stub, &quic, &conn, &wrong_secret, &pubkey, &dev).await;
         assert!(got.is_err(), "错 secret 的 Proof 必须被拒");
     }
-    drain_until(&rx, "quic: 证明失败闸", WAIT);
+    drain_until(&rx, "证明失败闸", WAIT);
     assert_eq!(quic.snapshot().proof_cooldowns, 1, "进入冷却一次：{:?}", quic.snapshot());
     // ② 冷却中：同 devTag 再走 Hello ⇒ **不发 Challenge**（连接被拒/关闭）
     let (_c, conn, _s) = client_conn(&quic).await;

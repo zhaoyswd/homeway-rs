@@ -327,7 +327,7 @@ impl AsyncUdpSocket for ClientSock {
                 };
                 if class != SendErrClass::WouldBlock && log_due(n) {
                     (self.logf)(&format!(
-                        "quic: 上行发送面错误（{class:?}；{e}；第 {n} 次；计数行首 3 + 每 100）"
+                        "上行发送面错误（{class:?}；{e}；第 {n} 次；计数行首 3 + 每 100）"
                     ));
                 }
                 Err(e)
@@ -367,7 +367,7 @@ impl AsyncUdpSocket for ClientSock {
                     };
                     if log_due(n_ignored) {
                         (self.logf)(&format!(
-                            "quic: 忽略非 kind=5 腿帧（来自 {src}；第 {n_ignored} 次；计数行首 3 + 每 100）"
+                            "忽略非 kind=5 腿帧（来自 {src}；第 {n_ignored} 次；计数行首 3 + 每 100）"
                         ));
                     }
                     continue;

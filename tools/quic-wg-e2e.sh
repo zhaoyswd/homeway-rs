@@ -64,10 +64,10 @@ RC_ON=0
     echo "!! 失败：公共端口落盘文件缺失（QUIC 面未起？）"
     RC_ON=1
   fi
-  if tail -n +"$((LOG0 + 1))" "$EXIT_LOG" | grep -q "quic: 端点就绪"; then
-    tail -n +"$((LOG0 + 1))" "$EXIT_LOG" | grep -m1 "quic: 端点就绪"
+  if tail -n +"$((LOG0 + 1))" "$EXIT_LOG" | grep -q "端点就绪"; then
+    tail -n +"$((LOG0 + 1))" "$EXIT_LOG" | grep -m1 "端点就绪"
   else
-    echo "!! 失败：本轮出口日志无 E-q1（quic: 端点就绪）"
+    echo "!! 失败：本轮出口日志无 E-q1（端点就绪）"
     RC_ON=1
   fi
   # M5：E1 的端口字段 = quic（`wg=` 字段退役）
@@ -104,7 +104,7 @@ tail -n +"$((LOG0 + 1))" "$EXIT_LOG" > "$RES/exit-lines.txt" 2>/dev/null || true
   echo "## 用例结论（汇总 exit code = $rc；0 = 两条都过；出口侧断言 rc=$RC_ON）"
   grep -E "^\[g9|^\[token|^test |^test result" "$RES/token-e2e.log" "$RES/g9-e2e.log" 2>/dev/null || true
   echo "## 出口侧证据行（本轮新增）"
-  grep -E "peer: \+|quic: 端点就绪|quic: 流面参数|serve 就绪|中继" "$RES/exit-lines.txt" 2>/dev/null | head -20 || true
+  grep -E "peer: \+|端点就绪|流面参数|serve 就绪|中继" "$RES/exit-lines.txt" 2>/dev/null | head -20 || true
 } > "$RES/SUMMARY.txt"
 
 echo "==> 读数落 $RES/（SUMMARY.txt / token-e2e.log / g9-e2e.log / exit-lines.txt / quic-on-assert.txt）"

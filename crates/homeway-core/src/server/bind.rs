@@ -309,7 +309,7 @@ impl ServerBind {
             Ok(s) => Some(s),
             Err(e) => {
                 (self.logf)(&format!(
-                    "quic: 腿（→ {remote}）发送句柄克隆失败（{e}）—— 该腿上的 QUIC 报文将无法回程"
+                    "腿（→ {remote}）发送句柄克隆失败（{e}）—— 该腿上的 QUIC 报文将无法回程"
                 ));
                 None
             }
@@ -333,7 +333,7 @@ impl ServerBind {
         let c = self.quic_leg_undelivered;
         if c <= 3 || c.is_multiple_of(100) {
             (self.logf)(&format!(
-                "quic: 腿上的 QUIC 报文无法投递（出口 QUIC 面不可用：未起/已收工）——已丢 {c} 个（最近 {n} 字节）"
+                "腿上的 QUIC 报文无法投递（出口 QUIC 面不可用：未起/已收工）——已丢 {c} 个（最近 {n} 字节）"
             ));
         }
     }

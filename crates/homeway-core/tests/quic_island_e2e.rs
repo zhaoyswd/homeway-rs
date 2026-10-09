@@ -221,7 +221,7 @@ fn island_connects_registers_and_survives_rebind_against_local_exit() {
     .expect("rebind 必须成功");
     println!("[e2e] rebind.to={to}");
 
-    let change = wait_log_from(&exit_log, log0, "quic: 路径变更", None, WAIT)
+    let change = wait_log_from(&exit_log, log0, "路径变更", None, WAIT)
         .expect("出口必须观测到路径变更（E-q2：remote_address() 变化；本轮新增行）");
     println!("[e2e] exit.path_change_line={change}");
 
@@ -245,13 +245,13 @@ fn island_connects_registers_and_survives_rebind_against_local_exit() {
     // ⚠️ M2 §1.8 / r14 F11：刷新成功**不重绑、不打 E-q2**（`quic: 连接采纳` 只在首次准入打）
     // ⇒ 服务端侧的到达证据 = 表内 E8 行 `peer: ~ dev=… refresh (idle=…)`（**原串不变**，
     // M1 已登记），且必须落在**路径变更行之后**（本轮新行序 = 时间序）。
-    let refresh_line = wait_log_after(&exit_log, log0, "refresh (idle=", "quic: 路径变更", WAIT)
+    let refresh_line = wait_log_after(&exit_log, log0, "refresh (idle=", "路径变更", WAIT)
         .expect("刷新帧必须从新源到达出口（client → exit 继续；E8 原串）");
     println!("[e2e] exit.refresh_on_new_path={refresh_line}");
     // 反向断言（r14 F11 的判据）：整轮**只有一条**采纳行（= 首次准入），刷新不再产生
     let run_log = std::fs::read_to_string(&exit_log).unwrap_or_default();
     let adopt_lines: Vec<&str> =
-        run_log.lines().skip(log0).filter(|l| l.contains("quic: 连接采纳")).collect();
+        run_log.lines().skip(log0).filter(|l| l.contains("连接采纳")).collect();
     assert_eq!(
         adopt_lines.len(),
         1,
@@ -562,7 +562,7 @@ fn generation_l3_rides_quic_datagram_against_local_exit() {
     );
     let c2 = log
         .lines()
-        .find(|l| l.contains("quic: 隧道侧就绪（L3 直通；"))
+        .find(|l| l.contains("隧道侧就绪（L3 直通；"))
         .unwrap_or("（缺）")
         .to_owned();
     println!("[e2e3] C2'={c2}");
@@ -576,7 +576,7 @@ fn generation_l3_rides_quic_datagram_against_local_exit() {
         "暖机判据位须为 quic（C8 值域扩展）"
     );
     assert!(!log.contains("回落 WG"), "本用例不得回落（单承载）：{log}");
-    assert!(!log.contains("quic: 岛未就用"), "岛必须起来：{log}");
+    assert!(!log.contains("岛未就用"), "岛必须起来：{log}");
 
     // ③ 状态 JSON 的 quic 段
     let v: serde_json::Value = serde_json::from_str(&st).expect("tun_status 是 JSON");
@@ -955,7 +955,7 @@ fn service_stream_rides_quic_through_app_core_bridge_against_local_exit() {
 
     // 世代日志：QUIC 档在场（判据 ⑤ 的前半）
     let log = std::fs::read_to_string(&out).unwrap_or_default();
-    assert!(log.contains("quic: 隧道侧就绪（L3 直通；"), "QUIC 档须在场：{log}");
+    assert!(log.contains("隧道侧就绪（L3 直通；"), "QUIC 档须在场：{log}");
     assert!(!log.contains("回落 WG"), "单承载后不得有回落话术：{log}");
 
     // ① 桥面（状态 JSON 的 bridgeAuth/bridgeFilesSock）

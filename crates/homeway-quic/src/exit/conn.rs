@@ -282,7 +282,7 @@ async fn admit(
     let n = ctx.stats.challenges_issued.fetch_add(1, Ordering::SeqCst) + 1;
     if log_due(n) {
         (*ctx.logf)(&format!(
-            "quic: 准入挑战已发（{}；在途未认证 {}/{}；第 {n} 次）",
+            "准入挑战已发（{}；在途未认证 {}/{}；第 {n} 次）",
             conn.remote_address(),
             inflight_unauthenticated(ctx),
             ctx.conn_cap
@@ -422,7 +422,7 @@ fn note_proof_fail(ctx: &FaceCtx, dev: &[u8; 8]) {
     let n = ctx.stats.proof_cooldowns.fetch_add(1, Ordering::SeqCst) + 1;
     if log_due(n) {
         (*ctx.logf)(&format!(
-            "quic: 证明失败闸（dev={} 在 {PROOF_FAIL_WINDOW:?} 内失败 {count} 次——冷却 {PROOF_FAIL_COOLDOWN:?}）",
+            "证明失败闸（dev={} 在 {PROOF_FAIL_WINDOW:?} 内失败 {count} 次——冷却 {PROOF_FAIL_COOLDOWN:?}）",
             dev_short(dev)
         ));
     }
@@ -684,7 +684,7 @@ fn reject(ctx: &FaceCtx, conn: &Connection, dev: &[u8; 8], why: &str, at: Counte
     let n = ctx.stats.regs_rejected.fetch_add(1, Ordering::SeqCst) + 1;
     if log_due(n) {
         (*ctx.logf)(&format!(
-            "quic: 准入被拒（dev={} ← {}；{why}；第 {n} 次）",
+            "准入被拒（dev={} ← {}；{why}；第 {n} 次）",
             dev_short(dev),
             conn.remote_address()
         ));
@@ -705,7 +705,7 @@ fn time_out(ctx: &FaceCtx, conn: &Connection, dur: Duration, which: TimeoutKind)
     } + 1;
     if log_due(n) {
         (*ctx.logf)(&format!(
-            "quic: 认证超时（{} 未在 {dur:?} 内完成证明——已弃；第 {n} 次）",
+            "认证超时（{} 未在 {dur:?} 内完成证明——已弃；第 {n} 次）",
             conn.remote_address()
         ));
     }

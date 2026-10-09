@@ -67,7 +67,7 @@ pub(super) async fn within<F: std::future::Future>(budget: Duration, fut: F) -> 
 fn close_on_failed_admission(conn: &Connection, why: &str, budget: Duration, logf: &Logf) {
     conn.close(quinn::VarInt::from_u32(0), b"admission failed");
     (*logf)(&format!(
-        "quic: 准入失败（{why}；预算 {}）—— 连接已显式关闭（不留悬挂）",
+        "准入失败（{why}；预算 {}）—— 连接已显式关闭（不留悬挂）",
         fmt_dur(budget)
     ));
 }
@@ -120,7 +120,7 @@ pub(crate) async fn run(
     if log_c4 {
         let relay_n = cands.iter().filter(|c| c.via.is_relay()).count();
         (*logf)(&format!(
-            "quic: 赛跑投出 {} 个候选（直连 {} / 中继 {relay_n}；本行每轮限 3 条）",
+            "赛跑投出 {} 个候选（直连 {} / 中继 {relay_n}；本行每轮限 3 条）",
             cands.len(),
             cands.len() - relay_n
         ));
@@ -181,7 +181,7 @@ pub(crate) async fn run(
         // 全候选失败：失败清单进行（排障要看得见"哪个候选没起来"，r12 专2-3）
         let miss: Vec<String> = unfinished.iter().map(|i| cands[*i].addr.to_string()).collect();
         (*logf)(&format!(
-            "quic: 赛跑小结：无胜者（候选 {} 个，耗时 {}）；未完成={}",
+            "赛跑小结：无胜者（候选 {} 个，耗时 {}）；未完成={}",
             cands.len(),
             fmt_dur(t0.elapsed()),
             miss.join("、")
@@ -195,7 +195,7 @@ pub(crate) async fn run(
     let done_list: Vec<String> = completed.iter().map(|i| cands[*i].addr.to_string()).collect();
     let miss_list: Vec<String> = unfinished.iter().map(|i| cands[*i].addr.to_string()).collect();
     (*logf)(&format!(
-        "quic: 赛跑结算：胜出 {} {}（候选 {} 个，耗时 {}）；完成={}；未完成={}",
+        "赛跑结算：胜出 {} {}（候选 {} 个，耗时 {}）；完成={}；未完成={}",
         via.text(),
         ep,
         cands.len(),
@@ -204,7 +204,7 @@ pub(crate) async fn run(
         miss_list.join("、"),
     ));
     (*logf)(&format!(
-        "quic: 路径确立：{} {}（首个完成握手）",
+        "路径确立：{} {}（首个完成握手）",
         via.text(),
         ep
     ));

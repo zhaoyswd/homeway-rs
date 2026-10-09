@@ -120,7 +120,7 @@ where
         return Err(e);
     }
     (logf)(&format!(
-        "quic: 服务流重试（tag={}；首试 {}；余预算内再试一次）",
+        "服务流重试（tag={}；首试 {}；余预算内再试一次）",
         tag.text(),
         e.text()
     ));

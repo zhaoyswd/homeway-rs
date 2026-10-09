@@ -4,7 +4,10 @@
 //! 1. **注册腿与数据面同一本地端口**：全部出站经驱动线程 ServerBind 的同一 WG socket
 //!    （`try_clone` 的 fd 副本——NAT 映射一致，打洞才打得开）；
 //! 2. 注册必须证明持有 peerId 私钥（X25519 挑战响应）；
-//! 3. hint 是不可信线索：只用来**盲打**（开自己的 NAT 过滤），路径是否真通由 WG 握手决定。
+//! 3. **M5 S4**：hint 盲打面（`LegEvent::Hint`/`parse_hint_addr`/`run_punch_worker`）随
+//!    WG 面退役整体删除——hint 的消费者是 WG 打洞（`bind.set_on_hint` 删于 S3b ⇒ 本面
+//!    自那时起**零构造点** = 不可达代码）；单承载下「中继 → 直连升级」由岛的迁移/重赛跑
+//!    承接（`G8` 登记）。
 //!
 //! 失败语义：控制面全链路「尽力而为」——连不上/断了就退避重连；一切错误只记日志，
 //! 绝不影响出口主服务。收工上界：stop 打断 tick/dial/sleep（≤ 一轮 tick + dial 5s）。
@@ -41,14 +44,6 @@ const KEEPALIVE_EVERY: Duration = Duration::from_secs(25);
 const RETRY_EVERY: Duration = Duration::from_secs(5);
 /// 30s 未确认注册的一次性告警。
 const WARN_AFTER: Duration = Duration::from_secs(30);
-/// 每次 hint 的盲打包数（上限，不做放大器）。
-const PUNCH_BURST: usize = 3;
-const PUNCH_GAP: Duration = Duration::from_millis(150);
-/// 同一地址的盲打节流。
-const PUNCH_MIN_INTERVAL: Duration = Duration::from_secs(3);
-/// lastPunch 表容量（防无界增长——清了重来，都是消耗品）。
-const PUNCH_TABLE_MAX: usize = 64;
-
 const CTL_DIAL_TIMEOUT: Duration = Duration::from_secs(5);
 const CTL_RECONNECT_MIN: Duration = Duration::from_secs(1);
 const CTL_RECONNECT_MAX: Duration = Duration::from_secs(30);
@@ -107,22 +102,13 @@ pub fn parse_relay_arg(v: &str) -> Result<RelayArg, String> {
     Ok(RelayArg { addr: crate::udpbatch::unmap_v4_in6(addr), secret: None })
 }
 
-/// hint 地址解析（`LegEvent::Hint` 的 addr 串；**不可信线索**，只做盲打触发器）。
-/// v4-mapped 归一（G3 同类）：盲打节流键 = `client.ip()`——不归一时同一地址的
-/// mapped/纯 v4 两形态各占一个桶（3s 节流被换形态绕过，也可让同一地址重复打）。
-/// 解析失败 = None（静默丢弃，Go 同义）。
-fn parse_hint_addr(addr: &str) -> Option<SocketAddr> {
-    addr.parse::<SocketAddr>().ok().map(crate::udpbatch::unmap_v4_in6)
-}
-
 // ---------- UDP 注册腿（relayclient.go） ----------
 
-/// 驱动线程 → relay-leg 线程的事件（bind 钩子投递）。
+/// 驱动线程 → relay-leg 线程的事件（bind 钩子投递）。M5 S4 起只剩控制帧一档
+/// （hint 面已删——见模块头第 3 条）。
 pub enum LegEvent {
     /// 中继控制帧（type=3 载荷 + 源）。
     Frame(Vec<u8>, SocketAddr),
-    /// hint 地址线索（地址串 + 源）。
-    Hint(String, SocketAddr),
 }
 
 /// 起 UDP 注册腿线程（非阻塞；随 stop 收工）。
@@ -160,31 +146,12 @@ fn run_relay_leg(
     let started = Instant::now();
     let mut warned = false;
 
-    // punch worker：单独一条线程 + 有界队列（3×150ms 节奏 sleep 不进本线程——
-    // Challenge 处理不被拖；也不 per-hint 起线程——防线程风暴）
-    let (punch_tx, punch_rx) = std::sync::mpsc::sync_channel::<SocketAddr>(16);
-    let punch_sock = sock.try_clone().expect("clone WG socket");
-    let punch_stop = Arc::new(AtomicBool::new(false));
-    let punch_stop2 = Arc::clone(&punch_stop);
-    let punch_logf: Logf = Arc::clone(logf);
-    std::thread::Builder::new()
-        .name("homeway-punch".into())
-        .stack_size(256 * 1024)
-        .spawn(move || run_punch_worker(punch_sock, punch_rx, &punch_stop2, &punch_logf))
-        .ok();
-
     send_hello(&sock, relay, label, pub_key.as_bytes(), logf);
     let mode = if secret.is_some() { "token 模式（rl1 凭据）" } else { "开放模式（无 token）" };
     (logf)(&format!("中继：注册腿开跑（中继 {relay}，{mode}）"));
 
-    // 收工贯通（评审 中-2）：**任何** return 路径都要停 punch worker——
-    // 通道断开（驱动线程先退）也走这里，防 worker 100% 空转 + socket 副本泄漏
-    let shutdown = |punch_stop: &AtomicBool| {
-        punch_stop.store(true, Ordering::SeqCst);
-    };
     loop {
         if stop.load(Ordering::SeqCst) {
-            shutdown(&punch_stop);
             return;
         }
         // 5s 节拍（事件驱动的睡法：事件随时唤醒本线程）
@@ -192,20 +159,8 @@ fn run_relay_leg(
             Ok(LegEvent::Frame(payload, src)) => {
                 handle_control(&sock, relay, &priv_key, &pub_key, secret, label, &payload, src, &mut verified, logf);
             }
-            Ok(LegEvent::Hint(addr, src)) => {
-                // hint 源校验（#23）：中继的 per-client 分配 socket（端口动态、IP 恒为
-                // 中继地址）——只比 IP；未知源的 hint 只记日志，绝不盲打
-                if src.ip() != relay.ip() {
-                    (logf)(&format!("中继：忽略来自未知源 {src} 的地址线索（应为中继 {relay}）"));
-                    continue;
-                }
-                if let Some(ap) = parse_hint_addr(&addr) {
-                    let _ = punch_tx.try_send(ap); // 队列满丢弃（hint 是消耗品）
-                }
-            }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                shutdown(&punch_stop);
                 return;
             }
         }
@@ -306,45 +261,6 @@ fn handle_control(
         }
     }
     // 未知 subtype：忽略（前向兼容）
-}
-
-/// 盲打 worker：对 hint 地址打几包（开自己 NAT 过滤）；每地址 3s 节流；小载荷腿帧。
-fn run_punch_worker(
-    sock: UdpSocket,
-    rx: std::sync::mpsc::Receiver<SocketAddr>,
-    stop: &AtomicBool,
-    logf: &Logf,
-) {
-    // 节流键 = IP（Go 同义；端口动态——按地址键可被换端口绕过）
-    let mut last_punch: std::collections::HashMap<std::net::IpAddr, Instant> = std::collections::HashMap::new();
-    while !stop.load(Ordering::SeqCst) {
-        let client = match rx.recv_timeout(Duration::from_millis(500)) {
-            Ok(c) => c,
-            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
-        };
-        if let Some(t) = last_punch.get(&client.ip()) {
-            if t.elapsed() < PUNCH_MIN_INTERVAL {
-                continue;
-            }
-        }
-        if last_punch.len() > PUNCH_TABLE_MAX {
-            last_punch.clear(); // 防无界增长：清了重来（都是消耗品）
-        }
-        last_punch.insert(client.ip(), Instant::now());
-        // 判据行（每地址 3s 节流，量可控——摘要级）
-        (logf)(&format!(
-            "中继：收到对端地址线索 {client} → 盲打 {PUNCH_BURST} 包（开自己 NAT 过滤；能否直连仍由 WG 握手决定）"
-        ));
-        for _ in 0..PUNCH_BURST {
-            // 小载荷腿帧：对端解析不出数据会静默丢弃，但 NAT 过滤已被打开
-            let f = legframe::frame_bytes(legframe::FrameKind::Data, &[0, 0, 0, 0]);
-            if send_to_ep(&sock, &f, client).is_err() {
-                break;
-            }
-            std::thread::sleep(PUNCH_GAP);
-        }
-    }
 }
 
 // ---------- TCP 控制面客户端（relayctl.go） ----------
@@ -707,18 +623,4 @@ mod tests {
         assert_eq!(r.secret, Some(secret));
     }
 
-    /// G3 同类：中继 hint 解析归一（盲打节流键 = IP——mapped/纯 v4 必须同桶同目标）。
-    #[test]
-    fn hint_addr_normalizes_v4_mapped() {
-        let want: SocketAddr = "198.51.100.7:41641".parse().unwrap();
-        assert_eq!(parse_hint_addr("[::ffff:198.51.100.7]:41641"), Some(want));
-        assert_eq!(parse_hint_addr("198.51.100.7:41641"), Some(want));
-        assert_eq!(
-            parse_hint_addr("[2001:db8::2]:41641"),
-            Some("[2001:db8::2]:41641".parse().unwrap())
-        );
-        // 非 IP:port 静默丢弃（不可信线索）
-        assert_eq!(parse_hint_addr("不是地址"), None);
-        assert_eq!(parse_hint_addr("host.example:41641"), None);
-    }
 }

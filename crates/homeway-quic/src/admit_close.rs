@@ -54,7 +54,7 @@ pub const fn is_admission_code(code: u64) -> bool {
 /// 脚本混淆（设计门 P3）。
 pub fn client_line(code: u64) -> String {
     let t = text(code).unwrap_or("（未知准入码）");
-    format!("quic: 准入回执（code=0x{code:02x} {t}）——本世代未建连")
+    format!("准入回执（code=0x{code:02x} {t}）——本世代未建连")
 }
 
 #[cfg(test)]
@@ -92,12 +92,12 @@ mod tests {
     #[test]
     fn client_line_has_its_own_prefix_and_the_stable_phrase() {
         let l = client_line(code::CREDENTIAL);
-        assert!(l.starts_with("quic: 准入回执（code=0x11 凭证不被接受）"), "{l}");
+        assert!(l.starts_with("准入回执（code=0x11 凭证不被接受）"), "{l}");
         assert!(l.contains("本世代未建连"), "{l}");
-        assert!(!l.starts_with("quic: 准入被拒"), "前缀必须与出口行区分：{l}");
+        assert!(!l.starts_with("准入被拒"), "前缀必须与出口行区分：{l}");
         assert_eq!(
             client_line(code::TIMEOUT),
-            "quic: 准入回执（code=0x14 准入超时）——本世代未建连"
+            "准入回执（code=0x14 准入超时）——本世代未建连"
         );
         // 未知码也产出可读行（不 panic、不静默）
         assert!(client_line(0x99).contains("（未知准入码）"));

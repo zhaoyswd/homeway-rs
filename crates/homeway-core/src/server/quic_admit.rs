@@ -32,13 +32,13 @@ pub fn resolve_retry_policy(base: AdmitLimits, raw: Option<&str>, logf: &Logf) -
             out.retry_policy = p;
             if p != base.retry_policy {
                 (logf)(&format!(
-                    "quic: 抗放大策略被 env 覆盖（{ENV_RETRY_POLICY}={raw} 覆盖配置 {}）",
+                    "抗放大策略被 env 覆盖（{ENV_RETRY_POLICY}={raw} 覆盖配置 {}）",
                     base.retry_policy.text()
                 ));
             }
         }
         None => (logf)(&format!(
-            "⚠️ quic: {ENV_RETRY_POLICY}={raw:?} 非法（合法取值 {}）—— 记行后按 {} 走（不 fail-fast）",
+            "⚠️ {ENV_RETRY_POLICY}={raw:?} 非法（合法取值 {}）—— 记行后按 {} 走（不 fail-fast）",
             RetryPolicy::VALUES.join("|"),
             base.retry_policy.text()
         )),

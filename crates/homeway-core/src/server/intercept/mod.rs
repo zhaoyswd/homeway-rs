@@ -1,11 +1,16 @@
 //! 拦截层（R3；语义真源 `pkg/intercept`；执行结构 = 单线程 reactor——
 //! `docs/reviews/reactor-design.md` v2）。
 //!
-//! 挂在出口隧道侧栈上，把「WG 解密后的明文 IP 包」按目的地址分流（tun2socks 同款语义，
+//! 挂在出口隧道侧栈上，把「解密后的明文 IP 包」按目的地址分流（tun2socks 同款语义，
 //! smoltcp 形态 = 包级 NAT 重写——见 `nat.rs` 头注释）：
 //!
-//!    dst == 隧道IP → 豁免：LocalServices 命中端口转投 UDS、其余回环同端口重拨
-//!    dst == 其它   → 过境：终结（栈内 TCP 状态机）+ 本机 socket 重拨
+//!    dst == 隧道IP 且端口 ∈ DNS 面（`:53`/`:5300`）→ 投栈内真 listener（进程内代答）
+//!    其余（含隧道 IP 上未登记的端口）        → 过境：终结（栈内 TCP 状态机）+ 本机 socket 重拨
+//!
+//! **M5 S4 收窄**：原「豁免」径（`local_services` 三服务 UDS 转投 + 隧道 IP 其余端口回环
+//! 同端口）随 WG 服务腿退役整体删除——M5 后客户端服务面走 QUIC `STREAM[tag]`（出口侧
+//! 直拨 `127.0.0.1`，见 `exit/dial.rs`），不再有「隧道 IP 上可拨端口」这一概念
+//! （`docs/reviews/M5-design.md` §3.2；判据行登记见 `docs/INTEROP-CRITERIA.md`）。
 //!
 //! **拨号先行**（设计 §4.1 / 评审 H2）：TCP SYN 不立即回 SYN-ACK——先建映射缓存 SYN、
 //! 非阻塞 connect upstream 成功后才建栈内 socket 注入缓存（SYN-ACK 由此产生）；失败
@@ -117,13 +122,11 @@ struct ReactorIo {
     dead: bool,
 }
 
-/// upstream 的拨号目标（豁免/过境/DNS 的建流决策面）。
+/// upstream 的拨号目标（过境/DNS 的建流决策面；M5 S4 删 `Unix` 档——UDS 转投随豁免面退役）。
 enum DialTarget {
-    /// 本机 TCP（transit；exempt 未命中 LocalServices 时的回环同端口）。
+    /// 本机 TCP（过境：dst:port 原样重拨）。
     Tcp(std::net::SocketAddr),
-    /// LocalServices UDS（files/term/speedtest）。
-    Unix(String),
-    /// 本机已连接 UDP（transit/exempt 的 UDP 重拨）。
+    /// 本机已连接 UDP（过境的 UDP 重拨）。
     Udp(std::net::SocketAddr),
 }
 
@@ -306,42 +309,6 @@ fn target_sockaddr(target: &DialTarget) -> std::io::Result<SockAddrPack> {
             let (d2, bind_any, blen) = pack_ip(&any_of(addr));
             debug_assert_eq!(d2, domain);
             Ok((domain, libc::SOCK_DGRAM, ss, len, Some((bind_any, blen))))
-        }
-        DialTarget::Unix(path) => {
-            // 装配约定 UDS 路径 < 100B（R3 §4.1 LocalServices 组装边界）；上界按
-            // 平台结构判（macOS sun_path=104B、Linux=108B——写死 108 会越界）。
-            // **与 `sysfd::SUN_PATH_MAX` 同源同义**（`len >= sun_path.len()` ≡
-            // `len > SUN_PATH_MAX`）——只注明，不字面改调（照字面改会因 off-by-one
-            // 静默收紧；Q-G F4.3）。
-            let bytes = path.as_bytes();
-            let mut ss: libc::sockaddr_un = unsafe { std::mem::zeroed() };
-            if bytes.len() >= ss.sun_path.len() {
-                return Err(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "UDS 路径超长",
-                ));
-            }
-            ss.sun_family = libc::AF_UNIX as libc::sa_family_t;
-            // sun_path 在部分平台是 [i8]——按字节指针拷；尾零靠 zeroed
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    bytes.as_ptr(),
-                    ss.sun_path.as_mut_ptr().cast::<u8>(),
-                    bytes.len(),
-                );
-            }
-            let mut storage: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-            // 长度自洽 = family 段 + 实际路径 + NUL（不依赖零填充到全结构长）
-            let len = (std::mem::offset_of!(libc::sockaddr_un, sun_path) + bytes.len() + 1)
-                as libc::socklen_t;
-            unsafe {
-                std::ptr::copy_nonoverlapping(
-                    &ss as *const _ as *const u8,
-                    &mut storage as *mut _ as *mut u8,
-                    len as usize,
-                );
-            }
-            Ok((libc::AF_UNIX, libc::SOCK_STREAM, storage, len, None))
         }
     }
 }
@@ -661,8 +628,6 @@ impl Stats {
 /// 拦截层配置（装配层注入）。
 pub struct Config {
     pub tunnel_ip: Ipv4Addr,
-    /// 豁免端口 → Unix socket 路径（LocalServices；UDP 不查——Go 同口径）。
-    pub local_services: HashMap<u16, String>,
     /// :53 进程内代答腿 + 隧道栈内 DNS 面（None = 关闭代答，:53 按原目标过境重拨）。
     pub dns: Option<Arc<DnsProxy>>,
     /// DNS worker 的应答回投通道（与 dns 同生共死）。
@@ -675,10 +640,10 @@ pub struct Config {
     pub logf: Logf,
 }
 
+/// 流的入口径（M5 S4：`Exempt` 档随豁免面退役——值域只剩 `{transit, dns}`）。
 #[derive(Clone, Copy, PartialEq)]
 enum Kind {
     Transit,
-    Exempt,
     Dns,
 }
 
@@ -686,7 +651,6 @@ impl Kind {
     fn as_str(self) -> &'static str {
         match self {
             Kind::Transit => "transit",
-            Kind::Exempt => "exempt",
             Kind::Dns => "dns",
         }
     }
@@ -861,8 +825,9 @@ pub struct Interceptor {
     reactor_win_pumps: u64,
     reactor_win_peak_fds: usize,
     reactor_win_peak_wall: Duration,
-    /// 栈内真 listener 的端口集（demux 优先面；3d 的 DNS listener 登记）。
-    served_ports: std::collections::HashSet<u16>,
+    /// DNS 面的隧道栈内监听端口集（M5 S4 语义单一：只装 `:53` 与解析腿 `:5300`；
+    /// 原「服务端口登记」随豁免面退役——见模块头注释）。
+    dns_ports: std::collections::HashSet<u16>,
     /// 出站明文包队列（TX 反重写后待 encap——pump 返回给引擎）。
     tx_out: Vec<Vec<u8>>,
     // ---- 发送整形（R8-3 8i；驱动线程独占——与 tx_out 同生命周期） ----
@@ -934,7 +899,7 @@ impl Interceptor {
             .add_default_ipv4_route(Ipv4Address::new(100, 64, 255, 254))
             .expect("路由表默认空");
         (cfg.logf)(&format!(
-            "intercept: 过境拦截就绪（隧道IP {}；豁免=转投本机同端口；TCP 并发上限 {}）",
+            "intercept: 过境拦截就绪（隧道IP {}；DNS 代答腿 :53/:5300；TCP 并发上限 {}）",
             cfg.tunnel_ip, MAX_CONNS
         ));
         // 整形状态**独立行**（评审 r2-1.4：E5 是与 Go 基线逐串对齐的判据行——
@@ -971,7 +936,7 @@ impl Interceptor {
             reactor_win_pumps: 0,
             reactor_win_peak_fds: 0,
             reactor_win_peak_wall: Duration::ZERO,
-            served_ports: std::collections::HashSet::new(),
+            dns_ports: std::collections::HashSet::new(),
             tx_out: Vec::new(),
             tx_deferred: std::collections::VecDeque::new(),
             tx_deferred_bytes: 0,
@@ -1002,14 +967,14 @@ impl Interceptor {
         if self.cfg.dns.is_none() {
             return;
         }
-        let mut served = std::mem::take(&mut self.served_ports);
+        let mut served = std::mem::take(&mut self.dns_ports);
         self.dns_faces = Some(DnsFaces::attach(
             self.cfg.tunnel_ip,
             self.cfg.dns_resolve_port,
             &mut self.sockets,
             &mut served,
         ));
-        self.served_ports = served;
+        self.dns_ports = served;
     }
 
     fn now_smol(&mut self) -> SmolInstant {
@@ -1163,10 +1128,9 @@ impl Interceptor {
             tcp_ack: v.tcp_ack,
             udp_payload: (payload_start, v.total_len),
         };
-        if v.dst == self.cfg.tunnel_ip && self.served_ports.contains(&v.dst_port) {
+        if v.dst == self.cfg.tunnel_ip && self.dns_ports.contains(&v.dst_port) {
             // demux 先投栈内**真 listener**（DNS :53/:5300——3d 建并登记）；
-            // 未登记的隧道 IP 端口走 NAT 豁免路径（files/term/speedtest 经拦截层转投——
-            // Go 的 SetTransportProtocolHandler 也在 demux 未命中后才接手，同序）
+            // 未登记的隧道 IP 端口**不再有豁免面**（M5 S4）⇒ 落过境径原样重拨
             self.device.rx_push(&pkt);
             return;
         }
@@ -1370,7 +1334,11 @@ impl Interceptor {
         }
     }
 
-    /// 豁免/过境/DNS 的 upstream 决策（Go serveTCP 的 target/LocalServices 同口径）。
+    /// 入口径决策（M5 S4 收窄：只有 DNS 与过境两径）。
+    ///
+    /// 隧道 IP 上未登记端口从「豁免→回环同端口」改为**落过境**（设计 §3.2 的实质删除）：
+    /// 过境即按原目的 `dst:port` 重拨——隧道 IP 不在本机地址表上，拨号以
+    /// `EHOSTUNREACH/ECONNREFUSED` 快速失败 ⇒ 客户端自连探测仍**可见失败**（不是黑洞）。
     fn route_upstream(&self, dst: Ipv4Addr, port: u16, proto: Proto) -> (Kind, DialTarget) {
         if self.cfg.dns.is_some() && port == 53 {
             // DNS 腿（FIX-60）：UDP 与 **TCP**（M3，R5 补）都不落地真实网络——
@@ -1378,20 +1346,6 @@ impl Interceptor {
             return match proto {
                 Proto::Udp => (Kind::Dns, DialTarget::Udp(loopback(port))),
                 Proto::Tcp => (Kind::Dns, DialTarget::Tcp(loopback(port))), // 占位：腿不拨号
-            };
-        }
-        if dst == self.cfg.tunnel_ip {
-            // 豁免：LocalServices 命中 → UDS（UDP 不查表——Go 同口径）；未命中 → 回环同端口
-            if proto == Proto::Tcp {
-                if let Some(sock) = self.cfg.local_services.get(&port) {
-                    return (Kind::Exempt, DialTarget::Unix(sock.clone()));
-                }
-            }
-            let target = loopback(port);
-            return if proto == Proto::Tcp {
-                (Kind::Exempt, DialTarget::Tcp(target))
-            } else {
-                (Kind::Exempt, DialTarget::Udp(target))
             };
         }
         let target = SocketAddrV4::new(dst, port).into();
@@ -2555,15 +2509,15 @@ impl Interceptor {
                     nat::rewrite_dst(&mut p, self.cfg.tunnel_ip, rw);
                     self.device.rx_push(&p);
                 }
-                // 判据行（E10 dialok）
-                let (kind, orig_dst, client) = {
+                // 判据行（E10 dialok；kind 位 M5 S4 起是**固定字面** `transit`——DNS 腿
+                // 不落本函数，值域只剩一个）
+                let (orig_dst, client) = {
                     let f = self.flows.get(&flow).expect("刚判存在");
-                    (f.kind, f.orig_dst, f.client)
+                    (f.orig_dst, f.client)
                 };
                 self.stats.incr_ok();
                 (self.cfg.logf)(&format!(
-                    "intercept: tcp {} {}:{} ← {}:{}（dialok）",
-                    kind.as_str(),
+                    "intercept: tcp transit {}:{} ← {}:{}（dialok）",
                     orig_dst.0,
                     orig_dst.1,
                     client.0,
@@ -3022,15 +2976,14 @@ impl Interceptor {
         let Some(f) = self.flows.get(&flow) else {
             return;
         };
-        let (kind, orig_dst, client, proto) = (f.kind, f.orig_dst, f.client, f.proto);
+        let (orig_dst, client, proto) = (f.orig_dst, f.client, f.proto);
         if proto == Proto::Tcp {
             if let Some(h) = f.sock {
                 self.sockets.get_mut::<TcpSocket>(h).close();
                 let _ = h;
             }
             (self.cfg.logf)(&format!(
-                "intercept: tcp {} {}:{} ← {}:{} 关闭",
-                kind.as_str(),
+                "intercept: tcp transit {}:{} ← {}:{} 关闭",
                 orig_dst.0,
                 orig_dst.1,
                 client.0,
@@ -3064,11 +3017,6 @@ impl Interceptor {
                 if f.proto == Proto::Tcp { 6 } else { 17 },
             ));
         }
-    }
-
-    /// 登记栈内真 listener 端口（demux 优先面；3d 的 DNS listener 建时调）。
-    pub fn add_served_port(&mut self, port: u16) {
-        self.served_ports.insert(port);
     }
 
     /// 停收新流（HaltNew——新 TCP 回 RST、新 UDP 回 ICMP；在途不受影响）。
@@ -3209,7 +3157,6 @@ mod tests {
     use smoltcp::time::Instant as SmolInstant;
     use std::io::{Read, Write as _};
     use std::os::fd::FromRawFd;
-    use std::os::unix::net::UnixListener;
 
     fn noop_logf() -> Logf {
         Arc::new(|_| {})
@@ -3225,7 +3172,6 @@ mod tests {
     fn cfg_base(tunnel_ip: Ipv4Addr) -> Config {
         Config {
             tunnel_ip,
-            local_services: HashMap::new(),
             dns: None,
             dns_events: None,
             dns_resolve_port: 0,
@@ -3257,11 +3203,31 @@ mod tests {
         }
     }
 
-    /// 豁免流端到端：客户端栈 connect(隧道IP:port) → NAT 豁免 → 回环 echo → 数据往返 +
-    /// 拨号先行语义（SYN 不提前应答——SYN-ACK 只在 DialOk 后产出）。
+    /// 客户端栈连上游（M5 S4 后的过境常态形态 = 本机回环服务）：`StackB::connect` 带
+    /// 生产环回闸（`127/8` 出站被拒——评审 ③-6），而「上游拨号目标 = 原目的」这条过境
+    /// 语义在测试里正是 127.0.0.1 ⇒ 用例自备建连（形态照抄 `StackB::connect`，仅去掉
+    /// 环回闸；`local_port` 由用例给足，单栈单连不冲突）。
+    fn connect_loopback_upstream(client: &mut StackB, port: u16, local_port: u16) -> SocketHandle {
+        let mut sock = TcpSocket::new(
+            tcp::SocketBuffer::new(vec![0u8; 1024 * 1024]),
+            tcp::SocketBuffer::new(vec![0u8; 1024 * 1024]),
+        );
+        sock.set_nagle_enabled(false);
+        sock.set_congestion_control(tcp::CongestionControl::Cubic);
+        let h = client.sockets.add(sock);
+        let cx = client.iface.context();
+        let s = client.sockets.get_mut::<TcpSocket>(h);
+        s.connect(cx, (Ipv4Addr::LOCALHOST, port), local_port)
+            .expect("测试面建连（回环上游）");
+        h
+    }
+
+    /// 过境流端到端（M5 S4：原「豁免流」用例的替代面——豁免径已退役）：客户端栈
+    /// connect(127.0.0.1:port) → 过境重拨本机 echo → 数据往返 + 拨号先行语义
+    /// （SYN 不提前应答——SYN-ACK 只在 DialOk 后产出）+ 关闭收口（流表清空 /
+    /// reactor fd 归零）。
     #[test]
-    fn exempt_flow_end_to_end() {
-        // 回环 echo（豁免 upstream = 127.0.0.1:同端口）
+    fn transit_flow_end_to_end() {
         let echo = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
         let port = echo.local_addr().unwrap().port();
         let echo_thread = std::thread::spawn(move || {
@@ -3283,17 +3249,14 @@ mod tests {
         let stats = Arc::new(Stats::default());
         let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::clone(&stats));
 
-        // 客户端栈（隧道侧地址 100.64.10.1；默认路由网关随便）
         let mut client = StackB::new(
             Ipv4Addr::new(100, 64, 10, 1),
             tunnel,
             SmolInstant::from_millis(0),
         );
-        let h: SocketHandle = client
-            .connect(std::net::SocketAddrV4::new(tunnel, port))
-            .unwrap();
+        let h = connect_loopback_upstream(&mut client, port, 40001);
 
-        // 少量轮：SYN 已到拦截层，拨号线程可能未完成——SYN-ACK 不应出现在前几轮
+        // 少量轮：SYN 已到拦截层，拨号可能未完成——SYN-ACK 不应出现在前几轮
         cross_pump(&mut client, &mut itc, 2, &mut 0);
 
         // 泵到建连（拨号 ≤ 回环即时）
@@ -3310,7 +3273,7 @@ mod tests {
         }
         assert!(
             established,
-            "豁免流应建连（state={:?}）",
+            "过境流应建连（state={:?}）",
             client.sockets.get::<TcpSocket>(h).state()
         );
         assert!(stats.snapshot()[0].1 >= 1, "dialok 应计数");
@@ -3319,7 +3282,7 @@ mod tests {
         client
             .sockets
             .get_mut::<TcpSocket>(h)
-            .send_slice(b"hello-exempt")
+            .send_slice(b"hello-transit")
             .unwrap();
         let deadline = Instant::now() + Duration::from_secs(5);
         let mut got = Vec::new();
@@ -3336,9 +3299,22 @@ mod tests {
                 break;
             }
             std::thread::sleep(Duration::from_millis(2));
-            // 拒绝忙转：共享 runner 满载时饿死拦截层工作线程（ubuntu CI 偶发 RST/建连超时——2ms 让出）
         }
-        assert_eq!(got, b"hello-exempt", "echo 数据应经豁免流往返");
+        assert_eq!(got, b"hello-transit", "echo 数据应经过境流往返");
+
+        // 关闭收口（原 UDS 豁免腿用例携带的同一断言面）：客户端 close → 流表清空 +
+        // reactor fd 归零（R-7③）。
+        client.sockets.get_mut::<TcpSocket>(h).close();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            cross_pump(&mut client, &mut itc, 4, &mut 0);
+            if itc.flow_count() == 0 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        assert_eq!(itc.flow_count(), 0, "流表应清空");
+        assert_eq!(itc.reactor_fds(), 0, "reactor 名下 fd 应归零（收口规则表）");
         drop(echo_thread); // 不 join：echo 在 read 阻塞直到对端断连（测试进程退出即终结）
     }
 
@@ -3354,21 +3330,21 @@ mod tests {
             tunnel,
             SmolInstant::from_millis(0),
         );
-        // 隧道 IP 上无服务的端口：豁免 upstream = 127.0.0.1:<临时死端口>（绑一个
-        // listener 取号再立刻关掉——无人听且不碰特权端口）。**别用 :1**：部分
-        // ubuntu CI 沙箱对特权端口的出站策略是 DROP 而非 RST（连接悬死，RST 判据
-        // 永远等不到——dd99ae0/7be330c/2f56af2 三轮红 + 同树 rerun 仍红、macos 恒绿、
-        // 预算 15s 也不救 ⇒ 非时序面而是投递策略面）；临时端口在回环面上恒
-        // ECONNREFUSED，跨平台/跨沙箱稳定。
+        // 过境死目的：`127.0.0.1:<临时死端口>`（绑一个 listener 取号再立刻关掉——
+        // 无人听且不碰特权端口）。**别用 :1**：部分 ubuntu CI 沙箱对特权端口的出站
+        // 策略是 DROP 而非 RST（连接悬死，RST 判据永远等不到——dd99ae0/7be330c/2f56af2
+        // 三轮红 + 同树 rerun 仍红、macos 恒绿、预算 15s 也不救 ⇒ 非时序面而是投递
+        // 策略面）；临时端口在回环面上恒 ECONNREFUSED，跨平台/跨沙箱稳定。
+        // **M5 S4**：目的从「隧道 IP（豁免→回环）」改为回环直拨——豁免径已退役，
+        // 隧道 IP 目的今天落过境（本机地址表上没有它 ⇒ 快速失败），语义等价但依赖
+        // 路由表形态；用回环钉住「拨号失败 → RST」这条判据本身。
         let dead_port = {
             let l = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
             let p = l.local_addr().unwrap().port();
             drop(l);
             p
         };
-        let h: SocketHandle = client
-            .connect(std::net::SocketAddrV4::new(tunnel, dead_port))
-            .unwrap();
+        let h = connect_loopback_upstream(&mut client, dead_port, 40002);
         // connect 后 socket 即 SynSent——初态直接记（reactor 批起拨号失败快于旧线程
         // 形态：SYN 与 RST 可能在同一 cross_pump 批内往返，批间采样观察不到 SynSent
         // 中间态；断言语义不变 = RST 只能被 SynSent 态的 socket 接受）。
@@ -3439,7 +3415,6 @@ mod tests {
         let stats = Arc::new(Stats::default());
         let cfg = Config {
             tunnel_ip: tunnel,
-            local_services: HashMap::new(),
             dns: Some(std::sync::Arc::clone(&proxy)),
             dns_events: Some(events),
             dns_resolve_port: 5300,
@@ -3448,8 +3423,8 @@ mod tests {
         };
         let mut itc = Interceptor::attach(cfg, Arc::clone(&stats));
         itc.attach_dns();
-        assert!(itc.served_ports.contains(&53), "demux 面应登记 :53");
-        assert!(itc.served_ports.contains(&5300), "解析腿端口应登记");
+        assert!(itc.dns_ports.contains(&53), "demux 面应登记 :53");
+        assert!(itc.dns_ports.contains(&5300), "解析腿端口应登记");
 
         // 一条 A 查询（id=0x3344，example.com）
         let mut q = Vec::new();
@@ -3628,7 +3603,6 @@ mod tests {
         let stats = Arc::new(Stats::default());
         let cfg = Config {
             tunnel_ip: tunnel,
-            local_services: HashMap::new(),
             dns: Some(std::sync::Arc::clone(&proxy)),
             dns_events: Some(events),
             dns_resolve_port: 5300,
@@ -3770,112 +3744,6 @@ mod tests {
         assert_eq!(interests_for(&io, 0), None);
     }
 
-    /// UDS 豁免腿 E2E（R-7① / R-1 回归钉）：local_services 映射 → 非阻塞 connect
-    /// **即时成功**（UDS 到活 listener 常态返 0——即时路径不产生 poll 事件，若验收
-    /// 只挂 POLLOUT 则流卡死到 10s 死线）→ dialok → 数据往返 → 关闭收口（reactor_fds
-    /// 归零——R-7③ 的 fd 收口断言面）。
-    #[test]
-    fn uds_exempt_flow_end_to_end() {
-        let dir = std::env::temp_dir().join(format!(
-            "homeway-rs-uds-exempt-{}-{}",
-            std::process::id(),
-            std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap()
-                .subsec_nanos()
-        ));
-        std::fs::create_dir_all(&dir).unwrap();
-        let sock_path = dir.join("svc.sock");
-        let listener = UnixListener::bind(&sock_path).unwrap();
-        let echo = std::thread::spawn(move || {
-            if let Ok((mut c, _)) = listener.accept() {
-                let mut buf = [0u8; 4096];
-                loop {
-                    match c.read(&mut buf) {
-                        Ok(0) | Err(_) => break,
-                        Ok(n) => {
-                            if c.write_all(&buf[..n]).is_err() {
-                                break;
-                            }
-                        }
-                    }
-                }
-            }
-        });
-
-        let tunnel = Ipv4Addr::new(100, 64, 255, 1);
-        let stats = Arc::new(Stats::default());
-        let mut cfg = cfg_base(tunnel);
-        cfg.local_services.insert(47902, sock_path.to_string_lossy().into_owned());
-        let mut itc = Interceptor::attach(cfg, Arc::clone(&stats));
-
-        let mut client = StackB::new(
-            Ipv4Addr::new(100, 64, 10, 11),
-            tunnel,
-            SmolInstant::from_millis(0),
-        );
-        let h: SocketHandle = client
-            .connect(std::net::SocketAddrV4::new(tunnel, 47902))
-            .unwrap();
-
-        // 泵到建连（UDS 即时 connect + 注入缓存 SYN → SYN-ACK）
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut established = false;
-        while Instant::now() < deadline {
-            cross_pump(&mut client, &mut itc, 4, &mut 0);
-            if client.sockets.get::<TcpSocket>(h).state() == tcp::State::Established {
-                established = true;
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        assert!(
-            established,
-            "UDS 豁免腿应即时建连（state={:?}）",
-            client.sockets.get::<TcpSocket>(h).state()
-        );
-        assert!(stats.snapshot()[0].1 >= 1, "dialok 应计数");
-
-        // 数据往返
-        client
-            .sockets
-            .get_mut::<TcpSocket>(h)
-            .send_slice(b"hello-uds")
-            .unwrap();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        let mut got = Vec::new();
-        while Instant::now() < deadline {
-            cross_pump(&mut client, &mut itc, 4, &mut 0);
-            let mut buf = [0u8; 4096];
-            let n = client
-                .sockets
-                .get_mut::<TcpSocket>(h)
-                .recv_slice(&mut buf)
-                .unwrap_or(0);
-            if n > 0 {
-                got.extend_from_slice(&buf[..n]);
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        assert_eq!(got, b"hello-uds", "echo 数据应经 UDS 豁免腿往返");
-
-        // 关闭收口：客户端 close → FIN 双向拆 → 流表清空 + reactor fd 归零
-        client.sockets.get_mut::<TcpSocket>(h).close();
-        let deadline = Instant::now() + Duration::from_secs(5);
-        while Instant::now() < deadline {
-            cross_pump(&mut client, &mut itc, 4, &mut 0);
-            if itc.flow_count() == 0 {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(2));
-        }
-        assert_eq!(itc.flow_count(), 0, "流表应清空");
-        assert_eq!(itc.reactor_fds(), 0, "reactor 名下 fd 应归零（收口规则表）");
-        drop(echo);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
     /// flush_out 的 EAGAIN 语义单元钉（评审 r2-高1 回归）：写满的 socket（自设
     /// 8KB sndbuf 的 socketpair，对端不读）上 1MB 待写——`flush_out` 必须**立即
     /// 返回**（原地重试 = 驱动线程自旋 = 整出口挂死）且余量保留在待写缓冲。
@@ -3919,7 +3787,7 @@ mod tests {
         }
         let tunnel = Ipv4Addr::new(100, 64, 255, 1);
         let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::new(Stats::default()));
-        // 手搓豁免流 + 8KB socketpair 写端当 upstream（对端〔读端〕不读）
+        // 手搓过境流 + 8KB socketpair 写端当 upstream（对端〔读端〕不读）
         let v = View5 {
             src: Ipv4Addr::new(100, 64, 10, 13),
             src_port: 40000,
@@ -3931,7 +3799,7 @@ mod tests {
             tcp_ack: 0,
             udp_payload: (0, 0),
         };
-        let flow = itc.alloc_flow(&v, Kind::Exempt, Proto::Tcp, Vec::new());
+        let flow = itc.alloc_flow(&v, Kind::Transit, Proto::Tcp, Vec::new());
         let fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
         set_fd_flags(fd.as_fd(), true).unwrap(); // place_io 契约：fd 已非阻塞（dial_nonblocking 平时的保证）
         itc.place_io(flow, fd, false, None, Instant::now());
@@ -4006,9 +3874,7 @@ mod tests {
             tunnel,
             SmolInstant::from_millis(0),
         );
-        let h: SocketHandle = client
-            .connect(std::net::SocketAddrV4::new(tunnel, port))
-            .unwrap();
+        let h = connect_loopback_upstream(&mut client, port, 40003);
         let deadline = Instant::now() + Duration::from_secs(10);
         while Instant::now() < deadline
             && client.sockets.get::<TcpSocket>(h).state() != tcp::State::Established
@@ -4825,9 +4691,7 @@ mod tests {
                 tunnel,
                 SmolInstant::from_millis(0),
             );
-            let h = s
-                .connect(std::net::SocketAddrV4::new(tunnel, port))
-                .unwrap();
+            let h = connect_loopback_upstream(&mut s, port, 40010 + i as u16);
             clients.push((s, h));
         }
 
@@ -5354,7 +5218,6 @@ mod tests {
         let stats = Arc::new(Stats::default());
         let cfg = Config {
             tunnel_ip: tunnel,
-            local_services: HashMap::new(),
             dns: Some(Arc::clone(&proxy)),
             dns_events: Some(events),
             dns_resolve_port: 5300,

@@ -305,12 +305,12 @@ impl Ladder {
                 self.jitter_streak = self.jitter_streak.saturating_add(1);
                 self.jitter_gate += 1;
                 if crate::client::log_due(self.jitter_gate) {
-                    (*logf)(&format!("quic: 链路探活抖动（{why}，已复探）"));
+                    (*logf)(&format!("链路探活抖动（{why}，已复探）"));
                 }
                 if self.jitter_streak >= self.tun.jitter_streak {
                     // §3.1-③：连续抖动升格为失败（防 fail-silent）
                     let why = format!("连续 {} 次抖动升格", self.jitter_streak);
-                    (*logf)(&format!("quic: {why} —— 计入失败链（防 fail-silent）"));
+                    (*logf)(&format!("{why} —— 计入失败链（防 fail-silent）"));
                     return self.fail_step(why, now, send, logf);
                 }
                 Step::Idle
@@ -332,7 +332,7 @@ impl Ladder {
                         self.r_fail_since = None;
                         self.r_attempts = 0;
                         (*logf)(&format!(
-                            "quic: 链路重连完成（原因={why}，耗时 {}）",
+                            "链路重连完成（原因={why}，耗时 {}）",
                             crate::client::fmt_dur(now.saturating_duration_since(at))
                         ));
                     }
@@ -479,7 +479,7 @@ impl Ladder {
             .take()
             .map(|p| p.why)
             .unwrap_or_else(|| "（无在途动作）".to_owned());
-        (*logf)("quic: 换本地 socket 失败 —— 转 R（新 QUIC 连接）");
+        (*logf)("换本地 socket 失败 —— 转 R（新 QUIC 连接）");
         self.next_action = Action::Reconnect;
         self.go_action(Action::Reconnect, format!("{why}（换绑失败）"), false, at, logf)
     }
@@ -512,7 +512,7 @@ impl Ladder {
         self.fail_gate += 1;
         if crate::client::log_due(self.fail_gate) {
             (*logf)(&format!(
-                "quic: 链路快探失败（连续 {}，原因={why}）",
+                "链路快探失败（连续 {}，原因={why}）",
                 self.fail_streak
             ));
         }
@@ -531,7 +531,7 @@ impl Ladder {
                 (Action::Reconnect, _) => "本机发送面无错".to_owned(),
             };
             (*logf)(&format!(
-                "quic: 链路动作选 {}（原因={why}；{detail}）",
+                "链路动作选 {}（原因={why}；{detail}）",
                 chosen.zh()
             ));
         }
@@ -561,7 +561,7 @@ impl Ladder {
                     self.r_fail_since = Some(now);
                 }
                 (*logf)(&format!(
-                    "quic: 链路重连中（原因={why}，第 {} 次）",
+                    "链路重连中（原因={why}，第 {} 次）",
                     self.r_attempts
                 ));
                 self._set_pending(Action::Reconnect, why.clone(), now);
@@ -578,7 +578,7 @@ impl Ladder {
         self.r_fail_streak = self.r_fail_streak.saturating_add(1);
         let since = *self.r_fail_since.get_or_insert(now);
         (*logf)(&format!(
-            "quic: 链路重连失败（原因={why}，第 {} 次）—— 交世代重建",
+            "链路重连失败（原因={why}，第 {} 次）—— 交世代重建",
             self.r_fail_streak
         ));
         let window = now.saturating_duration_since(since);
@@ -588,7 +588,7 @@ impl Ladder {
             self.pending = None;
             self.last_action = "rebuild";
             (*logf)(&format!(
-                "quic: 世代重建（原因={why}；连续重连失败 {}）",
+                "世代重建（原因={why}；连续重连失败 {}）",
                 self.r_fail_streak
             ));
             return Step::Rebuild {
@@ -598,7 +598,7 @@ impl Ladder {
         }
         // 另一动作（M↔R）：R 失败 ⇒ M
         (*logf)(&format!(
-            "quic: 交另一动作（M↔R；窗 {} / 门 {} 次未到）",
+            "交另一动作（M↔R；窗 {} / 门 {} 次未到）",
             crate::client::fmt_dur(window),
             self.tun.reconnect_streak
         ));
@@ -918,7 +918,7 @@ mod tests {
             log.lock()
                 .unwrap()
                 .iter()
-                .any(|l| l.starts_with("quic: 链路重连完成（原因=探活无回显，耗时 300ms）")),
+                .any(|l| l.starts_with("链路重连完成（原因=探活无回显，耗时 300ms）")),
             "耗时须覆盖「发起 → 确认成功」：{:?}",
             log.lock().unwrap()
         );
@@ -1034,12 +1034,12 @@ mod tests {
 
         let logged = log.lock().unwrap();
         let want = [
-            "quic: 链路快探失败（连续 1，原因=探活无回显）",
-            "quic: 链路探活抖动（探活无回显，已复探）",
-            "quic: 链路重连中（原因=探活无回显，第 1 次）",
-            "quic: 链路重连完成（原因=探活无回显，",
-            "quic: 链路重连失败（原因=对端不可达，第 1 次）—— 交世代重建",
-            "quic: 世代重建（原因=对端不可达；连续重连失败 ",
+            "链路快探失败（连续 1，原因=探活无回显）",
+            "链路探活抖动（探活无回显，已复探）",
+            "链路重连中（原因=探活无回显，第 1 次）",
+            "链路重连完成（原因=探活无回显，",
+            "链路重连失败（原因=对端不可达，第 1 次）—— 交世代重建",
+            "世代重建（原因=对端不可达；连续重连失败 ",
         ];
         for w in want {
             assert!(

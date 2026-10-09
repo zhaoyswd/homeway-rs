@@ -402,18 +402,14 @@ impl ServeEngine {
             ));
         }
 
-        // ---- 拦截层（E5）+ LocalServices 映射 ----
-        let mut local_services = std::collections::HashMap::new();
-        local_services.insert(cfg.files_port, serve_dir.join("files.sock").display().to_string());
-        local_services.insert(cfg.term_port, serve_dir.join("term.sock").display().to_string());
-        local_services.insert(cfg.speedtest_port, serve_dir.join("speedtest.sock").display().to_string());
+        // ---- 拦截层（E5）----
+        // M5 S4：`LocalServices` 三服务映射随豁免面退役（服务面走 QUIC `STREAM[tag]`）。
         let itc_stats = Arc::new(ItcStats::default());
         let dns_proxy = dns.clone();
         let dns_events = dns_events_rx;
         let mut intercept = Interceptor::attach(
             ItcConfig {
                 tunnel_ip: cfg.tunnel_ip,
-                local_services,
                 dns: dns_proxy,
                 dns_events,
                 dns_resolve_port: if dns_enabled { cfg.dns_port } else { 0 },
@@ -462,10 +458,10 @@ impl ServeEngine {
                 Ok(ln) => {
                     let own = sock_identity(&serve_dir.join("files.sock"));
                     socks.push((serve_dir.join("files.sock"), own));
-                    // E14（M3 §8.2-1 行文改写）：服务流 tag=1 + QUIC STREAM 承载 +
-                    // 本机 UDS 仍是 WG 服务腿入口（D1 下两腿并存 = 事实）
+                    // E14（M5 S4 定稿行文）：服务流 tag=1 经服务入口（QUIC STREAM）
+                    // 转投；本机 UDS 只服务调试面（WG 服务腿已退役）
                     (logf)(&format!(
-                        "files 就绪：root={} (rw) sock={}（服务流 tag=1；QUIC STREAM 承载；本机 UDS 仍为 WG 服务腿入口）",
+                        "files 就绪：root={} (rw) sock={}（STREAM tag=1 经服务入口转投）",
                         fsrv.root_dir().display(),
                         serve_dir.join("files.sock").display()
                     ));
@@ -508,9 +504,9 @@ impl ServeEngine {
             Ok(ln) => {
                 let own = sock_identity(&serve_dir.join("speedtest.sock"));
                 socks.push((serve_dir.join("speedtest.sock"), own));
-                // E17（M3 §8.2-2 行文改写）：服务流 tag=3 + QUIC STREAM 承载
+                // E17（M5 S4 定稿行文）：服务流 tag=3 经服务入口（QUIC STREAM）转投
                 (logf)(&format!(
-                    "speedtest 就绪：sock={}（服务流 tag=3；QUIC STREAM 承载；内存收发不落盘）",
+                    "speedtest 就绪：sock={}（STREAM tag=3 经服务入口转投；内存收发不落盘）",
                     serve_dir.join("speedtest.sock").display()
                 ));
                 if let Some((intake, tx)) = service_intake(
@@ -677,7 +673,7 @@ impl ServeEngine {
                         }
                         Err(e) => {
                             (logf)(&format!(
-                                "⚠️ quic: 端点未起（{e}）—— **出口没有公共端口**（客户端无从连入；本进程只剩服务/控制面）"
+                                "⚠️ 端点未起（{e}）—— **出口没有公共端口**（客户端无从连入；本进程只剩服务/控制面）"
                             ));
                             None
                         }
@@ -685,14 +681,14 @@ impl ServeEngine {
                 }
                 Err(e) => {
                     (logf)(&format!(
-                        "⚠️ quic: 端点未起（socket 置非阻塞失败：{e}）—— **出口没有公共端口**"
+                        "⚠️ 端点未起（socket 置非阻塞失败：{e}）—— **出口没有公共端口**"
                     ));
                     None
                 }
             },
             Err(e) => {
                 (logf)(&format!(
-                    "⚠️ quic: 端点未起（端口 {} 退让 +1…+9 与随机端口全失败：{e}）—— **出口没有公共端口**",
+                    "⚠️ 端点未起（端口 {} 退让 +1…+9 与随机端口全失败：{e}）—— **出口没有公共端口**",
                     quic_listen_port(&cfg)
                 ));
                 None
@@ -1382,7 +1378,7 @@ fn driver_loop(
             // （M5 起无回落面：出站按无绑定丢弃 + 计数，入站停止——设备需重连）。
             if q.is_finished() && !quic_dead_logged {
                 quic_dead_logged = true;
-                (dlogf)("quic: 出口 QUIC 面线程已退出 —— 公共端口随之失效：后续出站按无绑定丢弃（计数可见）、入站停止（客户端需重连）");
+                (dlogf)("出口 QUIC 面线程已退出 —— 公共端口随之失效：后续出站按无绑定丢弃（计数可见）、入站停止（客户端需重连）");
             }
         }
         // ③ 拦截拍（worker 事件 + DNS 应答回投 + 栈 poll + TX）。P1 两级前置背压：
@@ -1456,7 +1452,7 @@ fn driver_loop(
     if let Some(q) = quic_face {
         const QUIC_CLOSE_BUDGET: Duration = Duration::from_secs(2);
         if !q.stop_within(Instant::now() + QUIC_CLOSE_BUDGET) {
-            (dlogf)("quic: 出口 QUIC 面未在收工预算内退出 —— 已 detach（收割线程接手）");
+            (dlogf)("出口 QUIC 面未在收工预算内退出 —— 已 detach（收割线程接手）");
         }
     }
     // 到期：teardown（在途 TCP 立即拆——close 内逐条 teardown + 判据行）
@@ -1551,7 +1547,7 @@ fn admit_reg4(
         // MAC 不符：不是本出口的 token，或**同一帧换了连接**（重放——exporter 变了）。
         // 两种情形同面（不可区分，也不该区分）：都拒。
         (dlogf)(&format!(
-            "quic: 准入被拒（dev={} pub={}；hr-reg4 MAC 不符——含换连接重放）",
+            "准入被拒（dev={} pub={}；hr-reg4 MAC 不符——含换连接重放）",
             dev_short(&frame.dev_tag()),
             pub_short(&frame.pubkey())
         ));
@@ -3067,7 +3063,6 @@ mod tests {
         let mut itc = Interceptor::attach(
             ItcConfig {
                 tunnel_ip: DEFAULT_TUNNEL_IP,
-                local_services: std::collections::HashMap::new(),
                 dns: None,
                 dns_events: None,
                 dns_resolve_port: 0,

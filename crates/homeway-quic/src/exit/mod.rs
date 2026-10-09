@@ -673,7 +673,7 @@ impl Drop for ExitQuic {
 /// 不健康分类（`mark_unhealthy_if_current(gen, …)`）与引擎巡检同批接——S1b）。
 fn join_and_log(h: JoinHandle<()>, logf: &Logf) {
     if h.join().is_err() {
-        (*logf)(&format!("quic: {EXIT_THREAD} 线程 panic —— 本世代 QUIC 面已死"));
+        (*logf)(&format!("{EXIT_THREAD} 线程 panic —— 本世代 QUIC 面已死"));
     }
 }
 
@@ -702,7 +702,7 @@ fn thread_body(
     if let Err(payload) = res {
         let msg = crate::driver::panic_msg(payload.as_ref());
         (*logf)(&format!(
-            "quic: 出口 QUIC 面 panic（{msg}）—— 判不健康，线程退出（不复用该线程）"
+            "出口 QUIC 面 panic（{msg}）—— 判不健康，线程退出（不复用该线程）"
         ));
     }
     exit.mark_exited();
@@ -826,16 +826,23 @@ fn run_exit(
                 return;
             }
         };
+        // ---- E-q6（M5 S4 新增行）：单承载语境（WG 面已删，出口只有一个 QUIC 公共
+        // 端口，无「回落」可言）——把「面就绪 + 两个关键参数」钉在启动日志 ----
+        (*logf)(&format!(
+            "出口 QUIC 面就绪（单承载；migration={}，initial_mtu={}）",
+            transport::MIGRATION,
+            transport::INITIAL_MTU
+        ));
         // ---- E-q1（判据行：出口 QUIC 端点起后一行；形态见 M1 设计 §3.4）----
         (*logf)(&format!(
-            "quic: 端点就绪（{local_addr}，migration={}，initial_mtu={}，datagram 缓冲 {}B）",
+            "端点就绪（{local_addr}，migration={}，initial_mtu={}，datagram 缓冲 {}B）",
             transport::MIGRATION,
             transport::INITIAL_MTU,
             transport::DATAGRAM_BUFFER
         ));
         // ---- 抗放大面生效值（§3.2；`always` 档的代价记行 = §5-11 登记项）----
         (*logf)(&format!(
-            "quic: 流面参数（bidi={} uni={} recv_window={}B conn_recv_window={}B send_window={}B）",
+            "流面参数（bidi={} uni={} recv_window={}B conn_recv_window={}B send_window={}B）",
             cfg.streams.max_bidi,
             cfg.streams.max_uni,
             cfg.streams.recv_window,
@@ -843,7 +850,7 @@ fn run_exit(
             cfg.streams.send_window
         ));
         (*logf)(&format!(
-            "quic: 抗放大面（retry={}；retry_token_lifetime={:?}；每源 {}/{:?}；证明失败闸 {}）",
+            "抗放大面（retry={}；retry_token_lifetime={:?}；每源 {}/{:?}；证明失败闸 {}）",
             cfg.retry_policy.text(),
             cfg.retry_token_lifetime,
             cfg.per_src_fails,
@@ -856,7 +863,7 @@ fn run_exit(
         ));
         if cfg.retry_policy == RetryPolicy::Always {
             (*logf)(
-                "⚠️ quic: retry_policy=always —— 常态每次建连/重连 +1 RTT（真机 LTE ≈50ms；§3.1 登记的代价，仅排障用）",
+                "⚠️ retry_policy=always —— 常态每次建连/重连 +1 RTT（真机 LTE ≈50ms；§3.1 登记的代价，仅排障用）",
             );
         }
         if ready_tx.send(Ok((local_addr, rpk_public_key))).is_err() {
@@ -900,7 +907,7 @@ fn run_exit(
                             let n = stats.flood_refused.fetch_add(1, Ordering::SeqCst) + 1;
                             if log_due(n) {
                                 (*logf)(&format!(
-                                    "quic: 握手洪泛拒绝（{src:?} 在 {win:?} 内第 {k} 次尝试——已拒；第 {n} 次）",
+                                    "握手洪泛拒绝（{src:?} 在 {win:?} 内第 {k} 次尝试——已拒；第 {n} 次）",
                                     src = admit::SrcKey::of(peer).text(),
                                     win = cfg.per_src_window,
                                     k = gate_out.in_window
@@ -931,7 +938,7 @@ fn run_exit(
                                         let n = stats.retry_sent.fetch_add(1, Ordering::SeqCst) + 1;
                                         if log_due(n) {
                                             (*logf)(&format!(
-                                                "quic: 地址校验挑战（{peer}；在途未认证 {inflight}/{conn_cap}；第 {n} 次）"
+                                                "地址校验挑战（{peer}；在途未认证 {inflight}/{conn_cap}；第 {n} 次）"
                                             ));
                                         }
                                         None
@@ -950,7 +957,7 @@ fn run_exit(
                                     let n = stats.conn_refused.fetch_add(1, Ordering::SeqCst) + 1;
                                     if log_due(n) {
                                         (*logf)(&format!(
-                                            "quic: 拒新连接（连接总数 {held}/{conn_cap} 超限，来自 {peer}；第 {n} 次）"
+                                            "拒新连接（连接总数 {held}/{conn_cap} 超限，来自 {peer}；第 {n} 次）"
                                         ));
                                     }
                                 } else if handshakes.len() >= cfg.handshake_cap {
@@ -959,7 +966,7 @@ fn run_exit(
                                     let n = stats.handshake_refused.fetch_add(1, Ordering::SeqCst) + 1;
                                     if log_due(n) {
                                         (*logf)(&format!(
-                                            "quic: 拒新连接（并发握手 {}/{cap} 超限，来自 {peer}；第 {n} 次）",
+                                            "拒新连接（并发握手 {}/{cap} 超限，来自 {peer}；第 {n} 次）",
                                             handshakes.len(),
                                             cap = cfg.handshake_cap
                                         ));
@@ -1018,7 +1025,7 @@ fn run_exit(
                             let n = stats.handshake_timeouts.fetch_add(1, Ordering::SeqCst) + 1;
                             if log_due(n) {
                                 (*logf)(&format!(
-                                    "quic: 握手期限（{peer} 未在 {deadline:?} 内完成，已弃；第 {n} 次）",
+                                    "握手期限（{peer} 未在 {deadline:?} 内完成，已弃；第 {n} 次）",
                                     deadline = cfg.handshake_deadline
                                 ));
                             }
@@ -1029,7 +1036,7 @@ fn run_exit(
                 Some((dst, payload)) = plain_rx.recv() => {
                     // 引擎 → 公共端口：裸数据报（STUN 观测请求；M5 S3a）
                     if let Err(e) = plain_sock.send_plain(dst, &payload) {
-                        (*logf)(&format!("quic: 公共端口明文发送失败（→ {dst}，{}B：{e}）", payload.len()));
+                        (*logf)(&format!("公共端口明文发送失败（→ {dst}，{}B：{e}）", payload.len()));
                     }
                 }
                 Some(out) = out_rx.recv() => {
@@ -1061,19 +1068,28 @@ fn run_exit(
                     stats.path_changes.fetch_add(1, Ordering::SeqCst);
                     match bridge.dev_of_conn(c.conn_id) {
                         Some(dev) => (*logf)(&format!(
-                            "quic: 路径变更 dev={} {from} → {now}",
+                            "路径变更 dev={} {from} → {now}",
                             bridge::dev_short(&dev)
                         )),
-                        None => (*logf)(&format!("quic: 路径变更（未登记连接）{from} → {now}")),
+                        None => (*logf)(&format!("路径变更（未登记连接）{from} → {now}")),
                     }
                 }
             }
         }
         // ---- 收工：先在途握手/每连接任务全弃（JoinSet drop 即 abort）→ 关端点 → 丢句柄 ----
+        // E25（M5 S4 新增行；A10 的出口侧收线时点）：连接数从当前值收到 0 的**时点与
+        // 用时**必须可观测（此前只有「到点 detach」一条失败面行；正常收线无证据）。
+        let closing = Instant::now();
+        let was_conns = stats.connections.load(Ordering::SeqCst);
         drop(tasks);
         drop(handshakes);
         endpoint.close(0u32.into(), b"exit stopping");
         drop(conns);
+        stats.connections.store(0, Ordering::SeqCst);
+        (*logf)(&format!(
+            "出口收线（连接数 {was_conns} → 0，用时 {:?}）",
+            closing.elapsed()
+        ));
         drop(endpoint);
     });
 }

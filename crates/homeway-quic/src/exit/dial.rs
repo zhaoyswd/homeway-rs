@@ -225,7 +225,7 @@ pub(crate) async fn dial_serve(
         + 1;
     if log_due(n) {
         (*ctx.logf)(&format!(
-            "quic: 服务流已受理（tag={} dev={} 第 {n} 次）",
+            "服务流已受理（tag={} dev={} 第 {n} 次）",
             StreamTag::Dial.text(),
             dev_of(ctx, conn_id)
         ));
@@ -324,7 +324,7 @@ async fn pump_dial(
         .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     if log_due(n) {
         (*ctx.logf)(&format!(
-            "quic: 服务流结束（tag={}，↑{}B ↓{}B，耗时 {:?}）",
+            "服务流结束（tag={}，↑{}B ↓{}B，耗时 {:?}）",
             StreamTag::Dial.text(),
             up.bytes,
             down.bytes,
@@ -338,7 +338,7 @@ async fn pump_dial(
 fn note_dir(ctx: &Arc<FaceCtx>, dir: &str, r: &super::pump::CopyEnd) {
     if let Some(e) = &r.err {
         (*ctx.logf)(&format!(
-            "quic: 服务流目标侧中断（tag={}，{dir} 方向：{e}）",
+            "服务流目标侧中断（tag={}，{dir} 方向：{e}）",
             StreamTag::Dial.text()
         ));
     }

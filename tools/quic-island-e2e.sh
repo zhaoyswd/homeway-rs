@@ -87,13 +87,26 @@ fi
   grep -E "^\[e2e|^test |^test result" "$RES/island-e2e.log" "$RES/relay-e2e.log" \
     "$RES/generation-e2e.log" "$RES/service-stream-e2e.log" "$RES/app-core-service-e2e.log" 2>/dev/null || true
   echo "## 出口侧证据行（本轮新增）"
-  grep -E "peer: \+|quic: 连接采纳|quic: 路径变更|quic: 端点就绪|中继控制面|transit" "$RES/exit-lines.txt" 2>/dev/null || true
+  grep -E "peer: \+|连接采纳|路径变更|端点就绪|中继控制面|transit" "$RES/exit-lines.txt" 2>/dev/null || true
   echo "## 中继侧行（本轮新增；腿/会话/丢弃）"
   grep -E "中继|会话|腿|丢弃|转发" "$RES/relay-lines.txt" 2>/dev/null | tail -20 || true
   echo "## 岛侧判据行（S2a + S2b + S3-1 + M3 S2/S3）"
-  grep -hE "quic: |island\]" "$RES/island-e2e.log" "$RES/relay-e2e.log" "$RES/generation-e2e.log" \
+  grep -hE "\[island\]" "$RES/island-e2e.log" "$RES/relay-e2e.log" "$RES/generation-e2e.log" \
     "$RES/service-stream-e2e.log" "$RES/app-core-service-e2e.log" 2>/dev/null | grep -v "^\[e2e" | head -80 || true
 } > "$RES/SUMMARY.txt"
+
+# ---- A10（M5 S4 新增判据面）：出口侧**收线时点**——停出口后必须留下
+#      `出口收线（连接数 N → 0，用时 …）`（E25；此前出口正常收线零证据行）
+echo "==> 停出口（收线判据 A10/E25 的证据点）"
+"$REPO_ROOT/tools/local-rust-exit.sh" stop "$n" > "$RES/exit-stop.txt" 2>&1 || true
+if tail -n +"$((LOG0 + 1))" "$EXIT_LOG" 2>/dev/null | grep -q "出口收线（连接数"; then
+  tail -n +"$((LOG0 + 1))" "$EXIT_LOG" | grep -m1 "出口收线（连接数" | tee -a "$RES/SUMMARY.txt"
+  echo "[e2e] exit.close_line=1（E25 在场）" >> "$RES/SUMMARY.txt"
+else
+  echo "!! 失败：本轮出口日志无 E25（出口收线）" >&2
+  echo "[e2e] exit.close_line=0（E25 缺席）" >> "$RES/SUMMARY.txt"
+  rc=1
+fi
 
 echo "==> 读数落 $RES/（SUMMARY.txt / island-e2e.log / relay-e2e.log / exit-lines.txt / relay-lines.txt）"
 cat "$RES/SUMMARY.txt"

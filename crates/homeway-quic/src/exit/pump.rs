@@ -93,7 +93,7 @@ pub(crate) async fn run(
         Ok(io) => io,
         Err(e) => {
             (*ctx.logf)(&format!(
-                "quic: 服务流泵起不来（tag={tag} dev={}：socketpair 进 runtime 失败 {e}）——已关流",
+                "服务流泵起不来（tag={tag} dev={}：socketpair 进 runtime 失败 {e}）——已关流",
                 super::serve::dev_of(&ctx, conn_id)
             ));
             let _ = send.finish();
@@ -119,7 +119,7 @@ pub(crate) async fn run(
         + 1;
     if log_due(n) {
         (*ctx.logf)(&format!(
-            "quic: 服务流结束（tag={tag}，↑{}B ↓{}B，耗时 {:?}）",
+            "服务流结束（tag={tag}，↑{}B ↓{}B，耗时 {:?}）",
             up.bytes,
             down.bytes,
             t0.elapsed()

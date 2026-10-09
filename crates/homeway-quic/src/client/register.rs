@@ -83,7 +83,7 @@ pub(crate) async fn write_refresh<W: AsyncWriteExt + Unpin>(
     let frame = RefreshFrame::encode(secret, pubkey, dev_tag, now_unix(), exporter);
     sink.write_all(&frame).await.map_err(|_| IslandErr::ConnectionLost)?;
     (*logf)(&format!(
-        "quic: 注册刷新 → {}（dev={}，中继={relay}）",
+        "注册刷新 → {}（dev={}，中继={relay}）",
         ep,
         cred.dev_short()
     ));
@@ -111,7 +111,7 @@ pub(crate) async fn register_on_control_stream(
         .await
         .map_err(|_| IslandErr::ConnectionLost)?;
     (*logf)(&format!(
-        "quic: 准入已发起（dev={}，Hello {}B；等挑战/回执）",
+        "准入已发起（dev={}，Hello {}B；等挑战/回执）",
         cred.dev_short(),
         reg4::HELLO_LEN
     ));
@@ -140,7 +140,7 @@ pub(crate) async fn register_on_control_stream(
         return Err(IslandErr::RegistrationFailed);
     }
     (*logf)(&format!(
-        "quic: 准入完成（dev={}，耗时 {}）",
+        "准入完成（dev={}，耗时 {}）",
         cred.dev_short(),
         super::fmt_dur(t0.elapsed())
     ));

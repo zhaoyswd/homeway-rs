@@ -398,10 +398,10 @@ impl ExitBridge {
         debug_assert!(b.is_consistent(), "绑定表三索引不一致（bind 后）");
         drop(b);
         if replaced {
-            (self.logf)(&format!("quic: 替换旧连接（dev={}；旧连接已 CONNECTION_CLOSE）", dev_short(&dev)));
+            (self.logf)(&format!("替换旧连接（dev={}；旧连接已 CONNECTION_CLOSE）", dev_short(&dev)));
         }
         (self.logf)(&format!(
-            "quic: 连接采纳 dev={} tun={} ← {}",
+            "连接采纳 dev={} tun={} ← {}",
             dev_short(&dev),
             tun_ip,
             remote
@@ -478,7 +478,7 @@ impl ExitBridge {
             old.conn.close(VarInt::from_u32(0), b"device removed");
             debug_assert!(b.is_consistent(), "绑定表三索引不一致（unbind_pub 后）");
             drop(b);
-            (self.logf)(&format!("quic: 拆连接（dev={} 已从设备表摘除/轮换）", dev_short(&dev)));
+            (self.logf)(&format!("拆连接（dev={} 已从设备表摘除/轮换）", dev_short(&dev)));
         }
     }
 
@@ -488,7 +488,7 @@ impl ExitBridge {
         if log_due(n) {
             let s = self.stats.snapshot();
             (self.logf)(&format!(
-                "quic: 丢弃 超限={} 发送缓冲满={} 未登记={} 源校验拒={}（本次：{} {}；计数行首 3 + 每 100）",
+                "丢弃 超限={} 发送缓冲满={} 未登记={} 源校验拒={}（本次：{} {}；计数行首 3 + 每 100）",
                 s.drop_too_large,
                 s.drop_send_buffer_full,
                 s.drop_unregistered,
