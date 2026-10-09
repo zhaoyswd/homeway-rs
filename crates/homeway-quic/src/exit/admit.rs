@@ -185,6 +185,13 @@ fn fmt_dur(d: Duration) -> String {
 }
 
 /// 每源键（§3.2-④ 定死：**v4 /32、v6 /64 前缀聚合**——同址多端口算同源）。
+///
+/// **v4-mapped 归一（S5 D1 修复，2026-10-09）**：出口 QUIC socket 是**双栈**
+/// （`bind_dual_stack` 绑 `[::]`）⇒ IPv4 对端在 socket 面以 `::ffff:a.b.c.d` 出现。
+/// 若不归一，所有 IPv4 源会塌进同一个 `::/64` 桶（S5 实测：源 A 打满 16/10s 后，
+/// 异 /32 的源 B **第 1 次**尝试即被拒）——即 §3.2-④ 的「v4 /32」在双栈出口上不生效。
+/// 归一的定义域**只有** RFC 4291 的 v4-mapped（`::ffff:0:0/96`）：其余 IPv6
+/// （含 `::1`、ULA、GUA）保持 /64 聚合。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub(crate) enum SrcKey {
     /// IPv4 /32（整地址）。
@@ -194,15 +201,18 @@ pub(crate) enum SrcKey {
 }
 
 impl SrcKey {
-    /// 地址 → 前缀键（聚合口径见类型文档）。
+    /// 地址 → 前缀键（聚合口径见类型文档；**v4-mapped 先归一为 `V4`**）。
     pub fn of(peer: SocketAddr) -> Self {
         match peer.ip() {
             IpAddr::V4(v4) => Self::V4(v4.octets()),
-            IpAddr::V6(v6) => {
-                let mut b = [0u8; 8];
-                b.copy_from_slice(&v6.octets()[..8]);
-                Self::V6(b)
-            }
+            IpAddr::V6(v6) => match v6.to_ipv4_mapped() {
+                Some(v4) => Self::V4(v4.octets()),
+                None => {
+                    let mut b = [0u8; 8];
+                    b.copy_from_slice(&v6.octets()[..8]);
+                    Self::V6(b)
+                }
+            },
         }
     }
 
@@ -529,6 +539,14 @@ mod tests {
         SocketAddr::new(IpAddr::V6(ip), port)
     }
 
+    /// IPv4 的 `::ffff:a.b.c.d` 形态（**双栈 socket 面 IPv4 对端的真实表示**，S5 D1）。
+    fn v4_mapped(octets: [u8; 4], port: u16) -> SocketAddr {
+        SocketAddr::new(
+            IpAddr::V6(std::net::Ipv4Addr::from(octets).to_ipv6_mapped()),
+            port,
+        )
+    }
+
     /// **判据（S3-1）**：闸边界——窗内第 `F+1` 次起全部被拒；被拒的尝试仍计数
     /// （§3.3-1 的 `flood_refused = K − F` 算术）。
     #[test]
@@ -619,6 +637,55 @@ mod tests {
             "v4 按 /32 聚合（端口不进键）"
         );
         assert_ne!(SrcKey::of(v4(9, 1)), SrcKey::of(v4(10, 1)), "不同 /32 = 异键");
+    }
+
+    /// **判据（S5 D1 修复，2026-10-09）**：双栈出口（`[::]` 绑定）下 IPv4 对端以
+    /// **v4-mapped**（`::ffff:a.b.c.d`）出现 ⇒ 键必须先归一为 `V4(a.b.c.d/32)`：
+    /// **两个不同 IPv4 源各自独立计桶**（源 A 用满后源 B 仍可准入），且与 v4-only
+    /// socket 下同址的键一致；真正的 IPv6（`::1` 等）不受影响、仍按 /64 聚合。
+    #[test]
+    fn v4_mapped_sources_get_independent_v4_buckets() {
+        let t0 = Instant::now();
+        // 形态 = S5 实测行文里的对端：`[::ffff:192.168.3.12]:61979`
+        let a = v4_mapped([192, 168, 3, 12], 61979);
+        let b = v4_mapped([127, 0, 0, 1], 40000);
+        // 归一落点：v4-mapped 与同址的 v4 形态同键（同 /32 = 同桶，不论表示）
+        assert_eq!(
+            SrcKey::of(a),
+            SrcKey::of(SocketAddr::from(([192, 168, 3, 12], 1))),
+            "v4-mapped 与 v4 同址必须同键（端口不进键）"
+        );
+        assert_eq!(SrcKey::of(b), SrcKey::of(v4(1, 1)), "127.0.0.1 两种形态同键");
+        // 异 /32 ⇒ 异键。**这是 D1 的证伪点**：修复前两者都落 `V6([0; 8])` ⇒ 同键「::/64」
+        assert_ne!(
+            SrcKey::of(a),
+            SrcKey::of(b),
+            "不同 IPv4 源必须是不同桶（D1 根因：未归一时键恒为 ::/64）"
+        );
+        assert_eq!(SrcKey::of(a).text(), "192.168.3.12/32", "行文键 = 归一后的 /32");
+        // 行为面：F=2；源 A 打满（被拒那条第 3 次仍记账）⇒ 源 B 第 1 次仍被放行
+        let mut g = SrcGate::new(2, Duration::from_secs(10));
+        assert_eq!(g.attempt(t0, a).action, SrcAction::Allow);
+        assert_eq!(g.attempt(t0, a).action, SrcAction::Allow);
+        assert_eq!(g.attempt(t0, a).action, SrcAction::Refuse, "源 A 打满 2/10s");
+        let out = g.attempt(t0, b);
+        assert_eq!(
+            out.action,
+            SrcAction::Allow,
+            "源 B 独立计桶 ⇒ 第 1 次必放行（S5 实测：修复前此处被拒）"
+        );
+        assert_eq!(out.in_window, 1, "源 B 的窗内计数与源 A 无关");
+        assert_eq!(g.pending(t0, a), 3, "源 A 三条（含被拒那条仍记账）");
+        assert_eq!(g.pending(t0, b), 1, "源 B 一条");
+        assert_eq!(g.tracked(), 2, "两个源各占一条表项（修复前只有一条）");
+        // 真 IPv6 不被归一：`::1` 仍走 /64 键，且与 v4-mapped 异键
+        let loopback = SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), 1000);
+        assert!(
+            matches!(SrcKey::of(loopback), SrcKey::V6(_)),
+            "非 v4-mapped 的 IPv6 保持 /64 聚合"
+        );
+        assert_ne!(SrcKey::of(loopback), SrcKey::of(b), "`::1` 不是 127.0.0.1");
+        assert_eq!(SrcKey::of(loopback).text(), "::/64");
     }
 
     /// **判据（S3-1 / r14 F10）**：正常完成的尝试**不计数**——完成销窗内最早一条；
