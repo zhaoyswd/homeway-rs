@@ -649,16 +649,16 @@ fn reach(token_raw: &str) -> ReachReport {
         let expanded: Vec<std::net::SocketAddr> = if let Some(addr) = expand_literal(&ep.addr) {
             vec![addr]
         } else {
-            let Some((host, port)) = crate::wtransport::domain_eps::split_host_port_pub(&ep.addr)
+            let Some((host, port)) = crate::hostdns::split_host_port(&ep.addr)
             else {
                 continue;
             };
             let budget = REACH_PARENT_BUDGET.saturating_sub(t0.elapsed());
-            crate::wtransport::domain_eps::lookup_host(
+            crate::hostdns::lookup_host(
                 &host,
                 budget,
                 // Q-F F8e：daemon `host reach` 是用户可见结论面 ⇒ 关键档（不被后台刷新饿死）
-                crate::wtransport::domain_eps::ResolveLane::Critical,
+                crate::hostdns::ResolveLane::Critical,
             )
                 .unwrap_or_default()
                 .into_iter()

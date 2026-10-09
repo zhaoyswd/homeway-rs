@@ -641,11 +641,11 @@ fn host_candidates(tok: &Token, logf: &Logf) -> Result<Vec<homeway_quic::Candida
 
 /// 域名端点 → 首个 v4 地址（有界预算；失败/无 v4 ⇒ 记行 + `None`）。
 fn resolve_endpoint_v4(addr: &str, logf: &Logf) -> Option<SocketAddrV4> {
-    let (host, port) = crate::wtransport::domain_eps::split_host_port_pub(addr)?;
-    let ips = crate::wtransport::domain_eps::lookup_host(
+    let (host, port) = crate::hostdns::split_host_port(addr)?;
+    let ips = crate::hostdns::lookup_host(
         &host,
-        crate::wtransport::domain_eps::PROBE_SYNC_BUDGET,
-        crate::wtransport::domain_eps::ResolveLane::Critical,
+        crate::hostdns::PROBE_SYNC_BUDGET,
+        crate::hostdns::ResolveLane::Critical,
     )
     .unwrap_or_default();
     let v4 = ips

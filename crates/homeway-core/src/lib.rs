@@ -25,6 +25,13 @@ pub mod files;
 pub mod files_server;
 pub mod go_fmt;
 pub mod identity;
+/// 宿主面域名解析（分档令牌池 + 有界解析 + `host:port` 切分）。
+///
+/// M5 C3 迁址（设计 §1.1-D4 的保留面）：原 `wtransport::domain_eps` 的**与承载无关**
+/// 两件——CLI host 面拨号（`facade::host_session`）与 daemon `host reach`
+/// （`daemon/hosts.rs`）共用的解析闸与拆分函数；WG 档的候选展开/重解析编排随
+/// `wtransport` 删除（岛候选恒来自 token，无「学习/重解析」概念）。
+pub mod hostdns;
 /// 腿帧线格式（`[0xAA][peerId]` 前导 + `[0xBB][type][payload]` 封装）。
 ///
 /// M5 S0 迁址（设计 §1.2-M1）：原 `wtransport::frame` —— 中继（红线面）与 `relaywire`
