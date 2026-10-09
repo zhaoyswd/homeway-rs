@@ -60,7 +60,11 @@ mod driver;
 mod exit;
 mod reg4;
 mod rpk;
+/// **STREAM 协议面**（M3 §1：tag 单源 / 复位码表 / `StreamErr`；纯 std）。
+pub mod stream;
 mod sync_util;
+/// **可配常量面**（M3 §15-2/§15-3：流窗口/并发/待发队列 + 快探参数；纯 std）。
+pub mod tuning;
 mod tun;
 
 #[cfg(test)]
@@ -82,6 +86,9 @@ pub use exit::{
     ExitInbound, ExitQuic, ExitQuicConfig, ExitQuicErr, ExitQuicSnapshot, ExitSend, Reg4Request,
     Reg4Verdict, RejectWhy, RetryPolicy, FRAME_KIND_QUIC,
 };
+/// STREAM 协议类型（M3 S1）：tag / 复位码 / 流错误 / 写回执——`homeway-core` 的换轨面
+/// （S3）用同一份类型，不另写 tag 字面量。
+pub use stream::{StreamErr, StreamId, StreamTag, StreamWriteOut};
 // 帧层的**构造面**（组帧/解帧真源）：出口面校验与客户端组帧共用它；同步面（`homeway-core`
 // 的引擎与其测试）也用它——**不得**在消费侧另写一份标签顺序。
 pub use reg4::{Nonce, ProofFrame, RefreshFrame, Reg4Frame};
