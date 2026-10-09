@@ -1295,7 +1295,7 @@ async fn challenge_line_reports_inflight_and_cap() {
     let (logf, rx) = sink();
     let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(76), 32), logf)
         .expect("端点可起");
-    let stub = Stub::new(SECRET);
+    let _stub = Stub::new(SECRET); // 本用例只读日志行与快照（不 pump 引擎）
     let (_c, conn, _s) = client_conn(&quic).await;
     let (_send, _recv, _nonce) = hello_and_challenge(&conn, &[0x31u8; 32], &[0x32u8; 8]).await;
 
