@@ -286,6 +286,16 @@ fn exit_face(seed: u8) -> ExitQuic {
         .expect("出口 QUIC 面可起")
 }
 
+/// 出口面（**显式流面限制**）：把「对端接收窗」这类自变量在用例里钉死，使用例不随
+/// 设计缺省漂移（S9 把每流接收窗 256 KiB→4 MiB 时，背压用例的旧形态就不再必然出现 n=0）。
+fn exit_face_streams(seed: u8, streams: crate::tuning::StreamLimits) -> ExitQuic {
+    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("出口 socket 可绑");
+    let (logf, _rx) = sink();
+    let mut cfg = ExitQuicConfig::new(Ed25519Seed::from_bytes([seed; 32]), 32);
+    cfg.streams = streams;
+    ExitQuic::start(sock, cfg, logf).expect("出口 QUIC 面可起")
+}
+
 /// 出口的可连地址（`local_addr` 是**已绑定**地址；本测试全走回环 ⇒ 取端口 + 127.0.0.1）。
 fn connectable(quic: &ExitQuic) -> SocketAddrV4 {
     let port = match quic.local_addr() {
@@ -2398,10 +2408,15 @@ async fn stream_quota_exhausts_and_fails_fast_with_busy() {
 /// 快照 `stream_backpressure_events` 与「服务流背压」行同批可见。
 #[tokio::test]
 async fn stream_write_reports_backpressure_with_original_buffer() {
-    let quic = exit_face(0x34);
+    // 对端（出口）**显式**每流接收窗 64 KiB：本用例的机制是「对端停读 ⇒ 我方在途窗耗尽」，
+    // 该窗必须由用例给定（S9 把设计缺省抬到 4 MiB 后，写 1.25 MiB 不再必然撞窗）。
+    let quic = exit_face_streams(
+        0x34,
+        crate::tuning::StreamLimits { recv_window: 64 * 1024, ..crate::tuning::StreamLimits::design() },
+    );
     let stub = Stub::new();
     let (logf, logs) = sink();
-    // 测试缝：待发队列 4 KiB（下界）＋我方接收窗 32 KiB（让出口回显尽早阻塞）
+    // 测试缝：待发队列 4 KiB（下界）＋**我方**接收窗 32 KiB（让出口回显尽早阻塞）
     let mut cfg = island_cfg(Duration::from_secs(60), quic.rpk_public_key());
     cfg.streams.pending_bytes = 4096;
     cfg.streams.recv_window = 32 * 1024;
@@ -2421,7 +2436,7 @@ async fn stream_write_reports_backpressure_with_original_buffer() {
     .expect("开流");
 
     // 只写不读：出口回显填满我方接收窗（32 KiB）⇒ 出口的 echo 阻塞 ⇒ 我方流控窗
-    // （对端广告 256 KiB）与待发队列（4 KiB）依次填满 ⇒ 必然出现 `n=0`。
+    // （对端广告 64 KiB，本用例显式给定）与待发队列（4 KiB）依次填满 ⇒ 必然出现 `n=0`。
     let chunk = vec![0xEEu8; 8 * 1024];
     let mut saw_back = false;
     for _ in 0..160 {

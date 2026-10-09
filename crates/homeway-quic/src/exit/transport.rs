@@ -92,6 +92,10 @@ pub(crate) fn transport_config_with(mtu: u16, streams: StreamLimits) -> Arc<Tran
     t.max_concurrent_bidi_streams(VarInt::from_u32(streams.max_bidi));
     t.max_concurrent_uni_streams(VarInt::from_u32(streams.max_uni));
     t.stream_receive_window(VarInt::from_u32(streams.recv_window));
+    // **连接级接收窗（S9 新增）**：接收面聚合上界。quinn 缺省 = `VarInt::MAX`（无界），
+    // 「64 流 × 每流窗」是唯一兜底 ⇒ 每流窗抬到 4 MiB（S9）后必须显式给闸，否则最坏
+    // 256 MiB/连接。见 `crate::tuning::stream_defaults::CONN_RECV_WINDOW`。
+    t.receive_window(VarInt::from_u32(streams.conn_recv_window));
     // `send_window` = **连接级**（多流共享）；quinn 缺省 = 8×RWND=10 MB（§13.5 的账）。
     t.send_window(u64::from(streams.send_window));
     let mut ack = AckFrequencyConfig::default();

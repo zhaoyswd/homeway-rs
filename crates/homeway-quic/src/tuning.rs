@@ -22,9 +22,32 @@ pub mod stream_defaults {
     /// `max_concurrent_uni_streams`（§1.7-N13：本期限定「反向不开流」⇒ **0**；
     /// 与「`Cmd::Probe` 换 tag=5 真回显」**同切片**落地，否则巡检定音失效）。
     pub const MAX_UNI: u32 = 0;
-    /// `stream_receive_window`（每流接收窗；quinn 缺省 1.19 MiB ⇒ 收窄到 256 KiB）。
-    pub const RECV_WINDOW: u32 = 256 * 1024;
-    /// `send_window`（**连接级**、多流共享；quinn 缺省 10 MB ⇒ 收窄到 2 MiB）。
+    /// `stream_receive_window`（**每流接收窗**）。
+    ///
+    /// **S9 整改（2026-10-09；偏离 M3-design §1.7 的 256 KiB，依据 = S9 定位实验）**：
+    /// 出口泵的停等账实测——256 KiB 窗下 64 MiB 下载的 94% 墙钟（2512ms/2678ms）耗在
+    /// `SendStream::write_all` 的流控停等上，单次停等 ≈ 窗更新往返 9.8 ms
+    /// ⇒ 吞吐 = W/R_eff = 256 KiB/9.8 ms ≈ 25 MiB/s（与实测 23–25 MiB/s 逐值吻合；
+    /// 对照 WG/UDS 档 51 MiB/s ⇒ 0.46×，S8 的负面读数即此）。W=4 MiB 时停等降到 4–9%、
+    /// 吞吐 **71 MiB/s（= WG 的 1.39×）**。
+    ///
+    /// BDP 口径（quinn 对 `stream_receive_window` 的原话：应 ≥ 连接时延 × 期望吞吐）：
+    /// 4 MiB / 100 ms = 40 MB/s/流，覆盖真机 30–100 ms 档；本条只改**每流**窗，
+    /// 内存最坏面由 [`CONN_RECV_WINDOW`] 的聚合闸兜住（不随本条放大）。
+    pub const RECV_WINDOW: u32 = 4 * 1024 * 1024;
+    /// `receive_window`（**连接级接收窗 = 接收面聚合上界**；**S9 新增**）。
+    ///
+    /// 为什么必须显式给：quinn 缺省 `receive_window = VarInt::MAX`（无界）——设计 §7 的
+    /// 「64 流 × 每流窗 = 16 MiB/连接」账**只**由「每流窗 × 并发流数」兜底；每流窗抬到
+    /// 4 MiB 后该兜底会变成 256 MiB/连接（超设计账 16×）。显式 8 MiB ⇒ 单连接接收面最坏
+    /// **8 MiB**（比设计账 16 MiB 还低一半），同时单条 bulk 流仍可吃满 4 MiB 的每流窗
+    /// （两条 bulk 流各 4 MiB 亦容纳；>2 条并行时按聚合闸分摊）。
+    pub const CONN_RECV_WINDOW: u32 = 8 * 1024 * 1024;
+    /// `send_window`（**连接级发送缓冲**、多流共享；quinn 缺省 10 MB ⇒ 收窄到 2 MiB）。
+    ///
+    /// S9 实测：把出口侧本值抬到 8 MiB 对下行吞吐**零影响**（70.3/71.0 vs 70.0/71.9 MiB/s）
+    /// ⇒ 下行瓶颈不在发送缓冲；上传方向的发送侧缓冲同理属「在途未确认字节」闸，
+    /// 2 MiB 对 4 MiB 窗仍 ≥ 在途量级 ⇒ **本值不改**（保持设计 §1.7 的账）。
     pub const SEND_WINDOW: u32 = 2 * 1024 * 1024;
     /// 每流**待发队列**上界（§1.4：有界待发，懒分配）。
     pub const PENDING_BYTES: usize = 64 * 1024;
@@ -39,9 +62,11 @@ pub struct StreamLimits {
     pub max_bidi: u32,
     /// `max_concurrent_uni_streams`（本期 = 0）。
     pub max_uni: u32,
-    /// `stream_receive_window`（字节）。
+    /// `stream_receive_window`（每流接收窗，字节）。
     pub recv_window: u32,
-    /// `send_window`（字节；**连接级**）。
+    /// `receive_window`（**连接级**接收窗 = 接收面聚合上界，字节；S9 新增）。
+    pub conn_recv_window: u32,
+    /// `send_window`（字节；**连接级**发送缓冲）。
     pub send_window: u32,
     /// 每流待发队列上界（字节）。
     pub pending_bytes: usize,
@@ -53,6 +78,7 @@ impl Default for StreamLimits {
             max_bidi: stream_defaults::MAX_BIDI,
             max_uni: stream_defaults::MAX_UNI,
             recv_window: stream_defaults::RECV_WINDOW,
+            conn_recv_window: stream_defaults::CONN_RECV_WINDOW,
             send_window: stream_defaults::SEND_WINDOW,
             pending_bytes: stream_defaults::PENDING_BYTES,
         }
@@ -87,10 +113,20 @@ impl StreamLimits {
             EnvOutcome::Rejected(note) => notes.push(note),
             EnvOutcome::Unset => {}
         }
-        // 每流接收窗：32 KiB（小于此值 bulk 服务流会被窗口拖死）… 4 MiB（超 quinn 缺省即回到内存账）。
-        match parse_env_u64(get, ENV_STREAM_WINDOW, 32 * 1024, 4 * 1024 * 1024) {
+        // 每流接收窗：32 KiB（小于此值 bulk 服务流会被窗口拖死）… 16 MiB（S9：上限随
+        // 设计缺省抬到 4 MiB 一并放宽——否则缺省值 = 旧上限，消融臂再无处可抬）。
+        match parse_env_u64(get, ENV_STREAM_WINDOW, 32 * 1024, 16 * 1024 * 1024) {
             EnvOutcome::Value(v) => {
                 self.recv_window = v as u32;
+                applied += 1;
+            }
+            EnvOutcome::Rejected(note) => notes.push(note),
+            EnvOutcome::Unset => {}
+        }
+        // 连接级接收窗（接收面聚合上界）：256 KiB…64 MiB（S9 新增旋钮；缺省 8 MiB）。
+        match parse_env_u64(get, ENV_CONN_RECV_WINDOW, 256 * 1024, 64 * 1024 * 1024) {
+            EnvOutcome::Value(v) => {
+                self.conn_recv_window = v as u32;
                 applied += 1;
             }
             EnvOutcome::Rejected(note) => notes.push(note),
@@ -122,6 +158,8 @@ impl StreamLimits {
 pub const ENV_STREAMS: &str = "HOMEWAY_QUIC_STREAMS";
 /// env 名：每流接收窗（字节）。
 pub const ENV_STREAM_WINDOW: &str = "HOMEWAY_QUIC_STREAM_WINDOW";
+/// env 名：**连接级接收窗**（接收面聚合上界，字节；S9 新增）。
+pub const ENV_CONN_RECV_WINDOW: &str = "HOMEWAY_QUIC_RECV_WINDOW";
 /// env 名：连接级发送窗（字节）。
 pub const ENV_SEND_WINDOW: &str = "HOMEWAY_QUIC_SEND_WINDOW";
 /// env 名：每流待发队列（字节）。
@@ -410,18 +448,30 @@ mod tests {
         }
     }
 
-    /// **判据（§15-3 初值 = 设计定值）**：缺省逐值照设计（含 `uni=0` 与 N14 的自记账域）。
+    /// **判据（§15-3 初值 = 设计定值；S9 修订后的值域）**：缺省逐值照设计（含 `uni=0`
+    /// 与 N14 的自记账域）；每流窗/连接级接收窗 = S9 整改值（4 MiB / 8 MiB，依据见
+    /// [`stream_defaults::RECV_WINDOW`] 的定位实验账）。
     #[test]
     fn stream_limits_default_to_design_values() {
         let d = StreamLimits::design();
         assert_eq!(d.max_bidi, 64, "§1.7 的并发上限");
         assert_eq!(d.max_uni, 0, "§1.7-N13：本期 uni=0");
-        assert_eq!(d.recv_window, 256 * 1024, "每流接收窗");
-        assert_eq!(d.send_window, 2 * 1024 * 1024, "连接级发送窗");
+        assert_eq!(d.recv_window, 4 * 1024 * 1024, "每流接收窗（S9：256 KiB→4 MiB）");
+        assert_eq!(
+            d.conn_recv_window,
+            8 * 1024 * 1024,
+            "连接级接收窗（S9 新增：接收面聚合上界 8 MiB ≤ 设计 §7 的 16 MiB 账）"
+        );
+        assert_eq!(d.send_window, 2 * 1024 * 1024, "连接级发送窗（不改）");
         assert_eq!(d.pending_bytes, 64 * 1024, "每流待发队列");
         // N14：有效服务流容量 = 上限 − 2（控制流 + probe 持久流）
         assert_eq!(d.service_capacity(), 62);
         assert_eq!(d, StreamLimits::default());
+        // S9 的构造性关系：聚合闸 ≥ 单流窗（否则单条 bulk 流吃不满自己的每流窗）
+        assert!(
+            d.conn_recv_window >= d.recv_window,
+            "连接级接收窗必须 ≥ 每流窗（S9 的账）"
+        );
     }
 
     /// **判据（服务入口定值，§1.7/§8.2-16）**：intake 容量 = 在册上限 + K；K=4；
@@ -440,20 +490,22 @@ mod tests {
     /// **判据（env 消融臂，§15-2）**：合法值逐项生效；非法/越界 ⇒ 不改该项 + 一行说明。
     #[test]
     fn stream_env_overrides_apply_or_are_rejected_with_note() {
-        // ① 合法：四项全生效
+        // ① 合法：五项全生效
         let mut lim = StreamLimits::design();
         let get = table(&[
             ("HOMEWAY_QUIC_STREAMS", "32"),
             ("HOMEWAY_QUIC_STREAM_WINDOW", "131072"),
+            ("HOMEWAY_QUIC_RECV_WINDOW", "2097152"),
             ("HOMEWAY_QUIC_SEND_WINDOW", "1048576"),
             ("HOMEWAY_QUIC_STREAM_PENDING", "16384"),
         ]);
         let (applied, notes) = lim.apply_env(&get);
-        assert_eq!(applied, 4, "四项都命中：{notes:?}");
+        assert_eq!(applied, 5, "五项都命中：{notes:?}");
         assert!(notes.is_empty(), "合法值不产说明行：{notes:?}");
         assert_eq!(lim.max_bidi, 32);
         assert_eq!(lim.service_capacity(), 30);
         assert_eq!(lim.recv_window, 131_072);
+        assert_eq!(lim.conn_recv_window, 2_097_152);
         assert_eq!(lim.send_window, 1_048_576);
         assert_eq!(lim.pending_bytes, 16_384);
 
@@ -462,12 +514,13 @@ mod tests {
         let get = table(&[
             ("HOMEWAY_QUIC_STREAMS", "2"),         // 越界下限（< 3）
             ("HOMEWAY_QUIC_STREAM_WINDOW", "abc"), // 非数字
+            ("HOMEWAY_QUIC_RECV_WINDOW", "65536"), // 越界下限（< 256 KiB）
             ("HOMEWAY_QUIC_SEND_WINDOW", "-1"),    // 负数
             ("HOMEWAY_QUIC_STREAM_PENDING", "4194305"), // 越界上限（> 4 MiB）
         ]);
         let (applied, notes) = lim.apply_env(&get);
         assert_eq!(applied, 0);
-        assert_eq!(notes.len(), 4, "四条各自一行：{notes:?}");
+        assert_eq!(notes.len(), 5, "五条各自一行：{notes:?}");
         assert_eq!(lim, StreamLimits::design(), "非法项一律不改值");
         for n in &notes {
             assert!(n.contains("非法或越界"), "说明行形态：{n}");
@@ -484,12 +537,17 @@ mod tests {
         let mut lim = StreamLimits::design();
         let get = table(&[
             ("HOMEWAY_QUIC_STREAMS", "3"),
-            ("HOMEWAY_QUIC_STREAM_WINDOW", "4194304"),
+            ("HOMEWAY_QUIC_STREAM_WINDOW", "16777216"),
         ]);
         let (applied, _) = lim.apply_env(&get);
         assert_eq!(applied, 2);
         assert_eq!(lim.max_bidi, 3);
         assert_eq!(lim.service_capacity(), 1, "下限 = 恰一条服务流容量");
+        assert_eq!(lim.recv_window, 16 * 1024 * 1024, "每流窗上限（S9 放宽到 16 MiB）");
+        // ⑤ S9 消融臂的承重档位：旧缺省（256 KiB）仍可显式指定（复现 S8 负面读数的臂）
+        let mut lim = StreamLimits::design();
+        assert_eq!(lim.apply_env(&table(&[("HOMEWAY_QUIC_STREAM_WINDOW", "262144")])).0, 1);
+        assert_eq!(lim.recv_window, 256 * 1024, "旧缺省档位可达（负向对照臂）");
     }
 
     /// **判据（快探参数初值 + 消融臂，§15-2/§3.2）**：缺省 = 设计值；env 命中逐项生效。
@@ -559,6 +617,7 @@ mod tests {
     fn env_names_are_the_single_source() {
         assert_eq!(ENV_STREAMS, "HOMEWAY_QUIC_STREAMS");
         assert_eq!(ENV_STREAM_WINDOW, "HOMEWAY_QUIC_STREAM_WINDOW");
+        assert_eq!(ENV_CONN_RECV_WINDOW, "HOMEWAY_QUIC_RECV_WINDOW");
         assert_eq!(ENV_SEND_WINDOW, "HOMEWAY_QUIC_SEND_WINDOW");
         assert_eq!(ENV_STREAM_PENDING, "HOMEWAY_QUIC_STREAM_PENDING");
         assert_eq!(ENV_PROBE_BUDGET, "HOMEWAY_QUIC_PROBE_BUDGET");

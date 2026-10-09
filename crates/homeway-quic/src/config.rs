@@ -138,11 +138,13 @@ pub struct IslandConfig {
     /// `[QUIC_MTU_CAP_MIN, QUIC_MTU_CAP_MAX]`（facade 侧）；本字段不再夹——测试缝
     /// （窄路径注入）需要能给出区间外的值。
     pub mtu_cap: u16,
-    /// **流面限制**（M3 §1.7 / §15-3）：并发上限、每流接收窗、连接级发送窗、每流待发队列。
+    /// **流面限制**（M3 §1.7 / §15-3）：并发上限、每流接收窗、连接级接收窗（聚合上界）、
+    /// 连接级发送窗、每流待发队列。
     ///
     /// 缺省 = 设计定值（[`StreamLimits::design`]）；启动时按 `HOMEWAY_QUIC_STREAMS` /
-    /// `HOMEWAY_QUIC_STREAM_WINDOW` / `HOMEWAY_QUIC_SEND_WINDOW` /
-    /// `HOMEWAY_QUIC_STREAM_PENDING` 覆盖（env 优先，非法项按缺省 + 记行）。
+    /// `HOMEWAY_QUIC_STREAM_WINDOW` / `HOMEWAY_QUIC_RECV_WINDOW` /
+    /// `HOMEWAY_QUIC_SEND_WINDOW` / `HOMEWAY_QUIC_STREAM_PENDING` 覆盖（env 优先，
+    /// 非法项按缺省 + 记行）。
     pub streams: StreamLimits,
     /// **快探/恢复参数**（M3 §15-2；S4 消费）：首探预算/复探倍数/待机节拍/抖动与 B 门阈值/
     /// 发送面新鲜度窗。缺省 = 设计初值；启动时按 `HOMEWAY_QUIC_PROBE_*` 族覆盖。
