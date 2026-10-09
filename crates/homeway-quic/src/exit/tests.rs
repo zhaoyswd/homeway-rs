@@ -1124,6 +1124,242 @@ async fn bound_connection_re_admission_is_rejected() {
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
 
+// ---------- 代码门 r15 整改（G2/G17）：准入漏斗的 fail-visible 拒绝串定点用例 ----------
+//
+// 背景（`docs/reviews/M2.md` §2 的 G2/G17）：准入漏斗的 7 条 `why` 串里有 6 条只有实现、
+// 没有断言；判据行「准入挑战已发（…；在途未认证 n/cap；第 n 次）」的**数值**也从未被校验。
+// 这些串是设计 §13-4 点名的「fail-visible 拆细」产物 ⇒ 各补一条定点用例（照
+// `legacy_h3_frame_is_rejected_with_distinct_reason` 的模板：构帧 → 断言归因串 + 分档计数
+// + 关连接）。**不在本组**的两条：`证明失败闸冷却中`（见下方冷却用例）、`TLS exporter 不可得`
+// （真连接上恒可得，构造不出 ⇒ 登记为不可测，见 `M2.md`）。
+
+/// **判据（G2）**：首帧不是 Hello（这里是 `P4`）⇒ 拒（`帧格式非法（首帧必须是 Hello）`）
+/// + 归到「未发挑战」段 + 不投引擎 + 关连接。
+#[tokio::test]
+async fn first_frame_must_be_hello() {
+    let (logf, rx) = sink();
+    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(71), 32), logf)
+        .expect("端点可起");
+    let stub = Stub::new(SECRET);
+    let (_c, conn, _s) = client_conn(&quic).await;
+    let (mut send, _recv) = conn.open_bi().await.expect("open_bi");
+    // 首帧直送 Proof（语法合法但**位置非法**）：帧头判别先于任何状态
+    let frame = ProofFrame::encode(
+        &SECRET,
+        &[0x11u8; 32],
+        &[0x12u8; 8],
+        TS,
+        &Nonce::from_bytes([0x13u8; 16]),
+        &exporter_of(&conn),
+    );
+    send.write_all(&frame).await.expect("写首帧 Proof");
+
+    pump_until_line(&stub, &quic, &rx, "帧格式非法（首帧必须是 Hello）", WAIT).await;
+    assert_eq!(stub.proofs(), 0, "首帧非法不得投引擎");
+    assert_eq!(quic.snapshot().proof_rejected, 0, "不归 Proof 段");
+    assert_eq!(quic.snapshot().challenges_refused, 1, "归「未发挑战」段");
+    assert!(
+        pump_until(&stub, &quic, || conn.close_reason().is_some(), WAIT).await,
+        "首帧非法必须关连接"
+    );
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（S1-8 的 `P4` 臂 / G17）**：已绑定连接再发 `H4` **或 `P4`** ⇒ 一律拒
+/// （`已绑定连接的再准入`）+ 关连接（防止 `bind()` 把同一连接改指到另一身份）。
+#[tokio::test]
+async fn bound_connection_rejects_proof_re_admission() {
+    let (logf, rx) = sink();
+    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(72), 32), logf)
+        .expect("端点可起");
+    let stub = Stub::new(SECRET);
+    let pubkey = [0xC1u8; 32];
+    let dev = [0xC2u8; 8];
+    let (_c, conn, _s) = client_conn(&quic).await;
+    // 用 `four_frames` 保留本连接那枚 nonce（`admit` 会丢掉它）
+    let (mut send, _recv, nonce) = four_frames(&stub, &quic, &conn, &SECRET, &pubkey, &dev)
+        .await
+        .expect("四帧应走通");
+    pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=c2c2c2c2", WAIT).await;
+
+    // 另一台「设备」的 Proof（nonce 是**本连接**的，MAC 也合法）⇒ 仍必须被拒
+    let frame = ProofFrame::encode(
+        &SECRET,
+        &[0xE1u8; 32],
+        &[0xE2u8; 8],
+        TS,
+        &nonce,
+        &exporter_of(&conn),
+    );
+    send.write_all(&frame).await.expect("写已绑定连接的第二条 Proof");
+    pump_until_line(&stub, &quic, &rx, "已绑定连接的再准入", WAIT).await;
+    assert_eq!(stub.proofs(), 1, "只应有准入那一条 Proof 投到引擎");
+    assert_eq!(quic.snapshot().challenges_issued, 1, "不得再发挑战");
+    assert!(
+        pump_until(&stub, &quic, || conn.close_reason().is_some(), WAIT).await,
+        "再准入必须关连接"
+    );
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（G2）**：已绑定连接上收到**既非刷新帧**的客户端帧（这里 `C4`）⇒ 拒
+/// （`帧格式非法（已绑定连接只收刷新帧）`）+ 关连接。
+#[tokio::test]
+async fn bound_connection_rejects_non_refresh_frame() {
+    let (logf, rx) = sink();
+    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(73), 32), logf)
+        .expect("端点可起");
+    let stub = Stub::new(SECRET);
+    let pubkey = [0xC3u8; 32];
+    let dev = [0xC4u8; 8];
+    let (_c, conn, _s) = client_conn(&quic).await;
+    let (mut send, _recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
+    pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=c4c4c4c4", WAIT).await;
+
+    // `C4` 是出口→客户端的帧头；客户端发来即「不该出现的帧」
+    send.write_all(&ChallengeFrame::encode(&Nonce::from_bytes([0x5Au8; 16])))
+        .await
+        .expect("写 C4 帧");
+    pump_until_line(&stub, &quic, &rx, "帧格式非法（已绑定连接只收刷新帧）", WAIT).await;
+    assert_eq!(stub.refreshes(), 0, "非法帧不得投引擎（不是刷新）");
+    assert!(
+        pump_until(&stub, &quic, || conn.close_reason().is_some(), WAIT).await,
+        "非法帧必须关连接"
+    );
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（G2 · 撤销/轮换的最小对齐面）**：绑定被摘（设备淘汰/轮换/替换 ⇒ `unbind_pub`）
+/// ⇒ **连接被立刻拆**（`拆连接（dev=…）` 行 + 对端观察 `close_reason`），后续帧不再投引擎。
+///
+/// **形态说明（代码门 r15 整改的如实记录）**：`refresh_loop` 里那条「连接未绑定（绑定已摘）」
+/// 归因串是**防御位**——产品面上所有摘绑定的路径（`unbind_pub` 摘绑定 **并** 关连接；
+/// `bind()` 替换旧连接时同样关旧连接）都先关连接，控制流随即退出 ⇒ 该串构造不出（本用例
+/// 一度试图构造，实测只观察到「拆连接」行 ⇒ 改为断言**真实防线**：摘绑定必拆连接）。
+#[tokio::test]
+async fn binding_removed_midflight_closes_connection() {
+    let (logf, rx) = sink();
+    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(74), 32), logf)
+        .expect("端点可起");
+    let stub = Stub::new(SECRET);
+    let pubkey = [0xC5u8; 32];
+    let dev = [0xC6u8; 8];
+    let (_c, conn, _s) = client_conn(&quic).await;
+    let (mut send, _recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
+    pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=c6c6c6c6", WAIT).await;
+
+    quic.unbind_pub(&pubkey); // 摘绑定（引擎侧 Remove 的出口面动作）
+    pump_until_line(&stub, &quic, &rx, "quic: 拆连接（dev=c6c6c6c6", WAIT).await;
+    assert!(
+        pump_until(&stub, &quic, || conn.close_reason().is_some(), WAIT).await,
+        "摘绑定必须拆连接（被淘汰设备不得继续用旧连接）"
+    );
+    // 摘除后该连接的帧不再投引擎（控制流任务已随连接退出）
+    let before = stub.refreshes();
+    let frame = RefreshFrame::encode(&SECRET, &pubkey, &dev, TS, &exporter_of(&conn));
+    let _ = send.write_all(&frame).await; // 连接已关 ⇒ 写失败是预期，不 panic
+    tokio::time::sleep(Duration::from_millis(150)).await;
+    assert_eq!(stub.refreshes(), before, "摘绑定后刷新帧不得投引擎");
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（G2）**：刷新帧的**帧内身份**与绑定不符（同 MAC 合法）⇒ 拒
+/// （`刷新帧与绑定身份不符`）+ 关连接（本地双检查的第二道，零设备表查询）。
+#[tokio::test]
+async fn refresh_identity_mismatch_is_rejected() {
+    let (logf, rx) = sink();
+    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(75), 32), logf)
+        .expect("端点可起");
+    let stub = Stub::new(SECRET);
+    let pubkey = [0xC7u8; 32];
+    let dev = [0xC8u8; 8];
+    let (_c, conn, _s) = client_conn(&quic).await;
+    let (mut send, _recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
+    pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=c8c8c8c8", WAIT).await;
+
+    // 帧内换成另一个 dev/pub（MAC 用同一 secret 照算 ⇒ 域标签/MAC 都合法）
+    send_refresh(&conn, &mut send, &SECRET, &[0xC9u8; 32], &[0xCAu8; 8]).await;
+    pump_until_line(&stub, &quic, &rx, "刷新帧与绑定身份不符", WAIT).await;
+    assert_eq!(stub.refreshes(), 0, "身份不符不得投引擎");
+    assert!(
+        pump_until(&stub, &quic, || conn.close_reason().is_some(), WAIT).await,
+        "身份不符必须关连接"
+    );
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（G2 · §1.6 的挑战行）**：「准入挑战已发」行的**数值**同源——`在途未认证` 的
+/// 分子 = 存活连接 − 已绑定设备（1/64），分母 = `conn_cap`（2×`max_devices`）。
+#[tokio::test]
+async fn challenge_line_reports_inflight_and_cap() {
+    let (logf, rx) = sink();
+    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(76), 32), logf)
+        .expect("端点可起");
+    let stub = Stub::new(SECRET);
+    let (_c, conn, _s) = client_conn(&quic).await;
+    let (_send, _recv, _nonce) = hello_and_challenge(&conn, &[0x31u8; 32], &[0x32u8; 8]).await;
+
+    let line = drain_until(&rx, "quic: 准入挑战已发", WAIT);
+    let line = line
+        .iter()
+        .find(|l| l.contains("准入挑战已发"))
+        .unwrap_or_else(|| panic!("应有挑战行：{line:?}"));
+    assert!(
+        line.contains("在途未认证 1/64"),
+        "分子 = 存活连接 − 已绑定（1）、分母 = conn_cap（64）：{line}"
+    );
+    assert!(line.contains("第 1 次"), "节流序号从 1 起：{line}");
+    assert_eq!(quic.snapshot().challenges_issued, 1, "行与快照同源");
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（G2 · §5-11 的代价告警）**：`retry_policy=always` ⇒ 启动期打出
+/// 「常态 +1 RTT」告警行；缺省（pressure）⇒ **不打**（告警不得常态噪声）。
+#[tokio::test]
+async fn retry_policy_always_warns_about_extra_rtt() {
+    let (_quic, rx) = exit_face_logged(77, |c| c.retry_policy = RetryPolicy::Always);
+    let lines = collect_for(&rx, Duration::from_millis(300));
+    assert!(
+        lines.iter().any(|l| l.contains("retry_policy=always")),
+        "always 档必须打代价告警行：{lines:?}"
+    );
+    let (_q2, rx2) = exit_face_logged(78, |_c| {});
+    let lines2 = collect_for(&rx2, Duration::from_millis(300));
+    assert!(
+        !lines2.iter().any(|l| l.contains("retry_policy=always")),
+        "缺省（pressure）不得打该告警：{lines2:?}"
+    );
+}
+
+/// **判据（G2 · §3.2-⑥）**：冷却期内拒 Hello 的归因串**可辨**
+/// （`证明失败闸冷却中…`）——与「证明失败闸（dev=…）」那条计数行互补（后者已被
+/// `proof_fail_gate_cools_bad_dev_and_spares_engine_rejected` 覆盖）。
+#[tokio::test]
+async fn cooling_reject_why_is_visible_in_log() {
+    let (quic, rx) = exit_face_logged(79, |c| {
+        c.proof_fail_threshold = 1; // 阈值 1：一次 MAC 不符即进冷却
+        c.per_src_window = Duration::from_secs(60);
+    });
+    let stub = Stub::new(SECRET);
+    let pubkey = [0x41u8; 32];
+    let dev = [0x42u8; 8];
+    // 一次 MAC 不符（错 secret）⇒ 进冷却
+    let (_c, conn, _s) = client_conn(&quic).await;
+    let got = four_frames(&stub, &quic, &conn, &[0x00u8; 32], &pubkey, &dev).await;
+    assert!(got.is_err(), "错 secret 必须被拒");
+    drain_until(&rx, "quic: 证明失败闸", WAIT);
+
+    // 冷却中：同 devTag 的 Hello ⇒ 拒（可辨归因串）
+    let (_c2, conn2, _s2) = client_conn(&quic).await;
+    let (mut send, _recv) = conn2.open_bi().await.expect("open_bi");
+    send.write_all(&HelloFrame::encode(&pubkey, &dev, TS))
+        .await
+        .expect("写 Hello");
+    pump_until_line(&stub, &quic, &rx, "证明失败闸冷却中", WAIT).await;
+    assert_eq!(quic.snapshot().challenges_issued, 1, "冷却期不得再发挑战");
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
 /// **判据（S1-8 的正向半边 + 刷新面 · r14 F11）**：已绑定连接的刷新帧 ⇒ 引擎 `Accepted`
 /// ⇒ **不重绑、不打第二条 E-q2**（行频从「每次 Accepted」收成「仅首次准入」）。
 #[tokio::test]
