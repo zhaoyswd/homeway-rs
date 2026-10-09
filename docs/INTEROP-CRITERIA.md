@@ -623,6 +623,8 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 | 2026-10-09（同上） | **A11 跨承载标注（非判据行；口径注记）** | `docs/PERF-AB.md` 的「ACK 密度/段数/通告窗/在途估算」类读数标注为**跨承载不可比**（读数取自栈 B 的 ACK 时钟，随 M5 退场）；QUIC 档对位 = `exit/transport.rs` 的 `ACK_ELICITING_THRESHOLD=16`/`MAX_ACK_DELAY=5ms`；服务流吞吐对比须按 §7 的相对门槛（同刻同承载、同一服务操作 ≥0.95× WG/UDS 档）重采 | 设计 §5.3-A11/§7：ACK 整形换轨、旧读数无同义对位 | `docs/PERF-AB.md`（头部批注）；`docs/QUIC-BASELINE.md`/S8 的读数口径；**服务流吞吐相对门槛的读数归 S8** |
 | 2026-10-09（同上） | **既有小缺陷修复（非判据行）：统一进程 `files_root = ""` 判负** | `config.toml` 模板缺省 `files_root = ""` 被装配成 `Some(PathBuf::from(""))` ⇒ `FilesServer::open` 的 `is_dir()` 判负 ⇒ **恒打**「⚠️ files 根目录不可用—— 文件管理会报错，其余功能不受影响」（独立 `serve` 形态不生成模板 ⇒ 不受影响）→ **空串视作未配置**（与 `None` 同义 ⇒ `$HOME`，Go `files.Open("")` 同源） | 配合 Go 语义（`pkg/files/server.go:56-62` 的 `rootDir == "" ⇒ os.UserHomeDir()`）+ 模板键表自陈「空=$HOME」；**只归一「空」**，非空但不存在仍 `NotFound` 判负 | `crates/homeway-core/src/files_server.rs`（唯一 choke point）、统一进程/前台 `serve` 的 files 服务根；新单测 `files_server::tests::empty_root_is_treated_as_unconfigured`；**实采（修后）**：`files 就绪：root=/Users/zhaozhe …`（修前同一实例打「根目录不可用」） |
 | 2026-10-09（同上） | **M3 未新增 `config.toml` 键（显式登记）** | M3 **未新增/未改** `config.toml` 任何键；`serve.status` 的 `quic` 段与 `tunStatusJSON` 的 `quic` 段都是**只读输出面**；快探/流面参数全走硬编 + env（见配置常量条） | 设计 §12-2/§15-2/§15-3 的授权面（env 消融臂）已足够 S8 标定；不加 config 键 = 不动 `nodestate.rs` 模板与对 Go 单向兼容面 | `nodestate.rs`/`serve_cli.rs` **零 diff**（本批）；若后续要落 config 键，影响面须点 `nodestate.rs` + `serve_cli.rs` + 单向兼容说明（三条先例：`serve.quic*`/`tunConfig.*`） |
+| 2026-10-09（同上） | **已知 flake 补充登记：`wgcore::tests::stop_within_detaches_and_reaper_closes_wake_fd`** | 无 → 有（登记为**已知 flake**，非契约变更；其代码注释自陈「真出现按 flake 记」） | M3 S6 首轮全量并行跑实测 1 例红（并行 66s 轮；单测自带 5s 收割期限 + 裸 fd 号探测）；`--test-threads=1` 隔离复跑 **绿（0.02-0.07s，两轮）**；同批另两例（`daemon::tests::handshake_deadline_beats_slow_drip`、`term::service::tests::attach_size_applies_to_pty`）与 `wtransport` 实 socket 时序族为**已登记**族 | 判据行/wire/夹具**零变更**；flake 口径照 M0 §9.2④（红了先隔离单跑再判回归）；CI 复跑若再现按 flake 口径处置（不静默重跑） |
+| 2026-10-09（同上） | **tier `docs/agents/connection-lifecycle.md` §3 待修订（草案交付；非本表条目）** | tier 的「核内恢复阶梯」现文只描述 R1/R2/R3（WG 档） → **需按承载分档**（WG 档 = 旧三档原样；QUIC 档 = 快探 → 复探 → M/R → B 世代重建，门槛 `T_recv ≤ 3.5s`）；真源 = `docs/reviews/M3.md` 附录 A（§3 整节替换稿 + §9 常量追加 + §10 速查追加 + §11 待办两条） | M3 阶梯重写（QUIC 档无 R1/R2/R3；设计 §3.4/§8.1 的 tier 行） | tier 侧触点 = **用户**（M3 只出草案、不改 tier）；**未落地前该文档与实现短期不一致**（风险 §10-9；读到 `RECOVER` 行须先确认世代承载） |
 
 
 > **上表 E12/decr_flow 两行 = 2026-10-07 Q-B 批落地登记**（Q-A 批预登记的占位条目已按本政策补全
@@ -688,7 +690,7 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 > ①的**差异登记**（设计 vs 实测）按裁定已落 `docs/reviews/M2.md` §1（该文件由 S4 立，
 > **S6 续写** §2–§4 的代码门记录/威胁模型验证/判据行转交清单）。
 >
-> **其下三十行 = 2026-10-09 M3（WG → QUIC 传输层换代程序 **M3 服务流迁移 + 阶梯重写 +
+> **其下三十二行 = 2026-10-09 M3（WG → QUIC 传输层换代程序 **M3 服务流迁移 + 阶梯重写 +
 > 准入归因**，S1–S5 落地；S7 登记）**——登记面覆盖设计 §8.2 的 18 条草案 + 各切片「交 S7」清单，
 > **逐条按代码里的实际串/实际键表登记**（S2/S4 都报过「登记须照实装串」）：
 > ①E14 ②E17 ③E10/E11 输入集 ④E5 复核 ⑤E1 复核 ⑥E-q3（行文 + 接受集收窄）⑦新增 E-q5（四行）
@@ -699,7 +701,11 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 > ⑲M1 的 `连接已断` 行改写 ⑳配置与常量（含 13 条 env、intake 取值表、term 连接级闸 = 新行为）
 > ㉑零差异登记 ㉒stackb/UDS 退役（D1）+ §5.1 消费点身份订正 ㉓DC14/DC15/CA1/CA4/CA5 复核
 > ㉔CA7–CA10 复核 ㉕A13 复核 ㉖公面类型清单 ㉗A12 死变体删除 ㉘A11 跨承载标注 ㉙`files_root=""`
-> 小修 ㉚M3 无新增 config 键。
+> 小修 ㉚M3 无新增 config 键 ㉛已知 flake 补充登记（`wgcore::tests::stop_within_detaches_and_reaper_closes_wake_fd`）
+> ㉜tier `connection-lifecycle.md` §3 待修订（草案交付；tier 侧触点 = 用户）。
+> **同批订正两处**：①C11 触发集条追加「同日订正」——「QUIC 档零 C11 入口」只对内部触发点成立，
+> NAPI 下推入口 `ClientCoreTunRecover` 未分档（缺口登记 + 归 S9 代码门/M4 设计门，见 `docs/reviews/M3.md` §5）；
+> ②本批登记文内的 `ladde.rs` 笔误订正为 `client/ladder.rs`。
 > **本批的策略 = 「QUIC 档新增为主 + 三处行文改写（E14/E17/E-q3 明细）+ 两处行删除
 > （M1 的 Rebind 族、`连接已断` 旧串）+ 取值/键表变化」**（设计 §8.1）：
 > WG 族行**一条不改**（`_wg` 档判据 = 与 M1/M2 末逐字节同，证据 = `tools/quic-wg-e2e.sh` 复跑）；
@@ -775,5 +781,5 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 | 2026-10-09（**M3 S1–S5 落地；S7 登记**） | **E-q3 的 `源校验拒` 输入集**（QUIC 档） | 内层包源 ∉ `{tunnel_ip, tun_ip}` → ∉ **`{tun_ip}`**（QUIC 档接受集收窄；E-q3 明细同步改单元素集） | 设计 §6：`tunnel_ip` 在 QUIC 档无合法来源（源校验接受集收紧 = 安全面收紧）；`tunnel_ip` 字段保留但不再参与校验 | E-q3 数值、`quic` JSON 段的 `drops` 面（`源校验拒` 不在 JSON 段；行面）；`exit/conn.rs`；单测 `datagram_with_illegal_source_is_dropped_and_counted` |
 | 2026-10-09（同上） | **`migration_unconfirmed`（状态 JSON + N-b 行）** | 判定窗口 60s（巡检拍）→ **≤1 个快探预算（缺省 700ms）**；确认面由「`udp_rx` 增量」→ **「快探回显」**；语义由「慢变量告警」→ **动作前置条件**（置位 ⇒ 允许走 R） | 设计 §3.1（QUIC 档阶梯重写） | `quic.migration_unconfirmed` 读者、N-b 行读者、M1 真机「路径变更已验」复现脚本；`driver.rs`（M 确认失败行 `quic: 迁移未确认（一个快探预算内无对端回包 ⇒ 回落重连/重赛跑）`） |
 | 2026-10-09（同上） | **DC18** `intercept：dialOk=N dialFail=N reject=N flows=N` | QUIC 档服务流（files/term/speedtest 经 STREAM tag 分发）**不再进拦截层** ⇒ 不再抬高 `dialOk`/`flows`（对应 WG 档服务腿仍照计——D1 下该路径不变） | M3 服务流改 tag 分发（D1） | DC18 数值、`serve.status` intercept 段；按「QUIC 档服务流也会 +dialOk」写断言的脚本须改。**证据**：`[e2e5] exit.exempt_lines=0`（QUIC 档零 exempt/dialok 行） |
-| 2026-10-09（同上） | **C11 触发集（QUIC 档）** | M1 登记的「quic 档的巡检失败面走『Rebind 优先 + `patrol` 分类』、**不再驱动 WG 阶梯**」→ **M3 S4：QUIC 档零 C11 入口**（`recover()` 全部调用点都在 `!l3_on_island()` 守卫下）+ **C18 承担 QUIC 档恢复时间线**（替代关系） | 设计 §3.4/§8.2-9；阶梯重写 | C11 行读者（须按承载分档）；`session/recover.rs` **零 diff**；新增 `client/ladder.rs` 的 C18 族（见登记表） |
+| 2026-10-09（同上） | **C11 触发集（QUIC 档）** | M1 登记的「quic 档的巡检失败面走『Rebind 优先 + `patrol` 分类』、**不再驱动 WG 阶梯**」→ **M3 S4：QUIC 档零 C11 入口**（`recover()` 全部调用点都在 `!l3_on_island()` 守卫下）+ **C18 承担 QUIC 档恢复时间线**（替代关系） | 设计 §3.4/§8.2-9；阶梯重写 | C11 行读者（须按承载分档）；`session/recover.rs` **零 diff**；新增 `client/ladder.rs` 的 C18 族（见登记表）　**同日订正（S6 扫查）**：「QUIC 档零 C11 入口」只对**内部触发点**成立（挂起唤醒 / 巡检失败 / 3 连败 / 待发包下推四处均在 `!l3_on_island()` 守卫下）；**NAPI 下推入口 `ClientCoreTunRecover(from)` 未分档**（`facade/mod.rs` → `tun_exec.rs` 的隧道域 `recover` → WG 阶梯，全链无守卫）⇒ QUIC 档下该入口仍会产 `RECOVER` 族行并做 WG 动作。**缺口登记 + 归属**：homeway-rs `docs/reviews/M3.md` §5（S9 代码门复核 + M4 设计门定下推语义 + tier 触点）；读到 `RECOVER` 行时须先确认世代承载 |
 | 2026-10-09（同上） | **`unhealthyReason=patrol` 的触发源** | 「M1 = 连接死**即时**分类」→ 「M3 S4 = 岛内阶梯走完 M/R（B 门：连续 2 次 R 失败 **且** 窗 ≥10s）才上报」；**值域不变**（`{patrol,fd,panic,stop}`）；另：QUIC 档的**环境噪声位**（M1 S6 为 quic 档关掉的 WG 腿 `last_local_send_err` 那一路）由岛侧 `sock_send_errs`（非 `WouldBlock` 的 errno 白名单 + 新鲜度窗 + rebind 清零）等价替换承担 | 设计 §3.1/§3.5（分档纪律：不读另一条腿的错误）+ S4 偏离 1（阶梯落岛内） | `facade/tun_exec.rs`（`quic_unhealthy_signal` 如实判不健康）、App 的世代重建时点（`FailGate`）；新增行 `quic: 快探阶梯走完 M/R…` / `quic: 岛上报不健康（patrol）…`；单测 `connection_death_goes_to_the_ladder_instead_of_unhealthy` |
