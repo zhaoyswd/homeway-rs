@@ -104,7 +104,7 @@ QUIC MTU 1400 + DPLPMTUD，窄路径超限丢弃 + 计数；⑤中继零改动�
 |---|---|---|---|
 | **M0** | 骨架与依赖面（quinn/rustls/tokio 落地 + QUIC 岛设计 + 实验台转正 + 基线登记） | **已完成**（worktree 分支 `quic`，待用户指令合回 main） | 4/4 |
 | **M1** | QUIC 承载 + 全局代理（DATAGRAM + 迁移/赛跑） | **已完成**（实现 + 代码门 r13 有条件通过；**1 格未过已上报**：产品形态单连接内存；待用户指令合回 main） | 4/4 |
-| **M2** | 身份、设备表与准入（RPK + token 证明 + 抗放大） | 未开工 | 0/4 |
+| **M2** | 身份、设备表与准入（RPK + token 证明 + 抗放大） | **已完成**（S6 收口；代码门 r15 无高危；**1 项未过**：产品形态单连接内存；真机 S5-4 待用户点头） | 4/4 |
 | **M3** | 服务流迁移（STREAM tag；客户端 stackb 退役） | 未开工 | 0/4 |
 | **M4** | portfwd 承载适配（dial 缝换 STREAM；spec 不回退） | 未开工 | 0/3 |
 | **M5** | WG 路径删除与收束（大删码 + 判据全表登记） | 未开工 | 0/4 |
@@ -115,19 +115,24 @@ QUIC MTU 1400 + DPLPMTUD，窄路径超限丢弃 + 计数；⑤中继零改动�
 
 > **本节 = 唯一的「现在该干什么」指针。** 主会话只认这里。
 
-1. **M1 已收口**（实现 + 代码门记录 = `docs/reviews/M1.md`；规格 = `docs/reviews/M1-design.md`（含 §12
-   拍板与 §12.6/§12.7 订正）；门槛读数 = `docs/reviews/M1-S5-evidence.md`）。**两件待用户裁决**：
-   ①产品形态单连接内存格未过（+496K/+608K vs ≤+320K）——修订门槛 / 降级登记 / 限期归因 profiling；
-   ②双栈期体积 1.2264× 于 3.8MB（按设计属 M5 判，删码余量 ~0.86MB **未实测**）。
-   **M2 等待用户「开工」指令**（本程序节奏 = 逐期等指令，不自动接棒）。
-2. M2 开工前置：M1 的 `docs/INTEROP-CRITERIA.md` 补登条目与 `docs/reviews/M1.md` 的差异登记**必读**；
-   真机面七项仍归用户/硬件触点（`docs/reviews/M1.md` §3.6 清单：层 0 全通 / WiFi→蜂窝 / 真机吞吐 /
-   路径 MTU·丢包·NAT / OHOS 运行期 / UPnP 真 IGD / `panic="abort"` 跨仓）。
-3. **交付位置（用户触点）**：M0 + M1 全部工作在**独立 worktree** `~/Documents/projects/homeway-rs-quic`
-   的分支 `quic` 上（M0 = `3f16471`…`1de72a2`；M1 = 设计门 `cabc762` 起至本收口 commit，共 30+ 实施
-   commit）。**合回 main / push / 发 tag 均等用户显式指令**——主检出的 Q 批已全部收官（Q-L 收口
-   `4841b20`），合回已无在途冲突（`git merge-tree` 只读预检过）。
-4. M2 之后的期开工前置照旧：复验工作树 + `cargo test --workspace` 绿基线。
+1. **M2 已收口**（`docs/reviews/M2.md` = 实现 + 代码门 r15 记录（含威胁模型逐条验证）；规格 =
+   `docs/reviews/M2-design.md`（§13/§14/§15 实施期订正）；门槛读数 = `docs/reviews/M2-S5-evidence.md`）。
+   **M3（服务流迁移）等待用户「开工」指令**（逐期等指令，不自动接棒）。
+2. **M3 开工前先做一批「同类归一收口」**（代码门 r15 的 G3，D1 已证明这类缺口会以实测证伪形式暴露）：
+   `crates/homeway-core/src/probe.rs:230` 的 `probe_addr_acceptable` 首行 `unmap` + 用例、
+   `server/relayleg.rs` 的 `parse_relay_arg` 一处归一、候选/学习集键收口。
+3. **待用户点头/拍板**：①**真机 S5-4**（M2 的「能验」项 + M1「源校验拒」复看）——**动设备会拆掉设备上
+   正在跑的生产隧道**（本会话已发生过一次，已恢复），故按住等点头；②token 候选 B（设计 §4.2）；
+   ③M1 遗留的内存门槛数值（产品形态 512K vs ≤+320K）与体积预算口径（M5 判）；④tier `log-index.md`
+   陈旧拦出包门（tier 侧触点）。
+4. **观测面**：出口 quic 快照的外部只读面（`serve status --json` 平级 additive 段）随 M3 观测面期落
+   （设计 §15-1）。
+5. **交付位置（用户触点）**：M0–M2 全部工作在**独立 worktree** `~/Documents/projects/homeway-rs-quic`
+   的分支 `quic` 上。**合回 main / push / 发 tag 均等用户显式指令**——主检出的 Q 批已收官
+   （`4841b20`），合回**会有 2 个文档冲突**（`docs/INTEROP-CRITERIA.md` 与 `docs/QUIC-ROADMAP.md`
+   两边都追加过条目，按并集解）。
+6. **M3 开工前置照旧**：复验工作树（干净）+ `cargo test --workspace` 绿基线 + 读 M2 的
+   `docs/INTEROP-CRITERIA.md` 登记条目与 `docs/reviews/M2.md` 差异登记。
 
 ## 每期执行协议（子代理按此跑，主会话按此核对）
 
@@ -330,6 +335,26 @@ exit 0，有条件通过 → 条件 C1/C3 已整改、C2 上报；28 条意见 �
 
 **退出口**：安全门过；设备表对照全绿；token 格式变更已登记 + 上报 tier。
 
+**S6 收口（2026-10-09）**：
+- **高危整改**：S5 实测证伪 **D1**（双栈出口 ⇒ 每源闸键恒 `::/64` ⇒ 异 /32 源共享预算，源 A 用满后源 B
+  第 1 次即被拒）⇒ `SrcKey::of` 归一 v4-mapped（`ad03631`）；修复前后对比读数（源 B 由「第 1 次即被拒」
+  →「握手 1.5ms + A4」）与不回归读数（`k=24 ⇒ refused=8=K−16`、同源打满后仍拒、11s 窗清后成功）见
+  `docs/reviews/M2.md` §1.4。**D1 的方法论意义**：这类「本地形态掩盖的键归一缺口」会以实测证伪形式暴露
+  ⇒ 代码门 G3 列出的同类缺口（`probe.rs:230` 安全卫兵 / `relayleg` 归一）**建议紧随 M3 开工前一批修**。
+- **代码门 r15**：dsh `exit 0`；**无高危**（18 条：高 0 / 中 4 / 低 14）；中危 G1（隔离门判据不实）/
+  G2（fail-visible 串零用例）/ G4（S5-5 判据未按形态落实）随批整改，G3/G6/G7 等登记
+  （`docs/reviews/M2.md` §2.5/§7）。
+- **隔离门加固**：新增「豁免自证 + 扫描器自校准」——「把纯 std 文件挪进 `ASYNC_FILES` 逃过扫描」现在
+  **确定性红**（双向负例实测 exit=1）。
+- **威胁模型**：设计 §5 的 14 条逐条验证（`docs/reviews/M2.md` §3：12 条有代码落点、1 条显式未加固
+  =「强制回落 WG」、3 条仅结构性证据）。
+- **门槛**：M2 后 `quic` 每包 CPU **12.250µs**（对 M1 登记 −5.0%，0.833× 于现役 wg-shim）/ 线开销
+  1309.9B / 稳态 footprint 1216K（−2.6%）/ `.so` 4,685,472 B（M2 累计 +25,600 B ≤ +32KB 预算）；
+  **单连接内存格 512K vs ≤+320K 仍不达标**（+3.2% 对 M1，**无恶化**）。
+- **未验/未决**：真机 S5-4（**待用户点头**——设备上现在跑着用户的生产隧道，动设备会拆它）；
+  token 候选 B（待拍板）；N4（`RETRY_AFTER_FAILS=5` 与 `per_src_fails=16` 不同步）**裁定 = 保持独立**
+  （5 = 施加压力阈值、16 = 拒绝阈值，构成单调升级，非缺陷）。
+
 ## M3 服务流迁移（files / term / speedtest / 巡检）（估 4–6 会话日）
 
 **目标**：核心自连全走 STREAM；客户端 smoltcp（stackb）退役。
@@ -513,7 +538,11 @@ fixtures 向量逐字节不变；客户端依赖树不再含 smoltcp（脚本验
 - **本程序新增（M2 实现时登记，2026-10-09）**：`client::tests::send_buffer_used_grows_under_load`
   （S2-5 新增用例；全量并行跑红 2/2 含干净树基线、隔离复跑 13 次 1 红 ⇒ 负载/时序敏感，
   **不作回归判据**，红了先隔离复跑）。既登记族复现：`daemon::tests::server_bad_frame_gets_goodbye_and_disconnect`
-  （M2 S2 批实测 1 红、隔离复跑同二进制内翻转 = 已在册签名）。
+  （M2 S2 批实测 1 红、隔离复跑同二进制内翻转 = 已在册签名）；
+  **M2 S6 复跑读数**：`daemon::tests::handshake_deadline_beats_slow_drip` /
+  `server_bad_frame_gets_goodbye_and_disconnect` 在全量并行跑 4 次里 3 次各红 1 例、隔离全绿、
+  基线对照（stash 到 `779251d`）2/2 绿、两文件本批零 diff ⇒ 归在册 `daemon::tests` 实 socket 时序族
+  （**本树红频率高于基线，未解释，如实登记**）。
 - **工具坑登记（M2 实测，防后续棒踩）**：①`tools/quic-island-e2e.sh` 与 `tools/quic-wg-e2e.sh`
   **共用实例号 state**（`/tmp/homeway-rs-rustexit-1`）且 `serve token` 读台账末行 ⇒ 先跑 island
   再跑 wg 会读到上一轮铸的 token 而**假红**；解法 = wg 跑前先 `tools/local-rust-exit.sh wipe 1`。
