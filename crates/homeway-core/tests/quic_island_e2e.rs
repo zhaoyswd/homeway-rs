@@ -835,15 +835,30 @@ fn service_stream_files_over_quic_against_local_exit() {
     cmd_stream(&island, |reply| Cmd::StreamClose { id, reply }, WAIT).expect("关流");
 
     // ⑤ 出口侧 E-q5 行（受理 + 结束）与本设备短指纹
+    //
+    // **节流口径（M3 S4 订正，与 `[e2e5]` 同款）**：出口的 E-q5 受理行是节流面
+    // （**首 3 + 每 100**，且计数跨 tag 共享——probe 也占位）。S4 起岛在 TUN 在位时
+    // 跑快探阶梯（§3.1/§3.2），每连接多开 1 条 probe 流 ⇒ 本用例的 files 流受理行
+    // 常落在节流窗之外。**主判据 = 字节路径（上面的问候/应答）+ 岛侧在册计数（⑥）**，
+    // 日志面取「受理**或**结束**至少一条**在场」。
     let dev4 = hex4(&dev);
-    let accepted = wait_log_from(&exit_log, log0, "服务流已受理（tag=files", Some(&dev4), WAIT)
-        .unwrap_or_else(|| "（无受理行）".into());
-    assert!(accepted.contains("tag=files"), "出口须记受理行：{accepted}");
-    println!("[e2e4] exit.accepted_line={accepted}");
-    let closed = wait_log_from(&exit_log, log0, "服务流结束（tag=files", None, WAIT)
-        .unwrap_or_else(|| "（无结束行）".into());
-    assert!(closed.contains("↑"), "结束行须带逐向字节：{closed}");
-    println!("[e2e4] exit.closed_line={closed}");
+    let accepted = wait_log_from(&exit_log, log0, "服务流已受理（tag=files", Some(&dev4), WAIT);
+    let closed = wait_log_from(&exit_log, log0, "服务流结束（tag=files", None, WAIT);
+    assert!(
+        accepted.is_some() || closed.is_some(),
+        "出口须有本流的受理/结束行（节流窗内两条都被压时也应至少一条在场）"
+    );
+    println!(
+        "[e2e4] exit.accepted_line={}",
+        accepted.clone().unwrap_or_else(|| "（节流窗内被压）".into())
+    );
+    if let Some(c) = &closed {
+        assert!(c.contains("↑"), "结束行须带逐向字节：{c}");
+    }
+    println!(
+        "[e2e4] exit.closed_line={}",
+        closed.unwrap_or_else(|| "（节流窗内被压）".into())
+    );
 
     // ⑥ 关流后的岛快照（服务流计数面；`Island::snapshot` 是同步轮询口）
     let snap: homeway_quic::IslandSnapshot = island.snapshot();
