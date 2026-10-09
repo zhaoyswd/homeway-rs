@@ -80,7 +80,11 @@ fn island_stream_cmd<T>(
 /// 等回执的预算 = `budget + OPEN_BUDGET`（照 `island_cmd(.., budget + QUIC_RPC_BUDGET)`
 /// 的先例）：岛内 `open_bi` 自带 `OPEN_BUDGET` 兜底（对端 TP 错配形态），外层再夹一层
 /// 只兜「岛线程卡死」。
-fn open_stream(island: &Island, tag: StreamTag, budget: Duration) -> Result<StreamId, StreamErr> {
+pub(crate) fn open_stream(
+    island: &Island,
+    tag: StreamTag,
+    budget: Duration,
+) -> Result<StreamId, StreamErr> {
     island_stream_cmd(
         island,
         |reply| Cmd::StreamOpen { tag, reply },
@@ -95,7 +99,7 @@ fn open_stream(island: &Island, tag: StreamTag, budget: Duration) -> Result<Stre
 /// - 首试是**服务级拒绝**（阶梯豁免集）⇒ **原样返回、不重试**（服务不存在/入口满/未绑定
 ///   /tag 非法都不是连接故障，重试只会把「出口没有该服务」放大成延时）；
 /// - 首试是**连接面失败** ⇒ 预算未尽则重试一次（S4 的阶梯重写接手 QUIC 档恢复动作）。
-fn dial_with<F, T>(
+pub(crate) fn dial_with<F, T>(
     logf: &Logf,
     tag: StreamTag,
     budget: Duration,
@@ -166,10 +170,30 @@ pub(crate) fn dial_target(
             "世代装配中（数据面未就绪）——QUIC 档端口转发无法拨号",
         )
     })?;
+    let (id, rest) = dial_target_raw(&island, dst, budget)?;
+    // ★ RAII 守卫：构造即接管「此后任何失败路径也要关流」（见本函数 doc 的 H1 段）
+    let shared = Arc::new(StreamShared { island, id });
+    Ok(Box::new(QuicStream::from_shared(shared).with_pending(rest)))
+}
+
+/// `STREAM[dial]` 的**原始主体**（开流 → 写 6B 目标 → 读 1B 回执）⇒ `(id, 回执余量)`。
+///
+/// 两个消费方共用**唯一**一份回执值空间处理（防两处漂移，M5 S2a）：
+/// - `dial_target`（隧道域 portfwd：`GenRun` 面）；
+/// - `host_session::HostSession::dial_addr`（宿主会话：`&self` 面；余量交调用方的
+///   `PendingBuf`）。
+///
+/// **调用方契约**：取到 `id` 之后**立刻**构造关流守卫（`StreamShared`/`HostStream` 的
+/// drop 面）——否则开流成功而后续失败的路径会漏一个流槽（本函数 doc 的 H1 段）。
+pub(crate) fn dial_target_raw(
+    island: &Arc<Island>,
+    dst: SocketAddrV4,
+    budget: Duration,
+) -> io::Result<(StreamId, Vec<u8>)> {
     let deadline = Instant::now().checked_add(budget);
     let wait = remain(deadline).map_err(stream_err_to_io)?;
     let id = island_stream_cmd(
-        &island,
+        island,
         |reply| Cmd::StreamOpen {
             tag: StreamTag::Dial,
             reply,
@@ -177,17 +201,64 @@ pub(crate) fn dial_target(
         Some(wait),
     )
     .map_err(stream_err_to_io)?;
-    // ★ RAII 守卫：构造即接管「此后任何失败路径也要关流」（见本函数 doc 的 H1 段）
-    let shared = Arc::new(StreamShared { island, id });
-    write_dial_frame(&shared, dst)?;
-    let rest = read_dial_ack(deadline, |wait| {
-        island_stream_cmd(
-            &shared.island,
-            |reply| Cmd::StreamRead { id: shared.id, reply },
-            Some(wait),
-        )
-    })?;
-    Ok(Box::new(QuicStream::from_shared(shared).with_pending(rest)))
+    write_dial_frame_raw(island, id, dst)?;
+    let rest = read_dial_ack(deadline, |wait| read_block(island, id, Some(wait)))?;
+    Ok((id, rest))
+}
+
+/// 服务流原始命令面（M5 S2a：宿主会话与隧道域共用的**唯一**岛命令构造点——
+/// 调用方只做句柄/buffering，不另拼 `Cmd`）。
+///
+/// 开流 + 策略（[`dial_with`] 的可测主体）→ 只回 `id`（句柄归调用方）；`logf` 由调用方
+/// 给（重试行落调用方的日志面）。
+pub(crate) fn dial_stream_id(
+    island: &Arc<Island>,
+    logf: &Logf,
+    tag: StreamTag,
+    budget: Duration,
+) -> Result<StreamId, StreamErr> {
+    dial_with(logf, tag, budget, |b| open_stream(island, tag, b))
+}
+
+/// 读一块（无限期挂起；`Err(StreamErr::Closed)` = EOF）。`wait` = 有界面
+/// （`None` = 无限期——读语义）。
+pub(crate) fn read_block(
+    island: &Island,
+    id: StreamId,
+    wait: Option<Duration>,
+) -> Result<Vec<u8>, StreamErr> {
+    island_stream_cmd(island, |reply| Cmd::StreamRead { id, reply }, wait)
+}
+
+/// 写一块（非阻塞接纳；有界等待）。
+pub(crate) fn write_block(
+    island: &Island,
+    id: StreamId,
+    data: Vec<u8>,
+) -> Result<homeway_quic::StreamWriteOut, StreamErr> {
+    island_stream_cmd(
+        island,
+        |reply| Cmd::StreamWrite { id, data, reply },
+        Some(EXIT_RPC_BUDGET),
+    )
+}
+
+/// 半关写端（FIN；有界）。
+pub(crate) fn shutdown_block(island: &Island, id: StreamId) {
+    let _ = island_stream_cmd(
+        island,
+        |reply| Cmd::StreamShutdown { id, reply },
+        Some(EXIT_RPC_BUDGET),
+    );
+}
+
+/// 关流（幂等；有界）。
+pub(crate) fn close_block(island: &Island, id: StreamId) {
+    let _ = island_stream_cmd(
+        island,
+        |reply| Cmd::StreamClose { id, reply },
+        Some(EXIT_RPC_BUDGET),
+    );
 }
 
 /// 剩余预算（§2.2 的 `remain()`）；≤0 ⇒ [`StreamErr::Timeout`]（快速失败，不越界等）。
@@ -206,12 +277,12 @@ fn remain(deadline: Option<Instant>) -> Result<Duration, StreamErr> {
 }
 
 /// ③ 写 6B 目标帧（§2.2：`n == 6` 则成，否则 [`io::ErrorKind::WriteZero`]）。
-fn write_dial_frame(shared: &Arc<StreamShared>, dst: SocketAddrV4) -> io::Result<()> {
+fn write_dial_frame_raw(island: &Arc<Island>, id: StreamId, dst: SocketAddrV4) -> io::Result<()> {
     let frame = homeway_quic::stream::dial_target(dst);
-    let mut w = QuicWriteHalf {
-        shared: Arc::clone(shared),
+    let n = match write_block(island, id, frame.to_vec()) {
+        Ok(w) => w.n,
+        Err(e) => return Err(stream_err_to_io(e)),
     };
-    let n = w.write(&frame)?;
     if n != frame.len() {
         return Err(io::Error::new(
             io::ErrorKind::WriteZero,

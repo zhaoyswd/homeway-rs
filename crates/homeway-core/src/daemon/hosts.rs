@@ -636,9 +636,12 @@ fn reach(token_raw: &str) -> ReachReport {
     // 只取首个 A 会让多记录域名的活路径被误判不可达）；跨端点同址去重。
     let mut eps: Vec<(std::net::SocketAddr, bool)> = Vec::new();
     for ep in &tok.endpoints {
-        // M1 S1c：WG 档不吃 QUIC 类端点（§2.1 末段）——`host reach` 是 WG 面探测，
-        // 判据与 `token::wg_endpoint_refs` 同源（`EndpointKind::is_wg`）。
-        if !ep.kind.is_wg() {
+        // **M5 §2.6-G5（订正）**：过滤键 = `Quic | Relay`（与 `quic_candidates` 同源）——
+        // 旧键 `!is_wg()`（= 只吃 `Quic`）在两端都错：①WG 端点（`Direct`）不再是承载，
+        // ②**`Relay` 也是 QUIC 的合法承载**（relay-only token 会被整条漏掉 ⇒ reach 恒
+        // `none` ⇒ `DC3` 三档结论不可达）。reach 的复绿还依赖出口侧「参照点探测明文
+        // 应答」在新落点可用（设计 §1.2-M4 的 S3a 迁址面）。
+        if !matches!(ep.kind, EndpointKind::Quic | EndpointKind::Relay) {
             continue;
         }
         let relay = ep.kind == EndpointKind::Relay;

@@ -2128,6 +2128,53 @@ async fn connection_death_goes_to_the_ladder_instead_of_unhealthy() {
     drop(logs); // 日志面在本用例只作现场留痕（判据 = 阶梯动作 + 不误分类 + 有终局）
 }
 
+/// **M5 §2.4-A-2 ①/④（无 TUN 岛的阶梯启动；§15-3 待验证项 ③）**：**不** `TunAttach`
+/// 的岛（= 宿主会话 `facade/host_session.rs` 的承载形态）在连接死后**同样**必须交快探
+/// 阶梯——旧判据 `live && tun`（`:844`/`:859`/`:893`/`:903`）把无 TUN 会话的阶梯与快探
+/// 节拍**结构性关闭** ⇒ 宿主会话的「自愈」是空转的假能力。本用例与
+/// `connection_death_goes_to_the_ladder_instead_of_unhealthy` 的唯一差别 = 不附加数据面。
+#[tokio::test]
+async fn ladder_runs_without_tun_attach() {
+    let quic = exit_face(27);
+    let stub = Stub::new();
+    let (on_unhealthy, reasons) = unhealthy_sink();
+    let (logf, logs) = sink();
+    let island = Island::start(
+        logf,
+        on_unhealthy,
+        island_cfg(Duration::from_secs(60), quic.rpk_public_key()),
+    )
+    .expect("岛可起");
+    // **不** attach（宿主会话无 TUN）：准入照常（登记在握 = QUIC 档唯一的「可用」事实）
+    connect_direct(&island, &stub, &quic).await;
+    assert_eq!(stub.accepted(), 1, "登记成功（真出口侧绑定）");
+    assert!(!island.snapshot().attached, "前置：本用例确实没有 TUN 面");
+    // 人为关闭：出口摘绑定 ⇒ CONNECTION_CLOSE ⇒ 无 TUN 的岛也必须交快探阶梯
+    quic.unbind_pub(&PUBKEY);
+    let deadline = Instant::now() + WAIT;
+    while island.snapshot().ladder_action.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let action = island.snapshot().ladder_action.clone();
+    println!(
+        "[unit] no-tun ladder_action={action} connections={} fail_streak={}",
+        island.snapshot().connections,
+        island.snapshot().ladder_fail_streak
+    );
+    assert!(
+        matches!(action.as_str(), "migrate" | "reconnect" | "rebuild"),
+        "无 TUN（宿主会话）的连接死必须交阶梯动作（实得 {action:?}）"
+    );
+    // 连接死**不得就地**判不健康（与 TUN 档同语义：只有 B 才上报）。
+    assert!(
+        wait_reason(&reasons, Duration::from_millis(400)).await.is_none(),
+        "连接死不得就地判不健康（替代面 = 阶梯 M/R；B 才上报）"
+    );
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+    drop(logs);
+}
+
 /// **判据（S2-5 / M0 §8.1 残余项）**：`stop_within` **到点 detach** 后，老世代仍持
 /// UDP 源端口与连接数——两件都**可观测**（快照 + detach 计数行；岛线程卡死、命令面已不可用，
 /// 故可观测面必须是轮询面）。

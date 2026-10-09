@@ -526,6 +526,23 @@ struct DriverState {
     ladder_cand: Option<Candidate>,
     /// 「连接已断」行去重位（连接死是持续态；阶梯在动作，日志不该每拍一行）。
     dead_logged: bool,
+    /// **本世代曾完成准入**（M5 §2.4-A-2 ①：准入是 QUIC 档唯一的「可用」事实）。
+    ///
+    /// 为什么不是 `live.is_some()` / `tun.is_some()`（两处旧判据都不成立）：
+    /// ① `live` 在「连接死 → 交阶梯」的两处**先被置 `None`**（本文件 `housekeeping` 的
+    /// ①/② 支）⇒ 用 `live` 判 = **恒假**（阶梯永不启动）；② `tun`（TUN 面已附加）是
+    /// **数据面**事实，而 M5 起宿主会话（`facade/host_session.rs`，无 TUN）也必须让阶梯
+    /// 工作（否则「无 TUN 岛的阶梯被结构性关闭」= 假「已连接」）。
+    /// 准入是两档共同的可用性事实（`Live` 只在 `hr-reg4` 四帧通过后构造）⇒ 只要本世代
+    /// 曾经准入过（`adopt` 置位），连接死的恢复动作就该跑。
+    admitted: bool,
+    /// **服务流出站需求信号**（M5 §2.4-A-2 ⑤：宿主会话里「在用档」判据的 STREAM 面来源）。
+    ///
+    /// 旧 `in_use_now` 只认 `TunCounters::last_outbound_at`（只由 TUN 数据面写）⇒ 无 TUN 的
+    /// 宿主会话恒「待机档」（60s 探活节拍）。这里给 STREAM 面记一笔**最近成功写出的时刻**
+    /// （`Cmd::StreamWrite` 回执 `n > 0`），两档合成「有出站即新鲜」——与 `tun` 档同
+    /// `ProbeTuning::in_use_fresh` 窗。
+    last_stream_out_at: Option<std::time::Instant>,
 }
 
 /// M（换本地 socket）动作的记账（§3.1 的 `from → to` 与确认探活的耗时）。
@@ -587,6 +604,8 @@ fn run_driver(
             rebind: None,
             ladder_cand: None,
             dead_logged: false,
+            admitted: false,
+            last_stream_out_at: None,
         };
         let mut jobs: JoinSet<Job> = JoinSet::new();
         loop {
@@ -740,6 +759,9 @@ fn adopt(
         via: est.via,
     });
     let adopted = Live::new(est, patrol);
+    // M5 §2.4-A-2 ①：本世代「曾完成准入」位（`Live` 只在四帧准入之后构造）——连接死的
+    // 恢复动作判据（旧 `tun.is_some()` 在宿主会话恒假 ⇒ 阶梯被结构性关闭）。
+    st.admitted = true;
     // M3 S4：新连接 = 新失败链 ⇒ 阶梯重新武装（B 之后休眠的阶梯在此复活）
     st.ladder.rearm();
     st.rebind = None;
@@ -839,9 +861,9 @@ async fn housekeeping(
         // §3.1：链路**确定性**死亡（`close_reason` 已置）⇒ 无回显是结构性的，不消耗探活
         // 预算，直接进「复探失败」面的动作判别（M/R）——这是 ≤3.5s 判据在重启相位上的落点。
         //
-        // **门槛 = TUN 在位**（§3.2 的分档表把两档都写成 attached 前提；未附加 = 无数据面
-        // 要保 ⇒ 不动作，未附加期的死链由世代层 60s 巡检的兜底面承担）。
-        if st.tun.is_some() {
+        // **门槛 = 本世代曾完成准入**（M5 §2.4-A-2 ①：准入是 QUIC 档唯一的「可用」事实；
+        // 旧 `tun.is_some()` 是数据面事实 ⇒ 宿主会话（无 TUN）阶梯被结构性关闭）。
+        if st.admitted {
             let send = send_face(face, st.ladder.tuning().send_err_fresh);
             let step = st.ladder.on_link_dead(TokioInstant::now(), send, &ctx.logf);
             ladder_step(st, ctx, face, jobs, step);
@@ -856,7 +878,8 @@ async fn housekeeping(
             st.live = None;
             st.watch = None;
             st.pump_conn = None;
-            if st.tun.is_some() {
+            // M5 §2.4-A-2 ①：同 ① 支——判据 = 「曾完成准入」（`live` 刚被置 None ⇒ 用它恒假）。
+            if st.admitted {
                 let send = send_face(face, st.ladder.tuning().send_err_fresh);
                 let step = st.ladder.on_link_dead(TokioInstant::now(), send, &ctx.logf);
                 ladder_step(st, ctx, face, jobs, step);
@@ -890,7 +913,9 @@ async fn housekeeping(
             // 未确认 = 新路径不可用（协议侧要等 `max_idle_timeout` 30s 才定音）⇒
             // **交快探阶梯**（§3.1：位升为动作前置条件 ⇒ 允许走 R）——M1 的「即时判
             // 不健康（世代重建）」由本重写取代（梯级动作 = M/R/B，B 才上报不健康）。
-            if st.tun.is_some() {
+            // **判据 = 连接在位**（M5 §2.4-A-2 ③：迁移确认的语义面是「有没有连接在保」——
+            // 此处 `live` 仍 `Some`（与 ①/② 支的「刚置 None」不同）⇒ 直接用它）。
+            if st.live.is_some() {
                 let send = send_face(face, st.ladder.tuning().send_err_fresh);
                 let step = st.ladder.on_link_dead(TokioInstant::now(), send, &ctx.logf);
                 ladder_step(st, ctx, face, jobs, step);
@@ -900,7 +925,10 @@ async fn housekeeping(
     }
     // ③b **快探节拍**（§3.2：在用档背靠背 / 待机档 60s / 挂起空窗立即探——
     //     由 runtime 拍内务驱动；单飞与动作链在阶梯里）。
-    if st.live.is_some() && st.tun.is_some() {
+    //     **判据 = 连接在位**（M5 §2.4-A-2 ④：快探节拍是阶梯的唯一周期触发源——
+    //     旧 `live && tun` 把无 TUN 的宿主会话整条关掉；`tun` 与「有没有连接要保」
+    //     无关，故去掉）。
+    if st.live.is_some() {
         let in_use = in_use_now(st, ctx, &st.probe);
         if let Some((round, budget)) = st.ladder.due(TokioInstant::now(), in_use) {
             ladder_step(st, ctx, face, jobs, LadderStep::Probe { round, budget });
@@ -1203,6 +1231,11 @@ async fn handle_cmd(
         Cmd::StreamWrite { id, data, reply } => {
             // **同步**：非阻塞接纳（`n` 由待发队列余量给出）⇒ 绝不 await 到写满
             let r = st.streams.write(id, data);
+            // M5 §2.4-A-2 ⑤：STREAM 面需求信号（「在用档」判据的宿主会话来源）——
+            // 只在**真有字节出站**时刷新（`n=0` 背压不算需求）。
+            if matches!(&r, Ok(w) if w.n > 0) {
+                st.last_stream_out_at = Some(std::time::Instant::now());
+            }
             let _ = reply.send(r);
         }
         Cmd::StreamRead { id, reply } => match st.streams.slot_of(id) {
@@ -1239,14 +1272,19 @@ fn send_face(face: &Face, window: Duration) -> SendFace {
     }
 }
 
-/// 「在用档」判据（§3.2-1）：TUN 在位 + **出站新鲜**（岛侧等价面 = `TunCounters`；
-/// 亮屏位在岛内不可达——偏离登记见 `tuning::probe_defaults::IN_USE_FRESH`）。
+/// 「在用档」判据（§3.2-1）：**有出站且新鲜**（岛侧等价面 = ①TUN 数据面 `TunCounters`
+/// ②服务流出站（M5 §2.4-A-2 ⑤：宿主会话无 TUN ⇒ 用 STREAM 面补需求信号））。
+/// 亮屏位在岛内不可达——偏离登记见 `tuning::probe_defaults::IN_USE_FRESH`。
 fn in_use_now(st: &DriverState, ctx: &IslandCtx, tuning: &ProbeTuning) -> bool {
-    st.tun.is_some()
+    let tun_fresh = st.tun.is_some()
         && ctx
             .counters
             .last_outbound_at()
-            .is_some_and(|t| t.elapsed() <= tuning.in_use_fresh)
+            .is_some_and(|t| t.elapsed() <= tuning.in_use_fresh);
+    let stream_fresh = st
+        .last_stream_out_at
+        .is_some_and(|t| t.elapsed() <= tuning.in_use_fresh);
+    tun_fresh || stream_fresh
 }
 
 /// 执行阶梯的一步（**同步臂就地闭环、spawn 臂投任务并返回**）。

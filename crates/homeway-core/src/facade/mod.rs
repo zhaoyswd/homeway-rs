@@ -34,6 +34,9 @@ pub mod bridge_host;
 pub mod demand;
 pub mod events;
 pub mod files_op;
+/// **宿主会话（M5 S2a）**：岛承接的「无 TUN 服务会话」——CLI host 面 / daemon 承载面 /
+/// App 服务会话三者共用的唯一会话抽象（真源 `docs/reviews/M5-design.md` §2 + §2.7）。
+pub mod host_session;
 pub mod portfwd;
 pub mod probe_json;
 /// QUIC 档服务流拨号缝（M3 S3：虚拟端口 → STREAM tag；**本文件零 WG 引用**——
