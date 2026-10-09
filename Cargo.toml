@@ -30,7 +30,13 @@ base64 = "0.22"
 sha2 = "0.10"
 hmac = "0.12"
 hkdf = "0.12"
-x25519-dalek = "2.0.0-rc.3"
+# `static_secrets` = `StaticSecret`（+ `PublicKey::from(&StaticSecret)`）的**隐藏依赖**：
+# 此前由 boringtun 的依赖声明（`x25519-dalek/static_secrets,reusable_secrets`）经
+# feature 合一顺带打开；M5 删 boringtun 后若不同批显式补，`identity.rs` / `server/state.rs`
+# / `relay/**` / `engine.rs` 等 8+ 处立刻 E0432（报错点远离删除点——M5 设计 §7.3-1 实测）。
+# ⇒ S1 先补，不等 C 棒删依赖（本仓只用 `StaticSecret::from([u8;32])`/`PublicKey` 两面，
+# 不引 `reusable_secrets`）。
+x25519-dalek = { version = "2.0.0-rc.3", features = ["static_secrets"] }
 getrandom = { version = "0.2", features = ["std"] }
 # boringtun 0.6 钉 ring 0.16（无 OHOS 支持）⇒ 下方 [patch] 换同算法垫片
 # （R0 就位、R1 数据面消费；垫片源码 tools/ring-shim/，配方源自
@@ -79,3 +85,14 @@ tokio = { version = "1", default-features = false, features = ["rt", "time", "sy
 
 [patch.crates-io]
 ring = { path = "tools/ring-shim" }
+
+# ---- M5 S1 构建档位（设计 §0.3/§0.4 + §15-1 主会话裁决；登记 = §8.5-L-1） ----
+# 本仓**首次**引入 `[profile.*]`（M0–M4 全过程口径 = 无 profile 档）。
+# 依据：不改档位则 §0.3.3-bis 实测「删完 WG 仍 4.34–4.59MB」⇒ 路线判据 3.8MB 不可达；
+# 改档（本仓实测）双栈 4,891,776 B → 3,556,520 B（−27.3%），不改任何产品行为。
+# **同档对比纪律**：跨档读数不得互引（`[size]` 登记须带档位限定语——L-1）；
+# `opt-level` 保持默认 3（`opt-level="s"` 是已实测的后备路径，与 LTO 档**不可同引**）；
+# `panic` 保持 `unwind`（岛内 `catch_unwind` 依赖 unwind——设计 §0.3.1）。
+[profile.release]
+lto = true
+codegen-units = 1
