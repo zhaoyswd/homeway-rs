@@ -36,6 +36,9 @@ pub mod events;
 pub mod files_op;
 pub mod portfwd;
 pub mod probe_json;
+/// QUIC 档服务流拨号缝（M3 S3：虚拟端口 → STREAM tag；**本文件零 WG 引用**——
+/// 该事实是 S6 的机械断言面：QUIC 档服务流路径不得再可达 `stackb::`）。
+pub mod quic_stream;
 pub mod service_exec;
 pub mod service_op;
 pub mod speedtest_op;

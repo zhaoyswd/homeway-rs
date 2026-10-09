@@ -81,8 +81,9 @@ const DIAL_MS_DEFAULT: i64 = 15000;
 
 /// 退出路径 RPC 的预算（Q-F F3b/N1：close_write / SharedConn::drop 走在**必须退出**
 /// 的收工链上——引擎卡死时无界等待会把桥泵与世代收工钉住。2s = 阶梯动作预算同刻度，
-/// 正常引擎回执即时）。
-const EXIT_RPC_BUDGET: Duration = Duration::from_secs(2);
+/// 正常引擎回执即时）。**M3 S3**：QUIC 档服务流的 `StreamShared::drop`/`close_write`
+/// 同预算同理由（`facade/quic_stream.rs`）。
+pub(crate) const EXIT_RPC_BUDGET: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
 // M1 S3-1：L3 承载档（A/B 开关）与 QUIC 岛接线
@@ -286,8 +287,10 @@ impl Write for SessionWriteHalf {
 }
 
 /// 背压重试节拍（F8a 纯函数）：前 50 拍 2ms、51–100 拍 10ms、其后 20ms 封顶。
-/// 10s 无进展上界与「空写短路」语义不随本表变化。
-fn write_retry_backoff(attempt: u32) -> Duration {
+/// 10s 无进展上界与「空写短路」语义不随本表变化。**M3 S3**：QUIC 档写半
+/// （`facade/quic_stream.rs`）复用同一张表——节拍随承载变化须登记（§1.4），本节拍
+/// **不随承载变**（待发队列 64 KiB vs 旧栈 1 MiB 只影响 `n=0` 的到达频率）。
+pub(crate) fn write_retry_backoff(attempt: u32) -> Duration {
     if attempt < 50 {
         Duration::from_millis(2)
     } else if attempt < 100 {
@@ -416,7 +419,9 @@ fn healing_dial(
 }
 
 /// 阶梯首试预算（隧道域；服务域用 `session::DIAL_FIRST_TRY` 同值）。
-const FIRST_TRY: Duration = Duration::from_secs(4);
+/// **M3 S3**：QUIC 档服务流拨号的首试同值（`facade/quic_stream.rs`——两端「首试」的
+/// 语义面一致，便于对照读数）。
+pub(crate) const FIRST_TRY: Duration = Duration::from_secs(4);
 
 /// 恢复感知拨号的可测主体（两域共用形；单测注入「阻塞到期限」的桩闭包 ⇒ 断言
 /// 预算内返回——预算须 > `first_try` 且断言桩被调用过，否则假绿）。
@@ -1738,13 +1743,33 @@ fn gen_loop(
     }
 
     // ---- 隧道桥（attached 后才起——「会话在桥在」）----
+    //
+    // **M3 S3 换轨（设计 §3/§5.1 第 1/3–4 项）**：`DialFn` 签名不变，实现按**承载档**分派——
+    // - QUIC 档（岛建连成功）⇒ 开 `STREAM[tag]`（虚拟端口 → tag 见 `quic_stream::tag_for_port`），
+    //   应用层帧逐字节不变；**该分支不触 WG 会话**（S6 的「QUIC 档路径不得再可达 stackb::」）；
+    // - 其余（WG 档 / 岛未就用回落 / 岛已收回）⇒ 既有 `session_connect`（WG 会话 + 恢复阶梯，
+    //   逐字保留——D1 裁定：本体与 WG 档消费点保留，随 M5 与 `wgcore` 同批删除）。
+    //
+    // QUIC 档下**未知端口**（不在 7802/7724/7803 三个服务端口内）不再回落 WG：那是协议面
+    // 无法表达的拨号（本期限定三个服务 tag），静默走 WG 会把「QUIC 档零 stackb」变成条件成立。
     let bridge = Arc::new(BridgeHost::new(
         "隧道桥",
         cfg.identity_dir.clone(),
         Arc::clone(&logf),
         {
             let run2 = Arc::clone(&run);
-            Arc::new(move |port, budget| session_connect(&run2, port, budget))
+            Arc::new(move |port, budget| {
+                if run2.l3_on_island() {
+                    return match super::quic_stream::tag_for_port(port) {
+                        Some(tag) => super::quic_stream::dial(&run2, tag, budget),
+                        None => Err(io::Error::new(
+                            io::ErrorKind::Unsupported,
+                            format!("QUIC 档无该虚拟端口的服务 tag（port={port}）"),
+                        )),
+                    };
+                }
+                session_connect(&run2, port, budget)
+            })
         },
     ));
     // 桥拨号预算随 tunConfig（dialMs——评审 r2-L5：此前是死字段 + 常量 15s）
