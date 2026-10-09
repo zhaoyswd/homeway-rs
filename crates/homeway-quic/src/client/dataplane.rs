@@ -3,7 +3,7 @@
 //! 上行（TUN → DATAGRAM，本模块 [`send_datagram_checked`]）：
 //!
 //! ```text
-//! ① 准入窗：Live 只在 register::REG_SETTLE 之后才存在 ⇒ 本函数只可能跑在窗后
+//! ① 准入窗：Live 只在**四帧准入完成**（收到 `A4`）之后才存在 ⇒ 本函数只可能跑在窗后
 //!    （窗前的包由宿主按「未登记」丢弃，见 driver 的 TunPacket 分支）
 //! ② max_datagram_size() 检包       ⇒ 超限 = 丢 + 计 `超限`（§6.4 映射表）
 //! ③ datagram_send_buffer_space() 预检 ⇒ 不足 = 丢 + 计 `发送缓冲满`

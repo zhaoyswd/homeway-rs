@@ -685,6 +685,8 @@ async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx, seam: 
                 let (lost, cong) = l.path_stats();
                 s.lost_packets = lost;
                 s.congestion_events = cong;
+                // N8①/S2-5：瞬时量（无连接必为 0——它不属于「累计到本世代」的那一族）
+                s.send_buffer_used = l.send_buffer_used();
             }
             None => {
                 s.via = None;
@@ -692,6 +694,7 @@ async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx, seam: 
                 s.rtt_ms = 0;
                 s.mtu = None;
                 s.current_mtu = 0;
+                s.send_buffer_used = 0;
             }
         }
         let (relay_tx, rx_ignored, _rx_dgrams, _tx_dgrams) = face.sock_stats();
@@ -781,7 +784,7 @@ async fn handle_cmd(
         Cmd::TunPacket(pkt) => {
             // 在途名额交还（§6.4 的有界通道等价实现：读线程占名额、岛消费即还）
             ctx.counters.done_send();
-            // 发送路径（S2-4）：①准入窗由结构保证（`Live` 只在 REG_SETTLE 之后存在）；
+            // 发送路径（S2-4）：①准入窗由结构保证（`Live` 只在四帧准入完成之后存在）；
             // ②/③ 检包 + 缓冲预检 + 分类计数 = `client::dataplane::send_datagram_checked`
             // （**唯一**的 `send_datagram` 调用点）；无连接 ⇒ 归 `未登记`（登记前丢弃）。
             lock_unpoison(&ctx.snapshot).packets_in += 1;
@@ -789,6 +792,10 @@ async fn handle_cmd(
                 Some(live) => {
                     let note = drop_note(ctx);
                     dataplane::send_datagram_checked(&live.conn, pkt, &note);
+                    // N8①/S2-5：缓冲占用**按包**刷新——`housekeeping` 的 TICK 分支在连续流量
+                    // 下不会到点（`select!` 的 `sleep(TICK)` 每轮重建 ⇒ 只在无事件的 250ms
+                    // 之后才跑），黑洞期的读数不能等到那时才可见。
+                    lock_unpoison(&ctx.snapshot).send_buffer_used = live.send_buffer_used();
                 }
                 None => {
                     let n = pkt.len();

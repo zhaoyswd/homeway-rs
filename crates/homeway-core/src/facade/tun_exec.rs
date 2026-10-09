@@ -1104,6 +1104,7 @@ pub(crate) fn quic_in_of(s: &homeway_quic::IslandSnapshot) -> QuicIn {
         rx_ignored: s.rx_ignored,
         candidates: s.candidates as u64,
         mirrors: s.mirrors,
+        send_buffer_used: s.send_buffer_used,
     }
 }
 

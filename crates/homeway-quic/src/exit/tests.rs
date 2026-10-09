@@ -13,8 +13,8 @@ use std::time::{Duration, Instant};
 
 use crate::cmd::Logf;
 use crate::exit::bridge::ExitBridge;
-use crate::exit::conn::send_datagram_checked;
-use crate::exit::{FaceCtx, ExitStats};
+use crate::exit::conn::{bounded_by, send_datagram_checked};
+use crate::exit::{FaceCtx, ExitStats, DEFAULT_ADMIT_DEADLINE};
 use crate::reg4::{
     self, ACCEPT_MAGIC, CHALLENGE_LEN, ChallengeFrame, EXPORTER_LABEL, EXPORTER_LEN, HelloFrame,
     Nonce, ProofFrame, RefreshFrame,
@@ -478,6 +478,26 @@ fn qo_defaults_match_design() {
         "握手期限 10s（§9.3 Q-O）"
     );
     assert_eq!(cfg.conn_cap(), 64, "连接总数 = 2 × max_devices");
+}
+
+/// **判据（S2-6 的纯定时语义，设计 §1.3 / 设计门 r14 F3）**：`ADMIT_DEADLINE` 是**真期限**
+/// ——静止的准入 future（「握手完成但不发 Hello」的等价面）恰在 10s **虚拟时刻**被弃：
+/// 不是无限等，也不是等到 `max_idle_timeout=30s`；且期限与 idle 回收的**序关系**写死在此
+/// （期限必须更紧，否则那条连接永不自然过期 ⇒ 单攻击者可用 `conn_cap` 条占满槽位）。
+#[tokio::test(start_paused = true)]
+async fn admit_deadline_is_a_real_deadline_in_virtual_time() {
+    let t0 = tokio::time::Instant::now();
+    let got = bounded_by(DEFAULT_ADMIT_DEADLINE, std::future::pending::<()>()).await;
+    assert!(got.is_none(), "静止 future 必须在期限内被弃（未认证状态有界）");
+    assert_eq!(
+        tokio::time::Instant::now() - t0,
+        DEFAULT_ADMIT_DEADLINE,
+        "恰在 ADMIT_DEADLINE 到点（虚拟时钟，无需等墙钟）"
+    );
+    assert!(
+        DEFAULT_ADMIT_DEADLINE < crate::exit::transport::MAX_IDLE_TIMEOUT,
+        "期限必须比 idle 回收（30s）更紧——否则「握手完成但不发 Hello」永不自然过期"
+    );
 }
 
 // ---------- S1b/M2 S1：准入（hr-reg4 四帧 + exporter 连接绑定）/ 入站（源校验）/ 出站（checked 发送） ----------

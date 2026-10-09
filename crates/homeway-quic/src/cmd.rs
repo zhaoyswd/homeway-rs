@@ -312,6 +312,11 @@ pub struct IslandSnapshot {
     pub relay_tx: u64,
     /// 收到的腿帧中**非 kind=5** 的条数（忽略面；S2-7 判据的可观测位）。
     pub rx_ignored: u64,
+    /// **已占用（未确认）的 DATAGRAM 发送缓冲字节数**（M1 交下项 N8① / M2 §9.1.1 的
+    /// 「黑洞期已入缓冲的 1 MiB」可观测面）：无连接 = 0，满 = 每连接上限
+    /// （`exit::transport::DATAGRAM_BUFFER` = 1 MiB）。瞬时量（不是累计计数）——
+    /// TUN 上行的每包路径与巡检拍都会刷新它。
+    pub send_buffer_used: u64,
 }
 
 /// 日志落点（与同步面同形：`Arc<dyn Fn(&str) + Send + Sync>`；域前缀由调用方自带）。

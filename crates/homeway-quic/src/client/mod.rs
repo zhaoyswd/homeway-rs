@@ -255,6 +255,19 @@ impl Live {
         (p.lost_packets, p.congestion_events)
     }
 
+    /// **已占用（未确认）的 DATAGRAM 发送缓冲字节数**（M1 交下项 N8① / 设计 §9.1.1）。
+    ///
+    /// 「已死未察觉期」（黑洞）里 `send_datagram` 恒 `Ok`，最多 1 MiB 已入缓冲的包会在连接
+    /// 终结时被 quinn 静默丢——本读数让这批**从无计数变成可观测**。上限 = 每连接
+    /// `exit::transport::DATAGRAM_BUFFER`（两端共用同一份 TransportConfig，故同一常量）。
+    ///
+    /// **残余（如实登记）**：连接终结时被 quinn 丢的那批仍**无逐包计数**——本读数只回答
+    /// 「此刻缓冲里压着多少」，不回答「丢了哪些」。
+    pub(crate) fn send_buffer_used(&self) -> u64 {
+        (crate::exit::transport::DATAGRAM_BUFFER as u64)
+            .saturating_sub(self.conn.datagram_send_buffer_space() as u64)
+    }
+
     /// 刷新到点则写一帧 `R4`（`hr-reg4-refresh` 域；C15' 行；节拍 = 巡检节拍）。
     ///
     /// 返回 `false` = 连接已断（调用方清连接面）。写失败同样归「断」。

@@ -135,6 +135,9 @@ pub struct QuicIn {
     pub rx_ignored: u64,
     pub candidates: u64,
     pub mirrors: u64,
+    /// 已占用（未确认）的 DATAGRAM 发送缓冲字节数（M1 交下项 N8① / M2 S2-5；
+    /// **瞬时量**：无连接 = 0，满 = 1 MiB）。黑洞期「已入缓冲的 1 MiB」的可观测面。
+    pub send_buffer_used: u64,
 }
 
 /// 快照 → tunStatusJSON（Go tunStatusJSON 逐键对齐；键序 = 字典序）。
@@ -269,6 +272,7 @@ pub fn tun_status_json(input: &TunStatusInput) -> String {
         qm.insert("rx_ignored".into(), Value::from(q.rx_ignored));
         qm.insert("candidates".into(), Value::from(q.candidates));
         qm.insert("mirrors".into(), Value::from(q.mirrors));
+        qm.insert("send_buffer_used".into(), Value::from(q.send_buffer_used));
         m.insert("quic".into(), Value::Object(qm));
     }
 
@@ -494,6 +498,7 @@ mod tests {
                 rx_ignored: 8,
                 candidates: 4,
                 mirrors: 9,
+                send_buffer_used: 4096,
             }),
             ..bare
         };
@@ -504,7 +509,8 @@ mod tests {
             vec![
                 "candidates", "congestion_events", "connections", "current_mtu", "drops", "ep",
                 "local", "lost_packets", "migration_unconfirmed", "migrations", "mirrors", "mtu",
-                "packets_in", "packets_out", "relay_tx", "rtt_ms", "rx_ignored", "via",
+                "packets_in", "packets_out", "relay_tx", "rtt_ms", "rx_ignored",
+                "send_buffer_used", "via",
             ]
         );
         let dk: Vec<&str> = v["quic"]["drops"].as_object().unwrap().keys().map(|k| k.as_str()).collect();
@@ -516,6 +522,7 @@ mod tests {
         assert_eq!(v["quic"]["migration_unconfirmed"], true);
         assert_eq!(v["quic"]["mtu"], 1362);
         assert_eq!(v["quic"]["via"], "relay");
+        assert_eq!(v["quic"]["send_buffer_used"], 4096, "S2-5 的读数位进 JSON");
     }
 
     /// runner 缺席 ⇒ stats/exitIp/link/portForwards/bridge 全缺（failed/prepare 期形态）。

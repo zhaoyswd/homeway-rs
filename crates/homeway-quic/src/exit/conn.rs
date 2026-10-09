@@ -123,10 +123,10 @@ pub(crate) async fn control(conn: Connection, conn_id: u64, ctx: Arc<FaceCtx>) {
     // 控制流两半边的存放：`admit` 拿到后填进 `streams`，超时被 drop 时只是没人取（无害）。
     let deadline = ctx.admit_deadline;
     let mut streams: Option<(quinn::SendStream, quinn::RecvStream)> = None;
-    match tokio::time::timeout(deadline, admit(&conn, conn_id, &ctx, &mut streams)).await {
-        Ok(Admitted::Bound) => {}
-        Ok(Admitted::Rejected) => return, // 已拒 + 已关连接
-        Err(_elapsed) => {
+    match bounded_by(deadline, admit(&conn, conn_id, &ctx, &mut streams)).await {
+        Some(Admitted::Bound) => {}
+        Some(Admitted::Rejected) => return, // 已拒 + 已关连接
+        None => {
             // 「握手完成但不发 Hello」（连控制流都不开）与「Hello 之后不发 Proof」到点 ⇒
             // 本期限收口（r14 F3：`max_idle_timeout` + `keep_alive` 组合下这类连接**不会
             // 自然过期**，M1 的握手闸只管 `Connecting` 阶段 ⇒ 必须由本期限兜住）。
@@ -139,6 +139,19 @@ pub(crate) async fn control(conn: Connection, conn_id: u64, ctx: Arc<FaceCtx>) {
     let _keepalive_send = send;
     // 阶段 ②：已绑定连接的刷新循环（**无期限**——空闲是常态，最长等 max_idle_timeout）。
     refresh_loop(&conn, conn_id, &ctx, &mut recv).await;
+}
+
+/// 准入阶段的期限包装（设计 §1.3 的 `ADMIT_DEADLINE`）：**包住「等首帧（`accept_bi`）+
+/// 整段状态机」**，`None` = 到点。
+///
+/// 抽成具名函数的理由：纯定时语义要能被 `start_paused` 虚拟时钟**确定性**断言（挂在
+/// `control()` 里的匿名 `timeout` 形态在不建真实连接时构造不出来），且期限与
+/// `max_idle_timeout` 的关系（前者必须更紧，否则「握手完成但不发 Hello」永不回收）在同处可查。
+pub(super) async fn bounded_by<F: std::future::Future>(
+    deadline: Duration,
+    fut: F,
+) -> Option<F::Output> {
+    tokio::time::timeout(deadline, fut).await.ok()
 }
 
 /// 准入阶段的结果（`Bound` ⇒ 调用方转刷新循环；`Rejected` ⇒ 连接已关，收摊）。

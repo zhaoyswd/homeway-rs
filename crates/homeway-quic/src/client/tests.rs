@@ -856,6 +856,40 @@ async fn connect_while_racing_is_rejected_and_stop_is_prompt() {
 
 // ---------- 2b. 准入预算（S2-3） ----------
 
+/// **判据（S2-3 的纯定时语义，设计 §1.7 / r14 F8）**：准入预算 = `max(剩余, ADMIT_MIN)`
+/// 的**值语义**（纯函数）+ **虚拟时钟**下「到点恰在预算处」——`start_paused` ⇒ 断言确定，
+/// 不等墙钟（M0 flake 口径②）。
+#[tokio::test(start_paused = true)]
+async fn admit_budget_value_and_virtual_clock_expiry() {
+    let total = Duration::from_secs(5);
+    assert_eq!(super::race::admit_budget(total, Duration::ZERO), total, "未消耗 ⇒ 全量");
+    assert_eq!(
+        super::race::admit_budget(total, Duration::from_millis(3000)),
+        Duration::from_secs(2),
+        "剩 2s ≥ 下界 ⇒ 用剩余量"
+    );
+    assert_eq!(
+        super::race::admit_budget(total, Duration::from_millis(4900)),
+        super::race::ADMIT_MIN,
+        "剩 100ms < 下界 ⇒ 取下界（晚胜形态：不「必然失败但不说清」）"
+    );
+    assert_eq!(
+        super::race::admit_budget(total, Duration::from_secs(9)),
+        super::race::ADMIT_MIN,
+        "超支（saturating）⇒ 仍取下界，不是零/负"
+    );
+
+    // 虚拟时钟复算同一规则 + 包装到点语义：恰在下界处返回 `None`（不是立刻、也不是无限等）
+    let t0 = TokioInstant::now();
+    tokio::time::sleep(Duration::from_millis(4900)).await;
+    let b = super::race::admit_budget(total, t0.elapsed());
+    assert_eq!(b, super::race::ADMIT_MIN);
+    let t1 = TokioInstant::now();
+    let got = super::race::within(b, std::future::pending::<()>()).await;
+    assert!(got.is_none(), "到点必须返回 None（= RegistrationFailed 路径）");
+    assert_eq!(TokioInstant::now() - t1, b, "恰在预算到点");
+}
+
 /// **判据（S2-3 / 设计 §1.7 / r14 F8）**：`ADMIT_MIN` 形态——赛跑预算压到 1.5s、出口侧
 /// **从不回执**（引擎桩不 pump ⇒ 裁决永不到达）⇒ 岛侧准入按 `max(剩余, ADMIT_MIN)` 到点：
 /// ①归因 `IslandErr::RegistrationFailed`；②归因行写明**实际预算 = 下界 2s**（证明走了
@@ -1550,6 +1584,61 @@ async fn oversize_tun_packet_is_dropped_and_counted() {
         "N-c 行须与 JSON 同源（超限=1）：{lines:?}"
     );
 
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（S2-5 / M1 交下项 N8①，设计 §9.1.1）**：`send_buffer_used` 暴露「已入缓冲、
+/// 未确认」的 DATAGRAM 字节数——黑洞期那批包（最多 1 MiB）不再**无计数**。
+///
+/// 形态：TUN 面一次性投递远超 1 MiB 的包（单次投递在**无 `await`** 的循环里完成 ⇒ 岛消费这批
+/// 命令时其 runtime 不处理 IO ⇒ 缓冲不可能被 ACK 排空）⇒ 读数必 > 0，且同刻 `发送缓冲满`
+/// 计数 > 0（缓冲真被占满的交叉证据）。负判据：连接还没建立时读数为 0。
+#[tokio::test]
+async fn send_buffer_used_grows_under_load() {
+    let quic = exit_face(27);
+    let stub = Stub::new();
+    let (logf, _logs) = sink();
+    let island = island_with_log(Duration::from_secs(60), quic.rpk_public_key(), Arc::clone(&logf));
+    let (tun, _peer) = tun_pair();
+    assert!(matches!(attach(&island, tun.as_raw_fd(), 1280, BUDGET), Ok(())));
+
+    // 负判据：未建连 ⇒ 0（瞬时量，不是累计计数）
+    assert_eq!(island.snapshot().send_buffer_used, 0, "无连接 ⇒ 读数 0");
+
+    connect_direct(&island, &stub, &quic).await;
+    // 内层满包（1280B）投 1500 次 ≈ 1.9 MiB > 每连接 1 MiB 缓冲
+    let big: Box<[u8]> = {
+        let mut p = inner_pkt(TUN_IP, Ipv4Addr::new(10, 0, 0, 7));
+        p.resize(1280, 0);
+        p.into_boxed_slice()
+    };
+    for _ in 0..1500 {
+        island
+            .tx()
+            .send(Cmd::TunPacket(big.clone()))
+            .expect("投递（unbounded）");
+    }
+    // 有界轮询（flake 口径②：只判上界）：记录读数的**最大值**，直到「发送缓冲满」出现
+    // （= 1 MiB 缓冲真被占满的确定性信号；读数与计数互为交叉证据）
+    let deadline = Instant::now() + WAIT;
+    let mut max_used = 0u64;
+    loop {
+        let s = island.snapshot();
+        max_used = max_used.max(s.send_buffer_used);
+        if (max_used > 0 && s.drops.send_buffer_full > 0) || Instant::now() >= deadline {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+    }
+    assert!(
+        max_used > 0,
+        "缓冲被占后读数必须增长（M1 交下项 N8① 的可观测面）：max_used={max_used}"
+    );
+    assert!(
+        island.snapshot().drops.send_buffer_full > 0,
+        "1.9 MiB 投递量 > 1 MiB 缓冲 ⇒ 预检必拦下一部分（与读数互为交叉证据）"
+    );
     assert!(island.stop_within(Instant::now() + BUDGET));
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
