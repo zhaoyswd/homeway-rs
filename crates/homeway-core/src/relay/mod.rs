@@ -1981,6 +1981,75 @@ mod tests {
         assert!(got_down, "客户端应原样收到回程腿帧");
     }
 
+    /// S7a（Q2）**数据面 v6 变体**：同一 `forward_fallback_session_end_to_end` 流程，
+    /// 但监听 = **任意地址（双栈）**、客户端与后端都走 **v6 回环**——证明「v6 客户端经中继」
+    /// 不只是探测/注册面可用，**数据面（上行转发 + 下行回程 + hint）也走通**。
+    /// （island 侧中继候选是 `SocketAddrV4`（v4-only）⇒ 全链 v6 读数在岛面不可得，见 M5.md。）
+    #[test]
+    fn forward_fallback_session_end_to_end_over_v6() {
+        let (logf, lines) = capture_logf();
+        let tr = TestRelay::start(Config::new(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::UNSPECIFIED), 0), // 任意地址 ⇒ 双栈
+            None,
+            logf,
+        ));
+        let ready = wait_log_line(&lines, "中继就绪", 5).expect("R1 行必须打出");
+        assert!(ready.starts_with(&format!("中继就绪：[::]:{}（", tr.port)), "双栈形态：{ready}");
+
+        let v6 = |port: u16| SocketAddr::new(IpAddr::V6(std::net::Ipv6Addr::LOCALHOST), port);
+        let relay_addr = v6(tr.port);
+        let be = UdpSocket::bind("[::1]:0").unwrap();
+        let cl = UdpSocket::bind("[::1]:0").unwrap();
+        cl.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+
+        // 注册后端（v6 源）
+        let priv_ = rand_secret();
+        let pub_ = PublicKey::from(&priv_);
+        let label = relay_id(pub_.as_bytes());
+        register_open(&be, relay_addr, &priv_, &pub_, &label);
+
+        // 客户端发数据帧（v6 源）→ 后端应收到剥头转发帧
+        let data = legframe::frame_bytes(legframe::FrameKind::Data, b"wg-payload-v6");
+        let mut tagged = Vec::new();
+        legframe::encode_tagged_frame(&label, &data, &mut tagged);
+        cl.send_to(&tagged, relay_addr).unwrap();
+        let mut buf = [0u8; 256];
+        be.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut got_data = false;
+        for _ in 0..4 {
+            let Ok((n, _)) = be.recv_from(&mut buf) else { break };
+            if let Some((kind, payload)) = legframe::decode_frame(&buf[..n]) {
+                if kind == legframe::FrameKind::Data.to_wire() && payload == b"wg-payload-v6" {
+                    got_data = true;
+                    break;
+                }
+            }
+        }
+        assert!(got_data, "v6 后端应收到剥头转发的数据帧");
+
+        // 回程：后端从收到包的源（中继分配 socket）发回 → 客户端原样收到
+        let assoc_src = {
+            cl.send_to(&tagged, relay_addr).unwrap();
+            let (n2, src) = be.recv_from(&mut buf).unwrap();
+            assert_eq!(
+                &buf[..n2],
+                &legframe::frame_bytes(legframe::FrameKind::Data, b"wg-payload-v6")[..]
+            );
+            src
+        };
+        let back = legframe::frame_bytes(legframe::FrameKind::Data, b"down-payload-v6");
+        be.send_to(&back, assoc_src).unwrap();
+        let mut got_down = false;
+        for _ in 0..4 {
+            let Ok((n, _)) = cl.recv_from(&mut buf) else { break };
+            if buf[..n] == back[..] {
+                got_down = true;
+                break;
+            }
+        }
+        assert!(got_down, "v6 客户端应原样收到回程腿帧");
+    }
+
     /// token 模式：PSK 不过 → 拒（无 OK 应答）。
     #[test]
     fn token_mode_rejects_wrong_psk() {
