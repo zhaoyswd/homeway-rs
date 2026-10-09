@@ -40,8 +40,8 @@
 | E22 | `dns: q=%d qtcp=%d resp=%d filter=%d trunc=%d fallback=%d fail=%d drop=%d malformed=%d aaaa-mixed=%d fakeip=%d`（DNS 代答计数行，debug 级周期输出；与 E10 同族计数语义。**`fakeip=%d` = Q-J F3 追加**，见「判据变更记录」） | `pkg/dns/server.go:162`（`StatsLine`，判据行注记 `:159-161`） | **R1 已采**（2026-10-02，周期行）：`dns: q=0 qtcp=0 resp=1 filter=0 trunc=0 fallback=0 fail=0 drop=0 malformed=0 aaaa-mixed=0`（Q-J 前的历史形态，无 `fakeip=` 尾字段） |
 | E23 | `入站新源：%v（%s，%d 字节）`（源学习/漫游跟随证据，debug 级；**M5 值域收窄**：`shape ∈ {STUN应答, 参照点探测, 畸形腿帧, 腿帧type=3, 腿帧type=N, 畸形容器/未知消息容忍}`——WG 载荷/注册/控制/批量（kind=0/1/2/4）形态退役） | `pkg/servercore/bind.go:799` | **R1 已采**：`入站新源：192.168.3.12:54242（容器数据，222 字节）`；Rust 出口实采：`入站新源：192.168.3.12:62535（参照点探测，213 字节）` |
 
-| E25 | `出口收线（连接数 %d → 0，用时 %v）`（**M5 新增**；A10 的出口侧收线时点证据行——出口停止时 QUIC 面收工块打一次） | 本仓新增（无 Go 对应；`crates/homeway-quic/src/exit/mod.rs` 收工块） | `出口收线（连接数 1 → 0，用时 234µs）`（e2e 实测，`tools/quic-island-e2e.sh` 的 A10 断言面） |
-| E-q6 | `出口 QUIC 面就绪（单承载；migration=%v，initial_mtu=%d）`（**M5 新增**；单承载语境的就绪行，打在 E-q1 之前一行） | 本仓新增（M1 additive 族延续；`crates/homeway-quic/src/exit/mod.rs`） | `出口 QUIC 面就绪（单承载；migration=true，initial_mtu=1400）` |
+| E25 | `出口收线（连接数 %d → 0，用时 %v）`（**M5 新增**；A10 的出口侧收线时点证据行——出口停止时 QUIC 面收工块打一次） | 本仓新增（无 Go 对应；`crates/homeway-quic/src/exit/mod.rs` 收工块） | **实测**（`tools/quic-island-e2e.sh 1`，2026-10-10）：`出口收线（连接数 2 → 0，用时 43.042µs）`（脚本断言 `exit.close_line=1`，缺席即 rc=1） |
+| E-q6 | `出口 QUIC 面就绪（单承载；migration=%v，initial_mtu=%d）`（**M5 新增**；单承载语境的就绪行，打在 E-q1 之前一行） | 本仓新增（M1 additive 族延续；`crates/homeway-quic/src/exit/mod.rs`） | **实测**（本地出口 stdout.log，2026-10-10）：`出口 QUIC 面就绪（单承载；migration=true，initial_mtu=1400）` |
 
 ## 客户端侧（core / 服务会话）
 
@@ -67,7 +67,7 @@
 
 | C20 | **岛侧行族（M1 additive 组；M5 去前缀后升为主行）逐行列名**：`端点就绪（本地 %v，MTU %d，max_datagram_size=%d）` / `赛跑投出 %d 个候选（直连 %d / 中继 %d；本行每轮限 3 条）`（原 C4'）/ `赛跑结算：胜出 %s %v（候选 %d 个，耗时 %v）；完成=…；未完成=…`（原 C5'）/ `路径确立：%s %v（首个完成握手）`（原 C6'）/ `岛已建连（候选 %d 个，胜出 %s %v，耗时 %dms）—— L3 承载 = 岛` / `注册刷新 → %v（dev=%s，中继=%v）`（原 C15'）/ `迁移完成（%v → %v，耗时 %v）` / `迁移未确认（%v → %v，%v 内无对端回包 ⇒ 回落重连/重赛跑）` / `忽略非 kind=5 腿帧（…）`（**行文改写**：腿帧只可能是 kind=5——单承载后语义变了） / `窄路径不可用 —— max_datagram_size=%dB < 内层 MTU=%dB，1280 内层包将全部被丢（丢 + 计数不静默；MTU 降级旋钮 = HOMEWAY_QUIC_MTU）` / `隧道面已附加（fd=%d, mtu=%d；数据面已接线：读线程 + 回程队列 %d 条 + 写线程；fd 所有权在扩展，岛从不 close）` / `到点 detach —— 老世代仍持 UDP 源端口 %v、连接 %d 条（可能继续对出口发包；M0 §8.1 残余）` / `岛收工（连接面随端点关闭）` / `连接已断 —— 交快探阶梯（M/R/B；§3.1）保世代重连，不再就地拆世代` / `替换旧连接（旧连接已 CONNECTION_CLOSE）` | 本仓新增（M1 S3-1/S2a/S2b 落地；M5 去前缀升主行） | 岛侧就绪/赛跑/数据面/生命周期观测面（M1 判据证据） |
 | C21 | **装配 / 生命周期归因族（M1 additive 组；装配面 + 腿面五子族）逐行核**：`赛跑小结：无胜者（…）` / `赛跑未成（{e}）` / `候选清单已更新（{n} 条）` / `本地 socket 已换绑（{from} → {to}）` / `换绑失败（{from} → …；{e}）` / `岛内 panic（…）` / `岛线程 panic（…）` / `准入已发起（dev=%s，Hello %dB；等挑战/回执）` / `准入完成（dev=%s，耗时 %s）` / `准入失败（{why}；预算 {b}）—— 连接已显式关闭（不留悬挂）` / `拆连接（dev={dev} 已从设备表摘除/轮换）` / `路径变更（未登记连接）{from} → {now}` / `{EXIT_THREAD} 线程 panic —— 本世代 QUIC 面已死` / `出口 QUIC 面 panic（{msg}）—— 判不健康，线程退出（不复用该线程）` / `端点未起（三形态）` / `MTU 上限取值 {raw}（{from}）非法或越界…按缺省 {default} 走` / `腿（→ {remote}）发送句柄克隆失败…` / `腿上的 QUIC 报文无法投递（出口 QUIC 面不可用…）——已丢 {c} 个` / `出口 QUIC 面未在收工预算内退出 —— 已 detach`；**四条 WG 兜底措辞同批改写**（`岛附加失败 —— 尝试 WG 兜底` / `出口 QUIC 面线程已退出 —— 后续出站回落 WG 原样、入站停止` / `准入回执…——本世代回落 WG 承载` / `按承载分档`），其中 2 条属批量条目的 4 串例外 | 同上（M1 S6 补登 + M5 去前缀） | 装配/失败归因面（「不静默」硬口径）；改写面见批量条目①的 4 串例外 |
-| N-e | `内层 MTU 上限 %d（来源=%s）`（**M5 新增**；世代装配一次——生效值 + 来源；来源 ∈ `HOMEWAY_QUIC_MTU` / `tunConfig.quicMtuCap` / `缺省` / `缺省（非法值回退）`） | 本仓新增（`crates/homeway-core/src/facade/tun_exec.rs::resolve_mtu_cap`） | `内层 MTU 上限 1400（来源=缺省）` |
+| N-e | `内层 MTU 上限 %d（来源=%s）`（**M5 新增**；世代装配一次——生效值 + 来源；来源 ∈ `HOMEWAY_QUIC_MTU` / `tunConfig.quicMtuCap` / `缺省` / `缺省（非法值回退）`） | 本仓新增（`crates/homeway-core/src/facade/tun_exec.rs::resolve_mtu_cap`） | 单测实测（`mtu_cap_resolution_clamps_by_default_policy`，5 分支）：`内层 MTU 上限 1400（来源=缺省）` / `…1400（来源=tunConfig.quicMtuCap）` / `…1400（来源=缺省（非法值回退））` |
 
 ## 命令面结论行（host add 三档结论）
 
