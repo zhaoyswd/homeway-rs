@@ -121,9 +121,6 @@ impl L3Bearer {
 const QUIC_CONNECT_BUDGET: Duration = Duration::from_secs(5);
 /// 岛侧同步命令（TunAttach / Rebind）的等待预算（岛内短路径，超时 = 异常）。
 const QUIC_RPC_BUDGET: Duration = Duration::from_secs(5);
-/// Rebind 优先动作的确认探活预算（判据 = 「rebind 后无对端证据 ⇒ 回落」的**有界**形态；
-/// 岛自己的保持检测窗（一拍 = `patrol`）已在置 `migration_unconfirmed` 时跑完）。
-const QUIC_HEAL_PROBE: Duration = Duration::from_secs(3);
 
 /// 承载档解析：**env 优先**（`HOMEWAY_TRANSPORT`，首读缓存）→ config（`tunConfig.transport`）
 /// → 缺省 `quic`。非法值 ⇒ **记行 + 按缺省走**（fail-visible 不 fail-fast：这是排障
@@ -492,8 +489,6 @@ pub struct GenRun {
     island: RwLock<Option<Arc<homeway_quic::Island>>>,
     /// L3 实际落在岛上（quic 档 + 岛建连成功；岛装配失败/全候选失败 ⇒ false = 回落 WG）。
     l3_on_island: AtomicBool,
-    /// 「Rebind 优先」处置的单飞位（岛判死信号可能在岛线程/巡检线程两处并发到达）。
-    quic_heal: AtomicBool,
     /// 当前数据面（rebuild 换代；拨号/恢复自动落新世代）。**装配期后填**
     /// （评审 r2-M2：GenRun 在 identity/Client::start 之前就建好登记——窗口内
     /// request_stop/recover 打得到世代句柄，Go beginTunRun 时序同构）。
@@ -986,7 +981,6 @@ impl GenRun {
             bearer: L3Bearer::Wg,
             island: RwLock::new(None),
             l3_on_island: AtomicBool::new(false),
-            quic_heal: AtomicBool::new(false),
             client: RwLock::new(Some(Arc::new(client))),
             gate: RecoverGate::new(),
             cache: None,
@@ -1257,7 +1251,6 @@ fn gen_loop(
             bearer: cfg.bearer,
             island: RwLock::new(None),
             l3_on_island: AtomicBool::new(false),
-            quic_heal: AtomicBool::new(false),
             client: RwLock::new(None),
             gate: RecoverGate::new(),
             cache: cache.map(Mutex::new),
@@ -2153,17 +2146,6 @@ enum ProbeFail {
     Detail(String),
 }
 
-/// 「Rebind 优先」处置的三态结论（单飞闸的返回值——`InFlight` 不是失败）。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum HealOutcome {
-    /// 连接已保住（rebind + 探活通过）。
-    Recovered,
-    /// 不可救（连接已死 / 换绑失败 / 换绑后仍探不活）⇒ 交扩展重建。
-    Failed,
-    /// 已有处置在途（并发信号合并——由在途者定案）。
-    InFlight,
-}
-
 /// 岛侧候选装配（设计 §2.7 的**候选来源收窄**：只吃 token 的 QUIC 类端点 + 中继端点；
 /// 学习缓存/hint 在 M1 只服务 WG 面）。
 ///
@@ -2221,77 +2203,20 @@ fn island_unhealthy(run: &Arc<GenRun>) -> homeway_quic::OnUnhealthy {
     })
 }
 
-/// 岛判死信号处置（设计 §2.3：**Rebind 优先于重连/重赛跑**）。
+/// 岛不健康信号处置（M3 S4 §3.1：**QUIC 档的动作面在岛内快探阶梯**）。
 ///
-/// - `patrol`（连接死 / 迁移未确认）：先试 Rebind（保连接）；不成再 `patrol` 分类交扩展重建。
+/// 岛只在两种情形上报：
+/// - **B（世代重建）**：连续 2 次 R 失败且窗 ≥10s ⇒ 本回调 = 交世代层重建（岛已无动作可做）；
 /// - `fd`/`panic`：与 WG 面同源，直接分类（无「保连接」动作可做）。
+///
+/// 语义变化（M1 → M3 S4，登记 S7）：M1 时岛内无阶梯 ⇒ 连接死/迁移未确认即播 `patrol`
+/// 并在此处试一次「Rebind 优先」（`quic_rebind_first`）；S4 起 M/R 由岛内阶梯全权处置，
+/// 本函数不再做动作——收到信号即如实判不健康。
 fn quic_unhealthy_signal(run: &Arc<GenRun>, reason: &str) {
-    if reason != "patrol" {
-        run.tun_shared.mark_unhealthy_if_current(run.gen, reason);
-        return;
+    if reason == "patrol" {
+        (run.logf)("quic: 岛上报不健康（patrol）—— 岛内快探阶梯已走完 M/R（B 门），交世代重建");
     }
-    // 回调在岛线程内 ⇒ 处置必须另起线程（阻塞回调 = 岛僵死）
-    let r2 = Arc::clone(run);
-    let spawned = std::thread::Builder::new()
-        .name("homeway-quic-heal".into())
-        .spawn(move || match quic_rebind_first(&r2, "岛判死") {
-            HealOutcome::Recovered => {}
-            HealOutcome::Failed => r2.tun_shared.mark_unhealthy_if_current(r2.gen, "patrol"),
-            HealOutcome::InFlight => {}
-        });
-    if let Err(e) = spawned {
-        crate::syncutil::log_spawn_failed(
-            &run.logf,
-            "homeway-quic-heal",
-            &e,
-            "岛判死信号未做 Rebind 优先处置（按下一拍巡检重试）",
-        );
-    }
-}
-
-/// Rebind 优先处置（单飞）：`migration_unconfirmed` 时换本地 socket 并探活确认；
-/// 其余形态（连接已死）Rebind 无可保之物 ⇒ 直接判不可救（回落既有阶梯/扩展重建）。
-fn quic_rebind_first(run: &Arc<GenRun>, cause: &str) -> HealOutcome {
-    if run.quic_heal.swap(true, Ordering::AcqRel) {
-        return HealOutcome::InFlight;
-    }
-    let out = quic_rebind_body(run, cause);
-    run.quic_heal.store(false, Ordering::Release);
-    out
-}
-
-fn quic_rebind_body(run: &Arc<GenRun>, cause: &str) -> HealOutcome {
-    let Some(island) = run.current_island() else {
-        return HealOutcome::Failed;
-    };
-    let snap = island.snapshot();
-    if run.l3_on_island() && snap.migration_unconfirmed {
-        (run.logf)("quic: 迁移未确认 ⇒ 先试 Rebind（换本地 socket 保连接；设计 §2.3 的新增动作）");
-        match island_cmd(
-            &island,
-            |reply| homeway_quic::Cmd::Rebind { local: None, reply },
-            QUIC_RPC_BUDGET,
-        ) {
-            Ok(to) => {
-                (run.logf)(&format!("quic: Rebind 完成（→ {to}），等对端回包证路径"));
-                match l3_probe(run, QUIC_HEAL_PROBE) {
-                    Ok(()) => {
-                        (run.logf)("quic: Rebind 后探活通过 —— 连接保持（不拆世代）");
-                        return HealOutcome::Recovered;
-                    }
-                    Err(e) => (run.logf)(&format!(
-                        "quic: Rebind 后 {cause} 仍探不活（{e}）—— 回落重连/重赛跑（交扩展重建）"
-                    )),
-                }
-            }
-            Err(e) => (run.logf)(&format!("quic: Rebind 失败（{e}）—— 回落重连/重赛跑")),
-        }
-    } else {
-        (run.logf)(&format!(
-            "quic: {cause}（连接不在/迁移未确认位未置）—— Rebind 无可保之物，交扩展重建"
-        ));
-    }
-    HealOutcome::Failed
+    run.tun_shared.mark_unhealthy_if_current(run.gen, reason);
 }
 
 /// 岛的建立（凭据 → 候选 → 起岛 → SetOnUnhealthy/SetCandidates → 赛跑）。
@@ -2432,7 +2357,8 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
             return;
         }
         // 挂起空窗检测（>2×间隔 = 进程被冻结过）：不等本拍探测失败，直接 R1 起跑
-        // （quic 档：Rebind 优先动作由 `quic_rebind_first` 承担——见下方失败面）
+        // （quic 档：动作 = 岛内快探阶梯的 **M→R**（§3.1/§3.2-3）——岛的拍内务同样看得见
+        //   挂起空窗（`Ladder::due` 的 gap 判据）并立刻探活；本行只作世代层的现场留痕）
         let now = Instant::now();
         let gap = now.duration_since(last_loop_at);
         last_loop_at = now;
@@ -2441,12 +2367,7 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
                 "巡检空窗 {}（判为进程被挂起）→ 阶梯恢复",
                 crate::go_fmt::fmt_duration_go_secs(gap)
             ));
-            if run.l3_on_island() {
-                let run2 = Arc::clone(&run);
-                let _ = std::thread::spawn(move || {
-                    let _ = quic_rebind_first(&run2, "挂起唤醒");
-                });
-            } else {
+            if !run.l3_on_island() {
                 let run2 = Arc::clone(&run);
                 let _ = std::thread::spawn(move || {
                     run2.recover(Level::R1, "挂起唤醒");
@@ -2629,21 +2550,12 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
                 ));
                 // 失败当拍进 R1（补注册 + 丢会话，保采纳）——出口重启/记录被回收时
                 // 手机侧没有别的信号，原本要等 3 连败，现在本次巡检内就能恢复。
-                // **quic 档**：R1 的动作面（补注册/丢会话）是 WG 面的——QUIC 档的等价
-                // 动作 = **Rebind 优先**（§2.3 的新增动作）；未恢复也不在此拆世代
-                // （3 连败分支统一处置）。
+                // **quic 档**：动作面**只在岛内快探阶梯**（§3.1：快探 700ms/背靠背 →
+                // 复探 → M/R → B）——本拍只留痕（不重复动作、不抢跑；岛的动作快 240×）。
                 if run.l3_on_island() {
-                    match quic_rebind_first(&run, "巡检失败") {
-                        HealOutcome::Recovered => {
-                            (run.logf)("quic: Rebind 优先处置成功（连接保持）");
-                            fail_streak = 0;
-                            continue;
-                        }
-                        HealOutcome::Failed => {}
-                        HealOutcome::InFlight => {
-                            (run.logf)("quic: 已有 Rebind 处置在途 —— 本拍不重复动作");
-                        }
-                    }
+                    (run.logf)(
+                        "quic: 巡检失败 —— 动作面在岛内快探阶梯（§3.1；本拍不重复动作）",
+                    );
                 } else {
                     let rc = run.recover(Level::R1, "巡检失败");
                     if matches!(rc, LadderRc::Recovered(_)) {
@@ -2660,14 +2572,12 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
         }
         if fail_streak >= FAIL_STREAK_LADDER {
             if run.l3_on_island() {
-                // quic 档：R2 阶梯的动作面（换源/重赛跑）不在本世代内可表达 ⇒
-                // **Rebind 优先**（保连接）再交扩展重建（设计 §2.3；阶梯重写 = M3）。
-                (run.logf)("quic: 对端连续 3 次不可达 —— Rebind 优先（保连接），不成交扩展重建");
-                if quic_rebind_first(&run, "巡检3连败") == HealOutcome::Recovered {
-                    fail_streak = 0;
-                    probe_now = true;
-                    continue;
-                }
+                // quic 档：动作面 = 岛内快探阶梯（§3.1 的 M/R/B）；本支路只是**兜底**
+                // （岛的 B 门 = 连续 2 次 R 失败 + 窗 ≥10s ⇒ 10s 量级就会上报；走到这里
+                //   说明岛面也异常）⇒ 如实上报 `patrol` 交世代重建，不再做 Rebind 动作。
+                (run.logf)(
+                    "quic: 对端连续 3 次巡检不可达（岛内阶梯未见自愈）—— 兜底上报不健康，交扩展重建",
+                );
             } else {
                 (run.logf)("对端连续 3 次不可达，进恢复阶梯（R2 换源起跑，不拆隧道）");
                 let rc = run.recover(Level::R2, "巡检3连败");
@@ -2826,8 +2736,11 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
             let run2 = Arc::clone(&run);
             let _ = std::thread::spawn(move || {
                 if run2.l3_on_island() {
-                    // quic 档：Rebind 优先（§2.3 的新增动作），不成交扩展重建
-                    let _ = quic_rebind_first(&run2, "待发包下推");
+                    // quic 档：下推动作 = 岛内快探阶梯（§3.1：在用档 700ms/背靠背 ⇒ 岛自己
+                    // 就是「立即下推」；世代层不再重复动作）——本支路只留痕。
+                    (run2.logf)(
+                        "quic: 待发包下推 —— 岛内快探阶梯为准（§3.1；本拍不重复动作）",
+                    );
                 } else {
                     run2.recover(Level::R1, "待发包下推");
                 }
