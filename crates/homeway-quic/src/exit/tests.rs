@@ -1970,7 +1970,6 @@ async fn normal_races_do_not_trigger_retry_or_gate() {
         );
     }
     let snap = quic.snapshot();
-    println!("[S3 normal] {snap:?}");
     assert_eq!(snap.retry_sent, 0, "常态赛跑不得 Retry（r14 F10）：{snap:?}");
     assert_eq!(snap.flood_refused, 0, "常态赛跑不得撞每源闸：{snap:?}");
     // 回环上三候选**都会完成握手**（实测 admitted = 24/24：胜者留用、余者被 explicit close）

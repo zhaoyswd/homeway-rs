@@ -224,6 +224,9 @@ pub struct ExitQuicSnapshot {
     /// 已发出的 **Retry**（地址校验挑战）包数（M2 §3.1 观测面；生产者 = S3）。
     pub retry_sent: u64,
     /// 每源闸拒绝的连接尝试数（M2 §3.2-④/§3.3；生产者 = S3——「重连洪泛有界」的主计数）。
+    ///
+    /// 口径（设计门 r14 F18）：与 quinn `EndpointStats::refused_handshakes` **不同源**——
+    /// 后者只含应用层 `refuse()`（本计数亦然），**不含** <1200B 短包与端点饱和的静默丢。
     pub flood_refused: u64,
     /// 证明失败闸**进入冷却**的次数（M2 §3.2-⑥；行「证明失败闸」的节流计数源）。
     pub proof_cooldowns: u64,
@@ -707,7 +710,7 @@ fn run_exit(
                             if log_due(n) {
                                 (*logf)(&format!(
                                     "quic: 握手洪泛拒绝（{src:?} 在 {win:?} 内第 {k} 次尝试——已拒；第 {n} 次）",
-                                    src = admit::SrcKey::of(peer),
+                                    src = admit::SrcKey::of(peer).text(),
                                     win = cfg.per_src_window,
                                     k = gate_out.in_window
                                 ));

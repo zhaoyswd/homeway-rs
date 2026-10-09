@@ -180,7 +180,7 @@ fn fmt_dur(d: Duration) -> String {
 
 /// 每源键（§3.2-④ 定死：**v4 /32、v6 /64 前缀聚合**——同址多端口算同源）。
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
-pub enum SrcKey {
+pub(crate) enum SrcKey {
     /// IPv4 /32（整地址）。
     V4([u8; 4]),
     /// IPv6 /64（前 8 字节）。
@@ -199,11 +199,23 @@ impl SrcKey {
             }
         }
     }
+
+    /// 展示文案（判据行里要看得见**聚合后的源前缀**：`a.b.c.d/32` / `x::/64`）。
+    pub fn text(self) -> String {
+        match self {
+            Self::V4(o) => format!("{}/32", std::net::Ipv4Addr::from(o)),
+            Self::V6(b) => {
+                let mut full = [0u8; 16];
+                full[..8].copy_from_slice(&b);
+                format!("{}/64", std::net::Ipv6Addr::from(full))
+            }
+        }
+    }
 }
 
 /// 过闸结论 + 当时的窗内计数（计数进「握手洪泛拒绝」行）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct GateOutcome {
+pub(crate) struct GateOutcome {
     /// 放行 / 拒。
     pub action: SrcAction,
     /// 记账后该源在窗内的计数（含本次）。
@@ -212,7 +224,7 @@ pub struct GateOutcome {
 
 /// 过闸动作。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum SrcAction {
+pub(crate) enum SrcAction {
     /// 放行（窗内计数未达上限）。
     Allow,
     /// 拒（窗内计数已达上限）——调用方 `refuse()` + 计数 + 记行。
@@ -220,7 +232,7 @@ pub enum SrcAction {
 }
 
 /// 每源准入速率闸（§3.2-④；记账语义见模块头）。
-pub struct SrcGate {
+pub(crate) struct SrcGate {
     limit: u32,
     window: Duration,
     cap: usize,
@@ -328,7 +340,7 @@ impl SrcGate {
 /// **计数集排除引擎裁决拒绝**（r14 F12 订正）：表满/冲突/吊销/窗超都是合法设备的可用性
 /// 故障，把它们算进冷却会把一次可用性故障放大成更长的锁死 ⇒ 计数点只有两处
 /// （nonce 类 / MAC 类，见 `exit/conn.rs`），引擎裁决拒绝**不进本闸**。
-pub struct ProofGate {
+pub(crate) struct ProofGate {
     threshold: u32,
     cap: usize,
     order: VecDeque<[u8; 8]>,
