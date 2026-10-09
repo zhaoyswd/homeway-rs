@@ -30,7 +30,7 @@ const LOCK_NAME: &str = "session.lock";
 
 /// 拿锁失败：锁被活持有者占着（错误信息直指现场）。
 #[derive(Debug, thiserror::Error)]
-#[error("identity 已有会话在跑（pid={pid} 动词={verb}，起于 {since_ms}）——同 identity 并发会话会互踢 WG keypair（R6 前置批 ① 根因形态）：先停掉它，或换 --identity-dir，或确知无害用 --no-session-lock")]
+#[error("identity 已有会话在跑（pid={pid} 动词={verb}，起于 {since_ms}）——同 identity 并发会话会互踢隧道路径/准入身份（R6 前置批 ① 根因形态；原「互踢 WG keypair」措辞随 WG 面退役，E 棒代码门 L-1 订正）：先停掉它，或换 --identity-dir，或确知无害用 --no-session-lock")]
 pub struct LockHeld {
     pub pid: u32,
     pub verb: String,

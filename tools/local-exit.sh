@@ -163,7 +163,7 @@ EOF
   echo "==> 客户端 pid=$REPLY_PID"
   ;;
 client-add)
-  tok=$("$BIN" serve token --state "$EXIT_STATE" | grep -o 'hmw2[A-Za-z0-9+/=_-]*' | head -1)
+  tok=$("$BIN" serve token --state "$EXIT_STATE" | grep -o 'hmw[0-9][A-Za-z0-9+/=_-]*' | head -1)
   [[ -n "$tok" ]] || { echo "!! 取不到出口 #$n 的 token（先 start）" >&2; exit 1; }
   echo "==> host add（token 已掩码取用，长度 ${#tok}）"
   CL0=$(log_lines "$CLIENT_STATE/cache/client.log")

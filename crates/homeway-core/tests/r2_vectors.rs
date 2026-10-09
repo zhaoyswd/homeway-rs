@@ -1,7 +1,8 @@
 //! R2 增族向量对照：reg 报文字节 / files 帧字节
 //! （向量由 tools/vector-gen 从 baseline 克隆的生产真源产出——fixtures/vectors/*.json）。
-//! **M5 C3**：端点缓存（`endpoint_cache`）随 WG 面退役（设计 §1.6-G-1）⇒ 其字节对照
-//! 用例删除；`fixtures/vectors/endpointcache.json` 的退役登记归 S5。
+//! **M5 C3/E 棒**：端点缓存（`endpoint_cache`）随 WG 面退役（设计 §1.6-G-1）⇒ 其字节对照
+//! 用例删除；`fixtures/vectors/endpointcache.json` **已同批退役**（文件删 + 生成器停产出 +
+//! `SHA256SUMS` 去行——E 棒代码门 M-9：该件**零消费者**，L-8 原登记的「生产消费者仍在」对它不成立）。
 
 use homeway_core::reg2;
 

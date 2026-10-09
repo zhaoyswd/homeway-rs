@@ -491,7 +491,7 @@ impl ExitQuic {
                 }
             })
             .map_err(|e| {
-                log_spawn_failed(&logf, EXIT_THREAD, &e, "出口 QUIC 面缺席（WG 面不受影响）");
+                log_spawn_failed(&logf, EXIT_THREAD, &e, "出口 QUIC 面缺席（单承载 ⇒ 出口无 UDP 面）");
                 ExitQuicErr::Endpoint(e)
             })?;
 

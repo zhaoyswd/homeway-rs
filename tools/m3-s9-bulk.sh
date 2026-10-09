@@ -27,7 +27,7 @@ echo "==> 起干净出口 #$n"
 "$REPO_ROOT/tools/local-rust-exit.sh" wipe "$n" > "$RES/exit-wipe.txt" 2>&1 || true
 "$REPO_ROOT/tools/local-rust-exit.sh" start "$n" > "$RES/exit-start.txt" 2>&1 || {
   echo "!! 出口起不来（见 $RES/exit-start.txt）" >&2; exit 1; }
-TOKEN="$("$REPO_ROOT/tools/local-rust-exit.sh" token "$n" 2>/dev/null | grep -oE 'hmw2[A-Za-z0-9_=+/-]+' | head -1)"
+TOKEN="$("$REPO_ROOT/tools/local-rust-exit.sh" token "$n" 2>/dev/null | grep -oE 'hmw[0-9][A-Za-z0-9_=+/-]+' | head -1)"
 [[ -n "$TOKEN" ]] || { echo "!! token 取不到" >&2; exit 1; }
 print -r -- "$TOKEN" > "$RES/token.txt"
 PID=$(cat "$EXIT_STATE/pid")

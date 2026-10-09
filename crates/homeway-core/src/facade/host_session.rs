@@ -31,10 +31,17 @@
 //! - **G5**（`daemon host reach` 过滤键）：本模块只提供会话；过滤键修正落在
 //!   `daemon/hosts.rs`（WG 档的 `is_wg()` 反过滤 → `Quic|Relay`）。
 //! - **G6**（`dnstest` 的 UDP 服务面无替代）：岛只有 STREAM + L3，无 UDP socket 服务
-//!   ⇒ **登记退役**（排障工具，非产品四件套；`homeway-cli` 侧同批处置）。
-//! - **G7**（出口 `:5300` 解析腿在宿主会话无 tag 承载）：**登记缺口**（承接 = 出口侧
-//!   新增 `STREAM[tag=6]`，属出口协议面增项 ⇒ 归后续棒按设计 §12-C-8 裁决；本棒不
-//!   擅动出口 wire）。⇒ `CA5`（socks 域名目标）在本棒起降级为本机解析。
+//!   ⇒ **登记退役**（排障工具，非产品四件套；`homeway-cli` 侧同批处置：动词面无
+//!   dispatch + 用法行除名）。
+//! - **G7**（出口 `:5300` 解析腿在宿主会话无 tag 承载）：**本棒按「退役」执行**——
+//!   出口侧新增 `STREAM[tag=6]` 属出口协议面增项（设计 §12-C-8 的「承接」选项，**待用户
+//!   裁决**；本棒不擅动出口 wire）。**事实面（代码门 H-2 订正：本条曾写「降级为本机解析」，
+//!   而本仓根本没有该兜底）**：`tag_for_port(5300)` = `None`（`facade/quic_stream.rs`）⇒
+//!   socks **域名目标**（`curl --socks5-hostname`）在核侧**不可用**，失败归因为
+//!   `出口未提供该服务腿（端口 5300 无 STREAM tag）`（`daemon/carriers::DialErr::NoService`，
+//!   可行动文案——不再是误导性的「连接被拒（对端 RST）」）；**无本机解析兜底**。
+//!   判据面同批登记：`E4` 的 `resolve=` 段退役、`CA5` 降级（`docs/INTEROP-CRITERIA.md`
+//!   的 M5 批量条目）；原设计推荐的「承接」= 未做，作为待裁决项上报。
 
 use std::io::{self, Read, Write};
 use std::net::SocketAddrV4;
@@ -140,6 +147,10 @@ pub enum HostErr {
     /// 预算耗尽。
     #[error("拨号预算耗尽")]
     Budget,
+    /// 本端服务流额度耗尽（`StreamErr::Busy`；M5 代码门 M-6 —— 此前被并进
+    /// `NotReady` ⇒ 承载面报成「会话不在（收工/重建窗口）」，归因误导）。
+    #[error("出口服务并发额度已满（Busy）")]
+    Busy,
     /// 会话已关闭（连接死/被替换/本端已收工）。
     #[error("会话已关闭（{0}）")]
     Closed(String),
@@ -155,6 +166,9 @@ impl From<HostErr> for io::Error {
             HostErr::NoFace | HostErr::NotReady(_) => io::ErrorKind::NotConnected,
             HostErr::Refused => io::ErrorKind::ConnectionRefused,
             HostErr::Budget => io::ErrorKind::TimedOut,
+            // Busy = 本端额度面（不是连接面）：`WouldBlock` 让调用方按「稍后重试」处理，
+            // 且不与 refused-like（桥面 link_down 回帧判据）混淆。
+            HostErr::Busy => io::ErrorKind::WouldBlock,
             HostErr::Closed(_) => io::ErrorKind::Other,
             HostErr::Start(_) => io::ErrorKind::Other,
         };
@@ -169,6 +183,7 @@ impl HostErr {
         match e {
             StreamErr::NotSupported | StreamErr::Refused => HostErr::Refused,
             StreamErr::Timeout => HostErr::Budget,
+            StreamErr::Busy => HostErr::Busy,
             StreamErr::Closed | StreamErr::ConnectionLost => HostErr::Closed(e.to_string()),
             other => HostErr::NotReady(other.to_string()),
         }
@@ -179,6 +194,7 @@ impl HostErr {
         match e.kind() {
             io::ErrorKind::ConnectionRefused => HostErr::Refused,
             io::ErrorKind::TimedOut => HostErr::Budget,
+            io::ErrorKind::WouldBlock => HostErr::Busy,
             io::ErrorKind::NotConnected => HostErr::NoFace,
             _ => HostErr::Closed(e.to_string()),
         }
@@ -721,9 +737,11 @@ fn probe_once(inner: &Arc<Inner>, budget: Duration) -> ProbeOutcome {
         budget + RPC_BUDGET,
     ) {
         Ok(rtt) => ProbeOutcome::Ok { rtt },
-        Err(IslandRpcErr::Island(m)) if m.contains("NotConnected") || m.contains("未持有连接") => {
-            ProbeOutcome::NoFace
-        }
+        // **typed 判据（M5 代码门 M-1 整改）**：按 `IslandErr` 变体判，不做字符串匹配
+        // （`contains("NotConnected")` 那条分支曾恒假——Display 是中文，实际只靠
+        // `未持有连接` 四个字，改文案即静默失效）。
+        Err(IslandRpcErr::Island(homeway_quic::IslandErr::NotConnected))
+        | Err(IslandRpcErr::Island(homeway_quic::IslandErr::EngineGone)) => ProbeOutcome::NoFace,
         Err(_) => ProbeOutcome::Timeout,
     }
 }
@@ -813,7 +831,8 @@ fn patrol_loop(inner: Arc<Inner>) {
 /// 岛 RPC 的失败面（与 `tun_exec::IslandRpc` 同形；本模块自持一份避免跨模块耦合）。
 enum IslandRpcErr {
     Gone(String),
-    Island(String),
+    /// 岛侧 typed 错误（**保留类型**，不再 `to_string()` 抹平——M5 代码门 M-1）。
+    Island(homeway_quic::IslandErr),
     Timeout(String),
 }
 
@@ -821,7 +840,7 @@ impl std::fmt::Display for IslandRpcErr {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             IslandRpcErr::Gone(m) => write!(f, "岛已收工（{m}）"),
-            IslandRpcErr::Island(m) => write!(f, "{m}"),
+            IslandRpcErr::Island(e) => write!(f, "{e}"),
             IslandRpcErr::Timeout(m) => write!(f, "岛命令等待超时（{m}）"),
         }
     }
@@ -839,7 +858,7 @@ fn island_cmd<T>(
         .map_err(|e| IslandRpcErr::Gone(e.to_string()))?;
     match rx.recv_timeout(budget) {
         Ok(Ok(v)) => Ok(v),
-        Ok(Err(e)) => Err(IslandRpcErr::Island(e.to_string())),
+        Ok(Err(e)) => Err(IslandRpcErr::Island(e)),
         Err(e) => Err(IslandRpcErr::Timeout(e.to_string())),
     }
 }

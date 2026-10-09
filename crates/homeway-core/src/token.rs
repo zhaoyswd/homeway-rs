@@ -62,7 +62,10 @@ const MIN_V1_BODY_LEN: usize = 32 + 32 + 1 + 4;
 /// base64 crate 默认查，须显式放开才能逐字节同判）。Go 解码器还会跳过输入中任意位置的
 /// `\r`/`\n`（终端折行常态），crate 不做——由 [`decode`] 先行剥离对齐。
 /// （构造全为 const fn ⇒ 无需 LazyLock。）
-static B64: GeneralPurpose = GeneralPurpose::new(
+/// **单源可见性（M5 代码门 M-10）**：`pub(crate)` —— `relay/rltoken.rs` 的 rl1 body
+/// 走同一引擎（原先它是**拷贝**一份同参数常量；两份一起改就一起绿 ⇒ 中继 wire 的
+/// 静默漂移风险）。改本常量 = 同批影响 hmw2 与 rl1 两面。
+pub(crate) static B64: GeneralPurpose = GeneralPurpose::new(
     &URL_SAFE,
     base64::engine::GeneralPurposeConfig::new()
         .with_decode_padding_mode(base64::engine::DecodePaddingMode::RequireNone)
@@ -380,6 +383,9 @@ pub fn parse_body(raw: &[u8]) -> Result<TokenRef<'_>, TokenError> {
     let mut secret: Option<[u8; 32]> = None;
     let mut endpoints: Option<Vec<EndpointRef<'_>>> = None;
     let mut rpk: Option<RpkPubKey> = None;
+    // **已知段各只许出现一次**（E 棒代码门 L-8）：原实现是 `last-wins` ⇒ 同一凭据存在
+    // 多种等价字节表示（可塑性：缓存/去重/字节锚都可能被绕过）。无兼容包袱 ⇒ 直接拒。
+    let mut seen_known = [false; 4];
 
     for _ in 0..seg_count {
         if rest.len() < SEG_HEAD {
@@ -399,19 +405,31 @@ pub fn parse_body(raw: &[u8]) -> Result<TokenRef<'_>, TokenError> {
         rest = tail;
         match typ {
             t if t == SEG_PEER_ID | SEG_CRITICAL => {
+                if std::mem::replace(&mut seen_known[0], true) {
+                    return Err(TokenError::Malformed { reason: "peerId 段重复" });
+                }
                 peer_id = Some(seg.try_into().map_err(|_| TokenError::Malformed {
                     reason: "peerId 段长度不为 32",
                 })?);
             }
             t if t == SEG_SECRET | SEG_CRITICAL => {
+                if std::mem::replace(&mut seen_known[1], true) {
+                    return Err(TokenError::Malformed { reason: "secret 段重复" });
+                }
                 secret = Some(seg.try_into().map_err(|_| TokenError::Malformed {
                     reason: "secret 段长度不为 32",
                 })?);
             }
             t if t == SEG_ENDPOINTS | SEG_CRITICAL => {
+                if std::mem::replace(&mut seen_known[2], true) {
+                    return Err(TokenError::Malformed { reason: "端点段重复" });
+                }
                 endpoints = Some(parse_endpoint_list(seg)?);
             }
             t if t == SEG_RPK => {
+                if std::mem::replace(&mut seen_known[3], true) {
+                    return Err(TokenError::Malformed { reason: "rpk 段重复" });
+                }
                 let b: [u8; 32] = seg.try_into().map_err(|_| TokenError::Malformed {
                     reason: "rpk 段长度不为 32",
                 })?;
@@ -577,6 +595,15 @@ pub fn encode_body(spec: &TokenSpec<'_>) -> Result<Vec<u8>, TokenError> {
         eps.push(e.kind.to_wire());
         eps.push(e.addr.len() as u8);
         eps.extend_from_slice(e.addr.as_bytes());
+    }
+    // **段体长度上界 fail-closed（E 棒代码门 L-7）**：段长字段是 `u16 BE` ⇒ 端点段
+    // body > u16::MAX 时 `push_segment` 的 `as u16` 会**静默截断**（release），产出的
+    // token **自己解不开**（解析报「端点段为空」）。极端形态（255 端点 × 255B 地址 ≈
+    // 65,536B > 65,535）可达 ⇒ 构造期显式拒（debug_assert 只在 debug 生效，不够）。
+    if eps.len() > u16::MAX as usize {
+        return Err(TokenError::Malformed {
+            reason: "端点段过长（>64KiB）",
+        });
     }
     let mut segs = Vec::with_capacity(1 + 3 * 3 + eps.len() + 35 + 4);
     segs.push(if spec.rpk.is_some() { 4u8 } else { 3 }); // segCount
@@ -880,6 +907,25 @@ mod tests {
         match parse_body(&body) {
             Err(TokenError::Malformed { reason }) => assert_eq!(reason, "rpk 段长度不为 32"),
             other => panic!("rpk 段长度错应判 Malformed，实得 {other:?}"),
+        }
+        // ③-bis **已知段重复 ⇒ 拒**（E 棒代码门 L-8：原 last-wins 允许同一凭据两种字节表示）
+        let mut body = encode_body(&TokenSpec {
+            peer_id: &peer,
+            secret: &secret,
+            endpoints: &[],
+            rpk: None,
+        })
+        .unwrap();
+        body.truncate(body.len() - 4); // 去 CRC
+        body[0] = 4; // segCount：3 → 4（多一枚重复的 peerId 段）
+        body.push(SEG_PEER_ID | SEG_CRITICAL);
+        body.extend_from_slice(&32u16.to_be_bytes());
+        body.extend_from_slice(&[0x99; 32]);
+        let sum = Sha256::digest(&body);
+        body.extend_from_slice(&sum[..4]);
+        match parse_body(&body) {
+            Err(TokenError::Malformed { reason }) => assert_eq!(reason, "peerId 段重复"),
+            other => panic!("重复已知段应判 Malformed，实得 {other:?}"),
         }
         // 【冻结】v1 尾长纪律（rl1 路径）
         for extra in [1usize, 31, 33, 64] {

@@ -1,7 +1,8 @@
 //! files 原生协议客户端（语义真源 `baseline:pkg/files/{proto,client}.go`）。
 //!
-//! 承载：隧道内 TCP 流上**每命令一条流**（拨隧道 IP:7802，出口豁免规则转投本机
-//! files.sock）。线上格式：
+//! 承载（**M5 起**）：**QUIC `STREAM[tag=1]`**（端口 7802 只是「端口 → tag」映射的输入，
+//! 见 `facade::quic_stream::tag_for_port`）；旧描述「拨隧道 IP:7802，出口豁免规则转投本机
+//! files.sock」随豁免面退役（E 棒代码门 L-2 订正）。线上格式：
 //!
 //! ```text
 //! 服务端 → 客户端（流的第一个东西，恒有）：

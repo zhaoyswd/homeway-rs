@@ -518,10 +518,11 @@ func genR2Families(t *testing.T, out string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	vecWriteJSON(t, filepath.Join(out, "endpointcache.json"), map[string]any{
-		"comment": "端点缓存落盘 JSON 字节钉子（与 Go endpointFile 序列化逐字节一致：键序=声明序、verifiedAt omitempty、i64 毫秒）。语义真源 baseline clientcore/internal/wtransport/endpointcache.go。",
-		"json":    string(raw),
-	})
+	// **M5 E 棒（代码门 M-9）：endpointcache.json 停产出** —— 端点学习缓存随 WG 面退役
+	// （设计 §1.6-G-1：QUIC 候选来自 token，无「学习缓存」概念），该夹具在核侧**零消费者**
+	// ⇒ 与 `token.json` 同口径退役（文件删 + 停产出 + SHA256SUMS 去行）。
+	// 旧产物形态留档在本注释：{"comment":"端点缓存落盘 JSON 字节钉子…","json":"<raw>"}。
+	_ = raw
 
 	// ---- files 帧（4B BE len + payload；容器帧 [reg][data]）----
 	type frCase struct {

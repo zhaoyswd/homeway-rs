@@ -200,7 +200,7 @@ pub(crate) fn parse_unified_args(args: &[String]) -> UnifiedInvocation {
             "verbose" => verbose = cli_flags::take_bool_or_exit("verbose", inline, true),
             "help" | "h" => {
                 println!("homeway-cli [统一进程] —— 零参起；只认 --state <dir> / --verbose（角色参数写 config.toml，或用 serve/relay 前台单角色形态）");
-                println!("子命令形态：homeway-cli <serve|relay|status|host|term|files|connect|speedtest|token|dnstest|portfwd> …（无子命令 = 统一进程）");
+                println!("子命令形态：homeway-cli <serve|relay|status|host|term|files|connect|speedtest|token|portfwd> …（无子命令 = 统一进程）；dnstest 已退役（M5 §2.6-G6：岛无 UDP socket 服务面）");
                 return UnifiedInvocation::Help;
             }
             other => {

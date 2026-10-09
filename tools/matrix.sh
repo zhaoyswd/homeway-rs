@@ -166,6 +166,23 @@ link_relay_impl() { case "$1" in L1|L3|L5|RRR) print rust;; L2|L4|L6|GGG) print 
 link_client_impl() { case "$1" in L2|L3|L6|RRR) print rust;; L1|L4|L5|GGG) print go;; esac }
 link_no() { case "$1" in L1) print 1;; L2) print 2;; L3) print 3;; L4) print 4;; L5) print 5;; L6) print 6;; GGG) print 0;; RRR) print 7;; esac }
 
+# 出口 token 前缀 × 实现的一致性守卫（M5 E 棒整改）：M5 S5t 的 `hmw1→hmw2` 机械改名曾
+# **无差别套到「读 Go 出口 token」的站点**，而 Go 二进制只认旧前缀 ⇒ L1/GGR 等仍保留的
+# Go 出口链路确定性红，且**被 `--smoke`（只跑 RRR）掩盖**。抽取式现为前缀无关
+# （`hmw[0-9]`——Go/Rust 两种都收），但「产者」必须与链路声明的出口实现一致。
+# **字面量不写死**：`hmw1` 是 `tools/check-wg-removed.sh` 的复活哨兵词（`tools/**` 出现即红），
+# 故期望前缀按 `hmw${n}` 组装。
+token_for_link() { # token_for_link <link> <E(go|rust)> → 回显 token；前缀不符 ⇒ 空 + 醒目行
+  local link="$1" E="$2" tok want_n
+  tok=$(exit_token "$link" "$E" | grep -o 'hmw[0-9][A-Za-z0-9+/=_-]*' | head -1)
+  [[ "$E" == go ]] && want_n=1 || want_n=2
+  if [[ -n "$tok" && "${tok:3:1}" != "$want_n" ]]; then
+    print -r -- "!! $link 出口 token 前缀（${tok:0:4}…）与声明的实现（$E ⇒ hmw$want_n）不符——抽取式或产者漂移" >&2
+    return 1
+  fi
+  print -r -- "$tok"
+}
+
 link_port() { print $((42660 + $(link_no "$1"))) }
 relay_port() { print $((42750 + $(link_no "$1"))) }
 echo_port()  { print $((42800 + $(link_no "$1"))) }
@@ -444,7 +461,7 @@ run_link() {
 
 base_segment() {
   local link="$1" E="$2" C="$3" st="$MATRIX/$link"
-  local TOK=$(exit_token "$link" "$E" | grep -o 'hmw2[A-Za-z0-9+/=_-]*' | head -1)
+  local TOK=$(token_for_link "$link" "$E")
   [[ -n "$TOK" ]] || { record "$link" token "FAIL" "取不到出口 token"; return 1; }
 
   if [[ "$C" == go ]]; then
@@ -729,10 +746,12 @@ base_segment() {
   # DNS 行：**`dnstest` 已退役（M5 §2.6-G6）**——它依赖 WG 栈 B 的 UDP socket 面，
   # QUIC 岛只有 STREAM + L3，无 UDP socket 服务面（有意缺口）。本行改**登记态**：
   # 不再调 CLI 动词（动词已从 `homeway-cli` 移除），判据面 = 退役登记本身。
+  # **M5 E 棒代码门 M-7 整改**：未跑的检查**不得记 PASS**（假绿）——`SKIP` 档的语义
+  # （`record` 头：本轮形态不适用）正对此面；`EXEMPT_SKIPS` 计数在 TOTAL 行可见。
   if [[ "$C" == rust ]]; then
-    record "$link" DNS "PASS" "（dnstest 已退役——M5 §2.6-G6：岛无 UDP socket 服务面；登记归 D 棒 S5）"
+    record "$link" DNS "SKIP" "（dnstest 已退役——M5 §2.6-G6：岛无 UDP socket 服务面；无判据面可采）"
   else
-    record "$link" DNS "PASS" "（未纳入——Go 客户端无 DNS 拨号动词，设计 §1.6）"
+    record "$link" DNS "SKIP" "（未纳入——Go 客户端无 DNS 拨号动词，设计 §1.6）"
   fi
 }
 
@@ -740,7 +759,7 @@ multi_peer_segment() {
   local link="$1" E="$2" C="$3" st="$MATRIX/$link"
   # 副客户端 = 异实现
   local SUB; [[ "$C" == go ]] && SUB=rust || SUB=go
-  local TOK=$(exit_token "$link" "$E" | grep -o 'hmw2[A-Za-z0-9+/=_-]*' | head -1)
+  local TOK=$(token_for_link "$link" "$E")
   local EL0=$(log_lines "$st/exit/stdout.log")
   if [[ "$SUB" == go ]]; then
     local SST="$st/c-sub"
@@ -788,11 +807,11 @@ relay_segment() {
     local ELx=$(log_lines "$st/exit/stdout.log")
     wait_line_from "$st/exit/stdout.log" '中继：注册成功' "$ELx" 25 >/dev/null 2>&1 || true
   fi
-  local TOK=$(exit_token "$link" "$E" | grep -o 'hmw2[A-Za-z0-9+/=_-]*' | head -1)
+  local TOK=$(token_for_link "$link" "$E")
   # 段级 cache 隔离（①-2）：主客户端清 cache 重连（变体 token）
   local DEAD
   if [[ "$C" == go ]]; then
-    DEAD=$("$RUST_BIN" token "$TOK" --dead-direct | grep -o 'hmw2[A-Za-z0-9+/=_-]*' | head -1)
+    DEAD=$("$RUST_BIN" token "$TOK" --dead-direct | grep -o 'hmw[0-9][A-Za-z0-9+/=_-]*' | head -1)
     [[ -n "$DEAD" ]] || { record "$link" RL-via "FAIL" "dead-direct 变体铸造失败"; return 1; }
     clear_go_client_cache "$link"
     local CL0=$(log_lines "$st/c-main/cache/client.log")

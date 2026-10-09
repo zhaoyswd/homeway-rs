@@ -38,7 +38,7 @@ EXIT_EXTRA_FLAGS="--relay $RL1" "$REPO_ROOT/tools/local-rust-exit.sh" start "$n"
   echo "!! 出口起不来（见 $RES/exit-start.txt）" >&2; exit 1; }
 
 echo "==> 取 token（serve token 输出里抽 hmw2…）"
-TOKEN="$("$REPO_ROOT/tools/local-rust-exit.sh" token "$n" 2>/dev/null | grep -oE 'hmw2[A-Za-z0-9_=+/-]+' | head -1)"
+TOKEN="$("$REPO_ROOT/tools/local-rust-exit.sh" token "$n" 2>/dev/null | grep -oE 'hmw[0-9][A-Za-z0-9_=+/-]+' | head -1)"
 if [[ -z "$TOKEN" ]]; then
   echo "!! token 取不到（serve token 输出：）" >&2
   "$REPO_ROOT/tools/local-rust-exit.sh" token "$n" | head -5 >&2

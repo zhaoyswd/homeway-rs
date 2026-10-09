@@ -97,14 +97,37 @@ NEG_ASSERT_FILES=(
   "crates/homeway-core/tests/quic_stream_perf.rs"
 )
 scan_tree "$CRATES" "$PAT3" "$TMP/3.txt"
-drop_whitelist "$TMP/3.txt" "${NEG_ASSERT_FILES[@]}"
-# 二级：**断言上下文**白名单（C4 交下；设计 §7.1-③ 的「按断言上下文豁免」）——只放行
-# 「断言里写出该串以证明它不出现」的行（含 assert / contains / 必须已删除 / 不得 / banned），
-# 产品行（如 logf("回落 WG…")）不含这些词 ⇒ 照旧击红。
-grep -vE 'assert|contains|必须已删除|不得|banned' "$TMP/3.txt" > "$TMP/3f.txt" || true
-mv "$TMP/3f.txt" "$TMP/3.txt"
+# 二级：**断言上下文**豁免只作用于**负向断言文件**（M5 代码门 M-3 整改：原实现把
+# `assert|contains|不得|banned` 的 `grep -v` 放在**全域**，任何产品行只要含这些词就被豁免
+# ——`logf("回落 WG —— 不得惊慌")` 不会被击红 = fail-open）。改法：白名单**之外**的文件
+# 不看上下文（直接击红）；白名单**之内**只放行「断言里写出该串以证明它不出现」的行。
+ctx_exempt_in_wl() { # ctx_exempt_in_wl <文件> <白名单...>
+  local out="$1"; shift
+  local tmp="$out.f" line wl is_wl; : > "$tmp"
+  while IFS= read -r line; do
+    is_wl=0
+    for wl in "$@"; do case "$line" in "$wl":*) is_wl=1 ;; esac; done
+    # 白名单文件内：放行「断言上下文」行（旧口径）；
+    # **其余文件**：只放行**严格负向断言形态**（`assert!`/`assert_eq!`/`assert_ne!`/
+    # `!contains(`/`必须已删除`/`banned`）——让**内联单测**里的负向断言也能留（如
+    # `tun_exec.rs` 的「A/B 开关行（N-d）必须已删除」、`engine.rs` 的 `assert_eq!(… "不再回落 WG")`），
+    # 而产品行 `logf("回落 WG —— 不得惊慌")` 不匹配任何形态 ⇒ 照旧击红（M-3 的反面样本）。
+    if (( is_wl )); then
+      case "$line" in
+        *assert*|*contains*|*必须已删除*|*不得*|*banned*) continue ;;
+      esac
+    else
+      case "$line" in
+        *'assert!('*|*'assert_eq!'*|*'assert_ne!'*|*'!contains('*|*必须已删除*|*banned*) continue ;;
+      esac
+    fi
+    print -r -- "$line" >> "$tmp"
+  done < "$out"
+  mv "$tmp" "$out"
+}
+ctx_exempt_in_wl "$TMP/3.txt" "${NEG_ASSERT_FILES[@]}"
 [[ ! -s "$TMP/3.txt" ]] || fail "③ 行文面 WG 冒充残留：$(cat "$TMP/3.txt")"
-info "③ 行文面（含 \`serve.quic\` 键字面）= 0（负向断言白名单 ${#NEG_ASSERT_FILES[@]} 文件豁免）"
+info "③ 行文面（含 \`serve.quic\` 键字面）= 0（断言上下文豁免**仅限** ${#NEG_ASSERT_FILES[@]} 个负向断言文件内）"
 
 # ---------- ④ Cargo 依赖面 ----------
 ROOT_TOML="$REPO_ROOT/Cargo.toml"
@@ -199,7 +222,9 @@ fi
 
 # ---------- ⑨ tools/** + fuzz/** 作用域 ----------
 # 排除面：① `*/target/**`（构建产物）；② 注释行（^#，脚本）；③ 显式白名单（退役说明/自校准夹具）
-PAT9='HOMEWAY_TRANSPORT|tunConfig\.transport|wgcore::|ring-shim'
+# **M5 代码门 M-4 整改**：补设计 §7.1-⑨ 点名的第五键 `serve.quic`（`[^_]` 边界——
+# `serve.quic_listen`/`serve.quic_admit` 是**保留键**，不得误伤）。
+PAT9='HOMEWAY_TRANSPORT|tunConfig\.transport|serve\.quic[^_]|wgcore::|ring-shim'
 grep -rnE "$PAT9" "$REPO_ROOT/tools" "$REPO_ROOT/fuzz" 2>/dev/null \
   | grep -v '/target/' \
   | grep -vE '(^|:)[0-9]+:[[:space:]]*#' \
@@ -222,19 +247,28 @@ info "⑨ tools/** + fuzz/** 承载三键/模块引用 = 0"
 DOC="$REPO_ROOT/docs/INTEROP-CRITERIA.md"
 NEW_IDS=(E-q6 E25 N-e C20 C21)
 OCCUPIED_IDS=(E-q5 C18 C19)
-# 自校准（已占 ID，**全表词边界存在性**——它们在真源里以散文/登记行形态出现）：
+# 自校准（**两条管线各自校准**——M5 代码门 M-2 整改：原实现用「全表词边界」校
+# `E-q5`/`C18`/`C19`，而受测管线是「行级」，两者不同管线 ⇒ 校准对被测面零覆盖，
+# 门自身日志却打「行级全命中」= 假陈述）：
+#  · 词边界存在性管线（散文/登记行里的 ID 也能命中）——校已占 ID `E-q5`/`C18`/`C19`；
+#  · **行级管线**（与受测面同管线）——校已占且**行内可判**的 ID `E7`/`E22`/`C13`（主表行式）。
+row_count() { grep -cE "^\| *(~~)?$1(~~)? *\|" "$DOC" || true; }
 for id in "${OCCUPIED_IDS[@]}"; do
   n=$(grep -cE "(^|[^A-Za-z0-9-])${id}([^A-Za-z0-9-]|$)" "$DOC" || true)
-  [[ "$n" != "0" ]] || fail "⑩ 自校准失败：已占 ID ${id} 零命中（门空跑 = 失准）"
+  [[ "$n" != "0" ]] || fail "⑩ 自校准失败（词边界管线）：已占 ID ${id} 零命中（门空跑 = 失准）"
+done
+ROW_CALIB_IDS=(E7 E22 C13)
+for id in "${ROW_CALIB_IDS[@]}"; do
+  n=$(row_count "$id")
+  [[ "$n" != "0" ]] || fail "⑩ 自校准失败（**行级**管线）：已占 ID ${id} 零行命中（受测管线失准）"
 done
 # 新 ID：**行级**各恰一条（`| ID |` 或 `| ~~ID~~ |`）——双占 = 撞名（X1 双占是历史先例）
-row_count() { grep -cE "^\| *(~~)?$1(~~)? *\|" "$DOC" || true; }
 for id in "${NEW_IDS[@]}"; do
   n=$(row_count "$id")
   [[ "$n" != "0" ]] || fail "⑩ 新 ID ${id} 零行命中（登记漏）"
   [[ "$n" -le 1 ]] || fail "⑩ 新 ID ${id} 占 ${n} 行（双占/撞名——X1 双占是历史先例）"
 done
-info "⑩ ID 空间：新 ID 行级各恰 1；自校准（${OCCUPIED_IDS[*]}）行级全命中"
+info "⑩ ID 空间：新 ID 行级各恰 1；自校准 = 词边界（${OCCUPIED_IDS[*]}）+ 行级（${ROW_CALIB_IDS[*]}）双管线命中"
 
 # ---------- ⑥ 门自身校准（注入负例 ⇒ 确定性红） ----------
 calib() { # $1 = 文件名（临时），$2 = 内容，$3 = 正则

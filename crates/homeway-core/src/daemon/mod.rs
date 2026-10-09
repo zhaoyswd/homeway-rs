@@ -134,7 +134,8 @@ pub trait Backend: Send + Sync {
     /// 各主机动态面（state/reason/link/stats）。
     fn host_states(&self) -> Vec<proto::HostState>;
     /// 打开一条到目标主机指定 kind 服务（term=7724 / files=7802——端口映射在此处，
-    /// 不进控制面词表）的隧道连接。NoHost = 主机不在表；NoSession = 会话不在
+    /// 不进控制面词表；**M5 起**端口只用于选 `STREAM[tag]`，出口不再于隧道 IP 上监听
+    /// 这三端口——E 棒代码门 L-2 订正）的隧道连接。NoHost = 主机不在表；NoSession = 会话不在
     /// （收工/重建窗口）；其余错误 = 主机不可达（stream_refused）。
     fn dial_stream(&self, kind: &str, host_hex: &str) -> Result<Arc<dyn StreamConn>, BackendErr>;
     /// 宿主未就绪（hosts 表未挂）——host.*/snapshot 类操作报 not_ready。
@@ -259,7 +260,7 @@ fn carriers_dial_of(hosts: &Arc<hosts::HostTable>) -> carriers::CarrierDial {
             let id = hosts::decode_peer_id_pub(host).ok_or(carriers::DialErr::NoHost)?;
             let sess = h1.session(&id).ok_or(carriers::DialErr::NoSession)?;
             let sp = crate::facade::host_session::ServicePort::from_bridge_port(port)
-                .ok_or(carriers::DialErr::Refused)?;
+                .ok_or(carriers::DialErr::NoService(port))?;
             let stream = sess
                 .connect(sp, budget.min(std::time::Duration::from_secs(15)))
                 .map_err(map_dial_err)?;
@@ -289,6 +290,7 @@ fn map_dial_err(e: crate::facade::host_session::HostErr) -> carriers::DialErr {
     use crate::facade::host_session::HostErr;
     match e {
         HostErr::Refused => carriers::DialErr::Refused,
+        HostErr::Busy => carriers::DialErr::Busy,
         HostErr::NoFace | HostErr::NotReady(_) => carriers::DialErr::NoSession,
         HostErr::Closed(_) => carriers::DialErr::NoSession,
         other => carriers::DialErr::Other(other.to_string()),

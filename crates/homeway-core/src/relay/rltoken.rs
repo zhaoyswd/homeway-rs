@@ -1,7 +1,9 @@
 //! rl1 中继凭据 token（铸造/解析）与 relay.key 管理。
 //!
 //! 语义真源 `baseline:pkg/proto/relaytoken.go` + `internal/relay/{token,cli}.go`。
-//! 布局与 hmw1 完全相同（复用 `crate::token` 的 body 编解码），仅前缀不同：
+//! 布局 = **冻结的 v1 body**（复用 `crate::token::encode_v1_body`/`decode_v1_body`——
+//! M5 S5t 起出口 token 换了 `hmw2` 段容器，**rl1 不跟动**：中继 wire 零变化），仅前缀不同
+//! （旧注释「与 hmw1 完全相同」里的 `hmw1` 已不存在，E 棒代码门 L-9 订正）：
 //!
 //! ```text
 //! "rl1" ‖ base64url-raw( relayID(32)=SHA256(secret) ‖ relaySecret(32) ‖ epCount(1) ‖ [type+len+addr]* ‖ crc(4) )
@@ -26,15 +28,10 @@ pub fn relay_secret_id(secret: &[u8; 32]) -> [u8; 32] {
 /// rl1 前缀。
 pub const PREFIX: &str = "rl1";
 
-/// base64url 无填充引擎（与 `token.rs` 的 `B64` **同参数**——rl1 body 的字节面不允许两套口径）。
-/// 容忍非规范尾位（Go 解码器默认不查）、拒尾缀 `=`。
-static BASE64: base64::engine::GeneralPurpose = base64::engine::GeneralPurpose::new(
-    &base64::alphabet::URL_SAFE,
-    base64::engine::GeneralPurposeConfig::new()
-        .with_decode_padding_mode(base64::engine::DecodePaddingMode::RequireNone)
-        .with_decode_allow_trailing_bits(true)
-        .with_encode_padding(false),
-);
+/// base64url 无填充引擎 = **`token.rs` 的同一常量**（M5 代码门 M-10：原先这里**拷贝**
+/// 了一份同参数引擎，两份可独立漂移而两边测试都绿 ⇒ rl1 body 的字节面会静默变。
+/// 现为单源引用：`token::B64`（`pub(crate)`）。容忍非规范尾位（Go 解码器默认不查）、拒尾缀 `=`。
+use crate::token::B64 as BASE64;
 
 /// 铸一枚 rl1 token（中继启动时打印；端点 = 中继自己的地址，可多个）。
 pub fn encode_relay_token(secret: &[u8; 32], endpoints: &[Endpoint]) -> Result<String, token::TokenError> {
@@ -211,6 +208,37 @@ pub fn all_private(addrs: &[String]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **rl1 字节锚（冻结向量；M5 代码门 M-10）**：设计 §11-S5t 的完成判据含「字节锚」——
+    /// `hmw2` 有（`fixtures/vectors/token_hmw2.json`），rl1 原先只有往返（两侧一起改
+    /// 就一起绿 ⇒ 锚不成立）。本用例把**整串**钉成常量：前缀 / body 布局 / 端点段序 /
+    /// base64 口径，任一处漂移即红。
+    ///
+    /// 冻结串的来源（可复现 + 已独立复核）：`secret = [0x44;32]`、
+    /// `endpoints = [203.0.113.9:41741（Direct）]`；body 布局 =
+    /// `peerId(32) ‖ secret(32) ‖ epCount(1) ‖ [type(1)+len(1)+addr(17)] ‖ crc(4)`：
+    /// 实测 body = **88 B**（32+32+1+19+4）⇒ base64url 无填充 = **118 字符**
+    /// （总长 = 3 + 118 = 121）。**跨版本冻结的证据**：M5 代码门用 `git show 4bf8ba1` 的
+    /// 旧编码算法独立重实现（Python）逐字节比对**相等**（见 `docs/reviews/M5.md` 代码门处置表）。
+    const RL1_FROZEN: &str = "rl1uzkUFcBeOdd8oXOB074_fQzV5TMuWleTEa2qCqYhBulERERERERERERERERERERERERERERERERERERERERERAEAETIwMy4wLjExMy45OjQxNzQxYzjtCQ";
+
+    #[test]
+    fn relay_token_bytes_are_frozen_anchor() {
+        let secret = [0x44u8; 32];
+        let eps = vec![Endpoint {
+            addr: "203.0.113.9:41741".to_owned(),
+            kind: EndpointKind::Direct,
+        }];
+        let tok = encode_relay_token(&secret, &eps).unwrap();
+        assert_eq!(tok, RL1_FROZEN, "rl1 字节锚漂移（布局/base64 口径/端点序/前缀）");
+        assert_eq!(tok.len(), 121, "长度锚：3（前缀）+ 118（88B body 的 b64url 无填充）");
+        // 解析面同样钉死（解码路径的 body 解析 + 字段还原）
+        let back = decode_relay_token(RL1_FROZEN).unwrap();
+        assert_eq!(back.secret.as_bytes(), &secret);
+        assert_eq!(relay_secret_id(&secret)[..], back.peer_id.as_bytes()[..]);
+        assert_eq!(back.endpoints.len(), 1);
+        assert_eq!(back.endpoints[0].addr, "203.0.113.9:41741");
+    }
 
     #[test]
     fn relay_token_roundtrip_and_id() {

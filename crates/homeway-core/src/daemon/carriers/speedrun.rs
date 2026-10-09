@@ -398,6 +398,13 @@ fn dial_speedtest(
     match (dial.dial_port)(host, SPEEDTEST_SERVICE_PORT, DIAL_BUDGET) {
         Ok(c) => Ok(c.speed),
         Err(DialErr::Refused) => Err(SpeedtestError::NotSupported),
+        // 无服务 tag（本档没有这条路）/ 额度满（Busy）：与 `Other(msg)` 同族——归因文案
+        // 由 `DialErr` 的 Display 给（`出口未提供该服务腿（端口 …）` /
+        // `出口服务并发额度已满（Busy）`），**不当 not_supported**（那会误导成「出口太旧」）。
+        Err(e @ (DialErr::NoService(_) | DialErr::Busy)) => Err(SpeedtestError::Bridge(
+            speedtest::REASON_LINK_DOWN,
+            format!("隧道拨号失败：{e}"),
+        )),
         Err(e @ (DialErr::NoSession | DialErr::NoHost)) => Err(SpeedtestError::Bridge(
             speedtest::REASON_LINK_DOWN,
             format!("链路未就绪（会话不在/重建窗口）：{e}"),

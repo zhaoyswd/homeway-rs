@@ -147,7 +147,7 @@ setup_client() { # 客户端统一进程（serve/relay 双关；恒定 binA）
 
 mint_and_add() { # 出口 token →（--en0 原样 / 缺省 loopback-only）→ host add
   local raw tok
-  raw=$("$binA" serve token --state "$EXIT_STATE" | grep -o 'hmw2[A-Za-z0-9+/=_-]*' | head -1)
+  raw=$("$binA" serve token --state "$EXIT_STATE" | grep -o 'hmw[0-9][A-Za-z0-9+/=_-]*' | head -1)
   [[ -n "$raw" ]] || { echo "!! 取不到出口 token（出口先起一轮）" >&2; exit 1; }
   if (( en0 )); then tok="$raw"; else tok=$("$binA" token "$raw" --loopback-only); fi
   "$binA" host add --state "$CLIENT_STATE" --name qi --force "$tok" >/dev/null 2>&1 \

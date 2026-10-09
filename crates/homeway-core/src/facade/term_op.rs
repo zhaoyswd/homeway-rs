@@ -117,6 +117,8 @@ fn term_dial(auth_hex: &str, sock: &str) -> Result<UnixStream, TermOpError> {
         //   改字反而与基础词表脱钩。**登记在案**（不入判据行；如需去端口 = 跨仓词表批）。
         return Err(TermOpError::new(
             code::TERM_FOREIGN,
+            // 措辞沿 Go 词表（**M5 起** 7724 只作「端口→tag」映射输入、出口不再监听该端口；
+            // 去端口 = 跨仓词表批，见 E 棒代码门 L-2 的登记）。
             format!("出口 7724 端口上不是终端服务（收到帧 0x{:02x}）", frame.op.0),
         ));
     }

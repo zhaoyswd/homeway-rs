@@ -38,7 +38,7 @@
 | E20 | `公网端点：已按 **--public-endpoint 配置**公布 %v（跳过 UPnP/STUN 推断；写进 %s）`（显式端点路径；同族另有 STUN/UPnP 推断各形态行 `publicendpoint.go:187-218`） | `internal/server/publicendpoint.go:129` | `公网端点：已按 **--public-endpoint 配置**公布 [127.0.0.1:42642]（跳过 UPnP/STUN 推断；写进 public_endpoint.txt）` |
 | E21 | `绑卡：自动挑到 %s（%s）` / `绑卡看护：网卡 %s 探针失败…` / `…连续探不通，重新挑卡` / `…QUIC 端口 socket 钉在 %s（%s）`（**M5 改**：末者原为「WG socket 钉在」——M5 后该 socket 是 QUIC 公共端口） | `internal/server/serve.go:263` / `internal/server/bindwatch.go:148` / `:152` / `:156` | `绑卡：自动挑到 en0（index=6 up addrs=[192.168.3.12/24]）`；重钉成功形态 `绑卡看护：QUIC 端口 socket 钉在 en0（index=6 up addrs=[192.168.3.12/24]）` |
 | E22 | `dns: q=%d qtcp=%d resp=%d filter=%d trunc=%d fallback=%d fail=%d drop=%d malformed=%d aaaa-mixed=%d fakeip=%d`（DNS 代答计数行，debug 级周期输出；与 E10 同族计数语义。**`fakeip=%d` = Q-J F3 追加**，见「判据变更记录」） | `pkg/dns/server.go:162`（`StatsLine`，判据行注记 `:159-161`） | **R1 已采**（2026-10-02，周期行）：`dns: q=0 qtcp=0 resp=1 filter=0 trunc=0 fallback=0 fail=0 drop=0 malformed=0 aaaa-mixed=0`（Q-J 前的历史形态，无 `fakeip=` 尾字段） |
-| E23 | `入站新源：%v（%s，%d 字节）`（源学习/漫游跟随证据，debug 级；**M5 值域收窄**：`shape ∈ {STUN应答, 参照点探测, 畸形腿帧, 腿帧type=3, 腿帧type=N, 畸形容器/未知消息容忍}`——WG 载荷/注册/控制/批量（kind=0/1/2/4）形态退役） | `pkg/servercore/bind.go:799` | **R1 已采**：`入站新源：192.168.3.12:54242（容器数据，222 字节）`；Rust 出口实采：`入站新源：192.168.3.12:62535（参照点探测，213 字节）` |
+| E23 | `入站新源：%v（%s，%d 字节）`（源学习/漫游跟随证据，debug 级；**M5 值域收窄**：`shape ∈ {STUN应答, 参照点探测, 畸形腿帧, 腿帧type=3, 腿帧type=N, 畸形容器/未知消息容忍, 非帧（首字节=0x..）, 非帧包}`——WG 载荷/注册/控制/批量（kind=0/1/2/4）形态退役。**后两形态 = E 棒代码门 M-8 补登**（`bind.rs` 的 `process_packet` 对「非腿帧包」按首字节打 `非帧（首字节=0x..）`／空包打 `非帧包`；`pubface.rs` 模块头同域——三处口径现已一致）） | `pkg/servercore/bind.go:799` | **R1 已采**：`入站新源：192.168.3.12:54242（容器数据，222 字节）`；Rust 出口实采：`入站新源：192.168.3.12:62535（参照点探测，213 字节）` |
 
 | E25 | `出口收线（连接数 %d → 0，用时 %v）`（**M5 新增**；A10 的出口侧收线时点证据行——出口停止时 QUIC 面收工块打一次） | 本仓新增（无 Go 对应；`crates/homeway-quic/src/exit/mod.rs` 收工块） | **实测**（`tools/quic-island-e2e.sh 1`，2026-10-10）：`出口收线（连接数 2 → 0，用时 43.042µs）`（脚本断言 `exit.close_line=1`，缺席即 rc=1） |
 | E-q6 | `出口 QUIC 面就绪（单承载；migration=%v，initial_mtu=%d）`（**M5 新增**；单承载语境的就绪行，打在 E-q1 之前一行） | 本仓新增（M1 additive 族延续；`crates/homeway-quic/src/exit/mod.rs`） | **实测**（本地出口 stdout.log，2026-10-10）：`出口 QUIC 面就绪（单承载；migration=true，initial_mtu=1400）` |
@@ -506,7 +506,7 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 | CA2 | forward 持久化：daemon 重启后 `forward list` 规则重建（listening、无 warn）+ 重启后往返复绿（暖机窗口外） |
 | CA3 | forward 负例：端口值域外/目标非 v4/跨族占用（`监听端口 42701 已被 exit1 的 forward 规则 占用（可用 --listen 另选）`——socks on 撞 forward 端口的现场诊断）；每主机 8 条上限；损坏 forwards.json → 备份 + 空表重建（单测） |
 | CA4 | socks 代理（IPv4 目标）：`socks 已开启：exit1 127.0.0.1:42702（域名经 exit1 出口远程解析，不在本机解析）`；`curl --socks5 127.0.0.1:42702 http://192.168.3.12:42783/f.txt` → `hello-socks-file`（请求过隧道） |
-| CA5 | socks 域名目标（远程解析腿）：`curl --socks5-hostname 127.0.0.1:42702 http://example.com/` → `HTTP 200`（DNS-over-TCP → 隧道 IP:5300 出口代答 → 应答候选按序拨）；出口 `dns: … qtcp=N` 计数增长 |
+| CA5 | socks 域名目标（远程解析腿）：`curl --socks5-hostname 127.0.0.1:42702 http://example.com/` → `HTTP 200`（DNS-over-TCP → 隧道 IP:5300 出口代答 → 应答候选按序拨）；出口 `dns: … qtcp=N` 计数增长。**⚠️ M5 降级（见「M5 批」④ + 「判据变更记录」2026-10-10 条）**：宿主会话（daemon `socks` carrier）**无 `STREAM[tag=6]`** ⇒ 域名目标拨 `:5300` 落 `出口未提供该服务腿（端口 5300 在 QUIC 档无 STREAM tag）`；**本行在 daemon 面不可验收**（能力未消失——带 L3 的客户端面经隧道到 `tunnel_ip:5300` 仍通；设计 §12-C-8 的「承接」待用户裁决） |
 | CA6 | socks 记忆：daemon 重启后 `socks on` 缺省沿用记忆端口（42702）；`socks off` → `socks 已关闭：exit1（在世连接已 RST 收口；端口 42702 记忆保留，下次 on 缺省沿用）` |
 | CA7 | speedtest 守护托管：`✓ exit1：↑38MB/s ↓18MB/s` + 精确值行 `down=19005150B/s（152.04Mbps，18.12MB/s） up=40119589B/s（320.96Mbps，38.26MB/s） 用量 ↓51.06MB ↑95.44MB 墙钟 5.4s`；过程提示（stderr）`▶ exit1（via=direct rtt=7ms，开跑时冻结）`/`下行中 17MB/s`；`--json` 逐主机对象（host/name/ok/downBps/upBps/usageDown/usageUp/wallMs/via/rttMs） |
 | CA8 | speedtest busy：同主机并发第二台 `✗ exit1：并发满员，稍后再试（busy）` rc=1；Ctrl-C：CLI `已按 Ctrl-C 终止轮转（当前主机已取消；未测的主机不再测量）` rc=1 → daemon 侧 busy ~1s 内解除（重试立即可开新轮） |
@@ -564,7 +564,11 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
   **退役为历史参照**，新向量 = **本仓自产** `fixtures/vectors/token_hmw2.json`（生成器 =
   `crates/homeway-core/tests/token_vectors.rs::bless_token_hmw2_vectors`，`#[ignore]`；常规用例断言
   「编码器 reproduces 入库字节 + 解析逐字段 + 哨兵码」）；④**中继 `rl1` wire 零变化**（rl1 body 冻结在
-  v1 布局：`token::encode_v1_body`/`parse_v1_body` = 冻结单源，`relay/**` 零改动）；⑤tier App 零代码（只透传）。
+  v1 布局：`token::encode_v1_body`/`parse_v1_body` = 冻结单源）；**红线记账的准确写法**（E 棒代码门 H-3 勘误：
+  原写「`relay/**` 零改动」与事实相反——`relay/rltoken.rs` 有 **+18/−13 行**的**调用面换源**：encode/decode
+  改走 `encode_v1_body`/`decode_v1_body` + 自带 base64 引擎，删一条恒不可达分支）：**`relay/**` 的实际改动面 =
+  `rltoken.rs` 一个文件的调用面**；`relaywire.rs` 与 `relay/` 其余文件**零改动**；**中继 wire 逐字节不变**
+  （代码门独立用旧算法重实现比对两形态 hex 相等）；⑤tier App 零代码（只透传）。
 - **【M5 批，2026-10-10】E1 的 `files/term/speedtest` 三字段口径注记**：三数（7802/7724/7803）**不是**出口侧
   监听端口——M5 后出口**不再**于隧道 IP 上监听这三端口（豁免面退役，见 L-3/L-4）。它们 = **客户端
   「端口 → STREAM tag」映射的输入**（`quic_stream::tag_for_port`），保留原值使映射可见；出口侧服务入口 =
@@ -887,6 +891,26 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 >    （非法值「记行 + 缺省」面同批删）；保留 `HOMEWAY_QUIC_MTU` / `tunConfig.quicMtuCap` /
 >    `serve.quic_listen`。M1 登记的「配置新键（additive，六个）」条目**部分作废**（六键里三条退役）。
 >
+> ④ **远程解析腿 / `dnstest` 退役登记（E 棒代码门 H-2 钉死实况）**：`dnstest` 动词**退役**（岛无 UDP
+>    socket 服务面；动词面无 dispatch、用法行除名）；**socks 域名目标（CA5）在宿主会话面不可用**——
+>    `tag_for_port(5300)` = `None` ⇒ `daemon/carriers::DialErr::NoService(5300)`，归因文案 =
+>    `出口未提供该服务腿（端口 5300 在 QUIC 档无 STREAM tag）`（**此前误报「连接被拒（对端 RST）」**，
+>    代码门 H-2 整改）；**无「本机解析」兜底**（上一版模块头注释「降级为本机解析」失实，已订正）。
+>    **E4 行文零改**（出口侧 `resolve=` 监听仍在、逐字同串）但其 `resolve=` 腿**在宿主会话面零消费者**
+>    ——入口集注记见「计数输入集/数值语义」表；**CA5 = 降级**（daemon/socks 面不可用；**带 L3 的
+>    客户端面（App TUN / `connect`）经隧道 TCP 到 `tunnel_ip:5300` 仍可达**——是「宿主会话面没有这条
+>    路」，不是出口能力消失）。
+>    **⚠️ 设计 §12-C-8 的「承接」选项（新增 `STREAM[tag=6]`）未做 = 待用户裁决项**（见 `docs/reviews/M5.md`
+>    的收口材料；若用户选「承接」，本条目随之作废并改回原判据面）。
+>
+> ⑤ **E10/E11 的证据改锚（Rust 客户端链路）**：`tools/matrix.sh` 对 **Rust 客户端**链路
+>    （`C=rust`）的 **E10** 判据从「出口 `intercept: tcp transit …（dialok）` 行」改为
+>    **客户端往返行**（`transit: 经隧道拨`——QUIC dial 腿 `STREAM[dial]` 不再经出口 intercept
+>    transit 面）；**E11** 从 PASS 降 **WARN**（QUIC dial 腿的收口行受出口 #17 节流
+>    〔首 3 + 每 100〕，独立证据 = M4 `quic-pf-e2e` 的流收口/泄漏判据）。**判据行本体零改**
+>    （E10/E11 的行文与语义未动）——改的是**验收证据的锚点**，故记在批量条目而非行级（E 棒代码门 M-7 指出）。
+>    **同批**：矩阵 `DNS` 行从 `PASS` 改 `SKIP`（未跑的检查不得记 PASS；`SKIP` 档语义 = 本轮形态不适用）。
+>
 > **ID 说明**：M1 的两族 additive 行按设计改 **`C20`/`C21`**（避与 M3 的 `C18`/`C19` 撞名）；
 > 新增 **`E-q6` / `E25` / `N-e`**（落登记前经真源词边界 grep 实测为空位；门断言见
 > `tools/check-wg-removed.sh` ⑩——**与设计 §7.1-⑩ 的差异**：设计写「新 ID 全表 grep = 0」是
@@ -894,8 +918,10 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 >
 > **计数输入集表 = M5 六行**（E22 / `udpNoReply`+`udpDrop`+`shapeDrop`+`txFragDrop` / C5+C6 岛赛跑 /
 > DC18 / `transport.localErr*` 两键恒缺席 / E10–E12+E23 的 WG 档限定语失效——见下节）。
-> **fixtures**：`vectors/token.json` 退役（L-12）+ `identity/psk/reg/endpointcache` 四件**尚未退役**
-> （见 L-8 的「到」列——本棒的处置与设计草案不同，理由同条）。
+> **fixtures**：`vectors/token.json` 退役（L-12）；`identity/psk/reg` 三件**保留原样**（生产消费者
+> 实在，见 L-8 的「到」列）+ **`vectors/endpointcache.json` 于 E 棒退役**（E 棒代码门 M-9：
+> 该件**零消费者**——L-8 原登记的「四件生产消费者仍在」对它不成立，已订正；处置 = 文件删 +
+> 生成器停产出 + `SHA256SUMS` 去行）。
 > **tier 触点（只出草案，不改 tier）**：`exit-transit-intercept` 的回环同端口豁免 MUST 退役 +
 > 健康判据换源（设计 §12-C-7，须用户点头）；`connection-lifecycle.md` 修订稿随本轮交付（M3 先例）。
 >
@@ -911,13 +937,15 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 | 同上 | **L-5 WG 档行族删除 + E23 值域收窄** | C4/C5/C6/**C11 全族**/C15（WG 串）/U1/U2（RELAY-UPGRADE/RARM）**删除**；E23 `入站新源：%v（%s，%d 字节）` 的 `shape` 含 WG 载荷/注册/控制/批量形态 | 消费者整体退役（`wgcore`/`wtransport`/`session/recover`/`server/bind` 的 WG 面）；**E23 例外**：`note_new_src` 的多数调用点非 WG（STUN 应答/参照点探测/畸形腿帧/腿帧 type=3）⇒ **行保留、只收窄值域** | → 删除面见批量条目①②；E23 新值域 = `{STUN应答, 参照点探测, 畸形腿帧, 腿帧type=3, 腿帧type=N, 畸形容器/未知消息容忍}`（退役 = kind=0/1/2/4）。影响面 = 排障脚本 / matrix / 历史 review 文档（不追改） |
 | 同上 | **L-6 `quic: ` 前缀批量删除** | `quic: <正文>` | 单一承载 ⇒ 前缀退化为噪声（设计 §4.4）；「剩下的前缀才是信息」（`intercept:`/`peer:`/`term:`/`serve:`） | → `<正文>`（**只删前缀 4 字符**，4 条已登记串例外见批量条目①）。影响面 = `crates/homeway-quic/src/**`（driver/client/exit/admit_close/tuning）、`facade/tun_exec.rs`、`server/{bind,engine,quic_admit}.rs`、`crates/homeway-core/tests/quic_*.rs`、`tools/quic-{island,wg}-e2e.sh`；**例外保留**：`tunStatusJSON` 的 `quic` **段名** |
 | 同上 | **L-7 承载三键退役** | `HOMEWAY_TRANSPORT`（env）/ `serve.quic`（出口 config 键 + `--quic` flag）/ `tunConfig.transport`（App 世代键） | 单一承载 = 死旋钮（设计 §4.2/§15-5「三个全删」）；保留 `HOMEWAY_QUIC_MTU` / `tunConfig.quicMtuCap` / `serve.quic_listen` | → 无（非法值「记行 + 缺省」面同批删）。影响面 = M1 登记条「配置新键（additive，六个）」**部分作废**；tier 侧停发 `transport`（**`TunConfigJson` 非 deny_unknown_fields ⇒ 不报错**，设计 §4.3 已核）；`[serve]` 是严格表 ⇒ 旧 config 含 `quic = false` **拒启**（升级须删该行——升级注意，已登记） |
-| 同上 | **L-8 fixtures 处置** | 设计草案：`identity/psk/reg/endpointcache` 四件退役 + `tunnel_addr` 缩样本 + `tun_status.jsonl` 重写 | 设计 §8.3 的预判；**实施期实测与草案不同**：这四件的**生产消费者仍在**（identity/psk → RPK seed 派生面、reg → `table` 邻域 codec、`tunnel_addr` → `table.rs`/`tun_exec` 生产用），`tun_status.jsonl` 的可达形态（阶段机向量）**不含** `bearer`/`quic` 段 ⇒ 无需重写 | → **本批实际 = 零件退役**（`token.json` 除外，见 L-12）：四件与 `tunnel_addr` 保留原样、`tun_status.jsonl` 零改。**与设计草案的偏离已登记**（草稿的退役理由=「消费者退役」，实测不成立；设计门 r22 B4 已提示「生产消费者与向量退役解耦」，本棒按实测保守处置） |
+| 同上 | **L-8 fixtures 处置** | 设计草案：`identity/psk/reg/endpointcache` 四件退役 + `tunnel_addr` 缩样本 + `tun_status.jsonl` 重写 | 设计 §8.3 的预判；**实施期实测与草案不同**：`identity/psk`/`reg` 三件的**生产消费者仍在**（identity/psk → RPK seed 派生面、reg → `table` 邻域 codec；`tunnel_addr` → `table.rs`/`tun_exec` 生产用），`tun_status.jsonl` 的可达形态（阶段机向量）**不含** `bearer`/`quic` 段 ⇒ 无需重写 | → **D 棒本批实际 = 零件退役**（`token.json` 见 L-12；`identity`/`psk`/`reg`/`tunnel_addr` 保留原样、`tun_status.jsonl` 零改）；**E 棒追加（代码门 M-9 订正）**：`endpointcache.json` **零消费者**（唯一引用 = `r2_vectors.rs` 的注释）⇒ **本批退役**（文件删 + `tools/vector-gen` 停产出 + `SHA256SUMS` 去行）——原登记的「四件生产消费者仍在」括注**对 `endpointcache` 不成立，已订正**（设计门 r22 B4 的「生产消费者与向量退役解耦」原则方向不变） |
 | 同上 | **L-9（M5 B 棒 Q2）中继 listen 地址族** | `中继就绪：127.0.0.1:42781（…）` / `0.0.0.0:…`（单栈 v4 形态） | Go 双栈对齐（设计 §6-Q2 显式立条；`listen_with_fallback` 改走 `udpbatch::bind_dual_stack`） | → `中继就绪：[::]:42781（…）`（双栈形态；v4 映射地址仍可连）。影响面 = `R1` 行、`tools/local-rust-relay.sh` 断言、`relay_cli.rs` 用例 |
 | 同上 | **L-10（M5 B 棒 Q3/Q4/Q5）新增告警行 + 一处致命→非致命** | `listen_port.txt` 写失败 = 致命（`?`）；`public_endpoint.txt` 两处写失败**静默**（`let _ =`） | Go 对齐（Q3/Q4 显式立条：Go 侧三处皆非致命 + 告警） | → 三处均**非致命 + 告警行（additive）**：`⚠️ 公网端点写盘失败（{path}）：{e}` ×2 / `⚠️ 监听端口落盘失败（{path}）：{e}——服务照常就绪`；既有成功行文逐字不变。另 Q5：`--public-endpoint` 每段值域校验（非法 ⇒ exit 2）。影响面 = 出口启停语义、E20 族（additive 告警） |
 | 同上 | **L-11 新增行 `N-e` / `E-q6` / `E25`** | 无 → 有 | 单承载语料补全（N-e = 唯一的窄路径旋钮生效值；E-q6 = 无「回落」语境的就绪行）+ A10（M3 交下的出口侧收线时点） | → `N-e` `内层 MTU 上限 %d（来源=%s）`（世代装配一次；`tun_exec.rs`）；`E-q6` `出口 QUIC 面就绪（单承载；migration=%v，initial_mtu=%d）`（`exit/mod.rs`，E-q1 前一行）；`E25` `出口收线（连接数 %d → 0，用时 %v）`（QUIC 面收工块）。影响面 = 出口/客户端排障读者；`tools/quic-island-e2e.sh` 的 A10 断言（E25 缺席即 rc=1）；**ID 空位复核 = S5 的门断言（§7.1-⑩ 口径）** |
 | 同上 | **L-12 token 格式换代：`hmw1` → `hmw2` 段容器**（M2 候选 B；主会话裁决 §15-3「本期做」） | `hmw1` ‖ base64url( peerId(32) ‖ secret(32) ‖ epCount(1) ‖ [type+len+addr]* ‖ [rpk(32)]? ‖ crc(4) )（定长顺序布局 + 按尾长猜字段） | 趁「无兼容包袱」窗口把「按长度猜字段」换成**自描述段容器**（`segCount` + `[segType+len(2BE)+body]*`，critical 位 = 高位置 1；不认识 critical ⇒ 整串拒、info ⇒ 跳过）；M3+ 加字段不再改布局（M2 设计 §4.2/§4.4） | → `hmw2` ‖ base64url( segCount(1) ‖ [segType(1) ‖ len(2 BE) ‖ body]* ‖ crc(4) )；段 = `peerId`/`secret`/`epList`/`rpk(info)`；**字段与字节含义零变化**（`epList` 段体沿用 `epCount‖[type+len+addr]*`，type 2=QUIC 照旧）；**存量 `hmw1` token 一律失效**（明确版本拒 + 可行动文案）。影响面 = `token.rs`（encode/decode/parse_body/新 `encode_v1_body`/`parse_v1_body`）、`serve token` 渲染面**行文零改**、`tools/**` 的抽取正则（`hmw1`→`hmw2`，10+ 脚本）、CLI 用法文案、`crates/homeway-core/tests/token_vectors.rs`（改自产）、`fixtures/vectors/token_hmw2.json`（新）+ `token.json`（退役）；**中继 wire 零变化**（`rl1` body 冻结在 v1 布局：`rl1` 自带前缀 + `encode_v1_body` 单源，`relay/**` 零改动）；**tier App 零代码**（只透传） |
 | 同上 | **L-13 E21 的「WG socket」措辞** | `绑卡看护：WG socket 钉在 %s（%s）` | M5 后该 socket 是 **QUIC 公共端口**（唯一 UDP 面）；措辞失真 = 排障误导 | → `绑卡看护：QUIC 端口 socket 钉在 %s（%s）`。影响面 = `bindwatch.rs`（行 + 3 处单测断言）、E21 行读者；**同族其余行（探针失败/连续探不通/重钉失败/指纹变化）逐字不变** |
 | 同上 | **L-14 X1 族删一条：中继 hint 盲打行** | `中继：收到对端地址线索 %v → 盲打 3 包（开自己 NAT 过滤；能否直连仍由 WG 握手决定）`（X1 七条之一） | hint 的消费者 = WG 打洞（`bind.set_on_hint` 删于 S3b）⇒ 本面自那时起**零构造点** = 不可达代码；单承载下「中继 → 直连升级」由岛的迁移/重赛跑承接（G8 登记） | → **删除**（`LegEvent::Hint`/`parse_hint_addr`/`PUNCH_*`/`run_punch_worker` 同批删）。影响面 = X1 行族（7 → 6 条）、`server/relayleg.rs`（净 −98 行）、中继排障读者；**X1 其余六条 + `relay/**` 零改动**（红线守住） |
+| 2026-10-10（M5 E 棒代码门 H-2 整改） | **CA5 降级 + `dnstest` 退役（G6/G7 实况钉死）** | CA5：`curl --socks5-hostname … → HTTP 200`（DNS-over-TCP 经隧道 IP `:5300` 出口代答）→ **宿主会话面退役**：`tag_for_port(5300)` = `None` ⇒ `daemon/carriers::DialErr::NoService(5300)`，文案 = `出口未提供该服务腿（端口 5300 在 QUIC 档无 STREAM tag）`（此前误报「连接被拒（对端 RST）」）；**E4 行文零改**（出口侧 `resolve=` 监听仍在）但其 `resolve=` 腿在宿主会话面零消费者；`dnstest` 动词退役（无 dispatch + 用法行除名） | 设计 §2.6-G7 的「承接」选项（新增 `STREAM[tag=6]`）**未做**（§12-C-8 待用户裁决 ⇒ 实现按「退役」执行，见「M5 批」④）；代码门 H-2 指出三处不一致：模块头注释「降级为本机解析」**失实**、判据真源零改动、失败归因误导 | `docs/INTEROP-CRITERIA.md` CA5（E4 加注）、`crates/homeway-core/src/facade/host_session.rs`（模块头订正）、`crates/homeway-core/src/daemon/{mod.rs,carriers/mod.rs,carriers/speedrun.rs}`（`DialErr::NoService`/`Busy` + 归因分工）、`crates/homeway-cli/src/unified_cli.rs`（用法行）；**验收含义**：daemon `socks` 的域名目标**不再作为验收项**（IP 目标 CA4 不受影响）；**若用户裁「承接」⇒ 本条作废并恢复原 CA5 判据面** |
+| 2026-10-10（M5 E 棒代码门 M-7 整改） | **E10/E11 的验收证据锚（矩阵 Rust 客户端链路）+ 矩阵 `DNS` 档位** | E10 证据：出口 `intercept: tcp transit …（dialok）` → **客户端往返行**（`transit: 经隧道拨`）；E11：`PASS` → `WARN`（收口行受出口 #17 节流，独立证据 = M4 `quic-pf-e2e`）；矩阵 `DNS`：`PASS` → `SKIP` | M5 S4 的 intercept 收窄（豁免面退役 + QUIC dial 腿不再走出口 intercept transit）+ 出口服务流行节流 ⇒ 原证据锚**不再产出**；**Rust 客户端链路**适用；**Go 客户端链路（L1）证据锚不变**（仍按出口 transit 行） | `tools/matrix.sh`（`base_segment` 的 E10/E11 分支 + DNS 行）、`docs/reviews/M5.md`（矩阵读数）；**判据行 E10/E11/DNS 本体零改**（只改验收证据的取行位置） |
 
 ### 计数输入集 / 数值语义变化（**行文不变**，登记留痕）
 
