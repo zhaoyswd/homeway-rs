@@ -776,7 +776,9 @@ mod tests {
         assert_ne!(a.as_bytes(), b.as_bytes(), "两次生成不得相同（防常量/零填充实现）");
         assert_eq!(format!("{a:?}"), "Nonce(…)");
         assert!(a.ct_eq(&a));
-        assert!(!a.ct_eq(&Nonce::from_bytes([0u8; NONCE_LEN])) || a.as_bytes() == &[0u8; NONCE_LEN]);
+        // 与零填充**必不相等**（代码门 r15 的 G13：原写法 `!ct_eq(zero) || a == zero` 是恒真式）
+        assert_ne!(a.as_bytes(), &[0u8; NONCE_LEN], "生成值不得为零填充");
+        assert!(!a.ct_eq(&Nonce::from_bytes([0u8; NONCE_LEN])));
     }
 
     /// `Reg4Frame` 的两支都走各自的域（类型化分派不串域）。

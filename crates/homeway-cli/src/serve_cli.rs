@@ -109,7 +109,7 @@ pub(crate) struct FileQuicAdmit {
     /// Retry token 有效期（`1s..=60s`；缺省 `5s`——收自 quinn 缺省 15s，M2 §3.1 登记）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) retry_token_lifetime: Option<String>,
-    /// 每源滑动窗上限（`1..=1000`；缺省 `10`）。
+    /// 每源滑动窗上限（`1..=1000`；缺省 **16**——M2 §14-1 裁决 `10 → 16`，真源 = `admit.rs`）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) per_src_fails: Option<u32>,
     /// 每源滑动窗窗长（`1s..=1h`；缺省 `10s`）。

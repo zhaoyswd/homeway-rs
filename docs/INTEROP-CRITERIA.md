@@ -640,7 +640,8 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 > `--public-endpoint=`/`--bind-interface=` 空值形态**不在** carve-out（前者 Go 同拒、后者登记为已知识别差异）。
 > **其下十四行 = 2026-10-09 M2（WG → QUIC 传输层换代程序 **M2 身份、设备表与准入**，S1–S4）落地登记**：
 > ①准入协议版本（`hr-reg3` → `hr-reg4` 四帧；安全面 + 线协议面）②岛侧准入行改写 + 新增
-> ③出口侧准入/抗放大行族（九串 additive；含启动两行与 env 两行）④`why` 归因集扩展（十六串）
+> ③出口侧准入/抗放大行族（九串 additive；含启动两行与 env 两行）④`why` 归因集扩展（**十七串**
+> ——2026-10-09 S6 代码门 r15 的 G9③ 计数订正：原写「十六串」，逐串核对实为 17 条，行文与取值集不变）
 > ⑤`ExitQuicSnapshot`/`quic` JSON 新增字段（含 S2-5 的 `send_buffer_used`）⑥引擎侧协议版本串（r14 F4）
 > ⑦E-q2 频率/输入集（r14 F11）⑧E-q3 明细 `src=%v` ⑨`serve.quic_admit` 七键 + env
 > ⑩token 未变更留痕（设计 §13-1① 取候选 A）⑪E6/E7/E18 保留原串（零差异登记；E8/E9 的差异走计数输入集条）

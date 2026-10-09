@@ -330,6 +330,24 @@ HOMEWAY_QUIC_MTU=1200 HOMEWAY_TRANSPORT=quic "$AB" run --token "$TOKEN" --transp
   grep -E "窄路径不可用|quic: 丢弃|quic=\{|路径变更" "$RES/narrow-seam.log" | head -8
 } | tee "$RES/narrow-path.txt"
 
+# **S5-5 的断言形态**（代码门 r15 的 G4 整改：原为纯打印，判据要求「行 + 计数可见」是**断言**）
+# 判定式（缺任一即 rc=1——三条臂互为对照，防「只看 (c) 的 grep 恰好命中注释」）：
+#   (a) 合法下限 1320 ⇒ mds=1282（`"mtu":1282`）且**无**「窄路径不可用」；
+#   (b) 越界 1200 ⇒ 回落缺省（`"mtu":1362`）且**无**「窄路径不可用」；
+#   (c) 岛缝 1200 ⇒ **有**「窄路径不可用」+ `超限=` 计数 ≥1（丢 + 计数不静默）。
+NARROW_A_OK=0; NARROW_B_OK=0; NARROW_C_OK=0
+grep -q '"mtu":1282' "$RES/narrow-env1320.log" && ! grep -q '窄路径不可用' "$RES/narrow-env1320.log" && NARROW_A_OK=1
+grep -q '"mtu":1362' "$RES/narrow-env1200.log" && ! grep -q '窄路径不可用' "$RES/narrow-env1200.log" && NARROW_B_OK=1
+grep -q '窄路径不可用' "$RES/narrow-seam.log" && grep -qE 'quic: 丢弃 超限=[1-9]' "$RES/narrow-seam.log" && NARROW_C_OK=1
+{
+  echo "S5-5 断言（(a) 合法下限正对照 / (b) 越界回落 / (c) 岛缝窄路径行+超限计数）："
+  printf '  (a)=%s (b)=%s (c)=%s（1=命中，缺任一 ⇒ rc=1）\n' "$NARROW_A_OK" "$NARROW_B_OK" "$NARROW_C_OK"
+} | tee -a "$RES/narrow-path.txt"
+if (( NARROW_A_OK == 0 || NARROW_B_OK == 0 || NARROW_C_OK == 0 )); then
+  echo "!! S5-5 窄路径断言未全过（(a)=$NARROW_A_OK (b)=$NARROW_B_OK (c)=$NARROW_C_OK）——见 $RES/narrow-path.txt" >&2
+  rc=1
+fi
+
 # ---------- I) 产品形态单连接内存（M1 S5-4/E 段的同口径复测；M2 §8 点名） ----------
 # 方法照 M1：同一枚 m1-ab（= ClientCore 世代）跑 wg|quic，运行期 `vmmap` 8 次取下中位；
 # wg 档不构造岛（地板），两档之差 = **岛边际**（判据 §9.1-3 修订：≤+320K；M1 未过）。

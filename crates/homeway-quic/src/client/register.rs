@@ -13,9 +13,9 @@
 //! **在本连接上现算**并混进 MAC ⇒ 同帧换连接（重放）验不过。故 exporter 取一次、随连接
 //! 存活复用（它是连接级不变量）。
 //!
-//! **本切片的边界（S1）**：这里是「与新出口同协议」所需的最小实现——准入等待**没有**
-//! 岛内期限（照 M1 现状：唯一外层界是宿主 RPC 超时）。准入预算（`max(剩余, ADMIT_MIN)`）
-//! 与显式关连接 = S2-3 的范围。
+//! **准入期限（S2-3 落地后的现状；代码门 r15 的 G11 订正）**：本函数只负责帧序，
+//! **期限在调用侧**——`race::within(admit_budget(…))` 包住整段准入，失败/到点时
+//! `close_on_failed_admission` 显式关连接（预算 = `max(剩余, ADMIT_MIN=2s)`）。
 
 use std::net::SocketAddrV4;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
