@@ -25,7 +25,7 @@ use std::any::Any;
 use std::io;
 use std::net::SocketAddrV4;
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -103,6 +103,9 @@ struct IslandCtx {
     /// **服务流面计数**（M3 S1：写者/读任务在岛线程外加，快照装配读；同一枚 `Arc`
     /// 同时交给 `Streams` 与 `Island`）。
     stream_stats: Arc<StreamStats>,
+    /// **快探成功计数**（M3 S4；原子直读——判据/e2e 的「首个回显成功」观测位不该等
+    /// 拍内务的快照同步，口径同 `packets_out`）。
+    ladder_probe_ok: Arc<AtomicU64>,
 }
 
 impl IslandCtx {
@@ -133,6 +136,8 @@ pub struct Island {
     streams: StreamLimits,
     /// **已解决的快探参数**（同上；S4 消费）。
     probe: ProbeTuning,
+    /// 快探成功计数（原子直读口；岛线程写、同步面读）。
+    ladder_probe_ok: Arc<AtomicU64>,
 }
 
 impl Island {
@@ -199,6 +204,7 @@ impl Island {
         let exit = Arc::new(ExitSignal::new());
         let counters = TunCounters::new();
         let stream_stats = Arc::new(StreamStats::default());
+        let ladder_probe_ok = Arc::new(AtomicU64::new(0));
         let patrol = cfg.patrol;
 
         let ctx = IslandCtx {
@@ -210,6 +216,7 @@ impl Island {
             on_event: Arc::new(Mutex::new(None)),
             counters: Arc::clone(&counters),
             stream_stats: Arc::clone(&stream_stats),
+            ladder_probe_ok: Arc::clone(&ladder_probe_ok),
         };
         let tier_tx = IslandTx(tx.clone()); // 岛线程侧的命令口（TUN 线程也各持一份）
         let handle = thread::Builder::new()
@@ -242,6 +249,7 @@ impl Island {
             on_unhealthy,
             streams: resolved_streams,
             probe: resolved_probe,
+            ladder_probe_ok,
         })
     }
 
@@ -257,6 +265,8 @@ impl Island {
     pub fn snapshot(&self) -> IslandSnapshot {
         let mut s = lock_unpoison(&self.snapshot).clone();
         s.packets_out = self.counters.write_pkts();
+        // M3 S4：快探成功计数原子直读（判据面「首个回显成功」不等拍内务同步）
+        s.ladder_probe_ok = self.ladder_probe_ok.load(Ordering::Relaxed);
         s
     }
 
@@ -509,6 +519,10 @@ struct DriverState {
     ladder: Ladder,
     /// M 动作的记账（确认探活的结论要落 N-b 行/置 `migration_unconfirmed`）。
     rebind: Option<RebindNote>,
+    /// **阶梯 R 动作的候选**（§3.1：R = 新连接「**同端点**、同本地 socket」）——
+    /// 采纳连接时按胜者的 `ep`/`via` 钉住（`Cmd::Connect` 的候选列表**不**进本槽：
+    /// 赛跑候选面与「现任端点」是两件事，R 只保现任）。
+    ladder_cand: Option<Candidate>,
     /// 「连接已断」行去重位（连接死是持续态；阶梯在动作，日志不该每拍一行）。
     dead_logged: bool,
 }
@@ -570,6 +584,7 @@ fn run_driver(
             probe: probe_tuning,
             ladder: Ladder::new(probe_tuning),
             rebind: None,
+            ladder_cand: None,
             dead_logged: false,
         };
         let mut jobs: JoinSet<Job> = JoinSet::new();
@@ -620,6 +635,9 @@ fn run_driver(
                             let ok = result.is_ok();
                             let send = send_face(&face, st.ladder.tuning().send_err_fresh);
                             let step = st.ladder.on_round(round, result, now, send, &ctx.logf);
+                            // 探活成功计数**就地**发布（回显时刻即观测时刻；快照面原子直读）
+                            ctx.ladder_probe_ok
+                                .store(st.ladder.probe_ok, Ordering::Relaxed);
                             // M 的确认探活（N-b 行族：行文不变，窗口收窄到 ≤1 快探预算）
                             if round == Round::Confirm && ok {
                                 if let Some(note) = st.rebind.take() {
@@ -715,6 +733,11 @@ fn adopt(
     if let Via::Relay { label } = est.via {
         face.relays().pin(est.ep, label);
     }
+    // M3 S4：现任端点钉住（§3.1 的 R = 同端点重连）
+    st.ladder_cand = Some(Candidate {
+        addr: est.ep,
+        via: est.via,
+    });
     let adopted = Live::new(est, patrol);
     // M3 S4：新连接 = 新失败链 ⇒ 阶梯重新武装（B 之后休眠的阶梯在此复活）
     st.ladder.rearm();
@@ -1297,9 +1320,14 @@ fn ladder_step(
                     lock_unpoison(&ctx.snapshot).migration_unconfirmed = true;
                     st.watch = None;
                 }
-                let list = st.cands.clone();
+                // R 的候选 = **现任端点**（§3.1「同端点、同本地 socket」）；无现任
+                // （理论窗口：未采纳过连接）⇒ 回落「最近一次 SetCandidates」清单。
+                let list: Vec<Candidate> = match st.ladder_cand {
+                    Some(c) => vec![c],
+                    None => st.cands.clone(),
+                };
                 if list.is_empty() {
-                    // 无候选可拨（未 SetCandidates）：按 R 失败回灌 ⇒ B 门照走（不静默）
+                    // 无候选可拨（未采纳过连接且未 SetCandidates）：按 R 失败回灌 ⇒ B 门照走
                     step = st.ladder.on_reconnect_result(
                         false,
                         "无候选可拨".to_owned(),

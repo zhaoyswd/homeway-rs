@@ -398,22 +398,25 @@ impl Ladder {
     }
 
     /// M（Rebind）的结论回灌（宿主执行完 `Face::rebind` 后调）。
+    ///
+    /// ⚠️ 成败两分支的记账差别：**成功 ⇒ 保留 `pending`**（确认探活要认领它，从而分辨
+    /// 「迁移已确认 / 未确认」）；失败 ⇒ 转 R（`pending` 换手）。
     pub(crate) fn on_migrate_result(&mut self, ok: bool, at: TokioInstant, logf: &Logf) -> Step {
-        let (why, _) = match self.pending.take() {
-            Some(Pending { why, at, .. }) => (why, at),
-            None => ("（无在途动作）".to_owned(), at),
-        };
         if ok {
             self.inflight = true; // 确认探活在途（禁止并发起新轮）
-            Step::Probe {
+            return Step::Probe {
                 round: Round::Confirm,
                 budget: self.tun.fast_budget,
-            }
-        } else {
-            (*logf)("quic: 换本地 socket 失败 —— 转 R（新 QUIC 连接）");
-            self.next_action = Action::Reconnect;
-            self.go_action(Action::Reconnect, format!("{why}（换绑失败）"), false, at, logf)
+            };
         }
+        let why = self
+            .pending
+            .take()
+            .map(|p| p.why)
+            .unwrap_or_else(|| "（无在途动作）".to_owned());
+        (*logf)("quic: 换本地 socket 失败 —— 转 R（新 QUIC 连接）");
+        self.next_action = Action::Reconnect;
+        self.go_action(Action::Reconnect, format!("{why}（换绑失败）"), false, at, logf)
     }
 
     /// R（新连接）的结论回灌（宿主起完连接任务后调）。
@@ -802,6 +805,56 @@ mod tests {
         l.rearm();
         assert!(l.due(t0 + Duration::from_secs(3), true).is_some(), "重装后恢复节拍");
         assert_eq!(l.fail_streak(), 0);
+    }
+
+    /// **判据（C18 行族逐字，§8.2-10；S7 登记的行文以本用例为准）**：六条行文一条不少；
+    /// 且**替代关系**成立（§3.4：QUIC 档不产生 C11 族行——本模块零 `RECOVER`）。
+    #[test]
+    fn c18_line_family_texts_are_pinned_and_replaces_c11() {
+        let (logf, log) = lines();
+        let mut l = Ladder::new(tuning());
+        let t0 = TokioInstant::now();
+        // ① 失败（复探失败定音）
+        l.note_round(Round::First, t0);
+        let _ = l.on_round(Round::First, failed(), t0, SendFace::default(), &logf);
+        l.note_round(Round::Reprobe, t0);
+        let s = l.on_round(Round::Reprobe, failed(), t0, SendFace::default(), &logf);
+        assert!(matches!(s, Step::Reconnect { .. }));
+        // ② 抖动（另一条链：首探失败 + 复探成功）
+        let mut l2 = Ladder::new(tuning());
+        l2.note_round(Round::First, t0);
+        let _ = l2.on_round(Round::First, failed(), t0, SendFace::default(), &logf);
+        l2.note_round(Round::Reprobe, t0);
+        let _ = l2.on_round(Round::Reprobe, ok(), t0, SendFace::default(), &logf);
+        // ③ 重连完成（R 起跑 → 确认探活通过）
+        l2.note_round(Round::Confirm, t0);
+        let _ = l2.on_reconnect_result(true, "探活无回显".to_owned(), t0, &logf);
+        l2.note_round(Round::Confirm, t0);
+        let _ = l2.on_round(Round::Confirm, ok(), t0, SendFace::default(), &logf);
+        // ④ 重连失败（第 1 次）+ ⑤ 世代重建（把窗基准前推以开门）
+        let _ = l2.on_reconnect_result(false, "对端不可达".to_owned(), t0, &logf);
+        l2.r_fail_since = Some(t0 - Duration::from_secs(11));
+        let _ = l2.on_reconnect_result(false, "对端不可达".to_owned(), t0, &logf);
+
+        let logged = log.lock().unwrap();
+        let want = [
+            "quic: 链路快探失败（连续 1，原因=探活无回显）",
+            "quic: 链路探活抖动（探活无回显，已复探）",
+            "quic: 链路重连中（原因=探活无回显，第 1 次）",
+            "quic: 链路重连完成（原因=探活无回显，",
+            "quic: 链路重连失败（原因=对端不可达，第 1 次）—— 交世代重建",
+            "quic: 世代重建（原因=对端不可达；连续重连失败 ",
+        ];
+        for w in want {
+            assert!(
+                logged.iter().any(|l| l.starts_with(w)),
+                "C18 行文缺：{w}\n实得：{logged:?}"
+            );
+        }
+        assert!(
+            logged.iter().all(|l| !l.contains("RECOVER")),
+            "QUIC 档不得产生 C11 族行（§3.4 的替代关系）：{logged:?}"
+        );
     }
 
     /// **判据（`start_paused` 虚拟时钟，S4 完成判据点名的「预算/节拍/复探/抖动」四分支）**：
