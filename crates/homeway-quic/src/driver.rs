@@ -23,6 +23,7 @@
 
 use std::any::Any;
 use std::io;
+use std::net::SocketAddrV4;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -32,8 +33,10 @@ use std::time::{Duration, Instant};
 use tokio::runtime::Runtime;
 use tokio::sync::mpsc::{self as tmpsc, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinSet;
+use tokio::time::Instant as TokioInstant;
 
 use crate::client::dataplane::{self, DropNote};
+use crate::client::ladder::{self, Ladder, Round, SendFace, Step as LadderStep};
 use crate::client::streams::{self, StreamStats, Streams};
 use crate::client::{self, Face, Live, MigrationEvent, Watch};
 use crate::cmd::{
@@ -170,14 +173,16 @@ impl Island {
         ));
         let pt = cfg.probe;
         (*logf)(&format!(
-            "quic: 快探参数（首探 {:?}，复探 ×{}，待机 {:?}，抖动阈值 {}，B 门 连续 {}/窗 {:?}，发送面新鲜度窗 {:?}；env 覆盖 {n_probe} 项）",
+            "quic: 快探参数（首探 {:?}，拍间 {:?}，复探 ×{}，待机 {:?}，抖动阈值 {}，B 门 连续 {}/窗 {:?}，发送面新鲜度窗 {:?}，在用窗 {:?}；env 覆盖 {n_probe} 项）",
             pt.fast_budget,
+            pt.fast_gap,
             pt.reprobe_factor,
             pt.idle_interval,
             pt.jitter_streak,
             pt.reconnect_streak,
             pt.rebuild_window,
-            pt.send_err_fresh
+            pt.send_err_fresh,
+            pt.in_use_fresh
         ));
         let resolved_streams = cfg.streams;
         let resolved_probe = cfg.probe;
@@ -440,6 +445,16 @@ enum Job {
         reply: crate::cmd::IslandReply<Duration>,
         result: Result<Duration, IslandErr>,
     },
+    /// **快探阶梯**的一轮探活（M3 §3.1/§3.2；同刻只许一轮在途——单飞在阶梯里）。
+    FastProbe {
+        round: Round,
+        result: Result<Duration, IslandErr>,
+    },
+    /// **快探阶梯的 R 动作**（§3.1：新 QUIC 连接 + 四帧准入；`Ok` = 已采纳的连接）。
+    LadderConnect {
+        why: String,
+        result: Result<client::Established, IslandErr>,
+    },
     /// 回程泵（常驻任务：DATAGRAM → 有界队列 → TUN 写线程；`Ok(())` = 连接结束/收工）。
     /// 参数 = 该泵所属连接的 `stable_id()`（复位防重位时按身份比对，见 `pump_conn`）。
     Return(usize),
@@ -490,6 +505,19 @@ struct DriverState {
     streams: Arc<Streams>,
     /// 已解决的快探参数（读快照/发送面新鲜度窗用；S4 的阶梯消费同一份）。
     probe: ProbeTuning,
+    /// **快探阶梯**（M3 S4 §3.1/§3.2）：快探 → 复探 → M/R → B 的状态机（唯一动作判定面）。
+    ladder: Ladder,
+    /// M 动作的记账（确认探活的结论要落 N-b 行/置 `migration_unconfirmed`）。
+    rebind: Option<RebindNote>,
+    /// 「连接已断」行去重位（连接死是持续态；阶梯在动作，日志不该每拍一行）。
+    dead_logged: bool,
+}
+
+/// M（换本地 socket）动作的记账（§3.1 的 `from → to` 与确认探活的耗时）。
+struct RebindNote {
+    from: SocketAddrV4,
+    to: SocketAddrV4,
+    at: TokioInstant,
 }
 
 /// 驱动循环：命令 / 长任务回口 / 巡检拍**三源** `select!`（M1 设计 §2.1 的驱动循环形态）。
@@ -540,6 +568,9 @@ fn run_driver(
                 Arc::clone(&ctx.on_event),
             )),
             probe: probe_tuning,
+            ladder: Ladder::new(probe_tuning),
+            rebind: None,
+            dead_logged: false,
         };
         let mut jobs: JoinSet<Job> = JoinSet::new();
         loop {
@@ -583,6 +614,43 @@ fn run_driver(
                         Ok(Job::Probe { reply, result }) => {
                             let _ = reply.send(result);
                         }
+                        // ---- M3 S4：快探阶梯的回口（§3.1 的动作顺序在此闭环）----
+                        Ok(Job::FastProbe { round, result }) => {
+                            let now = TokioInstant::now();
+                            let ok = result.is_ok();
+                            let send = send_face(&face, st.ladder.tuning().send_err_fresh);
+                            let step = st.ladder.on_round(round, result, now, send, &ctx.logf);
+                            // M 的确认探活（N-b 行族：行文不变，窗口收窄到 ≤1 快探预算）
+                            if round == Round::Confirm && ok {
+                                if let Some(note) = st.rebind.take() {
+                                    (*ctx.logf)(&format!(
+                                        "quic: 迁移完成（{} → {}，耗时 {}）",
+                                        note.from,
+                                        note.to,
+                                        client::fmt_dur(now.saturating_duration_since(note.at))
+                                    ));
+                                    lock_unpoison(&ctx.snapshot).migrations += 1;
+                                    lock_unpoison(&ctx.snapshot).migration_unconfirmed = false;
+                                }
+                            }
+                            ladder_step(&mut st, ctx, &mut face, &mut jobs, step);
+                        }
+                        Ok(Job::LadderConnect { why, result }) => {
+                            let now = TokioInstant::now();
+                            let step = match result {
+                                Ok(est) => {
+                                    adopt(&mut st, ctx, &face, est, &mut jobs);
+                                    st.ladder.on_reconnect_result(true, why, now, &ctx.logf)
+                                }
+                                Err(e) => st.ladder.on_reconnect_result(
+                                    false,
+                                    format!("{why}（{e}）"),
+                                    now,
+                                    &ctx.logf,
+                                ),
+                            };
+                            ladder_step(&mut st, ctx, &mut face, &mut jobs, step);
+                        }
                         // 回程泵结束（连接死/隧道面收工）：连接死面由 housekeeping 统一处置。
                         // **只有"现任连接"的那枚泵**才复位防重位——被替换连接的老泵退出时
                         // 若一并复位，会误判"无泵"（代码门 r13 的 M1）。
@@ -601,7 +669,7 @@ fn run_driver(
                 }
                 () = tokio::time::sleep(TICK) => {}
             }
-            housekeeping(&mut st, &face, ctx, seam).await;
+            housekeeping(&mut st, &mut face, ctx, &mut jobs, seam).await;
         }
         // 收工：长任务全 abort（JoinSet drop）→ 连接面/端点随 face drop 关闭
         drop(jobs);
@@ -648,6 +716,10 @@ fn adopt(
         face.relays().pin(est.ep, label);
     }
     let adopted = Live::new(est, patrol);
+    // M3 S4：新连接 = 新失败链 ⇒ 阶梯重新武装（B 之后休眠的阶梯在此复活）
+    st.ladder.rearm();
+    st.rebind = None;
+    st.dead_logged = false;
     if let Some(old) = st.live.replace(adopted) {
         // 换连接 = 旧连接上的**服务流全部作废**（读回 EOF/写快速失败，§1.6 的 EOF 同形性）；
         // 不清就会留下「挂在死连接上的在册流」——`files` 那一侧会一直等不到回显。
@@ -695,21 +767,26 @@ fn check_narrow_path(st: &mut DriverState, ctx: &IslandCtx) {
     ));
 }
 
-/// 拍内务（无命令时每 [`TICK`] 一次）：连接死 → 刷新 → 迁移保持检测 → 快照同步。
+/// 拍内务（无命令时每 [`TICK`] 一次）：连接死 → 阶梯 → 刷新 → 迁移保持检测 → 快照同步。
 ///
-/// **巡检接线（设计 §2.5，S2-6 的判据面）**：
-/// - QUIC 连接死（`Connection::closed()` 的可观测等价面 = `close_reason()` 非空）⇒
-///   **即时**归既有分类 `patrol`（`mark_unhealthy_if_current(gen,"patrol")` 的岛侧落点）；
-///   「即时」而非「等下一拍探活 3 连败」的理由：岛内没有恢复阶梯（阶梯在世代层，
-///   M1 不动），连接死是**确定性**判据、不是抖动 ⇒ 让上层立刻有信号（M1 的「断线恢复
-///   ≤3.5s」判据靠它，等 3×60s 的巡检拍毫无意义）。
-/// - **反向腿失败不拆世代**：岛只看得见 QUIC 这条腿 ⇒ 只有 QUIC 连接的死驱动分类；
+/// **巡检接线（M3 S4 重写，设计 §3）**：
+/// - QUIC 连接死（`close_reason()` 非空）⇒ **不再**就地判不健康：岛内已有恢复阶梯
+///   （快探 → 复探 → M/R → B）⇒ 连接死只是「快探必然失败的确定性形态」，交给阶梯的
+///   动作链（**R 重连**保世代；连续失败才由 **B** 上报不健康 ⇒ 世代重建）。
+///   M1 的「即时分类 `patrol`」（当时岛内无阶梯）由本重写取代——**语义登记**见 S7。
+/// - **反向腿失败不拆世代**：岛只看得见 QUIC 这条腿 ⇒ 只有 QUIC 面的信号驱动动作；
 ///   WG 面的巡检失败（世代层的事）不会经岛触发任何动作。
-/// - **不误伤**：探活失败/超时（连接仍在）**不**触发分类——那是世代层阶梯的输入
-///   （`Cmd::Probe` 的结论由世代层消费；岛不抢跑）。
-async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx, seam: u8) {
+/// - **不误伤**：探活失败/超时（连接仍在）由快探阶梯自己消费（`Cmd::Probe` 的结论仍
+///   只回调用方；岛不抢跑）。
+async fn housekeeping(
+    st: &mut DriverState,
+    face: &mut Face,
+    ctx: &IslandCtx,
+    jobs: &mut JoinSet<Job>,
+    seam: u8,
+) {
     let patrol = st.patrol;
-    // ① 连接死（对端关闭/空闲回收）：清面 + 记行 + **归 `patrol` 分类**（S2-6 判据）
+    // ① 连接死（对端关闭/空闲回收）：清面 + 记行 + **交快探阶梯**（§3.1；不再就地判不健康）
     if st.live.as_ref().is_some_and(|l| !l.alive()) {
         // M3 §4（设计门 F4）：**准入后**的会话级关闭（被替换/设备被摘除）单独归因——
         // 与准入窗内的 `AdmissionRejected` 严格分开，不误报成「准入被拒」。
@@ -720,7 +797,10 @@ async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx, seam: 
                 ));
             }
         }
-        (*ctx.logf)("quic: 连接已断 —— 等上层重连/重赛跑（阶梯接线 = 世代层）");
+        if !st.dead_logged {
+            st.dead_logged = true;
+            (*ctx.logf)("quic: 连接已断 —— 交快探阶梯（M/R/B；§3.1）保世代重连，不再就地拆世代");
+        }
         // M3：在册服务流一并作废（读回 EOF / 写快速失败；§1.6 的 EOF 同形性——
         // 与今天 `stackb` 在连接死时的表现一致，调用方按需重开）
         let n = st.streams.clear_on_connection_loss();
@@ -732,16 +812,31 @@ async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx, seam: 
         // 连接死 ⇒ 其回程泵随 `read_datagram` 出错自退（`Job::Return` 按身份复位）；
         // 这里同步清掉防重位只为「新连接可在同一拍内起泵」。
         st.pump_conn = None;
-        ctx.unhealthy(REASON_PATROL);
+        // §3.1：链路**确定性**死亡（`close_reason` 已置）⇒ 无回显是结构性的，不消耗探活
+        // 预算，直接进「复探失败」面的动作判别（M/R）——这是 ≤3.5s 判据在重启相位上的落点。
+        //
+        // **门槛 = TUN 在位**（§3.2 的分档表把两档都写成 attached 前提；未附加 = 无数据面
+        // 要保 ⇒ 不动作，未附加期的死链由世代层 60s 巡检的兜底面承担）。
+        if st.tun.is_some() {
+            let send = send_face(face, st.ladder.tuning().send_err_fresh);
+            let step = st.ladder.on_link_dead(TokioInstant::now(), send, &ctx.logf);
+            ladder_step(st, ctx, face, jobs, step);
+        }
+    } else {
+        st.dead_logged = false;
     }
-    // ② 刷新到点（C15'；写失败 = 连接已断）
+    // ② 刷新到点（C15'；写失败 = 连接已断 ⇒ 交阶梯，判据同 ①）
     if let Some(live) = st.live.as_mut() {
         if !live.refresh_if_due(face.credential(), &ctx.logf).await {
-            (*ctx.logf)("quic: 注册刷新写失败 —— 判连接已断");
+            (*ctx.logf)("quic: 注册刷新写失败 —— 判连接已断（交快探阶梯）");
             st.live = None;
             st.watch = None;
             st.pump_conn = None;
-            ctx.unhealthy(REASON_PATROL);
+            if st.tun.is_some() {
+                let send = send_face(face, st.ladder.tuning().send_err_fresh);
+                let step = st.ladder.on_link_dead(TokioInstant::now(), send, &ctx.logf);
+                ladder_step(st, ctx, face, jobs, step);
+            }
         }
     }
     // ③ 迁移保持检测（N-b / 未确认；判据本体在 `client::migration`）
@@ -768,11 +863,24 @@ async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx, seam: 
             ));
             lock_unpoison(&ctx.snapshot).migration_unconfirmed = true;
             st.watch = None;
-            // 未确认 = 新路径不可用（协议侧要等 `max_idle_timeout` 30s 才定音）⇒ 与
-            // 连接死同面：**立刻**给世代层 `patrol` 分类（回落动作在世代层；设计 §2.3）。
-            ctx.unhealthy(REASON_PATROL);
+            // 未确认 = 新路径不可用（协议侧要等 `max_idle_timeout` 30s 才定音）⇒
+            // **交快探阶梯**（§3.1：位升为动作前置条件 ⇒ 允许走 R）——M1 的「即时判
+            // 不健康（世代重建）」由本重写取代（梯级动作 = M/R/B，B 才上报不健康）。
+            if st.tun.is_some() {
+                let send = send_face(face, st.ladder.tuning().send_err_fresh);
+                let step = st.ladder.on_link_dead(TokioInstant::now(), send, &ctx.logf);
+                ladder_step(st, ctx, face, jobs, step);
+            }
         }
         None => {}
+    }
+    // ③b **快探节拍**（§3.2：在用档背靠背 / 待机档 60s / 挂起空窗立即探——
+    //     由 runtime 拍内务驱动；单飞与动作链在阶梯里）。
+    if st.live.is_some() && st.tun.is_some() {
+        let in_use = in_use_now(st, ctx, &st.probe);
+        if let Some((round, budget)) = st.ladder.due(TokioInstant::now(), in_use) {
+            ladder_step(st, ctx, face, jobs, LadderStep::Probe { round, budget });
+        }
     }
     // ④ 快照同步（via/ep/rtt/mtu/candidates 一律由驱动态派生；local 取端点现值）
     {
@@ -822,6 +930,11 @@ async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx, seam: 
         s.sock_send_err_age_ms = ev.age.map(|d| d.as_millis() as u64);
         s.sock_send_err_last_errno = ev.last_errno;
         s.sock_send_err_local_fresh = ev.fresh;
+        // M3 S4：快探阶梯读数（§3.1/§3.2 的观测面；e2e 的 T_recv 观测位 = `ladder_probe_ok`）
+        s.ladder_probe_ok = st.ladder.probe_ok;
+        s.ladder_fail_streak = st.ladder.fail_streak();
+        s.ladder_jitter_streak = st.ladder.jitter_streak();
+        s.ladder_action = st.ladder.last_action.to_owned();
     }
     // ⑤ 「窄路径不可用」判据（mds 变小/连接换过都要重判；S2-4）
     check_narrow_path(st, ctx);
@@ -1081,6 +1194,141 @@ async fn handle_cmd(
         Cmd::StreamClose { id, reply } => {
             let r = st.streams.close(id).map(|_slot| ());
             let _ = reply.send(r);
+        }
+    }
+}
+
+// ---------- M3 S4：快探阶梯的执行面（§3.1 的动作顺序） ----------
+
+/// 发送面读数（M/R 判别的输入；`SockStats` 的白名单 + 新鲜度窗）。
+fn send_face(face: &Face, window: Duration) -> SendFace {
+    let v = face.send_err_view(window);
+    SendFace {
+        fresh: v.fresh,
+        errno: v.last_errno,
+    }
+}
+
+/// 「在用档」判据（§3.2-1）：TUN 在位 + **出站新鲜**（岛侧等价面 = `TunCounters`；
+/// 亮屏位在岛内不可达——偏离登记见 `tuning::probe_defaults::IN_USE_FRESH`）。
+fn in_use_now(st: &DriverState, ctx: &IslandCtx, tuning: &ProbeTuning) -> bool {
+    st.tun.is_some()
+        && ctx
+            .counters
+            .last_outbound_at()
+            .is_some_and(|t| t.elapsed() <= tuning.in_use_fresh)
+}
+
+/// 执行阶梯的一步（**同步臂就地闭环、spawn 臂投任务并返回**）。
+///
+/// 闭环性：M（换本地 socket）是同步原语 ⇒ 其结论就地回灌（`on_migrate_result`）并
+/// 继续推进（失败 ⇒ 立刻 R；成功 ⇒ 起确认探活）。R 与探活经 `JoinSet` 回口
+/// （`Job::LadderConnect` / `Job::FastProbe`）——回口处再调本函数。
+fn ladder_step(
+    st: &mut DriverState,
+    ctx: &IslandCtx,
+    face: &mut Face,
+    jobs: &mut JoinSet<Job>,
+    mut step: LadderStep,
+) {
+    loop {
+        match step {
+            LadderStep::Idle => return,
+            LadderStep::Probe { round, budget } => {
+                let Some(live) = st.live.as_ref() else {
+                    // 无连接（链路已死/动作间隙）：探活不可执行 ⇒ 按链路死收线，
+                    // 防「阶梯停在单飞态」（活性：动作仍必出）
+                    let send = send_face(face, st.ladder.tuning().send_err_fresh);
+                    step = st.ladder.on_link_dead(TokioInstant::now(), send, &ctx.logf);
+                    continue;
+                };
+                let conn = live.conn.clone();
+                let slot = Arc::clone(live.probe_slot());
+                st.ladder.note_round(round, TokioInstant::now());
+                jobs.spawn(async move {
+                    let result =
+                        ladder::run_round(budget, || client::probe(&conn, &slot, budget)).await;
+                    Job::FastProbe { round, result }
+                });
+                return;
+            }
+            LadderStep::Migrate { why } => {
+                let from = face.local();
+                match face.rebind(None) {
+                    Ok(to) => {
+                        (*ctx.logf)(&format!(
+                            "quic: 本地 socket 已换绑（{from} → {to}）—— M 动作（原因={why}）"
+                        ));
+                        st.rebind = Some(RebindNote {
+                            from,
+                            to,
+                            at: TokioInstant::now(),
+                        });
+                        step = st
+                            .ladder
+                            .on_migrate_result(true, TokioInstant::now(), &ctx.logf);
+                    }
+                    Err(e) => {
+                        (*ctx.logf)(&format!("quic: 换绑失败（{from} → …；{e}）"));
+                        step = st
+                            .ladder
+                            .on_migrate_result(false, TokioInstant::now(), &ctx.logf);
+                    }
+                }
+            }
+            LadderStep::Reconnect {
+                why,
+                after_migration_unconfirmed,
+            } => {
+                if after_migration_unconfirmed {
+                    // §3.1 末段：M 之后**一个快探预算内**无回显 ⇒ 置位（N-b 行文不变，
+                    // 窗口 60s → ≤1 快探预算 = 语义登记项 S7）
+                    match st.rebind.take() {
+                        Some(note) => (*ctx.logf)(&format!(
+                            "quic: 迁移未确认（{} → {}，{} 内无对端回包 ⇒ 回落重连/重赛跑）",
+                            note.from,
+                            note.to,
+                            client::fmt_dur(st.ladder.tuning().fast_budget)
+                        )),
+                        None => (*ctx.logf)(
+                            "quic: 迁移未确认（一个快探预算内无对端回包 ⇒ 回落重连/重赛跑）",
+                        ),
+                    }
+                    lock_unpoison(&ctx.snapshot).migration_unconfirmed = true;
+                    st.watch = None;
+                }
+                let list = st.cands.clone();
+                if list.is_empty() {
+                    // 无候选可拨（未 SetCandidates）：按 R 失败回灌 ⇒ B 门照走（不静默）
+                    step = st.ladder.on_reconnect_result(
+                        false,
+                        "无候选可拨".to_owned(),
+                        TokioInstant::now(),
+                        &ctx.logf,
+                    );
+                    continue;
+                }
+                face.relays().set(&list);
+                let endpoint = face.endpoint();
+                let ccfg = face.client_config();
+                let cred = Arc::clone(face.credential());
+                let budget = st.ladder.reconnect_budget();
+                let logf = Arc::clone(&ctx.logf);
+                jobs.spawn(async move {
+                    let result = client::connect(endpoint, ccfg, cred, &list, budget, false, &logf)
+                        .await
+                        .map(|(est, _outcome)| est);
+                    Job::LadderConnect { why, result }
+                });
+                return;
+            }
+            LadderStep::Rebuild { why, r_fails } => {
+                (*ctx.logf)(&format!(
+                    "quic: 快探阶梯走完 M/R（连续重连失败 {r_fails}，原因={why}）—— 上报不健康（交世代重建）"
+                ));
+                ctx.unhealthy(REASON_PATROL);
+                return;
+            }
         }
     }
 }

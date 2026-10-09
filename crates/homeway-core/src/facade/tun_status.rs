@@ -143,6 +143,14 @@ pub struct QuicIn {
     pub admit_reject_code: u64,
     /// 上者的稳定短语（空串 = 未发生/未知码）。
     pub admit_reject_text: String,
+    /// **累计成功快探次数**（M3 S4 §3.1/§3.2；e2e 的 `T_recv` 观测位）。
+    pub ladder_probe_ok: u64,
+    /// 当前连续快探失败次数（成功即清零）。
+    pub ladder_fail_streak: u32,
+    /// 当前连续抖动次数（§3.1-2；≥ 阈值 ⇒ 升格为失败）。
+    pub ladder_jitter_streak: u32,
+    /// 最近一次阶梯动作（`""`/`migrate`/`reconnect`/`rebuild`）。
+    pub ladder_action: String,
 }
 
 /// 快照 → tunStatusJSON（Go tunStatusJSON 逐键对齐；键序 = 字典序）。
@@ -283,6 +291,14 @@ pub fn tun_status_json(input: &TunStatusInput) -> String {
         qm.insert(
             "admit_reject_text".into(),
             Value::String(q.admit_reject_text.clone()),
+        );
+        // M3 S4（§3.1/§3.2）：快探阶梯四个读数键（additive）
+        qm.insert("ladder_probe_ok".into(), Value::from(q.ladder_probe_ok));
+        qm.insert("ladder_fail_streak".into(), Value::from(q.ladder_fail_streak));
+        qm.insert("ladder_jitter_streak".into(), Value::from(q.ladder_jitter_streak));
+        qm.insert(
+            "ladder_action".into(),
+            Value::String(q.ladder_action.clone()),
         );
         m.insert("quic".into(), Value::Object(qm));
     }
@@ -513,6 +529,11 @@ mod tests {
                 // M3 S5（§8.2-12）：准入归因两键（additive）
                 admit_reject_code: 0x11,
                 admit_reject_text: "凭证不被接受".into(),
+                // M3 S4（§3.1/§3.2）：快探阶梯四键（additive）
+                ladder_probe_ok: 77,
+                ladder_fail_streak: 0,
+                ladder_jitter_streak: 1,
+                ladder_action: "reconnect".into(),
             }),
             ..bare
         };
@@ -523,7 +544,8 @@ mod tests {
             vec![
                 // M3 S5：`admit_reject_code`/`admit_reject_text` 两键 additive（字典序在首）
                 "admit_reject_code", "admit_reject_text", "candidates", "congestion_events",
-                "connections", "current_mtu", "drops", "ep", "local", "lost_packets",
+                "connections", "current_mtu", "drops", "ep", "ladder_action", "ladder_fail_streak",
+                "ladder_jitter_streak", "ladder_probe_ok", "local", "lost_packets",
                 "migration_unconfirmed", "migrations", "mirrors", "mtu", "packets_in",
                 "packets_out", "relay_tx", "rtt_ms", "rx_ignored", "send_buffer_used", "via",
             ]
@@ -541,6 +563,11 @@ mod tests {
         // M3 S5：准入归因（App 状态面「为什么走了 WG」的落点；0/空串 = 未发生）
         assert_eq!(v["quic"]["admit_reject_code"], 0x11);
         assert_eq!(v["quic"]["admit_reject_text"], "凭证不被接受");
+        // M3 S4：快探阶梯读数（e2e 的 T_recv 观测位 = ladder_probe_ok）
+        assert_eq!(v["quic"]["ladder_probe_ok"], 77);
+        assert_eq!(v["quic"]["ladder_fail_streak"], 0);
+        assert_eq!(v["quic"]["ladder_jitter_streak"], 1);
+        assert_eq!(v["quic"]["ladder_action"], "reconnect");
     }
 
     /// runner 缺席 ⇒ stats/exitIp/link/portForwards/bridge 全缺（failed/prepare 期形态）。

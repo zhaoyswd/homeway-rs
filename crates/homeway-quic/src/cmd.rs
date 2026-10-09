@@ -433,6 +433,16 @@ pub struct IslandSnapshot {
     /// 不让快照面替阶梯做判定。
     pub sock_send_err_age_ms: Option<u64>,
 
+    // ---------- M3 S4：快探阶梯（§3.1/§3.2；`quic` JSON 段的四个新键） ----------
+    /// 累计**成功**快探次数（含复探/动作确认；e2e 的 `T_recv` 观测位）。
+    pub ladder_probe_ok: u64,
+    /// 当前连续失败次数（快探链；成功即清零）。
+    pub ladder_fail_streak: u32,
+    /// 当前连续抖动次数（§3.1-2：复探成功计数；≥ 阈值 ⇒ 升格为失败）。
+    pub ladder_jitter_streak: u32,
+    /// 最近一次动作（`""`/`migrate`/`reconnect`/`rebuild`；排障读数）。
+    pub ladder_action: String,
+
     // ---------- M3 S5：准入失败归因（设计 §4；`quic` JSON 段的两个新键） ----------
     /// 末次**准入被拒**的应用码（`None` = 未发生过）。
     ///

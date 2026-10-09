@@ -1997,15 +1997,27 @@ async fn tun_fd_death_classifies_fd() {
 
 // ---------- 7. 巡检接线（S2-6）与生命周期（S2-5） ----------
 
-/// **判据（S2-6 / 设计 §2.5）**：**QUIC 连接被人为关闭 ⇒ 不健康分类 `patrol` 可达**
-/// （分类值 ∈ 既有取值集 `{patrol,fd,panic,stop}`）；且**探活失败（连接仍在）不触发分类**
-/// ——只以当前承载的结论驱动判定、瞬时失败不拆世代（反向腿/瞬时面的保护）。
+/// **判据（M3 S4 重写，**取代** M1 S2-6 的「连接死 ⇒ 即时归 `patrol`」）**：QUIC 连接被人为
+/// 关闭 ⇒ 岛**不**就地判不健康——动作面交**岛内快探阶梯**（§3.1：快探 → 复探 → M/R → B），
+/// 只有 **B**（连续重连失败 + 窗 ≥10s）才上报 `patrol`。同时保住反向保护：预算极小的探活
+/// 失败（连接仍在）不触发任何分类。
+///
+/// 语义变化登记（S7）：`patrol` 分类的触发源从「连接死（即时）」变为「阶梯走完 M/R（B）」。
 #[tokio::test]
-async fn connection_death_classifies_patrol_but_probe_timeout_does_not() {
+async fn connection_death_goes_to_the_ladder_instead_of_unhealthy() {
     let quic = exit_face(25);
     let stub = Stub::new();
     let (on_unhealthy, reasons) = unhealthy_sink();
-    let island = island_with_unhealthy(Duration::from_secs(60), quic.rpk_public_key(), on_unhealthy);
+    let (logf, logs) = sink();
+    let island = Island::start(
+        logf,
+        on_unhealthy,
+        island_cfg(Duration::from_secs(60), quic.rpk_public_key()),
+    )
+    .expect("岛可起");
+    // 阶梯只在 TUN 在位后跑（§3.2 的分档表 = attached 前提）⇒ 本用例先附加数据面
+    let (tun, _peer) = tun_pair();
+    assert!(matches!(attach(&island, tun.as_raw_fd(), 1280, BUDGET), Ok(())));
     connect_direct(&island, &stub, &quic).await;
     assert_eq!(stub.accepted(), 1, "登记成功（真出口侧绑定）");
 
@@ -2029,16 +2041,31 @@ async fn connection_death_classifies_patrol_but_probe_timeout_does_not() {
         "探活失败/超时不得触发分类（不误伤、不拆世代）"
     );
 
-    // ② 人为关闭：出口摘绑定 ⇒ CONNECTION_CLOSE ⇒ 岛拍内务即时归 `patrol`
+    // ② 人为关闭：出口摘绑定 ⇒ CONNECTION_CLOSE ⇒ 岛交快探阶梯（**不**就地判不健康）
     quic.unbind_pub(&PUBKEY);
-    let got = wait_reason(&reasons, WAIT).await;
-    assert_eq!(got.as_deref(), Some("patrol"), "连接死必须归既有取值 `patrol`");
+    let deadline = Instant::now() + WAIT;
+    while island.snapshot().ladder_action.is_empty() && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let snap = island.snapshot();
+    let action = snap.ladder_action.clone();
+    println!(
+        "[unit] ladder_action={action} connections={} fail_streak={}",
+        snap.connections, snap.ladder_fail_streak
+    );
     assert!(
-        island.snapshot().connections == 0,
-        "连接死后面子清空（等世代层重连/重赛跑）"
+        matches!(action.as_str(), "migrate" | "reconnect" | "rebuild"),
+        "连接死必须交阶梯动作（实得 {action:?}）"
+    );
+    assert!(
+        wait_reason(&reasons, Duration::from_millis(400))
+            .await
+            .is_none(),
+        "连接死不得再就地判不健康（替代面 = 阶梯 M/R；B 才上报）"
     );
     assert!(island.stop_within(Instant::now() + BUDGET));
     assert!(quic.stop_within(Instant::now() + BUDGET));
+    drop(logs); // 日志面在本用例只作现场留痕（判据 = 阶梯动作 + 不误分类）
 }
 
 /// **判据（S2-5 / M0 §8.1 残余项）**：`stop_within` **到点 detach** 后，老世代仍持

@@ -1115,6 +1115,11 @@ pub(crate) fn quic_in_of(s: &homeway_quic::IslandSnapshot) -> QuicIn {
         // M3 S5（§4）：准入归因（0/空串 = 未发生过）
         admit_reject_code: s.admit_reject_code.unwrap_or(0),
         admit_reject_text: s.admit_reject_text.clone().unwrap_or_default(),
+        // M3 S4（§3.1/§3.2）：快探阶梯读数（additive）
+        ladder_probe_ok: s.ladder_probe_ok,
+        ladder_fail_streak: s.ladder_fail_streak,
+        ladder_jitter_streak: s.ladder_jitter_streak,
+        ladder_action: s.ladder_action.clone(),
     }
 }
 
