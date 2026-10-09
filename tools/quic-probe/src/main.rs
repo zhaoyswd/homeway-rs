@@ -270,7 +270,7 @@ fn derive_tun_ip(secret: &[u8; 32], pubkey: &[u8; 32]) -> [u8; 4] {
     ip
 }
 
-/// 中继路由标签 = `sha256(peerId)[:8]`（真源 `wtransport::frame::relay_id`）。
+/// 中继路由标签 = `sha256(peerId)[:8]`（真源 `homeway-core` 的 `legframe::relay_id`）。
 fn relay_label(peer_id: &[u8; 32]) -> [u8; 8] {
     Sha256::digest(peer_id)[..8].try_into().unwrap()
 }

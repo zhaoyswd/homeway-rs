@@ -2186,9 +2186,9 @@ enum ProbeFail {
 /// 学习缓存/hint 在 M1 只服务 WG 面）。
 ///
 /// 中继候选的 `label` = `sha256(peerId)[:8]`（信封帧 `[0xAA][label8]` 的来源；真源
-/// `wtransport::frame::relay_id`）——与出口侧腿表同源。
+/// `legframe::relay_id`）——与出口侧腿表同源。
 fn quic_candidates(tok: &Token) -> Result<Vec<homeway_quic::Candidate>, QuicFail> {
-    let label = crate::wtransport::frame::relay_id(tok.peer_id.as_bytes());
+    let label = crate::legframe::relay_id(tok.peer_id.as_bytes());
     let mut out: Vec<homeway_quic::Candidate> = Vec::new();
     for e in &tok.endpoints {
         let via = match e.kind {

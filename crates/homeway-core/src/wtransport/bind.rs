@@ -25,8 +25,8 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::token::Secret;
 
-use super::frame::{self, FrameKind};
-use super::reg;
+use crate::legframe::{self, FrameKind};
+use crate::reg2;
 use crate::go_fmt::fmt_duration_go_ms;
 
 /// 一条候选路径（relay 位参与候选集比较与镜像分派）。
@@ -287,7 +287,7 @@ impl Bind {
         if let Some(addr) = self.adopted {
             let mut wire = Vec::with_capacity(wg.len() + 16);
             wire.clear();
-            frame::encode_frame(FrameKind::Data, wg, &mut wire);
+            legframe::encode_frame(FrameKind::Data, wg, &mut wire);
             let wire = self.tag_relay(self.adopted_is_relay, wire);
             // 发送统计（拍板①：采纳路径单发 = 一次尝试）
             self.send_tries += 1;
@@ -307,7 +307,7 @@ impl Bind {
             if let Some((old, old_relay, until)) = self.handover {
                 if Instant::now() < until && old != addr {
                     let mut wire2 = Vec::with_capacity(wg.len() + 16);
-                    frame::encode_frame(FrameKind::Data, wg, &mut wire2);
+                    legframe::encode_frame(FrameKind::Data, wg, &mut wire2);
                     let wire2 = self.tag_relay(old_relay, wire2);
                     let _ = self.sock.send_to(&wire2, crate::udpbatch::xmit_addr(old, self.dual));
                 }
@@ -333,7 +333,7 @@ impl Bind {
             Vec::with_capacity(wg.len() + reg_pkt.as_ref().map_or(0, |r| r.len()) + 16);
         match &reg_pkt {
             Some(r) => {
-                frame::encode_batch(
+                legframe::encode_batch(
                     &[
                         (FrameKind::Reg.to_wire(), r),
                         (FrameKind::Data.to_wire(), wg),
@@ -341,7 +341,7 @@ impl Bind {
                     &mut frame_bytes,
                 );
             }
-            None => frame::encode_frame(FrameKind::Data, wg, &mut frame_bytes),
+            None => legframe::encode_frame(FrameKind::Data, wg, &mut frame_bytes),
         }
         let mut sent = 0usize;
         let mut relay_sent = 0usize;
@@ -452,14 +452,14 @@ impl Bind {
         let mut frame_bytes =
             Vec::with_capacity(pkt.len() + reg.as_ref().map_or(0, |r| r.len()) + 16);
         match &reg {
-            Some(r) => frame::encode_batch(
+            Some(r) => legframe::encode_batch(
                 &[
                     (FrameKind::Reg.to_wire(), r),
                     (FrameKind::Data.to_wire(), &pkt),
                 ],
                 &mut frame_bytes,
             ),
-            None => frame::encode_frame(FrameKind::Data, &pkt, &mut frame_bytes),
+            None => legframe::encode_frame(FrameKind::Data, &pkt, &mut frame_bytes),
         }
         let wire = self.tag_relay(true, frame_bytes);
         for c in &relay_cands {
@@ -493,8 +493,8 @@ impl Bind {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let mut pkt = Vec::with_capacity(reg::REG_LEN);
-        reg::encode_reg_parts(&ctx.secret, &ctx.pubkey, &ctx.dev_tag, now, &mut pkt);
+        let mut pkt = Vec::with_capacity(reg2::REG_LEN);
+        reg2::encode_reg_parts(&ctx.secret, &ctx.pubkey, &ctx.dev_tag, now, &mut pkt);
         Some(pkt)
     }
 
@@ -552,10 +552,10 @@ impl Bind {
         // 一律**不 adopt**（不写 adopted/race_seen、不打 C5/C6、不登记 handover）；
         // 真正的漫游/自愈仍由「未知来源 + 合法 Data 帧」成立（与 Go bind.go:511-515
         // 自注的收紧方向同向）。
-        if frame::frame_kind(&self.recv_buf[..n]) == Some(FrameKind::Data.to_wire()) {
+        if legframe::frame_kind(&self.recv_buf[..n]) == Some(FrameKind::Data.to_wire()) {
             self.adopt(src);
         }
-        let Some((kind, payload)) = frame::decode_frame(&self.recv_buf[..n]) else {
+        let Some((kind, payload)) = legframe::decode_frame(&self.recv_buf[..n]) else {
             return Ok(None); // 非帧包（垃圾/旧对端）：丢弃
         };
         match kind {
@@ -566,7 +566,7 @@ impl Bind {
             }
             k if k == FrameKind::Control.to_wire() => {
                 // hint 线索（学习缓存接线：回调只改内存 + 投递落盘信号，不阻塞收包热路径）
-                if let Some(addr) = frame::decode_hint_payload(payload) {
+                if let Some(addr) = legframe::decode_hint_payload(payload) {
                     // F2：hint **不构成路径证据**（上面已不 adopt），但仍是候选学习线索。
                     // 未知来源的 hint 必须过 `probe_addr_acceptable`——封掉「谁能发一个
                     // Control 帧就让客户端向任意地址打洞/污染候选表」的注入面；已知来源
@@ -708,10 +708,10 @@ impl Bind {
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_secs())
             .unwrap_or(0);
-        let mut pkt = Vec::with_capacity(reg::REG_LEN);
-        reg::encode_reg_parts(&ctx.secret, &ctx.pubkey, &ctx.dev_tag, now, &mut pkt);
+        let mut pkt = Vec::with_capacity(reg2::REG_LEN);
+        reg2::encode_reg_parts(&ctx.secret, &ctx.pubkey, &ctx.dev_tag, now, &mut pkt);
         let mut wire = Vec::with_capacity(pkt.len() + 16);
-        frame::encode_frame(FrameKind::Reg, &pkt, &mut wire);
+        legframe::encode_frame(FrameKind::Reg, &pkt, &mut wire);
         let wire = self.tag_relay(self.adopted_is_relay, wire);
         // 发送统计（复核 r3-F5：Go writeUDP 统一计数点覆盖 RREG 腿；localErr* 不动——
         // Go 的 localErrTotal 只含镜像候选〔bind_test 断言口径〕，采纳路径错误只进
@@ -1022,7 +1022,7 @@ mod tests {
             SocketAddr::V6(v6) => SocketAddr::V6(v6),
             other => panic!("客户端源应为 v6 形态（dual socket）：{other}"),
         };
-        let resp = crate::wtransport::frame::frame_bytes(crate::wtransport::frame::FrameKind::Data, b"resp6");
+        let resp = crate::legframe::frame_bytes(crate::legframe::FrameKind::Data, b"resp6");
         exit6.send_to(&resp, cli_ep).unwrap();
         // 客户端收到（纯 v6 不经 unmap 变形）
         exit4.set_read_timeout(Some(Duration::from_millis(200))).ok();
@@ -1080,20 +1080,20 @@ mod tests {
         let mut buf = [0u8; 2048];
         let (n, from) = exit.recv_from(&mut buf).unwrap();
         assert_eq!(from.port(), b.local_port());
-        let (kind, payload) = frame::decode_frame(&buf[..n]).unwrap();
+        let (kind, payload) = legframe::decode_frame(&buf[..n]).unwrap();
         assert_eq!(kind, FrameKind::Batch.to_wire());
-        let msgs = frame::decode_batch(payload).unwrap();
+        let msgs = legframe::decode_batch(payload).unwrap();
         assert_eq!(msgs.len(), 2);
         assert_eq!(msgs[0].0, FrameKind::Reg.to_wire());
         assert_eq!(msgs[1], (FrameKind::Data.to_wire(), &b"handshake-init"[..]));
         // 第二包不再搭 reg
         b.send_wg(b"second");
         let (n2, _) = exit.recv_from(&mut buf).unwrap();
-        let (k2, p2) = frame::decode_frame(&buf[..n2]).unwrap();
+        let (k2, p2) = legframe::decode_frame(&buf[..n2]).unwrap();
         assert_eq!((k2, p2), (FrameKind::Data.to_wire(), &b"second"[..]));
         // 回包采纳 + C5/C6
         let mut resp = Vec::new();
-        frame::encode_frame(FrameKind::Data, b"handshake-response", &mut resp);
+        legframe::encode_frame(FrameKind::Data, b"handshake-response", &mut resp);
         exit.send_to(&resp, format!("127.0.0.1:{}", b.local_port()))
             .unwrap();
         let mut rbuf = [0u8; 2048];
@@ -1115,14 +1115,14 @@ mod tests {
         // 已采纳：单发纯数据腿帧
         b.send_wg(b"after-adopt");
         let (n3, _) = exit.recv_from(&mut buf).unwrap();
-        let (k3, p3) = frame::decode_frame(&buf[..n3]).unwrap();
+        let (k3, p3) = legframe::decode_frame(&buf[..n3]).unwrap();
         assert_eq!((k3, p3), (FrameKind::Data.to_wire(), &b"after-adopt"[..]));
         // refresh_reg：独立 reg 帧
         assert!(b.refresh_reg());
         let (n4, _) = exit.recv_from(&mut buf).unwrap();
-        let (k4, p4) = frame::decode_frame(&buf[..n4]).unwrap();
+        let (k4, p4) = legframe::decode_frame(&buf[..n4]).unwrap();
         assert_eq!(k4, FrameKind::Reg.to_wire());
-        assert_eq!(p4.len(), reg::REG_LEN);
+        assert_eq!(p4.len(), reg2::REG_LEN);
     }
 
     /// 中继腿：信封字节（[0xAA][relayID]‖容器帧[reg][data]）+ via=relay + 告警行。
@@ -1154,15 +1154,15 @@ mod tests {
         // [0xAA][relayID(8)]‖[腿帧]
         assert_eq!(buf[0], 0xAA);
         assert_eq!(&buf[1..9], &relay_id(&peer_pub));
-        let (kind, payload) = frame::decode_frame(&buf[9..n]).unwrap();
+        let (kind, payload) = legframe::decode_frame(&buf[9..n]).unwrap();
         assert_eq!(kind, FrameKind::Batch.to_wire());
-        let msgs = frame::decode_batch(payload).unwrap();
+        let msgs = legframe::decode_batch(payload).unwrap();
         assert_eq!(msgs[0].0, FrameKind::Reg.to_wire());
         assert_eq!(msgs[1], (FrameKind::Data.to_wire(), &b"init"[..]));
 
         // 中继回数据帧（裸腿帧——FIX-91 统一线格式）→ 采纳为 relay
         let mut resp = Vec::new();
-        frame::encode_frame(FrameKind::Data, b"resp", &mut resp);
+        legframe::encode_frame(FrameKind::Data, b"resp", &mut resp);
         relay
             .send_to(&resp, format!("127.0.0.1:{}", b.local_port()))
             .unwrap();
@@ -1188,13 +1188,13 @@ mod tests {
         b.send_wg(b"data2");
         let (n2, _) = relay.recv_from(&mut buf).unwrap();
         assert_eq!(buf[0], 0xAA);
-        let (k, p) = frame::decode_frame(&buf[9..n2]).unwrap();
+        let (k, p) = legframe::decode_frame(&buf[9..n2]).unwrap();
         assert_eq!((k, p), (FrameKind::Data.to_wire(), &b"data2"[..]));
         // RREG：带路由头的 reg 腿帧
         assert!(b.refresh_reg());
         let (n3, _) = relay.recv_from(&mut buf).unwrap();
         assert_eq!(buf[0], 0xAA);
-        let (k3, _) = frame::decode_frame(&buf[9..n3]).unwrap();
+        let (k3, _) = legframe::decode_frame(&buf[9..n3]).unwrap();
         assert_eq!(k3, FrameKind::Reg.to_wire());
     }
 
@@ -1250,9 +1250,9 @@ mod tests {
         // 中继收到补发：[0xAA][id]‖[容器帧[reg][pkt-A]]
         let (n, _) = relay.recv_from(&mut buf).unwrap();
         assert_eq!(buf[0], 0xAA);
-        let (kind, payload) = frame::decode_frame(&buf[9..n]).unwrap();
+        let (kind, payload) = legframe::decode_frame(&buf[9..n]).unwrap();
         assert_eq!(kind, FrameKind::Batch.to_wire());
-        let msgs = frame::decode_batch(payload).unwrap();
+        let msgs = legframe::decode_batch(payload).unwrap();
         assert_eq!(
             msgs[0].0,
             FrameKind::Reg.to_wire(),
@@ -1296,7 +1296,7 @@ mod tests {
 
         // 初始采纳 exit
         let mut resp = Vec::new();
-        frame::encode_frame(FrameKind::Data, b"hello", &mut resp);
+        legframe::encode_frame(FrameKind::Data, b"hello", &mut resp);
         exit.send_to(&resp, format!("127.0.0.1:{}", b.local_port()))
             .unwrap();
         let mut rbuf = [0u8; 64];
@@ -1500,7 +1500,7 @@ mod tests {
         let _ = b.recv_from(&mut buf);
         assert_eq!(b.adopted(), None, "未知 kind 不得采纳");
         // ③ Control(hint) → 不采纳（hint 不构成路径证据）
-        exit.send_to(&frame::hint_bytes("203.0.113.5:41641"), &me).unwrap();
+        exit.send_to(&legframe::hint_bytes("203.0.113.5:41641"), &me).unwrap();
         let _ = b.recv_from(&mut buf);
         assert_eq!(b.adopted(), None, "Control 帧不得采纳");
         assert!(b.race_seen.is_empty(), "赛跑来源集不得被非 Data 帧写入");
@@ -1509,7 +1509,7 @@ mod tests {
         assert!(!all.iter().any(|l| l.starts_with("路径确立：")), "非 Data 帧不得打 C6：{all:?}");
         // ④ 合法 Data 帧 → 仍采纳
         let mut resp = Vec::new();
-        frame::encode_frame(FrameKind::Data, b"hello", &mut resp);
+        legframe::encode_frame(FrameKind::Data, b"hello", &mut resp);
         exit.send_to(&resp, &me).unwrap();
         assert_eq!(b.recv_from(&mut buf).unwrap(), Some(5));
         assert_eq!(b.adopted(), Some(exit_addr));
@@ -1530,7 +1530,7 @@ mod tests {
         let me = format!("127.0.0.1:{}", b.local_port());
         let mut buf = [0u8; 64];
         // 未知来源 + 不可接受地址（私网）→ 丢
-        intruder.send_to(&frame::hint_bytes("10.0.0.5:41641"), &me).unwrap();
+        intruder.send_to(&legframe::hint_bytes("10.0.0.5:41641"), &me).unwrap();
         let _ = b.recv_from(&mut buf);
         assert!(hits.lock().unwrap().is_empty(), "私网 hint 应被拒");
         assert!(
@@ -1538,7 +1538,7 @@ mod tests {
             "应打忽略行"
         );
         // 未知来源 + 可接受地址（TEST-NET-3）→ 通过
-        intruder.send_to(&frame::hint_bytes("203.0.113.9:41641"), &me).unwrap();
+        intruder.send_to(&legframe::hint_bytes("203.0.113.9:41641"), &me).unwrap();
         let _ = b.recv_from(&mut buf);
         assert_eq!(hits.lock().unwrap().as_slice(), &["203.0.113.9:41641".to_owned()]);
     }
@@ -1562,7 +1562,7 @@ mod tests {
         let me = format!("127.0.0.1:{}", b.local_port());
         let mut buf = [0u8; 64];
         // 已知来源（候选）的 hint：即便 hint 地址是私网也豁免卫兵、投给 on_hint
-        exit.send_to(&frame::hint_bytes("10.0.0.5:41641"), &me).unwrap();
+        exit.send_to(&legframe::hint_bytes("10.0.0.5:41641"), &me).unwrap();
         let _ = b.recv_from(&mut buf);
         assert_eq!(
             hits.lock().unwrap().as_slice(),
@@ -1589,41 +1589,41 @@ mod tests {
         // 首包搭 reg
         b.send_wg(b"a");
         let (n, _) = exit.recv_from(&mut buf).unwrap();
-        let (k, p) = frame::decode_frame(&buf[..n]).unwrap();
+        let (k, p) = legframe::decode_frame(&buf[..n]).unwrap();
         assert_eq!(k, FrameKind::Batch.to_wire());
-        assert_eq!(frame::decode_batch(p).unwrap()[0].0, FrameKind::Reg.to_wire());
+        assert_eq!(legframe::decode_batch(p).unwrap()[0].0, FrameKind::Reg.to_wire());
         // 间隔未到 ⇒ 不补投
         b.send_wg(b"b");
         let (n, _) = exit.recv_from(&mut buf).unwrap();
-        assert_eq!(frame::decode_frame(&buf[..n]).unwrap().0, FrameKind::Data.to_wire(), "间隔内不补投");
+        assert_eq!(legframe::decode_frame(&buf[..n]).unwrap().0, FrameKind::Data.to_wire(), "间隔内不补投");
         // 过间隔 ⇒ 补投
         std::thread::sleep(Duration::from_millis(80));
         b.send_wg(b"c");
         let (n, _) = exit.recv_from(&mut buf).unwrap();
-        let (k, p) = frame::decode_frame(&buf[..n]).unwrap();
+        let (k, p) = legframe::decode_frame(&buf[..n]).unwrap();
         assert_eq!(k, FrameKind::Batch.to_wire(), "过间隔应补投 reg");
-        assert_eq!(frame::decode_batch(p).unwrap()[0].0, FrameKind::Reg.to_wire());
+        assert_eq!(legframe::decode_batch(p).unwrap()[0].0, FrameKind::Reg.to_wire());
         assert_eq!(b.reg_resend_n, 1);
         // 次数上界：达上限后不再补投
         b.reg_resend_n = REG_RESEND_MAX;
         std::thread::sleep(Duration::from_millis(80));
         b.send_wg(b"d");
         let (n, _) = exit.recv_from(&mut buf).unwrap();
-        assert_eq!(frame::decode_frame(&buf[..n]).unwrap().0, FrameKind::Data.to_wire(), "达次数上界后不再补投");
+        assert_eq!(legframe::decode_frame(&buf[..n]).unwrap().0, FrameKind::Data.to_wire(), "达次数上界后不再补投");
         // 时长上界：次数复位但窗口已到 ⇒ 同样不补投（代码门 M3：窗口分支必须有测试）
         b.reg_resend_n = 0;
         b.reg_resend_window = Duration::ZERO;
         std::thread::sleep(Duration::from_millis(80));
         b.send_wg(b"e");
         let (n, _) = exit.recv_from(&mut buf).unwrap();
-        assert_eq!(frame::decode_frame(&buf[..n]).unwrap().0, FrameKind::Data.to_wire(), "达时长上界后不再补投");
+        assert_eq!(legframe::decode_frame(&buf[..n]).unwrap().0, FrameKind::Data.to_wire(), "达时长上界后不再补投");
         // rearm 归零：恢复阶梯重开一轮预算（新未采纳期）
         b.rearm();
         b.send_wg(b"f");
         let (n, _) = exit.recv_from(&mut buf).unwrap();
-        let (k, p) = frame::decode_frame(&buf[..n]).unwrap();
+        let (k, p) = legframe::decode_frame(&buf[..n]).unwrap();
         assert_eq!(k, FrameKind::Batch.to_wire(), "rearm 后重新搭 reg");
-        assert_eq!(frame::decode_batch(p).unwrap()[0].0, FrameKind::Reg.to_wire());
+        assert_eq!(legframe::decode_batch(p).unwrap()[0].0, FrameKind::Reg.to_wire());
         assert_eq!(b.reg_resend_n, 0, "rearm 归零计数");
     }
 }

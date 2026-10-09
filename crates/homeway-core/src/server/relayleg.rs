@@ -19,7 +19,7 @@ use std::time::{Duration, Instant};
 use x25519_dalek::{PublicKey, StaticSecret};
 
 use crate::relaywire as rw;
-use crate::wtransport::frame::{self, relay_id};
+use crate::legframe::{self, relay_id};
 
 use super::engine::EngineCmd;
 use crate::Logf;
@@ -236,18 +236,18 @@ fn send_to_ep(sock: &UdpSocket, payload: &[u8], ep: SocketAddr) -> std::io::Resu
 
 fn send_hello(sock: &UdpSocket, relay: SocketAddr, label: [u8; 8], pub_: &[u8; 32], logf: &Logf) {
     // 发往中继 listener 的包必须带 [0xAA][label] 路由标签（中继靠它认腿）
-    let hello = frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::encode_hello(pub_));
+    let hello = legframe::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::encode_hello(pub_));
     let mut tagged = Vec::with_capacity(9 + hello.len());
-    frame::encode_tagged_frame(&label, &hello, &mut tagged);
+    legframe::encode_tagged_frame(&label, &hello, &mut tagged);
     if let Err(e) = send_to_ep(sock, &tagged, relay) {
         (logf)(&format!("中继：注册 Hello 发送失败（{e}）"));
     }
 }
 
 fn send_keepalive(sock: &UdpSocket, relay: SocketAddr, label: [u8; 8]) {
-    let ka = frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::keepalive_bytes());
+    let ka = legframe::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::keepalive_bytes());
     let mut tagged = Vec::with_capacity(9 + ka.len());
-    frame::encode_tagged_frame(&label, &ka, &mut tagged);
+    legframe::encode_tagged_frame(&label, &ka, &mut tagged);
     let _ = send_to_ep(sock, &tagged, relay);
 }
 
@@ -277,9 +277,9 @@ fn handle_control(
         let dh = priv_key.diffie_hellman(&PublicKey::from(eph_pub));
         let psk = secret.map(|s| rw::auth_mac(&s, &nonce, pub_key.as_bytes()));
         let proof = rw::encode_proof(&nonce, dh.as_bytes(), pub_key.as_bytes(), psk.as_ref());
-        let pf = frame::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &proof);
+        let pf = legframe::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &proof);
         let mut tagged = Vec::with_capacity(9 + pf.len());
-        frame::encode_tagged_frame(&label, &pf, &mut tagged);
+        legframe::encode_tagged_frame(&label, &pf, &mut tagged);
         if let Err(e) = send_to_ep(sock, &tagged, relay) {
             (logf)(&format!("中继：注册证明发送失败（{e}）"));
         }
@@ -338,7 +338,7 @@ fn run_punch_worker(
         ));
         for _ in 0..PUNCH_BURST {
             // 小载荷腿帧：对端解析不出数据会静默丢弃，但 NAT 过滤已被打开
-            let f = frame::frame_bytes(frame::FrameKind::Data, &[0, 0, 0, 0]);
+            let f = legframe::frame_bytes(legframe::FrameKind::Data, &[0, 0, 0, 0]);
             if send_to_ep(&sock, &f, client).is_err() {
                 break;
             }

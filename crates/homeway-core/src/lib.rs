@@ -25,10 +25,22 @@ pub mod files;
 pub mod files_server;
 pub mod go_fmt;
 pub mod identity;
+/// 腿帧线格式（`[0xAA][peerId]` 前导 + `[0xBB][type][payload]` 封装）。
+///
+/// M5 S0 迁址（设计 §1.2-M1）：原 `wtransport::frame` —— 中继（红线面）与 `relaywire`
+/// 直接用它在用，**不可随 WG 面删除**；`wtransport` 的 WG 消费者退役后本模块留在 crate 根
+/// （QUIC 载荷 kind=5 与 `homeway-quic` 的 `FRAME_KIND_QUIC` 按字节复刻互锚）。
+pub mod legframe;
 pub mod logfile;
 pub mod nodestate;
 pub mod probe;
 pub mod psk;
+/// 注册报文 v2（`"H2" ‖ pubkey ‖ devTag ‖ ts ‖ mac`，MAC 标签 `hr-reg2`）的编码面。
+///
+/// M5 S0 迁址（设计 §1.2-M3）：原 `wtransport::reg` —— 出口 `admit_reg4` 用它**重建 v2
+/// 报文**再喂 `table.register`（时间窗/吊销/淘汰语义逐字不变），`server/table` 测试交叉验
+/// 同源；出口准入不随 WG 面退役 ⇒ 留 crate 根（名 `reg2` = 报文版本 v2 的编码面）。
+pub mod reg2;
 pub mod relay;
 pub mod relaywire;
 pub mod server;
@@ -36,6 +48,12 @@ pub mod session;
 pub mod session_lock;
 pub mod speedtest;
 pub mod speedtest_server;
+/// 栈 B（smoltcp 用户态栈）：`TunDevice`（`phy::Device`）+ `StackB` + `MTU`。
+///
+/// M5 S0 迁址（设计 §1.2-M2）：原 `wgcore::stackb` —— 出口 intercept **生产面在用**
+/// （`TunDevice` 字段 + `TunDevice::new()`）与 intercept E2E 测试泵（`StackB`）⇒ 不随
+/// 客户端 WG 面删除；客户端生产消费者退役后留 crate 根（生产消费者 = intercept）。
+pub mod stackb;
 pub mod status_json;
 /// 平台系统事实单源（fd 标志 / `sockaddr_un` 上限）——Q-G F1/F4；CLI crate 复用。
 pub mod sysfd;

@@ -36,7 +36,7 @@ use smoltcp::socket::udp::{self, Socket as UdpSocket};
 use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpCidr, IpEndpoint, Ipv4Address};
 
-use crate::wgcore::stackb::TunDevice;
+use crate::stackb::TunDevice;
 use crate::Logf;
 
 use self::dnsface::{DnsFaces, DnsRoute};
@@ -3203,7 +3203,7 @@ fn build_rst_for(v: &View5) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wgcore::stackb::StackB;
+    use crate::stackb::StackB;
     use smoltcp::iface::SocketHandle;
     use smoltcp::socket::tcp::Socket as TcpSocket;
     use smoltcp::time::Instant as SmolInstant;

@@ -10,7 +10,7 @@
 //! 腿 socket 并包腿帧；「最近摘除的腿」⇒ **丢 + 计数**（照 `server/bind.rs` 的 #17 纪律：
 //! 回落直连端口只会把包打到中继数据口、污染别的会话）；其余 ⇒ 直连端口。
 //! 腿帧 kind=5 由中继**原样透传**（中继不解释 kind）——这就是「中继代码零改动」的承载
-//! 方式；kind 字节的真源 = `homeway-core` 的 `wtransport::frame::FrameKind::Quic`（本
+//! 方式；kind 字节的真源 = `homeway-core` 的 `legframe::FrameKind::Quic`（本
 //! crate 是叶子、不得依赖 `homeway-core`，故按字节复刻；两处一致性由 `homeway-core` 侧
 //! 一条断言 `FrameKind::Quic.to_wire() == homeway_quic::FRAME_KIND_QUIC` 钉住）。
 //!
@@ -51,10 +51,10 @@ use crate::sync_util::lock_unpoison;
 
 use super::bridge::{DropKind, ExitBridge};
 
-/// 腿帧魔数（与 `wtransport::frame::FRAME_MAGIC` 同值）。
+/// 腿帧魔数（与 `legframe::FRAME_MAGIC` 同值）。
 const FRAME_MAGIC: u8 = 0xBB;
 /// 腿帧 kind=5（QUIC 载荷；真源 = `FrameKind::Quic`，跨 crate 一致性断言在
-/// `homeway-core` 的 `wtransport::frame` 测试里）。
+/// `homeway-core` 的 `legframe` 测试里）。
 pub const FRAME_KIND_QUIC: u8 = 5;
 /// 「最近摘除的腿」保留窗（与 `server/bind.rs` 的 `LEG_RECENT_TTL` 同值同义）。
 const LEG_RECENT_TTL: Duration = Duration::from_secs(5 * 60);

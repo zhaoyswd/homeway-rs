@@ -23,7 +23,7 @@ use homeway_core::server::intercept::nat::Ipv4View;
 use homeway_core::server::upnp;
 use homeway_core::speedtest;
 use homeway_core::token;
-use homeway_core::wtransport::frame;
+use homeway_core::legframe;
 
 const ITER: usize = 100_000;
 
@@ -59,12 +59,12 @@ fn seed() -> u64 {
 fn seeds() -> Vec<Vec<u8>> {
     let mut v: Vec<Vec<u8>> = Vec::new();
     // 腿帧/容器/信封骨架
-    v.push(frame::batch_bytes(&[(2, &[0x41; 66]), (0, &[1, 0, 0, 0, 2])]));
-    v.push(frame::frame_bytes(0, &[0xBB; 32]));
-    v.push(frame::frame_bytes(1, b"hint-payload"));
+    v.push(legframe::batch_bytes(&[(2, &[0x41; 66]), (0, &[1, 0, 0, 0, 2])]));
+    v.push(legframe::frame_bytes(0, &[0xBB; 32]));
+    v.push(legframe::frame_bytes(1, b"hint-payload"));
     let mut env = vec![0xAA];
     env.extend_from_slice(&[9u8; 8]);
-    env.extend_from_slice(&frame::frame_bytes(4, &[0; 10]));
+    env.extend_from_slice(&legframe::frame_bytes(4, &[0; 10]));
     v.push(env);
     // speedtest 帧（向量子集）
     v.push(b"SPED\x01\x00\x00\x00\x00\x00\x2d\x00".to_vec()); // 控制帧头（len=45）
@@ -180,17 +180,17 @@ fn fuzz_leg_frame() {
     let sd = seeds();
     for _ in 0..ITER {
         let b = gen_input(&mut rng, &sd);
-        let _ = frame::decode_frame(&b);
-        let _ = frame::decode_tagged(&b);
-        let _ = frame::decode_batch(&b);
+        let _ = legframe::decode_frame(&b);
+        let _ = legframe::decode_tagged(&b);
+        let _ = legframe::decode_batch(&b);
         // 真实调用形态（第二道门 低-23）：decode_batch 的消费者拿的是 decode_frame
         // 剥壳后的 payload（type=4 容器），不是整帧——两形态都打
-        if let Some((kind, payload)) = frame::decode_frame(&b) {
+        if let Some((kind, payload)) = legframe::decode_frame(&b) {
             if kind == 4 {
-                let _ = frame::decode_batch(payload);
+                let _ = legframe::decode_batch(payload);
             }
         }
-        let _ = frame::decode_hint_payload(&b);
+        let _ = legframe::decode_hint_payload(&b);
         let _ = homeway_core::relaywire::decode_relay_reg_frame(&b);
     }
 }

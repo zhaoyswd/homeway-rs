@@ -596,7 +596,7 @@ fn fmt_idle(d: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::wtransport::reg;
+    use crate::reg2;
     use crate::identity::DevTag;
     use std::sync::{Arc, Mutex};
 
@@ -832,7 +832,7 @@ mod tests {
         assert_eq!(r.unwrap_err(), RejectReason::Revoked);
     }
 
-    /// reg 编码真源交叉验（wtransport::reg 的 encode → 本表 verify）。
+    /// reg 编码真源交叉验（`crate::reg2` 的 encode → 本表 verify）。
     #[test]
     fn verify_accepts_client_encoding() {
         let secret_bytes = [0x42u8; 32];
@@ -841,7 +841,7 @@ mod tests {
         let dev = DevTag([0xBB; 8]);
         let ts = 1_800_000_000u64;
         let mut pkt2 = Vec::new();
-        reg::encode_reg_parts(&secret, &pubkey, dev.as_bytes(), ts, &mut pkt2);
+        reg2::encode_reg_parts(&secret, &pubkey, dev.as_bytes(), ts, &mut pkt2);
         let (pk, dt) = verify_reg(&secret_bytes, &pkt2, SystemTime::UNIX_EPOCH + Duration::from_secs(ts), Duration::ZERO).unwrap();
         assert_eq!(pk, pubkey);
         assert_eq!(dt, *dev.as_bytes());

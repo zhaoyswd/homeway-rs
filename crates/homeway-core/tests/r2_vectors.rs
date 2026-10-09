@@ -1,7 +1,8 @@
 //! R2 增族向量对照：reg 报文字节 / 端点缓存落盘 JSON / files 帧字节
 //! （向量由 tools/vector-gen 从 baseline 克隆的生产真源产出——fixtures/vectors/*.json）。
 
-use homeway_core::wtransport::{endpoint_cache, reg};
+use homeway_core::reg2;
+use homeway_core::wtransport::endpoint_cache;
 
 fn load(name: &str) -> serde_json::Value {
     let p = format!("{}/../../fixtures/vectors/{name}", env!("CARGO_MANIFEST_DIR"));
@@ -29,8 +30,8 @@ fn reg_wire_matches_go_vectors() {
         secret.copy_from_slice(&s);
         pubkey.copy_from_slice(&p);
         dev.copy_from_slice(&d);
-        let mut out = Vec::with_capacity(reg::REG_LEN);
-        reg::encode_reg_parts(
+        let mut out = Vec::with_capacity(reg2::REG_LEN);
+        reg2::encode_reg_parts(
             &homeway_core::token::Secret::from(secret),
             &pubkey,
             &dev,

@@ -356,8 +356,8 @@ fn island_uses_relay_and_pushes_traffic_through_tun() {
     let tok = token::decode(&token_str).expect("token 可解");
     let rpk = tok.rpk.expect("M1 的 token 必带出口 RPK");
 
-    // 中继候选：`label = sha256(peerId)[:8]`（真源 `wtransport::frame::relay_id`）
-    let label = homeway_core::wtransport::frame::relay_id(tok.peer_id.as_bytes());
+    // 中继候选：`label = sha256(peerId)[:8]`（真源 `legframe::relay_id`）
+    let label = homeway_core::legframe::relay_id(tok.peer_id.as_bytes());
     let relay_addr: SocketAddrV4 = match std::env::var("HOMEWAY_ISLAND_E2E_RELAY") {
         Ok(v) => v.parse().expect("HOMEWAY_ISLAND_E2E_RELAY 形如 ip:port"),
         Err(_) => tok

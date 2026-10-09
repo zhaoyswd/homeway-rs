@@ -28,7 +28,7 @@ use crate::server::intercept::{self, Config as ItcConfig, Interceptor, Stats as 
 use crate::server::state::State;
 use crate::server::table::{DevOp, DeviceTable, TableConfig};
 use crate::token::{Endpoint, EndpointKind};
-use crate::wtransport::reg;
+use crate::reg2;
 use crate::Logf;
 
 /// 默认内部地址/端口（Go serve.go 常量同源）。
@@ -1669,15 +1669,15 @@ fn admit_reg4(
         ));
         return Reg4Verdict::Rejected { why: RejectWhy::MacMismatch };
     };
-    let mut reg2 = Vec::with_capacity(reg::REG_LEN);
-    reg::encode_reg_parts(
+    let mut reg_pkt = Vec::with_capacity(reg2::REG_LEN);
+    reg2::encode_reg_parts(
         &crate::token::Secret::from(secret),
         &frame.pubkey(),
         &frame.dev_tag(),
         frame.ts(),
-        &mut reg2,
+        &mut reg_pkt,
     );
-    match table.register(&reg2, SystemTime::now()) {
+    match table.register(&reg_pkt, SystemTime::now()) {
         Ok((_action, ops)) => {
             apply_dev_ops(ops, device, quic);
             match table.device_addrs(&frame.dev_tag()) {

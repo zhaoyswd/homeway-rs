@@ -33,7 +33,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use crate::udpbatch::{bind_dual_stack, bind_v6_only, is_dual_stack, unmap_v4_in6};
-use crate::wtransport::frame::{self, FrameKind};
+use crate::legframe::{self, FrameKind};
 
 use super::device::InboundOut;
 use super::txring::{self, Slot};
@@ -392,8 +392,8 @@ impl ServerBind {
             return None;
         }
 
-        if buf.first() == Some(&frame::FRAME_MAGIC) {
-            let Some((kind, payload)) = frame::decode_frame(buf) else {
+        if buf.first() == Some(&legframe::FRAME_MAGIC) {
+            let Some((kind, payload)) = legframe::decode_frame(buf) else {
                 self.note_new_src(src, "畸形腿帧", buf.len());
                 return None; // 畸形腿帧：丢弃不中断
             };
@@ -417,7 +417,7 @@ impl ServerBind {
                 k if k == FrameKind::Control.to_wire() => {
                     self.note_new_src(src, "腿帧控制", buf.len());
                     if let (Some(f), Some(addr)) =
-                        (&mut self.on_hint, frame::decode_hint_payload(payload))
+                        (&mut self.on_hint, legframe::decode_hint_payload(payload))
                     {
                         f(addr, src);
                     }
@@ -465,7 +465,7 @@ impl ServerBind {
     /// 容器帧（Go handleBatch 同序）：reg 收集（**先于 data 应用**）→ data 只取首条投
     /// device → control 交 hint；未知消息类型忽略；无 data 且无 reg = 内部消费。
     fn handle_batch(&mut self, raw: &[u8], payload: &[u8], src: SocketAddr) -> Option<Inbound> {
-        let Some(msgs) = frame::decode_batch(payload) else {
+        let Some(msgs) = legframe::decode_batch(payload) else {
             self.note_new_src(src, "畸形容器", raw.len());
             return None;
         };
@@ -483,7 +483,7 @@ impl ServerBind {
                 }
                 k if k == FrameKind::Control.to_wire() => {
                     if let (Some(f), Some(addr)) =
-                        (&mut self.on_hint, frame::decode_hint_payload(mpayload))
+                        (&mut self.on_hint, legframe::decode_hint_payload(mpayload))
                     {
                         f(addr, src);
                     }
@@ -782,7 +782,7 @@ impl ServerBind {
                 .find(|lg| lg.sock.as_raw_fd() == fd)
             {
                 lg.last = Instant::now(); // Send 刷 last（Go Send 同义）
-                let wire = frame::frame_bytes(FrameKind::Data, wg);
+                let wire = legframe::frame_bytes(FrameKind::Data, wg);
                 let n = unsafe {
                     // MSG_NOSIGNAL（评审 D-1 中-4：与 relay/ctlface 同款——n != len 的
                     // 错误分支依赖 EPIPE 而非进程被信号打死）。
@@ -830,7 +830,7 @@ impl ServerBind {
             // 主 socket：帧化直写新 Vec（跨线程所有权移交的最简形态——每包一次
             // ~1.3KB 分配，39k 包/s ≈ 0.3% CPU 量级；回收环登记后续）
             let mut buf = Vec::with_capacity(wg.len() + 8);
-            frame::encode_frame(FrameKind::Data, wg, &mut buf);
+            legframe::encode_frame(FrameKind::Data, wg, &mut buf);
             if q.producer
                 .push(Slot { dst: self.xmit_addr(*ep), buf })
             {
@@ -1302,7 +1302,7 @@ mod tests {
 
         let reg = vec![0x41u8; 66];
         let wg = vec![1u8, 0, 0, 0, 2, 0, 0, 0]; // 假 init 形状
-        let batch = frame::batch_bytes(&[
+        let batch = legframe::batch_bytes(&[
             (FrameKind::Reg.to_wire(), &reg),
             (FrameKind::Data.to_wire(), &wg),
         ]);
@@ -1315,7 +1315,7 @@ mod tests {
         assert_eq!(dwg, wg);
 
         // 同一源的第二包不再记新源（测试日志面：检查不 panic 即可——判据在 3f 实测）
-        let r2 = b2.process_packet(&frame::frame_bytes(FrameKind::Data, &wg), src);
+        let r2 = b2.process_packet(&legframe::frame_bytes(FrameKind::Data, &wg), src);
         assert!(matches!(r2, Some(i) if i.data.is_some()));
         let _ = (AtomicUsize::new(0), Ordering::SeqCst); // 原计数断言面由形态断言替代
     }
@@ -1375,7 +1375,7 @@ mod tests {
         let mut b = ServerBind::open(0, "t", noop_logf()).unwrap();
         let src: SocketAddr = "127.0.0.1:5101".parse().unwrap();
         let payload = b"\x40\x01\x02\x03quic-initial-bytes";
-        let wire = frame::frame_bytes(FrameKind::Quic, payload);
+        let wire = legframe::frame_bytes(FrameKind::Quic, payload);
         let got = b.process_packet(&wire, src).expect("kind=5 应产 Inbound");
         let q = got.quic.expect("QUIC 载荷在 `quic` 字段");
         assert_eq!(q.src, src, "src = 腿远端（QUIC 眼里的对端地址）");
@@ -1396,7 +1396,7 @@ mod tests {
         let mut b = ServerBind::open(0, "t", noop_logf()).unwrap();
         let src: SocketAddr = "127.0.0.1:5102".parse().unwrap();
         // kind=5：不记
-        let wire = frame::frame_bytes(FrameKind::Quic, b"quic");
+        let wire = legframe::frame_bytes(FrameKind::Quic, b"quic");
         assert!(b.process_packet(&wire, src).is_some(), "kind=5 有产出");
         assert!(
             !b.src_seen.contains_key(&src),
@@ -1408,7 +1408,7 @@ mod tests {
         }
         assert!(!b.src_seen.contains_key(&src), "kind=5 多帧后仍零记录");
         // 反证：kind=0（数据）同 src ⇒ 记（既有行为未被动到）
-        let data = frame::frame_bytes(FrameKind::Data, b"wg");
+        let data = legframe::frame_bytes(FrameKind::Data, b"wg");
         assert!(b.process_packet(&data, src).is_some());
         assert!(b.src_seen.contains_key(&src), "kind=0 照旧记新源行（对照）");
     }
@@ -1489,10 +1489,10 @@ mod tests {
         // 畸形腿帧（长度 <2——只有魔数；Go DecodeFrame 同判）
         assert!(b.process_packet(&[0xBB], src).is_none());
         // 容器畸形（越界长度）
-        let bad_batch = frame::frame_bytes(FrameKind::Batch, &[0, 0xFF, 0]);
+        let bad_batch = legframe::frame_bytes(FrameKind::Batch, &[0, 0xFF, 0]);
         assert!(b.process_packet(&bad_batch, src).is_none());
         // hint 帧消费
-        let hint = frame::hint_bytes("1.2.3.4:9");
+        let hint = legframe::hint_bytes("1.2.3.4:9");
         assert!(b.process_packet(&hint, src).is_none());
     }
 

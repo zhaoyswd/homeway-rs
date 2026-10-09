@@ -4,7 +4,7 @@
 //! TCP 分帧边界 + MAC 四族定值）。
 
 use homeway_core::relaywire as rw;
-use homeway_core::wtransport::frame as wf;
+use homeway_core::legframe as wf;
 
 fn load() -> serde_json::Value {
     let p = format!("{}/../../fixtures/vectors/relay.json", env!("CARGO_MANIFEST_DIR"));

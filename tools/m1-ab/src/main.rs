@@ -580,7 +580,7 @@ fn spawn_reader(
 // ---------------------------------------------------------------------------
 
 fn relay_label_of(tok: &token::Token) -> [u8; 8] {
-    homeway_core::wtransport::frame::relay_id(tok.peer_id.as_bytes())
+    homeway_core::legframe::relay_id(tok.peer_id.as_bytes())
 }
 
 /// `--force-relay`：把 token 里的 **QUIC 直连端点（kind=2）改指 127.0.0.1:1**

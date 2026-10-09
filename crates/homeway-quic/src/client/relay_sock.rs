@@ -48,9 +48,9 @@ use crate::sync_util::lock_unpoison;
 
 use super::log_due;
 
-/// 标签帧魔数（`[0xAA][label8]` 前缀；真源 = `wtransport::frame::RELAY_TAG_MAGIC`）。
+/// 标签帧魔数（`[0xAA][label8]` 前缀；真源 = `legframe::RELAY_TAG_MAGIC`）。
 pub(crate) const RELAY_TAG_MAGIC: u8 = 0xAA;
-/// 腿帧魔数（`[0xBB][kind]` 前缀；真源 = `wtransport::frame::FRAME_MAGIC`）。
+/// 腿帧魔数（`[0xBB][kind]` 前缀；真源 = `legframe::FRAME_MAGIC`）。
 pub(crate) const FRAME_MAGIC: u8 = 0xBB;
 /// 标签帧头长（`[0xAA][label8]`）。
 pub(crate) const RELAY_TAG_LEN: usize = 9;

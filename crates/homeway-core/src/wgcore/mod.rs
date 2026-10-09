@@ -34,13 +34,10 @@ use smoltcp::time::Instant as SmolInstant;
 
 use crate::identity::Identity;
 use crate::psk::Psk;
+use crate::stackb::{DialError, StackB};
 use crate::token::{PeerId, Secret};
 use crate::tunnel_addr;
 use crate::wtransport::{Bind, Candidate, RegCtx, Via};
-
-pub mod stackb;
-
-use self::stackb::{DialError, StackB};
 
 /// TUN 面错误回调类型（fd 读写失败 → facade markUnhealthy；driver 线程执行）。
 pub type OnTunError = Box<dyn Fn(&str) + Send>;
@@ -77,7 +74,7 @@ pub(crate) const CLIENT_CLOSE_BUDGET: Duration = Duration::from_secs(2);
 /// 经 TUN 的应用流量由 OHOS 内核回 ACK，本改动对其零作用。
 /// env `HOMEWAY_ACK_POLL_CHUNK`（字节阈值覆盖；CLI/harness 消融缝——手机上 env
 /// 不可设，真机 off 臂 = 装 baseline 核对照；大值 ≈ 旧行为〔单 poll〕）。
-const ACK_DRAIN_BYTES: usize = 2 * stackb::MTU; // 2×MTU（MSS=MTU-40 ⇒ 2 满段 > 1×MSS 即触发立即 ACK；抬 MTU 时随动——r2-3.4）
+const ACK_DRAIN_BYTES: usize = 2 * crate::stackb::MTU; // 2×MTU（MSS=MTU-40 ⇒ 2 满段 > 1×MSS 即触发立即 ACK；抬 MTU 时随动——r2-3.4）
 
 /// ACK drain 阈值（env 覆盖的缓存读——热路径不重复走 env 解析）。
 fn ack_drain_bytes() -> usize {
@@ -464,7 +461,7 @@ impl Engine {
                 self.last_rx_drop_logged_at = dropped;
                 (self.logf)(&format!(
                     "wgcore: 栈B 收队列溢出（QUEUE_CAP={}）累计丢弃 {dropped} 包——出口下行突发超队列容量",
-                    crate::wgcore::stackb::QUEUE_CAP
+                    crate::stackb::QUEUE_CAP
                 ));
             }
         }

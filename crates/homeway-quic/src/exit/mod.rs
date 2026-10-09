@@ -68,7 +68,7 @@ pub use bridge::{
 /// 的三服务 accept 循环直接吃它）+ 出口侧入队句柄 `ServiceIntakeTx`。
 pub use intake::{IntakeFull, ServiceIntake, ServiceIntakeTx, ServiceIntakes};
 /// 腿帧 kind=5（QUIC 载荷）的线字节：真源 = `homeway-core` 的
-/// `wtransport::frame::FrameKind::Quic`；本 crate 是叶子、按字节复刻，跨 crate 一致性由
+/// `legframe::FrameKind::Quic`；本 crate 是叶子、按字节复刻，跨 crate 一致性由
 /// `homeway-core` 侧的断言钉住（见 `socket` 模块头）。
 pub use socket::FRAME_KIND_QUIC;
 
