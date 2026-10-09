@@ -10,7 +10,9 @@
 //!    主动关闭、岛不等待关闭完成」；对**已建立但未胜出**的连接另行显式 `close()`
 //!    （§2.2 的现任裁决）。
 //! 3. **预算**：`budget` = 整轮预算（不是每候选）；到点未完成者按 drop 收；全候选失败
-//!    ⇒ [`IslandErr::NoCandidate`]。
+//!    ⇒ [`IslandErr::NoCandidate`]。**同一枚 `budget` 也划出准入段的可用量**（M2 §1.7）：
+//!    胜者产出后按 `max(剩余, ADMIT_MIN)` 给准入自带期限，失败/到点一律**显式关连接**
+//!    （见 [`admit_budget`] / [`close_on_failed_admission`]）。
 //!
 //! 节流（C4'）照 `wtransport/bind.rs` 的 MIRROR 行常数：每轮 ≤3 行、两行间隔 ≥1s
 //! （本切片每轮只打一行，闸由宿主持有——形态保留给 S2b/S3 的重复赛跑）。
@@ -31,6 +33,40 @@ use super::{Established, fmt_dur, server_name};
 /// C4' 行节流常数（照 `wtransport/bind.rs` 的 MIRROR 行：每轮 ≤3 行、间隔 ≥1s）。
 const RACE_LOG_MAX: u32 = 3;
 const RACE_LOG_GAP: Duration = Duration::from_secs(1);
+
+/// 准入段的**最小预算下界**（M2 设计 §1.7 / 设计门 r14 F8）：晚胜（赛跑吃光整轮预算）
+/// 时仍给准入一个下界，避免「必然失败但不说清」。
+pub(crate) const ADMIT_MIN: Duration = Duration::from_secs(2);
+
+/// 准入可用预算 = `max(剩余, ADMIT_MIN)`（设计 §1.7 的规则，写死在这里——纯值函数，
+/// 好让 `start_paused` 的虚拟时钟用例直接断言）。
+///
+/// **为什么准入段要自带期限**（r14 F8 的现状订正）：`QUIC_CONNECT_BUDGET` 今天只作赛跑
+/// 循环的 deadline；登记段自身没有任何超时，唯一外层界是宿主的 RPC 超时——那时归因会落到
+/// 笼统的 RPC 超时，且岛内任务仍持连接。本期限 + [`close_on_failed_admission`] 一起把
+/// 「准入失败」变成**有界且显式收口**的结论。
+pub(crate) fn admit_budget(total: Duration, elapsed: Duration) -> Duration {
+    total.saturating_sub(elapsed).max(ADMIT_MIN)
+}
+
+/// 准入段的自带期限包装（抽名 = 虚拟时钟可断言；`None` = 到点）。
+pub(super) async fn within<F: std::future::Future>(budget: Duration, fut: F) -> Option<F::Output> {
+    tokio::time::timeout(budget, fut).await.ok()
+}
+
+/// 准入失败/超时的**显式收口**（设计 §1.7-③ / 设计门 r14 F8）：岛内任务在失败后必须显式
+/// 关闭连接，**不留悬挂连接**。
+///
+/// 不关的代价：客户端侧要等 `max_idle_timeout=30s` 才有结论，出口侧的对端槽位被同一段
+/// 时间占着（M2 的「未认证状态有界」在客户端半边同样成立才是真闭环）。归因行是排障入口
+/// （行文含实际预算 ⇒ 能分辨「走了 `ADMIT_MIN` 下界」与「用了剩余量」）。
+fn close_on_failed_admission(conn: &Connection, why: &str, budget: Duration, logf: &Logf) {
+    conn.close(quinn::VarInt::from_u32(0), b"admission failed");
+    (*logf)(&format!(
+        "quic: 准入失败（{why}；预算 {}）—— 连接已显式关闭（不留悬挂）",
+        fmt_dur(budget)
+    ));
+}
 
 /// C4' 行节流器（双条件；宿主持有、跨轮复用）。
 pub(crate) struct LogGate {
@@ -169,8 +205,33 @@ pub(crate) async fn run(
     ));
 
     // ---- 准入（§1.7）：本连接的 exporter + 首条 bidi 控制流上的 `hr-reg4` 四帧 ----
-    let exporter = register::exporter_of(&conn)?;
-    let (send, recv) = register::register_on_control_stream(&conn, &cred, &exporter, logf).await?;
+    // **自带期限 + 失败显式收口**（设计 §1.7 / r14 F8）：预算 = `max(剩余, ADMIT_MIN)`，
+    // 到点/失败 ⇒ `RegistrationFailed` + 显式关连接（不留悬挂）。
+    let abudget = admit_budget(budget, t0.elapsed());
+    let exporter = match register::exporter_of(&conn) {
+        Ok(e) => e,
+        Err(e) => {
+            close_on_failed_admission(&conn, "取连接绑定值（TLS exporter）失败", abudget, logf);
+            return Err(e);
+        }
+    };
+    let (send, recv) = match within(
+        abudget,
+        register::register_on_control_stream(&conn, &cred, &exporter, logf),
+    )
+    .await
+    {
+        Some(Ok(pair)) => pair,
+        Some(Err(e)) => {
+            close_on_failed_admission(&conn, &format!("登记失败（{e}）"), abudget, logf);
+            return Err(e);
+        }
+        // 到点：出口面未回挑战/回执（或无响应）——客户端侧与「出口拒」在传输层不可区分
+        None => {
+            close_on_failed_admission(&conn, "超时（准入预算内未收到回执）", abudget, logf);
+            return Err(IslandErr::RegistrationFailed);
+        }
+    };
     let outcome = RaceOutcome {
         winner: ep,
         via,

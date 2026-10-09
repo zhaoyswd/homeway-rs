@@ -405,6 +405,27 @@ async fn send_wait<T>(
     }
 }
 
+/// [`send_wait`] 的**静默版**：不 pump 引擎桩 ⇒ 出口侧的准入裁决永远拿不到回执
+/// （S2-3 的「准入到点」与「引擎不答时客户端自带期限」两半专用）。
+async fn send_wait_silent<T>(
+    island: &Island,
+    make: impl FnOnce(IslandReply<T>) -> Cmd,
+    wait: Duration,
+) -> Result<T, IslandErr> {
+    let (tx, rx) = channel();
+    island.tx().send(make(tx)).expect("命令投递（unbounded）");
+    let deadline = Instant::now() + wait;
+    loop {
+        match rx.try_recv() {
+            Ok(v) => return v,
+            Err(TryRecvError::Disconnected) => return Err(IslandErr::EngineGone),
+            Err(TryRecvError::Empty) => {}
+        }
+        assert!(Instant::now() < deadline, "命令回执超时（岛未应答 ⇒ 挂死）");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+}
+
 /// 收日志行（非阻塞轮询版 `drain_until`）。
 async fn logs_until(rx: &Receiver<String>, needle: &str, wait: Duration) -> Vec<String> {
     let deadline = Instant::now() + wait;
@@ -830,6 +851,72 @@ async fn connect_while_racing_is_rejected_and_stop_is_prompt() {
         "收工不得越过上界：{:?}",
         t0.elapsed()
     );
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+// ---------- 2b. 准入预算（S2-3） ----------
+
+/// **判据（S2-3 / 设计 §1.7 / r14 F8）**：`ADMIT_MIN` 形态——赛跑预算压到 1.5s、出口侧
+/// **从不回执**（引擎桩不 pump ⇒ 裁决永不到达）⇒ 岛侧准入按 `max(剩余, ADMIT_MIN)` 到点：
+/// ①归因 `IslandErr::RegistrationFailed`；②归因行写明**实际预算 = 下界 2s**（证明走了
+/// `ADMIT_MIN` 而不是剩余量）；③**连接被显式 close**（出口面连接数回落 0——不是等 30s
+/// idle）；④耗时落 [下界, 出口侧 `ADMIT_DEADLINE` 10s) 区间内。
+#[tokio::test]
+async fn admission_budget_floor_fails_with_explicit_close() {
+    let quic = exit_face(8);
+    let stub = Stub::new();
+    let (logf, logs) = sink();
+    let island = island_with_log(Duration::from_secs(60), quic.rpk_public_key(), Arc::clone(&logf));
+    let addr = connectable(&quic);
+
+    let t0 = Instant::now();
+    let res = send_wait_silent(
+        &island,
+        |reply| Cmd::Connect {
+            cands: vec![direct(addr)],
+            budget: Duration::from_millis(1500), // 赛跑吃光 ⇒ 剩余 ≪ ADMIT_MIN
+            reply,
+        },
+        WAIT,
+    )
+    .await;
+    let elapsed = t0.elapsed();
+    assert!(
+        matches!(res, Err(IslandErr::RegistrationFailed)),
+        "准入到点必须归 RegistrationFailed：{res:?}"
+    );
+    assert!(
+        elapsed >= super::race::ADMIT_MIN,
+        "必须跑满下界（ADMIT_MIN=2s）才收口（剩余量会在毫秒级就失败）：{elapsed:?}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(8),
+        "不得拖到出口侧的 ADMIT_DEADLINE（10s）：{elapsed:?}"
+    );
+
+    let lines = logs_until(&logs, "quic: 准入失败", WAIT).await;
+    let line = lines
+        .iter()
+        .find(|l| l.contains("quic: 准入失败"))
+        .expect("准入失败行在（失败必须可归因，不静默）")
+        .clone();
+    assert!(line.contains("预算 2s"), "行文须写明实际预算 = 下界：{line}");
+    assert!(
+        line.contains("连接已显式关闭"),
+        "行文须写明显式收口（不留悬挂）：{line}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("quic: 准入已发起")),
+        "四帧已发起（Hello 已发）后才到点：{lines:?}"
+    );
+
+    // ③ 显式 close 的**出口侧证据**：连接数回落 0（若靠 idle 回收，这一格要 30s 才动）
+    assert!(
+        wait_for(&stub, &quic, || quic.snapshot().connections == 0, WAIT).await,
+        "岛侧必须显式关连接（出口面连接数应回落 0）：{:?}",
+        quic.snapshot().connections
+    );
+    assert!(island.stop_within(Instant::now() + BUDGET));
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
 
