@@ -360,6 +360,21 @@ impl ExitStats {
     }
 }
 
+/// 出口 QUIC 面的**只读计数句柄**（M3 S2）：`Clone` + `Send` + `Sync`，同步面（`homeway-core`
+/// 的 `serve status --json` 段）直读快照——不占出口线程、不碰面句柄的生命周期（面的收工
+/// 与句柄 drop 无关）。
+#[derive(Clone)]
+pub struct ExitStatsHandle {
+    stats: Arc<ExitStats>,
+}
+
+impl ExitStatsHandle {
+    /// 运行读数（原子直读；与 [`ExitQuic::snapshot`] 同源同形）。
+    pub fn snapshot(&self) -> ExitQuicSnapshot {
+        self.stats.snapshot()
+    }
+}
+
 /// 出口 QUIC 面句柄（同步面）：地址/公开身份/读数/两向投递/收工（幂等）。
 pub struct ExitQuic {
     local_addr: SocketAddr,
@@ -470,6 +485,14 @@ impl ExitQuic {
     /// 运行读数（轮询；无阻塞——原子直读，不含锁等待）。
     pub fn snapshot(&self) -> ExitQuicSnapshot {
         self.stats.snapshot()
+    }
+
+    /// 只读计数句柄（M3 S2：`serve status --json` 的 `quic` 段在**装配点**留一份，
+    /// 驱动线程仍独占面句柄；句柄 drop 不影响面的生命周期）。
+    pub fn stats_handle(&self) -> ExitStatsHandle {
+        ExitStatsHandle {
+            stats: Arc::clone(&self.stats),
+        }
     }
 
     /// 唤醒 fd（**引擎 poll 集**用它：入站队列非空时此 fd 可读；§1.4）。

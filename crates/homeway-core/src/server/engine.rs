@@ -231,6 +231,9 @@ pub struct ServeEngine {
     pub quic_local_addr: Option<SocketAddr>,
     /// 出口 RPK 公钥（进 token 的 32B；M1 §12-②）。
     pub quic_rpk_public_key: Option<homeway_quic::RpkPublicKey>,
+    /// 出口 QUIC 面**只读计数句柄**（M3 S2；None = 本世代面未起——`serve status --json`
+    /// 的 `quic` 段随之缺席）。
+    quic_stats: Option<homeway_quic::ExitStatsHandle>,
     stop_flags: Vec<Arc<AtomicBool>>,
     term_srv: Option<Arc<crate::term::service::TermService>>,
     pub state_dir: PathBuf,
@@ -436,101 +439,55 @@ impl ServeEngine {
         let mut bind = ServerBind::open_bound(cfg.listen_port, &cfg.build, bind_addr, resolved.as_ref().map(|i| (i.index, i.name.clone())), Arc::clone(&logf))?;
         let local_port = bind.local_port();
         std::fs::write(cache_dir.join("listen_port.txt"), format!("{local_port}\n"))?;
-        // ---- QUIC 面（M1 §1.1/§1.7：独立 UDP 端口 + 专用线程 + RPK 身份）----
-        // 端口：`serve.quic_listen`（缺省 = serve.listen + 1）；被占用按 WG 同款**退让**
-        // 语义换端口（+1…+9 → 随机），实际端口落 `cache/quic_listen_port.txt` 并由
-        // `ServeEngine::quic_local_addr` 暴露（token/UPnP/status 的唯一来源，§1.1）。
-        // 起不来 = **fail-soft**：WG 面与服务面照常（QUIC 档缺席要在行里看得见）。
-        // **S3-4 开关**：`serve.quic=false` ⇒ 整个面不建（无端口监听、无 E-q1/E-q4 行、
-        // token 无 QUIC 端点与 `rpk` 尾字段 ⇒ 逐字节回落 M1 前形态）。
-        let mut quic_brief: Option<(SocketAddr, homeway_quic::RpkPublicKey)> = None;
-        let quic_face = if !cfg.quic {
-            (logf)("quic: 面未启用（serve.quic=false）—— 不监听 QUIC 端口、token 不带 QUIC 端点（客户端将回落 WG）");
-            None
-        } else {
-            match crate::server::bind::listen_with_fallback_addr(quic_listen_port(&cfg), bind_addr) {
-            Ok(sock) => match sock.set_nonblocking(true) {
-                Ok(()) => {
-                    let seed = crate::server::quic_rpk_seed(&priv_key);
-                    // 抗放大闸生效值（M2 §3.2）：config 段（严格读层已校验值域）+ env 叠加
-                    // （非法 env ⇒ 记行 + 缺省，不 fail-fast）。
-                    let admit = crate::server::quic_admit::resolve_retry_policy(
-                        cfg.quic_admit.unwrap_or_default(),
-                        crate::envflag::quic_admit_retry_raw(),
-                        &logf,
-                    );
-                    match homeway_quic::ExitQuic::start(
-                        sock,
-                        homeway_quic::ExitQuicConfig::new(seed, cfg.max_devices).with_admit(admit),
-                        Arc::clone(&logf),
-                    ) {
-                        Ok(q) => {
-                            // L3 可弃缓存（与 listen_port.txt 同语义）：写失败不致命
-                            let _ = std::fs::write(
-                                cache_dir.join("quic_listen_port.txt"),
-                                format!("{}\n", q.local_addr().port()),
-                            );
-                            quic_brief = Some((q.local_addr(), q.rpk_public_key()));
-                            Some(q)
-                        }
-                        Err(e) => {
-                            (logf)(&format!(
-                                "⚠️ quic: 端点未起（{e}）—— QUIC 档不可用（WG 面与服务面不受影响）"
-                            ));
-                            None
-                        }
-                    }
-                }
-                Err(e) => {
-                    (logf)(&format!(
-                        "⚠️ quic: 端点未起（socket 置非阻塞失败：{e}）—— QUIC 档不可用（WG 面不受影响）"
-                    ));
-                    None
-                }
-            },
-            Err(e) => {
-                (logf)(&format!(
-                    "⚠️ quic: 端点未起（端口 {} 退让 +1…+9 与随机端口全失败：{e}）—— QUIC 档不可用（WG 面不受影响）",
-                    quic_listen_port(&cfg)
-                ));
-                None
-            }
-            }
-        };
         // 公布口径的 pinned 判据 = **运行期事实**（socket 钉卡成功与否 + 绑地址），
         // 看护循环重钉后更新（Go `pinnedNow`/`PinnedIface` 同义）。
         let pinned_flag = Arc::new(AtomicBool::new(bind.pinned.is_some() || bind_addr.is_some()));
 
-        // ---- files / speedtest / term UDS 服务（E14/E15/E16/E17）----
+        // ---- files / speedtest / term 服务（E14/E15/E16/E17）+ 服务入口（M3 S2）----
+        // 服务入口形态（设计 §2.2 方案 B′）：每个服务一枚 `ServiceIntake` = **两源**
+        // （UDS 监听器〔WG 服务腿/调试〕+ QUIC stream 队列〔tag 分发，出口面泵入队〕）。
+        // 容量 = 该服务在册上限 + K（§1.7 设计门 2-4/2-5：保证**应用层 busy 路径**先于
+        // intake 满触发）；`ServiceIntake` 同时是 `serve_stoppable` 的形参（服务本体零改）。
         let mut stop_flags = Vec::new();
         let mut socks = Vec::new();
         let mut term_srv: Option<Arc<crate::term::service::TermService>> = None;
+        let mut service_intakes = homeway_quic::ServiceIntakes::default();
         let files_srv = crate::files_server::FilesServer::open(cfg.files_root.as_deref(), Arc::clone(&dlogf)).ok();
         if let Some(fsrv) = files_srv {
             match crate::files_server::listen_local_service(&serve_dir, "files.sock", &dlogf) {
                 Ok(ln) => {
                     let own = sock_identity(&serve_dir.join("files.sock"));
                     socks.push((serve_dir.join("files.sock"), own));
+                    // E14（M3 §8.2-1 行文改写）：服务流 tag=1 + QUIC STREAM 承载 +
+                    // 本机 UDS 仍是 WG 服务腿入口（D1 下两腿并存 = 事实）
                     (logf)(&format!(
-                        "files 就绪：root={} (rw) sock={}（隧道IP:{} 经拦截层转投）",
+                        "files 就绪：root={} (rw) sock={}（服务流 tag=1；QUIC STREAM 承载；本机 UDS 仍为 WG 服务腿入口）",
                         fsrv.root_dir().display(),
-                        serve_dir.join("files.sock").display(),
-                        cfg.files_port
+                        serve_dir.join("files.sock").display()
                     ));
-                    let stop = spawn_service_stop_flag(&mut stop_flags);
-                    let d2 = Arc::clone(&dlogf);
-                    let d3 = Arc::clone(&dlogf);
-                    if let Err(e) = std::thread::Builder::new()
-                        .name("homeway-files".into())
-                        .spawn(move || {
-                            // F5：只 Fatal（监听面真没了）退工——退工记行（修前静默 `let _ =`）
-                            if let Err(e) = fsrv.serve_stoppable(ln, stop) {
-                                (d2)(&format!("files: 服务线程退工（{e}）——文件管理不可用，直到重启出口"));
-                            }
-                        })
-                    {
-                        (d3)(&format!("⚠️ files: 服务线程起不来（{e}）——监听点无人受理（文件管理不可用）"));
+                    if let Some((intake, tx)) = service_intake(
+                        ln,
+                        homeway_quic::tuning::service_defaults::intake_capacity(crate::files_server::MAX_CONNS),
+                        "files",
+                        &logf,
+                    ) {
+                        service_intakes.files = Some(tx);
+                        let stop = spawn_service_stop_flag(&mut stop_flags);
+                        let d2 = Arc::clone(&dlogf);
+                        let d3 = Arc::clone(&dlogf);
+                        if let Err(e) = std::thread::Builder::new()
+                            .name("homeway-files".into())
+                            .spawn(move || {
+                                // F5：只 Fatal（监听面真没了）退工——退工记行（修前静默 `let _ =`）
+                                if let Err(e) = fsrv.serve_stoppable(intake, stop) {
+                                    (d2)(&format!("files: 服务线程退工（{e}）——文件管理不可用，直到重启出口"));
+                                }
+                            })
+                        {
+                            (d3)(&format!("⚠️ files: 服务线程起不来（{e}）——监听点无人受理（文件管理不可用）"));
+                        }
                     }
+                    // 入口起不来（`None`）：该服务整条腿停用（已记行；QUIC 档该 tag 落到 0x22）
                 }
                 Err(e) => {
                     (logf)(&format!(
@@ -547,25 +504,33 @@ impl ServeEngine {
             Ok(ln) => {
                 let own = sock_identity(&serve_dir.join("speedtest.sock"));
                 socks.push((serve_dir.join("speedtest.sock"), own));
+                // E17（M3 §8.2-2 行文改写）：服务流 tag=3 + QUIC STREAM 承载
                 (logf)(&format!(
-                    "speedtest 就绪：sock={}（隧道IP:{} 经拦截层转投；内存收发不落盘）",
-                    serve_dir.join("speedtest.sock").display(),
-                    cfg.speedtest_port
+                    "speedtest 就绪：sock={}（服务流 tag=3；QUIC STREAM 承载；内存收发不落盘）",
+                    serve_dir.join("speedtest.sock").display()
                 ));
-                let stop = spawn_service_stop_flag(&mut stop_flags);
-                let srv2 = Arc::clone(&speed_srv);
-                let d2 = Arc::clone(&dlogf);
-                let d3 = Arc::clone(&dlogf);
-                if let Err(e) = std::thread::Builder::new()
-                    .name("homeway-speedtest".into())
-                    .spawn(move || {
-                        // F5：只 Fatal 退工——退工记行（修前静默 `let _ =`）
-                        if let Err(e) = srv2.serve_stoppable(ln, stop) {
-                            (d2)(&format!("speedtest: 服务线程退工（{e}）——测速不可用，直到重启出口"));
-                        }
-                    })
-                {
-                    (d3)(&format!("⚠️ speedtest: 服务线程起不来（{e}）——监听点无人受理（测速不可用）"));
+                if let Some((intake, tx)) = service_intake(
+                    ln,
+                    homeway_quic::tuning::service_defaults::intake_capacity(crate::speedtest_server::MAX_CONNS),
+                    "speedtest",
+                    &logf,
+                ) {
+                    service_intakes.speedtest = Some(tx);
+                    let stop = spawn_service_stop_flag(&mut stop_flags);
+                    let srv2 = Arc::clone(&speed_srv);
+                    let d2 = Arc::clone(&dlogf);
+                    let d3 = Arc::clone(&dlogf);
+                    if let Err(e) = std::thread::Builder::new()
+                        .name("homeway-speedtest".into())
+                        .spawn(move || {
+                            // F5：只 Fatal 退工——退工记行（修前静默 `let _ =`）
+                            if let Err(e) = srv2.serve_stoppable(intake, stop) {
+                                (d2)(&format!("speedtest: 服务线程退工（{e}）——测速不可用，直到重启出口"));
+                            }
+                        })
+                    {
+                        (d3)(&format!("⚠️ speedtest: 服务线程起不来（{e}）——监听点无人受理（测速不可用）"));
+                    }
                 }
             }
             Err(e) => {
@@ -598,13 +563,24 @@ impl ServeEngine {
                         tsrv.features_text(),
                         tsrv.vt_text()
                     ));
-                    let stop = spawn_service_stop_flag(&mut stop_flags);
-                    let t = Arc::clone(&tsrv);
-                    std::thread::Builder::new()
-                        .name("homeway-term".into())
-                        .spawn(move || t.serve_stoppable(ln, stop))
-                        .ok();
-                    term_srv = Some(tsrv);
+                    match service_intake(
+                        ln,
+                        homeway_quic::tuning::service_defaults::intake_capacity(tsrv.max_sessions()),
+                        "term",
+                        &logf,
+                    ) {
+                        Some((intake, tx)) => {
+                            service_intakes.term = Some(tx);
+                            let stop = spawn_service_stop_flag(&mut stop_flags);
+                            let t = Arc::clone(&tsrv);
+                            std::thread::Builder::new()
+                                .name("homeway-term".into())
+                                .spawn(move || t.serve_stoppable(intake, stop))
+                                .ok();
+                            term_srv = Some(tsrv);
+                        }
+                        None => tsrv.close(),
+                    }
                 }
                 Err(e) => {
                     // 与 files 同一取舍：可选服务起不来不影响隧道/转发
@@ -616,6 +592,74 @@ impl ServeEngine {
                 }
             }
         }
+
+        // ---- QUIC 面（M1 §1.1/§1.7：独立 UDP 端口 + 专用线程 + RPK 身份）----
+        // 端口：`serve.quic_listen`（缺省 = serve.listen + 1）；被占用按 WG 同款**退让**
+        // 语义换端口（+1…+9 → 随机），实际端口落 `cache/quic_listen_port.txt` 并由
+        // `ServeEngine::quic_local_addr` 暴露（token/UPnP/status 的唯一来源，§1.1）。
+        // 起不来 = **fail-soft**：WG 面与服务面照常（QUIC 档缺席要在行里看得见）。
+        // **S3-4 开关**：`serve.quic=false` ⇒ 整个面不建（无端口监听、无 E-q1/E-q4 行、
+        // token 无 QUIC 端点与 `rpk` 尾字段 ⇒ 逐字节回落 M1 前形态）。
+        let mut quic_brief: Option<(SocketAddr, homeway_quic::RpkPublicKey)> = None;
+        let mut quic_stats: Option<homeway_quic::ExitStatsHandle> = None;
+        let quic_face = if !cfg.quic {
+            (logf)("quic: 面未启用（serve.quic=false）—— 不监听 QUIC 端口、token 不带 QUIC 端点（客户端将回落 WG）");
+            None
+        } else {
+            match crate::server::bind::listen_with_fallback_addr(quic_listen_port(&cfg), bind_addr) {
+            Ok(sock) => match sock.set_nonblocking(true) {
+                Ok(()) => {
+                    let seed = crate::server::quic_rpk_seed(&priv_key);
+                    // 抗放大闸生效值（M2 §3.2）：config 段（严格读层已校验值域）+ env 叠加
+                    // （非法 env ⇒ 记行 + 缺省，不 fail-fast）。
+                    let admit = crate::server::quic_admit::resolve_retry_policy(
+                        cfg.quic_admit.unwrap_or_default(),
+                        crate::envflag::quic_admit_retry_raw(),
+                        &logf,
+                    );
+                    match homeway_quic::ExitQuic::start(
+                        sock,
+                        homeway_quic::ExitQuicConfig::new(seed, cfg.max_devices)
+                            .with_admit(admit)
+                            .with_intakes(service_intakes.clone()),
+                        Arc::clone(&logf),
+                    ) {
+                        Ok(q) => {
+                            // L3 可弃缓存（与 listen_port.txt 同语义）：写失败不致命
+                            let _ = std::fs::write(
+                                cache_dir.join("quic_listen_port.txt"),
+                                format!("{}\n", q.local_addr().port()),
+                            );
+                            quic_brief = Some((q.local_addr(), q.rpk_public_key()));
+                            // M3 S2：只读计数句柄留装配点（`serve status --json` 的
+                            // `quic` 段直读——驱动线程仍独占面句柄）
+                            quic_stats = Some(q.stats_handle());
+                            Some(q)
+                        }
+                        Err(e) => {
+                            (logf)(&format!(
+                                "⚠️ quic: 端点未起（{e}）—— QUIC 档不可用（WG 面与服务面不受影响）"
+                            ));
+                            None
+                        }
+                    }
+                }
+                Err(e) => {
+                    (logf)(&format!(
+                        "⚠️ quic: 端点未起（socket 置非阻塞失败：{e}）—— QUIC 档不可用（WG 面不受影响）"
+                    ));
+                    None
+                }
+            },
+            Err(e) => {
+                (logf)(&format!(
+                    "⚠️ quic: 端点未起（端口 {} 退让 +1…+9 与随机端口全失败：{e}）—— QUIC 档不可用（WG 面不受影响）",
+                    quic_listen_port(&cfg)
+                ));
+                None
+            }
+            }
+        };
 
         // ---- 命令通道（驱动线程收；观测/udpcap/中继控制面都经它交互） ----
         let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCmd>();
@@ -909,6 +953,7 @@ impl ServeEngine {
             local_port,
             quic_local_addr: quic_brief.as_ref().map(|(a, _)| *a),
             quic_rpk_public_key: quic_brief.as_ref().map(|(_, k)| *k),
+            quic_stats,
             stop_flags,
             term_srv,
             state_dir: cfg.state_dir.clone(),
@@ -959,6 +1004,12 @@ impl ServeEngine {
     /// 公网端点立即重测（换网事件）。
     pub fn kick_public_endpoint(&self) {
         let _ = self.cmd_tx.send(EngineCmd::KickPublicEndpoint);
+    }
+
+    /// 出口 QUIC 面计数快照（M3 S2；`None` = 本世代面未起）。**原子直读**、不占驱动线程
+    /// （与 `itc_stats` 同款观测缝），供 `serve status --json` 的 `quic` 段。
+    pub fn quic_snapshot(&self) -> Option<homeway_quic::ExitQuicSnapshot> {
+        self.quic_stats.as_ref().map(|h| h.snapshot())
     }
 
     /// 驱动线程在世位（false = 已停——正常 shutdown 或异常终结；统一进程 supervisor
@@ -1084,6 +1135,29 @@ fn remove_sock_own(path: &std::path::Path, own: (u64, u64)) {
     if let Ok(md) = std::fs::metadata(path) {
         if (md.dev(), md.ino()) == own {
             let _ = std::fs::remove_file(path);
+        }
+    }
+}
+
+/// 服务入口装配（M3 S2，设计 §2.2 方案 B′）：UDS 监听器 → [`homeway_quic::ServiceIntake`]
+/// （两源）+ 出口侧入队句柄。`capacity` = 该服务在册上限 + K。
+///
+/// 失败（自唤醒管道/权限面，理论面）⇒ 与「监听失败」同一取舍：**该服务整条腿停用**
+/// （记行 + 返回 `None`，调用方关掉服务对象）——`0x22`（服务不可用）才是如实观测
+/// （设计门 N16 的保守面：不做「静默降级成只有 UDS」）。
+fn service_intake(
+    ln: std::os::unix::net::UnixListener,
+    capacity: usize,
+    tag: &str,
+    logf: &Logf,
+) -> Option<(homeway_quic::ServiceIntake, homeway_quic::ServiceIntakeTx)> {
+    match homeway_quic::ServiceIntake::with_quic(ln, capacity) {
+        Ok((intake, tx)) => Some((intake, tx)),
+        Err(e) => {
+            (*logf)(&format!(
+                "⚠️ {tag}: 服务入口起不来（{e}）—— 该服务不可用（QUIC 档与该服务的本机入口一起停用），直到重启出口"
+            ));
+            None
         }
     }
 }

@@ -27,6 +27,8 @@
 use std::collections::HashMap;
 use std::io::Read;
 use std::os::unix::net::UnixListener;
+
+use homeway_quic::ServiceIntake;
 use std::os::unix::net::UnixStream;
 use std::sync::atomic::AtomicBool;
 use std::sync::atomic::AtomicU64;
@@ -778,6 +780,13 @@ impl TermService {
         svc
     }
 
+    /// 会话数上限（`HOMEWAY_TERM_MAX_SESSIONS`，缺省 16）——服务入口容量 = 它 + K
+    /// （M3 §1.7 设计门 2-4：term 今天**没有**连接级在册闸，入口容量按会话上限 + K 取，
+    /// 是**新引入的连接级上限**，行为变化见 `docs/reviews/M3-design.md` §8.2-16）。
+    pub fn max_sessions(&self) -> usize {
+        self.cfg.max_sessions
+    }
+
     /// 登录 shell 文本（就绪行用）。
     pub fn shell_text(&self) -> String {
         super::pty::login_shell()
@@ -827,20 +836,27 @@ impl TermService {
         }
     }
 
-    /// 同 [`Self::serve`]，但 accept 走非阻塞 + 停止位轮询——服务收工时监听线程
-    /// 可退出（不陪跑到进程结束；Go Shutdown 里的 `s.termLn.Close()` 同效）。
-    pub fn serve_stoppable(self: &Arc<Self>, ln: UnixListener, stop: Arc<AtomicBool>) {
-        use std::os::unix::io::AsRawFd as _;
-        let _ = ln.set_nonblocking(true);
-        let fd = ln.as_raw_fd();
+    /// 同 [`Self::serve`]，但 accept 走**两源入口**（[`ServiceIntake`]）+ 停止位轮询——
+    /// 服务收工时监听线程可退出（不陪跑到进程结束；Go Shutdown 里的 `s.termLn.Close()` 同效）。
+    ///
+    /// **M3 S2 的重写点（设计 §2.2）**：形参 `UnixListener → ServiceIntake`，poll 目标改成
+    /// intake 登记的**就绪 fd 集**（⑤：UDS 监听 fd + QUIC 唤醒读端）——两条性质逐条保住：
+    /// ①「poll 到达即 accept——**无 200ms 空闲延迟**」（评审 P7；唤醒面由 intake 的
+    /// 自唤醒管道承担，QUIC 入队写 1B 即刻可读）；②停止位在窗内可查（200ms 节拍不变）。
+    /// `ServiceIntake::from_listener` = 改前的单 UDS 形态（既有 P7 用例走它，语义零改）。
+    pub fn serve_stoppable(self: &Arc<Self>, intake: ServiceIntake, stop: Arc<AtomicBool>) {
         loop {
             if stop.load(Ordering::Relaxed) || self.stop.load(Ordering::Relaxed) {
                 return;
             }
-            // poll 等 POLLIN（连接**到达即返回**——纯 sleep 轮询会给空闲期连接加
+            // poll 就绪 fd 集（连接**到达即返回**——纯 sleep 轮询会给空闲期连接加
             // 平均 100ms 延迟；200ms 只是空闲醒来看停止位的节拍，评审 P7）
-            let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
-            let r = unsafe { libc::poll(&mut pfd, 1, 200) };
+            let mut pfds: Vec<libc::pollfd> = intake
+                .ready_fds()
+                .into_iter()
+                .map(|fd| libc::pollfd { fd, events: libc::POLLIN, revents: 0 })
+                .collect();
+            let r = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as libc::nfds_t, 200) };
             if r < 0 {
                 let err = std::io::Error::last_os_error();
                 if err.kind() == std::io::ErrorKind::Interrupted {
@@ -851,9 +867,8 @@ impl TermService {
             if r == 0 {
                 continue; // 空闲：只查停止位
             }
-            match ln.accept() {
-                Ok((stream, _)) => {
-                    let _ = stream.set_nonblocking(false);
+            match intake.accept() {
+                Ok(stream) => {
                     let svc = Arc::clone(self);
                     std::thread::Builder::new()
                         .name("term-conn".into())
@@ -3635,7 +3650,12 @@ mod tests {
 
     impl Client {
         fn connect(path: &std::path::Path) -> Self {
-            let stream = UnixStream::connect(path).unwrap();
+            Self::from_stream(UnixStream::connect(path).unwrap())
+        }
+
+        /// 从**任意一条已连上的服务侧连接**起（M3 S2：QUIC 入口 = 出口泵交出的
+        /// socketpair 服务端；握手帧断言与 UDS 路径共用同一份）。
+        fn from_stream(stream: UnixStream) -> Self {
             let mut io = FrameIo::new(stream);
             let g = io.read_frame_deadline(Duration::from_secs(5)).unwrap();
             assert_eq!(g.op, Op::GREETING);
@@ -4155,6 +4175,50 @@ mod tests {
         svc.close();
     }
 
+    /// **M3 S2 判据（服务入口承载面）**：经 **QUIC 源（socketpair）** 的客户端与经
+    /// **UDS 源** 的客户端拿到**逐字节相同**的握手帧与 LIST 应答载荷（「应用层零改动」的
+    /// 构造性钉法——HSP 帧层一行未改）；且两源在同一入口上**并发可用**（QUIC 不断开流时
+    /// UDS 照常受理）。
+    #[test]
+    fn intake_two_sources_serve_term_protocol_byte_exact() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let svc = svc_with(TermConfig::default(), Arc::clone(&lines));
+        let (ln, path) = start_listener();
+        let capacity = homeway_quic::tuning::service_defaults::intake_capacity(16);
+        assert_eq!(capacity, 20, "term 入口容量 = 会话上限 16 + 4（§8.2-16）");
+        let (intake, tx) = homeway_quic::ServiceIntake::with_quic(ln, capacity).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        {
+            let svc2 = Arc::clone(&svc);
+            let st2 = Arc::clone(&stop);
+            std::thread::spawn(move || svc2.serve_stoppable(intake, st2));
+        }
+        // 源①：UDS
+        let mut c1 = Client::connect(&path);
+        c1.send(Op::LIST, &[]);
+        let l1 = c1.expect(Op::LIST, 5);
+        // 源②：QUIC（socketpair 服务端）
+        let (svc_end, cli_end) = UnixStream::pair().unwrap();
+        tx.try_enqueue(svc_end).expect("入队");
+        let mut c2 = Client::from_stream(cli_end);
+        c2.send(Op::LIST, &[]);
+        let l2 = c2.expect(Op::LIST, 5);
+        assert_eq!(l2.op, l1.op, "LIST 帧类型");
+        assert_eq!(l2.payload, l1.payload, "LIST 应答载荷逐字节相同（两源同协议面）");
+        assert!(
+            String::from_utf8_lossy(&l2.payload).contains("\"sessions\""),
+            "内容面（防两源都回了空壳）：{}",
+            String::from_utf8_lossy(&l2.payload)
+        );
+        // 两源并发：QUIC 腿保持连接（c2 不收线）时 UDS 仍能受理
+        let mut c3 = Client::connect(&path);
+        c3.send(Op::LIST, &[]);
+        let _ = c3.expect(Op::LIST, 5);
+        drop((c1, c2, c3));
+        svc.close();
+        stop.store(true, Ordering::Relaxed);
+    }
+
     /// P7：serve_stoppable 置停止位后监听线程在窗内退出（engine 实际用的路径）。
     #[test]
     fn serve_stoppable_exits_on_stop() {
@@ -4164,7 +4228,9 @@ mod tests {
         let stop = Arc::new(AtomicBool::new(false));
         let s2 = Arc::clone(&svc);
         let st2 = Arc::clone(&stop);
-        let h = std::thread::spawn(move || s2.serve_stoppable(ln, st2));
+        // M3 S2：形参换成两源入口；`from_listener` = 改前的单 UDS 形态（语义零改）
+        let intake = ServiceIntake::from_listener(ln).expect("入口");
+        let h = std::thread::spawn(move || s2.serve_stoppable(intake, st2));
         // 连接可用（poll 到达即 accept——无 200ms 空闲延迟）
         let mut c = Client::connect(&path);
         c.send(Op::LIST, &[]);

@@ -421,6 +421,7 @@ impl Backend for DaemonCore {
                         peers: Vec::new(),
                         ddns: None,
                         intercept: Default::default(),
+                        quic: None,
                     },
                 )
                 .unwrap())),

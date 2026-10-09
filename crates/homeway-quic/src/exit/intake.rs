@@ -480,8 +480,13 @@ mod tests {
         let _ = std::fs::remove_file(&path);
     }
 
-    /// **判据（③ 唤醒面：QUIC 入队唤醒阻塞中的 accept）**：accept 已在 poll 中等待 ⇒
-    /// 入队必须**立即**唤醒它（远小于 poll 预算），且返回的正是那条 QUIC 连接。
+    /// **判据（③ 唤醒面：入队后 accept 不空转满预算）**：两源皆空时 accept 会 poll 一个预算；
+    /// 一旦 QUIC 入队（写 1B 唤醒字节），**在途或后续**的 accept 都必须立刻取到它
+    /// ——两种交错（accept 先进 poll / 入队先发生）都靠**电平触发**的唤醒字节收敛到同一
+    /// 结果：总等待远小于「无唤醒面」下的一条预算空转。
+    ///
+    /// 不上 `thread::sleep` 拼时序：唤醒字节在队列非空前恒可读（收干只在排空时），
+    /// 所以「入队在前」这一支也必然即刻返回（这正是电平触发的用意）。
     #[test]
     fn enqueue_wakes_a_blocked_accept_promptly() {
         let (intake, tx) = ServiceIntake::quic_only(4).expect("intake");
@@ -489,26 +494,26 @@ mod tests {
         let i2 = Arc::clone(&intake);
         let t0 = std::time::Instant::now();
         let h = std::thread::spawn(move || {
-            let s = i2.accept().expect("被唤醒后受理");
-            (s, t0.elapsed())
+            let mut s = i2.accept().expect("被唤醒后受理");
+            (read_marker(&mut s), t0.elapsed())
         });
-        // 让 accept 先进入 poll（起线程后小睡；200ms 预算内必已进 poll）
-        std::thread::sleep(Duration::from_millis(50));
-        let (a, _b) = StdUnixStream::pair().expect("socketpair");
+        let (a, b) = quic_pair();
+        (&b).write_all(&[0x77]).expect("写标记");
         let t_enq = std::time::Instant::now();
         tx.try_enqueue(a).expect("入队");
-        let (_s, waited) = h.join().expect("线程退出");
-        // 上界口径（flake 口径②：只判上界）：唤醒后 accept 的总等待 ≈ 入队前的 50ms + ε，
-        // 远小于「无唤醒面」下的 200ms 空转
+        let (marker, waited) = h.join().expect("线程退出");
+        assert_eq!(marker, 0x77, "取到的正是刚入队的那条");
+        // 上界口径（flake 口径②：只判上界）
         assert!(
-            waited < ACCEPT_POLL_BUDGET * 2,
-            "唤醒面未生效（等待 {waited:?} ≥ 2× 预算）"
+            waited < ACCEPT_POLL_BUDGET,
+            "唤醒面未生效（等待 {waited:?} ≥ 一条 poll 预算）"
         );
         assert!(
             t_enq.elapsed() < ACCEPT_POLL_BUDGET,
             "入队本身必须非阻塞（实得 {:?}）",
             t_enq.elapsed()
         );
+        assert_eq!(intake.taken_total(), 1);
     }
 
     /// **判据（② accept 超时 ⇒ WouldBlock；容量口径）**：两源皆空 ⇒ 一个 poll 预算后
@@ -520,8 +525,9 @@ mod tests {
         let t0 = std::time::Instant::now();
         let e = intake.accept().expect_err("两源皆空应超时");
         assert_eq!(e.kind(), io::ErrorKind::WouldBlock);
+        // 下界 = 硬要求（不许空转即返）；上界取宽（flake 口径②：只判上界，负载下不判精确墙钟）
         assert!(
-            t0.elapsed() >= ACCEPT_POLL_BUDGET && t0.elapsed() < ACCEPT_POLL_BUDGET * 4,
+            t0.elapsed() >= ACCEPT_POLL_BUDGET && t0.elapsed() < ACCEPT_POLL_BUDGET * 20,
             "超时预算区间（实得 {:?}）",
             t0.elapsed()
         );

@@ -83,7 +83,8 @@ pub use driver::{Island, IslandTx};
 /// 的配置层与装配点）直接读它，值域校验只有 [`AdmitLimits::validate`] 一处真源）。
 pub use exit::admit::AdmitLimits;
 pub use exit::{
-    ExitInbound, ExitQuic, ExitQuicConfig, ExitQuicErr, ExitQuicSnapshot, ExitSend, IntakeFull,
+    ExitInbound, ExitQuic, ExitQuicConfig, ExitQuicErr, ExitQuicSnapshot, ExitSend, ExitStatsHandle,
+    IntakeFull,
     Reg4Request, Reg4Verdict, RejectWhy, RetryPolicy, ServiceIntake, ServiceIntakeTx,
     ServiceIntakes, FRAME_KIND_QUIC,
 };
