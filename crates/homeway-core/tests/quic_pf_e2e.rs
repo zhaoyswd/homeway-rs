@@ -42,8 +42,22 @@ const LEAK_DIALS: u32 = 80;
 const RECOVER_ROUNDS: usize = 5;
 /// S4 falsify：下推耗时上界（预登记 8s；实测正常形态 0.7s/2.1s 两档）。
 const RECOVER_LIMIT: Duration = Duration::from_secs(8);
-/// 本机 LAN 直连地址（**直连网段**：设计 §0.4-2 禁非直连网段——那会被 fake-IP 代理接住）。
-const LAN_IP: &str = "192.168.3.12";
+/// 本机 LAN 直连地址的**缺省值**（开发机）：设计 §0.4-2 要求「直连网段」——非直连网段会被
+/// 本机 fake-IP 代理接住，测到的就不是我方拨号腿。
+///
+/// **换机/多网段环境**用 env `HOMEWAY_PF_E2E_LAN_IP=<ipv4>` 覆盖（代码门 r21 F4：此前写死常量，
+/// 换机时形态 3/4 会以「echo 可在指定地址绑定」这种**不指向环境**的报错失败）。
+const LAN_IP_DEFAULT: &str = "192.168.3.12";
+
+/// 本机 LAN 直连地址（见 [`LAN_IP_DEFAULT`]）。
+fn lan_ip() -> Ipv4Addr {
+    match std::env::var("HOMEWAY_PF_E2E_LAN_IP") {
+        Ok(s) => s
+            .parse()
+            .unwrap_or_else(|_| panic!("HOMEWAY_PF_E2E_LAN_IP={s:?} 不是 IPv4 字面量")),
+        Err(_) => LAN_IP_DEFAULT.parse().expect("缺省 LAN 地址可解析"),
+    }
+}
 /// 本机实测**黑洞**目标（设计 §12.1-④ 指定；SYN 无回音 ⇒ 出口 10s 预算到点如实给 `0x26`）。
 const BLACKHOLE: &str = "169.254.169.254:80";
 
@@ -412,8 +426,15 @@ fn start_wedge(upstream_port: u16) -> Wedge {
 }
 
 /// 在**指定地址**起一枚回环/任意地址 echo（形态 3/4 的 `{ip}:{port}` 目标面）。
+///
+/// 绑定失败 = 环境不符（该地址不在本机 / 已被占）⇒ 报错点明「可用 `HOMEWAY_PF_E2E_LAN_IP` 覆盖」
+/// （代码门 r21 F4：不把环境事实伪装成「代码写错」）。
 fn spawn_echo_at(addr: std::net::SocketAddrV4) -> (u16, Arc<std::sync::atomic::AtomicBool>) {
-    let ln = TcpListener::bind(addr).expect("echo 可在指定地址绑定");
+    let ln = TcpListener::bind(addr).unwrap_or_else(|e| {
+        panic!(
+            "echo 无法绑到 {addr}（{e}）——该地址须是本机直连网段地址；用 env HOMEWAY_PF_E2E_LAN_IP=<ipv4> 指定"
+        )
+    });
     let port = ln.local_addr().expect("echo 地址").port();
     let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
     let s2 = Arc::clone(&stop);
@@ -598,7 +619,8 @@ fn recover_downpush_on_island_satisfies_falsify_metrics() {
 /// （客户端 pf 监听器与出口目标同机同址同端口）⇒ 归真机（`targetIp=""`+`targetPort=0`
 /// 是 App 表单形态，真机 R1-S① 覆盖的是形态 2）。
 ///
-/// **运行前提（出口拒绝行节流 = 既有语义 `log_due(n) = n≤3 ∨ n%100=0`，全局计数、M4 零改动）**：
+/// **运行前提（出口行节流 = 既有语义 `log_due(n) = n≤3 ∨ n%100=0`，M4 零改动；两个独立窗：
+/// 受理行共用 `streams_open`、拒行共用 `stream_refused`，各自跨 tag 共享——代码门 r21 F11）**：
 /// 本用例的两条归因行须落在**新起出口**的头三次额度内 ⇒ 由 `tools/quic-pf-e2e.sh` 保证
 /// （顺序 = ride → 0x26 → **forms** → leak → s4，且驱动先 `wipe`+`start`）；手工单跑前请先
 /// `tools/local-rust-exit.sh wipe 1 && tools/local-rust-exit.sh start 1`。
@@ -610,6 +632,7 @@ fn port_forward_target_forms_and_failure_attribution() {
         std::env::var("HOMEWAY_ISLAND_E2E_EXIT_LOG").expect("须给 HOMEWAY_ISLAND_E2E_EXIT_LOG"),
     );
     let (echo2, stop2) = spawn_echo(); // 形态 2 的目标（回环任意端口）
+    let lan = lan_ip(); // LAN 直连地址（缺省 192.168.3.12；env HOMEWAY_PF_E2E_LAN_IP 覆盖）
     let l2 = free_port();
     let l3 = free_port();
     let l4 = free_port();
@@ -617,22 +640,22 @@ fn port_forward_target_forms_and_failure_attribution() {
     let l6 = free_port();
     let l7 = free_port();
     let dead = free_port();
-    // 形态 3 的目标 = `{ip}:{listen}`：echo 必须恰好监听 LAN_IP:l3
+    // 形态 3 的目标 = `{ip}:{listen}`：echo 必须恰好监听 `{lan}` 的 `l3`（LAN 地址见 `lan_ip()`）
     let (echo3, stop3) = spawn_echo_at(
-        format!("{LAN_IP}:{l3}").parse().expect("LAN:t 可解析"),
+        format!("{lan}:{l3}").parse().expect("LAN:t 可解析"),
     );
-    assert_eq!(echo3, l3, "形态 3 的 echo 必须落在 {LAN_IP}:{l3}");
+    assert_eq!(echo3, l3, "形态 3 的 echo 必须落在 {lan}:{l3}");
     // 形态 4 的目标 = `{ip}:{port}`（显式端口）
-    let (echo4, stop4) = spawn_echo_at(format!("{LAN_IP}:0").parse().expect("LAN:0 可解析"));
+    let (echo4, stop4) = spawn_echo_at(format!("{lan}:0").parse().expect("LAN:0 可解析"));
     // 显式回环格（`targetIp=127.0.0.1` + 独立 echo）
     let (echo_r, stop_r) = spawn_echo();
     let rules = format!(
         r#"[{{"listen":{l2},"targetIp":"","targetPort":{echo2}}},
-            {{"listen":{l3},"targetIp":"{LAN_IP}","targetPort":0}},
-            {{"listen":{l4},"targetIp":"{LAN_IP}","targetPort":{echo4}}},
+            {{"listen":{l3},"targetIp":"{lan}","targetPort":0}},
+            {{"listen":{l4},"targetIp":"{lan}","targetPort":{echo4}}},
             {{"listen":{l5},"targetIp":"127.0.0.1","targetPort":{echo_r}}},
             {{"listen":{l6},"targetIp":"","targetPort":{dead}}},
-            {{"listen":{l7},"targetIp":"{LAN_IP}","targetPort":{dead}}}]"#
+            {{"listen":{l7},"targetIp":"{lan}","targetPort":{dead}}}]"#
     );
     let (core, gen_log, _peer, exit_log, _tun) = start_generation(&token_str, &rules, "forms");
     let (l2d, l3d, l4d, l5d, l6d, l7d) = (l2, l3, l4, l5, l6, l7);
@@ -650,19 +673,19 @@ fn port_forward_target_forms_and_failure_attribution() {
         rule_state(&core, l7d)["target"]
     );
     assert_eq!(rule_state(&core, l2d)["target"], format!("主机:{echo2}"));
-    assert_eq!(rule_state(&core, l3d)["target"], format!("{LAN_IP}:{l3}"));
-    assert_eq!(rule_state(&core, l4d)["target"], format!("{LAN_IP}:{echo4}"));
+    assert_eq!(rule_state(&core, l3d)["target"], format!("{lan}:{l3}"));
+    assert_eq!(rule_state(&core, l4d)["target"], format!("{lan}:{echo4}"));
     assert_eq!(rule_state(&core, l5d)["target"], format!("127.0.0.1:{echo_r}"));
     // ---- spec R1① 的**行为断言**：映射**仅回环**（同端口在 LAN 地址上不得监听）----
     let lan_hit = std::net::TcpStream::connect_timeout(
-        &format!("{LAN_IP}:{l2d}").parse().expect("LAN:listen 可解析"),
+        &format!("{lan}:{l2d}").parse().expect("LAN:listen 可解析"),
         Duration::from_secs(3),
     );
     assert!(
         lan_hit.is_err(),
-        "spec R1①：映射只许在 127.0.0.1 上监听（不暴露局域网）——{LAN_IP}:{l2d} 却被接住"
+        "spec R1①：映射只许在 127.0.0.1 上监听（不暴露局域网）——{lan}:{l2d} 却被接住"
     );
-    println!("[pf-e2e] forms R1①：{LAN_IP}:{l2d} 连接被拒（仅回环）");
+    println!("[pf-e2e] forms R1①：{lan}:{l2d} 连接被拒（仅回环）");
     // ---- spec R1② 的**行为断言**：pf 往返**不骑 TUN 数据面**（岛 TUN 包计数不动）----
     let before = {
         let v: serde_json::Value = serde_json::from_str(&core.tun_status()).expect("JSON");
@@ -706,8 +729,8 @@ fn port_forward_target_forms_and_failure_attribution() {
         (
             "形态4 未监听",
             l7d,
-            format!("{LAN_IP}:{dead}"),
-            format!("目标拨号失败（{LAN_IP}:{dead}：Connection refused (os error 61)）"),
+            format!("{lan}:{dead}"),
+            format!("目标拨号失败（{lan}:{dead}：Connection refused (os error 61)）"),
         ),
     ] {
         let e = round_trip(listen, b"x").expect_err("死端口必失败");
@@ -742,7 +765,7 @@ fn port_forward_target_forms_and_failure_attribution() {
     assert!(
         dead_lines
             .iter()
-            .any(|l| l.contains(&format!("-> {LAN_IP}:{dead} 拨号失败")) && l.contains("目标拒绝")),
+            .any(|l| l.contains(&format!("-> {lan}:{dead} 拨号失败")) && l.contains("目标拒绝")),
         "形态 4 的链 A 行文：{dead_lines:?}"
     );
     // 计数面（R3：`pfFails` 逐条 +1；`conns` 随连接 ±1）

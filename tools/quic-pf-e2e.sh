@@ -60,8 +60,10 @@ run_one() {
   return $r
 }
 
-# **顺序是判据的一部分**（出口拒绝行/受理行的节流 = 既有语义 `log_due(n) = n≤3 ∨ n%100=0`，
-# 全局计数、M4 零改动）：断言出口行的用例必须落在**新起出口**的头三次额度内 ⇒ 顺序 =
+# **顺序是判据的一部分**（出口行的节流 = 既有语义 `log_due(n) = n≤3 ∨ n%100=0`，M4 零改动；
+# 代码门 r21 F11 订正：**两个独立计数窗**——受理/结束行共用 `streams_open` 计数、拒行共用
+# `stream_refused` 计数，各自「首 3 + 每 100」，且**跨 tag 共享**（dial 与 tag1–3/probe 同窗））
+# ⇒ 断言出口行的用例必须落在**新起出口**的头三次额度内 ⇒ 顺序 =
 # ride（受理行 #≤3）→ 0x26（拒绝 #1）→ forms（拒绝 #2/#3）→ leak（只断言客户端行）→ s4。
 # 单独重跑某条断言出口行的用例时须先 `local-rust-exit.sh wipe n && start n`（本脚本已保证）。
 run_one port_forward_rides_stream_dial_against_local_exit              "$RES/pf-ride.log"      || rc=1
@@ -110,13 +112,14 @@ spec "R1-②'" "客户端拨号缝只经 quic_stream::dial_target / session_conn
   zsh -c "grep -q 'fn pf_dial_via_run' '$SRC/facade/tun_exec.rs' && grep -q 'dial_target' '$SRC/facade/tun_exec.rs'"
 # R1③「不受应用绕过名单影响」= 结构性：**全核非测试代码里 `bypass` 零命中**（没有该配置面 ⇒
 # pf 路径无从消费；测试名里的 bypass 由 awk 在 `#[cfg(test)]` 处截断排除）
-spec "R1-③" "全核（core+quic）非测试代码零 `bypass`（无该配置面）" \
+# 注：desc 串**不得用反引号**（双引号内会触发命令替换，落纸描述残缺——代码门 r21 F8）。
+spec "R1-③" "全核（core+quic）非测试代码零 bypass（无该配置面）" \
   zsh -c "for f in \$(grep -rl bypass '$REPO_ROOT/crates/homeway-core/src' '$REPO_ROOT/crates/homeway-quic/src' --include='*.rs' 2>/dev/null); do if awk '/^#\[cfg\(test\)\]/{exit} {print}' \"\$f\" | grep -qi bypass; then exit 1; fi; done; exit 0"
 # R2「持久化/级联删除/重连生效在 tier」= 核侧无持久化面（HostStore 在 tier；核侧只有装表接口 + rc）
 spec "R2" "核侧**代码面**零 HostStore/hosts.json（注释引用不算）" \
   zsh -c "! grep -rnE 'HostStore|hosts\.json' '$SRC/facade/portfwd.rs' '$SRC/facade/mod.rs' | grep -vE ':[0-9]+:[[:space:]]*(//|/\*|\*)'"
 # R5「出口侧回环目标不经代理」= vacuous 达标（前提「出口配了转发代理」在 Rust 出口不存在）
-spec "R5" "实现面（crates/）零 `forward-via-proxy`（vacuous 达标；旧栈已退役）" \
+spec "R5" "实现面（crates/）零 forward-via-proxy（vacuous 达标；旧栈已退役）" \
   zsh -c "! grep -rq 'forward-via-proxy' '$REPO_ROOT/crates' 2>/dev/null"
 # R3/R4 的**行为面**：值域单测（本机可验的那半）
 spec "R3/R4" "portfwd 值域/状态面单测全绿（validate_table + 逐条状态 + code 真值）" \

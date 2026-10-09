@@ -3323,7 +3323,8 @@ mod tests {
     /// Q-F-B F4-4：热替换 rc 回 Go 语义——活世代 ⇒ `0`（**真装表**）；无世代 / 换代
     /// （gen 不符）/ 收口（stop 位）⇒ `-1` 且**无孤儿监听器**。
     #[test]
-    fn request_port_forwards_rc_zero_with_live_gen_stale_minus_one() {        let (logf, _lines) = {
+    fn request_port_forwards_rc_zero_with_live_gen_stale_minus_one() {
+        let (logf, _lines) = {
             let (tx, rx) = mpsc::channel::<String>();
             let l: Logf = Arc::new(move |s: &str| {
                 let _ = tx.send(s.to_owned());

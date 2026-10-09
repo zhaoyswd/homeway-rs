@@ -148,6 +148,13 @@ where
 /// 同一连接上的 files/term/speedtest/dial 全部 `Busy`。故：**开流成功之后立即构造
 /// [`StreamShared`]**——此后任何失败路径靠 drop 关流（`Drop` 里的 `Cmd::StreamClose` 有界
 /// `EXIT_RPC_BUDGET`），成功路径把同一枚 `Arc` 交给 [`QuicStream`]。
+///
+/// **残余微窗（代码门 r21 F3-b，如实登记；本侧无 id 可关 ⇒ 不可在客户端修）**：`StreamOpen`
+/// 的等回执在**本侧**先到点（`remain()` 耗尽）而岛侧恰在此刻把 `id` 成功投进通道的形态下，
+/// 调用方已放弃、`id` 也随通道消失 ⇒ 该流在岛内无句柄可关（岛侧兜底只覆盖 `reply.send`
+/// **失败**的一面，见 `homeway-quic/src/driver.rs` 的 `StreamOpen` 臂）。窗口 = 微秒级且需
+/// 累积 62 次才显形（跨一次「预算刚好用尽」的窄缝）⇒ 判据仍以**常态失败路径**（写帧失败 /
+/// 回执 0x25·0x26 / 空块 / 预算耗尽）为准，泄漏判据（`tests/quic_pf_e2e.rs`）只覆盖 `0x25` 面。
 pub(crate) fn dial_target(
     run: &Arc<GenRun>,
     dst: SocketAddrV4,
@@ -214,6 +221,11 @@ fn write_dial_frame(shared: &Arc<StreamShared>, dst: SocketAddrV4) -> io::Result
     Ok(())
 }
 
+/// 连续空块上限（**纯防御**，正常形态不可达）：岛侧若持续回 0 长块，下面的续读环否则永不收敛
+/// （设计只说「预算内续读」；`remain(None)` 的天文配置形态下更无全局时限）。32 = 远大于任何
+/// 分帧边界能产生的空块数，到点按**协议面无进展**收（`InvalidData` ⇒ pf 链按拨号失败处置）。
+const MAX_EMPTY_ACK_CHUNKS: u32 = 32;
+
 /// ④ 读 1B 回执（值空间穷举见 §2.2 的 ④ 表；返回**回执之后的余量**）。
 ///
 /// `read` 注入成闭包（生产 = `Cmd::StreamRead` 的有界等待；单测注入假块）——值空间的每一行
@@ -222,11 +234,24 @@ fn read_dial_ack<F>(deadline: Option<Instant>, mut read: F) -> io::Result<Vec<u8
 where
     F: FnMut(Duration) -> Result<Vec<u8>, StreamErr>,
 {
+    let mut empty_chunks: u32 = 0;
     loop {
         let wait = remain(deadline).map_err(stream_err_to_io)?;
         match read(wait) {
-            // 空块（0B 的 STREAM 帧）：**不是**结束形态 ⇒ 预算内续读（不得 `[0]` 索引 ⇒ panic）
-            Ok(chunk) if chunk.is_empty() => continue,
+            // 空块（0B 的 STREAM 帧）：**不是**结束形态 ⇒ 预算内续读（不得 `[0]` 索引 ⇒ panic）；
+            // 连续空块有界（[`MAX_EMPTY_ACK_CHUNKS`]）
+            Ok(chunk) if chunk.is_empty() => {
+                empty_chunks += 1;
+                if empty_chunks > MAX_EMPTY_ACK_CHUNKS {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "QUIC 服务流：dial 回执连续 {MAX_EMPTY_ACK_CHUNKS} 个空块（协议面无进展）"
+                        ),
+                    ));
+                }
+                continue;
+            }
             // 成功：首字节 = DIAL_OK，其后即目标侧裸字节（**余量必须带回**，§1.2 铁律）
             Ok(chunk) if chunk[0] == DIAL_OK => return Ok(chunk[1..].to_vec()),
             // 首字节非法 = 协议面错（**不得**当 EOF/成功）

@@ -14,6 +14,10 @@
 #   7. tools/matrix.sh --smoke            RRR 基础段冒烟
 # 全量档：--full 加 cargo test --ignored（fuzz_replay **12** 目标 × 100k；Q-D 批新增
 # ⑫⑬⑭ term 面——codec 目标带自产网格往返，全量档预计 **+2-4 min**）。
+# **不在本脚本内的手工门（代码门 r21 F12 点名；防「门存在但无人跑」）**：
+# `tools/quic-island-e2e.sh` / `quic-wg-e2e.sh` / `quic-ladder-e2e.sh` / **`quic-pf-e2e.sh`（M4 新）**
+# ——四条都需**本地私有出口**（起真实例 + 真 token）且耗时较长，故不进 ci-local；改代码后
+# 至少手工跑与本批相关的一条（`cargo test --workspace` 里这些用例是 `#[ignore]` = **不计入绿**）。
 # 预算（实测口径，2026-10-07 Q-A 修订）：**冒烟档快步 ≈399s ≈ 6.6 分钟**（R5-5f 收口
 # 实测值，热 target）；**冷构建首轮显著更长**（依赖全量编译，未见分钟级上界）。M0 起
 # 第 3 步多跑一条 OHOS 真链路（NDK 在：+≈1-2 min 增量构建）。另：

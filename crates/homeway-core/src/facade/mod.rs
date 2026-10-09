@@ -459,8 +459,12 @@ impl ClientCore {
     ///
     /// **M4 §5.3 分档（登记 §8 行 13）**：执行体按 `l3_on_island()` 分档——
     /// `true`（本世代 L3 真在岛上）⇒ 岛快探 + 一次复探 ⇒ **只产 `0/-1/-2`**
-    /// （`-2` = 无 attached/stale **或**岛不在；`-3/-4` 在该世代不可达）；
-    /// `false`（WG 档 / 岛未就的回落世代）⇒ WG 阶梯原路（`-1/-3/-4` 仍可达）。
+    /// （`-3/-4` 在该世代不可达）；`false`（WG 档 / 岛未就的回落世代）⇒ WG 阶梯原路
+    /// （`-1/-3/-4` 仍可达）。
+    /// **`-2` 的构成（代码门 r21 F1 订正）**：**只**来自既有两条前置——「无世代」与「陈世代」
+    /// （`tun_exec.rs::recover` 的前两个 `return -2`），**不含**「岛不在/未 attach」：那种形态
+    /// `l3_on_island()==false` ⇒ 走 WG 原路（`-1/-3/-4`）——设计 §5.3 原文曾把 `-2` 写宽，
+    /// 已在 `docs/INTEROP-CRITERIA.md` 追加更正行（登记只可追加）。
     /// tier 侧决策（`rc===0` 跳过整套重建 / 其余落重建）**不变**。
     pub fn tun_recover(&self, from: i64) -> i32 {
         let lvl = crate::session::recover::Level::clamp(from);
