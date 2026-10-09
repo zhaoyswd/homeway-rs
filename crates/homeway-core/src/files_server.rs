@@ -219,8 +219,14 @@ pub struct FilesServer {
 
 impl FilesServer {
     /// 打开根目录（rootDir 空 = 用户主目录）。不存在/不是目录 → 报错。
+    ///
+    /// **空串 = 未配置**（`Some("")` 与 `None` 同义；Go `files.Open("")` = `os.UserHomeDir()`，
+    /// `pkg/files/server.go:56-62`）。M3 S6 修复：统一进程的 `config.toml` 模板写
+    /// `files_root = ""`（键表注明「空=$HOME」），装配层搬过来的是 `Some(PathBuf::from(""))`
+    /// ⇒ 旧形态 `canonicalize()` 失败后 `is_dir()` 判负 ⇒ **恒打**「⚠️ files 根目录不可用」
+    /// （独立 `serve` 形态不生成模板故不受影响）。
     pub fn open(root: Option<&Path>, logf: crate::Logf) -> std::io::Result<Self> {
-        let root = match root {
+        let root = match root.filter(|p| !p.as_os_str().is_empty()) {
             Some(p) => p.to_path_buf(),
             None => std::env::var_os("HOME")
                 .map(PathBuf::from)
@@ -1839,5 +1845,26 @@ mod tests {
         let ln2 = listen_local_service(&dir, "files.sock", &logf);
         assert!(ln2.is_ok(), "死残留应可清重建");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **M3 S6 修复判据（统一进程 config 模板面）**：`files_root = ""`（`DEFAULT_CONFIG_TOML`
+    /// 的缺省形态）装配出来的是 `Some(PathBuf::from(""))` ⇒ 必须与 `None` 同义（Go
+    /// `files.Open("")` = `os.UserHomeDir()`）——旧形态恒打「⚠️ files 根目录不可用」。
+    /// **负例**：空串归一**不得**放松「不存在/不是目录」判负。
+    #[test]
+    fn empty_root_is_treated_as_unconfigured() {
+        let home = std::env::var_os("HOME").expect("测试环境须有 HOME");
+        let home = std::fs::canonicalize(PathBuf::from(home)).expect("HOME 必须存在");
+        let s = FilesServer::open(Some(Path::new("")), noop_logf()).expect("空串必须回落 $HOME");
+        assert_eq!(s.root_dir(), home.as_path(), "空串 = 未配置（$HOME）");
+        let n = FilesServer::open(None, noop_logf()).expect("None = $HOME");
+        assert_eq!(n.root_dir(), s.root_dir(), "空串与 None 同义（同一条回落路径）");
+        // 负例：非空但不存在 ⇒ 仍判负（Kind = NotFound，与旧形态同）
+        let missing = Path::new("/nonexistent-homeway-m3s6-files-root");
+        assert!(!missing.exists(), "负例前提：该路径不得存在");
+        assert!(
+            matches!(FilesServer::open(Some(missing), noop_logf()), Err(e) if e.kind() == std::io::ErrorKind::NotFound),
+            "空串归一不得放松「不是目录」判负"
+        );
     }
 }
