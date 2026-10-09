@@ -105,7 +105,7 @@ QUIC MTU 1400 + DPLPMTUD，窄路径超限丢弃 + 计数；⑤中继零改动�
 | **M0** | 骨架与依赖面（quinn/rustls/tokio 落地 + QUIC 岛设计 + 实验台转正 + 基线登记） | **已完成**（worktree 分支 `quic`，待用户指令合回 main） | 4/4 |
 | **M1** | QUIC 承载 + 全局代理（DATAGRAM + 迁移/赛跑） | **已完成**（实现 + 代码门 r13 有条件通过；**1 格未过已上报**：产品形态单连接内存；待用户指令合回 main） | 4/4 |
 | **M2** | 身份、设备表与准入（RPK + token 证明 + 抗放大） | **已完成**（S6 收口；代码门 r15 无高危；**1 项未过**：产品形态单连接内存；真机 S5-4 待用户点头） | 4/4 |
-| **M3** | 服务流迁移（STREAM tag；客户端 stackb 退役） | 未开工 | 0/4 |
+| **M3** | 服务流迁移（STREAM tag；客户端 stackb 退役） | **已完成**（S1–S9c 落地；设计门 r16/r17 + **代码门 r18**：两条高危〔阶梯活性洞 / 窗口整改未落登记〕已整改与补登；**吞吐门槛已过 1.35–1.37×**〔改前 0.46×〕；**2 项未过**：真机 R5 瞬时黑洞未做〔挂 M6〕、真机 R1 上传面不可自动化〔tier 触点〕；1 项 e2e 时点断言未做〔归 M5〕；待用户指令合回 main） | 4/4 |
 | **M4** | portfwd 承载适配（dial 缝换 STREAM；spec 不回退） | 未开工 | 0/3 |
 | **M5** | WG 路径删除与收束（大删码 + 判据全表登记） | 未开工 | 0/4 |
 | **M6** | 真机与性能终验（2×2 + 归因 + PERF 报告） | 未开工 | 0/3 |
@@ -115,24 +115,27 @@ QUIC MTU 1400 + DPLPMTUD，窄路径超限丢弃 + 计数；⑤中继零改动�
 
 > **本节 = 唯一的「现在该干什么」指针。** 主会话只认这里。
 
-1. **M2 已收口**（`docs/reviews/M2.md` = 实现 + 代码门 r15 记录（含威胁模型逐条验证）；规格 =
-   `docs/reviews/M2-design.md`（§13/§14/§15 实施期订正）；门槛读数 = `docs/reviews/M2-S5-evidence.md`）。
-   **M3（服务流迁移）等待用户「开工」指令**（逐期等指令，不自动接棒）。
-2. **M3 开工前先做一批「同类归一收口」**（代码门 r15 的 G3，D1 已证明这类缺口会以实测证伪形式暴露）：
-   `crates/homeway-core/src/probe.rs:230` 的 `probe_addr_acceptable` 首行 `unmap` + 用例、
-   `server/relayleg.rs` 的 `parse_relay_arg` 一处归一、候选/学习集键收口。
+1. **M3 已收口**（规格 = `docs/reviews/M3-design.md`（§14 两轮设计门 + §15/§16 实施期订正）；
+   实现与收口 = `docs/reviews/M3.md`（S1–S9c）；读数 = `docs/reviews/M3-S8-evidence.md`；登记 =
+   `INTEROP-CRITERIA.md` 的 M3 条目 + S9 整改 5 行 + 差异登记）。**M4（portfwd 收口）等待用户
+   「开工」指令**（逐期等指令，不自动接棒）。
+2. **M4 开工前的前置（设计已点名）**：①**NAPI `ClientCoreTunRecover` 未分档**（QUIC 档仍会走 WG 阶梯，
+   真机已可观测）——M4 设计门首条；②**A8/dial 判定表**（`STREAM[dial]` 的「出口本机」语义缺口与地址
+   接受集，M3 只定协议 + 拒未启用）；③`docs/reviews/M3.md` §7 的 **tier `connection-lifecycle` 修订稿
+   草案**（交付 = 用户触点，需转达）；④**M5 输入** = `.so` 终值 4,850,368 B + 内存两口径
+   （单连接 8 MiB / ×32 ≈ 256 MiB 最坏）+ 出口死亡风险 + 残余共享段上限 + S1 体积超预估。
 3. **待用户拍板**：①token 候选 B（设计 §4.2，本批按候选 A 不动 token，窗口未关）；②M1 遗留的内存
    门槛数值（产品形态 512K vs ≤+320K，M2 后无恶化）与体积预算口径（双栈 4.685MB = 1.233× 3.8MB，
    按设计属 M5 判）；③tier `log-index.md` 陈旧拦出包门（tier 侧触点）。**真机 S5-4 已做完**
    （2026-10-09 测试机授权后一轮跑完，见 M2 收口证据与 M1 真机面）。
-4. **观测面**：出口 quic 快照的外部只读面（`serve status --json` 平级 additive 段）随 M3 观测面期落
-   （设计 §15-1）。
-5. **交付位置（用户触点）**：M0–M2 全部工作在**独立 worktree** `~/Documents/projects/homeway-rs-quic`
+4. **观测面**：出口 quic 段的外部只读面**已随 M3 S2 落**（`serve status --json` 的 additive `quic` 段，
+   28 键）；M5 仍需补 A10 的「出口侧每连接收线」判据行（归 M5 出口观测面）。
+5. **交付位置（用户触点）**：M0–**M3** 全部工作在**独立 worktree** `~/Documents/projects/homeway-rs-quic`
    的分支 `quic` 上。**合回 main / push / 发 tag 均等用户显式指令**——主检出的 Q 批已收官
    （`4841b20`），合回**会有 2 个文档冲突**（`docs/INTEROP-CRITERIA.md` 与 `docs/QUIC-ROADMAP.md`
    两边都追加过条目，按并集解）。
-6. **M3 开工前置照旧**：复验工作树（干净）+ `cargo test --workspace` 绿基线 + 读 M2 的
-   `docs/INTEROP-CRITERIA.md` 登记条目与 `docs/reviews/M2.md` 差异登记。
+6. **M4 开工前置照旧**：复验工作树（干净）+ `cargo test --workspace` 绿基线 + 读 M3 的
+   `docs/INTEROP-CRITERIA.md` 登记条目与 `docs/reviews/M3.md` 差异登记。
 
 ## 每期执行协议（子代理按此跑，主会话按此核对）
 
@@ -409,6 +412,27 @@ fixtures 向量逐字节不变；**客户端 QUIC 档零 `stackb::` 可达引用
 **退出口**：服务面全绿 + **QUIC 档 stackb 消费点清零合入**（本体删除移 M5，与 `wgcore` 同批）+ tier
 `connection-lifecycle` 修订稿交付（tier 侧触点，M3 只出草案）。
 
+**收口证据（2026-10-09；真源 = `docs/reviews/M3.md` 的 S1–S9c 各节 + `docs/reviews/M3-S8-evidence.md` 台账）**：
+
+- **规格**：`docs/reviews/M3-design.md`（§14 设计门 r16 27 条 / r17 16 条逐条处置；§15 实施期订正 8 条；
+  **§16 流控窗整改回填**〔S9 实测把「每流接收窗」定为瓶颈：量化闭合到 1.2% 差〕）。
+- **实现记录**：`docs/reviews/M3.md`（S1 / S2 / S3+S5 / S4 / S6+S7 / S8 / 吞吐整改 / **S9c 代码门 + 收口**）。
+- **读数台账**：`docs/reviews/M3-S8-evidence.md`（§1 本地门槛 cpu/overhead/size/mem；§2 吞吐与共存 A/B；
+  §3 真机 R1–R7 逐格；§4 新发现；§5 收口门；**§7 吞吐整改定位/对照/回归 + 出口死亡随访**）。
+- **判据登记**：`docs/INTEROP-CRITERIA.md` 的 M3 主表（S7 的 32 行 + **S9 整改 5 行 + 差异登记 1 行**）
+  与数值语义表（+3 行）。
+- **门**：workspace 测试全绿 / clippy `-D warnings` 0 / 三目标（OHOS + musl×2）check 0 error /
+  `build-app-core.sh` 三门 / 隔离门 **11/11** / 词表门 PASS / e2e 三件套全绿。
+- **门槛**：服务流吞吐 **1.347–1.366×**（门槛 ≥0.95×，改前 0.464×）；`T_recv` 本地两相位
+  **2.45s / 1.29s**（≤3.5s）、真机 **2296ms / 847ms**（在用档）；`.so` = **4,850,368 B**
+  （M3 累计 +164,896 B，**M5 删码余量重算输入**）。
+- **真机（R1–R7）**：files 列目录/下载 ✓（下载件 sha256 = 源件）、term ✓（attach/分离/re-attach 同会话号）、
+  speedtest ✓、`T_recv` ✓、伪造 token ⇒ `0x11` + 回落 WG ✓、`_wg` 原串 ✓；**上传面不可自动化**（系统 picker
+  完成钮，tier 触点）；**R5 瞬时黑洞未做**（缺 token QUIC 端点改写面，挂 M6）。
+- **未过/未做（如实）**：上述两项真机项；A10 出口侧关闭时点 e2e 断言（归 M5 出口观测面）；出口进程
+  一次死亡**未复现**（随访仪器 `tools/m3-s9-bulk.sh`，进 M5 风险表）；残余共享段上限 73–76 MiB/s
+  **未定论**（交 M5）；NAPI `ClientCoreTunRecover` 未分档（**接受现状，归 M4 设计门**）。
+
 ## M4 portfwd 收口（估 1–2 会话日）
 
 **目标**：端口转发全形态经 `STREAM[dial]`；Q-F-B（`72f1325`）已落地的真监听器面**只做承载适配
@@ -576,6 +600,16 @@ fixtures 向量逐字节不变；**客户端 QUIC 档零 `stackb::` 可达引用
   再跑 wg 会读到上一轮铸的 token 而**假红**；解法 = wg 跑前先 `tools/local-rust-exit.sh wipe 1`。
   ②`tools/local-rust-exit.sh start` 在 `target/release/homeway-cli` 存在时**不重建** ⇒ 改完核必须先
   `cargo build --release -p homeway-cli` 再起实例，否则跑到旧二进制（现象 = 新行/新配置缺席）。
+- **本程序新增（M3 实现时登记，2026-10-09）**：①`term::service::tests::attach_size_applies_to_pty` 在
+  M3 各批全量并行跑里**多次**红（S6/S7/S9/S9c 各一次；**隔离复跑恒绿**，M3 对该文件仅「入口形参/在册闸」
+  类改动、与 60s 硬期限无关）⇒ 归**在册 load-sensitive 族**，红了先隔离复跑；②
+  `wgcore::tests::stop_within_detaches_and_reaper_closes_wake_fd`（S6 首轮全量并行 1 例红；隔离复跑绿）；
+  ③`client::tests::stream_write_reports_backpressure_with_original_buffer`（S9 吞吐棒期间**真红**：该用例
+  依赖「出口缺省接收窗 256 KiB」这一自变量 ⇒ 已按「自钉自变量」修，**修后三轮全绿、非 flake**）；
+  ④`client::tests::send_buffer_used_grows_under_load` 的交叉证据断言已按代码门 r18 C7② 改写为不依赖
+  排空速率的判据（原形态随调度翻转）——该用例**从在册 flake 面移出**（主判据不变）；
+  ⑤`daemon::tests::handshake_deadline_beats_slow_drip` 在 S8/S9/S9c 批继续复现（在册族）。
+  **口径照 M0 §9.2 ④**：红了先隔离单跑再判回归，**不静默重跑**。
 
 ## 附录 A：实验台与原始数据（2026-10-08）
 
