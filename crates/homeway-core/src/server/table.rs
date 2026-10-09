@@ -104,6 +104,19 @@ pub enum RejectReason {
 }
 
 impl RejectReason {
+    /// **M3 §4 的准入关闭码分桶**（`homeway-quic::EngineRejectClass`）：
+    /// `no-token`/`revoked` ⇒ 凭证面；`table-full`/`ip-conflict`（表压）⇒ 资源面。
+    ///
+    /// 分桶只影响 `CONNECTION_CLOSE` 的应用码（粗粒度两桶，不给未认证对端更多 Oracle）；
+    /// 表内详细归因行（`peer: ! reject reason=…`）逐字不变。
+    pub fn engine_class(self) -> homeway_quic::EngineRejectClass {
+        use homeway_quic::EngineRejectClass as C;
+        match self {
+            RejectReason::NoToken | RejectReason::Revoked => C::Credential,
+            RejectReason::TableFull | RejectReason::IpConflict => C::Resource,
+        }
+    }
+
     fn as_str(self) -> &'static str {
         match self {
             RejectReason::NoToken => "no-token",

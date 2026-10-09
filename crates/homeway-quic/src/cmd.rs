@@ -167,8 +167,33 @@ pub enum IslandErr {
     ConnectionLost,
     /// 登记窗内连接关闭：出口拒绝（坏 MAC/表满/吊销）或链路断——客户端侧不可区分，
     /// 出口侧归因行在出口日志。
+    ///
+    /// **M3 §4 起**：出口带**准入关闭码**（`0x11–0x14`）的拒绝走 [`Self::AdmissionRejected`]；
+    /// 本变体只剩「码不在白名单/无关闭原因/本地关」的形态（归因面**不扩**：未知码不给
+    /// 可行动文案——不给未认证对端额外 Oracle）。
     #[error("登记失败（连接在登记窗内关闭）")]
     RegistrationFailed,
+    /// **准入被拒**（M3 §4；**只在未绑定态映射**——设计门 F4）：出口以
+    /// `CONNECTION_CLOSE(code)` 拒绝，`code` ∈ `{0x11 凭证不被接受, 0x12 资源暂不可用,
+    /// 0x13 准入数据非法, 0x14 准入超时}`（取值/短语单源 = [`crate::admit_close`]）。
+    ///
+    /// 为什么不再是「一律 RegistrationFailed」：M2 真机发现①——三种拒绝原因在设备侧
+    /// 不可见，WG 回落又让黑洞期无观测 ⇒ 用户看到的是「莫名走了 WG」。
+    #[error("准入被拒（code=0x{code:02x}）")]
+    AdmissionRejected {
+        /// 出口写进 `CONNECTION_CLOSE` 的应用码（白名单内）。
+        code: u64,
+    },
+    /// **会话已关闭**（准入后：被替换/设备被摘除/对端主动关；M3 §4 的独立分支）。
+    ///
+    /// 与 [`Self::AdmissionRejected`] 严格分开：否则「会话中被吊销/被替换」会被误报成
+    /// 「准入被拒」（设计门 F4）。
+    #[error("会话已关闭（{reason}）")]
+    SessionClosed {
+        /// 出口的关闭短语（`replaced by newer registration` / `device removed` 等；
+        /// 空 = 用码值兜底）。
+        reason: String,
+    },
     /// 探活在预算内未获对端证据——**不误报活**（无证据即失败）。
     #[error("探活预算内无对端证据")]
     ProbeNoResponse,
@@ -407,6 +432,15 @@ pub struct IslandSnapshot {
     /// 新鲜度窗由消费侧（S4）按 `ProbeTuning::send_err_fresh` 判——本字段只出「多久以前」，
     /// 不让快照面替阶梯做判定。
     pub sock_send_err_age_ms: Option<u64>,
+
+    // ---------- M3 S5：准入失败归因（设计 §4；`quic` JSON 段的两个新键） ----------
+    /// 末次**准入被拒**的应用码（`None` = 未发生过）。
+    ///
+    /// 单向递增语义：一旦记录即保持（世代内最后一次拒绝的归因）——回落 WG 的世代里它是
+    /// App 回答「为什么走了 WG」的唯一依据（设计 §4）。
+    pub admit_reject_code: Option<u64>,
+    /// 上者的稳定短语（与 [`crate::admit_close::text`] 同源；`None` = 未发生/未知码）。
+    pub admit_reject_text: Option<String>,
 }
 
 /// 日志落点（与同步面同形：`Arc<dyn Fn(&str) + Send + Sync>`；域前缀由调用方自带）。

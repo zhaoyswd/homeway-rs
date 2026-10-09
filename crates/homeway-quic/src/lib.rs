@@ -53,6 +53,8 @@
 //! **异步栈名字只允许出现在 `driver.rs`、`client/**` 与 `exit/**`**（隔离门层 3 断言；
 //! 白名单同步扩了 `client/**`——见 `tools/check-quic-isolation.sh` 的注释与 commit 说明）。
 
+/// **准入拒绝的关闭码表**（M3 §4：出口写、客户端读的**单源**；纯 std）。
+pub mod admit_close;
 mod client;
 mod cmd;
 mod config;
@@ -83,10 +85,9 @@ pub use driver::{Island, IslandTx};
 /// 的配置层与装配点）直接读它，值域校验只有 [`AdmitLimits::validate`] 一处真源）。
 pub use exit::admit::AdmitLimits;
 pub use exit::{
-    ExitInbound, ExitQuic, ExitQuicConfig, ExitQuicErr, ExitQuicSnapshot, ExitSend, ExitStatsHandle,
-    IntakeFull,
-    Reg4Request, Reg4Verdict, RejectWhy, RetryPolicy, ServiceIntake, ServiceIntakeTx,
-    ServiceIntakes, FRAME_KIND_QUIC,
+    EngineRejectClass, ExitInbound, ExitQuic, ExitQuicConfig, ExitQuicErr, ExitQuicSnapshot,
+    ExitSend, ExitStatsHandle, IntakeFull, Reg4Request, Reg4Verdict, RejectWhy, RetryPolicy,
+    ServiceIntake, ServiceIntakeTx, ServiceIntakes, FRAME_KIND_QUIC,
 };
 /// STREAM 协议类型（M3 S1）：tag / 复位码 / 流错误 / 写回执——`homeway-core` 的换轨面
 /// （S3）用同一份类型，不另写 tag 字面量。

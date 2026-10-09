@@ -1073,9 +1073,11 @@ pub(crate) fn transport_of(run: &GenRun) -> TransportIn {
 
 /// `quic` 段快照（M1 S3-2；`None` = 岛不在 ⇒ JSON 整段缺席）。
 pub(crate) fn quic_status_of(run: &GenRun) -> Option<QuicIn> {
-    // 段存在判据 = **本世代 quic 档 且 岛实际在位**（回落 WG 的世代不出现该段——
-    // 它描述岛的实况，不是配置意图）
-    if run.bearer != L3Bearer::Quic || !run.l3_on_island() {
+    // 段存在判据 = **本世代 quic 档 且 岛已构造**（M3 S5 订正：**不再**要求「L3 落在岛上」）。
+    // 理由（§4）：岛建连失败（含准入被拒）时本世代回落 WG，而「为什么走了 WG」正是 App
+    // 需要的归因——旧判据下该段整段缺席，黑洞期设备侧不可见（M2 真机发现①）。
+    // 语义变化登记（S7）：`quic` 段 = 「本世代 quic 档的岛实况」（含未建连/被拒形态）。
+    if run.bearer != L3Bearer::Quic {
         return None;
     }
     let s = run.current_island()?.snapshot();
@@ -1110,6 +1112,9 @@ pub(crate) fn quic_in_of(s: &homeway_quic::IslandSnapshot) -> QuicIn {
         candidates: s.candidates as u64,
         mirrors: s.mirrors,
         send_buffer_used: s.send_buffer_used,
+        // M3 S5（§4）：准入归因（0/空串 = 未发生过）
+        admit_reject_code: s.admit_reject_code.unwrap_or(0),
+        admit_reject_text: s.admit_reject_text.clone().unwrap_or_default(),
     }
 }
 

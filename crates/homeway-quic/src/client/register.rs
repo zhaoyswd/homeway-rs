@@ -148,7 +148,11 @@ pub(crate) async fn register_on_control_stream(
 }
 
 /// 有界读一帧的回程字节：失败时按「连接是否已被对端关闭」分流归因
-/// （被出口拒绝 ⇒ `RegistrationFailed`；否则链路断 ⇒ `ConnectionLost`）。
+/// （被出口拒绝 ⇒ [`admission_rejected`] 的 typed 归因；否则链路断 ⇒ `ConnectionLost`）。
+///
+/// **M3 §4**：准入窗内（本函数只在准入面被调用）的 `ApplicationClosed{code}` 若落在
+/// [`crate::admit_close`] 的白名单里 ⇒ `IslandErr::AdmissionRejected{code}`（把「为什么
+/// 被拒」带回设备侧）；白名单外/无关闭原因 ⇒ 仍是 `RegistrationFailed`（原样）。
 async fn read_exact_or_registration_failed(
     conn: &quinn::Connection,
     recv: &mut quinn::RecvStream,
@@ -156,7 +160,50 @@ async fn read_exact_or_registration_failed(
 ) -> Result<(), IslandErr> {
     match recv.read_exact(buf).await {
         Ok(_) => Ok(()),
-        Err(_) if conn.close_reason().is_some() => Err(IslandErr::RegistrationFailed),
-        Err(_) => Err(IslandErr::ConnectionLost),
+        Err(_) => Err(admission_rejected(conn)),
+    }
+}
+
+/// 准入窗内失败 → typed 归因（**本函数是「未绑定态」的唯一映射点**，设计门 F4）。
+///
+/// 映射规则（§4）：`close_reason()` 是 `ApplicationClosed{error_code}` 且码在白名单
+/// （`0x11–0x14`）⇒ `AdmissionRejected{code}`；其余（本地关闭/超时回收/未知码）⇒ 今天
+/// 的 `RegistrationFailed`（**归因面不扩**：未知码不给可行动文案）。
+fn admission_rejected(conn: &quinn::Connection) -> IslandErr {
+    use quinn::ConnectionError as CE;
+    match conn.close_reason() {
+        Some(CE::ApplicationClosed(ac)) => {
+            let code = ac.error_code.into_inner();
+            if crate::admit_close::is_admission_code(code) {
+                IslandErr::AdmissionRejected { code }
+            } else {
+                IslandErr::RegistrationFailed
+            }
+        }
+        Some(_) => IslandErr::RegistrationFailed,
+        None => IslandErr::ConnectionLost,
+    }
+}
+
+/// **准入后**（已绑定）连接的关闭归因（§4 的独立分支）：`ApplicationClosed` ⇒
+/// `SessionClosed{reason}`（替换/吊销等**会话级**事件），其余 ⇒ `ConnectionLost`。
+///
+/// 与准入面的分界写死在此处：准入窗内走 [`admission_rejected`]，绑定后的连接死走本函数
+/// ——否则「会话中被吊销/被替换」会被误报成「准入被拒」。
+pub(crate) fn session_closed(conn: &quinn::Connection) -> IslandErr {
+    use quinn::ConnectionError as CE;
+    match conn.close_reason() {
+        Some(CE::ApplicationClosed(ac)) => {
+            let reason = String::from_utf8_lossy(&ac.reason).trim().to_owned();
+            IslandErr::SessionClosed {
+                reason: if reason.is_empty() {
+                    format!("对端关闭（code=0x{:02x}）", ac.error_code.into_inner())
+                } else {
+                    reason
+                },
+            }
+        }
+        Some(_) => IslandErr::ConnectionLost,
+        None => IslandErr::ConnectionLost,
     }
 }

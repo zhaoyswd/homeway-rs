@@ -138,6 +138,11 @@ pub struct QuicIn {
     /// 已占用（未确认）的 DATAGRAM 发送缓冲字节数（M1 交下项 N8① / M2 S2-5；
     /// **瞬时量**：无连接 = 0，满 = 1 MiB）。黑洞期「已入缓冲的 1 MiB」的可观测面。
     pub send_buffer_used: u64,
+    /// **末次准入被拒的关闭码**（M3 §4；`0` = 未发生过）。与 `admit_reject_text` 成对——
+    /// 回落 WG 的世代里 App 据此回答「为什么走了 WG」（M2 真机发现①的黑洞面）。
+    pub admit_reject_code: u64,
+    /// 上者的稳定短语（空串 = 未发生/未知码）。
+    pub admit_reject_text: String,
 }
 
 /// 快照 → tunStatusJSON（Go tunStatusJSON 逐键对齐；键序 = 字典序）。
@@ -273,6 +278,12 @@ pub fn tun_status_json(input: &TunStatusInput) -> String {
         qm.insert("candidates".into(), Value::from(q.candidates));
         qm.insert("mirrors".into(), Value::from(q.mirrors));
         qm.insert("send_buffer_used".into(), Value::from(q.send_buffer_used));
+        // M3 S5（§4/§8.2-12）：准入归因两键（additive；0/空串 = 未发生过）
+        qm.insert("admit_reject_code".into(), Value::from(q.admit_reject_code));
+        qm.insert(
+            "admit_reject_text".into(),
+            Value::String(q.admit_reject_text.clone()),
+        );
         m.insert("quic".into(), Value::Object(qm));
     }
 
@@ -499,6 +510,9 @@ mod tests {
                 candidates: 4,
                 mirrors: 9,
                 send_buffer_used: 4096,
+                // M3 S5（§8.2-12）：准入归因两键（additive）
+                admit_reject_code: 0x11,
+                admit_reject_text: "凭证不被接受".into(),
             }),
             ..bare
         };
@@ -507,10 +521,11 @@ mod tests {
         assert_eq!(
             qk,
             vec![
-                "candidates", "congestion_events", "connections", "current_mtu", "drops", "ep",
-                "local", "lost_packets", "migration_unconfirmed", "migrations", "mirrors", "mtu",
-                "packets_in", "packets_out", "relay_tx", "rtt_ms", "rx_ignored",
-                "send_buffer_used", "via",
+                // M3 S5：`admit_reject_code`/`admit_reject_text` 两键 additive（字典序在首）
+                "admit_reject_code", "admit_reject_text", "candidates", "congestion_events",
+                "connections", "current_mtu", "drops", "ep", "local", "lost_packets",
+                "migration_unconfirmed", "migrations", "mirrors", "mtu", "packets_in",
+                "packets_out", "relay_tx", "rtt_ms", "rx_ignored", "send_buffer_used", "via",
             ]
         );
         let dk: Vec<&str> = v["quic"]["drops"].as_object().unwrap().keys().map(|k| k.as_str()).collect();
@@ -523,6 +538,9 @@ mod tests {
         assert_eq!(v["quic"]["mtu"], 1362);
         assert_eq!(v["quic"]["via"], "relay");
         assert_eq!(v["quic"]["send_buffer_used"], 4096, "S2-5 的读数位进 JSON");
+        // M3 S5：准入归因（App 状态面「为什么走了 WG」的落点；0/空串 = 未发生）
+        assert_eq!(v["quic"]["admit_reject_code"], 0x11);
+        assert_eq!(v["quic"]["admit_reject_text"], "凭证不被接受");
     }
 
     /// runner 缺席 ⇒ stats/exitIp/link/portForwards/bridge 全缺（failed/prepare 期形态）。

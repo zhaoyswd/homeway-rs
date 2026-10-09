@@ -59,7 +59,9 @@ use socket::{ExitSock, LegTable};
 
 /// 两向边界的公面（引擎消费面）：入站事件 + 准入请求/裁决 + 出站投递结果。
 pub use admit::RetryPolicy;
-pub use bridge::{ExitInbound, ExitSend, Reg4Request, Reg4Verdict, RejectWhy};
+pub use bridge::{
+    EngineRejectClass, ExitInbound, ExitSend, Reg4Request, Reg4Verdict, RejectWhy,
+};
 /// 服务入口（M3 S2，§2.2 方案 B′）：服务侧受理面 `ServiceIntake`（**纯 std**，`homeway-core`
 /// 的三服务 accept 循环直接吃它）+ 出口侧入队句柄 `ServiceIntakeTx`。
 pub use intake::{IntakeFull, ServiceIntake, ServiceIntakeTx, ServiceIntakes};

@@ -81,6 +81,20 @@ impl Reg4Request {
     }
 }
 
+/// 引擎裁决拒绝的**类**（M3 §4：准入关闭码分桶用；**粗粒度两桶**——细粒度会给未认证
+/// 对端更多 Oracle）。
+///
+/// 分桶依据（`homeway-core` 的 `table::RejectReason` 四值）：`no-token`/`revoked` ⇒
+/// [`Self::Credential`]；`table-full`/`ip-conflict`（表压）⇒ [`Self::Resource`]。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+#[non_exhaustive]
+pub enum EngineRejectClass {
+    /// 凭证面（`no-token`/`revoked`）⇒ 关闭码 `0x11`。
+    Credential,
+    /// 资源面（`table-full`/`ip-conflict`）⇒ 关闭码 `0x12`。
+    Resource,
+}
+
 /// 引擎裁决的**类型化拒绝原因**（设计门 r14 F7）：MAC 试秘在引擎侧，出口面拿不到原因
 /// ⇒ 必须由 verdict 携带（否则出口面打不出 `hr-reg4 MAC 不符` 这条归因行）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -89,7 +103,11 @@ pub enum RejectWhy {
     /// 逐 secret 试秘全不命中（含**换连接重放**：exporter 不同 ⇒ MAC 恒不匹配）。
     MacMismatch,
     /// 引擎裁决拒绝（时间窗 ±90s / 吊销 / 表满 / 地址冲突）——表内已打归因行 + 计数。
-    EngineRejected,
+    /// **M3 §4**：带 [`EngineRejectClass`]（准入关闭码的分桶输入；行文与会话级拒绝面不变）。
+    EngineRejected {
+        /// 拒绝的类（凭证面 / 资源面）。
+        class: EngineRejectClass,
+    },
     /// **刷新帧的第三道前置**（设计 §1.4 步骤 6 ② / 设计门 r14 F25）：MAC 未验之前先看
     /// 「表内仍在册」——设备已被淘汰（TTL/表满/显式摘除）时刷新帧必须被拒，否则表里一有
     /// 空位它就会把设备重新 `Added`（**resurrect**：淘汰语义被一个刷新帧抹平）。
@@ -99,10 +117,11 @@ pub enum RejectWhy {
 
 impl RejectWhy {
     /// 出口面 `准入被拒` 行的 `why` 文案（设计 §1.4-4.3 的两类落点 + 刷新第三道前置）。
+    /// **逐字不变**（M3 §4：出口侧详细归因行不改——只加关闭码）。
     pub fn text(self) -> &'static str {
         match self {
             Self::MacMismatch => "hr-reg4 MAC 不符——含换连接重放",
-            Self::EngineRejected => "引擎裁决拒绝（见引擎侧归因行）",
+            Self::EngineRejected { .. } => "引擎裁决拒绝（见引擎侧归因行）",
             Self::RefreshNotRegistered => "刷新帧但设备不在册（已淘汰，不 resurrect）",
         }
     }

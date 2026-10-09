@@ -42,7 +42,9 @@ use crate::reg4::{
 use crate::sync_util::lock_unpoison;
 
 use super::admit::{PROOF_FAIL_COOLDOWN, PROOF_FAIL_WINDOW};
-use super::bridge::{Bound, DropKind, ExitInbound, Reg4Request, Reg4Verdict, RejectWhy, dev_short};
+use super::bridge::{
+    Bound, DropKind, EngineRejectClass, ExitInbound, Reg4Request, Reg4Verdict, RejectWhy, dev_short,
+};
 use super::{FaceCtx, log_due};
 
 /// 发送结果（测试面：`Dropped` 与计数一一对应）。
@@ -196,18 +198,32 @@ async fn admit(
         return Admitted::Rejected; // 对端关流/连接死（无「拒绝」语义，不计拒绝）
     };
     if let Some(why) = head.legacy_why() {
-        reject(ctx, conn, &[0u8; 8], why, Counter::BeforeChallenge);
+        reject(ctx, conn, &[0u8; 8], why, Counter::BeforeChallenge, CloseCode::BadData);
         return Admitted::Rejected;
     }
     match head {
         FrameHead::Hello => {}
         FrameHead::Refresh => {
             // 未绑定连接上的刷新帧（设计 §1.4 步骤 6 的前置①）
-            reject(ctx, conn, &[0u8; 8], "刷新帧但连接未绑定", Counter::BeforeChallenge);
+            reject(
+                ctx,
+                conn,
+                &[0u8; 8],
+                "刷新帧但连接未绑定",
+                Counter::BeforeChallenge,
+                CloseCode::BadData,
+            );
             return Admitted::Rejected;
         }
         _ => {
-            reject(ctx, conn, &[0u8; 8], "帧格式非法（首帧必须是 Hello）", Counter::BeforeChallenge);
+            reject(
+                ctx,
+                conn,
+                &[0u8; 8],
+                "帧格式非法（首帧必须是 Hello）",
+                Counter::BeforeChallenge,
+                CloseCode::BadData,
+            );
             return Admitted::Rejected;
         }
     }
@@ -217,7 +233,14 @@ async fn admit(
         return Admitted::Rejected;
     }
     let Some(hello) = HelloFrame::parse(&hbuf) else {
-        reject(ctx, conn, &[0u8; 8], "帧格式非法（魔数/长度）", Counter::BeforeChallenge);
+        reject(
+            ctx,
+            conn,
+            &[0u8; 8],
+            "帧格式非法（魔数/长度）",
+            Counter::BeforeChallenge,
+            CloseCode::BadData,
+        );
         return Admitted::Rejected;
     };
 
@@ -231,6 +254,7 @@ async fn admit(
                 &hello.dev_tag,
                 "证明失败闸冷却中（同 dev 短时多次 nonce/MAC 类失败——暂不发挑战）",
                 Counter::BeforeChallenge,
+                CloseCode::Credential,
             );
             return Admitted::Rejected;
         }
@@ -247,6 +271,7 @@ async fn admit(
                 &hello.dev_tag,
                 &format!("挑战不可发（{e}）"),
                 Counter::BeforeChallenge,
+                CloseCode::Resource,
             );
             return Admitted::Rejected;
         }
@@ -277,7 +302,14 @@ async fn admit(
     };
     let (pbytes, phead) = waited;
     if let Some(why) = phead.legacy_why() {
-        reject(ctx, conn, &hello.dev_tag, why, Counter::AtProof);
+        reject(
+            ctx,
+            conn,
+            &hello.dev_tag,
+            why,
+            Counter::AtProof,
+            CloseCode::BadData,
+        );
         return Admitted::Rejected;
     }
     if phead != FrameHead::Proof {
@@ -287,7 +319,14 @@ async fn admit(
         } else {
             "帧格式非法（Hello 之后必须是 Proof）"
         };
-        reject(ctx, conn, &hello.dev_tag, why, Counter::BeforeChallenge);
+        reject(
+            ctx,
+            conn,
+            &hello.dev_tag,
+            why,
+            Counter::BeforeChallenge,
+            CloseCode::BadData,
+        );
         return Admitted::Rejected;
     }
     let mut pbuf = [0u8; reg4::PROOF_LEN];
@@ -296,7 +335,14 @@ async fn admit(
         return Admitted::Rejected;
     }
     let Some(proof) = ProofFrame::parse(&pbuf) else {
-        reject(ctx, conn, &hello.dev_tag, "帧格式非法（魔数/长度）", Counter::AtProof);
+        reject(
+            ctx,
+            conn,
+            &hello.dev_tag,
+            "帧格式非法（魔数/长度）",
+            Counter::AtProof,
+            CloseCode::BadData,
+        );
         return Admitted::Rejected;
     };
 
@@ -306,14 +352,28 @@ async fn admit(
         proof.nonce.ct_eq(&pending.nonce) && pending.issued_at.elapsed() <= ctx.nonce_ttl;
     if !ok_nonce {
         note_proof_fail(ctx, &proof.dev_tag); // §3.2-⑥：nonce 类失败进证明失败闸
-        reject(ctx, conn, &proof.dev_tag, "nonce 缺失/过期/已消费", Counter::AtProof);
+        reject(
+            ctx,
+            conn,
+            &proof.dev_tag,
+            "nonce 缺失/过期/已消费",
+            Counter::AtProof,
+            CloseCode::Credential,
+        );
         return Admitted::Rejected;
     }
 
     // ---- 投引擎裁决（MAC 试秘 + 设备表原路径）----
     let Some(exporter) = exporter_of(conn) else {
         // TLS exporter 取不到 = 该连接不是可绑定形态（理论上 TLS1.3 后必可得）
-        reject(ctx, conn, &proof.dev_tag, "TLS exporter 不可得", Counter::AtProof);
+        reject(
+            ctx,
+            conn,
+            &proof.dev_tag,
+            "TLS exporter 不可得",
+            Counter::AtProof,
+            CloseCode::BadData,
+        );
         return Admitted::Rejected;
     };
     let Some(verdict) = ask_engine(ctx, conn, Reg4Frame::Proof(proof), exporter).await else {
@@ -337,7 +397,14 @@ async fn admit(
             if why == RejectWhy::MacMismatch {
                 note_proof_fail(ctx, &proof.dev_tag);
             }
-            reject(ctx, conn, &proof.dev_tag, why.text(), Counter::AtProof);
+            reject(
+                ctx,
+                conn,
+                &proof.dev_tag,
+                why.text(),
+                Counter::AtProof,
+                CloseCode::of_why(why),
+            );
             Admitted::Rejected
         }
     }
@@ -378,12 +445,26 @@ async fn refresh_loop(conn: &Connection, conn_id: u64, ctx: &FaceCtx, recv: &mut
         let Some(bound) = ctx.bridge.binding_of_conn(conn_id) else {
             // 绑定已摘（设备被摘除/轮换/连接被替换）：拒绝 + 收摊（不再有「已绑定」身份）
             if head.is_client_inbound() {
-                reject(ctx, conn, &[0u8; 8], "连接未绑定（绑定已摘）", Counter::BeforeChallenge);
+                reject(
+                    ctx,
+                    conn,
+                    &[0u8; 8],
+                    "连接未绑定（绑定已摘）",
+                    Counter::BeforeChallenge,
+                    CloseCode::Session,
+                );
             }
             return;
         };
         if let Some(why) = head.legacy_why() {
-            reject(ctx, conn, &bound.dev, why, Counter::BeforeChallenge);
+            reject(
+                ctx,
+                conn,
+                &bound.dev,
+                why,
+                Counter::BeforeChallenge,
+                CloseCode::Session,
+            );
             return;
         }
         match head {
@@ -393,15 +474,36 @@ async fn refresh_loop(conn: &Connection, conn_id: u64, ctx: &FaceCtx, recv: &mut
                     return;
                 }
                 let Some(frame) = RefreshFrame::parse(&buf) else {
-                    reject(ctx, conn, &bound.dev, "帧格式非法（魔数/长度）", Counter::BeforeChallenge);
+                    reject(
+                        ctx,
+                        conn,
+                        &bound.dev,
+                        "帧格式非法（魔数/长度）",
+                        Counter::BeforeChallenge,
+                        CloseCode::Session,
+                    );
                     return;
                 };
                 if frame.pubkey != bound.pubkey || frame.dev_tag != bound.dev {
-                    reject(ctx, conn, &bound.dev, "刷新帧与绑定身份不符", Counter::BeforeChallenge);
+                    reject(
+                        ctx,
+                        conn,
+                        &bound.dev,
+                        "刷新帧与绑定身份不符",
+                        Counter::BeforeChallenge,
+                        CloseCode::Session,
+                    );
                     return;
                 }
                 let Some(exporter) = exporter_of(conn) else {
-                    reject(ctx, conn, &bound.dev, "TLS exporter 不可得", Counter::BeforeChallenge);
+                    reject(
+                        ctx,
+                        conn,
+                        &bound.dev,
+                        "TLS exporter 不可得",
+                        Counter::BeforeChallenge,
+                        CloseCode::Session,
+                    );
                     return;
                 };
                 let Some(verdict) = ask_engine(ctx, conn, Reg4Frame::Refresh(frame), exporter).await
@@ -415,7 +517,14 @@ async fn refresh_loop(conn: &Connection, conn_id: u64, ctx: &FaceCtx, recv: &mut
                         ctx.stats.regs_accepted.fetch_add(1, Ordering::SeqCst);
                     }
                     Reg4Verdict::Rejected { why } => {
-                        reject(ctx, conn, &bound.dev, why.text(), Counter::BeforeChallenge);
+                        reject(
+                            ctx,
+                            conn,
+                            &bound.dev,
+                            why.text(),
+                            Counter::BeforeChallenge,
+                            CloseCode::Session,
+                        );
                         return;
                     }
                 }
@@ -423,7 +532,14 @@ async fn refresh_loop(conn: &Connection, conn_id: u64, ctx: &FaceCtx, recv: &mut
             // **已绑定连接的再准入**（r14 F15）：否则 `bind()` 会把本连接改指到另一个 dev，
             // 旧 dev 的 `by_dev`/`by_pub` 残留 ⇒「连接 = 设备」破裂。
             FrameHead::Hello | FrameHead::Proof => {
-                reject(ctx, conn, &bound.dev, "已绑定连接的再准入", Counter::BeforeChallenge);
+                reject(
+                    ctx,
+                    conn,
+                    &bound.dev,
+                    "已绑定连接的再准入",
+                    Counter::BeforeChallenge,
+                    CloseCode::Session,
+                );
                 return;
             }
             _ => {
@@ -433,6 +549,7 @@ async fn refresh_loop(conn: &Connection, conn_id: u64, ctx: &FaceCtx, recv: &mut
                     &bound.dev,
                     "帧格式非法（已绑定连接只收刷新帧）",
                     Counter::BeforeChallenge,
+                    CloseCode::Session,
                 );
                 return;
             }
@@ -475,7 +592,11 @@ async fn ask_engine(
     {
         ctx.bridge
             .note_drop(DropKind::Unregistered, "准入请求（入境队列满 8192 条）");
-        conn.close(VarInt::from_u32(0), b"inbound queue full");
+        // M3 §4：入境队列满 = 资源桶（0x12）——准入窗内的第三处带码点
+        conn.close(
+            VarInt::from_u32(crate::admit_close::code::RESOURCE as u32),
+            b"inbound queue full",
+        );
         return None;
     }
     reply_rx.await.ok()
@@ -486,6 +607,53 @@ fn inflight_unauthenticated(ctx: &FaceCtx) -> u64 {
     let alive = ctx.stats.connections.load(Ordering::SeqCst);
     let bound = ctx.bridge.bound_count() as u64;
     alive.saturating_sub(bound)
+}
+
+/// 准入关闭码的**分派面**（M3 §4：出口写进 `CONNECTION_CLOSE` 的 `VarInt`）。
+///
+/// 取值单源 = [`crate::admit_close::code`]（客户端读同一份表）；本枚举只承担
+/// 「哪一处拒绝归哪一桶」的映射，**不另写码值**。
+///
+/// **哪些点带码**（设计 §4 的「4 + 3 处」表）：只有**准入窗内**的三处
+/// （`reject()` / `time_out()` / 入境队列满）；准入后的会话级关闭（替换/摘除）与
+/// 刷新面拒绝留 [`CloseCode::Session`]（`0`）——客户端据此不把它们误报成「准入被拒」。
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CloseCode {
+    /// `0x11` 凭证不被接受（MAC 不符 / 证明失败闸 / 引擎 `no-token`·`revoked`）。
+    Credential,
+    /// `0x12` 资源暂不可用（引擎 `table-full`·表压 / 入境队列满）。
+    Resource,
+    /// `0x13` 准入数据非法（帧格式/版本族）。
+    BadData,
+    /// `0x14` 准入超时（两族计时器）。
+    Timeout,
+    /// 会话级关闭（**非准入面**）：码值恒 `0`（= 今天的行为）。
+    Session,
+}
+
+impl CloseCode {
+    fn raw(self) -> u64 {
+        use crate::admit_close::code as c;
+        match self {
+            CloseCode::Credential => c::CREDENTIAL,
+            CloseCode::Resource => c::RESOURCE,
+            CloseCode::BadData => c::BAD_DATA,
+            CloseCode::Timeout => c::TIMEOUT,
+            CloseCode::Session => 0,
+        }
+    }
+
+    /// 引擎裁决拒绝 → 桶（§4 的两桶表；`RefreshNotRegistered` 是刷新面 ⇒ 会话级）。
+    fn of_why(why: RejectWhy) -> CloseCode {
+        match why {
+            RejectWhy::MacMismatch => CloseCode::Credential,
+            RejectWhy::EngineRejected { class } => match class {
+                EngineRejectClass::Credential => CloseCode::Credential,
+                EngineRejectClass::Resource => CloseCode::Resource,
+            },
+            RejectWhy::RefreshNotRegistered => CloseCode::Session,
+        }
+    }
 }
 
 /// 拒绝计数的落点（**准入漏斗的两段**——两段之和 = `regs_rejected`）。
@@ -508,7 +676,10 @@ impl Counter {
 }
 
 /// 关连接 + 计数 + 记行（**准入拒绝的唯一出口**）。
-fn reject(ctx: &FaceCtx, conn: &Connection, dev: &[u8; 8], why: &str, at: Counter) {
+///
+/// **M3 §4**：`code` 决定 `CONNECTION_CLOSE` 的应用码（准入窗内三处带码；刷新/会话级
+/// 拒绝留 `Session` = `0`）。行文与计数集**逐字不变**（出口侧详细归因行不改）。
+fn reject(ctx: &FaceCtx, conn: &Connection, dev: &[u8; 8], why: &str, at: Counter, code: CloseCode) {
     at.bump(ctx);
     let n = ctx.stats.regs_rejected.fetch_add(1, Ordering::SeqCst) + 1;
     if log_due(n) {
@@ -518,13 +689,15 @@ fn reject(ctx: &FaceCtx, conn: &Connection, dev: &[u8; 8], why: &str, at: Counte
             conn.remote_address()
         ));
     }
-    conn.close(VarInt::from_u32(0), b"registration rejected");
+    conn.close(VarInt::from_u32(code.raw() as u32), b"registration rejected");
 }
 
 /// 期限到点（`ADMIT_DEADLINE` / `NONCE_TTL`）：弃连接 + 计数 + 节流记行。
 ///
 /// 与 [`reject`] 分开的理由（设计 §1.6 的行族）：超时不是「对端发了坏帧」，归因行不同
 /// （`认证超时`），且**不等** `max_idle_timeout=30s`——主动 `CONNECTION_CLOSE`。
+/// **M3 §4**：两族计时器一律 `0x14`（准入超时；客户端据此把「出口没答应」与「出口拒了」
+/// 分开）。
 fn time_out(ctx: &FaceCtx, conn: &Connection, dur: Duration, which: TimeoutKind) {
     let n = match which {
         TimeoutKind::AdmitTimeout => ctx.stats.admit_timeouts.fetch_add(1, Ordering::SeqCst),
@@ -536,7 +709,10 @@ fn time_out(ctx: &FaceCtx, conn: &Connection, dur: Duration, which: TimeoutKind)
             conn.remote_address()
         ));
     }
-    conn.close(VarInt::from_u32(0), b"admission timeout");
+    conn.close(
+        VarInt::from_u32(CloseCode::Timeout.raw() as u32),
+        b"admission timeout",
+    );
 }
 
 /// [`time_out`] 的两类计时器（各自独立计数）。

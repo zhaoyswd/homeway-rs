@@ -20,7 +20,10 @@ use crate::reg4::{
     Nonce, ProofFrame, RefreshFrame,
 };
 use crate::rpk::{Ed25519Seed, RpkPublicKey};
-use crate::{ExitInbound, ExitQuic, ExitQuicConfig, Reg4Verdict, RejectWhy, RetryPolicy};
+use crate::{
+    EngineRejectClass, ExitInbound, ExitQuic, ExitQuicConfig, Reg4Verdict, RejectWhy,
+    RetryPolicy,
+};
 
 /// 收工预算（与 `wgcore::CLIENT_CLOSE_BUDGET` 同量级 = 2s）。
 const BUDGET: Duration = Duration::from_secs(2);
@@ -542,6 +545,8 @@ struct Stub {
     /// Proof 的裁决改成**引擎裁决拒绝**（S3-3 的 r14 F12 用例：表满/冲突/吊销/窗超这类
     /// 可用性故障**不得**计入证明失败闸）。
     engine_reject: AtomicBool,
+    /// 引擎裁决拒绝的**类**（M3 §4：准入关闭码分桶——凭证桶 `0x11` / 资源桶 `0x12`）。
+    engine_class: Mutex<EngineRejectClass>,
     packets: Mutex<Vec<Vec<u8>>>,
 }
 
@@ -555,6 +560,7 @@ impl Stub {
             refreshes: AtomicU64::new(0),
             evict_refresh: AtomicBool::new(false),
             engine_reject: AtomicBool::new(false),
+            engine_class: Mutex::new(EngineRejectClass::Credential),
             packets: Mutex::new(Vec::new()),
         })
     }
@@ -565,6 +571,12 @@ impl Stub {
     }
 
     /// 注入「引擎裁决拒绝」（S3-3 的 r14 F12 用例专用；MAC 校验被跳过 ⇒ 只判裁决形态）。
+    /// 引擎裁决拒绝的注入（`class` = M3 §4 的桶；缺省凭证桶）。
+    fn engine_reject_with(&self, on: bool, class: EngineRejectClass) {
+        self.engine_reject.store(on, Ordering::SeqCst);
+        *self.engine_class.lock().unwrap() = class;
+    }
+
     fn engine_reject(&self, on: bool) {
         self.engine_reject.store(on, Ordering::SeqCst);
     }
@@ -594,8 +606,9 @@ impl Stub {
                 } else if engine_rejected {
                     // 引擎裁决拒绝（表满/冲突/吊销/窗超的等价注入）：r14 F12 的负例面
                     self.rejected.fetch_add(1, Ordering::SeqCst);
+                    let class = *self.engine_class.lock().unwrap();
                     req.reply(Reg4Verdict::Rejected {
-                        why: RejectWhy::EngineRejected,
+                        why: RejectWhy::EngineRejected { class },
                     });
                 } else if req.frame.mac_matches(&self.secret, &req.exporter) {
                     self.accepted.fetch_add(1, Ordering::SeqCst);
@@ -1260,6 +1273,106 @@ async fn binding_removed_midflight_closes_connection() {
     let _ = send.write_all(&frame).await; // 连接已关 ⇒ 写失败是预期，不 panic
     tokio::time::sleep(Duration::from_millis(150)).await;
     assert_eq!(stub.refreshes(), before, "摘绑定后刷新帧不得投引擎");
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// 客户端侧观察到的 `CONNECTION_CLOSE` 应用码（`None` = 还没关/非应用关闭）。
+fn peer_close_code(conn: &quinn::Connection) -> Option<u64> {
+    match conn.close_reason() {
+        Some(quinn::ConnectionError::ApplicationClosed(ac)) => Some(ac.error_code.into_inner()),
+        _ => None,
+    }
+}
+
+/// **判据（M3 S5 / §4：准入失败归因回传）**：准入窗内的拒绝把「为什么」带进
+/// `CONNECTION_CLOSE` 的**应用码**（此前恒 `0` ⇒ 客户端三种拒绝一律 `登记失败`）：
+///
+/// | 触发 | 桶 | 码 |
+/// |---|---|---|
+/// | MAC 不符（`RejectWhy::MacMismatch`） | 凭证 | `0x11` |
+/// | 引擎裁决拒绝·凭证面（`no-token`/`revoked`） | 凭证 | `0x11` |
+/// | 引擎裁决拒绝·资源面（`table-full`/表压） | 资源 | `0x12` |
+/// | 帧格式/版本族（未知魔数） | 数据 | `0x13` |
+#[tokio::test]
+async fn admission_close_codes_are_bucketed() {
+    // ① MAC 不符 ⇒ 0x11（凭证桶）
+    {
+        let (logf, _rx) = sink();
+        let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(76), 32), logf)
+            .expect("端点可起");
+        let stub = Stub::new(SECRET);
+        let (_c, conn, _s) = client_conn(&quic).await;
+        let _ = four_frames(&stub, &quic, &conn, &[0x99u8; 32], &[0x77u8; 32], &[0x88u8; 8]).await;
+        assert!(
+            pump_until(&stub, &quic, || peer_close_code(&conn).is_some(), WAIT).await,
+            "被拒连接必须关"
+        );
+        assert_eq!(peer_close_code(&conn), Some(0x11), "MAC 不符 ⇒ 凭证桶");
+        assert!(quic.stop_within(Instant::now() + BUDGET));
+    }
+    // ②③ 引擎裁决拒绝的两桶（同 MAC 合法，仅裁决结果不同）
+    for (class, want) in [
+        (EngineRejectClass::Credential, 0x11u64),
+        (EngineRejectClass::Resource, 0x12u64),
+    ] {
+        let (logf, _rx) = sink();
+        let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(77), 32), logf)
+            .expect("端点可起");
+        let stub = Stub::new(SECRET);
+        stub.engine_reject_with(true, class);
+        let (_c, conn, _s) = client_conn(&quic).await;
+        let _ = four_frames(&stub, &quic, &conn, &SECRET, &[0x78u8; 32], &[0x79u8; 8]).await;
+        assert!(
+            pump_until(&stub, &quic, || peer_close_code(&conn).is_some(), WAIT).await,
+            "被拒连接必须关（{class:?}）"
+        );
+        assert_eq!(peer_close_code(&conn), Some(want), "{class:?} 的桶");
+        assert!(quic.stop_within(Instant::now() + BUDGET));
+    }
+    // ④ 帧格式非法（未知魔数，首帧不是 Hello）⇒ 0x13（数据桶）
+    {
+        let (logf, _rx) = sink();
+        let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(78), 32), logf)
+            .expect("端点可起");
+        let stub = Stub::new(SECRET);
+        let (_c, conn, _s) = client_conn(&quic).await;
+        let (mut send, _recv) = conn.open_bi().await.expect("open_bi");
+        let _ = send.write_all(b"XXBADFIRSTFRAME").await;
+        assert!(
+            pump_until(&stub, &quic, || peer_close_code(&conn).is_some(), WAIT).await,
+            "非法帧必须关"
+        );
+        assert_eq!(peer_close_code(&conn), Some(0x13), "帧格式 ⇒ 数据桶");
+        assert!(quic.stop_within(Instant::now() + BUDGET));
+    }
+}
+
+/// **判据（M3 S5 / §4 设计门 F4 的负例）**：**准入后**的会话级关闭（设备被摘除 ⇒
+/// `unbind_pub` 的 `device removed`）**不得**带准入码——客户端据此走 `SessionClosed`
+/// 分支，不会把「会话中被吊销」误报成「准入被拒」。
+#[tokio::test]
+async fn post_admission_close_carries_no_admission_code() {
+    let (logf, rx) = sink();
+    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(79), 32), logf)
+        .expect("端点可起");
+    let stub = Stub::new(SECRET);
+    let pubkey = [0xCBu8; 32];
+    let dev = [0xCCu8; 8];
+    let (_c, conn, _s) = client_conn(&quic).await;
+    let (_send, _recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
+    pump_until_line(&stub, &quic, &rx, "quic: 连接采纳 dev=cccccccc", WAIT).await;
+
+    quic.unbind_pub(&pubkey); // 设备摘除（会话级事件）
+    assert!(
+        pump_until(&stub, &quic, || peer_close_code(&conn).is_some(), WAIT).await,
+        "摘绑定必须拆连接"
+    );
+    let code = peer_close_code(&conn).expect("对端应用关闭");
+    assert_eq!(code, 0, "会话级关闭不得带准入码（码域 {:#x}–{:#x} 是准入面）", crate::admit_close::code::CREDENTIAL, crate::admit_close::code::TIMEOUT);
+    assert!(
+        !crate::admit_close::is_admission_code(code),
+        "客户端必须把它判成会话级（非准入面）"
+    );
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
 

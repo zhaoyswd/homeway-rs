@@ -1668,12 +1668,23 @@ fn admit_reg4(
             apply_dev_ops(ops, device, quic);
             match table.device_addrs(&frame.dev_tag()) {
                 Some((tunnel_ip, tun_ip)) => Reg4Verdict::Accepted { tunnel_ip, tun_ip },
-                // 理论不可达（刚注册成功必在表内）；真出现即拒（宁可让客户端重连）
-                None => Reg4Verdict::Rejected { why: RejectWhy::EngineRejected },
+                // 理论不可达（刚注册成功必在表内）；真出现即拒（宁可让客户端重连）。
+                // 归资源桶（M3 §4：这是出口侧的内部不一致，重试即可能成功）
+                None => Reg4Verdict::Rejected {
+                    why: RejectWhy::EngineRejected {
+                        class: homeway_quic::EngineRejectClass::Resource,
+                    },
+                },
             }
         }
-        // 表内已打拒绝归因行 + 计数（no-token/revoked/table-full/ip-conflict），此处不重复
-        Err(_reason) => Reg4Verdict::Rejected { why: RejectWhy::EngineRejected },
+        // 表内已打拒绝归因行 + 计数（no-token/revoked/table-full/ip-conflict），此处不重复；
+        // **M3 §4**：按 `RejectReason` 归桶（凭证面/资源面）随 verdict 带回出口面 ⇒ 关闭码
+        // 能分「token 不对/被吊销」与「表满/地址冲突」（客户端据此给可行动文案）。
+        Err(reason) => Reg4Verdict::Rejected {
+            why: RejectWhy::EngineRejected {
+                class: reason.engine_class(),
+            },
+        },
     }
 }
 
@@ -2989,7 +3000,15 @@ mod tests {
         );
         let v = admit_reg4(&frame, &exporter, &mut dev(), &mut table, None, &logf);
         assert!(
-            matches!(v, homeway_quic::Reg4Verdict::Rejected { why: homeway_quic::RejectWhy::EngineRejected }),
+            matches!(
+                v,
+                homeway_quic::Reg4Verdict::Rejected {
+                    why: homeway_quic::RejectWhy::EngineRejected {
+                        // M3 §4：超窗（ts 超 ±90s 窗）在表内归 `no-token` ⇒ **凭证桶**
+                        class: homeway_quic::EngineRejectClass::Credential,
+                    },
+                }
+            ),
             "超窗必须归 EngineRejected（MAC 过、窗拒）：{v:?}"
         );
         assert_eq!(table.len(), 0);

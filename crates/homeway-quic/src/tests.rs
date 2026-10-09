@@ -537,6 +537,13 @@ fn island_err_variants_are_pinned() {
             IslandErr::TunAttach(io_err) => {
                 let _: std::io::Error = io_err;
             }
+            // M3 S5 增补：准入归因（§4）——载荷仍**全是 std**（u64 / String；无异步栈夹带）
+            IslandErr::AdmissionRejected { code } => {
+                let _: u64 = code;
+            }
+            IslandErr::SessionClosed { reason } => {
+                let _: String = reason;
+            }
         }
     }
     let _: fn(IslandErr) = pin;

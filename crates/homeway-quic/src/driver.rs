@@ -564,6 +564,17 @@ fn run_driver(
                                     let _ = reply.send(Ok(outcome));
                                 }
                                 Err(e) => {
+                                    // M3 §4：准入被拒 ⇒ 归因行（**行名前缀刻意与出口的
+                                    // `quic: 准入被拒（dev=…` 区分**——设计门 P3）+ 快照两字段
+                                    // （App 状态面据此回答「为什么走了 WG」）。
+                                    if let IslandErr::AdmissionRejected { code } = &e {
+                                        let line = crate::admit_close::client_line(*code);
+                                        (*ctx.logf)(&line);
+                                        let mut s = lock_unpoison(&ctx.snapshot);
+                                        s.admit_reject_code = Some(*code);
+                                        s.admit_reject_text =
+                                            crate::admit_close::text(*code).map(str::to_owned);
+                                    }
                                     (*ctx.logf)(&format!("quic: 赛跑未成（{e}）"));
                                     let _ = reply.send(Err(e));
                                 }
@@ -700,6 +711,15 @@ async fn housekeeping(st: &mut DriverState, face: &Face, ctx: &IslandCtx, seam: 
     let patrol = st.patrol;
     // ① 连接死（对端关闭/空闲回收）：清面 + 记行 + **归 `patrol` 分类**（S2-6 判据）
     if st.live.as_ref().is_some_and(|l| !l.alive()) {
+        // M3 §4（设计门 F4）：**准入后**的会话级关闭（被替换/设备被摘除）单独归因——
+        // 与准入窗内的 `AdmissionRejected` 严格分开，不误报成「准入被拒」。
+        if let Some(l) = st.live.as_ref() {
+            if let IslandErr::SessionClosed { reason } = client::session_closed(&l.conn) {
+                (*ctx.logf)(&format!(
+                    "quic: 会话被对端关闭（{reason}）——会话级归因（非准入面）"
+                ));
+            }
+        }
         (*ctx.logf)("quic: 连接已断 —— 等上层重连/重赛跑（阶梯接线 = 世代层）");
         // M3：在册服务流一并作废（读回 EOF / 写快速失败；§1.6 的 EOF 同形性——
         // 与今天 `stackb` 在连接死时的表现一致，调用方按需重开）

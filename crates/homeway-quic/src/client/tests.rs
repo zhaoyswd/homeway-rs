@@ -30,7 +30,7 @@ use crate::cmd::{
 };
 use crate::config::{IslandConfig, IslandCredential, TokenSecret};
 use crate::driver::seams;
-use crate::exit::{ExitInbound, ExitQuic, ExitQuicConfig, Reg4Verdict, RejectWhy};
+use crate::exit::{EngineRejectClass, ExitInbound, ExitQuic, ExitQuicConfig, Reg4Verdict, RejectWhy};
 use crate::reg4::{EXPORTER_LABEL, EXPORTER_LEN, ProofFrame, RefreshFrame};
 use crate::rpk::{Ed25519Seed, RpkPublicKey};
 use crate::{Island, IslandTx};
@@ -311,6 +311,9 @@ struct Stub {
     accepted: AtomicU64,
     rejected: AtomicU64,
     packets: Mutex<Vec<Vec<u8>>>,
+    /// 注入**引擎裁决拒绝**的桶（M3 S5：`Some(..)` ⇒ 不看 MAC 一律按该桶拒——
+    /// 复刻真引擎 `table.register` 的 `no-token`/`table-full` 两族）。
+    reject_class: Mutex<Option<EngineRejectClass>>,
 }
 
 impl Stub {
@@ -319,13 +322,20 @@ impl Stub {
             accepted: AtomicU64::new(0),
             rejected: AtomicU64::new(0),
             packets: Mutex::new(Vec::new()),
+            reject_class: Mutex::new(None),
         })
     }
 
     fn pump(&self, quic: &ExitQuic) {
         quic.drain_inbound(|item| match item {
             ExitInbound::Reg(req) => {
-                if req.frame.mac_matches(&SECRET, &req.exporter) {
+                // M3 S5 注入面（优先于 MAC 判定：真引擎里 MAC 过了才谈裁决）
+                if let Some(class) = *self.reject_class.lock().unwrap() {
+                    self.rejected.fetch_add(1, Ordering::SeqCst);
+                    req.reply(Reg4Verdict::Rejected {
+                        why: RejectWhy::EngineRejected { class },
+                    });
+                } else if req.frame.mac_matches(&SECRET, &req.exporter) {
                     self.accepted.fetch_add(1, Ordering::SeqCst);
                     req.reply(Reg4Verdict::Accepted {
                         tunnel_ip: TUNNEL_IP,
@@ -570,6 +580,98 @@ async fn connect_registers_on_control_stream_and_logs_criteria_lines() {
         "赛跑登记后必须能预算内收工"
     );
     assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+// ---------- 1b. 准入失败归因回传（M3 S5 / §4） ----------
+
+/// **判据（M3 S5 / §4）**：出口按准入码拒绝 ⇒ 设备侧**看得见原因**（M2 真机发现①洞）：
+/// ①`Cmd::Connect` 返回 typed `IslandErr::AdmissionRejected{code}`（不再是通串
+/// `RegistrationFailed`）；②岛打**客户端归因行** `quic: 准入回执（code=0x%02x %s）——
+//   本世代回落 WG 承载`（**前缀**与出口的 `quic: 准入被拒（` 区分——设计门 P3）；
+/// ③岛快照两字段（`admit_reject_code`/`admit_reject_text`）——App 状态面据此回答
+/// 「为什么走了 WG」。
+#[tokio::test]
+async fn admission_rejection_carries_code_line_and_snapshot_fields() {
+    for (class, want, text) in [
+        (EngineRejectClass::Credential, 0x11u64, "凭证不被接受"),
+        (EngineRejectClass::Resource, 0x12u64, "资源暂不可用（稍后重试）"),
+    ] {
+        let quic = exit_face(9);
+        let stub = Stub::new();
+        *stub.reject_class.lock().unwrap() = Some(class);
+        let (logf, logs) = sink();
+        let island =
+            island_with_log(Duration::from_secs(60), quic.rpk_public_key(), Arc::clone(&logf));
+        let addr = connectable(&quic);
+
+        let res = send_wait(
+            &island,
+            &stub,
+            &quic,
+            |reply| Cmd::Connect {
+                cands: vec![direct(addr)],
+                budget: WAIT,
+                reply,
+            },
+            WAIT,
+        )
+        .await;
+        match res {
+            Err(IslandErr::AdmissionRejected { code }) if code == want => {}
+            other => panic!("{class:?} 必须带码 {want:#x} 回传（不再是 RegistrationFailed）：{other:?}"),
+        }
+
+        // ② 客户端归因行（前缀与出口行区分 + 短语逐字 + 末句）
+        let lines = logs_until(&logs, "准入回执", WAIT).await;
+        let l = lines
+            .iter()
+            .find(|l| l.contains("准入回执"))
+            .unwrap_or_else(|| panic!("缺准入回执行：{lines:?}"))
+            .clone();
+        assert_eq!(
+            l,
+            format!("quic: 准入回执（code=0x{want:02x} {text}）——本世代回落 WG 承载"),
+            "归因行逐字"
+        );
+        assert!(!l.contains("准入被拒"), "客户端行不得用出口前缀（脚本 grep 会混淆）：{l}");
+
+        // ③ 快照两字段（App 状态面的「为什么走了 WG」）
+        let snap = island.snapshot();
+        assert_eq!(snap.admit_reject_code, Some(want), "{class:?} 的码面");
+        assert_eq!(snap.admit_reject_text.as_deref(), Some(text), "{class:?} 的短语面");
+
+        assert!(island.stop_within(Instant::now() + BUDGET));
+    }
+}
+
+/// **判据（M3 S5 / §4 设计门 F4 的负例）**：**准入后**的会话级关闭（对端 `device removed`
+/// = `unbind_pub`）⇒ 走 `SessionClosed` 独立分支：**不产生**准入回执行、快照不落准入码、
+/// 行文归会话级——否则「会话中被吊销」会被误报成「准入被拒」。
+#[tokio::test]
+async fn post_admission_session_close_is_not_reported_as_admission() {
+    let quic = exit_face(10);
+    let stub = Stub::new();
+    let (logf, logs) = sink();
+    let island = island_with_log(Duration::from_secs(60), quic.rpk_public_key(), Arc::clone(&logf));
+    let addr = connect_direct(&island, &stub, &quic).await;
+    let _ = addr;
+
+    // 准入后摘除设备（出口侧 `unbind_pub` ⇒ `device removed` 的 CONNECTION_CLOSE）
+    quic.unbind_pub(&PUBKEY);
+    let lines = logs_until(&logs, "会话被对端关闭", WAIT).await;
+    assert!(
+        lines.iter().any(|l| l.contains("会话被对端关闭")),
+        "会话级关闭必须单独归因：{lines:?}"
+    );
+    assert!(
+        !lines.iter().any(|l| l.starts_with("quic: 准入回执（")),
+        "会话级关闭**不得**产生准入回执（设计门 F4）：{lines:?}"
+    );
+    let snap = island.snapshot();
+    assert_eq!(snap.admit_reject_code, None, "准入码面必须保持空：{snap:?}");
+    assert_eq!(snap.admit_reject_text, None);
+
+    assert!(island.stop_within(Instant::now() + BUDGET));
 }
 
 // ---------- 2. 赛跑：三候选（一活两死） ----------

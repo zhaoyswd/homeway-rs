@@ -40,6 +40,7 @@ use crate::stream::StreamTag;
 
 pub(crate) use migration::{MigrationEvent, Watch};
 pub(crate) use race::LogGate;
+pub(crate) use register::session_closed;
 pub(crate) use relay_sock::{ClientSock, RelayTable, SockStats};
 
 /// 记行节流（仓内既有口径「首 3 + 每 100」——与 `driver::log_due` 同值同义；两处各一份
