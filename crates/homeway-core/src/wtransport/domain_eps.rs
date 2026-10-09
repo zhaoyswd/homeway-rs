@@ -302,6 +302,14 @@ pub fn split_and_resolve(eps: &[EndpointRef<'_>], logf: &Logf) -> EndpointInputs
     let mut static_base = Vec::new();
     let mut domain_initial = Vec::new();
     let mut add = |ap: SocketAddr, relay: bool, into_domain: bool| {
+        // 候选地址归一（M2 代码门 G3，同类 D1）：token 字面量允许写 `[::ffff:a.b.c.d]`
+        // 形态，而 `Candidate.addr` 是**下游全部比较/键的基准**（seen 去重、Bind 的
+        // relay_eps/race_seen、hint 的「已知来源」判定、cache Merge 的 relay 位反查、
+        // candidate_tag 的 LAN/公网分类）。不归一时同一地址两形态算两条候选：中继位
+        // 反查失配（候选按直连裸发）、v4 地址被标成 IPv6、与 socket 面（bind 读侧已
+        // unmap）的纯 v4 源永不命中。域名路径的 IP 由 `lookup_host` 按其契约先归一
+        // （v4-mapped → v4，见 `lookup_host_with`），本行覆盖字面量路径。
+        let ap = crate::udpbatch::unmap_v4_in6(ap);
         if !seen.contains(&ap) {
             seen.push(ap);
             let group_seen = if into_domain { &mut seen_domain } else { &mut seen_static };
@@ -382,7 +390,9 @@ pub fn resolve_domains(
             Ok(ips) => {
                 for ip in ips {
                     fresh.push(Candidate {
-                        addr: SocketAddr::new(ip, de.port),
+                        // 候选地址归一（G3）：`lookup_host` 契约已归一（v4-mapped → v4），
+                        // 这里再走一次 `unmap` 是防契约漂移的兜底（幂等、零成本面）。
+                        addr: crate::udpbatch::unmap_v4_in6(SocketAddr::new(ip, de.port)),
                         relay: de.relay,
                     });
                 }
@@ -598,6 +608,33 @@ mod tests {
         assert!(!got.candidates[0].relay, "先到的直连形态保留");
         assert!(got.candidates[1].relay);
         assert!(got.domains.is_empty());
+    }
+
+    /// M2 代码门 G3（D1 同类）：token 字面量的 v4-mapped 形态归一到纯 v4——
+    /// ①与纯 v4 形态**同址去重**（改前算两条候选）②`Candidate.addr` 是 relay_eps
+    /// 反查 / hint 已知来源判定 / candidate_tag 分类的基准，恒为规范形态。
+    #[test]
+    fn split_normalizes_v4_mapped_literals() {
+        let (logf, _lines) = mem_logf();
+        let eps = vec![
+            EndpointRef::new("[::ffff:1.2.3.4]:41641", EndpointKind::Relay),
+            EndpointRef::new("1.2.3.4:41641", EndpointKind::Direct), // 归一同址 ⇒ 去重（先到先得）
+            EndpointRef::new("[::ffff:5.6.7.8]:41641", EndpointKind::Direct),
+        ];
+        let got = split_and_resolve(&eps, &logf);
+        assert_eq!(got.candidates.len(), 2, "mapped 与纯 v4 同址必须去重");
+        assert_eq!(got.candidates[0].addr, "1.2.3.4:41641".parse().unwrap());
+        assert_eq!(got.candidates[1].addr, "5.6.7.8:41641".parse().unwrap());
+        assert!(got.candidates[0].relay, "先到的中继形态保留");
+        assert!(
+            got.static_base.iter().all(|c| c.addr.is_ipv4()),
+            "静态基座恒为规范纯 v4：{:?}",
+            got.static_base
+        );
+        // 真 v6 原样（不归一）
+        let eps6 = vec![EndpointRef::new("[2001:db8::1]:41641", EndpointKind::Direct)];
+        let got6 = split_and_resolve(&eps6, &logf);
+        assert_eq!(got6.candidates[0].addr, "[2001:db8::1]:41641".parse().unwrap());
     }
 
     /// 域名端点（localhost）展开 + 首解析记行 + 域名条目保留。

@@ -187,15 +187,16 @@ impl Bind {
         let (sock, dual) = crate::udpbatch::open_client_socket()?;
         enlarge_udp_bufs(&sock);
         sock.set_nonblocking(true)?;
+        let candidates = canon_candidates(candidates);
         let mut b = Self {
             sock,
             dual,
-            candidates: candidates.to_vec(),
             relay_eps: candidates
                 .iter()
                 .filter(|c| c.relay)
                 .map(|c| c.addr)
                 .collect(),
+            candidates,
             relay_id: relay_id(peer_pub),
             // F11：`None` 保持 `None` = **显式关**（全部候选同时打）；`Some(0)` → 缺省 2s
             // （Go `core.go:117-124` 的 `0 → 2s` 同义）。此前 `map_or(Some(DEFAULT), …)`
@@ -806,6 +807,7 @@ impl Bind {
     /// 更新候选集（Go SetCandidates 同义）：忽略序比较（relay 位参与——FIX-14：腿类型
     /// 变化也是「集合变了」）；变化打一行；relay_eps 同临界区重建（FIX-10）。
     pub fn set_candidates(&mut self, cands: Vec<Candidate>) {
+        let cands = canon_candidates(&cands);
         let changed = !same_candidates(&self.candidates, &cands);
         self.candidates = cands;
         self.relay_eps = self
@@ -914,6 +916,19 @@ pub(crate) fn same_candidates(a: &[Candidate], b: &[Candidate]) -> bool {
     sa.sort();
     sb.sort();
     sa == sb
+}
+
+/// 候选地址归一（M2 代码门 G3，同类 D1）：`Candidate.addr` 是**候选面的键**——
+/// `relay_eps` 反查（中继腿判定/`relay_only`）、`race_seen`、hint 的「已知来源」豁免、
+/// `candidate_tag` 的 LAN/公网分类都按它比对；接收面 src 恒为规范纯 v4/v6
+/// （`recv_from` 已 `unmap_v4_in6`）。两形态混用 ⇒ 中继候选被判直连、已知来源被当
+/// 未知（hint 走安全卫兵/被丢）。生产来源（`domain_eps` 构造 + `endpoint_cache` 键）
+/// 已各自归一，本处是**候选面入 Bind 的最后一道兜底**（幂等；规范输入零差异）。
+fn canon_candidates(cands: &[Candidate]) -> Vec<Candidate> {
+    cands
+        .iter()
+        .map(|c| Candidate { addr: crate::udpbatch::unmap_v4_in6(c.addr), relay: c.relay })
+        .collect()
 }
 
 /// 候选一行标签（C5 未响应列表的 tag：中继/IPv6/LAN/公网v4；Go candidateTag 同义）。
@@ -1526,6 +1541,38 @@ mod tests {
         intruder.send_to(&frame::hint_bytes("203.0.113.9:41641"), &me).unwrap();
         let _ = b.recv_from(&mut buf);
         assert_eq!(hits.lock().unwrap().as_slice(), &["203.0.113.9:41641".to_owned()]);
+    }
+
+    /// M2 代码门 G3（D1 同类）：候选地址入 Bind 面归一——mapped 形态的候选与纯 v4
+    /// 同键（`relay_eps` 反查 / hint「已知来源」豁免 / candidate_tag 分类恒按规范形态）。
+    /// 改前：mapped 候选与 socket 面（recv 已 unmap）的纯 v4 源永不相等 ⇒ ①已知来源
+    /// 被判未知（hint 走安全卫兵，私网 hint 被丢）②中继候选被当直连（relay_eps 失配）。
+    #[test]
+    fn candidates_normalized_v4_mapped() {
+        let exit = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let exit_addr = exit.local_addr().unwrap();
+        let mapped: SocketAddr = format!("[::ffff:127.0.0.1]:{}", exit_addr.port()).parse().unwrap();
+        let (logf, _logs) = log_sink();
+        let hits = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let h2 = Arc::clone(&hits);
+        // 候选按 mapped 形态入 Bind（生产构造处已归一——这里验最后一道兜底）
+        let mut b = bind(&[Candidate { addr: mapped, relay: false }], None, &logf);
+        assert_eq!(b.candidates[0].addr, exit_addr, "候选地址归一为纯 v4");
+        b.set_on_hint(Arc::new(move |a: &str| h2.lock().unwrap().push(a.to_owned())));
+        let me = format!("127.0.0.1:{}", b.local_port());
+        let mut buf = [0u8; 64];
+        // 已知来源（候选）的 hint：即便 hint 地址是私网也豁免卫兵、投给 on_hint
+        exit.send_to(&frame::hint_bytes("10.0.0.5:41641"), &me).unwrap();
+        let _ = b.recv_from(&mut buf);
+        assert_eq!(
+            hits.lock().unwrap().as_slice(),
+            &["10.0.0.5:41641".to_owned()],
+            "已知候选来源的 hint 必须豁免卫兵（改前 mapped 候选不命中 ⇒ 被当未知来源丢弃）"
+        );
+        // set_candidates 同归一：中继候选（mapped 写入）归后 relay_eps 命中
+        b.set_candidates(vec![Candidate { addr: mapped, relay: true }]);
+        assert_eq!(b.candidates[0].addr, exit_addr);
+        assert!(b.relay_eps.contains(&exit_addr), "中继位反查按规范形态命中");
     }
 
     /// F3：未采纳期按间隔补投 reg（首包丢/时钟偏差自愈），并受次数/时长上界约束。

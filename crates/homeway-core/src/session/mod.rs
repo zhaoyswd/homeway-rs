@@ -976,7 +976,9 @@ fn install_hint_callback(shared: &Arc<Shared>) {
                 return;
             }
             if let Ok(ap) = addr.parse::<SocketAddr>() {
-                let _ = sh.hint_tx.send(ap);
+                // 地址键归一（M2 代码门 G3，同类 D1）：hint 串是**学习集/候选集的入口**
+                // （缓存键、Merge 候选键、日志）——mapped 与纯 v4 两形态不得各占一份。
+                let _ = sh.hint_tx.send(crate::udpbatch::unmap_v4_in6(ap));
             }
         }));
 }
