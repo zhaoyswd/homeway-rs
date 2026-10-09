@@ -2,11 +2,12 @@
 //! `publicendpoint.go` + `udpcap.go`——裁剪面见 R3-design §0：relay/term/DDNS/
 //! daemon 控制面不在本期）。
 //!
-//! 线程面（设计 §1.1）：装配线程（Start）→ 一条 WG 驱动线程（独占 device/拦截栈/
-//! 设备表/ServerBind——无锁热路径）+ DNS worker 池（dnsproxy 自带）+ 拦截 worker 池
-//! （intercept 自带）+ files/speedtest UDS 服务线程 + 公网端点观测线程 + udpcap 探测
-//! 线程。观测线程经 `EngineCmd` 与驱动线程交互（STUN 走**同监听 socket**——
-//! bind.stun_query；caps/probe 端点回填）。
+//! 线程面（设计 §1.1；M5 S3b 后的形态）：装配线程（Start）→ 一条驱动线程（独占拦截栈/
+//! 设备表/腿面 ServerBind/公共端点面 PubFace 的写侧——无锁热路径）+ DNS worker 池
+//! （dnsproxy 自带）+ 拦截 worker 池（intercept 自带）+ files/speedtest UDS 服务线程 +
+//! 公网端点观测线程 + udpcap 探测线程。观测线程经 `EngineCmd` 与驱动线程交互；STUN 观测
+//! 走**公共端口**（QUIC 面的直连 socket——M5 S3a：`public endpoint 面迁址`），caps/probe
+//! 端点回填同面。
 //!
 //! 收工序（Go Shutdown D5）：① 停新流（HaltNew）→ ② 关 UDS listeners → ③ 过境存量
 //! 有界宽限（Drain）→ ④ 关 WG UDP → ⑤ DNS/观测收工 + UPnP 缩租 + 服务收工。
@@ -20,11 +21,11 @@ use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
 
-use crate::server::bind::{Inbound, ServerBind, TxStatsSnap};
-use crate::server::device::{Device, InboundOut, PeerConfig};
+use crate::server::bind::ServerBind;
 use crate::server::dnsproxy::{DnsConfig, DnsProxy};
 use crate::server::egress::{self, IfaceInfo};
 use crate::server::intercept::{self, Config as ItcConfig, Interceptor, Stats as ItcStats};
+use crate::server::pubface::PubFace;
 use crate::server::state::State;
 use crate::server::table::{DevOp, DeviceTable, TableConfig};
 use crate::token::{Endpoint, EndpointKind};
@@ -65,10 +66,6 @@ pub struct ServeConfig {
     /// QUIC 端口（M1 §1.1）：`None` = 缺省 `listen_port + 1`；被占用按 WG 同款退让
     /// 换端口（实际端口见 `cache/quic_listen_port.txt` 与 `ServeEngine::quic_local_addr`）。
     pub quic_listen_port: Option<u16>,
-    /// QUIC 面总开关（M1 S3-4）：缺省 **true**。`false` ⇒ 不监听 QUIC 端口、不打
-    /// E-q1/E-q4 行、token 不带 QUIC 端点与 `rpk` 尾字段（⇒ token 串与 M1 前**逐字节
-    /// 相同**；WG 面与服务面零变化）。
-    pub quic: bool,
     pub tunnel_ip: Ipv4Addr,
     pub files_port: u16,
     pub term_port: u16,
@@ -119,7 +116,6 @@ impl Default for ServeConfig {
             state_dir: PathBuf::from("."),
             listen_port: DEFAULT_LISTEN_PORT,
             quic_listen_port: None,
-            quic: true,
             tunnel_ip: DEFAULT_TUNNEL_IP,
             files_port: DEFAULT_FILES_PORT,
             term_port: DEFAULT_TERM_PORT,
@@ -162,7 +158,8 @@ pub const STOP_GRACE: Duration = Duration::from_secs(10);
 /// 观测线程 → 驱动线程的命令。
 pub enum EngineCmd {
     Stop { grace: Duration },
-    /// 同监听 socket 的 STUN 观测（应答经 reply 回执——None = 无应答/不合法）。
+    /// 公共端口（QUIC 面直连 socket）上的 STUN 观测（应答经 reply 回执——None = 无应答/
+    /// 不合法；QUIC 面未起 = 无公共端口，直接回 None）。
     StunQuery { server: SocketAddr, reply: Sender<Option<SocketAddr>> },
     StunAbort,
     /// 探测应答的能力位（udpcap 结论）。
@@ -171,7 +168,8 @@ pub enum EngineCmd {
     SetProbeEndpoints(Vec<SocketAddr>),
     /// 公网端点立即重测（换网事件——绑卡看护的 onChange）。
     KickPublicEndpoint,
-    /// 把 WG socket 重钉到指定网卡（绑卡看护换卡/重挑；驱动线程独占 socket）。
+    /// 把**公共端口**（QUIC 面直连 socket）重钉到指定网卡（绑卡看护换卡/重挑；
+    /// socket 由 QUIC 面独占 ⇒ 本命令只做 setsockopt——M5 S3a）。
     Repin {
         index: u32,
         name: String,
@@ -234,6 +232,8 @@ pub struct ServeEngine {
     driver_alive: Arc<AtomicBool>,
     /// 拦截计数共享原子（status 观测面直读——不占驱动线程）。
     itc_stats: Arc<super::intercept::Stats>,
+    /// 出口**公共端口**（M5 起 = QUIC 面的直连端口；`None` = 本世代无公共端口——
+    /// 面未起的形态）。`shrink_upnp_lease`/status 与 token 的端口口径同源。
     pub local_port: u16,
     /// QUIC 端点实际地址（`None` = 本世代 QUIC 面未起；M1 §1.1 的「实际端口有去处」）。
     pub quic_local_addr: Option<SocketAddr>,
@@ -441,18 +441,11 @@ impl ServeEngine {
             crate::go_fmt::fmt_duration_go_secs(ttl),
             crate::go_fmt::fmt_duration_go_secs(grace)
         ));
-        let device = Device::new(priv_key.clone(), Arc::clone(&dlogf));
-
-        // ---- ServerBind（双栈监听 + 钉卡；实际端口落盘）----
-        // 绑地址形态（IP 字面量）单栈；钉卡形态不绑地址（双栈 [::]——v4/v6 客户端
-        // 都能连，v6 STUN 观测同 socket 成立）。
-        let mut bind = ServerBind::open_bound(cfg.listen_port, &cfg.build, bind_addr, resolved.as_ref().map(|i| (i.index, i.name.clone())), Arc::clone(&logf))?;
-        let local_port = bind.local_port();
-        // Q4/S7b：写失败**非致命**（原 `?` = 致命 ⇒ serve 启不来，与 Go `role.go:95` 相反）。
-        write_listen_port_file(&cache_dir.join("listen_port.txt"), local_port, &logf);
-        // 公布口径的 pinned 判据 = **运行期事实**（socket 钉卡成功与否 + 绑地址），
-        // 看护循环重钉后更新（Go `pinnedNow`/`PinnedIface` 同义）。
-        let pinned_flag = Arc::new(AtomicBool::new(bind.pinned.is_some() || bind_addr.is_some()));
+        // ---- 腿面 + 公共端点面（M5 S3b/S3a）----
+        // 腿面不再自有 socket（唯一公共端口 = QUIC 面的直连 socket，见 `server::bind` 模块头）；
+        // 公共端点面（探测应答 / STUN 观测 / 绑卡重钉 / 注册腿帧）见 `server::pubface`。
+        let mut bind = ServerBind::new(Arc::clone(&logf));
+        let pubface = Arc::new(PubFace::new(&cfg.build, Arc::clone(&logf)));
 
         // ---- files / speedtest / term 服务（E14/E15/E16/E17）+ 服务入口（M3 S2）----
         // 服务入口形态（设计 §2.2 方案 B′）：每个服务一枚 `ServiceIntake` = **两源**
@@ -605,21 +598,55 @@ impl ServeEngine {
         }
 
         // ---- QUIC 面（M1 §1.1/§1.7：独立 UDP 端口 + 专用线程 + RPK 身份）----
-        // 端口：`serve.quic_listen`（缺省 = serve.listen + 1）；被占用按 WG 同款**退让**
-        // 语义换端口（+1…+9 → 随机），实际端口落 `cache/quic_listen_port.txt` 并由
-        // `ServeEngine::quic_local_addr` 暴露（token/UPnP/status 的唯一来源，§1.1）。
-        // 起不来 = **fail-soft**：WG 面与服务面照常（QUIC 档缺席要在行里看得见）。
-        // **S3-4 开关**：`serve.quic=false` ⇒ 整个面不建（无端口监听、无 E-q1/E-q4 行、
-        // token 无 QUIC 端点与 `rpk` 尾字段 ⇒ 逐字节回落 M1 前形态）。
+        // **M5 起这是出口唯一的公共 UDP 端口**（WG 面退役）：端口 = `serve.quic_listen`
+        // （缺省 = serve.listen + 1）；被占用按同款**退让**语义换端口（+1…+9 → 随机），
+        // 实际端口落 `cache/quic_listen_port.txt`（与 `listen_port.txt` 同值——公共端口只有
+        // 一个）并由 `ServeEngine::quic_local_addr` 暴露（token/UPnP/status 的唯一来源）。
+        // 起不来 = fail-soft（进程照常起，但**没有公共端口**——行里看得见）。
         let mut quic_brief: Option<(SocketAddr, homeway_quic::RpkPublicKey)> = None;
         let mut quic_stats: Option<homeway_quic::ExitStatsHandle> = None;
-        let quic_face = if !cfg.quic {
-            (logf)("quic: 面未启用（serve.quic=false）—— 不监听 QUIC 端口、token 不带 QUIC 端点（该 token 的客户端无 QUIC 面可用）");
-            None
-        } else {
+        // 注册腿 socket（出口 → 中继 HELLO/Keepalive 的出站口）：公共端口的 fd 副本
+        // ——「注册腿与数据面同一本地端口」的硬约束按 M5 后的口径继续成立（原 = WG socket
+        // 的副本）。中继的回执回到本端口 ⇒ 经公共端点面的钩子分派（`pubface`）。
+        let mut relay_sock_dup: Option<std::net::UdpSocket> = None;
+        // 钉卡成功的运行期事实（公布口径的 pinned 判据；见下方 pinned_flag）
+        let mut pinned_pin_ok = false;
+        let quic_face = {
             match crate::server::bind::listen_with_fallback_addr(quic_listen_port(&cfg), bind_addr) {
             Ok(sock) => match sock.set_nonblocking(true) {
                 Ok(()) => {
+                    let actual_port = sock.local_addr().map(|a| a.port()).unwrap_or(0);
+                    if actual_port != quic_listen_port(&cfg) {
+                        (logf)(&format!(
+                            "⚠️ QUIC 监听端口 {} 被占用 —— 改用 {}；token 里的端口以公布/签发为准",
+                            quic_listen_port(&cfg),
+                            actual_port
+                        ));
+                    }
+                    // 绑卡（E21 族）：**公共端口 socket 的钉卡**（原 WG socket 同款语义——
+                    // 钉卡不绑地址；失败只告警，公布自动变保守）。dup fd 交公共端点面供
+                    // 运行期重钉（setsockopt 作用于同一 socket 对象）。
+                    if let Some((index, name)) = resolved.as_ref().map(|i| (i.index, i.name.clone())) {
+                        use std::os::fd::AsRawFd as _;
+                        match egress::pin_socket_to_iface(sock.as_raw_fd(), index, &name) {
+                            Ok(()) => pinned_pin_ok = true,
+                            Err(e) => {
+                                (logf)(&format!(
+                                    "⚠️ 钉网卡 {name} 失败（{e}）—— 继续以未绑卡运行：STUN 观测可能被 TUN 型代理污染，公网端点公布会因此变保守"
+                                ));
+                            }
+                        }
+                    }
+                    match sock.try_clone() {
+                        Ok(dup) => {
+                            pubface.attach_socket(dup);
+                            match sock.try_clone() {
+                                Ok(dup2) => relay_sock_dup = Some(dup2),
+                                Err(e) => (logf)(&format!("⚠️ 注册腿 socket 副本失败（{e}）—— --relay 注册腿将无法与公共端口同源")),
+                            }
+                        }
+                        Err(e) => (logf)(&format!("⚠️ 公共端口 socket 副本失败（{e}）—— 绑卡看护重钉不可用")),
+                    }
                     let seed = crate::server::quic_rpk_seed(&priv_key);
                     // 抗放大闸生效值（M2 §3.2）：config 段（严格读层已校验值域）+ env 叠加
                     // （非法 env ⇒ 记行 + 缺省，不 fail-fast）。
@@ -632,7 +659,8 @@ impl ServeEngine {
                         sock,
                         homeway_quic::ExitQuicConfig::new(seed, cfg.max_devices)
                             .with_admit(admit)
-                            .with_intakes(service_intakes.clone()),
+                            .with_intakes(service_intakes.clone())
+                            .with_plain_hook(pubface.hook()),
                         Arc::clone(&logf),
                     ) {
                         Ok(q) => {
@@ -649,7 +677,7 @@ impl ServeEngine {
                         }
                         Err(e) => {
                             (logf)(&format!(
-                                "⚠️ quic: 端点未起（{e}）—— QUIC 档不可用（WG 面与服务面不受影响）"
+                                "⚠️ quic: 端点未起（{e}）—— **出口没有公共端口**（客户端无从连入；本进程只剩服务/控制面）"
                             ));
                             None
                         }
@@ -657,20 +685,27 @@ impl ServeEngine {
                 }
                 Err(e) => {
                     (logf)(&format!(
-                        "⚠️ quic: 端点未起（socket 置非阻塞失败：{e}）—— QUIC 档不可用（WG 面不受影响）"
+                        "⚠️ quic: 端点未起（socket 置非阻塞失败：{e}）—— **出口没有公共端口**"
                     ));
                     None
                 }
             },
             Err(e) => {
                 (logf)(&format!(
-                    "⚠️ quic: 端点未起（端口 {} 退让 +1…+9 与随机端口全失败：{e}）—— QUIC 档不可用（WG 面不受影响）",
+                    "⚠️ quic: 端点未起（端口 {} 退让 +1…+9 与随机端口全失败：{e}）—— **出口没有公共端口**",
                     quic_listen_port(&cfg)
                 ));
                 None
             }
             }
         };
+        // 公共端口（= QUIC 面实际端口）落盘 + pinned 运行期事实（看护重钉后更新）。
+        let local_port = quic_brief.as_ref().map(|(a, _)| a.port()).unwrap_or(0);
+        // Q4/S7b：写失败**非致命**（原 `?` = 致命 ⇒ serve 启不来，与 Go `role.go:95` 相反）。
+        write_listen_port_file(&cache_dir.join("listen_port.txt"), local_port, &logf);
+        // 公布口径的 pinned 判据 = **运行期事实**（socket 钉卡成功与否 + 绑地址），
+        // 看护循环重钉后更新（Go `pinnedNow`/`PinnedIface` 同义）。
+        let pinned_flag = Arc::new(AtomicBool::new(pinned_pin_ok || bind_addr.is_some()));
 
         // ---- 命令通道（驱动线程收；观测/udpcap/中继控制面都经它交互） ----
         let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCmd>();
@@ -700,18 +735,21 @@ impl ServeEngine {
         // 重新解析一次拿完整 RelayArg（addr + secret；上面的 relay_ep 只端点面）
         let relay_arg = relay_ep.as_ref().and_then(|_| super::relayleg::parse_relay_arg(cfg.relay.as_deref().unwrap_or_default()).ok());
         if let Some(arg) = relay_arg {
-            let relay_sock = bind
-                .try_clone_socket()
-                .expect("clone WG socket（注册腿与数据面同端口的硬约束）");
-            // 驱动线程 → relay-leg 线程事件通道（type=3 控制帧 + hint；try_send 不阻塞驱动线程）
+            let relay_sock = relay_sock_dup
+                .take()
+                .expect("公共端口 socket 副本（注册腿与公共端口同源的硬约束）");
+            // 驱动线程 → relay-leg 线程事件通道（type=3 控制帧；try_send 不阻塞驱动线程）。
+            // **两个来源同灌一条通道**：①腿 socket 上的 kind=3（`bind.set_on_leg_frame`）；
+            // ②公共端口上的 kind=3（中继对**注册腿** Hello 的回执——M5 起注册腿从公共端口
+            // 发出 ⇒ 回执回到公共端口，由 `pubface` 的钩子分派）。
             let (leg_tx, leg_rx) = mpsc::sync_channel::<super::relayleg::LegEvent>(64);
             let leg_tx_frame = leg_tx.clone();
             bind.set_on_leg_frame(Box::new(move |payload, src| {
                 let _ = leg_tx_frame.try_send(super::relayleg::LegEvent::Frame(payload.to_vec(), src));
             }));
-            let leg_tx_hint = leg_tx.clone();
-            bind.set_on_hint(Box::new(move |addr, src| {
-                let _ = leg_tx_hint.try_send(super::relayleg::LegEvent::Hint(addr.to_string(), src));
+            let leg_tx_frame2 = leg_tx;
+            pubface.set_on_leg_frame(Box::new(move |payload, src| {
+                let _ = leg_tx_frame2.try_send(super::relayleg::LegEvent::Frame(payload.to_vec(), src));
             }));
             let stop = spawn_service_stop_flag(&mut stop_flags);
             super::relayleg::spawn_relay_leg(
@@ -734,19 +772,6 @@ impl ServeEngine {
             );
         }
 
-        // ---- P1 发送线程（浅拆：密文→sendto 独立；唯一发送路径——无条件起） ----
-        // 单轮排空字节上界 = burst（团块钳制与整形器单拍上界同语义）；整形 off 臂
-        // 用默认 TX_SHAPE_BURST（形态约束与整形开关正交）。
-        {
-            let sock_dup = bind
-                .try_clone_socket()
-                .expect("dup WG socket（发送线程装配——唯一发送路径，起不来即出口起不来）");
-            let burst = crate::server::intercept::tx_shape_resolve(cfg.tx_shape_cfg)
-                .map(|s| s.burst)
-                .unwrap_or(crate::server::intercept::TX_SHAPE_BURST);
-            bind.tx_start(sock_dup, burst, Arc::clone(&dlogf));
-        }
-
         // ---- 驱动线程 ----
         let driver_alive = Arc::new(AtomicBool::new(true));
         let driver_alive_ctor = Arc::clone(&driver_alive); // 构造面（spawn 外）与线程体守卫各持一份
@@ -756,7 +781,7 @@ impl ServeEngine {
             .spawn({
                 let cfg = cfg.clone();
                 let bind = bind;
-                let mut device = device;
+                let pubface = Arc::clone(&pubface);
                 let mut table = table;
                 let mut intercept = intercept;
                 let dns = dns.clone();
@@ -778,7 +803,7 @@ impl ServeEngine {
                     }
                     let _alive_guard = AliveGuard(driver_alive_t);
                     driver_loop(
-                        cfg, bind, &mut device, &mut table, &mut intercept, dns.as_ref(), &st,
+                        cfg, bind, pubface, &mut table, &mut intercept, dns.as_ref(), &st,
                         &revoked_set, cmd_rx, &dlogf, &itc_stats, pub_kick_tx, quic_face,
                     );
                 }
@@ -945,8 +970,8 @@ impl ServeEngine {
             hex(&backend_pub6)
         ));
         (logf)(&format!(
-            "serve 就绪：wg=:{}（配置端口；被占用会自动退让）tunnel={} files={} term={} speedtest={} dns={} tokens={} key={}…",
-            cfg.listen_port,
+            "serve 就绪：quic=:{}（配置端口；被占用会自动退让）tunnel={} files={} term={} speedtest={} dns={} tokens={} key={}…",
+            quic_listen_port(&cfg),
             cfg.tunnel_ip,
             cfg.files_port,
             cfg.term_port,
@@ -1191,7 +1216,7 @@ fn spawn_service_stop_flag(flags: &mut Vec<Arc<AtomicBool>>) -> Arc<AtomicBool> 
 fn driver_loop(
     cfg: ServeConfig,
     mut bind: ServerBind,
-    device: &mut Device,
+    pubface: Arc<PubFace>,
     table: &mut DeviceTable,
     intercept: &mut Interceptor,
     dns: Option<&Arc<DnsProxy>>,
@@ -1205,7 +1230,6 @@ fn driver_loop(
     // 还要把尾包投给 intercept，故必须停在 `intercept.close()` **之前**）。
     quic_face: Option<homeway_quic::ExitQuic>,
 ) {
-    let udp_fd = bind.udp_fd();
     // GC 节拍（10min ±10% 抖动）与吊销跟随（1s mtime）/DNS 统计（60s）
     let mut rng = [0u8; 8];
     getrandom::getrandom(&mut rng).expect("系统随机源不可用");
@@ -1219,21 +1243,11 @@ fn driver_loop(
     let revoked_path = cfg.state_dir.join("serve").join("revoked.jsonl");
     let mut revoked_mtime = std::fs::metadata(&revoked_path).and_then(|m| m.modified()).ok();
     let mut last_dns_stats = Instant::now();
-    let mut last_tx_stats = Instant::now();
-    let mut last_tx_stats_snap = crate::server::bind::TxStatsSnap {
-        bytes: 0,
-        calls: 0,
-        pkgs: 0,
-        drops: 0,
-        ring_drops: 0,
-        wakeups: 0,
-        drain_ns: 0,
-        batch_max: 0,
-        depth_peak: 0,
-        hist: [0; 13],
-    };
-    let mut last_tx_wall_ns = 0u64;
-    let mut out = InboundOut::default();
+    // tun_ip → pubkey 映射（M5 §3.2-bis 方案 (a)）：**出口出站分流键**。数据源 = 设备表
+    // 的 `DevOp`（Add 带 `tun_ip`/pubkey；Remove 带 pubkey）——原 WG 面 `device.tun_ip_owner`
+    // 的等价物，**不动岛公面**。dst == 某设备 tun_ip ⇒ QUIC DATAGRAM；否则丢 + 计数 + 记行。
+    let mut pub_by_tun: std::collections::HashMap<Ipv4Addr, [u8; 32]> = std::collections::HashMap::new();
+    let mut unbound_dropped: u64 = 0;
     let mut stop = false;
     let mut stop_grace = STOP_GRACE;
     // 「出口面线程已死」只记一次（否则每拍一行）
@@ -1260,19 +1274,32 @@ fn driver_loop(
                     let _ = reply.send(briefs);
                 }
                 EngineCmd::StunQuery { server, reply } => {
-                    if bind.stun_query(server, reply).is_err() {
-                        // 已有查询在等：直接回 None（观测周期分钟级，冲突即失败）
+                    // 公共端口（QUIC 面直连 socket）上的观测（M5 S3a）。面未起 = 无公共端口
+                    // ⇒ 直接回 None（外层打「观测失败」行）；已有查询在等 ⇒ 同 None。
+                    match (pubface.stun_begin(reply), quic_face.as_ref()) {
+                        (Some(txid), Some(q)) => {
+                            let req = crate::server::egress::stun_request(&txid, "");
+                            if !q.send_plain(server, &req) {
+                                pubface.stun_abort();
+                            }
+                        }
+                        (Some(_), None) => {
+                            // 无公共端口：把占位撤掉并回 None（不悬着下一次查询）
+                            pubface.stun_abort();
+                            (dlogf)("STUN：观测不可用 —— 公共端口未起（QUIC 面缺席）");
+                        }
+                        (None, _) => {} // 已有一次在等：直接失败（观测周期分钟级）
                     }
                 }
-                EngineCmd::StunAbort => bind.stun_query_abort(),
-                EngineCmd::SetCaps(c) => bind.set_caps(c),
-                EngineCmd::SetProbeEndpoints(eps) => bind.set_probe_endpoints(eps),
+                EngineCmd::StunAbort => pubface.stun_abort(),
+                EngineCmd::SetCaps(c) => pubface.set_caps(c),
+                EngineCmd::SetProbeEndpoints(eps) => pubface.set_probe_endpoints(eps),
                 EngineCmd::KickPublicEndpoint => {
                     let _ = pub_kick_tx.try_send(()); // 转发到观测线程（满=已有待处理 kick）
                 }
                 EngineCmd::Repin { index, name, reply } => {
-                    // 看护循环重钉（socket 由驱动线程独占——两族都设、单栈容错）
-                    let _ = reply.send(bind.repin_to(index, &name));
+                    // 看护循环重钉（公共端口 socket——dup fd 上 setsockopt；两族都设、单栈容错）
+                    let _ = reply.send(pubface.repin_to(index, &name));
                 }
                 EngineCmd::LegRegister { id, remote, marker } => {
                     // SESSION 通告 → 拨腿（连接 socket + LEGUP 标记 + 入表）
@@ -1300,8 +1327,9 @@ fn driver_loop(
         // QUIC 面唤醒 fd（M1 §1.4：入站队列非空即可读——没有它每个入站包最多等 5ms，
         // TCP RTT/吞吐直接受损）。所有权在 `quic_face`，本循环只 poll + 交给它 drain。
         let quic_wake_fd: Option<i32> = quic_face.as_ref().map(|q| q.wake_fd());
-        let mut pollfds = Vec::with_capacity(1 + leg_fds.len() + usize::from(quic_wake_fd.is_some()));
-        pollfds.push(libc::pollfd { fd: udp_fd, events: libc::POLLIN, revents: 0 });
+        // 等待集 = 腿 fd + QUIC 面唤醒 fd（M5 起**不再有**公共端口的 poll 项：公共端口由
+        // QUIC 面的 reactor 独占；探针/观测经其明文钩子在那边消化）。
+        let mut pollfds = Vec::with_capacity(leg_fds.len() + usize::from(quic_wake_fd.is_some()));
         for fd in &leg_fds {
             pollfds.push(libc::pollfd { fd: *fd, events: libc::POLLIN, revents: 0 });
         }
@@ -1322,17 +1350,22 @@ fn driver_loop(
                 (dlogf)(&format!("serve: poll 错误（{e}）—— 继续循环"));
             }
         }
-        let readable_legs: Vec<i32> = pollfds[1..1 + leg_fds.len()]
+        let readable_legs: Vec<i32> = pollfds[..leg_fds.len()]
             .iter()
             .filter(|pf| pf.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0)
             .map(|pf| pf.fd)
             .collect();
-        // 腿 fd 可读（与主 socket 同一消费管线——data 进 device / reg 进设备表 /
-        // kind=5 进 QUIC 面）
+        // 腿 fd 可读：kind=5（QUIC 载荷）交出口 QUIC 面注入；kind=3 已由 bind 的钩子转
+        // 注册腿线程（M5 后腿面上只有这两类）
         for fd in readable_legs {
             let (_alive, inbound) = bind.leg_readable(fd);
             if let Some(inbound) = inbound {
-                handle_inbound(inbound, device, table, intercept, &mut bind, &mut out, &cfg, quic_face.as_ref());
+                let pkt = inbound.quic;
+                let n = pkt.payload.len();
+                match quic_face.as_ref() {
+                    Some(q) if q.inject_leg(pkt.src, pkt.payload) => {}
+                    _ => bind.note_quic_leg_undelivered(n),
+                }
             }
         }
         // 腿读错误会摘腿 ⇒ 同拍把摘除同步给 QUIC 面（面侧保留「最近摘除」窗）
@@ -1341,57 +1374,30 @@ fn driver_loop(
         // 准入请求在此裁决（回执非阻塞）、明文包直投 `intercept.on_plain`。
         if let Some(q) = quic_face.as_ref() {
             if quic_poll_idx.is_some_and(|i| pollfds[i].revents & libc::POLLIN != 0) {
-                q.drain_inbound(|item| on_quic_inbound(item, device, table, intercept, Some(q), dlogf));
+                q.drain_inbound(|item| {
+                    on_quic_inbound(item, table, intercept, Some(q), &mut pub_by_tun, dlogf)
+                });
             }
             // 出口面线程死（panic/异常退出）= 引擎侧可观测的「不健康」：**记一次行**
-            // 且出站自动回落 WG（`send_to_pub` 在面死后恒 `Unbound`）。
+            // （M5 起无回落面：出站按无绑定丢弃 + 计数，入站停止——设备需重连）。
             if q.is_finished() && !quic_dead_logged {
                 quic_dead_logged = true;
-                (dlogf)("quic: 出口 QUIC 面线程已退出 —— 后续出站回落 WG 原样、入站停止（QUIC 档设备需重连）");
+                (dlogf)("quic: 出口 QUIC 面线程已退出 —— 公共端口随之失效：后续出站按无绑定丢弃（计数可见）、入站停止（客户端需重连）");
             }
         }
-        let mut got_packet = false;
-        loop {
-            match bind.recv_packet() {
-                Ok(Some(inbound)) => {
-                    got_packet = true;
-                    handle_inbound(inbound, device, table, intercept, &mut bind, &mut out, &cfg, quic_face.as_ref());
-                }
-                Ok(None) => continue,
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    break
-                }
-                Err(e) => {
-                    (dlogf)(&format!("serve: 读错误（{e}）—— 继续循环"));
-                    break;
-                }
-            }
-        }
-        let _ = got_packet;
         // ③ 拦截拍（worker 事件 + DNS 应答回投 + 栈 poll + TX）。P1 两级前置背压：
         // 发送 ring 高水位 ⇒ 本拍整形释放退化「只并入不释放」（包留整形 FIFO =
         // 真背压不丢包，满丢成为最后兜底）。
-        let hold = bind.tx_high_water();
-        let tx = if hold {
-            intercept.pump_hold()
-        } else {
-            intercept.pump()
-        };
-        route_encap(&tx, device, &mut bind, &mut out, quic_face.as_ref());
-        // ④ WG 定时器（握手重传/keepalive/服务端主动握手的产出面）
-        device.tick_timers(&mut out);
-        bind.send_wire(&out); // P1 定位批回退全量 Queued（设计 v2 形态——控制面同队；
-        // send_wire_ctl 的 inline 分流是对 pending 双实例误诊的临时缓解，根因已修）
-        out.wire.clear();
+        let tx = intercept.pump();
+        // ④ 出站分流（M5 §3.2-bis：dst == 设备 tun_ip ⇒ QUIC DATAGRAM；无绑定 ⇒ 丢 +
+        //    计数 + 节流记行——原「WG 兜底」面无替代、不静默）
+        route_out(&tx, &pub_by_tun, quic_face.as_ref(), &mut unbound_dropped, dlogf);
         // ⑤ 周期任务
         let now = Instant::now();
         if now >= next_gc {
             let sys_now = SystemTime::now();
             for (_a, ops) in table.gc(sys_now) {
-                apply_dev_ops(ops, device, quic_face.as_ref());
+                apply_dev_ops(ops, &mut pub_by_tun, quic_face.as_ref());
             }
             let jitter = (std::process::id() as u64 * 7919) % 60;
             next_gc = now + cfg.peer_ttl + Duration::from_secs(jitter);
@@ -1423,83 +1429,6 @@ fn driver_loop(
                 (dlogf)(&d.stats_line());
             }
         }
-        // R8-2 归因 + P1 拆分观测：批量出站形态 5s 行（dlogf 面；本窗调用有增长才打
-        // ——空闲静默）。判别面 = 均批包数（**「轮」口径**：发送线程一次排空轮
-        // ≤ burst 字节）+ 丢弃计数（send_batch 短返/失败 + ring 满丢）+ 发送面耗时
-        // 剂量（P1b-0：send_wire wall = 判定+入队侧，排空耗时另列 drain_ns）。
-        if now.duration_since(last_tx_stats) > Duration::from_secs(5) {
-            last_tx_stats = now;
-            let s = bind.tx_stats_snapshot();
-            if s.calls > last_tx_stats_snap.calls {
-                let dcalls = s.calls - last_tx_stats_snap.calls;
-                let dpkgs = s.pkgs - last_tx_stats_snap.pkgs;
-                let dbytes = s.bytes - last_tx_stats_snap.bytes;
-                let avg = dpkgs as f64 / dcalls as f64;
-                let bpp = (dbytes as f64 / dpkgs.max(1) as f64) as u64;
-                // P1b-0 剂量插桩：发送面耗时（send_wire wall-time 差分，ms/5s）——
-                // 驱动线程被发送面占住时长的直接观测（PERF-AB §9.3 的 78% 是线程内
-                // 占比，这里是绝对剂量）。
-                let dwell_ms = (bind.tx_wall_ns - last_tx_wall_ns) as f64 / 1e6;
-                let drain_ms = (s.drain_ns - last_tx_stats_snap.drain_ns) as f64 / 1e6;
-                let hist: Vec<String> = s
-                    .hist
-                    .iter()
-                    .enumerate()
-                    .filter(|(_, c)| **c > 0)
-                    .map(|(i, c)| {
-                        let lo = 1usize << i;
-                        let hi = 1usize << (i + 1);
-                        if i + 1 == s.hist.len() {
-                            format!("≥{lo}:{c}")
-                        } else {
-                            format!("{lo}-{}:{c}", hi - 1)
-                        }
-                    })
-                    .collect();
-                let drop_seg = if s.drops > last_tx_stats_snap.drops {
-                    format!(
-                        " 累计丢弃{}包（+{}）",
-                        s.drops,
-                        s.drops - last_tx_stats_snap.drops
-                    )
-                } else {
-                    String::new()
-                };
-                let ring_drop_seg = if s.ring_drops > last_tx_stats_snap.ring_drops {
-                    format!(" 满丢{}（+{}）", s.ring_drops, s.ring_drops - last_tx_stats_snap.ring_drops)
-                } else {
-                    String::new()
-                };
-                (dlogf)(&format!(
-                    "serve: UDP 出站[发送线程] 轮+{dcalls} 均轮{avg:.1}包 单轮最大{}包 均包{bpp}B 发送面耗时{dwell_ms:.0}ms/5s 排空耗时{drain_ms:.0}ms/5s{drop_seg}{ring_drop_seg} 批分布[{}]",
-                    s.batch_max,
-                    hist.join(" ")
-                ));
-                // 发送线程行（唤醒/队深面；评审 p1a-D-2：由驱动线程打——窗口稳定，
-                // 发送线程空窗长眠不打行）
-                {
-                    let dwake = s.wakeups - last_tx_stats_snap.wakeups;
-                    let per_wake = if dwake > 0 { dpkgs as f64 / dwake as f64 } else { 0.0 };
-                    (dlogf)(&format!(
-                        "serve: 发送线程 唤醒+{dwake} 排空+{dpkgs}包(均{per_wake:.1}包/唤醒) 队深峰{}包 累计满丢{}包",
-                        s.depth_peak, s.ring_drops
-                    ));
-                }
-            }
-            last_tx_stats_snap = TxStatsSnap {
-                bytes: s.bytes,
-                calls: s.calls,
-                pkgs: s.pkgs,
-                drops: s.drops,
-                ring_drops: s.ring_drops,
-                wakeups: s.wakeups,
-                drain_ns: s.drain_ns,
-                batch_max: 0,
-                depth_peak: 0,
-                hist: [0; 13],
-            };
-            last_tx_wall_ns = bind.tx_wall_ns;
-        }
     }
     // ---- 收工（D5：① 已由 Stop 置位；这里 ③④——drain 的出站包照走 encap 链
     //      （评审 M2：宽限窗口的 FIN/ACK/尾数据丢弃 = 存量连接无法自然收销账）；
@@ -1509,9 +1438,8 @@ fn driver_loop(
     let deadline = Instant::now() + stop_grace;
     loop {
         let tx = intercept.pump_grace(deadline);
-        let mut out2 = InboundOut::default();
-        route_encap(&tx, device, &mut bind, &mut out2, quic_face.as_ref());
-        out2.wire.clear();
+        // 宽限期尾包照走 QUIC 出站分流（WG 兜底面已退役——无绑定即丢弃 + 计数）
+        route_out(&tx, &pub_by_tun, quic_face.as_ref(), &mut unbound_dropped, dlogf);
         // 评审 r2-1.1 兜底：滞留未清空不提前收摊（流表空但尾数据还在整形队列——
         // 主修在 pump_grace 的全量释放面，这里是宽限循环侧的第二道闸）。
         if (intercept.flow_count() == 0 && !intercept.tx_deferred_pending())
@@ -1521,10 +1449,6 @@ fn driver_loop(
         }
         std::thread::sleep(Duration::from_millis(10));
     }
-    // 发送线程收工（P1：stop + 唤醒 + join 无超时〔必返论证见 tx_shutdown〕——
-    // drain-then-exit 语义保证宽限期尾入队的密文排空后才退）。在 intercept.close
-    // 之前（close 的 teardown 不再产出出站包——现状码序）。
-    bind.tx_shutdown(dlogf);
     // QUIC 面收工（M1 §1.7 的收工链：`bind.shutdown_legs()` → `intercept.halt_new()`
     // → **QUIC 面 stop_within(CLOSE_BUDGET)** → `intercept.close()`）。位置：宽限循环
     // 之后（尾包该投的已投）、intercept teardown 之前；到点 detach 由收割线程接手
@@ -1537,45 +1461,6 @@ fn driver_loop(
     }
     // 到期：teardown（在途 TCP 立即拆——close 内逐条 teardown + 判据行）
     intercept.close();
-}
-
-/// 一个入站包的消化：**reg 先于 data 应用**（容器帧顺序契约——H1）。
-#[allow(clippy::too_many_arguments)] // 驱动状态一次性穿参（同 `driver_loop` 口径）
-fn handle_inbound(
-    inbound: Inbound,
-    device: &mut Device,
-    table: &mut DeviceTable,
-    intercept: &mut Interceptor,
-    bind: &mut ServerBind,
-    out: &mut InboundOut,
-    cfg: &ServeConfig,
-    quic: Option<&homeway_quic::ExitQuic>,
-) {
-    let _ = cfg;
-    for (reg, _src) in inbound.regs {
-        let now = SystemTime::now();
-        if let Ok((_action, ops)) = table.register(&reg, now) {
-            apply_dev_ops(ops, device, quic); // 拒绝归因行由表内打出
-        }
-    }
-    if let Some((src, wg)) = inbound.data {
-        device.decapsulate(src, &wg, out);
-        bind.send_wire(out); // P1 定位批回退全量 Queued（握手应答同队——根因修复后
-        // 队列路径实测全通；send_wire_ctl 分流已删）
-        out.wire.clear();
-        for p in out.plain.drain(..) {
-            intercept.on_plain(p);
-        }
-    }
-    // 腿上的 QUIC 载荷（kind=5，M1 §1.6）：交给出口 QUIC 面注入（`src` = 腿远端）。
-    // 面不可用（未起 / 已收工）⇒ 丢 + 计数 + 节流记行（`bind` 侧的可见面，不静默）。
-    if let Some(pkt) = inbound.quic {
-        let n = pkt.payload.len();
-        match quic {
-            Some(q) if q.inject_leg(pkt.src, pkt.payload) => {}
-            _ => bind.note_quic_leg_undelivered(n),
-        }
-    }
 }
 
 /// 腿表 → QUIC 面腿表的**差分同步**（M1 §1.6 发送侧路由）：新腿登记发送句柄（该腿
@@ -1606,19 +1491,19 @@ fn sync_quic_legs(bind: &mut ServerBind, quic: Option<&homeway_quic::ExitQuic>) 
 ///
 /// - `Reg`：准入/刷新裁决（`hr-reg4` 连接绑定 MAC → **原样走 `table.register`**）并**必须回执**
 ///   （回执非阻塞：oneshot `send` 是普通内存操作；拒绝原因**类型化**回传——r14 F7）；
-/// - `Packet`：源校验已在出口面做完 ⇒ 直投 `intercept.on_plain`（与 WG 入站的明文面同址
-///   ——`device.rs` 的 `StepOut::PlainV4` 投递点语义等价）。
+/// - `Packet`：源校验已在出口面做完 ⇒ 直投 `intercept.on_plain`（M5 起这是**唯一**的
+///   内层明文入口——WG 面的 `device.decapsulate → on_plain` 路径已随 WG 删除）。
 fn on_quic_inbound(
     item: homeway_quic::ExitInbound,
-    device: &mut Device,
     table: &mut DeviceTable,
     intercept: &mut Interceptor,
     quic: Option<&homeway_quic::ExitQuic>,
+    tun_owner: &mut std::collections::HashMap<Ipv4Addr, [u8; 32]>,
     dlogf: &Logf,
 ) {
     match item {
         homeway_quic::ExitInbound::Reg(req) => {
-            let verdict = admit_reg4(&req.frame, &req.exporter, device, table, quic, dlogf);
+            let verdict = admit_reg4(&req.frame, &req.exporter, table, quic, tun_owner, dlogf);
             req.reply(verdict);
         }
         homeway_quic::ExitInbound::Packet { pkt, .. } => intercept.on_plain(pkt),
@@ -1645,9 +1530,9 @@ fn on_quic_inbound(
 fn admit_reg4(
     frame: &homeway_quic::Reg4Frame,
     exporter: &[u8; 32],
-    device: &mut Device,
     table: &mut DeviceTable,
     quic: Option<&homeway_quic::ExitQuic>,
+    tun_owner: &mut std::collections::HashMap<Ipv4Addr, [u8; 32]>,
     dlogf: &Logf,
 ) -> homeway_quic::Reg4Verdict {
     use homeway_quic::{Reg4Frame, Reg4Verdict, RejectWhy};
@@ -1682,7 +1567,7 @@ fn admit_reg4(
     );
     match table.register(&reg_pkt, SystemTime::now()) {
         Ok((_action, ops)) => {
-            apply_dev_ops(ops, device, quic);
+            apply_dev_ops(ops, tun_owner, quic);
             match table.device_addrs(&frame.dev_tag()) {
                 Some((tunnel_ip, tun_ip)) => Reg4Verdict::Accepted { tunnel_ip, tun_ip },
                 // 理论不可达（刚注册成功必在表内）；真出现即拒（宁可让客户端重连）。
@@ -1705,16 +1590,27 @@ fn admit_reg4(
     }
 }
 
-fn apply_dev_ops(ops: Vec<DevOp>, device: &mut Device, quic: Option<&homeway_quic::ExitQuic>) {
+/// 设备表变更 → 出口侧两份状态（M5 S3b：原 WG `Device` 装配点）：
+///
+/// - `tun_owner`：**出站分流键**（§3.2-bis 方案 (a)）——`tun_ip → pubkey`；
+/// - QUIC 面的设备绑定（`unbind_pub`）：设备离表后它的绑定与连接一并拆（回程不得再发往
+///   已摘除的设备；重登记会重新绑定）。
+///
+/// 恒等入口：`table.register`（准入）与 `table.gc`（淘汰）两处 ops 都经这里。
+fn apply_dev_ops(
+    ops: Vec<DevOp>,
+    tun_owner: &mut std::collections::HashMap<Ipv4Addr, [u8; 32]>,
+    quic: Option<&homeway_quic::ExitQuic>,
+) {
     for op in ops {
         match op {
-            DevOp::Add { pubkey, psk, tunnel_ip, tun_ip } => {
-                device.add_peer(PeerConfig { pubkey, psk, tunnel_ip, tun_ip });
+            // `psk`/`tunnel_ip` 面随 WG 删除无消费者（QUIC 准入只经 `table`；隧道地址族
+            // 由表内判据行覆盖）——这里只留分流键需要的 `tun_ip`。
+            DevOp::Add { pubkey, tun_ip, .. } => {
+                tun_owner.insert(tun_ip, pubkey);
             }
             DevOp::Remove { pubkey } => {
-                device.remove_peer(&pubkey);
-                // QUIC 面同摘（§1.3 撤销/轮换的最小对齐）：设备离表后它的绑定与连接一并拆
-                // （回程不得再发往已摘除的设备；重登记会重新绑定）
+                tun_owner.retain(|_, v| *v != pubkey);
                 if let Some(q) = quic {
                     q.unbind_pub(&pubkey);
                 }
@@ -1733,39 +1629,38 @@ fn pub_short(p: &[u8; 32]) -> String {
     p.iter().take(4).map(|b| format!("{b:02x}")).collect()
 }
 
-/// 拦截层出站明文包 → 按目的地址分流（M1 设计 §1.5）：
-/// `dst == 设备 tun_ip`（`hw-app`）且该设备已在 QUIC 面登记 ⇒ **DATAGRAM**（QUIC 出站队列；
-/// 满 = 丢 + 计数，§6.4）；其余（`tunnel_ip` = 服务面自带连接、QUIC 档未登记的 WG 设备、
-/// 未知 dst）⇒ **WG `device.encapsulate` 原样**。
+/// 拦截层出站明文包 → 按目的地址分流（M1 设计 §1.5；**M5 §3.2-bis 定稿 = 方案 (a)**）：
+/// `dst == 某设备 tun_ip`（`hw-app` 派生地址）⇒ **QUIC DATAGRAM**（出口 QUIC 面出站队列；
+/// 满 = 丢 + 计数）；其余 ⇒ **丢 + 计数 + 节流记行**（原「WG `device.encapsulate` 原样」
+/// 的兜底面随 WG 删除，登记 §3.2-bis ② 的「丢 + 计数 + 记行（首 3 + 每 100）」）。
 ///
-/// 为什么 `tunnel_ip` 必须留在 WG（§1.5）：客户端核的 `bridge_host` 拨号走
-/// `session_connect_target → gen_client.connect_deadline`（今天就是 WG/栈 B）——M1 把
-/// 服务面留在 WG，M3 才换 `STREAM[tag]`。分出的 QUIC 包**不进 `out.wire`**（否则
-/// `bind.send_wire` 会把同一包再发一遍给 WG peer）。
-fn route_encap(
+/// 分流键 `tun_ip → pubkey` 由引擎侧自持（`apply_dev_ops` 维护）：数据源 = 设备表已持有的
+/// 每设备隧道地址（`table.rs` 的 `DevOp`），**不动岛公面**。
+fn route_out(
     tx: &[Vec<u8>],
-    device: &mut Device,
-    bind: &mut ServerBind,
-    out: &mut InboundOut,
+    tun_owner: &std::collections::HashMap<Ipv4Addr, [u8; 32]>,
     quic: Option<&homeway_quic::ExitQuic>,
+    unbound_dropped: &mut u64,
+    dlogf: &Logf,
 ) {
     for pkt in tx {
         let Some(IpAddr::V4(d)) = intercept::nat_view_dst(pkt).map(IpAddr::V4) else {
             continue; // 畸形：静默丢（拦截层产出恒可解析——防御位）
         };
-        let mut via_wg = true;
-        if let Some(q) = quic {
-            if let Some(key) = device.tun_ip_owner(&d) {
-                // `Unbound` = 该设备没有 QUIC 连接（wg 档/未登记/面已死）⇒ 回落 WG 原样
-                via_wg = q.send_to_pub(&key, pkt) != homeway_quic::ExitSend::Handled;
+        let handled = match (quic, tun_owner.get(&d)) {
+            (Some(q), Some(key)) => q.send_to_pub(key, pkt) == homeway_quic::ExitSend::Handled,
+            _ => false,
+        };
+        if !handled {
+            // 无 QUIC 面 / 该 tun_ip 无绑定（设备未登记、连接已死、面已收工）
+            *unbound_dropped += 1;
+            if *unbound_dropped <= 3 || (*unbound_dropped).is_multiple_of(100) {
+                (dlogf)(&format!(
+                    "出站丢弃（无 QUIC 绑定：{d}）—— 累计 {unbound_dropped} 包（WG 兜底面已退役；等设备重连）"
+                ));
             }
         }
-        if via_wg {
-            device.encapsulate(&IpAddr::V4(d), pkt, out);
-        }
     }
-    bind.send_wire(out);
-    out.wire.clear();
 }
 
 // ---------- 公网端点观测 + token 打印 ----------
@@ -1787,6 +1682,7 @@ struct TokenCtx {
     st: Arc<State>,
     secret: [u8; 32],
     backend_priv: x25519_dalek::StaticSecret,
+    /// 公共端口（= QUIC 端口；M5 起唯一）。
     local_port: u16,
     logf: Logf,
     revoked: Arc<Mutex<HashSet<[u8; 32]>>>,
@@ -1861,17 +1757,20 @@ fn public_endpoint_loop(
     }
 }
 
-/// QUIC 端口的公网可达性（M1 S1c / S1-7）：**UPnP 映射 + 实际外口写进 token 的 QUIC 类
-/// 端点**；结果成/败都打 **E-q4** 行（`UPnP：QUIC 端口 %d 映射 %s`），失败时 token 只公布
-/// LAN/中继 QUIC 端点（fail-visible）。
+/// **公共端口**（= QUIC 端口；M5 后唯一）的公网可达性（M1 S1c / S1-7）：**UPnP 映射 +
+/// 实际外口写进 token 的 QUIC 类端点**；结果成/败都打 **E-q4** 行
+/// （`UPnP：QUIC 端口 %d 映射 %s`），失败时 token 只公布 LAN/中继 QUIC 端点（fail-visible）。
 ///
-/// 与 WG 端口映射的关系：**各自独立一条映射**（两端口不同，M1 §1.1）——本函数只在
-/// `quic_ep` 存在（QUIC 面已起）时跑；无 QUIC 面 ⇒ **不打行**（没有端口可映射，不假装）。
-/// WG 侧的映射逻辑与行文**零改动**（本函数不碰它）。
+/// 返回 `(外部端口, 公网 IP)` 供 `refresh_public_endpoint` 的证据合流复用——**M5 起只有
+/// 这一个端口**，映射只做一次（原「WG 端口与 QUIC 端口各自独立一条映射」的两条并存形态
+/// 随 WG 端口删除）。
+///
+/// 本函数只在 `quic_ep` 存在（QUIC 面已起）时跑；无 QUIC 面 ⇒ **不打行**（没有端口可
+/// 映射，不假装）。
 ///
 /// `--upnp=false`：明文打失败行（设计 §10 S1-7 的判据形态）——「失败可见」而不是静默缺席。
-fn refresh_quic_public(ctx: &Arc<TokenCtx>) {
-    let Some(q) = ctx.quic_ep else { return };
+fn refresh_quic_public(ctx: &Arc<TokenCtx>) -> (u16, Option<Ipv4Addr>) {
+    let Some(q) = ctx.quic_ep else { return (0, None) };
     let port = q.port();
     let set_pub = |v: Option<SocketAddr>| {
         if let Ok(mut inner) = ctx.inner.lock() {
@@ -1883,13 +1782,13 @@ fn refresh_quic_public(ctx: &Arc<TokenCtx>) {
         (ctx.logf)(&format!(
             "UPnP：QUIC 端口 {port} 映射 未启用（--upnp=false）——公网 QUIC 端点不公布（LAN/中继 QUIC 端点照常）"
         ));
-        return;
+        return (0, None);
     }
     let cands = crate::server::upnp::local_ipv4_candidates();
     if cands.is_empty() {
         set_pub(None);
         (ctx.logf)(&format!("UPnP：QUIC 端口 {port} 映射 失败（找不到内网 IPv4 候选）"));
-        return;
+        return (0, None);
     }
     let logf2: Logf = Arc::clone(&ctx.logf);
     let deadline = std::time::Instant::now() + crate::server::upnp::UPNP_TOTAL_BUDGET;
@@ -1900,9 +1799,10 @@ fn refresh_quic_public(ctx: &Arc<TokenCtx>) {
                 "UPnP：QUIC 端口 {port} 映射 失败（{e}）——出口在 NAT 后时可在路由器上手动把 UDP {port} 转发到本机（候选 {:?}）；公网 QUIC 端点不公布",
                 cands
             ));
+            (0, None)
         }
         Ok((ext, used)) => {
-            // 外网 IP 与 WG 侧同源（IGD 的 ExternalIPAddress；非公网地址不公布）
+            // 外网 IP（IGD 的 ExternalIPAddress；非公网地址不公布）——同一轮已查到就复用
             let wan = crate::server::upnp::discover_igd(used, deadline)
                 .ok()
                 .and_then(|g| g.external_ip().ok())
@@ -1914,12 +1814,14 @@ fn refresh_quic_public(ctx: &Arc<TokenCtx>) {
                     (ctx.logf)(&format!(
                         "UPnP：QUIC 端口 {port} 映射 外部 UDP {ext} → {used}:{port}（公布 {pub_ep}；重启时从路由器表认领）"
                     ));
+                    (ext, Some(ip))
                 }
                 None => {
                     set_pub(None);
                     (ctx.logf)(&format!(
                         "UPnP：QUIC 端口 {port} 映射 已建立（外部 UDP {ext}）但外网 IP 不可得/非公网——公网 QUIC 端点不公布"
                     ));
+                    (ext, None)
                 }
             }
         }
@@ -1979,10 +1881,10 @@ fn normalize_public_endpoint(cfg: &mut ServeConfig, logf: &Logf) {
 }
 
 fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> bool {
-    // QUIC 端口的公网映射（M1 S1c / S1-7：**E-q4 行成/败都打**，且 `--upnp=false`
-    // 形态也打失败行 = fail-visible）。放在本轮最前：本函数末尾的
-    // `print_client_token` 才能读到本轮的公网 QUIC 端点。
-    refresh_quic_public(ctx);
+    // 公共端口（= QUIC 端口；M5 后 WG 端口不存在）的公网映射（M1 S1c / S1-7：**E-q4 行
+    // 成/败都打**，且 `--upnp=false` 形态也打失败行 = fail-visible）。放在本轮最前：
+    // 既要给 token 填 `quic_pub`，也要把外口喂给下文的证据合流。
+    let (upnp_ext, upnp_wan) = refresh_quic_public(ctx);
     let endpoint_file = ctx.cfg.state_dir.join("cache").join("public_endpoint.txt");
     let manual = ctx.cfg.public_endpoint.trim().to_owned();
     if !manual.is_empty() {
@@ -2003,42 +1905,11 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
         return true;
     }
 
-    // ---- 推断路径：UPnP 映射 + 同 socket STUN 观测（两条证据合流才公布）----
-    let mut ext_port: u16 = 0;
-    let mut wan_ip: Option<Ipv4Addr> = None;
-    if ctx.cfg.upnp {
-        let cands = crate::server::upnp::local_ipv4_candidates();
-        if cands.is_empty() {
-            (ctx.logf)("UPnP：找不到内网 IPv4 候选，跳过端口映射");
-        } else {
-            let d2 = ctx.logf.clone();
-            let logf2: Logf = Arc::clone(&d2);
-            // 全局 40s 预算贯穿「映射 + 外网 IP 查询」两步（Go publicendpoint.go:141 单 ctx）
-            let upnp_deadline = std::time::Instant::now() + crate::server::upnp::UPNP_TOTAL_BUDGET;
-            match crate::server::upnp::ensure_port_mapping(&cands, ctx.local_port, &*logf2, &*logf2, upnp_deadline) {
-                Err(e) => {
-                    (ctx.logf)(&format!(
-                        "UPnP：未取得端口映射（{e}）；出口在 NAT 后时可在路由器上手动把 UDP {} 转发到本机（候选 {:?}）",
-                        ctx.local_port, cands
-                    ));
-                }
-                Ok((ext, used)) => {
-                    ext_port = ext;
-                    (ctx.logf)(&format!(
-                        "UPnP：已建立端口映射 外部 UDP {ext} → {used}:{}（重启时从路由器表认领，不需本地文件）",
-                        ctx.local_port
-                    ));
-                    if let Ok(g) = crate::server::upnp::discover_igd(used, upnp_deadline) {
-                        if let Ok(ip) = g.external_ip() {
-                            if egress::is_public_addr(IpAddr::V4(ip)) {
-                                wan_ip = Some(ip);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
+    // ---- 推断路径：UPnP 映射（= 上面公共端口那条）+ 同端口 STUN 观测（两条证据合流才公布）----
+    // **M5 起只有一条映射**：公共端口就是 QUIC 端口（`refresh_quic_public` 已映射并打
+    // E-q4 行）——这里直接取它的产物，不再重复映射一次（WG 端口不存在了）。
+    let ext_port: u16 = upnp_ext;
+    let wan_ip: Option<Ipv4Addr> = upnp_wan;
 
     let mut observed: Option<SocketAddr> = None;
     if !ctx.cfg.stun.is_empty() {
@@ -2262,14 +2133,8 @@ fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
         labels.push(format!("{}（{kind}）", e.addr));
         eps.push(e);
     };
-    for ifi in egress::physical_candidates() {
-        for a in ifi.addrs {
-            add(Endpoint { addr: format!("{a}:{}", ctx.local_port), kind: EndpointKind::Direct }, "内网");
-        }
-    }
-    // QUIC 内网端点（M1 S1c：独立端口 = 退让后的**实际** QUIC 监听口；类别 Quic ⇒
-    // WG 档不吃它——`wtransport::domain_eps` 的过滤）。与 WG 内网端点同址不同口 ⇒
-    // `add` 的去重键（addr 串）不会误合并。
+    // 内网端点（M5 S3a：**唯一承载类 = Quic**——WG 端口已不存在，原 Direct 内网端点块
+    // 删除；端口 = 退让后的**实际** QUIC 监听口）。
     if let Some(q) = ctx.quic_ep {
         for ifi in egress::physical_candidates() {
             for a in ifi.addrs {
@@ -2280,11 +2145,14 @@ fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
             }
         }
     }
+    // 已公布公网端点（E20 族：显式配置 / UPnP+STUN 合流产物）——M5 起同为 **Quic** 类
+    // （该端口就是 QUIC 端口；WG 类 Direct 公网端点退役 = 设计 §8.1-E3「QUIC 类端点成为
+    // 唯一公网/直连承载类」）。
     for p in published {
-        add(Endpoint { addr: p.clone(), kind: EndpointKind::Direct }, "公网");
+        add(Endpoint { addr: p.clone(), kind: EndpointKind::Quic }, "QUIC 公网");
     }
     // QUIC 公网端点（E-q4 的 UPnP 映射产物；未映射/未启用 ⇒ 缺席 = fail-visible，
-    // 与 E-q4 行同步）。
+    // 与 E-q4 行同步）。与上一块的地址通常相同（去重键 = addr 串 ⇒ 只留一条）。
     if let Some(qp) = ctx.inner.lock().map(|i| i.quic_pub).unwrap_or(None) {
         add(Endpoint { addr: qp.to_string(), kind: EndpointKind::Quic }, "QUIC 公网");
     }
@@ -2295,7 +2163,7 @@ fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
         if p != 0 {
             for domain in &ctx.cfg.ddns {
                 add(
-                    Endpoint { addr: format!("{domain}:{p}"), kind: EndpointKind::Direct },
+                    Endpoint { addr: format!("{domain}:{p}"), kind: EndpointKind::Quic },
                     "域名",
                 );
             }
@@ -2693,8 +2561,13 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir2);
     }
 
-    /// **判据（S1-8）**：铸造的 token **含 QUIC 类端点**（内网 + 公网）与 **RPK 字段**，
-    /// 且 WG 端点（Direct/Relay 类）语义不变；E3 行（`端点：…`）带 `（QUIC 内网/公网）`。
+    /// **判据（S1-8 / M5 改写）**：铸造的 token **全部端点 = QUIC 类**（内网 + 公网）+
+    /// **RPK 字段**；E3 行（`端点：…`）带 `（QUIC 内网/公网）`。
+    ///
+    /// **M5 变更（登记）**：出口不再有 WG 端口 ⇒ 已公布公网端点（显式配置/UPnP+STUN 合流
+    /// 产物）的类别由 `Direct` 改为 `Quic`（设计 §8.1-E3：「QUIC 类端点成为唯一公网/直连
+    /// 承载类」）；`Direct` 类在**本出口铸出的 token 里不再出现**（旧 token 的 Direct 类
+    /// 仍是客户端侧 G9 的可见失败路径，见 `quic_wg_e2e`）。
     #[test]
     fn minted_token_carries_quic_endpoints_and_rpk() {
         let (logf, rx) = log_sink();
@@ -2714,11 +2587,11 @@ mod tests {
         assert!(eps_line.contains("（QUIC 内网）"), "端点行含 QUIC 内网：{eps_line}");
         assert!(eps_line.contains("（QUIC 公网）"), "端点行含 QUIC 公网：{eps_line}");
         assert!(
-            eps_line.contains("203.0.113.7:42650（公网）"),
-            "WG 公网端点行文不变：{eps_line}"
+            eps_line.contains("203.0.113.7:42650（QUIC 公网）"),
+            "已公布公网端点同为 QUIC 类（M5 改写）：{eps_line}"
         );
 
-        // 解出 token：QUIC 类 = 独立端口；rpk = 出口公钥；WG 端点类别/地址不变
+        // 解出 token：QUIC 类 = 独立端口；rpk = 出口公钥
         let tok_str = tok_line.split("：").last().unwrap().trim().to_owned();
         let t = crate::token::decode(&tok_str).expect("铸出的 token 必可解");
         assert_eq!(t.rpk.map(|k| *k.as_bytes()), Some(rpk), "RPK 字段进 token");
@@ -2729,24 +2602,22 @@ mod tests {
             .map(|e| e.addr.as_str())
             .collect();
         assert!(quic.contains(&"203.0.113.7:42652"), "公网 QUIC 端点：{quic:?}");
+        // M5：LAN 端点与 quic_pub 都走 QUIC 端口；已公布公网端点（published）也归 QUIC 类
+        // （其端口在生产路径 = 同一 QUIC 端口；本用例的输入 42650 是显式给的字面值）
+        assert!(quic.contains(&"192.168.3.12:42652"), "LAN QUIC 端点用 QUIC 端口：{quic:?}");
+        assert!(quic.contains(&"203.0.113.7:42650"), "已公布公网端点入 QUIC 类：{quic:?}");
+        // M5：Direct 类端点整体退役（WG 端口不存在）——铸出的 token 里零命中
         assert!(
-            quic.iter().all(|a| a.ends_with(":42652")),
-            "QUIC 端点必须用 QUIC 端口（缺省 listen+1 = 42651？此处显式 42652）：{quic:?}"
+            t.endpoints.iter().all(|e| e.kind != EndpointKind::Direct),
+            "WG 类（Direct）端点已退役：{:?}",
+            t.endpoints.iter().map(|e| e.addr.as_str()).collect::<Vec<_>>()
         );
-        let wg_public = t
+        let public = t
             .endpoints
             .iter()
             .find(|e| e.addr == "203.0.113.7:42650")
-            .expect("WG 公网端点仍在");
-        assert_eq!(wg_public.kind, EndpointKind::Direct, "WG 公网端点类别不变");
-        // 既有 WG 端点的**地址与类别**逐条不变：Direct 类端口的端口恒 = local_port
-        for e in t.endpoints.iter().filter(|e| e.kind == EndpointKind::Direct) {
-            assert!(
-                e.addr.ends_with(":42650"),
-                "Direct 类端点必须仍是 WG 端口（既有端点语义不变）：{}",
-                e.addr
-            );
-        }
+            .expect("已公布公网端点仍在（类别 = QUIC）");
+        assert_eq!(public.kind, EndpointKind::Quic, "公网端点类别 = QUIC（M5 改写）");
         // 台账也带 rpk（serve token 走末行重铸 ⇒ 与运行期串一致）
         let back = ctx.st.last_token().unwrap().unwrap();
         assert_eq!(back.rpk.map(|k| *k.as_bytes()), Some(rpk), "台账末行带 rpk");
@@ -2857,11 +2728,6 @@ mod tests {
         );
     }
 
-    fn dev() -> Device {
-        let logf: Logf = Arc::new(|_: &str| {});
-        Device::new(x25519_dalek::StaticSecret::from([0x5Au8; 32]), logf)
-    }
-
     // ---------- S1b/M2 S1：准入（hr-reg4 四帧 + 连接绑定）/ 入站接线 / 出站分流 ----------
 
     /// `hr-reg4` 用 secret（与既有 reg2 用例的 secret 无关，避免互相干扰）。
@@ -2929,26 +2795,26 @@ mod tests {
     }
 
     /// **判据（S1-3）**：合法 Proof ⇒ 采纳（`Accepted` + 派生地址回填）+ `peer: +` 判据行
-    /// + `device` 侧真加上 peer（`table.register` 的原路径）。
+    /// + 分流键（`tun_ip → pubkey`）真落（`table.register` 的原路径）。
     #[test]
     fn admit_reg4_accepts_valid_frame() {
         let (lines, logf) = line_sink();
         let mut table = reg4_table(&logf);
-        let mut device = dev();
+        let mut tun_owner = std::collections::HashMap::new();
         let pubkey = [0x21u8; 32];
         let dev_tag = [0x22u8; 8];
         let exporter = [0x23u8; 32];
         let frame = reg4_proof(&REG3_SECRET, &pubkey, &dev_tag, &exporter, real_now_unix());
 
-        match admit_reg4(&frame, &exporter, &mut device, &mut table, None, &logf) {
+        match admit_reg4(&frame, &exporter, &mut table, None, &mut tun_owner, &logf) {
             homeway_quic::Reg4Verdict::Accepted { tunnel_ip, tun_ip } => {
                 let sec = crate::token::Secret::from(REG3_SECRET);
                 assert_eq!(tunnel_ip, crate::tunnel_addr::derive_tunnel_ip(&sec, &pubkey));
                 assert_eq!(tun_ip, crate::tunnel_addr::derive_tun_ip(&sec, &pubkey));
+                assert_eq!(tun_owner.get(&tun_ip), Some(&pubkey), "分流键已落（M5 §3.2-bis）");
             }
             other => panic!("合法 Proof 必须采纳：{other:?}"),
         }
-        assert!(device.has_peer(&pubkey), "ops 已落 device");
         assert_eq!(table.len(), 1);
         let ls = lines_of(&lines);
         assert!(
@@ -2971,13 +2837,13 @@ mod tests {
 
         // 重放：同一帧换到 exporter_b（另一条连接）上验
         let mut table = reg4_table(&logf);
-        let mut device = dev();
-        let v = admit_reg4(&frame, &[0xB2u8; 32], &mut device, &mut table, None, &logf);
+        let mut tun_owner = std::collections::HashMap::new();
+        let v = admit_reg4(&frame, &[0xB2u8; 32], &mut table, None, &mut tun_owner, &logf);
         assert!(
             matches!(v, homeway_quic::Reg4Verdict::Rejected { why: homeway_quic::RejectWhy::MacMismatch }),
             "重放必须归 MacMismatch（出口面按它打归因行）：{v:?}"
         );
-        assert_eq!(device.peer_count(), 0, "被拒不得落 peer");
+        assert!(tun_owner.is_empty(), "被拒不得落分流键");
         assert_eq!(table.len(), 0, "被拒不得进设备表");
         let ls = lines_of(&lines);
         assert!(
@@ -2991,7 +2857,7 @@ mod tests {
 
         // 对照：原连接（exporter_a）⇒ 通过
         let mut table2 = reg4_table(&logf);
-        let v2 = admit_reg4(&frame, &exporter_a, &mut dev(), &mut table2, None, &logf);
+        let v2 = admit_reg4(&frame, &exporter_a, &mut table2, None, &mut Default::default(), &logf);
         assert!(
             matches!(v2, homeway_quic::Reg4Verdict::Accepted { .. }),
             "同连接上同一帧应通过：{v2:?}"
@@ -3003,11 +2869,11 @@ mod tests {
     fn admit_reg4_rejects_bad_mac() {
         let (lines, logf) = line_sink();
         let mut table = reg4_table(&logf);
-        let mut device = dev();
+        let mut tun_owner = std::collections::HashMap::new();
         // ① 别的 secret 组帧（不是本出口的 token）
         let other = reg4_proof(&[0x99u8; 32], &[0x41; 32], &[0x42; 8], &[0x43; 32], real_now_unix());
         assert!(matches!(
-            admit_reg4(&other, &[0x43u8; 32], &mut device, &mut table, None, &logf),
+            admit_reg4(&other, &[0x43u8; 32], &mut table, None, &mut tun_owner, &logf),
             homeway_quic::Reg4Verdict::Rejected { why: homeway_quic::RejectWhy::MacMismatch }
         ));
         // ② 合法帧篡改 mac 一位
@@ -3021,14 +2887,14 @@ mod tests {
             admit_reg4(
                 &homeway_quic::Reg4Frame::Proof(tampered),
                 &[0x46u8; 32],
-                &mut device,
                 &mut table,
                 None,
+                &mut tun_owner,
                 &logf
             ),
             homeway_quic::Reg4Verdict::Rejected { why: homeway_quic::RejectWhy::MacMismatch }
         ));
-        assert_eq!(device.peer_count(), 0);
+        assert!(tun_owner.is_empty());
         assert_eq!(table.len(), 0);
         assert!(lines_of(&lines).iter().filter(|l| l.contains("hr-reg4 MAC 不符")).count() >= 2);
     }
@@ -3044,10 +2910,10 @@ mod tests {
         let ts = real_now_unix();
         // 先让设备在册（刷新帧的语义前提）
         let mut table = reg4_table(&logf);
-        let mut device = dev();
+        let mut tun_owner = std::collections::HashMap::new();
         let proof = reg4_proof(&REG3_SECRET, &pubkey, &dev_tag, &exporter, ts);
         assert!(matches!(
-            admit_reg4(&proof, &exporter, &mut device, &mut table, None, &logf),
+            admit_reg4(&proof, &exporter, &mut table, None, &mut tun_owner, &logf),
             homeway_quic::Reg4Verdict::Accepted { .. }
         ));
 
@@ -3058,7 +2924,7 @@ mod tests {
         let forged = homeway_quic::Reg4Frame::Refresh(
             homeway_quic::RefreshFrame::parse(&raw).expect("可解"),
         );
-        let v = admit_reg4(&forged, &exporter, &mut device, &mut table, None, &logf);
+        let v = admit_reg4(&forged, &exporter, &mut table, None, &mut tun_owner, &logf);
         assert!(
             matches!(v, homeway_quic::Reg4Verdict::Rejected { why: homeway_quic::RejectWhy::MacMismatch }),
             "Proof 的 MAC 不得在刷新域成立：{v:?}"
@@ -3066,7 +2932,7 @@ mod tests {
 
         // ② 真刷新帧 ⇒ 采纳（同 devTag 同 pubkey ⇒ 表内 Refreshed 路径）
         let refresh = reg4_refresh(&REG3_SECRET, &pubkey, &dev_tag, &exporter, ts);
-        let v2 = admit_reg4(&refresh, &exporter, &mut device, &mut table, None, &logf);
+        let v2 = admit_reg4(&refresh, &exporter, &mut table, None, &mut tun_owner, &logf);
         assert!(matches!(v2, homeway_quic::Reg4Verdict::Accepted { .. }), "{v2:?}");
         assert_eq!(table.len(), 1, "刷新不新增设备");
         assert!(
@@ -3092,10 +2958,10 @@ mod tests {
             TableConfig { max_devices: 4, ttl: Duration::from_millis(1), ..Default::default() },
             Arc::clone(&logf),
         );
-        let mut device = dev();
+        let mut tun_owner = std::collections::HashMap::new();
         let proof = reg4_proof(&REG3_SECRET, &pubkey, &dev_tag, &exporter, ts);
         assert!(matches!(
-            admit_reg4(&proof, &exporter, &mut device, &mut table, None, &logf),
+            admit_reg4(&proof, &exporter, &mut table, None, &mut tun_owner, &logf),
             homeway_quic::Reg4Verdict::Accepted { .. }
         ));
         assert_eq!(table.len(), 1);
@@ -3113,7 +2979,7 @@ mod tests {
             refresh.mac_matches(&REG3_SECRET, &exporter),
             "MAC 必须成立——本用例证的是「MAC 之外还有一道」"
         );
-        let v = admit_reg4(&refresh, &exporter, &mut device, &mut table, None, &logf);
+        let v = admit_reg4(&refresh, &exporter, &mut table, None, &mut tun_owner, &logf);
         assert!(
             matches!(
                 v,
@@ -3138,7 +3004,7 @@ mod tests {
         );
 
         // 对照：**完整准入**（Proof）是合法复位路径 ⇒ 同一设备可重新登记
-        let v2 = admit_reg4(&proof, &exporter, &mut dev(), &mut table, None, &logf);
+        let v2 = admit_reg4(&proof, &exporter, &mut table, None, &mut Default::default(), &logf);
         assert!(
             matches!(v2, homeway_quic::Reg4Verdict::Accepted { .. }),
             "完整准入必须仍可登记（resurrect 只许经四帧准入，不许经刷新帧）：{v2:?}"
@@ -3162,7 +3028,7 @@ mod tests {
             frame.mac_matches(&REG3_SECRET, &exporter),
             "MAC 覆盖域含 ts——超窗帧的 MAC 仍成立"
         );
-        let v = admit_reg4(&frame, &exporter, &mut dev(), &mut table, None, &logf);
+        let v = admit_reg4(&frame, &exporter, &mut table, None, &mut Default::default(), &logf);
         assert!(
             matches!(
                 v,
@@ -3219,10 +3085,10 @@ mod tests {
         );
         on_quic_inbound(
             homeway_quic::ExitInbound::Packet { dev: [0x01; 8], pkt },
-            &mut dev(),
             &mut table,
             &mut itc,
             None,
+            &mut Default::default(),
             &logf,
         );
         let ls = lines_of(&lines);
@@ -3260,68 +3126,63 @@ mod tests {
         q
     }
 
-    /// **判据（S1-5 的判定面）**：出站按 dst 分流——`tun_ip` 归 QUIC 档键、`tunnel_ip`
-    /// 与未知地址不归（⇒ WG 原样）。QUIC 侧的真投递在 `homeway-quic` 的出口面用例里断言。
+    /// **判据（S1-5 的判定面 / M5 §3.2-bis 方案 (a)）**：出站分流键 = 引擎侧
+    /// `tun_ip → pubkey` 映射（数据源 = `DevOp`）——`tun_ip`（hw-app）唯一命中；
+    /// `tunnel_ip`（hw-tun，服务面自带连接）与未知地址都不命中。
     #[test]
-    fn tun_ip_owner_is_the_quic_split_key() {
-        let mut device = dev();
+    fn tun_owner_map_is_the_quic_split_key() {
         let pubkey = [0x61u8; 32];
-        device.add_peer(PeerConfig {
-            pubkey,
-            psk: [0x62; 32],
-            tunnel_ip: Ipv4Addr::new(100, 64, 3, 1),
-            tun_ip: Ipv4Addr::new(100, 64, 3, 2),
-        });
-        assert_eq!(
-            device.tun_ip_owner(&Ipv4Addr::new(100, 64, 3, 2)),
-            Some(pubkey),
-            "tun_ip（hw-app）⇒ QUIC 档键"
-        );
-        assert_eq!(
-            device.tun_ip_owner(&Ipv4Addr::new(100, 64, 3, 1)),
+        let tun_ip = Ipv4Addr::new(100, 64, 3, 2);
+        let tunnel_ip = Ipv4Addr::new(100, 64, 3, 1);
+        let mut owner: std::collections::HashMap<Ipv4Addr, [u8; 32]> =
+            std::collections::HashMap::new();
+        apply_dev_ops(
+            vec![DevOp::Add { pubkey, psk: [0x62; 32], tunnel_ip, tun_ip }],
+            &mut owner,
             None,
-            "tunnel_ip（hw-tun，服务面自带连接）⇒ 不归 QUIC（WG 原样）"
         );
-        assert_eq!(device.tun_ip_owner(&Ipv4Addr::new(100, 64, 3, 9)), None, "未知 ⇒ 不归");
+        assert_eq!(owner.get(&tun_ip), Some(&pubkey), "tun_ip（hw-app）⇒ QUIC 档键");
+        assert_eq!(owner.get(&tunnel_ip), None, "tunnel_ip（hw-tun，服务面自带连接）⇒ 不归");
+        assert_eq!(owner.get(&Ipv4Addr::new(100, 64, 3, 9)), None, "未知 ⇒ 不归");
+        // 摘除（淘汰/吊销/轮换）⇒ 键随之消失
+        apply_dev_ops(vec![DevOp::Remove { pubkey }], &mut owner, None);
+        assert!(owner.is_empty(), "摘除后分流键清空");
     }
 
-    /// **判据（S1-5 的回落面）**：`route_encap` 在 QUIC 面**无绑定**时回落 WG 原样——
-    /// 真起一枚出口面（未登记任何设备）作桩：`tun_ip` 目的的包仍走 `device.encapsulate`
-    /// （⇒ 无 endpoint 计数 +1），而不是被静默吞掉。
+    /// **判据（S1-5 的回落面；M5 改判）**：`route_out` 在**无绑定**时 = 丢 + 计数 + 记行
+    /// （原「WG `device.encapsulate` 原样」的兜底面随 WG 删除；§3.2-bis ②）。
     #[test]
-    fn route_encap_falls_back_to_wg_when_unbound() {
-        let (_, logf) = line_sink();
+    fn route_out_drops_and_counts_when_unbound() {
+        let (lines, logf) = line_sink();
         let quic = homeway_quic::ExitQuic::start(
             std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("回环可绑"),
             homeway_quic::ExitQuicConfig::new(homeway_quic::Ed25519Seed::from_bytes([0x11; 32]), 4),
             Arc::clone(&logf),
         )
         .expect("端点可起");
-        let mut device = dev();
-        let pk = [0x71u8; 32];
-        device.add_peer(PeerConfig {
-            pubkey: pk,
-            psk: [0x72; 32],
-            tunnel_ip: Ipv4Addr::new(100, 64, 4, 1),
-            tun_ip: Ipv4Addr::new(100, 64, 4, 2),
-        });
-        let mut bind =
-            ServerBind::open_bound(0, "", None, None, Arc::clone(&logf)).expect("bind 可起");
-        let mut out = InboundOut::default();
         let dst = Ipv4Addr::new(100, 64, 4, 2);
         let tx = vec![udp_pkt(dst, dst, 40000, 53, b"x")];
-        route_encap(&tx, &mut device, &mut bind, &mut out, Some(&quic));
+        let mut dropped = 0u64;
+        // ① 空映射（设备未登记）：丢 + 计数
+        route_out(&tx, &Default::default(), Some(&quic), &mut dropped, &logf);
+        assert_eq!(dropped, 1, "无绑定 ⇒ 丢弃计数 +1");
+        // ② 有绑定但 QUIC 面报 Unbound（未登记/连接死）：同样计丢（不静默）
+        let mut owner = std::collections::HashMap::new();
+        owner.insert(dst, [0x71u8; 32]);
+        route_out(&tx, &owner, Some(&quic), &mut dropped, &logf);
+        assert_eq!(dropped, 2, "面侧 Unbound ⇒ 丢弃计数 +1（不再回落 WG）");
+        let ls = lines_of(&lines);
         assert!(
-            device.no_endpoint_drops >= 1,
-            "无绑定 ⇒ QUIC 面报 Unbound ⇒ 回落 WG encap（未学 endpoint ⇒ 计数 +1）"
+            ls.iter().any(|l| l.contains("出站丢弃（无 QUIC 绑定")),
+            "丢弃必须可见（首 3 记行）：{ls:?}"
         );
         assert!(quic.stop_within(Instant::now() + Duration::from_secs(2)), "面应能收工");
     }
 
-    /// P0-2 端到端不变量：表满淘汰后 `apply_dev_ops` **真摘掉** victim 的 peer——
-    /// `Device.peers` 不再随淘汰单调增长（表-设备一致）。
+    /// P0-2 端到端不变量（M5 形态）：表满淘汰后 `apply_dev_ops` **真摘掉** victim 的
+    /// 分流键——`tun_ip → pubkey` 不再随淘汰单调增长（表—引擎状态一致）。
     #[test]
-    fn eviction_removes_device_peer() {
+    fn eviction_removes_tun_owner() {
         let secret = [0x66u8; 32];
         let logf: Logf = Arc::new(|_: &str| {});
         let mut table = DeviceTable::new(
@@ -3329,33 +3190,34 @@ mod tests {
             TableConfig { max_devices: 2, ..Default::default() },
             Arc::clone(&logf),
         );
-        let mut device = dev();
+        let mut tun_owner = std::collections::HashMap::new();
         let base = now();
         // d1：已超宽限（10 分钟 + 60s 前注册）
         let old_ts = now_unix() - (crate::server::table::DEFAULT_GRACE.as_secs() + 60);
         let (_, ops) = table
             .register(&reg_bytes(&secret, &[1; 32], &[1; 8], old_ts), base - Duration::from_secs(660))
             .unwrap();
-        apply_dev_ops(ops, &mut device, None);
+        apply_dev_ops(ops, &mut tun_owner, None);
         let (_, ops) = table.register(&reg_bytes(&secret, &[2; 32], &[2; 8], now_unix()), base).unwrap();
-        apply_dev_ops(ops, &mut device, None);
-        assert_eq!(device.peer_count(), 2);
+        apply_dev_ops(ops, &mut tun_owner, None);
+        assert_eq!(tun_owner.len(), 2, "两台设备 ⇒ 两个分流键");
 
         // d3 触发淘汰：ops = [Remove(d1.pub), Add(d3.pub)]
         let (_, ops) = table.register(&reg_bytes(&secret, &[3; 32], &[3; 8], now_unix()), base).unwrap();
         assert!(matches!(ops[0], DevOp::Remove { pubkey } if pubkey == [1; 32]));
-        apply_dev_ops(ops, &mut device, None);
-        assert_eq!(device.peer_count(), 2, "淘汰一个加一个——peers 表不单调增长");
-        assert!(!device.has_peer(&[1; 32]), "victim peer 已被真摘除");
-        assert!(device.has_peer(&[2; 32]));
-        assert!(device.has_peer(&[3; 32]));
+        apply_dev_ops(ops, &mut tun_owner, None);
+        assert_eq!(tun_owner.len(), 2, "淘汰一个加一个——键表不单调增长");
+        assert!(!tun_owner.values().any(|p| p == &[1; 32]), "victim 的键已被真摘除");
+        assert!(tun_owner.values().any(|p| p == &[2; 32]));
+        assert!(tun_owner.values().any(|p| p == &[3; 32]));
     }
 
-    /// 克隆场景的**弱不变量**：同公钥挂两个 devTag 时，device 侧同一 pubkey 只保留
-    /// 一条 peer；按 pubkey 发 Remove 会把仍在表的另一 devTag 的 peer 一并摘掉——
-    /// 这与 Go `peers.go` 同序同缺口（共享），故断言写成弱不变量而非「表-设备一一对应」。
+    /// 克隆场景的**弱不变量**（M5 形态）：同公钥挂两个 devTag 时，分流键按 `tun_ip`
+    /// 分列（两键共存，QUIC 面按 pubkey 绑定同一连接）；按 pubkey 发 Remove 会把两条
+    /// 键一并摘掉——与 Go `peers.go` 同序同缺口（共享），故断言写成弱不变量而非
+    /// 「表—键一一对应」。
     #[test]
-    fn clone_same_pubkey_keeps_single_peer() {
+    fn clone_same_pubkey_shares_tun_owner_removal() {
         let secret = [0x67u8; 32];
         let logf: Logf = Arc::new(|_: &str| {});
         let mut table = DeviceTable::new(
@@ -3363,22 +3225,24 @@ mod tests {
             TableConfig { max_devices: 2, ..Default::default() },
             Arc::clone(&logf),
         );
-        let mut device = dev();
+        let mut tun_owner = std::collections::HashMap::new();
         let base = now();
         // 同公钥 [9;32]、两个 devTag（克隆形态：应用数据被复制）；d1 超宽限以便被淘汰
         let old_ts = now_unix() - (crate::server::table::DEFAULT_GRACE.as_secs() + 60);
         let (_, ops) = table
             .register(&reg_bytes(&secret, &[9; 32], &[1; 8], old_ts), base - Duration::from_secs(660))
             .unwrap();
-        apply_dev_ops(ops, &mut device, None);
+        apply_dev_ops(ops, &mut tun_owner, None);
         let (_, ops) = table.register(&reg_bytes(&secret, &[9; 32], &[2; 8], now_unix()), base).unwrap();
-        apply_dev_ops(ops, &mut device, None);
+        apply_dev_ops(ops, &mut tun_owner, None);
         assert_eq!(table.len(), 2, "两个 devTag 都在表（克隆合法）");
-        assert_eq!(device.peer_count(), 1, "同 pubkey 只保留一条 peer（弱不变量）");
-        // 淘汰其一 ⇒ Remove(pubkey [9;32]) ⇒ 唯一那条 peer 被摘（已知共享差异）
+        // `derive_tun_ip` 的输入是 (secret, pubkey)——**不含 devTag** ⇒ 同 pubkey 的两个
+        // devTag 派生出同一个 tun_ip ⇒ 分流键只有一条（QUIC 面同样按 pubkey 绑定单连接）
+        assert_eq!(tun_owner.len(), 1, "同 pubkey ⇒ 同 tun_ip ⇒ 单键");
+        // 淘汰其一 ⇒ Remove(pubkey [9;32]) ⇒ 两条键一并摘（已知共享差异）
         let (_, ops) = table.register(&reg_bytes(&secret, &[3; 32], &[3; 8], now_unix()), base).unwrap();
         assert!(matches!(ops[0], DevOp::Remove { pubkey } if pubkey == [9; 32]));
-        apply_dev_ops(ops, &mut device, None);
-        assert!(device.peer_count() <= 1, "同一 pubkey 至多一条 peer");
+        apply_dev_ops(ops, &mut tun_owner, None);
+        assert!(!tun_owner.values().any(|p| p == &[9; 32]), "该 pubkey 的键全摘（弱不变量）");
     }
 }

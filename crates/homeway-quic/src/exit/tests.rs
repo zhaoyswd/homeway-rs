@@ -2144,6 +2144,7 @@ async fn removed_leg_does_not_fall_back_to_direct_socket() {
         Arc::clone(&legs),
         inject_rx,
         Arc::clone(&bridge),
+        None, // 明文面钩子（M5 S3a）：本用例只测 QUIC 路径
     );
     let tx = |dest: SocketAddr, body: &'static [u8]| Transmit {
         destination: dest,

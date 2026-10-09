@@ -89,8 +89,9 @@ EOF
       --upnp=false --stun= --stun6= --public-endpoint "127.0.0.1:$ep" --relay "$RL1" --verbose \
       >> "$st/exit.log" 2>&1 &
   else
+    # M5 C4：Rust 出口的公共端口 = QUIC 端口（= --listen + 1）
     nohup "$RUST_BIN" serve --state "$st/exit" --listen "$ep" --bind-interface none \
-      --upnp=false --stun= --public-endpoint "127.0.0.1:$ep" --relay "$RL1" \
+      --upnp=false --stun= --public-endpoint "127.0.0.1:$((ep + 1))" --relay "$RL1" \
       --files-root "$st/files" --verbose >> "$st/exit.log" 2>&1 &
   fi
   echo $! > "$st/exit.pid"

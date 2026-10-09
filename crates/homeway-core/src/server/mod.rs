@@ -1,24 +1,24 @@
-//! server：R3 出口侧模块（多 peer WG device / 腿帧收发面 / 设备表 / 台账 / 拦截层）。
+//! server：R3 出口侧模块（**腿面** / 设备表 / 台账 / 拦截层 / 公共端点面）。
 //!
 //! 对应 Go 侧 `internal/server/` + `pkg/servercore/` + `pkg/intercept/` + `pkg/dns/` 的 Rust 平移；
-//! 模块划分按 Rust 惯例（`bind.rs` 对应 `servercore.ServerBind`——与客户端
-//! 客户端 `wtransport::bind`（对应 `wtransport.Bind`；**M5 C3 已随 WG 面删除**）同名是「同一协议两端各一个 Bind」的
-//! 对称结构，全路径区分）。
+//! 模块划分按 Rust 惯例。**M5 后的形态**：`bind.rs` = 出口**腿面**（M5 设计 §1.3-T6 的保留列：
+//! 腿表族 + 腿 socket 收包解析，QUIC 经中继的唯一通路）；`pubface.rs` = **公共端点面**
+//! （QUIC 出口 socket 的公共端口上非 QUIC 流量的协议真源——S3a 的五类迁址落点）；
+//! WG 载荷面（`device.rs` 的多 peer noise device / `txring.rs` 的发送环）随 WG 面删除。
 
 pub mod bind;
 pub mod bindwatch;
 pub mod ddnscheck;
-pub mod device;
 pub mod dnsproxy;
 pub mod engine;
 pub mod egress;
 pub mod quic_admit;
 pub mod upnp;
+pub mod pubface;
 pub mod state;
 pub mod table;
 pub mod intercept;
 pub mod relayleg;
-pub mod txring;
 
 /// 出口 QUIC 面的 RPK 私钥种子 = `HKDF(后端静态私钥, "homeway/quic-rpk")`（M1 设计
 /// §1.3/§12-② 的「出口侧产出」）。

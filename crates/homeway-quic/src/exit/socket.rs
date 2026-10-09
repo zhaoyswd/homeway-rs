@@ -3,8 +3,14 @@
 //!
 //! | 路径 | 收 | 发 |
 //! |---|---|---|
-//! | **直连**（`serve.quic_listen` 独立端口） | 本 socket 直接读 | 本 socket 直接写 |
+//! | **直连**（`serve.quic_listen` 独立端口） | 本 socket 直接读（**先经明文钩子**） | 本 socket 直接写 |
 //! | **中继腿**（中继 assoc 的腿 socket） | **引擎线程**按腿帧解析后注入（见下） | 本 socket 走该腿 socket 并包 `[0xBB][5]` |
+//!
+//! **M5 S3a 起本 socket 同时是出口的公共端点面**（[`PlainDatagramHook`]）：本端口上
+//! 非 QUIC 的报文（参照点探测请求、STUN 观测应答、中继**注册腿**的控制帧）先经钩子判定，
+//! 认领即就地应答且不喂 quinn（`poll_recv` 的 ③ 步）；STUN 观测请求的**出站**走
+//! [`super::ExitQuic::send_plain`]（同样是本端口）。WG 面退役后本 socket 是出口唯一的
+//! 公共 UDP 面 ⇒ 探针/观测都必须在它上面。
 //!
 //! **发送侧路由键 = `Transmit.destination`**（QUIC 眼里的连接对端地址）：命中腿表 ⇒ 走该
 //! 腿 socket 并包腿帧；「最近摘除的腿」⇒ **丢 + 计数**（照 `server/bind.rs` 的 #17 纪律：
@@ -50,6 +56,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use crate::sync_util::lock_unpoison;
 
 use super::bridge::{DropKind, ExitBridge};
+use super::{PlainDatagramHook, PlainOutcome};
 
 /// 腿帧魔数（与 `legframe::FRAME_MAGIC` 同值）。
 const FRAME_MAGIC: u8 = 0xBB;
@@ -130,6 +137,10 @@ pub(crate) struct ExitSock {
     /// 引擎注入队列（腿上的 kind=5 载荷；接收端只在 QUIC 线程 poll——锁无竞争）。
     inject: Mutex<InjectRx>,
     bridge: Arc<ExitBridge>,
+    /// 公共端点的**明文数据报钩子**（M5 S3a）：直连端口上非 QUIC 的包（参照点探测请求 /
+    /// STUN 观测应答 / 中继注册腿控制帧）先经它判定——返回 `Some((dst, resp))` 即由本
+    /// socket 就地应答（该包**不再**喂 quinn）。`None` = 无钩子（纯 QUIC 形态）。
+    plain: Option<PlainDatagramHook>,
 }
 
 impl std::fmt::Debug for ExitSock {
@@ -148,6 +159,7 @@ impl ExitSock {
         legs: Arc<LegTable>,
         inject: InjectRx,
         bridge: Arc<ExitBridge>,
+        plain: Option<PlainDatagramHook>,
     ) -> Self {
         Self {
             direct,
@@ -155,7 +167,14 @@ impl ExitSock {
             legs,
             inject: Mutex::new(inject),
             bridge,
+            plain,
         }
+    }
+
+    /// 从**公共端口 socket** 直接发一个裸数据报（STUN 观测请求等；非 QUIC 载荷）。
+    /// 引擎线程经出站通道调用 → 本函数在 QUIC 线程执行（`try_send_to` 是即时系统调用）。
+    pub(crate) fn send_plain(&self, dst: SocketAddr, payload: &[u8]) -> io::Result<()> {
+        self.direct.try_send_to(payload, dst).map(|_| ())
     }
 
     /// 注入一条腿上的 QUIC 报文（引擎线程；`false` = 面已收工 ⇒ 调用方停止注入）。
@@ -285,6 +304,26 @@ impl AsyncUdpSocket for ExitSock {
             }
             match self.direct.try_recv_from(&mut buf[..]) {
                 Ok((n, src)) => {
+                    // ③ 公共端点的**明文面**（M5 S3a）：非 QUIC 的包（探测请求 / STUN 观测
+                    //    应答 / 中继注册腿控制帧）先交钩子——它认领（返回应答）即就地发出、
+                    //    且**不**喂 quinn（否则会被当作畸形 QUIC 报文丢弃：探测请求的首字节
+                    //    0x48 恰好像 1-RTT 短头）。钩子不认领 ⇒ 照旧喂 quinn。
+                    if let Some(hook) = &self.plain {
+                        if let Some(outcome) = hook(&buf[..n], src) {
+                            if let PlainOutcome::Reply { dst, payload } = outcome {
+                                if let Err(e) = self.direct.try_send_to(&payload, dst) {
+                                    self.bridge.note_drop(
+                                        DropKind::SendBufferFull,
+                                        &format!(
+                                            "明文面应答发送失败（→ {dst}，{}B：{e}）",
+                                            payload.len()
+                                        ),
+                                    );
+                                }
+                            }
+                            continue; // 已消化：继续读下一包（本轮可能还有）
+                        }
+                    }
                     meta[0] = RecvMeta { addr: src, len: n, stride: n, ecn: None, dst_ip: None };
                     return Poll::Ready(Ok(1));
                 }

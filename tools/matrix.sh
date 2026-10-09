@@ -49,6 +49,19 @@ for a in "$@"; do
   prev="$a"
 done
 if (( SMOKE )); then LINKS=(RRR); fi
+# ---- L2/L3 退役（M5 C4 裁决②；登记 = docs/reviews/M5.md）----
+# 两行 = {Go 出口} × {Rust 客户端}：Go 出口的 token 不带 QUIC 端点/RPK ⇒ QUIC-only 的
+# Rust 客户端**必然失败**（C3 实测三判据 FAIL）。按「无兼容包袱」口径（2026-10-09 用户
+# 重申）该组合不存在：Go 出口已于 2026-10-05 整体退役 ⇒ 退役行**跳过 + 说明**（不判红）。
+L2_L3_RETIRED=(L2 L3)
+_kept=(); for l in "${LINKS[@]}"; do
+  if (( ${L2_L3_RETIRED[(I)$l]} )); then
+    echo "[$l] SKIP — Go 出口退役（2026-10-05）+ 无兼容包袱 ⇒ 该组合不存在（M5 C4 裁决②）"
+  else
+    _kept+=("$l")
+  fi
+done
+LINKS=("${_kept[@]}")
 if (( ${#LINKS} == 0 )); then LINKS=(L1 L2 L3 L4 L5 L6); fi
 if (( PERF )); then LINKS+=(GGG RRR); fi
 
@@ -188,8 +201,9 @@ start_exit() { # start_exit <链路> <go|rust> [rl1token]
   local extra=()
   [[ -n "$rl" ]] && extra+=(--relay "$rl")
   if [[ "$impl" == rust ]]; then
+    # M5 C4：公共端口 = QUIC 端口（缺省 listen+1）；--public-endpoint 指向它
     nohup "$RUST_BIN" serve --state "$st" --listen "$port" --bind-interface none \
-      --upnp=false --stun= --public-endpoint "127.0.0.1:$port" \
+      --upnp=false --stun= --public-endpoint "127.0.0.1:$((port + 1))" \
       --files-root "$MATRIX/$link/files" --verbose "${extra[@]}" \
       >> "$st/stdout.log" 2>&1 &
   else
@@ -210,8 +224,11 @@ CONFEOF
   if line=$(wait_line_from "$st/stdout.log" 'serve 就绪' 0 25); then
     local actual
     actual=$(cat "$st/cache/listen_port.txt" 2>/dev/null)
-    if [[ "$actual" != "$port" ]]; then
-      echo "!! 实际监听端口 $actual ≠ 配置 $port（退让）——判据会指向占用者" >&2
+    # 期望值：Rust 出口 = QUIC 端口（= listen+1，M5 起唯一公共端口）；Go 出口 = listen
+    local want="$port"
+    [[ "$impl" == rust ]] && want=$((port + 1))
+    if [[ "$actual" != "$want" ]]; then
+      echo "!! 实际公共端口 $actual ≠ 期望 $want（退让）——判据会指向占用者" >&2
       return 1
     fi
     print -r -- "$line"
@@ -437,10 +454,39 @@ base_segment() {
     local CLN=$(log_lines "$st/c-main/cache/client.log")
     # 等「路径确立：直连」或巡检 via=direct（90s 窗——竞速偶发落中继时 hint 盲打
     # 自愈会翻直连，巡检行 60s 一拍必然报到；重启重试机制实测故障面大于收益，弃）
-    if V=$(wait_line_from "$st/c-main/cache/client.log" '路径确立：直连|link: via=direct' "$CLN" 150); then
-      record "$link" C-via-direct "PASS" "${V:0:100}"
+    # **C-via（M5 C4 裁决①改写，同上）**：胜者 ∈ {直连, 中继}；落中继时另判「直连可用」。
+    local W0=$(date +%s)
+    if V=$(wait_line_from "$st/c-main/cache/client.log" \
+        '路径确立：直连|路径确立：中继|link: via=direct|link: via=relay' "$CLN" 150); then
+      local dt=$(( $(date +%s) - W0 ))
+      record "$link" C-via "PASS" "${V:0:100}" "（胜者耗时 ${dt}s）"
+      if [[ "$V" == *中继* || "$V" == *via=relay* ]]; then
+        # 独立断言：打死中继 ⇒ 重开会话必须直连（Go 侧 = 重启 daemon + 换名重 add）
+        stop_pid "$MATRIX/$link/relay/pid"
+        stop_pid "$st/c-main/pid"
+        rm -rf "$st/c-main/cache/endpoints"
+        start_go_client "$link" || true
+        local wsock=0
+        while (( wsock < 8 )) && [[ ! -S "$st/c-main/control.sock" ]]; do
+          sleep 1; (( wsock+=1 ))
+        done
+        sleep 2
+        if CL=$(go_client_add "$link" "$TOK" "m${link}d" 2>/dev/null); then
+          if V=$(wait_line_from "$st/c-main/cache/client.log" '路径确立：直连|link: via=direct' \
+              "$(log_lines "$st/c-main/cache/client.log")" 60); then
+            record "$link" C-direct-usable "PASS" "${V:0:100}" "（中继打死形态）"
+          else
+            record "$link" C-direct-usable "FAIL" "中继打死 60s 内仍未直连"
+          fi
+        else
+          record "$link" C-direct-usable "FAIL" "中继打死形态 host add 失败"
+        fi
+        start_relay "$link" "$(link_relay_impl "$link")" >/dev/null 2>&1 || true
+      else
+        record "$link" C-direct-usable "PASS" "赛跑胜者本身即直连（无需打死中继对照）"
+      fi
     else
-      # 落中继且 150s 未自愈——重启 daemon + 换名重 add（控制面 sock 轮询就绪再 add）
+      # 两轮都没结算：沿用「重启重试一轮」的既有兜底
       stop_pid "$st/c-main/pid"
       rm -rf "$st/c-main/cache/endpoints"
       start_go_client "$link" || true
@@ -450,13 +496,16 @@ base_segment() {
       done
       sleep 2
       if CL=$(go_client_add "$link" "$TOK" "m${link}r" 2>/dev/null); then
-        if V=$(grep -E '路径确立：直连|link: via=direct' "$st/c-main/cache/client.log" 2>/dev/null | tail -1); then
-          record "$link" C-via-direct "PASS" "${V:0:100}" "（重启重试命中——首轮落中继未自愈）"
+        if V=$(grep -E '路径确立：直连|路径确立：中继|link: via=(direct|relay)' "$st/c-main/cache/client.log" 2>/dev/null | tail -1); then
+          record "$link" C-via "PASS" "${V:0:100}" "（重启重试命中）"
+          record "$link" C-direct-usable "SKIP" "重试轮未做打死中继对照"
         else
-          record "$link" C-via-direct "FAIL" "重试会话仍未直连"
+          record "$link" C-via "FAIL" "重试会话仍未结算路径"
+          record "$link" C-direct-usable "SKIP" "赛跑未结算"
         fi
       else
-        record "$link" C-via-direct "FAIL" "重试 host add 失败"
+        record "$link" C-via "FAIL" "重试 host add 失败"
+        record "$link" C-direct-usable "SKIP" "赛跑未结算"
       fi
     fi
   else
@@ -472,21 +521,36 @@ base_segment() {
       record "$link" C-ready "FAIL" "25s 内未见 warmup pong"
       return 1
     fi
-    if V=$(wait_line_from "$st/c-main/rust.log" '路径确立：直连|link: via=direct' "$CL0" 150); then
-      record "$link" C-via-direct "PASS" "${V:0:100}"
-    else
-      # 落中继且 150s 未自愈（hint 时序运气）——重启会话再竞速一轮（Rust 侧重启链路
-      # 简单可靠；主客户端 --speedtest 会重跑，E13 判据照常收）
-      stop_pid "$st/c-main/pid"
-      local CL0r=$(log_lines "$st/c-main/rust.log")
-      nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$IDDIR" --no-session-lock \
-        --speedtest --hold 600 >> "$st/c-main/rust.log" 2>&1 &
-      echo $! > "$st/c-main/pid"
-      if V=$(wait_line_from "$st/c-main/rust.log" '路径确立：直连|link: via=direct' "$CL0r" 60); then
-        record "$link" C-via-direct "PASS" "${V:0:100}" "（重启重试命中——首轮落中继未自愈）"
+    # **C-via（M5 C4 裁决①改写）**：赛跑取最快者 = 特性（判据 = 胜者 ∈ {直连, 中继}，
+    # 记录胜者与耗时）；原「直连必胜」在本地中继腿（2ms）在场时不成立（C3 实测：
+    # 直连首飞 ~1s vs 中继 2ms ⇒ 恒落中继）。
+    local W0=$(date +%s)
+    if V=$(wait_line_from "$st/c-main/rust.log" \
+        '路径确立：直连|路径确立：中继|link: via=direct|link: via=relay' "$CL0" 150); then
+      local dt=$(( $(date +%s) - W0 ))
+      record "$link" C-via "PASS" "${V:0:100}" "（胜者耗时 ${dt}s）"
+      if [[ "$V" == *中继* || "$V" == *via=relay* ]]; then
+        # **独立断言 C-direct-usable（裁决①第二半）**：直连路径必须**真的可用**——
+        # 打死中继后重开会话 ⇒ 必须直连成功（C3 实测该形态 1.005s）。
+        stop_pid "$MATRIX/$link/relay/pid"
+        stop_pid "$st/c-main/pid"
+        local CLd=$(log_lines "$st/c-main/rust.log")
+        nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$IDDIR" --no-session-lock \
+          --speedtest --hold 600 >> "$st/c-main/rust.log" 2>&1 &
+        echo $! > "$st/c-main/pid"
+        if V=$(wait_line_from "$st/c-main/rust.log" '路径确立：直连|link: via=direct' "$CLd" 60); then
+          record "$link" C-direct-usable "PASS" "${V:0:100}" "（中继打死形态）"
+        else
+          record "$link" C-direct-usable "FAIL" "中继打死 60s 内仍未直连"
+        fi
+        # 恢复中继（后续段要用；出口的注册腿 5s 节拍自愈）
+        start_relay "$link" "$(link_relay_impl "$link")" >/dev/null 2>&1 || true
       else
-        record "$link" C-via-direct "FAIL" "两轮（150s+60s）均未见直连"
+        record "$link" C-direct-usable "PASS" "赛跑胜者本身即直连（无需打死中继对照）"
       fi
+    else
+      record "$link" C-via "FAIL" "150s 内未见路径确立（直连或中继均无）"
+      record "$link" C-direct-usable "SKIP" "赛跑未结算"
     fi
   fi
 

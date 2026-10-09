@@ -116,10 +116,41 @@ pub const DEFAULT_ADMIT_DEADLINE: Duration = Duration::from_secs(10);
 /// 计量用**服务端 `Instant`** ⇒ 与客户端时钟解耦（时钟偏移容忍不新增面）。它只需覆盖
 /// 「收 Challenge → 回 Proof」的 1 RTT（客户端总预算是它的数倍 ⇒ 不冲突）。
 pub const DEFAULT_NONCE_TTL: Duration = Duration::from_secs(5);
+/// 公共端口明文出站队列上限（M5 S3a）：观测面是分钟级低频请求 ⇒ 64 条足够；
+/// 满 ⇒ 丢 + 记行（不阻塞引擎线程）。
+pub(crate) const PLAIN_QUEUE_MAX: usize = 64;
+
 /// 记行节流（仓内既有口径「首 3 + 每 100」——`relay/mod.rs` 的 `reject_log_due` 同款）。
 pub(crate) fn log_due(n: u64) -> bool {
     n <= 3 || n.is_multiple_of(100)
 }
+
+/// 明文面的认领结论（[`PlainDatagramHook`] 的返回）。
+#[derive(Debug)]
+#[non_exhaustive]
+pub enum PlainOutcome {
+    /// 归本面消化，无需应答（如中继注册腿的控制帧——回执已转交内部通道）。
+    Consumed,
+    /// 归本面消化，并从**同一个公共 socket** 回一个应答（如参照点探测 `HWQ → HWR`）。
+    Reply {
+        /// 应答的目的地址（通常是请求的源地址）。
+        dst: SocketAddr,
+        /// 应答字节。
+        payload: Vec<u8>,
+    },
+}
+
+/// **公共端点的明文数据报钩子**（M5 S3a）：直连端口上**非 QUIC** 的报文先经它判定。
+///
+/// - 返回 `Some(PlainOutcome::…)` ⇒ 该包归钩子消化（`Reply` 的应答从**同一个公共 socket**
+///   发出），**不**喂 quinn；
+/// - 返回 `None` ⇒ 不是钩子的包，照旧交 quinn（QUIC 报文）。
+///
+/// 形态是「纯 std + 一个 Arc 闭包」（本岛的同步/异步边界：钩子由 `homeway-core` 在同步
+/// 线程构造，调用点在 QUIC 线程；闭包内不得夹带异步栈类型）。协议（探测/STUN/腿帧）
+/// 的真源留在 `homeway-core`——本岛不认识它们。
+pub type PlainDatagramHook =
+    Arc<dyn Fn(&[u8], SocketAddr) -> Option<PlainOutcome> + Send + Sync>;
 
 /// 出口 QUIC 面配置（**全 std 类型 + 本岛 newtype**：同步面可见面，不夹带异步栈类型）。
 pub struct ExitQuicConfig {
@@ -156,6 +187,10 @@ pub struct ExitQuicConfig {
     /// **服务入口**（M3 S2，§2.2 方案 B′）：tag 1/2/3 的入队句柄；未装配的服务 ⇒ `0x22`。
     /// 缺省全空 = S1 的「QUIC 档不提供这四个服务」形态（既有测试零改）。
     pub intakes: ServiceIntakes,
+    /// **公共端点明文钩子**（M5 S3a；缺省 `None` = 纯 QUIC 形态，既有测试零改）：
+    /// 直连端口上的非 QUIC 报文先经它判定（见 [`PlainDatagramHook`]）。协议真源留在
+    /// `homeway-core`（参照点探测 / STUN 观测 / 中继注册腿帧），本岛只做「认领与否 + 原样收发」。
+    pub plain_hook: Option<PlainDatagramHook>,
 }
 
 impl ExitQuicConfig {
@@ -176,7 +211,14 @@ impl ExitQuicConfig {
             retry_policy: RetryPolicy::Pressure,
             streams: StreamLimits::design(),
             intakes: ServiceIntakes::default(),
+            plain_hook: None,
         }
+    }
+
+    /// 装配公共端点明文钩子（M5 S3a；`homeway-core` 的装配点在起本面之前挂进来）。
+    pub fn with_plain_hook(mut self, hook: PlainDatagramHook) -> Self {
+        self.plain_hook = Some(hook);
+        self
     }
 
     /// 装配服务入口（M3 S2；`homeway-core` 的引擎装配点在起本面之前把三个 intake 的
@@ -392,6 +434,8 @@ pub struct ExitQuic {
     legs: Arc<LegTable>,
     /// 引擎 → QUIC 面的注入队列（腿上的 kind=5 载荷；引擎线程 `try_send` 非阻塞）。
     inject_tx: socket::InjectTx,
+    /// 引擎 → 公共端口的**明文出站**队列（STUN 观测请求等；M5 S3a）。
+    plain_tx: tmpsc::Sender<(SocketAddr, Vec<u8>)>,
     logf: Logf,
 }
 
@@ -428,6 +472,8 @@ impl ExitQuic {
         // 注入队列与「面 → 引擎」的入站队列同上限（8192 条，§6.4）：满 ⇒ 丢 + 计数。
         let legs = Arc::new(LegTable::default());
         let (inject_tx, inject_rx) = tmpsc::channel::<socket::InjPkt>(bridge::INBOUND_QUEUE_MAX);
+        // ---- 公共端口的明文出站（M5 S3a）：STUN 观测请求等；容量小（低频观测面）----
+        let (plain_tx, plain_rx) = tmpsc::channel::<(SocketAddr, Vec<u8>)>(PLAIN_QUEUE_MAX);
 
         let handle = thread::Builder::new()
             .name(EXIT_THREAD.into())
@@ -440,7 +486,7 @@ impl ExitQuic {
                 move || {
                     thread_body(
                         socket, cfg, logf, ready_tx, stop_rx, exit, stats, bridge, legs, out_rx,
-                        inject_rx,
+                        inject_rx, plain_rx,
                     )
                 }
             })
@@ -460,6 +506,7 @@ impl ExitQuic {
                 bridge,
                 legs,
                 inject_tx,
+                plain_tx,
                 logf,
             }),
             Ok(Err(e)) => {
@@ -479,6 +526,15 @@ impl ExitQuic {
     /// 实际监听地址（**退让后的真实端口**——token/UPnP/status 的唯一来源，§1.1）。
     pub fn local_addr(&self) -> SocketAddr {
         self.local_addr
+    }
+
+    /// 从**公共端口**发一个裸数据报（M5 S3a：STUN 观测请求走本端口才反映本端口的 NAT
+    /// 映射）。`false` = 面已收工 / 队列满（调用方按「观测失败」收场，不静默成功）。
+    pub fn send_plain(&self, dst: SocketAddr, payload: &[u8]) -> bool {
+        if self.exit.is_exited() {
+            return false;
+        }
+        self.plain_tx.try_send((dst, payload.to_vec())).is_ok()
     }
 
     /// 出口 RPK 公钥（进 token 的 32B；M1 设计 §12-②）。
@@ -635,9 +691,13 @@ fn thread_body(
     legs: Arc<LegTable>,
     out_rx: tmpsc::Receiver<Outbound>,
     inject_rx: socket::InjectRx,
+    plain_rx: tmpsc::Receiver<(SocketAddr, Vec<u8>)>,
 ) {
     let res = catch_unwind(AssertUnwindSafe(|| {
-        run_exit(socket, cfg, &logf, ready_tx, stop_rx, &stats, &bridge, &legs, out_rx, inject_rx)
+        run_exit(
+            socket, cfg, &logf, ready_tx, stop_rx, &stats, &bridge, &legs, out_rx, inject_rx,
+            plain_rx,
+        )
     }));
     if let Err(payload) = res {
         let msg = crate::driver::panic_msg(payload.as_ref());
@@ -697,6 +757,7 @@ fn run_exit(
     legs: &Arc<LegTable>,
     mut out_rx: tmpsc::Receiver<Outbound>,
     inject_rx: socket::InjectRx,
+    mut plain_rx: tmpsc::Receiver<(SocketAddr, Vec<u8>)>,
 ) {
     let rt = match tokio::runtime::Builder::new_current_thread().enable_all().build() {
         Ok(rt) => rt,
@@ -748,7 +809,10 @@ fn run_exit(
             Arc::clone(legs),
             inject_rx,
             Arc::clone(bridge),
+            cfg.plain_hook.clone(),
         ));
+        // 公共端口明文出站的落点（主循环 select! 用；与 quinn 共享同一 socket 对象）
+        let plain_sock = Arc::clone(&abs);
         // ---- 端点（抽象 socket：直连 + 腿两条物理路径，见 `socket` 模块头）----
         let endpoint = match Endpoint::new_with_abstract_socket(
             EndpointConfig::default(),
@@ -960,6 +1024,12 @@ fn run_exit(
                             }
                         }
                         Err(_join_err) => {} // 任务被 abort（收工路径）——不计
+                    }
+                }
+                Some((dst, payload)) = plain_rx.recv() => {
+                    // 引擎 → 公共端口：裸数据报（STUN 观测请求；M5 S3a）
+                    if let Err(e) = plain_sock.send_plain(dst, &payload) {
+                        (*logf)(&format!("quic: 公共端口明文发送失败（→ {dst}，{}B：{e}）", payload.len()));
                     }
                 }
                 Some(out) = out_rx.recv() => {

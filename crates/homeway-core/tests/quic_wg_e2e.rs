@@ -1,16 +1,18 @@
-//! **单承载失败路径端到端**（M5 C3 改写；原「`_wg` 档全链」用例面随 WG 面删除）。
+//! **单承载（QUIC-only）端点面判据**（M5 C4 改写；脚本 = `tools/quic-wg-e2e.sh`）。
 //!
-//! 两个用例：
-//! 1. `wg_only_token_generation_fails_visibly_without_fallback`（`#[ignore]`，需外部先起
-//!    一个 **`--quic=false`** 的本地 Rust 出口——该形态的 token 只带 WG 类端点且无 `rpk`
-//!    尾字段）：**设计 §2.6-G9 的负例实测**——世代必须**可见失败**（`岛未就用（…候选为空）`
-//!    归因行 + `failed` 终态 + 单飞锁释放），**且不得有任何回落/兜底话术**。
-//!    驱动脚本 = `tools/quic-wg-e2e.sh`。
-//! 2. `removed_transport_key_is_ignored`（**常跑**，不需出口）：M5 删掉的承载键
-//!    `tunConfig.transport` 属**未知键**（`TunConfigJson` 未加 `deny_unknown_fields`）
-//!    ⇒ App 继续传不得导致配置被拒（设计 §4.3 的 R9 核查点，用测试钉住）。
+//! 三条用例：
+//! 1. `wg_only_token_generation_fails_visibly_without_fallback`（**常跑**，无需出口）：
+//!    **设计 §2.6-G9 的负例实测**——只带 WG 类端点（`Direct`）的旧 token ⇒ 岛候选为空
+//!    （且无 `rpk` 尾字段 ⇒ 落 RPK 面归因）⇒ 世代必须**可见失败**（`岛未就用（…）` 归因行 +
+//!    `failed` 终态 + 单飞锁释放），**且不得有任何回落/兜底话术**。token **在本用例内铸造**
+//!    （M5 起出口不再能产出该形态——`serve.quic` 键已删，「WG-only token」只作为存量形态存在）。
+//! 2. `exit_token_is_single_bearer_quic_only`（`#[ignore]`，需外部本地 Rust 出口在跑）：
+//!    **E3 改写后的正向面**——铸出的 token 带 `rpk`、端点**全是 Quic 类**（`Direct` 零命中）。
+//! 3. `removed_transport_key_is_ignored`（**常跑**）：M5 删掉的承载键 `tunConfig.transport`
+//!    属**未知键**（`TunConfigJson` 未加 `deny_unknown_fields`）⇒ App 继续传不得导致配置被拒
+//!    （设计 §4.3 的 R9 核查点，用测试钉住）。
 //!
-//! 环境契约（用例 1）：`HOMEWAY_WG_E2E_TOKEN`（出口 token）/ `HOMEWAY_WG_E2E_EXIT_LOG`
+//! 环境契约（用例 2）：`HOMEWAY_WG_E2E_TOKEN`（出口 token）/ `HOMEWAY_WG_E2E_EXIT_LOG`
 //! （出口 stdout 日志）。
 
 use std::path::PathBuf;
@@ -55,29 +57,38 @@ fn wait_log_from(path: &PathBuf, skip: usize, needle: &str, wait: Duration) -> O
     None
 }
 
-/// **判据（设计 §2.6-G9）**：只带 WG 类端点的 token（`--quic=false` 出口形态）⇒ 岛候选为
-/// 空 ⇒ **可见失败**：
-/// - 世代日志：`quic: 岛未就用（…）` 归因行在场（`--quic=false` 出口的 token 无 `rpk`
-///   尾字段 ⇒ 落 RPK 面归因；带 RPK 的纯 WG 端点 token 落「候选为空」面——
-///   两条都使 `tun_exec` 单测与一条 e2e 用例）；**零**回落/兜底话术；**零**
-///   `transport: 本世代 L3 承载 =`（A/B 开关行已删）；
+/// **判据（设计 §2.6-G9）**：只带 WG 类端点（`Direct`）且无 `rpk` 的 token ⇒ 岛候选为空
+/// ⇒ **可见失败**：
+/// - 世代日志：`岛未就用（…）` 归因行在场（无 `rpk` 尾字段 ⇒ 落 RPK 面归因；带 RPK 但
+///   纯 WG 端点的形态落「候选为空」面——两条都使 `tun_exec` 单测与一条 e2e 用例）；
+///   **零**回落/兜底话术；**零** `transport: 本世代 L3 承载 =`（A/B 开关行已删）；
 /// - 状态面：`state=failed` 且 `reason` 带同一归因（用户/排障可见）；
 /// - 生命周期：failed 终态后 `tun_stop` 即收 0（单飞锁已放，无孤儿世代）。
 #[test]
-#[ignore = "端到端：需 `--quic=false` 的本地 Rust 出口在跑（tools/quic-wg-e2e.sh 驱动）"]
 fn wg_only_token_generation_fails_visibly_without_fallback() {
-    let token = std::env::var("HOMEWAY_WG_E2E_TOKEN").expect("须给 HOMEWAY_WG_E2E_TOKEN");
+    use homeway_core::token::{self, EndpointRef, PeerId, Secret, TokenSpec};
+    let peer = PeerId::from([0x11u8; 32]);
+    let secret = Secret::from([0x12u8; 32]);
+    // 旧 token 形态：只有 WG 类（Direct）端点、无 rpk 尾字段
+    let eps = [EndpointRef::new("203.0.113.9:41641", token::EndpointKind::Direct)];
+    let token = token::encode(&TokenSpec {
+        peer_id: &peer,
+        secret: &secret,
+        endpoints: &eps,
+        rpk: None,
+    })
+    .expect("token 可编码");
     let tok = homeway_core::token::decode(&token).expect("token 可解");
-    assert!(tok.rpk.is_none(), "serve.quic=false ⇒ token 不带 rpk 尾字段");
+    assert!(tok.rpk.is_none(), "旧形态：token 不带 rpk 尾字段");
     assert!(
         !tok.endpoints
             .iter()
             .any(|e| e.kind == homeway_core::token::EndpointKind::Quic),
-        "serve.quic=false ⇒ token 不带 QUIC 类端点：{:?}",
+        "旧形态：token 不带 QUIC 类端点：{:?}",
         tok.endpoints
     );
 
-    let dir = std::env::temp_dir().join(format!("hw-m5c3-wgonly-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("hw-m5c4-wgonly-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("临时目录可建");
     let out = dir.join("gen.log");
     let ident_dir = dir.join("identity");
@@ -95,9 +106,6 @@ fn wg_only_token_generation_fails_visibly_without_fallback() {
 
     let hit = wait_log_from(&out, 0, "岛未就用", WAIT).expect("失败归因行必须可见");
     println!("[g9] attribution={hit}");
-    // 归因取两条可见失败路径之一（`start_island` 的检查序：RPK → 候选）：
-    // ① `--quic=false` 出口的 token 无 `rpk` 尾字段 ⇒ 先落 RPK 面；
-    // ② 带 RPK 但只有 WG 类端点 ⇒ 落「候选为空」（`tun_exec` 单测覆盖该支）。
     assert!(
         hit.contains("未携带出口 RPK") || hit.contains("候选为空"),
         "归因须指向「无岛可用」（RPK 或候选）：{hit}"
@@ -118,13 +126,37 @@ fn wg_only_token_generation_fails_visibly_without_fallback() {
         !st.contains("\"quic\""),
         "岛未构造 ⇒ quic 段缺席（无岛可报）：{st}"
     );
-    // 出口侧对照：日志存在（非空）——「QUIC 面确实没起」由驱动脚本断言
+    assert_eq!(core.tun_stop(), 0, "failed 终态后 stop 即收 0（放锁）");
+    println!("[g9] state=failed, no fallback, lock released");
+}
+
+/// **判据（E3 改写后的正向面）**：真出口铸出的 token = **单承载 QUIC**——`rpk` 在场、
+/// 端点全为 `Quic` 类、`Direct` 类零命中（出口不再有 WG 端口；`tools/quic-wg-e2e.sh` 驱动）。
+#[test]
+#[ignore = "端到端：需本地 Rust 出口在跑（tools/quic-wg-e2e.sh 驱动）"]
+fn exit_token_is_single_bearer_quic_only() {
+    let token = std::env::var("HOMEWAY_WG_E2E_TOKEN").expect("须给 HOMEWAY_WG_E2E_TOKEN");
+    let tok = homeway_core::token::decode(&token).expect("token 可解");
+    assert!(tok.rpk.is_some(), "QUIC 单承载 ⇒ token 必带 rpk 尾字段");
+    let kinds: Vec<_> = tok.endpoints.iter().map(|e| e.kind).collect();
+    assert!(
+        tok.endpoints
+            .iter()
+            .any(|e| e.kind == homeway_core::token::EndpointKind::Quic),
+        "必有 QUIC 类端点：{kinds:?}"
+    );
+    assert!(
+        !tok.endpoints
+            .iter()
+            .any(|e| e.kind == homeway_core::token::EndpointKind::Direct),
+        "WG 类（Direct）端点已退役（单承载）：{kinds:?}"
+    );
+    // 出口侧对照：日志在场（公共端口/QUIC 面的判据行由驱动脚本断言）
     if let Ok(p) = std::env::var("HOMEWAY_WG_E2E_EXIT_LOG") {
         let exit_log = PathBuf::from(p);
         assert!(log_lines(&exit_log) > 0, "出口日志须在场：{exit_log:?}");
     }
-    assert_eq!(core.tun_stop(), 0, "failed 终态后 stop 即收 0（放锁）");
-    println!("[g9] state=failed, no fallback, lock released");
+    println!("[token] quic-only 单承载：{} 个端点", tok.endpoints.len());
 }
 
 /// **判据（设计 §4.3 的 R9 核查点）**：删掉的承载键 `tunConfig.transport` 是**未知键**
@@ -150,7 +182,7 @@ fn removed_transport_key_is_ignored() {
     })
     .expect("token 可编码");
 
-    let dir = std::env::temp_dir().join(format!("hw-m5c3-ukey-{}", std::process::id()));
+    let dir = std::env::temp_dir().join(format!("hw-m5c4-ukey-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("临时目录可建");
     let out = dir.join("gen.log");
     let ident_dir = dir.join("identity");

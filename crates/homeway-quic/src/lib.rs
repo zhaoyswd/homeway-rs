@@ -86,8 +86,8 @@ pub use driver::{Island, IslandTx};
 pub use exit::admit::AdmitLimits;
 pub use exit::{
     EngineRejectClass, ExitInbound, ExitQuic, ExitQuicConfig, ExitQuicErr, ExitQuicSnapshot,
-    ExitSend, ExitStatsHandle, IntakeFull, Reg4Request, Reg4Verdict, RejectWhy, RetryPolicy,
-    ServiceIntake, ServiceIntakeTx, ServiceIntakes, FRAME_KIND_QUIC,
+    ExitSend, ExitStatsHandle, IntakeFull, PlainDatagramHook, PlainOutcome, Reg4Request, Reg4Verdict,
+    RejectWhy, RetryPolicy, ServiceIntake, ServiceIntakeTx, ServiceIntakes, FRAME_KIND_QUIC,
 };
 /// STREAM 协议类型（M3 S1）：tag / 复位码 / 流错误 / 写回执——`homeway-core` 的换轨面
 /// （S3）用同一份类型，不另写 tag 字面量。

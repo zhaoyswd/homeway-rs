@@ -106,11 +106,11 @@ start_exit() { # start_exit <arm> [--files]
   [[ -f "$ex" ]] || : > "$ex"
   if [[ "${1:-}" == "--files" ]]; then
     nohup "$BIN_PATH" serve --state "$EXIT_STATE" --listen "$EXIT_PORT" --bind-interface none \
-      --upnp=false --public-endpoint "127.0.0.1:$EXIT_PORT" --files-root "$FILES_ROOT" --verbose \
+      --upnp=false --public-endpoint "127.0.0.1:$((EXIT_PORT + 1))" --files-root "$FILES_ROOT" --verbose \
       >> "$ex" 2>&1 &
   else
     nohup "$BIN_PATH" serve --state "$EXIT_STATE" --listen "$EXIT_PORT" --bind-interface none \
-      --upnp=false --public-endpoint "127.0.0.1:$EXIT_PORT" --verbose \
+      --upnp=false --public-endpoint "127.0.0.1:$((EXIT_PORT + 1))" --verbose \
       >> "$ex" 2>&1 &
   fi
   EXIT_PID=$!
@@ -123,7 +123,8 @@ start_exit() { # start_exit <arm> [--files]
   kill -0 "$EXIT_PID" 2>/dev/null || { echo "!! 出口（$arm）起不来——看 $ex" >&2; tail -12 "$ex" >&2; exit 1; }
   local actual
   actual=$(cat "$EXIT_STATE/cache/listen_port.txt" 2>/dev/null)
-  [[ "$actual" == "$EXIT_PORT" ]] || { echo "!! 实际端口 $actual ≠ $EXIT_PORT（退让）——中止" >&2; exit 1; }
+  # M5 C4：公共端口 = QUIC 端口（= --listen + 1；出口唯一公共口）
+  [[ "$actual" == "$((EXIT_PORT + 1))" ]] || { echo "!! 实际公共端口 $actual ≠ $((EXIT_PORT + 1))（= listen+1；退让）——中止" >&2; exit 1; }
 }
 stop_exit() {
   [[ -n "${EXIT_PID:-}" ]] || return

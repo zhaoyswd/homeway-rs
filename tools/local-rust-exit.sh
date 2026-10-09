@@ -3,7 +3,8 @@
 # 绝不碰现役出口——同 local-exit.sh 的隔离条款，端口再错开一段：Rust 出口 4265x）
 #
 # 用法：tools/local-rust-exit.sh <命令> [实例号]
-#   实例号 n 缺省 1；出口 state = /tmp/homeway-rs-rustexit-n，WG UDP 端口 = 42650+n。
+#   实例号 n 缺省 1；出口 state = /tmp/homeway-rs-rustexit-n，**公共 UDP 端口 = QUIC 端口 = 42651+n**（M5 C4：WG 面退役 ⇒ 出口唯一公共端口
+#   就是 QUIC 端口；`--listen` 只作 QUIC 端口缺省的基线 = listen+1）。
 #
 # 命令：
 #   start [n]     起 Rust 出口（release 构建；--bind-interface none --upnp=false
@@ -30,6 +31,8 @@ cmd="${1:-help}"; n="${2:-1}"
 EXIT_STATE="/tmp/homeway-rs-rustexit-$n"
 CLIENT_STATE="/tmp/homeway-rs-rustgo-client-$n"
 EXIT_PORT=$((42650 + n))
+# 公共端口 = QUIC 端口（缺省 = --listen + 1；M5 起它才是被公布/被观测的那个口）
+EXIT_QUIC_PORT=$((EXIT_PORT + 1))
 EXIT_LOG="$EXIT_STATE/stdout.log"
 CLIENT_LOG="$CLIENT_STATE/stdout.log"
 EXIT_PIDFILE="$EXIT_STATE/pid"
@@ -67,16 +70,16 @@ start)
   [[ -x "$BIN" ]] || build_bin
   mkdir -p "$EXIT_STATE" || exit 1
   LOG0=$(log_lines "$EXIT_LOG")
-  echo "==> 起 Rust 出口 #$n：state=$EXIT_STATE wg=127.0.0.1:$EXIT_PORT（本轮日志从第 $((LOG0 + 1)) 行起）"
+  echo "==> 起 Rust 出口 #$n：state=$EXIT_STATE quic=127.0.0.1:$EXIT_QUIC_PORT（--listen $EXIT_PORT；本轮日志从第 $((LOG0 + 1)) 行起）"
   nohup "$BIN" serve --state "$EXIT_STATE" --listen "$EXIT_PORT" --bind-interface none \
-    --upnp=false --stun= --public-endpoint "127.0.0.1:$EXIT_PORT" --verbose \
+    --upnp=false --stun= --public-endpoint "127.0.0.1:$EXIT_QUIC_PORT" --verbose \
     ${=EXIT_EXTRA_FLAGS:-} \
     >> "$EXIT_LOG" 2>&1 &
   echo $! > "$EXIT_PIDFILE"
   if ready=$(wait_line_from "$EXIT_LOG" 'serve 就绪' "$LOG0" 25); then
     actual=$(cat "$EXIT_STATE/cache/listen_port.txt" 2>/dev/null)
-    if [[ "$actual" != "$EXIT_PORT" ]]; then
-      echo "!! 实际监听端口 $actual ≠ 配置 $EXIT_PORT（被占用退让）——判据会指向占用者，拒绝继续。" >&2
+    if [[ "$actual" != "$EXIT_QUIC_PORT" ]]; then
+      echo "!! 实际公共端口 $actual ≠ 期望 $EXIT_QUIC_PORT（= --listen+1；被占用退让）——判据会指向占用者，拒绝继续。" >&2
       "$0" stop "$n" >/dev/null 2>&1; exit 1
     fi
     echo "==> 就绪（端口无退让）。token："; "$0" token "$n"
@@ -101,7 +104,7 @@ token)
   ;;
 status)
   if our_pid "$EXIT_PIDFILE"; then
-    echo "pid=$REPLY_PID 配置端口=$EXIT_PORT 实际=$(cat "$EXIT_STATE/cache/listen_port.txt" 2>/dev/null || echo '?')"
+    echo "pid=$REPLY_PID 配置基线=$EXIT_PORT 公共端口=$(cat "$EXIT_STATE/cache/listen_port.txt" 2>/dev/null || echo '?')"
     grep 'serve 就绪' "$EXIT_LOG" 2>/dev/null | tail -1
     grep '过境拦截就绪' "$EXIT_LOG" 2>/dev/null | tail -1
     grep 'peer: +' "$EXIT_LOG" 2>/dev/null | tail -1 || echo '（尚无 peer 注册）'
