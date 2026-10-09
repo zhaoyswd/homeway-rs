@@ -22,7 +22,7 @@
 | 工作目录 | 主检出 `/Users/zhaozhe/Documents/projects/homeway-rs`（分支 **`main`**） |
 | 开工复验（`git status --short`） | **干净**（零跟踪文件改动）；HEAD = **`0cf68b4`**（"修 CI（ubuntu）两条红"，2026-10-09） |
 | 兄弟 worktree | `~/Documents/projects/homeway-rs-quic`（分支 `quic`）**只读参考，未触碰** |
-| 实验区 | `/tmp/m5lab/`（`coarse` = 粗删树、`lto` = profile 实验树、`wgonly` = 现役口径树；三者均 `git worktree add --detach`）；`crates/homeway-quic/src/**` 的「不动」= **不改线协议**（QUIC/stage/线格式零改动）；**公面与结构门的改动已登记（r23 M9/H2/H5 要求）**：①§2.4-A-2 的**六处 `st.tun` 门**（`:844/:859` 换「曾完成准入」位、`:893/:903` 换 `live`、`:705/:780` 保留 TUN 判据、`:1245` 需求信号）+ **三条语义面**（`swap_out_pkts`/`attached`/`ladder_probe_ok`）；②§1.2-M4/S3a 的**五类公共端点 API** 迁到 `exit` 侧；③§3.2-bis 若选备选 (b) 的 `by_tun_ip` 反查 API（默认选 (a) ⇒ 不动岛） |
+| 实验区 | `/tmp/m5lab/`（`coarse` = 粗删树、`lto` = profile 实验树、`wgonly` = 现役口径树；三者均 `git worktree add --detach`）；`crates/homeway-quic/src/**` 的「不动」= **不改线协议**（QUIC/stage/线格式零改动）；**公面与结构门的改动已登记（r23 M9/H2/H5 要求）**：①§2.4-A-2 的**七处 `st.tun` 读点**（`:844/:859` 换「曾完成准入」位、`:893/:903` 换 `live`、`:705/:780` 保留 TUN 判据、`:1245` 需求信号）+ **三条语义面**（`swap_out_pkts`/`attached`/`ladder_probe_ok`）；②§1.2-M4/S3a 的**五类公共端点 API** 迁到 `exit` 侧；③§3.2-bis 若选备选 (b) 的 `by_tun_ip` 反查 API（默认选 (a) ⇒ 不动岛） |
 | 现役出口 | **未触碰**（未起、未停、未读写 `~/.config/homeway-rs`） |
 | OHOS 设备 | 本棒**只读侦察，未连**（真机留实现期） |
 
@@ -240,8 +240,12 @@ llvm-nm --print-size --demangle <unstripped.so> | python3 <聚合脚本>       #
 > `leg_send_handle`/`leg_remotes`/`shutdown_legs`/`#17 最近摘除窗`）+ `relayleg` 的控制面腿拨号/LEGUP +
 > 「收包首字节分类」（kind=5 → `Inbound.quic`）+ 公共端点面（STUN/参照点应答/caps/pin）。
 > **删** = WG 专属：`device` 的 noise 表/漫游/encap/decapsulate 消费、`send_wire` 的 WG 广播路径、
-> 发送线程 + `txring` 批量面（T1 的 sendmmsg）、新源日志（E23）、`set_on_hint` 的 WG 打洞提示面、
-> `tx_*` 观测族。
+> 发送线程 + `txring` 批量面（T1 的 sendmmsg）、**新源表的 WG 形态入账（`src_seen`/`note_new_src` 本体保留——见 §3.3-E23 值域收窄）**、
+> `set_on_hint` 的 WG 打洞提示面、`tx_*` 观测族。
+> **保留列逐符号化（r24 必闭合 1；防 H1 同型事故）**：`recv_packet`（本体）、`kind=3 → on_leg_frame`
+> （`FRAME_TYPE_RELAY_REG` = 3 与 `FrameKind::Reg` = 2 **只差一字** ⇒ 见 §1.3-T7 的歧义注）、
+> `try_clone_socket`（`engine.rs:701` 注册腿克隆）、`leg_fds`（poll 必需）、`udp_fd`、
+> `listen_with_fallback_addr`（`engine.rs:617` 用它开 **QUIC 监听口**）、`quic_leg_pkts`。
 > **连带修正**：①§1.6-G-2「出口侧腿表退役」**作废**（改为「腿面保留、WG 侧腿语义退役」）；
 > ②`X1` 族（exit 侧中继注册）**保留**且**不再与 D8 矛盾**；③`R7/R8/R9`（中继腿生命期）判据**保留**；
 > ④**K 清单新增 K11**（腿表族类型面）；⑤净删行数下调 ≈1.3–1.7 千行（见 §11.1）；
@@ -266,8 +270,8 @@ llvm-nm --print-size --demangle <unstripped.so> | python3 <聚合脚本>       #
 | T3 | `speedtest.rs` | 1285 → 约 1200（**改判**） | 只删 `ClientConn` 的 **WG 专属构造**（`wgcore::Client` 直连形态） | **保留 `SpeedConn` trait / `engine_conn` 的接口位 / `run` 的 CLI 入口**——消费者 = `homeway-cli speedtest`（`main.rs:507/717`）与 `daemon/carriers/speedrun.rs`（`daemon/mod.rs:329`）；§2-A 下换 `SpeedConn` 实现（岛流）即可。**设计门 r22 H4 修正** |
 | T4 | `facade/tun_exec.rs` | 3746 → 估 3150–3350 | WG 档：`L3Bearer::Wg` 分支、`session_connect*`/`SessionStream`/`SessionReadHalf`/`SessionWriteHalf`/`SharedConn`、`healing_dial`/`dial_with_recover`/`run_round`/`TunnelTransport`（WG 阶梯）、`install_tunnel_hint`/`spawn_tunnel_hint_handler`/`tunnel_punch_to`/`spawn_tunnel_save_loop`（WG hint/落盘）、`attach_wg`、`domain_eps`/`EndpointCache`/`merged_candidates` 的 WG 消费、`current_client()` 族取数点（**−约 400–600**） | 岛装配/巡检/收尾/runner/transport/quic 状态/`pf_dial_via_run`（改单腿）/`l3_probe`/诊断行 |
 | T5 | `daemon/**` 与 `facade/service_exec.rs`、`session/mod.rs` | 见 §2 | **待裁决**（岛化 ⇒ 改；停用 ⇒ 删） | 控制面 op 面（serve/relay 生命周期、config、export/import、`DC1/DC8/DC10/DC11/DC13/DC17/DC19/DC20`）**不涉 WG，恒保留** |
-| **T6** | `server/bind.rs` | 1743 → 估 **800–1100** | WG 专属：`Device` 收发驱动（`recv_packet` 的 decap 循环）、`send_wire` 的 WG 广播/镜像路径、发送线程（`tx_start`/`tx_shutdown`/`tx_high_water`/`tx_stats_snapshot`）+ `txring` 消费、`set_on_hint` 的 WG 打洞提示面、`set_on_leg_frame` 的 WG reg/data 处理、新源表（`src_seen`，E23）、`stun`/`probe` 的**WG socket 绑定形态**（改为新落点） | **腿表族**（`legs`/`register_leg`/`remove_leg`/`clear_legs`/`sweep_legs`/`leg_readable`/`leg_send_handle`/`leg_remotes`/`shutdown_legs`/`#17`）+ 收包 kind 分类（kind=5 → `Inbound.quic`）+ 公共端点五类（§1.2-M4） |
-| **T7** | `server/relayleg.rs` | 724 → 估 **600–700** | WG 专属：腿上的 WG 帧处理（kind=0/2/4 的上行投递形态）、`parse_relay_arg` 的 WG 语义（若 QUIC 也需要则留） | **中继控制面腿拨号 + LEGUP 认证 + 会话重放/拆腿**（QUIC 经中继的必需件） |
+| **T6** | `server/bind.rs` | 1743 → 估 **800–1100** | WG 专属（**r24 逐符号化**）：①**`recv_packet` 的 decap 分支**（函数本体**保留**——它是主 socket 的唯一收包入口，STUN 应答/参照点探测/kind=5/畸形腿帧都经它）；②`send_wire` 的 WG 广播/镜像路径；③发送线程（`tx_start`/`tx_shutdown`/`tx_high_water`/`tx_stats_snapshot`）+ `txring` 消费；④`set_on_hint` 的 WG 打洞提示面；`set_on_leg_frame` 的 WG reg/data 处理、新源表（`src_seen`，E23）、`stun`/`probe` 的**WG socket 绑定形态**（改为新落点） | **腿表族**（`legs`/`register_leg`/`remove_leg`/`clear_legs`/`sweep_legs`/`leg_readable`/`leg_send_handle`/`leg_remotes`/`shutdown_legs`/`#17`）+ 收包 kind 分类（kind=5 → `Inbound.quic`）+ 公共端点五类（§1.2-M4） |
+| **T7** | `server/relayleg.rs` | 724 → 估 **600–700** | WG 专属（**r24 逐符号化**）：①**`LegEvent::Hint`/`parse_hint_addr`/`PUNCH_*`/`run_punch_worker`**（还在发 kind=0 的 WG 探包 ⇒ 随 WG 删）；②腿上的 **kind=0/2/4** 上行投递分支。**⚠️ 歧义钉死（r24）**：`reg` 在仓内两义——`FrameKind::Reg = 2`（随 WG 删）与 `FRAME_TYPE_RELAY_REG = 3`（`relaywire.rs:22`，**保留**，否则中继控制帧无人处理 = H1 同型） | **中继控制面腿拨号 + LEGUP 认证 + 会话重放/拆腿**（QUIC 经中继的必需件）+ `parse_relay_arg`（**保留**——其产物 `relay_ep` 进 token，是 QUIC 客户端中继候选的唯一来源，`engine.rs:2252`）+ kind=3 分派 |
 | **T8** | `server/device.rs` | 772 → 估 **60–120** | `Device` 的 noise/Tunn/peer 表/`encapsulate`/`decapsulate`/漫游跟随/`ConnectionExpired`/rate limiter（全部 WG） | **类型面**：`InboundOut`（`bind.rs:38`）、`Inbound`、`PeerConfig`（`engine.rs:24` 的 import 面；`PeerConfig` 若只服务 device 装配则随删） |
 
 ### 1.4 **共用类型保留面**（岛与残留面共用的类型清单——「除 QUIC 岛共用类型」的落地清单）
@@ -298,15 +302,16 @@ llvm-nm --print-size --demangle <unstripped.so> | python3 <聚合脚本>       #
 理由 = 0.3.3 实测：`tun_exec` 的 WG 档与方法级纠缠 ⇒ 原子删 = 一次性面对 17+ 编译点且无中间可编译态，
 回滚粒度太粗（本棒已实测其代价）。
 
-| 步 | 动作 | 可编译性保证 | 每步判据 |
+| 步（= §11 的 15 片合并视角） | 动作 | 可编译性保证 | 每步判据 |
 |---|---|---|---|
-| **S0 + S0b** | 迁址（M1/M2/M3：`frame.rs`→`legframe.rs`、`stackb.rs`→`stackb.rs`、`reg.rs`→邻域）+ `lib.rs`/`server/mod.rs` 模块表更新 + 全仓 `sed` 改引用；**`relay/**` 的 import 改道单列 S0b**（§6-Q2 纪律：红线面显式小批 + 独立 commit + 上报） | 纯改名，行为零变 | `cargo test --workspace` 全绿（**这一步必须是绿的**：改名不该改变任何行为）+ `local-rust-relay.sh` 烟囱 |
-| **S1** | 加 `[profile.release] lto/codegen-units` + `x25519-dalek` 显式 `features=["static_secrets"]`（**0.3.3 实测的隐藏依赖**，见 §7.3）+ 体积门 | 构建链变，行为不变 | `[size]` 读数入册；`quic-ab.sh` **lab 档**照跑并标注「非产品档」（§9.2 默认 (c)）；门槛表 CPU 口径变更同批登记 |
-| **S2** | 客户端 WG 面切除：`tun_exec` 的 `L3Bearer`/两处 dial 腿/阶梯域/hint/save/域名面 → 岛单腿；`wgcore`/`session`/`wtransport`(bind,endpoint_cache,domain_eps) 删 | 以 **S2a 宿主会话岛化**（§2）为前置；未就则本步不可编译 ⇒ **S2 与 S2a 必须同批** | `cargo test --workspace` 绿 + 隔离门 11 条绿 + `quic-island-e2e`/`quic-wg-e2e` 改写后绿 |
-| **S3 + S1b** | 出口 WG 面切除：`server/*` **裁剪**（T6/T7/T8，见 §1.3）+ `txring` 删 + `engine.rs` 去 WG 装配（腿表 WG 分支/发送线程/`route_encap` 的 WG 分支/`sync_quic_legs`）+ `bindwatch` 复核；**S1b（D11）**：`tools/ring-shim` + `[patch]` + `boringtun` + 四处连带 manifest（**依赖 S3**：先删代码再删依赖） | 出口只剩 QUIC 面 + intercept | `cargo test --workspace` 绿 + `quic-ladder-e2e`/`quic-pf-e2e` 绿 + 出口 `serve status --json` 键面复验 |
-| **S2a + S2**（同批，见 §11） | 宿主会话岛化（含 `homeway-quic` 六处门 + 三条语义面）→ 客户端 WG 面切除 | 收窄面与 WG 删除同批（否则 `local_services` 无消费者却仍在） | 行文逐字断言 + `E5/E10/E11/E14/E17` 用例 |
-| **S5** | 判据全表登记 + fixtures 退役 + 残留扫查门（§7/§8） | 文档与门同批 | 扫查门绿 + 词表门 PASS + `INTEROP-CRITERIA` 全表同步 |
-| **S6** | 门槛终值实测（体积/内存/CPU）+ 真机构建 + 代码门 | — | 0.4 的预判 vs 实测对照入册 |
+| **S0 + S0b** | 迁址（M1/M2/M3：`frame.rs`→`legframe.rs`、`stackb.rs`→`stackb.rs`、`reg.rs`→邻域）+ `lib.rs`/`server/mod.rs` 模块表 + 全仓 `sed` 改引用；**`relay/**` 的 import 改道单列 S0b**（§6-Q2 纪律：红线面显式小批 + 独立 commit + 上报） | 纯改名，行为零变 | `cargo test --workspace` 全绿（改名不改行为）+ `local-rust-relay.sh` 烟囱 |
+| **S1** | `[profile.release] lto/codegen-units` + `x25519-dalek` 显式 `features=["static_secrets"]`（§7.3 的隐藏依赖）+ 体积门 | 构建链变，行为不变 | `[size]` ≤3,800,000 B 入册；`quic-ab.sh` **lab 档**照跑并标注「非产品档」（§9.2 默认 (c)）；门槛表 CPU 口径变更同批登记 |
+| **S2a + S2**（**必须同批**——§10-R7；单 commit 边界） | 先加 `facade/host_session.rs`（形态面按 **§2.7**：`HostSession`/`ServicePort`/`ProbeOutcome`/`HostErr`）+ **`homeway-quic` 七处 `st.tun` 读点改造与三条语义面**（§2.4-A-2）+ §2.6-G5/G6/G7 → 三处换源（`service_exec`/`daemon carriers`/CLI）→ 再删客户端 WG 面（`tun_exec` 的 `L3Bearer`/两处 dial 腿/阶梯域/hint/save/域名面 + `wgcore`/`session`/`wtransport`(bind,endpoint_cache,domain_eps)） | 前置互依：S2 依赖 S2a 的新会话面 | ①单测 + C3/C7/C10/C14/C16/C17 行断言 + DC/CA 用例绿；②App 服务会话 e2e；③无 TUN 阶梯三态 + `attached`/`packets_out` 键面复验 + rc 可达集回归；④**`ConnErr` 全消费点清单闭合**；⑤形态面按 §2.7 |
+| **S3 + S1b** | 出口 WG 面**裁剪**（T6/T7/T8 逐符号清单 + `txring` 删 + `engine.rs` 去 WG 装配〔腿表 WG 分支/发送线程/`route_encap` WG 分支/`sync_quic_legs` 的 WG 部分〕+ 公共端点面迁址〔S3a，§1.2-M4〕）+ **S1b（D11）**：`tools/ring-shim`/`[patch]`/`boringtun`/四处连带 manifest（**依赖 S3**） | 出口只剩 QUIC 面 + intercept | `cargo test --workspace` 绿 + `quic-ladder-e2e`/`quic-pf-e2e` 绿 + **E20/E20a（STUN）/C14（参照点应答）在新落点复绿** + `serve status --json` 键面 + lock 无 ring 0.16 |
+| **S4** | intercept 收窄（`local_services`/`DialTarget::Unix`/`Kind::Exempt` 删；`served_ports` 单一语义）+ 观测面重写（`quic: ` 前缀批量删）+ §8.4 三新行（N-e/E-q6/E25）+ **E23 值域收窄（行保留）** | 收窄面与 WG 删除同批（否则 `local_services` 无消费者却仍在） | 行文逐字断言（E5/E10/E11/E12/E14/E17 + 去前缀签名面）+ `intercept` 用例增删（`exempt_*` 两例删、transit+DNS 两径留）+ A10 收线时点 e2e |
+| **S5** | 判据全表登记（§8 全表 + C18/C19/C20/C21 逐行列名 + 计数输入集表复核）+ fixtures 退役（§8.3）+ 新门 `check-wg-removed.sh`（§7.1）+ 交下-1/5/6 + **ID 空位门断言** | 文档与门同批（**门不得先立**——HEAD 上必红） | 登记五字段齐 + 词表门 PASS + 新门绿（含 ⑥ 注入负例）+ `cargo test -- --list` 无 WG 前缀用例 + ID 空位全 0 |
+| **S5t**（§5 若做） | token 段容器 `hmw2` + `rl1` body 冻结 + 向量重生 + `tools/**` 抽取面 | 独立可回退 | 新向量往返 + 字节锚 + 渲染面不变 + 上报 tier |
+| **S6 + S7a/S7b/S7c** | S6：体积/内存/CPU 终值 + 真机构建 + 烟囱（含 S5t 若做）；**S7a（中继 v6，只依赖 S1）/S7b（Q3/Q4/Q5）/S7c（Q8 复测）可提前并行、各自独立 commit** | — | 门槛表逐格填数 + `M5.md` 台账（S6）；S7a/b/c 各自判据见 §6 |
 
 **硬约定**（照 M4 §11 先例 + 本棒追加）：
 ①**不带旧写法进代码**（不留 `_wg`/`wg` 兼容分支、不留 `SERVER_TUNNEL_IP` 之外的 WG 别名）；
@@ -378,6 +383,9 @@ llvm-nm --print-size --demangle <unstripped.so> | python3 <聚合脚本>       #
 - 处置：把「桥面超时」改为 `SpeedtestError::Timeout`（新增变体）或直接 `io::ErrorKind::TimedOut`；
   岛侧连接错误统一用 `homeway_quic::StreamErr`（已存在）。
 - **禁止**把 `ConnErr` 原样搬到中立模块「为了少改」（那是 Go 直译痕迹的典型：错误类型不表达新语义）。
+- **实现期必做（r24 必闭合 5；r22 B6 的落点）**：开工第一件事 = `grep -rn 'ConnErr' crates/ | wc -l`（实测口径 ≈ **59 处 / 9 文件**，
+  含 `SpeedtestError::Conn` 公开枚举、【DatagramTooLarge】无对应变体、【EngineGone → NoSession】语义面）并**逐点登记到
+  `docs/reviews/M5.md` 的「`ConnErr` 消费点清单」**（一行一处：文件:行 → 新归属），**清单闭合为 S2a 的完成判据之四**。
 
 ---
 
@@ -390,6 +398,24 @@ llvm-nm --print-size --demangle <unstripped.so> | python3 <聚合脚本>       #
 | **G7** | **`:5300` 远程解析腿在宿主会话岛化后无 tag、无 L3**：出口的 DNS listener 在**隧道栈内**（`served_ports` 的 `:5300`），客户端须经 L3/豁免才到得了；岛宿主无 TUN ⇒ 不可达 ⇒ `CA5`（socks 域名）/`E4` 的 `resolve=` 面**静默失效**（原稿 §8.1 判「核过」= 错） | `intercept/mod.rs:1166/1373-1397`（`:5300` 走栈内 listener）+ `exit/` 的 DNS 面装配；§8.1-CA5/E4 | **①新增 `STREAM[tag=6]`（dns-resolve）**：客户端把 DoT/裸 DNS 查询经流送出、出口代答（**+80–150 行**，与 §2.4-A5 同族）；或 ②**登记退役**（socks 域名目标不再支持远程解析，退化为本机解析）。**建议①**（socks 域名面是产品能力） |
 | **G8** | **中继 hint 被岛显式忽略**：`relay_sock.rs:67/76` 丢弃 hint ⇒ 「中继 → 直连升级」（`U1`）在 QUIC 档无对应物；G-1 只登记了端点缓存 | `crates/homeway-quic/src/client/relay_sock.rs:67/76` | 登记（**G-1 扩写**：「hint 学习/中继升级」整面退役；岛以「迁移 + 重赛跑」替代）——`U1/U2` 行据此判「删除」而非「改写」（§8.1 已列） |
 | **G9** | **旧 token（无 QUIC 端点 / 无 RPK）在 M5 后无候选**：token 类端点过滤（`quic_candidates` 只吃 `Quic`/`Relay`）⇒ 只带 WG 端点的旧 token = 恒 `NoCandidate` | `facade/tun_exec.rs` 的 `quic_candidates`（WG 类 `continue`） | 登记**失败路径**（`岛未就用（…候选为空）` 归因）——因「无兼容包袱」⇒ **不做迁移**，但**必须让用户看得见**（现有行已具备，补一条 `M5.md` 的负例实测） |
+
+### 2.7 宿主会话的 **Rust 形态面**（r24 必闭合 2；§11-S2a 的「Rust 形态面见 §2.7」指本节）
+
+> **约束来源**：AGENTS「工程原则：地道 Rust，不做 Go 直译」+ r23 checklist 点名的风险
+> （`:347` 的「同 API 面」写法容易变成 Go `hostsession.Session` 的接口仿写）。**S2a 是本期唯一新增功能代码
+> （600–900 行）⇒ 形态面在这里写死**。
+
+| # | 项 | 定稿（Rust 形态） | 反面（禁止） |
+|---|---|---|---|
+| R-1 | 会话句柄 | `HostSession`：`connect(&self, port: u16, budget: Duration) -> Result<Stream, HostErr>`；`Stream` 实现 `std::io::Read + Write`（**借用/所有权明确**：`into_halves()` 供桥泵拆半，仿 `BridgeStream`） | ❌ 照搬 Go 的 `Session` 方法串（`connect/read/write/close/path_probe/snapshot/stop_within` 全套同名同形） |
+| R-2 | 「端口」语义 | **newtype `ServicePort(u16)`**，构造只经 `ServicePort::from_bridge_port(u16) -> Option<Self>`（内部 = `quic_stream::tag_for_port` 的同一真源）；未知端口 = `None` ⇒ 归因「无此服务」 | ❌ 裸 `u16` 在三个模块间传（今天 `u16` 满天飞，正是 Go 直译痕迹） |
+| R-3 | 探活 | `path_probe(&self, budget) -> ProbeOutcome`（`enum ProbeOutcome { Ok { rtt: Duration }, Timeout, NoFace }`） | ❌ `Result<(), ConnErr>` 或 bool/字符串（`wgcore::ConnErr` 不迁入，见 §2.5） |
+| R-4 | 错误 | `HostErr`（thiserror 类型：`NoFace`/`Refused`/`Timeout`/`Closed`/`Budget`）；**桥面需要的 `io::ErrorKind` 映射写在一处**（`impl From<HostErr> for io::Error`） | ❌ 字符串错误；❌ 在调用方各自 `match` 拼文案 |
+| R-5 | 快照 | `SessionSnapshot`/`LinkSnapshot` **同形重建**（K13：`status_json`/`tunStatusJSON` 键面消费）但字段来源 = 岛快照；**不得**把 `TunCounters` 当需求信号（§2.4-A-2 三条语义面） | ❌ 直接复用 `wgcore` 的 `Snapshot`（`via/ep` 形态不同，K10 非 drop-in） |
+| R-6 | 生命周期 | `stop_within(deadline) -> Result<(), HostErr>`（与 `homeway-quic` 的 `stop_within` 同节奏）；`Drop` 不阻塞（收割线程先例 `CLIENT_CLOSE_BUDGET`） | ❌ `Drop` 里 join/阻塞 IO |
+| R-7 | 并发 | 单实例 + `&self` 方法（内部 `Mutex`/原子，不加 `Arc<Mutex<…>>` 套壳）；**不得**引入第二个 runtime（岛单线程前提） | ❌ 每流一个 runtime/线程池；❌ 多余 `Arc<Mutex<>>` |
+
+---
 
 ## 3. intercept 收窄（入口面 / `served_ports` / 行文）
 
@@ -895,10 +921,10 @@ cargo test --workspace && cargo clippy --all-targets -D warnings
 | **R12** | 真机验证的可自动化度（M3/M4 已如实登记的既有缺项：上传面 picker / 分流打开态 / 三指标需人工换网） | 判据不能全自动 | 沿用既有如实登记；M5 只增「真机构建 + 删码后烟囱」两条可自动项 |
 | **R13** | **岛候选不含域名端点**（§2.4-A5） | `--ddns` 发布的域名端点在本仓不可用 | 推荐承接（+80–150 行）；否则登记缺口（用户可见的功能缩水）⇒ **待裁决** |
 | **R14** | **腿面误删**（设计门 r22 H1，**高危**） | QUIC 经中继整条死（NAT 后唯一通路）；补需改中继 ⇒ 破红线 | 已订正（§1.1 腿面订正 + T6/T7/T8）；**上报主会话：路线 M5 范围原文须订正** |
-| **R15** | **无 TUN 岛的 `st.tun` 结构门**（r22 H10 + r23 H2 逐处订正） | 宿主会话的阶梯/数据面恒不启动 ⇒ 假「已连接」；门判据改错 ⇒ 恒假或编不过 | §2.4-A-2 纳入 S2a 内容与完成判据（**六处门**〔`:844/:859/:893/:903` 改造 + `:705/:780` 保留〕+ **三条语义面**〔需求信号/`attached`/`ladder_probe_ok`〕+ 用例三态） |
-| **R16** | **出口出站分流键与 `Unbound` 兜底**（r22 H11） | DNS 回复等隧道 IP 目的出站静默丢 | §3.2-bis 纳入 S3 完成判据（岛侧 by-tun_ip 索引 + 丢→计数+记行 + 新 e2e） |
-| **R17** | **`:5300` 解析腿 / `dnstest` UDP / `host reach` 三个岛化后缺口**（r22 H12/H13/H14） | socks 域名面降级 / 排障工具失效 / DC3 不可达 | §2.6-G5/G6/G7 逐条处置（G7 建议新增 `STREAM[tag=6]`；G6 建议退役登记）⇒ **待裁决（并入 §12-C-2）** |
-| **R18** | **门槛参照臂消失**（r22 §5c） | 「每包 CPU ≤ 现役 WG+shim」「线开销 ≤40B」「中继腿表峰值」三条失去参照 | §9.2 三选一（推荐 a：新建产品档探针臂）⇒ **上报用户（与 §12-C-5 合并）** |
+| **R15** | **无 TUN 岛的 `st.tun` 结构门**（r22 H10 + r23 H2 逐处订正） | 宿主会话的阶梯/数据面恒不启动 ⇒ 假「已连接」；门判据改错 ⇒ 恒假或编不过 | §2.4-A-2 纳入 S2a 内容与完成判据（**七处 `st.tun` 读点**〔`:844/:859/:893/:903` 改造 + `:705/:780` 保留〕+ **三条语义面**〔需求信号/`attached`/`ladder_probe_ok`〕+ 用例三态） |
+| **R16** | **出口出站分流键与 `Unbound` 兜底**（r22 H11） | DNS 回复等隧道 IP 目的出站静默丢 | §3.2-bis 纳入 S3 完成判据（**默认 (a)：引擎侧自建 `tun_ip → pubkey` 映射，不动岛**；备选 (b) 岛 `by_tun_ip` 须登记岛公面）+ 丢→计数+记行 + 新 e2e |
+| **R17** | **`:5300` 解析腿 / `dnstest` UDP / `host reach` 三个岛化后缺口**（r22 H12/H13/H14） | socks 域名面降级 / 排障工具失效 / DC3 不可达 | §2.6-G5/G6/G7 逐条处置 ⇒ **G7 的裁决位 = §12-C-8**（r24 订正：原写「并入 C-2」错，C-2 是 token 域名端点）；G6 建议退役登记；G5 过滤键 = `Quic\|Relay` |
+| **R18** | **门槛参照臂消失**（r22 §5c） | 「每包 CPU ≤ 现役 WG+shim」「线开销 ≤40B」「中继腿表峰值」三条失去参照 | **§9.2 默认 (c)**（门槛表同批删三条 WG 相对列、保留绝对列 + 登记）；**(a) 新建产品档探针臂 = M6 候选**（r24 订正：原写「推荐 a」与 §9.2 定稿相反）⇒ **上报用户（与 §12-C-5 合并）** |
 | **R19** | **`derive_tunnel_ip` 误判退役**（r22 H9） | `table.rs:499` 生产断链 | 已订正（§1.4-K6） |
 | **R21** | **M2 威胁模型 #12「强制回落 WG」面消失需复评**（r22 B9 的落点；r23 指出该落点原为**空指针**） | 威胁模型里「准入失败 ⇒ 强制回落 WG」一类的缓解链条在 M5 后**不存在**（无 WG 可落）⇒ 该条威胁的**后果与缓解须重写**（M2 设计 §5 的 14 条之一） | **S5 的登记专项内的一条**（重写该条 → 落 `docs/reviews/M5.md` 的威胁模型复评段；不改代码） |
 | **R20** | **`ConnErr` 迁移规模低估**（r22 §6） | 实现期返工 | 实测 ≈ **59 处 / 9 文件**（含 `SpeedtestError::Conn` 公开枚举、`DatagramTooLarge` 无对应、`EngineGone→NoSession` 语义）⇒ **S2a 的完成判据加一条「`ConnErr` 全消费点清单逐条闭合」**（清单由实现棒 `grep` 生成并落 `M5.md`） |
@@ -911,7 +937,7 @@ cargo test --workspace && cargo clippy --all-targets -D warnings
 ## 11. 实施清单（S1–S8 + 依赖顺序 + 每项完成判据 + 净删行数登记方式）
 
 > 顺序（**与 §1.5 的 7 步表同源**；S7a 依赖 S1 不需等到最后；**S1b 依赖 S3**）：`S0 → S0b（relay import 改道，
-> 见 §6-Q2 纪律）→ S1 → {S7a, S7b, S7c}（可并行，各自独立 commit）→ S2a（含 §2.6-G5/G6/G7 + §2.4-A-2 六处门
+> 见 §6-Q2 纪律）→ S1 → {S7a, S7b, S7c}（可并行，各自独立 commit）→ S2a（含 §2.6-G5/G6/G7 + §2.4-A-2 七处 `st.tun` 读点
 > + R20 的 `ConnErr` 清单）→ S2 → S3（a=公共端点面迁址 / b=WG 删除）→ **S1b（D11：ring-shim + `[patch]` +
 > `boringtun` + 四处连带 manifest + lock 复核）** → S4 → S5（含 §8.1 C18/C19/C20/C21 逐行列名 + 计数输入集表
 > 复核 + 交下-1/5/6 + **ID 空位门断言**）→ S5t（§5 若做）→ S6（含交下-3/4）→ S8（代码门+收口）`。
@@ -924,11 +950,11 @@ cargo test --workspace && cargo clippy --all-targets -D warnings
 | **S0b relay import 改道**（§6-Q2 纪律：**红线面显式小批**） | 仅 `relay/**` + `relaywire.rs` 的 `use crate::legframe::…`（行为零变；不引新依赖、不碰中继线格式） | S0 | `cargo test --workspace` 全绿 + `tools/local-rust-relay.sh` 烟囱 + **上报：这是本程序期内第一次动 `relay/**`**（登入 §13.3 的「上报主会话」清单） |
 | **S1b D11 退役**（r23 M10 补：原稿无切片归属） | `tools/ring-shim/`、根 `[patch.crates-io]`、`boringtun` 依赖、**四处连带 manifest**（`fuzz/Cargo.toml:20`、`tools/m1-ab/Cargo.toml:29`、`tools/quic-ab/wg-shim/Cargo.toml:23`、`tools/quic-ab/arms/wg-shim`） | **S3 之后**（boringtun 的消费者 = `device.rs`/`wgcore`，先删代码再删依赖） | `cargo test --workspace` 绿 + `cargo metadata`/`Cargo.lock` **无 `ring 0.16`**（只余 0.17）+ `fuzz` 与 `tools/m1-ab` 可构建 + **新门 ④ 条绿**（否则 S5 必红） |
 | **S1 构建档位 + 隐藏依赖** | 根 `Cargo.toml`：`[profile.release] lto=true, codegen-units=1`；`x25519-dalek` 显式 `features=["static_secrets"]`；`smoltcp` features 复核（§7.3-2） | S0 | ①`build-app-core.sh` 三门过；②`[size]` ≤3,800,000 B（**预期 ≈3.0–3.3MB = ≈3.0–3.3×10⁶ B**）；③`quic-ab.sh` lab 档臂照跑 + **如实标注「非产品档」**（§9.2 默认 (c)；**不得**按「(a) 产品档读数」写判据）；④门槛表 CPU/线开销口径变更同批落登记；⑤`ci-local.sh` 绿 |
-| **S2a 宿主会话岛化**（§2-A） | 新 `facade/host_session.rs`（**Rust 形态面**见 §2.7）+ `service_exec`/`daemon carriers`/CLI 三处换源 + `quic_stream` 缝复用 + `ConnErr`→岛类型（§2.5）+ **`homeway-quic` 六处门改造与三条语义面**（§2.4-A-2）+ §2.6-G5/G6/G7 | S0/S1 | ①单测（连接/读/写/半关/超时/快照/停）+ C3/C7/C10/C14/C16/C17 行断言 + DC/CA 相关用例绿；②**App 服务会话 e2e**（`ClientCoreServiceStart` → 文件面往返）；③**无 TUN 阶梯用例三态**（判定 / 动作 / 复探各一）+ `attached`/`packets_out` **键面复验**（假死防线）+ `ClientCoreTunRecover` 的 **rc 可达集回归**（K13/`facade/mod.rs:470`） |
+| **S2a 宿主会话岛化**（§2-A） | 新 `facade/host_session.rs`（**Rust 形态面**见 §2.7）+ `service_exec`/`daemon carriers`/CLI 三处换源 + `quic_stream` 缝复用 + `ConnErr`→岛类型（§2.5）+ **`homeway-quic` 七处 `st.tun` 读点改造与三条语义面**（§2.4-A-2）+ §2.6-G5/G6/G7 | S0/S1 | ①单测（连接/读/写/半关/超时/快照/停）+ C3/C7/C10/C14/C16/C17 行断言 + DC/CA 相关用例绿；②**App 服务会话 e2e**（`ClientCoreServiceStart` → 文件面往返）；③**无 TUN 阶梯用例三态**（判定 / 动作 / 复探各一）+ `attached`/`packets_out` **键面复验**（假死防线）+ `ClientCoreTunRecover` 的 **rc 可达集回归**（K13/`facade/mod.rs:470`）；④**`ConnErr` 全消费点清单逐条闭合**（§2.5 末，≈59 处/9 文件，落 `M5.md` 且零残留）；⑤形态面按 **§2.7**（`HostSession`/`ServicePort`/`ProbeOutcome`/`HostErr`，**不得照搬 Go `Session` 形状**） |
 | **S2 客户端 WG 面切除** | `tun_exec` 去 `L3Bearer`/两处 dial 腿/阶梯域/hint/save/域名面（§1.3-T4）；删 `wgcore/mod.rs`、`session/{mod,recover}`、`wtransport/{bind,endpoint_cache,domain_eps,mod}`；`envflag` 去 `HOMEWAY_TRANSPORT`（§4.3①） | S2a | `cargo test --workspace` 绿 + `grep -rn "current_client()\|L3Bearer\|session_connect" crates/` **零命中** + 隔离门 11 条绿 + `quic-island-e2e` 去 WG 断言后绿 |
-| **S3 出口 WG 面切除（含公共端点面迁址）** | **S3a 先迁址**：§1.2-M4 的五类（STUN 观测 / 参照点探测应答 / udpcap caps / 绑卡重钉 / QUIC 腿注入计数）从 `ServerBind` 迁到 `homeway-quic::exit` 的 socket 层——**该步必然改 `homeway-quic` 的公面（r23 M9/M5 指出：与 §0.1『不改公面』相抵）⇒ §0.1/§0.2 的「岛改动面」须显式登记（A-2 六处门 + S3a 的五类 API + §3.2-bis 若选 (b) 的 by-tun_ip）**；**S3b 再删**：`server/{bind,device,relayleg,txring}` + `engine.rs` 去 WG 装配（腿表/发送线程/`route_encap` WG 分支/`sync_quic_legs`/新源日志）+ `E23` 行删 | S2 | 全绿 + `quic-ladder-e2e`/`quic-pf-e2e`/`quic-wg-e2e`（改写后）绿 + **`E20/E20a`（STUN 观测真观测）+ `C14`（参照点探测应答）两条判据的 e2e 在新落点复绿**（本棒点名的必改项）+ `serve status --json` 键面复验 + `[size]` 入册 |
+| **S3 出口 WG 面切除（含公共端点面迁址）** | **S3a 先迁址**：§1.2-M4 的五类（STUN 观测 / 参照点探测应答 / udpcap caps / 绑卡重钉 / QUIC 腿注入计数）从 `ServerBind` 迁到 `homeway-quic::exit` 的 socket 层——**该步必然改 `homeway-quic` 的公面（r23 M9/M5 指出：与 §0.1『不改公面』相抵）⇒ §0.1/§0.2 的「岛改动面」须显式登记（A-2 七处 `st.tun` 读点 + S3a 的五类 API + §3.2-bis 若选 (b) 的 by-tun_ip）**；**S3b 再删**：`server/{bind,device,relayleg,txring}` 的 **WG 专属面**（T6/T7/T8 逐符号清单，§1.3）+ `engine.rs` 去 WG 装配（腿表 WG 分支/发送线程/`route_encap` WG 分支/`sync_quic_legs` 的 WG 部分）+ **E23 值域收窄（行保留；不得删行——r24 必闭合 1）** | S2 | 全绿 + `quic-ladder-e2e`/`quic-pf-e2e`/`quic-wg-e2e`（改写后）绿 + **`E20/E20a`（STUN 观测真观测）+ `C14`（参照点探测应答）两条判据的 e2e 在新落点复绿**（本棒点名的必改项）+ `serve status --json` 键面复验 + `[size]` 入册 |
 | **S4 intercept 收窄 + 观测面重写** | §3.2（`local_services`/`DialTarget::Unix`/`Kind::Exempt` 删；`served_ports` 单一语义）+ §3.3 行文 + §4.4 前缀删除 + §8.4 新增行（N-e/**E-q6**/E25） | S3 | 行文逐字断言（E5/E10/E11/E12/E14/E17 + 去前缀签名面）+ `intercept` 用例增删（`exempt_*` 两例删、transit+DNS 两径留）+ A10 收线时点 e2e |
-| **S5 判据全表登记 + fixtures + 扫查门** | §8 全表落 `INTEROP-CRITERIA.md`（**与代码同批 commit**）；§8.3 fixtures 退役 + `SHA256SUMS`/`MANIFEST` + 向量管线；新门 `tools/check-wg-removed.sh`（§7.1 八条）挂 `ci-local.sh` | S4 | 登记表条目齐（五字段）+ 词表门 PASS + 新门绿（含 ⑥ 注入负例自检）+ `cargo test -- --list` 无 WG 前缀用例 |
+| **S5 判据全表登记 + fixtures + 扫查门** | §8 全表落 `INTEROP-CRITERIA.md`（**与代码同批 commit**）；§8.3 fixtures 退役 + `SHA256SUMS`/`MANIFEST` + 向量管线；新门 `tools/check-wg-removed.sh`（§7.1 九条）挂 `ci-local.sh` | S4 | 登记表条目齐（五字段）+ 词表门 PASS + 新门绿（含 ⑥ 注入负例自检）+ `cargo test -- --list` 无 WG 前缀用例 + **ID 空位门断言**（`^| E-q6`/`^| E25`/`^| N-e`/`^| C20`/`^| C21` 全 0）+ **计数输入集/数值语义表逐行复核**（≥5 行改写） |
 | **S5t token B**（§5 若做） | `token.rs` 段容器（`hmw2` + `info/critical`）+ `rl1` body 冻结 + 向量重生 + `tools/**` 抽取面 | S5 | 新向量往返 + 字节锚 + `serve token` 渲染不变 + 全仓 `hmw1` 白名单核 + 上报 tier |
 | **S6 门槛终值 + 真机** | 体积/内存/CPU 终值实测（含 §9.3 复测）+ 真机构建 + 删码后烟囱（浏览器/files/term/portfwd 四件套） | S5 | 门槛表逐格填数（过/差异登记）+ `docs/reviews/M5.md` 读数台账 + 真机记录 |
 | **S7a 中继 v6（Q2）** | §6-Q2 的 ①②③④⑤ | S1（可与 S2/S3 并行但**独立 commit**） | v6 客户端经中继可用（本机 `local-rust-relay.sh` + 真机） + `R1` 行登记 + `relay_cli` 用例 |
@@ -973,7 +999,7 @@ cargo test --workspace && cargo clippy --all-targets -D warnings
 | **C-2** | §2.4-A5 **token 域名端点** | **承接**（迁解析到岛候选，+80–150 行） | 缺口登记（`--ddns` 域名端点在核侧不可用） |
 | **C-3** | §5 **token 候选 B** | **本期做**（独立切片 S5t；前置已满足） | 不做 = 窗口留 M6/M7（成本更高）；整片顺延（不拆半做） |
 | **C-4** | §9.3 **单连接内存格（≤+320K 未过）** | **修订门槛为 ≤+640K（falsify 1.05×）**，理由 = 窗—吞吐耦合（S9 实测） | 维持 +320K ⇒ 须先做窗—吞吐再平衡实验（独立批） |
-| **C-5** | §0.4 **采 LTO 档**（含 §9.2-a 重跑 quic-ab） | **采**（`lto=true, codegen-units=1`，`opt-level` 3） | 不采 ⇒ 需在 3.8MB 判据上走「超预算显式登记理由」 |
+| **C-5** | §0.4 **采 LTO 档** + **门槛表口径变更**（= §9.2 默认 (c)：**删「每包 CPU ≤ 现役 WG+shim」「线开销 ≤40B」「中继腿表峰值」三条的 WG 相对列**、保留绝对列并标注档位）——**与 C-4 合并为一项上报**（r24 必闭合 4） | **采**（`lto=true, codegen-units=1`，`opt-level` 3）；CPU/线开销读数按 §9.2 默认 (c) 处理（**不再要求 §9.2-a 的产品档重跑**） | 不采 LTO ⇒ 需在 3.8MB 判据上走「超预算显式登记理由」；不改门槛口径 ⇒ 三条门槛无参照臂（永久失效） |
 | **C-6** | §4 **承载三键全删**（含 tier 停发 `transport`） | **全删**（需 tier 跟做一事；§10-R9 先核 serde） | 留 env 一档作「心理回退」⇒ 与「简洁」冲突，且回退无实效 |
 | **C-7** | **tier `exit-transit-intercept` 的 MUST 退役**（回环同端口豁免；r23 M8 指出它同时是**恢复阶梯的健康判据来源**——原文「死端口 MUST 快速回 RST，作为恢复阶梯的健康判据」） | **须用户点头**：①豁免面退役（§3.2/§3.3）+②**健康判据换源**（M5 后由 `STREAM[probe]`/快探承接，`tier:connection-lifecycle` 修订稿同批交付） | 不点头 ⇒ 保留豁免臂（与「DATAGRAM → 过境 + DNS 两径」的范围原文冲突，须再登记） |
 | **C-8** | **§2.6-G7 的 `:5300` 解析腿**（承接 = 新增 `STREAM[tag=6]`，+80–150 行；或退役登记） | **承接**（socks 域名面是产品能力；`CA5`/`E4` 以它为前置） | 退役 ⇒ `CA5` 降级（域名目标只能本机解析）+ `E4` 的 `resolve=` 段退役（登记） |
@@ -1108,6 +1134,51 @@ cargo test --workspace && cargo clippy --all-targets -D warnings
 - **按 r23 的明文要求**（「修完高 5 项 + 中高 6 项后可重走设计门（r24）」）⇒ **须走 r24 复审确认**；**r24 未过之前不得开工实现**（§13.3-4 纪律）。
 - **r24 的复审目标（供主会话切棒）**：①复核 22 条的 v3 落点是否真闭合（**逐条 `grep`/回源，不接受自述**）；②复核 v3 新增面（§2.4-A-2 六门+三面 / §8.1 的三张补表 / §9.2 默认 (c) / S0b/S1b 切片）是否自洽；③重点检查 §1.5 的 7 步表与 §11 切片集（14 片）是否仍有一处不一致。
 
+### 13.7 复审确认轮（r24）——轮次事实
+
+| 项 | 值 |
+|---|---|
+| 目录 | **`/tmp/dsh-review/r24.QZhEjG/`**（`prompt.txt` 3,997 B / **`output.md` 23,321 B = 完整报告** / `stderr.log` 150,976 B） |
+| 命令 | `dsh --profile headless "$(cat prompt.txt)" > output.md 2> stderr.log; echo "exit=$?"` |
+| **exit code** | **`0`** |
+| 被评审版本 | **v3**：`wc -l` = 1,155（评审实测）/ `wc -c` = 157,327 B / sha256 `2e192b78…f04d905d`（与 prompt 给的哈希一致）；HEAD `0ac6caa` |
+| 评审形态 | 逐条 `grep` 回源 + **源码断言逐一 `sed -n` 复核**（`driver.rs`/`bind.rs`/`bridge.rs`/`table.rs`/`hosts.rs`/`probe.rs`/`token.rs`/`streams.rs`/`cmd.rs`/`frame.rs`/`relaywire.rs`/`quic_island_e2e.rs`）+ 真源 ID 穷举 + 算术逐格实算 |
+| **意见条数** | **必闭合 5 项**（全部「v3 自身改动未传导」型：T6/§11-S3 的 E23/`src_seen` 自相矛盾 + 逐符号化；§11-S2a 引不存在的 §2.7 + 宿主会话 Rust 形态面无正文；§10-R16/R17/R18 三行与 §3.2-bis(a)/C-8/§9.2(c) 相反；§12-C-5 括注 + 门槛表口径变更无承载行；R20/B6 的 `ConnErr` 清单两处未落）+ **非阻塞 13 项**（中/低：标签「六处门」漏枚举、§11.1 算术、§8.5 合计、切片数 15 片、§0.2「不动」、§13.1 旧文残留、S1b 判据引用未建的门、§0.4-5② 相抵、CA3/CA4 证据行、S5 判据缺项、L-1 单位落点） |
+| **门结论（原文）** | 「**门未过（列剩余必闭合项）**…五处均为**文档内一行级同步/补写，无需新设计**，修完即可走 r25 确认；未修完之前按 §13.3-4 纪律不得开工实现」 |
+| 复核确认的「真闭合」 | r23 的 **5 高 + 6 中高**核心处置**逐条回源证实真闭合**（D8 残留行已删 / C18-C19 撞名已改 C20-C21 且真源两族补处置 / E-q5 两复活点改 E-q6 且三新 ID 确为空位 / A-2 六门逐处与源码对上且无致恒假措辞并已进 S2a / E4-CA5 与 G7 一致且立 C-8 / E23 已改判值域收窄 / §8.5 六处计数不自洽已改 / opt-s 跨档净增已删且单位钉死 / §9.2(c) 与 §11-S1 相容 / D11 已获 S1b） |
+| 仓内副作用 | `git status --short` = 仅 `?? docs/reviews/M5-design.md`（评审未改跟踪文件） |
+
+### 13.8 r24 逐条处置（**认同改**）
+
+| # | 严重度 | 意见（摘要） | 处置（v4） | 落到 |
+|---|---|---|---|---|
+| **1 + 6** | **中高** | **T6/T7/§11-S3 的 E23/`src_seen` 自相矛盾**（T6 与 S3 仍令删 `src_seen`/E23，而 §3.3 已判「整面删除被否决」）；且 T6/T7 保留列未逐符号化（`reg` = kind 2 与 `FRAME_TYPE_RELAY_REG` = 3 只差一字、`recv_packet` 须保留本体） | **认同**：T6/T7 改**逐符号化**（保留：`recv_packet` 本体、`kind=3 → on_leg_frame`、`try_clone_socket`/`leg_fds`/`udp_fd`/`listen_with_fallback_addr`/`quic_leg_pkts`；删：decap 分支/`send_wire` WG 路径/发送线程/`set_on_hint`/`LegEvent::Hint`+`PUNCH_*`/kind 0-2-4 投递分支）；S3 内容列改「**E23 值域收窄（行保留；不得删行）**」；保留列加逐符号清单 | §1.3-T6/T7 / §1.1 订正块 / §11-S3 |
+| **2** | **中** | **§11-S2a 引「§2.7」但全文无 §2.7**（空指针）；r23 checklist 的「宿主会话 = Go `Session` 接口仿写」风险无正文承载 | **认同**：**新增 §2.7「宿主会话的 Rust 形态面」**（R-1…R-7：`HostSession::connect(&self, ServicePort, budget) -> Result<Stream, HostErr>`；`ServicePort` newtype；`ProbeOutcome` enum；`HostErr` thiserror + 单处 `io::Error` 映射；快照同形重建但来源换岛；`Drop` 不阻塞；单实例 `&self`、不得引第二个 runtime）——并把 S2a 内容列改为「形态面按 §2.7」 | §2.7 / §11-S2a |
+| **3** | **中** | **§10-R16/R17/R18 三行与 v3 定稿相反**（R16 岛侧索引 ≠ §3.2-bis 默认 (a)；R17 并入 C-2 ≠ C-8；R18「推荐 a」≠ §9.2 默认 (c)） | **认同**：三行同步（R16 → 引擎侧 `tun_ip→pubkey` 映射、备选 (b) 须登记岛公面；R17 → **C-8**；R18 → **默认 (c)** + (a) 列 M6 候选） | §10-R16/R17/R18 |
+| **4** | **中** | §12-C-5 括注仍写「含 §9.2-a 重跑 quic-ab」；且 §9.2 要求上报的「门槛表删 WG 相对列」在 §12 **无承载行** | **认同**：C-5 改写为「LTO 档 **+ 门槛表口径变更**（删三条 WG 相对列、保留绝对列并标注档位）」并注明**与 C-4 合并为一项上报** | §12-C-5 |
+| **5** | **中** | **R20/B6 承诺的两处未落**（§2.5 无「实现期先 `grep` 生成全消费点清单」；S2a 判据无「`ConnErr` 全消费点清单逐条闭合」） | **认同**：§2.5 末补「开工第一件事 = `grep` 全量 ≈59 处/9 文件 → 逐点登记 `M5.md`」；S2a 完成判据补**第④条** | §2.5 / §11-S2a |
+| **7** | 低 | 「六处门」标签漏枚举 `:1245`（实际 7 个 `st.tun` 读点） | **认同**：全文改「**七处 `st.tun` 读点**（A-2 ①–⑥）」（§0.1/§2.4/§10-R15/§11-S2a/§15-3，`grep` 复核「六处」= **0**） | 全文 |
+| **8** | 低 | §11.1 删小计按旧区间算（应 11,215–12,110；净删 9,415–11,060） | **认同**（已改，含算式） | §11.1 |
+| **9** | 低 | §8.5 合计行与列和差 1（改列 26 vs 27；小计 37 vs 38）；C additive「改=1」与 C21 四条改写不一致 | **认同**：改列 → **26**、小计 → **37**；C additive 改 → **5**（含 C21 四条） | §8.5 |
+| **10** | 低 | §11 实为 15 片而 §13.6 写 14 片；§1.5 七步表未含 S4/S5t/S7*/S8；S6 依赖未含 S5t | **认同**：§13.6 改 15 片并点名；**§1.5 表整体重写为 8 步（与 15 片对齐，含 S4 行与 S5t/S7*/S6 合并行）**（原表的「S2a+S2」行实为 S4 内容错位，一并修正）；S6 依赖补「含 S5t 若做」 | §1.5 / §11-S6 / §13.6 |
+| **11** | 低 | §0.2 岛面「不动」与 §0.1/§11-S3a 相抵 | **认同**：§0.2 改「**不改线协议**；公面与结构门改动面见 §0.1/§2.4-A-2」 | §0.2 |
+| **12** | 低 | §13.1 旧文残留（B12 引不存在的 §1.5-bis；B19 写 946 行；A7 写 `!is_wg()` 已被 r23 改为 `Quic\|Relay`） | **认同**：三处订正（B12 → §0.3.3-bis；B19 → 1,066 行〔r23 时的实测〕；A7 → `Quic \| Relay`），并在 A7/B12/B19 行内加「（r23/r24 已订正）」标记 | §13.1 |
+| **13** | 低 | S1b 完成判据引 S5 才建的门的 ④ 条（顺序不可执行） | **认同**：改「按 §7.1-④ 口径**手工核**，S5 建门后回归」 | §11-S1b |
+| **14** | 低 | §0.4-5② 首分支「须在 M5 内重跑产品档」与 §9.2(c) 相抵 | **认同**：首分支改写为 §9.2(c) 口径（(a) 降 M6 候选） | §0.4 |
+| **15** | 低 | CA3/CA4 未指定 post-M5 证据行（r23 M8b 六项中的两项） | **认同**：CA3 → 成功路径证据行 = `tag=dial` 服务流族；CA4 → 服务流受理行（若不为 socks 设 tag 则同 portfwd 腿），**待实现期按实际 tag 定、登记即合规** | §8.1-CA3/CA4 |
+| **16** | 低 | S5 完成判据缺「ID 空位断言」「计数输入集表复核」（charter 行有） | **认同**：两处判据补齐（§11-S5） | §11-S5 |
+| **17** | 低 | L-1 未含单位钉死（单位在 §0.3.1） | **认同**：L-1 条目内加「单位钉死落点 = §0.3.1」 | §8.5-L-1 |
+| **18** | 信息 | 题面写 1,150 行、实测 1,155 行（哈希一致） | **认同（无动作）**：以**哈希**为准；本节记录 r24 实测 1,155 行 / v4 现为 1,181+ 行（**引用一律用章节号，r22 起的纪律**） | §13.7 |
+
+**处置统计**：**必闭合 5/5 认同并改**、**非阻塞 13/13 认同并改**（含 6 与必闭合 1 同批）；**认同 18 条（100%）**、部分认同 0、**不认同 0**。
+
+### 13.9 门结论（r24 → v4 修订 → r25）
+
+- **r24 门结论 = 未过**（必闭合 5 项 + 非阻塞 13 项；r24 自述「五处均为文档内一行级同步/补写，无需新设计」）。
+- **本棒完成 v4 全量修订**（18/18 认同并改；见 §13.8 的「落到（v4）」列）：必闭合 5 项全落（T6/T7 逐符号化 + E23 值域收窄同步 + §2.7 新增 + §10 三行同步 + C-5 承载行 + `ConnErr` 清单两处落点），非阻塞 13 项全改（含 §1.5 表重写为 8 步与 15 片对齐、「六处」→「七处」全文归零、§11.1/§8.5 算术收口、§13.1 三处旧文订正）。
+- **按 r24 的明文要求**（「修完即可走 r25 确认」）⇒ **须走 r25 确认**；**r25 未过之前不得开工实现**（§13.3-4 纪律）。
+- **r25 的复审目标**：①必闭合 5 项 + 非阻塞 13 项的 v4 落点逐条回源；②**新增面**（§2.7 的 R-1…R-7、§1.5 重写表、§8.1 三补表、§9.2(c)、S0b/S1b/S2a 判据）是否自洽；③**本类缺陷的根因是「v(n-1) 的改动未传导到全部表」** ⇒ r25 请**专扫跨表传导**（同一事实在 §1.1/§1.3/§3.3/§8/§10/§11/§12 七处是否口径一致）。
+
 ---
 
 ## 14. 设计门后记（本棒自检）
@@ -1143,7 +1214,7 @@ cargo test --workspace && cargo clippy --all-targets -D warnings
 |---|---|---|---|
 | 1 | **粗删终点的 `.so` 直读**（§0.3.3） | S1 | 校准 0.30–0.55 MB 的推算区间；若实测显著偏离 ⇒ 修订 §0.4 |
 | 2 | **LTO 档的每包 CPU / 吞吐**（§9.2） | S1（独占机器） | 门槛表口径（R18） |
-| 3 | **无 TUN 岛的阶梯启动**（§2.4-A-2） | S2a | **六处门**（`:844/:859/:893/:903` 改造 + `:705/:780` 保留原判据）后的用例三态 + `attached`/`packets_out` 键面复验 |
+| 3 | **无 TUN 岛的阶梯启动**（§2.4-A-2） | S2a | **七处 `st.tun` 读点**（A-2 ①–⑥：`:844/:859/:893/:903` 改造 + `:705/:780` 保留原判据）后的用例三态 + `attached`/`packets_out` 键面复验 |
 | 4 | **出口出站分流键 + `Unbound` 归因**（§3.2-bis） | S3 | DNS 回复 e2e（新增） |
 | 5 | **`:5300` 解析腿的 tag 承载**（§2.6-G7） | S2a（若裁决做） | `CA5`/`E4` 复绿 |
 | 6 | **`smoltcp` 的 `socket-tcp-reno` 是否死 feature**（§7.3-2） | S1 | 删则需 TCP 行为回归 |
