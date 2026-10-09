@@ -516,3 +516,11 @@ TUN socketpair + 合成 UDP 流，`--rate 0 --window 64 --secs 8` = 容量档）
 - 本地私有实例：#5 **收工时 stop**（`tools/local-rust-exit.sh stop 5`）；现役出口 pid 33667 全程未碰。
 - **临时测量补丁已 revert**（`exit/pump.rs`、`client/streams.rs`、`tuning.rs` 的 TEMP 改动：
   `git diff` 已核对为零残留）。
+
+### 7.7 干净树复跑（收工状态）
+
+| 项 | 读数 |
+|---|---|
+| `tools/build-app-core.sh`（HEAD **`fcb605e`** 提交后干净树） | `[ver] **fcb605eb8d51-rust**`、`[sym] 20/20`、`[size] **4,850,416 B**`（与 dirty 复跑同值 ⇒ 本批体积代价 = **+144 B / +0.003%**，来源 = 常量值变大 + `receive_window` 组装行） |
+| `tools/m3-s8-perf.sh 5 3`（干净树复跑；同仪器） | quic **69.05 / 69.93 / 70.47**（下中位 **69.93**）vs wg **51.92 / 51.90 / 52.07**（下中位 **51.92**）⇒ **1.347×**（≥0.95× ✓；与 dirty 轮 1.366× 同带——两轮合计 6 个 quic 读数 = 69.1–71.0 MiB/s，离散 ±1.4%） |
+| 收工 | 本地私有实例 #1/#2/#5 与本地中继 #1 全部 `stop`；**现役出口 pid 33667 全程未碰**（收工复核仍在跑）；`~/m3s9-bulk.bin` 已删；两仓只读复核：tier = 仅既有 `?? openspec/changes/term-local-scrollback/`、homeway（Go）与主检出 `homeway-rs`（`main`）均干净 |
