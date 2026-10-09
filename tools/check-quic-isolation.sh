@@ -1,8 +1,8 @@
 #!/bin/zsh
 # check-quic-isolation.sh — 「禁止 async 泄漏进同步面 + QUIC 数据面纪律」的源码门
-# （M0 设计 §3.4 层 3；M1 S6-2 扩第 ⑥–⑩ 条）。
+# （M0 设计 §3.4 层 3；M1 S6-2 扩第 ⑥–⑩ 条；M3 S6 扩第 ⑪ 条）。
 #
-# **九条断言**（fail-closed；任一击红即退出非 0）：
+# **十一条断言**（fail-closed；任一击红即退出非 0）：
 #   ① 异步栈名字只出现在 crates/homeway-quic/Cargo.toml —— homeway-core / homeway-cli /
 #      homeway-capi 的 manifest 零命中（防同步面拿到异步依赖 ⇒ 层 0 的 E0433 保证失效）；
 #   ② crates/homeway-quic/src/** 里 `tokio::|quinn|rustls|async fn|.await` **只在异步面**
@@ -34,6 +34,24 @@
 #      (b) `client/streams.rs`（写者任务所在）`write_all` 命中 ≥ 1（防 (a) 空过）；
 #      (c) `client/streams.rs` 的 `fn write`（命令循环调用的唯一写入口）不是 `async fn`
 #      且体内零 `.await`（背压不落命令循环）。
+#   ⑪ **QUIC 档零 `stackb::` 可达引用**（M3 S6 / 设计 §12-1 的 D1 判据，路线文件 M3
+#      「判据」列的实装面；**本体与 WG 档消费点保留至 M5——本门不要求删除本体**）：
+#      三件可判定事实（逐件 fail-closed）——
+#      (a) **依赖面**：`homeway-quic`（QUIC 岛）的 manifest 零 `homeway-core` 依赖
+#          （stackb 在 core 里 ⇒ 不依赖 ⇒ 编译期不可达；反向自校准 = core 的 manifest
+#          **必须**依赖 `homeway-quic`，否则本判据退化为空话）；
+#      (b) **源码面**：`crates/homeway-quic/src/**` 剥注释后 `stackb|wgcore` 零命中
+#          （注释里的同名引用**合法**——口径 = ② 条的六态状态机；raw 面 ≥1 命中自校准，
+#          证明「零命中」不是「压根没提过」的假绿）；
+#      (c) **客户端拨号缝**：`facade/quic_stream.rs` 剥注释后
+#          `wgcore|stackb|connect_deadline|healing_dial|Session` 零命中；且 `tun_exec.rs`
+#          的**桥拨号闭包块**（`BridgeHost::new(` → `set_dial_timeout(`）剥注释后
+#          `stackb::|wgcore::|connect_deadline|healing_dial` 零命中（块内自校准 =
+#          `quic_stream::dial` ≥1 且 `session_connect` ≥1——QUIC 分支与 WG 分支都在，
+#          QUIC 分支不触 WG 会话）。
+#      **双向负例自检**：管线在 mktemp 样本上自校准（代码里的 `stackb::` 判得出 /
+#      注释里的判不出）；S6 另在真文件上注入一处可见引用复核「确定红」（记录见
+#      `docs/reviews/M3.md` S6 节）。
 #
 # **M1 起对第 ⑤ 条的收窄说明（偏离设计原文，见 commit message 与
 # `docs/INTEROP-CRITERIA.md` 判据变更记录）**：RFC 7250 RPK 的客户端钉定在 rustls 公开面里
@@ -399,4 +417,69 @@ rm -f /tmp/.hw-write.$$
 (( WCALL >= 3 )) || fail "站内写入口抽出的行数异常（${WCALL} < 3）——⑩(c) 的判据可能空过"
 echo "  ⑩ 通过：driver.rs 零 write_all/feed/flush；client/streams.rs 写者任务有 write_all（${WRITER_HITS} 处）；流写入口为同步 fn 且体内零 .await"
 
-echo "QUIC 隔离门全绿（十条断言：异步边界 / 阻塞面 / aws-lc / 跳过验证 / DATAGRAM 纪律 / 中继零异步名 / 单线程前提 / 命令循环零写等待）"
+# ---------- ⑪ QUIC 档零 `stackb::` 可达引用（M3 S6；D1 判据，三件可判定事实） ----------
+# 判据原文（路线文件 M3「判据」列，D1 形态）= 「**客户端 QUIC 档路径零 `stackb::` 可达引用**」。
+# 「可达」在此取最机械的三面：依赖（不可命名）→ 岛源码（零命中）→ 客户端拨号缝（零命中）。
+STACKB_ISLAND_PATTERN='stackb|wgcore'
+STACKB_DIAL_PATTERN='wgcore|stackb|connect_deadline|healing_dial|Session'
+STACKB_BLOCK_PATTERN='stackb::|wgcore::|connect_deadline|healing_dial'
+STACKB_BLOCK_START='BridgeHost::new('
+STACKB_BLOCK_END='set_dial_timeout'
+
+# (a) 依赖面：岛 manifest 零 homeway-core；反向自校准 = core manifest 必须依赖岛。
+h="$(hits_toml "$ISLAND/Cargo.toml" 'homeway-core|homeway_core')"
+[[ -z "$h" ]] || fail $'QUIC 岛 manifest 声明了 homeway-core（stackb 可达面被打开）：\n'"$h"
+CORE_DEP="$(hits_toml "$CRATES/homeway-core/Cargo.toml" 'homeway-quic|homeway_quic' | wc -l | tr -d ' ')"
+(( CORE_DEP >= 1 )) || fail "core 的 manifest 未依赖 homeway-quic（${CORE_DEP} 条）——⑪ 判据退化（岛不在依赖树里）"
+h="$(hits_toml "$ISLAND/Cargo.toml" 'stackb')"
+[[ -z "$h" ]] || fail $'QUIC 岛 manifest 出现 stackb（不得经任何依赖取得它）：\n'"$h"
+
+# (b) 源码面：岛整棵 src 剥注释后零命中；raw 面 ≥1 自校准（证明剥注释确实在做工作）。
+BAD_ISLAND=""
+ISLAND_SRC_SCANNED=0
+ISLAND_RAW_HITS=0
+while IFS= read -r f; do
+  ISLAND_SRC_SCANNED=$(( ISLAND_SRC_SCANNED + 1 ))
+  h="$(hits_rs "$f" "$STACKB_ISLAND_PATTERN")"
+  [[ -n "$h" ]] && BAD_ISLAND+="${f}:"$'\n'"${h}"$'\n'
+  ISLAND_RAW_HITS=$(( ISLAND_RAW_HITS + $(grep -cE "$STACKB_ISLAND_PATTERN" "$f" || true) ))
+done < <(find "$SRC" -name '*.rs' | sort)
+[[ -z "$BAD_ISLAND" ]] || fail $'QUIC 岛源码出现 stackb/wgcore（QUIC 档路径不得可达栈 B——注释里的引用合法，代码里的不允许）：\n'"$BAD_ISLAND"
+(( ISLAND_SRC_SCANNED >= 8 )) || fail "岛源码扫描文件数异常（${ISLAND_SRC_SCANNED} < 8）——门可能空过"
+(( ISLAND_RAW_HITS >= 1 )) || fail "岛源码 raw 面零 stackb/wgcore 命中——⑪(b) 的「剥注释后零命中」是假绿（文件面选错/文件被清空）"
+
+# (c) 客户端拨号缝：quic_stream.rs 零命中；tun_exec.rs 的桥拨号闭包块零命中。
+QUIC_STREAM="crates/homeway-core/src/facade/quic_stream.rs"
+[[ -f "$REPO_ROOT/$QUIC_STREAM" ]] || fail "QUIC 档服务流拨号缝缺失：$QUIC_STREAM（M3 S3 的真源面）"
+h="$(hits_rs "$REPO_ROOT/$QUIC_STREAM" "$STACKB_DIAL_PATTERN")"
+[[ -z "$h" ]] || fail $'QUIC 档拨号缝（'"$QUIC_STREAM"'）出现 WG 面名字（剥注释后）：\n'"$h"
+QS_SELF="$(hits_rs "$REPO_ROOT/$QUIC_STREAM" 'quic_stream::dial|Cmd::Stream|StreamTag' | wc -l | tr -d ' ')"
+(( QS_SELF >= 1 )) || fail "拨号缝文件内零服务流名字（${QS_SELF}）——⑪(c) 的判据面可能抽错（文件改名/清空）"
+TUN_EXEC="$CRATES/homeway-core/src/facade/tun_exec.rs"
+[[ -f "$TUN_EXEC" ]] || fail "世代层拨号派发面缺失：$TUN_EXEC"
+BLOCK_RAW="$(mktemp -t hw-iso-bridge.XXXXXX)" || fail "mktemp 失败（拨号闭包块无法抽取）"
+LC_ALL=C awk -v s="$STACKB_BLOCK_START" -v e="$STACKB_BLOCK_END" \
+  'index($0, s) > 0 { inb = 1 } inb { print NR": "$0 } inb && index($0, e) > 0 { exit }' \
+  "$TUN_EXEC" > "$BLOCK_RAW" || true
+BLOCK_LINES="$(wc -l < "$BLOCK_RAW" | tr -d ' ')"
+(( BLOCK_LINES >= 15 )) || fail "桥拨号闭包块抽出的行数异常（${BLOCK_LINES} < 15）——标记漂移，判据可能空过"
+h="$(strip_rs "$BLOCK_RAW" | grep -nE "$STACKB_BLOCK_PATTERN" || true)"
+[[ -z "$h" ]] || fail $'桥拨号闭包块（QUIC 分支所在）出现 WG 面引用（剥注释后）：\n'"$h"
+B_QUIC="$(strip_rs "$BLOCK_RAW" | grep -cE 'quic_stream::dial' || true)"
+B_WG="$(strip_rs "$BLOCK_RAW" | grep -cE 'session_connect' || true)"
+rm -f "$BLOCK_RAW"
+(( B_QUIC >= 1 )) || fail "桥拨号闭包块内零 quic_stream::dial——QUIC 分支不在（⑪(c) 空过）"
+(( B_WG >= 1 )) || fail "桥拨号闭包块内零 session_connect——WG 保留分支不在（块抽取范围漂了）"
+
+# 管线自校准（fail-closed；双向）：代码里的 `stackb::` 判得出 / 注释里的判不出。
+STACKB_SAMPLE="$(mktemp -t hw-iso-stackb.XXXXXX)" || fail "mktemp 失败（⑪ 自校准无法进行）"
+printf 'fn touches_stackb() { let _ = crate::wgcore::stackb::MTU; }\n' > "$STACKB_SAMPLE"
+h="$(hits_rs "$STACKB_SAMPLE" "$STACKB_ISLAND_PATTERN")"
+[[ -n "$h" ]] || fail "⑪ 自校准失败：代码里的 `stackb` 未被判出（判据会整体空过）"
+printf '// crate::wgcore::stackb::MTU 只出现在注释里\nfn doc_only() {}\n' > "$STACKB_SAMPLE"
+h="$(hits_rs "$STACKB_SAMPLE" "$STACKB_ISLAND_PATTERN")"
+[[ -z "$h" ]] || fail $'⑪ 自校准失败：注释里的 stackb 被误判（剥注释状态机坏了）：\n'"$h"
+rm -f "$STACKB_SAMPLE"
+echo "  ⑪ 通过：QUIC 档零 stackb:: 可达引用（岛 manifest 零 homeway-core/stackb；岛源码 ${ISLAND_SRC_SCANNED} 文件剥注释后零 stackb|wgcore〔raw 面 ${ISLAND_RAW_HITS} 处注释引用自校准〕；拨号缝 quic_stream.rs + tun_exec 桥闭包块〔${BLOCK_LINES} 行；dial=${B_QUIC}/session_connect=${B_WG}〕零 WG 面引用；管线自校准 2/2）"
+
+echo "QUIC 隔离门全绿（十一条断言：异步边界 / 阻塞面 / aws-lc / 跳过验证 / DATAGRAM 纪律 / 中继零异步名 / 单线程前提 / 命令循环零写等待 / QUIC 档零 stackb:: 可达引用）"
