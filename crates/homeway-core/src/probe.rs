@@ -227,11 +227,14 @@ pub fn ping_ex(target: SocketAddr, pad: usize, budget: Duration) -> io::Result<P
 /// 探测线索的消费卫兵（与出口侧对称，transport.go probeAddrAcceptable 同义）：
 /// 只要全球单播且不落 fake-IP 段（198.18/15，代理）与 CGNAT（100.64/10）——
 /// 应答无认证，不能让投喂污染候选表。
+///
+/// **v4-mapped 归一（M2 代码门 G3，同类 D1）**：Go 同函数首行 `ip = ip.Unmap()`。
+/// 双栈 socket 上 IPv4 对端/hint 以 `::ffff:a.b.c.d` 出现；不先归一则私网/回环/
+/// 链路本地/fake-IP/CGNAT 的 mapped 形态全部走 v6 分支放行（可达链 =
+/// `wtransport/bind.rs` 的未认证 hint → 候选集/打洞），安全卫兵被绕过。
+/// 归一后 mapped 与纯 v4 **同判定**；真 IPv6（含 `::1`/ULA）语义不变。
 pub fn probe_addr_acceptable(addr: &SocketAddr) -> bool {
-    let ip = match addr {
-        SocketAddr::V4(v4) => std::net::IpAddr::V4(*v4.ip()),
-        SocketAddr::V6(v6) => std::net::IpAddr::V6(*v6.ip()),
-    };
+    let ip = crate::udpbatch::unmap_v4_in6(*addr).ip();
     match ip {
         std::net::IpAddr::V4(v4) => {
             let o = v4.octets();
@@ -366,5 +369,52 @@ mod tests {
         assert!(probe_addr_acceptable(&"[2001:db8::1]:41641".parse().unwrap()));
         assert!(!probe_addr_acceptable(&"[fe80::1]:1".parse().unwrap()));
         assert!(!probe_addr_acceptable(&"[fc00::1]:1".parse().unwrap()));
+    }
+
+    /// M2 代码门 G3（D1 同类）：v4-mapped 形态先归一 ⇒ 与纯 v4 **同判定**；
+    /// mapped 的私网/回环/链路本地/fake-IP/CGNAT 全拒（改前全放行——安全卫兵绕过）。
+    #[test]
+    fn addr_acceptance_guard_normalizes_v4_mapped() {
+        // 等价性质：对每个 v4，mapped 形态与纯 v4 判定相同。
+        for v4 in [
+            "10.0.0.1",
+            "192.168.1.1",
+            "127.0.0.1",
+            "169.254.1.1",
+            "198.18.0.1",
+            "100.64.0.1",
+            "224.0.0.1",
+            "203.0.113.9",
+            "8.8.8.8",
+        ] {
+            let pure: SocketAddr = format!("{v4}:41641").parse().unwrap();
+            let mapped: SocketAddr = format!("[::ffff:{v4}]:41641").parse().unwrap();
+            assert_eq!(
+                probe_addr_acceptable(&mapped),
+                probe_addr_acceptable(&pure),
+                "mapped {v4} 与纯 v4 必须同判定"
+            );
+        }
+        // 负例（mapped 形态的拒绝面——改前全部被放行）
+        for bad in [
+            "[::ffff:10.0.0.1]:1",
+            "[::ffff:172.16.0.1]:1",
+            "[::ffff:192.168.1.1]:1",
+            "[::ffff:127.0.0.1]:1",
+            "[::ffff:169.254.1.1]:1",
+            "[::ffff:198.18.0.1]:1",
+            "[::ffff:100.64.0.1]:1",
+            "[::ffff:224.0.0.1]:1",
+        ] {
+            assert!(!probe_addr_acceptable(&bad.parse().unwrap()), "{bad} 应拒（同 v4 判定）");
+        }
+        // 正例：mapped 的全球单播收（与纯 v4 同判定）
+        assert!(probe_addr_acceptable(&"[::ffff:203.0.113.9]:41641".parse().unwrap()));
+        // 真 IPv6 不受归一影响（负例：回环/ULA/链路本地；正例：GUA）
+        assert!(!probe_addr_acceptable(&"[::1]:1".parse().unwrap()));
+        assert!(!probe_addr_acceptable(&"[fc00::1]:1".parse().unwrap()));
+        assert!(!probe_addr_acceptable(&"[fe80::1]:1".parse().unwrap()));
+        assert!(!probe_addr_acceptable(&"[ff02::1]:1".parse().unwrap()));
+        assert!(probe_addr_acceptable(&"[2001:db8::1]:41641".parse().unwrap()));
     }
 }

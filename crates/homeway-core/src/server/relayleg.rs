@@ -66,6 +66,16 @@ pub struct RelayArg {
 
 /// `ParseRelayArg`（serve.go:753-779 同义）：rl1 token（地址 + 鉴权密钥）或裸
 /// host:port（开放模式）。Direct 端点优先、无 Direct 用全端点；端点非 IP:port 报错。
+///
+/// **v4-mapped 归一（M2 代码门 G3，同类 D1）**：解析结果经 `unmap_v4_in6` 归一为
+/// 纯 v4/v6。`relay` 在本模块是**三处比较/键的基准**——①hint 源校验（`src.ip() !=
+/// relay.ip()`，Go `relayclient.go:78` 两侧 `.Unmap()`）②控制帧源全等判据（`src !=
+/// relay`）③中继数据腿远端构造（`SocketAddr::new(relay.ip(), sess.data_port)`，Go
+/// `relayctl.go:206` 显式 `relay.Addr().Unmap()`）。不归一时 `[::ffff:a.b.c.d]` 形态
+/// 的 `--relay`/token 端点与 socket 面（bind 读侧已 unmap）的纯 v4 源**永不相等** ⇒
+/// hint 恒被忽略、控制帧恒被忽略（注册腿静默失效）；出口 `relay_ep` 的地址串去重
+/// （`engine.rs` 的 `seen: HashSet<String>`）也会与直连端点形态错开。归一在**解析
+/// 一处收口**，下游三处比较/键随之全部成立。
 pub fn parse_relay_arg(v: &str) -> Result<RelayArg, String> {
     // （装配期一次性解析，错误文案直接面向 CLI 用户——保留 String 形态；运行期错误走 LegError）
     let v = v.trim();
@@ -89,12 +99,20 @@ pub fn parse_relay_arg(v: &str) -> Result<RelayArg, String> {
         let addr: SocketAddr = eps[0]
             .parse()
             .map_err(|_| format!("中继 token 端点 {:?} 不是 IP:port（先用带 IP 的 token）", eps[0]))?;
-        return Ok(RelayArg { addr, secret: Some(*tok.secret.as_bytes()) });
+        return Ok(RelayArg { addr: crate::udpbatch::unmap_v4_in6(addr), secret: Some(*tok.secret.as_bytes()) });
     }
     let addr: SocketAddr = v
         .parse()
         .map_err(|_| format!("{v:?} 既不是 host:port 也不是 rl1 token"))?;
-    Ok(RelayArg { addr, secret: None })
+    Ok(RelayArg { addr: crate::udpbatch::unmap_v4_in6(addr), secret: None })
+}
+
+/// hint 地址解析（`LegEvent::Hint` 的 addr 串；**不可信线索**，只做盲打触发器）。
+/// v4-mapped 归一（G3 同类）：盲打节流键 = `client.ip()`——不归一时同一地址的
+/// mapped/纯 v4 两形态各占一个桶（3s 节流被换形态绕过，也可让同一地址重复打）。
+/// 解析失败 = None（静默丢弃，Go 同义）。
+fn parse_hint_addr(addr: &str) -> Option<SocketAddr> {
+    addr.parse::<SocketAddr>().ok().map(crate::udpbatch::unmap_v4_in6)
 }
 
 // ---------- UDP 注册腿（relayclient.go） ----------
@@ -181,7 +199,7 @@ fn run_relay_leg(
                     (logf)(&format!("中继：忽略来自未知源 {src} 的地址线索（应为中继 {relay}）"));
                     continue;
                 }
-                if let Ok(ap) = addr.parse::<SocketAddr>() {
+                if let Some(ap) = parse_hint_addr(&addr) {
                     let _ = punch_tx.try_send(ap); // 队列满丢弃（hint 是消耗品）
                 }
             }
@@ -656,5 +674,51 @@ mod tests {
         // 环境错误形态
         assert!(parse_relay_arg("nonsense").is_err());
         assert!(parse_relay_arg("rl1AAAA").is_err());
+    }
+
+    /// M2 代码门 G3（D1 同类）：`--relay` 的 v4-mapped 形态归一为纯 v4。
+    /// 下游三处（hint 源校验 / 控制帧源全等 / 数据腿远端构造）都以本解析为基准——
+    /// socket 面源地址恒已 unmap 成纯 v4，不归一时 mapped 形态的 relay 永不匹配。
+    #[test]
+    fn parse_relay_arg_normalizes_v4_mapped() {
+        // 裸地址：mapped 与纯 v4 解析为同一形态
+        let mapped = parse_relay_arg("[::ffff:127.0.0.1]:42741").unwrap();
+        let pure = parse_relay_arg("127.0.0.1:42741").unwrap();
+        assert_eq!(mapped.addr, pure.addr);
+        assert_eq!(mapped.addr, "127.0.0.1:42741".parse().unwrap());
+        // 真 v6 / 公网 v4 原样
+        assert_eq!(
+            parse_relay_arg("[2001:db8::1]:42741").unwrap().addr,
+            "[2001:db8::1]:42741".parse().unwrap()
+        );
+        assert_eq!(parse_relay_arg("198.51.100.7:42741").unwrap().addr, "198.51.100.7:42741".parse().unwrap());
+        // rl1 token 端点同口径（Direct 优先分支）
+        let secret = [9u8; 32];
+        let tok = crate::relay::rltoken::encode_relay_token(
+            &secret,
+            &[crate::token::Endpoint {
+                addr: "[::ffff:127.0.0.1]:42742".into(),
+                kind: crate::token::EndpointKind::Direct,
+            }],
+        )
+        .unwrap();
+        let r = parse_relay_arg(&tok).unwrap();
+        assert_eq!(r.addr, "127.0.0.1:42742".parse().unwrap());
+        assert_eq!(r.secret, Some(secret));
+    }
+
+    /// G3 同类：中继 hint 解析归一（盲打节流键 = IP——mapped/纯 v4 必须同桶同目标）。
+    #[test]
+    fn hint_addr_normalizes_v4_mapped() {
+        let want: SocketAddr = "198.51.100.7:41641".parse().unwrap();
+        assert_eq!(parse_hint_addr("[::ffff:198.51.100.7]:41641"), Some(want));
+        assert_eq!(parse_hint_addr("198.51.100.7:41641"), Some(want));
+        assert_eq!(
+            parse_hint_addr("[2001:db8::2]:41641"),
+            Some("[2001:db8::2]:41641".parse().unwrap())
+        );
+        // 非 IP:port 静默丢弃（不可信线索）
+        assert_eq!(parse_hint_addr("不是地址"), None);
+        assert_eq!(parse_hint_addr("host.example:41641"), None);
     }
 }
