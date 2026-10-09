@@ -332,6 +332,12 @@ pub fn session_connect_target(
     dst: SocketAddrV4,
     budget: Duration,
 ) -> io::Result<Box<dyn BridgeStream>> {
+    // **环回归一（M4 §1.3 裁决 D-1 在 WG 腿内的落点）**：`PfDialTarget::ExitPort` 的 wire
+    // 语义 M4 起是「出口回环」（`portfwd::PfDialTarget::resolve`），而 WG 档的「出口本机」
+    // 只能经**隧道 IP** 表达（出口 intercept 的豁免臂 `dst == tunnel_ip ⇒ 出口 127.0.0.1`）
+    // ⇒ 环回目标在本腿替换；A1① 的「客户端不得把 127/8 当隧道内目标」约束**只在 WG 腿内**
+    // 继承，wire 语义不外泄。
+    let dst = wg_dial_addr(dst);
     let gen_client = run.current_client();
     // 装配期拨号（同上——pf 的 accept 线程只活在 attached 后，防御性收口）
     let gen_client = gen_client
@@ -340,8 +346,27 @@ pub fn session_connect_target(
     Ok(Box::new(SessionStream::shared(gen_client, id)))
 }
 
+/// WG 腿的目标归一：**环回 ⇒ 出口隧道 IP 的该端口**，其余原样。
+///
+/// **双栈期临时物（M4 §10-W10）**：M5 删 [`session_connect_target`] 时一并删——那时
+/// 「出口本机」只由 QUIC 档的 `127.0.0.1:p` 表达，本函数不再有调用点。
+fn wg_dial_addr(dst: SocketAddrV4) -> SocketAddrV4 {
+    if dst.ip().is_loopback() {
+        SocketAddrV4::new(crate::wgcore::SERVER_TUNNEL_IP, dst.port())
+    } else {
+        dst
+    }
+}
+
 /// portfwd 拨号缝的生产实现（`PfRuntime` 全注入面——闭包持 `Weak<GenRun>` 防 Arc 环：
 /// 世代收工后 `upgrade()` 失败 = 拨号失败如实收口（conn 线程记 fails + RST + 行））。
+///
+/// **分派（M4 §2.1）**：判据 = `l3_on_island()`（与桥拨号 `tun_exec.rs` 的 `BridgeHost`
+/// 构造处**同源同形**）——岛在世且 L3 在岛上 ⇒ QUIC 档（`STREAM[dial]`）；其余（WG 档 /
+/// 岛未就 / 岛已收回 / 单测合成世代）⇒ WG 腿。
+///
+/// **阀 / 两阶段 install / `FlowGuard` / 计数逐字保留（§2.3）**：承载差异**止于此闭包**
+/// （`PfDialFn` 签名与语义不变 ⇒ `admit_conn` 与 `pf_conn_thread` 一行不改）。
 fn pf_dial_via_run(
     run: &std::sync::Weak<GenRun>,
     dst: SocketAddrV4,
@@ -353,7 +378,11 @@ fn pf_dial_via_run(
             "世代已收工（拨号放弃）",
         ));
     };
-    session_connect_target(&r, dst, budget)
+    if r.l3_on_island() {
+        super::quic_stream::dial_target(&r, dst, budget)
+    } else {
+        session_connect_target(&r, dst, budget)
+    }
 }
 
 /// `ConnErr` → `io::Error` 的类型归因（评审 r2-M9：桥宿主的「出口活着、端口没服务」
@@ -2997,11 +3026,123 @@ mod tests {
         }
     }
 
+    /// **判据（M4 §1.3 裁决 D-1 的 WG 腿归一）**：环回 ⇒ **出口隧道 IP 的该端口**（WG 档的
+    /// 「出口本机」只能经隧道 IP 表达——出口 intercept 的豁免臂 `dst == tunnel_ip`）；其余
+    /// （含 `0.0.0.0`、私网、公网）**原样**——归一**不得加宽**（加宽 = 打死真目标）。
+    #[test]
+    fn wg_dial_addr_replaces_loopback_only() {
+        let tun = crate::wgcore::SERVER_TUNNEL_IP;
+        assert_eq!(
+            wg_dial_addr("127.0.0.1:8080".parse().unwrap()),
+            SocketAddrV4::new(tun, 8080),
+            "环回 ⇒ 隧道 IP（ExitPort 的 wire 语义在 WG 腿内的落点）"
+        );
+        assert_eq!(
+            wg_dial_addr("127.9.8.7:0".parse().unwrap()),
+            SocketAddrV4::new(tun, 0),
+            "127/8 任意地址 + 端口 0 原样带过（端口 0 的拒入是出口侧 A8 的面）"
+        );
+        for keep in ["0.0.0.0:1", "10.1.2.3:9", "8.8.8.8:53", "100.64.255.1:1"] {
+            let dst: SocketAddrV4 = keep.parse().unwrap();
+            assert_eq!(wg_dial_addr(dst), dst, "{keep} 必须原样（归一不加宽）");
+        }
+    }
+
+    /// **判据（M4 §2.1 的承载分派）**：`pf_dial_via_run` 按 `l3_on_island()` 走两条腿——
+    /// ① `false`（WG 档 / 岛未就 / 岛已收回 / 合成世代）⇒ **WG 腿**：错误面与
+    /// `session_connect_target` 逐字相同（且**不含** QUIC 腿的文本）；
+    /// ② `true` 且岛不在（`current_island() == None`：装配窗口）⇒ **QUIC 腿**：错误文本 =
+    /// 「QUIC 档端口转发无法拨号」⇒ 分派真按判据走，且 QUIC 分支**不触 WG 会话**。
+    ///
+    /// 结构化前提（§2.3）：两条腿的都只经 `PfDialFn` 与 pf 运行时接触 ⇒ 本用例的注入面
+    /// 就是 `pf` 生产闭包本身。
+    #[test]
+    fn pf_dial_dispatch_follows_l3_on_island() {
+        let (logf, _lines) = {
+            let (tx, rx) = mpsc::channel::<String>();
+            let l: Logf = Arc::new(move |s: &str| {
+                let _ = tx.send(s.to_owned());
+            });
+            (l, rx)
+        };
+        let run = Arc::new(GenRun::synthetic_for_test(logf));
+        let w = Arc::downgrade(&run);
+        let dst: SocketAddrV4 = "127.0.0.1:8080".parse().unwrap();
+        let budget = Duration::from_millis(20);
+        // `Box<dyn BridgeStream>` 不是 `Debug`（`expect_err` 用不了）⇒ 显式取错
+        fn err_of(r: io::Result<Box<dyn super::BridgeStream>>) -> io::Error {
+            match r {
+                Ok(_) => panic!("本用例的一切拨号都必须失败"),
+                Err(e) => e,
+            }
+        }
+
+        // ① WG 腿（默认 `l3_on_island = false`）：与 `session_connect_target` 同一条链
+        assert!(!run.l3_on_island(), "合成世代默认不在岛上");
+        let via_pf = err_of(pf_dial_via_run(&w, dst, budget));
+        let direct = err_of(session_connect_target(&run, dst, budget));
+        assert_eq!(
+            via_pf.to_string(),
+            direct.to_string(),
+            "WG 腿 = `session_connect_target` 逐字（承载差异只有那一行分派）"
+        );
+        assert!(
+            !via_pf.to_string().contains("QUIC 服务流"),
+            "WG 腿不得说 QUIC 面的话：{via_pf}"
+        );
+
+        // ② **岛在世但 `l3_on_island = false`**（岛未承接 L3 = 回落世代）⇒ 仍走 WG 腿
+        //    （判据 `l3_on_island()` = 标志位 **且** 岛在场；只有标志位为真才换轨）
+        let ident = crate::identity::Identity::ephemeral().expect("临时身份");
+        let cred = homeway_quic::IslandCredential::new(
+            homeway_quic::TokenSecret::from_bytes([7u8; 32]),
+            ident.public_key(),
+            *ident.dev_tag().as_bytes(),
+            homeway_quic::RpkPublicKey::from_bytes([9u8; 32]),
+        );
+        let mut icfg = homeway_quic::IslandConfig::new(cred);
+        icfg.bind = Some(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0));
+        let island = Arc::new(
+            homeway_quic::Island::start(
+                Arc::clone(&run.logf),
+                Arc::new(|_r: &str| {}),
+                icfg,
+            )
+            .expect("岛可起（只绑回环 :0，不建连）"),
+        );
+        run.set_island(Arc::clone(&island));
+        assert!(
+            !run.l3_on_island(),
+            "岛在场但标志位为假 ⇒ 判据仍为假（回落世代按 WG 跑）"
+        );
+        let e = err_of(pf_dial_via_run(&w, dst, budget));
+        assert_eq!(e.to_string(), direct.to_string(), "回落世代 ⇒ WG 腿逐字");
+
+        // ③ QUIC 腿（标志位为真 **且** 岛在场）：开流走真岛的命令面——无 live 连接 ⇒
+        //    `StreamErr::ConnectionLost` ⇒ QUIC 面归因（与 WG 面可区分 ⇒ 分派真的发生）
+        run.set_l3_on_island(true);
+        assert!(run.l3_on_island(), "两条件齐 ⇒ 判据为真");
+        let e = err_of(pf_dial_via_run(&w, dst, budget));
+        assert_eq!(e.kind(), io::ErrorKind::Other, "{e:?}");
+        assert!(
+            e.to_string().contains("QUIC 服务流"),
+            "QUIC 腿的归因串：{e}"
+        );
+        assert_ne!(e.to_string(), direct.to_string(), "两条腿可区分（分派真的发生）");
+        run.set_l3_on_island(false);
+        run.take_island();
+        island.stop();
+
+        // ④ 世代收工（Weak 升级失败）：既有语义逐字保留（不触任何承载）
+        drop(run);
+        let e = err_of(pf_dial_via_run(&w, dst, budget));
+        assert!(e.to_string().contains("世代已收工（拨号放弃）"), "{e}");
+    }
+
     /// Q-F-B F4-4：热替换 rc 回 Go 语义——活世代 ⇒ `0`（**真装表**）；无世代 / 换代
     /// （gen 不符）/ 收口（stop 位）⇒ `-1` 且**无孤儿监听器**。
     #[test]
-    fn request_port_forwards_rc_zero_with_live_gen_stale_minus_one() {
-        let (logf, _lines) = {
+    fn request_port_forwards_rc_zero_with_live_gen_stale_minus_one() {        let (logf, _lines) = {
             let (tx, rx) = mpsc::channel::<String>();
             let l: Logf = Arc::new(move |s: &str| {
                 let _ = tx.send(s.to_owned());

@@ -21,10 +21,12 @@
 //!    写走 §1.4 的 `n=0` 分级退避环（`tun_exec::write_retry_backoff` 同款）。
 
 use std::io::{self, Read, Write};
+use std::net::SocketAddrV4;
 use std::sync::mpsc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use homeway_quic::stream::DIAL_OK;
 use homeway_quic::{Cmd, Island, StreamErr, StreamId, StreamReply, StreamTag};
 
 use crate::Logf;
@@ -123,6 +125,124 @@ where
     open(remain)
 }
 
+/// QUIC 档 portfwd 的**拨号缝**（M4 §2.2）：开 `STREAM[dial]` ⇒ 写 6B 目标 ⇒ 等 **1B 回执**
+/// ⇒ 交付 `BridgeStream`（回执之后的余量**预置进读半缓冲**）。
+///
+/// 预算语义（§2.2，三步各自吃 `remain()`）：
+/// - ① 岛不在 ⇒ `NotConnected`（世代装配中/已收回——与 [`dial`] 同款文本）；
+/// - ② 开流**自有有界等待**（`remain()`；**不复用** [`open_stream`]——它的等回执预算 =
+///   `budget + OPEN_BUDGET(5s)`，会给出 `dialMs + 5s` 的假上界）⇒ `seam 总时长 ≤ dialMs`；
+/// - ③ 写 6B（走既有 [`QuicWriteHalf`] 的 `n=0` 分级退避环；**结构性事实**：开流瞬间待发队列
+///   必空且容量 64 KiB ≫ 6B ⇒ 单次写入 `n == 6`；不满足则 `WriteZero`——**不承担**
+///   「按 `&data[n..]` 重试」的隐含要求）；
+/// - ④ 回执读（`remain()`；**空块续读**、`Closed` **显式归「拨号失败」**——不得沿
+///   [`QuicReadHalf::read`] 的 `Closed ⇒ Ok(0)` 读成「成功但无回执」）。
+///
+/// **单次尝试（不重试）**：**不复用** [`dial_with`]（那是服务流策略：连接面失败重试一次）。
+/// Q-F-B D11 已定「pf 的常态拒绝不许触发恢复阶梯」；重试只会把「出口不在/目标拒绝」放大成
+/// 延时，且 pf 侧失败立刻 RST 给本机应用（浏览器自己会重连）——登记为策略面（§8 行 5）。
+///
+/// **RAII 关流（r19 H1，高危）**：岛内的流**只**由 `Cmd::StreamClose` 或连接死从在册表摘除，
+/// **对端 reset 不清表**；而额度判据是 `map.len() < 62` ⇒ 每条「回执 0x25/0x26」的失败拨号
+/// （= 常态：浏览器探测、目标没起）若不关流，就在长活连接上**永久漏一个槽**，62 条之后
+/// 同一连接上的 files/term/speedtest/dial 全部 `Busy`。故：**开流成功之后立即构造
+/// [`StreamShared`]**——此后任何失败路径靠 drop 关流（`Drop` 里的 `Cmd::StreamClose` 有界
+/// `EXIT_RPC_BUDGET`），成功路径把同一枚 `Arc` 交给 [`QuicStream`]。
+pub(crate) fn dial_target(
+    run: &Arc<GenRun>,
+    dst: SocketAddrV4,
+    budget: Duration,
+) -> io::Result<Box<dyn BridgeStream>> {
+    let island = run.current_island().ok_or_else(|| {
+        io::Error::new(
+            io::ErrorKind::NotConnected,
+            "世代装配中（数据面未就绪）——QUIC 档端口转发无法拨号",
+        )
+    })?;
+    let deadline = Instant::now().checked_add(budget);
+    let wait = remain(deadline).map_err(stream_err_to_io)?;
+    let id = island_stream_cmd(
+        &island,
+        |reply| Cmd::StreamOpen {
+            tag: StreamTag::Dial,
+            reply,
+        },
+        Some(wait),
+    )
+    .map_err(stream_err_to_io)?;
+    // ★ RAII 守卫：构造即接管「此后任何失败路径也要关流」（见本函数 doc 的 H1 段）
+    let shared = Arc::new(StreamShared { island, id });
+    write_dial_frame(&shared, dst)?;
+    let rest = read_dial_ack(deadline, |wait| {
+        island_stream_cmd(
+            &shared.island,
+            |reply| Cmd::StreamRead { id: shared.id, reply },
+            Some(wait),
+        )
+    })?;
+    Ok(Box::new(QuicStream::from_shared(shared).with_pending(rest)))
+}
+
+/// 剩余预算（§2.2 的 `remain()`）；≤0 ⇒ [`StreamErr::Timeout`]（快速失败，不越界等）。
+///
+/// `None` = `budget` 大到 `Instant` 装不下（`dial_ms` 是配置面，手改到天文数字时
+/// `Instant + Duration` 会 **panic**）⇒ 视为「无截止」，但每步 RPC 仍用一枚**有界**等待额
+/// （1h：远超一切真配置；岛内 `OPEN_BUDGET` 仍是最后一层兜底）。
+fn remain(deadline: Option<Instant>) -> Result<Duration, StreamErr> {
+    match deadline {
+        None => Ok(Duration::from_secs(3600)),
+        Some(d) => d
+            .checked_duration_since(Instant::now())
+            .filter(|r| !r.is_zero())
+            .ok_or(StreamErr::Timeout),
+    }
+}
+
+/// ③ 写 6B 目标帧（§2.2：`n == 6` 则成，否则 [`io::ErrorKind::WriteZero`]）。
+fn write_dial_frame(shared: &Arc<StreamShared>, dst: SocketAddrV4) -> io::Result<()> {
+    let frame = homeway_quic::stream::dial_target(dst);
+    let mut w = QuicWriteHalf {
+        shared: Arc::clone(shared),
+    };
+    let n = w.write(&frame)?;
+    if n != frame.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::WriteZero,
+            format!("QUIC 服务流：dial 目标帧只接纳 {n}/{}B", frame.len()),
+        ));
+    }
+    Ok(())
+}
+
+/// ④ 读 1B 回执（值空间穷举见 §2.2 的 ④ 表；返回**回执之后的余量**）。
+///
+/// `read` 注入成闭包（生产 = `Cmd::StreamRead` 的有界等待；单测注入假块）——值空间的每一行
+/// 都要有用例，而真块时序（空块 / 首块 > 1B / 对端 FIN）在真岛上不可控。
+fn read_dial_ack<F>(deadline: Option<Instant>, mut read: F) -> io::Result<Vec<u8>>
+where
+    F: FnMut(Duration) -> Result<Vec<u8>, StreamErr>,
+{
+    loop {
+        let wait = remain(deadline).map_err(stream_err_to_io)?;
+        match read(wait) {
+            // 空块（0B 的 STREAM 帧）：**不是**结束形态 ⇒ 预算内续读（不得 `[0]` 索引 ⇒ panic）
+            Ok(chunk) if chunk.is_empty() => continue,
+            // 成功：首字节 = DIAL_OK，其后即目标侧裸字节（**余量必须带回**，§1.2 铁律）
+            Ok(chunk) if chunk[0] == DIAL_OK => return Ok(chunk[1..].to_vec()),
+            // 首字节非法 = 协议面错（**不得**当 EOF/成功）
+            Ok(chunk) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("QUIC 服务流：dial 回执首字节非法（{:#04x}）", chunk[0]),
+                ))
+            }
+            // `Closed`（对端 FIN / 白名单外复位码 / `ConnectionLost`）**显式归拨号失败**
+            // （`stream_err_to_io(Closed)` = `Other` ⇒ pf 链 fails+1 + RST）
+            Err(e) => return Err(stream_err_to_io(e)),
+        }
+    }
+}
+
 /// QUIC 档的一条服务流连接（`BridgeStream`；应用层帧逐字节不变）。
 pub(crate) fn dial(
     run: &Arc<GenRun>,
@@ -186,13 +306,28 @@ impl Drop for StreamShared {
 /// QUIC 服务流整体（`BridgeStream`：拆两半给桥泵）。
 pub(crate) struct QuicStream {
     shared: Arc<StreamShared>,
+    /// 交付前**已在手**的余量（dial 缝的 1B 回执之后可能立刻跟目标字节 ⇒ 首块
+    /// `[0x01, payload…]`；余量丢失 = **应用层帧错位**，§1.2 铁律）。开流时为空。
+    pending: Vec<u8>,
 }
 
 impl QuicStream {
     fn new(island: Arc<Island>, id: StreamId) -> Self {
+        QuicStream::from_shared(Arc::new(StreamShared { island, id }))
+    }
+
+    /// 从既有共享体构造（dial 缝用它把已持的 RAII 守卫交给流本体）。
+    fn from_shared(shared: Arc<StreamShared>) -> Self {
         QuicStream {
-            shared: Arc::new(StreamShared { island, id }),
+            shared,
+            pending: Vec::new(),
         }
+    }
+
+    /// 预置读半缓冲（**余量保真**；见 `pending` 字段的 doc）。
+    fn with_pending(mut self, pending: Vec<u8>) -> Self {
+        self.pending = pending;
+        self
     }
 }
 
@@ -203,8 +338,7 @@ impl BridgeStream for QuicStream {
         Ok((
             Box::new(QuicReadHalf {
                 shared: Arc::clone(&self.shared),
-                buf: Vec::new(),
-                off: 0,
+                pending: PendingBuf::new(self.pending),
             }),
             Box::new(QuicWriteHalf {
                 shared: Arc::clone(&self.shared),
@@ -217,16 +351,42 @@ impl BridgeStream for QuicStream {
 /// `SessionReadHalf` 同形——桥泵据此收口）。
 struct QuicReadHalf {
     shared: Arc<StreamShared>,
+    /// 交付前已在手的余量（dial 缝的 1B 回执之后可能立刻跟目标字节）——**先于**任何岛命令
+    /// 吐出（见 [`PendingBuf`]）。
+    pending: PendingBuf,
+}
+
+/// 交付前余量的**先出**缓冲（`with_pending` 的载体）。
+///
+/// 单独成件（而不是裸 `buf/off` 字段）的唯一理由 = **可测**：这条不变量（余量先出、分次不丢、
+/// 空则转岛命令面）没有真岛就构造不出「首块 > 1B」的时序，而它一旦破了就是**应用层帧错位**
+/// （浏览器侧表现为「响应缺首字节」，极难定位——§1.2 铁律）。
+#[derive(Default)]
+struct PendingBuf {
     buf: Vec<u8>,
     off: usize,
 }
 
+impl PendingBuf {
+    fn new(buf: Vec<u8>) -> Self {
+        PendingBuf { buf, off: 0 }
+    }
+
+    /// 取一段（`None` = 余量已空 ⇒ 调用方转 `Cmd::StreamRead`）。
+    fn take(&mut self, out: &mut [u8]) -> Option<usize> {
+        if self.off >= self.buf.len() {
+            return None;
+        }
+        let n = (self.buf.len() - self.off).min(out.len());
+        out[..n].copy_from_slice(&self.buf[self.off..self.off + n]);
+        self.off += n;
+        Some(n)
+    }
+}
+
 impl Read for QuicReadHalf {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
-        if self.off < self.buf.len() {
-            let n = (self.buf.len() - self.off).min(out.len());
-            out[..n].copy_from_slice(&self.buf[self.off..self.off + n]);
-            self.off += n;
+        if let Some(n) = self.pending.take(out) {
             return Ok(n);
         }
         let id = self.shared.id;
@@ -234,8 +394,8 @@ impl Read for QuicReadHalf {
             Ok(data) => {
                 let n = data.len().min(out.len());
                 out[..n].copy_from_slice(&data[..n]);
-                self.buf = data;
-                self.off = n;
+                self.pending = PendingBuf::new(data);
+                self.pending.off = n;
                 Ok(n)
             }
             // 对端 FIN / 白名单外的复位 / 本端关流 ⇒ EOF（§1.6 的 EOF 同形性）
@@ -414,5 +574,107 @@ mod tests {
         };
         assert!(refused_like(StreamErr::NotSupported), "0x22 ⇒ not_supported 链不变");
         assert!(!refused_like(StreamErr::Busy), "0x23 不是 refused 面");
+    }
+
+    /// **判据（dial 回执值空间穷举，§2.2 的 ④ 表逐行）**：八行各有断言——
+    /// `[0x01,rest]` / 空块续读 / 首字节非 0x01 / `Busy` / `Refused` / `Timeout` /
+    /// `Closed`（**显式归拨号失败，不得读成 EOF/成功**）/ `ConnectionLost`；另加
+    /// `NotSupported/Unbound/BadTag` 的防御面。
+    #[test]
+    fn dial_ack_value_space_is_exhaustive() {
+        let far = Some(Instant::now() + Duration::from_secs(5));
+        let never = |_w: Duration| -> Result<Vec<u8>, StreamErr> { unreachable!("不应被调用") };
+
+        // ① `[0x01, rest…]` ⇒ 成功 + **余量原样带回**（1 字节不丢；§1.2 铁律）
+        let rest = read_dial_ack(far, |_w| Ok(vec![DIAL_OK, b'a', b'b', b'c'])).expect("成功");
+        assert_eq!(rest, b"abc", "回执之后的余量必须逐字节带回");
+        let rest = read_dial_ack(far, |_w| Ok(vec![DIAL_OK])).expect("成功");
+        assert!(rest.is_empty(), "只有回执 = 空余量");
+
+        // ② 空块（0B 的 STREAM 帧）⇒ **预算内续读**（不得 `[0]` 索引 panic）
+        let mut calls = 0;
+        let rest = read_dial_ack(far, |_w| {
+            calls += 1;
+            match calls {
+                1 | 2 => Ok(Vec::new()),
+                _ => Ok(vec![DIAL_OK, 9]),
+            }
+        })
+        .expect("空块后续读到回执");
+        assert_eq!(rest, vec![9]);
+        assert_eq!(calls, 3, "空块不是结束形态");
+
+        // ③ 首字节非 0x01 ⇒ InvalidData（协议面错）
+        let e = read_dial_ack(far, |_w| Ok(vec![0x22, 1, 2])).expect_err("非法首字节");
+        assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e:?}");
+        assert!(e.to_string().contains("dial 回执首字节非法"), "{e}");
+
+        // ④ 岛内快速失败 / 出口复位码 / 空面：逐行映射
+        for (se, kind) in [
+            (StreamErr::Busy, io::ErrorKind::Other),
+            (StreamErr::Refused, io::ErrorKind::ConnectionRefused),
+            (StreamErr::Timeout, io::ErrorKind::TimedOut),
+            (StreamErr::ConnectionLost, io::ErrorKind::Other),
+            (StreamErr::NotSupported, io::ErrorKind::ConnectionRefused),
+            (StreamErr::Unbound, io::ErrorKind::Other),
+            (StreamErr::BadTag, io::ErrorKind::Other),
+        ] {
+            let e = read_dial_ack(far, |_w| Err(se)).expect_err("必须归错");
+            assert_eq!(e.kind(), kind, "{se:?} 的 io kind");
+        }
+        // ⑤ `Closed`（对端 FIN / 白名单外复位 / ConnectionLost）⇒ **显式拨号失败**
+        //    （**不得**沿读半的 `Closed ⇒ Ok(0)` 读成「成功无回执」）
+        let e = read_dial_ack(far, |_w| Err(StreamErr::Closed)).expect_err("Closed 必须是失败");
+        assert_eq!(e.kind(), io::ErrorKind::Other);
+        assert!(
+            e.to_string().contains("服务流已关闭"),
+            "Closed 的归因串：{e}"
+        );
+
+        // ⑥ 预算耗尽（deadline 已过）⇒ 不再调 read，直接 TimedOut
+        let past = Some(Instant::now() - Duration::from_millis(1));
+        let e = read_dial_ack(past, never).expect_err("预算耗尽");
+        assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e:?}");
+    }
+
+    /// **判据（`remain()` 的两形态）**：未到点 ⇒ 剩余额；到点/已过 ⇒ `Timeout`；
+    /// `None`（配置面给到 `Instant` 装不下的预算）⇒ 一枚**有界**等待额（不 panic、不无限挂）。
+    #[test]
+    fn remain_is_bounded_and_never_panics() {
+        let now = Instant::now();
+        let r = remain(Some(now + Duration::from_secs(5))).expect("未到点");
+        assert!(r <= Duration::from_secs(5) && r > Duration::from_secs(4), "{r:?}");
+        assert_eq!(remain(Some(now)).err(), Some(StreamErr::Timeout), "零剩余");
+        assert_eq!(
+            remain(Some(now - Duration::from_millis(1))).err(),
+            Some(StreamErr::Timeout),
+            "已过点"
+        );
+        // 溢出防御：`dial_ms` 是配置面 ⇒ `Instant + Duration` 会 panic 的输入不得进到加法
+        assert!(Instant::now().checked_add(Duration::MAX).is_none(), "前提：MAX 装不下");
+        assert!(remain(None).is_ok(), "无截止 ⇒ 仍有界等待");
+    }
+
+    /// **判据（余量保真：读半先给余量、分次不丢、空则转岛命令面）**：`[0x01, 3B]` 同块
+    /// 形态 ⇒ 读半先吐 3B（**在**任何岛命令之前）；`out` 比余量小时分次吐且字节序不变。
+    #[test]
+    fn pending_prefix_goes_first_and_never_loses_a_byte() {
+        let mut p = PendingBuf::new(b"xyz".to_vec());
+        let mut out = [0u8; 8];
+        assert_eq!(p.take(&mut out), Some(3), "余量先出（3B 全额）");
+        assert_eq!(&out[..3], b"xyz");
+        assert_eq!(p.take(&mut out), None, "余量空 ⇒ 转岛命令面（`Cmd::StreamRead`）");
+
+        // 分次取（`out` 小于余量）：逐段吐出、顺序不变、总长不变
+        let mut p = PendingBuf::new(b"abcdef".to_vec());
+        let mut got = Vec::new();
+        let mut one = [0u8; 4];
+        while let Some(n) = p.take(&mut one) {
+            got.extend_from_slice(&one[..n]);
+        }
+        assert_eq!(got, b"abcdef", "分次读取不丢字节、不乱序");
+        // 空余量（无回执余量的常规开流）⇒ 直接就 None
+        let mut p = PendingBuf::new(Vec::new());
+        assert_eq!(p.take(&mut out), None);
     }
 }
