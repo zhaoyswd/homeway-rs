@@ -40,6 +40,15 @@ pub(crate) fn quic_mtu_raw() -> Option<&'static str> {
         .as_deref()
 }
 
+/// `HOMEWAY_QUIC_ADMIT_RETRY`（M2 设计 §3.2 表末的排障开关）**原始串**；解析/记行同在
+/// `server::quic_admit::resolve_retry_policy`（理由同 [`transport_raw`]：非法值要
+/// 「记行 + 按缺省走」，而记行需要世代日志面）。
+pub(crate) fn quic_admit_retry_raw() -> Option<&'static str> {
+    static V: OnceLock<Option<String>> = OnceLock::new();
+    V.get_or_init(|| std::env::var("HOMEWAY_QUIC_ADMIT_RETRY").ok())
+        .as_deref()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

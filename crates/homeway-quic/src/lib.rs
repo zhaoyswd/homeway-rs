@@ -75,9 +75,12 @@ pub use config::{
     QUIC_MTU_CAP_MAX, QUIC_MTU_CAP_MIN,
 };
 pub use driver::{Island, IslandTx};
+/// `serve.quic_admit` 段的已解析形态（M2 §3.2 六行七键；**纯 std**——同步面（`homeway-core`
+/// 的配置层与装配点）直接读它，值域校验只有 [`AdmitLimits::validate`] 一处真源）。
+pub use exit::admit::AdmitLimits;
 pub use exit::{
     ExitInbound, ExitQuic, ExitQuicConfig, ExitQuicErr, ExitQuicSnapshot, ExitSend, Reg4Request,
-    Reg4Verdict, RejectWhy, FRAME_KIND_QUIC,
+    Reg4Verdict, RejectWhy, RetryPolicy, FRAME_KIND_QUIC,
 };
 // 帧层的**构造面**（组帧/解帧真源）：出口面校验与客户端组帧共用它；同步面（`homeway-core`
 // 的引擎与其测试）也用它——**不得**在消费侧另写一份标签顺序。

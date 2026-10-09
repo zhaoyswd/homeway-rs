@@ -1506,7 +1506,9 @@ fn test_face_ctx(logf: Logf) -> Arc<FaceCtx> {
     wake_rx.set_nonblocking(true).unwrap();
     let (out_tx, _out_rx) = tokio::sync::mpsc::channel(1);
     let bridge = Arc::new(ExitBridge::new(Arc::clone(&stats), logf, wake_tx, wake_rx, out_tx));
-    Arc::new(FaceCtx {
+    Arc::new(FaceCtx { proof_gate: std::sync::Arc::new(std::sync::Mutex::new(
+        crate::exit::admit::ProofGate::new(crate::exit::admit::PROOF_FAIL_THRESHOLD_DEFAULT),
+    )),
         stats,
         bridge,
         logf: Arc::new(|_| {}),

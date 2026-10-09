@@ -21,6 +21,7 @@
 //! 隔离：本目录（`src/exit/**`）属**异步面**——`tools/check-quic-isolation.sh` 第 ② 条
 //! 的白名单与 `driver.rs` 同款（其余 `src/` 文件零异步栈名字）。
 
+pub(crate) mod admit;
 mod bridge;
 mod conn;
 pub(crate) mod rpk;
@@ -53,6 +54,7 @@ use bridge::{DropKind, ExitBridge, Outbound, OUTBOUND_QUEUE_MAX};
 use socket::{ExitSock, LegTable};
 
 /// 两向边界的公面（引擎消费面）：入站事件 + 准入请求/裁决 + 出站投递结果。
+pub use admit::RetryPolicy;
 pub use bridge::{ExitInbound, ExitSend, Reg4Request, Reg4Verdict, RejectWhy};
 /// 腿帧 kind=5（QUIC 载荷）的线字节：真源 = `homeway-core` 的
 /// `wtransport::frame::FrameKind::Quic`；本 crate 是叶子、按字节复刻，跨 crate 一致性由
@@ -70,6 +72,9 @@ pub(crate) struct FaceCtx {
     pub(crate) nonce_ttl: Duration,
     /// 连接总数上限（`2 × max_devices`；挑战行的「在途未认证 n/cap」分母）。
     pub(crate) conn_cap: usize,
+    /// 证明失败闸（M2 §3.2-⑥；主循环建、每连接任务读写——任务与主循环同线程，
+    /// `Mutex` 只为通过 `Arc` 共享）。
+    pub(crate) proof_gate: Arc<Mutex<admit::ProofGate>>,
 }
 
 /// QUIC 面线程名（与岛 `homeway-quic` 区分：这是**出口侧**的那一枚）。
@@ -118,10 +123,22 @@ pub struct ExitQuicConfig {
     pub admit_deadline: Duration,
     /// nonce 有效期（缺省 [`DEFAULT_NONCE_TTL`]；M2 §1.3 的双期限之二，同上）。
     pub nonce_ttl: Duration,
+    /// Retry token 有效期（缺省 [`admit::RETRY_TOKEN_LIFETIME_DEFAULT`] = 5s，**收自 quinn
+    /// 缺省 15s**，M2 §3.1 登记；值域 `1s..=60s`）。
+    pub retry_token_lifetime: Duration,
+    /// 每源滑动窗上限（缺省 [`admit::PER_SRC_FAILS_DEFAULT`] = 10；值域 `1..=1000`）。
+    pub per_src_fails: u32,
+    /// 每源滑动窗窗长（缺省 [`admit::PER_SRC_WINDOW_DEFAULT`] = 10s；值域 `1s..=1h`）。
+    pub per_src_window: Duration,
+    /// 证明失败闸阈值（缺省 [`admit::PROOF_FAIL_THRESHOLD_DEFAULT`] = 10；`0` = 关闭该闸）。
+    pub proof_fail_threshold: u32,
+    /// Retry 策略（缺省 [`RetryPolicy::Pressure`] = 压力触发，M2 §3.1 推荐档）。
+    pub retry_policy: RetryPolicy,
 }
 
 impl ExitQuicConfig {
-    /// 生产缺省（seed 与设备表上限由调用侧给；Q-O 的两个上限与 M2 的双期限取设计定值）。
+    /// 生产缺省（seed 与设备表上限由调用侧给；Q-O 的两个上限、M2 的双期限与 §3 的抗放大
+    /// 初值全取设计定值——`serve.quic_admit` 的显式配置覆盖在 `homeway-core` 装配点叠加）。
     pub fn new(rpk_seed: Ed25519Seed, max_devices: usize) -> Self {
         Self {
             rpk_seed,
@@ -130,12 +147,30 @@ impl ExitQuicConfig {
             handshake_deadline: DEFAULT_HANDSHAKE_DEADLINE,
             admit_deadline: DEFAULT_ADMIT_DEADLINE,
             nonce_ttl: DEFAULT_NONCE_TTL,
+            retry_token_lifetime: admit::RETRY_TOKEN_LIFETIME_DEFAULT,
+            per_src_fails: admit::PER_SRC_FAILS_DEFAULT,
+            per_src_window: admit::PER_SRC_WINDOW_DEFAULT,
+            proof_fail_threshold: admit::PROOF_FAIL_THRESHOLD_DEFAULT,
+            retry_policy: RetryPolicy::Pressure,
         }
     }
 
     /// 连接总数上限（`2 × max_devices`，§9.3 Q-O；饱和乘防溢出）。
     fn conn_cap(&self) -> usize {
         self.max_devices.saturating_mul(2)
+    }
+
+    /// 叠加 `serve.quic_admit` 的显式配置（M2 §3.2；缺省 = [`admit::AdmitLimits::default`]，
+    /// 与 [`Self::new`] 逐值相同 ⇒ 缺省不改行为）。
+    pub fn with_admit(mut self, limits: admit::AdmitLimits) -> Self {
+        self.retry_token_lifetime = limits.retry_token_lifetime;
+        self.per_src_fails = limits.per_src_fails;
+        self.per_src_window = limits.per_src_window;
+        self.nonce_ttl = limits.nonce_ttl;
+        self.admit_deadline = limits.admit_deadline;
+        self.proof_fail_threshold = limits.proof_fail_threshold;
+        self.retry_policy = limits.retry_policy;
+        self
     }
 }
 
@@ -186,6 +221,12 @@ pub struct ExitQuicSnapshot {
     /// 准入总期限到点（连接被采纳起 `ADMIT_DEADLINE` 内未走完四帧 ⇒ 弃连接——含
     /// 「握手完成但不发 Hello」，设计门 r14 F3）。
     pub admit_timeouts: u64,
+    /// 已发出的 **Retry**（地址校验挑战）包数（M2 §3.1 观测面；生产者 = S3）。
+    pub retry_sent: u64,
+    /// 每源闸拒绝的连接尝试数（M2 §3.2-④/§3.3；生产者 = S3——「重连洪泛有界」的主计数）。
+    pub flood_refused: u64,
+    /// 证明失败闸**进入冷却**的次数（M2 §3.2-⑥；行「证明失败闸」的节流计数源）。
+    pub proof_cooldowns: u64,
     /// 丢弃：超限（内层包 > `max_datagram_size()`）。
     pub drop_too_large: u64,
     /// 丢弃：发送缓冲满（per-conn 预检不过 ∨ 引擎→面出站队列满）。
@@ -214,6 +255,9 @@ pub(crate) struct ExitStats {
     proof_rejected: AtomicU64,
     pending_expired: AtomicU64,
     admit_timeouts: AtomicU64,
+    retry_sent: AtomicU64,
+    flood_refused: AtomicU64,
+    proof_cooldowns: AtomicU64,
     drop_too_large: AtomicU64,
     drop_send_buffer_full: AtomicU64,
     drop_unregistered: AtomicU64,
@@ -238,6 +282,9 @@ impl ExitStats {
             proof_rejected: self.proof_rejected.load(Ordering::SeqCst),
             pending_expired: self.pending_expired.load(Ordering::SeqCst),
             admit_timeouts: self.admit_timeouts.load(Ordering::SeqCst),
+            retry_sent: self.retry_sent.load(Ordering::SeqCst),
+            flood_refused: self.flood_refused.load(Ordering::SeqCst),
+            proof_cooldowns: self.proof_cooldowns.load(Ordering::SeqCst),
             drop_too_large: self.drop_too_large.load(Ordering::SeqCst),
             drop_send_buffer_full: self.drop_send_buffer_full.load(Ordering::SeqCst),
             drop_unregistered: self.drop_unregistered.load(Ordering::SeqCst),
@@ -544,7 +591,8 @@ fn run_exit(
     };
     rt.block_on(async move {
         // ---- 服务端身份（出口 RPK：RFC 7250；私钥种子 → PKCS#8 → SPKI 出示）----
-        let (server_cfg, rpk_public_key) = match rpk::server_config(&cfg.rpk_seed) {
+        // `retry_token_lifetime` 随服务端配置下发（§3.1：收自 quinn 缺省 15s 到 5s）。
+        let (server_cfg, rpk_public_key) = match rpk::server_config(&cfg.rpk_seed, cfg.retry_token_lifetime) {
             Ok(v) => v,
             Err(e) => {
                 let _ = ready_tx.send(Err(ExitQuicErr::Identity(e)));
@@ -600,6 +648,24 @@ fn run_exit(
             transport::INITIAL_MTU,
             transport::DATAGRAM_BUFFER
         ));
+        // ---- 抗放大面生效值（§3.2；`always` 档的代价记行 = §5-11 登记项）----
+        (*logf)(&format!(
+            "quic: 抗放大面（retry={}；retry_token_lifetime={:?}；每源 {}/{:?}；证明失败闸 {}）",
+            cfg.retry_policy.text(),
+            cfg.retry_token_lifetime,
+            cfg.per_src_fails,
+            cfg.per_src_window,
+            if cfg.proof_fail_threshold == 0 {
+                "关闭".to_owned()
+            } else {
+                cfg.proof_fail_threshold.to_string()
+            }
+        ));
+        if cfg.retry_policy == RetryPolicy::Always {
+            (*logf)(&format!(
+                "⚠️ quic: retry_policy=always —— 常态每次建连/重连 +1 RTT（真机 LTE ≈50ms；§3.1 登记的代价，仅排障用）"
+            ));
+        }
         if ready_tx.send(Ok((local_addr, rpk_public_key))).is_err() {
             return; // 调用侧已放弃（start 失败路径）——直接收摊
         }
@@ -611,6 +677,9 @@ fn run_exit(
         let mut tasks: JoinSet<()> = JoinSet::new();
         let mut next_conn_id: u64 = 1;
         let conn_cap = cfg.conn_cap();
+        // ---- 抗放大闸表（M2 §3.2-④/§3.2-⑥；纯 std，主循环线程独占 `src_gate`）----
+        let mut src_gate = admit::SrcGate::new(cfg.per_src_fails, cfg.per_src_window);
+        let proof_gate = Arc::new(Mutex::new(admit::ProofGate::new(cfg.proof_fail_threshold)));
         let ctx = Arc::new(FaceCtx {
             stats: Arc::clone(stats),
             bridge: Arc::clone(bridge),
@@ -618,6 +687,7 @@ fn run_exit(
             admit_deadline: cfg.admit_deadline,
             nonce_ttl: cfg.nonce_ttl,
             conn_cap,
+            proof_gate: Arc::clone(&proof_gate),
         });
         loop {
             tokio::select! {
@@ -625,42 +695,97 @@ fn run_exit(
                 inc = endpoint.accept() => match inc {
                     Some(incoming) => {
                         let peer = incoming.remote_address();
-                        // 闸①：连接总数（**口径收紧一档**：存活连接 + 在途握手一起算——
-                        // 否则「在途握手转正」会把上限撑破；§9.3 Q-O 的原义只写了连接总数）
-                        let held = (conns.len() + handshakes.len()) as u64;
-                        if held >= conn_cap as u64 {
+                        let now = Instant::now();
+                        // ============== 抗放大（M2 §3.1/§3.2）：先闸后 Retry ==============
+                        // ① 每源滑动窗闸（§3.2-④；键 = v4 /32、v6 /64 前缀）。顺序裁决
+                        //    （§3.1）：**先闸（廉价、本地）后 Retry**——闸拒绝 = `refuse()`
+                        //    发 CONNECTION_REFUSED，同样不给攻击者建立状态。
+                        let gate_out = src_gate.attempt(now, peer);
+                        if gate_out.action == admit::SrcAction::Refuse {
                             incoming.refuse();
-                            let n = stats.conn_refused.fetch_add(1, Ordering::SeqCst) + 1;
+                            let n = stats.flood_refused.fetch_add(1, Ordering::SeqCst) + 1;
                             if log_due(n) {
                                 (*logf)(&format!(
-                                    "quic: 拒新连接（连接总数 {held}/{conn_cap} 超限，来自 {peer}；第 {n} 次）"
-                                ));
-                            }
-                        } else if handshakes.len() >= cfg.handshake_cap {
-                            // 闸②：并发握手上限（Q-O 的 64；M2 的抗放大面还没来）
-                            incoming.refuse();
-                            let n = stats.handshake_refused.fetch_add(1, Ordering::SeqCst) + 1;
-                            if log_due(n) {
-                                (*logf)(&format!(
-                                    "quic: 拒新连接（并发握手 {}/{cap} 超限，来自 {peer}；第 {n} 次）",
-                                    handshakes.len(),
-                                    cap = cfg.handshake_cap
+                                    "quic: 握手洪泛拒绝（{src:?} 在 {win:?} 内第 {k} 次尝试——已拒；第 {n} 次）",
+                                    src = admit::SrcKey::of(peer),
+                                    win = cfg.per_src_window,
+                                    k = gate_out.in_window
                                 ));
                             }
                         } else {
-                            // 闸③：握手期限（到点即弃；丢 `Connecting` = quinn 侧关连接）
-                            let deadline = cfg.handshake_deadline;
-                            stats.handshakes_in_flight.fetch_add(1, Ordering::SeqCst);
-                            handshakes.spawn(async move {
-                                match incoming.accept() {
-                                    Ok(connecting) => match tokio::time::timeout(deadline, connecting).await {
-                                        Ok(Ok(conn)) => HandshakeOutcome::Accepted(peer, conn),
-                                        Ok(Err(_e)) => HandshakeOutcome::Failed(peer),
-                                        Err(_) => HandshakeOutcome::Deadline(peer),
-                                    },
-                                    Err(_e) => HandshakeOutcome::Failed(peer),
+                            // ② Retry 决策（§3.1 三条；`never` 档恒假、`always` 档恒真）：
+                            //    ① 未认证在途 ≥ handshake_cap/2 ② 同源「未完成/被拒」≥5
+                            //    ③ 窗内有闸拒绝。三条都按「未完成/被拒」计数 ⇒ 常态赛跑不吃
+                            //    +1 RTT（r14 F10）。
+                            let inflight = conns.len().saturating_sub(bridge.bound_count());
+                            let due = admit::retry_due(
+                                cfg.retry_policy,
+                                inflight,
+                                cfg.handshake_cap,
+                                src_gate.pending(now, peer),
+                                src_gate.refused_recently(now),
+                            );
+                            // 守卫（r14 F19）：用 `!validated() && may_retry()` 避免进 `Err`；
+                            // 真进了 `Err` 也**必须** `into_incoming()` 取回——直接丢错误值会连带
+                            // drop `Incoming` ⇒ 隐式 `refuse()`（假拒绝）。
+                            let incoming = if due
+                                && !incoming.remote_address_validated()
+                                && incoming.may_retry()
+                            {
+                                match incoming.retry() {
+                                    Ok(()) => {
+                                        let n = stats.retry_sent.fetch_add(1, Ordering::SeqCst) + 1;
+                                        if log_due(n) {
+                                            (*logf)(&format!(
+                                                "quic: 地址校验挑战（{peer}；在途未认证 {inflight}/{conn_cap}；第 {n} 次）"
+                                            ));
+                                        }
+                                        None
+                                    }
+                                    Err(e) => Some(e.into_incoming()),
                                 }
-                            });
+                            } else {
+                                Some(incoming)
+                            };
+                            if let Some(incoming) = incoming {
+                                // 闸①：连接总数（**口径收紧一档**：存活连接 + 在途握手一起算——
+                                // 否则「在途握手转正」会把上限撑破；§9.3 Q-O 的原义只写了连接总数）
+                                let held = (conns.len() + handshakes.len()) as u64;
+                                if held >= conn_cap as u64 {
+                                    incoming.refuse();
+                                    let n = stats.conn_refused.fetch_add(1, Ordering::SeqCst) + 1;
+                                    if log_due(n) {
+                                        (*logf)(&format!(
+                                            "quic: 拒新连接（连接总数 {held}/{conn_cap} 超限，来自 {peer}；第 {n} 次）"
+                                        ));
+                                    }
+                                } else if handshakes.len() >= cfg.handshake_cap {
+                                    // 闸②：并发握手上限（Q-O 的 64）
+                                    incoming.refuse();
+                                    let n = stats.handshake_refused.fetch_add(1, Ordering::SeqCst) + 1;
+                                    if log_due(n) {
+                                        (*logf)(&format!(
+                                            "quic: 拒新连接（并发握手 {}/{cap} 超限，来自 {peer}；第 {n} 次）",
+                                            handshakes.len(),
+                                            cap = cfg.handshake_cap
+                                        ));
+                                    }
+                                } else {
+                                    // 闸③：握手期限（到点即弃；丢 `Connecting` = quinn 侧关连接）
+                                    let deadline = cfg.handshake_deadline;
+                                    stats.handshakes_in_flight.fetch_add(1, Ordering::SeqCst);
+                                    handshakes.spawn(async move {
+                                        match incoming.accept() {
+                                            Ok(connecting) => match tokio::time::timeout(deadline, connecting).await {
+                                                Ok(Ok(conn)) => HandshakeOutcome::Accepted(peer, conn),
+                                                Ok(Err(_e)) => HandshakeOutcome::Failed(peer),
+                                                Err(_) => HandshakeOutcome::Deadline(peer),
+                                            },
+                                            Err(_e) => HandshakeOutcome::Failed(peer),
+                                        }
+                                    });
+                                }
+                            }
                         }
                     }
                     None => break,
@@ -668,7 +793,10 @@ fn run_exit(
                 Some(joined) = handshakes.join_next(), if !handshakes.is_empty() => {
                     stats.handshakes_in_flight.fetch_sub(1, Ordering::SeqCst);
                     match joined {
-                        Ok(HandshakeOutcome::Accepted(_peer, conn)) => {
+                        Ok(HandshakeOutcome::Accepted(peer, conn)) => {
+                            // 闸④ 销账（§3.1-② / r14 F10）：**握手被采纳的尝试不计数** ⇒
+                            // 多候选正常赛跑（其余候选完成/被关闭）不会攒满每源闸。
+                            src_gate.completed(peer);
                             stats.admitted.fetch_add(1, Ordering::SeqCst);
                             let conn_id = next_conn_id;
                             next_conn_id += 1;
@@ -679,7 +807,8 @@ fn run_exit(
                             stats.connections.store(conns.len() as u64, Ordering::SeqCst);
                         }
                         // 握手失败（错 RPK / 对端放弃）：明细记行与四类丢弃计数归 E-q3——
-                        // 握手面失败留在本总计数（客户端钉定判据的证据面）
+                        // 握手面失败留在本总计数（客户端钉定判据的证据面）。
+                        // 闸④：**未完成**的尝试留在窗内（不销账）——它们正是触发②/③的输入。
                         Ok(HandshakeOutcome::Failed(_peer)) => {
                             stats.handshake_failed.fetch_add(1, Ordering::SeqCst);
                         }

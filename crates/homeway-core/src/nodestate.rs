@@ -266,6 +266,14 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# homeway 配置（L1 意图层，唯�
 #           dns_probe_target 一键喂挑卡/健康探针/udpcap 三路；stun_probe_target 须带端口)
 #   [[serve.ddns]] domain = "裸域名"（可多条；出口只读解析，记录由外部 DDNS 维护）
 #   [serve.tx_shape] 发送整形（rate_mbps/burst_kb；缺省 = 产品默认 200MiB/s+256KiB，HOMEWAY_TX_SHAPING=off 整套关）
+#   [serve.quic_admit] 抗放大闸（M2 §3.2 六行七键；省略本节省略即不变——缺省 = 设计定值）：
+#           retry_token_lifetime(时长串 1s-60s，缺省 5s；Retry token 有效期) /
+#           per_src_fails(1-1000，缺省 10；每源滑动窗的未完成/被拒上限) /
+#           per_src_window(时长串 1s-1h，缺省 10s) / nonce_ttl(时长串 1s-30s，缺省 5s) /
+#           admit_deadline(时长串 1s-60s，缺省 10s) /
+#           proof_fail_threshold(0-1000，缺省 10；0 = 关闭该闸) /
+#           retry_policy(pressure|always|never，缺省 pressure；always = 常态每次建连 +1 RTT，仅排障)
+#           **值域非法 ⇒ 拒启**（serve 节严格表纪律）；env HOMEWAY_QUIC_ADMIT_RETRY 非法 ⇒ 记行 + 缺省
 #   [relay] enabled / listen(":41741") / advertise(逗号分隔，空=自动探测)
 # 客户端角色无配置节（随进程常开）；host 表在 <state>/client/hosts.json（不进 config）。
 

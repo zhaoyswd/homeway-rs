@@ -39,8 +39,10 @@ use crate::reg4::{
     self, AcceptFrame, ChallengeFrame, FrameHead, HelloFrame, Nonce, ProofFrame, RefreshFrame,
     Reg4Frame,
 };
+use crate::sync_util::lock_unpoison;
 
-use super::bridge::{Bound, DropKind, ExitInbound, Reg4Request, Reg4Verdict, dev_short};
+use super::admit::{PROOF_FAIL_COOLDOWN, PROOF_FAIL_WINDOW};
+use super::bridge::{Bound, DropKind, ExitInbound, Reg4Request, Reg4Verdict, RejectWhy, dev_short};
 use super::{FaceCtx, log_due};
 
 /// 发送结果（测试面：`Dropped` 与计数一一对应）。
@@ -205,6 +207,21 @@ async fn admit(
         return Admitted::Rejected;
     };
 
+    // ---- 证明失败闸（§3.2-⑥）：冷却期内**不再发 Challenge**（拒 Hello，r14 F12）----
+    {
+        let cooling = lock_unpoison(&ctx.proof_gate).is_cooling(Instant::now(), hello.dev_tag);
+        if cooling {
+            reject(
+                ctx,
+                conn,
+                &hello.dev_tag,
+                "证明失败闸冷却中（同 dev 短时多次 nonce/MAC 类失败——暂不发挑战）",
+                Counter::BeforeChallenge,
+            );
+            return Admitted::Rejected;
+        }
+    }
+
     // ---- 生成 nonce + 写 Challenge（**不触碰设备表、不投引擎**）----
     let nonce = match Nonce::generate() {
         Ok(n) => n,
@@ -274,6 +291,7 @@ async fn admit(
     let ok_nonce =
         proof.nonce.ct_eq(&pending.nonce) && pending.issued_at.elapsed() <= ctx.nonce_ttl;
     if !ok_nonce {
+        note_proof_fail(ctx, &proof.dev_tag); // §3.2-⑥：nonce 类失败进证明失败闸
         reject(ctx, conn, &proof.dev_tag, "nonce 缺失/过期/已消费", Counter::AtProof);
         return Admitted::Rejected;
     }
@@ -300,9 +318,32 @@ async fn admit(
             Admitted::Bound
         }
         Reg4Verdict::Rejected { why } => {
+            // §3.2-⑥ 的计数集 = nonce/MAC 类；**引擎裁决拒绝（表满/冲突/吊销/窗超）
+            // 一律不计数**（r14 F12：可用性故障不得被放大成冷却锁死）
+            if why == RejectWhy::MacMismatch {
+                note_proof_fail(ctx, &proof.dev_tag);
+            }
             reject(ctx, conn, &proof.dev_tag, why.text(), Counter::AtProof);
             Admitted::Rejected
         }
+    }
+}
+
+/// 记一次 **nonce/MAC 类**失败（设计 §3.2-⑥ 的计数集；调用点 = nonce 判负与
+/// `MacMismatch` 裁决两处，引擎裁决拒绝不在此列）。
+///
+/// 跨过阈值时打「证明失败闸」行（行文照 §3.3 的可观测行；计数与快照 `proof_cooldowns`
+/// 同源）。本函数**只在准入路径**被调用：冷却的效果是「不再发 Challenge」，故输入也只取
+/// 准入面的 nonce/MAC 类失败（刷新路径的 MAC 失败不计——避免把一次刷新抖动放大成准入锁死）。
+fn note_proof_fail(ctx: &FaceCtx, dev: &[u8; 8]) {
+    let entered = lock_unpoison(&ctx.proof_gate).note_fail(Instant::now(), *dev);
+    let Some(count) = entered else { return };
+    let n = ctx.stats.proof_cooldowns.fetch_add(1, Ordering::SeqCst) + 1;
+    if log_due(n) {
+        (*ctx.logf)(&format!(
+            "quic: 证明失败闸（dev={} 在 {PROOF_FAIL_WINDOW:?} 内失败 {count} 次——冷却 {PROOF_FAIL_COOLDOWN:?}）",
+            dev_short(dev)
+        ));
     }
 }
 

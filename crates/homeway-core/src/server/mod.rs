@@ -12,6 +12,7 @@ pub mod device;
 pub mod dnsproxy;
 pub mod engine;
 pub mod egress;
+pub mod quic_admit;
 pub mod upnp;
 pub mod state;
 pub mod table;

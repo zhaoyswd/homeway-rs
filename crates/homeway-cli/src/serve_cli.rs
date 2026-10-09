@@ -95,6 +95,82 @@ pub(crate) struct FileServe {
     /// `homeway_core::server::intercept::TxShapeCfg`；覆盖序 env > config > 默认）。
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) tx_shape: Option<homeway_core::server::intercept::TxShapeCfg>,
+    /// 抗放大闸（M2 §3.2 的 `[serve.quic_admit]`；缺省 = 设计定值 ⇒ 缺省不改行为）。
+    /// **值域非法 ⇒ 拒启**（`serve` 节严格表纪律；与 env 面的「记行 + 缺省」不同面）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) quic_admit: Option<FileQuicAdmit>,
+}
+
+/// `[serve.quic_admit]` 节（M2 §3.2 表：**六行七键**——`per_src_fails`/`per_src_window`
+/// 同行两键）。时长照 `serve.peer_ttl` 的 Go 时长串口径（如 `"5s"`/`"1h"`）。
+#[derive(serde::Deserialize, serde::Serialize, Clone, Debug, Default)]
+#[serde(deny_unknown_fields)]
+pub(crate) struct FileQuicAdmit {
+    /// Retry token 有效期（`1s..=60s`；缺省 `5s`——收自 quinn 缺省 15s，M2 §3.1 登记）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retry_token_lifetime: Option<String>,
+    /// 每源滑动窗上限（`1..=1000`；缺省 `10`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) per_src_fails: Option<u32>,
+    /// 每源滑动窗窗长（`1s..=1h`；缺省 `10s`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) per_src_window: Option<String>,
+    /// nonce 有效期（`1s..=30s`；缺省 `5s`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) nonce_ttl: Option<String>,
+    /// 准入总期限（`1s..=60s`；缺省 `10s`）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) admit_deadline: Option<String>,
+    /// 证明失败闸阈值（`0..=1000`；缺省 `10`；`0` = 关闭该闸）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) proof_fail_threshold: Option<u32>,
+    /// Retry 策略（枚举 `pressure`（缺省）| `always` | `never`；非法值 ⇒ 拒启）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) retry_policy: Option<String>,
+}
+
+impl FileQuicAdmit {
+    /// 解析 + 值域校验 ⇒ `AdmitLimits`（**唯一收口点**：`validate_file` 与 `serve_config_of`
+    /// 都走它——语法错与越界都在这里变成拒启文案；值域真源 = `AdmitLimits::validate`）。
+    pub(crate) fn resolve(
+        &self,
+    ) -> Result<homeway_core::server::quic_admit::AdmitLimits, String> {
+        use homeway_core::server::quic_admit::{AdmitLimits, RetryPolicy};
+        let dur = |name: &str, raw: &str| -> Result<Duration, String> {
+            parse_go_duration(raw).ok_or_else(|| {
+                format!("serve.quic_admit.{name}：{raw:?} 非法（时长串，如 \"5s\"/\"10m\"/\"1h\"）")
+            })
+        };
+        let mut l = AdmitLimits::default();
+        if let Some(v) = &self.retry_token_lifetime {
+            l.retry_token_lifetime = dur("retry_token_lifetime", v)?;
+        }
+        if let Some(v) = self.per_src_fails {
+            l.per_src_fails = v;
+        }
+        if let Some(v) = &self.per_src_window {
+            l.per_src_window = dur("per_src_window", v)?;
+        }
+        if let Some(v) = &self.nonce_ttl {
+            l.nonce_ttl = dur("nonce_ttl", v)?;
+        }
+        if let Some(v) = &self.admit_deadline {
+            l.admit_deadline = dur("admit_deadline", v)?;
+        }
+        if let Some(v) = self.proof_fail_threshold {
+            l.proof_fail_threshold = v;
+        }
+        if let Some(v) = &self.retry_policy {
+            l.retry_policy = RetryPolicy::parse(v).ok_or_else(|| {
+                format!(
+                    "serve.quic_admit.retry_policy：{v:?} 非法（合法取值 {}）",
+                    RetryPolicy::VALUES.join("|")
+                )
+            })?;
+        }
+        l.validate()?;
+        Ok(l)
+    }
 }
 
 impl Default for FileServe {
@@ -128,6 +204,7 @@ impl FileServe {
             dns_probe_target: None,
             stun_probe_target: None,
             tx_shape: None,
+            quic_admit: None,
         }
     }
 }
@@ -235,6 +312,11 @@ fn validate_file(path: &Path, f: &FileConfig) -> Result<(), String> {
                 format!("{v:?} 非法（时长串，如 \"168h\"；须 ≥ 0，0 = 关闭 TTL 回收）"),
             );
         }
+    }
+    // [serve.quic_admit]（M2 §3.2）：语法 + 值域都在 `FileQuicAdmit::resolve` 内收口；
+    // 越界/非法 ⇒ **拒启**（`serve` 节严格表纪律——与 env 面的「记行 + 缺省」不同面）。
+    if let Some(q) = &f.serve.quic_admit {
+        q.resolve().map_err(|e| format!("{p}: {e}"))?;
     }
     if let Some(list) = &f.serve.ddns {
         for d in list {
@@ -616,6 +698,11 @@ pub(crate) fn serve_config_of(fc: &FileConfig, state_dir: &Path) -> Result<Serve
     }
     // [serve.tx_shape]（D-3）：解析与 env 覆盖在 tx_shape_resolve（engine 装配点）。
     cfg.tx_shape_cfg = fc.serve.tx_shape;
+    // [serve.quic_admit]（M2 §3.2）：值域已在校验层收口；这里只做「时长串 → Duration」搬运
+    // （env `HOMEWAY_QUIC_ADMIT_RETRY` 的叠加在 engine 装配点）。
+    if let Some(q) = &fc.serve.quic_admit {
+        cfg.quic_admit = Some(q.resolve()?);
+    }
     // serve.relay：注册腿端点（rl1 token / 裸 host:port——R4-4c 接线）
     if let Some(v) = &fc.serve.relay {
         if !v.is_empty() {
@@ -1252,6 +1339,46 @@ mod tests {
             ("[serve]\nlisten = 99999\n", "config.toml"),
             ("[serve]\n不认识的键 = 1\n", "config.toml"),
             ("[serve]\ntx_shape = { rate_mbps = \"200\" }\n", "config.toml"),
+            // M2 S3-4：`[serve.quic_admit]` 七键——语法/值域非法一律**拒启**（§3.2 表）
+            (
+                "[serve.quic_admit]\nretry_token_lifetime = \"5\"\n",
+                "serve.quic_admit.retry_token_lifetime",
+            ),
+            (
+                "[serve.quic_admit]\nretry_token_lifetime = \"0s\"\n",
+                "serve.quic_admit.retry_token_lifetime",
+            ),
+            (
+                "[serve.quic_admit]\nretry_token_lifetime = \"61s\"\n",
+                "serve.quic_admit.retry_token_lifetime",
+            ),
+            ("[serve.quic_admit]\nper_src_fails = 0\n", "serve.quic_admit.per_src_fails"),
+            (
+                "[serve.quic_admit]\nper_src_fails = 1001\n",
+                "serve.quic_admit.per_src_fails",
+            ),
+            (
+                "[serve.quic_admit]\nper_src_window = \"2h\"\n",
+                "serve.quic_admit.per_src_window",
+            ),
+            ("[serve.quic_admit]\nnonce_ttl = \"31s\"\n", "serve.quic_admit.nonce_ttl"),
+            (
+                "[serve.quic_admit]\nadmit_deadline = \"0s\"\n",
+                "serve.quic_admit.admit_deadline",
+            ),
+            (
+                "[serve.quic_admit]\nadmit_deadline = \"61s\"\n",
+                "serve.quic_admit.admit_deadline",
+            ),
+            (
+                "[serve.quic_admit]\nproof_fail_threshold = 1001\n",
+                "serve.quic_admit.proof_fail_threshold",
+            ),
+            (
+                "[serve.quic_admit]\nretry_policy = \"恒开\"\n",
+                "serve.quic_admit.retry_policy",
+            ),
+            ("[serve.quic_admit]\n不认识的键 = 1\n", "config.toml"),
         ];
         for (body, want_field) in cases {
             write_cfg(&d, body);
@@ -1516,20 +1643,53 @@ mod tests {
             "dns_upstream", "dns_fallback", "ddns_resolver", "dns_probe_target", "stun_probe_target",
         ];
         const RELAY_KEYS: &[&str] = &["enabled", "listen", "advertise"];
-        for k in SERVE_KEYS.iter().chain(RELAY_KEYS.iter()) {
+        // M2 S3-4：`[serve.quic_admit]` 七键（六行——per_src_fails/per_src_window 同行）
+        const QUIC_ADMIT_KEYS: &[&str] = &[
+            "retry_token_lifetime", "per_src_fails", "per_src_window", "nonce_ttl",
+            "admit_deadline", "proof_fail_threshold", "retry_policy",
+        ];
+        for k in SERVE_KEYS
+            .iter()
+            .chain(RELAY_KEYS.iter())
+            .chain(QUIC_ADMIT_KEYS.iter())
+        {
             assert!(
                 tpl.contains(k),
                 "模板注释键表缺 {k}"
             );
         }
+        assert!(tpl.contains("[serve.quic_admit]"), "注释键表须列 quic_admit 节名");
         // 逐键「能被 schema 接受」复核：把每个键以合法值形态喂进去必须 Ok。
+        // （含 M2 的 `[serve.quic_admit]` 全七键——显式配置当场过语法 + 值域。）
         let served = "[serve]\nenabled = true\nlisten = 41641\nquic = true\nbind_interface = \"auto\"\nupnp = false\n\
              stun = \"\"\nstun6 = \"\"\nrelay = \"\"\nmax_peers = 32\npeer_ttl = \"168h\"\n\
              dns_port = 5300\nfiles_root = \"\"\npublic_endpoint = \"\"\n\
              dns_upstream = [\"1.1.1.1\", \"9.9.9.9:5353\"]\ndns_fallback = \"223.5.5.5\"\n\
              ddns_resolver = [\"223.5.5.5\"]\ndns_probe_target = [\"223.5.5.5:53\"]\n\
              stun_probe_target = [\"162.159.207.1:3478\"]\n\
+             [serve.quic_admit]\nretry_token_lifetime = \"5s\"\nper_src_fails = 10\n\
+             per_src_window = \"10s\"\nnonce_ttl = \"5s\"\nadmit_deadline = \"10s\"\n\
+             proof_fail_threshold = 10\nretry_policy = \"pressure\"\n\
              [relay]\nenabled = false\nlisten = \":41741\"\nadvertise = \"\"\n";
-        assert!(toml::from_str::<FileConfig>(served).is_ok());
+        let fc = toml::from_str::<FileConfig>(served).expect("全键（含 quic_admit 七键）可解析");
+        let limits = fc
+            .serve
+            .quic_admit
+            .as_ref()
+            .expect("quic_admit 节在")
+            .resolve()
+            .expect("显式值合法");
+        assert_eq!(
+            limits,
+            homeway_core::server::quic_admit::AdmitLimits::default(),
+            "显式写全的合法值 == 设计缺省（缺省不改行为的对照）"
+        );
+        // 缺省（不写 `[serve.quic_admit]`）⇒ 与设计缺省逐值同（不改行为）。
+        let bare: FileConfig = toml::from_str("[serve]\nenabled = true\n").unwrap();
+        assert!(bare.serve.quic_admit.is_none(), "缺省即无节");
+        assert_eq!(
+            bare.serve.quic_admit.unwrap_or_default().resolve().unwrap(),
+            homeway_core::server::quic_admit::AdmitLimits::default()
+        );
     }
 }

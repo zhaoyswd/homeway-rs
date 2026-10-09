@@ -107,6 +107,10 @@ pub struct ServeConfig {
     /// 发送整形的 config 覆盖（D-3 反过拟合约束 3：`[serve.tx_shape]` 节；
     /// None = 全默认。env 测试缝的优先级在 `tx_shape_resolve` 内——env > config > 默认）。
     pub tx_shape_cfg: Option<crate::server::intercept::TxShapeCfg>,
+    /// 抗放大闸的 config 覆盖（M2 §3.2 的 `[serve.quic_admit]` 七键；`None` = 全设计缺省）。
+    /// 值域已由 `homeway-cli` 的严格读层校验（非法 ⇒ 拒启）；env
+    /// `HOMEWAY_QUIC_ADMIT_RETRY` 的叠加在 [`crate::server::quic_admit::resolve_retry_policy`]。
+    pub quic_admit: Option<crate::server::quic_admit::AdmitLimits>,
 }
 
 impl Default for ServeConfig {
@@ -140,6 +144,7 @@ impl Default for ServeConfig {
             dns_probe_target: egress::default_probe_targets(),
             stun_probe_target: egress::default_stun_targets(),
             tx_shape_cfg: None,
+            quic_admit: None,
         }
     }
 }
@@ -447,9 +452,16 @@ impl ServeEngine {
             Ok(sock) => match sock.set_nonblocking(true) {
                 Ok(()) => {
                     let seed = crate::server::quic_rpk_seed(&priv_key);
+                    // 抗放大闸生效值（M2 §3.2）：config 段（严格读层已校验值域）+ env 叠加
+                    // （非法 env ⇒ 记行 + 缺省，不 fail-fast）。
+                    let admit = crate::server::quic_admit::resolve_retry_policy(
+                        cfg.quic_admit.unwrap_or_default(),
+                        crate::envflag::quic_admit_retry_raw(),
+                        &logf,
+                    );
                     match homeway_quic::ExitQuic::start(
                         sock,
-                        homeway_quic::ExitQuicConfig::new(seed, cfg.max_devices),
+                        homeway_quic::ExitQuicConfig::new(seed, cfg.max_devices).with_admit(admit),
                         Arc::clone(&logf),
                     ) {
                         Ok(q) => {

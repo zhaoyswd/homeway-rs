@@ -55,7 +55,14 @@ fn certified_key(seed: &Ed25519Seed) -> Result<(CertifiedKey, RpkPublicKey), Rpk
 ///
 /// 私钥只活在 `CertifiedKey` 内（quinn/rustls 仅在握手签名时用它）；本函数返回的
 /// `RpkPublicKey` 是可公开材料。
-pub(crate) fn server_config(seed: &Ed25519Seed) -> Result<(quinn::ServerConfig, RpkPublicKey), RpkErr> {
+///
+/// `retry_token_lifetime` = Retry token 有效期（M2 §3.1：收自 quinn 缺省 15s 到 5s，
+/// 压缩「一次 Retry 的成果可复用」的窗；token 是**无状态 AEAD**，校验只查地址一致 +
+/// 未过期，没有一次性记账）。
+pub(crate) fn server_config(
+    seed: &Ed25519Seed,
+    retry_token_lifetime: std::time::Duration,
+) -> Result<(quinn::ServerConfig, RpkPublicKey), RpkErr> {
     let (certified, pubkey) = certified_key(seed)?;
     let rcfg = rustls::ServerConfig::builder_with_provider(provider())
         .with_protocol_versions(&[&rustls::version::TLS13])
@@ -68,6 +75,7 @@ pub(crate) fn server_config(seed: &Ed25519Seed) -> Result<(quinn::ServerConfig, 
     let mut scfg = quinn::ServerConfig::with_crypto(Arc::new(quic_cfg));
     scfg.migration(transport::MIGRATION);
     scfg.transport_config(transport::transport_config());
+    scfg.retry_token_lifetime(retry_token_lifetime);
     Ok((scfg, pubkey))
 }
 
