@@ -161,8 +161,18 @@ pub mod probe_defaults {
 
     /// 在用档首探预算（§13-T2 实测：预算 700ms/间隔 0 ⇒ 706ms 定音）。
     pub const FAST_BUDGET: Duration = Duration::from_millis(700);
+    /// 在用档**拍间**（§3.2-1「背靠背（拍间 ≤300ms，由 runtime 拍内务驱动）」——
+    /// 岛内拍 = `driver::TICK`（250ms）⇒ 取 250ms 与拍同拍，恒 ≤300ms）。
+    pub const FAST_GAP: Duration = Duration::from_millis(250);
     /// 复探倍数（§3.1-2：首探失败 ⇒ 本拍内用加倍预算复探一次）。
     pub const REPROBE_FACTOR: u32 = 2;
+    /// 「在用」判据的**出站新鲜窗**（§3.2-1「在用档（`demand > 0`，沿用 `demand.rs` 需求位）」）。
+    ///
+    /// 岛是叶子 crate（不得依赖 `homeway-core::demand`）⇒ 本窗口照抄
+    /// `demand::OUTBOUND_FRESH`（5s）的**包面语义**：岛按自己的 `TunCounters::last_outbound_at`
+    /// 判「有包在等」。**偏离登记**：亮屏位（`demand.rs` 的 activity 位）在岛内不可达
+    /// （它由扩展经 NAPI 推给 core）⇒ 本档位对「亮屏但无包」的设备按待机走（电池面更保守）。
+    pub const IN_USE_FRESH: Duration = Duration::from_secs(5);
     /// 待机档节拍（= `PATROL_INTERVAL`，不变——保电池/CPU）。
     pub const IDLE_INTERVAL: Duration = Duration::from_secs(60);
     /// 抖动连续升格阈值（§3.1-③：防 fail-silent）。
@@ -180,6 +190,8 @@ pub mod probe_defaults {
 pub struct ProbeTuning {
     /// 首探预算。
     pub fast_budget: Duration,
+    /// 在用档拍间（背靠背；§3.2-1）。
+    pub fast_gap: Duration,
     /// 复探倍数（≥1）。
     pub reprobe_factor: u32,
     /// 待机档节拍。
@@ -192,18 +204,22 @@ pub struct ProbeTuning {
     pub rebuild_window: Duration,
     /// 本机发送面错误的新鲜度窗（N5；M/R 判别用）。
     pub send_err_fresh: Duration,
+    /// 「在用档」判据的出站新鲜窗（§3.2-1；岛侧包面语义，见 `probe_defaults::IN_USE_FRESH`）。
+    pub in_use_fresh: Duration,
 }
 
 impl Default for ProbeTuning {
     fn default() -> Self {
         Self {
             fast_budget: probe_defaults::FAST_BUDGET,
+            fast_gap: probe_defaults::FAST_GAP,
             reprobe_factor: probe_defaults::REPROBE_FACTOR,
             idle_interval: probe_defaults::IDLE_INTERVAL,
             jitter_streak: probe_defaults::JITTER_STREAK,
             reconnect_streak: probe_defaults::RECONNECT_STREAK,
             rebuild_window: probe_defaults::REBUILD_WINDOW,
             send_err_fresh: probe_defaults::SEND_ERR_FRESH,
+            in_use_fresh: probe_defaults::IN_USE_FRESH,
         }
     }
 }
@@ -219,6 +235,8 @@ impl ProbeTuning {
         let mut applied = 0;
         let mut notes = Vec::new();
         env_ms(get, ENV_PROBE_BUDGET, 50, 10_000, &mut self.fast_budget, &mut applied, &mut notes);
+        // 拍间允许 0（真背靠背：拍内务每次回看都探）…1s（不得超过首探预算的量级）。
+        env_ms(get, ENV_PROBE_GAP, 0, 1_000, &mut self.fast_gap, &mut applied, &mut notes);
         env_u32(
             get,
             ENV_PROBE_REPROBE,
@@ -249,12 +267,23 @@ impl ProbeTuning {
             &mut applied,
             &mut notes,
         );
+        env_ms(
+            get,
+            ENV_IN_USE_FRESH,
+            500,
+            120_000,
+            &mut self.in_use_fresh,
+            &mut applied,
+            &mut notes,
+        );
         (applied, notes)
     }
 }
 
 /// env 名：首探预算（ms）。
 pub const ENV_PROBE_BUDGET: &str = "HOMEWAY_QUIC_PROBE_BUDGET";
+/// env 名：在用档拍间（ms；背靠背）。
+pub const ENV_PROBE_GAP: &str = "HOMEWAY_QUIC_PROBE_GAP";
 /// env 名：复探倍数。
 pub const ENV_PROBE_REPROBE: &str = "HOMEWAY_QUIC_PROBE_REPROBE";
 /// env 名：待机档节拍（ms）。
@@ -267,6 +296,8 @@ pub const ENV_RECONNECT_STREAK: &str = "HOMEWAY_QUIC_RECONNECT_STREAK";
 pub const ENV_REBUILD_WINDOW: &str = "HOMEWAY_QUIC_REBUILD_WINDOW";
 /// env 名：发送面错误新鲜度窗（ms）。
 pub const ENV_SEND_ERR_FRESH: &str = "HOMEWAY_QUIC_SEND_ERR_FRESH";
+/// env 名：「在用档」出站新鲜窗（ms）。
+pub const ENV_IN_USE_FRESH: &str = "HOMEWAY_QUIC_IN_USE_FRESH";
 
 // ---------------------------------------------------------------------------
 // env 解析小件（纯函数；测试直接喂 `get` 闭包，不碰进程环境）
@@ -466,33 +497,40 @@ mod tests {
     fn probe_tuning_defaults_and_env_overrides() {
         let d = ProbeTuning::design();
         assert_eq!(d.fast_budget, Duration::from_millis(700), "§13-T2 的承重值");
+        assert_eq!(d.fast_gap, Duration::from_millis(250), "§3.2-1：拍间 ≤300ms");
+        assert!(d.fast_gap <= Duration::from_millis(300), "§3.2-1 的上界");
         assert_eq!(d.reprobe_factor, 2);
         assert_eq!(d.idle_interval, Duration::from_secs(60));
         assert_eq!(d.jitter_streak, 3);
         assert_eq!(d.reconnect_streak, 2, "B 门：连续 2");
         assert_eq!(d.rebuild_window, Duration::from_secs(10), "B 门：窗 ≥10s");
         assert_eq!(d.send_err_fresh, Duration::from_secs(5), "N5 新鲜度窗");
+        assert_eq!(d.in_use_fresh, Duration::from_secs(5), "= demand::OUTBOUND_FRESH");
 
         let mut t = ProbeTuning::design();
         let get = table(&[
             ("HOMEWAY_QUIC_PROBE_BUDGET", "300"),
+            ("HOMEWAY_QUIC_PROBE_GAP", "100"),
             ("HOMEWAY_QUIC_PROBE_REPROBE", "3"),
             ("HOMEWAY_QUIC_PROBE_IDLE", "5000"),
             ("HOMEWAY_QUIC_JITTER_STREAK", "5"),
             ("HOMEWAY_QUIC_RECONNECT_STREAK", "4"),
             ("HOMEWAY_QUIC_REBUILD_WINDOW", "30000"),
             ("HOMEWAY_QUIC_SEND_ERR_FRESH", "1500"),
+            ("HOMEWAY_QUIC_IN_USE_FRESH", "2000"),
         ]);
         let (applied, notes) = t.apply_env(&get);
-        assert_eq!(applied, 7, "七项全命中：{notes:?}");
+        assert_eq!(applied, 9, "九项全命中：{notes:?}");
         assert!(notes.is_empty());
         assert_eq!(t.fast_budget, Duration::from_millis(300));
+        assert_eq!(t.fast_gap, Duration::from_millis(100));
         assert_eq!(t.reprobe_factor, 3);
         assert_eq!(t.idle_interval, Duration::from_secs(5));
         assert_eq!(t.jitter_streak, 5);
         assert_eq!(t.reconnect_streak, 4);
         assert_eq!(t.rebuild_window, Duration::from_secs(30));
         assert_eq!(t.send_err_fresh, Duration::from_millis(1500));
+        assert_eq!(t.in_use_fresh, Duration::from_secs(2));
 
         // 越界（复探倍数 0 / 新鲜度窗 100ms）⇒ 不生效 + 两行说明
         let mut t = ProbeTuning::design();
@@ -504,6 +542,16 @@ mod tests {
         assert_eq!(applied, 0);
         assert_eq!(notes.len(), 2);
         assert_eq!(t, ProbeTuning::design());
+
+        // 拍间可到 0（真背靠背）；负值/超上界 ⇒ 按缺省
+        let mut t = ProbeTuning::design();
+        let get = table(&[("HOMEWAY_QUIC_PROBE_GAP", "0")]);
+        assert_eq!(t.apply_env(&get).0, 1);
+        assert_eq!(t.fast_gap, Duration::ZERO);
+        let mut t = ProbeTuning::design();
+        let get = table(&[("HOMEWAY_QUIC_PROBE_GAP", "1001")]);
+        assert_eq!(t.apply_env(&get).0, 0);
+        assert_eq!(t.fast_gap, probe_defaults::FAST_GAP);
     }
 
     /// env 名常量是**单源**（生产/消融/登记三处不许各写一份字面量）。
@@ -514,11 +562,13 @@ mod tests {
         assert_eq!(ENV_SEND_WINDOW, "HOMEWAY_QUIC_SEND_WINDOW");
         assert_eq!(ENV_STREAM_PENDING, "HOMEWAY_QUIC_STREAM_PENDING");
         assert_eq!(ENV_PROBE_BUDGET, "HOMEWAY_QUIC_PROBE_BUDGET");
+        assert_eq!(ENV_PROBE_GAP, "HOMEWAY_QUIC_PROBE_GAP");
         assert_eq!(ENV_PROBE_REPROBE, "HOMEWAY_QUIC_PROBE_REPROBE");
         assert_eq!(ENV_PROBE_IDLE, "HOMEWAY_QUIC_PROBE_IDLE");
         assert_eq!(ENV_JITTER_STREAK, "HOMEWAY_QUIC_JITTER_STREAK");
         assert_eq!(ENV_RECONNECT_STREAK, "HOMEWAY_QUIC_RECONNECT_STREAK");
         assert_eq!(ENV_REBUILD_WINDOW, "HOMEWAY_QUIC_REBUILD_WINDOW");
         assert_eq!(ENV_SEND_ERR_FRESH, "HOMEWAY_QUIC_SEND_ERR_FRESH");
+        assert_eq!(ENV_IN_USE_FRESH, "HOMEWAY_QUIC_IN_USE_FRESH");
     }
 }

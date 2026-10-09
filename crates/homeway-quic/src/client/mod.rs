@@ -16,6 +16,7 @@
 //! 「预检 → 发送」之间无 `await` ⇒ 不存在被别处插入的窗口（S6-2 的代码门条）。
 
 pub(crate) mod dataplane;
+pub(crate) mod ladder;
 mod migration;
 mod race;
 mod register;

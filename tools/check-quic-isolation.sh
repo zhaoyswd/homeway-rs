@@ -71,6 +71,8 @@ ASYNC_FILES=(
   # M3 S2：服务流的 socketpair 适配器 + 异步泵（**本清单双向 fail-closed**——
   # `exit/intake.rs` 是纯 std（两面共用）⇒ **不入清单**，受 ② 条真扫描）
   "exit/pump.rs"
+  # M3 S4：快探阶梯（§3.1/§3.2——预算语义走 `tokio::time`，`start_paused` 用例要它）
+  "client/ladder.rs"
 )
 # 异步名的判定式（②条、豁免自证、扫描器自校准**共用同一串**——三处不同步 = 门自相矛盾）。
 # **代码门 r15 G1 整改**：`client/migration.rs` 原在清单里但它**零异步名**（纯逻辑小件，
