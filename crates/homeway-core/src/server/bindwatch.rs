@@ -9,7 +9,7 @@
 //!   ——永远不因为挑不到卡就不启动。
 //!
 //! 判据行族（E21 后半）：`绑卡看护：网卡 %s 探针失败 %d/%d（%v）` / `…连续探不通，
-//! 重新挑卡` / `…%s → %s（指纹变化）` / `…WG socket 钉在 %s（%s）` / `…重钉到 %s
+//! 重新挑卡` / `…%s → %s（指纹变化）` / `…QUIC 端口 socket 钉在 %s（%s）` / `…重钉到 %s
 //! 失败（%v）` / `…暂时挑不到可用网卡（%v），先保持现状` / `…挑不到可用物理网卡
 //! （%v）—— 本轮不绑，走系统默认路由`。
 //!
@@ -153,7 +153,7 @@ pub(crate) fn watch_tick(st: &mut WatchState, d: &mut impl WatchDeps) {
             match d.repin(next.index, &next.name) {
                 Err(e) => d.log(format!("绑卡看护：重钉到 {} 失败（{e}）", next.name)),
                 Ok(()) => {
-                    d.log(format!("绑卡看护：WG socket 钉在 {}（{nfp}）", next.name));
+                    d.log(format!("绑卡看护：QUIC 端口 socket 钉在 {}（{nfp}）", next.name));
                     st.cur = Some(next);
                     st.cur_fp = nfp;
                     st.fails = 0;
@@ -410,7 +410,7 @@ mod tests {
         watch_tick(&mut st, &mut d);
         assert_eq!(d.repins, vec![(6, "en0".to_owned())]);
         assert_eq!(d.changes, 1);
-        assert!(joined(&d.logs).contains("绑卡看护：WG socket 钉在 en0（index=6 up addrs=[192.0.2.6/24]）"));
+        assert!(joined(&d.logs).contains("绑卡看护：QUIC 端口 socket 钉在 en0（index=6 up addrs=[192.0.2.6/24]）"));
     }
 
     /// 无当前卡 + 挑不到：`本轮不绑` 行、不重钉；有当前卡 + 挑不到（指纹先变触发
@@ -551,11 +551,11 @@ mod tests {
         d.resolves = vec![Ok(Script::iface(6, "en0"))];
         watch_tick(&mut st, &mut d);
         assert_eq!(d.repins.len(), 1, "同名同指纹 ⇒ 维持现状（不重钉）");
-        assert!(!joined(&d.logs).contains("WG socket 钉在"), "无重钉行：{}", joined(&d.logs));
+        assert!(!joined(&d.logs).contains("QUIC 端口 socket 钉在"), "无重钉行：{}", joined(&d.logs));
         assert_eq!(st.cur.as_ref().map(|i| i.index), Some(0), "当前卡不被同名重挑改写");
     }
 
-    /// 重挑挑到**别的卡**：重钉 + 「WG socket 钉在 %s」 + on_change；重钉失败：打行、
+    /// 重挑挑到**别的卡**：重钉 + 「QUIC 端口 socket 钉在 %s」 + on_change；重钉失败：打行、
     /// 不更新当前卡、不 on_change。
     #[test]
     fn repin_failure_logged() {
@@ -568,7 +568,7 @@ mod tests {
         d.resolves = vec![Ok(Script::iface(7, "en1"))];
         d.fps.insert(6, Script::fp(6, true, "198.51.100.7/24"));
         watch_tick(&mut st, &mut d);
-        assert!(joined(&d.logs).contains("绑卡看护：WG socket 钉在 en1"), "{}", joined(&d.logs));
+        assert!(joined(&d.logs).contains("绑卡看护：QUIC 端口 socket 钉在 en1"), "{}", joined(&d.logs));
         assert_eq!(d.changes, 2);
         // 再触发挑卡（en1 指纹变）挑回 en0 但重钉失败：打行、保持 en1
         d.repin_err = Some("IP_BOUND_IF/IPV6_BOUND_IF: x / y".to_owned());

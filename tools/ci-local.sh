@@ -9,7 +9,8 @@
 #      的路径；NDK 缺 ⇒ 显式 SKIP 并打档位，不静默绿）+ **QUIC 岛隔离门**（M0 §3.4 层 3）
 #   4. tools/gen-vectors.sh + shasum -c + git diff   向量确定性门（含 SUMS 校验——G-11）
 #   4.5 tools/gen-fuzz-seeds.sh + 摘要对账  fuzz 种子展开门（第二道门 中-13 整改）
-#   5. tools/check-vocab.sh               词表三方门
+#   5. tools/check-vocab.sh               词表三方门 + tools/check-wg-removed.sh（WG 残留十条，
+#       M5 S5 新挂；含 ⑧ 的 `cargo test --list` 用例面与 ⑩ 的 ID 空间门）
 #   6. cargo build --release -p homeway-cli           smoke 前置（G-10）
 #   7. tools/matrix.sh --smoke            RRR 基础段冒烟
 # 全量档：--full 加 cargo test --ignored（fuzz_replay **12** 目标 × 100k；Q-D 批新增
@@ -97,8 +98,9 @@ SEEDS_DIGEST=$("$REPO_ROOT/tools/gen-fuzz-seeds.sh" 2>/dev/null | tail -1) || fa
 WANT_DIGEST=$(cat "$REPO_ROOT/fuzz/corpus.seeds.sha256" 2>/dev/null) || fail 4 "摘要基准文件缺失（fuzz/corpus.seeds.sha256）"
 [[ "$SEEDS_DIGEST" == "$WANT_DIGEST" ]] || fail 4 "种子展开摘要漂移（得 $SEEDS_DIGEST 想要 $WANT_DIGEST——fixtures 变更须同批更新基准文件）"
 
-echo "==> [5/7] 词表三方门（check-vocab.sh）"
+echo "==> [5/7] 词表三方门（check-vocab.sh）+ WG 残留门（check-wg-removed.sh，M5 S5 新挂）"
 "$REPO_ROOT/tools/check-vocab.sh" || fail 5 "词表漂移"
+"$REPO_ROOT/tools/check-wg-removed.sh" || fail 5 "WG 残留（check-wg-removed.sh）"
 
 echo "==> [6/7] release 构建（smoke 前置）"
 (cd "$REPO_ROOT" && cargo build --release -p homeway-cli) || fail 6 "release 构建"
