@@ -387,21 +387,25 @@ WG 面 `WriteToTunnelV6 => Done` 同义）⇒ **两档行为等价**，QUIC 档�
   **原样**（term HSP、files proto、speedtest 帧逐字节不变）；出口按 tag 分发到对应服务（服务
   入口从 UDS accept 换成 stream 适配器，**应用层零改动**）。
 - 客户端：`bridge_host` 的 `DialFn` 改开 STREAM；`session/recover` 阶梯重写（断线 = 重连/迁移；
-  不再有 R1/R2/R3 档位语义）；巡检 = `STREAM[probe]`；删除 stackb 与 5 处消费点
-  （`tun_exec.rs:238/334/349`、`session/mod.rs:648/667`）；「虚拟端口」（7802/7724/7803）→ tag。
-- 出口：intercept 的「豁免命中端口 → UDS」分支退役（只剩 DNS:53/:5300）。
-- 地址派生收窄：保留 `tunIp`（App 接口地址）与出口常量 IP（DNS 目标）；**栈 B 派生地址退役**。
+  不再有 R1/R2/R3 档位语义）；巡检 = `STREAM[probe]`；**清零客户端 QUIC 档的 stackb 消费点**
+  （路线文件原记 5 处〔`tun_exec.rs:238/334/349`、`session/mod.rs:648/667`〕，设计门实测**共 12 处 / 7 文件**
+  ——多出的 6 处在 daemon/CLI 的 host 会话面，属 WG-only 路径，随本体留 M5）；「虚拟端口」（7802/7724/7803）→ tag。
+- 出口：**QUIC 档不再经** intercept 的「豁免命中端口 → UDS」分支（分支本体保留至 M5——消费者 = WG 服务腿）。
+- 地址派生收窄：保留 `tunIp`（App 接口地址）与出口常量 IP（DNS 目标）；**栈 B 派生地址在 QUIC 档退役**。
 
 **判据**：App 真机 files / term / speedtest 全绿（matrix 冒烟 + E2E）；term 帧 / 键编码 /
-fixtures 向量逐字节不变；客户端依赖树不再含 smoltcp（脚本验证）；DC14 / DC15 / CA1 / CA4 / CA5
-语义对照。
+fixtures 向量逐字节不变；**客户端 QUIC 档零 `stackb::` 可达引用**（`tools/check-quic-isolation.sh` 新断言；
+原「依赖树不再含 smoltcp」不可判——出口 intercept 面共用 smoltcp，**已订正**，见
+`docs/reviews/M3-design.md` §15-1）；DC14 / DC15 / CA1 / CA4 / CA5 语义对照。
 
 **评审过程**：
 
-- 设计门：`docs/reviews/M3-design.md`（tag 分发 / 背压 / 错误面 / 阶梯重写 = 连接策略变更）→ dsh。
-- 代码门：`docs/reviews/M3.md`（专项 = 删 stackb 后的遗留假设，如「环回不经隧道」语义是否仍成立）。
+- 设计门：`docs/reviews/M3-design.md`（tag 分发 / 背压 / 错误面 / 阶梯重写 = 连接策略变更）→ dsh
+  （**已走两轮**：r16 首轮 27 条含 9 高危判「阻塞」→ 全部改设计；r17 复审 16 条 → 有条件通过）。
+- 代码门：`docs/reviews/M3.md`（专项 = 删 stackb 后的遗留假设〔设计已列 A1–A14〕，如「环回不经隧道」语义是否仍成立）。
 
-**退出口**：服务面全绿 + stackb 删除合入 + tier `connection-lifecycle` 修订稿交付。
+**退出口**：服务面全绿 + **QUIC 档 stackb 消费点清零合入**（本体删除移 M5，与 `wgcore` 同批）+ tier
+`connection-lifecycle` 修订稿交付（tier 侧触点，M3 只出草案）。
 
 ## M4 portfwd 收口（估 1–2 会话日）
 
