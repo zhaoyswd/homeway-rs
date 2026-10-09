@@ -17,7 +17,19 @@
 > **前一轮（`/tmp/quic-ab/m0/`）的读数已弃用**：那一轮与本表的差（如 wg-ring 稳态 `f=1536`
 > 这类 harness 旧版产物）见 `docs/reviews/M0.md` 的代码门处置表（M1/M2）。
 
-## 1. 体积基线（OHOS aarch64 cdylib，release + LTO + strip）
+## 1. 体积基线
+
+> **口径变更（M5，2026-10-10；登记 = `docs/INTEROP-CRITERIA.md` L-1）**：product 档自 M5 起为
+> **LTO + `codegen-units=1` + NDK strip**（此前为「默认 release 无 profile 档」）。**同档判、跨档不得
+> 互引**——本表 M0–M4 各行均为**无 profile 档**读数。同档历史锚：WG-only（`4841b20`）+ LTO =
+> **1,685,144 B**。
+>
+> **M5 终值**：OHOS `.so` = **2,958,896 B = 0.779× 判据（≤3,800,000 B）**（`[sym]` 20/20、`[ver]` 过）；
+> 出口二进制单独量 = `homeway-cli` **8,758,816 B**（同档 LTO 未 strip；**不设判据**）。
+> 双栈期（M3/M4 无 profile 档）= 4,891,776 B；**同一份双栈码改档后 = 3,556,520 B（0.936× 判据）**——
+> 即 **3.8MB 判据的主杠杆是构建档位，不是删码**（删码后终值再降至 2,958,896 B）。
+
+（OHOS aarch64 cdylib，release + LTO + strip）
 
 | 档 | 值（本轮实测） | 附录 A 旧值 | 偏差 | 出处 / 复测命令 |
 |---|---|---|---|---|
