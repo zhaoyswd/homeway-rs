@@ -183,8 +183,42 @@ pub(crate) fn dial_target(
 /// - `host_session::HostSession::dial_addr`（宿主会话：`&self` 面；余量交调用方的
 ///   `PendingBuf`）。
 ///
+/// **关流守卫（H1 段不变量的承载体；M5 C2 就地修复）**：开流成功后**本函数内部**
+/// 立即接管「此后任何失败路径也要关流」——写 6B/读回执失败时由 `Drop` 关流。
+///
+/// 修复沿革（如实登记）：C 棒①把本序列抽成 `dial_target_raw` 时，守卫只留在**调用方**
+/// 构造（`StreamShared`/`HostStream`）⇒ 本函数内部的失败路径（写帧失败、回执异常、
+/// 预算耗尽）在返回后**没有**任何句柄去关流 ⇒ 岛内流槽逐次泄漏（`pf` 的 N=80 泄漏
+/// 判据实测：「本机在册 62/62」顶满 ⇒ 第 62 次起全部 `Busy`）。守卫放回本函数：
+/// 成功时 `disarm()` 交棒给调用方的句柄（drop 面仍在调用方），失败时即刻关流。
+struct DialCloseGuard {
+    island: Arc<Island>,
+    id: StreamId,
+    armed: bool,
+}
+
+impl DialCloseGuard {
+    fn new(island: Arc<Island>, id: StreamId) -> Self {
+        DialCloseGuard { island, id, armed: true }
+    }
+
+    /// 交棒（成功路径）：此后关流归调用方持有的句柄。
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for DialCloseGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            close_block(&self.island, self.id);
+        }
+    }
+}
+
 /// **调用方契约**：取到 `id` 之后**立刻**构造关流守卫（`StreamShared`/`HostStream` 的
-/// drop 面）——否则开流成功而后续失败的路径会漏一个流槽（本函数 doc 的 H1 段）。
+/// drop 面）——否则**返回之后**的失败路径会漏一个流槽（本函数 doc 的 H1 段；函数内部
+/// 的失败路径由 [`DialCloseGuard`] 兜住）。
 pub(crate) fn dial_target_raw(
     island: &Arc<Island>,
     dst: SocketAddrV4,
@@ -201,8 +235,11 @@ pub(crate) fn dial_target_raw(
         Some(wait),
     )
     .map_err(stream_err_to_io)?;
+    // ★ RAII：开流成功即接管（写帧/回执的失败路径也要关流）
+    let guard = DialCloseGuard::new(Arc::clone(island), id);
     write_dial_frame_raw(island, id, dst)?;
     let rest = read_dial_ack(deadline, |wait| read_block(island, id, Some(wait)))?;
+    guard.disarm();
     Ok((id, rest))
 }
 
