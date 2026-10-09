@@ -1249,8 +1249,18 @@ fn conn_threads_are_reaped_after_rounds() {
     let _ = std::fs::remove_dir_all(sock.parent().unwrap());
 }
 
-/// F5 慢滴水（M2 交办）：每 40ms 发 1 字节、永不完成帧——期限仍必须生效
+/// F5 慢滴水（M2 交办）：每 **120ms** 发 1 字节、永不完成帧——期限仍必须生效
 /// （判据在带期限的半帧/半体读内，读侧期限不是「拍上才查」）。
+///
+/// **节拍 40ms → 120ms（M5 C2 实施期加固，根因实证）**：原 40ms 节拍下，5B 头
+/// 只需 160ms 即凑满，而期限是 120ms——**裕量仅 40ms**。而本用例的对手方是
+/// 「连接**已被 accept** 才起算」：客户端 connect 后立即滴水，若服务端 accept
+/// 线程被调度延迟 ≥160ms（全量并行跑 700+ 测试时实测可达），5B 零字节头会在读侧
+/// 开工前**预积累**在 socket 缓冲里 ⇒ 头在期限检查前即凑满 ⇒ 归因走
+/// `bad_frame`（`Op::from_code(0)` = None）而非期限路径 ⇒ 用例红
+/// （实测 `实得 Ok(16)` = goodbye 帧前 16B 片段；隔离单跑恒绿）。
+/// 120ms 节拍把该裕量提到 3×（凑满需 480ms，且 120ms < 500ms 读拍 ⇒
+/// **原始缺陷面不变**：持续有进展时读侧仍不得只在拍上判期限）。
 #[test]
 fn handshake_deadline_beats_slow_drip() {
     let (srv, sock, logs, serve_h) =
@@ -1258,8 +1268,8 @@ fn handshake_deadline_beats_slow_drip() {
     use std::io::{Read, Write};
     let mut c = std::os::unix::net::UnixStream::connect(&sock).unwrap();
     c.set_read_timeout(Some(Duration::from_secs(4))).unwrap();
-    // 持续滴水（每 40ms 1 字节；5 字节头永远凑不满——第一字节恒为 Req 码也无所谓，
-    // head 未完成即不进入 op 分发）。
+    // 持续滴水（每 120ms 1 字节；5 字节头在期限路径下凑不满——第一字节恒为 Req 码
+    // 也无所谓，head 未完成即不进入 op 分发）。
     let mut w = c.try_clone().unwrap();
     let stop = Arc::new(AtomicBool::new(false));
     let stop2 = Arc::clone(&stop);
@@ -1268,7 +1278,7 @@ fn handshake_deadline_beats_slow_drip() {
             if w.write_all(&[0u8]).is_err() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(40));
+            std::thread::sleep(Duration::from_millis(120));
         }
     });
     // 期限（120ms）后连接必须被服务端断开：读到 0/错误，且**远早于** 4s 读超时
