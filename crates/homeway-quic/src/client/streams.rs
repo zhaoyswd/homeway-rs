@@ -536,6 +536,13 @@ pub(crate) async fn read_task(slot: Arc<Slot>, reply: StreamReply<Vec<u8>>, stre
 }
 
 /// 读结论归一（§1.6：白名单复位码 ⇒ typed；对端 FIN/区间外 ⇒ `Closed` = EOF）。
+///
+/// **连接死也归 EOF（代码门 r18 ①-4 的修法）**：`clear_on_connection_loss`（housekeeping
+/// 拍内）会把在册流整体按 EOF 收（§1.6 的 EOF 同形性 / A9「连接死 = 读回 EOF」），但读任务
+/// 可能**先**落定在 `ReadError::ConnectionLost` 上 ⇒ 同一条连接死在两个时刻给出「EOF」与
+/// 「typed 错误」两种结论（窗口 = 一拍 250ms）。两条出口统一到 **`Closed` = EOF**：消费侧
+/// （`facade/quic_stream.rs`）本就把二者都当「服务流结束」收，不存在把连接故障误判成
+/// 服务级拒绝的风险（服务级拒绝走白名单复位码那一支）。
 fn classify_read(r: Result<Option<quinn::Chunk>, ReadError>) -> Result<Vec<u8>, StreamErr> {
     match r {
         Ok(Some(c)) => Ok(c.bytes.to_vec()),
@@ -543,7 +550,7 @@ fn classify_read(r: Result<Option<quinn::Chunk>, ReadError>) -> Result<Vec<u8>, 
         Err(ReadError::Reset(code)) => {
             Err(StreamErr::from_reset_code(code.into_inner()).unwrap_or(StreamErr::Closed))
         }
-        Err(ReadError::ConnectionLost(_)) => Err(StreamErr::ConnectionLost),
+        Err(ReadError::ConnectionLost(_)) => Err(StreamErr::Closed),
         // `ClosedStream`/`UnknownStream`/`ZeroRttRejected`：流面已结束 ⇒ EOF 同面
         Err(_) => Err(StreamErr::Closed),
     }
@@ -552,6 +559,36 @@ fn classify_read(r: Result<Option<quinn::Chunk>, ReadError>) -> Result<Vec<u8>, 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **判据（读结论归一，§1.6/A9；代码门 r18 ①-4）**：连接死、对端 FIN、白名单外复位码
+    /// 三条都归 `Closed`（EOF 同形）；只有白名单内的复位码才是 typed 拒绝。
+    #[test]
+    fn classify_read_maps_connection_loss_to_eof() {
+        use quinn::ConnectionError;
+        // 连接死（housekeeping 尚未把槽置 closed 的竞态窗）⇒ EOF 面，不是 typed 错误
+        assert_eq!(
+            classify_read(Err(ReadError::ConnectionLost(ConnectionError::LocallyClosed))),
+            Err(StreamErr::Closed),
+            "连接死 = 读回 EOF（与 clear_on_connection_loss 同面）"
+        );
+        // 白名单内复位码 ⇒ typed
+        assert_eq!(
+            classify_read(Err(ReadError::Reset(VarInt::from_u32(
+                crate::stream::reset::SERVICE_DISABLED as u32
+            )))),
+            Err(StreamErr::NotSupported)
+        );
+        // 白名单外（对端自选 0x07）⇒ EOF
+        assert_eq!(
+            classify_read(Err(ReadError::Reset(VarInt::from_u32(7)))),
+            Err(StreamErr::Closed)
+        );
+        // 流面已结束的其余形态 ⇒ EOF
+        assert_eq!(
+            classify_read(Err(ReadError::ClosedStream)),
+            Err(StreamErr::Closed)
+        );
+    }
 
     /// 待发队列的**非阻塞接纳**（§1.4 的核心判据之一，纯逻辑可测）：
     /// 满 ⇒ `n=0` + 原 Vec 带回；部分接纳 ⇒ 前缀推进；空写 ⇒ 短路。

@@ -1703,9 +1703,17 @@ async fn oversize_tun_packet_is_dropped_and_counted() {
 /// **判据（S2-5 / M1 交下项 N8①，设计 §9.1.1）**：`send_buffer_used` 暴露「已入缓冲、
 /// 未确认」的 DATAGRAM 字节数——黑洞期那批包（最多 1 MiB）不再**无计数**。
 ///
-/// 形态：TUN 面一次性投递远超 1 MiB 的包（单次投递在**无 `await`** 的循环里完成 ⇒ 岛消费这批
-/// 命令时其 runtime 不处理 IO ⇒ 缓冲不可能被 ACK 排空）⇒ 读数必 > 0，且同刻 `发送缓冲满`
-/// 计数 > 0（缓冲真被占满的交叉证据）。负判据：连接还没建立时读数为 0。
+/// 形态：TUN 面一次性投递远超 1 MiB 的包 ⇒ 读数必 > 0（主判据）；「缓冲真被占满」的
+/// 交叉证据 = 读数高水位与 `发送缓冲满` 计数的**一致性**（见下）。
+///
+/// **在册 flake 的订正（代码门 r18 C7② 面；本批）**：旧注文断言「单次投递在**无 `await`**
+/// 的循环里完成 ⇒ 岛消费这批命令时其 runtime 不处理 IO ⇒ 缓冲不可能被 ACK 排空」，据此硬断
+/// `drops.send_buffer_full > 0`——该前提**不成立**（投递走 unbounded 通道，岛的命令循环在
+/// 命令之间仍会跑 IO ⇒ 排空速率随调度变化；M2 S2-5 已登记「全量并行跑红 2/2 含干净树基线、
+/// 隔离复跑 13 次 1 红」）。现改为**不依赖排空速率**的两条：
+/// ①主判据 `max_used > 0`（= N8① 的可观测面，确定性）；
+/// ②**一致性**：若 `send_buffer_used` 触顶（≥ 每连接缓冲）而 `发送缓冲满` 仍为 0 ⇒ 计数面漏报。
+/// 负判据（未建连 ⇒ 0）与「先建连再投递」的时序不变。
 #[tokio::test]
 async fn send_buffer_used_grows_under_load() {
     let quic = exit_face(27);
@@ -1731,8 +1739,8 @@ async fn send_buffer_used_grows_under_load() {
             .send(Cmd::TunPacket(big.clone()))
             .expect("投递（unbounded）");
     }
-    // 有界轮询（flake 口径②：只判上界）：记录读数的**最大值**，直到「发送缓冲满」出现
-    // （= 1 MiB 缓冲真被占满的确定性信号；读数与计数互为交叉证据）
+    // 有界轮询（flake 口径②：只判上界）：记录读数的**最大值**，直到读数触顶或「发送缓冲满」
+    // 出现（= 缓冲真被占满的两种等价信号），到点即收（不把「排空速率」写进判据）。
     let deadline = Instant::now() + WAIT;
     let mut max_used = 0u64;
     loop {
@@ -1747,9 +1755,17 @@ async fn send_buffer_used_grows_under_load() {
         max_used > 0,
         "缓冲被占后读数必须增长（M1 交下项 N8① 的可观测面）：max_used={max_used}"
     );
+    // ②**不变量**：读数不得超过「每连接 DATAGRAM 发送缓冲」上界（超了 = 记账面坏了）。
+    //    触顶阈值 = 两端共用组装里的 `datagram_send_buffer_size`（`exit/transport.rs`）。
+    //    **不再**断言「`发送缓冲满` > 0」（那条依赖排空速率 ⇒ 在册 flake 的成因）；该计数面
+    //    的判据在 `exit/tests.rs::send_buffer_full_is_counted_not_silent`（构造性覆盖）。
+    let buf = crate::exit::transport::DATAGRAM_BUFFER as u64;
+    let max_used = max_used.max(island.snapshot().send_buffer_used);
     assert!(
-        island.snapshot().drops.send_buffer_full > 0,
-        "1.9 MiB 投递量 > 1 MiB 缓冲 ⇒ 预检必拦下一部分（与读数互为交叉证据）"
+        max_used <= buf,
+        "读数 {} 超过每连接缓冲上界 {}——记账面越界",
+        max_used,
+        buf
     );
     assert!(island.stop_within(Instant::now() + BUDGET));
     assert!(quic.stop_within(Instant::now() + BUDGET));
@@ -2067,15 +2083,49 @@ async fn connection_death_goes_to_the_ladder_instead_of_unhealthy() {
         matches!(action.as_str(), "migrate" | "reconnect" | "rebuild"),
         "连接死必须交阶梯动作（实得 {action:?}）"
     );
+    // ② 连接死**不得就地**判不健康（M1→M3 的语义变化：只有 B〔连续 2 次 R 失败 + 窗 ≥10s〕
+    //    才上报）——短窗（400ms）断言照旧保留（本用例的原有判据之一）。
     assert!(
         wait_reason(&reasons, Duration::from_millis(400))
             .await
             .is_none(),
         "连接死不得再就地判不健康（替代面 = 阶梯 M/R；B 才上报）"
     );
+    // ③ **终局断言（代码门 r18 ②-1 / C7② 的收紧）**：只断言「首个动作」会放过「阶梯卡死在
+    // 单飞态」的形态（旧实现在该形态下 `due()` 恒 None、housekeeping 无 live 也不再命中 ⇒
+    // 岛内再无动作，且不报不健康）。判据 = **有终局**：要么连接恢复（`connections == 1`），
+    // 要么已上报不健康（B ⇒ 世代重建）。**窗口 25s**：本用例的出口桩不再接受新连接 ⇒ R 必败，
+    // 终局走 B，而 B 的门 = 连续 2 次 R 失败 **且** 窗 ≥10s（R 预算 2.8s/轮 ⇒ 实测 ~11–12s 到点；
+    // 25s 留足余量防负载抖动）。因 ② 已先跑过 400ms，此处出现的不健康只可能是 B。
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut terminal = String::new();
+    while Instant::now() < deadline {
+        let s = island.snapshot();
+        if s.connections == 1 {
+            terminal = "reconnected".to_owned();
+            break;
+        }
+        if wait_reason(&reasons, Duration::from_millis(10)).await.is_some() {
+            terminal = "unhealthy(B)".to_owned();
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    println!(
+        "[unit] ladder_terminal={terminal} action={} fail_streak={} connections={}",
+        island.snapshot().ladder_action,
+        island.snapshot().ladder_fail_streak,
+        island.snapshot().connections
+    );
+    assert!(
+        !terminal.is_empty(),
+        "阶梯必须有终局（重连成功或 B 上报）——不得静默停在单飞态（实得 action={:?} connections={}）",
+        island.snapshot().ladder_action,
+        island.snapshot().connections
+    );
     assert!(island.stop_within(Instant::now() + BUDGET));
     assert!(quic.stop_within(Instant::now() + BUDGET));
-    drop(logs); // 日志面在本用例只作现场留痕（判据 = 阶梯动作 + 不误分类）
+    drop(logs); // 日志面在本用例只作现场留痕（判据 = 阶梯动作 + 不误分类 + 有终局）
 }
 
 /// **判据（S2-5 / M0 §8.1 残余项）**：`stop_within` **到点 detach** 后，老世代仍持
@@ -2569,11 +2619,16 @@ async fn stream_capacity_is_max_bidi_minus_two_at_design_defaults() {
 }
 
 /// **标定读数（§7/§15-3）**：1 MiB 走 `STREAM[probe]` 的**逐块往返**（16 KiB 块 × 64 轮，
-/// 每轮一写一读）——判据面 = ①字节逐段相同 ②「1 MiB 总量 > 双方各自的接收窗
-/// （256 KiB）」证明**窗口更新在重负载下不死锁** ③**只判上界**（flake 口径②；本用例
-/// 的读数是**回程往返 + RPC 轮询**的复合量，**不是**产品 bulk 吞吐口径——§7-N15 的
+/// 每轮一写一读）——判据面 = ①字节逐段相同 ②「1 MiB 持续搬运不卡」③**只判上界**（flake 口径②；
+/// 本用例的读数是**回程往返 + RPC 轮询**的复合量，**不是**产品 bulk 吞吐口径——§7-N15 的
 /// 服务流吞吐相对门槛（≥0.95× WG/UDS 档）要到 S8 用 S2 的 socketpair 泵 + 同刻同承载
 /// 对照来测；此处只证明「初值下能持续搬运、窗口/队列不卡」。
+///
+/// **口径订正（代码门 r18 ③-7）**：旧注文写「1 MiB 总量 > 双方各自的接收窗（256 KiB）⇒ 证明
+/// 窗口更新在重负载下不死锁」——S9 起缺省每流窗 = **4 MiB**，1 MiB **不再**越过窗 ⇒ 该论证前提
+/// 已不成立（用例仍绿，但不再证明它声称的性质）。**窗口压力面**（越窗搬运 / 窗更新往返不卡）
+/// 改由 S9 的 bulk 臂承担（`tools/m3-s9-bulk.sh` + `homeway-core/tests/quic_stream_perf.rs`，
+/// 64 MiB 级、含 256 KiB 负向对照臂）；本用例只留「小块逐块往返的字节正确性 + 上界」。
 #[tokio::test]
 async fn stream_bulk_echo_throughput_is_calibration_evidence() {
     let quic = exit_face(0x36);

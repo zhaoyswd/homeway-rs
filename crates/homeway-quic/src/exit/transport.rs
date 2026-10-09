@@ -34,7 +34,8 @@ pub(crate) const MTU_UPPER_BOUND: u16 = 1400;
 /// 直译 = 32×8MiB 不可接受（M1 设计 §6.3 裁决；`docs/QUIC-BASELINE.md` 内存门槛同源）。
 pub(crate) const DATAGRAM_BUFFER: usize = 1 << 20;
 
-/// ACK 频率阈值（出口侧下发给对端；中继 200pps 预算是硬约束——默认 ACK 比值 3.97
+/// ACK 频率阈值（**两端共用同一份组装** ⇒ 客户端与出口都广告本值，不只是「出口侧下发」；
+/// 代码门 r18 ①-2 的措辞订正。中继 200pps 预算是硬约束——默认 ACK 比值 3.97
 /// ⇒ 下行上界 ≈9 Mbps，须显式开启；M1 设计 §1.2/§7.2 B3）。
 pub(crate) const ACK_ELICITING_THRESHOLD: u32 = 16;
 
@@ -56,7 +57,9 @@ pub(crate) const MIGRATION: bool = true;
 // 流面限制（M3 §1.7 的账；值域与 env 覆盖见 `crate::tuning`）：
 // 为什么在 `TransportConfig` 里显式设置（而不是吃 quinn 缺省）——quinn 缺省
 // `100 bidi + 100 uni × 1.19 MiB` ⇒ 最坏接收窗 **≈238 MB/连接**（quinn 自身文档警告）；
-// 产品内存账（§7）取 `64 × 256 KiB = 16 MiB` 上界。**两端共用同一个组装函数**
+// 产品内存账（§7）在 **S9 整改后**取「每流 4 MiB × 连接级聚合闸 8 MiB」⇒ **单连接接收面
+// 最坏 8 MiB**（比设计 §7 的 16 MiB 账还低一半；旧值 256 KiB/隐含 16 MiB 已被 S9 取代，
+// 登记见 `docs/INTEROP-CRITERIA.md` 的窗口整改条）。**两端共用同一个组装函数**
 // （[`transport_config_with`]）⇒ 值域不会各写一份。
 use crate::tuning::StreamLimits;
 

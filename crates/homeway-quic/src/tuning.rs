@@ -48,6 +48,11 @@ pub mod stream_defaults {
     /// S9 实测：把出口侧本值抬到 8 MiB 对下行吞吐**零影响**（70.3/71.0 vs 70.0/71.9 MiB/s）
     /// ⇒ 下行瓶颈不在发送缓冲；上传方向的发送侧缓冲同理属「在途未确认字节」闸，
     /// 2 MiB 对 4 MiB 窗仍 ≥ 在途量级 ⇒ **本值不改**（保持设计 §1.7 的账）。
+    ///
+    /// **口径边界（代码门 r18 ③-3，如实登记）**：上面的「零影响」读数取自**回环**（RTT ≈0.1ms）；
+    /// 本值的语义 = 发送端本地「未确认保留字节」上界 ⇒ 可持续吞吐 ≲ `send_window / RTT`
+    /// （2 MiB / 100 ms ≈ 20 MB/s 量级）**只在真机 RTT 档才可能成为瓶颈** ⇒ 真机复测（M5）
+    /// 须**双向**采读数，并注意**出口进程不施加本组 env**（消融上传方向要在装配点接线）。
     pub const SEND_WINDOW: u32 = 2 * 1024 * 1024;
     /// 每流**待发队列**上界（§1.4：有界待发，懒分配）。
     pub const PENDING_BYTES: usize = 64 * 1024;
@@ -149,6 +154,17 @@ impl StreamLimits {
             }
             EnvOutcome::Rejected(note) => notes.push(note),
             EnvOutcome::Unset => {}
+        }
+        // 跨项关系（代码门 r18 ③-4）：**连接级接收窗必须 ≥ 每流接收窗**，否则连接窗是真界
+        // ⇒ 抬高的每流窗静默失效（quinn 不校验、不夹取；缺省值由单测钉住，但 env 组合能
+        // 构造出违例）。处置 = **抬连接窗到每流窗**（保证「所请求的每流窗可达」）并记一行。
+        if self.recv_window > self.conn_recv_window {
+            let was = self.conn_recv_window;
+            self.conn_recv_window = self.recv_window;
+            notes.push(format!(
+                "quic: ⚠️ 流面参数跨项关系 —— 连接级接收窗（{}B）< 每流接收窗（{}B）会让每流窗失效；连接窗按需抬到 {}B（照依赖库语义：连接级窗 = 接收面聚合上界）",
+                was, self.recv_window, self.conn_recv_window
+            ));
         }
         (applied, notes)
     }
@@ -548,6 +564,34 @@ mod tests {
         let mut lim = StreamLimits::design();
         assert_eq!(lim.apply_env(&table(&[("HOMEWAY_QUIC_STREAM_WINDOW", "262144")])).0, 1);
         assert_eq!(lim.recv_window, 256 * 1024, "旧缺省档位可达（负向对照臂）");
+    }
+
+    /// **判据（跨项关系，代码门 r18 ③-4）**：连接级接收窗 < 每流接收窗 ⇒ **抬连接窗** +
+    /// 一行说明（否则每流窗静默失效：连接窗是真界）；合法组合不产说明行。
+    #[test]
+    fn env_cross_check_keeps_conn_window_above_stream_window() {
+        // 违例组合：每流 16 MiB（上限档）+ 连接窗缺省 8 MiB
+        let mut lim = StreamLimits::design();
+        let (applied, notes) = lim.apply_env(&table(&[("HOMEWAY_QUIC_STREAM_WINDOW", "16777216")]));
+        assert_eq!(applied, 1);
+        assert_eq!(lim.recv_window, 16 * 1024 * 1024);
+        assert_eq!(lim.conn_recv_window, 16 * 1024 * 1024, "连接窗被抬到每流窗");
+        assert_eq!(notes.len(), 1, "须有一行说明：{notes:?}");
+        assert!(notes[0].contains("连接级接收窗"), "{}", notes[0]);
+        // 合法组合（每流 1 MiB < 连接 8 MiB）⇒ 零说明行
+        let mut lim = StreamLimits::design();
+        let (applied, notes) = lim.apply_env(&table(&[("HOMEWAY_QUIC_STREAM_WINDOW", "1048576")]));
+        assert_eq!(applied, 1);
+        assert!(notes.is_empty(), "合法组合不产说明行：{notes:?}");
+        assert_eq!(lim.conn_recv_window, 8 * 1024 * 1024, "连接窗不动");
+        // 显式把连接窗设小、每流窗设大 ⇒ 仍按「抬到每流窗」收（连接窗是真界）
+        let mut lim = StreamLimits::design();
+        let (_, notes) = lim.apply_env(&table(&[
+            ("HOMEWAY_QUIC_STREAM_WINDOW", "4194304"),
+            ("HOMEWAY_QUIC_RECV_WINDOW", "262144"),
+        ]));
+        assert_eq!(notes.len(), 1);
+        assert_eq!(lim.conn_recv_window, 4 * 1024 * 1024);
     }
 
     /// **判据（快探参数初值 + 消融臂，§15-2/§3.2）**：缺省 = 设计值；env 命中逐项生效。

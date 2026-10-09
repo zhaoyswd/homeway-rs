@@ -769,8 +769,12 @@ fn run_exit(
         ));
         // ---- 抗放大面生效值（§3.2；`always` 档的代价记行 = §5-11 登记项）----
         (*logf)(&format!(
-            "quic: 流面参数（bidi={} uni={} recv_window={}B send_window={}B）",
-            cfg.streams.max_bidi, cfg.streams.max_uni, cfg.streams.recv_window, cfg.streams.send_window
+            "quic: 流面参数（bidi={} uni={} recv_window={}B conn_recv_window={}B send_window={}B）",
+            cfg.streams.max_bidi,
+            cfg.streams.max_uni,
+            cfg.streams.recv_window,
+            cfg.streams.conn_recv_window,
+            cfg.streams.send_window
         ));
         (*logf)(&format!(
             "quic: 抗放大面（retry={}；retry_token_lifetime={:?}；每源 {}/{:?}；证明失败闸 {}）",

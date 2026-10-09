@@ -11,8 +11,12 @@
 //!   服务侧收线（EOF）⇒ 对端 `finish()`（**不用 reset 做正常收口**）——与
 //!   `tokio::io::copy_bidirectional` 同义（一个方向收线不打断另一个方向）。
 //! - **复位**（§2.2 设计门 N12）：AF_UNIX 没有 TCP 的「`SO_LINGER=0` ⇒ RST」语义，
-//!   且今天出口侧本来就是普通 close ⇒ **`reset(code)` = 关 socketpair（普通 close）**；
-//!   错误码只留在出口行/计数里，**不跨 socketpair**。服务侧先收线时同样走 FIN。
+//!   且今天出口侧本来就是普通 close ⇒ **`reset(code)` = 关 socketpair**；错误码只留在
+//!   出口行/计数里，**不跨 socketpair**。服务侧先收线时同样走 FIN。
+//!   **实装口径（代码门 r18 C3 订正）**：对端 reset/连接死时，泵侧做的是 `shutdown(SHUT_WR)`
+//!   （`upstream` 的 `Err` 分支）——**效果**是「服务侧不再永久阻塞在 read 上」（它见到 EOF），
+//!   与「普通 close」在**服务侧可观测面**等价（本轮没有 RST 语义）；两者不等价之处只在
+//!   读半边仍可由下行任务持有（故不是整条 fd 的 close）。
 //! - **背压**：socketpair 内核缓冲（显式 [`crate::tuning::service_defaults::SOCKPAIR_BYTES`]
 //!   /方向）+ QUIC 流窗口 = 端到端真背压；服务侧的阻塞读写语义与今天 UDS 逐字相同。
 //! - **不新增线程**：泵是出口 `current_thread` runtime 上的一枚任务（§2.2 的准确说法：
