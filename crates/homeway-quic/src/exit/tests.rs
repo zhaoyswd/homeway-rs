@@ -2264,6 +2264,13 @@ async fn flood_same_source_is_refused_and_counted() {
             wrong_pin_attempt(addr).await; // 闸拒（客户端拿到 CONNECTION_REFUSED）
         }
     }
+    // 有界等待最后一次尝试的**记账落地**（flake 口径②：只判上界）：K 次尝试是异步收尾的，
+    // 立即读快照会丢最后 1 条的归账（ubuntu CI 实测 4 vs 5）。
+    assert!(
+        wait_until(|| quic.snapshot().flood_refused >= K - 3, WAIT).await,
+        "第 F+1..K 次全拒（K−F = 5）须有界到账：{:?}",
+        quic.snapshot()
+    );
     let snap = quic.snapshot();
     assert_eq!(
         snap.flood_refused,
