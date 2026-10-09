@@ -838,7 +838,7 @@ cargo test --workspace && cargo clippy --all-targets -D warnings
 | | ⏵（到） | `中继就绪：[::]:42781（…）`（双栈形态；v4 映射地址仍可连） | | |
 | L-10 | **Q3/Q4 新增告警行 + Q4 致命→非致命** | `std::fs::write(listen_port.txt)?`（致命）/ 静默（两处 public_endpoint） | Go 对齐（Q3/Q4 显式立条） | 出口启停语义（非致命）、E20 族（additive 告警） |
 | | ⏵（到） | 均非致命 + 告警行（**additive**）；既有成功行文逐字不变 | | |
-| L-11 | **新增行 N-e / E-q6 / E25** | 无 → 有（见 §8.4） | 单承载语料补全 + A10（M3 交下） | 出口排障 / tier（E25 仅日志面）；**ID 空位复核 = S5 的门断言（`grep -c '^| E-q6' == 0` 等三条）** |
+| L-11 | **新增行 N-e / E-q6 / E25** | 无 → 有（见 §8.4） | 单承载语料补全 + A10（M3 交下） | 出口排障 / tier（E25 仅日志面）；**ID 空位复核 = S5 的门断言（按 §7.1-⑩ 口径：词边界全表式 + 正向自校准；`^| ` 行首式禁用于 additive 行）** |
 
 **计数（设计门 r22 H18 订正：原稿「8 条 vs 11 行」自相矛盾，本节逐行重数）**
 
@@ -936,6 +936,8 @@ cargo test --workspace && cargo clippy --all-targets -D warnings
 
 ## 11. 实施清单（S1–S8 + 依赖顺序 + 每项完成判据 + 净删行数登记方式）
 
+> **本设计已过门，可实现**（设计门结论 = 通过；见 §13.13）。
+
 > 顺序（**与 §1.5 的 7 步表同源**；S7a 依赖 S1 不需等到最后；**S1b 依赖 S3**）：`S0 → S0b（relay import 改道，
 > 见 §6-Q2 纪律）→ S1 → {S7a, S7b, S7c}（可并行，各自独立 commit）→ S2a（含 §2.6-G5/G6/G7 + §2.4-A-2 七处 `st.tun` 读点
 > + R20 的 `ConnErr` 清单）→ S2 → S3（a=公共端点面迁址 / b=WG 删除）→ **S1b（D11：ring-shim + `[patch]` +
@@ -954,7 +956,7 @@ cargo test --workspace && cargo clippy --all-targets -D warnings
 | **S2 客户端 WG 面切除** | `tun_exec` 去 `L3Bearer`/两处 dial 腿/阶梯域/hint/save/域名面（§1.3-T4）；删 `wgcore/mod.rs`、`session/{mod,recover}`、`wtransport/{bind,endpoint_cache,domain_eps,mod}`；`envflag` 去 `HOMEWAY_TRANSPORT`（§4.3①） | S2a | `cargo test --workspace` 绿 + `grep -rn "current_client()\|L3Bearer\|session_connect" crates/` **零命中** + 隔离门 11 条绿 + `quic-island-e2e` 去 WG 断言后绿 |
 | **S3 出口 WG 面切除（含公共端点面迁址）** | **S3a 先迁址**：§1.2-M4 的五类（STUN 观测 / 参照点探测应答 / udpcap caps / 绑卡重钉 / QUIC 腿注入计数）从 `ServerBind` 迁到 `homeway-quic::exit` 的 socket 层——**该步必然改 `homeway-quic` 的公面（r23 M9/M5 指出：与 §0.1『不改公面』相抵）⇒ §0.1/§0.2 的「岛改动面」须显式登记（A-2 七处 `st.tun` 读点 + S3a 的五类 API + §3.2-bis 若选 (b) 的 by-tun_ip）**；**S3b 再删**：`server/{bind,device,relayleg,txring}` 的 **WG 专属面**（T6/T7/T8 逐符号清单，§1.3）+ `engine.rs` 去 WG 装配（腿表 WG 分支/发送线程/`route_encap` WG 分支/`sync_quic_legs` 的 WG 部分）+ **E23 值域收窄（行保留；不得删行——r24 必闭合 1）** | S2 | 全绿 + `quic-ladder-e2e`/`quic-pf-e2e`/`quic-wg-e2e`（改写后）绿 + **`E20/E20a`（STUN 观测真观测）+ `C14`（参照点探测应答）两条判据的 e2e 在新落点复绿**（本棒点名的必改项）+ **`ExitSend::Unbound` 改「丢+计数+记行（首 3 + 每 100）」**（§3.2-bis；r25 新发现 D）+ **新增「无 WG 树的 DNS 回复 e2e」** + `serve status --json` 键面复验 + `[size]` 入册 |
 | **S4 intercept 收窄 + 观测面重写** | §3.2（`local_services`/`DialTarget::Unix`/`Kind::Exempt` 删；`served_ports` 单一语义）+ §3.3 行文 + §4.4 前缀删除 + §8.4 新增行（N-e/**E-q6**/E25） | S3 | 行文逐字断言（E5/E10/E11/E12/E14/E17 + 去前缀签名面）+ `intercept` 用例增删（`exempt_*` 两例删、transit+DNS 两径留）+ A10 收线时点 e2e |
-| **S5 判据全表登记 + fixtures + 扫查门** | §8 全表落 `INTEROP-CRITERIA.md`（**与代码同批 commit**）；§8.3 fixtures 退役 + `SHA256SUMS`/`MANIFEST` + 向量管线；新门 `tools/check-wg-removed.sh`（§7.1 九条）挂 `ci-local.sh` | S4 | 登记表条目齐（五字段）+ 词表门 PASS + 新门绿（含 ⑥ 注入负例自检）+ `cargo test -- --list` 无 WG 前缀用例 + **ID 空位门断言**（`^| E-q6`/`^| E25`/`^| N-e`/`^| C20`/`^| C21` 全 0）+ **计数输入集/数值语义表逐行复核**（≥5 行改写） |
+| **S5 判据全表登记 + fixtures + 扫查门** | §8 全表落 `INTEROP-CRITERIA.md`（**与代码同批 commit**）；§8.3 fixtures 退役 + `SHA256SUMS`/`MANIFEST` + 向量管线；新门 `tools/check-wg-removed.sh`（§7.1 九条）挂 `ci-local.sh` | S4 | 登记表条目齐（五字段）+ 词表门 PASS + 新门绿（含 ⑥ 注入负例自检）+ `cargo test -- --list` 无 WG 前缀用例 + **ID 空位门断言**（按 §7.1-⑩ 口径：**词边界全表式** + 对已占 ID 自校准；`E-q6`/`E25`/`N-e`/`C20`/`C21` **全 0**）+ **计数输入集/数值语义表逐行复核**（≥5 行改写） |
 | **S5t token B**（§5 若做） | `token.rs` 段容器（`hmw2` + `info/critical`）+ `rl1` body 冻结 + 向量重生 + `tools/**` 抽取面 | S5 | 新向量往返 + 字节锚 + `serve token` 渲染不变 + 全仓 `hmw1` 白名单核 + 上报 tier |
 | **S6 门槛终值 + 真机** | 体积/内存/CPU 终值实测（含 §9.3 复测）+ 真机构建 + 删码后烟囱（浏览器/files/term/portfwd 四件套） | S5 | 门槛表逐格填数（过/差异登记）+ `docs/reviews/M5.md` 读数台账 + 真机记录 |
 | **S7a 中继 v6（Q2）** | §6-Q2 的 ①②③④⑤ | S1（可与 S2/S3 并行但**独立 commit**） | v6 客户端经中继可用（本机 `local-rust-relay.sh` + 真机） + `R1` 行登记 + `relay_cli` 用例 |
@@ -1028,7 +1030,6 @@ cargo test --workspace && cargo clippy --all-targets -D warnings
 
 | # | 严重度 | 意见（摘要） | 处置 | 落到 |
 
-> **⚠️ 本节 = r22 原始记录**：其中三处措辞已在 r23/r24 更正——**A7** 的「`!is_wg()`」→ **`Quic|Relay`**（r23 M4）；**B12** 引用的「§1.5-bis」→ **§0.3.3-bis**（r24）；**B19** 的「v2 = 946 行」→ **1,066 行**（r23 实测）。其余单元格为 r22 当时的原始处置文本（**不追改历史**）。
 |---|---|---|---|---|
 | **A1/H1** | **高** | **D8/G-2 事实错误**：出口**腿回程 = QUIC 经中继的唯一通路**（`exit/socket.rs:3-19` 两条物理路径 + `engine.rs:1585` 的 `sync_quic_legs` + `relayleg.rs:565-576` 的拨腿）；整件删 = QUIC 经中继死、且补需改中继（破红线）；且 §8.1 `X1`「保留」与 D8 自相矛盾 | **认同（高危必改）**：本棒**独立回源码复核成立**（`exit/socket.rs` 头注释 + `engine.rs:1276-1285` + `sync_quic_legs`）⇒ `server/bind.rs`/`relayleg.rs` **改判「裁剪」**（T6/T7），新增「§1.1 腿面订正」块、G-2 作废改 G-2′、K11 入保留面、净删行数下调 | §1.1 订正块 / §1.3-T6/T7/T8 / §1.4-K11 / §1.6-G-2′ |
 | **A1b/H2** | **高** | `ServerBind` 的**腿表 `leg_readable` 是 kind=5 的唯一读者**；§1.2-M4 五类只列「注入/计数」，未含**读侧与所有权** | **认同**：并入 T6 的「保留」列 + §1.1 订正块的「单一读者是构造性不变量」 | §1.3-T6 / §1.1 订正块 |
@@ -1064,6 +1065,8 @@ cargo test --workspace && cargo clippy --all-targets -D warnings
 **不认同项：无**——本轮的每条意见本棒都独立回源码或真跑命令复核，**未发现需以证据反驳者**（唯一「评审自评需订正」的两处
 ——①§11.1 算术、②E1 三服务字段——属于**评审审计到的是我修订前的旧版**，评审自己在收口说明里已点明「对最新版已过时」；
 本棒按「以最新版为准」处理并保留该过程记录）。
+
+> **⚠️ 本节 = r22 原始记录**：其中三处措辞已在 r23/r24 更正——**A7** 的「`!is_wg()`」→ **`Quic|Relay`**（r23 M4）；**B12** 引用的「§1.5-bis」→ **§0.3.3-bis**（r24）；**B19** 的「v2 = 946 行」→ **1,066 行**（r23 实测）。其余单元格为 r22 当时的原始处置文本（**不追改历史**）。
 
 ### 13.2 评审**独立复现**的证据（本棒采纳，作为 §0 结论的第二方见证）
 
@@ -1222,6 +1225,25 @@ cargo test --workspace && cargo clippy --all-targets -D warnings
 - **v5 全量修订已落**（§13.11 逐条 + `grep` 实测证据）；**本轮特别登记的方法教训**：r24 的「自述已落但未落」由**批量脚本静默中止**造成 ⇒ **v5 起，凡「已落」声明必须附 `grep`/`sed -n` 实测**（本节已照此执行）。
 - **按 r25 的明文要求**（「修完可再走一轮确认」）⇒ 走 **r26 确认轮**；**r26 未过之前不得开工实现**。
 - **r26 复审目标**：①必闭合 3 项 + 新发现 9 项 + r24 未落 12 项的 v5 落点逐条 `grep` 复核；②**跨表传导专扫**（r25 的 7 组事实链，重点 ①E23 与 ②分流键的**判据面**）；③抽查 §2.7（R-1 已改 `ServicePort`）与 §1.5/§11 的 15 片对齐。
+
+### 13.13 门结论（r26 确认轮 + 收口）
+
+| 项 | 值 |
+|---|---|
+| r26 目录 | **`/tmp/dsh-review/r26.7NjhWt/`**（`output.md` 22,376 B = **完整报告**；`stderr.log`） |
+| 命令 / exit | `dsh --profile headless "$(cat prompt.txt)" > output.md 2> stderr.log; echo "exit=$?"` ⇒ **exit = 0** |
+| r26 复核结论（原文摘要） | 「r25 的 3 项必闭合（1 高危 + 2 中）**全部真闭合**，且逐条经源码回源与活体面 `grep` 双向证实…**无一构成『照抄实施清单即删错保留面』类的高危**」 |
+| r26 对残余的定性 | 列 **10 组非阻塞项**（文档一致性 / 表格转义 / 计数口径 / 登记纪律），并**明确标注「全部非阻塞，可在实现期或收尾同批修掉，不构成开工障碍」** |
+| **门结论（原文）** | **「门已过（可开工）」** |
+
+**设计门结论：通过（r22 28 条 / r23 22 条 / r24 18 条 / r25 12 条逐条处置；无遗留阻塞项）。**
+
+> 收口说明（2026-10-09，主会话调度指令：停开新复审轮）：r22→r25 的边际项已收敛（28 → 22 → 18 → 12 → 必闭合 3/3 闭合），
+> 设计门目的（方案站得住 / 删除清单完备 / 判据登记可执行 / 风险已登记）已达成 ⇒ **本棒只做两处收口改动**：
+> ①本节（门结论）；②§11 前的「已过门」一行。**r26 列出的 10 组非阻塞项不再全量修订**（登记已足够），
+> **留给实现棒与代码门按 §7.1-⑩ / §11-S5 的口径处置**；其中「§11-S5 / §8.5-L-11 的 ID 门断言措辞」已按 r26 建议
+> 就地统一为 **§7.1-⑩ 的词边界式 + 自校准**（避免 S5 落一个假绿门），另修两处**编辑副作用**（§13.1 表的注移出表头、
+> `\|` 转义）——**均为格式/措辞级，不改任何设计内容**。
 
 ---
 
