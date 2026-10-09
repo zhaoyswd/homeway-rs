@@ -49,11 +49,16 @@ for a in "$@"; do
   prev="$a"
 done
 if (( SMOKE )); then LINKS=(RRR); fi
-# ---- L2/L3 退役（M5 C4 裁决②；登记 = docs/reviews/M5.md）----
-# 两行 = {Go 出口} × {Rust 客户端}：Go 出口的 token 不带 QUIC 端点/RPK ⇒ QUIC-only 的
-# Rust 客户端**必然失败**（C3 实测三判据 FAIL）。按「无兼容包袱」口径（2026-10-09 用户
-# 重申）该组合不存在：Go 出口已于 2026-10-05 整体退役 ⇒ 退役行**跳过 + 说明**（不判红）。
-L2_L3_RETIRED=(L2 L3)
+# ---- L2/L3 + L4/L5 退役（M5 C4 裁决②；登记 = docs/reviews/M5.md §4.2/§4.3）----
+# · L2/L3 = {Go 出口} × {Rust 客户端}：Go 出口的 token 不带 QUIC 端点/RPK ⇒ QUIC-only 的
+#   Rust 客户端**必然失败**（C3 实测三判据 FAIL）。
+# · L4/L5 = {Rust 出口} × {Go 客户端}：**本棒实测**（M5 C4）——Go 客户端**连 token 都解不开**：
+#   `homeway: token 非法（hmw1…）：格式非法`（M1 起 Rust 出口的 token 携带 `Quic` 类端点，
+#   Go 侧解析器不认；且 WG 面已随 M5 删除）⇒ C-ready/MP-n2/RL-via 三判据 FAIL。
+# 按「无兼容包袱」口径（2026-10-09 用户重申）这两个组合都不存在：Go 出口已于 2026-10-05
+# 整体退役、Go 客户端为 WG-only ⇒ 退役行**跳过 + 说明**（不判红）。**可一行回退**（删掉
+# 本数组里对应项即恢复实跑）。
+L2_L3_RETIRED=(L2 L3 L4 L5)
 _kept=(); for l in "${LINKS[@]}"; do
   if (( ${L2_L3_RETIRED[(I)$l]} )); then
     echo "[$l] SKIP — Go 出口退役（2026-10-05）+ 无兼容包袱 ⇒ 该组合不存在（M5 C4 裁决②）"
