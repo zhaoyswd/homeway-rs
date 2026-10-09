@@ -20,7 +20,7 @@ use crate::reg4::{
     Nonce, ProofFrame, RefreshFrame,
 };
 use crate::rpk::{Ed25519Seed, RpkPublicKey};
-use crate::{ExitInbound, ExitQuic, ExitQuicConfig, Reg4Verdict, RejectWhy};
+use crate::{ExitInbound, ExitQuic, ExitQuicConfig, Reg4Verdict, RejectWhy, RetryPolicy};
 
 /// 收工预算（与 `wgcore::CLIENT_CLOSE_BUDGET` 同量级 = 2s）。
 const BUDGET: Duration = Duration::from_secs(2);
@@ -532,6 +532,9 @@ struct Stub {
     /// 判定由真引擎用例 `admit_reg4_refresh_does_not_resurrect_evicted_device` 覆盖，
     /// 这里只注入它的**裁决结果**）。
     evict_refresh: AtomicBool,
+    /// Proof 的裁决改成**引擎裁决拒绝**（S3-3 的 r14 F12 用例：表满/冲突/吊销/窗超这类
+    /// 可用性故障**不得**计入证明失败闸）。
+    engine_reject: AtomicBool,
     packets: Mutex<Vec<Vec<u8>>>,
 }
 
@@ -544,6 +547,7 @@ impl Stub {
             proofs: AtomicU64::new(0),
             refreshes: AtomicU64::new(0),
             evict_refresh: AtomicBool::new(false),
+            engine_reject: AtomicBool::new(false),
             packets: Mutex::new(Vec::new()),
         })
     }
@@ -551,6 +555,11 @@ impl Stub {
     /// 注入「引擎判 = 刷新帧但设备不在册（已淘汰）」（S2-2 用例专用）。
     fn evict_refresh(&self) {
         self.evict_refresh.store(true, Ordering::SeqCst);
+    }
+
+    /// 注入「引擎裁决拒绝」（S3-3 的 r14 F12 用例专用；MAC 校验被跳过 ⇒ 只判裁决形态）。
+    fn engine_reject(&self, on: bool) {
+        self.engine_reject.store(on, Ordering::SeqCst);
     }
 
     fn pump(&self, quic: &ExitQuic) {
@@ -568,17 +577,27 @@ impl Stub {
                 // 第三道前置的注入：刷新帧一律按「设备不在册」拒（**不看 MAC**——该判定在
                 // 真引擎里先于 MAC 试秘，本桩复刻同一序）
                 let evicted = is_refresh && self.evict_refresh.load(Ordering::SeqCst);
-                if !evicted && req.frame.mac_matches(&self.secret, &req.exporter) {
+                let engine_rejected =
+                    !is_refresh && self.engine_reject.load(Ordering::SeqCst);
+                if evicted {
+                    self.rejected.fetch_add(1, Ordering::SeqCst);
+                    req.reply(Reg4Verdict::Rejected {
+                        why: RejectWhy::RefreshNotRegistered,
+                    });
+                } else if engine_rejected {
+                    // 引擎裁决拒绝（表满/冲突/吊销/窗超的等价注入）：r14 F12 的负例面
+                    self.rejected.fetch_add(1, Ordering::SeqCst);
+                    req.reply(Reg4Verdict::Rejected {
+                        why: RejectWhy::EngineRejected,
+                    });
+                } else if req.frame.mac_matches(&self.secret, &req.exporter) {
                     self.accepted.fetch_add(1, Ordering::SeqCst);
                     req.reply(Reg4Verdict::Accepted { tunnel_ip: TUNNEL_IP, tun_ip: TUN_IP });
                 } else {
                     self.rejected.fetch_add(1, Ordering::SeqCst);
-                    let why = if evicted {
-                        RejectWhy::RefreshNotRegistered
-                    } else {
-                        RejectWhy::MacMismatch
-                    };
-                    req.reply(Reg4Verdict::Rejected { why });
+                    req.reply(Reg4Verdict::Rejected {
+                        why: RejectWhy::MacMismatch,
+                    });
                 }
             }
             ExitInbound::Packet { pkt, .. } => self.packets.lock().unwrap().push(pkt),
@@ -1782,4 +1801,443 @@ async fn removed_leg_does_not_fall_back_to_direct_socket() {
     send_ready(&sock, &tx(relay_addr, b"again")).await;
     let (n, _src) = relay.recv_from(&mut buf).expect("重登记后腿路径应恢复");
     assert_eq!(&buf[..n], b"\xBB\x05again");
+}
+
+// ---------- S3（M2 §3.1–§3.3）：抗放大闸 + Retry ----------
+
+/// 建出口面（S3 用例共用：可改配置；日志丢弃）。
+fn exit_face_with(seed: u8, f: impl FnOnce(&mut ExitQuicConfig)) -> ExitQuic {
+    let (logf, _rx) = sink();
+    let mut cfg = ExitQuicConfig::new(seed_of(seed), 32);
+    f(&mut cfg);
+    ExitQuic::start(loopback_socket(), cfg, logf).expect("出口 QUIC 面可起")
+}
+
+/// 建出口面 + 收回其日志行（S3 的「行与快照同源」断言用）。
+fn exit_face_logged(seed: u8, f: impl FnOnce(&mut ExitQuicConfig)) -> (ExitQuic, Receiver<String>) {
+    let (logf, rx) = sink();
+    let mut cfg = ExitQuicConfig::new(seed_of(seed), 32);
+    f(&mut cfg);
+    (ExitQuic::start(loopback_socket(), cfg, logf).expect("出口 QUIC 面可起"), rx)
+}
+
+fn seed_of(byte: u8) -> Ed25519Seed {
+    Ed25519Seed::from_bytes([byte; 32])
+}
+
+/// 一次「同源未完成」的建连尝试：**错 RPK** ⇒ 客户端握手中止（TLS alert）⇒ 出口侧
+/// 该次尝试永远不完成（正是每源闸要计的形态）。
+async fn wrong_pin_attempt(exit: SocketAddr) -> bool {
+    let (client, cfg, _sock) = client_endpoint_and_config(RpkPublicKey::from_bytes([0xEE; 32]));
+    let done = tokio::time::timeout(
+        WAIT,
+        client
+            .connect_with(cfg, exit, super::rpk::client_pin::SERVER_NAME)
+            .expect("connect 调用面"),
+    )
+    .await
+    .is_ok_and(|r| r.is_ok());
+    client.close(quinn::VarInt::from_u32(0), b"test done");
+    done
+}
+
+/// **判据（S3-1 / §3.3-1）**：同源短时大量「未完成」尝试 ⇒ 第 `F+1` 次起全拒、
+/// `flood_refused = K − F`（确定性注入，不靠真打流量）。
+#[tokio::test]
+async fn flood_same_source_is_refused_and_counted() {
+    let (quic, rx) = exit_face_logged(61, |c| {
+        c.per_src_fails = 3;
+        c.per_src_window = Duration::from_secs(60);
+        c.retry_policy = RetryPolicy::Never; // 本条只测闸（Retry 由下一用例测）
+    });
+    let addr = quic.local_addr();
+    const K: u64 = 8;
+    for i in 0..K {
+        if i < 3 {
+            let ok = wrong_pin_attempt(addr).await;
+            assert!(!ok, "错 pin 不得连上");
+        } else {
+            wrong_pin_attempt(addr).await; // 闸拒（客户端拿到 CONNECTION_REFUSED）
+        }
+    }
+    let snap = quic.snapshot();
+    assert_eq!(
+        snap.flood_refused,
+        K - 3,
+        "第 F+1..K 次全拒（K−F = 5）：{snap:?}"
+    );
+    assert_eq!(snap.retry_sent, 0, "never 档恒不 Retry");
+    assert_eq!(snap.admitted, 0, "无一次完成（全是未完成尝试）");
+    // 行与快照同源（§3.3-5）：洪泛拒绝行在场；节流口径 = 首 3 + 每 100 ⇒ 本次 K−F=5 条
+    // 拒绝里只有前 3 条落行，且首条的「窗内第 k 次」= F+1 = 4（第 4 次尝试起全拒）。
+    let lines = drain_until(&rx, "quic: 握手洪泛拒绝", WAIT);
+    let more = collect_for(&rx, Duration::from_millis(300)); // 收尾：K−F 条拒绝已全在队列里
+    let flood_lines: Vec<&String> = lines
+        .iter()
+        .chain(more.iter())
+        .filter(|l| l.contains("quic: 握手洪泛拒绝"))
+        .collect();
+    assert_eq!(flood_lines.len(), 3, "节流口径 = 首 3 + 每 100（5 条拒绝只落 3 条）：{flood_lines:?}");
+    assert!(
+        flood_lines[0].contains("第 4 次尝试"),
+        "首条拒绝 = 窗内第 F+1 次：{}",
+        flood_lines[0]
+    );
+    assert!(flood_lines[0].contains("已拒"), "行文：{}", flood_lines[0]);
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（S3-2 / §3.1 压力触发）**：同源「未完成/被拒」≥ `RETRY_AFTER_FAILS` ⇒ 下一次
+/// 建连收到 Retry（`retry_sent` + 行），且**正常客户端仍能完成握手**（按 token 重发
+/// Initial ⇒ 地址被验证，§0.3 R1 形态）。
+#[tokio::test]
+async fn pressure_arm_sends_retry_and_client_still_completes() {
+    let (quic, rx) = exit_face_logged(62, |c| c.per_src_window = Duration::from_secs(60));
+    let pin = quic.rpk_public_key();
+    let addr = quic.local_addr();
+    // 攒「同源未完成」到触发条件②（`RETRY_AFTER_FAILS = 5`）：5 次错 pin 尝试都留下窗内
+    // 记录（= 未完成）；读数为 0 说明触发条件②在**下一条**建连前尚未命中。
+    for _ in 0..5 {
+        assert!(!wrong_pin_attempt(addr).await, "错 pin 尝试不得连上");
+    }
+    // 下一条（正常 pin）：同源未完成 ≥ 5 ⇒ Retry；客户端按 token 重发 ⇒ 仍能完成
+    let (client, cfg, _sock) = client_endpoint_and_config(pin);
+    let conn = tokio::time::timeout(
+        WAIT,
+        client
+            .connect_with(cfg, addr, super::rpk::client_pin::SERVER_NAME)
+            .expect("connect 调用面"),
+    )
+    .await
+    .expect("预算内定音")
+    .expect("Retry 之后客户端必须仍能完成握手（否则常态重连被打断）");
+    assert!(
+        wait_until(|| quic.snapshot().retry_sent >= 1, WAIT).await,
+        "应有 Retry：{:?}",
+        quic.snapshot()
+    );
+    let lines = drain_until(&rx, "quic: 地址校验挑战", WAIT);
+    let line = lines.last().expect("地址校验挑战行在");
+    assert!(line.contains("在途未认证"), "行文：{line}");
+    assert!(
+        wait_until(|| quic.snapshot().admitted >= 1, WAIT).await,
+        "Retry 后的连接应被采纳：{:?}",
+        quic.snapshot()
+    );
+    drop(conn);
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（S3-2 / r14 F10 + §3.3-6）**：≥3 候选的正常赛跑连续 8 轮 ⇒ `retry_sent = 0`
+/// 且 `flood_refused = 0`（触发条件不得落进常态包络）。
+///
+/// ⚠️ **形态口径（实测登记，见 commit/回报）**：本用例走 §3.1-② 描述的模型形态——
+/// 「候选**完成**握手后被收掉」（回环上三候选都在同一 RTT 内完成）。**客户端在候选完成
+/// 前 abort 输家**的形态（`race::run` 的 `abort_all` 语义）在出口侧落进
+/// `HandshakeOutcome::Failed` ⇒ 计入每源闸（实测：真岛 3 候选，第 2 轮起 `retry_sent`
+/// 增长、第 4 轮 `flood_refused` 到 3 ⇒ `NoCandidate`）——该形态的处置属设计裁决面
+/// （§3.2-④ 计数集 / §2.2 赛跑收尾语义），不在本切片改。
+#[tokio::test]
+async fn normal_races_do_not_trigger_retry_or_gate() {
+    let quic = exit_face_with(63, |c| c.per_src_window = Duration::from_secs(60));
+    let pin = quic.rpk_public_key();
+    let addr = quic.local_addr();
+    // 同一源（同 /32、同一 socket）+ 3 个并行候选到同一出口 —— 设计点名的「同源多候选」
+    // 最严形态（§3.1-② 的计数集若不排除「完成的尝试」，这里会攒满 ⇒ Retry）。
+    let (client, cfg, _sock) = client_endpoint_and_config(pin);
+    const ROUNDS: u64 = 8;
+    for round in 0..ROUNDS {
+        let a = client.connect_with(cfg.clone(), addr, super::rpk::client_pin::SERVER_NAME).expect("connect 调用面");
+        let b = client.connect_with(cfg.clone(), addr, super::rpk::client_pin::SERVER_NAME).expect("connect 调用面");
+        let c = client.connect_with(cfg.clone(), addr, super::rpk::client_pin::SERVER_NAME).expect("connect 调用面");
+        // 三个候选都走到「握手完成」（设计模型：完成 ⇒ 销账），随后全部收掉（胜者留用语义
+        // 在下一轮由新连接承接）。
+        let (ra, rb, rc) = tokio::time::timeout(WAIT, async { tokio::join!(a, b, c) })
+            .await
+            .unwrap_or_else(|_| panic!("第 {round} 轮：三候选都应在预算内定音"));
+        for (i, r) in [ra, rb, rc].into_iter().enumerate() {
+            assert!(
+                r.is_ok(),
+                "第 {round} 轮候选 {i} 未连上（{:?}）；快照 = {:?}",
+                r.err(),
+                quic.snapshot()
+            );
+        }
+        assert!(
+            wait_until(|| quic.snapshot().admitted > round, WAIT).await,
+            "第 {round} 轮胜者应被采纳：{:?}",
+            quic.snapshot()
+        );
+    }
+    let snap = quic.snapshot();
+    println!("[S3 normal] {snap:?}");
+    assert_eq!(snap.retry_sent, 0, "常态赛跑不得 Retry（r14 F10）：{snap:?}");
+    assert_eq!(snap.flood_refused, 0, "常态赛跑不得撞每源闸：{snap:?}");
+    // 回环上三候选**都会完成握手**（实测 admitted = 24/24：胜者留用、余者被 explicit close）
+    // ⇒ 每次完成都销账（否则 24 次尝试早把 per_src_fails=10 的窗口攒满 ⇒ 上面两条必红）。
+    assert!(snap.admitted >= ROUNDS, "每轮至少一个胜者：{snap:?}");
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// QUIC **Initial** 头里的 token 长度（`None` = 不是 Initial 或解析不出）——「扣住带 token
+/// 的 Initial」的中继判据（S3 的 token 有效期用例）。
+fn initial_token_len(p: &[u8]) -> Option<u64> {
+    if p.len() < 7 || p[0] & 0x80 == 0 || (p[0] >> 4) & 0x3 != 0 {
+        return None; // 非长头 / 非 Initial（Retry=3、Handshake=2、0-RTT=1）
+    }
+    let dcil = *p.get(5)? as usize;
+    let mut i = 6 + dcil;
+    let scil = *p.get(i)? as usize;
+    i += 1 + scil;
+    let b = *p.get(i)?;
+    match b >> 6 {
+        0 => Some(u64::from(b & 0x3f)),
+        1 => {
+            let b1 = *p.get(i + 1)?;
+            Some(u64::from(u16::from_be_bytes([b & 0x3f, b1])))
+        }
+        2 => {
+            let v = u32::from_be_bytes([b & 0x3f, *p.get(i + 1)?, *p.get(i + 2)?, *p.get(i + 3)?]);
+            Some(u64::from(v))
+        }
+        _ => None,
+    }
+}
+
+/// 「扣住带 token 的 Initial」中继（S3 的 token 有效期判据）：client→exit 方向**放行首发
+/// （无 token）Initial**、扣下**带 token** 的 Initial 直到 `hold_until`；exit→client 方向
+/// 恒放行（Retry 要能到客户端）。
+struct TokenHoldRelay {
+    addr: SocketAddr,
+    stop: Arc<AtomicBool>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl TokenHoldRelay {
+    fn start(exit: SocketAddr, hold: Duration) -> Self {
+        let front = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("前端 socket 可绑");
+        let back = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("后端 socket 可绑");
+        front
+            .set_read_timeout(Some(Duration::from_millis(20)))
+            .expect("前端设超时");
+        back.set_read_timeout(Some(Duration::from_millis(20)))
+            .expect("后端设超时");
+        let addr = front.local_addr().expect("前端地址");
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = Arc::clone(&stop);
+        let hold_until = Instant::now() + hold;
+        let thread = std::thread::Builder::new()
+            .name("s3-token-hold".into())
+            .spawn(move || {
+                let mut buf = [0u8; 2048];
+                let mut client: Option<SocketAddr> = None;
+                while !stop2.load(Ordering::SeqCst) {
+                    if let Ok((n, src)) = front.recv_from(&mut buf) {
+                        client = Some(src);
+                        let has_token = initial_token_len(&buf[..n]).is_some_and(|l| l > 0);
+                        if has_token && Instant::now() < hold_until {
+                            continue; // 扣住（客户端拿到的 Retry 成果被拖过有效期）
+                        }
+                        let _ = back.send_to(&buf[..n], exit);
+                    }
+                    if let Ok((n, _src)) = back.recv_from(&mut buf) {
+                        if let Some(c) = client {
+                            let _ = front.send_to(&buf[..n], c);
+                        }
+                    }
+                }
+            })
+            .expect("中继线程可起");
+        Self { addr, stop, thread: Some(thread) }
+    }
+}
+
+impl Drop for TokenHoldRelay {
+    fn drop(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(t) = self.thread.take() {
+            let _ = t.join();
+        }
+    }
+}
+
+/// **判据（S3-2 / §3.1）**：`retry_token_lifetime` 生效——Retry 的成果被拖过有效期后，
+/// token **不再被认**：出口按 RFC 9000 §8.1.3 回 `INVALID_TOKEN`（客户端拿到传输错误，
+/// 不是静默超时）。**反证**：缺省 15s 量级下同样扣 1.5s 仍能完成（见下一条用例）。
+#[tokio::test]
+async fn retry_token_lifetime_is_enforced() {
+    let quic = exit_face_with(65, |c| {
+        c.retry_policy = RetryPolicy::Always; // 恒 Retry ⇒ 客户端必拿 token（确定性）
+        c.retry_token_lifetime = Duration::from_secs(1); // 值域下界：1s
+    });
+    let tap = TokenHoldRelay::start(quic.local_addr(), Duration::from_millis(1500));
+    let (client, cfg, _sock) = client_endpoint_and_config(quic.rpk_public_key());
+    let r = tokio::time::timeout(
+        WAIT,
+        client
+            .connect_with(cfg, tap.addr, super::rpk::client_pin::SERVER_NAME)
+            .expect("connect 调用面"),
+    )
+    .await
+    .expect("预算内定音");
+    // 出口在包层就回 `INVALID_TOKEN`（CONNECTION_CLOSE，错误码 0xB）——客户端按
+    // “TransportError 或 ConnectionClosed”两种包装收到它都算命中。
+    match r {
+        Err(quinn::ConnectionError::TransportError(e)) => assert_eq!(
+            e.code,
+            quinn::TransportErrorCode::INVALID_TOKEN,
+            "过期 token 应回 INVALID_TOKEN，实得 {e:?}"
+        ),
+        Err(quinn::ConnectionError::ConnectionClosed(c)) => assert_eq!(
+            c.error_code,
+            quinn::TransportErrorCode::INVALID_TOKEN,
+            "过期 token 应回 INVALID_TOKEN：{c:?}"
+        ),
+        Err(other) => panic!("应为 INVALID_TOKEN 语义的失败，实得 {other:?}"),
+        Ok(_) => panic!("过期 token 不得被接受（1s 有效期未生效？）"),
+    }
+    assert!(quic.snapshot().retry_sent >= 1, "应至少发过一次 Retry：{:?}", quic.snapshot());
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+    drop(tap);
+}
+
+/// 上一条的**对照臂**：有效期 20s（> 扣包时长）⇒ 同一形态照常完成 —— 证明上一条的红
+/// 来自「有效期」而不是「扣包/重传」本身。
+#[tokio::test]
+async fn retry_token_lifetime_longer_than_hold_still_connects() {
+    let quic = exit_face_with(66, |c| {
+        c.retry_policy = RetryPolicy::Always;
+        c.retry_token_lifetime = Duration::from_secs(20);
+    });
+    let tap = TokenHoldRelay::start(quic.local_addr(), Duration::from_millis(1500));
+    let (client, cfg, _sock) = client_endpoint_and_config(quic.rpk_public_key());
+    let conn = tokio::time::timeout(
+        WAIT,
+        client
+            .connect_with(cfg, tap.addr, super::rpk::client_pin::SERVER_NAME)
+            .expect("connect 调用面"),
+    )
+    .await
+    .expect("预算内定音")
+    .expect("有效期内的 token 必须仍被认（扣包只是拖延）");
+    assert!(quic.snapshot().retry_sent >= 1, "Retry 已发（恒档）");
+    drop(conn);
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+    drop(tap);
+}
+
+/// **判据（S3-3 / §3.2-⑥ + r14 F12）**：证明失败闸——同 devTag 的 nonce/MAC 类失败
+/// 跨阈值 ⇒ 冷却期内**不再发 Challenge**（拒 Hello + 行 + 快照计数同源）；
+/// 而**引擎裁决拒绝**（表满/冲突/吊销/窗超的等价注入）**不进计数集** ⇒ 不被冷却。
+#[tokio::test]
+async fn proof_fail_gate_cools_bad_dev_and_spares_engine_rejected() {
+    let (quic, rx) = exit_face_logged(67, |c| {
+        c.proof_fail_threshold = 2; // 阈值 2（缺省 10）
+        c.per_src_window = Duration::from_secs(60);
+    });
+    let stub = Stub::new(SECRET);
+    let pubkey = [0x77u8; 32];
+    let dev = [0x88u8; 8];
+    let wrong_secret = [0x00u8; 32];
+    // ① 两次 MAC 不符的 Proof ⇒ 跨阈值 ⇒ 进冷却 + 行
+    for _ in 0..2 {
+        let (_c, conn, _s) = client_conn(&quic).await;
+        let got = four_frames(&stub, &quic, &conn, &wrong_secret, &pubkey, &dev).await;
+        assert!(got.is_err(), "错 secret 的 Proof 必须被拒");
+    }
+    drain_until(&rx, "quic: 证明失败闸", WAIT);
+    assert_eq!(quic.snapshot().proof_cooldowns, 1, "进入冷却一次：{:?}", quic.snapshot());
+    // ② 冷却中：同 devTag 再走 Hello ⇒ **不发 Challenge**（连接被拒/关闭）
+    let (_c, conn, _s) = client_conn(&quic).await;
+    let (mut send, mut recv) = conn.open_bi().await.expect("open_bi");
+    send.write_all(&HelloFrame::encode(&pubkey, &dev, TS))
+        .await
+        .expect("写 Hello");
+    let mut ch = [0u8; CHALLENGE_LEN];
+    let challenge = tokio::time::timeout(WAIT, recv.read_exact(&mut ch))
+        .await
+        .is_ok_and(|r| r.is_ok())
+        && ChallengeFrame::parse(&ch).is_some();
+    assert!(!challenge, "冷却期内不得发 Challenge（拒 Hello）");
+    assert!(
+        quic.snapshot().challenges_refused >= 1,
+        "未发挑战的拒绝计数应增长：{:?}",
+        quic.snapshot()
+    );
+    // ③ 引擎裁决拒绝**不**计入：同样两次「引擎拒」不产生第二次冷却
+    let stub2_dev = [0x99u8; 8];
+    let stub2_pub = [0xAAu8; 32];
+    stub.engine_reject(true);
+    for _ in 0..2 {
+        let (_c, conn, _s) = client_conn(&quic).await;
+        let got = four_frames(&stub, &quic, &conn, &SECRET, &stub2_pub, &stub2_dev).await;
+        assert!(got.is_err(), "引擎裁决拒绝 ⇒ 准入失败");
+    }
+    stub.engine_reject(false);
+    assert_eq!(
+        quic.snapshot().proof_cooldowns,
+        1,
+        "引擎裁决拒绝不得进证明失败闸（r14 F12）"
+    );
+    // ④ 该 devTag 未被冷却：新连接照常拿到 Challenge 并完成准入
+    let (_c, conn, _s) = client_conn(&quic).await;
+    let (_send, _recv) = admit(&stub, &quic, &conn, &SECRET, &stub2_pub, &stub2_dev).await;
+    assert!(
+        quic.snapshot().regs_accepted >= 1,
+        "可用性故障后设备仍能准入（不得被冷却锁死）：{:?}",
+        quic.snapshot()
+    );
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（S3-3 / §3.3-2 与 §3.3-3 的本地可判面）**：洪泛期间——① 并发握手不越
+/// `handshake_cap`、连接总数不越 `conn_cap`；② **已采纳连接仍可用**（DATAGRAM 双向
+/// 不丢）；（吞吐下降 ≤10% 与 footprint 归 S5 的独占机器实测，本用例只留可用性面。）
+#[tokio::test]
+async fn flood_keeps_bounds_and_spares_admitted_connection() {
+    let (quic, _rx) = exit_face_logged(68, |c| {
+        c.per_src_fails = 5;
+        c.per_src_window = Duration::from_secs(60);
+        c.retry_policy = RetryPolicy::Never; // 只测洪泛面（Retry 另有用例）
+    });
+    let stub = Stub::new(SECRET);
+    let pubkey = [0x33u8; 32];
+    let dev = [0x44u8; 8];
+    // 先建一条**已采纳**连接（洪泛不得把它打断）
+    let (_client, conn, _sock) = client_conn(&quic).await;
+    let (_send, _recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
+    // 洪泛：同一源 12 次「未完成」尝试（上限 5 ⇒ 第 6 次起全拒）
+    for _ in 0..12 {
+        let _ = wrong_pin_attempt(quic.local_addr()).await;
+    }
+    let snap = quic.snapshot();
+    assert!(snap.flood_refused >= 7, "第 F+1..K 次应全拒：{snap:?}");
+    assert!(
+        snap.handshakes_in_flight <= 64,
+        "并发握手不得越 handshake_cap：{snap:?}"
+    );
+    assert!(
+        snap.connections + snap.handshakes_in_flight <= 64,
+        "连接总数不得越 conn_cap（2×max_devices）：{snap:?}"
+    );
+    // ② 既有连接仍可用：入站数据报仍投引擎、出站 DATAGRAM 仍回得来
+    let pkt = inner_pkt(TUN_IP, Ipv4Addr::new(8, 8, 8, 8));
+    conn.send_datagram(bytes::Bytes::from(pkt.clone()))
+        .expect("洪泛期间既有连接仍应能发");
+    assert!(
+        pump_until(&stub, &quic, || !stub.packets().is_empty(), WAIT).await,
+        "洪泛期间已采纳连接的数据报仍应投引擎"
+    );
+    assert_eq!(stub.packets()[0], pkt, "字节级一致");
+    assert_eq!(
+        quic.send_to_pub(&pubkey, &pkt),
+        crate::ExitSend::Handled,
+        "出站仍走 QUIC 面（绑定未被洪泛打断）"
+    );
+    let got = tokio::time::timeout(WAIT, conn.read_datagram())
+        .await
+        .expect("预算内应收到")
+        .expect("连接活着");
+    assert_eq!(got.as_ref(), &pkt[..], "出站 DATAGRAM 字节级一致");
+    assert!(quic.stop_within(Instant::now() + BUDGET));
 }

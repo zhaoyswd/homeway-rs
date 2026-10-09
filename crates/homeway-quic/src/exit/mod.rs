@@ -662,9 +662,9 @@ fn run_exit(
             }
         ));
         if cfg.retry_policy == RetryPolicy::Always {
-            (*logf)(&format!(
-                "⚠️ quic: retry_policy=always —— 常态每次建连/重连 +1 RTT（真机 LTE ≈50ms；§3.1 登记的代价，仅排障用）"
-            ));
+            (*logf)(
+                "⚠️ quic: retry_policy=always —— 常态每次建连/重连 +1 RTT（真机 LTE ≈50ms；§3.1 登记的代价，仅排障用）",
+            );
         }
         if ready_tx.send(Ok((local_addr, rpk_public_key))).is_err() {
             return; // 调用侧已放弃（start 失败路径）——直接收摊
