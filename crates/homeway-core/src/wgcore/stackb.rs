@@ -39,8 +39,11 @@ pub(crate) const QUEUE_CAP: usize = 1024;
 pub enum DialError {
     #[error("环回地址不进隧道（本地栈内无此路由）")]
     LoopbackRejected,
-    #[error("连接表已满")]
-    TooManyConns,
+    // M3 S6/A12（设计 §5.3-A12）：**删除死变体** `TooManyConns`（`#[error("连接表已满")]`）
+    // ——声明以来全仓零构造点（`StackB::connect` 不做并发上限），而 M3 起「并发上限从无到有」
+    // 的失败态在 **QUIC 档**（`max_concurrent_bidi_streams=64`）由 `StreamErr::Busy`
+    // 快速失败承担（§1.6），栈 B 侧接线 = 改 WG 档行为且该文件 M5 即删 ⇒ 取删除。
+    // 登记：`docs/INTEROP-CRITERIA.md`「判据变更记录」M3 S6/S7 批（非判据行）。
     #[error("smoltcp: {0}")]
     Stack(String),
 }

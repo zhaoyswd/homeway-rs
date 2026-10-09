@@ -1,5 +1,12 @@
 # PERF-AB — 性能 A/B 报告（R5-5c，2026-10-03；R6 前置批 ⑤ 修正 2026-10-03 深夜）
 
+> **M3 批注（2026-10-09，S6/A11）——ACK 密度类读数跨承载不可比**：本报告全部「ACK 密度 /
+> 段数 / 通告窗 / 在途估算」类读数取自**栈 B（smoltcp）**的 ACK 时钟与整形臂（`wgcore` 的
+> `block_on`/`ACK_DRAIN_BYTES` 族），该机制随 M5 的栈 B 退场（M3 设计 §5.3-A11/§7）。QUIC 档的
+> 对位机制 = `exit/transport.rs` 的 `ACK_ELICITING_THRESHOLD=16` / `MAX_ACK_DELAY=5ms`
+> （常量面已落）⇒ **同一数字在 QUIC 档没有同义读数**，任何跨承载对比须先按 M3 设计 §7 的
+> 「服务流吞吐相对门槛」（同刻同承载同一服务操作 ≥0.95× WG/UDS 档读数；读数归 S8）重采。
+>
 > **删除批注记（2026-10-07）**：v0.2.2 简洁化批删除了若干被本报告用作消融臂的机制——
 > 逐包 pacing 时刻表（`HOMEWAY_TX_PACING` 族/[serve.tx_shape] `pacing` 键/est 估计器）、
 > 发送线程双模式（`HOMEWAY_TX_SENDTHREAD` on/off 臂；发送线程默认 on 且唯一）、内层 MTU 升档
