@@ -201,6 +201,14 @@ pub(crate) async fn dial_serve(
         }
     };
 
+    // ---- ④b. `TCP_NODELAY`（**M4 实施期对齐**；S1–S3 交下的待确认项，S5 实测给结论）----
+    //
+    // 依据 = **出口侧同源先例**：WG 档的 transit 腿在拨号完成后设 `TCP_NODELAY`（Go
+    // `SetDelayOption(false)` 同口径，`server/intercept/mod.rs:2233-2246`）——dial 腿与它同属
+    // 「无目的地策略的直拨」，**同一映射在两条承载下的小包时延不得有差异**（Nagle 会把
+    // 「请求—响应」型小包多压一个 ACK 往返）。失败不致命（最佳努力，与 intercept 同形）。
+    let _ = tcp.set_nodelay(true);
+
     // ---- ⑤ 回执（**先于任何目标字节**，§1.2）----
     //
     // 写失败（对端已 reset / 连接死）⇒ **立即返回**（`tcp` 随作用域 drop ⇒ 目标连接不成为
