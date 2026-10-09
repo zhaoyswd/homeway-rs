@@ -128,6 +128,30 @@ pub const ENV_SEND_WINDOW: &str = "HOMEWAY_QUIC_SEND_WINDOW";
 pub const ENV_STREAM_PENDING: &str = "HOMEWAY_QUIC_STREAM_PENDING";
 
 // ---------------------------------------------------------------------------
+// 出口服务入口（intake）与 socketpair（§1.7/§2.2/§15-3；M3 S2 消费）
+// ---------------------------------------------------------------------------
+
+/// 出口服务入口的设计定值（§1.7 设计门 2-4/2-5 + §2.2 的 B′ 形态）。
+///
+/// 三条一起构成「应用层 busy 路径在 STREAM 面可达」的构造性保证：**intake 容量 =
+/// 服务在册上限 + K** ⇒ 超限时先撞**服务自身的在册闸**（files `server_busy` /
+/// speedtest `error:"busy"` 逐字节保留），intake 满只在极端洪泛（> 在册上限 + K 并发）出现。
+pub mod service_defaults {
+    /// intake 容量余量 K（留给应用层 busy 路径；§1.7 设计门 2-5）。
+    pub const INTAKE_K: usize = 4;
+    /// socketpair 两向缓冲（§2.2：「显式 64 KiB/方向」，纳入内存账）。
+    ///
+    /// 注（平台事实，实测）：darwin 上 AF_UNIX 的 `SO_SNDBUF` 被内核夹到系统上限
+    /// （读回 4097）——产品平台（Linux/OHOS）按本值生效，读回为设定值的 2×（内核记账）。
+    pub const SOCKPAIR_BYTES: usize = 64 * 1024;
+
+    /// 某服务在册上限对应的 intake 容量（§8.2-16：files 20 / speedtest 16 / term 20）。
+    pub const fn intake_capacity(registered_max: usize) -> usize {
+        registered_max + INTAKE_K
+    }
+}
+
+// ---------------------------------------------------------------------------
 // 快探参数（§3.2/§15-2；S4 消费——S1 落值域与消融臂）
 // ---------------------------------------------------------------------------
 
@@ -367,6 +391,19 @@ mod tests {
         // N14：有效服务流容量 = 上限 − 2（控制流 + probe 持久流）
         assert_eq!(d.service_capacity(), 62);
         assert_eq!(d, StreamLimits::default());
+    }
+
+    /// **判据（服务入口定值，§1.7/§8.2-16）**：intake 容量 = 在册上限 + K；K=4；
+    /// socketpair 64 KiB/方向——三条都是设计点名的值（改动即偏离设计，须先登记）。
+    #[test]
+    fn service_intake_defaults_are_the_designed_values() {
+        use service_defaults as sd;
+        assert_eq!(sd::INTAKE_K, 4, "§1.7 设计门 2-5 的 K");
+        assert_eq!(sd::SOCKPAIR_BYTES, 64 * 1024, "§2.2 的「显式 64 KiB/方向」");
+        // §8.2-16 的三个实例值
+        assert_eq!(sd::intake_capacity(16), 20, "files：在册 16 + 4");
+        assert_eq!(sd::intake_capacity(12), 16, "speedtest：在册 12 + 4");
+        assert_eq!(sd::intake_capacity(16), 20, "term：会话上限 16 + 4");
     }
 
     /// **判据（env 消融臂，§15-2）**：合法值逐项生效；非法/越界 ⇒ 不改该项 + 一行说明。

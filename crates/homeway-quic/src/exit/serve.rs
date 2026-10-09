@@ -1,20 +1,34 @@
-//! 出口侧**服务流受理**（M3 §1.1/§1.2/§1.6 的出口面）。
+//! 出口侧**服务流受理**（M3 §1.1/§1.2/§1.6/§2.1 的出口面）。
 //!
 //! **本文件属异步面**（隔离门 ② 条的 `ASYNC_FILES` 显式清单）。
 //!
-//! 本期落地范围（逐条对齐 §11 的切片边界）：
-//! - **`probe`（tag=5）真回显**（§1.2 末行：客户端写 N(≥1)B ⇒ 出口原样回显直到客户端
-//!   半关）。它与岛侧「`Cmd::Probe` 换 STREAM 回显 + `uni=0`」**必须同切片落地**
-//!   （§1.7-N13）——否则中间切片上巡检定音失效；本文件即那个「另一半」；
-//! - **tag 1–4**：`reset(0x22)`（服务不可用）+ 行 + 计数。**S2 接线前的事实**：QUIC 档
-//!   确实还不提供这四个服务（它们仍走本机 UDS），故 `0x22` 是语义正确的暂态；S2 把
-//!   这四条臂换成 `ServiceIntake` 入队 + 泵即可（**本文件就是 S2 的 accept 骨架**）；
-//! - **非法 tag** ⇒ `reset(0x21)`；**读了 TAG_READ_BUDGET 仍未读到 tag** ⇒ `reset(0x27)`
-//!   （**reset 而非 drop**：quinn 的未 accept/未 reset 流不归还并发额度）。
+//! 分发骨架（§2.1；每流一枚任务、**不与 accept 串行**）：
 //!
-//! 未落地（**S2**，如实登记）：`0x24`（未绑定连接上的服务流——准入协议把「首条 bidi
-//! 流」固定为控制流，故「准入前的服务流」在本循环里不可表达）、intake 容量/公平性、
-//! socketpair 泵、应用层 busy 路径。本文件不改这三条的语义。
+//! ```text
+//! accept_bi() ─► 每流一个 task
+//!                 │  读 1B tag（预算 TAG_READ_BUDGET=5s；到点 ⇒ reset(0x27)）
+//!                 ├─ 未绑定连接 ⇒ reset(0x24) + 行 + 计数
+//!                 ├─ tag ∉ {1..5} ⇒ reset(0x21) + 行 + 计数
+//!                 ├─ 服务未启用（无 intake）⇒ reset(0x22) + 行 + 计数
+//!                 ├─ 入口队列满 ⇒ reset(0x23) + 行 + 计数
+//!                 └─ tag 1/2/3 ⇒ socketpair + 入队 + 泵（[`super::pump`]）
+//!                    tag 4（dial）⇒ 读 6B 目标后 reset(0x22)（M3 只定协议，M4 换轨）
+//!                    tag 5（probe）⇒ 回显任务直连（**不进队列**，不占服务资源）
+//! ```
+//!
+//! 「应用层零改动」（§1.2）的落点：三个服务收到的是**一条 UnixStream**（socketpair 服务侧
+//! 端）——帧层 / per-syscall 期限 / `poll(2)` 语义 / `try_clone` / `shutdown_both` / busy
+//! 路径一行不改；本文件只做「tag → 服务入口」的搬运。
+//!
+//! **0x24（未绑定）的可达性（如实登记）**：受理循环由控制流任务在**准入通过之后**启动
+//! （`conn::control` 的 `join!`），故「准入前的服务流」在本循环里不可表达；但**准入后绑定
+//! 被摘除**（设备被摘除/轮换：`ExitQuic::unbind_pub` 先摘绑定再关连接）与受理之间存在真
+//! 竞态窗 ⇒ 本臂是那条窗的防线（拒绝 + 行 + 计数），不是死码。
+//! **0x27（tag 读取超时）的可达性**：QUIC 的流开通 = 对端发出的**首个 STREAM 帧**
+//! （`open_bi()` 本身不通知对端）⇒ 1B 的 tag 不存在「部分到达」形态，本臂在正常客户端下
+//! **不可触发**（只有首字节在链路上被延迟 > `TAG_READ_BUDGET` 才命中，如长时间丢包/手写
+//! 对端）。保留理由：①§1.6 的码表要求「不给对端留无限期槽位」的防线存在；②对端读侧的
+//! `0x27 ⇒ StreamErr::BadTag` 分类是**可构造可测**的（见 `crate::stream` 的单测）。
 
 use std::sync::Arc;
 use std::time::Instant;
@@ -22,7 +36,8 @@ use std::time::Instant;
 use quinn::{ReadExactError, RecvStream, SendStream, VarInt};
 use tokio::task::JoinSet;
 
-use crate::stream::{reset, StreamTag, TAG_READ_BUDGET};
+use crate::stream::{dial_parse, reset, StreamTag, TAG_READ_BUDGET};
+use crate::tuning::service_defaults;
 
 use super::{log_due, FaceCtx};
 
@@ -46,24 +61,17 @@ pub(crate) async fn serve_streams(conn: quinn::Connection, conn_id: u64, ctx: Ar
             }
         }
     }
-    drop(tasks); // 在途回显任务随连接一起收（`JoinSet` drop = abort）
+    drop(tasks); // 在途泵/回显任务随连接一起收（`JoinSet` drop = abort；socketpair 随任务 drop
+                 // 关闭 ⇒ 服务侧会话看到 EOF/错误，与今天 UDS 形态同款）
 }
 
-/// 单条服务流：读 tag（预算内）⇒ 分发（本期：probe 回显 / 其余拒）。
-///
-/// **`0x27`（tag 读取超时）的可达性（如实登记）**：QUIC 的流开通 = 对端发出的**首个
-/// STREAM 帧**（`open_bi()` 本身不通知对端）⇒ 1B 的 tag 不存在「部分到达」形态，本臂在
-/// 正常客户端下**不可触发**（只有首字节在链路上被延迟 > `TAG_READ_BUDGET` 才命中，如
-/// 长时间丢包/手写对端）。保留它的理由：①§1.6 的码表要求「不给对端留无限期槽位」的
-/// 防线存在；②对端读侧的 `0x27 ⇒ StreamErr::BadTag` 分类是**可构造可测**的（见
-/// `crate::stream` 的单测），协议面闭环不依赖本臂被触发。
-/// **对端开流后立刻半关（FIN，无 tag）**：静默收（不计拒、不留槽）——那不是错误形态。
+/// 单条服务流：读 tag（预算内）⇒ 受理前置 ⇒ 分发。
 async fn handle_stream(mut send: SendStream, mut recv: RecvStream, conn_id: u64, ctx: Arc<FaceCtx>) {
     let mut tag_byte = [0u8; 1];
     let tag = match tokio::time::timeout(TAG_READ_BUDGET, recv.read_exact(&mut tag_byte)).await {
         // 到点：**reset 而非 drop**（未 reset 的流会让对端的并发额度不归还）
         Err(_elapsed) => {
-            let _ = send.reset(VarInt::try_from(reset::TAG_READ_TIMEOUT).expect("复位码在 VarInt 值域内"));
+            let _ = send.reset(varint(reset::TAG_READ_TIMEOUT));
             refuse(&ctx, conn_id, None, reset::TAG_READ_TIMEOUT, "tag 读取超时");
             return;
         }
@@ -74,19 +82,101 @@ async fn handle_stream(mut send: SendStream, mut recv: RecvStream, conn_id: u64,
         Ok(Ok(())) => tag_byte[0],
     };
     let Some(tag) = StreamTag::from_byte(tag) else {
-        let _ = send.reset(VarInt::try_from(reset::TAG_UNKNOWN).expect("复位码在 VarInt 值域内"));
+        let _ = send.reset(varint(reset::TAG_UNKNOWN));
         refuse(&ctx, conn_id, None, reset::TAG_UNKNOWN, "未知 tag");
         return;
     };
+    // ---- 受理前置：服务流只在**已绑定**连接上受理（§1.1；未绑定 ⇒ §1.6 的 0x24）----
+    if ctx.bridge.dev_of_conn(conn_id).is_none() {
+        let _ = send.reset(varint(reset::UNBOUND));
+        refuse(&ctx, conn_id, Some(tag), reset::UNBOUND, "连接未绑定");
+        return;
+    }
     match tag {
         StreamTag::Probe => echo(send, recv, conn_id, &ctx).await,
-        // S2 接线前：这四个服务不在 QUIC 档（仍走本机 UDS）⇒ `0x22`（服务不可用），
-        // 与 §1.6「files 监听失败 ⇒ 该服务 QUIC 腿一并停用」同一条保守语义（设计门 N16）
-        StreamTag::Files | StreamTag::Term | StreamTag::Speedtest | StreamTag::Dial => {
-            let _ = send.reset(VarInt::try_from(reset::SERVICE_DISABLED).expect("复位码在 VarInt 值域内"));
-            refuse(&ctx, conn_id, Some(tag), reset::SERVICE_DISABLED, "服务不可用（S2 接线前）");
+        // M3 只定协议（§1.1/§12-4）：解析 6B `[4B IPv4][2B BE port]` 后一律 `0x22`；
+        // M4 换轨时只把这条臂换成真拨号，**帧不再改**。
+        StreamTag::Dial => dial_refuse(send, recv, conn_id, &ctx).await,
+        StreamTag::Files | StreamTag::Term | StreamTag::Speedtest => {
+            serve_via_intake(send, recv, tag, conn_id, &ctx).await
         }
     }
+}
+
+/// tag 1/2/3：socketpair + 入队（服务入口）+ 泵。
+///
+/// 未启用（`intakes.slot(tag) == None`：`serve.quic` 面没拿到该服务的 intake——监听失败 /
+/// `HOMEWAY_TERM=off`）⇒ `0x22`（§1.6 设计门 N16 的**保守选择**：UDS bind 失败 ⇒ 该服务
+/// QUIC 腿一并停用，与今天「整服务不可用」同形）。
+async fn serve_via_intake(
+    mut send: SendStream,
+    recv: RecvStream,
+    tag: StreamTag,
+    conn_id: u64,
+    ctx: &Arc<FaceCtx>,
+) {
+    let Some(tx) = ctx.intakes.slot(tag) else {
+        let _ = send.reset(varint(reset::SERVICE_DISABLED));
+        refuse(ctx, conn_id, Some(tag), reset::SERVICE_DISABLED, "服务不可用（未启用）");
+        return;
+    };
+    // 服务侧端（交 intake）/ 泵侧端（本端）；两向缓冲 = §2.2 的显式 64 KiB
+    let (svc_end, pump_end) = match super::pump::socketpair(service_defaults::SOCKPAIR_BYTES) {
+        Ok(v) => v,
+        // 本机资源面失败（fd/内存）：没有对应的复位码表条目 ⇒ 归「服务不可用」，
+        // 但行文要能区分（排障时「0x22 但原因不同」是两回事）
+        Err(e) => {
+            let _ = send.reset(varint(reset::SERVICE_DISABLED));
+            refuse(
+                ctx,
+                conn_id,
+                Some(tag),
+                reset::SERVICE_DISABLED,
+                &format!("服务不可用（socketpair 建不起来：{e}）"),
+            );
+            return;
+        }
+    };
+    if let Err(full) = tx.try_enqueue(svc_end) {
+        // 入口队列满（§1.7：容量 = 在册上限 + K）⇒ 0x23 + 行（带当刻 n/cap）
+        let _ = send.reset(varint(reset::INTAKE_FULL));
+        refuse(
+            ctx,
+            conn_id,
+            Some(tag),
+            reset::INTAKE_FULL,
+            &format!("入口队列满 {}/{}", full.queued, full.capacity),
+        );
+        return;
+    }
+    // 受理计数 + 行（E-q5；**入队即受理**——此后服务自身的在册闸可能回应用层 busy，
+    // 那是服务语义不是出口拒入，故不再计拒）
+    let n = ctx.stats.streams_open.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+    if log_due(n) {
+        (*ctx.logf)(&format!(
+            "quic: 服务流已受理（tag={tag} dev={} 第 {n} 次）",
+            dev_of(ctx, conn_id)
+        ));
+    }
+    super::pump::run(send, recv, pump_end, tag, conn_id, Arc::clone(ctx)).await;
+}
+
+/// `dial`（tag=4）本期限定形态（§2.1）：读 6B 目标 ⇒ `reset(0x22)` + 行。
+///
+/// 读得出目标 = 协议面成立（M4 换轨时 `dial_parse` 反向复用同一份帧，**帧不改**）；
+/// 读不出（对端只发 tag 就等 / 链路慢）也照样拒（本期出口没有 dial 能力）。
+async fn dial_refuse(mut send: SendStream, mut recv: RecvStream, conn_id: u64, ctx: &Arc<FaceCtx>) {
+    let mut frame = [0u8; 6];
+    let why = match tokio::time::timeout(TAG_READ_BUDGET, recv.read_exact(&mut frame)).await {
+        Ok(Ok(())) => match dial_parse(&frame) {
+            Some(dst) => format!("服务不可用（dial 目标 {dst}；M3 只定协议，M4 换轨）"),
+            // `read_exact(6)` 成功后长度必为 6 ⇒ 本臂不可达（留作帧格式变更的防线）
+            None => "服务不可用（dial 目标帧畸形；M3 只定协议，M4 换轨）".to_owned(),
+        },
+        _ => "服务不可用（dial 目标未读出；M3 只定协议，M4 换轨）".to_owned(),
+    };
+    let _ = send.reset(varint(reset::SERVICE_DISABLED));
+    refuse(ctx, conn_id, Some(StreamTag::Dial), reset::SERVICE_DISABLED, &why);
 }
 
 /// `probe` 回显（§1.2：**原样回显直到客户端半关**）。
@@ -94,6 +184,7 @@ async fn handle_stream(mut send: SendStream, mut recv: RecvStream, conn_id: u64,
 /// 用 `tokio::io::copy`（quinn 的 `RecvStream: AsyncRead` / `SendStream: AsyncWrite`）：
 /// 「读多少写多少，读到 FIN 即 `finish`」正是半关语义的原生表达；逐块手写循环等价但更易错。
 /// 失败（对端 reset/连接死）按结束收——回显流没有协议错误面。
+/// **不进 intake 队列**（§2.1：不占服务资源），但同样计入每连接流额度与受理计数。
 async fn echo(mut send: SendStream, mut recv: RecvStream, conn_id: u64, ctx: &Arc<FaceCtx>) {
     let t0 = Instant::now();
     let n = ctx
@@ -111,8 +202,14 @@ async fn echo(mut send: SendStream, mut recv: RecvStream, conn_id: u64, ctx: &Ar
     let bytes = tokio::io::copy(&mut recv, &mut send).await.unwrap_or(0);
     let _ = send.finish(); // 客户端半关 ⇒ 我方 FIN（正常收工，**不用 reset**，§1.3）
     ctx.stats
-        .stream_bytes
+        .stream_bytes_in
         .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+    ctx.stats
+        .stream_bytes_out
+        .fetch_add(bytes, std::sync::atomic::Ordering::SeqCst);
+    ctx.stats
+        .streams_closed
+        .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     if log_due(n) {
         // ↑ = 客户端上行（本端读到的量）、↓ = 下发给客户端的量——回显下两者相等
         (*ctx.logf)(&format!(
@@ -140,8 +237,13 @@ fn refuse(ctx: &Arc<FaceCtx>, conn_id: u64, tag: Option<StreamTag>, code: u64, w
     ));
 }
 
+/// 复位码 → `VarInt`（码表恒在 `VarInt` 值域内 ⇒ `expect` 是常量断言，不是运行期风险）。
+fn varint(code: u64) -> VarInt {
+    VarInt::try_from(code).expect("复位码在 VarInt 值域内")
+}
+
 /// 连接的设备短指纹（已绑定 ⇒ 8B devTag 的 4B hex；未绑定/未知 ⇒ `—`）。
-fn dev_of(ctx: &Arc<FaceCtx>, conn_id: u64) -> String {
+pub(crate) fn dev_of(ctx: &Arc<FaceCtx>, conn_id: u64) -> String {
     match ctx.bridge.dev_of_conn(conn_id) {
         Some(d) => super::bridge::dev_short(&d),
         None => "—".to_owned(),
@@ -152,15 +254,41 @@ fn dev_of(ctx: &Arc<FaceCtx>, conn_id: u64) -> String {
 mod tests {
     use super::*;
 
-    /// 复位码与行文的关系（本文件只会产出这三码；改表即红——防「拒了但说不清」）。
+    /// 复位码与行文的关系（S2 起本文件会产出全部五码；改表即红——防「拒了但说不清」）。
     #[test]
-    fn serve_only_emits_the_three_designed_codes() {
+    fn serve_only_emits_the_designed_codes() {
         assert_eq!(reset::TAG_UNKNOWN, 0x21);
         assert_eq!(reset::SERVICE_DISABLED, 0x22);
+        assert_eq!(reset::INTAKE_FULL, 0x23);
+        assert_eq!(reset::UNBOUND, 0x24);
         assert_eq!(reset::TAG_READ_TIMEOUT, 0x27);
-        // 白名单映射（对端读侧）与出口写侧同表：三个码都能被客户端识别成 typed 错误
-        assert!(crate::stream::StreamErr::from_reset_code(reset::TAG_UNKNOWN).is_some());
-        assert!(crate::stream::StreamErr::from_reset_code(reset::SERVICE_DISABLED).is_some());
-        assert!(crate::stream::StreamErr::from_reset_code(reset::TAG_READ_TIMEOUT).is_some());
+        // 白名单映射（对端读侧）与出口写侧同表：本文件写出的五个码都能被客户端识别成 typed 错误
+        for code in [
+            reset::TAG_UNKNOWN,
+            reset::SERVICE_DISABLED,
+            reset::INTAKE_FULL,
+            reset::UNBOUND,
+            reset::TAG_READ_TIMEOUT,
+        ] {
+            assert!(
+                crate::stream::StreamErr::from_reset_code(code).is_some(),
+                "{code:#x} 必须在对端白名单里"
+            );
+        }
+        // M4 的两码本文件**不得**写出（本期没有 dial 目标面：`dial_refuse` 一律 0x22）
+        for code in [reset::DIAL_REFUSED, reset::DIAL_TIMEOUT] {
+            assert!(
+                crate::stream::StreamErr::from_reset_code(code).is_some(),
+                "{code:#x} 是 M4 的码（本文件不写，但白名单已备）"
+            );
+        }
+    }
+
+    /// 服务入口容量 = 在册上限 + K（§1.7 设计门 2-5 的构造性保证）——三个服务的实例值
+    /// 由调用侧（`homeway-core` 装配点）按本常量算出，本断言钉住它不被改窄成「= 在册上限」。
+    #[test]
+    fn intake_capacity_keeps_the_busy_path_reachable() {
+        assert!(service_defaults::intake_capacity(16) > 16, "必须在册上限之上留 K");
+        assert_eq!(service_defaults::intake_capacity(0), 4, "K 单独成立");
     }
 }

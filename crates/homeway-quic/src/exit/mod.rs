@@ -24,6 +24,8 @@
 pub(crate) mod admit;
 mod bridge;
 mod conn;
+mod intake;
+mod pump;
 pub(crate) mod rpk;
 mod serve;
 mod socket;
@@ -58,6 +60,9 @@ use socket::{ExitSock, LegTable};
 /// 两向边界的公面（引擎消费面）：入站事件 + 准入请求/裁决 + 出站投递结果。
 pub use admit::RetryPolicy;
 pub use bridge::{ExitInbound, ExitSend, Reg4Request, Reg4Verdict, RejectWhy};
+/// 服务入口（M3 S2，§2.2 方案 B′）：服务侧受理面 `ServiceIntake`（**纯 std**，`homeway-core`
+/// 的三服务 accept 循环直接吃它）+ 出口侧入队句柄 `ServiceIntakeTx`。
+pub use intake::{IntakeFull, ServiceIntake, ServiceIntakeTx, ServiceIntakes};
 /// 腿帧 kind=5（QUIC 载荷）的线字节：真源 = `homeway-core` 的
 /// `wtransport::frame::FrameKind::Quic`；本 crate 是叶子、按字节复刻，跨 crate 一致性由
 /// `homeway-core` 侧的断言钉住（见 `socket` 模块头）。
@@ -77,6 +82,8 @@ pub(crate) struct FaceCtx {
     /// 证明失败闸（M2 §3.2-⑥；主循环建、每连接任务读写——任务与主循环同线程，
     /// `Mutex` 只为通过 `Arc` 共享）。
     pub(crate) proof_gate: Arc<Mutex<admit::ProofGate>>,
+    /// 每 tag 的服务入口入队句柄（M3 S2；`None` = 该服务本期不可用 ⇒ 0x22）。
+    pub(crate) intakes: Arc<ServiceIntakes>,
 }
 
 /// QUIC 面线程名（与岛 `homeway-quic` 区分：这是**出口侧**的那一枚）。
@@ -142,6 +149,9 @@ pub struct ExitQuicConfig {
     /// 对方开流的上限」⇒ 出口广告 `64` 才允许一条设备连接开 64 条服务流；两端值不同 =
     /// 岛侧自记账与对端信用不一致（§1.7 的账全错）。
     pub streams: StreamLimits,
+    /// **服务入口**（M3 S2，§2.2 方案 B′）：tag 1/2/3 的入队句柄；未装配的服务 ⇒ `0x22`。
+    /// 缺省全空 = S1 的「QUIC 档不提供这四个服务」形态（既有测试零改）。
+    pub intakes: ServiceIntakes,
 }
 
 impl ExitQuicConfig {
@@ -161,7 +171,15 @@ impl ExitQuicConfig {
             proof_fail_threshold: admit::PROOF_FAIL_THRESHOLD_DEFAULT,
             retry_policy: RetryPolicy::Pressure,
             streams: StreamLimits::design(),
+            intakes: ServiceIntakes::default(),
         }
+    }
+
+    /// 装配服务入口（M3 S2；`homeway-core` 的引擎装配点在起本面之前把三个 intake 的
+    /// 入队句柄挂进来——服务侧 intake 同时交给各服务的 `serve_stoppable`）。
+    pub fn with_intakes(mut self, intakes: ServiceIntakes) -> Self {
+        self.intakes = intakes;
+        self
     }
 
     /// 连接总数上限（`2 × max_devices`，§9.3 Q-O；饱和乘防溢出）。
@@ -260,13 +278,18 @@ pub struct ExitQuicSnapshot {
     pub drop_unregistered: u64,
     /// 丢弃：源校验拒（复刻 `device.rs` 的 `src_allowed`）。
     pub drop_src_rejected: u64,
-    // ---------- M3 S1：服务流面（出口侧；§8.2-7 的 E-q5 行与 §8.2-12 的 `quic` 段） ----------
-    /// 已受理的服务流条数（本期 = probe 回显；S2 起含 files/term/speedtest）。
+    // ---------- M3 S1/S2：服务流面（出口侧；§8.2-7 的 E-q5 行与 §8.2-12 的 `quic` 段） ----------
+    /// 已受理的服务流条数（probe 回显 + tag 1/2/3 的**入队**即计；`0x23` 拒的不计）。
     pub streams_open: u64,
-    /// 服务流拒绝条数（`0x21` 未知 tag / `0x22` 服务不可用 / `0x27` tag 读取超时）。
+    /// 服务流拒绝条数（`0x21` 未知 tag / `0x22` 服务不可用 / `0x23` 入口队列满 /
+    /// `0x24` 未绑定 / `0x27` tag 读取超时）。
     pub stream_refused: u64,
-    /// 服务流搬运的应用字节（回显面 = 上下行各计一次；S2 的泵会按方向拆细）。
-    pub stream_bytes: u64,
+    /// 已收工的服务流条数（泵/回显两侧任一收线即计——收工明细见 E-q5 行）。
+    pub streams_closed: u64,
+    /// 服务流搬运的应用字节（**上行**：客户端 → 出口侧读到的量）。
+    pub stream_bytes_in: u64,
+    /// 服务流搬运的应用字节（**下行**：出口 → 客户端的量）。
+    pub stream_bytes_out: u64,
 }
 
 /// 计量面（原子直读——**反应式**，不必等巡检拍；`snapshot()` 由它组装）。
@@ -297,7 +320,9 @@ pub(crate) struct ExitStats {
     drop_src_rejected: AtomicU64,
     streams_open: AtomicU64,
     stream_refused: AtomicU64,
-    stream_bytes: AtomicU64,
+    streams_closed: AtomicU64,
+    stream_bytes_in: AtomicU64,
+    stream_bytes_out: AtomicU64,
 }
 
 impl ExitStats {
@@ -328,7 +353,9 @@ impl ExitStats {
             drop_src_rejected: self.drop_src_rejected.load(Ordering::SeqCst),
             streams_open: self.streams_open.load(Ordering::SeqCst),
             stream_refused: self.stream_refused.load(Ordering::SeqCst),
-            stream_bytes: self.stream_bytes.load(Ordering::SeqCst),
+            streams_closed: self.streams_closed.load(Ordering::SeqCst),
+            stream_bytes_in: self.stream_bytes_in.load(Ordering::SeqCst),
+            stream_bytes_out: self.stream_bytes_out.load(Ordering::SeqCst),
         }
     }
 }
@@ -759,6 +786,7 @@ fn run_exit(
             nonce_ttl: cfg.nonce_ttl,
             conn_cap,
             proof_gate: Arc::clone(&proof_gate),
+            intakes: Arc::new(cfg.intakes.clone()),
         });
         loop {
             tokio::select! {

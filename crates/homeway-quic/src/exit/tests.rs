@@ -1777,6 +1777,7 @@ fn test_face_ctx(logf: Logf) -> Arc<FaceCtx> {
         admit_deadline: crate::exit::DEFAULT_ADMIT_DEADLINE,
         nonce_ttl: crate::exit::DEFAULT_NONCE_TTL,
         conn_cap: 64,
+        intakes: Arc::new(crate::ServiceIntakes::default()),
     })
 }
 
@@ -2681,7 +2682,9 @@ async fn service_stream_tag_dispatch_refusals_and_probe_echo() {
     let snap = quic.snapshot();
     assert_eq!(snap.streams_open, 1, "受理 1 条（probe）");
     assert!(snap.stream_refused >= 2, "两条拒（0x21/0x22）：{}", snap.stream_refused);
-    assert_eq!(snap.stream_bytes, 5, "回显搬运 5B（上行 5 计一次）");
+    assert_eq!(snap.stream_bytes_in, 5, "回显上行 5B");
+    assert_eq!(snap.stream_bytes_out, 5, "回显下行 5B（S2 起按方向拆细）");
+    assert_eq!(snap.streams_closed, 1, "收工 1 条");
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
 
@@ -2728,5 +2731,281 @@ async fn stream_closed_without_tag_is_absorbed_silently() {
     let snap = quic.snapshot();
     assert_eq!(snap.stream_refused, 0, "不得计拒：{snap:?}");
     assert_eq!(snap.streams_open, 1, "只有 probe 那条被受理");
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+// ---------------------------------------------------------------------------
+// M3 S2：服务入口（intake 五件套 + socketpair 泵 + tag 1–4 真入队）
+// ---------------------------------------------------------------------------
+
+/// 桩服务（**真线程**——服务的 accept 循环是阻塞面，不能跑在测试的 current_thread
+/// runtime 上）：受理一条 ⇒ 发问候 ⇒ 读 4B 请求 ⇒ 回响应 ⇒ **服务侧半关（WRITE）** ⇒
+/// 读残尾（验证「客户端 FIN ⇒ 服务侧 read_to_end 收尾」的半关传播）。
+///
+/// 读数经 `mpsc` 回传（**不**用 `JoinHandle::join` 直接等：测试的 current_thread
+/// runtime 一旦被阻塞，客户端的 TAIL/FIN 就发不出去——那就变成「等着自己」的死锁）。
+fn stub_service(
+    intake: crate::ServiceIntake,
+    greeting: &'static [u8],
+    response: &'static [u8],
+) -> std::sync::mpsc::Receiver<(Vec<u8>, Vec<u8>)> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        use std::io::{Read as _, Write as _};
+        let mut conn = intake.accept().expect("服务侧受理（QUIC 泵入队）");
+        conn.write_all(greeting).expect("问候");
+        let mut head = [0u8; 4];
+        conn.read_exact(&mut head).expect("读请求头");
+        conn.write_all(response).expect("响应");
+        conn.shutdown(std::net::Shutdown::Write).expect("服务侧半关（WRITE）");
+        let mut rest = Vec::new();
+        let _ = conn.read_to_end(&mut rest); // 客户端 FIN 之后的半关读
+        let _ = tx.send((head.to_vec(), rest));
+    });
+    rx
+}
+
+/// 等桩服务读数（**异步轮询**：保持 runtime 被驱动，客户端侧的待发字节才有机会上线）。
+async fn await_stub(
+    rx: &std::sync::mpsc::Receiver<(Vec<u8>, Vec<u8>)>,
+    wait: Duration,
+) -> (Vec<u8>, Vec<u8>) {
+    let deadline = Instant::now() + wait;
+    loop {
+        match rx.try_recv() {
+            Ok(v) => return v,
+            Err(std::sync::mpsc::TryRecvError::Empty) => {
+                assert!(Instant::now() < deadline, "桩服务读数未在 {wait:?} 内到达");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => panic!("桩服务线程死了"),
+        }
+    }
+}
+
+/// 起一枚「带服务入口」的出口面 + 一条已绑定连接（S2 用例的公共脚手架）。
+async fn exit_with_intakes(
+    seed_byte: u8,
+    intakes: crate::ServiceIntakes,
+) -> (
+    ExitQuic,
+    Receiver<String>,
+    quinn::Endpoint,
+    quinn::Connection,
+    Arc<Stub>,
+    [u8; 32],
+    [u8; 8],
+) {
+    let (logf, rx) = sink();
+    let cfg = ExitQuicConfig::new(seed(seed_byte), 32).with_intakes(intakes);
+    let quic = ExitQuic::start(loopback_socket(), cfg, logf).expect("端点可起");
+    let stub = Stub::new(SECRET);
+    let (_client, conn, _sock) = client_conn(&quic).await;
+    let (pubkey, dev) = ([0x61u8; 32], [0x62u8; 8]);
+    let (_ctl_send, _ctl_recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
+    (quic, rx, _client, conn, stub, pubkey, dev)
+}
+
+/// **判据（§2.1 分发 + §2.2 泵：tag 1–3 真入队、字节逐字往返、两向半关、计数/行）**：
+/// tag=1 经 socketpair 泵进 intake ⇒ 桩服务受理；问候/请求/响应**逐字节**；服务侧半关 ⇒
+/// 客户端读 EOF（FIN 不是 reset）；客户端 FIN ⇒ 服务侧 `read_to_end` 收尾；出口计数按方向
+/// 拆细（↑ = 客户端上行、↓ = 下发客户端）。
+#[tokio::test]
+async fn service_stream_tag1_rides_intake_pump_byte_exact() {
+    const GREETING: &[u8] = b"HELLO\n";
+    const RESPONSE: &[u8] = b"R-OK\n";
+    let (files_intake, files_tx) = crate::ServiceIntake::quic_only(4).expect("intake");
+    let svc = stub_service(files_intake, GREETING, RESPONSE);
+    let (quic, rx, _client, conn, _stub, _pubkey, _dev) = exit_with_intakes(
+        0x61,
+        crate::ServiceIntakes {
+            files: Some(files_tx),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let (mut s, mut r) = conn.open_bi().await.expect("open_bi");
+    s.write_all(&[1]).await.expect("tag=files");
+    s.write_all(b"GET\n").await.expect("请求体");
+    let mut greet = vec![0u8; GREETING.len()];
+    r.read_exact(&mut greet).await.expect("问候");
+    assert_eq!(greet, GREETING, "服务侧问候逐字节到达客户端");
+    let mut resp = vec![0u8; RESPONSE.len()];
+    r.read_exact(&mut resp).await.expect("响应");
+    assert_eq!(resp, RESPONSE, "服务侧响应逐字节到达客户端");
+    // 服务侧半关（shutdown WRITE）⇒ 客户端读到 EOF（FIN；**不是** reset）
+    let tail = tokio::time::timeout(WAIT, r.read_chunk(8, true))
+        .await
+        .expect("服务侧半关后应读得 EOF")
+        .expect("不得是错误（收线走 FIN，§1.3）");
+    assert!(tail.is_none(), "EOF ⇒ Ok(None)：{tail:?}");
+    // 客户端仍可写（半关是**单向**的，§1.3）
+    s.write_all(b"TAIL").await.expect("对端 FIN 后仍可写");
+    s.finish().expect("客户端 FIN");
+    let (req, rest) = await_stub(&svc, WAIT).await;
+    assert_eq!(req, b"GET\n", "请求头逐字节");
+    assert_eq!(rest, b"TAIL", "客户端 FIN ⇒ 服务侧 read_to_end 收尾（半关传播）");
+    assert!(
+        wait_until(|| quic.snapshot().streams_closed == 1, WAIT).await,
+        "泵应在客户端 FIN 后收工"
+    );
+    let snap = quic.snapshot();
+    assert_eq!(snap.streams_open, 1, "受理 1 条：{snap:?}");
+    assert_eq!(snap.stream_refused, 0, "无拒入：{snap:?}");
+    assert_eq!(snap.stream_bytes_in, 8, "↑ = GET\\n + TAIL（tag 不算应用字节）");
+    assert_eq!(snap.stream_bytes_out, GREETING.len() as u64 + RESPONSE.len() as u64, "↓");
+    // E-q5 行族（受理 / 结束）
+    let lines = collect_for(&rx, Duration::from_millis(400));
+    assert!(
+        lines.iter().any(|l| l.contains("服务流已受理（tag=files") && l.contains("dev=")),
+        "受理行：{lines:?}"
+    );
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("服务流结束（tag=files") && l.contains("↑8B ↓11B")),
+        "结束行（含逐向字节）：{lines:?}"
+    );
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（§1.7 设计门 2-5：intake 满 ⇒ `0x23` + 行带 n/cap）**：容量 1 的入口先被占满
+/// （服务侧不取），第二条 QUIC 服务流必须拿到 `reset(0x23)`（**不是**应用层 busy——那条
+/// 路径由服务自身的在册闸承担，见 `homeway-core` 的用例）。
+#[tokio::test]
+async fn service_stream_intake_full_resets_0x23_with_depth() {
+    let (files_intake, files_tx) = crate::ServiceIntake::quic_only(1).expect("intake");
+    // 占满：一条原生 socketpair 端入队（服务侧**不**受理——桩不跑 accept）
+    let (filler, _peer) = std::os::unix::net::UnixStream::pair().expect("socketpair");
+    files_tx.try_enqueue(filler).expect("第 1 条入队");
+    assert_eq!(files_tx.depth(), 1);
+    let (quic, rx, _client, conn, _stub, _pubkey, _dev) = exit_with_intakes(
+        0x62,
+        crate::ServiceIntakes {
+            files: Some(files_tx),
+            ..Default::default()
+        },
+    )
+    .await;
+
+    let (mut s, mut r) = conn.open_bi().await.expect("open_bi");
+    s.write_all(&[1]).await.expect("tag=files");
+    let e = r
+        .read_chunk(32, true)
+        .await
+        .expect_err("入口满 ⇒ 必须被 reset");
+    match e {
+        quinn::ReadError::Reset(code) => {
+            assert_eq!(code.into_inner(), 0x23, "复位码 = INTAKE_FULL")
+        }
+        other => panic!("期望 Reset(0x23)，实得 {other:?}"),
+    }
+    let lines = drain_until(&rx, "服务流拒", WAIT);
+    assert!(
+        lines
+            .iter()
+            .any(|l| l.contains("入口队列满 1/1") && l.contains("0x23") && l.contains("tag=files")),
+        "归因行须带当刻 n/cap：{lines:?}"
+    );
+    let snap = quic.snapshot();
+    assert_eq!(snap.stream_refused, 1, "计拒 1 条：{snap:?}");
+    assert_eq!(snap.streams_open, 0, "拒入不记受理：{snap:?}");
+    // 服务侧仍能把占位那条取走（拒入不影响已入队的）
+    let _ = files_intake.accept().expect("取走占位条");
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（§2.1 的 dial 本期限定）**：tag=4 + 6B `[4B IPv4][2B BE port]` ⇒ 出口**读得出
+/// 目标**（协议面成立，M4 换轨不再改帧）但仍 `reset(0x22)`；归因行带目标。
+#[tokio::test]
+async fn service_stream_dial_reads_target_then_refuses_0x22() {
+    let (quic, rx, _client, conn, _stub, _pubkey, _dev) =
+        exit_with_intakes(0x63, crate::ServiceIntakes::default()).await;
+    let dst: std::net::SocketAddrV4 = "100.64.9.7:7802".parse().unwrap();
+    let (mut s, mut r) = conn.open_bi().await.expect("open_bi");
+    s.write_all(&[4]).await.expect("tag=dial");
+    s.write_all(&crate::stream::dial_target(dst)).await.expect("6B 目标");
+    let e = r.read_chunk(32, true).await.expect_err("dial 本期一律拒");
+    match e {
+        quinn::ReadError::Reset(code) => {
+            assert_eq!(code.into_inner(), 0x22, "复位码 = SERVICE_DISABLED（M3 只定协议）")
+        }
+        other => panic!("期望 Reset(0x22)，实得 {other:?}"),
+    }
+    let lines = drain_until(&rx, "服务流拒", WAIT);
+    assert!(
+        lines.iter().any(|l| l.contains("tag=dial")
+            && l.contains("100.64.9.7:7802")
+            && l.contains("0x22")),
+        "dial 归因行须带解析出的目标：{lines:?}"
+    );
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（§1.1 受理前置 ⇒ §1.6 的 `0x24`）**：绑定在受理窗内被摘除（设备摘除/轮换的
+/// 竞态面：`unbind_pub` 先摘绑定再关连接）⇒ 该连接上的后续服务流一律 `reset(0x24)`。
+#[tokio::test]
+async fn service_stream_on_unbound_connection_resets_0x24() {
+    let (quic, rx, _client, conn, _stub, _pubkey, _dev) =
+        exit_with_intakes(0x64, crate::ServiceIntakes::default()).await;
+    // 摘绑定（**不**关连接——正是「摘绑定与受理之间的窗」）
+    quic.bridge.unbind_conn(1);
+    let (mut s, mut r) = conn.open_bi().await.expect("open_bi");
+    s.write_all(&[5]).await.expect("tag=probe");
+    let e = r.read_chunk(32, true).await.expect_err("未绑定 ⇒ 拒");
+    match e {
+        quinn::ReadError::Reset(code) => {
+            assert_eq!(code.into_inner(), 0x24, "复位码 = UNBOUND")
+        }
+        other => panic!("期望 Reset(0x24)，实得 {other:?}"),
+    }
+    let lines = drain_until(&rx, "连接未绑定", WAIT);
+    assert!(
+        lines.iter().any(|l| l.contains("服务流拒") && l.contains("0x24") && l.contains("dev=—")),
+        "未绑定归因行（dev=—）：{lines:?}"
+    );
+    let snap = quic.snapshot();
+    assert_eq!(snap.stream_refused, 1, "计拒 1 条：{snap:?}");
+    assert_eq!(snap.streams_open, 0, "不得受理：{snap:?}");
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（§2.1 每 tag 独立入口）**：同一条连接上 tag=2/3 各走各的 intake（term 的桩与
+/// speedtest 的桩各自受理自己那条）——分发不串台。
+#[tokio::test]
+async fn service_streams_route_each_tag_to_its_own_intake() {
+    let (term_intake, term_tx) = crate::ServiceIntake::quic_only(4).expect("intake");
+    let (speed_intake, speed_tx) = crate::ServiceIntake::quic_only(4).expect("intake");
+    let term = stub_service(term_intake, b"T-HI\n", b"T-OK\n");
+    let speed = stub_service(speed_intake, b"S-HI\n", b"S-OK\n");
+    let (quic, _rx, _client, conn, _stub, _pubkey, _dev) = exit_with_intakes(
+        0x65,
+        crate::ServiceIntakes {
+            term: Some(term_tx),
+            speedtest: Some(speed_tx),
+            ..Default::default()
+        },
+    )
+    .await;
+    for (tag, greeting, response) in [(2u8, b"T-HI\n", b"T-OK\n"), (3u8, b"S-HI\n", b"S-OK\n")] {
+        let (mut s, mut r) = conn.open_bi().await.expect("open_bi");
+        s.write_all(&[tag]).await.expect("tag");
+        s.write_all(b"REQ\n").await.expect("请求");
+        let mut g = vec![0u8; greeting.len()];
+        r.read_exact(&mut g).await.expect("问候");
+        assert_eq!(g, greeting, "tag={tag} 的问候来自自己的入口");
+        let mut resp = vec![0u8; response.len()];
+        r.read_exact(&mut resp).await.expect("响应");
+        assert_eq!(resp, response, "tag={tag} 的响应来自自己的入口");
+        s.finish().expect("FIN");
+        let _ = r.read_chunk(8, true).await; // 服务侧半关后收 EOF
+    }
+    let (t_req, _) = await_stub(&term, WAIT).await;
+    let (s_req, _) = await_stub(&speed, WAIT).await;
+    assert_eq!(t_req, b"REQ\n");
+    assert_eq!(s_req, b"REQ\n");
+    assert!(wait_until(|| quic.snapshot().streams_closed == 2, WAIT).await);
+    assert_eq!(quic.snapshot().streams_open, 2);
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }

@@ -83,8 +83,9 @@ pub use driver::{Island, IslandTx};
 /// 的配置层与装配点）直接读它，值域校验只有 [`AdmitLimits::validate`] 一处真源）。
 pub use exit::admit::AdmitLimits;
 pub use exit::{
-    ExitInbound, ExitQuic, ExitQuicConfig, ExitQuicErr, ExitQuicSnapshot, ExitSend, Reg4Request,
-    Reg4Verdict, RejectWhy, RetryPolicy, FRAME_KIND_QUIC,
+    ExitInbound, ExitQuic, ExitQuicConfig, ExitQuicErr, ExitQuicSnapshot, ExitSend, IntakeFull,
+    Reg4Request, Reg4Verdict, RejectWhy, RetryPolicy, ServiceIntake, ServiceIntakeTx,
+    ServiceIntakes, FRAME_KIND_QUIC,
 };
 /// STREAM 协议类型（M3 S1）：tag / 复位码 / 流错误 / 写回执——`homeway-core` 的换轨面
 /// （S3）用同一份类型，不另写 tag 字面量。
