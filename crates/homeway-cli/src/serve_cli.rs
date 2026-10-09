@@ -813,6 +813,10 @@ pub(crate) fn assemble_result(args: &[String]) -> Result<ServeConfig, CliErr> {
         cfg.max_devices = v;
     }
     if let Some(v) = &f.public_endpoint {
+        // Q5/S7b：**flag 显式给出 ⇒ 当场校验**（fail fast；Go `cli.go:98-105`
+        // `netip.ParseAddrPort` 同义——用户明确写了端点，静默清空/忽略比报错更糟）。
+        // config 面校验在 `load_config_strict`（serve_cli.rs:295-305，保持）。
+        validate_public_endpoint_flag(v).map_err(CliErr::Usage)?;
         cfg.public_endpoint = v.clone();
     }
     if let Some(v) = f.dns_port {
@@ -872,6 +876,36 @@ fn parse_bind_iface(v: &str) -> BindMode {
             Err(_) => BindMode::Explicit(t.to_owned()),
         },
     }
+}
+
+/// `--public-endpoint` 显式 flag 的值域校验（Q5/S7b；对齐 Go `cli.go:98-105` 的
+/// 「显式给的值当场校验（fail fast）」）。每段 = `ip:port` 字面（`SocketAddr` 解析，
+/// v4/v6 皆可）+ 端口 1–65535；非法 ⇒ 可行动文案（调用方 `CliErr::Usage` ⇒ exit 2）。
+///
+/// **空值 carve-out**：`--public-endpoint=''` = 显式关掉公网端点公布（Go flag 空串同义，
+/// config 面同样只对非空值校验）——空串不是「非法」。
+/// **比 Go 严一点**（登记）：Go `netip.ParseAddrPort` 收端口 0，本函数拒（端口 0 不是
+/// 可公布的端点）；其余口径一致。
+fn validate_public_endpoint_flag(v: &str) -> Result<(), String> {
+    if v.trim().is_empty() {
+        return Ok(());
+    }
+    for line in v.split(',') {
+        match line.trim().parse::<std::net::SocketAddr>() {
+            Ok(a) if a.port() != 0 => {}
+            Ok(_) => {
+                return Err(format!(
+                    "--public-endpoint {line:?} 非法（端口 0 不是可公布的端点；须为逗号分隔的 ip:port，端口 1–65535）"
+                ))
+            }
+            Err(e) => {
+                return Err(format!(
+                    "--public-endpoint {line:?} 非法（{e}；须为逗号分隔的 ip:port）"
+                ))
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `homeway-cli serve [...]`：前台出口（Ctrl-C / SIGTERM 有序收工）。
@@ -1744,5 +1778,42 @@ mod tests {
             bare.serve.quic_admit.unwrap_or_default().resolve().unwrap(),
             homeway_core::server::quic_admit::AdmitLimits::default()
         );
+    }
+
+    /// S7b/Q5：`--public-endpoint` 显式值**当场校验**（对齐 Go `cli.go:98-105` 的
+    /// fail-fast）——非法 ⇒ `CliErr::Usage`（前台 exit 2）+ 可行动文案；合法与显式空值放行。
+    #[test]
+    fn public_endpoint_flag_is_validated_fail_fast() {
+        let d = tmp_state("peflag");
+        write_cfg(&d, "[serve]\n");
+        let state = d.display().to_string();
+        let ok = |v: &str| {
+            assemble_result(&[
+                "--state".to_owned(),
+                state.clone(),
+                "--public-endpoint".to_owned(),
+                v.to_owned(),
+            ])
+        };
+        // 合法：v4/v6 字面 + 多段 + 空白容错（值原样搬运，不做归一）
+        let cfg = ok(" 1.2.3.4:41641 , [::1]:41641 ").expect("合法值放行");
+        assert_eq!(cfg.public_endpoint, " 1.2.3.4:41641 , [::1]:41641 ");
+        // 显式空值：**flag 层就拒**（`take_value_or_exit(..,false)` 的既有行为，exit 2；
+        // Go `--public-endpoint=` 同样报错——`ParseAddrPort("")` 失败）⇒ 不会走到本校验函数；
+        // 校验函数内的空值早退只是防御面（直接构造 `ServeConfig` 的调用方）。
+        assert!(validate_public_endpoint_flag("").is_ok(), "空值在校验函数内 = no-op 防御");
+        // 非法：缺端口 / 非地址 / 端口 0 / 端口越界 ⇒ 一律 Usage（exit 2）+ 文案带值
+        for bad in ["1.2.3.4", "nonsense", "1.2.3.4:0", "1.2.3.4:70000", "1.2.3.4:1,bad"] {
+            match ok(bad) {
+                Err(CliErr::Usage(m)) => {
+                    assert!(
+                        m.starts_with("--public-endpoint ") && m.contains("逗号分隔的 ip:port"),
+                        "文案须可行动（值 + 期望形态）：{m}"
+                    );
+                }
+                other => panic!("非法值须 Usage（exit 2）：{bad}（is_ok={}）", other.is_ok()),
+            }
+        }
+        let _ = std::fs::remove_dir_all(&d);
     }
 }

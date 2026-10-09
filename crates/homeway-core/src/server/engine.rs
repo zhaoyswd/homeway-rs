@@ -259,12 +259,14 @@ impl ServeEngine {
     /// 口径〕；`dlogf` = 细节流〔debug 文件恒写，verbose 回显〕；`tokf` = token 端点
     /// 变化轮流〔events 文件只写，verbose 回显〕；`log_paths` = 首轮「日志：」提示行。
     pub fn start(
-        cfg: ServeConfig,
+        mut cfg: ServeConfig,
         logf: Logf,
         dlogf: Logf,
         tokf: Logf,
         log_paths: Option<(String, String)>,
     ) -> std::io::Result<Arc<Self>> {
+        // Q5/S7b：公网端点非法 ⇒ 告警 + 按未配置处理（Go `serve.go:113-121` 的 `fill()` 同形）。
+        normalize_public_endpoint(&mut cfg, &logf);
         let serve_dir = cfg.state_dir.join("serve");
         let cache_dir = cfg.state_dir.join("cache");
         std::fs::create_dir_all(&serve_dir)?;
@@ -446,7 +448,8 @@ impl ServeEngine {
         // 都能连，v6 STUN 观测同 socket 成立）。
         let mut bind = ServerBind::open_bound(cfg.listen_port, &cfg.build, bind_addr, resolved.as_ref().map(|i| (i.index, i.name.clone())), Arc::clone(&logf))?;
         let local_port = bind.local_port();
-        std::fs::write(cache_dir.join("listen_port.txt"), format!("{local_port}\n"))?;
+        // Q4/S7b：写失败**非致命**（原 `?` = 致命 ⇒ serve 启不来，与 Go `role.go:95` 相反）。
+        write_listen_port_file(&cache_dir.join("listen_port.txt"), local_port, &logf);
         // 公布口径的 pinned 判据 = **运行期事实**（socket 钉卡成功与否 + 绑地址），
         // 看护循环重钉后更新（Go `pinnedNow`/`PinnedIface` 同义）。
         let pinned_flag = Arc::new(AtomicBool::new(bind.pinned.is_some() || bind_addr.is_some()));
@@ -1923,6 +1926,58 @@ fn refresh_quic_public(ctx: &Arc<TokenCtx>) {
     }
 }
 
+// ---------- S7b（Q3/Q4/Q5）：公共端点面三小修 ----------
+//
+// 三条都是「写盘/取值失败**不得静默、也不得致命**」的对齐（真源 = Go
+// `publicendpoint.go:126/226`（告警）、`role.go:95`（非致命）、`serve.go:113-121`
+// （非法值告警清空））。**成功路径的行文逐字不变**；新增面全是 additive 告警行。
+
+/// 监听端口落盘（Q4，原 `std::fs::write(..)?` = 致命）：失败只告警。
+///
+/// `cache/listen_port.txt` 是 **L3 可弃缓存**（`nodestate.rs`）——“只是少了给人看的
+/// 记录，不影响隧道”（Go `role.go:95` 原文）。写失败不应阻断 serve 就绪。
+fn write_listen_port_file(path: &std::path::Path, port: u16, logf: &Logf) {
+    if let Err(e) = std::fs::write(path, format!("{port}\n")) {
+        logf(&format!(
+            "⚠️ 监听端口落盘失败（{}）：{e}——服务照常就绪",
+            path.display()
+        ));
+    }
+}
+
+/// 公网端点落盘（Q3，原 `let _ = std::fs::write(..)` = 静默）：失败告警、**不中止本轮**。
+///
+/// 与 Go 的残余差异（如实登记）：Go `publicendpoint.go:126/226` 在写失败时
+/// `return false`（本轮不公布、不打 token）；本实现取「告警 + 本轮照常公布」——
+/// 理由 = 出口启停/公告语义不应因 L3 缓存写不进去而变（token 是终端一辈子只打一轮的
+/// 产品面）；两处调用点（显式端点路径 / 推断路径）共用本函数。
+fn write_public_endpoint_file(path: &std::path::Path, lines: &[String], logf: &Logf) {
+    if let Err(e) = std::fs::write(path, format!("{}\n", lines.join("\n"))) {
+        logf(&format!("⚠️ 公网端点写盘失败（{}）：{e}", path.display()));
+    }
+}
+
+/// 公网端点值域归一（Q5 的**守护期形态**，对齐 Go `serve.go:113-121` 的 `fill()`）：
+/// 任一段非法 ⇒ **告警 + 按未配置处理**（整串清空，Go 同形），不拒启。
+///
+/// CLI 显式 flag 已在 `serve_cli::validate_public_endpoint_flag` fail fast（exit 2）、
+/// config 面在严格读层拒启 ⇒ 本归一在正常 CLI 形态**恒不触发**（多一道防线；覆盖
+/// 直接构造 `ServeConfig` 的调用方，如 App/capi 侧）。覆盖序不变：它只做「非法即清」。
+fn normalize_public_endpoint(cfg: &mut ServeConfig, logf: &Logf) {
+    if cfg.public_endpoint.trim().is_empty() {
+        return;
+    }
+    for line in cfg.public_endpoint.split(',') {
+        if let Err(e) = line.trim().parse::<std::net::SocketAddr>() {
+            logf(&format!(
+                "⚠️ --public-endpoint {line:?} 非法（{e}）——按未配置处理"
+            ));
+            cfg.public_endpoint.clear();
+            break;
+        }
+    }
+}
+
 fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> bool {
     // QUIC 端口的公网映射（M1 S1c / S1-7：**E-q4 行成/败都打**，且 `--upnp=false`
     // 形态也打失败行 = fail-visible）。放在本轮最前：本函数末尾的
@@ -1934,7 +1989,7 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
         // 配置覆盖：推断在「不能枚举/不能观测」的环境里无解（macOS SSDP 被本地网络
         // 隐私拒即一例）——照常写文件 + 打 token。
         let lines: Vec<String> = manual.split(',').map(|s| s.trim().to_owned()).collect();
-        let _ = std::fs::write(&endpoint_file, format!("{}\n", lines.join("\n")));
+        write_public_endpoint_file(&endpoint_file, &lines, &ctx.logf);
         (ctx.logf)(&format!(
             "公网端点：已按 **--public-endpoint 配置**公布 {}（跳过 UPnP/STUN 推断；写进 public_endpoint.txt）",
             format_lines(&lines)
@@ -2088,7 +2143,7 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
             }
         }
     }
-    let _ = std::fs::write(&endpoint_file, format!("{}\n", lines.join("\n")));
+    write_public_endpoint_file(&endpoint_file, &lines, &ctx.logf);
     (ctx.logf)(&format!(
         "公网端点：已公布 {}（写进 public_endpoint.txt；下次签发 token 会带上它）",
         format_lines(&lines)
@@ -2456,6 +2511,101 @@ mod tests {
         let sum = mac.finalize().into_bytes();
         out.extend_from_slice(&sum[..16]);
         out
+    }
+
+    /// S7b/Q3：`public_endpoint.txt` 写失败 ⇒ **告警行**（原 = 静默 `let _ =`）；
+    /// 成功路径 = 逐字写 + **不打任何行**（既有成功行文不变）。
+    #[test]
+    fn public_endpoint_write_failure_warns() {
+        let (logf, rx) = log_sink();
+        let dir = tmp_dir("pubep");
+        // 让写入必失败：目标路径占据成**目录**（EISDIR）
+        let path = dir.join("public_endpoint.txt");
+        std::fs::create_dir_all(&path).unwrap();
+        write_public_endpoint_file(&path, &["203.0.113.7:42650".to_owned()], &logf);
+        let lines: Vec<String> = rx.try_iter().collect();
+        assert_eq!(lines.len(), 1, "写失败必须告警（且只一行）：{lines:?}");
+        assert!(
+            lines[0].starts_with("⚠️ 公网端点写盘失败（") && lines[0].contains("public_endpoint.txt"),
+            "告警行须带路径：{}",
+            lines[0]
+        );
+        // 子用例二：目标路径是普通目录下的文件（父目录不存在 ⇒ ENOENT）
+        let path2 = dir.join("no-such-dir").join("public_endpoint.txt");
+        write_public_endpoint_file(&path2, &["203.0.113.7:42650".to_owned()], &logf);
+        assert_eq!(rx.try_iter().count(), 1, "父目录缺失同样告警");
+        // 成功路径：文件内容 = 每条一行 + 尾换行；零新增行
+        let ok = dir.join("ok.txt");
+        write_public_endpoint_file(&ok, &["a:1".to_owned(), "b:2".to_owned()], &logf);
+        assert_eq!(std::fs::read_to_string(&ok).unwrap(), "a:1\nb:2\n");
+        assert_eq!(rx.try_iter().count(), 0, "成功路径不打行（既有行文不变）");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S7b/Q4：`listen_port.txt` 写失败 = **告警 + 非致命**（原 `?` = 致命 ⇒ serve 启不来）；
+    /// 成功路径 = `端口\n`（逐字节保持既有落盘格式）。
+    #[test]
+    fn listen_port_write_failure_warns_and_is_not_fatal() {
+        let (logf, rx) = log_sink();
+        let dir = tmp_dir("lp");
+        let path = dir.join("listen_port.txt");
+        std::fs::create_dir_all(&path).unwrap(); // 占据成目录 ⇒ EISDIR
+        write_listen_port_file(&path, 42650, &logf); // 不 panic、不返回 Err（非致命）
+        let lines: Vec<String> = rx.try_iter().collect();
+        assert_eq!(lines.len(), 1, "写失败必须告警：{lines:?}");
+        assert!(
+            lines[0].starts_with("⚠️ 监听端口落盘失败（") && lines[0].ends_with("——服务照常就绪"),
+            "告警行形态：{}",
+            lines[0]
+        );
+        let ok = dir.join("ok.txt");
+        write_listen_port_file(&ok, 42650, &logf);
+        assert_eq!(std::fs::read_to_string(&ok).unwrap(), "42650\n", "落盘格式逐字节不变");
+        assert_eq!(rx.try_iter().count(), 0, "成功路径不打行");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// S7b/Q5（守护期形态，对齐 Go `serve.go:113-121` 的 `fill()`）：非法值 ⇒
+    /// **告警 + 清空**（按未配置处理）；合法值 ⇒ 原样保留、零输出。
+    #[test]
+    fn normalize_public_endpoint_warns_and_clears_on_invalid() {
+        let (logf, rx) = log_sink();
+        let mut cfg = ServeConfig {
+            public_endpoint: "1.2.3.4:5,not-an-endpoint".to_owned(),
+            ..ServeConfig::default()
+        };
+        normalize_public_endpoint(&mut cfg, &logf);
+        assert!(cfg.public_endpoint.is_empty(), "非法 ⇒ 整串清空（Go fill() 同形）");
+        let lines: Vec<String> = rx.try_iter().collect();
+        assert_eq!(lines.len(), 1, "告警一行：{lines:?}");
+        assert!(
+            lines[0].starts_with("⚠️ --public-endpoint") && lines[0].ends_with("——按未配置处理"),
+            "告警行形态：{}",
+            lines[0]
+        );
+        // 合法（v4 + v6 字面 + 空白容错）：原样保留、零输出
+        let mut cfg2 = ServeConfig {
+            public_endpoint: " 1.2.3.4:5 , [::1]:6 ".to_owned(),
+            ..ServeConfig::default()
+        };
+        normalize_public_endpoint(&mut cfg2, &logf);
+        assert_eq!(cfg2.public_endpoint, " 1.2.3.4:5 , [::1]:6 ", "合法值不动（含原空白）");
+        // 空值：早退、零输出（空 = 未配置）
+        let mut cfg3 = ServeConfig::default();
+        normalize_public_endpoint(&mut cfg3, &logf);
+        assert_eq!(rx.try_iter().count(), 0, "合法/空值零输出");
+    }
+
+    fn tmp_dir(tag: &str) -> std::path::PathBuf {
+        static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        let d = std::env::temp_dir().join(format!(
+            "hw-eng-s7b-{tag}-{}-{}",
+            std::process::id(),
+            N.fetch_add(1, std::sync::atomic::Ordering::SeqCst)
+        ));
+        let _ = std::fs::remove_dir_all(&d);
+        std::fs::create_dir_all(&d).unwrap();
+        d
     }
 
     fn now() -> SystemTime {
