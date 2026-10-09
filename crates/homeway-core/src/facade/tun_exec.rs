@@ -782,7 +782,7 @@ fn gen_loop(
 
     let tunnel_ip = crate::tunnel_addr::derive_tunnel_ip(&cfg.token.secret, &ident.public_key());
     // ---- QUIC 岛装配（单承载：岛成 ⇒ 本世代唯一承载；岛不成 ⇒ 本世代失败）----
-    // 失败路径 = **可见失败**（设计 §2.6-G9：无 QUIC/中继端点的 token〔`serve.quic=false`
+    // 失败路径 = **可见失败**（设计 §2.6-G9：无 QUIC/中继端点的 token〔旧版出口/存量 WG-only
     // 形态 / 旧 token〕、无 RPK、岛起不来、赛跑未成——四条同一归因锚 `岛未就用（…）`；
     // M5 起无回落承载，故 stage 直接落 failed，不再有「按 WG 跑」的第二态）。
     match start_island(&run, &cfg, &ident, &logf) {
@@ -1200,7 +1200,7 @@ fn log_identity(
 #[derive(Debug, thiserror::Error)]
 enum QuicFail {
     /// token 缺 RPK 尾字段（`serve.quic=false` 形态的出口 token ⇒ 无法钉定服务端身份）。
-    #[error("token 未携带出口 RPK（serve.quic=false 形态？）")]
+    #[error("token 未携带出口 RPK（旧版出口/未启用 QUIC 面的形态？）")]
     NoRpk,
     /// token 里没有任何 QUIC/中继类端点（§2.7 收窄后的候选来源为空）。
     #[error("token 无 QUIC/中继类端点（候选为空）")]
@@ -2103,7 +2103,7 @@ mod tests {
         }
     }
 
-    /// **判据（§2.6-G9 的负例实测；M5 C3）**：token 只带 **WG 类端点**（`serve.quic=false`
+    /// **判据（§2.6-G9 的负例实测；M5 C3/C4）**：token 只带 **WG 类端点**（存量旧 token 形态
     /// 形态 / 旧 token）⇒ 岛候选为空 ⇒ **可见失败**：`岛未就用（…候选为空）` 归因行 +
     /// `failed` 终态 + **单飞锁已放**（下一次 prepare 可受理）。**不得**有任何回落兜底。
     #[test]

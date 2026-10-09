@@ -179,6 +179,12 @@ impl PubFace {
         src: SocketAddr,
     ) -> Option<homeway_quic::PlainOutcome> {
         use homeway_quic::PlainOutcome;
+        // **源地址归一**（原 `ServerBind::recv_packet` 同义、同位置）：出口公共端口是
+        // 双栈 socket（`[::]`）——v4 包的源地址是 v4-mapped 形态（`::ffff:x.y.z.w`），
+        // 归一成纯 v4。下游三处比较/键（①注册腿线程的「控制帧源全等」判据 ②新源表
+        // ③STUN 回执地址）都按纯 v4/v6 口径做——不归一会让**中继注册腿的回执被静默
+        // 忽略**（C4 实测：注册永不确认 ⇒ 中继不给客户端 hint）。
+        let src = crate::udpbatch::unmap_v4_in6(src);
         // ① STUN 观测应答（只认事务 ID 匹配的应答——不匹配的照旧不算本面）。
         if stun_looks_like_response(buf) {
             let mut g = self.stun.lock().expect("stun 锁中毒");

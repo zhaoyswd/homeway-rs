@@ -31,6 +31,10 @@ QUIC_PORT_FILE="$EXIT_STATE/cache/quic_listen_port.txt"
 
 mkdir -p "$RES" || exit 1
 
+# **先停**（上一个 e2e 可能还在跑同一实例）：否则下面的端口缓存清理 + E-q1 断言都指不到
+# 本轮日志/本轮文件（C4 实测的假红形态）
+"$REPO_ROOT/tools/local-rust-exit.sh" stop "$n" >/dev/null 2>&1 || true
+
 # 断言前置：清掉上一轮的端口缓存——否则「文件存在」是假阳性（M5：两个文件同值 = 公共端口）
 rm -f "$QUIC_PORT_FILE" "$LISTEN_PORT_FILE"
 # **起服之前**记日志基线：启动期的判据行（`quic: 端点就绪`）只在这一段里
@@ -78,7 +82,7 @@ run_one() {
   local extra=()
   [[ "$ignored" == "ignored" ]] && extra=(--ignored)
   ( cd "$REPO_ROOT" && HOMEWAY_WG_E2E_TOKEN="$TOKEN" HOMEWAY_WG_E2E_EXIT_LOG="$EXIT_LOG" \
-      cargo test -p homeway-core --test quic_wg_e2e "$name" "${extra[@]}" -- --nocapture --test-threads=1 ) \
+      cargo test -p homeway-core --test quic_wg_e2e "$name" -- "${extra[@]}" --nocapture --test-threads=1 ) \
     > "$out" 2>&1
   local r=$?
   grep -E "^\[g9|^\[token|^test result" "$out" || true

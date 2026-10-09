@@ -105,7 +105,7 @@ async fn handle_stream(mut send: SendStream, mut recv: RecvStream, conn_id: u64,
 
 /// tag 1/2/3：socketpair + 入队（服务入口）+ 泵。
 ///
-/// 未启用（`intakes.slot(tag) == None`：`serve.quic` 面没拿到该服务的 intake——监听失败 /
+/// 未启用（`intakes.slot(tag) == None`：出口 QUIC 面没拿到该服务的 intake——监听失败 /
 /// `HOMEWAY_TERM=off`）⇒ `0x22`（§1.6 设计门 N16 的**保守选择**：UDS bind 失败 ⇒ 该服务
 /// QUIC 腿一并停用，与今天「整服务不可用」同形）。
 async fn serve_via_intake(
