@@ -13,7 +13,7 @@
 # state：/tmp/homeway-rs-matrix/<链路>/{exit,relay,c-main,c-sub,files}；每链路自 wipe。
 # files 根显式隔离（--files-root …/<链路>/files——不落 $HOME；上传目标带随机后缀）。
 # 段级隔离（评审 ①-2）：identity 跨段复用（保 devTag——n 计数可控）；endpoint cache
-#   按段清/换（Rust --endpoint-cache-dir 分目录；Go 段间 rm -rf <state>/cache/endpoints）。
+#   面（M5 C2：Rust 侧随 WG 档退役——岛候选恒来自 token；Go 侧段间 rm -rf <state>/cache/endpoints）。
 # 中继段驻留判据分口径（评审 ①-1）：Rust relay 链路硬钉（--no-hints + 段预算 <300s）；
 #   Go relay 链路只判首窗 via=relay + 数据，翻直连 = 预期自愈观测（备注列，非 FAIL）。
 #
@@ -460,10 +460,10 @@ base_segment() {
       fi
     fi
   else
-    local IDDIR="$st/c-main/identity" CACHEDIR="$st/c-main/ep-base"
-    mkdir -p "$IDDIR" "$CACHEDIR"
+    local IDDIR="$st/c-main/identity"
+    mkdir -p "$IDDIR"
     local CL0=$(log_lines "$st/c-main/rust.log")
-    nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$IDDIR" --no-session-lock --endpoint-cache-dir "$CACHEDIR" \
+    nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$IDDIR" --no-session-lock \
       --speedtest --hold 600 >> "$st/c-main/rust.log" 2>&1 &
     echo $! > "$st/c-main/pid"
     if V=$(wait_line_from "$st/c-main/rust.log" 'warmup pong: 就绪' "$CL0" 25); then
@@ -479,7 +479,7 @@ base_segment() {
       # 简单可靠；主客户端 --speedtest 会重跑，E13 判据照常收）
       stop_pid "$st/c-main/pid"
       local CL0r=$(log_lines "$st/c-main/rust.log")
-      nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$IDDIR" --no-session-lock --endpoint-cache-dir "$CACHEDIR" \
+      nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$IDDIR" --no-session-lock \
         --speedtest --hold 600 >> "$st/c-main/rust.log" 2>&1 &
       echo $! > "$st/c-main/pid"
       if V=$(wait_line_from "$st/c-main/rust.log" '路径确立：直连|link: via=direct' "$CL0r" 60); then
@@ -536,7 +536,7 @@ base_segment() {
   while [[ -z "$SP" || "$SP" == *失败* ]] && (( tries < 3 )); do
     tries=$((tries + 1))
     sleep 20
-    SP=$(tmo 90 "$RUST_BIN" speedtest --token "$TOK" --identity-dir "$st/c-main/identity" --no-session-lock --endpoint-cache-dir "$st/c-main/ep-base" --rounds 1 2>&1 | grep -E 'round|失败' | tail -2)
+    SP=$(tmo 90 "$RUST_BIN" speedtest --token "$TOK" --identity-dir "$st/c-main/identity" --no-session-lock --rounds 1 2>&1 | grep -E 'round|失败' | tail -2)
   done
   if [[ -n "$SP" && "$SP" != *失败* ]]; then
     record "$link" E13-speedtest "PASS" "$(echo "$SP" | tr '\n' '；' | cut -c1-100)" $'（复核第 '"$tries"' 轮命中）'
@@ -604,15 +604,26 @@ base_segment() {
     stop_pid "$st/c-main/pid"
     local CL0b=$(log_lines "$st/c-main/rust.log")
     nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$st/c-main/identity" --no-session-lock \
-      --endpoint-cache-dir "$st/c-main/ep-base" --dial "$(lan_ip):$(echo_port "$link")" --hold 600 \
+      --dial "$(lan_ip):$(echo_port "$link")" --hold 600 \
       >> "$st/c-main/rust.log" 2>&1 &
     echo $! > "$st/c-main/pid"
     # dial 在会话就绪后自动执行（transit 行即产）
   fi
-  if V=$(wait_line_from "$st/exit/stdout.log" 'intercept: tcp transit.*dialok' "$EL1" 25); then
-    record "$link" E10 "PASS" "${V:0:100}"
+  if [[ "$C" == go ]]; then
+    if V=$(wait_line_from "$st/exit/stdout.log" 'intercept: tcp transit.*dialok' "$EL1" 25); then
+      record "$link" E10 "PASS" "${V:0:100}"
+    else
+      record "$link" E10 "FAIL" "25s 内未见 transit dialok"
+    fi
   else
-    record "$link" E10 "FAIL" "25s 内未见 transit dialok"
+    # M5 C2：Rust 客户端的 `--dial` 走 **QUIC dial 腿**（`STREAM[dial]`）——出口
+    # intercept 的 transit 行**不再产出**（设计 S4 的收窄面）⇒ 证据换源 = **客户端
+    # 往返行**（echo 回显字节数 = 端到端证通，强于单侧受理行；登记归 D 棒 S5）。
+    if V=$(wait_line_from "$st/c-main/rust.log" 'transit: 经隧道拨' "$CL0b" 25); then
+      record "$link" E10 "PASS" "${V:0:100}" "（QUIC dial 腿：客户端往返行；出口 intercept transit 行随 S4 收窄）"
+    else
+      record "$link" E10 "FAIL" "25s 内客户端未见 transit 往返行"
+    fi
   fi
   # E11 关闭行（transit 流关后；Rust exit 的关闭行时序可达数秒——15s 轮询窗）
   local wi=0 V11=""
@@ -623,6 +634,11 @@ base_segment() {
   done
   if [[ -n "$V11" ]]; then
     record "$link" E11 "PASS" "${V11:0:100}"
+  elif [[ "$C" == rust ]]; then
+    # M5 C2：QUIC dial 腿的收口行 = 出口 `quic: 服务流结束（tag=dial`（#17 节流面：
+    # 首 3 + 每 100 ⇒ 本链路多流后大概率被节流）⇒ 不强判，改登记态：流收口由 M4
+    # `quic-pf-e2e` 的流终结/泄漏判据 + E10 的客户端往返行共同承载。
+    record "$link" E11 "WARN" "（QUIC dial 腿收口行受出口 #17 节流——证据 = M4 quic-pf-e2e 流收口/泄漏判据 + E10 客户端往返行）" "E11-QUIC-DIAL"
   elif [[ "$E" == rust ]]; then
     # Rust exit 链路：Go forward 对断开连接「自然收口」（不强关——不发主动 FIN），
     # exit 侧 teardown 由 idle 回收（5min）触发 ⇒ 关闭行延后——teardown 的 E11 行
@@ -641,18 +657,11 @@ base_segment() {
     record "$link" FB-files "PASS" "list ${FB} 行（并发闸不误伤；满员拒绝面见单测）"
   fi
 
-  # DNS（Rust 客户端链路；Go 客户端无 DNS 拨号动词——未纳入表见设计 §1.6）
+  # DNS 行：**`dnstest` 已退役（M5 §2.6-G6）**——它依赖 WG 栈 B 的 UDP socket 面，
+  # QUIC 岛只有 STREAM + L3，无 UDP socket 服务面（有意缺口）。本行改**登记态**：
+  # 不再调 CLI 动词（动词已从 `homeway-cli` 移除），判据面 = 退役登记本身。
   if [[ "$C" == rust ]]; then
-    local DNST
-    if DNST=$(tmo 30 "$RUST_BIN" dnstest --token "$TOK" --identity-dir "$st/c-main/identity" --no-session-lock --mode leg example.com 2>&1 | grep 'rcode=' | head -1); then
-      if [[ "$DNST" == *"rcode=0"* ]]; then
-        record "$link" DNS "PASS" "${DNST:0:100}"
-      else
-        record "$link" DNS "FAIL" "$DNST"
-      fi
-    else
-      record "$link" DNS "FAIL" "dnstest 无输出"
-    fi
+    record "$link" DNS "PASS" "（dnstest 已退役——M5 §2.6-G6：岛无 UDP socket 服务面；登记归 D 棒 S5）"
   else
     record "$link" DNS "PASS" "（未纳入——Go 客户端无 DNS 拨号动词，设计 §1.6）"
   fi
@@ -679,7 +688,7 @@ EOF
     go_client_add_sub "$link" "$TOK" || true
   else
     mkdir -p "$st/c-sub/identity" "$st/c-sub/ep"
-    nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$st/c-sub/identity" --no-session-lock --endpoint-cache-dir "$st/c-sub/ep" \
+    nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$st/c-sub/identity" --no-session-lock \
       --hold 120 >> "$st/c-sub/rust.log" 2>&1 &
     echo $! > "$st/c-sub/pid"
   fi
@@ -726,7 +735,7 @@ relay_segment() {
     mkdir -p "$st/c-main/ep-relay"
     local CL0=$(log_lines "$st/c-main/rust.log")
     nohup "$RUST_BIN" connect --token "$TOK" --identity-dir "$st/c-main/identity" --no-session-lock \
-      --endpoint-cache-dir "$st/c-main/ep-relay" --dead-direct --speedtest --hold 240 \
+      --dead-direct --speedtest --hold 240 \
       >> "$st/c-main/rust.log" 2>&1 &
     echo $! > "$st/c-main/pid"
     local LOGF="$st/c-main/rust.log"
@@ -829,7 +838,7 @@ relay_segment() {
     UP_OUT=$(tmo 150 "$GO_BIN" files put --state "$st/c-main" --host "dead$link" "${RLIM[@]}" "$LOCAL" "/$RNAME" 2>&1 | tail -1)
     DN_OUT=$(tmo 150 "$GO_BIN" files get --state "$st/c-main" --host "dead$link" "/$RNAME" -o "$st/dn-rl.bin" 2>&1 | tail -1)
   else
-    # files CLI 无 --endpoint-cache-dir（不识别会错位进 rest）——不带 = 会话无落盘缓存，
+    # M5 C2：端点缓存面已退役（`--endpoint-cache-dir` 不再存在）——候选恒来自 token，
     # 竞速 token 端点（dead-direct 形态下恒中继），段级隔离天然成立
     UP_OUT=$(tmo 150 "$RUST_BIN" files upload --token "$TOK" --identity-dir "$st/c-main/identity" --no-session-lock --dead-direct "${RLIM[@]}" "/$RNAME" "$LOCAL" 2>&1 | tail -1)
     DN_OUT=$(tmo 150 "$RUST_BIN" files download --token "$TOK" --identity-dir "$st/c-main/identity" --no-session-lock --dead-direct "/$RNAME" "$st/dn-rl.bin" 2>&1 | tail -1)
