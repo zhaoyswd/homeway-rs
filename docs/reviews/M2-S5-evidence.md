@@ -337,7 +337,20 @@ E2 ——洪泛后**立即重连被拒**「the server refused to accept a new co
 
 ## 4. 未过 / 存疑项与工具局限（如实，不粉饰）
 
-（本批下一次 commit 落。）
+| # | 项 | 结论 | 处置建议 |
+|---|---|---|---|
+| **D1** | **按源闸在双栈出口上退化为全局桶**（`SrcKey::of` 未归一 v4-mapped IPv6 ⇒ 键恒为 `::/64`） | **证伪**（§3.3）：异源 /32 不独立；一个 IPv4 源打满窗 ⇒ 其余 IPv4 客户端**重连被拒至多 10s**（E2 实测） | **交 S6 / 主会话裁决**：改法 = `SrcKey::of` 里把 `V6` 的 v4-mapped（`::ffff:a.b.c.d`）归一成 `V4([a,b,c,d])`（一行 + 单测 + 判据行不变）；本切片**不改产品代码**（S5 = 实测切片） |
+| **N1（M1 遗留）** | **产品形态单连接内存**（§9.1-3 门槛 ≤+320K） | **仍不达标**，且 M2 后**持平略差**：下中位 **512K**（496/512/592）vs M1 同形态 496K = **+3.2%**（§3.10） | 门槛数值修订 / 降级登记 / S6 profiling 三条老建议不变（门槛表 = 主会话触点） |
+| **N2（M1 遗留）** | 体积对 3.8MB 阈值 | 双栈期 **1.233×**（4,685,216 B）；M2 增量 **+25,344 B ≤ +32KB** ✓ | M5 判；M5 设计门先实测删码余量 |
+| **N3** | **`handshake_cap=64` 在缺省配置下不可达**（双闸先束住单源） | 本切片用「抬闸 + 关 Retry」单独触达（C2）⇒ 上界**成立**但**不是缺省形态的实测** | 若要「缺省形态也能触达」，需多真源（不同 v6 /64 前缀）或真机；真机面承接 |
+| **N4** | `per_src_fails=16` 在 **pressure 档 + 最悲观形态**下客户端第 **11** 次就被拒（§3.1 B2） | **登记**（触发②的 `RETRY_AFTER_FAILS=5` 与 `16` 不同步） | 真机标定（S5-4，按住）；若要同步 = 改 `RETRY_AFTER_FAILS`（一行 + 登记） |
+| **N5** | 350ms RTT 预算下 `ready_ms≈2.25s` 的**构成**未分解（7.2×RTT；探针面单独手 = 1 RTT） | 预算**过**（45% of 5s），但「为什么是 7 RTT」未归因 | 后续期/真机 profiling（不影响预算判据） |
+| **L1** | `tools/quic-ab.sh` 的 `mem` 采样器只 strip 非数字 ⇒ `vmmap` 的 `10.3M` 会被读成 `103`（K 档无此问题，探针恒 <10MB 故一直未暴露） | **本切片踩到**（产品出口 10MB+） | 已在 `tools/m2-s5-e2e.sh` 归一（M 档 ×1024）；**`tools/quic-ab.sh` 与 `tools/m1-ab-e2e.sh` 的同款未改**（登记，防后续采样 ≥10MB 目标时误读） |
+| **L2** | `tools/m1-ab` 的 `--mtu-cap` **只对 `migrate` 档有效**：`run` 档走 facade，MTU 旋钮是 `HOMEWAY_QUIC_MTU`（首跑踩过：`run --mtu-cap 1200` 被静默忽略） | 已修（用法行写明 + 注释）；`run` 档的生产旋钮面已在 §3.9(a)(b) 覆盖 | 无需再改；后续棒用 `run` 档测 MTU 请用 env |
+| **L3** | 「非法 MTU 值 ⇒ 记行 + 按缺省」的**记行**在 `m1-ab run` 里落不出来（facade 日志面不接该 harness） | 只读到行为面（回落 1400）；记行由 `facade::tun_exec` 单测（`mtu_cap_resolution_clamps_by_default_policy`）与真机日志面覆盖 | 若要 E2E 看该行：走 `homeway-cli connect`/island e2e（后续期） |
+| **L4** | `ExitQuicSnapshot` **无外部只读面** ⇒ 判据 2 的「快照可读」只能以行内自带数落实（§3.6 限制） | 登记 | S6/后续期：`serve status --json` 暴露 quic 段（additive） |
+| **L5** | 洪泛臂的**客户端无法区分**「被 Retry / 被闸拒 / 真在途」（黑洞档收不到回包） | C 臂只作参考；C2/D 用**能定音的形态**（关 Retry / 正常握手） | 已在 §3.2 标注；后续棒若要精确读数，需在探针侧按 Retry 包特征分流 |
+| **残留** | 预存在的 `tools/quic-ab/arms/target/release/{raw,wg,quic} server` 进程 **11 枚**（Oct 8 20:44 起，`0.0% CPU`，非本切片） | 不影响读数（loadavg 全期 ≤3.75） | 属前一棒的清理面；本切片不擅自 kill 非自己起的实例 |
 
 ---
 
@@ -349,3 +362,59 @@ E2 ——洪泛后**立即重连被拒**「the server refused to accept a new co
 | `per_src_fails=16` 的**真机标定** | 同上（本机只能给「pressure 档最悲观形态」参考读数，§3.1 B2） | 真机（用户点头后） |
 | 路径 MTU 变化 / NAT 重绑 / 蜂窝切换 | 回环无这些形态 | 真机（M6） |
 | 真源多前缀（多 /64）下的计 2 前半触达 | 本机可用源前缀全落 `::/64`（v4-mapped）+ 无全局 v6 | 真机 / 加 v6 别名的机架 |
+
+---
+
+## 6. 收口门（本切片的测试与纪律门）
+
+| 门 | 结果 | 证据 |
+|---|---|---|
+| `cargo test --workspace` | **一次全绿**（16 个测试目标 0 failed；`homeway-core --lib` 692 passed/4 ignored；`homeway-quic --lib` 116 passed）——本批无 flake 复现（S4 批曾 3/4 红） | `/tmp/m2s5-res/final-workspace-test.log` |
+| `cargo clippy --workspace --all-targets -- -D warnings` | **0 告警**（rc=0） | `/tmp/m2s5-res/final-clippy.log` |
+| 三目标 `cargo check` | `aarch64-unknown-linux-ohos` rc=0（真 NDK clang；1 条存量 `libc::time_t` deprecated warning）；`x86_64-unknown-linux-musl` / `aarch64-unknown-linux-musl` **按 `ci.yml` 配方**（`CC_*=clang` + `CFLAGS_x86_64…=-nostdlibinc …` + `-p core/cli/capi/quic --locked`）**各 rc=0**；`-nostdlibinc` 落点断言 = 只落 ring ✓；ring `libring_core_0_17_14_.a` 两目标都在 ✓ | `/tmp/m2s5-res/check-*.log`、`check-ci-*.log` |
+| `tools/build-app-core.sh` | **三道门全过**（`[sym] 20/20` / `[ver] 8f8234608f67-rust` / `[size] 4,685,216 B`） | `/tmp/m2s5-res/build-app-core.log` |
+| `tools/check-quic-isolation.sh` | **九条全绿** | `/tmp/m2s5-res/final-isolation.log` |
+| `tools/check-vocab.sh` | **PASS**（Rust 声明 5 单元 / 26 值；ledger sha256 一致） | `/tmp/m2s5-res/final-vocab.log` |
+| 红线自查 | 本切片文件面 = `tools/**` + `docs/reviews/M2-S5-evidence.md`；**`crates/**` 零 diff** ⇒ `relay/**`、`relaywire.rs`、`server/intercept/**` 全未触碰 | `git diff --name-only 815dfd6..HEAD` |
+| 副作用残留 | 本切片起的本地出口/中继实例（#2/#4/#6/#8）**全部 stop**；`homeway-cli serve --state /tmp/homeway-rs-rust*` 进程 = **0**；现役出口（`/Users/zhaozhe/bin/homeway-rs --state ~/.config/homeway-rs`，pid 33667）**未碰**（始终在跑） | 收口前 `ps` 实测 |
+
+**建议 S6 承接（本切片不做）**：①D1 的 `SrcKey::of` v4-mapped 归一（**高危面**，一行 + 用例）；
+②`serve status --json` 暴露 quic 段（含 `flood_refused`/`retry_sent`/`handshakes_in_flight`）；
+③`RETRY_AFTER_FAILS`（5）与 `per_src_fails`（16）的同步裁决；④L1 采样器单位归一在
+`tools/quic-ab.sh` / `tools/m1-ab-e2e.sh` 的同款修复；⑤真机（S5-4）待用户点头。
+
+## 7. 复现命令（一条链）
+
+```sh
+# S5-1：门槛（独占机器；一运行一目录，防 loadavg.tsv 互相截断）
+QUIC_AB_DIR=/tmp/m2s5-res/quic-ab-cpu tools/quic-ab.sh cpu --arms raw,wg-shim,wg-ring,quic --rounds 5
+QUIC_AB_DIR=/tmp/m2s5-res/quic-ab-overhead tools/quic-ab.sh overhead --mtu 1400
+QUIC_AB_DIR=/tmp/m2s5-res/mem-steady  tools/quic-ab.sh mem --mode steady --arms raw,wg-shim,wg-ring,quic --rounds 3
+QUIC_AB_DIR=/tmp/m2s5-res/mem-load    tools/quic-ab.sh mem --mode load --arms raw,wg-shim,wg-ring,quic
+QUIC_AB_DIR=/tmp/m2s5-res/mem-conns5  tools/quic-ab.sh mem --mode conns
+QUIC_AB_DIR=/tmp/m2s5-res/mem-conns3  tools/quic-ab.sh mem --mode conns --conns-points 1,3,5
+QUIC_AB_DIR=/tmp/m2s5-res/mem-conns32 tools/quic-ab.sh mem --mode conns --conns-points 1,2,3,4,5,8,16,32
+QUIC_AB_DIR=/tmp/m2s5-res/mem-connsload        tools/quic-ab.sh mem --mode conns-load
+CONNS_LOAD_NO_READ=1 QUIC_AB_DIR=/tmp/m2s5-res/mem-connsload-noread tools/quic-ab.sh mem --mode conns-load
+QUIC_AB_DIR=/tmp/m2s5-res/size tools/quic-ab.sh size --profile lab,product && tools/build-app-core.sh
+
+# S5-2/S5-3/S5-5：产品路径（本地私有出口 #2/#4/#6 + 中继 #2；跑完自己停）
+cargo build --release -p homeway-cli                      # 工具坑②：不重建会跑到旧二进制
+( cd tools/m1-ab && cargo build --release ) && ( cd tools/quic-probe && cargo build --release )
+tools/m2-s5-e2e.sh 2 3        # A/A2 直连 A/B + A3 常态赛跑 + B1/B2/B3 判据1 + C/C2/D 判据2
+                              # + E 判据3 + E2 附带损伤 + F 300ms 预算 + G 窄路径 + I 产品形态内存
+```
+
+产物目录：`/tmp/m2s5-res/{quic-ab-cpu,quic-ab-overhead,mem-*,size,e2e}/`（`SUMMARY.txt` /
+`SUMMARY-flood.txt` / `loadavg.tsv` / 逐轮 `.json` / `*.log`）。**测试期间起的本地实例已全部停**。
+
+
+---
+
+## 5. 未做项（真机 / OHOS 触点；**本轮不宣称已验证**）
+
+| 项 | 为什么本机做不了 | 承接 |
+|---|---|---|
+| **S5-4 真机复验**（§7 的「能验」项 + §9.1-1 的源校验拒复看） | **主会话指令：用户设备上跑着生产环境的活隧道，任何安装/注入都会拆掉它** ⇒ 本轮不做 | **待用户点头** |
+| `per_src_fails=16` 的**真机标定** | 同上（本机只能给「pressure 档最悲观形态」参考读数） | 真机（用户点头后） |
+| 路径 MTU 变化 / NAT 重绑 / 蜂窝切换 | 回环无这些形态 | 真机（M6） |
