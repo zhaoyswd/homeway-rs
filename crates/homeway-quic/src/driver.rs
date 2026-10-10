@@ -1006,6 +1006,35 @@ async fn housekeeping(
         s.ladder_jitter_streak = st.ladder.jitter_streak();
         s.ladder_action = st.ladder.last_action.to_owned();
     }
+    // M6.7 临时诊断（收口删除）：逐秒落岛侧 quinn 读数 + TUN 面计数 + 四类丢弃
+    if let Some(seq) = crate::exit::m67_due() {
+        if let Some(live) = st.live.as_ref() {
+            let (drops, counters) = {
+                let s = lock_unpoison(&ctx.snapshot);
+                (
+                    format!(
+                        "{}/{}/{}/{}",
+                        s.drops.too_large,
+                        s.drops.send_buffer_full,
+                        s.drops.return_queue_full,
+                        s.drops.unregistered
+                    ),
+                    format!(
+                        " pkts_in={} pkts_out={} sbuf={}",
+                        s.packets_in, s.packets_out, s.send_buffer_used
+                    ),
+                )
+            };
+            let extra = format!(" drops={drops}{counters}");
+            (*ctx.logf)(&crate::exit::m67_line(
+                "island",
+                seq,
+                0,
+                &live.conn,
+                &extra,
+            ));
+        }
+    }
     // ⑤ 「窄路径不可用」判据（mds 变小/连接换过都要重判；S2-4）
     check_narrow_path(st, ctx);
     // 测试注入缝（仅 `#[cfg(test)]`；生产构建里是空函数）：连接在位后卡死——测
