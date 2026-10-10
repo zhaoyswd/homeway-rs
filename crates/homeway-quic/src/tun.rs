@@ -306,7 +306,11 @@ fn poll_fd(fd: i32, events: libc::c_short, deadline: Instant) -> io::Result<Read
         };
         let slice = POLL_SLICE.min(deadline.saturating_duration_since(now));
         let ms = slice.as_millis().min(i32::MAX as u128) as i32;
+        // M6.6 差分插桩：poll(2) 只量系统调用本身（`tun_read_poll` 段）
+        let __t = crate::diag_m66::diag().tun_read_poll.start();
+        crate::diag_m66::add(crate::diag_m66::C_POLL_CALLS, 1);
         let r = unsafe { libc::poll(&mut pfd, 1, ms) };
+        crate::diag_m66::diag().tun_read_poll.end(__t);
         if r < 0 {
             let e = io::Error::last_os_error();
             if e.kind() == io::ErrorKind::Interrupted {
@@ -350,7 +354,10 @@ fn write_fd_all(fd: i32, mut buf: &[u8]) -> io::Result<()> {
         if Instant::now() >= deadline {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "tun fd 写等待超预算"));
         }
+        // M6.6 差分插桩：`write(2)` 只量系统调用本身（`tun_write` 段）
+        let __t = crate::diag_m66::diag().tun_write.start();
         let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
+        crate::diag_m66::diag().tun_write.end(__t);
         if n < 0 {
             let e = io::Error::last_os_error();
             match e.kind() {
@@ -384,12 +391,17 @@ fn read_loop(fd: i32, tx: IslandTx, counters: Arc<TunCounters>, logf: Logf) {
     let mut buf = vec![0u8; 65535];
     let mut pending_drops: u64 = 0;
     loop {
+        // M6.6 差分插桩：`read(2)` 只量系统调用本身（`tun_read` 段）
+        let __t = crate::diag_m66::diag().tun_read.start();
+        crate::diag_m66::add(crate::diag_m66::C_READ_CALLS, 1);
         let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        crate::diag_m66::diag().tun_read.end(__t);
         if n < 0 {
             let e = io::Error::last_os_error();
             match e.kind() {
                 io::ErrorKind::Interrupted => continue,
                 io::ErrorKind::WouldBlock => {
+                    crate::diag_m66::add(crate::diag_m66::C_UP_EAGAIN, 1);
                     // 回退支（fd 非阻塞/标志不可清时才会走到）：等 POLLIN 一片。
                     // 三分处置（镜像 `wgcore`）：片到（TimedOut）= 继续；poll 出错 = 判死。
                     match poll_fd(fd, libc::POLLIN, Instant::now() + POLL_SLICE) {
@@ -453,6 +465,8 @@ fn read_loop(fd: i32, tx: IslandTx, counters: Arc<TunCounters>, logf: Logf) {
             n -= 4;
         }
         let pkt: Box<[u8]> = buf[..n].to_vec().into_boxed_slice();
+        crate::diag_m66::add(crate::diag_m66::C_UP_READ, 1);
+        crate::diag_m66::add(crate::diag_m66::C_UP_BYTES, n as u64);
         counters.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
         // 需求信号（demand-driven-recovery D1：只计 App 源；巡检拍取走清零）
         counters.out_pkts.fetch_add(1, Ordering::Relaxed);
@@ -480,7 +494,11 @@ fn read_loop(fd: i32, tx: IslandTx, counters: Arc<TunCounters>, logf: Logf) {
             }
             continue;
         }
-        if tx.send(Cmd::TunPacket(pkt)).is_err() {
+        let __tw = crate::diag_m66::diag().xwake_in.start();
+        let __send = tx.send(Cmd::TunPacket(pkt));
+        crate::diag_m66::diag().xwake_in.end(__tw);
+        crate::diag_m66::add(crate::diag_m66::C_WAKE, 1);
+        if __send.is_err() {
             // 岛已收工（通道断）——读线程自退（不重试、不挂死）
             counters.done_send();
             (logf)("homeway-tun-read: 投递失败（岛已收工）—— 读线程退出");
@@ -510,7 +528,11 @@ fn write_loop(
     writer_alive: Arc<std::sync::atomic::AtomicBool>,
 ) {
     loop {
-        let batch = match rx.recv() {
+        // M6.6 差分插桩：唤醒接收（futex 面；CPU 钟不含等待）
+        let __tw = crate::diag_m66::diag().wake_recv.start();
+        let __got = rx.recv();
+        crate::diag_m66::diag().wake_recv.end(__tw);
+        let batch = match __got {
             Ok(p) => p,
             Err(_) => {
                 writer_alive.store(false, Ordering::Relaxed);
@@ -523,6 +545,14 @@ fn write_loop(
                 Ok(()) => {
                     counters.write_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
                     counters.write_pkts.fetch_add(1, Ordering::Relaxed);
+                    // M6.6 差分插桩：下行投递计数 + 周期 dump（本线程是唯一「每包都过」的
+                    // 下行出口 ⇒ 由它驱动 dump 线）
+                    crate::diag_m66::add(crate::diag_m66::C_DN_WRITE, 1);
+                    crate::diag_m66::add(crate::diag_m66::C_DN_BYTES, pkt.len() as u64);
+                    if crate::diag_m66::dump_due() {
+                        let line = crate::diag_m66::dump_line("new");
+                        (logf)(&line);
+                    }
                 }
                 Err(e) => {
                     let msg = format!("tun fd 写入失败：{e}（标记隧道不健康）");

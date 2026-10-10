@@ -58,6 +58,8 @@ pub mod admit_close;
 mod client;
 mod cmd;
 mod config;
+/// **M6.6 差分量测插桩**（临时物；本批收口整文件删除；两臂树逐字节相同）。
+mod diag_m66;
 mod driver;
 mod exit;
 mod reg4;

@@ -433,6 +433,8 @@ fn thread_body(
     ready_tx: mpsc::Sender<io::Result<()>>,
     seam: u8,
 ) {
+    // M6.6：校准线程（ALU 环 + 管道写参考）——跨臂 per-call 成本必须带这一列
+    crate::diag_m66::spawn_calibrator();
     let res = catch_unwind(AssertUnwindSafe(|| {
         run_driver(&rt, rx, tx, &ctx, cfg, patrol, ready_tx, seam)
     }));
@@ -619,13 +621,20 @@ fn run_driver(
         };
         let mut jobs: JoinSet<Job> = JoinSet::new();
         loop {
+            // M6.6 差分插桩：岛主循环一轮（CPU 钟；等待不计——同步面「引擎一轮」的同义面）
+            crate::diag_m66::add(crate::diag_m66::C_LOOP, 1);
+            let __t_step = crate::diag_m66::diag().step.start();
             if ctx.stop.load(Ordering::SeqCst) {
                 break;
             }
             tokio::select! {
                 cmd = rx.recv() => match cmd {
                     Some(Cmd::Stop) => break,
-                    Some(c) => handle_cmd(c, &mut st, &mut face, ctx, &mut jobs, &tx, seam).await,
+                    Some(c) => {
+                        let __t_cmd = crate::diag_m66::diag().cmd_handle.start();
+                        handle_cmd(c, &mut st, &mut face, ctx, &mut jobs, &tx, seam).await;
+                        crate::diag_m66::diag().cmd_handle.end(__t_cmd);
+                    }
                     // 所有投递口掉光（实践里非主退出路径——同步面的岛句柄持 sender；
                     // 主路径是 `Cmd::Stop`／stop 位，见设计 §3.2）
                     None => break,
@@ -718,6 +727,7 @@ fn run_driver(
                 () = tokio::time::sleep(TICK) => {}
             }
             housekeeping(&mut st, &mut face, ctx, &mut jobs, seam).await;
+            crate::diag_m66::diag().step.end(__t_step);
         }
         // 收工：长任务全 abort（JoinSet drop）→ 连接面/端点随 face drop 关闭
         drop(jobs);

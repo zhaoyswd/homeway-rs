@@ -286,7 +286,12 @@ impl ClientSock {
 
     /// 单段接收（回退路径；填 `meta[0]`）。
     fn recv_one(&self, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> io::Result<usize> {
-        let (len, addr) = self.io.try_recv_from(&mut bufs[0][..])?;
+        // M6.6 差分插桩：UDP 收只量系统调用本身（`udp_recv` 段）
+        let __t = crate::diag_m66::diag().udp_recv.start();
+        let __r = self.io.try_recv_from(&mut bufs[0][..]);
+        crate::diag_m66::diag().udp_recv.end(__t);
+        crate::diag_m66::add(crate::diag_m66::C_UDP_RX, 1);
+        let (len, addr) = __r?;
         meta[0] = RecvMeta {
             addr,
             len,
@@ -329,7 +334,12 @@ impl AsyncUdpSocket for ClientSock {
             Some(f) => (f.as_slice(), true),
             None => (transmit.contents, false),
         };
-        match self.io.try_send_to(payload, transmit.destination) {
+        // M6.6 差分插桩：UDP 发只量系统调用本身（`udp_send` 段）
+        let __t = crate::diag_m66::diag().udp_send.start();
+        let __r = self.io.try_send_to(payload, transmit.destination);
+        crate::diag_m66::diag().udp_send.end(__t);
+        crate::diag_m66::add(crate::diag_m66::C_UDP_TX, 1);
+        match __r {
             Ok(_) => {
                 let mut st = lock_unpoison(&self.stats);
                 st.tx_dgrams += 1;
@@ -376,6 +386,7 @@ impl AsyncUdpSocket for ClientSock {
                 Ok(_) | Err(_) => continue,
             };
             // 剥壳 + 跳过忽略帧（有效载荷前移到各自的 buf 头部；`meta` 按序紧凑）
+            let __t_dn = crate::diag_m66::diag().proto_dn.start();
             let mut out = 0usize;
             let mut ignored_src = None;
             for i in 0..recvd {
@@ -422,8 +433,10 @@ impl AsyncUdpSocket for ClientSock {
                 }
             }
             if out > 0 {
+                crate::diag_m66::diag().proto_dn.end(__t_dn);
                 return Poll::Ready(Ok(out));
             }
+            crate::diag_m66::diag().proto_dn.end(__t_dn);
             // 整批都是忽略帧：继续收（与改前的 `continue` 同义）
         }
     }
