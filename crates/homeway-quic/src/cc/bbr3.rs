@@ -24,12 +24,12 @@
 //! | 上游面 | 本仓 | 等价性 / 处理 |
 //! |---|---|---|
 //! | `on_sent(now, &mut SentPacket, bif)` | `on_sent(now, bytes, last_pkt_num)` | 快照改写本模块的 [`SentTable`]（见下条） |
-//! | `SentPacket.rate_sample_state` | [`SentTable`] 的 `SentSnapshot` | **每次 `on_sent` 记一条**（quinn 的 `bytes` 可能是 **GSO 批总量**：一条记录覆盖批内 N 包，按 `bytes_remaining` 逐包核销；批内各包共用首个快照） |
+//! | `SentPacket.rate_sample_state` | [`SentTable`] 的 `SentSnapshot` | **每次 `on_sent` 记一条**（quinn 的 `bytes` 可能是 **GSO 批总量**：一条记录覆盖批内 N 包，按 `bytes_remaining` 逐包核销；批内各包共用首个快照。**delivered 累加用逐包 `on_ack` 的 `bytes`，不用记录的 `sent_size`**——否则批全确认后 `delivered` 膨胀 ×N〔2026-10-10 审查 A-2 修复〕） |
 //! | `on_ack(&mut SentPacket, …, bytes_in_flight)` | `on_ack(now, sent, bytes, …)` | 按 `(sent 时刻)` 取最近的未核销记录；quinn 的 `bytes` = 单包字节 |
 //! | `begin_ack(now, bif)` | 无对应钩子 | **懒开批**：本批首个 `on_ack` 时做同名复位（`ack_batch_open` 标志） |
 //! | `end_ack()` | `on_end_acks(now, in_flight, …)` | 等价（quinn 的 `now`/`in_flight` = 权威值） |
-//! | `on_congestion_event(now, &SentPacket, persistent, lost, bif)` | `on_congestion_event(now, sent, persistent, lost_bytes)` | 上游逐包调用，本仓**逐丢包批次**调用（`lost_bytes` = 批总量）；`handle_lost_packet` 的逐包字段取自 `sent` 时刻的记录，记录缺失时跳过该步（cwnd/持久拥塞逻辑不受影响） |
-//! | `stats.bytes_in_flight`（自维护） | 自维护 + **每批用 quinn 的 `in_flight` 对齐** | quinn 的 `in_flight.bytes` 不含纯 ACK 包（`SentPacket.size = 0`）⇒ 以它为权威 |
+//! | `on_congestion_event(now, &SentPacket, persistent, lost, bif)` | `on_congestion_event(now, sent, persistent, lost_bytes)` | 上游逐包调用，本仓**逐丢包事件**调用（`lost_bytes` = 该包字节）；`handle_lost_packet` 的逐包字段取自 `sent` 时刻的记录，记录缺失时跳过该步（cwnd/持久拥塞逻辑不受影响）。**ECN-CE 事件（`lost_bytes=0`）跳过逐包模型数学、只走进恢复主路径**——上游无 ECN 入路，不臆造 inflight_hi 定位〔2026-10-10 审查 A-3 修复〕 |
+//! | `stats.bytes_in_flight`（自维护） | 自维护 + **每批用 quinn 的 `in_flight` 对齐** | quinn 的 `in_flight.bytes` 不含纯 ACK 包（`SentPacket.size = 0`）⇒ 以它为权威；**批间隙内**自维护值会把纯 ACK 数据报字节也计入（quinn 的 `on_sent` 给整数据报）——量级 = 一个 ACK 批间隙的 ACK 字节，`on_end_acks` 即对齐，未另行补偿 |
 //! | `set_max_datagram_size`（上游由配置面更新） | `on_mtu_update(new_mtu)` | 更新 `max_datagram_size`/`min_cwnd`/`initial_cwnd` 并夹住 cwnd（照 quinn 自带 CC 的惯例） |
 //! | `pacing_rate()`（框架**据此发车**） | `metrics().pacing_rate`（仅**观测**） | ⚠️ **最大语义差**：quinn 的 pacer 按 `window()/RTT` 自算令牌桶（`quinn-proto` 的 `connection/pacing.rs`），**不消费**控制器给的速率 ⇒ BBR 的 `pacing_gain` 只经 `send_quantum`/`offload_budget`/`extra_acked` 与 `cwnd_gain` 间接生效 |
 //! | `pacing.rs`（上游自带 pacer） | **不搬** | 同上：pacing 属框架职责；搬进来会与 quinn 的 pacer 双发车 |
@@ -1675,7 +1675,11 @@ impl Bbr3 {
     //    /* solving for lost_prefix we arrive at: */
     //    lost_prefix = (BBRLossThresh * inflight_prev - lost_prev) / (1 - BBRLossThresh)
     fn inflight_hi_from_lost_packet(&mut self, rec: &SentRecord, lost_bytes: u64) -> u64 {
-        let size = lost_bytes.max(rec.sent_size);
+        // `size` = **被丢的那个包**的字节（上游 = `packet.sent_size`；本仓 = 框架逐丢包
+        // 事件给的 `lost_bytes`）。审查 A-3 修复：原 `lost_bytes.max(rec.sent_size)` 在
+        // GSO 批形态会拿数据报总量顶替单包大小 ⇒ `inflight_prev` 被过度扣减、
+        // `inflight_hi` 定位偏低。
+        let size = lost_bytes;
 
         // What was in flight before this packet?
         let inflight_prev = rec.tx_in_flight.saturating_sub(size);
@@ -2024,8 +2028,9 @@ impl Bbr3 {
         self.open_ack_batch(now);
 
         // Update rate sample by each ack packet.
+        // `bytes` = 本包确认字节（审查 A-2：累加面必须逐包，见 update_rate_sample 文档）。
         if let Some(mut rec) = self.sent.take_for_ack(sent, bytes) {
-            self.delivery_rate_estimator.update_rate_sample(&mut rec, now);
+            self.delivery_rate_estimator.update_rate_sample(&mut rec, now, bytes);
             self.ack_state.packet_delivered = self.ack_state.packet_delivered.max(rec.delivered);
         }
 
@@ -2123,8 +2128,17 @@ impl Controller for Bbr3 {
             self.ack_state.newly_lost_bytes.saturating_add(lost_bytes);
 
         // 逐包信号（上游面）取自 `sent` 时刻的快照；缺记录 ⇒ 跳过该步。
-        let rec = self.sent.peek_at(sent).cloned();
-        self.update_on_loss(now, rec.as_ref(), lost_bytes);
+        //
+        // **ECN 语义适配**（2026-10-10 审查 A-3）：框架把 ECN-CE 也送进本回调、且
+        // `lost_bytes = 0`（trait 文档明示）；上游只有真实丢包这一入路。ECN 事件没有
+        // 「被丢的那个包」——`handle_lost_packet` 的逐包模型数学（`ack_state.lost` 的
+        // 快照累计差 + `sent_size` 代入 lost_prefix）会拿陈旧快照算出错位值 ⇒ 只走
+        // 「进恢复 + 乘性降窗」主路径（下方 `enter_recovery`），跳过 inflight_hi/bw_hi
+        // 定位（上游无此输入面，不臆造）。
+        if lost_bytes > 0 {
+            let rec = self.sent.peek_at(sent).cloned();
+            self.update_on_loss(now, rec.as_ref(), lost_bytes);
+        }
 
         // Refer to https://www.rfc-editor.org/rfc/rfc9002#section-7.6.2
         // When persistent congestion is declared, the sender's congestion

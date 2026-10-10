@@ -39,7 +39,11 @@ pub(super) struct SentRecord {
     /// 发送时刻。
     pub(super) time_sent: Instant,
 
-    /// 发送字节数（= 上游 `SentPacket.sent_size`）。
+    /// 发送字节数（= 上游 `SentPacket.sent_size`；本仓 = **数据报总量**——GSO 批时一条
+    /// 记录覆盖批内 N 包）。2026-10-10 审查 A-2/A-3 修复后生产路径不再消费它（delivered
+    /// 累加改逐包 `acked_bytes`、lost-prefix 改 `lost_bytes`）；保留 = 快照语义的文档位
+    /// 与测试面构造器（`#[allow(dead_code)]` 与 `minmax` 同款显式登记）。
+    #[allow(dead_code)]
     pub(super) sent_size: u64,
 
     /// `P.first_sent_time`：发送时 C.first_sent_time 的快照。
@@ -188,14 +192,25 @@ impl DeliveryRateEstimator {
     /// Update rate sampler (rs) when a packet is SACKed or ACKed.
     ///
     /// `now` = 框架给出的 ack 时刻（上游读 `packet.time_acked`，语义相同）。
+    /// `acked_bytes` = **本次确认的单包字节数**（框架 `on_ack` 的 `bytes`）——上游用
+    /// `packet.sent_size` 累加 `C.delivered`，那是「该包自己的大小」；本仓的
+    /// [`SentRecord::sent_size`] 是**数据报总量**（GSO 批时一条记录服务批内 N 包，
+    /// 每包各取一次克隆快照）⇒ 累加必须用逐包的 `acked_bytes`，否则批全确认后
+    /// `delivered` 膨胀 ×N、`delivery_rate`/`max_bw`/`bdp` 全部级联膨胀（2026-10-10
+    /// 审查 A-2 的修复点）。
     /// See <https://datatracker.ietf.org/doc/html/draft-cheng-iccrg-delivery-rate-estimation-02#section-3.3>.
-    pub(super) fn update_rate_sample(&mut self, rec: &mut SentRecord, now: Instant) {
+    pub(super) fn update_rate_sample(
+        &mut self,
+        rec: &mut SentRecord,
+        now: Instant,
+        acked_bytes: u64,
+    ) {
         if rec.delivered_time.is_none() {
             // Packet already SACKed or packet not acked
             return;
         }
 
-        self.delivered = self.delivered.saturating_add(rec.sent_size);
+        self.delivered = self.delivered.saturating_add(acked_bytes);
         // note: Update rate sample after P.time_acked got update. The default Instant::now() is
         // not accurate for estimating ack_elapsed.
         self.delivered_time = now;
@@ -398,7 +413,7 @@ mod tests {
         }
         let ack1 = now + Duration::from_millis(20);
         for p in &mut part1 {
-            est.update_rate_sample(p, ack1);
+            est.update_rate_sample(p, ack1, pkt_size);
         }
         est.generate_rate_sample();
         assert_eq!(est.delivered(), pkt_size * n_pkts);
@@ -410,7 +425,7 @@ mod tests {
         let mut consumed = rec(99, now, pkt_size);
         consumed.delivered_time = None;
         let before = est.delivered();
-        est.update_rate_sample(&mut consumed, ack1);
+        est.update_rate_sample(&mut consumed, ack1, pkt_size);
         assert_eq!(est.delivered(), before, "已消费的快照不再计入 delivered");
 
         est.set_app_limited(true);
@@ -427,7 +442,7 @@ mod tests {
         }
         let ack2 = now + Duration::from_millis(30);
         for p in &mut part2 {
-            est.update_rate_sample(p, ack2);
+            est.update_rate_sample(p, ack2, pkt_size);
         }
         est.generate_rate_sample();
         assert_eq!(est.delivered(), pkt_size * n_pkts * 2);
@@ -440,5 +455,31 @@ mod tests {
         assert_eq!(est.rate_sample.send_elapsed, send_elapsed);
         assert_eq!(est.sample_rtt(), ack2 - part2[0].time_sent);
         assert!(!est.is_sample_app_limited());
+    }
+
+    /// 回归（2026-10-10 审查 A-2）：GSO 批记录（`sent_size` = 批总量 N×P）被批内
+    /// N 包各确认一次——每次 `take_for_ack` 返回**新鲜克隆**（防重标记写在克隆上、
+    /// 不落原记录）⇒ `delivered` 的累加完全由 `acked_bytes` 参数决定：必须 = N×P，
+    /// 不是 N×N×P。
+    #[test]
+    fn delivered_counts_per_packet_bytes_for_gso_batch_record() {
+        let now = Instant::now();
+        let mut est = DeliveryRateEstimator::new(now);
+        let pkt = 1200u64;
+        let n = 4u64;
+        // 一条「数据报」记录（sent_size = 批总量；on_sent 的 bytes 形态）
+        let mut rec0 = SentRecord::new(9, now, pkt * n);
+        est.on_packet_sent(&mut rec0, 0, 0);
+        let ack_at = now + Duration::from_millis(10);
+        for _ in 0..n {
+            let mut clone = rec0.clone();
+            est.update_rate_sample(&mut clone, ack_at, pkt);
+        }
+        est.generate_rate_sample();
+        assert_eq!(
+            est.delivered(),
+            pkt * n,
+            "GSO 批全确认：delivered = N×P（不得 N×N×P 膨胀）"
+        );
     }
 }
