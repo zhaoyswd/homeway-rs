@@ -5,7 +5,7 @@
 //! 钉定与 Q-O 资源上限；**M2 S1** 加：`hr-reg4` 四帧准入（nonce 一次性 / 窗 / 双期限 /
 //! 已绑定再准入门禁 / 版本与域）/ 刷新不重绑 / exporter 连接绑定 / 未认证门禁。
 
-use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, SocketAddrV6, UdpSocket};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
@@ -2148,6 +2148,7 @@ async fn removed_leg_does_not_fall_back_to_direct_socket() {
     let sock = ExitSock::new(
         tokio::net::UdpSocket::from_std(direct).expect("进 runtime 面"),
         direct_addr,
+        false, // 直连面 = 裸 v4 回环 socket（族归一是双栈面的事，见下方「发送侧族适配」用例）
         Arc::clone(&legs),
         inject_rx,
         Arc::clone(&bridge),
@@ -2205,6 +2206,334 @@ async fn removed_leg_does_not_fall_back_to_direct_socket() {
     send_ready(&sock, &tx(relay_addr, b"again")).await;
     let (n, _src) = relay.recv_from(&mut buf).expect("重登记后腿路径应恢复");
     assert_eq!(&buf[..n], b"\xBB\x05again");
+}
+
+// ---------- 直连 socket 的发送侧族适配（Darwin `EINVAL` 修复）----------
+
+/// 双栈监听 socket（`[::]:<内核分配>`；`IPV6_V6ONLY=0` **必须在 bind 前设**——生产绑定面
+/// `bind_dual_stack` 同款，本 crate 是叶子、不得依赖 `homeway-core`，故本地复刻）。
+fn dual_stack_socket() -> UdpSocket {
+    use std::os::fd::{AsRawFd as _, FromRawFd as _, OwnedFd};
+    // SAFETY：新建 fd 的所有权随即转 `OwnedFd`（失败路径由它关闭）
+    let fd = unsafe { libc::socket(libc::AF_INET6, libc::SOCK_DGRAM, 0) };
+    assert!(
+        fd >= 0,
+        "AF_INET6/UDP socket 必可建（实得 {}）",
+        std::io::Error::last_os_error()
+    );
+    // SAFETY：fd 由 socket(2) 新建、未别处持有
+    let fd = unsafe { OwnedFd::from_raw_fd(fd) };
+    let off: libc::c_int = 0;
+    // SAFETY：setsockopt 只读 `off` 的 4 字节
+    let r = unsafe {
+        libc::setsockopt(
+            fd.as_raw_fd(),
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            &off as *const _ as *const libc::c_void,
+            std::mem::size_of::<libc::c_int>() as u32,
+        )
+    };
+    assert_eq!(
+        r,
+        0,
+        "IPV6_V6ONLY=0 必须设成（实得 {}）",
+        std::io::Error::last_os_error()
+    );
+    let mut sin6: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+    sin6.sin6_family = libc::AF_INET6 as _;
+    sin6.sin6_port = 0; // 端口由内核分配（flake 口径①：不钉固定端口）
+    sin6.sin6_addr = libc::in6_addr { s6_addr: [0; 16] };
+    #[cfg(any(target_os = "macos", target_os = "ios"))]
+    {
+        sin6.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+    }
+    // SAFETY：bind 只读 `sin6`
+    let r = unsafe {
+        libc::bind(
+            fd.as_raw_fd(),
+            &sin6 as *const _ as *const libc::sockaddr,
+            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
+        )
+    };
+    assert_eq!(
+        r,
+        0,
+        "[::]:0 必可绑（实得 {}）",
+        std::io::Error::last_os_error()
+    );
+    UdpSocket::from(fd)
+}
+
+/// 发送面用例的承载：直连 socket = 双栈 `[::]:0`（`dual` 事实用 `socket::is_dual_stack`
+/// 取——与生产装配同源）、空腿表、注入队列丢弃端；`plain` 可选。返回 `(socket, 直连地址, 统计)`。
+fn exit_sock_dual_direct(
+    plain: Option<crate::exit::PlainDatagramHook>,
+) -> (
+    Arc<crate::exit::socket::ExitSock>,
+    SocketAddr,
+    Arc<ExitStats>,
+) {
+    use crate::exit::socket::{is_dual_stack, ExitSock, LegTable};
+    let stats = Arc::new(ExitStats::default());
+    let (wake_tx, wake_rx) = std::os::unix::net::UnixStream::pair().expect("self-pipe 可建");
+    wake_tx.set_nonblocking(true).unwrap();
+    wake_rx.set_nonblocking(true).unwrap();
+    let (out_tx, _out_rx) = tokio::sync::mpsc::channel(1);
+    let bridge = Arc::new(ExitBridge::new(
+        Arc::clone(&stats),
+        Arc::new(|_: &str| {}),
+        wake_tx,
+        wake_rx,
+        out_tx,
+    ));
+    let direct = dual_stack_socket();
+    let local = direct.local_addr().expect("本地地址可读");
+    direct.set_nonblocking(true).expect("from_std 前置");
+    let dual = is_dual_stack(&direct);
+    assert!(dual, "用例前提：本 socket 必须判为双栈（V6ONLY=0 已设）");
+    let (_inject_tx, inject_rx) = tokio::sync::mpsc::channel(4);
+    let sock = Arc::new(ExitSock::new(
+        tokio::net::UdpSocket::from_std(direct).expect("进 runtime 面"),
+        local,
+        dual,
+        Arc::new(LegTable::default()),
+        inject_rx,
+        bridge,
+        plain,
+    ));
+    (sock, local, stats)
+}
+
+/// `send_plain` 的用例形态：先按产品形态落定写就绪（quinn 的 io_poller——就绪缓存未起时
+/// tokio 的 `try_send_to` 首答 `WouldBlock`），再发；等待预算 = 仓内上界 `WAIT`
+/// （flake 口径②：只判上界，不设紧预算）。
+async fn send_plain_ready(
+    sock: &Arc<crate::exit::socket::ExitSock>,
+    dst: SocketAddr,
+    payload: &[u8],
+) {
+    use quinn::AsyncUdpSocket as _;
+    let mut poller = Arc::clone(sock).create_io_poller();
+    tokio::time::timeout(
+        WAIT,
+        std::future::poll_fn(|cx| poller.as_mut().poll_writable(cx)),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("发送面在 {WAIT:?} 内未就绪（→ {dst}）"))
+    .expect("发送面就绪不得报错");
+    match sock.send_plain(dst, payload) {
+        Ok(()) => {}
+        Err(e) => panic!("send_plain(→ {dst}) 失败：{e}（期望送达）"),
+    }
+}
+
+/// 有界等一包（flake 口径②：只判上界）。返回 `(载荷, 源地址)`。
+fn recv_within(sock: &UdpSocket, wait: Duration) -> Option<(Vec<u8>, SocketAddr)> {
+    sock.set_read_timeout(Some(wait)).ok();
+    let mut buf = [0u8; 2048];
+    match sock.recv_from(&mut buf) {
+        Ok((n, src)) => Some((buf[..n].to_vec(), src)),
+        Err(_) => None,
+    }
+}
+
+/// `homeway-core::udpbatch::unmap_v4_in6` 的同义复刻（本 crate 是叶子、不得依赖 core）：
+/// v4-mapped v6 源归一成纯 v4——`pubface` 在钩子内做同一件事，用例 C 复刻该口径。
+fn unmap_v4_in6(a: SocketAddr) -> SocketAddr {
+    match a {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::V4(SocketAddrV4::new(v4, v6.port())),
+            None => a,
+        },
+        v4 => v4,
+    }
+}
+
+/// **判据（族适配的语义面）**：dual 时仅裸 `V4 → V4-mapped`；v4-mapped / 纯 v6 原样
+/// （**不重复 map**）；**非 dual 一律原样**（族不匹配的错误照旧如实上报）。
+/// Linux/OHOS 内核对 AF_INET6 socket 的裸 v4 目标会自行转 v4-mapped ⇒ 下方三条端到端
+/// 回环用例（A/B/C；评审用例 3/4/5）在该平台只有语义价值——**跨平台钉回退的是本条
+/// 纯函数判据**。
+#[test]
+fn xmit_addr_maps_only_bare_v4_under_dual() {
+    use crate::exit::socket::xmit_addr;
+    let v4: SocketAddr = "127.0.0.1:41234".parse().unwrap();
+    let mapped: SocketAddr = "[::ffff:127.0.0.1]:41234".parse().unwrap();
+    let v6: SocketAddr = "[::1]:41234".parse().unwrap();
+    assert_eq!(xmit_addr(v4, true), mapped, "dual：裸 v4 必须 map");
+    assert_eq!(
+        xmit_addr(mapped, true),
+        mapped,
+        "dual：v4-mapped 原样（不重复 map）"
+    );
+    assert_eq!(xmit_addr(v6, true), v6, "dual：纯 v6 原样");
+    assert_eq!(
+        xmit_addr(v4, false),
+        v4,
+        "非 dual：裸 v4 原样（错误如实上报）"
+    );
+    assert_eq!(xmit_addr(v6, false), v6, "非 dual：v6 原样");
+}
+
+/// **判据（dual 事实的读法）**：`IPV6_V6ONLY=0` 的 `[::]` socket 判 dual；v4 socket
+/// （该选项不可读）判非 dual。
+#[test]
+fn is_dual_stack_reads_the_runtime_fact() {
+    use crate::exit::socket::is_dual_stack;
+    assert!(
+        is_dual_stack(&dual_stack_socket()),
+        "V6ONLY=0 的 [::] socket 必须判 dual"
+    );
+    assert!(
+        !is_dual_stack(&loopback_socket()),
+        "v4 socket 必须判非 dual"
+    );
+}
+
+/// **用例 A（Darwin `EINVAL` 修复的判据）**：双栈直连 socket 上 `send_plain` 一个**裸 v4**
+/// 目的地必须送达 v4 回环观察者——发送侧归一成 v4-mapped。不归一时 Darwin 的 `sendto`
+/// 直接 `EINVAL (os error 22)`；Linux/OHOS 内核会内部转 ⇒ 该缺陷只在 Darwin 现形。
+#[tokio::test]
+async fn send_plain_to_bare_v4_dst_is_delivered_from_dual_stack_socket() {
+    let (sock, direct_addr, _stats) = exit_sock_dual_direct(None);
+    let observer = loopback_socket();
+    let observer_addr = observer.local_addr().expect("观察者本地地址可读"); // 裸 v4 回环
+    assert!(
+        observer_addr.is_ipv4(),
+        "观察者必须是 v4 面（实得 {observer_addr}）"
+    );
+    send_plain_ready(&sock, observer_addr, b"HWQ-v4").await;
+    let (payload, src) = recv_within(&observer, Duration::from_secs(2)).unwrap_or_else(|| {
+        panic!("双栈 socket 应把裸 v4 目的地（→ {observer_addr}）送达：期望 1 包，实得 0 包")
+    });
+    assert_eq!(
+        payload, b"HWQ-v4",
+        "载荷期望 {:?}，实得 {payload:?}",
+        b"HWQ-v4"
+    );
+    assert_eq!(
+        src.port(),
+        direct_addr.port(),
+        "源端口期望 = 直连 socket 端口 {}，实得 {}",
+        direct_addr.port(),
+        src.port()
+    );
+}
+
+/// **用例 B（v4-mapped 目的地是 no-op）**：目的地已是 v4-mapped 形态 ⇒ 归一不得再动它，
+/// datagram 照常送达（wire 面）。**不是回退敏感用例**（删掉归一后本条在任何平台仍绿——
+/// v4-mapped 本就是 v6 形态）：它守的是**错误修法**（重复 map / 乱动纯 v6），不是回退。
+#[tokio::test]
+async fn send_plain_to_v4_mapped_dst_is_delivered_unchanged() {
+    let (sock, direct_addr, _stats) = exit_sock_dual_direct(None);
+    let observer = loopback_socket();
+    let observer_addr = observer.local_addr().expect("观察者本地地址可读");
+    let SocketAddr::V4(v4) = observer_addr else {
+        panic!("观察者必须是 v4 面（实得 {observer_addr}）");
+    };
+    let mapped = SocketAddr::V6(SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0));
+    send_plain_ready(&sock, mapped, b"HWQ-mapped").await;
+    let (payload, src) = recv_within(&observer, Duration::from_secs(2)).unwrap_or_else(|| {
+        panic!("v4-mapped 目的地（→ {mapped}）应照常送达：期望 1 包，实得 0 包")
+    });
+    assert_eq!(
+        payload, b"HWQ-mapped",
+        "载荷期望 {:?}，实得 {payload:?}",
+        b"HWQ-mapped"
+    );
+    assert_eq!(
+        src.port(),
+        direct_addr.port(),
+        "源端口期望 = 直连 socket 端口 {}，实得 {}",
+        direct_addr.port(),
+        src.port()
+    );
+}
+
+/// **用例 C（生产路径）**：明文钩子回 `PlainOutcome::Reply { dst: 裸 v4 }`——`pubface` 把
+/// 收侧的 v4-mapped 源 unmap 成纯 v4 后原样回填——应答必须从双栈直连 socket 送达。
+#[tokio::test]
+async fn plain_hook_reply_to_bare_v4_dst_is_delivered_from_dual_stack_socket() {
+    use quinn::udp::RecvMeta;
+    use quinn::AsyncUdpSocket as _;
+    use std::io::IoSliceMut;
+    let hook: crate::exit::PlainDatagramHook = Arc::new(|_buf: &[u8], src: SocketAddr| {
+        Some(crate::exit::PlainOutcome::Reply {
+            dst: unmap_v4_in6(src),
+            payload: b"HWR-pong".to_vec(),
+        })
+    });
+    let (sock, direct_addr, stats) = exit_sock_dual_direct(Some(hook));
+
+    // 发送侧就绪按产品形态落定（quinn 的 io_poller——`poll_recv` 内的就地应答不等第二拍，
+    // 未落定会让 tokio 的 `try_send_to` 首答回 WouldBlock 并计丢）。
+    let mut poller = Arc::clone(&sock).create_io_poller();
+    tokio::time::timeout(
+        WAIT,
+        std::future::poll_fn(|cx| poller.as_mut().poll_writable(cx)),
+    )
+    .await
+    .unwrap_or_else(|_| panic!("发送面在 {WAIT:?} 内未就绪"))
+    .expect("发送面就绪不得报错");
+
+    // 请求方 = v4 回环 socket：发往 127.0.0.1:<双栈端口>（收侧源随即成为 v4-mapped 形态）
+    let prober = loopback_socket();
+    prober
+        .set_nonblocking(true)
+        .expect("非阻塞收（轮内不阻塞 runtime）");
+    prober
+        .send_to(b"HWQ-probe", (Ipv4Addr::LOCALHOST, direct_addr.port()))
+        .expect("探测请求可发");
+
+    // 真 waker + 预算驱动 `poll_recv`（quinn 的产品形态）：钩子认领即在本调用内就地应答
+    let mut buf = [0u8; 2048];
+    let mut meta = [RecvMeta {
+        addr: SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
+        len: 0,
+        stride: 0,
+        ecn: None,
+        dst_ip: None,
+    }];
+    let mut iov = [IoSliceMut::new(&mut buf)];
+    let mut rbuf = [0u8; 2048];
+    let deadline = Instant::now() + WAIT;
+    let mut reply: Option<(Vec<u8>, SocketAddr)> = None;
+    while reply.is_none() && Instant::now() < deadline {
+        let _ = tokio::time::timeout(
+            Duration::from_millis(50),
+            std::future::poll_fn(|cx| sock.poll_recv(cx, &mut iov, &mut meta)),
+        )
+        .await;
+        match prober.recv_from(&mut rbuf) {
+            Ok((n, src)) => reply = Some((rbuf[..n].to_vec(), src)),
+            Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(e) => panic!("请求方收包失败：{e}"),
+        }
+    }
+    let (payload, src) = reply.unwrap_or_else(|| {
+        panic!(
+            "明文面应答应在 {WAIT:?} 内送达（期望 {:?}，实得 0 包）",
+            b"HWR-pong"
+        )
+    });
+    assert_eq!(
+        payload, b"HWR-pong",
+        "载荷期望 {:?}，实得 {payload:?}",
+        b"HWR-pong"
+    );
+    assert_eq!(
+        src.port(),
+        direct_addr.port(),
+        "源端口期望 = 直连 socket 端口 {}，实得 {}",
+        direct_addr.port(),
+        src.port()
+    );
+    let drops = stats.snapshot().drop_send_buffer_full;
+    assert_eq!(
+        drops, 0,
+        "应答不得走「发送失败丢包」分支（实得丢包计数 {drops}）"
+    );
 }
 
 // ---------- S3（M2 §3.1–§3.3）：抗放大闸 + Retry ----------

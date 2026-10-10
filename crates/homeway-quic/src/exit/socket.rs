@@ -15,6 +15,15 @@
 //! **发送侧路由键 = `Transmit.destination`**（QUIC 眼里的连接对端地址）：命中腿表 ⇒ 走该
 //! 腿 socket 并包腿帧；「最近摘除的腿」⇒ **丢 + 计数**（照 `server/bind.rs` 的 #17 纪律：
 //! 回落直连端口只会把包打到中继数据口、污染别的会话）；其余 ⇒ 直连端口。
+//!
+//! **直连 socket 的族约束（发送侧统一归一）**：该 socket 常是双栈（`[::]` +
+//! `IPV6_V6ONLY=0`）——此时 `sendto` 的目标**必须**是 v6 形态，**v4 目标须写成 v4-mapped**
+//! （`::ffff:a.b.c.d`）：Darwin 内核对 AF_INET6 socket + 裸 `sockaddr_in` 直接 `EINVAL`
+//! （Linux/OHOS 内核会内部转成 v4-mapped ⇒ 该约束只在 Darwin 现形）。故本 socket 的发送点
+//! **一律经 [`xmit_addr`]**（判定开关 = getsockopt 的**运行期**事实 `ExitSock::dual`）；
+//! **非 dual 一律原样**——族不匹配的错误照旧如实上报。收侧不归一：钩子拿到的 v4 源是
+//! v4-mapped 形态，unmap 归 `homeway-core` 的 `pubface` 管。
+//!
 //! 腿帧 kind=5 由中继**原样透传**（中继不解释 kind）——这就是「中继代码零改动」的承载
 //! 方式；kind 字节的真源 = `homeway-core` 的 `legframe::FrameKind::Quic`（本
 //! crate 是叶子、不得依赖 `homeway-core`，故按字节复刻；两处一致性由 `homeway-core` 侧
@@ -42,7 +51,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, IoSliceMut};
-use std::net::{SocketAddr, UdpSocket};
+use std::net::{SocketAddr, SocketAddrV6, UdpSocket};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -128,11 +137,49 @@ impl LegTable {
     }
 }
 
+/// socket 是否为 v6 双栈（AF_INET6 且 `IPV6_V6ONLY=0`——getsockopt **运行期**检测；
+/// v4 socket 上该选项报 ENOPROTOOPT ⇒ 非 dual）。与 `homeway-core::udpbatch::is_dual_stack`
+/// 同款（本 crate 是叶子、不得依赖 core）。
+pub(super) fn is_dual_stack(sock: &UdpSocket) -> bool {
+    use std::os::fd::AsRawFd as _;
+    // SAFETY：getsockopt 只写 `v` 的 4 字节（`len` 初值 = 其长度）
+    unsafe {
+        let mut v: libc::c_int = 1;
+        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
+        let r = libc::getsockopt(
+            sock.as_raw_fd(),
+            libc::IPPROTO_IPV6,
+            libc::IPV6_V6ONLY,
+            &mut v as *mut _ as *mut libc::c_void,
+            &mut len,
+        );
+        r == 0 && v == 0
+    }
+}
+
+/// 发送目标的族适配：dual 时 `V4 → V6(v4-mapped)`（v4-mapped / 纯 v6 已是 v6 形态 ⇒ 原样）；
+/// **非 dual 一律原样**（族不匹配的错误如实上报）。语义与 `homeway-core::udpbatch::xmit_addr`
+/// 对齐（本 crate 是叶子、不得依赖 core）。
+pub(super) fn xmit_addr(dst: SocketAddr, dual: bool) -> SocketAddr {
+    if !dual {
+        return dst;
+    }
+    match dst {
+        SocketAddr::V4(v4) => {
+            SocketAddr::V6(SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0))
+        }
+        v6 => v6,
+    }
+}
+
 /// 出口 QUIC 面的抽象 socket（[`quinn::AsyncUdpSocket`]）。
 pub(crate) struct ExitSock {
     /// 直连端口 socket（`serve.quic_listen`；端点的 `local_addr` 也取自它）。
     direct: TokioUdp,
     local: SocketAddr,
+    /// 直连 socket 是否双栈（getsockopt 运行期事实，装配点取；发送侧归一的开关，
+    /// 见 [`xmit_addr`]）。
+    dual: bool,
     legs: Arc<LegTable>,
     /// 引擎注入队列（腿上的 kind=5 载荷；接收端只在 QUIC 线程 poll——锁无竞争）。
     inject: Mutex<InjectRx>,
@@ -147,6 +194,7 @@ impl std::fmt::Debug for ExitSock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ExitSock")
             .field("local", &self.local)
+            .field("dual", &self.dual)
             .field("legs", &self.legs.remotes().len())
             .finish_non_exhaustive()
     }
@@ -156,6 +204,7 @@ impl ExitSock {
     pub(crate) fn new(
         direct: TokioUdp,
         local: SocketAddr,
+        dual: bool,
         legs: Arc<LegTable>,
         inject: InjectRx,
         bridge: Arc<ExitBridge>,
@@ -164,6 +213,7 @@ impl ExitSock {
         Self {
             direct,
             local,
+            dual,
             legs,
             inject: Mutex::new(inject),
             bridge,
@@ -171,10 +221,17 @@ impl ExitSock {
         }
     }
 
+    /// 发送前归一：双栈直连 socket 的 v4 目标 → v4-mapped（非 dual 原样；见 [`xmit_addr`]）。
+    fn tx_addr(&self, dst: SocketAddr) -> SocketAddr {
+        xmit_addr(dst, self.dual)
+    }
+
     /// 从**公共端口 socket** 直接发一个裸数据报（STUN 观测请求等；非 QUIC 载荷）。
     /// 引擎线程经出站通道调用 → 本函数在 QUIC 线程执行（`try_send_to` 是即时系统调用）。
     pub(crate) fn send_plain(&self, dst: SocketAddr, payload: &[u8]) -> io::Result<()> {
-        self.direct.try_send_to(payload, dst).map(|_| ())
+        self.direct
+            .try_send_to(payload, self.tx_addr(dst))
+            .map(|_| ())
     }
 
     /// 注入一条腿上的 QUIC 报文（引擎线程；`false` = 面已收工 ⇒ 调用方停止注入）。
@@ -255,7 +312,7 @@ impl AsyncUdpSocket for ExitSock {
             return res;
         }
         self.direct
-            .try_send_to(transmit.contents, transmit.destination)
+            .try_send_to(transmit.contents, self.tx_addr(transmit.destination))
             .map(|_| ())
     }
 
@@ -311,7 +368,11 @@ impl AsyncUdpSocket for ExitSock {
                     if let Some(hook) = &self.plain {
                         if let Some(outcome) = hook(&buf[..n], src) {
                             if let PlainOutcome::Reply { dst, payload } = outcome {
-                                if let Err(e) = self.direct.try_send_to(&payload, dst) {
+                                // 归一只用于系统调用：日志/归因仍报**原始** dst（排障面要的是
+                                // 逻辑对端，不是内核的 v4-mapped 表示——与 `send_plain` 失败行
+                                // 同口径）。
+                                let mapped = self.tx_addr(dst);
+                                if let Err(e) = self.direct.try_send_to(&payload, mapped) {
                                     self.bridge.note_drop(
                                         DropKind::SendBufferFull,
                                         &format!(

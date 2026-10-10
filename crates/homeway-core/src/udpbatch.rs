@@ -108,7 +108,8 @@ pub(crate) fn bind_v6_only(ip: std::net::Ipv6Addr, port: u16) -> io::Result<UdpS
 }
 
 /// socket 是否为 v6 双栈（AF_INET6 且 `IPV6_V6ONLY=0`——getsockopt 运行期检测；
-/// v4 socket 上该选项报 ENOPROTOOPT ⇒ 非 dual）。
+/// v4 socket 上该选项报 ENOPROTOOPT ⇒ 非 dual）。`homeway-quic` 的 `exit/socket.rs` 有
+/// 同款复刻（该 crate 是叶子、不得依赖本 crate）。
 pub(crate) fn is_dual_stack(sock: &UdpSocket) -> bool {
     use std::os::fd::AsRawFd as _;
     unsafe {
@@ -126,8 +127,10 @@ pub(crate) fn is_dual_stack(sock: &UdpSocket) -> bool {
 }
 
 /// 发送目标的族适配：双栈 socket 发 v4 目标须 map 成 v4-mapped（AF_INET6 的
-/// msg_name 用 sockaddr_in 会 EAFNOSUPPORT——Go 内部 WriteToUDPAddrPort 同义）。
+/// msg_name 用裸 sockaddr_in 会 EINVAL——Darwin 实测 errno 22；Linux/OHOS 内核自行转成
+/// v4-mapped 故不现形——Go 内部 WriteToUDPAddrPort 同义）。
 /// 非 dual socket 原样返回（族不匹配的错误如实上报）。
+/// `homeway-quic` 的 `exit/socket.rs` 有同款复刻（该 crate 是叶子、不得依赖本 crate）。
 pub(crate) fn xmit_addr(ep: SocketAddr, dual: bool) -> SocketAddr {
     if !dual {
         return ep;

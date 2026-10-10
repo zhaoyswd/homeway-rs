@@ -806,6 +806,10 @@ fn run_exit(
             let _ = ready_tx.send(Err(ExitQuicErr::Endpoint(e)));
             return;
         }
+        // 直连 socket 的**运行期**双栈事实（getsockopt：`IPV6_V6ONLY=0` 才算 dual——显式
+        // v6 字面量绑定走 `bind_v6_only`，那里 map 不了）。发送侧归一的开关，见
+        // `socket::xmit_addr`。
+        let dual = socket::is_dual_stack(&socket);
         let direct = match tokio::net::UdpSocket::from_std(socket) {
             Ok(s) => s,
             Err(e) => {
@@ -816,6 +820,7 @@ fn run_exit(
         let abs = Arc::new(ExitSock::new(
             direct,
             local_addr,
+            dual,
             Arc::clone(legs),
             inject_rx,
             Arc::clone(bridge),
