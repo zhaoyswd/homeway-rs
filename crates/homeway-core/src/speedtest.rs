@@ -584,7 +584,7 @@ struct ConnGuard {
 
 impl Drop for ConnGuard {
     fn drop(&mut self) {
-        let conns = self.conns.lock().expect("连接表锁中毒").clone();
+        let conns = crate::syncutil::lock_unpoison(&self.conns).clone();
         for c in conns {
             c.kill();
         }
@@ -651,7 +651,7 @@ fn watchdog_cancellable(
         if let Some(cx) = external_cancel {
             if cx.load(std::sync::atomic::Ordering::Acquire) {
                 cancelled.store(true, std::sync::atomic::Ordering::Release);
-                let first = conns.lock().expect("连接表锁中毒").clone();
+                let first = crate::syncutil::lock_unpoison(&conns).clone();
                 for c in first {
                     c.kill();
                 }
@@ -663,7 +663,7 @@ fn watchdog_cancellable(
                     match done.recv_timeout(Duration::from_millis(200)) {
                         Ok(()) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
                         Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                            let late = conns.lock().expect("连接表锁中毒").clone();
+                            let late = crate::syncutil::lock_unpoison(&conns).clone();
                             for c in late {
                                 c.kill();
                             }
@@ -680,7 +680,7 @@ fn watchdog_cancellable(
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 if Instant::now() >= deadline {
                     timed_out.store(true, std::sync::atomic::Ordering::Release);
-                    let conns = conns.lock().expect("连接表锁中毒").clone();
+                    let conns = crate::syncutil::lock_unpoison(&conns).clone();
                     for c in conns {
                         c.kill();
                     }
@@ -785,10 +785,7 @@ fn run_phases(
             return Err(SpeedtestError::Cancelled);
         }
         let c = dial()?;
-        conns
-            .lock()
-            .expect("连接表锁中毒")
-            .push(std::sync::Arc::clone(&c));
+        crate::syncutil::lock_unpoison(&conns).push(std::sync::Arc::clone(&c));
         down_conns.push(c);
     }
     if let Some(l) = live {
@@ -908,10 +905,7 @@ fn run_phases(
             return Err(SpeedtestError::Cancelled);
         }
         let c = dial()?;
-        conns
-            .lock()
-            .expect("连接表锁中毒")
-            .push(std::sync::Arc::clone(&c));
+        crate::syncutil::lock_unpoison(&conns).push(std::sync::Arc::clone(&c));
         up_conns.push(c);
     }
     if let Some(l) = live {
