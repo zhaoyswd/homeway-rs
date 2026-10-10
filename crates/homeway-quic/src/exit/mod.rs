@@ -96,6 +96,10 @@ pub(crate) const EXIT_THREAD: &str = "homeway-quic-exit";
 pub(crate) const REAP_THREAD: &str = "hw-quic-exit-reap";
 /// 驱动循环回看节拍（stop 位 + 连接巡检；无事件时周期性回看，不做忙等）。
 const TICK: Duration = Duration::from_millis(250);
+/// 出站队列单轮批量排空上限（2026-10-10 审查 中-1）：`out_rx` 臂一轮最多取这么多条，
+/// 保 accept/stop/握手收割等其余 select 臂在下行洪峰下的公平性（溢出留给下一轮——
+/// 队列有界 8192，丢新语义不变）。
+const OUT_DRAIN_MAX: usize = 256;
 
 /// 并发握手上限（M1 设计 §9.3 Q-O；**保守资源上限**——M2 才有抗放大/Retry/限流）。
 pub const DEFAULT_HANDSHAKE_CAP: usize = 64;
@@ -905,6 +909,8 @@ fn run_exit(
             proof_gate: Arc::clone(&proof_gate),
             intakes: Arc::new(cfg.intakes.clone()),
         });
+        // 巡检节流基准（见循环尾「时间节流」注释）
+        let mut last_sweep = Instant::now();
         loop {
             tokio::select! {
                 _ = stop_rx.recv() => break,
@@ -1054,39 +1060,59 @@ fn run_exit(
                         (*logf)(&format!("公共端口明文发送失败（→ {dst}，{}B：{e}）", payload.len()));
                     }
                 }
-                Some(out) = out_rx.recv() => {
-                    // 引擎 → 出口面：内层包交给对应连接（§1.5）
-                    match bridge.conn_of_pub(&out.pubkey) {
-                        Some(conn) => {
-                            let _ = conn::send_datagram_checked(&conn, out.pkt, &ctx);
+                Some(mut out) = out_rx.recv() => {
+                    // 引擎 → 出口面：内层包交给对应连接（§1.5）。**单轮批量排空**
+                    // （2026-10-10 审查 中-1：原一轮 select 只处理一条 ⇒ 每包都要付出
+                    // 一轮循环开销；上限 [`OUT_DRAIN_MAX`] 保其余臂公平）。
+                    let mut drained = 0usize;
+                    loop {
+                        match bridge.conn_of_pub(&out.pubkey) {
+                            Some(conn) => {
+                                let _ = conn::send_datagram_checked(&conn, out.pkt, &ctx);
+                            }
+                            // 绑定在「引擎判有绑定」与「面侧取连接」之间消失（设备摘除/连接死）
+                            None => bridge.note_drop(DropKind::Unregistered, "出站目标无绑定"),
                         }
-                        // 绑定在「引擎判有绑定」与「面侧取连接」之间消失（设备摘除/连接死）
-                        None => bridge.note_drop(DropKind::Unregistered, "出站目标无绑定"),
+                        drained += 1;
+                        if drained >= OUT_DRAIN_MAX {
+                            break;
+                        }
+                        match out_rx.try_recv() {
+                            Ok(next) => out = next,
+                            Err(_) => break,
+                        }
                     }
                 }
                 _ = tokio::time::sleep(TICK) => {}
             }
-            // 巡检（每拍）：清死连接（摘绑定）+ 观测路径变更（E-q2 行）
-            conns.retain(|c| {
-                let alive = c.conn.close_reason().is_none();
-                if !alive {
-                    bridge.unbind_conn(c.conn_id);
-                }
-                alive
-            });
-            stats.connections.store(conns.len() as u64, Ordering::SeqCst);
-            for c in conns.iter_mut() {
-                let now = c.conn.remote_address();
-                if now != c.remote {
-                    let from = c.remote;
-                    c.remote = now;
-                    stats.path_changes.fetch_add(1, Ordering::SeqCst);
-                    match bridge.dev_of_conn(c.conn_id) {
-                        Some(dev) => (*logf)(&format!(
-                            "路径变更 dev={} {from} → {now}",
-                            bridge::dev_short(&dev)
-                        )),
-                        None => (*logf)(&format!("路径变更（未登记连接）{from} → {now}")),
+            // 巡检（**时间节流**，2026-10-10 审查 中-1）：原「每轮迭代」在下行热路径 =
+            // 每包一次全连接 `close_reason()`（quinn 内部锁）+ `remote_address()` 全扫，
+            // 150k pps × 64 连接 ≈ 10M 锁/s。不能只挂 `sleep(TICK)` 臂——连续流量下
+            // sleep 永不到点 ⇒ 死连接永不被摘；按「距上次巡检 ≥ [`TICK`]」节流后，
+            // 摘绑/路径变更观测的时延上界仍是 TICK。
+            if last_sweep.elapsed() >= TICK {
+                last_sweep = Instant::now();
+                conns.retain(|c| {
+                    let alive = c.conn.close_reason().is_none();
+                    if !alive {
+                        bridge.unbind_conn(c.conn_id);
+                    }
+                    alive
+                });
+                stats.connections.store(conns.len() as u64, Ordering::SeqCst);
+                for c in conns.iter_mut() {
+                    let now = c.conn.remote_address();
+                    if now != c.remote {
+                        let from = c.remote;
+                        c.remote = now;
+                        stats.path_changes.fetch_add(1, Ordering::SeqCst);
+                        match bridge.dev_of_conn(c.conn_id) {
+                            Some(dev) => (*logf)(&format!(
+                                "路径变更 dev={} {from} → {now}",
+                                bridge::dev_short(&dev)
+                            )),
+                            None => (*logf)(&format!("路径变更（未登记连接）{from} → {now}")),
+                        }
                     }
                 }
             }
