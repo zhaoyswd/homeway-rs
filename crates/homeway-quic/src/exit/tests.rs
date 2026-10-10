@@ -2381,6 +2381,14 @@ async fn normal_races_do_not_trigger_retry_or_gate() {
             quic.snapshot()
         );
     }
+    // 断言前先**有界等待所有握手落地**（flake 口径②：只判上界）：末轮候选的收尾是异步的，
+    // 在途握手会被计入「未完成」并可能触发压力 Retry ⇒ 立即读快照会得到 retry_sent=1
+    // 且 handshakes_in_flight=1（macOS CI 实测）。
+    assert!(
+        wait_until(|| quic.snapshot().handshakes_in_flight == 0, WAIT).await,
+        "末轮候选须在预算内全部定音：{:?}",
+        quic.snapshot()
+    );
     let snap = quic.snapshot();
     assert_eq!(snap.retry_sent, 0, "常态赛跑不得 Retry（r14 F10）：{snap:?}");
     assert_eq!(snap.flood_refused, 0, "常态赛跑不得撞每源闸：{snap:?}");
