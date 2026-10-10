@@ -76,6 +76,9 @@ pub const FRAME_KIND_QUIC: u8 = 5;
 const LEG_RECENT_TTL: Duration = Duration::from_secs(5 * 60);
 /// 「最近摘除」窗表容量上限（满则清表重记——排障级记忆，与 #17 的 leg_ports 同口径）。
 const LEG_RECENT_MAX: usize = 4096;
+/// 「最近摘除」窗的**懒清扫**间隔（2026-10-10 审查 中-3）：全表 retain 每秒至多一次；
+/// 单条 TTL 判定按条目自身时间戳逐次进行（清扫只管内存回收，不改变判定语义）。
+const LEG_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 
 /// 一条注入包的落点（引擎线程 → QUIC 面；`src` = 该腿的远端地址 = QUIC 眼里的对端）。
 pub(crate) struct InjPkt {
@@ -86,6 +89,21 @@ pub(crate) struct InjPkt {
 /// 注入队列的两端别名（有界通道；上限由 [`super::bridge::INBOUND_QUEUE_MAX`] 给）。
 pub(crate) type InjectTx = Sender<InjPkt>;
 pub(crate) type InjectRx = Receiver<InjPkt>;
+
+/// 「最近摘除」窗（地址 → 摘除时刻）+ 上次全表清扫时刻（懒清扫见 [`LEG_SWEEP_INTERVAL`]）。
+struct RecentLegs {
+    map: std::collections::HashMap<SocketAddr, Instant>,
+    last_sweep: Instant,
+}
+
+impl Default for RecentLegs {
+    fn default() -> Self {
+        Self {
+            map: HashMap::new(),
+            last_sweep: Instant::now(),
+        }
+    }
+}
 
 /// 腿表（发送侧路由）：`远端地址 → 腿 socket 的**发送句柄**`。
 ///
@@ -99,13 +117,13 @@ pub(crate) type InjectRx = Receiver<InjPkt>;
 #[derive(Default)]
 pub(crate) struct LegTable {
     live: Mutex<HashMap<SocketAddr, UdpSocket>>,
-    recent: Mutex<HashMap<SocketAddr, Instant>>,
+    recent: Mutex<RecentLegs>,
 }
 
 impl LegTable {
     /// 登记/替换一条腿（同远端重登记 = 撤「最近摘除」标记后替换发送句柄）。
     pub(crate) fn open(&self, remote: SocketAddr, sock: UdpSocket) {
-        lock_unpoison(&self.recent).remove(&remote);
+        lock_unpoison(&self.recent).map.remove(&remote);
         lock_unpoison(&self.live).insert(remote, sock);
     }
 
@@ -113,10 +131,10 @@ impl LegTable {
     pub(crate) fn close(&self, remote: SocketAddr) {
         lock_unpoison(&self.live).remove(&remote);
         let mut recent = lock_unpoison(&self.recent);
-        if recent.len() >= LEG_RECENT_MAX {
-            recent.clear(); // 满表清空（排障级记忆，丢了只影响归因）
+        if recent.map.len() >= LEG_RECENT_MAX {
+            recent.map.clear(); // 满表清空（排障级记忆，丢了只影响归因）
         }
-        recent.insert(remote, Instant::now());
+        recent.map.insert(remote, Instant::now());
     }
 
     /// 当前腿远端集（引擎侧差分的读面）。
@@ -129,11 +147,22 @@ impl LegTable {
     }
 
     /// 该远端是否落在「最近摘除」窗内（窗内发送 = 丢）。
+    ///
+    /// 2026-10-10 审查 中-3：本函数挂在**直连发送热路径**（live 表未命中的每个 Transmit
+    /// 都查到这里）——原「每次调用全表 retain」在用过中继后的 5min 窗内 = 每包
+    /// O(4096) 哈希遍历 + 一次时钟读 + 一次锁。改懒清扫（≥[`LEG_SWEEP_INTERVAL`] 一次），
+    /// **单条判定改按条目自身时间戳**（清扫间隙里过期条目不会延长「窗内丢」语义）。
     fn is_recent(&self, remote: &SocketAddr) -> bool {
         let now = Instant::now();
         let mut recent = lock_unpoison(&self.recent);
-        recent.retain(|_, at| now.duration_since(*at) <= LEG_RECENT_TTL);
-        recent.contains_key(remote)
+        if now.duration_since(recent.last_sweep) >= LEG_SWEEP_INTERVAL {
+            recent.map.retain(|_, at| now.duration_since(*at) <= LEG_RECENT_TTL);
+            recent.last_sweep = now;
+        }
+        recent
+            .map
+            .get(remote)
+            .is_some_and(|at| now.duration_since(*at) <= LEG_RECENT_TTL)
     }
 }
 
