@@ -90,78 +90,6 @@ pub(crate) struct FaceCtx {
     pub(crate) intakes: Arc<ServiceIntakes>,
 }
 
-// ===================== M6.7 批临时诊断（**收口整段删除**） =====================
-//
-// 目的：`connection.stats()` 从未在真机读过（M6/M6.5/M6.6 只量了设备侧与出口进程 CPU），
-// 而「下行 DATAGRAM 包率 ~8.5k vs 旧臂 16–18k」的判决恰恰需要发送侧读数（cwnd / lost /
-// congestion_events / pacing 面 / 线上包率）。门 = env `HOMEWAY_M67`；未开 = 一次 env 读。
-//
-// 读数面（逐秒一行，`logf` 落 stdout）：
-//   sent/lost/cong/cwnd/rtt/mtu（quinn `PathStats`）
-//   utx_dg/utx_b/utx_ios（`udp_tx`：线上 UDP 数据报/字节/IO 次数——GSO 判据）
-//   urx_dg/urx_b（`udp_rx`）
-//   ftx_dg/ftx_ack（`frame_tx`：数据报帧与 ACK 帧——ACK 时钟密度）
-//   buf_free（`datagram_send_buffer_space`——发送缓冲余量）
-//   out=<n> loop=<n>（出口主循环从 `out_rx` 取走的条数 / 主循环轮数）
-
-/// 诊断总门（`HOMEWAY_M67` 非空即开；懒读一次）。
-pub(crate) fn m67_on() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var_os("HOMEWAY_M67").is_some_and(|v| !v.is_empty()))
-}
-
-/// 1s 节流（进程内单一诊断节拍；返回 `true` = 本次到点，附带序号）。
-pub(crate) fn m67_due() -> Option<u64> {
-    static START: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
-    static LAST_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    static SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    use std::sync::atomic::Ordering;
-    if !m67_on() {
-        return None;
-    }
-    let start = *START.get_or_init(std::time::Instant::now);
-    let now_ms = start.elapsed().as_millis() as u64;
-    let last = LAST_MS.load(Ordering::Relaxed);
-    if now_ms.saturating_sub(last) < 1000 {
-        return None;
-    }
-    LAST_MS.store(now_ms, Ordering::Relaxed);
-    Some(SEQ.fetch_add(1, Ordering::Relaxed))
-}
-
-/// 计数器（`out_rx` 取走条数 / 主循环轮数；`Relaxed` 单线程写）。
-pub(crate) static M67_OUT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-/// 同上：主循环轮数。
-pub(crate) static M67_LOOP: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-
-/// 一行连接读数（`tag` 区分出口/岛；`extra` 追加面侧计数）。
-pub(crate) fn m67_line(tag: &str, seq: u64, id: u64, conn: &quinn::Connection, extra: &str) -> String {
-    use std::sync::atomic::Ordering;
-    let s = conn.stats();
-    format!(
-        "m67[{tag}] seq={seq} id={id} sent={} lost={} cong={} cwnd={} rtt_us={} minrtt_us={} mtu={} \
-utx_dg={} utx_b={} utx_ios={} urx_dg={} urx_b={} ftx_dg={} ftx_ack={} \
-buf_free={} out={} loop={}{extra}",
-        s.path.sent_packets,
-        s.path.lost_packets,
-        s.path.congestion_events,
-        s.path.cwnd,
-        s.path.rtt.as_micros(),
-        s.path.min_rtt.as_micros(),
-        s.path.current_mtu,
-        s.udp_tx.datagrams,
-        s.udp_tx.bytes,
-        s.udp_tx.ios,
-        s.udp_rx.datagrams,
-        s.udp_rx.bytes,
-        s.frame_tx.datagram,
-        s.frame_tx.acks,
-        conn.datagram_send_buffer_space(),
-        M67_OUT.load(Ordering::Relaxed),
-        M67_LOOP.load(Ordering::Relaxed),
-    )
-}
-
 /// QUIC 面线程名（与岛 `homeway-quic` 区分：这是**出口侧**的那一枚）。
 pub(crate) const EXIT_THREAD: &str = "homeway-quic-exit";
 /// 到点收割线程名（镜像 `hw-quic-reap`）。
@@ -963,8 +891,6 @@ fn run_exit(
             intakes: Arc::new(cfg.intakes.clone()),
         });
         loop {
-            // M6.7 临时诊断（收口删除）：主循环轮数（单线程 runtime ⇒ Relaxed 直加）
-            M67_LOOP.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             tokio::select! {
                 _ = stop_rx.recv() => break,
                 inc = endpoint.accept() => match inc {
@@ -1114,8 +1040,6 @@ fn run_exit(
                     }
                 }
                 Some(out) = out_rx.recv() => {
-                    // M6.7 临时诊断（收口删除）：从引擎出站队列取走的条数
-                    M67_OUT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     // 引擎 → 出口面：内层包交给对应连接（§1.5）
                     match bridge.conn_of_pub(&out.pubkey) {
                         Some(conn) => {
@@ -1126,19 +1050,6 @@ fn run_exit(
                     }
                 }
                 _ = tokio::time::sleep(TICK) => {}
-            }
-            // M6.7 临时诊断（收口删除）：逐秒落每连接 quinn 读数 + 本面丢弃计数
-            if let Some(seq) = m67_due() {
-                for c in conns.iter() {
-                    let extra = format!(
-                        " drops={}/{}/{}/{}",
-                        stats.drop_too_large.load(Ordering::Relaxed),
-                        stats.drop_send_buffer_full.load(Ordering::Relaxed),
-                        stats.drop_unregistered.load(Ordering::Relaxed),
-                        stats.drop_src_rejected.load(Ordering::Relaxed),
-                    );
-                    (*logf)(&m67_line("exit", seq, c.conn_id, &c.conn, &extra));
-                }
             }
             // 巡检（每拍）：清死连接（摘绑定）+ 观测路径变更（E-q2 行）
             conns.retain(|c| {

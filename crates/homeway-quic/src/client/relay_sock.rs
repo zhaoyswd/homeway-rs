@@ -228,6 +228,23 @@ pub(crate) fn note_send_err(st: &mut SockStats, e: &std::io::Error, now: std::ti
     class
 }
 
+/// 读回 socket 缓冲设定值（`getsockopt`；失败返回 `None`——只作读数，不参与判定）。
+fn get_sockbuf(sock: &std::net::UdpSocket, opt: libc::c_int) -> Option<usize> {
+    let mut v: libc::c_int = 0;
+    let mut len = std::mem::size_of_val(&v) as libc::socklen_t;
+    // SAFETY：`getsockopt` 写 `v` 的 4 字节（`len` 初值 = 其长度）
+    let r = unsafe {
+        libc::getsockopt(
+            std::os::fd::AsRawFd::as_raw_fd(sock),
+            libc::SOL_SOCKET,
+            opt,
+            std::ptr::addr_of_mut!(v).cast(),
+            &mut len,
+        )
+    };
+    (r == 0).then_some(v.max(0) as usize)
+}
+
 /// 岛侧抽象 socket（`quinn::AsyncUdpSocket`）：直连裸包 + 中继包封/剥壳。
 pub(crate) struct ClientSock {
     io: TokioUdp,
@@ -259,6 +276,38 @@ impl ClientSock {
             Some(a) => std::net::UdpSocket::bind(a)?,
             None => std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))?,
         };
+        // ---- M6.7：内核 socket 缓冲**显式定尺**（不靠内核缺省）----
+        //
+        // 证据（M6.7 A 真机逐环）：下行突发里岛的 `rx_queue` 峰值 ~76KB 且 `/proc/net/udp` 的
+        // `drops` 逐轮 +17…+32（与 `/proc/net/snmp` 的 `Udp: RcvbufErrors` 同源）⇒ **内核缺省
+        // 接收缓冲在突发下溢出**；丢掉的 DATAGRAM 在 QUIC 面**不重传** ⇒ 每个丢包都变成内层 TCP
+        // 的一次丢段（对端 dup ACK/RTO），内层 CUBIC cwnd 与速率档一起被压住。
+        // 定尺依据 = 发送侧 pacer 的单次突发上界（quinn `MAX_BURST_SIZE` = 256×MTU ≈ 350KB）
+        // × 岛 runtime 的调度抖动余量：**接收 2 MiB**（≈1600 包 ≈ 0.16s@20kpps）。
+        // 发送侧（上行内层 ACK 突发）同理给 **1 MiB**（与 `exit::transport::DATAGRAM_BUFFER` 同量级）。
+        // 核内会把设定值翻倍记账（Linux 口径），故内存账按 2× 记（登记面见 M6.7 记录）。
+        const RCVBUF: usize = 2 * 1024 * 1024;
+        const SNDBUF: usize = 1024 * 1024;
+        for (opt, want) in [(libc::SO_RCVBUF, RCVBUF), (libc::SO_SNDBUF, SNDBUF)] {
+            let v = libc::c_int::try_from(want).unwrap_or(libc::c_int::MAX);
+            // SAFETY：`setsockopt` 只读 `v` 的 4 字节；失败**不致命**（沿用内核缺省 + 记行）
+            let r = unsafe {
+                libc::setsockopt(
+                    std::os::fd::AsRawFd::as_raw_fd(&std_sock),
+                    libc::SOL_SOCKET,
+                    opt,
+                    std::ptr::addr_of!(v).cast(),
+                    std::mem::size_of_val(&v) as libc::socklen_t,
+                )
+            };
+            let got = get_sockbuf(&std_sock, opt);
+            (*logf)(&format!(
+                "岛 socket 缓冲（{}）：设定 {want}B，读回 {}B{}",
+                if opt == libc::SO_RCVBUF { "SO_RCVBUF（下行接收）" } else { "SO_SNDBUF（上行发送）" },
+                got.map(|g| g.to_string()).unwrap_or_else(|| "?".into()),
+                if r == 0 { "" } else { "（setsockopt 失败——沿用内核缺省）" }
+            ));
+        }
         std_sock.set_nonblocking(true)?;
         let local = std_sock.local_addr()?;
         let SocketAddr::V4(v4) = local else {

@@ -30,6 +30,10 @@ pub(crate) const READ_THREAD: &str = "homeway-tun-read";
 pub(crate) const WRITE_THREAD: &str = "homeway-tun-write";
 
 /// 回程队列上限（设计 §6.4 矩阵：**2048 条**≈2.6MB @1280B；满 ⇒ 丢新 + 计数）。
+///
+/// **M6.7 实测（2048 → 4096 被否）**：抬到 4096 后真机 `回程队列满` 逐轮仍 400–500 次
+/// （只把「首次溢出」推迟；溢出是**稳态**的——写线程 28k 包/s 上限 < 外承载突发 30–45k 包/s），
+/// 且 T2 中位无同向改善 ⇒ **撤回**（不付 +2.6MB 最坏内存账换无收益；见 M6.7 记录 §B）。
 pub(crate) const RETURN_QUEUE_MAX: usize = 2048;
 
 /// TUN 读线程 → 岛的**在途上限**（设计 §6.4 矩阵：**有界通道 4096 条**≈5MB @1280B；
