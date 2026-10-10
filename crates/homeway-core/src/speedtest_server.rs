@@ -884,8 +884,20 @@ mod tests {
             .filter_map(|r| r.split(' ').next().and_then(|n| n.parse().ok()))
             .collect();
         assert!(ids.len() >= 4, "两轮应各有受理+结算行：{lines:?}");
-        assert!(ids[0] < ids[2], "第二轮会话号必须大于第一轮（单调）：{ids:?}");
-        assert_eq!(ids[0], ids[1], "同会话受理/结算同号：{ids:?}");
+        // 断言**不依赖行序**：两轮各自「受理+结算」同号 ⇒ ids 必是两个值、各出现两次、互不相同。
+        // （原形态用 `ids[0] < ids[2]` 的位置单调性，隐含「两轮的行严格按轮序入队」——但两轮之间
+        //  只读了一帧、未等第一轮结算行落纸，负载下第 2 轮的行可能先入队 ⇒ 位置断言会翻（CI 实测）。）
+        let mut uniq: Vec<u64> = ids.clone();
+        uniq.sort_unstable();
+        uniq.dedup();
+        assert_eq!(uniq.len(), 2, "两轮 = 两个不同会话号：{ids:?}");
+        for id in &uniq {
+            assert_eq!(
+                ids.iter().filter(|x| *x == id).count(),
+                2,
+                "同会话受理/结算同号（每个会话号恰两行）：{ids:?}"
+            );
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
