@@ -5,13 +5,16 @@
 #   ①起本地 Rust 中继（`local-rust-relay.sh start`）并取它的 rl1 token；
 #   ②起本地 Rust 出口并**挂在该中继上**（`EXIT_EXTRA_FLAGS=--relay <rl1…>`）；
 #   ③取出口 token（含 wg/quic/relay 三类端点）；
-#   ④跑 `crates/homeway-core/tests/quic_island_e2e.rs` 的两条 `#[ignore]` 用例（**串行**）：
+#   ④跑 `crates/homeway-core/tests/quic_island_e2e.rs` 的六条 `#[ignore]` 用例（**串行**）：
 #     · S2a：岛连上 → 登记 → 出口 `peer: +` → rebind 迁移后仍通；
 #     · S2b：**只给中继候选** ⇒ 信封路径全链 + 数据面双向（TUN fd ⇄ DATAGRAM，经中继）；
+#     · S3-1 世代级 L3 / M3 服务流两条 / **M7 S2a：隧道 DNS 代答经隧道回包**
+#       （V20 本机轮，含 `dns: q=/resp=` 计数对账——等下一 60s 统计拍）；
 #   ⑤读数与证据行留到 /tmp（**仓外**，不污染工作树）。
 #
 # 用法：tools/quic-island-e2e.sh [实例号]（缺省 1）
-# 读数：/tmp/m1s2b-res/（SUMMARY.txt / island-e2e.log / relay-e2e.log / exit-lines.txt / …）
+# 读数：/tmp/m1s2b-res/（SUMMARY.txt / island-e2e.log / relay-e2e.log / generation-e2e.log /
+#      service-stream-e2e.log / app-core-service-e2e.log / dns-e2e.log / exit-lines.txt / …）
 set -uo pipefail
 
 REPO_ROOT="${0:h:A:h}"
@@ -72,6 +75,9 @@ run_one service_stream_files_over_quic_against_local_exit "$RES/service-stream-e
 # M3 S3：**客户端换轨**——App 核形态（真世代 + 隧道桥）的 files 请求经 STREAM 端到端；
 # 负判据 = 本轮出口日志零 `intercept: tcp exempt …:7802`（服务流不再走 WG 服务腿）
 run_one service_stream_rides_quic_through_app_core_bridge_against_local_exit "$RES/app-core-service-e2e.log" || rc=1
+# M7 S2a（V20 本机轮）：隧道 DNS 代答的经隧道回包 + `dns: q=/resp=` 计数对账
+# （末尾等下一统计拍 ≤70s —— 60s 周期计数行；只此一条会拉长本轮）
+run_one dns_query_over_tunnel_round_trips "$RES/dns-e2e.log" || rc=1
 
 # 出口侧本轮新增行（含 `peer: +` / `quic: 连接采纳` / `quic: 路径变更` / `quic: 服务流*`）
 tail -n +"$((LOG0 + 1))" "$EXIT_LOG" > "$RES/exit-lines.txt" 2>/dev/null || true
@@ -83,16 +89,19 @@ fi
   echo "# M1 S2b/S3-1 岛侧端到端读数（$(date '+%F %T')）"
   echo "# 出口实例 = $EXIT_STATE（日志：$EXIT_LOG）；中继实例 = $RELAY_STATE（日志：$RELAY_LOG）"
   echo "# 拓扑：岛(quic 客户端) → Rust 中继 127.0.0.1:$((42780 + n)) → Rust 出口（挂中继腿）"
-  echo "## 用例结论（run_one 汇总 exit code = $rc；0 = 五条都过）"
+  echo "## 用例结论（run_one 汇总 exit code = $rc；0 = 六条都过）"
   grep -E "^\[e2e|^test |^test result" "$RES/island-e2e.log" "$RES/relay-e2e.log" \
-    "$RES/generation-e2e.log" "$RES/service-stream-e2e.log" "$RES/app-core-service-e2e.log" 2>/dev/null || true
+    "$RES/generation-e2e.log" "$RES/service-stream-e2e.log" "$RES/app-core-service-e2e.log" \
+    "$RES/dns-e2e.log" 2>/dev/null || true
+  echo "## M7 S2a：隧道 DNS 判据（V20 本机轮）"
+  grep -E "^\[dns\]" "$RES/dns-e2e.log" 2>/dev/null || true
   echo "## 出口侧证据行（本轮新增）"
-  grep -E "peer: \+|连接采纳|路径变更|端点就绪|中继控制面|transit" "$RES/exit-lines.txt" 2>/dev/null || true
+  grep -E "peer: \+|连接采纳|路径变更|端点就绪|中继控制面|transit|dns 代答就绪|dns: q=" "$RES/exit-lines.txt" 2>/dev/null || true
   echo "## 中继侧行（本轮新增；腿/会话/丢弃）"
   grep -E "中继|会话|腿|丢弃|转发" "$RES/relay-lines.txt" 2>/dev/null | tail -20 || true
   echo "## 岛侧判据行（S2a + S2b + S3-1 + M3 S2/S3）"
   grep -hE "\[island\]" "$RES/island-e2e.log" "$RES/relay-e2e.log" "$RES/generation-e2e.log" \
-    "$RES/service-stream-e2e.log" "$RES/app-core-service-e2e.log" 2>/dev/null | grep -v "^\[e2e" | head -80 || true
+    "$RES/service-stream-e2e.log" "$RES/app-core-service-e2e.log" "$RES/dns-e2e.log" 2>/dev/null | grep -v "^\[e2e" | head -80 || true
 } > "$RES/SUMMARY.txt"
 
 # ---- A10（M5 S4 新增判据面）：出口侧**收线时点**——停出口后必须留下

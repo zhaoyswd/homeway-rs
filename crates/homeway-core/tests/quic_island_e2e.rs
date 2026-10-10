@@ -1039,3 +1039,217 @@ fn service_stream_rides_quic_through_app_core_bridge_against_local_exit() {
     let _ = core.tun_stop();
     println!("[e2e5] done");
 }
+
+// ---------------------------------------------------------------------------
+// M7 S2a：**隧道 DNS 代答的经隧道回包**（M6 `§10-④` / S7① 的承接；V20 本机轮）
+// ---------------------------------------------------------------------------
+
+/// 最小 DNS 查询报文（txid + RD + 单问题；`qtype` 1=A / 28=AAAA）。
+fn dns_query(txid: u16, name: &str, qtype: u16) -> Vec<u8> {
+    let mut q = Vec::new();
+    q.extend_from_slice(&txid.to_be_bytes());
+    q.extend_from_slice(&[0x01, 0x00]); // flags：RD=1（标准查询）
+    q.extend_from_slice(&1u16.to_be_bytes()); // QDCOUNT
+    q.extend_from_slice(&[0, 0, 0, 0, 0, 0]); // AN/NS/AR = 0
+    for label in name.split('.') {
+        q.push(label.len() as u8);
+        q.extend_from_slice(label.as_bytes());
+    }
+    q.push(0);
+    q.extend_from_slice(&qtype.to_be_bytes());
+    q.extend_from_slice(&1u16.to_be_bytes()); // IN
+    q
+}
+
+/// DNS 报文的 **QNAME 编码形态**（`\x07example\x03com\x00`）——应答里问题段按标签编码回显，
+/// 不是裸字符串（用裸串做包含判定会假红）。
+fn dns_qname_bytes(name: &str) -> Vec<u8> {
+    let mut out = Vec::new();
+    for label in name.split('.') {
+        out.push(label.len() as u8);
+        out.extend_from_slice(label.as_bytes());
+    }
+    out.push(0);
+    out
+}
+
+/// 从内层 IPv4+UDP 包里取 UDP 载荷（头长按 IHL 算；非 UDP 返 None）。
+fn inner_udp_payload(p: &[u8]) -> Option<&[u8]> {
+    if p.len() < 20 || p[0] >> 4 != 4 || p[9] != 17 {
+        return None;
+    }
+    let ihl = ((p[0] & 0x0f) as usize) * 4;
+    let off = ihl + 8;
+    (p.len() >= off).then(|| &p[off..])
+}
+
+/// 读出口日志里**最后一条** `dns: q=N … resp=M` 计数行（返回 `(q, resp, 原文)`）。
+fn last_dns_counters(log: &PathBuf) -> Option<(u64, u64, String)> {
+    let s = std::fs::read_to_string(log).ok()?;
+    let line = s.lines().rev().find(|l| l.contains("dns: q="))?.to_owned();
+    let num = |key: &str| -> Option<u64> {
+        let i = line.find(key)? + key.len();
+        let d: String = line[i..].chars().take_while(|c| c.is_ascii_digit()).collect();
+        d.parse().ok()
+    };
+    Some((num("dns: q=")?, num("resp=")?, line))
+}
+
+/// **判据（M7 S2a 的 V20 本机轮）**：隧道 DNS 代答的**经隧道回包**——走产品路径
+/// （`ClientCore::tun_prepare` + `tun_attach`，L3 over QUIC DATAGRAM）把查询投到
+/// **出口隧道 IP:53/udp**（手机侧 `dnsAddresses` 的形态），断言：
+/// ①两枚查询（A + 被代答过滤的 AAAA）**都**经隧道回包：txid 一致、QR=1、问题段回显；
+/// ②出口侧 E4 族 `dns 代答就绪：tunnel=100.64.255.1:53（UDP+TCP）resolve=…:5300（TCP）` 在场；
+/// ③`dns: q=N … resp=M` **计数对账**（等下一统计拍 ≤70s：Δq ≥ 2 且 Δresp ≥ 2）。
+///
+/// **口径（如实）**：`resolve=…:5300`（TCP 解析腿）**不在本机轮**——内层 TCP 需要真客户端
+/// 内核栈；且宿主会话面对该端口已退役（`INTEROP-CRITERIA` CA5 登记）。真机轮（S2b/U2）承接。
+/// AAAA（`qtype=28`）是**代答过滤**集 ⇒ 该应答不依赖上游网络，判定本机可复现。
+#[test]
+#[ignore = "端到端（DNS over tunnel）：需本地 QUIC 出口在跑（tools/quic-island-e2e.sh 驱动）"]
+fn dns_query_over_tunnel_round_trips() {
+    use homeway_core::facade::demand::DemandSignals;
+    use homeway_core::facade::tun_exec::TunnelExec;
+    use homeway_core::facade::ClientCore;
+    use std::os::fd::AsRawFd as _;
+    use std::os::unix::net::UnixDatagram;
+
+    let token_str = std::env::var("HOMEWAY_ISLAND_E2E_TOKEN").expect("须给 HOMEWAY_ISLAND_E2E_TOKEN");
+    let exit_log = PathBuf::from(
+        std::env::var("HOMEWAY_ISLAND_E2E_EXIT_LOG").expect("须给 HOMEWAY_ISLAND_E2E_EXIT_LOG"),
+    );
+    let log0 = log_lines(&exit_log);
+    let before = last_dns_counters(&exit_log);
+    println!(
+        "[dns] before={:?}",
+        before.as_ref().map(|(q, r, _)| (*q, *r))
+    );
+
+    let dir = std::env::temp_dir().join(format!("hw-m7-dns-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("临时目录可建");
+    let out = dir.join("gen.log");
+    let ident_dir = dir.join("identity");
+    let _ = std::fs::remove_file(&out);
+    let cfg = format!(
+        r#"{{"token":"{token_str}","out":"{}","identityDir":"{}","transport":"quic"}}"#,
+        out.display(),
+        ident_dir.display()
+    );
+    let demand = std::sync::Arc::new(DemandSignals::new());
+    let exec = TunnelExec::new(std::sync::Arc::clone(&demand));
+    let core = std::sync::Arc::new(ClientCore::with_shared(exec, demand));
+    assert_eq!(core.tun_prepare(&cfg, true), 0, "prepare 受理");
+    let deadline = Instant::now() + WAIT;
+    while !core.tun_status().contains("\"state\":\"ready\"") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        core.tun_status().contains("\"state\":\"ready\""),
+        "世代须 ready：{}",
+        core.tun_status()
+    );
+
+    let (tun, peer) = UnixDatagram::pair().expect("socketpair(DGRAM)");
+    assert_eq!(core.tun_attach(tun.as_raw_fd(), 1280), 0, "attach 受理");
+    let deadline = Instant::now() + WAIT;
+    while !core.tun_status().contains("\"state\":\"attached\"") && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    assert!(
+        core.tun_status().contains("\"state\":\"attached\""),
+        "fd 须被接管：{}",
+        core.tun_status()
+    );
+
+    // 源 = 状态面公布的本设备派生地址（出口 `src_allowed` 面）；目的 = 出口保留隧道 IP
+    let tun_ip: Ipv4Addr = serde_json::from_str::<serde_json::Value>(&core.tun_status())
+        .expect("tun_status 是 JSON")["tunIp"]
+        .as_str()
+        .expect("状态面须公布 tunIp")
+        .parse()
+        .expect("tunIp 是 IPv4");
+    let dns_ip = homeway_core::tunnel_addr::SERVER_TUNNEL_IP;
+    println!("[dns] src={tun_ip} dns={dns_ip}:53（隧道 DNS = 出口隧道 IP）");
+
+    // ---- ①②两枚查询经隧道往返 ----
+    let cases: [(u16, &str, u16, bool); 2] = [
+        (0x4d37, "example.com", 1, false),  // A（走上游；只硬判「经隧道回包」）
+        (0x4d38, "example.com", 28, true),  // AAAA（代答过滤 ⇒ 不依赖上游，确定性）
+    ];
+    for (txid, name, qtype, filtered) in cases {
+        let q = dns_query(txid, name, qtype);
+        let pkt = inner_udp(tun_ip, dns_ip, 40053, 53, &q);
+        write_tun(&peer, &pkt);
+        let deadline = Instant::now() + WAIT;
+        let mut got: Option<Vec<u8>> = None;
+        while Instant::now() < deadline {
+            if let Some(p) = read_tun(&peer, Duration::from_millis(200)) {
+                if let Some(pl) = inner_udp_payload(&p) {
+                    if pl.len() >= 12 && pl[0..2] == txid.to_be_bytes() {
+                        got = Some(p);
+                        break;
+                    }
+                }
+            }
+        }
+        let back = got.unwrap_or_else(|| panic!("DNS 应答必须经隧道回到 TUN fd（txid={txid:#06x}）"));
+        let pl = inner_udp_payload(&back).expect("回程是内层 UDP");
+        assert!(pl[2] & 0x80 != 0, "QR=1（是应答）：{pl:?}");
+        assert_eq!(pl[0..2], txid.to_be_bytes(), "txid 必须一致");
+        // 问题段回显（QNAME 的**标签编码**形态；首 12 字节 = 头）
+        let qname = dns_qname_bytes(name);
+        assert!(
+            pl.len() > 12 && pl[12..].windows(qname.len()).any(|w| w == qname.as_slice()),
+            "问题段须回显 {name}（标签编码）：{pl:?}"
+        );
+        let ancount = u16::from_be_bytes([pl[6], pl[7]]);
+        println!(
+            "[dns] txid={txid:#06x} qtype={qtype} filtered={filtered} 回程={}B answer={} rcode={}",
+            back.len(),
+            ancount,
+            pl[3] & 0x0f
+        );
+    }
+
+    // ---- ②出口侧 E4 族（DNS 面就绪行） ----
+    let ready = wait_log_from(&exit_log, log0, "dns 代答就绪：", Some(":53"), WAIT)
+        .unwrap_or_else(|| "（无 E4 行——出口早于本用例启动，见日志前段）".into());
+    println!("[dns] exit.ready_line={ready}");
+    let all = std::fs::read_to_string(&exit_log).unwrap_or_default();
+    assert!(
+        all.contains("dns 代答就绪：tunnel="),
+        "出口 DNS 面就绪行必须在场（E4 族）"
+    );
+
+    // ---- ③计数对账（等下一统计拍：60s 周期 ⇒ 上界 70s）----
+    let base = before.as_ref().map(|(q, r, _)| (*q, *r));
+    let mut cur = last_dns_counters(&exit_log).map(|(q, r, _)| (q, r));
+    let deadline = Instant::now() + Duration::from_secs(70);
+    while Instant::now() < deadline {
+        if let (Some((q0, r0)), Some((q1, r1))) = (base, cur) {
+            if q1 >= q0 + 2 && r1 >= r0 + 2 {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+        cur = last_dns_counters(&exit_log).map(|(q, r, _)| (q, r));
+    }
+    let (q1, r1) = cur.expect("出口须有 dns: 计数行（E22 族）");
+    println!("[dns] after=({q1},{r1}) before={base:?}");
+    match base {
+        Some((q0, r0)) => {
+            assert!(
+                q1 >= q0 + 2,
+                "Δq 须 ≥ 2（两枚查询都到达出口 DNS 面）：{q0} → {q1}"
+            );
+            assert!(
+                r1 >= r0 + 2,
+                "Δresp 须 ≥ 2（两枚查询都经隧道回包）：{r0} → {r1}"
+            );
+        }
+        None => println!("[dns] 本轮出口首条计数行在本用例内产生——基线缺 ⇒ 只记读数"),
+    }
+
+    let _ = core.tun_stop();
+    println!("[dns] done");
+}
