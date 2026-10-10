@@ -356,9 +356,6 @@ fn write_fd_all(fd: i32, mut buf: &[u8]) -> io::Result<()> {
             match e.kind() {
                 io::ErrorKind::Interrupted => continue,
                 io::ErrorKind::WouldBlock => {
-                    if crate::diag_m65::on() {
-                        crate::diag_m65::diag().write_wb.fetch_add(1, Ordering::Relaxed);
-                    }
                     let r = poll_fd(fd, libc::POLLOUT, deadline)?;
                     if r.hup || r.err || r.nval {
                         return Err(io::Error::new(
@@ -386,65 +383,16 @@ fn write_fd_all(fd: i32, mut buf: &[u8]) -> io::Result<()> {
 fn read_loop(fd: i32, tx: IslandTx, counters: Arc<TunCounters>, logf: Logf) {
     let mut buf = vec![0u8; 65535];
     let mut pending_drops: u64 = 0;
-    let diag_on = crate::diag_m65::on();
-    let mut last_dump = Instant::now();
-    // 上一轮 poll 是否报可读（自旋签名：报可读但 read 仍 EAGAIN）
-    let mut poll_readable = false;
     loop {
-        let t_read0 = if diag_on {
-            crate::diag_m65::diag().read_syscall.start()
-        } else {
-            None
-        };
         let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-        if diag_on {
-            crate::diag_m65::diag().read_syscall.end(t_read0);
-        }
         if n < 0 {
             let e = io::Error::last_os_error();
             match e.kind() {
-                io::ErrorKind::Interrupted => {
-                    if diag_on {
-                        crate::diag_m65::diag()
-                            .read_eintr
-                            .fetch_add(1, Ordering::Relaxed);
-                    }
-                    continue;
-                }
+                io::ErrorKind::Interrupted => continue,
                 io::ErrorKind::WouldBlock => {
-                    if diag_on {
-                        let d = crate::diag_m65::diag();
-                        d.read_eagain.fetch_add(1, Ordering::Relaxed);
-                        if poll_readable {
-                            d.poll_but_eagain.fetch_add(1, Ordering::Relaxed);
-                        }
-                    }
-                    poll_readable = false;
-                    // 非阻塞 fd 的常态：等 POLLIN 一片（片界即退出判定点）。
+                    // 回退支（fd 非阻塞/标志不可清时才会走到）：等 POLLIN 一片。
                     // 三分处置（镜像 `wgcore`）：片到（TimedOut）= 继续；poll 出错 = 判死。
-                    let t_poll0 = if diag_on {
-                        crate::diag_m65::diag().read_poll.start()
-                    } else {
-                        None
-                    };
-                    let wall0 = diag_on.then(Instant::now);
-                    let pr = poll_fd(fd, libc::POLLIN, Instant::now() + POLL_SLICE);
-                    if diag_on {
-                        let d = crate::diag_m65::diag();
-                        d.read_poll.end(t_poll0);
-                        d.poll_calls.fetch_add(1, Ordering::Relaxed);
-                        if let Some(w) = wall0 {
-                            if w.elapsed() < Duration::from_micros(200) {
-                                d.poll_imm.fetch_add(1, Ordering::Relaxed);
-                            }
-                        }
-                        if let Ok(r) = &pr {
-                            if r.readable {
-                                poll_readable = true;
-                            }
-                        }
-                    }
-                    match pr {
+                    match poll_fd(fd, libc::POLLIN, Instant::now() + POLL_SLICE) {
                         Ok(_ready) => {} // 可读优先（含 POLLIN|POLLHUP 同置：先读，下一轮定性）
                         Err(pe) if pe.kind() == io::ErrorKind::TimedOut => {}
                         Err(pe) => {
@@ -467,13 +415,7 @@ fn read_loop(fd: i32, tx: IslandTx, counters: Arc<TunCounters>, logf: Logf) {
         if n == 0 {
             // EOF/空读：判死**只看 hup||err||nval**（darwin 上 EOF 恒带 POLLIN），
             // 且判死前确认一片（poll 本身即等待——不用 sleep）。
-            let t_poll0 = diag_on
-                .then(|| crate::diag_m65::diag().read_poll.start())
-                .flatten();
             let first = poll_fd(fd, libc::POLLIN, Instant::now() + POLL_SLICE);
-            if diag_on {
-                crate::diag_m65::diag().read_poll.end(t_poll0);
-            }
             let (dead, readable) = match &first {
                 Ok(r) => (r.hup || r.err || r.nval, r.readable),
                 Err(pe) if pe.kind() == io::ErrorKind::TimedOut => (false, false),
@@ -501,7 +443,6 @@ fn read_loop(fd: i32, tx: IslandTx, counters: Arc<TunCounters>, logf: Logf) {
             }
             continue;
         }
-        poll_readable = false;
         let mut n = n as usize;
         // packet-info 头自动探测（镜像 `wgcore` 的 r2-L4：4 字节 PI + 合法 IP 版本号才剥）
         let looks_like_pi = n >= 5
@@ -539,25 +480,11 @@ fn read_loop(fd: i32, tx: IslandTx, counters: Arc<TunCounters>, logf: Logf) {
             }
             continue;
         }
-        let t_send0 = diag_on
-            .then(|| crate::diag_m65::diag().read_chan_send.start())
-            .flatten();
-        let sent = tx.send(Cmd::TunPacket(pkt));
-        if diag_on {
-            let d = crate::diag_m65::diag();
-            d.read_chan_send.end(t_send0);
-            d.read_ok.fetch_add(1, Ordering::Relaxed);
-            d.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
-        }
-        if sent.is_err() {
+        if tx.send(Cmd::TunPacket(pkt)).is_err() {
             // 岛已收工（通道断）——读线程自退（不重试、不挂死）
             counters.done_send();
             (logf)("homeway-tun-read: 投递失败（岛已收工）—— 读线程退出");
             return;
-        }
-        if diag_on && last_dump.elapsed() >= std::time::Duration::from_secs(5) {
-            last_dump = Instant::now();
-            (logf)(&crate::diag_m65::dump_line("5s"));
         }
         if pending_drops > 0 {
             let _ = tx.send(Cmd::DatagramDropped {
@@ -582,7 +509,6 @@ fn write_loop(
     inflight: Arc<std::sync::atomic::AtomicUsize>,
     writer_alive: Arc<std::sync::atomic::AtomicBool>,
 ) {
-    let diag_on = crate::diag_m65::on();
     loop {
         let batch = match rx.recv() {
             Ok(p) => p,
@@ -593,16 +519,7 @@ fn write_loop(
         };
         // M6.5 批化：一次唤醒写一整批；批内逐包 write（TUN 语义：一次 write = 一包，不能合并）
         for pkt in &batch {
-            let t_w0 = diag_on
-                .then(|| crate::diag_m65::diag().write_syscall.start())
-                .flatten();
-            let res = write_fd_all(fd, pkt);
-            if diag_on {
-                let d = crate::diag_m65::diag();
-                d.write_syscall.end(t_w0);
-                d.write_pkts.fetch_add(1, Ordering::Relaxed);
-            }
-            match res {
+            match write_fd_all(fd, pkt) {
                 Ok(()) => {
                     counters.write_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
                     counters.write_pkts.fetch_add(1, Ordering::Relaxed);

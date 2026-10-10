@@ -58,8 +58,6 @@ pub mod admit_close;
 mod client;
 mod cmd;
 mod config;
-/// **M6.5 临时诊断插桩**（收口前删除；env 门 `HOMEWAY_M65_DIAG=1`）。
-mod diag_m65;
 mod driver;
 mod exit;
 mod reg4;

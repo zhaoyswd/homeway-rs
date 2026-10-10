@@ -1087,11 +1087,6 @@ async fn handle_cmd(
             let _ = reply.send(Ok(()));
         }
         Cmd::TunPacket(pkt) => {
-            // M6.5 临时插桩（删除见 `diag_m65.rs` 模块头）
-            let m65_on = crate::diag_m65::on();
-            let m65_t0 = m65_on
-                .then(|| crate::diag_m65::diag().island_tunpkt.start())
-                .flatten();
             // 在途名额交还（§6.4 的有界通道等价实现：读线程占名额、岛消费即还）
             ctx.counters.done_send();
             // 发送路径（S2-4）：①准入窗由结构保证（`Live` 只在四帧准入完成之后存在）；
@@ -1116,11 +1111,6 @@ async fn handle_cmd(
                     let n = pkt.len();
                     note_drop(ctx, DropReason::Unregistered, 1, "无已登记连接", Some(n as u64));
                 }
-            }
-            if m65_on {
-                let d = crate::diag_m65::diag();
-                d.island_tunpkt.end(m65_t0);
-                d.island_pkts.fetch_add(1, Ordering::Relaxed);
             }
         }
         // 循环侧处置（幂等；重入无害）

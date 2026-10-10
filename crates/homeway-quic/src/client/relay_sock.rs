@@ -228,9 +228,6 @@ pub(crate) fn note_send_err(st: &mut SockStats, e: &std::io::Error, now: std::ti
     class
 }
 
-/// 单次 `recvmmsg` 最多收几条（M6.5 多段接收；与 `max_receive_segments()` 同值）。
-pub(crate) const RECV_SEGMENTS: usize = 8;
-
 /// 岛侧抽象 socket（`quinn::AsyncUdpSocket`）：直连裸包 + 中继包封/剥壳。
 pub(crate) struct ClientSock {
     io: TokioUdp,
@@ -239,8 +236,6 @@ pub(crate) struct ClientSock {
     /// 计数（`Arc` 与岛共享；岛线程写、快照读）。
     stats: Arc<Mutex<SockStats>>,
     logf: Logf,
-    /// `recvmmsg` 不可用（EINVAL/ENOSYS…）⇒ 永久退单段接收（如实记一次行）。
-    batch_off: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for ClientSock {
@@ -277,81 +272,16 @@ impl ClientSock {
                 relays,
                 stats,
                 logf,
-                batch_off: std::sync::atomic::AtomicBool::new(false),
             }),
             v4,
         ))
     }
 
-    /// **批量接收**（M6.5；`recvmmsg`）：把至多 `min(bufs.len(), RECV_SEGMENTS)` 条数据报
-    /// 收进 `bufs[0..]`，逐条写 `meta[i] = {addr, len, stride=len}`，返回条数。
-    ///
-    /// 非 Linux 目标（本机 macOS 开发/测试）无 `recvmmsg` ⇒ 单段 `try_recv_from`（等价旧行为）。
-    /// Linux 上 `recvmmsg` 报 `EINVAL/ENOSYS`（内核/权限差异）⇒ 永久退单段 + 记一次行。
-    /// `EAGAIN`（无数据）原样上抛（调用方回 `poll_recv_ready`）。
+    /// 单段接收（**M6.5 实测结论**：`recvmmsg` 多段接收在本设备**无增益**——每包成本由
+    /// 内核每包处理（skb 出队/拷贝）主导，不是系统调用进出；实测每包 22.5µs（单段）
+    /// vs 28.1µs（8 段批），故**不启用多段**、保持 QT-M1 的段能力 = 1 登记）。
     fn recv_batch(&self, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> io::Result<usize> {
-        use std::sync::atomic::Ordering;
-        if self.batch_off.load(Ordering::Relaxed) {
-            return self.recv_one(bufs, meta);
-        }
-        #[cfg(target_os = "linux")]
-        {
-            use std::os::fd::AsRawFd;
-            let want = bufs.len().min(RECV_SEGMENTS);
-            // SAFETY：三张定长数组就地零初始化后逐项填指针/长度；recvmmsg 只写 bufs[i]
-            // 指向的本进程可写内存（≤ 该 iovec 的 iov_len）与 hdrs[i]/addrs[i]。
-            let mut hdrs: [libc::mmsghdr; RECV_SEGMENTS] = unsafe { std::mem::zeroed() };
-            let mut iovs: [libc::iovec; RECV_SEGMENTS] = unsafe { std::mem::zeroed() };
-            let mut addrs: [libc::sockaddr_storage; RECV_SEGMENTS] = unsafe { std::mem::zeroed() };
-            for i in 0..want {
-                iovs[i] = libc::iovec {
-                    iov_base: bufs[i].as_mut_ptr().cast(),
-                    iov_len: bufs[i].len(),
-                };
-                hdrs[i].msg_hdr.msg_name = (&mut addrs[i] as *mut libc::sockaddr_storage).cast();
-                hdrs[i].msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
-                hdrs[i].msg_hdr.msg_iov = &mut iovs[i] as *mut libc::iovec;
-                hdrs[i].msg_hdr.msg_iovlen = 1;
-            }
-            let rc = unsafe {
-                libc::recvmmsg(
-                    self.io.as_raw_fd(),
-                    hdrs.as_mut_ptr(),
-                    want as u32,
-                    0,
-                    std::ptr::null_mut(),
-                )
-            };
-            if rc < 0 {
-                let e = io::Error::last_os_error();
-                if matches!(e.raw_os_error(), Some(libc::EINVAL) | Some(libc::ENOSYS)) {
-                    self.batch_off.store(true, Ordering::Relaxed);
-                    (self.logf)(&format!(
-                        "多段接收不可用（recvmmsg: {e}）—— 退单段接收（成本面登记）"
-                    ));
-                    return self.recv_one(bufs, meta);
-                }
-                return Err(e);
-            }
-            let rc = rc as usize;
-            for i in 0..rc {
-                let len = hdrs[i].msg_len as usize;
-                let addr = sockaddr_v4(&addrs[i]).unwrap_or(self.local);
-                meta[i] = RecvMeta {
-                    addr,
-                    len,
-                    stride: len,
-                    ecn: None,
-                    dst_ip: None,
-                };
-            }
-            Ok(rc)
-        }
-        #[cfg(not(target_os = "linux"))]
-        {
-            // 非 Linux（本机开发/测试）：无 recvmmsg ⇒ 单段（等价旧行为）
-            self.recv_one(bufs, meta)
-        }
+        self.recv_one(bufs, meta)
     }
 
     /// 单段接收（回退路径；填 `meta[0]`）。
@@ -390,16 +320,6 @@ impl AsyncUdpSocket for ClientSock {
             }
             return Ok(());
         }
-        // M6.5 临时插桩（删除见 `diag_m65.rs` 模块头）
-        let m65_on = crate::diag_m65::on();
-        if m65_on {
-            crate::diag_m65::diag()
-                .sock_send_calls
-                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-        }
-        let m65_t0 = m65_on
-            .then(|| crate::diag_m65::diag().sock_send.start())
-            .flatten();
         let framed = self.relays.label_of(&transmit.destination).map(|label| {
             let mut out = Vec::with_capacity(RELAY_TAG_LEN + ENV_LEN + transmit.contents.len());
             out.extend_from_slice(&wrap_uplink(label, transmit.contents));
@@ -409,11 +329,7 @@ impl AsyncUdpSocket for ClientSock {
             Some(f) => (f.as_slice(), true),
             None => (transmit.contents, false),
         };
-        let res = self.io.try_send_to(payload, transmit.destination);
-        if m65_on {
-            crate::diag_m65::diag().sock_send.end(m65_t0);
-        }
-        match res {
+        match self.io.try_send_to(payload, transmit.destination) {
             Ok(_) => {
                 let mut st = lock_unpoison(&self.stats);
                 st.tx_dgrams += 1;
@@ -446,8 +362,6 @@ impl AsyncUdpSocket for ClientSock {
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
         debug_assert_eq!(bufs.len(), meta.len(), "quinn 恒成对传入 bufs/meta");
-        // M6.5 临时插桩（删除见 `diag_m65.rs` 模块头）
-        let m65_on = crate::diag_m65::on();
         loop {
             match self.io.poll_recv_ready(cx) {
                 Poll::Ready(Ok(())) => {}
@@ -456,32 +370,11 @@ impl AsyncUdpSocket for ClientSock {
             }
             // **M6.5 多段接收**（真机逐段表：每包一次 recvmsg ≈ 22µs CPU ⇒ 一次系统调用
             // 收一批）：`recvmmsg` 收至多 [`RECV_SEGMENTS`] 条；不支持则退单段路径。
-            if m65_on {
-                crate::diag_m65::diag()
-                    .sock_recv_calls
-                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-            }
-            let m65_t0 = m65_on
-                .then(|| crate::diag_m65::diag().sock_recv.start())
-                .flatten();
             let recvd = match self.recv_batch(bufs, meta) {
-                Ok(v) => v,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                    if m65_on {
-                        crate::diag_m65::diag().sock_recv.end(m65_t0);
-                    }
-                    continue;
-                }
-                Err(e) => {
-                    if m65_on {
-                        crate::diag_m65::diag().sock_recv.end(m65_t0);
-                    }
-                    return Poll::Ready(Err(e));
-                }
+                Ok(v) if v > 0 => v,
+                // 无数据（含空返）⇒ 回 `poll_recv_ready` 重新挂等待
+                Ok(_) | Err(_) => continue,
             };
-            if m65_on {
-                crate::diag_m65::diag().sock_recv.end(m65_t0);
-            }
             // 剥壳 + 跳过忽略帧（有效载荷前移到各自的 buf 头部；`meta` 按序紧凑）
             let mut out = 0usize;
             let mut ignored_src = None;
@@ -544,17 +437,10 @@ impl AsyncUdpSocket for ClientSock {
         1
     }
 
-    /// **多段接收**（M6.5：`recvmmsg` 一次收一批；真机逐段表 = 每包 22µs 的系统调用面）。
-    /// 发送侧仍 = 1 段（不声明 GSO：客户端上行是 ACK/小包，批处理无收益且要碰
-    /// `UDP_SEGMENT` 的兼容面）。**容量**：quinn 端点接收缓冲 = `max_udp_payload_size`
-    /// （缺省 1472）× 本值 × 32 = **376KB**（改前 47KB；`T9` 内存面按此登记）。
+    /// 段能力 = 1（**保持 Q-K/QT-M1 登记面不变**；M6.5 实测：多段接收无增益，见
+    /// [`Self::recv_batch`] 的注释——故不启用）。
     fn max_receive_segments(&self) -> usize {
-        // 非 Linux（无 recvmmsg）⇒ 如实 1；Linux（OHOS/生产面）⇒ 多段
-        if cfg!(target_os = "linux") {
-            RECV_SEGMENTS
-        } else {
-            1
-        }
+        1
     }
 
     /// 不设 `DONTFRAG`/`MTU_DISCOVER` ⇒ 如实 `true`（见模块头：与设计 §1.2 等价）。
