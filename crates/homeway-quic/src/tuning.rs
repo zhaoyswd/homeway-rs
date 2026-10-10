@@ -182,6 +182,93 @@ pub const ENV_SEND_WINDOW: &str = "HOMEWAY_QUIC_SEND_WINDOW";
 pub const ENV_STREAM_PENDING: &str = "HOMEWAY_QUIC_STREAM_PENDING";
 
 // ---------------------------------------------------------------------------
+// 拥塞控制器选择（M6.7 登记的可选改进项：剩余 11% 的速率控制面）
+// ---------------------------------------------------------------------------
+
+/// 拥塞控制器选择（**默认 = [`CcChoice::Cubic`]，与 M1 起的「不设 factory」逐字节同效**）。
+///
+/// 为什么是 env 消融臂而不是正式配置项（§15-3 的登记纪律）：M6.7 的结论是「缺一条按带宽
+/// （而非按丢包）的发送速率控制」，但**换控制器会改线上的发送节奏**（cwnd/pacing 全变）——
+/// 属判据面变更，须先有实测读数再谈默认值。本批只做「可开关 + 可复现地量」，**默认档一个
+/// 字节都不动**（不设 env = 现状 = quinn 默认 CUBIC）。要转正式配置项另登记。
+///
+/// 值域是**闭集**（不是区间）：`cubic` / `bbr`，大小写不敏感；其余一律非法 ⇒
+/// 记行 + 回落 `cubic`（照 `HOMEWAY_QUIC_MTU` 先例）。**`bbr3` 在移植落地后加入**
+/// （本批第二段：env 域与实现同批扩，避免「接受一个悬空值」）。
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum CcChoice {
+    /// quinn 缺省 CUBIC（RFC 8312；与 smoltcp 侧同族）。
+    #[default]
+    Cubic,
+    /// quinn 自带 BBR **v1**（draft-iccrg；上游标注 Experimental）。
+    Bbr,
+}
+
+/// env 名：拥塞控制器（`cubic`[默认] / `bbr`）。
+pub const ENV_CC: &str = "HOMEWAY_QUIC_CC";
+
+impl CcChoice {
+    /// 字形（**单源**：记行、测试、文档都读它，不许各写一份字面量）。
+    pub const fn name(self) -> &'static str {
+        match self {
+            CcChoice::Cubic => "cubic",
+            CcChoice::Bbr => "bbr",
+        }
+    }
+
+    /// env 串 → 选择（闭集；大小写不敏感；`None` = 非法）。
+    pub fn parse(v: &str) -> Option<Self> {
+        let v = v.trim();
+        if v.eq_ignore_ascii_case("cubic") {
+            Some(CcChoice::Cubic)
+        } else if v.eq_ignore_ascii_case("bbr") {
+            Some(CcChoice::Bbr)
+        } else {
+            None
+        }
+    }
+
+    /// 合法值域的展示串（记行用；与 [`Self::parse`] 成对维护）。
+    pub const VALUES: &'static str = "cubic|bbr";
+
+    /// env 覆盖（形态同 [`StreamLimits::apply_env`]）：**未设 ⇒ 不改、不打行**；
+    /// **非法 ⇒ 不改本值 + 一行说明**（调用方落 `Logf`）。
+    pub fn apply_env(&mut self, get: &dyn Fn(&str) -> Option<String>) -> (usize, Vec<String>) {
+        let Some(raw) = get(ENV_CC) else {
+            return (0, Vec::new());
+        };
+        match Self::parse(&raw) {
+            Some(v) => {
+                *self = v;
+                (1, Vec::new())
+            }
+            None => (
+                0,
+                vec![format!(
+                    "⚠️ {ENV_CC}={raw} 非法（有效值 {}）—— 该项按设计缺省走（= {}；照 HOMEWAY_QUIC_MTU 先例）",
+                    Self::VALUES,
+                    CcChoice::default().name()
+                )],
+            ),
+        }
+    }
+}
+
+/// 施加拥塞控制 env 覆盖并按 `Logf` 落行（岛/出口的启动路径共用；返回生效条数）。
+pub fn apply_cc_env(cc: &mut CcChoice, logf: &crate::cmd::Logf) -> usize {
+    let (applied, notes) = cc.apply_env(&env_get);
+    for n in &notes {
+        (*logf)(n);
+    }
+    (*logf)(&format!(
+        "拥塞控制器（CC）= {}（env {ENV_CC}；设计缺省 = {}）",
+        cc.name(),
+        CcChoice::default().name()
+    ));
+    applied
+}
+
+// ---------------------------------------------------------------------------
 // 出口服务入口（intake）与 socketpair（§1.7/§2.2/§15-3；M3 S2 消费）
 // ---------------------------------------------------------------------------
 
@@ -656,9 +743,74 @@ mod tests {
         assert_eq!(t.fast_gap, probe_defaults::FAST_GAP);
     }
 
+    /// **判据（拥塞控制 env 消融臂，M6.7）**：合法值逐档生效；非法 ⇒ **不改值 + 一行说明**
+    /// （回落 = 设计缺省 `cubic`）；未设 ⇒ 零噪声。缺省值本身 = `cubic`（**默认档不许变**：
+    /// 不设 env 必须与 M1–M6 的「不设 factory」逐字节同效）。
+    #[test]
+    fn cc_env_choice_applies_or_falls_back_with_note() {
+        // ① 缺省 = cubic（构造性：`CcChoice::default()`）
+        assert_eq!(CcChoice::default(), CcChoice::Cubic);
+        assert_eq!(CcChoice::default().name(), "cubic");
+        // 单键 env 读取闭包（**不碰进程环境**：值与断言都局部）
+        let one = |raw: &str| {
+            let raw = raw.to_owned();
+            move |k: &str| (k == ENV_CC).then(|| raw.clone())
+        };
+        // ② 合法值（大小写不敏感 + 空白容忍）
+        for (raw, want) in [
+            ("cubic", CcChoice::Cubic),
+            ("CUBIC", CcChoice::Cubic),
+            (" bbr ", CcChoice::Bbr),
+            ("Bbr", CcChoice::Bbr),
+        ] {
+            let mut cc = CcChoice::Cubic;
+            let (applied, notes) = cc.apply_env(&one(raw));
+            assert_eq!(applied, 1, "{raw} 应生效：{notes:?}");
+            assert!(notes.is_empty(), "合法值不产说明行：{notes:?}");
+            assert_eq!(cc, want);
+        }
+        // ③ 非法 ⇒ **不改该项** + 一行说明（含原值、值域、回落结果）。缺省档（= 生产路径
+        // 的现实形态：无人显式设过本字段）⇒ 结果就是「回落 cubic」。
+        for raw in ["reno", "bbr2", "bbrv3", "1", "", "cubic bbr"] {
+            let mut cc = CcChoice::default();
+            let (applied, notes) = cc.apply_env(&one(raw));
+            assert_eq!(applied, 0, "{raw} 不得生效");
+            assert_eq!(notes.len(), 1, "非法值一行说明：{notes:?}");
+            assert!(notes[0].contains("非法"), "{}", notes[0]);
+            assert!(notes[0].contains(ENV_CC), "{}", notes[0]);
+            assert!(notes[0].contains("cubic"), "说明行须给出回落值：{}", notes[0]);
+            assert_eq!(cc, CcChoice::Cubic, "非法 ⇒ 按设计缺省走（= cubic）");
+        }
+        // ③-b 显式配置面：非法 env **不得**覆盖显式值（照流面 `不改该项` 的既有纪律）
+        let mut cc = CcChoice::Bbr;
+        let (applied, notes) = cc.apply_env(&one("reno"));
+        assert_eq!(applied, 0);
+        assert_eq!(notes.len(), 1);
+        assert_eq!(cc, CcChoice::Bbr, "非法 env 不改任何现有值");
+        // ④ 未设 ⇒ 不改、不打行（常态路径零噪声）
+        let mut cc = CcChoice::Cubic;
+        let (applied, notes) = cc.apply_env(&none);
+        assert_eq!(applied, 0);
+        assert!(notes.is_empty());
+        // ⑤ `VALUES` 与 `parse` 成对（值域展示串不得漏项/多项）
+        for (v, want) in [
+            ("cubic", CcChoice::Cubic),
+            ("bbr", CcChoice::Bbr),
+        ] {
+            assert!(CcChoice::VALUES.split('|').any(|x| x == v), "{v} 在展示串里");
+            assert_eq!(CcChoice::parse(v), Some(want));
+        }
+        assert_eq!(
+            CcChoice::VALUES.split('|').count(),
+            2,
+            "值域项数 = parse 接受的字形数（加档必须两处同批）"
+        );
+    }
+
     /// env 名常量是**单源**（生产/消融/登记三处不许各写一份字面量）。
     #[test]
     fn env_names_are_the_single_source() {
+        assert_eq!(ENV_CC, "HOMEWAY_QUIC_CC");
         assert_eq!(ENV_STREAMS, "HOMEWAY_QUIC_STREAMS");
         assert_eq!(ENV_STREAM_WINDOW, "HOMEWAY_QUIC_STREAM_WINDOW");
         assert_eq!(ENV_CONN_RECV_WINDOW, "HOMEWAY_QUIC_RECV_WINDOW");

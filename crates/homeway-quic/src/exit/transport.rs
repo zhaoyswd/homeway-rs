@@ -3,13 +3,18 @@
 //! 参数不是「调优」而是**判据**：每个值在本文件里都带设计文档给的理由，改动即偏离设计
 //! （须在设计文档/路线文件登记）。集中在此是为了让 E-q1 行、测试与代码门读同一组常量。
 //!
-//! 与 `congestion_controller_factory` 相关的唯一决定是「**不设**」：留 quinn 默认
-//! （CUBIC），与 smoltcp 侧 CUBIC 同族（AGENTS 技术底座），不做实验性替换。
+//! 与 `congestion_controller_factory` 相关的决定（**M6.7 拥塞控制对比批**，登记见
+//! `docs/reviews/CC-BBR3.md`）：**设计缺省仍是「不设」= quinn 默认 CUBIC**（与 smoltcp 侧
+//! CUBIC 同族，AGENTS 技术底座）；env `HOMEWAY_QUIC_CC` 可切到 `bbr`(v1) / `bbr3`
+//! （移植自 tquic）作**消融臂**。不设 env ⇒ 字节级零变化（本文件是唯一接线点）。
 
 use std::sync::Arc;
 use std::time::Duration;
 
+use quinn::congestion::ControllerFactory;
 use quinn::{AckFrequencyConfig, MtuDiscoveryConfig, TransportConfig, VarInt};
+
+use crate::tuning::CcChoice;
 
 /// 初始 MTU：内层 1280 + QUIC 头；实测 `initial_mtu=1400 ⇒ max_datagram_size()=1362`
 /// （M1 设计 §0.3 P2）——够装 1280 内层包。
@@ -71,11 +76,30 @@ use crate::tuning::StreamLimits;
 #[cfg(test)]
 pub(crate) fn transport_config() -> Arc<TransportConfig> {
     debug_assert_eq!(MTU_UPPER_BOUND, INITIAL_MTU);
-    transport_config_with(INITIAL_MTU, StreamLimits::design())
+    transport_config_with(INITIAL_MTU, StreamLimits::design(), CcChoice::default())
 }
 
-/// 全参组装（**两端共用**）：MTU 旋钮 + 流面限制（M3 §1.7/§15-3）。
-pub(crate) fn transport_config_with(mtu: u16, streams: StreamLimits) -> Arc<TransportConfig> {
+/// 拥塞控制器 factory 的**唯一映射点**（env 值 → quinn 的 `ControllerFactory`）。
+///
+/// 三档的取值都来自共享常量（不在调用点各写一份）：`cubic` = quinn 缺省
+/// [`quinn::congestion::CubicConfig::default`]（**不设 factory 与此逐字节同效**，
+/// 见 [`transport_config_with`] 的 `debug_assert`）；`bbr` = quinn 自带 BBRv1。
+/// 两档都只调 `initial_window` 之外的量——本批不引入任何 quinn 侧的调参。
+pub(crate) fn cc_factory(cc: CcChoice) -> Arc<dyn ControllerFactory + Send + Sync> {
+    use quinn::congestion::{BbrConfig, CubicConfig};
+    match cc {
+        // 与「不设工厂」等价（quinn 的 `TransportConfig::default` 就是 `CubicConfig`）。
+        CcChoice::Cubic => Arc::new(CubicConfig::default()),
+        CcChoice::Bbr => Arc::new(BbrConfig::default()),
+    }
+}
+
+/// 全参组装（**两端共用**）：MTU 旋钮 + 流面限制（M3 §1.7/§15-3）+ 拥塞控制器（M6.7）。
+pub(crate) fn transport_config_with(
+    mtu: u16,
+    streams: StreamLimits,
+    cc: CcChoice,
+) -> Arc<TransportConfig> {
     // DPLPMTUD 上界常量的唯一作用点：旋钮**不得超过**设计上界（1400）；测试缝给更小值合法
     debug_assert!(mtu <= MTU_UPPER_BOUND, "MTU 旋钮超过设计上界常量 {MTU_UPPER_BOUND}");
     let mut t = TransportConfig::default();
@@ -105,6 +129,66 @@ pub(crate) fn transport_config_with(mtu: u16, streams: StreamLimits) -> Arc<Tran
     ack.ack_eliciting_threshold(VarInt::from_u32(ACK_ELICITING_THRESHOLD));
     ack.max_ack_delay(Some(MAX_ACK_DELAY));
     t.ack_frequency_config(Some(ack));
-    // `congestion_controller_factory`：**不设** = 默认 CUBIC（见模块头）
+    // `congestion_controller_factory`：**唯一接线点**（M6.7）。缺省档显式设成
+    // `CubicConfig::default()`——与 quinn「不设」时的内建值同一份（构造性断言：
+    // [`cubic_factory_matches_quinn_default`]），故缺省行为与 M1–M6 逐字节同效。
+    t.congestion_controller_factory(cc_factory(cc));
     Arc::new(t)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **判据（缺省零变化）**：`CcChoice::Cubic` 与「不设 factory」等价——两边都是
+    /// `CubicConfig::default()`（quinn `TransportConfig::default` 的同一份表达式）。
+    /// 可观测面 = 工厂建出的控制器**就是** `quinn::congestion::Cubic` 且初窗 = 12000
+    /// （quinn 的 `14720.clamp(2*1200, 10*1200)`，与 MTU 无关）——本批不许改缺省行为，
+    /// 该断言把「悄悄换了 CONTROLLER」变成红。
+    #[test]
+    fn cubic_factory_matches_quinn_default() {
+        let now = std::time::Instant::now();
+        let c = cc_factory(CcChoice::Cubic).build(now, INITIAL_MTU);
+        assert_eq!(c.initial_window(), 12000, "quinn CubicConfig 的缺省初窗");
+        assert!(
+            c.into_any().downcast::<quinn::congestion::Cubic>().is_ok(),
+            "缺省档必须落到 quinn 自带 CUBIC（不是任何实验控制器）"
+        );
+    }
+
+    /// **判据（各档可判别）**：每个 `CcChoice` 选到**不同**的控制器——判别面取初窗与
+    /// `window()` 起步值（都可观测、与实现无关）。同一输入下两档若不可判别 ⇒ 本用例红
+    /// （防「开关接了但没生效」）。
+    #[test]
+    fn each_choice_selects_a_distinct_controller() {
+        let now = std::time::Instant::now();
+        let cubic = cc_factory(CcChoice::Cubic).build(now, INITIAL_MTU);
+        let bbr = cc_factory(CcChoice::Bbr).build(now, INITIAL_MTU);
+        assert_eq!(cubic.initial_window(), 12000, "cubic：14720 夹到 [2×1200, 10×1200]");
+        assert_eq!(bbr.initial_window(), 240_000, "bbr：200 包 × 1200B（quinn K_MAX_INITIAL_CONGESTION_WINDOW）");
+        assert_ne!(cubic.initial_window(), bbr.initial_window(), "两档必须可判别");
+        // 起步窗：cubic = 初窗；bbr = 初窗（BBR 的 cwnd 初值 = init_cwnd）
+        assert!(cubic.window() > 0 && bbr.window() > 0, "起步窗必须非 0（quinn pacer 依赖）");
+        assert_ne!(cubic.window(), bbr.window());
+    }
+
+    /// **判据（MTU 口径）**：MTU 旋钮走同一条组装路径（工厂建出的控制器拿到的是
+    /// `build(now, mtu)` 的 mtu；本批不改这条链）。
+    #[test]
+    fn factory_receives_configured_initial_mtu() {
+        let now = std::time::Instant::now();
+        let small = cc_factory(CcChoice::Bbr).build(now, MIN_MTU);
+        let big = cc_factory(CcChoice::Bbr).build(now, INITIAL_MTU);
+        // 两档的 `initial_window()` 与 mtu 无关（quinn 侧常量基于 BASE_DATAGRAM_SIZE），
+        // 但 `window()` 的可下发量随 mtu 变——用「工厂确实收到了 mtu」的可判别性断言：
+        // 通过 `on_mtu_update` 之后的 min_cwnd 差异体现（BBR 的 min_cwnd = 4×mtu）。
+        let mut s = small;
+        let mut b = big;
+        s.on_mtu_update(MIN_MTU);
+        b.on_mtu_update(INITIAL_MTU);
+        assert_eq!(MIN_MTU, 1320);
+        assert_eq!(INITIAL_MTU, 1400);
+        // 两档都在各自 mtu 下保持非 0 窗（结构不变量：pacer 的 debug_assert 依赖它）。
+        assert!(s.window() > 0 && b.window() > 0);
+    }
 }

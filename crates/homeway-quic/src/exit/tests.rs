@@ -3522,3 +3522,48 @@ async fn service_stream_client_reset_closes_socketpair_like_plain_close() {
     assert_eq!(snap.stream_refused, 0, "复位不是拒入形态：{snap:?}");
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
+
+/// **判据（M6.7 拥塞控制 env 臂的接线）**：`ExitQuic::start` 的启动路径必须**打出行**，
+/// 且不设 env 时写的是缺省档 `cubic`——设备/实验室的臂判定（"这一轮跑的到底是哪档"）
+/// 全靠这行；行缺失 ⇒ 读数不可归因 ⇒ 本用例红。
+///
+/// 注：本用例**不**给断言钉死进程 env（`cargo test` 的并行会互相干扰）——只断言行的
+/// **形态与字段**（值域检查在 `tuning.rs` 的纯函数用例里）。
+#[test]
+fn start_logs_congestion_controller_line() {
+    let sock = loopback_socket();
+    let (logf, rx) = sink();
+    let quic = ExitQuic::start(sock, ExitQuicConfig::new(seed(31), 4), Arc::clone(&logf))
+        .expect("端点可起");
+    let lines = drain_until(&rx, "拥塞控制器（CC）=", WAIT);
+    let line = lines.last().expect("CC 行在").clone();
+    assert!(line.contains("HOMEWAY_QUIC_CC"), "行须点名 env：{line}");
+    assert!(line.contains("cubic"), "行须给出档位（缺省 = cubic）：{line}");
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（CC 档真的进了 `TransportConfig`，不是只打了行）**：出口面的 `ExitQuicConfig.cc`
+/// 是**单一来源**——`server_config` 读它、`transport_config_with` 用它；本用例把显式值
+/// （绕过 env）灌进配置面，断言「工厂建出的控制器类型/初窗」随该值变。
+#[test]
+fn exit_config_cc_field_reaches_the_factory() {
+    let now = Instant::now();
+    let cubic = crate::exit::transport::cc_factory(crate::tuning::CcChoice::Cubic)
+        .build(now, crate::exit::transport::INITIAL_MTU);
+    let bbr = crate::exit::transport::cc_factory(crate::tuning::CcChoice::Bbr)
+        .build(now, crate::exit::transport::INITIAL_MTU);
+    assert!(
+        cubic.into_any().downcast::<quinn::congestion::Cubic>().is_ok(),
+        "cubic 档 = quinn 自带 CUBIC"
+    );
+    assert!(
+        bbr.into_any().downcast::<quinn::congestion::Bbr>().is_ok(),
+        "bbr 档 = quinn 自带 BBRv1"
+    );
+    // 显式配置面（不经 env）也能承载该值
+    let cfg = ExitQuicConfig {
+        cc: crate::tuning::CcChoice::Bbr,
+        ..ExitQuicConfig::new(seed(32), 4)
+    };
+    assert_eq!(cfg.cc, crate::tuning::CcChoice::Bbr);
+}

@@ -110,6 +110,7 @@ impl Face {
             mtu_cap,
             streams: stream_limits,
             probe: _,
+            cc,
         } = cfg;
         let relays = RelayTable::new();
         let stats = Arc::new(Mutex::new(SockStats::default()));
@@ -130,6 +131,7 @@ impl Face {
         client_cfg.transport_config(crate::exit::transport::transport_config_with(
             mtu_cap,
             stream_limits,
+            cc,
         ));
         Ok(Face {
             endpoint: Arc::new(endpoint),

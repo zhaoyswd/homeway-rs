@@ -54,7 +54,7 @@ use tokio::task::JoinSet;
 use crate::cmd::Logf;
 use crate::rpk::{Ed25519Seed, RpkPublicKey};
 use crate::sync_util::{lock_unpoison, log_spawn_failed, ExitSignal};
-use crate::tuning::StreamLimits;
+use crate::tuning::{CcChoice, StreamLimits};
 
 use bridge::{DropKind, ExitBridge, Outbound, OUTBOUND_QUEUE_MAX};
 use socket::{ExitSock, LegTable};
@@ -184,6 +184,11 @@ pub struct ExitQuicConfig {
     /// 对方开流的上限」⇒ 出口广告 `64` 才允许一条设备连接开 64 条服务流；两端值不同 =
     /// 岛侧自记账与对端信用不一致（§1.7 的账全错）。
     pub streams: StreamLimits,
+    /// **拥塞控制器**（M6.7 拥塞控制对比批；缺省 [`CcChoice::Cubic`] = 现状）。
+    ///
+    /// 由 `ExitQuic::start` 按 env `HOMEWAY_QUIC_CC` 覆盖（不设 = 缺省，零行为变化）；
+    /// 出口是**下行方向的发送端** ⇒ 下行吞吐/包率的速率控制面在这里选。
+    pub cc: CcChoice,
     /// **服务入口**（M3 S2，§2.2 方案 B′）：tag 1/2/3 的入队句柄；未装配的服务 ⇒ `0x22`。
     /// 缺省全空 = S1 的「QUIC 档不提供这四个服务」形态（既有测试零改）。
     pub intakes: ServiceIntakes,
@@ -210,6 +215,7 @@ impl ExitQuicConfig {
             proof_fail_threshold: admit::PROOF_FAIL_THRESHOLD_DEFAULT,
             retry_policy: RetryPolicy::Pressure,
             streams: StreamLimits::design(),
+            cc: CcChoice::default(),
             intakes: ServiceIntakes::default(),
             plain_hook: None,
         }
@@ -446,9 +452,12 @@ impl ExitQuic {
     /// `+1…+9 → 随机`，M1 设计 §1.1）；交给 quinn 后本模块不再碰它。
     pub fn start(
         socket: UdpSocket,
-        cfg: ExitQuicConfig,
+        mut cfg: ExitQuicConfig,
         logf: Logf,
     ) -> Result<ExitQuic, ExitQuicErr> {
+        // ---- M6.7：拥塞控制器的 env 消融臂（照 `HOMEWAY_QUIC_MTU` 先例：env 优先 →
+        // 显式配置 → 设计缺省；非法 ⇒ 不改该项 + 记行）。不设 = 缺省 CUBIC = 现状 ----
+        crate::tuning::apply_cc_env(&mut cfg.cc, &logf);
         // 端点与 runtime 都建在**专用线程内**（`tokio::net::UdpSocket::from_std` 需要
         // runtime 上下文）；起点失败的两种情形（runtime 建不出来 / 端点或身份建不出来）
         // 都必须在 `start` 返回前定音——不留「起了但死的面」。
@@ -774,6 +783,7 @@ fn run_exit(
             &cfg.rpk_seed,
             cfg.retry_token_lifetime,
             cfg.streams,
+            cfg.cc,
         ) {
             Ok(v) => v,
             Err(e) => {

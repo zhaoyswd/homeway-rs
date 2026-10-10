@@ -47,7 +47,7 @@ use crate::config::IslandConfig;
 use crate::stream::{StreamErr, OPEN_BUDGET};
 use crate::sync_util::{lock_unpoison, log_spawn_failed, ExitSignal};
 use crate::tun::{self, ReturnPath, TunCounters};
-use crate::tuning::{apply_probe_env, apply_stream_env, ProbeTuning, StreamLimits};
+use crate::tuning::{apply_cc_env, apply_probe_env, apply_stream_env, ProbeTuning, StreamLimits};
 
 /// 驱动线程名（镜像 `homeway-wg`）。
 pub(crate) const ISLAND_THREAD: &str = "homeway-quic";
@@ -166,6 +166,7 @@ impl Island {
         // env 优先 → 显式配置 → 设计缺省；非法/越界 ⇒ 不改该项 + 记行）----
         let n_streams = apply_stream_env(&mut cfg.streams, &logf);
         let n_probe = apply_probe_env(&mut cfg.probe, &logf);
+        apply_cc_env(&mut cfg.cc, &logf);
         let lim = cfg.streams;
         (*logf)(&format!(
             "流面参数（bidi={} uni={} recv_window={}B conn_recv_window={}B send_window={}B 待发={}B；有效服务流 {}；env 覆盖 {n_streams} 项）",

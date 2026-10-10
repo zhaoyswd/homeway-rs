@@ -15,7 +15,7 @@ use std::net::SocketAddrV4;
 use std::time::Duration;
 
 use crate::rpk::RpkPublicKey;
-use crate::tuning::{ProbeTuning, StreamLimits};
+use crate::tuning::{CcChoice, ProbeTuning, StreamLimits};
 
 /// 巡检节拍缺省值（= 既有 `PATROL_INTERVAL`；判据行 C15 的 60s 刷新同源）。
 pub const DEFAULT_PATROL: Duration = Duration::from_secs(60);
@@ -149,6 +149,11 @@ pub struct IslandConfig {
     /// **快探/恢复参数**（M3 §15-2；S4 消费）：首探预算/复探倍数/待机节拍/抖动与 B 门阈值/
     /// 发送面新鲜度窗。缺省 = 设计初值；启动时按 `HOMEWAY_QUIC_PROBE_*` 族覆盖。
     pub probe: ProbeTuning,
+    /// **拥塞控制器**（M6.7 拥塞控制对比批；缺省 [`CcChoice::Cubic`] = 现状）。
+    ///
+    /// 启动时按 `HOMEWAY_QUIC_CC` 覆盖（不设 = 缺省 ⇒ 行为零变化）。岛是**上行方向的
+    /// 发送端**（本期限定「反向不开流」，但登记/控制流仍走它）；装置侧一般不动本值。
+    pub cc: CcChoice,
 }
 
 impl IslandConfig {
@@ -161,6 +166,7 @@ impl IslandConfig {
             mtu_cap: QUIC_MTU_CAP_DEFAULT,
             streams: StreamLimits::design(),
             probe: ProbeTuning::design(),
+            cc: CcChoice::default(),
         }
     }
 }
