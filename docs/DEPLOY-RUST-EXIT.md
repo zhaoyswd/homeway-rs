@@ -425,3 +425,129 @@ v0.2.2 核 × Mac v0.2.1 出口）实测四判据全绿——回退出口不需�
 && launchctl kickstart -k …`；阿里云 pkill 等退净后 `cp …/homeway-rs.bak-v0.2.2
 /usr/local/bin/homeway-rs` + 重跑 nohup 命令行。state/config 兼容（零变更）；
 wire 面零差异——回退出口不需要动手机。
+
+## 12. 滚动升级 v0.3.0（QUIC 单承载，**待执行**——U1/U2/U3 用户触点）
+
+> **本节 = 执行手册 + 实录位**。设计真源 = `docs/reviews/M7-design.md`（§4 切换方案 / §5 失败预案 /
+> §6 上线前核验清单 / §7 tier 交付物）；本节只写**执行面**并给出与设计不同的**实测口径订正**。
+> **历史节 §0–§11 一字不动**（v0.2.x 实录保留）；**v0.3.0 是破坏性换代**（token `hmw1`→`hmw2`、
+> WG 面整件退役），**故本节不是「换个二进制」而是三阶段代际切换**。
+>
+> **三阶段顺序（不变式 I：设备须始终有一条「核与出口同代」路径）**：
+> **U1 阿里云出口 → G2（设备零扰动）→ U2 设备核 → G2（+ 贴阿里云新 token）→ U3 Mac 出口 → G2
+> （+ 贴 Mac 新 token）**。⇒ **核升级必须夹在两次出口升级之间**。
+
+### 12.1 代际矩阵（四格；交叉两格**硬失败**）
+
+| 核 \ 出口 | **G1 出口**（≤ v0.2.3） | **G2 出口**（≥ v0.3.0） |
+|---|---|---|
+| **G1 核**（pin ≤ `cbd45f0`，WG 核） | ✅ 全通（v0.2.x 生产态） | ❌ 硬失败（旧核把 `Quic` 端点当直连发 WG 握手 + 出口已无 WG 面） |
+| **G2 核**（≥ v0.3.0，QUIC 岛） | ❌ 硬失败（`UnsupportedVersion`：存量 token 一律失效） | ✅ 全通 |
+
+**回滚的最小单元 = 设备核 + 至少一台出口 + 至少一枚同代 token**（三者必须同代）。
+
+### 12.2 共同前置（A 步之前一次做完；**缺任一件不做切换**）
+
+| # | 件 | Mac（本次实施棒已在位） | 阿里云（U1 现场做） |
+|---|---|---|---|
+| 1 | 现役二进制 | `~/bin/homeway-rs.bak-v0.2.3`（sha `98f337e5…` 逐字节同）+ 副本 `~/homeway-rollback/homeway-rs.bak-v0.2.3` | `cp /usr/local/bin/homeway-rs /usr/local/bin/homeway-rs.bak-v0.2.3`（sha 期望 `2dabce88…`） |
+| 2 | `config.toml` | `~/homeway-rollback/config.toml.bak-pre-m7`（`diff` 与现役件同） | `cp …/config.toml …/config.toml.bak-pre-m7` |
+| 3 | plist | `~/homeway-rollback/me.zhaozhe.homeway-exit.plist.bak-pre-m7`（`plutil -lint` OK） | —（nohup 形态无 plist） |
+| 4 | 两枚旧 `hmw1` token | `~/homeway-rollback/tokens-mac-pre-m7.txt`（0600；端点清单见同目录 `tok-endpoints.txt`） | U1 现场 `serve token` 抄存（**升级后读不到旧串**：台账 append-only + 读末行） |
+| 5 | G1 核 `.so` | `~/homeway-rollback/libclientcore-g1.so`（2,348,864 B，sha `6a183e86…`）+ `homeway-cli-g1-macos`（sha `3008074a…`，`/tmp/m6-ab` 易失面已转存） | — |
+| 6 | 旧 HSP 重建配方 | §12.5（本节） | — |
+| 7 | state 全量 tar | `~/homeway-rollback/state-mac-pre-m7.tar.gz`（3 条目：`config.toml` + `serve/key.bin` + `serve/tokens.jsonl`；sha `fd8b55f9…`；**Mac relay 角色停用 ⇒ 无 `relay/relay.key`**，与设计 §4.0-C-7 的「若有」一致——已核 `relay/` 目录为空） | `tar czf /opt/homeway/backups/data-rs-pre-m7.tar.gz -C /opt/homeway/data-rs config.toml serve/key.bin serve/tokens.jsonl relay/relay.key`（阿里云 relay 双角色 ⇒ **有** `relay.key`） |
+
+**配置面（两台都要）：显式 `quic_listen = 41641`**
+
+```toml
+[serve]
+enabled = true
+listen = 41641
+quic_listen = 41641     # ← 新增行（缺省 = listen+1 = 41642 ⇒ 端口/防火墙/NAT/文档口径全换号）
+relay = "rl1…"
+```
+
+**回滚的配置面陷阱**：`quic_listen` 是 M1 新键，旧二进制 v0.2.3 的 `serve` 表是
+`deny_unknown_fields`（`serve_cli.rs`）⇒ **回滚 = 三件套「换二进制 + 还原 config（删该键）+ 启动」**，
+不许只换件。
+
+**台账跨代可读性（本实施棒已实测，§4.0-E 的可复跑校验）**：新出口会把 `hmw2` 行 append 进
+`serve/tokens.jsonl`；**旧 v0.2.3 二进制能读混合台账**——①`serve token` 探针：33 行 `hmw1` +
+1 行真 `hmw2`（带 `rpk` + `"Quic":true` 端点）⇒ **rc=0**，按旧格式重编码打印 `hmw1…`；
+②**整体启动**：同款混合台账起旧出口 ⇒ `serve 就绪：wg=:41681（…）tokens=34 key=8aee740b7220…`，
+零 `BadTokenLine`。**探针命令（设计 §4.0-E 的路径形态需订正）**：
+
+```bash
+# ⚠️ 设计 §4.0-E 原文 `cp -a <state>/serve /tmp/rollback-probe` 会把 serve 的内容平铺进探针目录，
+#    二进制找的是 <state>/serve ⇒ 报「台账为空」。正确形态（两层）：
+rm -rf /tmp/rollback-probe && mkdir -p /tmp/rollback-probe
+cp -a ~/.config/homeway-rs/serve /tmp/rollback-probe/     # ⇒ /tmp/rollback-probe/serve/*
+~/bin/homeway-rs.bak-v0.2.3 serve token --state /tmp/rollback-probe   # 期望 rc=0 且打印 hmw1…
+```
+
+### 12.3 取 token 的命令形态（**实测订正**：设计 §4.1/§4.2/§4.3 的 `sed` 管道在守护运行态取空）
+
+实测（2026-10-10，本机现役 v0.2.3 出口在跑）：`serve token --state <dir>` **两态输出不同**：
+
+| 形态 | stdout | stderr |
+|---|---|---|
+| **守护/统一进程在跑**（控制面可达：Mac 生产态、阿里云统一进程） | **裸 token 一行**（**无** `serve token：` 前缀） | `（已连 control.sock：serverVersion=… generation=… seq=…）` + `（端点：…；来源=ledger）` |
+| 守护不在跑（回落台账直读） | `serve token：<token>` + 来源 + 端点（三行中文） | — |
+
+⇒ 设计里的 `sed -n 's/^serve token：//p'` 在**运行态取空串**；配合设计的 `case "$TOK" in hmw2*)`
+fail-closed 断言只会「抓取失败 ⇒ 停」（**不会误用坏串**，这是 fail-closed 生效而非静默错），
+但会让 U1/U2/U3 卡在第一步。**两态通吃的取法（本节口径）**：
+
+```bash
+TOK=$(/usr/local/bin/homeway-rs serve token --state /opt/homeway/data-rs 2>/dev/null \
+      | sed -n 's/^serve token：//p;/^hmw[0-9]/p' | head -1)
+case "$TOK" in hmw2*) ;; *) echo "token 抓取失败（拿到：${TOK:0:8}…）——停"; exit 1;; esac
+```
+
+**凭证卫生**：`set +o history`（或注入后 `history -D`）；token 只经 shell 变量传递，**不落任何
+报告/commit/评审原文**（只留前缀 + 尾 4）；不从 `exit.log`/`unified-stdout.log`（无轮转）抄 token。
+
+### 12.4 三阶段执行（判据行 = `docs/reviews/M7-design.md` §4.1–§4.3 的 V1–V24）
+
+**U1 阿里云出口 → G2**（判据 V1–V9）：`pkill -x homeway-rs` 等退净（`Text file busy` 教训，§9/§10）
+→ 上传 `homeway-cli-v0.3.0-linux-amd64.tar.gz` + `sha256sum -c SHA256SUMS` + `--version` = `v0.3.0`
+→ 加 `quic_listen` → nohup 重起 → 逐条对 V1（**端口未退让**：`cache/quic_listen_port.txt == 41641`
+且 `grep -c '被占用' <日志> == 0`；E1 打的是配置值，**不能**用它判退让）/ V3（身份连续：`key=` 与
+`后端身份：` 标签机械 diff 逐字同）/ V4（relay 角色行 **现行 = `[::]:41741` 双栈**）/ V7（新 token `hmw2…`）/
+V8（中继互注零人工）。
+
+> **「中继就绪」样件的现行串（L-9 的更新说明）**：§2 的实录样件是 **v0.2.x 单栈形态**
+> （`中继就绪：0.0.0.0:41741（…）` 形态，`:122` 附近）；**M5 起 = 双栈**：
+> `中继就绪：[::]:41741（token 模式（中继 ID …）；…）`（v4 映射地址仍可连）。历史正文不动，本节给现行串。
+
+**U2 设备核 → G2**（判据 V10–V20，含 T11 真机档 V19 / DNS 真机轮 V20）：tier 侧 pin 前进 +
+出包（正式路径被 `log-index` 门拦时走手拷逃生口，须留痕）→ `force-stop` 后注入**阿里云**新 token
+（`--ps host_token`）→ 屏上点 VPN 授权 + 开「全局代理」→ 逐条对 V10–V18 + V19/V20 + V13b。
+
+**U3 Mac 出口 → G2**（判据 V21–V24 + 观察期）：临时件 + `mv` 原子换名 + `launchctl kickstart -k`
+（`KeepAlive=true` ⇒ **不要**用 `bootout`/`bootstrap`，失败会 crash-loop）→ 逐条对 V21–V24。
+
+### 12.5 回滚（按「回退手段序」从小到大）
+
+1. **设备切另一台 G2 出口**（一次粘贴；零出口动作、零核回退）——首选；
+2. **单台出口回退 + 同批核回退**：`cp ~/bin/homeway-rs.bak-v0.2.3 ~/bin/homeway-rs`
+   + `cp ~/.config/homeway-rs/config.toml.bak-pre-m7 ~/.config/homeway-rs/config.toml`（**删
+   `quic_listen`**）+ `launchctl kickstart -k gui/$(id -u)/me.zhaozhe.homeway-exit`
+   + 设备装回 G1 核 HSP（`~/homeway-rollback/libclientcore-g1.so` 两处手拷 → 重建 HSP → 覆盖装）
+   + 重注入旧 `hmw1` token（`~/homeway-rollback/tokens-mac-pre-m7.txt`）；
+3. **双台出口回退 + 核回退**：② + 阿里云同款三件套（`homeway-rs.bak-v0.2.3` +
+   `config.toml.bak-pre-m7` + 重起 nohup）。
+
+**旧 HSP 重建配方（第 6 件）**：`libclientcore-g1.so`（2,348,864 B）拷到 tier
+`tailcat/libs/arm64-v8a/` 与 `tailcat/src/main/cpp/prebuilt/arm64-v8a/` 两处（两处 md5 一致留证）
+→ `hvigorw --mode module -p module=tailcat@default … assembleHsp` → `hdc install -r` 覆盖装。
+
+### 12.6 执行实录（U1/U2/U3 现场填写）
+
+| 阶段 | 时刻 | 版本/身份读数 | 判据行 | 结论 |
+|---|---|---|---|---|
+| 前置（M7 实施棒，2026-10-10） | — | 七件在位（sha 见 §12.2）+ 台账跨代可读 rc=0 ×2 | — | 就绪 |
+| U1 阿里云 | （待填） | | V1–V9 | |
+| U2 设备核 | （待填） | | V10–V20 | |
+| U3 Mac | （待填） | | V21–V24 | |

@@ -23,7 +23,8 @@
 
 ```bash
 cd ~/Documents/projects/tier
-HOMEWAY_RS=/Users/zhaozhe/Documents/projects/homeway-rs-quic tools/tailcat/build-core.sh  # ① 核（必须最先）
+HOMEWAY_RS=/Users/zhaozhe/Documents/projects/homeway-rs tools/tailcat/build-core.sh  # ① 核（必须最先）
+#   注：M0–M3 的 worktree `…/homeway-rs-quic` 已合回 main 主检出 ⇒ 用 `/…/homeway-rs`（worktree 只作历史）
 . tools/ohos-env.sh                                    # ② 注入 node/JBR/SDK 与 $HVIGORW
 "$HVIGORW" --mode module -p module=tailcat@default  -p product=default assembleHsp  --no-daemon
 "$HVIGORW" --mode module -p module=terminal@default -p product=default assembleHsp  --no-daemon
@@ -65,6 +66,9 @@ $HDC shell "aa force-stop me.zhaozhe.tier"
 
 ## 3. 免点屏注入 token（M1 实测可用）
 
+> ⚠️ **本节为 M1/M5 历史实录**（含 `quic: ` 前缀、`token 端点 = :42651(WG)/:42652(QUIC)` 双端口形态）——
+> **现行口径见 §8**；本节串按历史原样保留（登记 = `docs/INTEROP-CRITERIA.md`「判据变更记录」）。
+
 ```bash
 $HDC shell "power-shell wakeup"          # 必须先唤醒屏幕，否则 aa start 报 10106102
 TOK=$(tools/local-rust-exit.sh token 1)  # 本地私有出口的 token（核侧从 stdout/`serve token` 取）
@@ -89,6 +93,9 @@ $HDC shell "uitest uiInput click <X> <Y>"                                       
 
 ## 5. 日志面
 
+> ⚠️ **本节为 M1/M5 历史实录**（含 `quic: ` 前缀、已删除的 `transport: 本世代 L3 承载 = quic`）——
+> **现行口径见 §8**；本节串按历史原样保留（登记 = `docs/INTEROP-CRITERIA.md`「判据变更记录」）。
+
 | 面 | 位置 / 命令 |
 |---|---|
 | 核日志（设备沙箱，隧道路径全判据） | `/data/app/el2/100/base/me.zhaozhe.tier/haps/entry/files/tailcat-tun.log` → `$HDC file recv <该路径> /tmp/tailcat-tun.log`（**用 `grep -a`**，文件含长行/二进制） |
@@ -106,3 +113,44 @@ $HDC shell "uitest uiInput click <X> <Y>"                                       
 1) 起本地私有出口（`tools/local-rust-exit.sh start 1`）→ 2) 装机（§2）→ 3) `power-shell wakeup` + 免点屏注入 token（§3）
 → 4) `uitest` 点 VPN 开关（§4）→ 5) 拉核日志 + 出口日志核对判据（§5）→ 6) 收工：关 VPN 开关、停本地出口、
 `git -C tier status --porcelain` 与开工前对照（零新增脏文件）。
+
+## 8. 现行口径（M7 起）
+
+> **本节 = 排障时该 grep 的串**（M7=生产切换期；§3/§5 的历史串与此处冲突时**以本节为准**）。
+> 承载换代（M5：WG → QUIC 单承载）后的形态一次写清，避免照 §3/§5 的旧串排障。
+
+**① 出口侧（`<state>/cache/debug.log` / 本地实例 `stdout.log`）**
+
+| 判据 | 现行串（逐字） |
+|---|---|
+| E1 就绪 | `serve 就绪：quic=:41641（配置端口；被占用会自动退让）tunnel=100.64.255.1 files=7802 term=7724 speedtest=7803 dns=true tokens=N key=<出口公钥前 12 hex>…`（**字段名 `quic=`**，此前为 `wg=`） |
+| 公共端口 | **公共端口 = QUIC 端口**；显式配置 `serve.quic_listen`（缺省 = `listen+1`）⇒ 生产口径写死 `quic_listen = 41641`；**退让**时 `cache/quic_listen_port.txt` 写实际值 + 一行 `⚠️ QUIC 监听端口 … 被占用 —— 改用 …` |
+| E-q6 出口 QUIC 面 | `出口 QUIC 面就绪（单承载；migration=true，initial_mtu=1400）` |
+| E-q1 端点就绪 | `端点就绪（[::]:41641，migration=true，initial_mtu=1400，datagram 缓冲 1048576B）`（**无 `quic: ` 前缀**） |
+| E-q2 准入 | `连接采纳 dev=<8hex> tun=<隧道 IP> ← <源地址>`；路径变化：`路径变更 dev=<8hex> <旧> → <新>` |
+| E4 DNS 面 | `dns 代答就绪：tunnel=100.64.255.1:53（UDP+TCP）resolve=100.64.255.1:5300（TCP）upstream=…`；计数行 `dns: q=N qtcp=N resp=N filter=N trunc=N fallback=N fail=N drop=N malformed=N aaaa-mixed=N fakeip=N`（**60s 周期**） |
+| E19 身份（连续性锚） | `后端身份：标签 <16hex> ｜公钥 <12hex>…`（换代前后**逐字不变**——身份根 = `serve/key.bin`，复用不轮换） |
+| 中继角色 | `中继就绪：[::]:41741（token 模式（中继 ID …）；…）`（**双栈**；v0.2.x 的 `0.0.0.0:41741` 单栈形态已退役）+ `中继控制面：TCP 0.0.0.0:41741 就绪` |
+| E25 收线 | `出口收线（连接数 N → 0，用时 …）` |
+| 服务面 | `intercept: tcp transit …（dialok）`（L3 过境）/ `peer: + dev=…` / `peer: ~ dev=… refresh` |
+
+**② 设备侧核日志（`tailcat-tun.log`）——单承载行集**
+
+- `传输：新栈（QUIC 岛）`（**不再有** `wg-native-stack`）
+- `岛已建连（候选 N 个，胜出 直连 <ip:port>，耗时 …ms）—— L3 承载 = 岛`
+- `warmup pong: 就绪（判据=quic）` → `attached（数据面已接管 fd=…，L3 直通）` → `link: via=direct ep=<ip:port> rtt=…ms`
+- 恢复族：`链路快探失败（…）` / `链路重连完成（原因=…，耗时 …ms）`（**T_recv ≤ 3.5s**，在用档）/ `路径变更` / `迁移未确认`
+- 收工：`岛收工`（**无**「已收工」字面量）
+
+**③ 已退役、不得再出现的串**（出现即回落世代或误读）
+
+- `transport: 本世代 L3 承载 = quic`（A/B 开关行，M5 删除；已是 e2e **禁串**）
+- `quic: ` 前缀形式的端点/迁移行（M5 批量去前缀）；`wg=` 字段；`回落 WG` / `尝试 WG 兜底` / `按承载分档`
+- `hmw1` 客户端 token（**存量一律失效**——撞到就是「版本拒 + 换代归因」两段式报错：哨兵
+  `homeway/token: 不支持的 token 版本: hmw1` + 归因「存量 token 已失效…请重新索取后重新粘贴」）
+- WG 档服务腿 `intercept: tcp exempt`（服务面改走 `STREAM[tag]`）
+
+**④ token / 端口速查（M7 起）**：客户端 token 前缀 **`hmw2`**（中继凭据 `rl1` 不变）；本地 Rust
+出口实例 `n` 的**公共端口 = QUIC 端口 = 42651+n**（不再是「WG 4265n + QUIC 4265n+1」双端口）；
+取 token 用 `tools/local-rust-exit.sh token <n>`（**守护在跑时输出是裸 token 一行、不在跑时带
+`serve token：` 前缀**——两态通吃用 `sed -n 's/^serve token：//p;/^hmw[0-9]/p'`）。

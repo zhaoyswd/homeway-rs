@@ -12,6 +12,13 @@
 > **必须**更新本文件，并在 roadmap 提交信息里注明。升级前此节描述的流程已执行两次
 > （`621fe0e` → `d4148f6`），见下方「R7 重锚记录」。
 
+## 换代后对齐义务范围（2026-10-10，M7 文档收束）
+
+**Go 基线 = 只读历史参照 / oracle**；**token 与 WG 承载面**的对齐义务随 QUIC 换代（M5）终止——
+`fixtures/vectors/token.json`（Go 冻结向量）已退役，代之以本仓自产 `token_hmw2.json`；
+仍在对齐面内的 = term / files / 控制面 / relaywire 等**保留面** + 判据行政策（登记制，
+见 `docs/INTEROP-CRITERIA.md`「判据变更记录」）。
+
 ## 锚定值
 
 | 项 | 值 | 采集方式 / 备注 |
@@ -23,7 +30,8 @@
 | **Go 版本** | go.mod：`go 1.24.0` + `toolchain go1.24.5`；本机构建一律 `GOTOOLCHAIN=go1.24.5`（离线 toolchain 已在 `~/go/pkg/mod/golang.org/toolchain@v0.0.1-go1.24.5.darwin-arm64`） | `/usr/local/go` 基底 1.21.6，不带 GOTOOLCHAIN 必失败 |
 | **契约台账** | `contracts/ledger.jsonl` **422 行 = 422 单元**（每行一个词表单元，字段 family/unit/value/faces/status/spec） | ROADMAP 附录 A 写 349 为立项盘点时旧值，**以本表 422 为准**；spec 字段为台账内逻辑分组名（如 `daemon-control-plane`），不是文件路径 |
 | **term golden** | `pkg/term/testdata/frames.v1.jsonl`（唯一 testdata 文件） | 拷贝入 `fixtures/` 时记来源 hash |
-| **关键输入 sha256** | `contracts/ledger.jsonl` = `0ae1d104ec1eeb546d61d7352052fccb062d654232e17f0b03adbe4323c2469f`；`third_party/libghostty-vt/prebuilt/darwin-arm64/lib/libghostty-vt.a` = `7202ac3bf6bff5259493fffd54e964c9e27feedf4d06d445f477ef7c3517ad21` | 升级基线时核对（vt 库换了 = 需重验构建） |
+| **关键输入 sha256** | `contracts/ledger.jsonl` = `0ae1d104ec1eeb546d61d7352052fccb062d654232e17f0b03adbe4323c2469f`（**仍有效**——词表门 `tools/check-vocab.sh` 引用）；`third_party/libghostty-vt/prebuilt/darwin-arm64/lib/libghostty-vt.a` = `7202ac3bf6bff5259493fffd54e964c9e27feedf4d06d445f477ef7c3517ad21` | 升级基线时核对（vt 库换了 = 需重验构建） |
+| **已退役的输入** | `fixtures/vectors/token.json`（Go 冻结 token 向量）= **已退役（M5 S5t）**——`hmw1` 载体换代后不再有产出面，代之以本仓自产 `fixtures/vectors/token_hmw2.json` | 登记见 `docs/INTEROP-CRITERIA.md` L-12 |
 | **vt 静态库来源** | dev 仓 `third_party/libghostty-vt/prebuilt/darwin-arm64/`（2026-10-01 构建，存在）⇒ 直接拷入 baseline 克隆 | tier submodule 检出里同款也在，互为备份 |
 
 ## tier 侧在途 openspec change 清单（11 个，2026-10-02）

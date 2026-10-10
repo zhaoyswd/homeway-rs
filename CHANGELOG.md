@@ -1,5 +1,39 @@
 # Changelog
 
+## v0.3.0（2026-10-10）
+
+**传输层换代：WG → QUIC 单承载（M0–M7）**——**破坏性变更**，客户端与出口必须同代：
+
+- **单承载 QUIC**（quinn 0.11 + rustls 0.23 RPK）：出口唯一公共 UDP 端口，`migration=true`
+  + MTU 1400（DPLPMTUD）；一条连接 = 一台设备。
+- **token 换代 `hmw1` → `hmw2` 段容器**：**存量 token 一律失效**（版本拒 + 可行动归因）；
+  新增 `rpk` 段（出口 RPK 裸公钥）与端点类 `type=2`（QUIC）；客户端与出口必须同代
+  （交叉两格硬失败）。中继 `rl1` wire 逐字节不变。
+- **RPK 钉定 + 四帧准入**（Hello/Challenge/Proof + 刷新）与设备表语义（devTag 钉定、表满闸）。
+- **服务流 `STREAM[tag]`**：files / term / speedtest / dial / probe 走 QUIC 双向流
+  （端口 → tag 映射保留原值仅作映射输入）；出口侧服务入口 = UDS（调试面）+ STREAM。
+- **WG 面全量退役**：`wgcore` / `wtransport` / `boringtun` / `tools/ring-shim` /
+  `[patch.crates-io]` / 旧恢复阶梯（`RECOVER R1–R3`）整体删除（净删 ≈13,269 行）；
+  `tools/check-wg-removed.sh` 十条常驻门防复活。
+- **恢复阶梯重写**（QUIC 档）：快探（700ms 预算）→ 复探（×2）→ **M（迁移/Rebind，优先，
+  成功即保连接）** → R（重连/重赛跑）→ **B 门**（连续 2 次 R 失败且窗 ≥10s 才上报世代重建）；
+  `T_recv ≤ 3.5s`（在用档；待机档 60s 拍不承诺）。
+- 构建档位改 **LTO + `codegen-units=1`**：OHOS `.so` = **2,958,896 B = 0.779× 判据**
+  （≤3,800,000 B）；M6.7 修复后 2,968,016 B。
+- 配置新增 **`serve.quic_listen`**（缺省 = `listen + 1`）：**回滚到 v0.2.x 必须删除该键**
+  （旧二进制 `deny_unknown_fields` 拒启）。承载三键（`HOMEWAY_TRANSPORT` / `serve.quic` /
+  `tunConfig.transport`）退役。
+- 真机读数（M5/M6/M6.7 同设备同仪器）：T2 热 **0.893×**（**未达 0.95×，已登记**，
+  `docs/PERF-AB.md` §9.20.11）/ T6 1.36× / 断线恢复 **2.447s·0.918s** / 内存五格过
+  （+3 MiB 显式 socket 缓冲入账）/ 体积 0.779×。
+- 判据面：`docs/INTEROP-CRITERIA.md` 新增 M0–M7 各批登记（含 M7 补登 7 条：M6.5 TUN 读面
+  形态 + 写阻塞语义偏离 / M5 C8 值域收窄 / `SessionSnapshot::stats` 来源换岛 /
+  `--dead-direct`·`--loopback-only` 承载无关 / `daemon::StreamConn` 写停滞 30s→10s /
+  M6.7 socket 缓冲与内存账 / **M7 S1 旧 token 换代归因**）。
+- 回滚件（生产切换前置，**七件**，切换/回滚步骤见 `docs/DEPLOY-RUST-EXIT.md` §12）：
+  两台旧二进制 + 两台 `config.toml` + plist + 两枚旧 `hmw1` token + G1 核 `.so` +
+  旧 HSP 重建配方 + 两台 state tar（`key.bin`/`tokens.jsonl`/`relay.key`）。
+
 ## v0.2.3（2026-10-07）
 
 拦截层单线程 reactor 简化批（出口重拨 OS socket 从 8-worker 池收进单事件循环——
