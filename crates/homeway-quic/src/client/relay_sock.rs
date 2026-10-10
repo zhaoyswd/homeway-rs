@@ -326,13 +326,6 @@ impl ClientSock {
         ))
     }
 
-    /// 单段接收（**M6.5 实测结论**：`recvmmsg` 多段接收在本设备**无增益**——每包成本由
-    /// 内核每包处理（skb 出队/拷贝）主导，不是系统调用进出；实测每包 22.5µs（单段）
-    /// vs 28.1µs（8 段批），故**不启用多段**、保持 QT-M1 的段能力 = 1 登记）。
-    fn recv_batch(&self, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> io::Result<usize> {
-        self.recv_one(bufs, meta)
-    }
-
     /// 单段接收（回退路径；填 `meta[0]`）。
     fn recv_one(&self, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> io::Result<usize> {
         let (len, addr) = self.io.try_recv_from(&mut bufs[0][..])?;
@@ -417,12 +410,19 @@ impl AsyncUdpSocket for ClientSock {
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
-            // **M6.5 多段接收**（真机逐段表：每包一次 recvmsg ≈ 22µs CPU ⇒ 一次系统调用
-            // 收一批）：`recvmmsg` 收至多 [`RECV_SEGMENTS`] 条；不支持则退单段路径。
-            let recvd = match self.recv_batch(bufs, meta) {
+            // 单段接收（**M6.5 实测结论**：`recvmmsg` 多段在本设备无增益——每包成本由
+            // 内核每包处理主导，不是系统调用进出；实测每包 22.5µs 单段 vs 28.1µs 8 段批，
+            // 故保持 QT-M1 的段能力 = 1 登记；本循环内联原 `recv_batch` 间接层）。
+            let recvd = match self.recv_one(bufs, meta) {
                 Ok(v) if v > 0 => v,
-                // 无数据（含空返）⇒ 回 `poll_recv_ready` 重新挂等待
-                Ok(_) | Err(_) => continue,
+                // 无数据（EAGAIN/WouldBlock）⇒ 回 `poll_recv_ready` 重新挂等待
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                // **持久性错误上抛**（2026-10-10 审查 低-3）：原 `Err(_) => continue` 在
+                // 就绪位因驻留错误（fd 关闭后的 EBADF 等）恒 Ready 时 = 单线程 runtime 上
+                // 的忙转 + 全岛饿死；对齐出口面同款分类——WouldBlock 续等、其余交 quinn
+                // 的接收错误处置路径。
+                Err(e) => return Poll::Ready(Err(e)),
+                Ok(_) => continue,
             };
             // 剥壳 + 跳过忽略帧（有效载荷前移到各自的 buf 头部；`meta` 按序紧凑）
             let mut out = 0usize;

@@ -525,17 +525,36 @@ impl Read for QuicReadHalf {
             return Ok(n);
         }
         let id = self.shared.id;
-        match island_stream_cmd(&self.shared.island, |reply| Cmd::StreamRead { id, reply }, None) {
-            Ok(data) => {
-                let n = data.len().min(out.len());
-                out[..n].copy_from_slice(&data[..n]);
-                self.pending = PendingBuf::new(data);
-                self.pending.off = n;
-                Ok(n)
+        // 空块（0B 的 STREAM 帧）**不是** EOF——续读有界（与 [`read_dial_ack`] 同款；
+        // 2026-10-10 审查：原对空块直接 `Ok(0)`，而 `io::Read` 的 `Ok(0)` = 通道关 ⇒
+        // 一个空块就会被消费者误判成流提前结束）。
+        let mut empty_chunks = 0u32;
+        loop {
+            let data = match island_stream_cmd(
+                &self.shared.island,
+                |reply| Cmd::StreamRead { id, reply },
+                None,
+            ) {
+                Ok(data) => data,
+                // 对端 FIN / 白名单外的复位 / 本端关流 ⇒ EOF（§1.6 的 EOF 同形性）
+                Err(StreamErr::Closed) => return Ok(0),
+                Err(e) => return Err(stream_err_to_io(e)),
+            };
+            if data.is_empty() {
+                empty_chunks += 1;
+                if empty_chunks > MAX_EMPTY_ACK_CHUNKS {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("QUIC 服务流：连续 {MAX_EMPTY_ACK_CHUNKS} 个空块（协议面无进展）"),
+                    ));
+                }
+                continue;
             }
-            // 对端 FIN / 白名单外的复位 / 本端关流 ⇒ EOF（§1.6 的 EOF 同形性）
-            Err(StreamErr::Closed) => Ok(0),
-            Err(e) => Err(stream_err_to_io(e)),
+            let n = data.len().min(out.len());
+            out[..n].copy_from_slice(&data[..n]);
+            self.pending = PendingBuf::new(data);
+            self.pending.off = n;
+            return Ok(n);
         }
     }
 }

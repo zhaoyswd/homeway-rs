@@ -888,6 +888,10 @@ fn adopt(
     // 恢复动作判据（旧 `tun.is_some()` 在宿主会话恒假 ⇒ 阶梯被结构性关闭）。
     st.admitted = true;
     st.snap_sync_last = None; // 关键转换：快照立即到期（via/ep/connections 不滞后；节流见 housekeeping ④）
+    // 撤旧连接的迁移保持窗（2026-10-10 审查 中-4）：窗的基线（rx0 = 旧连接的累计
+    // udp_rx）对新连接无意义——保留会让它拿新连接的收包数与旧基线比，长会话下必出
+    // 假「未确认」⇒ 对健康连接发 M/R。
+    st.watch = None;
     // M6.5：丢弃上报口只在此构造一次（热路径零新分配）
     if st.drop_note.is_none() {
         st.drop_note = Some(drop_note_one(ctx));
@@ -1242,6 +1246,10 @@ async fn handle_cmd(
             (*ctx.logf)(&msg);
             ctx.unhealthy(REASON_FD);
             st.tun = None;
+            // **attached 位刻意不复位**（2026-10-10 审查 低-1 的裁定：保持既有语义——
+            // 测试面三处钉住此形态）：fd 死 ⇒ 本岛已上报不健康，恢复路径 = 世代层**整岛
+            // 重建**（App 换新 fd 配新岛），不是同岛换 fd 重附加；`attached` 与 `tun`
+            // 的暂态不对称只在「unhealthy 回调缺席」的防御窗口内可见。
             // 旧泵的消费者（写线程）已退：它在下一包 `try_push` 归 `Gone` 时自退（S6 的 A3）；
             // 清防重位让"同连接再附加"能起新泵（老泵已不可写，不会与新泵争抢同一队列）。
             st.pump_conn = None;
