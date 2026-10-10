@@ -57,6 +57,10 @@ pub(crate) const REAP_THREAD: &str = "hw-quic-reap";
 /// 命令等待节拍上限（镜像 `wgcore` 的 `POLL_CAP = 250ms`）：无命令时周期性回看 stop 位
 /// （拍内务——刷新/迁移保持检测/快照同步——挂在这一拍上）。
 const TICK: Duration = Duration::from_millis(250);
+/// 快照同步（housekeeping ④）的时间节流（2026-10-10 审查 中-3）：拍内务逐命令执行
+/// （上行热路径 = 每包一遍）而快照只需匹配同步面的轮询率 ⇒ 距上次同步 ≥ 本间隔才做；
+/// 连接采纳/断开等关键转换置「立即到期」（见 [`DriverState::snap_sync_last`]）。
+const SNAP_SYNC_INTERVAL: Duration = Duration::from_millis(200);
 /// 不健康原因（判据语义取值集 `{patrol, fd, panic, stop}` 的一员）。
 const REASON_PANIC: &str = "panic";
 /// QUIC 承载的巡检判死分类（设计 §2.5：**归既有取值 `patrol`**，不新增枚举值）。
@@ -607,6 +611,9 @@ struct DriverState {
     /// （`Cmd::StreamWrite` 回执 `n > 0`），两档合成「有出站即新鲜」——与 `tun` 档同
     /// `ProbeTuning::in_use_fresh` 窗。
     last_stream_out_at: Option<std::time::Instant>,
+    /// 快照同步（housekeeping ④）的节流基准：`Some(at)` = 上次同步时刻，`None` = 立即
+    /// 到期（连接采纳/断开等关键转换置 `None`，保 via/ep/connections 不滞后）。
+    snap_sync_last: Option<Instant>,
 }
 
 /// M（换本地 socket）动作的记账（§3.1 的 `from → to` 与确认探活的耗时）。
@@ -670,6 +677,7 @@ fn run_driver(
             dead_logged: false,
             admitted: false,
             last_stream_out_at: None,
+            snap_sync_last: None,
             drop_note: None,
             drop_note_n: None,
         };
@@ -879,6 +887,7 @@ fn adopt(
     // M5 §2.4-A-2 ①：本世代「曾完成准入」位（`Live` 只在四帧准入之后构造）——连接死的
     // 恢复动作判据（旧 `tun.is_some()` 在宿主会话恒假 ⇒ 阶梯被结构性关闭）。
     st.admitted = true;
+    st.snap_sync_last = None; // 关键转换：快照立即到期（via/ep/connections 不滞后；节流见 housekeeping ④）
     // M6.5：丢弃上报口只在此构造一次（热路径零新分配）
     if st.drop_note.is_none() {
         st.drop_note = Some(drop_note_one(ctx));
@@ -969,6 +978,8 @@ async fn housekeeping(
             st.dead_logged = true;
             (*ctx.logf)("连接已断 —— 交快探阶梯（M/R/B；§3.1）保世代重连，不再就地拆世代");
         }
+        // 关键转换：快照立即到期（节流见 ④）
+        st.snap_sync_last = None;
         // M3：在册服务流一并作废（读回 EOF / 写快速失败；§1.6 的 EOF 同形性——
         // 与今天 `stackb` 在连接死时的表现一致，调用方按需重开）
         let n = st.streams.clear_on_connection_loss();
@@ -1000,6 +1011,7 @@ async fn housekeeping(
             st.live = None;
             st.watch = None;
             st.pump_conn = None;
+            st.snap_sync_last = None; // 关键转换：快照立即到期（节流见 ④）
             // M5 §2.4-A-2 ①：同 ① 支——判据 = 「曾完成准入」（`live` 刚被置 None ⇒ 用它恒假）。
             if st.admitted {
                 let send = send_face(face, st.ladder.tuning().send_err_fresh);
@@ -1056,8 +1068,12 @@ async fn housekeeping(
             ladder_step(st, ctx, face, jobs, LadderStep::Probe { round, budget });
         }
     }
-    // ④ 快照同步（via/ep/rtt/mtu/candidates 一律由驱动态派生；local 取端点现值）
-    {
+    // ④ 快照同步（via/ep/rtt/mtu/candidates 一律由驱动态派生；local 取端点现值）。
+    //    **时间节流**（2026-10-10 审查 中-3）：拍内务逐命令执行（上行热路径 = 每包一遍），
+    //    而本块每次要拿 4 把跨线程锁（snapshot/stats×2/streams）+ 1 次 String 分配——
+    //    快照只需匹配同步面的轮询率 ⇒ 距上次 ≥[`SNAP_SYNC_INTERVAL`] 才做；关键转换
+    //    （①连接死/②刷新失败/采纳）置 `None` 强制到期。
+    if st.snap_sync_last.is_none_or(|at| at.elapsed() >= SNAP_SYNC_INTERVAL) {
         let mut s = lock_unpoison(&ctx.snapshot);
         s.candidates = st.cands.len();
         s.mirrors = st.mirrors;
@@ -1109,6 +1125,7 @@ async fn housekeeping(
         s.ladder_fail_streak = st.ladder.fail_streak();
         s.ladder_jitter_streak = st.ladder.jitter_streak();
         s.ladder_action = st.ladder.last_action.to_owned();
+        st.snap_sync_last = Some(Instant::now());
     }
     // ⑤ 「窄路径不可用」判据（mds 变小/连接换过都要重判；S2-4）
     check_narrow_path(st, ctx);
@@ -1236,6 +1253,8 @@ async fn handle_cmd(
             *lock_unpoison(&ctx.on_event) = Some(h);
         }
         Cmd::SetCandidates { cands } => {
+            // 命令频次（非每包）：快照立即到期（节流见 housekeeping ④）
+            st.snap_sync_last = None;
             let n = cands.len();
             // S2-7：候选面同时喂 socket 的中继表（发送侧包封的路由键——必须在任何
             // `connect` 之前装配，否则中继候选的握手包会以裸包发出）
@@ -1315,6 +1334,8 @@ async fn handle_cmd(
         // 且自记账通过后不阻塞）；`StreamWrite` 走同步的 `Streams::write`（非阻塞接纳），
         // 真正的 `write_all().await` 全在写者任务里。
         Cmd::StreamOpen { tag, reply } => {
+            // 命令频次：快照立即到期（streams_* 计数不滞后；节流见 housekeeping ④）
+            st.snap_sync_last = None;
             let Some(live) = st.live.as_ref() else {
                 st.streams.note_refused(tag, StreamErr::ConnectionLost);
                 let _ = reply.send(Err(StreamErr::ConnectionLost));
@@ -1356,6 +1377,8 @@ async fn handle_cmd(
             }
         }
         Cmd::StreamWrite { id, data, reply } => {
+            // 命令频次：快照立即到期（节流见 housekeeping ④）
+            st.snap_sync_last = None;
             // **同步**：非阻塞接纳（`n` 由待发队列余量给出）⇒ 绝不 await 到写满
             let r = st.streams.write(id, data);
             // M5 §2.4-A-2 ⑤：STREAM 面需求信号（「在用档」判据的宿主会话来源）——
@@ -1365,23 +1388,31 @@ async fn handle_cmd(
             }
             let _ = reply.send(r);
         }
-        Cmd::StreamRead { id, reply } => match st.streams.slot_of(id) {
-            Some(slot) => {
-                let streams = Arc::clone(&st.streams);
-                jobs.spawn(guard_job(PanickedJob::Stream, async move {
-                    streams::read_task(slot, reply, streams).await;
-                    Job::StreamDone
-                }));
+        Cmd::StreamRead { id, reply } => {
+            // 命令频次：快照立即到期（节流见 housekeeping ④）
+            st.snap_sync_last = None;
+            match st.streams.slot_of(id) {
+                Some(slot) => {
+                    let streams = Arc::clone(&st.streams);
+                    jobs.spawn(guard_job(PanickedJob::Stream, async move {
+                        streams::read_task(slot, reply, streams).await;
+                        Job::StreamDone
+                    }));
+                }
+                None => {
+                    let _ = reply.send(Err(StreamErr::Closed));
+                }
             }
-            None => {
-                let _ = reply.send(Err(StreamErr::Closed));
-            }
-        },
+        }
         Cmd::StreamShutdown { id, reply } => {
+            // 命令频次：快照立即到期（节流见 housekeeping ④）
+            st.snap_sync_last = None;
             let r = st.streams.shutdown(id).map(|_tag| ());
             let _ = reply.send(r);
         }
         Cmd::StreamClose { id, reply } => {
+            // 命令频次：快照立即到期（节流见 housekeeping ④）
+            st.snap_sync_last = None;
             let r = st.streams.close(id).map(|_slot| ());
             let _ = reply.send(r);
         }
