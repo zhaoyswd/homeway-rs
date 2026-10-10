@@ -138,7 +138,10 @@ M1 门槛（≤ 40B/包）：WG 32B / QUIC 30.13B 均在门槛内。**产品后�
   **⇒ 已被门槛表取代（M6/M6.7，2 次用户批准）**：**单连接 ≤ +640K / 每设备 ≤ 96K /
   32 设备 ≤ +3.1 MiB**——现行门槛真源 = `docs/QUIC-ROADMAP.md` 的门槛表（本条只作历史锚）。
   **M6.7 客户端显式 socket 缓冲（入账项）**：`ClientSock::open` 设 **`SO_RCVBUF=2 MiB`（下行接收）
-  / `SO_SNDBUF=1 MiB`（上行发送）**——**设定值 +3 MiB**（Linux 内核口径 ×2 ⇒ 记账上界 +6 MiB）；
+  / `SO_SNDBUF=1 MiB`（上行发送）**——**设定值 +3 MiB**（Linux 内核口径 ×2 ⇒ 记账上界 +6 MiB；
+  **口径**：每岛一枚活跃 socket，`rebind` 瞬间新旧短暂并存；**本表四格测的是 `tools/quic-ab/arms/`
+  独立探针（不含 `homeway-quic` 的 `ClientSock`）⇒ 本项是「设定值入账」而非本表测出值**，
+  产品侧实测面 = 真机 App Pss / U2-U3 观察期）；
   观测行 = `岛 socket 缓冲（SO_RCVBUF（下行接收）|SO_SNDBUF（上行发送））：设定 {want}B，读回 {got}B…`；
   判据面登记 = `docs/INTEROP-CRITERIA.md` 登记表 2026-10-10（M7 补登）条
   〔M6.7 实读：修前 `RcvbufErrors +17…+32/轮` ⇒ 修后六轮全 0、T2 热 11.27 → 20.14 MB/s〕。
