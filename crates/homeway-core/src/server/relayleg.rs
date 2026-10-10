@@ -121,13 +121,25 @@ pub fn spawn_relay_leg(
     stop: Arc<AtomicBool>,
     logf: Logf,
 ) {
-    std::thread::Builder::new()
+    // F7 纪律（2026-10-10 审查 中-3 补齐）：spawn 失败不得静默——线程起不来 ⇒ 出口
+    // 不向中继注册，而 token 打印面照常并入中继端点 ⇒ 客户端拿到一条静默失效的中继路径。
+    if let Err(e) = std::thread::Builder::new()
         .name("homeway-relayleg".into())
         .stack_size(512 * 1024)
-        .spawn(move || {
-            run_relay_leg(sock, relay, priv_key, secret, events, &stop, &logf);
+        .spawn({
+            let logf = Arc::clone(&logf);
+            move || {
+                run_relay_leg(sock, relay, priv_key, secret, events, &stop, &logf);
+            }
         })
-        .ok();
+    {
+        crate::syncutil::log_spawn_failed(
+            &logf,
+            "homeway-relayleg",
+            &e,
+            "出口将不向中继注册（经中继的路径不可用）",
+        );
+    }
 }
 
 fn run_relay_leg(
@@ -274,13 +286,25 @@ pub fn spawn_relay_ctl(
     stop: Arc<AtomicBool>,
     logf: Logf,
 ) {
-    std::thread::Builder::new()
+    // F7 纪律（2026-10-10 审查 中-3 补齐）：同 spawn_relay_leg——控制面起不来 ⇒
+    // SESSION/RELEASE 无法下发，中继数据面注定闲置，必须记行可查。
+    if let Err(e) = std::thread::Builder::new()
         .name("homeway-relayctl".into())
         .stack_size(512 * 1024)
-        .spawn(move || {
-            run_control_loop(relay, priv_key, secret, cmd_tx, &stop, &logf);
+        .spawn({
+            let logf = Arc::clone(&logf);
+            move || {
+                run_control_loop(relay, priv_key, secret, cmd_tx, &stop, &logf);
+            }
         })
-        .ok();
+    {
+        crate::syncutil::log_spawn_failed(
+            &logf,
+            "homeway-relayctl",
+            &e,
+            "中继控制面（SESSION/RELEASE）不可用，经中继的承载将无法建立",
+        );
+    }
 }
 
 fn run_control_loop(
