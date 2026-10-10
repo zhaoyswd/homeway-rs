@@ -1465,6 +1465,9 @@ fn ladder_step(
     jobs: &mut JoinSet<Job>,
     mut step: LadderStep,
 ) {
+    // 阶梯动作/结论 = 关键转换：快照立即到期（`ladder_fail_streak`/`ladder_action` 等
+    // 读数不得滞后——e2e「动作行落纸即读快照」的形态靠这行保住；节流见 housekeeping ④）。
+    st.snap_sync_last = None;
     // **同步链步数安全网**（代码门 r18 ②-1 的配套）：正常链 ≤2 步（M/R ⇒ 确认），但
     // 「候选为空 × M/R 轮转」这类结构性异常会在同步路径上环回 ⇒ 超限即按 B 收（上报
     // 不健康交世代层），**不得**让岛线程自旋或停在单飞态。
