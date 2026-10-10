@@ -55,10 +55,22 @@ jobs:
         with:
           key: ${{ matrix.target }}
       - run: rustup target add ${{ matrix.target }}
+      # M0 起依赖面含 ring 0.17（QUIC 栈的 rustls 后端）⇒ **musl 目标不再「纯 Rust」**：
+      # ring 的 C/asm 面需要真 C 编译器（v0.3.0 首跑实测 `failed to find tool
+      # "aarch64-linux-musl-gcc"`）。两台 runner 的宿主架构与目标架构同族
+      # （ubuntu-latest = x86_64 / ubuntu-24.04-arm = aarch64）⇒ 原生 `musl-gcc` 即可。
+      - name: musl C 工具链（ring 0.17 的 C/asm 面）
+        if: endsWith(matrix.target, '-musl')
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq musl-tools
       - name: 构建（版本注入 HOMEWAY_CLI_VERSION）
         run: cargo build --release --target ${{ matrix.target }} --locked -p homeway-cli
         env:
           HOMEWAY_CLI_VERSION: ${{ github.ref_name }}
+          # 显式点名 cc-rs 用 musl 包装器（缺省会去找 `<arch>-linux-musl-gcc`）
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
       - run: strip target/${{ matrix.target }}/release/homeway-cli
       - name: 静态核验（musl 面必须静态链接）
         if: endsWith(matrix.target, '-musl')
