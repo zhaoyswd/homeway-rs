@@ -672,12 +672,14 @@ fn server_bad_frame_gets_goodbye_and_disconnect() {
     bad.extend_from_slice(&(2u32 << 20).to_be_bytes());
     s.write_all(&bad).unwrap();
     // 读到 goodbye(bad_frame) 后 EOF。
-    // ⚠️ 期限用 `short()*3`：macOS CI runner 高负载下 lib 套件实测 662s（本地 ~20s），
-    // 5s 上界会让 goodbye 尚未到达就判负（`rest` 空 ⇒ 索引越界，CI 实测）；只判上界、不下调。
+    // ⚠️ 循环条件 = **读到 EOF 或上界**，不得用 `got.len() < N` 这类启发式：welcome 帧长度随
+    // 环境变（exe 路径等），首个 read 就可能把它读满 ⇒ 启发式会**提前退出**、goodbye 根本没读
+    // （`rest` 空 ⇒ 索引越界；本地 welcome 恰好短、CI 上更长 ⇒ 环境相关红）。
+    // 期限用 `short()*3`：macOS CI 高负载下 lib 套件实测 662–791s（本地 ~20s）。
     let mut buf = [0u8; 128];
     let mut got = Vec::new();
     let deadline = std::time::Instant::now() + short() * 3;
-    while got.len() < 64 && std::time::Instant::now() < deadline {
+    while got.len() < 4096 && std::time::Instant::now() < deadline {
         match s.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => got.extend_from_slice(&buf[..n]),
