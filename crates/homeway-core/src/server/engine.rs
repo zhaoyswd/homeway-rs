@@ -773,10 +773,9 @@ impl ServeEngine {
                     );
                 }
                 None => {
-                    (logf)(&format!(
-                        "⚠️ --relay 注册腿未起（公共端口 socket 副本缺席——端口 bind 失败或副本失败）\
-                         —— 中继端点不并入 token，出口仅直连形态运行"
-                    ));
+                    (logf)(
+                        "⚠️ --relay 注册腿未起（公共端口 socket 副本缺席——端口 bind 失败或副本失败）—— 中继端点不并入 token，出口仅直连形态运行",
+                    );
                     relay_ep = None;
                     relay_wanted = false;
                 }

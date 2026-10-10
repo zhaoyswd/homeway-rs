@@ -785,7 +785,7 @@ fn run_phases(
             return Err(SpeedtestError::Cancelled);
         }
         let c = dial()?;
-        crate::syncutil::lock_unpoison(&conns).push(std::sync::Arc::clone(&c));
+        crate::syncutil::lock_unpoison(conns).push(std::sync::Arc::clone(&c));
         down_conns.push(c);
     }
     if let Some(l) = live {
@@ -905,7 +905,7 @@ fn run_phases(
             return Err(SpeedtestError::Cancelled);
         }
         let c = dial()?;
-        crate::syncutil::lock_unpoison(&conns).push(std::sync::Arc::clone(&c));
+        crate::syncutil::lock_unpoison(conns).push(std::sync::Arc::clone(&c));
         up_conns.push(c);
     }
     if let Some(l) = live {
