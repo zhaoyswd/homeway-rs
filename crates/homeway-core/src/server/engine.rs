@@ -731,41 +731,56 @@ impl ServeEngine {
         // 重新解析一次拿完整 RelayArg（addr + secret；上面的 relay_ep 只端点面）
         let relay_arg = relay_ep.as_ref().and_then(|_| super::relayleg::parse_relay_arg(cfg.relay.as_deref().unwrap_or_default()).ok());
         if let Some(arg) = relay_arg {
-            let relay_sock = relay_sock_dup
-                .take()
-                .expect("公共端口 socket 副本（注册腿与公共端口同源的硬约束）");
-            // 驱动线程 → relay-leg 线程事件通道（type=3 控制帧；try_send 不阻塞驱动线程）。
-            // **两个来源同灌一条通道**：①腿 socket 上的 kind=3（`bind.set_on_leg_frame`）；
-            // ②公共端口上的 kind=3（中继对**注册腿** Hello 的回执——M5 起注册腿从公共端口
-            // 发出 ⇒ 回执回到公共端口，由 `pubface` 的钩子分派）。
-            let (leg_tx, leg_rx) = mpsc::sync_channel::<super::relayleg::LegEvent>(64);
-            let leg_tx_frame = leg_tx.clone();
-            bind.set_on_leg_frame(Box::new(move |payload, src| {
-                let _ = leg_tx_frame.try_send(super::relayleg::LegEvent::Frame(payload.to_vec(), src));
-            }));
-            let leg_tx_frame2 = leg_tx;
-            pubface.set_on_leg_frame(Box::new(move |payload, src| {
-                let _ = leg_tx_frame2.try_send(super::relayleg::LegEvent::Frame(payload.to_vec(), src));
-            }));
-            let stop = spawn_service_stop_flag(&mut stop_flags);
-            super::relayleg::spawn_relay_leg(
-                relay_sock,
-                arg.addr,
-                priv_key.clone(),
-                arg.secret,
-                leg_rx,
-                Arc::clone(&stop),
-                Arc::clone(&logf),
-            );
-            // 控制面（TCP，同号端口）：SESSION/RELEASE 经 EngineCmd 交驱动线程拨/拆腿
-            super::relayleg::spawn_relay_ctl(
-                arg.addr,
-                priv_key.clone(),
-                arg.secret,
-                cmd_tx.clone(),
-                Arc::clone(&stop),
-                Arc::clone(&logf),
-            );
+            // fail-soft（2026-10-10 全面审查 中-1）：socket 副本缺席（端口 bind 全失败/
+            // 置非阻塞失败/try_clone 失败——都是上方已按 fail-soft 记行降级的同族形态）
+            // 时**不 panic**——按「--relay 解析失败」同款处置：不起注册腿与控制面，
+            // 中继端点不并入 token（出口以直连形态继续运行，行为面可观测）。
+            match relay_sock_dup.take() {
+                Some(relay_sock) => {
+                    // 驱动线程 → relay-leg 线程事件通道（type=3 控制帧；try_send 不阻塞驱动线程）。
+                    // **两个来源同灌一条通道**：①腿 socket 上的 kind=3（`bind.set_on_leg_frame`）；
+                    // ②公共端口上的 kind=3（中继对**注册腿** Hello 的回执——M5 起注册腿从公共端口
+                    // 发出 ⇒ 回执回到公共端口，由 `pubface` 的钩子分派）。
+                    let (leg_tx, leg_rx) = mpsc::sync_channel::<super::relayleg::LegEvent>(64);
+                    let leg_tx_frame = leg_tx.clone();
+                    bind.set_on_leg_frame(Box::new(move |payload, src| {
+                        let _ =
+                            leg_tx_frame.try_send(super::relayleg::LegEvent::Frame(payload.to_vec(), src));
+                    }));
+                    let leg_tx_frame2 = leg_tx;
+                    pubface.set_on_leg_frame(Box::new(move |payload, src| {
+                        let _ =
+                            leg_tx_frame2.try_send(super::relayleg::LegEvent::Frame(payload.to_vec(), src));
+                    }));
+                    let stop = spawn_service_stop_flag(&mut stop_flags);
+                    super::relayleg::spawn_relay_leg(
+                        relay_sock,
+                        arg.addr,
+                        priv_key.clone(),
+                        arg.secret,
+                        leg_rx,
+                        Arc::clone(&stop),
+                        Arc::clone(&logf),
+                    );
+                    // 控制面（TCP，同号端口）：SESSION/RELEASE 经 EngineCmd 交驱动线程拨/拆腿
+                    super::relayleg::spawn_relay_ctl(
+                        arg.addr,
+                        priv_key.clone(),
+                        arg.secret,
+                        cmd_tx.clone(),
+                        Arc::clone(&stop),
+                        Arc::clone(&logf),
+                    );
+                }
+                None => {
+                    (logf)(&format!(
+                        "⚠️ --relay 注册腿未起（公共端口 socket 副本缺席——端口 bind 失败或副本失败）\
+                         —— 中继端点不并入 token，出口仅直连形态运行"
+                    ));
+                    relay_ep = None;
+                    relay_wanted = false;
+                }
+            }
         }
 
         // ---- 驱动线程 ----
