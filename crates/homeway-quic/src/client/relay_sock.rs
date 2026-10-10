@@ -228,6 +228,9 @@ pub(crate) fn note_send_err(st: &mut SockStats, e: &std::io::Error, now: std::ti
     class
 }
 
+/// 单次 `recvmmsg` 最多收几条（M6.5 多段接收；与 `max_receive_segments()` 同值）。
+pub(crate) const RECV_SEGMENTS: usize = 8;
+
 /// 岛侧抽象 socket（`quinn::AsyncUdpSocket`）：直连裸包 + 中继包封/剥壳。
 pub(crate) struct ClientSock {
     io: TokioUdp,
@@ -236,6 +239,8 @@ pub(crate) struct ClientSock {
     /// 计数（`Arc` 与岛共享；岛线程写、快照读）。
     stats: Arc<Mutex<SockStats>>,
     logf: Logf,
+    /// `recvmmsg` 不可用（EINVAL/ENOSYS…）⇒ 永久退单段接收（如实记一次行）。
+    batch_off: std::sync::atomic::AtomicBool,
 }
 
 impl std::fmt::Debug for ClientSock {
@@ -272,9 +277,94 @@ impl ClientSock {
                 relays,
                 stats,
                 logf,
+                batch_off: std::sync::atomic::AtomicBool::new(false),
             }),
             v4,
         ))
+    }
+
+    /// **批量接收**（M6.5；`recvmmsg`）：把至多 `min(bufs.len(), RECV_SEGMENTS)` 条数据报
+    /// 收进 `bufs[0..]`，逐条写 `meta[i] = {addr, len, stride=len}`，返回条数。
+    ///
+    /// 非 Linux 目标（本机 macOS 开发/测试）无 `recvmmsg` ⇒ 单段 `try_recv_from`（等价旧行为）。
+    /// Linux 上 `recvmmsg` 报 `EINVAL/ENOSYS`（内核/权限差异）⇒ 永久退单段 + 记一次行。
+    /// `EAGAIN`（无数据）原样上抛（调用方回 `poll_recv_ready`）。
+    fn recv_batch(&self, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> io::Result<usize> {
+        use std::sync::atomic::Ordering;
+        if self.batch_off.load(Ordering::Relaxed) {
+            return self.recv_one(bufs, meta);
+        }
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+            let want = bufs.len().min(RECV_SEGMENTS);
+            // SAFETY：三张定长数组就地零初始化后逐项填指针/长度；recvmmsg 只写 bufs[i]
+            // 指向的本进程可写内存（≤ 该 iovec 的 iov_len）与 hdrs[i]/addrs[i]。
+            let mut hdrs: [libc::mmsghdr; RECV_SEGMENTS] = unsafe { std::mem::zeroed() };
+            let mut iovs: [libc::iovec; RECV_SEGMENTS] = unsafe { std::mem::zeroed() };
+            let mut addrs: [libc::sockaddr_storage; RECV_SEGMENTS] = unsafe { std::mem::zeroed() };
+            for i in 0..want {
+                iovs[i] = libc::iovec {
+                    iov_base: bufs[i].as_mut_ptr().cast(),
+                    iov_len: bufs[i].len(),
+                };
+                hdrs[i].msg_hdr.msg_name = (&mut addrs[i] as *mut libc::sockaddr_storage).cast();
+                hdrs[i].msg_hdr.msg_namelen = std::mem::size_of::<libc::sockaddr_storage>() as u32;
+                hdrs[i].msg_hdr.msg_iov = &mut iovs[i] as *mut libc::iovec;
+                hdrs[i].msg_hdr.msg_iovlen = 1;
+            }
+            let rc = unsafe {
+                libc::recvmmsg(
+                    self.io.as_raw_fd(),
+                    hdrs.as_mut_ptr(),
+                    want as u32,
+                    0,
+                    std::ptr::null_mut(),
+                )
+            };
+            if rc < 0 {
+                let e = io::Error::last_os_error();
+                if matches!(e.raw_os_error(), Some(libc::EINVAL) | Some(libc::ENOSYS)) {
+                    self.batch_off.store(true, Ordering::Relaxed);
+                    (self.logf)(&format!(
+                        "多段接收不可用（recvmmsg: {e}）—— 退单段接收（成本面登记）"
+                    ));
+                    return self.recv_one(bufs, meta);
+                }
+                return Err(e);
+            }
+            let rc = rc as usize;
+            for i in 0..rc {
+                let len = hdrs[i].msg_len as usize;
+                let addr = sockaddr_v4(&addrs[i]).unwrap_or(self.local);
+                meta[i] = RecvMeta {
+                    addr,
+                    len,
+                    stride: len,
+                    ecn: None,
+                    dst_ip: None,
+                };
+            }
+            Ok(rc)
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            // 非 Linux（本机开发/测试）：无 recvmmsg ⇒ 单段（等价旧行为）
+            self.recv_one(bufs, meta)
+        }
+    }
+
+    /// 单段接收（回退路径；填 `meta[0]`）。
+    fn recv_one(&self, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> io::Result<usize> {
+        let (len, addr) = self.io.try_recv_from(&mut bufs[0][..])?;
+        meta[0] = RecvMeta {
+            addr,
+            len,
+            stride: len,
+            ecn: None,
+            dst_ip: None,
+        };
+        Ok(1)
     }
 }
 
@@ -300,6 +390,16 @@ impl AsyncUdpSocket for ClientSock {
             }
             return Ok(());
         }
+        // M6.5 临时插桩（删除见 `diag_m65.rs` 模块头）
+        let m65_on = crate::diag_m65::on();
+        if m65_on {
+            crate::diag_m65::diag()
+                .sock_send_calls
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        let m65_t0 = m65_on
+            .then(|| crate::diag_m65::diag().sock_send.start())
+            .flatten();
         let framed = self.relays.label_of(&transmit.destination).map(|label| {
             let mut out = Vec::with_capacity(RELAY_TAG_LEN + ENV_LEN + transmit.contents.len());
             out.extend_from_slice(&wrap_uplink(label, transmit.contents));
@@ -309,7 +409,11 @@ impl AsyncUdpSocket for ClientSock {
             Some(f) => (f.as_slice(), true),
             None => (transmit.contents, false),
         };
-        match self.io.try_send_to(payload, transmit.destination) {
+        let res = self.io.try_send_to(payload, transmit.destination);
+        if m65_on {
+            crate::diag_m65::diag().sock_send.end(m65_t0);
+        }
+        match res {
             Ok(_) => {
                 let mut st = lock_unpoison(&self.stats);
                 st.tx_dgrams += 1;
@@ -342,49 +446,92 @@ impl AsyncUdpSocket for ClientSock {
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
         debug_assert_eq!(bufs.len(), meta.len(), "quinn 恒成对传入 bufs/meta");
-        let buf = &mut bufs[0];
+        // M6.5 临时插桩（删除见 `diag_m65.rs` 模块头）
+        let m65_on = crate::diag_m65::on();
         loop {
             match self.io.poll_recv_ready(cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
                 Poll::Pending => return Poll::Pending,
             }
-            let (n, src) = match self.io.try_recv_from(&mut buf[..]) {
+            // **M6.5 多段接收**（真机逐段表：每包一次 recvmsg ≈ 22µs CPU ⇒ 一次系统调用
+            // 收一批）：`recvmmsg` 收至多 [`RECV_SEGMENTS`] 条；不支持则退单段路径。
+            if m65_on {
+                crate::diag_m65::diag()
+                    .sock_recv_calls
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+            let m65_t0 = m65_on
+                .then(|| crate::diag_m65::diag().sock_recv.start())
+                .flatten();
+            let recvd = match self.recv_batch(bufs, meta) {
                 Ok(v) => v,
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                Err(e) => return Poll::Ready(Err(e)),
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    if m65_on {
+                        crate::diag_m65::diag().sock_recv.end(m65_t0);
+                    }
+                    continue;
+                }
+                Err(e) => {
+                    if m65_on {
+                        crate::diag_m65::diag().sock_recv.end(m65_t0);
+                    }
+                    return Poll::Ready(Err(e));
+                }
             };
-            lock_unpoison(&self.stats).rx_dgrams += 1;
-            let (start, payload) = match strip_downlink(&buf[..n]) {
-                Downlink::Bare => (0, &buf[..n]),
-                Downlink::Quic(p) => (ENV_LEN, p),
-                // 非 kind=5 帧：**不喂 quinn**（中继的 hint 控制帧等）；计数 + 节流记行
-                Downlink::Ignored => {
-                    let n_ignored = {
-                        let mut st = lock_unpoison(&self.stats);
-                        st.rx_ignored += 1;
-                        st.rx_ignored
-                    };
+            if m65_on {
+                crate::diag_m65::diag().sock_recv.end(m65_t0);
+            }
+            // 剥壳 + 跳过忽略帧（有效载荷前移到各自的 buf 头部；`meta` 按序紧凑）
+            let mut out = 0usize;
+            let mut ignored_src = None;
+            for i in 0..recvd {
+                let len = meta[i].len;
+                let src = meta[i].addr;
+                let (start, payload_len) = match strip_downlink(&bufs[i][..len]) {
+                    Downlink::Bare => (0usize, len),
+                    Downlink::Quic(p) => (ENV_LEN, p.len()),
+                    // 非 kind=5 帧：**不喂 quinn**（中继的 hint 控制帧等）；计数 + 节流记行
+                    Downlink::Ignored => {
+                        ignored_src = Some(src);
+                        continue;
+                    }
+                };
+                if start > 0 {
+                    bufs[i].copy_within(start..start + payload_len, 0);
+                }
+                if out != i {
+                    // 紧凑：把本条前移到 out（out < i；用 split_at_mut 保借用合法）
+                    let (left, right) = bufs.split_at_mut(i);
+                    left[out][..payload_len].copy_from_slice(&right[0][..payload_len]);
+                }
+                meta[out] = RecvMeta {
+                    addr: src,
+                    len: payload_len,
+                    stride: payload_len,
+                    ecn: None,
+                    dst_ip: None,
+                };
+                out += 1;
+            }
+            {
+                let mut st = lock_unpoison(&self.stats);
+                st.rx_dgrams += recvd as u64;
+                if let Some(src) = ignored_src {
+                    st.rx_ignored += 1;
+                    let n_ignored = st.rx_ignored;
+                    drop(st);
                     if log_due(n_ignored) {
                         (self.logf)(&format!(
                             "忽略非 kind=5 腿帧（来自 {src}；第 {n_ignored} 次；计数行首 3 + 每 100）"
                         ));
                     }
-                    continue;
                 }
-            };
-            let len = payload.len();
-            if start > 0 {
-                buf.copy_within(start..n, 0);
             }
-            meta[0] = RecvMeta {
-                addr: src,
-                len,
-                stride: len,
-                ecn: None,
-                dst_ip: None,
-            };
-            return Poll::Ready(Ok(1));
+            if out > 0 {
+                return Poll::Ready(Ok(out));
+            }
+            // 整批都是忽略帧：继续收（与改前的 `continue` 同义）
         }
     }
 
@@ -397,8 +544,17 @@ impl AsyncUdpSocket for ClientSock {
         1
     }
 
+    /// **多段接收**（M6.5：`recvmmsg` 一次收一批；真机逐段表 = 每包 22µs 的系统调用面）。
+    /// 发送侧仍 = 1 段（不声明 GSO：客户端上行是 ACK/小包，批处理无收益且要碰
+    /// `UDP_SEGMENT` 的兼容面）。**容量**：quinn 端点接收缓冲 = `max_udp_payload_size`
+    /// （缺省 1472）× 本值 × 32 = **376KB**（改前 47KB；`T9` 内存面按此登记）。
     fn max_receive_segments(&self) -> usize {
-        1
+        // 非 Linux（无 recvmmsg）⇒ 如实 1；Linux（OHOS/生产面）⇒ 多段
+        if cfg!(target_os = "linux") {
+            RECV_SEGMENTS
+        } else {
+            1
+        }
     }
 
     /// 不设 `DONTFRAG`/`MTU_DISCOVER` ⇒ 如实 `true`（见模块头：与设计 §1.2 等价）。
@@ -422,6 +578,21 @@ impl UdpPoller for SockPoller {
     fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.sock.io.poll_send_ready(cx)
     }
+}
+
+/// `sockaddr_storage` → `SocketAddr`（本 socket 恒 IPv4；形态异常返 `None`）。
+/// 仅 Linux（`recvmmsg` 路径）使用。
+#[cfg(target_os = "linux")]
+fn sockaddr_v4(st: &libc::sockaddr_storage) -> Option<SocketAddr> {
+    if st.ss_family as libc::c_int != libc::AF_INET {
+        return None;
+    }
+    // SAFETY：ss_family == AF_INET ⇒ 按 sockaddr_in 读出（共用体按地址转换，读的是
+    // 内核已写入的那一份）。
+    let sin = unsafe { &*(st as *const libc::sockaddr_storage as *const libc::sockaddr_in) };
+    let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
+    let port = u16::from_be(sin.sin_port);
+    Some(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)))
 }
 
 #[cfg(test)]

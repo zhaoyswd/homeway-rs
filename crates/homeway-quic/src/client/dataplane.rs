@@ -32,6 +32,9 @@ use crate::tun::{PushOutcome, ReturnPath};
 /// 丢弃上报口（岛宿主注入：入快照 + N-c 行 + 事件回调）。
 pub(crate) type DropNote = Arc<dyn Fn(DropReason, &str) + Send + Sync + 'static>;
 
+/// 丢弃上报口（**带条数**；M6.5 回程批化的落点：丢一批 = 一次上报 N 条，计数仍精确）。
+pub(crate) type DropNoteN = Arc<dyn Fn(DropReason, u64, &str) + Send + Sync + 'static>;
+
 /// 发送结果（测试面：`Dropped` 与计数一一对应）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SendOutcome {
@@ -99,21 +102,38 @@ pub(crate) fn send_datagram_checked(
 /// 退出：连接死（`read_datagram` 出错）/ **写线程已退（`PushOutcome::Gone`——S6 的 A3）** /
 /// 任务被 abort（收工）。
 /// 队列满 ⇒ 丢 + 计 `回程队列满`（丢新——与出口的 ring「队尾丢」语义同向：TCP 会重传）。
-pub(crate) async fn pump_return(conn: Connection, ret: Arc<ReturnPath>, note: DropNote) {
+pub(crate) async fn pump_return(conn: Connection, ret: Arc<ReturnPath>, note: DropNoteN) {
+    // M6.5 临时插桩（删除见 `diag_m65.rs` 模块头）
+    let m65_on = crate::diag_m65::on();
+    // **M6.5 批化**（证据：M6.5 真机逐段表——回程泵每包 4.7µs + 写线程每包一次唤醒/投递）：
+    // 先**不等**地把队列里已有的包抽干成一批（至多 [`crate::tun::RETURN_BATCH_MAX`]）再一次
+    // 投递；抽干后再回到 `read_datagram().await` 正常等待。丢弃语义不变（丢新/丢 + 计数/收口）。
     loop {
-        let dg = match conn.read_datagram().await {
-            Ok(d) => d,
-            Err(_) => return, // 连接死/被替换：本任务收口（新连接会另起一枚）
-        };
-        // 拷贝一手的理由（**不是**零拷贝的地方）：`read_datagram` 给的 `Bytes` 是 quinn
-        // 接收池缓冲的切片，直接入队会把池块按队列长度钉住（内存面不可预测）；拷进自有
-        // `Vec` 后队列内存 = ≤ 上限 × 包长（与设计 §6.3/§6.4 的预算口径一致）。
-        match ret.try_push(dg.to_vec()) {
+        let mut batch = drain_ready(&conn, m65_on);
+        if batch.is_empty() {
+            // 没有现成包：正常等待下一个（或收口）
+            let dg = match conn.read_datagram().await {
+                Ok(d) => d,
+                Err(_) => return, // 连接死/被替换：本任务收口（新连接会另起一枚）
+            };
+            let t = m65_on
+                .then(|| crate::diag_m65::diag().pump_deliver.start())
+                .flatten();
+            batch.push(dg.to_vec().into_boxed_slice());
+            if m65_on {
+                let d = crate::diag_m65::diag();
+                d.pump_deliver.end(t);
+                d.pump_pkts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
+        }
+        let n = batch.len() as u64;
+        match ret.try_push_batch(batch) {
             PushOutcome::Pushed => {}
             PushOutcome::Full => {
                 note(
                     DropReason::ReturnQueueFull,
-                    &format!("回程队列满（上限 {} 条）", crate::tun::RETURN_QUEUE_MAX),
+                    n,
+                    &format!("回程队列满（在途上限 {} 包）", crate::tun::RETURN_QUEUE_MAX),
                 );
             }
             // 消费者（TUN 写线程）已退：**不**把它计成「队列满」（队列没满，是没人收）——
@@ -122,10 +142,45 @@ pub(crate) async fn pump_return(conn: Connection, ret: Arc<ReturnPath>, note: Dr
             PushOutcome::Gone => {
                 note(
                     DropReason::Unregistered,
+                    n,
                     "回程面已终止（TUN 写线程已退）—— 回程泵收口",
                 );
                 return;
             }
         }
     }
+}
+
+/// **同步抽干**已就绪的 datagram（至多 [`crate::tun::RETURN_BATCH_MAX`] 条；不等）。
+///
+/// 手法：就地 poll 一次 `ReadDatagram`——它的 poll 先看接收队列（拿得到就 `Ready`），
+/// 拿不到才 `Pending`；非阻塞 ⇒ 一次 noop waker 的 context 足够，不新增依赖。
+/// **同步 fn**：把 waker/context 关在函数内（async 体里夹带非 `Send` 值会破坏任务 `Send`）。
+///
+/// 拷贝一手的理由（**不是**零拷贝的地方）：`read_datagram` 给的 `Bytes` 是 quinn
+/// 接收池缓冲的切片，直接入队会把池块按队列长度钉住（内存面不可预测）；拷进自有
+/// `Vec` 后队列内存 = ≤ 上限 × 包长（与设计 §6.3/§6.4 的预算口径一致）。
+fn drain_ready(conn: &Connection, m65_on: bool) -> crate::tun::ReturnBatch {
+    let waker = std::task::Waker::noop();
+    let mut cx = std::task::Context::from_waker(waker);
+    let mut batch: crate::tun::ReturnBatch = Vec::new();
+    while batch.len() < crate::tun::RETURN_BATCH_MAX {
+        let mut fut = Box::pin(conn.read_datagram());
+        match std::future::Future::poll(fut.as_mut(), &mut cx) {
+            std::task::Poll::Ready(Ok(d)) => {
+                let t = m65_on
+                    .then(|| crate::diag_m65::diag().pump_deliver.start())
+                    .flatten();
+                batch.push(d.to_vec().into_boxed_slice());
+                if m65_on {
+                    let dg = crate::diag_m65::diag();
+                    dg.pump_deliver.end(t);
+                    dg.pump_pkts.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                }
+            }
+            // 队列空（正常）或连接错（由 await 分支收口）
+            std::task::Poll::Ready(Err(_)) | std::task::Poll::Pending => break,
+        }
+    }
+    batch
 }

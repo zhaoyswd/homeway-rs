@@ -72,6 +72,11 @@ pub(crate) struct TunCounters {
     pub(crate) last_outbound_mono_ns: AtomicI64,
     /// `Cmd::TunPacket` 在途条数（**有界通道的等价实现**；见 [`CMD_INFLIGHT_MAX`]）。
     inflight: AtomicU64,
+    /// 岛侧收到的 `TunPacket` 总数（**快照 `packets_in` 的原子直读面**；M6.5：从
+    /// 每包一次快照互斥锁改成原子计数——热路径不再为读数上锁）。
+    pub(crate) pkts_in: AtomicU64,
+    /// datagram 发送缓冲占用（快照 `send_buffer_used` 的原子面；同上，避免每包上锁）。
+    pub(crate) send_buf_used: AtomicU64,
 }
 
 impl TunCounters {
@@ -139,12 +144,26 @@ fn process_mono_start() -> Instant {
     *START.get_or_init(Instant::now)
 }
 
+/// 回程队列的**批次**（M6.5：一批最多 [`RETURN_BATCH_MAX`] 包——一次唤醒投一批，
+/// 写线程一次取一批；上限口径仍按**包**计，见 [`ReturnPath::inflight`]）。
+pub(crate) type ReturnBatch = Vec<Box<[u8]>>;
+
+/// 单批最大包数（M6.5 批化：批量大小取 16——足够把「每包一次唤醒 + 一次队列投递」
+/// 摊薄一个量级，又不至于把回程时延拖过 1 个 MTU 的发送时间）。
+pub(crate) const RETURN_BATCH_MAX: usize = 16;
+
 /// 回程通道（岛 → TUN）：有界队列的**生产者面**（消费者 = 写线程）。
 ///
-/// 生产者 = 岛线程内的回程泵（[`crate::client::dataplane::pump_return`]）；`try_push`
-/// **非阻塞**（绝不把阻塞传染进岛 runtime）。
+/// 生产者 = 岛线程内的回程泵（[`crate::client::dataplane::pump_return`]）；`try_push_batch`
+/// **非阻塞**（绝不把阻塞传染进岛 runtime）。**有界口径按包**：`inflight` 计在途包数
+/// （上限仍 = [`RETURN_QUEUE_MAX`]），到顶丢新 + 计数（与 M1 §6.4 的预算口径一致）。
 pub(crate) struct ReturnPath {
-    tx: SyncSender<Box<[u8]>>,
+    tx: SyncSender<ReturnBatch>,
+    /// 在途包数（岛侧加、写线程写完后减；单生产者 + 单消费者 ⇒ 计数精确）。
+    inflight: Arc<std::sync::atomic::AtomicUsize>,
+    /// 写线程存活位（退出前置 false）：**`Gone` 优先于包级 `Full`**——消费者已死时
+    /// 包级计数可能残留（写线程在写中退出 ⇒ 整批未减），不能把「没人收」报成「队列满」。
+    writer_alive: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// 投递结果（**两种失败必须可分**：满 = 队列在但来不及排空；Gone = 消费者已死）。
@@ -170,17 +189,45 @@ impl ReturnPath {
         counters: Arc<TunCounters>,
         logf: Logf,
     ) -> io::Result<Arc<Self>> {
-        let (queue_tx, rx) = sync_channel::<Box<[u8]>>(RETURN_QUEUE_MAX);
+        // 队列容量按**批**给（每批 ≤ RETURN_BATCH_MAX 包；包级闸由 inflight 卡）
+        let (queue_tx, rx) = sync_channel::<ReturnBatch>(RETURN_QUEUE_MAX / RETURN_BATCH_MAX);
+        let inflight = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let writer_alive = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let inflight_w = Arc::clone(&inflight);
+        let alive_w = Arc::clone(&writer_alive);
         std::thread::Builder::new()
             .name(WRITE_THREAD.into())
-            .spawn(move || write_loop(fd, rx, tx, counters, logf))?;
-        Ok(Arc::new(Self { tx: queue_tx }))
+            .spawn(move || write_loop(fd, rx, tx, counters, logf, inflight_w, alive_w))?;
+        Ok(Arc::new(Self {
+            tx: queue_tx,
+            inflight,
+            writer_alive,
+        }))
     }
 
-    /// 投一包（满 ⇒ `Full`，消费者已死 ⇒ `Gone`；两者都不阻塞）。
-    pub(crate) fn try_push(&self, pkt: Vec<u8>) -> PushOutcome {
-        match self.tx.try_send(pkt.into_boxed_slice()) {
-            Ok(()) => PushOutcome::Pushed,
+    /// 投一批（**包级**有界：在途包数超 [`RETURN_QUEUE_MAX`] ⇒ `Full`；消费者已死 ⇒ `Gone`）。
+    ///
+    /// 不阻塞：批队列满同样归 `Full`（调用方丢 + 计数；TCP 会重传）。
+    pub(crate) fn try_push_batch(&self, batch: ReturnBatch) -> PushOutcome {
+        if batch.is_empty() {
+            return PushOutcome::Pushed;
+        }
+        use std::sync::atomic::Ordering as O;
+        let n = batch.len();
+        // 消费者已死 ⇒ 先归 `Gone`（A3：不得把「没人收」误报成「队列满」）
+        if !self.writer_alive.load(O::Relaxed) {
+            return PushOutcome::Gone;
+        }
+        // 包级闸（单生产者：load+add 无竞态窗口——写线程只减）
+        let cur = self.inflight.load(O::Relaxed);
+        if cur + n > RETURN_QUEUE_MAX {
+            return PushOutcome::Full;
+        }
+        match self.tx.try_send(batch) {
+            Ok(()) => {
+                self.inflight.fetch_add(n, O::Relaxed);
+                PushOutcome::Pushed
+            }
             Err(TrySendError::Full(_)) => PushOutcome::Full,
             // 写线程已退（fd 失效/收工）：**单独一类**（丢弃语义同「丢」，但归因不同——见 PushOutcome）
             Err(TrySendError::Disconnected(_)) => PushOutcome::Gone,
@@ -195,10 +242,53 @@ pub(crate) fn spawn_reader(
     counters: Arc<TunCounters>,
     logf: Logf,
 ) -> io::Result<()> {
+    let blocking = set_blocking_read(fd, &logf);
+    (*logf)(&format!(
+        "TUN 读面形态：{}（M6.5 逐段成本整改：阻塞读消「read+poll」系统调用对）",
+        if blocking {
+            "阻塞读（每包一次 read）"
+        } else {
+            "非阻塞读 + poll（回退形态）"
+        }
+    ));
     std::thread::Builder::new()
         .name(READ_THREAD.into())
         .spawn(move || read_loop(fd, tx, counters, logf))?;
     Ok(())
+}
+
+/// M6.5：把 fd 置成**阻塞读**（清 `O_NONBLOCK`）。
+///
+/// 真机逐段表（M6.5）显示读线程的 CPU 几乎全在「非阻塞 read 返 EAGAIN + poll 等」的
+/// 系统调用对上（read≈39µs/次、poll≈96µs/次；每上行包 1.84 次 read + 0.85 次 poll）——
+/// 阻塞读把等待收回内核等待队列，**每包只花一次 read**。
+///
+/// 读循环仍保留 EAGAIN → poll 的回退支（fd 天生非阻塞/标志不可清 ⇒ 行为与改前一致，
+/// 零回归）。副作用（**登记在案**）：写线程 `write_fd_all` 在 tun 队列满时改为**阻塞在
+/// write 内**（原为 `WouldBlock` → `POLLOUT` 有界等待）；fd 死亡仍以写错误
+/// （EBADF/EPIPE/EIO）面呈现。
+fn set_blocking_read(fd: i32, logf: &Logf) -> bool {
+    // SAFETY：fcntl(F_GETFL/F_SETFL) 只读写 fd 标志位（无指针、无别名问题）。
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    if flags < 0 {
+        (*logf)(&format!(
+            "TUN fd 读阻塞化失败（F_GETFL: {}）—— 保持非阻塞读 + poll 形态",
+            std::io::Error::last_os_error()
+        ));
+        return false;
+    }
+    if flags & libc::O_NONBLOCK == 0 {
+        return true; // 本来就是阻塞 fd
+    }
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
+    if rc < 0 {
+        (*logf)(&format!(
+            "TUN fd 读阻塞化失败（F_SETFL: {}）—— 保持非阻塞读 + poll 形态",
+            std::io::Error::last_os_error()
+        ));
+        return false;
+    }
+    true
 }
 
 /// 单 fd poll 等待（片长 [`POLL_SLICE`]；EINTR 内部重试；到 `deadline` 返 `TimedOut`；
@@ -266,6 +356,9 @@ fn write_fd_all(fd: i32, mut buf: &[u8]) -> io::Result<()> {
             match e.kind() {
                 io::ErrorKind::Interrupted => continue,
                 io::ErrorKind::WouldBlock => {
+                    if crate::diag_m65::on() {
+                        crate::diag_m65::diag().write_wb.fetch_add(1, Ordering::Relaxed);
+                    }
                     let r = poll_fd(fd, libc::POLLOUT, deadline)?;
                     if r.hup || r.err || r.nval {
                         return Err(io::Error::new(
@@ -293,16 +386,65 @@ fn write_fd_all(fd: i32, mut buf: &[u8]) -> io::Result<()> {
 fn read_loop(fd: i32, tx: IslandTx, counters: Arc<TunCounters>, logf: Logf) {
     let mut buf = vec![0u8; 65535];
     let mut pending_drops: u64 = 0;
+    let diag_on = crate::diag_m65::on();
+    let mut last_dump = Instant::now();
+    // 上一轮 poll 是否报可读（自旋签名：报可读但 read 仍 EAGAIN）
+    let mut poll_readable = false;
     loop {
+        let t_read0 = if diag_on {
+            crate::diag_m65::diag().read_syscall.start()
+        } else {
+            None
+        };
         let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        if diag_on {
+            crate::diag_m65::diag().read_syscall.end(t_read0);
+        }
         if n < 0 {
             let e = io::Error::last_os_error();
             match e.kind() {
-                io::ErrorKind::Interrupted => continue,
+                io::ErrorKind::Interrupted => {
+                    if diag_on {
+                        crate::diag_m65::diag()
+                            .read_eintr
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    continue;
+                }
                 io::ErrorKind::WouldBlock => {
+                    if diag_on {
+                        let d = crate::diag_m65::diag();
+                        d.read_eagain.fetch_add(1, Ordering::Relaxed);
+                        if poll_readable {
+                            d.poll_but_eagain.fetch_add(1, Ordering::Relaxed);
+                        }
+                    }
+                    poll_readable = false;
                     // 非阻塞 fd 的常态：等 POLLIN 一片（片界即退出判定点）。
                     // 三分处置（镜像 `wgcore`）：片到（TimedOut）= 继续；poll 出错 = 判死。
-                    match poll_fd(fd, libc::POLLIN, Instant::now() + POLL_SLICE) {
+                    let t_poll0 = if diag_on {
+                        crate::diag_m65::diag().read_poll.start()
+                    } else {
+                        None
+                    };
+                    let wall0 = diag_on.then(Instant::now);
+                    let pr = poll_fd(fd, libc::POLLIN, Instant::now() + POLL_SLICE);
+                    if diag_on {
+                        let d = crate::diag_m65::diag();
+                        d.read_poll.end(t_poll0);
+                        d.poll_calls.fetch_add(1, Ordering::Relaxed);
+                        if let Some(w) = wall0 {
+                            if w.elapsed() < Duration::from_micros(200) {
+                                d.poll_imm.fetch_add(1, Ordering::Relaxed);
+                            }
+                        }
+                        if let Ok(r) = &pr {
+                            if r.readable {
+                                poll_readable = true;
+                            }
+                        }
+                    }
+                    match pr {
                         Ok(_ready) => {} // 可读优先（含 POLLIN|POLLHUP 同置：先读，下一轮定性）
                         Err(pe) if pe.kind() == io::ErrorKind::TimedOut => {}
                         Err(pe) => {
@@ -325,7 +467,13 @@ fn read_loop(fd: i32, tx: IslandTx, counters: Arc<TunCounters>, logf: Logf) {
         if n == 0 {
             // EOF/空读：判死**只看 hup||err||nval**（darwin 上 EOF 恒带 POLLIN），
             // 且判死前确认一片（poll 本身即等待——不用 sleep）。
+            let t_poll0 = diag_on
+                .then(|| crate::diag_m65::diag().read_poll.start())
+                .flatten();
             let first = poll_fd(fd, libc::POLLIN, Instant::now() + POLL_SLICE);
+            if diag_on {
+                crate::diag_m65::diag().read_poll.end(t_poll0);
+            }
             let (dead, readable) = match &first {
                 Ok(r) => (r.hup || r.err || r.nval, r.readable),
                 Err(pe) if pe.kind() == io::ErrorKind::TimedOut => (false, false),
@@ -353,6 +501,7 @@ fn read_loop(fd: i32, tx: IslandTx, counters: Arc<TunCounters>, logf: Logf) {
             }
             continue;
         }
+        poll_readable = false;
         let mut n = n as usize;
         // packet-info 头自动探测（镜像 `wgcore` 的 r2-L4：4 字节 PI + 合法 IP 版本号才剥）
         let looks_like_pi = n >= 5
@@ -390,11 +539,25 @@ fn read_loop(fd: i32, tx: IslandTx, counters: Arc<TunCounters>, logf: Logf) {
             }
             continue;
         }
-        if tx.send(Cmd::TunPacket(pkt)).is_err() {
+        let t_send0 = diag_on
+            .then(|| crate::diag_m65::diag().read_chan_send.start())
+            .flatten();
+        let sent = tx.send(Cmd::TunPacket(pkt));
+        if diag_on {
+            let d = crate::diag_m65::diag();
+            d.read_chan_send.end(t_send0);
+            d.read_ok.fetch_add(1, Ordering::Relaxed);
+            d.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
+        }
+        if sent.is_err() {
             // 岛已收工（通道断）——读线程自退（不重试、不挂死）
             counters.done_send();
             (logf)("homeway-tun-read: 投递失败（岛已收工）—— 读线程退出");
             return;
+        }
+        if diag_on && last_dump.elapsed() >= std::time::Duration::from_secs(5) {
+            last_dump = Instant::now();
+            (logf)(&crate::diag_m65::dump_line("5s"));
         }
         if pending_drops > 0 {
             let _ = tx.send(Cmd::DatagramDropped {
@@ -412,26 +575,67 @@ fn read_loop(fd: i32, tx: IslandTx, counters: Arc<TunCounters>, logf: Logf) {
 /// ⇒ 岛侧打 `fd` 分类 + 卸面）。
 fn write_loop(
     fd: i32,
-    rx: Receiver<Box<[u8]>>,
+    rx: Receiver<ReturnBatch>,
     tx: IslandTx,
     counters: Arc<TunCounters>,
     logf: Logf,
+    inflight: Arc<std::sync::atomic::AtomicUsize>,
+    writer_alive: Arc<std::sync::atomic::AtomicBool>,
 ) {
+    let diag_on = crate::diag_m65::on();
     loop {
-        let pkt = match rx.recv() {
+        let batch = match rx.recv() {
             Ok(p) => p,
-            Err(_) => return, // 生产者全 drop（岛收工）⇒ 写线程退出
-        };
-        match write_fd_all(fd, &pkt) {
-            Ok(()) => {
-                counters.write_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
-                counters.write_pkts.fetch_add(1, Ordering::Relaxed);
+            Err(_) => {
+                writer_alive.store(false, Ordering::Relaxed);
+                return; // 生产者全 drop（岛收工）⇒ 写线程退出
             }
-            Err(e) => {
-                let msg = format!("tun fd 写入失败：{e}（标记隧道不健康）");
-                (logf)(&msg);
-                let _ = tx.send(Cmd::TunFdDead { msg });
-                return;
+        };
+        // M6.5 批化：一次唤醒写一整批；批内逐包 write（TUN 语义：一次 write = 一包，不能合并）
+        for pkt in &batch {
+            let t_w0 = diag_on
+                .then(|| crate::diag_m65::diag().write_syscall.start())
+                .flatten();
+            let res = write_fd_all(fd, pkt);
+            if diag_on {
+                let d = crate::diag_m65::diag();
+                d.write_syscall.end(t_w0);
+                d.write_pkts.fetch_add(1, Ordering::Relaxed);
+            }
+            match res {
+                Ok(()) => {
+                    counters.write_bytes.fetch_add(pkt.len() as u64, Ordering::Relaxed);
+                    counters.write_pkts.fetch_add(1, Ordering::Relaxed);
+                }
+                Err(e) => {
+                    let msg = format!("tun fd 写入失败：{e}（标记隧道不健康）");
+                    (logf)(&msg);
+                    let _ = tx.send(Cmd::TunFdDead { msg });
+                    // 退出前：整批名额就地归还 + 置死活位（`Gone` 优先于包级 `Full`）
+                    release(&inflight, batch.len());
+                    writer_alive.store(false, Ordering::Relaxed);
+                    return;
+                }
+            }
+        }
+        // 交还在途名额（包级；整批一次性减）
+        release(&inflight, batch.len());
+    }
+}
+
+/// 归还在途名额（`n` 包；下限 0；单生产者 + 单消费者 ⇒ 竞态面只有「写线程减、岛侧加」）。
+fn release(inflight: &std::sync::atomic::AtomicUsize, n: usize) {
+    use std::sync::atomic::Ordering as O;
+    let mut cur = inflight.load(O::Relaxed);
+    loop {
+        let next = cur.saturating_sub(n);
+        match inflight.compare_exchange_weak(cur, next, O::Relaxed, O::Relaxed) {
+            Ok(_) => break,
+            Err(now) => {
+                if now == 0 {
+                    break;
+                }
+                cur = now;
             }
         }
     }
@@ -459,8 +663,8 @@ mod tests {
         let counters = TunCounters::new();
         let ret =
             ReturnPath::new(a.as_raw_fd(), cmd_tx(), Arc::clone(&counters), logf).expect("写线程可起");
-        assert_eq!(ret.try_push(vec![1, 2, 3, 4]), PushOutcome::Pushed);
-        assert_eq!(ret.try_push(vec![9; 64]), PushOutcome::Pushed);
+        assert_eq!(ret.try_push_batch(vec![vec![1, 2, 3, 4].into_boxed_slice()]), PushOutcome::Pushed);
+        assert_eq!(ret.try_push_batch(vec![vec![9u8; 64].into_boxed_slice()]), PushOutcome::Pushed);
         let mut got = [0u8; 4];
         (&b).read_exact(&mut got).expect("读到第一包");
         assert_eq!(got, [1, 2, 3, 4]);
@@ -500,10 +704,10 @@ mod tests {
         assert!(c.try_begin_send(), "归零后仍可用");
     }
 
-    /// 队列满：`try_push` 非阻塞返 `Full`（岛侧据此计 `回程队列满`）。
+    /// 队列满：`try_push_batch` 非阻塞返 `Full`（岛侧据此计 `回程队列满`）。
     ///
-    /// 构造：socketpair 的读端**不读**且先灌满内核缓冲 ⇒ 写线程阻塞在第一包上 ⇒
-    /// 队列被填满至上限，此后 `try_push` 恒 `Full`（不阻塞、不覆盖最旧）。
+    /// **M6.5 口径（批化后）**：上限按**包**卡（[`RETURN_QUEUE_MAX`]），批粒度容差 ≤ 1 批；
+    /// 构造同旧版（socketpair 读端不读 + 灌满内核缓冲 ⇒ 写线程卡在第一批写里 ⇒ 队列填满）。
     #[test]
     fn return_queue_full_is_non_blocking() {
         let (a, b) = UnixStream::pair().expect("socketpair");
@@ -528,21 +732,27 @@ mod tests {
         let (logf, _rx) = (Arc::new(|_s: &str| {}) as Logf, ());
         let counters = TunCounters::new();
         let ret = ReturnPath::new(a.as_raw_fd(), cmd_tx(), counters, logf).expect("写线程可起");
+        // 逐批投（每批满 RETURN_BATCH_MAX）：**包级**上限 = RETURN_QUEUE_MAX，容差 ≤ 1 批
+        let batch = || -> Vec<Box<[u8]>> { vec![vec![0u8; 8].into_boxed_slice(); RETURN_BATCH_MAX] };
         let mut pushed = 0usize;
-        for _ in 0..(RETURN_QUEUE_MAX + 16) {
-            if ret.try_push(vec![0u8; 8]) == PushOutcome::Pushed {
-                pushed += 1;
+        for _ in 0..(RETURN_QUEUE_MAX / RETURN_BATCH_MAX + 8) {
+            if ret.try_push_batch(batch()) == PushOutcome::Pushed {
+                pushed += RETURN_BATCH_MAX;
             }
         }
         assert!(
             pushed >= RETURN_QUEUE_MAX,
             "队列应被填满（RETURN_QUEUE_MAX={RETURN_QUEUE_MAX}，实际入队 {pushed}）"
         );
-        // 上限面：写线程最多再取走 1 条（取走后卡在 write 上）⇒ 接受数 ≤ 上限 + 1；
-        // 其余 `try_push` 必须**非阻塞返 `Full`**（岛侧据此计 `回程队列满`）。
         assert!(
-            pushed <= RETURN_QUEUE_MAX + 1,
-            "队列不得越过上限（RETURN_QUEUE_MAX={RETURN_QUEUE_MAX}，实际入队 {pushed}）"
+            pushed <= RETURN_QUEUE_MAX + RETURN_BATCH_MAX,
+            "队列不得越过包级上限 + 1 批（RETURN_QUEUE_MAX={RETURN_QUEUE_MAX}，实际入队 {pushed}）"
+        );
+        // 上限面：此后 `try_push_batch` 必须**非阻塞返 `Full`**（岛侧据此计 `回程队列满`）
+        assert_eq!(
+            ret.try_push_batch(batch()),
+            PushOutcome::Full,
+            "包级上限已到 ⇒ 必须归 `Full`（写线程仍活）"
         );
     }
 
@@ -560,10 +770,10 @@ mod tests {
         let ret = ReturnPath::new(a.as_raw_fd(), cmd_tx(), counters, logf).expect("写线程可起");
         // 首包进队（写线程随后取走并失败退出）；之后必须观测到 `Gone`（有界轮询上界）
         let deadline = Instant::now() + Duration::from_secs(2);
-        let mut outcome = ret.try_push(vec![0u8; 8]);
+        let mut outcome = ret.try_push_batch(vec![vec![0u8; 8].into_boxed_slice()]);
         while outcome != PushOutcome::Gone && Instant::now() < deadline {
             std::thread::yield_now();
-            outcome = ret.try_push(vec![0u8; 8]);
+            outcome = ret.try_push_batch(vec![vec![0u8; 8].into_boxed_slice()]);
         }
         assert_eq!(
             outcome,

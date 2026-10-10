@@ -35,7 +35,7 @@ use tokio::sync::mpsc::{self as tmpsc, UnboundedReceiver, UnboundedSender};
 use tokio::task::JoinSet;
 use tokio::time::Instant as TokioInstant;
 
-use crate::client::dataplane::{self, DropNote};
+use crate::client::dataplane::{self, DropNote, DropNoteN};
 use crate::client::ladder::{self, Ladder, Round, SendFace, Step as LadderStep};
 use crate::client::streams::{self, StreamStats, Streams};
 use crate::client::{self, Face, Live, MigrationEvent, Watch};
@@ -266,6 +266,10 @@ impl Island {
     pub fn snapshot(&self) -> IslandSnapshot {
         let mut s = lock_unpoison(&self.snapshot).clone();
         s.packets_out = self.counters.write_pkts();
+        // M6.5：`packets_in` / `send_buffer_used` 也改**原子直读**（热路径不再每包上锁；
+        // 口径与 `packets_out` 同款：反应式读数不等拍内务同步）
+        s.packets_in = self.counters.pkts_in.load(Ordering::Relaxed);
+        s.send_buffer_used = self.counters.send_buf_used.load(Ordering::Relaxed);
         // M3 S4：快探成功计数原子直读（判据面「首个回显成功」不等拍内务同步）
         s.ladder_probe_ok = self.ladder_probe_ok.load(Ordering::Relaxed);
         s
@@ -536,6 +540,10 @@ struct DriverState {
     /// 准入是两档共同的可用性事实（`Live` 只在 `hr-reg4` 四帧通过后构造）⇒ 只要本世代
     /// 曾经准入过（`adopt` 置位），连接死的恢复动作就该跑。
     admitted: bool,
+    /// 丢弃上报口（单条形态；**采纳连接时构造一次**——M6.5 去每包 `Arc` 分配）。
+    drop_note: Option<DropNote>,
+    /// 丢弃上报口（带条数；回程泵批投用）。
+    drop_note_n: Option<DropNoteN>,
     /// **服务流出站需求信号**（M5 §2.4-A-2 ⑤：宿主会话里「在用档」判据的 STREAM 面来源）。
     ///
     /// 旧 `in_use_now` 只认 `TunCounters::last_outbound_at`（只由 TUN 数据面写）⇒ 无 TUN 的
@@ -606,6 +614,8 @@ fn run_driver(
             dead_logged: false,
             admitted: false,
             last_stream_out_at: None,
+            drop_note: None,
+            drop_note_n: None,
         };
         let mut jobs: JoinSet<Job> = JoinSet::new();
         loop {
@@ -729,7 +739,10 @@ fn maybe_start_pump(st: &mut DriverState, ctx: &IslandCtx, jobs: &mut JoinSet<Jo
     if st.pump_conn == Some(conn_id) {
         return; // 现任连接的回程泵已在跑
     }
-    let note = drop_note(ctx);
+    let note = st
+        .drop_note_n
+        .clone()
+        .unwrap_or_else(|| drop_note_with_count(ctx));
     let ret = Arc::clone(&tun.ret);
     jobs.spawn(async move {
         dataplane::pump_return(conn, ret, note).await;
@@ -762,6 +775,11 @@ fn adopt(
     // M5 §2.4-A-2 ①：本世代「曾完成准入」位（`Live` 只在四帧准入之后构造）——连接死的
     // 恢复动作判据（旧 `tun.is_some()` 在宿主会话恒假 ⇒ 阶梯被结构性关闭）。
     st.admitted = true;
+    // M6.5：丢弃上报口只在此构造一次（热路径零新分配）
+    if st.drop_note.is_none() {
+        st.drop_note = Some(drop_note_one(ctx));
+        st.drop_note_n = Some(drop_note_with_count(ctx));
+    }
     // M3 S4：新连接 = 新失败链 ⇒ 阶梯重新武装（B 之后休眠的阶梯在此复活）
     st.ladder.rearm();
     st.rebind = None;
@@ -1069,25 +1087,40 @@ async fn handle_cmd(
             let _ = reply.send(Ok(()));
         }
         Cmd::TunPacket(pkt) => {
+            // M6.5 临时插桩（删除见 `diag_m65.rs` 模块头）
+            let m65_on = crate::diag_m65::on();
+            let m65_t0 = m65_on
+                .then(|| crate::diag_m65::diag().island_tunpkt.start())
+                .flatten();
             // 在途名额交还（§6.4 的有界通道等价实现：读线程占名额、岛消费即还）
             ctx.counters.done_send();
             // 发送路径（S2-4）：①准入窗由结构保证（`Live` 只在四帧准入完成之后存在）；
             // ②/③ 检包 + 缓冲预检 + 分类计数 = `client::dataplane::send_datagram_checked`
             // （**唯一**的 `send_datagram` 调用点）；无连接 ⇒ 归 `未登记`（登记前丢弃）。
-            lock_unpoison(&ctx.snapshot).packets_in += 1;
+            ctx.counters.pkts_in.fetch_add(1, Ordering::Relaxed);
             match st.live.as_ref() {
                 Some(live) => {
-                    let note = drop_note(ctx);
+                    let note = st
+                        .drop_note
+                        .clone()
+                        .unwrap_or_else(|| drop_note_one(ctx));
                     dataplane::send_datagram_checked(&live.conn, pkt, &note);
                     // N8①/S2-5：缓冲占用**按包**刷新——`housekeeping` 的 TICK 分支在连续流量
                     // 下不会到点（`select!` 的 `sleep(TICK)` 每轮重建 ⇒ 只在无事件的 250ms
                     // 之后才跑），黑洞期的读数不能等到那时才可见。
-                    lock_unpoison(&ctx.snapshot).send_buffer_used = live.send_buffer_used();
+                    ctx.counters
+                        .send_buf_used
+                        .store(live.send_buffer_used(), Ordering::Relaxed);
                 }
                 None => {
                     let n = pkt.len();
                     note_drop(ctx, DropReason::Unregistered, 1, "无已登记连接", Some(n as u64));
                 }
+            }
+            if m65_on {
+                let d = crate::diag_m65::diag();
+                d.island_tunpkt.end(m65_t0);
+                d.island_pkts.fetch_add(1, Ordering::Relaxed);
             }
         }
         // 循环侧处置（幂等；重入无害）
@@ -1431,19 +1464,22 @@ fn note_drop_shared(
     detail: &str,
     ext: Option<u64>,
 ) {
-    let (total, line) = {
+    let (first_of_note, line) = {
         let mut s = lock_unpoison(snapshot);
         let total = s.drops.bump(reason, n);
+        // 节流口径（M6.5 批化后）：按**本条上报的首条计数**判（= 逐包上报时的口径，
+        // 「首 3 + 每 100」不因一次报 N 条而漏掉首条）
+        let first_of_note = total.saturating_sub(n).saturating_add(1);
         let d = s.drops;
         (
-            total,
+            first_of_note,
             format!(
                 "超限={} 发送缓冲满={} 回程队列满={} 未登记={}",
                 d.too_large, d.send_buffer_full, d.return_queue_full, d.unregistered
             ),
         )
     };
-    if log_due(total) {
+    if log_due(first_of_note) {
         let ext = ext.map(|v| format!("，字节/条数={v}")).unwrap_or_default();
         (*logf)(&format!(
             "丢弃 {line}（本次：{} ×{n} {detail}{ext}；计数行首 3 + 每 100）",
@@ -1456,13 +1492,26 @@ fn note_drop_shared(
     }
 }
 
-/// 数据面任务的丢弃上报口（`Arc<dyn Fn>`：常驻任务需要 `'static`——故三件共享件都克隆）。
-fn drop_note(ctx: &IslandCtx) -> DropNote {
+/// 数据面丢弃上报口（**单条**形态；M6.5：在**采纳连接时构造一次**存进 `DriverState`，
+/// 热路径只 `Arc::clone`，不再每包新建闭包）。
+fn drop_note_one(ctx: &IslandCtx) -> DropNote {
     let snapshot = Arc::clone(&ctx.snapshot);
     let logf = Arc::clone(&ctx.logf);
     let on_event = Arc::clone(&ctx.on_event);
     Arc::new(move |reason, detail| {
         note_drop_shared(&snapshot, &logf, &on_event, reason, 1, detail, None)
+    })
+}
+
+/// 数据面任务的丢弃上报口（`Arc<dyn Fn>`：常驻任务需要 `'static`——故三件共享件都克隆）。
+///
+/// M6.5：改成**带条数**的形态（`n`）——回程泵按批投递，丢一批要一次记 N 条（计数仍精确）。
+fn drop_note_with_count(ctx: &IslandCtx) -> crate::client::dataplane::DropNoteN {
+    let snapshot = Arc::clone(&ctx.snapshot);
+    let logf = Arc::clone(&ctx.logf);
+    let on_event = Arc::clone(&ctx.on_event);
+    Arc::new(move |reason, n, detail| {
+        note_drop_shared(&snapshot, &logf, &on_event, reason, n, detail, None)
     })
 }
 
