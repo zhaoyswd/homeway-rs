@@ -1051,7 +1051,27 @@ fn run_exit(
                                 ));
                             }
                         }
-                        Err(_join_err) => {} // 任务被 abort（收工路径）——不计
+                        // abort（收工路径）不计；任务 panic 单独记行（2026-10-10 审查 中-2
+                        // 的姊妹面：handshakes 原有收割、但 panic 与 abort 同被吞）。
+                        Err(join_err) => {
+                            if join_err.is_panic() {
+                                (*logf)(&format!(
+                                    "⚠️ 握手任务 panic（{join_err}）—— 该次握手按失败计（槽位已随收割释放）"
+                                ));
+                                stats.handshake_failed.fetch_add(1, Ordering::SeqCst);
+                            }
+                        }
+                    }
+                }
+                // 每连接任务收割（2026-10-10 审查 中-2）：`JoinSet` 已完成未收割的条目会
+                // 滞留 harness/输出节点——原只在收工时整体 drop ⇒ 按断连/重连节奏无限累积
+                // （每连接 2 条任务，慢泄漏）；顺带把任务 panic 从静默变可观测（连接面由
+                // 巡检摘绑 + ADMIT_DEADLINE/keep_alive 兜底，panic 不致命）。
+                Some(joined) = tasks.join_next(), if !tasks.is_empty() => {
+                    if let Err(join_err) = joined {
+                        if join_err.is_panic() {
+                            (*logf)(&format!("⚠️ 连接任务 panic（{join_err}）—— 对应连接由巡检/TTL 兜底回收"));
+                        }
                     }
                 }
                 Some((dst, payload)) = plain_rx.recv() => {
