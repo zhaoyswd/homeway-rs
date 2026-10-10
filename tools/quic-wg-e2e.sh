@@ -105,8 +105,15 @@ run_one legacy_hmw1_token_surfaces_actionable_changeover_attribution "$RES/s1-e2
 S1_CLI_RC=0
 {
   echo "# M7 S1 CLI 面断言（$(date '+%F %T')）：存量 hmw1 串必须点名归因"
+  # **显式建产物**（代码门 r31 低-7 整改）：`local-rust-exit.sh` 只在缺产物时构建 ⇒ 改了 CLI
+  # 而不重建会让本断言假红/假绿。这里显式构建（幂等、热 target 秒级）。
+  ( cd "$REPO_ROOT" && cargo build --release -p homeway-cli ) || { echo "!! 失败：release 构建"; S1_CLI_RC=1; }
   CLI_BIN="${HOMEWAY_BIN:-$REPO_ROOT/target/release/homeway-cli}"
-  legacy="hmw1iu50C3IgUoXEPLRuz7_lQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  if [[ ! -x "$CLI_BIN" ]]; then
+    echo "!! 失败：无 CLI 产物 $CLI_BIN（不得静默跳过）"; S1_CLI_RC=1
+  fi
+  # **合成串**（安全面：不写任何真实 token 片段；版本面在 base64 解析前判死 ⇒ 前缀即足够）
+  legacy="hmw1AAAAAAsynthetic-not-a-real-token-00000000000000"
   S1_CLI_OUT=$("$CLI_BIN" host add "$legacy" 2>&1)
   S1_CLI_CMD_RC=$?
   echo "rc=$S1_CLI_CMD_RC（期望 1）"

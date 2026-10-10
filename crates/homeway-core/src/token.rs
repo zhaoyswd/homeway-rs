@@ -1089,7 +1089,7 @@ mod tests {
             assert_eq!(e.user_message(), e.to_string(), "{e:?}");
         }
         // 全链：一段真 `hmw1` 串（夹具里的存量形态）走 decode ⇒ 同一归因
-        let real = decode("hmw1iu50C3IgAAAA");
+        let real = decode("hmw1AAAAAAsynthetic");
         let err = real.expect_err("hmw1 串必拒（版本面）");
         assert_eq!(err.changeover_attribution(), old.changeover_attribution());
     }

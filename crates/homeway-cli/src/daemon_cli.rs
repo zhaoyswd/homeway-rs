@@ -679,7 +679,7 @@ fn host_add(args: &[String]) {
     // M7 S1：用户可见文案走 `user_message()`——存量 `hmw1` 串追加换代归因（哨兵字节不变）。
     if let Err(e) = homeway_core::token::decode(&token) {
         eprintln!(
-            "token 非法：{}（token 形如 hmw2…，从出口启动日志现场获取后重新粘贴）",
+            "token 非法：{}（token 前缀 `hmw2`；用 `homeway-cli serve token` 现取后再粘贴）",
             e.user_message()
         );
         std::process::exit(1);

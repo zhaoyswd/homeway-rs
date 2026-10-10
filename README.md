@@ -100,7 +100,7 @@ token 是**凭证**：不内置、不进仓库、不随包分发（客户端 tok
 |---|---|
 | **新会话入口 / 硬规则 / 工程原则 / 技术底座** | `AGENTS.md` |
 | **程序主体进度真源**（期次范围、判据、退出口、下一步指针） | `ROADMAP.md` |
-| **传输层换代程序真源**（WG → QUIC，M0–M7，已收官） | `docs/QUIC-ROADMAP.md` |
+| **传输层换代程序真源**（WG → QUIC，M0–M7；**M7 生产切换待 U1–U3 执行**，收官标记由主会话在路线文件同批收口） | `docs/QUIC-ROADMAP.md` |
 | 三基线（体积 / 每包 CPU / 内存 + 线开销） | `docs/QUIC-BASELINE.md` |
 | 真机操作手册（App 核装机 / 判据行 / 逃生口） | `docs/DEVICE-TEST-OHOS.md` |
 | **整改批进度真源**（2026-10-07 评审后的 Q 批分批范围与执行协议） | `docs/REVIEW-ROADMAP.md` |

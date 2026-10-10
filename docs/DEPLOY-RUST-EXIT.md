@@ -510,7 +510,8 @@ case "$TOK" in hmw2*) ;; *) echo "token 抓取失败（拿到：${TOK:0:8}…）
 
 ### 12.4 三阶段执行（判据行 = `docs/reviews/M7-design.md` §4.1–§4.3 的 V1–V24）
 
-**U1 阿里云出口 → G2**（判据 V1–V9）：`pkill -x homeway-rs` 等退净（`Text file busy` 教训，§9/§10）
+**U1 阿里云出口 → G2**（判据 V1–V9）：**取 token 一律用 §12.3 的两态通吃形态**；
+`pkill -x homeway-rs` 等退净（`Text file busy` 教训，§9/§10）
 → 上传 `homeway-cli-v0.3.0-linux-amd64.tar.gz` + `sha256sum -c SHA256SUMS` + `--version` = `v0.3.0`
 → 加 `quic_listen` → nohup 重起 → 逐条对 V1（**端口未退让**：`cache/quic_listen_port.txt == 41641`
 且 `grep -c '被占用' <日志> == 0`；E1 打的是配置值，**不能**用它判退让）/ V3（身份连续：`key=` 与
@@ -521,23 +522,42 @@ V8（中继互注零人工）。
 > （`中继就绪：0.0.0.0:41741（…）` 形态，`:122` 附近）；**M5 起 = 双栈**：
 > `中继就绪：[::]:41741（token 模式（中继 ID …）；…）`（v4 映射地址仍可连）。历史正文不动，本节给现行串。
 
-**U2 设备核 → G2**（判据 V10–V20，含 T11 真机档 V19 / DNS 真机轮 V20）：tier 侧 pin 前进 +
+**U2 设备核 → G2**（判据 V10–V20，含 T11 真机档 V19 / DNS 真机轮 V20）：**取 token 用 §12.3**；
+另**补一条观察项**（代码门 r31 中-6）：**App Pss 读数**（`hidumper --mem <vpn_pid>`，与 M6 基线
+33,823 KB 对照；超 +3 MiB 回看 M6.7 显式 socket 缓冲条）——它不在设计 V10–V24 清单里，但为
+「+3 MiB 设定值入账」的产品侧实测面。tier 侧 pin 前进 +
 出包（正式路径被 `log-index` 门拦时走手拷逃生口，须留痕）→ `force-stop` 后注入**阿里云**新 token
 （`--ps host_token`）→ 屏上点 VPN 授权 + 开「全局代理」→ 逐条对 V10–V18 + V19/V20 + V13b。
 
-**U3 Mac 出口 → G2**（判据 V21–V24 + 观察期）：临时件 + `mv` 原子换名 + `launchctl kickstart -k`
+**U3 Mac 出口 → G2**（判据 V21–V24 + 观察期）：**取 token 用 §12.3**；临时件 + `mv` 原子换名 + `launchctl kickstart -k`
 （`KeepAlive=true` ⇒ **不要**用 `bootout`/`bootstrap`，失败会 crash-loop）→ 逐条对 V21–V24。
 
 ### 12.5 回滚（按「回退手段序」从小到大）
 
+> **纪律（代码门 r31 中-2 整改，两处都是实测教训）**：①**Mac（launchd）**：`cp` 覆盖**运行中**
+> 的二进制在 Darwin/APFS 上会**直接把进程杀掉**（实测 `rc=0` + 进程 `Killed: 9`），配合
+> `KeepAlive=true` ⇒ launchd 立刻用**尚未还原的 config**（仍含 `quic_listen`）拉起旧二进制 ⇒
+> `deny_unknown_fields` 拒启 ⇒ **crash-loop**。故 Mac 一律「**先还原 config → `install` 临时件 + `mv -f` 原子换名 → `kickstart -k`**」。
+> ②**阿里云**：Linux 的 ETXTBSY（`Text file busy`，§9/§10 三次实录）要求 **先 `pkill -x homeway-rs` 等退净再换件**。
+
 1. **设备切另一台 G2 出口**（一次粘贴；零出口动作、零核回退）——首选；
-2. **单台出口回退 + 同批核回退**：`cp ~/bin/homeway-rs.bak-v0.2.3 ~/bin/homeway-rs`
-   + `cp ~/.config/homeway-rs/config.toml.bak-pre-m7 ~/.config/homeway-rs/config.toml`（**删
-   `quic_listen`**）+ `launchctl kickstart -k gui/$(id -u)/me.zhaozhe.homeway-exit`
+2. **单台出口回退 + 同批核回退**（Mac）：
+   ```bash
+   cp ~/.config/homeway-rs/config.toml.bak-pre-m7 ~/.config/homeway-rs/config.toml   # ① 先还原 config（删 quic_listen）
+   install -m 0755 ~/homeway-rollback/homeway-rs.bak-v0.2.3 ~/bin/homeway-rs.new      # ② 临时件
+   mv -f ~/bin/homeway-rs.new ~/bin/homeway-rs                                        # ③ 原子换名（不撞运行中进程）
+   launchctl kickstart -k gui/$(id -u)/me.zhaozhe.homeway-exit                        # ④ 重启（KeepAlive 形态）
+   ```
    + 设备装回 G1 核 HSP（`~/homeway-rollback/libclientcore-g1.so` 两处手拷 → 重建 HSP → 覆盖装）
    + 重注入旧 `hmw1` token（`~/homeway-rollback/tokens-mac-pre-m7.txt`）；
-3. **双台出口回退 + 核回退**：② + 阿里云同款三件套（`homeway-rs.bak-v0.2.3` +
-   `config.toml.bak-pre-m7` + 重起 nohup）。
+3. **双台出口回退 + 核回退**：② + 阿里云同款三件套（**顺序照 §4.1**，不许压缩成一条）：
+   ```bash
+   pkill -x homeway-rs; until ! pgrep -x homeway-rs >/dev/null; do sleep 1; done   # ① 先停净（ETXTBSY 教训）
+   cp /usr/local/bin/homeway-rs.bak-v0.2.3 /usr/local/bin/homeway-rs                # ② 换件
+   cp /opt/homeway/data-rs/config.toml.bak-pre-m7 /opt/homeway/data-rs/config.toml  # ③ 还原 config（删 quic_listen）
+   cd /opt/homeway && HOME=/opt/homeway/served nohup /usr/local/bin/homeway-rs \
+     --state /opt/homeway/data-rs >> /opt/homeway/data-rs/cache/unified-stdout.log 2>&1 &
+   ```
 
 **旧 HSP 重建配方（第 6 件）**：`libclientcore-g1.so`（2,348,864 B）拷到 tier
 `tailcat/libs/arm64-v8a/` 与 `tailcat/src/main/cpp/prebuilt/arm64-v8a/` 两处（两处 md5 一致留证）

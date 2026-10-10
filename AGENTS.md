@@ -76,7 +76,7 @@
 | 干什么/干到哪/怎么接棒 | `ROADMAP.md`（程序主体）；**整改批进度** = `docs/REVIEW-ROADMAP.md` |
 | 整改批发现清单 / 用户快速上手 | `docs/reviews/AUDIT-2026-10-07.md` / `README.md` |
 | 基线 hash / 台账 / 在途 change | `docs/BASELINE.md`（**冻结**：锚 `d4148f6`，只读 oracle，不再前移） |
-| **传输层换代程序**（WG → QUIC，M0–M7 已收官） | `docs/QUIC-ROADMAP.md`；三基线 = `docs/QUIC-BASELINE.md`；真机手册 = `docs/DEVICE-TEST-OHOS.md` |
+| **传输层换代程序**（WG → QUIC，M0–M7；**M7 生产切换待 U1–U3**——路线文件状态由主会话收口） | `docs/QUIC-ROADMAP.md`；三基线 = `docs/QUIC-BASELINE.md`；真机手册 = `docs/DEVICE-TEST-OHOS.md` |
 | 互操作判据行 | `docs/INTEROP-CRITERIA.md`（含「判据变更记录」——变更须登记） |
 | golden 夹具 / 派生向量 | `fixtures/`（`SHA256SUMS` 覆盖全目录 + `MANIFEST.md` 口径） |
 | 起本地出口/矩阵 | **主力** = `tools/local-rust-exit.sh`（Rust 出口，单公共端口 = QUIC 端口）、`tools/matrix.sh`；`tools/local-exit.sh` = **历史 oracle（Go 已退役，仅供对照复现）** |

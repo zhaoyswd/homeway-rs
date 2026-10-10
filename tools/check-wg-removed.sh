@@ -18,7 +18,7 @@
 #   ⑧ 测试面残留：`cargo test --workspace -- --list` 的用例名零 `wgcore`/`wtransport`/
 #      `recover::`/`session::` 前缀；`fuzz/**` 源码零 `wgcore`/`wtransport`（独立 workspace）
 #   ⑨ tools/** + fuzz/** 作用域：承载三键与 `wgcore::`/`ring-shim` 零命中（非注释面）
-#   ⑩ **ID 空间门**：本批新增 ID（`E-q6`/`E25`/`N-e`/`C20`/`C21`）在
+#   ⑩ **ID 空间门**：本批新增 ID（`E-q6`/`E25`/`N-e`/`C20`/`C21`/`N-f`/`N-g`）在
 #      `docs/INTEROP-CRITERIA.md` 里**各恰一条行**（`^| <ID> |` 行首式；0 = 登记漏；
 #      ≥2 = **双占/撞名**——X1 双占就是历史先例）；正向自校准 = 已占 ID（`E-q5`/`C18`/`C19`）
 #      同管线必须命中（否则门空跑）。
@@ -245,7 +245,7 @@ info "⑨ tools/** + fuzz/** 承载三键/模块引用 = 0"
 
 # ---------- ⑩ ID 空间门 ----------
 DOC="$REPO_ROOT/docs/INTEROP-CRITERIA.md"
-NEW_IDS=(E-q6 E25 N-e C20 C21)
+NEW_IDS=(E-q6 E25 N-e C20 C21 N-f N-g)
 OCCUPIED_IDS=(E-q5 C18 C19)
 # 自校准（**两条管线各自校准**——M5 代码门 M-2 整改：原实现用「全表词边界」校
 # `E-q5`/`C18`/`C19`，而受测管线是「行级」，两者不同管线 ⇒ 校准对被测面零覆盖，

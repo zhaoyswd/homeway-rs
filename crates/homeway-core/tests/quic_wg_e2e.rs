@@ -145,7 +145,8 @@ fn wg_only_token_generation_fails_visibly_without_fallback() {
 #[test]
 fn legacy_hmw1_token_surfaces_actionable_changeover_attribution() {
     // 真 `hmw1` 形态（版本面在 base64 解析之前判死 ⇒ 前缀即足够；不构造旧布局载荷）
-    let legacy = "hmw1iu50C3IgUoXEPLRuz7_lQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    // **合成串**（安全面：不写任何真实 token 片段——版本面在 base64 解析之前就判死，前缀即足够）
+    let legacy = "hmw1AAAAAAsynthetic-not-a-real-token-00000000000000";
     let err = homeway_core::token::decode(legacy).expect_err("hmw1 串必拒（版本面）");
     let dir = std::env::temp_dir().join(format!("hw-m7s1-legacy-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("临时目录可建");

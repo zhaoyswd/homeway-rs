@@ -151,6 +151,8 @@ $HDC shell "uitest uiInput click <X> <Y>"                                       
 - WG 档服务腿 `intercept: tcp exempt`（服务面改走 `STREAM[tag]`）
 
 **④ token / 端口速查（M7 起）**：客户端 token 前缀 **`hmw2`**（中继凭据 `rl1` 不变）；本地 Rust
-出口实例 `n` 的**公共端口 = QUIC 端口 = 42651+n**（不再是「WG 4265n + QUIC 4265n+1」双端口）；
+出口实例 `n` 的端口有两位含义（勿混）：**`--listen` 配置基线 = `42650+n`**（只作 QUIC 端口的
+缺省基线，不再是独立监听口）、**公共端口 = QUIC 端口 = `42651+n`**（n=1 ⇒ 42652；不再有
+「WG `4265n` + QUIC `4265n+1`」双端口；判据 = `cache/quic_listen_port.txt` 与 `listen_port.txt` 同值）；
 取 token 用 `tools/local-rust-exit.sh token <n>`（**守护在跑时输出是裸 token 一行、不在跑时带
 `serve token：` 前缀**——两态通吃用 `sed -n 's/^serve token：//p;/^hmw[0-9]/p'`）。
