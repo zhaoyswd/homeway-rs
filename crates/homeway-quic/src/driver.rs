@@ -22,6 +22,7 @@
 //!   **预算内收工**由 `stop_within` 的 join 分支记 panic 行、**到点 detach** 由收割线程记。
 
 use std::any::Any;
+use std::future::Future;
 use std::io;
 use std::net::SocketAddrV4;
 use std::panic::{catch_unwind, AssertUnwindSafe};
@@ -477,6 +478,60 @@ enum Job {
     /// 服务流任务结束（写者任务 / 读任务；**记账已在任务内落**——见
     /// `client::streams::{writer_task,read_task}`，本变体只让 `JoinSet` 的收割口有名字）。
     StreamDone,
+    /// 长任务 panic（2026-10-10 审查 中-2）：[`guard_job`] 壳捕获后按「任务种类 + 复位
+    /// 所需最小上下文」上抛。不隔这一层时 panic 会落进 `join_next` 的 `Err`（与收工
+    /// abort 同形、任务种类丢失）⇒ 单飞位（`racing` / 阶梯 `inflight` / 泵防重位）
+    /// 永久卡在「在途」态——正是 r18 ②-1 修过的「阶梯死绝」形态，触发源换成 panic。
+    Panicked {
+        /// 复位动作的最小上下文（按任务种类带 round/conn_id）。
+        recover: PanickedJob,
+        /// panic 载荷文本（`panic_msg`）。
+        note: String,
+    },
+}
+
+/// [`Job::Panicked`] 的复位上下文：panic 载荷里拿不回这些（必须在 spawn 时捕获）。
+#[derive(Clone, Copy, Debug)]
+enum PanickedJob {
+    Race,
+    Probe,
+    FastProbe(Round),
+    LadderConnect,
+    Return(usize),
+    Stream,
+}
+
+/// 长任务 spawn 的统一壳：panic 捕获后转 [`Job::Panicked`]（驱动按 [`PanickedJob`]
+/// 复位单飞位并走对应失败路径），正常完成则原样透传。实现 = futures `FutureExt::
+/// catch_unwind` 同款的手写 poll 壳（tokio JoinSet 自身也是这层捕获）；`Box::pin`
+/// 是任务级一次性分配（连接/流级频次，非热路径）。
+fn guard_job<F>(recover: PanickedJob, fut: F) -> Guarded<F>
+where
+    F: Future<Output = Job>,
+{
+    Guarded {
+        recover,
+        fut: Box::pin(fut),
+    }
+}
+
+struct Guarded<F> {
+    recover: PanickedJob,
+    fut: std::pin::Pin<Box<F>>,
+}
+
+impl<F: Future<Output = Job>> Future for Guarded<F> {
+    type Output = Job;
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Job> {
+        let this = self.get_mut();
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| this.fut.as_mut().poll(cx))) {
+            Ok(poll) => poll,
+            Err(payload) => std::task::Poll::Ready(Job::Panicked {
+                recover: this.recover,
+                note: panic_msg(payload.as_ref()),
+            }),
+        }
+    }
 }
 
 /// TUN 面（数据面的 fd 侧；`TunAttach` 时装配，随岛收工/连接结束而弃）。
@@ -712,7 +767,55 @@ fn run_driver(
                         // 读任务回执），这里无需动作——变体存在的意义是让 abort/panic
                         // 与正常结束在同一处可见（排障时 `JoinSet` 的收割口有名字）。
                         Ok(Job::StreamDone) => {}
-                        // 任务被 abort（收工路径）：其回执口随之 drop ⇒ 调用侧归 EngineGone
+                        // 长任务 panic（2026-10-10 审查 中-2）：复位单飞位 + 走对应失败
+                        // 路径——否则 `racing`/阶梯 `inflight`/泵防重位永久停在「在途」，
+                        // 岛呈静默僵尸（连接死后无恢复动作，直到 App 拆岛）。
+                        Ok(Job::Panicked { recover, note }) => {
+                            (*ctx.logf)(&format!(
+                                "⚠️ 岛内长任务 panic（{recover:?}：{note}）—— 按失败路径复位单飞位"
+                            ));
+                            match recover {
+                                // 回执口随任务 drop ⇒ 调用侧已归 EngineGone；这里只复位单飞位
+                                PanickedJob::Race => st.racing = false,
+                                PanickedJob::Probe => {}
+                                // 视为该轮探活失败：走阶梯正常失败路径（保 r18 ②-1 的 B 门
+                                // 可达；`ProbeNoResponse` 语义 = 无对端证据，与 panic 等价）
+                                PanickedJob::FastProbe(round) => {
+                                    let now = TokioInstant::now();
+                                    let send = send_face(&face, st.ladder.tuning().send_err_fresh);
+                                    let step = st.ladder.on_round(
+                                        round,
+                                        Err(IslandErr::ProbeNoResponse),
+                                        now,
+                                        send,
+                                        &ctx.logf,
+                                    );
+                                    ctx.ladder_probe_ok
+                                        .store(st.ladder.probe_ok, Ordering::Relaxed);
+                                    ladder_step(&mut st, ctx, &mut face, &mut jobs, step);
+                                }
+                                // R 动作按失败回灌（阶梯自行决定退避/再试/B 门）
+                                PanickedJob::LadderConnect => {
+                                    let step = st.ladder.on_reconnect_result(
+                                        false,
+                                        "R 动作任务 panic".to_owned(),
+                                        TokioInstant::now(),
+                                        &ctx.logf,
+                                    );
+                                    ladder_step(&mut st, ctx, &mut face, &mut jobs, step);
+                                }
+                                // 泵防重位按身份复位（同 `Job::Return` 正常路径）
+                                PanickedJob::Return(conn) => {
+                                    if st.pump_conn == Some(conn) {
+                                        st.pump_conn = None;
+                                    }
+                                }
+                                // 槽侧记账已在任务内落（panic 展开时 RAII 守卫照常执行）
+                                PanickedJob::Stream => {}
+                            }
+                        }
+                        // 任务被 abort（收工路径）：其回执口随之 drop ⇒ 调用侧归 EngineGone。
+                        // panic 已由 [`guard_job`] 壳转成 `Job::Panicked`，不再落到这里。
                         Err(_aborted) => {}
                     }
                 }
@@ -745,10 +848,10 @@ fn maybe_start_pump(st: &mut DriverState, ctx: &IslandCtx, jobs: &mut JoinSet<Jo
         .clone()
         .unwrap_or_else(|| drop_note_with_count(ctx));
     let ret = Arc::clone(&tun.ret);
-    jobs.spawn(async move {
+    jobs.spawn(guard_job(PanickedJob::Return(conn_id), async move {
         dataplane::pump_return(conn, ret, note).await;
         Job::Return(conn_id)
-    });
+    }));
     st.pump_conn = Some(conn_id);
 }
 
@@ -1168,10 +1271,10 @@ async fn handle_cmd(
             let ccfg = face.client_config();
             let cred = Arc::clone(face.credential());
             let logf = Arc::clone(&ctx.logf);
-            jobs.spawn(async move {
+            jobs.spawn(guard_job(PanickedJob::Race, async move {
                 let result = client::connect(endpoint, ccfg, cred, &list, budget, log_c4, &logf).await;
                 Job::Race { reply, result }
-            });
+            }));
         }
         Cmd::Rebind { local, reply } => {
             let from = face.local();
@@ -1199,10 +1302,10 @@ async fn handle_cmd(
             Some(live) => {
                 let conn = live.conn.clone();
                 let probe = Arc::clone(live.probe_slot());
-                jobs.spawn(async move {
+                jobs.spawn(guard_job(PanickedJob::Probe, async move {
                     let result = client::probe(&conn, &probe, budget).await;
                     Job::Probe { reply, result }
-                });
+                }));
             }
         },
         // ---------- M3 S1：服务流族（设计 §1.4/§1.5/§1.6/§1.7） ----------
@@ -1228,10 +1331,10 @@ async fn handle_cmd(
                     let slot = st.streams.register(tag, recv);
                     let id = slot.id();
                     let streams = Arc::clone(&st.streams);
-                    jobs.spawn(async move {
+                    jobs.spawn(guard_job(PanickedJob::Stream, async move {
                         streams::writer_task(send, slot, streams).await;
                         Job::StreamDone
-                    });
+                    }));
                     // **回执投不出去 ⇒ 就地关流**（M4 §2.2 的 H1 残余窄窗）：调用方已放弃
                     // （客户端 seam 拿不到 id ⇒ 它的 RAII 守卫也无从构造）时，这个流在岛内
                     // **没有句柄可关**；不关就永久占一个槽（`has_capacity()` = `map.len() < 62`）
@@ -1265,10 +1368,10 @@ async fn handle_cmd(
         Cmd::StreamRead { id, reply } => match st.streams.slot_of(id) {
             Some(slot) => {
                 let streams = Arc::clone(&st.streams);
-                jobs.spawn(async move {
+                jobs.spawn(guard_job(PanickedJob::Stream, async move {
                     streams::read_task(slot, reply, streams).await;
                     Job::StreamDone
-                });
+                }));
             }
             None => {
                 let _ = reply.send(Err(StreamErr::Closed));
@@ -1347,11 +1450,11 @@ fn ladder_step(
                 let conn = live.conn.clone();
                 let slot = Arc::clone(live.probe_slot());
                 st.ladder.note_round(round, TokioInstant::now());
-                jobs.spawn(async move {
+                jobs.spawn(guard_job(PanickedJob::FastProbe(round), async move {
                     let result =
                         ladder::run_round(budget, || client::probe(&conn, &slot, budget)).await;
                     Job::FastProbe { round, result }
-                });
+                }));
                 return;
             }
             LadderStep::Migrate { why } => {
@@ -1421,12 +1524,12 @@ fn ladder_step(
                 let cred = Arc::clone(face.credential());
                 let budget = st.ladder.reconnect_budget();
                 let logf = Arc::clone(&ctx.logf);
-                jobs.spawn(async move {
+                jobs.spawn(guard_job(PanickedJob::LadderConnect, async move {
                     let result = client::connect(endpoint, ccfg, cred, &list, budget, false, &logf)
                         .await
                         .map(|(est, _outcome)| est);
                     Job::LadderConnect { why, result }
-                });
+                }));
                 return;
             }
             LadderStep::Rebuild { why, r_fails } => {
@@ -1644,5 +1747,57 @@ pub(crate) mod seams {
     fn block_briefly(d: Duration) {
         let (_tx, rx) = std::sync::mpsc::channel::<()>();
         let _ = rx.recv_timeout(d);
+    }
+}
+
+// ---------- guard_job 单测（2026-10-10 审查 中-2 的回归钉） ----------
+#[cfg(test)]
+mod guard_job_tests {
+    use super::{guard_job, Job, PanickedJob};
+
+    fn rt() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .expect("test runtime")
+    }
+
+    /// 首 poll 即 panic 的任务：壳必须转 `Job::Panicked`（recover 透传 + note 带 panic 文本），
+    /// **不得**让 panic 穿出 block_on（否则 JoinSet 收割面拿到的是 Err、单飞位复位逻辑不可达）。
+    #[test]
+    fn panic_on_first_poll_becomes_panicked_job() {
+        let job = rt().block_on(guard_job(PanickedJob::Race, async {
+            panic!("审计注入-首 poll panic");
+        }));
+        match job {
+            Job::Panicked {
+                recover: PanickedJob::Race,
+                note,
+            } => assert!(note.contains("审计注入-首 poll panic"), "note={note}"),
+            _ => panic!("应为 Job::Panicked"),
+        }
+    }
+
+    /// pending 一轮后再 panic（覆盖「waker 已注册、二次 poll 时炸」的形态——
+    /// 壳必须在后续 poll 里同样接住）。
+    #[test]
+    fn panic_after_pending_becomes_panicked_job() {
+        let job = rt().block_on(guard_job(PanickedJob::Return(7), async {
+            tokio::task::yield_now().await;
+            panic!("审计注入-二次 poll panic");
+        }));
+        match job {
+            Job::Panicked {
+                recover: PanickedJob::Return(7),
+                note,
+            } => assert!(note.contains("审计注入-二次 poll panic"), "note={note}"),
+            _ => panic!("应为 Job::Panicked"),
+        }
+    }
+
+    /// 正常完成：原样透传（壳不得改写/吞掉任务结论）。
+    #[test]
+    fn normal_completion_passes_through() {
+        let job = rt().block_on(guard_job(PanickedJob::Stream, async { Job::StreamDone }));
+        assert!(matches!(job, Job::StreamDone));
     }
 }
