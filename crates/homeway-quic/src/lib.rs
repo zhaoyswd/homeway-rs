@@ -55,6 +55,9 @@
 
 /// **准入拒绝的关闭码表**（M3 §4：出口写、客户端读的**单源**；纯 std）。
 pub mod admit_close;
+/// **拥塞控制移植面**（M6.7；BBRv3 移植自 tquic，Apache-2.0——出处见模块头）。
+/// 属**异步面**（实现框架的 `Controller`）：新文件已入隔离门 `ASYNC_FILES`。
+mod cc;
 mod client;
 mod cmd;
 mod config;

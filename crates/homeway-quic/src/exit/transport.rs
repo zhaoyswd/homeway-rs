@@ -83,14 +83,18 @@ pub(crate) fn transport_config() -> Arc<TransportConfig> {
 ///
 /// 三档的取值都来自共享常量（不在调用点各写一份）：`cubic` = quinn 缺省
 /// [`quinn::congestion::CubicConfig::default`]（**不设 factory 与此逐字节同效**，
-/// 见 [`transport_config_with`] 的 `debug_assert`）；`bbr` = quinn 自带 BBRv1。
-/// 两档都只调 `initial_window` 之外的量——本批不引入任何 quinn 侧的调参。
+/// 见 [`transport_config_with`] 的 `debug_assert`）；`bbr` = quinn 自带 BBRv1；
+/// `bbr3` = 本仓移植的 [`crate::cc::Bbr3Config`]（出处/差异见 `cc/` 模块头）。
+/// 三档除各自的工厂配置外**不加任何 quinn 侧调参**（本批只换控制器）。
 pub(crate) fn cc_factory(cc: CcChoice) -> Arc<dyn ControllerFactory + Send + Sync> {
     use quinn::congestion::{BbrConfig, CubicConfig};
     match cc {
         // 与「不设工厂」等价（quinn 的 `TransportConfig::default` 就是 `CubicConfig`）。
         CcChoice::Cubic => Arc::new(CubicConfig::default()),
         CcChoice::Bbr => Arc::new(BbrConfig::default()),
+        // 工厂按 `build(now, current_mtu)` 给的 MTU 定 `min_cwnd`/`initial_cwnd`
+        // （配置里的 mds 会被 `build` 覆写，见 `cc::bbr3` 的 `ControllerFactory` 实现）。
+        CcChoice::Bbr3 => Arc::new(crate::cc::Bbr3Config::for_mtu(INITIAL_MTU)),
     }
 }
 
@@ -164,12 +168,17 @@ mod tests {
         let now = std::time::Instant::now();
         let cubic = cc_factory(CcChoice::Cubic).build(now, INITIAL_MTU);
         let bbr = cc_factory(CcChoice::Bbr).build(now, INITIAL_MTU);
+        let bbr3 = cc_factory(CcChoice::Bbr3).build(now, INITIAL_MTU);
         assert_eq!(cubic.initial_window(), 12000, "cubic：14720 夹到 [2×1200, 10×1200]");
         assert_eq!(bbr.initial_window(), 240_000, "bbr：200 包 × 1200B（quinn K_MAX_INITIAL_CONGESTION_WINDOW）");
+        assert_eq!(bbr3.initial_window(), 14_000, "bbr3：10 × mds(1400)（上游 RecoveryConfig 缺省倍率）");
         assert_ne!(cubic.initial_window(), bbr.initial_window(), "两档必须可判别");
-        // 起步窗：cubic = 初窗；bbr = 初窗（BBR 的 cwnd 初值 = init_cwnd）
-        assert!(cubic.window() > 0 && bbr.window() > 0, "起步窗必须非 0（quinn pacer 依赖）");
+        assert_ne!(bbr.initial_window(), bbr3.initial_window(), "v1/v3 必须可判别");
+        assert_ne!(cubic.initial_window(), bbr3.initial_window());
+        // 起步窗：三档各自非 0（quinn pacer 的 debug_assert 依赖）
+        assert!(cubic.window() > 0 && bbr.window() > 0 && bbr3.window() > 0, "起步窗必须非 0");
         assert_ne!(cubic.window(), bbr.window());
+        assert_ne!(bbr.window(), bbr3.window());
     }
 
     /// **判据（MTU 口径）**：MTU 旋钮走同一条组装路径（工厂建出的控制器拿到的是

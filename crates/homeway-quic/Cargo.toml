@@ -9,6 +9,12 @@ edition.workspace = true
 # 消费侧 homeway-core 只加一条路径依赖、不声明它们 ⇒ 同步面里 `use tokio::…` = E0433。
 [dependencies]
 quinn.workspace = true
+# **M6.7（拥塞控制对比批）**：`quinn` façade **不 re-export** 拥塞控制器 trait 签名里的
+# `RttEstimator`（`Controller::on_ack(…, rtt: &RttEstimator)`）⇒ 外部实现者必须直接点名
+# 本 crate。版本与 `quinn 0.11.12` 的传递依赖**同一份**（Cargo.lock 里 quinn-proto 只有
+# 0.11.19 一条 ⇒ 同一编译单元、零新增传递面）；`default-features = false`（features 由
+# `quinn` 那条统一裁，本行不额外开任何 feature）。
+quinn-proto = { version = "0.11", default-features = false }
 rustls.workspace = true
 # `net`（M1 S1c 增开）：出口 QUIC 面的**自定义抽象 socket**（`tokio::net::UdpSocket` 的
 # poll/try 面——直连端口 + 腿表 + 注入队列，M1 设计 §1.6）；其余 features 见 workspace：

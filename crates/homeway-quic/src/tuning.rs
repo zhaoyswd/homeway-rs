@@ -192,19 +192,20 @@ pub const ENV_STREAM_PENDING: &str = "HOMEWAY_QUIC_STREAM_PENDING";
 /// 属判据面变更，须先有实测读数再谈默认值。本批只做「可开关 + 可复现地量」，**默认档一个
 /// 字节都不动**（不设 env = 现状 = quinn 默认 CUBIC）。要转正式配置项另登记。
 ///
-/// 值域是**闭集**（不是区间）：`cubic` / `bbr`，大小写不敏感；其余一律非法 ⇒
-/// 记行 + 回落 `cubic`（照 `HOMEWAY_QUIC_MTU` 先例）。**`bbr3` 在移植落地后加入**
-/// （本批第二段：env 域与实现同批扩，避免「接受一个悬空值」）。
+/// 值域是**闭集**（不是区间）：`cubic` / `bbr` / `bbr3`，大小写不敏感；其余一律非法 ⇒
+/// 记行 + 回落 `cubic`（照 `HOMEWAY_QUIC_MTU` 先例）。
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub enum CcChoice {
-    /// quinn 缺省 CUBIC（RFC 8312；与 smoltcp 侧同族）。
+    /// 框架缺省 CUBIC（RFC 8312；与 smoltcp 侧同族）。
     #[default]
     Cubic,
-    /// quinn 自带 BBR **v1**（draft-iccrg；上游标注 Experimental）。
+    /// 框架自带 BBR **v1**（draft-iccrg；上游标注 Experimental）。
     Bbr,
+    /// **BBRv3**（`crate::cc`：移植自 tquic，Apache-2.0；出处与差异见该模块头）。
+    Bbr3,
 }
 
-/// env 名：拥塞控制器（`cubic`[默认] / `bbr`）。
+/// env 名：拥塞控制器（`cubic`[默认] / `bbr` / `bbr3`）。
 pub const ENV_CC: &str = "HOMEWAY_QUIC_CC";
 
 impl CcChoice {
@@ -213,6 +214,7 @@ impl CcChoice {
         match self {
             CcChoice::Cubic => "cubic",
             CcChoice::Bbr => "bbr",
+            CcChoice::Bbr3 => "bbr3",
         }
     }
 
@@ -223,13 +225,15 @@ impl CcChoice {
             Some(CcChoice::Cubic)
         } else if v.eq_ignore_ascii_case("bbr") {
             Some(CcChoice::Bbr)
+        } else if v.eq_ignore_ascii_case("bbr3") {
+            Some(CcChoice::Bbr3)
         } else {
             None
         }
     }
 
     /// 合法值域的展示串（记行用；与 [`Self::parse`] 成对维护）。
-    pub const VALUES: &'static str = "cubic|bbr";
+    pub const VALUES: &'static str = "cubic|bbr|bbr3";
 
     /// env 覆盖（形态同 [`StreamLimits::apply_env`]）：**未设 ⇒ 不改、不打行**；
     /// **非法 ⇒ 不改本值 + 一行说明**（调用方落 `Logf`）。
@@ -762,6 +766,8 @@ mod tests {
             ("CUBIC", CcChoice::Cubic),
             (" bbr ", CcChoice::Bbr),
             ("Bbr", CcChoice::Bbr),
+            ("bbr3", CcChoice::Bbr3),
+            ("BBR3", CcChoice::Bbr3),
         ] {
             let mut cc = CcChoice::Cubic;
             let (applied, notes) = cc.apply_env(&one(raw));
@@ -796,13 +802,14 @@ mod tests {
         for (v, want) in [
             ("cubic", CcChoice::Cubic),
             ("bbr", CcChoice::Bbr),
+            ("bbr3", CcChoice::Bbr3),
         ] {
             assert!(CcChoice::VALUES.split('|').any(|x| x == v), "{v} 在展示串里");
             assert_eq!(CcChoice::parse(v), Some(want));
         }
         assert_eq!(
             CcChoice::VALUES.split('|').count(),
-            2,
+            3,
             "值域项数 = parse 接受的字形数（加档必须两处同批）"
         );
     }

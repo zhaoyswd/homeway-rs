@@ -529,6 +529,7 @@ dependencies = [
  "hmac",
  "libc",
  "quinn",
+ "quinn-proto",
  "rustls",
  "sha2",
  "thiserror 2.0.21",

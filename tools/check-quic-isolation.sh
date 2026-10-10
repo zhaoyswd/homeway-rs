@@ -101,6 +101,11 @@ ASYNC_FILES=(
   "client/ladder.rs"
   # M4 S1：出口 dial 腿（tag=4 真拨号：`tokio::time::timeout` + `tokio::net::TcpStream`）
   "exit/dial.rs"
+  # M6.7 拥塞控制对比批：BBRv3 移植（实现框架的 `Controller`/`ControllerFactory` ⇒ 必点
+  # 框架名）。同模块的 `cc/mod.rs`（模块头/工厂转发）与 `cc/minmax.rs`、
+  # `cc/delivery_rate.rs` 都是**纯算法/纯 std**（零异步名）⇒ **不入清单**，受 ② 条递归
+  # 真扫描（与 `exit/intake.rs` 同款处置；豁免自证会挡住「往清单里塞纯 std 文件」）。
+  "cc/bbr3.rs"
 )
 # 异步名的判定式（②条、豁免自证、扫描器自校准**共用同一串**——三处不同步 = 门自相矛盾）。
 # **代码门 r15 G1 整改**：`client/migration.rs` 原在清单里但它**零异步名**（纯逻辑小件，
