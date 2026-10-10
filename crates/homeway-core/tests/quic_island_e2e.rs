@@ -1083,8 +1083,13 @@ fn inner_udp_payload(p: &[u8]) -> Option<&[u8]> {
     (p.len() >= off).then(|| &p[off..])
 }
 
-/// 读出口日志里**最后一条** `dns: q=N … resp=M` 计数行（返回 `(q, resp, 原文)`）。
-fn last_dns_counters(log: &PathBuf) -> Option<(u64, u64, String)> {
+/// 读出口日志里**最后一条** `dns: q=N … resp=M` 计数行（返回 `(q, resp, filter, 原文)`）。
+///
+/// **计数语义（回源码核过，勿想当然）**：`q` 在 `submit()` 记（每枚到达 DNS 面的查询）；
+/// `resp` 在 `respond()` 的**转发路径**末尾记；**被代答过滤的 qtype（AAAA/HTTPS/SVCB/ANY）
+/// 走 early-return，只记 `filter` 不记 `resp`**（`server/dnsproxy.rs:666/702`）
+/// ⇒ 本用例的「A + AAAA」两枚查询的期望增量 = `Δq ≥ 2`、`Δfilter ≥ 1`、`Δresp ≥ 1`。
+fn last_dns_counters(log: &PathBuf) -> Option<(u64, u64, u64, String)> {
     let s = std::fs::read_to_string(log).ok()?;
     let line = s.lines().rev().find(|l| l.contains("dns: q="))?.to_owned();
     let num = |key: &str| -> Option<u64> {
@@ -1092,7 +1097,7 @@ fn last_dns_counters(log: &PathBuf) -> Option<(u64, u64, String)> {
         let d: String = line[i..].chars().take_while(|c| c.is_ascii_digit()).collect();
         d.parse().ok()
     };
-    Some((num("dns: q=")?, num("resp=")?, line))
+    Some((num("dns: q=")?, num("resp=")?, num("filter=")?, line))
 }
 
 /// **判据（M7 S2a 的 V20 本机轮）**：隧道 DNS 代答的**经隧道回包**——走产品路径
@@ -1101,7 +1106,8 @@ fn last_dns_counters(log: &PathBuf) -> Option<(u64, u64, String)> {
 /// ①两枚查询（A + 被代答过滤的 AAAA）**都**经隧道回包：txid 一致、QR=1、问题段回显；
 /// ②出口侧 E4 族 `dns 代答就绪：tunnel=100.64.255.1:53（UDP+TCP）resolve=…:5300（TCP）` 在场；
 /// ③`dns: q=N … resp=M` **计数对账**（**基线先等到一次拍边界**（计数行 60s 一拍、无条件产出）
-/// 再发查询 ⇒ Δ **必为**本轮两枚查询的净增量；断言 Δq ≥ 2 且 Δresp ≥ 2；两段等待各 ≤100s）。
+/// 再发查询 ⇒ Δ **必为**本轮两枚查询的净增量；断言 `Δq ≥ 2` + `Δfilter ≥ 1` + `Δresp ≥ 1`
+/// ——**过滤 qtype 只记 `filter` 不记 `resp`**（`dnsproxy.rs:666/702`，回源码核过）；两段等待各 ≤100s）。
 ///
 /// **口径（如实）**：`resolve=…:5300`（TCP 解析腿）**不在本机轮**——内层 TCP 需要真客户端
 /// 内核栈；且宿主会话面对该端口已退役（`INTEROP-CRITERIA` CA5 登记）。真机轮（S2b/U2）承接。
@@ -1125,17 +1131,21 @@ fn dns_query_over_tunnel_round_trips() {
     // （或实例的首拍）作为基线，再发查询——这样 Δ 才是「本轮两枚查询」的净增量。
     // 代价：本用例最慢（基线等 ≤100s + 拍间隔 ≤100s）；上界只判上界（flake 口径②）。
     let base0 = last_dns_counters(&exit_log);
-    let mut baseline = base0.as_ref().map(|(q, r, _)| (*q, *r));
+    let mut baseline = base0.as_ref().map(|(q, r, f, _)| (*q, *r, *f));
     let deadline = Instant::now() + Duration::from_secs(100);
     while Instant::now() < deadline {
-        let cur = last_dns_counters(&exit_log).map(|(q, r, _)| (q, r));
+        let cur = last_dns_counters(&exit_log).map(|(q, r, f, _)| (q, r, f));
         if cur != baseline {
             baseline = cur;
             break;
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-    println!("[dns] 拍边界基线 base0={:?} baseline={:?}", base0.as_ref().map(|(q, r, _)| (*q, *r)), baseline);
+    println!(
+        "[dns] 拍边界基线 base0={:?} baseline(q,resp,filter)={:?}",
+        base0.as_ref().map(|(q, r, f, _)| (*q, *r, *f)),
+        baseline
+    );
 
     let dir = std::env::temp_dir().join(format!("hw-m7-dns-{}", std::process::id()));
     std::fs::create_dir_all(&dir).expect("临时目录可建");
@@ -1234,29 +1244,33 @@ fn dns_query_over_tunnel_round_trips() {
     );
 
     // ---- ③计数对账（**基线 = 拍边界**，故 Δ 必为本轮两枚查询的净增量；等下一拍 ≤100s）----
-    let base = baseline.expect("基线拍必须取到（出口 `dns:` 计数行 60s 一拍且无条件产出）");
-    let mut cur = last_dns_counters(&exit_log).map(|(q, r, _)| (q, r));
+    let (bq, br, bf) = baseline.expect("基线拍必须取到（出口 `dns:` 计数行 60s 一拍且无条件产出）");
+    let mut cur = last_dns_counters(&exit_log).map(|(q, r, f, _)| (q, r, f));
     let deadline = Instant::now() + Duration::from_secs(100);
     while Instant::now() < deadline {
-        if let Some((q1, r1)) = cur {
-            if q1 >= base.0 + 2 && r1 >= base.1 + 2 {
+        if let Some((q1, r1, f1)) = cur {
+            if q1 >= bq + 2 && f1 > bf && r1 > br {
                 break;
             }
         }
         std::thread::sleep(Duration::from_millis(500));
-        cur = last_dns_counters(&exit_log).map(|(q, r, _)| (q, r));
+        cur = last_dns_counters(&exit_log).map(|(q, r, f, _)| (q, r, f));
     }
-    let (q1, r1) = cur.expect("出口须有 dns: 计数行（E22 族）");
-    println!("[dns] 计数对账：baseline={base:?} → ({q1},{r1})（Δq={}，Δresp={}）", q1 - base.0, r1 - base.1);
+    let (q1, r1, f1) = cur.expect("出口须有 dns: 计数行（E22 族）");
+    println!(
+        "[dns] 计数对账：baseline(q,resp,filter)=({bq},{br},{bf}) → ({q1},{r1},{f1})（Δq={}，Δresp={}，Δfilter={}）",
+        q1 - bq,
+        r1 - br,
+        f1 - bf
+    );
+    assert!(q1 >= bq + 2, "Δq 须 ≥ 2（两枚查询都到达出口 DNS 面）：{bq} → {q1}");
     assert!(
-        q1 >= base.0 + 2,
-        "Δq 须 ≥ 2（两枚查询都到达出口 DNS 面）：{} → {q1}",
-        base.0
+        r1 > br,
+        "Δresp 须 ≥ 1（A 查询的应答已交付；**过滤 qtype 走 early-return 不计 resp**——回源码核过）：{br} → {r1}"
     );
     assert!(
-        r1 >= base.1 + 2,
-        "Δresp 须 ≥ 2（两枚查询都经隧道回包）：{} → {r1}",
-        base.1
+        f1 > bf,
+        "Δfilter 须 ≥ 1（AAAA 走的正是代答过滤路径）：{bf} → {f1}"
     );
 
     let _ = core.tun_stop();
