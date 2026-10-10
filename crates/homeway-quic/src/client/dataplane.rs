@@ -155,7 +155,9 @@ fn drain_ready(conn: &Connection) -> crate::tun::ReturnBatch {
     let mut cx = std::task::Context::from_waker(waker);
     let mut batch: crate::tun::ReturnBatch = Vec::new();
     while batch.len() < crate::tun::RETURN_BATCH_MAX {
-        let mut fut = Box::pin(conn.read_datagram());
+        // 栈钉定（2026-10-10 审查 中-5：原 `Box::pin` 每包一次堆分配，30–45k 包/s 的
+        // 下行热路径 = 每秒数万次 malloc；`pin!` 零分配同语义）
+        let mut fut = std::pin::pin!(conn.read_datagram());
         match std::future::Future::poll(fut.as_mut(), &mut cx) {
             std::task::Poll::Ready(Ok(d)) => batch.push(d.to_vec().into_boxed_slice()),
             // 队列空（正常）或连接错（由 await 分支收口）
