@@ -66,7 +66,7 @@ pub enum FilesError {
     /// 传输/协议层失败（连接、帧、JSON）。
     #[error("files 传输失败：{0}")]
     Transport(String),
-    /// 连接建立失败（宿主会话拨号；§2.5 的换型面：`wgcore::ConnErr` 不迁入）。
+    /// 连接建立失败（宿主会话拨号；§2.5 的换型面：已退役 WG 档的错误类型不迁入）。
     #[error("files 连接失败：{0}")]
     Conn(#[from] HostErr),
 }

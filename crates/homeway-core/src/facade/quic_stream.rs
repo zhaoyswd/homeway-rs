@@ -417,8 +417,8 @@ fn stream_err_to_io(e: StreamErr) -> io::Error {
     io::Error::new(kind, format!("QUIC 服务流：{}（{e}）", e.text()))
 }
 
-/// 流句柄的共享体（两半各持一份 `Arc`；**Drop = 关流**——防半开连接累积，与
-/// `tun_exec::SharedConn` 同款且同预算）。
+/// 流句柄的共享体（两半各持一份 `Arc`；**Drop = 关流**——防半开连接累积；形态承
+/// 自已退役的 WG 档 `SharedConn`，预算同款）。
 struct StreamShared {
     island: Arc<Island>,
     id: StreamId,
@@ -496,19 +496,21 @@ struct QuicReadHalf {
 /// 单独成件（而不是裸 `buf/off` 字段）的唯一理由 = **可测**：这条不变量（余量先出、分次不丢、
 /// 空则转岛命令面）没有真岛就构造不出「首块 > 1B」的时序，而它一旦破了就是**应用层帧错位**
 /// （浏览器侧表现为「响应缺首字节」，极难定位——§1.2 铁律）。
+/// 读余量缓冲（单源：本文件与 `host_session` 的流面共用——**余量丢失 = 应用层帧
+/// 错位**，两处必须同一实现）。
 #[derive(Default)]
-struct PendingBuf {
-    buf: Vec<u8>,
-    off: usize,
+pub(crate) struct PendingBuf {
+    pub(crate) buf: Vec<u8>,
+    pub(crate) off: usize,
 }
 
 impl PendingBuf {
-    fn new(buf: Vec<u8>) -> Self {
+    pub(crate) fn new(buf: Vec<u8>) -> Self {
         PendingBuf { buf, off: 0 }
     }
 
-    /// 取一段（`None` = 余量已空 ⇒ 调用方转 `Cmd::StreamRead`）。
-    fn take(&mut self, out: &mut [u8]) -> Option<usize> {
+    /// 取一段（`None` = 余量已空 ⇒ 调用方转下一段读取）。
+    pub(crate) fn take(&mut self, out: &mut [u8]) -> Option<usize> {
         if self.off >= self.buf.len() {
             return None;
         }

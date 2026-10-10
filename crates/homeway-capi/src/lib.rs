@@ -6,8 +6,9 @@
 //! - 入参 `char*`：本壳只读（CStr 即时转 &str），**从不释放**——副本由 NAPI 侧
 //!   分配与回收；
 //! - 返回 `char*`：`libc::malloc` 分配（**非 Rust 分配器**——NAPI 侧 `std::free`
-//!   释放，Go C.CString 同契约）；失败兜底返回空串指针（永不为 NULL——NAPI 侧
-//!   MakeString 对 NULL 转空串，但恒非空更稳）；
+//!   释放，Go C.CString 同契约）；失败兜底返回空串指针（2026-10-10 审查订正：
+//!   malloc **二次**失败时仍可能 NULL——NAPI 侧 MakeString 对 NULL 转空串，
+//!   消费方按空串处理即安全）；
 //! - panic 边界（工单⑥）：每导出 `catch_unwind`——c-shared 宿主是扩展进程，
 //!   panic 穿透 = 整个 App 数据面死；兜底返回安全错误值（int = -9；char* = 空）。
 //!

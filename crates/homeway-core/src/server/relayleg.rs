@@ -1,8 +1,8 @@
 //! 出口侧的中继注册腿（UDP）+ 控制面客户端（TCP）——R4-4c。
 //!
 //! 语义真源 `baseline:internal/server/{relayclient,relayctl}.go`。三条硬约束（design D4）：
-//! 1. **注册腿与数据面同一本地端口**：全部出站经驱动线程 ServerBind 的同一 WG socket
-//!    （`try_clone` 的 fd 副本——NAT 映射一致，打洞才打得开）；
+//! 1. **注册腿与数据面同一本地端口**：注册腿的出站 socket = 公共端口（M5 起 =
+//!    QUIC 面那一个 UDP socket）的 `try_clone` fd 副本——NAT 映射一致，打洞才打得开；
 //! 2. 注册必须证明持有 peerId 私钥（X25519 挑战响应）；
 //! 3. **M5 S4**：hint 盲打面（`LegEvent::Hint`/`parse_hint_addr`/`run_punch_worker`）随
 //!    WG 面退役整体删除——hint 的消费者是 WG 打洞（`bind.set_on_hint` 删于 S3b ⇒ 本面
@@ -194,7 +194,7 @@ fn run_relay_leg(
     }
 }
 
-/// 经腿 socket 发往端点（族适配：sock 是主 WG socket 的克隆——双栈形态发 v4 目标
+/// 经腿 socket 发往端点（族适配：sock 是公共端口 socket 的克隆——双栈形态发 v4 目标
 /// 须 map v4-mapped，否则 EINVAL）。控制面低频路径，getsockopt 每次查无妨。
 fn send_to_ep(sock: &UdpSocket, payload: &[u8], ep: SocketAddr) -> std::io::Result<usize> {
     let dual = crate::udpbatch::is_dual_stack(sock);

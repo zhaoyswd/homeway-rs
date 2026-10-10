@@ -1,6 +1,6 @@
 //! 出口**公共端点面**（M5 S3a）：WG 面退役后，出口唯一的公共 UDP 端口 = QUIC 出口
 //! socket（`homeway_quic::ExitQuic` 的直连端口）。本模块是那一端口上**非 QUIC** 流量的
-//! 协议真源——原 `ServerBind`（WG socket）上的五类公共端点面在这里重建：
+//! 协议真源——原 `ServerBind`（历史 WG socket；M5 起 = QUIC 公共端口）上的五类公共端点面在这里重建：
 //!
 //! | # | 面 | 原落点 | 现落点 |
 //! |---|---|---|---|

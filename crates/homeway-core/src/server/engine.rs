@@ -10,7 +10,7 @@
 //! 端点回填同面。
 //!
 //! 收工序（Go Shutdown D5）：① 停新流（HaltNew）→ ② 关 UDS listeners → ③ 过境存量
-//! 有界宽限（Drain）→ ④ 关 WG UDP → ⑤ DNS/观测收工 + UPnP 缩租 + 服务收工。
+//! 有界宽限（Drain）→ ④ 关 QUIC 面（公共 UDP 端口）→ ⑤ DNS/观测收工 + UPnP 缩租 + 服务收工。
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
@@ -45,7 +45,7 @@ const PUBLIC_REFRESH_FAIL: Duration = Duration::from_secs(120);
 /// udpcap 重探间隔（Go udpCapInterval——设计表误写 10min，Go 真源 5min）。
 const UDPCAP_INTERVAL: Duration = Duration::from_secs(300);
 
-/// WG socket 钉哪张物理网卡（BindMode）。
+/// 公共端口 socket 钉哪张物理网卡（BindMode；历史名 = WG socket）。
 #[derive(Clone, Debug, PartialEq)]
 pub enum BindMode {
     /// 自动挑卡（探针取最快；看护循环每轮重挑）。
@@ -2341,9 +2341,12 @@ fn probe_once(
         }
     }
     let _ = generic_ok;
-    // 真实流量证据（统计窗口 = 本次探测与上次探测之间）
+    // 真实流量证据（统计窗口 = 本次探测与上次探测之间）。键名取数（2026-10-10 审查
+    // 低-8：原按位置索引 `snap[4]/snap[5]`，与同文件 `status_bits` 的按键名查找两种
+    // 取法并存——快照表一旦重排即静默读错，编译器无从兜底）。
     let snap = stats.snapshot();
-    let (replied, no_reply) = (snap[4].1, snap[5].1);
+    let get = |k: &str| snap.iter().find(|(n, _)| *n == k).map(|(_, v)| *v).unwrap_or(0);
+    let (replied, no_reply) = (get("udpReplied"), get("udpNoReply"));
     let d_replied = replied.saturating_sub(*prev_replied);
     let d_no_reply = no_reply.saturating_sub(*prev_no_reply);
     *prev_replied = replied;

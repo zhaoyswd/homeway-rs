@@ -387,7 +387,7 @@ impl HostSession {
         });
 
         let island = start_island(&cfg.token, &ident, &cands, &inner)?;
-        *lock(&inner.island) = Some(Arc::clone(&island));
+        *crate::syncutil::lock_unpoison(&inner.island) = Some(Arc::clone(&island));
         let n = cands.len();
         let outcome = island_cmd(
             &island,
@@ -407,7 +407,7 @@ impl HostSession {
             )),
             Err(e) => {
                 // 建连失败 = 装配类硬失败（清岛 + 报装配错误——上层按「会话失败」收口）。
-                *lock(&inner.island) = None;
+                *crate::syncutil::lock_unpoison(&inner.island) = None;
                 let _ = island.stop_within(Instant::now() + STOP_WAIT);
                 return Err(HostErr::Start(format!("岛建连失败：{e}")));
             }
@@ -452,7 +452,7 @@ impl HostSession {
                 None
             }
         };
-        *lock(&inner.patrol) = patrol;
+        *crate::syncutil::lock_unpoison(&inner.patrol) = patrol;
         Ok(HostSession { inner })
     }
 
@@ -472,7 +472,7 @@ impl HostSession {
             shared: Arc::new(StreamShared {
                 island,
                 id,
-                pending: Mutex::new(PendingBuf::new(rest)),
+                pending: Mutex::new(super::quic_stream::PendingBuf::new(rest)),
             }),
         })
     }
@@ -484,7 +484,7 @@ impl HostSession {
 
     /// 状态快照（键面同形；来源 = 岛快照）。
     pub fn snapshot(&self) -> SessionSnapshot {
-        let mut s = lock(&self.inner.snapshot).clone();
+        let mut s = crate::syncutil::lock_unpoison(&self.inner.snapshot).clone();
         s.stats = self.island_stats();
         s
     }
@@ -523,12 +523,12 @@ impl HostSession {
         }
         set_state_unless_failed(&self.inner, SessState::Stopping, "");
         let deadline = Instant::now() + STOP_WAIT;
-        if let Some(h) = lock(&self.inner.patrol).take() {
+        if let Some(h) = crate::syncutil::lock_unpoison(&self.inner.patrol).take() {
             if !crate::syncutil::join_bounded(h, deadline) {
                 (self.inner.logf)("收工等待巡检线程超时（STOP_WAIT）——放行自退");
             }
         }
-        let island = lock(&self.inner.island).take();
+        let island = crate::syncutil::lock_unpoison(&self.inner.island).take();
         self.inner.gen.fetch_add(1, Ordering::Release);
         if let Some(i) = island {
             if !i.stop_within(deadline) {
@@ -542,7 +542,12 @@ impl HostSession {
         }
     }
 
-    /// 带期限收工（服务域 `stop` 的既有节奏；`true` = 期限内收完本体）。
+    /// 带期限收工（服务域 `stop` 的既有节奏）。
+    ///
+    /// 返回值语义（2026-10-10 审查 低-11 澄清，行为保持既有）：`true` = **岛本体**
+    /// 收工无异常——赶上了调用方期限，或虽超期但自身耗时 < [`STOP_WAIT`]（超期可能
+    /// 来自同预算里巡检线程的先行消耗，不该让岛背 detach 的锅）；`false` = 岛本体
+    /// 自身耗时 ≥ [`STOP_WAIT`]（真卡死面）⇒ 调用方走 detach/收割线程兜底。
     pub fn stop_within(&self, deadline: Instant) -> bool {
         let t0 = Instant::now();
         self.stop();
@@ -558,7 +563,7 @@ impl HostSession {
         if self.inner.stop.load(Ordering::Acquire) {
             return Err(HostErr::Closed("本会话已收工".to_owned()));
         }
-        lock(&self.inner.island)
+        crate::syncutil::lock_unpoison(&self.inner.island)
             .clone()
             .ok_or(HostErr::NoFace)
     }
@@ -571,13 +576,13 @@ impl HostSession {
             shared: Arc::new(StreamShared {
                 island,
                 id,
-                pending: Mutex::new(PendingBuf::default()),
+                pending: Mutex::new(super::quic_stream::PendingBuf::default()),
             }),
         })
     }
 
     fn island_stats(&self) -> Option<(u64, u64)> {
-        let i = lock(&self.inner.island).clone()?;
+        let i = crate::syncutil::lock_unpoison(&self.inner.island).clone()?;
         let s = i.snapshot();
         Some((s.stream_bytes_in, s.stream_bytes_out))
     }
@@ -727,7 +732,7 @@ fn start_island(
 // ---------- 探活 / 快照 ----------
 
 fn probe_once(inner: &Arc<Inner>, budget: Duration) -> ProbeOutcome {
-    let island = lock(&inner.island).clone();
+    let island = crate::syncutil::lock_unpoison(&inner.island).clone();
     let Some(island) = island else {
         return ProbeOutcome::NoFace;
     };
@@ -747,14 +752,14 @@ fn probe_once(inner: &Arc<Inner>, budget: Duration) -> ProbeOutcome {
 }
 
 fn set_link(inner: &Arc<Inner>, rtt: Duration) {
-    let island = lock(&inner.island).clone();
+    let island = crate::syncutil::lock_unpoison(&inner.island).clone();
     let Some(i) = island else { return };
     let s = i.snapshot();
     let via = s
         .via
         .map(|v| v.link_text().to_owned())
         .unwrap_or_else(|| "none".to_owned());
-    let mut snap = lock(&inner.snapshot);
+    let mut snap = crate::syncutil::lock_unpoison(&inner.snapshot);
     snap.link = Some(LinkSnapshot {
         via: via.clone(),
         ep: s.ep.map(|a| a.to_string()).unwrap_or_default(),
@@ -771,7 +776,7 @@ fn set_link(inner: &Arc<Inner>, rtt: Duration) {
 }
 
 fn set_state(inner: &Arc<Inner>, state: SessState, reason: &str) {
-    let mut s = lock(&inner.snapshot);
+    let mut s = crate::syncutil::lock_unpoison(&inner.snapshot);
     s.state = state;
     s.reason = reason.to_owned();
     s.since = Instant::now();
@@ -779,7 +784,7 @@ fn set_state(inner: &Arc<Inner>, state: SessState, reason: &str) {
 
 /// **除非当前是 Failed** 才置态（failed 终态保留；同一临界区内判定 + 写）。
 fn set_state_unless_failed(inner: &Arc<Inner>, state: SessState, reason: &str) -> bool {
-    let mut s = lock(&inner.snapshot);
+    let mut s = crate::syncutil::lock_unpoison(&inner.snapshot);
     if s.state == SessState::Failed {
         return false;
     }
@@ -870,10 +875,6 @@ fn now_unix_ms() -> i64 {
         .unwrap_or(0)
 }
 
-fn lock<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 // ---------- 流句柄（`&self` 面 = daemon 承载面消费；半句柄面 = 桥泵消费） ----------
 
 /// 一条宿主流的共享体（两个面共用：`&self` 的 chunk 面 + 拆半的两半）。
@@ -882,12 +883,12 @@ pub(crate) struct StreamShared {
     id: StreamId,
     /// 交付前**已在手**的余量（`STREAM[dial]` 的 1B 回执之后可能立刻跟目标字节——
     /// 余量丢失 = **应用层帧错位**；与 `quic_stream::PendingBuf` 同一不变量）。
-    pending: Mutex<PendingBuf>,
+    pending: Mutex<super::quic_stream::PendingBuf>,
 }
 
 impl StreamShared {
     fn take_pending(&self, out: &mut [u8]) -> Option<usize> {
-        lock(&self.pending).take(out)
+        crate::syncutil::lock_unpoison(&self.pending).take(out)
     }
 
     /// 读一块（`Closed` ⇒ EOF 面由调用方分档）。
@@ -900,28 +901,6 @@ impl Drop for StreamShared {
     fn drop(&mut self) {
         // 关流走在必须退出的收工链上（桥泵收口）⇒ 有界面（岛卡死时不挂死线程）。
         super::quic_stream::close_block(&self.island, self.id);
-    }
-}
-
-#[derive(Default)]
-struct PendingBuf {
-    buf: Vec<u8>,
-    off: usize,
-}
-
-impl PendingBuf {
-    fn new(buf: Vec<u8>) -> Self {
-        PendingBuf { buf, off: 0 }
-    }
-
-    fn take(&mut self, out: &mut [u8]) -> Option<usize> {
-        if self.off >= self.buf.len() {
-            return None;
-        }
-        let n = (self.buf.len() - self.off).min(out.len());
-        out[..n].copy_from_slice(&self.buf[self.off..self.off + n]);
-        self.off += n;
-        Some(n)
     }
 }
 
@@ -999,7 +978,7 @@ impl Read for HostReadHalf {
             Ok(data) => {
                 let n = data.len().min(out.len());
                 out[..n].copy_from_slice(&data[..n]);
-                let mut p = lock(&self.shared.pending);
+                let mut p = crate::syncutil::lock_unpoison(&self.shared.pending);
                 p.buf = data;
                 p.off = n;
                 Ok(n)

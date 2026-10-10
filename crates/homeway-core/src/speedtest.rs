@@ -99,8 +99,8 @@ pub const REASON_INVALID_ARG: &str = "invalid_arg";
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
 pub enum SpeedtestError {
-    /// 连接建立/承载失败（M5 C2 载荷换型：`wgcore::ConnErr` → 宿主会话 `HostErr`；
-    /// §2.5：WG 版错误类型不迁入新面）。
+    /// 连接建立/承载失败（M5 C2 载荷换型：错误类型从已退役的 WG 版换成本面
+    /// `SpeedtestError`；§2.5：旧版错误类型不迁入新面）。
     #[error("测速连接失败：{0}")]
     Conn(#[from] crate::facade::host_session::HostErr),
     /// 期限到点（桥面/承载面超时——M5 C2 新增变体，§2.5 定稿：不再借

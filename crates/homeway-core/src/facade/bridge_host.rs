@@ -80,10 +80,6 @@ impl WriteHalf for Box<dyn WriteHalf + Send> {
 
 /// 宿主域的锁获取（工单②：锁中毒不 panic——c-shared 宿主进程里 panic = 扩展进程
 /// 死；持锁线程 panic 后数据仍可用，into_inner 取出继续）。
-fn lock_host<T>(m: &Mutex<T>) -> std::sync::MutexGuard<'_, T> {
-    m.lock().unwrap_or_else(|e| e.into_inner())
-}
-
 /// 桥拨号闭包面（工单⑤ dial_port 接缝的类型别名）。
 ///
 /// Q-F F4：**单个 `Arc`**——`handle_conn` 从锁里克隆 Arc 后**出锁拨号**（此前持锁
@@ -244,7 +240,7 @@ impl ConnGate {
     /// 登记：满员挤掉最老（返回其 fd 供调用方断连）。clone 失败不入表（少记一条
     /// 比误挤好）。
     fn admit(&self, conn: &UnixStream) -> (u64, Option<UnixStream>) {
-        let mut live = lock_host(&self.live);
+        let mut live = crate::syncutil::lock_unpoison(&self.live);
         let evicted = if live.len() >= self.max {
             live.pop_front().map(|(_, c)| c)
         } else {
@@ -258,7 +254,7 @@ impl ConnGate {
     }
 
     fn leave(&self, ticket: u64) {
-        lock_host(&self.live).retain(|(t, _)| *t != ticket);
+        crate::syncutil::lock_unpoison(&self.live).retain(|(t, _)| *t != ticket);
     }
 }
 
@@ -445,13 +441,13 @@ impl BridgeHost {
     /// 换拨号面（服务桥形态：构造时给占位，会话建好后换真拨号；幂等替换）。
     /// F4：原子换 `Arc`（在途拨号持旧 Arc 跑完，换轨不阻塞、不半换）。
     pub fn set_dial(&self, f: DialFn) {
-        *lock_host(&self.dial_port) = f;
+        *crate::syncutil::lock_unpoison(&self.dial_port) = f;
     }
 
     /// 换拨号预算（隧道域随 tunConfig.dialMs 传入——Go tunRunner.dialTimeout 同义；
     /// 评审 r2-L5：dial_ms 此前是死字段）。
     pub fn set_dial_timeout(&self, d: Duration) {
-        *lock_host(&self.dial_timeout) = d.max(Duration::from_millis(500));
+        *crate::syncutil::lock_unpoison(&self.dial_timeout) = d.max(Duration::from_millis(500));
     }
 
     fn live_leave(&self) {
@@ -463,7 +459,7 @@ impl BridgeHost {
     /// 起桥（幂等；非阻塞——listen 重试在后台线程）。任一座桥起不来只记状态不
     /// 阻断宿主（桥是附加能力，不是数据面本体）。
     pub fn start(self: &Arc<Self>) {
-        let mut inner = lock_host(&self.inner);
+        let mut inner = crate::syncutil::lock_unpoison(&self.inner);
         if inner.token.is_some() || self.stopped.load(Ordering::Acquire) {
             return; // 已启动 / 已停止
         }
@@ -548,7 +544,7 @@ impl BridgeHost {
             if let Err(e) = spawned {
                 // F7-4①：置位点在 spawn 点（accept_loop 在 spawn 失败时根本不会跑）
                 let (name, logf) = {
-                    let mut inner = lock_host(&self.inner);
+                    let mut inner = crate::syncutil::lock_unpoison(&self.inner);
                     let name = inner.socks.get(idx).map(|s| s.name).unwrap_or("bridge");
                     if let Some(s) = inner.socks.get_mut(idx) {
                         s.unavailable = true;
@@ -573,7 +569,7 @@ impl BridgeHost {
     fn accept_loop(self: Arc<Self>, idx: usize) {
         self.live_enter();
         let (name, port, path) = {
-            let inner = lock_host(&self.inner);
+            let inner = crate::syncutil::lock_unpoison(&self.inner);
             match inner.socks.get(idx) {
                 Some(s) => (s.name, s.port, s.path.clone()),
                 None => return self.live_leave(),
@@ -581,7 +577,7 @@ impl BridgeHost {
         };
         let ln =
             BridgeSock::listen_path(name, &path, &self.stopped, &self.logf).map(|(ln, own)| {
-                let mut inner = lock_host(&self.inner);
+                let mut inner = crate::syncutil::lock_unpoison(&self.inner);
                 if let Some(s) = inner.socks.get_mut(idx) {
                     s.own = own;
                 }
@@ -590,7 +586,7 @@ impl BridgeHost {
         let Some(ln) = ln else {
             // F7-4②：listen 重试耗尽 ⇒ 置位（status 面返回空路径——不再谎报可用）
             {
-                let mut inner = lock_host(&self.inner);
+                let mut inner = crate::syncutil::lock_unpoison(&self.inner);
                 if let Some(s) = inner.socks.get_mut(idx) {
                     s.unavailable = true;
                 }
@@ -628,7 +624,7 @@ impl BridgeHost {
     fn handle_conn(&self, name: &'static str, port: u16, mut conn: UnixStream) {
         self.live_enter();
         let (gate, token) = {
-            let inner = lock_host(&self.inner);
+            let inner = crate::syncutil::lock_unpoison(&self.inner);
             let g = match name {
                 "files-bridge" => Arc::clone(&inner.files_gate),
                 "term-bridge" => Arc::clone(&inner.term_gate),
@@ -656,8 +652,8 @@ impl BridgeHost {
             return;
         }
         // 预算与拨号面都**克隆出锁**再拨（F4：短临界区；拨号本身最长 15s，不得持锁）
-        let budget = *lock_host(&self.dial_timeout);
-        let dial = Arc::clone(&lock_host(&self.dial_port));
+        let budget = *crate::syncutil::lock_unpoison(&self.dial_timeout);
+        let dial = Arc::clone(&crate::syncutil::lock_unpoison(&self.dial_port));
         let r = dial(port, budget);
         match r {
             Ok(remote) => {
@@ -731,7 +727,7 @@ impl BridgeHost {
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
         let socks = {
-            let mut inner = lock_host(&self.inner);
+            let mut inner = crate::syncutil::lock_unpoison(&self.inner);
             inner.token = None;
             std::mem::take(&mut inner.socks)
         };
@@ -742,7 +738,7 @@ impl BridgeHost {
         // 鉴权/拨号——等一下让「下一次 start 不撞旧票/旧监听」；泵线程不等待，
         // 在途连接随会话关闭自然断——Go bridge.stop 同形态）。
         let deadline = Instant::now() + Duration::from_secs(2);
-        let mut n = lock_host(&self.live);
+        let mut n = crate::syncutil::lock_unpoison(&self.live);
         while *n > 0 {
             let left = deadline.saturating_duration_since(Instant::now());
             if left.is_zero() {
@@ -759,7 +755,7 @@ impl BridgeHost {
 
     /// 当前三座桥的状态（socket 路径随令牌在场；桥未起/已停全空串）。
     pub fn status(&self) -> BridgeStatus {
-        let inner = lock_host(&self.inner);
+        let inner = crate::syncutil::lock_unpoison(&self.inner);
         let Some(tok) = inner.token else {
             return BridgeStatus::default();
         };
@@ -1149,7 +1145,7 @@ mod tests {
                 Err(std::io::Error::new(ErrorKind::ConnectionRefused, "拒"))
             }),
         ));
-        let dial_of = |h: &Arc<BridgeHost>| Arc::clone(&lock_host(&h.dial_port));
+        let dial_of = |h: &Arc<BridgeHost>| Arc::clone(&crate::syncutil::lock_unpoison(&h.dial_port));
         let a = {
             let d = dial_of(&host);
             std::thread::spawn(move || d(7802, Duration::from_secs(5)))
@@ -1211,7 +1207,7 @@ mod tests {
         assert_eq!(before.auth_hex.len(), 96);
         // 直置位（F7-4 置位点在生产路径 = spawn 点 / listen 结论点）
         {
-            let mut inner = lock_host(&host.inner);
+            let mut inner = crate::syncutil::lock_unpoison(&host.inner);
             let s = inner
                 .socks
                 .iter_mut()

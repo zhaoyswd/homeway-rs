@@ -71,6 +71,8 @@ pub const ATTACH_DEADLINE: Duration = Duration::from_secs(60);
 /// 与 -4「失败」区分）。
 pub const ATTACH_POLL: Duration = Duration::from_secs(5);
 /// stop 收工等待预算（tunStopWait 的 3s；超时 -1，且期间无新世代 ⇒ 强制放锁 -2）。
+/// 墙钟上界口径（2026-10-10 审查 低-9，如实登记）：preparing 世代的停止会先在调用
+/// 线程上同步执行 `stop_within(CLIENT_CLOSE_BUDGET=2s)`，再进本预算 ⇒ 最坏 ~5s。
 pub const STOP_WAIT: Duration = Duration::from_secs(3);
 /// attach 死线终态的判据串（Go tunmode.go:802 生产路径逐字；C-5 向量源）。
 pub const ATTACH_TIMEOUT_REASON: &str = "就绪后无人 attach，已自行收工放锁";
@@ -620,7 +622,7 @@ mod tests {
                     shared
                         .stage
                         .set_if_current(gen, TunStage::Ready, "", "", true);
-                    shared.stage.set_ready_by("wg");
+                    shared.stage.set_ready_by("quic");
                 } else {
                     shared.stage.set_if_current(
                         gen,
@@ -719,7 +721,7 @@ mod tests {
         assert_eq!(core.tun_prepare(r#"{"token":"hmw2-x"}"#, true), 0);
         wait_stage(&core, TunStage::Ready, Duration::from_secs(2));
         assert!(core.tun_status().contains("\"state\":\"ready\""));
-        assert!(core.tun_status().contains("\"readyBy\":\"wg\""));
+        assert!(core.tun_status().contains("\"readyBy\":\"quic\""));
         assert_eq!(core.tun_attach(90, 1280), 0);
         wait_stage(&core, TunStage::Attached, Duration::from_secs(2));
         assert!(core.tun_status().contains("\"state\":\"attached\""));

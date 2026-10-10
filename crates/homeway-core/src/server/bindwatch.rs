@@ -1,6 +1,6 @@
 //! 绑卡看护循环（B0-1；语义真源 `baseline:internal/server/bindwatch.go`）。
 //!
-//! 出口的 WG socket 钉哪张物理网卡：默认**自动挑**，换网自动重挑 + 重钉。
+//! 出口的公共端口 socket（M5 起 = QUIC 面）钉哪张物理网卡：默认**自动挑**，换网自动重挑 + 重钉。
 //! - **换网卡指纹变化**（Wi-Fi↔有线、地址漂移）：重新挑卡重钉 socket，并踢公网
 //!   端点/udpcap 立即重测（否则接口索引一变，socket 就钉在一个不存在的网卡上、
 //!   端点 stale 到下一轮 10 分钟）；
@@ -100,7 +100,7 @@ pub(crate) struct WatchState {
 /// 2. 指纹变化：打「%s → %s」落入挑卡；
 /// 3. 挑卡：失败时**保留旧 pin**（从未钉过则「本轮不绑」）；
 /// 4. 挑到的还是同一张卡（同 index 同指纹）：不动；
-/// 5. 重钉失败打行保持现状；成功打「WG socket 钉在 %s（%s）」+ on_change。
+/// 5. 重钉失败打行保持现状；成功打「socket 钉在 %s（%s）」+ on_change。
 pub(crate) fn watch_tick(st: &mut WatchState, d: &mut impl WatchDeps) {
     st.tick += 1;
     // 1) 当前卡还在、指纹没变：只做低频健康检查

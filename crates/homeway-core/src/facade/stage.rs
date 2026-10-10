@@ -116,7 +116,7 @@ impl StageMachine {
         };
     }
 
-    /// 记录最近一次就绪的判据（现仅 "wg"——隧道内暖机探测；随 tunStatusJSON 下发）。
+    /// 记录最近一次就绪的判据（生产面现仅 "quic"——隧道内暖机探测；随 tunStatusJSON 下发）。
     /// 新世代起点清空（Go runTun2Tailcat 世代起点 setReadyBy("")）。
     pub fn set_ready_by(&self, by: &str) {
         lock_unpoison(&self.inner).snap.ready_by = by.to_owned();
@@ -180,9 +180,9 @@ mod tests {
     #[test]
     fn ready_by_survives_stage_writes() {
         let m = StageMachine::new();
-        m.set_ready_by("wg");
+        m.set_ready_by("quic");
         m.set(TunStage::Ready, "", "", true);
-        assert_eq!(m.snapshot().ready_by, "wg");
+        assert_eq!(m.snapshot().ready_by, "quic");
         m.set_ready_by("");
         assert_eq!(m.snapshot().ready_by, "");
     }
@@ -192,8 +192,8 @@ mod tests {
     fn begin_generation_clears_ready_by() {
         let m = StageMachine::new();
         m.begin_generation(1);
-        m.set_ready_by("wg");
-        assert_eq!(m.snapshot().ready_by, "wg");
+        m.set_ready_by("quic");
+        assert_eq!(m.snapshot().ready_by, "quic");
         m.begin_generation(2);
         assert_eq!(m.snapshot().ready_by, "", "世代起点清 readyBy（Go setReadyBy(\"\")）");
     }

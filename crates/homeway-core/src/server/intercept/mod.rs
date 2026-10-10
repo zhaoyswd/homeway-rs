@@ -4512,8 +4512,8 @@ mod tests {
         fn passthrough() -> Self {
             Self::new(usize::MAX, usize::MAX / 2, Duration::from_millis(1))
         }
-        /// WiFi 部署形态：24MB/s 速率 + 2MB 队列（WG socket SO_SNDBUF=4MB 的保守
-        /// 折半，见 bind.rs）+ 13ms 单向时延。
+        /// WiFi 部署形态：24MB/s 速率 + 2MB 队列（历史 WG socket SO_SNDBUF=4MB 的
+        /// 保守折半，见 bind.rs）+ 13ms 单向时延。
         fn deep() -> Self {
             Self::new(2 * 1024 * 1024, 24 * 1024 * 1024, Duration::from_millis(13))
         }

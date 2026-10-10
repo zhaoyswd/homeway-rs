@@ -587,7 +587,8 @@ impl ExitQuic {
     /// 引擎出站面（M1 §1.5）：把内层明文包交给该设备的 QUIC 连接。
     ///
     /// - [`ExitSend::Handled`]：QUIC 面承接（入队；队列满 = 已丢 + 计数）；
-    /// - [`ExitSend::Unbound`]：该设备无绑定（或面已死）⇒ 调用方按 WG 原样走。
+    /// - [`ExitSend::Unbound`]：该设备无绑定（或面已死）⇒ 调用方丢包 + 计数（引擎侧
+    ///   `route_out` 的丢弃归因行）。
     pub fn send_to_pub(&self, pubkey: &[u8; 32], pkt: &[u8]) -> ExitSend {
         if self.exit.is_exited() {
             return ExitSend::Unbound; // 面已死：出站报 Unbound（调用方丢 + 计数；无第二承载）

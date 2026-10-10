@@ -17,8 +17,8 @@
 //! 重拨到出口的 127.0.0.1 同效；本仓 WG 档栈显式拒环回，不映射就是「监听中但连不上」）。
 //!
 //! **「出口本机」的线上形态（M4 §1.3 裁决 D-1）**：`ExitPort(p)` 交给拨号缝的地址 =
-//! **`127.0.0.1:p`**（QUIC 档：出口 dial 腿直接拨本机回环）；WG 档由
-//! `tun_exec::wg_dial_addr` 在**拨号腿内**替换为 `SERVER_TUNNEL_IP:p`（wire 语义不外泄）。
+//! **`127.0.0.1:p`**（出口 dial 腿直接拨本机回环）。〔历史：WG 档曾由 `wg_dial_addr`
+//! 在腿内替换为 `SERVER_TUNNEL_IP:p`——该面已随 M5 删码退役。〕
 
 use std::collections::BTreeSet;
 use std::io;
@@ -137,9 +137,8 @@ pub fn pf_target_text(f: &PortForwardRule) -> String {
 /// 拨号目标（target_ip 空 / 环回 / 未指定 = 出口自己；否则经出口拨任意目标）。
 ///
 /// **「出口本机」的载体是 `ExitPort`**（与具体承载无关的语义位）；它**在线上**的地址由各承载的
-/// 拨号腿决定（M4 §1.3 裁决 D-1）：QUIC 档 = `127.0.0.1:p`（[`PfDialTarget::resolve`]，出口
-/// dial 腿直接拨本机回环）；WG 档 = `SERVER_TUNNEL_IP:p`（`tun_exec::wg_dial_addr` 在 WG 腿内
-/// 替换——出口 intercept 的豁免臂再落回出口回环）。
+/// 拨号腿决定（M4 §1.3 裁决 D-1）：`127.0.0.1:p`（[`PfDialTarget::resolve`]，出口 dial
+/// 腿直接拨本机回环；M5 后唯一承载 = QUIC）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PfDialTarget {
     /// 拨出口自己的端口。
@@ -1224,7 +1223,7 @@ mod tests {
             Err(TableErr::BadTarget("example.com".into()))
         );
         // 解析（M4 §1.3 裁决 D-1）：`ExitPort` 落到**出口回环**——wire 上出现 `127.0.0.1:p`
-        // 就是「出口本机」（WG 腿的 `SERVER_TUNNEL_IP` 替换在 `tun_exec::wg_dial_addr` 内）
+        // 就是「出口本机」（历史：WG 腿曾把 `ExitPort` 换写成 `SERVER_TUNNEL_IP:p`）
         assert_eq!(
             PfDialTarget::ExitPort(8080).resolve(),
             SocketAddrV4::new(Ipv4Addr::LOCALHOST, 8080)
