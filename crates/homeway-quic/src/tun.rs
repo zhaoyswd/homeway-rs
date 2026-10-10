@@ -222,19 +222,29 @@ impl ReturnPath {
         if !self.writer_alive.load(O::Relaxed) {
             return PushOutcome::Gone;
         }
-        // 包级闸（单生产者：load+add 无竞态窗口——写线程只减）
-        let cur = self.inflight.load(O::Relaxed);
-        if cur + n > RETURN_QUEUE_MAX {
+        // 包级闸：**先记账后投递**（单生产者 + 写线程只减 ⇒ 记账面无并发加法）。
+        // 2026-10-10 审查 中-1：原「先 try_send 后 fetch_add」存在窄窗——岛线程在两步
+        // 之间被抢占时，写线程可能抢先收走整批并 `release`，`saturating_sub` 把尚未
+        // 记账的名额钳成 0→0 空转；生产者恢复后照常 `fetch_add` ⇒ 每次泄漏 ≤1 批的
+        // 幽灵名额，累积到 [`RETURN_QUEUE_MAX`] 即**永久**误报「回程队列满」（下行
+        // 黑洞，TUN 附加生命周期内不可自愈）。先加后发 + 失败回退后，名额恒 ≥
+        // 队内+在写包数，钳位只剩防御意义。
+        self.inflight.fetch_add(n, O::Relaxed);
+        if self.inflight.load(O::Relaxed) > RETURN_QUEUE_MAX {
+            release(&self.inflight, n);
             return PushOutcome::Full;
         }
         match self.tx.try_send(batch) {
-            Ok(()) => {
-                self.inflight.fetch_add(n, O::Relaxed);
-                PushOutcome::Pushed
+            Ok(()) => PushOutcome::Pushed,
+            Err(TrySendError::Full(_)) => {
+                release(&self.inflight, n);
+                PushOutcome::Full
             }
-            Err(TrySendError::Full(_)) => PushOutcome::Full,
             // 写线程已退（fd 失效/收工）：**单独一类**（丢弃语义同「丢」，但归因不同——见 PushOutcome）
-            Err(TrySendError::Disconnected(_)) => PushOutcome::Gone,
+            Err(TrySendError::Disconnected(_)) => {
+                release(&self.inflight, n);
+                PushOutcome::Gone
+            }
         }
     }
 }
