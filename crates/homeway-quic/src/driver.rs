@@ -1106,7 +1106,7 @@ async fn housekeeping(
                 s.send_buffer_used = 0;
             }
         }
-        let (relay_tx, rx_ignored, _rx_dgrams, _tx_dgrams) = face.sock_stats();
+        let (relay_tx, rx_ignored) = face.sock_stats();
         s.relay_tx = relay_tx;
         s.rx_ignored = rx_ignored;
         // M3 S1：服务流面计数（`quic` 段的岛侧子集，§8.2-12）

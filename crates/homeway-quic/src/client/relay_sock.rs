@@ -145,9 +145,6 @@ pub(crate) struct SockStats {
     pub(crate) relay_tx: u64,
     /// 下行收到的腿帧中**非 kind=5** 的条数（忽略面；S1c 探针实测中继会推 hint）。
     pub(crate) rx_ignored: u64,
-    /// 收包总数（含被忽略的腿帧）与发包容貌（排障读数）。
-    pub(crate) rx_dgrams: u64,
-    pub(crate) tx_dgrams: u64,
     /// `try_send` 的**非 `WouldBlock`** 错误总数（N5 的第一层计数）。
     pub(crate) send_errs: u64,
     /// 其中命中 errno 白名单的条数（= 「M（本机发送面错误）」的证据；`rebind` 清零）。
@@ -374,7 +371,6 @@ impl AsyncUdpSocket for ClientSock {
         match self.io.try_send_to(payload, transmit.destination) {
             Ok(_) => {
                 let mut st = lock_unpoison(&self.stats);
-                st.tx_dgrams += 1;
                 if relayed {
                     st.relay_tx += 1;
                 }
@@ -458,7 +454,6 @@ impl AsyncUdpSocket for ClientSock {
             }
             {
                 let mut st = lock_unpoison(&self.stats);
-                st.rx_dgrams += recvd as u64;
                 if let Some(src) = ignored_src {
                     st.rx_ignored += 1;
                     let n_ignored = st.rx_ignored;

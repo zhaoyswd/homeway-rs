@@ -38,6 +38,7 @@
 //! | `log::*` 宏 | 删 | 本仓不用该依赖（判据行走 `Logf`，控制器内不打行） |
 //! | `RttEstimator`（参数） | 同名类型（未用） | BBRv3 全程不用框架 RTT 估计（自带 min_rtt）——上游亦然（quinn 面该类型要直接点名其 crate，本仓为此显式声明了一条同版本依赖） |
 //! | `AckState.prior_bytes_in_flight` / `extra_acked` | **未搬**（上游也从不读取） | 纯残迹字段，留着只是死代码（本仓 clippy 零容忍） |
+//! | `min_pacing_rate` | **已删**（2026-10-10 审查 A-5） | 上游经 trait `min_pacing_rate()` 暴露给框架消费；quinn 的 `Controller` 无此方法 ⇒ 本仓只写不读的本地死代码 |
 //!
 //! 另有两处**刻意保留的偏离**（上游行为照抄但本仓语境下会掉账，故补齐）：
 //!
@@ -551,8 +552,6 @@ pub struct Bbr3 {
     /// controls inter-packet spacing.（本仓 = **观测值**，见文件头差异表）
     pacing_rate: u64,
 
-    /// BBR.min_pacing_rate: The min pacing rate for a BBR flow.
-    min_pacing_rate: Option<u64>,
 
     /// BBR.send_quantum: The maximum size of a data aggregate scheduled and
     /// transmitted together.
@@ -758,7 +757,6 @@ impl Bbr3 {
 
             pacing_rate: 0,
 
-            min_pacing_rate: None,
 
             send_quantum: 0,
 
@@ -976,7 +974,6 @@ impl Bbr3 {
 
     fn update_control_parameters(&mut self) {
         self.set_pacing_rate();
-        self.set_min_pacing_rate();
         self.set_send_quantum();
         self.set_cwnd();
     }
@@ -1830,13 +1827,6 @@ impl Bbr3 {
     /// See <https://www.ietf.org/archive/id/draft-cardwell-iccrg-bbr-congestion-control-02.html#name-pacing-rate-bbrpacing_rate>.
     fn set_pacing_rate(&mut self) {
         self.set_pacing_rate_with_gain(self.pacing_gain);
-    }
-
-    fn set_min_pacing_rate(&mut self) {
-        self.min_pacing_rate = match self.min_pacing_rate {
-            None => Some(self.pacing_rate),
-            Some(min) => Some(min.min(self.pacing_rate)),
-        }
     }
 
     /// See <https://www.ietf.org/archive/id/draft-cardwell-iccrg-bbr-congestion-control-02.html#name-send-quantum-bbrsend_quantu>.

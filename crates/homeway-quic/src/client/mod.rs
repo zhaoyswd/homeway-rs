@@ -165,9 +165,9 @@ impl Face {
     }
 
     /// socket 读数（快照面读：非 kind=5 帧忽略计数等）。
-    pub(crate) fn sock_stats(&self) -> (u64, u64, u64, u64) {
+    pub(crate) fn sock_stats(&self) -> (u64, u64) {
         let s = crate::sync_util::lock_unpoison(&self.stats);
-        (s.relay_tx, s.rx_ignored, s.rx_dgrams, s.tx_dgrams)
+        (s.relay_tx, s.rx_ignored)
     }
 
     /// 发送面错误读数（§3.1-N5 的岛侧信号；新鲜度按 `window` 现算——窗值来自

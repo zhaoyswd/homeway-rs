@@ -73,8 +73,6 @@ pub struct LegInbound {
 /// 出口腿面（驱动线程独占）。
 pub struct ServerBind {
     logf: crate::Logf,
-    /// 细节日志面（#17 丢弃行——Go logfD 对应）。
-    dlogf: crate::Logf,
     on_leg_frame: Option<OnLegFrame>,
     src_seen: SrcSeen,
     // ---- 腿表（驱动线程独占；R4） ----
@@ -84,7 +82,6 @@ pub struct ServerBind {
     leg_recent: HashMap<SocketAddr, Instant>,
     /// 曾当过一次腿的远端地址（Send 兜底丢弃判据；不受 5min 窗限制——#17）。
     leg_ports: HashSet<SocketAddr>,
-    leg_dropped: u64,
     /// 腿面上收到的 kind=5（QUIC 载荷）报文数（M1 S1c §1.6）。
     quic_leg_pkts: u64,
     /// 因 QUIC 面不可用而丢掉的 kind=5 报文数（丢可见面）。
@@ -96,14 +93,12 @@ impl ServerBind {
     pub fn new(logf: crate::Logf) -> Self {
         Self {
             logf: Arc::clone(&logf),
-            dlogf: logf,
             on_leg_frame: None,
             src_seen: SrcSeen::new(),
             leg_by_id: HashMap::new(),
             leg_by_r: HashMap::new(),
             leg_recent: HashMap::new(),
             leg_ports: HashSet::new(),
-            leg_dropped: 0,
             quic_leg_pkts: 0,
             quic_leg_undelivered: 0,
         }
@@ -313,16 +308,6 @@ impl ServerBind {
                 ));
                 None
             }
-        }
-    }
-
-    /// #17 的出站兜底丢弃（QUIC 面腿表的「最近摘除」窗由面侧自持；本计数面留给
-    /// 腿面上的旧路径与观测——语义 = 「目标曾当过腿、现已摘除，不回落公共端口」）。
-    pub fn note_leg_dropped(&mut self, ep: &SocketAddr, pkgs: usize) {
-        self.leg_dropped += 1;
-        let c = self.leg_dropped;
-        if c <= 3 || c.is_multiple_of(1000) {
-            (self.dlogf)(&format!("腿已摘或非现任（{ep}）丢弃出站 {pkgs} 包（等控制面重放重建腿）"));
         }
     }
 
