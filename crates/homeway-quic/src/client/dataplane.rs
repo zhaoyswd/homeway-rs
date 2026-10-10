@@ -59,14 +59,6 @@ pub(crate) fn send_datagram_checked(
     pkt: Box<[u8]>,
     note: &DropNote,
 ) -> SendOutcome {
-    // M6.6 差分插桩：上行出厂用户态全量（检包 + 预检 + `send_datagram`）
-    let __t = crate::diag_m66::diag().proto_up.start();
-    let out = send_datagram_inner(conn, pkt, note);
-    crate::diag_m66::diag().proto_up.end(__t);
-    out
-}
-
-fn send_datagram_inner(conn: &Connection, pkt: Box<[u8]>, note: &DropNote) -> SendOutcome {
     let len = pkt.len();
     match conn.max_datagram_size() {
         // 连接未就绪（对端尚未确认 DATAGRAM 参数 / 握手未完）⇒ 归 `未登记`
@@ -115,13 +107,9 @@ pub(crate) async fn pump_return(conn: Connection, ret: Arc<ReturnPath>, note: Dr
     // 先**不等**地把队列里已有的包抽干成一批（至多 [`crate::tun::RETURN_BATCH_MAX`]）再一次
     // 投递；抽干后再回到 `read_datagram().await` 正常等待。丢弃语义不变（丢新/丢 + 计数/收口）。
     loop {
-        // M6.6 差分插桩：**同步**部分分开量（不能跨 await——跨 await 会把同线程别的
-        // 工作算进本段；M6.6 首版踩过，证据 = 52µs/次 与岛总 CPU 不自洽）
-        let __t = crate::diag_m66::diag().xwake_out.start();
         let mut batch = drain_ready(&conn);
-        crate::diag_m66::diag().xwake_out.end(__t);
         if batch.is_empty() {
-            // 没有现成包：正常等待下一个（或收口）——等待与唤醒后的取包不算进段
+            // 没有现成包：正常等待下一个（或收口）
             let dg = match conn.read_datagram().await {
                 Ok(d) => d,
                 Err(_) => return, // 连接死/被替换：本任务收口（新连接会另起一枚）
@@ -129,12 +117,7 @@ pub(crate) async fn pump_return(conn: Connection, ret: Arc<ReturnPath>, note: Dr
             batch.push(dg.to_vec().into_boxed_slice());
         }
         let n = batch.len() as u64;
-        crate::diag_m66::add(crate::diag_m66::C_RX_PKTS, n);
-        let __t2 = crate::diag_m66::diag().xout_push.start();
-        let __out = ret.try_push_batch(batch);
-        crate::diag_m66::diag().xout_push.end(__t2);
-        crate::diag_m66::add(crate::diag_m66::C_WAKE, 1);
-        match __out {
+        match ret.try_push_batch(batch) {
             PushOutcome::Pushed => {}
             PushOutcome::Full => {
                 note(
