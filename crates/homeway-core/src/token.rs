@@ -89,6 +89,35 @@ pub enum TokenError {
     Malformed { reason: &'static str },
 }
 
+impl TokenError {
+    /// **换代归因**（M7 S1；设计 §10-5 = M6 `§12-1` 交下）：拿**上一代**的 token 撞本代
+    /// 二进制是**换代的必然结果**，不是「串坏了」——给一条**可行动**归因（点明去哪里取新串）。
+    ///
+    /// 只有 `UnsupportedVersion` 有话说；`Corrupted`/`Malformed` 是真坏串 ⇒ `None`。
+    ///
+    /// **与 `Display` 的分工**：`Display` 的哨兵段是 Go 对齐面 + 经 NAPI 直达 App 的**冻结**
+    /// 字节（`fixtures/vectors/token_hmw2.json` 的 `sentinels` 逐字钉住），本方法只做**追加**
+    /// ——调用面自行拼接，绝不改哨兵字节。
+    pub fn changeover_attribution(&self) -> Option<&'static str> {
+        match self {
+            TokenError::UnsupportedVersion { .. } => Some(
+                "存量 token 已失效（WG→QUIC 换代：本代只铸/只认 hmw2）——\
+                 请重新向出口索取 token（`homeway-cli serve token`）后重新粘贴",
+            ),
+            _ => None,
+        }
+    }
+
+    /// **用户可见文案** = 哨兵 `Display` +（仅版本不符时）换代归因。
+    /// 用户可见面（世代 failed reason / CLI 报错）一律走本条；诊断与 wire 面继续用 `Display`。
+    pub fn user_message(&self) -> String {
+        match self.changeover_attribution() {
+            Some(note) => format!("{self}（{note}）"),
+            None => self.to_string(),
+        }
+    }
+}
+
 /// 端点类别（载荷 `type` 字节的语义化形态）。
 ///
 /// **M1 新增 `Quic`（wire 2，additive）**：QUIC 类端点（`serve.quic_listen` 的独立端口，
@@ -1029,6 +1058,40 @@ mod tests {
         }
         .to_string();
         assert!(m.starts_with("homeway/token: 格式非法: "), "{m}"); // ASCII 冒号空格
+    }
+
+    /// **M7 S1**：旧代 token 的**用户可见归因**——`hmw1` 串（存量）与其它 `hmw*` 串都
+    /// 必须给出「取证 + 重新粘贴」的可行动指向；坏串（`Corrupted`/`Malformed`）**不得**
+    /// 误归因到换代（那会把人引向错误的处置）。哨兵 Display 一字不改（上面那条钉住）。
+    #[test]
+    fn unsupported_version_carries_actionable_changeover_attribution() {
+        let old = TokenError::UnsupportedVersion {
+            seen: "hmw1".into(),
+        };
+        let note = old
+            .changeover_attribution()
+            .expect("存量 hmw1 ⇒ 换代归因必须在场");
+        assert!(note.contains("存量 token 已失效"), "{note}");
+        assert!(note.contains("hmw2"), "归因须点明本代载体：{note}");
+        assert!(note.contains("serve token"), "归因须给出取证入口：{note}");
+        // 用户可见文案 = 哨兵原文（冻结字节）+ 归因（追加）
+        let msg = old.user_message();
+        assert!(msg.starts_with(&old.to_string()), "哨兵前缀段不得改：{msg}");
+        assert!(msg.contains(note), "{msg}");
+        // 真坏串：无归因，文案 = Display（不得把坏串说成换代）
+        for e in [
+            TokenError::Corrupted,
+            TokenError::Malformed {
+                reason: "缺少 hmw2 前缀",
+            },
+        ] {
+            assert_eq!(e.changeover_attribution(), None, "{e:?}");
+            assert_eq!(e.user_message(), e.to_string(), "{e:?}");
+        }
+        // 全链：一段真 `hmw1` 串（夹具里的存量形态）走 decode ⇒ 同一归因
+        let real = decode("hmw1iu50C3IgAAAA");
+        let err = real.expect_err("hmw1 串必拒（版本面）");
+        assert_eq!(err.changeover_attribution(), old.changeover_attribution());
     }
 
     /// L2：Secret 的 Debug 全脱敏（不含任何字节片段）。

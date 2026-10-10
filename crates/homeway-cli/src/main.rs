@@ -141,6 +141,19 @@ fn loopback_endpoints(t: &mut token::Token) {
     }
 }
 
+/// 用户面 token 解析（**M7 S1**）：失败文案 = 调用点前缀 + `TokenError::user_message()`
+/// （哨兵 `Display` + 版本不符时的换代归因）。CLI 各动词（connect/speedtest/files/portfwd/
+/// token 改写）共用一条，避免「同一类失败各写各的」——存量 `hmw1` 串一律给可行动指向。
+fn token_or_exit(s: &str, prefix: &str) -> token::Token {
+    match token::decode(s) {
+        Ok(t) => t,
+        Err(e) => {
+            eprintln!("{prefix}{}", e.user_message());
+            std::process::exit(1);
+        }
+    }
+}
+
 /// `--endpoint-cache-dir`：随 WG 档端点缓存退役（设计 §1.6-G-1；M5 C2）——
 /// 显式 fail-fast（不静默吞值：吞了 = 用户以为缓存仍在生效）。
 fn cache_flag_retired() -> ! {
@@ -196,13 +209,7 @@ fn cmd_token(args: &[String]) {
             eprintln!("--v6-only 与 --dead-direct/--loopback-only 互斥（各自的改写目标重叠）");
             std::process::exit(2);
         }
-        let mut t = match token::decode(&s) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("解析失败：{e}");
-                std::process::exit(1);
-            }
-        };
+        let mut t = token_or_exit(&s, "解析失败：");
         for e in &mut t.endpoints {
             if e.kind == token::EndpointKind::Direct
                 && e.addr.parse::<std::net::SocketAddr>().is_ok_and(|a| a.is_ipv4())
@@ -230,13 +237,7 @@ fn cmd_token(args: &[String]) {
         }
     }
     if dead_direct || loopback_only {
-        let mut t = match token::decode(&s) {
-            Ok(t) => t,
-            Err(e) => {
-                eprintln!("解析失败：{e}");
-                std::process::exit(1);
-            }
-        };
+        let mut t = token_or_exit(&s, "解析失败：");
         if dead_direct {
             kill_direct_endpoints(&mut t);
         } else {
@@ -261,18 +262,11 @@ fn cmd_token(args: &[String]) {
             }
         }
     }
-    match token::decode(&s) {
-        Ok(t) => {
-            println!("peer_id  = {}", hex_str(t.peer_id.as_bytes()));
-            println!("secret   = {}", hex_str(t.secret.as_bytes()));
-            for e in &t.endpoints {
-                println!("endpoint = {} ({:?})", e.addr, e.kind);
-            }
-        }
-        Err(e) => {
-            eprintln!("解析失败：{e}");
-            std::process::exit(1);
-        }
+    let t = token_or_exit(&s, "解析失败：");
+    println!("peer_id  = {}", hex_str(t.peer_id.as_bytes()));
+    println!("secret   = {}", hex_str(t.secret.as_bytes()));
+    for e in &t.endpoints {
+        println!("endpoint = {} ({:?})", e.addr, e.kind);
     }
 }
 
@@ -442,13 +436,7 @@ fn cmd_connect(args: &[String]) {
         eprintln!("用法：homeway-cli connect --token <hmw2…> […]");
         std::process::exit(2);
     };
-    let mut t = match token::decode(&tok) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("token 解析失败：{e}");
-            std::process::exit(1);
-        }
-    };
+    let mut t = token_or_exit(&tok, "token 解析失败：");
     let _session_lock = (!a.no_session_lock).then(|| session_lock_or_exit(&a.identity_dir, "connect"));
 
     // ---- 故障注入（M5 C2：QUIC 档的注入面 = 端点改写——须在装配前生效）----
@@ -702,10 +690,7 @@ fn cmd_speedtest(args: &[String]) {
         eprintln!("用法：homeway-cli speedtest --token <hmw2…> [--identity-dir D] [--rounds N] [--hold]");
         std::process::exit(2);
     };
-    let mut t = match token::decode(&tok) {
-        Ok(t) => t,
-        Err(e) => { eprintln!("token 解析失败：{e}"); std::process::exit(1); }
-    };
+    let mut t = token_or_exit(&tok, "token 解析失败：");
     if dead_direct {
         kill_direct_endpoints(&mut t);
         println!("inject: token 直连端点已改指死端口（127.0.0.1:1）——只有中继可达");
@@ -1005,13 +990,7 @@ fn cmd_files(args: &[String]) {
         eprintln!("homeway: files 需要 --token <hmw2> 或 --host <ref>（远程形态）");
         std::process::exit(2);
     };
-    let mut t = match token::decode(&tok) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("token 解析失败：{e}");
-            std::process::exit(1);
-        }
-    };
+    let mut t = token_or_exit(&tok, "token 解析失败：");
     if dead_direct {
         kill_direct_endpoints(&mut t);
         println!("inject: token 直连端点已改指死端口（127.0.0.1:1）——只有中继可达");
@@ -1328,13 +1307,7 @@ fn cmd_portfwd(args: &[String]) {
         eprintln!("至少一条 --map");
         std::process::exit(2);
     }
-    let t = match token::decode(&tok) {
-        Ok(t) => t,
-        Err(e) => {
-            eprintln!("token 解析失败：{e}");
-            std::process::exit(1);
-        }
-    };
+    let t = token_or_exit(&tok, "token 解析失败：");
     let _session_lock = (!no_session_lock).then(|| session_lock_or_exit(&identity_dir, "portfwd"));
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
     let session = match HostSession::start(HostSessionConfig {

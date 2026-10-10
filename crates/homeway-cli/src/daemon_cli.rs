@@ -676,8 +676,12 @@ fn host_add(args: &[String]) {
     }
     let token = p.positional[0].trim().to_owned();
     // ①本地语法校验前置（spec host-cli「token 非法就地报错」：不探测、不连 daemon、不入表）。
+    // M7 S1：用户可见文案走 `user_message()`——存量 `hmw1` 串追加换代归因（哨兵字节不变）。
     if let Err(e) = homeway_core::token::decode(&token) {
-        eprintln!("token 非法：{e}（token 形如 hmw2…，从出口启动日志现场获取后重新粘贴）");
+        eprintln!(
+            "token 非法：{}（token 形如 hmw2…，从出口启动日志现场获取后重新粘贴）",
+            e.user_message()
+        );
         std::process::exit(1);
     }
     let c = dial_control(&state, p.no_spawn);

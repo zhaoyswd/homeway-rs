@@ -161,7 +161,8 @@ impl ServiceExec {
             Ok(t) => t,
             Err(e) => {
                 domain.set_state(ServiceState::Failed);
-                domain.set_reason(&format!("token 解析失败：{e}"));
+                // M7 S1：用户可见 reason 走 `user_message()`（版本不符追加换代归因；哨兵字节不变）
+                domain.set_reason(&format!("token 解析失败：{}", e.user_message()));
                 return -3;
             }
         };

@@ -367,8 +367,10 @@ impl TunExecutor for TunnelExec {
         gen: u64,
     ) -> Result<(), TunError> {
         // token 解析（同步——坏 token 是参数面：Err 由 facade 写 failed 终态）
+        // M7 S1：用户可见文案走 `user_message()`——版本不符（存量 `hmw1` 串）追加**可行动归因**
+        // （`TokenError::changeover_attribution`）；哨兵 `Display` 字节不变。
         let token = crate::token::decode(&cfg.token)
-            .map_err(|e| TunError::Core(format!("token 解析失败：{e}")))?;
+            .map_err(|e| TunError::Core(format!("token 解析失败：{}", e.user_message())))?;
         // 日志文件（追加写——跨重连保留上次断因；打开失败 = -2 面）
         let raw_logf = open_gen_log(&cfg.out).map_err(TunError::LogOpen)?;
 

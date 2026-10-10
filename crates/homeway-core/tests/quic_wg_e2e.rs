@@ -1,6 +1,6 @@
 //! **单承载（QUIC-only）端点面判据**（M5 C4 改写；脚本 = `tools/quic-wg-e2e.sh`）。
 //!
-//! 三条用例：
+//! 四条用例：
 //! 1. `wg_only_token_generation_fails_visibly_without_fallback`（**常跑**，无需出口）：
 //!    **设计 §2.6-G9 的负例实测**——只带 WG 类端点（`Direct`）的旧 token ⇒ 岛候选为空
 //!    （且无 `rpk` 尾字段 ⇒ 落 RPK 面归因）⇒ 世代必须**可见失败**（`岛未就用（…）` 归因行 +
@@ -11,6 +11,9 @@
 //! 3. `removed_transport_key_is_ignored`（**常跑**）：M5 删掉的承载键 `tunConfig.transport`
 //!    属**未知键**（`TunConfigJson` 未加 `deny_unknown_fields`）⇒ App 继续传不得导致配置被拒
 //!    （设计 §4.3 的 R9 核查点，用测试钉住）。
+//! 4. `legacy_hmw1_token_surfaces_actionable_changeover_attribution`（**常跑**，M7 S1 新增）：
+//!    存量 `hmw1` token（设备 App 主机卡里的旧条目）⇒ status reason 必须带**换代归因**
+//!    （哨兵原文 + 「存量 token 已失效」/取证入口/重新粘贴），且不得说成串损坏。
 //!
 //! 环境契约（用例 2）：`HOMEWAY_WG_E2E_TOKEN`（出口 token）/ `HOMEWAY_WG_E2E_EXIT_LOG`
 //! （出口 stdout 日志）。
@@ -128,6 +131,69 @@ fn wg_only_token_generation_fails_visibly_without_fallback() {
     );
     assert_eq!(core.tun_stop(), 0, "failed 终态后 stop 即收 0（放锁）");
     println!("[g9] state=failed, no fallback, lock released");
+}
+
+/// **判据（M7 S1；设计 §10-5 = M6 `§12-1` 交下）**：用户手里**上一代**的 `hmw1` token
+/// 撞本代核 ⇒ 失败面必须**点名归因**（不是一句「解析失败」）：
+/// - 哨兵原文（Go 对齐字节，App 面可达）：`homeway/token: 不支持的 token 版本: hmw1`
+/// - **换代归因**（`TokenError::changeover_attribution`）：点明「存量 token 已失效」+ 取证入口
+///   （`serve token`）+ 重新粘贴的动作
+/// - `failed` 终态 + 归因进 status reason（**App 用户可见面**，U2 真机实录点）
+/// - 不得把换代的必然结果说成「串坏了」（禁 `校验失败` 话术）
+///
+/// 这条覆盖**设备核换代后设备仍存旧 token** 的主路径（App 主机卡里的存量条目）。
+#[test]
+fn legacy_hmw1_token_surfaces_actionable_changeover_attribution() {
+    // 真 `hmw1` 形态（版本面在 base64 解析之前判死 ⇒ 前缀即足够；不构造旧布局载荷）
+    let legacy = "hmw1iu50C3IgUoXEPLRuz7_lQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA";
+    let err = homeway_core::token::decode(legacy).expect_err("hmw1 串必拒（版本面）");
+    let dir = std::env::temp_dir().join(format!("hw-m7s1-legacy-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).expect("临时目录可建");
+    let out = dir.join("gen.log");
+    let ident_dir = dir.join("identity");
+    let _ = std::fs::remove_file(&out);
+    let cfg = format!(
+        r#"{{"token":"{legacy}","out":"{}","identityDir":"{}"}}"#,
+        out.display(),
+        ident_dir.display()
+    );
+    let demand = std::sync::Arc::new(DemandSignals::new());
+    let exec = TunnelExec::new(std::sync::Arc::clone(&demand));
+    let core = ClientCore::with_shared(exec, demand);
+    assert_eq!(
+        core.tun_prepare(&cfg, true),
+        0,
+        "坏 token 是**世代内**失败（装配受理 ⇒ 失败进 status），不是参数面拒启"
+    );
+    let deadline = Instant::now() + WAIT;
+    while core.tun_status().contains("\"state\":\"preparing\"") {
+        assert!(Instant::now() < deadline, "版本拒应即时落 failed：{}", core.tun_status());
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let st = core.tun_status();
+    assert!(st.contains("\"state\":\"failed\""), "旧 token ⇒ failed 终态：{st}");
+    assert!(
+        st.contains("不支持的 token 版本: hmw1"),
+        "哨兵原文必须保留（Go 对齐字节 / App 按类归因）：{st}"
+    );
+    let note = err
+        .changeover_attribution()
+        .expect("UnsupportedVersion ⇒ 换代归因");
+    for needle in ["存量 token 已失效", "hmw2", "serve token"] {
+        assert!(note.contains(needle), "换代归因须含 {needle}：{note}");
+        assert!(
+            st.contains(needle),
+            "换代归因必须进 status reason（用户可见）：缺 {needle} —— {st}"
+        );
+    }
+    assert!(
+        !st.contains("校验失败"),
+        "换代（版本不符）不得被说成串损坏：{st}"
+    );
+    // 锁已放：下一次 prepare 仍可受理（失败不粘单飞锁）
+    assert_eq!(core.tun_prepare(&format!(r#"{{"token":"{legacy}","out":"{}"}}"#, out.display()), true), 0);
+    let _ = core.tun_stop();
+    println!("[s1] legacy-attribution={note}");
 }
 
 /// **判据（E3 改写后的正向面）**：真出口铸出的 token = **单承载 QUIC**——`rpk` 在场、
