@@ -466,21 +466,6 @@ impl UdpPoller for SockPoller {
     }
 }
 
-/// `sockaddr_storage` → `SocketAddr`（本 socket 恒 IPv4；形态异常返 `None`）。
-/// 仅 Linux（`recvmmsg` 路径）使用。
-#[cfg(target_os = "linux")]
-fn sockaddr_v4(st: &libc::sockaddr_storage) -> Option<SocketAddr> {
-    if st.ss_family as libc::c_int != libc::AF_INET {
-        return None;
-    }
-    // SAFETY：ss_family == AF_INET ⇒ 按 sockaddr_in 读出（共用体按地址转换，读的是
-    // 内核已写入的那一份）。
-    let sin = unsafe { &*(st as *const libc::sockaddr_storage as *const libc::sockaddr_in) };
-    let ip = std::net::Ipv4Addr::from(u32::from_be(sin.sin_addr.s_addr));
-    let port = u16::from_be(sin.sin_port);
-    Some(SocketAddr::V4(std::net::SocketAddrV4::new(ip, port)))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
