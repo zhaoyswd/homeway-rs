@@ -30,7 +30,7 @@ pub fn cmd_tui(args: &[String]) {
 
 fn tui_usage() {
     println!(
-        "homeway tui —— 桌面终端工作台（openspec add-tui-panel，实施中）\n  四区面板：主机列表（含本机）/ 会话列表（agent 徽章）/ 终端视图 / 状态行\n  当前为骨架批：交互面板尚未启用，仅提供 --help。"
+        "homeway tui —— 桌面终端工作台（openspec add-tui-panel）\n  四区面板：左上主机列表（含本机）/ 左下会话列表（agent 徽章）/ 右侧终端视图（可交互）/ 底部状态行\n  用法：homeway tui [--state DIR]\n  键位：↑↓ 选择；Tab 换栏；Enter 进入终端焦点（F12 返回）；q 退出\n  终端焦点内按键原样送达会话；多实例同显（选中状态本机共享）"
     );
 }
 
