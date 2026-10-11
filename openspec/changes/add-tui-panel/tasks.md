@@ -42,5 +42,5 @@
 - [ ] 5.5 轮询成本量化（数值门，基线校准后定稿并记录修订）：**活动态**（有输入窗口内）daemon CPU 增量 ≤2% 单核、每秒上下文切换增量 ≤50、QUIC 新建流 ≤35/min（2s LIST 拍 + 重连余量）；**非活动态** QUIC 新建流 ≤8/min（10s 拍）；快照拍走 control.sock 不计入 QUIC 预算（计入 CPU/ctx 项）；验证 = 对照数据落盘 docs/reviews/ 同目录（r2 N-13 / r3 C）
 - [x] 5.6 `tools/tui-smoke.sh`（local-rust-exit + 双实例 + 断线注入）与手测清单工件化（docs/reviews/ 下附录）；验证 = 脚本可一键执行并产出记录骨架
 - [x] 5.7 本地门全绿：`tools/ci-local.sh`（含 WG 残留门、矩阵冒烟）+ `cargo test --workspace` + 三目标交叉 check；验证 = 退出码 0
-- [ ] 5.8 代码评审门（外部评审 + Go 直译痕迹 checklist），记录入 docs/reviews/；高危项整改或登记豁免；验证 = 评审记录文件存在且意见闭环（硬规则 5）
+- [x] 5.8 代码评审门（外部评审 + Go 直译痕迹 checklist），记录入 docs/reviews/；高危项整改或登记豁免；验证 = 评审记录文件存在且意见闭环（硬规则 5）
 - [ ] 5.9 收尾：README/usage 面补充、`openspec validate --strict` 通过、变更归档、按工作单元分 commit；验证 = 归档后 `openspec/specs/tui-panel/spec.md` 生成且 validate 通过
