@@ -929,9 +929,9 @@ session 64.5K / boringtun 59.8K / service_exec 31.9K + facade 份额）预计终
   `server_bad_frame_gets_goodbye_and_disconnect` 在全量并行跑 4 次里 3 次各红 1 例、隔离全绿、
   基线对照（stash 到 `779251d`）2/2 绿、两文件本批零 diff ⇒ 归在册 `daemon::tests` 实 socket 时序族
   （**本树红频率高于基线，未解释，如实登记**）。
-- **工具坑登记（M2 实测，防后续棒踩）**：①`tools/quic-island-e2e.sh` 与 `tools/quic-wg-e2e.sh`
-  **共用实例号 state**（`/tmp/homeway-rs-rustexit-1`）且 `serve token` 读台账末行 ⇒ 先跑 island
-  再跑 wg 会读到上一轮铸的 token 而**假红**；解法 = wg 跑前先 `tools/local-rust-exit.sh wipe 1`。
+- **工具坑登记（M2 实测，防后续棒踩）**：①`tools/quic-island-e2e.sh` 与 `tools/quic-single-bearer-e2e.sh`
+  （当时名 `quic-wg-e2e.sh`；测试面精简批改名）**共用实例号 state**（`/tmp/homeway-rs-rustexit-1`）且 `serve token` 读台账末行 ⇒ 先跑 island
+  再跑该脚本会读到上一轮铸的 token 而**假红**；解法 = 跑前先 `tools/local-rust-exit.sh wipe 1`。
   ②`tools/local-rust-exit.sh start` 在 `target/release/homeway-cli` 存在时**不重建** ⇒ 改完核必须先
   `cargo build --release -p homeway-cli` 再起实例，否则跑到旧二进制（现象 = 新行/新配置缺席）。
 - **本程序新增（M3 实现时登记，2026-10-09）**：①`term::service::tests::attach_size_applies_to_pty` 在
@@ -953,6 +953,9 @@ session 64.5K / boringtun 59.8K / service_exec 31.9K + facade 份额）预计终
 - **M7 后/实验批新增（2026-10-10）**：`stackb::tests::stack_to_stack_tcp_transfer_fills_window`（墙钟吞吐断言）
   在**本机高 ambient 负载**下会红（QS-burst 批实测：同日两次全绿、隔离复跑 3 绿/2 红，5-min loadavg 到 10.97）
   ⇒ **判环境性 flake**，但**在册口径「隔离跑恒绿」今天不成立**（如实登记，红了先看 loadavg 再判回归）。
+  **（2026-10-11 测试面精简批销账）**：墙钟 `mbps > 100` 断言已删——「2000 轮内收满 4MB」是
+  「窗口不被截」的确定性判据（注释自证：窗口被截到 1×MSS 需 ~3400 轮、2000 轮内收不满），
+  判定力全额保留；同批该测试 0.15s 绿，flake 类别销账。
 
 - **M5 E 棒（2026-10-10）**：`term::service::tests::attach_size_applies_to_pty` 全量并行跑一次红
   （60s 硬期限护栏 = 环境性挂死），`--test-threads=1` 隔离复跑绿 ⇒ **在册 flake（不新增类别）**。

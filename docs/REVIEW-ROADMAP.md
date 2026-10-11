@@ -67,15 +67,17 @@
 
 | 测试 | 形态 | 甄别口径 |
 |---|---|---|
-| `wgcore::stackb::tests::stack_to_stack_tcp_transfer_fills_window` | 墙钟吞吐断言（`mbps > 100`） | 全量并发跑常红、隔离跑恒绿；基线 `git stash` 亦复现 |
+| ~~`wgcore::stackb::tests::stack_to_stack_tcp_transfer_fills_window`~~（**2026-10-11 测试面精简批销账**：墙钟 `mbps > 100` 断言已删——「2000 轮内收满 4MB」确定性判据全额承担「窗口不被截」验收，同批时该测试 0.15s 绿） | 墙钟吞吐断言（`mbps > 100`） | 全量并发跑常红、隔离跑恒绿；基线 `git stash` 亦复现 |
 | `daemon::tests::server_bad_frame_gets_goodbye_and_disconnect` | 读日志行时序 | 同一二进制重复单跑红绿翻转 |
 | `speedtest_server::tests::serve_send_end_to_end`（2026-10-08 Q-E 复跑观察） | 50ms 预热/200ms 窗口内按精确字节数断言 | 隔离 3/3 绿、全量并发跑可红（窗口内跑不完 5 次迭代） |
 | `term::service::tests::attach_size_applies_to_pty`（2026-10-08 复跑观察） | PTY 时序（0.87s 隔离） | 隔离恒绿、并发/高负载下超时红 |
 | `daemon::tests::handshake_deadline_beats_slow_drip`（2026-10-08 Q-I 尾段复跑观察） | 握手期限 vs 慢滴水的墙钟竞态 | 隔离 3/3 绿；高载轮红 |
-| `daemon::carriers::forward::tests::add_roundtrip_remove_and_rebuild` / `per_host_cap_cascade_and_corrupt_file`（2026-10-08 Q-K 收口复跑观察） | 承载面 forward 真 socket + 时序；**单跑耗时 65–124s**（远超常规单测，本身值得单独查） | 隔离复跑 3 次 2 绿 1 红；与 Q-K 改动面零交集（Q-K 触 `server/intercept/**`+`wgcore/**`，本测试在 `daemon/carriers/forward`） |
+| ~~`daemon::carriers::forward::tests::add_roundtrip_remove_and_rebuild` / `per_host_cap_cascade_and_corrupt_file`~~（**2026-10-11 测试面精简批销账**：真因 = `PollListener::accept()` **持 listener 互斥锁睡 50ms**、醒来立即重锁 ⇒ macOS 非公平互斥下取锁方（`remove_host`/`close`）被插队饿死；**产品缺陷已修**（节拍时长随 `Idle` 变体带出、调用方放锁后睡），实测 118.09s→0.03s / 28.60s→0.08s；`daemon::carriers` 全组 16.42s→1.14s） | 承载面 forward 真 socket + 时序；**单跑耗时 65–124s**（远超常规单测，本身值得单独查） | 隔离复跑 3 次 2 绿 1 红；与 Q-K 改动面零交集（Q-K 触 `server/intercept/**`+`wgcore/**`，本测试在 `daemon/carriers/forward`） |
 | **并发跑两个 `cargo test`（同一工作树或兄弟 worktree）**（2026-10-08 Q-F 复跑观察；**Q-L 扩证**：兄弟 worktree `homeway-rs-quic` 的 `cargo test --workspace` 与本仓并发 ⇒ 本仓三条红〔`daemon::carriers::forward::{add_roundtrip_remove_and_rebuild, per_host_cap_cascade_and_corrupt_file}` + `daemon::carriers::tests::uppercase_host_canonicalized_full_chain`，端口 19990/20001/20002/20911，全为 `EADDRINUSE`〕，对方也红 2 条〔`daemon::tests::{handshake_deadline_beats_slow_drip, server_bad_frame_gets_goodbye_and_disconnect}`〕） | `daemon/carriers` 族用固定端口互撞 ⇒ `EADDRINUSE` 红 | 串行/隔离恒绿；两个实例同时跑必红——**不是回归**，判回归前先确认没有第二个 `cargo test` 在跑（含兄弟 worktree；`ps aux \| grep "[c]argo test"` 直证） |
 | `relay::tests::ctl_keepalive_echo`（2026-10-08 Q-L 代码门复核轮观察） | 中继控制面 keepalive 回显真 socket 时序；`relay/mod.rs:2051` `Os{54,ConnectionReset}` | 隔离复跑 3/3 绿、同树第二次全量 767/0 绿；与改动面零交集（Q-L 未动 `relay/**`） |
 | `server::bind::tests::dual_stack_listen_and_unmap`（2026-10-08 Q-J 代码门观察） | 200×5ms 轮询窗内收 2 包（高载/并发下窗口内跑不完） | 隔离 5/5 绿、与两 `cargo test` 并发时红；`bind.rs` 未动（判非回归）；判回归前先确认没有第二个 `cargo test` 在跑 |
+| `exit::tests::flood_keeps_bounds_and_spares_admitted_connection`（2026-10-11 精简批全量跑观察） | 洪泛计数断言（`flood_refused >= 7`）；高载下握手完成顺序漂移（实测 `flood_refused: 6`，差 1） | 隔离 3/3 绿（0.08s 级）；与改动面零交集（本批未触 `homeway-quic/**`）；loadavg 7 时全量跑红一次、复跑全量绿 |
+| `term::service::tests::raw_attach_replay_echo_kill_ended`（2026-10-11 精简批全量跑观察） | PTY 会话时序（`expect` 读帧超时；与同族 `attach_size_applies_to_pty` 同因）；loadavg 15 下全量跑红一次 | 隔离 3/3 绿（1.4–1.5s）；与改动面零交集（本批未触 `term/**`）；同族 `attach_size` 已在册 |
 
 > 判据：**隔离复跑绿 + 与改动面无交集 + 基线可复现** ⇒ 判 flake，不算回归；三者缺一就不许当 flake
 > 放过（Q-E 批 `serve_send_end_to_end` 即按此口径甄别：隔离 3/3 绿 + 全量两轮 590 passed/0 failed）。
