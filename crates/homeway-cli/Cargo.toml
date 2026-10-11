@@ -13,6 +13,12 @@ base64.workspace = true
 serde.workspace = true
 sha2.workspace = true
 getrandom.workspace = true
+# ---- TUI 面板线（openspec add-tui-panel）：桌面终端工作台前端 ----
+# ratatui 0.30 = 立即模式 TUI（crossterm 0.29 后端）；alacritty_terminal 走
+# workspace 继承（0.26，与 homeway-core 同源——客户端内嵌 SessionVt 与出口同实现）。
+ratatui = "0.30"
+crossterm = "0.29"
+alacritty_terminal.workspace = true
 
 [features]
 # 透传 homeway-core 的故障注入缝（阶梯时间窗实测用）
