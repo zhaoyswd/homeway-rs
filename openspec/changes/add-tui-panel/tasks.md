@@ -1,6 +1,6 @@
 ## 1. 立线与准备
 
-- [ ] 1.1 ROADMAP.md 登记新功能线（tui-panel，范围/判据/非目标引用本变更与 docs/reviews/TUI-design.md 的 A 案决策），确认与 QUIC 线 U1–U3 触点无冲突；验证 = ROADMAP 出现路线条目且指回 openspec 变更目录
+- [x] 1.1 ROADMAP.md 登记新功能线（tui-panel，范围/判据/非目标引用本变更与 docs/reviews/TUI-design.md 的 A 案决策），确认与 QUIC 线 U1–U3 触点无冲突；验证 = ROADMAP 出现路线条目且指回 openspec 变更目录
 - [ ] 1.2 编译探针：homeway-cli 侧构造 core 公开的 `SessionVt` 并调用 `key_options()/encode_key()`（5 行级探针测试）；验证 = 探针通过 ⇒ core 零改动定稿（design D2），tasks 2.1 保持跳过；失败 ⇒ 回头补 core 公开面并改回 design
 - [ ] 1.3 `crates/homeway-cli/Cargo.toml` 新增 ratatui、crossterm；alacritty_terminal 走 workspace 依赖继承（不重复声明版本）；验证 = `cargo check -p homeway-cli` 通过且 Cargo.lock 无第二个 alacritty_terminal 版本
 - [ ] 1.4 三目标交叉 check（aarch64-unknown-linux-ohos + musl×2，与 `.github/workflows/ci.yml` 同款命令）；验证 = 三目标 `cargo check -p homeway-cli` 通过，或确定 cfg 门控方案并记入 design
