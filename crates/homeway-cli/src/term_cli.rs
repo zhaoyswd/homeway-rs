@@ -213,12 +213,12 @@ impl TermReadErr {
 }
 
 /// 读/写两半（attach 主循环形态：读腿线程 + 主线程写；本地面经 UDS 克隆共享 socket）。
-enum TermReadHalf {
+pub(crate) enum TermReadHalf {
     Local(FrameIo),
     Remote { st: Arc<ClientStream>, buf: Vec<u8> },
 }
 
-enum TermWriteHalf {
+pub(crate) enum TermWriteHalf {
     Local(FrameIo),
     Remote { client: Arc<ControlClient>, st: Arc<ClientStream> },
 }
@@ -264,7 +264,7 @@ impl TermConn {
     }
 
     /// 分读/写两半（attach 主循环形态）。
-    fn split(self) -> Result<(TermReadHalf, TermWriteHalf), String> {
+    pub(crate) fn split(self) -> Result<(TermReadHalf, TermWriteHalf), String> {
         match self {
             TermConn::Local(io) => {
                 let clone = io
@@ -280,6 +280,36 @@ impl TermConn {
                 let write = TermWriteHalf::Remote { client, st };
                 Ok((read, write))
             }
+        }
+    }
+}
+
+/// 连接收口句柄（split 后保留的逃生口——Remote 面的可靠读解阻塞 + Local 面的 shutdown）。
+pub(crate) enum TermCloser {
+    Remote(Arc<ControlClient>),
+    Local(std::os::unix::net::UnixStream),
+}
+
+impl TermCloser {
+    pub(crate) fn close(&self) {
+        match self {
+            TermCloser::Remote(c) => c.close(),
+            TermCloser::Local(s) => {
+                let _ = s.shutdown(std::net::Shutdown::Both);
+            }
+        }
+    }
+}
+
+impl TermConn {
+    /// split 前取收口句柄（conn 被 split 消费后仍可强制收口）。
+    pub(crate) fn closer(&self) -> TermCloser {
+        match self {
+            TermConn::Remote { client, .. } => TermCloser::Remote(Arc::clone(client)),
+            TermConn::Local(io) => match io.try_clone_stream() {
+                Ok(s) => TermCloser::Local(s),
+                Err(_) => TermCloser::Local(std::os::unix::net::UnixStream::connect("/dev/null").unwrap()),
+            },
         }
     }
 }
@@ -1166,7 +1196,7 @@ fn osc_reply_end(b: &[u8]) -> Option<(usize, usize)> {
 
 /// 客户端实例标识：主机名 + uid + tty 设备路径的短哈希（同一终端重跑 ⇒ 同一标识
 /// ⇒ 重连替换自身旧腿、不被自己的旧腿锁在腿数上限外；无 tty 退化为每进程随机）。
-fn client_id() -> String {
+pub(crate) fn client_id() -> String {
     let tty_path = tty_name();
     if tty_path.is_empty() {
         let mut b = [0u8; 4];

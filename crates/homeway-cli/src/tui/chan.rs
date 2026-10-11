@@ -13,14 +13,13 @@
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::time::Duration;
 
-/// 腿帧消息（读帧线程 → UI）。`Bytes` 载荷 = PTY 字节流切片（回放与实时同形）。
+/// 腿帧消息（读帧线程 → UI）。`Frame` 载荷 = **完整单帧**的 encode_frame 字节
+/// （读帧线程按帧边界读出后原样转发；UI 侧 [`super::leg::decode_frame`] 还原）。
 #[derive(Debug, PartialEq)]
 pub(crate) enum LegMsg {
-    Bytes(Vec<u8>),
-    Attached,
-    ReplayDone { truncated: bool },
-    State { agent: u8, state_v2: u8, title: String },
-    Ended { code: i32, reason: String },
+    Frame(Vec<u8>),
+    /// 流终结（裸断或流错误；ENDED 帧本身走 `Frame`——监督器在腿线程侧判定）。
+    Gone { reason: String },
 }
 
 /// 建通道（`cap` 为界：建议 64——一问一答突发吸收，语义同出口 F3 队列）。
@@ -78,13 +77,13 @@ mod tests {
     fn fifo_preserves_byte_order() {
         let (send, recv) = leg_channel(64);
         for i in 0..8u8 {
-            send.send(LegMsg::Bytes(vec![i])).expect("容量内发送");
+            send.send(LegMsg::Frame(vec![i])).expect("容量内发送");
         }
         let bytes: Vec<Vec<u8>> = recv
             .drain()
             .into_iter()
             .filter_map(|m| match m {
-                LegMsg::Bytes(b) => Some(b),
+                LegMsg::Frame(b) => Some(b),
                 _ => None,
             })
             .collect();
@@ -94,29 +93,29 @@ mod tests {
     #[test]
     fn bounded_send_blocks_until_drained() {
         let (send, recv) = leg_channel(1);
-        send.send(LegMsg::Bytes(b"a".to_vec())).expect("第一帧入队");
+        send.send(LegMsg::Frame(b"a".to_vec())).expect("第一帧入队");
         // 容量 1 已满：线程再发一帧必然阻塞——100ms 后仍未完成 ⇒ 证明阻塞。
         let done = Arc::new(AtomicBool::new(false));
         let done2 = Arc::clone(&done);
         let h = std::thread::spawn(move || {
             let send = send; // SendHalf：可 move 进腿线程（Send）
-            send.send(LegMsg::Bytes(b"b".to_vec())).expect("drain 后可达");
+            send.send(LegMsg::Frame(b"b".to_vec())).expect("drain 后可达");
             done2.store(true, Ordering::SeqCst);
         });
         std::thread::sleep(Duration::from_millis(100));
         assert!(!done.load(Ordering::SeqCst), "满容量下 send 阻塞（背压生效）");
         // 消费一帧 ⇒ 阻塞的发送放行 ⇒ 无一帧丢失。
-        assert_eq!(recv.try_recv(), Ok(LegMsg::Bytes(b"a".to_vec())));
+        assert_eq!(recv.try_recv(), Ok(LegMsg::Frame(b"a".to_vec())));
         h.join().expect("发送线程收尾");
         assert!(done.load(Ordering::SeqCst));
-        assert_eq!(recv.try_recv(), Ok(LegMsg::Bytes(b"b".to_vec())), "背压放行后帧完整");
+        assert_eq!(recv.try_recv(), Ok(LegMsg::Frame(b"b".to_vec())), "背压放行后帧完整");
     }
 
     #[test]
     fn drain_coalesces_without_loss() {
         let (send, recv) = leg_channel(8);
         for i in 0..5u8 {
-            send.send(LegMsg::Bytes(vec![i])).expect("入队");
+            send.send(LegMsg::Frame(vec![i])).expect("入队");
         }
         assert_eq!(recv.drain().len(), 5);
         assert_eq!(recv.drain().len(), 0, "收清后为空（下一次渲染拍无残留）");
@@ -126,6 +125,6 @@ mod tests {
     fn send_reports_when_receiver_dropped() {
         let (send, recv) = leg_channel(2);
         drop(recv);
-        assert_eq!(send.send(LegMsg::Bytes(b"x".to_vec())), Err(SendEnded), "接收端收线 = 读帧线程收尾信号");
+        assert_eq!(send.send(LegMsg::Frame(b"x".to_vec())), Err(SendEnded), "接收端收线 = 读帧线程收尾信号");
     }
 }

@@ -423,6 +423,8 @@ mod tests {
                 state_v2: "unknown".into(),
                 last_active_ms: *t,
                 legs: 0,
+                cols: 80,
+                rows: 24,
             })
             .collect()
     }

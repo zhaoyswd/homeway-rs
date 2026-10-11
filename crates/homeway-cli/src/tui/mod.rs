@@ -9,6 +9,7 @@
 pub(crate) mod app;
 pub(crate) mod backend;
 pub(crate) mod render;
+pub(crate) mod runtime;
 pub(crate) mod termview;
 pub(crate) mod chan;
 pub(crate) mod hosts;
@@ -18,20 +19,13 @@ pub(crate) mod local;
 pub(crate) mod selection;
 pub(crate) mod sessions;
 
-/// 命令入口（main.rs 分发）。本批 = 骨架：usage + 探针面；四区面板随任务组 3/4 落地。
+/// 命令入口（main.rs 分发）：终端环境边界检查 → daemon 拉起 → 面板主循环。
 pub fn cmd_tui(args: &[String]) {
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h" | "help")) {
         tui_usage();
         return;
     }
-    // 骨架期不收任何参数/启动路径（避免给出半成品交互面）；面板本体落地后这里
-    // 换成「终端环境边界检查 → daemon 拉起 → 面板主循环」。
-    if let Some(a) = args.first() {
-        eprintln!("homeway tui：实施中，尚不认识参数 {a:?}（面板本体随任务组 3/4 落地）");
-        std::process::exit(2);
-    }
-    tui_usage();
-    std::process::exit(2);
+    std::process::exit(runtime::run(args));
 }
 
 fn tui_usage() {

@@ -130,6 +130,40 @@ pub(crate) fn encode_resize(cols: u16, rows: u16) -> Vec<u8> {
     frames::enc_resize(cols, rows)
 }
 
+/// 鼠标事件编码（tasks 3.5/4.4b）：会话启用上报时由 runtime 调用（路由在前）。
+/// 坐标折算到 pane 内（出口网格坐标即 pane 坐标——会话尺寸 = 对齐尺寸）。
+pub(crate) fn encode_mouse_event(
+    m: &crossterm::event::MouseEvent,
+    pane: ratatui::layout::Rect,
+    vt: &SessionVt,
+) -> Option<Vec<u8>> {
+    use homeway_core::term::keyenc::MouseAction;
+    if m.column < pane.x || m.row < pane.y {
+        return None;
+    }
+    let (x, y) = (m.column - pane.x, m.row - pane.y);
+    let (action, button) = match m.kind {
+        crossterm::event::MouseEventKind::Down(b) => (MouseAction::Press, cmouse_to_key(b)),
+        crossterm::event::MouseEventKind::Up(b) => (MouseAction::Release, cmouse_to_key(b)),
+        crossterm::event::MouseEventKind::Drag(b) => (MouseAction::Motion, cmouse_to_key(b)),
+        crossterm::event::MouseEventKind::Moved => (MouseAction::Motion, homeway_core::term::keyenc::MouseButton::UNKNOWN),
+        crossterm::event::MouseEventKind::ScrollUp => (MouseAction::Press, homeway_core::term::keyenc::MouseButton(4)),
+        crossterm::event::MouseEventKind::ScrollDown => (MouseAction::Press, homeway_core::term::keyenc::MouseButton(5)),
+        _ => return None,
+    };
+    let mods = map_mods(m.modifiers);
+    Some(vt.encode_mouse(&homeway_core::term::keyenc::MouseEvent { action, button, mods, x, y }))
+}
+
+fn cmouse_to_key(b: crossterm::event::MouseButton) -> homeway_core::term::keyenc::MouseButton {
+    use homeway_core::term::keyenc::MouseButton as MB;
+    match b {
+        crossterm::event::MouseButton::Left => MB::LEFT,
+        crossterm::event::MouseButton::Right => MB::RIGHT,
+        crossterm::event::MouseButton::Middle => MB(3),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

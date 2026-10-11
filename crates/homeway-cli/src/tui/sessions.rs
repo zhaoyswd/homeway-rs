@@ -24,6 +24,9 @@ pub(crate) struct SessionView {
     pub last_active_ms: i64,
     /// 观察腿数量（LIST `clients[]` 长度——腿满判定的输入，r2 N-2）。
     pub legs: usize,
+    /// 会话几何（HELLO 尺寸对齐的输入——接入不改会话几何，r2 N-4）。
+    pub cols: u16,
+    pub rows: u16,
 }
 
 /// agent 状态徽章（spec 需求 3 的五形态：四态 + 无 agent）。
@@ -67,6 +70,8 @@ pub(crate) fn parse_list_reply(payload: &[u8]) -> Option<Vec<SessionView>> {
                 agent: s.agent,
                 state_v2: s.state_v2,
                 last_active_ms: s.last_active_ms,
+                cols: s.cols,
+                rows: s.rows,
             })
             .collect(),
     )
@@ -82,6 +87,10 @@ struct ListSession {
     state_v2: String,
     agent: String,
     title: String,
+    #[serde(default)]
+    cols: u16,
+    #[serde(default)]
+    rows: u16,
     #[serde(default)]
     clients: Vec<serde_json::Value>,
 }

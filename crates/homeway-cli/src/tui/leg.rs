@@ -41,6 +41,18 @@ pub(crate) fn build_hello(name: &str, cols: u16, rows: u16, greeting_feats: u32,
     frames::enc_hello(cols, rows, 0, name, &frames::enc_hello_tail(cap_bits, true, client_id))
 }
 
+/// 单帧解码（通道字节 → Frame；与 `pull_remote_frame` 的帧形同口径：op + len2LE）。
+pub(crate) fn decode_frame(buf: &[u8]) -> Option<Frame> {
+    if buf.len() < 3 {
+        return None;
+    }
+    let n = u16::from_le_bytes([buf[1], buf[2]]) as usize;
+    if buf.len() < 3 + n {
+        return None;
+    }
+    Some(Frame { op: Op(buf[0]), payload: buf[3..3 + n].to_vec() })
+}
+
 /// 接入前检查（spec 需求 5：腿满 MUST NOT 接入；会话不存在 ⇒ 终止语义）。
 #[derive(Debug, PartialEq, Eq)]
 pub(crate) enum Precheck {
@@ -154,6 +166,11 @@ impl TermLeg {
     /// 键编码口径快照（kitty flags 等）。
     pub fn key_options(&self) -> homeway_core::term::keyenc::KeyOptions {
         self.vt.key_options()
+    }
+
+    /// 内嵌模拟器访问（输入编码按会话模式位取口径——runtime 透传路径用）。
+    pub fn vt(&self) -> &homeway_core::term::vt::SessionVt {
+        &self.vt
     }
 }
 

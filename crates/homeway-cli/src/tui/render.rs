@@ -222,7 +222,7 @@ mod tests {
         app.sessions.replace(vec![
             super::super::sessions::SessionView {
                 name: "agent-a".into(), title: Some("重构".into()), agent: "codex".into(),
-                state_v2: "working".into(), last_active_ms: 1, legs: 0,
+                state_v2: "working".into(), last_active_ms: 1, legs: 0, cols: 120, rows: 40,
             },
         ]);
         let mut t = Terminal::new(TestBackend::new(80, 12)).unwrap();
