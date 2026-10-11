@@ -172,6 +172,22 @@ impl TermLeg {
     pub fn vt(&self) -> &homeway_core::term::vt::SessionVt {
         &self.vt
     }
+
+    // —— 滚轮回看（tasks 4.8；core 滚动面 = design D7 同路径最小公开）——
+    /// 滚动偏移（0 = 贴底）。
+    pub fn display_offset(&self) -> usize {
+        self.vt.display_offset()
+    }
+
+    /// 滚轮驱动滚动（±delta，贴顶/贴底截断）。
+    pub fn scroll_display(&mut self, delta: i32) {
+        self.vt.scroll_display(delta);
+    }
+
+    /// 按当前偏移取行（回看瞬态视图；offset=0 由调用方走 rows_and_commit）。
+    pub fn rows_at_offset(&self) -> Vec<homeway_core::term::vt::Row> {
+        self.vt.rows_at_offset()
+    }
 }
 
 // ---------------------------------------------------------------------------

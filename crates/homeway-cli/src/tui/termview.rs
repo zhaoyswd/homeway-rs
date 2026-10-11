@@ -36,7 +36,11 @@ impl TermView {
 
     /// 渲染到 pane 区域（每渲染拍调用；rows_and_commit 同时清脏标）。
     pub fn render(&mut self, f: &mut ratatui::Frame, area: Rect) {
-        let rows = self.leg.rows_and_commit();
+        let rows = if self.leg.display_offset() == 0 {
+            self.leg.rows_and_commit()
+        } else {
+            self.leg.rows_at_offset()
+        };
         let buf = f.buffer_mut();
         for (ry, row) in rows.iter().enumerate() {
             if ry as u16 >= area.height {

@@ -129,3 +129,19 @@
 
 - r3 后状态：spec 13 需求 18 场景组（新增重拨紧循环、导航焦点失焦、链路中断不回落回落三场景）；design 8 决策 + Risks 三条新增；tasks 5 组 30 条（断言全数对齐）。
 - 下一步：进入实施（/opsx:apply）；代码评审门仍留待实施完工后（tasks 5.8）。
+
+---
+
+# 4.8 登记：core 滚动面最小公开（2026-10-11，实施中拆出）
+
+- **缘起**：spec 需求 4 承诺「会话未启用鼠标上报时滚轮用于面板内回看」；实施发现 `SessionVt`
+  无滚动偏移面（`vt.rs:49`「本层 display_offset 恒 0」实证，网格探针复核）——回看需要
+  core 增量。按 design D7 编译探针先例的同一路径处理：**先登记、同批变更、最小面**。
+- **变更面**（`term/vt.rs`，仅公开既有 alacritty 能力，无 wire/行为变化）：
+  `display_offset()`（只读偏移）、`scroll_display(delta)`（包装 `Term::scroll_display`，
+  贴顶/贴底截断）、`rows_at_offset()`（按当前偏移取整屏行——只读，不推进脏标/指纹；
+  `read_row` 泛化为带偏移变体，offset=0 恒等旧 `rows()`）。
+- **TUI 消费**：终端焦点 + 会话未启用鼠标上报 ⇒ 滚轮 → `scroll_display(±3)`；渲染按
+  offset=0 走 `rows_and_commit`（提交脏标）、offset>0 走 `rows_at_offset`（瞬态回看视图）。
+- **边界**：core 判据面（term 帧/编码器/会话注册表）不受影响——纯视图层；三目标交叉
+  check 与 clippy 随同批验证。

@@ -780,6 +780,16 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
                                     let _ = tx.send(ev);
                                 }
                             }
+                        } else if focus == Focus::Terminal
+                            && matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
+                        {
+                            // 滚轮回看（tasks 4.8）：会话未启用上报 ⇒ 面板内回看（spec 需求 4）。
+                            if let Some(tv) = termview.as_mut() {
+                                match m.kind {
+                                    MouseEventKind::ScrollUp => tv.leg.scroll_display(3),
+                                    _ => tv.leg.scroll_display(-3),
+                                }
+                            }
                         } else if let MouseEventKind::Down(CMouse::Left) = m.kind {
                             if click_select(shared, m.column, m.row) {
                                 {
@@ -857,6 +867,10 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
                 let phase = shared.leg_phase.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 if !phase.is_empty() {
                     s.push_str(&format!(" · {phase}"));
+                }
+                let off = termview.as_ref().map(|tv| tv.leg.display_offset()).unwrap_or(0);
+                if off > 0 {
+                    s.push_str(&format!(" · 回看中({off})"));
                 }
                 s
             };
