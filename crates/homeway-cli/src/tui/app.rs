@@ -150,6 +150,18 @@ impl AppModel {
             PanelCmd::MoveUp | PanelCmd::MoveDown if self.pane == Pane::Hosts => {
                 let delta = if cmd == PanelCmd::MoveDown { 1i64 } else { -1i64 };
                 let next = (self.host_cursor as i64 + delta).clamp(0, hosts_len.max(1) as i64 - 1) as usize;
+                // 主机末位下探 ⇒ 落到会话栏（单主机时 ↑↓ 直接管理会话——r4 验收 UX）。
+                if delta > 0 && next == self.host_cursor && hosts_len > 0 {
+                    self.pane = Pane::Sessions;
+                    self.session_cursor = 0;
+                    if let Some(s) = self.sessions.sessions().first() {
+                        let name = s.name.clone();
+                        let changed = self.sessions.selected() != Some(name.as_str());
+                        self.sessions.select(&name);
+                        return changed;
+                    }
+                    return false;
+                }
                 if next != self.host_cursor {
                     self.host_cursor = next;
                     if let Some(id) = self.host_at(next) {
@@ -165,6 +177,20 @@ impl AppModel {
             }
             PanelCmd::MoveUp | PanelCmd::MoveDown if self.pane == Pane::Sessions => {
                 let delta = if cmd == PanelCmd::MoveDown { 1i64 } else { -1i64 };
+                // 会话顶上探主机栏（选最后一台主机），其余在栏内移动。
+                if delta < 0 && self.session_cursor == 0 {
+                    self.pane = Pane::Hosts;
+                    self.host_cursor = hosts_len.max(1) - 1;
+                    if let Some(h) = self.host_at(self.host_cursor) {
+                        if self.selected_host.as_deref() != Some(h.as_str()) {
+                            self.selected_host = Some(h);
+                            self.sessions = SessionListModel::default();
+                            self.session_cursor = 0;
+                            return true;
+                        }
+                    }
+                    return false;
+                }
                 let next = (self.session_cursor as i64 + delta).clamp(0, sessions_len.max(1) as i64 - 1) as usize;
                 self.session_cursor = next;
                 if let Some(s) = self.sessions.sessions().get(next) {
@@ -403,6 +429,24 @@ mod tests {
         app.hosts.feed(FeedInput::Snapshot { generation: "g3", hosts: &hosts });
         assert!(!app.on_hosts_updated(), "可恢复异常不触发主机回落");
         assert_eq!(app.selected_host.as_deref(), Some("peer-b"), "留守");
+    }
+
+    #[test]
+    fn single_host_down_falls_through_to_sessions() {
+        // r4 验收 UX：单主机下 ↓ 落到会话栏（↑↓ 用户心智 = 连续浏览）。
+        let mut app = AppModel::new();
+        super::super::app::refresh_local(&mut app, "my-mac", super::super::local::ServeState::Running, true);
+        app.fallback_host(); // 仅本机（无远端快照）⇒ 唯一条目
+        assert_eq!(app.selected_host.as_deref(), Some("local"));
+        app.sessions
+            .replace(parse_sessions(&[("demo", 100)]));
+        assert!(app.apply_panel(PanelCmd::MoveDown), "落到会话栏并选中首会话");
+        assert_eq!(app.pane, Pane::Sessions);
+        assert!(app.sessions.selected().is_some());
+        // 会话顶上 ↑ 回到主机栏（选中不变——本机已是当前选中）。
+        app.apply_panel(PanelCmd::MoveUp);
+        assert_eq!(app.pane, Pane::Hosts);
+        assert_eq!(app.selected_host.as_deref(), Some("local"));
     }
 
     #[test]

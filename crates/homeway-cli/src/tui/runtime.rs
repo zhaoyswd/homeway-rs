@@ -242,8 +242,7 @@ fn leg_thread(gen: u64, shared: Arc<Shared>, stop: StopFlag, send: SendHalf) {
         };
         let local = host == LOCAL_HOST_ID;
         // 契约（r4 F1 修复）：list_once 恒传 **state 根**（本机分支内部自己 join serve）；
-        // dial 目录才在本机面 join serve（term_cli 本地 --state 语义 = serve 子目录）。
-        let dial_dir = if local { dir.join("serve") } else { dir.clone() };
+        // 拨号目录由 attach_and_read 自算（本机面 join serve）。
         let list_arg = if local { LOCAL_HOST_ID.to_owned() } else { host.clone() };
         // 接入前检查：LIST 快照 = 存在性 + 腿满 + 尺寸对齐输入（接入不改几何，r2 N-4）。
         match backend::list_once(&dir, &list_arg) {
@@ -257,7 +256,8 @@ fn leg_thread(gen: u64, shared: Arc<Shared>, stop: StopFlag, send: SendHalf) {
                 }
                 let found_view = found.cloned();
                 match sup.on(LegEvent::Precheck { exists, legs }) {
-                    LegAction::Attach => {}
+                    LegAction::Attach => {
+                    }
                     LegAction::WaitVacancy { delay } => {
                         shared.set_phase(&vacancy_text(found_view.as_ref()));
                         let _ = delay;
@@ -290,7 +290,7 @@ fn leg_thread(gen: u64, shared: Arc<Shared>, stop: StopFlag, send: SendHalf) {
         }
         match attach_and_read(
             &mut sup, &shared, &stop, &send, &mut last_link_up, &host, &session,
-            &dial_dir, local, cols, rows, gen,
+            &dir, local, cols, rows, gen,
         ) {
             LoopCtl::Continue => continue 'outer,
             LoopCtl::Exit => return,
@@ -319,7 +319,9 @@ fn attach_and_read(
     let dial_dir = if local { state_root.join("serve") } else { state_root.to_owned() };
     let (mut conn, feats) =
         match crate::term_cli::dial_term_conn_impl(&dial_dir, host_ref.as_deref(), true) {
-            Ok(x) => x,
+            Ok(x) => {
+                x
+            }
             Err(e) => {
                 let _ = send.send(LegMsg::Gone { reason: format!("拨号失败：{e}") });
                 return judge_after_loss(sup, shared, stop, send, last_link_up, host, session, state_root, local, gen);
@@ -362,13 +364,15 @@ fn attach_and_read(
                 closer.close();
                 return LoopCtl::Exit;
             }
-            shared.leg_reset("");
+            // 清相位但**不推世代**（leg_reset 会令本腿自毁——r4 验收期发现）。
+            shared.set_phase("");
         }
         Op::ERROR => {
             let (code, msg) = frames::dec_error(&f.payload).unwrap_or_default();
             closer.close();
-            // too_many_clients = 服务端权威兜底（r3 B）⇒ 判定循环接管（腿满分支）。
-            shared.leg_reset(&format!("接入被拒（{code}）"));
+            // too_many_clients = 服务端权威兜底（r3 B）⇒ 判定循环接管（腿满分支）；
+            // 不推世代（线程要在判定循环里等空位）。
+            shared.set_phase(&format!("接入被拒（{code}）"));
             let _ = send.send(LegMsg::Gone { reason: format!("接入被拒：{code} {msg}") });
             sup.on(LegEvent::StreamEnd { ended: false });
             return judge_after_loss(sup, shared, stop, send, last_link_up, host, session, state_root, local, gen);

@@ -20,7 +20,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use homeway_core::daemon::client::ControlClient;
+use homeway_core::daemon::client::{ClientErr, ControlClient};
 use homeway_core::daemon::proto::{EventBody, HostState};
 use homeway_core::daemon::vocab;
 
@@ -120,16 +120,28 @@ impl ControlConn for RealConn {
 /// TUI 控制面拨号（spec 需求 1：未运行族按需拉起；frontend = homeway-tui）。
 pub(crate) fn dial_control(state_dir: &Path) -> Result<Arc<ControlClient>, String> {
     let sock = state_dir.join("control.sock");
-    match ControlClient::dial(&sock, "cli", "homeway-tui") {
-        Ok((c, _)) => Ok(c),
-        Err(e) => {
-            if crate::daemon_cli::sock_not_running(&sock) {
-                crate::daemon_cli::dial_control_spawn(state_dir, "homeway-tui", false)
-            } else {
-                Err(e.to_string())
+    let mut last: Option<ClientErr> = None;
+    for attempt in 0..3 {
+        match ControlClient::dial(&sock, "cli", "homeway-tui") {
+            Ok((c, _)) => return Ok(c),
+            // ConnClosed = 握手窗口竞态（新二进制冷启动页缓存未热 ⇒ Hello 落笔
+            // 晚于 dial 的 500ms 流读窗口）——隔 300ms 重试，热身后必成（验收期发现）。
+            Err(e @ ClientErr::ConnClosed) => {
+                last = Some(e);
+                std::thread::sleep(Duration::from_millis(300 * (attempt as u64 + 1)));
+            }
+            Err(e) => {
+                if crate::daemon_cli::sock_not_running(&sock) {
+                    return crate::daemon_cli::dial_control_spawn(state_dir, "homeway-tui", false);
+                }
+                return Err(e.to_string());
             }
         }
     }
+    Err(format!(
+        "控制面握手重试 3 拍未成（{}）——daemon 负载异常或版本不匹配",
+        last.map(|e| e.to_string()).unwrap_or_default()
+    ))
 }
 
 /// 喂入出口：真实面 = `Mutex<HostsModel>`（app 层持有），测试面 = 记录器。
