@@ -28,7 +28,7 @@
 //! | `on_ack(&mut SentPacket, …, bytes_in_flight)` | `on_ack(now, sent, bytes, …)` | 按 `(sent 时刻)` 取最近的未核销记录；quinn 的 `bytes` = 单包字节 |
 //! | `begin_ack(now, bif)` | 无对应钩子 | **懒开批**：本批首个 `on_ack` 时做同名复位（`ack_batch_open` 标志） |
 //! | `end_ack()` | `on_end_acks(now, in_flight, …)` | 等价（quinn 的 `now`/`in_flight` = 权威值） |
-//! | `on_congestion_event(now, &SentPacket, persistent, lost, bif)` | `on_congestion_event(now, sent, persistent, lost_bytes)` | 上游逐包调用，本仓**逐丢包事件**调用（`lost_bytes` = 该包字节）；`handle_lost_packet` 的逐包字段取自 `sent` 时刻的记录，记录缺失时跳过该步（cwnd/持久拥塞逻辑不受影响）。**ECN-CE 事件（`lost_bytes=0`）跳过逐包模型数学、只走进恢复主路径**——上游无 ECN 入路，不臆造 inflight_hi 定位〔2026-10-10 审查 A-3 修复〕 |
+//! | `on_congestion_event(now, &SentPacket, persistent, lost, bif)` | `on_congestion_event(now, sent, persistent, lost_bytes)` | 上游**逐包**调用（`packet.sent_size`）；本仓框架面 = **每丢包检测轮一次**（quinn 在检测循环累加后单次回调）——`lost_bytes` = 轮内丢包总量、`sent` = 最大丢包的发送时刻 ⇒ `handle_lost_packet` 的逐包字段取该时刻快照（**近似**：`inflight_hi_from_lost_packet` 以 `min(lost_bytes, rec.sent_size)` 钳到数据报粒度〔评审 r1 中-2 订正〕）；记录缺失时跳过该步（cwnd/持久拥塞逻辑不受影响）。**ECN-CE 事件（`lost_bytes=0`）跳过逐包模型数学、只走进恢复主路径**——上游无 ECN 入路，不臆造 inflight_hi 定位〔2026-10-10 审查 A-3 修复〕 |
 //! | `stats.bytes_in_flight`（自维护） | 自维护 + **每批用 quinn 的 `in_flight` 对齐** | quinn 的 `in_flight.bytes` 不含纯 ACK 包（`SentPacket.size = 0`）⇒ 以它为权威；**批间隙内**自维护值会把纯 ACK 数据报字节也计入（quinn 的 `on_sent` 给整数据报）——量级 = 一个 ACK 批间隙的 ACK 字节，`on_end_acks` 即对齐，未另行补偿 |
 //! | `set_max_datagram_size`（上游由配置面更新） | `on_mtu_update(new_mtu)` | 更新 `max_datagram_size`/`min_cwnd`/`initial_cwnd` 并夹住 cwnd（照 quinn 自带 CC 的惯例） |
 //! | `pacing_rate()`（框架**据此发车**） | `metrics().pacing_rate`（仅**观测**） | ⚠️ **最大语义差**：quinn 的 pacer 按 `window()/RTT` 自算令牌桶（`quinn-proto` 的 `connection/pacing.rs`），**不消费**控制器给的速率 ⇒ BBR 的 `pacing_gain` 只经 `send_quantum`/`offload_budget`/`extra_acked` 与 `cwnd_gain` 间接生效 |
@@ -1672,11 +1672,13 @@ impl Bbr3 {
     //    /* solving for lost_prefix we arrive at: */
     //    lost_prefix = (BBRLossThresh * inflight_prev - lost_prev) / (1 - BBRLossThresh)
     fn inflight_hi_from_lost_packet(&mut self, rec: &SentRecord, lost_bytes: u64) -> u64 {
-        // `size` = **被丢的那个包**的字节（上游 = `packet.sent_size`；本仓 = 框架逐丢包
-        // 事件给的 `lost_bytes`）。审查 A-3 修复：原 `lost_bytes.max(rec.sent_size)` 在
-        // GSO 批形态会拿数据报总量顶替单包大小 ⇒ `inflight_prev` 被过度扣减、
-        // `inflight_hi` 定位偏低。
-        let size = lost_bytes;
+        // `size` ≈ 上游「被丢的那个包」的字节（`packet.sent_size`）。本仓的可用输入与
+        // 上游不同构（评审 r1 中-2 订正登记）：框架每**丢包检测轮**只回调一次、
+        // `lost_bytes` = 轮内丢包总量（非逐包）、`rec` = 最大丢包发送时刻的快照 ⇒ 取
+        // `min(批总量, 该数据报总量)`——非 GSO 恒等单包大小；GSO 批量丢时钳到数据报
+        // 粒度（比裸批总量更接近上游语义；首批的 `.max(数据报总量)` 在非 GSO 下与本式
+        // 等价、GSO 下本式更准）。
+        let size = lost_bytes.min(rec.sent_size);
 
         // What was in flight before this packet?
         let inflight_prev = rec.tx_in_flight.saturating_sub(size);
@@ -2492,5 +2494,44 @@ mod tests {
     /// 它喂给 `on_ack`，而 BBRv3 **不读**该参数（上游同样标 `_rtt`）。
     fn dummy_rtt() -> RttEstimator {
         unsafe { std::mem::zeroed() }
+    }
+
+    /// 评审 r1 低-7：GSO 批记录经 `SentTable::take_for_ack` 的**真实配对/核销路径**——
+    /// `bytes_remaining` 写在原记录上（逐包递减至 0），克隆只带走 `rec`（防重标记
+    /// `delivered_time = None` 因此只落克隆、不落原记录）。批内 N 包各确认一次时
+    /// `delivered` 累计 = N×P（逐包 `acked_bytes`），且核销完毕后同刻不再出记录。
+    #[test]
+    fn sent_table_gso_batch_ack_pairs_per_packet() {
+        use crate::cc::delivery_rate::{DeliveryRateEstimator, SentRecord};
+        let now = Instant::now();
+        let mut est = DeliveryRateEstimator::new(now);
+        let mut t = SentTable::new();
+        let pkt: u64 = 1200;
+        let n: u64 = 4;
+        // 一条「数据报」记录（sent_size = 批总量 N×P；on_sent 的 bytes 形态）
+        let mut rec = SentRecord::new(9, now, pkt * n);
+        est.on_packet_sent(&mut rec, 0, 0);
+        t.push(SentSnapshot {
+            time_sent: now,
+            bytes_remaining: pkt * n,
+            rec,
+        });
+        let ack_at = now + Duration::from_millis(10);
+        for _ in 0..n {
+            let mut clone = t
+                .take_for_ack(now, pkt)
+                .expect("bytes_remaining 未尽 ⇒ 每次核销出一枚克隆");
+            est.update_rate_sample(&mut clone, ack_at, pkt);
+        }
+        est.generate_rate_sample();
+        assert_eq!(
+            est.delivered(),
+            pkt * n,
+            "GSO 批全确认（经 take_for_ack 真实路径）：delivered = N×P"
+        );
+        assert!(
+            t.take_for_ack(now, pkt).is_none(),
+            "批内核销尽 ⇒ 同刻不再出记录（防二次取样由 bytes_remaining 把守）"
+        );
     }
 }

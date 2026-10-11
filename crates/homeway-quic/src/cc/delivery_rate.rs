@@ -457,10 +457,12 @@ mod tests {
         assert!(!est.is_sample_app_limited());
     }
 
-    /// 回归（2026-10-10 审查 A-2）：GSO 批记录（`sent_size` = 批总量 N×P）被批内
-    /// N 包各确认一次——每次 `take_for_ack` 返回**新鲜克隆**（防重标记写在克隆上、
-    /// 不落原记录）⇒ `delivered` 的累加完全由 `acked_bytes` 参数决定：必须 = N×P，
-    /// 不是 N×N×P。
+    /// 回归（2026-10-10 审查 A-2；评审 r1 低-7 收窄措辞）：GSO 批记录（`sent_size` =
+    /// 批总量 N×P）被批内 N 包各确认一次——每次 `take_for_ack` 返回**新鲜克隆**
+    /// （防重标记 `delivered_time = None` 只落克隆、不落原记录；`bytes_remaining`
+    /// 的核销写在**原记录**上）⇒ `delivered` 的累加完全由 `acked_bytes` 参数决定：
+    /// 必须 = N×P，不是 N×N×P。〔真实配对/核销路径的端到端用例在 `bbr3.rs` 的
+    /// `sent_table_gso_batch_ack_pairs_per_packet`。〕
     #[test]
     fn delivered_counts_per_packet_bytes_for_gso_batch_record() {
         let now = Instant::now();
