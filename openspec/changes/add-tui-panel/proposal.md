@@ -10,8 +10,8 @@
   - 右侧：当前选中会话的终端视图，**可交互**（crossterm 键鼠 → keyenc → DATA 字节帧）；
   - 底部状态行：当前主机的连接状态、延迟、流量。
 - **全局唯一**：选中状态本机共享（落 `<state>/cache/` 选中文件，实例间文件 watch 镜像）；多个 `homeway tui` 实例同开显示相同内容（选中与高亮镜像一致，右侧面板各实例自开观察腿渲染同一会话）。
-- 右侧终端采用 raw 腿（**不声明** capsRawTerminal 位）+ 内嵌 core 公开的 `SessionVt` 渲染管线（alacritty_terminal 0.26 同源）；输入经客户端 keyenc 编码走 DATA 字节帧（与 `term attach` 同路）；断线恢复走既有回放环 + 尺寸哨兵路径，并按「会话终止/链路中断/腿满被让位」三态分别处理；接入以当前会话尺寸对齐（不改会话几何）。
-- 零协议与契约面改动：term 帧协议、QUIC 承载、capi/App 面、tier 对齐面、**daemon 控制面词表（跨仓冻结契约）**全部不动；core 仅一处可见性公开（keyenc kitty 模式位访问器）。
+- 右侧终端采用 raw 腿（**不声明** capsRawTerminal 位）+ 内嵌 core 公开的 `SessionVt` 渲染管线（alacritty_terminal 0.26 同源）；输入经客户端 keyenc 编码走 DATA 字节帧（与 `term attach` 同路）；断线恢复走既有回放环 + 尺寸哨兵路径，并按「会话终止/链路中断/腿满被让位」三态分别处理；接入以最近一次会话尺寸快照对齐。
+- 零协议与契约面改动：term 帧协议、QUIC 承载、capi/App 面、tier 对齐面、**daemon 控制面词表（跨仓冻结契约）**全部不动；**core 零改动**（模拟器复用公开的 `SessionVt`，编译探针前置确认；探针失败才回头补最小公开面）。
 - 本期非目标：面板外提醒（系统通知/响铃）、herdr 式 Socket API 反向开放、会话元数据服务端推送（LIST 轮询差分替代）、延迟实时化（既有端到端探活口径 60s 拍如实显示）。
 
 ## Capabilities
