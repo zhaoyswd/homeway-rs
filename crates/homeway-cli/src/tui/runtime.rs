@@ -24,6 +24,7 @@ use crossterm::event::{
     EnableFocusChange, EnableMouseCapture, Event, KeyEventKind, MouseButton as CMouse,
     MouseEventKind,
 };
+use crossterm::cursor::SetCursorStyle;
 use crossterm::{execute, terminal};
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
@@ -82,9 +83,9 @@ struct Shared {
     leg_phase: Mutex<String>,
     /// 最近渲染的终端区域（RESIZE 的 pane 尺寸来源 + 点击命中测试）。
     term_area: Mutex<Rect>,
-    /// 流量速率差分簿记 (rx, tx, at_ms)。
-    rate_prev: Mutex<Option<(i64, i64, i64)>>,
-    rate: Mutex<Option<(f64, f64)>>,
+    /// 流量速率差分簿记（逐主机，r5 验收批：主机条目第二行都要显示）(rx, tx, at_ms)。
+    rates_prev: Mutex<std::collections::HashMap<String, (i64, i64, i64)>>,
+    rates: Mutex<std::collections::HashMap<String, (f64, f64)>>,
     /// 恢复一次性哨兵（首个快照后执行持久化选中恢复）。
     restored: AtomicBool,
     /// 终端区尺寸变化待发（画后新 area 落位再发 RESIZE，r4 中4）。
@@ -106,8 +107,8 @@ impl Shared {
             leg_recv: Mutex::new(None),
             leg_phase: Mutex::new(String::new()),
             term_area: Mutex::new(Rect::default()),
-            rate_prev: Mutex::new(None),
-            rate: Mutex::new(None),
+            rates_prev: Mutex::new(std::collections::HashMap::new()),
+            rates: Mutex::new(std::collections::HashMap::new()),
             restored: AtomicBool::new(false),
             pending_resize: AtomicBool::new(false),
             attached: Mutex::new(None),
@@ -594,6 +595,7 @@ pub(crate) fn run(args: &[String]) -> i32 {
             io::stdout(),
             terminal::LeaveAlternateScreen,
             DisableMouseCapture,
+            SetCursorStyle::DefaultUserShape,
             crossterm::style::ResetColor
         );
         prev_hook(info);
@@ -684,15 +686,28 @@ pub(crate) fn run(args: &[String]) -> i32 {
                     app.on_hosts_updated();
                 }
                 let now = now_ms();
-                let cur = {
+                // 逐主机差分（r5 验收批：主机条目第二行各自显示 ↑↓ 速率）。
+                let cur: std::collections::HashMap<String, (i64, i64, i64)> = {
                     let app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
-                    app.selected_host_view().and_then(|h| h.rx_bytes.zip(h.tx_bytes).map(|(rx, tx)| (rx, tx, now)))
+                    app.display_hosts()
+                        .iter()
+                        .filter_map(|h| {
+                            h.rx_bytes.zip(h.tx_bytes).map(|(rx, tx)| (h.id.clone(), (rx, tx, now)))
+                        })
+                        .collect()
                 };
-                if let Some(cur) = cur {
-                    let prev = *shared.rate_prev.lock().unwrap_or_else(|e| e.into_inner());
-                    let rate = AppModel::rate_of(prev, cur);
-                    *shared.rate.lock().unwrap_or_else(|e| e.into_inner()) = rate;
-                    *shared.rate_prev.lock().unwrap_or_else(|e| e.into_inner()) = Some(cur);
+                {
+                    let mut prev = shared.rates_prev.lock().unwrap_or_else(|e| e.into_inner());
+                    let mut rates = shared.rates.lock().unwrap_or_else(|e| e.into_inner());
+                    for (id, c) in &cur {
+                        if let Some(r) = AppModel::rate_of(prev.get(id).copied(), *c) {
+                            rates.insert(id.clone(), r);
+                        }
+                    }
+                    // 消失的主机（快照重取/删除）不再残留旧读数。
+                    rates.retain(|id, _| cur.contains_key(id));
+                    prev.retain(|id, _| cur.contains_key(id));
+                    *prev = cur;
                 }
                 std::thread::sleep(Duration::from_secs(1));
             }
@@ -767,6 +782,8 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
     let mut leg_recv: Option<RecvHalf> = None;
     let mut termview: Option<TermView> = None;
     let mut ui_gen = shared.leg_gen_now();
+    // 宿主光标样式切换沿（终端焦点 ↔ 面板）——DECSCUSR 只在沿上写。
+    let mut last_focus: Option<Focus> = None;
 
     let mut out = io::stdout();
     if execute!(out, terminal::EnterAlternateScreen).is_err() {
@@ -980,27 +997,36 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
             } else {
                 push_focus(shared, &mut termview, false);
             }
+            // 宿主光标样式随焦点切换（r5 验收批：终端焦点 = 闪烁块；离开/退出还原
+            // 缺省形状。DECSCUSR 只在切换沿写一次，不逐帧写）。
+            if Some(focus_now) != last_focus {
+                let _ = match focus_now {
+                    Focus::Terminal => execute!(io::stdout(), SetCursorStyle::BlinkingBlock),
+                    _ => execute!(io::stdout(), SetCursorStyle::DefaultUserShape),
+                };
+                last_focus = Some(focus_now);
+            }
             // 渲染。
-            let status = {
+            let now = now_ms();
+            let (status, rates) = {
                 let app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
-                let rate = *shared.rate.lock().unwrap_or_else(|e| e.into_inner());
-                let mut s = render::status_line(&app, now_ms(), rate);
-                let phase = shared.leg_phase.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                if !phase.is_empty() {
-                    s.push_str(&format!(" · {phase}"));
-                }
-                let off = termview.as_ref().map(|tv| tv.leg.display_offset()).unwrap_or(0);
-                if off > 0 {
-                    s.push_str(&format!(" · 回看中({off})"));
-                }
-                s
+                (render::status_line(&app), shared.rates.lock().unwrap_or_else(|e| e.into_inner()).clone())
             };
+            let phase = shared.leg_phase.lock().unwrap_or_else(|e| e.into_inner()).clone();
+            let mut status = status;
+            if !phase.is_empty() {
+                status.push_str(&format!(" · {phase}"));
+            }
+            let off = termview.as_ref().map(|tv| tv.leg.display_offset()).unwrap_or(0);
+            if off > 0 {
+                status.push_str(&format!(" · 回看中({off})"));
+            }
             let area_store = &shared.term_area;
             let app_ref = &mut *shared.app.lock().unwrap_or_else(|e| e.into_inner());
             let tv = termview.as_mut();
             if t
                 .draw(|f| {
-                    render::draw(f, app_ref, tv, &status);
+                    render::draw(f, app_ref, tv, &status, &rates, now);
                     *area_store.lock().unwrap_or_else(|e| e.into_inner()) = render::layout(f.area()).2;
                 })
                 .is_err()
@@ -1031,6 +1057,7 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
         DisableBracketedPaste,
         DisableFocusChange,
         DisableMouseCapture,
+        SetCursorStyle::DefaultUserShape,
         crossterm::style::ResetColor
     );
     code
@@ -1062,7 +1089,8 @@ fn click_select(shared: &Arc<Shared>, col: u16, row: u16) -> bool {
     let (hosts_a, sess_a, _, _) = render::layout(area);
     let mut app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
     if hosts_a.contains((col, row).into()) {
-        let idx = row.saturating_sub(hosts_a.y + 1) as usize;
+        // 两行条目（r5 验收批）：● 名称行 + 副标题行 ⇒ 行号除 2 得条目下标。
+        let idx = (row.saturating_sub(hosts_a.y + 1) / 2) as usize;
         let hosts = app.display_hosts();
         if let Some(h) = hosts.get(idx) {
             if app.selected_host.as_deref() != Some(h.id.as_str()) {
