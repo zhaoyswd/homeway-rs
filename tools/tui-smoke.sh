@@ -28,41 +28,40 @@ RC_TTY=$?
 set -e
 [ "$RC_TTY" = "2" ] && echo "$OUT_TTY" | grep -q "TTY" || fail "非 TTY 应 exit 2 并提示 TTY"
 
-say "[3/4] 本地矩阵（Rust 出口）就绪检查"
+say "[3/4] 验收拓扑（统一进程：control + serve 一体——TUI 的主机/状态面走 control.sock）"
+TUI_STATE=/tmp/homeway-tui-demo
+BIN=./target/release/homeway-cli
 if [ "${1:-}" = "--hands-on" ]; then
-    say "起本地 Rust 出口（tools/local-rust-exit.sh start 1：release 构建 + 就绪判定）"
-    "$REPO_ROOT/tools/local-rust-exit.sh" start 1 || fail "local-rust-exit 启动失败"
-    "$REPO_ROOT/tools/local-rust-exit.sh" status 1 || true
+    if [ -S "$TUI_STATE/control.sock" ]; then
+        say "统一进程已在跑（${TUI_STATE}）——复用"
+    else
+        say "起统一进程（control+client+serve 按期望态）+ 打开 serve"
+        nohup "$BIN" --state "$TUI_STATE" > /tmp/homeway-tui-demo.log 2>&1 &
+        sleep 3
+        "$BIN" serve start --state "$TUI_STATE" | tail -1 || fail "serve start"
+        sleep 1
+    fi
+    "$BIN" term new demo -d --state "$TUI_STATE/serve" | tail -1 || true
+    "$BIN" term new work -d --state "$TUI_STATE/serve" | tail -1 || true
+    [ -S "$TUI_STATE/control.sock" ] && [ -S "$TUI_STATE/serve/term.sock" ] \
+        || fail "验收拓扑不就绪（control.sock / serve/term.sock）"
     cat <<'RUNBOOK'
 
-==== 交互验收（真终端逐项执行，清单 = docs/reviews/TUI-acceptance.md）====
-  本地出口 state = /tmp/homeway-rs-rustexit-1（实例 1；QUIC 端口 42652）
+==== 拓扑就绪。启动面板（真终端执行这一条）====
+    target/release/homeway-cli tui --state /tmp/homeway-tui-demo
 
-  【会话准备】本地面 --state 指 serve 子目录（term_cli 语义，r1 D-14）：
-    target/release/homeway-cli term new demo --state /tmp/homeway-rs-rustexit-1/serve
-    target/release/homeway-cli term new work --state /tmp/homeway-rs-rustexit-1/serve
-    target/release/homeway-cli term list --state /tmp/homeway-rs-rustexit-1/serve
+  面板内：↑↓/点击选中；Enter 进终端焦点（跑 vim/htop）；F12 返回；q 退出；
+  滚轮回看（状态行「回看中(N)」）；粘贴多行；状态行 = 形态/延迟(采样年龄)/流量
 
-  【面板】另开一个真终端：
-    target/release/homeway-cli tui --state /tmp/homeway-rs-rustexit-1
-    □ 1.2 主机列表：本机条目（local，可用；远端主机需按 2.1 host add）
-    □ 1.3 会话列表：demo/work + agent 徽章；↑↓/点击选中
-    □ 1.4 Enter 进终端焦点：vim/htop 正常渲染；1.5 Alt 组合/F1/Ctrl+C 透传
-    □ 1.6 F12 返回面板；1.7 状态行（形态/延迟含采样年龄/流量）；1.8 粘贴
-    □ 4.8 滚轮回看：会话未启用鼠标上报时滚轮上翻（状态行出现「回看中(N)」）
-
-  【2.1 远端链路（可选，测断线自愈需远端隧道）】：
+  【2.1 远端链路（可选）】再起一个出口实例当远端主机：
     tools/local-rust-exit.sh start 2
     TOKEN2=$(tools/local-rust-exit.sh token 2)
-    target/release/homeway-cli host add "$TOKEN2" --state /tmp/homeway-rs-rustexit-1
-    target/release/homeway-cli term new remote-demo --host <主机名> --state /tmp/homeway-rs-rustexit-1
-    面板切到远端主机接入后：tools/local-rust-exit.sh stop 2（→断线）
-    → tools/local-rust-exit.sh start 2（→自动重附，屏幕经回放恢复）
-
-  【2.2/2.3 断线三态】会话内 exit 或 term delete（→已结束+回落）；
-    8 个 term attach 占满腿再让面板接入（→腿满提示不抢占）
-  【5.3 双实例】再开一个同 --state 的 tui：A 切换选中 B 1s 内镜像；A 退出 B 不受影响
-  【5.4 共存】面板观察中：term attach demo --state /tmp/homeway-rs-rustexit-1/serve
+    target/release/homeway-cli host add "$TOKEN2" --state /tmp/homeway-tui-demo
+    target/release/homeway-cli term new remote-demo --host <主机名> --state /tmp/homeway-tui-demo
+    断线测试：tools/local-rust-exit.sh stop 2 → start 2（面板应自动重附）
+  【2.2/2.3】会话内 exit / term delete（→已结束+回落）；8 个 term attach 占满（→腿满提示）
+  【5.3 双实例】再开一个同 --state 的 tui：A 切换 B 1s 内镜像
+  【5.4 共存】面板观察中：term attach demo --state /tmp/homeway-tui-demo/serve
 RUNBOOK
 else
     say "（--hands-on 跳过；本地矩阵交互验收需真终端，见 docs/reviews/TUI-acceptance.md）"
