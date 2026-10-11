@@ -6,6 +6,8 @@
 //! 与 core 零契约面改动，终端腿不声明 capsRawTerminal（服务端继续代答查询），
 //! 输入走客户端 keyenc → DATA 字节帧（不用 INPUT 帧）。
 
+pub(crate) mod selection;
+
 /// 命令入口（main.rs 分发）。本批 = 骨架：usage + 探针面；四区面板随任务组 3/4 落地。
 pub fn cmd_tui(args: &[String]) {
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h" | "help")) {
