@@ -798,14 +798,17 @@ fn set_state_unless_failed(inner: &Arc<Inner>, state: SessState, reason: &str) -
 fn patrol_loop(inner: Arc<Inner>) {
     let mut fail_streak: u32 = 0;
     loop {
-        // 睡到下一拍（500ms 粒度查收工）。
+        // 睡到下一拍（IDLE-WAKE B：粒度 500ms→1s——stop 等待片尾部 ≤1s，仍在
+        // join_bounded 6s 预算内；到点重新装填，只认 stop 位）。
         let deadline = Instant::now() + PATROL_INTERVAL;
         while Instant::now() < deadline {
             if inner.stop.load(Ordering::SeqCst) {
                 (inner.logf)("宿主会话巡检退出（已收工）");
                 return;
             }
-            std::thread::sleep(Duration::from_millis(500));
+            std::thread::sleep(Duration::from_millis(1000).min(
+                deadline.saturating_duration_since(Instant::now()),
+            ));
         }
         if inner.stop.load(Ordering::SeqCst) {
             (inner.logf)("宿主会话巡检退出（已收工）");

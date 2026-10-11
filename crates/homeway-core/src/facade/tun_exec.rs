@@ -1087,7 +1087,9 @@ fn gen_loop(
         if run.stop.load(Ordering::Acquire) {
             break;
         }
-        std::thread::sleep(Duration::from_millis(200));
+        // IDLE-WAKE B：分片 200ms→1s（stop 尾部 ≤1s，仍在收尾链 2s join / STOP_WAIT=3s
+        // 预算内；到点一律重新装填——本循环只认 stop 位，绝无「因超时推进收工」路径）
+        std::thread::sleep(Duration::from_millis(1000));
     }
     (logf)("收到停止信号，正在回收（client/stack）");
     // 巡检/pusher/stats 随 stop 位退出（join 有界——**总预算 2s**，与 STOP_WAIT=3s
@@ -1478,7 +1480,12 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
                     (run.logf)("链路巡检退出（隧道已停止）");
                     return;
                 }
-                match ev_rx.recv_timeout(Duration::from_millis(200)) {
+                // IDLE-WAKE B：分片改「到下一拍的全期限，1s 封顶」——Kick/Stop 事件
+                // 即醒不变（通道语义）；60s 拍点不漂（最后一睡压在剩余上）；stop 等待
+                // 片尾部 ≤1s（含 try_send 丢 Stop 事件的兜底——dsh r2-P4）
+                match ev_rx.recv_timeout(
+                    Duration::from_millis(1000).min(next.saturating_duration_since(Instant::now())),
+                ) {
                     Ok(GenEvent::Kick) => {
                         (run.logf)("链路巡检：App 回到前台，立即探测一次");
                         break;
@@ -1626,14 +1633,16 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
         if run.stop.load(Ordering::Acquire) {
             return;
         }
-        // 分片等待（评审 r2-H3：整段 sleep(1s) 一样挡收工；100ms 片界查 stop）
+        // 分片等待（评审 r2-H3：整段 sleep(1s) 一样挡收工；IDLE-WAKE B：片界 100ms→
+        // 1s 封顶——pusher 的业务拍本就是 1s，此改只是把 stop 等待片的空转从 10/s 降到
+        // 1/s，尾部不变）
         let next = Instant::now() + PUSHER_TICK;
         while Instant::now() < next {
             if run.stop.load(Ordering::Acquire) {
                 return;
             }
             std::thread::sleep(
-                Duration::from_millis(100).min(next.saturating_duration_since(Instant::now())),
+                Duration::from_millis(1000).min(next.saturating_duration_since(Instant::now())),
             );
         }
         if run.current_island().is_none() {
@@ -1682,8 +1691,9 @@ fn stats_loop(run: Arc<GenRun>, stats_secs: i64, _diag_fd_secs: i64) {
             if run.stop.load(Ordering::Acquire) {
                 return;
             }
+            // IDLE-WAKE B：分片 100ms→1s 封顶（stop 等待片尾部 ≤1s，仍在 2s join 预算内）
             let nap =
-                Duration::from_millis(100).min(deadline.saturating_duration_since(Instant::now()));
+                Duration::from_millis(1000).min(deadline.saturating_duration_since(Instant::now()));
             std::thread::sleep(nap);
         }
         let (rd, wr) = run.l3_tun_stats();
