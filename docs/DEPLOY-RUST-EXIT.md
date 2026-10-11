@@ -635,4 +635,27 @@ App 的免手工外部通道只有 `--ps host_token`（主机注入）与 `--ps 
 把 `HMW_PREFIX` 硬编码为 `'hmw1'` ⇒ **手工粘贴 hmw2 token 会被前端校验拒**（「token 应以 hmw1
 开头」）。`--ps host_token` 注入路径**不经过**该校验（直接进核解析 + HostStore）⇒ 本批部署不受
 它阻塞，但「在 App 里手工粘贴新 token」这条路**目前不可用**，需 tier 侧放宽（`hmw1|hmw2`）。
+**（2026-10-11 已由 tier 侧修掉：`HMW_PREFIX='hmw2'` 只认当前代 + 错误文案给自救指引 + 脱敏正则
+改版本位通配 `hmw[0-9]`，见 §12.7。）**
+
+### 12.7 二次滚动升级 v0.3.2（核侧审查修复批；2026-10-11）
+
+**触发**：核侧「审查修复①–⑦ + 评审 r1 整改」批收口（工作树干净、CI 绿、19 分钟无新提交）⇒ 按
+§12.4 的同一条路径把两台出口与设备核一并换到该版本（无 config 变更：`quic_listen` 已在位）。
+
+| 阶段 | 版本读数 | 判据 | 结论 |
+|---|---|---|---|
+| 发版 | `v0.3.2` 四目标 + Release（tag = main HEAD `75ee175`） | 发版 CI 3m24s 绿 | ✓ |
+| 前置 | 阿里云 `homeway-rs.bak-v0.3.1`（sha `1bfb4c04` 逐字节同）+ `config.toml.bak-v0.3.1` + `data-rs-pre-v032.tar.gz`（3 条目）；Mac `~/homeway-rollback/homeway-rs.v0.3.1`（sha `314082fd`）+ `config.toml.v0.3.1` | 两处 sha 与 v0.3.1 产物一致 | ✓ |
+| **U1 阿里云** | `v0.3.2`（sha `ff4e2904…`）；`serve 就绪：quic=:41641 … key=1020c3eae8b3…` | 停净 6 s → 换件 → nohup 起（新 pid 1588460）；身份逐字不变 | ✓ |
+| **U3 Mac** | `v0.3.2`（sha `edf27e8a…`）；`serve 就绪 … key=8aee740b7220…`；`后端身份：标签 d07c57dd5bde1fa7`；`STUN：… 眼里是 114.242.60.128:41641` + v4/v6 公网端点已公布 | 原子换名 + `kickstart -k`（新 pid 70052）；身份逐字不变；热修（族归一）在新版继续生效 | ✓ |
+| **U2 设备** | 新核 `.so` = **2,997,296 B**（标记 `75ee1751220c-rust` = tag 提交，与出口二进制同源）；`tailcat-default-signed.hsp` 2,180,710 B 装机成功 | 重出 HAP/HSP 全链：`build-core.sh` 门全绿（pin/脏检出/napi-sync/log-index）→ `assembleHsp` → `hdc install -r` → force-stop + 起 → 点开关重连 | ✓ |
+| 端到端复验 | 设备 `主机 quic:192.168.3.12, 直连, 17 ms`；出口 `连接采纳 dev=aca645d3 tun=100.64.210.203 ← [::ffff:192.168.3.67]:44176`；真机测速 **↑54 MB/s ↓57 MB/s**；`serve token` 的 control 面 `serverVersion=v0.3.2` | 同 §12.6 的口径（层 0 + 服务面） | ✓ |
+
+**凭证连续性**：台账 append-only ⇒ 换装前设备持有的 `hmw2` token **继续有效**（未吊销），设备无需
+重新注入即自动重连；本轮两次出口重启（U1/U3）后设备均自动回到「直连」。
+**回滚**：单台出口 = `cp <bak> /usr/local/bin/homeway-rs`（阿里云，先 `pkill`）/ `install + mv -f`（Mac）
++ `launchctl kickstart -k`；设备核 = 重装 v0.3.1 的 HSP（`libs/` 新旧 `.so` 均在 git 外，需从
+`~/homeway-rollback/` 或重建取）。**v0.3.1 的回滚件已就位（本表「前置」行）。**
+
 

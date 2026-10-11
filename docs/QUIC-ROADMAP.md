@@ -122,25 +122,30 @@ QUIC MTU 1400 + DPLPMTUD，窄路径超限丢弃 + 计数；⑤中继零改动�
 
 > **本节 = 唯一的「现在该干什么」指针。** 主会话只认这里。
 
-0. **★ 当前态（2026-10-11）：滚动升级已执行（v0.3.1），项目实质收口。**
-   ① **U1 阿里云出口 ✓**（`v0.3.1` sha `1bfb4c04…`；身份 `key=1020c3eae8b3…` 逐字不变；公网端点已公布）
-   ② **U3 Mac 出口 ✓**（`v0.3.1` sha `314082fd…`；身份 `key=8aee740b7220…` 逐字不变；v4+v6 公网端点已公布；
-   **V24 观察期 ✓**：30 min 35 s 内 `ERROR|panic|FATAL` = 0、中继腿注册 1 次无抖动）。
-   ③ **U2 设备 ✓**（新核 `.so` 2,995,376 B / `77068d72c938-rust` 已装；两台出口的 `hmw2` token 已注入；
-   **真机 V10–V15 / V17 / V18 / V20 全过**〔层 0 / files 下载内容一致 / term 键输入落纸 / speedtest
-   ↑56MB/s ↓62MB/s / portfwd 载荷经隧道逐字到达 / 收工链 / 零 panic / DNS 计数〕，V16 过待机档
-   〔检测 36–42 s + 重连 4 s〕，V19 未做；**App Pss 34,164 KB**〔基线 33,823，+341 KB〕）。
-   验收由 **hdc 驱动手机**完成（`uitest uiInput` + `dumpLayout` + `screenCap`）。执行实录与两处
-   判据措辞订正 = `docs/DEPLOY-RUST-EXIT.md` §12.6。
+0. **★ 当前态（2026-10-11）：滚动升级已执行两轮（v0.3.1 → **v0.3.2**），项目实质收口。**
+   ⓿ **v0.3.2 二次换装 ✓**（核侧「审查修复①–⑦ + 评审 r1 整改」批收口后重发）：U1 阿里云
+   （sha `ff4e2904…`）+ U3 Mac（sha `edf27e8a…`）换件后**身份逐字不变**、公网端点照旧公布；设备核重出
+   （`.so` 2,997,296 B / 标记 `75ee1751220c-rust` = tag 提交）并装机；端到端复验 = 设备 `直连 17 ms` +
+   出口 `连接采纳 dev=aca645d3` + 真机测速 **↑54/↓57 MB/s** + `serverVersion=v0.3.2`；台账 append-only
+   ⇒ **换装前设备持有的 token 继续有效**（无需重注入）。vt. 见 `docs/DEPLOY-RUST-EXIT.md` §12.7。
+   ① **U1 阿里云出口 ✓**（v0.3.1 时已验；v0.3.2 复验身份 `key=1020c3eae8b3…` 逐字不变）
+   ② **U3 Mac 出口 ✓**（v0.3.1 时 V21/V22 ✓ + **V24 观察期 ✓**：30 min 35 s 内 `ERROR|panic|FATAL` = 0；
+   v0.3.2 复验身份 `key=8aee740b7220…` 不变、v4+v6 公网端点已公布）。
+   ③ **U2 设备 ✓**（**真机 V10–V15 / V17 / V18 / V20 全过**〔层 0 / files 内容一致 / term 键输入落纸 /
+   speedtest / portfwd 载荷经隧道逐字到达 / 收工链 / 零 panic / DNS 计数〕，V16 过待机档〔检测 36–42 s +
+   重连 4 s〕，V19 未做；**App Pss 34,164 KB**〔基线 33,823，+341 KB〕）。验收由 **hdc 驱动手机**完成
+   （`uitest uiInput` + `dumpLayout` + `screenCap`）。执行实录与两处判据措辞订正 = §12.6。
    ④ **执行中发现并修复部署阻塞级缺陷**（出口面双栈 socket 的裸 v4 目标在 Darwin `EINVAL(22)`
    ⇒ STUN 观测恒失败 ⇒ 公网端点不公布）⇒ 热修补记 = `docs/reviews/M7-HOTFIX-fam.md`，
    **v0.3.0 弃用**（未承载生产流量）、v0.3.1 重发四目标 + Release。
-   ⑤ **tier 侧三项待办（用户触点，本仓不改）**：pin 前进（现 `cbd45f04…`）、
-   `docs/agents/log-index.md` 重生成（QUIC 换代的**行号漂移**；出包正式路径被它拦，本批走手拷逃生口）、
-   `TokenCheck.ets` 的 `HMW_PREFIX` 放宽到 `hmw1|hmw2`（否则 App 内**手工粘贴**新 token 会被前端拒；
-   `--ps` 注入不受影响）。
-   ⑥ **回滚窗口未关**：`~/homeway-rollback/`（Mac 七件）与阿里云 `/opt/homeway/backups/`
-   （`data-rs-pre-m7.tar.gz` + `homeway-rs.bak-v0.2.3` + `tokens-aliyun-pre-m7.txt`）**保留到用户确认**。
+   ⑤ **tier 侧三项已做**（用户 2026-10-11 授权「在 tier 里改」）：`TokenCheck` 只认 `hmw2` + 脱敏正则
+   版本位通配 + uitest 铸 token 取样前缀无关化 + 文档口径同步；`log-index.md` 重生成（多次）；
+   **pin 前进 `cbd45f0→1d7a5aa→75ee175`**。**另**：tier 非 core 代码做了一轮三面审查（UI / 逻辑 /
+   基础设施），三批整改已落地并推送（真缺陷 7 条 + 结构与门禁 30 余条，单测 271→320，新增
+   terminal NAPI 对账门 / ABI 签名维 / 跨仓版本常量门）。
+   ⑥ **回滚窗口未关**：`~/homeway-rollback/`（Mac 七件 + `homeway-rs.v0.3.1` + `config.toml.v0.3.1`）
+   与阿里云 `/opt/homeway/backups/`（`data-rs-pre-m7.tar.gz` / `homeway-rs.bak-v0.2.3` /
+   `tokens-aliyun-pre-m7.txt` / `homeway-rs.bak-v0.3.1` / `data-rs-pre-v032.tar.gz`）**保留到用户确认**。
 
 1. **M6 已收口（测量与归因）**（规格 = `docs/reviews/M6-design.md`（r28/r29 两轮过门 + §12 裁决）；
    实现与读数 = `docs/reviews/M6.md`；报告 = `docs/PERF-AB.md` §9.20）。**M7（生产切换与文档收束）等待
