@@ -1,5 +1,6 @@
 #!/bin/zsh
-# quic-wg-e2e.sh — **单承载（QUIC-only）端点面**的本地全链证据（**本地私有出口，绝不碰现役实例**）。
+# quic-single-bearer-e2e.sh — **单承载（QUIC-only）端点面**的本地全链证据（**本地私有出口，绝不碰现役实例**）。
+# （旧名 quic-wg-e2e.sh 的 `wg` 是历史叙事；本脚本随测试目标 quic_single_bearer_e2e 同批改名。）
 #
 # **M5 C4 改写**：原「`_wg` 档全链」/「`--quic=false` 缺失路径」两面随 WG 面与承载开关删除
 # 而退役（`serve.quic` 键已不存在，出口再也产不出「无 QUIC 端点」的 token）。现脚本走两半：
@@ -15,7 +16,7 @@
 # 做什么：
 #   ①起本地 Rust 出口（正常形态）；
 #   ②取出口 token，断言 QUIC 面**起了**（`cache/quic_listen_port.txt` 存在 + E-q1 `quic: 端点就绪`）；
-#   ③跑 `crates/homeway-core/tests/quic_wg_e2e.rs`：
+#   ③跑 `crates/homeway-core/tests/quic_single_bearer_e2e.rs`：
 #     · `exit_token_is_single_bearer_quic_only`（`--ignored`：需出口 token）；
 #     · `wg_only_token_generation_fails_visibly_without_fallback`（常跑；G9 负例，无需出口）；
 #     · `legacy_hmw1_token_surfaces_actionable_changeover_attribution`（常跑；**M7 S1** 负例）。
@@ -23,7 +24,7 @@
 #     不连 daemon、不入表 ⇒ 零副作用）。
 #   ④读数与证据行留到 /tmp（**仓外**，不污染工作树）。
 #
-# 用法：tools/quic-wg-e2e.sh [实例号]（缺省 1）
+# 用法：tools/quic-single-bearer-e2e.sh [实例号]（缺省 1）
 # 读数：/tmp/m5c4-token-res/（SUMMARY.txt / token-e2e.log / g9-e2e.log / s1-e2e.log /
 #      s1-cli-assert.txt / exit-lines.txt / quic-on-assert.txt）
 set -uo pipefail
@@ -88,8 +89,8 @@ run_one() {
   echo "==> 跑用例 $name"
   local extra=()
   [[ "$ignored" == "ignored" ]] && extra=(--ignored)
-  ( cd "$REPO_ROOT" && HOMEWAY_WG_E2E_TOKEN="$TOKEN" HOMEWAY_WG_E2E_EXIT_LOG="$EXIT_LOG" \
-      cargo test -p homeway-core --test quic_wg_e2e "$name" -- "${extra[@]}" --nocapture --test-threads=1 ) \
+  ( cd "$REPO_ROOT" && HOMEWAY_SB_E2E_TOKEN="$TOKEN" HOMEWAY_SB_E2E_EXIT_LOG="$EXIT_LOG" \
+      cargo test -p homeway-core --test quic_single_bearer_e2e "$name" -- "${extra[@]}" --nocapture --test-threads=1 ) \
     > "$out" 2>&1
   local r=$?
   grep -E "^\[g9|^\[s1|^\[token|^test result" "$out" || true

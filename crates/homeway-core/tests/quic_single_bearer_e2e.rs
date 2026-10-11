@@ -1,4 +1,5 @@
-//! **单承载（QUIC-only）端点面判据**（M5 C4 改写；脚本 = `tools/quic-wg-e2e.sh`）。
+//! **单承载（QUIC-only）端点面判据**（M5 C4 改写；脚本 = `tools/quic-single-bearer-e2e.sh`；
+//! 文件名 `quic_single_bearer_e2e`——旧名 `quic_wg_e2e` 的 `wg` 是历史叙事，本文件面零 WG）。
 //!
 //! 四条用例：
 //! 1. `wg_only_token_generation_fails_visibly_without_fallback`（**常跑**，无需出口）：
@@ -15,8 +16,8 @@
 //!    存量 `hmw1` token（设备 App 主机卡里的旧条目）⇒ status reason 必须带**换代归因**
 //!    （哨兵原文 + 「存量 token 已失效」/取证入口/重新粘贴），且不得说成串损坏。
 //!
-//! 环境契约（用例 2）：`HOMEWAY_WG_E2E_TOKEN`（出口 token）/ `HOMEWAY_WG_E2E_EXIT_LOG`
-//! （出口 stdout 日志）。
+//! 环境契约（用例 2）：`HOMEWAY_SB_E2E_TOKEN`（出口 token）/ `HOMEWAY_SB_E2E_EXIT_LOG`
+//! （出口 stdout 日志；旧名 `HOMEWAY_WG_E2E_*` 随文件改名同批失效）。
 
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
@@ -198,11 +199,11 @@ fn legacy_hmw1_token_surfaces_actionable_changeover_attribution() {
 }
 
 /// **判据（E3 改写后的正向面）**：真出口铸出的 token = **单承载 QUIC**——`rpk` 在场、
-/// 端点全为 `Quic` 类、`Direct` 类零命中（出口不再有 WG 端口；`tools/quic-wg-e2e.sh` 驱动）。
+/// 端点全为 `Quic` 类、`Direct` 类零命中（出口不再有 WG 端口；`tools/quic-single-bearer-e2e.sh` 驱动）。
 #[test]
-#[ignore = "端到端：需本地 Rust 出口在跑（tools/quic-wg-e2e.sh 驱动）"]
+#[ignore = "端到端：需本地 Rust 出口在跑（tools/quic-single-bearer-e2e.sh 驱动）"]
 fn exit_token_is_single_bearer_quic_only() {
-    let token = std::env::var("HOMEWAY_WG_E2E_TOKEN").expect("须给 HOMEWAY_WG_E2E_TOKEN");
+    let token = std::env::var("HOMEWAY_SB_E2E_TOKEN").expect("须给 HOMEWAY_SB_E2E_TOKEN");
     let tok = homeway_core::token::decode(&token).expect("token 可解");
     assert!(tok.rpk.is_some(), "QUIC 单承载 ⇒ token 必带 rpk 尾字段");
     let kinds: Vec<_> = tok.endpoints.iter().map(|e| e.kind).collect();
@@ -219,7 +220,7 @@ fn exit_token_is_single_bearer_quic_only() {
         "WG 类（Direct）端点已退役（单承载）：{kinds:?}"
     );
     // 出口侧对照：日志在场（公共端口/QUIC 面的判据行由驱动脚本断言）
-    if let Ok(p) = std::env::var("HOMEWAY_WG_E2E_EXIT_LOG") {
+    if let Ok(p) = std::env::var("HOMEWAY_SB_E2E_EXIT_LOG") {
         let exit_log = PathBuf::from(p);
         assert!(log_lines(&exit_log) > 0, "出口日志须在场：{exit_log:?}");
     }

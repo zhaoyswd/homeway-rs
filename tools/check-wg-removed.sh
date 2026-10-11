@@ -91,7 +91,7 @@ info "② WG 术语（$PAT2）= 0"
 PAT3='经 WG 拨|回落 WG|尝试 WG 兜底|按承载分档|A/B 开关|HOMEWAY_TRANSPORT|tunConfig\.transport|判据=wg|R1 重握手|R2 换源|R3 重赛跑|serve\.quic[^_]'
 # 白名单 = **负向断言**所在文件（测试必须写出该串才能断言「不得出现」——C4 交下）
 NEG_ASSERT_FILES=(
-  "crates/homeway-core/tests/quic_wg_e2e.rs"
+  "crates/homeway-core/tests/quic_single_bearer_e2e.rs"
   "crates/homeway-core/tests/quic_island_e2e.rs"
   "crates/homeway-core/tests/quic_pf_e2e.rs"
   "crates/homeway-core/tests/quic_stream_perf.rs"
@@ -165,15 +165,15 @@ PAT5='ring-shim|hmw1|_wg'
 #  · token_vectors.rs：负例**必须**含存量 `hmw1…` 串（「旧串⇒版本拒」的判据本体）
 #  · rltoken.rs：测试里 `"hmw1xxxx"` = 「非 rl1 前缀拒」的输入样本
 #  · token.rs：**冻结** v1 布局的文档注释（剥注释后本不命中，留档）
-#  · quic_wg_e2e.rs：`quic_wg_e2e` 是**文件名/用例名**（`_wg` 子串），非 WG 面引用
+#  · quic_single_bearer_e2e.rs：`hmw1` = 换代负例样本/用例名（M7 S1 判据本体，非 WG 面引用）
 #  · vecgen_vectors_test.go：已退役的 Go oracle 函数体（不接线；`hmw1` 是其历史输入）
 SB_ALLOW_FILES=(
   "crates/homeway-core/tests/token_vectors.rs"
   "crates/homeway-core/src/relay/rltoken.rs"
   "crates/homeway-core/src/token.rs"
-  "crates/homeway-core/tests/quic_wg_e2e.rs"
-  #  · quic-wg-e2e.sh：同因（它跑的就是 `--test quic_wg_e2e` 这个**目标名**）
-  "tools/quic-wg-e2e.sh"
+  "crates/homeway-core/tests/quic_single_bearer_e2e.rs"
+  #  · quic-single-bearer-e2e.sh：同因（它跑的负例用例面必写 `hmw1` 合成串）
+  "tools/quic-single-bearer-e2e.sh"
   "tools/vector-gen/vecgen_vectors_test.go"
   #  · 本门自身：哨兵词表与白名单清单**必须**写出这些串（自指面）
   "tools/check-wg-removed.sh"
@@ -234,7 +234,7 @@ drop_whitelist "$TMP/9.txt" \
   "tools/check-wg-removed.sh" \
   "tools/m1-ab-e2e.sh" \
   "tools/m2-s5-e2e.sh" \
-  "tools/quic-wg-e2e.sh" \
+  "tools/quic-single-bearer-e2e.sh" \
   "tools/quic-ab/README.md" \
   "tools/vector-gen/README.md" \
   "tools/vector-gen/vecgen_vectors_test.go" \

@@ -2591,7 +2591,7 @@ mod tests {
     /// **M5 变更（登记）**：出口不再有 WG 端口 ⇒ 已公布公网端点（显式配置/UPnP+STUN 合流
     /// 产物）的类别由 `Direct` 改为 `Quic`（设计 §8.1-E3：「QUIC 类端点成为唯一公网/直连
     /// 承载类」）；`Direct` 类在**本出口铸出的 token 里不再出现**（旧 token 的 Direct 类
-    /// 仍是客户端侧 G9 的可见失败路径，见 `quic_wg_e2e`）。
+    /// 仍是客户端侧 G9 的可见失败路径，见 `quic_single_bearer_e2e`）。
     #[test]
     fn minted_token_carries_quic_endpoints_and_rpk() {
         let (logf, rx) = log_sink();
