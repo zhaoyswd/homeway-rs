@@ -89,38 +89,9 @@ mod tests {
         v
     }
 
-    /// 吃 Go 真源向量（fixtures/vectors/tunnel_addr.json，含守卫命中样本）。
-    #[test]
-    fn addr_matches_go_vectors() {
-        let cases: &[(&str, &str, &str, &str)] = &[
-            // (secret, pubkey, tunnel_ip, tun_ip)
-            (
-                "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
-                "d5cae8cf000000000000000000000000000000000000000000000000000000ff",
-                "100.64.132.190",
-                "100.64.181.212",
-            ),
-            (
-                "deadbeefcafebabe000000000000000000000000000000000000000000000001",
-                "1111111111111111111111111111111111111111111111111111111111111111",
-                "100.64.216.183",
-                "100.64.32.62",
-            ),
-            (
-                // 守卫路径：hw-app 与 hw-tun 撞 v → hw-app.2.. 再散列
-                "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
-                "0000807800000000000000000000000000000000000000000000000000000000",
-                "100.64.140.211",
-                "100.64.187.180",
-            ),
-        ];
-        for (secret, pubkey, tunnel, tun) in cases {
-            let sec = Secret::from(h32(secret));
-            let pk = h32(pubkey);
-            assert_eq!(derive_tunnel_ip(&sec, &pk).to_string(), *tunnel);
-            assert_eq!(derive_tun_ip(&sec, &pk).to_string(), *tun);
-        }
-    }
+    // 向量数值面（secrets/pubs → tunnel_ip/tun_ip 的逐案对账）由集成测试
+    // `tests/identity_vectors.rs::tunnel_addr_matches_go` 吃 `fixtures/vectors/tunnel_addr.json`
+    // 承担（单一真源）；此处只留**内联算法面**（守卫机制的构造性自证），不重复数值副本。
 
     /// 守卫自证：对守卫命中样本，hw-app 原始派生与 tunnel 相等、再散列后脱开
     /// （防止向量断言退化成「同函数两端比相等」的恒真）。

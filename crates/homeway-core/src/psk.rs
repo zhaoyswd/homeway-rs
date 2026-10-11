@@ -55,31 +55,5 @@ pub(crate) fn hkdf_expand_32(ikm: &[u8], info: &[u8]) -> [u8; 32] {
     out
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn h(s: &str) -> [u8; 32] {
-        let mut v = [0u8; 32];
-        hex::decode_to_slice(s, &mut v).unwrap();
-        v
-    }
-
-    /// 吃 Go 真源向量（fixtures/vectors/psk.json，经 tools/gen-vectors.sh 产出）。
-    #[test]
-    fn psk_matches_go_vectors() {
-        for (secret, want) in [
-            (
-                "0102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f20",
-                "9e28dcb06a224b2b9573cd11e98f147afe456831d88d88be42447573bcc11d14",
-            ),
-            (
-                "deadbeefcafebabe000000000000000000000000000000000000000000000001",
-                "71fb220f3981f7b1e9df3ae57d831c5428f61a3e53f87c9f9e61295dd0249d79",
-            ),
-        ] {
-            let psk = Psk::from(Secret::from(h(secret)));
-            assert_eq!(hex::encode(psk.as_bytes()), want, "secret={secret}");
-        }
-    }
-}
+// 向量数值面（secret → psk 逐案对账）由集成测试 `tests/identity_vectors.rs::psk_matches_go`
+// 吃 `fixtures/vectors/psk.json` 承担（单一真源）；本模块不再重复内联数值副本。

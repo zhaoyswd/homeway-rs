@@ -362,52 +362,29 @@ mod tests {
         v
     }
 
-    /// 吃 Go 真源向量（fixtures/vectors/identity.json）：master+peerID → 私钥/公钥；
-    /// master → devTag（TagDerived 派生路径）。
+    /// devTag 派生（TagDerived 降级路径）——吃 `fixtures/vectors/identity.json` 的
+    /// `devtags` 段（`derive_dev_tag` 是私有面，集成侧 store 全路径测试覆盖不到；
+    /// 私钥/公钥面已由 `tests/identity_vectors.rs` 经 store 全路径复算，此处不重复）。
     #[test]
-    fn derivation_matches_go_vectors() {
-        for (master, peer, priv_want, pub_want) in [
-            (
-                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-                "1111111111111111111111111111111111111111111111111111111111111111",
-                "1ebf5701e608af93bc66b1c50c26b3683e8fc120251fef02bce7b52c07c3ae34",
-                "3c98c9c07bf119c8ea650053f532639010563aa1993e85f12073ba1422296f17",
-            ),
-            (
-                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-                "2222222222222222222222222222222222222222222222222222222222222222",
-                "db4a1b4800130b2fd2ca8ff5c3a1ae8d9994b88280aeaef14017c80e168583ac",
-                "ab9bca523d26e4dd94783c5627e651cdd61f7e6d2d1688f48666091cac60e911",
-            ),
-            (
-                "f1e2d3c4b5a6978869584a3b2c1d0e0f00112233445566778899aabbccddeeff",
-                "1111111111111111111111111111111111111111111111111111111111111111",
-                "48c0537f9a0d82f6f5c7a83eae3bd41bda48482eca1dc7b4ef3e0123d2018366",
-                "aeb760ae073a3f07229a23ac7c257cc273c9974703358fa7e5bda859c8efcc52",
-            ),
-        ] {
-            let m = h32(master);
-            let key = derive_key(&m, &PeerId::from(h32(peer)));
-            assert_eq!(hex::encode(key.to_bytes()), priv_want, "master={master}");
-            let id = Identity { key, dev_tag: DevTag([0; 8]) };
-            assert_eq!(hex::encode(id.public_key()), pub_want);
-        }
-        // devTag 派生（TagDerived 降级路径）
-        for (master, want_tag, want_short) in [
-            (
-                "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f",
-                "1273adaf45f0a411",
-                "1273adaf",
-            ),
-            (
-                "f1e2d3c4b5a6978869584a3b2c1d0e0f00112233445566778899aabbccddeeff",
-                "1f33e66a917ee2ad",
-                "1f33e66a",
-            ),
-        ] {
-            let tag = derive_dev_tag(&h32(master));
-            assert_eq!(hex::encode(tag.as_bytes()), want_tag);
-            assert_eq!(tag.short(), want_short);
+    fn devtag_derivation_matches_go_vectors() {
+        let raw = std::fs::read_to_string(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../fixtures/vectors/identity.json"
+        ))
+        .unwrap();
+        let v: serde_json::Value = serde_json::from_str(&raw).unwrap();
+        let entries = v["devtags"].as_array().expect("devtags 段");
+        assert!(entries.len() >= 2, "向量集不完整");
+        for e in entries {
+            let master = h32(e["master"].as_str().unwrap());
+            let tag = derive_dev_tag(&master);
+            assert_eq!(
+                hex_encode(tag.as_bytes()),
+                e["dev_tag"].as_str().unwrap(),
+                "{}",
+                e["name"].as_str().unwrap_or("")
+            );
+            assert_eq!(tag.short(), e["short_dev"].as_str().unwrap());
         }
     }
 

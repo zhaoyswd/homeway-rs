@@ -4,7 +4,8 @@
 //! identity 族经**store 全路径**复算：把向量的 master.key 落盘到临时目录，
 //! `load_or_create` 应产出与 Go `LoadOrCreateIdentity` 一致的私钥/公钥
 //! （Go 向量生成时同路径交叉验证；devtag 文件不落盘 ⇒ 标签走创建随机路径，
-//! 不在字节断言面内——TagDerived 派生路径由 `identity::tests` 内联向量钉住）。
+//! 不在字节断言面内——TagDerived 派生路径由
+//! `identity::tests::devtag_derivation_matches_go_vectors` 吃同 JSON 的 `devtags` 段钉住）。
 
 use homeway_core::identity;
 use homeway_core::psk::Psk;
