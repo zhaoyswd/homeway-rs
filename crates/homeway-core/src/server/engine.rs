@@ -753,7 +753,7 @@ impl ServeEngine {
                             leg_tx_frame2.try_send(super::relayleg::LegEvent::Frame(payload.to_vec(), src));
                     }));
                     let stop = spawn_service_stop_flag(&mut stop_flags);
-                    super::relayleg::spawn_relay_leg(
+                    let leg = super::relayleg::spawn_relay_leg(
                         relay_sock,
                         arg.addr,
                         priv_key.clone(),
@@ -763,7 +763,7 @@ impl ServeEngine {
                         Arc::clone(&logf),
                     );
                     // 控制面（TCP，同号端口）：SESSION/RELEASE 经 EngineCmd 交驱动线程拨/拆腿
-                    super::relayleg::spawn_relay_ctl(
+                    let ctl = super::relayleg::spawn_relay_ctl(
                         arg.addr,
                         priv_key.clone(),
                         arg.secret,
@@ -771,6 +771,17 @@ impl ServeEngine {
                         Arc::clone(&stop),
                         Arc::clone(&logf),
                     );
+                    // 评审 r1 低-1：线程起不全 ⇒ 与「socket 副本缺席」同款处置（token 不
+                    // 带中继端点——否则客户端拿到一条静默失效的中继路径；明细行已在
+                    // spawn 内部落，这里只摘发布面）。控制面单独失败时注册腿会周期
+                    // Hello 但 SESSION 无法建立 ⇒ 中继路径同样不可用，一并摘。
+                    if leg.is_err() || ctl.is_err() {
+                        (logf)(
+                            "⚠️ --relay 线程起不全（注册腿/控制面 spawn 失败，见上行明细）—— 中继端点不并入 token，出口仅直连形态运行",
+                        );
+                        relay_ep = None;
+                        relay_wanted = false;
+                    }
                 }
                 None => {
                     (logf)(

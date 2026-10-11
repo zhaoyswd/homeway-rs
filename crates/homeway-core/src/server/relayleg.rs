@@ -112,6 +112,10 @@ pub enum LegEvent {
 }
 
 /// 起 UDP 注册腿线程（非阻塞；随 stop 收工）。
+///
+/// 返回 `Err` = 线程没起来（F7 + 评审 r1 低-1：调用方〔engine〕据此把中继端点从
+/// token 发布面摘除——否则出口不向中继注册而 token 照带中继端点，客户端拿到一条
+/// 静默失效的路径）。
 pub fn spawn_relay_leg(
     sock: UdpSocket,
     relay: SocketAddr,
@@ -120,10 +124,8 @@ pub fn spawn_relay_leg(
     events: std::sync::mpsc::Receiver<LegEvent>,
     stop: Arc<AtomicBool>,
     logf: Logf,
-) {
-    // F7 纪律（2026-10-10 审查 中-3 补齐）：spawn 失败不得静默——线程起不来 ⇒ 出口
-    // 不向中继注册，而 token 打印面照常并入中继端点 ⇒ 客户端拿到一条静默失效的中继路径。
-    if let Err(e) = std::thread::Builder::new()
+) -> std::io::Result<()> {
+    let spawned = std::thread::Builder::new()
         .name("homeway-relayleg".into())
         .stack_size(512 * 1024)
         .spawn({
@@ -131,14 +133,18 @@ pub fn spawn_relay_leg(
             move || {
                 run_relay_leg(sock, relay, priv_key, secret, events, &stop, &logf);
             }
-        })
-    {
-        crate::syncutil::log_spawn_failed(
-            &logf,
-            "homeway-relayleg",
-            &e,
-            "出口将不向中继注册（经中继的路径不可用）",
-        );
+        });
+    match spawned {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            crate::syncutil::log_spawn_failed(
+                &logf,
+                "homeway-relayleg",
+                &e,
+                "出口将不向中继注册（经中继的路径不可用）",
+            );
+            Err(e)
+        }
     }
 }
 
@@ -285,10 +291,10 @@ pub fn spawn_relay_ctl(
     cmd_tx: Sender<EngineCmd>,
     stop: Arc<AtomicBool>,
     logf: Logf,
-) {
-    // F7 纪律（2026-10-10 审查 中-3 补齐）：同 spawn_relay_leg——控制面起不来 ⇒
-    // SESSION/RELEASE 无法下发，中继数据面注定闲置，必须记行可查。
-    if let Err(e) = std::thread::Builder::new()
+) -> std::io::Result<()> {
+    // F7 纪律 + 评审 r1 低-1：同 spawn_relay_leg——控制面起不来 ⇒ SESSION/RELEASE
+    // 无法下发（中继数据面注定闲置），Err 上抛供调用方摘 token 中继端点。
+    let spawned = std::thread::Builder::new()
         .name("homeway-relayctl".into())
         .stack_size(512 * 1024)
         .spawn({
@@ -296,14 +302,18 @@ pub fn spawn_relay_ctl(
             move || {
                 run_control_loop(relay, priv_key, secret, cmd_tx, &stop, &logf);
             }
-        })
-    {
-        crate::syncutil::log_spawn_failed(
-            &logf,
-            "homeway-relayctl",
-            &e,
-            "中继控制面（SESSION/RELEASE）不可用，经中继的承载将无法建立",
-        );
+        });
+    match spawned {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            crate::syncutil::log_spawn_failed(
+                &logf,
+                "homeway-relayctl",
+                &e,
+                "中继控制面（SESSION/RELEASE）不可用，经中继的承载将无法建立",
+            );
+            Err(e)
+        }
     }
 }
 
