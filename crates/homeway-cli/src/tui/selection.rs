@@ -14,8 +14,11 @@
 //! 落 `cache/` 的理由：该层可清理（reset cache 整目录删）且不进 export/import
 //! 白名单面——选中是设备本地偏好，不随状态迁移本就合理（r2 D-9/D-1 定案）。
 
+// 消费方（app 层的全局唯一接线，tasks 4.6）随下一批落地——期间豁免 dead_code。
+#![allow(dead_code)]
+
 use std::fs;
-use std::hash::{Hash, Hasher};
+use std::hash::Hasher;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -38,9 +41,6 @@ pub struct SelectionState {
     #[serde(default)]
     pub session: Option<String>,
 }
-
-/// 本机条目的主机 id 哨兵（design D5：本机条目由面板合成，不入 daemon 主机表）。
-pub const LOCAL_HOST_ID: &str = "local";
 
 /// 选中文件句柄。`poll` 的指纹簿记在句柄内（每实例一份）。
 pub struct SelectionFile {
@@ -125,6 +125,7 @@ fn unique_suffix() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::super::local::LOCAL_HOST_ID;
 
     /// 每用例独立临时目录（仓内无 tempfile 依赖；进程 id + 计数器足够隔离）。
     fn temp_state_dir(tag: &str) -> PathBuf {
