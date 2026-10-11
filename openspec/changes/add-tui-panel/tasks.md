@@ -15,11 +15,11 @@
 - [x] 3.1 主机状态面：`snapshot.get` 初值 + `events.subscribe(link, session)` 增量状态机（既有域，含 cursor 回放 + generation 门），daemon 重启/控制面中断后自动重连 + 全量重快照（**不复刻 `status --watch` 的 cursor_stale → exit(1)**）；验证 = 单测：事件序列驱动语义正确 + generation 失配触发全量重取而非退出（r2 N-12③）
 - [ ] 3.2 本机条目合成：serve 运行状态（非 running 四态 stopping/stopped/failed/absent 统一归不可用）+ 本地 term socket 可连判据；路径 = `<state>/serve/term.sock`（**不复用 term_cli 本地 dial 段的 --state 路径约定**）；验证 = 单测：running+sock 可连 / running+sock 不可连 / 非 running 各态下的条目形态（r2 N-12②）
 - [x] 3.3 会话列表轮询器：活动态自适应拍（活动 ≤2s / 非活动 10s，活动态 = 最近 30s 有用户输入或外层焦点在面板）、显示排序 lastActiveMs 降序 + 会话名破平、选中以会话名为键、徽章映射（agent∈{shell,unknown}→无 agent，否则 stateV2 四态）；验证 = 单测：内联 LIST JSON 字样（不动冻结夹具）→ 列表模型与徽章 + 重排后选中稳定（r2 N-7）
-- [ ] 3.4a 终端腿接入与解析：stream.open → HELLO（无 SURFACE/无 RAW_TERMINAL caps 位，**尾随块携带全零 caps 块以便 client_id 生效**，尺寸取 LIST 当前 cols/rows 对齐）→ ATTACHED/DATA/REPLAY_DONE/STATE 帧解析 → 内嵌 `SessionVt` 喂入；**接入前 LIST 腿满检查 + 稳定 client_id**；验证 = 单测：回放字节流喂入后网格与预期一致 + 腿满拒绝接入（上限常量 8 来源写死，服务端覆盖为已知限制）+ 服务端观察到同一 client_id 走同实例替换（旧腿被 REPLACED）+ HELLO 尺寸等于 LIST 尺寸断言（r2 N-2/N-3/N-4 / r3 B/G）
-- [ ] 3.4b 四分支断线判定与重拨策略（mock link/session 状态 + LIST 快照序列驱动，不做 clients 自证）：会话不在 LIST ⇒ 终止停拨；链路离去/形态不可用（本机 = socket 重连失败）⇒ 自动重拨（**退避 0.5s 起指数至 10s 上限，链路恢复事件重置**）；腿满 ⇒ 退避 10–30s 待空位不抢占；其余 ⇒ 按链路中断重附；验证 = 单测：四分支谓词各自的可观察行为 + 谓词依序短路 + 失败重拨间隔下界断言（r2 N-1 / r3 E/F）
-- [ ] 3.5 输入通路：crossterm 键鼠事件 → `SessionVt`/keyenc 编码 → **DATA 字节帧**（不使用 INPUT 帧）；粘贴按会话括号粘贴位包裹（外层 2004 由面板启用）、焦点事件按会话上报位注入（导航焦点期间按失焦处理）；RESIZE 仅交互实例首次交互后下发（镜像实例 NEVER）；验证 = 单测：键事件→字节编码矩阵 + 粘贴/焦点按位分支 + 导航焦点失焦注入 + 镜像实例不产生 RESIZE 帧断言（r2 N-8/N-4 / r3 L）
+- [x] 3.4a 终端腿接入与解析：stream.open → HELLO（无 SURFACE/无 RAW_TERMINAL caps 位，**尾随块携带全零 caps 块以便 client_id 生效**，尺寸取 LIST 当前 cols/rows 对齐）→ ATTACHED/DATA/REPLAY_DONE/STATE 帧解析 → 内嵌 `SessionVt` 喂入；**接入前 LIST 腿满检查 + 稳定 client_id**；验证 = 单测：回放字节流喂入后网格与预期一致 + 腿满拒绝接入（上限常量 8 来源写死，服务端覆盖为已知限制）+ 服务端观察到同一 client_id 走同实例替换（旧腿被 REPLACED）+ HELLO 尺寸等于 LIST 尺寸断言（r2 N-2/N-3/N-4 / r3 B/G）
+- [x] 3.4b 四分支断线判定与重拨策略（mock link/session 状态 + LIST 快照序列驱动，不做 clients 自证）：会话不在 LIST ⇒ 终止停拨；链路离去/形态不可用（本机 = socket 重连失败）⇒ 自动重拨（**退避 0.5s 起指数至 10s 上限，链路恢复事件重置**）；腿满 ⇒ 退避 10–30s 待空位不抢占；其余 ⇒ 按链路中断重附；验证 = 单测：四分支谓词各自的可观察行为 + 谓词依序短路 + 失败重拨间隔下界断言（r2 N-1 / r3 E/F）
+- [x] 3.5 输入通路：crossterm 键鼠事件 → `SessionVt`/keyenc 编码 → **DATA 字节帧**（不使用 INPUT 帧）；粘贴按会话括号粘贴位包裹（外层 2004 由面板启用）、焦点事件按会话上报位注入（导航焦点期间按失焦处理）；RESIZE 仅交互实例首次交互后下发（镜像实例 NEVER）；验证 = 单测：键事件→字节编码矩阵 + 粘贴/焦点按位分支 + 导航焦点失焦注入 + 镜像实例不产生 RESIZE 帧断言（r2 N-8/N-4 / r3 L）
 - [x] 3.6 选中状态文件面：`<state>/cache/tui-selection.json` **临时文件 + rename 原子写**、读方按内容指纹判定变化、运行期解析失败/消失 = 忽略本次读保持当前选中、仅启动走回落链；300ms mtime watch；验证 = 单测：并发写不产生半截读、坏文件运行期忽略/启动期回落、指纹去重（r2 N-5）
-- [ ] 3.7 读帧→UI 通道：有界通道 + 背压阻塞（不静默丢字节）+ 合帧渲染；验证 = 单测：通道满时读线程阻塞、无字节丢失
+- [x] 3.7 读帧→UI 通道：有界通道 + 背压阻塞（不静默丢字节）+ 合帧渲染；验证 = 单测：通道满时读线程阻塞、无字节丢失
 
 ## 4. 面板 UI 层
 

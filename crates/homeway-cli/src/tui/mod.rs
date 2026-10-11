@@ -7,7 +7,10 @@
 //! 输入走客户端 keyenc → DATA 字节帧（不用 INPUT 帧）。
 
 pub(crate) mod backend;
+pub(crate) mod chan;
 pub(crate) mod hosts;
+pub(crate) mod input;
+pub(crate) mod leg;
 pub(crate) mod local;
 pub(crate) mod selection;
 pub(crate) mod sessions;
