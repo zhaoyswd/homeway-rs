@@ -6,7 +6,10 @@
 //! 与 core 零契约面改动，终端腿不声明 capsRawTerminal（服务端继续代答查询），
 //! 输入走客户端 keyenc → DATA 字节帧（不用 INPUT 帧）。
 
+pub(crate) mod app;
 pub(crate) mod backend;
+pub(crate) mod render;
+pub(crate) mod termview;
 pub(crate) mod chan;
 pub(crate) mod hosts;
 pub(crate) mod input;
