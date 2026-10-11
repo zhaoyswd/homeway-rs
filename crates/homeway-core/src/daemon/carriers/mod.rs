@@ -419,8 +419,11 @@ pub(super) const ACCEPT_RETRY_STEP_MS: u64 = 50;
 
 pub(super) enum PollAccept {
     Conn(std::net::TcpStream),
-    /// 无待收（正常节拍）。
-    Idle,
+    /// 无待收（正常节拍）。**附节拍时长——调用方必须在放锁后睡**：锁内睡会让
+    /// 取锁方（remove_host/close/重建）在非公平互斥上被"醒来立即重锁"的 accept
+    /// 线程持续插队饿死（实测 forward 族单测 28s/118s 级挂起，采样钉死在
+    /// `pthread_mutex_firstfit_lock_wait`；改后同测试秒级收口）。
+    Idle(std::time::Duration),
     /// 监听器被关（正常收口）。
     Closed,
     /// 瞬态错误烧尽（监听失效——按 failed/off 收口）。
@@ -444,6 +447,8 @@ impl PollListener {
         self.fail_next = Some(msg.to_owned());
     }
 
+    /// 非阻塞 accept 一拍（**不自睡**——节拍时长随 `Idle` 返回，调用方放锁后睡；
+    /// 理由见 `PollAccept::Idle` 的注释）。
     pub fn accept(&mut self) -> PollAccept {
         #[cfg(test)]
         if let Some(msg) = self.fail_next.take() {
@@ -460,8 +465,7 @@ impl PollListener {
             Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {
                 // 高-1 整改：无待收 = 50ms 节拍（非阻塞 accept 不空转；接入延迟
                 // 0–50ms——与 Go 阻塞 accept 的零延迟差，登记 B0-2b §十六）。
-                std::thread::sleep(std::time::Duration::from_millis(50));
-                PollAccept::Idle
+                PollAccept::Idle(std::time::Duration::from_millis(50))
             }
             // fd/内存短缺族 = 瞬态（低-2 整改：与 Go transientAcceptError 同集——
             // 一次 EMFILE 不该把监听打死为 failed）。
@@ -479,10 +483,9 @@ impl PollListener {
                 if self.backoff > ACCEPT_RETRY_MAX {
                     return PollAccept::Failed(format!("连续失败（{} 次）：{e}", self.backoff));
                 }
-                std::thread::sleep(std::time::Duration::from_millis(
+                PollAccept::Idle(std::time::Duration::from_millis(
                     self.backoff as u64 * ACCEPT_RETRY_STEP_MS,
-                ));
-                PollAccept::Idle
+                ))
             }
             Err(e) => PollAccept::Failed(format!("accept：{e}")),
         }

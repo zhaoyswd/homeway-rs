@@ -164,7 +164,7 @@ impl SocksServer {
                         self.drop_conn_by(id);
                     }
                 }
-                PollAccept::Idle => {} // 节拍在 PollListener::accept 的 WouldBlock 分支内（高-1）
+                PollAccept::Idle(pace) => std::thread::sleep(pace), // 放锁后睡（勿锁内睡——同 forward）
                 PollAccept::Closed => return Ok(()),
                 PollAccept::Failed(err) => {
                     // Q-H F4：先落账（dead）再上抛——状态面按 off + err 如实呈现；

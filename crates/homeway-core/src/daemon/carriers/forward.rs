@@ -334,6 +334,8 @@ fn start_listener(e: &Arc<FwdEntry>) -> Result<(), String> {
 }
 
 /// accept 轮询（50ms 节拍；监听收口 = listener 被取走 → Closed 退出）。
+/// **节拍在锁外睡**（`PollAccept::Idle` 带时长——锁内睡会饿死 remove_host/close
+/// 等取锁方，见该变体注释）。
 fn accept_loop(e: Arc<FwdEntry>, port_for_log: u16) {
     loop {
         let step = {
@@ -379,7 +381,7 @@ fn accept_loop(e: Arc<FwdEntry>, port_for_log: u16) {
                     ));
                 }
             }
-            PollAccept::Idle => {}
+            PollAccept::Idle(pace) => std::thread::sleep(pace), // 放锁后睡（勿锁内睡）
             PollAccept::Closed => return, // delete/级联/收工——正常收口
             PollAccept::Failed(err) => {
                 // 瞬态错误烧尽：置 failed + 原因（与重启重建的软失败同款）——防
