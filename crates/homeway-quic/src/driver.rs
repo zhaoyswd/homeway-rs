@@ -57,6 +57,11 @@ pub(crate) const REAP_THREAD: &str = "hw-quic-reap";
 /// 命令等待节拍上限（镜像 `wgcore` 的 `POLL_CAP = 250ms`）：无命令时周期性回看 stop 位
 /// （拍内务——刷新/迁移保持检测/快照同步——挂在这一拍上）。
 const TICK: Duration = Duration::from_millis(250);
+/// **无连接态**的拍上限（IDLE-WAKE C）：housekeeping 在无 live 时全 no-op（命令/任务
+/// 回执照常唤醒循环；赛跑/R/确认探活全走任务回执或同步链——dsh r3 逐项核实无「等
+/// 下一拍」路径）⇒ 空闲兜底拍放宽到 1s。连接在位保持 [`TICK`]——在用档快探地板与
+/// `fast_gap=250ms` 对齐是判据面（≤3.5s 恢复），不动。
+const TICK_IDLE: Duration = Duration::from_secs(1);
 /// 快照同步（housekeeping ④）的时间节流（2026-10-10 审查 中-3）：拍内务逐命令执行
 /// （上行热路径 = 每包一遍）而快照只需匹配同步面的轮询率 ⇒ 距上次同步 ≥ 本间隔才做；
 /// 连接采纳/断开等关键转换置「立即到期」（见 [`DriverState::snap_sync_last`]）。
@@ -835,7 +840,8 @@ fn run_driver(
                         Err(_aborted) => {}
                     }
                 }
-                () = tokio::time::sleep(TICK) => {}
+                // IDLE-WAKE C：无连接放宽到 1s（见 TICK_IDLE 文档；连接在位 = 判据面不动）
+                () = tokio::time::sleep(if st.live.is_some() { TICK } else { TICK_IDLE }) => {}
             }
             housekeeping(&mut st, &mut face, ctx, &mut jobs, seam).await;
         }
