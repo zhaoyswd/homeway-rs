@@ -20,6 +20,7 @@
 
 use std::collections::VecDeque;
 use std::io::{ErrorKind, Read, Write};
+use std::os::fd::{AsRawFd, OwnedFd};
 use std::os::unix::fs::MetadataExt;
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
@@ -275,7 +276,8 @@ struct BridgeSock {
     path: PathBuf,
     /// bind 出的 socket 文件身份（stop 只删自己的——防误删接管者；(dev, ino)）。
     /// （评审 r2-L8：listener 恒 None 的死字段已删——监听器由 accept 线程独占持有，
-    /// stop 的收口 = stopped 位 + 100ms 节拍轮询 + 2s 有界等待，不靠关 fd。）
+    /// stop 的收口 = stopped 位 + 唤醒管道即醒〔IDLE-WAKE A；管道缺席退 100ms 轮询〕
+    /// + 2s 有界等待，不靠关 fd。）
     own: Option<(u64, u64)>,
     /// Q-F F7b（N2 同族「假状态」）：accept 线程起不来或 listen 重试耗尽 ⇒ 置位，
     /// `status()` 对该桥**返回空路径**（App 拿不到非空路径就连接不上的谎报）。
@@ -381,6 +383,11 @@ pub struct BridgeHost {
     dial_timeout: Mutex<Duration>,
     inner: Mutex<HostInner>,
     stopped: Arc<AtomicBool>,
+    /// stop 唤醒管道（IDLE-WAKE A；构造期经 `sysfd::pipe_cloexec` 建，失败 ⇒ None，
+    /// accept 侧退回 100ms 轮询旧形态并记行）。**字节永不消费**：1 字节即永久翻开
+    /// level-triggered 唤醒，醒来的线程只查 `stopped` 判退——读走它会在「读到旧
+    /// false 的线程」与「进 poll」之间开丢唤醒窗（dsh r3-F5 的证伪形态）。
+    wake: Option<(OwnedFd, OwnedFd)>,
     auth_drops: AtomicU64,
     /// accept/pump 线程的收尾观测面（stop 有界等待用；工单②：stop 不再只发信号
     /// 就走——pump 线程可能正持着 gate 票在收尾，等一下让「下一次 start 不撞旧锁」）。
@@ -411,6 +418,15 @@ pub struct BridgeStatus {
 impl BridgeHost {
     /// 构造（未启动）。`dir` = filesDir（socket 落 `<dir>/bridge/*.sock`；None = 不起桥）。
     pub fn new(what: &'static str, dir: Option<PathBuf>, logf: Logf, dial_port: DialFn) -> Self {
+        let wake = match crate::sysfd::pipe_cloexec() {
+            Ok(p) => Some(p),
+            Err(e) => {
+                (logf)(&format!(
+                    "{what}: stop 唤醒管道创建失败（{e}）—— accept 侧本轮退回 100ms 轮询形态"
+                ));
+                None
+            }
+        };
         BridgeHost {
             what,
             dir,
@@ -425,6 +441,7 @@ impl BridgeHost {
                 speed_gate: Arc::new(ConnGate::new(10)),
             }),
             stopped: Arc::new(AtomicBool::new(false)),
+            wake,
             auth_drops: AtomicU64::new(0),
             live: Mutex::new(0),
             live_cv: Condvar::new(),
@@ -560,8 +577,8 @@ impl BridgeHost {
         (self.logf)(&format!("{}: 桥宿主启动（三座桥后台就位中）", self.what));
     }
 
-    /// 一座桥的 accept 循环（非阻塞 accept + 100ms 节拍轮询 stopped——桥连接非
-    /// 热路径，粗粒度足够；stop 位置起后线程退出、fd 由 drop 关）。
+    /// 一座桥的 accept 循环（非阻塞 accept + `poll` 阻塞等就绪〔IDLE-WAKE A〕——
+    /// 唤醒管道字节不消费、stop 位置起后线程即时退出、fd 由 drop 关）。
     /// 工单②：listen 重试**不持宿主锁**（信息交接式短临界区）；每条连接的处理
     /// spawn 出去（鉴权 5s + 经会话拨号 15s 不得卡 accept 面）。
     fn accept_loop(self: Arc<Self>, idx: usize) {
@@ -592,7 +609,21 @@ impl BridgeHost {
             return self.live_leave();
         };
 
+        // IDLE-WAKE A：阻塞等就绪（原 WouldBlock→sleep(100ms) = 每桥 10 次/秒的空闲
+        // 唤醒；三座桥合计 30/s 是空闲态最大单一唤醒源）。accept 错误分流（dsh r3-F6
+        // 顺带收口既有静默死面）：瞬时族（探测者 connect+close 的 ECONNABORTED、
+        // EINTR/EMFILE 族）短退避续跑——原 `Err(_) => break` 会把它们当「监听器被关」
+        // 静默杀死整座桥而 status() 仍报路径；致命错误记行退出。
+        let mut transient_n: u64 = 0;
         while !self.stopped.load(Ordering::Acquire) {
+            match self.wait_accept(&ln) {
+                Ok(true) => {}
+                Ok(false) => continue, // 唤醒拍：回循环顶查 stopped（位已置则退出）
+                Err(e) => {
+                    (self.logf)(&format!("{name}: accept 等待面错误（{e}）—— 该桥监听退出"));
+                    break;
+                }
+            }
             match ln.accept() {
                 Ok((conn, _)) => {
                     conn.set_nonblocking(false).ok();
@@ -607,13 +638,74 @@ impl BridgeHost {
                         ));
                     }
                 }
-                Err(e) if e.kind() == ErrorKind::WouldBlock => {
-                    std::thread::sleep(Duration::from_millis(100));
+                Err(e) if e.kind() == ErrorKind::WouldBlock => {} // 空返/竞态：回等待面
+                Err(e)
+                    if matches!(
+                        e.raw_os_error(),
+                        Some(
+                            libc::ECONNABORTED
+                                | libc::EINTR
+                                | libc::EMFILE
+                                | libc::ENFILE
+                                | libc::ENOBUFS
+                                | libc::ENOMEM
+                        )
+                    ) =>
+                {
+                    transient_n += 1;
+                    if transient_n <= 3 || transient_n.is_multiple_of(100) {
+                        (self.logf)(&format!(
+                            "{name}: accept 瞬时错误（{e}；累计 {transient_n} 次）—— 50ms 退避续跑"
+                        ));
+                    }
+                    std::thread::sleep(Duration::from_millis(50));
                 }
-                Err(_) => break, // 监听器被关（收工）
+                Err(e) => {
+                    (self.logf)(&format!("{name}: accept 错误（{e}）—— 该桥监听退出"));
+                    break;
+                }
             }
         }
         self.live_leave();
+    }
+
+    /// accept 环的就绪等待（IDLE-WAKE A）：管道在场 ⇒ `poll(listener + 唤醒读端, -1)`
+    /// 阻塞等（空闲零唤醒）；缺席（构造期失败的降级面）⇒ 100ms 轮询旧形态。
+    /// 返回 `true` = listener 可能就绪；`false` = 唤醒拍——回循环顶查 `stopped`。
+    /// poll 错误面（dsh r3-F6 写死）：EINTR 续等；`POLLERR/POLLHUP/POLLNVAL` 异常位
+    /// 致命上抛（记行退出——**不得**空转重 poll，那是 100% 忙转）。
+    fn wait_accept(&self, ln: &UnixListener) -> std::io::Result<bool> {
+        let Some((rd, _)) = self.wake.as_ref() else {
+            std::thread::sleep(Duration::from_millis(100));
+            return Ok(true); // 降级拍：调用方 accept 见 WouldBlock 自然回等待面
+        };
+        let mut fds = [
+            libc::pollfd { fd: ln.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: rd.as_raw_fd(), events: libc::POLLIN, revents: 0 },
+        ];
+        loop {
+            let r = unsafe { libc::poll(fds.as_mut_ptr(), fds.len() as libc::nfds_t, -1) };
+            if r < 0 {
+                let e = std::io::Error::last_os_error();
+                if e.kind() == ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
+            }
+            const BAD: libc::c_short =
+                libc::POLLERR | libc::POLLHUP | libc::POLLNVAL;
+            if fds.iter().any(|f| f.revents & BAD != 0) {
+                return Err(std::io::Error::other(format!(
+                    "poll 异常位：listener={:#x} wake={:#x}",
+                    fds[0].revents, fds[1].revents
+                )));
+            }
+            // 唤醒字节**不读**（见字段文档）——醒来只靠位判退
+            if fds[1].revents & libc::POLLIN != 0 {
+                return Ok(false);
+            }
+            return Ok(fds[0].revents & libc::POLLIN != 0);
+        }
     }
 
     /// 一条桥接连接：闸 → 鉴权 → 经会话拨出口 → 双向泵（**在自己的线程上**——
@@ -724,6 +816,15 @@ impl BridgeHost {
     /// 面此后读到空 bridgeAuth，消费方自然失败。
     pub fn stop(&self) {
         self.stopped.store(true, Ordering::Release);
+        // IDLE-WAKE A：唤醒阻塞在 poll 的 accept 线程（**先置位后写**——晚到者进
+        // poll 前必查到已置的位，或被永留的字节 level-triggered 唤醒）。阻塞管道写
+        // 1 字节恒有空间（stop 幂等多写无害）；失败忽略——位已置，降级轮询形态也退。
+        if let Some((_, wr)) = self.wake.as_ref() {
+            let b = [1u8];
+            unsafe {
+                let _ = libc::write(wr.as_raw_fd(), b.as_ptr().cast::<libc::c_void>(), 1);
+            }
+        }
         let socks = {
             let mut inner = crate::syncutil::lock_unpoison(&self.inner);
             inner.token = None;
@@ -1354,5 +1455,48 @@ mod tests {
         };
         pump(&mut r4, &mut w4, &logf, "桥泵", "up", true);
         assert!(lines.lock().unwrap().is_empty(), "桥侧旧门槛不变");
+    }
+
+    /// IDLE-WAKE A（dsh r3-F5 的回归钉）：stop 后三枚 accept 线程即时退出——
+    /// 唤醒字节**不消费**的正确性面。断言口径：①桥可正常连接（poll 路径不破坏
+    /// accept）；②`stop()` 用时远小于 2s live 预算（若唤醒丢失/线程挂起，会烧满
+    /// 预算才返回）；③三轮重复（每轮新宿主——单世代对象），钉「多线程并发 stop
+    /// 全退」形态。
+    #[test]
+    fn stop_wakes_all_accept_threads_promptly() {
+        for round in 0..3u32 {
+            let dir = tmp_dir(&format!("wake-{round}"));
+            let (logf, _lines) = log_silent();
+            let host = Arc::new(BridgeHost::new(
+                "测试桥",
+                Some(dir.clone()),
+                logf,
+                Arc::new(|_, _| unreachable!()),
+            ));
+            host.start();
+            // 等三份 socket 文件就位（listen 在后台线程；有界上界 2s，只判上界）
+            let bridge_dir = dir.join("bridge");
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while std::fs::read_dir(&bridge_dir).map(|d| d.count()).unwrap_or(0) < 3
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let st = host.status();
+            assert!(!st.files_sock.is_empty(), "第 {round} 轮：files 桥应就位");
+            // 连一座（钉 poll 路径不破坏 accept：传输层握手即成功；鉴权失败属预期）
+            assert!(
+                UnixStream::connect(&st.files_sock).is_ok(),
+                "第 {round} 轮：桥应可连接"
+            );
+            let t0 = Instant::now();
+            host.stop();
+            let took = t0.elapsed();
+            assert!(
+                took < Duration::from_millis(1500),
+                "第 {round} 轮：stop 用时 {took:?}（唤醒丢失形态会烧满 2s live 预算）"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 }
