@@ -24,6 +24,8 @@ pub(crate) struct SessionView {
     pub last_active_ms: i64,
     /// 观察腿数量（LIST `clients[]` 长度——腿满判定的输入，r2 N-2）。
     pub legs: usize,
+    /// 腿明细 (kind, active)——腿满提示的占用信息（spec 需求 5，r4 F2）。
+    pub clients: Vec<(String, bool)>,
     /// 会话几何（HELLO 尺寸对齐的输入——接入不改会话几何，r2 N-4）。
     pub cols: u16,
     pub rows: u16,
@@ -66,6 +68,7 @@ pub(crate) fn parse_list_reply(payload: &[u8]) -> Option<Vec<SessionView>> {
             .map(|s| SessionView {
                 title: (!s.title.is_empty()).then_some(s.title),
                 legs: s.clients.len(),
+                clients: s.clients.iter().map(|c| (c.kind.clone(), c.active)).collect(),
                 name: s.name,
                 agent: s.agent,
                 state_v2: s.state_v2,
@@ -92,7 +95,14 @@ struct ListSession {
     #[serde(default)]
     rows: u16,
     #[serde(default)]
-    clients: Vec<serde_json::Value>,
+    clients: Vec<ListClient>,
+}
+
+#[derive(Deserialize, Default)]
+#[serde(default)]
+struct ListClient {
+    kind: String,
+    active: bool,
 }
 
 /// 外层包装：`sessions` 必填——`{}`/`[]` 等缺键形态一律拒收（轮询拍丢弃）。

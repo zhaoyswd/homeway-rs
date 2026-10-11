@@ -4,14 +4,14 @@
 
 **LIST `clients[]` 无腿身份标识**（仅 kind/cols/rows/sinceMs/active，`service.rs:3487-3496`），断连后自身腿已被摘除——「被腾位」不可经 clients[] 自证，四分支判定必须用会话存在性 + 链路状态 + 腿满三个外部可判定信号（r2 N-1）。
 
-**控制面词表是跨仓冻结契约**（`daemon/vocab.rs:1-4`；tier 侧订阅域初始集钉死；`daemon/tests.rs:43` 断言冻结夹具恰 43 帧）。技术评审两轮（docs/reviews/TUI-design.md：r1 31 条、r2 14 条）后定案 **A 案：控制面零新增、core 零改动**——全部新逻辑落在 TUI 进程与本机文件。
+**控制面词表是跨仓冻结契约**（`daemon/vocab.rs:1-4`；tier 侧订阅域初始集钉死；`daemon/tests.rs:43` 断言冻结夹具恰 43 帧）。技术评审三轮（docs/reviews/TUI-design.md：r1 31 条、r2 14 条、r3 14 条）后定案 **A 案：控制面零新增、core 零行为改动**——全部新逻辑落在 TUI 进程与本机文件。
 
 约束：TUI 为纯客户端进程（不 acquire `<state>/lock`、不撞 identity session.lock）；线上协议（term 帧、QUIC、capi、tier 对齐面）零改动；本仓对空闲唤醒敏感，一切轮询要有账（tasks 5.5 数值门）。
 
 ## Goals / Non-Goals
 
 **Goals:**
-- daemon **零契约面改动**（无新 op、无新事件域、无响应字段变更）；**core 零改动**（模拟器复用公开的 `SessionVt`，编译探针前置确认）；
+- daemon **零契约面改动**（无新 op、无新事件域、无响应字段变更）；**core 零行为改动**（模拟器复用公开的 `SessionVt`；4.8 滚动面三方法 = 仅视图层公开，登记 TUI-design.md）；
 - 三条数据通路与全局唯一的选型落地；四分支断线判定的**可判定谓词**（r2 N-1 整改主战场）；
 - 接入对会话的副作用最小化并显式登记（r2 N-4：HELLO 尺寸对齐）；
 - 状态行三项口径（全部既有数据面）。

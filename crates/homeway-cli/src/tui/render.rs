@@ -89,11 +89,12 @@ pub(crate) fn status_line(
     } else {
         match (h.rtt_ms, h.link_at) {
             (Some(rtt), Some(at)) => {
-                let age = now_ms - at;
-                if age > 120_000 {
-                    parts.push(format!("延迟 {rtt}ms(陈旧)"));
+                let age = (now_ms - at).max(0) / 1000;
+                if age > 120 {
+                    parts.push(format!("延迟 {rtt}ms({age}s 陈旧)"));
                 } else {
-                    parts.push(format!("延迟 {rtt}ms"));
+                    // spec 需求 8：**显示采样年龄**（r4 F3——此前只有陈旧一支）。
+                    parts.push(format!("延迟 {rtt}ms({age}s)"));
                 }
             }
             _ => parts.push("延迟 —".to_owned()),
@@ -222,7 +223,7 @@ mod tests {
         app.sessions.replace(vec![
             super::super::sessions::SessionView {
                 name: "agent-a".into(), title: Some("重构".into()), agent: "codex".into(),
-                state_v2: "working".into(), last_active_ms: 1, legs: 0, cols: 120, rows: 40,
+                state_v2: "working".into(), last_active_ms: 1, legs: 0, clients: Vec::new(), cols: 120, rows: 40,
             },
         ]);
         let mut t = Terminal::new(TestBackend::new(80, 12)).unwrap();
@@ -250,12 +251,12 @@ mod tests {
         let hosts = vec![h];
         app.hosts.feed(super::super::hosts::FeedInput::Snapshot { generation: "g1", hosts: &hosts });
         app.selected_host = Some("peer-a".into());
-        // 新鲜采样
+        // 新鲜采样：**带年龄数值**（r4 F3——需求 8 的 SHALL）
         let s = status_line(&app, 61_000, None);
-        assert!(s.contains("alpha · direct") && s.contains("延迟 42ms") && s.contains("流量 —"), "{s}");
+        assert!(s.contains("alpha · direct") && s.contains("延迟 42ms(60s)"), "{s}");
         // 陈旧采样（>120s）
         let s = status_line(&app, 1_121_001, Some((10.0, 5.0)));
-        assert!(s.contains("延迟 42ms(陈旧)"), "{s}");
+        assert!(s.contains("延迟 42ms(1120s 陈旧)"), "{s}");
         assert!(s.contains("10B/s"), "{s}");
     }
 

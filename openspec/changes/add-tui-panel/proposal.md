@@ -11,7 +11,7 @@
   - 底部状态行：当前主机的连接状态、延迟、流量。
 - **全局唯一**：选中状态本机共享（落 `<state>/cache/` 选中文件，实例间文件 watch 镜像）；多个 `homeway tui` 实例同开显示相同内容（选中与高亮镜像一致，右侧面板各实例自开观察腿渲染同一会话）。
 - 右侧终端采用 raw 腿（**不声明** capsRawTerminal 位）+ 内嵌 core 公开的 `SessionVt` 渲染管线（alacritty_terminal 0.26 同源）；输入经客户端 keyenc 编码走 DATA 字节帧（与 `term attach` 同路）；断线恢复走既有回放环 + 尺寸哨兵路径，并按「会话终止/链路中断/腿满被让位」三态分别处理；接入以最近一次会话尺寸快照对齐。
-- 零协议与契约面改动：term 帧协议、QUIC 承载、capi/App 面、tier 对齐面、**daemon 控制面词表（跨仓冻结契约）**全部不动；**core 零改动**（模拟器复用公开的 `SessionVt`，编译探针前置确认；探针失败才回头补最小公开面）。
+- 零协议与契约面改动：term 帧协议、QUIC 承载、capi/App 面、tier 对齐面、**daemon 控制面词表（跨仓冻结契约）**全部不动；**core 仅滚动面三方法**（4.8 登记：`display_offset`/`scroll_display`/`rows_at_offset`——纯视图层，无 wire/行为变化；登记与变更同批 TUI-design.md）。
 - 本期非目标：面板外提醒（系统通知/响铃）、herdr 式 Socket API 反向开放、会话元数据服务端推送（LIST 轮询差分替代）、延迟实时化（既有端到端探活口径 60s 拍如实显示）。
 
 ## Capabilities
@@ -22,7 +22,7 @@
 
 ### Modified Capabilities
 
-（无——本变更对既有能力零需求变更：控制面词表零新增（A 案）、core 零改动（内嵌模拟器复用 core 公开的 `SessionVt`，编译探针前置确认）；支撑面在 design 中描述，外部可观察行为即「多实例同显」与「接入不触发会话几何变化」，归入 `tui-panel` 需求。）
+（无——本变更对既有能力零需求变更：控制面词表零新增（A 案）、core 仅滚动面三方法（4.8 登记，纯视图层）；支撑面在 design 中描述，外部可观察行为即「多实例同显」与「接入不触发会话几何变化」，归入 `tui-panel` 需求。）
 
 ## Impact
 

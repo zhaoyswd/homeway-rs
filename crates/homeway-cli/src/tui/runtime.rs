@@ -47,6 +47,17 @@ use super::termview::TermView;
 use crate::unified_cli::default_state_dir;
 
 // ---------------------------------------------------------------------------
+// 信号面（r4 高4）
+// ---------------------------------------------------------------------------
+
+/// 可捕获信号旗标（SIGTERM/SIGHUP/SIGQUIT ⇒ UI 心跳检测后走还原路径）。
+static SIGNALLED: AtomicBool = AtomicBool::new(false);
+
+extern "C" fn on_signal(_sig: libc::c_int) {
+    SIGNALLED.store(true, Ordering::SeqCst);
+}
+
+// ---------------------------------------------------------------------------
 // 共享状态
 // ---------------------------------------------------------------------------
 
@@ -56,8 +67,12 @@ struct Shared {
     state_dir: PathBuf,
     /// 活动态判据：最近一次本实例用户输入时刻。
     last_input: Mutex<Option<Instant>>,
+    /// 外层终端焦点（DEC 1004；None = 终端不上报——按活动对待，r4 低2）。
+    outer_focus: Mutex<Option<bool>>,
     /// 腿世代：选中变化 ⇒ +1；旧腿线程观察到世代不符自行收尾。
     leg_gen: AtomicU64,
+    /// 当前腿的收口句柄（r4 F5：换代/退出主动 close——不再依赖对端 REPLACED）。
+    leg_closer: Mutex<Option<crate::term_cli::TermCloser>>,
     /// 输入通路（UI → 腿线程 → PTY）：类型化消息经写者线程入 PTY（r4 高2）。
     input_tx: Mutex<Option<std::sync::mpsc::Sender<LegInput>>>,
     /// 当前腿接收半（UI 按世代取走）。
@@ -71,6 +86,8 @@ struct Shared {
     rate: Mutex<Option<(f64, f64)>>,
     /// 恢复一次性哨兵（首个快照后执行持久化选中恢复）。
     restored: AtomicBool,
+    /// 终端区尺寸变化待发（画后新 area 落位再发 RESIZE，r4 中4）。
+    pending_resize: AtomicBool,
     /// 当前腿的挂接目标（host, session）——状态收敛的对照面（r4 高1）。
     attached: Mutex<Option<(String, String)>>,
 }
@@ -82,6 +99,7 @@ impl Shared {
             sel_file: SelectionFile::new(&state_dir),
             state_dir,
             last_input: Mutex::new(None),
+            outer_focus: Mutex::new(None),
             leg_gen: AtomicU64::new(0),
             input_tx: Mutex::new(None),
             leg_recv: Mutex::new(None),
@@ -90,7 +108,9 @@ impl Shared {
             rate_prev: Mutex::new(None),
             rate: Mutex::new(None),
             restored: AtomicBool::new(false),
+            pending_resize: AtomicBool::new(false),
             attached: Mutex::new(None),
+            leg_closer: Mutex::new(None),
         }
     }
 
@@ -99,6 +119,12 @@ impl Shared {
     }
 
     fn active(&self) -> bool {
+        // spec 需求 3：最近 30s 有输入，**或**外层终端焦点位于面板（r4 低2 补全）；
+        // 终端不上报焦点（1004 未启用/不支持）⇒ 按活动对待（保守快节奏）。
+        let outer = *self.outer_focus.lock().unwrap_or_else(|e| e.into_inner());
+        if outer == Some(true) {
+            return true;
+        }
         match self.last_input.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             Some(t) => t.elapsed() < Duration::from_secs(30),
             None => true, // 尚无输入 = 视为活动（首拍快节奏）
@@ -113,6 +139,11 @@ impl Shared {
 
     fn leg_gen_now(&self) -> u64 {
         self.leg_gen.load(Ordering::SeqCst)
+    }
+
+    /// 相位显示（**不推世代**——世代由重挂路径专管，r4 F2：监督相位驱动显示）。
+    fn set_phase(&self, phase: &str) {
+        *self.leg_phase.lock().unwrap_or_else(|e| e.into_inner()) = phase.to_owned();
     }
 
     /// 用户发起的选中持久化（回落**不**走这里——回落不写回，r3 N-6）。
@@ -176,6 +207,21 @@ impl FeedSink for Shared {
 // 腿线程（tasks 3.4a/b 的运行面）
 // ---------------------------------------------------------------------------
 
+/// 腿满相位的占用明细文案（spec 需求 5：数量 + 类型构成 + 活跃标记，r4 F2）。
+fn vacancy_text(found: Option<&super::sessions::SessionView>) -> String {
+    let Some(s) = found else { return "腿满——等待空位".to_owned() };
+    if s.clients.is_empty() {
+        return format!("腿满（{}/?）——等待空位", s.legs);
+    }
+    let detail = s
+        .clients
+        .iter()
+        .map(|(kind, active)| if *active { format!("{kind}*") } else { kind.clone() })
+        .collect::<Vec<_>>()
+        .join(",");
+    format!("腿满（{}/{}）——等待空位 · 占用：{}", s.legs, s.clients.len(), detail)
+}
+
 /// 监督循环的控制流：继续（外层重走 Precheck）/ 退出（停止或世代更替）。
 #[derive(Debug, PartialEq, Eq)]
 enum LoopCtl {
@@ -183,15 +229,8 @@ enum LoopCtl {
     Exit,
 }
 
-fn leg_thread(
-    gen: u64,
-    shared: Arc<Shared>,
-    stop: StopFlag,
-    send: SendHalf,
-    in_rx: std::sync::mpsc::Receiver<LegInput>,
-) {
-    // Receiver 无 Clone：Arc+Mutex 共享给每次接入的输入写者线程。
-    let in_rx = Arc::new(Mutex::new(in_rx));
+fn leg_thread(gen: u64, shared: Arc<Shared>, stop: StopFlag, send: SendHalf) {
+
     let mut sup = LegSupervisor::new();
     let mut last_link_up = false;
     'outer: loop {
@@ -216,9 +255,12 @@ fn leg_thread(
                     cols = s.cols;
                     rows = s.rows;
                 }
+                let found_view = found.cloned();
                 match sup.on(LegEvent::Precheck { exists, legs }) {
                     LegAction::Attach => {}
                     LegAction::WaitVacancy { delay } => {
+                        shared.set_phase(&vacancy_text(found_view.as_ref()));
+                        let _ = delay;
                         if vacancy_wait(&mut sup, shared.as_ref(), &stop, &dir, &list_arg, &session, delay, gen)
                             == LoopCtl::Exit
                         {
@@ -247,7 +289,7 @@ fn leg_thread(
             }
         }
         match attach_and_read(
-            &mut sup, &shared, &stop, &send, &in_rx, &mut last_link_up, &host, &session,
+            &mut sup, &shared, &stop, &send, &mut last_link_up, &host, &session,
             &dial_dir, local, cols, rows, gen,
         ) {
             LoopCtl::Continue => continue 'outer,
@@ -264,7 +306,6 @@ fn attach_and_read(
     shared: &Arc<Shared>,
     stop: &StopFlag,
     send: &SendHalf,
-    in_rx: &Arc<Mutex<std::sync::mpsc::Receiver<LegInput>>>,
     last_link_up: &mut bool,
     host: &str,
     session: &str,
@@ -290,6 +331,8 @@ fn attach_and_read(
     }
     // split 前取收口句柄（conn 被 split 消费；closer 保留可靠逃生口）。
     let closer = conn.closer();
+    // 注册到 Shared：换代/退出路径主动收口（r4 F5）。
+    *shared.leg_closer.lock().unwrap_or_else(|e| e.into_inner()) = Some(closer.duplicate());
     let (mut read_half, mut write_half) = match conn.split() {
         Ok(x) => x,
         Err(e) => {
@@ -336,19 +379,18 @@ fn attach_and_read(
             return judge_after_loss(sup, shared, stop, send, last_link_up, host, session, state_root, local, gen);
         }
     }
-    // 输入写者：Receiver 经 Arc+Mutex 共享（跨重接存续——写半随每次接入重建）。
+    // 输入通路（r4 F4 定稿）：通道**随接入建**——shared 槽替换后 UI 旧 Sender
+    // 发送即 Err（旧写者随之收尾），无双消费者；写者持写半，UI 只产类型化消息。
+    let (in_tx, in_rx) = std::sync::mpsc::channel::<LegInput>();
+    *shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(in_tx);
     {
-        let in_rx = Arc::clone(in_rx);
         let stop_w = stop.clone();
-        std::thread::spawn(move || loop {
-            let msg = {
-                let rx = in_rx.lock().unwrap_or_else(|e| e.into_inner());
-                rx.recv()
-            };
-            let Ok(msg) = msg else { break };
-            let (op, payload) = input_frame(&msg);
-            if write_half.write_frame(op, &payload).is_err() || stop_w.stopped() {
-                break;
+        std::thread::spawn(move || {
+            for msg in in_rx {
+                let (op, payload) = input_frame(&msg);
+                if write_half.write_frame(op, &payload).is_err() || stop_w.stopped() {
+                    break;
+                }
             }
         });
     }
@@ -532,6 +574,13 @@ pub(crate) fn run(args: &[String]) -> i32 {
 
     let shared = Arc::new(Shared::new(state_dir.clone()));
     let stop = StopFlag::default();
+    // 4.7 可捕获信号：TERM/HUP/QUIT 不再默认杀死进程——旗标 + UI 心跳还原后退出。
+    unsafe {
+        let h = on_signal as extern "C" fn(libc::c_int) as usize;
+        libc::signal(libc::SIGTERM, h);
+        libc::signal(libc::SIGHUP, h);
+        libc::signal(libc::SIGQUIT, h);
+    }
     // panic hook：任何 panic 路径还原终端（4.7）。
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
@@ -612,8 +661,10 @@ pub(crate) fn run(args: &[String]) -> i32 {
         let shared = Arc::clone(&shared);
         let stop = stop.clone();
         std::thread::spawn(move || {
+            // r4 中6：控制面连接**复用**（此前每秒新建一条——污染 5.5 数值门）。
+            let mut conn: Option<Arc<ControlClient>> = None;
             while !stop.stopped() {
-                let (serve_state, sock_ok) = match serve_state_of(&shared.state_dir) {
+                let (serve_state, sock_ok) = match serve_state_of(&mut conn, &shared.state_dir) {
                     Some(s) => (s, local::term_sock_reachable(&shared.state_dir.join("serve"))),
                     None => (local::ServeState::Absent, false),
                 };
@@ -643,15 +694,26 @@ pub(crate) fn run(args: &[String]) -> i32 {
     code
 }
 
-/// serve.status → ServeState（None = 控制面不可达）。
-fn serve_state_of(state_dir: &std::path::Path) -> Option<local::ServeState> {
-    let sock = state_dir.join("control.sock");
-    let (c, _) = ControlClient::dial(&sock, "cli", "homeway-tui-beat").ok()?;
-    let v = c
-        .request(vocab::OpName::ServeStatus.as_str(), None, Duration::from_secs(5))
-        .ok()?;
-    let st: ServeStatusResult = serde_json::from_value(v).ok()?;
-    local::ServeState::from_wire(&st.state)
+/// serve.status → ServeState（None = 不可达；连接**复用**，失败重拨——r4 中6）。
+fn serve_state_of(
+    conn: &mut Option<Arc<ControlClient>>,
+    state_dir: &std::path::Path,
+) -> Option<local::ServeState> {
+    if conn.is_none() {
+        let sock = state_dir.join("control.sock");
+        *conn = ControlClient::dial(&sock, "cli", "homeway-tui-beat").ok().map(|(c, _)| c);
+    }
+    let c = conn.as_ref()?;
+    match c.request(vocab::OpName::ServeStatus.as_str(), None, Duration::from_secs(5)) {
+        Ok(v) => {
+            let st: ServeStatusResult = serde_json::from_value(v).ok()?;
+            local::ServeState::from_wire(&st.state)
+        }
+        Err(_) => {
+            *conn = None; // 断线/失效 ⇒ 下拍重拨
+            None
+        }
+    }
 }
 
 fn now_ms() -> i64 {
@@ -680,12 +742,10 @@ fn spawn_leg(shared: &Arc<Shared>, stop: &StopFlag) {
     shared.leg_reset("接入中…");
     let gen = shared.leg_gen_now();
     let (frame_send, frame_recv) = leg_channel(64);
-    let (in_tx, in_rx) = std::sync::mpsc::channel::<LegInput>();
     *shared.leg_recv.lock().unwrap_or_else(|e| e.into_inner()) = Some(frame_recv);
-    *shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(in_tx);
     let shared2 = Arc::clone(shared);
     let stop2 = stop.clone();
-    std::thread::spawn(move || leg_thread(gen, shared2, stop2, frame_send, in_rx));
+    std::thread::spawn(move || leg_thread(gen, shared2, stop2, frame_send));
 }
 
 // ---------------------------------------------------------------------------
@@ -811,15 +871,18 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
                         if focus == Focus::Terminal {
                             if let Some(tv) = termview.as_mut() {
                                 let tx = shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                                if let (Some(tx), Some(bytes)) = (tx, input::encode_paste(&text, tv.leg.vt())) {
-                                    let _ = tx.send(LegInput::Data(bytes));
+                                if let Some(tx) = tx {
+                                    for bytes in input::encode_paste_fragments(&text, tv.leg.vt()).unwrap_or_default() {
+                                        let _ = tx.send(LegInput::Data(bytes));
+                                    }
                                 }
                             }
                         }
                     }
                     Event::FocusGained | Event::FocusLost => {
-                        // 外层 1004：终端焦点下按会话位注入（design D7）。
+                        // 外层 1004：活动态判据 + 终端焦点下按会话位注入（design D7）。
                         let gained = matches!(ev, Event::FocusGained);
+                        *shared.outer_focus.lock().unwrap_or_else(|e| e.into_inner()) = Some(gained);
                         let focus = shared.app.lock().unwrap_or_else(|e| e.into_inner()).focus;
                         if focus == Focus::Terminal {
                             if let Some(tv) = termview.as_mut() {
@@ -830,7 +893,12 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
                             }
                         }
                     }
-                    Event::Resize(_, _) => {}
+                    Event::Resize(_, _) => {
+                        // r4 中4：pane 尺寸变化不再丢弃——置旗，画后（新 area 落位）下发。
+                        if { shared.app.lock().unwrap_or_else(|e| e.into_inner()).focus } == Focus::Terminal {
+                            shared.pending_resize.store(true, Ordering::SeqCst);
+                        }
+                    }
                 }
             }
             // 挂腿状态收敛（r4 高1）：期望目标 ≠ 已挂目标 ⇒ 重挂——覆盖冷启动、
@@ -879,9 +947,19 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
                                 tv.leg.on_frame(&f);
                             }
                         }
-                        LegMsg::Gone { .. } => { /* 相位显示由腿线程更新 */ }
+                        LegMsg::Gone { reason } => {
+                            // r4 中3：终结原因消费到相位显示（此前十处写零消费）。
+                            *shared.leg_phase.lock().unwrap_or_else(|e| e.into_inner()) = reason;
+                        }
                     }
                 }
+            }
+            // 会话焦点跟随面板焦点切换（r4 高3：Enter=复得 / F12=失焦，去重）。
+            let focus_now = shared.app.lock().unwrap_or_else(|e| e.into_inner()).focus;
+            if focus_now == Focus::Terminal {
+                push_focus(shared, &mut termview, true);
+            } else {
+                push_focus(shared, &mut termview, false);
             }
             // 渲染。
             let status = {
@@ -910,6 +988,15 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
             {
                 break;
             }
+            // 尺寸变化待发：新 area 落位后下发 RESIZE（r4 中4）。
+            if shared.pending_resize.swap(false, Ordering::SeqCst) {
+                if let Some(tx) = shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+                    let a = *shared.term_area.lock().unwrap_or_else(|e| e.into_inner());
+                    if a.width > 0 && a.height > 0 {
+                        let _ = tx.send(LegInput::Resize(a.width, a.height));
+                    }
+                }
+            }
             if stop.stopped() {
                 break;
             }
@@ -927,6 +1014,26 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
         crossterm::style::ResetColor
     );
     code
+}
+
+/// 会话焦点注入（r4 高3）：按会话 1004 位编码，**按最后注入态去重**——
+/// 面板焦点切换（Enter/Exit）与外层焦点事件共用，避免双发。
+fn push_focus(shared: &Shared, termview: &mut Option<TermView>, gained: bool) {
+    let Some(tv) = termview.as_mut() else { return };
+    if tv.session_focus == Some(gained) {
+        return;
+    }
+    let tx = shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let Some(tx) = tx else { return };
+    match input::encode_focus(gained, tv.leg.vt()) {
+        Some(bytes) => {
+            tv.session_focus = Some(gained);
+            let _ = tx.send(LegInput::Data(bytes));
+        }
+        None => {
+            tv.session_focus = None; // 会话未启用 1004：无可注入（注入态置未知）
+        }
+    }
 }
 
 /// 面板点击选中（命中测试：主机区/会话区行）。返回是否改变选中。

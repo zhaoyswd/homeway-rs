@@ -115,8 +115,34 @@ pub(crate) fn encode_key_event(ev: &crossterm::event::KeyEvent, vt: &SessionVt) 
 }
 
 /// 粘贴编码：按会话括号粘贴位（DEC 2004）决定包裹（spec 需求 4）。
-pub(crate) fn encode_paste(text: &str, vt: &SessionVt) -> Option<Vec<u8>> {
-    keyenc::encode_paste_part(text.as_bytes(), vt.modes().bracketed_paste, true, true)
+/// **分片**（r4 中1）：帧载荷上限 64KiB（u16 len），超限粘贴按片拆分——
+/// 首片带起始序列、末片带结束序列，中间片裸文本；每片独立成 DATA 帧。
+pub(crate) fn encode_paste_fragments(text: &str, vt: &SessionVt) -> Option<Vec<Vec<u8>>> {
+    const CHUNK: usize = 48 * 1024; // 留足括号序列与帧头余量（上限 65535）
+    let bracketed = vt.modes().bracketed_paste;
+    if !bracketed {
+        // 未启用 2004：原样文本也要分片（超限文本同样会被 encode_frame 截断）。
+        if text.is_empty() {
+            return None;
+        }
+        return Some(
+            text.as_bytes()
+                .chunks(CHUNK)
+                .map(|c| c.to_vec())
+                .collect(),
+        );
+    }
+    let mut out = Vec::new();
+    let bytes = text.as_bytes();
+    if bytes.is_empty() {
+        return keyenc::encode_paste_part(b"", true, true, true).map(|b| vec![b]);
+    }
+    for (i, chunk) in bytes.chunks(CHUNK).enumerate() {
+        let open = i == 0;
+        let close = i == bytes.chunks(CHUNK).count() - 1;
+        out.push(keyenc::encode_paste_part(chunk, true, open, close)?);
+    }
+    Some(out)
 }
 
 /// 焦点事件编码：按会话焦点上报位（DEC 1004）决定是否注入；未启用 ⇒ `None`
@@ -226,13 +252,39 @@ mod tests {
     fn paste_wraps_only_when_session_enables_2004() {
         let mut v = vt();
         let raw = "ls 発";
-        let plain = encode_paste(raw, &v).expect("未启用也有原文本");
-        assert_eq!(plain, raw.as_bytes(), "2004 关 = 原样文本");
+        let plain = encode_paste_fragments(raw, &v).expect("未启用也有原文本");
+        assert_eq!(plain, vec![raw.as_bytes().to_vec()], "2004 关 = 原样文本（单片）");
         v.write(b"\x1b[?2004h");
-        let wrapped = encode_paste(raw, &v).expect("启用后包裹");
+        let frags = encode_paste_fragments(raw, &v).expect("启用后包裹");
+        assert_eq!(frags.len(), 1, "短文本单片");
+        let wrapped = &frags[0];
         assert!(wrapped.starts_with(b"\x1b[200~"), "括号粘贴起始序列");
         assert!(wrapped.ends_with(b"\x1b[201~"), "括号粘贴结束序列");
         assert!(wrapped.windows(raw.len()).any(|w| w == raw.as_bytes()), "正文完整保留");
+    }
+
+    #[test]
+    fn paste_long_text_fragments_with_bracket_pairs() {
+        // r4 中1：超限文本分片——首片带起始、末片带结束、单片 ≤48KiB、正文无损。
+        let mut v = vt();
+        v.write(b"\x1b[?2004h");
+        let big = "x".repeat(120 * 1024);
+        let frags = encode_paste_fragments(&big, &v).expect("分片");
+        assert!(frags.len() >= 3, "120KiB ⇒ 至少 3 片：{}", frags.len());
+        assert!(frags[0].starts_with(b"\x1b[200~"), "首片带起始");
+        assert!(frags.last().unwrap().ends_with(b"\x1b[201~"), "末片带结束");
+        for (i, f) in frags.iter().enumerate() {
+            assert!(f.len() <= 64 * 1024, "片 {i} 超帧上限");
+            if i > 0 {
+                assert!(!f.starts_with(b"\x1b[200~"), "中间片不带起始序列");
+            }
+            if i + 1 < frags.len() {
+                assert!(!f.ends_with(b"\x1b[201~"), "非末片不带结束序列");
+            }
+        }
+        // 正文无损：内容全为 'x'（0x78 不出现在包裹序列里）⇒ 按字节计数。
+        let xcount: usize = frags.iter().map(|f| f.iter().filter(|&&b| b == b'x').count()).sum();
+        assert_eq!(xcount, big.len(), "正文无损");
     }
 
     #[test]

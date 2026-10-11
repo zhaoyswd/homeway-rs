@@ -288,6 +288,9 @@ impl TermConn {
 pub(crate) enum TermCloser {
     Remote(Arc<ControlClient>),
     Local(std::os::unix::net::UnixStream),
+    /// 无可收口（try_clone 失败等）——显式占位，**禁止**用 /dev/null 连接兜底
+    ///（ENOTSOCK 必 panic，r4 高5）。
+    Noop,
 }
 
 impl TermCloser {
@@ -297,6 +300,19 @@ impl TermCloser {
             TermCloser::Local(s) => {
                 let _ = s.shutdown(std::net::Shutdown::Both);
             }
+            TermCloser::Noop => {}
+        }
+    }
+
+    /// 复制句柄（Shared 注册与本地并用两份；Local 走 fd 复制，失败降级 Noop）。
+    pub(crate) fn duplicate(&self) -> TermCloser {
+        match self {
+            TermCloser::Remote(c) => TermCloser::Remote(Arc::clone(c)),
+            TermCloser::Local(s) => match s.try_clone() {
+                Ok(s2) => TermCloser::Local(s2),
+                Err(_) => TermCloser::Noop,
+            },
+            TermCloser::Noop => TermCloser::Noop,
         }
     }
 }
@@ -308,7 +324,7 @@ impl TermConn {
             TermConn::Remote { client, .. } => TermCloser::Remote(Arc::clone(client)),
             TermConn::Local(io) => match io.try_clone_stream() {
                 Ok(s) => TermCloser::Local(s),
-                Err(_) => TermCloser::Local(std::os::unix::net::UnixStream::connect("/dev/null").unwrap()),
+                Err(_) => TermCloser::Noop,
             },
         }
     }
