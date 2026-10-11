@@ -126,9 +126,12 @@ QUIC MTU 1400 + DPLPMTUD，窄路径超限丢弃 + 计数；⑤中继零改动�
    ① **U1 阿里云出口 ✓**（`v0.3.1` sha `1bfb4c04…`；身份 `key=1020c3eae8b3…` 逐字不变；公网端点已公布）
    ② **U3 Mac 出口 ✓**（`v0.3.1` sha `314082fd…`；身份 `key=8aee740b7220…` 逐字不变；v4+v6 公网端点已公布；
    **V24 观察期 ✓**：30 min 35 s 内 `ERROR|panic|FATAL` = 0、中继腿注册 1 次无抖动）。
-   ③ **U2 设备**：新核（`.so` 2,995,376 B / `77068d72c938-rust`）已装、两台出口的 `hmw2` token 已经
-   `--ps host_token` 注入 ⇒ **剩「屏上点开 VPN + 开全局代理」一步**，之后复跑 V10–V20
-   （含 App Pss 观察项）。执行实录 = `docs/DEPLOY-RUST-EXIT.md` §12.6。
+   ③ **U2 设备 ✓**（新核 `.so` 2,995,376 B / `77068d72c938-rust` 已装；两台出口的 `hmw2` token 已注入；
+   **真机 V10–V15 / V17 / V18 / V20 全过**〔层 0 / files 下载内容一致 / term 键输入落纸 / speedtest
+   ↑56MB/s ↓62MB/s / portfwd 载荷经隧道逐字到达 / 收工链 / 零 panic / DNS 计数〕，V16 过待机档
+   〔检测 36–42 s + 重连 4 s〕，V19 未做；**App Pss 34,164 KB**〔基线 33,823，+341 KB〕）。
+   验收由 **hdc 驱动手机**完成（`uitest uiInput` + `dumpLayout` + `screenCap`）。执行实录与两处
+   判据措辞订正 = `docs/DEPLOY-RUST-EXIT.md` §12.6。
    ④ **执行中发现并修复部署阻塞级缺陷**（出口面双栈 socket 的裸 v4 目标在 Darwin `EINVAL(22)`
    ⇒ STUN 观测恒失败 ⇒ 公网端点不公布）⇒ 热修补记 = `docs/reviews/M7-HOTFIX-fam.md`，
    **v0.3.0 弃用**（未承载生产流量）、v0.3.1 重发四目标 + Release。
