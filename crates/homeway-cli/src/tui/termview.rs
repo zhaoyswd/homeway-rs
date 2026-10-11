@@ -2,6 +2,9 @@
 //!
 //! - **宽字符**：Cell 显式宽度位直读——width=2 渲染符号本体，width=0 的尾占位格
 //!   落空格（不重画，避免残影）；
+//! - **空格契约**：VT「无文本 = symbol 空串」（vt.rs:171）——空串在真终端是
+//!   Print no-op，必须落**真实空格**并先整区铺底（Cell::reset），否则切会话/
+//!   清屏时旧字符残留（r5 验收实测：切换会话多会话内容叠加）；
 //! - **裁剪**：pane 小于会话网格 ⇒ 左上对齐裁剪（会话尺寸跟随交互实例的 RESIZE
 //!   选举，旁观态下裁剪是预期形态，design D2）；
 //! - **颜色/属性**：Palette→Indexed、Rgb→Rgb；attr 位 → Modifier（BOLD/ITALIC/
@@ -38,6 +41,18 @@ impl TermView {
 
     /// 渲染到 pane 区域（每渲染拍调用；rows_and_commit 同时清脏标）。
     pub fn render(&mut self, f: &mut ratatui::Frame, area: Rect) {
+        // 先整区铺真空格（Cell::reset = 空格 + 缺省样式）：VT 契约「无文本 =
+        // symbol 空串」，而真终端对空串 cell 的 Print 是 no-op——空串格直接落
+        // 缓冲时旧字符（上一会话/上一帧）会原样残留（r5 验收实测：切换会话
+        // 多会话内容叠加）。铺底同时清掉网格小于 pane 的右侧/下侧带区。
+        let buf = f.buffer_mut();
+        for y in area.top()..area.bottom() {
+            for x in area.left()..area.right() {
+                if let Some(rc) = buf.cell_mut((x, y)) {
+                    rc.reset();
+                }
+            }
+        }
         let rows = if self.leg.display_offset() == 0 {
             self.leg.rows_and_commit()
         } else {
@@ -74,8 +89,13 @@ impl TermView {
 }
 
 fn apply_cell(rc: &mut RCell, cell: &homeway_core::term::vt::Cell) {
-    if cell.symbol.is_empty() || cell.width == 0 {
+    if cell.width == 0 {
+        // 尾占位格不打印（真终端自持宽字形两列——打印会打碎字形的右半列）。
         rc.set_symbol("");
+    } else if cell.symbol.is_empty() {
+        // 无文本契约（vt.rs:171）= 空串 ⇒ 必须落**真实空格**：空串在真终端是
+        // no-op，清屏/切换会话的空白区都靠它把旧字符盖掉（背景色仍按 cell 带）。
+        rc.set_symbol(" ");
     } else {
         rc.set_symbol(cell.symbol.as_str());
     }
@@ -170,5 +190,41 @@ mod tests {
         let area = Rect::new(0, 0, 4, 1); // 只看得到 4 列
         t.draw(|f| tv.render(f, area)).unwrap();
         assert_eq!(line_text(&mut t, 0, 40), "ABCD", "pane 小于网格 = 左上裁剪");
+    }
+
+    #[test]
+    fn session_switch_clears_previous_content() {
+        // r5 验收实录：切换会话后旧会话内容透出——空串格在真终端 Print no-op +
+        // 网格小于 pane 的带区无人写。缓冲面契约：新会话空白区 = 真实空格，
+        // 带区随铺底清空；宽字符尾占位格（width=0）仍落空串（不打印）。
+        let mut t = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        let area = Rect::new(0, 0, 40, 10);
+        // 会话 A：满屏 'O'
+        let mut a = TermView::new(40, 10).expect("建视图");
+        let mut full = b"\x1b[2J\x1b[H".to_vec();
+        full.extend(vec![b'O'; 40 * 10]);
+        a.leg.on_frame(&homeway_core::term::frames::Frame {
+            op: homeway_core::term::frames::Op::DATA,
+            payload: full,
+        });
+        t.draw(|f| a.render(f, area)).unwrap();
+        // 切到会话 B：全新 VT（runtime 换代语义），20×5 网格只有左上 'B'，其余全空
+        let mut b = TermView::new(20, 5).expect("建视图");
+        b.leg.on_frame(&homeway_core::term::frames::Frame {
+            op: homeway_core::term::frames::Op::DATA,
+            payload: b"\x1b[2J\x1b[HB".to_vec(),
+        });
+        t.draw(|f| b.render(f, area)).unwrap();
+        let buf = t.backend().buffer();
+        assert_eq!(buf[(0, 0)].symbol(), "B", "新会话内容在位");
+        for y in 0..10u16 {
+            for x in 0..40u16 {
+                if (x, y) == (0, 0) {
+                    continue;
+                }
+                let s = buf[(x, y)].symbol();
+                assert_eq!(s, " ", "({x},{y}) 残留 {s:?}——旧会话字符或空串 no-op 未清");
+            }
+        }
     }
 }
