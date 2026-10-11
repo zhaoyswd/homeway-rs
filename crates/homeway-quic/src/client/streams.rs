@@ -445,6 +445,32 @@ pub(crate) enum WriterEnd {
     Reset,
 }
 
+/// 写者任务的收尾守卫（评审 r1 中-3）：**panic/abort 展开时兜底补账**——否则
+/// `writer_finished` 不执行 ⇒ `send_broken` 不置位 ⇒ `Streams::write` 照常接纳
+/// 进待发队列但已无写者消费（**静默数据黑洞**，直到 close/连接死）。显式回报点
+/// 经 [`Self::report`]（消费守卫并置幂等位）⇒ Drop 不二次记账。
+struct WriterGuard {
+    slot: Arc<Slot>,
+    streams: Arc<Streams>,
+    done: bool,
+}
+
+impl WriterGuard {
+    /// 显式回报（正常三出口专用）：恰好一次。
+    fn report(mut self, reason: WriterEnd) {
+        self.done = true;
+        self.streams.writer_finished(&self.slot, reason);
+    }
+}
+
+impl Drop for WriterGuard {
+    fn drop(&mut self) {
+        if !self.done {
+            self.streams.writer_finished(&self.slot, WriterEnd::Broken);
+        }
+    }
+}
+
 /// **写者任务**（每流一枚；`JoinSet` 托底 abort）。
 ///
 /// 循环：取空队列 → 逐块 `write_all().await` → 查结束标记 → 无事则 `notified().await`。
@@ -454,6 +480,11 @@ pub(crate) async fn writer_task(
     slot: Arc<Slot>,
     streams: Arc<Streams>,
 ) {
+    let guard = WriterGuard {
+        slot: Arc::clone(&slot),
+        streams: Arc::clone(&streams),
+        done: false,
+    };
     loop {
         // ① 取空（锁内快照 + 清零字节账；写者独占消费 ⇒ 不会与别的写者抢）
         let batch: Vec<Vec<u8>> = {
@@ -463,7 +494,7 @@ pub(crate) async fn writer_task(
         };
         for chunk in batch {
             if send.write_all(&chunk).await.is_err() {
-                streams.writer_finished(&slot, WriterEnd::Broken);
+                guard.report(WriterEnd::Broken);
                 return;
             }
             // 只算应用载荷：开流时的 tag 首字节（1B）在第一块上抵扣
@@ -480,12 +511,12 @@ pub(crate) async fn writer_task(
         match slot.pending.end.load(Ordering::SeqCst) {
             END_FINISH => {
                 let _ = send.finish();
-                streams.writer_finished(&slot, WriterEnd::Finished);
+                guard.report(WriterEnd::Finished);
                 return;
             }
             END_RESET => {
                 let _ = send.reset(VarInt::from_u32(0));
-                streams.writer_finished(&slot, WriterEnd::Reset);
+                guard.report(WriterEnd::Reset);
                 return;
             }
             _ => {}
@@ -499,6 +530,11 @@ pub(crate) async fn writer_task(
 ///
 /// 取消路径（`Cmd::StreamClose` / 连接死）：`STOP_SENDING` + 回 `Closed`——与
 /// 「连接死 ⇒ 读回 EOF」同面（§1.6 的 EOF 同形性）。
+///
+/// **无收尾守卫是刻意的**（评审 r1 中-3 的裁定）：panic 展开时 `reply` 口随栈 drop ⇒
+/// 调用侧收通道断（`EngineGone` 族可见失败，可重开流/重试读）——这是**诚实信号**；
+/// 若 Drop 兜底投 `Closed`（= EOF）反而把一次 panic 掩成「干净流结束」。`recv` 半边
+/// 的 `TokioMutex` 守卫随展开释放，无死锁面。
 pub(crate) async fn read_task(slot: Arc<Slot>, reply: StreamReply<Vec<u8>>, streams: Arc<Streams>) {
     // ① 取读半边（先查已关 + 许可语义；`TokioMutex` 串行化同流并发读）
     let mut recv = loop {

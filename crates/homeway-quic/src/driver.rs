@@ -812,13 +812,21 @@ fn run_driver(
                                     );
                                     ladder_step(&mut st, ctx, &mut face, &mut jobs, step);
                                 }
-                                // 泵防重位按身份复位（同 `Job::Return` 正常路径）
+                                // 泵防重位按身份复位（同 `Job::Return` 正常路径）+
+                                // **就地重启**（评审 r1 补-1）：泵 panic 时连接/TUN 面
+                                // 往往仍活（panic ≠ 连接死）——只清位不重启 ⇒ 下行永久
+                                // 黑洞而探活（独立 STREAM）照常成功 = 岛表面健康的静默
+                                // 半死。`maybe_start_pump` 自带 live+tun+防重位三重守卫：
+                                // 连接已死/TUN 已卸则等价 no-op（恢复交 housekeeping/阶梯）。
                                 PanickedJob::Return(conn) => {
                                     if st.pump_conn == Some(conn) {
                                         st.pump_conn = None;
                                     }
-                                }
-                                // 槽侧记账已在任务内落（panic 展开时 RAII 守卫照常执行）
+                                    maybe_start_pump(&mut st, ctx, &mut jobs);
+                                }                                // 写者任务已由 `streams::WriterGuard`（RAII 幂等守卫，
+                                // panic/abort 展开按 Broken 补账 ⇒ send_broken 置位、后
+                                // 续写快速失败）兜底；读者任务 panic 时 reply 口随栈
+                                // drop ⇒ 调用侧收 EngineGone（可见失败，不掩成 EOF）。
                                 PanickedJob::Stream => {}
                             }
                         }
