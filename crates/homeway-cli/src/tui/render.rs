@@ -162,7 +162,20 @@ pub(crate) fn draw(
         .render(sess_a, f.buffer_mut());
     // 右侧：终端视图或引导提示
     match term {
-        Some(tv) => tv.render(f, term_a),
+        Some(tv) => {
+            tv.render(f, term_a);
+            // 终端焦点的宿主光标 = 会话 VT 光标（会话声明可见位且贴底视口时；
+            // 回看中的光标位置无语义，保持隐藏）。面板焦点下 ratatui 缺省隐藏。
+            let cur = tv.leg.cursor();
+            if app.focus == Focus::Terminal
+                && cur.visible
+                && tv.leg.display_offset() == 0
+            {
+                if let Some(p) = super::termview::cursor_in_pane(cur, term_a) {
+                    f.set_cursor_position(p);
+                }
+            }
+        }
         None => {
             Paragraph::new(
                 "↑↓ 选择主机 / 会话；Enter 进入终端焦点（F12 返回）；q 退出。\n选中会话后，这里显示其终端画面。",

@@ -20,8 +20,9 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    self, DisableBracketedPaste, DisableFocusChange, EnableBracketedPaste, EnableFocusChange,
-    Event, KeyEventKind, MouseButton as CMouse, MouseEventKind,
+    self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, KeyEventKind, MouseButton as CMouse,
+    MouseEventKind,
 };
 use crossterm::{execute, terminal};
 use ratatui::backend::CrosstermBackend;
@@ -589,7 +590,12 @@ pub(crate) fn run(args: &[String]) -> i32 {
     let prev_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = terminal::disable_raw_mode();
-        let _ = execute!(io::stdout(), terminal::LeaveAlternateScreen, crossterm::style::ResetColor);
+        let _ = execute!(
+            io::stdout(),
+            terminal::LeaveAlternateScreen,
+            DisableMouseCapture,
+            crossterm::style::ResetColor
+        );
         prev_hook(info);
     }));
 
@@ -763,13 +769,22 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
     let mut ui_gen = shared.leg_gen_now();
 
     let mut out = io::stdout();
-    if execute!(out, terminal::EnterAlternateScreen, EnableBracketedPaste, EnableFocusChange).is_err() {
+    if execute!(out, terminal::EnterAlternateScreen).is_err() {
         eprintln!("homeway tui：终端进入备用屏失败（能力不足）");
         return 2;
     }
     if terminal::enable_raw_mode().is_err() {
         let _ = execute!(out, terminal::LeaveAlternateScreen);
         eprintln!("homeway tui：终端 raw 模式启用失败");
+        return 2;
+    }
+    // 输入协议面。鼠标捕获 = 「独占」的另一半（r5 验收实测）：不开则滚轮事件留在
+    // 宿主终端——备用屏下 iTerm2/Terminal.app 照样滚 scrollback，把进面板前的历史
+    // 滚出来；开了宿主才把滚轮/点击交给本面板（回看/点选路径 4.4b 早已就绪）。
+    if execute!(out, EnableBracketedPaste, EnableFocusChange, EnableMouseCapture).is_err() {
+        let _ = terminal::disable_raw_mode();
+        let _ = execute!(out, terminal::LeaveAlternateScreen, crossterm::style::ResetColor);
+        eprintln!("homeway tui：终端输入模式启用失败");
         return 2;
     }
     let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -1015,6 +1030,7 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
         terminal::LeaveAlternateScreen,
         DisableBracketedPaste,
         DisableFocusChange,
+        DisableMouseCapture,
         crossterm::style::ResetColor
     );
     code

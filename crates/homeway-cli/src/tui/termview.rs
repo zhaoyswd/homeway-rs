@@ -88,8 +88,20 @@ impl TermView {
     }
 }
 
-fn apply_cell(rc: &mut RCell, cell: &homeway_core::term::vt::Cell) {
-    if cell.width == 0 {
+/// 终端焦点的宿主光标定位：VT 光标 → pane 绝对坐标（出界夹取回 pane 内）。
+/// 差分渲染下宿主光标若不显式定位，会停在「最后一个被打印的格子」这种无语义
+/// 位置——herdr 的 host cursor 同款实践（r5 验收：光标位置观感混乱）。
+pub(crate) fn cursor_in_pane(c: homeway_core::term::vt::Cursor, area: Rect) -> Option<(u16, u16)> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    Some((
+        area.x + c.x.min(area.width - 1),
+        area.y + c.y.min(area.height - 1),
+    ))
+}
+
+fn apply_cell(rc: &mut RCell, cell: &homeway_core::term::vt::Cell) {    if cell.width == 0 {
         // 尾占位格不打印（真终端自持宽字形两列——打印会打碎字形的右半列）。
         rc.set_symbol("");
     } else if cell.symbol.is_empty() {
@@ -190,6 +202,23 @@ mod tests {
         let area = Rect::new(0, 0, 4, 1); // 只看得到 4 列
         t.draw(|f| tv.render(f, area)).unwrap();
         assert_eq!(line_text(&mut t, 0, 40), "ABCD", "pane 小于网格 = 左上裁剪");
+    }
+
+    #[test]
+    fn cursor_in_pane_clamps_to_area() {
+        let area = Rect::new(10, 5, 40, 10);
+        let mk = |x: u16, y: u16| homeway_core::term::vt::Cursor {
+            x,
+            y,
+            visible: true,
+            blinking: false,
+            password: false,
+            wide_tail: false,
+            shape: homeway_core::term::vt::CursorShape::default(),
+        };
+        assert_eq!(cursor_in_pane(mk(3, 2), area), Some((13, 7)), "界内直映");
+        assert_eq!(cursor_in_pane(mk(100, 50), area), Some((49, 14)), "出界夹取回 pane 右下");
+        assert_eq!(cursor_in_pane(mk(0, 0), Rect::new(0, 0, 0, 5)), None, "零宽 area 无定位");
     }
 
     #[test]
