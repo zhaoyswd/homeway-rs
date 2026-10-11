@@ -417,7 +417,9 @@ impl AsyncUdpSocket for ExitSock {
                     meta[0] = RecvMeta { addr: src, len: n, stride: n, ecn: None, dst_ip: None };
                     return Poll::Ready(Ok(1));
                 }
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
+                // EINTR 与 EAGAIN 同为瞬时态（评审 r1 中-1：quinn 不替我们重试 EINTR，
+                // 上抛会终止端点驱动）；其余错误对齐 quinn 自带 socket 的接收错误面。
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => continue,
                 Err(e) => return Poll::Ready(Err(e)),
             }
         }

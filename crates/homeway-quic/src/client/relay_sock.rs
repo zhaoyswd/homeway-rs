@@ -411,12 +411,19 @@ impl AsyncUdpSocket for ClientSock {
             // 故保持 QT-M1 的段能力 = 1 登记；本循环内联原 `recv_batch` 间接层）。
             let recvd = match self.recv_one(bufs, meta) {
                 Ok(v) if v > 0 => v,
-                // 无数据（EAGAIN/WouldBlock）⇒ 回 `poll_recv_ready` 重新挂等待
-                Err(e) if e.kind() == io::ErrorKind::WouldBlock => continue,
-                // **持久性错误上抛**（2026-10-10 审查 低-3）：原 `Err(_) => continue` 在
-                // 就绪位因驻留错误（fd 关闭后的 EBADF 等）恒 Ready 时 = 单线程 runtime 上
-                // 的忙转 + 全岛饿死；对齐出口面同款分类——WouldBlock 续等、其余交 quinn
-                // 的接收错误处置路径。
+                // 无数据（EAGAIN/WouldBlock）与瞬时中断（EINTR——定义上重试无害）⇒
+                // 回 `poll_recv_ready` 重新挂等待
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {
+                    continue;
+                }
+                // **持久性错误上抛**（2026-10-10 审查 低-3 + 评审 r1 中-1）：原 `Err(_) =>
+                // continue` 在就绪位因驻留错误（fd 关闭后的 EBADF 等）恒 Ready 时 = 单线程
+                // runtime 上的忙转 + 全岛饿死。上抛对齐 quinn 自带 socket 的接收错误面
+                // （其 EndpointDriver 只放过 `ConnectionReset`，其余终止驱动 ⇒ 走恢复链）；
+                // `Interrupted` 必须留在续等侧——quinn 不会替我们重试它，一次瞬时 EINTR
+                // 就足以打死端点驱动（连接不报死、探活恒超时、阶梯在死端点上打转到 B 门）。
+                // 〔登记〕`ECONNREFUSED`（Linux 对 UDP 的 ICMP 异步错误）与 quinn std socket
+                // 同面不特殊放行——本仓两侧 socket 均为未 connect 的 send_to 形态，概率极低。
                 Err(e) => return Poll::Ready(Err(e)),
                 Ok(_) => continue,
             };
