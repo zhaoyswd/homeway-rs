@@ -35,7 +35,7 @@ use homeway_core::term::frames::{self, Op};
 
 use super::app::{route_key, AppModel, Focus, PanelCmd, Route};
 use super::backend::{self, ControlConn, FeedSink, RealConn, StopFlag};
-use super::chan::{leg_channel, LegMsg, RecvHalf, SendHalf};
+use super::chan::{input_frame, leg_channel, LegInput, LegMsg, RecvHalf, SendHalf};
 use super::hosts::FeedInput;
 use super::input;
 use super::leg::{decode_frame, LegAction, LegEvent, LegSupervisor};
@@ -58,8 +58,8 @@ struct Shared {
     last_input: Mutex<Option<Instant>>,
     /// 腿世代：选中变化 ⇒ +1；旧腿线程观察到世代不符自行收尾。
     leg_gen: AtomicU64,
-    /// 输入通路（UI → 腿线程 → PTY）：字节经腿线程的写半入 PTY。
-    input_tx: Mutex<Option<std::sync::mpsc::Sender<Vec<u8>>>>,
+    /// 输入通路（UI → 腿线程 → PTY）：类型化消息经写者线程入 PTY（r4 高2）。
+    input_tx: Mutex<Option<std::sync::mpsc::Sender<LegInput>>>,
     /// 当前腿接收半（UI 按世代取走）。
     leg_recv: Mutex<Option<RecvHalf>>,
     /// 腿监督相位（终端 pane 标题显示）。
@@ -71,6 +71,8 @@ struct Shared {
     rate: Mutex<Option<(f64, f64)>>,
     /// 恢复一次性哨兵（首个快照后执行持久化选中恢复）。
     restored: AtomicBool,
+    /// 当前腿的挂接目标（host, session）——状态收敛的对照面（r4 高1）。
+    attached: Mutex<Option<(String, String)>>,
 }
 
 impl Shared {
@@ -88,6 +90,7 @@ impl Shared {
             rate_prev: Mutex::new(None),
             rate: Mutex::new(None),
             restored: AtomicBool::new(false),
+            attached: Mutex::new(None),
         }
     }
 
@@ -185,7 +188,7 @@ fn leg_thread(
     shared: Arc<Shared>,
     stop: StopFlag,
     send: SendHalf,
-    in_rx: std::sync::mpsc::Receiver<Vec<u8>>,
+    in_rx: std::sync::mpsc::Receiver<LegInput>,
 ) {
     // Receiver 无 Clone：Arc+Mutex 共享给每次接入的输入写者线程。
     let in_rx = Arc::new(Mutex::new(in_rx));
@@ -199,10 +202,12 @@ fn leg_thread(
             return;
         };
         let local = host == LOCAL_HOST_ID;
+        // 契约（r4 F1 修复）：list_once 恒传 **state 根**（本机分支内部自己 join serve）；
+        // dial 目录才在本机面 join serve（term_cli 本地 --state 语义 = serve 子目录）。
         let dial_dir = if local { dir.join("serve") } else { dir.clone() };
         let list_arg = if local { LOCAL_HOST_ID.to_owned() } else { host.clone() };
         // 接入前检查：LIST 快照 = 存在性 + 腿满 + 尺寸对齐输入（接入不改几何，r2 N-4）。
-        match backend::list_once(&dial_dir, &list_arg) {
+        match backend::list_once(&dir, &list_arg) {
             Ok(v) => {
                 let found = v.iter().find(|s| s.name == session);
                 let exists = found.is_some();
@@ -214,7 +219,7 @@ fn leg_thread(
                 match sup.on(LegEvent::Precheck { exists, legs }) {
                     LegAction::Attach => {}
                     LegAction::WaitVacancy { delay } => {
-                        if vacancy_wait(&mut sup, shared.as_ref(), &stop, &dial_dir, &list_arg, &session, delay, gen)
+                        if vacancy_wait(&mut sup, shared.as_ref(), &stop, &dir, &list_arg, &session, delay, gen)
                             == LoopCtl::Exit
                         {
                             return;
@@ -234,7 +239,7 @@ fn leg_thread(
                 sup.on(LegEvent::StreamEnd { ended: false });
                 match judge_after_loss(
                     &mut sup, &shared, &stop, &send, &mut last_link_up, &host,
-                    &session, &dial_dir, local, gen,
+                    &session, &dir, local, gen,
                 ) {
                     LoopCtl::Continue => continue 'outer,
                     LoopCtl::Exit => return,
@@ -259,23 +264,24 @@ fn attach_and_read(
     shared: &Arc<Shared>,
     stop: &StopFlag,
     send: &SendHalf,
-    in_rx: &Arc<Mutex<std::sync::mpsc::Receiver<Vec<u8>>>>,
+    in_rx: &Arc<Mutex<std::sync::mpsc::Receiver<LegInput>>>,
     last_link_up: &mut bool,
     host: &str,
     session: &str,
-    dial_dir: &std::path::Path,
+    state_root: &std::path::Path,
     local: bool,
     cols: u16,
     rows: u16,
     gen: u64,
 ) -> LoopCtl {
     let host_ref = (!local).then(|| host.to_owned());
+    let dial_dir = if local { state_root.join("serve") } else { state_root.to_owned() };
     let (mut conn, feats) =
-        match crate::term_cli::dial_term_conn_impl(dial_dir, host_ref.as_deref(), true) {
+        match crate::term_cli::dial_term_conn_impl(&dial_dir, host_ref.as_deref(), true) {
             Ok(x) => x,
             Err(e) => {
                 let _ = send.send(LegMsg::Gone { reason: format!("拨号失败：{e}") });
-                return judge_after_loss(sup, shared, stop, send, last_link_up, host, session, dial_dir, local, gen);
+                return judge_after_loss(sup, shared, stop, send, last_link_up, host, session, state_root, local, gen);
             }
         };
     if stop.stopped() || shared.leg_gen_now() != gen {
@@ -289,7 +295,7 @@ fn attach_and_read(
         Err(e) => {
             closer.close();
             let _ = send.send(LegMsg::Gone { reason: format!("连接分半失败：{e}") });
-            return judge_after_loss(sup, shared, stop, send, last_link_up, host, session, dial_dir, local, gen);
+            return judge_after_loss(sup, shared, stop, send, last_link_up, host, session, state_root, local, gen);
         }
     };
     // HELLO：尺寸对齐 LIST 快照；caps 全零块保 client_id（r3 G）；flags=0 不创建不接管。
@@ -297,14 +303,14 @@ fn attach_and_read(
     if let Err(e) = write_half.write_frame(Op::HELLO, &hello) {
         closer.close();
         let _ = send.send(LegMsg::Gone { reason: format!("HELLO：{}", e.message(session)) });
-        return judge_after_loss(sup, shared, stop, send, last_link_up, host, session, dial_dir, local, gen);
+        return judge_after_loss(sup, shared, stop, send, last_link_up, host, session, state_root, local, gen);
     }
     let f = match read_half.read_frame() {
         Ok(f) => f,
         Err(e) => {
             closer.close();
             let _ = send.send(LegMsg::Gone { reason: format!("接入应答：{}", e.message(session)) });
-            return judge_after_loss(sup, shared, stop, send, last_link_up, host, session, dial_dir, local, gen);
+            return judge_after_loss(sup, shared, stop, send, last_link_up, host, session, state_root, local, gen);
         }
     };
     match f.op {
@@ -322,12 +328,12 @@ fn attach_and_read(
             shared.leg_reset(&format!("接入被拒（{code}）"));
             let _ = send.send(LegMsg::Gone { reason: format!("接入被拒：{code} {msg}") });
             sup.on(LegEvent::StreamEnd { ended: false });
-            return judge_after_loss(sup, shared, stop, send, last_link_up, host, session, dial_dir, local, gen);
+            return judge_after_loss(sup, shared, stop, send, last_link_up, host, session, state_root, local, gen);
         }
         other => {
             closer.close();
             let _ = send.send(LegMsg::Gone { reason: format!("接入首帧异常 op={other:?}") });
-            return judge_after_loss(sup, shared, stop, send, last_link_up, host, session, dial_dir, local, gen);
+            return judge_after_loss(sup, shared, stop, send, last_link_up, host, session, state_root, local, gen);
         }
     }
     // 输入写者：Receiver 经 Arc+Mutex 共享（跨重接存续——写半随每次接入重建）。
@@ -335,12 +341,13 @@ fn attach_and_read(
         let in_rx = Arc::clone(in_rx);
         let stop_w = stop.clone();
         std::thread::spawn(move || loop {
-            let bytes = {
+            let msg = {
                 let rx = in_rx.lock().unwrap_or_else(|e| e.into_inner());
                 rx.recv()
             };
-            let Ok(bytes) = bytes else { break };
-            if write_half.write_frame(Op::DATA, &bytes).is_err() || stop_w.stopped() {
+            let Ok(msg) = msg else { break };
+            let (op, payload) = input_frame(&msg);
+            if write_half.write_frame(op, &payload).is_err() || stop_w.stopped() {
                 break;
             }
         });
@@ -369,7 +376,7 @@ fn attach_and_read(
                 closer.close();
                 let _ = send.send(LegMsg::Gone { reason: e.message(session) });
                 sup.on(LegEvent::StreamEnd { ended: false });
-                return judge_after_loss(sup, shared, stop, send, last_link_up, host, session, dial_dir, local, gen);
+                return judge_after_loss(sup, shared, stop, send, last_link_up, host, session, state_root, local, gen);
             }
         }
     }
@@ -386,7 +393,7 @@ fn judge_after_loss(
     last_link_up: &mut bool,
     host: &str,
     session: &str,
-    dial_dir: &std::path::Path,
+    state_root: &std::path::Path,
     local: bool,
     gen: u64,
 ) -> LoopCtl {
@@ -404,7 +411,7 @@ fn judge_after_loss(
             }
         }
         *last_link_up = link_up_now;
-        let (exists, legs) = match backend::list_once(dial_dir, &list_arg) {
+        let (exists, legs) = match backend::list_once(state_root, &list_arg) {
             Ok(v) => match v.iter().find(|s| s.name == session) {
                 Some(s) => (true, s.legs),
                 None => (false, 0),
@@ -434,7 +441,7 @@ fn judge_after_loss(
                     std::thread::sleep(step);
                     left = left.saturating_sub(step);
                 }
-                if let Ok(v) = backend::list_once(dial_dir, &list_arg) {
+                if let Ok(v) = backend::list_once(state_root, &list_arg) {
                     let legs = v.iter().find(|s| s.name == session).map(|s| s.legs).unwrap_or(0);
                     if matches!(sup.on(LegEvent::VacancyPoll { legs }), LegAction::Attach) {
                         return LoopCtl::Continue;
@@ -452,7 +459,7 @@ fn vacancy_wait(
     sup: &mut LegSupervisor,
     shared: &Shared,
     stop: &StopFlag,
-    dial_dir: &std::path::Path,
+    state_root: &std::path::Path,
     list_arg: &str,
     session: &str,
     delay: Duration,
@@ -467,7 +474,7 @@ fn vacancy_wait(
     if stop.stopped() || shared.leg_gen_now() != gen {
         return LoopCtl::Exit;
     }
-    if let Ok(v) = backend::list_once(dial_dir, list_arg) {
+    if let Ok(v) = backend::list_once(state_root, list_arg) {
         let legs = v.iter().find(|s| s.name == session).map(|s| s.legs).unwrap_or(0);
         if matches!(sup.on(LegEvent::VacancyPoll { legs }), LegAction::Attach) {
             return LoopCtl::Continue;
@@ -594,7 +601,7 @@ pub(crate) fn run(args: &[String]) -> i32 {
                         app.restore(&sel);
                     }
                     list_beat(&shared);
-                    spawn_leg(&shared, &stop);
+                    // 重挂腿由 UI 收敛块接管（镜像只改模型，r4 高1）。
                 }
                 std::thread::sleep(Duration::from_millis(300));
             }
@@ -673,7 +680,7 @@ fn spawn_leg(shared: &Arc<Shared>, stop: &StopFlag) {
     shared.leg_reset("接入中…");
     let gen = shared.leg_gen_now();
     let (frame_send, frame_recv) = leg_channel(64);
-    let (in_tx, in_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (in_tx, in_rx) = std::sync::mpsc::channel::<LegInput>();
     *shared.leg_recv.lock().unwrap_or_else(|e| e.into_inner()) = Some(frame_recv);
     *shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(in_tx);
     let shared2 = Arc::clone(shared);
@@ -727,12 +734,12 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
                                             tv.interacted = true;
                                             let a = *shared.term_area.lock().unwrap_or_else(|e| e.into_inner());
                                             if a.width > 0 && a.height > 0 {
-                                                let _ = tx.send(input::encode_resize(a.width, a.height));
+                                                let _ = tx.send(LegInput::Resize(a.width, a.height));
                                             }
                                         }
                                         if k.kind == KeyEventKind::Press || k.kind == KeyEventKind::Repeat {
                                             if let Some(bytes) = input::encode_key_event(&k, tv.leg.vt()) {
-                                                let _ = tx.send(bytes);
+                                                let _ = tx.send(LegInput::Data(bytes));
                                             }
                                         }
                                     }
@@ -755,13 +762,12 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
                                     break;
                                 }
                                 if changed {
-                                    // 用户发起 ⇒ 持久化 + 立即重取列表 + 重挂腿（r3 D/N）。
+                                    // 用户发起 ⇒ 持久化 + 立即重取列表（重挂腿由收敛块接管，r4 高1）。
                                     {
                                         let app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
                                         shared.persist_selection(&app);
                                     }
                                     list_beat(shared);
-                                    spawn_leg(shared, stop);
                                 }
                             }
                         }
@@ -777,7 +783,7 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
                                 let tx = shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()).clone();
                                 let pane = *shared.term_area.lock().unwrap_or_else(|e| e.into_inner());
                                 if let (Some(tx), Some(ev)) = (tx, input::encode_mouse_event(&m, pane, tv.leg.vt())) {
-                                    let _ = tx.send(ev);
+                                    let _ = tx.send(LegInput::Data(ev));
                                 }
                             }
                         } else if focus == Focus::Terminal
@@ -797,7 +803,6 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
                                     shared.persist_selection(&app);
                                 }
                                 list_beat(shared);
-                                spawn_leg(shared, stop);
                             }
                         }
                     }
@@ -807,7 +812,7 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
                             if let Some(tv) = termview.as_mut() {
                                 let tx = shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()).clone();
                                 if let (Some(tx), Some(bytes)) = (tx, input::encode_paste(&text, tv.leg.vt())) {
-                                    let _ = tx.send(bytes);
+                                    let _ = tx.send(LegInput::Data(bytes));
                                 }
                             }
                         }
@@ -820,12 +825,31 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
                             if let Some(tv) = termview.as_mut() {
                                 let tx = shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()).clone();
                                 if let (Some(tx), Some(bytes)) = (tx, input::encode_focus(gained, tv.leg.vt())) {
-                                    let _ = tx.send(bytes);
+                                    let _ = tx.send(LegInput::Data(bytes));
                                 }
                             }
                         }
                     }
                     Event::Resize(_, _) => {}
+                }
+            }
+            // 挂腿状态收敛（r4 高1）：期望目标 ≠ 已挂目标 ⇒ 重挂——覆盖冷启动、
+            // 恢复、回落链换目标、镜像全部路径（不再依赖「选中变化」事件触发）。
+            let desired = {
+                let app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
+                app.selected_host
+                    .clone()
+                    .zip(app.sessions.selected().map(|s| s.to_owned()))
+            };
+            {
+                let mut attached = shared.attached.lock().unwrap_or_else(|e| e.into_inner());
+                if *attached != desired {
+                    if desired.is_some() {
+                        spawn_leg(shared, stop);
+                    } else {
+                        shared.leg_reset("未选中会话");
+                    }
+                    *attached = desired;
                 }
             }
             // 腿世代推进（用户切换/镜像）⇒ 接手新通道 + 重建终端视图。

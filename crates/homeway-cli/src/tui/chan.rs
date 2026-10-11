@@ -10,6 +10,8 @@
 
 #![allow(dead_code)]
 
+use homeway_core::term::frames;
+use homeway_core::term::frames::Op;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, SyncSender, TryRecvError};
 use std::time::Duration;
 
@@ -60,6 +62,22 @@ impl RecvHalf {
             out.push(m);
         }
         out
+    }
+}
+
+/// 输入通道消息（UI → 腿写者线程，r4 高2）：**带帧类型**——RESIZE 不再混入
+/// DATA（否则载荷被当键盘字节注入 PTY、服务端永远收不到尺寸）。
+#[derive(Debug, PartialEq)]
+pub(crate) enum LegInput {
+    Data(Vec<u8>),
+    Resize(u16, u16),
+}
+
+/// LegInput → 出口帧（op + 载荷）。写者线程据此写 PTY；纯函数便于装配层断言。
+pub(crate) fn input_frame(msg: &LegInput) -> (Op, Vec<u8>) {
+    match msg {
+        LegInput::Data(b) => (Op::DATA, b.clone()),
+        LegInput::Resize(w, h) => (Op::RESIZE, frames::enc_resize(*w, *h)),
     }
 }
 
@@ -119,6 +137,17 @@ mod tests {
         }
         assert_eq!(recv.drain().len(), 5);
         assert_eq!(recv.drain().len(), 0, "收清后为空（下一次渲染拍无残留）");
+    }
+
+    #[test]
+    fn input_frame_types_are_distinct() {
+        // r4 高2 回归钉：RESIZE 必须走 Op::RESIZE 帧（此前被包成 DATA 注入 PTY）。
+        let (op, payload) = input_frame(&LegInput::Resize(120, 40));
+        assert_eq!(op, Op::RESIZE);
+        assert_eq!(payload, frames::enc_resize(120, 40));
+        let (op, payload) = input_frame(&LegInput::Data(b"ls".to_vec()));
+        assert_eq!(op, Op::DATA);
+        assert_eq!(payload, b"ls");
     }
 
     #[test]
