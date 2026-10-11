@@ -78,8 +78,6 @@ impl WriteHalf for Box<dyn WriteHalf + Send> {
     }
 }
 
-/// 宿主域的锁获取（工单②：锁中毒不 panic——c-shared 宿主进程里 panic = 扩展进程
-/// 死；持锁线程 panic 后数据仍可用，into_inner 取出继续）。
 /// 桥拨号闭包面（工单⑤ dial_port 接缝的类型别名）。
 ///
 /// Q-F F4：**单个 `Arc`**——`handle_conn` 从锁里克隆 Arc 后**出锁拨号**（此前持锁

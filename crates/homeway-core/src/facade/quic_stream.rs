@@ -333,7 +333,7 @@ fn write_dial_frame_raw(island: &Arc<Island>, id: StreamId, dst: SocketAddrV4) -
 /// 连续空块上限（**纯防御**，正常形态不可达）：岛侧若持续回 0 长块，下面的续读环否则永不收敛
 /// （设计只说「预算内续读」；`remain(None)` 的天文配置形态下更无全局时限）。32 = 远大于任何
 /// 分帧边界能产生的空块数，到点按**协议面无进展**收（`InvalidData` ⇒ pf 链按拨号失败处置）。
-const MAX_EMPTY_ACK_CHUNKS: u32 = 32;
+pub(super) const MAX_EMPTY_ACK_CHUNKS: u32 = 32;
 
 /// ④ 读 1B 回执（值空间穷举见 §2.2 的 ④ 表；返回**回执之后的余量**）。
 ///
@@ -499,18 +499,18 @@ struct QuicReadHalf {
 /// 读余量缓冲（单源：本文件与 `host_session` 的流面共用——**余量丢失 = 应用层帧
 /// 错位**，两处必须同一实现）。
 #[derive(Default)]
-pub(crate) struct PendingBuf {
-    pub(crate) buf: Vec<u8>,
-    pub(crate) off: usize,
+pub(super) struct PendingBuf {
+    pub(super) buf: Vec<u8>,
+    pub(super) off: usize,
 }
 
 impl PendingBuf {
-    pub(crate) fn new(buf: Vec<u8>) -> Self {
+    pub(super) fn new(buf: Vec<u8>) -> Self {
         PendingBuf { buf, off: 0 }
     }
 
     /// 取一段（`None` = 余量已空 ⇒ 调用方转下一段读取）。
-    pub(crate) fn take(&mut self, out: &mut [u8]) -> Option<usize> {
+    pub(super) fn take(&mut self, out: &mut [u8]) -> Option<usize> {
         if self.off >= self.buf.len() {
             return None;
         }

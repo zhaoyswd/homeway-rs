@@ -43,7 +43,7 @@ if (( FULL )); then
   (cd "$REPO_ROOT" && cargo test --workspace --ignored -- --test-threads=1) || fail 2 "fuzz_replay"
 fi
 
-echo "==> [3/7] clippy（-D warnings）+ OHOS 交叉面（评审 r1-F18：macOS 编译不到 sendmmsg 支——交叉 check 补覆盖）+ 真 OHOS link + QUIC 岛隔离门"
+echo "==> [3/7] clippy（-D warnings）+ OHOS 交叉面（评审 r1-F18：macOS 编译不到的 libc 面由交叉 check 补覆盖）+ 真 OHOS link + QUIC 岛隔离门"
 (cd "$REPO_ROOT" && cargo clippy --workspace --all-targets -- -D warnings) || fail 3 "clippy"
 
 # ---- C 侧前置（M0 设计 §2.5/§2.6）：ring 0.17 的 build script 在 check 与 build 下都编 C。

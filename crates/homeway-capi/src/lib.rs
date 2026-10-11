@@ -60,7 +60,8 @@ fn arg_str<'a>(p: *const std::os::raw::c_char) -> std::borrow::Cow<'a, str> {
     unsafe { CStr::from_ptr(p) }.to_string_lossy()
 }
 
-/// 返回串：libc::malloc 分配（NAPI 侧 std::free）；分配失败 = 空串指针（恒非 NULL）。
+/// 返回串：libc::malloc 分配（NAPI 侧 std::free）；分配失败 = 空串指针——malloc
+/// **二次**失败时仍可能 NULL（NAPI 侧 MakeString 对 NULL 转空串，消费方按空串处理）。
 fn ret_cstring(s: &str) -> *mut std::os::raw::c_char {
     match CString::new(s) {
         Ok(c) => {

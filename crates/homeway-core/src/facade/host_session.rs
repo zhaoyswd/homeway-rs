@@ -974,17 +974,35 @@ impl Read for HostReadHalf {
         if let Some(n) = self.shared.take_pending(out) {
             return Ok(n);
         }
-        match self.shared.read_cmd() {
-            Ok(data) => {
-                let n = data.len().min(out.len());
-                out[..n].copy_from_slice(&data[..n]);
-                let mut p = crate::syncutil::lock_unpoison(&self.shared.pending);
-                p.buf = data;
-                p.off = n;
-                Ok(n)
+        // 空块（0B STREAM 帧）不是 EOF——续读有界（评审 r1 补-2：与 quic_stream 的
+        // `QuicReadHalf::read`/`read_dial_ack` 对齐；原对空块直接 `Ok(0)` 会被
+        // `io::Read` 消费者判成流提前结束）。
+        let mut empty_chunks = 0u32;
+        loop {
+            let data = match self.shared.read_cmd() {
+                Ok(data) => data,
+                Err(StreamErr::Closed) => return Ok(0), // 对端 FIN / 本端关流 ⇒ EOF
+                Err(e) => return Err(HostErr::from_stream(e).into()),
+            };
+            if data.is_empty() {
+                empty_chunks += 1;
+                if empty_chunks > super::quic_stream::MAX_EMPTY_ACK_CHUNKS {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!(
+                            "QUIC 服务流：连续 {} 个空块（协议面无进展）",
+                            super::quic_stream::MAX_EMPTY_ACK_CHUNKS
+                        ),
+                    ));
+                }
+                continue;
             }
-            Err(StreamErr::Closed) => Ok(0), // 对端 FIN / 本端关流 ⇒ EOF
-            Err(e) => Err(HostErr::from_stream(e).into()),
+            let n = data.len().min(out.len());
+            out[..n].copy_from_slice(&data[..n]);
+            let mut p = crate::syncutil::lock_unpoison(&self.shared.pending);
+            p.buf = data;
+            p.off = n;
+            return Ok(n);
         }
     }
 }

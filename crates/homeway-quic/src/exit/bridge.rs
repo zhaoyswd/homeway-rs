@@ -445,7 +445,7 @@ impl ExitBridge {
         lock_unpoison(&self.bindings).by_conn.get(&conn_id).copied()
     }
 
-    /// 是否已有该公钥的绑定（出站分流键：无 ⇒ 调用方走 WG 原样）。
+    /// 是否已有该公钥的绑定（出站分流键：无 ⇒ 调用方丢包 + 计数——引擎侧 `route_out` 的丢弃归因行）。
     pub(crate) fn is_bound(&self, pubkey: &[u8; 32]) -> bool {
         lock_unpoison(&self.bindings).by_pub.contains_key(pubkey)
     }

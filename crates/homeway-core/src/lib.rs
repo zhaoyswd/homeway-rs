@@ -69,7 +69,7 @@ pub mod sysfd;
 pub mod term;
 pub mod token;
 pub mod tunnel_addr;
-pub mod udpbatch;
+pub(crate) mod udpbatch; // 评审 r1 补-4：sendmmsg 族已删，现存 6 个 pub(crate) socket 工具无 crate 外消费者
 
 /// 构建标记（探针应答 `build` 字段 / 出口能力行的单一真源）。中继与出口共用——
 /// 中继此前 `Config.build` 全仓无赋值 ⇒ 恒 `"relay-dev"`（F9：探针应答上报真实构建）。

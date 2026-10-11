@@ -1297,6 +1297,9 @@ async fn handle_cmd(
                 return;
             }
             st.racing = true;
+            // 评审 r1 低-6：赛跑计数（mirrors）进快照不滞后（失败路径不走 adopt 的
+            // 立即到期；节流见 housekeeping ④）
+            st.snap_sync_last = None;
             st.race_gate.reset();
             let log_c4 = st.race_gate.due(Instant::now());
             st.mirrors += list.len() as u64;
@@ -1312,6 +1315,8 @@ async fn handle_cmd(
             }));
         }
         Cmd::Rebind { local, reply } => {
+            // 评审 r1 低-6：local/迁移位进快照不滞后（节流见 housekeeping ④）
+            st.snap_sync_last = None;
             let from = face.local();
             match face.rebind(local) {
                 Ok(to) => {
