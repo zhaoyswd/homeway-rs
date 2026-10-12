@@ -3061,8 +3061,15 @@ async fn flood_keeps_bounds_and_spares_admitted_connection() {
     for _ in 0..12 {
         let _ = wrong_pin_attempt(quic.local_addr()).await;
     }
+    // 计数判据**有界等待**（口径同 `flood_same_source_is_refused_and_counted`）：闸记账
+    // 本身确定性（`SrcGate::attempt` = 纯时间戳，与握手结果无关），但「拒包已发」与
+    // 「`flood_refused` 自增」在同一 accept 迭代内**非原子**——多线程 runtime 下客户端
+    // 可能先观测到 CONNECTION_REFUSED 再回读快照（2026-10-12 公开 CI ubuntu 实测
+    // `flood_refused=6` vs 期望 7、同刻 `handshake_failed=5` = 允许额恰好用尽，未见
+    // 越闸采纳）。末条尝试的计数与快照竞争 ⇒ 直接连读是位置启发式，改等有界窗口。
+    let _ = wait_until(|| quic.snapshot().flood_refused >= 7, WAIT).await;
     let snap = quic.snapshot();
-    assert!(snap.flood_refused >= 7, "第 F+1..K 次应全拒：{snap:?}");
+    assert!(snap.flood_refused >= 7, "第 F+1..K 次应全拒（有界等待后仍缺）：{snap:?}");
     assert!(
         snap.handshakes_in_flight <= 64,
         "并发握手不得越 handshake_cap：{snap:?}"
@@ -3896,3 +3903,8 @@ fn exit_config_cc_field_reaches_the_factory() {
     };
     assert_eq!(cfg.cc, crate::tuning::CcChoice::Bbr);
 }
+
+/// **判据（DNS-STREAM 批：tag=6 出口面）**：① 已装配（`ServiceIntakes.dns`）⇒ tag=6 经
+/// 既有服务入口通道（socketpair + 入队 + 泵）到达服务侧，帧字节**逐字**转交（入口层不做
+/// DNS 语义）、受理行带 `tag=dns`（E-q5 的 `%s` 新值域）；② 未装配 ⇒ `reset(0x22)` +
+/// `服务流拒（…）` 行（与 tag 1/2/3 同款的保守选择——DNS 未启用 = 该服务腿整条停用）。
