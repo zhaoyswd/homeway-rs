@@ -8,6 +8,8 @@
 
 pub(crate) mod app;
 pub(crate) mod backend;
+pub(crate) mod blit;
+pub(crate) mod frame;
 pub(crate) mod render;
 pub(crate) mod runtime;
 pub(crate) mod theme;

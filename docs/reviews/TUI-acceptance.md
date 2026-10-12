@@ -152,6 +152,24 @@
   tmux 合成按键驱动不了 opencode 的退出（键全进其输入框，进程不退），残留机制
   疑与 df5f713 修复前「缓冲/终端失同步」同族（错位伪影在 ratatui 认为无变化的格
   上存活）；待用户在新二进制上复测，若仍残留以截图定位。
+- 2026-10-12　**输出接缝整体搬运（tui-blit-layer，用户拍板）**——经评估确认 herdr 的
+  输出接缝 = `render_ansi.rs` BlitEncoder（纯 Rust，不牵 ghostty/zig/OHOS）后整体移植：
+  · `tui/frame.rs` = 帧模型（CellData/CursorState/FrameData + `from_ratatui_buffer` +
+  颜色/修饰符打包，移植自 herdr wire.rs，Apache-2.0）
+  · `tui/blit.rs` = BlitEncoder（整帧/差分双路径、列推进按 unicode 宽度自算、宽尾
+  `to_skip`/宽度变化 `invalidated` 失效传播、`CSI ?2026` 同步输出、光标先隐后定、
+  DECSCUSR 随帧、每帧 OSC8 复位）+ **BlitBackend**（Buffer-backed 后端：ratatui 仅
+  离屏合成，flush = Buffer→帧→编码→stdout——ratatui 的 crossterm 后端彻底退出输出
+  路径）
+  · 接线：`Terminal<BlitBackend>` + 光标槽（渲染闭包写、flush 读，替代手写 DECSCUSR
+  边沿）；termview 宽尾改显式 `skip` 位模型
+  · 回归钉 14 个（宽字形列推进/宽尾跳位/差分/半角浊音假名/SGR/光标记忆/尺寸变化整屏/
+  同步输出帧序）+ 原 126 用例全绿
+  · **tmux 全场景回归（显示列切片——修正探针 CJK 切列 bug）**：ls 逐行完整（含此前
+  误报「行首吞字」的 verify_token.py/web.jpeg——**该残留全为探针切片伪影，帧转储与
+  字节转储双证渲染一直正确**）、vim 全屏/退出、clear、中文回显全部通过
+  · 新发现（独立于输出层）：改窗后 shell 提示符重绘对齐瑕疵（zsh 重绘×VT 重排交互）
+  记入下一步
 - 2026-10-12　5.1 手测发现（第四轮，**高危**）：**「work 会话敲命令回车无反应、命令消失」
   真因 = TUI 进程 tty 死亡后 100% CPU 永久自旋**——crossterm 0.29 `try_read` 内圈在
   `read` 返回 `Ok(0)`（EOF）或非 WouldBlock 错误时既不 break 也不返回（源码实证），

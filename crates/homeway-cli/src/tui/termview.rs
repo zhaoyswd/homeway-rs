@@ -85,7 +85,10 @@ impl TermView {
                 }
                 let Some(rc) = buf.cell_mut((x, y)) else { break };
                 if cell.skip && prev_real {
+                    // 宽字形尾格：symbol 空 + 差分跳过位（BlitEncoder 按 skip 语义
+                    // 排除出输出与比较——真终端自持两列）。
                     rc.set_symbol("");
+                    rc.set_diff_option(ratatui::buffer::CellDiffOption::Skip);
                     rc.set_style(Style::new().bg(cell_bg(&cell.bg)));
                 } else if cell.skip || cell.symbol.is_empty() {
                     rc.set_symbol(" ");

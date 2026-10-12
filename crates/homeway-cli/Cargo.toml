@@ -19,6 +19,8 @@ getrandom.workspace = true
 ratatui = "0.30"
 crossterm = "0.29"
 alacritty_terminal.workspace = true
+# 帧差分编码器（移植 herdr render_ansi，Apache-2.0）按显示宽度算列推进。
+unicode-width = "0.2"
 
 [features]
 # 透传 homeway-core 的故障注入缝（阶梯时间窗实测用）

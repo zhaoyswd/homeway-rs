@@ -26,9 +26,11 @@ use crossterm::event::{
 };
 use crossterm::cursor::SetCursorStyle;
 use crossterm::{execute, terminal};
-use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Rect;
 use ratatui::Terminal;
+
+use super::blit::BlitBackend;
+use super::frame::CursorState;
 
 use homeway_core::daemon::client::ControlClient;
 use homeway_core::daemon::proto::ServeStatusResult;
@@ -795,8 +797,9 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
     let mut leg_recv: Option<RecvHalf> = None;
     let mut termview: Option<TermView> = None;
     let mut ui_gen = shared.leg_gen_now();
-    // 宿主光标样式切换沿（终端焦点 ↔ 面板）——DECSCUSR 只在沿上写。
-    let mut last_focus: Option<Focus> = None;
+    // 帧光标槽（渲染闭包写入 → BlitBackend.flush 读取；DECSCUSR 随帧由编码器下发）。
+    let cursor_slot: std::sync::Arc<std::sync::Mutex<Option<CursorState>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
     // ` +` 输入浮层（主机 token / 会话名）。
     let mut input: Option<InputState> = None;
 
@@ -820,7 +823,7 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
         return 2;
     }
     let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut t = match Terminal::new(CrosstermBackend::new(io::stdout())) {
+        let mut t = match Terminal::new(BlitBackend::new()) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("homeway tui：终端初始化失败：{e}");
@@ -887,7 +890,7 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 2,
             }
             // —— 渲染心跳以下与事件处理同拍（每 ≤100ms 一轮）——
-            if !ui_tick(shared, stop, &mut t, &mut termview, &mut leg_recv, &mut ui_gen, &mut last_focus, &input) {
+            if !ui_tick(shared, stop, &mut t, &mut termview, &mut leg_recv, &mut ui_gen, &cursor_slot, &input) {
                 break 0;
             }
             if stop.stopped() {
@@ -1129,11 +1132,11 @@ fn handle_event(
 fn ui_tick(
     shared: &Arc<Shared>,
     stop: &StopFlag,
-    t: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    t: &mut Terminal<BlitBackend>,
     termview: &mut Option<TermView>,
     leg_recv: &mut Option<RecvHalf>,
     ui_gen: &mut u64,
-    last_focus: &mut Option<Focus>,
+    cursor_slot: &std::sync::Arc<std::sync::Mutex<Option<CursorState>>>,
     input: &Option<InputState>,
 ) -> bool {
     // 挂腿状态收敛（r4 高1）：期望目标 ≠ 已挂目标 ⇒ 重挂——覆盖冷启动、
@@ -1196,16 +1199,7 @@ fn ui_tick(
     } else {
         push_focus(shared, termview, false);
     }
-    // 宿主光标样式随焦点切换（r5 验收批：终端焦点 = 闪烁块；离开/退出还原
-    // 缺省形状。DECSCUSR 只在切换沿写一次，不逐帧写）。
-    if Some(focus_now) != *last_focus {
-        let _ = match focus_now {
-            Focus::Terminal => execute!(io::stdout(), SetCursorStyle::BlinkingBlock),
-            _ => execute!(io::stdout(), SetCursorStyle::DefaultUserShape),
-        };
-        *last_focus = Some(focus_now);
-    }
-    // 渲染。
+    // 渲染（光标形状/显隐随帧由 BlitEncoder 下发——见 render::draw 的光标槽）。
     let now = now_ms();
     let (status, rates) = {
         let app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
@@ -1226,7 +1220,7 @@ fn ui_tick(
     if t
         .draw(|f| {
             let overlay = input.as_ref().map(|s| s.overlay());
-            render::draw(f, app_ref, tv, &status, &rates, now, overlay.as_ref());
+            render::draw(f, app_ref, tv, &status, &rates, now, overlay.as_ref(), cursor_slot);
             *area_store.lock().unwrap_or_else(|e| e.into_inner()) = f.area();
         })
         .is_err()

@@ -228,6 +228,7 @@ fn render_section_divider(f: &mut Frame, section: Rect) {
 }
 
 /// 面板整体绘制（UI 主循环每拍调用）。返回鼠标命中区。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn draw(
     f: &mut Frame,
     app: &mut AppModel,
@@ -236,6 +237,7 @@ pub(crate) fn draw(
     rates: &std::collections::HashMap<String, (f64, f64)>,
     now_ms: i64,
     overlay: Option<&Overlay>,
+    cursor_slot: &std::sync::Mutex<Option<super::frame::CursorState>>,
 ) -> HitZones {
     let area = f.area();
     let regions = layout(area);
@@ -335,20 +337,30 @@ pub(crate) fn draw(
             let content = term_content(term_a);
             if content.height > 0 {
                 tv.render(f, content);
-                // 终端焦点的宿主光标 = 会话 VT 光标（会话声明可见位且贴底视口时；
-                // 回看中的光标位置无语义，保持隐藏）。
+                // 终端焦点的宿主光标 = 会话 VT 光标（贴底视口且会话声明可见位时；
+                // 回看中无语义）。写入光标槽——由 BlitEncoder 在帧尾定位/显隐/定形状
+                // （shape=1 闪烁块；不再手写 DECSCUSR 边沿）。
                 let cur = tv.leg.cursor();
-                if app.focus == Focus::Terminal && cur.visible && tv.leg.display_offset() == 0 {
-                    if let Some(p) = super::termview::cursor_in_pane(cur, content) {
-                        f.set_cursor_position(p);
-                    }
-                }
+                let state = if app.focus == Focus::Terminal
+                    && cur.visible
+                    && tv.leg.display_offset() == 0
+                {
+                    super::termview::cursor_in_pane(cur, content).map(|(x, y)| {
+                        super::frame::CursorState { x, y, visible: true, shape: 1 }
+                    })
+                } else {
+                    None
+                };
+                *cursor_slot.lock().unwrap_or_else(|e| e.into_inner()) = state;
+            } else {
+                *cursor_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
             }
         }
         None => {
             Paragraph::new(" ↑↓ 选择主机 / 会话；Enter 进入终端焦点（F12 返回）；q 退出。\n 选中会话后，这里显示其终端画面。")
                 .style(theme::placeholder())
                 .render(term_a, f.buffer_mut());
+            *cursor_slot.lock().unwrap_or_else(|e| e.into_inner()) = None;
         }
     }
 
@@ -443,7 +455,8 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(80, 16)).unwrap();
         let rates = std::iter::once(("peer-a".to_owned(), (10.0, 5.0))).collect();
         let mut hit_out = None;
-        t.draw(|f| hit_out = Some(draw(f, &mut app, None, "", &rates, 61_000, None))).unwrap();
+        let slot = std::sync::Mutex::new(None);
+        t.draw(|f| hit_out = Some(draw(f, &mut app, None, "", &rates, 61_000, None, &slot))).unwrap();
         let hit = hit_out.unwrap();
         let lines = buffer_text(&mut t);
         let joined = lines.join("\n");
@@ -485,7 +498,8 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(80, 12)).unwrap();
         let rates = std::collections::HashMap::new();
         let mut hit_out = None;
-        t.draw(|f| hit_out = Some(draw(f, &mut app, Some(&mut tv), "", &rates, 0, None))).unwrap();
+        let slot = std::sync::Mutex::new(None);
+        t.draw(|f| hit_out = Some(draw(f, &mut app, Some(&mut tv), "", &rates, 0, None, &slot))).unwrap();
         let _ = hit_out;
         let joined = buffer_text(&mut t).join("\n");
         let flat = joined.replace(' ', "");
@@ -504,7 +518,8 @@ mod tests {
         let mut t = Terminal::new(TestBackend::new(80, 12)).unwrap();
         let rates = std::collections::HashMap::new();
         let mut hit_out = None;
-        t.draw(|f| hit_out = Some(draw(f, &mut app, None, "", &rates, 0, Some(&ov)))).unwrap();
+        let slot = std::sync::Mutex::new(None);
+        t.draw(|f| hit_out = Some(draw(f, &mut app, None, "", &rates, 0, Some(&ov), &slot))).unwrap();
         let _ = hit_out;
         let joined = buffer_text(&mut t).join("\n");
         let flat = joined.replace(' ', "");
