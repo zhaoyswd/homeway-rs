@@ -158,6 +158,12 @@ impl TermLeg {
         self.vt.size()
     }
 
+    /// 本地 VT 跟尺寸（r5 实录：窗口 resize 只改了会话侧 PTY——本地网格不跟随
+    /// ⇒ 重炮应用按新尺寸重画时整屏折行错位/残留）。随 RESIZE 下发同拍调用。
+    pub fn resize(&mut self, cols: u16, rows: u16) {
+        let _ = self.vt.resize(cols, rows);
+    }
+
     /// 会话模式（括号粘贴/焦点上报/鼠标上报位——输入编码的门，spec 需求 4）。
     pub fn modes(&self) -> homeway_core::term::vt::Modes {
         self.vt.modes()

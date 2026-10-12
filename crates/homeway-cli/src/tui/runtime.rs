@@ -976,6 +976,7 @@ fn handle_event(
                             }
                             if (fresh || follow) && a.width > 0 && a.height > 0 {
                                 let _ = tx.send(LegInput::Resize(a.width, a.height));
+                                tv.leg.resize(a.width, a.height);
                                 tv.last_sent = Some(size);
                             }
                             if k.kind == KeyEventKind::Press || k.kind == KeyEventKind::Repeat {
@@ -1017,6 +1018,7 @@ fn handle_event(
                             if tv.interacted && tv.last_sent != Some(size) && a.width > 0 && a.height > 0 {
                                 if let Some(tx) = shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()).clone() {
                                     let _ = tx.send(LegInput::Resize(a.width, a.height));
+                                    tv.leg.resize(a.width, a.height);
                                     tv.last_sent = Some(size);
                                 }
                             }
@@ -1238,6 +1240,7 @@ fn ui_tick(
             if a.width > 0 && a.height > 0 {
                 let _ = tx.send(LegInput::Resize(a.width, a.height));
                 if let Some(tv) = termview.as_mut() {
+                    tv.leg.resize(a.width, a.height);
                     tv.last_sent = Some((a.width, a.height));
                 }
             }
