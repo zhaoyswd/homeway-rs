@@ -335,8 +335,11 @@ fn attach_and_read(
     }
     // split 前取收口句柄（conn 被 split 消费；closer 保留可靠逃生口）。
     let closer = conn.closer();
-    // 注册到 Shared：换代/退出路径主动收口（r4 F5）。
-    *shared.leg_closer.lock().unwrap_or_else(|e| e.into_inner()) = Some(closer.duplicate());
+    // 注册到 Shared：换代/退出路径主动收口（r4 F5）。世代已换代时不注册——
+    // 迟到注册会覆盖新腿的 closer（下次换代就会漏关这一条）。
+    if shared.leg_gen_now() == gen {
+        *shared.leg_closer.lock().unwrap_or_else(|e| e.into_inner()) = Some(closer.duplicate());
+    }
     let (mut read_half, mut write_half) = match conn.split() {
         Ok(x) => x,
         Err(e) => {
@@ -391,10 +394,14 @@ fn attach_and_read(
     *shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()) = Some(in_tx);
     {
         let stop_w = stop.clone();
+        // 写失败 = 流已死：此前静默 break ⇒ UI 继续把键入送进死写者（「敲命令没
+        // 反应」且相位无提示）。现在主动收口令读循环立即退出进入判定重拨。
+        let closer_w = closer.duplicate();
         std::thread::spawn(move || {
             for msg in in_rx {
                 let (op, payload) = input_frame(&msg);
                 if write_half.write_frame(op, &payload).is_err() || stop_w.stopped() {
+                    let _ = closer_w.close();
                     break;
                 }
             }
@@ -764,6 +771,12 @@ fn list_beat(shared: &Shared) {
 
 /// 腿（重）挂：世代自增令旧线程自退 + 换通道 + 起腿线程。
 fn spawn_leg(shared: &Arc<Shared>, stop: &StopFlag) {
+    // 换代前先**主动收口上一条腿**（r5 实录泄漏修复）：旧腿读循环阻塞在
+    // read_frame（空闲会话无帧）⇒ 世代检查永远跑不到；shared 槽里的旧 closer
+    // 若只被覆盖不 close（duplicate 句柄 Drop 不关连接）＝空闲腿永久泄漏。
+    if let Some(prev) = shared.leg_closer.lock().unwrap_or_else(|e| e.into_inner()).take() {
+        prev.close();
+    }
     shared.leg_reset("接入中…");
     let gen = shared.leg_gen_now();
     let (frame_send, frame_recv) = leg_channel(64);
