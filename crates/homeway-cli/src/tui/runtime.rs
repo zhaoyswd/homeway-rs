@@ -812,241 +812,74 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
                 return 2;
             }
         };
-        loop {
-            // 事件排空（poll 100ms = 渲染心跳）。
-            if event::poll(Duration::from_millis(100)).unwrap_or(false) {
-                let Ok(ev) = event::read() else { break };
-                shared.mark_input();
-                match ev {
-                    Event::Key(k) => {
-                        let focus = shared.app.lock().unwrap_or_else(|e| e.into_inner()).focus;
-                        match route_key(&k, focus) {
-                            Route::Passthrough => {
-                                // 首次交互 RESIZE（仅本实例有键入即交互——镜像实例无键入，r2 N-4）。
-                                if let Some(tv) = termview.as_mut() {
-                                    let tx = shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                                    if let Some(tx) = tx {
-                                        if !tv.interacted {
-                                            tv.interacted = true;
-                                            let a = *shared.term_area.lock().unwrap_or_else(|e| e.into_inner());
-                                            if a.width > 0 && a.height > 0 {
-                                                let _ = tx.send(LegInput::Resize(a.width, a.height));
-                                            }
-                                        }
-                                        if k.kind == KeyEventKind::Press || k.kind == KeyEventKind::Repeat {
-                                            if let Some(bytes) = input::encode_key_event(&k, tv.leg.vt()) {
-                                                let _ = tx.send(LegInput::Data(bytes));
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                            Route::Panel(cmd) => {
-                                let mut quit = false;
-                                let changed = {
-                                    let mut app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
-                                    match cmd {
-                                        PanelCmd::Quit => {
-                                            quit = true;
-                                            false
-                                        }
-                                        other => app.apply_panel(other),
-                                    }
-                                };
-                                if quit {
-                                    stop.stop();
-                                    break;
-                                }
-                                if changed {
-                                    // 用户发起 ⇒ 持久化 + 立即重取列表（重挂腿由收敛块接管，r4 高1）。
-                                    {
-                                        let app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
-                                        shared.persist_selection(&app);
-                                    }
-                                    list_beat(shared);
-                                }
+        // 输入泵线程（r5 实录修复）：crossterm 0.29 的 try_read 在 tty EOF（master
+        // 关闭/锁屏唤醒 fd 静默死亡——macOS 实证 slave 恒「可读」且 read 恒 Ok(0)）
+        // 时内圈不 break，poll 里 100% CPU 自旋、主循环永困其中（stop 旗标都不再看）。
+        // 读独立线程 + 有界通道：主循环永不困在 crossterm 里；EOF 自旋由看门狗识别。
+        enum Pump {
+            Ev(Event),
+            Lost,
+        }
+        let (ev_tx, ev_rx) = std::sync::mpsc::sync_channel::<Pump>(256);
+        let _ = std::thread::Builder::new()
+            .name("tui-input".into())
+            .spawn(move || loop {
+                match event::poll(Duration::from_millis(200)) {
+                    Ok(true) => match event::read() {
+                        Ok(ev) => {
+                            if ev_tx.send(Pump::Ev(ev)).is_err() {
+                                return;
                             }
                         }
-                    }
-                    Event::Mouse(m) => {
-                        // 鼠标归属：终端焦点 + 会话启用上报 ⇒ 编码转发；否则面板点击。
-                        let (focus, tracking) = {
-                            let app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
-                            (app.focus, termview.as_ref().map(|tv| tv.leg.modes().mouse_tracking()).unwrap_or(false))
-                        };
-                        if focus == Focus::Terminal && tracking {
-                            if let Some(tv) = termview.as_mut() {
-                                let tx = shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                                let pane = *shared.term_area.lock().unwrap_or_else(|e| e.into_inner());
-                                if let (Some(tx), Some(ev)) = (tx, input::encode_mouse_event(&m, pane, tv.leg.vt())) {
-                                    let _ = tx.send(LegInput::Data(ev));
-                                }
-                            }
-                        } else if focus == Focus::Terminal
-                            && matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
-                        {
-                            // 滚轮回看（tasks 4.8）：会话未启用上报 ⇒ 面板内回看（spec 需求 4）。
-                            if let Some(tv) = termview.as_mut() {
-                                match m.kind {
-                                    MouseEventKind::ScrollUp => tv.leg.scroll_display(3),
-                                    _ => tv.leg.scroll_display(-3),
-                                }
-                            }
-                        } else if let MouseEventKind::Down(CMouse::Left) = m.kind {
-                            if click_select(shared, m.column, m.row) {
-                                {
-                                    let app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
-                                    shared.persist_selection(&app);
-                                }
-                                list_beat(shared);
-                            }
+                        Err(_) => {
+                            let _ = ev_tx.send(Pump::Lost);
+                            return;
                         }
-                    }
-                    Event::Paste(text) => {
-                        let focus = shared.app.lock().unwrap_or_else(|e| e.into_inner()).focus;
-                        if focus == Focus::Terminal {
-                            if let Some(tv) = termview.as_mut() {
-                                let tx = shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                                if let Some(tx) = tx {
-                                    for bytes in input::encode_paste_fragments(&text, tv.leg.vt()).unwrap_or_default() {
-                                        let _ = tx.send(LegInput::Data(bytes));
-                                    }
-                                }
-                            }
-                        }
-                    }
-                    Event::FocusGained | Event::FocusLost => {
-                        // 外层 1004：活动态判据 + 终端焦点下按会话位注入（design D7）。
-                        let gained = matches!(ev, Event::FocusGained);
-                        *shared.outer_focus.lock().unwrap_or_else(|e| e.into_inner()) = Some(gained);
-                        let focus = shared.app.lock().unwrap_or_else(|e| e.into_inner()).focus;
-                        if focus == Focus::Terminal {
-                            if let Some(tv) = termview.as_mut() {
-                                let tx = shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()).clone();
-                                if let (Some(tx), Some(bytes)) = (tx, input::encode_focus(gained, tv.leg.vt())) {
-                                    let _ = tx.send(LegInput::Data(bytes));
-                                }
-                            }
-                        }
-                    }
-                    Event::Resize(_, _) => {
-                        // r4 中4：pane 尺寸变化不再丢弃——置旗，画后（新 area 落位）下发。
-                        if { shared.app.lock().unwrap_or_else(|e| e.into_inner()).focus } == Focus::Terminal {
-                            shared.pending_resize.store(true, Ordering::SeqCst);
-                        }
+                    },
+                    Ok(false) => {}
+                    Err(_) => {
+                        let _ = ev_tx.send(Pump::Lost);
+                        return;
                     }
                 }
-            }
-            // 挂腿状态收敛（r4 高1）：期望目标 ≠ 已挂目标 ⇒ 重挂——覆盖冷启动、
-            // 恢复、回落链换目标、镜像全部路径（不再依赖「选中变化」事件触发）。
-            let desired = {
-                let app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
-                app.selected_host
-                    .clone()
-                    .zip(app.sessions.selected().map(|s| s.to_owned()))
-            };
-            {
-                let mut attached = shared.attached.lock().unwrap_or_else(|e| e.into_inner());
-                if *attached != desired {
-                    if desired.is_some() {
-                        spawn_leg(shared, stop);
-                    } else {
-                        shared.leg_reset("未选中会话");
-                    }
-                    *attached = desired;
-                }
-            }
-            // 腿世代推进（用户切换/镜像）⇒ 接手新通道 + 重建终端视图。
-            let gen = shared.leg_gen_now();
-            if gen != ui_gen {
-                ui_gen = gen;
-                if let Some(r) = shared.leg_recv.lock().unwrap_or_else(|e| e.into_inner()).take() {
-                    leg_recv = Some(r);
-                }
-                let dims = {
-                    let app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
-                    app.sessions
-                        .sessions()
-                        .iter()
-                        .find(|s| Some(s.name.as_str()) == app.sessions.selected())
-                        .map(|s| (s.cols, s.rows))
-                        .unwrap_or((80, 24))
-                };
-                termview = TermView::new(dims.0, dims.1).ok();
-            }
-            // 腿帧 drain → 内嵌模拟器（合帧：丢渲染拍不丢字节）。
-            if let (Some(tv), Some(rh)) = (termview.as_mut(), leg_recv.as_ref()) {
-                for msg in rh.drain() {
-                    match msg {
-                        LegMsg::Frame(b) => {
-                            if let Some(f) = decode_frame(&b) {
-                                tv.leg.on_frame(&f);
-                            }
-                        }
-                        LegMsg::Gone { reason } => {
-                            // r4 中3：终结原因消费到相位显示（此前十处写零消费）。
-                            *shared.leg_phase.lock().unwrap_or_else(|e| e.into_inner()) = reason;
-                        }
+            });
+        let mut stuck_ticks = 0u32;
+        let exit_code = loop {
+            match ev_rx.recv_timeout(Duration::from_millis(100)) {
+                Ok(Pump::Ev(ev)) => {
+                    stuck_ticks = 0;
+                    shared.mark_input();
+                    if !handle_event(shared, stop, &mut termview, ev) {
+                        break 0i32;
                     }
                 }
-            }
-            // 会话焦点跟随面板焦点切换（r4 高3：Enter=复得 / F12=失焦，去重）。
-            let focus_now = shared.app.lock().unwrap_or_else(|e| e.into_inner()).focus;
-            if focus_now == Focus::Terminal {
-                push_focus(shared, &mut termview, true);
-            } else {
-                push_focus(shared, &mut termview, false);
-            }
-            // 宿主光标样式随焦点切换（r5 验收批：终端焦点 = 闪烁块；离开/退出还原
-            // 缺省形状。DECSCUSR 只在切换沿写一次，不逐帧写）。
-            if Some(focus_now) != last_focus {
-                let _ = match focus_now {
-                    Focus::Terminal => execute!(io::stdout(), SetCursorStyle::BlinkingBlock),
-                    _ => execute!(io::stdout(), SetCursorStyle::DefaultUserShape),
-                };
-                last_focus = Some(focus_now);
-            }
-            // 渲染。
-            let now = now_ms();
-            let (status, rates) = {
-                let app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
-                (render::status_line(&app), shared.rates.lock().unwrap_or_else(|e| e.into_inner()).clone())
-            };
-            let phase = shared.leg_phase.lock().unwrap_or_else(|e| e.into_inner()).clone();
-            let mut status = status;
-            if !phase.is_empty() {
-                status.push_str(&format!(" · {phase}"));
-            }
-            let off = termview.as_ref().map(|tv| tv.leg.display_offset()).unwrap_or(0);
-            if off > 0 {
-                status.push_str(&format!(" · 回看中({off})"));
-            }
-            let area_store = &shared.term_area;
-            let app_ref = &mut *shared.app.lock().unwrap_or_else(|e| e.into_inner());
-            let tv = termview.as_mut();
-            if t
-                .draw(|f| {
-                    render::draw(f, app_ref, tv, &status, &rates, now);
-                    *area_store.lock().unwrap_or_else(|e| e.into_inner()) = render::layout(f.area()).2;
-                })
-                .is_err()
-            {
-                break;
-            }
-            // 尺寸变化待发：新 area 落位后下发 RESIZE（r4 中4）。
-            if shared.pending_resize.swap(false, Ordering::SeqCst) {
-                if let Some(tx) = shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()).clone() {
-                    let a = *shared.term_area.lock().unwrap_or_else(|e| e.into_inner());
-                    if a.width > 0 && a.height > 0 {
-                        let _ = tx.send(LegInput::Resize(a.width, a.height));
+                Ok(Pump::Lost) => {
+                    eprintln!("homeway tui：终端输入面失联（EOF/IO 错误）");
+                    break 2;
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                    // 看门狗：fd 恒「可读」而泵 1s 零产出 ⇒ 泵已陷 crossterm EOF 自旋
+                    // （tty 已死——正常路径下字节会被泵立刻吃掉，不会留在线程 fd 上）。
+                    let mut fds = [libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 }];
+                    let readable =
+                        unsafe { libc::poll(fds.as_mut_ptr(), 1, 0) } > 0 && fds[0].revents & libc::POLLIN != 0;
+                    stuck_ticks = if readable { stuck_ticks.saturating_add(1) } else { 0 };
+                    if stuck_ticks >= 10 {
+                        eprintln!("homeway tui：终端输入面失联（EOF 看门狗）");
+                        break 2;
                     }
                 }
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 2,
+            }
+            // —— 渲染心跳以下与事件处理同拍（每 ≤100ms 一轮）——
+            if !ui_tick(shared, stop, &mut t, &mut termview, &mut leg_recv, &mut ui_gen, &mut last_focus) {
+                break 0;
             }
             if stop.stopped() {
-                break;
+                break 0;
             }
-        }
-        0
+        };
+        exit_code
     }));
     // 4.7：任何可捕获退出路径还原终端。
     let code = code.unwrap_or(2);
@@ -1061,6 +894,245 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
         crossterm::style::ResetColor
     );
     code
+}
+
+/// UI 事件分派（输入泵通道消费侧；r5 EOF 自旋修复时从主循环抽出）。
+/// 返回 false = 退出（q / 终端失联路径外的主动退出）。
+fn handle_event(shared: &Arc<Shared>, stop: &StopFlag, termview: &mut Option<TermView>, ev: Event) -> bool {
+    match ev {
+        Event::Key(k) => {
+            let focus = shared.app.lock().unwrap_or_else(|e| e.into_inner()).focus;
+            match route_key(&k, focus) {
+                Route::Passthrough => {
+                    // 首次交互 RESIZE（仅本实例有键入即交互——镜像实例无键入，r2 N-4）。
+                    if let Some(tv) = termview.as_mut() {
+                        let tx = shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                        if let Some(tx) = tx {
+                            if !tv.interacted {
+                                tv.interacted = true;
+                                let a = *shared.term_area.lock().unwrap_or_else(|e| e.into_inner());
+                                if a.width > 0 && a.height > 0 {
+                                    let _ = tx.send(LegInput::Resize(a.width, a.height));
+                                }
+                            }
+                            if k.kind == KeyEventKind::Press || k.kind == KeyEventKind::Repeat {
+                                if let Some(bytes) = input::encode_key_event(&k, tv.leg.vt()) {
+                                    let _ = tx.send(LegInput::Data(bytes));
+                                }
+                            }
+                        }
+                    }
+                }
+                Route::Panel(cmd) => {
+                    let quit = {
+                        let mut app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
+                        match cmd {
+                            PanelCmd::Quit => true,
+                            other => app.apply_panel(other),
+                        }
+                    };
+                    if quit {
+                        stop.stop();
+                        return false;
+                    }
+                    // 用户发起 ⇒ 持久化 + 立即重取列表（重挂腿由收敛块接管，r4 高1）。
+                    {
+                        let app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
+                        shared.persist_selection(&app);
+                    }
+                    list_beat(shared);
+                }
+            }
+        }
+        Event::Mouse(m) => {
+            // 鼠标归属：终端焦点 + 会话启用上报 ⇒ 编码转发；否则面板点击。
+            let (focus, tracking) = {
+                let app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
+                (app.focus, termview.as_ref().map(|tv| tv.leg.modes().mouse_tracking()).unwrap_or(false))
+            };
+            if focus == Focus::Terminal && tracking {
+                if let Some(tv) = termview.as_mut() {
+                    let tx = shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    let pane = *shared.term_area.lock().unwrap_or_else(|e| e.into_inner());
+                    if let (Some(tx), Some(ev)) = (tx, input::encode_mouse_event(&m, pane, tv.leg.vt())) {
+                        let _ = tx.send(LegInput::Data(ev));
+                    }
+                }
+            } else if focus == Focus::Terminal
+                && matches!(m.kind, MouseEventKind::ScrollUp | MouseEventKind::ScrollDown)
+            {
+                // 滚轮回看（tasks 4.8）：会话未启用上报 ⇒ 面板内回看（spec 需求 4）。
+                if let Some(tv) = termview.as_mut() {
+                    match m.kind {
+                        MouseEventKind::ScrollUp => tv.leg.scroll_display(3),
+                        _ => tv.leg.scroll_display(-3),
+                    }
+                }
+            } else if let MouseEventKind::Down(CMouse::Left) = m.kind {
+                if click_select(shared, m.column, m.row) {
+                    {
+                        let app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
+                        shared.persist_selection(&app);
+                    }
+                    list_beat(shared);
+                }
+            }
+        }
+        Event::Paste(text) => {
+            let focus = shared.app.lock().unwrap_or_else(|e| e.into_inner()).focus;
+            if focus == Focus::Terminal {
+                if let Some(tv) = termview.as_mut() {
+                    let tx = shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    if let Some(tx) = tx {
+                        for bytes in input::encode_paste_fragments(&text, tv.leg.vt()).unwrap_or_default() {
+                            let _ = tx.send(LegInput::Data(bytes));
+                        }
+                    }
+                }
+            }
+        }
+        Event::FocusGained | Event::FocusLost => {
+            // 外层 1004：活动态判据 + 终端焦点下按会话位注入（design D7）。
+            let gained = matches!(ev, Event::FocusGained);
+            *shared.outer_focus.lock().unwrap_or_else(|e| e.into_inner()) = Some(gained);
+            let focus = shared.app.lock().unwrap_or_else(|e| e.into_inner()).focus;
+            if focus == Focus::Terminal {
+                if let Some(tv) = termview.as_mut() {
+                    let tx = shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                    if let (Some(tx), Some(bytes)) = (tx, input::encode_focus(gained, tv.leg.vt())) {
+                        let _ = tx.send(LegInput::Data(bytes));
+                    }
+                }
+            }
+        }
+        Event::Resize(_, _) => {
+            // r4 中4：pane 尺寸变化不再丢弃——置旗，画后（新 area 落位）下发。
+            if { shared.app.lock().unwrap_or_else(|e| e.into_inner()).focus } == Focus::Terminal {
+                shared.pending_resize.store(true, Ordering::SeqCst);
+            }
+        }
+    }
+    true
+}
+
+/// 渲染心跳拍（每 ≤100ms 一轮）：挂腿收敛 / 世代接管 / 帧合流 / 焦点与光标样式 /
+/// 绘制 / RESIZE 待发。返回 false = draw 失败（终端面坏）⇒ 退出。
+#[allow(clippy::too_many_arguments)]
+fn ui_tick(
+    shared: &Arc<Shared>,
+    stop: &StopFlag,
+    t: &mut Terminal<CrosstermBackend<std::io::Stdout>>,
+    termview: &mut Option<TermView>,
+    leg_recv: &mut Option<RecvHalf>,
+    ui_gen: &mut u64,
+    last_focus: &mut Option<Focus>,
+) -> bool {
+    // 挂腿状态收敛（r4 高1）：期望目标 ≠ 已挂目标 ⇒ 重挂——覆盖冷启动、
+    // 恢复、回落链换目标、镜像全部路径（不再依赖「选中变化」事件触发）。
+    let desired = {
+        let app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
+        app.selected_host
+            .clone()
+            .zip(app.sessions.selected().map(|s| s.to_owned()))
+    };
+    {
+        let mut attached = shared.attached.lock().unwrap_or_else(|e| e.into_inner());
+        if *attached != desired {
+            if desired.is_some() {
+                spawn_leg(shared, stop);
+            } else {
+                shared.leg_reset("未选中会话");
+            }
+            *attached = desired;
+        }
+    }
+    // 腿世代推进（用户切换/镜像）⇒ 接手新通道 + 重建终端视图。
+    let gen = shared.leg_gen_now();
+    if gen != *ui_gen {
+        *ui_gen = gen;
+        if let Some(r) = shared.leg_recv.lock().unwrap_or_else(|e| e.into_inner()).take() {
+            *leg_recv = Some(r);
+        }
+        let dims = {
+            let app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
+            app.sessions
+                .sessions()
+                .iter()
+                .find(|s| Some(s.name.as_str()) == app.sessions.selected())
+                .map(|s| (s.cols, s.rows))
+                .unwrap_or((80, 24))
+        };
+        *termview = TermView::new(dims.0, dims.1).ok();
+    }
+    // 腿帧 drain → 内嵌模拟器（合帧：丢渲染拍不丢字节）。
+    if let (Some(tv), Some(rh)) = (termview.as_mut(), leg_recv.as_ref()) {
+        for msg in rh.drain() {
+            match msg {
+                LegMsg::Frame(b) => {
+                    if let Some(f) = decode_frame(&b) {
+                        tv.leg.on_frame(&f);
+                    }
+                }
+                LegMsg::Gone { reason } => {
+                    // r4 中3：终结原因消费到相位显示（此前十处写零消费）。
+                    *shared.leg_phase.lock().unwrap_or_else(|e| e.into_inner()) = reason;
+                }
+            }
+        }
+    }
+    // 会话焦点跟随面板焦点切换（r4 高3：Enter=复得 / F12=失焦，去重）。
+    let focus_now = shared.app.lock().unwrap_or_else(|e| e.into_inner()).focus;
+    if focus_now == Focus::Terminal {
+        push_focus(shared, termview, true);
+    } else {
+        push_focus(shared, termview, false);
+    }
+    // 宿主光标样式随焦点切换（r5 验收批：终端焦点 = 闪烁块；离开/退出还原
+    // 缺省形状。DECSCUSR 只在切换沿写一次，不逐帧写）。
+    if Some(focus_now) != *last_focus {
+        let _ = match focus_now {
+            Focus::Terminal => execute!(io::stdout(), SetCursorStyle::BlinkingBlock),
+            _ => execute!(io::stdout(), SetCursorStyle::DefaultUserShape),
+        };
+        *last_focus = Some(focus_now);
+    }
+    // 渲染。
+    let now = now_ms();
+    let (status, rates) = {
+        let app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
+        (render::status_line(&app), shared.rates.lock().unwrap_or_else(|e| e.into_inner()).clone())
+    };
+    let phase = shared.leg_phase.lock().unwrap_or_else(|e| e.into_inner()).clone();
+    let mut status = status;
+    if !phase.is_empty() {
+        status.push_str(&format!(" · {phase}"));
+    }
+    let off = termview.as_ref().map(|tv| tv.leg.display_offset()).unwrap_or(0);
+    if off > 0 {
+        status.push_str(&format!(" · 回看中({off})"));
+    }
+    let area_store = &shared.term_area;
+    let app_ref = &mut *shared.app.lock().unwrap_or_else(|e| e.into_inner());
+    let tv = termview.as_mut();
+    if t
+        .draw(|f| {
+            render::draw(f, app_ref, tv, &status, &rates, now);
+            *area_store.lock().unwrap_or_else(|e| e.into_inner()) = render::layout(f.area()).2;
+        })
+        .is_err()
+    {
+        return false;
+    }
+    // 尺寸变化待发：新 area 落位后下发 RESIZE（r4 中4）。
+    if shared.pending_resize.swap(false, Ordering::SeqCst) {
+        if let Some(tx) = shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+            let a = *shared.term_area.lock().unwrap_or_else(|e| e.into_inner());
+            if a.width > 0 && a.height > 0 {
+                let _ = tx.send(LegInput::Resize(a.width, a.height));
+            }
+        }
+    }
+    true
 }
 
 /// 会话焦点注入（r4 高3）：按会话 1004 位编码，**按最后注入态去重**——
