@@ -21,7 +21,7 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{
     self, DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
-    EnableFocusChange, EnableMouseCapture, Event, KeyEventKind, MouseButton as CMouse,
+    EnableFocusChange, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton as CMouse,
     MouseEventKind,
 };
 use crossterm::cursor::SetCursorStyle;
@@ -401,7 +401,7 @@ fn attach_and_read(
             for msg in in_rx {
                 let (op, payload) = input_frame(&msg);
                 if write_half.write_frame(op, &payload).is_err() || stop_w.stopped() {
-                    let _ = closer_w.close();
+                    closer_w.close();
                     break;
                 }
             }
@@ -797,6 +797,8 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
     let mut ui_gen = shared.leg_gen_now();
     // 宿主光标样式切换沿（终端焦点 ↔ 面板）——DECSCUSR 只在沿上写。
     let mut last_focus: Option<Focus> = None;
+    // ` +` 输入浮层（主机 token / 会话名）。
+    let mut input: Option<InputState> = None;
 
     let mut out = io::stdout();
     if execute!(out, terminal::EnterAlternateScreen).is_err() {
@@ -862,7 +864,7 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
                 Ok(Pump::Ev(ev)) => {
                     stuck_ticks = 0;
                     shared.mark_input();
-                    if !handle_event(shared, stop, &mut termview, ev) {
+                    if !handle_event(shared, stop, &mut termview, &mut input, ev) {
                         break 0i32;
                     }
                 }
@@ -885,7 +887,7 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 2,
             }
             // —— 渲染心跳以下与事件处理同拍（每 ≤100ms 一轮）——
-            if !ui_tick(shared, stop, &mut t, &mut termview, &mut leg_recv, &mut ui_gen, &mut last_focus) {
+            if !ui_tick(shared, stop, &mut t, &mut termview, &mut leg_recv, &mut ui_gen, &mut last_focus, &input) {
                 break 0;
             }
             if stop.stopped() {
@@ -911,20 +913,58 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
 
 /// UI 事件分派（输入泵通道消费侧；r5 EOF 自旋修复时从主循环抽出）。
 /// 返回 false = 退出（q / 终端失联路径外的主动退出）。
-fn handle_event(shared: &Arc<Shared>, stop: &StopFlag, termview: &mut Option<TermView>, ev: Event) -> bool {
+fn handle_event(
+    shared: &Arc<Shared>,
+    stop: &StopFlag,
+    termview: &mut Option<TermView>,
+    input: &mut Option<InputState>,
+    ev: Event,
+) -> bool {
     match ev {
         Event::Key(k) => {
+            // 输入浮层激活时独占键盘：Enter 提交 / Esc 取消 / Backspace 删除 / 字符入缓冲。
+            if input.is_some() {
+                if k.kind == KeyEventKind::Press || k.kind == KeyEventKind::Repeat {
+                    let state = input.as_mut().expect("已判活");
+                    match k.code {
+                        KeyCode::Esc => *input = None,
+                        KeyCode::Enter => {
+                            let kind = state.kind;
+                            let res = match kind {
+                                InputKind::Host => submit_host_add(shared, &state.buffer),
+                                InputKind::Session => submit_session_create(shared, &state.buffer),
+                            };
+                            match res {
+                                Ok(()) => {
+                                    *input = None;
+                                    list_beat(shared);
+                                }
+                                Err(e) => state.error = Some(e),
+                            }
+                        }
+                        KeyCode::Backspace => {
+                            state.buffer.pop();
+                            state.error = None;
+                        }
+                        KeyCode::Char(c) => {
+                            state.buffer.push(c);
+                            state.error = None;
+                        }
+                        _ => {}
+                    }
+                }
+                return true;
+            }
             let focus = shared.app.lock().unwrap_or_else(|e| e.into_inner()).focus;
             match route_key(&k, focus) {
                 Route::Passthrough => {
                     // RESIZE 随窗口跟随（r5 实录）：首次交互必发（仅交互实例，镜像
                     // 实例无键入永不发——r2 N-4）；其后 pane 尺寸 ≠ 已发尺寸即重发
-                    // （覆盖「面板焦点改窗 → 回同一会话」——世代未变、interacted 已
-                    // 置位，此前永远不再发 ⇒ 会话几何冻结在旧尺寸）。
+                    // （覆盖「面板焦点改窗 → 回同一会话」）。尺寸 = 标题栏之下内容区。
                     if let Some(tv) = termview.as_mut() {
                         let tx = shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()).clone();
                         if let Some(tx) = tx {
-                            let a = *shared.term_area.lock().unwrap_or_else(|e| e.into_inner());
+                            let a = super::render::term_content_of(*shared.term_area.lock().unwrap_or_else(|e| e.into_inner()));
                             let size = (a.width, a.height);
                             let fresh = !tv.interacted;
                             let follow = tv.interacted
@@ -968,11 +1008,11 @@ fn handle_event(shared: &Arc<Shared>, stop: &StopFlag, termview: &mut Option<Ter
                         }
                         list_beat(shared);
                     }
-                    // 进入终端焦点：交互实例把当前 pane 尺寸同步给会话（r5 实录——
+                    // 进入终端焦点：交互实例把当前内容区尺寸同步给会话（r5 实录——
                     // 面板焦点期间改窗口后 Enter，此前无任何路径补发 RESIZE）。
                     if shared.app.lock().unwrap_or_else(|e| e.into_inner()).focus == Focus::Terminal {
                         if let Some(tv) = termview.as_mut() {
-                            let a = *shared.term_area.lock().unwrap_or_else(|e| e.into_inner());
+                            let a = super::render::term_content_of(*shared.term_area.lock().unwrap_or_else(|e| e.into_inner()));
                             let size = (a.width, a.height);
                             if tv.interacted && tv.last_sent != Some(size) && a.width > 0 && a.height > 0 {
                                 if let Some(tx) = shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()).clone() {
@@ -1010,12 +1050,37 @@ fn handle_event(shared: &Arc<Shared>, stop: &StopFlag, termview: &mut Option<Ter
                     }
                 }
             } else if let MouseEventKind::Down(CMouse::Left) = m.kind {
-                if click_select(shared, m.column, m.row) {
-                    {
-                        let app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
-                        shared.persist_selection(&app);
+                match click_select(shared, m.column, m.row) {
+                    ClickOutcome::SelectionChanged => {
+                        {
+                            let app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
+                            shared.persist_selection(&app);
+                        }
+                        list_beat(shared);
                     }
-                    list_beat(shared);
+                    ClickOutcome::Detach => {
+                        // 终端标题栏 ✕：断开观察当前会话（非破坏——不删会话）。
+                        // 清会话选中 ⇒ desired=None ⇒ 收敛块收腿，pane 回引导态。
+                        let mut app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
+                        app.sessions = SessionListModel::default();
+                        app.session_cursor = 0;
+                        app.focus = Focus::Panel;
+                    }
+                    ClickOutcome::OpenHostInput => {
+                        *input = Some(InputState {
+                            kind: InputKind::Host,
+                            buffer: String::new(),
+                            error: None,
+                        });
+                    }
+                    ClickOutcome::OpenSessionInput => {
+                        *input = Some(InputState {
+                            kind: InputKind::Session,
+                            buffer: String::new(),
+                            error: None,
+                        });
+                    }
+                    ClickOutcome::None => {}
                 }
             }
         }
@@ -1067,6 +1132,7 @@ fn ui_tick(
     leg_recv: &mut Option<RecvHalf>,
     ui_gen: &mut u64,
     last_focus: &mut Option<Focus>,
+    input: &Option<InputState>,
 ) -> bool {
     // 挂腿状态收敛（r4 高1）：期望目标 ≠ 已挂目标 ⇒ 重挂——覆盖冷启动、
     // 恢复、回落链换目标、镜像全部路径（不再依赖「选中变化」事件触发）。
@@ -1157,17 +1223,18 @@ fn ui_tick(
     let tv = termview.as_mut();
     if t
         .draw(|f| {
-            render::draw(f, app_ref, tv, &status, &rates, now);
-            *area_store.lock().unwrap_or_else(|e| e.into_inner()) = render::layout(f.area()).2;
+            let overlay = input.as_ref().map(|s| s.overlay());
+            render::draw(f, app_ref, tv, &status, &rates, now, overlay.as_ref());
+            *area_store.lock().unwrap_or_else(|e| e.into_inner()) = f.area();
         })
         .is_err()
     {
         return false;
     }
-    // 尺寸变化待发：新 area 落位后下发 RESIZE（r4 中4）。
+    // 尺寸变化待发：新 area 落位后下发 RESIZE（r4 中4）——尺寸取标题栏之下内容区。
     if shared.pending_resize.swap(false, Ordering::SeqCst) {
         if let Some(tx) = shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()).clone() {
-            let a = *shared.term_area.lock().unwrap_or_else(|e| e.into_inner());
+            let a = super::render::term_content_of(*shared.term_area.lock().unwrap_or_else(|e| e.into_inner()));
             if a.width > 0 && a.height > 0 {
                 let _ = tx.send(LegInput::Resize(a.width, a.height));
                 if let Some(tv) = termview.as_mut() {
@@ -1199,33 +1266,146 @@ fn push_focus(shared: &Shared, termview: &mut Option<TermView>, gained: bool) {
     }
 }
 
-/// 面板点击选中（命中测试：主机区/会话区行）。返回是否改变选中。
-fn click_select(shared: &Arc<Shared>, col: u16, row: u16) -> bool {
+/// 鼠标点击命中结果。
+#[derive(Debug, PartialEq, Eq)]
+enum ClickOutcome {
+    None,
+    SelectionChanged,
+    /// 终端标题栏 ✕：断开观察当前会话。
+    Detach,
+    OpenHostInput,
+    OpenSessionInput,
+}
+
+/// 鼠标点击命中（按钮优先：✕/＋；其次两行条目：体行号 ÷3）。
+fn click_select(shared: &Arc<Shared>, col: u16, row: u16) -> ClickOutcome {
     let area = *shared.term_area.lock().unwrap_or_else(|e| e.into_inner());
-    let (hosts_a, sess_a, _, _) = render::layout(area);
+    let regions = render::layout(area);
+    let zones = render::hit_zones(area);
+    if zones.term_close.contains((col, row).into()) {
+        let app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
+        return if app.sessions.selected().is_some() {
+            ClickOutcome::Detach
+        } else {
+            ClickOutcome::None
+        };
+    }
+    if zones.host_plus.contains((col, row).into()) {
+        return ClickOutcome::OpenHostInput;
+    }
+    if zones.sess_plus.contains((col, row).into()) {
+        return ClickOutcome::OpenSessionInput;
+    }
     let mut app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
-    if hosts_a.contains((col, row).into()) {
-        // 两行条目（r5 验收批）：● 名称行 + 副标题行 ⇒ 行号除 2 得条目下标。
-        let idx = (row.saturating_sub(hosts_a.y + 1) / 2) as usize;
-        let hosts = app.display_hosts();
-        if let Some(h) = hosts.get(idx) {
-            if app.selected_host.as_deref() != Some(h.id.as_str()) {
-                app.selected_host = Some(h.id.clone());
-                app.host_cursor = idx;
-                app.sessions = SessionListModel::default();
-                app.session_cursor = 0;
-                return true;
+    if regions.hosts.contains((col, row).into()) {
+        let body = render::section_body(regions.hosts);
+        if !body.is_empty() && row >= body.y {
+            let idx = ((row - body.y) / 3) as usize;
+            if let Some(h) = app.display_hosts().get(idx) {
+                if app.selected_host.as_deref() != Some(h.id.as_str()) {
+                    app.selected_host = Some(h.id.clone());
+                    app.host_cursor = idx;
+                    app.sessions = SessionListModel::default();
+                    app.session_cursor = 0;
+                    return ClickOutcome::SelectionChanged;
+                }
             }
         }
-        return false;
+        return ClickOutcome::None;
     }
-    if sess_a.contains((col, row).into()) {
-        let idx = row.saturating_sub(sess_a.y + 1) as usize;
-        app.session_cursor = idx;
-        if let Some(s) = app.sessions.sessions().get(idx) {
-            let name = s.name.clone();
-            return app.sessions.select(&name);
+    if regions.sessions.contains((col, row).into()) {
+        let body = render::section_body(regions.sessions);
+        if !body.is_empty() && row >= body.y {
+            let idx = ((row - body.y) / 3) as usize;
+            app.session_cursor = idx;
+            if let Some(s) = app.sessions.sessions().get(idx) {
+                let name = s.name.clone();
+                return if app.sessions.select(&name) {
+                    ClickOutcome::SelectionChanged
+                } else {
+                    ClickOutcome::None
+                };
+            }
         }
     }
-    false
+    ClickOutcome::None
+}
+
+/// ` +` 输入浮层状态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InputKind {
+    Host,
+    Session,
+}
+
+#[derive(Debug, Clone)]
+struct InputState {
+    kind: InputKind,
+    buffer: String,
+    error: Option<String>,
+}
+
+impl InputState {
+    fn label(&self) -> &'static str {
+        match self.kind {
+            InputKind::Host => "+ 主机 token（hmw2…）:",
+            InputKind::Session => "+ 会话名:",
+        }
+    }
+
+    fn overlay(&self) -> render::Overlay {
+        render::Overlay {
+            label: self.label().to_owned(),
+            buffer: self.buffer.clone(),
+            error: self.error.clone(),
+        }
+    }
+}
+
+/// + 主机：本地 token 语法校验前置（与 CLI 同口径）→ 控制面 host.add。
+fn submit_host_add(shared: &Arc<Shared>, raw: &str) -> Result<(), String> {
+    let token = raw.trim().to_owned();
+    if let Err(e) = homeway_core::token::decode(&token) {
+        return Err(format!("token 非法：{}", e.user_message()));
+    }
+    let sock = shared.state_dir.join("control.sock");
+    let (c, _) = ControlClient::dial(&sock, "tui", "host-add")
+        .map_err(|e| format!("控制面连接失败：{e}"))?;
+    c.request(
+        homeway_core::daemon::vocab::OpName::HostAdd.as_str(),
+        Some(serde_json::json!({
+            "token": token,
+            "name": serde_json::Value::Null,
+            "force": false,
+        })),
+        std::time::Duration::from_secs(10),
+    )
+    .map(|_| ())
+    .map_err(|e| format!("host.add：{}", crate::daemon_cli::op_err_text(&e)))
+}
+
+/// + 会话：名字校验（CLI 同口径）→ term CREATE op（不接入，-d 语义）。
+fn submit_session_create(shared: &Arc<Shared>, raw: &str) -> Result<(), String> {
+    let name = raw.trim();
+    crate::term_cli::validate_name(name)?;
+    let serve_dir = shared.state_dir.join("serve");
+    let (mut conn, _) = crate::term_cli::dial_term_conn_impl(&serve_dir, None, true)
+        .map_err(|e| format!("term 连接失败：{e}"))?;
+    if let Err(e) = conn.write_frame(Op::CREATE, &frames::enc_create(0, name)) {
+        conn.close();
+        return Err(format!("CREATE：{}", e.message(name)));
+    }
+    let f = match conn.read_frame() {
+        Ok(f) => f,
+        Err(e) => {
+            conn.close();
+            return Err(format!("CREATE 应答：{}", e.message(name)));
+        }
+    };
+    conn.close();
+    if f.op == Op::ERROR {
+        let (code, msg) = frames::dec_error(&f.payload).unwrap_or_default();
+        return Err(format!("{code} {msg}"));
+    }
+    Ok(())
 }

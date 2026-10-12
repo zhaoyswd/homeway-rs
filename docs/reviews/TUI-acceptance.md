@@ -95,6 +95,21 @@
   消失、相位无提示）。修复 = 写者持 closer 副本，写失败主动收口 ⇒ 读循环立即退出进入
   判定重拨（自愈 + 相位可见）。现场时间线：14:39 用户三次切换（work→demo→work），
   14:39:28 的 demo 腿即泄漏腿。
+- 2026-10-12　UI 改造批（用户需求：**向 herdr 视觉对齐**，参照 `~/herdr-study/herdr`
+  的 sidebar/panes 实现）：①**无边框区块**替换 Block 边框盒——小标题 ` 主机`/` 会话`
+  （overlay0+BOLD，herdr ` spaces`/` agents` 同款）+ 标题右侧 ` +` 按钮 +
+  区块间 `─` 分隔线（surface_dim）；②**整行底色选中**（selection_bg 49,50,68）替换
+  反白高亮；③**会话列表两行化**（`● 会话名` + `徽章 · 标题`，徽章状态色
+  working=yellow/blocked=red/idle=green）+ 主机/会话条目均带 gap 空行；④**终端 pane
+  标题栏**（聚焦 = accent+BOLD，herdr pane title 同款）显示会话名与标题 + 右侧 ` ✕`
+  （点击 = 断开观察当前会话，非破坏——清选中回引导态，不删会话）；⑤**主题 token 模块**
+  `theme.rs`（herdr `Palette::catppuccin()` 同源色值钉）；⑥**` +` 真实可用**：点击弹
+  输入浮层（selection_bg 行）——主机 + = token 校验（`token::decode` 前置）→ 控制面
+  `host.add`；会话 + = `validate_name` → term CREATE op（-d 语义）；Enter 提交 /
+  Esc 取消 / 失败红字留在浮层。⑦命中区 `hit_zones()` 纯布局函数（点击与绘制同源）；
+  `term_area` 存全屏区域（点击布局基准），RESIZE 位点经 `term_content_of` 派生内容区。
+  探针实证：合成 SGR 鼠标点击 + → 浮层 → 键入 → 会话真实创建；非法 token 报错红字；
+  Esc 取消。71 用例绿 clippy 零告警。
 - 2026-10-12　5.1 手测发现（第四轮，**高危**）：**「work 会话敲命令回车无反应、命令消失」
   真因 = TUI 进程 tty 死亡后 100% CPU 永久自旋**——crossterm 0.29 `try_read` 内圈在
   `read` 返回 `Ok(0)`（EOF）或非 WouldBlock 错误时既不 break 也不返回（源码实证），

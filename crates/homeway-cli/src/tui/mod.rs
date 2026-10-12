@@ -10,6 +10,7 @@ pub(crate) mod app;
 pub(crate) mod backend;
 pub(crate) mod render;
 pub(crate) mod runtime;
+pub(crate) mod theme;
 pub(crate) mod termview;
 pub(crate) mod chan;
 pub(crate) mod hosts;
