@@ -126,17 +126,17 @@ fn stream_open_err_text(e: &homeway_core::daemon::proto::OpError) -> String {
 }
 
 /// 拨号目标：本地面（连 `<state>/term.sock`）或远端（--host 经控制面）。
-pub(crate) struct TermTarget {
-    pub(crate) state_dir: PathBuf,
-    pub(crate) host_ref: String,
-    pub(crate) host_id: Option<String>,
-    pub(crate) timeout: Duration,
+struct TermTarget {
+    state_dir: PathBuf,
+    host_ref: String,
+    host_id: Option<String>,
+    timeout: Duration,
     /// 守护未跑时不按需拉起（Go FIX-57 共享位；D-1 评审补齐）。
-    pub(crate) no_spawn: bool,
+    no_spawn: bool,
 }
 
 impl TermTarget {
-    pub(crate) fn remote(&self) -> bool {
+    fn remote(&self) -> bool {
         !self.host_ref.is_empty()
     }
 }
@@ -147,7 +147,7 @@ impl TermTarget {
 
 /// 远程流终结的三态（Go streamend.Error/RemoteEndError 同义：closed|gone|conn）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) struct RemoteEndError {
+struct RemoteEndError {
     reason: String,
 }
 
@@ -185,7 +185,7 @@ fn pull_remote_frame(st: &Arc<ClientStream>, buf: &mut Vec<u8>) -> Result<frames
     }
 }
 
-pub(crate) enum TermConn {
+enum TermConn {
     Local(FrameIo),
     Remote {
         client: Arc<ControlClient>,
@@ -195,14 +195,14 @@ pub(crate) enum TermConn {
 }
 
 /// 读帧错误的两类面：IO 失败 / 远程流终结（三态）。
-pub(crate) enum TermReadErr {
+enum TermReadErr {
     Io(String),
     Ended(RemoteEndError),
 }
 
 impl TermReadErr {
     /// 归因文案（远程面三态；本地面断链单一文案）。
-    pub(crate) fn message(&self, name: &str) -> String {
+    fn message(&self, name: &str) -> String {
         match self {
             TermReadErr::Ended(e) => remote_end_message(name, &e.reason),
             TermReadErr::Io(e) => {
@@ -213,12 +213,12 @@ impl TermReadErr {
 }
 
 /// 读/写两半（attach 主循环形态：读腿线程 + 主线程写；本地面经 UDS 克隆共享 socket）。
-pub(crate) enum TermReadHalf {
+enum TermReadHalf {
     Local(FrameIo),
     Remote { st: Arc<ClientStream>, buf: Vec<u8> },
 }
 
-pub(crate) enum TermWriteHalf {
+enum TermWriteHalf {
     Local(FrameIo),
     Remote { client: Arc<ControlClient>, st: Arc<ClientStream> },
 }
@@ -229,7 +229,7 @@ impl TermConn {
         TermReadErr::Ended(RemoteEndError { reason })
     }
 
-    pub(crate) fn write_frame(&mut self, op: Op, payload: &[u8]) -> Result<(), TermReadErr> {
+    fn write_frame(&mut self, op: Op, payload: &[u8]) -> Result<(), TermReadErr> {
         match self {
             TermConn::Local(io) => io
                 .write_frame(op, payload, Duration::from_secs(30))
@@ -243,7 +243,7 @@ impl TermConn {
         }
     }
 
-    pub(crate) fn read_frame(&mut self) -> Result<frames::Frame, TermReadErr> {
+    fn read_frame(&mut self) -> Result<frames::Frame, TermReadErr> {
         match self {
             TermConn::Local(io) => io.read_frame().map_err(|e| TermReadErr::Io(e.to_string())),
             TermConn::Remote { st, buf, .. } => pull_remote_frame(st, buf),
@@ -252,7 +252,7 @@ impl TermConn {
 
     /// 收口（Go streamConn.Close 的死锁序：先 Client.Close〔唯一可靠逃生口——closed
     /// 解阻塞读腿的阻塞投递〕，stream.close 尽力而为、错误忽略；本地面直接关）。
-    pub(crate) fn close(&mut self) {
+    fn close(&mut self) {
         match self {
             TermConn::Local(io) => {
                 if let Ok(clone) = io.try_clone_stream() {
@@ -264,7 +264,7 @@ impl TermConn {
     }
 
     /// 分读/写两半（attach 主循环形态）。
-    pub(crate) fn split(self) -> Result<(TermReadHalf, TermWriteHalf), String> {
+    fn split(self) -> Result<(TermReadHalf, TermWriteHalf), String> {
         match self {
             TermConn::Local(io) => {
                 let clone = io
@@ -284,54 +284,8 @@ impl TermConn {
     }
 }
 
-/// 连接收口句柄（split 后保留的逃生口——Remote 面的可靠读解阻塞 + Local 面的 shutdown）。
-pub(crate) enum TermCloser {
-    Remote(Arc<ControlClient>),
-    Local(std::os::unix::net::UnixStream),
-    /// 无可收口（try_clone 失败等）——显式占位，**禁止**用 /dev/null 连接兜底
-    ///（ENOTSOCK 必 panic，r4 高5）。
-    Noop,
-}
-
-impl TermCloser {
-    pub(crate) fn close(&self) {
-        match self {
-            TermCloser::Remote(c) => c.close(),
-            TermCloser::Local(s) => {
-                let _ = s.shutdown(std::net::Shutdown::Both);
-            }
-            TermCloser::Noop => {}
-        }
-    }
-
-    /// 复制句柄（Shared 注册与本地并用两份；Local 走 fd 复制，失败降级 Noop）。
-    pub(crate) fn duplicate(&self) -> TermCloser {
-        match self {
-            TermCloser::Remote(c) => TermCloser::Remote(Arc::clone(c)),
-            TermCloser::Local(s) => match s.try_clone() {
-                Ok(s2) => TermCloser::Local(s2),
-                Err(_) => TermCloser::Noop,
-            },
-            TermCloser::Noop => TermCloser::Noop,
-        }
-    }
-}
-
-impl TermConn {
-    /// split 前取收口句柄（conn 被 split 消费后仍可强制收口）。
-    pub(crate) fn closer(&self) -> TermCloser {
-        match self {
-            TermConn::Remote { client, .. } => TermCloser::Remote(Arc::clone(client)),
-            TermConn::Local(io) => match io.try_clone_stream() {
-                Ok(s) => TermCloser::Local(s),
-                Err(_) => TermCloser::Noop,
-            },
-        }
-    }
-}
-
 impl TermReadHalf {
-    pub(crate) fn read_frame(&mut self) -> Result<frames::Frame, TermReadErr> {
+    fn read_frame(&mut self) -> Result<frames::Frame, TermReadErr> {
         match self {
             TermReadHalf::Local(io) => io.read_frame().map_err(|e| TermReadErr::Io(e.to_string())),
             TermReadHalf::Remote { st, buf } => pull_remote_frame(st, buf),
@@ -340,7 +294,7 @@ impl TermReadHalf {
 }
 
 impl TermWriteHalf {
-    pub(crate) fn write_frame(&mut self, op: Op, payload: &[u8]) -> Result<(), TermReadErr> {
+    fn write_frame(&mut self, op: Op, payload: &[u8]) -> Result<(), TermReadErr> {
         match self {
             TermWriteHalf::Local(io) => io
                 .write_frame(op, payload, Duration::from_secs(30))
@@ -369,28 +323,9 @@ impl TermWriteHalf {
     }
 }
 
-/// TUI backend 共用拨号缝：直接给定 state 目录与 host_ref（绕开 parse_term_args）。
-/// 远端 = 控制面 stream.open（state_dir = 统一 state 根）；本机 = serve/term.sock
-/// （state_dir = `<state>/serve` 子目录——两处目录语义差异见 r1 D-14）。
-#[allow(dead_code)] // 消费方 = tui backend 的 list_once（app 主循环接线后进入活跃面）
-pub(crate) fn dial_term_conn_impl(
-    state_dir: &std::path::Path,
-    host_ref: Option<&str>,
-    no_spawn: bool,
-) -> Result<(TermConn, u32), String> {
-    let mut t = TermTarget {
-        state_dir: state_dir.to_owned(),
-        host_ref: host_ref.unwrap_or("").to_owned(),
-        host_id: None,
-        timeout: Duration::from_secs(10),
-        no_spawn,
-    };
-    dial_term(&mut t)
-}
-
 /// 拨号并读 GREETING（list/new/delete/attach/explain 共用的唯一拨号缝）。
 /// 返回出口声明的 features 位（attach 的版本声明位由它决定，FIX-29）。
-pub(crate) fn dial_term(t: &mut TermTarget) -> Result<(TermConn, u32), String> {
+fn dial_term(t: &mut TermTarget) -> Result<(TermConn, u32), String> {
     let conn = if t.remote() {
         let id = match &t.host_id {
             Some(id) => id.clone(),
@@ -676,7 +611,7 @@ fn parse_term_args(
     Ok(out)
 }
 
-pub(crate) fn validate_name(name: &str) -> Result<(), String> {
+fn validate_name(name: &str) -> Result<(), String> {
     let ok = !name.is_empty()
         && name.len() <= 64
         && name
@@ -787,7 +722,7 @@ fn print_sessions(entries: &[SessionInfo]) {
 }
 
 /// 一锤子往返：发一帧、读应答；ERROR 帧翻协议错误文案。
-pub(crate) fn round_trip(conn: &mut TermConn, op: Op, payload: &[u8]) -> Result<Vec<u8>, String> {
+fn round_trip(conn: &mut TermConn, op: Op, payload: &[u8]) -> Result<Vec<u8>, String> {
     conn.write_frame(op, payload).map_err(|e| e.message("?"))?;
     let f = conn.read_frame().map_err(|e| e.message("?"))?;
     if f.op == Op::ERROR {
@@ -1212,7 +1147,7 @@ fn osc_reply_end(b: &[u8]) -> Option<(usize, usize)> {
 
 /// 客户端实例标识：主机名 + uid + tty 设备路径的短哈希（同一终端重跑 ⇒ 同一标识
 /// ⇒ 重连替换自身旧腿、不被自己的旧腿锁在腿数上限外；无 tty 退化为每进程随机）。
-pub(crate) fn client_id() -> String {
+fn client_id() -> String {
     let tty_path = tty_name();
     if tty_path.is_empty() {
         let mut b = [0u8; 4];

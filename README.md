@@ -94,26 +94,6 @@ tools/ci-local.sh
 token 是**凭证**：不内置、不进仓库、不随包分发（客户端 token 前缀 **`hmw2`**〔M5 起段容器；
 存量 `hmw1` 一律失效〕；中继凭据前缀 `rl1`）。
 
-## TUI 面板（桌面终端工作台）
-
-`homeway tui` 是跑在终端里的四区面板：左上主机列表（含本机）/ 左下会话列表（agent 徽章）/
-右侧可交互终端视图 / 底部状态行（形态-延迟-流量）；多实例同显（选中状态经本机文件镜像）。
-需求与进度真源 = openspec 变更 `add-tui-panel`（归档后 `openspec/specs/tui-panel/`）。
-
-```bash
-# 面板的主机/状态面走 control.sock —— 前置是统一进程（零参，control+serve 一体），不是裸 serve
-target/release/homeway-cli --state /tmp/hw-local
-target/release/homeway-cli tui --state /tmp/hw-local   # 注意：tui 的 --state 指 state 根
-
-# 一键演示拓扑（起统一进程 + 建 demo/work 会话，结束于面板启动命令）
-tools/tui-smoke.sh --hands-on
-```
-
-键位：↑↓/Tab 选择与换栏；Enter 进终端焦点（vim/htop 等全屏应用按键原样透传），F12 返回
-面板；滚轮回看；q 退出。断线自动重附/回落；加主机/建会话仍走 CLI（`host add` / `term new`），
-面板列表自动跟随。设计/评审/手测清单见 `docs/reviews/TUI-design.md` / `TUI-code-review.md` /
-`TUI-acceptance.md`。
-
 ## 文档地图
 
 | 想了解 | 看 |

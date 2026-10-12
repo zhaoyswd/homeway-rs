@@ -703,17 +703,7 @@ impl SessionVt {
     }
 
     fn read_row(&self, grid: &alacritty_terminal::grid::Grid<AlacCell>, y: usize) -> Row {
-        self.read_row_at(grid, y, 0)
-    }
-
-    /// 按偏移取行：`off` = display_offset（N = 视口上移 N 行，取 `Line(-N + y)`）。
-    fn read_row_at(
-        &self,
-        grid: &alacritty_terminal::grid::Grid<AlacCell>,
-        y: usize,
-        off: i32,
-    ) -> Row {
-        let line = Line(-off + y as i32);
+        let line = Line(y as i32);
         let row = &grid[line];
         let mut cells = Vec::with_capacity(self.cols);
         for x in 0..self.cols {
@@ -725,32 +715,6 @@ impl SessionVt {
     fn row_at(&self, y: usize) -> Row {
         let grid = self.term.grid();
         self.read_row(grid, y)
-    }
-
-    // —— 滚动面（TUI 面板回看，tasks 4.8；登记 = docs/reviews/TUI-design.md）——
-    /// 滚动偏移（alacritty display_offset 语义：0 = 贴底实时视口；N = 上翻 N 行）。
-    pub fn display_offset(&self) -> usize {
-        self.term.grid().display_offset()
-    }
-
-    /// 滚动：`delta > 0` 上翻历史、`delta < 0` 下回；贴顶/贴底由 alacritty 截断。
-    /// 有 damage/事件副作用（与真实终端一致）；不影响 PTY 写入流。
-    pub fn scroll_display(&mut self, delta: i32) {
-        use alacritty_terminal::grid::Scroll;
-        self.term.scroll_display(Scroll::Delta(delta));
-    }
-
-    /// 按当前滚动偏移取整屏行（**只读**——不推进脏标/指纹，回看是瞬态视图）。
-    /// offset=0 时与 [`SessionVt::rows`] 等价。
-    pub fn rows_at_offset(&self) -> Vec<Row> {
-        let off = self.term.grid().display_offset() as i32;
-        let grid = self.term.grid();
-        (0..self.rows).map(|y| self.read_row_at(grid, y, off)).collect()
-    }
-
-    #[cfg(test)]
-    fn grid_history_rows(&self) -> usize {
-        self.term.grid().history_size()
     }
 
     /// 光标快照（视口坐标）。
@@ -2379,39 +2343,6 @@ mod tests {
             if mm.screen == Screen::Alternate { bits |= 128; }
             let _ = m;
             assert_eq!(bits.to_string(), row[16], "{key}: 模式位");
-        }
-    }
-}
-
-#[cfg(test)]
-mod vt_scroll_tests {
-    use super::SessionVt;
-
-    #[test]
-    fn scroll_surface_offsets_viewport() {
-        let mut vt = SessionVt::new(10, 5, 1000).expect("建 vt");
-        for i in 0..40 {
-            vt.write(format!("line{i:02}\r\n").as_bytes());
-        }
-        assert!(vt.grid_history_rows() > 0, "40 行入 5 行屏 ⇒ 有历史");
-        assert_eq!(vt.display_offset(), 0, "缺省贴底");
-        let text_at = |vt: &SessionVt, y: usize| -> String {
-            vt.rows_at_offset()[y].cells.iter().map(|c| c.symbol.clone()).collect()
-        };
-        assert!(text_at(&vt, 3).contains("line39"), "行39 在视口第 4 行（行尾 \r\n 已下移一行）");
-        vt.scroll_display(10);
-        assert_eq!(vt.display_offset(), 10);
-        assert!(text_at(&vt, 0).contains("line26"), "上翻 10 行后视口顶 = line26（贴底顶 = line36）");
-        vt.scroll_display(1000);
-        let max = vt.display_offset();
-        assert!(max > 10 && max <= 40, "截断在历史范围内：{max}");
-        vt.scroll_display(-1000);
-        assert_eq!(vt.display_offset(), 0, "下回贴底截断为 0");
-        let a = vt.rows_at_offset();
-        let b = vt.rows();
-        assert_eq!(a.len(), b.len());
-        for (ra, rb) in a.iter().zip(b.iter()) {
-            assert_eq!(ra.cells, rb.cells);
         }
     }
 }
