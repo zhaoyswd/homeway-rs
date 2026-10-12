@@ -87,9 +87,14 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
    （Q-J 记录 = `docs/reviews/QJ.md`，设计 = `QJ-design.md`）。
 3. **Q 批之后的批次与待裁决**：**`Q-F-B`（portfwd 实装监听器）已完成**（2026-10-08，用户授权补齐；
    两门通过，提交 `129f1c4`+`08a0f62`+`11800a7`；tier `port-forwarding` 的 SHALL/MUST 已由
-   「已知不达标」转**达标**，记录 = `docs/reviews/QFB.md`）；**`Q-K`（出口侧有界 IPv4 分片重组）
-   与 `Q-L`（账实对账 + 挂空小项）进行中/待做**；`Q-I-DNS`（DNS TTL 缓存小批；取证与建议 =
-   `docs/reviews/QIt.md` §7.1）仍待指令。
+   「已知不达标」转**达标**，记录 = `docs/reviews/QFB.md`）；**`Q-K`（出口侧有界 IPv4 分片重组，
+   提交 `51adb4c`+`a8a993c`）与 `Q-L`（账实对账 + 挂空小项，提交 `68a52b1` 等）均已完成**
+   （2026-10-08，两门通过；Q-L 兼 QUIC 交接 Q1–Q12 落档 `QL.md` §4）。`Q-I-DNS`（DNS TTL 缓存小批；
+   取证与建议 = `docs/reviews/QIt.md` §7.1）**仍是本表唯一待指令项**（建议口径 = 不做，理由在 §7.1）。
+   **并行线状态（2026-10-12）**：QUIC 换代程序已收官（`docs/QUIC-ROADMAP.md`「2026-10-12 收口注」）；
+   IDLE-WAKE 空闲唤醒批已实施收口（稳态 8/s）；TUI 面板线已按用户决策整体回滚（提交 `871dcba`，
+   恢复路径 = `git revert 871dcba`）；**DNS-STREAM 承接批已落地**（`STREAM[tag=6]` 恢复 socks
+   域名目标远程解析、CA5 判据面恢复；记录 = `docs/reviews/DNS-STREAM.md`）。
    Q-J 上报项：tier spec 偏离 5 条、App 需置 HELLO caps `KEY_ALT_ESC_PREFIX`——全部为用户触点
    或 tier 侧动作，见 `docs/reviews/QJ.md` §6。
    **A-any ↔ tier `exit-upnp-port-mapping:32-35` MUST 的二选一已由主会话裁定（2026-10-08）= 选项①

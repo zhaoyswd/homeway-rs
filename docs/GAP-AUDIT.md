@@ -163,7 +163,7 @@
 | K-17 | D-19 portable-pty 信号死 -1 | R6 6f-3a | 已按 Go 逐值对齐处置（6f-3b） |
 | K-18 | R2 登记项（tunStatusJSON 键面→R7 已兑现；CLI 并发 foot-gun→7e 会话锁已兑现） | R2.md 豁免表 | 已清 |
 | K-19 | R5 第二道门登记留档 4 中 + 2 低 | R5.md | 已随 R6 前置批清账 |
-| K-20 | R8 收官批剩余触点项（共存定案/终测报告定稿/tier 文档指针/AGENTS-README 定稿/遗留清账移交） | ROADMAP 当前指针 | 待做（收官批，多为用户触点）。**（2026-10-08 Q-L）复核注**：R8 之后各批已收官（Q-A…Q-K + Q-F-B + Q-L 全清），本表剩余 = **用户触点**（tier `homeway-rs.pin` 前进 / 终测定稿 / tier 文档指针）——见 `ROADMAP.md`「下一步（当前指针）」 |
+| K-20 | R8 收官批剩余触点项（共存定案/终测报告定稿/tier 文档指针/AGENTS-README 定稿/遗留清账移交） | ROADMAP 当前指针 | 待做（收官批，多为用户触点）。**（2026-10-08 Q-L）复核注**：R8 之后各批已收官（Q-A…Q-K + Q-F-B + Q-L 全清），本表剩余 = **用户触点**（tier `homeway-rs.pin` 前进 / 终测定稿 / tier 文档指针）——见 `ROADMAP.md`「下一步（当前指针）」。**（2026-10-12 复核）tier 触点已全部落地**（pin 前进 / `log-index.md` 重生成 / `TokenCheck` 认 hmw2 / `connection-lifecycle.md` 定稿 / `exit-transit-intercept` 豁免 MUST 退役 / App caps `KEY_ALT_ESC_PREFIX` + Q-J 偏离知会——见 tier 仓同批提交）；**剩余仅环境／确认面三项**：设备侧 V19（需本地中继做腿，`DEPLOY-RUST-EXIT.md` §12.6）、真机蜂窝 A/B（设备无 SIM）、回滚窗口关闭（等用户确认） |
 
 ## 四、汇总统计
 
