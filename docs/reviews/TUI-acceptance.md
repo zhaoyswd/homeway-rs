@@ -110,6 +110,19 @@
   `term_area` 存全屏区域（点击布局基准），RESIZE 位点经 `term_content_of` 派生内容区。
   探针实证：合成 SGR 鼠标点击 + → 浮层 → 键入 → 会话真实创建；非法 token 报错红字；
   Esc 取消。71 用例绿 clippy 零告警。
+- 2026-10-12　5.1 手测发现（第八轮，**重炮 TUI 场景**）：**opencode 不清屏重叠 / codex
+  内容错乱** 根因 = `apply_cell` 把「带样式空格」与「宽字符尾占位」混判（都命中
+  `width==0` → 写空串）：core 口径 style 空格 = width0/skip=false、宽尾 = skip=true；
+  空串在真终端是 Print no-op，**而 ratatui 行内游标假设它已打印 ⇒ 该行后续字符的
+  MoveTo 全被省略、整行逐字左移**（codex 菜单词粘连 `Backgroundserverhas...`）+ 旧内容
+  不擦（opencode 重叠）。修复 = 按 `skip` 位分流（skip→空串不打印 / 空格→真实空格 /
+  其余→字形）；回归钉 `styled_space_renders_real_space_not_empty`。对照实验法：
+  **同款应用原始 pty（参考）vs 经 TUI，pyte 逐行比**——vim/vim 退出还原/vim 首行空白
+  均先证伪（参考组同样形态），避免误修。终验：codex（菜单/logo 盲文/对话/CJK/标题栏
+  实时 spinner）与 opencode（ASCII logo/输入框/状态行/标题栏 OSC）全量正确渲染。
+  **结论：错误全在自研接缝（渲染映射），alacritty VT 面对重炮 TUI 字节级正确——
+  「整体搬 herdr 终端栈」暂不成立（herdr 的 ghostty VT 也修不了这类映射缝错误）；
+  若未来出现 VT 级缺口（kitty 图形协议等）再评估借用 herdr 具体件。**
 - 2026-10-12　5.1 手测发现（第四轮，**高危**）：**「work 会话敲命令回车无反应、命令消失」
   真因 = TUI 进程 tty 死亡后 100% CPU 永久自旋**——crossterm 0.29 `try_read` 内圈在
   `read` 返回 `Ok(0)`（EOF）或非 WouldBlock 错误时既不 break 也不返回（源码实证），

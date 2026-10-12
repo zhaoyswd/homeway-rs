@@ -109,12 +109,16 @@ pub(crate) fn cursor_in_pane(c: homeway_core::term::vt::Cursor, area: Rect) -> O
     ))
 }
 
-fn apply_cell(rc: &mut RCell, cell: &homeway_core::term::vt::Cell) {    if cell.width == 0 {
-        // 尾占位格不打印（真终端自持宽字形两列——打印会打碎字形的右半列）。
+fn apply_cell(rc: &mut RCell, cell: &homeway_core::term::vt::Cell) {
+    if cell.skip {
+        // 宽字符尾/软折行占位（skip=true）不打印——真终端自持宽字形两列，
+        // 打印会打碎字形右半列。
         rc.set_symbol("");
     } else if cell.symbol.is_empty() {
-        // 无文本契约（vt.rs:171）= 空串 ⇒ 必须落**真实空格**：空串在真终端是
-        // no-op，清屏/切换会话的空白区都靠它把旧字符盖掉（背景色仍按 cell 带）。
+        // 空格（含**带样式空格**——core 口径 width=0/skip=false）与未写格统一落
+        // **真实空格**：空串在真终端是 Print no-op，而 ratatui 的行内游标假设它
+        // 已打印 ⇒ 该行后续字符的 MoveTo 全被省略、整行逐字左移（codex 菜单
+        // 「词粘连」），且旧内容不被擦除（opencode「不清屏、重叠」）——r5 实测根因。
         rc.set_symbol(" ");
     } else {
         rc.set_symbol(cell.symbol.as_str());
@@ -227,6 +231,38 @@ mod tests {
         assert_eq!(cursor_in_pane(mk(3, 2), area), Some((13, 7)), "界内直映");
         assert_eq!(cursor_in_pane(mk(100, 50), area), Some((49, 14)), "出界夹取回 pane 右下");
         assert_eq!(cursor_in_pane(mk(0, 0), Rect::new(0, 0, 0, 5)), None, "零宽 area 无定位");
+    }
+
+    #[test]
+    fn styled_space_renders_real_space_not_empty() {
+        // r5 实测根因钉：带样式空格（core 口径 width=0/skip=false）必须落真实空格——
+        // 空串会让 Print 变 no-op 且 ratatui 行内游标错位（codex 词粘连 / opencode 不清屏）。
+        let mut t = Terminal::new(TestBackend::new(8, 1)).unwrap();
+        let cell = homeway_core::term::vt::Cell {
+            symbol: String::new(),
+            width: 0,
+            skip: false,
+            fg: homeway_core::term::vt::Color::None,
+            bg: homeway_core::term::vt::Color::None,
+            attr: 0,
+        };
+        t.draw(|f| {
+            let buf = f.buffer_mut();
+            let rc = buf.cell_mut((0, 0)).unwrap();
+            apply_cell(rc, &cell);
+        })
+        .unwrap();
+        assert_eq!(t.backend().buffer()[(0, 0)].symbol(), " ", "带样式空格 → 真实空格");
+        // 宽字符尾（skip=true）保持空串不打印。
+        let tail = homeway_core::term::vt::Cell { skip: true, ..cell.clone() };
+        let mut t2 = Terminal::new(TestBackend::new(8, 1)).unwrap();
+        t2.draw(|f| {
+            let buf = f.buffer_mut();
+            let rc = buf.cell_mut((0, 0)).unwrap();
+            apply_cell(rc, &tail);
+        })
+        .unwrap();
+        assert_eq!(t2.backend().buffer()[(0, 0)].symbol(), "", "宽尾占位保持不打印");
     }
 
     #[test]
