@@ -33,15 +33,16 @@
 //! - **G6**（`dnstest` 的 UDP 服务面无替代）：岛只有 STREAM + L3，无 UDP socket 服务
 //!   ⇒ **登记退役**（排障工具，非产品四件套；`homeway-cli` 侧同批处置：动词面无
 //!   dispatch + 用法行除名）。
-//! - **G7**（出口 `:5300` 解析腿在宿主会话无 tag 承载）：**本棒按「退役」执行**——
-//!   出口侧新增 `STREAM[tag=6]` 属出口协议面增项（设计 §12-C-8 的「承接」选项，**待用户
-//!   裁决**；本棒不擅动出口 wire）。**事实面（代码门 H-2 订正：本条曾写「降级为本机解析」，
-//!   而本仓根本没有该兜底）**：`tag_for_port(5300)` = `None`（`facade/quic_stream.rs`）⇒
-//!   socks **域名目标**（`curl --socks5-hostname`）在核侧**不可用**，失败归因为
-//!   `出口未提供该服务腿（端口 5300 无 STREAM tag）`（`daemon/carriers::DialErr::NoService`，
-//!   可行动文案——不再是误导性的「连接被拒（对端 RST）」）；**无本机解析兜底**。
-//!   判据面同批登记：`E4` 的 `resolve=` 段退役、`CA5` 降级（`docs/INTEROP-CRITERIA.md`
-//!   的 M5 批量条目）；原设计推荐的「承接」= 未做，作为待裁决项上报。
+//! - **G7**（出口 `:5300` 解析腿在宿主会话无 tag 承载）：**2026-10-12 已裁「承接」并落地**
+//!   （DNS-STREAM 批，用户指令）：新增 `STREAM[tag=6]`（`DnsResolve`，文本 `dns`）——
+//!   出口侧并入既有服务入口（socketpair + `serve_via_intake`），服务体 =
+//!   `server/dns_stream.rs`（每连接一线程，RFC1035 分帧 ⇄ `DnsProxy::answer_stream`）；
+//!   客户端 `tag_for_port(5300)` = `Some(DnsResolve)` ⇒ socks **域名目标**恢复可用（CA5
+//!   判据面恢复；机制面从「隧道 IP:5300 经拦截层回环豁免」改述为「`STREAM[tag=6]`」）。
+//!   `DialErr::NoService` 保留给**真正无 tag** 的端口；「该 tag 在出口未装配」（`reset(0x22)`）
+//!   另立 `DialErr::ServiceDisabled`（可行动文案，别混报成「连接被拒（对端 RST）」）。
+//!   登记 = `docs/INTEROP-CRITERIA.md` 的 CA5 行 + 判据变更记录 2026-10-12 条 + 计数输入集表
+//!   （`qtcp` 输入集新增 tag=6）。
 
 use std::io::{self, Read, Write};
 use std::net::SocketAddrV4;
@@ -141,9 +142,15 @@ pub enum HostErr {
     /// 会话未就绪（尚未建连/正在收工）。
     #[error("宿主会话未就绪（{0}）")]
     NotReady(String),
-    /// 出口无该服务（`StreamErr::NotSupported` 面；含未知端口）。
+    /// 出口无该服务（`StreamErr::Refused` 面；含 `dial` 目标拒）。
     #[error("出口没有该服务")]
     Refused,
+    /// **出口未提供该服务腿**（`StreamErr::NotSupported` 面 = `reset(0x22)`：该 tag 在出口
+    /// 未装配/已停用，如 `dns_port=0` 时 DNS 代答未启用）。与 [`Self::Refused`] 分开：
+    /// Refused = 服务在但被拒；本支 = **本档没有这条路**（DNS-STREAM 批：承接后 `0x22` 若
+    /// 混报成「连接被拒（对端 RST）」= M5 代码门 H-2 点名的归因误导复现）。
+    #[error("出口未提供该服务腿（服务未装配/已停用）")]
+    ServiceDisabled,
     /// 预算耗尽。
     #[error("拨号预算耗尽")]
     Budget,
@@ -164,7 +171,9 @@ impl From<HostErr> for io::Error {
     fn from(e: HostErr) -> io::Error {
         let kind = match e {
             HostErr::NoFace | HostErr::NotReady(_) => io::ErrorKind::NotConnected,
-            HostErr::Refused => io::ErrorKind::ConnectionRefused,
+            // 服务未装配与「服务在但被拒」在**桥面**同档（link_down 判据），只有拨号缝
+            // （`daemon::map_dial_err` / 解析腿）细分文案 ⇒ io kind 保持 ConnectionRefused。
+            HostErr::Refused | HostErr::ServiceDisabled => io::ErrorKind::ConnectionRefused,
             HostErr::Budget => io::ErrorKind::TimedOut,
             // Busy = 本端额度面（不是连接面）：`WouldBlock` 让调用方按「稍后重试」处理，
             // 且不与 refused-like（桥面 link_down 回帧判据）混淆。
@@ -181,7 +190,8 @@ impl HostErr {
     /// `quic_stream.rs` 的三条纪律；此处只做类型搬运）。
     fn from_stream(e: StreamErr) -> HostErr {
         match e {
-            StreamErr::NotSupported | StreamErr::Refused => HostErr::Refused,
+            StreamErr::NotSupported => HostErr::ServiceDisabled,
+            StreamErr::Refused => HostErr::Refused,
             StreamErr::Timeout => HostErr::Budget,
             StreamErr::Busy => HostErr::Busy,
             StreamErr::Closed | StreamErr::ConnectionLost => HostErr::Closed(e.to_string()),

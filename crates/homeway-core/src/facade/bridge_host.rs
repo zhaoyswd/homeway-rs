@@ -202,6 +202,10 @@ pub mod port {
     pub const TERM: u16 = 7724;
     /// speedtest 服务（app_speedtest.go speedtestServicePort；QUIC 档 ⇒ `STREAM[tag=3]`）。
     pub const SPEEDTEST: u16 = 7803;
+    /// 客户端远程解析腿（**clientcore 写死 5300**；Go `socksDNSPort` 同值；QUIC 档 ⇒
+    /// `STREAM[tag=6]`（dns-resolve，DNS-STREAM 批）。单源引用方 = `daemon/carriers/dnsq.rs`
+    /// 的 `SOCKS_DNS_PORT`（别再各写一份字面 5300）。
+    pub const DNS_RESOLVE: u16 = 5300;
 }
 
 /// term 端口的可变面（HOMEWAY_TERM_PORT 同源；测试/特殊部署用）。

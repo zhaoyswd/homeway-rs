@@ -452,6 +452,46 @@ impl ServeEngine {
         let mut socks = Vec::new();
         let mut term_srv: Option<Arc<crate::term::service::TermService>> = None;
         let mut service_intakes = homeway_quic::ServiceIntakes::default();
+        // ---- DNS 流腿（`STREAM[tag=6]` dns-resolve；DNS-STREAM 批，2026-10-12）----
+        // 可用性判据 = `dns_enabled`（**与 `dns_port` 取值无关**——tag 不携带端口；`dns_port`
+        // 只管栈内 `:53/:5300` 监听面）；未装配 ⇒ 出口对该 tag 落既有 `reset(0x22)`。
+        if let Some(proxy) = &dns {
+            match homeway_quic::ServiceIntake::quic_only(
+                homeway_quic::tuning::service_defaults::intake_capacity(
+                    crate::server::dns_stream::MAX_CONNS,
+                ),
+            ) {
+                Ok((intake, tx)) => {
+                    service_intakes.dns = Some(tx);
+                    (logf)(&format!(
+                        "dns 流腿就绪：STREAM tag=6（客户端虚拟端口 {}；代答复用 :53 同一上游 dnsproxy）",
+                        crate::facade::bridge_host::port::DNS_RESOLVE
+                    ));
+                    let stop = spawn_service_stop_flag(&mut stop_flags);
+                    let proxy2 = Arc::clone(proxy);
+                    let d2 = Arc::clone(&dlogf);
+                    let d3 = Arc::clone(&dlogf);
+                    if let Err(e) = std::thread::Builder::new()
+                        .name("homeway-dns-stream".into())
+                        .spawn(move || {
+                            if let Err(e) =
+                                crate::server::dns_stream::serve(intake, proxy2, stop, Arc::clone(&d2))
+                            {
+                                (d2)(&format!(
+                                    "dns: 流腿服务线程退工（{e}）——socks 域名目标不可用，直到重启出口"
+                                ));
+                            }
+                        })
+                    {
+                        (d3)(&format!("⚠️ dns: 流腿服务线程起不来（{e}）——socks 域名目标不可用"));
+                    }
+                }
+                Err(_e0) => {
+                    // 入口建不起来（fd/内存）：该 tag 落 0x22（与 files/speedtest 的保守选择同款）
+                    (logf)("⚠️ dns: 流腿入口起不来——socks 域名目标不可用（该 tag 落 0x22）");
+                }
+            }
+        }
         let files_srv = crate::files_server::FilesServer::open(cfg.files_root.as_deref(), Arc::clone(&dlogf)).ok();
         if let Some(fsrv) = files_srv {
             match crate::files_server::listen_local_service(&serve_dir, "files.sock", &dlogf) {

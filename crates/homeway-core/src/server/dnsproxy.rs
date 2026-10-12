@@ -566,22 +566,45 @@ impl DnsProxy {
         self.submit(tag, query, true)
     }
 
-    fn submit_leg_impl(&self, tag: u64, query: Vec<u8>) -> SubmitOutcome {
+    /// 流服务面（`STREAM[tag=6]` dns-resolve）：**同步等应答**，供阻塞读的服务线程用
+    /// （DNS-STREAM 批）。口径与 [`Self::submit_tcp`] 同源：`qtcp` **收到即计**（门之前，
+    /// 与计数输入集口径一致）、在途门/入队失败计 `dropped`；`is_tcp = true` 写死
+    /// （应答**不**按 1232 截断——漏传会让大应答被静默截断而 CA5 的小 A 查询照常绿）。
+    ///
+    /// 等待上界 = `budget + 1s`（与 `answer_sync` 同款）：worker 的上游尝试由绝对期限
+    /// 钳在 `budget` 内 ⇒ 超时只出现在 worker 线程异常的残余面。`None` = 丢弃/无应答，
+    /// 调用方**不回帧**（与栈内 TCP 面一致：客户端按自身预算超时归因、不缓存）。
+    pub fn answer_stream(&self, query: &[u8]) -> Option<Vec<u8>> {
+        self.core.stats.qtcp.fetch_add(1, Ordering::Relaxed);
+        let (tx, rx) = mpsc::channel();
+        let job = DnsJob { tag: 0, query: query.to_vec(), is_tcp: true, reply_to: tx };
+        if self.admit_and_send(job).is_err() {
+            return None;
+        }
+        rx.recv_timeout(self.core.budget + Duration::from_secs(1)).ok().and_then(|r| r.resp)
+    }
+
+    /// 在途门 + 入队（**单源**；`Err` = 已计 `dropped`，调用方无须再记）。
+    ///
+    /// 不变量（三调用点共享，别处不得再写一份）：过门成功 ⇒ `in_flight` 由 worker 应答后
+    /// 自减（调用方**不**自减，含等待超时路径——worker 仍会减）；门拒/入队失败 ⇒ 本函数自减。
+    fn admit_and_send(&self, job: DnsJob) -> Result<(), ()> {
         if self.in_flight.fetch_add(1, Ordering::Relaxed) + 1 > self.core.max_in_flight {
             self.in_flight.fetch_sub(1, Ordering::Relaxed);
             self.core.stats.dropped.fetch_add(1, Ordering::Relaxed);
-            return SubmitOutcome::Dropped;
+            return Err(());
         }
-        if self
-            .job_tx
-            .try_send(DnsJob { tag, query, is_tcp: false, reply_to: self.reply_tx.clone() })
-            .is_err()
-        {
+        if self.job_tx.try_send(job).is_err() {
             self.in_flight.fetch_sub(1, Ordering::Relaxed);
             self.core.stats.dropped.fetch_add(1, Ordering::Relaxed);
-            return SubmitOutcome::Dropped;
+            return Err(());
         }
-        SubmitOutcome::Accepted
+        Ok(())
+    }
+
+    fn submit_leg_impl(&self, tag: u64, query: Vec<u8>) -> SubmitOutcome {
+        let job = DnsJob { tag, query, is_tcp: false, reply_to: self.reply_tx.clone() };
+        self.admit_and_send(job).map(|()| SubmitOutcome::Accepted).unwrap_or(SubmitOutcome::Dropped)
     }
 
     fn submit(&self, tag: u64, query: Vec<u8>, is_tcp: bool) -> SubmitOutcome {
@@ -590,21 +613,9 @@ impl DnsProxy {
         } else {
             self.core.stats.q.fetch_add(1, Ordering::Relaxed);
         }
-        if self.in_flight.fetch_add(1, Ordering::Relaxed) + 1 > self.core.max_in_flight {
-            self.in_flight.fetch_sub(1, Ordering::Relaxed);
-            self.core.stats.dropped.fetch_add(1, Ordering::Relaxed);
-            return SubmitOutcome::Dropped; // 超限丢弃：客户端按超时重试，不排长队放大延迟
-        }
-        if self
-            .job_tx
-            .try_send(DnsJob { tag, query, is_tcp, reply_to: self.reply_tx.clone() })
-            .is_err()
-        {
-            self.in_flight.fetch_sub(1, Ordering::Relaxed);
-            self.core.stats.dropped.fetch_add(1, Ordering::Relaxed);
-            return SubmitOutcome::Dropped;
-        }
-        SubmitOutcome::Accepted
+        let job = DnsJob { tag, query, is_tcp, reply_to: self.reply_tx.clone() };
+        // 超限丢弃：客户端按超时重试，不排长队放大延迟
+        self.admit_and_send(job).map(|()| SubmitOutcome::Accepted).unwrap_or(SubmitOutcome::Dropped)
     }
 
     /// 同步应答一条查询（自检/测试面；经同一 worker 管线——与异步路径同一条应答逻辑）。
@@ -1702,5 +1713,74 @@ mod tests {
         assert_eq!(a1.join(","), "10.1.1.1", "旧快照内容逐字不变");
         assert_eq!(b.join(","), "10.1.1.2");
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// **DNS-STREAM 批判据**：`answer_stream` —— ① 同步应答（事务 ID 回显）+ `qtcp`
+    /// **收到即计**（门之前，口径同 `submit_tcp`；不计 `q`）；② 在途门：`max_in_flight=1`
+    /// 且上游全不答 ⇒ 首条占门（≤budget）、第二条 `None` + `dropped`。
+    #[test]
+    fn answer_stream_counts_qtcp_before_gate_and_gates() {
+        // ① 正常应答面（假上游回显 ID）
+        let up = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let up_addr = format!("127.0.0.1:{}", up.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            loop {
+                let Ok((_n, from)) = up.recv_from(&mut buf) else { return };
+                let mut r = a_response("as.test", 0, 30, &[0x0a00_0005]);
+                r[0..2].copy_from_slice(&buf[..2]);
+                let _ = up.send_to(&r, from);
+            }
+        });
+        let dir = std::env::temp_dir().join(format!("homeway-rs-dnsas-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("resolv.conf"), format!("nameserver {up_addr}\n")).unwrap();
+        let (logf, dlogf) = noop();
+        let (proxy, _events) = DnsProxy::spawn(
+            DnsConfig {
+                resolv_path: dir.join("resolv.conf").to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            logf,
+            dlogf,
+        );
+        let resp = proxy.answer_stream(&a_query("as.test", 0x5151)).expect("应有应答");
+        assert_eq!(&resp[..2], &0x5151u16.to_be_bytes());
+        let line = proxy.stats_line();
+        assert!(line.contains("qtcp=1"), "stats: {line}");
+        assert!(line.contains("q=0"), "answer_stream 不计 UDP q：{line}");
+
+        // ② 在途门（上游收下不答 ⇒ 首条 worker 占门至预算）
+        let dead = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let dead_addr = format!("127.0.0.1:{}", dead.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            while dead.recv_from(&mut buf).is_ok() {}
+        });
+        let dir2 = std::env::temp_dir().join(format!("homeway-rs-dnsas2-{}", std::process::id()));
+        std::fs::create_dir_all(&dir2).unwrap();
+        std::fs::write(dir2.join("resolv.conf"), format!("nameserver {dead_addr}\n")).unwrap();
+        let (logf2, dlogf2) = noop();
+        let (p2, _ev2) = DnsProxy::spawn(
+            DnsConfig {
+                resolv_path: dir2.join("resolv.conf").to_string_lossy().into_owned(),
+                fallback_dns: "127.0.0.1:1".to_owned(),
+                budget: Duration::from_millis(800),
+                max_in_flight: 1,
+                ..Default::default()
+            },
+            logf2,
+            dlogf2,
+        );
+        let p2b = Arc::clone(&p2);
+        let h = std::thread::spawn(move || p2b.answer_stream(&a_query("gate.test", 1)));
+        std::thread::sleep(Duration::from_millis(120));
+        assert!(p2.answer_stream(&a_query("gate.test", 2)).is_none(), "在途门应拒第二条");
+        assert!(p2.stats_line().contains("drop=1"), "stats: {}", p2.stats_line());
+        // 首条：worker 由绝对期限钳在 budget 内 ⇒ 总会给应答（全死上游 = SERVFAIL，不是 None）
+        let first = h.join().unwrap().expect("预算内应有应答（SERVFAIL 也是应答）");
+        assert_eq!(first[3] & 0x0F, 2, "全死上游 ⇒ SERVFAIL");
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&dir2);
     }
 }

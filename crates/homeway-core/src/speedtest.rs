@@ -315,7 +315,8 @@ fn io_to_speedtest(e: std::io::Error) -> SpeedtestError {
 
 /// 由宿主会话拨一条测速流（本地/守护两形态共用的拨号腿）。
 ///
-/// 归因（§2.5）：出口无该服务（`HostErr::Refused`）⇒ `NotSupported`（与首帧前
+/// 归因（§2.5）：出口无该服务（`HostErr::Refused`）或该服务未装配
+/// （`HostErr::ServiceDisabled`，`reset(0x22)`）⇒ `NotSupported`（与首帧前
 /// EOF 的既有 not_supported 判据同族）；预算耗尽 ⇒ `Timeout`；其余 ⇒ `Conn`。
 pub fn dial_host_stream(
     sess: &crate::facade::host_session::HostSession,
@@ -326,8 +327,8 @@ pub fn dial_host_stream(
         budget,
     ) {
         Ok(stream) => Ok(engine_conn_host(std::sync::Arc::new(stream))),
-        Err(e @ crate::facade::host_session::HostErr::Refused) => {
-            let _ = e;
+        Err(crate::facade::host_session::HostErr::Refused)
+        | Err(crate::facade::host_session::HostErr::ServiceDisabled) => {
             Err(SpeedtestError::NotSupported)
         }
         Err(crate::facade::host_session::HostErr::Budget) => Err(SpeedtestError::Timeout),

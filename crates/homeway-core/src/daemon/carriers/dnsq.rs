@@ -14,9 +14,10 @@ use std::time::Duration;
 
 use crate::daemon::StreamConn;
 
-/// 出口客户端解析腿端口（隧道 IP:5300 的 TCP——出口在**隧道栈内**起的
-/// DNS-over-TCP listener；Go socksDNSPort 同源同值）。
-pub const SOCKS_DNS_PORT: u16 = 5300;
+/// 出口客户端解析腿端口（**虚拟端口 5300**；Go `socksDNSPort` 同源同值）。QUIC 档经
+/// `STREAM[tag=6]`（dns-resolve）送达出口——出口以与 `:53` 同一 `dnsproxy` 管线代答；
+/// 端口常量单源 = [`crate::facade::bridge_host::port::DNS_RESOLVE`]（别再写字面量）。
+pub const SOCKS_DNS_PORT: u16 = crate::facade::bridge_host::port::DNS_RESOLVE;
 
 const TYPE_A: u16 = 1;
 /// 查询名的编码长度上限（253 字节域名 + 标签长度位）。

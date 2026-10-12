@@ -3908,3 +3908,58 @@ fn exit_config_cc_field_reaches_the_factory() {
 /// 既有服务入口通道（socketpair + 入队 + 泵）到达服务侧，帧字节**逐字**转交（入口层不做
 /// DNS 语义）、受理行带 `tag=dns`（E-q5 的 `%s` 新值域）；② 未装配 ⇒ `reset(0x22)` +
 /// `服务流拒（…）` 行（与 tag 1/2/3 同款的保守选择——DNS 未启用 = 该服务腿整条停用）。
+#[tokio::test]
+async fn dns_stream_tag6_rides_intake_and_refuses_when_unassembled() {
+    const FRAME: &[u8] = b"\x00\x04TEST"; // 2B 长度前缀 + 正文（入口层按字节搬运）
+    const REPLY: &[u8] = b"\x00\x04R-OK";
+    // ① 已装配
+    let (dns_intake, dns_tx) = crate::ServiceIntake::quic_only(4).expect("intake");
+    let svc = stub_service(dns_intake, b"", REPLY);
+    let (quic, rx, _client, conn, _stub, _pk, _dev) = exit_with_intakes(
+        0x6a,
+        crate::ServiceIntakes {
+            dns: Some(dns_tx),
+            ..Default::default()
+        },
+    )
+    .await;
+    {
+        let (mut s, mut r) = conn.open_bi().await.expect("open_bi");
+        s.write_all(&[6]).await.expect("tag=6（dns）");
+        s.write_all(FRAME).await.expect("写帧");
+        s.finish().expect("客户端半关");
+        let mut got = vec![0u8; REPLY.len()];
+        r.read_exact(&mut got).await.expect("读应答");
+        assert_eq!(got, REPLY, "应答逐字节");
+    }
+    let (head, rest) = await_stub(&svc, WAIT).await;
+    assert_eq!(head, FRAME[..4].to_vec(), "入口搬运不做 DNS 语义（按字节转交）");
+    assert_eq!(rest, FRAME[4..].to_vec(), "余量随半关到达");
+    let lines = drain_until(&rx, "服务流已受理（tag=dns", WAIT);
+    assert!(
+        lines.iter().any(|l| l.contains("服务流已受理（tag=dns")),
+        "受理行带 tag=dns（E-q5 值域新成员）：{lines:?}"
+    );
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+
+    // ② 未装配（无 dns 槽）⇒ reset(0x22) + 拒绝行
+    let (quic2, rx2, _c2, conn2, _s2, _p2, _d2) =
+        exit_with_intakes(0x6b, crate::ServiceIntakes::default()).await;
+    {
+        let (mut s, mut r) = conn2.open_bi().await.expect("open_bi");
+        s.write_all(&[6]).await.expect("tag=6");
+        let e = r.read_chunk(32, true).await.expect_err("未装配必须 reset");
+        match e {
+            quinn::ReadError::Reset(code) => {
+                assert_eq!(code.into_inner(), 0x22, "复位码 = SERVICE_DISABLED")
+            }
+            other => panic!("期望 Reset(0x22)，实得 {other:?}"),
+        }
+    }
+    let lines2 = drain_until(&rx2, "服务流拒（", WAIT);
+    assert!(
+        lines2.iter().any(|l| l.contains("tag=dns")),
+        "拒绝行带 tag=dns：{lines2:?}"
+    );
+    assert!(quic2.stop_within(Instant::now() + BUDGET));
+}

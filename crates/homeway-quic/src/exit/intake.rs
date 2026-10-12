@@ -120,6 +120,10 @@ pub struct ServiceIntakes {
     pub term: Option<ServiceIntakeTx>,
     /// tag=3 speedtest 的入口（在册上限 = `speedtest_server::MAX_CONNS`）。
     pub speedtest: Option<ServiceIntakeTx>,
+    /// tag=6 DNS 代答的入口（**DNS-STREAM 批**）。注意：**intake 容量只约束队列条数**
+    /// （取走即释放）⇒ 本槽位不能当在册上限用——服务侧自带真在册闸
+    /// （`server::dns_stream::MAX_CONNS`，见该模块头）。
+    pub dns: Option<ServiceIntakeTx>,
 }
 
 impl ServiceIntakes {
@@ -129,13 +133,15 @@ impl ServiceIntakes {
             crate::stream::StreamTag::Files => self.files.as_ref(),
             crate::stream::StreamTag::Term => self.term.as_ref(),
             crate::stream::StreamTag::Speedtest => self.speedtest.as_ref(),
+            crate::stream::StreamTag::DnsResolve => self.dns.as_ref(),
             crate::stream::StreamTag::Dial | crate::stream::StreamTag::Probe => None,
         }
     }
 
-    /// 是否有任一服务入口（装配面判据；`false` = QUIC 档只提供 probe）。
+    /// 是否有任一服务入口（`false` = QUIC 档只提供 probe）。**当前无消费者**（保留语义
+    /// 自洽；设计门 r33 1-3：别把它当装配判据读）。
     pub fn any(&self) -> bool {
-        self.files.is_some() || self.term.is_some() || self.speedtest.is_some()
+        self.files.is_some() || self.term.is_some() || self.speedtest.is_some() || self.dns.is_some()
     }
 }
 

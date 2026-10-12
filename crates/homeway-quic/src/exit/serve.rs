@@ -8,10 +8,10 @@
 //! accept_bi() ─► 每流一个 task
 //!                 │  读 1B tag（预算 TAG_READ_BUDGET=5s；到点 ⇒ reset(0x27)）
 //!                 ├─ 未绑定连接 ⇒ reset(0x24) + 行 + 计数
-//!                 ├─ tag ∉ {1..5} ⇒ reset(0x21) + 行 + 计数
+//!                 ├─ tag ∉ {1..6} ⇒ reset(0x21) + 行 + 计数
 //!                 ├─ 服务未启用（无 intake）⇒ reset(0x22) + 行 + 计数
 //!                 ├─ 入口队列满 ⇒ reset(0x23) + 行 + 计数
-//!                 └─ tag 1/2/3 ⇒ socketpair + 入队 + 泵（[`super::pump`]）
+//!                 └─ tag 1/2/3/6 ⇒ socketpair + 入队 + 泵（[`super::pump`]）
 //!                    tag 4（dial）⇒ 真拨号腿（[`super::dial`]；0x25/0x26 双码）
 //!                    tag 5（probe）⇒ 回显任务直连（**不进队列**，不占服务资源）
 //! ```
@@ -97,7 +97,7 @@ async fn handle_stream(mut send: SendStream, mut recv: RecvStream, conn_id: u64,
         // M4 S1 换轨：这条臂换成真拨号腿（`exit/dial.rs`）——读 6B `[4B IPv4][2B BE port]`
         // ⇒ 地址类判定 ⇒ 拨号 ⇒ 1B 回执 ⇒ 泛型泵。**帧不改**（M3 定稿沿用；§1.1）。
         StreamTag::Dial => super::dial::dial_serve(send, recv, conn_id, &ctx).await,
-        StreamTag::Files | StreamTag::Term | StreamTag::Speedtest => {
+        StreamTag::Files | StreamTag::Term | StreamTag::Speedtest | StreamTag::DnsResolve => {
             serve_via_intake(send, recv, tag, conn_id, &ctx).await
         }
     }

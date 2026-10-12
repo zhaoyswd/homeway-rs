@@ -263,7 +263,14 @@ fn carriers_dial_of(hosts: &Arc<hosts::HostTable>) -> carriers::CarrierDial {
                 .ok_or(carriers::DialErr::NoService(port))?;
             let stream = sess
                 .connect(sp, budget.min(std::time::Duration::from_secs(15)))
-                .map_err(map_dial_err)?;
+                .map_err(|e| match e {
+                    // 服务未装配（0x22）带上端口号改写文案（DNS-STREAM 批：解析腿的
+                    // 「出口未开 DNS 代答」可行动归因）；其余照 `map_dial_err` 分派。
+                    crate::facade::host_session::HostErr::ServiceDisabled => {
+                        carriers::DialErr::ServiceDisabled(port)
+                    }
+                    other => map_dial_err(other),
+                })?;
             Ok(carrier_conn_of(stream))
         },
     );

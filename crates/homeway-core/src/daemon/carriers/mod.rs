@@ -68,11 +68,16 @@ pub enum DialErr {
     #[error("连接被拒（对端 RST）")]
     Refused,
     /// **端口在 QUIC 档无服务 tag**（M5 代码门 H-2：`ServicePort::from_bridge_port`
-    /// 返回 `None` 的端口——如 socks 的出口解析腿 `:5300`，M5 起退役）。
-    /// 与 `Refused` 分开：Refused = 服务在但被拒（对端 RST）；本支 = **本档没有这条路**
-    /// （归因可行动：「出口未提供该服务腿」，不再误导成「对端 RST」）。
+    /// 返回 `None` 的端口）。与 `Refused` 分开：Refused = 服务在但被拒（对端 RST）；
+    /// 本支 = **本档没有这条路**（归因可行动：「出口未提供该服务腿」）。
     #[error("出口未提供该服务腿（端口 {0} 在 QUIC 档无 STREAM tag）")]
     NoService(u16),
+    /// **该 tag 在出口未装配/已停用**（`HostErr::ServiceDisabled` 换型 = `reset(0x22)`；
+    /// DNS-STREAM 批：如出口 `dns_port=0` 时 DNS 代答未启用 ⇒ 解析腿不可用）。
+    /// 与 [`Self::NoService`] 分开：NoService = 客户端不知道这条路（无 tag）；
+    /// 本支 = 路存在但出口没有开（归因可行动，别混报成「连接被拒（对端 RST）」）。
+    #[error("出口未提供该服务腿（端口 {0} 的服务在出口侧未装配/已停用）")]
+    ServiceDisabled(u16),
     /// 本端服务流额度耗尽（`HostErr::Busy` 换型；M5 代码门 M-6）。
     #[error("出口服务并发额度已满（Busy）")]
     Busy,

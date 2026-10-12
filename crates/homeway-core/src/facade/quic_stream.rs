@@ -35,11 +35,12 @@ use crate::Logf;
 use super::bridge_host::{BridgeStream, WriteHalf};
 use super::tun_exec::{write_retry_backoff, GenRun, EXIT_RPC_BUDGET, FIRST_TRY};
 
-/// 虚拟端口 → 服务 tag（§5.1：`7802/7724/7803 → 1/2/3`；**其余端口无 tag**）。
+/// 虚拟端口 → 服务 tag（§5.1：`7802/7724/7803 → 1/2/3`；**5300 → 6**（dns-resolve，
+/// DNS-STREAM 批——宿主侧 socks 域名目标的远程解析腿）；其余端口无 tag）。
 ///
-/// 两个端口源都是**既有配置面**（E1 值域不变）：files/speedtest 用常量，term 走
-/// `term_port()`（`HOMEWAY_TERM_PORT` 可改——A13 登记的可配面，本函数是它的唯一消费
-/// 判据：改端口不破 tag 映射）。
+/// 端口源都是**既有配置面/契约常量**（E1 值域不变）：files/speedtest/解析腿用常量，
+/// term 走 `term_port()`（`HOMEWAY_TERM_PORT` 可改——A13 登记的可配面，本函数是它的唯一
+/// 消费判据：改端口不破 tag 映射）。
 pub(crate) fn tag_for_port(port: u16) -> Option<StreamTag> {
     use super::bridge_host::{port as bport, term_port};
     if port == bport::FILES {
@@ -48,6 +49,8 @@ pub(crate) fn tag_for_port(port: u16) -> Option<StreamTag> {
         Some(StreamTag::Term)
     } else if port == bport::SPEEDTEST {
         Some(StreamTag::Speedtest)
+    } else if port == bport::DNS_RESOLVE {
+        Some(StreamTag::DnsResolve)
     } else {
         None
     }
@@ -645,6 +648,8 @@ mod tests {
         // term 端口是**可配面**（HOMEWAY_TERM_PORT）——映射随 `term_port()` 走，
         // 不写死字面量（写死 = 改端口即拨错服务）
         assert_eq!(tag_for_port(term_port()), Some(StreamTag::Term));
+        // DNS-STREAM 批：远程解析腿 5300 ⇒ tag=6（宿主侧 socks 域名目标的落点）
+        assert_eq!(tag_for_port(bport::DNS_RESOLVE), Some(StreamTag::DnsResolve));
         for p in [0u16, 1, 80, 7801, 7804, 7725, 65535] {
             if p == term_port() {
                 continue;
@@ -655,6 +660,13 @@ mod tests {
         assert_eq!(bport::FILES, 7802);
         assert_eq!(bport::TERM, 7724);
         assert_eq!(bport::SPEEDTEST, 7803);
+        assert_eq!(bport::DNS_RESOLVE, 5300);
+        // 单源 pin（3-5）：socks 解析腿常量与映射常量必须同源（各写一份字面 = 漂移口）
+        assert_eq!(
+            crate::daemon::carriers::dnsq::SOCKS_DNS_PORT,
+            bport::DNS_RESOLVE,
+            "SOCKS_DNS_PORT 必须引用 bridge_host::port::DNS_RESOLVE"
+        );
     }
 
     /// **判据（阶梯豁免集，§1.6 设计门 3-3；S3 完成判据点名）**：服务级拒绝

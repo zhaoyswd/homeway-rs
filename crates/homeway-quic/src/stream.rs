@@ -34,16 +34,22 @@ pub enum StreamTag {
     Dial,
     /// `5`：快探（客户端写 N(≥1)B ⇒ 出口原样回显直到客户端半关，§1.2/§3.2）。
     Probe,
+    /// `6`：DNS 代答（**DNS-STREAM 批，2026-10-12；M5 §12-C-8 裁决「承接」**）——客户端把
+    /// DNS-over-TCP 裸分帧（2B BE 长度 + 报文）经流送出，出口以与 `:53` 同一 `dnsproxy`
+    /// 管线代答（qtcp 计数面同源）。恢复宿主侧 socks 域名目标的远程解析（CA5）；出口未
+    /// 装配（DNS 未启用）⇒ 既有 `reset(0x22)` 语义。
+    DnsResolve,
 }
 
 impl StreamTag {
     /// 全部合法 tag（校验集与遍历面的单源；顺序 = 线值序）。
-    pub const ALL: [StreamTag; 5] = [
+    pub const ALL: [StreamTag; 6] = [
         StreamTag::Files,
         StreamTag::Term,
         StreamTag::Speedtest,
         StreamTag::Dial,
         StreamTag::Probe,
+        StreamTag::DnsResolve,
     ];
 
     /// 线字节（§1.1 的单源；出口分发与岛侧开流都只经它）。
@@ -54,6 +60,7 @@ impl StreamTag {
             StreamTag::Speedtest => 3,
             StreamTag::Dial => 4,
             StreamTag::Probe => 5,
+            StreamTag::DnsResolve => 6,
         }
     }
 
@@ -65,6 +72,7 @@ impl StreamTag {
             3 => Some(StreamTag::Speedtest),
             4 => Some(StreamTag::Dial),
             5 => Some(StreamTag::Probe),
+            6 => Some(StreamTag::DnsResolve),
             _ => None,
         }
     }
@@ -77,6 +85,7 @@ impl StreamTag {
             StreamTag::Speedtest => "speedtest",
             StreamTag::Dial => "dial",
             StreamTag::Probe => "probe",
+            StreamTag::DnsResolve => "dns",
         }
     }
 }
@@ -94,7 +103,7 @@ impl fmt::Display for StreamTag {
 /// （[`StreamErr::from_reset_code`] 的 `None` 分支）——这样「半途复位 = 静默截断」的
 /// 既有行为逐字保留（§1.6 设计门 3-2）。
 pub mod reset {
-    /// 未知 tag（tag ∉ {1..5}）。
+    /// 未知 tag（tag ∉ {1..6}）。
     pub const TAG_UNKNOWN: u64 = 0x21;
     /// 服务不可用（`HOMEWAY_TERM=off` / 无 speedtest 监听 / files 监听失败 / **S2 接线前**
     /// 的 tag 1–4 暂态——设计门 N16 的「保守选择」注记见 §1.6）。
@@ -154,7 +163,7 @@ pub enum StreamErr {
     /// 入口队列满（`0x23`）**或本端额度耗尽**（§1.6：两种都归这里，调用方按同一档处置）。
     #[error("入口队列满")]
     Busy,
-    /// tag ∉ {1..5}（`0x21`）或 tag 读取超时（`0x27`）——客户端侧不可再分（§1.6 的映射表）。
+    /// tag ∉ {1..6}（`0x21`）或 tag 读取超时（`0x27`）——客户端侧不可再分（§1.6 的映射表）。
     #[error("tag 读取超时")]
     BadTag,
     /// `dial` 目标拒（`0x25`；M4）。
@@ -288,6 +297,7 @@ mod tests {
             (StreamTag::Speedtest, 3, "speedtest"),
             (StreamTag::Dial, 4, "dial"),
             (StreamTag::Probe, 5, "probe"),
+            (StreamTag::DnsResolve, 6, "dns"),
         ];
         for (tag, byte, text) in want {
             assert_eq!(tag.as_byte(), byte, "tag {tag:?} 的线字节");
@@ -297,9 +307,9 @@ mod tests {
         }
         // `ALL` 与线值序一致（遍历面漂移 = 校验集漏项）
         let all: Vec<u8> = StreamTag::ALL.iter().map(|t| t.as_byte()).collect();
-        assert_eq!(all, vec![1, 2, 3, 4, 5]);
-        // 非法值（含 0 与 6..=255 的抽样）一律 `None`
-        for b in [0u8, 6, 0x21, 0xFF] {
+        assert_eq!(all, vec![1, 2, 3, 4, 5, 6]);
+        // 非法值（含 0 与 7..=255 的抽样）一律 `None`
+        for b in [0u8, 7, 0x21, 0xFF] {
             assert_eq!(StreamTag::from_byte(b), None, "非法 tag 字节 {b:#04x}");
         }
     }

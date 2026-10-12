@@ -606,4 +606,86 @@ mod tests {
         assert!(m2.status()[0].on);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// **DNS-STREAM 批判据（5-1a：本批最容易错的接缝零覆盖 ⇒ 补全链）**：
+    /// `resolver_for` —— 拨号缝拨**出口解析腿（`SOCKS_DNS_PORT`）** ⇒ RFC1035 帧一问一答
+    /// （回显 ID + question）⇒ 候选列表；命中缓存**不再拨**；否定（NXDOMAIN）不缓存。
+    #[test]
+    fn resolver_for_dials_resolve_leg_frames_and_caches() {
+        use std::io::{Read, Write};
+        use std::net::TcpListener;
+
+        // 假出口解析腿（每条连接 = 一帧一问一答；test.com ⇒ 10.9.8.7；nx.test ⇒ NXDOMAIN）
+        let ln = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = ln.local_addr().unwrap();
+        let accepts = Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let accepts2 = Arc::clone(&accepts);
+        std::thread::spawn(move || loop {
+            let Ok((mut c, _)) = ln.accept() else { return };
+            accepts2.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+            let mut hdr = [0u8; 2];
+            if c.read_exact(&mut hdr).is_err() {
+                continue;
+            }
+            let n = u16::from_be_bytes(hdr) as usize;
+            let mut q = vec![0u8; n];
+            if c.read_exact(&mut q).is_err() {
+                continue;
+            }
+            // 解析 qname（offset 12 起）
+            let mut name = String::new();
+            let mut i = 12;
+            while i < q.len() && q[i] != 0 {
+                let l = q[i] as usize;
+                name.push_str(&String::from_utf8_lossy(&q[i + 1..i + 1 + l]));
+                name.push('.');
+                i += 1 + l;
+            }
+            let nx = name.starts_with("nx.");
+            let mut r = Vec::new();
+            r.extend_from_slice(&q[0..2]); // 回显事务 ID
+            r.extend_from_slice(&[0x80 | 0x01, 0x80]); // flags：QR/RD/RA
+            r.extend_from_slice(&1u16.to_be_bytes()); // QD=1
+            r.extend_from_slice(&(if nx { 0u16 } else { 1u16 }).to_be_bytes()); // AN
+            r.extend_from_slice(&0u16.to_be_bytes()); // NS
+            r.extend_from_slice(&0u16.to_be_bytes()); // AR
+            r.extend_from_slice(&q[12..]); // 回显 question
+            if !nx {
+                r.extend_from_slice(&[0xC0, 0x0C, 0x00, 0x01, 0x00, 0x01]);
+                r.extend_from_slice(&30u32.to_be_bytes());
+                r.extend_from_slice(&4u16.to_be_bytes());
+                r.extend_from_slice(&[10, 9, 8, 7]);
+            }
+            let mut framed = (r.len() as u16).to_be_bytes().to_vec();
+            framed.extend_from_slice(&r);
+            let _ = c.write_all(&framed);
+        });
+
+        let dial = FakeDial::new();
+        dial.port_map.lock().unwrap().insert(SOCKS_DNS_PORT, addr);
+        let cache = Arc::new(DnsCache::new(64));
+        let resolve = resolver_for(&dial.carrier_dial(), &hex_host(7), &cache);
+
+        // ① 命中：候选 = 应答 A 记录
+        assert_eq!(
+            resolve("test.com").unwrap(),
+            vec!["10.9.8.7".parse::<std::net::Ipv4Addr>().unwrap()]
+        );
+        // ② 缓存：同域名不再拨（拨号记录仍 1 条）
+        assert_eq!(resolve("test.com").unwrap().len(), 1);
+        assert_eq!(dial.calls.lock().unwrap().len(), 1, "命中缓存不得再拨");
+        // ③ 否定不缓存：两次都真拨（拨号记录 3 条）
+        assert!(resolve("nx.test").is_err());
+        assert!(resolve("nx.test").is_err());
+        assert_eq!(dial.calls.lock().unwrap().len(), 3, "否定不缓存 ⇒ 每次都拨");
+        // 拨号目标 = 解析腿端口（与 tag=6 映射同源）
+        assert!(
+            dial.calls.lock().unwrap()[0].ends_with(&SOCKS_DNS_PORT.to_string()),
+            "拨号应落解析腿端口：{:?}",
+            dial.calls.lock().unwrap()
+        );
+        // 每查询一条新连接（消费方形态）⇒ 服务端共 accept 3 次
+        assert_eq!(accepts.load(std::sync::atomic::Ordering::Relaxed), 3, "每查询一条新连接");
+    }
 }
