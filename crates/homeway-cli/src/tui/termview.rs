@@ -30,13 +30,21 @@ pub(crate) struct TermView {
     pub leg: TermLeg,
     /// 进入终端焦点后是否已发生用户交互（交互实例的 RESIZE 门，r2 N-4）。
     pub interacted: bool,
+    /// 最近一次下发的 RESIZE 尺寸（跟随窗口变化的判据，r5 实录：面板焦点期间
+    /// 改窗口 → 回同一会话后 interacted=true 且世代未变 ⇒ 不重发 ⇒ 会话几何冻结）。
+    pub last_sent: Option<(u16, u16)>,
     /// 最后注入会话的焦点态（r4 高3 去重：面板切换与外层事件共用；None = 未知/未启用）。
     pub session_focus: Option<bool>,
 }
 
 impl TermView {
     pub fn new(cols: u16, rows: u16) -> Result<Self, homeway_core::term::vt::VtError> {
-        Ok(TermView { leg: TermLeg::new(cols, rows)?, interacted: false, session_focus: None })
+        Ok(TermView {
+            leg: TermLeg::new(cols, rows)?,
+            interacted: false,
+            last_sent: None,
+            session_focus: None,
+        })
     }
 
     /// 渲染到 pane 区域（每渲染拍调用；rows_and_commit 同时清脏标）。

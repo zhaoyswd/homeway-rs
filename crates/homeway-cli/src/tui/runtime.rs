@@ -904,16 +904,26 @@ fn handle_event(shared: &Arc<Shared>, stop: &StopFlag, termview: &mut Option<Ter
             let focus = shared.app.lock().unwrap_or_else(|e| e.into_inner()).focus;
             match route_key(&k, focus) {
                 Route::Passthrough => {
-                    // 首次交互 RESIZE（仅本实例有键入即交互——镜像实例无键入，r2 N-4）。
+                    // RESIZE 随窗口跟随（r5 实录）：首次交互必发（仅交互实例，镜像
+                    // 实例无键入永不发——r2 N-4）；其后 pane 尺寸 ≠ 已发尺寸即重发
+                    // （覆盖「面板焦点改窗 → 回同一会话」——世代未变、interacted 已
+                    // 置位，此前永远不再发 ⇒ 会话几何冻结在旧尺寸）。
                     if let Some(tv) = termview.as_mut() {
                         let tx = shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()).clone();
                         if let Some(tx) = tx {
-                            if !tv.interacted {
+                            let a = *shared.term_area.lock().unwrap_or_else(|e| e.into_inner());
+                            let size = (a.width, a.height);
+                            let fresh = !tv.interacted;
+                            let follow = tv.interacted
+                                && tv.last_sent != Some(size)
+                                && a.width > 0
+                                && a.height > 0;
+                            if fresh {
                                 tv.interacted = true;
-                                let a = *shared.term_area.lock().unwrap_or_else(|e| e.into_inner());
-                                if a.width > 0 && a.height > 0 {
-                                    let _ = tx.send(LegInput::Resize(a.width, a.height));
-                                }
+                            }
+                            if (fresh || follow) && a.width > 0 && a.height > 0 {
+                                let _ = tx.send(LegInput::Resize(a.width, a.height));
+                                tv.last_sent = Some(size);
                             }
                             if k.kind == KeyEventKind::Press || k.kind == KeyEventKind::Repeat {
                                 if let Some(bytes) = input::encode_key_event(&k, tv.leg.vt()) {
@@ -944,6 +954,20 @@ fn handle_event(shared: &Arc<Shared>, stop: &StopFlag, termview: &mut Option<Ter
                             shared.persist_selection(&app);
                         }
                         list_beat(shared);
+                    }
+                    // 进入终端焦点：交互实例把当前 pane 尺寸同步给会话（r5 实录——
+                    // 面板焦点期间改窗口后 Enter，此前无任何路径补发 RESIZE）。
+                    if shared.app.lock().unwrap_or_else(|e| e.into_inner()).focus == Focus::Terminal {
+                        if let Some(tv) = termview.as_mut() {
+                            let a = *shared.term_area.lock().unwrap_or_else(|e| e.into_inner());
+                            let size = (a.width, a.height);
+                            if tv.interacted && tv.last_sent != Some(size) && a.width > 0 && a.height > 0 {
+                                if let Some(tx) = shared.input_tx.lock().unwrap_or_else(|e| e.into_inner()).clone() {
+                                    let _ = tx.send(LegInput::Resize(a.width, a.height));
+                                    tv.last_sent = Some(size);
+                                }
+                            }
+                        }
                     }
                 }
             }
@@ -1133,6 +1157,9 @@ fn ui_tick(
             let a = *shared.term_area.lock().unwrap_or_else(|e| e.into_inner());
             if a.width > 0 && a.height > 0 {
                 let _ = tx.send(LegInput::Resize(a.width, a.height));
+                if let Some(tv) = termview.as_mut() {
+                    tv.last_sent = Some((a.width, a.height));
+                }
             }
         }
     }
