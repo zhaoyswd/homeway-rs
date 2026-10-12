@@ -17,7 +17,6 @@
 
 #![allow(dead_code)]
 
-use ratatui::buffer::Cell as RCell;
 use ratatui::layout::Rect;
 use ratatui::style::{Color as RColor, Modifier as RModifier, Style};
 
@@ -49,10 +48,9 @@ impl TermView {
 
     /// 渲染到 pane 区域（每渲染拍调用；rows_and_commit 同时清脏标）。
     pub fn render(&mut self, f: &mut ratatui::Frame, area: Rect) {
-        // 先整区铺真空格（Cell::reset = 空格 + 缺省样式）：VT 契约「无文本 =
-        // symbol 空串」，而真终端对空串 cell 的 Print 是 no-op——空串格直接落
-        // 缓冲时旧字符（上一会话/上一帧）会原样残留（r5 验收实测：切换会话
-        // 多会话内容叠加）。铺底同时清掉网格小于 pane 的右侧/下侧带区。
+        // 先整区铺真空格（Cell::reset = 空格 + 缺省样式）：真终端对空串 cell 的
+        // Print 是 no-op，铺底保证空白区被真实空格覆盖（r5 切换会话残留修复）。
+        // 铺底同时清掉网格小于 pane 的右侧/下侧带区。
         let buf = f.buffer_mut();
         for y in area.top()..area.bottom() {
             for x in area.left()..area.right() {
@@ -72,25 +70,41 @@ impl TermView {
                 break;
             }
             let y = area.y + ry as u16;
-            let mut x = area.x;
-            for cell in &row.cells {
+            // 逐列 1:1 推进（宽字形占两格由「头格写字形 + 尾格写空串不打印」表达，
+            // 真终端自持两列）。**两种 skip 必须分开**——core 的头格 width 恒 1，
+            // 「两列」语义只由尾格 skip 位表达（cell_of 注释：skip 尾格表达宽度）：
+            // 紧跟在真字符格后的 skip = 宽字形尾格（写空串不打印）；行首等其余
+            // skip（前导宽占有位）= 空白（落真实空格）——写空串会让 ratatui 行内
+            // 游标假设前进而实际零输出，后续字符 MoveTo 被省略 ⇒ 真终端整行左移
+            // （r5 实测；pyte 的独立格模型看不见这类伪影）。
+            let mut prev_real = false;
+            for (col, cell) in row.cells.iter().enumerate() {
+                let x = area.x + col as u16;
                 if x >= area.x + area.width {
                     break;
                 }
-                let rc = buf.cell_mut((x, y)).expect("pane 内坐标");
-                apply_cell(rc, cell);
-                if cell.width == 2 {
-                    // 宽字符占两格：下一格由 width=0 占位落空格（此处直接推进）。
-                    x += 1;
-                    if x < area.x + area.width {
-                        if let Some(rc) = buf.cell_mut((x, y)) {
-                            // 尾占位格置空串：拼接文本不受残影污染（显示面为空白）。
-                            rc.set_symbol("");
-                            rc.set_style(Style::new().bg(cell_bg(&cell.bg)));
-                        }
-                    }
+                let Some(rc) = buf.cell_mut((x, y)) else { break };
+                if cell.skip && prev_real {
+                    rc.set_symbol("");
+                    rc.set_style(Style::new().bg(cell_bg(&cell.bg)));
+                } else if cell.skip || cell.symbol.is_empty() {
+                    rc.set_symbol(" ");
+                    rc.set_style(
+                        Style::new()
+                            .fg(cell_fg(&cell.fg))
+                            .bg(cell_bg(&cell.bg))
+                            .add_modifier(attr_mod(cell.attr)),
+                    );
+                } else {
+                    rc.set_symbol(cell.symbol.as_str());
+                    rc.set_style(
+                        Style::new()
+                            .fg(cell_fg(&cell.fg))
+                            .bg(cell_bg(&cell.bg))
+                            .add_modifier(attr_mod(cell.attr)),
+                    );
                 }
-                x += 1;
+                prev_real = !cell.skip && !cell.symbol.is_empty();
             }
         }
     }
@@ -107,23 +121,6 @@ pub(crate) fn cursor_in_pane(c: homeway_core::term::vt::Cursor, area: Rect) -> O
         area.x + c.x.min(area.width - 1),
         area.y + c.y.min(area.height - 1),
     ))
-}
-
-fn apply_cell(rc: &mut RCell, cell: &homeway_core::term::vt::Cell) {
-    if cell.skip {
-        // 宽字符尾/软折行占位（skip=true）不打印——真终端自持宽字形两列，
-        // 打印会打碎字形右半列。
-        rc.set_symbol("");
-    } else if cell.symbol.is_empty() {
-        // 空格（含**带样式空格**——core 口径 width=0/skip=false）与未写格统一落
-        // **真实空格**：空串在真终端是 Print no-op，而 ratatui 的行内游标假设它
-        // 已打印 ⇒ 该行后续字符的 MoveTo 全被省略、整行逐字左移（codex 菜单
-        // 「词粘连」），且旧内容不被擦除（opencode「不清屏、重叠」）——r5 实测根因。
-        rc.set_symbol(" ");
-    } else {
-        rc.set_symbol(cell.symbol.as_str());
-    }
-    rc.set_style(Style::new().fg(cell_fg(&cell.fg)).bg(cell_bg(&cell.bg)).add_modifier(attr_mod(cell.attr)));
 }
 
 fn cell_fg(c: &HColor) -> RColor {
@@ -168,6 +165,7 @@ fn attr_mod(attr: u16) -> RModifier {
 
 #[cfg(test)]
 mod tests {
+
     use super::*;
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -234,35 +232,43 @@ mod tests {
     }
 
     #[test]
-    fn styled_space_renders_real_space_not_empty() {
-        // r5 实测根因钉：带样式空格（core 口径 width=0/skip=false）必须落真实空格——
-        // 空串会让 Print 变 no-op 且 ratatui 行内游标错位（codex 词粘连 / opencode 不清屏）。
+    fn wide_char_column_alignment_pin() {
+        // r5 两轮实测回归钉：真终端下空串格导致「行内游标假设前进而实际零输出」⇒
+        // 后续字符整段左移；以及旧实现的宽头格双推进 ⇒ 后续右移。此处逐列断言
+        // 宽字符前后的对齐（左移/右移都会红）。
+        let mut tv = TermView::new(40, 10).expect("建视图");
+        tv.leg.on_frame(&homeway_core::term::frames::Frame {
+            op: homeway_core::term::frames::Op::DATA,
+            payload: b"\x1b[2J\x1b[Hab\xe4\xb8\x96cd".to_vec(), // ab世cd
+        });
+        let mut t = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        let area = Rect::new(0, 0, 40, 10);
+        t.draw(|f| tv.render(f, area)).unwrap();
+        let b = t.backend().buffer();
+        assert_eq!(b[(0, 0)].symbol(), "a", "列0");
+        assert_eq!(b[(1, 0)].symbol(), "b", "列1");
+        assert_eq!(b[(2, 0)].symbol(), "世", "宽字形头格在列2");
+        // 尾格不发射（frame 缓冲里是空串、与内部上一帧相同 ⇒ diff 跳过）——
+        // TestBackend 显示从未被写的初始空格；真终端此处由宽字形右半列自持。
+        assert_eq!(b[(3, 0)].symbol(), " ", "尾格不发射（宽字形自持两列）");
+        assert_eq!(b[(4, 0)].symbol(), "c", "宽字符后列4（左移/右移钉）");
+        assert_eq!(b[(5, 0)].symbol(), "d", "宽字符后列5");
+    }
+
+    #[test]
+    fn styled_space_renders_real_space() {
+        // 带样式空格（core 口径 width=0/skip=false）必须落真实空格（同左移根因）。
+        let mut tv = TermView::new(8, 1).expect("建视图");
+        tv.leg.on_frame(&homeway_core::term::frames::Frame {
+            op: homeway_core::term::frames::Op::DATA,
+            payload: b"\x1b[2J\x1b[H\x1b[1mA\x1b[0m B".to_vec(),
+        });
         let mut t = Terminal::new(TestBackend::new(8, 1)).unwrap();
-        let cell = homeway_core::term::vt::Cell {
-            symbol: String::new(),
-            width: 0,
-            skip: false,
-            fg: homeway_core::term::vt::Color::None,
-            bg: homeway_core::term::vt::Color::None,
-            attr: 0,
-        };
-        t.draw(|f| {
-            let buf = f.buffer_mut();
-            let rc = buf.cell_mut((0, 0)).unwrap();
-            apply_cell(rc, &cell);
-        })
-        .unwrap();
-        assert_eq!(t.backend().buffer()[(0, 0)].symbol(), " ", "带样式空格 → 真实空格");
-        // 宽字符尾（skip=true）保持空串不打印。
-        let tail = homeway_core::term::vt::Cell { skip: true, ..cell.clone() };
-        let mut t2 = Terminal::new(TestBackend::new(8, 1)).unwrap();
-        t2.draw(|f| {
-            let buf = f.buffer_mut();
-            let rc = buf.cell_mut((0, 0)).unwrap();
-            apply_cell(rc, &tail);
-        })
-        .unwrap();
-        assert_eq!(t2.backend().buffer()[(0, 0)].symbol(), "", "宽尾占位保持不打印");
+        t.draw(|f| tv.render(f, Rect::new(0, 0, 8, 1))).unwrap();
+        let b = t.backend().buffer();
+        assert_eq!(b[(0, 0)].symbol(), "A");
+        assert_eq!(b[(1, 0)].symbol(), " ", "词间空格保留（列1）");
+        assert_eq!(b[(2, 0)].symbol(), "B", "空格后字符在列2（左移钉）");
     }
 
     #[test]
