@@ -170,6 +170,17 @@
   字节转储双证渲染一直正确**）、vim 全屏/退出、clear、中文回显全部通过
   · 新发现（独立于输出层）：改窗后 shell 提示符重绘对齐瑕疵（zsh 重绘×VT 重排交互）
   记入下一步
+- 2026-10-12　**blit 移植首日回归修复（两处实症）**：①**光标不可见**——ui_loop 自建了
+  光标槽 Arc 而 BlitBackend 内部另有其一（渲染写 A、编码读 B 恒 None）；修=槽必须取自
+  backend 实例。②**改窗整屏空白**——根因（读 ratatui 源码坐实）：`apply_buffer_with_cursor`
+  为 `flush(差分喂送)→swap→backend.flush()` 双冲洗，且 resize 路径 `clear_viewport`
+  会复位内部缓冲并自走一轮 flush——我们靠 diff 增量维护的镜像缓冲被清空后，ratatui
+  两内部缓冲彼此一致、diff 恒空、**永不复喂**（帧转储实证 nonblank 216→0 不复原）。
+  修=**放弃镜像，改快照驱动**：`Terminal::draw` 返回的 `CompletedFrame.buffer` 即当帧
+  完整快照——runtime 每帧取它喂 `BlitEncoder`（后端只剩报尺寸/收 clear 旗/光标槽），
+  与 herdr 的「编码器吃完整帧」形态一致，diff-mirror 失同步类整体消除。
+  tmux 实证：光标 flag=1 且改窗后位置正确、100×28/120×35 双向改窗内容完整、ls 全行
+  完整。126 用例绿 clippy 零告警。
 - 2026-10-12　5.1 手测发现（第四轮，**高危**）：**「work 会话敲命令回车无反应、命令消失」
   真因 = TUI 进程 tty 死亡后 100% CPU 永久自旋**——crossterm 0.29 `try_read` 内圈在
   `read` 返回 `Ok(0)`（EOF）或非 WouldBlock 错误时既不 break 也不返回（源码实证），

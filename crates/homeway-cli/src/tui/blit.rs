@@ -454,38 +454,38 @@ fn write_cell(
 // ---------------------------------------------------------------------------
 
 use ratatui::backend::{Backend, ClearType, WindowSize};
-use ratatui::buffer::Buffer;
-use ratatui::layout::{Position, Rect, Size};
+use ratatui::layout::{Position, Size};
 use std::io;
 use std::sync::{Arc, Mutex};
 
-/// Buffer-backed 后端：维持整屏 Buffer，flush 时转帧 → 差分编码 → 写宿主终端。
-/// **输出侧不再经过 ratatui 的 crossterm 后端**（其逐格 Print 的行内游标假设是
-/// r5 渲染缺陷的病灶层）；ratatui 只用于离屏合成（面板/终端视图照旧渲染进 Buffer）。
+/// 输出后端（r5 二次实测定稿）：**不维持镜像缓冲**——ratatui 的差分喂送在 resize/
+/// clear 路径会与后端失同步（`clear_viewport` 复位内部缓冲后双方 diff 恒空、永不复喂，
+/// 实测改窗后整屏空白）；改为 runtime 每帧直接取 `Terminal::draw` 返回的
+/// `CompletedFrame.buffer`（当帧完整快照）喂 [`BlitEncoder`]。本后端只剩三件事：
+/// 报尺寸、收 `clear` 旗（→ 请求整屏 repaint）、提供光标槽。
 pub(crate) struct BlitBackend {
-    buffer: Buffer,
-    /// 帧光标槽（渲染闭包内写、flush 读——ratatui 自身的光标回调在本后端为 no-op）。
+    /// 帧光标槽（渲染闭包内写、runtime 编码时读）。
     cursor: Arc<Mutex<Option<CursorState>>>,
-    encoder: BlitEncoder,
-    out: io::Stdout,
-    repaint: bool,
+    /// ratatui 请求过 clear（resize 等）⇒ 下一帧走整屏重画。
+    repaint: Arc<std::sync::atomic::AtomicBool>,
 }
 
 impl BlitBackend {
     pub(crate) fn new() -> Self {
-        let (cols, rows) = crossterm::terminal::size().unwrap_or((80, 24));
         BlitBackend {
-            buffer: Buffer::empty(Rect::new(0, 0, cols, rows)),
             cursor: Arc::new(Mutex::new(None)),
-            encoder: BlitEncoder::new(),
-            out: io::stdout(),
-            repaint: true,
+            repaint: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         }
     }
 
     /// 与渲染闭包共享的光标槽。
     pub(crate) fn cursor_slot(&self) -> Arc<Mutex<Option<CursorState>>> {
         Arc::clone(&self.cursor)
+    }
+
+    /// 整屏重画请求旗（clear 置位；runtime 编码时消费）。
+    pub(crate) fn repaint_flag(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.repaint)
     }
 
     fn term_size(&self) -> (u16, u16) {
@@ -496,15 +496,11 @@ impl BlitBackend {
 impl Backend for BlitBackend {
     type Error = io::Error;
 
-    fn draw<'a, I>(&mut self, content: I) -> io::Result<()>
+    fn draw<'a, I>(&mut self, _content: I) -> io::Result<()>
     where
         I: Iterator<Item = (u16, u16, &'a ratatui::buffer::Cell)>,
     {
-        for (x, y, cell) in content {
-            if let Some(target) = self.buffer.cell_mut((x, y)) {
-                *target = cell.clone();
-            }
-        }
+        // 差分喂送不消费——帧源 = CompletedFrame.buffer 快照。
         Ok(())
     }
 
@@ -525,18 +521,16 @@ impl Backend for BlitBackend {
     }
 
     fn set_cursor_position<P: Into<Position>>(&mut self, _position: P) -> io::Result<()> {
-        // 光标以渲染闭包写入的共享槽为准（见 ui_tick 接线）。
         Ok(())
     }
 
     fn clear(&mut self) -> io::Result<()> {
-        self.buffer.reset();
-        self.repaint = true;
+        self.repaint.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
     fn clear_region(&mut self, _clear_type: ClearType) -> io::Result<()> {
-        self.buffer.reset();
+        self.repaint.store(true, std::sync::atomic::Ordering::SeqCst);
         Ok(())
     }
 
@@ -558,19 +552,7 @@ impl Backend for BlitBackend {
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        // 尺寸变化兜底（Terminal 理应已走 clear，这里再保险一次）。
-        let (cols, rows) = self.term_size();
-        if cols != self.buffer.area.width || rows != self.buffer.area.height {
-            self.buffer = Buffer::empty(Rect::new(0, 0, cols, rows));
-            self.repaint = true;
-        }
-        let cursor = *self.cursor.lock().unwrap_or_else(|e| e.into_inner());
-        let frame = FrameData::from_ratatui_buffer(&self.buffer, cursor);
-        let encoded = self.encoder.encode(&frame, self.repaint);
-        self.repaint = false;
-        self.out.write_all(&encoded.bytes)?;
-        self.out.flush()?;
-        self.encoder.commit(frame, encoded);
+        // 编码由 runtime 在 draw 后按 CompletedFrame 快照执行——此处无事。
         Ok(())
     }
 }

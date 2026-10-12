@@ -29,7 +29,7 @@ use crossterm::{execute, terminal};
 use ratatui::layout::Rect;
 use ratatui::Terminal;
 
-use super::blit::BlitBackend;
+use super::blit::{BlitBackend, BlitEncoder};
 use super::frame::CursorState;
 
 use homeway_core::daemon::client::ControlClient;
@@ -797,9 +797,13 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
     let mut leg_recv: Option<RecvHalf> = None;
     let mut termview: Option<TermView> = None;
     let mut ui_gen = shared.leg_gen_now();
-    // 帧光标槽（渲染闭包写入 → BlitBackend.flush 读取；DECSCUSR 随帧由编码器下发）。
+    // 帧光标槽：**必须取自 BlitBackend 实例**（渲染闭包写入 → flush 读取；
+    // 各建各的 Arc 会让指针永不可见——r5 移植首日实测）。
+    let mut backend_opt = Some(BlitBackend::new());
     let cursor_slot: std::sync::Arc<std::sync::Mutex<Option<CursorState>>> =
-        std::sync::Arc::new(std::sync::Mutex::new(None));
+        backend_opt.as_ref().expect("backend 已建").cursor_slot();
+    let repaint_flag = backend_opt.as_ref().expect("backend 已建").repaint_flag();
+    let mut encoder = BlitEncoder::new();
     // ` +` 输入浮层（主机 token / 会话名）。
     let mut input: Option<InputState> = None;
 
@@ -823,7 +827,8 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
         return 2;
     }
     let code = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        let mut t = match Terminal::new(BlitBackend::new()) {
+        let backend = backend_opt.take().expect("backend 单次构建");
+        let mut t = match Terminal::new(backend) {
             Ok(t) => t,
             Err(e) => {
                 eprintln!("homeway tui：终端初始化失败：{e}");
@@ -890,7 +895,7 @@ fn ui_loop(shared: &Arc<Shared>, stop: &StopFlag) -> i32 {
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 2,
             }
             // —— 渲染心跳以下与事件处理同拍（每 ≤100ms 一轮）——
-            if !ui_tick(shared, stop, &mut t, &mut termview, &mut leg_recv, &mut ui_gen, &cursor_slot, &input) {
+            if !ui_tick(shared, stop, &mut t, &mut termview, &mut leg_recv, &mut ui_gen, &cursor_slot, &mut encoder, &repaint_flag, &input) {
                 break 0;
             }
             if stop.stopped() {
@@ -1137,6 +1142,8 @@ fn ui_tick(
     leg_recv: &mut Option<RecvHalf>,
     ui_gen: &mut u64,
     cursor_slot: &std::sync::Arc<std::sync::Mutex<Option<CursorState>>>,
+    encoder: &mut BlitEncoder,
+    repaint_flag: &std::sync::Arc<std::sync::atomic::AtomicBool>,
     input: &Option<InputState>,
 ) -> bool {
     // 挂腿状态收敛（r4 高1）：期望目标 ≠ 已挂目标 ⇒ 重挂——覆盖冷启动、
@@ -1217,15 +1224,30 @@ fn ui_tick(
     let area_store = &shared.term_area;
     let app_ref = &mut *shared.app.lock().unwrap_or_else(|e| e.into_inner());
     let tv = termview.as_mut();
-    if t
-        .draw(|f| {
-            let overlay = input.as_ref().map(|s| s.overlay());
-            render::draw(f, app_ref, tv, &status, &rates, now, overlay.as_ref(), cursor_slot);
-            *area_store.lock().unwrap_or_else(|e| e.into_inner()) = f.area();
-        })
-        .is_err()
-    {
-        return false;
+    // 绘制 + **快照编码**（r5 二次实测定稿）：取 CompletedFrame.buffer（当帧完整
+    // 快照）喂 BlitEncoder——不经 ratatui 的差分喂送（其 clear/resize 路径会与
+    // 后端镜像失同步、改窗整屏空白实测）。completed 借用 t，编码在此作用域内完成。
+    let draw_result = t.draw(|f| {
+        let overlay = input.as_ref().map(|s| s.overlay());
+        render::draw(f, app_ref, tv, &status, &rates, now, overlay.as_ref(), cursor_slot);
+        *area_store.lock().unwrap_or_else(|e| e.into_inner()) = f.area();
+    });
+    match draw_result {
+        Ok(completed) => {
+            let cursor = *cursor_slot.lock().unwrap_or_else(|e| e.into_inner());
+            let frame = super::frame::FrameData::from_ratatui_buffer(completed.buffer, cursor);
+            let repaint = repaint_flag.swap(false, Ordering::SeqCst);
+            let encoded = encoder.encode(&frame, repaint);
+            {
+                use std::io::Write as _;
+                let mut out = io::stdout();
+                if out.write_all(&encoded.bytes).is_err() || out.flush().is_err() {
+                    return false;
+                }
+            }
+            encoder.commit(frame, encoded);
+        }
+        Err(_) => return false,
     }
     // 尺寸变化待发：新 area 落位后下发 RESIZE（r4 中4）——尺寸取标题栏之下内容区。
     if shared.pending_resize.swap(false, Ordering::SeqCst) {
