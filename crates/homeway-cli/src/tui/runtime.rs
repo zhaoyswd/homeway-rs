@@ -924,11 +924,13 @@ fn handle_event(shared: &Arc<Shared>, stop: &StopFlag, termview: &mut Option<Ter
                     }
                 }
                 Route::Panel(cmd) => {
-                    let quit = {
+                    // (quit, changed) 双旗——quit 仅 Quit 命令；apply_panel 的返回是
+                    // 「选中已变化」（bb8f90e 曾误当 quit ⇒ 任意改选中的键直接退出）。
+                    let (quit, changed) = {
                         let mut app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
                         match cmd {
-                            PanelCmd::Quit => true,
-                            other => app.apply_panel(other),
+                            PanelCmd::Quit => (true, false),
+                            other => (false, app.apply_panel(other)),
                         }
                     };
                     if quit {
@@ -936,11 +938,13 @@ fn handle_event(shared: &Arc<Shared>, stop: &StopFlag, termview: &mut Option<Ter
                         return false;
                     }
                     // 用户发起 ⇒ 持久化 + 立即重取列表（重挂腿由收敛块接管，r4 高1）。
-                    {
-                        let app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
-                        shared.persist_selection(&app);
+                    if changed {
+                        {
+                            let app = shared.app.lock().unwrap_or_else(|e| e.into_inner());
+                            shared.persist_selection(&app);
+                        }
+                        list_beat(shared);
                     }
-                    list_beat(shared);
                 }
             }
         }
