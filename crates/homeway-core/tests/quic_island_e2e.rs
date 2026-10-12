@@ -1109,8 +1109,9 @@ fn last_dns_counters(log: &PathBuf) -> Option<(u64, u64, u64, String)> {
 /// 再发查询 ⇒ Δ **必为**本轮两枚查询的净增量；断言 `Δq ≥ 2` + `Δfilter ≥ 1` + `Δresp ≥ 1`
 /// ——**过滤 qtype 只记 `filter` 不记 `resp`**（`dnsproxy.rs:666/702`，回源码核过）；两段等待各 ≤100s）。
 ///
-/// **口径（如实）**：`resolve=…:5300`（TCP 解析腿）**不在本机轮**——内层 TCP 需要真客户端
-/// 内核栈；且宿主会话面对该端口已退役（`INTEROP-CRITERIA` CA5 登记）。真机轮（S2b/U2）承接。
+/// **口径（如实）**：`resolve=…:5300`（栈内 TCP 解析腿）**不在本机轮**——内层 TCP 需要真客户端
+/// 内核栈；宿主会话面对该腿的消费已改经 `STREAM[tag=6]`（DNS-STREAM 批，2026-10-12 承接，
+/// `INTEROP-CRITERIA` CA5 已恢复——本处只述「本机轮不覆盖栈内 `:5300`」）。真机轮（S2b/U2）承接。
 /// AAAA（`qtype=28`）是**代答过滤**集 ⇒ 该应答不依赖上游网络，判定本机可复现。
 #[test]
 #[ignore = "端到端（DNS over tunnel）：需本地 QUIC 出口在跑（tools/quic-island-e2e.sh 驱动）"]

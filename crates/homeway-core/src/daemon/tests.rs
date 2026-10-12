@@ -1307,3 +1307,23 @@ fn handshake_deadline_beats_slow_drip() {
     let _ = serve_h.join();
     let _ = std::fs::remove_dir_all(sock.parent().unwrap());
 }
+
+/// **判据（DNS-STREAM 批；代码门 r34 L5）**：`dial_port` 缝的归因分档——
+/// `ServiceDisabled`（`reset(0x22)`）带端口号改写文案（可行动）；`Refused` 仍走
+/// `连接被拒（对端 RST）`（两形态在宿主会话面可区分）。
+#[test]
+fn dial_port_error_attribution_splits_disabled_from_refused() {
+    use crate::facade::host_session::HostErr;
+    match super::map_dial_port_err(HostErr::ServiceDisabled, 5300) {
+        crate::daemon::carriers::DialErr::ServiceDisabled(p) => {
+            assert_eq!(p, 5300);
+            let msg = crate::daemon::carriers::DialErr::ServiceDisabled(p).to_string();
+            assert!(msg.contains("5300") && msg.contains("未装配"), "文案含端口与归因：{msg}");
+        }
+        other => panic!("期望 ServiceDisabled，实得 {other:?}"),
+    }
+    match super::map_dial_port_err(HostErr::Refused, 5300) {
+        crate::daemon::carriers::DialErr::Refused => {}
+        other => panic!("期望 Refused，实得 {other:?}"),
+    }
+}

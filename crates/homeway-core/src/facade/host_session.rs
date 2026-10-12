@@ -1120,8 +1120,29 @@ mod tests {
             io::ErrorKind::NotConnected
         );
         assert_eq!(kind(HostErr::Refused), io::ErrorKind::ConnectionRefused);
+        // DNS-STREAM 批（代码门 r34 L5）：服务未装配与「服务在但被拒」在**桥面**同档
+        // （`bridge_host::is_refused_like` 的 link_down 判据不变）；细分只在拨号缝文案。
+        assert_eq!(
+            kind(HostErr::ServiceDisabled),
+            io::ErrorKind::ConnectionRefused
+        );
         assert_eq!(kind(HostErr::Budget), io::ErrorKind::TimedOut);
         assert_eq!(kind(HostErr::Closed("x".into())), io::ErrorKind::Other);
+        // 反向（`from_io`）：ConnectionRefused 仍归 Refused（ServiceDisabled 无独立 io kind
+        // ⇒ 只由 `from_stream` 的 0x22 产生，不在此反解）
+        assert!(matches!(
+            HostErr::from_io(io::Error::from(io::ErrorKind::ConnectionRefused)),
+            HostErr::Refused
+        ));
+        // `StreamErr::NotSupported`（0x22）与 `Refused`（0x25）在 typed 面分档
+        assert!(matches!(
+            HostErr::from_stream(StreamErr::NotSupported),
+            HostErr::ServiceDisabled
+        ));
+        assert!(matches!(
+            HostErr::from_stream(StreamErr::Refused),
+            HostErr::Refused
+        ));
     }
 
     /// **判据（K13：状态值域与字符串同串）**。

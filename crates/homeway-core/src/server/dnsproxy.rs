@@ -571,9 +571,12 @@ impl DnsProxy {
     /// 与计数输入集口径一致）、在途门/入队失败计 `dropped`；`is_tcp = true` 写死
     /// （应答**不**按 1232 截断——漏传会让大应答被静默截断而 CA5 的小 A 查询照常绿）。
     ///
-    /// 等待上界 = `budget + 1s`（与 `answer_sync` 同款）：worker 的上游尝试由绝对期限
-    /// 钳在 `budget` 内 ⇒ 超时只出现在 worker 线程异常的残余面。`None` = 丢弃/无应答，
-    /// 调用方**不回帧**（与栈内 TCP 面一致：客户端按自身预算超时归因、不缓存）。
+    /// 等待上界 = `budget + 1s`（与 `answer_sync` 同款）。**如实口径（代码门 r34 M1 订正）**：
+    /// 单条 job 由绝对期限钳在 `budget` 内，但**门饱和（在途 256）时入队后还要排在 64 个
+    /// worker 之后**——末位 job 的排队等待最坏 ≈ (256−64)/64 × budget ≈ 7.5s > 上界 ⇒
+    /// 一条上游正常的查询也可能到点返 `None`（**负载下的主动让路**，与栈内 TCP 面的异步回投
+    /// 在极端负载下会分叉：那边晚到也送达）。`None` = 丢弃/无应答，调用方**不回帧**
+    /// （客户端按自身预算超时归因、不缓存 ⇒ 重试语义与栈内面同族）。
     pub fn answer_stream(&self, query: &[u8]) -> Option<Vec<u8>> {
         self.core.stats.qtcp.fetch_add(1, Ordering::Relaxed);
         let (tx, rx) = mpsc::channel();
@@ -1777,6 +1780,49 @@ mod tests {
         std::thread::sleep(Duration::from_millis(120));
         assert!(p2.answer_stream(&a_query("gate.test", 2)).is_none(), "在途门应拒第二条");
         assert!(p2.stats_line().contains("drop=1"), "stats: {}", p2.stats_line());
+        // ② 饱和让路（代码门 r34 M1③）：门**饱和**（非门拒）下排队等待 > recv_timeout ⇒ None
+        //    且**不计 drop**（它过了门）——与栈内 TCP 面的异步回投在极端负载下分叉，如实钉死。
+        let dead2 = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
+        let dead2_addr = format!("127.0.0.1:{}", dead2.local_addr().unwrap().port());
+        std::thread::spawn(move || {
+            let mut buf = [0u8; 1500];
+            while dead2.recv_from(&mut buf).is_ok() {}
+        });
+        let dir3 = std::env::temp_dir().join(format!("homeway-rs-dnssat-{}", std::process::id()));
+        std::fs::create_dir_all(&dir3).unwrap();
+        std::fs::write(dir3.join("resolv.conf"), format!("nameserver {dead2_addr}\n")).unwrap();
+        let (logf3, dlogf3) = noop();
+        let (p3, _ev3) = DnsProxy::spawn(
+            DnsConfig {
+                resolv_path: dir3.join("resolv.conf").to_string_lossy().into_owned(),
+                fallback_dns: "127.0.0.1:1".to_owned(),
+                budget: Duration::from_millis(1000),
+                workers: 1,
+                max_in_flight: 8,
+                ..Default::default()
+            },
+            logf3,
+            dlogf3,
+        );
+        // 一条 worker + 四条排队（每条吃满 budget=1s）⇒ 第五条（本探针）排队 ≈4s > budget+1s=2s
+        let mut hs = Vec::new();
+        for i in 0..4u16 {
+            let p = Arc::clone(&p3);
+            hs.push(std::thread::spawn(move || p.answer_stream(&a_query("sat.test", 10 + i))));
+            std::thread::sleep(Duration::from_millis(30));
+        }
+        let c = p3.answer_stream(&a_query("sat.test", 99));
+        assert!(c.is_none(), "门饱和下的排队让路应返 None");
+        assert!(
+            p3.stats_line().contains("drop=0"),
+            "让路非门拒（不计 drop）：{}",
+            p3.stats_line()
+        );
+        for h in hs {
+            let _ = h.join();
+        }
+        let _ = std::fs::remove_dir_all(&dir3);
+
         // 首条：worker 由绝对期限钳在 budget 内 ⇒ 总会给应答（全死上游 = SERVFAIL，不是 None）
         let first = h.join().unwrap().expect("预算内应有应答（SERVFAIL 也是应答）");
         assert_eq!(first[3] & 0x0F, 2, "全死上游 ⇒ SERVFAIL");

@@ -16,15 +16,18 @@
 //!    送 1 字节」的滴流无限续命 ⇒ 逐 syscall 收敛到帧首算起的绝对预算（同 `dnsproxy` 的
 //!    `DeadlineIo` 口径）。
 //!
-//! **内存账（2-1 订正后）**：每连接 = 线程栈 256 KiB（照 `facade/portfwd.rs` 的
-//! `PF_THREAD_STACK` 先例；files/term 用默认 2 MiB 栈）+ socketpair 双向缓冲（`tuning.rs`
-//! `SOCKPAIR_BYTES` 64 KiB/向，内核记账 ≈2×）+ 泵缓冲 8 KiB ⇒ **≈448 KiB/连接**；
-//! 闸上限 64 ⇒ **最坏 ≈28 MiB**（原设计稿「≈16 MiB」漏算了 socketpair 与泵缓冲，已订正）。
+//! **内存账（2-1 订正 + 代码门 r34 L3 算清）**：每连接 = 线程栈 256 KiB（照
+//! `facade/portfwd.rs` 的 `PF_THREAD_STACK` 先例；files/term 用默认 2 MiB 栈）+ socketpair
+//! 4 面装填值（`tuning.rs` 的 `SOCKPAIR_BYTES` 64 KiB/面 ⇒ 256 KiB；口径照 `exit/pump.rs`
+//! 「按设置值记」、不乘内核系数）+ 泵缓冲 8 KiB ⇒ **≈520 KiB/连接**；闸上限 64 ⇒
+//! **最坏 ≈33 MiB**（原设计稿「≈16 MiB」漏算 socketpair 与泵缓冲，本批两轮订正后以此式为准）。
 //!
 //! **帧异常面**（与栈内 TCP 面逐条同形）：`len=0` ⇒ 收线（Go「空 TCP 消息」判异常；**不计
 //! `qtcp`**——计数发生在读帧之后）；畸形（len<12）⇒ 交 dnsproxy（`malformed` +1）且**不回帧**；
 //! 丢弃/无应答（`answer_stream` 返 `None`）⇒ 不回帧（客户端按自身 5s 预算超时归因）；
 //! 应答长度域 > `u16::MAX` ⇒ **收线**（镜像 `dnsface::deliver_tcp`；静默截断会把帧语义写坏）。
+//! 应答下界 ≥12B 由 `dnsproxy` 保证（能过 `qtype` 的查询必得 ≥12B 应答或 SERVFAIL）——
+//! 本层不另设长度下界（代码门 r34 L7）。
 
 use std::io::{ErrorKind, Read, Write};
 use std::os::unix::net::UnixStream;
@@ -71,6 +74,7 @@ pub(crate) fn serve_with_cap(
 ) -> std::io::Result<()> {
     let live = Arc::new(AtomicUsize::new(0));
     let refused = Arc::new(AtomicU64::new(0));
+    let spawn_fails = Arc::new(AtomicU64::new(0));
     let logf_accept = Arc::clone(&logf);
     serve_stoppable_accepts(
         || intake.accept(),
@@ -100,9 +104,13 @@ pub(crate) fn serve_with_cap(
                     handle_conn(conn, dns2, logf2);
                 })
             {
-                (logf)(&format!(
-                    "⚠️ dns: 流腿会话线程起不来（{e}）——连接直接收线（在册名额已回收）"
-                ));
+                // 节流（代码门 r34 L6）：fd/内存耗尽期正是该行的放大期——首 3 + 每 100
+                let k = spawn_fails.fetch_add(1, Ordering::Relaxed) + 1;
+                if k <= 3 || k.is_multiple_of(100) {
+                    (logf)(&format!(
+                        "⚠️ dns: 流腿会话线程起不来（{e}）——连接直接收线（累计 {k}；在册名额已回收）"
+                    ));
+                }
             }
         },
         stop,

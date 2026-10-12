@@ -455,41 +455,25 @@ impl ServeEngine {
         // ---- DNS 流腿（`STREAM[tag=6]` dns-resolve；DNS-STREAM 批，2026-10-12）----
         // 可用性判据 = `dns_enabled`（**与 `dns_port` 取值无关**——tag 不携带端口；`dns_port`
         // 只管栈内 `:53/:5300` 监听面）；未装配 ⇒ 出口对该 tag 落既有 `reset(0x22)`。
-        if let Some(proxy) = &dns {
-            match homeway_quic::ServiceIntake::quic_only(
-                homeway_quic::tuning::service_defaults::intake_capacity(
-                    crate::server::dns_stream::MAX_CONNS,
-                ),
-            ) {
-                Ok((intake, tx)) => {
-                    service_intakes.dns = Some(tx);
-                    (logf)(&format!(
-                        "dns 流腿就绪：STREAM tag=6（客户端虚拟端口 {}；代答复用 :53 同一上游 dnsproxy）",
-                        crate::facade::bridge_host::port::DNS_RESOLVE
-                    ));
-                    let stop = spawn_service_stop_flag(&mut stop_flags);
-                    let proxy2 = Arc::clone(proxy);
-                    let d2 = Arc::clone(&dlogf);
-                    let d3 = Arc::clone(&dlogf);
-                    if let Err(e) = std::thread::Builder::new()
-                        .name("homeway-dns-stream".into())
-                        .spawn(move || {
-                            if let Err(e) =
-                                crate::server::dns_stream::serve(intake, proxy2, stop, Arc::clone(&d2))
-                            {
-                                (d2)(&format!(
-                                    "dns: 流腿服务线程退工（{e}）——socks 域名目标不可用，直到重启出口"
-                                ));
-                            }
-                        })
+        if let (Some(proxy), Some((intake, tx))) = (&dns, dns_intake_of(dns.as_ref(), &logf)) {
+            service_intakes.dns = Some(tx);
+            let stop = spawn_service_stop_flag(&mut stop_flags);
+            let proxy2 = Arc::clone(proxy);
+            let d2 = Arc::clone(&dlogf);
+            let d3 = Arc::clone(&dlogf);
+            if let Err(e) = std::thread::Builder::new()
+                .name("homeway-dns-stream".into())
+                .spawn(move || {
+                    if let Err(e) =
+                        crate::server::dns_stream::serve(intake, proxy2, stop, Arc::clone(&d2))
                     {
-                        (d3)(&format!("⚠️ dns: 流腿服务线程起不来（{e}）——socks 域名目标不可用"));
+                        (d2)(&format!(
+                            "dns: 流腿服务线程退工（{e}）——socks 域名目标不可用，直到重启出口"
+                        ));
                     }
-                }
-                Err(_e0) => {
-                    // 入口建不起来（fd/内存）：该 tag 落 0x22（与 files/speedtest 的保守选择同款）
-                    (logf)("⚠️ dns: 流腿入口起不来——socks 域名目标不可用（该 tag 落 0x22）");
-                }
+                })
+            {
+                (d3)(&format!("⚠️ dns: 流腿服务线程起不来（{e}）——socks 域名目标不可用"));
             }
         }
         let files_srv = crate::files_server::FilesServer::open(cfg.files_root.as_deref(), Arc::clone(&dlogf)).ok();
@@ -1248,6 +1232,32 @@ fn remove_sock_own(path: &std::path::Path, own: (u64, u64)) {
 /// 失败（自唤醒管道/权限面，理论面）⇒ 与「监听失败」同一取舍：**该服务整条腿停用**
 /// （记行 + 返回 `None`，调用方关掉服务对象）——`0x22`（服务不可用）才是如实观测
 /// （设计门 N16 的保守面：不做「静默降级成只有 UDS」）。
+/// DNS 流腿（`STREAM[tag=6]`）的入口装配（**DNS-STREAM 批；代码门 r34 M2③ 的可测面**）：
+/// `dns = None`（DNS 未启用）或入口建不起来 ⇒ `None`（该 tag 落既有 `reset(0x22)`）；
+/// 可用性判据 = `dns_enabled`，**与 `dns_port` 取值无关**（tag 不携带端口）。
+fn dns_intake_of(
+    dns: Option<&Arc<DnsProxy>>,
+    logf: &Logf,
+) -> Option<(homeway_quic::ServiceIntake, homeway_quic::ServiceIntakeTx)> {
+    dns?;
+    match homeway_quic::ServiceIntake::quic_only(
+        homeway_quic::tuning::service_defaults::intake_capacity(crate::server::dns_stream::MAX_CONNS),
+    ) {
+        Ok((intake, tx)) => {
+            (logf)(&format!(
+                "dns 流腿就绪：STREAM tag=6（客户端虚拟端口 {}；代答复用 :53 同一上游 dnsproxy）",
+                crate::facade::bridge_host::port::DNS_RESOLVE
+            ));
+            Some((intake, tx))
+        }
+        Err(_e) => {
+            // 入口建不起来（fd/内存）：该 tag 落 0x22（与 files/speedtest 的保守选择同款）
+            (logf)("⚠️ dns: 流腿入口起不来——socks 域名目标不可用（该 tag 落 0x22）");
+            None
+        }
+    }
+}
+
 fn service_intake(
     ln: std::os::unix::net::UnixListener,
     capacity: usize,
@@ -2596,6 +2606,38 @@ mod tests {
         (Arc::new(move |s: &str| {
             let _ = tx.send(s.to_owned());
         }), rx)
+    }
+
+    /// **判据（DNS-STREAM 批；代码门 r34 M2③ 的装配断言）**：`dns_intake_of` 两态——
+    /// `dns = None`（DNS 未启用）⇒ 无入口、无行（该 tag 落 0x22）；`dns = Some` ⇒ 入口 + 就绪行
+    /// （含虚拟端口 5300）。删掉装配接线（`service_intakes.dns = Some(tx)` 的上游）时本用例变红。
+    #[test]
+    fn dns_intake_assembles_only_when_dns_is_enabled() {
+        let (logf, rx) = log_sink();
+        assert!(dns_intake_of(None, &logf).is_none(), "DNS 未启用 ⇒ 无入口");
+        assert!(rx.try_iter().next().is_none(), "DNS 未启用 ⇒ 无就绪行");
+
+        let dir = std::env::temp_dir().join(format!("homeway-rs-dnsintake-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("resolv.conf"), "nameserver 127.0.0.1:1\n").unwrap();
+        let (dlogf, _drx) = log_sink();
+        let (proxy, _ev) = DnsProxy::spawn(
+            crate::server::dnsproxy::DnsConfig {
+                resolv_path: dir.join("resolv.conf").to_string_lossy().into_owned(),
+                ..Default::default()
+            },
+            Arc::clone(&dlogf),
+            dlogf,
+        );
+        let got = dns_intake_of(Some(&proxy), &logf).expect("DNS 启用 ⇒ 应有入口");
+        drop(got);
+        let lines: Vec<String> = rx.try_iter().collect();
+        assert!(
+            lines.iter().any(|l| l.contains("dns 流腿就绪：STREAM tag=6")
+                && l.contains("虚拟端口 5300")),
+            "就绪行须在场且带虚拟端口：{lines:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// **判据（S1-7 的失败形态 / E-q4）**：`--upnp=false` ⇒ 打**失败行**（不静默缺席）

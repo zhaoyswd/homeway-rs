@@ -263,14 +263,7 @@ fn carriers_dial_of(hosts: &Arc<hosts::HostTable>) -> carriers::CarrierDial {
                 .ok_or(carriers::DialErr::NoService(port))?;
             let stream = sess
                 .connect(sp, budget.min(std::time::Duration::from_secs(15)))
-                .map_err(|e| match e {
-                    // 服务未装配（0x22）带上端口号改写文案（DNS-STREAM 批：解析腿的
-                    // 「出口未开 DNS 代答」可行动归因）；其余照 `map_dial_err` 分派。
-                    crate::facade::host_session::HostErr::ServiceDisabled => {
-                        carriers::DialErr::ServiceDisabled(port)
-                    }
-                    other => map_dial_err(other),
-                })?;
+                .map_err(|e| map_dial_port_err(e, port))?;
             Ok(carrier_conn_of(stream))
         },
     );
@@ -289,6 +282,20 @@ fn carriers_dial_of(hosts: &Arc<hosts::HostTable>) -> carriers::CarrierDial {
         },
     );
     carriers::CarrierDial { dial_port, dial }
+}
+
+/// `dial_port` 缝的归因（**代码门 r34 L5 的可测面**）：服务未装配（`0x22`）带上端口号改写
+/// 文案（DNS-STREAM 批：解析腿「出口未开 DNS 代答」的可行动归因）；其余照 [`map_dial_err`]。
+fn map_dial_port_err(
+    e: crate::facade::host_session::HostErr,
+    port: u16,
+) -> carriers::DialErr {
+    match e {
+        crate::facade::host_session::HostErr::ServiceDisabled => {
+            carriers::DialErr::ServiceDisabled(port)
+        }
+        other => map_dial_err(other),
+    }
 }
 
 /// `HostErr` → 承载面归因（§2.5 的换型面）：服务级拒绝 = refused（runner 的

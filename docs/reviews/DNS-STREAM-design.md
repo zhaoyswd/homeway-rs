@@ -143,7 +143,7 @@ pub fn answer_stream(&self, query: &[u8]) -> Option<Vec<u8>>
 | 2-1 | **高** | 在册闸没真落地：`ServiceIntake` 容量只约束队列条数（取走即释放）⇒ 设计稿的 ≈16 MiB 内存账不成立 | **认同**：`dns_stream` 自带 `MAX_CONNS=64` 原子闸（RAII 守卫，超限**直接关流**）；内存账重记 = 栈 256 KiB + socketpair 64 KiB×2 向 + 泵 8 KiB ≈ **448 KiB/连接 ⇒ 最坏 ≈28 MiB**（模块头留痕）；`serve_with_cap` 可注入面 + 用例「第 cap+1 条 ⇒ EOF」；intake 容量不变量「对本服务不适用」写进 intake.rs 注释 |
 | 2-2 | 中 | 帧读期限 per-syscall ⇒ 滴流半帧无限续命 | **认同**：`read_exact_deadline` 逐 syscall 收敛到**每帧绝对预算**（`FRAME_BUDGET=10s`，同 `dnsproxy` 的 `DeadlineIo` 口径） |
 | 2-3 | 中 | 应答长度域 > u16::MAX 无处置（静默截断 = 帧语义坏） | **认同**：`u16::try_from` 失败 ⇒ **收线** + 记行（镜像 `dnsface::deliver_tcp`） |
-| 2-4 | 中 | 未装配（0x22）在客户端退化成「连接被拒（对端 RST）」（M5 H-2 修过的误导复现）；`DialErr::NoService` 失去唯一生产构造点 | **认同（选项 a）**：`HostErr::ServiceDisabled` 新变体（`StreamErr::NotSupported` 专收）+ `DialErr::ServiceDisabled(port)`（带端口可行动文案）；`speedtest`/`speedrun`/`host_reach` 同族分支同步；`NoService` 保留给真正无 tag 的端口；可达性变化记入变更记录 |
+| 2-4 | 中 | 未装配（0x22）在客户端退化成「连接被拒（对端 RST）」（M5 H-2 修过的误导复现）；`DialErr::NoService` 失去唯一生产构造点 | **认同（选项 a）**：`HostErr::ServiceDisabled` 新变体（`StreamErr::NotSupported` 专收）+ `DialErr::ServiceDisabled(port)`（带端口可行动文案）；`speedtest`/`speedrun` 同族分支同步（**订正（代码门 r34 L9）**：`host_reach` 面不存在——`daemon host reach` 走 token 端点裸 UDP 探测、零 `HostErr` 分支，本批未触 `hosts.rs`）；`NoService` 保留给真正无 tag 的端口；可达性变化记入变更记录 |
 | 2-5 | 低 | tag=6 可用性 = `dns_enabled`（与 `dns_port` 取值无关）须写明 | **认同**：装配行改「客户端虚拟端口 5300；代答复用 :53 同一上游 dnsproxy」+ engine 注释写死口径 |
 | 2-6 | 低 | drop 路径的客户端日志是「解析超时」而非「拨号失败」 | **认同**：记录/论证两分支分开写（本文 §三-2 的口径按此理解；日志原文 = `dnsq` 的 `解析超时（预算 5s）`） |
 | 2-7 | 低 | 停止语义措辞（「intake 收线」不准确） | **认同**：改为「accept 循环下一拍退（≤200ms）；在途 handler 随泵/FIN 收尾、不 join」 |
