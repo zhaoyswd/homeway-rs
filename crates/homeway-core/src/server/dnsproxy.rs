@@ -471,6 +471,12 @@ pub struct DnsProxy {
     in_flight: Arc<AtomicUsize>,
 }
 
+/// **测试注入口（`#[cfg(test)]`）**：worker 在取到 job 后先睡该毫秒数（一次性，睡完清零）。
+/// 用途 = 把「门饱和下的排队让路」做成**确定性**用例（不依赖上游墙钟行为；macOS CI 实测
+/// 首版用例因 dead 上游的 job 耗时随平台漂移而假红）。
+#[cfg(test)]
+pub(crate) static TEST_JOB_HOLD_MS: AtomicU64 = AtomicU64::new(0);
+
 impl DnsProxy {
     /// 起代答核心 + DNS 专用 worker 池（H3 整改：阻塞面全长 2.5s/查询不占驱动线程）。
     /// 返回（句柄, 应答回投通道——驱动线程在拍内 drain）。
@@ -518,6 +524,14 @@ impl DnsProxy {
                     loop {
                         let job = { job_rx2.lock().expect("作业队列锁中毒").recv() };
                         let Ok(job) = job else { return };
+                        #[cfg(test)]
+                        {
+                            let h = TEST_JOB_HOLD_MS.load(Ordering::Relaxed);
+                            if h > 0 {
+                                TEST_JOB_HOLD_MS.store(0, Ordering::Relaxed);
+                                std::thread::sleep(Duration::from_millis(h));
+                            }
+                        }
                         let resp = c2.respond(&job.query, job.is_tcp, &mut scratch);
                         let _ = job.reply_to.send(DnsReply { tag: job.tag, resp });
                         in_flight2.fetch_sub(1, Ordering::Relaxed);
@@ -1780,8 +1794,8 @@ mod tests {
         std::thread::sleep(Duration::from_millis(120));
         assert!(p2.answer_stream(&a_query("gate.test", 2)).is_none(), "在途门应拒第二条");
         assert!(p2.stats_line().contains("drop=1"), "stats: {}", p2.stats_line());
-        // ② 饱和让路（代码门 r34 M1③）：门**饱和**（非门拒）下排队等待 > recv_timeout ⇒ None
-        //    且**不计 drop**（它过了门）——与栈内 TCP 面的异步回投在极端负载下分叉，如实钉死。
+        // ② 饱和让路（代码门 r34 M1③；**注入口驱动 = 确定性**）：worker 被 TEST_JOB_HOLD_MS
+        //    钉住 ⇒ 后续 job 排队等待恒 > recv_timeout（= budget+1s）⇒ 探针返 None 且不计 drop。
         let dead2 = UdpSocket::bind(("127.0.0.1", 0)).unwrap();
         let dead2_addr = format!("127.0.0.1:{}", dead2.local_addr().unwrap().port());
         std::thread::spawn(move || {
@@ -1796,7 +1810,7 @@ mod tests {
             DnsConfig {
                 resolv_path: dir3.join("resolv.conf").to_string_lossy().into_owned(),
                 fallback_dns: "127.0.0.1:1".to_owned(),
-                budget: Duration::from_millis(1000),
+                budget: Duration::from_millis(300),
                 workers: 1,
                 max_in_flight: 8,
                 ..Default::default()
@@ -1804,13 +1818,12 @@ mod tests {
             logf3,
             dlogf3,
         );
-        // 一条 worker + 四条排队（每条吃满 budget=1s）⇒ 第五条（本探针）排队 ≈4s > budget+1s=2s
-        let mut hs = Vec::new();
-        for i in 0..4u16 {
+        TEST_JOB_HOLD_MS.store(3000, Ordering::Relaxed);
+        let held = {
             let p = Arc::clone(&p3);
-            hs.push(std::thread::spawn(move || p.answer_stream(&a_query("sat.test", 10 + i))));
-            std::thread::sleep(Duration::from_millis(30));
-        }
+            std::thread::spawn(move || p.answer_stream(&a_query("sat.test", 1)))
+        };
+        std::thread::sleep(Duration::from_millis(100)); // 让 worker 取到首条并开始持有
         let c = p3.answer_stream(&a_query("sat.test", 99));
         assert!(c.is_none(), "门饱和下的排队让路应返 None");
         assert!(
@@ -1818,9 +1831,7 @@ mod tests {
             "让路非门拒（不计 drop）：{}",
             p3.stats_line()
         );
-        for h in hs {
-            let _ = h.join();
-        }
+        let _ = held.join();
         let _ = std::fs::remove_dir_all(&dir3);
 
         // 首条：worker 由绝对期限钳在 budget 内 ⇒ 总会给应答（全死上游 = SERVFAIL，不是 None）
