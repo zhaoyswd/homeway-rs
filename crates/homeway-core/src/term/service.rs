@@ -3502,7 +3502,9 @@ fn pure_terminal_reply(payload: &[u8]) -> bool {
                 // 无 final t 的键编码；日志实证（2026-10-14）：TUI 重画发像素查询、
                 // 双腿各自应答自己的像素尺寸，`t` 漏网时每敲一键几何就被两条应答
                 // 各搬一次（UI 宽↔窄反复跳的最后一环）。
-                if !matches!(final_b, b'c' | b'n' | b'q' | b'R' | b'u' | b'y' | b'm' | b't') {
+                // `S`（XTSMGRAPHICS 图形能力应答 `CSI ? … S`）只认 `?`/`>` 开头形
+                // ——纯数字 `CSI <n>S` 是 SU（上滚）输出序列，保守不认。
+                if !matches!(final_b, b'c' | b'n' | b'q' | b'R' | b'u' | b'y' | b'm' | b't' | b'S') {
                     return false;
                 }
                 let p = &payload[param..i];
@@ -4819,6 +4821,10 @@ mod tests {
         assert!(pure_terminal_reply(b"\x1b[4;353;797t"), "像素尺寸应答（宽窗）");
         assert!(pure_terminal_reply(b"\x1b[8;24;80t"), "字符尺寸应答（18t 的回）");
         assert!(pure_terminal_reply(b"\x1b[3;5;10t"), "窗口位置应答");
+        // XTSMGRAPHICS 图形能力应答（`?` 开头 + final S）；纯数字 S 是 SU 输出序不认
+        assert!(pure_terminal_reply(b"\x1b[?87;0S"), "图形能力查询失败应答");
+        assert!(pure_terminal_reply(b"\x1b[?1;2;3S"), "graphics caps 应答");
+        assert!(!pure_terminal_reply(b"\x1b[2S"), "SU 上滚（纯数字 S）不认");
         // 焦点失去判据：整帧只含 `CSI O`
         assert!(pure_focus_out(b"\x1b[O"), "单条 focus-out");
         assert!(pure_focus_out(b"\x1b[O\x1b[O"), "两条连发");
