@@ -1334,7 +1334,15 @@ impl TermService {
                 Op::DATA => {
                     let pty = {
                         let mut st = self.lock_state();
-                        let sz = st.registry.note_activity(name, key, now_ms());
+                        // 无键鼠标移动（?1003 hover 流）不是「使用」：整帧只含
+                        // `CSI < 35 ; col ; row M` 时不记活动——不搬几何、不动
+                        // active（判定保守，识别不出的字节按真输入照记；判据
+                        // 变更已登记）。字节照常透传：程序（hover 高亮等）仍要用。
+                        let sz = if pure_mouse_motion(&f.payload) {
+                            None
+                        } else {
+                            st.registry.note_activity(name, key, now_ms())
+                        };
                         let active = st.registry.session(name).and_then(|s| s.active);
                         let Some(rt) = rt_of_mut(&mut st, name, sess_gen) else { return };
                         // 已被收尾/腾位的腿不得再向 PTY 注入（评审 H3：写者收线后
@@ -3355,6 +3363,45 @@ fn nudge_bytes_for(stopped: bool, focus_mode: bool, focus_in: bool) -> Option<&'
     Some(if focus_in { b"\x1b[I" } else { b"\x1b[O" })
 }
 
+/// 整帧是否只含 SGR 无键鼠标移动序列（`CSI < 35 ; col ; row M`——`?1003` any-event
+/// 模式下鼠标划过窗口的 hover 流；35 = 32(motion) | 3(无键按下)）。
+///
+/// 用途：把「鼠标划过窗口、未点击」从输入活动中摘出——记活动会把会话几何搬到该腿
+/// （最近活动者赢），两窗口异宽时纯浏览即反复搬几何 + 对面腿反复清屏重排。判定
+/// **保守**：键盘、带键拖动（32|0/1/2）、滚轮（64/65）、其他鼠标编码（X10/UTF-8）、
+/// 焦点序列、跨帧截断的半截序列、空帧 ⇒ 一律 `false`（按真输入记活动）——误判只会
+/// 多记活动（= 现状行为），不会丢「一敲即回本机网格」。
+fn pure_mouse_motion(payload: &[u8]) -> bool {
+    const MOTION_HEAD: &[u8] = b"\x1b[<35;";
+    if payload.is_empty() {
+        return false;
+    }
+    let mut i = 0;
+    loop {
+        if i == payload.len() {
+            return true;
+        }
+        if !payload[i..].starts_with(MOTION_HEAD) {
+            return false;
+        }
+        i += MOTION_HEAD.len();
+        for field in 0..2 {
+            let digits = i;
+            while i < payload.len() && payload[i].is_ascii_digit() {
+                i += 1;
+            }
+            if i == digits {
+                return false; // 坐标参数为空 = 畸形/截断
+            }
+            let want = if field == 0 { b';' } else { b'M' };
+            if i >= payload.len() || payload[i] != want {
+                return false;
+            }
+            i += 1;
+        }
+    }
+}
+
 /// 快照镜像窗口的实际行数（F1c 调用点口径）：`min(rows × MIRROR_VIEWPORTS, 行数预算)`。
 fn mirror_window_rows(cols: u16, rows: u16) -> usize {
     (rows as usize * super::codec::MIRROR_VIEWPORTS).min(mirror_rows_budget(cols as usize))
@@ -4569,6 +4616,70 @@ mod tests {
         assert_eq!(nudge_bytes_for(false, false, false), None, "未开 ?1004 ⇒ 不注入");
         assert_eq!(nudge_bytes_for(false, true, true), Some(&b"\x1b[I"[..]), "focus-in");
         assert_eq!(nudge_bytes_for(false, true, false), Some(&b"\x1b[O"[..]), "focus-out");
+    }
+
+    /// 无键鼠标移动判据边界表：只认 SGR `CSI < 35 ; col ; row M` 的整帧；
+    /// 键盘/带键拖动/滚轮/焦点/其他编码/截断半截/空帧一律按真输入（保守方向）。
+    #[test]
+    fn pure_mouse_motion_boundaries() {
+        assert!(pure_mouse_motion(b"\x1b[<35;10;20M"), "单条 hover");
+        assert!(pure_mouse_motion(b"\x1b[<35;1;1M\x1b[<35;640;480M"), "连发（多坐标位）");
+        assert!(!pure_mouse_motion(b""), "空帧保守");
+        assert!(!pure_mouse_motion(b"x"), "键盘");
+        assert!(!pure_mouse_motion(b"\x1b[<32;5;5M"), "按住左键拖动（32=motion|左键）");
+        assert!(!pure_mouse_motion(b"\x1b[<34;5;5M"), "按住右键拖动");
+        assert!(!pure_mouse_motion(b"\x1b[<64;1;1M"), "滚轮上");
+        assert!(!pure_mouse_motion(b"\x1b[<35;1;1Mx"), "motion 与键盘混合帧");
+        assert!(!pure_mouse_motion(b"\x1b[<35;12"), "跨帧截断（前半，无坐标尾）");
+        assert!(!pure_mouse_motion(b";20M"), "跨帧截断（后半，无头）");
+        assert!(!pure_mouse_motion(b"\x1b[I"), "焦点事件仍算输入");
+        assert!(!pure_mouse_motion(b"\x1b[M !#"), "X10 legacy 编码不认（保守）");
+        assert!(!pure_mouse_motion(b"\x1b[<35;;20M"), "空坐标参数 = 畸形");
+        assert!(!pure_mouse_motion(b"\x1b[<35m"), "无坐标的畸形头");
+    }
+
+    /// 无键鼠标移动不搬会话几何：A(120x30) 与 B(80x24) 双腿在场（会话=80x24）时
+    /// A 发纯 hover 流会话保持 80x24；A 发真键盘后才切 120x30。同连接帧序保证
+    /// LIST 应答反映先行 DATA 帧处理后的状态（无需 sleep）。
+    #[test]
+    fn mouse_motion_does_not_steal_geometry() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let cfg = TermConfig { shell: Some("cat".into()), ..TermConfig::default() };
+        let svc = svc_with(cfg, Arc::clone(&lines));
+        let (ln, path) = start_listener();
+        {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || svc.serve(ln));
+        }
+        let session_size = |c: &mut Client| -> (u16, u16) {
+            c.send(Op::LIST, &[]);
+            let f = c.expect(Op::LIST, 5);
+            let v: serde_json::Value = serde_json::from_slice(&f.payload).unwrap();
+            let s = &v["sessions"]
+                .as_array()
+                .expect("sessions 数组")
+                .iter()
+                .find(|s| s["name"] == "t-hover")
+                .expect("会话在列");
+            (s["cols"].as_u64().unwrap() as u16, s["rows"].as_u64().unwrap() as u16)
+        };
+        let mut a = Client::connect(&path);
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "hov-a");
+        a.send(Op::HELLO, &frames::enc_hello(120, 30, hello_flags::CREATE, "t-hover", &tail));
+        a.expect(Op::ATTACHED, 5);
+        a.expect(Op::REPLAY_DONE, 5);
+        let mut b = Client::connect(&path);
+        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "hov-b");
+        b.send(Op::HELLO, &frames::enc_hello(80, 24, 0, "t-hover", &tail_b));
+        b.expect(Op::ATTACHED, 5);
+        assert_eq!(session_size(&mut a), (80, 24), "B 接入后会话几何=B");
+        // 纯 hover 流（划过窗口不点击）：不记活动、不搬几何
+        a.send(Op::DATA, b"\x1b[<35;10;20M\x1b[<35;11;21M\x1b[<35;12;22M");
+        assert_eq!(session_size(&mut a), (80, 24), "hover 流不得搬走几何");
+        // 真键盘：照常记活动、切回 A 的几何
+        a.send(Op::DATA, b"x");
+        assert_eq!(session_size(&mut a), (120, 30), "键盘输入照常切回本腿几何");
+        svc.close();
     }
 
     /// F6：丢弃计数 + 节流日志（首 3 次 + 每 100 次）。
