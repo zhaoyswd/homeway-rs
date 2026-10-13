@@ -110,12 +110,14 @@ jobs:
           RUSTFLAGS: "-D warnings"
       # 运行面最小烟囱：版本横幅 + 纯函数动词（token 解码 = fixtures 向量的第一例
       # ——平台无关面：base64/crc/端点解析）。decode 期望 peer_id 段命中间量向量值。
+      # `encoding='utf-8'` 必须显式：windows runner 的 Python 缺省 cp1252，向量文件含
+      # UTF-8 中文 ⇒ 缺参会 UnicodeDecodeError（2026-10-13 首轮实测）。
       - name: 运行烟囱（--version / token 向量解码）
         shell: bash
         run: |
           set -eo pipefail
           cargo build --locked -p homeway-cli
           ./target/debug/homeway.exe --version
-          TOK=$(python3 -c "import json;print(json.load(open('fixtures/vectors/token_hmw2.json'))['cases'][0]['token'])")
+          TOK=$(python3 -c "import json;print(json.load(open('fixtures/vectors/token_hmw2.json',encoding='utf-8'))['cases'][0]['token'])")
           ./target/debug/homeway.exe token "$TOK" | grep -F "peer_id  = 1111111111111111111111111111111111111111111111111111111111111111"
           echo "win smoke ok"

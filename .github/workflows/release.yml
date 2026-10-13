@@ -43,6 +43,9 @@ jobs:
       # 错位 tag 产物与 main 不符且事后难对齐；非 tag 触发（workflow_dispatch）跳过。
       - name: 发版纪律门：tag == origin/main 头
         if: startsWith(github.ref, 'refs/tags/v')
+        # 显式 bash：windows runner 缺省 shell 是 pwsh，本段是 bash 语法
+        # （2026-10-13 v0.3.3 首跑实测：pwsh 下 `set -euo pipefail` 直接击红）。
+        shell: bash
         run: |
           set -euo pipefail
           git fetch --depth=1 origin main
@@ -110,7 +113,11 @@ jobs:
       - uses: actions/upload-artifact@v4
         with:
           name: homeway-${{ matrix.name }}
-          path: homeway-*.tar.gz
+          # unix 面 = tar.gz；windows 面 = zip（WIN 批起）——两形都要在，否则
+          # windows job 因 if-no-files-found 击红（2026-10-13 v0.3.3 首跑实测）。
+          path: |
+            homeway-*.tar.gz
+            homeway-*.zip
           if-no-files-found: error
 
   release:
