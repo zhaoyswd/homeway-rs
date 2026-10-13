@@ -725,3 +725,22 @@ App 的免手工外部通道只有 `--ps host_token`（主机注入）与 `--ps 
   仅白名单外 1 个 `client/hosts.json.corrupt-*` 条目被替换；该存档**不参与运行**，无影响。
 - **如实注记②**：Mac 出口本轮 `公网端点` 只公布 IPv4（IPv6 STUN 无应答，换装前一轮曾公布 v6）——
   属网络侧瞬时形态，出口会按既有节拍重测。
+
+### 13.6 补丁换装 v0.3.4（2026-10-13 23:11–23:12，CLI 本地 term 面修复）
+
+**触发**：用户实测 `homeway term list`（零参 / 统一根）报「出口未在运行…」——出口角色的本地服务
+socket 建在 `<state>/serve/` 子目录（`serve/{files,term,speedtest}.sock`），而命令面的本机形态按
+早期平坦布局口径拨 `<state>/term.sock` ⇒ 与「零参正式形态」不合（与 13.2/13.3 的 state 迁移
+**无关**：旧 `--state <根>` 形态同样拨不通）。修复 = `term_cli.rs::local_term_sock` 扁平优先 +
+serve 子目录回退（登记 = `docs/INTEROP-CRITERIA.md` 2026-10-13「v0.3.4 补丁」条）。
+
+| 机器 | 换装 | 判据 |
+|---|---|---|
+| 发版 | tag `v0.3.4` = main 头 `df2989e`；五目标全绿（darwin-arm64 6m13s 最长）+ release 12s | ✓ |
+| Mac | `/opt/homebrew/bin/homeway`（旧件留 `homeway.bak-v0.3.3`）+ `launchctl kickstart -k` → 新 pid 62397 | `key=8aee740b7220…`（不变）；**`homeway term list` 零参通**（「当前没有会话」）；中继腿 23:11:34 重注册 ✓ |
+| 阿里云 | `/usr/local/bin/homeway`（旧件留 `homeway.bak-v0.3.3`）；SIGTERM 7s 退净 → `setsid` 零参起 → 新 pid 1603223 | `key=1020c3eae8b3…`（不变）；41641/41741 在听；**零参 `term list` 通**；中继控制面 23:12:09 重连（后端身份 `d07c57dd5bde1fa7` 不变）✓ |
+| MacBook Pro | `/usr/local/bin/homeway`（旧件留 `homeway.bak-v0.3.3`） | 登录 shell `homeway v0.3.4` ✓ |
+| 三机一致性 | 三处 `--version` 全 = `homeway v0.3.4` | ✓ |
+
+**注**：重启会丢当轮 term 会话（会话在服务进程内；Mac 上换装前那两条 `opencode`/`shell` 会话随之
+结束）——这是既有语义（会话由出口进程持有），非本次回归。
