@@ -7,6 +7,24 @@
   `target/release/homeway`（Windows 面 `homeway.exe`）；版本横幅/用法文案/工具脚本
   的二进制路径与进程匹配形同批跟进；发版产物名 = `homeway-<tag>-<平台>.tar.gz`。
   判据行输出串零变化（登记 = `docs/INTEROP-CRITERIA.md`「判据变更记录」2026-10-13 条）。
+- **Windows 支持（x86_64-pc-windows-msvc）**（2026-10-13，用户指令；设计 =
+  `docs/reviews/WIN-design.md`）：relay/客户端域/出口（serve）三角色编译可用；
+  **term（终端）不支持**（用户明示豁免——`homeway term` 报不支持退出）；唯一新增
+  依赖 = `windows-sys`（cfg(windows) 门控，unix 构建零波及）。要点：
+  - 平台底座四件：`sysock`（socket/poll：unix=libc 直通 / windows=winsock，reactor
+    与 egress 钉卡面走它）+ `syslock`（flock/LockFileEx）+ `systime`（localtime_r/
+    时区 API）+ `daemon/ipc`（unix=UDS 原样 / windows=TCP loopback+端口文件——控制面
+    协议帧传输无关）。
+  - App 核面（ClientCore/三桥/tun_exec/世代件）与 term 在 windows 不编译；跨平台件
+    （BridgeStream trait/出口虚拟端口）拆 `facade/bridge_io`。
+  - quic 岛：服务流泵的承载对 = unix socketpair / windows 回环 TCP 对（`sysio`）；
+    出口三服务的 UDS 调试腿在 windows 不装配（QUIC STREAM 为主入口）。
+  - CLI 停止面收敛 `stopsig`（unix=SIGINT/SIGTERM+pipe 原语义 / windows=控制台事件+
+    回环对；SIGTERM 不可捕获——服务管理走控制面）；daemon 化 = setsid /
+    DETACHED_PROCESS。
+  - 门与验证：CI 增 `win-check`（cargo check 三 crate + --version/token 向量烟囱）；
+    发版增 `windows-amd64` 产物（zip）；本地交叉 check 配方 = cc-check-shim 垫片
+    （ring C 面）。windows 测试面是后续批（非目标登记）。
 
 ## v0.3.0（2026-10-10）
 

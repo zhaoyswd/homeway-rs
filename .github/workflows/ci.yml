@@ -90,3 +90,28 @@ jobs:
       # 门是 zsh 脚本（仓内 tools/ 惯例）；镜像若缺 zsh 则显式装
       - run: which zsh || sudo apt-get install -y zsh
       - run: zsh tools/check-quic-isolation.sh
+
+  # WIN 批（2026-10-13）：windows 编译门（x86_64-pc-windows-msvc）。范围 = -p 三 crate
+  # （homeway-capi 是 OHOS 专用壳不进 windows 面）；**check 不跑测试**——windows
+  # 测试面是后续批（unix 设计的用例面大，WIN-design §0 非目标登记）。ring 在
+  # windows runner 上原生 MSVC 构建（无交叉垫片需求）。
+  win-check:
+    name: check windows-msvc
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: x86_64-pc-windows-msvc
+      - run: cargo check --locked -p homeway-core -p homeway-cli -p homeway-quic
+      # 运行面最小烟囱：版本横幅 + 纯函数动词（token 解码 = fixtures 向量的第一例
+      # ——平台无关面：base64/crc/端点解析）。decode 期望 peer_id 段命中间量向量值。
+      - name: 运行烟囱（--version / token 向量解码）
+        shell: bash
+        run: |
+          set -eo pipefail
+          cargo build --locked -p homeway-cli
+          ./target/debug/homeway.exe --version
+          TOK=$(python3 -c "import json;print(json.load(open('fixtures/vectors/token_hmw2.json'))['cases'][0]['token'])")
+          ./target/debug/homeway.exe token "$TOK" | grep -F "peer_id  = 1111111111111111111111111111111111111111111111111111111111111111"
+          echo "win smoke ok"

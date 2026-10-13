@@ -33,6 +33,9 @@ jobs:
           # aarch64-musl 时 rustc 传的 --fix-cortex-a53-843419 撞宿主 x86 ld（首跑实测；
           # 编译面是 self-contained 的、链接面不是）。原生面顺带解锁 --version 烟囱。
           - { os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl, name: linux-arm64, smoke: true }
+          # WIN 批（2026-10-13）：windows 面加入发版产物（x86_64-msvc 原生构建；
+          # term 不支持——docs/reviews/WIN-design.md §0 的豁免面）。
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, name: windows-amd64, smoke: true }
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -71,7 +74,10 @@ jobs:
           # 显式点名 cc-rs 用 musl 包装器（缺省会去找 `<arch>-linux-musl-gcc`）
           CC_x86_64_unknown_linux_musl: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
+      # strip：unix 面显式 strip（profile 档未开 strip）；windows-msvc 的 release
+      # 构建默认不带符号（无 strip 工具面——跳过）。
       - run: strip target/${{ matrix.target }}/release/homeway
+        if: runner.os != 'Windows'
       - name: 静态核验（musl 面必须静态链接）
         if: endsWith(matrix.target, '-musl')
         # 措辞按 file 版本有差：新版 file 对 static-PIE 报 "static-pie linked"
@@ -79,12 +85,28 @@ jobs:
         run: file "target/${{ matrix.target }}/release/homeway" | grep -Eq 'statically linked|static-pie linked'
       - name: 版本烟囱（可本机执行的目标上跑 --version）
         if: matrix.smoke && startsWith(github.ref, 'refs/tags/v')
-        run: target/${{ matrix.target }}/release/homeway --version | grep -F "$GITHUB_REF_NAME"
-      - name: 打包 tar.gz
+        shell: bash
+        run: |
+          bin="target/${{ matrix.target }}/release/homeway"
+          [ "$RUNNER_OS" = "Windows" ] && bin="$bin.exe"
+          "$bin" --version | grep -F "$GITHUB_REF_NAME"
+      - name: 打包 tar.gz（unix 面）
+        if: runner.os != 'Windows'
         run: |
           set -euo pipefail
           cd "target/${{ matrix.target }}/release"
           tar czf "$GITHUB_WORKSPACE/homeway-${GITHUB_REF_NAME:-manual}-${{ matrix.name }}.tar.gz" homeway
+      - name: 打包 zip（windows 面）
+        if: runner.os == 'Windows'
+        run: |
+          $bin = "target/${{ matrix.target }}/release/homeway.exe"
+          $dst = "$env:GITHUB_WORKSPACE/homeway-${{ github.ref_name }}-${{ matrix.name }}.zip"
+          # ref_name 为空（workflow_dispatch）时回退 manual（与 unix 面同形态）
+          if ([string]::IsNullOrEmpty("${{ github.ref_name }}")) {
+            $dst = "$env:GITHUB_WORKSPACE/homeway-manual-${{ matrix.name }}.zip"
+          }
+          Compress-Archive -Path $bin -DestinationPath $dst -Force
+          Get-Item $dst | Select-Object Name, Length
       - uses: actions/upload-artifact@v4
         with:
           name: homeway-${{ matrix.name }}
@@ -100,10 +122,12 @@ jobs:
         with:
           merge-multiple: true
       - name: SHA256SUMS
-        run: shasum -a 256 homeway-*.tar.gz | tee SHA256SUMS
+        # unix tar.gz + windows zip（WIN 批起 windows-amd64 = zip 内含 homeway.exe）
+        run: shasum -a 256 homeway-*.tar.gz homeway-*.zip | tee SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           files: |
             homeway-*.tar.gz
+            homeway-*.zip
             SHA256SUMS
           generate_release_notes: true

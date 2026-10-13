@@ -94,6 +94,15 @@ tools/ci-local.sh
 token 是**凭证**：不内置、不进仓库、不随包分发（客户端 token 前缀 **`hmw2`**〔M5 起段容器；
 存量 `hmw1` 一律失效〕；中继凭据前缀 `rl1`）。
 
+### Windows（2026-10-13 起，发版产物 windows-amd64 = zip）
+
+- 三角色（serve/relay/客户端域）编译可用；**term（终端）不支持**（`homeway term`
+  报不支持退出——豁免面见 `docs/reviews/WIN-design.md` §0）。
+- 停止信号 = 控制台事件（Ctrl-C/Ctrl-Break/关窗）；**SIGTERM 不可捕获**（`taskkill`
+  走硬终止）——服务管理请走控制面（`homeway serve stop` / `homeway relay stop`）。
+- 控制面本地承载 = 回环 TCP + `<state>/control.port` 端口文件（unix = `control.sock`
+  UDS；协议层一致）。
+
 ## 文档地图
 
 | 想了解 | 看 |

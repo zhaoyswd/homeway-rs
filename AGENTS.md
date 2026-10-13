@@ -2,7 +2,8 @@
 
 本仓是 homeway（Go，`~/Documents/projects/homeway`）的 Rust 实现，**Go 版已于 2026-10-05
 整体退役（tier 侧 C 批转正）——本仓即唯一实现**。三角色（出口/客户端核/中继）同一二进制
-`homeway-cli`，OHOS 侧以 `crates/homeway-capi` 的 C-ABI 壳供给鸿蒙 App。
+`homeway`（包名仍为 homeway-cli——`-p homeway-cli` 构建契约不变；WIN 批 2026-10-13 起产物不带
+`-cli` 后缀），OHOS 侧以 `crates/homeway-capi` 的 C-ABI 壳供给鸿蒙 App。
 **唯一进度真源 = `ROADMAP.md`**——新会话先读它（续接协议/隔离条款/各期范围与判据都在那里）；
 2026-10-07 起的整改批真源 = `docs/REVIEW-ROADMAP.md` + `docs/reviews/AUDIT-2026-10-07.md`。
 
@@ -11,7 +12,8 @@
 1. **远端 = `github.com/zhaoyswd/homeway-rs`（公开仓，2026-10-05 用户建仓并授权推送——
    转正 A 批；推送前敏感扫描存档见 `docs/PUSH-PRECHECK.md`）**。CI = `.github/workflows/ci.yml`
    （push/PR：test 双 runner + clippy + OHOS/musl 交叉 check）；发版 = 推 `v*` tag 触发
-   `release.yml`（四目标产物 + tag 纪律门 + SHA256SUMS）。**推 tag / 发 Release / 建 PR
+   `release.yml`（五目标产物〔WIN 批起含 windows-amd64=zip〕+ tag 纪律门 + SHA256SUMS；
+   windows 面 = 编译门在 ci.yml 的 win-check〔check + 烟囱，不跑测试——WIN-design §0〕）。**推 tag / 发 Release / 建 PR
    仍需用户明确指令**；日常 main 直推照旧。本地-only 门（基线/向量/词表/**WG 残留门**
    〔`tools/check-wg-removed.sh`〕/矩阵冒烟）走 `tools/ci-local.sh`，不在公开 CI 复刻
    （依赖私有 baseline/）。
