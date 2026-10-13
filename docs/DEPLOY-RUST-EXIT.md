@@ -744,3 +744,19 @@ serve 子目录回退（登记 = `docs/INTEROP-CRITERIA.md` 2026-10-13「v0.3.4 
 
 **注**：重启会丢当轮 term 会话（会话在服务进程内；Mac 上换装前那两条 `opencode`/`shell` 会话随之
 结束）——这是既有语义（会话由出口进程持有），非本次回归。
+
+### 13.7 换装 v0.3.5（2026-10-13 23:41–23:43，MIT 许可 + README 收束 + CLI 主机寻址统一）
+
+**触发**：用户指令六条（MIT 许可 / README 只讲功能与命令 / `term new` 直接进入 / files-term-forward
+统一 host 风格且不带 `--token` / Windows 段一句话 / 去「迭代·测试形态」节）。CLI 面 = `--host` 缺省走
+「默认主机」（单主机直接用、无主机提示先 `host add`、多主机要求显式指定；term 另有本机出口面）；
+`portfwd` 用法改向 `homeway forward`（登记 = `docs/INTEROP-CRITERIA.md` 2026-10-13「v0.3.5」条）。
+**App 核零改**（CLI 不进 `.so`）⇒ tier pin 不动、设备包不出。
+
+| 机器 | 换装 | 判据 |
+|---|---|---|
+| 发版 | tag `v0.3.5` = main 头 `fe17931`；五目标全绿 + release 11s | ✓ |
+| Mac | `/opt/homebrew/bin/homeway`（旧件留 `homeway.bak-v0.3.4`）+ `kickstart -k` | `key=8aee740b7220…` 不变；零参 `term list` 通；**零参 `files list` 出「还没有添加主机」提示**（新行为；该机未配主机）✓ |
+| 阿里云 | `/usr/local/bin/homeway`（旧件留 `homeway.bak-v0.3.4`）；SIGTERM → `setsid` 零参起 | `key=1020c3eae8b3…` 不变；41641/41741 在听；零参 `term list` 通 ✓ |
+| MacBook Pro | `/usr/local/bin/homeway`（旧件留 `homeway.bak-v0.3.4`） | 登录 shell `homeway v0.3.5` ✓ |
+| 互注 | Mac `中继控制面已连（23:43:01）` ↔ 阿里云 `中继：后端 d07c57dd5bde1fa7 控制面就绪（114.242.60.128:62088）` | ✓ |
