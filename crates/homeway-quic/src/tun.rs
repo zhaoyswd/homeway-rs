@@ -392,11 +392,26 @@ fn read_loop(fd: crate::sysio::RawIo, tx: IslandTx, counters: Arc<TunCounters>, 
     let mut pending_drops: u64 = 0;
     loop {
         // WIN 批：裸读经 sysio（unix = read(2) 原语义；windows = recv——错误经
-        // WSAGetLastError 归一到 io::Error，sysio 单源）。
-        let n: isize = match crate::sysio::read(fd, &mut buf) {
-            Ok(n) => n as isize,
+        // WSAGetLastError 归一到 io::Error，sysio 单源）。四态直排（评审 L5：修前
+        // 用 -11 假 EAGAIN 哨兵过桥——语义分叉面收进 match 本身）。
+        let n: usize = match crate::sysio::read(fd, &mut buf) {
+            Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
-            Err(e) if e.kind() == io::ErrorKind::WouldBlock => -11, // EAGAIN 形态位（下块分类）
+            // WouldBlock 回退支（fd 非阻塞/标志不可清时才会走到）：等 POLLIN 一片。
+            // 三分处置（镜像 `wgcore`）：片到（TimedOut）= 继续；poll 出错 = 判死。
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                match poll_fd(fd, crate::sysio::POLLIN, Instant::now() + POLL_SLICE) {
+                    Ok(_ready) => {} // 可读优先（含 POLLIN|POLLHUP 同置：先读，下一轮定性）
+                    Err(pe) if pe.kind() == io::ErrorKind::TimedOut => {}
+                    Err(pe) => {
+                        let msg = format!("tun fd poll 失败：{pe}（标记隧道不健康）");
+                        (logf)(&msg);
+                        let _ = tx.send(Cmd::TunFdDead { msg });
+                        return;
+                    }
+                }
+                continue;
+            }
             Err(e) => {
                 let msg = format!("tun fd 读取失败：{e}（标记隧道不健康）");
                 (logf)(&msg);
@@ -404,21 +419,6 @@ fn read_loop(fd: crate::sysio::RawIo, tx: IslandTx, counters: Arc<TunCounters>, 
                 return;
             }
         };
-        if n < 0 {
-            // WouldBlock 回退支（fd 非阻塞/标志不可清时才会走到）：等 POLLIN 一片。
-            // 三分处置（镜像 `wgcore`）：片到（TimedOut）= 继续；poll 出错 = 判死。
-            match poll_fd(fd, crate::sysio::POLLIN, Instant::now() + POLL_SLICE) {
-                Ok(_ready) => {} // 可读优先（含 POLLIN|POLLHUP 同置：先读，下一轮定性）
-                Err(pe) if pe.kind() == io::ErrorKind::TimedOut => {}
-                Err(pe) => {
-                    let msg = format!("tun fd poll 失败：{pe}（标记隧道不健康）");
-                    (logf)(&msg);
-                    let _ = tx.send(Cmd::TunFdDead { msg });
-                    return;
-                }
-            }
-            continue;
-        }
         if n == 0 {
             // EOF/空读：判死**只看 hup||err||nval**（darwin 上 EOF 恒带 POLLIN），
             // 且判死前确认一片（poll 本身即等待——不用 sleep）。

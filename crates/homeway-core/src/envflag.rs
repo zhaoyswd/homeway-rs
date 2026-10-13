@@ -13,6 +13,7 @@ use std::sync::OnceLock;
 /// `HOMEWAY_QUIC_MTU`（M1 设计 §12-① 的 MTU 上限旋钮）**原始串**；解析/夹区间/记行
 /// 同在 `facade::tun_exec`。**M5 C3**：同文件的 `transport_raw`（`HOMEWAY_TRANSPORT`
 /// 承载开关）与 `wg_debug` 随 WG 面删除——单承载下前者是死旋钮（设计 §4.3①）。
+#[cfg(not(windows))] // 消费面 = tun_exec（windows 不编译——评审 M3）
 pub(crate) fn quic_mtu_raw() -> Option<&'static str> {
     static V: OnceLock<Option<String>> = OnceLock::new();
     V.get_or_init(|| std::env::var("HOMEWAY_QUIC_MTU").ok())

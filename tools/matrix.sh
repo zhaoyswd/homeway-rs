@@ -154,7 +154,12 @@ stop_pid() { local pf="$1" p
   p=$(cat "$pf" 2>/dev/null) || { rm -f "$pf"; return 0; }
   kill -TERM "$p" 2>/dev/null
   local i; for i in {1..10}; do kill -0 "$p" 2>/dev/null || break; sleep 1; done
-  kill -0 "$p" 2>/dev/null && kill -KILL "$p" 2>/dev/null && sleep 1
+  # L8（评审 H1 教训）：TERM 后 10s 仍在 = 优雅收工路径断了（此前静默 KILL 掩盖）
+  # ——大声记账再兜底杀。
+  if kill -0 "$p" 2>/dev/null; then
+    echo "!! stop_pid: pid $p 10s 内未优雅退出（SIGTERM 失效面？）——强制 KILL 兜底" >&2
+    kill -KILL "$p" 2>/dev/null && sleep 1
+  fi
   rm -f "$pf"
 }
 

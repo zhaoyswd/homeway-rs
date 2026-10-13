@@ -528,17 +528,9 @@ impl Relay {
             if next_stats > now {
                 timeout = timeout.min(next_stats.duration_since(now).as_millis() as i32);
             }
-            let n = match sysock::poll_slice_timeout(&mut pollfds, timeout) {
-                Ok(n) => n,
-                Err(e) => {
-                    let n = -1;
-                    let _ = n;
-                    self.logf(&format!("relay: poll 错误（{e}）—— 继续循环"));
-                    -1
-                }
-            };
-            if n < 0 {
-                let e = io::Error::last_os_error();
+            // poll 失败/EINTR：抑制 Interrupted 记行（旧形态——Ctrl-C 不该产「poll 错误」
+            // 吓人行；poll(2) 无 SA_RESTART，信号必经此臂），真错误记一行继续（评审 M7）。
+            if let Err(e) = sysock::poll_slice_timeout(&mut pollfds, timeout) {
                 if e.kind() != io::ErrorKind::Interrupted {
                     self.logf(&format!("relay: poll 错误（{e}）—— 继续循环"));
                 }

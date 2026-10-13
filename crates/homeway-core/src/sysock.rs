@@ -118,12 +118,25 @@ pub use windows_sys::Win32::Networking::WinSock::{
 };
 
 /// poll 条目（跨平台字段名：unix `pollfd.fd` / windows `WSAPOLLFD.socket`）。
+/// 布局钉（评审 M5）：unix 臂把整片 `PollEnt` 直接 reinterpret 成 `libc::pollfd`
+/// ⇒ 必须 `#[repr(C)]` 且字段序/宽度一致（编译期断言）；加字段/重排会被断言拦下
+/// 而不是静默给错 `revents`。
+#[repr(C)]
 #[derive(Clone, Copy)]
 pub struct PollEnt {
     pub raw: RawSock,
     pub events: i16,
     pub revents: i16,
 }
+#[cfg(unix)]
+const _: () = {
+    assert!(std::mem::size_of::<PollEnt>() == std::mem::size_of::<libc::pollfd>());
+    assert!(std::mem::align_of::<PollEnt>() == std::mem::align_of::<libc::pollfd>());
+    // 字段偏移逐个对（fd/events/revents 三段的位形）
+    assert!(std::mem::offset_of!(PollEnt, raw) == std::mem::offset_of!(libc::pollfd, fd));
+    assert!(std::mem::offset_of!(PollEnt, events) == std::mem::offset_of!(libc::pollfd, events));
+    assert!(std::mem::offset_of!(PollEnt, revents) == std::mem::offset_of!(libc::pollfd, revents));
+};
 
 /// 零超时轮询（reactor 每拍形态：就绪集是提示不是契约——电平触发，漏看下拍重报）。
 /// 返回就绪条数；`Err` = 系统调用失败（调用方按拍级失败处理——与 unix 臂现状同形）。

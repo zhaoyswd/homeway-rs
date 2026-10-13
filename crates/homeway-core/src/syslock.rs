@@ -44,15 +44,16 @@ pub fn try_lock_exclusive(file: &File) -> io::Result<LockOutcome> {
         let mut overlapped: windows_sys::Win32::System::IO::OVERLAPPED = unsafe {
             std::mem::zeroed()
         };
-        // 全文件域：Offset/OffsetHigh 置 0 + 长度全 1（LockFileEx 的区段语义是
-        // [Offset, Offset+Length)——两个 u32 拼不出全 64 位域时用「锁整个文件」
-        // 的惯用形：len=0 表示从 Offset 到 EOF（含此后追加）。
+        // 区段 = 字节 0（评审 L2）：`0,0`（len=0 = 「到 EOF」的方言口径）与
+        // `!0,!0` 都有争议，锁住**首字节**是各 Windows 锁实现的最小共识互斥面——
+        // 所有持有者锁同一字节 ⇒ 互斥成立；解锁随句柄关闭。待 windows 测试面
+        // （后续批）加两进程互斥断言钉死。
         let rc = unsafe {
             LockFileEx(
                 file.as_raw_handle(),
                 LOCKFILE_EXCLUSIVE_LOCK | LOCKFILE_FAIL_IMMEDIATELY,
                 0,
-                0,
+                1,
                 0,
                 &mut overlapped,
             )

@@ -55,11 +55,13 @@ unsafe extern "system" fn on_console_event(_ctrl: u32) -> i32 {
 }
 
 /// handler 主体：置命中 + （若 armed）写一字节（失败静默——合并位语义）。
+/// 写面走平台分派的 [`write1`]（**unix 的停止管道是管道**——socket 系 send(2) 对
+/// pipe fd 报 ENOTSOCK 且被静默吞掉；评审 H1 实测钉，勿改回 send）。
 fn on_stop() {
     HIT.store(true, std::sync::atomic::Ordering::SeqCst);
     let fd = ARMED.load(std::sync::atomic::Ordering::SeqCst) as Raw;
     if fd != DISARMED {
-        let _ = sysock::send(fd, b"x");
+        write1(fd);
     }
 }
 
@@ -128,7 +130,9 @@ pub fn close(fd: Raw) {
 
 // ---------- arm/disarm 与安装 ----------
 
-/// arm：handler 的写目标（`DISARMED` = disarm）。
+/// arm：handler 的写目标（`DISARMED` = disarm）。**属主纪律**（评审 H2）：ARMED 是
+/// 进程级共享槽——只有「本面调过 `arm`」的消费方才可在收线时 `disarm_and_restore`，
+/// 否则只 `arm(DISARMED)` 断写面（统一进程的宿主 handler 不被打掉）。
 pub fn arm(fd: Raw) {
     ARMED.store(fd as usize, std::sync::atomic::Ordering::SeqCst);
 }

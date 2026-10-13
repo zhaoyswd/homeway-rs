@@ -401,8 +401,8 @@ fn parse_resolv_nameservers(_path: &str) -> Option<Vec<String>> {
                         let e = &*cur;
                         let raw = &e.IpAddress;
                         // IP_ADDRESS_STRING.String = [i8; 16] 的 C 串（windows-sys 用
-                        // 有符号字节面——按位重解释成 u8 读）
-                        let bytes: &[u8; 16] = unsafe { &*(&raw.String as *const [i8; 16]).cast() };
+                        // 有符号字节面——按位重解释成 u8 读；函数体外层 unsafe 已覆盖）
+                        let bytes: &[u8; 16] = &*(&raw.String as *const [i8; 16]).cast();
                         let s = std::ffi::CStr::from_bytes_until_nul(bytes)
                             .ok()?
                             .to_string_lossy()

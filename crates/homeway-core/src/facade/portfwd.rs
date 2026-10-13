@@ -20,21 +20,42 @@
 //! **`127.0.0.1:p`**（出口 dial 腿直接拨本机回环）。〔历史：WG 档曾由 `wg_dial_addr`
 //! 在腿内替换为 `SERVER_TUNNEL_IP:p`——该面已随 M5 删码退役。〕
 
-use std::collections::BTreeSet;
+#[cfg(not(windows))]
 use std::io;
-use std::net::{Ipv4Addr, SocketAddrV4, TcpListener, TcpStream};
-use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
-use std::sync::mpsc;
-use std::sync::{Arc, Mutex};
-use std::thread::JoinHandle;
-use std::time::{Duration, Instant};
+use std::net::{Ipv4Addr, SocketAddrV4};
+use std::sync::atomic::{AtomicI64, Ordering};
+#[cfg(not(windows))]
+use std::time::Duration;
 
 use serde::Deserialize;
 
-use super::bridge_io::BridgeStream;
-use crate::syncutil::lock_unpoison;
-use crate::Logf;
 use crate::PortfwdErr;
+
+// 运行时半边（not(windows)，见下分节）专用 imports——WIN 批随半边门控（评审 M3）。
+#[cfg(not(windows))]
+use std::collections::BTreeSet;
+#[cfg(not(windows))] // unix 运行时半边消费（windows pf_bind 臂已删——评审 M1 复核改删）
+use std::net::TcpListener;
+#[cfg(not(windows))]
+use std::net::TcpStream;
+#[cfg(not(windows))]
+use std::sync::atomic::AtomicBool;
+#[cfg(not(windows))]
+use std::sync::atomic::AtomicU64;
+#[cfg(not(windows))]
+use std::sync::mpsc;
+#[cfg(not(windows))]
+use std::sync::{Arc, Mutex};
+#[cfg(not(windows))]
+use std::thread::JoinHandle;
+#[cfg(not(windows))]
+use std::time::Instant;
+#[cfg(not(windows))]
+use super::bridge_io::BridgeStream;
+#[cfg(not(windows))]
+use crate::syncutil::lock_unpoison;
+#[cfg(not(windows))]
+use crate::Logf;
 
 /// 监听端口值域下限（`pkg/portfwd` 同源）。
 pub const MIN_PORT: u16 = 1024;
@@ -48,15 +69,21 @@ pub const MAX_PF_RULES: usize = 8;
 pub const MAX_PF_FLOWS: u64 = 256;
 
 /// install 等待旧监听器退出 ack 的预算（**共享**：全部待等监听器同一个 400ms）。
+#[cfg(not(windows))] // 运行时半边专用（评审 M3）
 const ACK_BUDGET_INSTALL: Duration = Duration::from_millis(400);
 /// 收工等待监听器 ack 的预算（共享 200ms；到点 detach 自退）。
+#[cfg(not(windows))] // 运行时半边专用（评审 M3）
 const ACK_BUDGET_STOP: Duration = Duration::from_millis(200);
 /// 未 ack 端口的 bind 重试次数 × 间隔（3 × 50ms——旧监听器还没放掉 fd 的窄窗）。
+#[cfg(not(windows))] // 运行时半边专用（评审 M3）
 const BIND_RETRY_TIMES: u32 = 3;
+#[cfg(not(windows))] // 运行时半边专用（评审 M3）
 const BIND_RETRY_GAP: Duration = Duration::from_millis(50);
 /// accept 轮询节拍（`poll(2)`；用户可见延迟路径——连接就绪即接，50ms 只是停止延迟上界）。
+#[cfg(not(windows))] // 运行时半边专用（评审 M3）
 const ACCEPT_POLL_MS: i32 = 50;
 /// 监听 backlog（Go `net.Listen`：Linux = `somaxconn` / darwin = 128 ⇒ 本批固定 128）。
+#[cfg(not(windows))] // 运行时半边专用（评审 M3）
 const LISTEN_BACKLOG: i32 = 128;
 /// 每连接线程的显式栈（conn 1 + 泵 2 = 3 线程/连接；默认 2 MiB ×3 无谓吃虚拟内存）。
 ///
@@ -65,6 +92,7 @@ const LISTEN_BACKLOG: i32 = 128;
 /// 因为 pf 的 conn/泵线程跑的就是同一批 `SessionStream`（`connect_deadline`/`read`/`write`）
 /// 代码；Rust 栈溢出的后果是**进程 abort**（手机上 = 核进程死 + 整套 VPN 重建），
 /// 而「省虚拟内存」的收益可忽略（3×256 KiB×256 流 ≈192 MiB 虚拟 vs 引擎 512 MiB RSS）。
+#[cfg(not(windows))]
 const PF_THREAD_STACK: usize = 256 * 1024;
 
 /// 一条映射（tunConfig.portForwards 元素 / NAPI 热替换单元的同形状）。
@@ -159,6 +187,7 @@ impl PfDialTarget {
     /// 登记（§8 行 6）：`targetIp = 100.64.255.1`（手填出口隧道 IP 常量）在 QUIC 档 =
     /// 「字面拨 100.64.255.1」（通常拒），与 WG 档的「豁免臂 ⇒ 出口回环」不同；**不引入别名**
     /// （无兼容包袱常设口径；App 表单不会产生该常量）。
+    #[cfg(not(windows))]
     pub(crate) fn resolve(&self) -> SocketAddrV4 {
         match self {
             PfDialTarget::ExitPort(p) => SocketAddrV4::new(Ipv4Addr::LOCALHOST, *p),
@@ -267,6 +296,7 @@ impl PfState {
     }
 
     /// 迟到失败置位（accept 致命错误 / accept 线程异常退出；幂等——首个原因保留）。
+    #[cfg(not(windows))]
     pub(crate) fn mark_late_failed(&self, err: String) {
         let _ = self.late_fail.set(err);
     }
@@ -817,19 +847,6 @@ pub(crate) fn pf_bind(listen: u16) -> io::Result<TcpListener> {
     Ok(ln)
 }
 
-#[cfg(not(windows))]
-/// bind `127.0.0.1:{listen}`（windows 臂；WIN 批 §D4）：std `TcpListener::bind` +
-/// `set_nonblocking(true)`——地址硬编码回环同 unix 臂；SO_REUSEADDR 是 unix 臂的
-/// 重 bind 补偿面（windows 由系统 TIME_WAIT 语义兜底）。accept 带超时的就绪等待
-/// 在 unix 走 `poll_readable`（`poll(2)`）；windows 侧的等价面 = `sysock`
-/// （`AsRawSocket` 取 `RawSock` + `poll_slice` 的 WSAPoll 同形 API），随本文件的
-/// accept 线程面 windows 化一并接线。
-#[cfg(windows)]
-pub(crate) fn pf_bind(listen: u16) -> io::Result<TcpListener> {
-    let ln = TcpListener::bind((Ipv4Addr::LOCALHOST, listen))?;
-    ln.set_nonblocking(true)?;
-    Ok(ln)
-}
 
 #[cfg(not(windows))]
 /// `poll(2)` 等监听 fd 可读（≤`timeout_ms`）；到点返回 `Ok(())`（由 `accept` 裁决）。

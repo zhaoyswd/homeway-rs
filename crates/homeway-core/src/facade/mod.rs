@@ -62,15 +62,25 @@ pub mod tun_exec;
 pub mod tun_shared;
 pub mod tun_status;
 
-use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
 use std::time::Duration;
+
+// ClientCore 专属（WIN 批——评审 M3：windows 下未用静音）。
+#[cfg(not(windows))]
+use std::sync::Arc;
+#[cfg(not(windows))]
+use std::sync::atomic::{AtomicBool, Ordering};
+#[cfg(not(windows))]
+use std::sync::Mutex;
 
 use serde::Deserialize;
 
+#[cfg(not(windows))] // ClientCore 专属（WIN 批——评审 M3：windows 下未用静音）
 use demand::DemandSignals;
+#[cfg(not(windows))]
 use stage::TunStage;
+#[cfg(not(windows))]
 use tun_shared::{lock_unpoison, TunShared};
+#[cfg(not(windows))]
 use tun_status::{RunnerIn, TransportIn, TunStatusInput};
 
 /// 暖机窗口：等注册确认为止（软失败——超时仍 ready、可 attach 自愈）。
@@ -158,6 +168,8 @@ impl TunError {
 /// - 世代线程从 `shared.attach_receiver()` 拿 fd 接收端：暖机完成（stage=ready）后
 ///   在 `ATTACH_DEADLINE` 内等 fd，到点自行收工（`idle/"attach-timeout"` 终态）；
 /// - `request_stop` 要能打断暖机（Go：关客户端是第二条打断路径）。
+// App 核专用（世代执行体注入面——tun_exec/capi 消费；windows 不编译，评审 M3 随 imports 门控）。
+#[cfg(not(windows))]
 pub trait TunExecutor: Send + Sync {
     /// 暖机一个世代（启动即返；见模块头生命周期契约）。
     fn warmup(&self, cfg: &TunConfigJson, shared: Arc<TunShared>, gen: u64)
@@ -188,8 +200,10 @@ pub trait TunExecutor: Send + Sync {
 /// 无操作执行体（默认：一切本地动作失败——prepare 只到参数校验、暖机即失败）。
 /// `TunnelExec`（真 hub）在 tun_exec；这保证 facade 独立可测。
 #[derive(Debug, Default)]
+#[cfg(not(windows))]
 pub struct NoopTunExecutor;
 
+#[cfg(not(windows))]
 impl TunExecutor for NoopTunExecutor {
     fn warmup(
         &self,
@@ -601,6 +615,7 @@ impl ClientCore {
 }
 
 /// rustc 版本（编译期常量；等价 Go runtime.Version() 的信息位）。
+#[cfg(not(windows))] // ClientCore::version 消费（windows 不编译——评审 M3）
 fn rustc_semver() -> &'static str {
     // 编译期取（无运行时 API）：经 env 不可得时回落 stable 形态
     option_env!("HOMEWAY_RUSTC_VERSION").unwrap_or("stable")

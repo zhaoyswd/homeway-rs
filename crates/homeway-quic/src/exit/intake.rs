@@ -214,12 +214,8 @@ impl ServiceIntake {
     #[cfg(unix)]
     pub fn from_listener(listener: UnixListener) -> io::Result<Self> {
         listener.set_nonblocking(true)?;
-        let shared = new_shared(0)?;
-        Ok(Self {
-            listener: Some(listener),
-            shared,
-            streak: AtomicUsize::new(0),
-        })
+        let (intake, _tx) = Self::build(Some(listener), 0)?;
+        Ok(intake)
     }
 
     /// ② **两源形态**：UDS 监听器 + QUIC 源（容量 = 在册上限 + K）。返回值 =
@@ -230,11 +226,22 @@ impl ServiceIntake {
         capacity: usize,
     ) -> io::Result<(Self, ServiceIntakeTx)> {
         listener.set_nonblocking(true)?;
-        Self::pair(Some(listener), capacity)
+        Self::build(Some(listener), capacity)
     }
 
     /// ③ **QUIC-only 形态**（无 UDS 监听器；测试与纯 QUIC 部署面；windows 的**唯一**形态）。
     pub fn quic_only(capacity: usize) -> io::Result<(Self, ServiceIntakeTx)> {
+        #[cfg(unix)]
+        return Self::build(None, capacity);
+        #[cfg(windows)]
+        return Self::build(capacity);
+    }
+
+    /// 两源/单源共用的构造（评审 L5：修前 `quic_only` 手抄 `pair` 主体——分叉面）。
+    fn build(
+        #[cfg(unix)] listener: Option<UnixListener>,
+        capacity: usize,
+    ) -> io::Result<(Self, ServiceIntakeTx)> {
         let shared = new_shared(capacity)?;
         let tx = ServiceIntakeTx {
             shared: Arc::clone(&shared),
@@ -242,22 +249,6 @@ impl ServiceIntake {
         Ok((
             Self {
                 #[cfg(unix)]
-                listener: None,
-                shared,
-                streak: AtomicUsize::new(0),
-            },
-            tx,
-        ))
-    }
-
-    #[cfg(unix)]
-    fn pair(listener: Option<UnixListener>, capacity: usize) -> io::Result<(Self, ServiceIntakeTx)> {
-        let shared = new_shared(capacity)?;
-        let tx = ServiceIntakeTx {
-            shared: Arc::clone(&shared),
-        };
-        Ok((
-            Self {
                 listener,
                 shared,
                 streak: AtomicUsize::new(0),

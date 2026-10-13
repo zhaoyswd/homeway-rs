@@ -66,7 +66,9 @@ fn dial_control(state_dir: &std::path::Path, no_spawn: bool) -> Arc<ControlClien
     }
 }
 
-/// 裸 socket 三态探测的「未运行」出口（term/files --host 的拉起分流共用）。
+/// 裸 socket 三态探测的「未运行」出口（term --host 的拉起分流消费——windows 不编译
+/// term ⇒ 静音；files --host 走 dial_control_spawn 的内建探测）。
+#[cfg_attr(windows, allow(dead_code))]
 pub fn sock_not_running(sock: &std::path::Path) -> bool {
     matches!(probe_sock(sock), SockState::NotRunning)
 }

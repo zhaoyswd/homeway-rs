@@ -103,7 +103,11 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           key: x86_64-pc-windows-msvc
+      # 评审 M3：-D warnings（本地交叉 check 已零警告；windows 测试面不在本门——
+      # --all-targets 会编 tests〔unix 用例未门控〕，见 WIN-design §0 非目标）。
       - run: cargo check --locked -p homeway-core -p homeway-cli -p homeway-quic
+        env:
+          RUSTFLAGS: "-D warnings"
       # 运行面最小烟囱：版本横幅 + 纯函数动词（token 解码 = fixtures 向量的第一例
       # ——平台无关面：base64/crc/端点解析）。decode 期望 peer_id 段命中间量向量值。
       - name: 运行烟囱（--version / token 向量解码）

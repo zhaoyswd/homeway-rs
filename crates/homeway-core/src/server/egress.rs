@@ -271,7 +271,7 @@ fn interfaces_win() -> Vec<IfaceInfo> {
                         let mut e = IfaceInfo {
                             name,
                             // IfIndex 在 union 联合（windows-sys 的 Anonymous.u 形态）
-                            index: unsafe { a.Anonymous1.Anonymous.IfIndex },
+                            index: a.Anonymous1.Anonymous.IfIndex,
                             index_ok: true,
                             addrs: Vec::new(),
                             cidrs: Vec::new(),
@@ -379,6 +379,9 @@ pub fn pin_socket_to_iface(fd: crate::sysock::RawSock, index: u32, name: &str) -
         ));
     }
     let _ = name;
+    // unsafe 收进 unix 两臂（windows 臂经 `sysock::setsockopt_u32` 是安全调用——
+    // 评审 M3：修前外层整块 unsafe 在 windows 下 unnecessary）。
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
     unsafe {
         #[cfg(target_os = "macos")]
         {
@@ -409,6 +412,7 @@ pub fn pin_socket_to_iface(fd: crate::sysock::RawSock, index: u32, name: &str) -
         }
         #[cfg(target_os = "linux")]
         {
+            let _ = index; // linux 走 SO_BINDTODEVICE（按名），index 不参与（评审 H3 恢复）
             // 代码门 L1：空名 ⇒ `SO_BINDTODEVICE(optlen=0)` 在内核里是「**解绑**且成功」
             // ——与 darwin `IP_BOUND_IF=0` 同型的「解绑误报成已钉卡」；按名面在同型缺口上补门。
             if name.is_empty() {
@@ -431,19 +435,20 @@ pub fn pin_socket_to_iface(fd: crate::sysock::RawSock, index: u32, name: &str) -
             }
             Ok(())
         }
-        #[cfg(windows)]
-        {
-            use crate::sysock::{setsockopt_u32, IP_UNICAST_IF, IPV6_UNICAST_IF, IPPROTO_IP, IPPROTO_IPV6};
-            // 值 = 接口 index 的**网络字节序**（winsock 特有口径——按 u32 重解释）。
-            let v = index.to_be();
-            let e4 = setsockopt_u32(fd, IPPROTO_IP, IP_UNICAST_IF, v).err();
-            let e6 = setsockopt_u32(fd, IPPROTO_IPV6, IPV6_UNICAST_IF, v).err();
-            match (e4, e6) {
-                (Some(e4), Some(e6)) => Err(io::Error::other(format!(
-                    "IP_UNICAST_IF/IPV6_UNICAST_IF: {e4} / {e6}"
-                ))),
-                _ => Ok(()),
-            }
+    }
+    // windows 钉卡臂（安全调用面——setsockopt_u32 内部自带 unsafe 边界）。
+    #[cfg(windows)]
+    {
+        use crate::sysock::{setsockopt_u32, IP_UNICAST_IF, IPV6_UNICAST_IF, IPPROTO_IP, IPPROTO_IPV6};
+        // 值 = 接口 index 的**网络字节序**（winsock 特有口径——按 u32 重解释）。
+        let v = index.to_be();
+        let e4 = setsockopt_u32(fd, IPPROTO_IP, IP_UNICAST_IF, v).err();
+        let e6 = setsockopt_u32(fd, IPPROTO_IPV6, IPV6_UNICAST_IF, v).err();
+        match (e4, e6) {
+            (Some(e4), Some(e6)) => Err(io::Error::other(format!(
+                "IP_UNICAST_IF/IPV6_UNICAST_IF: {e4} / {e6}"
+            ))),
+            _ => Ok(()),
         }
     }
 }

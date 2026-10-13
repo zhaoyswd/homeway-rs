@@ -49,7 +49,10 @@ our_pid() {
   [[ -f "$pf" ]] || return 1
   p=$(cat "$pf" 2>/dev/null) || return 1
   kill -0 "$p" 2>/dev/null || return 1
-  [[ "$(ps -p "$p" -o comm= 2>/dev/null)" == *"${pat}"* ]] || return 1
+  # L8（评审）：glob 匹配会把 homeway-go 误认成 homeway——按「comm == pat 或
+  # comm 以 pat 开头且 pat 是词首（homeway 匹配 homeway、不匹配 homeway-go）」收紧。
+  local comm; comm=$(ps -p "$p" -o comm= 2>/dev/null)
+  [[ "$comm" == "$pat" || "$comm" == "${pat}-"* || "$comm" == "${pat} "[0-9]* ]] || return 1
   REPLY_PID=$p
 }
 

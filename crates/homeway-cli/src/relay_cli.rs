@@ -124,6 +124,11 @@ pub struct RelayProc {
     /// run 线程在世位（线程出口清零——panic 也清；统一进程 supervisor 的运行期
     /// 失败判据）。
     exited: Arc<std::sync::atomic::AtomicBool>,
+    /// **本 proc 是否 arm 过停止信号**（评审 H2：`stopsig::ARMED` 是进程级共享槽——
+    /// 统一进程里它由宿主（serve 面）arm；relay 在统一进程**从不** arm。恢复默认
+    /// 处置必须只在本面曾 arm 时做，否则会把宿主 handler 打回 SIG_DFL〔QG §4 原
+    /// 不变式〕）。
+    armed_here: bool,
 }
 
 impl RelayProc {
@@ -132,7 +137,7 @@ impl RelayProc {
         self.shutdown();
     }
 
-    /// 收口（`stop()` 与 `Drop` 共用）：disarm（`STOP_FD = -1`）→ 恢复信号处置
+    /// 收口（`stop()` 与 `Drop` 共用）：disarm（`stopsig::ARMED = DISARMED`）→ 恢复信号处置
     /// （仅当本 proc 曾 arm——见下）→ 写停止字节 → join → 关两端。
     ///
     /// **不变式（借用契约）**：`run` 借用读端裸值（[`StopPipe::read_fd`]）且从不
@@ -148,8 +153,14 @@ impl RelayProc {
         let Some(stop) = self.stop.take() else {
             return; // 已收口（幂等）
         };
-        // disarm：先断 handler 的写面（stopsig 的 swap 先于恢复——原不变式逐字保留）。
-        let _armed_here = crate::stopsig::disarm_and_restore();
+        // disarm：先断 handler 的写面（swap 先于 join/close 的顺序纪律不变）；
+        // 「恢复默认处置 + 清共享槽」只在本 proc 曾 arm 时做（评审 H2 整改——注意
+        // else 路径**什么都不做**：统一进程的共享槽归宿主（serve 面）arm，relay
+        // 收线若动它〔哪怕写 DISARMED〕会弄瞎宿主的信号写面——实测挂死复现钉）。
+        if self.armed_here {
+            crate::stopsig::disarm_and_restore();
+            self.armed_here = false;
+        }
         stop.signal();
         if let Some(h) = self.join.take() {
             let _ = h.join();
@@ -161,13 +172,14 @@ impl RelayProc {
     }
 
     /// 把停止管道写端交给信号 handler（**只在前台单角色调用**；armed 状态由
-    /// `STOP_FD >= 0` 单源表达——不设 `armed` 布尔字段）。
+    /// armed 状态由 `armed_here` 字段单源表达（评审 H2——共享槽属主化））。
     /// 未 armed 窗口（装配后 ~ 本调用前）由前台循环的「`exited()` 判失败 +
     /// `SIGNAL_HIT` 判信号」兜底，不会漏 Ctrl-C。
-    pub fn arm_signal(&self) {
+    pub fn arm_signal(&mut self) {
         crate::stopsig::arm(
             self.stop.as_ref().map(|s| s.write_fd()).unwrap_or(crate::stopsig::DISARMED),
         );
+        self.armed_here = true;
     }
 
     /// 在世位的共享句柄（supervisor 看护用——proc 本体留在宿主表内被 stop 消费；
@@ -278,7 +290,7 @@ pub fn assemble_relay(
             }
         })
         .expect("spawn relay");
-    Ok(RelayProc { stop: Some(stop), join: Some(join), exited })
+    Ok(RelayProc { stop: Some(stop), join: Some(join), exited, armed_here: false })
 }
 
 /// `homeway relay [...]`：前台中继（Ctrl-C / SIGTERM 收工——确定性 closeAll）。
@@ -329,7 +341,7 @@ pub fn cmd_relay(args: &[String]) {
     }
     let listen = rc.listen;
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
-    let proc = match assemble_relay(
+    let mut proc = match assemble_relay(
         &state_dir,
         RelayAssemble { listen, advertise: rc.advertise, no_hints: f.no_hints, open: f.open },
         Arc::clone(&logf),
@@ -392,7 +404,7 @@ fn install_relay_stop_signal() {
 mod tests {
     use super::*;
 
-    /// Q-G F3（CLI 层）：`STOP_FD` 的 arm/disarm 单源 + `shutdown` 幂等。
+    /// Q-G F3（CLI 层）：stopsig ARMED 的 arm/disarm 单源 + `shutdown` 幂等。
     ///
     /// - `arm_signal()` → `STOP_FD == 写端号`；
     /// - `shutdown()` → `STOP_FD == -1`（disarm，且此后 handler 写面关闭）；
@@ -407,6 +419,7 @@ mod tests {
             stop: Some(stop),
             join: None, // 无 run 线程：只测 arm/shutdown 结构面
             exited: Arc::new(std::sync::atomic::AtomicBool::new(true)),
+            armed_here: false,
         };
         proc.arm_signal();
         assert_eq!(crate::stopsig::armed(), w_fd, "arm 后 ARMED = 写端句柄");

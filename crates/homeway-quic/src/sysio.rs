@@ -31,6 +31,10 @@ pub fn pair() -> io::Result<(SvcStream, SvcStream)> {
         let c1 = std::net::TcpStream::connect(a)?;
         let c2 = ln.accept()?.0;
         drop(ln);
+        // 评审 M9：关 Nagle（承载对要的是字节流管道语义——与 core::sysock::WakePair
+        // 的回环对同款；不关会让小帧路径凑包）。
+        let _ = c1.set_nodelay(true);
+        let _ = c2.set_nodelay(true);
         Ok((c2, c1))
     }
 }
@@ -208,13 +212,22 @@ pub use libc::{POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT};
 #[cfg(windows)]
 pub use windows_sys::Win32::Networking::WinSock::{POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT};
 
+/// 布局钉（评审 M5，与 core::sysock 同钉）：unix 臂整片 reinterpret 成
+/// `libc::pollfd`——repr(C) + 编译期布局断言。
+#[repr(C)]
 #[derive(Clone, Copy)]
-#[allow(dead_code)] // raw/events 字段在 windows 臂的 WSAPoll 转换里读写（unix 构建静音）
 pub struct PollEnt {
     pub raw: RawIo,
     pub events: i16,
     pub revents: i16,
 }
+#[cfg(unix)]
+const _: () = {
+    assert!(std::mem::size_of::<PollEnt>() == std::mem::size_of::<libc::pollfd>());
+    assert!(std::mem::offset_of!(PollEnt, raw) == std::mem::offset_of!(libc::pollfd, fd));
+    assert!(std::mem::offset_of!(PollEnt, events) == std::mem::offset_of!(libc::pollfd, events));
+    assert!(std::mem::offset_of!(PollEnt, revents) == std::mem::offset_of!(libc::pollfd, revents));
+};
 
 /// 带超时 poll（毫秒）。Err = 系统调用失败（含 Interrupted——调用方按需重试）。
 pub fn poll(ents: &mut [PollEnt], timeout_ms: i32) -> io::Result<i32> {
@@ -336,17 +349,23 @@ pub fn recv(raw: RawIo, buf: &mut [u8]) -> io::Result<usize> {
     Ok(r as usize)
 }
 
-/// 裸句柄 send（unix 无 MSG_NOSIGNAL 面〔调用方语境无 SIGPIPE 处置〕；windows 同形）。
-#[allow(dead_code)] // windows 臂消费（unix 构建静音）
+/// 裸句柄 send。unix 带 `MSG_NOSIGNAL`——与 `core::sysock::send` 同语义对齐
+/// （评审 M6：修前两份同型助手在一批内语义分叉）；windows 无 SIGPIPE 概念，
+/// flags=0 等价。（unix 构建下仅 `write()` 的 windows 臂间接可达——静音。）
+#[allow(dead_code)]
 pub fn send(raw: RawIo, buf: &[u8]) -> io::Result<usize> {
+    #[cfg(unix)]
+    let flags = libc::MSG_NOSIGNAL;
+    #[cfg(windows)]
+    let flags = 0;
     let r = unsafe {
         #[cfg(unix)]
         {
-            libc::send(raw, buf.as_ptr().cast(), buf.len(), 0)
+            libc::send(raw, buf.as_ptr().cast(), buf.len(), flags)
         }
         #[cfg(windows)]
         {
-            windows_sys::Win32::Networking::WinSock::send(raw as usize, buf.as_ptr(), buf.len() as i32, 0)
+            windows_sys::Win32::Networking::WinSock::send(raw as usize, buf.as_ptr(), buf.len() as i32, flags)
         }
     };
     #[cfg(unix)]

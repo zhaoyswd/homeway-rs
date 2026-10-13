@@ -47,12 +47,14 @@ pub(crate) fn bind_v6_only(ip: std::net::Ipv6Addr, port: u16) -> io::Result<UdpS
     let a = SocketAddr::from((ip, port));
     let packed = crate::sysock::pack_addr(&a);
     let sock = crate::sysock::socket(packed.domain, crate::sysock::SOCK_DGRAM)?;
-    crate::sysock::setsockopt_i32(
+    // V6ONLY=1 的 setsockopt 失败按旧形态忽略（原实现 `let _ =`——bind 会按系统
+    // 缺省继续，极端形态由 is_dual_stack 运行期检测兜底；评审 L1 恢复）。
+    let _ = crate::sysock::setsockopt_i32(
         crate::sysock::sock_raw(&sock),
         crate::sysock::IPPROTO_IPV6,
         crate::sysock::IPV6_V6ONLY,
         1,
-    )?;
+    );
     crate::sysock::bind(&sock, &packed)?;
     Ok(crate::sysock::into_udp_socket(sock))
 }

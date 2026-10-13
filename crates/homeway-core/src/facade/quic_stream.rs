@@ -19,9 +19,14 @@
 //!    归 S4 的阶梯重写（本切片只做「换轨 + 归因」，不动阶梯结构）。
 //! 3. **读无限期**（§1.5）：[`Read`] 的读挂到数据/EOF/取消为止——files 空闲 5min、
 //!    term 腿可挂数小时，**不得**套 RPC 预算；取消只经关流（`Drop`/`close_write`）。
-//!    写走 §1.4 的 `n=0` 分级退避环（`tun_exec::write_retry_backoff` 同款）。
+//!    写走 §1.4 的 `n=0` 分级退避环（`write_retry_backoff`——WIN 批起定义在本模块，
+//!    `tun_exec` 同款消费）。
 
-use std::io::{self, Read, Write};
+use std::io::{self};
+// Read/Write 只被 QuicStream 两半（GenRun 桥承载，windows 不编译）消费——
+// 宿主会话面（HostStream）经 host_session 自己的 io 面。
+#[cfg(not(windows))]
+use std::io::{Read, Write};
 use std::net::SocketAddrV4;
 use std::sync::mpsc;
 use std::sync::Arc;
@@ -32,6 +37,7 @@ use homeway_quic::{Cmd, Island, StreamErr, StreamId, StreamReply, StreamTag};
 
 use crate::Logf;
 
+#[cfg(not(windows))] // BridgeStream/WriteHalf 面 = App 桥承载（windows 不装配三桥）
 use super::bridge_io::{BridgeStream, WriteHalf};
 #[cfg(not(windows))] // GenRun 面 = App 世代执行体（tun_exec 在 windows 不编译）
 use super::tun_exec::GenRun;
@@ -445,6 +451,9 @@ fn stream_err_to_io(e: StreamErr) -> io::Error {
 
 /// 流句柄的共享体（两半各持一份 `Arc`；**Drop = 关流**——防半开连接累积；形态承
 /// 自已退役的 WG 档 `SharedConn`，预算同款）。
+// 构造面 = dial/dial_target（GenRun 桥承载，windows 不编译）——windows 下未构造
+// 即静音（方法面是可携的，QuicStream 本体在宿主会话路径用）。
+#[cfg_attr(windows, allow(dead_code))]
 struct StreamShared {
     island: Arc<Island>,
     id: StreamId,
@@ -465,6 +474,7 @@ impl Drop for StreamShared {
 }
 
 /// QUIC 服务流整体（`BridgeStream`：拆两半给桥泵）。
+#[cfg(not(windows))] // 构造面 = dial/dial_target（GenRun 桥承载，windows 不编译）
 pub(crate) struct QuicStream {
     shared: Arc<StreamShared>,
     /// 交付前**已在手**的余量（dial 缝的 1B 回执之后可能立刻跟目标字节 ⇒ 首块
@@ -472,6 +482,7 @@ pub(crate) struct QuicStream {
     pending: Vec<u8>,
 }
 
+#[cfg(not(windows))]
 impl QuicStream {
     fn new(island: Arc<Island>, id: StreamId) -> Self {
         QuicStream::from_shared(Arc::new(StreamShared { island, id }))
@@ -512,6 +523,7 @@ impl BridgeStream for QuicStream {
 
 /// 读半：`Cmd::StreamRead` **无限期挂起**（§1.5）；`Err(Closed)` = EOF（今天的
 /// `SessionReadHalf` 同形——桥泵据此收口）。
+#[cfg(not(windows))]
 struct QuicReadHalf {
     shared: Arc<StreamShared>,
     /// 交付前已在手的余量（dial 缝的 1B 回执之后可能立刻跟目标字节）——**先于**任何岛命令
@@ -549,6 +561,7 @@ impl PendingBuf {
     }
 }
 
+#[cfg(not(windows))]
 impl Read for QuicReadHalf {
     fn read(&mut self, out: &mut [u8]) -> io::Result<usize> {
         if let Some(n) = self.pending.take(out) {
@@ -592,10 +605,12 @@ impl Read for QuicReadHalf {
 /// 写半：`Cmd::StreamWrite`（**非阻塞**：`n` 由待发队列余量给出）；`n=0` 走 §1.4 的
 /// Ok(0) 分级退避环（**不得**按 `io::Write` 的「`Ok(0)` = 通道关」处理——那是本仓
 /// 被真机打过的坑）。
+#[cfg(not(windows))]
 struct QuicWriteHalf {
     shared: Arc<StreamShared>,
 }
 
+#[cfg(not(windows))]
 impl Write for QuicWriteHalf {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         if data.is_empty() {
@@ -641,6 +656,7 @@ impl Write for QuicWriteHalf {
     }
 }
 
+#[cfg(not(windows))]
 impl WriteHalf for QuicWriteHalf {
     fn close_write(&mut self) {
         // 半关 = FIN（§1.3：单向——对端仍可发、本端仍可读）；走收工链 ⇒ 有界

@@ -452,7 +452,10 @@ impl ServeEngine {
         // 容量 = 该服务在册上限 + K（§1.7 设计门 2-4/2-5：保证**应用层 busy 路径**先于
         // intake 满触发）；`ServiceIntake` 同时是 `serve_stoppable` 的形参（服务本体零改）。
         let mut stop_flags = Vec::new();
+        #[cfg(unix)]
         let mut socks = Vec::new();
+        #[cfg(windows)]
+        let socks = Vec::new(); // windows 无本地调试腿（评审 M2）——收工清理面为空
         #[cfg(not(windows))]
         let mut term_srv: Option<Arc<crate::term::service::TermService>> = None;
         let mut service_intakes = homeway_quic::ServiceIntakes::default();
@@ -482,28 +485,53 @@ impl ServeEngine {
         }
         let files_srv = crate::files_server::FilesServer::open(cfg.files_root.as_deref(), Arc::clone(&dlogf)).ok();
         if let Some(fsrv) = files_srv {
-            match crate::files_server::listen_local_service(&serve_dir, "files.sock", &dlogf) {
+            // 本地调试腿（<serve_dir>/files.sock）是 **unix 面**：windows 只装 QUIC 入口
+            // （主路径不缺；评审 M2——修前 windows 也 bind 本地口后即丢：端口文件残留 +
+            // 就绪行误导）。
+            #[cfg(unix)]
+            let local = match crate::files_server::listen_local_service(&serve_dir, "files.sock", &dlogf) {
                 Ok(ln) => {
-                    #[cfg(unix)]
-                    let own = sock_identity(&serve_dir.join("files.sock"));
-                    // WIN 批：windows TCP IPC 无 sock 文件——无属主可比，收工清理由
-                    // remove_sock_own 的 (0,0) 臂兜（NotFound 容错）。
-                    #[cfg(windows)]
-                    let own = (0, 0);
-                    socks.push((serve_dir.join("files.sock"), own));
-                    // E14（M5 S4 定稿行文）：服务流 tag=1 经服务入口（QUIC STREAM）
-                    // 转投；本机 UDS 只服务调试面（WG 服务腿已退役）
+                    socks.push((serve_dir.join("files.sock"), sock_identity(&serve_dir.join("files.sock"))));
+                    Some(ln)
+                }
+                Err(e) => {
                     (logf)(&format!(
-                        "files 就绪：root={} (rw) sock={}（STREAM tag=1 经服务入口转投）",
-                        fsrv.root_dir().display(),
+                        "⚠️ files 监听 {} 失败（{e}）—— 文件管理会报错（state 目录异常/被其它实例占用），其余功能不受影响",
                         serve_dir.join("files.sock").display()
                     ));
-                    if let Some((intake, tx)) = service_intake(
-                        ln,
-                        homeway_quic::tuning::service_defaults::intake_capacity(crate::files_server::MAX_CONNS),
-                        "files",
-                        &logf,
-                    ) {
+                    None
+                }
+            };
+            // E14（M5 S4 定稿行文）：服务流 tag=1 经服务入口（QUIC STREAM）转投；本机
+            // UDS 只服务调试面（WG 服务腿已退役）。
+            #[cfg(unix)]
+            (logf)(&format!(
+                "files 就绪：root={} (rw) sock={}（STREAM tag=1 经服务入口转投）",
+                fsrv.root_dir().display(),
+                serve_dir.join("files.sock").display()
+            ));
+            #[cfg(windows)]
+            (logf)(&format!(
+                "files 就绪：root={} (rw)（STREAM tag=1 经服务入口转投；本机调试腿在 windows 不装配）",
+                fsrv.root_dir().display()
+            ));
+            #[cfg(unix)]
+            let built = local.and_then(|ln| {
+                service_intake(
+                    ln,
+                    homeway_quic::tuning::service_defaults::intake_capacity(crate::files_server::MAX_CONNS),
+                    "files",
+                    &logf,
+                )
+            });
+            #[cfg(windows)]
+            let built = service_intake(
+                homeway_quic::tuning::service_defaults::intake_capacity(crate::files_server::MAX_CONNS),
+                "files",
+                &logf,
+            );
+            {
+                if let Some((intake, tx)) = built {
                         service_intakes.files = Some(tx);
                         let stop = spawn_service_stop_flag(&mut stop_flags);
                         let d2 = Arc::clone(&dlogf);
@@ -520,38 +548,55 @@ impl ServeEngine {
                             (d3)(&format!("⚠️ files: 服务线程起不来（{e}）——监听点无人受理（文件管理不可用）"));
                         }
                     }
-                    // 入口起不来（`None`）：该服务整条腿停用（已记行；QUIC 档该 tag 落到 0x22）
-                }
-                Err(e) => {
-                    (logf)(&format!(
-                        "⚠️ files 监听 {} 失败（{e}）—— 文件管理会报错（state 目录异常/被其它实例占用），其余功能不受影响",
-                        serve_dir.join("files.sock").display()
-                    ));
-                }
             }
+            // 入口起不来（`None`）：该服务整条腿停用（已记行；QUIC 档该 tag 落到 0x22）
         } else {
             (logf)("⚠️ files 根目录不可用—— 文件管理会报错，其余功能不受影响");
         }
         let speed_srv = Arc::new(crate::speedtest_server::SpeedtestServer::new(Arc::clone(&dlogf)));
-        match crate::files_server::listen_local_service(&serve_dir, "speedtest.sock", &dlogf) {
+        // 本地调试腿同 files：unix 面（评审 M2）。
+        #[cfg(unix)]
+        let local = match crate::files_server::listen_local_service(&serve_dir, "speedtest.sock", &dlogf) {
             Ok(ln) => {
-                #[cfg(unix)]
-                let own = sock_identity(&serve_dir.join("speedtest.sock"));
-                // WIN 批：同 files——windows 无 sock 文件属主面。
-                #[cfg(windows)]
-                let own = (0, 0);
-                socks.push((serve_dir.join("speedtest.sock"), own));
-                // E17（M5 S4 定稿行文）：服务流 tag=3 经服务入口（QUIC STREAM）转投
+                socks.push((
+                    serve_dir.join("speedtest.sock"),
+                    sock_identity(&serve_dir.join("speedtest.sock")),
+                ));
+                Some(ln)
+            }
+            Err(e) => {
                 (logf)(&format!(
-                    "speedtest 就绪：sock={}（STREAM tag=3 经服务入口转投；内存收发不落盘）",
+                    "⚠️ speedtest 监听 {} 失败（{e}）—— 测速功能会报错（state 目录异常/被其它实例占用），其余功能不受影响",
                     serve_dir.join("speedtest.sock").display()
                 ));
-                if let Some((intake, tx)) = service_intake(
-                    ln,
-                    homeway_quic::tuning::service_defaults::intake_capacity(crate::speedtest_server::MAX_CONNS),
-                    "speedtest",
-                    &logf,
-                ) {
+                None
+            }
+        };
+        // E17（M5 S4 定稿行文）：服务流 tag=3 经服务入口（QUIC STREAM）转投
+        #[cfg(unix)]
+        (logf)(&format!(
+            "speedtest 就绪：sock={}（STREAM tag=3 经服务入口转投；内存收发不落盘）",
+            serve_dir.join("speedtest.sock").display()
+        ));
+        #[cfg(windows)]
+        (logf)("speedtest 就绪：（STREAM tag=3 经服务入口转投；内存收发不落盘；本机调试腿在 windows 不装配）");
+        #[cfg(unix)]
+        let built = local.and_then(|ln| {
+            service_intake(
+                ln,
+                homeway_quic::tuning::service_defaults::intake_capacity(crate::speedtest_server::MAX_CONNS),
+                "speedtest",
+                &logf,
+            )
+        });
+        #[cfg(windows)]
+        let built = service_intake(
+            homeway_quic::tuning::service_defaults::intake_capacity(crate::speedtest_server::MAX_CONNS),
+            "speedtest",
+            &logf,
+        );
+        {
+            if let Some((intake, tx)) = built {
                     service_intakes.speedtest = Some(tx);
                     let stop = spawn_service_stop_flag(&mut stop_flags);
                     let srv2 = Arc::clone(&speed_srv);
@@ -568,13 +613,6 @@ impl ServeEngine {
                     {
                         (d3)(&format!("⚠️ speedtest: 服务线程起不来（{e}）——监听点无人受理（测速不可用）"));
                     }
-                }
-            }
-            Err(e) => {
-                (logf)(&format!(
-                    "⚠️ speedtest 监听 {} 失败（{e}）—— 测速功能会报错（state 目录异常/被其它实例占用），其余功能不受影响",
-                    serve_dir.join("speedtest.sock").display()
-                ));
             }
         }
 
@@ -1287,21 +1325,33 @@ fn dns_intake_of(
     }
 }
 
+/// intake 装配（unix 两源 = UDS 调试腿 + QUIC；windows QUIC-only——评审 M2 后的
+/// 显式双签名：windows 侧不再 bind 本地口〔修前 bind 后即丢、端口文件残留〕）。
+#[cfg(unix)]
 fn service_intake(
     ln: crate::daemon::ipc::IpcListener,
     capacity: usize,
     tag: &str,
     logf: &Logf,
 ) -> Option<(homeway_quic::ServiceIntake, homeway_quic::ServiceIntakeTx)> {
-    // WIN 批：intake 装配面（quic 的 ServiceIntake）在 unix 上吃 UDS 监听器——
-    // 解包；windows 上该腿不装配（设计 §D2），本函数不会被走到。
-    #[cfg(unix)]
     let crate::daemon::ipc::IpcListener::Unix(ln) = ln;
-    #[cfg(unix)]
-    let built = homeway_quic::ServiceIntake::with_quic(ln, capacity);
-    // windows：无 UDS 调试腿——QUIC-only intake（主入口 = STREAM，行为面不缺）。
-    #[cfg(windows)]
-    let built = homeway_quic::ServiceIntake::quic_only(capacity);
+    service_intake_built(homeway_quic::ServiceIntake::with_quic(ln, capacity), tag, logf)
+}
+
+#[cfg(windows)]
+fn service_intake(
+    capacity: usize,
+    tag: &str,
+    logf: &Logf,
+) -> Option<(homeway_quic::ServiceIntake, homeway_quic::ServiceIntakeTx)> {
+    service_intake_built(homeway_quic::ServiceIntake::quic_only(capacity), tag, logf)
+}
+
+fn service_intake_built(
+    built: std::io::Result<(homeway_quic::ServiceIntake, homeway_quic::ServiceIntakeTx)>,
+    tag: &str,
+    logf: &Logf,
+) -> Option<(homeway_quic::ServiceIntake, homeway_quic::ServiceIntakeTx)> {
     match built {
         Ok((intake, tx)) => Some((intake, tx)),
         Err(e) => {

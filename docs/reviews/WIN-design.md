@@ -184,8 +184,9 @@ unix 臂语义不动，windows 臂按 winsock 值域自然工作，个别形态�
      `SOCKET`=usize（本仓 RawSock 取 u64=RawSocket 宽度，调用点收窄 cast）。
    - `GetAdaptersAddresses` 的 IfIndex 藏在 `Anonymous1.Anonymous.IfIndex` 双层联合。
 3. **唤醒对/停止管道的 syscall 分派**（实测 bug 修复）：unix 的唤醒对是**管道**——
-   socket 系 `send/recv` 对 pipe fd 报 ENOTSOCK ⇒ `wake_signal/wake_drain/stopsig` 在
-   unix 臂走 `write/read(2)`、windows 臂（回环 TCP 对）走 `send/recv`。
+   socket 系 `send/recv` 对 pipe fd 报 ENOTSOCK ⇒ `wake_signal/wake_drain/stopsig`
+   （含 handler 主体——r1 评审 H1 抓漏的一处）在 unix 臂走 `write/read(2)`、
+   windows 臂（回环 TCP 对）走 `send/recv`。
 4. **intake 承载流**：quic 的 `SvcStream`（unix=UnixStream / windows=回环 TCP）跨 crate
    公开，core 侧 `files_server::intake_conn` 归 wrap 成 `IpcStream`（服务本体只见
    IpcStream）。`ServiceIntake::from_listener/with_quic`（UDS 调试腿）= unix-only；
@@ -198,7 +199,33 @@ unix 臂语义不动，windows 臂按 winsock 值域自然工作，个别形态�
    `_byteswap_*` + no-op `lib.exe`；与 OHOS/musl 交叉 check 同纪律——check-only）。
 6. **代理（棒子）完成面**：IPC 替换（daemon/files/speedtest/engine/dns_stream）、锁
    （syslock）、权限位 cfg 对（identity/nodestate/artifact/state/carriers）、
-   `disk_free_bytes`、portfwd `pf_bind` windows 臂。已登记的 8 条风险点见其完成报告
-   （其中「EACCES 归入 Held」「accept 循环重写」两条在评审门复核）。
+   `disk_free_bytes`。portfwd `pf_bind` 的 windows 臂**未接线**（运行时半边整体
+   not(windows)，无调用点——评审 M1 后删除，后续批接 windows 化 accept 面时重建）。
+   代理登记的 8 条风险点中「EACCES 归入 Held」「accept 循环重写」经 r1 复核接受
+   （记录 = docs/reviews/WIN.md）。
 7. **残留非目标**：windows 测试面（用例 unix 化）；`homeway term` 在 windows 明确报
    「不支持」；`homeway-capi` 不进 windows 面。
+
+## 5. r1 评审后的登记订正与补登（2026-10-13；记录 = docs/reviews/WIN.md）
+
+- **§D3 偏离**：`facade/bridge_auth.rs`（write_auth 搬家）未落地——四桥消费模块
+  （bridge_host/files_op/speedtest_op/term_op）整体同门控，搬家无必要；跨平台件
+  落 `bridge_io`（trait + 出口虚拟端口），功能等价。
+- **§D4 「重复 ≤50 行」订正**：quic `sysio` 实为 ≈250 行同型复刻（SvcStream/pair
+  之外与 core::sysock 近乎逐字）；r1 后 `send` 语义已对齐（unix 带
+  MSG_NOSIGNAL）。抽第三叶子 crate = 后续批（登记于 WIN.md 待办 ⑦）。
+- **风险表补登（§3 增行）**：
+  - 每条服务流一对回环 TCP（windows 泵承载）⇒ 每流一个 TIME_WAIT + 动态端口 +
+    3 次额外 syscall；高流速率下动态端口耗尽会把该流打成 `reset(0x22)`
+    （表现 = 服务不可用）——量级待压测（WIN.md 待办 ④）。
+  - windows 臂 close 带未读数据 ⇒ RST（AF_UNIX 无此面）——错误码/日志面差异
+    （FIN/EOF 语义不受影响）；pump 头注已改口径。
+- **M4 登记**：windows 守护进程**无 daemon 级优雅停止路径**（控制面只有
+  serve.\*/relay.\* 动词；taskkill 不带 /f 对无控制台进程无效）——README 已明写；
+  `daemon.stop` = 后续批（WIN.md 待办 ⑥）。
+- **§4-12（L1 登记）**：三处 unix 失败路径**有意**的可见改善——artifact/timestamp
+  失败回 `{secs}`/`unknown-time(secs)`（旧 = 零值 tm 拼出 `19000100-000000` 形态）；
+  TUN 非阻塞化失败日志合并为单 errno 文案（旧分 F_GETFL/F_SETFL 两标签）。
+- **§4-8（H3 附带）**：linux-gnu 目标的 clippy 是 CI clippy 门的实际目标面，本地
+  mac 全绿不代表它绿——复验配方 `cargo clippy --target x86_64-unknown-linux-gnu
+  -p homeway-core -- -D warnings`（ring C 面走 cc-check-shim 同款）。

@@ -26,6 +26,9 @@ pub struct LocalTm {
 pub fn localtime(secs: i64) -> Option<LocalTm> {
     #[cfg(unix)]
     {
+        // time_t 用 i64 直述的 libc 原口径（musl/ohos 把 time_t 别名标 deprecated，
+        // i64 是它的实指——旧 relay/logfile.rs 的 allow+注释随迁，评审 M8）。
+        #[allow(deprecated)]
         let t: libc::time_t = secs as libc::time_t;
         let mut tm: libc::tm = unsafe { std::mem::zeroed() };
         let p = unsafe { libc::localtime_r(&t, &mut tm) };

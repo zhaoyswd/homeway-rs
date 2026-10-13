@@ -927,7 +927,7 @@ fn fs_mode_bits(md: &std::fs::Metadata) -> u32 {
 /// `ServiceIntake`（quic 服务流泵/调试腿）产出的流 → [`IpcStream`] 归 wrap。
 /// WIN 批：承载流类型 = quic 的 `SvcStream`（unix = UDS 零拷贝包一层 / windows =
 /// 回环 TCP 对——泵侧同源），两平台服务本体都吃到 `IpcStream`。
-pub(crate) fn intake_conn(s: homeway_quic::sysio::SvcStream) -> IpcStream {
+pub(crate) fn intake_conn(s: homeway_quic::SvcStream) -> IpcStream {
     #[cfg(unix)]
     {
         IpcStream::Unix(s)
@@ -1059,6 +1059,9 @@ impl Drop for ConnReservation {
 /// WIN 批（§D2）：承载经 `ipc.rs`——unix 臂凭证面（长度拒绝/0700/0600）原样；
 /// windows = TCP loopback + 端口文件，这三步整体跳过（§D2 鉴权面偏离已登记）。
 pub fn listen_local_service(dir: &Path, name: &str, logf: &crate::Logf) -> std::io::Result<IpcListener> {
+    // （unix 臂的 0700/0600 告警消费 logf；windows 臂无这两步——评审 M3 静音）
+    #[cfg(windows)]
+    let _ = logf;
     let sock = dir.join(name);
     // 量法统一为**字节口径**（`as_os_str().len()`——旧 `display()` 是 lossy 字符串，
     // 与判据不同源；Q-G F4.3）。
