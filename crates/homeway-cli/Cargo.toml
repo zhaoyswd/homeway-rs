@@ -2,6 +2,7 @@
 name = "homeway-cli"
 description = "homeway：生产出口/中继/客户端/daemon 统一二进制（零参 = 统一进程；v0.2.3）"
 version.workspace = true
+license.workspace = true
 edition.workspace = true
 
 # 二进制名 = `homeway`（WIN 批 2026-10-13 用户指令：发布产物不带 -cli 后缀；

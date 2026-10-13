@@ -2,6 +2,7 @@
 name = "homeway-core"
 description = "homeway 的 Rust 平行实现：协议底座与共享语义（对齐基线见仓 docs/BASELINE.md）"
 version.workspace = true
+license.workspace = true
 edition.workspace = true
 
 [dependencies]

@@ -607,6 +607,42 @@ fn parse_args(usage: &str, args: &[String]) -> ParsedArgs {
     out
 }
 
+/// `--host` **缺省**时的寻址（2026-10-13 用户指令：file/term/forward 统一 host 风格，
+/// 普通用户不必知道 token/state 等参数）：**0 台 ⇒ 可行动提示；1 台 ⇒ 直接用它；
+/// 多台 ⇒ 要求显式 `--host`**。返回寻址串（name 优先；表内匹配规则同 [`resolve_host`]）。
+///
+/// 需要控制面（`host add` 的主机表即在此）；未运行时按既有形态拉起。
+pub fn default_host_ref(
+    state_dir: &std::path::Path,
+    cmd: &str,
+    timeout: Duration,
+    no_spawn: bool,
+) -> Result<String, String> {
+    let c = dial_control_spawn(state_dir, "homeway-host", no_spawn)?;
+    let briefs = c
+        .request(vocab::OpName::HostList.as_str(), None, timeout)
+        .map_err(|e| format!("host.list 失败：{}", op_err_text(&e)))?;
+    let hosts = briefs["hosts"].as_array().cloned().unwrap_or_default();
+    match hosts.len() {
+        0 => Err(format!(
+            "还没有添加主机——先在出口机上执行 `homeway serve token` 取 token，再在本机执行 \
+             `homeway host add <token>`（加过之后 `homeway {cmd}` 默认就用它）"
+        )),
+        1 => {
+            let b = &hosts[0];
+            Ok(b["name"]
+                .as_str()
+                .filter(|s| !s.is_empty())
+                .or_else(|| b["id"].as_str())
+                .unwrap_or_default()
+                .to_owned())
+        }
+        n => Err(format!(
+            "本机有 {n} 台主机——用 `--host <name|id>` 指定（`homeway host list` 看全表）"
+        )),
+    }
+}
+
 /// 主机寻址（Go resolveHostTarget 同义：空串拒绝、名称/唯一前缀、歧义列候选、
 /// 全长 64 hex 必须在表内——Q-H F10：CLI-2 整改的 `starts_with("")` 恒真曾可静默删
 /// 第一台；F10 起 64-hex 分支改「解码 → 小写 canonical → 与表内 id 比对」，

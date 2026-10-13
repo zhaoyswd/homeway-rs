@@ -2,6 +2,7 @@
 name = "homeway-quic"
 description = "QUIC 岛：单线程 runtime 宿主 + 同步/异步边界 + 出口 QUIC 面 + 客户端连接/数据面（对同步面只暴露命令通道；M1 起已接线）"
 version.workspace = true
+license.workspace = true
 edition.workspace = true
 
 # 纪律（M0 设计 §3.1/§3.4）：本 crate 是**叶子**（leaf-ward）——**不得**依赖

@@ -764,8 +764,9 @@ fn cmd_speedtest(args: &[String]) {
 fn cmd_files(args: &[String]) {
     // Q-H F8/CA13：`--help`/`-h` 短路（用法 + exit 0；任意位置）。
     if wants_help(args) {
-        eprintln!("用法：homeway files <list|stat|mkdir|read|get|put|download|upload> --token <hmw2…> […] <路径> [<本地>]");
-        eprintln!("  远程形态：homeway files <verb> --host <ref> [--state D] [--timeout T] <远端路径> [<本地路径>]");
+        eprintln!("用法：homeway files <list|stat|mkdir|read|get|put|download|upload> <远端路径> [<本地路径>]");
+        eprintln!("  默认用本机主机；有多台时用 `--host <name|id>` 指定（`homeway host list` 看全表）");
+        eprintln!("  get <远端> [-o 本地] [--force]；put <本地> <远端>");
         std::process::exit(0);
     }
     // files <verb> --token <hmw2> [--identity-dir D] [--dead-direct] [--inject relay-lock|no-hint]
@@ -852,10 +853,18 @@ fn cmd_files(args: &[String]) {
         i += adv;
     }
     if tok.is_none() && host_ref.is_none() {
-        eprintln!("用法：homeway files <list|stat|mkdir|read|get|put|download|upload> --token <hmw2> [--identity-dir D] [--rate-limit B/s（缺省 2MiB/s；0 不限）] <远端路径> [<本地路径>]");
-        eprintln!("  远程形态：homeway files <verb> --host <ref> [--state D] [--timeout T] <远端路径> [<本地路径>]（经控制面 stream.open 转发——D-1）");
-        eprintln!("  get <远端> [-o 本地] [--force]（目标缺省 = basename，已存在默认拒）；put <本地> <远端>——Go 契约参数序，与 download/upload（<远端> [<本地>]）不同");
-        std::process::exit(2);
+        // 2026-10-13 用户指令：file/term/forward 统一 host 风格——`--host` 缺省（且未给
+        // 直连缝 `--token`）时走「默认主机」寻址：1 台 ⇒ 用它；0 台 ⇒ 提示先 host add；
+        // 多台 ⇒ 要求显式 `--host`。
+        let state_dir = host_state.clone().unwrap_or_else(crate::unified_cli::default_state_dir);
+        let timeout = host_timeout.unwrap_or(Duration::from_secs(10));
+        match daemon_cli::default_host_ref(&state_dir, "files <子命令>", timeout, no_spawn) {
+            Ok(r) => host_ref = Some(r),
+            Err(e) => {
+                eprintln!("homeway: {e}");
+                std::process::exit(1);
+            }
+        }
     }
     let verb = rest.first().cloned().unwrap_or_default();
     // ---- 动词感知解析（dsh r1 高-1 整改）：get/put 是 Go 契约形态，参数序/flag 面
@@ -979,7 +988,7 @@ fn cmd_files(args: &[String]) {
             let p = rest.get(1).cloned().unwrap_or_default();
             let l = rest.get(2).cloned().unwrap_or_default();
             if p.is_empty() {
-                eprintln!("用法：homeway files <verb> --token <hmw2> [--rate-limit B/s] <远端路径> [<本地路径>]");
+                eprintln!("用法：homeway files <list|stat|mkdir|read|get|put|download|upload> <远端路径> [<本地路径>]");
                 std::process::exit(2);
             }
             (p, l)
@@ -1255,7 +1264,11 @@ fn files_stream_open_err_text(e: &homeway_core::daemon::proto::OpError) -> Strin
 fn cmd_portfwd(args: &[String]) {
     // Q-H F8/CA13：`--help`/`-h` 短路（用法 + exit 0；任意位置）。
     if wants_help(args) {
-        eprintln!("用法：homeway portfwd --token <hmw2…> --map 15432:5432 [--map 15433:1.2.3.4:5432] [--identity-dir D] [--no-session-lock]");
+        eprintln!("端口转发的正式用法（host 形态）：");
+        eprintln!("  homeway forward add --listen 15432 --target :5432      # 建规则（单主机可省 --host）");
+        eprintln!("  homeway forward list / delete --listen 15432");
+        eprintln!("homeway portfwd = **直连调试缝**（自动化/矩阵专用，不经主机表）：");
+        eprintln!("  homeway portfwd --token <hmw2…> --map 15432:5432 [--identity-dir D]");
         std::process::exit(0);
     }
     let mut tok: Option<String> = None;
@@ -1318,7 +1331,8 @@ fn cmd_portfwd(args: &[String]) {
         i += adv;
     }
     let Some(tok) = tok else {
-        eprintln!("用法：homeway portfwd --token <hmw2> --map 15432:5432 [--map 15433:1.2.3.4:5432]");
+        eprintln!("homeway portfwd 是直连调试缝（自动化用）——端口转发的正式用法：");
+        eprintln!("  homeway forward add --listen 15432 --target :5432   （homeway forward --help 看全）");
         std::process::exit(2);
     };
     if maps.is_empty() {

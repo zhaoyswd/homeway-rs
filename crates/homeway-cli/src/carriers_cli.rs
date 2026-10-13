@@ -190,12 +190,13 @@ pub fn cmd_forward(args: &[String]) {
 
 fn forward_usage() {
     eprintln!("用法：");
-    eprintln!("  homeway forward add --host <ref> --listen <P> [--target <ip:P>|:<P>] [--state D] [--no-spawn]");
+    eprintln!("  homeway forward add --listen <P> [--target <ip:P>|:<P>] [--host <ref>]");
     eprintln!("                     建规则并立即起监听（127.0.0.1:P；目标缺省 = 该主机出口自己同端口）");
-    eprintln!("  homeway forward list [--host <ref>] [--json]");
+    eprintln!("  homeway forward list [--host <ref>]");
     eprintln!("                     规则表 + 运行态（listening/failed/在世连接数）");
-    eprintln!("  homeway forward delete --host <ref> --listen <P>");
+    eprintln!("  homeway forward delete --listen <P> [--host <ref>]");
     eprintln!("                     删规则并关监听（在世连接不强关、自然收口）");
+    eprintln!("--host 只有一台主机时可省（默认用它）；没有主机先 `homeway host add <token>`。");
     eprintln!("监听端口 1024–65535、每主机 ≤8 条、与全部规则及 socks 监听全局唯一。");
 }
 
@@ -226,13 +227,19 @@ fn parse_forward_target(s: &str) -> Result<(String, u16), String> {
 
 fn forward_add(args: &[String]) {
     let p = parse_carrier_args(
-        "forward add --host <ref> --listen <P> [--target <ip:P>|:<P>]",
+        "forward add [--host <ref>] --listen <P> [--target <ip:P>|:<P>]",
         args,
         &["host", "listen", "target"],
     );
-    let Some(host_ref) = p.value_of("host").map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned) else {
-        eprintln!("homeway: forward add 需要 --host <ref>（homeway host list 查看在表主机）");
-        std::process::exit(2);
+    // `--host` 可选（2026-10-13 用户指令）：缺省走默认主机寻址（单主机用它 / 无主机提示先
+    // `host add` / 多主机要求显式指定）。
+    let host_ref = match p.value_of("host").map(str::trim).filter(|s| !s.is_empty()) {
+        Some(h) => h.to_owned(),
+        None => crate::daemon_cli::default_host_ref(&p.state, "forward <子命令>", TIMEOUT, p.no_spawn)
+            .unwrap_or_else(|e| {
+                eprintln!("homeway: {e}");
+                std::process::exit(1);
+            }),
     };
     let Some(listen) = p.value_of("listen").and_then(|v| v.parse::<u16>().ok()) else {
         eprintln!("homeway: forward add 需要 --listen <端口>（1024–65535）");
@@ -459,13 +466,17 @@ fn forward_list(args: &[String]) {
 
 fn forward_delete(args: &[String]) {
     let p = parse_carrier_args(
-        "forward delete --host <ref> --listen <P>",
+        "forward delete [--host <ref>] --listen <P>",
         args,
         &["host", "listen"],
     );
-    let Some(host_ref) = p.value_of("host").map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned) else {
-        eprintln!("homeway: forward delete 需要 --host <ref>（homeway forward list 查看）");
-        std::process::exit(2);
+    let host_ref = match p.value_of("host").map(str::trim).filter(|s| !s.is_empty()) {
+        Some(h) => h.to_owned(),
+        None => crate::daemon_cli::default_host_ref(&p.state, "forward <子命令>", TIMEOUT, p.no_spawn)
+            .unwrap_or_else(|e| {
+                eprintln!("homeway: {e}");
+                std::process::exit(1);
+            }),
     };
     let Some(listen) = p.value_of("listen").and_then(|v| v.parse::<u16>().ok()) else {
         eprintln!("homeway: forward delete 需要 --listen <端口>（homeway forward list 查看）");

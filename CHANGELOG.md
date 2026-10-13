@@ -1,5 +1,17 @@
 # Changelog
 
+## v0.3.5（2026-10-13）
+
+- **仓库改 MIT 许可**（用户指令）：新增 `LICENSE`；workspace 与四个 crate 的 `license = "MIT"`。
+- **README 收束为用户面**（用户指令）：只讲功能与命令——去掉 `connect --token` / `files --token`
+  这类调试形态、`--json`、`--state`、多实例与环境变量说明、`export/import/reset` 工件命令；
+  命令示例统一为「加过主机就直接用」的简洁形态。
+- **`files` / `term` / `forward` 的 `--host` 可选化**（用户指令：统一 host 风格）：
+  `--host` 缺省时 = **单主机直接用、无主机提示先 `host add`、多主机要求显式指定**；
+  `term` 另有本机出口面（`term.sock` 在就用本机）。`portfwd` 用法说明改向 `homeway forward`
+  （其 `--token` 直连形态保留为自动化缝，不再进帮助）。
+- **Windows 段一句话**（用户指令）：只说「`term` 不支持」。
+
 ## v0.3.4（2026-10-13）
 
 - **CLI 本地 term 面：补 `<state>/serve/term.sock` 回退**（用户实测缺口）：出口角色的本地

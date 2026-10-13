@@ -467,17 +467,36 @@ impl TermCommon {
     /// 构造拨号目标（Go newTermTarget 同义缺省决策：远程 timeout 缺省补 10s、
     /// 本地 state 缺省补默认 state 根）+ **本地面拒绝 --timeout**（Go exec-r1 L6：
     /// 静默忽略与「不认识的参数」严格风格不一致——显式报错）。
+    ///
+    /// `--host` **缺省**时的两档（2026-10-13 用户指令）：①本机出口在（`term.sock` 存在）
+    /// ⇒ 管本机；②否则走默认主机寻址（单主机用它 / 无主机提示先 `host add` / 多主机要求
+    /// 显式 `--host`）。
     fn into_target(self) -> Result<TermTarget, String> {
-        if self.host_ref.is_empty() && self.timeout.is_some() {
-            return Err(
-                "--timeout 仅 --host 模式可用（远程的解析/打开预算）；本地面请去掉 --timeout".to_owned(),
-            );
+        let state_dir = self.state_dir.unwrap_or_else(default_state_dir);
+        let timeout = self.timeout.unwrap_or(DEFAULT_REMOTE_TIMEOUT);
+        let mut host_ref = self.host_ref;
+        if host_ref.is_empty() {
+            if local_term_sock(&state_dir).exists() {
+                if self.timeout.is_some() {
+                    return Err(
+                        "--timeout 仅 --host 模式可用（远程的解析/打开预算）；本地面请去掉 --timeout"
+                            .to_owned(),
+                    );
+                }
+            } else {
+                host_ref = crate::daemon_cli::default_host_ref(
+                    &state_dir,
+                    "term <子命令>",
+                    timeout,
+                    self.no_spawn,
+                )?;
+            }
         }
         Ok(TermTarget {
-            state_dir: self.state_dir.unwrap_or_else(default_state_dir),
-            host_ref: self.host_ref,
+            state_dir,
+            host_ref,
             host_id: None,
-            timeout: self.timeout.unwrap_or(DEFAULT_REMOTE_TIMEOUT),
+            timeout,
             no_spawn: self.no_spawn,
         })
     }
