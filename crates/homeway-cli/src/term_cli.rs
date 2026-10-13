@@ -339,11 +339,33 @@ fn dial_term(t: &mut TermTarget) -> Result<(TermConn, u32), String> {
         let st = client.open_stream(vocab::STREAM_KIND_TERM, &id, t.timeout).map_err(|e| stream_open_err_text(&e))?;
         TermConn::Remote { client, st, buf: Vec::new() }
     } else {
-        let sock = t.state_dir.join("term.sock");
+        let sock = local_term_sock(&t.state_dir);
         let stream = UnixStream::connect(&sock).map_err(|e| local_dial_err(&sock, e))?;
         TermConn::Local(FrameIo::new(stream))
     };
     read_greeting(conn)
+}
+
+/// 本地面 socket 解析：**扁平优先、serve 子目录回退**（2026-10-13 用户实测缺口修复）。
+///
+/// 出口角色的本地服务 socket 建在 **`<state>/serve/`** 子目录（`serve/files.sock` /
+/// `serve/term.sock` / `serve/speedtest.sock`——`server/engine.rs` 的 `listen_local_service`），
+/// 而本命令面的历史口径（早期平坦 state 布局）是 `<state>/term.sock` ⇒ 默认 / 统一根形态
+/// 在出口机上零参拨不通。两档解析：
+///
+/// 1. `<state>/term.sock` 存在 ⇒ 用它（`--state` 直指 serve 目录的老用法照旧）；
+/// 2. 否则 `<state>/serve/term.sock` 存在 ⇒ 用它（统一根 / 零参形态）；
+/// 3. 都不在 ⇒ 返回扁平路径（错误文案仍如实指向用户给的那个 state）。
+fn local_term_sock(state_dir: &std::path::Path) -> std::path::PathBuf {
+    let flat = state_dir.join("term.sock");
+    if flat.exists() {
+        return flat;
+    }
+    let nested = state_dir.join("serve").join("term.sock");
+    if nested.exists() {
+        return nested;
+    }
+    flat
 }
 
 /// 本地面连接层错误 → 可行动文案（Go dialErrText 同义：两态 + 合并提示）。
@@ -1904,6 +1926,32 @@ fn explain_session(session: &str, t: &mut TermTarget, json_out: bool) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 本地面 socket 解析三态：统一根回退 serve 子目录 / 扁平优先 / 都不在 ⇒ 扁平路径
+    /// （错误文案口径不变）。2026-10-13 用户实测缺口（`homeway term list` 零参拨不通）。
+    #[test]
+    fn local_term_sock_flat_then_serve_fallback() {
+        let d = std::env::temp_dir().join(format!(
+            "hw-term-sock-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(d.join("serve")).expect("临时 state 可建");
+        // ① 统一根形态：只有 <state>/serve/term.sock ⇒ 回退到它（零参/默认 state 走这条）
+        std::fs::write(d.join("serve").join("term.sock"), b"").expect("占位可写");
+        assert_eq!(local_term_sock(&d), d.join("serve").join("term.sock"));
+        // ② 扁平形态：<state>/term.sock 也在 ⇒ 优先扁平（--state 直指 serve 目录的老用法）
+        std::fs::write(d.join("term.sock"), b"").expect("占位可写");
+        assert_eq!(local_term_sock(&d), d.join("term.sock"));
+        // ③ 都不在 ⇒ 返回扁平路径（错误文案仍指向用户给的那个 state）
+        std::fs::remove_file(d.join("term.sock")).expect("可删");
+        std::fs::remove_file(d.join("serve").join("term.sock")).expect("可删");
+        assert_eq!(local_term_sock(&d), d.join("term.sock"));
+        let _ = std::fs::remove_dir_all(&d);
+    }
 
     #[test]
     fn detach_key_spec_forms() {

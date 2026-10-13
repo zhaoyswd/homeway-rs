@@ -1,5 +1,16 @@
 # Changelog
 
+## v0.3.4（2026-10-13）
+
+- **CLI 本地 term 面：补 `<state>/serve/term.sock` 回退**（用户实测缺口）：出口角色的本地
+  服务 socket 建在 `<state>/serve/` 子目录（`serve/files.sock` / `serve/term.sock` /
+  `serve/speedtest.sock`），而 `homeway term …` 的**本机形态**按早期平坦布局口径拨
+  `<state>/term.sock` ⇒ 「零参正式部署」下在出口机上拨不通（报「出口未在运行…」）。
+  现改为**扁平优先 + serve 子目录回退**：`<state>/term.sock` 存在就用它（`--state`
+  直指 serve 目录的老用法照旧）；否则用 `<state>/serve/term.sock`（统一根 / 零参形态）；
+  都不在 ⇒ 错误文案逐字不变。落点 `crates/homeway-cli/src/term_cli.rs::local_term_sock`；
+  证据 = 单测 `term_cli::tests::local_term_sock_flat_then_serve_fallback` + 出口机零参实测。
+
 ## v0.3.3（2026-10-13）
 
 - **选路回归「直连优先」（用户指令）**：岛赛跑改为两阶段——**窗口内只投直连**（缺省 2s，
