@@ -301,7 +301,7 @@ struct ConnectArgs {
     recover_delay: u64,
     inject: Option<String>,
     /// 测试注入：token 的直连端点改指死端口（127.0.0.1:1）——压出「只有中继可达」
-    /// 形态（DirectFirst 解锁 + via=relay）。
+    /// 形态（直连优先窗口到点/直连全灭后解锁中继 + via=relay）。
     dead_direct: bool,
     /// 跳过 identity 会话锁（矩阵脚本/刻意并发测试的逃生口——R7-7e）。
     no_session_lock: bool,

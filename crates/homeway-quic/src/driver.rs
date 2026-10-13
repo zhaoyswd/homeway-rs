@@ -572,6 +572,9 @@ struct DriverState {
     na_logged: bool,
     /// 巡检节拍（刷新 + 迁移保持判据；构造期定案，运行期不改）。
     patrol: Duration,
+    /// **直连优先窗口**（`IslandConfig::direct_first`；构造期定案）：喂 `client::connect`
+    /// 的两处赛跑（`Cmd::Connect` 与阶梯 R 的全清单回落）；`0` = 关（全候选同刻投出）。
+    direct_first: Duration,
     /// TUN 面（数据面；未附加 = `None`）。
     tun: Option<TunPlane>,
     /// 回程泵防重位：记的是**在跑泵所属连接的 `stable_id()`**（`None` = 无泵在跑）。
@@ -646,6 +649,7 @@ fn run_driver(
     // 流面限制/快探参数要在 `cfg` 被 `Face::open` 吃掉之前取出（`Streams` 与快照面共用）
     let stream_limits = cfg.streams;
     let probe_tuning = cfg.probe;
+    let direct_first = cfg.direct_first;
     rt.block_on(async move {
         let mut face = match Face::open(cfg, Arc::clone(&ctx.logf)) {
             Ok(f) => f,
@@ -666,6 +670,7 @@ fn run_driver(
             watch: None,
             na_logged: false,
             patrol,
+            direct_first,
             tun: None,
             pump_conn: None,
             narrow_logged: None,
@@ -1314,9 +1319,12 @@ async fn handle_cmd(
             let endpoint = face.endpoint();
             let ccfg = face.client_config();
             let cred = Arc::clone(face.credential());
+            let direct_first = st.direct_first;
             let logf = Arc::clone(&ctx.logf);
             jobs.spawn(guard_job(PanickedJob::Race, async move {
-                let result = client::connect(endpoint, ccfg, cred, &list, budget, log_c4, &logf).await;
+                let result =
+                    client::connect(endpoint, ccfg, cred, &list, budget, direct_first, log_c4, &logf)
+                        .await;
                 Job::Race { reply, result }
             }));
         }
@@ -1584,11 +1592,21 @@ fn ladder_step(
                 let ccfg = face.client_config();
                 let cred = Arc::clone(face.credential());
                 let budget = st.ladder.reconnect_budget();
+                let direct_first = st.direct_first;
                 let logf = Arc::clone(&ctx.logf);
                 jobs.spawn(guard_job(PanickedJob::LadderConnect, async move {
-                    let result = client::connect(endpoint, ccfg, cred, &list, budget, false, &logf)
-                        .await
-                        .map(|(est, _outcome)| est);
+                    let result = client::connect(
+                        endpoint,
+                        ccfg,
+                        cred,
+                        &list,
+                        budget,
+                        direct_first,
+                        false,
+                        &logf,
+                    )
+                    .await
+                    .map(|(est, _outcome)| est);
                     Job::LadderConnect { why, result }
                 }));
                 return;

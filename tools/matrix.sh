@@ -481,7 +481,8 @@ base_segment() {
     local CLN=$(log_lines "$st/c-main/cache/client.log")
     # 等「路径确立：直连」或巡检 via=direct（90s 窗——竞速偶发落中继时 hint 盲打
     # 自愈会翻直连，巡检行 60s 一拍必然报到；重启重试机制实测故障面大于收益，弃）
-    # **C-via（M5 C4 裁决①改写，同上）**：胜者 ∈ {直连, 中继}；落中继时另判「直连可用」。
+    # **C-via（2026-10-13 直连优先改裁，同下）**：胜者 ∈ {直连, 中继}——落中继 = 直连首飞
+    # 超窗口/直连不可达的**合法**形态（读表时按窗口缺省 2s 复核）；落中继时另判「直连可用」。
     local W0=$(date +%s)
     if V=$(wait_line_from "$st/c-main/cache/client.log" \
         '路径确立：直连|路径确立：中继|link: via=direct|link: via=relay' "$CLN" 150); then
@@ -548,17 +549,19 @@ base_segment() {
       record "$link" C-ready "FAIL" "25s 内未见 warmup pong"
       return 1
     fi
-    # **C-via（M5 C4 裁决①改写）**：赛跑取最快者 = 特性（判据 = 胜者 ∈ {直连, 中继}，
-    # 记录胜者与耗时）；原「直连必胜」在本地中继腿（2ms）在场时不成立（C3 实测：
-    # 直连首飞 ~1s vs 中继 2ms ⇒ 恒落中继）。
+    # **C-via（2026-10-13 直连优先改裁）**：判据 = 胜者 ∈ {直连, 中继}，记录胜者与耗时。
+    # 直连优先（窗口缺省 2s）下**正常形态应落直连**；落中继 = 直连首飞超窗口（本机高负载
+    # 形态，C3 实测直连首飞 ~1s）或直连不可达——合法形态，读表时按解锁行（`赛跑：直连窗口
+    # …到点仍无胜者`/`…直连候选全部失败`）复核原因，不作 FAIL。
     local W0=$(date +%s)
     if V=$(wait_line_from "$st/c-main/rust.log" \
         '路径确立：直连|路径确立：中继|link: via=direct|link: via=relay' "$CL0" 150); then
       local dt=$(( $(date +%s) - W0 ))
       record "$link" C-via "PASS" "${V:0:100}" "（胜者耗时 ${dt}s）"
       if [[ "$V" == *中继* || "$V" == *via=relay* ]]; then
-        # **独立断言 C-direct-usable（裁决①第二半）**：直连路径必须**真的可用**——
-        # 打死中继后重开会话 ⇒ 必须直连成功（C3 实测该形态 1.005s）。
+        # **独立断言 C-direct-usable**：直连路径必须**真的可用**——打死中继后重开会话
+        # ⇒ 必须直连成功（C3 实测该形态 1.005s）。直连优先改裁后本断言仍是「中继兜底
+        # 不该掩盖直连坏掉」的独立面（落直连时本行记「胜者本身即直连」）。
         stop_pid "$MATRIX/$link/relay/pid"
         stop_pid "$st/c-main/pid"
         local CLd=$(log_lines "$st/c-main/rust.log")

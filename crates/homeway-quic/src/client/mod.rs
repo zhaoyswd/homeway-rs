@@ -9,8 +9,8 @@
 //!   （`exit::transport`——MTU/缓冲/ACK/保活/迁移对两端都是同一组判据值）；
 //! - **服务端 RPK 钉定**：`exit::rpk::client_pin`（§1.3/§12-②；本切片接线后其
 //!   dead-code 豁免已删，见 commit 的偏离说明）；
-//! - **赛跑/准入/迁移**：§2.2（首个完成握手者胜）、§1.7/§1.8（`hr-reg4` 四帧准入 +
-//!   60s `R4` 刷新，同一控制流）、§2.3（`rebind` + 保持检测）。
+//! - **赛跑/准入/迁移**：§2.2（窗口内只投直连、中继是纯后备——直连优先，2026-10-13 改裁）、
+//!   §1.7/§1.8（`hr-reg4` 四帧准入 + 60s `R4` 刷新，同一控制流）、§2.3（`rebind` + 保持检测）。
 //!
 //! 单线程前提（同出口面）：本 crate 的岛 runtime 是 `current_thread`，且发送路径的
 //! 「预检 → 发送」之间无 `await` ⇒ 不存在被别处插入的窗口（S6-2 的代码门条）。
@@ -107,6 +107,7 @@ impl Face {
             credential,
             bind,
             patrol: _,
+            direct_first: _,
             mtu_cap,
             streams: stream_limits,
             probe: _,
@@ -220,21 +221,23 @@ impl Face {
     }
 }
 
-/// 赛跑 + 准入（设计 §2.2/§1.7）：首个完成握手者胜 ⇒ 走首条 bidi 控制流四帧准入
-/// （等 `A4` 确定性回执）⇒ 交回可用连接。
+/// 赛跑 + 准入（设计 §2.2/§1.7 + 直连优先改裁）：**窗口内只投直连**（中继是纯后备），
+/// 首个完成握手者胜 ⇒ 走首条 bidi 控制流四帧准入（等 `A4` 确定性回执）⇒ 交回可用连接。
 ///
 /// 自由函数而不是 `Face` 的方法：宿主把它搬进 `JoinSet` 任务（`Face` 本体留在宿主里
 /// 供换绑/刷新用），故只搬必需的三件（端点 `Arc` + 配置 + 凭据 `Arc`）。
+#[allow(clippy::too_many_arguments)] // 赛跑单入口（同 `race::run`：两枚时间值=整轮预算/岛级窗口）
 pub(crate) async fn connect(
     endpoint: Arc<Endpoint>,
     cfg: quinn::ClientConfig,
     cred: Arc<IslandCredential>,
     cands: &[Candidate],
     budget: Duration,
+    direct_first: Duration,
     log_c4: bool,
     logf: &Logf,
 ) -> Result<(Established, RaceOutcome), IslandErr> {
-    race::run(endpoint, cfg, cred, cands, budget, log_c4, logf).await
+    race::run(endpoint, cfg, cred, cands, budget, direct_first, log_c4, logf).await
 }
 
 /// 赛跑赢家的原料（准入已完成的连接 + 控制流两半边 + 连接绑定值）。

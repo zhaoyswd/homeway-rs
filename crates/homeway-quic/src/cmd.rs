@@ -262,6 +262,10 @@ pub struct Candidate {
 /// 赛跑结算（设计 §2.2 的 C5'：胜者 + 候选数 + 耗时 + 完成/未完成清单）。
 ///
 /// 「完成」清单保留**端点**而不是布尔：排障要看得见"哪个候选没起来"（r12 专2-3）。
+///
+/// ⚠️ 两清单的并集 = 本轮**实际投出**的候选（直连优先下，窗口未解锁就已被直连赢下的
+/// 中继候选**不在**其中——与「调用面拒绝」同档；投出/解锁的时点看 `赛跑投出`/`赛跑：…解锁`
+/// 两行，见 `client/race.rs` 模块头第 4 条）。
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RaceOutcome {
     /// 胜出候选（首个完成握手者）。
@@ -272,7 +276,7 @@ pub struct RaceOutcome {
     pub rtt_ms: u64,
     /// 本轮完成握手的候选（含胜者；并行候选在胜出瞬间已完成的也会列在这里并被关闭）。
     pub completed: Vec<SocketAddrV4>,
-    /// 未完成/失败的候选（含被 drop 的在途握手）。
+    /// 未完成/失败的候选（含被 drop 的在途握手；不含未投出者——见上）。
     pub unfinished: Vec<SocketAddrV4>,
     /// 本轮耗时（ms）。
     pub elapsed_ms: u64,

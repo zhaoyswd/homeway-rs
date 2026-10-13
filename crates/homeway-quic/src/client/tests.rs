@@ -89,6 +89,13 @@ fn island_cfg(patrol: Duration, pin: RpkPublicKey) -> IslandConfig {
     cfg
 }
 
+/// 岛配置（**显式直连优先窗口**版；缺省窗口版 = [`island_cfg`]）——窗口用例专用。
+fn island_cfg_df(patrol: Duration, pin: RpkPublicKey, direct_first: Duration) -> IslandConfig {
+    let mut cfg = island_cfg(patrol, pin);
+    cfg.direct_first = direct_first;
+    cfg
+}
+
 /// 岛侧测试入口（带不健康回调；判据：分类值 ∈ 既有取值集）。
 fn island_with_unhealthy(patrol: Duration, pin: RpkPublicKey, h: OnUnhealthy) -> Island {
     let (logf, _rx) = sink();
@@ -103,6 +110,17 @@ fn island_with_seam(patrol: Duration, pin: RpkPublicKey, logf: Logf, seam: u8) -
 
 fn island_with_log(patrol: Duration, pin: RpkPublicKey, logf: Logf) -> Island {
     Island::start(logf, Arc::new(|_r: &str| {}), island_cfg(patrol, pin))
+        .expect("岛可起（含 QUIC 端点）")
+}
+
+/// 岛侧测试入口（**显式直连优先窗口**版；见 [`island_cfg_df`]）。
+fn island_with_log_df(
+    patrol: Duration,
+    pin: RpkPublicKey,
+    logf: Logf,
+    direct_first: Duration,
+) -> Island {
+    Island::start(logf, Arc::new(|_r: &str| {}), island_cfg_df(patrol, pin, direct_first))
         .expect("岛可起（含 QUIC 端点）")
 }
 
@@ -462,6 +480,15 @@ async fn logs_until(rx: &Receiver<String>, needle: &str, wait: Duration) -> Vec<
     lines
 }
 
+/// 排空当前已落日志（**「不该有的行」的断言用**：直连优先下「中继未解锁 ⇒ 无解锁行」）。
+fn drain_logs(rx: &Receiver<String>) -> Vec<String> {
+    let mut lines = Vec::new();
+    while let Ok(l) = rx.try_recv() {
+        lines.push(l);
+    }
+    lines
+}
+
 /// 连上真出口的单直连候选（S2-4/S2-5/S2-6 用例的公共前段）。
 async fn connect_direct(island: &Island, stub: &Stub, quic: &ExitQuic) -> SocketAddrV4 {
     let addr = connectable(quic);
@@ -750,10 +777,13 @@ async fn relay_candidate_wins_through_envelope_and_downlink_is_stripped() {
     let stub = Stub::new();
     let (logf, logs) = sink();
     // 短巡检节拍：让刷新行（C15' 的「中继=」位）也在本用例窗口内出现
-    let island = island_with_log(
+    // 短直连窗口（300ms）：本用例只验信封/剥壳（死直连 + 活中继 ⇒ 窗口到点后中继接管）；
+    // 直连优先本身的判据面见下面 direct_first_* 用例组
+    let island = island_with_log_df(
         Duration::from_millis(300),
         quic.rpk_public_key(),
         Arc::clone(&logf),
+        Duration::from_millis(300),
     );
     let label = [0xA1u8; 8];
     let mut relay = FakeRelay::start(connectable(&quic), label);
@@ -832,7 +862,376 @@ async fn relay_candidate_wins_through_envelope_and_downlink_is_stripped() {
     relay.stop();
 }
 
-/// **判据（S2-2 的失败面）**：全候选失败 ⇒ `IslandErr::NoCandidate`（且快照无 path）。
+// ---------- 2b. 直连优先（2026-10-13 改裁）：窗口内只投直连、中继是纯后备 ----------
+
+/// **判据（直连优先）**：活直连 + 活中继 ⇒ **直连在窗口内胜出**，且中继腿**未投出**
+/// （`uplink_frames == 0` = 一个包都没到；无解锁行）；结算两清单不含未投出的中继候选
+/// （清单并集 = 实际投出的候选）。
+#[tokio::test]
+async fn direct_first_wins_with_direct_before_unlock_and_relay_unused() {
+    let quic = exit_face(15);
+    let stub = Stub::new();
+    let (logf, logs) = sink();
+    // 窗口 800ms ≫ 回环直连握手（ms 级）⇒ 直连在窗口内胜出，解锁点根本不会到
+    let island = island_with_log_df(
+        Duration::from_secs(60),
+        quic.rpk_public_key(),
+        Arc::clone(&logf),
+        Duration::from_millis(800),
+    );
+    let label = [0xB2u8; 8];
+    let mut relay = FakeRelay::start(connectable(&quic), label);
+    let direct_addr = connectable(&quic);
+
+    let outcome = send_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::Connect {
+            cands: vec![
+                direct(direct_addr),
+                Candidate {
+                    addr: relay.addr,
+                    via: Via::Relay { label },
+                },
+            ],
+            budget: Duration::from_secs(3),
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .expect("活直连必须胜出");
+
+    assert_eq!(outcome.via, Via::Direct, "直连优先：{outcome:?}");
+    assert_eq!(outcome.winner, direct_addr);
+    assert_eq!(
+        outcome.completed,
+        vec![direct_addr],
+        "完成清单只含胜者：{outcome:?}"
+    );
+    assert!(
+        outcome.unfinished.is_empty(),
+        "未投出的中继不入未完成清单：{outcome:?}"
+    );
+    assert!(
+        outcome.elapsed_ms < 800,
+        "直连必须在窗口内胜出（不该等到解锁点）：{outcome:?}"
+    );
+    assert_eq!(relay.uplink_frames(), 0, "中继腿未投出 ⇒ 零上行帧");
+
+    let lines = drain_logs(&logs);
+    assert!(
+        !lines.iter().any(|l| l.contains("解锁中继候选")),
+        "直连胜出 ⇒ 不得有解锁行：{lines:?}"
+    );
+    assert!(
+        lines.iter().any(|l| l.contains("赛跑结算：胜出 直连")),
+        "结算行如实记直连胜出：{lines:?}"
+    );
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+    relay.stop();
+}
+
+/// **判据（直连优先）**：死直连 + 活中继 ⇒ 中继**必须等窗口到点**才被解锁并接管；
+/// 解锁行取「窗口到点」档（含有效窗口值）；未完成清单 = 死直连。
+#[tokio::test]
+async fn direct_first_unlocks_relay_after_window_expiry() {
+    let quic = exit_face(16);
+    let stub = Stub::new();
+    let (logf, logs) = sink();
+    let island = island_with_log_df(
+        Duration::from_secs(60),
+        quic.rpk_public_key(),
+        Arc::clone(&logf),
+        Duration::from_millis(300),
+    );
+    let label = [0xC3u8; 8];
+    let mut relay = FakeRelay::start(connectable(&quic), label);
+    let (_dead, dead) = dead_candidate();
+
+    let outcome = send_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::Connect {
+            cands: vec![
+                dead,
+                Candidate {
+                    addr: relay.addr,
+                    via: Via::Relay { label },
+                },
+            ],
+            budget: Duration::from_secs(3),
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .expect("窗口到点后中继必须接管");
+
+    assert_eq!(outcome.via, Via::Relay { label }, "中继接管：{outcome:?}");
+    assert_eq!(outcome.winner, relay.addr);
+    assert!(
+        outcome.elapsed_ms >= 300,
+        "中继不得早于窗口到点被解锁：{outcome:?}"
+    );
+    assert_eq!(
+        outcome.unfinished,
+        vec![dead.addr],
+        "未完成清单 = 死直连（已胜出的中继从清单摘除）：{outcome:?}"
+    );
+    assert!(relay.uplink_frames() > 0, "解锁后中继腿必须被投出");
+
+    let lines = logs_until(&logs, "解锁中继候选", WAIT).await;
+    let unlock = lines
+        .iter()
+        .find(|l| l.contains("解锁中继候选"))
+        .expect("解锁行必须在场（不静默）")
+        .clone();
+    assert!(
+        unlock.contains("直连窗口 300ms 到点仍无胜者") && unlock.contains("解锁中继候选 1 个"),
+        "解锁行按「窗口到点」档取值：{unlock}"
+    );
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+    relay.stop();
+}
+
+/// **判据（直连优先）**：直连候选**全部快失败**（错 RPK 钉定的活出口 ⇒ TLS 当场中止）
+/// ⇒ 不必烧满窗口，**提前解锁**中继（解锁行取「直连候选全部失败」档）。
+#[tokio::test]
+async fn direct_first_unlocks_early_when_all_direct_fail() {
+    let good = exit_face(17);
+    let other = exit_face(18); // 活出口但 RPK 不同 ⇒ 钉定检查当场失败（快失败直连）
+    let stub = Stub::new();
+    let (logf, logs) = sink();
+    // 窗口 30s ≫ 用例预算：只有「提前解锁」路径能在预算内让中继接管
+    let island = island_with_log_df(
+        Duration::from_secs(60),
+        good.rpk_public_key(),
+        Arc::clone(&logf),
+        Duration::from_secs(30),
+    );
+    let label = [0xD4u8; 8];
+    let mut relay = FakeRelay::start(connectable(&good), label);
+
+    let outcome = send_wait(
+        &island,
+        &stub,
+        &good,
+        |reply| Cmd::Connect {
+            cands: vec![
+                direct(connectable(&other)),
+                Candidate {
+                    addr: relay.addr,
+                    via: Via::Relay { label },
+                },
+            ],
+            budget: Duration::from_secs(3),
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .expect("直连全灭后中继必须接管");
+
+    assert_eq!(outcome.via, Via::Relay { label }, "中继接管：{outcome:?}");
+    assert!(
+        outcome.elapsed_ms < 1000,
+        "提前解锁（不等 30s 窗口）：{outcome:?}"
+    );
+    assert!(relay.uplink_frames() > 0, "提前解锁后中继腿被投出");
+
+    let lines = logs_until(&logs, "解锁中继候选", WAIT).await;
+    let unlock = lines
+        .iter()
+        .find(|l| l.contains("解锁中继候选"))
+        .expect("解锁行必须在场")
+        .clone();
+    assert!(
+        unlock.contains("直连候选全部失败") && unlock.contains("解锁中继候选 1 个"),
+        "解锁行按「提前」档取值：{unlock}"
+    );
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(good.stop_within(Instant::now() + BUDGET));
+    relay.stop();
+}
+
+/// **判据（直连优先的边界一）**：**无直连候选** ⇒ 不设窗口（中继同刻投出，不等窗口到点）。
+#[tokio::test]
+async fn relay_only_candidates_are_dialed_without_window_wait() {
+    let quic = exit_face(19);
+    let stub = Stub::new();
+    let (logf, logs) = sink();
+    let island = island_with_log_df(
+        Duration::from_secs(60),
+        quic.rpk_public_key(),
+        Arc::clone(&logf),
+        Duration::from_secs(30), // 窗口再长也不该等（无直连 ⇒ 无窗口可言）
+    );
+    let label = [0xE5u8; 8];
+    let mut relay = FakeRelay::start(connectable(&quic), label);
+
+    let outcome = send_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::Connect {
+            cands: vec![Candidate {
+                addr: relay.addr,
+                via: Via::Relay { label },
+            }],
+            budget: Duration::from_secs(3),
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .expect("中继-only 候选必须直接胜出");
+
+    assert_eq!(outcome.via, Via::Relay { label });
+    assert!(
+        outcome.elapsed_ms < 1000,
+        "无直连候选 ⇒ 立即投中继：{outcome:?}"
+    );
+    let lines = drain_logs(&logs);
+    assert!(
+        !lines.iter().any(|l| l.contains("解锁中继候选")),
+        "无窗口可言 ⇒ 无解锁行：{lines:?}"
+    );
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+    relay.stop();
+}
+
+/// **判据（直连优先的边界二）**：窗口 = `0`（显式关）⇒ 全候选同刻投出（= 改裁前形态）：
+/// 死直连 + 活中继不烧窗口就由中继接管，且无解锁行。
+#[tokio::test]
+async fn zero_window_dials_all_candidates_at_once() {
+    let quic = exit_face(20);
+    let stub = Stub::new();
+    let (logf, logs) = sink();
+    let island = island_with_log_df(
+        Duration::from_secs(60),
+        quic.rpk_public_key(),
+        Arc::clone(&logf),
+        Duration::ZERO,
+    );
+    let label = [0xF6u8; 8];
+    let mut relay = FakeRelay::start(connectable(&quic), label);
+    let (_dead, dead) = dead_candidate();
+
+    let outcome = send_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::Connect {
+            cands: vec![
+                dead,
+                Candidate {
+                    addr: relay.addr,
+                    via: Via::Relay { label },
+                },
+            ],
+            budget: Duration::from_secs(3),
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .expect("窗口关 ⇒ 中继同刻投出并胜出");
+
+    assert_eq!(outcome.via, Via::Relay { label });
+    assert!(
+        outcome.elapsed_ms < 1000,
+        "窗口 = 0 ⇒ 不等窗口：{outcome:?}"
+    );
+    let lines = drain_logs(&logs);
+    assert!(
+        !lines.iter().any(|l| l.contains("解锁中继候选")),
+        "窗口关 ⇒ 无解锁行（全候选起跑即投）：{lines:?}"
+    );
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+    relay.stop();
+}
+
+/// **判据（直连优先的清单口径）**：窗口解锁后中继腿**投出即入**「未完成」清单（与起跑侧
+/// 同记法）——死直连 + 死中继 ⇒ 结算小结的未完成清单含**两条**（两清单并集 = 实际投出的
+/// 候选；未投出的候选才不入）。
+#[tokio::test]
+async fn unlocked_relay_enters_unfinished_when_it_never_completes() {
+    let quic = exit_face(21);
+    let stub = Stub::new();
+    let (logf, logs) = sink();
+    let island = island_with_log_df(
+        Duration::from_secs(60),
+        quic.rpk_public_key(),
+        Arc::clone(&logf),
+        Duration::from_millis(200),
+    );
+    let (_dead, dead) = dead_candidate();
+    // 死中继：信封上行打到无人应答的 socket（握手永不完成）——只验清单记账，不验中继协议
+    let (_dead_relay, dead_relay) = dead_candidate();
+    let relay_cand = Candidate {
+        addr: dead_relay.addr,
+        via: Via::Relay { label: [0x17u8; 8] },
+    };
+
+    let res = send_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::Connect {
+            cands: vec![dead, relay_cand],
+            budget: Duration::from_millis(800),
+            reply,
+        },
+        WAIT,
+    )
+    .await;
+    assert!(
+        matches!(res, Err(IslandErr::NoCandidate)),
+        "两候选都永不完成 ⇒ NoCandidate：{res:?}"
+    );
+
+    let lines = logs_until(&logs, "赛跑小结：无胜者", WAIT).await;
+    let miss = lines
+        .iter()
+        .find(|l| l.contains("赛跑小结：无胜者"))
+        .expect("小结行必须在场")
+        .clone();
+    assert!(
+        miss.contains(&dead.addr.to_string()) && miss.contains(&dead_relay.addr.to_string()),
+        "未完成清单含**投出的两条**（含解锁后投出的中继）：{miss}"
+    );
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（直连优先的窗口取值）**：有效窗口 = `min(配置窗口, 整轮预算 / 2)`（纯值函数；
+/// 夹到半轮 = 「中继是纯后备」的结构性保证——后备有可达的上限时间点）。
+#[test]
+fn direct_window_clips_to_half_the_round_budget() {
+    use super::race::direct_window;
+    assert_eq!(
+        direct_window(Duration::from_secs(5), Duration::from_secs(2)),
+        Duration::from_secs(2),
+        "生产缺省（预算 5s、窗口 2s）不受夹"
+    );
+    assert_eq!(
+        direct_window(Duration::from_secs(3), Duration::from_secs(30)),
+        Duration::from_millis(1500),
+        "窗口 > 半轮 ⇒ 夹到半轮（中继至少拿到半轮预算）"
+    );
+    assert_eq!(
+        direct_window(Duration::from_secs(5), Duration::ZERO),
+        Duration::ZERO,
+        "0 = 显式关"
+    );
+}
 #[tokio::test]
 async fn race_all_dead_reports_no_candidate() {
     let quic = exit_face(3);

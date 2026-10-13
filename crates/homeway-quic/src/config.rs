@@ -20,6 +20,12 @@ use crate::tuning::{CcChoice, ProbeTuning, StreamLimits};
 /// 巡检节拍缺省值（= 既有 `PATROL_INTERVAL`；判据行 C15 的 60s 刷新同源）。
 pub const DEFAULT_PATROL: Duration = Duration::from_secs(60);
 
+/// 直连优先窗口缺省值（老 `DirectFirst` 的 2s；2026-10-13 用户指令回归）。
+///
+/// 口径真源 = `tier:openspec/project.md`「手机端选路 = **直连优先、中继纯后备**（直连窗口
+/// 默认 2s）」——本值是它在岛内赛跑的落点（`0` = 显式关，全候选同刻投出）。
+pub const DEFAULT_DIRECT_FIRST: Duration = Duration::from_secs(2);
+
 /// QUIC MTU 上限旋钮的缺省 / 有效区间（M1 设计 §12-① 的实现契约）。
 ///
 /// 缺省 1400；有效区间 `[1320,1400]`——低于 1320 时 `max_datagram_size()` < 1280，
@@ -131,6 +137,13 @@ pub struct IslandConfig {
     pub bind: Option<SocketAddrV4>,
     /// 巡检节拍（刷新 + 迁移保持判据；缺省 [`DEFAULT_PATROL`]）。
     pub patrol: Duration,
+    /// **直连优先窗口**（老 `DirectFirst` 语义回归；见 [`DEFAULT_DIRECT_FIRST`]）：新一轮
+    /// 赛跑起跑**只投直连候选**；窗口到点（或直连已无在途）才解锁中继候选（同一轮）。
+    ///
+    /// `0` = 显式关（全候选同刻投出，= 无窗口形态）；有效值由 [`crate::client::race`]
+    /// 夹到 `min(本值, 整轮预算 / 2)`（保证中继腿至少拿到半轮预算——「中继纯后备」的
+    /// 后备必须有可达的上限时间点）。
+    pub direct_first: Duration,
     /// QUIC MTU 上限（`initial_mtu` 与 DPLPMTUD `upper_bound` 同值；缺省
     /// [`QUIC_MTU_CAP_DEFAULT`]）。
     ///
@@ -163,6 +176,7 @@ impl IslandConfig {
             credential,
             bind: None,
             patrol: DEFAULT_PATROL,
+            direct_first: DEFAULT_DIRECT_FIRST,
             mtu_cap: QUIC_MTU_CAP_DEFAULT,
             streams: StreamLimits::design(),
             probe: ProbeTuning::design(),
@@ -203,6 +217,11 @@ mod tests {
         assert!(cfg.bind.is_none(), "缺省不钉绑定地址");
         assert_eq!(cfg.patrol, DEFAULT_PATROL);
         assert_eq!(DEFAULT_PATROL, Duration::from_secs(60));
+        assert_eq!(
+            cfg.direct_first, DEFAULT_DIRECT_FIRST,
+            "缺省 = 直连优先开（2s 窗口）"
+        );
+        assert_eq!(DEFAULT_DIRECT_FIRST, Duration::from_secs(2));
         assert_eq!(cfg.mtu_cap, QUIC_MTU_CAP_DEFAULT, "缺省 MTU 上限 = 1400");
         // M3 §15-3：流面/快探缺省 = 设计定值（env 覆盖在 `Island::start` 施加）
         assert_eq!(cfg.streams, crate::tuning::StreamLimits::design());
