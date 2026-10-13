@@ -12,7 +12,7 @@
 #    --public-endpoint 127.0.0.1:42659 --verbose`——**不带任何 stun flag**：该形态对
 #    F0 修复前后的二进制都能起（public_endpoint 非空 ⇒ 公网端点推断短路，QIt-design §2 F0）。
 #    客户端恒定用 binA 起（单变量 = 出口臂；客户端二进制不随臂切换）。
-#  - 臂切换 = 原子替换 target/release/homeway-cli（cp+mv；trap 恢复原物 + 清进程）。
+#  - 臂切换 = 原子替换 target/release/homeway（cp+mv；trap 恢复原物 + 清进程）。
 #  - 轮序平衡：--rounds 3 ⇒ A,B,B,A,A,B；--rounds 2 ⇒ A,B,B,A（消时段漂移）。
 #  - loadavg 1Hz 带时间戳落盘 + 轮首/轮末标记（loadavg.tsv）；1min >4 的轮在汇总标 [!]
 #    （判决纪律：只在 1min ≤4 作数）。
@@ -22,7 +22,7 @@
 set -uo pipefail
 
 REPO_ROOT="${0:h:A:h}"
-BIN_PATH="$REPO_ROOT/target/release/homeway-cli"
+BIN_PATH="$REPO_ROOT/target/release/homeway"
 EXIT_STATE="/tmp/qit-exit9"
 CLIENT_STATE="/tmp/qit-client"
 EXIT_PORT=42659
@@ -76,7 +76,7 @@ time_to_secs() { # "0:41.62" / "1:02:03" => 秒
   echo "$1" | tr -d ' ' | awk -F: '{ if (NF==3) printf "%.2f", $1*3600+$2*60+$3; else printf "%.2f", $1*60+$2 }'
 }
 
-ORIG_BIN_BAK="$DIR/homeway-cli.orig"
+ORIG_BIN_BAK="$DIR/homeway.orig"
 if [[ -f "$BIN_PATH" ]]; then cp "$BIN_PATH" "$ORIG_BIN_BAK"; fi
 EXIT_PID=""; CLIENT_PID=""; FIREHOSE_PID=""; RSS_PID=""; SAMPLE_PID=""
 CLEANED=0
@@ -136,7 +136,7 @@ stop_exit() {
 }
 
 setup_client() { # 客户端统一进程（serve/relay 双关；恒定 binA）
-  pkill -f "homeway-cli --state $CLIENT_STATE" 2>/dev/null
+  pkill -f "homeway --state $CLIENT_STATE" 2>/dev/null
   rm -rf "$CLIENT_STATE"; mkdir -p "$CLIENT_STATE"
   printf '[serve]\nenabled = false\n[relay]\nenabled = false\n' > "$CLIENT_STATE/config.toml"
   nohup "$binA" --state "$CLIENT_STATE" --verbose > "$DIR/client.log" 2>&1 &
@@ -192,7 +192,7 @@ balanced_order() { # 平衡轮序（设计 §4.1）：[A,B,B,A] 循环取前 2n 
 
 # ---------- 会话前置（两模式共用）----------
 wipe_session() {
-  pkill -f "homeway-cli --state $CLIENT_STATE" 2>/dev/null
+  pkill -f "homeway --state $CLIENT_STATE" 2>/dev/null
   rm -rf "$EXIT_STATE" "$CLIENT_STATE"; mkdir -p "$EXIT_STATE"
 }
 

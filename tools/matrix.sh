@@ -25,7 +25,7 @@
 set -uo pipefail
 
 REPO_ROOT="${0:h:A:h}"
-RUST_BIN="$REPO_ROOT/target/release/homeway-cli"
+RUST_BIN="$REPO_ROOT/target/release/homeway"
 GO_BIN="${HOMEWAY_GO:-$REPO_ROOT/bin/homeway-go}"
 MATRIX="/tmp/homeway-rs-matrix"
 OUT_MD="$REPO_ROOT/docs/matrix-latest.md"
@@ -745,7 +745,7 @@ base_segment() {
 
   # DNS 行：**`dnstest` 已退役（M5 §2.6-G6）**——它依赖 WG 栈 B 的 UDP socket 面，
   # QUIC 岛只有 STREAM + L3，无 UDP socket 服务面（有意缺口）。本行改**登记态**：
-  # 不再调 CLI 动词（动词已从 `homeway-cli` 移除），判据面 = 退役登记本身。
+  # 不再调 CLI 动词（动词已从 `homeway` 移除），判据面 = 退役登记本身。
   # **M5 E 棒代码门 M-7 整改**：未跑的检查**不得记 PASS**（假绿）——`SKIP` 档的语义
   # （`record` 头：本轮形态不适用）正对此面；`EXEMPT_SKIPS` 计数在 TOTAL 行可见。
   if [[ "$C" == rust ]]; then

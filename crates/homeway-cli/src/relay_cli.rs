@@ -1,4 +1,4 @@
-//! `homeway-cli relay` 命令面（R4-4a4；语义真源 `cmd/homeway` 的 relay 子命令 +
+//! `homeway relay` 命令面（R4-4a4；语义真源 `cmd/homeway` 的 relay 子命令 +
 //! `internal/relay/{role,cli}.go`——裁剪面：无 daemon 期望态/instance lock/status 面）。
 //!
 //! 前台单角色：不改期望态，flag 为一次性覆盖（覆盖序 flag > config.toml [relay] 节 >
@@ -47,8 +47,8 @@ struct RelayFlags {
 }
 
 fn relay_usage() {
-    eprintln!("用法：homeway-cli relay [--state DIR] [--listen :41741] [--advertise IP:port] [--open] [--no-hints]");
-    eprintln!("  = 前台单中继（Ctrl-C 收工）；启停/查询用 `homeway-cli relay start|stop|restart|status|token`（控制面）。");
+    eprintln!("用法：homeway relay [--state DIR] [--listen :41741] [--advertise IP:port] [--open] [--no-hints]");
+    eprintln!("  = 前台单中继（Ctrl-C 收工）；启停/查询用 `homeway relay start|stop|restart|status|token`（控制面）。");
 }
 
 fn parse_flags(args: &[String]) -> Result<RelayFlags, String> {
@@ -288,7 +288,7 @@ pub fn assemble_relay(
     Ok(RelayProc { stop: Some(stop), join: Some(join), exited })
 }
 
-/// `homeway-cli relay [...]`：前台中继（Ctrl-C / SIGTERM 收工——确定性 closeAll）。
+/// `homeway relay [...]`：前台中继（Ctrl-C / SIGTERM 收工——确定性 closeAll）。
 pub fn cmd_relay(args: &[String]) {
     let f = match parse_flags(args) {
         Ok(f) => f,

@@ -9,7 +9,7 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
-const BIN: &str = env!("CARGO_BIN_EXE_homeway-cli");
+const BIN: &str = env!("CARGO_BIN_EXE_homeway");
 
 fn mktemp(tag: &str) -> PathBuf {
     let d = std::env::temp_dir().join(format!(

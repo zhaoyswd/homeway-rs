@@ -19,4 +19,13 @@
 void *malloc(size_t __size);
 void free(void *__ptr);
 
+/* x86_64-pc-windows-msvc 交叉 check（WIN 批，2026-10-13）：clang `--target=…msvc`
+ * 下 ring 的 internal.h（`#if defined(_WIN32)` 臂）调 `_byteswap_ulong/_byteswap_uint64`
+ * （MSVC 的 stdlib.h 面）——同样只声明给 C 前端过（check 不链接）。clang 内建直供，
+ * 非 _WIN32 编译面（OHOS/musl 交叉 check）不受影响。 */
+#if defined(_WIN32) && defined(__clang__)
+#define _byteswap_ulong(v) __builtin_bswap32(v)
+#define _byteswap_uint64(v) __builtin_bswap64(v)
+#endif
+
 #endif /* HW_CHECK_SHIM_STDLIB_H */

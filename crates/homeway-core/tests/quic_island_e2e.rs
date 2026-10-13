@@ -144,7 +144,7 @@ fn island_connects_registers_and_survives_rebind_against_local_exit() {
 
     // 候选 = token 的 QUIC 类端点（M1 §2.7 的收窄：quic 档只吃 QUIC 类）。
     //
-    // **同机回环隔离缝**（照 `homeway-cli token --loopback-only` 的既有先例）：token 里的
+    // **同机回环隔离缝**（照 `homeway token --loopback-only` 的既有先例）：token 里的
     // QUIC 内网端点带的是出口网卡地址；本用例的出口与岛在**同一台机器**上，走网卡地址
     // 会撞上 macOS 应用防火墙的入站拦（与「现役出口不碰」精神一致 —— 本机私有实例之间
     // 一律走回环）。端口不变 ⇒ 仍是「出口真实 QUIC 监听口」。

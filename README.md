@@ -3,7 +3,7 @@
 homeway 的 Rust 实现。最初是 Go 版 homeway 的**平行实现**，2026-10-05 Go 版整体退役后
 **已转正为唯一实现**——鸿蒙端「回家」VPN 的**出口 / 客户端核 / 中继**三角色都由本仓供给。
 
-- **三角色同一二进制**：`homeway-cli` 既是出口（**QUIC 端点**（quinn/rustls RPK）+ 过境拦截
+- **三角色同一二进制**：`homeway` 既是出口（**QUIC 端点**（quinn/rustls RPK）+ 过境拦截
   + files/term/DNS 等服务）、也是客户端（**QUIC 岛**：并行赛跑 / rebind 迁移 / 快探阶梯）、
   也是中继（**信封转发 + 准入，零 QUIC 依赖**）；
 - **客户端核**：`crates/homeway-capi` 提供 C-ABI 壳，产出 `libclientcore.so` 供鸿蒙 App 的
@@ -25,7 +25,7 @@ homeway 的 Rust 实现。最初是 Go 版 homeway 的**平行实现**，2026-10
             └─ facade/       App 桥面：tun 生命周期 / 探测 / 服务会话 / files / term / portfwd / speedtest
                                  │  QUIC over UDP（一条连接 = 一台设备；直连或经中继，中继零解析）
                                  ▼
-             出口（homeway-cli，Rust 统一进程）
+             出口（homeway，Rust 统一进程）
                ├─ server/      QUIC 端点（单 UDP 端口，migration=true）+ 设备表（RPK 钉定 + 四帧准入）
                ├─ intercept/   过境拦截：TCP/UDP 五元组终结 + 本机 socket 重拨（L3 直通）
                ├─ term/        终端服务（alacritty_terminal + 自建编码器/应答器）
@@ -34,10 +34,10 @@ homeway 的 Rust 实现。最初是 Go 版 homeway 的**平行实现**，2026-10
                └─ daemon/      统一进程：serve + relay + client 角色 + 控制面（control.sock）
                                      │
                                      ▼
-                                   中继（homeway-cli 的 relay 角色：信封转发 + 准入）
+                                   中继（homeway 的 relay 角色：信封转发 + 准入）
 ```
 
-两台生产出口（Mac launchd / 阿里云 nohup）与中继均跑本仓 `homeway-cli`，滚动升级记录见
+两台生产出口（Mac launchd / 阿里云 nohup）与中继均跑本仓 `homeway`，滚动升级记录见
 `docs/DEPLOY-RUST-EXIT.md`。
 
 ## 构建
@@ -68,7 +68,7 @@ tools/local-rust-exit.sh start 1
 tools/local-rust-exit.sh token 1
 
 # 3. 用命令行客户端连它（服务会话形态，不带 TUN）
-target/release/homeway-cli connect --token '<上一步的 token>'
+target/release/homeway connect --token '<上一步的 token>'
 
 # 收尾
 tools/local-rust-exit.sh stop 1
@@ -78,7 +78,7 @@ tools/local-rust-exit.sh stop 1
 
 ```bash
 # 零参 = 统一进程（client/control 恒开 + serve/relay 按 config 期望态装配）
-target/release/homeway-cli --state /tmp/hw-local
+target/release/homeway --state /tmp/hw-local
 
 # 对照 Go 基线起本地 Go 出口 = **历史 oracle（Go 已退役，仅供对照复现）**
 # （需先 tools/make-baseline.sh 建快照克隆；现役本地链路一律用上面的 local-rust-exit.sh）

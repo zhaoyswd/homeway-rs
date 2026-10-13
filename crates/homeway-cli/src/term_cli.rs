@@ -1,4 +1,4 @@
-//! `homeway-cli term` 命令面（B0-2b 第 2 棒：P1-3 五动词 + `--host` 远程模式——
+//! `homeway term` 命令面（B0-2b 第 2 棒：P1-3 五动词 + `--host` 远程模式——
 //! 语义真源 `baseline:pkg/term/term_cli.go` + `term_cli_attach.go`〔raw 腿〕+
 //! `internal/daemon/term_remote.go`〔远程拨号与三态归因〕）。
 //!
@@ -6,11 +6,11 @@
 //! `--host` 模式经 control.sock 的 stream.open{kind:term} → 隧道 → 对端 term 服务，
 //! term 帧协议端到端原样承载）：
 //!
-//!  homeway-cli term list [--json] [--host <ref>] [--state D] [--timeout T]
-//!  homeway-cli term new [name] [-d] [-A] […]        # 默认创建并接入；-d 只创建不接入
-//!  homeway-cli term attach [name] [-d] [--detach-key K] […]
-//!  homeway-cli term delete <name> […]
-//!  homeway-cli term explain --file <屏幕文本> --agent <label> | <会话名> […]
+//!  homeway term list [--json] [--host <ref>] [--state D] [--timeout T]
+//!  homeway term new [name] [-d] [-A] […]        # 默认创建并接入；-d 只创建不接入
+//!  homeway term attach [name] [-d] [--detach-key K] […]
+//!  homeway term delete <name> […]
+//!  homeway term explain --file <屏幕文本> --agent <label> | <会话名> […]
 //!
 //! raw 腿生命周期硬约束（spec「raw 终端接入」）：任何退出路径都还原本地终端设置
 //! （收尾闭包统一收口 + 信号处理）；非 TTY 拒绝；TERM_SESSION_ID 指向目标会话时
@@ -48,7 +48,7 @@ const AUTO_NAME_TRIES: usize = 8;
 /// `timeout` = 本次解析的预算（Go：解析与打开各用一次 --timeout，默认各 10s）。
 fn resolve_host_ref(state_dir: &std::path::Path, r#ref: &str, timeout: Duration) -> Result<String, String> {
     if r#ref.trim().is_empty() {
-        return Err("空寻址串不可用——homeway-cli term <子命令> --host 需要 <name|id>（homeway-cli host list 查看在表主机）".to_owned());
+        return Err("空寻址串不可用——homeway term <子命令> --host 需要 <name|id>（homeway host list 查看在表主机）".to_owned());
     }
     let c = dial_control_spawn_term(state_dir, false)?;
     let briefs = c
@@ -93,7 +93,7 @@ fn control_dial_err(sock: &std::path::Path, e: &ClientErr) -> String {
                 }
             }
             format!(
-                "homeway 统一进程未在运行（{} 不存在{hint}）\n--host 模式下 --state 指统一 state 根（control.sock 所在）；先启动：homeway-cli --state {}",
+                "homeway 统一进程未在运行（{} 不存在{hint}）\n--host 模式下 --state 指统一 state 根（control.sock 所在）；先启动：homeway --state {}",
                 sock.display(),
                 dir.display()
             )
@@ -115,10 +115,10 @@ fn stream_open_err_text(e: &homeway_core::daemon::proto::OpError) -> String {
         if d.is_empty() { String::new() } else { format!("：{d}") }
     };
     match e.code.as_str() {
-        vocab::CODE_NO_HOST => "主机不在守护进程表中（no_host）；homeway-cli host list 查看在表主机".to_owned(),
+        vocab::CODE_NO_HOST => "主机不在守护进程表中（no_host）；homeway host list 查看在表主机".to_owned(),
         vocab::CODE_NOT_READY => "守护进程注册表未就绪（not_ready；client 角色启动中/重建窗口），稍后重试".to_owned(),
         vocab::CODE_STREAM_REFUSED => format!(
-            "与主机的流打开被拒（stream_refused）——主机离线、隧道未通或主机会话不可用；用 homeway-cli host status <name> 核对会话与链路态{detail}"
+            "与主机的流打开被拒（stream_refused）——主机离线、隧道未通或主机会话不可用；用 homeway host status <name> 核对会话与链路态{detail}"
         ),
         "timeout" => "连接/打开超预算（--timeout）：daemon 未应答或目标主机拨号黑洞；可用 --timeout 加大预算后重试".to_owned(),
         other => format!("stream.open 失败：{other}{detail}"),
@@ -155,11 +155,11 @@ struct RemoteEndError {
 fn remote_end_message(name: &str, reason: &str) -> String {
     match reason {
         "gone" => format!(
-            "与主机的流被收尾（主机会话不可达或上行过快）；会话 {name} 仍在目标主机运行，可重新 attach：homeway-cli term attach {name} --host <ref>"
+            "与主机的流被收尾（主机会话不可达或上行过快）；会话 {name} 仍在目标主机运行，可重新 attach：homeway term attach {name} --host <ref>"
         ),
         "closed" => "对端已关闭连接（term 服务退出或会话收工；也可能是本端长时间停止读取、出口侧慢腿自治收尾了本腿——停滞超 60s 断腿不发 ENDED）".to_owned(),
         "conn" => "与守护进程的连接断开；可重新执行命令重连".to_owned(),
-        other => format!("与主机的流已终结（{other}）；可重新 attach：homeway-cli term attach {name} --host <ref>"),
+        other => format!("与主机的流已终结（{other}）；可重新 attach：homeway term attach {name} --host <ref>"),
     }
 }
 
@@ -206,7 +206,7 @@ impl TermReadErr {
         match self {
             TermReadErr::Ended(e) => remote_end_message(name, &e.reason),
             TermReadErr::Io(e) => {
-                format!("与出口的连接被断开（{e}）；会话仍在运行，可用 homeway-cli term attach {name} 重新接入")
+                format!("与出口的连接被断开（{e}）；会话仍在运行，可用 homeway term attach {name} 重新接入")
             }
         }
     }
@@ -420,7 +420,7 @@ pub fn cmd_term(args: &[String]) {
 
 fn term_usage() {
     println!(
-        "homeway-cli term —— 终端服务的主机命令面（与 App 同一份会话注册表）\n  \
+        "homeway term —— 终端服务的主机命令面（与 App 同一份会话注册表）\n  \
 list [--json] [--host <ref>] [--state D] [--timeout T]   列会话\n  \
 new [name] [-d] [-A] […]   新建并接入；-d 只创建不接入；省略名字自动命名 host-<4hex>\n  \
 attach [name] [-d] [--detach-key K] […]   接入（raw 字节模式）；省略名字 = 最近活跃；-d 显式接管\n  \
@@ -568,7 +568,7 @@ fn parse_term_args(
                     adv = 2;
                 }
                 if v.trim().is_empty() {
-                    return Err("--host 需要主机名或 ID（homeway-cli host list 查看在表主机）".to_owned());
+                    return Err("--host 需要主机名或 ID（homeway host list 查看在表主机）".to_owned());
                 }
                 out.common.host_ref = v;
             }
@@ -687,7 +687,7 @@ fn list_fetch(t: &mut TermTarget) -> Result<Vec<SessionInfo>, String> {
 
 fn print_sessions(entries: &[SessionInfo]) {
     if entries.is_empty() {
-        println!("（当前没有会话；homeway-cli term new 可创建）");
+        println!("（当前没有会话；homeway term new 可创建）");
         return;
     }
     // 最近活跃在前（与 attach 省略名字的选取一致）。
@@ -735,7 +735,7 @@ fn round_trip(conn: &mut TermConn, op: Op, payload: &[u8]) -> Result<Vec<u8>, St
 /// protoError 文案（Go 同义：no_session 带刷新提示）。
 fn proto_error_text(code: &str, msg: &str) -> String {
     match code {
-        "no_session" => format!("{msg}；用 homeway-cli term list 查看当前会话"),
+        "no_session" => format!("{msg}；用 homeway term list 查看当前会话"),
         _ if !msg.is_empty() => msg.to_owned(),
         _ => code.to_owned(),
     }
@@ -769,7 +769,7 @@ fn cli_new(args: &[String]) -> Result<(), String> {
                     return Ok(());
                 }
             }
-            return Err("自动命名连续重名 8 次（运气太差）；请显式给名字：homeway-cli term new <名字> -d".to_owned());
+            return Err("自动命名连续重名 8 次（运气太差）；请显式给名字：homeway term new <名字> -d".to_owned());
         }
         create_once(&mut t, &name, flags, false)?;
         println!("已创建会话 {name}（不接入）");
@@ -818,7 +818,7 @@ fn create_once(t: &mut TermTarget, name: &str, flags: u8, retry: bool) -> Result
 fn cli_delete(args: &[String]) -> Result<(), String> {
     let p = parse_term_args(args, &[], &[], true)?;
     if p.name.is_empty() {
-        return Err("delete 需要会话名：homeway-cli term delete <name>".to_owned());
+        return Err("delete 需要会话名：homeway term delete <name>".to_owned());
     }
     validate_name(&p.name)?;
     let name = p.name.clone();
@@ -919,7 +919,7 @@ fn attach_cmd(o: AttachOpts) -> Result<(), String> {
         name = pick_recent_session(&mut target)?;
         if in_session(&name) {
             return Err(format!(
-                "最近活跃的会话就是当前会话（{name}）：接入自身会让输出回环；用 homeway-cli term attach <别的会话>"
+                "最近活跃的会话就是当前会话（{name}）：接入自身会让输出回环；用 homeway term attach <别的会话>"
             ));
         }
     }
@@ -933,7 +933,7 @@ fn attach_cmd(o: AttachOpts) -> Result<(), String> {
                 Err(e) => return Err(e),
             }
         }
-        return Err("自动命名连续重名 8 次（运气太差）；请显式给名字：homeway-cli term new <名字>".to_owned());
+        return Err("自动命名连续重名 8 次（运气太差）；请显式给名字：homeway term new <名字>".to_owned());
     }
     let (conn, attached) = attach_dial(&mut target, &o, &tty, &name)?;
     attach_run(conn, &tty, attached, &name, &o)
@@ -948,7 +948,7 @@ fn in_session(name: &str) -> bool {
 fn pick_recent_session(t: &mut TermTarget) -> Result<String, String> {
     let entries = list_fetch(t)?;
     let Some(best) = entries.iter().max_by_key(|s| s.last_active_ms) else {
-        return Err("当前没有会话；homeway-cli term new 可创建一个，或 homeway-cli term list 查看".to_owned());
+        return Err("当前没有会话；homeway term new 可创建一个，或 homeway term list 查看".to_owned());
     };
     Ok(best.name.clone())
 }
@@ -1391,16 +1391,16 @@ fn drop_signal_pipes(p: SigPipe) {
 fn ended_message(name: &str, code: i32, reason: &str) -> String {
     match (code, reason) {
         (c, r) if c == ended_code::REPLACED && r == frames::ended_reason::SELF_RECONNECT => {
-            format!("本实例的新连接替换了这条腿（self_reconnect）；重新接入：homeway-cli term attach {name}")
+            format!("本实例的新连接替换了这条腿（self_reconnect）；重新接入：homeway term attach {name}")
         }
         (c, r) if c == ended_code::REPLACED && r == frames::ended_reason::REPLACED => {
-            format!("会话 {name} 已被另一客户端接管（replaced）；重新接入：homeway-cli term attach {name}")
+            format!("会话 {name} 已被另一客户端接管（replaced）；重新接入：homeway term attach {name}")
         }
         (c, r) if c == ended_code::REPLACED => {
             format!("会话 {name} 的这条腿被服务端结束（{r}）")
         }
         (c, _) if c == ended_code::KILLED => {
-            format!("会话 {name} 已被关闭（App 或 homeway-cli term delete）")
+            format!("会话 {name} 已被关闭（App 或 homeway term delete）")
         }
         (c, _) if c == ended_code::SERVICE_STOPPED => {
             format!("出口服务正在退出，会话 {name} 已结束")
@@ -1776,7 +1776,7 @@ fn cli_explain(args: &[String]) -> Result<(), String> {
                 let v = take_arg("host", inline, next)?;
                 if inline.is_none() { adv = 2; }
                 if v.trim().is_empty() {
-                    return Err("--host 需要主机名或 ID（homeway-cli host list 查看在表主机）".to_owned());
+                    return Err("--host 需要主机名或 ID（homeway host list 查看在表主机）".to_owned());
                 }
                 common.host_ref = v;
             }
@@ -1794,7 +1794,7 @@ fn cli_explain(args: &[String]) -> Result<(), String> {
     }
     if !file.is_empty() {
         if !common.host_ref.is_empty() {
-            return Err("--file 是本地面（规则判定在本地 manifest），不接受 --host；对远程主机的会话取实时判定：homeway-cli term explain <会话名> --host <name|id>".to_owned());
+            return Err("--file 是本地面（规则判定在本地 manifest），不接受 --host；对远程主机的会话取实时判定：homeway term explain <会话名> --host <name|id>".to_owned());
         }
         if common.timeout.is_some() {
             return Err("--timeout 仅 --host 模式可用（远程的解析/打开预算）；--file 离线模式请去掉 --timeout".to_owned());
@@ -1805,7 +1805,7 @@ fn cli_explain(args: &[String]) -> Result<(), String> {
         return explain_file(&file, &agent, common.state_dir.as_deref(), json_out);
     }
     if session.is_empty() {
-        return Err("需要 --file <屏幕文本> 或 <会话名>（见 homeway-cli term --help）".to_owned());
+        return Err("需要 --file <屏幕文本> 或 <会话名>（见 homeway term --help）".to_owned());
     }
     let mut t = common.into_target()?;
     explain_session(&session, &mut t, json_out)

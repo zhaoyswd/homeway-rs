@@ -105,7 +105,7 @@ pub struct ServeConfig {
     /// None = 全默认。env 测试缝的优先级在 `tx_shape_resolve` 内——env > config > 默认）。
     pub tx_shape_cfg: Option<crate::server::intercept::TxShapeCfg>,
     /// 抗放大闸的 config 覆盖（M2 §3.2 的 `[serve.quic_admit]` 七键；`None` = 全设计缺省）。
-    /// 值域已由 `homeway-cli` 的严格读层校验（非法 ⇒ 拒启）；env
+    /// 值域已由 `homeway` 的严格读层校验（非法 ⇒ 拒启）；env
     /// `HOMEWAY_QUIC_ADMIT_RETRY` 的叠加在 [`crate::server::quic_admit::resolve_retry_policy`]。
     pub quic_admit: Option<crate::server::quic_admit::AdmitLimits>,
 }
@@ -2176,7 +2176,7 @@ fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
                 inner.revoked_logged = true;
                 drop(inner);
                 (ctx.logf)(
-                    "⚠️ 在用凭证已被吊销——**不再打印 token**（旧 token 已作废）；执行 `homeway-cli serve restart`（重启）铸出新凭证，客户端需重新粘贴",
+                    "⚠️ 在用凭证已被吊销——**不再打印 token**（旧 token 已作废）；执行 `homeway serve restart`（重启）铸出新凭证，客户端需重新粘贴",
                 );
             }
             return;
@@ -2286,7 +2286,7 @@ fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
         match e {
             crate::server::state::StateError::SecretRevoked => {
                 (ctx.logf)(&format!(
-                    "⚠️ 在用凭证已被吊销（{e}）——本轮 token 未入台账；执行 `homeway-cli serve restart`（重启）铸出新凭证"
+                    "⚠️ 在用凭证已被吊销（{e}）——本轮 token 未入台账；执行 `homeway serve restart`（重启）铸出新凭证"
                 ));
             }
             other => {

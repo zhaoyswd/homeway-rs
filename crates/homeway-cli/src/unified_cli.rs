@@ -1,4 +1,4 @@
-//! `homeway-cli` 零参形态 = 统一进程（B0-1 部署最小面 + **B0-2b daemon 面**；
+//! `homeway` 零参形态 = 统一进程（B0-1 部署最小面 + **B0-2b daemon 面**；
 //! 语义真源 `baseline:internal/daemon/unified.go` + `internal/control`）。
 //!
 //! 装配序（Go D1 同构）：锁 → 三层 state → config（fail-fast）→ **client 角色恒开**
@@ -183,7 +183,7 @@ pub(crate) fn parse_unified_args(args: &[String]) -> UnifiedInvocation {
     while i < args.len() {
         let a = &args[i];
         let Some((name, inline)) = cli_flags::split_flag(a) else {
-            eprintln!("统一进程不接受位置参数（{a:?}）——角色命令见 `homeway-cli serve` / `homeway-cli relay` / 客户端域命令");
+            eprintln!("统一进程不接受位置参数（{a:?}）——角色命令见 `homeway serve` / `homeway relay` / 客户端域命令");
             std::process::exit(2);
         };
         match name {
@@ -199,12 +199,12 @@ pub(crate) fn parse_unified_args(args: &[String]) -> UnifiedInvocation {
             }
             "verbose" => verbose = cli_flags::take_bool_or_exit("verbose", inline, true),
             "help" | "h" => {
-                println!("homeway-cli [统一进程] —— 零参起；只认 --state <dir> / --verbose（角色参数写 config.toml，或用 serve/relay 前台单角色形态）");
-                println!("子命令形态：homeway-cli <serve|relay|status|host|term|files|connect|speedtest|token|portfwd> …（无子命令 = 统一进程）；dnstest 已退役（M5 §2.6-G6：岛无 UDP socket 服务面）");
+                println!("homeway [统一进程] —— 零参起；只认 --state <dir> / --verbose（角色参数写 config.toml，或用 serve/relay 前台单角色形态）");
+                println!("子命令形态：homeway <serve|relay|status|host|term|files|connect|speedtest|token|portfwd> …（无子命令 = 统一进程）；dnstest 已退役（M5 §2.6-G6：岛无 UDP socket 服务面）");
                 return UnifiedInvocation::Help;
             }
             other => {
-                eprintln!("统一进程只认 --state/--verbose（--{other} 是角色 flag）——角色参数请写 {} 的 config.toml，或用 `homeway-cli serve` / `homeway-cli relay` 前台单角色形态",
+                eprintln!("统一进程只认 --state/--verbose（--{other} 是角色 flag）——角色参数请写 {} 的 config.toml，或用 `homeway serve` / `homeway relay` 前台单角色形态",
                     state_dir.display());
                 std::process::exit(2);
             }

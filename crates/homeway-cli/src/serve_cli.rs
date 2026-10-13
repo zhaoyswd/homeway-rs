@@ -1,4 +1,4 @@
-//! `homeway-cli serve` 命令面（R3-3f；语义真源 `cmd/homeway` 的 serve 子命令 +
+//! `homeway serve` 命令面（R3-3f；语义真源 `cmd/homeway` 的 serve 子命令 +
 //! `internal/daemon/servegroup_cli.go` 的 token 族——裁剪面：无 daemon 期望态，
 //! 只有前台 `serve` 与纯读/纯文件操作的 `serve token [list|revoke]`）。
 //!
@@ -497,12 +497,12 @@ struct ServeFlags {
 }
 
 fn serve_usage() {
-    eprintln!("用法：homeway-cli serve [--state DIR] [--listen P] [--bind-interface M] [--upnp[=bool]] [--stun H:P] [--stun6 H:P]");
+    eprintln!("用法：homeway serve [--state DIR] [--listen P] [--bind-interface M] [--upnp[=bool]] [--stun H:P] [--stun6 H:P]");
     eprintln!("       [--relay rl1…|ip:port] [--peer-ttl 168h] [--max-peers N] [--public-endpoint ip:port,ip:port]");
     eprintln!("       [--dns-port P] [--files-root DIR] [--ddns 裸域名] [--verbose]");
     eprintln!("  --stun= / --stun6= / --relay= 空值 = 关（Go flag 空串同义，F0 carve-out）；");
     eprintln!("  --bind-interface= 空值 = auto（Go ResolveBind(\"\") 同义，Q-L carve-out）；");
-    eprintln!("  = 前台单出口（Ctrl-C 收工）；启停/查询用 `homeway-cli serve start|stop|restart|status|token`（控制面）。");
+    eprintln!("  = 前台单出口（Ctrl-C 收工）；启停/查询用 `homeway serve start|stop|restart|status|token`（控制面）。");
 }
 
 fn parse_serve_flags(args: &[String]) -> Result<ServeFlags, CliErr> {
@@ -891,7 +891,7 @@ fn validate_public_endpoint_flag(v: &str) -> Result<(), String> {
     Ok(())
 }
 
-/// `homeway-cli serve [...]`：前台出口（Ctrl-C / SIGTERM 有序收工）。
+/// `homeway serve [...]`：前台出口（Ctrl-C / SIGTERM 有序收工）。
 pub fn cmd_serve(args: &[String]) {
     let cfg = assemble(args);
     // 单实例锁（Go 全形态共用 <state>/lock；form=serve——防 launchd 双起/统一进程
@@ -1058,7 +1058,7 @@ pub fn wait_stop_pipe() -> StopWait {
 // ---------- serve token [list|revoke]（纯读/纯文件操作） ----------
 
 fn token_usage() {
-    eprintln!("用法：homeway-cli serve token [list | revoke <id>] [--state DIR] [--reason S]");
+    eprintln!("用法：homeway serve token [list | revoke <id>] [--state DIR] [--reason S]");
     eprintln!("  无动词 = reveal（完整凭证只经本命令族；来源 = 台账末行）");
 }
 
@@ -1134,7 +1134,7 @@ fn token_reveal(args: &[String]) {
         }
     };
     let Some(tok) = st.last_token().ok().flatten() else {
-        eprintln!("台账为空（出口从未铸出 token）：先 `homeway-cli serve`，等首轮端点探测后重试");
+        eprintln!("台账为空（出口从未铸出 token）：先 `homeway serve`，等首轮端点探测后重试");
         std::process::exit(1);
     };
     let eps: Vec<homeway_core::token::EndpointRef> = tok
@@ -1180,7 +1180,7 @@ fn token_list(args: &[String]) {
         }
     };
     if ledger.is_empty() {
-        println!("台账为空（出口从未铸出 token）：先 `homeway-cli serve`，等首轮端点探测后重试");
+        println!("台账为空（出口从未铸出 token）：先 `homeway serve`，等首轮端点探测后重试");
         return;
     }
     println!("{:<8}  {:<20}  {:<14}  端点/凭证（掩码）", "id", "签发", "状态");
@@ -1207,7 +1207,7 @@ fn token_list(args: &[String]) {
         }
     }
     println!("\n共 {} 行 / {} 枚凭证（id 相同 = 同一凭证的多轮铸出）", ledger.len(), creds.len());
-    println!("吊销：homeway-cli serve token revoke <id>（即时对新注册生效；已登记设备随出口重启清空）");
+    println!("吊销：homeway serve token revoke <id>（即时对新注册生效；已登记设备随出口重启清空）");
 }
 
 fn mask_secret(s: &str) -> String {
@@ -1258,7 +1258,7 @@ fn token_revoke(args: &[String]) {
     }
     let state = state.unwrap_or_else(crate::unified_cli::default_state_dir);
     if id.is_empty() {
-        eprintln!("serve token revoke 需要 <id>（先 `homeway-cli serve token list` 查）");
+        eprintln!("serve token revoke 需要 <id>（先 `homeway serve token list` 查）");
         std::process::exit(2);
     }
     let st = match homeway_core::server::state::State::open(&state.join("serve")) {
@@ -1276,7 +1276,7 @@ fn token_revoke(args: &[String]) {
         }
     };
     let Some(entry) = ledger.iter().find(|e| e.id == id) else {
-        eprintln!("台账里没有 id={id}（先 `homeway-cli serve token list` 查）");
+        eprintln!("台账里没有 id={id}（先 `homeway serve token list` 查）");
         std::process::exit(1);
     };
     let secret_b64 = entry.secret.clone();

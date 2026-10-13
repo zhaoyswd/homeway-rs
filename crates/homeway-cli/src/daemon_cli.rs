@@ -403,7 +403,7 @@ pub fn dial_control_spawn(
             }
             if no_spawn {
                 return Err(format!(
-                    "守护进程未运行且 --no-spawn 已给定（不拉起）\nsock={}\n先手动启动：homeway-cli --state {}（零参统一进程；Ctrl-C 收工）",
+                    "守护进程未运行且 --no-spawn 已给定（不拉起）\nsock={}\n先手动启动：homeway --state {}（零参统一进程；Ctrl-C 收工）",
                     sock.display(),
                     state_dir.display()
                 ));
@@ -500,7 +500,7 @@ fn token_reveal_with_fallback(state: &std::path::Path, op: vocab::OpName) {
             ]);
         }
         _ => {
-            eprintln!("homeway: 守护进程未运行——relay token 的离线推算请用 `homeway-cli relay` 前台形态日志");
+            eprintln!("homeway: 守护进程未运行——relay token 的离线推算请用 `homeway relay` 前台形态日志");
             std::process::exit(1);
         }
     }
@@ -654,7 +654,7 @@ pub fn cmd_host(args: &[String]) {
         "delete" => host_delete(&args[1..]),
         // Q-H F8/CA13：裸名词 --help 短路（此前落「不认识的子命令」exit 2）。
         "--help" | "-h" => {
-            eprintln!("用法：homeway-cli host <add|list|status|delete> …");
+            eprintln!("用法：homeway host <add|list|status|delete> …");
             eprintln!("  add [--name N] [--force] <token> / list [--json] / status [name] / delete <name|id> [--yes]（均可 --state DIR --no-spawn）");
             std::process::exit(0);
         }
@@ -679,7 +679,7 @@ fn host_add(args: &[String]) {
     // M7 S1：用户可见文案走 `user_message()`——存量 `hmw1` 串追加换代归因（哨兵字节不变）。
     if let Err(e) = homeway_core::token::decode(&token) {
         eprintln!(
-            "token 非法：{}（token 前缀 `hmw2`；用 `homeway-cli serve token` 现取后再粘贴）",
+            "token 非法：{}（token 前缀 `hmw2`；用 `homeway serve token` 现取后再粘贴）",
             e.user_message()
         );
         std::process::exit(1);
@@ -891,7 +891,7 @@ pub fn cmd_status(args: &[String]) {
     // 纯读不拉起（中-5——Go status_cli 同义：未跑 = 降级呈现，不起进程）。
     let Some(c) = try_dial_control_named(&state, "homeway") else {
         println!(
-            "守护进程：未运行（sock={}/control.sock 不存在/不可连）——本命令纯读不拉起；先启动：homeway-cli --state {}（零参统一进程）",
+            "守护进程：未运行（sock={}/control.sock 不存在/不可连）——本命令纯读不拉起；先启动：homeway --state {}（零参统一进程）",
             state.display(),
             state.display()
         );
@@ -950,7 +950,7 @@ pub fn cmd_serve_group(args: &[String]) {
         "token" => vocab::OpName::ServeToken,
         // Q-H F8/CA13：裸名词 --help 短路（此前落「不认识的动词」exit 2）。
         "--help" | "-h" => {
-            eprintln!("用法：homeway-cli serve <start|stop|restart|status|token|relay|ddns> [--state DIR]");
+            eprintln!("用法：homeway serve <start|stop|restart|status|token|relay|ddns> [--state DIR]");
             eprintln!("  start/stop/restart = 角色期望态（写 config serve.enabled + 控制面启停）；status/token 纯读不拉起。");
             eprintln!("  relay set <token>|clear / ddns add <域名>|delete <域名>|list（纯配置写，需 restart 生效）。");
             std::process::exit(0);
@@ -1081,8 +1081,8 @@ pub fn cmd_relay_group(args: &[String]) {
         "token" => vocab::OpName::RelayToken,
         // Q-H F8/CA13：裸名词 --help 短路。
         "--help" | "-h" => {
-            eprintln!("用法：homeway-cli relay <start|stop|restart|status|token> [--state DIR]");
-            eprintln!("  = 本机中继角色的控制面命令组（前台单中继 = `homeway-cli relay [flags]`）。");
+            eprintln!("用法：homeway relay <start|stop|restart|status|token> [--state DIR]");
+            eprintln!("  = 本机中继角色的控制面命令组（前台单中继 = `homeway relay [flags]`）。");
             std::process::exit(0);
         }
         other => {
@@ -1321,7 +1321,7 @@ fn status_watch(state_dir: &std::path::Path) {
         Ok(v) => v,
         Err(e) => {
             eprintln!(
-                "homeway 未在运行（sock={}：{e}）\n--watch 需进程在位（纯读不拉起）；先启动：homeway-cli --state {}（零参统一进程）",
+                "homeway 未在运行（sock={}：{e}）\n--watch 需进程在位（纯读不拉起）；先启动：homeway --state {}（零参统一进程）",
                 sock.display(),
                 state_dir.display()
             );
@@ -1361,7 +1361,7 @@ fn status_watch(state_dir: &std::path::Path) {
     ) {
         if e.code == vocab::CODE_CURSOR_STALE {
             eprintln!(
-                "homeway: 订阅游标失效（cursor_stale：守护进程已重启或事件窗过旧）——重新运行一次 homeway-cli status --watch 即从全量快照开始"
+                "homeway: 订阅游标失效（cursor_stale：守护进程已重启或事件窗过旧）——重新运行一次 homeway status --watch 即从全量快照开始"
             );
             std::process::exit(1);
         }
@@ -1386,11 +1386,11 @@ fn status_watch(state_dir: &std::path::Path) {
         if c.is_closed() {
             if let Some(g) = c.goodbye() {
                 eprintln!(
-                    "homeway: 守护进程已断开（goodbye={}）——检查守护进程（homeway-cli status）后重新运行本命令",
+                    "homeway: 守护进程已断开（goodbye={}）——检查守护进程（homeway status）后重新运行本命令",
                     g.reason
                 );
             } else {
-                eprintln!("homeway: 守护进程连接已断开——守护进程可能已退出（homeway-cli status 确认后重新运行本命令）");
+                eprintln!("homeway: 守护进程连接已断开——守护进程可能已退出（homeway status 确认后重新运行本命令）");
             }
             drop_status_watch_signals(pipes);
             std::process::exit(1);

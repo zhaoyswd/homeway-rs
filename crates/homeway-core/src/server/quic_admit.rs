@@ -3,7 +3,7 @@
 //! **两套纪律并存**（§3.2 表末的显式注记）：
 //!
 //! - **config 段**（config.toml 的 `[serve.quic_admit]`）：值域非法 ⇒ **拒启**（照 Q-H 的
-//!   严格表纪律，执行点 = `homeway-cli` 的 `load_config_strict` / `validate_file`）；
+//!   严格表纪律，执行点 = `homeway` 的 `load_config_strict` / `validate_file`）；
 //! - **env**（`HOMEWAY_QUIC_ADMIT_RETRY`）：非法值 ⇒ **记行 + 缺省**（**不 fail-fast**——
 //!   与 M1 的 `HOMEWAY_TRANSPORT` 同纪律：排障开关不该把出口打进死路）。
 //!

@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **二进制改名 `homeway-cli` → `homeway`**（2026-10-13，用户指令：发布产物不带 `-cli`
+  后缀）：`crates/homeway-cli` 包名不动（`-p homeway-cli` 构建契约零波及），产物 =
+  `target/release/homeway`（Windows 面 `homeway.exe`）；版本横幅/用法文案/工具脚本
+  的二进制路径与进程匹配形同批跟进；发版产物名 = `homeway-<tag>-<平台>.tar.gz`。
+  判据行输出串零变化（登记 = `docs/INTEROP-CRITERIA.md`「判据变更记录」2026-10-13 条）。
+
 ## v0.3.0（2026-10-10）
 
 **传输层换代：WG → QUIC 单承载（M0–M7）**——**破坏性变更**，客户端与出口必须同代：

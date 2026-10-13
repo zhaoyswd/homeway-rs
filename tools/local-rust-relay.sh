@@ -15,11 +15,11 @@
 #   log [n] [行数]   tail relay.log（运行日志；终端只有 token 与端点公告）
 #   wipe [n]         停 + 删中继 state
 #
-# 二进制：target/release/homeway-cli（先 build）。
+# 二进制：target/release/homeway（先 build）。
 set -uo pipefail
 
 REPO_ROOT="${0:h:A:h}"
-BIN="$REPO_ROOT/target/release/homeway-cli"
+BIN="$REPO_ROOT/target/release/homeway"
 
 cmd="${1:-help}"; n="${2:-1}"
 RELAY_STATE="/tmp/homeway-rs-rustrelay-$n"
@@ -37,7 +37,7 @@ our_pid() {
   [[ -f "$pf" ]] || return 1
   p=$(cat "$pf" 2>/dev/null) || return 1
   kill -0 "$p" 2>/dev/null || return 1
-  [[ "$(ps -p "$p" -o comm= 2>/dev/null)" == *homeway-cli* ]] || return 1
+  [[ "$(ps -p "$p" -o comm= 2>/dev/null)" == *homeway* ]] || return 1
   REPLY_PID=$p
 }
 

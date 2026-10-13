@@ -1,0 +1,14 @@
+#!/bin/sh
+# check-only 垫片（WIN 批 2026-10-13）：从 macOS 交叉 `cargo check
+# --target x86_64-pc-windows-msvc` 时，cc-rs 在归档阶段会找 `lib.exe`（MSVC 库管理器）。
+# check 不链接、归档产物无人消费 ⇒ no-op 放行即可（纪律同上级目录的 stdlib.h 垫片：
+# 只用于 check 门，绝不进真实构建路径——真构建在 windows runner 上用真 MSVC）。
+# 造出 /OUT: 目标空文件是为指纹缓存稳定（同入参重复调用幂等）。
+out=""
+for a in "$@"; do
+  case "$a" in
+    [/-]OUT:*|[/-]out:*) out="${a#*:}" ;;
+  esac
+done
+[ -n "$out" ] && : > "$out"
+exit 0

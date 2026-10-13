@@ -31,7 +31,7 @@
 //! - **G5**（`daemon host reach` 过滤键）：本模块只提供会话；过滤键修正落在
 //!   `daemon/hosts.rs`（WG 档的 `is_wg()` 反过滤 → `Quic|Relay`）。
 //! - **G6**（`dnstest` 的 UDP 服务面无替代）：岛只有 STREAM + L3，无 UDP socket 服务
-//!   ⇒ **登记退役**（排障工具，非产品四件套；`homeway-cli` 侧同批处置：动词面无
+//!   ⇒ **登记退役**（排障工具，非产品四件套；`homeway` 侧同批处置：动词面无
 //!   dispatch + 用法行除名）。
 //! - **G7**（出口 `:5300` 解析腿在宿主会话无 tag 承载）：**2026-10-12 已裁「承接」并落地**
 //!   （DNS-STREAM 批，用户指令）：新增 `STREAM[tag=6]`（`DnsResolve`，文本 `dns`）——

@@ -2,7 +2,7 @@ name: release
 
 # 发版 = 推 tag：`git tag v0.x.y && git push origin v0.x.y`（triple-check 纪律：
 # 改版本→commit→推 main→打 tag 在 main 头上→推 tag；tag 纪律门在 build 前拦截错位 tag）。
-# 产物 = homeway-cli 四目标二进制（strip + tar.gz + SHA256SUMS）：
+# 产物 = homeway 四目标二进制（strip + tar.gz + SHA256SUMS）：
 #   - darwin-arm64/amd64：macos-latest（arm64）原生 + x86_64-apple-darwin 交叉
 #     （纯 Rust 依赖面，Xcode CLT 链接一次过——本机已实测同配方）。
 #   - linux-amd64/arm64：ubuntu-latest 上 musl 静态（x86_64 原生 + aarch64 交叉，
@@ -71,24 +71,24 @@ jobs:
           # 显式点名 cc-rs 用 musl 包装器（缺省会去找 `<arch>-linux-musl-gcc`）
           CC_x86_64_unknown_linux_musl: musl-gcc
           CC_aarch64_unknown_linux_musl: musl-gcc
-      - run: strip target/${{ matrix.target }}/release/homeway-cli
+      - run: strip target/${{ matrix.target }}/release/homeway
       - name: 静态核验（musl 面必须静态链接）
         if: endsWith(matrix.target, '-musl')
         # 措辞按 file 版本有差：新版 file 对 static-PIE 报 "static-pie linked"
         # （首跑 ubuntu 实测），旧版报 "statically linked"——两形都认，动态依赖才红。
-        run: file "target/${{ matrix.target }}/release/homeway-cli" | grep -Eq 'statically linked|static-pie linked'
+        run: file "target/${{ matrix.target }}/release/homeway" | grep -Eq 'statically linked|static-pie linked'
       - name: 版本烟囱（可本机执行的目标上跑 --version）
         if: matrix.smoke && startsWith(github.ref, 'refs/tags/v')
-        run: target/${{ matrix.target }}/release/homeway-cli --version | grep -F "$GITHUB_REF_NAME"
+        run: target/${{ matrix.target }}/release/homeway --version | grep -F "$GITHUB_REF_NAME"
       - name: 打包 tar.gz
         run: |
           set -euo pipefail
           cd "target/${{ matrix.target }}/release"
-          tar czf "$GITHUB_WORKSPACE/homeway-cli-${GITHUB_REF_NAME:-manual}-${{ matrix.name }}.tar.gz" homeway-cli
+          tar czf "$GITHUB_WORKSPACE/homeway-${GITHUB_REF_NAME:-manual}-${{ matrix.name }}.tar.gz" homeway
       - uses: actions/upload-artifact@v4
         with:
-          name: homeway-cli-${{ matrix.name }}
-          path: homeway-cli-*.tar.gz
+          name: homeway-${{ matrix.name }}
+          path: homeway-*.tar.gz
           if-no-files-found: error
 
   release:
@@ -100,10 +100,10 @@ jobs:
         with:
           merge-multiple: true
       - name: SHA256SUMS
-        run: shasum -a 256 homeway-cli-*.tar.gz | tee SHA256SUMS
+        run: shasum -a 256 homeway-*.tar.gz | tee SHA256SUMS
       - uses: softprops/action-gh-release@v2
         with:
           files: |
-            homeway-cli-*.tar.gz
+            homeway-*.tar.gz
             SHA256SUMS
           generate_release_notes: true

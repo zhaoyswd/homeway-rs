@@ -21,10 +21,10 @@
 set -uo pipefail
 
 REPO_ROOT="${0:h:A:h}"
-# Q-I 尾段 F7：二进制覆盖（A/B 臂切换用——`HOMEWAY_BIN=/path/to/homeway-cli`；
+# Q-I 尾段 F7：二进制覆盖（A/B 臂切换用——`HOMEWAY_BIN=/path/to/homeway`；
 # 缺省 = 仓内 release 产物）。注：F0 修复前的二进制不认 `--stun=` 空值，需用
 # `tools/qi-ab.sh` 的免 flag 形态起出口。
-BIN="${HOMEWAY_BIN:-$REPO_ROOT/target/release/homeway-cli}"
+BIN="${HOMEWAY_BIN:-$REPO_ROOT/target/release/homeway}"
 GO_BIN="${HOMEWAY_GO:-$REPO_ROOT/bin/homeway-go}"
 
 cmd="${1:-help}"; n="${2:-1}"
@@ -44,8 +44,8 @@ build_bin() {
 }
 
 our_pid() {
-  # pattern 缺省 homeway-cli（Rust 出口）；go 客户端侧传 homeway-go 形态
-  local pf="$1" p pat="${2:-homeway-cli}"
+  # pattern 缺省 homeway（Rust 出口）；go 客户端侧传 homeway-go 形态
+  local pf="$1" p pat="${2:-homeway}"
   [[ -f "$pf" ]] || return 1
   p=$(cat "$pf" 2>/dev/null) || return 1
   kill -0 "$p" 2>/dev/null || return 1

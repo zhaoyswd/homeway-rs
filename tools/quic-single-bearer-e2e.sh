@@ -109,7 +109,7 @@ S1_CLI_RC=0
   # **显式建产物**（代码门 r31 低-7 整改）：`local-rust-exit.sh` 只在缺产物时构建 ⇒ 改了 CLI
   # 而不重建会让本断言假红/假绿。这里显式构建（幂等、热 target 秒级）。
   ( cd "$REPO_ROOT" && cargo build --release -p homeway-cli ) || { echo "!! 失败：release 构建"; S1_CLI_RC=1; }
-  CLI_BIN="${HOMEWAY_BIN:-$REPO_ROOT/target/release/homeway-cli}"
+  CLI_BIN="${HOMEWAY_BIN:-$REPO_ROOT/target/release/homeway}"
   if [[ ! -x "$CLI_BIN" ]]; then
     echo "!! 失败：无 CLI 产物 $CLI_BIN（不得静默跳过）"; S1_CLI_RC=1
   fi

@@ -16,7 +16,7 @@
 set -uo pipefail
 
 REPO_ROOT="${0:h:A:h}"
-RUST_BIN="$REPO_ROOT/target/release/homeway-cli"
+RUST_BIN="$REPO_ROOT/target/release/homeway"
 GO_BIN="${HOMEWAY_GO:-$REPO_ROOT/bin/homeway-go}"
 BASE="/tmp/homeway-rs-matrix-perf"
 
@@ -286,7 +286,7 @@ for who in sorted(mx):
 PY
 echo "-- 体积 --"
 echo "  homeway-go: $GO_SIZE B（strip: $GO_STRIP B）"
-echo "  homeway-cli: $RS_SIZE B（strip: $RS_STRIP B）"
+echo "  homeway: $RS_SIZE B（strip: $RS_STRIP B）"
 echo "-- 环境 --"
 echo "  loadavg: $(sysctl -n vm.loadavg 2>/dev/null || uptime)"
 echo "  GOGC/GOMAXPROCS: 未设置（默认）"

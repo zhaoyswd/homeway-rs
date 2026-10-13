@@ -2,7 +2,7 @@
 # quic-ab.sh — WG vs QUIC 承载对比实验台（M0 转正自 /tmp/quic-lab）。
 #
 # 真源与口径：docs/reviews/M0-design.md §4 + tools/quic-ab/README.md（逐项映射表）。
-# 纪律（与 qi-ab.sh 的差别）：**完全不碰 homeway-cli / 任何生产实例**——四臂都是独立探针，
+# 纪律（与 qi-ab.sh 的差别）：**完全不碰 homeway / 任何生产实例**——四臂都是独立探针，
 # 只绑 127.0.0.1:0（内核分配端口后读回），无 state 目录/出口/token；收工**只按记录的 PID** kill。
 #
 # 用法：

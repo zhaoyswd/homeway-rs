@@ -102,7 +102,7 @@ impl TokenError {
         match self {
             TokenError::UnsupportedVersion { .. } => Some(
                 "存量 token 已失效（WG→QUIC 换代：本代只铸/只认 hmw2）——\
-                 请重新向出口索取 token（`homeway-cli serve token`）后重新粘贴",
+                 请重新向出口索取 token（`homeway serve token`）后重新粘贴",
             ),
             _ => None,
         }

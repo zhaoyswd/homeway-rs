@@ -26,7 +26,7 @@
 set -uo pipefail
 
 REPO_ROOT="${0:h:A:h}"
-RUST_BIN="$REPO_ROOT/target/release/homeway-cli"
+RUST_BIN="$REPO_ROOT/target/release/homeway"
 N="${1:-9}"
 SIZE_MB="${2:-400}"
 RATE="${3:-2000000}"

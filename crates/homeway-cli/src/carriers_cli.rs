@@ -150,7 +150,7 @@ fn carrier_op_err(op: &str, e: &OpError) -> String {
     };
     match e.code.as_str() {
         vocab::CODE_NO_HOST => format!(
-            "主机不在守护进程表中（no_host）；homeway-cli host list 查看在表主机{extra}"
+            "主机不在守护进程表中（no_host）；homeway host list 查看在表主机{extra}"
         ),
         vocab::CODE_NOT_READY => format!(
             "守护进程注册表未就绪（not_ready；client 角色启动中/重建窗口），稍后重试{extra}"
@@ -190,11 +190,11 @@ pub fn cmd_forward(args: &[String]) {
 
 fn forward_usage() {
     eprintln!("用法：");
-    eprintln!("  homeway-cli forward add --host <ref> --listen <P> [--target <ip:P>|:<P>] [--state D] [--no-spawn]");
+    eprintln!("  homeway forward add --host <ref> --listen <P> [--target <ip:P>|:<P>] [--state D] [--no-spawn]");
     eprintln!("                     建规则并立即起监听（127.0.0.1:P；目标缺省 = 该主机出口自己同端口）");
-    eprintln!("  homeway-cli forward list [--host <ref>] [--json]");
+    eprintln!("  homeway forward list [--host <ref>] [--json]");
     eprintln!("                     规则表 + 运行态（listening/failed/在世连接数）");
-    eprintln!("  homeway-cli forward delete --host <ref> --listen <P>");
+    eprintln!("  homeway forward delete --host <ref> --listen <P>");
     eprintln!("                     删规则并关监听（在世连接不强关、自然收口）");
     eprintln!("监听端口 1024–65535、每主机 ≤8 条、与全部规则及 socks 监听全局唯一。");
 }
@@ -231,7 +231,7 @@ fn forward_add(args: &[String]) {
         &["host", "listen", "target"],
     );
     let Some(host_ref) = p.value_of("host").map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned) else {
-        eprintln!("homeway: forward add 需要 --host <ref>（homeway-cli host list 查看在表主机）");
+        eprintln!("homeway: forward add 需要 --host <ref>（homeway host list 查看在表主机）");
         std::process::exit(2);
     };
     let Some(listen) = p.value_of("listen").and_then(|v| v.parse::<u16>().ok()) else {
@@ -426,7 +426,7 @@ fn forward_list(args: &[String]) {
         return;
     }
     if forwards.is_empty() {
-        println!("无转发规则（homeway-cli forward add --host <ref> --listen <P> 添加）");
+        println!("无转发规则（homeway forward add --host <ref> --listen <P> 添加）");
         c.close();
         return;
     }
@@ -464,11 +464,11 @@ fn forward_delete(args: &[String]) {
         &["host", "listen"],
     );
     let Some(host_ref) = p.value_of("host").map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned) else {
-        eprintln!("homeway: forward delete 需要 --host <ref>（homeway-cli forward list 查看）");
+        eprintln!("homeway: forward delete 需要 --host <ref>（homeway forward list 查看）");
         std::process::exit(2);
     };
     let Some(listen) = p.value_of("listen").and_then(|v| v.parse::<u16>().ok()) else {
-        eprintln!("homeway: forward delete 需要 --listen <端口>（homeway-cli forward list 查看）");
+        eprintln!("homeway: forward delete 需要 --listen <端口>（homeway forward list 查看）");
         std::process::exit(2);
     };
     let (c, hosts) = dial_and_hosts(&p, "homeway-forward");
@@ -508,7 +508,7 @@ fn forward_delete(args: &[String]) {
                     }
                 }
             }
-            eprintln!("homeway: 规则不存在：{dname} 127.0.0.1:{listen}（homeway-cli forward list 查看）");
+            eprintln!("homeway: 规则不存在：{dname} 127.0.0.1:{listen}（homeway forward list 查看）");
             std::process::exit(1);
         }
         exit_carrier_op("forward.remove", &e);
@@ -549,11 +549,11 @@ pub fn cmd_socks(args: &[String]) {
 
 fn socks_usage() {
     eprintln!("用法：");
-    eprintln!("  homeway-cli socks on --host <ref> [--listen 1080] [--state D] [--no-spawn]");
+    eprintln!("  homeway socks on --host <ref> [--listen 1080] [--state D] [--no-spawn]");
     eprintln!("                     该主机开 SOCKS5 监听（127.0.0.1；域名经该主机出口远程解析）");
-    eprintln!("  homeway-cli socks off --host <ref>");
+    eprintln!("  homeway socks off --host <ref>");
     eprintln!("                     关监听并显式关在世连接（端口记忆保留，下次 on 缺省沿用）");
-    eprintln!("  homeway-cli socks status [--json]");
+    eprintln!("  homeway socks status [--json]");
     eprintln!("                     每主机开关态 + 端口 + 在世连接数 + 链路态（via/rtt）");
     eprintln!("监听端口 1024–65535、与 forward 规则全局唯一。多主机 = 多端口，浏览器按端口选出口。");
 }
@@ -561,7 +561,7 @@ fn socks_usage() {
 fn socks_on(args: &[String]) {
     let p = parse_carrier_args("socks on --host <ref> [--listen P]", args, &["host", "listen"]);
     let Some(host_ref) = p.value_of("host").map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned) else {
-        eprintln!("homeway: socks on 需要 --host <ref>（homeway-cli host list 查看在表主机）");
+        eprintln!("homeway: socks on 需要 --host <ref>（homeway host list 查看在表主机）");
         std::process::exit(2);
     };
     // Q-H F7a：`--listen` 非法值 fail-fast（此前静默回落 0 = 沿用记忆端口）。
@@ -643,7 +643,7 @@ fn remembered_socks_port(c: &Arc<ControlClient>, host: &str) -> u16 {
 fn socks_off(args: &[String]) {
     let p = parse_carrier_args("socks off --host <ref>", args, &["host"]);
     let Some(host_ref) = p.value_of("host").map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned) else {
-        eprintln!("homeway: socks off 需要 --host <ref>（homeway-cli socks status 查看）");
+        eprintln!("homeway: socks off 需要 --host <ref>（homeway socks status 查看）");
         std::process::exit(2);
     };
     let (c, hosts) = dial_and_hosts(&p, "homeway-socks");
@@ -664,7 +664,7 @@ fn socks_off(args: &[String]) {
         Ok(v) => v,
         Err(e) => {
             if e.code == vocab::CODE_BAD_REQUEST {
-                eprintln!("homeway: {dname} 没有开着的 socks 监听（homeway-cli socks status 查看）");
+                eprintln!("homeway: {dname} 没有开着的 socks 监听（homeway socks status 查看）");
                 std::process::exit(1);
             }
             exit_carrier_op("socks.off", &e);
@@ -730,7 +730,7 @@ fn socks_status(args: &[String]) {
         return;
     }
     if socks.is_empty() {
-        println!("无 socks 记录（homeway-cli socks on --host <ref> 开启）");
+        println!("无 socks 记录（homeway socks on --host <ref> 开启）");
         c.close();
         return;
     }
@@ -810,7 +810,7 @@ impl SpeedHostResult {
 
 pub fn cmd_speedtest_hosted(args: &[String]) {
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h" | "help")) {
-        eprintln!("用法：homeway-cli speedtest [--host <ref>] [--json] [--down 10s] [--up 10s] [--warmup 2s] [--streams 4] [--wait 60s] [--quiet] [--state D] [--no-spawn]");
+        eprintln!("用法：homeway speedtest [--host <ref>] [--json] [--down 10s] [--up 10s] [--warmup 2s] [--streams 4] [--wait 60s] [--quiet] [--state D] [--no-spawn]");
         eprintln!("  对指定主机（或全部主机顺序轮流）做隧道上下行测速；参数默认与边界 = 手机口径。");
         eprintln!("  --wait = 链路未就绪的有界等待（0 = 不等即报错；默认 60s 覆盖恢复阶梯最坏时长）。");
         eprintln!("  Ctrl-C 终止整个轮转（先取消当前主机再退出，退出码非零）；--quiet 抑制过程提示。");
@@ -886,7 +886,7 @@ pub fn cmd_speedtest_hosted(args: &[String]) {
         }
         None => {
             if host_arr.is_empty() {
-                eprintln!("homeway: 主机表为空——先 homeway-cli host add <token> 添加后端，再测速");
+                eprintln!("homeway: 主机表为空——先 homeway host add <token> 添加后端，再测速");
                 std::process::exit(1);
             }
             host_arr
