@@ -1209,6 +1209,7 @@ impl TermService {
             // 接入即活动的尺寸应用（H2：注册表只改记账，PTY/vt/环 epoch 在这里跟上；
             // 哨兵不在注册路径注入——stream 统一一次）
             if let Some(sz) = reg.size_applied {
+                self.logf(&format!("term: 会话 {name} 几何切换 → {sz}（腿 {key:?} 接入）", key = reg.key));
                 apply_size_locked(rt, sz);
             }
             // 活动切换的主题/剪贴板回落（评审 P3：注册即活动——Go noteActivityLocked
@@ -1336,10 +1337,16 @@ impl TermService {
                         let mut st = self.lock_state();
                         // 非用户操作的自动上行不记活动：① `?1003` hover 流（鼠标划过
                         // 窗口不点击）；② 终端应答（本地终端对程序查询的自动回投——
-                        // 双 raw 腿下应答在两腿间搬几何成反馈环）。两者都不搬几何、
-                        // 不动 active（判定保守，识别不出的字节按真输入照记；判据
-                        // 变更已登记）。字节照常透传：程序（hover 高亮/查询消费）不受影响。
-                        let sz = if pure_mouse_motion(&f.payload) || pure_terminal_reply(&f.payload) {
+                        // 双 raw 腿下应答在两腿间搬几何成反馈环）；③ 焦点**失去**
+                        // （`?1004` 的 focus-out——离开窗口不是使用它，且焦点切换的
+                        // out/in 经两条腿上行、到达顺序不保证，out 记活动会在乱序时
+                        // 把几何翻回刚离开的窗口）。三者都不搬几何、不动 active
+                        // （判定保守，识别不出的字节按真输入照记；判据变更已登记）。
+                        // 字节照常透传：程序（hover 高亮/查询消费/焦点响应）不受影响。
+                        let sz = if pure_mouse_motion(&f.payload)
+                            || pure_terminal_reply(&f.payload)
+                            || pure_focus_out(&f.payload)
+                        {
                             None
                         } else {
                             st.registry.note_activity(name, key, now_ms())
@@ -1353,6 +1360,14 @@ impl TermService {
                         }
                         apply_active_theme_locked(rt, active);
                         if let Some(sz) = sz {
+                            // 几何切换观测（多腿异宽排查）：触发帧的字节证据随行打出
+                            //——hover/应答/focus-out 修复后仍跳变时，日志直接指认搬几何者。
+                            let hex: String =
+                                f.payload.iter().take(48).map(|b| format!("{b:02x}")).collect();
+                            self.logf(&format!(
+                                "term: 会话 {name} 几何切换 → {sz}（腿 {key:?} 输入 {}B: {hex}）",
+                                f.payload.len()
+                            ));
                             apply_size_locked(rt, sz);
                             self.sentinel_repaint_locked(rt);
                         }
@@ -1400,6 +1415,9 @@ impl TermService {
                         }
                         apply_active_theme_locked(rt, active);
                         if let Some(sz) = sz {
+                            self.logf(&format!(
+                                "term: 会话 {name} 几何切换 → {sz}（腿 {key:?} RESIZE 上报）"
+                            ));
                             apply_size_locked(rt, sz);
                             self.sentinel_repaint_locked(rt);
                             if clamped {
@@ -3478,7 +3496,9 @@ fn pure_terminal_reply(payload: &[u8]) -> bool {
                     i += 1;
                 }
                 let Some(&final_b) = payload.get(i) else { return false };
-                if !matches!(final_b, b'c' | b'n' | b'q' | b'R' | b'u' | b'y') {
+                // `m`（modifyOtherKeys 类应答 `CSI ? … m`）只认 `?`/`>` 开头形——
+                // 输入侧的鼠标释放是 `CSI < … m`（带 `<`，param 白名单外），无冲突。
+                if !matches!(final_b, b'c' | b'n' | b'q' | b'R' | b'u' | b'y' | b'm') {
                     return false;
                 }
                 let p = &payload[param..i];
@@ -3497,6 +3517,19 @@ fn pure_terminal_reply(payload: &[u8]) -> bool {
             _ => return false,
         }
     }
+}
+
+/// 整帧是否只含焦点**失去**事件（`CSI O`，`?1004`）。
+///
+/// 离开窗口不是使用它；且 macOS 焦点切换时旧窗口的 focus-out 与新窗口的
+/// focus-in 经**两条腿**分别上行、到达顺序不保证——focus-out 若记活动，乱序时
+/// 会把几何翻回用户刚离开的窗口（表现为切到新窗口打字时 UI 又跳走一次）。
+/// focus-in 仍算输入（点它 = 用它）。
+///
+/// 输入侧不可能拼出 `\x1b[O` 三字节形：Alt+O = `\x1bO`（无 `[`），SS3 功能键
+/// `\x1bOP/Q/R/S` 同为无 `[` 形。
+fn pure_focus_out(payload: &[u8]) -> bool {
+    !payload.is_empty() && payload.chunks(3).all(|c| c == b"\x1b[O")
 }
 
 /// 快照镜像窗口的实际行数（F1c 调用点口径）：`min(rows × MIRROR_VIEWPORTS, 行数预算)`。
@@ -4771,6 +4804,66 @@ mod tests {
         assert!(!pure_terminal_reply(b"\x1b]11;rgb:0000/0000"), "OSC 截断（无终结符）");
         assert!(!pure_terminal_reply(b"\x1b[?62"), "CSI 截断（无 final）");
         assert!(!pure_terminal_reply(b"\x1bO"), "SS3 截断");
+        // modifyOtherKeys 类应答（`?` 开头 + final m）——修后补的形态
+        assert!(pure_terminal_reply(b"\x1b[?2;1;0m"), "modifyOtherKeys 应答");
+        assert!(pure_terminal_reply(b"\x1b[?1m"), "XTQMODKEYS 短应答");
+        // 焦点失去判据：整帧只含 `CSI O`
+        assert!(pure_focus_out(b"\x1b[O"), "单条 focus-out");
+        assert!(pure_focus_out(b"\x1b[O\x1b[O"), "两条连发");
+        assert!(!pure_focus_out(b""), "空帧");
+        assert!(!pure_focus_out(b"\x1b[I"), "focus-in 仍算输入");
+        assert!(!pure_focus_out(b"\x1bO"), "Alt+O（两字节，无 `[`）");
+        assert!(!pure_focus_out(b"\x1bOP"), "SS3 F1 前缀");
+        assert!(!pure_focus_out(b"\x1b[Ox"), "focus-out 后跟键盘（混合帧）");
+        assert!(!pure_focus_out(b"\x1b[\x1b[O"), "截断混合");
+    }
+
+    /// 焦点乱序不翻几何（macOS 焦点切换 = 旧窗口 focus-out + 新窗口 focus-in，
+    /// 两条腿分别上行、到达顺序不保证）：A focus-in 切宽后，B 迟到的 focus-out
+    /// 不得把几何翻回窄——修前这正是「切窗口打字时 UI 又跳走一次」的机制。
+    /// focus-in 本身仍算输入（反向正例）。
+    #[test]
+    fn late_focus_out_does_not_flip_geometry() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let cfg = TermConfig { shell: Some("cat".into()), ..TermConfig::default() };
+        let svc = svc_with(cfg, Arc::clone(&lines));
+        let (ln, path) = start_listener();
+        {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || svc.serve(ln));
+        }
+        let session_size = |c: &mut Client| -> (u16, u16) {
+            c.send(Op::LIST, &[]);
+            let f = c.expect(Op::LIST, 5);
+            let v: serde_json::Value = serde_json::from_slice(&f.payload).unwrap();
+            let s = &v["sessions"]
+                .as_array()
+                .expect("sessions 数组")
+                .iter()
+                .find(|s| s["name"] == "t-foc")
+                .expect("会话在列");
+            (s["cols"].as_u64().unwrap() as u16, s["rows"].as_u64().unwrap() as u16)
+        };
+        let mut a = Client::connect(&path);
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "foc-a");
+        a.send(Op::HELLO, &frames::enc_hello(120, 30, hello_flags::CREATE, "t-foc", &tail));
+        a.expect(Op::ATTACHED, 5);
+        a.expect(Op::REPLAY_DONE, 5);
+        let mut b = Client::connect(&path);
+        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "foc-b");
+        b.send(Op::HELLO, &frames::enc_hello(80, 24, 0, "t-foc", &tail_b));
+        b.expect(Op::ATTACHED, 5);
+        assert_eq!(session_size(&mut a), (80, 24), "B 接入后会话几何=B");
+        // 用户切到 A：A 的 focus-in 先到 ⇒ 几何切宽
+        a.send(Op::DATA, b"\x1b[I");
+        assert_eq!(session_size(&mut a), (120, 30), "focus-in 照常切到本腿几何");
+        // B 迟到的 focus-out：不得把几何翻回窄
+        b.send(Op::DATA, b"\x1b[O");
+        assert_eq!(session_size(&mut a), (120, 30), "迟到的 focus-out 不得翻动几何");
+        // 反向正例：B 的 focus-in（用户点回 B）照常切回窄
+        b.send(Op::DATA, b"\x1b[I");
+        assert_eq!(session_size(&mut a), (80, 24), "focus-in 仍算输入（点它 = 用它）");
+        svc.close();
     }
 
     /// 无键鼠标移动不搬会话几何：A(120x30) 与 B(80x24) 双腿在场（会话=80x24）时
