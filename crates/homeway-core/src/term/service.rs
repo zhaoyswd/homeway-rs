@@ -3498,14 +3498,19 @@ fn pure_terminal_reply(payload: &[u8]) -> bool {
                 let Some(&final_b) = payload.get(i) else { return false };
                 // `m`（modifyOtherKeys 类应答 `CSI ? … m`）只认 `?`/`>` 开头形——
                 // 输入侧的鼠标释放是 `CSI < … m`（带 `<`，param 白名单外），无冲突。
-                if !matches!(final_b, b'c' | b'n' | b'q' | b'R' | b'u' | b'y' | b'm') {
+                // `t`（XTWINOPS 窗口/像素尺寸应答 `CSI 4;<h>;<w>t` 等）全认——输入侧
+                // 无 final t 的键编码；日志实证（2026-10-14）：TUI 重画发像素查询、
+                // 双腿各自应答自己的像素尺寸，`t` 漏网时每敲一键几何就被两条应答
+                // 各搬一次（UI 宽↔窄反复跳的最后一环）。
+                if !matches!(final_b, b'c' | b'n' | b'q' | b'R' | b'u' | b'y' | b'm' | b't') {
                     return false;
                 }
                 let p = &payload[param..i];
                 let known_shape = match p.first() {
                     Some(b'?') | Some(b'>') => true, // DA1/DA2/DECRPM/kitty 应答标志
                     _ => {
-                        matches!(final_b, b'R' | b'n')
+                        // 纯数字形：CPR（R）/ DSR-OK（n）/ XTWINOPS 尺寸·位置（t）
+                        matches!(final_b, b'R' | b'n' | b't')
                             && p.iter().all(|b| b.is_ascii_digit() || *b == b';')
                     }
                 };
@@ -4807,6 +4812,13 @@ mod tests {
         // modifyOtherKeys 类应答（`?` 开头 + final m）——修后补的形态
         assert!(pure_terminal_reply(b"\x1b[?2;1;0m"), "modifyOtherKeys 应答");
         assert!(pure_terminal_reply(b"\x1b[?1m"), "XTQMODKEYS 短应答");
+        // XTWINOPS 像素/字符尺寸·位置应答（final t，纯数字参数）——日志实证形
+        //（2026-10-14：双窗口各自本地终端的像素应答 `\x1b[4;353;580t`/`\x1b[4;353;797t`
+        //  被记活动，每敲一键几何被两条应答各搬一次）
+        assert!(pure_terminal_reply(b"\x1b[4;353;580t"), "像素尺寸应答（窄窗）");
+        assert!(pure_terminal_reply(b"\x1b[4;353;797t"), "像素尺寸应答（宽窗）");
+        assert!(pure_terminal_reply(b"\x1b[8;24;80t"), "字符尺寸应答（18t 的回）");
+        assert!(pure_terminal_reply(b"\x1b[3;5;10t"), "窗口位置应答");
         // 焦点失去判据：整帧只含 `CSI O`
         assert!(pure_focus_out(b"\x1b[O"), "单条 focus-out");
         assert!(pure_focus_out(b"\x1b[O\x1b[O"), "两条连发");
