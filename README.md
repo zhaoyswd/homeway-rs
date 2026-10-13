@@ -1,128 +1,129 @@
-# homeway-rs
+# homeway
 
-homeway 的 Rust 实现。最初是 Go 版 homeway 的**平行实现**，2026-10-05 Go 版整体退役后
-**已转正为唯一实现**——鸿蒙端「回家」VPN 的**出口 / 客户端核 / 中继**三角色都由本仓供给。
+「回家」网络工具：把手机 / 电脑的全部 IPv4 流量经**自建出口节点**出网。
+**三角色（出口 / 中继 / 客户端核）由同一个二进制 `homeway` 供给**，纯 Rust 实现。
 
-- **三角色同一二进制**：`homeway` 既是出口（**QUIC 端点**（quinn/rustls RPK）+ 过境拦截
-  + files/term/DNS 等服务）、也是客户端（**QUIC 岛**：并行赛跑 / rebind 迁移 / 快探阶梯）、
-  也是中继（**信封转发 + 准入，零 QUIC 依赖**）；
-- **客户端核**：`crates/homeway-capi` 提供 C-ABI 壳，产出 `libclientcore.so` 供鸿蒙 App 的
-  VPN 扩展进程加载（20 个 `ClientCore*` 导出，与 tier 仓原生契约四处同步）；
-- **行为对齐**：**保留面**（relaywire / term / files / 控制面）的 wire 字节 / 行为常量 / 判据行
-  与 Go 基线（冻结锚 `d4148f6`）逐一对齐；**WG/token 承载面已随 M5 换代**（`hmw2` 段容器 +
-  QUIC 单承载，无兼容包袱，登记见 `docs/INTEROP-CRITERIA.md` L-1/L-12）。
-  对照件 = `fixtures/`（golden 夹具 + 派生向量）+ `docs/INTEROP-CRITERIA.md`。
+- **出口（`serve`）**：QUIC 端点（单 UDP 端口，支持连接迁移）+ 动态设备表（token 凭证）
+  + 过境拦截层（TCP/UDP 五元组终结后本机重拨）+ files / 终端 / DNS 代答 / 测速 /
+  端口转发 / DDNS / UPnP / STUN。
+- **中继（`relay`）**：信封转发 + 准入，零 QUIC 依赖的轻量角色；出口与客户端打不通直连
+  时自动经它中转。
+- **客户端核**：`crates/homeway-capi` 的 C-ABI 壳（产物 `libclientcore.so`，20 个
+  `ClientCore*` 导出），供鸿蒙 App 的 VPN 扩展进程加载；核内 = QUIC 连接岛（连接 / 准入 /
+  候选赛跑 / 迁移 / 恢复阶梯）+ TUN 读写 + 服务流分发。
+- **选路与自愈**：**直连优先**（窗口 2s，中继纯后备）；连接中换网走本地重绑（rebind）
+  迁移；断链走「快探 → 复探 → 迁移 → 重连」阶梯。
+- **平台**：macOS arm64 / amd64、Linux amd64（musl 静态）/ arm64（musl 静态）、
+  Windows amd64（无终端能力）；鸿蒙核为 OHOS 交叉产物。
 
-## 架构
+## 安装
 
-```
-鸿蒙 App（tier 仓）
-  └─ VpnExtensionAbility（VPN 扩展进程）
-       └─ libclientcore.so（crates/homeway-capi → homeway-core）
-            ├─ homeway-quic/ QUIC 岛：连接管理 / 控制流 / 流分发 tag / 迁移（rebind）与快探阶梯
-            ├─ session/      连接生命周期：**快探 → 复探 → M(migrate/Rebind) → R(重连) → B 门**
-            │                （QUIC 档；旧 R1–R3 阶梯随 WG 面退役，tier 文档见 `connection-lifecycle` 定稿）
-            └─ facade/       App 桥面：tun 生命周期 / 探测 / 服务会话 / files / term / portfwd / speedtest
-                                 │  QUIC over UDP（一条连接 = 一台设备；直连或经中继，中继零解析）
-                                 ▼
-             出口（homeway，Rust 统一进程）
-               ├─ server/      QUIC 端点（单 UDP 端口，migration=true）+ 设备表（RPK 钉定 + 四帧准入）
-               ├─ intercept/   过境拦截：TCP/UDP 五元组终结 + 本机 socket 重拨（L3 直通）
-               ├─ term/        终端服务（alacritty_terminal + 自建编码器/应答器）
-               ├─ files / dns / speedtest / ddns / upnp / stun
-               ├─ QUIC STREAM[tag] → files/term/speedtest/dial/probe（服务面入口）
-               └─ daemon/      统一进程：serve + relay + client 角色 + 控制面（control.sock）
-                                     │
-                                     ▼
-                                   中继（homeway 的 relay 角色：信封转发 + 准入）
-```
-
-两台生产出口（Mac launchd / 阿里云 nohup）与中继均跑本仓 `homeway`，滚动升级记录见
-`docs/DEPLOY-RUST-EXIT.md`。
-
-## 构建
+发版产物 = GitHub Release 的 `homeway-<tag>-<平台>.tar.gz`（Windows = `.zip`）+ `SHA256SUMS`。
+平台名：`darwin-arm64` / `darwin-amd64` / `linux-amd64` / `linux-arm64` / `windows-amd64`。
 
 ```bash
-cargo build --release                 # 本机（macOS / Linux）
-cargo build --release -p homeway-cli  # 只出 CLI
+# 以 darwin-arm64、tag v0.3.3 为例（其余平台换产物名）
+curl -LO https://github.com/zhaoyswd/homeway-rs/releases/download/v0.3.3/homeway-v0.3.3-darwin-arm64.tar.gz
+curl -LO https://github.com/zhaoyswd/homeway-rs/releases/download/v0.3.3/SHA256SUMS
+grep darwin-arm64 SHA256SUMS | shasum -a 256 -c -
+tar xzf homeway-v0.3.3-darwin-arm64.tar.gz
+sudo install -m 0755 homeway /usr/local/bin/homeway     # 装进系统 PATH
+homeway --version
 ```
 
-- 工具链：`rust-toolchain.toml` 钉 stable `1.99.0`。
-- **鸿蒙核**（`libclientcore.so`，OHOS 交叉）：需要 DevEco NDK 与
-  `rustup target add aarch64-unknown-linux-ohos`，配方见 `AGENTS.md`「技术底座」与
-  `.cargo/config.toml`；核的产物构建/落盘由 tier 仓 `tools/tailcat/build-core.sh` 驱动
-  （本仓 `tools/build-app-core.sh` 为核侧自检门）。
-- 发版产物（四目标：darwin-arm64/amd64、linux-amd64/arm64-musl 静态）走 `v*` tag 触发的
-  Release CI，见 `.github/workflows/release.yml`。
-- **OHOS `.so` 判据 ≤3,800,000 B**，口径 = **product 档**（LTO + `codegen-units=1` + NDK strip）；
-  **同档判、跨档不互引**（L-1）。现役读数见 `docs/QUIC-BASELINE.md` §1。
+Windows：解压 `.zip`，把 `homeway.exe` 放进 PATH 内的目录。
 
-## 快速开始（本地起出口 + 取 token）
+从源码构建：
 
 ```bash
-# 1. 起一台本地 Rust 出口（私有实例：/tmp state、端口 4265x，绝不会碰现役出口）
-cargo build --release -p homeway-cli
-tools/local-rust-exit.sh start 1
-
-# 2. 取客户端 token（粘进 App 的「添加主机」，或喂给 connect/speedtest 的 --token）
-tools/local-rust-exit.sh token 1
-
-# 3. 用命令行客户端连它（服务会话形态，不带 TUN）
-target/release/homeway connect --token '<上一步的 token>'
-
-# 收尾
-tools/local-rust-exit.sh stop 1
+cargo build --release                  # 产物 target/release/homeway
+cargo build --release -p homeway-cli   # 同上（包名 homeway-cli，产物名 homeway）
 ```
 
-其他常用入口：
+工具链版本见 `rust-toolchain.toml`；鸿蒙核的 OHOS 交叉配方见 `AGENTS.md`「技术底座」。
+
+## 运行
+
+**正式部署 = 参数最简**：二进制在 PATH 内，零参 / 子命令直接跑，**不带 `--state`**——
+state 走缺省目录 `$HOME/.config/homeway`。`--state <dir>` 只用于测试、多实例或临时验证。
 
 ```bash
-# 零参 = 统一进程（client/control 恒开 + serve/relay 按 config 期望态装配）
-target/release/homeway --state /tmp/hw-local
+homeway                                 # 统一进程：client/control 恒开 + serve/relay 按 config 期望态装配
+homeway --verbose                       # 同上，多打过程行
 
-# 对照 Go 基线起本地 Go 出口 = **历史 oracle（Go 已退役，仅供对照复现）**
-# （需先 tools/make-baseline.sh 建快照克隆；现役本地链路一律用上面的 local-rust-exit.sh）
-tools/local-exit.sh start 1            # 出口 4264x
-tools/local-exit.sh client-start 1     # 其统一进程客户端（serve/relay 双关）
-
-# 互操作矩阵 / 性能 A/B / 本地 CI 一键门
-tools/matrix.sh --smoke
-tools/perf-ab.sh
-tools/ci-local.sh
+homeway serve                           # 前台单出口（Ctrl-C 收工）
+homeway serve --listen 41641 --relay 'rl1…'   # 首次起出口常用参数（之后写进 config.toml，零参即可）
+homeway relay --listen :41741 --advertise 203.0.113.7:41741   # 前台单中继
 ```
 
-token 是**凭证**：不内置、不进仓库、不随包分发（客户端 token 前缀 **`hmw2`**〔M5 起段容器；
-存量 `hmw1` 一律失效〕；中继凭据前缀 `rl1`）。
+`<state>/config.toml`（= `$HOME/.config/homeway/config.toml`）是**期望态**：
+`[serve]` / `[relay]` 的 `enabled` / `listen` / `advertise` / `files_root` / `[[serve.ddns]]`
+等写一次，之后 `homeway`（零参）与 `homeway serve start` 都按它装配。
 
-### Windows（2026-10-13 起，发版产物 windows-amd64 = zip）
+### 起停与运行面
 
-- 三角色（serve/relay/客户端域）编译可用；**term（终端）不支持**（`homeway term`
-  报不支持退出——豁免面见 `docs/reviews/WIN-design.md` §0）。
-- 停止信号 = 控制台事件（Ctrl-C/Ctrl-Break/关窗）；**SIGTERM 不可捕获**（`taskkill`
-  走硬终止）——服务管理请走控制面（`homeway serve stop` / `homeway relay stop`）。
-- 控制面本地承载 = 回环 TCP + `<state>/control.port` 端口文件（unix = `control.sock`
-  UDS；协议层一致）。
+```bash
+homeway serve start | stop | restart | status | token     # 出口（控制面，不占前台）
+homeway relay start | stop | restart | status | token     # 中继
+homeway status [--json] [--watch]                         # 运行面聚合（link / 统计 / 计数）
+homeway export <dest.tar> | import <file> | reset cache   # 状态工件：备份 / 迁移 / 清 cache
+```
 
-## 文档地图
+### 凭证（token）与主机管理
 
-| 想了解 | 看 |
-|---|---|
-| **新会话入口 / 硬规则 / 工程原则 / 技术底座** | `AGENTS.md` |
-| **程序主体进度真源**（期次范围、判据、退出口、下一步指针） | `ROADMAP.md` |
-| **传输层换代程序真源**（WG → QUIC，M0–M7；**M7 生产切换待 U1–U3 执行**，收官标记由主会话在路线文件同批收口） | `docs/QUIC-ROADMAP.md` |
-| 三基线（体积 / 每包 CPU / 内存 + 线开销） | `docs/QUIC-BASELINE.md` |
-| 真机操作手册（App 核装机 / 判据行 / 逃生口） | `docs/DEVICE-TEST-OHOS.md` |
-| **整改批进度真源**（2026-10-07 评审后的 Q 批分批范围与执行协议） | `docs/REVIEW-ROADMAP.md` |
-| **评审发现清单**（P0×5 + P1 全量 + 复核标注） | `docs/reviews/AUDIT-2026-10-07.md` |
-| 版本历史（每版改了什么） | `CHANGELOG.md` |
-| 生产出口部署与滚动升级实录 | `docs/DEPLOY-RUST-EXIT.md` |
-| 基线锚定（**冻结 `d4148f6`，只读 oracle**）与漂移登记 | `docs/BASELINE.md` |
-| 互操作判据行真源（含「判据变更记录」） | `docs/INTEROP-CRITERIA.md` |
-| golden 夹具与对照向量 | `fixtures/`（`MANIFEST.md` + `SHA256SUMS`） |
-| 性能 A/B 报告 | `docs/PERF-AB.md` |
-| 全量对齐缺口审计（与基线逐特性对照） | `docs/GAP-AUDIT.md` |
-| 各期评审记录 | `docs/reviews/` |
-| 本地 CI / 构建 / 向量生成脚本 | `tools/`（`ci-local.sh` / `gen-vectors.sh` / `local-*.sh`） |
+```bash
+homeway serve token                     # 出口凭证 hmw2…（粘进 App「添加主机」，或喂给下面的命令）
+homeway serve token list | revoke <id>  # 台账 append-only：吊销即时生效
+homeway host add --name home '<hmw2…>'  # 本机客户端加一台主机（daemon 托管）
+homeway host list | status [name] | delete <name|id> [--yes]
+```
+
+token 是**凭证**：不内置、不进仓库、不随包分发。客户端 token 前缀 `hmw2`；中继凭据前缀 `rl1`。
+
+### 客户端命令面
+
+```bash
+homeway connect --token '<hmw2…>'                     # 服务会话（无 TUN）：最直接的连通性验证
+homeway speedtest [--host home] [--json]              # 隧道上下行测速（无 --host = 全部主机轮转）
+homeway files upload --host home <本地> <远端目录>     # files：list/stat/mkdir/read/get/put/download/upload
+homeway files <verb> --token '<hmw2…>' …              # 同命令的裸客户端形态（不落主机）
+homeway term new work -d && homeway term attach work  # 远程终端（Ctrl-b d 分离；Windows 不支持）
+homeway term list | delete <name> | explain …
+homeway portfwd --token '<hmw2…>' --map 15432:5432    # 本机 TCP 端口转发（--map 15433:10.0.0.5:5432 可指定目的）
+```
+
+`homeway status --json` / `homeway speedtest --json` / `homeway host list --json` 出机器可读输出。
+
+### Windows 注记
+
+- 三角色编译可用；**终端（`term`）不支持**。
+- 停止信号 = 控制台事件（Ctrl-C / Ctrl-Break / 关窗）；SIGTERM 不可捕获 ⇒ 服务管理走控制面
+  （`homeway serve stop` / `homeway relay stop`）。
+- 控制面本地承载 = 回环 TCP + `<state>/control.port`（unix = `control.sock`；协议层一致）。
+
+### 迭代 / 测试形态（多实例）
+
+联调、矩阵、性能 A/B 一律用**私有实例**：显式 `--state /tmp/…` + 独立端口，绝不碰正式实例。
+
+```bash
+tools/local-rust-exit.sh start 1      # 起本地私有出口（/tmp state、4265x 端口）
+tools/local-rust-exit.sh token 1      # 取它的 token
+tools/local-rust-relay.sh start 1     # 起本地私有中继
+target/release/homeway connect --token '<上一步 token>' --state /tmp/hw-test   # 测试才带 --state
+```
+
+## 构建与自检
+
+```bash
+cargo build --release                       # 本机（macOS / Linux）
+cargo test --workspace                      # 单测 + 集成
+cargo clippy --workspace --all-targets -- -D warnings
+tools/ci-local.sh                           # 本地一键门（测试 / clippy / 向量 / 词表 / 矩阵冒烟）
+tools/matrix.sh --smoke                     # 本机互操作矩阵冒烟
+```
+
+发版 = 推 `v*` tag 触发 Release CI（五目标产物 + tag 纪律门 + `SHA256SUMS`），见
+`.github/workflows/release.yml`。
 
 ## 许可
 
