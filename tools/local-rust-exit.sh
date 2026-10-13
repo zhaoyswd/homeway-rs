@@ -49,10 +49,12 @@ our_pid() {
   [[ -f "$pf" ]] || return 1
   p=$(cat "$pf" 2>/dev/null) || return 1
   kill -0 "$p" 2>/dev/null || return 1
-  # L8（评审）：glob 匹配会把 homeway-go 误认成 homeway——按「comm == pat 或
-  # comm 以 pat 开头且 pat 是词首（homeway 匹配 homeway、不匹配 homeway-go）」收紧。
-  local comm; comm=$(ps -p "$p" -o comm= 2>/dev/null)
-  [[ "$comm" == "$pat" || "$comm" == "${pat}-"* || "$comm" == "${pat} "[0-9]* ]] || return 1
+  # L8/P1（评审 r2）：按 **basename** 比较精确名——macOS 的 `ps -o comm=` 返回
+  # 调用路径（不是 basename；ucomm 才是且带尾随空格），修前的路径串三条全不匹配
+  # ⇒ our_pid 恒假（status/stop 全哑、进程残留）。zsh 的 ${c:t} 取尾段，HOMEWAY_BIN
+  # 任意路径覆盖也兼容。homeway 不匹配 homeway-go（词边界：精确名比较）。
+  local comm c; comm=$(ps -p "$p" -o comm= 2>/dev/null); c=${comm:t}
+  [[ "$c" == "$pat" || "$c" == "$pat".exe ]] || return 1
   REPLY_PID=$p
 }
 
@@ -96,7 +98,7 @@ stop)
     kill -TERM "$local_pid" 2>/dev/null
     for i in {1..15}; do kill -0 "$local_pid" 2>/dev/null || break; sleep 1; done
     if kill -0 "$local_pid" 2>/dev/null; then
-      kill -KILL "$local_pid" 2>/dev/null; sleep 1
+      echo "!! stop: pid 未优雅退出（SIGTERM 失效面？）——强制 KILL 兜底" >&2; kill -KILL "$local_pid" 2>/dev/null; sleep 1
     fi
     echo "==> Rust 出口 #$n 已停（pid=$local_pid）"
   else echo "Rust 出口 #$n 未在跑"; fi
@@ -118,7 +120,7 @@ wipe) "$0" stop "$n"; rm -rf "$EXIT_STATE"; echo "==> 已删 $EXIT_STATE" ;;
 go-client-add)
   # Go 客户端统一进程（serve/relay 双关——同 local-exit.sh client-start 的断言纪律）
   [[ -x "$GO_BIN" ]] || { echo "!! $GO_BIN 不在（先 tools/local-exit.sh start 1 触发构建或手工构建）" >&2; exit 1; }
-  if ! our_pid "$CLIENT_PIDFILE" homeway; then
+  if ! our_pid "$CLIENT_PIDFILE" homeway-go; then  # P1：go 客户端传 basename 名
     mkdir -p "$CLIENT_STATE" || exit 1
     cat > "$CLIENT_STATE/config.toml" <<EOF
 [serve]
@@ -147,11 +149,11 @@ EOF
   fi
   ;;
 go-client-stop)
-  if our_pid "$CLIENT_PIDFILE" homeway; then
+  if our_pid "$CLIENT_PIDFILE" homeway-go; then  # P1：go 客户端传 basename 名
     local_pid=$REPLY_PID
     kill -TERM "$local_pid" 2>/dev/null
     for i in {1..10}; do kill -0 "$local_pid" 2>/dev/null || break; sleep 1; done
-    kill -0 "$local_pid" 2>/dev/null && kill -KILL "$local_pid" 2>/dev/null
+    kill -0 "$local_pid" 2>/dev/null && echo "!! stop: pid 未优雅退出（SIGTERM 失效面？）——强制 KILL 兜底" >&2; kill -KILL "$local_pid" 2>/dev/null
     echo "==> Go 客户端 #$n 已停"
   else echo "Go 客户端 #$n 未在跑"; fi
   rm -f "$CLIENT_PIDFILE"

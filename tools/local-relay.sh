@@ -66,7 +66,7 @@ stop)
     local_pid=$REPLY_PID
     kill -TERM "$local_pid" 2>/dev/null
     for i in {1..8}; do kill -0 "$local_pid" 2>/dev/null || break; sleep 1; done
-    kill -0 "$local_pid" 2>/dev/null && kill -KILL "$local_pid" 2>/dev/null
+    kill -0 "$local_pid" 2>/dev/null && echo "!! stop: pid 未优雅退出（SIGTERM 失效面？）——强制 KILL 兜底" >&2; kill -KILL "$local_pid" 2>/dev/null
     echo "==> 中继 #$n 已停（pid=$local_pid）"
   else echo "中继 #$n 未在跑"; fi
   rm -f "$RELAY_PIDFILE"

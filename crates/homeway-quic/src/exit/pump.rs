@@ -10,7 +10,9 @@
 //! - **半关传播**（§1.3/§1.5）：客户端 FIN ⇒ 服务侧 `shutdown(WRITE)`；
 //!   服务侧收线（EOF）⇒ 对端 `finish()`（**不用 reset 做正常收口**）——与
 //!   `tokio::io::copy_bidirectional` 同义（一个方向收线不打断另一个方向）。
-//! - **复位**（§2.2 设计门 N12）：AF_UNIX 没有 TCP 的「`SO_LINGER=0` ⇒ RST」语义，
+//! - **复位**（§2.2 设计门 N12）：AF_UNIX 没有 TCP 的「`SO_LINGER=0` ⇒ RST」语义
+//!   （**windows 臂例外**——r2-P4 登记：承载对是回环 TCP，close 带未读数据 ⇒ RST、
+//!   错误码面是 ECONNRESET 而非干净 EOF；FIN/EOF 语义不受影响），
 //!   且今天出口侧本来就是普通 close ⇒ **`reset(code)` = 关 socketpair**；错误码只留在
 //!   出口行/计数里，**不跨 socketpair**。服务侧先收线时同样走 FIN。
 //!   **实装口径（代码门 r18 C3 订正）**：对端 reset/连接死时，泵侧做的是 `shutdown(SHUT_WR)`

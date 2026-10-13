@@ -175,7 +175,7 @@ impl RelayProc {
     /// armed 状态由 `armed_here` 字段单源表达（评审 H2——共享槽属主化））。
     /// 未 armed 窗口（装配后 ~ 本调用前）由前台循环的「`exited()` 判失败 +
     /// `SIGNAL_HIT` 判信号」兜底，不会漏 Ctrl-C。
-    pub fn arm_signal(&mut self) {
+    pub(crate) fn arm_signal(&mut self) { // r2 加固：属主面不外放
         crate::stopsig::arm(
             self.stop.as_ref().map(|s| s.write_fd()).unwrap_or(crate::stopsig::DISARMED),
         );

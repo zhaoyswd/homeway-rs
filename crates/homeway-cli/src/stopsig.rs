@@ -79,8 +79,7 @@ pub fn pipe() -> std::io::Result<(Raw, Raw)> {
 }
 
 /// 写一个停止字节（unix `write(2)` / windows `send`；失败静默——「写满 = 已有
-/// 待收信号」的合并位语义。测试面也用它注入）。
-#[allow(dead_code)]
+/// 待收信号」的合并位语义）。`on_stop` 与测试面共用。
 pub fn write1(fd: Raw) {
     #[cfg(unix)]
     unsafe {

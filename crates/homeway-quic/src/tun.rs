@@ -450,7 +450,7 @@ fn read_loop(fd: crate::sysio::RawIo, tx: IslandTx, counters: Arc<TunCounters>, 
             }
             continue;
         }
-        let mut n = n as usize;
+        let mut n = n;
         // packet-info 头自动探测（镜像 `wgcore` 的 r2-L4：4 字节 PI + 合法 IP 版本号才剥）
         let looks_like_pi = n >= 5
             && ((buf[2] == 0x08 && buf[3] == 0x00 && buf[4] >> 4 == 4)

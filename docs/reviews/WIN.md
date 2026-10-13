@@ -16,19 +16,19 @@ musl check 与两例真进程信号测试。结论 **3 高 / 10 中 / 9 低**，
 | M3 | 中 | windows 门 warning-blind（42 条无人看，含死码） | 全量清零（imports/常量/助手随消费半边门控；TunExecutor 族门控；sysio 死助手删）+ win-check 上 `RUSTFLAGS: -D warnings` | 三 crate 交叉 check **零警告** |
 | M4 | 中 | windows 无 daemon 级优雅停止（控制面只有 serve.\*/relay.\*；taskkill 硬杀） | **登记**（README/WIN-design §4-9）：`daemon.stop` 控制面动词 = 后续批；README 已明写「无优雅停止路径，taskkill /f 形态」 | 文档 |
 | M5 | 中 | `PollEnt` 缺 `#[repr(C)]`（靠字段巧合布局） | repr(C) + size/align/offset 编译期断言（core+quic 两份） | 编译期断言在位 |
-| M6 | 中 | quic `sysio` 复制 ≈250 行（设计称 ≤50）且 `send` 语义分叉 | send 对齐（unix 补 MSG_NOSIGNAL）；设计 §4-10 改按实登记（抽第三叶子 crate = 后续批） | 代码 + 文档 |
+| M6 | 中 | quic `sysio` 复制 ≈250 行（设计称 ≤50）且 `send` 语义分叉 | send 对齐（unix 补 MSG_NOSIGNAL）；设计 §5 改按实登记（抽第三叶子 crate = 后续批） | 代码 + 文档 |
 | M7 | 中 | relay poll 错误路径：EINTR 新记行 + 真错误双记 + 重读 errno（unix 行为回归） | Err 臂恢复 `kind != Interrupted` 抑制 + 单次记行；删遗留块 | unix 全量测试绿 |
 | M8 | 中 | systime 丢 `#[allow(deprecated)]`（musl/OHOS 交叉 check 噪声回归） | allow+原注释随迁 | musl check 无警告 |
 | M9 | 中 | quic `pair()` 缺 nodelay；每服务流一对 loopback TCP 的成本未登记 | 补 `set_nodelay(true)`；TIME_WAIT/端口耗尽面登记 §3 风险表 | 代码 + 文档 |
-| M10 | 中 | pump 头注「AF_UNIX 无 RST/错误码不跨 socketpair」在 windows 臂为假 | 注释改口径 + §4-11 登记（close 带未读数据 ⇒ RST；错误码面差异） | 文档 |
-| L1 | 低 | 四处 unix 失败路径可见差（timestamp 回退形态/TUN 日志细节/V6ONLY 上抛） | bind_v6_only 恢复忽略语义；其余三处登记为「失败路径改善」（§4-12） | 代码 + 文档 |
+| M10 | 中 | pump 头注「AF_UNIX 无 RST/错误码不跨 socketpair」在 windows 臂为假 | 注释改口径 + §5 登记（close 带未读数据 ⇒ RST；错误码面差异） | 文档 |
+| L1 | 低 | 四处 unix 失败路径可见差（timestamp 回退形态/TUN 日志细节/V6ONLY 上抛） | bind_v6_only 恢复忽略语义；其余三处登记为「失败路径改善」（§5） | 代码 + 文档 |
 | L2 | 低 | `LockFileEx(0,0)` 区段口径存疑 | 改 `1,0`（锁字节 0——互斥最小共识面）；真机两进程互斥断言 = 后续批 | 代码 |
 | L3 | 低 | 适配器缓冲对齐；IP_UNICAST_IF 字节序未真机钉 | 对齐维持（实践对齐面）+ 登记真机清单 | 文档 |
 | L4 | 低 | `pub mod sysio` 暴露面过宽 + 死助手 + 多余 cast | `mod sysio` + `pub use SvcStream`；死助手删；cast 清 | windows check 零警告 |
 | L5 | 低 | `-11` 哨兵 / quic_only 手抄 / 平台分支泄漏 | 前两件重构（四态直排 + `build()` 收口）；`from_std` 两臂维持（登记） | 代码 |
 | L6 | 低 | 注释/文案漂移 + windows 帮助列 term | 逐处订正；帮助行平台分档 | unix check 零警告 |
 | L7 | 低 | 设计文档失真（pf_bind 完成面/bridge_auth 未落地/≤50 行/§4-3 stopsig） | §4 全面按实订正（见下） | 文档 |
-| L8 | 低 | 脚本 pattern 放宽误配 homeway-go；stop 无优雅断言；attach_size 残留进程毒化 | `our_pid` 收紧为精确/词首匹配；`stop_pid` 大声记账再 KILL 兜底 | 脚本语法过 + 本次收口全链重验 |
+| L8 | 低 | 脚本 pattern 放宽误配 homeway-go；stop 无优雅断言；attach_size 残留进程毒化 | `our_pid` 改 basename 精确匹配（r2-P1：第一版收紧在 macOS 恒假——`ps -o comm=` 返回路径）；`stop_pid`/各 local-*.sh 大声记账再 KILL 兜底；attach_size = 在册环境性 flake（REVIEW-ROADMAP 台账/本会话三次实证「残留进程毒化→清理即绿」），非本批代码面 | start/status/stop 实测全链 + ci-local 全绿 |
 | L9 | 低 | stopsig windows 注释口径（事件集/TRUE 语义/arm(DISARMED) 共享槽） | 注释订正；`arm(DISARMED)` 面随 H2 属主化一并消失 | 代码 |
 
 评审人复核确认面（「看过没发现问题」的独立背书）：sysock/sysio unix 臂逐调用
@@ -47,3 +47,31 @@ musl check 与两例真进程信号测试。结论 **3 高 / 10 中 / 9 低**，
 5. windows `cargo test`/`clippy --all-targets`（用例面 unix 化）。
 6. `daemon.stop` 控制面动词（M4）。
 7. sysio/sysock 抽第三叶子 crate（M6 记载）。
+
+
+## r2 复核（2026-10-13；评审记录全文 = 会话档 /tmp/dsh-review/r2.zojVLm，要点落此）
+
+r1 的 22 条处置：**18 到位**（含 H1/H2 真进程复验 0.042s/退出码 0/判据行原文；
+M3 抽查无「为静音而误门控」；M7 与 pre-WIN 逐句同形）；4 条部分到位/不到位，
+r2 新发现 10 项（P1 高/P2 中/P3-P10 低），全部于同批处置：
+
+| # | 摘要 | 处置 |
+|---|---|---|
+| P1 高 | our_pid 第一版收紧在 macOS 恒假（`ps -o comm=` 返回路径非 basename）⇒ 脚本 stop/status 全哑 + 残留进程 | basename（`${c:t}`）精确比较 + go-client 调用点改传 `homeway-go` + 各 stop 大声记账（P10） | start/status/stop 实测全链 + 无残留 |
+| P2 中 | M2 重构把 unix 就绪行挪成无条件——bind 失败窗口与告警行自相矛盾（E14/E17 假证据） | 就绪行回成功分支（`if local.is_some()`） |
+| P3/P4/P5/P6/P7 | term 死臂/pump 头注/quic align 断言/冗余 cast 与过时 allow/syslock 头注 | 逐项清 |
+| P8/P9 | WIN.md §4-x 指针失准/attach_size 子项无登记 | 指针改 §5；attach_size 按在册 flake 登记 |
+| P10 | 其余 local-*.sh stop 静默 KILL | 大声记账（local-exit.sh = Go oracle 不动） |
+| 加固 | arm_signal 属主面外放 | 收 pub(crate) |
+
+
+## 收口时的门账（2026-10-13 晚）
+
+- **恒绿**：workspace 测试 975/0（多轮）；clippy -D（mac + linux-gnu 目标）零错；
+  windows 三 crate `-D warnings` 零错；**独立形态矩阵 5/5 全绿**（315s 恒定，含
+  r2 修复后的二进制）；local-rust-exit start/status/stop 实测全链（P1 修复验证）。
+- **间歇红（环境性，登记）**：ci-local 嵌入形态的矩阵步骤今天 3 绿 5 红交替，
+  失败签名恒定 = 直连准入回执 5s 无回执（UDP 无重传面）→ F-100MB/E10 红、
+  TOTAL 679s。同 commit 同机器独立形态恒绿 ⇒ 非代码回归；归因 = 步骤 1-6 的
+  编译产物触发索引/负载风暴抢占准入窗（在册「handshake 慢滴水」负载敏感族，
+  REVIEW-ROADMAP 台账）。嵌入形态的最近一次全绿 = 2026-10-13 15:01:49。

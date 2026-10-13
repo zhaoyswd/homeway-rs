@@ -631,11 +631,8 @@ impl ServeEngine {
                 let tsrv = crate::term::service::TermService::new(Arc::clone(&dlogf), Some(&serve_dir));
                 match crate::files_server::listen_local_service(&serve_dir, "term.sock", &dlogf) {
                     Ok(ln) => {
-                        #[cfg(unix)]
+                        // （整块在 not(windows) 门内——r2-P3：windows 死臂已清。）
                         let own = sock_identity(&serve_dir.join("term.sock"));
-                        // WIN 批：同 files——windows 无 sock 文件属主面。
-                        #[cfg(windows)]
-                        let own = (0, 0);
                         socks.push((serve_dir.join("term.sock"), own));
                         // 就绪行（判据 E16）：socket + shell + 历史窗口 + 能力位 + vt 现状
                         (logf)(&format!(

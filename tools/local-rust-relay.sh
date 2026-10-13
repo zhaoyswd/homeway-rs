@@ -33,11 +33,17 @@ build_bin() {
 }
 
 our_pid() {
-  local pf="$1" p
+  # pattern 缺省 homeway（Rust 出口）；go 客户端侧传 homeway-go 形态
+  local pf="$1" p pat="${2:-homeway}"
   [[ -f "$pf" ]] || return 1
   p=$(cat "$pf" 2>/dev/null) || return 1
   kill -0 "$p" 2>/dev/null || return 1
-  [[ "$(ps -p "$p" -o comm= 2>/dev/null)" == *homeway* ]] || return 1
+  # L8/P1（评审 r2）：按 **basename** 比较精确名——macOS 的 `ps -o comm=` 返回
+  # 调用路径（不是 basename；ucomm 才是且带尾随空格），修前的路径串三条全不匹配
+  # ⇒ our_pid 恒假（status/stop 全哑、进程残留）。zsh 的 ${c:t} 取尾段，HOMEWAY_BIN
+  # 任意路径覆盖也兼容。homeway 不匹配 homeway-go（词边界：精确名比较）。
+  local comm c; comm=$(ps -p "$p" -o comm= 2>/dev/null); c=${comm:t}
+  [[ "$c" == "$pat" || "$c" == "$pat".exe ]] || return 1
   REPLY_PID=$p
 }
 
@@ -77,7 +83,7 @@ stop)
     local_pid=$REPLY_PID
     kill -TERM "$local_pid" 2>/dev/null
     for i in {1..8}; do kill -0 "$local_pid" 2>/dev/null || break; sleep 1; done
-    kill -0 "$local_pid" 2>/dev/null && kill -KILL "$local_pid" 2>/dev/null
+    kill -0 "$local_pid" 2>/dev/null && echo "!! stop: pid 未优雅退出（SIGTERM 失效面？）——强制 KILL 兜底" >&2; kill -KILL "$local_pid" 2>/dev/null
     echo "==> Rust 中继 #$n 已停（pid=$local_pid）"
   else echo "Rust 中继 #$n 未在跑"; fi
   rm -f "$RELAY_PIDFILE"

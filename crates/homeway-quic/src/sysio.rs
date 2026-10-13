@@ -224,6 +224,7 @@ pub struct PollEnt {
 #[cfg(unix)]
 const _: () = {
     assert!(std::mem::size_of::<PollEnt>() == std::mem::size_of::<libc::pollfd>());
+    assert!(std::mem::align_of::<PollEnt>() == std::mem::align_of::<libc::pollfd>());
     assert!(std::mem::offset_of!(PollEnt, raw) == std::mem::offset_of!(libc::pollfd, fd));
     assert!(std::mem::offset_of!(PollEnt, events) == std::mem::offset_of!(libc::pollfd, events));
     assert!(std::mem::offset_of!(PollEnt, revents) == std::mem::offset_of!(libc::pollfd, revents));

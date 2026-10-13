@@ -1,7 +1,8 @@
 //! 跨平台排它文件锁（WIN 批 2026-10-13）。
 //!
 //! unix = `flock(LOCK_EX|LOCK_NB)`（原样——持有进程死亡即内核释放，无陈旧文件）；
-//! windows = `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY, 全文件域)`
+//! windows = `LockFileEx(LOCKFILE_EXCLUSIVE_LOCK|LOCKFILE_FAIL_IMMEDIATELY, 字节 0 区段)`
+//! （锁首字节即互斥最小共识面——r2-P7；解锁随句柄关闭）
 //! ——进程退出句柄即关、锁即放，判活性同构。[`LockOutcome::Held`] = 他者持有
 //! （unix EWOULDBLOCK/EACCES；windows ERROR_LOCK_VIOLATION——两族同义映射）。
 
