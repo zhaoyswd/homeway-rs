@@ -108,6 +108,10 @@ const FETCH_ROWS_MAX: u16 = 512;
 /// 剪贴板读缓存上限（与 Go 的 clipMaxBytes 同值：载荷 u16 长度域的精确上限）。
 const CLIP_MAX_BYTES: usize = super::frames::MAX_PAYLOAD - 3;
 
+/// 会话几何真变时注入 raw 腿的清屏序（清屏 + 归位；**不含 `3J`**——回滚条是合法
+/// 历史，不是残影，与 attach「换屏前序」的差别就在这）。
+const RESIZE_CLEAR_SEQ: &[u8] = b"\x1b[2J\x1b[H";
+
 /// 快照镜像窗口行数预算（F1c）：`MIRROR_BYTES_BUDGET / (cols × 48)`，下限 64 行。
 /// 与视口的 `rows × MIRROR_VIEWPORTS` 取 min 在调用点（[`mirror_window_rows`]）。
 /// 下限 64 是**纯防御**：仅 `cols > ~10922` 才触发，生产被 `Size::MAX_COLS`（1000）
@@ -575,6 +579,9 @@ struct LegRt {
     /// **本腿**键编码平台口径（Q-J F1）：由 HELLO caps 声明（`KEY_ALT_*`），未声明/
     /// 歧义 = 宿主推断。按腿存放——同会话两条不同声明的腿各按各自口径编码。
     key_flavor: super::keyenc::KeyFlavor,
+    /// 本腿最近上报的网格尺寸（HELLO / RESIZE；registry `LegState.size` 的运行态
+    /// 镜像——会话几何真变时据此判「本腿本地网格 ≠ 会话网格」的 raw 腿需要清屏）。
+    size: Size,
     out: Arc<LegOut>,
     surface: Option<SurfaceLeg>,
     theme_known: bool,
@@ -1182,6 +1189,7 @@ impl TermService {
                 kind: LegKind::of(surface, raw_capable),
                 raw_capable,
                 key_flavor,
+                size,
                 out: Arc::clone(&out),
                 surface: surface.then(SurfaceLeg::new),
                 theme_known: false,
@@ -1376,6 +1384,11 @@ impl TermService {
                     let sz = st.registry.note_activity(name, key, now_ms());
                     let active = st.registry.session(name).and_then(|s| s.active);
                     if let Some(rt) = rt_of_mut(&mut st, name, sess_gen) {
+                        // 腿尺寸镜像（LegRt.size）无条件跟进——会话尺寸不变时也要记，
+                        // 后续他腿引发的几何变化据此判「本腿 ≠ 会话」。
+                        if let Some(l) = rt.legs.iter_mut().find(|l| l.key == key) {
+                            l.size = size;
+                        }
                         apply_active_theme_locked(rt, active);
                         if let Some(sz) = sz {
                             apply_size_locked(rt, sz);
@@ -3301,7 +3314,12 @@ fn apply_active_theme_locked(rt: &mut SessRt, active: Option<LegKey>) {
 }
 
 /// 尺寸应用（applySizeLocked）：PTY setsize + epoch + vt 重排 + 全 surface 腿标记全量
-/// （被动腿会拒收几何不符的差分，任务 3.1 的连带义务）。
+/// （被动腿会拒收几何不符的差分，任务 3.1 的连带义务）+ **异几何 raw 腿注入清屏序**。
+///
+/// raw 腿本地不渲染（字节透传），会话收窄后 PTY 内程序按新宽重画只覆盖新宽度，
+/// 本地更宽的腿在旧宽度外残留上一帧画面（Go 基线同缺口）——上报几何 ≠ 新会话
+/// 几何的 raw 腿先清屏再收重画；上报几何 == 新会话几何的腿（含触发腿）本地网格
+/// 与会话一致，程序重画正好覆盖整行，不清（免闪屏）。
 ///
 /// 入参是 [`Size`]——非 0 且在限内由类型保证（入径归一 + [`super::vt::SessionVt`] 硬拒
 /// 之外的门移到编译期）；`RESIZE 0×0` 在入径已被拦下（F1b），这里不再需要 0 判断。
@@ -3320,6 +3338,8 @@ fn apply_size_locked(rt: &mut SessRt, size: Size) {
     for l in &mut rt.legs {
         if let Some(s) = l.surface.as_mut() {
             s.mark_need_snapshot("resize");
+        } else if l.size != size {
+            l.out.enqueue(WriteItem::new(Op::DATA, RESIZE_CLEAR_SEQ.to_vec()), 0);
         }
     }
     if rt.any_surface() {
@@ -4097,6 +4117,83 @@ mod tests {
             Ok(()) => { let _ = body.join(); }
             Err(_) => panic!("attach_size_applies_to_pty 硬期限 60s 超时（环境性挂死复现——按 F3 加固判失败）"),
         }
+    }
+
+    /// 会话几何真变 ⇒ 上报几何 ≠ 新几何的 raw 腿收清屏序（attach 入径 + RESIZE 入径
+    /// 各一次）；触发腿自己不清（本地网格与会话一致）。修前异宽多 attach 收窄后，
+    /// 宽腿窄宽外残留上一帧画面（程序重画只覆盖新宽度）。
+    #[test]
+    fn shrink_clears_wider_raw_leg() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let cfg = TermConfig { shell: Some("cat".into()), ..TermConfig::default() };
+        let svc = svc_with(cfg, Arc::clone(&lines));
+        let (ln, path) = start_listener();
+        {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || svc.serve(ln));
+        }
+        // 宽腿 A（120x30）attach：回放前序（3J+2J+H）与 ATTACHED/REPLAY_DONE 走完
+        let mut a = Client::connect(&path);
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "clr-a");
+        a.send(Op::HELLO, &frames::enc_hello(120, 30, hello_flags::CREATE, "t-clr", &tail));
+        a.expect(Op::ATTACHED, 5);
+        a.expect(Op::REPLAY_DONE, 5);
+        // 窄腿 B（80x24）attach ⇒ 会话 120x30 → 80x24，A（≠80x24）收清屏序
+        let mut b = Client::connect(&path);
+        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "clr-b");
+        b.send(Op::HELLO, &frames::enc_hello(80, 24, 0, "t-clr", &tail_b));
+        b.expect(Op::ATTACHED, 5);
+        let got = a.drain_data_until(|d| has_bytes(d, RESIZE_CLEAR_SEQ), 10);
+        assert!(has_bytes(&got, RESIZE_CLEAR_SEQ), "异宽 attach 后宽腿未收清屏序");
+        // RESIZE 入径：B 上报 60x20 ⇒ 会话再变，A（仍 120x30）再收一条
+        b.send(Op::RESIZE, &frames::enc_resize(60, 20));
+        let got2 = a.drain_data_until(|d| has_bytes(d, RESIZE_CLEAR_SEQ), 10);
+        assert!(
+            got2.windows(RESIZE_CLEAR_SEQ.len()).filter(|w| *w == RESIZE_CLEAR_SEQ).count() >= 1,
+            "他腿 RESIZE 引发的几何变化未清屏"
+        );
+        svc.close();
+    }
+
+    /// 负例：触发腿自己上报的尺寸变化（本地网格 == 新会话几何）不注入清屏——
+    /// 单腿拖窗口是高频操作，每次闪屏不可接受。
+    #[test]
+    fn own_resize_does_not_clear() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let cfg = TermConfig { shell: Some("cat".into()), ..TermConfig::default() };
+        let svc = svc_with(cfg, Arc::clone(&lines));
+        let (ln, path) = start_listener();
+        {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || svc.serve(ln));
+        }
+        let mut a = Client::connect(&path);
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "clr-solo");
+        a.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, "t-clr-solo", &tail));
+        a.expect(Op::ATTACHED, 5);
+        a.expect(Op::REPLAY_DONE, 5);
+        a.send(Op::RESIZE, &frames::enc_resize(100, 30));
+        // cat 不响应 SIGWINCH ⇒ RESIZE 后只可能到 STATE/NOTIFY；500ms 窗口内出现
+        // 任何含清屏序的 DATA 都判失败（回放前序在 REPLAY_DONE 前已消费完）。
+        let deadline = Instant::now() + Duration::from_millis(500);
+        let mut leak = Vec::new();
+        loop {
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            match a.io.read_frame_deadline(left.max(Duration::from_millis(10))) {
+                Ok(f) if f.op == Op::DATA => leak.extend_from_slice(&f.payload),
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        assert!(
+            !has_bytes(&leak, b"\x1b[2J"),
+            "触发腿自身的 RESIZE 不应清屏，却收到：{:?}",
+            String::from_utf8_lossy(&leak)
+        );
+        svc.close();
     }
 
     /// H3 回归：上限腾位（裸断无 ENDED）的旧腿必须**立即见 EOF**——修前 dup fd 的
