@@ -1334,11 +1334,12 @@ impl TermService {
                 Op::DATA => {
                     let pty = {
                         let mut st = self.lock_state();
-                        // 无键鼠标移动（?1003 hover 流）不是「使用」：整帧只含
-                        // `CSI < 35 ; col ; row M` 时不记活动——不搬几何、不动
-                        // active（判定保守，识别不出的字节按真输入照记；判据
-                        // 变更已登记）。字节照常透传：程序（hover 高亮等）仍要用。
-                        let sz = if pure_mouse_motion(&f.payload) {
+                        // 非用户操作的自动上行不记活动：① `?1003` hover 流（鼠标划过
+                        // 窗口不点击）；② 终端应答（本地终端对程序查询的自动回投——
+                        // 双 raw 腿下应答在两腿间搬几何成反馈环）。两者都不搬几何、
+                        // 不动 active（判定保守，识别不出的字节按真输入照记；判据
+                        // 变更已登记）。字节照常透传：程序（hover 高亮/查询消费）不受影响。
+                        let sz = if pure_mouse_motion(&f.payload) || pure_terminal_reply(&f.payload) {
                             None
                         } else {
                             st.registry.note_activity(name, key, now_ms())
@@ -3402,6 +3403,102 @@ fn pure_mouse_motion(payload: &[u8]) -> bool {
     }
 }
 
+/// 整帧是否只含**终端应答**序列——本地终端对程序查询（DA/OSC/DCS/CPR/kitty 探测）
+/// 的自动回投。与 hover 同理摘出输入活动：应答不是用户操作。
+///
+/// 双 raw 腿场景的反馈环（本判据的存在理由）：程序发查询 → 透传双腿 → 两个本地
+/// 终端各自应答 → 应答作为 DATA 上行各自记活动 → 几何随应答到达顺序在两腿间
+/// 反复搬（每搬一次 TUI 重画又可能发新查询）——用户看到 UI 宽↔窄跳多次。
+///
+/// 认的形态（整帧须全部由这些构成，可多条连发）：
+/// - OSC 应答：`ESC ] … (BEL | ESC \)`（OSC 10/11 颜色、标题等）；
+/// - DCS 应答：`ESC P … ESC \`（DA3、XTGETTCAP 等）；
+/// - CSI 应答：`ESC [ 参数 final ∈ {c,n,q,R,u,y}`，参数形 = `?`/`>` 开头
+///   （DA1/DA2/DECRPM/kitty 查询应答的标志），或纯数字（`;` 分隔）且 final ∈ {R,n}
+///   （CPR / DSR-OK）。
+///
+/// 保守面（一律 `false` = 按真输入记活动）：键盘、焦点（`\x1b[I`/`\x1b[O`）、
+/// kitty 键盘**输入**编码（`CSI <code>;<mods>u`——纯数字参数，非 `?` 开头）、
+/// 方向/功能键、鼠标（final M/m 不在集）、跨帧截断的半截序列、空帧。误判只会
+/// 多记活动（= 现状行为），不会丢「一敲即回本机网格」。
+fn pure_terminal_reply(payload: &[u8]) -> bool {
+    /// CSI 应答参数区字符白名单（键盘输入参数只有数字与 `;`——含这些符号的帧
+    /// 不可能来自键编码）。
+    fn reply_param_byte(b: u8) -> bool {
+        b.is_ascii_digit() || matches!(b, b';' | b'?' | b'>' | b'$' | b'\'' | b'"' | b' ' | b'=' | b'!' | b'*')
+    }
+    if payload.is_empty() {
+        return false;
+    }
+    let mut i = 0;
+    loop {
+        if i == payload.len() {
+            return true;
+        }
+        // 每条应答都从 ESC 起；终结符（BEL/ST）必须是完整二字节形态才算完——
+        // 截断的半截按真输入处理（保守）。
+        if i + 1 >= payload.len() || payload[i] != b'\x1b' {
+            return false;
+        }
+        match payload[i + 1] {
+            b']' => {
+                i += 2;
+                loop {
+                    match payload.get(i) {
+                        Some(b'\x07') => {
+                            i += 1;
+                            break;
+                        }
+                        Some(b'\x1b') if payload.get(i + 1) == Some(&b'\\') => {
+                            i += 2;
+                            break;
+                        }
+                        Some(_) => i += 1,
+                        None => return false, // OSC 未终结 = 截断
+                    }
+                }
+            }
+            b'P' => {
+                i += 2;
+                loop {
+                    match payload.get(i) {
+                        Some(b'\x1b') if payload.get(i + 1) == Some(&b'\\') => {
+                            i += 2;
+                            break;
+                        }
+                        Some(_) => i += 1,
+                        None => return false, // DCS 未终结 = 截断
+                    }
+                }
+            }
+            b'[' => {
+                i += 2;
+                let param = i;
+                while i < payload.len() && reply_param_byte(payload[i]) {
+                    i += 1;
+                }
+                let Some(&final_b) = payload.get(i) else { return false };
+                if !matches!(final_b, b'c' | b'n' | b'q' | b'R' | b'u' | b'y') {
+                    return false;
+                }
+                let p = &payload[param..i];
+                let known_shape = match p.first() {
+                    Some(b'?') | Some(b'>') => true, // DA1/DA2/DECRPM/kitty 应答标志
+                    _ => {
+                        matches!(final_b, b'R' | b'n')
+                            && p.iter().all(|b| b.is_ascii_digit() || *b == b';')
+                    }
+                };
+                if !known_shape {
+                    return false;
+                }
+                i += 1;
+            }
+            _ => return false,
+        }
+    }
+}
+
 /// 快照镜像窗口的实际行数（F1c 调用点口径）：`min(rows × MIRROR_VIEWPORTS, 行数预算)`。
 fn mirror_window_rows(cols: u16, rows: u16) -> usize {
     (rows as usize * super::codec::MIRROR_VIEWPORTS).min(mirror_rows_budget(cols as usize))
@@ -4638,6 +4735,44 @@ mod tests {
         assert!(!pure_mouse_motion(b"\x1b[<35m"), "无坐标的畸形头");
     }
 
+    /// 终端应答判据边界表：OSC/DCS/CSI 应答整帧 ⇒ true；键盘/焦点/kitty 输入
+    /// 编码/鼠标/截断 ⇒ false（保守方向 = 记活动）。
+    #[test]
+    fn pure_terminal_reply_boundaries() {
+        // OSC 应答（颜色/标题；BEL 与 ST 两种终结）
+        assert!(pure_terminal_reply(b"\x1b]11;rgb:0000/0000/0000\x1b\\"));
+        assert!(pure_terminal_reply(b"\x1b]0;title\x07"));
+        assert!(pure_terminal_reply(b"\x1b]11;rgb:ffff/ffff/ffff\x07\x1b[?62c"), "多条应答连发");
+        // DCS 应答（DA3 / XTGETTCAP）
+        assert!(pure_terminal_reply(b"\x1bP!|00000000\x1b\\"));
+        assert!(pure_terminal_reply(b"\x1bP1+r6d6f6465\x1b\\"));
+        // CSI 应答：? / > 开头（DA1/DA2/DECRPM/kitty）
+        assert!(pure_terminal_reply(b"\x1b[?62c"), "DA1 短形态");
+        assert!(pure_terminal_reply(b"\x1b[?6;1;15;22c"), "DA1 全形态");
+        assert!(pure_terminal_reply(b"\x1b[>0;10;1c"), "DA2");
+        assert!(pure_terminal_reply(b"\x1b[?1;2u"), "kitty 查询应答");
+        assert!(pure_terminal_reply(b"\x1b[?1;1;0;1q"), "modifyOtherKeys 应答");
+        assert!(pure_terminal_reply(b"\x1b[?1049;2$y"), "DECRPM 应答");
+        // CSI 应答：纯数字 + R/n（CPR / DSR-OK）
+        assert!(pure_terminal_reply(b"\x1b[24;80R"), "CPR");
+        assert!(pure_terminal_reply(b"\x1b[0n"), "DSR-OK");
+        // 保守面：不是应答的一律记活动
+        assert!(!pure_terminal_reply(b""), "空帧");
+        assert!(!pure_terminal_reply(b"x"), "键盘");
+        assert!(!pure_terminal_reply(b"\x1b[I"), "焦点 focus-in 仍算输入");
+        assert!(!pure_terminal_reply(b"\x1b[O"), "焦点 focus-out 仍算输入");
+        assert!(!pure_terminal_reply(b"\x1b[A"), "方向键上");
+        assert!(!pure_terminal_reply(b"\x1b[1;5C"), "Ctrl+右");
+        assert!(!pure_terminal_reply(b"\x1b[97u"), "kitty 输入编码（无修饰 a）");
+        assert!(!pure_terminal_reply(b"\x1b[97;5u"), "kitty 输入编码（Ctrl+a）");
+        assert!(!pure_terminal_reply(b"\x1b[<0;10;20M"), "SGR 鼠标按下");
+        assert!(!pure_terminal_reply(b"\x1b[<35;10;20M"), "hover 流（另一判据的地盘）");
+        assert!(!pure_terminal_reply(b"\x1b]11;rgb:0000/0000/0000x"), "应答后跟键盘");
+        assert!(!pure_terminal_reply(b"\x1b]11;rgb:0000/0000"), "OSC 截断（无终结符）");
+        assert!(!pure_terminal_reply(b"\x1b[?62"), "CSI 截断（无 final）");
+        assert!(!pure_terminal_reply(b"\x1bO"), "SS3 截断");
+    }
+
     /// 无键鼠标移动不搬会话几何：A(120x30) 与 B(80x24) 双腿在场（会话=80x24）时
     /// A 发纯 hover 流会话保持 80x24；A 发真键盘后才切 120x30。同连接帧序保证
     /// LIST 应答反映先行 DATA 帧处理后的状态（无需 sleep）。
@@ -4679,6 +4814,81 @@ mod tests {
         // 真键盘：照常记活动、切回 A 的几何
         a.send(Op::DATA, b"x");
         assert_eq!(session_size(&mut a), (120, 30), "键盘输入照常切回本腿几何");
+        svc.close();
+    }
+
+    /// 终端应答不记活动（反馈环回归）：会话程序发 DA 查询（TUI 启动/重画的常态），
+    /// 查询透传两条 raw 腿、两个本地终端各自应答——**应答回投是 DATA**，若记活动
+    /// 则每轮查询都把几何在两腿间搬一次（用户看到 UI 宽↔窄反复跳）。程序 = 收到
+    /// 一行输入就发一次 `\033[c` 的循环脚本，双腿读到查询即应答 `\033[?62c`。
+    /// 修前：几何随应答振荡；修后：几何停在 B 输入腿（80x24）不动。
+    #[test]
+    fn reply_feedback_does_not_flip_geometry() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let cfg = TermConfig {
+            shell: Some("while read -r _l; do printf '\\033[c'; done".into()),
+            ..TermConfig::default()
+        };
+        let svc = svc_with(cfg, Arc::clone(&lines));
+        let (ln, path) = start_listener();
+        {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || svc.serve(ln));
+        }
+        let session_size = |c: &mut Client| -> (u16, u16) {
+            c.send(Op::LIST, &[]);
+            let f = c.expect(Op::LIST, 5);
+            let v: serde_json::Value = serde_json::from_slice(&f.payload).unwrap();
+            let s = &v["sessions"]
+                .as_array()
+                .expect("sessions 数组")
+                .iter()
+                .find(|s| s["name"] == "t-reply")
+                .expect("会话在列");
+            (s["cols"].as_u64().unwrap() as u16, s["rows"].as_u64().unwrap() as u16)
+        };
+        // 读下行到「见到 DA 查询即回投应答」（模拟本地终端的自动应答）；其它帧跳过。
+        // 返回是否应答过（0 次 = 程序没发查询，测试空转——尾部有断言防假绿）。
+        fn answer_da(c: &mut Client) -> bool {
+            let deadline = Instant::now() + Duration::from_millis(1500);
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return false;
+                }
+                match c.io.read_frame_deadline(left.max(Duration::from_millis(10))) {
+                    Ok(f) if f.op == Op::DATA && has_bytes(&f.payload, b"\x1b[c") => {
+                        c.send(Op::DATA, b"\x1b[?62c");
+                        return true;
+                    }
+                    Ok(_) => continue,
+                    Err(_) => return false,
+                }
+            }
+        }
+        let mut a = Client::connect(&path);
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "rep-a");
+        a.send(Op::HELLO, &frames::enc_hello(120, 30, hello_flags::CREATE, "t-reply", &tail));
+        a.expect(Op::ATTACHED, 5);
+        a.expect(Op::REPLAY_DONE, 5);
+        let mut b = Client::connect(&path);
+        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "rep-b");
+        b.send(Op::HELLO, &frames::enc_hello(80, 24, 0, "t-reply", &tail_b));
+        b.expect(Op::ATTACHED, 5);
+        // 三轮「输入触发查询 → 双腿应答」：几何必须停在 B（80x24）不动。
+        // 中间态断言点在 A 应答后、B 应答前——修前 A 的应答即把几何翻到 120
+        // （振荡的一翼），只看轮末态会被 B 的应答拉回 80 掩盖。
+        let mut answered = 0;
+        for round in 0..3 {
+            b.send(Op::DATA, b"q\n");
+            answered += answer_da(&mut a) as u8;
+            let mid = session_size(&mut a);
+            assert_eq!(mid, (80, 24), "第 {round} 轮：A 的应答不得翻动几何（反馈环一翼）");
+            answered += answer_da(&mut b) as u8;
+            let sz = session_size(&mut a);
+            assert_eq!(sz, (80, 24), "第 {round} 轮应答后几何被应答翻动（反馈环）");
+        }
+        assert!(answered >= 3, "应答未发生（程序没发查询?answered={answered}）——测试空转");
         svc.close();
     }
 
