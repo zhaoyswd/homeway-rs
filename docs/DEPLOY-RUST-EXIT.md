@@ -659,3 +659,69 @@ App 的免手工外部通道只有 `--ps host_token`（主机注入）与 `--ps 
 `~/homeway-rollback/` 或重建取）。**v0.3.1 的回滚件已就位（本表「前置」行）。**
 
 
+
+## 13. 部署形态改简 + v0.3.3 换装（2026-10-13，用户指令）
+
+**改简后的正式形态**（本节起，两处生产主机同款；测试 / 多实例仍走 `--state`）：
+
+- 二进制 = **系统 PATH 内**的 `homeway`（Mac = `/opt/homebrew/bin/homeway`〔该机 `/usr/local/bin`
+  属 root、装它需 sudo〕；阿里云 = `/usr/local/bin/homeway`）；
+- 命令行 = **零参 / 子命令直跑、不带 `--state`**；state = 缺省 `$HOME/.config/homeway`
+  （因此终端里 `homeway serve status` / `homeway serve token` 直接作用于在跑实例）。
+- 变化点 = state 从各自旧路径**迁到缺省路径**：Mac `~/.config/homeway-rs` → `~/.config/homeway`；
+  阿里云 `/opt/homeway/data-rs` → `/root/.config/homeway`。
+
+### 13.1 发版 v0.3.3
+
+| 阶段 | 读数 | 结论 |
+|---|---|---|
+| 版本 / tag | 0.3.2 → **0.3.3**；tag = main 头 `f1512ce`（含 Windows 支持、二进制改名、直连优先回归） | ✓ |
+| 首跑 | windows job 在**发版纪律门**击红（bash 语法跑在 pwsh 下）+ upload-artifact 只列 `*.tar.gz`（windows 产物是 zip ⇒ `if-no-files-found` 也会红）；`v0.3.3` 未产出 Release | ✗ → 修 workflow（纪律门加 `shell: bash`；artifact path 两形都列） |
+| 二跑 | 五目标全绿（linux-arm64 2m36s / linux-amd64 2m50s / darwin-amd64 3m19s / darwin-arm64 4m4s / windows 4m19s）+ release job 14s | ✓ |
+| 重打 tag | 首跑死在 build 阶段、**无 Release 产出** ⇒ `v0.3.3` 重指到修后的 main 头 `f1512ce`（发版纪律：tag 必须在 main 头上） | ✓ |
+
+### 13.2 Mac 换装（22:29–22:31）
+
+| 件 | 读数 |
+|---|---|
+| 产物 | `homeway-v0.3.3-darwin-arm64.tar.gz`（sha256 `ba442c51…` 对 `SHA256SUMS` 通过）→ `/opt/homebrew/bin/homeway` |
+| 停 | `launchctl bootout gui/501/me.zhaozhe.homeway-exit`（旧 pid 61963，2 s 退净 + 端口释放） |
+| state | `~/.config/homeway-rs` → `~/.config/homeway`；旧缺省路径的 prerust 存档 → `~/.config/homeway.bak-20261013`（不参与运行） |
+| plist | `ProgramArguments = [/opt/homebrew/bin/homeway]`（**零参**）；`StandardOut/ErrorPath` 与 `WorkingDirectory` → 新 state 路径 |
+| 起 | `launchctl bootstrap` → pid 53696；`homeway: 统一进程就绪（state=/Users/zhaozhe/.config/homeway，serve=true relay=false，version=v0.3.3）` |
+| 判据 | `serve 就绪 … key=8aee740b7220…`（**身份逐字不变**）；`公网端点：已公布 [114.242.60.128:41641]`；`中继：注册成功（腿 41641 → 123.56.218.212:41741）`；零参 `homeway serve status` = `state=running listenPort=41641`，token 端点 = LAN + 公网 v4 + Relay |
+
+### 13.3 阿里云换装（22:30–22:31）
+
+| 件 | 读数 |
+|---|---|
+| 产物 | `homeway-v0.3.3-linux-amd64.tar.gz`（sha256 `f7fcaabc…`；static-pie）→ `/usr/local/bin/homeway`；旧件留 `/usr/local/bin/homeway-rs.bak-v0.3.2` |
+| 停 | `kill -TERM 1588460`（6 s 退净 + 41641/41741 释放） |
+| state | `/opt/homeway/data-rs` → `/root/.config/homeway` |
+| 起 | `cd /opt/homeway && setsid /usr/local/bin/homeway >> /root/.config/homeway/cache/unified-stdout.log 2>&1 &`（**无 `--state`**）→ pid 1601626 |
+| 判据 | `key=1020c3eae8b3…`（**逐字不变**）；零参 `serve status` = `state=running listenPort=41641`、token 含公网 `123.56.218.212:41641`；零参 `relay status` = `state=running listen=:41741`、`rl133ZkGIEpR…`（**与 Mac 出口 config 引用的 rl1 逐字同**）；`ss` = 41641/udp(eth0) + 41741/udp+tcp |
+| 互注 | Mac `中继控制面已连（22:30:59）` ↔ 阿里云 `中继：后端 d07c57dd5bde1fa7 控制面就绪（114.242.60.128:55684）`——**中继重启后出口自动重注册** ✓ |
+
+### 13.4 第二台 Mac（客户端机，192.168.3.8）
+
+`homeway-v0.3.3-darwin-arm64`（sha 与 Mac 产物同：`ba442c51…`）→ `/usr/local/bin/homeway`
+（该机 `/usr/local/bin` 属 zhaozhe、可写）；登录 shell `homeway --version` = `homeway v0.3.3` ✓。
+**无服务、无 state**——客户端机按需零参使用（`homeway host add <token>` 等，state 自动落在
+`~/.config/homeway`）。
+
+### 13.5 回滚与注记
+
+- **回滚（Mac）**：`launchctl bootout` → plist 的 `ProgramArguments` 换回
+  `~/bin/homeway-rs.bak-v0.3.2` + `--state ~/.config/homeway`（旧 state 目录被迁走 ⇒ 需先把
+  `~/.config/homeway` 挪回 `~/.config/homeway-rs`，或直接改指 `~/.config/homeway`）
+  → `launchctl bootstrap`。
+- **回滚（阿里云）**：`kill -TERM <pid>` → `cp /usr/local/bin/homeway-rs.bak-v0.3.2
+  /usr/local/bin/homeway-rs` → `cd /opt/homeway && HOME=/opt/homeway/served nohup
+  /usr/local/bin/homeway-rs --state /root/.config/homeway …`（state 位置可从缺省路径指回）。
+- **凭证连续性**：state 整体搬迁（key.bin / tokens.jsonl 随迁）⇒ 台账与身份都不变，
+  设备持有的 `hmw2` token 继续有效。换装时设备不在线（`peers=0`），下次连接即用新实例。
+- **如实注记①**：换装前旧 state 存档（`~/.config/homeway.bak-20261013`，prerust 形态）曾被一次
+  误执行的自刷新（`homeway export --help` / `import --help`——帮助串被当位置参数）：内容等价，
+  仅白名单外 1 个 `client/hosts.json.corrupt-*` 条目被替换；该存档**不参与运行**，无影响。
+- **如实注记②**：Mac 出口本轮 `公网端点` 只公布 IPv4（IPv6 STUN 无应答，换装前一轮曾公布 v6）——
+  属网络侧瞬时形态，出口会按既有节拍重测。
