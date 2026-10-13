@@ -11,6 +11,7 @@
 use std::io;
 
 use std::net::Ipv4Addr;
+use std::net::Ipv6Addr;
 use std::net::SocketAddr;
 use std::net::SocketAddrV4;
 use std::net::SocketAddrV6;
@@ -21,93 +22,59 @@ use std::net::UdpSocket;
 /// 双栈 UDP socket（AF_INET6 + `IPV6_V6ONLY=0`——Go `net.ListenUDP("udp", …)` 同义：
 /// v4/v6 对端都能通、同 socket 的 STUN 观测对两族都成立）。V6ONLY 必须在 bind 前
 /// 设（bind 后再设无效），std 的 `UdpSocket::bind` 一体化创建插不进 setsockopt ⇒
-/// libc 手建。
+/// 裸建（WIN 批起经 `sysock`——unix 臂 = 原 libc 直调同形）。
 pub(crate) fn bind_dual_stack(port: u16) -> io::Result<UdpSocket> {
-    // F1：CLOEXEC 创建即落（linux/OHOS 走 `SOCK_CLOEXEC` 原子位；darwin 建后立即补）
-    // ——失败路径 fd 随 OwnedFd drop 关，无需手写 close。
-    let fd = crate::sysfd::socket_cloexec(libc::AF_INET6, libc::SOCK_DGRAM, 0)?;
-    let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
-    unsafe {
-        let off: libc::c_int = 0;
-        let _ = libc::setsockopt(
-            raw,
-            libc::IPPROTO_IPV6,
-            libc::IPV6_V6ONLY,
-            &off as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as u32,
-        );
-        let mut sin6: libc::sockaddr_in6 = std::mem::zeroed();
-        sin6.sin6_family = libc::AF_INET6 as _;
-        sin6.sin6_port = port.to_be();
-        sin6.sin6_addr = libc::in6_addr { s6_addr: [0; 16] };
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        {
-            sin6.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
-        }
-        let r = libc::bind(
-            raw,
-            &sin6 as *const _ as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-        );
-        if r != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(UdpSocket::from(fd))
+    // F1：CLOEXEC 在创建时落下（`sysock::socket` 单源——linux/OHOS 原子位；darwin
+    // 建后补；windows 句柄默认不可继承）——失败路径随 SysSock drop 关。
+    let any6 = SocketAddr::from((Ipv6Addr::UNSPECIFIED, port));
+    let packed = crate::sysock::pack_addr(&any6);
+    let sock = crate::sysock::socket(packed.domain, crate::sysock::SOCK_DGRAM)?;
+    // V6ONLY 设置失败按 best-effort 忽略（旧形态 `let _ =` 同口径——bind 会按系统
+    // 默认继续，`is_dual_stack` 运行期检测兜底）。
+    let _ = crate::sysock::setsockopt_i32(
+        crate::sysock::sock_raw(&sock),
+        crate::sysock::IPPROTO_IPV6,
+        crate::sysock::IPV6_V6ONLY,
+        0,
+    );
+    crate::sysock::bind(&sock, &packed)?;
+    Ok(crate::sysock::into_udp_socket(sock))
 }
 
 /// v6 **单栈** UDP socket（IP 字面量绑定的 v6 形态——Go `ListenUDP("udp6", …)` 显式
 /// `IPV6_V6ONLY=1` 同义：std bind 的 v6 socket 用系统默认（多为 0），须显式设 1）。
 pub(crate) fn bind_v6_only(ip: std::net::Ipv6Addr, port: u16) -> io::Result<UdpSocket> {
-    // F1：CLOEXEC 创建即落（分派同 bind_dual_stack）。
-    let fd = crate::sysfd::socket_cloexec(libc::AF_INET6, libc::SOCK_DGRAM, 0)?;
-    let raw = std::os::fd::AsRawFd::as_raw_fd(&fd);
-    unsafe {
-        let on: libc::c_int = 1;
-        let _ = libc::setsockopt(
-            raw,
-            libc::IPPROTO_IPV6,
-            libc::IPV6_V6ONLY,
-            &on as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as u32,
-        );
-        let mut sin6: libc::sockaddr_in6 = std::mem::zeroed();
-        sin6.sin6_family = libc::AF_INET6 as _;
-        sin6.sin6_port = port.to_be();
-        sin6.sin6_addr = libc::in6_addr { s6_addr: ip.octets() };
-        #[cfg(any(target_os = "macos", target_os = "ios"))]
-        {
-            sin6.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
-        }
-        let r = libc::bind(
-            raw,
-            &sin6 as *const _ as *const libc::sockaddr,
-            std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t,
-        );
-        if r != 0 {
-            return Err(io::Error::last_os_error());
-        }
-    }
-    Ok(UdpSocket::from(fd))
+    let a = SocketAddr::from((ip, port));
+    let packed = crate::sysock::pack_addr(&a);
+    let sock = crate::sysock::socket(packed.domain, crate::sysock::SOCK_DGRAM)?;
+    crate::sysock::setsockopt_i32(
+        crate::sysock::sock_raw(&sock),
+        crate::sysock::IPPROTO_IPV6,
+        crate::sysock::IPV6_V6ONLY,
+        1,
+    )?;
+    crate::sysock::bind(&sock, &packed)?;
+    Ok(crate::sysock::into_udp_socket(sock))
 }
 
 /// socket 是否为 v6 双栈（AF_INET6 且 `IPV6_V6ONLY=0`——getsockopt 运行期检测；
 /// v4 socket 上该选项报 ENOPROTOOPT ⇒ 非 dual）。`homeway-quic` 的 `exit/socket.rs` 有
 /// 同款复刻（该 crate 是叶子、不得依赖本 crate）。
 pub(crate) fn is_dual_stack(sock: &UdpSocket) -> bool {
-    use std::os::fd::AsRawFd as _;
-    unsafe {
-        let mut v: libc::c_int = 1;
-        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        let r = libc::getsockopt(
-            sock.as_raw_fd(),
-            libc::IPPROTO_IPV6,
-            libc::IPV6_V6ONLY,
-            &mut v as *mut _ as *mut libc::c_void,
-            &mut len,
-        );
-        r == 0 && v == 0
-    }
+    let raw = {
+        #[cfg(unix)]
+        {
+            std::os::fd::AsRawFd::as_raw_fd(sock)
+        }
+        #[cfg(windows)]
+        {
+            std::os::windows::io::AsRawSocket::as_raw_socket(sock)
+        }
+    };
+    matches!(
+        crate::sysock::getsockopt_i32(raw, crate::sysock::IPPROTO_IPV6, crate::sysock::IPV6_V6ONLY),
+        Ok(0)
+    )
 }
 
 /// 发送目标的族适配：双栈 socket 发 v4 目标须 map 成 v4-mapped（AF_INET6 的

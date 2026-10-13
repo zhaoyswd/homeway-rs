@@ -199,13 +199,11 @@ pub(crate) fn classify_send_err(e: &std::io::Error) -> SendErrClass {
     if e.kind() == std::io::ErrorKind::WouldBlock {
         return SendErrClass::WouldBlock;
     }
-    match e.raw_os_error() {
-        Some(libc::ENETUNREACH)
-        | Some(libc::EHOSTUNREACH)
-        | Some(libc::EADDRNOTAVAIL)
-        | Some(libc::ENETDOWN)
-        | Some(libc::EINVAL) => SendErrClass::Local,
-        _ => SendErrClass::Other,
+    // WIN 批：本地族白名单经 sysio（windows = WSAE* 值域）。
+    if crate::sysio::is_local_net_err(e) {
+        SendErrClass::Local
+    } else {
+        SendErrClass::Other
     }
 }
 
@@ -226,20 +224,11 @@ pub(crate) fn note_send_err(st: &mut SockStats, e: &std::io::Error, now: std::ti
 }
 
 /// 读回 socket 缓冲设定值（`getsockopt`；失败返回 `None`——只作读数，不参与判定）。
-fn get_sockbuf(sock: &std::net::UdpSocket, opt: libc::c_int) -> Option<usize> {
-    let mut v: libc::c_int = 0;
-    let mut len = std::mem::size_of_val(&v) as libc::socklen_t;
-    // SAFETY：`getsockopt` 写 `v` 的 4 字节（`len` 初值 = 其长度）
-    let r = unsafe {
-        libc::getsockopt(
-            std::os::fd::AsRawFd::as_raw_fd(sock),
-            libc::SOL_SOCKET,
-            opt,
-            std::ptr::addr_of_mut!(v).cast(),
-            &mut len,
-        )
-    };
-    (r == 0).then_some(v.max(0) as usize)
+/// WIN 批：经 sysio（unix 臂与原 libc 直调同形）。
+fn get_sockbuf(sock: &std::net::UdpSocket, opt: i32) -> Option<usize> {
+    crate::sysio::getsockopt_i32(crate::sysio::udp_raw(sock), crate::sysio::SOL_SOCKET, opt)
+        .ok()
+        .map(|v| v.max(0) as usize)
 }
 
 /// 岛侧抽象 socket（`quinn::AsyncUdpSocket`）：直连裸包 + 中继包封/剥壳。
@@ -285,24 +274,21 @@ impl ClientSock {
         // 核内会把设定值翻倍记账（Linux 口径），故内存账按 2× 记（登记面见 M6.7 记录）。
         const RCVBUF: usize = 2 * 1024 * 1024;
         const SNDBUF: usize = 1024 * 1024;
-        for (opt, want) in [(libc::SO_RCVBUF, RCVBUF), (libc::SO_SNDBUF, SNDBUF)] {
-            let v = libc::c_int::try_from(want).unwrap_or(libc::c_int::MAX);
-            // SAFETY：`setsockopt` 只读 `v` 的 4 字节；失败**不致命**（沿用内核缺省 + 记行）
-            let r = unsafe {
-                libc::setsockopt(
-                    std::os::fd::AsRawFd::as_raw_fd(&std_sock),
-                    libc::SOL_SOCKET,
-                    opt,
-                    std::ptr::addr_of!(v).cast(),
-                    std::mem::size_of_val(&v) as libc::socklen_t,
-                )
-            };
+        for (opt, want) in [(crate::sysio::SO_RCVBUF, RCVBUF), (crate::sysio::SO_SNDBUF, SNDBUF)] {
+            let v = i32::try_from(want).unwrap_or(i32::MAX);
+            // setsockopt 失败**不致命**（沿用内核缺省 + 记行）——sysio 同形收口（WIN 批）。
+            let r = crate::sysio::setsockopt_i32(
+                crate::sysio::udp_raw(&std_sock),
+                crate::sysio::SOL_SOCKET,
+                opt,
+                v,
+            );
             let got = get_sockbuf(&std_sock, opt);
             (*logf)(&format!(
                 "岛 socket 缓冲（{}）：设定 {want}B，读回 {}B{}",
-                if opt == libc::SO_RCVBUF { "SO_RCVBUF（下行接收）" } else { "SO_SNDBUF（上行发送）" },
+                if opt == crate::sysio::SO_RCVBUF { "SO_RCVBUF（下行接收）" } else { "SO_SNDBUF（上行发送）" },
                 got.map(|g| g.to_string()).unwrap_or_else(|| "?".into()),
-                if r == 0 { "" } else { "（setsockopt 失败——沿用内核缺省）" }
+                if r.is_ok() { "" } else { "（setsockopt 失败——沿用内核缺省）" }
             ));
         }
         std_sock.set_nonblocking(true)?;

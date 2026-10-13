@@ -170,3 +170,35 @@ unix 臂语义不动，windows 臂按 winsock 值域自然工作，个别形态�
 | msvc libc 符号面窄（无 localtime/socket/poll） | 全部走 D1/D4/D6 收口，不散写 |
 | `cargo test` 在 windows 未跑（用例面 unix 化） | 非目标登记；windows 测试面另立批 |
 | SetConsoleCtrlHandler 与阻塞读的竞态（handler 线程写 socket 时主线程已收线） | 唤醒对生命周期 = 进程级（不提前 drop），写失败即已停止——幂等 |
+
+## 4. 实现注记（收口时补；差异/钉子如实登记）
+
+1. **unix 行为零变化的载体**：`sysock`/`sysio` 的 unix 臂全部 = 原 libc 直调（包一层
+   inline 同形函数）；reactor/relay/engine 的 poll 调用点、egress 钉卡、udpbatch 双栈、
+   ctlface 读写均经此收口——unix 侧由全量测试（core 682 + quic 222 + cli 43）+ ci-local
+   八步门（矩阵 RRR 全过）背书。
+2. **windows-sys 0.59 的实测钉**（都已写进代码注释）：
+   - `IP_ADAPTER_ADDRESSES_LH` 需要 features `Ndis`+`WinSock` 双开（联合类型才导出）；
+   - `FIXED_INFO` 实名 `FIXED_INFO_W2KSP1`；`WSAData` 实名 `WSADATA`；`MAKEWORD`/
+     `TIME_ZONE_ID_*` 未导出（字面常量内联）；`WSAPOLLFD` 的字段名是 `fd`；
+     `SOCKET`=usize（本仓 RawSock 取 u64=RawSocket 宽度，调用点收窄 cast）。
+   - `GetAdaptersAddresses` 的 IfIndex 藏在 `Anonymous1.Anonymous.IfIndex` 双层联合。
+3. **唤醒对/停止管道的 syscall 分派**（实测 bug 修复）：unix 的唤醒对是**管道**——
+   socket 系 `send/recv` 对 pipe fd 报 ENOTSOCK ⇒ `wake_signal/wake_drain/stopsig` 在
+   unix 臂走 `write/read(2)`、windows 臂（回环 TCP 对）走 `send/recv`。
+4. **intake 承载流**：quic 的 `SvcStream`（unix=UnixStream / windows=回环 TCP）跨 crate
+   公开，core 侧 `files_server::intake_conn` 归 wrap 成 `IpcStream`（服务本体只见
+   IpcStream）。`ServiceIntake::from_listener/with_quic`（UDS 调试腿）= unix-only；
+   windows 装配走 `quic_only`（主入口 STREAM 不缺面）。
+5. **本地交叉 check 配方**（ring C 面无 MSVC 时的替代）：
+   `PATH="$PWD/tools/cc-check-shim/bin:$PATH" CC_x86_64_pc_windows_msvc=clang
+   CFLAGS_x86_64_pc_windows_msvc="-nostdlibinc -DRING_CORE_NOSTDLIBINC -isystem
+   $PWD/tools/cc-check-shim" cargo check --target x86_64-pc-windows-msvc -p homeway-core
+   -p homeway-cli -p homeway-quic --locked`（垫片 = cc-check-shim 的 stdlib.h 补
+   `_byteswap_*` + no-op `lib.exe`；与 OHOS/musl 交叉 check 同纪律——check-only）。
+6. **代理（棒子）完成面**：IPC 替换（daemon/files/speedtest/engine/dns_stream）、锁
+   （syslock）、权限位 cfg 对（identity/nodestate/artifact/state/carriers）、
+   `disk_free_bytes`、portfwd `pf_bind` windows 臂。已登记的 8 条风险点见其完成报告
+   （其中「EACCES 归入 Held」「accept 循环重写」两条在评审门复核）。
+7. **残留非目标**：windows 测试面（用例 unix 化）；`homeway term` 在 windows 明确报
+   「不支持」；`homeway-capi` 不进 windows 面。

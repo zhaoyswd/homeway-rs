@@ -61,8 +61,8 @@ use crate::identity::{self, Identity, IdentitySource};
 use crate::token::Token;
 use crate::Logf;
 
-use super::bridge_host::{BridgeStream, WriteHalf};
-use super::tun_exec::write_retry_backoff;
+use super::bridge_io::{BridgeStream, WriteHalf};
+use super::quic_stream::write_retry_backoff;
 
 // ---------- 节拍常量（与连接行为真源同值；见 `tier:docs/agents/connection-lifecycle.md`） ----------
 
@@ -95,16 +95,16 @@ impl ServicePort {
     }
 
     pub fn files() -> ServicePort {
-        ServicePort(super::bridge_host::port::FILES)
+        ServicePort(super::bridge_io::port::FILES)
     }
 
     pub fn term() -> ServicePort {
         // term 端口是**可配面**（`HOMEWAY_TERM_PORT`）——真源恒走 `term_port()`。
-        ServicePort(super::bridge_host::term_port())
+        ServicePort(super::bridge_io::term_port())
     }
 
     pub fn speedtest() -> ServicePort {
-        ServicePort(super::bridge_host::port::SPEEDTEST)
+        ServicePort(super::bridge_io::port::SPEEDTEST)
     }
 
     /// 原端口值（判据行/日志面用）。
@@ -1102,7 +1102,7 @@ mod tests {
         assert!(ServicePort::from_bridge_port(0).is_none());
         assert!(ServicePort::from_bridge_port(80).is_none());
         assert_eq!(
-            ServicePort::from_bridge_port(super::super::bridge_host::port::FILES)
+            ServicePort::from_bridge_port(super::super::bridge_io::port::FILES)
                 .map(|p| p.get()),
             Some(7802)
         );

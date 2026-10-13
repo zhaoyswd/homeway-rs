@@ -67,6 +67,7 @@ mod reg4;
 mod rpk;
 /// **STREAM 协议面**（M3 §1：tag 单源 / 复位码表 / `StreamErr`；纯 std）。
 pub mod stream;
+pub mod sysio;
 mod sync_util;
 /// **可配常量面**（M3 §15-2/§15-3：流窗口/并发/待发队列 + 快探参数；纯 std）。
 pub mod tuning;

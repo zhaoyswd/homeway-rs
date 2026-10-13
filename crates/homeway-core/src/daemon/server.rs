@@ -27,13 +27,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{ErrorKind, Read, Write};
-use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
 use super::bus::{Bus, SubscribeErr, Subscriber};
 use super::frame::{self, FrameError, Op};
+use super::ipc::{IpcListener, IpcStream};
 use super::listen::ListenError;
 use super::proto::*;
 use super::vocab;
@@ -118,14 +118,14 @@ impl ControlServer {
     /// 接入循环（阻塞；正常 shutdown 后返回 Ok）。瞬态 accept 错误（连接中断/
     /// fd 短缺类）同一 listener 有界退避重试；其余（listener 失效类）返回错误由
     /// 调用方（控制角色）上抛走退避重建。
-    pub fn serve(self: &Arc<Self>, ln: UnixListener) -> Result<(), ListenError> {
+    pub fn serve(self: &Arc<Self>, ln: IpcListener) -> Result<(), ListenError> {
         // 非阻塞 accept + 节拍轮询：listener 所有权在本线程（shutdown 侧无法关它），
         // 轮询 shutting_down 才能保证 serve() 在收工后可返回（角色线程可 join）。
         ln.set_nonblocking(true).map_err(|e| ListenError::Bind(e.to_string()))?;
         let mut retry = Duration::ZERO;
         loop {
             match ln.accept() {
-                Ok((stream, _)) => {
+                Ok(stream) => {
                     retry = Duration::ZERO;
                     // Q-H F5：先回收已结束的连接线程句柄（此前只增不减——
                     // shutdown 才 drain）；随后按并发上限裁决。
@@ -195,7 +195,7 @@ impl ControlServer {
     /// 低-1（D-2 收敛）：连接线程/fd 克隆失败（资源耗尽级）= **该连接降级关闭**，
     /// 不带走进程（原 expect 形态把外部可触发的 EMFILE 变成整进程 panic）。任一步
     /// 失败：已起的线程随 conn.close 的收工语义自灭，接入循环继续。
-    fn spawn_conn(self: &Arc<Self>, stream: std::os::unix::net::UnixStream) -> Option<Arc<ConnShared>> {
+    fn spawn_conn(self: &Arc<Self>, stream: IpcStream) -> Option<Arc<ConnShared>> {
         let _ = stream.set_nonblocking(false);
         let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
         let _ = stream.set_write_timeout(Some(WRITE_STALL_TIMEOUT));
@@ -315,7 +315,19 @@ fn transient_accept_error(e: &std::io::Error) -> bool {
             | ErrorKind::ConnectionReset
             | ErrorKind::Interrupted
             | ErrorKind::WouldBlock
-    ) || matches!(e.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOMEM))
+    ) || fd_shortage_errno(e)
+}
+
+/// fd/内存短缺族 errno（unix = libc 面）。WIN 批（设计 §D13）：windows 走通用
+/// （永久）错误路径——EMFILE 族在 winsock 罕见，分类本就是 best-effort。
+#[cfg(unix)]
+fn fd_shortage_errno(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOMEM))
+}
+
+#[cfg(windows)]
+fn fd_shortage_errno(_e: &std::io::Error) -> bool {
+    false
 }
 
 // ---------- 连接 ----------
@@ -344,7 +356,7 @@ struct StreamTable {
 struct ConnShared {
     srv: Arc<ControlServer>,
     /// 收工用的第三句柄（shutdown 解阻塞 reader 的阻塞读）。
-    ctl_sock: Mutex<std::os::unix::net::UnixStream>,
+    ctl_sock: Mutex<IpcStream>,
     /// 连接建立时刻（Q-H F5：未握手超期的判据基点）。
     accepted_at: Instant,
     closed: AtomicBool,
@@ -430,7 +442,7 @@ impl ConnShared {
 
     // ---------- reader ----------
 
-    fn reader_main(&self, mut sock: std::os::unix::net::UnixStream) {
+    fn reader_main(&self, mut sock: IpcStream) {
         let mut buf: Vec<u8> = Vec::new(); // 半帧缓冲（读超时中断后的续读面）
         loop {
             // Q-H F5：握手期限的读侧期限（**慢滴水防御**——半帧/半体持续有进展时
@@ -1235,7 +1247,7 @@ impl ConnShared {
 
     // ---------- writer（唯一 socket 写者，优先级排空） ----------
 
-    fn writer_main(&self, mut sock: std::os::unix::net::UnixStream) {
+    fn writer_main(&self, mut sock: IpcStream) {
         loop {
             if self.is_closed() {
                 // 收工：high 队列里可能还有告别帧——排空一次后退出。
@@ -1274,7 +1286,7 @@ impl ConnShared {
     }
 
     /// 排空 high 队列；false = 写失败（连接收工）。
-    fn drain_high(&self, sock: &mut std::os::unix::net::UnixStream) -> bool {
+    fn drain_high(&self, sock: &mut IpcStream) -> bool {
         loop {
             let item = {
                 let mut q = self.out.lock().unwrap_or_else(|e| e.into_inner());
@@ -1324,7 +1336,7 @@ impl ConnShared {
 
     /// 事件非阻塞一条。门闩置位 = 跳过；overrun = `goodbye(overrun)` 断连（不静默
     /// 丢事件）。
-    fn write_one_event(&self, sock: &mut std::os::unix::net::UnixStream) -> EventStep {
+    fn write_one_event(&self, sock: &mut IpcStream) -> EventStep {
         let sub = self.sub.lock().unwrap_or_else(|e| e.into_inner()).clone();
         let Some(sub) = sub else { return EventStep::Idle };
         if sub.overrun() {
@@ -1357,7 +1369,7 @@ impl ConnShared {
 
     /// 流公平轮询一条（data 或 end 标记——end 与该流数据同队列 FIFO：「end 之前的
     /// 数据先送达、end 之后绝无该流数据」）。返回 true = 有产出。
-    fn write_one_stream_item(&self, sock: &mut std::os::unix::net::UnixStream) -> bool {
+    fn write_one_stream_item(&self, sock: &mut IpcStream) -> bool {
         let streams: Vec<Arc<Stream>> = {
             let st = self.streams.lock().unwrap_or_else(|e| e.into_inner());
             st.map.values().cloned().collect()
@@ -1393,7 +1405,7 @@ impl ConnShared {
     }
 
     /// 写一帧字节（写停滞看门狗 = socket 写超时 30s；失败 = 连接收工）。
-    fn write_bytes(&self, sock: &mut std::os::unix::net::UnixStream, f: &[u8]) -> bool {
+    fn write_bytes(&self, sock: &mut IpcStream, f: &[u8]) -> bool {
         match sock.write_all(f) {
             Ok(()) => true,
             Err(_) => {
@@ -1404,7 +1416,7 @@ impl ConnShared {
     }
 
     /// writer 侧致命路径（overrun：告别帧同步写出后断连——走 high 队列已无意义）。
-    fn fatal_from_writer(&self, sock: &mut std::os::unix::net::UnixStream, reason: &str) {
+    fn fatal_from_writer(&self, sock: &mut IpcStream, reason: &str) {
         let _ = sock.set_write_timeout(Some(Duration::from_secs(2)));
         let f = encode_json_frame(Op::Goodbye, &GoodbyeBody { reason: reason.to_owned() });
         let _ = sock.write_all(&f);
@@ -1653,7 +1665,7 @@ fn map_backend_err(e: super::proto::BackendErr) -> OpError {
 /// 从 socket + 残余缓冲读 5 字节帧头。Ok(None) = 读超时节拍（无进展）或
 /// `deadline` 到点（Q-H F5 的读侧期限——慢滴水防御；调用方负责归因/断开）。
 pub(super) fn read_head_deadline(
-    sock: &mut std::os::unix::net::UnixStream,
+    sock: &mut IpcStream,
     buf: &mut Vec<u8>,
     deadline: Option<Instant>,
 ) -> Result<Option<frame::FrameHead>, FrameError> {
@@ -1679,14 +1691,14 @@ pub(super) fn read_head_deadline(
 
 /// 无期限薄壳（客户端与其他既有调用面）。
 pub(super) fn read_head(
-    sock: &mut std::os::unix::net::UnixStream,
+    sock: &mut IpcStream,
     buf: &mut Vec<u8>,
 ) -> Result<Option<frame::FrameHead>, FrameError> {
     read_head_deadline(sock, buf, None)
 }
 
 pub(super) fn read_body_buf(
-    sock: &mut std::os::unix::net::UnixStream,
+    sock: &mut IpcStream,
     buf: &mut Vec<u8>,
     head: frame::FrameHead,
 ) -> Result<Vec<u8>, FrameError> {
@@ -1696,7 +1708,7 @@ pub(super) fn read_body_buf(
 
 /// 带期限的半体续读（Q-H F5；Ok(None) = 期限到点——半体缓冲**保留**，调用方归因）。
 pub(super) fn read_body_buf_deadline(
-    sock: &mut std::os::unix::net::UnixStream,
+    sock: &mut IpcStream,
     buf: &mut Vec<u8>,
     head: frame::FrameHead,
     deadline: Option<Instant>,
@@ -1714,7 +1726,7 @@ pub(super) fn read_body_buf_deadline(
 
 /// 填一块；false = 本拍无数据（读超时节拍——10ms 缓冲后返回，防忙等）。
 pub(super) fn fill(
-    sock: &mut std::os::unix::net::UnixStream,
+    sock: &mut IpcStream,
     buf: &mut Vec<u8>,
 ) -> Result<bool, FrameError> {
     let mut tmp = [0u8; 16 * 1024];

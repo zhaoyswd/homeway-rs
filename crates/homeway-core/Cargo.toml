@@ -18,17 +18,26 @@ libc.workspace = true
 # 端点缓存落盘（与 Go 字节对齐的持久化 JSON——键序/omitempty 语义面，R2）
 serde.workspace = true
 serde_json.workspace = true
-# R6 term 服务面（alacritty = 仿真底座；flate2 = surface gzip；fnv = golden digest；
-# toml = manifest 规则文件；regex = manifest 方言垫片）
-alacritty_terminal.workspace = true
+# R6 term 服务面（flate2 = surface gzip；fnv = golden digest；toml = manifest 规则文件；
+# regex = manifest 方言垫片——这四条也被 term 之外的面消费，保持无条件依赖；
+# alacritty/portable-pty 两条 term 专属已随上面 target 段门控）
 toml.workspace = true
-portable-pty.workspace = true
 flate2.workspace = true
 fnv.workspace = true
 regex.workspace = true
 # M0 传输层换代：QUIC 岛（异步栈自持在岛内；本 crate **不声明**它，故同步面写不出
 # 异步代码——源码零引用，M1 才接线。见 docs/reviews/M0-design.md §3.4 层 0/层 1）
 homeway-quic = { path = "../homeway-quic" }
+
+# WIN 批（2026-10-13）：term 面依赖只在非 windows 目标声明（term 在 windows 不装配——
+# 用户指令豁免面；依赖随模块门控，windows 构建面收窄）。
+[target.'cfg(not(windows))'.dependencies]
+alacritty_terminal.workspace = true
+portable-pty.workspace = true
+
+# WIN 批（2026-10-13）：windows 系统面（socket/poll/文件锁/时区/控制台/网卡/磁盘）。
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
 
 [dev-dependencies]
 serde = { version = "1", features = ["derive"] }

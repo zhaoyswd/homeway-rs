@@ -31,8 +31,8 @@ use std::time::{Duration, Instant};
 
 use serde::Deserialize;
 
-use super::bridge_host::BridgeStream;
-use super::tun_shared::lock_unpoison;
+use super::bridge_io::BridgeStream;
+use crate::syncutil::lock_unpoison;
 use crate::Logf;
 use crate::PortfwdErr;
 
@@ -311,8 +311,11 @@ pub fn parse_rules_json(cfg: &str) -> Result<Vec<PortForwardRule>, TableErr> {
 
 // ---------------------------------------------------------------------------
 // 运行时（真监听器）
+// WIN 批门控：以下运行时半边（真监听器/泵/拨号缝/阀）是 App 世代面（tun_exec 消费），
+// windows 不编译——CLI/daemon 承载面只消费上半边的规则表件（MIN_PORT/Rule/文本/JSON）。
 // ---------------------------------------------------------------------------
 
+#[cfg(not(windows))]
 /// 运行时上限（注入面：生产 = 8 / 256；测试用小阀值直喂）。
 #[derive(Debug, Clone, Copy)]
 pub struct PfLimits {
@@ -320,6 +323,7 @@ pub struct PfLimits {
     pub max_flows: u64,
 }
 
+#[cfg(not(windows))]
 impl Default for PfLimits {
     fn default() -> Self {
         PfLimits {
@@ -329,6 +333,7 @@ impl Default for PfLimits {
     }
 }
 
+#[cfg(not(windows))]
 /// 运行时计数（全部 `AtomicU64`，类型一致）。
 #[derive(Debug, Default)]
 pub struct PfCounters {
@@ -338,6 +343,7 @@ pub struct PfCounters {
     flow_rejected: AtomicU64,
 }
 
+#[cfg(not(windows))]
 impl PfCounters {
     /// accept 准入的转发连接数（`stats.pfAccepted` 源）。
     pub fn accepted(&self) -> u64 {
@@ -357,11 +363,13 @@ impl PfCounters {
     }
 }
 
+#[cfg(not(windows))]
 /// 拨号缝（全注入——运行时**不依赖 `GenRun`**：纯回环可测；生产闭包持
 /// `Weak<GenRun>` 防 Arc 环 ⇒ 世代可回收）。
 pub type PfDialFn =
     Arc<dyn Fn(SocketAddrV4, Duration) -> io::Result<Box<dyn BridgeStream>> + Send + Sync>;
 
+#[cfg(not(windows))]
 /// 监听器退出 ack 的等待结果（`Disconnected` = 线程已退出 = fd 已关，**不是**超时）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AckOutcome {
@@ -370,9 +378,11 @@ pub enum AckOutcome {
     Timeout,
 }
 
+#[cfg(not(windows))]
 /// ack 等待缝（测试注入「永不 ack / 慢 ack」直喂超时路径；生产 = 有界 `recv_timeout`）。
 pub type AckWaitFn = Arc<dyn Fn(&mpsc::Receiver<()>, Duration) -> AckOutcome + Send + Sync>;
 
+#[cfg(not(windows))]
 fn wait_ack_default(rx: &mpsc::Receiver<()>, budget: Duration) -> AckOutcome {
     match rx.recv_timeout(budget) {
         Ok(()) => AckOutcome::Acked,
@@ -381,6 +391,7 @@ fn wait_ack_default(rx: &mpsc::Receiver<()>, budget: Duration) -> AckOutcome {
     }
 }
 
+#[cfg(not(windows))]
 /// 运行时装配参数（注入面）。
 pub struct PfSetup {
     pub dial: PfDialFn,
@@ -392,6 +403,7 @@ pub struct PfSetup {
     pub limits: PfLimits,
 }
 
+#[cfg(not(windows))]
 /// 线程共享面（accept/conn/泵线程只持它，不持整个运行时）。
 struct PfContext {
     counters: Arc<PfCounters>,
@@ -405,6 +417,7 @@ struct PfContext {
     conn_spawns: AtomicU64,
 }
 
+#[cfg(not(windows))]
 /// 一个在册监听器（**不持 listener fd**——fd 随 accept 线程走；`acked` 收到即在
 /// 「fd 确已关」之后，是端口释放的可观测证据）。
 struct PfListener {
@@ -414,12 +427,14 @@ struct PfListener {
     handle: JoinHandle<()>,
 }
 
+#[cfg(not(windows))]
 struct PfInner {
     /// 新表就位前原地保留（否则状态面出现「空表」第三态）。
     states: Vec<Arc<PfState>>,
     lns: Vec<PfListener>,
 }
 
+#[cfg(not(windows))]
 /// `install` 阶段 3 的**暂存守卫**（代码门 r27 P3）：已 spawn 但尚未换入 `inner` 的
 /// 监听器不在 `stop_all` 的视野里——本守卫在 drop（含 panic 展开 / 任何早退）时对
 /// 未提交条目置停止位，线程 ≤1 拍自退、fd 即关 ⇒ 孤儿窗口收敛为 0。
@@ -428,6 +443,7 @@ struct StagedLns {
     committed: bool,
 }
 
+#[cfg(not(windows))]
 impl Drop for StagedLns {
     fn drop(&mut self) {
         if !self.committed {
@@ -438,6 +454,7 @@ impl Drop for StagedLns {
     }
 }
 
+#[cfg(not(windows))]
 /// portfwd 运行时（规则替换 / 真监听 / 真计数）。
 pub struct PfRuntime {
     /// install / stop_all 串行（长动作——bind/等 ack/spawn——全在状态锁外）。
@@ -451,6 +468,7 @@ pub struct PfRuntime {
     swap_seam: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
+#[cfg(not(windows))]
 impl PfRuntime {
     pub fn new(setup: PfSetup) -> Self {
         PfRuntime {
@@ -722,6 +740,7 @@ impl PfRuntime {
     }
 }
 
+#[cfg(not(windows))]
 /// 装配期防御面（tunConfig 旁路可达的破损配置——逐条、不影响其余条目）：
 /// `listen` 非法 / 超条数 / `target_ip` 非法 一律**不 bind** + `failed` 空码 + 精确 err。
 ///
@@ -749,6 +768,7 @@ fn defensive_err(r: &PortForwardRule, idx: usize, max_rules: usize) -> Option<St
     None
 }
 
+#[cfg(not(windows))]
 /// bind `127.0.0.1:{listen}`（F6 语义对齐 Go `net.Listen`）：`SOCK_CLOEXEC` +
 /// `SO_REUSEADDR` + backlog 128 + 非阻塞；**单次尝试不重试**（重试语义在调用方）。
 /// 地址**硬编码回环**（无配置面、无 `0.0.0.0` 退路——局域网不可达由绑定地址保证）。
@@ -797,6 +817,21 @@ pub(crate) fn pf_bind(listen: u16) -> io::Result<TcpListener> {
     Ok(ln)
 }
 
+#[cfg(not(windows))]
+/// bind `127.0.0.1:{listen}`（windows 臂；WIN 批 §D4）：std `TcpListener::bind` +
+/// `set_nonblocking(true)`——地址硬编码回环同 unix 臂；SO_REUSEADDR 是 unix 臂的
+/// 重 bind 补偿面（windows 由系统 TIME_WAIT 语义兜底）。accept 带超时的就绪等待
+/// 在 unix 走 `poll_readable`（`poll(2)`）；windows 侧的等价面 = `sysock`
+/// （`AsRawSocket` 取 `RawSock` + `poll_slice` 的 WSAPoll 同形 API），随本文件的
+/// accept 线程面 windows 化一并接线。
+#[cfg(windows)]
+pub(crate) fn pf_bind(listen: u16) -> io::Result<TcpListener> {
+    let ln = TcpListener::bind((Ipv4Addr::LOCALHOST, listen))?;
+    ln.set_nonblocking(true)?;
+    Ok(ln)
+}
+
+#[cfg(not(windows))]
 /// `poll(2)` 等监听 fd 可读（≤`timeout_ms`）；到点返回 `Ok(())`（由 `accept` 裁决）。
 fn poll_readable(fd: std::os::fd::RawFd, timeout_ms: i32) -> io::Result<()> {
     let mut pfd = libc::pollfd {
@@ -815,6 +850,7 @@ fn poll_readable(fd: std::os::fd::RawFd, timeout_ms: i32) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(not(windows))]
 /// accept 线程体（fd 单属本线程；退出 ack 由 [`ListenerExit`] 在 **fd 关闭之后**投出）。
 fn pf_accept_thread(
     ctx: Arc<PfContext>,
@@ -843,6 +879,7 @@ fn pf_accept_thread(
     accept_serve(&ctx, listen, &st, &own_stop, &dst, &mut accept);
 }
 
+#[cfg(not(windows))]
 /// accept 线程的退出守卫：drop 即「关 fd → 投 ack」（fd 已关 = 端口释放的可观测证据）；
 /// panic 展开路径同样保证「ack 在 fd 之后」，并把该条状态转 `failed`——accept 线程异常
 /// 退出与致命错误同族：端口已释放而状态还报 `listening` 就是谎报（代码门 r27 P2）。
@@ -852,6 +889,7 @@ struct ListenerExit {
     state: Arc<PfState>,
 }
 
+#[cfg(not(windows))]
 impl Drop for ListenerExit {
     fn drop(&mut self) {
         if std::thread::panicking() {
@@ -866,6 +904,7 @@ impl Drop for ListenerExit {
     }
 }
 
+#[cfg(not(windows))]
 /// 可停 accept 循环（错误分类走共享件 `files_server::classify_accept_err`；`accept`
 /// 可注入 ⇒ 「一次致命错误后状态转 failed」与「瞬态退避不退出」可测）。
 fn accept_serve<A>(
@@ -920,6 +959,7 @@ fn accept_serve<A>(
     }
 }
 
+#[cfg(not(windows))]
 /// 准入（**在 accept 线程内**，Go 形）：阀 → RAII `FlowGuard` → spawn conn 线程。
 /// 阀先于线程创建 ⇒ 它同时是「在册流」与「线程创建」的上界（超限连接不进线程）。
 fn admit_conn(
@@ -961,6 +1001,7 @@ fn admit_conn(
     }
 }
 
+#[cfg(not(windows))]
 /// 准入守卫（RAII 承担资源不变量）：`conns -= 1` 与 `flows -= 1` 在最后一枚持有者
 /// 结束时自动发生（泵线程各持一份 `Arc<FlowGuard>`——两向都收工才回退；`accepted`
 /// 只增）。
@@ -969,6 +1010,7 @@ struct FlowGuard {
     state: Arc<PfState>,
 }
 
+#[cfg(not(windows))]
 impl FlowGuard {
     /// 准入（`flows` 的 +1 已由阀判定完成；本件负责三条计数的**回退**与 accepted/conns 的 +1）。
     fn admit(counters: &Arc<PfCounters>, state: &Arc<PfState>) -> Self {
@@ -981,6 +1023,7 @@ impl FlowGuard {
     }
 }
 
+#[cfg(not(windows))]
 impl Drop for FlowGuard {
     fn drop(&mut self) {
         self.state.conns.fetch_sub(1, Ordering::Relaxed);
@@ -988,6 +1031,7 @@ impl Drop for FlowGuard {
     }
 }
 
+#[cfg(not(windows))]
 /// 一条入站连接：裸拨（F2/D11——**不复用 `healing_dial`**，常态拒绝不许触发恢复阶梯）
 /// → 成功则双向泵（复用 `bridge_host::pump`，EOF 零日志——对齐 Go `pkg/netpipe`）；
 /// 失败 ⇒ `fails += 1` + **RST 收口**（`SO_LINGER(0)`；优雅 FIN 会让应用把「连上后

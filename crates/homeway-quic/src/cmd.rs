@@ -21,7 +21,9 @@ use crate::stream::{StreamErr, StreamId, StreamTag, StreamWriteOut};
 pub enum Cmd {
     /// L3 直通 attach（M1 起语义 = `wgcore::attach_tun`：**fd 所有权在扩展，岛从不 close**）。
     TunAttach {
-        fd: i32,
+        /// TUN fd（**unix** = fd / windows = SOCKET 句柄——sysio::RawIo 单源；windows
+        /// 无运行期生产者，编译面保通）。
+        fd: crate::sysio::RawIo,
         mtu: u32,
         reply: IslandReply<()>,
     },

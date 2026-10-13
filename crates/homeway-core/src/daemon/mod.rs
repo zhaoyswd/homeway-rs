@@ -17,6 +17,9 @@ pub mod carriers;
 pub mod client;
 pub mod frame;
 pub mod hosts;
+// WIN 批（2026-10-13）：IPC 承载收口（unix = UDS / windows = TCP loopback + 端口文件，
+// 设计 §D2）——listen/server/client 与 serve 侧本地服务面消费它。
+pub mod ipc;
 pub mod listen;
 pub mod proto;
 pub mod server;

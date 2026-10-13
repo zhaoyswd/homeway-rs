@@ -13,7 +13,6 @@
 
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
-use std::os::fd::AsRawFd as _;
 use std::time::{Duration, Instant};
 
 /// egress 错误面（R3-M23 类型化）：Display 文案与既有日志/判据行**同串**（消费面
@@ -109,14 +108,28 @@ pub(crate) fn is_fake_ip(ip: IpAddr) -> bool {
 }
 
 /// 名字像隧道/虚拟网卡吗（ifaceutil.IsVirtual 的前缀并集——多跳过一张虚拟卡只会让
-/// 候选少一张，不会选错上行）。
+/// 候选少一张，不会选错上行）。windows 面另加本平台虚拟卡前缀（WIN 批 §D7：vEthernet
+/// = Hyper-V/WSL、Loopback* = 系统回环、Tailscale/ZeroTier/OpenVPN/TAP = 常驻代理卡）。
 pub fn is_virtual_iface(name: &str) -> bool {
     const PREFIXES: [&str; 19] = [
         "lo", "utun", "ipsec", "gif", "stf", "awdl", "llw", "anpi", "ap", "bridge", "vmnet",
         "vmenet", "tap", "tun", "tailscale", "docker", "br-", "veth", "virbr",
     ];
+    #[cfg(windows)]
+    const WIN_PREFIXES: [&str; 7] =
+        ["loopback", "vethernet", "wsl", "zerotier", "openvpn", "hyper-v", "isatap"];
     let l = name.to_ascii_lowercase();
     PREFIXES.iter().any(|p| l.starts_with(p))
+        || {
+            #[cfg(windows)]
+            {
+                WIN_PREFIXES.iter().any(|p| l.starts_with(p))
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        }
 }
 
 /// 一张网卡的可用信息（getifaddrs 面）。
@@ -137,8 +150,21 @@ pub struct IfaceInfo {
     pub loopback: bool,
 }
 
-/// 枚举系统网卡（getifaddrs FFI；失败返回空表——候选面走「不绑」）。
+/// 枚举系统网卡（unix = getifaddrs FFI；windows = `GetAdaptersAddresses`——WIN 批
+/// §D7；失败返回空表——候选面走「不绑」）。
 pub fn interfaces() -> Vec<IfaceInfo> {
+    #[cfg(unix)]
+    {
+        interfaces_unix()
+    }
+    #[cfg(windows)]
+    {
+        interfaces_win()
+    }
+}
+
+#[cfg(unix)]
+fn interfaces_unix() -> Vec<IfaceInfo> {
     unsafe {
         let mut ifap: *mut libc::ifaddrs = std::ptr::null_mut();
         if libc::getifaddrs(&mut ifap) != 0 {
@@ -161,7 +187,7 @@ pub fn interfaces() -> Vec<IfaceInfo> {
                 if !ifa.ifa_addr.is_null()
                     && (*ifa.ifa_addr).sa_family == libc::AF_INET as libc::sa_family_t
                 {
-                    let sa = ifa.ifa_addr as *const libc::sockaddr_in;
+                        let sa = ifa.ifa_addr as *const libc::sockaddr_in;
                     let raw = (*sa).sin_addr.s_addr;
                     e.addrs.push(Ipv4Addr::from(raw.swap_bytes()));
                     if !ifa.ifa_netmask.is_null()
@@ -209,6 +235,91 @@ pub fn interfaces() -> Vec<IfaceInfo> {
     }
 }
 
+/// windows 网卡枚举（WIN 批 §D7）：`GetAdaptersAddresses`（AF_INET）——IfIndex 直取
+/// （无 unix 的 `if_nametoindex` 失败面 ⇒ `index_ok` 恒真）；OperStatus=up、
+/// IF_TYPE_SOFTWARE_LOOPBACK 回环、OnLinkPrefixLength → CIDR。
+#[cfg(windows)]
+fn interfaces_win() -> Vec<IfaceInfo> {
+    use windows_sys::Win32::Foundation::ERROR_BUFFER_OVERFLOW;
+    use windows_sys::Win32::NetworkManagement::IpHelper::GetAdaptersAddresses;
+    use windows_sys::Win32::Networking::WinSock::AF_INET;
+    use windows_sys::Win32::NetworkManagement::IpHelper::{
+        GAA_FLAG_SKIP_ANYCAST, GAA_FLAG_SKIP_MULTICAST, IP_ADAPTER_ADDRESSES_LH,
+    };
+    unsafe {
+        let mut size: u32 = 16 * 1024;
+        loop {
+            let mut buf = vec![0u8; size as usize];
+            let rc = GetAdaptersAddresses(
+                AF_INET as u32,
+                GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST,
+                std::ptr::null(),
+                buf.as_mut_ptr() as *mut IP_ADAPTER_ADDRESSES_LH,
+                &mut size,
+            );
+            match rc {
+                0 => {
+                    let mut out = Vec::new();
+                    let mut cur = buf.as_ptr() as *const IP_ADAPTER_ADDRESSES_LH;
+                    while !cur.is_null() {
+                        let a = &*cur;
+                        let name = if a.FriendlyName.is_null() {
+                            String::new()
+                        } else {
+                            widestr_to_string(a.FriendlyName)
+                        };
+                        let mut e = IfaceInfo {
+                            name,
+                            // IfIndex 在 union 联合（windows-sys 的 Anonymous.u 形态）
+                            index: unsafe { a.Anonymous1.Anonymous.IfIndex },
+                            index_ok: true,
+                            addrs: Vec::new(),
+                            cidrs: Vec::new(),
+                            up: a.OperStatus == 1, // IfOperStatusUp
+                            loopback: a.IfType == 24, // IF_TYPE_SOFTWARE_LOOPBACK
+                        };
+                        let mut ua = a.FirstUnicastAddress;
+                        while !ua.is_null() {
+                            let u = &*ua;
+                            if u.Address.lpSockaddr.is_null() {
+                                ua = u.Next;
+                                continue;
+                            }
+                            let sa = &*u.Address.lpSockaddr;
+                            if sa.sa_family == AF_INET as u16 {
+                                let sin = &*(u.Address.lpSockaddr as *const windows_sys::Win32::Networking::WinSock::SOCKADDR_IN);
+                                let raw = sin.sin_addr.S_un.S_addr;
+                                let ip = Ipv4Addr::from(raw.swap_bytes());
+                                e.addrs.push(ip);
+                                e.cidrs.push(format!("{}/{}", ip, u.OnLinkPrefixLength));
+                            }
+                            ua = u.Next;
+                        }
+                        out.push(e);
+                        cur = a.Next;
+                    }
+                    return out;
+                }
+                ERROR_BUFFER_OVERFLOW => continue, // size 已更新——扩容重试
+                _ => return Vec::new(),
+            }
+        }
+    }
+}
+
+/// `GetAdaptersAddresses` 的 FriendlyName（UTF-16）→ String。
+#[cfg(windows)]
+fn widestr_to_string(p: *const u16) -> String {
+    unsafe {
+        let mut len = 0usize;
+        while *p.add(len) != 0 {
+            len += 1;
+        }
+        let slice = std::slice::from_raw_parts(p, len);
+        String::from_utf16_lossy(slice)
+    }
+}
+
 /// 候选上行网卡（up、非回环、非虚拟、至少有一个 IPv4——PhysicalCandidates）。
 /// **F5 平台分档**：darwin 上 `index` 不可用（`index_ok=false`）= 不可钉 ⇒ 不参与候选
 /// （挑到也钉不上）；linux 按名钉卡、index 不参与 ⇒ 不过滤（多一张候选）。
@@ -243,31 +354,34 @@ pub(crate) fn iface_same(a: &IfaceInfo, b: &IfaceInfo) -> bool {
 }
 
 /// 把 UDP socket 钉在网卡上（darwin IP_BOUND_IF+IPV6_BOUND_IF 两族 / linux
-/// SO_BINDTODEVICE——ifacebind_*.go 同义；unix 面由本仓仅服务 macOS/linux）。
+/// SO_BINDTODEVICE / windows IP_UNICAST_IF+IPV6_UNICAST_IF 两族——ifacebind_*.go 同义
+/// 的平台分派；unix 面由本仓仅服务 macOS/linux，windows 面 = WIN 批 §D7）。
 ///
-/// darwin **两族都设、各自单栈容错**（Go `pinToFD` 语义）：v4-only socket 上
-/// IPV6_BOUND_IF 报 ENOPROTOOPT、v6-only socket 上 IP_BOUND_IF 报错——都属预期，
-/// 另一族成立即算钉上；**两族都失败才报错**（错误文案 = Go 同串
-/// `IP_BOUND_IF/IPV6_BOUND_IF: %v / %v`——文案即契约）。半边缺失的形态会让人
-/// 「v6 钉卡失败拖死 v4」（GAP-AUDIT P0-2 的根因），两族独立容错后 v6 路径可用性
-/// 不再受 v4 面牵连（反之亦然）。
-pub fn pin_socket_to_iface(fd: std::os::fd::RawFd, index: u32, name: &str) -> io::Result<()> {
+/// darwin/windows **两族都设、各自单栈容错**（Go `pinToFD` 语义）：v4-only socket 上
+/// v6 族报错、v6-only socket 上 v4 族报错——都属预期，另一族成立即算钉上；**两族都
+/// 失败才报错**（错误文案 = Go 同串族 `IP_BOUND_IF/IPV6_BOUND_IF: %v / %v`——文案即
+/// 契约；windows 面同形 `IP_UNICAST_IF/IPV6_UNICAST_IF: %v / %v`）。半边缺失的形态
+/// 会让人「v6 钉卡失败拖死 v4」（GAP-AUDIT P0-2 的根因），两族独立容错后 v6 路径
+/// 可用性不再受 v4 面牵连（反之亦然）。
+pub fn pin_socket_to_iface(fd: crate::sysock::RawSock, index: u32, name: &str) -> io::Result<()> {
     // F5 平台语义（取代 F12 的全平台硬拒）：
     // - darwin：**按 index 钉卡**（`IP_BOUND_IF`）；index=0 = 解绑且 setsockopt 会成功
     //   ⇒ 必须硬拒（否则把「解绑」误报成「已钉卡」，判据反向）；
     // - linux：**按名钉卡**（`SO_BINDTODEVICE`，index 不参与）⇒ 不按 index 拒；
     //   index 仅诊断值（`if_nametoindex` 失败不影响按名绑定）。
-    #[cfg(target_os = "macos")]
+    // - windows：**按 index 钉卡**（`IP_UNICAST_IF`，值 = index 的网络字节序——MSDN
+    //   口径）；index=0 同样按 InvalidInput 拒（值 0 = 未指定接口，同「解绑」形态）。
+    #[cfg(any(target_os = "macos", windows))]
     if index == 0 {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "网卡 index 为 0（if_nametoindex 失败/无该卡）—— darwin 上不可钉卡（IP_BOUND_IF=0 是解绑）",
+            "网卡 index 为 0（if_nametoindex 失败/无该卡）—— 该平台按 index 钉卡，index=0 是未指定接口",
         ));
     }
+    let _ = name;
     unsafe {
         #[cfg(target_os = "macos")]
         {
-            let _ = name;
             let idx = index as libc::c_int;
             let r4 = libc::setsockopt(
                 fd,
@@ -295,7 +409,6 @@ pub fn pin_socket_to_iface(fd: std::os::fd::RawFd, index: u32, name: &str) -> io
         }
         #[cfg(target_os = "linux")]
         {
-            let _ = index; // linux 走 SO_BINDTODEVICE（按名），index 不参与
             // 代码门 L1：空名 ⇒ `SO_BINDTODEVICE(optlen=0)` 在内核里是「**解绑**且成功」
             // ——与 darwin `IP_BOUND_IF=0` 同型的「解绑误报成已钉卡」；按名面在同型缺口上补门。
             if name.is_empty() {
@@ -318,10 +431,19 @@ pub fn pin_socket_to_iface(fd: std::os::fd::RawFd, index: u32, name: &str) -> io
             }
             Ok(())
         }
-        #[cfg(not(any(target_os = "macos", target_os = "linux")))]
+        #[cfg(windows)]
         {
-            let _ = (fd, index, name);
-            Ok(())
+            use crate::sysock::{setsockopt_u32, IP_UNICAST_IF, IPV6_UNICAST_IF, IPPROTO_IP, IPPROTO_IPV6};
+            // 值 = 接口 index 的**网络字节序**（winsock 特有口径——按 u32 重解释）。
+            let v = index.to_be();
+            let e4 = setsockopt_u32(fd, IPPROTO_IP, IP_UNICAST_IF, v).err();
+            let e6 = setsockopt_u32(fd, IPPROTO_IPV6, IPV6_UNICAST_IF, v).err();
+            match (e4, e6) {
+                (Some(e4), Some(e6)) => Err(io::Error::other(format!(
+                    "IP_UNICAST_IF/IPV6_UNICAST_IF: {e4} / {e6}"
+                ))),
+                _ => Ok(()),
+            }
         }
     }
 }
@@ -505,7 +627,7 @@ fn probe_with(
     let targets = if targets.is_empty() { &default_probe_targets()[..] } else { targets };
     let s = UdpSocket::bind("0.0.0.0:0")?;
     if let Some(ifi) = pin {
-        pin_socket_to_iface(s.as_raw_fd(), ifi.index, &ifi.name)?;
+        pin_socket_to_iface(crate::sysock::udp_raw(&s), ifi.index, &ifi.name)?;
     }
     let deadline = Instant::now() + timeout;
     s.set_read_timeout(Some(timeout))?;
@@ -561,7 +683,7 @@ pub fn probe_stun(
     let targets = if targets.is_empty() { &default_stun_targets()[..] } else { targets };
     let s = UdpSocket::bind("0.0.0.0:0")?;
     if let Some(ifi) = pin {
-        pin_socket_to_iface(s.as_raw_fd(), ifi.index, &ifi.name)?;
+        pin_socket_to_iface(crate::sysock::udp_raw(&s), ifi.index, &ifi.name)?;
     }
     let deadline = Instant::now() + timeout;
     s.set_read_timeout(Some(timeout))?;
@@ -659,6 +781,8 @@ pub fn select_best(
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::fd::AsRawFd as _;
     use super::*;
 
     /// STUN 编解码：请求形状 + XOR 解码（对拍 RFC 5389 示例形态）。
@@ -735,8 +859,7 @@ mod tests {
     /// 网卡的形态（CI 容器）跳过。
     #[test]
     fn pin_socket_dual_family_tolerant() {
-        use std::os::fd::AsRawFd as _;
-        let Some(ifi) = physical_candidates().into_iter().next() else {
+                let Some(ifi) = physical_candidates().into_iter().next() else {
             return;
         };
         let s4 = UdpSocket::bind("0.0.0.0:0").unwrap();

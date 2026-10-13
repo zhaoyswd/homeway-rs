@@ -21,7 +21,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, UdpSocket};
-use std::os::fd::AsRawFd as _;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -222,12 +221,12 @@ impl ServerBind {
     /// 腿 fd 可读：recv（连接 socket，源恒为腿远端）→ LEGUP 标记吞包防御 →
     /// 同一条 `process_packet` 解析（产出交驱动线程——**与公共端口分离**：kind=5 的
     /// 载荷交 QUIC 面注入、kind=3 交注册腿线程）。返回 (存活, 产出)。
-    pub fn leg_readable(&mut self, fd: std::os::fd::RawFd) -> (bool, Option<LegInbound>) {
+    pub fn leg_readable(&mut self, fd: crate::sysock::RawSock) -> (bool, Option<LegInbound>) {
         // 按 fd 找腿（驱动线程 poll 回指）
         let Some((id, remote)) = self
             .leg_by_id
             .values()
-            .find(|lg| lg.sock.as_raw_fd() == fd)
+            .find(|lg| crate::sysock::udp_raw(&lg.sock) == fd)
             .map(|lg| (lg.id, lg.remote))
         else {
             return (false, None);
@@ -283,10 +282,10 @@ impl ServerBind {
     }
 
     /// 腿表当前 fd 集（驱动线程 poll 用）。
-    pub fn leg_fds(&self) -> Vec<std::os::fd::RawFd> {
+    pub fn leg_fds(&self) -> Vec<crate::sysock::RawSock> {
         self.leg_by_id
             .values()
-            .map(|lg| lg.sock.as_raw_fd())
+            .map(|lg| crate::sysock::udp_raw(&lg.sock))
             .collect()
     }
 

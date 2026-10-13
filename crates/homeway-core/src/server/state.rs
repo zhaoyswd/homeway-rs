@@ -9,7 +9,6 @@
 
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
-use std::os::unix::fs::{DirBuilderExt as _, OpenOptionsExt as _, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -147,15 +146,22 @@ pub struct LedgerEntry {
 impl State {
     /// 打开（目录 **0700**：`DirBuilder::mode` 创建即收紧 + create 后无条件 chmod
     /// 归一——`mkdir` 同样受 umask 掩码，只靠 `.mode` 不够；chmod 失败**告警**，
-    /// 对齐 `nodestate.rs` 的口径。Q-G F4/A3）。
+    /// 对齐 `nodestate.rs` 的口径。Q-G F4/A3）。WIN 批（§D11）：windows 无
+    /// mode 位——普通建 + 跳过 chmod。
     pub fn open(dir: &Path) -> std::io::Result<Self> {
-        std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
-        if let Err(e) = fs::set_permissions(dir, fs::Permissions::from_mode(0o700)) {
-            eprintln!(
-                "homeway: ⚠️ state 目录 {} 收紧 0700 失败（{e}）——建议手工 chmod",
-                dir.display()
-            );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+            std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+            if let Err(e) = fs::set_permissions(dir, fs::Permissions::from_mode(0o700)) {
+                eprintln!(
+                    "homeway: ⚠️ state 目录 {} 收紧 0700 失败（{e}）——建议手工 chmod",
+                    dir.display()
+                );
+            }
         }
+        #[cfg(not(unix))]
+        std::fs::DirBuilder::new().recursive(true).create(dir)?;
         Ok(Self { dir: dir.to_path_buf() })
     }
 
@@ -185,29 +191,51 @@ impl State {
         if let Ok(b) = fs::read(self.key_path()) {
             let n = b.len();
             let arr: [u8; 32] = b.try_into().map_err(|_| StateError::BadKeyLen(n))?;
-            if let Ok(f) = OpenOptions::new().read(true).open(self.key_path()) {
-                if let Err(e) = f.set_permissions(fs::Permissions::from_mode(0o600)) {
-                    eprintln!(
-                        "homeway: ⚠️ 存量身份私钥 {} 收紧 0600 失败（{e}）——建议手工 chmod",
-                        self.key_path().display()
-                    );
+            // 存量私钥的 best-effort 权限归一（unix 凭证面；WIN 批 §D11：windows
+            // 无 mode 位，跳过）。
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                if let Ok(f) = OpenOptions::new().read(true).open(self.key_path()) {
+                    if let Err(e) = f.set_permissions(fs::Permissions::from_mode(0o600)) {
+                        eprintln!(
+                            "homeway: ⚠️ 存量身份私钥 {} 收紧 0600 失败（{e}）——建议手工 chmod",
+                            self.key_path().display()
+                        );
+                    }
                 }
             }
             return Ok(StaticSecret::from(arr));
         }
         let mut seed = [0u8; 32];
         getrandom::getrandom(&mut seed).expect("系统随机源不可用");
+        // 创建即 0600（`.mode`）+ handle 后 fchmod 归一 + 失败告警（Q-G F4/A1；
+        // WIN 批 §D11：windows 无 mode 位——普通开）。
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(self.key_path())?
+        };
+        #[cfg(not(unix))]
         let mut f = OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .mode(0o600)
             .open(self.key_path())?;
-        if let Err(e) = f.set_permissions(fs::Permissions::from_mode(0o600)) {
-            eprintln!(
-                "homeway: ⚠️ 身份私钥 {} 收紧 0600 失败（{e}）——文件权限未归一，建议手工 chmod",
-                self.key_path().display()
-            );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            if let Err(e) = f.set_permissions(fs::Permissions::from_mode(0o600)) {
+                eprintln!(
+                    "homeway: ⚠️ 身份私钥 {} 收紧 0600 失败（{e}）——文件权限未归一，建议手工 chmod",
+                    self.key_path().display()
+                );
+            }
         }
         f.write_all(&seed)?;
         Ok(StaticSecret::from(seed))
@@ -485,17 +513,28 @@ fn decode_secret_b64(s: &str) -> Result<[u8; 32], StateError> {
 /// fchmod 归一 + 失败告警——旧形态的双层静默 `let _`（连 `metadata()` 错误都吞）
 /// 会让 token/吊销台账在 chmod 失败时永久 0644。Go 侧为原子
 /// `os.OpenFile(..., O_CREATE|O_APPEND, 0o600)`（`state.go:181/221`）。
+/// WIN 批（§D11）：windows 无 mode 位——普通开 + 跳过 chmod。
 fn append_file(path: &Path, bytes: &[u8]) -> Result<(), StateError> {
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .mode(0o600)
-        .open(path)?;
-    if let Err(e) = f.set_permissions(fs::Permissions::from_mode(0o600)) {
-        eprintln!(
-            "homeway: ⚠️ 台账 {} 收紧 0600 失败（{e}）——文件权限未归一，建议手工 chmod",
-            path.display()
-        );
+    #[cfg(unix)]
+    let mut f = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(path)?
+    };
+    #[cfg(not(unix))]
+    let mut f = OpenOptions::new().create(true).append(true).open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(e) = f.set_permissions(fs::Permissions::from_mode(0o600)) {
+            eprintln!(
+                "homeway: ⚠️ 台账 {} 收紧 0600 失败（{e}）——文件权限未归一，建议手工 chmod",
+                path.display()
+            );
+        }
     }
     f.write_all(bytes)?;
     Ok(())
@@ -544,6 +583,7 @@ mod tests {
     /// = 0600。**注**：正常 umask 下修前最终 mode 也是 0600（旧后置 chmod 会执行），
     /// 故这是**回归守卫 + 代码面复核**，不是修前红（设计 §4.2 已降级登记）。
     #[test]
+    #[cfg(unix)] // WIN 批：0600/0700 权限位断言 = unix 专属语义
     fn permissions_are_atomic_0600_and_dir_0700() {
         use std::os::unix::fs::PermissionsExt as _;
         // 目录刻意先建成 0755（模拟 umask 宽松的 state 根）

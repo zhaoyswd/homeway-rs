@@ -170,20 +170,15 @@ impl LegTable {
 /// v4 socket 上该选项报 ENOPROTOOPT ⇒ 非 dual）。与 `homeway-core::udpbatch::is_dual_stack`
 /// 同款（本 crate 是叶子、不得依赖 core）。
 pub(super) fn is_dual_stack(sock: &UdpSocket) -> bool {
-    use std::os::fd::AsRawFd as _;
-    // SAFETY：getsockopt 只写 `v` 的 4 字节（`len` 初值 = 其长度）
-    unsafe {
-        let mut v: libc::c_int = 1;
-        let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-        let r = libc::getsockopt(
-            sock.as_raw_fd(),
-            libc::IPPROTO_IPV6,
-            libc::IPV6_V6ONLY,
-            &mut v as *mut _ as *mut libc::c_void,
-            &mut len,
-        );
-        r == 0 && v == 0
-    }
+    // WIN 批：经 sysio（unix 臂与原 libc 直调同形）。
+    matches!(
+        crate::sysio::getsockopt_i32(
+            crate::sysio::udp_raw(sock),
+            crate::sysio::IPPROTO_IPV6,
+            crate::sysio::IPV6_V6ONLY
+        ),
+        Ok(0)
+    )
 }
 
 /// 发送目标的族适配：dual 时 `V4 → V6(v4-mapped)`（v4-mapped / 纯 v6 已是 v6 形态 ⇒ 原样）；

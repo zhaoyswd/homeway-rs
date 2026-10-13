@@ -12,6 +12,7 @@
 //! ——含 `False`）；裸 flag = 默认值；其余 = exit 2。
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// 取值结果（区分「缺值」与「等号形空值」——两者文案不同）。
 #[derive(Debug, PartialEq, Eq)]
@@ -120,6 +121,45 @@ pub(crate) fn take_bool_or_exit(name: &str, inline: Option<&str>, bare_default: 
 fn fail(name: &str, why: &str) -> ! {
     eprintln!("--{name} {why}——取值不会吞下一个参数（值以 `-` 开头请用 --{name}=<值> 形态）");
     std::process::exit(2);
+}
+
+/// 时长解析（`10s` / `1500ms` / `2m`…；ns/µs/ms/s/m/h 六档）。**WIN 批从 `term_cli`
+/// 搬入**（term 在 windows 不编译，而 `--timeout`（main.rs 的 files 远程形态）跨平台
+/// 消费——语义与实现逐字不变）。
+pub(crate) fn parse_duration(v: &str) -> Option<Duration> {
+    let split = v.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(v.len());
+    let (num, unit) = v.split_at(split);
+    let n: f64 = num.parse().ok()?;
+    let secs = match unit {
+        "ns" => n / 1e9,
+        "us" | "µs" => n / 1e6,
+        "ms" => n / 1e3,
+        "s" => n,
+        "m" => n * 60.0,
+        "h" => n * 3600.0,
+        _ => return None,
+    };
+    // 溢出防护（评审 r2-D：from_secs_f64 超界 panic）。
+    (secs > 0.0 && secs < 86400.0 * 365.0).then(|| Duration::from_secs_f64(secs))
+}
+
+/// 等号形 flag 展开（`--a=b` → `--a` `b`）。**WIN 批从 `term_cli` 搬入**（term 在
+/// windows 不编译，而 carriers 的 speedtest 解析面跨平台消费——语义逐字不变）。
+pub(crate) fn expand_flag_eq(args: &[String]) -> Vec<String> {
+    let mut out = Vec::with_capacity(args.len());
+    for a in args {
+        if let Some(rest) = a.strip_prefix("--") {
+            if let Some(i) = rest.find('=') {
+                if i > 0 {
+                    out.push(format!("--{}", &rest[..i]));
+                    out.push(rest[i + 1..].to_owned());
+                    continue;
+                }
+            }
+        }
+        out.push(a.clone());
+    }
+    out
 }
 
 #[cfg(test)]

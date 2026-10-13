@@ -38,8 +38,7 @@ mod tests;
 
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
-use std::os::fd::RawFd;
-use std::os::unix::net::UnixStream;
+use crate::sysio;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
@@ -470,7 +469,8 @@ impl ExitQuic {
         let exit = Arc::new(ExitSignal::new());
         let stats = Arc::new(ExitStats::default());
         // ---- 两向边界（M1 §1.7）：唤醒 self-pipe + 出站队列（引擎侧 try_send 非阻塞）----
-        let (wake_tx, wake_rx) = UnixStream::pair().map_err(ExitQuicErr::Endpoint)?;
+        // WIN 批：唤醒对经 sysio（unix = UnixStream::pair / windows = 回环 TCP 对）。
+        let (wake_tx, wake_rx) = sysio::pair().map_err(ExitQuicErr::Endpoint)?;
         wake_tx.set_nonblocking(true).map_err(ExitQuicErr::Endpoint)?;
         wake_rx.set_nonblocking(true).map_err(ExitQuicErr::Endpoint)?;
         let (out_tx, out_rx) = tmpsc::channel::<Outbound>(OUTBOUND_QUEUE_MAX);
@@ -571,7 +571,7 @@ impl ExitQuic {
     /// 唤醒 fd（**引擎 poll 集**用它：入站队列非空时此 fd 可读；§1.4）。
     ///
     /// 所有权在句柄（引擎**不得 close**；句柄 drop 后该 fd 失效——引擎须同生命周期持有）。
-    pub fn wake_fd(&self) -> RawFd {
+    pub fn wake_fd(&self) -> crate::sysio::RawIo {
         self.bridge.wake_fd()
     }
 

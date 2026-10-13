@@ -188,7 +188,7 @@ pub(crate) enum PushOutcome {
 impl ReturnPath {
     /// 起写线程并接上队列（fd 的所有权在扩展；本模块不 close）。
     pub(crate) fn new(
-        fd: i32,
+        fd: crate::sysio::RawIo,
         tx: IslandTx,
         counters: Arc<TunCounters>,
         logf: Logf,
@@ -251,7 +251,7 @@ impl ReturnPath {
 
 /// 起 TUN 读线程（**分离**——不等 join；退出面见模块头）。
 pub(crate) fn spawn_reader(
-    fd: i32,
+    fd: crate::sysio::RawIo,
     tx: IslandTx,
     counters: Arc<TunCounters>,
     logf: Logf,
@@ -281,63 +281,56 @@ pub(crate) fn spawn_reader(
 /// 零回归）。副作用（**登记在案**）：写线程 `write_fd_all` 在 tun 队列满时改为**阻塞在
 /// write 内**（原为 `WouldBlock` → `POLLOUT` 有界等待）；fd 死亡仍以写错误
 /// （EBADF/EPIPE/EIO）面呈现。
-fn set_blocking_read(fd: i32, logf: &Logf) -> bool {
-    // SAFETY：fcntl(F_GETFL/F_SETFL) 只读写 fd 标志位（无指针、无别名问题）。
-    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
-    if flags < 0 {
-        (*logf)(&format!(
-            "TUN fd 读阻塞化失败（F_GETFL: {}）—— 保持非阻塞读 + poll 形态",
-            std::io::Error::last_os_error()
-        ));
-        return false;
+fn set_blocking_read(fd: crate::sysio::RawIo, logf: &Logf) -> bool {
+    // WIN 批：非阻塞位切换经 sysio（unix = fcntl 原语义；windows = FIONBIO——该面
+    // 在 windows 无运行期来源，仅编译面保通）。
+    match crate::sysio::set_nonblocking(fd, false) {
+        Ok(()) => true,
+        Err(e) => {
+            (*logf)(&format!(
+                "TUN fd 读阻塞化失败（{e}）—— 保持非阻塞读 + poll 形态"
+            ));
+            false
+        }
     }
-    if flags & libc::O_NONBLOCK == 0 {
-        return true; // 本来就是阻塞 fd
-    }
-    let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags & !libc::O_NONBLOCK) };
-    if rc < 0 {
-        (*logf)(&format!(
-            "TUN fd 读阻塞化失败（F_SETFL: {}）—— 保持非阻塞读 + poll 形态",
-            std::io::Error::last_os_error()
-        ));
-        return false;
-    }
-    true
 }
 
 /// 单 fd poll 等待（片长 [`POLL_SLICE`]；EINTR 内部重试；到 `deadline` 返 `TimedOut`；
 /// 片到无事件 = `Ready::default()`）。形态镜像 `wgcore::poll_fd`。
-fn poll_fd(fd: i32, events: libc::c_short, deadline: Instant) -> io::Result<Ready> {
+fn poll_fd(fd: crate::sysio::RawIo, events: i16, deadline: Instant) -> io::Result<Ready> {
+    use crate::sysio::{PollEnt, POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT};
     loop {
         let now = Instant::now();
         if now >= deadline {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "tun fd 等待超预算"));
         }
-        let mut pfd = libc::pollfd {
-            fd,
+        let mut pfd = PollEnt {
+            raw: fd,
             events,
             revents: 0,
         };
         let slice = POLL_SLICE.min(deadline.saturating_duration_since(now));
         let ms = slice.as_millis().min(i32::MAX as u128) as i32;
-        let r = unsafe { libc::poll(&mut pfd, 1, ms) };
-        if r < 0 {
-            let e = io::Error::last_os_error();
-            if e.kind() == io::ErrorKind::Interrupted {
-                continue;
+        // WIN 批：poll 经 sysio（unix = libc::poll 原语义；windows = WSAPoll）。
+        let r = match crate::sysio::poll(std::slice::from_mut(&mut pfd), ms) {
+            Ok(r) => r,
+            Err(e) => {
+                if e.kind() == io::ErrorKind::Interrupted {
+                    continue;
+                }
+                return Err(e);
             }
-            return Err(e);
-        }
+        };
         if r == 0 {
             return Ok(Ready::default()); // 片到无事件：超时，不判死
         }
         let rev = pfd.revents;
         let mut ready = Ready {
-            readable: rev & libc::POLLIN != 0,
-            writable: rev & libc::POLLOUT != 0,
-            hup: rev & libc::POLLHUP != 0,
-            err: rev & libc::POLLERR != 0,
-            nval: rev & libc::POLLNVAL != 0,
+            readable: rev & POLLIN != 0,
+            writable: rev & POLLOUT != 0,
+            hup: rev & POLLHUP != 0,
+            err: rev & POLLERR != 0,
+            nval: rev & POLLNVAL != 0,
         };
         if !ready.readable && !ready.writable && !ready.hup && !ready.err && !ready.nval {
             ready.err = true; // 只认出未知位 ⇒ 保守异常（同 wgcore）
@@ -358,19 +351,19 @@ struct Ready {
 
 /// TUN 全量写（部分写回补 + POLLOUT 等待**有总预算**——镜像 `wgcore::write_fd_all`；
 /// 预算检查写死在循环顶，不能只靠 `poll_fd` 的内部期限）。
-fn write_fd_all(fd: i32, mut buf: &[u8]) -> io::Result<()> {
+fn write_fd_all(fd: crate::sysio::RawIo, mut buf: &[u8]) -> io::Result<()> {
     let deadline = Instant::now() + WRITE_BUDGET;
     while !buf.is_empty() {
         if Instant::now() >= deadline {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "tun fd 写等待超预算"));
         }
-        let n = unsafe { libc::write(fd, buf.as_ptr().cast(), buf.len()) };
-        if n < 0 {
-            let e = io::Error::last_os_error();
-            match e.kind() {
+        // WIN 批：裸写经 sysio（unix = write(2) 原语义；windows = send）。
+        let n = match crate::sysio::write(fd, buf) {
+            Ok(n) => n as isize,
+            Err(e) => match e.kind() {
                 io::ErrorKind::Interrupted => continue,
                 io::ErrorKind::WouldBlock => {
-                    let r = poll_fd(fd, libc::POLLOUT, deadline)?;
+                    let r = poll_fd(fd, crate::sysio::POLLOUT, deadline)?;
                     if r.hup || r.err || r.nval {
                         return Err(io::Error::new(
                             io::ErrorKind::BrokenPipe,
@@ -380,8 +373,8 @@ fn write_fd_all(fd: i32, mut buf: &[u8]) -> io::Result<()> {
                     continue; // writable 或片到 ⇒ 回循环顶复检期限
                 }
                 _ => return Err(e),
-            }
-        }
+            },
+        };
         buf = &buf[n as usize..];
     }
     Ok(())
@@ -394,31 +387,31 @@ fn write_fd_all(fd: i32, mut buf: &[u8]) -> io::Result<()> {
 ///   用一小片 poll 兜底（替代 `wgcore` 的地板睡眠）后继续；
 /// - 投包失败（岛已收工/通道断）⇒ **自退**（M0 设计 §3.6-2④；不重试、不挂死）；
 /// - fd 读错 ⇒ 记行 + `TunFdDead`（岛侧打 `fd` 分类）+ 退出。
-fn read_loop(fd: i32, tx: IslandTx, counters: Arc<TunCounters>, logf: Logf) {
+fn read_loop(fd: crate::sysio::RawIo, tx: IslandTx, counters: Arc<TunCounters>, logf: Logf) {
     let mut buf = vec![0u8; 65535];
     let mut pending_drops: u64 = 0;
     loop {
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+        // WIN 批：裸读经 sysio（unix = read(2) 原语义；windows = recv——错误经
+        // WSAGetLastError 归一到 io::Error，sysio 单源）。
+        let n: isize = match crate::sysio::read(fd, &mut buf) {
+            Ok(n) => n as isize,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => -11, // EAGAIN 形态位（下块分类）
+            Err(e) => {
+                let msg = format!("tun fd 读取失败：{e}（标记隧道不健康）");
+                (logf)(&msg);
+                let _ = tx.send(Cmd::TunFdDead { msg });
+                return;
+            }
+        };
         if n < 0 {
-            let e = io::Error::last_os_error();
-            match e.kind() {
-                io::ErrorKind::Interrupted => continue,
-                io::ErrorKind::WouldBlock => {
-                    // 回退支（fd 非阻塞/标志不可清时才会走到）：等 POLLIN 一片。
-                    // 三分处置（镜像 `wgcore`）：片到（TimedOut）= 继续；poll 出错 = 判死。
-                    match poll_fd(fd, libc::POLLIN, Instant::now() + POLL_SLICE) {
-                        Ok(_ready) => {} // 可读优先（含 POLLIN|POLLHUP 同置：先读，下一轮定性）
-                        Err(pe) if pe.kind() == io::ErrorKind::TimedOut => {}
-                        Err(pe) => {
-                            let msg = format!("tun fd poll 失败：{pe}（标记隧道不健康）");
-                            (logf)(&msg);
-                            let _ = tx.send(Cmd::TunFdDead { msg });
-                            return;
-                        }
-                    }
-                }
-                _ => {
-                    let msg = format!("tun fd 读取失败：{e}（标记隧道不健康）");
+            // WouldBlock 回退支（fd 非阻塞/标志不可清时才会走到）：等 POLLIN 一片。
+            // 三分处置（镜像 `wgcore`）：片到（TimedOut）= 继续；poll 出错 = 判死。
+            match poll_fd(fd, crate::sysio::POLLIN, Instant::now() + POLL_SLICE) {
+                Ok(_ready) => {} // 可读优先（含 POLLIN|POLLHUP 同置：先读，下一轮定性）
+                Err(pe) if pe.kind() == io::ErrorKind::TimedOut => {}
+                Err(pe) => {
+                    let msg = format!("tun fd poll 失败：{pe}（标记隧道不健康）");
                     (logf)(&msg);
                     let _ = tx.send(Cmd::TunFdDead { msg });
                     return;
@@ -429,14 +422,14 @@ fn read_loop(fd: i32, tx: IslandTx, counters: Arc<TunCounters>, logf: Logf) {
         if n == 0 {
             // EOF/空读：判死**只看 hup||err||nval**（darwin 上 EOF 恒带 POLLIN），
             // 且判死前确认一片（poll 本身即等待——不用 sleep）。
-            let first = poll_fd(fd, libc::POLLIN, Instant::now() + POLL_SLICE);
+            let first = poll_fd(fd, crate::sysio::POLLIN, Instant::now() + POLL_SLICE);
             let (dead, readable) = match &first {
                 Ok(r) => (r.hup || r.err || r.nval, r.readable),
                 Err(pe) if pe.kind() == io::ErrorKind::TimedOut => (false, false),
                 Err(_) => (true, false),
             };
             let dead = if dead {
-                match poll_fd(fd, libc::POLLIN, Instant::now() + DEAD_CONFIRM_DELAY) {
+                match poll_fd(fd, crate::sysio::POLLIN, Instant::now() + DEAD_CONFIRM_DELAY) {
                     Ok(r) => r.hup || r.err || r.nval,
                     Err(pe) if pe.kind() == io::ErrorKind::TimedOut => false,
                     Err(_) => true, // poll 本身失败（EBADF/EIO…）⇒ 判死
@@ -453,7 +446,7 @@ fn read_loop(fd: i32, tx: IslandTx, counters: Arc<TunCounters>, logf: Logf) {
             // 「read 返 0 且 poll 立返可读」的空读形态：一小片兜底（防热自旋；
             // 本模块不用 sleep——用 poll 片等价实现，见模块头）。
             if readable {
-                let _ = poll_fd(fd, libc::POLLIN, Instant::now() + DEAD_CONFIRM_DELAY);
+                let _ = poll_fd(fd, crate::sysio::POLLIN, Instant::now() + DEAD_CONFIRM_DELAY);
             }
             continue;
         }
@@ -515,7 +508,7 @@ fn read_loop(fd: i32, tx: IslandTx, counters: Arc<TunCounters>, logf: Logf) {
 /// 退出：通道断（岛收工/回程泵随连接结束而 drop）/ fd 写失败（记行 + `TunFdDead`
 /// ⇒ 岛侧打 `fd` 分类 + 卸面）。
 fn write_loop(
-    fd: i32,
+    fd: crate::sysio::RawIo,
     rx: Receiver<ReturnBatch>,
     tx: IslandTx,
     counters: Arc<TunCounters>,

@@ -30,9 +30,16 @@
 //! tun 域的数据面执行体经 [`TunExecutor`] 注入；本仓实现 = `tun_exec::TunnelExec`
 //! （真 hub：QUIC 岛 + TUN fd → L3 直通）。
 
+// WIN 批（2026-10-13）App 核面门控：桥装配/三桥操作面/世代执行体/App 服务启动器在
+// windows 上不编译（`docs/reviews/WIN-design.md` §D3——桌面无 App 消费者，capi 是
+// OHOS 专用壳）。跨平台件（trait/端口常量）已拆 `bridge_io`。
+#[cfg(not(windows))]
 pub mod bridge_host;
+/// 桥接流抽象与出口虚拟端口（WIN 批从 `bridge_host` 拆出的跨平台件）。
+pub mod bridge_io;
 pub mod demand;
 pub mod events;
+#[cfg(not(windows))]
 pub mod files_op;
 /// **宿主会话（M5 S2a）**：岛承接的「无 TUN 服务会话」——CLI host 面 / daemon 承载面 /
 /// App 服务会话三者共用的唯一会话抽象（真源 `docs/reviews/M5-design.md` §2 + §2.7）。
@@ -42,11 +49,15 @@ pub mod probe_json;
 /// QUIC 档服务流拨号缝（M3 S3：虚拟端口 → STREAM tag；**本文件零 WG 引用**——
 /// 该事实是 S6 的机械断言面：QUIC 档服务流路径不得再可达 `stackb::`）。
 pub mod quic_stream;
+#[cfg(not(windows))]
 pub mod service_exec;
 pub mod service_op;
+#[cfg(not(windows))]
 pub mod speedtest_op;
 pub mod stage;
+#[cfg(not(windows))]
 pub mod term_op;
+#[cfg(not(windows))]
 pub mod tun_exec;
 pub mod tun_shared;
 pub mod tun_status;
@@ -201,7 +212,10 @@ impl TunExecutor for NoopTunExecutor {
     }
 }
 
-/// App 核门面（20 导出面的 Rust API；线程安全）。
+/// App 核门面（20 导出面的 Rust API；线程安全）。**WIN 批门控**：App 核是
+/// capi/OHOS 专用面，windows 不编译（`docs/reviews/WIN-design.md` §D3——桌面 CLI/
+/// daemon 走 `host_session`，不经本门面）。
+#[cfg(not(windows))]
 pub struct ClientCore {
     /// tun 域世代共享面（单飞锁/世代/阶段机/健康位/attach 通道/done）。
     tun: Arc<TunShared>,
@@ -223,12 +237,14 @@ pub struct ClientCore {
     pub service_bridge: Mutex<Option<Arc<bridge_host::BridgeHost>>>,
 }
 
+#[cfg(not(windows))]
 impl Default for ClientCore {
     fn default() -> Self {
         Self::new(Arc::new(NoopTunExecutor))
     }
 }
 
+#[cfg(not(windows))]
 impl ClientCore {
     pub fn new(executor: Arc<dyn TunExecutor>) -> Self {
         Self::with_shared(executor, Arc::new(DemandSignals::new()))

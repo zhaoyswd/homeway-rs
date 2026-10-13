@@ -493,6 +493,7 @@ dependencies = [
  "serde_json",
  "sha2",
  "toml",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]
@@ -517,6 +518,7 @@ dependencies = [
  "smoltcp",
  "thiserror 2.0.21",
  "toml",
+ "windows-sys 0.59.0",
  "x25519-dalek",
 ]
 
@@ -534,6 +536,7 @@ dependencies = [
  "sha2",
  "thiserror 2.0.21",
  "tokio",
+ "windows-sys 0.59.0",
 ]
 
 [[package]]

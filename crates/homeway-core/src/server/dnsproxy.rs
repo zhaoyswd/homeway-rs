@@ -318,15 +318,36 @@ impl Upstreams {
         }
         st.last_check = Instant::now();
         if !st.list.is_empty() {
+            #[cfg(unix)]
             if let Ok(md) = std::fs::metadata(&self.path) {
                 if md.modified().ok() == st.mtime {
                     return Arc::clone(&st.list); // 未变：保留 last-good
                 }
             }
+            // windows（WIN 批 §D10）：无 resolv.conf mtime 面（系统 DNS 经 iphlpapi——
+            // 网络变化不落文件）；mtime 字段改作「上次重读时刻」，60s 周期刷新。
+            #[cfg(windows)]
+            {
+                let fresh = st
+                    .mtime
+                    .and_then(|t| t.elapsed().ok())
+                    .map(|d| d < std::time::Duration::from_secs(60))
+                    .unwrap_or(false);
+                if fresh {
+                    return Arc::clone(&st.list);
+                }
+            }
         }
         if let Some(list) = parse_resolv_nameservers(&self.path) {
             if !list.is_empty() {
-                st.mtime = std::fs::metadata(&self.path).and_then(|m| m.modified()).ok();
+                #[cfg(unix)]
+                {
+                    st.mtime = std::fs::metadata(&self.path).and_then(|m| m.modified()).ok();
+                }
+                #[cfg(windows)]
+                {
+                    st.mtime = Some(std::time::SystemTime::now());
+                }
                 st.list = Arc::new(list); // 换新 Arc（在途查询持旧快照）
             }
         }
@@ -340,6 +361,9 @@ impl Upstreams {
 }
 
 /// 逐行取 nameserver 项（忽略注释/其它指令）；空列表 = 文件无有效上游。
+/// windows（WIN 批 §D10）：`path` 不用——系统 DNS 经 `GetNetworkParams`（iphlpapi 的
+/// FIXED_INFO.DnsServer 链表）。
+#[cfg(unix)]
 fn parse_resolv_nameservers(path: &str) -> Option<Vec<String>> {
     let body = std::fs::read_to_string(path).ok()?;
     let mut out = Vec::new();
@@ -356,6 +380,45 @@ fn parse_resolv_nameservers(path: &str) -> Option<Vec<String>> {
         }
     }
     Some(out)
+}
+
+#[cfg(windows)]
+fn parse_resolv_nameservers(_path: &str) -> Option<Vec<String>> {
+    use windows_sys::Win32::NetworkManagement::IpHelper::{GetNetworkParams, FIXED_INFO_W2KSP1};
+    unsafe {
+        let mut size: u32 = 4 * 1024;
+        loop {
+            let mut buf = vec![0u8; size as usize];
+            let rc = GetNetworkParams(buf.as_mut_ptr() as *mut FIXED_INFO_W2KSP1, &mut size);
+            match rc {
+                0 => {
+                    let info = &*(buf.as_ptr() as *const FIXED_INFO_W2KSP1);
+                    let mut out = Vec::new();
+                    let mut cur: *const windows_sys::Win32::NetworkManagement::IpHelper::IP_ADDR_STRING =
+                        &info.DnsServerList;
+                    // 取链表前 4 项（网卡面常见 2-3 项；防异常驱动超长链）
+                    while !cur.is_null() && out.len() < 4 {
+                        let e = &*cur;
+                        let raw = &e.IpAddress;
+                        // IP_ADDRESS_STRING.String = [i8; 16] 的 C 串（windows-sys 用
+                        // 有符号字节面——按位重解释成 u8 读）
+                        let bytes: &[u8; 16] = unsafe { &*(&raw.String as *const [i8; 16]).cast() };
+                        let s = std::ffi::CStr::from_bytes_until_nul(bytes)
+                            .ok()?
+                            .to_string_lossy()
+                            .into_owned();
+                        if !s.is_empty() {
+                            out.push(s);
+                        }
+                        cur = e.Next;
+                    }
+                    return Some(out);
+                }
+                111 => continue, // ERROR_BUFFER_OVERFLOW：size 已更新——扩容重试
+                _ => return None,
+            }
+        }
+    }
 }
 
 // ---------- 计数器族（StatsLine 的数据源；跨线程原子——worker 池并发应答） ----------

@@ -960,47 +960,27 @@ pub fn cmd_serve(args: &[String]) {
     engine.shutdown(Duration::from_secs(2));
 }
 
-/// 信号 → 自写管道一字节（async-signal-safe 面）。
-static STOP_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-
-extern "C" fn on_stop_signal(_sig: i32) {
-    let fd = STOP_FD.load(std::sync::atomic::Ordering::SeqCst);
-    if fd >= 0 {
-        unsafe {
-            let b = b"x";
-            libc::write(fd, b.as_ptr().cast(), 1);
-        }
-    }
-}
-
-static STOP_PIPE: std::sync::OnceLock<(i32, i32)> = std::sync::OnceLock::new();
+// WIN 批：信号/管道面收敛到 `stopsig`（unix 臂与原 libc 直调逐调用同形；windows =
+// 控制台事件 + 回环对——§D8）。STOP_PIPE 仍 OnceLock（单次生命周期、无 restart 面）。
+static STOP_PIPE: std::sync::OnceLock<(crate::stopsig::Raw, crate::stopsig::Raw)> =
+    std::sync::OnceLock::new();
 
 pub fn install_stop_signals() {
-    // Q-G F1：管道经 `sysfd` 建（两端 CLOEXEC）→ 立即 `into_raw_fd()` 交既有 i32
-    // 字段（生命周期仍由 `wait_stop_pipe`/进程存活期收口——本批不改结构，单次
-    // 生命周期、无 restart 面）。建立失败 = 可行动错误退出（旧形态忽略 rc 会让
-    // handler 写 fd 0）。
-    let (r, w) = *STOP_PIPE.get_or_init(|| match homeway_core::sysfd::pipe_cloexec() {
-        Ok((r, w)) => (
-            std::os::fd::IntoRawFd::into_raw_fd(r),
-            std::os::fd::IntoRawFd::into_raw_fd(w),
-        ),
+    // Q-G F1 的建立失败 = 可行动错误退出（旧形态忽略 rc 会让 handler 写 fd 0）。
+    let (r, w) = *STOP_PIPE.get_or_init(|| match crate::stopsig::pipe() {
+        Ok((r, w)) => (r, w),
         Err(e) => {
             eprintln!("homeway: serve 停止管道建立失败（{e}）——退出");
             std::process::exit(1);
         }
     });
-    STOP_FD.store(w, std::sync::atomic::Ordering::SeqCst);
-    unsafe {
-        let h = on_stop_signal as extern "C" fn(i32) as libc::sighandler_t;
-        libc::signal(libc::SIGTERM, h);
-        libc::signal(libc::SIGINT, h);
-    }
+    crate::stopsig::arm(w);
+    crate::stopsig::install();
     let _ = r;
 }
 
 /// 注入缝形（Q-H 代码门 H1：不碰 errno 的可测面；`__error` 在 linux 上不存在）。
-type ReadFn<'a> = dyn FnMut(i32, &mut [u8]) -> Result<usize, std::io::Error> + 'a;
+type ReadFn<'a> = dyn FnMut(crate::stopsig::Raw, &mut [u8]) -> Result<usize, std::io::Error> + 'a;
 
 /// 停止等待结果（Q-H F16：返回值自此有语义——不再是无意义 `bool`）。
 #[derive(Debug, PartialEq, Eq)]
@@ -1017,8 +997,8 @@ pub(crate) enum StopWait {
 /// 注入缝形 = `Result<usize, std::io::Error>`（**不碰 errno**——`libc::__error` 只在
 /// apple/bsd 存在，linux 面是 `__errno_location`；用 errno 注入会让 ubuntu CI 的
 /// `--all-targets` 编译失败，代码门 H1）。
-fn read_stop_signal_with(fd: i32, read_fn: &mut ReadFn<'_>) -> Result<StopWait, String> {
-    if fd < 0 {
+fn read_stop_signal_with(fd: crate::stopsig::Raw, read_fn: &mut ReadFn<'_>) -> Result<StopWait, String> {
+    if fd == crate::stopsig::DISARMED {
         return Err("停止管道未安装（fd 无效）——本函数不会去读 fd 0（stdin）".to_owned());
     }
     let mut b = [0u8; 1];
@@ -1032,23 +1012,13 @@ fn read_stop_signal_with(fd: i32, read_fn: &mut ReadFn<'_>) -> Result<StopWait, 
     }
 }
 
-pub(crate) fn read_stop_signal(fd: i32) -> Result<StopWait, String> {
-    read_stop_signal_with(fd, &mut |fd, buf| {
-        let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
-        if n >= 0 {
-            Ok(n as usize)
-        } else {
-            Err(std::io::Error::last_os_error())
-        }
-    })
+pub(crate) fn read_stop_signal(fd: crate::stopsig::Raw) -> Result<StopWait, String> {
+    read_stop_signal_with(fd, &mut |fd, buf| crate::stopsig::read(fd, buf))
 }
 
 /// 等待停止（壳；**不 exit**——可进程内断言）：未安装 ⇒ 不读 fd 0，返回 `PipeErr`。
 pub fn wait_stop_pipe() -> StopWait {
-    let fd = match STOP_PIPE.get() {
-        Some((r, _)) => *r,
-        None => -1,
-    };
+    let fd = STOP_PIPE.get().map(|(r, _)| *r).unwrap_or(crate::stopsig::DISARMED);
     match read_stop_signal(fd) {
         Ok(v) => v,
         Err(e) => StopWait::PipeErr(e),
@@ -1642,24 +1612,22 @@ mod tests {
     /// F16：read_stop_signal 四档（字节/EOF/未安装/EINTR 注入重试）。
     #[test]
     fn read_stop_signal_cases() {
-        // 未安装（fd < 0）⇒ Err（绝不读 fd 0）。
-        assert!(read_stop_signal(-1).is_err());
+        // 未安装（DISARMED 哨兵）⇒ Err（绝不读 fd 0）。
+        assert!(read_stop_signal(crate::stopsig::DISARMED).is_err());
         // 真管道：写 1 字节 ⇒ Signaled；关写端（EOF）⇒ Signaled。
-        let (r, w) = homeway_core::sysfd::pipe_cloexec().unwrap();
-        let rfd = std::os::fd::IntoRawFd::into_raw_fd(r);
-        let wfd = std::os::fd::IntoRawFd::into_raw_fd(w);
-        unsafe { libc::write(wfd, b"x".as_ptr().cast(), 1) };
+        let (rfd, wfd) = crate::stopsig::pipe().unwrap();
+        crate::stopsig::write1(wfd);
         assert_eq!(read_stop_signal(rfd).unwrap(), StopWait::Signaled);
         // 关写端 ⇒ 读到 0 字节 EOF ⇒ 同样 Signaled（不关写端会阻塞——先关再读）。
-        unsafe { libc::close(wfd) };
+        crate::stopsig::close(wfd);
         assert_eq!(read_stop_signal(rfd).unwrap(), StopWait::Signaled); // EOF
-        unsafe { libc::close(rfd) };
+        crate::stopsig::close(rfd);
         // EINTR：注入 read 先返 Interrupted 再返 1（用注入缝——进程级 raise(SIGUSR1)
         // 在 cargo test 并发下有误伤面，且 macOS 的 raise 是线程定向、不保证命中
         // 在途 read ⇒ 形态脆弱；注入缝钉的是同一段重试逻辑，且**不碰 errno**
         // 〔libc::__error 只存在于 apple/bsd——用了会让 linux CI 编译失败〕）。
         let mut calls = 0;
-        let mut fake = |_fd: i32, buf: &mut [u8]| {
+        let mut fake = |_fd: crate::stopsig::Raw, buf: &mut [u8]| {
             calls += 1;
             if calls == 1 {
                 return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "注入 EINTR"));
@@ -1671,7 +1639,7 @@ mod tests {
         assert_eq!(calls, 2, "EINTR 后必须重试一次");
         // 其它错误 ⇒ Err（可读文案），不重试。
         let mut calls2 = 0;
-        let mut bad = |_fd: i32, _b: &mut [u8]| {
+        let mut bad = |_fd: crate::stopsig::Raw, _b: &mut [u8]| {
             calls2 += 1;
             Err(std::io::Error::other("注入 IO 错"))
         };

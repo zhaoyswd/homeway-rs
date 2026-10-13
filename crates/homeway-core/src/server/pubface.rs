@@ -126,10 +126,9 @@ impl PubFace {
     /// 把公共端口 socket 重钉到指定网卡（绑卡看护换卡/重挑；原 `bind.repin_to` 同义——
     /// 两族都设、单栈容错）。socket 由 QUIC 面独占 ⇒ 本函数只做 `setsockopt`。
     pub fn repin_to(&self, index: u32, name: &str) -> std::io::Result<()> {
-        use std::os::fd::AsRawFd as _;
         let g = self.pin_sock.lock().expect("pin_sock 锁中毒");
         match g.as_ref() {
-            Some(s) => super::egress::pin_socket_to_iface(s.as_raw_fd(), index, name),
+            Some(s) => super::egress::pin_socket_to_iface(crate::sysock::udp_raw(s), index, name),
             None => Err(std::io::Error::other("公共端口 socket 未挂（QUIC 面未起）")),
         }
     }

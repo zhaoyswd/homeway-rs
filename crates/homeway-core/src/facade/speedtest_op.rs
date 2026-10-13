@@ -154,7 +154,7 @@ pub fn speed_cancel_json() -> String {
 pub struct BridgeSpeedConn {
     raw: UnixStream,
     r: Mutex<Box<dyn Read + Send>>,
-    w: Mutex<Box<dyn super::bridge_host::WriteHalf + Send>>,
+    w: Mutex<Box<dyn super::bridge_io::WriteHalf + Send>>,
     /// **绝对期限**（评审 r1-F13：set_read/write_timeout 是 per-syscall 超时——
     /// 慢滴对端每次成功读写都给整份期限续命；Go SetDeadline 是绝对时刻。这里记
     /// deadline 时刻，每次读写前按剩余量收敛 per-op 超时，到点后读写立即失败——
@@ -302,7 +302,7 @@ pub fn speed_dial_conn(
     let raw = conn
         .try_clone()
         .map_err(|e| ("bridge_down", format!("测速桥 fd 复制失败：{e}")))?;
-    let boxed: Box<dyn super::bridge_host::BridgeStream> = Box::new(conn);
+    let boxed: Box<dyn super::bridge_io::BridgeStream> = Box::new(conn);
     let (r, w) = boxed
         .into_halves()
         .map_err(|e| ("bridge_down", format!("测速桥拆半失败：{e}")))?;

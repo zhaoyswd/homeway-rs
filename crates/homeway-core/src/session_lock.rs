@@ -6,8 +6,9 @@
 //! 「写通道长时间无进展」。产品形态（App：服务会话/隧道会话各唯一、files/term 走
 //! 常驻会话自己的桥）无此面；**CLI 是唯一能踩进来的入口**。
 //!
-//! 治理：`<identity_dir>/session.lock` + `flock(2)`（内核语义——持有进程死亡即自动
-//! 释放，无陈旧文件问题；锁内容 = 持有者自述 pid/动词/起时，供错误信息直指现场）：
+//! 治理：`<identity_dir>/session.lock` + `flock(2)`（windows = LockFileEx，syslock
+//! 单源——WIN 批 §D5；内核语义——持有进程死亡即自动释放，无陈旧文件问题；锁内容 =
+//! 持有者自述 pid/动词/起时，供错误信息直指现场）：
 //! - `connect`（常驻）：锁被活持有者占 ⇒ 明确错误退出（双常驻同 identity = 互踢形态）；
 //! - `files` / `speedtest`（短命动词）：锁被活持有者占 ⇒ 明确错误（这正是 R6 根因
 //!   形态——常驻会话在场时短命动词必踢掉常驻的 keypair）；
@@ -21,7 +22,6 @@
 
 use std::fs::{File, OpenOptions};
 use std::io::Write;
-use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -66,11 +66,20 @@ impl Drop for SessionLock {
 /// 错误信息消费）。identity 目录不存在则创建（与 master.key 的目录契约一致）。
 pub fn acquire(identity_dir: &Path, verb: &str) -> Result<SessionLock, LockError> {
     // 密钥目录权限契约（identity.rs 同款 0700——评审 r1-C6：create_dir_all 的 0755
-    // 会把新目录的权限放宽）
-    use std::os::unix::fs::DirBuilderExt;
-    let mut builder = std::fs::DirBuilder::new();
-    builder.mode(0o700);
-    builder
+    // 会把新目录的权限放宽）。WIN 批（§D11）：windows 无 mode 位——普通建，隔离靠
+    // 用户 profile 目录边界。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut builder = std::fs::DirBuilder::new();
+        builder.mode(0o700);
+        builder
+            .recursive(true)
+            .create(identity_dir)
+            .map_err(|e| LockError::Io(LockIo { path: identity_dir.to_owned(), err: e }))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::DirBuilder::new()
         .recursive(true)
         .create(identity_dir)
         .map_err(|e| LockError::Io(LockIo { path: identity_dir.to_owned(), err: e }))?;
@@ -78,29 +87,39 @@ pub fn acquire(identity_dir: &Path, verb: &str) -> Result<SessionLock, LockError
     // Q-G F4（B 组新增）：锁文件**创建即 0600**（Go = `os.OpenFile(lockFile,
     // O_CREATE|O_RDWR, 0o600)`，`identity_store_unix.go:21`）——内容含 pid/动词，
     // 非凭据；目录 0700 之外本无兜底，一行 `.mode` 对齐。
-    use std::os::unix::fs::OpenOptionsExt as _;
+    #[cfg(unix)]
+    let file = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .truncate(false)
+            .mode(0o600)
+            .open(&path)
+    };
+    #[cfg(not(unix))]
     let file = OpenOptions::new()
         .create(true)
         .read(true)
         .write(true)
         .truncate(false)
-        .mode(0o600)
-        .open(&path)
-        .map_err(|e| LockError::Io(LockIo { path: path.clone(), err: e }))?;
-    // flock EX|NB：内核级持有者判活（进程死 = 自动释放）——不依赖 pid 探测
-    let rc = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
-    if rc != 0 {
-        let err = std::io::Error::last_os_error();
-        // EWOULDBLOCK 与 EAGAIN 在 POSIX 上同值（11）——只匹配一个（同值双匹配在
-        // 部分目标报 unreachable pattern）
-        let eagain = libc::EWOULDBLOCK;
-        let held = matches!(err.raw_os_error(), Some(e) if e == eagain || e == libc::EACCES);
-        if held {
+        .open(&path);
+    let file =
+        file.map_err(|e| LockError::Io(LockIo { path: path.clone(), err: e }))?;
+    // flock EX|NB：内核级持有者判活（进程死 = 自动释放）——不依赖 pid 探测。
+    // WIN 批（§D5）：windows = LockFileEx，syslock 单源（EWOULDBLOCK/EACCES 与
+    // ERROR_LOCK_VIOLATION 的「他者持有」映射在 syslock 内）。
+    match crate::syslock::try_lock_exclusive(&file) {
+        Ok(crate::syslock::LockOutcome::Acquired) => {}
+        Ok(crate::syslock::LockOutcome::Held) => {
             // 读持有者自述（拿锁失败 ⇒ 内容是有效持有者写的）
             let (pid, v, since_ms) = read_holder(&file);
             return Err(LockError::Held(LockHeld { pid, verb: v, since_ms }));
         }
-        return Err(LockError::Io(LockIo { path, err }));
+        Err(err) => {
+            return Err(LockError::Io(LockIo { path, err }));
+        }
     }
     // 拿到锁：覆写自述（std 对 &File 有 Read/Write/Seek 三 impl——借引用即可）
     let since_ms = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as u64).unwrap_or(0);
@@ -187,6 +206,7 @@ mod tests {
     /// Q-H F9：不可写 identity 目录 ⇒ `LockError::Io`（分类 + path 字段）——调用点
     /// （main.rs）据此 fail-fast（此前"仅告警继续" = 防线静默消失）。
     #[test]
+    #[cfg(unix)] // WIN 批：root 绕过判断走 libc::geteuid（unix 专属）
     fn unwritable_dir_is_lock_io_with_path() {
         use std::os::unix::fs::PermissionsExt;
         // root 绕过权限位 ⇒ 该形态在 root 下不可构造（CI 容器可能以 root 跑：

@@ -35,7 +35,8 @@ use crate::token::Token;
 use crate::tunnel_addr::SERVER_TUNNEL_IP;
 use crate::Logf;
 
-use super::bridge_host::{BridgeHost, BridgeStream};
+use super::bridge_host::BridgeHost;
+use super::bridge_io::BridgeStream;
 use super::demand::{self, DemandSignals};
 use super::portfwd::{PfLimits, PfRuntime, PfSetup, PortForwardRule};
 use super::stage::TunStage;
@@ -67,10 +68,6 @@ const MTU_DEFAULT: i64 = 1280;
 /// 的 dialMs 热传入 BridgeHost）。
 const DIAL_MS_DEFAULT: i64 = 15000;
 
-/// 退出路径 RPC 的预算（Q-F F3b/N1：close_write / `StreamShared::drop` 走在**必须退出**
-/// 的收工链上——引擎卡死时无界等待会把桥泵与世代收工钉住。2s = 动作预算同刻度，
-/// 正常引擎回执即时）。消费点 = QUIC 服务流（`facade/quic_stream.rs`）。
-pub(crate) const EXIT_RPC_BUDGET: Duration = Duration::from_secs(2);
 
 // ---------------------------------------------------------------------------
 // 单承载常量（M5 C3：A/B 开关三键与回落档一并删除，设计 §4.3）
@@ -138,19 +135,6 @@ fn link_via_opt(v: Option<homeway_quic::Via>) -> &'static str {
 // 会话流适配器（桥远端——工单⑤ dial_port 接缝：流 id ≠ fd，适配成 Read/Write 两半）
 // ---------------------------------------------------------------------------
 
-/// 背压重试节拍（F8a 纯函数）：前 50 拍 2ms、51–100 拍 10ms、其后 20ms 封顶。
-/// 10s 无进展上界与「空写短路」语义不随本表变化。**M3 S3**：QUIC 档写半
-/// （`facade/quic_stream.rs`）复用同一张表——节拍随承载变化须登记（§1.4），本节拍
-/// **不随承载变**（待发队列 64 KiB vs 旧栈 1 MiB 只影响 `n=0` 的到达频率）。
-pub(crate) fn write_retry_backoff(attempt: u32) -> Duration {
-    if attempt < 50 {
-        Duration::from_millis(2)
-    } else if attempt < 100 {
-        Duration::from_millis(10)
-    } else {
-        Duration::from_millis(20)
-    }
-}
 
 /// portfwd 拨号缝的生产实现（`PfRuntime` 全注入面——闭包持 `Weak<GenRun>` 防 Arc 环：
 /// 世代收工后 `upgrade()` 失败 = 拨号失败如实收口（conn 线程记 fails + RST + 行））。
@@ -181,9 +165,6 @@ fn pf_dial_via_run(
     super::quic_stream::dial_target(&r, dst, budget)
 }
 
-/// 拨号首试预算（隧道域；宿主会话的服务域用 `host_session` 的同值档——两端「首试」的
-/// 语义面一致，便于对照读数）。
-pub(crate) const FIRST_TRY: Duration = Duration::from_secs(4);
 
 // ---------------------------------------------------------------------------
 // 世代运行态（Go tunRun）
@@ -1776,12 +1757,12 @@ mod tests {
     /// F8a：写退避分级表（前 50 拍 2ms ⇒ 其后 10ms ⇒ 100 拍后 20ms 封顶）。
     #[test]
     fn write_backoff_schedule() {
-        assert_eq!(write_retry_backoff(0), Duration::from_millis(2));
-        assert_eq!(write_retry_backoff(49), Duration::from_millis(2));
-        assert_eq!(write_retry_backoff(50), Duration::from_millis(10));
-        assert_eq!(write_retry_backoff(99), Duration::from_millis(10));
-        assert_eq!(write_retry_backoff(100), Duration::from_millis(20));
-        assert_eq!(write_retry_backoff(u32::MAX), Duration::from_millis(20));
+        assert_eq!(super::super::quic_stream::write_retry_backoff(0), Duration::from_millis(2));
+        assert_eq!(super::super::quic_stream::write_retry_backoff(49), Duration::from_millis(2));
+        assert_eq!(super::super::quic_stream::write_retry_backoff(50), Duration::from_millis(10));
+        assert_eq!(super::super::quic_stream::write_retry_backoff(99), Duration::from_millis(10));
+        assert_eq!(super::super::quic_stream::write_retry_backoff(100), Duration::from_millis(20));
+        assert_eq!(super::super::quic_stream::write_retry_backoff(u32::MAX), Duration::from_millis(20));
     }
 
     /// 探测空闲回环端口（**不钉固定端口**——同树并发跑测试会互撞）。

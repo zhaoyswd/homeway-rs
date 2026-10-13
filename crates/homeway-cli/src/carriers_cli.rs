@@ -16,7 +16,7 @@ use homeway_core::daemon::proto::OpError;
 use homeway_core::daemon::vocab;
 
 use crate::daemon_cli::{dial_control_spawn, op_err_text, resolve_host};
-use crate::term_cli::{expand_flag_eq, parse_duration};
+use crate::cli_flags::{expand_flag_eq, parse_duration};
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 /// status 轮询拍（Go CLI 的 250ms）。
@@ -761,8 +761,19 @@ type SpeedTarget = (String, String);
 /// Ctrl-C 的取消面（信号处理器只写原子位——async-signal-safe）。
 static SPD_CANCEL: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+#[cfg(unix)]
 extern "C" fn on_spd_sig(_sig: i32) {
     SPD_CANCEL.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// 轮转的取消判定（unix = 本 handler 的标志；windows = stopsig 的控制台命中位）。
+#[cfg(unix)]
+fn spd_cancelled() -> bool {
+    SPD_CANCEL.load(std::sync::atomic::Ordering::SeqCst)
+}
+#[cfg(windows)]
+fn spd_cancelled() -> bool {
+    crate::stopsig::HIT.load(std::sync::atomic::Ordering::SeqCst)
 }
 
 /// 一台主机的结果（--json 的逐主机对象真源——字段名冻结、只增）。
@@ -927,14 +938,22 @@ pub fn cmd_speedtest_hosted(args: &[String]) {
     }
 
     // Ctrl-C：终止整个轮转（先 cancel 当前主机再退出、退出码非零）。
+    #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGINT, on_spd_sig as extern "C" fn(i32) as libc::sighandler_t);
+    }
+    // windows：复用 stopsig 的控制台 handler（HIT 标志；无需写管道——arm 哨兵）。
+    #[cfg(windows)]
+    {
+        crate::stopsig::HIT.store(false, std::sync::atomic::Ordering::SeqCst);
+        crate::stopsig::arm(crate::stopsig::DISARMED);
+        crate::stopsig::install();
     }
 
     let mut results: Vec<SpeedHostResult> = Vec::new();
     let mut interrupted = false;
     for (id, name, _, _) in &targets {
-        if SPD_CANCEL.load(std::sync::atomic::Ordering::SeqCst) {
+        if spd_cancelled() {
             interrupted = true;
             break;
         }
@@ -958,7 +977,7 @@ pub fn cmd_speedtest_hosted(args: &[String]) {
             }
             Err(msg) => {
                 // Ctrl-C 落在当前主机：run 内已发 cancel——退出轮转。
-                if SPD_CANCEL.load(std::sync::atomic::Ordering::SeqCst) {
+                if spd_cancelled() {
                     interrupted = true;
                     break;
                 }
@@ -983,8 +1002,13 @@ pub fn cmd_speedtest_hosted(args: &[String]) {
             }
         }
     }
+    #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGINT, libc::SIG_DFL);
+    }
+    #[cfg(windows)]
+    {
+        crate::stopsig::disarm_and_restore();
     }
     if interrupted {
         c.close();

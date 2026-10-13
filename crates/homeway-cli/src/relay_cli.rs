@@ -148,14 +148,8 @@ impl RelayProc {
         let Some(stop) = self.stop.take() else {
             return; // 已收口（幂等）
         };
-        // disarm：先断 handler 的写面（handler 里 `fd >= 0` 才写）
-        let armed_here = STOP_FD.swap(-1, std::sync::atomic::Ordering::SeqCst) >= 0;
-        if armed_here {
-            unsafe {
-                libc::signal(libc::SIGTERM, libc::SIG_DFL);
-                libc::signal(libc::SIGINT, libc::SIG_DFL);
-            }
-        }
+        // disarm：先断 handler 的写面（stopsig 的 swap 先于恢复——原不变式逐字保留）。
+        let _armed_here = crate::stopsig::disarm_and_restore();
         stop.signal();
         if let Some(h) = self.join.take() {
             let _ = h.join();
@@ -171,9 +165,8 @@ impl RelayProc {
     /// 未 armed 窗口（装配后 ~ 本调用前）由前台循环的「`exited()` 判失败 +
     /// `SIGNAL_HIT` 判信号」兜底，不会漏 Ctrl-C。
     pub fn arm_signal(&self) {
-        STOP_FD.store(
-            self.stop.as_ref().map(|s| s.write_fd()).unwrap_or(-1),
-            std::sync::atomic::Ordering::SeqCst,
+        crate::stopsig::arm(
+            self.stop.as_ref().map(|s| s.write_fd()).unwrap_or(crate::stopsig::DISARMED),
         );
     }
 
@@ -357,7 +350,7 @@ pub fn cmd_relay(args: &[String]) {
     // Q-G F3：等待面 = 信号标志 + `exited()` 位（不再 poll stop 管道——那是 run
     // 的通道，双读者会抢字节）。
     loop {
-        if SIGNAL_HIT.load(std::sync::atomic::Ordering::SeqCst) {
+        if crate::stopsig::HIT.load(std::sync::atomic::Ordering::SeqCst) {
             break; // 正常 Ctrl-C/SIGTERM 路径（run 侧已由 handler 写醒）
         }
         if proc.exited() {
@@ -381,42 +374,23 @@ pub fn acquire_lock_or_exit(state_dir: &std::path::Path, form: &str) -> homeway_
     }
 }
 
-// ---------- stop 管道（与 serve_cli 同款形态） ----------
+// ---------- stop 管道（WIN 批：STOP_FD/SIGNAL_HIT/handler 收敛到 `stopsig` 单源——
+// unix 臂与原实现逐调用同形；windows = 控制台事件 + 回环对，§D8） ----------
 
-static STOP_FD: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
-
-/// 前台形态收到 SIGINT/SIGTERM 的标志（单通道形态的「正常收工」判据——handler
-/// 与前台等待循环的唯一共享面；统一进程不装该 handler，故此标志恒 false）。
-static SIGNAL_HIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-extern "C" fn on_stop_signal(_sig: i32) {
-    // handler 只做两件事：置命中标志 + （若已 armed）写停止字节。
-    SIGNAL_HIT.store(true, std::sync::atomic::Ordering::SeqCst);
-    let fd = STOP_FD.load(std::sync::atomic::Ordering::SeqCst);
-    if fd >= 0 {
-        unsafe {
-            let b = b"x";
-            libc::write(fd, b.as_ptr().cast(), 1);
-        }
-    }
-}
-
+/// 前台形态收到 SIGINT/SIGTERM（或 windows 控制台事件）的标志（单通道形态的
+/// 「正常收工」判据——handler 与前台等待循环的唯一共享面；统一进程不装该
+/// handler，故此标志恒 false）。
 /// 前台单角色形态：装信号 handler（Ctrl-C/SIGTERM → relay stop 管道）。
 /// **统一进程不调用**（handler 由宿主统一安装——装配期覆盖宿主 handler 会造成
 /// 「relay 收工、主线程挂等」的半死窗口，评审 r1-Z5）。停止管道本体在
 /// `assemble_relay` 建（`RelayProc` 持有），此处只把写端交给 handler。
 fn install_relay_stop_signal() {
-    unsafe {
-        let h = on_stop_signal as extern "C" fn(i32) as libc::sighandler_t;
-        libc::signal(libc::SIGTERM, h);
-        libc::signal(libc::SIGINT, h);
-    }
+    crate::stopsig::install();
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::atomic::Ordering as AOrd;
 
     /// Q-G F3（CLI 层）：`STOP_FD` 的 arm/disarm 单源 + `shutdown` 幂等。
     ///
@@ -435,14 +409,14 @@ mod tests {
             exited: Arc::new(std::sync::atomic::AtomicBool::new(true)),
         };
         proc.arm_signal();
-        assert_eq!(STOP_FD.load(AOrd::SeqCst), w_fd, "arm 后 STOP_FD = 写端号");
+        assert_eq!(crate::stopsig::armed(), w_fd, "arm 后 ARMED = 写端句柄");
         assert!(proc.exited(), "exited 位透传");
         proc.shutdown();
-        assert_eq!(STOP_FD.load(AOrd::SeqCst), -1, "shutdown 后必须 disarm");
+        assert_eq!(crate::stopsig::armed(), crate::stopsig::DISARMED, "shutdown 后必须 disarm");
         assert!(proc.stop.is_none(), "两端已 take（结构断言，不用 F_GETFD 判 EBADF）");
         proc.shutdown(); // 幂等：再来一次不 panic
         drop(proc); // Drop 走同一 shutdown：同样幂等
-        assert_eq!(STOP_FD.load(AOrd::SeqCst), -1);
+        assert_eq!(crate::stopsig::armed(), crate::stopsig::DISARMED);
     }
 
     /// S7a（Q2）：`:port` 形态 = **任意地址占位**（`0.0.0.0` 字面 + `is_unspecified()`

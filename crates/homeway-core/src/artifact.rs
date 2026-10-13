@@ -20,7 +20,6 @@
 //! 工件互通）。pax 扩展头（'x'/'g'）与本布局不会出现，读到达即拒（可行动文案）。
 
 use std::io::{Read, Write};
-use std::os::unix::fs::OpenOptionsExt as _;
 use std::path::Path;
 
 /// 工件顶层目录名（Go exportTop）。
@@ -94,13 +93,20 @@ pub fn export(state_dir: &Path, dest: &Path) -> Result<(), String> {
         }
     }
     let bytes = tar.finish();
-    let mut f = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .truncate(true)
-        .mode(0o600)
-        .open(dest)
-        .map_err(|e| e.to_string())?;
+    // 工件 0600（WIN 批 §D11：windows 无 mode 位——普通开）。
+    #[cfg(unix)]
+    let f = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(dest)
+    };
+    #[cfg(not(unix))]
+    let f = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(dest);
+    let mut f = f.map_err(|e| e.to_string())?;
     f.write_all(&bytes).map_err(|e| e.to_string())?;
     Ok(())
 }
@@ -191,11 +197,19 @@ struct Entry {
 
 /// 工件落位（校验 → 解包 → 落位序 → 回滚）。成功后旧四件备份目录一并清理。
 pub fn import(state_dir: &Path, artifact: &Path) -> Result<(), String> {
+    // 目录 0700（评审 r2-9：create_dir_all 默认 0755）。WIN 批（§D11）：windows
+    // 无 mode 位——普通建。
+    #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt as _;
         let mut b = std::fs::DirBuilder::new();
         b.mode(0o700).recursive(true).create(state_dir).map_err(|e| e.to_string())?;
     }
+    #[cfg(not(unix))]
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .create(state_dir)
+        .map_err(|e| e.to_string())?;
     // 目标进程在停（锁试探；在跑 = 可行动错误拒绝）。
     if lock_held(state_dir)? {
         return Err(format!(
@@ -354,11 +368,17 @@ fn validate_artifact(entries: &[Entry]) -> Result<(), String> {
 }
 
 /// 解包到临时目录（文件 0600、目录 0700——评审 r2-9：create_dir_all 默认 0755）。
+/// WIN 批（§D11）：windows 无 mode 位——普通建/普通开。
 fn extract_artifact(entries: &[Entry], tmp_dir: &Path) -> Result<(), String> {
-    use std::os::unix::fs::DirBuilderExt as _;
+    #[cfg(unix)]
     fn mkdir_700(p: &Path) -> std::io::Result<()> {
+        use std::os::unix::fs::DirBuilderExt as _;
         let mut b = std::fs::DirBuilder::new();
         b.mode(0o700).recursive(true).create(p)
+    }
+    #[cfg(not(unix))]
+    fn mkdir_700(p: &Path) -> std::io::Result<()> {
+        std::fs::DirBuilder::new().recursive(true).create(p)
     }
     for e in entries {
         if e.name == EXPORT_TOP {
@@ -372,13 +392,19 @@ fn extract_artifact(entries: &[Entry], tmp_dir: &Path) -> Result<(), String> {
         if let Some(parent) = dst.parent() {
             mkdir_700(parent).map_err(|err| err.to_string())?;
         }
-        std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(true)
-            .mode(0o600)
-            .open(&dst)
-            .and_then(|mut f| f.write_all(&e.data))
+        #[cfg(unix)]
+        let f = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&dst)
+        };
+        #[cfg(not(unix))]
+        let f = std::fs::OpenOptions::new().create(true).write(true).truncate(true).open(&dst);
+        f.and_then(|mut f| f.write_all(&e.data))
             .map_err(|err| err.to_string())?;
     }
     Ok(())
@@ -418,12 +444,19 @@ fn place_pieces_inner(
         if !src.exists() {
             continue;
         }
+        // 旧件暂存目录 0700（同 import 的 state 目录契约；WIN 批：windows 普通建）。
+        #[cfg(unix)]
         {
             use std::os::unix::fs::DirBuilderExt as _;
             let mut b = std::fs::DirBuilder::new();
             b.mode(0o700).recursive(true).create(old_dir)
                 .map_err(|e| format!("import: 建旧件暂存目录失败：{e}"))?;
         }
+        #[cfg(not(unix))]
+        std::fs::DirBuilder::new()
+            .recursive(true)
+            .create(old_dir)
+            .map_err(|e| format!("import: 建旧件暂存目录失败：{e}"))?;
         std::fs::rename(&src, old_dir.join(p))
             .map_err(|e| format!("import: 旧件 {p} 搬走失败：{e}"))?;
         moved_old.push((*p).to_owned());
@@ -457,11 +490,17 @@ pub fn reset_cache(state_dir: &Path) -> Result<(), String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => {} // Go os.RemoveAll 语义
         Err(e) => return Err(e.to_string()),
     }
+    // 重建空 cache（0700；WIN 批：windows 普通建）。
+    #[cfg(unix)]
     {
         use std::os::unix::fs::DirBuilderExt as _;
         let mut b = std::fs::DirBuilder::new();
         b.mode(0o700).create(state_dir.join("cache")).map_err(|e| e.to_string())?;
     }
+    #[cfg(not(unix))]
+    std::fs::DirBuilder::new()
+        .create(state_dir.join("cache"))
+        .map_err(|e| e.to_string())?;
     Ok(())
 }
 
@@ -477,17 +516,13 @@ fn lock_held(state_dir: &Path) -> Result<bool, String> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(format!("锁试探失败（{}）：{e}", path.display())),
     };
-    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&f);
-    let r = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if r != 0 {
-        let e = std::io::Error::last_os_error();
-        if e.kind() == std::io::ErrorKind::WouldBlock {
-            return Ok(true); // 有人持有
-        }
-        return Err(format!("锁试探失败（{}）：{e}", path.display()));
+    // flock EX|NB 试探（WIN 批 §D5：windows = LockFileEx，syslock 单源——句柄关闭
+    // 即释放，探测不持锁）。
+    match crate::syslock::try_lock_exclusive(&f) {
+        Ok(crate::syslock::LockOutcome::Acquired) => Ok(false),
+        Ok(crate::syslock::LockOutcome::Held) => Ok(true), // 有人持有
+        Err(e) => Err(format!("锁试探失败（{}）：{e}", path.display())),
     }
-    unsafe { libc::flock(fd, libc::LOCK_UN) };
-    Ok(false)
 }
 
 fn timestamp() -> String {
@@ -496,19 +531,18 @@ fn timestamp() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    // 本地时区偏移：靠 libc localtime_r 拿（无 chrono 依赖）。
-    unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&secs, &mut tm);
-        format!(
+    // 本地时区经 systime 单源（WIN 批：unix = localtime_r 原样；失败回 UTC 形态）。
+    match crate::systime::localtime(secs) {
+        Some(tm) => format!(
             "{:04}{:02}{:02}-{:02}{:02}{:02}",
-            tm.tm_year as i64 + 1900,
-            tm.tm_mon + 1,
-            tm.tm_mday,
-            tm.tm_hour,
-            tm.tm_min,
-            tm.tm_sec
-        )
+            tm.year,
+            tm.mon,
+            tm.mday,
+            tm.hour,
+            tm.min,
+            tm.sec
+        ),
+        None => format!("{secs}"),
     }
 }
 
@@ -702,6 +736,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(unix)] // WIN 批：工件 0600 权限位断言 = unix 专属语义
     fn export_import_roundtrip() {
         let src = tmpdir("rt-src");
         seed_state(&src);

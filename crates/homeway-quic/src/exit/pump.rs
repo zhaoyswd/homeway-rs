@@ -29,7 +29,7 @@
 //! **本文件属异步面**（隔离门 ② 条的 `ASYNC_FILES` 显式清单；照 `exit/serve.rs` 先例）。
 
 use std::io;
-use std::os::unix::net::UnixStream as StdUnixStream;
+use crate::sysio::{self, SvcStream};
 use std::sync::Arc;
 use std::time::Instant;
 
@@ -43,22 +43,11 @@ use crate::stream::StreamTag;
 ///
 /// 注（Linux 事实，如实登记）：内核把 `SO_SNDBUF` 的设定值**翻倍**作内部记账（`getsockopt`
 /// 读回 2×）；设置面仍是「每方向 64 KiB」这一设计值，`sum .so`/内存账按设置值记。
-fn set_sockbuf(sock: &StdUnixStream, bytes: usize) -> io::Result<()> {
-    let v = libc::c_int::try_from(bytes).unwrap_or(libc::c_int::MAX);
-    for opt in [libc::SO_SNDBUF, libc::SO_RCVBUF] {
-        // SAFETY：`setsockopt` 只读 `v` 的 4 字节；失败原样上抛（调用方按「起不来」处置）。
-        let r = unsafe {
-            libc::setsockopt(
-                std::os::fd::AsRawFd::as_raw_fd(sock),
-                libc::SOL_SOCKET,
-                opt,
-                std::ptr::addr_of!(v).cast(),
-                std::mem::size_of_val(&v) as libc::socklen_t,
-            )
-        };
-        if r != 0 {
-            return Err(io::Error::last_os_error());
-        }
+fn set_sockbuf(sock: &SvcStream, bytes: usize) -> io::Result<()> {
+    let v = i32::try_from(bytes).unwrap_or(i32::MAX);
+    // WIN 批：sockopt 经 sysio（unix 臂与原 libc 直调同形）。
+    for opt in [sysio::SO_SNDBUF, sysio::SO_RCVBUF] {
+        sysio::setsockopt_i32(sysio::svc_raw(sock), sysio::SOL_SOCKET, opt, v)?;
     }
     Ok(())
 }
@@ -67,8 +56,9 @@ fn set_sockbuf(sock: &StdUnixStream, bytes: usize) -> io::Result<()> {
 ///
 /// 两端都置非阻塞：服务侧端由 [`crate::exit::intake::ServiceIntake::accept`] 交出去之前
 /// 会置回阻塞（服务本体的语义要阻塞 fd），泵侧端直接交 `tokio::net::UnixStream`。
-pub(crate) fn socketpair(bytes: usize) -> io::Result<(StdUnixStream, StdUnixStream)> {
-    let (svc, pump) = StdUnixStream::pair()?;
+pub(crate) fn socketpair(bytes: usize) -> io::Result<(SvcStream, SvcStream)> {
+    // WIN 批：unix = UnixStream::pair / windows = 回环 TCP 对（sysio::pair 单源）。
+    let (svc, pump) = sysio::pair()?;
     for s in [&svc, &pump] {
         set_sockbuf(s, bytes)?;
         s.set_nonblocking(true)?;
@@ -83,13 +73,18 @@ pub(crate) fn socketpair(bytes: usize) -> io::Result<(StdUnixStream, StdUnixStre
 pub(crate) async fn run(
     mut send: SendStream,
     mut recv: RecvStream,
-    sock: StdUnixStream,
+    sock: SvcStream,
     tag: StreamTag,
     conn_id: u64,
     ctx: Arc<FaceCtx>,
 ) {
     let t0 = Instant::now();
-    let io = match tokio::net::UnixStream::from_std(sock) {
+    // 承载流进 runtime（unix = UDS / windows = TCP——同款 from_std 形态，WIN 批）。
+    #[cfg(unix)]
+    let tried = tokio::net::UnixStream::from_std(sock);
+    #[cfg(windows)]
+    let tried = tokio::net::TcpStream::from_std(sock);
+    let io = match tried {
         Ok(io) => io,
         Err(e) => {
             (*ctx.logf)(&format!(
@@ -229,25 +224,15 @@ mod tests {
     fn socketpair_buffers_are_set_to_the_designed_value() {
         let bytes = crate::tuning::service_defaults::SOCKPAIR_BYTES;
         let (a, b) = socketpair(bytes).expect("建 socketpair");
-        let get = |s: &StdUnixStream, opt: libc::c_int| -> usize {
-            let mut v: libc::c_int = 0;
-            let mut len = std::mem::size_of_val(&v) as libc::socklen_t;
-            let r = unsafe {
-                libc::getsockopt(
-                    std::os::fd::AsRawFd::as_raw_fd(s),
-                    libc::SOL_SOCKET,
-                    opt,
-                    std::ptr::addr_of_mut!(v).cast(),
-                    &mut len,
-                )
-            };
-            assert_eq!(r, 0, "getsockopt");
-            v as usize
+        // WIN 批：sockopt 读写经 sysio（承载流类型随平台——SvcStream 别名）。
+        let get = |s: &SvcStream, opt: i32| -> usize {
+            crate::sysio::getsockopt_i32(crate::sysio::svc_raw(s), crate::sysio::SOL_SOCKET, opt)
+                .expect("getsockopt") as usize
         };
         for s in [&a, &b] {
-            let rcv = get(s, libc::SO_RCVBUF);
+            let rcv = get(s, crate::sysio::SO_RCVBUF);
             assert!(rcv >= bytes, "SO_RCVBUF 未按设计值设置：读回 {rcv} < {bytes}");
-            let snd = get(s, libc::SO_SNDBUF);
+            let snd = get(s, crate::sysio::SO_SNDBUF);
             if cfg!(target_os = "linux") {
                 assert!(snd >= bytes, "SO_SNDBUF 未按设计值设置：读回 {snd} < {bytes}");
             } else {

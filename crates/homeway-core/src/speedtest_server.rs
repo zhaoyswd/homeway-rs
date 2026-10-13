@@ -12,13 +12,14 @@
 //! 单连接硬超时 30s、预热 ≤5s、窗口 ∈[100ms,15s]、data 载荷 ≤65535。
 
 use std::io::{BufReader, BufWriter, Read, Write};
-use std::os::unix::net::{UnixListener, UnixStream};
 
 use homeway_quic::ServiceIntake;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::daemon::ipc::{IpcListener, IpcStream};
+use crate::files_server::intake_conn;
 use crate::go_fmt::fmt_duration_go_ms;
 use crate::speedtest::{
     crc32_ieee, zero_crc, HEADER, MAGIC, TYPE_DATA, TYPE_FINISH, TYPE_REPORT, TYPE_REQUEST,
@@ -125,13 +126,13 @@ struct CountingRegistry {
     live: usize,
     /// 在册会话句柄（会话号 → dup 句柄；F6b：`release(id)` 按会话收口——修前
     /// `release()` 清整表，任一会话结束会把其它在跑会话的句柄从账上抹掉）。
-    conns: Vec<(u64, UnixStream)>,
+    conns: Vec<(u64, IpcStream)>,
 }
 
 impl CountingRegistry {
     /// 受理：满员 None；否则在册 +1 并返回**单调会话号**（评审 H3——Go connreg
     /// 单调自增语义，可 >MAX_CONNS）。
-    fn admit(&mut self, id_alloc: &AtomicU64, conn: &UnixStream, max_conns: usize) -> Option<u64> {
+    fn admit(&mut self, id_alloc: &AtomicU64, conn: &IpcStream, max_conns: usize) -> Option<u64> {
         if self.live >= max_conns {
             return None;
         }
@@ -177,9 +178,10 @@ impl SpeedtestServer {
     }
 
     /// 受理循环（每连接一线程；accept 出错即返回——listener 由持有方关）。
-    pub fn serve(self: &Arc<Self>, ln: UnixListener) -> std::io::Result<()> {
-        for conn in ln.incoming() {
-            let conn = conn?;
+    /// WIN 批：承载经 `ipc.rs`（unix = UDS / windows = TCP loopback + 端口文件）。
+    pub fn serve(self: &Arc<Self>, ln: IpcListener) -> std::io::Result<()> {
+        loop {
+            let conn = ln.accept()?;
             let srv = Arc::clone(self);
             std::thread::Builder::new()
                 .name("homeway-speedtest".into())
@@ -187,7 +189,6 @@ impl SpeedtestServer {
                 .spawn(move || srv.serve_conn(conn))
                 .ok();
         }
-        Ok(())
     }
 
     /// 可停形态（引擎收工面）。accept 错误分类/退避/节流日志走共享件
@@ -203,7 +204,7 @@ impl SpeedtestServer {
     ) -> std::io::Result<()> {
         let logf = self.logf.clone();
         let r = crate::files_server::serve_stoppable_accepts(
-            || intake.accept(),
+            || intake.accept().map(intake_conn),
             move |conn| {
                 let srv = Arc::clone(self);
                 let logf = logf.clone();
@@ -231,7 +232,7 @@ impl SpeedtestServer {
         self.conns.lock().map(|c| c.live).unwrap_or(0)
     }
 
-    fn serve_conn(self: Arc<Self>, conn: UnixStream) {
+    fn serve_conn(self: Arc<Self>, conn: IpcStream) {
         // 上限判定与登记同临界区；拒绝路径先有界读掉请求帧再回帧（r1 中-1②：回帧后
         // 立刻关会走 RST 路径、已发出的 report 可能被对端丢弃）。
         let conn_id = {
@@ -329,7 +330,7 @@ impl SpeedtestServer {
     /// R8-2 归因插桩：窗口段按 1s 切片泵送（共享同一截止时刻——墙钟行为与整段
     /// pump_data 等价，切片只用于计量），末尾多打一行逐秒字节序列 + 尾 3s 速率
     /// ——真机下行「爬坡支配 vs 稳态封顶」的判别面（窗口均值会掩盖前者）。
-    fn serve_recv(&self, id: u64, w: &UnixStream, warmup: Duration, window: Duration, deadline: Instant) {
+    fn serve_recv(&self, id: u64, w: &IpcStream, warmup: Duration, window: Duration, deadline: Instant) {
         let mut bw = BufWriter::new(DeadlineIo { sock: w, deadline });
         let block = vec![0u8; self.limits.send_block];
         let mut seq: u32 = 0;
@@ -399,7 +400,7 @@ impl SpeedtestServer {
     }
 
     /// role=send：读帧计数——START 前 = 预热，START 后 = 窗口；FINISH 触发 report。
-    fn serve_send(&self, id: u64, r: &mut BufReader<DeadlineIo<'_>>, w: &UnixStream, deadline: Instant) {
+    fn serve_send(&self, id: u64, r: &mut BufReader<DeadlineIo<'_>>, w: &IpcStream, deadline: Instant) {
         let mut window_bytes: i64 = 0;
         let mut warmup_bytes: i64 = 0;
         let mut started = false;
@@ -477,7 +478,7 @@ impl SpeedtestServer {
 
 /// 按**绝对期限**收敛设置读写超时（每次触达 socket 的读写前调用——`SO_RCVTIMEO`
 /// 是 per-syscall，只在会话开头设一次会被慢滴客户端每次成功读续命；零即设 1ms 立即失败）。
-fn arm_io(conn: &UnixStream, deadline: Instant) {
+fn arm_io(conn: &IpcStream, deadline: Instant) {
     let remain = deadline.saturating_duration_since(Instant::now());
     if remain.is_zero() {
         let _ = conn.set_read_timeout(Some(Duration::from_millis(1)));
@@ -493,7 +494,7 @@ fn arm_io(conn: &UnixStream, deadline: Instant) {
 /// 「每次成功读续命」把会话拖过期限）。设计 R8 的三个 arm 点（读前 / flush 前 /
 /// 直写前）由本适配器统一覆盖。
 struct DeadlineIo<'a> {
-    sock: &'a UnixStream,
+    sock: &'a IpcStream,
     deadline: Instant,
 }
 
@@ -591,7 +592,7 @@ fn json_escape(s: &str) -> String {
 }
 
 /// 失败收场：回 report（error 形态）后冲刷（写前按绝对期限 arm）。
-fn finish_with_error(w: &UnixStream, msg: &str, deadline: Instant) {
+fn finish_with_error(w: &IpcStream, msg: &str, deadline: Instant) {
     let mut bw = BufWriter::new(DeadlineIo { sock: w, deadline });
     let rep = report_json(0, 0, 0, Some(msg));
     let _ = write_control(&mut bw, TYPE_REPORT, rep.as_bytes());
@@ -602,7 +603,7 @@ fn finish_with_error(w: &UnixStream, msg: &str, deadline: Instant) {
 /// 回 report 并冲刷 → 短窗继续吞输入（send 角色在回帧抵达前还在泵）→ 关。
 /// 两段各自**绝对期限**（F6c：帧吞 `now+2s`、循环 `now+1s`——per-syscall 续命会让
 /// 滴流连接永久占住一条线程）。
-fn reply_then_close(conn: UnixStream, error_report: &str) {
+fn reply_then_close(conn: IpcStream, error_report: &str) {
     let Ok(r_stream) = conn.try_clone() else { return };
     {
         let frame_deadline = Instant::now() + BUSY_FRAME_BUDGET;
@@ -741,7 +742,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("speedtest.sock");
         let _ = std::fs::remove_file(&sock);
-        let ln = UnixListener::bind(&sock).unwrap();
+        let ln = IpcListener::bind(&sock).unwrap();
         let logf: crate::Logf = Arc::new(|_| {});
         let srv = Arc::new(SpeedtestServer::new(Arc::clone(&logf)));
         let srv2 = Arc::clone(&srv);
@@ -749,7 +750,7 @@ mod tests {
             let _ = srv2.serve(ln);
         });
 
-        let mut c = UnixStream::connect(&sock).unwrap();
+        let mut c = IpcStream::connect(&sock).unwrap();
         // 请求：role=recv、warmup 100ms、window 300ms
         let req = br#"{"role":"recv","warmup_ms":100,"window_ms":300}"#;
         write_control(&mut c, TYPE_REQUEST, req).unwrap();
@@ -790,7 +791,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("speedtest.sock");
         let _ = std::fs::remove_file(&sock);
-        let ln = UnixListener::bind(&sock).unwrap();
+        let ln = IpcListener::bind(&sock).unwrap();
         let lines = Arc::new(Mutex::new(Vec::<String>::new()));
         let l2 = Arc::clone(&lines);
         let logf: crate::Logf = Arc::new(move |s: &str| {
@@ -802,7 +803,7 @@ mod tests {
             let _ = srv2.serve(ln);
         });
 
-        let mut c = UnixStream::connect(&sock).unwrap();
+        let mut c = IpcStream::connect(&sock).unwrap();
         let req = br#"{"role":"send","warmup_ms":50,"window_ms":200}"#;
         write_control(&mut c, TYPE_REQUEST, req).unwrap();
         // 预热泵 3 帧 → START → 窗口泵 5 帧 → FINISH
@@ -857,7 +858,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("speedtest.sock");
         let _ = std::fs::remove_file(&sock);
-        let ln = UnixListener::bind(&sock).unwrap();
+        let ln = IpcListener::bind(&sock).unwrap();
         let lines = Arc::new(Mutex::new(Vec::<String>::new()));
         let l2 = Arc::clone(&lines);
         let logf: crate::Logf = Arc::new(move |s: &str| {
@@ -870,7 +871,7 @@ mod tests {
         });
         // 两轮 role=send（收口即退——每轮一个号）
         for _ in 0..2 {
-            let mut c = UnixStream::connect(&sock).unwrap();
+            let mut c = IpcStream::connect(&sock).unwrap();
             write_control(&mut c, TYPE_REQUEST, br#"{"role":"send","warmup_ms":10,"window_ms":100}"#).unwrap();
             write_control(&mut c, TYPE_START, &[]).unwrap();
             write_control(&mut c, TYPE_FINISH, &[]).unwrap();
@@ -906,12 +907,13 @@ mod tests {
     /// ② 在册满 ⇒ **应用层 busy 报表在 intake 面仍可达**（第 13 条拿到 `"error":"busy"`）；
     /// ③ 入口容量 = 在册上限 + K（装配点的算式与常量一致）。
     #[test]
+    #[cfg(unix)] // WIN 批：from_listener 的 UDS 源与 socketpair 造法 = unix 专属
     fn intake_two_sources_serve_identical_bytes_and_busy_stays_reachable() {
         let dir = std::env::temp_dir().join(format!("homeway-rs-spintake-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("speedtest.sock");
         let _ = std::fs::remove_file(&sock);
-        let ln = UnixListener::bind(&sock).unwrap();
+        let ln = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         let logf: crate::Logf = Arc::new(|_| {});
         let srv = Arc::new(SpeedtestServer::new(Arc::clone(&logf)));
 
@@ -930,16 +932,16 @@ mod tests {
 
         // 同一请求（未知角色 ⇒ `finish_with_error` 定型帧）在两条入口上跑：字节对比
         let bad = br#"{"role":"bogus","warmup_ms":0,"window_ms":100}"#;
-        let run = |mut c: UnixStream| -> Vec<u8> {
+        let run = |mut c: std::os::unix::net::UnixStream| -> Vec<u8> {
             write_control(&mut c, TYPE_REQUEST, bad).unwrap();
             let mut r = BufReader::new(c);
             let f = read_frame(&mut r).expect("错误报表帧");
             assert_eq!(f.0, TYPE_REPORT);
             f.1
         };
-        let c_uds = UnixStream::connect(&sock).unwrap();
+        let c_uds = std::os::unix::net::UnixStream::connect(&sock).unwrap();
         let rep_uds = run(c_uds);
-        let (svc_end, cli_end) = UnixStream::pair().unwrap();
+        let (svc_end, cli_end) = std::os::unix::net::UnixStream::pair().unwrap();
         tx.try_enqueue(svc_end).expect("入队");
         let rep_quic = run(cli_end);
         assert_eq!(rep_quic, rep_uds, "两源同协议面：应答帧逐字节相同");
@@ -952,7 +954,7 @@ mod tests {
         // ② 在册满（12 条经 intake 的会话挂着）⇒ 第 13 条走应用层 busy
         let mut holders = Vec::new();
         for _ in 0..MAX_CONNS {
-            let (svc_end, cli_end) = UnixStream::pair().unwrap();
+            let (svc_end, cli_end) = std::os::unix::net::UnixStream::pair().unwrap();
             tx.try_enqueue(svc_end).expect("入队");
             holders.push(cli_end); // 不写请求：会话线程挂在读请求帧上（名额持住）
         }
@@ -961,7 +963,7 @@ mod tests {
             assert!(Instant::now() < deadline, "在册数未达上限：{}", srv.live());
             std::thread::sleep(Duration::from_millis(20));
         }
-        let (svc_end, cli_end) = UnixStream::pair().unwrap();
+        let (svc_end, cli_end) = std::os::unix::net::UnixStream::pair().unwrap();
         tx.try_enqueue(svc_end).expect("第 13 条入队（入口未满——在册闸先触发）");
         let mut c = cli_end;
         write_control(&mut c, TYPE_REQUEST, br#"{"role":"recv","warmup_ms":100,"window_ms":200}"#).unwrap();
@@ -986,7 +988,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("speedtest.sock");
         let _ = std::fs::remove_file(&sock);
-        let ln = UnixListener::bind(&sock).unwrap();
+        let ln = IpcListener::bind(&sock).unwrap();
         let logf: crate::Logf = Arc::new(|_| {});
         let srv = Arc::new(SpeedtestServer::new(Arc::clone(&logf)));
         let srv2 = Arc::clone(&srv);
@@ -996,13 +998,13 @@ mod tests {
         // 占满：12 条并发 recv 会话（每条 30s 超时内不退出）
         let mut holders = Vec::new();
         for _ in 0..MAX_CONNS {
-            let mut c = UnixStream::connect(&sock).unwrap();
+            let mut c = IpcStream::connect(&sock).unwrap();
             write_control(&mut c, TYPE_REQUEST, br#"{"role":"recv","warmup_ms":1000,"window_ms":5000}"#).unwrap();
             holders.push(c);
         }
         std::thread::sleep(Duration::from_millis(200));
         // 第 13 条：busy 回帧
-        let mut c = UnixStream::connect(&sock).unwrap();
+        let mut c = IpcStream::connect(&sock).unwrap();
         write_control(&mut c, TYPE_REQUEST, br#"{"role":"recv","warmup_ms":100,"window_ms":200}"#).unwrap();
         let mut r = BufReader::new(c);
         let rep = read_frame(&mut r).expect("busy report 应到达");
@@ -1023,7 +1025,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("speedtest.sock");
         let _ = std::fs::remove_file(&sock);
-        let ln = UnixListener::bind(&sock).unwrap();
+        let ln = IpcListener::bind(&sock).unwrap();
         let logf: crate::Logf = Arc::new(|_| {});
         let srv = Arc::new(SpeedtestServer::with_limits(
             Arc::clone(&logf),
@@ -1033,7 +1035,7 @@ mod tests {
         std::thread::spawn(move || {
             let _ = srv2.serve(ln);
         });
-        let mut c = UnixStream::connect(&sock).unwrap();
+        let mut c = IpcStream::connect(&sock).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         write_control(&mut c, TYPE_REQUEST, br#"{"role":"send","warmup_ms":0,"window_ms":100}"#).unwrap();
         // 滴流：每 100ms 1 字节（对端逐 syscall 续命即永远读不完帧头）
@@ -1074,7 +1076,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("speedtest.sock");
         let _ = std::fs::remove_file(&sock);
-        let ln = UnixListener::bind(&sock).unwrap();
+        let ln = IpcListener::bind(&sock).unwrap();
         let logf: crate::Logf = Arc::new(|_| {});
         let srv = Arc::new(SpeedtestServer::with_limits(
             Arc::clone(&logf),
@@ -1084,7 +1086,7 @@ mod tests {
         std::thread::spawn(move || {
             let _ = srv2.serve(ln);
         });
-        let mut c = UnixStream::connect(&sock).unwrap();
+        let mut c = IpcStream::connect(&sock).unwrap();
         write_control(&mut c, TYPE_REQUEST, br#"{"role":"send","warmup_ms":10,"window_ms":100}"#).unwrap();
         write_control(&mut c, TYPE_START, &[]).unwrap();
         write_control(&mut c, TYPE_FINISH, &[]).unwrap();
@@ -1100,13 +1102,17 @@ mod tests {
     /// 在册表：`release(id)` 只摘自己那条（修前清整表）；`close_all` 切断全部在跑会话
     /// 且 `live = 0` 是事实。
     #[test]
+    #[cfg(unix)] // WIN 批：from_listener 的 UDS 源与 socketpair 造法 = unix 专属
     fn release_by_session_id_and_close_all() {
-        let (a1, a2) = UnixStream::pair().unwrap();
-        let (b1, mut b2) = UnixStream::pair().unwrap();
+        let (a1, _a2) = std::os::unix::net::UnixStream::pair().unwrap();
+        let (b1, mut b2) = std::os::unix::net::UnixStream::pair().unwrap();
+        // 归 wrap 的流必须活到断言之后（临时量会在 admit 语句尾被 drop——提前关
+        // 原始 fd 会改变 close_all 前的连接形态）。
+        let (ia1, ib1) = (IpcStream::Unix(a1), IpcStream::Unix(b1));
         let mut reg = CountingRegistry { live: 0, conns: Vec::new() };
         let alloc = AtomicU64::new(0);
-        let id1 = reg.admit(&alloc, &a1, MAX_CONNS).expect("会话 1");
-        let id2 = reg.admit(&alloc, &b1, MAX_CONNS).expect("会话 2");
+        let id1 = reg.admit(&alloc, &ia1, MAX_CONNS).expect("会话 1");
+        let id2 = reg.admit(&alloc, &ib1, MAX_CONNS).expect("会话 2");
         assert_eq!((id1, id2), (1, 2));
         assert_eq!(reg.live, 2);
         reg.release(id1);
@@ -1127,18 +1133,19 @@ mod tests {
                 "应是 EOF/连接类错误而非超时：{e}"
             ),
         }
-        drop((a1, a2, b1));
+        // a1/b1 已随 admit 的 IpcStream 归 wrap 移交注册表（close_all 后随 reg drop）
     }
 
     /// 真会话端到端：两条 role=send 挂住 → 会话 1 FINISH 收口后 `live()==1` →
     /// 停止位置位（serve_stoppable 收工）⇒ 会话 2 被切断。
     #[test]
+    #[cfg(unix)] // WIN 批：from_listener 的 UDS 源 = unix 专属
     fn stop_cuts_remaining_sessions_after_release() {
         let dir = std::env::temp_dir().join(format!("homeway-rs-sprel-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("speedtest.sock");
         let _ = std::fs::remove_file(&sock);
-        let ln = UnixListener::bind(&sock).unwrap();
+        let ln = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         let logf: crate::Logf = Arc::new(|_| {});
         let srv = Arc::new(SpeedtestServer::new(Arc::clone(&logf)));
         let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
@@ -1151,10 +1158,10 @@ mod tests {
                 let _ = srv2.serve_stoppable(intake, stop2);
             });
         }
-        let mut c1 = UnixStream::connect(&sock).unwrap();
+        let mut c1 = IpcStream::connect(&sock).unwrap();
         c1.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         write_control(&mut c1, TYPE_REQUEST, br#"{"role":"send","warmup_ms":0,"window_ms":100}"#).unwrap();
-        let mut c2 = UnixStream::connect(&sock).unwrap();
+        let mut c2 = IpcStream::connect(&sock).unwrap();
         c2.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
         write_control(&mut c2, TYPE_REQUEST, br#"{"role":"send","warmup_ms":0,"window_ms":100}"#).unwrap();
         let wait_live = |want: usize| {
@@ -1201,7 +1208,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("speedtest.sock");
         let _ = std::fs::remove_file(&sock);
-        let ln = UnixListener::bind(&sock).unwrap();
+        let ln = IpcListener::bind(&sock).unwrap();
         let logf: crate::Logf = Arc::new(|_| {});
         let srv = Arc::new(SpeedtestServer::new(Arc::clone(&logf)));
         let srv2 = Arc::clone(&srv);
@@ -1210,14 +1217,14 @@ mod tests {
         });
         let mut holders = Vec::new();
         for _ in 0..MAX_CONNS {
-            let mut c = UnixStream::connect(&sock).unwrap();
+            let mut c = IpcStream::connect(&sock).unwrap();
             write_control(&mut c, TYPE_REQUEST, br#"{"role":"recv","warmup_ms":1000,"window_ms":5000}"#).unwrap();
             holders.push(c);
         }
         std::thread::sleep(Duration::from_millis(200));
         // 第 13 条：滴流（每 700ms 1 字节，共 15B 帧头；帧头 10.5s 才凑齐——修前
         // per-syscall 续命 ⇒ 回帧要等帧头凑齐/对端停发）
-        let mut c = UnixStream::connect(&sock).unwrap();
+        let mut c = IpcStream::connect(&sock).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
         let rd = c.try_clone().unwrap();
         rd.set_read_timeout(Some(Duration::from_secs(10))).unwrap();
@@ -1252,7 +1259,7 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let sock = dir.join("speedtest.sock");
         let _ = std::fs::remove_file(&sock);
-        let ln = UnixListener::bind(&sock).unwrap();
+        let ln = IpcListener::bind(&sock).unwrap();
         let logf: crate::Logf = Arc::new(|_| {});
         let srv = Arc::new(SpeedtestServer::new(Arc::clone(&logf)));
         let srv2 = Arc::clone(&srv);
@@ -1262,13 +1269,13 @@ mod tests {
         // 占满并发
         let mut holders = Vec::new();
         for _ in 0..MAX_CONNS {
-            let mut c = UnixStream::connect(&sock).unwrap();
+            let mut c = IpcStream::connect(&sock).unwrap();
             write_control(&mut c, TYPE_REQUEST, br#"{"role":"recv","warmup_ms":1000,"window_ms":5000}"#).unwrap();
             holders.push(c);
         }
         std::thread::sleep(Duration::from_millis(200));
         // 第 13 条：首帧是 data 大载荷（非 request）+ 后续垃圾滴流
-        let mut c = UnixStream::connect(&sock).unwrap();
+        let mut c = IpcStream::connect(&sock).unwrap();
         c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
         let big = vec![0u8; 60 * 1024];
         write_control(&mut c, TYPE_DATA, &big).unwrap();

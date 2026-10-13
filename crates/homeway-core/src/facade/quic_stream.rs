@@ -32,8 +32,9 @@ use homeway_quic::{Cmd, Island, StreamErr, StreamId, StreamReply, StreamTag};
 
 use crate::Logf;
 
-use super::bridge_host::{BridgeStream, WriteHalf};
-use super::tun_exec::{write_retry_backoff, GenRun, EXIT_RPC_BUDGET, FIRST_TRY};
+use super::bridge_io::{BridgeStream, WriteHalf};
+#[cfg(not(windows))] // GenRun 面 = App 世代执行体（tun_exec 在 windows 不编译）
+use super::tun_exec::GenRun;
 
 /// 虚拟端口 → 服务 tag（§5.1：`7802/7724/7803 → 1/2/3`；**5300 → 6**（dns-resolve，
 /// DNS-STREAM 批——宿主侧 socks 域名目标的远程解析腿）；其余端口无 tag）。
@@ -41,8 +42,28 @@ use super::tun_exec::{write_retry_backoff, GenRun, EXIT_RPC_BUDGET, FIRST_TRY};
 /// 端口源都是**既有配置面/契约常量**（E1 值域不变）：files/speedtest/解析腿用常量，
 /// term 走 `term_port()`（`HOMEWAY_TERM_PORT` 可改——A13 登记的可配面，本函数是它的唯一
 /// 消费判据：改端口不破 tag 映射）。
+/// 背压重试节拍（F8a 纯函数）：前 50 拍 2ms、51–100 拍 10ms、其后 20ms 封顶。
+/// 10s 无进展上界与「空写短路」语义不随本表变化。**WIN 批**：从 `tun_exec` 搬入
+/// （`tun_exec` 是 App 面〔windows 不编译〕，而本表被本模块写半与 `host_session`
+/// 的写主体共用——跨平台件随跨平台模块落地；节拍语义不变）。
+pub(crate) fn write_retry_backoff(attempt: u32) -> Duration {
+    if attempt < 50 {
+        std::time::Duration::from_millis(2)
+    } else if attempt < 100 {
+        std::time::Duration::from_millis(10)
+    } else {
+        std::time::Duration::from_millis(20)
+    }
+}
+
+/// 世代/会话收工 RPC 的预算（tun_exec 原值搬入——同上跨平台化）。
+pub(crate) const EXIT_RPC_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// 拨号首试预算（tun_exec 原值搬入——同上）。
+pub(crate) const FIRST_TRY: std::time::Duration = std::time::Duration::from_secs(4);
+
 pub(crate) fn tag_for_port(port: u16) -> Option<StreamTag> {
-    use super::bridge_host::{port as bport, term_port};
+    use super::bridge_io::{port as bport, term_port};
     if port == bport::FILES {
         Some(StreamTag::Files)
     } else if port == term_port() {
@@ -163,6 +184,7 @@ where
 /// **失败**的一面，见 `homeway-quic/src/driver.rs` 的 `StreamOpen` 臂）。窗口 = 微秒级且需
 /// 累积 62 次才显形（跨一次「预算刚好用尽」的窄缝）⇒ 判据仍以**常态失败路径**（写帧失败 /
 /// 回执 0x25·0x26 / 空块 / 预算耗尽）为准，泄漏判据（`tests/quic_pf_e2e.rs`）只覆盖 `0x25` 面。
+#[cfg(not(windows))] // GenRun 面（App 世代执行体）
 pub(crate) fn dial_target(
     run: &Arc<GenRun>,
     dst: SocketAddrV4,
@@ -381,6 +403,7 @@ where
 }
 
 /// QUIC 档的一条服务流连接（`BridgeStream`；应用层帧逐字节不变）。
+#[cfg(not(windows))] // GenRun 面（App 世代执行体；宿主会话走 dial_with/open_stream 直拼）
 pub(crate) fn dial(
     run: &Arc<GenRun>,
     tag: StreamTag,
@@ -469,6 +492,8 @@ impl QuicStream {
     }
 }
 
+// App 桥承载面（windows 不装配三桥——宿主会话直接用 QuicStream 的 Read/Write）
+#[cfg(not(windows))]
 impl BridgeStream for QuicStream {
     fn into_halves(
         self: Box<Self>,
@@ -642,7 +667,7 @@ mod tests {
     /// 其余（含 0/1/7804）**无 tag**（QUIC 档不得静默拨到别的服务）。
     #[test]
     fn virtual_ports_map_to_their_stream_tags() {
-        use super::super::bridge_host::{port as bport, term_port};
+        use super::super::bridge_io::{port as bport, term_port};
         assert_eq!(tag_for_port(bport::FILES), Some(StreamTag::Files));
         assert_eq!(tag_for_port(bport::SPEEDTEST), Some(StreamTag::Speedtest));
         // term 端口是**可配面**（HOMEWAY_TERM_PORT）——映射随 `term_port()` 走，

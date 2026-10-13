@@ -30,7 +30,6 @@
 //! 本层不另设长度下界（代码门 r34 L7）。
 
 use std::io::{ErrorKind, Read, Write};
-use std::os::unix::net::UnixStream;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -38,7 +37,8 @@ use std::time::{Duration, Instant};
 use homeway_quic::ServiceIntake;
 
 use crate::Logf;
-use crate::files_server::serve_stoppable_accepts;
+use crate::daemon::ipc::IpcStream;
+use crate::files_server::{intake_conn, serve_stoppable_accepts};
 use crate::server::dnsproxy::DnsProxy;
 
 /// 在册连接上限（**真闸**；与栈内 TCP 面 `dnsface::MAX_TCP_CONNS` 同阶 = 64）。
@@ -77,7 +77,7 @@ pub(crate) fn serve_with_cap(
     let spawn_fails = Arc::new(AtomicU64::new(0));
     let logf_accept = Arc::clone(&logf);
     serve_stoppable_accepts(
-        || intake.accept(),
+        || intake.accept().map(intake_conn),
         move |conn| {
             let logf = &logf_accept;
             let n = live.fetch_add(1, Ordering::AcqRel) + 1;
@@ -128,7 +128,7 @@ impl Drop for LiveGuard {
 }
 
 /// 一条连接：逐帧「读 2B 长度 + 读正文 → 代答 → 写 2B 长度 + 应答」，直到 EOF/异常/超限。
-fn handle_conn(mut conn: UnixStream, dns: Arc<DnsProxy>, logf: Logf) {
+fn handle_conn(mut conn: IpcStream, dns: Arc<DnsProxy>, logf: Logf) {
     let _ = conn.set_write_timeout(Some(WRITE_BUDGET));
     loop {
         let deadline = Instant::now() + FRAME_BUDGET;
@@ -177,7 +177,7 @@ enum ReadOutcome {
 
 /// 读满 `buf`，**绝对期限**由 `deadline` 收敛（逐 syscall 重设 `SO_RCVTIMEO`——只设一次会被
 /// 滴流（每 <预算 送 1 字节）无限续命，同 `dnsproxy` 的 `DeadlineIo` 处置）。
-fn read_exact_deadline(conn: &mut UnixStream, buf: &mut [u8], deadline: Instant) -> ReadOutcome {
+fn read_exact_deadline(conn: &mut IpcStream, buf: &mut [u8], deadline: Instant) -> ReadOutcome {
     let mut off = 0;
     while off < buf.len() {
         let remain = deadline.saturating_duration_since(Instant::now());
@@ -286,6 +286,7 @@ mod tests {
     /// ② `len=0` ⇒ 收线且**不计** qtcp；③ 畸形（len<12）⇒ 计 qtcp 但不回帧（客户端读超时）；
     /// ④ 应答 >1232B **不截断**（`is_tcp=true`，`trunc` 不增）。
     #[test]
+    #[cfg(unix)] // WIN 批：socketpair 造法 = unix 专属
     fn stream_serves_frames_closes_on_len0_and_keeps_big_answers() {
         let big: Vec<u32> = (0..100).map(|i| 0x0a00_0000 | i).collect();
         let proxy = proxy_with_fake_upstream("rt", &big);
@@ -338,6 +339,7 @@ mod tests {
 
     /// **判据（在册闸 2-1）**：第 `cap+1` 条连接**直接关流**（读回 EOF），前面的不受影响。
     #[test]
+    #[cfg(unix)] // WIN 批：socketpair 造法 = unix 专属
     fn stream_live_gate_closes_extra_connections() {
         // 上游无关紧要（本测只发两条不发帧的连接 + 一条被拒连接）
         let proxy = proxy_with_fake_upstream("gate", &[0x0a00_0001]);

@@ -15,7 +15,6 @@
 
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddrV4, TcpStream, ToSocketAddrs as _, UdpSocket};
-use std::os::fd::AsRawFd as _;
 use std::time::Duration;
 
 use super::egress::{interfaces, is_virtual_iface};
@@ -191,40 +190,28 @@ fn pin_multicast_with(
     conn: &UdpSocket,
     local_ip: Ipv4Addr,
     logf: Option<&dyn Fn(&str)>,
-    pin: &dyn Fn(std::os::fd::RawFd, u32, &str) -> std::io::Result<()>,
+    pin: &dyn Fn(crate::sysock::RawSock, u32, &str) -> std::io::Result<()>,
 ) -> Result<(), UpnpError> {
     let ifi = crate::server::egress::interfaces()
         .into_iter()
         .find(|i| i.addrs.contains(&local_ip));
-    let fd = conn.as_raw_fd();
+    let fd = crate::sysock::udp_raw(conn);
     // ① IP_MULTICAST_IF：值 = 本地接口地址（struct in_addr，网络序）
-    let in_addr = libc::in_addr { s_addr: u32::from(local_ip).to_be() };
-    let r = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_IP,
-            libc::IP_MULTICAST_IF,
-            &in_addr as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::in_addr>() as u32,
-        )
-    };
-    if r != 0 {
-        return Err(UpnpError::Io(std::io::Error::last_os_error()));
-    }
+    crate::sysock::setsockopt_u32(
+        fd,
+        crate::sysock::IPPROTO_IP,
+        crate::sysock::IP_MULTICAST_IF,
+        u32::from(local_ip).to_be(),
+    )
+    .map_err(UpnpError::Io)?;
     // ② IP_MULTICAST_TTL = 2
-    let ttl: libc::c_int = 2;
-    let r = unsafe {
-        libc::setsockopt(
-            fd,
-            libc::IPPROTO_IP,
-            libc::IP_MULTICAST_TTL,
-            &ttl as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as u32,
-        )
-    };
-    if r != 0 {
-        return Err(UpnpError::Io(std::io::Error::last_os_error()));
-    }
+    crate::sysock::setsockopt_i32(
+        fd,
+        crate::sysock::IPPROTO_IP,
+        crate::sysock::IP_MULTICAST_TTL,
+        2,
+    )
+    .map_err(UpnpError::Io)?;
     // ③ 钉卡（网卡在系统表里找得到才钉——Go ifaceForIP 同义找不到就跳过；F4-4 降级）
     if let Some(ifi) = ifi {
         if let Err(e) = pin(fd, ifi.index, &ifi.name) {

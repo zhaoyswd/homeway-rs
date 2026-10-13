@@ -22,7 +22,6 @@
 //! 不同时在世）。时间前缀与 Go `logTimePrefix` 同形（本地时区）。
 
 use std::fs::{File, OpenOptions};
-use std::os::unix::fs::{DirBuilderExt as _, FileExt as _, OpenOptionsExt as _, PermissionsExt as _};
 use std::path::{Path, PathBuf};
 
 use crate::logfile::{RotatingWriter, DEBUG_BACKUPS, DEBUG_MAX_BYTES, EVENTS_BACKUPS, EVENTS_MAX_BYTES};
@@ -53,23 +52,42 @@ impl InstanceLock {
         // state 根收紧 0700（Go MkdirAll(dir, 0o700)；chmod 失败只告警不阻断——
         // r1-W2：create_dir_all 的默认权限不该留一个 0755 的 state 根）。
         // Q-G F4/A4：`DirBuilder::mode` 创建即收紧 + 保留告警（umask 掩码仍可能
-        // 压掉 mode ⇒ 后置 chmod 仍需执行）。
-        if let Err(e) = std::fs::DirBuilder::new()
-            .recursive(true)
-            .mode(0o700)
-            .create(state_dir)
-            .and_then(|_| std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700)))
-        {
+        // 压掉 mode ⇒ 后置 chmod 仍需执行）。WIN 批（§D11）：windows 无 mode 位——
+        // 普通建 + 跳过 chmod（隔离靠用户 profile 目录边界）。
+        #[cfg(unix)]
+        let mkdir = {
+            use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+            std::fs::DirBuilder::new()
+                .recursive(true)
+                .mode(0o700)
+                .create(state_dir)
+                .and_then(|_| {
+                    std::fs::set_permissions(state_dir, std::fs::Permissions::from_mode(0o700))
+                })
+        };
+        #[cfg(not(unix))]
+        let mkdir = std::fs::DirBuilder::new().recursive(true).create(state_dir);
+        if let Err(e) = mkdir {
             eprintln!("homeway: ⚠️ state 目录 {} 建立/收紧 0700 失败（{e}）——建议手工 chmod", state_dir.display());
         }
         let path = state_dir.join("lock");
-        #[allow(clippy::suspicious_open_options)] // 读写打开持锁文件：不清内容（截断在锁内做）
-        let mut f = OpenOptions::new().create(true).read(true).write(true).mode(0o600).open(&path)?;
-        let fd = std::os::unix::io::AsRawFd::as_raw_fd(&f);
-        let r = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-        if r != 0 {
-            let e = std::io::Error::last_os_error();
-            if e.kind() == std::io::ErrorKind::WouldBlock {
+        // 锁文件创建即 0600（同 identity/master.key 的目录契约；WIN 批：windows 无
+        // mode 位——普通开）。
+        #[cfg(unix)]
+        let open = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            #[allow(clippy::suspicious_open_options)] // 读写打开持锁文件：不清内容（截断在锁内做）
+            OpenOptions::new().create(true).read(true).write(true).mode(0o600).open(&path)
+        };
+        #[cfg(not(unix))]
+        #[allow(clippy::suspicious_open_options)] // 同 unix 臂注释
+        let open = OpenOptions::new().create(true).read(true).write(true).open(&path);
+        let mut f = open?;
+        // flock EX|NB（WIN 批 §D5：windows = LockFileEx，syslock 单源——持有进程
+        // 死亡即内核/句柄释放，判活语义同构）。
+        match crate::syslock::try_lock_exclusive(&f) {
+            Ok(crate::syslock::LockOutcome::Acquired) => {}
+            Ok(crate::syslock::LockOutcome::Held) => {
                 let (pid, held_form) = read_lock_holder(&mut f);
                 let form = if held_form.is_empty() || held_form == "?" {
                     "未知（旧格式锁或读不到）".to_owned()
@@ -82,14 +100,25 @@ impl InstanceLock {
                     state: state_dir.display().to_string(),
                 });
             }
-            return Err(LockError::Io(e));
+            Err(e) => return Err(LockError::Io(e)),
         }
-        // 写持有者信息（截断重写：崩溃残留的旧内容不该存活）
+        // 写持有者信息（截断重写：崩溃残留的旧内容不该存活）。unix 臂 `write_all_at`
+        // 定位写；windows 臂 seek+write 等价（语义对齐「写全 + 落盘前置句柄」）。
         let _ = f.set_len(0);
-        let _ = f.write_all_at(
-            format!("pid={}\nrole=homeway\nform={form}\n", std::process::id()).as_bytes(),
-            0,
-        );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::FileExt as _;
+            let _ = f.write_all_at(
+                format!("pid={}\nrole=homeway\nform={form}\n", std::process::id()).as_bytes(),
+                0,
+            );
+        }
+        #[cfg(not(unix))]
+        {
+            use std::io::{Seek as _, SeekFrom, Write as _};
+            let _ = f.seek(SeekFrom::Start(0));
+            let _ = f.write_all(format!("pid={}\nrole=homeway\nform={form}\n", std::process::id()).as_bytes());
+        }
         Ok(Self { f: Some(f), path })
     }
 
@@ -101,10 +130,9 @@ impl InstanceLock {
 
 impl Drop for InstanceLock {
     fn drop(&mut self) {
-        if let Some(f) = self.f.take() {
-            let fd = std::os::unix::io::AsRawFd::as_raw_fd(&f);
-            unsafe { libc::flock(fd, libc::LOCK_UN) };
-        }
+        // 释放 = 句柄关闭（flock 随 fd 关 / LockFileEx 随句柄关——WIN 批 §D5，syslock
+        // 单源；原显式 LOCK_UN 与关闭等价，无额外语义）。
+        drop(self.f.take());
     }
 }
 
@@ -113,22 +141,33 @@ impl Drop for InstanceLock {
 ///（D-1 补-3 收敛：此前 daemon_cli 侧有一份逐字段重复实现）。
 pub fn probe_lock_holder(state_dir: &Path) -> (bool, i32, String) {
     let Ok(f) = File::open(state_dir.join("lock")) else { return (false, 0, String::new()) };
-    let fd = std::os::unix::io::AsRawFd::as_raw_fd(&f);
-    let r = unsafe { libc::flock(fd, libc::LOCK_EX | libc::LOCK_NB) };
-    if r == 0 {
-        unsafe { libc::flock(fd, libc::LOCK_UN) };
-        return (false, 0, String::new());
+    // 与改前同形：拿到 = 未持有（句柄关闭即释放，显式 UN 无额外语义）；其余一律按
+    // 「有人持有」读持有者自述（含探测失败形态——保守面，Go 同款）。
+    match crate::syslock::try_lock_exclusive(&f) {
+        Ok(crate::syslock::LockOutcome::Acquired) => (false, 0, String::new()),
+        _ => {
+            let mut f = f;
+            let (pid, form) = read_lock_holder(&mut f);
+            (true, pid, form)
+        }
     }
-    let mut f = f;
-    let (pid, form) = read_lock_holder(&mut f);
-    (true, pid, form)
 }
 
 /// 持有者 pid/形态（读不到 = 0 / "?"）。
 fn read_lock_holder(f: &mut File) -> (i32, String) {
-    use std::os::unix::fs::FileExt as _;
     let mut buf = [0u8; 128];
-    let n = f.read_at(&mut buf, 0).unwrap_or(0);
+    #[cfg(unix)]
+    let n = {
+        use std::os::unix::fs::FileExt as _;
+        f.read_at(&mut buf, 0).unwrap_or(0)
+    };
+    // WIN 批：windows 无 read_at——seek 归零 + 顺序读（锁文件 ≤128B，等价读出面）。
+    #[cfg(not(unix))]
+    let n = {
+        use std::io::{Read as _, Seek as _, SeekFrom};
+        let _ = f.seek(SeekFrom::Start(0));
+        f.read(&mut buf).unwrap_or(0)
+    };
     let mut pid = 0;
     let mut form = "?".to_owned();
     for line in String::from_utf8_lossy(&buf[..n]).lines() {
@@ -309,14 +348,25 @@ pub struct NodeState {
 pub fn open_node_state(dir: &Path) -> std::io::Result<NodeState> {
     // Q-G F4/A5：`DirBuilder::mode(0o700)` 创建即收紧（create_dir_all 的默认权限
     // 会留一个 0755 的 state 根）——**仍随后无条件 chmod 归一**（mkdir 同样受
-    // umask 掩码）+ 失败告警（保留既有告警形态）。
+    // umask 掩码）+ 失败告警（保留既有告警形态）。WIN 批（§D11）：windows 无
+    // mode 位——普通建 + 跳过 chmod。
+    #[cfg(unix)]
+    use std::os::unix::fs::{DirBuilderExt as _, PermissionsExt as _};
+    #[cfg(unix)]
     std::fs::DirBuilder::new().recursive(true).mode(0o700).create(dir)?;
+    #[cfg(not(unix))]
+    std::fs::DirBuilder::new().recursive(true).create(dir)?;
+    #[cfg(unix)]
     if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
         eprintln!("homeway: ⚠️ state 目录 {} 收紧 0700 失败（{e}）——建议手工 chmod", dir.display());
     }
     for sub in ["serve", "relay", "client", "cache"] {
         let p = dir.join(sub);
+        #[cfg(unix)]
         std::fs::DirBuilder::new().recursive(true).mode(0o700).create(&p)?;
+        #[cfg(not(unix))]
+        std::fs::DirBuilder::new().recursive(true).create(&p)?;
+        #[cfg(unix)]
         if let Err(e) = std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o700)) {
             eprintln!("homeway: ⚠️ state 子目录 {} 收紧 0700 失败（{e}）——建议手工 chmod", p.display());
         }
@@ -328,14 +378,25 @@ pub fn open_node_state(dir: &Path) -> std::io::Result<NodeState> {
         // handle 后 fchmod 归一（旧形态默认权限建 → 静默 chmod，chmod 失败无告警）。
         use std::io::Write as _;
         let tmp = dir.join(".config.toml.tmp");
+        #[cfg(unix)]
+        let mut f = {
+            use std::os::unix::fs::OpenOptionsExt as _;
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp)?
+        };
+        #[cfg(not(unix))]
         let mut f = std::fs::OpenOptions::new()
             .write(true)
             .create(true)
             .truncate(true)
-            .mode(0o600)
             .open(&tmp)?;
         // 失败**告警不阻断**（代码门②：配置模板不含密钥，不得为权限归一牺牲进程可
-        // 启动性；与 A1–A5 的告警形态一致）
+        // 启动性；与 A1–A5 的告警形态一致）。WIN 批：windows 无 mode 位，跳过。
+        #[cfg(unix)]
         if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
             eprintln!("homeway: ⚠️ config 模板 {} 收紧 0600 失败（{e}）——建议手工 chmod", tmp.display());
         }

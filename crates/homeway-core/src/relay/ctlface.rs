@@ -236,37 +236,36 @@ impl CtlConn {
     /// 非阻塞写一条消息。EAGAIN/短写 = 写失败（对端死/缓冲满——单驱动线程绝不能挂；
     /// 恢复路径与 Go「写失败即断连」相同：断连逼后端重连走重放对账）。
     pub fn write_msg_nonblocking(&mut self, msg: &[u8]) -> bool {
-        use std::os::fd::AsRawFd as _;
         let mut wire = Vec::with_capacity(2 + msg.len());
         rw::ctl_frame_into(msg, &mut wire);
-        // 单次 send：不留部分写状态（≤29B 消息 + 内核缓冲几乎不可能部分写）
-        let fd = self.stream.as_raw_fd();
-        let ptr = wire.as_ptr().cast::<libc::c_void>();
-        let n = unsafe { libc::send(fd, ptr, wire.len(), libc::MSG_NOSIGNAL) };
-        n == wire.len() as isize
+        // 单次 send：不留部分写状态（≤29B 消息 + 内核缓冲几乎不可能部分写）。
+        // MSG_NOSIGNAL 语义在 sysock 内（unix 带 flag；windows 无 SIGPIPE——WIN 批）。
+        crate::sysock::send(crate::sysock::tcp_stream_raw(&self.stream), &wire)
+            .map(|n| n == wire.len())
+            .unwrap_or(false)
     }
 
     /// 非阻塞读尽当前可读字节进 decoder，弹出完整消息。`Err(ConnDead)` = 连接死亡
     /// （EOF/ECONNRESET/长度行非法）——调用方走断连路径。
     pub fn read_available(&mut self, out: &mut Vec<(u8, Vec<u8>)>) -> Result<(), ConnDead> {
-        use std::os::fd::AsRawFd as _;
-        let fd = self.stream.as_raw_fd();
+        let fd = crate::sysock::tcp_stream_raw(&self.stream);
         let mut buf = [0u8; 4096];
         loop {
-            let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast::<libc::c_void>(), buf.len(), 0) };
-            if n < 0 {
-                let err = std::io::Error::last_os_error();
-                if err.kind() == std::io::ErrorKind::WouldBlock
-                    || err.raw_os_error() == Some(libc::EINTR)
-                {
-                    return Ok(());
+            let n = match crate::sysock::recv(fd, &mut buf) {
+                Ok(n) => n,
+                Err(err) => {
+                    if err.kind() == std::io::ErrorKind::WouldBlock
+                        || err.kind() == std::io::ErrorKind::Interrupted
+                    {
+                        return Ok(());
+                    }
+                    return Err(ConnDead);
                 }
-                return Err(ConnDead);
-            }
+            };
             if n == 0 {
                 return Err(ConnDead); // EOF
             }
-            self.decoder.feed(&buf[..n as usize], out).map_err(|_| ConnDead)?;
+            self.decoder.feed(&buf[..n], out).map_err(|_| ConnDead)?;
         }
     }
 }

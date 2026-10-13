@@ -38,6 +38,21 @@ hkdf = "0.12"
 # 不引 `reusable_secrets`）。
 x25519-dalek = { version = "2.0.0-rc.3", features = ["static_secrets"] }
 getrandom = { version = "0.2", features = ["std"] }
+# ---- WIN 批（2026-10-13）：windows 面系统绑定（msvc 的 libc crate 无 socket/poll/
+# 文件锁/时区/控制台符号——实测）；只在各 crate 的 [target.'cfg(windows)'.dependencies]
+# 消费，unix 构建零波及。微软官方零开销绑定，features 并集放 workspace 单源。----
+# （IpHelper 的适配器结构体额外要求 Ndis+WinSock 双 feature——0.59 实测；
+#   OVERLAPPED 在 System::IO。）
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Networking_WinSock",
+    "Win32_NetworkManagement_IpHelper",
+    "Win32_NetworkManagement_Ndis",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Console",
+    "Win32_System_IO",
+    "Win32_System_Time",
+] }
 # 0.14 起 TCP 拥塞控制按算法 feature 门控（R8-8a：CUBIC——R6.6 的 CC 垫片即 CUBIC
 # 增长律，迁移后由上游 RFC 合规实现替代）。R8-2 曾加开 reno feature 做真机归因消融
 # 对照臂（HOMEWAY_CC=reno）——该 env 已在 R8 收尾批删除、`crates/**` 零引用 ⇒ **M5 C3

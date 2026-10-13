@@ -91,7 +91,8 @@ enum SockState {
 }
 
 fn probe_sock(sock: &std::path::Path) -> SockState {
-    match std::os::unix::net::UnixStream::connect(sock) {
+    // WIN 批：经 ipc（unix = UDS / windows = 端口文件 + loopback）——三态分类不变。
+    match homeway_core::daemon::ipc::IpcStream::connect(sock) {
         Ok(_) => SockState::Alive,
         Err(e) => match e.kind() {
             std::io::ErrorKind::NotFound | std::io::ErrorKind::ConnectionRefused => {
@@ -113,7 +114,7 @@ fn wait_control_ready(state_dir: &std::path::Path, d: Duration) -> bool {
     let sock = state_dir.join("control.sock");
     let deadline = std::time::Instant::now() + d;
     while std::time::Instant::now() < deadline {
-        if let Ok(c) = std::os::unix::net::UnixStream::connect(&sock) {
+        if let Ok(c) = homeway_core::daemon::ipc::IpcStream::connect(&sock) {
             drop(c);
             return true;
         }
@@ -325,17 +326,28 @@ fn start_spawned_process(state_dir: &std::path::Path) -> Result<u32, String> {
     }
     // Q-G F4（A8）：**创建即 0600**（`.mode` + 拿到 handle 后 fchmod 归一，防 umask
     // 掩码）——旧形态是「默认权限建 → 静默 chmod」，存在短窗口且失败无告警。
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+    // windows 无 mode 位语义（WIN 批 §D9：目录/ACL 边界在用户 profile 下）。
+    #[cfg(unix)]
+    let mut lf = {
+        use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .mode(0o600)
+            .open(&log)
+            .map_err(|e| e.to_string())?;
+        // 失败**告警不阻断**（代码门②：与 state.rs 的告警形态一致；spawn 日志不含凭据）
+        if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+            eprintln!("homeway: ⚠️ spawn 日志 {} 收紧 0600 失败（{e}）——建议手工 chmod", log.display());
+        }
+        f
+    };
+    #[cfg(not(unix))]
     let mut lf = std::fs::OpenOptions::new()
         .create(true)
         .append(true)
-        .mode(0o600)
         .open(&log)
         .map_err(|e| e.to_string())?;
-    // 失败**告警不阻断**（代码门②：与 state.rs 的告警形态一致；spawn 日志不含凭据）
-    if let Err(e) = lf.set_permissions(std::fs::Permissions::from_mode(0o600)) {
-        eprintln!("homeway: ⚠️ spawn 日志 {} 收紧 0600 失败（{e}）——建议手工 chmod", log.display());
-    }
     // 分隔行（Go spawn.go 同形态——多次拉起的失败原因累积可查）。
     {
         use std::io::Write as _;
@@ -349,15 +361,28 @@ fn start_spawned_process(state_dir: &std::path::Path) -> Result<u32, String> {
     cmd.arg("--state").arg(state_dir).stdin(std::process::Stdio::null());
     cmd.stdout(lf.try_clone().map_err(|e| e.to_string())?);
     cmd.stderr(lf);
-    unsafe {
-        cmd.pre_exec(|| {
-            if libc::setsid() == -1 {
-                return Err(std::io::Error::last_os_error());
-            }
-            Ok(())
-        });
+    // 会话脱离：unix = setsid（init 收养、不 wait——原注释语义）；windows =
+    // DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP（脱离控制台、Ctrl-C 不再定向到
+    // 子进程——WIN 批 §D9 的同义形态）。
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt as _;
+        unsafe {
+            cmd.pre_exec(|| {
+                if libc::setsid() == -1 {
+                    return Err(std::io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
     }
-    use std::os::unix::process::CommandExt as _;
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt as _;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NEW_PROCESS_GROUP: u32 = 0x0000_0200;
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NEW_PROCESS_GROUP);
+    }
     let child = cmd.spawn().map_err(|e| e.to_string())?;
     Ok(child.id())
 }
@@ -1254,25 +1279,24 @@ pub fn cmd_reset(args: &[String]) {
     println!("cache/ 已清（日志/端点缓存可弃层；L1/L2 与 migration-backup-* 不动；下次启动自动重建）");
 }
 
-/// RFC3339 近形时间戳（spawn 分隔行用；localtime 面与 now_timestamp 同源）。
+/// RFC3339 近形时间戳（spawn 分隔行用；本地时区经 `systime` 单源——WIN 批）。
 fn chrono_like_now() -> String {
     let secs = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&secs, &mut tm);
-        format!(
+    match homeway_core::systime::localtime(secs) {
+        Some(tm) => format!(
             "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}{:+03}:00",
-            tm.tm_year as i64 + 1900,
-            tm.tm_mon + 1,
-            tm.tm_mday,
-            tm.tm_hour,
-            tm.tm_min,
-            tm.tm_sec,
-            tm.tm_gmtoff / 3600
-        )
+            tm.year,
+            tm.mon,
+            tm.mday,
+            tm.hour,
+            tm.min,
+            tm.sec,
+            tm.gmtoff / 3600
+        ),
+        None => format!("unknown-time({secs})"),
     }
 }
 
@@ -1281,18 +1305,12 @@ fn now_timestamp() -> String {
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs() as i64;
-    unsafe {
-        let mut tm: libc::tm = std::mem::zeroed();
-        libc::localtime_r(&secs, &mut tm);
-        format!(
+    match homeway_core::systime::localtime(secs) {
+        Some(tm) => format!(
             "{:04}{:02}{:02}-{:02}{:02}{:02}",
-            tm.tm_year as i64 + 1900,
-            tm.tm_mon + 1,
-            tm.tm_mday,
-            tm.tm_hour,
-            tm.tm_min,
-            tm.tm_sec
-        )
+            tm.year, tm.mon, tm.mday, tm.hour, tm.min, tm.sec
+        ),
+        None => format!("{secs}"),
     }
 }
 
@@ -1487,47 +1505,27 @@ fn render_watch(hosts: &[WatchHost]) {
 
 /// 信号管道（SIGINT/SIGTERM → 'x'；status watch 的干净退出面）。
 struct WatchSigPipe {
-    read_fd: i32,
-    write_fd: i32,
+    read_fd: crate::stopsig::Raw,
+    write_fd: crate::stopsig::Raw,
 }
 
-static WATCH_SIG_W: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(-1);
 
-extern "C" fn on_watch_sig(_sig: i32) {
-    let fd = WATCH_SIG_W.load(std::sync::atomic::Ordering::SeqCst);
-    if fd >= 0 {
-        let b = b"x";
-        unsafe { libc::write(fd, b.as_ptr().cast(), 1) };
-    }
-}
-
+// WIN 批：watch 信号面收敛 `stopsig`（unix 臂与原实现同形；windows = 控制台事件）。
 fn install_status_watch_signals() -> WatchSigPipe {
-    // Q-G F1：管道经 `sysfd` 建（两端 CLOEXEC）→ 立即 `into_raw_fd()` 交既有 i32
-    // 字段（生命周期由 `drop_status_watch_signals` 收口）。arm/disarm 形态已是
-    // 正确先例（先 `store(-1)` 再 close），本批只补标志。
-    let (r, w) = match homeway_core::sysfd::pipe_cloexec() {
-        Ok(v) => (
-            std::os::fd::IntoRawFd::into_raw_fd(v.0),
-            std::os::fd::IntoRawFd::into_raw_fd(v.1),
-        ),
+    // Q-G F1 的原注释口径保留：生命周期由 `drop_status_watch_signals` 收口；
+    // arm/disarm 先 store 再 close 的顺序纪律不变。
+    let (r, w) = match crate::stopsig::pipe() {
+        Ok(v) => v,
         Err(e) => {
             eprintln!("homeway: 信号管道建立失败（{e}）——watch 退出");
             std::process::exit(1);
         }
     };
-    let fds = [r, w];
     // 读端非阻塞（评审 r2-1：阻塞读端曾令主循环每轮末尾挂死——事件/断开全冻结）。
-    unsafe {
-        let fl = libc::fcntl(fds[0], libc::F_GETFL);
-        libc::fcntl(fds[0], libc::F_SETFL, fl | libc::O_NONBLOCK);
-    }
-    WATCH_SIG_W.store(fds[1], std::sync::atomic::Ordering::SeqCst);
-    unsafe {
-        let h = on_watch_sig as extern "C" fn(i32) as libc::sighandler_t;
-        libc::signal(libc::SIGINT, h);
-        libc::signal(libc::SIGTERM, h);
-    }
-    WatchSigPipe { read_fd: fds[0], write_fd: fds[1] }
+    let _ = crate::stopsig::set_nonblocking(r, true);
+    crate::stopsig::arm(w);
+    crate::stopsig::install();
+    WatchSigPipe { read_fd: r, write_fd: w }
 }
 
 /// 非阻塞排空信号管道（有 'x' = 退出信号到过）。
@@ -1535,26 +1533,22 @@ fn watch_signal_fired(p: &WatchSigPipe) -> bool {
     let mut b = [0u8; 64];
     let mut got = false;
     loop {
-        let n = unsafe { libc::read(p.read_fd, b.as_mut_ptr().cast(), b.len()) };
-        if n > 0 {
-            if b[..n as usize].contains(&b'x') {
-                got = true;
+        match crate::stopsig::read(p.read_fd, &mut b) {
+            Ok(n) if n > 0 => {
+                if b[..n].contains(&b'x') {
+                    got = true;
+                }
             }
-            continue;
+            _ => break, // Ok(0)=EOF / Err(WouldBlock)=排空 / 其它错误按空处理
         }
-        break;
     }
     got
 }
 
 fn drop_status_watch_signals(p: WatchSigPipe) {
-    WATCH_SIG_W.store(-1, std::sync::atomic::Ordering::SeqCst);
-    unsafe {
-        libc::signal(libc::SIGINT, libc::SIG_DFL);
-        libc::signal(libc::SIGTERM, libc::SIG_DFL);
-        libc::close(p.read_fd);
-        libc::close(p.write_fd);
-    }
+    crate::stopsig::disarm_and_restore();
+    crate::stopsig::close(p.read_fd);
+    crate::stopsig::close(p.write_fd);
 }
 
 // ---------- serve relay set/clear 与 serve ddns（一次性直跑：纯文件操作） ----------

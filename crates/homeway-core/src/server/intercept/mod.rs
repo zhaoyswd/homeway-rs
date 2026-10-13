@@ -30,7 +30,6 @@ pub mod reasm;
 
 use std::collections::{HashMap, VecDeque};
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4};
-use std::os::fd::{AsFd as _, AsRawFd, OwnedFd};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -42,6 +41,8 @@ use smoltcp::time::Instant as SmolInstant;
 use smoltcp::wire::{HardwareAddress, IpCidr, IpEndpoint, Ipv4Address};
 
 use crate::stackb::TunDevice;
+use crate::sysock::{self, PollEnt, SysSock};
+use crate::sysock::{POLLERR, POLLHUP, POLLIN, POLLNVAL, POLLOUT};
 use crate::Logf;
 
 use self::dnsface::{DnsFaces, DnsRoute};
@@ -107,7 +108,8 @@ enum ConnState {
 /// 单流的重拨 OS socket 面（reactor 所有——驱动线程独占，无锁）。
 struct ReactorIo {
     /// 类型承担不变量：drop 恰关一次。无 OS socket（DNS 进程内腿）= Flow.io 为 None。
-    fd: OwnedFd,
+    /// （WIN 批：unix = OwnedFd / windows = OwnedSocket——`sysock::SysSock` 单源。）
+    fd: SysSock,
     udp: bool,
     /// 栈→upstream 字节流待写（TCP/UDS；前缀消费——部分写余量续传）。
     out_tcp: VecDequeLite,
@@ -132,20 +134,20 @@ enum DialTarget {
 
 /// 兴趣位纯函数（reactor-design §二——单测面）：`backlog` = 该流 tx_backlog 现存
 /// 字节（下行背压门控）。`None` = 本拍不注册该 fd。
-fn interests_for(io: &ReactorIo, backlog: usize) -> Option<libc::c_short> {
+fn interests_for(io: &ReactorIo, backlog: usize) -> Option<i16> {
     match io.conn {
-        Some(ConnState::InProgress) => Some(libc::POLLOUT),
+        Some(ConnState::InProgress) => Some(POLLOUT),
         Some(ConnState::Retry) => None, // 每拍主动重拨，无兴趣位
         None => {
             if io.dead && io.out_tcp.remaining().is_empty() && io.out_udp.is_empty() {
                 return None; // 排空即收的窗口（下一拍已不在表内）
             }
-            let mut ev = 0;
+            let mut ev: i16 = 0;
             if !io.dead && backlog < WATERMARK {
-                ev |= libc::POLLIN;
+                ev |= POLLIN;
             }
             if !io.out_tcp.remaining().is_empty() || !io.out_udp.is_empty() {
-                ev |= libc::POLLOUT;
+                ev |= POLLOUT;
             }
             Some(ev)
         }
@@ -218,81 +220,41 @@ enum FeedOutcome {
 /// 任何 poll 事件，若验收只挂 POLLOUT，流会卡到死线）。
 enum DialOutcome {
     /// connect 返回 0（UDS 常态/TCP 回环偶发/UDP 恒）。
-    Connected(OwnedFd),
+    Connected(SysSock),
     /// EINPROGRESS/EALREADY。
-    InProgress(OwnedFd),
+    InProgress(SysSock),
     /// EAGAIN（Linux AF_UNIX 监听队列满）：保留 fd 每拍重拨 connect。
-    Retry(OwnedFd),
+    Retry(SysSock),
 }
 
 /// 非阻塞拨号（reactor-design §二：**禁止 std 的 connect/connect_timeout**——std 在
-/// 非阻塞 socket 上把 EINPROGRESS 当 Err 返回；`SOCK_NONBLOCK` 在 libc 的 apple 目标
-/// 未定义，非阻塞一律 fcntl）。**前提**：UDP（bind+connect 皆本地操作）恒即时成功
-/// ——「pending 窗口坍缩为零」（设计 §三）的依据；SOCK_DGRAM 上 EINPROGRESS/EAGAIN
-/// 不可达，出现即按 fail 收口。
+/// 非阻塞 socket 上把 EINPROGRESS 当 Err 返回）。**前提**：UDP（bind+connect 皆本地
+/// 操作）恒即时成功——「pending 窗口坍缩为零」（设计 §三）的依据；SOCK_DGRAM 上
+/// EINPROGRESS/EAGAIN 不可达，出现即按 fail 收口。
+///
+/// WIN 批：fd 面经 `sysock`（unix 臂与原 libc 直调逐调用同形——行为零变化）。
 fn dial_nonblocking(target: &DialTarget) -> std::io::Result<DialOutcome> {
-    let (domain, ty, addr, len, bind_any) = target_sockaddr(target)?;
-    unsafe {
-        // F1：CLOEXEC 在**创建时**落下（linux/OHOS 走 `SOCK_CLOEXEC` 原子位；darwin
-        // 建后立即补）——Go 侧 `net.Dialer` 的 fd 天然 CLOEXEC，此为移植回退面收口。
-        let fd = crate::sysfd::socket_cloexec(domain, ty, 0)?;
-        set_fd_flags(fd.as_fd(), true)?;
-        if let Some((baddr, blen)) = bind_any {
-            // UDP：先绑临时端口（Go「bind ephemeral + connect」同形态）
-            if libc::bind(fd.as_raw_fd(), &baddr as *const _ as *const libc::sockaddr, blen) != 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
-        // EINTR 重试（连接调用被信号打断 = 立即重拨本调用，不当失败）
-        loop {
-            let rc = libc::connect(fd.as_raw_fd(), &addr as *const _ as *const libc::sockaddr, len);
-            if rc == 0 {
-                return Ok(DialOutcome::Connected(fd));
-            }
-            let e = std::io::Error::last_os_error();
-            match e.raw_os_error() {
-                Some(libc::EINTR) => continue,
-                Some(libc::EINPROGRESS) | Some(libc::EALREADY) => return Ok(DialOutcome::InProgress(fd)),
-                Some(libc::EAGAIN) => return Ok(DialOutcome::Retry(fd)),
-                _ => return Err(e),
-            }
-        }
+    let (ty, addr, bind_any) = target_sockaddr(target)?;
+    let domain = addr.domain;
+    let sock = sysock::socket(domain, ty)?;
+    sysock::set_nonblocking(&sock, true)?;
+    if let Some(baddr) = bind_any {
+        // UDP：先绑临时端口（Go「bind ephemeral + connect」同形态）
+        sysock::bind(&sock, &baddr)?;
+    }
+    match sysock::connect(&sock, &addr)? {
+        sysock::ConnectOutcome::Connected => Ok(DialOutcome::Connected(sock)),
+        sysock::ConnectOutcome::InProgress => Ok(DialOutcome::InProgress(sock)),
+        sysock::ConnectOutcome::Retry => Ok(DialOutcome::Retry(sock)),
     }
 }
 
-/// 拨号目标的 sockaddr 打包（v4/v6/UDS 三形态）。
-type SockAddrPack = (
-    libc::c_int,
-    libc::c_int,
-    libc::sockaddr_storage,
-    libc::socklen_t,
-    Option<(libc::sockaddr_storage, libc::socklen_t)>,
-);
-
-fn target_sockaddr(target: &DialTarget) -> std::io::Result<SockAddrPack> {
-    fn pack_ip(a: &SocketAddr) -> (libc::c_int, libc::sockaddr_storage, libc::socklen_t) {
-        let mut ss: libc::sockaddr_storage = unsafe { std::mem::zeroed() };
-        let len = match a {
-            SocketAddr::V4(v4) => {
-                let s: &mut libc::sockaddr_in = unsafe { &mut *(&mut ss as *mut _ as *mut _) };
-                s.sin_family = libc::AF_INET as libc::sa_family_t;
-                s.sin_port = v4.port().to_be();
-                // octets 内存序即网络序——u32 原生重解释写回同一字节形态
-                s.sin_addr = libc::in_addr { s_addr: u32::from_ne_bytes(v4.ip().octets()) };
-                std::mem::size_of::<libc::sockaddr_in>() as libc::socklen_t
-            }
-            SocketAddr::V6(v6) => {
-                let s: &mut libc::sockaddr_in6 = unsafe { &mut *(&mut ss as *mut _ as *mut _) };
-                s.sin6_family = libc::AF_INET6 as libc::sa_family_t;
-                s.sin6_port = v6.port().to_be();
-                s.sin6_addr = libc::in6_addr { s6_addr: v6.ip().octets() };
-                s.sin6_scope_id = v6.scope_id();
-                std::mem::size_of::<libc::sockaddr_in6>() as libc::socklen_t
-            }
-        };
-        (ss.ss_family as libc::c_int, ss, len)
-    }
-    // UDP 先绑的任意地址 = 目标同族的 UNSPECIFIED:0（pack_ip 直推）
+/// 拨号目标的 sockaddr 打包（v4/v6 两形态；M5 S4 起 UDS 档已删）。
+/// 返回 (sock 类型, 目标地址, UDP 先绑的任意地址)。
+fn target_sockaddr(
+    target: &DialTarget,
+) -> std::io::Result<(i32, sysock::SockAddrBuf, Option<sysock::SockAddrBuf>)> {
+    // UDP 先绑的任意地址 = 目标同族的 UNSPECIFIED:0
     fn any_of(a: &SocketAddr) -> SocketAddr {
         match a {
             SocketAddr::V4(_) => SocketAddr::from((Ipv4Addr::UNSPECIFIED, 0)),
@@ -300,37 +262,13 @@ fn target_sockaddr(target: &DialTarget) -> std::io::Result<SockAddrPack> {
         }
     }
     match target {
-        DialTarget::Tcp(addr) => {
-            let (domain, ss, len) = pack_ip(addr);
-            Ok((domain, libc::SOCK_STREAM, ss, len, None))
-        }
-        DialTarget::Udp(addr) => {
-            let (domain, ss, len) = pack_ip(addr);
-            let (d2, bind_any, blen) = pack_ip(&any_of(addr));
-            debug_assert_eq!(d2, domain);
-            Ok((domain, libc::SOCK_DGRAM, ss, len, Some((bind_any, blen))))
-        }
+        DialTarget::Tcp(addr) => Ok((sysock::SOCK_STREAM, sysock::pack_addr(addr), None)),
+        DialTarget::Udp(addr) => Ok((
+            sysock::SOCK_DGRAM,
+            sysock::pack_addr(addr),
+            Some(sysock::pack_addr(&any_of(addr))),
+        )),
     }
-}
-
-/// fcntl 建非阻塞 + `FD_CLOEXEC`（`SOCK_NONBLOCK`/`SOCK_CLOEXEC` 在 libc 的 apple
-/// 目标均未定义——darwin 唯一形态；linux/OHOS 创建期已走原子位，此处幂等重设）。
-/// 失败按 Err 返回（「循环内禁阻塞」的防御闭合：置不上非阻塞的 fd 会阻塞驱动
-/// 线程——评审 r2-低6；CLOEXEC 缺失 = 子进程继承悬挂 fd——Q-G F1）。
-fn set_fd_flags(fd: std::os::fd::BorrowedFd<'_>, nonblocking: bool) -> std::io::Result<()> {
-    unsafe {
-        if nonblocking {
-            let fl = libc::fcntl(fd.as_raw_fd(), libc::F_GETFL);
-            if fl < 0 || libc::fcntl(fd.as_raw_fd(), libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
-                return Err(std::io::Error::last_os_error());
-            }
-        }
-        let fc = libc::fcntl(fd.as_raw_fd(), libc::F_GETFD);
-        if fc < 0 || libc::fcntl(fd.as_raw_fd(), libc::F_SETFD, fc | libc::FD_CLOEXEC) < 0 {
-            return Err(std::io::Error::last_os_error());
-        }
-    }
-    Ok(())
 }
 
 // ---------- 出口发送整形（R8-3 8i；设计 = docs/reviews/R8.md §九） ----------
@@ -815,7 +753,7 @@ pub struct Interceptor {
     next_rw_port: u16,
     halted: bool,
     /// reactor 的 pollfd 复用缓冲（每拍 clear 重建——评审 R-6：不重建 Vec 只重填）。
-    pollfds: Vec<libc::pollfd>,
+    pollfds: Vec<PollEnt>,
     /// pollfds 的同序流号索引（revents → 流回指）。
     poll_index: Vec<u64>,
     /// reactor 等待者位（connect 在途 ∨ 任一流待写缓冲非空——引擎 wait_hint 消费；
@@ -1426,7 +1364,7 @@ impl Interceptor {
 
     /// ReactorIo 落位（流已不在表 = 已被收口——fd 随 drop 关闭；deadline 只在
     /// conn=Some 时被读，即时成功路径传 now() 占位）。
-    fn place_io(&mut self, flow: u64, fd: OwnedFd, udp: bool, conn: Option<ConnState>, deadline: Instant) {
+    fn place_io(&mut self, flow: u64, fd: SysSock, udp: bool, conn: Option<ConnState>, deadline: Instant) {
         if let Some(f) = self.flows.get_mut(&flow) {
             if f.io.is_none() {
                 f.io = Some(ReactorIo {
@@ -1453,24 +1391,19 @@ impl Interceptor {
             if io.conn.is_none() {
                 return;
             }
-            let mut soerr: libc::c_int = 0;
-            let mut len = std::mem::size_of::<libc::c_int>() as libc::socklen_t;
-            let rc = unsafe {
-                libc::getsockopt(
-                    io.fd.as_raw_fd(),
-                    libc::SOL_SOCKET,
-                    libc::SO_ERROR,
-                    &mut soerr as *mut _ as *mut libc::c_void,
-                    &mut len,
-                )
-            };
-            if rc != 0 {
-                false
-            } else if soerr == 0 || soerr == libc::EISCONN {
-                io.conn = None;
-                true
-            } else {
-                false // SO_ERROR≠0 = 拨号失败（ECONNREFUSED 等）
+            match sysock::so_error(sysock::sock_raw(&io.fd)) {
+                Ok(0) => {
+                    io.conn = None;
+                    true
+                }
+                // unix：SO_ERROR=EISCONN = 已连上（重拨已通的形态）；windows 无该
+                // 值域（验收前不会有二次 connect）——同臂不命中，语义不漂。
+                Ok(sysock::SO_ERROR_EISCONN) => {
+                    io.conn = None;
+                    true
+                }
+                Ok(_) => false, // SO_ERROR≠0 = 拨号失败（ECONNREFUSED 等）
+                Err(_) => false,
             }
         };
         if fd_ok {
@@ -1493,7 +1426,7 @@ impl Interceptor {
             let target = self.route_upstream(f.orig_dst.0, f.orig_dst.1, f.proto).1;
             target_sockaddr(&target).ok()
         };
-        let Some((_, _, addr, len, _)) = pack else {
+        let Some((_, addr, _)) = pack else {
             return;
         };
         // 三态：连上（验收收口）/ 仍在队列外（下拍再试）/ 真 fail（同 DialFailed 收口）
@@ -1508,28 +1441,14 @@ impl Interceptor {
             if !matches!(io.conn, Some(ConnState::Retry)) {
                 return;
             }
-            let mut step = Step::Still;
-            loop {
-                let rc = unsafe {
-                    libc::connect(io.fd.as_raw_fd(), &addr as *const _ as *const libc::sockaddr, len)
-                };
-                if rc == 0 {
-                    step = Step::Accepted;
-                    break;
-                }
-                match std::io::Error::last_os_error().raw_os_error() {
-                    Some(libc::EINTR) => continue,
-                    Some(libc::EAGAIN) => break, // 仍在队列外——下拍再试
-                    Some(libc::EISCONN) => {
-                        step = Step::Accepted;
-                        break;
-                    }
-                    _ => {
-                        step = Step::Failed;
-                        break;
-                    }
-                }
-            }
+            // EINTR 已在 sysock::connect 内重试（单次结论）；三态 + EISCONN 如实分档。
+            let step = match sysock::connect(&io.fd, &addr) {
+                Ok(sysock::ConnectOutcome::Connected) => Step::Accepted,
+                Ok(sysock::ConnectOutcome::InProgress) => Step::Still, // 仍在队列外——下拍再试
+                Ok(sysock::ConnectOutcome::Retry) => Step::Still, // EAGAIN 同形（windows 不可达）
+                Err(e) if sysock::is_eisconn(&e) => Step::Accepted,
+                Err(_) => Step::Failed,
+            };
             if matches!(step, Step::Accepted) {
                 io.conn = None;
             }
@@ -2185,8 +2104,8 @@ impl Interceptor {
         for (id, f) in &self.flows {
             let Some(io) = f.io.as_ref() else { continue };
             let Some(ev) = interests_for(io, f.tx_backlog.remaining().len()) else { continue };
-            self.pollfds.push(libc::pollfd {
-                fd: io.fd.as_raw_fd(),
+            self.pollfds.push(PollEnt {
+                raw: sysock::sock_raw(&io.fd),
                 events: ev,
                 revents: 0,
             });
@@ -2194,32 +2113,33 @@ impl Interceptor {
         }
         let n_fds = self.pollfds.len();
         if n_fds > 0 {
-            let rc = unsafe { libc::poll(self.pollfds.as_mut_ptr(), n_fds as libc::nfds_t, 0) };
-            if rc > 0 {
-                let ready: Vec<(u64, libc::c_short)> = self
-                    .pollfds
-                    .iter()
-                    .zip(self.poll_index.iter())
-                    .filter(|(pf, _)| pf.revents != 0)
-                    .map(|(pf, flow)| (*flow, pf.revents))
-                    .collect();
-                for (flow, revents) in ready {
-                    if revents & libc::POLLNVAL != 0 {
-                        // 所有权模型下不可达（fd 命 = io 在）——防御：宁可泄漏不误关
-                        if let Some(f) = self.flows.get_mut(&flow) {
-                            if let Some(io) = f.io.take() {
-                                std::mem::forget(io.fd);
-                                (self.cfg.logf)(&format!(
-                                    "intercept: reactor POLLNVAL（flow {flow}）——防御摘除"
-                                ));
+            if let Ok(rc) = sysock::poll_slice(&mut self.pollfds) {
+                if rc > 0 {
+                    let ready: Vec<(u64, i16)> = self
+                        .pollfds
+                        .iter()
+                        .zip(self.poll_index.iter())
+                        .filter(|(pf, _)| pf.revents != 0)
+                        .map(|(pf, flow)| (*flow, pf.revents))
+                        .collect();
+                    for (flow, revents) in ready {
+                        if revents & POLLNVAL != 0 {
+                            // 所有权模型下不可达（fd 命 = io 在）——防御：宁可泄漏不误关
+                            if let Some(f) = self.flows.get_mut(&flow) {
+                                if let Some(io) = f.io.take() {
+                                    std::mem::forget(io.fd);
+                                    (self.cfg.logf)(&format!(
+                                        "intercept: reactor POLLNVAL（flow {flow}）——防御摘除"
+                                    ));
+                                }
                             }
+                            continue;
                         }
-                        continue;
+                        let readable = revents & POLLIN != 0;
+                        let writable = revents & POLLOUT != 0;
+                        let errish = revents & (POLLERR | POLLHUP) != 0;
+                        self.on_fd_ready(flow, readable, writable, errish);
                     }
-                    let readable = revents & libc::POLLIN != 0;
-                    let writable = revents & libc::POLLOUT != 0;
-                    let errish = revents & (libc::POLLERR | libc::POLLHUP) != 0;
-                    self.on_fd_ready(flow, readable, writable, errish);
                 }
             }
         }
@@ -2259,28 +2179,30 @@ impl Interceptor {
             if io.dead || io.conn.is_some() {
                 return;
             }
-            (io.fd.as_raw_fd(), io.udp)
+            (sysock::sock_raw(&io.fd), io.udp)
         };
         if is_udp {
             // downSeen 实测位 + 数据报整包回投（应用层无预算——内核 rcvbuf 界定，§四/R-11）
             // Q-I F3：读缓冲循环外提（每次调用一次零初始化，不再每数据报一次）。
             let mut buf = [0u8; 65536];
             loop {
-                let n = unsafe { libc::recv(fd, buf.as_mut_ptr().cast(), buf.len(), 0) };
+                let n = match sysock::recv(fd, &mut buf) {
+                    Ok(n) => n,
+                    Err(e) => {
+                        if e.kind() != std::io::ErrorKind::WouldBlock {
+                            // 读错误 = 拆（macOS connected UDP ECONNREFUSED 的发现路径之二）
+                            self.on_upstream_eof(flow);
+                        }
+                        break;
+                    }
+                };
                 if n > 0 {
                     if let Some(f) = self.flows.get_mut(&flow) {
                         if f.kind == Kind::Transit {
                             f.udp_replied = true;
                         }
                     }
-                    self.udp_send_to_client(flow, &buf[..n as usize]);
-                } else if n < 0 {
-                    let e = std::io::Error::last_os_error();
-                    if e.kind() != std::io::ErrorKind::WouldBlock {
-                        // 读错误 = 拆（macOS connected UDP ECONNREFUSED 的发现路径之二）
-                        self.on_upstream_eof(flow);
-                    }
-                    break;
+                    self.udp_send_to_client(flow, &buf[..n]);
                 }
                 // n == 0：UDP 空数据报——吞（对齐旧 worker：不算 EOF 不投递）
             }
@@ -2301,19 +2223,22 @@ impl Interceptor {
             if gated {
                 break;
             }
-            let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), buf.len()) };
+            let n = match sysock::recv(fd, &mut buf) {
+                Ok(n) => n,
+                Err(e) => {
+                    if e.kind() != std::io::ErrorKind::WouldBlock {
+                        self.on_upstream_eof(flow);
+                    }
+                    break;
+                }
+            };
             if n > 0 {
                 let Some(f) = self.flows.get_mut(&flow) else { return };
-                f.tx_backlog.push(&buf[..n as usize]);
+                f.tx_backlog.push(&buf[..n]);
                 f.last_active = Instant::now();
-            } else if n == 0 {
-                self.on_upstream_eof(flow);
-                break;
             } else {
-                let e = std::io::Error::last_os_error();
-                if e.kind() != std::io::ErrorKind::WouldBlock {
-                    self.on_upstream_eof(flow);
-                }
+                // n == 0：EOF（流读尽）
+                self.on_upstream_eof(flow);
                 break;
             }
         }
@@ -2347,19 +2272,15 @@ impl Interceptor {
                     let Some(f) = self.flows.get_mut(&flow) else { return };
                     let Some(io) = f.io.as_mut() else { return };
                     let Some(dg) = io.out_udp.front() else { break };
-                    let n = unsafe {
-                        // MSG_NOSIGNAL（评审 D-1 中-4：主进程对 SIGPIPE 已恢复默认
-                        // 处置，裸写会打死进程——send 带 flag 面，write 无）。
-                        libc::send(io.fd.as_raw_fd(), dg.as_ptr().cast(), dg.len(), libc::MSG_NOSIGNAL)
-                    };
-                    if n >= 0 {
-                        io.out_udp.pop_front();
-                        f.last_active = Instant::now();
-                        Step::Wrote
-                    } else if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
-                        Step::Full
-                    } else {
-                        Step::Dead
+                    // MSG_NOSIGNAL 语义在 sysock 内（unix 带 flag；windows 无 SIGPIPE）。
+                    match sysock::send(sysock::sock_raw(&io.fd), dg) {
+                        Ok(_) => {
+                            io.out_udp.pop_front();
+                            f.last_active = Instant::now();
+                            Step::Wrote
+                        }
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Step::Full,
+                        Err(_) => Step::Dead,
                     }
                 };
                 match step {
@@ -2381,20 +2302,15 @@ impl Interceptor {
                     if rem.is_empty() {
                         break;
                     }
-                    // MSG_NOSIGNAL：同上。
-                    let n = unsafe {
-                        libc::send(io.fd.as_raw_fd(), rem.as_ptr().cast(), rem.len(), libc::MSG_NOSIGNAL)
-                    };
-                    if n > 0 {
-                        io.out_tcp.consume(n as usize);
-                        f.last_active = Instant::now();
-                        Step::Wrote
-                    } else if n == 0 {
-                        Step::Dead // send 返 0（流语义下不应发生）——按错误处置
-                    } else if std::io::Error::last_os_error().kind() == std::io::ErrorKind::WouldBlock {
-                        Step::Full
-                    } else {
-                        Step::Dead
+                    match sysock::send(sysock::sock_raw(&io.fd), rem) {
+                        Ok(n) if n > 0 => {
+                            io.out_tcp.consume(n);
+                            f.last_active = Instant::now();
+                            Step::Wrote
+                        }
+                        Ok(_) => Step::Dead, // send 返 0（流语义下不应发生）——按错误处置
+                        Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Step::Full,
+                        Err(_) => Step::Dead,
                     }
                 };
                 match step {
@@ -2470,16 +2386,12 @@ impl Interceptor {
                 // TCP_NODELAY（Go SetDelayOption(false) 同口径——连接完成后设，两路
                 // 验收的唯一会合点）
                 if let Some(io) = self.flows.get(&flow).and_then(|f| f.io.as_ref()) {
-                    let one = libc::c_int::from(1);
-                    unsafe {
-                        libc::setsockopt(
-                            io.fd.as_raw_fd(),
-                            libc::IPPROTO_TCP,
-                            libc::TCP_NODELAY,
-                            &one as *const _ as *const libc::c_void,
-                            std::mem::size_of::<libc::c_int>() as u32,
-                        );
-                    }
+                    let _ = sysock::setsockopt_i32(
+                        sysock::sock_raw(&io.fd),
+                        sysock::IPPROTO_TCP,
+                        sysock::TCP_NODELAY,
+                        1,
+                    );
                 }
                 // TCP：建栈内 listen socket + 注入缓存包（SYN-ACK 由此产生）
                 let rw = f.rw_port;
@@ -3151,6 +3063,8 @@ fn build_rst_for(v: &View5) -> Vec<u8> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(unix)]
+    use std::os::fd::AsRawFd as _;
     use crate::stackb::StackB;
     use smoltcp::iface::SocketHandle;
     use smoltcp::socket::tcp::Socket as TcpSocket;
@@ -3709,11 +3623,12 @@ mod tests {
 
     /// 兴趣集纯函数单测（R-7④）：水位摘 POLLIN / InProgress 只 POLLOUT / Retry 无位 /
     /// dead 只 POLLOUT 或不注册。
+    #[cfg(unix)] // SysSock 的 UdpSocket 转换是 unix 面（OwnedFd::from）
     #[test]
     fn reactor_interests_matrix() {
         let sock = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
         let mut io = ReactorIo {
-            fd: OwnedFd::from(sock),
+            fd: std::os::fd::OwnedFd::from(sock),
             udp: false,
             out_tcp: VecDequeLite::new(),
             out_udp: VecDeque::new(),
@@ -3800,8 +3715,8 @@ mod tests {
             udp_payload: (0, 0),
         };
         let flow = itc.alloc_flow(&v, Kind::Transit, Proto::Tcp, Vec::new());
-        let fd = unsafe { OwnedFd::from_raw_fd(fds[0]) };
-        set_fd_flags(fd.as_fd(), true).unwrap(); // place_io 契约：fd 已非阻塞（dial_nonblocking 平时的保证）
+        let fd = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
+        crate::sysock::set_nonblocking(&fd, true).unwrap(); // place_io 契约：fd 已非阻塞（dial_nonblocking 平时的保证）
         itc.place_io(flow, fd, false, None, Instant::now());
         if let Some(io) = itc.flows.get_mut(&flow).and_then(|f| f.io.as_mut()) {
             io.out_tcp.push(&vec![0x5au8; 1024 * 1024]);
@@ -4876,7 +4791,7 @@ mod tests {
     fn tx_backlog_watermark_gate_uses_remaining() {
         let tunnel = Ipv4Addr::new(100, 64, 255, 1);
         // 纯函数边界（read_upstream 的门与 interests_for 同式）
-        let devnull: OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
+        let devnull: std::os::fd::OwnedFd = std::fs::File::open("/dev/null").unwrap().into();
         let io = ReactorIo {
             fd: devnull,
             udp: false,
@@ -4899,7 +4814,7 @@ mod tests {
         // 按 remaining 而非 backing 长度判）
         let (up, mut peer) = std::os::unix::net::UnixStream::pair().unwrap();
         up.set_nonblocking(true).unwrap();
-        let fd: OwnedFd = up.into();
+        let fd: std::os::fd::OwnedFd = up.into();
         let mut itc = Interceptor::attach(cfg_base(tunnel), Arc::new(Stats::default()));
         let flow = 1u64;
         let mut tb = VecDequeLite::new();
@@ -5141,7 +5056,7 @@ mod tests {
         assert!(!itc.udp_out_full(flow, 1000), "无 io = 不满");
         // 造 io + 填满条数
         let s = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
-        itc.place_io(flow, OwnedFd::from(s), true, None, Instant::now());
+        itc.place_io(flow, std::os::fd::OwnedFd::from(s), true, None, Instant::now());
         if let Some(io) = itc.flows.get_mut(&flow).and_then(|f| f.io.as_mut()) {
             for _ in 0..MAX_OUT_UDP_PKTS {
                 io.out_udp.push_back(vec![0u8; 10]);

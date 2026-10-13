@@ -9,13 +9,13 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::Write;
-use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use super::frame::{self, Op};
+use super::ipc::IpcStream;
 use super::proto::*;
 use super::server::{read_body_buf, read_head};
 use super::vocab;
@@ -164,7 +164,7 @@ impl ClientStream {
 /// 控制面客户端（一连接一客户端）。
 pub struct ControlClient {
     sock: PathBuf,
-    write_sock: Mutex<UnixStream>,
+    write_sock: Mutex<IpcStream>,
     corr: AtomicU64,
     pending: Mutex<HashMap<u64, std::sync::mpsc::Sender<ResponseBody>>>,
     streams: Mutex<HashMap<u32, Arc<ClientStream>>>,
@@ -176,7 +176,7 @@ pub struct ControlClient {
     events_rx: Mutex<Option<std::sync::mpsc::Receiver<EventBody>>>,
     notify_tx: std::sync::mpsc::Sender<ResponseBody>,
     events_tx: std::sync::mpsc::SyncSender<EventBody>,
-    ctl_sock: Mutex<UnixStream>,
+    ctl_sock: Mutex<IpcStream>,
 }
 
 impl ControlClient {
@@ -186,7 +186,7 @@ impl ControlClient {
         frontend_kind: &str,
         frontend_name: &str,
     ) -> Result<(Arc<ControlClient>, WelcomeBody), ClientErr> {
-        let stream = UnixStream::connect(sock).map_err(|e| ClientErr::Dial(e.to_string()))?;
+        let stream = IpcStream::connect(sock).map_err(|e| ClientErr::Dial(e.to_string()))?;
         let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
         let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
         let writer = stream.try_clone().map_err(|e| ClientErr::Io(e.to_string()))?;
@@ -442,7 +442,7 @@ impl ControlClient {
         w.write_all(&f).map_err(|e| e.to_string())
     }
 
-    fn reader_main(&self, mut sock: UnixStream, welcome_tx: std::sync::mpsc::Sender<WelcomeBody>) {
+    fn reader_main(&self, mut sock: IpcStream, welcome_tx: std::sync::mpsc::Sender<WelcomeBody>) {
         let mut buf: Vec<u8> = Vec::new();
         loop {
             let head = match read_head(&mut sock, &mut buf) {

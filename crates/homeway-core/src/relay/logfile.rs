@@ -18,24 +18,16 @@ const MAX_BYTES: u64 = 2 << 20;
 const BACKUPS: usize = 3;
 
 /// 时间戳（Go 布局 `2006-01-02 15:04:05.000 [relay] ` 的**本地时区**等价形态：
-/// localtime_r 取本地偏移——epoch civil 换算仍是 UTC 基）。
+/// 本地偏移经 `systime::localtime` 单源——unix = `localtime_r` 原样，windows = 时区
+/// API（WIN 批）；失败按 UTC）。epoch civil 换算仍是 UTC 基。
 fn stamp() -> String {
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .unwrap_or_default();
     let secs_utc = now.as_secs() as i64;
-    // 本地时区偏移（libc::localtime_r；失败按 UTC）。time_t 用 i64 直述——
-    // libc 对部分目标（musl/ohos）把 time_t 别名标 deprecated，i64 是它的实指。
-    #[allow(deprecated)]
-    let local_offset: i64 = unsafe {
-        let t: libc::time_t = secs_utc as libc::time_t;
-        let mut tm: libc::tm = std::mem::zeroed();
-        if libc::localtime_r(&t, &mut tm).is_null() {
-            0
-        } else {
-            tm.tm_gmtoff as i64
-        }
-    };
+    let local_offset: i64 = crate::systime::localtime(secs_utc)
+        .map(|tm| tm.gmtoff)
+        .unwrap_or(0);
     let secs = secs_utc + local_offset;
     let millis = now.subsec_millis();
     // days since epoch → y/m/d（civil_from_days 算法）

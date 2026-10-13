@@ -248,23 +248,38 @@ impl Carriers {
 /// 0600 原子写（tmp + rename；hosts.json 同口径）。目录缺失即建（0700）。
 /// Q-G F4/A7：**创建即 0600**（`.mode`）+ handle 后 fchmod 归一——旧形态
 /// 「默认权限建 → 静默 chmod」有 0644 短窗口且 chmod 失败无告警。
+/// WIN 批（§D11）：windows 无 mode 位——普通建/普通开 + 跳过 chmod。
 pub(super) fn save_json_atomic(path: &std::path::Path, body: &[u8]) -> Result<(), String> {
     use std::io::Write as _;
-    use std::os::unix::fs::{OpenOptionsExt as _, PermissionsExt as _};
     let dir = path.parent().unwrap_or(std::path::Path::new("."));
     std::fs::create_dir_all(dir).map_err(|e| format!("建目录 {}：{e}", dir.display()))?;
     let tmp = path.with_extension("json.tmp");
+    #[cfg(unix)]
+    let mut f = {
+        use std::os::unix::fs::OpenOptionsExt as _;
+        std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .truncate(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| format!("建 {}：{e}", tmp.display()))?
+    };
+    #[cfg(not(unix))]
     let mut f = std::fs::OpenOptions::new()
         .create(true)
         .write(true)
         .truncate(true)
-        .mode(0o600)
         .open(&tmp)
         .map_err(|e| format!("建 {}：{e}", tmp.display()))?;
     // 失败**告警不阻断**（代码门②：与 A1–A5 的告警形态一致——硬失败会把
     // 「状态落盘成功」变成报错并留下 .tmp，行为变化不值得）
-    if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
-        eprintln!("homeway: ⚠️ {} 收紧 0600 失败（{e}）——建议手工 chmod", tmp.display());
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        if let Err(e) = f.set_permissions(std::fs::Permissions::from_mode(0o600)) {
+            eprintln!("homeway: ⚠️ {} 收紧 0600 失败（{e}）——建议手工 chmod", tmp.display());
+        }
     }
     f.write_all(body).and_then(|_| f.write(b"\n")).map_err(|e| format!("写 {}：{e}", tmp.display()))?;
     drop(f);
@@ -304,7 +319,7 @@ fn canonical_host_hex(host: &str) -> String {
 
 /// 本地 TCP 连接 RST 收口——**单源上移到 `crate::sysfd`**（Q-F-B F2-3/D13：portfwd
 /// 拨号失败面同用，不再有第四份私有副本）。本重导出保住本模块三处既有调用点零改动。
-pub(super) use crate::sysfd::rst_close_tcp;
+pub(super) use crate::sysock::rst_close_tcp;
 
 /// TCP 双向透传的半关闭单实现（Go pkg/netpipe.Both 同义：任一向 EOF 只收该向写端，
 /// 两向都收工才关两端；RST 只属于失败路径，由调用方负责）。
@@ -475,7 +490,7 @@ impl PollListener {
             // fd/内存短缺族 = 瞬态（低-2 整改：与 Go transientAcceptError 同集——
             // 一次 EMFILE 不该把监听打死为 failed）。
             Err(e)
-                if matches!(e.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOMEM))
+                if fd_shortage_errno(&e)
                     || matches!(
                         e.kind(),
                         std::io::ErrorKind::ConnectionAborted
@@ -500,6 +515,18 @@ impl PollListener {
     pub fn close(&mut self) {
         self.ln = None;
     }
+}
+
+/// fd/内存短缺族 errno（unix = libc 面）。WIN 批（设计 §D13）：windows 走通用
+/// （Failed）路径——EMFILE 族在 winsock 罕见，分类本就是 best-effort。
+#[cfg(unix)]
+fn fd_shortage_errno(e: &std::io::Error) -> bool {
+    matches!(e.raw_os_error(), Some(libc::EMFILE) | Some(libc::ENFILE) | Some(libc::ENOMEM))
+}
+
+#[cfg(windows)]
+fn fd_shortage_errno(_e: &std::io::Error) -> bool {
+    false
 }
 
 

@@ -20,7 +20,6 @@
 use std::fmt;
 use std::fs::{self, OpenOptions};
 use std::io::Write as _;
-use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
@@ -215,11 +214,20 @@ fn derive_dev_tag(master: &[u8; 32]) -> DevTag {
 
 /// 读主密钥；缺失则创建、损坏则归档重建（Go `loadOrCreateMaster`）。
 fn load_or_create_master(dir: &Path) -> Result<([u8; 32], IdentitySource), IdentityError> {
-    // 目录 0700（Go MkdirAll(dir, 0o700)；create_dir_all 默认 0777&~umask——评审中-5）
-    let mut db = std::fs::DirBuilder::new();
-    db.recursive(true);
-    use std::os::unix::fs::DirBuilderExt;
-    db.mode(0o700)
+    // 目录 0700（Go MkdirAll(dir, 0o700)；create_dir_all 默认 0777&~umask——评审中-5）。
+    // WIN 批（§D11）：windows 无 mode 位——普通建，隔离靠用户 profile 目录边界。
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        let mut db = std::fs::DirBuilder::new();
+        db.recursive(true);
+        db.mode(0o700)
+            .create(dir)
+            .map_err(|e| IdentityError::StoreUnavailable(format!("建目录 {dir:?}: {e}")))?;
+    }
+    #[cfg(not(unix))]
+    std::fs::DirBuilder::new()
+        .recursive(true)
         .create(dir)
         .map_err(|e| IdentityError::StoreUnavailable(format!("建目录 {dir:?}: {e}")))?;
     let path = dir.join(MASTER_KEY_FILE);
@@ -296,15 +304,22 @@ enum CreateExclError {
 }
 
 /// `O_CREATE|O_EXCL` 抢占最终路径并写随机材料 + fsync（Go `createRandomFileUnderLock`；
-/// 写失败自清理，不点半截文件）。
+/// 写失败自清理，不点半截文件）。密钥文件创建即 0600（WIN 批 §D11：windows 无
+/// mode 位——普通开）。
 fn create_random_file_excl(path: &Path, n: usize) -> Result<Vec<u8>, CreateExclError> {
     let buf = random_bytes(n).map_err(|e| CreateExclError::Io(std::io::Error::other(e)))?;
-    let mut f = OpenOptions::new()
-        .write(true)
-        .create_new(true)
-        .mode(0o600)
-        .open(path)
-        .map_err(|e| {
+    #[cfg(unix)]
+    let f = {
+        use std::os::unix::fs::OpenOptionsExt;
+        OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(0o600)
+            .open(path)
+    };
+    #[cfg(not(unix))]
+    let f = OpenOptions::new().write(true).create_new(true).open(path);
+    let mut f = f.map_err(|e| {
             if e.kind() == std::io::ErrorKind::AlreadyExists {
                 CreateExclError::Exists
             } else {

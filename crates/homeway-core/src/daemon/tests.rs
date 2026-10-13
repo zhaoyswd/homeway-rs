@@ -653,6 +653,7 @@ fn stream_recv_wait_wakes_on_data() {
 }
 
 #[test]
+#[cfg(unix)] // WIN 批：裸 UDS 直连造法 = unix 专属
 fn server_bad_frame_gets_goodbye_and_disconnect() {
     let (srv, sock, _bus, serve_h) = start_server("badframe", MockBackend::new());
     // 裸 socket：先发合法 hello 握手，再发声明超限的帧头 → goodbye(bad_frame) 断连。
@@ -707,6 +708,7 @@ fn server_bad_frame_gets_goodbye_and_disconnect() {
 }
 
 #[test]
+#[cfg(unix)] // WIN 批：裸 UDS 直连造法 = unix 专属
 fn server_request_overrun_disconnects() {
     // 慢 host.add（800ms/条）+ 背靠背 40 条请求（不读应答）→ 在途超 32 → goodbye(overrun)。
     let dir = std::env::temp_dir().join(format!("hw-ctl-srv-ovr-{}", std::process::id()));
@@ -815,6 +817,7 @@ impl Backend for SlowBackend {
 // ---------- 宽松解码（wire-2）：缺键帧不断连 ----------
 
 #[test]
+#[cfg(unix)] // WIN 批：裸 UDS 直连造法 = unix 专属
 fn missing_fields_get_stable_errors_not_disconnect() {
     // Go encoding/json 零值语义：缺 corr = 0、缺 op = 空串（→ unknown_op 应答），
 // 缺 version 的 hello 正常握手——**只有非法 JSON 才 bad_json 断连**。
@@ -860,6 +863,7 @@ fn missing_fields_get_stable_errors_not_disconnect() {
 // ---------- 并发-2：stream.open 的 30s 级拨号计入在途 ----------
 
 #[test]
+#[cfg(unix)] // WIN 批：裸 UDS 直连造法 = unix 专属
 fn slow_dial_counts_inflight_and_overruns() {
     // 慢 dial_stream（2s/次）+ 背靠背 40 条 stream.open：拨号全程占在途（Go defer
     // 同义）——第 33 条在途触发 goodbye(overrun)。
@@ -972,6 +976,7 @@ fn slow_dial_counts_inflight_and_overruns() {
 // ---------- 握手协议次序（版本不匹配 → reload） ----------
 
 #[test]
+#[cfg(unix)] // WIN 批：裸 UDS 直连造法 = unix 专属
 fn handshake_version_mismatch_reloads() {
     let (srv, sock, _bus, serve_h) = start_server("reload", MockBackend::new());
     use std::io::{Read, Write};
@@ -1159,6 +1164,7 @@ fn hello_frame() -> Vec<u8> {
 /// F5-cap：`max_conns = 2` 注入——前两条正常握手；第 3 条**接受后立即关闭**
 /// （读到 EOF/错误，无 welcome），且服务端日志出现拒绝行。
 #[test]
+#[cfg(unix)] // WIN 批：裸 UDS 直连造法 = unix 专属
 fn server_conn_cap_rejects_extra_conns() {
     let (srv, sock, logs, serve_h) = start_server_cfg("cap", 2, super::server::DEFAULT_HANDSHAKE_DEADLINE);
     let (c1, _w1) = ControlClient::dial(&sock, "cli", "t1").unwrap();
@@ -1192,6 +1198,7 @@ fn server_conn_cap_rejects_extra_conns() {
 /// F5-deadline：`handshake_deadline = 80ms` 注入——不发 hello 的连接被断开并记行；
 /// 已握手的连接不受影响。
 #[test]
+#[cfg(unix)] // WIN 批：裸 UDS 直连造法 = unix 专属
 fn server_handshake_deadline_disconnects_silent_conn() {
     let (srv, sock, logs, serve_h) =
         start_server_cfg("hs", 8, Duration::from_millis(80));
@@ -1266,6 +1273,7 @@ fn conn_threads_are_reaped_after_rounds() {
 /// 120ms 节拍把该裕量提到 3×（凑满需 480ms，且 120ms < 500ms 读拍 ⇒
 /// **原始缺陷面不变**：持续有进展时读侧仍不得只在拍上判期限）。
 #[test]
+#[cfg(unix)] // WIN 批：裸 UDS 直连造法 = unix 专属
 fn handshake_deadline_beats_slow_drip() {
     let (srv, sock, logs, serve_h) =
         start_server_cfg("drip", 8, Duration::from_millis(120));

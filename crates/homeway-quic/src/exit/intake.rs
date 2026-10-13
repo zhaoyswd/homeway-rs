@@ -41,13 +41,18 @@
 use std::collections::VecDeque;
 use std::io;
 use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::net::{UnixListener, UnixStream};
+#[cfg(unix)]
+use std::os::fd::AsRawFd as _;
+#[cfg(unix)]
+use std::os::unix::net::UnixListener;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use crate::sync_util::lock_unpoison;
+// WIN 批：承载流 = unix UDS / windows 回环 TCP（sysio 单源）；UDS 监听腿是 unix 调试面
+// （windows 只装配 QUIC 源——docs/reviews/WIN-design.md §D2）。
+use crate::sysio::{self, SvcStream};
 
 /// `accept()` 的 poll 预算。
 ///
@@ -75,13 +80,13 @@ pub struct IntakeFull {
 /// 两源共享件（出口侧入队句柄与服务侧 intake 各持一份 `Arc`）。
 struct Shared {
     /// QUIC 源队列（在队列条数 = 容量占用口径）。
-    queue: Mutex<VecDeque<UnixStream>>,
+    queue: Mutex<VecDeque<SvcStream>>,
     /// 容量（0 = 无 QUIC 源：`from_listener` 形态）。
     capacity: usize,
     /// 唤醒管道写端（**非阻塞**：队列非空时写 1B，`EAGAIN` 忽略——电平触发不需要计数）。
-    wake_tx: UnixStream,
+    wake_tx: SvcStream,
     /// 唤醒管道读端（非阻塞；服务侧 poll 目标之一）。
-    wake_rx: UnixStream,
+    wake_rx: SvcStream,
     /// 入队成功累计（诊断/用例读数）。
     enqueued: AtomicU64,
     /// 入队被拒累计（诊断/用例读数；出口侧另有 E-q5 计数与行）。
@@ -153,7 +158,7 @@ pub struct ServiceIntakeTx {
 
 impl ServiceIntakeTx {
     /// 入队一条**服务侧**socketpair 端。满 ⇒ [`IntakeFull`]（调用方按 `reset(0x23)` 处置）。
-    pub fn try_enqueue(&self, conn: UnixStream) -> Result<(), IntakeFull> {
+    pub fn try_enqueue(&self, conn: SvcStream) -> Result<(), IntakeFull> {
         let mut q = lock_unpoison(&self.shared.queue);
         if q.len() >= self.shared.capacity {
             let full = IntakeFull {
@@ -192,7 +197,8 @@ impl ServiceIntakeTx {
 
 /// 服务侧受理面（**单消费者**：每个服务一枚 accept 循环线程；`Send` 但不必 `Sync`）。
 pub struct ServiceIntake {
-    /// UDS 源（`None` = QUIC-only 形态）。
+    /// UDS 源（`None` = QUIC-only 形态）。**unix 调试面**（windows 无该腿——WIN 批）。
+    #[cfg(unix)]
     listener: Option<UnixListener>,
     /// 两源共享件。
     shared: Arc<Shared>,
@@ -205,6 +211,7 @@ impl ServiceIntake {
     /// 「不起 QUIC 面的本地形态」用它。
     ///
     /// 监听器置非阻塞（`accept()` 的 poll 前提）；失败即 `Err`（调用方按起不来处置）。
+    #[cfg(unix)]
     pub fn from_listener(listener: UnixListener) -> io::Result<Self> {
         listener.set_nonblocking(true)?;
         let shared = new_shared(0)?;
@@ -217,6 +224,7 @@ impl ServiceIntake {
 
     /// ② **两源形态**：UDS 监听器 + QUIC 源（容量 = 在册上限 + K）。返回值 =
     /// （服务侧 intake，出口侧入队句柄）。
+    #[cfg(unix)]
     pub fn with_quic(
         listener: UnixListener,
         capacity: usize,
@@ -225,11 +233,24 @@ impl ServiceIntake {
         Self::pair(Some(listener), capacity)
     }
 
-    /// ③ **QUIC-only 形态**（无 UDS 监听器；测试与纯 QUIC 部署面）。
+    /// ③ **QUIC-only 形态**（无 UDS 监听器；测试与纯 QUIC 部署面；windows 的**唯一**形态）。
     pub fn quic_only(capacity: usize) -> io::Result<(Self, ServiceIntakeTx)> {
-        Self::pair(None, capacity)
+        let shared = new_shared(capacity)?;
+        let tx = ServiceIntakeTx {
+            shared: Arc::clone(&shared),
+        };
+        Ok((
+            Self {
+                #[cfg(unix)]
+                listener: None,
+                shared,
+                streak: AtomicUsize::new(0),
+            },
+            tx,
+        ))
     }
 
+    #[cfg(unix)]
     fn pair(listener: Option<UnixListener>, capacity: usize) -> io::Result<(Self, ServiceIntakeTx)> {
         let shared = new_shared(capacity)?;
         let tx = ServiceIntakeTx {
@@ -249,12 +270,13 @@ impl ServiceIntake {
     ///
     /// term 的监听循环重写后 poll 它；files/speedtest 直接调 [`Self::accept`]（内部 poll
     /// 同一集合）——两条路径共用同一份登记，不各写一份 fd 列表。
-    pub fn ready_fds(&self) -> Vec<RawFd> {
+    pub fn ready_fds(&self) -> Vec<sysio::RawIo> {
         let mut fds = Vec::with_capacity(2);
+        #[cfg(unix)]
         if let Some(ln) = &self.listener {
             fds.push(ln.as_raw_fd());
         }
-        fds.push(self.shared.wake_rx.as_raw_fd());
+        fds.push(sysio::svc_raw(&self.shared.wake_rx));
         fds
     }
 
@@ -267,9 +289,10 @@ impl ServiceIntake {
     /// `WouldBlock`（调用方既有 `Retry` 节拍：sleep 200ms 后再来，顺带查停止位）。
     /// UDS 源的**真错**（监听器坏了）与 QUIC 源不同：前者原样上报（调用方 `classify_accept_err`
     /// 分类：瞬态退避 / 致命退工），后者不产生错误（队列空只是空）。
-    pub fn accept(&self) -> io::Result<UnixStream> {
+    pub fn accept(&self) -> io::Result<SvcStream> {
         loop {
-            // ① UDS 源优先（**每次回环都先查**——见模块头 ④）
+            // ① UDS 源优先（**每次回环都先查**——见模块头 ④；unix 调试腿）
+            #[cfg(unix)]
             if let Some(ln) = &self.listener {
                 match ln.accept() {
                     Ok((conn, _)) => {
@@ -318,7 +341,7 @@ impl ServiceIntake {
 
     /// 从 QUIC 队列取一条；**队列排空时收干唤醒字节**（电平触发的收口——否则遗留的 1B
     /// 会让后续 poll 恒可读而空转）。
-    fn take_quic(&self) -> Option<UnixStream> {
+    fn take_quic(&self) -> Option<SvcStream> {
         let got = {
             let mut q = lock_unpoison(&self.shared.queue);
             q.pop_front()
@@ -337,28 +360,25 @@ impl ServiceIntake {
     /// `false` = 预算到点或 `EINTR`（调用方按 `WouldBlock` 处置）。
     fn wait_ready(&self) -> bool {
         let fds = self.ready_fds();
-        let mut pfds: Vec<libc::pollfd> = fds
+        let mut pfds: Vec<sysio::PollEnt> = fds
             .iter()
-            .map(|fd| libc::pollfd {
-                fd: *fd,
-                events: libc::POLLIN,
+            .map(|fd| sysio::PollEnt {
+                raw: *fd,
+                events: sysio::POLLIN,
                 revents: 0,
             })
             .collect();
-        let r = unsafe {
-            libc::poll(
-                pfds.as_mut_ptr(),
-                pfds.len() as libc::nfds_t,
-                ACCEPT_POLL_BUDGET.as_millis() as libc::c_int,
-            )
-        };
-        r > 0
+        // poll 失败/EINTR 按预算到点处置（`r > 0` = 有事可做——原语义逐字保留）。
+        sysio::poll(&mut pfds, ACCEPT_POLL_BUDGET.as_millis() as i32)
+            .map(|r| r > 0)
+            .unwrap_or(false)
     }
 }
 
-/// 两源共享件构造（唤醒管道 = `UnixStream::pair`，两端非阻塞）。
+/// 两源共享件构造（唤醒对经 `sysio::pair`——unix = UnixStream::pair / windows = 回环
+/// TCP 对；两端非阻塞）。
 fn new_shared(capacity: usize) -> io::Result<Arc<Shared>> {
-    let (wake_tx, wake_rx) = UnixStream::pair()?;
+    let (wake_tx, wake_rx) = sysio::pair()?;
     wake_tx.set_nonblocking(true)?;
     wake_rx.set_nonblocking(true)?;
     Ok(Arc::new(Shared {

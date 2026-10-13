@@ -64,8 +64,19 @@ pub mod speedtest_server;
 /// `TunDevice` + E2E 测试泵 `StackB`）：客户端生产消费者已随 WG 面退役。
 pub mod stackb;
 pub mod status_json;
+/// 跨平台 socket/poll 底座（WIN 批：unix = libc 直通，windows = winsock）。
+pub mod sysock;
+/// 跨平台排它文件锁（unix flock / windows LockFileEx——WIN 批）。
+pub mod syslock;
 /// 平台系统事实单源（fd 标志 / `sockaddr_un` 上限）——Q-G F1/F4；CLI crate 复用。
+/// unix 专属（WIN 批：windows 的对应面在 `sysock`/`syslock`——SUN_PATH_MAX 是
+/// `sockaddr_un` 的 unix 布局事实）。
+#[cfg(unix)]
 pub mod sysfd;
+/// 跨平台本地时间（unix localtime_r / windows 时区 API——WIN 批）。
+pub mod systime;
+/// term 服务面（WIN 批：windows 不装配——用户指令豁免；wire 常量保留在协议层）。
+#[cfg(not(windows))]
 pub mod term;
 pub mod token;
 pub mod tunnel_addr;

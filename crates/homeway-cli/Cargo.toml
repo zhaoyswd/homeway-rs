@@ -20,6 +20,10 @@ serde.workspace = true
 sha2.workspace = true
 getrandom.workspace = true
 
+# WIN 批（2026-10-13）：windows 系统面（控制台事件——stopsig；spawn flags）。
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 [features]
 # 透传 homeway-core 的故障注入缝（阶梯时间窗实测用）
 test-seams = ["homeway-core/test-seams"]

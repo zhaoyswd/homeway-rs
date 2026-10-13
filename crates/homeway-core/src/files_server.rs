@@ -10,8 +10,9 @@
 //! 提前关流/出错只删**自己创建的**临时文件；写同路径前顺手回收超 24h 的陈旧残留。
 
 use std::io::{BufRead, BufReader, Read, Write};
+
+#[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
-use std::os::unix::net::{UnixListener, UnixStream};
 
 use homeway_quic::ServiceIntake;
 use std::path::{Path, PathBuf};
@@ -19,6 +20,7 @@ use std::time::{Duration, SystemTime};
 
 use serde::{Deserialize, Serialize};
 
+use crate::daemon::ipc::{self, IpcListener, IpcStream};
 use crate::files::{Entry, MAX_CHUNK};
 
 /// 与 App 侧 NAPI 契约对齐的默认值（Go 同源）。
@@ -116,16 +118,40 @@ fn ok_response() -> Response {
     Response { ok: true, ..Default::default() }
 }
 
-/// 目标目录的可用字节数（`statvfs` 的 `f_bavail × f_frsize`；macOS/Linux/OHOS 同 API）。
-/// 失败 → `None`（调用方 fail-open + 节流告警）。
-fn avail_bytes(dir: &Path) -> Option<u64> {
-    use std::os::unix::ffi::OsStrExt as _;
-    let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
-    let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
-    if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
-        return None;
+/// 目标目录的可用字节数（unix = `statvfs` 的 `f_bavail × f_frsize`，原样；windows =
+/// `GetDiskFreeSpaceExW` 的 AvailableToCaller——同义面，WIN 批 §D11）。失败 → `None`
+/// （调用方 fail-open + 节流告警）。
+fn disk_free_bytes(dir: &Path) -> Option<u64> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt as _;
+        let c = std::ffi::CString::new(dir.as_os_str().as_bytes()).ok()?;
+        let mut st: libc::statvfs = unsafe { std::mem::zeroed() };
+        if unsafe { libc::statvfs(c.as_ptr(), &mut st) } != 0 {
+            return None;
+        }
+        Some(st.f_bavail as u64 * st.f_frsize as u64)
     }
-    Some(st.f_bavail as u64 * st.f_frsize as u64)
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt as _;
+        use windows_sys::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+        let wide: Vec<u16> = dir.as_os_str().encode_wide().chain(std::iter::once(0)).collect();
+        let mut avail: u64 = 0; // ULARGE_INTEGER（AvailableToCaller）
+        // 返回 0 = 失败（失败面按 None 走 fail-open，与 unix 臂同位）。
+        if unsafe {
+            GetDiskFreeSpaceExW(
+                wide.as_ptr(),
+                &mut avail,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        } == 0
+        {
+            return None;
+        }
+        Some(avail)
+    }
 }
 
 /// 上传水位判定（纯函数——三态可测；`avail = None` = statvfs 失败 ⇒ fail-open 放行）。
@@ -192,7 +218,7 @@ impl DiskWatermark {
     fn probe(&self, dir: &Path, logf: &crate::Logf) -> Option<u64> {
         let v = match &self.avail {
             Some(f) => f(dir),
-            None => avail_bytes(dir),
+            None => disk_free_bytes(dir),
         };
         if v.is_none() {
             let n = self.fail_count.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
@@ -248,13 +274,13 @@ impl FilesServer {
         &self.root
     }
 
-    /// 在 UDS 上服务（每连接一线程；accept 出错即返回）。
-    pub fn serve(&self, ln: UnixListener) -> std::io::Result<()> {
-        for conn in ln.incoming() {
-            let conn = conn?;
+    /// 在 IPC 监听点上服务（每连接一线程；accept 出错即返回）。
+    /// WIN 批：承载经 `ipc.rs`（unix = UDS / windows = TCP loopback + 端口文件）。
+    pub fn serve(&self, ln: IpcListener) -> std::io::Result<()> {
+        loop {
+            let conn = ln.accept()?;
             self.spawn_conn(conn);
         }
-        Ok(())
     }
 
     /// 可停形态（引擎收工：两源 accept + stop 轮询——② 关服务入口的执行面）。
@@ -271,7 +297,7 @@ impl FilesServer {
         stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
     ) -> std::io::Result<()> {
         serve_stoppable_accepts(
-            || intake.accept(),
+            || intake.accept().map(intake_conn),
             |conn| self.spawn_conn(conn),
             stop,
             &self.logf,
@@ -282,7 +308,7 @@ impl FilesServer {
     /// accept 后派发：在册 <16 走正常服务（结束时 release）；满则 busy 拒入
     ///（Go sem 同义——先发 greeting、吞掉一条请求再回 busy，客户端拿到的仍是
     ///「有根目录的服务端拒绝了我」，不是连接层失败）。
-    fn spawn_conn(&self, conn: UnixStream) {
+    fn spawn_conn(&self, conn: IpcStream) {
         let Some(res) = ConnReservation::acquire(&self.conns) else {
             self.spawn_busy(conn);
             return;
@@ -304,7 +330,7 @@ impl FilesServer {
         }
     }
 
-    fn spawn_busy(&self, conn: UnixStream) {
+    fn spawn_busy(&self, conn: IpcStream) {
         let server = FilesServer {
             root: self.root.clone(),
             logf: self.logf.clone(),
@@ -317,7 +343,7 @@ impl FilesServer {
     }
 
     /// 满员拒入路径（Go server.go:141-156 同序）。
-    fn serve_busy(self, conn: UnixStream) {
+    fn serve_busy(self, conn: IpcStream) {
         let _ = conn.set_read_timeout(Some(IDLE_TIMEOUT));
         let _ = conn.set_write_timeout(Some(IDLE_TIMEOUT));
         let mut reader = BufReader::new(match conn.try_clone() {
@@ -345,7 +371,7 @@ impl FilesServer {
         (self.logf)(&format!("files: 并发流已满（{MAX_CONNS}）——回 busy 拒入"));
     }
 
-    fn serve_conn(self, conn: UnixStream) {
+    fn serve_conn(self, conn: IpcStream) {
         let _ = conn.set_read_timeout(Some(IDLE_TIMEOUT));
         let _ = conn.set_write_timeout(Some(IDLE_TIMEOUT));
         let mut reader = BufReader::new(match conn.try_clone() {
@@ -385,7 +411,7 @@ impl FilesServer {
     }
 
     #[allow(clippy::result_large_err)]
-    fn dispatch(&self, w: &mut UnixStream, r: &mut BufReader<UnixStream>, req: &Request) -> Result<(), Response> {
+    fn dispatch(&self, w: &mut IpcStream, r: &mut BufReader<IpcStream>, req: &Request) -> Result<(), Response> {
         match req.op.as_str() {
             "list" => {
                 let ents = self.list(&req.path)?;
@@ -539,7 +565,7 @@ impl FilesServer {
                 .and_then(|t| t.duration_since(SystemTime::UNIX_EPOCH).ok())
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0),
-            mode: md.permissions().mode() & 0o777,
+            mode: fs_mode_bits(md),
         }
     }
 
@@ -582,7 +608,7 @@ impl FilesServer {
     }
 
     #[allow(clippy::result_large_err)]
-    fn read(&self, w: &mut UnixStream, req: &Request) -> Result<(), Response> {
+    fn read(&self, w: &mut IpcStream, req: &Request) -> Result<(), Response> {
         let path = self.rel_path(&req.path)?;
         let md = std::fs::metadata(&path).map_err(|e| Self::map_io_err("read", &req.path, e))?;
         if md.is_dir() {
@@ -616,7 +642,7 @@ impl FilesServer {
     }
 
     #[allow(clippy::result_large_err)]
-    fn download(&self, w: &mut UnixStream, req: &Request) -> Result<(), Response> {
+    fn download(&self, w: &mut IpcStream, req: &Request) -> Result<(), Response> {
         let path = self.rel_path(&req.path)?;
         let md = std::fs::metadata(&path).map_err(|e| Self::map_io_err("download", &req.path, e))?;
         if md.is_dir() {
@@ -641,7 +667,7 @@ impl FilesServer {
     }
 
     #[allow(clippy::result_large_err)]
-    fn write(&self, w: &mut UnixStream, r: &mut BufReader<UnixStream>, req: &Request) -> Result<(), Response> {
+    fn write(&self, w: &mut IpcStream, r: &mut BufReader<IpcStream>, req: &Request) -> Result<(), Response> {
         let path = self.rel_path(&req.path)?;
         if path == self.root {
             return Err(err_response(crate::files::CODE_INVALID_NAME, "不能写入根目录本身"));
@@ -682,8 +708,8 @@ impl FilesServer {
     #[allow(clippy::result_large_err)]
     fn receive_upload(
         &self,
-        w: &mut UnixStream,
-        r: &mut BufReader<UnixStream>,
+        w: &mut IpcStream,
+        r: &mut BufReader<IpcStream>,
         part: &Path,
         target: &Path,
         req: &Request,
@@ -805,7 +831,7 @@ fn line_err_response(e: &LineErr) -> Response {
 
 /// 读一行请求（F3b：`MAX_REQUEST_LINE` **累积中判负**——`read_until` 无界累积换成
 /// `fill_buf` 逐块推进，超限即返 `OverLimit`，对齐 Go `readLineLimited`）。
-fn read_line(r: &mut BufReader<UnixStream>) -> Result<Vec<u8>, LineErr> {
+fn read_line(r: &mut BufReader<IpcStream>) -> Result<Vec<u8>, LineErr> {
     let mut buf: Vec<u8> = Vec::new();
     loop {
         let mut chunk: Vec<u8> = Vec::new();
@@ -838,20 +864,20 @@ fn read_line(r: &mut BufReader<UnixStream>) -> Result<Vec<u8>, LineErr> {
     }
 }
 
-fn write_line(w: &mut UnixStream, resp: &Response) -> std::io::Result<()> {
+fn write_line(w: &mut IpcStream, resp: &Response) -> std::io::Result<()> {
     let mut line = serde_json::to_vec(resp).map_err(std::io::Error::other)?;
     line.push(b'\n');
     w.write_all(&line)
 }
 
-fn write_frame(w: &mut UnixStream, payload: &[u8]) -> std::io::Result<()> {
+fn write_frame(w: &mut IpcStream, payload: &[u8]) -> std::io::Result<()> {
     w.write_all(&(payload.len() as u32).to_be_bytes())?;
     w.write_all(payload)
 }
 
 /// 测试壳（Q-I F6.1 起生产路径走 `read_frame_into`）：每帧新分配 + 一次拷贝。
 #[cfg(test)]
-fn read_frame(r: &mut BufReader<UnixStream>) -> std::io::Result<Option<Vec<u8>>> {
+fn read_frame(r: &mut BufReader<IpcStream>) -> std::io::Result<Option<Vec<u8>>> {
     let mut buf = Vec::new();
     Ok(read_frame_into(r, &mut buf)?.map(|n| {
         buf.truncate(n);
@@ -862,7 +888,7 @@ fn read_frame(r: &mut BufReader<UnixStream>) -> std::io::Result<Option<Vec<u8>>>
 /// 读一帧进**调用方缓冲**（Q-I F6.1）：`None` = 终止帧；`Some(n)` = 载荷在 `buf[..n]`。
 /// 缓冲由调用方跨帧持有（**每连接自持，不跨连接共享**）⇒ 帧长不超历史最大时**零成本**
 /// （旧形态每帧 `vec![0u8; n]` 整段零填充，≤MAX_CHUNK=256KiB）。
-fn read_frame_into(r: &mut BufReader<UnixStream>, buf: &mut Vec<u8>) -> std::io::Result<Option<usize>> {
+fn read_frame_into(r: &mut BufReader<IpcStream>, buf: &mut Vec<u8>) -> std::io::Result<Option<usize>> {
     let mut len = [0u8; 4];
     r.read_exact(&mut len)?;
     // 前缀判定与客户端共用单一真源（files::decode_prefix——R5 第二道门 高-4 整改：
@@ -880,7 +906,37 @@ fn read_frame_into(r: &mut BufReader<UnixStream>, buf: &mut Vec<u8>) -> std::io:
     }
 }
 
+
+/// 权限位的类 unix 渲染（unix = 真实 mode & 0o777；windows 无位语义——给类 unix
+/// 读者的缺省 0o644，只读位面不参与任何判定——WIN 批）。
+fn fs_mode_bits(md: &std::fs::Metadata) -> u32 {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        md.permissions().mode() & 0o777
+    }
+    #[cfg(windows)]
+    {
+        let _ = md;
+        0o644
+    }
+}
+
 // ---------- accept 错误分类 / 退避 / 名额回滚（F5：files 与 speedtest 共用） ----------
+
+/// `ServiceIntake`（quic 服务流泵/调试腿）产出的流 → [`IpcStream`] 归 wrap。
+/// WIN 批：承载流类型 = quic 的 `SvcStream`（unix = UDS 零拷贝包一层 / windows =
+/// 回环 TCP 对——泵侧同源），两平台服务本体都吃到 `IpcStream`。
+pub(crate) fn intake_conn(s: homeway_quic::sysio::SvcStream) -> IpcStream {
+    #[cfg(unix)]
+    {
+        IpcStream::Unix(s)
+    }
+    #[cfg(windows)]
+    {
+        IpcStream::Tcp(s)
+    }
+}
 
 /// accept 错误的处置分类（纯函数，可测）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -934,8 +990,8 @@ pub(crate) fn serve_stoppable_accepts<A, H>(
     tag: &'static str,
 ) -> std::io::Result<()>
 where
-    A: FnMut() -> std::io::Result<UnixStream>,
-    H: FnMut(UnixStream),
+    A: FnMut() -> std::io::Result<IpcStream>,
+    H: FnMut(IpcStream),
 {
     use std::sync::atomic::Ordering as OD;
     let mut backoff = Duration::from_millis(200);
@@ -1000,35 +1056,39 @@ impl Drop for ConnReservation {
 /// 都传 `serve_dir`：`engine.rs` 的 files/speedtest/term 三处）——函数在 bind 之前
 /// 会把 `dir` 收紧 0700（失败**告警不阻断**），这是 UDS 无法原子 0600 的补偿面
 /// （`bind()` 无 mode 参数，跨用户暴露面由目录权限关闭；同用户窗口为已知残余）。
-pub fn listen_local_service(dir: &Path, name: &str, logf: &crate::Logf) -> std::io::Result<UnixListener> {
+/// WIN 批（§D2）：承载经 `ipc.rs`——unix 臂凭证面（长度拒绝/0700/0600）原样；
+/// windows = TCP loopback + 端口文件，这三步整体跳过（§D2 鉴权面偏离已登记）。
+pub fn listen_local_service(dir: &Path, name: &str, logf: &crate::Logf) -> std::io::Result<IpcListener> {
     let sock = dir.join(name);
     // 量法统一为**字节口径**（`as_os_str().len()`——旧 `display()` 是 lossy 字符串，
     // 与判据不同源；Q-G F4.3）。
-    let s_len = sock.as_os_str().len();
-    if s_len > crate::sysfd::SUN_PATH_MAX {
+    #[cfg(unix)]
+    if sock.as_os_str().len() > crate::sysfd::SUN_PATH_MAX {
         return Err(std::io::Error::new(
             std::io::ErrorKind::InvalidInput,
             format!(
-                "路径超长（{s_len} 字节 > {}，sun_path 上限〔平台值〕）",
+                "路径超长（{} 字节 > {}，sun_path 上限〔平台值〕）",
+                sock.as_os_str().len(),
                 crate::sysfd::SUN_PATH_MAX
             ),
         ));
     }
     // 活实例占用判别：拨得通 = 有人（报占用）；ENOENT/ECONNREFUSED = 死残留（可清）
-    if let Ok(c) = UnixStream::connect(&sock) {
-        drop(c);
+    if ipc::probe_alive(&sock).unwrap_or(false) {
         return Err(std::io::Error::new(std::io::ErrorKind::AddrInUse, "socket 已被另一个活实例占用（同 state 双实例？）"));
     }
-    let _ = std::fs::remove_file(&sock);
+    let _ = ipc::remove_stale(&sock);
     // 目录先 0700（bind 之前；失败告警不阻断——socket 0600 那层还兜着）
+    #[cfg(unix)]
     if let Err(e) = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700)) {
         logf(&format!(
             "⚠️ state 目录 {} 收紧 0700 失败（{e}）——socket 0600 仍是边界",
             dir.display()
         ));
     }
-    let ln = UnixListener::bind(&sock)?;
+    let ln = IpcListener::bind(&sock)?;
     // chmod 0600：**失败告警**（旧形态静默 `let _ =`；Go `chmodTighten` 会告警）
+    #[cfg(unix)]
     if let Err(e) = std::fs::set_permissions(&sock, std::fs::Permissions::from_mode(0o600)) {
         logf(&format!(
             "⚠️ {} chmod 0600 失败（{e}）—— 纵深加固未生效，state 目录权限仍是边界",
@@ -1057,11 +1117,19 @@ mod tests {
         std::sync::Arc::new(|_| {})
     }
 
+    /// `UnixStream::pair` → IPC 流对（测试面；unix 专属造法——socketpair）。
+    #[cfg(unix)]
+    fn pair_ipc() -> (IpcStream, IpcStream) {
+        let (a, b) = std::os::unix::net::UnixStream::pair().unwrap();
+        (IpcStream::Unix(a), IpcStream::Unix(b))
+    }
+
     /// **M3 S2 判据（服务入口承载面）**：① 同一请求序列在**两条入口**（UDS 监听器 /
     /// QUIC socketpair 端）上的应答**逐字节相同**（「应用层零改动」的构造性钉法）；
     /// ② 在册满 ⇒ **应用层 busy 路径在 intake 面仍可达**（第 17 条拿到 `server_busy`，
     /// 而不是在入口就被拒）；③ 入口容量 = 在册上限 + K（装配点的算式与常量一致）。
     #[test]
+    #[cfg(unix)] // WIN 批：from_listener 的 UDS 源与 socketpair 造法 = unix 专属
     fn intake_two_sources_serve_identical_bytes_and_busy_stays_reachable() {
         let dir = tmpdir("intake");
         std::fs::write(dir.join("hello.txt"), b"hi").unwrap();
@@ -1072,7 +1140,7 @@ mod tests {
         let dir_a = dir.join("a");
         std::fs::create_dir_all(&dir_a).unwrap();
         let sock = dir_a.join("files.sock");
-        let ln = UnixListener::bind(&sock).unwrap();
+        let ln = std::os::unix::net::UnixListener::bind(&sock).unwrap();
         let (uds_intake, _no_tx) = {
             let intake = homeway_quic::ServiceIntake::from_listener(ln).unwrap();
             (intake, ())
@@ -1096,7 +1164,7 @@ mod tests {
 
         // 同一请求在两条入口上各跑一遍：问候行 + stat 应答**逐字节对比**
         let request = serde_json::json!({"op": "stat", "path": "hello.txt"}).to_string();
-        let run = |stream: UnixStream| -> (Vec<u8>, Vec<u8>) {
+        let run = |stream: IpcStream| -> (Vec<u8>, Vec<u8>) {
             let mut w = stream.try_clone().unwrap();
             w.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let mut r = BufReader::new(stream);
@@ -1106,12 +1174,12 @@ mod tests {
             (greet, resp)
         };
         let (g_uds, r_uds) = {
-            let c = UnixStream::connect(&sock).unwrap();
-            run(c)
+            let c = std::os::unix::net::UnixStream::connect(&sock).unwrap();
+            run(IpcStream::Unix(c))
         };
-        let (svc_end, cli_end) = UnixStream::pair().unwrap();
+        let (svc_end, cli_end) = std::os::unix::net::UnixStream::pair().unwrap();
         tx.try_enqueue(svc_end).expect("入队");
-        let (g_quic, r_quic) = run(cli_end);
+        let (g_quic, r_quic) = run(IpcStream::Unix(cli_end));
         assert_eq!(g_quic, g_uds, "问候行逐字节相同（同一 root/ver ⇒ 同串）");
         assert_eq!(r_quic, r_uds, "stat 应答逐字节相同：两源同协议面");
         assert!(
@@ -1123,7 +1191,7 @@ mod tests {
         // ② 在册满（MAX_CONNS 条经 intake 的会话挂着不关）⇒ 第 17 条走应用层 busy
         let mut holders = Vec::new();
         for _ in 0..MAX_CONNS {
-            let (svc_end, cli_end) = UnixStream::pair().unwrap();
+            let (svc_end, cli_end) = std::os::unix::net::UnixStream::pair().unwrap();
             tx.try_enqueue(svc_end).expect("入队");
             holders.push(cli_end); // 不读不关：会话线程挂在读请求行上（在册名额held）
         }
@@ -1133,9 +1201,9 @@ mod tests {
             assert!(std::time::Instant::now() < deadline, "在册数未达上限：{}", conns.load(std::sync::atomic::Ordering::Acquire));
             std::thread::sleep(Duration::from_millis(20));
         }
-        let (svc_end, cli_end) = UnixStream::pair().unwrap();
+        let (svc_end, cli_end) = std::os::unix::net::UnixStream::pair().unwrap();
         tx.try_enqueue(svc_end).expect("第 17 条入队（入口未满——在册闸先触发）");
-        let (greet17, resp17) = run(cli_end);
+        let (greet17, resp17) = run(IpcStream::Unix(cli_end));
         let g17: serde_json::Value = serde_json::from_slice(&greet17).unwrap();
         assert_eq!(g17["ok"], serde_json::json!(true), "busy 路径也先发问候（Go 同序）");
         let r17: serde_json::Value = serde_json::from_slice(&resp17).unwrap();
@@ -1153,12 +1221,13 @@ mod tests {
     /// G3：满员拒入（Go server.go:140-156 同序）——在册置满后第 17 条流拿到
     /// greeting → 回 server_busy 错误响应（不是连接层失败）。
     #[test]
+    #[cfg(unix)] // WIN 批：socketpair 造法 = unix 专属
     fn busy_rejection_when_conns_full() {
         let dir = tmpdir("busy");
         let srv = FilesServer { root: dir.canonicalize().unwrap(), logf: noop_logf(), conns: Default::default(), watermark: Default::default() };
         srv.conns.store(MAX_CONNS, std::sync::atomic::Ordering::Release);
 
-        let (a, b) = UnixStream::pair().unwrap();
+        let (a, b) = pair_ipc();
         let s2 = FilesServer { root: srv.root.clone(), logf: noop_logf(), conns: std::sync::Arc::clone(&srv.conns), watermark: Default::default() };
         std::thread::spawn(move || s2.serve_busy(a));
         let mut r = BufReader::new(b.try_clone().unwrap());
@@ -1176,8 +1245,9 @@ mod tests {
     /// Q-I F6.1：`read_frame_into` 复用缓冲——帧长交替（小帧↔大帧↔等长帧）内容不错位；
     /// 等长帧第二帧起**不 resize**（不重复零填：ptr/len 稳定）。
     #[test]
+    #[cfg(unix)] // WIN 批：socketpair 造法 = unix 专属
     fn read_frame_into_reuses_buffer() {
-        let (a, b) = UnixStream::pair().unwrap();
+        let (a, b) = pair_ipc();
         let mut w = b;
         let small: Vec<u8> = (0..7u8).collect();
         let big: Vec<u8> = (0..200_000u32).map(|i| (i % 251) as u8).collect();
@@ -1209,14 +1279,15 @@ mod tests {
     /// 内存对拍：客户端请求（R2 同协议形态）→ 服务端响应。**每命令一对 pair**
     /// （协议即「每命令一流」——Go serveConn 同义）。
     #[test]
+    #[cfg(unix)] // WIN 批：socketpair 造法 = unix 专属
     fn six_verbs_over_ud_pair() {
         let dir = tmpdir("verbs");
         let srv = FilesServer { root: dir.canonicalize().unwrap(), logf: noop_logf(), conns: Default::default(), watermark: Default::default() };
         std::fs::write(dir.join("hello.txt"), b"hello-files").unwrap();
 
         // 一条命令 = 起 pair + 服务端线程；返回（读半, 写半）
-        fn call(srv: &FilesServer) -> (BufReader<UnixStream>, UnixStream) {
-            let (a, b) = UnixStream::pair().unwrap();
+        fn call(srv: &FilesServer) -> (BufReader<IpcStream>, IpcStream) {
+            let (a, b) = pair_ipc();
             let s2 = FilesServer { root: srv.root.clone(), logf: noop_logf(), conns: std::sync::Arc::clone(&srv.conns), watermark: Default::default() };
             std::thread::spawn(move || s2.serve_conn(a));
             let w = b.try_clone().unwrap();
@@ -1308,6 +1379,7 @@ mod tests {
         (root, s2, outside)
     }
 
+    #[cfg(unix)] // WIN 批：symlink 造法 = unix 专属
     fn symlink(target: &Path, at: &Path) {
         std::os::unix::fs::symlink(target, at).unwrap();
     }
@@ -1315,6 +1387,7 @@ mod tests {
     /// ① `link -> <根外>` + 不存在叶子：整个候选从未被解析 ⇒ 必须 not_found（**修前红**：
     /// canonicalize ENOENT ⇒ `Ok(candidate)` 原样放行）。
     #[test]
+    #[cfg(unix)] // WIN 批：symlink 造法 = unix 专属
     fn rel_path_escape_symlink_with_missing_leaf_rejected() {
         let (root, srv, outside) = mkroot("esc-leaf");
         symlink(&outside, &root.join("link"));
@@ -1329,6 +1402,7 @@ mod tests {
     /// ④ 绝对目标 + 落在根内：Go `os.Root` 一律拒（§0.4 实测 `path escapes from parent`）
     /// ⇒ `not_found`（**修前红**：canonicalize 成功且 starts_with(root) ⇒ 放行）。
     #[test]
+    #[cfg(unix)] // WIN 批：symlink 造法 = unix 专属
     fn rel_path_absolute_target_even_inside_root_rejected() {
         let (root, srv, outside) = mkroot("esc-abs");
         std::fs::create_dir(root.join("sub")).unwrap();
@@ -1345,6 +1419,7 @@ mod tests {
     /// ⇒ 一律 not_found——修前实现会词法回升到根、把**未复核**的 `evil`（指向根外的
     /// 符号链接）直接拼回 ⇒ 根外落文件（真实 crate 已复现）。
     #[test]
+    #[cfg(unix)] // WIN 批：symlink 造法 = unix 专属
     fn rel_path_dotdot_after_missing_component_rejected() {
         let (root, srv, outside) = mkroot("esc-dotdot");
         std::os::unix::fs::symlink(&outside, root.join("evil")).unwrap();
@@ -1362,7 +1437,7 @@ mod tests {
             serde_json::json!({"op":"read","path":"l"}),
             serde_json::json!({"op":"list","path":"l"}),
         ] {
-            let (a, b) = UnixStream::pair().unwrap();
+            let (a, b) = pair_ipc();
             let s2 = FilesServer {
                 root: srv.root.clone(),
                 logf: noop_logf(),
@@ -1389,6 +1464,7 @@ mod tests {
 
     /// ② 悬空链接（相对目标越界/或目标不存在）⇒ not_found（规则 c；Go 实测同级）。
     #[test]
+    #[cfg(unix)] // WIN 批：symlink 造法 = unix 专属
     fn rel_path_dangling_symlink_rejected() {
         let (root, srv, outside) = mkroot("esc-dangle");
         symlink(&outside.join("notyet"), &root.join("l_dangle_out")); // 绝对悬空
@@ -1405,6 +1481,7 @@ mod tests {
 
     /// ③ 相对根内链接（目标存在）+ 不存在叶子 ⇒ 放行且落在根内目标下。
     #[test]
+    #[cfg(unix)] // WIN 批：symlink 造法 = unix 专属
     fn rel_path_in_root_relative_symlink_resolves() {
         let (root, srv, outside) = mkroot("esc-inrel");
         std::fs::create_dir(root.join("sub")).unwrap();
@@ -1416,6 +1493,7 @@ mod tests {
 
     /// ⑤ 链接链（`l1 -> l2 -> <根外>`）⇒ not_found；⑥ 循环链接（深度上限）⇒ not_found。
     #[test]
+    #[cfg(unix)] // WIN 批：symlink 造法 = unix 专属
     fn rel_path_link_chain_and_cycle_rejected() {
         let (root, srv, outside) = mkroot("esc-chain");
         symlink(Path::new("l2"), &root.join("l1"));
@@ -1456,6 +1534,7 @@ mod tests {
     /// **端到端负例（审计点名）**：真 UDS 对 + 六动词打 `link/<新叶>` ⇒ 全 `ok=false`，
     /// 且根外目录内容**一字未增**（修前 write/mkdir 会在根外落文件）。
     #[test]
+    #[cfg(unix)] // WIN 批：symlink 造法 = unix 专属
     fn symlink_escape_no_write_outside() {
         let (root, srv, outside) = mkroot("esc-e2e");
         std::fs::write(outside.join("sentinel"), b"keep").unwrap();
@@ -1466,7 +1545,7 @@ mod tests {
             .collect();
 
         fn call(srv: &FilesServer, req: serde_json::Value) -> serde_json::Value {
-            let (a, b) = UnixStream::pair().unwrap();
+            let (a, b) = pair_ipc();
             let s2 = FilesServer { root: srv.root.clone(), logf: noop_logf(), conns: Default::default(), watermark: Default::default() };
             std::thread::spawn(move || s2.serve_conn(a));
             let mut w = b.try_clone().unwrap();
@@ -1528,17 +1607,19 @@ mod tests {
         assert_eq!(quota_verdict(None, 0, 1 << 30, true), QuotaVerdict::Allow);
     }
 
-    /// 真 `statvfs` 冒烟（临时目录应可取到可用空间）。
+    /// 真磁盘可用量冒烟（临时目录应可取到可用空间；unix = statvfs / windows =
+    /// GetDiskFreeSpaceExW——WIN 批 §D11 同义面）。
     #[test]
-    fn avail_bytes_smoke() {
-        let v = avail_bytes(&std::env::temp_dir());
-        assert!(v.is_some(), "statvfs 在临时目录应可用");
+    fn disk_free_bytes_smoke() {
+        let v = disk_free_bytes(&std::env::temp_dir());
+        assert!(v.is_some(), "磁盘可用量探测在临时目录应可用");
         assert!(v.unwrap() > 0);
     }
 
     /// 起始门端到端（注入 avail=0）：`write` 回 op_failed、**无 .tierpart 残留**、目标未变；
     /// 中途门（注入值先足量后跌破）⇒ 中止 + 清理。
     #[test]
+    #[cfg(unix)] // WIN 批：socketpair 造法 = unix 专属
     fn upload_rejected_when_low_disk() {
         let dir = tmpdir("quota-low");
         let mut srv = FilesServer::open(Some(&dir), noop_logf()).unwrap();
@@ -1549,7 +1630,7 @@ mod tests {
             conns: std::sync::Arc::clone(&srv.conns),
             watermark: srv.watermark.clone(),
         };
-        let (a, b) = UnixStream::pair().unwrap();
+        let (a, b) = pair_ipc();
         std::thread::spawn(move || s2.serve_conn(a));
         let mut w = b.try_clone().unwrap();
         let mut r = BufReader::new(b);
@@ -1587,7 +1668,7 @@ mod tests {
             conns: Default::default(),
             watermark: srv2.watermark.clone(),
         };
-        let (a, b) = UnixStream::pair().unwrap();
+        let (a, b) = pair_ipc();
         std::thread::spawn(move || s3.serve_conn(a));
         let mut w = b.try_clone().unwrap();
         let mut r = BufReader::new(b);
@@ -1619,6 +1700,7 @@ mod tests {
     /// 66KB（> 65536）+ 换行 ⇒ `invalid_arg`（msg **逐字**对齐 Go「请求行超过 65536 字节」）
     /// 并收线；60KB 正常请求仍通。
     #[test]
+    #[cfg(unix)] // WIN 批：socketpair 造法 = unix 专属
     fn request_line_over_64k_rejected() {
         let dir = tmpdir("reqline");
         let srv = FilesServer::open(Some(&dir), noop_logf()).unwrap();
@@ -1628,7 +1710,7 @@ mod tests {
             conns: std::sync::Arc::clone(&srv.conns),
             watermark: Default::default(),
         };
-        let (a, b) = UnixStream::pair().unwrap();
+        let (a, b) = pair_ipc();
         std::thread::spawn(move || s2.serve_conn(a));
         let mut w = b.try_clone().unwrap();
         let mut r = BufReader::new(b);
@@ -1648,7 +1730,7 @@ mod tests {
         drop((r, w));
 
         // 60KB 合法请求（JSON 尾部空白合法）仍通
-        let (a, b) = UnixStream::pair().unwrap();
+        let (a, b) = pair_ipc();
         let s3 = FilesServer {
             root: srv.root.clone(),
             logf: noop_logf(),
@@ -1670,6 +1752,7 @@ mod tests {
 
     /// busy 路径同口径：超长行 ⇒ 回 `invalid_arg`（**非** busy）再收线。
     #[test]
+    #[cfg(unix)] // WIN 批：socketpair 造法 = unix 专属
     fn busy_path_over_64k_line_replies_invalid_arg() {
         let dir = tmpdir("reqline-busy");
         let srv = FilesServer::open(Some(&dir), noop_logf()).unwrap();
@@ -1680,7 +1763,7 @@ mod tests {
             conns: std::sync::Arc::clone(&srv.conns),
             watermark: Default::default(),
         };
-        let (a, b) = UnixStream::pair().unwrap();
+        let (a, b) = pair_ipc();
         std::thread::spawn(move || s2.serve_busy(a));
         let mut w = b.try_clone().unwrap();
         let mut r = BufReader::new(b);
@@ -1718,6 +1801,7 @@ mod tests {
     /// 注入脚本化 accept：`EMFILE`×2 → 一条真连接 ⇒ 循环未退出、连接被受理、退避发生过
     /// （**修前红**：现状一次错误即 `return Ok(())` 摘服务）。
     #[test]
+    #[cfg(unix)] // WIN 批：socketpair 造法 = unix 专属
     fn serve_stoppable_accepts_survives_transient_error() {
         let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
@@ -1725,10 +1809,10 @@ mod tests {
         let logf: crate::Logf = std::sync::Arc::new(move |s: &str| {
             l2.lock().unwrap().push(s.to_owned());
         });
-        let (tx, rx) = std::sync::mpsc::channel::<UnixStream>();
+        let (tx, rx) = std::sync::mpsc::channel::<IpcStream>();
         let mut script = 0usize;
-        let (keep_a, keep_b) = UnixStream::pair().unwrap();
-        let mut keep = Some(keep_a);
+        let (keep_a, keep_b) = std::os::unix::net::UnixStream::pair().unwrap();
+        let mut keep = Some(IpcStream::Unix(keep_a));
         let stop2 = std::sync::Arc::clone(&stop);
         let t0 = std::time::Instant::now();
         let h = std::thread::spawn(move || {
@@ -1822,6 +1906,7 @@ mod tests {
     /// 权限 ⇒ 只读目录也成功；非属主构造在本仓测试不可行）——按设计 §2-F4 测试计划
     /// 如实降级为「代码面复核」。
     #[test]
+    #[cfg(unix)] // WIN 批：socket 权限位断言 = unix 专属语义
     fn uds_listen_and_occupancy() {
         let dir = tmpdir("uds");
         std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o755)).unwrap();
@@ -1836,9 +1921,10 @@ mod tests {
             0o700,
             "bind 之前目录已收紧 0700（F4：目录面是 UDS 的补偿边界）"
         );
-        // 活占用：一个 listener 在听 → 第二个 bind 报占用
+        // 活占用：一个 listener 在听 → 第二个 bind 报占用（IpcListener 无 Debug——
+        // 走 err().map(kind) 断言）
         let r = listen_local_service(&dir, "files.sock", &logf);
-        assert_eq!(r.unwrap_err().kind(), std::io::ErrorKind::AddrInUse);
+        assert_eq!(r.err().map(|e| e.kind()), Some(std::io::ErrorKind::AddrInUse));
         drop(ln);
         // 死残留（listener 已关、文件还在）→ 可清重建
         assert!(sock.exists());

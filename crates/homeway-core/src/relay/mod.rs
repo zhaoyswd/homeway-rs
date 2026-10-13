@@ -23,7 +23,8 @@ pub mod rltoken;
 use std::collections::{HashMap, HashSet};
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
-use std::os::fd::{AsRawFd as _, OwnedFd};
+use crate::sysock::{self, PollEnt, RawSock, SysSock};
+use crate::sysock::{POLLERR, POLLHUP, POLLIN, POLLNVAL};
 use std::sync::atomic::{AtomicI32, Ordering};
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
@@ -244,25 +245,12 @@ enum Msg {
 
 
 /// 大收发缓冲（4MB 尽力而为——内核钳制；突发场景防整包丢弃，R3 出口同款）。
+/// WIN 批：sockopt 经 `sysock`（unix 臂与原 libc 直调同形）。
 fn bump_sock_bufs(sock: &UdpSocket) {
-    use std::os::fd::AsRawFd as _;
-    unsafe {
-        let sz: libc::c_int = 4 * 1024 * 1024;
-        let _ = libc::setsockopt(
-            sock.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_SNDBUF,
-            &sz as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as u32,
-        );
-        let _ = libc::setsockopt(
-            sock.as_raw_fd(),
-            libc::SOL_SOCKET,
-            libc::SO_RCVBUF,
-            &sz as *const _ as *const libc::c_void,
-            std::mem::size_of::<libc::c_int>() as u32,
-        );
-    }
+    let raw = sysock::udp_raw(sock);
+    let sz = 4 * 1024 * 1024;
+    let _ = sysock::setsockopt_i32(raw, sysock::SOL_SOCKET, sysock::SO_SNDBUF, sz);
+    let _ = sysock::setsockopt_i32(raw, sysock::SOL_SOCKET, sysock::SO_RCVBUF, sz);
 }
 
 /// relay 停止管道的 RAII 具名形态（Q-G F3）：**每次新建**（去 `OnceLock` 单例——
@@ -272,41 +260,41 @@ fn bump_sock_bufs(sock: &UdpSocket) {
 /// 「借用、不 close」契约——`BorrowedFd` 过不了 `thread::spawn` 的 `'static`）。
 /// 收工不变式：**先 join 再关两端**（调用方 `RelayProc::shutdown` 保证）。
 pub struct StopPipe {
-    r: OwnedFd,
-    w: OwnedFd,
+    r: SysSock,
+    w: SysSock,
 }
 
 impl StopPipe {
-    /// 新建（两端 CLOEXEC——`sysfd::pipe_cloexec`）。
+    /// 新建（unix 两端 CLOEXEC——`sysock::WakePair` 单源；windows = 回环 TCP 对）。
     pub fn new() -> io::Result<Self> {
-        let (r, w) = crate::sysfd::pipe_cloexec()?;
-        Ok(Self { r, w })
+        let wp = sysock::WakePair::new()?;
+        Ok(Self { r: wp.read, w: wp.write })
     }
 
     /// 读端裸值（交 `Relay::run` 的 `stop_fd`——所有权仍在本结构）。
-    pub fn read_fd(&self) -> i32 {
-        self.r.as_raw_fd()
+    pub fn read_fd(&self) -> RawSock {
+        sysock::sock_raw(&self.r)
     }
 
     /// 写端裸值（CLI 的信号 handler 把 `STOP_FD` 指向它——arm/disarm 面）。
-    pub fn write_fd(&self) -> i32 {
-        self.w.as_raw_fd()
+    pub fn write_fd(&self) -> RawSock {
+        sysock::sock_raw(&self.w)
     }
 
     /// 写一个停止字节（EAGAIN/EBADF 忽略——合并位语义，写满即已有待收信号）。
     pub fn signal(&self) {
-        unsafe { libc::write(self.w.as_raw_fd(), b"x".as_ptr().cast(), 1) };
+        sysock::wake_signal(sysock::sock_raw(&self.w));
     }
 }
 
 /// wake 写端的**共享所有权**（Q-G F3）：握手线程持 `Arc` 克隆，写与关都经同一把
 /// 锁 ⇒ 消「i32 值拷贝裸写」与「写已复用 fd 号」；`take()` 保证关恰好一次。
 struct WakeHandle {
-    fd: std::sync::Mutex<Option<OwnedFd>>,
+    fd: std::sync::Mutex<Option<SysSock>>,
 }
 
 impl WakeHandle {
-    fn new(fd: OwnedFd) -> Self {
+    fn new(fd: SysSock) -> Self {
         Self { fd: std::sync::Mutex::new(Some(fd)) }
     }
 
@@ -315,7 +303,7 @@ impl WakeHandle {
     fn wake(&self) {
         let g = crate::syncutil::lock_unpoison(&self.fd);
         if let Some(fd) = g.as_ref() {
-            unsafe { libc::write(fd.as_raw_fd(), b"x".as_ptr().cast(), 1) };
+            sysock::wake_signal(sysock::sock_raw(fd));
         }
     }
 
@@ -429,7 +417,7 @@ impl Relay {
     /// ——所有权在调用方的 `StopPipe`；收工不变式 = 「先 join 本线程、再关两端」
     /// （`relay_cli::RelayProc::shutdown`）。`BorrowedFd` 过不了 `thread::spawn`
     /// 的 `'static`，故这里收裸值。
-    pub fn run(mut self, stop_fd: i32, on_ready: impl FnOnce(u16)) -> io::Result<()> {
+    pub fn run(mut self, stop_fd: RawSock, on_ready: impl FnOnce(u16)) -> io::Result<()> {
         let udp = Self::listen_with_fallback(self.cfg.listen, &self.cfg.logf)?;
         // 族事实定一次（回包映射用）：任意地址形态 = 双栈 AF_INET6（S7a/Q2）。
         self.listen_v6 = matches!(udp.local_addr()?, SocketAddr::V6(_));
@@ -480,21 +468,16 @@ impl Relay {
             self.cfg.max_legs
         ));
 
-        // 唤醒管道（握手线程交接 / 测试注入）。
-        // F1：CLOEXEC 创建即落（linux/OHOS 原子 `pipe2`；darwin 建后立即补）。
-        // F3：读端 = 局部 `OwnedFd`（随 `run` 作用域 RAII 关——替代手写 close）；
-        // 写端 = `Arc<WakeHandle>`（握手线程持克隆，锁内写/关——消 i32 值拷贝裸写）。
-        let (wake_r, wake_w) = crate::sysfd::pipe_cloexec()?;
+        // 唤醒管道（握手线程交接 / 测试注入；WIN 批：`sysock::WakePair` 单源——
+        // unix = pipe〔F1 CLOEXEC 创建即落〕，windows = 回环 TCP 对）。
+        // F3：读端 = 局部 `SysSock`（随 `run` 作用域 RAII 关——替代手写 close）；
+        // 写端 = `Arc<WakeHandle>`（握手线程持克隆，锁内写/关——消裸值拷贝裸写）。
+        let wp = sysock::WakePair::new()?;
+        let (wake_r, wake_w) = (wp.read, wp.write);
         // 读端非阻塞（排空循环）；写端非阻塞（N3：写满即丢弃——合并位语义，且
         // `WakeHandle::wake` 持锁写不得阻塞）。
-        for fd in [wake_r.as_raw_fd(), wake_w.as_raw_fd()] {
-            unsafe {
-                let fl = libc::fcntl(fd, libc::F_GETFL);
-                if fl < 0 || libc::fcntl(fd, libc::F_SETFL, fl | libc::O_NONBLOCK) < 0 {
-                    return Err(io::Error::last_os_error());
-                }
-            }
-        }
+        sysock::set_nonblocking(&wake_r, true)?;
+        sysock::set_nonblocking(&wake_w, true)?;
         let wake = Arc::new(WakeHandle::new(wake_w));
         let (msg_tx, msg_rx) = mpsc::channel::<Msg>();
         self.msg_tx = msg_tx;
@@ -502,7 +485,7 @@ impl Relay {
         let mut next_reap = Instant::now() + self.reap_interval();
         let mut next_stats = Instant::now() + Duration::from_secs(60);
         self.poll_dirty = true;
-        let mut pollfds: Vec<libc::pollfd> = Vec::new();
+        let mut pollfds: Vec<PollEnt> = Vec::new();
         let mut sources: Vec<PollSource> = Vec::new();
         let mut events: Vec<PollSource> = Vec::new();
         let mut msgs: Vec<(u8, Vec<u8>)> = Vec::new();
@@ -518,21 +501,21 @@ impl Relay {
             if dirty {
                 pollfds.clear();
                 sources.clear();
-                let mut push = |fd: i32, src: PollSource| {
-                    pollfds.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
+                let mut push = |fd: RawSock, src: PollSource| {
+                    pollfds.push(PollEnt { raw: fd, events: POLLIN, revents: 0 });
                     sources.push(src);
                 };
                 push(stop_fd, PollSource::Stop);
-                push(wake_r.as_raw_fd(), PollSource::Wakeup);
-                push(udp.as_raw_fd(), PollSource::Udp);
+                push(sysock::sock_raw(&wake_r), PollSource::Wakeup);
+                push(sysock::udp_raw(&udp), PollSource::Udp);
                 if let Some(ln) = &ctl_ln {
-                    push(ln.as_raw_fd(), PollSource::TcpListener);
+                    push(sysock::tcp_listener_raw(ln), PollSource::TcpListener);
                 }
                 for (k, a) in &self.assocs {
-                    push(a.sock.as_raw_fd(), PollSource::Assoc(*k));
+                    push(sysock::udp_raw(&a.sock), PollSource::Assoc(*k));
                 }
                 for (id, c) in &self.ctl_conns {
-                    push(c.stream.as_raw_fd(), PollSource::Ctl(*id));
+                    push(sysock::tcp_stream_raw(&c.stream), PollSource::Ctl(*id));
                 }
                 self.poll_dirty = false;
             }
@@ -545,7 +528,15 @@ impl Relay {
             if next_stats > now {
                 timeout = timeout.min(next_stats.duration_since(now).as_millis() as i32);
             }
-            let n = unsafe { libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, timeout) };
+            let n = match sysock::poll_slice_timeout(&mut pollfds, timeout) {
+                Ok(n) => n,
+                Err(e) => {
+                    let n = -1;
+                    let _ = n;
+                    self.logf(&format!("relay: poll 错误（{e}）—— 继续循环"));
+                    -1
+                }
+            };
             if n < 0 {
                 let e = io::Error::last_os_error();
                 if e.kind() != io::ErrorKind::Interrupted {
@@ -559,7 +550,7 @@ impl Relay {
             for (pf, src) in pollfds.iter().zip(&sources) {
                 // F3 防御一行：`POLLNVAL` 同样算事件（读端若先被关，poll 立返 NVAL
                 // 而不匹配任何位 ⇒ 满核忙转）——stop 管道与唤醒管道都在此覆盖。
-                if pf.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP | libc::POLLNVAL) != 0
+                if pf.revents & (POLLIN | POLLERR | POLLHUP | POLLNVAL) != 0
                 {
                     if *src == PollSource::Stop {
                         stop = true;
@@ -571,8 +562,7 @@ impl Relay {
             for src in events.drain(..) {
                 match src {
                     PollSource::Wakeup => {
-                        let mut b = [0u8; 64];
-                        while unsafe { libc::read(wake_r.as_raw_fd(), b.as_mut_ptr().cast(), 64) } > 0 {}
+                        sysock::wake_drain(sysock::sock_raw(&wake_r));
                         while let Ok(m) = msg_rx.try_recv() {
                             match m {
                                 Msg::HandshakeDone(r) => self.handshake_done(r),
@@ -1736,7 +1726,7 @@ mod tests {
     #[test]
     fn relay_run_exits_immediately_when_stop_pipe_write_end_already_closed() {
         let StopPipe { r, w } = StopPipe::new().unwrap();
-        let stop_r = r.as_raw_fd();
+        let stop_r = crate::sysock::sock_raw(&r);
         drop(w); // **只关写端**（读端仍开）= §0.5 的残留形态：读端处于 EOF
         let relay = Relay::new(Config::new(
             SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),

@@ -14,6 +14,7 @@
 
 use std::collections::HashSet;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
+#[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -243,6 +244,8 @@ pub struct ServeEngine {
     /// 的 `quic` 段随之缺席）。
     quic_stats: Option<homeway_quic::ExitStatsHandle>,
     stop_flags: Vec<Arc<AtomicBool>>,
+    /// term 服务面（**windows 不装配**——用户指令豁免面，WIN 批 §D0）。
+    #[cfg(not(windows))]
     term_srv: Option<Arc<crate::term::service::TermService>>,
     pub state_dir: PathBuf,
     pub serve_dir: PathBuf,
@@ -450,6 +453,7 @@ impl ServeEngine {
         // intake 满触发）；`ServiceIntake` 同时是 `serve_stoppable` 的形参（服务本体零改）。
         let mut stop_flags = Vec::new();
         let mut socks = Vec::new();
+        #[cfg(not(windows))]
         let mut term_srv: Option<Arc<crate::term::service::TermService>> = None;
         let mut service_intakes = homeway_quic::ServiceIntakes::default();
         // ---- DNS 流腿（`STREAM[tag=6]` dns-resolve；DNS-STREAM 批，2026-10-12）----
@@ -480,7 +484,12 @@ impl ServeEngine {
         if let Some(fsrv) = files_srv {
             match crate::files_server::listen_local_service(&serve_dir, "files.sock", &dlogf) {
                 Ok(ln) => {
+                    #[cfg(unix)]
                     let own = sock_identity(&serve_dir.join("files.sock"));
+                    // WIN 批：windows TCP IPC 无 sock 文件——无属主可比，收工清理由
+                    // remove_sock_own 的 (0,0) 臂兜（NotFound 容错）。
+                    #[cfg(windows)]
+                    let own = (0, 0);
                     socks.push((serve_dir.join("files.sock"), own));
                     // E14（M5 S4 定稿行文）：服务流 tag=1 经服务入口（QUIC STREAM）
                     // 转投；本机 UDS 只服务调试面（WG 服务腿已退役）
@@ -526,7 +535,11 @@ impl ServeEngine {
         let speed_srv = Arc::new(crate::speedtest_server::SpeedtestServer::new(Arc::clone(&dlogf)));
         match crate::files_server::listen_local_service(&serve_dir, "speedtest.sock", &dlogf) {
             Ok(ln) => {
+                #[cfg(unix)]
                 let own = sock_identity(&serve_dir.join("speedtest.sock"));
+                // WIN 批：同 files——windows 无 sock 文件属主面。
+                #[cfg(windows)]
+                let own = (0, 0);
                 socks.push((serve_dir.join("speedtest.sock"), own));
                 // E17（M5 S4 定稿行文）：服务流 tag=3 经服务入口（QUIC STREAM）转投
                 (logf)(&format!(
@@ -569,50 +582,59 @@ impl ServeEngine {
         //      客户端拨隧道 IP:<term_port>，拦截层按 LocalServices 映射转投；会话由
         //      出口持有（客户端断开只摘泵，不杀进程）；开关 HOMEWAY_TERM=off，调参
         //      HOMEWAY_TERM_*（6f-3b）。----
-        if crate::term::service::disabled_by_env() {
-            (logf)("term 服务被 HOMEWAY_TERM=off 关闭");
-        } else {
-            // stateDir 参数 = manifest 覆盖目录基（<dir>/agent-detection/）
-            let tsrv = crate::term::service::TermService::new(Arc::clone(&dlogf), Some(&serve_dir));
-            match crate::files_server::listen_local_service(&serve_dir, "term.sock", &dlogf) {
-                Ok(ln) => {
-                    let own = sock_identity(&serve_dir.join("term.sock"));
-                    socks.push((serve_dir.join("term.sock"), own));
-                    // 就绪行（判据 E16）：socket + shell + 历史窗口 + 能力位 + vt 现状
-                    (logf)(&format!(
-                        "# Serving terminal sessions on sock={} (shell={}, history={}, features={}, vt={})",
-                        serve_dir.join("term.sock").display(),
-                        tsrv.shell_text(),
-                        tsrv.history_text(),
-                        tsrv.features_text(),
-                        tsrv.vt_text()
-                    ));
-                    match service_intake(
-                        ln,
-                        homeway_quic::tuning::service_defaults::intake_capacity(tsrv.max_sessions()),
-                        "term",
-                        &logf,
-                    ) {
-                        Some((intake, tx)) => {
-                            service_intakes.term = Some(tx);
-                            let stop = spawn_service_stop_flag(&mut stop_flags);
-                            let t = Arc::clone(&tsrv);
-                            std::thread::Builder::new()
-                                .name("homeway-term".into())
-                                .spawn(move || t.serve_stoppable(intake, stop))
-                                .ok();
-                            term_srv = Some(tsrv);
+        // WIN 批门控：term 在 windows 不装配（用户指令豁免——docs/reviews/WIN-design.md
+        // §0）；`service_intakes.term` 保持 None ⇒ 出口对该 tag 落既有 reset(0x22)。
+        #[cfg(not(windows))]
+        {
+            if crate::term::service::disabled_by_env() {
+                (logf)("term 服务被 HOMEWAY_TERM=off 关闭");
+            } else {
+                // stateDir 参数 = manifest 覆盖目录基（<dir>/agent-detection/）
+                let tsrv = crate::term::service::TermService::new(Arc::clone(&dlogf), Some(&serve_dir));
+                match crate::files_server::listen_local_service(&serve_dir, "term.sock", &dlogf) {
+                    Ok(ln) => {
+                        #[cfg(unix)]
+                        let own = sock_identity(&serve_dir.join("term.sock"));
+                        // WIN 批：同 files——windows 无 sock 文件属主面。
+                        #[cfg(windows)]
+                        let own = (0, 0);
+                        socks.push((serve_dir.join("term.sock"), own));
+                        // 就绪行（判据 E16）：socket + shell + 历史窗口 + 能力位 + vt 现状
+                        (logf)(&format!(
+                            "# Serving terminal sessions on sock={} (shell={}, history={}, features={}, vt={})",
+                            serve_dir.join("term.sock").display(),
+                            tsrv.shell_text(),
+                            tsrv.history_text(),
+                            tsrv.features_text(),
+                            tsrv.vt_text()
+                        ));
+                        match service_intake(
+                            ln,
+                            homeway_quic::tuning::service_defaults::intake_capacity(tsrv.max_sessions()),
+                            "term",
+                            &logf,
+                        ) {
+                            Some((intake, tx)) => {
+                                service_intakes.term = Some(tx);
+                                let stop = spawn_service_stop_flag(&mut stop_flags);
+                                let t = Arc::clone(&tsrv);
+                                std::thread::Builder::new()
+                                    .name("homeway-term".into())
+                                    .spawn(move || t.serve_stoppable(intake, stop))
+                                    .ok();
+                                term_srv = Some(tsrv);
+                            }
+                            None => tsrv.close(),
                         }
-                        None => tsrv.close(),
                     }
-                }
-                Err(e) => {
-                    // 与 files 同一取舍：可选服务起不来不影响隧道/转发
-                    (logf)(&format!(
-                        "⚠️ term 监听 {} 失败（{e}）—— 终端功能会报错（state 目录异常/被其它实例占用），其余功能不受影响",
-                        serve_dir.join("term.sock").display()
-                    ));
-                    tsrv.close();
+                    Err(e) => {
+                        // 与 files 同一取舍：可选服务起不来不影响隧道/转发
+                        (logf)(&format!(
+                            "⚠️ term 监听 {} 失败（{e}）—— 终端功能会报错（state 目录异常/被其它实例占用），其余功能不受影响",
+                            serve_dir.join("term.sock").display()
+                        ));
+                        tsrv.close();
+                    }
                 }
             }
         }
@@ -647,8 +669,7 @@ impl ServeEngine {
                     // 钉卡不绑地址；失败只告警，公布自动变保守）。dup fd 交公共端点面供
                     // 运行期重钉（setsockopt 作用于同一 socket 对象）。
                     if let Some((index, name)) = resolved.as_ref().map(|i| (i.index, i.name.clone())) {
-                        use std::os::fd::AsRawFd as _;
-                        match egress::pin_socket_to_iface(sock.as_raw_fd(), index, &name) {
+                        match egress::pin_socket_to_iface(crate::sysock::udp_raw(&sock), index, &name) {
                             Ok(()) => pinned_pin_ok = true,
                             Err(e) => {
                                 (logf)(&format!(
@@ -1036,6 +1057,7 @@ impl ServeEngine {
             quic_rpk_public_key: quic_brief.as_ref().map(|(_, k)| *k),
             quic_stats,
             stop_flags,
+            #[cfg(not(windows))]
             term_srv,
             state_dir: cfg.state_dir.clone(),
             serve_dir,
@@ -1051,6 +1073,7 @@ impl ServeEngine {
             f.store(true, Ordering::SeqCst); // ② UDS listeners（accept 循环下一拍退出）
         }
         // term：全部会话 ENDED(service_stopped) + 子进程收尸（UDS listener 由 stop_flags 收）
+        #[cfg(not(windows))]
         if let Some(t) = &self.term_srv {
             t.close();
         }
@@ -1209,6 +1232,10 @@ fn iface_state_str(i: &IfaceInfo) -> String {
     format!("index={} {} addrs=[{}]", i.index, if i.up { "up" } else { "down" }, addrs.join(","))
 }
 
+/// sock 文件的 dev/ino 属主标识（removeSockOwn 的「只删自己 bind 出来的那个」比对面）。
+/// WIN 批：unix 专属——windows 的 TCP IPC 无 sock 文件（socks 表该侧恒 (0,0)，收工
+/// 走「删不存在路径、NotFound 容错」的无害路径）。
+#[cfg(unix)]
 fn sock_identity(p: &std::path::Path) -> (u64, u64) {
     std::fs::metadata(p).map(|m| (m.dev(), m.ino())).unwrap_or((0, 0))
 }
@@ -1219,6 +1246,8 @@ fn remove_sock_own(path: &std::path::Path, own: (u64, u64)) {
         let _ = std::fs::remove_file(path);
         return;
     }
+    // WIN 批：dev/ino 比对是 unix 专属面（windows 恒走上面的 (0,0) 臂）。
+    #[cfg(unix)]
     if let Ok(md) = std::fs::metadata(path) {
         if (md.dev(), md.ino()) == own {
             let _ = std::fs::remove_file(path);
@@ -1246,7 +1275,7 @@ fn dns_intake_of(
         Ok((intake, tx)) => {
             (logf)(&format!(
                 "dns 流腿就绪：STREAM tag=6（客户端虚拟端口 {}；代答复用 :53 同一上游 dnsproxy）",
-                crate::facade::bridge_host::port::DNS_RESOLVE
+                crate::facade::bridge_io::port::DNS_RESOLVE
             ));
             Some((intake, tx))
         }
@@ -1259,12 +1288,21 @@ fn dns_intake_of(
 }
 
 fn service_intake(
-    ln: std::os::unix::net::UnixListener,
+    ln: crate::daemon::ipc::IpcListener,
     capacity: usize,
     tag: &str,
     logf: &Logf,
 ) -> Option<(homeway_quic::ServiceIntake, homeway_quic::ServiceIntakeTx)> {
-    match homeway_quic::ServiceIntake::with_quic(ln, capacity) {
+    // WIN 批：intake 装配面（quic 的 ServiceIntake）在 unix 上吃 UDS 监听器——
+    // 解包；windows 上该腿不装配（设计 §D2），本函数不会被走到。
+    #[cfg(unix)]
+    let crate::daemon::ipc::IpcListener::Unix(ln) = ln;
+    #[cfg(unix)]
+    let built = homeway_quic::ServiceIntake::with_quic(ln, capacity);
+    // windows：无 UDS 调试腿——QUIC-only intake（主入口 = STREAM，行为面不缺）。
+    #[cfg(windows)]
+    let built = homeway_quic::ServiceIntake::quic_only(capacity);
+    match built {
         Ok((intake, tx)) => Some((intake, tx)),
         Err(e) => {
             (*logf)(&format!(
@@ -1390,41 +1428,40 @@ fn driver_loop(
         //    - 否则：5ms 常规拍（不加空转唤醒成本）。
         //    腿 fd 同轮在等待集（R4：控制面通告建立的腿与主 socket 同构收包）。
         // 负 fd 防御（r2-2.4：理论上不可达——腿 fd 只取活 socket——防御位）
-        let leg_fds: Vec<i32> = bind
+        let leg_fds: Vec<crate::sysock::RawSock> = bind
             .leg_fds()
             .into_iter()
-            .filter(|fd| *fd >= 0)
+            .filter(|fd| crate::sysock::is_valid(*fd))
             .collect();
         // QUIC 面唤醒 fd（M1 §1.4：入站队列非空即可读——没有它每个入站包最多等 5ms，
         // TCP RTT/吞吐直接受损）。所有权在 `quic_face`，本循环只 poll + 交给它 drain。
-        let quic_wake_fd: Option<i32> = quic_face.as_ref().map(|q| q.wake_fd());
+        let quic_wake_fd: Option<crate::sysock::RawSock> =
+            quic_face.as_ref().map(|q| q.wake_fd());
         // 等待集 = 腿 fd + QUIC 面唤醒 fd（M5 起**不再有**公共端口的 poll 项：公共端口由
         // QUIC 面的 reactor 独占；探针/观测经其明文钩子在那边消化）。
-        let mut pollfds = Vec::with_capacity(leg_fds.len() + usize::from(quic_wake_fd.is_some()));
+        // WIN 批：poll 集经 `sysock`（unix = libc::poll 原语义；windows = WSAPoll）。
+        let mut pollfds: Vec<crate::sysock::PollEnt> =
+            Vec::with_capacity(leg_fds.len() + usize::from(quic_wake_fd.is_some()));
         for fd in &leg_fds {
-            pollfds.push(libc::pollfd { fd: *fd, events: libc::POLLIN, revents: 0 });
+            pollfds.push(crate::sysock::PollEnt { raw: *fd, events: crate::sysock::POLLIN, revents: 0 });
         }
         let quic_poll_idx = quic_wake_fd.map(|fd| {
-            pollfds.push(libc::pollfd { fd, events: libc::POLLIN, revents: 0 });
+            pollfds.push(crate::sysock::PollEnt { raw: fd, events: crate::sysock::POLLIN, revents: 0 });
             pollfds.len() - 1
         });
-        let poll_ms: libc::c_int = match intercept.wait_hint() {
+        let poll_ms: i32 = match intercept.wait_hint() {
             Some(_) => 1,
             None => 5,
         };
-        let n = unsafe {
-            libc::poll(pollfds.as_mut_ptr(), pollfds.len() as libc::nfds_t, poll_ms)
-        };
-        if n < 0 {
-            let e = std::io::Error::last_os_error();
+        if let Err(e) = crate::sysock::poll_slice_timeout(&mut pollfds, poll_ms) {
             if e.kind() != std::io::ErrorKind::Interrupted {
                 (dlogf)(&format!("serve: poll 错误（{e}）—— 继续循环"));
             }
         }
-        let readable_legs: Vec<i32> = pollfds[..leg_fds.len()]
+        let readable_legs: Vec<crate::sysock::RawSock> = pollfds[..leg_fds.len()]
             .iter()
-            .filter(|pf| pf.revents & (libc::POLLIN | libc::POLLERR | libc::POLLHUP) != 0)
-            .map(|pf| pf.fd)
+            .filter(|pf| pf.revents & (crate::sysock::POLLIN | crate::sysock::POLLERR | crate::sysock::POLLHUP) != 0)
+            .map(|pf| pf.raw)
             .collect();
         // 腿 fd 可读：kind=5（QUIC 载荷）交出口 QUIC 面注入；kind=3 已由 bind 的钩子转
         // 注册腿线程（M5 后腿面上只有这两类）
@@ -1444,7 +1481,7 @@ fn driver_loop(
         // QUIC 入站（M1 §1.3/§1.4）：poll 唤醒后 drain（唤醒字节 + 入站队列）——
         // 准入请求在此裁决（回执非阻塞）、明文包直投 `intercept.on_plain`。
         if let Some(q) = quic_face.as_ref() {
-            if quic_poll_idx.is_some_and(|i| pollfds[i].revents & libc::POLLIN != 0) {
+            if quic_poll_idx.is_some_and(|i| pollfds[i].revents & crate::sysock::POLLIN != 0) {
                 q.drain_inbound(|item| {
                     on_quic_inbound(item, table, intercept, Some(q), &mut pub_by_tun, dlogf)
                 });

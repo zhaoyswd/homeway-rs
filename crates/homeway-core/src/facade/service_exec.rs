@@ -24,7 +24,8 @@ use crate::facade::host_session::{HostErr, HostSession, HostSessionConfig, Servi
 use crate::token;
 use crate::Logf;
 
-use super::bridge_host::{BridgeHost, BridgeStream};
+use super::bridge_host::BridgeHost;
+use super::bridge_io::BridgeStream;
 use super::host_session::NO_SUCH_SERVICE;
 use super::service_op::{ServiceDomain, ServiceState};
 
@@ -538,7 +539,7 @@ fn settle_inline(
 
 type BridgeDialFn = crate::facade::bridge_host::DialFn;
 /// 闭包工厂的拨号实现面（dial_via_run 同形——T = ServiceRun）。
-type BridgeDialImpl<T> = fn(&Arc<T>, u16, Duration) -> io::Result<Box<dyn crate::facade::bridge_host::BridgeStream>>;
+type BridgeDialImpl<T> = fn(&Arc<T>, u16, Duration) -> io::Result<Box<dyn crate::facade::bridge_io::BridgeStream>>;
 
 fn bridge_dial_closure<T: Send + Sync + 'static>(run: Arc<T>, dial: BridgeDialImpl<T>) -> BridgeDialFn {
     let weak = Arc::downgrade(&run);
@@ -818,7 +819,7 @@ mod tests {
             r: &Arc<Dummy>,
             _port: u16,
             _budget: Duration,
-        ) -> io::Result<Box<dyn crate::facade::bridge_host::BridgeStream>> {
+        ) -> io::Result<Box<dyn crate::facade::bridge_io::BridgeStream>> {
             r.called.store(true, Ordering::Release);
             Err(io::Error::new(io::ErrorKind::AddrInUse, "替身不产流"))
         }

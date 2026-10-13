@@ -15,8 +15,7 @@
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::Ipv4Addr;
-use std::os::fd::{AsRawFd, RawFd};
-use std::os::unix::net::UnixStream;
+use crate::sysio::{self, SvcStream};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
@@ -258,8 +257,8 @@ pub(crate) struct ExitBridge {
     /// 入站队列（出口面 → 引擎；批次换出由引擎侧 drain）。
     inbound: Mutex<VecDeque<ExitInbound>>,
     /// 唤醒 fd（读端留引擎 poll；字节只作「有事件」语义）。
-    wake_rx: UnixStream,
-    wake_tx: UnixStream,
+    wake_rx: SvcStream,
+    wake_tx: SvcStream,
     /// 出站队列（引擎 → 出口面；`try_send` 非阻塞）。
     out_tx: mpsc::Sender<Outbound>,
     bindings: Mutex<Bindings>,
@@ -269,8 +268,8 @@ impl ExitBridge {
     pub(crate) fn new(
         stats: Arc<ExitStats>,
         logf: Logf,
-        wake_tx: UnixStream,
-        wake_rx: UnixStream,
+        wake_tx: SvcStream,
+        wake_rx: SvcStream,
         out_tx: mpsc::Sender<Outbound>,
     ) -> Self {
         Self {
@@ -285,8 +284,8 @@ impl ExitBridge {
     }
 
     /// 唤醒 fd（引擎 poll 用；**引擎不得 close 它**——所有权在出口面句柄）。
-    pub(crate) fn wake_fd(&self) -> RawFd {
-        self.wake_rx.as_raw_fd()
+    pub(crate) fn wake_fd(&self) -> sysio::RawIo {
+        sysio::svc_raw(&self.wake_rx)
     }
 
     /// 写唤醒字节（入队后调；非阻塞——管道满时读端必可读，唤醒不丢）。

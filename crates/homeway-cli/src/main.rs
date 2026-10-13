@@ -26,7 +26,9 @@ mod cli_flags;
 mod daemon_cli;
 mod relay_cli;
 mod serve_cli;
+#[cfg(not(windows))] // term 在 windows 不支持（用户指令豁免——WIN 批）
 mod term_cli;
+mod stopsig;
 mod unified_cli;
 
 /// 版本串（构建方注入：release 流水线 `HOMEWAY_CLI_VERSION=<tag>`——与核面
@@ -40,6 +42,8 @@ fn main() {
     // 低-8（B0-2a 登记→D-1 收口）：SIGPIPE 恢复默认处置——Go 运行时同语义（fd1/2
     // 写断管 = 进程静默退出）；Rust 默认忽略 SIGPIPE 会把 println! 变成 panic 链
     //（`homeway … | head` 形态）。恢复默认后全仓 println 面无需逐处改写。
+    // （windows 无 SIGPIPE 概念——std 的写错误路径天然返回 Err，WIN 批 §D8。）
+    #[cfg(unix)]
     unsafe {
         libc::signal(libc::SIGPIPE, libc::SIG_DFL);
     }
@@ -90,7 +94,15 @@ fn main() {
         },
         Some("host") => daemon_cli::cmd_host(&args[2..]),
         Some("status") => daemon_cli::cmd_status(&args[2..]),
+        // term（终端）在 windows 不支持（用户指令豁免——WIN 批）：明确报「不支持」
+        // 而非静默缺命令（调用方可行动）。
+        #[cfg(not(windows))]
         Some("term") => term_cli::cmd_term(&args[2..]),
+        #[cfg(windows)]
+        Some("term") => {
+            eprintln!("homeway: term（终端）在 Windows 上不支持（WIN 批豁免面——docs/reviews/WIN-design.md §0）");
+            std::process::exit(2);
+        }
         Some("export") => daemon_cli::cmd_export(&args[2..]),
         Some("import") => daemon_cli::cmd_import(&args[2..]),
         Some("reset") => daemon_cli::cmd_reset(&args[2..]),
@@ -806,7 +818,7 @@ fn cmd_files(args: &[String]) {
             "timeout" => {
                 let v = cli_flags::take_value_or_exit("timeout", inline, next, false);
                 if inline.is_none() { adv = 2; }
-                host_timeout = term_cli::parse_duration(&v);
+                host_timeout = cli_flags::parse_duration(&v);
                 if host_timeout.is_none() {
                     eprintln!("--timeout {v:?} 不是时长（如 10s / 1500ms）");
                     std::process::exit(2);

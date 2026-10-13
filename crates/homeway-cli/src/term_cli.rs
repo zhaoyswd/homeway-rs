@@ -400,7 +400,7 @@ pub fn cmd_term(args: &[String]) {
         term_usage();
         return;
     }
-    let rest = &expand_flag_eq(&args[1..]);
+    let rest = &crate::cli_flags::expand_flag_eq(&args[1..]);
     let r = match sub.as_str() {
         "explain" => cli_explain(rest),
         "list" => cli_list(rest),
@@ -430,24 +430,6 @@ explain --file <屏幕文本> --agent <label> | <会话名> […]   规则判定
 --timeout = 解析与打开各一次的预算（默认各 10s，仅 --host 可用）。\n\
 attach 分离键：Ctrl-b d 分离 / Ctrl-b r 重对齐 / Ctrl-b Ctrl-b 字面量；--detach-key none 关闭。"
     );
-}
-
-/// `--flag=value` → `--flag value`（Go expandFlagEq 同义；cmd_term 入口统一归一）。
-pub(crate) fn expand_flag_eq(args: &[String]) -> Vec<String> {
-    let mut out = Vec::with_capacity(args.len());
-    for a in args {
-        if let Some(rest) = a.strip_prefix("--") {
-            if let Some(i) = rest.find('=') {
-                if i > 0 {
-                    out.push(format!("--{}", &rest[..i]));
-                    out.push(rest[i + 1..].to_owned());
-                    continue;
-                }
-            }
-        }
-        out.push(a.clone());
-    }
-    out
 }
 
 /// 公共参数（--state/--host/--timeout）。
@@ -480,23 +462,6 @@ impl TermCommon {
 }
 
 /// `--timeout <10s|1500ms>` 解析（Go time.ParseDuration 的 CLI 子集；无单位拒绝——Go 同款）。
-pub(crate) fn parse_duration(v: &str) -> Option<Duration> {
-    let split = v.find(|c: char| c.is_ascii_alphabetic()).unwrap_or(v.len());
-    let (num, unit) = v.split_at(split);
-    let n: f64 = num.parse().ok()?;
-    let secs = match unit {
-        "ns" => n / 1e9,
-        "us" | "µs" => n / 1e6,
-        "ms" => n / 1e3,
-        "s" => n,
-        "m" => n * 60.0,
-        "h" => n * 3600.0,
-        _ => return None,
-    };
-    // 溢出防护（评审 r2-D：from_secs_f64 超界 panic）。
-    (secs > 0.0 && secs < 86400.0 * 365.0).then(|| Duration::from_secs_f64(secs))
-}
-
 /// 解析产物：公共参数 + 出现过的已知名 flag（动词自行消化）+ 带值 flag 的值对 + 位置会话名。
 struct ParsedTermArgs {
     common: TermCommon,
@@ -577,7 +542,7 @@ fn parse_term_args(
                 if inline.is_none() {
                     adv = 2;
                 }
-                out.common.timeout = Some(parse_duration(&v).filter(|d| !d.is_zero()).ok_or_else(
+                out.common.timeout = Some(crate::cli_flags::parse_duration(&v).filter(|d| !d.is_zero()).ok_or_else(
                     || format!("--timeout {v:?} 不是合法时长（如 10s、1500ms）"),
                 )?);
             }
@@ -1783,7 +1748,7 @@ fn cli_explain(args: &[String]) -> Result<(), String> {
             "timeout" => {
                 let v = take_arg("timeout", inline, next)?;
                 if inline.is_none() { adv = 2; }
-                common.timeout = Some(parse_duration(&v).filter(|d| !d.is_zero()).ok_or_else(|| {
+                common.timeout = Some(crate::cli_flags::parse_duration(&v).filter(|d| !d.is_zero()).ok_or_else(|| {
                     format!("--timeout {v:?} 不是合法时长（如 10s、1500ms）")
                 })?);
             }
@@ -2040,19 +2005,19 @@ mod tests {
 
     #[test]
     fn duration_parsing() {
-        assert_eq!(parse_duration("10s"), Some(Duration::from_secs(10)));
-        assert_eq!(parse_duration("1500ms"), Some(Duration::from_millis(1500)));
-        assert_eq!(parse_duration("2m"), Some(Duration::from_secs(120)));
-        assert!(parse_duration("0s").is_none());
-        assert!(parse_duration("abc").is_none());
+        assert_eq!(crate::cli_flags::parse_duration("10s"), Some(Duration::from_secs(10)));
+        assert_eq!(crate::cli_flags::parse_duration("1500ms"), Some(Duration::from_millis(1500)));
+        assert_eq!(crate::cli_flags::parse_duration("2m"), Some(Duration::from_secs(120)));
+        assert!(crate::cli_flags::parse_duration("0s").is_none());
+        assert!(crate::cli_flags::parse_duration("abc").is_none());
         // 无单位拒绝（Go time.ParseDuration 同款——「missing unit」）。
-        assert!(parse_duration("10").is_none());
+        assert!(crate::cli_flags::parse_duration("10").is_none());
     }
 
     #[test]
     fn flag_eq_expansion() {
         let eq = |s: &str| -> Vec<String> {
-            expand_flag_eq(&s.split_whitespace().map(str::to_owned).collect::<Vec<_>>())
+            crate::cli_flags::expand_flag_eq(&s.split_whitespace().map(str::to_owned).collect::<Vec<_>>())
         };
         assert_eq!(
             eq("attach --detach-key=^] s1"),

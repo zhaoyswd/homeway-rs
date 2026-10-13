@@ -41,6 +41,10 @@ getrandom.workspace = true
 # tokio/quinn/rustls），且不引入新的传递依赖（core 已在用同一版本）。
 libc.workspace = true
 
+# WIN 批（2026-10-13）：windows 系统面（winsock/控制台；unix 构建零波及）。
+[target.'cfg(windows)'.dependencies]
+windows-sys.workspace = true
+
 # 测试依赖：出口面/客户端面用例走**真线程 + 真回环 IO**（连接/迁移/上限注入），不钉端口、
 # 只判上界（M0 设计 §9.2 flake 口径①②）。`macros` = `#[tokio::test]`；**`test-util`**
 # = 纯定时语义用例的 `start_paused` 虚拟时钟（设计 §10 S2-6 点名同批加）。
