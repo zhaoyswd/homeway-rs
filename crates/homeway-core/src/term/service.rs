@@ -582,6 +582,10 @@ struct LegRt {
     /// 本腿最近上报的网格尺寸（HELLO / RESIZE；registry `LegState.size` 的运行态
     /// 镜像——会话几何真变时据此判「本腿本地网格 ≠ 会话网格」的 raw 腿需要清屏）。
     size: Size,
+    /// 环游标低水位：几何切换清屏时抬到当时的环尾——写者跳过**清屏前积压**的
+    /// 旧几何画面（清屏帧只清屏幕，随后涌出的积压字节会把残留重新画上）。
+    /// 单调递增，消费后无需复位（off ≥ 该值后恒不生效）。
+    skip_to: u64,
     out: Arc<LegOut>,
     surface: Option<SurfaceLeg>,
     theme_known: bool,
@@ -1190,6 +1194,7 @@ impl TermService {
                 raw_capable,
                 key_flavor,
                 size,
+                skip_to: 0,
                 out: Arc::clone(&out),
                 surface: surface.then(SurfaceLeg::new),
                 theme_known: false,
@@ -2854,6 +2859,8 @@ impl TermService {
 
     /// 实时读环（**不推进 off**——写出成功才由调用方推进；停滞重试要重写同一片）。
     /// 有界追赶：落后超过一个回放窗口就跳到 written-replay（跳头部保尾部，D5）。
+    /// 几何切换低水位：清屏腿的 skip_to 抬到清屏时刻的环尾——积压的旧几何画面
+    /// 不再发出（清屏后被旧画面重画 = 残留复发）。
     fn peek_ring_chunk(&self, name: &str, sess_gen: u64, key: LegKey, off: &mut u64) -> Peek {
         let st = self.lock_state();
         let Some(rt) = rt_of(&st, name, sess_gen) else { return Peek::Gone };
@@ -2861,6 +2868,9 @@ impl TermService {
             || !rt.legs.iter().any(|l| l.key == key)
         {
             return Peek::Gone;
+        }
+        if let Some(l) = rt.legs.iter().find(|l| l.key == key) {
+            *off = (*off).max(l.skip_to);
         }
         if self.cfg.replay > 0 && rt.ring.written().saturating_sub(*off) > self.cfg.replay as u64 {
             *off = rt.ring.written() - self.cfg.replay as u64;
@@ -3366,6 +3376,10 @@ fn apply_size_locked(rt: &mut SessRt, size: Size) {
         if let Some(s) = l.surface.as_mut() {
             s.mark_need_snapshot("resize");
         } else if l.size != size {
+            // 清屏 + 跳环尾（同一锁内，写者的 peek 线性化在后）：清屏帧只清屏幕，
+            // 环里积压的旧几何画面会在清屏后涌出把残留重新画上——跳到环尾，
+            // 清屏后直接接 resize 之后的新输出（TUI 的重画帧由哨兵保证到达）。
+            l.skip_to = rt.ring.written().max(l.skip_to);
             l.out.enqueue(WriteItem::new(Op::DATA, RESIZE_CLEAR_SEQ.to_vec()), 0);
         }
     }
@@ -4836,6 +4850,98 @@ mod tests {
         assert!(!pure_focus_out(b"\x1b[\x1b[O"), "截断混合");
     }
 
+    /// 清屏后不涌积压（几何切换跳环尾回归）：程序先全速输出 30k 字节（制造
+    /// 大于 socket 发送缓冲的积压——写者落后、环中留有未送出的旧画面）再转
+    /// 50ms 限速（在途清零）；TRAPWINCH 在 PTY resize 后向流里打 `(W)` 标记。
+    /// B(80x24) 接入触发清屏 + 跳环尾：修前积压的旧画面在清屏帧**之后**涌出
+    /// （残留被重新画上）——表现为清屏与首个 `(W)` 之间隔着 ~22k 个旧字节；
+    /// 修后清屏后直接接新纪元（≤100 个限速相旧点）。
+    #[test]
+    fn clear_screen_skips_backlog() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let cfg = TermConfig {
+            shell: Some(
+                "TRAPWINCH() { printf '(W)'; }; for i in $(seq 1 30000); do printf '.'; done; \
+                 while :; do printf '.'; sleep 0.05; done"
+                    .into(),
+            ),
+            ..TermConfig::default()
+        };
+        let svc = svc_with(cfg, Arc::clone(&lines));
+        let (ln, path) = start_listener();
+        {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || svc.serve(ln));
+        }
+        // 收尾守卫：程序是无限循环——断言 panic 时也必须 close 杀会话，
+        // 否则孤儿 shell 全速烧 CPU、测试进程挂着不退。
+        struct KillOnDrop(Arc<TermService>);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                self.0.close();
+            }
+        }
+        let _kill = KillOnDrop(Arc::clone(&svc));
+        // 窗口化读 DATA（超时返回已收字节；其它帧跳过）
+        fn read_window(c: &mut Client, ms: u64) -> Vec<u8> {
+            let deadline = Instant::now() + Duration::from_millis(ms);
+            let mut all = Vec::new();
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return all;
+                }
+                match c.io.read_frame_deadline(left.max(Duration::from_millis(5))) {
+                    Ok(f) if f.op == Op::DATA => all.extend_from_slice(&f.payload),
+                    Ok(_) => continue,
+                    Err(_) => return all,
+                }
+            }
+        }
+        let mut a = Client::connect(&path);
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "skp-a");
+        a.send(Op::HELLO, &frames::enc_hello(120, 30, hello_flags::CREATE, "t-skip", &tail));
+        a.expect(Op::ATTACHED, 5);
+        a.expect(Op::REPLAY_DONE, 5);
+        // 不读 3s：全速相（30k 字节）结束、写者在 socket 发送缓冲外落后，
+        // 环里留有积压；限速相稳态（在途清零、每 50ms 一个点）
+        std::thread::sleep(Duration::from_millis(3000));
+        // B 接入 ⇒ 几何切换（SIGWINCH×2 ⇒ `(W)` 标记）⇒ A 清屏 + 跳环尾
+        let mut b = Client::connect(&path);
+        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "skp-b");
+        b.send(Op::HELLO, &frames::enc_hello(80, 24, 0, "t-skip", &tail_b));
+        b.expect(Op::ATTACHED, 5);
+        // A 恢复读：清屏帧（REPLAY_DONE 前的换屏前序已被 expect 消费，此后出现的
+        // \x1b[2J\x1b[H 只能是几何清屏帧）→ 首个 `(W)` 标记 → 统计其间旧字节量
+        let mut all = Vec::new();
+        let stale = loop {
+            let chunk = read_window(&mut a, 500);
+            assert!(
+                chunk.len() < 4 << 20,
+                "A 读不到尽头（程序未转限速相?）——测试前置失效"
+            );
+            all.extend_from_slice(&chunk);
+            let Some(c) = find_last(&all, RESIZE_CLEAR_SEQ) else { continue };
+            let after = &all[c + RESIZE_CLEAR_SEQ.len()..];
+            if let Some(w) = find_last(after, b"(W)") {
+                break after[..w].iter().filter(|b| **b == b'.').count();
+            }
+            // 5s 上界：限速相 50ms/点 + 网络往返，超过即前置失效
+            if all.len() > 1 << 20 {
+                panic!("未等到 `(W)` 标记——TRAPWINCH 未生效?已收 {}B", all.len());
+            }
+        };
+        assert!(
+            stale <= 100,
+            "清屏后涌出积压旧画面（{stale} 个旧点 > 100）——残留复发"
+        );
+        drop(b);
+    }
+
+    fn find_last(hay: &[u8], needle: &[u8]) -> Option<usize> {
+        hay.windows(needle.len()).rposition(|w| w == needle)
+    }
+
     /// 焦点乱序不翻几何（macOS 焦点切换 = 旧窗口 focus-out + 新窗口 focus-in，
     /// 两条腿分别上行、到达顺序不保证）：A focus-in 切宽后，B 迟到的 focus-out
     /// 不得把几何翻回窄——修前这正是「切窗口打字时 UI 又跳走一次」的机制。
@@ -4878,9 +4984,11 @@ mod tests {
         // B 迟到的 focus-out：不得把几何翻回窄
         b.send(Op::DATA, b"\x1b[O");
         assert_eq!(session_size(&mut a), (120, 30), "迟到的 focus-out 不得翻动几何");
-        // 反向正例：B 的 focus-in（用户点回 B）照常切回窄
+        // 反向正例：B 的 focus-in（用户点回 B）照常切回窄——经 b 自己的连接查
+        // LIST（同连接帧序保证 focus-in 先于 LIST 处理；跨连接查与服务端两个读
+        // 循环线程竞态，workspace 并行负载下偶发假红）
         b.send(Op::DATA, b"\x1b[I");
-        assert_eq!(session_size(&mut a), (80, 24), "focus-in 仍算输入（点它 = 用它）");
+        assert_eq!(session_size(&mut b), (80, 24), "focus-in 仍算输入（点它 = 用它）");
         svc.close();
     }
 
