@@ -842,3 +842,16 @@ macos runner 挂 `homeway-quic` 的 `normal_races_do_not_trigger_retry_or_gate`�
 成功但零字节、CLI 永久挂（list/delete 皆然）。`pkill` 客户端守护重拉即恢复 ⇒ 卡死态。待修三层：
 ①岛重连赛跑投全名册 + 阶梯耗尽后退避重试而非永久 failed；②daemon 对 failed 主机的 `term.open` 立刻
 报错 + 世代重建关闭旧世代孤儿流（给 CLI EOF）；③CLI 一次性 term 操作首应答加 `--timeout` 预算。
+
+**13.9 补②：岛恢复接棒三层修（`7d3cea3`）的 MacBook Pro 真网演练（2026-10-14 22:10–22:25，测试件 devel）**。
+演练 = 停 Mac mini 出口（`launchctl bootout`）再拉起，MBP 客户端守护在线观察：
+
+| 演练 | 读数 | 结论 |
+|---|---|---|
+| ① 出口停 27s | 断线期间 MBP `term list` **10 s 超时报可行动文案**（`读 GREETING：出口 10s 内未应答——主机可能刚断线…`；修前永久挂）；岛 R 赛跑 **`候选 3 个`**（修前 1 个；直连窗口 1.4s 到点解锁中继）；出口回来后 R#4 立即成功——**胜出公网直连 114.242.60.128**；host 全程 ready（B 门差一次未到） | ✓ |
+| ② 出口停至 B 门 | t+21 `state=failed reason=岛不健康（patrol）；自动重连中`；日志：`世代重建前收口 —— 现任连接已关、0 条在册服务流按 EOF 收` → `…置 failed，起世代重建` → `世代重建：重赛跑全名册（第 1 次，候选 3 个，退避 1s）` → 失败 → `第 2 次…退避 2s` → **`世代重建成功（第 2 次，胜出 直连 114.242.60.128:41641，耗时 17ms）—— 会话回 ready`**（出口拉起后 5 s 内）；`term list` 通 | ✓ |
+
+**环境发现（与产品无关、值得关注）**：两轮演练 MBP 的岛都再次报 `上行发送面错误（No route to host (errno 65)）`，
+且重连胜出的总是**公网直连**而非局域网 192.168.3.12——MBP（Wi-Fi）→ Mac mini 的局域网 UDP 路径本身不稳
+（ping 通但 UDP 发送偶发 EHOSTUNREACH；疑 AP 隔离 / ARP 抖动）。全名册 R 正是靠公网路径兜住的。
+MBP 现为 devel 测试件（含本修复，回滚件 `homeway.bak-v0.3.7`），待下版发版换正式件。
