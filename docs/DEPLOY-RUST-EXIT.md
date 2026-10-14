@@ -820,3 +820,25 @@ macos runner 挂 `homeway-quic` 的 `normal_races_do_not_trigger_retry_or_gate`�
 
 **注**：出口机上 `install.sh` 的 `--autostart no` 是必须的——脚本的自启动项 Label 是 `homeway`，与既有
 `me.zhaozhe.homeway-exit` 并存会双实例撞 state 锁。新机器用脚本配自启动则无此问题。
+
+**13.9 补：MacBook Pro 全新安装测试（2026-10-14 21:10–21:30，用户指令「删干净再全新装」）**。机器现 IP
+**192.168.3.71**（`zhaozhedeMacBook-Pro-2.local`，DHCP 换址——此前 ping .8 不通的原因）。盘点残留 =
+`/usr/local/bin/homeway`（v0.3.5）+ `.bak-v0.3.3/.bak-v0.3.4` + `~/.config/homeway`（含 `serve/key.bin` +
+`tokens.jsonl` + `config.toml [serve] enabled = true`——**正是 v0.3.6 前「纯读命令意外成出口」的现场**）；
+无进程、无 launchd。全删后 `curl -fsSL …/main/install.sh | sh`（ssh 非交互 ⇒ 不配自启动）装 v0.3.7。
+
+| 验收 | 读数 | 结论 |
+|---|---|---|
+| 两次 `term list` | 均「还没有添加主机…」exit 1；无守护、`~/.config/homeway` **未创建** | ✓（v0.3.7 ③） |
+| `host add --name home <Mac mini 凭证>` | 三端点可达：192.168.3.12 直连 5ms / 114.242.60.128 直连 12ms / 123.56.218.212 中继 16ms | ✓ |
+| `term list` / `term new fresh-test -d` | 转发到 Mac mini（空表 → 建会话）；Mac mini 本机 `term list` 见 `fresh-test 80x24 shell idle` | ✓ 会话在出口 |
+| 客户端 state | `[serve] enabled = false`；`serve/` 空目录（无身份/凭证/sock） | ✓（v0.3.7 ①②） |
+| `term delete fresh-test`（从 MBP） | **挂死 > 6 min**（CLI 无超时阻塞读；守护侧流 `↑0B ↓0B`） | ✗ **新发现缺陷**（见下） |
+
+**新发现（岛层，严重，待立批）**：`new -d` 成功后 0.6 s，客户端岛 UDP 发送面报 `No route to host (errno 65)`
+（MBP Wi-Fi 瞬断——该机今晚掉线过、换过 IP）→ 阶梯 M（换 socket）→ 迁移 700 ms 未确认 → **重连赛跑只投
+1 个候选（当前直连；未用公网直连/中继）** → 16 连败 → 世代重建 → `⚠️ 宿主会话不健康（patrol）`、主机
+`state=failed` → **此后 7 分钟零重连尝试**（网络 10 s 内已恢复，ping 5 ms）；期间所有远程 term 操作开流
+成功但零字节、CLI 永久挂（list/delete 皆然）。`pkill` 客户端守护重拉即恢复 ⇒ 卡死态。待修三层：
+①岛重连赛跑投全名册 + 阶梯耗尽后退避重试而非永久 failed；②daemon 对 failed 主机的 `term.open` 立刻
+报错 + 世代重建关闭旧世代孤儿流（给 CLI EOF）；③CLI 一次性 term 操作首应答加 `--timeout` 预算。
