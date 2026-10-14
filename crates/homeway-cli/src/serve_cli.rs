@@ -387,7 +387,7 @@ fn validate_file(path: &Path, f: &FileConfig) -> Result<(), String> {
             }
         }
     }
-    let listen = f.relay.listen.as_deref().unwrap_or(":41741");
+    let listen = f.relay.listen.as_deref().unwrap_or(homeway_core::relay::DEFAULT_LISTEN);
     validate_relay_listen(listen).map_err(|e| format!("{p}: relay.listen：{e}"))?;
     Ok(())
 }
@@ -416,12 +416,12 @@ pub(crate) fn validate_relay_arg(tok: &str) -> Result<(), String> {
 /// 复用 relay 装配期的 `parse_listen`，验收集与装配面一致）。
 pub(crate) fn validate_relay_listen(v: &str) -> Result<(), String> {
     if v.is_empty() {
-        return Err("空地址非法（如 \":41741\"）".to_owned());
+        return Err("空地址非法（如 \":38341\"）".to_owned());
     }
     match crate::relay_cli::parse_listen(v) {
         Some(a) if a.port() >= 1 => Ok(()),
         Some(a) => Err(format!("端口 {} 非法（合法值域 1–65535）", a.port())),
-        None => Err(format!("{v:?} 非法（[host:]port 形态，如 \":41741\"）")),
+        None => Err(format!("{v:?} 非法（[host:]port 形态，如 \":38341\"）")),
     }
 }
 
@@ -539,11 +539,11 @@ fn parse_serve_flags(args: &[String]) -> Result<ServeFlags, CliErr> {
                     "listen",
                     inline,
                     next,
-                    "仅收端口数字 1-65535，如 41641；不收 ip:port；0 不收——Go 同口径",
+                    "仅收端口数字 1-65535，如 38241；不收 ip:port；0 不收——Go 同口径",
                 );
                 if v == 0 {
                     return Err(CliErr::Usage(
-                        "--listen 非法（0——仅收端口数字 1-65535，如 41641；不收 ip:port；0 不收——Go 同口径）"
+                        "--listen 非法（0——仅收端口数字 1-65535，如 38241；不收 ip:port；0 不收——Go 同口径）"
                             .to_owned(),
                     ));
                 }

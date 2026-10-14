@@ -313,14 +313,14 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# homeway 配置（L1 意图层，唯�
 #           proof_fail_threshold(0-1000，缺省 10；0 = 关闭该闸) /
 #           retry_policy(pressure|always|never，缺省 pressure；always = 常态每次建连 +1 RTT，仅排障)
 #           **值域非法 ⇒ 拒启**（serve 节严格表纪律）；env HOMEWAY_QUIC_ADMIT_RETRY 非法 ⇒ 记行 + 缺省
-#   [relay] enabled / listen(":41741") / advertise(逗号分隔，空=自动探测)
+#   [relay] enabled / listen(":38341") / advertise(逗号分隔，空=自动探测)
 # 客户端角色无配置节（随进程常开）；host 表在 <state>/client/hosts.json（不进 config）。
 # 出口角色须显式启用：`homeway serve start`（写 enabled = true 并装配）。新 state 缺省
 # 不启用——任何机器第一次拉起守护都不会意外成为出口（生成身份/签发 token/监听端口）。
 
 [serve]
 enabled = false
-listen = 41641
+listen = 38241
 bind_interface = "auto"
 upnp = true
 stun = "stun.cloudflare.com:3478"
@@ -334,7 +334,7 @@ files_root = ""
 
 [relay]
 enabled = false
-listen = ":41741"
+listen = ":38341"
 advertise = ""
 "#;
 
@@ -538,9 +538,9 @@ mod tests {
         }
         let fc: FileConfig = toml::from_str(DEFAULT_CONFIG_TOML).expect("默认模板必须可解析");
         assert!(!fc.serve.enabled, "新 state 缺省不启用出口（2026-10-14：须 `serve start` 显式开）");
-        assert_eq!(fc.serve.listen, Some(41641));
+        assert_eq!(fc.serve.listen, Some(38241));
         assert_eq!(fc.serve.stun6.as_deref(), Some("stun.cloudflare.com:3478"));
         assert!(!fc.relay.enabled);
-        assert_eq!(fc.relay.listen.as_deref(), Some(":41741"));
+        assert_eq!(fc.relay.listen.as_deref(), Some(":38341"));
     }
 }

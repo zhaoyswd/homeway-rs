@@ -300,9 +300,9 @@ impl UnifiedRoles {
 
     /// 装配 relay 角色（config listen/advertise；token 铸出存运行态）。
     fn assemble_relay_role(&self, cfg: &FileConfig) -> Result<(RelayProc, Option<String>, String), String> {
-        let listen_str = cfg.relay.listen.clone().unwrap_or_else(|| ":41741".to_owned());
+        let listen_str = cfg.relay.listen.clone().unwrap_or_else(|| homeway_core::relay::DEFAULT_LISTEN.to_owned());
         let listen = crate::relay_cli::parse_listen(&listen_str)
-            .ok_or_else(|| format!("relay listen {listen_str:?} 非法（[host:]port，如 \":41741\"）"))?;
+            .ok_or_else(|| format!("relay listen {listen_str:?} 非法（[host:]port，如 \":38341\"）"))?;
         let advertise = cfg.relay.advertise.clone().unwrap_or_default();
         // token 铸出（离线推算形态——与 relay 前台同源；listen 端口 = config 值）。
         let relay_dir = self.state_dir.join("relay");
@@ -1114,10 +1114,10 @@ impl RoleHost for UnifiedRoles {
                 let Some(secret) = secret else {
                     return Err(BackendErr::Other("relay.key 不存在（先 relay start）".into()));
                 };
-                let listen_str = inner.cfg.relay.listen.clone().unwrap_or_else(|| ":41741".into());
+                let listen_str = inner.cfg.relay.listen.clone().unwrap_or_else(|| homeway_core::relay::DEFAULT_LISTEN.into());
                 let port = crate::relay_cli::parse_listen(&listen_str)
                     .map(|a| a.port())
-                    .unwrap_or(41741);
+                    .unwrap_or(38341);
                 let advertise = inner.cfg.relay.advertise.clone().unwrap_or_default();
                 let built = homeway_core::relay::rltoken::build_token(
                     &secret,

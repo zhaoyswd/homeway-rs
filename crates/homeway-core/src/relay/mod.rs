@@ -42,6 +42,11 @@ pub type Logf = crate::Logf;
 
 // ---------- 默认参数（可用 Config 覆盖；真源 relay.go:42-66） ----------
 
+/// 中继监听地址缺省（`[host:]port`，缺 host = 任意地址）。2026-10-14 起 `:38341`
+///（此前 `:41741` 沿袭自 tailcat——与出口缺省 [`crate::server::engine::DEFAULT_LISTEN_PORT`]
+/// 同批换区间）。已部署机器 config 显式写了地址，不受影响。
+pub const DEFAULT_LISTEN: &str = ":38341";
+
 const DEFAULT_IDLE_TIMEOUT: Duration = Duration::from_secs(90); // 分配腿空闲回收
 const DEFAULT_LEG_TIMEOUT: Duration = Duration::from_secs(90); // 注册腿过期（保活 25s × 3 容错）
 const DEFAULT_DIAL_WAIT: Duration = Duration::from_secs(15); // 拨腿等待窗口

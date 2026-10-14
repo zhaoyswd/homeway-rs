@@ -39,7 +39,9 @@ pub const DEFAULT_FILES_PORT: u16 = 7802;
 pub const DEFAULT_TERM_PORT: u16 = 7724;
 pub const DEFAULT_SPEEDTEST_PORT: u16 = 7803;
 pub const DEFAULT_DNS_PORT: u16 = 5300;
-pub const DEFAULT_LISTEN_PORT: u16 = 41641;
+/// 出口对外端口缺省（2026-10-14 起 38241；此前 41641 沿袭自 tailcat——同机并存两套时撞端口）。
+/// 已部署机器的 config 显式写了端口，不受缺省变更影响；中继缺省见 [`crate::relay::DEFAULT_LISTEN`]。
+pub const DEFAULT_LISTEN_PORT: u16 = 38241;
 /// 公网端点刷新（成/败）。
 const PUBLIC_REFRESH_OK: Duration = Duration::from_secs(600);
 const PUBLIC_REFRESH_FAIL: Duration = Duration::from_secs(120);

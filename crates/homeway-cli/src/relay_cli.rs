@@ -23,12 +23,12 @@ pub(crate) struct RelayCfg {
     pub advertise: String,
 }
 
-/// 纯映射：`FileConfig` → relay 装配参数（listen 缺省 `:41741`）。
+/// 纯映射：`FileConfig` → relay 装配参数（listen 缺省 `:38341`）。
 pub(crate) fn relay_config_of(fc: &FileConfig) -> Result<RelayCfg, String> {
-    let listen_str = fc.relay.listen.clone().unwrap_or_else(|| ":41741".to_owned());
+    let listen_str = fc.relay.listen.clone().unwrap_or_else(|| homeway_core::relay::DEFAULT_LISTEN.to_owned());
     let listen = parse_listen(&listen_str)
         .filter(|a| a.port() >= 1)
-        .ok_or_else(|| format!("relay.listen {listen_str:?} 非法（[host:]port，端口 1–65535，如 \":41741\"）"))?;
+        .ok_or_else(|| format!("relay.listen {listen_str:?} 非法（[host:]port，端口 1–65535，如 \":38341\"）"))?;
     Ok(RelayCfg {
         listen,
         listen_str,
@@ -47,7 +47,7 @@ struct RelayFlags {
 }
 
 fn relay_usage() {
-    eprintln!("用法：homeway relay [--state DIR] [--listen :41741] [--advertise IP:port] [--open] [--no-hints]");
+    eprintln!("用法：homeway relay [--state DIR] [--listen :38341] [--advertise IP:port] [--open] [--no-hints]");
     eprintln!("  = 前台单中继（Ctrl-C 收工）；启停/查询用 `homeway relay start|stop|restart|status|token`（控制面）。");
 }
 
