@@ -835,7 +835,7 @@ fn cmd_files(args: &[String]) {
                 if inline.is_none() { adv = 2; }
                 host_timeout = cli_flags::parse_duration(&v);
                 if host_timeout.is_none() {
-                    eprintln!("--timeout {v:?} 不是时长（如 10s / 1500ms）");
+                    eprintln!("--timeout {v:?} 不是合法时长（如 10s、1500ms）");
                     std::process::exit(2);
                 }
             }
@@ -1051,7 +1051,8 @@ fn cmd_files(args: &[String]) {
         eprintln!("会话失败收工");
         std::process::exit(1);
     }
-    let budget = Duration::from_secs(30);
+    // --token 直连形态尊重 --timeout（2026-10-15 一致性批：此前解析后静默忽略、固定 30s）
+    let budget = host_timeout.unwrap_or(Duration::from_secs(30));
     let r: Result<(), homeway_core::files::FilesError> = match verb.as_str() {
         "list" => homeway_core::files::list(&session, budget, &path).map(|entries| {
             for e in entries {
@@ -1163,7 +1164,7 @@ fn cmd_files_remote(host_ref: &str, a: FilesRemoteArgs) {
     let st = match c.open_stream(vocab::STREAM_KIND_FILES, &id, timeout) {
         Ok(st) => st,
         Err(e) => {
-            eprintln!("homeway: {}", files_stream_open_err_text(&e));
+            eprintln!("homeway: {}", crate::daemon_cli::stream_open_err_text(&e));
             std::process::exit(1);
         }
     };
@@ -1232,31 +1233,6 @@ fn cmd_files_remote(host_ref: &str, a: FilesRemoteArgs) {
     if let Err(e) = r {
         eprintln!("files {verb} 失败：{e}");
         std::process::exit(1);
-    }
-}
-
-/// stream.open 错误码 → files 面可行动文案（Go filesStreamOpenErr：bad_request 的
-/// 代际文案——kind 值域外 = 新 CLI 配旧 daemon 的唯一兼容断点，design D5）。
-fn files_stream_open_err_text(e: &homeway_core::daemon::proto::OpError) -> String {
-    let detail = {
-        let d = e.detail();
-        if d.is_empty() { String::new() } else { format!("：{d}") }
-    };
-    match e.code.as_str() {
-        homeway_core::daemon::vocab::CODE_BAD_REQUEST => {
-            "守护进程代际过旧，不识 files 流；请同批升级 daemon（bad_request：stream.open 的 kind 值域外）".to_owned()
-        }
-        homeway_core::daemon::vocab::CODE_NO_HOST => {
-            "主机不在守护进程表中（no_host）；homeway host list 查看在表主机".to_owned()
-        }
-        homeway_core::daemon::vocab::CODE_NOT_READY => {
-            "守护进程注册表未就绪（not_ready；client 角色启动中/重建窗口），稍后重试".to_owned()
-        }
-        homeway_core::daemon::vocab::CODE_STREAM_REFUSED => format!(
-            "与主机的流打开被拒（stream_refused）——主机离线、隧道未通或主机会话不可用；用 homeway host status <name> 核对会话与链路态{detail}"
-        ),
-        "timeout" => "连接/打开超预算（--timeout）：daemon 未应答或目标主机拨号黑洞；可用 --timeout 加大预算后重试".to_owned(),
-        other => format!("stream.open 失败：{other}{detail}"),
     }
 }
 

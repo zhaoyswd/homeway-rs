@@ -193,7 +193,7 @@ fn forward_usage() {
     eprintln!("                                                           （目标缺省 = 出口机自己的同一端口）");
     eprintln!("      homeway forward list                                 规则与运行状态");
     eprintln!("      homeway forward delete --listen <P>                  删规则并关监听");
-    eprintln!("  只有一台主机时不必 --host；多台用 --host <name|id>。监听端口 1024–65535，每主机最多 8 条。");
+    eprintln!("  只有一台主机时不必 --host；多台用 --host <name|id>（list 缺省列全部主机的规则，--host 作过滤）。");
 }
 
 /// --target 形态：空 = 出口自己同端口；":P" = 出口自己指定端口；"ip:P" = 任意
@@ -570,7 +570,7 @@ fn socks_on(args: &[String]) {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("homeway: {e}");
-                std::process::exit(2);
+                std::process::exit(1);
             }
         },
     };
@@ -658,7 +658,7 @@ fn socks_off(args: &[String]) {
             Ok(h) => h,
             Err(e) => {
                 eprintln!("homeway: {e}");
-                std::process::exit(2);
+                std::process::exit(1);
             }
         },
     };
@@ -697,13 +697,24 @@ fn socks_off(args: &[String]) {
 }
 
 fn socks_status(args: &[String]) {
-    let p = parse_carrier_args("socks status [--json]", args, &[]);
+    let p = parse_carrier_args("socks status [--host <ref>] [--json]", args, &["host"]);
     let (c, hosts) = dial_and_hosts(&p, "homeway-socks");
     let raw = match c.request(vocab::OpName::SocksStatus.as_str(), None, TIMEOUT) {
         Ok(v) => v,
         Err(e) => exit_carrier_op("socks.status", &e),
     };
-    let socks = raw["socks"].as_array().cloned().unwrap_or_default();
+    let mut socks = raw["socks"].as_array().cloned().unwrap_or_default();
+    // --host = 可选过滤器（对齐 forward list：缺省列全部，给了只看那台）
+    if let Some(want) = p.value_of("host").map(str::trim).filter(|s| !s.is_empty()) {
+        let id = match crate::daemon_cli::resolve_host(&hosts, want) {
+            Ok(id) => id,
+            Err(e) => {
+                eprintln!("homeway: {e}");
+                std::process::exit(1);
+            }
+        };
+        socks.retain(|s| s["host"].as_str() == Some(id.as_str()));
+    }
     let link_of = |hex: &str| -> (String, i64) {
         if let Some(arr) = hosts["hosts"].as_array() {
             for h in arr {
@@ -911,7 +922,7 @@ pub fn cmd_speedtest_hosted(args: &[String]) {
         }
         None => {
             if host_arr.is_empty() {
-                eprintln!("还没有添加主机。先 `homeway host add <凭证>`，再测速。");
+                eprintln!("{}", crate::daemon_cli::no_host_hint("speedtest"));
                 std::process::exit(1);
             }
             host_arr

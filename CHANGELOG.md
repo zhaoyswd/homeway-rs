@@ -2,6 +2,13 @@
 
 ## 未发布
 
+- **CLI 一致性批（全命令排查后修 7 项）**：attach/new 路由修复引出的系统排查——① socks on/off 无主机时的
+  退出码 2 → **1**（与其余命令一致）；② `socks status` 认 `--host` 过滤（对齐 forward list，缺省仍列全部）；
+  ③ files `--token` 直连形态**尊重 `--timeout`**（此前解析后静默忽略、固定 30s）；④ speedtest 的「还没有添加
+  主机」提示与 default_host_ref **同源**（`no_host_hint` 单源）；⑤ term 与 files 的 stream.open 错误文案
+  **合一**（`daemon_cli::stream_open_err_text`：stream_refused 用新版可行动文案 + 保留 bad_request 代际分支）；
+  ⑥ `--timeout` 非法值文案两版统一；⑦ forward 组帮助注明「list 缺省列全部、--host 作过滤」。排查另确认
+  `--state` 缺省三处同源、守护拨号缝无绕过、term 面无直组残留。
 - **`term attach` / `term new`（进入形态）在客户端机报「出口未在运行」**（用户实测）：attach 直组目标、没走
   v0.3.5 起 list/new -d/delete 共用的 `--host` 缺省判定（本机面 / 默认主机规则）——`host_ref` 为空一律落本地面，
   出口机上碰巧成立所以一直没暴露。现与其它子命令同一条路；本地面拒 `--timeout` 的校验也由同一处内建。

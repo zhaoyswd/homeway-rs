@@ -602,6 +602,15 @@ fn parse_args(usage: &str, args: &[String]) -> ParsedArgs {
     out
 }
 
+/// 「还没有添加主机」的可行动提示（单源：default_host_ref / speedtest 等共用——
+/// 2026-10-15 一致性批：此前 speedtest 自写一份，行动项措辞分叉）。
+pub fn no_host_hint(cmd: &str) -> String {
+    format!(
+        "还没有添加主机。先在出口机上执行 `homeway serve token` 取凭证，再在本机执行 \
+         `homeway host add <凭证>`，之后 `homeway {cmd}` 直接用。"
+    )
+}
+
 /// `--host` **缺省**时的寻址（2026-10-13 用户指令：file/term/forward 统一 host 风格，
 /// 普通用户不必知道 token/state 等参数）：**0 台 ⇒ 可行动提示；1 台 ⇒ 直接用它；
 /// 多台 ⇒ 要求显式 `--host`**。返回寻址串（name 优先；表内匹配规则同 [`resolve_host`]）。
@@ -616,12 +625,8 @@ pub fn default_host_ref(
     timeout: Duration,
     no_spawn: bool,
 ) -> Result<String, String> {
-    let no_host = || {
-        format!(
-            "还没有添加主机。先在出口机上执行 `homeway serve token` 取凭证，再在本机执行 \
-             `homeway host add <凭证>`，之后 `homeway {cmd}` 直接用。"
-        )
-    };
+    let _ = cmd;
+    let no_host = || no_host_hint(cmd);
     if !state_dir.join("client").join(homeway_core::daemon::hosts::HOSTS_FILE_NAME).exists() {
         return Err(no_host());
     }
@@ -653,6 +658,27 @@ pub fn default_host_ref(
 /// 表外/大写未命中 = **就地报错**（Go `host_cli.go:419-427`：全长 64 hex 必须与
 /// 表内 ID 精确相等，否则 `主机 %s 不存在`）；term/files `--host` 与 host delete
 /// 共用同一份规则文案）。
+/// `stream.open` 失败 → 可行动文案（单源：term / files 共用——2026-10-15 一致性批：
+/// 此前两份各写（stream_refused 文案分叉、files 独有 bad_request 代际分支），合一取并集）。
+pub fn stream_open_err_text(e: &homeway_core::daemon::proto::OpError) -> String {
+    let detail = {
+        let d = e.detail();
+        if d.is_empty() { String::new() } else { format!("：{d}") }
+    };
+    match e.code.as_str() {
+        vocab::CODE_BAD_REQUEST => {
+            "守护进程代际过旧，不识该服务流；请把 daemon 升到同版本（bad_request：stream.open 的 kind 值域外）".to_owned()
+        }
+        vocab::CODE_NO_HOST => "主机不在守护进程表中（no_host）；homeway host list 查看在表主机".to_owned(),
+        vocab::CODE_NOT_READY => "守护进程注册表未就绪（not_ready；client 角色启动中/重建窗口），稍后重试".to_owned(),
+        vocab::CODE_STREAM_REFUSED => format!(
+            "连不上主机（stream_refused）——主机离线或刚断线；断线后守护进程会自动重连，稍等几秒重试；`homeway host status` 看会话与链路态{detail}"
+        ),
+        "timeout" => "连接/打开超预算（--timeout）：daemon 未应答或目标主机拨号黑洞；可用 --timeout 加大预算后重试".to_owned(),
+        other => format!("stream.open 失败：{other}{detail}"),
+    }
+}
+
 pub fn resolve_host(briefs: &serde_json::Value, want: &str) -> Result<String, String> {
     if want.is_empty() {
         return Err("寻址串为空（给 name、id 前缀或全长 id）".to_owned());

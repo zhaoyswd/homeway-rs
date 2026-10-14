@@ -109,22 +109,6 @@ fn control_dial_err(sock: &std::path::Path, e: &ClientErr) -> String {
 }
 
 /// stream.open 错误码 → 可行动文案（Go streamOpenErr 同义）。
-fn stream_open_err_text(e: &homeway_core::daemon::proto::OpError) -> String {
-    let detail = {
-        let d = e.detail();
-        if d.is_empty() { String::new() } else { format!("：{d}") }
-    };
-    match e.code.as_str() {
-        vocab::CODE_NO_HOST => "主机不在守护进程表中（no_host）；homeway host list 查看在表主机".to_owned(),
-        vocab::CODE_NOT_READY => "守护进程注册表未就绪（not_ready；client 角色启动中/重建窗口），稍后重试".to_owned(),
-        vocab::CODE_STREAM_REFUSED => format!(
-            "连不上主机（stream_refused）——主机离线或刚断线；断线后守护进程会自动重连，稍等几秒重试；`homeway host status` 看会话与链路态{detail}"
-        ),
-        "timeout" => "连接/打开超预算（--timeout）：daemon 未应答或目标主机拨号黑洞；可用 --timeout 加大预算后重试".to_owned(),
-        other => format!("stream.open 失败：{other}{detail}"),
-    }
-}
-
 /// 拨号目标：本地面（连 `<state>/term.sock`）或远端（--host 经控制面）。
 struct TermTarget {
     state_dir: PathBuf,
@@ -388,7 +372,7 @@ fn dial_term(t: &mut TermTarget) -> Result<(TermConn, u32), String> {
             }
         };
         let client = dial_control_spawn_term(&t.state_dir, t.no_spawn)?;
-        let st = client.open_stream(vocab::STREAM_KIND_TERM, &id, t.timeout).map_err(|e| stream_open_err_text(&e))?;
+        let st = client.open_stream(vocab::STREAM_KIND_TERM, &id, t.timeout).map_err(|e| crate::daemon_cli::stream_open_err_text(&e))?;
         TermConn::Remote { client, st, buf: Vec::new() }
     } else {
         let sock = local_term_sock(&t.state_dir);
