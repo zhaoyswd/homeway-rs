@@ -88,12 +88,20 @@ pub struct TransportIn {
 #[derive(Debug, Clone, Default)]
 pub struct TunStatusInput {
     pub stage: StageSnapshot,
-    /// running 判据（单飞锁 + 健康位 + attached 的合成；调用方持有这三个信号）。
+    /// running 判据（设备面存活的合成；调用方经 `TunShared::running()` 单点取）。
     pub running: bool,
     pub demand: DemandState,
     /// fg 诊断位（不参与需求合成——仅给诊断面一个出口）。
     pub demand_fg: bool,
     pub unhealthy_reason: Option<String>,
+    /// 传输类不健康（tun-death-gate：`unhealthy_why == "patrol"` 的显式布尔——
+    /// App 按键消费不比对字符串值集，词表走 EXTENSION_KEYS 键登记）。
+    pub transport_unhealthy: bool,
+    /// 设备死（tun-death-gate：fd/panic/stop 与未知分类的显式布尔，与 running 同源）。
+    pub device_dead: bool,
+    /// 服务流活跃计数（tun-death-gate：files/term/speed 在册服务流数——探针流
+    /// 不计入；扩展侧半死态检测用它排除「业务活跃期的 stats 静默」）。
+    pub service_streams_active: u64,
     pub runner: Option<RunnerIn>,
     pub transport: Option<TransportIn>,
     /// QUIC 岛快照段（M1 S3-2；**additive 平级段**——`None` = 本世代非 quic 档/岛不在）。
@@ -151,6 +159,9 @@ pub struct QuicIn {
     pub ladder_jitter_streak: u32,
     /// 最近一次阶梯动作（`""`/`migrate`/`reconnect`/`rebuild`）。
     pub ladder_action: String,
+    /// 在册服务流数（tun-death-gate：探针流不计入；顶层 `serviceStreamsActive`
+    /// 的同源数据面）。
+    pub streams_active: u64,
 }
 
 /// 快照 → tunStatusJSON（Go tunStatusJSON 逐键对齐；键序 = 字典序）。
@@ -166,6 +177,17 @@ pub fn tun_status_json(input: &TunStatusInput) -> String {
     m.insert("readyBy".into(), Value::String(st.ready_by.clone()));
     m.insert("elapsedMs".into(), Value::from(elapsed_ms));
     m.insert("running".into(), Value::from(i32::from(input.running)));
+    // tun-death-gate 三新键（顶层恒在——failed/无 runner 期 deviceDead 也有诊断
+    // 价值；键名即契约，App 只读键不比对字符串值集）
+    m.insert(
+        "transportUnhealthy".into(),
+        Value::from(input.transport_unhealthy),
+    );
+    m.insert("deviceDead".into(), Value::from(input.device_dead));
+    m.insert(
+        "serviceStreamsActive".into(),
+        Value::from(input.service_streams_active),
+    );
 
     // demand 段：reason 空 = 从未判定（Go 兜「未判定」）
     let mut dm = Map::new();
@@ -337,12 +359,24 @@ mod tests {
             let want = rec["json"].as_str().unwrap().to_owned();
             let got_raw = tun_status_json(&vec_case_input(name));
             // elapsedMs 归一（Go 产端已归 0；Rust 侧 since=now → 0~1ms 段替 0）
-            let got = match got_raw.split_once("\"elapsedMs\":") {
+            let got_norm = match got_raw.split_once("\"elapsedMs\":") {
                 Some((pre, rest)) => {
                     let tail = rest.find(',').unwrap_or(rest.len());
                     format!("{pre}\"elapsedMs\":0{}", &rest[tail..])
                 }
                 None => got_raw,
+            };
+            // tun-death-gate 三新键不参与 Go 向量对账（Go 冻结产端无此键）——
+            // 比对前解析删键再序列化（键序保持字典序，无残逗号）。
+            let got = {
+                let mut v: serde_json::Value =
+                    serde_json::from_str(&got_norm).expect("归一后仍是合法 JSON");
+                if let serde_json::Value::Object(ref mut m) = v {
+                    for k in ["transportUnhealthy", "deviceDead", "serviceStreamsActive"] {
+                        m.remove(k);
+                    }
+                }
+                serde_json::to_string(&v).expect("再序列化")
             };
             assert_eq!(got, want, "case {name}: Go 向量对账失败");
             seen += 1;
@@ -399,7 +433,10 @@ mod tests {
         let keys: Vec<&str> = v.as_object().unwrap().keys().map(|k| k.as_str()).collect();
         assert_eq!(
             keys,
-            vec!["code", "demand", "elapsedMs", "meowed", "readyBy", "reason", "running", "state"]
+            vec![
+                "code", "demand", "deviceDead", "elapsedMs", "meowed", "readyBy", "reason",
+                "running", "serviceStreamsActive", "state", "transportUnhealthy",
+            ]
         );
         // demand 段键面与「未判定」兜底
         let d = &v["demand"];
@@ -419,6 +456,9 @@ mod tests {
             demand: DemandState { active: true, reason: "亮屏".into(), at_ms: 1696000000000 },
             demand_fg: true,
             unhealthy_reason: Some("patrol".into()),
+            transport_unhealthy: true,
+            device_dead: false,
+            service_streams_active: 2,
             runner: Some(RunnerIn {
                 fd_read_bytes: 111,
                 fd_write_bytes: 222,
@@ -461,8 +501,9 @@ mod tests {
             keys,
             vec![
                 "bridgeAuth", "bridgeFilesSock", "bridgeSpeedSock", "bridgeTermSock", "code",
-                "demand", "elapsedMs", "exitIp", "identity", "link", "meowed", "portForwards",
-                "readyBy", "reason", "running", "state", "stats", "tunIp", "unhealthyReason",
+                "demand", "deviceDead", "elapsedMs", "exitIp", "identity", "link", "meowed",
+                "portForwards", "readyBy", "reason", "running", "serviceStreamsActive",
+                "state", "stats", "transportUnhealthy", "tunIp", "unhealthyReason",
             ]
         );
         assert_eq!(v["running"], 1);
@@ -494,14 +535,22 @@ mod tests {
             runner: None,
             transport: None,
             unhealthy_reason: None,
+            transport_unhealthy: false,
+            device_dead: false,
+            service_streams_active: 0,
             quic: None,
         };
         let v: Value = serde_json::from_str(&tun_status_json(&bare)).unwrap();
         assert!(v.get("quic").is_none(), "岛不在 ⇒ 整段缺席");
+        // tun-death-gate：三新键顶层恒在（岛不在也输出——deviceDead 的诊断价值）
+        assert_eq!(v["transportUnhealthy"], false);
+        assert_eq!(v["deviceDead"], false);
+        assert_eq!(v["serviceStreamsActive"], 0);
 
         // ① 在场形态：字段齐 + 键序（serde_json Map = 字典序）
         let input = TunStatusInput {
             quic: Some(QuicIn {
+                streams_active: 1,
                 mtu: 1362,
                 current_mtu: 1400,
                 lost_packets: 3,

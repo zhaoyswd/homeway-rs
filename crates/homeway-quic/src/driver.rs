@@ -1148,6 +1148,7 @@ async fn housekeeping(
         s.ladder_fail_streak = st.ladder.fail_streak();
         s.ladder_jitter_streak = st.ladder.jitter_streak();
         s.ladder_action = st.ladder.last_action.to_owned();
+        s.ladder_inflight = st.ladder.inflight();
         st.snap_sync_last = Some(Instant::now());
     }
     // ⑤ 「窄路径不可用」判据（mds 变小/连接换过都要重判；S2-4）

@@ -18,12 +18,18 @@
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Condvar, Mutex};
+use std::time::{Duration, Instant};
 
 use super::stage::{StageMachine, TunStage};
 
 /// 锁中毒不 panic（Q-F F6-1：单源上移到 `crate::syncutil`——facade 面 /
 /// recover gate 与本处共用同一件；facade 内的既有调用点经本重导出零改动）。
 pub(crate) use crate::syncutil::lock_unpoison;
+
+/// 不健康分类的设备/传输分界（tun-death-gate）：`patrol` = 传输类（对端不可达——
+/// 不写设备死位、可翻回）；`fd`/`panic`/`stop` 与**任何未知值** = 设备类（单向，
+/// 仅新世代 begin 清——未知值保守归设备侧）。
+const DEVICE_CLASS: fn(&str) -> bool = |why| why != "patrol";
 
 /// tun 域的世代共享面（Arc 交给执行体）。
 pub struct TunShared {
@@ -32,10 +38,17 @@ pub struct TunShared {
     /// 世代计数（每次 prepare 递增；阶段写与收尾都比对它防陈旧）。
     pub gen: AtomicU64,
     pub stage: StageMachine,
-    /// 健康位（Go tunHealthy：fd 循环异常/巡检耗尽/收工都会翻 false）。
+    /// 健康位（传输面，tun-death-gate 拆分后）：`patrol` 写假、翻回写真——不再
+    /// 承载设备死亡（设备死看 [`Self::device_dead`]）。
     pub healthy: AtomicBool,
-    /// 不健康分类（patrol/fd/panic/stop；Go tunUnhealthyWhy——写序：先写它再翻 healthy）。
+    /// 设备死位（fd/panic/stop + 未知分类；单向——仅新世代 [`Self::begin_healthy`]
+    /// 清）。`running()` 只看它：传输类不健康不再把 running 拉零（2026-10-15 事故
+    /// 的误杀链入口）。
+    pub device_dead: AtomicBool,
+    /// 不健康分类（patrol/fd/panic/stop；写序：先写它再翻 healthy/设备位）。
     pub unhealthy_why: Mutex<String>,
+    /// 最近一次 patrol 判定时刻（翻回最小间隔的记账面；仅 patrol 分类写入）。
+    last_patrol_at: Mutex<Option<Instant>>,
     /// attach fd 通道（缓冲 1；世代线程接收端经 [`Self::attach_receiver`] 注册——
     /// Go attachCh。投递端非阻塞：满/无接收者即 false（调用方按 -1 收）。
     attach_tx: Mutex<Option<mpsc::SyncSender<i32>>>,
@@ -61,7 +74,9 @@ impl TunShared {
             gen: AtomicU64::new(0),
             stage: StageMachine::new(),
             healthy: AtomicBool::new(true),
+            device_dead: AtomicBool::new(false),
             unhealthy_why: Mutex::new(String::new()),
+            last_patrol_at: Mutex::new(None),
             attach_tx: Mutex::new(None),
             done: Mutex::new(false),
             done_cv: Condvar::new(),
@@ -108,10 +123,17 @@ impl TunShared {
         *lock_unpoison(&self.attach_tx) = None;
     }
 
-    /// 标记不健康（写序契约：先 why 后 healthy——见模块头）。只有当前世代有权
+    /// 标记不健康（写序契约：先 why 后健康位——见模块头）。只有当前世代有权
     /// （世代守卫在调用方过——执行体知道自己是否当前世代时才调）。
+    /// 分类分流（tun-death-gate）：设备类写 [`Self::device_dead`]（单向）；
+    /// 传输类（patrol）只写传输位并记判定时刻（翻回最小间隔的基准）。
     pub fn mark_unhealthy(&self, why: &str) {
         *lock_unpoison(&self.unhealthy_why) = why.to_owned();
+        if DEVICE_CLASS(why) {
+            self.device_dead.store(true, Ordering::Release);
+        } else {
+            *lock_unpoison(&self.last_patrol_at) = Some(Instant::now());
+        }
         self.healthy.store(false, Ordering::Release);
     }
 
@@ -125,10 +147,45 @@ impl TunShared {
     }
 
     /// 新世代起点：清健康位与分类（Go tunBegin：tunUnhealthyWhy.Store("") +
-    /// tunHealthy.Store(true)；顺序即注释——先清分类再置健康）。
+    /// tunHealthy.Store(true)；顺序即注释——先清分类再置健康）。设备死位与 patrol
+    /// 判定时刻一并随新世代清（tun-death-gate）。
     pub fn begin_healthy(&self) {
         *lock_unpoison(&self.unhealthy_why) = String::new();
         self.healthy.store(true, Ordering::Release);
+        self.device_dead.store(false, Ordering::Release);
+        *lock_unpoison(&self.last_patrol_at) = None;
+    }
+
+    /// 传输健康翻回（tun-death-gate）：仅当分类为 `patrol` 且距上次判定 ≥ `min_gap`
+    /// 时生效——写序「先清 why 再置 healthy」（与 begin_healthy 同序）；**分类槽为
+    /// 设备/传输共用，仅清 patrol**——设备类诊断文案不受影响。返回
+    /// `Some(距上次判定时长)` = 已翻回（调用方打判据行）；`None` = 未翻（分类不符
+    /// 或间隔未到——抖动循环由最小间隔拦）。
+    pub fn try_recover_transport(&self, min_gap: Duration) -> Option<Duration> {
+        let mut why = lock_unpoison(&self.unhealthy_why);
+        if *why != "patrol" {
+            return None;
+        }
+        let at = (*lock_unpoison(&self.last_patrol_at))?;
+        let elapsed = Instant::now().saturating_duration_since(at);
+        if elapsed < min_gap {
+            return None;
+        }
+        *why = String::new();
+        drop(why);
+        self.healthy.store(true, Ordering::Release);
+        Some(elapsed)
+    }
+
+    /// `running` 的单点合成（tun-death-gate：capi 面与对账快照共用——只反映设备面
+    /// 存活：单飞锁 + **非设备死** + attached。传输类不健康〔patrol〕不再把
+    /// running 拉零——调用方据 `unhealthyReason` 区分「需要重建（设备死）」与
+    /// 「只需恢复传输」）。三个信号各自原子、合起来不是一致快照，转换瞬间可能
+    /// 瞬时 0/1；调用方已用去抖。
+    pub fn running(&self) -> bool {
+        self.probe_running.load(Ordering::Acquire)
+            && !self.device_dead.load(Ordering::Acquire)
+            && self.stage.snapshot().stage == TunStage::Attached
     }
 
     /// 世代收尾（**执行体世代线程的一切退出路径必须调**；幂等——done 只关一次，
@@ -337,6 +394,67 @@ mod tests {
         assert!(
             f2.load(Ordering::Acquire),
             "收尾置当前世代停止位（Go close(r.stop) 同义）"
+        );
+    }
+
+    /// tun-death-gate：传输类不健康（patrol）不把 running 拉零；设备类才拉。
+    #[test]
+    fn patrol_not_pull_running_zero() {
+        let sh = TunShared::new();
+        sh.begin_generation(1);
+        sh.probe_running.store(true, Ordering::Release);
+        sh.stage.set_if_current(1, TunStage::Attached, "", "", true);
+        assert!(sh.running(), "健康基线");
+        sh.mark_unhealthy("patrol");
+        assert!(
+            sh.running(),
+            "patrol 只写传输位——running（设备面）仍为真（2026-10-15 事故的误杀链入口）"
+        );
+        assert!(!sh.healthy.load(Ordering::Acquire), "传输健康位为假");
+        sh.begin_generation(2);
+        sh.begin_healthy();
+        sh.probe_running.store(true, Ordering::Release);
+        sh.stage.set_if_current(2, TunStage::Attached, "", "", true);
+        sh.mark_unhealthy("fd");
+        assert!(!sh.running(), "设备死把 running 拉零");
+        assert!(sh.device_dead.load(Ordering::Acquire));
+    }
+
+    /// tun-death-gate：翻回仅对 patrol 生效（分类不符不动）；设备类文案不被抹。
+    #[test]
+    fn recover_keeps_device_class_why() {
+        let sh = TunShared::new();
+        sh.mark_unhealthy("fd");
+        assert!(sh.try_recover_transport(Duration::ZERO).is_none());
+        assert_eq!(
+            *lock_unpoison(&sh.unhealthy_why),
+            "fd",
+            "设备类分类文案不得被翻回抹掉"
+        );
+        assert!(!sh.healthy.load(Ordering::Acquire));
+        // 未知分类保守归设备：同样不翻。
+        sh.begin_healthy();
+        sh.mark_unhealthy("fd-timeout");
+        assert!(sh.try_recover_transport(Duration::ZERO).is_none());
+        assert!(sh.device_dead.load(Ordering::Acquire), "未知值归设备类");
+    }
+
+    /// tun-death-gate：patrol 翻回的最小间隔与写序（先清 why 再置 healthy）。
+    #[test]
+    fn recover_patrol_with_min_gap() {
+        let sh = TunShared::new();
+        sh.mark_unhealthy("patrol");
+        assert!(
+            sh.try_recover_transport(Duration::from_secs(30)).is_none(),
+            "间隔未到不翻（防抖动循环）"
+        );
+        assert_eq!(*lock_unpoison(&sh.unhealthy_why), "patrol");
+        let got = sh.try_recover_transport(Duration::ZERO);
+        assert!(got.is_some(), "间隔放宽后翻回");
+        assert!(sh.healthy.load(Ordering::Acquire));
+        assert!(
+            lock_unpoison(&sh.unhealthy_why).is_empty(),
+            "翻回后分类已清（写序：先清 why）"
         );
     }
 }

@@ -150,6 +150,11 @@ pub(crate) struct Ladder {
     last_round_at: Option<TokioInstant>,
     /// 单飞位（探活/动作在途 ⇒ 不再起新轮；§3.2-4）。
     inflight: bool,
+    /// 挂起空窗标志（tun-death-gate §2.3）：due() 检出空窗（主信号 = 核内 gap
+    /// 判据 >2×待机节拍——可证明的挂起检出）时置位；下一次失败轮的动作选择消费
+    /// （强制 M——挂起导致的 socket 腐烂可以是静默的，无 errno 也得换源）；快探
+    /// 成功清位。一拍性：不跨「空窗→快探成功→很久后的下一次失败」残留（成功即清）。
+    suspend_gap_pending: bool,
     /// 首探失败的原因（等复探结论判「抖动 vs 故障」）。
     pending_fail: Option<String>,
     /// 连续抖动次数（§3.1-2：≥ `jitter_streak` ⇒ 升格为失败）。
@@ -187,6 +192,7 @@ impl Ladder {
             last_tick: TokioInstant::now(),
             last_round_at: None,
             inflight: false,
+            suspend_gap_pending: false,
             pending_fail: None,
             jitter_streak: 0,
             fail_streak: 0,
@@ -209,6 +215,11 @@ impl Ladder {
     }
 
     /// 连续失败次数（快照读数）。
+    /// 单飞位读面（tun-death-gate：宿主重赛跑入口发起前查——防打断在途探活/动作）。
+    pub(crate) fn inflight(&self) -> bool {
+        self.inflight
+    }
+
     pub(crate) fn fail_streak(&self) -> u32 {
         self.fail_streak
     }
@@ -237,6 +248,7 @@ impl Ladder {
         self.dormant = false;
         self.pending = None;
         self.inflight = false;
+        self.suspend_gap_pending = false;
         self.pending_fail = None;
         self.fail_streak = 0;
         self.jitter_streak = 0;
@@ -261,6 +273,9 @@ impl Ladder {
             return None;
         }
         if self.last_round_at.is_some() && gap > 2 * self.tun.idle_interval {
+            // tun-death-gate §2.3：空窗检出（主信号 = 核内 gap 判据）——置一拍性标志，
+            // 本轮失败时强制换源（不等发送面 errno：挂起腐烂是静默的）。
+            self.suspend_gap_pending = true;
             return Some((Round::First, self.tun.fast_budget));
         }
         let wait = if in_use {
@@ -318,6 +333,7 @@ impl Ladder {
             (Round::First, Ok(_)) | (Round::Confirm, Ok(_)) => {
                 self.probe_ok += 1;
                 self.fail_streak = 0;
+                self.suspend_gap_pending = false;
                 self.jitter_streak = 0;
                 self.pending_fail = None;
                 let done = self.pending.take();
@@ -519,7 +535,14 @@ impl Ladder {
         // M/R 判别（§3.1 的表）：**本机发送面新鲜报错 ⇒ M；否则 R**。只在失败轮起点选
         // （`fail_streak == 1`）——其后按「败 ⇒ 另一动作」翻转，不受信号反复影响。
         if self.fail_streak == 1 {
+            let forced_by_gap = self.suspend_gap_pending;
+            self.suspend_gap_pending = false;
             let chosen = if send.fresh {
+                Action::Migrate
+            } else if forced_by_gap {
+                // tun-death-gate §2.3：空窗后的首次失败绕过 errno 判据直接换源
+                //（事故实证：挂起腐烂静默无 errno ⇒ 选 R 必败 ⇒ 直落 B 门）。
+                (*logf)("挂起空窗后快探失败 → 直接换源（不等发送面报错）");
                 Action::Migrate
             } else {
                 Action::Reconnect
@@ -662,6 +685,68 @@ mod tests {
 
     fn failed() -> Result<Duration, IslandErr> {
         Err(IslandErr::ProbeNoResponse)
+    }
+
+    /// tun-death-gate §2.3：空窗后的首次失败强制换源（静默腐烂无 errno 也走 M）。
+    #[test]
+    fn suspend_gap_forces_migrate_without_errno() {
+        let mut l = Ladder::new(tuning());
+        let t0 = TokioInstant::now();
+        // 起一轮成功（建立 last_round_at 历史）
+        assert!(l.due(t0, true).is_some());
+        l.note_round(Round::First, t0);
+        l.on_round(Round::First, ok(), t0, SendFace::default(), &lines().0);
+        // 空窗：> 2×待机节拍（60s×2）——due 立即探并置一拍性标志
+        let t1 = t0 + Duration::from_secs(130);
+        assert!(l.due(t1, false).is_some(), "空窗后立即探");
+        l.note_round(Round::First, t1);
+        // 首探失败 ⇒ 复探；复探失败 ⇒ fail_step 选动作：SendFace 全空（静默腐烂）
+        // 但空窗标志在 ⇒ 必须选 M（换源），不是 R。
+        l.on_round(Round::First, failed(), t1, SendFace::default(), &lines().0);
+        let (f, v) = lines();
+        let step = l.on_round(Round::Reprobe, failed(), t1, SendFace::default(), &f);
+        assert!(
+            matches!(step, Step::Migrate { .. }),
+            "空窗后首败强制换源（got {step:?}）"
+        );
+        assert!(
+            v.lock().unwrap().iter().any(|l| l.contains("挂起空窗后快探失败 → 直接换源")),
+            "判据行必须出现"
+        );
+    }
+
+    /// tun-death-gate §2.3：无空窗时静默腐烂仍走 R（既有口径不回退）；快探成功清标志
+    ///（不跨「空窗→成功→很久后的下一次失败」残留）。
+    #[test]
+    fn no_gap_keeps_r_and_success_clears_flag() {
+        // ① 无空窗（正常节拍）：SendFace 无错 ⇒ R（§3.1 表既有口径不回退）
+        let mut l0 = Ladder::new(tuning());
+        let t0 = TokioInstant::now();
+        assert!(l0.due(t0, true).is_some());
+        l0.note_round(Round::First, t0);
+        l0.on_round(Round::First, failed(), t0, SendFace::default(), &lines().0);
+        let step = l0.on_round(Round::Reprobe, failed(), t0, SendFace::default(), &lines().0);
+        assert!(matches!(step, Step::Reconnect { .. }), "无空窗保持 R 口径");
+
+        // ② 空窗置位 → 本轮成功 → 标志清除；下一次（再空窗后的）失败回到 R
+        let mut l = Ladder::new(tuning());
+        assert!(l.due(t0, true).is_some());
+        l.note_round(Round::First, t0);
+        l.on_round(Round::First, ok(), t0, SendFace::default(), &lines().0);
+        let t1 = t0 + Duration::from_secs(130);
+        assert!(l.due(t1, false).is_some(), "空窗后立即探（置位）");
+        l.note_round(Round::First, t1);
+        l.on_round(Round::First, ok(), t1, SendFace::default(), &lines().0);
+        // 成功清位后：正常节拍（非空窗）内再失败——回到 R（若标志残留则会错走 M）
+        let t2 = t1 + Duration::from_millis(250);
+        assert!(l.due(t2, true).is_some(), "在用档背靠背到点");
+        l.note_round(Round::First, t2);
+        l.on_round(Round::First, failed(), t2, SendFace::default(), &lines().0);
+        let step = l.on_round(Round::Reprobe, failed(), t2, SendFace::default(), &lines().0);
+        assert!(
+            matches!(step, Step::Reconnect { .. }),
+            "成功清标志后回到 R（不跨拍残留）"
+        );
     }
 
     /// **判据（节拍三段，§3.2）**：在用档 = 背靠背（拍间 `fast_gap`，≤300ms）；待机档 = 60s；

@@ -448,6 +448,8 @@ pub struct IslandSnapshot {
     pub ladder_jitter_streak: u32,
     /// 最近一次动作（`""`/`migrate`/`reconnect`/`rebuild`；排障读数）。
     pub ladder_action: String,
+    /// 阶梯单飞位（tun-death-gate：宿主重赛跑入口的发起前守卫——在飞则不发起）。
+    pub ladder_inflight: bool,
 
     // ---------- M3 S5：准入失败归因（设计 §4；`quic` JSON 段的两个新键） ----------
     /// 末次**准入被拒**的应用码（`None` = 未发生过）。

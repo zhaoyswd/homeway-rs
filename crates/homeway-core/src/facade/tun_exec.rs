@@ -75,6 +75,14 @@ const DIAL_MS_DEFAULT: i64 = 15000;
 
 /// 岛侧赛跑预算（世代装配期一次；覆盖 LAN/中继握手 + `hr-reg4` 四帧准入）。
 const QUIC_CONNECT_BUDGET: Duration = Duration::from_secs(5);
+/// tun-death-gate §2.1：巡检续探再发起重赛跑的需求期节流（对齐巡检节拍）。
+const RERACE_PATROL_THROTTLE: Duration = Duration::from_secs(60);
+/// tun-death-gate §2.1：无需求期的长兜底节拍（需求恢复沿另触发；防与扩展侧
+/// 双链整夜各 60s 烧射频）。
+const RERACE_IDLE_FALLBACK: Duration = Duration::from_secs(600);
+/// tun-death-gate §2.1：巡检探测成功翻回的最小间隔（防抖动循环；**重赛跑证据
+/// 不受此限**——全新 socket 握手成功是强证据，B 门后秒级翻回合法）。
+const TRANSPORT_RECOVER_MIN_GAP: Duration = Duration::from_secs(30);
 /// 岛侧同步命令（TunAttach / Rebind）的等待预算（岛内短路径，超时 = 异常）。
 const QUIC_RPC_BUDGET: Duration = Duration::from_secs(5);
 /// 世代收尾的**岛**停止预算（Q-G F5：有界收工——到点 detach，不让收工链挂死）。
@@ -606,6 +614,7 @@ pub(crate) fn quic_in_of(s: &homeway_quic::IslandSnapshot) -> QuicIn {
         ladder_fail_streak: s.ladder_fail_streak,
         ladder_jitter_streak: s.ladder_jitter_streak,
         ladder_action: s.ladder_action.clone(),
+        streams_active: s.streams_active,
     }
 }
 
@@ -1011,16 +1020,20 @@ fn gen_loop(
                     return;
                 }
                 let snap = shared2.stage.snapshot();
-                let running = shared2.probe_running.load(Ordering::Acquire)
-                    && shared2.healthy.load(Ordering::Acquire)
-                    && snap.stage == TunStage::Attached;
+                // tun-death-gate：running 单点（与 capi 同源——TunShared::running）
+                let running = shared2.running();
                 let why = lock_unpoison(&shared2.unhealthy_why).clone();
                 let input = super::tun_status::TunStatusInput {
                     stage: snap,
                     running,
                     demand: demand2.last(),
                     demand_fg: demand2.fg(),
+                    transport_unhealthy: why == "patrol",
                     unhealthy_reason: (!why.is_empty()).then_some(why),
+                    device_dead: shared2.device_dead.load(Ordering::Acquire),
+                    service_streams_active: quic_status_of(&run2)
+                        .map(|q| q.streams_active)
+                        .unwrap_or(0),
                     runner: Some(runner_of(&run2)),
                     transport: Some(transport_of(&run2)),
                     quic: quic_status_of(&run2),
@@ -1296,9 +1309,71 @@ fn island_unhealthy(run: &Arc<GenRun>) -> homeway_quic::OnUnhealthy {
 /// 本函数不再做动作——收到信号即如实判不健康。
 fn quic_unhealthy_signal(run: &Arc<GenRun>, reason: &str) {
     if reason == "patrol" {
-        (run.logf)("岛上报不健康（patrol）—— 岛内快探阶梯已走完 M/R（B 门），交世代重建");
+        // tun-death-gate §2.2：B 门先走统一重赛跑（宿主面——岛线程回调内只允许
+        // 内存操作 + 起线程，内部有阻塞 RPC ⇒ spawn 出去），成功即翻回不上报；
+        // 失败才按现状上报 patrol 交扩展处置（岛内僵尸收口已由 B 门路径先行）。
+        (run.logf)("岛上报不健康（patrol）—— 岛内快探阶梯已走完 M/R（B 门），先走统一重赛跑（成功不上报）");
+        let r = Arc::clone(run);
+        let _ = std::thread::Builder::new()
+            .name("homeway-rerace".into())
+            .spawn(move || {
+                if let Err(why) = rerace_tunnel(&r) {
+                    (r.logf)(&format!(
+                        "阶梯尽头重赛跑：未获对端证据（{why}）——上报传输类不健康"
+                    ));
+                    r.tun_shared.mark_unhealthy_if_current(r.gen, "patrol");
+                }
+            });
+        return;
     }
     run.tun_shared.mark_unhealthy_if_current(run.gen, reason);
+}
+
+/// 统一重赛跑入口（tun-death-gate §2.2）。**岛线程回调内只允许 spawn 线程调本
+/// 函数**（内部有阻塞 RPC）；巡检续探 / 恢复下推两条调用方本身在非岛线程。
+/// 固定序列：换本地 socket（`Cmd::Rebind{local:None}`——M 的动作面，静默腐烂
+/// 只有这步能解）→ 全候选赛跑（`Cmd::Connect`，空候选回落名册；`st.racing`
+/// 单飞在入口内合并——`RaceInFlight` = 已在飞非失败）。成功走既有 adopt（含
+/// 阶梯复活 + 换连接清流）后翻回（**强证据**，不受翻回最小间隔约束）；失败
+/// 返回 Err（调用方决定是否上报——B 门失败才上报，巡检续探只等待下一拍）。
+fn rerace_tunnel(run: &Arc<GenRun>) -> Result<(), String> {
+    let island = run
+        .current_island()
+        .ok_or_else(|| "岛不在".to_owned())?;
+    // 阶梯在飞则不发起（r4 N4：防宿主 Rebind 打断在途确认探活——巡检兜底路径
+    // 上阶梯可能仍活跃；B 门路径 dormant 前置天然满足）。
+    if island.snapshot().ladder_inflight {
+        return Err("阶梯在飞".to_owned());
+    }
+    island_cmd(
+        &island,
+        |reply| homeway_quic::Cmd::Rebind {
+            local: None,
+            reply,
+        },
+        QUIC_RPC_BUDGET,
+    )
+    .map_err(|e| format!("换源失败：{e}"))?;
+    let outcome = island_cmd(
+        &island,
+        |reply| homeway_quic::Cmd::Connect {
+            cands: Vec::new(),
+            budget: QUIC_CONNECT_BUDGET,
+            reply,
+        },
+        QUIC_CONNECT_BUDGET + QUIC_RPC_BUDGET,
+    )
+    .map_err(|e| format!("赛跑失败：{e}"))?;
+    if let Some(elapsed) = run.tun_shared.try_recover_transport(Duration::ZERO) {
+        (run.logf)(&format!(
+            "阶梯尽头重赛跑：胜出 {} {}（耗时 {}ms）——传输恢复，不拆接口（patrol 清除，证据=重赛跑，距上次判定 {}）",
+            outcome.via.text(),
+            outcome.winner,
+            outcome.elapsed_ms,
+            crate::go_fmt::fmt_duration_go_secs(elapsed)
+        ));
+    }
+    Ok(())
 }
 
 /// 岛的建立（凭据 → 候选 → 起岛 → SetOnUnhealthy/SetCandidates → 赛跑）。
@@ -1421,7 +1496,7 @@ fn recover_downpush_on_island(run: &Arc<GenRun>, cause: &str) -> i32 {
     use homeway_quic::tuning::probe_defaults::{FAST_BUDGET, REPROBE_FACTOR};
     // 不设 `deadline`（NAPI 面无线）；探段自带预算，RPC 等待亦为 `budget + QUIC_RPC_BUDGET`。
     let first = l3_probe(run, FAST_BUDGET);
-    let (tag, verdict, rc) = match first {
+    let (tag, verdict, mut rc) = match first {
         Ok(()) => ("", "通过".to_owned(), 0),
         Err(e1) => {
             // 一次复探（与岛内阶梯同粒度：`ladder.rs:222` 的 `fast_budget × reprobe_factor`）
@@ -1439,6 +1514,19 @@ fn recover_downpush_on_island(run: &Arc<GenRun>, cause: &str) -> i32 {
     (run.logf)(&format!("恢复下推（{cause}）——岛快探{tag}：{verdict}"));
     // 耗时口径：实测值（正常形态 0.7s / 2.1s 两档）由用例与真机读数钉（M4.md §S4）；
     // 上界只在**实测**面设门（预登记指标 ≤8s），不在此处断言（见函数头的订正）。
+    // tun-death-gate §2.2：patrol 态（已上报传输类不健康）的下推重走全链——快探+
+    // 复探失败后再走一次统一重赛跑（换 socket + 全候选；成功 = 恢复，失败才交 -1
+    // 给扩展的窗口逻辑）。非 patrol 态维持原「只探不做」口径（动作面在岛内阶梯）。
+    if rc == -1 && *lock_unpoison(&run.tun_shared.unhealthy_why) == "patrol" {
+        match rerace_tunnel(run) {
+            Ok(()) => rc = 0,
+            Err(why) => {
+                (run.logf)(&format!(
+                    "阶梯尽头重赛跑：未获对端证据（{why}）——下推全链未恢复"
+                ));
+            }
+        }
+    }
     rc
 }
 
@@ -1452,6 +1540,10 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
     let mut last_counted: Option<Instant> = None;
     let mut gated = false;
     let mut probe_now = true; // attach 完就立即探（界面链路条不必空等第一个间隔）
+    // tun-death-gate §2.1：patrol 上报后的续探记账（幂等上报位 / 需求沿 / 重赛跑节流）。
+    let mut patrol_reported = false;
+    let mut prev_demand = false;
+    let mut rerace_last: Option<Instant> = None;
     loop {
         if !probe_now {
             let next = last_loop_at + PATROL_INTERVAL;
@@ -1510,6 +1602,20 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
         let probe = l3_probe(&run, PROBE_TIMEOUT);
         // 成功面：链路快照（C10 形态；来源 = 岛快照）
         if let Ok(()) = probe {
+            // tun-death-gate：patrol 态下探测成功 ⇒ 翻回（弱证据——受最小间隔约束，
+            // 防抖动循环；重赛跑路径的强证据翻回在 rerace_tunnel 内）。
+            if patrol_reported {
+                if let Some(elapsed) =
+                    run.tun_shared
+                        .try_recover_transport(TRANSPORT_RECOVER_MIN_GAP)
+                {
+                    (run.logf)(&format!(
+                        "传输恢复（patrol 清除，证据=探测，距上次判定 {}）",
+                        crate::go_fmt::fmt_duration_go_secs(elapsed)
+                    ));
+                    patrol_reported = false;
+                }
+            }
             if let Some((via, ep, rtt_ms)) = run.island_link() {
                 (run.logf)(&format!(
                     "link: via={via} ep={ep} rtt={rtt_ms}ms（新栈状态快照）"
@@ -1566,12 +1672,42 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
         if fail_streak >= FAIL_STREAK_LADDER {
             // 动作面 = 岛内快探阶梯（§3.1 的 M/R/B）；本支路只是**兜底**
             //（岛的 B 门 = 连续 2 次 R 失败 + 窗 ≥10s ⇒ 10s 量级就会上报；走到这里
-            //  说明岛面也异常）⇒ 如实上报 `patrol` 交世代重建。
-            (run.logf)(
-                "对端连续 3 次巡检不可达（岛内阶梯未见自愈）—— 兜底上报不健康，交扩展重建",
-            );
-            run.tun_shared.mark_unhealthy_if_current(run.gen, "patrol");
-            return;
+            //  说明岛面也异常）⇒ 如实上报 `patrol` 交扩展处置（幂等——一次判定的
+            //  边沿只报一次）。
+            if !patrol_reported {
+                patrol_reported = true;
+                (run.logf)(
+                    "对端连续 3 次巡检不可达（岛内阶梯未见自愈）—— 兜底上报不健康（传输类），交扩展处置",
+                );
+                run.tun_shared.mark_unhealthy_if_current(run.gen, "patrol");
+            }
+            // tun-death-gate §2.1：上报后线程**不退出**——翻回探测者在位。需求期按
+            // `RERACE_PATROL_THROTTLE` 节流再发起统一重赛跑；无需求期只在需求恢复沿
+            // 或 `RERACE_IDLE_FALLBACK` 兜底节拍（防与扩展侧双链整夜各 60s 烧射频；
+            // 无 live 时 Cmd::Probe 必败属已知——不据此翻回，翻回靠重赛跑/成功拍）。
+            let demand_rising = demand_active && !prev_demand;
+            prev_demand = demand_active;
+            let throttle = if demand_active {
+                RERACE_PATROL_THROTTLE
+            } else {
+                RERACE_IDLE_FALLBACK
+            };
+            let rerace_due = demand_rising
+                || rerace_last
+                    .map(|t| last_loop_at.duration_since(t) >= throttle)
+                    .unwrap_or(true);
+            if rerace_due {
+                rerace_last = Some(last_loop_at);
+                match rerace_tunnel(&run) {
+                    Ok(()) => {
+                        fail_streak = 0;
+                        patrol_reported = false;
+                    }
+                    Err(why) => {
+                        (run.logf)(&format!("巡检续探重赛跑未恢复（{why}）——等待下一拍"));
+                    }
+                }
+            }
         }
     }
 }

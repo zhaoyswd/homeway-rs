@@ -428,25 +428,30 @@ impl ClientCore {
         let running = self.tun_running_inner(&exec);
         // unhealthyReason 只看分类是否非空（Go `if why != ""`——与 running 位独立）
         let why = lock_unpoison(&self.tun.unhealthy_why).clone();
+        let transport_unhealthy = why == "patrol";
+        let quic = exec.quic_status();
         let input = TunStatusInput {
             stage: snap,
             running,
             demand: self.demand.last(),
             demand_fg: self.demand.fg(),
             unhealthy_reason: (!why.is_empty()).then_some(why),
+            // tun-death-gate：显式分类键（App 只读键不比值集）
+            transport_unhealthy,
+            device_dead: self.tun.device_dead.load(Ordering::Acquire),
+            service_streams_active: quic.as_ref().map(|q| q.streams_active).unwrap_or(0),
             runner: exec.runner(),
             transport: exec.transport(),
-            quic: exec.quic_status(),
+            quic,
         };
         tun_status::tun_status_json(&input)
     }
 
     fn tun_running_inner(&self, _exec: &Arc<dyn TunExecutor>) -> bool {
-        // 只有接上数据面且健康才算 1（单飞锁 + 健康位 + attached 的合成——三个信号
-        // 各自原子、合起来不是一致快照，转换瞬间可能瞬时 0/1；调用方已用去抖）。
-        self.tun.probe_running.load(Ordering::Acquire)
-            && self.tun.healthy.load(Ordering::Acquire)
-            && self.tun.stage.snapshot().stage == TunStage::Attached
+        // tun-death-gate：running 只反映设备面存活（单飞锁 + 非设备死 + attached），
+        // 单点合成在 TunShared::running（capi 面与对账快照共用同一份）。传输类不健康
+        // （patrol）不再把 running 拉零——2026-10-15 事故的误杀链入口。
+        self.tun.running()
     }
 
     // ---- ⑤ ClientCoreTunStop（tunStopWait）----
