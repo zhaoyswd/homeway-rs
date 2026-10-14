@@ -2,6 +2,10 @@
 
 ## 未发布
 
+- **CLI 简化第一批：删除 `homeway portfwd` 直连命令**（用户指令：除 host add 外 --token 形态对用户无价值）——
+  正式用法 = `homeway forward`；承载面（forward 命令 / 词表 / STREAM[dial]）零变化。依赖盘点确认无工具依赖；
+  `connect --token` / `speedtest --token` / `files --token` / `token 变换` 被 matrix/perf-ab/qi-ab 使用，删除需
+  连带改造三工具（另批）。**README 补 SOCKS5 段**（socks on/off/status）。
 - **CLI 一致性批（全命令排查后修 7 项）**：attach/new 路由修复引出的系统排查——① socks on/off 无主机时的
   退出码 2 → **1**（与其余命令一致）；② `socks status` 认 `--host` 过滤（对齐 forward list，缺省仍列全部）；
   ③ files `--token` 直连形态**尊重 `--timeout`**（此前解析后静默忽略、固定 30s）；④ speedtest 的「还没有添加

@@ -297,11 +297,12 @@ fn numeric_and_bool_flags_failfast() {
     let t = text(&out);
     assert_eq!(out.status.code(), Some(1), "等号形应走直连形态：{t}");
     assert!(t.contains("token 解析失败"), "{t}");
-    // 代码门 M4：portfwd 等号形同样生效（此前死代码 + 未知参数）。
-    let out = raw_cli(&state, &["portfwd", "--token=hmw2xxx", "--map", "15432:5432"]);
+    // portfwd CLI 已删（2026-10-15 简化批：无工具依赖的直连调试缝；正式用法 = forward）——
+    // 未知命令面同样有 failfast 断言价值：exit 2 且给可用命令表。
+    let out = raw_cli(&state, &["portfwd", "--token=hmw2xxx"]);
     let t = text(&out);
-    assert_eq!(out.status.code(), Some(1), "{t}");
-    assert!(t.contains("token 解析失败"), "{t}");
+    assert_eq!(out.status.code(), Some(2), "已删命令应未知命令 exit 2：{t}");
+    assert!(t.contains("不认识的命令 \"portfwd\""), "{t}");
     // 代码门 M4：verb 级布尔显式值被接受（`--force=false` 不再「未知参数」；
     // 走到 token 解码失败 = 证明 get 解析面收下了该形态）。
     let out = cli(&state, &["files", "get", "/tmp/qh-none", "--force=false", "--token=hmw2xxx"]);

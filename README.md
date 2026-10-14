@@ -123,6 +123,18 @@ homeway forward delete --listen 15432
 
 `--target <IP>:<端口>` 可指定出口侧的目标地址（缺省 = 出口自己同端口）。
 
+### SOCKS5 代理
+
+把浏览器或任意支持 SOCKS5 的程序的流量经出口出网（域名在出口侧解析）：
+
+```bash
+homeway socks on --listen 1080     # 本机 127.0.0.1:1080 起 SOCKS5，流量走出口机
+homeway socks status               # 开关态 / 端口 / 连接数
+homeway socks off                  # 关掉
+```
+
+多台主机各开一个端口（`--host <name|id>` 指定），浏览器按端口选走哪个出口。
+
 ## Windows
 
 三角色可用；`term`（终端）不支持。

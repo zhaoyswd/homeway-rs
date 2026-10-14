@@ -557,7 +557,7 @@ pub fn cmd_socks(args: &[String]) {
 fn socks_usage() {
     eprintln!("用法：homeway socks on [--listen 1080]     本机开 SOCKS5 代理（127.0.0.1），流量走出口机");
     eprintln!("      homeway socks off                    关代理");
-    eprintln!("      homeway socks status [--json]        开关态 / 端口 / 连接数");
+    eprintln!("      homeway socks status [--host <ref>] [--json]   开关态 / 端口 / 连接数（--host 过滤）");
     eprintln!("  只有一台主机时不必 --host；多台用 --host <name|id>（每台一个端口，浏览器按端口选出口）。");
 }
 
