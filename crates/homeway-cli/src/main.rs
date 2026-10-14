@@ -62,7 +62,7 @@ fn main() {
         // serve 命令组（start/stop/restart/status/token）= 控制面往返；动词之外的
         // 形态 = 前台单角色（`serve token [list|revoke]` 纯读命令保留直连 state 形态）。
         Some("serve") => match args.get(2).map(String::as_str) {
-            Some("start") | Some("stop") | Some("restart") | Some("status") => {
+            Some("start") | Some("stop") | Some("restart") | Some("status") | Some("grant") => {
                 daemon_cli::cmd_serve_group(&args[2..])
             }
             Some("token") => {

@@ -10,6 +10,7 @@
 #   --version vX.Y.Z   装指定版本（缺省 = 最新 release）
 #   --bin-dir DIR      装到哪（缺省：/usr/local/bin 可写就用它，否则 ~/.local/bin）
 #   --autostart yes|no 是否配置自启动（缺省：交互式询问；非交互 = no）
+  --grant yes|no     预授权 macOS 文件夹访问（缺省：交互式询问；非交互 = 不问只提示）
 set -eu
 
 REPO="zhaoyswd/homeway-rs"
@@ -17,6 +18,7 @@ NAME="homeway"
 VERSION=""
 BIN_DIR=""
 AUTOSTART=""
+GRANT=""
 
 say()  { printf '%s\n' "$*"; }
 die()  { printf '安装失败：%s\n' "$*" >&2; exit 1; }
@@ -185,11 +187,40 @@ UNIT
   fi
 }
 
+autostart_done=no
 if ask_autostart; then
   case "${os_tag}" in
-    darwin) setup_launchd ;;
-    linux)  setup_systemd ;;
+    darwin) setup_launchd && autostart_done=yes ;;
+    linux)  setup_systemd && autostart_done=yes ;;
   esac
+fi
+
+# ---------- 5.5 macOS 文件夹预授权（出口机需要） ----------
+# TCC 弹窗按「负责进程」记录：经控制面让守护自己去访问，授权才记在 homeway 名下。
+# 只有守护在跑（配了自启动 ⇒ launchd 起的）才有意义；CLI 自己拉起的守护授权会记到终端名下。
+ask_grant() {
+  if [ -n "${GRANT}" ]; then
+    [ "${GRANT}" = yes ]; return
+  fi
+  if [ -t 0 ]; then
+    printf '要现在预授权文件夹访问吗？（出口机需要；屏幕上会弹 3 次系统授权窗，请点「允许」）[y/N] '
+    read -r ans || ans=
+    case "${ans}" in y|Y|yes|YES) return 0 ;; *) return 1 ;; esac
+  fi
+  return 1
+}
+if [ "${os_tag}" = darwin ]; then
+  if [ "${autostart_done}" = yes ] && ask_grant; then
+    # 刚 bootstrap 的守护要一两秒起控制面——等 control.sock 出现再 grant
+    i=0
+    while [ ! -S "${HOME}/.config/homeway/control.sock" ] && [ "${i}" -lt 16 ]; do
+      sleep 0.5; i=$((i + 1))
+    done
+    "${dest}" serve grant || say "预授权未完成——稍后可手动执行：homeway serve grant"
+  else
+    say "提示：这台 Mac 作出口时，首次访问「文稿 / 桌面 / 下载」会弹系统授权窗（期间远端命令会像卡住）——"
+    say "      出口机就绪后执行一次 homeway serve grant 预授权（人在屏幕前点几次「允许」，长期有效）。"
+  fi
 fi
 
 # ---------- 6. 常用命令 ----------
@@ -198,6 +229,7 @@ say "装好了。最常用的几条："
 say "  出口机（家里那台）："
 say "    homeway serve start          # 开出口（第一次需要；之后自启动会带起）"
 say "    homeway serve token          # 取凭证，给客户端加主机用"
+say "    homeway serve grant          # macOS：预授权文稿/桌面/下载（首次访问不再弹窗卡住）"
 say "  客户端（电脑 / 手机 App）："
 say "    homeway host add --name home <凭证>   # 加主机（手机 App 里是「添加主机」粘贴同一串）"
 say "    homeway term new work        # 在出口机上开一个终端（Ctrl-b d 分离，attach 回来）"

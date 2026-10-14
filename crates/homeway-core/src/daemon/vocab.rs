@@ -51,6 +51,8 @@ pub enum OpName {
     ServeRestart,
     ServeStatus,
     ServeToken,
+    /// macOS 文件夹授权预触发（出口守护自己访问受保护根 ⇒ 弹窗归属 homeway）。
+    ServeGrant,
     RelayStart,
     RelayStop,
     RelayRestart,
@@ -84,6 +86,7 @@ impl OpName {
             OpName::ServeRestart => "serve.restart",
             OpName::ServeStatus => "serve.status",
             OpName::ServeToken => "serve.token",
+            OpName::ServeGrant => "serve.grant",
             OpName::RelayStart => "relay.start",
             OpName::RelayStop => "relay.stop",
             OpName::RelayRestart => "relay.restart",
@@ -118,6 +121,7 @@ impl OpName {
             "serve.restart" => OpName::ServeRestart,
             "serve.status" => OpName::ServeStatus,
             "serve.token" => OpName::ServeToken,
+            "serve.grant" => OpName::ServeGrant,
             "relay.start" => OpName::RelayStart,
             "relay.stop" => OpName::RelayStop,
             "relay.restart" => OpName::RelayRestart,
@@ -247,6 +251,13 @@ pub const FILES_SERVICE_PORT: u16 = 7802;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// serve.grant 入词表（as_str/parse 往返）。
+    #[test]
+    fn serve_grant_roundtrip() {
+        assert_eq!(OpName::ServeGrant.as_str(), "serve.grant");
+        assert_eq!(OpName::parse("serve.grant"), Some(OpName::ServeGrant));
+    }
 
     #[test]
     fn op_names_roundtrip_full_table() {

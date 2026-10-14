@@ -31,6 +31,10 @@ use std::sync::atomic::{AtomicBool, AtomicI32, AtomicI64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, Weak};
 use std::time::{Duration, Instant};
 
+/// serve.grant 单目录等用户点 TCC 弹窗的预算（用户可能要走到机器前——给足；
+/// 三个目录串行 ⇒ CLI 侧 RPC 预算须 ≥ 3×本值）。
+const GRANT_WAIT_PER_DIR: Duration = Duration::from_secs(120);
+
 use super::bus::{Bus, SubscribeErr, Subscriber};
 use super::frame::{self, FrameError, Op};
 use super::ipc::{IpcListener, IpcStream};
@@ -665,6 +669,15 @@ impl ConnShared {
                 }
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => return,
             };
+            if req.op == vocab::OpName::ServeGrant.as_str() {
+                // serve.grant：探测要等用户点 TCC 弹窗（分钟级）——分流独立线程，
+                // 不占工位串行位（在途计数随本循环 continue 即减，应答经 corr 异步发回）。
+                let conn = Arc::clone(self);
+                let _ = std::thread::Builder::new()
+                    .name("hw-ctl-grant".to_owned())
+                    .spawn(move || conn.op_serve_grant(req.corr));
+                continue;
+            }
             if req.op == vocab::OpName::StreamOpen.as_str() {
                 // stream.open：整条移交拨号执行体（30s 级拨号不占工位串行位——在途
                 // 计数随本调用原子转移：dispatch 不减、拨号收尾减）。
@@ -718,6 +731,7 @@ impl ConnShared {
             O::ServeRestart => self.role_op(req.corr, RoleOp::ServeRestart),
             O::ServeStatus => self.role_op(req.corr, RoleOp::ServeStatus),
             O::ServeToken => self.role_op(req.corr, RoleOp::ServeToken),
+            O::ServeGrant => {} // dispatcher 已分流到 op_serve_grant（理论不可达）
             O::RelayStart => self.role_op(req.corr, RoleOp::RelayStart),
             O::RelayStop => self.role_op(req.corr, RoleOp::RelayStop),
             O::RelayRestart => self.role_op(req.corr, RoleOp::RelayRestart),
@@ -1243,6 +1257,40 @@ impl ConnShared {
 
     fn reply_err(&self, corr: u64, e: OpError) {
         self.reply_json(corr, None, Some(&e));
+    }
+
+    /// `serve.grant`：在**守护进程自己**的进程里触发 macOS 文件夹授权弹窗（TCC 按
+    /// 「负责进程」记录——launchd 起的守护 = homeway 自己；这也是 grant 必须经控制面
+    /// 走、CLI 不在本地直接 read_dir 的原因：终端里跑的子进程授权会记到终端名下）。
+    /// 逐个探测受保护根；弹窗等用户点击（每目录上限 [`GRANT_WAIT_PER_DIR`]）。
+    fn op_serve_grant(&self, corr: u64) {
+        let roots = crate::tcc::protected_roots();
+        if roots.is_empty() {
+            self.reply_json(corr, Some(serde_json::json!({ "unsupported": true })), None);
+            return;
+        }
+        let mut results = Vec::new();
+        for (name, path) in roots {
+            // 串行逐目录：TCC 弹窗一次一个，并行会把三个窗叠着弹
+            let st = crate::tcc::probe_read_dir(&path, GRANT_WAIT_PER_DIR);
+            let status = match st {
+                crate::tcc::GrantStatus::Granted => "granted",
+                crate::tcc::GrantStatus::Denied(_) => "denied",
+                crate::tcc::GrantStatus::Pending => "pending",
+            };
+            (self.srv.logf)(&format!(
+                "tcc: {}（{}）→ {status}{}",
+                name,
+                path.display(),
+                if status == "pending" { "（弹窗等待超预算——点掉后重跑 serve grant 即收尾）" } else { "" }
+            ));
+            results.push(serde_json::json!({
+                "name": name,
+                "path": path.display().to_string(),
+                "status": status,
+            }));
+        }
+        self.reply_json(corr, Some(serde_json::json!({ "unsupported": false, "results": results })), None);
     }
 
     // ---------- writer（唯一 socket 写者，优先级排空） ----------

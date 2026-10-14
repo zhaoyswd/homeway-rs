@@ -1006,7 +1006,7 @@ pub fn cmd_status(args: &[String]) {
 
 pub fn cmd_serve_group(args: &[String]) {
     let Some(verb) = args.first() else {
-        eprintln!("serve 命令组需要动词：start / stop / restart / status / token / relay / ddns");
+        eprintln!("serve 命令组需要动词：start / stop / restart / status / token / grant / relay / ddns");
         std::process::exit(2);
     };
     let op = match verb.as_str() {
@@ -1018,10 +1018,18 @@ pub fn cmd_serve_group(args: &[String]) {
         // Q-H F8/CA13：裸名词 --help 短路（此前落「不认识的动词」exit 2）。
         "--help" | "-h" => {
             eprintln!("用法：homeway serve start|stop|restart|status|token    出口的启停 / 状态 / 取凭证");
+            eprintln!("      homeway serve grant                              预授权文件夹访问（仅 macOS）");
             eprintln!("      homeway serve relay set <凭证>|clear             配置 / 清除中继");
             eprintln!("      homeway serve ddns add|delete <域名> | list      配置 DDNS 域名");
             eprintln!("  改配置的项 restart 后生效。");
             std::process::exit(0);
+        }
+        // macOS TCC 预授权（2026-10-14）：守护进程自己触发「文稿/桌面/下载」的授权弹窗——
+        // 必须经控制面让 launchd 起的守护去访问（弹窗按负责进程记录，终端里跑的 CLI
+        // 自己去碰会把授权记到终端名下、对守护无效）。
+        "grant" => {
+            cli_serve_grant(&args[1..]);
+            return;
         }
         // 一次性直跑（纯文件操作——servegroup_cli.go「serve relay set/clear 与 ddns」
         // 同框：写完打「需 restart 生效」提示）。
@@ -1038,6 +1046,7 @@ pub fn cmd_serve_group(args: &[String]) {
     let state = p.state.clone();
     if op == vocab::OpName::ServeToken {
         token_reveal_with_fallback(&state, op);
+        grant_hint_once(&state);
         return;
     }
     // 纯读/直改族不拉起（中-5——Go dialGroupRead/roleStopCLI：status 未跑 = 降级
@@ -1073,6 +1082,87 @@ pub fn cmd_serve_group(args: &[String]) {
     let v = c.request(op.as_str(), Some(serde_json::json!({})), TIMEOUT).unwrap_or_else(|e| exit_op_err(&e));
     // （start/restart 的应答面；status/stop 已在纯读/直改分支提前返回。）
     println!("serve：{}", v["action"].as_str().unwrap_or("?"));
+    grant_hint_once(&state);
+}
+
+/// `homeway serve grant`：经控制面让**守护进程自己**触发 macOS 文件夹授权弹窗。
+/// 守护未运行时**不自动拉起**（CLI 拉起的守护是终端的子进程，TCC 会把授权记到终端
+/// 名下、对 launchd 起的出口无效）——给引导文案。
+fn cli_serve_grant(args: &[String]) {
+    let p = parse_args("serve grant [--state DIR]", args);
+    let state = p.state.clone();
+    #[cfg(not(target_os = "macos"))]
+    {
+        println!("本命令只在 macOS 需要（其它系统没有文件夹授权）");
+        let _ = state;
+        return;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        let Some(c) = try_dial_control_named(&state, "homeway-serve") else {
+            eprintln!("守护进程未在运行——预授权需要记在 homeway 名下才能对出口生效：");
+            eprintln!("  先让守护跑起来（装了自启动：打开它；或 homeway serve start），再执行 homeway serve grant");
+            std::process::exit(1);
+        };
+        println!("即将触发系统授权弹窗（文稿 / 桌面 / 下载，最多 3 次）——请在屏幕上点『允许』…");
+        let budget = Duration::from_secs(6 * 60 + 30); // 守护侧每目录等 120s、三目录串行
+        let v = c.request(vocab::OpName::ServeGrant.as_str(), Some(serde_json::json!({})), budget)
+            .unwrap_or_else(|e| exit_op_err(&e));
+        if v["unsupported"].as_bool().unwrap_or(false) {
+            println!("本命令只在 macOS 需要（其它系统没有文件夹授权）");
+            return;
+        }
+        let mut all = true;
+        if let Some(list) = v["results"].as_array() {
+            for r in list {
+                let name = r["name"].as_str().unwrap_or("?");
+                match r["status"].as_str().unwrap_or("?") {
+                    "granted" => println!("  {name}：已授权 ✓"),
+                    "denied" => {
+                        all = false;
+                        println!("  {name}：被拒绝——可在 系统设置 → 隐私与安全性 → 文件与文件夹 里改；或直接在「完全磁盘访问」里添加 homeway");
+                    }
+                    _ => {
+                        all = false;
+                        println!("  {name}：弹窗还在等（预算 2 分钟内没点）——点掉后重跑 homeway serve grant 即收尾");
+                    }
+                }
+            }
+        }
+        if all {
+            mark_grant_hinted(&state);
+            println!("预授权完成——files / term 访问这些目录不会再弹窗、远端不会再像卡住");
+        }
+    }
+}
+
+/// grant 首次提示标记（`<state>/cache/grant-hinted`）：`serve token` / `serve start`
+/// 的提示只打一次，grant 完成后也不再提示。
+fn grant_hint_marker(state: &std::path::Path) -> std::path::PathBuf {
+    state.join("cache").join("grant-hinted")
+}
+
+fn mark_grant_hinted(state: &std::path::Path) {
+    let _ = std::fs::create_dir_all(state.join("cache"));
+    let _ = std::fs::write(grant_hint_marker(state), b"\n");
+}
+
+/// macOS 上首次给出 grant 提示（之后静音）。挂在 `serve token` 的 token 之后与
+/// `serve start` 的输出之后——用户拿 token / 起出口的那一眼。
+fn grant_hint_once(state: &std::path::Path) {
+    #[cfg(target_os = "macos")]
+    {
+        if grant_hint_marker(state).exists() {
+            return;
+        }
+        mark_grant_hinted(state);
+        eprintln!("提示：出口首次访问「文稿 / 桌面 / 下载」会弹系统授权窗，期间远端命令会像卡住——");
+        eprintln!("      现在执行 `homeway serve grant` 可预授权（人在出口机前点几次『允许』，一次长期有效）");
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = state;
+    }
 }
 
 /// serve.status 的渲染单实现（中-5 收敛：在线/拉起两路共用）。

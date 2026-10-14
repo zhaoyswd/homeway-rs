@@ -58,6 +58,7 @@ pub mod server;
 pub mod session_lock;
 pub mod speedtest;
 pub mod speedtest_server;
+pub mod tcc;
 /// 栈 B（smoltcp 用户态栈）：`TunDevice`（`phy::Device`）+ `StackB` + `MTU`。
 ///
 /// M5 S0 迁址（设计 §1.2-M2）→ M5 C3 后**唯一消费者 = 出口 intercept**（生产面
