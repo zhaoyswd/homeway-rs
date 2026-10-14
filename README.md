@@ -14,21 +14,19 @@
 
 ## 安装
 
-发版产物在 [Releases](https://github.com/zhaoyswd/homeway-rs/releases)：`homeway-<版本>-<平台>.tar.gz`
-（Windows = `.zip`）+ `SHA256SUMS`。平台名：`darwin-arm64` / `darwin-amd64` / `linux-amd64` /
-`linux-arm64` / `windows-amd64`。
+一条命令（macOS / Linux）：自动识别系统、下载最新版并校验、装进 bin 目录、询问是否开机自启动：
 
 ```bash
-# 以 v0.3.4、darwin-arm64 为例（版本与平台按需替换）
-curl -LO https://github.com/zhaoyswd/homeway-rs/releases/download/v0.3.4/homeway-v0.3.4-darwin-arm64.tar.gz
-curl -LO https://github.com/zhaoyswd/homeway-rs/releases/download/v0.3.4/SHA256SUMS
-grep darwin-arm64 SHA256SUMS | shasum -a 256 -c -
-tar xzf homeway-v0.3.4-darwin-arm64.tar.gz
-sudo install -m 0755 homeway /usr/local/bin/homeway     # 装进系统 PATH
-homeway --version
+curl -fsSL https://raw.githubusercontent.com/zhaoyswd/homeway-rs/main/install.sh | sh
 ```
 
-Windows：解压 `.zip`，把 `homeway.exe` 放进 PATH 内的目录。
+`curl | sh` 形态无交互、不会配自启动；要配的话下载后带参跑：`sh install.sh --autostart yes`
+（其它参数：`--version vX.Y.Z` 装指定版本、`--bin-dir DIR` 指定目录；缺省 `/usr/local/bin`
+可写就用它，否则 `~/.local/bin`）。装完会打印最常用的几条命令。
+
+手动安装：到 [Releases](https://github.com/zhaoyswd/homeway-rs/releases) 取 `homeway-<版本>-<平台>.tar.gz`
+（平台：`darwin-arm64` / `darwin-amd64` / `linux-amd64` / `linux-arm64`；Windows 为 `.zip`），
+`SHA256SUMS` 校验后把 `homeway` 放进 PATH 内的目录（macOS 若提示无法打开，先 `xattr -c homeway`）。
 
 从源码构建：`cargo build --release`（产物 `target/release/homeway`；工具链见 `rust-toolchain.toml`）。
 
@@ -43,8 +41,8 @@ homeway relay                           # 前台单中继
 启动参数写在配置文件里，之后零参启动即可：
 
 ```bash
-homeway serve --listen 41641                            # 起出口
-homeway relay --listen :41741 --advertise <公网IP>:41741   # 起中继（对外公告地址）
+homeway serve --listen 38241                            # 起出口
+homeway relay --listen :38341 --advertise <公网IP>:38341   # 起中继（对外公告地址）
 homeway relay token                                     # 取中继凭据 rl1…（出口侧 --relay 用它）
 homeway serve --relay '<rl1…>'                          # 出口经该中继可达（打不通直连时走它）
 ```
@@ -57,7 +55,7 @@ homeway serve --relay '<rl1…>'                          # 出口经该中继�
 ```toml
 [serve]
 enabled = true
-listen = 41641
+listen = 38241
 files_root = "/srv/files"      # 可选：文件服务根目录
 relay = "rl1…"                 # 可选：中继凭据
 [[serve.ddns]]
