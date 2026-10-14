@@ -645,6 +645,8 @@ struct SessRt {
     nudge_dropped: Arc<AtomicU64>,
     /// `RESIZE 0×0` 忽略计数（F1a 的 0 值面观测；节流日志用）。
     zero_resize_ignored: u64,
+    /// 非 active 腿应答丢弃计数（应答让位收窄到 active 腿；节流日志用）。
+    replies_dropped: u64,
     /// surface 唤醒（pump/attach → 投递线程；u32 代数 + Condvar）。
     surf_wake: Arc<(Mutex<u32>, Condvar)>,
     /// 剪贴板写投递（vt 事件面 → surface 投递线程；只发 surface 腿）。
@@ -1338,7 +1340,7 @@ impl TermService {
             };
             match f.op {
                 Op::DATA => {
-                    let pty = {
+                    let (pty, discard_reply) = {
                         let mut st = self.lock_state();
                         // 非用户操作的自动上行不记活动：① `?1003` hover 流（鼠标划过
                         // 窗口不点击）；② 终端应答（本地终端对程序查询的自动回投——
@@ -1347,9 +1349,9 @@ impl TermService {
                         // out/in 经两条腿上行、到达顺序不保证，out 记活动会在乱序时
                         // 把几何翻回刚离开的窗口）。三者都不搬几何、不动 active
                         // （判定保守，识别不出的字节按真输入照记；判据变更已登记）。
-                        // 字节照常透传：程序（hover 高亮/查询消费/焦点响应）不受影响。
+                        let is_reply = pure_terminal_reply(&f.payload);
                         let sz = if pure_mouse_motion(&f.payload)
-                            || pure_terminal_reply(&f.payload)
+                            || is_reply
                             || pure_focus_out(&f.payload)
                         {
                             None
@@ -1362,6 +1364,22 @@ impl TermService {
                         // 读循环可能还有在途帧）
                         if !rt.legs.iter().any(|l| l.key == key) {
                             return;
+                        }
+                        // 应答让位收窄到 active 腿（判据变更 2026-10-14）：多 raw 腿
+                        // 在场时程序的每次查询会收到多个矛盾答案（两套颜色/像素尺寸/
+                        // 能力表，程序取哪个取决于到达顺序）——**非 active 腿的纯应答
+                        // 帧丢弃**（不写 PTY），active 腿照常透传；hover/focus-out
+                        // 不丢（程序需要焦点/悬停事件，丢弃破坏其状态）。已知代价：
+                        // 查询与应答间 active 切换时该轮查询程序侧超时（TUI 有降级）。
+                        let discard_reply = is_reply && active != Some(key);
+                        if discard_reply {
+                            rt.replies_dropped += 1;
+                            let n = rt.replies_dropped;
+                            if n <= 3 || n.is_multiple_of(100) {
+                                self.logf(&format!(
+                                    "term: 会话 {name} 丢弃非活动腿应答 {n} 次（多腿应答竞态防护）"
+                                ));
+                            }
                         }
                         apply_active_theme_locked(rt, active);
                         if let Some(sz) = sz {
@@ -1376,8 +1394,11 @@ impl TermService {
                             apply_size_locked(rt, sz);
                             self.sentinel_repaint_locked(rt);
                         }
-                        Arc::clone(&rt.pty)
+                        (Arc::clone(&rt.pty), discard_reply)
                     };
+                    if discard_reply {
+                        continue; // 非 active 腿的应答已丢弃（锁内计数 + 节流日志）
+                    }
                     if !f.payload.is_empty() && !pty.write_input(&f.payload) {
                         return; // PTY 写失败：收尾走 client_closed 同款摘腿
                     }
@@ -1835,6 +1856,7 @@ impl TermService {
             clip_dropped: Arc::new(AtomicU64::new(0)),
             nudge_dropped: Arc::new(AtomicU64::new(0)),
             zero_resize_ignored: 0,
+            replies_dropped: 0,
             surf_wake: Arc::new((Mutex::new(0), Condvar::new())),
             clip_tx,
             stopped: Arc::new(AtomicBool::new(false)),
@@ -4940,6 +4962,99 @@ mod tests {
 
     fn find_last(hay: &[u8], needle: &[u8]) -> Option<usize> {
         hay.windows(needle.len()).rposition(|w| w == needle)
+    }
+
+    /// 应答让位收窄到 active 腿：多 raw 腿在场时，程序的每次查询只应收到
+    /// **active 腿**的应答（双腿应答 = 矛盾答案，程序取哪个取决于到达顺序）。
+    /// 程序 = 后台子 shell 周期发 DA 查询（模拟 TUI 重画查询）+ 前台 perl 逐字节
+    /// hexdump 上行（观测「什么进了 PTY」——应答 `\x1b[?62c` 进 PTY 会在下行流
+    /// 里出现它的 hex 文本 `1b5b3f363263`）。修前：双腿应答都进（每轮 2 份）；
+    /// 修后：只 active 的进（每轮 1 份）。hover/focus-out 不在丢弃面。
+    #[test]
+    fn reply_only_from_active_leg_reaches_pty() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let cfg = TermConfig {
+            shell: Some(
+                // stty raw -echo：真 TUI 的形态（无行规程缓冲/无回显）——canonical 下
+                // perl 的 sysread 等不到换行（应答无 \n）永远阻塞。
+                "stty raw -echo; (while :; do printf '\\033[c'; sleep 0.3; done) & \
+                 exec perl -e '$|=1; while (sysread(STDIN,$x,1)) { printf \"%02x\", ord($x) }'"
+                    .into(),
+            ),
+            ..TermConfig::default()
+        };
+        let svc = svc_with(cfg, Arc::clone(&lines));
+        let (ln, path) = start_listener();
+        {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || svc.serve(ln));
+        }
+        struct KillOnDrop(Arc<TermService>);
+        impl Drop for KillOnDrop {
+            fn drop(&mut self) {
+                self.0.close();
+            }
+        }
+        let _kill = KillOnDrop(Arc::clone(&svc));
+        // 读下行到「见到 DA 查询即回投应答」（模拟本地终端）；其它帧累积返回。
+        fn answer_da_collect(c: &mut Client, ms: u64, acc: &mut Vec<u8>) {
+            let deadline = Instant::now() + Duration::from_millis(ms);
+            loop {
+                let left = deadline.saturating_duration_since(Instant::now());
+                if left.is_zero() {
+                    return;
+                }
+                match c.io.read_frame_deadline(left.max(Duration::from_millis(10))) {
+                    Ok(f) => {
+                        if f.op == Op::DATA {
+                            acc.extend_from_slice(&f.payload);
+                            if has_bytes(&f.payload, b"\x1b[c") {
+                                c.send(Op::DATA, b"\x1b[?62c");
+                                return;
+                            }
+                        }
+                    }
+                    Err(_) => return,
+                }
+            }
+        }
+        let mut a = Client::connect(&path);
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "ra-a");
+        a.send(Op::HELLO, &frames::enc_hello(120, 30, hello_flags::CREATE, "t-ractive", &tail));
+        a.expect(Op::ATTACHED, 5);
+        a.expect(Op::REPLAY_DONE, 5);
+        let mut b = Client::connect(&path);
+        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "ra-b");
+        b.send(Op::HELLO, &frames::enc_hello(80, 24, 0, "t-ractive", &tail_b));
+        b.expect(Op::ATTACHED, 5);
+        // B 接入即活动 ⇒ active=B；两轮查询-应答，A、B 都应答。
+        // b 的收流用独立 buf（PTY 输出双腿各一份——混进 a_flow 会把同一份应答数两次）
+        let mut a_flow = Vec::new();
+        let mut b_flow = Vec::new();
+        for _ in 0..2 {
+            answer_da_collect(&mut a, 2000, &mut a_flow);
+            answer_da_collect(&mut b, 2000, &mut b_flow);
+        }
+        // 收尾窗口：perl 的 hex 输出（应答进了 PTY 的证据）到达双腿
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while Instant::now() < deadline {
+            match a.io.read_frame_deadline(Duration::from_millis(200)) {
+                Ok(f) if f.op == Op::DATA => a_flow.extend_from_slice(&f.payload),
+                Ok(_) => continue,
+                Err(_) => break,
+            }
+        }
+        // hex 文本 `1b5b3f363263` = 一条应答进了 PTY；两轮应恰 2 份（修前 4 份）
+        let needle = b"1b5b3f363263";
+        let count = a_flow.windows(needle.len()).filter(|w| *w == needle).count();
+        let srv_logs = lines.lock().unwrap_or_else(|e| e.into_inner()).join(" | ");
+        let queries = a_flow.windows(3).filter(|w| *w == b"\x1b[c").count();
+        assert_eq!(
+            count, 2,
+            "进 PTY 的应答份数应为轮数（只 active 腿），实测 {count} 份（查询 {queries} 次）；服务日志：{srv_logs}；流：{:?}",
+            String::from_utf8_lossy(&a_flow)
+        );
+        drop(b);
     }
 
     /// 焦点乱序不翻几何（macOS 焦点切换 = 旧窗口 focus-out + 新窗口 focus-in，
