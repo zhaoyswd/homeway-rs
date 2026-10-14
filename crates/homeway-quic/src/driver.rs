@@ -1571,12 +1571,13 @@ fn ladder_step(
                     lock_unpoison(&ctx.snapshot).migration_unconfirmed = true;
                     st.watch = None;
                 }
-                // R 的候选 = **现任端点**（§3.1「同端点、同本地 socket」）；无现任
-                // （理论窗口：未采纳过连接）⇒ 回落「最近一次 SetCandidates」清单。
-                let list: Vec<Candidate> = match st.ladder_cand {
-                    Some(c) => vec![c],
-                    None => st.cands.clone(),
-                };
+                // R 的候选 = **现任端点优先 + 名册其余**（2026-10-14 改裁）。§3.1 原文
+                // 「同端点、同本地 socket」的单候选 R 在 QUIC-ROADMAP 已登记为「窗口结构性
+                // 无作用」的未动面，承接方（世代重建重赛跑）在宿主会话路径并不存在——
+                // 局域网路径瞬断（发送面 EHOSTUNREACH）时公网直连 / 中继仍可用，单候选 R
+                // 连败 16 次直到 B 门（MacBook Pro 实测）。全名册 + 直连优先窗口照旧：
+                // 现任端点仍是首个直连候选，健康场景的行为不变。
+                let list: Vec<Candidate> = reconnect_candidates(&st.cands, st.ladder_cand);
                 if list.is_empty() {
                     // 无候选可拨（未采纳过连接且未 SetCandidates）：按 R 失败回灌 ⇒ B 门照走
                     step = st.ladder.on_reconnect_result(
@@ -1615,11 +1616,47 @@ fn ladder_step(
                 (*ctx.logf)(&format!(
                     "快探阶梯走完 M/R（连续重连失败 {r_fails}，原因={why}）—— 上报不健康（交世代重建）"
                 ));
+                // 僵尸连接收口（2026-10-14 MacBook Pro 实测）：走到 B 的现任连接多半是
+                // 「发送面报错但 QUIC 未判死」的半死态——不关，后续 `StreamOpen` 仍会在
+                // 它上面「成功」开流、一个字节不流（CLI 一次性操作永久挂）。显式关 +
+                // 在册服务流按 EOF 收 ⇒ 开流立刻 `ConnectionLost`、调用方按需重开；
+                // 重建（上层重赛跑 `Cmd::Connect`）成功后 `adopt` 复活阶梯。
+                drop_zombie_live(st, ctx);
                 ctx.unhealthy(REASON_PATROL);
                 return;
             }
         }
     }
+}
+
+/// R（重连）的候选集：现任端点优先，名册其余去重后跟上（2026-10-14 改裁，见
+/// `ladder_step` 的 Reconnect 臂注释）。无名册 ⇒ 只有现任；无现任 ⇒ 名册原样。
+fn reconnect_candidates(roster: &[Candidate], current: Option<Candidate>) -> Vec<Candidate> {
+    let mut list: Vec<Candidate> = Vec::with_capacity(roster.len() + 1);
+    if let Some(c) = current {
+        list.push(c);
+    }
+    for c in roster {
+        if !list.contains(c) {
+            list.push(*c);
+        }
+    }
+    list
+}
+
+/// B 门前的僵尸连接收口：关现任连接、在册服务流按 EOF 收、清同连接态
+/// （与 `housekeeping` 的「连接已断」分支同形，但那条只在 QUIC 自己判死时走——
+/// 半死态连接到不了那里）。
+fn drop_zombie_live(st: &mut DriverState, ctx: &IslandCtx) {
+    let Some(old) = st.live.take() else { return };
+    let n = st.streams.clear_on_connection_loss();
+    old.conn.close(quinn::VarInt::from_u32(0), b"island rebuild");
+    (*ctx.logf)(&format!(
+        "世代重建前收口 —— 现任连接已关、{n} 条在册服务流按 EOF 收（调用方按需重开）"
+    ));
+    st.watch = None;
+    st.pump_conn = None;
+    st.snap_sync_last = None;
 }
 
 /// 记一次丢弃（四类计数 + N-c 行 + 事件回调；`ext` = 本次明细里的包长/条数补充）。
@@ -1878,5 +1915,26 @@ mod guard_job_tests {
     fn normal_completion_passes_through() {
         let job = rt().block_on(guard_job(PanickedJob::Stream, async { Job::StreamDone }));
         assert!(matches!(job, Job::StreamDone));
+    }
+}
+
+#[cfg(test)]
+mod reconnect_candidates_tests {
+    use super::*;
+    use std::net::{Ipv4Addr, SocketAddrV4};
+
+    fn c(port: u16, via: Via) -> Candidate {
+        Candidate { addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), via }
+    }
+
+    /// R 候选集：现任优先、名册去重跟上；无现任 = 名册；无名册 = 只有现任。
+    #[test]
+    fn current_first_then_roster_deduped() {
+        let roster = vec![c(1, Via::Direct), c(2, Via::Direct), c(3, Via::Relay { label: [0; 8] })];
+        let got = reconnect_candidates(&roster, Some(c(2, Via::Direct)));
+        assert_eq!(got, vec![c(2, Via::Direct), c(1, Via::Direct), c(3, Via::Relay { label: [0; 8] })]);
+        assert_eq!(reconnect_candidates(&roster, None), roster, "无现任 = 名册原样");
+        assert_eq!(reconnect_candidates(&[], Some(c(9, Via::Direct))), vec![c(9, Via::Direct)], "无名册 = 只有现任");
+        assert!(reconnect_candidates(&[], None).is_empty());
     }
 }

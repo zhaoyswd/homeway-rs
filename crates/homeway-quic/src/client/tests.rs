@@ -3156,3 +3156,114 @@ async fn stream_bulk_echo_throughput_is_calibration_evidence() {
     assert!(island.stop_within(Instant::now() + BUDGET));
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
+
+/// 2026-10-14 MacBook Pro 实测缺陷的岛侧回归（三合一）：
+/// ① **R 投全名册**：名册 = 现任 + 一个死端口候选 ⇒ 重连赛跑的「赛跑小结」须报「候选 2 个」
+///    （修前 R 只投现任端点 = 「候选 1 个」，局域网路径瞬断时公网直连/中继永远用不上）；
+/// ② **B 后开流快速失败**：走到 B 门后 `StreamOpen` 立即 `ConnectionLost`（修前半死连接上
+///    能开流、一个字节不流 ⇒ CLI 永久挂）；
+/// ③ **B 后 `Cmd::Connect` 能重建**：上层（宿主会话重建循环）发全名册 Connect ⇒ 采纳新
+///    连接、阶梯复活（修前 B 之后岛 dormant、宿主会话置 failed 终态、无人重赛跑）。
+/// 终局窗 25s 与 `connection_death_goes_to_the_ladder_instead_of_unhealthy` 同口径。
+#[tokio::test]
+async fn ladder_exhaustion_then_connect_rebuilds_and_r_uses_roster() {
+    let quic = exit_face(26);
+    let stub = Stub::new();
+    let (on_unhealthy, reasons) = unhealthy_sink();
+    let (logf, logs) = sink();
+    let island = Island::start(
+        logf,
+        on_unhealthy,
+        island_cfg(Duration::from_secs(60), quic.rpk_public_key()),
+    )
+    .expect("岛可起");
+    let (tun, _peer) = tun_pair();
+    assert!(matches!(attach(&island, tun.as_raw_fd(), 1280, BUDGET), Ok(())));
+    let addr = connect_direct(&island, &stub, &quic).await;
+    assert_eq!(stub.accepted(), 1);
+    // 名册：现任 + 死端口（UDP 9 无人听 ⇒ 永不完成握手；只为钉「候选 2 个」）
+    let dead = SocketAddrV4::new(*addr.ip(), 9);
+    island
+        .tx()
+        .send(Cmd::SetCandidates {
+            cands: vec![direct(addr), direct(dead)],
+        })
+        .expect("更新候选");
+
+    // 出口摘绑定 ⇒ 连接死 ⇒ 阶梯 R（桩不被驱动 ⇒ R 必败）⇒ B 门（≤25s）
+    quic.unbind_pub(&PUBKEY);
+    let deadline = Instant::now() + Duration::from_secs(25);
+    let mut reason = None;
+    while Instant::now() < deadline {
+        if let Some(r) = wait_reason(&reasons, Duration::from_millis(50)).await {
+            reason = Some(r);
+            break;
+        }
+    }
+    assert_eq!(reason.as_deref(), Some("patrol"), "阶梯耗尽须经 B 上报不健康（patrol）");
+
+    // ① R 全名册：至少一次重连赛跑的结算/小结行报「候选 2 个」（本桩 QUIC 端点仍活、
+    //    只摘了绑定 ⇒ QUIC 层能握手、准入失败 ⇒ 走「赛跑结算：胜出…（候选 2 个」；真网断
+    //    形态走「赛跑小结：无胜者（候选 2 个」——两形都算）
+    let lines = logs_until(&logs, "快探阶梯走完", Duration::from_millis(500)).await;
+    let race_lines: Vec<&String> = lines.iter().filter(|l| l.contains("赛跑")).collect();
+    let roster_r = race_lines.iter().any(|l| l.contains("候选 2 个"));
+    assert!(
+        roster_r,
+        "重连赛跑须投全名册（候选 2 个），实得：{:?}",
+        race_lines.iter().take(4).collect::<Vec<_>>()
+    );
+
+    // ② B 后开流快速失败（live 已清 ⇒ ConnectionLost，不挂）
+    let t0 = Instant::now();
+    let (otx, orx) = channel();
+    island
+        .tx()
+        .send(Cmd::StreamOpen {
+            tag: crate::StreamTag::Probe,
+            reply: otx,
+        })
+        .expect("命令投递");
+    let r = loop {
+        match orx.try_recv() {
+            Ok(v) => break v,
+            Err(TryRecvError::Disconnected) => panic!("岛已退出"),
+            Err(TryRecvError::Empty) => {}
+        }
+        assert!(t0.elapsed() < Duration::from_secs(3), "B 后开流须快速失败（3s 未回执）");
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    };
+    assert!(
+        t0.elapsed() < Duration::from_secs(2),
+        "B 后开流须快速失败而非等 open_bi 预算（{:?}）",
+        t0.elapsed()
+    );
+    assert!(
+        matches!(r, Err(crate::stream::StreamErr::ConnectionLost)),
+        "B 后现任连接已收口，开流须 ConnectionLost（实得 {r:?}）"
+    );
+
+    // ③ 上层重建：驱动桩重新受理 + 全名册 Connect ⇒ 采纳新连接、阶梯复活
+    let o = send_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::Connect {
+            cands: vec![direct(addr), direct(dead)],
+            budget: WAIT,
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .expect("B 之后 Cmd::Connect 全名册重建须成功");
+    assert_eq!(o.winner, addr, "胜出者 = 活着的那个候选");
+    assert_eq!(island.snapshot().connections, 1, "重建后持有 1 条连接");
+    assert!(stub.accepted() >= 2, "重建 = 新连接新准入（桩受理至少 +1；R 期间的握手也会计入）");
+    assert!(
+        wait_reason(&reasons, Duration::from_millis(300)).await.is_none(),
+        "重建成功后不得再报不健康"
+    );
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}

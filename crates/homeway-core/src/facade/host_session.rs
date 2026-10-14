@@ -76,6 +76,10 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const STOP_WAIT: Duration = Duration::from_secs(6);
 /// 岛侧赛跑预算（覆盖 LAN/中继握手 + `hr-reg4` 四帧准入；与 `tun_exec` 同值）。
 const CONNECT_BUDGET: Duration = Duration::from_secs(5);
+/// 世代重建退避：首次 1s，每败 ×2，上限 30s（2026-10-14：岛内阶梯走完 B 门后由本层
+/// 重赛跑全名册接棒——此前上报不健康只置 failed 终态、永不恢复）。
+const REBUILD_BACKOFF_MIN: Duration = Duration::from_secs(1);
+const REBUILD_BACKOFF_MAX: Duration = Duration::from_secs(30);
 /// 岛命令的有界等待预算（岛内短路径；超时 = 异常）。
 const RPC_BUDGET: Duration = Duration::from_secs(5);
 
@@ -310,6 +314,12 @@ struct Inner {
     logf: Logf,
     /// 巡检线程柄（有界 join）。
     patrol: Mutex<Option<std::thread::JoinHandle<()>>>,
+    /// 候选名册（token 端点派生；世代重建重赛跑用——与初次建连同一份）。
+    cands: Vec<homeway_quic::Candidate>,
+    /// 世代重建线程在跑（单飞：岛可能连发多次不健康上报）。
+    rebuilding: AtomicBool,
+    /// 重建线程柄（收工时有界 join）。
+    rebuild: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
 /// 宿主会话句柄（单实例 + `&self`；`Arc<HostSession>` 供桥/承载面共享）。
@@ -394,6 +404,9 @@ impl HostSession {
             }),
             logf: Arc::clone(&logf),
             patrol: Mutex::new(None),
+            cands: cands.clone(),
+            rebuilding: AtomicBool::new(false),
+            rebuild: Mutex::new(None),
         });
 
         let island = start_island(&cfg.token, &ident, &cands, &inner)?;
@@ -538,6 +551,11 @@ impl HostSession {
                 (self.inner.logf)("收工等待巡检线程超时（STOP_WAIT）——放行自退");
             }
         }
+        if let Some(h) = crate::syncutil::lock_unpoison(&self.inner.rebuild).take() {
+            if !crate::syncutil::join_bounded(h, deadline) {
+                (self.inner.logf)("收工等待重建线程超时（STOP_WAIT）——放行自退");
+            }
+        }
         let island = crate::syncutil::lock_unpoison(&self.inner.island).take();
         self.inner.gen.fetch_add(1, Ordering::Release);
         if let Some(i) = island {
@@ -617,6 +635,9 @@ impl HostSession {
             }),
             logf,
             patrol: Mutex::new(None),
+            cands: Vec::new(),
+            rebuilding: AtomicBool::new(false),
+            rebuild: Mutex::new(None),
         });
         HostSession { inner }
     }
@@ -714,11 +735,7 @@ fn start_island(
     let w = Arc::downgrade(inner);
     let on_unhealthy: homeway_quic::OnUnhealthy = Arc::new(move |reason: &str| {
         if let Some(i) = w.upgrade() {
-            // 岛内阶梯已走完 M/R（B 门）或 `fd`/`panic` ⇒ 如实置 State（不谎报 ready）。
-            (i.logf)(&format!(
-                "⚠️ 宿主会话不健康（{reason}）——岛内阶梯已尽力；本会话状态置 failed"
-            ));
-            set_state(&i, SessState::Failed, &format!("岛不健康（{reason}）"));
+            on_island_unhealthy(&i, reason);
         }
     });
     let island = Island::start(Arc::clone(&inner.logf), on_unhealthy, icfg)
@@ -728,8 +745,7 @@ fn start_island(
     let w2 = Arc::downgrade(inner);
     let h: homeway_quic::OnUnhealthy = Arc::new(move |reason: &str| {
         if let Some(i) = w2.upgrade() {
-            (i.logf)(&format!("⚠️ 宿主会话不健康（{reason}）"));
-            set_state(&i, SessState::Failed, &format!("岛不健康（{reason}）"));
+            on_island_unhealthy(&i, reason);
         }
     });
     let _ = island.tx().send(Cmd::SetOnUnhealthy { h });
@@ -737,6 +753,115 @@ fn start_island(
         cands: cands.to_vec(),
     });
     Ok(island)
+}
+
+// ---------- 世代重建（B 门之后的恢复接棒） ----------
+
+/// 岛上报不健康：如实置 failed（不谎报 ready）+ **起世代重建**（2026-10-14 起）。
+/// 此前只置 failed 终态——岛内阶梯 B 之后 `dormant`、宿主会话无人重赛跑，网络早已恢复
+/// 会话却永久 failed（MacBook Pro 实测：Wi-Fi 瞬断 10 s 后 7 分钟零重连）。
+fn on_island_unhealthy(inner: &Arc<Inner>, reason: &str) {
+    (inner.logf)(&format!(
+        "⚠️ 宿主会话不健康（{reason}）——岛内阶梯已尽力；本会话状态置 failed，起世代重建"
+    ));
+    set_state(inner, SessState::Failed, &format!("岛不健康（{reason}）；自动重连中"));
+    spawn_rebuild(inner);
+}
+
+/// 单飞起重建线程（已在跑 / 已收工 ⇒ 不重复）。
+fn spawn_rebuild(inner: &Arc<Inner>) {
+    if inner.stop.load(Ordering::SeqCst) || inner.rebuilding.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let sh = Arc::clone(inner);
+    match std::thread::Builder::new()
+        .name("homeway-host-rebuild".into())
+        .spawn(move || rebuild_loop(sh))
+    {
+        Ok(h) => *crate::syncutil::lock_unpoison(&inner.rebuild) = Some(h),
+        Err(e) => {
+            inner.rebuilding.store(false, Ordering::SeqCst);
+            crate::syncutil::log_spawn_failed(
+                &inner.logf,
+                "宿主会话重建线程",
+                &e,
+                "本会话停在 failed（无人重赛跑）——重启守护进程可恢复",
+            );
+        }
+    }
+}
+
+/// 退避序列：1s → 2s → 4s → … 封顶 30s（纯函数，单测钉）。
+fn next_backoff(cur: Duration) -> Duration {
+    (cur * 2).min(REBUILD_BACKOFF_MAX)
+}
+
+/// 重建循环：退避 → 全名册重赛跑（`Cmd::Connect`，与初次建连同一条路）→ 成功置 ready
+/// 并退出；失败退避加倍再试，直到收工或岛本体已不可用（`Gone`/`EngineGone` = 终态）。
+fn rebuild_loop(inner: Arc<Inner>) {
+    let mut attempt: u32 = 0;
+    let mut backoff = REBUILD_BACKOFF_MIN;
+    'outer: loop {
+        // 睡退避（1s 粒度，stop 可打断）
+        let deadline = Instant::now() + backoff;
+        while Instant::now() < deadline {
+            if inner.stop.load(Ordering::SeqCst) {
+                break 'outer;
+            }
+            std::thread::sleep(Duration::from_millis(1000).min(deadline.saturating_duration_since(Instant::now())));
+        }
+        if inner.stop.load(Ordering::SeqCst) {
+            break;
+        }
+        let island = crate::syncutil::lock_unpoison(&inner.island).clone();
+        let Some(island) = island else { break };
+        attempt += 1;
+        let n = inner.cands.len();
+        (inner.logf)(&format!(
+            "世代重建：重赛跑全名册（第 {attempt} 次，候选 {n} 个，退避 {}）",
+            crate::go_fmt::fmt_duration_go_secs(backoff)
+        ));
+        let cands = inner.cands.clone();
+        match island_cmd(
+            &island,
+            |reply| Cmd::Connect { cands, budget: CONNECT_BUDGET, reply },
+            CONNECT_BUDGET + RPC_BUDGET,
+        ) {
+            Ok(o) => {
+                (inner.logf)(&format!(
+                    "世代重建成功（第 {attempt} 次，胜出 {} {}，耗时 {}ms）—— 会话回 ready",
+                    o.via.text(),
+                    o.winner,
+                    o.elapsed_ms
+                ));
+                set_state(&inner, SessState::Ready, "");
+                if let ProbeOutcome::Ok { rtt } = probe_once(&inner, PROBE_TIMEOUT) {
+                    set_link(&inner, rtt);
+                }
+                break;
+            }
+            Err(e @ IslandRpcErr::Gone(_))
+            | Err(e @ IslandRpcErr::Island(homeway_quic::IslandErr::EngineGone)) => {
+                (inner.logf)(&format!("世代重建停止：岛本体已不可用（{e}）—— 会话保持 failed"));
+                set_state(&inner, SessState::Failed, &format!("岛不可用（{e}）"));
+                break;
+            }
+            Err(e) => {
+                let next = next_backoff(backoff);
+                (inner.logf)(&format!(
+                    "世代重建失败（第 {attempt} 次，{e}）—— {} 后再试",
+                    crate::go_fmt::fmt_duration_go_secs(next)
+                ));
+                set_state(
+                    &inner,
+                    SessState::Failed,
+                    &format!("岛不健康；自动重连中（第 {attempt} 次失败）"),
+                );
+                backoff = next;
+            }
+        }
+    }
+    inner.rebuilding.store(false, Ordering::SeqCst);
 }
 
 // ---------- 探活 / 快照 ----------
@@ -1185,6 +1310,40 @@ mod tests {
             matches!(&e, HostErr::Start(m) if m.contains("没有任何可用端点")),
             "{e}"
         );
+    }
+
+    /// 世代重建退避序列：1 → 2 → 4 → … 封顶 30s。
+    #[test]
+    fn rebuild_backoff_doubles_and_caps() {
+        let mut b = REBUILD_BACKOFF_MIN;
+        let mut seen = vec![b];
+        for _ in 0..8 {
+            b = next_backoff(b);
+            seen.push(b);
+        }
+        assert_eq!(
+            seen.iter().map(|d| d.as_secs()).collect::<Vec<_>>(),
+            vec![1, 2, 4, 8, 16, 30, 30, 30, 30]
+        );
+    }
+
+    /// 岛上报不健康 ⇒ 置 failed 且 reason 标「自动重连中」、起重建线程（单飞位置位）；
+    /// 无岛（合成会话）⇒ 循环即退、单飞位复位——不挂线程、不 panic。
+    #[test]
+    fn unhealthy_marks_failed_with_rebuilding_reason_and_spawns_once() {
+        let s = HostSession::synthetic_for_test(SessState::Ready, "");
+        on_island_unhealthy(&s.inner, "patrol");
+        let snap = s.snapshot();
+        assert_eq!(snap.state, SessState::Failed);
+        assert!(snap.reason.contains("自动重连中"), "reason 须告知在自动重连：{}", snap.reason);
+        // 第二次上报不重复起线程（单飞）；等线程因无岛自退后单飞位复位
+        on_island_unhealthy(&s.inner, "patrol");
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while s.inner.rebuilding.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        assert!(!s.inner.rebuilding.load(Ordering::SeqCst), "无岛时重建线程须自退并复位单飞位");
+        s.stop();
     }
 
     /// **判据（合成会话缝：state/reason 直读；不建隧道）**。

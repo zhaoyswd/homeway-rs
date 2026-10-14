@@ -118,7 +118,7 @@ fn stream_open_err_text(e: &homeway_core::daemon::proto::OpError) -> String {
         vocab::CODE_NO_HOST => "主机不在守护进程表中（no_host）；homeway host list 查看在表主机".to_owned(),
         vocab::CODE_NOT_READY => "守护进程注册表未就绪（not_ready；client 角色启动中/重建窗口），稍后重试".to_owned(),
         vocab::CODE_STREAM_REFUSED => format!(
-            "与主机的流打开被拒（stream_refused）——主机离线、隧道未通或主机会话不可用；用 homeway host status <name> 核对会话与链路态{detail}"
+            "连不上主机（stream_refused）——主机离线或刚断线；断线后守护进程会自动重连，稍等几秒重试；`homeway host status` 看会话与链路态{detail}"
         ),
         "timeout" => "连接/打开超预算（--timeout）：daemon 未应答或目标主机拨号黑洞；可用 --timeout 加大预算后重试".to_owned(),
         other => format!("stream.open 失败：{other}{detail}"),
@@ -185,6 +185,36 @@ fn pull_remote_frame(st: &Arc<ClientStream>, buf: &mut Vec<u8>) -> Result<frames
     }
 }
 
+/// 带预算的远程读帧（一次性操作面）：`None` 且无终因 = 超时。
+fn pull_remote_frame_deadline(
+    st: &Arc<ClientStream>,
+    buf: &mut Vec<u8>,
+    deadline: Instant,
+    budget: Duration,
+) -> Result<frames::Frame, TermReadErr> {
+    loop {
+        if buf.len() >= 3 {
+            let n = u16::from_le_bytes([buf[1], buf[2]]) as usize;
+            if buf.len() >= 3 + n {
+                let f = frames::Frame { op: Op(buf[0]), payload: buf[3..3 + n].to_vec() };
+                buf.drain(..3 + n);
+                return Ok(f);
+            }
+        }
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() {
+            return Err(TermReadErr::Timeout(budget));
+        }
+        match st.recv_timeout(left) {
+            Some(chunk) => buf.extend_from_slice(&chunk),
+            None => match st.end_reason() {
+                Some(reason) => return Err(TermReadErr::Ended(RemoteEndError { reason })),
+                None => return Err(TermReadErr::Timeout(budget)),
+            },
+        }
+    }
+}
+
 enum TermConn {
     Local(FrameIo),
     Remote {
@@ -194,10 +224,14 @@ enum TermConn {
     },
 }
 
-/// 读帧错误的两类面：IO 失败 / 远程流终结（三态）。
+/// 读帧错误的三类面：IO 失败 / 远程流终结（三态）/ 预算内无应答。
 enum TermReadErr {
     Io(String),
     Ended(RemoteEndError),
+    /// 一次性操作（list / new -d / delete / explain / GREETING）在预算内没等到应答——
+    /// 2026-10-14 MacBook Pro 实测：主机岛半死（发送面 EHOSTUNREACH、QUIC 未判死）时
+    /// 服务流能开但一个字节不流，CLI 无超时读永久挂。
+    Timeout(Duration),
 }
 
 impl TermReadErr {
@@ -208,6 +242,10 @@ impl TermReadErr {
             TermReadErr::Io(e) => {
                 format!("与出口的连接被断开（{e}）；会话仍在运行，可用 homeway term attach {name} 重新接入")
             }
+            TermReadErr::Timeout(d) => format!(
+                "出口 {} 内未应答——主机可能刚断线（守护进程会自动重连），稍后重试；--timeout 可加大预算",
+                homeway_core::go_fmt::fmt_duration_go_secs(*d)
+            ),
         }
     }
 }
@@ -247,6 +285,20 @@ impl TermConn {
         match self {
             TermConn::Local(io) => io.read_frame().map_err(|e| TermReadErr::Io(e.to_string())),
             TermConn::Remote { st, buf, .. } => pull_remote_frame(st, buf),
+        }
+    }
+
+    /// 带预算读帧（一次性操作：GREETING / LIST / CREATE / KILL / EXPLAIN 的应答）——
+    /// 预算 = `--timeout`（缺省 10s）；本地面同样受限（本机 socket 应答在毫秒级）。
+    fn read_frame_deadline(&mut self, budget: Duration) -> Result<frames::Frame, TermReadErr> {
+        match self {
+            TermConn::Local(io) => io.read_frame_deadline(budget).map_err(|e| match e {
+                homeway_core::term::wire::ReadFail::Timeout => TermReadErr::Timeout(budget),
+                other => TermReadErr::Io(other.to_string()),
+            }),
+            TermConn::Remote { st, buf, .. } => {
+                pull_remote_frame_deadline(st, buf, Instant::now() + budget, budget)
+            }
         }
     }
 
@@ -343,7 +395,7 @@ fn dial_term(t: &mut TermTarget) -> Result<(TermConn, u32), String> {
         let stream = UnixStream::connect(&sock).map_err(|e| local_dial_err(&sock, e))?;
         TermConn::Local(FrameIo::new(stream))
     };
-    read_greeting(conn)
+    read_greeting(conn, t.timeout)
 }
 
 /// 本地面 socket 解析：**扁平优先、serve 子目录回退**（2026-10-13 用户实测缺口修复）。
@@ -388,8 +440,10 @@ fn local_dial_err(sock: &std::path::Path, e: std::io::Error) -> String {
 }
 
 /// GREETING 读取 + 版本门（CLI 侧，FIX-29：ver != 本端当场拒）。
-fn read_greeting(mut conn: TermConn) -> Result<(TermConn, u32), String> {
-    let f = conn.read_frame().map_err(|e| format!("读 GREETING：{}", e.message("?")))?;
+fn read_greeting(mut conn: TermConn, budget: Duration) -> Result<(TermConn, u32), String> {
+    let f = conn
+        .read_frame_deadline(budget)
+        .map_err(|e| format!("读 GREETING：{}", e.message("?")))?;
     if f.op != Op::GREETING {
         conn.close();
         return Err(format!("首帧应为 GREETING，收到 op 0x{:02x}", f.op.0));
@@ -672,7 +726,7 @@ fn cli_list(args: &[String]) -> Result<(), String> {
     let json_out = p.flags.iter().any(|f| f == "--json");
     let mut t = p.common.into_target()?;
     let (mut conn, _) = dial_term(&mut t)?;
-    let raw = round_trip(&mut conn, Op::LIST, &[])?;
+    let raw = round_trip(&mut conn, Op::LIST, &[], t.timeout)?;
     conn.close();
     if json_out {
         let v: serde_json::Value =
@@ -689,7 +743,7 @@ fn cli_list(args: &[String]) -> Result<(), String> {
 /// 取 LIST（表格与「attach 省略名字」的最近活跃解析共用）。
 fn list_fetch(t: &mut TermTarget) -> Result<Vec<SessionInfo>, String> {
     let (mut conn, _) = dial_term(t)?;
-    let raw = round_trip(&mut conn, Op::LIST, &[])?;
+    let raw = round_trip(&mut conn, Op::LIST, &[], t.timeout)?;
     conn.close();
     let out: SessionsWrap =
         serde_json::from_slice(&raw).map_err(|e| format!("LIST-REPLY 不是合法 JSON：{e}"))?;
@@ -733,9 +787,9 @@ fn print_sessions(entries: &[SessionInfo]) {
 }
 
 /// 一锤子往返：发一帧、读应答；ERROR 帧翻协议错误文案。
-fn round_trip(conn: &mut TermConn, op: Op, payload: &[u8]) -> Result<Vec<u8>, String> {
+fn round_trip(conn: &mut TermConn, op: Op, payload: &[u8], budget: Duration) -> Result<Vec<u8>, String> {
     conn.write_frame(op, payload).map_err(|e| e.message("?"))?;
-    let f = conn.read_frame().map_err(|e| e.message("?"))?;
+    let f = conn.read_frame_deadline(budget).map_err(|e| e.message("?"))?;
     if f.op == Op::ERROR {
         let (code, msg) = frames::dec_error(&f.payload).unwrap_or_default();
         return Err(proto_error_text(&code, &msg));
@@ -811,7 +865,7 @@ fn create_once(t: &mut TermTarget, name: &str, flags: u8, retry: bool) -> Result
     let (mut conn, _) = dial_term(t)?;
     conn.write_frame(Op::CREATE, &frames::enc_create(flags, name))
         .map_err(|e| e.message(name))?;
-    let f = conn.read_frame().map_err(|e| e.message(name))?;
+    let f = conn.read_frame_deadline(t.timeout).map_err(|e| e.message(name))?;
     conn.close();
     if f.op == Op::ERROR {
         let (code, msg) = frames::dec_error(&f.payload).unwrap_or_default();
@@ -837,7 +891,7 @@ fn cli_delete(args: &[String]) -> Result<(), String> {
     let (mut conn, _) = dial_term(&mut t)?;
     conn.write_frame(Op::KILL, &frames::enc_name(&name))
         .map_err(|e| e.message(&name))?;
-    let f = conn.read_frame().map_err(|e| e.message(&name))?;
+    let f = conn.read_frame_deadline(t.timeout).map_err(|e| e.message(&name))?;
     conn.close();
     if f.op == Op::ERROR {
         let (code, msg) = frames::dec_error(&f.payload).unwrap_or_default();
@@ -2160,6 +2214,33 @@ mod tests {
         assert!(e.contains("还没有添加主机"), "无 sock 时须走主机规则：{e}");
         // 显式 --host 带 --timeout 合法（远程面）
         assert!(common(Some(Duration::from_secs(5)), "exit1").into_target().is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// 一次性操作读帧带预算：对端不应答 ⇒ 预算到点报 Timeout（文案含「未应答」与
+    /// --timeout 提示），而不是永久阻塞（2026-10-14 MacBook Pro 实测：岛半死时服务流
+    /// 能开不流，delete/list 挂 6 分钟）。
+    #[test]
+    fn one_shot_read_times_out_instead_of_hanging() {
+        let dir = std::env::temp_dir().join(format!("hw-term-to-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let sock = dir.join("t.sock");
+        let ln = std::os::unix::net::UnixListener::bind(&sock).unwrap();
+        // 服务端：接受连接后什么都不写（模拟半死主机）
+        let srv = std::thread::spawn(move || {
+            let (s, _) = ln.accept().unwrap();
+            std::thread::sleep(Duration::from_millis(800));
+            drop(s);
+        });
+        let stream = UnixStream::connect(&sock).unwrap();
+        let mut conn = TermConn::Local(FrameIo::new(stream));
+        let t0 = Instant::now();
+        let e = conn.read_frame_deadline(Duration::from_millis(200)).expect_err("应超时");
+        assert!(t0.elapsed() < Duration::from_millis(700), "须在预算附近返回，实测 {:?}", t0.elapsed());
+        let msg = e.message("s1");
+        assert!(msg.contains("未应答") && msg.contains("--timeout"), "超时文案须可行动：{msg}");
+        let _ = srv.join();
         let _ = std::fs::remove_dir_all(&dir);
     }
 
