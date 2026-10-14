@@ -1,6 +1,6 @@
 # Changelog
 
-## 未发布
+## v0.3.7（2026-10-14）
 
 - **出口角色须显式启用**（用户实测驱动：新客户端机第一次 `term list` 提示加主机、第二次却列本机
   空会话表；`host add` 后 `term new` 建在了本地）：新 state 的配置缺省 **`[serve] enabled = false`**
