@@ -189,15 +189,11 @@ pub fn cmd_forward(args: &[String]) {
 }
 
 fn forward_usage() {
-    eprintln!("用法：");
-    eprintln!("  homeway forward add --listen <P> [--target <ip:P>|:<P>] [--host <ref>]");
-    eprintln!("                     建规则并立即起监听（127.0.0.1:P；目标缺省 = 该主机出口自己同端口）");
-    eprintln!("  homeway forward list [--host <ref>]");
-    eprintln!("                     规则表 + 运行态（listening/failed/在世连接数）");
-    eprintln!("  homeway forward delete --listen <P> [--host <ref>]");
-    eprintln!("                     删规则并关监听（在世连接不强关、自然收口）");
-    eprintln!("--host 只有一台主机时可省（默认用它）；没有主机先 `homeway host add <token>`。");
-    eprintln!("监听端口 1024–65535、每主机 ≤8 条、与全部规则及 socks 监听全局唯一。");
+    eprintln!("用法：homeway forward add --listen <P> [--target <ip:P>|:<P>]   本机 127.0.0.1:P 转到出口侧目标");
+    eprintln!("                                                           （目标缺省 = 出口机自己的同一端口）");
+    eprintln!("      homeway forward list                                 规则与运行状态");
+    eprintln!("      homeway forward delete --listen <P>                  删规则并关监听");
+    eprintln!("  只有一台主机时不必 --host；多台用 --host <name|id>。监听端口 1024–65535，每主机最多 8 条。");
 }
 
 /// --target 形态：空 = 出口自己同端口；":P" = 出口自己指定端口；"ip:P" = 任意
@@ -559,21 +555,24 @@ pub fn cmd_socks(args: &[String]) {
 }
 
 fn socks_usage() {
-    eprintln!("用法：");
-    eprintln!("  homeway socks on --host <ref> [--listen 1080] [--state D] [--no-spawn]");
-    eprintln!("                     该主机开 SOCKS5 监听（127.0.0.1；域名经该主机出口远程解析）");
-    eprintln!("  homeway socks off --host <ref>");
-    eprintln!("                     关监听并显式关在世连接（端口记忆保留，下次 on 缺省沿用）");
-    eprintln!("  homeway socks status [--json]");
-    eprintln!("                     每主机开关态 + 端口 + 在世连接数 + 链路态（via/rtt）");
-    eprintln!("监听端口 1024–65535、与 forward 规则全局唯一。多主机 = 多端口，浏览器按端口选出口。");
+    eprintln!("用法：homeway socks on [--listen 1080]     本机开 SOCKS5 代理（127.0.0.1），流量走出口机");
+    eprintln!("      homeway socks off                    关代理");
+    eprintln!("      homeway socks status [--json]        开关态 / 端口 / 连接数");
+    eprintln!("  只有一台主机时不必 --host；多台用 --host <name|id>（每台一个端口，浏览器按端口选出口）。");
 }
 
 fn socks_on(args: &[String]) {
-    let p = parse_carrier_args("socks on --host <ref> [--listen P]", args, &["host", "listen"]);
-    let Some(host_ref) = p.value_of("host").map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned) else {
-        eprintln!("homeway: socks on 需要 --host <ref>（homeway host list 查看在表主机）");
-        std::process::exit(2);
+    let p = parse_carrier_args("socks on [--host <ref>] [--listen P]", args, &["host", "listen"]);
+    // --host 缺省走默认主机规则（与 files/term/forward 同口径：单主机直接用 / 无主机提示 / 多主机要求显式）
+    let host_ref = match p.value_of("host").map(str::trim).filter(|s| !s.is_empty()) {
+        Some(h) => h.to_owned(),
+        None => match crate::daemon_cli::default_host_ref(&p.state, "socks <子命令>", TIMEOUT, p.no_spawn) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("homeway: {e}");
+                std::process::exit(2);
+            }
+        },
     };
     // Q-H F7a：`--listen` 非法值 fail-fast（此前静默回落 0 = 沿用记忆端口）。
     let listen = match p.value_of("listen") {
@@ -652,10 +651,16 @@ fn remembered_socks_port(c: &Arc<ControlClient>, host: &str) -> u16 {
 }
 
 fn socks_off(args: &[String]) {
-    let p = parse_carrier_args("socks off --host <ref>", args, &["host"]);
-    let Some(host_ref) = p.value_of("host").map(str::trim).filter(|s| !s.is_empty()).map(str::to_owned) else {
-        eprintln!("homeway: socks off 需要 --host <ref>（homeway socks status 查看）");
-        std::process::exit(2);
+    let p = parse_carrier_args("socks off [--host <ref>]", args, &["host"]);
+    let host_ref = match p.value_of("host").map(str::trim).filter(|s| !s.is_empty()) {
+        Some(h) => h.to_owned(),
+        None => match crate::daemon_cli::default_host_ref(&p.state, "socks <子命令>", TIMEOUT, p.no_spawn) {
+            Ok(h) => h,
+            Err(e) => {
+                eprintln!("homeway: {e}");
+                std::process::exit(2);
+            }
+        },
     };
     let (c, hosts) = dial_and_hosts(&p, "homeway-socks");
     let briefs = match c.request(vocab::OpName::HostList.as_str(), None, TIMEOUT) {
@@ -832,10 +837,8 @@ impl SpeedHostResult {
 
 pub fn cmd_speedtest_hosted(args: &[String]) {
     if args.iter().any(|a| matches!(a.as_str(), "--help" | "-h" | "help")) {
-        eprintln!("用法：homeway speedtest [--host <ref>] [--json] [--down 10s] [--up 10s] [--warmup 2s] [--streams 4] [--wait 60s] [--quiet] [--state D] [--no-spawn]");
-        eprintln!("  对指定主机（或全部主机顺序轮流）做隧道上下行测速；参数默认与边界 = 手机口径。");
-        eprintln!("  --wait = 链路未就绪的有界等待（0 = 不等即报错；默认 60s 覆盖恢复阶梯最坏时长）。");
-        eprintln!("  Ctrl-C 终止整个轮转（先取消当前主机再退出，退出码非零）；--quiet 抑制过程提示。");
+        eprintln!("用法：homeway speedtest [--host <ref>] [--json] [--down 10s] [--up 10s] [--streams 4] [--wait 60s] [--quiet]");
+        eprintln!("  对主机做上下行测速（不指定 --host = 全部主机轮流）；--wait 等链路就绪的最长时间（0 = 不等）。");
         return;
     }
     let p = parse_carrier_args(
@@ -908,7 +911,7 @@ pub fn cmd_speedtest_hosted(args: &[String]) {
         }
         None => {
             if host_arr.is_empty() {
-                eprintln!("homeway: 主机表为空——先 homeway host add <token> 添加后端，再测速");
+                eprintln!("还没有添加主机。先 `homeway host add <凭证>`，再测速。");
                 std::process::exit(1);
             }
             host_arr

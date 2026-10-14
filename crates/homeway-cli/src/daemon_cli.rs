@@ -447,13 +447,8 @@ pub fn dial_control_spawn(
                 }
                 eprintln!("KeepAlive {}s 内未重拉——改为自行拉起", SPAWN_KEEPALIVE_WAIT.as_secs());
             } else if cfg!(target_os = "macos") {
-                // 文案改写（Q-J F6）：旧文案在「默认 state 但无相关 plist」时**会说假话**。
-                // 仅 darwin 打（代码门 L4：Linux 无 launchd，旧形态该情形是本行也没有的
-                // 无输出——保持平台条件句）。
-                eprintln!(
-                    "（未在册 launchd 代理提及 state={}——不等 launchd KeepAlive，直接拉起）",
-                    state_dir.display()
-                );
+                // darwin-only 注记（Linux 无 launchd，该情形本就无输出）。
+                eprintln!("（无相关自启动项——直接拉起守护）");
             }
             let pid = start_spawned_process(state_dir)
                 .map_err(|e| format!("拉起统一进程失败：{e}"))?;
@@ -623,8 +618,8 @@ pub fn default_host_ref(
 ) -> Result<String, String> {
     let no_host = || {
         format!(
-            "还没有添加主机——先在出口机上执行 `homeway serve token` 取 token，再在本机执行 \
-             `homeway host add <token>`（加过之后 `homeway {cmd}` 默认就用它）"
+            "还没有添加主机。先在出口机上执行 `homeway serve token` 取凭证，再在本机执行 \
+             `homeway host add <凭证>`，之后 `homeway {cmd}` 直接用。"
         )
     };
     if !state_dir.join("client").join(homeway_core::daemon::hosts::HOSTS_FILE_NAME).exists() {
@@ -726,8 +721,8 @@ pub fn cmd_host(args: &[String]) {
         "delete" => host_delete(&args[1..]),
         // Q-H F8/CA13：裸名词 --help 短路（此前落「不认识的子命令」exit 2）。
         "--help" | "-h" => {
-            eprintln!("用法：homeway host <add|list|status|delete> …");
-            eprintln!("  add [--name N] [--force] <token> / list [--json] / status [name] / delete <name|id> [--yes]（均可 --state DIR --no-spawn）");
+            eprintln!("用法：homeway host add [--name N] [--force] <凭证>    加主机（凭证来自出口机 `homeway serve token`）");
+            eprintln!("      homeway host list [--json] / status [name] / delete <name|id> [--yes]");
             std::process::exit(0);
         }
         other => {
@@ -949,7 +944,7 @@ pub fn cmd_status(args: &[String]) {
         }
         rest.push(a.clone());
     }
-    let p = parse_args("status [--json] [--watch] [--state DIR]", &rest);
+    let p = parse_args("homeway status [--json] [--watch]   连接与流量（--watch 持续刷新）", &rest);
     let json = p.json;
     let state = p.state.clone();
     if watch {
@@ -1022,9 +1017,10 @@ pub fn cmd_serve_group(args: &[String]) {
         "token" => vocab::OpName::ServeToken,
         // Q-H F8/CA13：裸名词 --help 短路（此前落「不认识的动词」exit 2）。
         "--help" | "-h" => {
-            eprintln!("用法：homeway serve <start|stop|restart|status|token|relay|ddns> [--state DIR]");
-            eprintln!("  start/stop/restart = 角色期望态（写 config serve.enabled + 控制面启停）；status/token 纯读不拉起。");
-            eprintln!("  relay set <token>|clear / ddns add <域名>|delete <域名>|list（纯配置写，需 restart 生效）。");
+            eprintln!("用法：homeway serve start|stop|restart|status|token    出口的启停 / 状态 / 取凭证");
+            eprintln!("      homeway serve relay set <凭证>|clear             配置 / 清除中继");
+            eprintln!("      homeway serve ddns add|delete <域名> | list      配置 DDNS 域名");
+            eprintln!("  改配置的项 restart 后生效。");
             std::process::exit(0);
         }
         // 一次性直跑（纯文件操作——servegroup_cli.go「serve relay set/clear 与 ddns」
@@ -1153,8 +1149,7 @@ pub fn cmd_relay_group(args: &[String]) {
         "token" => vocab::OpName::RelayToken,
         // Q-H F8/CA13：裸名词 --help 短路。
         "--help" | "-h" => {
-            eprintln!("用法：homeway relay <start|stop|restart|status|token> [--state DIR]");
-            eprintln!("  = 本机中继角色的控制面命令组（前台单中继 = `homeway relay [flags]`）。");
+            eprintln!("用法：homeway relay start|stop|restart|status|token    中继的启停 / 状态 / 取凭证");
             std::process::exit(0);
         }
         other => {
@@ -1616,7 +1611,7 @@ fn serve_ddns_relay_group(group: &str, args: &[String]) {
         match group {
             "ddns" => {
                 eprintln!("用法：homeway serve ddns add <domain> | homeway serve ddns delete <domain> | homeway serve ddns list");
-                eprintln!("（[[serve.ddns]] = token 叠加域名条目 + 自检；域名记录由你的 DDNS 设施维护）");
+                eprintln!("（域名记录由你的 DDNS 服务商侧维护，这里只登记给出口用）");
                 std::process::exit(2);
             }
             _ => {

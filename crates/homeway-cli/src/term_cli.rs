@@ -442,15 +442,14 @@ pub fn cmd_term(args: &[String]) {
 
 fn term_usage() {
     println!(
-        "homeway term —— 终端服务的主机命令面（与 App 同一份会话注册表）\n  \
-list [--json] [--host <ref>] [--state D] [--timeout T]   列会话\n  \
-new [name] [-d] [-A] […]   新建并接入；-d 只创建不接入；省略名字自动命名 host-<4hex>\n  \
-attach [name] [-d] [--detach-key K] […]   接入（raw 字节模式）；省略名字 = 最近活跃；-d 显式接管\n  \
-delete <name> […]   结束会话\n  \
-explain --file <屏幕文本> --agent <label> | <会话名> […]   规则判定（离线 / 在线）\n\
-远程模式：--host <name|id>（经 daemon 控制面转发；--state 指统一 state 根）；\n  \
---timeout = 解析与打开各一次的预算（默认各 10s，仅 --host 可用）。\n\
-attach 分离键：Ctrl-b d 分离 / Ctrl-b r 重对齐 / Ctrl-b Ctrl-b 字面量；--detach-key none 关闭。"
+        "homeway term —— 出口机上的终端\n  \
+list [--json]              会话列表\n  \
+new [name] [-d] [-A]       新建并进入；-d 只建不进；-A 已有同名就直接进\n  \
+attach [name] [-d]         进入（省略名字 = 最近用的）；-d 把别的客户端踢下线\n  \
+delete <name>              结束会话\n  \
+explain <name>             看会话状态是怎么判出来的\n\
+只有一台主机时不必 --host；多台用 --host <name|id>（--timeout 只在 --host 时有意义）。\n\
+进入后：Ctrl-b d 分离（会话继续跑）/ Ctrl-b r 重对齐 / Ctrl-b Ctrl-b 发送 Ctrl-b 本身；--detach-key none 关闭。"
     );
 }
 

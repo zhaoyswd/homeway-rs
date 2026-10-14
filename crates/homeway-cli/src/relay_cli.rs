@@ -47,8 +47,13 @@ struct RelayFlags {
 }
 
 fn relay_usage() {
-    eprintln!("用法：homeway relay [--state DIR] [--listen :38341] [--advertise IP:port] [--open] [--no-hints]");
-    eprintln!("  = 前台单中继（Ctrl-C 收工）；启停/查询用 `homeway relay start|stop|restart|status|token`（控制面）。");
+    eprintln!("用法：homeway relay start|stop|restart|status|token    后台中继：启停 / 状态 / 取凭证");
+    eprintln!("      homeway relay [选项]                             前台起中继（Ctrl-C 停）");
+    eprintln!();
+    eprintln!("选项（也可写进 ~/.config/homeway/config.toml 的 [relay] 节）：");
+    eprintln!("  --listen :P              监听地址（默认 :38341）");
+    eprintln!("  --advertise IP:port      对外公告的地址（空 = 自动探测）");
+    eprintln!("  --open                   不要求凭证的公开中继");
 }
 
 fn parse_flags(args: &[String]) -> Result<RelayFlags, String> {

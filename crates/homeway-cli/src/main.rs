@@ -113,15 +113,20 @@ fn main() {
         Some("files") => cmd_files(&args[2..]),
         Some("portfwd") => cmd_portfwd(&args[2..]),
         _ => {
-            eprintln!(
-"homeway——可用：\n  零参 = 统一进程（--state DIR / --verbose；client/control 恒开 + serve/relay 按期望态）\n  host add [--name N] [--force] <token> / host list [--json] / host status [name] / host delete <name|id> [--yes]\n  status [--json] [--watch]（daemon.status 聚合面）"
-            );
-            // term 行平台分档（windows 不支持——评审 L6：帮助不列不可用面）。
+            if let Some(c) = args.get(1) {
+                eprintln!("homeway：不认识的命令 {c:?}");
+            }
+            eprintln!("可用命令：");
+            eprintln!("  serve start|stop|status|token    出口     relay start|stop|status|token    中继");
+            eprintln!("  host add|list|status|delete      主机     status                           连接与流量");
+            // term 行平台分档（windows 不支持——帮助不列不可用面）。
             #[cfg(not(windows))]
-            eprintln!("  term <list|new|attach|delete|explain> […]（本地面 term.sock；--host <ref> = 经控制面远程接入）");
-            eprintln!(
-"  export [dest.tar] / import <file> / reset cache [--state D]（状态工件面：不变量四件打包/落位/清 cache）\n  serve <start|stop|restart|status|token> / relay <start|stop|restart|status|token>（控制面命令组）\n  serve [flags]（前台单角色）/ relay [flags]（前台单角色）\n  token <hmw2…> [--dead-direct]（改写输出：非中继端点 → 死端口——矩阵中继段注入缝）\n  connect --token <hmw2…> [--identity-dir <dir>]\n      [--speedtest] [--dial <ip:port>] [--hold <secs>] [--probe N] [--status-json]\n      [--recover-from <1|2|3> [--recover-cause <s>]] [--inject relay-lock|no-hint]\n  speedtest [--host <ref>] [--json] [--down/--up 10s] [--streams 4] [--wait 60s]（守护托管：全主机轮转或单台；Ctrl-C 终止轮转）\n  speedtest --token <hmw2…> [--identity-dir D] [--rounds N] [--hold]（直连形态：同会话 N 轮——A/B 轮次口径）\n  forward <add|list|delete> / socks <on|off|status>（承载面：端口转发规则/SOCKS5 监听，--state 恒指 daemon state）"
-            );
+            eprintln!("  term new|list|attach|delete      终端     files list|get|put|…             文件");
+            #[cfg(windows)]
+            eprintln!("  files list|get|put|…             文件");
+            eprintln!("  forward add|list|delete          端口转发  socks on|off|status              SOCKS5");
+            eprintln!("  speedtest                        测速     export / import / reset cache    状态备份与清理");
+            eprintln!("  每个命令 --help 看细节；homeway --help 看总览。");
             std::process::exit(2);
         }
     }
@@ -184,8 +189,8 @@ fn cache_flag_retired() -> ! {
 fn cmd_token(args: &[String]) {
     // Q-H F8/CA13：`--help`/`-h` 短路（用法 + exit 0；任意位置）。
     if wants_help(args) {
-        eprintln!("用法：homeway token <hmw2…> [--dead-direct] [--loopback-only] [--v6-only]");
-        eprintln!("  无 flag = 解析并打印 peer_id/secret/端点；--dead-direct = 全部**非中继**端点改死端口（矩阵中继段注入缝——M5 C2 起覆盖 Direct 与 Quic 两类）。");
+        eprintln!("用法：homeway token <凭证> [--dead-direct] [--loopback-only] [--v6-only]   （调试用）");
+        eprintln!("  解析并打印凭证内容；带 flag = 改写端点后重新输出（测试注入用）。");
         std::process::exit(0);
     }
     // `token <hmw2…> --dead-direct`：解析后把**非中继**端点改指 127.0.0.1:1 重编码输出
@@ -445,8 +450,10 @@ fn session_lock_or_exit(identity_dir: &Option<PathBuf>, verb: &str) -> Option<ho
 fn cmd_connect(args: &[String]) {
     // Q-H F8/CA13：`--help`/`-h` 短路（用法 + exit 0；任意位置）。
     if wants_help(args) {
-        eprintln!("用法：homeway connect --token <hmw2…> [--identity-dir D] [--speedtest] [--dial <ip:port>]");
-        eprintln!("       [--hold S] [--probe N] [--status-json] [--recover-from 1|2|3 [--recover-cause S] [--recover-delay S]] [--inject relay-lock|no-hint] [--dead-direct] [--no-session-lock]");
+        eprintln!("用法：homeway connect --token <凭证> [选项]   （调试用：不经主机表，用凭证直接连一次）");
+        eprintln!("  日常使用请 homeway host add <凭证>，之后 term / files / forward 直接用。");
+        eprintln!("  选项：--identity-dir D --speedtest --dial ip:port --hold S --probe N --status-json");
+        eprintln!("        --recover-from 1|2|3 [--recover-cause S] [--recover-delay S] --inject relay-lock|no-hint --dead-direct --no-session-lock");
         std::process::exit(0);
     }
     let a = parse_connect(args);
@@ -660,8 +667,8 @@ fn cmd_speedtest_dispatch(args: &[String]) {
 fn cmd_speedtest(args: &[String]) {
     // Q-H F8/CA13：`--help`/`-h` 短路（用法 + exit 0；守护托管形态的 help 在 carriers_cli）。
     if wants_help(args) {
-        eprintln!("用法：homeway speedtest --token <hmw2…> [--identity-dir D] [--rounds N] [--hold] [--dead-direct] [--no-session-lock]");
-        eprintln!("  无 --token = 守护托管形态（homeway speedtest [--host <ref>] [--json] …）。");
+        eprintln!("用法：homeway speedtest [--host <ref>] [--json] …          测速（homeway speedtest --help 看选项）");
+        eprintln!("  带 --token <凭证> 的形态是直连调试用（不经主机表；可选 --identity-dir D / --rounds N / --hold）。");
         std::process::exit(0);
     }
     let mut tok: Option<String> = None;
@@ -764,9 +771,10 @@ fn cmd_speedtest(args: &[String]) {
 fn cmd_files(args: &[String]) {
     // Q-H F8/CA13：`--help`/`-h` 短路（用法 + exit 0；任意位置）。
     if wants_help(args) {
-        eprintln!("用法：homeway files <list|stat|mkdir|read|get|put|download|upload> <远端路径> [<本地路径>]");
-        eprintln!("  默认用本机主机；有多台时用 `--host <name|id>` 指定（`homeway host list` 看全表）");
-        eprintln!("  get <远端> [-o 本地] [--force]；put <本地> <远端>");
+        eprintln!("用法：homeway files list|stat|mkdir|read <远端路径>        出口机上的文件");
+        eprintln!("      homeway files get <远端> [-o 本地] [--force]        下载（已存在加 --force 覆盖）");
+        eprintln!("      homeway files put <本地> <远端>                     上传");
+        eprintln!("  只有一台主机时不必 --host；多台用 --host <name|id>。");
         std::process::exit(0);
     }
     // files <verb> --token <hmw2> [--identity-dir D] [--dead-direct] [--inject relay-lock|no-hint]
@@ -1264,11 +1272,8 @@ fn files_stream_open_err_text(e: &homeway_core::daemon::proto::OpError) -> Strin
 fn cmd_portfwd(args: &[String]) {
     // Q-H F8/CA13：`--help`/`-h` 短路（用法 + exit 0；任意位置）。
     if wants_help(args) {
-        eprintln!("端口转发的正式用法（host 形态）：");
-        eprintln!("  homeway forward add --listen 15432 --target :5432      # 建规则（单主机可省 --host）");
-        eprintln!("  homeway forward list / delete --listen 15432");
-        eprintln!("homeway portfwd = **直连调试缝**（自动化/矩阵专用，不经主机表）：");
-        eprintln!("  homeway portfwd --token <hmw2…> --map 15432:5432 [--identity-dir D]");
+        eprintln!("端口转发请用：homeway forward add --listen 15432 --target :5432（homeway forward --help 看全）");
+        eprintln!("homeway portfwd 是直连调试用（不经主机表）：homeway portfwd --token <凭证> --map 15432:5432");
         std::process::exit(0);
     }
     let mut tok: Option<String> = None;
@@ -1331,8 +1336,7 @@ fn cmd_portfwd(args: &[String]) {
         i += adv;
     }
     let Some(tok) = tok else {
-        eprintln!("homeway portfwd 是直连调试缝（自动化用）——端口转发的正式用法：");
-        eprintln!("  homeway forward add --listen 15432 --target :5432   （homeway forward --help 看全）");
+        eprintln!("端口转发请用：homeway forward add --listen 15432 --target :5432（homeway forward --help 看全）");
         std::process::exit(2);
     };
     if maps.is_empty() {

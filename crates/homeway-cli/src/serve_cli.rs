@@ -501,12 +501,17 @@ struct ServeFlags {
 }
 
 fn serve_usage() {
-    eprintln!("用法：homeway serve [--state DIR] [--listen P] [--bind-interface M] [--upnp[=bool]] [--stun H:P] [--stun6 H:P]");
-    eprintln!("       [--relay rl1…|ip:port] [--peer-ttl 168h] [--max-peers N] [--public-endpoint ip:port,ip:port]");
-    eprintln!("       [--dns-port P] [--files-root DIR] [--ddns 裸域名] [--verbose]");
-    eprintln!("  --stun= / --stun6= / --relay= 空值 = 关（Go flag 空串同义，F0 carve-out）；");
-    eprintln!("  --bind-interface= 空值 = auto（Go ResolveBind(\"\") 同义，Q-L carve-out）；");
-    eprintln!("  = 前台单出口（Ctrl-C 收工）；启停/查询用 `homeway serve start|stop|restart|status|token`（控制面）。");
+    eprintln!("用法：homeway serve start|stop|restart|status|token    后台出口：启停 / 状态 / 取凭证");
+    eprintln!("      homeway serve [选项]                             前台起出口（Ctrl-C 停）");
+    eprintln!();
+    eprintln!("选项（也可写进 ~/.config/homeway/config.toml 的 [serve] 节，之后零参启动）：");
+    eprintln!("  --listen P                   端口（默认 38241）");
+    eprintln!("  --bind-interface M           绑定网卡：auto | none | 网卡名 | IP（空值 = auto）");
+    eprintln!("  --upnp[=bool]                UPnP 自动端口映射");
+    eprintln!("  --stun H:P / --stun6 H:P     公网地址探测服务器（空值 = 关）");
+    eprintln!("  --relay rl1…|ip:port         中继凭证，直连不通时经它中转（空值 = 不用）");
+    eprintln!("  --public-endpoint ip:port,…  手工指定公网端点");
+    eprintln!("  --dns-port P / --files-root DIR / --ddns 域名 / --peer-ttl 168h / --max-peers N / --verbose");
 }
 
 fn parse_serve_flags(args: &[String]) -> Result<ServeFlags, CliErr> {

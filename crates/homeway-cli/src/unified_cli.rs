@@ -199,8 +199,19 @@ pub(crate) fn parse_unified_args(args: &[String]) -> UnifiedInvocation {
             }
             "verbose" => verbose = cli_flags::take_bool_or_exit("verbose", inline, true),
             "help" | "h" => {
-                println!("homeway [统一进程] —— 零参起；只认 --state <dir> / --verbose（角色参数写 config.toml，或用 serve/relay 前台单角色形态）");
-                println!("子命令形态：homeway <serve|relay|status|host|term|files|connect|speedtest|token|portfwd> …（无子命令 = 统一进程）；dnstest 已退役（M5 §2.6-G6：岛无 UDP socket 服务面）");
+                println!("homeway —— 回家网络工具（出口 / 中继 / 客户端，同一个二进制）");
+                println!();
+                println!("  homeway                                  按配置启动（通常由开机自启动带起）");
+                println!("  homeway serve start|stop|status|token    出口：家里那台机器");
+                println!("  homeway relay start|stop|status|token    中继：公网机器，直连不通时中转");
+                println!("  homeway host add|list|status|delete      主机：客户端加出口凭证");
+                println!("  homeway term new|list|attach|delete      出口机上的终端");
+                println!("  homeway files list|get|put|…             出口机上的文件");
+                println!("  homeway forward add|list|delete          端口转发");
+                println!("  homeway speedtest                        测速");
+                println!("  homeway status                           连接与流量");
+                println!();
+                println!("  每个子命令 --help 看细节；--state DIR 指定数据目录（多实例 / 测试用）。");
                 return UnifiedInvocation::Help;
             }
             other => {
