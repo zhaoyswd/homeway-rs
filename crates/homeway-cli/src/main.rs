@@ -860,7 +860,10 @@ fn cmd_files(args: &[String]) {
         }
         i += adv;
     }
-    if tok.is_none() && host_ref.is_none() {
+    // files 有意**不做本机面**（用户拍板 2026-10-15）：出口机上 `serve/files.sock` 只作
+  // 服务端调试腿，CLI 一律走主机表——无主机直接提示 `host add`（default_host_ref 的
+  // 0 台分支不拉守护、直接给行动项），不绕「连本机」的弯。term 的本机面是特例不是模板。
+  if tok.is_none() && host_ref.is_none() {
         // 2026-10-13 用户指令：file/term/forward 统一 host 风格——`--host` 缺省（且未给
         // 直连缝 `--token`）时走「默认主机」寻址：1 台 ⇒ 用它；0 台 ⇒ 提示先 host add；
         // 多台 ⇒ 要求显式 `--host`。
