@@ -2113,17 +2113,45 @@ mod tests {
     #[test]
     fn local_mode_rejects_timeout() {
         // Go exec-r1 L6：本地面给 --timeout = 显式报错（不静默忽略）。
-        let c = TermCommon { state_dir: None, host_ref: String::new(), timeout: Some(Duration::from_secs(5)), no_spawn: false };
-        assert!(c.into_target().is_err());
-        let c = TermCommon { state_dir: None, host_ref: String::new(), timeout: None, no_spawn: false };
-        assert!(c.into_target().is_ok());
+        // 环境受控：`--host` 可选化（v0.3.5）后本地面的成立条件 = `<state>/term.sock`
+        // 在；用临时 state 显式造/不造 sock——不依赖跑测试那台机器有没有出口在跑
+        // （缺省 state 形态下本机有出口则过、CI 空环境则红，v0.3.5 起 CI 一直红）。
+        let dir = std::env::temp_dir().join(format!(
+            "hw-term-local-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        // 本地面在（扁平 `<state>/term.sock`；exists 判定不要求真 socket）
+        std::fs::write(local_term_sock(&dir), b"").unwrap();
         let c = TermCommon {
-            state_dir: None,
+            state_dir: Some(dir.clone()),
+            host_ref: String::new(),
+            timeout: Some(Duration::from_secs(5)),
+            no_spawn: true,
+        };
+        let e = c.into_target().err().expect("应返回错误");
+        assert!(e.contains("--timeout 仅 --host 模式可用"), "本地面带 --timeout 须报 L6 文案：{e}");
+        let c = TermCommon { state_dir: Some(dir.clone()), host_ref: String::new(), timeout: None, no_spawn: true };
+        let t = c.into_target().unwrap();
+        assert!(t.host_ref.is_empty(), "本地面目标的 host_ref 应为空（本机出口）");
+        // 本地面不在 + 无主机册 ⇒ 走默认主机规则 ⇒ 「先 host add」类错误（非 L6 文案）
+        std::fs::remove_file(local_term_sock(&dir)).unwrap();
+        let c = TermCommon { state_dir: Some(dir.clone()), host_ref: String::new(), timeout: None, no_spawn: true };
+        let e = c.into_target().err().expect("应返回错误");
+        assert!(!e.contains("--timeout"), "无本地面无主机时不该报 L6 文案：{e}");
+        // 显式 --host 带 --timeout 合法（远程面）
+        let c = TermCommon {
+            state_dir: Some(dir.clone()),
             host_ref: "exit1".to_owned(),
             timeout: Some(Duration::from_secs(5)),
-            no_spawn: false,
+            no_spawn: true,
         };
         assert!(c.into_target().is_ok());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
