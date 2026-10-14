@@ -50,7 +50,9 @@ homeway serve --relay '<rl1…>'                          # 出口经该中继�
 ```
 
 参数写进 `homeway` 的配置文件（`~/.config/homeway/config.toml`）后，`homeway`（零参）
-与 `homeway serve start` 都按它装配：
+与 `homeway serve start` 都按它装配。新机器的配置缺省 `enabled = false`——不会因为跑了一条
+命令就意外成为出口；**出口机执行一次 `homeway serve start`**，它会写入 `enabled = true`
+并装配，之后零参 `homeway`（launchd / 服务）也按它起出口：
 
 ```toml
 [serve]

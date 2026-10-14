@@ -611,23 +611,32 @@ fn parse_args(usage: &str, args: &[String]) -> ParsedArgs {
 /// 普通用户不必知道 token/state 等参数）：**0 台 ⇒ 可行动提示；1 台 ⇒ 直接用它；
 /// 多台 ⇒ 要求显式 `--host`**。返回寻址串（name 优先；表内匹配规则同 [`resolve_host`]）。
 ///
-/// 需要控制面（`host add` 的主机表即在此）；未运行时按既有形态拉起。
+/// 需要控制面（`host add` 的主机表即在此）；未运行时按既有形态拉起——**但主机表文件
+/// 不存在时不拉起**（2026-10-14）：那必然是 0 台，纯读命令在新机器上不该有「悄悄起一个
+/// 守护」的副作用（曾与 serve 缺省启用叠加成「第一次提示加主机、第二次列本机空会话表」
+/// 的不一致）。文件在 ⇒ 仍经守护（主机表语义真源，含校验与同键刷新）。
 pub fn default_host_ref(
     state_dir: &std::path::Path,
     cmd: &str,
     timeout: Duration,
     no_spawn: bool,
 ) -> Result<String, String> {
+    let no_host = || {
+        format!(
+            "还没有添加主机——先在出口机上执行 `homeway serve token` 取 token，再在本机执行 \
+             `homeway host add <token>`（加过之后 `homeway {cmd}` 默认就用它）"
+        )
+    };
+    if !state_dir.join("client").join(homeway_core::daemon::hosts::HOSTS_FILE_NAME).exists() {
+        return Err(no_host());
+    }
     let c = dial_control_spawn(state_dir, "homeway-host", no_spawn)?;
     let briefs = c
         .request(vocab::OpName::HostList.as_str(), None, timeout)
         .map_err(|e| format!("host.list 失败：{}", op_err_text(&e)))?;
     let hosts = briefs["hosts"].as_array().cloned().unwrap_or_default();
     match hosts.len() {
-        0 => Err(format!(
-            "还没有添加主机——先在出口机上执行 `homeway serve token` 取 token，再在本机执行 \
-             `homeway host add <token>`（加过之后 `homeway {cmd}` 默认就用它）"
-        )),
+        0 => Err(no_host()),
         1 => {
             let b = &hosts[0];
             Ok(b["name"]

@@ -476,7 +476,13 @@ impl TermCommon {
         let timeout = self.timeout.unwrap_or(DEFAULT_REMOTE_TIMEOUT);
         let mut host_ref = self.host_ref;
         if host_ref.is_empty() {
-            if local_term_sock(&state_dir).exists() {
+            // 本机面 = 本机 term.sock 在 **且** config 的 serve 角色启用（2026-10-14）：只看
+            // sock 文件会被「serve stop 后残留的 sock」或「曾意外起过出口」的机器遮蔽远端
+            // 主机（用户实测：加了主机后 `term new` 建在了本地）——出口意图以 config
+            // enabled 为准；config 缺失 / 坏 ⇒ 不走本机面（守护侧会如实报 config 错）。
+            let local_exit = local_term_sock(&state_dir).exists()
+                && crate::unified_cli::config_role_enabled(&state_dir, "serve").unwrap_or(false);
+            if local_exit {
                 if self.timeout.is_some() {
                     return Err(
                         "--timeout 仅 --host 模式可用（远程的解析/打开预算）；本地面请去掉 --timeout"
@@ -2113,9 +2119,9 @@ mod tests {
     #[test]
     fn local_mode_rejects_timeout() {
         // Go exec-r1 L6：本地面给 --timeout = 显式报错（不静默忽略）。
-        // 环境受控：`--host` 可选化（v0.3.5）后本地面的成立条件 = `<state>/term.sock`
-        // 在；用临时 state 显式造/不造 sock——不依赖跑测试那台机器有没有出口在跑
-        // （缺省 state 形态下本机有出口则过、CI 空环境则红，v0.3.5 起 CI 一直红）。
+        // 环境受控：本地面的成立条件 = `<state>/term.sock` 在 **且** config serve.enabled
+        //（2026-10-14 加的第二维——只看 sock 曾让意外起过出口的客户端机遮蔽远端主机）；
+        // 用临时 state 显式造/不造两者——不依赖跑测试那台机器有没有出口在跑。
         let dir = std::env::temp_dir().join(format!(
             "hw-term-local-{}-{}",
             std::process::id(),
@@ -2125,32 +2131,36 @@ mod tests {
                 .unwrap_or(0)
         ));
         std::fs::create_dir_all(&dir).unwrap();
-        // 本地面在（扁平 `<state>/term.sock`；exists 判定不要求真 socket）
+        let cfg = |enabled: bool| {
+            std::fs::write(dir.join("config.toml"), format!("[serve]\nenabled = {enabled}\n")).unwrap();
+        };
+        let common = |timeout: Option<Duration>, host: &str| TermCommon {
+            state_dir: Some(dir.clone()),
+            host_ref: host.to_owned(),
+            timeout,
+            no_spawn: true,
+        };
+        // 本地面在（sock 在 + enabled=true；exists 判定不要求真 socket）
         std::fs::write(local_term_sock(&dir), b"").unwrap();
-        let c = TermCommon {
-            state_dir: Some(dir.clone()),
-            host_ref: String::new(),
-            timeout: Some(Duration::from_secs(5)),
-            no_spawn: true,
-        };
-        let e = c.into_target().err().expect("应返回错误");
+        cfg(true);
+        let e = common(Some(Duration::from_secs(5)), "").into_target().err().expect("应返回错误");
         assert!(e.contains("--timeout 仅 --host 模式可用"), "本地面带 --timeout 须报 L6 文案：{e}");
-        let c = TermCommon { state_dir: Some(dir.clone()), host_ref: String::new(), timeout: None, no_spawn: true };
-        let t = c.into_target().unwrap();
+        let t = common(None, "").into_target().unwrap();
         assert!(t.host_ref.is_empty(), "本地面目标的 host_ref 应为空（本机出口）");
-        // 本地面不在 + 无主机册 ⇒ 走默认主机规则 ⇒ 「先 host add」类错误（非 L6 文案）
+        // sock 在但 serve 未启用（serve stop 后的残留 sock / 曾意外起过出口）⇒ **不是**本地面
+        // ⇒ 默认主机规则；主机表文件缺 ⇒ 直接「还没有添加主机」——且**不拉守护**（走到
+        // dial_control_spawn 的话 no_spawn=true 会报「守护进程未运行且 --no-spawn」，文案不同）
+        cfg(false);
+        let e = common(None, "").into_target().err().expect("应返回错误");
+        assert!(e.contains("还没有添加主机"), "serve 未启用须走主机规则并直接提示加主机：{e}");
+        assert!(!e.contains("--no-spawn"), "主机表缺时不应走到拉守护路径：{e}");
+        // sock 不在 + enabled=true ⇒ 同样走主机规则
         std::fs::remove_file(local_term_sock(&dir)).unwrap();
-        let c = TermCommon { state_dir: Some(dir.clone()), host_ref: String::new(), timeout: None, no_spawn: true };
-        let e = c.into_target().err().expect("应返回错误");
-        assert!(!e.contains("--timeout"), "无本地面无主机时不该报 L6 文案：{e}");
+        cfg(true);
+        let e = common(None, "").into_target().err().expect("应返回错误");
+        assert!(e.contains("还没有添加主机"), "无 sock 时须走主机规则：{e}");
         // 显式 --host 带 --timeout 合法（远程面）
-        let c = TermCommon {
-            state_dir: Some(dir.clone()),
-            host_ref: "exit1".to_owned(),
-            timeout: Some(Duration::from_secs(5)),
-            no_spawn: true,
-        };
-        assert!(c.into_target().is_ok());
+        assert!(common(Some(Duration::from_secs(5)), "exit1").into_target().is_ok());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

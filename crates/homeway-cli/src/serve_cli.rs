@@ -27,14 +27,17 @@ fn default_enabled_true() -> bool {
 
 /// config.toml 的 `[serve]` 节（fileServe 子集；deny_unknown = Go 的 typo 保护同口径）。
 ///
-/// **缺省语义（Go `nodeconfig.Default()` 同义）**：`serve.enabled` 缺省 = **true**
-/// （手编省略该键 = 启用）；`relay.enabled` 缺省 = false。手写 `impl Default` 而非
-/// derive——serde 的 `default = fn` 只在反序列化时生效，`FileConfig::default()`（缺失
-/// 文件路径）也必须同义。
+/// **缺省语义（2026-10-14 起偏离 Go `nodeconfig.Default()`）**：文件缺失 / `[serve]` 整节缺失
+/// ⇒ `enabled` = **false**——出口角色须显式启用（`homeway serve start`），任何机器第一次
+/// 拉起守护都不会意外成为出口（生成身份、签发 token、监听端口；客户端机上 `term list`
+/// 曾因此被本机空会话表遮蔽）。手编 `[serve]` 节**省略 `enabled` 键** ⇒ 仍 = true
+/// （用户显式写了出口节，Go 同义「省略 = 启用」）——这是 serde 字段级缺省，与整节缺省
+/// 不同义。`relay.enabled` 两面缺省都是 false。手写 `impl Default` 而非 derive——serde 的
+/// `default = fn` 只在反序列化字段时生效，`FileConfig::default()`（缺失文件路径）另有口径。
 #[derive(serde::Deserialize, serde::Serialize, Clone, Debug)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct FileServe {
-    /// 缺省 = true（Go `nodeconfig.Default()` 同义——手编省略该键 = 启用）。
+    /// 字段级缺省 = true（手编 `[serve]` 节省略该键 = 启用，Go 同义）；整节/文件缺省见 `Default`。
     #[serde(default = "default_enabled_true")]
     pub(crate) enabled: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -170,7 +173,8 @@ impl FileQuicAdmit {
 
 impl Default for FileServe {
     fn default() -> Self {
-        FileServe { enabled: true, ..FileServe::empty() }
+        // 文件 / 整节缺失 = 不启用（出口须 `homeway serve start` 显式开；见 struct 文档）。
+        FileServe::empty()
     }
 }
 
@@ -1297,13 +1301,22 @@ mod tests {
         d
     }
 
-    /// F1：缺失 config = 默认（serve.enabled 缺省 true）。
+    /// F1：缺失 config = 默认——2026-10-14 起 `serve.enabled` 整节/文件缺省 = **false**
+    /// （出口须 `serve start` 显式开）；手编 `[serve]` 节省略 `enabled` 键仍 = true（Go 同义
+    /// 「省略 = 启用」是字段级缺省，与整节缺省不同义——两面都钉）。
     #[test]
     fn strict_load_missing_is_default() {
         let d = tmp_state("missing");
         let fc = load_config_strict(&d).unwrap();
-        assert!(fc.serve.enabled);
+        assert!(!fc.serve.enabled, "文件缺失 ⇒ 出口不启用");
         assert!(fc.serve.listen.is_none());
+        assert!(!fc.relay.enabled);
+        // 只有 [relay] 节（出口整节缺失）⇒ 同样不启用
+        std::fs::write(d.join("config.toml"), "[relay]\nenabled = false\n").unwrap();
+        assert!(!load_config_strict(&d).unwrap().serve.enabled, "整节缺失 ⇒ 不启用");
+        // 写了 [serve] 节但省略 enabled 键 ⇒ 启用（用户显式写了出口节）
+        std::fs::write(d.join("config.toml"), "[serve]\nlisten = 41641\n").unwrap();
+        assert!(load_config_strict(&d).unwrap().serve.enabled, "省略键 ⇒ 启用（Go 同义）");
         let _ = std::fs::remove_dir_all(&d);
     }
 

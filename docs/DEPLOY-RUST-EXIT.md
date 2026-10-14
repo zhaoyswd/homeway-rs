@@ -792,3 +792,10 @@ workflow 的绿、漏看 ci。修 = 临时 state 显式造/不造 sock。② 本
   须 `rm` 后 `cp` 换新 inode；② `homeway serve restart` 只在进程内重建引擎、**不换进程**——换二进制
   后必须 `launchctl kickstart -k`；③ 经 ssh 用 `setsid … &` 起远端进程，ssh 会话会被继承的 fd 挂住
   （远端进程已脱离、不受影响）——另开会话核判据。
+
+**首装流程变更注记（2026-10-14，待随下版发布）**：新 state 的配置缺省改为 `[serve] enabled = false`
+——**新出口机首装多一步** `homeway serve start`（写 `enabled = true` 并装配；之后零参 launchd /
+`setsid` 形态按它起出口）。三台现有机器 config 已显式 `enabled = true`，不受影响。动机：客户端机
+上任何纯读命令（如 `term list`）按需拉起守护时，曾按缺省装配出口（生成身份、签发 token、监听
+41641）并以本机空会话表遮蔽远端主机（用户实测：`host add` 后 `term new` 建在本地）。详见
+`CHANGELOG.md`「未发布」与 `docs/INTEROP-CRITERIA.md` 2026-10-14「出口须显式启用」条。

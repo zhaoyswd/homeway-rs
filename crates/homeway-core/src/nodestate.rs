@@ -315,9 +315,11 @@ pub const DEFAULT_CONFIG_TOML: &str = r#"# homeway 配置（L1 意图层，唯�
 #           **值域非法 ⇒ 拒启**（serve 节严格表纪律）；env HOMEWAY_QUIC_ADMIT_RETRY 非法 ⇒ 记行 + 缺省
 #   [relay] enabled / listen(":41741") / advertise(逗号分隔，空=自动探测)
 # 客户端角色无配置节（随进程常开）；host 表在 <state>/client/hosts.json（不进 config）。
+# 出口角色须显式启用：`homeway serve start`（写 enabled = true 并装配）。新 state 缺省
+# 不启用——任何机器第一次拉起守护都不会意外成为出口（生成身份/签发 token/监听端口）。
 
 [serve]
-enabled = true
+enabled = false
 listen = 41641
 bind_interface = "auto"
 upnp = true
@@ -535,7 +537,7 @@ mod tests {
             #[serde(default)] relay: FileRelay,
         }
         let fc: FileConfig = toml::from_str(DEFAULT_CONFIG_TOML).expect("默认模板必须可解析");
-        assert!(fc.serve.enabled);
+        assert!(!fc.serve.enabled, "新 state 缺省不启用出口（2026-10-14：须 `serve start` 显式开）");
         assert_eq!(fc.serve.listen, Some(41641));
         assert_eq!(fc.serve.stun6.as_deref(), Some("stun.cloudflare.com:3478"));
         assert!(!fc.relay.enabled);

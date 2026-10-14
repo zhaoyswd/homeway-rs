@@ -1,5 +1,19 @@
 # Changelog
 
+## 未发布
+
+- **出口角色须显式启用**（用户实测驱动：新客户端机第一次 `term list` 提示加主机、第二次却列本机
+  空会话表；`host add` 后 `term new` 建在了本地）：新 state 的配置缺省 **`[serve] enabled = false`**
+  （模板与 `FileServe::default()` 两面；手编 `[serve]` 节省略 `enabled` 键仍 = 启用）——任何机器
+  第一次拉起守护都不再意外成为出口（此前会生成身份、签发 token、建 `serve/term.sock`、监听 41641）。
+  **出口机首装多一步 `homeway serve start`**（写 `enabled = true` + 装配，零参 launchd/服务随后按它起）；
+  现有已写 `enabled = true` 的机器不受影响。
+- **`--host` 缺省寻址：主机表文件不存在时不拉守护**——直接提示「还没有添加主机」（纯读命令在新机器上
+  不再有「悄悄起一个守护」的副作用；文件在时仍经守护，主机表真源不变）。
+- **`term` 本机面成立条件加第二维**：`term.sock` 在 **且** config `serve.enabled = true`——`serve stop`
+  后残留的 sock 或曾意外起过出口的机器不再遮蔽远端主机。
+- 判据登记：`docs/INTEROP-CRITERIA.md` 2026-10-14「出口须显式启用」条（CA11 拉起触发集收窄）。
+
 ## v0.3.6（2026-10-14）
 
 - **term 多 attach 异宽场景的几何治理**（用户实测驱动，九项；全部在出口侧 raw 腿面）：
