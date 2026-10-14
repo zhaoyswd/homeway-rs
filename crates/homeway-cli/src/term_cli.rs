@@ -967,18 +967,17 @@ fn attach_cmd(o: AttachOpts) -> Result<(), String> {
         return Err("attach 需要交互终端（stdin/stdout 都是 TTY）；在管道/脚本里请用 list / new -d / delete".to_owned());
     }
     let tty = Tty::open().map_err(|e| format!("读终端属性失败：{e}"))?;
-    let mut target = TermTarget {
-        state_dir: o.state_dir.clone(),
+    // 目标判定与 list/new -d/delete 同一条路（into_target：本机面〔sock 在 且 serve 启用〕
+    // / 默认主机规则）。修前这里直组 TermTarget——host_ref 为空一律落本地面，客户端机上
+    // attach/new 报「出口未在运行」（2026-10-15 MBP 实测）；L6（本地面拒 --timeout）也由
+    // into_target 内建，不再手工校验。
+    let mut target = TermCommon {
+        state_dir: Some(o.state_dir.clone()),
         host_ref: o.host_ref.clone(),
-        host_id: None,
-        timeout: o.timeout,
+        timeout: o.timeout_given.then_some(o.timeout),
         no_spawn: o.no_spawn,
-    };
-    // 本地面拒绝 --timeout（Go exec-r1 L6；远程缺省在 TermCommon::into_target 补，attach
-    // 直组 TermTarget——此处同款校验）。
-    if target.host_ref.is_empty() && o.timeout_given {
-        return Err("--timeout 仅 --host 模式可用（远程的解析/打开预算）；本地面请去掉 --timeout".to_owned());
     }
+    .into_target()?;
     if name.is_empty() && !o.auto_named {
         // attach 省略名字 = 最近活跃（远程走同一拨号缝的远程 LIST）。
         name = pick_recent_session(&mut target)?;
