@@ -799,3 +799,24 @@ workflow 的绿、漏看 ci。修 = 临时 state 显式造/不造 sock。② 本
 上任何纯读命令（如 `term list`）按需拉起守护时，曾按缺省装配出口（生成身份、签发 token、监听
 41641）并以本机空会话表遮蔽远端主机（用户实测：`host add` 后 `term new` 建在本地）。详见
 `CHANGELOG.md`「未发布」与 `docs/INTEROP-CRITERIA.md` 2026-10-14「出口须显式启用」条。
+
+### 13.9 换装 v0.3.7（2026-10-14 19:38–19:42，出口须显式启用 + 默认端口换区间 + install.sh + CLI 输出梳理）
+
+**触发**：用户四件（新客户端机 `term list` 两次行为不一致 / `host add` 后 `term new` 建在本地 → 出口须显式启用；
+tailcat 沿袭端口撞端口 → 38241/:38341；一条命令安装；CLI 输出简洁可行动）。**全部为新装机器语义**：已部署
+三机 config 显式写了 `enabled = true` 与端口，零影响；App 核零改 ⇒ tier pin 不动。清单见 `CHANGELOG.md` v0.3.7。
+
+**发版纪律本次执行到位**：先看 `gh run list --branch main` ——四个功能 commit 的 ci 全绿；bump 提交的 ci 在
+macos runner 挂 `homeway-quic` 的 `normal_races_do_not_trigger_retry_or_gate`（第 7 轮候选 CONNECTION_REFUSED，
+本地 UDP 端口瞬时形态、与本批无关）→ `gh run rerun --failed` 绿 → 才打 tag。
+
+| 机器 | 换装 | 判据 |
+|---|---|---|
+| 发版 | tag `v0.3.7` = main 头 `6bebd0a`（ci 绿后）；五目标全绿（darwin-arm64 4m8s 最长）+ release 11s | ✓ |
+| Mac | **用 `install.sh` 装**（脚本真实验收：`sh install.sh --bin-dir /opt/homebrew/bin --autostart no`——已有 launchd 代理，不让脚本再建一个）：识别 darwin-arm64 → 302 取版本 → 下载 + SHA256SUMS 校验 → 旧件备份 `homeway.bak-v0.3.6` → rm+cp → `xattr -c` → `--version` 通过；`kickstart -k` → 新 pid **76397** | `统一进程就绪（… version=v0.3.7）`；`key=8aee740b7220` **不变**；serve 仍 `listenPort=41641`（config 显式，端口缺省变更零影响）；`中继：注册成功`（19:39:29）；零参 `term list` 通（本机面 = sock + config enabled 两维均成立）✓ |
+| 阿里云 | `homeway-v0.3.7-linux-amd64.tar.gz`（sha OK）scp → `/usr/local/bin/homeway`（旧件留 `homeway.bak-v0.3.6`）；SIGTERM 6 s 退净 → `setsid` 零参起（起进程的 ssh 本地 8 s 限时后释放）→ 新 pid **1610493** | `version=v0.3.7`；`公钥 1020c3eae8b3` **不变**；serve 41641 + relay :41741 running、`ss` 两端口在听；零参 `term list` 通 ✓ |
+| 互注 | 阿里云 relay 日志：19:39:30（Mac 重启后）与 19:41:00（阿里云重启后 0.3 s）两次 `中继：后端 d07c57dd5bde1fa7 控制面就绪` | ✓ |
+| MacBook Pro | **仍离线**（ping 100% 丢包）——**待换装**：上线后在它上面跑 `curl -fsSL https://raw.githubusercontent.com/zhaoyswd/homeway-rs/main/install.sh \| sh`（客户端机，不配自启动）即可；v0.3.6 那次也欠着，一并补 | ✗ **待办** |
+
+**注**：出口机上 `install.sh` 的 `--autostart no` 是必须的——脚本的自启动项 Label 是 `homeway`，与既有
+`me.zhaozhe.homeway-exit` 并存会双实例撞 state 锁。新机器用脚本配自启动则无此问题。
