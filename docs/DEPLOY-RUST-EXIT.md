@@ -760,3 +760,35 @@ serve 子目录回退（登记 = `docs/INTEROP-CRITERIA.md` 2026-10-13「v0.3.4 
 | 阿里云 | `/usr/local/bin/homeway`（旧件留 `homeway.bak-v0.3.4`）；SIGTERM → `setsid` 零参起 | `key=1020c3eae8b3…` 不变；41641/41741 在听；零参 `term list` 通 ✓ |
 | MacBook Pro | `/usr/local/bin/homeway`（旧件留 `homeway.bak-v0.3.4`） | 登录 shell `homeway v0.3.5` ✓ |
 | 互注 | Mac `中继控制面已连（23:43:01）` ↔ 阿里云 `中继：后端 d07c57dd5bde1fa7 控制面就绪（114.242.60.128:62088）` | ✓ |
+
+### 13.8 换装 v0.3.6（2026-10-14 15:27–15:34，term 多 attach 异宽几何治理 + CI 两修）
+
+**触发**：用户两窗口异宽 attach 同一会话跑 opencode 的实测（2026-10-13 深夜～14 日凌晨）暴露一条
+四环振荡链 + 两处残留——九项修复全部在出口侧 raw 腿面（清屏序 + 跳环尾 / hover·应答·focus-out
+不记活动 / 应答让位收窄到 active 腿 / 几何切换观测行；清单见 `CHANGELOG.md` v0.3.6、登记见
+`docs/INTEROP-CRITERIA.md` 2026-10-13/14 七条）。**App 核 surface 腿面零改**（App 走 INPUT 帧）
+⇒ tier pin 不动、设备包不出。
+
+**发版前先修 main CI**（否则 tag 打在红 CI 的 main 头上）：① `term_cli::local_mode_rejects_timeout`
+自 v0.3.5「`--host` 可选化」起双 runner 一直红——测试用缺省 state，本地面成立条件 = 本机有
+`term.sock`（跑测试那台机器有出口在跑就过，CI 空环境报「先 host add」）；v0.3.5 发版只看了 release
+workflow 的绿、漏看 ci。修 = 临时 state 显式造/不造 sock。② 本批新增 `clear_screen_skips_backlog`
+首跑在 CI 挂 30+ 分钟（已取消）——程序用 zsh 专属 `TRAPWINCH()`，CI 登录 shell 是 bash 永不触发
+`(W)` 标记、退出条件「收满 1MB」在 50ms/点限速相下 ≈14 小时；修 = POSIX `trap … WINCH` + 10s 墙钟
+上界。两修后 ci 转绿（test 1m24s / 1m52s，v0.3.5 以来首次）。
+
+| 机器 | 换装 | 判据 |
+|---|---|---|
+| 发版 | tag `v0.3.6` = main 头 `34e7fbf`（ci 绿之后）；五目标全绿（darwin-arm64 4m23s 最长、linux 两目标 2m41s）+ release 11s | ✓ |
+| Mac | `homeway-v0.3.6-darwin-arm64.tar.gz`（sha 对 `SHA256SUMS` OK，7,540,056 B）→ `/opt/homebrew/bin/homeway`（换装前跑的是含本批前八项的 **devel 测试件**，直接覆盖；正式回滚件 = `homeway.bak-v0.3.5`，由早先备的 `homeway.v0.3.5.bak` 规范化改名）+ `launchctl kickstart -k` → 旧 pid 78467 → 新 **31174** | `统一进程就绪（… version=v0.3.6）`；`key=8aee740b7220…` **不变**；`中继：注册成功` + `中继控制面已连`（15:30:43）；端点 = 内网 + 公网 v4 + 公网 v6 + Relay；零参 `serve status`=running、`term list` 通 ✓ |
+| 阿里云 | `homeway-v0.3.6-linux-amd64.tar.gz`（sha OK，4,234,217 B）→ `/usr/local/bin/homeway`（旧件留 `homeway.bak-v0.3.5`）；`kill -TERM 1604309` **6 s 退净** → `cd /opt/homeway && setsid /usr/local/bin/homeway >> /root/.config/homeway/cache/unified-stdout.log 2>&1 &`（零参）→ 新 **1608318** | `后端身份 … 公钥 1020c3eae8b3…` **不变**；`统一进程就绪（… serve=true relay=true … version=v0.3.6）`；零参 `serve status`=running(41641) / `relay status`=running(:41741)；`ss` = 41641/udp + 41741/udp+tcp；零参 `term list` 通 ✓ |
+| 互注 | 阿里云重启后 **0.7 s**：`中继：后端 d07c57dd5bde1fa7 控制面就绪（114.242.60.128:60465；SESSION 通告启用拨腿模式）`（15:33:31.6）——Mac 出口自动重注册 | ✓ |
+| MacBook Pro | **离线**（ping 100% 丢包、ssh 22 超时）——**待换装**：件在 Mac mini `/tmp/hw-rel-0.3.6/homeway` 或 release 直取；形态同 13.4（→ `/usr/local/bin/homeway`，旧件留 `homeway.bak-v0.3.5`） | ✗ **待办** |
+| 两出口一致性 | Mac / 阿里云 `--version` 均 `homeway v0.3.6` | ✓ |
+
+**注**：
+- 重启收工当轮 term 会话（既有语义；两出口换装时均无会话在跑）。
+- 操作坑（本轮实踩，记忆已同步）：① `cp` 覆盖写旧 inode 的新二进制被 macOS SIGKILL（exit 137）——
+  须 `rm` 后 `cp` 换新 inode；② `homeway serve restart` 只在进程内重建引擎、**不换进程**——换二进制
+  后必须 `launchctl kickstart -k`；③ 经 ssh 用 `setsid … &` 起远端进程，ssh 会话会被继承的 fd 挂住
+  （远端进程已脱离、不受影响）——另开会话核判据。
