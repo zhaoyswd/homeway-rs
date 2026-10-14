@@ -428,7 +428,7 @@ impl ClientCore {
         let running = self.tun_running_inner(&exec);
         // unhealthyReason 只看分类是否非空（Go `if why != ""`——与 running 位独立）
         let why = lock_unpoison(&self.tun.unhealthy_why).clone();
-        let transport_unhealthy = why == "patrol";
+        let transport_unhealthy = self.tun.transport_unhealthy();
         let quic = exec.quic_status();
         let input = TunStatusInput {
             stage: snap,

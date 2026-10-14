@@ -1340,10 +1340,12 @@ fn rerace_tunnel(run: &Arc<GenRun>) -> Result<(), String> {
     let island = run
         .current_island()
         .ok_or_else(|| "岛不在".to_owned())?;
-    // 阶梯在飞则不发起（r4 N4：防宿主 Rebind 打断在途确认探活——巡检兜底路径
-    // 上阶梯可能仍活跃；B 门路径 dormant 前置天然满足）。
+    // 阶梯在飞 ⇒ 不发起（r4 N4），但**按「本轮让路」处理而非失败**（r5 M1：快照有
+    // 200ms 节流陈旧，B 门路径 dormant 前置也可能读到陈旧 inflight——返回 Ok 让调用
+    // 方不上报，等待巡检续探驱动下一轮）。
     if island.snapshot().ladder_inflight {
-        return Err("阶梯在飞".to_owned());
+        (run.logf)("重赛跑让路：阶梯在飞（或快照陈旧）——本轮不发起，待续探驱动");
+        return Ok(());
     }
     island_cmd(
         &island,
@@ -1354,7 +1356,7 @@ fn rerace_tunnel(run: &Arc<GenRun>) -> Result<(), String> {
         QUIC_RPC_BUDGET,
     )
     .map_err(|e| format!("换源失败：{e}"))?;
-    let outcome = island_cmd(
+    let outcome = match island_cmd(
         &island,
         |reply| homeway_quic::Cmd::Connect {
             cands: Vec::new(),
@@ -1362,14 +1364,30 @@ fn rerace_tunnel(run: &Arc<GenRun>) -> Result<(), String> {
             reply,
         },
         QUIC_CONNECT_BUDGET + QUIC_RPC_BUDGET,
-    )
-    .map_err(|e| format!("赛跑失败：{e}"))?;
-    if let Some(elapsed) = run.tun_shared.try_recover_transport(Duration::ZERO) {
+    ) {
+        Ok(v) => v,
+        // r5 M3：RaceInFlight = **另一入口在飞非失败**（三调用方并发时后到者让路，
+        // 不据此翻标健康位、不上报——design「统一入口单飞合并」的语义）。
+        Err(e) if e.to_string().contains("RaceInFlight") => {
+            (run.logf)("重赛跑让路：候选赛跑已在飞——本入口合并等待");
+            return Ok(());
+        }
+        Err(e) => return Err(format!("赛跑失败：{e}")),
+    };
+    // 成功判据行独立于翻回（r5 M2：B 门路径 rerace 先于 patrol 判定，why 可能仍空，
+    // try_recover 返回 None 时不该吞掉成功行）。
+    (run.logf)(&format!(
+        "阶梯尽头重赛跑：胜出 {} {}（耗时 {}ms）——传输恢复，不拆接口",
+        outcome.via.text(),
+        outcome.winner,
+        outcome.elapsed_ms
+    ));
+    if let Some(elapsed) =
+        run.tun_shared
+            .try_recover_transport_if_current(run.gen, Duration::ZERO)
+    {
         (run.logf)(&format!(
-            "阶梯尽头重赛跑：胜出 {} {}（耗时 {}ms）——传输恢复，不拆接口（patrol 清除，证据=重赛跑，距上次判定 {}）",
-            outcome.via.text(),
-            outcome.winner,
-            outcome.elapsed_ms,
+            "传输恢复（patrol 清除，证据=重赛跑，距上次判定 {}）",
             crate::go_fmt::fmt_duration_go_secs(elapsed)
         ));
     }
@@ -1517,7 +1535,7 @@ fn recover_downpush_on_island(run: &Arc<GenRun>, cause: &str) -> i32 {
     // tun-death-gate §2.2：patrol 态（已上报传输类不健康）的下推重走全链——快探+
     // 复探失败后再走一次统一重赛跑（换 socket + 全候选；成功 = 恢复，失败才交 -1
     // 给扩展的窗口逻辑）。非 patrol 态维持原「只探不做」口径（动作面在岛内阶梯）。
-    if rc == -1 && *lock_unpoison(&run.tun_shared.unhealthy_why) == "patrol" {
+    if rc == -1 && run.tun_shared.transport_unhealthy() {
         match rerace_tunnel(run) {
             Ok(()) => rc = 0,
             Err(why) => {
@@ -1605,9 +1623,10 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
             // tun-death-gate：patrol 态下探测成功 ⇒ 翻回（弱证据——受最小间隔约束，
             // 防抖动循环；重赛跑路径的强证据翻回在 rerace_tunnel 内）。
             if patrol_reported {
-                if let Some(elapsed) =
-                    run.tun_shared
-                        .try_recover_transport(TRANSPORT_RECOVER_MIN_GAP)
+                if let Some(elapsed) = run.tun_shared.try_recover_transport_if_current(
+                    run.gen,
+                    TRANSPORT_RECOVER_MIN_GAP,
+                )
                 {
                     (run.logf)(&format!(
                         "传输恢复（patrol 清除，证据=探测，距上次判定 {}）",

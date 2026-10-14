@@ -161,7 +161,14 @@ impl TunShared {
     /// 设备/传输共用，仅清 patrol**——设备类诊断文案不受影响。返回
     /// `Some(距上次判定时长)` = 已翻回（调用方打判据行）；`None` = 未翻（分类不符
     /// 或间隔未到——抖动循环由最小间隔拦）。
-    pub fn try_recover_transport(&self, min_gap: Duration) -> Option<Duration> {
+    pub fn try_recover_transport_if_current(
+        &self,
+        gen: u64,
+        min_gap: Duration,
+    ) -> Option<Duration> {
+        if self.gen.load(Ordering::Acquire) != gen {
+            return None; // 陈旧世代的重赛跑回执不得清新世代的 patrol（r5 M4）
+        }
         let mut why = lock_unpoison(&self.unhealthy_why);
         if *why != "patrol" {
             return None;
@@ -175,6 +182,12 @@ impl TunShared {
         drop(why);
         self.healthy.store(true, Ordering::Release);
         Some(elapsed)
+    }
+
+    /// 传输类不健康的单点判别（r5 L1：`why=="patrol"` 的派生集中在此——状态组装
+    /// 面两处共用，别在调用点散写字符串比对）。
+    pub fn transport_unhealthy(&self) -> bool {
+        *lock_unpoison(&self.unhealthy_why) == "patrol"
     }
 
     /// `running` 的单点合成（tun-death-gate：capi 面与对账快照共用——只反映设备面
@@ -425,7 +438,7 @@ mod tests {
     fn recover_keeps_device_class_why() {
         let sh = TunShared::new();
         sh.mark_unhealthy("fd");
-        assert!(sh.try_recover_transport(Duration::ZERO).is_none());
+        assert!(sh.try_recover_transport_if_current(1, Duration::ZERO).is_none());
         assert_eq!(
             *lock_unpoison(&sh.unhealthy_why),
             "fd",
@@ -435,21 +448,40 @@ mod tests {
         // 未知分类保守归设备：同样不翻。
         sh.begin_healthy();
         sh.mark_unhealthy("fd-timeout");
-        assert!(sh.try_recover_transport(Duration::ZERO).is_none());
+        assert!(sh.try_recover_transport_if_current(1, Duration::ZERO).is_none());
         assert!(sh.device_dead.load(Ordering::Acquire), "未知值归设备类");
+    }
+
+    /// r5 M4：翻回带世代守卫——陈旧世代的重赛跑回执不得清新世代的 patrol。
+    #[test]
+    fn recover_respects_generation_guard() {
+        let sh = TunShared::new();
+        sh.begin_generation(1);
+        sh.mark_unhealthy("patrol");
+        sh.begin_generation(2); // 新世代接管（begin_healthy 未调——新世代仍在 patrol 外）
+        sh.mark_unhealthy("patrol");
+        assert!(
+            sh.try_recover_transport_if_current(1, Duration::ZERO).is_none(),
+            "旧世代回执不得翻新世代"
+        );
+        assert!(
+            sh.try_recover_transport_if_current(2, Duration::ZERO).is_some(),
+            "当前世代照常翻回"
+        );
     }
 
     /// tun-death-gate：patrol 翻回的最小间隔与写序（先清 why 再置 healthy）。
     #[test]
     fn recover_patrol_with_min_gap() {
         let sh = TunShared::new();
+        sh.begin_generation(1);
         sh.mark_unhealthy("patrol");
         assert!(
-            sh.try_recover_transport(Duration::from_secs(30)).is_none(),
+            sh.try_recover_transport_if_current(1, Duration::from_secs(30)).is_none(),
             "间隔未到不翻（防抖动循环）"
         );
         assert_eq!(*lock_unpoison(&sh.unhealthy_why), "patrol");
-        let got = sh.try_recover_transport(Duration::ZERO);
+        let got = sh.try_recover_transport_if_current(1, Duration::ZERO);
         assert!(got.is_some(), "间隔放宽后翻回");
         assert!(sh.healthy.load(Ordering::Acquire));
         assert!(
