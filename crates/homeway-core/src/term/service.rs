@@ -4883,7 +4883,10 @@ mod tests {
         let lines = Arc::new(Mutex::new(Vec::new()));
         let cfg = TermConfig {
             shell: Some(
-                "TRAPWINCH() { printf '(W)'; }; for i in $(seq 1 30000); do printf '.'; done; \
+                // POSIX `trap … WINCH`（bash/zsh 通用）——不能用 zsh 专属 `TRAPWINCH()`：
+                // CI runner 的登录 shell 是 bash，那只是定义普通函数、永不触发 ⇒ `(W)`
+                // 永不出现 ⇒ 测试挂到墙钟上界（首跑曾在 CI 挂 30+ 分钟）。
+                "trap 'printf \"(W)\"' WINCH; for i in $(seq 1 30000); do printf '.'; done; \
                  while :; do printf '.'; sleep 0.05; done"
                     .into(),
             ),
@@ -4934,9 +4937,17 @@ mod tests {
         b.send(Op::HELLO, &frames::enc_hello(80, 24, 0, "t-skip", &tail_b));
         b.expect(Op::ATTACHED, 5);
         // A 恢复读：清屏帧（REPLAY_DONE 前的换屏前序已被 expect 消费，此后出现的
-        // \x1b[2J\x1b[H 只能是几何清屏帧）→ 首个 `(W)` 标记 → 统计其间旧字节量
+        // \x1b[2J\x1b[H 只能是几何清屏帧）→ 首个 `(W)` 标记 → 统计其间旧字节量。
+        // 墙钟上界 10s：标记不出现（trap 未生效等）直接判失败，不许挂死 CI。
         let mut all = Vec::new();
+        let wall = Instant::now() + Duration::from_secs(10);
         let stale = loop {
+            assert!(
+                Instant::now() < wall,
+                "10s 内未等到 `(W)` 标记（trap WINCH 未生效?）——已收 {}B，尾段 {:?}",
+                all.len(),
+                String::from_utf8_lossy(&all[all.len().saturating_sub(80)..])
+            );
             let chunk = read_window(&mut a, 500);
             assert!(
                 chunk.len() < 4 << 20,
@@ -4947,10 +4958,6 @@ mod tests {
             let after = &all[c + RESIZE_CLEAR_SEQ.len()..];
             if let Some(w) = find_last(after, b"(W)") {
                 break after[..w].iter().filter(|b| **b == b'.').count();
-            }
-            // 5s 上界：限速相 50ms/点 + 网络往返，超过即前置失效
-            if all.len() > 1 << 20 {
-                panic!("未等到 `(W)` 标记——TRAPWINCH 未生效?已收 {}B", all.len());
             }
         };
         assert!(
