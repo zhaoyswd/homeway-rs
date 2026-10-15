@@ -32,21 +32,21 @@ homeway relay stop/restart/status # 管理/获取中继状态
 
 ## 部署主机
 
-*配置中继*
+配置中继
 
 ```bash
 homeway serve relay set 'rl1…' # 通过中继token设置中继服务（可选）
 homeway serve relay clear # 清楚中继服务配置
 ```
 
-*配置DDND*
+配置DDND
 
 ```bash
 homeway serve ddns add exit.example.com     # 为主机配置 ddns 域名
 homeway serve ddns delete exit.example.com  # 删除 ddns 域名
 ```
 
-*启动与管理服务*
+启动与管理服务
 
 ```bash
 homeway serve start # 启动主机端，显示主机token
