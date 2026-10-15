@@ -1746,6 +1746,13 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
                     ));
                     patrol_reported = false;
                     lock_unpoison(&run.rescue).deactivate();
+                } else if !run.tun_shared.transport_unhealthy() {
+                    // 旁路恢复跟齐：重赛跑/自救轮次已清传输位（try_recover 因
+                    // why≠patrol 返回 None）——本地记账不同步会让同世代第二次死亡
+                    // 进不了自救（2026-10-16 真机实证：恢复走重赛跑后本位永真，
+                    // 巡检计数 5/3 仍不兜底，轮次永不重开）。
+                    patrol_reported = false;
+                    lock_unpoison(&run.rescue).deactivate();
                 }
             }
             if let Some((via, ep, rtt_ms)) = run.island_link() {
