@@ -49,32 +49,28 @@ pub fn protected_roots() -> Vec<(&'static str, PathBuf)> {
 /// 带预算的 `read_dir` 探测：预算内返回/权限错误即结论；预算耗尽 = [`GrantStatus::Pending`]
 /// （探测线程 detach，继续挂到系统调用返回——用户点掉弹窗后自然退出，结论丢弃）。
 pub fn probe_read_dir(path: &std::path::Path, wait: Duration) -> GrantStatus {
-    #[cfg(not(target_os = "macos"))]
-    {
-        let _ = (path, wait);
-        GrantStatus::Granted
+    // 实现平台无关（read_dir + 探测线程 + 预算）：macOS 上 TCC 未决会让 read_dir
+    // 阻塞到用户点弹窗 ⇒ 走 Pending 分支；其它平台 read_dir 立即返回真实结果，
+    // Pending 只剩慢盘含义。**不做 `#[cfg]` 特判**——曾因非 macOS 分支恒 Granted
+    // 而 unused-import 连挂 CI 三平台（2026-10-15）。
+    let p = path.to_path_buf();
+    let (tx, rx) = mpsc::channel();
+    // 探测线程：成功/失败经 channel 回执；Pending 时它继续阻塞在 read_dir 里
+    // （macOS TCC 弹窗）直到用户点掉——daemon 侧调用方须用独立线程跑本函数。
+    let spawned = std::thread::Builder::new()
+        .name("hw-tcc-probe".into())
+        .spawn(move || {
+            let r = std::fs::read_dir(&p);
+            let _ = tx.send(r.is_ok());
+        });
+    if spawned.is_err() {
+        return GrantStatus::Denied("probe_spawn_failed");
     }
-    #[cfg(target_os = "macos")]
-    {
-        let p = path.to_path_buf();
-        let (tx, rx) = mpsc::channel();
-        // 探测线程：成功/失败经 channel 回执；Pending 时它继续阻塞在 read_dir 里
-        // （TCC 弹窗）直到用户点掉——daemon 侧调用方须用独立线程跑本函数。
-        let spawned = std::thread::Builder::new()
-            .name("hw-tcc-probe".into())
-            .spawn(move || {
-                let r = std::fs::read_dir(&p);
-                let _ = tx.send(r.is_ok());
-            });
-        if spawned.is_err() {
-            return GrantStatus::Denied("probe_spawn_failed");
-        }
-        match rx.recv_timeout(wait) {
-            Ok(true) => GrantStatus::Granted,
-            Ok(false) => GrantStatus::Denied("permission"), // EPERM/EACCES 等（含用户点『不允许』）
-            Err(mpsc::RecvTimeoutError::Timeout) => GrantStatus::Pending,
-            Err(mpsc::RecvTimeoutError::Disconnected) => GrantStatus::Denied("probe_panicked"),
-        }
+    match rx.recv_timeout(wait) {
+        Ok(true) => GrantStatus::Granted,
+        Ok(false) => GrantStatus::Denied("permission"), // EPERM/EACCES/NotFound 等（macOS 含用户点『不允许』）
+        Err(mpsc::RecvTimeoutError::Timeout) => GrantStatus::Pending,
+        Err(mpsc::RecvTimeoutError::Disconnected) => GrantStatus::Denied("probe_panicked"),
     }
 }
 
