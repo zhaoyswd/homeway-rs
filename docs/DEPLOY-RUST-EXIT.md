@@ -855,3 +855,22 @@ macos runner 挂 `homeway-quic` 的 `normal_races_do_not_trigger_retry_or_gate`�
 且重连胜出的总是**公网直连**而非局域网 192.168.3.12——MBP（Wi-Fi）→ Mac mini 的局域网 UDP 路径本身不稳
 （ping 通但 UDP 发送偶发 EHOSTUNREACH；疑 AP 隔离 / ARP 抖动）。全名册 R 正是靠公网路径兜住的。
 MBP 现为 devel 测试件（含本修复，回滚件 `homeway.bak-v0.3.7`），待下版发版换正式件。
+
+### 13.10 换装 v0.3.8（2026-10-15 15:00–15:10，客户端断线自愈 + serve grant + attach 路由修复 + CLI 一致性/简化）
+
+**触发**：用户在装 v0.3.7 的机器上 `term attach` 报「term.sock 不存在」（attach 路由 bug `02067d0` 已修未发版）→ 发版。
+清单见 `CHANGELOG.md` v0.3.8 条；App 核零改 ⇒ tier pin 不动。
+
+**发版前修了两处 CI 红**（此前 4 个 push 挂）：① `tcc.rs` 的 `#[cfg]` 特判在非 macOS 恒 Granted + unused-import
+（三平台挂——**本地 mac 全绿看不见**，教训：平台分支的编译面本地交叉 check 一下）；② grant 两个 helper 只被
+macOS 代码调用（非 mac 死代码挂 clippy/windows，`#[cfg(macos)]` 门）。修后 ci 全绿（macos test 上一轮 20 min
+挂死判环境性 flake——同代码本轮 1m34s 绿）。**install.sh 在 tag 前已坏**（--grant 参数说明行丢行首 `#`，被当命令
+执行、`set -eu` 中止在安装前——Mac mini 首装实测击中）：tag 后即时修复推 main（README 的 curl 拉 main 即刻生效；
+**v0.3.8 tag 内的 install.sh 仍是坏的**——须用 main 版）。
+
+| 机器 | 换装 | 判据 |
+|---|---|---|
+| 发版 | tag `v0.3.8` = main 头 `eb6219b`（ci 绿后）；五目标全绿（darwin-arm64 4m29s 最长）+ release 13s | ✓ |
+| Mac | 修复版 install.sh（`--bin-dir /opt/homebrew/bin --autostart no`；旧 devel 测试件备份 `homeway.bak-(devel)`）+ `kickstart -k` → pid **82769** | `version=v0.3.8`；`key=8aee740b7220` **不变**；serve 41641 running；零参 `term list` 通 ✓ |
+| 阿里云 | `homeway-v0.3.8-linux-amd64.tar.gz`（sha OK）→ `/usr/local/bin/homeway`（旧件留 `homeway.bak-v0.3.7`）；SIGTERM 6s 退净 → `setsid` 零参起 → pid **1615258** | `version=v0.3.8`；`公钥 1020c3eae8b3` **不变**；serve 41641 + relay :41741 running；`term list` 通；Mac 出口控制面重就绪（15:06:57）✓ |
+| MacBook Pro | **离线**（ssh 超时——`sleep 1` 分钟的省电形态）——**待换装**：机器唤醒后一条命令 `curl -fsSL https://raw.githubusercontent.com/zhaoyswd/homeway-rs/main/install.sh \| sh`（客户端机，自启动选 N）| ✗ **待办** |
