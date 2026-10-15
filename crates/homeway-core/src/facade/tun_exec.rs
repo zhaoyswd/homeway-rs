@@ -1355,14 +1355,22 @@ fn quic_unhealthy_signal(run: &Arc<GenRun>, reason: &str) {
                 let reported = match rerace_tunnel(&r) {
                     Ok(ReraceOutcome::Recovered) => None,
                     Ok(ReraceOutcome::Yielded) => {
-                        // r3-M1(b)：让路读的是 200ms 节流快照——在飞赛跑可能已
-                        // 胜出翻回。健康位复核：已恢复就不上报不进轮次（否则健康
-                        // 隧道多挨一轮 Rebind+Connect + 扩展侧「链路异常」假告警）。
-                        if r.tun_shared.healthy.load(Ordering::Acquire) {
-                            (r.logf)("B 门重赛跑让路且健康位已翻回（在飞胜出）——不上报不进自救");
-                            None
-                        } else {
-                            Some("B 门重赛跑让路（在飞/快照陈旧）——仍上报并进自救（轮次吸收在飞态）".to_owned())
+                        // r4-1：让路读的是 200ms 节流快照——B 门从阶梯同步失败转入
+                        // 时，快照几乎必然还记着在飞（陈旧），但**「在飞」不是恢复
+                        // 证据**。有界复读：睡过一个快照同步周期后重跑一次 rerace——
+                        // 初次让路若确系陈旧，这次会真正执行（成败自定）；仍在飞则
+                        // 照 r2-N1 原口径上报进轮次（轮次吸收在飞态）。
+                        // ⚠ 健康位不可用在这里：B 门时刻它按构造恒真（世代起点
+                        // begin_healthy 置真；本 episode 的首个 mark 正是这条链要发
+                        // 的那次上报）——r3-M1b 曾误用，把常态 B 门上报整条吞掉。
+                        std::thread::sleep(Duration::from_millis(250));
+                        match rerace_tunnel(&r) {
+                            Ok(ReraceOutcome::Recovered) => None, // 复读重跑胜出——翻回已在内完成
+                            Ok(ReraceOutcome::Yielded) => Some(
+                                "B 门重赛跑让路（在飞持续——非快照陈旧）——照失败上报并进自救（轮次吸收在飞态）"
+                                    .to_owned(),
+                            ),
+                            Err(why) => Some(why),
                         }
                     }
                     Err(why) => Some(why),
@@ -1709,7 +1717,7 @@ fn recover_downpush_on_island(run: &Arc<GenRun>, cause: &str) -> i32 {
                 }
                 Ok(ReraceOutcome::Yielded) => {
                     std::thread::sleep(Duration::from_millis(500));
-                    if run.tun_shared.healthy.load(Ordering::Acquire) {
+                    if run.tun_shared.is_healthy() {
                         rc = 0; // 在飞赛跑已成功翻回（强证据）
                         break;
                     }
@@ -2000,7 +2008,7 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
                 // rerace）翻回健康位时自救未退（reset_rounds 保持 active）⇒ 会在
                 // **健康**隧道上多跑一轮全量重连、且自救中巡检跳探测（链路快照
                 // 冻结）。健康位 = 退出自救的单一收口。
-                if run.tun_shared.healthy.load(Ordering::Acquire) {
+                if run.tun_shared.is_healthy() {
                     rescue.deactivate();
                     drop(rescue);
                     run.tun_shared.bump_flip(); // 翻沿（退出自救）

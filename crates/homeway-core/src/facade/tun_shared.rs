@@ -241,6 +241,17 @@ impl TunShared {
         *lock_unpoison(&self.unhealthy_why) == "patrol"
     }
 
+    /// 健康位单点读（评审 r4-4：三处调用点直读原子位、语义注释散落——正是
+    /// r3-M1b 把它误读成「在飞动作已胜出」的温床）。**语义 = 「本世代/本 episode
+    /// 尚无未决不健康判定」**：世代起点 [`Self::begin_healthy`] 即置真、任何
+    /// mark（传输/设备）置假、恢复翻回再置真。只可用于「无未决判定」的判断
+    ///（如 recover_push 吸收循环的已恢复判据、pusher 的外部恢复同步门）；
+    /// **不得**当「某次在飞动作获胜」的证据——一次死亡 episode 的首个 mark
+    /// 往往正是调用方自己要发的那次上报，届时本位恒真。
+    pub fn is_healthy(&self) -> bool {
+        self.healthy.load(Ordering::Acquire)
+    }
+
     /// `running` 的单点合成（tun-death-gate：capi 面与对账快照共用——只反映设备面
     /// 存活：单飞锁 + **非设备死** + attached。传输类不健康〔patrol〕不再把
     /// running 拉零——调用方据 `unhealthyReason` 区分「需要重建（设备死）」与
@@ -600,6 +611,22 @@ mod tests {
         );
     }
 
+    /// **不变量（评审 r4-1，r3-M1b 教训）**：健康位在「本 episode 首个 mark
+    /// 之前」按构造恒真——B 门时刻读它必然得真。它只能表达「无未决不健康
+    /// 判定」（M1a 的用法），不得当「某次在飞动作已胜出」的证据（M1b 的误用：
+    /// 把常态 B 门上报整条吞掉，重开 ~3min 空窗）。
+    #[test]
+    fn healthy_bit_is_true_before_first_mark_of_episode() {
+        let sh = TunShared::new();
+        sh.begin_generation(1);
+        assert!(
+            sh.is_healthy(),
+            "世代起点即真——episode 首个 mark（通常是 B 门上报）之前无任何未决判定"
+        );
+        sh.mark_unhealthy("patrol");
+        assert!(!sh.is_healthy(), "mark 后才为假");
+    }
+
     /// **判据（评审 r3-M1a）**：设备类 mark 改写分类槽后 `transport_unhealthy()`
     /// 变假——「恢复」判据不得用它（recover_push 吸收循环曾据此把设备死判成
     /// rc=0，吞掉唯一合法的重建升级）。健康位是唯一精确判据：真 ⟺ 翻回/新世代。
@@ -616,7 +643,7 @@ mod tests {
             "分类槽已被设备类改写（旧判据在此误判「已恢复」）"
         );
         assert!(
-            !sh.healthy.load(Ordering::Acquire),
+            !sh.is_healthy(),
             "健康位仍假——不得按恢复收口（rc=0）"
         );
         assert!(sh.device_dead.load(Ordering::Acquire), "设备死位在册");
