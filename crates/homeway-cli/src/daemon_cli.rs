@@ -1121,7 +1121,6 @@ fn cli_serve_grant(args: &[String]) {
     {
         println!("本命令只在 macOS 需要（其它系统没有文件夹授权）");
         let _ = state;
-        return;
     }
     #[cfg(target_os = "macos")]
     {
@@ -1164,10 +1163,12 @@ fn cli_serve_grant(args: &[String]) {
 
 /// grant 首次提示标记（`<state>/cache/grant-hinted`）：`serve token` / `serve start`
 /// 的提示只打一次，grant 完成后也不再提示。
+#[cfg(target_os = "macos")] // 调用方全在 macOS 的 grant/提示面（2026-10-15：非 mac 曾死代码挂 CI）
 fn grant_hint_marker(state: &std::path::Path) -> std::path::PathBuf {
     state.join("cache").join("grant-hinted")
 }
 
+#[cfg(target_os = "macos")]
 fn mark_grant_hinted(state: &std::path::Path) {
     let _ = std::fs::create_dir_all(state.join("cache"));
     let _ = std::fs::write(grant_hint_marker(state), b"\n");
