@@ -101,11 +101,11 @@ pub struct TunStatusInput {
     pub device_dead: bool,
     /// 服务流活跃计数（tun-death-gate：files/term/speed 在册服务流数——探针流
     /// 不计入；扩展侧半死态检测用它排除「业务活跃期的 stats 静默」）。
-        pub service_streams_active: u64,
+    pub service_streams_active: u64,
     /// event-driven-heal §2.2：自救轮次耗尽位（顶层键 `rescueRoundsExhausted`——
     /// 灯塔对账与熄灯门的消费面；耗尽态被传感面首包重武装后翻回 false）。
     pub rescue_rounds_exhausted: bool,
-pub runner: Option<RunnerIn>,
+    pub runner: Option<RunnerIn>,
     pub transport: Option<TransportIn>,
     /// QUIC 岛快照段（M1 S3-2；**additive 平级段**——`None` = 本世代非 quic 档/岛不在）。
     pub quic: Option<QuicIn>,
