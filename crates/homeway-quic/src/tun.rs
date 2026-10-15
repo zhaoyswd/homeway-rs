@@ -6,7 +6,8 @@
 //!
 //! 1. **零 `std::thread::sleep`**（隔离门层 3 禁阻塞 sleep）：`wgcore` 在「读返 0 且
 //!    poll 立返可读」的空读形态用一次地板睡眠兜底；本模块改用 **`poll` 一份小片**
-//!    （[`DEAD_CONFIRM_DELAY`]）——同样是「等一小段再复看」，但不引入 `sleep`。
+//!    （[`DEAD_CONFIRM_DELAY`]）——但该小片对**恒可读** fd 是电平触发立即返回、不
+//!    构成等待（2026-10-15 事故形态），防自旋由 [`StuckReadGuard`] 双阈值判死兜底。
 //! 2. **本模块不做 fd 判死的分类**：判死（`POLLHUP/POLLERR/POLLNVAL`、`read` 返错、
 //!    写超预算）一律**记行 + 投 `Cmd::TunFdDead`**（镜像 `wgcore` 的同名命令），由岛
 //!    线程按既有取值集打 `fd` 分类（`mark_unhealthy_if_current(gen,"fd")` 的岛侧落点）。
@@ -54,6 +55,17 @@ const DROP_REPORT_BATCH: u64 = 64;
 const POLL_SLICE: Duration = Duration::from_millis(500);
 /// 空读判死的确认片（镜像 `wgcore::DEAD_CONFIRM_DELAY` 的量级；用 poll 而非 sleep）。
 const DEAD_CONFIRM_DELAY: Duration = Duration::from_millis(50);
+/// 僵死读（poll 恒报可读而 read 恒返空/EAGAIN）的判死阈值：拍数与墙钟**双条件**
+/// （2026-10-15 事故：恒可读 fd 下 poll 是电平触发立即返回，防自旋的「兜底片」
+/// 不睡——仅拍数会被微秒级紧环瞬间凑满而误判；墙钟条件同时把该形态的自旋
+/// 时长钉死在秒级上界内）。
+const STUCK_READ_MAX: u32 = 100;
+const STUCK_DEAD_AFTER: Duration = Duration::from_secs(1);
+// 口径：紧环形态下墙钟主导（判死前 ≤1s 满核、一次性）；「慢形态」（每拍 poll 真等
+// 到片末）下拍数主导（≤ STUCK_READ_MAX×POLL_SLICE ≈ 50s 判死，期间睡在 poll 里
+// 不烧 CPU）——两形态都满足合取阈值，别把 50s 判死时延当回归。真源 = tier 仓
+// openspec/changes/event-driven-heal（wg-native-transport「TUN fd 僵死形态的防自旋」
+// + design D4）。
 /// TUN 写总预算（镜像 `wgcore::write_fd_all` 的 5s——超预算按超时收 ⇒ 记行 + 卸面）。
 const WRITE_BUDGET: Duration = Duration::from_secs(5);
 
@@ -380,16 +392,75 @@ fn write_fd_all(fd: crate::sysio::RawIo, mut buf: &[u8]) -> io::Result<()> {
     Ok(())
 }
 
+/// 僵死读记账（防自旋，2026-10-15 事故修复）：「poll 立返可读而本轮未取得数据」的
+/// 连拍计数 + 首拍时刻。双阈值（[`STUCK_READ_MAX`] 拍 ∧ [`STUCK_DEAD_AFTER`] 墙钟）
+/// 同时满足才判死——poll 对恒可读 fd 是电平触发立即返回，「先转真等待」不可实现
+/// （模块零 `std::thread::sleep` 铁律），唯一有界处置是按 fd 失效收工；取得数据或
+/// 片睡到底（健康节拍）即断链清零。
+#[derive(Debug, Default)]
+struct StuckReadGuard {
+    reads: u32,
+    since: Option<Instant>,
+}
+
+impl StuckReadGuard {
+    /// 记一拍「可读而不可得」；返回 `true` = 双阈值命中（应判死）。
+    fn note_readable_empty(&mut self) -> bool {
+        self.note_readable_empty_at(Instant::now())
+    }
+
+    /// 时钟可注入的判位点（单测不真睡 [`STUCK_DEAD_AFTER`]）。
+    fn note_readable_empty_at(&mut self, now: Instant) -> bool {
+        self.reads = self.reads.saturating_add(1);
+        self.since.get_or_insert(now);
+        self.reads >= STUCK_READ_MAX
+            && now.duration_since(self.since.expect("上方已置位")) >= STUCK_DEAD_AFTER
+    }
+
+    /// 取得数据或 poll 片睡到底 ⇒ 僵死链断。
+    fn note_progress(&mut self) {
+        self.reads = 0;
+        self.since = None;
+    }
+
+    /// 判死记行用的摘要（拍数 + 实际历时）。
+    fn describe(&self) -> String {
+        let dur = self.since.map(|t| t.elapsed()).unwrap_or(Duration::ZERO);
+        format!("{} 拍/{:?}", self.reads, dur)
+    }
+
+    /// 判死记行（两条支路共用；归因文案与「对端不可达（patrol）」可区分）。
+    fn dead_msg(&self) -> String {
+        format!(
+            "tun fd 僵死：poll 恒可读而 read 恒空（{}，双阈值判死——标记隧道不健康）",
+            self.describe()
+        )
+    }
+}
+
+/// poll 结果是否报了任何被识别的事件位（纯函数——单测钉死「静默片不计数」的
+/// 高危回归：bug 形态 = 把健康空闲的静默片计拍 ⇒ 空闲 fd 约 50s 被误判死）。
+/// `writable` 不参与（本模块只等 POLLIN）。
+fn poll_reports_event(r: &Ready) -> bool {
+    r.readable || r.hup || r.err || r.nval
+}
+
 /// 读循环（应用出站方向）：裸 read → 计数 → `Cmd::TunPacket` 投岛。
 ///
-/// - OHOS 的 VPN fd 是**非阻塞**的（`wgcore` 真机实证）⇒ EAGAIN 走 poll(POLLIN, 一片)；
+/// - OHOS 的 VPN fd 是**非阻塞**的（`wgcore` 真机实证；`spawn_reader` 会先尝试
+///   `set_blocking_read`，不可清时落「非阻塞读 + poll」回退形态——OHOS 即此）⇒
+///   EAGAIN 走 poll(POLLIN, 一片)；
 /// - `n == 0`（EOF/空读）：`hup|err|nval` ⇒ 判死（记行 + `TunFdDead` + 退出），否则
 ///   用一小片 poll 兜底（替代 `wgcore` 的地板睡眠）后继续；
+/// - **僵死形态**（poll 恒报可读而 read 恒返空/EAGAIN——2026-10-15 事故：恒定约 7%
+///   单核零日志自旋）⇒ [`StuckReadGuard`] 双阈值（拍数 ∧ 墙钟）判死，同 `TunFdDead`
+///   收工——poll 对恒可读 fd 电平触发立即返回，等待不可实现（零 sleep 铁律）；
 /// - 投包失败（岛已收工/通道断）⇒ **自退**（M0 设计 §3.6-2④；不重试、不挂死）；
 /// - fd 读错 ⇒ 记行 + `TunFdDead`（岛侧打 `fd` 分类）+ 退出。
 fn read_loop(fd: crate::sysio::RawIo, tx: IslandTx, counters: Arc<TunCounters>, logf: Logf) {
     let mut buf = vec![0u8; 65535];
     let mut pending_drops: u64 = 0;
+    let mut stuck = StuckReadGuard::default();
     loop {
         // WIN 批：裸读经 sysio（unix = read(2) 原语义；windows = recv——错误经
         // WSAGetLastError 归一到 io::Error，sysio 单源）。四态直排（评审 L5：修前
@@ -398,17 +469,36 @@ fn read_loop(fd: crate::sysio::RawIo, tx: IslandTx, counters: Arc<TunCounters>, 
             Ok(n) => n,
             Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
             // WouldBlock 回退支（fd 非阻塞/标志不可清时才会走到）：等 POLLIN 一片。
-            // 三分处置（镜像 `wgcore`）：片到（TimedOut）= 继续；poll 出错 = 判死。
+            // 三分处置（镜像 `wgcore`）：片到（静默）= 继续；poll 出错 = 判死。
             Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
-                match poll_fd(fd, crate::sysio::POLLIN, Instant::now() + POLL_SLICE) {
-                    Ok(_ready) => {} // 可读优先（含 POLLIN|POLLHUP 同置：先读，下一轮定性）
-                    Err(pe) if pe.kind() == io::ErrorKind::TimedOut => {}
+                let stuck_dead = match poll_fd(fd, crate::sysio::POLLIN, Instant::now() + POLL_SLICE) {
+                    // 报了任何被识别的事件位（含 POLLIN|POLLHUP 同置——与 n==0 支口径
+                    // 一致）⇒ 立返可读而本轮无数据，记一拍僵死（真有数据会在下一轮
+                    // read 取得并清零）。
+                    Ok(r) if poll_reports_event(&r) => stuck.note_readable_empty(),
+                    // 静默片（`poll_fd` 的「片到无事件」= `Ok(Ready::default())` 全
+                    // false——`Err(TimedOut)` 只在进循环即超期时出现，本调用点不可达）
+                    // = 健康停泊节拍（EAGAIN 空闲主路径），僵死链断。
+                    Ok(_) => {
+                        stuck.note_progress();
+                        false
+                    }
+                    Err(pe) if pe.kind() == io::ErrorKind::TimedOut => {
+                        stuck.note_progress();
+                        false
+                    }
                     Err(pe) => {
                         let msg = format!("tun fd poll 失败：{pe}（标记隧道不健康）");
                         (logf)(&msg);
                         let _ = tx.send(Cmd::TunFdDead { msg });
                         return;
                     }
+                };
+                if stuck_dead {
+                    let msg = stuck.dead_msg();
+                    (logf)(&msg);
+                    let _ = tx.send(Cmd::TunFdDead { msg });
+                    return;
                 }
                 continue;
             }
@@ -443,13 +533,23 @@ fn read_loop(fd: crate::sysio::RawIo, tx: IslandTx, counters: Arc<TunCounters>, 
                 let _ = tx.send(Cmd::TunFdDead { msg: msg.into() });
                 return;
             }
-            // 「read 返 0 且 poll 立返可读」的空读形态：一小片兜底（防热自旋；
-            // 本模块不用 sleep——用 poll 片等价实现，见模块头）。
+            // 「read 返 0 且 poll 立返可读」的空读形态：兜底片对恒可读 fd 同样立返
+            // （2026-10-15 事故路径——原「防热自旋」兜底在此形态是空操作）⇒ 记一拍
+            // 僵死；不可读（片睡到底）则僵死链断。
             if readable {
                 let _ = poll_fd(fd, crate::sysio::POLLIN, Instant::now() + DEAD_CONFIRM_DELAY);
+                if stuck.note_readable_empty() {
+                    let msg = stuck.dead_msg();
+                    (logf)(&msg);
+                    let _ = tx.send(Cmd::TunFdDead { msg });
+                    return;
+                }
+            } else {
+                stuck.note_progress();
             }
             continue;
         }
+        stuck.note_progress(); // 取得数据：僵死链断
         let mut n = n;
         // packet-info 头自动探测（镜像 `wgcore` 的 r2-L4：4 字节 PI + 合法 IP 版本号才剥）
         let looks_like_pi = n >= 5
@@ -577,6 +677,100 @@ mod tests {
     /// `#[cfg(test)]` 缝定义在 `driver.rs`，本文件不命名异步栈类型）。
     fn cmd_tx() -> IslandTx {
         IslandTx::dead_for_test()
+    }
+
+    /// **判据（防自旋，2026-10-15 事故）**：僵死读的判死是**双阈值合取**——拍数到
+    /// 量而墙钟未到 ⇒ 不判（瞬时抖动不误杀）；两界都过 ⇒ 判死（自旋时长钉死在
+    /// 秒级）。时钟经 `note_readable_empty_at` 注入，测试不真睡 [`STUCK_DEAD_AFTER`]。
+    #[test]
+    fn stuck_guard_requires_both_count_and_wallclock() {
+        let mut g = StuckReadGuard::default();
+        let t0 = Instant::now();
+        // 微秒级紧环凑满拍数（每拍 8ms 假时钟推进 ⇒ 120 拍仅 0.96s，墙钟未满）：
+        // 拍数到量而墙钟未到 ⇒ 全程不判死（>= 语义下避开 100×10ms=1s 的恰界）。
+        for i in 0..(STUCK_READ_MAX + 20) {
+            let now = t0 + Duration::from_millis(u64::from(i) * 8);
+            assert!(
+                !g.note_readable_empty_at(now),
+                "第 {} 拍：墙钟 {:?} 未满 {:?}，不得判死",
+                i + 1,
+                now.duration_since(t0),
+                STUCK_DEAD_AFTER
+            );
+        }
+        // 两界都过（>100 拍且假时钟 >1s）⇒ 判死。
+        let t_dead = t0 + STUCK_DEAD_AFTER + Duration::from_millis(50);
+        assert!(
+            g.note_readable_empty_at(t_dead),
+            "拍数与墙钟双阈值命中后必须判死"
+        );
+    }
+
+    /// **判据**：取得数据或片睡到底 ⇒ 僵死链断清零——健康包流/空闲停泊不累积。
+    #[test]
+    fn stuck_guard_resets_on_progress() {
+        let mut g = StuckReadGuard::default();
+        let t0 = Instant::now();
+        // 攒到接近阈值，然后一次健康节拍清零；再从零攒并跨过双阈值 ⇒ 判死成立
+        //（清零是真的清零，不是「压线续命」）。
+        for i in 0..(STUCK_READ_MAX - 1) {
+            g.note_readable_empty_at(t0 + Duration::from_millis(u64::from(i) * 20));
+        }
+        g.note_progress();
+        assert_eq!(g.reads, 0, "清零后拍数归零");
+        assert!(g.since.is_none(), "清零后起始时刻复位");
+        for i in 0..(STUCK_READ_MAX + 5) {
+            let now = t0 + Duration::from_secs(2) + Duration::from_millis(u64::from(i) * 20);
+            // 清零后重新起算：墙钟恒已越过 STUCK_DEAD_AFTER ⇒ 第 100 拍起判死成立。
+            let dead = g.note_readable_empty_at(now);
+            assert_eq!(dead, i + 1 >= STUCK_READ_MAX, "第 {} 拍的判死态", i + 1);
+        }
+    }
+
+    /// **判据（空闲停泊不误伤）**：健康 fd（peer 在位、无数据、非阻塞 ⇒ EAGAIN →
+    /// poll 片睡到底）下读循环**不退出**——墙钟窗口内线程仍在（片睡节拍 ≥500ms，
+    /// 无自旋）；对端关闭（EOF+HUP）⇒ 既有判死路径在秒级内退出。
+    #[test]
+    fn read_loop_parks_on_idle_fd_and_exits_on_peer_close() {
+        let (a, b) = UnixStream::pair().expect("socketpair");
+        a.set_nonblocking(true).expect("置非阻塞（走 EAGAIN→poll 路径）");
+        let counters = TunCounters::new();
+        let logf = Arc::new(|_s: &str| {}) as Logf;
+        let h = std::thread::spawn(move || {
+            read_loop(a.as_raw_fd(), cmd_tx(), counters, logf);
+        });
+        std::thread::sleep(Duration::from_millis(700));
+        assert!(!h.is_finished(), "空闲 fd 上读循环必须停泊存活（EAGAIN→静默片停泊）");
+        drop(b); // 对端关闭 ⇒ EOF + POLLHUP ⇒ 既有判死路径
+        // 有界等待：判死路径失效时本测试必须失败而不是挂死（评审中-2）。
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !h.is_finished() && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(h.is_finished(), "对端关闭后读循环应在秒级内判死退出");
+        let _ = h.join();
+    }
+
+    /// **判据（评审高-1 的回归钉）**：健康空闲的「片到无事件」（`poll_fd` 返
+    /// `Ok(Ready::default())` 全 false）**不是**僵死拍——bug 形态把静默片计拍
+    /// （1 拍/500ms）⇒ 空闲 fd 约 50s 被 `TunFdDead` 误判死（评审实测 100 拍/
+    /// 49.5s）。报了任何被识别事件位（readable/hup/err/nval）才算一拍。
+    #[test]
+    fn silent_poll_slice_is_not_a_beat() {
+        assert!(
+            !poll_reports_event(&Ready::default()),
+            "静默片是健康停泊节拍，不得计僵死拍"
+        );
+        for r in [
+            Ready { readable: true, ..Ready::default() },
+            Ready { hup: true, ..Ready::default() },
+            Ready { err: true, ..Ready::default() },
+            Ready { nval: true, ..Ready::default() },
+        ] {
+            assert!(poll_reports_event(&r), "事件位（{:?}）必须计拍", r);
+        }
+        // writable 不参与（本模块只等 POLLIN）。
+        assert!(!poll_reports_event(&Ready { writable: true, ..Ready::default() }));
     }
 
     /// 写面：有界队列 → `write_fd_all`（真 fd：socketpair 的另一端），包尺寸/内容逐字节。
