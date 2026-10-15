@@ -450,6 +450,10 @@ pub struct IslandSnapshot {
     pub ladder_action: String,
     /// 阶梯单飞位（tun-death-gate：宿主重赛跑入口的发起前守卫——在飞则不发起）。
     pub ladder_inflight: bool,
+    /// 赛跑单飞位（评审 r2-N2：宿主重赛跑入口把它提到 Rebind **之前**查——
+    /// `RaceInFlight` 在 Connect 才暴露，彼时 Rebind（换本地 socket，endpoint 粒度
+    /// 副作用）已经执行，让路变成每秒一次的干扰源）。
+    pub racing: bool,
 
     // ---------- M3 S5：准入失败归因（设计 §4；`quic` JSON 段的两个新键） ----------
     /// 末次**准入被拒**的应用码（`None` = 未发生过）。

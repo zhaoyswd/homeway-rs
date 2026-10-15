@@ -56,12 +56,15 @@ const FAIL_STREAK_LADDER: u32 = 3;
 const PATROL_FAIL_WINDOW: Duration = Duration::from_secs(600);
 /// demand pusher 节拍（D4：App 出站新鲜 + 接收静默 → 立即下推，不等巡检拍）。
 const PUSHER_TICK: Duration = Duration::from_secs(1);
-/// 闲置分档拍（评审 r1-F24）：非自救中且连续数拍无新鲜出站包时，传感面的响应
-/// 粒度放宽到 5s——首包到轮次起跑的延迟从 ≤1s 变 ≤5s（轮次一旦 active 立即回
-/// 1s 桍），换来稳态唤醒 1/s → 0.2/s。
+/// 闲置分档拍（评审 r1-F24）：非自救中且连续数拍无新鲜出站包时，传感面的业务拍
+/// 放宽到 5s——首包到轮次起跑的延迟从 ≤1s 变 ≤5s（轮次一旦 active 立即回
+/// 1s 档）。降的是业务拍频次与日志机会；线程唤醒仍 1/s（收工有界等待钉住片界）。
 const PUSHER_IDLE_TICK: Duration = Duration::from_secs(5);
 /// 连续多少拍无新鲜包才升到闲置档（升档要快、降档即时——rescue active 直接回 1s）。
 const PUSHER_IDLE_AFTER: u32 = 3;
+/// 让路退避（评审 r2-N2）：rerace 对在飞让路后，至少隔这么久才重试——在飞态
+/// 持续期间的重复尝试只是空转（且退避窗内不消耗包新鲜门，见 pusher）。
+const RERACE_YIELD_BACKOFF: Duration = Duration::from_secs(5);
 /// stats 周期的下限（防 cfg.stats_secs 填 0 打爆日志；Go normalize 同义下限）。
 const STATS_SECS_MIN: i64 = 5;
 /// stats 周期缺省（Go normalizeTunConfig 的 StatsSecs 缺省 60）。
@@ -1345,10 +1348,20 @@ fn quic_unhealthy_signal(run: &Arc<GenRun>, reason: &str) {
             .name("homeway-rerace".into())
             .spawn(move || {
                 // Recovered：翻回已在 rerace_tunnel 内完成（强证据不上报）。
-                // Yielded：阶梯/赛跑在飞——其完成自会驱动后续事件。
-                if let Err(why) = rerace_tunnel(&r) {
+                // Yielded（r2-N1）：B 门是「阶梯自己宣布走完」的权威结论——让路
+                // （快照陈旧/并发在飞）不等于无结论，照失败同款上报+进轮次（pusher
+                // 的轮次会吸收在飞态：rerace 对在飞零副作用让路 + 让路退避重试）；
+                // 静默丢弃会把 F26 刚消灭的 ~3min 上报空窗在 Yielded 子情形下带回来。
+                let reported = match rerace_tunnel(&r) {
+                    Ok(ReraceOutcome::Recovered) => None,
+                    Ok(ReraceOutcome::Yielded) => {
+                        Some("B 门重赛跑让路（在飞/快照陈旧）——仍上报并进自救（轮次吸收在飞态）".to_owned())
+                    }
+                    Err(why) => Some(why),
+                };
+                if let Some(label) = reported {
                     (r.logf)(&format!(
-                        "阶梯尽头重赛跑：未获对端证据（{why}）——上报传输类不健康"
+                        "阶梯尽头重赛跑：未获对端证据（{label}）——上报传输类不健康"
                     ));
                     r.tun_shared.mark_unhealthy_if_current(r.gen, "patrol");
                     // 评审 r1-F26：B 门失败 = 「岛内阶梯已走完」的强证据——直接
@@ -1474,11 +1487,13 @@ fn rerace_tunnel(run: &Arc<GenRun>) -> Result<ReraceOutcome, String> {
     let island = run
         .current_island()
         .ok_or_else(|| "岛不在".to_owned())?;
-    // 阶梯在飞 ⇒ 不发起（r4 N4），但**按「本轮让路」处理而非失败**（r5 M1：快照有
-    // 200ms 节流陈旧，B 门路径 dormant 前置也可能读到陈旧 inflight——让路等待巡检
-    // 续探驱动下一轮）。
-    if island.snapshot().ladder_inflight {
-        (run.logf)("重赛跑让路：阶梯在飞（或快照陈旧）——本轮不发起，待续探驱动");
+    // 在飞守卫（r4 N4 / r2-N2）：阶梯或赛跑在飞 ⇒ 让路。**必须在 Rebind 之前**——
+    // `RaceInFlight` 要到 Connect 才暴露，彼时 Rebind（换本地 socket，endpoint 粒度
+    // 副作——影响该端点全部连接）已经执行；把守卫提前后让路路径零副作用。快照有
+    // 200ms 节流陈旧（残余 check-then-act 窗口由 Connect 的单飞位兜底）。
+    let snap = island.snapshot();
+    if snap.ladder_inflight || snap.racing {
+        (run.logf)("重赛跑让路：阶梯/赛跑在飞（或快照陈旧）——本轮不发起，零副作用等待");
         return Ok(ReraceOutcome::Yielded);
     }
     island_cmd(
@@ -1670,17 +1685,28 @@ fn recover_downpush_on_island(run: &Arc<GenRun>, cause: &str) -> i32 {
     // 复探失败后再走一次统一重赛跑（换 socket + 全候选；成功 = 恢复，失败才交 -1
     // 给扩展的窗口逻辑）。非 patrol 态维持原「只探不做」口径（动作面在岛内阶梯）。
     if rc == -1 && run.tun_shared.transport_unhealthy() {
-        match rerace_tunnel(run) {
-            Ok(ReraceOutcome::Recovered) => rc = 0,
-            Ok(ReraceOutcome::Yielded) => {
-                // r1-F1：在飞让路不是恢复——不虚报 rc=0；在飞赛跑的结果由翻沿/
-                // 轮次面收敛，这里如实保 -1。
-                (run.logf)("恢复下推重赛跑：让路（赛跑在飞）——如实保未恢复，结果由翻沿收敛");
-            }
-            Err(why) => {
-                (run.logf)(&format!(
-                    "阶梯尽头重赛跑：未获对端证据（{why}）——下推全链未恢复"
-                ));
+        // r2-N4：让路不是失败——rc 面值 -1 会被扩展当「重绑未恢复」升级整套重建
+        //（拆 TUN 重启核，抢在在飞赛跑出结果之前）。有界吸收在飞（≤3s，赛跑预算
+        // 同量级）：期间健康位翻回（在飞赛跑成功）= rc 0。
+        for _ in 0..6 {
+            match rerace_tunnel(run) {
+                Ok(ReraceOutcome::Recovered) => {
+                    rc = 0;
+                    break;
+                }
+                Ok(ReraceOutcome::Yielded) => {
+                    std::thread::sleep(Duration::from_millis(500));
+                    if !run.tun_shared.transport_unhealthy() {
+                        rc = 0; // 在飞赛跑已成功翻回
+                        break;
+                    }
+                }
+                Err(why) => {
+                    (run.logf)(&format!(
+                        "阶梯尽头重赛跑：未获对端证据（{why}）——下推全链未恢复"
+                    ));
+                    break;
+                }
             }
         }
     }
@@ -1907,6 +1933,7 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
     let mut last_tick = Instant::now();
     let mut last_tick_len = PUSHER_TICK;
     let mut idle_ticks: u32 = 0;
+    let mut yield_until: Option<Instant> = None; // r2-N2：rerace 让路退避锚
     let mut exhausted_reported = false;
     loop {
         if run.stop.load(Ordering::Acquire) {
@@ -1914,8 +1941,10 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
         }
         // 分片等待（评审 r2-H3：整段 sleep(1s) 一样挡收工；IDLE-WAKE B：片界 100ms→
         // 1s 封顶——pusher 的业务拍本就是 1s，此改只是把 stop 等待片的空转从 10/s 降到
-        // 1/s，尾部不变）。r1-F24：非自救且无新鲜包时升 5s 档（首包后的第一拍最多
-        // 迟 5s 才见——轮次 active 即回 1s）。
+        // 1/s，尾部不变）。r1-F24/r2-N11：非自救且无新鲜包时升 5s 档——**降的是业务
+        // 拍频次与观测噪声**（线程唤醒仍 1/s：收工的有界等待要求片界 ≤1s，5s 整睡
+        // 会让 tun_stop 的 join 超预算）；首包后的第一拍最多迟 5s 才见——轮次
+        // active 即回 1s 档。
         let tick = {
             let rescue_active = lock_unpoison(&run.rescue).is_active();
             if !rescue_active && idle_ticks >= PUSHER_IDLE_AFTER {
@@ -1937,7 +1966,10 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
             continue;
         }
         let now = Instant::now();
-        let suspend_window = now.duration_since(last_tick) > 2 * last_tick_len;
+        // r2-N11：挂起窗阈值取 max(上一拍长, 本拍长)——进 5s 档的过渡拍若按上一拍
+        // （1s）算，5s > 2×1s 会被误判成挂起窗口（该档只在非自救时选中，当前无害，
+        // 但自救恰在这次长睡中被激活时会白丢一拍）。
+        let suspend_window = now.duration_since(last_tick) > 2 * last_tick_len.max(tick);
         last_tick_len = tick;
         last_tick = now;
         // 自救中（§2.1）：传感面 = 出站包记账仍在更新（连接面死而 TUN 读面在位、
@@ -1946,6 +1978,16 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
         {
             let mut rescue = lock_unpoison(&run.rescue);
             if rescue.is_active() {
+                // r2-N3：外部恢复同步——轮次之外的路径（recover() 换网重绑、B 门
+                // rerace）翻回健康位时自救未退（reset_rounds 保持 active）⇒ 会在
+                // **健康**隧道上多跑一轮全量重连、且自救中巡检跳探测（链路快照
+                // 冻结）。健康位 = 退出自救的单一收口。
+                if run.tun_shared.healthy.load(Ordering::Acquire) {
+                    rescue.deactivate();
+                    drop(rescue);
+                    run.tun_shared.bump_flip(); // 翻沿（退出自救）
+                    continue;
+                }
                 let out_at = run.l3_last_outbound_at();
                 let packet_fresh = out_at
                     .map(|t| now.duration_since(t) < demand::OUTBOUND_FRESH)
@@ -1956,6 +1998,11 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
                         exhausted_reported = false; // 重武装后再耗尽可再次上报
                     }
                 }
+                // r2-N2：让路退避窗内不重试（也不消耗包新鲜门——伪造包位是 r1 引入
+                // 的缺陷：让路链里 wants_round 每拍都能过门 = 每秒重跑一次）。
+                if yield_until.map(|t| now < t).unwrap_or(false) {
+                    continue;
+                }
                 if rescue.wants_round(now, suspend_window) {
                     drop(rescue); // rerace 带预算等待，不持锁
                     match rerace_tunnel(&run) {
@@ -1965,10 +2012,11 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
                             exhausted_reported = false;
                             run.tun_shared.bump_flip(); // 翻沿（退出自救）
                         }
-                        // r1-F1：让路 ≠ 恢复——不退出自救、不消耗轮次；包新鲜门在
-                        // wants_round 内已清，本拍出站仍新鲜 ⇒ 重新武装，下拍再试。
+                        // r1-F1/r2-N2：让路 ≠ 恢复——不退出自救、不消耗轮次、**不伪造
+                        // 包新鲜位**（伪造 = 让路链绕过包门每秒重跑）；让路退避 5s 后
+                        // 由真实包/免费轮自然重试，在飞结果由翻沿/健康位收敛。
                         Ok(ReraceOutcome::Yielded) => {
-                            lock_unpoison(&run.rescue).note_packet();
+                            yield_until = Some(now + RERACE_YIELD_BACKOFF);
                         }
                         Err(why) => {
                             let exhausted = {

@@ -272,6 +272,10 @@ impl TunShared {
             self.signal_stop();
             self.mark_unhealthy("stop");
             self.probe_running.store(false, Ordering::Release);
+            // 评审 r2-F25 廉价替代：世代结束 = 一次翻沿——唤醒所有在飞 wait_flip
+            //（宿主侧已置停不会重挂；不 bump 则暗态/销毁路径的在飞等待要挂满
+            // 2min 上限才归，白占 NAPI 工作线程槽）。
+            self.bump_flip();
         }
         // done/attach 通道同过世代守卫（评审 r2-H2：它们是 TunShared 单例槽——
         // 旧世代迟到的收尾若无条件写，会污染新世代：① attach 通道被关 ⇒ 新世代

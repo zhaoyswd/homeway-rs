@@ -1149,6 +1149,7 @@ async fn housekeeping(
         s.ladder_jitter_streak = st.ladder.jitter_streak();
         s.ladder_action = st.ladder.last_action.to_owned();
         s.ladder_inflight = st.ladder.inflight();
+        s.racing = st.racing; // r2-N2：赛跑单飞位上面（宿主重赛跑入口的 Rebind 前置守卫）
         st.snap_sync_last = Some(Instant::now());
     }
     // ⑤ 「窄路径不可用」判据（mds 变小/连接换过都要重判；S2-4）
