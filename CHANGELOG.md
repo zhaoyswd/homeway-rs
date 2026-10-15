@@ -1,6 +1,6 @@
 # Changelog
 
-## 未发布
+## v0.3.8（2026-10-15）
 
 - **CLI 简化第一批：删除 `homeway portfwd` 直连命令**（用户指令：除 host add 外 --token 形态对用户无价值）——
   正式用法 = `homeway forward`；承载面（forward 命令 / 词表 / STREAM[dial]）零变化。依赖盘点确认无工具依赖；
