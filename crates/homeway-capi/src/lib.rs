@@ -107,7 +107,8 @@ fn guard<T>(body: impl FnOnce() -> T + std::panic::UnwindSafe, fallback: impl Fn
 }
 
 // ---------------------------------------------------------------------------
-// 20 个导出（符号名/签名/语义 = Go probe_lib.go 及 app_*.go 的 //export 逐个对齐）
+// 21 个导出（符号名/签名/语义 = Go probe_lib.go 及 app_*.go 的 //export 逐个对齐；
+// ClientCoreTunWaitFlip 为 event-driven-heal §2.4 新面——无 Go 对应物）
 // ---------------------------------------------------------------------------
 
 /// ClientCoreVersion：`tier core %s (%s, c-shared)` 同形。
@@ -137,6 +138,19 @@ pub extern "C" fn ClientCoreTunAttach(fd: std::os::raw::c_int) -> std::os::raw::
 #[no_mangle]
 pub extern "C" fn ClientCoreTunStatus() -> *mut std::os::raw::c_char {
     guard(|| ret_cstring(&core().tun_status()), empty_cstr)
+}
+
+/// ClientCoreTunWaitFlip：挂起式等待翻沿（event-driven-heal §2.4 选型 (b)）。
+/// 入参 JSON `{"lastSeq":N,"timeoutMs":M}`（JSON 进/JSON 出——与 ProbeAddr 族
+/// 同面）；超时返回当前快照即轻对账；单飞 ≤1 与重挂节奏由宿主保证。
+#[no_mangle]
+pub extern "C" fn ClientCoreTunWaitFlip(
+    c_arg: *const std::os::raw::c_char,
+) -> *mut std::os::raw::c_char {
+    guard(
+        || ret_cstring(&core().tun_wait_flip(&arg_str(c_arg))),
+        empty_cstr,
+    )
 }
 
 /// ClientCoreTunStop：0 已停 / -1 等待超时 / -2 超时后强制放锁。

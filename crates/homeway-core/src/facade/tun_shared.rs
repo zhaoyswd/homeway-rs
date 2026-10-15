@@ -59,6 +59,12 @@ pub struct TunShared {
     /// 评审 r2-L12。世代线程入口经 [`Self::set_stop_flag_if_current`] 登记；
     /// `finish_generation` 对当前世代置位——保证收尾路径不依赖 request_stop 先行）。
     stop_flag: Mutex<Option<Arc<AtomicBool>>>,
+    /// event-driven-heal §2.4：翻沿序号（宿主挂起式等待的唤醒面——分类/自救态的
+    /// 任何翻沿都 `bump_flip`；宿主 `wait_flip` 比对上次见到的序号即知有翻沿）。
+    flip_seq: AtomicU64,
+    /// 翻沿等待原语（与 `flip_seq` 配对；锁本身无载荷——只做唤醒/序号可见性）。
+    flip_gate: Mutex<()>,
+    flip_cv: Condvar,
 }
 
 impl Default for TunShared {
@@ -80,6 +86,9 @@ impl TunShared {
             attach_tx: Mutex::new(None),
             done: Mutex::new(false),
             done_cv: Condvar::new(),
+            flip_seq: AtomicU64::new(0),
+            flip_gate: Mutex::new(()),
+            flip_cv: Condvar::new(),
             stop_flag: Mutex::new(None),
         }
     }
@@ -135,6 +144,7 @@ impl TunShared {
             *lock_unpoison(&self.last_patrol_at) = Some(Instant::now());
         }
         self.healthy.store(false, Ordering::Release);
+        self.bump_flip(); // 翻沿（进入不健康——设备类或传输类）
     }
 
     /// 带世代守卫的不健康标记（评审 r2-M1：Go `tunRun.markUnhealthy` 内有
@@ -154,6 +164,7 @@ impl TunShared {
         self.healthy.store(true, Ordering::Release);
         self.device_dead.store(false, Ordering::Release);
         *lock_unpoison(&self.last_patrol_at) = None;
+        self.bump_flip(); // 翻沿（新世代起点 = 全清）
     }
 
     /// 传输健康翻回（tun-death-gate）：仅当分类为 `patrol` 且距上次判定 ≥ `min_gap`
@@ -181,7 +192,47 @@ impl TunShared {
         *why = String::new();
         drop(why);
         self.healthy.store(true, Ordering::Release);
+        self.bump_flip(); // 翻沿（传输健康恢复）
         Some(elapsed)
+    }
+
+    /// 翻沿信号（event-driven-heal §2.4）：分类/自救态翻沿时调用——唤醒所有
+    /// 挂起中的 `wait_flip`。返回新序号。
+    pub fn bump_flip(&self) -> u64 {
+        let seq = self.flip_seq.fetch_add(1, Ordering::AcqRel) + 1;
+        drop(lock_unpoison(&self.flip_gate));
+        self.flip_cv.notify_all();
+        seq
+    }
+
+    /// 翻沿序号读面（宿主首次调用前取基线）。
+    pub fn flip_seq(&self) -> u64 {
+        self.flip_seq.load(Ordering::Acquire)
+    }
+
+    /// 挂起式等待翻沿（event-driven-heal §2.4 选型 (b)：单飞 ≤1 由宿主保证；
+    /// 超时返回**当前**序号——超时本身构成一次轻对账，不丢翻沿）。序号已大于
+    /// `last` 时立即返回。
+    pub fn wait_flip(&self, last: u64, timeout: Duration) -> u64 {
+        let mut g = lock_unpoison(&self.flip_gate);
+        let deadline = Instant::now() + timeout;
+        while self.flip_seq.load(Ordering::Acquire) <= last {
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            let slice = deadline.saturating_duration_since(now);
+            let (g2, res) = match self.flip_cv.wait_timeout(g, slice) {
+                Ok(v) => v,
+                // 毒锁：取回守卫与超时结果按常态收口（序号在锁内重读）
+                Err(e) => e.into_inner(),
+            };
+            g = g2;
+            if res.timed_out() {
+                break;
+            }
+        }
+        self.flip_seq.load(Ordering::Acquire)
     }
 
     /// 传输类不健康的单点判别（r5 L1：`why=="patrol"` 的派生集中在此——状态组装
@@ -275,6 +326,63 @@ impl TunShared {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// **判据（event-driven-heal §2.4）**：翻沿信号唤醒挂起中的等待——bump 后
+    /// wait_flip 即时返回（不等超时），返回新序号。
+    #[test]
+    fn flip_wakes_pending_wait_with_new_seq() {
+        let sh = std::sync::Arc::new(TunShared::new());
+        let sh2 = std::sync::Arc::clone(&sh);
+        let h = std::thread::spawn(move || sh2.wait_flip(0, Duration::from_secs(5)));
+        std::thread::sleep(Duration::from_millis(50));
+        let t0 = Instant::now();
+        assert_eq!(sh.bump_flip(), 1, "bump 返回新序号");
+        let got = h.join().expect("等待线程收口");
+        assert_eq!(got, 1);
+        assert!(
+            t0.elapsed() < Duration::from_secs(1),
+            "唤醒即时（实测 {:?}）",
+            t0.elapsed()
+        );
+    }
+
+    /// **判据**：超时返回当前序号（不丢翻沿语义——超时即一次轻对账）；已过序号
+    /// 立即返回不等待。
+    #[test]
+    fn flip_wait_times_out_and_immediate_path() {
+        let sh = TunShared::new();
+        let t0 = Instant::now();
+        assert_eq!(sh.wait_flip(0, Duration::from_millis(80)), 0, "无翻沿：超时返当前序号");
+        assert!(t0.elapsed() >= Duration::from_millis(70), "真等了超时窗");
+        assert_eq!(sh.bump_flip(), 1);
+        let t1 = Instant::now();
+        assert_eq!(sh.wait_flip(0, Duration::from_secs(5)), 1, "已过序号：立即返回");
+        assert!(t1.elapsed() < Duration::from_secs(1));
+        assert_eq!(sh.wait_flip(1, Duration::from_millis(0)), 1, "timeout=0 = 立即取快照");
+    }
+
+    /// **判据**：三个翻沿点都 bump——mark_unhealthy（进入不健康，两类都算）、
+    /// begin_healthy（新世代清零）、try_recover_transport（传输翻回）。
+    #[test]
+    fn classification_flips_signal_the_channel() {
+        let sh = TunShared::new();
+        let base = sh.flip_seq();
+        sh.mark_unhealthy("patrol");
+        assert!(sh.flip_seq() > base, "进入传输类不健康 = 翻沿");
+        let mid = sh.flip_seq();
+        sh.begin_generation(1);
+        sh.begin_healthy();
+        assert!(sh.flip_seq() > mid, "新世代清零 = 翻沿");
+        // 传输翻回：需 patrol 分类 + 过最小间隔（0 = 恒过）
+        sh.mark_unhealthy("patrol");
+        let before = sh.flip_seq();
+        assert!(sh.try_recover_transport_if_current(1, Duration::ZERO).is_some());
+        assert!(sh.flip_seq() > before, "传输健康翻回 = 翻沿");
+        // 陈旧世代不翻沿（守卫语义不因翻沿通道改变）
+        let guard_before = sh.flip_seq();
+        assert!(sh.try_recover_transport_if_current(999, Duration::ZERO).is_none());
+        assert_eq!(sh.flip_seq(), guard_before, "陈旧世代不产生翻沿");
+    }
 
     #[test]
     fn finish_releases_lock_and_resets_stage() {

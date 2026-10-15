@@ -454,6 +454,40 @@ impl ClientCore {
         tun_status::tun_status_json(&input)
     }
 
+    /// event-driven-heal §2.4：挂起式等待翻沿（宿主收到后立即重挂——单飞 ≤1 由
+    /// 宿主保证；超时返回**当前**快照，超时本身构成一次轻对账）。入参 JSON：
+    /// `{"lastSeq":N,"timeoutMs":M}`（缺省/解析失败按 0——立即取快照）；返回
+    /// `{"seq":N,"transportUnhealthy":b,"deviceDead":b,"rescueRoundsExhausted":b}`。
+    /// timeout 上限 2 分钟（设计 D5 单次等待上界）。
+    pub fn tun_wait_flip(&self, arg_json: &str) -> String {
+        #[derive(serde::Deserialize, Default)]
+        struct WaitFlipArg {
+            #[serde(default)]
+            last_seq: u64,
+            #[serde(default)]
+            timeout_ms: u64,
+        }
+        let arg: WaitFlipArg = serde_json::from_str(arg_json).unwrap_or_default();
+        let timeout = Duration::from_millis(arg.timeout_ms).min(Duration::from_secs(120));
+        let seq = self.tun.wait_flip(arg.last_seq, timeout);
+        let exec = self.executor();
+        let mut m = serde_json::Map::new();
+        m.insert("seq".into(), serde_json::Value::from(seq));
+        m.insert(
+            "transportUnhealthy".into(),
+            serde_json::Value::from(self.tun.transport_unhealthy()),
+        );
+        m.insert(
+            "deviceDead".into(),
+            serde_json::Value::from(self.tun.device_dead.load(Ordering::Acquire)),
+        );
+        m.insert(
+            "rescueRoundsExhausted".into(),
+            serde_json::Value::from(exec.rescue_rounds_exhausted()),
+        );
+        serde_json::to_string(&m).unwrap_or_else(|_| "{\"seq\":0}".to_owned())
+    }
+
     fn tun_running_inner(&self, _exec: &Arc<dyn TunExecutor>) -> bool {
         // tun-death-gate：running 只反映设备面存活（单飞锁 + 非设备死 + attached），
         // 单点合成在 TunShared::running（capi 面与对账快照共用同一份）。传输类不健康
@@ -758,6 +792,27 @@ mod tests {
             }
             std::thread::sleep(Duration::from_millis(10));
         }
+    }
+
+    /// **判据（event-driven-heal §2.4）**：WaitFlip 的 JSON 面——立即取快照（timeout
+    /// 缺省 = 0）返回全量分类四键；翻沿唤醒路径在 TunShared 单测覆盖（此处钉 capi
+    /// 消费的组装面）。
+    #[test]
+    fn tun_wait_flip_snapshot_json_face() {
+        let core = core_with(true, true);
+        // 坏入参按缺省（0/0）处理：立即返回当前快照，不 panic。
+        let snap = core.tun_wait_flip("not-json");
+        assert!(snap.contains("\"seq\""), "快照含 seq：{snap}");
+        assert!(snap.contains("\"transportUnhealthy\""));
+        assert!(snap.contains("\"deviceDead\""));
+        assert!(snap.contains("\"rescueRoundsExhausted\""));
+        let v: serde_json::Value = serde_json::from_str(&snap).unwrap();
+        assert_eq!(v["transportUnhealthy"], serde_json::json!(false));
+        assert_eq!(v["deviceDead"], serde_json::json!(false));
+        assert_eq!(v["rescueRoundsExhausted"], serde_json::json!(false));
+        // 显式入参形态可解析（lastSeq 基线 + 短超时立即返）。
+        let snap2 = core.tun_wait_flip(r#"{"lastSeq":0,"timeoutMs":10}"#);
+        assert!(snap2.contains("\"seq\""));
     }
 
     /// 两阶段全流程：prepare（受理 → ready）→ attach（0）→ running=1 → stop（0）。

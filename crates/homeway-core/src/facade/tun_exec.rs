@@ -1905,6 +1905,7 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
                             (run.logf)("自救轮次：统一重赛跑恢复成功 —— 退出自救");
                             lock_unpoison(&run.rescue).note_round_result(now, true);
                             exhausted_reported = false;
+                            run.tun_shared.bump_flip(); // 翻沿（退出自救）
                         }
                         Err(why) => {
                             let exhausted = {
@@ -1917,6 +1918,7 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
                                 (run.logf)(
                                     "自救轮次耗尽（3 轮失败）—— 上报宿主（熄灯门：扩展按本 episode 出站包记账处置）",
                                 );
+                                run.tun_shared.bump_flip(); // 翻沿（轮次耗尽）
                             } else if !exhausted {
                                 (run.logf)(&format!("自救轮次未恢复（{why}）—— 按节流等待下一轮"));
                             }
