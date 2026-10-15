@@ -40,7 +40,9 @@ pub struct TunShared {
     pub stage: StageMachine,
     /// 健康位（传输面，tun-death-gate 拆分后）：`patrol` 写假、翻回写真——不再
     /// 承载设备死亡（设备死看 [`Self::device_dead`]）。
-    pub healthy: AtomicBool,
+    /// 私有（评审 r5-低：生产读必须走 [`Self::is_healthy`] 的语义单点——
+    /// 直读原子位正是 r3-M1b 误用的温床；模块内白盒测试不受影响）。
+    healthy: AtomicBool,
     /// 设备死位（fd/panic/stop + 未知分类；单向——仅新世代 [`Self::begin_healthy`]
     /// 清）。`running()` 只看它：传输类不健康不再把 running 拉零（2026-10-15 事故
     /// 的误杀链入口）。
