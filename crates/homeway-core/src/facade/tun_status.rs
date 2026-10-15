@@ -101,8 +101,11 @@ pub struct TunStatusInput {
     pub device_dead: bool,
     /// 服务流活跃计数（tun-death-gate：files/term/speed 在册服务流数——探针流
     /// 不计入；扩展侧半死态检测用它排除「业务活跃期的 stats 静默」）。
-    pub service_streams_active: u64,
-    pub runner: Option<RunnerIn>,
+        pub service_streams_active: u64,
+    /// event-driven-heal §2.2：自救轮次耗尽位（顶层键 `rescueRoundsExhausted`——
+    /// 灯塔对账与熄灯门的消费面；耗尽态被传感面首包重武装后翻回 false）。
+    pub rescue_rounds_exhausted: bool,
+pub runner: Option<RunnerIn>,
     pub transport: Option<TransportIn>,
     /// QUIC 岛快照段（M1 S3-2；**additive 平级段**——`None` = 本世代非 quic 档/岛不在）。
     pub quic: Option<QuicIn>,
@@ -187,6 +190,11 @@ pub fn tun_status_json(input: &TunStatusInput) -> String {
     m.insert(
         "serviceStreamsActive".into(),
         Value::from(input.service_streams_active),
+    );
+    // event-driven-heal §2.2：自救轮次耗尽位（灯塔对账与熄灯门的消费面）。
+    m.insert(
+        "rescueRoundsExhausted".into(),
+        Value::from(input.rescue_rounds_exhausted),
     );
 
     // demand 段：reason 空 = 从未判定（Go 兜「未判定」）
@@ -372,7 +380,12 @@ mod tests {
                 let mut v: serde_json::Value =
                     serde_json::from_str(&got_norm).expect("归一后仍是合法 JSON");
                 if let serde_json::Value::Object(ref mut m) = v {
-                    for k in ["transportUnhealthy", "deviceDead", "serviceStreamsActive"] {
+                    for k in [
+                        "transportUnhealthy",
+                        "deviceDead",
+                        "serviceStreamsActive",
+                        "rescueRoundsExhausted",
+                    ] {
                         m.remove(k);
                     }
                 }
@@ -435,7 +448,8 @@ mod tests {
             keys,
             vec![
                 "code", "demand", "deviceDead", "elapsedMs", "meowed", "readyBy", "reason",
-                "running", "serviceStreamsActive", "state", "transportUnhealthy",
+                "rescueRoundsExhausted", "running", "serviceStreamsActive", "state",
+                "transportUnhealthy",
             ]
         );
         // demand 段键面与「未判定」兜底
@@ -459,6 +473,7 @@ mod tests {
             transport_unhealthy: true,
             device_dead: false,
             service_streams_active: 2,
+            rescue_rounds_exhausted: false,
             runner: Some(RunnerIn {
                 fd_read_bytes: 111,
                 fd_write_bytes: 222,
@@ -502,8 +517,9 @@ mod tests {
             vec![
                 "bridgeAuth", "bridgeFilesSock", "bridgeSpeedSock", "bridgeTermSock", "code",
                 "demand", "deviceDead", "elapsedMs", "exitIp", "identity", "link", "meowed",
-                "portForwards", "readyBy", "reason", "running", "serviceStreamsActive",
-                "state", "stats", "transportUnhealthy", "tunIp", "unhealthyReason",
+                "portForwards", "readyBy", "reason", "rescueRoundsExhausted", "running",
+                "serviceStreamsActive", "state", "stats", "transportUnhealthy", "tunIp",
+                "unhealthyReason",
             ]
         );
         assert_eq!(v["running"], 1);
@@ -538,6 +554,7 @@ mod tests {
             transport_unhealthy: false,
             device_dead: false,
             service_streams_active: 0,
+            rescue_rounds_exhausted: false,
             quic: None,
         };
         let v: Value = serde_json::from_str(&tun_status_json(&bare)).unwrap();

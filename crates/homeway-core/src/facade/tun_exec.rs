@@ -75,11 +75,17 @@ const DIAL_MS_DEFAULT: i64 = 15000;
 
 /// 岛侧赛跑预算（世代装配期一次；覆盖 LAN/中继握手 + `hr-reg4` 四帧准入）。
 const QUIC_CONNECT_BUDGET: Duration = Duration::from_secs(5);
-/// tun-death-gate §2.1：巡检续探再发起重赛跑的需求期节流（对齐巡检节拍）。
-const RERACE_PATROL_THROTTLE: Duration = Duration::from_secs(60);
-/// tun-death-gate §2.1：无需求期的长兜底节拍（需求恢复沿另触发；防与扩展侧
-/// 双链整夜各 60s 烧射频）。
-const RERACE_IDLE_FALLBACK: Duration = Duration::from_secs(600);
+/// event-driven-heal §2.2：自救轮次上限——连续失败轮次数，耗尽即上报宿主
+/// （熄灯门：扩展按「本 episode 出站包记账」处置）。真源 = tier
+/// openspec/changes/event-driven-heal（wg-native-transport「事件驱动的恢复触发」
+/// 的自救轮次条 + design D3）。
+const RESCUE_ROUNDS_MAX: u32 = 3;
+/// event-driven-heal §2.2：轮次间指数节流（第 1 轮立即；失败后依次 30s/1min/2min）。
+const RESCUE_ROUND_GAP: [Duration; 3] = [
+    Duration::from_secs(30),
+    Duration::from_secs(60),
+    Duration::from_secs(120),
+];
 /// tun-death-gate §2.1：巡检探测成功翻回的最小间隔（防抖动循环；**重赛跑证据
 /// 不受此限**——全新 socket 握手成功是强证据，B 门后秒级翻回合法）。
 const TRANSPORT_RECOVER_MIN_GAP: Duration = Duration::from_secs(30);
@@ -203,6 +209,8 @@ pub struct GenRun {
     tun_ip: String,
     /// 链路快照（runner link 段数据源；巡检写）。
     pub link: Mutex<Option<LinkIn>>,
+    /// 自救轮次状态机（event-driven-heal §2.2；巡检上报沿进入、下推器传感拍驱动）。
+    rescue: Mutex<RescueRounds>,
     /// 隧道桥（attached 后起；None = 未起/已停）。
     pub bridge: Mutex<Option<Arc<BridgeHost>>>,
     /// 日志面（带 `tier-core: ` 前缀；写世代日志文件）。
@@ -436,6 +444,9 @@ impl TunExecutor for TunnelExec {
         if run.gen != run.tun_shared.gen.load(Ordering::Acquire) {
             return -2;
         }
+        // event-driven-heal §2.2：换网/唤醒（recover 的调用沿）= 「新信息」——自救
+        // 轮次清零（下个传感拍即可起跑，绕过节流），保持自救中。
+        lock_unpoison(&run.rescue).reset_rounds();
         recover_downpush_on_island(&run, cause)
     }
 
@@ -450,6 +461,13 @@ impl TunExecutor for TunnelExec {
     /// `quic` 段快照（M1 S3-2；quic 档且 L3 在岛上才有——其余 = `None` ⇒ JSON 整段缺席）。
     fn quic_status(&self) -> Option<QuicIn> {
         quic_status_of(self.gen_run()?.as_ref())
+    }
+
+    /// event-driven-heal §2.2：自救轮次耗尽位（无在世世代 = false）。
+    fn rescue_rounds_exhausted(&self) -> bool {
+        self.gen_run()
+            .map(|run| lock_unpoison(&run.rescue).is_exhausted())
+            .unwrap_or(false)
     }
 
     /// portfwd 整表热替换（Q-F-B F4-4）：有在世世代 ⇒ 真装表（真监听器整表替换）→
@@ -503,6 +521,7 @@ impl GenRun {
             )
             .to_string(),
             link: Mutex::new(None),
+            rescue: Mutex::new(RescueRounds::default()),
             bridge: Mutex::new(None),
             logf: Arc::clone(&logf),
             tun_shared,
@@ -717,6 +736,7 @@ fn gen_loop(
             tun_ip: crate::tunnel_addr::derive_tun_ip(&cfg.token.secret, &ident.public_key())
                 .to_string(),
             link: Mutex::new(None),
+            rescue: Mutex::new(RescueRounds::default()),
             bridge: Mutex::new(None),
             logf: Arc::clone(&logf),
             tun_shared: Arc::clone(&shared),
@@ -1034,6 +1054,7 @@ fn gen_loop(
                     service_streams_active: quic_status_of(&run2)
                         .map(|q| q.streams_active)
                         .unwrap_or(0),
+                    rescue_rounds_exhausted: false,
                     runner: Some(runner_of(&run2)),
                     transport: Some(transport_of(&run2)),
                     quic: quic_status_of(&run2),
@@ -1336,6 +1357,91 @@ fn quic_unhealthy_signal(run: &Arc<GenRun>, reason: &str) {
 /// 单飞在入口内合并——`RaceInFlight` = 已在飞非失败）。成功走既有 adopt（含
 /// 阶梯复活 + 换连接清流）后翻回（**强证据**，不受翻回最小间隔约束）；失败
 /// 返回 Err（调用方决定是否上报——B 门失败才上报，巡检续探只等待下一拍）。
+/// 自救轮次状态机（event-driven-heal §2.2；纯状态 + 时钟注入，单测面）。
+///
+/// 自救中态（传输类不健康已上报、连接面死而 TUN 读面/传感面在位）的**唯一恢复
+/// 动作驱动**：传感面首包/换网/唤醒起跑轮次（轮 = 统一重赛跑入口）；第 2 轮起以
+/// 「包新鲜」（自上轮起跑后传感面有出站记账）为推进前置；挂起窗口内不起跑不
+/// 推进；30s→1min→2min 指数节流；恢复成功或换网清零；3 轮耗尽（上报熄灯门）；
+/// 耗尽态被传感面首包重武装（新需求 episode）。**巡检自续探重赛跑已退役**
+/// （§2.3，原 `RERACE_*` 路径）——翻回可达性由本机的重赛跑轮次承载。
+#[derive(Debug, Default)]
+struct RescueRounds {
+    /// 是否处于自救中（patrol 上报沿进入；恢复成功退出；换网/唤醒保持并清零计数）。
+    active: bool,
+    rounds_done: u32,
+    next_due: Option<Instant>,
+    /// 自上轮起跑后传感面是否有过出站包（包新鲜门——夜间解冻的无包轮次链停在第 1 轮）。
+    packet_since_round: bool,
+    exhausted: bool,
+}
+
+impl RescueRounds {
+    fn enter_rescuing(&mut self) {
+        *self = Self { active: true, ..Self::default() };
+    }
+
+    fn is_active(&self) -> bool {
+        self.active
+    }
+
+    fn is_exhausted(&self) -> bool {
+        self.exhausted
+    }
+
+    /// 换网/唤醒：轮次清零（「新信息」绕过节流——下个传感拍即可起跑），保持自救中。
+    fn reset_rounds(&mut self) {
+        let active = self.active;
+        *self = Self { active, ..Self::default() };
+    }
+
+    /// 恢复成功：退出自救（巡检恢复常态）。
+    fn deactivate(&mut self) {
+        *self = Self::default();
+    }
+
+    /// 传感面首包；耗尽态下 = 重武装（计数清零、第 1 轮可立即起跑——不是评估熄灯）。
+    fn note_packet(&mut self) {
+        if !self.active {
+            return;
+        }
+        if self.exhausted {
+            self.reset_rounds();
+        }
+        self.packet_since_round = true;
+    }
+
+    /// 本拍是否应起跑一轮（调用方执行统一重赛跑并经 `note_round_result` 报结果）。
+    fn wants_round(&mut self, now: Instant, suspend_window: bool) -> bool {
+        if !self.active || self.exhausted || suspend_window {
+            return false;
+        }
+        if self.rounds_done >= 1 && !self.packet_since_round {
+            return false; // 包新鲜门：无包不推进
+        }
+        if let Some(due) = self.next_due {
+            if now < due {
+                return false; // 指数节流
+            }
+        }
+        self.packet_since_round = false;
+        true
+    }
+
+    fn note_round_result(&mut self, now: Instant, ok: bool) {
+        if ok {
+            self.deactivate();
+            return;
+        }
+        self.rounds_done = (self.rounds_done + 1).min(RESCUE_ROUNDS_MAX + 1);
+        let idx = (self.rounds_done as usize - 1).min(RESCUE_ROUND_GAP.len() - 1);
+        self.next_due = Some(now + RESCUE_ROUND_GAP[idx]);
+        if self.rounds_done >= RESCUE_ROUNDS_MAX {
+            self.exhausted = true;
+        }
+    }
+}
+
 fn rerace_tunnel(run: &Arc<GenRun>) -> Result<(), String> {
     let island = run
         .current_island()
@@ -1560,8 +1666,6 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
     let mut probe_now = true; // attach 完就立即探（界面链路条不必空等第一个间隔）
     // tun-death-gate §2.1：patrol 上报后的续探记账（幂等上报位 / 需求沿 / 重赛跑节流）。
     let mut patrol_reported = false;
-    let mut prev_demand = false;
-    let mut rerace_last: Option<Instant> = None;
     loop {
         if !probe_now {
             let next = last_loop_at + PATROL_INTERVAL;
@@ -1616,6 +1720,14 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
             return;
         }
         let out_pkts = run.l3_swap_out_pkts();
+        // 自救中（event-driven-heal §2.2/§2.3）：连接面已死，探测对象不存在——
+        // 轮次是唯一恢复动作驱动（传感面在下推器 1s 拍；巡检自续探已退役）。需求
+        // 记账照常（真源口径），证据/上报面跳过。
+        if lock_unpoison(&run.rescue).is_active() {
+            let (demand_active, demand_why) = run.demand.patrol_demand(out_pkts, Instant::now());
+            run.demand.note_demand(demand_active, demand_why, now_unix_ms());
+            continue;
+        }
         // 本拍探测（10s；岛 `Cmd::Probe` = `STREAM[probe]` 回显）
         let probe = l3_probe(&run, PROBE_TIMEOUT);
         // 成功面：链路快照（C10 形态；来源 = 岛快照）
@@ -1633,6 +1745,7 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
                         crate::go_fmt::fmt_duration_go_secs(elapsed)
                     ));
                     patrol_reported = false;
+                    lock_unpoison(&run.rescue).deactivate();
                 }
             }
             if let Some((via, ep, rtt_ms)) = run.island_link() {
@@ -1691,42 +1804,20 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
         if fail_streak >= FAIL_STREAK_LADDER {
             // 动作面 = 岛内快探阶梯（§3.1 的 M/R/B）；本支路只是**兜底**
             //（岛的 B 门 = 连续 2 次 R 失败 + 窗 ≥10s ⇒ 10s 量级就会上报；走到这里
-            //  说明岛面也异常）⇒ 如实上报 `patrol` 交扩展处置（幂等——一次判定的
-            //  边沿只报一次）。
+            //  说明岛面也异常）⇒ 如实上报 `patrol` 并**转入自救**（幂等——一次判定
+            //  的边沿只报一次）。
             if !patrol_reported {
                 patrol_reported = true;
                 (run.logf)(
-                    "对端连续 3 次巡检不可达（岛内阶梯未见自愈）—— 兜底上报不健康（传输类），交扩展处置",
+                    "对端连续 3 次巡检不可达（岛内阶梯未见自愈）—— 兜底上报不健康（传输类），转入自救（轮次承载恢复）",
                 );
                 run.tun_shared.mark_unhealthy_if_current(run.gen, "patrol");
+                lock_unpoison(&run.rescue).enter_rescuing();
             }
-            // tun-death-gate §2.1：上报后线程**不退出**——翻回探测者在位。需求期按
-            // `RERACE_PATROL_THROTTLE` 节流再发起统一重赛跑；无需求期只在需求恢复沿
-            // 或 `RERACE_IDLE_FALLBACK` 兜底节拍（防与扩展侧双链整夜各 60s 烧射频；
-            // 无 live 时 Cmd::Probe 必败属已知——不据此翻回，翻回靠重赛跑/成功拍）。
-            let demand_rising = demand_active && !prev_demand;
-            prev_demand = demand_active;
-            let throttle = if demand_active {
-                RERACE_PATROL_THROTTLE
-            } else {
-                RERACE_IDLE_FALLBACK
-            };
-            let rerace_due = demand_rising
-                || rerace_last
-                    .map(|t| last_loop_at.duration_since(t) >= throttle)
-                    .unwrap_or(true);
-            if rerace_due {
-                rerace_last = Some(last_loop_at);
-                match rerace_tunnel(&run) {
-                    Ok(()) => {
-                        fail_streak = 0;
-                        patrol_reported = false;
-                    }
-                    Err(why) => {
-                        (run.logf)(&format!("巡检续探重赛跑未恢复（{why}）——等待下一拍"));
-                    }
-                }
-            }
+            // event-driven-heal §2.3：上报后**不再自续探重赛跑**（原 RERACE_* 节流
+            // 路径退役）——自救中态的恢复动作唯一由轮次状态机承载（传感面首包/
+            // 换网/唤醒起跑，下推器 1s 拍驱动；§2.2 包新鲜门/挂起窗口门/指数节流/
+            // 3 轮耗尽；本环在自救中跳过探测，见拍头）。
         }
     }
 }
@@ -1765,6 +1856,10 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
     let mut last_push: Option<Instant> = None;
     let mut last_rx: u64 = 0;
     let mut recv_at: Option<Instant> = None;
+    // event-driven-heal §2.1/§2.2：自救中传感面与轮次驱动（本环 1s 拍 = 首包触发的
+    // 响应粒度）；挂起窗口 = 本拍迟到 > 2× 拍长（轮次不起跑不推进——冻结期注定白试）。
+    let mut last_tick = Instant::now();
+    let mut exhausted_reported = false;
     loop {
         if run.stop.load(Ordering::Acquire) {
             return;
@@ -1783,6 +1878,54 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
         }
         if run.current_island().is_none() {
             continue;
+        }
+        let now = Instant::now();
+        let suspend_window = now.duration_since(last_tick) > 2 * PUSHER_TICK;
+        last_tick = now;
+        // 自救中（§2.1）：传感面 = 出站包记账仍在更新（连接面死而 TUN 读面在位、
+        // 包被计数丢弃——`last_outbound` 每包都记）。首包触发轮次（耗尽态重武装），
+        // 节流/包新鲜/挂起窗口门在状态机内；轮 = 统一重赛跑入口（§2.2）。
+        {
+            let mut rescue = lock_unpoison(&run.rescue);
+            if rescue.is_active() {
+                let out_at = run.l3_last_outbound_at();
+                let packet_fresh = out_at
+                    .map(|t| now.duration_since(t) < demand::OUTBOUND_FRESH)
+                    .unwrap_or(false);
+                if packet_fresh {
+                    rescue.note_packet();
+                    if !rescue.is_exhausted() {
+                        exhausted_reported = false; // 重武装后再耗尽可再次上报
+                    }
+                }
+                if rescue.wants_round(now, suspend_window) {
+                    drop(rescue); // rerace 带预算等待，不持锁
+                    match rerace_tunnel(&run) {
+                        Ok(()) => {
+                            (run.logf)("自救轮次：统一重赛跑恢复成功 —— 退出自救");
+                            lock_unpoison(&run.rescue).note_round_result(now, true);
+                            exhausted_reported = false;
+                        }
+                        Err(why) => {
+                            let exhausted = {
+                                let mut r = lock_unpoison(&run.rescue);
+                                r.note_round_result(now, false);
+                                r.is_exhausted()
+                            };
+                            if exhausted && !exhausted_reported {
+                                exhausted_reported = true;
+                                (run.logf)(
+                                    "自救轮次耗尽（3 轮失败）—— 上报宿主（熄灯门：扩展按本 episode 出站包记账处置）",
+                                );
+                            } else if !exhausted {
+                                (run.logf)(&format!("自救轮次未恢复（{why}）—— 按节流等待下一轮"));
+                            }
+                        }
+                    }
+                    continue;
+                }
+                continue; // 自救中不走健康面的待发包下推（岛内阶梯无对象）
+            }
         }
         // 需求信号（岛的**同名接口/快照面**）
         let rx = run.l3_rx();
@@ -1905,6 +2048,72 @@ fn now_unix_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+
+    /// **判据（event-driven-heal §2.2）**：自救轮次状态机的门控合取——
+    /// 起跑需「自救中 ∧ 非耗尽 ∧ 非挂起窗口 ∧ 过节流 ∧（首轮 ∨ 包新鲜）」。
+    #[test]
+    fn rescue_rounds_gating_matrix() {
+        let t0 = Instant::now();
+        let mut r = RescueRounds::default();
+        // 非自救中：不起跑。
+        assert!(!r.wants_round(t0, false));
+        // 进入自救：首轮立即起跑。
+        r.enter_rescuing();
+        assert!(r.wants_round(t0, false), "首轮立即（事件已到——上报沿本身）");
+        // 挂起窗口拦起跑（即使首轮）。
+        let mut r2 = RescueRounds::default();
+        r2.enter_rescuing();
+        assert!(!r2.wants_round(t0, true), "挂起窗口内不起跑");
+        // 第 1 轮失败 → 30s 节流 + 包新鲜门（第 2 轮起需自上轮后有包）。
+        r.note_round_result(t0, false);
+        assert!(!r.wants_round(t0 + Duration::from_secs(31), false), "无包不推进（包新鲜门）");
+        r.note_packet();
+        assert!(!r.wants_round(t0 + Duration::from_secs(10), false), "节流未到");
+        assert!(r.wants_round(t0 + Duration::from_secs(31), false), "有包且过节流 ⇒ 第 2 轮");
+        // 第 2 轮失败 → 60s 节流；第 3 轮失败 → 耗尽。
+        r.note_round_result(t0 + Duration::from_secs(31), false);
+        r.note_packet();
+        assert!(r.wants_round(t0 + Duration::from_secs(120), false), "第 3 轮");
+        r.note_round_result(t0 + Duration::from_secs(120), false);
+        assert!(r.is_exhausted(), "3 轮失败 ⇒ 耗尽");
+        assert!(!r.wants_round(t0 + Duration::from_secs(600), false), "耗尽后无第 4 轮");
+    }
+
+    /// **判据**：耗尽态被传感面首包重武装（新需求 episode——清零起跑，不是评估
+    /// 熄灯）；换网/唤醒清零保持自救中；恢复成功退出自救。
+    #[test]
+    fn rescue_rounds_rearm_and_exits() {
+        let t0 = Instant::now();
+        let mut r = RescueRounds::default();
+        r.enter_rescuing();
+        for i in 0..RESCUE_ROUNDS_MAX {
+            // 每轮起跑时刻推 200s（过节流：30s→60s→120s 均已过）。
+            let now = t0 + Duration::from_secs(200 * u64::from(i));
+            assert!(r.wants_round(now, false), "第 {} 轮应可起跑", i + 1);
+            r.note_round_result(now, false);
+            if i + 1 < RESCUE_ROUNDS_MAX {
+                r.note_packet(); // 保持包新鲜（末轮失败后不补包——耗尽态的重武装是显式的）
+            }
+        }
+        assert!(r.is_exhausted());
+        // 首包重武装：清零、可立即起跑。
+        r.note_packet();
+        assert!(!r.is_exhausted(), "重武装后脱离耗尽态");
+        assert!(r.wants_round(t0, false), "重武装后第 1 轮立即可起跑");
+        // 换网清零（保持自救中、绕过节流）。
+        r.note_round_result(t0, false);
+        r.reset_rounds();
+        assert!(r.is_active(), "换网保持自救中");
+        assert!(r.wants_round(t0, false), "换网后绕过节流立即可起跑");
+        // 恢复成功：退出自救。
+        r.note_round_result(t0, true);
+        assert!(!r.is_active(), "恢复成功退出自救");
+        assert!(!r.wants_round(t0, false));
+        // 非自救中的 note_packet 是空操作（不误入自救）。
+        r.note_packet();
+        assert!(!r.is_active());
+    }
+
     use super::*;
     use crate::facade::{ClientCore, TunStage};
     use crate::token::{self, EndpointRef, PeerId, RpkPubKey, Secret, TokenSpec};

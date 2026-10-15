@@ -185,6 +185,9 @@ pub trait TunExecutor: Send + Sync {
     /// 健康位/分类在 `TunShared`（不走本 trait——世代共享面）。
     fn runner(&self) -> Option<RunnerIn>;
     fn transport(&self) -> Option<TransportIn>;
+    /// event-driven-heal §2.2：自救轮次耗尽位（tunStatusJSON 顶层键
+    /// `rescueRoundsExhausted` 的源——灯塔对账/熄灯门的消费面）。
+    fn rescue_rounds_exhausted(&self) -> bool;
     /// QUIC 岛快照段（M1 S3-2；**缺省 `None`** = 本世代非 quic 档/岛不在 ⇒ JSON 整段缺席）。
     /// 为什么走 trait 而不是塞进 `RunnerIn`：设计 §4.3 定的是**平级段**（`quic{…}`），
     /// 且它只在 quic 档存在——塞进 runner 会污染所有既有读者的键面。
@@ -217,6 +220,9 @@ impl TunExecutor for NoopTunExecutor {
     fn request_stop(&self) {}
     fn recover(&self, _from: i64, _cause: &str) -> i32 {
         -2
+    }
+    fn rescue_rounds_exhausted(&self) -> bool {
+        false
     }
     fn runner(&self) -> Option<RunnerIn> {
         None
@@ -440,6 +446,7 @@ impl ClientCore {
             transport_unhealthy,
             device_dead: self.tun.device_dead.load(Ordering::Acquire),
             service_streams_active: quic.as_ref().map(|q| q.streams_active).unwrap_or(0),
+            rescue_rounds_exhausted: exec.rescue_rounds_exhausted(),
             runner: exec.runner(),
             transport: exec.transport(),
             quic,
@@ -718,6 +725,9 @@ mod tests {
         fn recover(&self, _from: i64, _cause: &str) -> i32 {
             0
         }
+        fn rescue_rounds_exhausted(&self) -> bool {
+            false
+        }
         fn runner(&self) -> Option<RunnerIn> {
             None
         }
@@ -952,6 +962,9 @@ mod tests {
         fn request_stop(&self) {}
         fn recover(&self, _from: i64, _cause: &str) -> i32 {
             -2
+        }
+        fn rescue_rounds_exhausted(&self) -> bool {
+            false
         }
         fn runner(&self) -> Option<RunnerIn> {
             None

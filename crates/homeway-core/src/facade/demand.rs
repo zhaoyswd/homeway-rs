@@ -12,8 +12,14 @@ use std::time::{Duration, Instant};
 
 
 
-/// 扩展下发的亮屏/前台位的新鲜期（> 泵节拍 5s × 若干抖动，<< 巡检 60s×2）。
-pub const ACTIVITY_FRESHNESS: Duration = Duration::from_secs(90);
+/// 扩展下发的亮屏/前台位的新鲜期。**event-driven-heal §2.5（2026-10-15）起 = 灯塔
+/// 量级（约 10 分钟 = 2× 灯塔拍）**：5s 泵退役后亮屏位由灯塔拍（约 5min）与决策点
+/// 事件现查补推——90s 新鲜期会让「亮屏但隧道零出站包」（全绕过使用）期几乎恒过期
+/// （原「下一拍推送即恢复」口径随泵消失）。挂起期间两侧一起冻结、值停在冻结前，
+/// 空窗后按自然过期处理（唤醒后的首个灯塔拍/决策点先推新值再评估——spec 同款）。
+/// 真源 = tier openspec/changes/event-driven-heal（wg-native-transport「失败证据的
+/// 需求门控」+ tasks 2.5）。
+pub const ACTIVITY_FRESHNESS: Duration = Duration::from_secs(600);
 
 /// App 出站包新鲜窗——「有包在等」的口径（下推器 1s 节拍检查）。
 pub const OUTBOUND_FRESH: Duration = Duration::from_secs(5);
