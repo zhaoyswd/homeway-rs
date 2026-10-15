@@ -1355,7 +1355,15 @@ fn quic_unhealthy_signal(run: &Arc<GenRun>, reason: &str) {
                 let reported = match rerace_tunnel(&r) {
                     Ok(ReraceOutcome::Recovered) => None,
                     Ok(ReraceOutcome::Yielded) => {
-                        Some("B 门重赛跑让路（在飞/快照陈旧）——仍上报并进自救（轮次吸收在飞态）".to_owned())
+                        // r3-M1(b)：让路读的是 200ms 节流快照——在飞赛跑可能已
+                        // 胜出翻回。健康位复核：已恢复就不上报不进轮次（否则健康
+                        // 隧道多挨一轮 Rebind+Connect + 扩展侧「链路异常」假告警）。
+                        if r.tun_shared.healthy.load(Ordering::Acquire) {
+                            (r.logf)("B 门重赛跑让路且健康位已翻回（在飞胜出）——不上报不进自救");
+                            None
+                        } else {
+                            Some("B 门重赛跑让路（在飞/快照陈旧）——仍上报并进自救（轮次吸收在飞态）".to_owned())
+                        }
                     }
                     Err(why) => Some(why),
                 };
@@ -1685,9 +1693,14 @@ fn recover_downpush_on_island(run: &Arc<GenRun>, cause: &str) -> i32 {
     // 复探失败后再走一次统一重赛跑（换 socket + 全候选；成功 = 恢复，失败才交 -1
     // 给扩展的窗口逻辑）。非 patrol 态维持原「只探不做」口径（动作面在岛内阶梯）。
     if rc == -1 && run.tun_shared.transport_unhealthy() {
-        // r2-N4：让路不是失败——rc 面值 -1 会被扩展当「重绑未恢复」升级整套重建
-        //（拆 TUN 重启核，抢在在飞赛跑出结果之前）。有界吸收在飞（≤3s，赛跑预算
-        // 同量级）：期间健康位翻回（在飞赛跑成功）= rc 0。
+        // r2-N4/r3-M1(a)：让路不是失败——rc 面值 -1 会被扩展当「重绑未恢复」升级
+        // 整套重建（拆 TUN 重启核，抢在在飞赛跑出结果之前）。有界吸收在飞：让路
+        // 段 ≤6×500ms=3s；末次迭代可转为一次完整重赛跑（Rebind+Connect 预算 ≈15s
+        // 上界，占 NAPI 工作线程槽——同池有 wait_flip，调用方为低频换网/唤醒路径）。
+        // 「已恢复」判据 = **健康位**（r3-M1a：`!transport_unhealthy()` 判的是分类
+        // ≠patrol，设备类 mark〔fd/panic/stop——含僵死 fd 判死〕同样会把分类槽改
+        // 写成非 patrol ⇒ 假成功 rc=0 会吞掉设备死唯一合法的重建升级——与 N4 要
+        // 修的假失败互为镜像）。健康位为真 ⟺ try_recover 已翻回或新世代。
         for _ in 0..6 {
             match rerace_tunnel(run) {
                 Ok(ReraceOutcome::Recovered) => {
@@ -1696,8 +1709,8 @@ fn recover_downpush_on_island(run: &Arc<GenRun>, cause: &str) -> i32 {
                 }
                 Ok(ReraceOutcome::Yielded) => {
                     std::thread::sleep(Duration::from_millis(500));
-                    if !run.tun_shared.transport_unhealthy() {
-                        rc = 0; // 在飞赛跑已成功翻回
+                    if run.tun_shared.healthy.load(Ordering::Acquire) {
+                        rc = 0; // 在飞赛跑已成功翻回（强证据）
                         break;
                     }
                 }
@@ -1977,6 +1990,11 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
         // 节流/包新鲜/挂起窗口门在状态机内；轮 = 统一重赛跑入口（§2.2）。
         {
             let mut rescue = lock_unpoison(&run.rescue);
+            if !rescue.is_active() {
+                // r3-L8①：让路退避随 episode 复位——旧 episode 的 5s 退避不得压住
+                // 新 episode 的首轮。
+                yield_until = None;
+            }
             if rescue.is_active() {
                 // r2-N3：外部恢复同步——轮次之外的路径（recover() 换网重绑、B 门
                 // rerace）翻回健康位时自救未退（reset_rounds 保持 active）⇒ 会在

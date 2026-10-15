@@ -270,12 +270,10 @@ impl TunShared {
             // request_stop 先行；置位让世代的一切派生线程〔patrol/pusher/stats/
             // 桥/hint〕从片界观察到收尾）
             self.signal_stop();
+            // mark_unhealthy("stop") 内含 bump_flip（r3-L2：无需另调——世代结束
+            // 的翻沿唤醒由它承担；在飞 wait_flip 不会挂满 2min 上限）。
             self.mark_unhealthy("stop");
             self.probe_running.store(false, Ordering::Release);
-            // 评审 r2-F25 廉价替代：世代结束 = 一次翻沿——唤醒所有在飞 wait_flip
-            //（宿主侧已置停不会重挂；不 bump 则暗态/销毁路径的在飞等待要挂满
-            // 2min 上限才归，白占 NAPI 工作线程槽）。
-            self.bump_flip();
         }
         // done/attach 通道同过世代守卫（评审 r2-H2：它们是 TunShared 单例槽——
         // 旧世代迟到的收尾若无条件写，会污染新世代：① attach 通道被关 ⇒ 新世代
@@ -600,5 +598,27 @@ mod tests {
             lock_unpoison(&sh.unhealthy_why).is_empty(),
             "翻回后分类已清（写序：先清 why）"
         );
+    }
+
+    /// **判据（评审 r3-M1a）**：设备类 mark 改写分类槽后 `transport_unhealthy()`
+    /// 变假——「恢复」判据不得用它（recover_push 吸收循环曾据此把设备死判成
+    /// rc=0，吞掉唯一合法的重建升级）。健康位是唯一精确判据：真 ⟺ 翻回/新世代。
+    #[test]
+    fn device_class_mark_disguised_as_recovery_rejected() {
+        let sh = TunShared::new();
+        sh.begin_generation(1);
+        sh.mark_unhealthy("patrol");
+        assert!(sh.transport_unhealthy(), "前置：传输类在册");
+        // 吸收窗内设备判死（fd 类——含僵死 fd 双阈值判死路径）改写分类槽。
+        sh.mark_unhealthy("fd");
+        assert!(
+            !sh.transport_unhealthy(),
+            "分类槽已被设备类改写（旧判据在此误判「已恢复」）"
+        );
+        assert!(
+            !sh.healthy.load(Ordering::Acquire),
+            "健康位仍假——不得按恢复收口（rc=0）"
+        );
+        assert!(sh.device_dead.load(Ordering::Acquire), "设备死位在册");
     }
 }
