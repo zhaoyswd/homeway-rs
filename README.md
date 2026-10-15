@@ -1,16 +1,9 @@
 # homeway
 
-「回家」网络工具：把手机 / 电脑的全部 IPv4 流量经**自建出口节点**出网。
-**三角色（出口 / 中继 / 客户端核）由同一个二进制 `homeway` 供给**，纯 Rust 实现。
-
-- **出口（`serve`）**：QUIC 端点 + 设备表（token 凭证）+ 过境拦截（TCP/UDP 五元组终结后
-  本机重拨）+ files / 终端 / DNS 代答 / 测速 / 端口转发 / DDNS / UPnP / STUN。
-- **中继（`relay`）**：信封转发 + 准入的轻量角色；出口与客户端打不通直连时自动经它中转。
-- **客户端核**：`crates/homeway-capi` 的 C-ABI 壳（产物 `libclientcore.so`，20 个
-  `ClientCore*` 导出），供鸿蒙 App 的 VPN 扩展进程加载。
-- **选路与自愈**：直连优先（中继纯后备）；连接中换网自动迁移；断链自动恢复
-  （快探 → 复探 → 迁移 → 重连）。
-- **平台**：macOS（arm64 / amd64）、Linux（amd64 / arm64，静态）、Windows（amd64）。
+不用账号，把家里的网络带在手上：
+- 建立手机到个人电脑、多个个人电脑之间的点对点连接
+- 通过手机访问内网服务，将手机请求通过内网主机转发
+- 多设备间共享终端会话
 
 ## 安装
 
@@ -20,37 +13,50 @@
 curl -fsSL https://raw.githubusercontent.com/zhaoyswd/homeway-rs/main/install.sh | sh
 ```
 
-`curl | sh` 形态无交互、不会配自启动；要配的话下载后带参跑：`sh install.sh --autostart yes`
-（其它参数：`--version vX.Y.Z` 装指定版本、`--bin-dir DIR` 指定目录；缺省 `/usr/local/bin`
-可写就用它，否则 `~/.local/bin`）。装完会打印最常用的几条命令。
-
 手动安装：到 [Releases](https://github.com/zhaoyswd/homeway-rs/releases) 取 `homeway-<版本>-<平台>.tar.gz`
 （平台：`darwin-arm64` / `darwin-amd64` / `linux-amd64` / `linux-arm64`；Windows 为 `.zip`），
 `SHA256SUMS` 校验后把 `homeway` 放进 PATH 内的目录（macOS 若提示无法打开，先 `xattr -c homeway`）。
 
 从源码构建：`cargo build --release`（产物 `target/release/homeway`；工具链见 `rust-toolchain.toml`）。
 
-## 运行
+
+## 部署中继（可选）
+
+当无法直连成功时，可以在有公网 IP 的机器上部署中继服务。
 
 ```bash
-homeway                                 # 统一进程：按配置装配出口 / 中继（推荐）
-homeway serve                           # 前台单出口（Ctrl-C 收工）
-homeway relay                           # 前台单中继
+homeway relay start # 启动中继，显示中继token
+homeway relay token # 获取中继token
+homeway relay stop/restart/status # 管理/获取中继状态
 ```
 
-启动参数写在配置文件里，之后零参启动即可：
+## 部署主机
+
+*配置中继*
 
 ```bash
-homeway serve --listen 38241                            # 起出口
-homeway relay --listen :38341 --advertise <公网IP>:38341   # 起中继（对外公告地址）
-homeway relay token                                     # 取中继凭据 rl1…（出口侧 --relay 用它）
-homeway serve --relay '<rl1…>'                          # 出口经该中继可达（打不通直连时走它）
+homeway serve relay set 'rl1…' # 通过中继token设置中继服务（可选）
+homeway serve relay clear # 清楚中继服务配置
 ```
 
-参数写进 `homeway` 的配置文件（`~/.config/homeway/config.toml`）后，`homeway`（零参）
-与 `homeway serve start` 都按它装配。新机器的配置缺省 `enabled = false`——不会因为跑了一条
-命令就意外成为出口；**出口机执行一次 `homeway serve start`**，它会写入 `enabled = true`
-并装配，之后零参 `homeway`（launchd / 服务）也按它起出口：
+*配置DDND*
+
+```bash
+homeway serve ddns add exit.example.com     # 为主机配置 ddns 域名
+homeway serve ddns delete exit.example.com  # 删除 ddns 域名
+```
+
+*启动与管理服务*
+
+```bash
+homeway serve start # 启动主机端，显示主机token
+homeway serve token # 获取主机token
+homeway serve stop/restart/status # 管理/获取主机状态
+```
+
+主机token是连接的主机的唯一凭据，可以在其它电脑通过`homeway add host --name mymac '主机token'`进行注册，或者在手机 APP 填入进行注册。注意保管，切勿泄露。
+
+以上参数写在配置文件（`~/.config/homeway/config.toml`）里：
 
 ```toml
 [serve]
@@ -65,29 +71,22 @@ domain = "exit.example.com"    # 可选：DDNS 记录
 enabled = false
 ```
 
-### 起停
+## 使用方式
 
-```bash
-homeway serve start | stop | restart | status | token     # 出口（后台，不占终端）
-homeway relay start | stop | restart | status | token     # 中继
-homeway status                                            # 运行面（连接 / 流量 / 计数）
-```
+### 添加主机
 
-## 主机
-
-出口凭证是连接的唯一凭据：在出口机上取 token，在客户端（App 或命令行）把它加为主机。
+在APP或电脑上将其它主机添加为出口。
 
 ```bash
 # 出口机
-homeway serve token                     # 输出 hmw2… 凭证
+homeway serve token                     # 获取主机token，形如：hmw2…
 
 # 客户端机
 homeway host add --name home '<hmw2…>'  # App 里则是「添加主机」粘贴同一个 token
 homeway host list / status [name] / delete <name|id>
 ```
 
-命令行工具默认用本机主机：**只有一台主机时不必指定**；有多台时用 `--host <name|id>`
-选中其中一台；还没有主机时会提示先 `homeway host add`。
+当只添加了一台出口主机时，以下命令不必指定主机，有多台时需要在命令后添加 `--host name`
 
 ### 测速
 
@@ -98,6 +97,8 @@ homeway speedtest --host home           # 只测其中一台
 
 ### 文件
 
+默认只能管理出口主机的用户目录。
+
 ```bash
 homeway files list /remote/path                     # list / stat / mkdir / read 同形
 homeway files download /remote/file ./local         # upload 反向（本地在前）
@@ -105,6 +106,8 @@ homeway files get /remote/file -o ./local           # 已存在时加 --force �
 ```
 
 ### 终端
+
+同一个终端会话可以在多个设备、APP打开，内容实时共享。不支持 Windows 系统。
 
 ```bash
 homeway term new work                   # 新建并直接进入 work 终端（Ctrl-b d 分离）
@@ -132,12 +135,6 @@ homeway socks on --listen 1080     # 本机 127.0.0.1:1080 起 SOCKS5，流量�
 homeway socks status               # 开关态 / 端口 / 连接数
 homeway socks off                  # 关掉
 ```
-
-多台主机各开一个端口（`--host <name|id>` 指定），浏览器按端口选走哪个出口。
-
-## Windows
-
-三角色可用；`term`（终端）不支持。
 
 ## 构建与自检
 
