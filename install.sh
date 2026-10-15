@@ -10,7 +10,7 @@
 #   --version vX.Y.Z   装指定版本（缺省 = 最新 release）
 #   --bin-dir DIR      装到哪（缺省：/usr/local/bin 可写就用它，否则 ~/.local/bin）
 #   --autostart yes|no 是否配置自启动（缺省：交互式询问；非交互 = no）
-  --grant yes|no     预授权 macOS 文件夹访问（缺省：交互式询问；非交互 = 不问只提示）
+#   --grant yes|no     预授权 macOS 文件夹访问（缺省：交互式询问；非交互 = 不问只提示）
 set -eu
 
 REPO="zhaoyswd/homeway-rs"
