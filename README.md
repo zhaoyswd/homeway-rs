@@ -36,10 +36,10 @@ homeway relay stop/restart/status # 管理/获取中继状态
 
 ```bash
 homeway serve relay set 'rl1…' # 通过中继token设置中继服务
-homeway serve relay clear # 清楚中继服务配置
+homeway serve relay clear # 清除中继服务配置
 ```
 
-配置DDND（可选）
+配置DDNS（可选）
 
 ```bash
 homeway serve ddns add exit.example.com     # 为主机配置 ddns 域名
@@ -87,6 +87,18 @@ homeway host list / status [name] / delete <name|id>
 ```
 
 当只添加了一台出口主机时，以下命令不必指定主机，有多台时需要在命令后添加 `--host name`
+
+### macOS 目录预授权
+
+macOS 出口主机首次访问「文稿 / 桌面 / 下载」时会弹系统授权窗，期间远端的文件 / 终端命令会像卡住。可以在出口机上预先授权，一次长期有效：
+
+```bash
+homeway serve grant    # 触发系统授权弹窗（最多 3 次），在屏幕上点『允许』
+```
+
+- 需要先让出口跑起来（`homeway serve start`，或已装的开机自启动）——授权要记在 homeway 名下才对出口生效。
+- 误点了『不允许』：到 系统设置 → 隐私与安全性 → 文件与文件夹 里改回；或把 homeway 加进「完全磁盘访问」。
+- 发布二进制是测试签名（ad-hoc），升级换二进制后 macOS 可能把新版本当作新程序，弹窗再次出现时重跑一次 `homeway serve grant` 即可。
 
 ### 测速
 
