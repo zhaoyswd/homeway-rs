@@ -460,7 +460,11 @@ impl ClientCore {
     /// `{"seq":N,"transportUnhealthy":b,"deviceDead":b,"rescueRoundsExhausted":b}`。
     /// timeout 上限 2 分钟（设计 D5 单次等待上界）。
     pub fn tun_wait_flip(&self, arg_json: &str) -> String {
+        // 入参来自 ArkTS（camelCase：lastSeq/timeoutMs）——漏 rename_all 时两字段
+        // 静默落 0，翻沿环变忙轮询（2026-10-16 真机 118% CPU 事故；回归钉在
+        // `tun_wait_flip_snapshot_json_face`）。
         #[derive(serde::Deserialize, Default)]
+        #[serde(rename_all = "camelCase")]
         struct WaitFlipArg {
             #[serde(default)]
             last_seq: u64,
@@ -813,6 +817,18 @@ mod tests {
         // 显式入参形态可解析（lastSeq 基线 + 短超时立即返）。
         let snap2 = core.tun_wait_flip(r#"{"lastSeq":0,"timeoutMs":10}"#);
         assert!(snap2.contains("\"seq\""));
+        // 忙轮询回归（2026-10-16 真机事故）：入参键是 camelCase——漏 rename_all 时
+        // lastSeq/timeoutMs 静默落 0 ⇒ 每次等待立即返回 ⇒ 翻沿环烧满主线程。钉法：
+        // 以当前 seq 为基线 + 60ms 超时，**两个字段都解析成功**等待才真实发生
+        // （基线解析失败则立即返、超时解析失败则仍立即返——两条腿都踩住）。
+        let base: serde_json::Value = serde_json::from_str(&snap2).unwrap();
+        let cur = base["seq"].as_u64().unwrap_or(0);
+        let t0 = std::time::Instant::now();
+        let _ = core.tun_wait_flip(&format!(r#"{{"lastSeq":{cur},"timeoutMs":60}}"#));
+        assert!(
+            t0.elapsed() >= std::time::Duration::from_millis(50),
+            "camelCase 入参必须生效（lastSeq 基线 + timeoutMs 超时缺一即忙轮询）"
+        );
     }
 
     /// 两阶段全流程：prepare（受理 → ready）→ attach（0）→ running=1 → stop（0）。
