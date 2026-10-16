@@ -85,7 +85,7 @@ const DIAL_MS_DEFAULT: i64 = 15000;
 /// 岛侧赛跑预算（世代装配期一次；覆盖 LAN/中继握手 + `hr-reg4` 四帧准入）。
 const QUIC_CONNECT_BUDGET: Duration = Duration::from_secs(5);
 /// event-driven-heal §2.2：自救轮次上限——连续失败轮次数，耗尽即上报宿主
-/// （熄灯门：扩展按「本 episode 出站包记账」处置）。真源 = tier
+/// （扩展挂起等首包重武装）。真源 = tier
 /// openspec/changes/event-driven-heal（wg-native-transport「事件驱动的恢复触发」
 /// 的自救轮次条 + design D3）。
 const RESCUE_ROUNDS_MAX: u32 = 3;
@@ -1407,7 +1407,7 @@ fn quic_unhealthy_signal(run: &Arc<GenRun>, reason: &str) {
 /// 自救中态（传输类不健康已上报、连接面死而 TUN 读面/传感面在位）的**唯一恢复
 /// 动作驱动**：传感面首包/换网/唤醒起跑轮次（轮 = 统一重赛跑入口）；第 2 轮起以
 /// 「包新鲜」（自上轮起跑后传感面有出站记账）为推进前置；挂起窗口内不起跑不
-/// 推进；30s→1min→2min 指数节流；恢复成功或换网清零；3 轮耗尽（上报熄灯门）；
+/// 推进；30s→1min→2min 指数节流；恢复成功或换网清零；3 轮耗尽（上报宿主挂起）；
 /// 耗尽态被传感面首包重武装（新需求 episode）。**巡检自续探重赛跑已退役**
 /// （§2.3，原 `RERACE_*` 路径）——翻回可达性由本机的重赛跑轮次承载。
 #[derive(Debug, Default)]
@@ -1445,7 +1445,7 @@ impl RescueRounds {
         *self = Self::default();
     }
 
-    /// 传感面首包；耗尽态下 = 重武装（计数清零、第 1 轮可立即起跑——不是评估熄灯）。
+    /// 传感面首包；耗尽态下 = 重武装（计数清零、第 1 轮可立即起跑）。
     fn note_packet(&mut self) {
         if !self.active {
             return;
@@ -1489,7 +1489,7 @@ impl RescueRounds {
 
 /// rerace 的三态回执（评审 r1-F1）：**让路 ≠ 恢复**——两个让路分支（阶梯在飞 /
 /// RaceInFlight）此前返回 `Ok(())` 被 pusher 一律按「恢复成功——退出自救」处理，
-/// 自救停摆且 `patrol_reported` 永真 ⇒ 永不重入、永不熄灯（隧道已死而 UI 恒显
+/// 自救停摆且 `patrol_reported` 永真 ⇒ 永不重入（隧道已死而 UI 恒显
 /// 已连接的静默黑洞）。枚举让调用方编译期分派，杜绝再混。
 #[derive(PartialEq, Eq, Clone, Copy, Debug)]
 enum ReraceOutcome {
@@ -2223,7 +2223,7 @@ mod tests {
     }
 
     /// **判据**：耗尽态被传感面首包重武装（新需求 episode——清零起跑，不是评估
-    /// 熄灯）；换网/唤醒清零保持自救中；恢复成功退出自救。
+    /// 挂起）；换网/唤醒清零保持自救中；恢复成功退出自救。
     #[test]
     fn rescue_rounds_rearm_and_exits() {
         let t0 = Instant::now();

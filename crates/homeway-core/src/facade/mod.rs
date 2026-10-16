@@ -186,7 +186,7 @@ pub trait TunExecutor: Send + Sync {
     fn runner(&self) -> Option<RunnerIn>;
     fn transport(&self) -> Option<TransportIn>;
     /// event-driven-heal §2.2：自救轮次耗尽位（tunStatusJSON 顶层键
-    /// `rescueRoundsExhausted` 的源——灯塔对账/熄灯门的消费面）。
+    /// `rescueRoundsExhausted` 的源——灯塔对账/挂起档呈现的消费面）。
     fn rescue_rounds_exhausted(&self) -> bool;
     /// QUIC 岛快照段（M1 S3-2；**缺省 `None`** = 本世代非 quic 档/岛不在 ⇒ JSON 整段缺席）。
     /// 为什么走 trait 而不是塞进 `RunnerIn`：设计 §4.3 定的是**平级段**（`quic{…}`），

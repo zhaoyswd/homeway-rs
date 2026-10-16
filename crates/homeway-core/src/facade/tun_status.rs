@@ -103,7 +103,7 @@ pub struct TunStatusInput {
     /// 不计入；扩展侧半死态检测用它排除「业务活跃期的 stats 静默」）。
     pub service_streams_active: u64,
     /// event-driven-heal §2.2：自救轮次耗尽位（顶层键 `rescueRoundsExhausted`——
-    /// 灯塔对账与熄灯门的消费面；耗尽态被传感面首包重武装后翻回 false）。
+    /// 灯塔对账与挂起档呈现的消费面；耗尽态被传感面首包重武装后翻回 false）。
     pub rescue_rounds_exhausted: bool,
     pub runner: Option<RunnerIn>,
     pub transport: Option<TransportIn>,
@@ -191,7 +191,7 @@ pub fn tun_status_json(input: &TunStatusInput) -> String {
         "serviceStreamsActive".into(),
         Value::from(input.service_streams_active),
     );
-    // event-driven-heal §2.2：自救轮次耗尽位（灯塔对账与熄灯门的消费面）。
+    // event-driven-heal §2.2：自救轮次耗尽位（灯塔对账与挂起档呈现的消费面）。
     m.insert(
         "rescueRoundsExhausted".into(),
         Value::from(input.rescue_rounds_exhausted),
