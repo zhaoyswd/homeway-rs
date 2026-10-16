@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.3.9（2026-10-16）
+
+- **客户端核自愈三态化（event-driven-heal，核侧主体）**：断线处置从「秒级轮询 + 无限冷却重试 +
+  半死态重装」收敛为「自救轮次 + 熄灯门 + 翻沿传感面」——传输类故障恢复唯一由轮次承载
+  （RescueRounds：轮 1 免包起跑、其后包新鲜门、30s→60s→120s 指数节流、3 轮耗尽上报熄灯门、
+  耗尽态首包重武装）；巡检自续探重赛跑退役（RERACE_* 删除）；新翻沿通道
+  `ClientCoreTunWaitFlip`（挂起式等待 ≤2min，JSON 进出）+ `tunStatusJSON` 新顶层键
+  `rescueRoundsExhausted`；`ACTIVITY_FRESHNESS` 90s→10min。App 侧（tier 仓）配套：5s 事件泵
+  退役（灯塔拍 5min 唯一周期机器）、四决策入口（翻沿/网络/前台/灯塔）、熄灯执行器。
+  **实测**：稳态扩展 0% CPU；杀出口→轮 1 完成 59s（旧 5.5 分钟）→耗尽熄灯全链 7m50s（旧
+  15.7 分钟）；熄灯后扩展进程彻底退出；打开 App 自动重连 0.7s connected。
+- **TUN 读循环防自旋**：僵死 fd（poll 恒可读而 read 恒空）双阈值判死（≥100 拍 ∧ 墙钟 ≥1s →
+  TunFdDead）——修 2026-10-15 真机事故（半死态误报重装引入恒约 7% 单核零日志自旋 107 分钟）；
+  静默片（poll 无事件返 `Ok(Ready::default())`）不计数，健康空闲 fd 不误判。
+- **五轮外部评审整改（连接/重连全链）**：消除「rerace 让路被当恢复成功⇒自救停摆永不熄灯」
+  静默黑洞（ReraceOutcome 三态 + 在飞守卫提到 Rebind 之前 + 让路复读重跑）；B 门失败直达
+  自救轮次（感知→首轮 ~3min 空窗消除）；健康位翻回即退出自救（换网路径不再在健康隧道上多
+  挨一次全量重连）；`TunShared::is_healthy()` 语义单点（字段私有化）；pusher 闲置分档
+  （1s→5s 业务拍）；世代收尾唤醒在飞等待者。
+- **真机验收修复**：`tun_wait_flip` 入参 camelCase 漏 rename_all ⇒ 翻沿环忙轮询（118% CPU）；
+  `patrol_reported` 本地账本不跟旁路恢复 ⇒ 同世代第二次死亡进不了自救。
+- 判据行变更已登记 `docs/INTEROP-CRITERIA.md`（自救轮次行族/让路形态/传感观测改名/B 门直达
+  自救）；规格真源 = tier 仓 `openspec/changes/event-driven-heal`（五轮评审记录 r1-r5）。
+
 ## v0.3.8（2026-10-15）
 
 - **CLI 简化第一批：删除 `homeway portfwd` 直连命令**（用户指令：除 host add 外 --token 形态对用户无价值）——
