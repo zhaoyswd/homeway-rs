@@ -81,6 +81,11 @@ const REPLAY_BUDGET: Duration = Duration::from_secs(2);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(10);
 const HELLO_TIMEOUT: Duration = Duration::from_secs(15);
 const KILL_GRACE: Duration = Duration::from_millis(500);
+/// 间隔哨兵的第二跳延迟（真源；`HOMEWAY_TERM_SENTINEL_GAP`〔毫秒〕可调）。
+/// 背靠背双 resize 的两次 SIGWINCH 会被内核合并、App 读到「尺寸未变」跳过重绘
+/// （opencode 实测背靠背 0 字节输出 / 间隔 300ms 全屏重绘 14732B；vim 无条件
+/// 重绘不受影响）——真源实验记录见 docs/reviews/term-attach-resilience-design.md。
+const SENTINEL_GAP: Duration = Duration::from_millis(300);
 const SAMPLE_PERIOD: Duration = Duration::from_secs(1);
 const RAW_STALL_LIMIT: Duration = Duration::from_secs(60);
 const RAW_STALL_RETRY: Duration = Duration::from_secs(1);
@@ -174,6 +179,8 @@ pub struct TermConfig {
     pub max_clients: usize,
     pub write_timeout: Duration,
     pub raw_stall_limit: Duration,
+    /// 间隔哨兵的第二跳延迟（真源 = [`SENTINEL_GAP`]；env 覆盖走毫秒值）。
+    pub sentinel_gap: Duration,
     pub pending_cap: usize,
     pub queue_bytes: usize,
     pub detect: bool,
@@ -191,6 +198,7 @@ impl Default for TermConfig {
             max_clients: super::session::DEFAULT_MAX_CLIENTS,
             write_timeout: WRITE_TIMEOUT,
             raw_stall_limit: RAW_STALL_LIMIT,
+            sentinel_gap: SENTINEL_GAP,
             pending_cap: PENDING_CAP,
             queue_bytes: QUEUE_BYTES,
             detect: true,
@@ -218,6 +226,10 @@ impl TermConfig {
             raw_stall_limit: Duration::from_millis(env_int(
                 "HOMEWAY_TERM_STALL_LIMIT_MS",
                 RAW_STALL_LIMIT.as_millis() as usize,
+            ) as u64),
+            sentinel_gap: Duration::from_millis(env_int(
+                "HOMEWAY_TERM_SENTINEL_GAP",
+                SENTINEL_GAP.as_millis() as usize,
             ) as u64),
             pending_cap: env_int("HOMEWAY_TERM_PENDING_CAP_BYTES", PENDING_CAP),
             queue_bytes: env_int("HOMEWAY_TERM_QUEUE_BYTES", QUEUE_BYTES),
@@ -252,6 +264,7 @@ fn warn_invalid_term_env(logf: &Logf) {
         ("HOMEWAY_TERM_MAX_CLIENTS", 1),
         ("HOMEWAY_TERM_WRITE_TIMEOUT_MS", 1),
         ("HOMEWAY_TERM_STALL_LIMIT_MS", 1),
+        ("HOMEWAY_TERM_SENTINEL_GAP", 1),
         ("HOMEWAY_TERM_PENDING_CAP_BYTES", 1024),
         ("HOMEWAY_TERM_QUEUE_BYTES", 4096),
     ];
@@ -418,6 +431,12 @@ struct PtyShared {
 impl PtyShared {
     fn resize(&self, cols: u16, rows: u16) {
         let _ = self.inner.lock().unwrap_or_else(|e| e.into_inner()).resize(cols, rows);
+    }
+
+    /// 当前 PTY 实际尺寸（间隔哨兵观测面：区分「PTY 当前值」与「会话记账 rt.size()」）。
+    #[cfg(test)]
+    fn tty_size(&self) -> (u16, u16) {
+        self.inner.lock().unwrap_or_else(|e| e.into_inner()).tty_size()
     }
 
     fn write_input(&self, p: &[u8]) -> bool {
@@ -1311,7 +1330,11 @@ impl TermService {
         }
         // 尺寸哨兵：raw 腿在回放之后（写者按握手计划执行）；surface 腿在快照下发前
         // （投递循环还在合并窗里，快照取到的已是按最终尺寸重绘过的屏）。
-        self.sentinel_repaint(&name, sess_gen);
+        // 分档（term-attach-resilience）：本次 attach 几何未变（size_applied=None）⇒
+        // 间隔形态（背靠背双 SIGWINCH 被内核合并、App 读到尺寸未变会跳过重绘）；
+        // 几何真变 ⇒ 现状背靠背（真实 SIGWINCH 已足够，且避免 apply+第一跳合并落中间值）。
+        let spaced_sentinel = reg.size_applied.is_none();
+        self.sentinel_repaint(&name, sess_gen, spaced_sentinel);
         if surface {
             let st = self.lock_state();
             if let Some(rt) = rt_of(&st, &name, sess_gen) {
@@ -1392,7 +1415,7 @@ impl TermService {
                                 f.payload.len()
                             ));
                             apply_size_locked(rt, sz);
-                            self.sentinel_repaint_locked(rt);
+                            self.sentinel_repaint_locked(rt, false); // 几何真变路径：保持背靠背现状
                         }
                         (Arc::clone(&rt.pty), discard_reply)
                     };
@@ -1445,7 +1468,7 @@ impl TermService {
                                 "term: 会话 {name} 几何切换 → {sz}（腿 {key:?} RESIZE 上报）"
                             ));
                             apply_size_locked(rt, sz);
-                            self.sentinel_repaint_locked(rt);
+                            self.sentinel_repaint_locked(rt, false); // 几何真变路径：保持背靠背现状
                             if clamped {
                                 self.logf(&format!(
                                     "term: 会话 {name} 尺寸夹取 {cols}x{rows} → {sz}（上限 {}x{}）",
@@ -1943,27 +1966,79 @@ impl TermService {
 
     /// 尺寸哨兵（外部入口）：sentinel → 真实尺寸，两次 SIGWINCH 逼 TUI 重绘。
     /// 带会话代数——注册与哨兵之间同名重建时不打新会话（评审 P8）。
-    fn sentinel_repaint(&self, name: &str, sess_gen: u64) {
+    ///
+    /// 两种形态：`spaced = false`（几何真变路径，现状）两跳锁内背靠背——真实 SIGWINCH
+    /// 本身已足以逼重绘，合并落在终值上无害；`spaced = true`（**几何未变的 attach**）
+    /// 第一跳原位、第二跳延迟 `sentinel_gap` 由独立线程执行——背靠背会被内核合并成
+    /// 一次 SIGWINCH，App 读到「尺寸未变」直接跳过重绘（opencode 类差分渲染 TUI）。
+    fn sentinel_repaint(self: &Arc<Self>, name: &str, sess_gen: u64, spaced: bool) {
+        let base = {
+            let mut guard = self.lock_state();
+            let st = &mut *guard;
+            if st.registry.session(name).is_none_or(|s| s.done) {
+                return;
+            }
+            let Some(rt) = st.sessions.get_mut(name).filter(|rt| rt.gen == sess_gen) else { return };
+            self.sentinel_repaint_locked(rt, spaced)
+        };
+        if let Some(base) = base {
+            // 间隔形态：第二跳延迟执行。线程起不来 = 锁内兜底立即恢复——绝不停在
+            // sentinel 列宽上跑（后果重于 KILL_GRACE 忽略 Err 的先例）。
+            let svc = Arc::clone(self);
+            let tname = name.to_string();
+            let gap = self.cfg.sentinel_gap;
+            let spawned = std::thread::Builder::new()
+                .name("term-sentinel-restore".into())
+                .spawn(move || {
+                    std::thread::sleep(gap);
+                    svc.sentinel_restore(&tname, sess_gen, base);
+                });
+            if let Err(e) = spawned {
+                self.logf(&format!(
+                    "term: 会话 {name} 哨兵恢复线程起不来（{e}）——立即恢复真实尺寸"
+                ));
+                self.sentinel_restore(name, sess_gen, base);
+            }
+        }
+    }
+
+    /// 间隔哨兵的第二跳（延迟执行）：五重验全过才恢复真实尺寸。
+    fn sentinel_restore(self: &Arc<Self>, name: &str, sess_gen: u64, base: Size) {
         let mut guard = self.lock_state();
         let st = &mut *guard;
         if st.registry.session(name).is_none_or(|s| s.done) {
-            return;
+            return; // ① 会话不在册/已收工
         }
-        let Some(rt) = st.sessions.get_mut(name).filter(|rt| rt.gen == sess_gen) else { return };
-        self.sentinel_repaint_locked(rt);
+        let Some(rt) = st.sessions.get_mut(name).filter(|rt| rt.gen == sess_gen) else {
+            return; // ② 同名重建（换代）
+        };
+        if rt.stopped.load(Ordering::Relaxed) {
+            return; // ③ 会话已停
+        }
+        if rt.size() != base {
+            return; // ④ 间隔期间真实 resize 已让位——不覆盖新尺寸
+        }
+        rt.pty.resize(base.cols(), base.rows()); // ⑤ 恢复（同值幂等：TIOCSWINSZ 不产生信号）
     }
 
-    /// 同上（调用方持锁 + rt 在手）。
-    fn sentinel_repaint_locked(&self, rt: &mut SessRt) {
+    /// 同上（调用方持锁 + rt 在手）。间隔形态返回 `Some(base)`（第二跳由延迟线程执行）。
+    ///
+    /// 不变量（恢复重验④的前提）：第一跳只动 PTY——**不写 ring epoch、不改 `rt.size()`**；
+    /// 若改用 `apply_size_locked` 做第一跳，重验会恒让位 ⇒ PTY 永远停在 sentinel 列宽。
+    fn sentinel_repaint_locked(&self, rt: &mut SessRt, spaced: bool) -> Option<Size> {
         if rt.stopped.load(Ordering::Relaxed) {
-            return;
+            return None;
         }
-        rt.sentinel_count += 1; // 低7 判据计数器：一次 attach 只应 +1
+        rt.sentinel_count += 1; // 低7 判据计数器：一次 attach 只应 +1（分档只改两跳时序）
         let size = rt.size();
         let (cols, rows) = (size.cols(), size.rows());
         let sentinel = if cols > 1 { cols - 1 } else { cols + 1 };
         rt.pty.resize(sentinel, rows);
+        if spaced {
+            return Some(size);
+        }
         rt.pty.resize(cols, rows);
+        None
     }
 
     /// 摘腿（幂等「只摘一次」）：注册表 + 运行态 + 派生（重选举/末腿 focus-out）+ 日志。
@@ -2019,7 +2094,7 @@ impl TermService {
         }
         if let Some(sz) = outcome.size_applied {
             apply_size_locked(rt, sz);
-            self.sentinel_repaint_locked(rt);
+            self.sentinel_repaint_locked(rt, false); // 几何真变路径：保持背靠背现状
         }
     }
 
@@ -4715,6 +4790,192 @@ mod tests {
             assert_eq!(rt.sentinel_count, 2, "RESIZE 真变再 +1");
         }
         svc.close();
+    }
+
+    /// 间隔哨兵主形态（term-attach-resilience 1.2/1.3）：几何未变 attach——第一跳后
+    /// PTY 在 sentinel 列、会话记账不变（不变量反证：不写 rt.size()/epoch），第二跳
+    /// 延迟恢复；真变路径（RESIZE）立即落终值，不引入中间值停留。
+    #[test]
+    fn sentinel_spaced_form_on_unchanged_geometry() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let cfg = TermConfig {
+            shell: Some("cat".into()),
+            sentinel_gap: Duration::from_millis(250),
+            ..TermConfig::default()
+        };
+        let svc = svc_with(cfg, lines);
+        let (ln, path) = start_listener();
+        {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || svc.serve(ln));
+        }
+        let mut c = Client::connect(&path);
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "sp");
+        c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, "t-sp", &tail));
+        c.expect(Op::ATTACHED, 5);
+        // 第一跳：间隔窗内 PTY = 79；记账/epoch 不动（重验④的前提）
+        std::thread::sleep(Duration::from_millis(80));
+        {
+            let st = svc.lock_state();
+            let rt = st.sessions.get("t-sp").expect("会话在");
+            assert_eq!(rt.pty.tty_size(), (79, 24), "间隔窗内 PTY 在 sentinel 列");
+            assert_eq!((rt.size().cols(), rt.size().rows()), (80, 24), "会话记账保持 base");
+            // 创建记 1 个 epoch——第一跳不得再添（不变量）
+            assert_eq!(rt.ring.epochs.len(), 1, "第一跳不写 epoch（不变量）");
+        }
+        // 第二跳：gap 后恢复真实尺寸
+        std::thread::sleep(Duration::from_millis(300));
+        {
+            let st = svc.lock_state();
+            let rt = st.sessions.get("t-sp").expect("会话在");
+            assert_eq!(rt.pty.tty_size(), (80, 24), "第二跳恢复真实尺寸");
+        }
+        // 真变路径：RESIZE 背靠背落终值（不按中间列宽停留）
+        c.send(Op::RESIZE, &frames::enc_resize(120, 40));
+        std::thread::sleep(Duration::from_millis(60));
+        {
+            let st = svc.lock_state();
+            let rt = st.sessions.get("t-sp").expect("会话在");
+            assert_eq!(rt.pty.tty_size(), (120, 40), "真变立即落终值");
+        }
+        svc.close();
+    }
+
+    /// 间隔期间真实 resize 让位：恢复跳不覆盖新尺寸（重验④）。
+    #[test]
+    fn sentinel_spaced_yields_to_real_resize() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let cfg = TermConfig {
+            shell: Some("cat".into()),
+            sentinel_gap: Duration::from_millis(350),
+            ..TermConfig::default()
+        };
+        let svc = svc_with(cfg, lines);
+        let (ln, path) = start_listener();
+        {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || svc.serve(ln));
+        }
+        let mut c = Client::connect(&path);
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "yd");
+        c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, "t-yd", &tail));
+        c.expect(Op::ATTACHED, 5);
+        std::thread::sleep(Duration::from_millis(60)); // 仍在间隔窗内
+        c.send(Op::RESIZE, &frames::enc_resize(100, 30));
+        std::thread::sleep(Duration::from_millis(100));
+        {
+            let st = svc.lock_state();
+            let rt = st.sessions.get("t-yd").expect("会话在");
+            assert_eq!(rt.pty.tty_size(), (100, 30), "真实 resize 已应用");
+        }
+        std::thread::sleep(Duration::from_millis(450)); // 过 gap：旧 base 恢复必须让位
+        {
+            let st = svc.lock_state();
+            let rt = st.sessions.get("t-yd").expect("会话在");
+            assert_eq!(rt.pty.tty_size(), (100, 30), "恢复跳让位——不覆盖新尺寸");
+        }
+        svc.close();
+    }
+
+    /// 间隔期间会话终结/同名重建：恢复跳不跨代误伤（重验①②）。
+    #[test]
+    fn sentinel_spaced_not_cross_generation() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let cfg = TermConfig {
+            shell: Some("cat".into()),
+            sentinel_gap: Duration::from_millis(250),
+            ..TermConfig::default()
+        };
+        let svc = svc_with(cfg, lines);
+        let (ln, path) = start_listener();
+        {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || svc.serve(ln));
+        }
+        let mut c = Client::connect(&path);
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "gn");
+        c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, "t-gn", &tail));
+        c.expect(Op::ATTACHED, 5);
+        std::thread::sleep(Duration::from_millis(50)); // 仍在间隔窗内
+        // KILL → OK → ENDED(-2)（读腿收线前把握手读完——同 kill 判据测试的模式）
+        c.send(Op::KILL, &frames::enc_name("t-gn"));
+        let _ = c.expect(Op::OK, 5);
+        let _ = c.expect(Op::ENDED, 8);
+        drop(c);
+        // 等收尾摘表（SIGHUP→宽限→收尸→删注册表；直接看注册表，不猜时序）
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while svc.lock_state().registry.session("t-gn").is_some() {
+            assert!(Instant::now() < deadline, "KILL 收尾 5s 内未摘表");
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        // 同名重建（新世代、新几何）——自己的间隔哨兵照常工作
+        let mut c = Client::connect(&path);
+        c.send(Op::HELLO, &frames::enc_hello(96, 26, hello_flags::CREATE, "t-gn", &tail));
+        c.expect(Op::ATTACHED, 5);
+        std::thread::sleep(Duration::from_millis(80));
+        {
+            let st = svc.lock_state();
+            let rt = st.sessions.get("t-gn").expect("新会话在");
+            assert_eq!(rt.pty.tty_size(), (95, 26), "新会话自己的间隔窗（未被旧 base 80 覆盖）");
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        {
+            let st = svc.lock_state();
+            let rt = st.sessions.get("t-gn").expect("新会话在");
+            assert_eq!(rt.pty.tty_size(), (96, 26), "新会话恢复到自己的真实尺寸");
+        }
+        svc.close();
+    }
+
+    /// 恢复跳幂等：PTY 已在 base 时再触发恢复无副作用（同值 TIOCSWINSZ 不产生信号）。
+    #[test]
+    fn sentinel_restore_idempotent() {
+        let lines = Arc::new(Mutex::new(Vec::new()));
+        let cfg = TermConfig {
+            shell: Some("cat".into()),
+            sentinel_gap: Duration::from_millis(80),
+            ..TermConfig::default()
+        };
+        let svc = svc_with(cfg, lines);
+        let (ln, path) = start_listener();
+        {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || svc.serve(ln));
+        }
+        let mut c = Client::connect(&path);
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "id");
+        c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, "t-id", &tail));
+        c.expect(Op::ATTACHED, 5);
+        std::thread::sleep(Duration::from_millis(250)); // 第二跳已恢复
+        let gen = {
+            let st = svc.lock_state();
+            st.sessions.get("t-id").expect("会话在").gen
+        };
+        svc.sentinel_restore("t-id", gen, Size::normalized(80, 24)); // 再触发一次
+        svc.sentinel_restore("t-id", gen, Size::normalized(80, 24));
+        {
+            let st = svc.lock_state();
+            let rt = st.sessions.get("t-id").expect("会话在");
+            assert_eq!(rt.pty.tty_size(), (80, 24), "幂等——恢复不产生副作用");
+        }
+        svc.close();
+    }
+
+    /// `HOMEWAY_TERM_SENTINEL_GAP` 解析三态：未设=默认 / 设值生效 / 非法回退
+    /// （唯一变量名 + 用后即清，无并行读者）。
+    #[test]
+    fn sentinel_gap_env_parse() {
+        const NAME: &str = "HOMEWAY_TERM_SENTINEL_GAP";
+        let def = SENTINEL_GAP.as_millis() as usize;
+        std::env::remove_var(NAME);
+        assert_eq!(env_int(NAME, def), def, "未设 = 默认");
+        std::env::set_var(NAME, "150");
+        assert_eq!(env_int(NAME, def), 150, "设值生效");
+        std::env::set_var(NAME, "abc");
+        assert_eq!(env_int(NAME, def), def, "非法回退默认");
+        std::env::set_var(NAME, "0");
+        assert_eq!(env_int(NAME, def), def, "0 视为非法回退");
+        std::env::remove_var(NAME);
     }
 
     /// run_explain 的 wire 字段序（explainOutput 声明序 = Go struct 序）。

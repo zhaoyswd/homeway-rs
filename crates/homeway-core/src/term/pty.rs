@@ -275,6 +275,15 @@ impl PtySession {
             .map_err(|e| e.to_string())
     }
 
+    /// 当前 PTY 实际尺寸（读 master 的 TIOCGWINSZ；失败退回 spawn 记录值）。
+    /// 观测面：间隔哨兵的单测要区分「PTY 当前值」与「会话记账值 rt.size()」。
+    pub fn tty_size(&self) -> (u16, u16) {
+        match self.master.get_size() {
+            Ok(s) => (s.cols, s.rows),
+            Err(_) => (self.cols, self.rows),
+        }
+    }
+
     /// 写 PTY（输入面：客户端按键 / 哨兵后的重绘 / focus nudge）。
     pub fn write_input(&mut self, p: &[u8]) -> Result<(), String> {
         self.writer.write_all(p).map_err(|e| e.to_string())?;
@@ -283,6 +292,9 @@ impl PtySession {
 
     /// 尺寸哨兵：sentinel → 真实尺寸，两次 SIGWINCH 逼 TUI 重绘当前屏。
     /// 返回哨兵列值（低 7 判据：一次 attach 只应 +1 次）。
+    ///
+    /// **仅测试夹具**——生产语义在 `term/service.rs`（`sentinel_repaint_locked`，
+    /// term-attach-resilience 起分「背靠背/间隔」两形态）；勿在生产代码上引用本方法。
     pub fn sentinel_repaint(&self) -> u16 {
         let (cols, rows) = (self.cols, self.rows);
         let sentinel = if cols > 1 { cols - 1 } else { cols + 1 };
