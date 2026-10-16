@@ -874,3 +874,20 @@ macOS 代码调用（非 mac 死代码挂 clippy/windows，`#[cfg(macos)]` 门�
 | Mac | 修复版 install.sh（`--bin-dir /opt/homebrew/bin --autostart no`；旧 devel 测试件备份 `homeway.bak-(devel)`）+ `kickstart -k` → pid **82769** | `version=v0.3.8`；`key=8aee740b7220` **不变**；serve 41641 running；零参 `term list` 通 ✓ |
 | 阿里云 | `homeway-v0.3.8-linux-amd64.tar.gz`（sha OK）→ `/usr/local/bin/homeway`（旧件留 `homeway.bak-v0.3.7`）；SIGTERM 6s 退净 → `setsid` 零参起 → pid **1615258** | `version=v0.3.8`；`公钥 1020c3eae8b3` **不变**；serve 41641 + relay :41741 running；`term list` 通；Mac 出口控制面重就绪（15:06:57）✓ |
 | MacBook Pro | **离线**（ssh 超时——`sleep 1` 分钟的省电形态）——**待换装**：机器唤醒后一条命令 `curl -fsSL https://raw.githubusercontent.com/zhaoyswd/homeway-rs/main/install.sh \| sh`（客户端机，自启动选 N）| ✗ **待办** |
+
+### 13.11 换装 v0.3.9（2026-10-16 09:52–10:05，event-driven-heal 核侧 + 五轮评审整改 + 防自旋）
+
+**触发**：event-driven-heal 变更收口（真机验收 + 五轮外部评审 r5 终审通过 + 整改后重采五项全过）。
+清单见 `CHANGELOG.md` v0.3.9 条；**本版主要是客户端核（App 侧）行为**——出口面无 CLI/协议变更，
+出口机换装属例行跟进（App 核 = tier 仓 pin 同批前进）。
+
+| 机器 | 换装 | 判据 |
+|---|---|---|
+| 发版 | tag `v0.3.9` = main 头 `2b808e1`（ci 绿 2m14s 后）；release 五目标全绿（4m37s）+ SHA256SUMS | ✓ |
+| Mac mini | `homeway-v0.3.9-darwin-arm64.tar.gz`（sha `5011bb0b…` = SHA256SUMS）→ 备份 `homeway.bak-v0.3.8` → rm+cp（换二进制坑：cp 覆盖旧 inode 会被 SIGKILL）→ `launchctl kickstart -k` → pid **46243** | `version=v0.3.9`；`key=8aee740b7220` **不变**；serve 41641 running（LAN/公网 v4/v6 + Relay 端点公布）；零参 `term list` 通；peers=1 ✓ |
+| 阿里云 | `linux-amd64.tar.gz`（sha `b4953c7d…` 双侧核对）scp 上传 → 备份 `homeway.bak-v0.3.8` → SIGTERM 退净 → rm+cp → `/opt/homeway` 下 `setsid` 零参起 → pid **1619224** | `version=v0.3.9`；`公钥 1020c3eae8b3` **三版不变**（0.3.7→0.3.8→0.3.9）；serve 41641（UDP %eth0）+ relay :41741 双角色；STUN 公网端点公布；Mac 出口中继控制面 09:59:54 重认证（阿里云 09:59:53 就绪后 1s 内）✓ |
+| MacBook Pro | **离线**（ping 通、ssh 22 超时——省电形态，同 v0.3.8 时）——**待换装**：机器唤醒后 `curl -fsSL https://raw.githubusercontent.com/zhaoyswd/homeway-rs/main/install.sh \| sh`（客户端机，自启动选 N） | ✗ 待办（v0.3.8 起累计） |
+
+**过程注记**：①ci-local 门修一件——fbb149e 测试里的 `std::thread::sleep` 违反 QUIC 隔离门层 3
+（全文件面含测试），换有界让权等待（门不弱化）；②本机 push 前远端有用户的 README commit
+（9f4c5b3）——rebase 后推，无冲突。
