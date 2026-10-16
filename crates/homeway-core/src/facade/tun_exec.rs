@@ -2053,10 +2053,12 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
                 // 岛可能自己把连接救活但不回告世代层（健康位保持 false）。轮次
                 // 起跑前快探一次（700ms，与岛内阶梯同判负粒度）：通过 = 岛活着，
                 // 走强证据翻回退出自救——不多跑 Rebind+Connect（会掐在飞服务流）。
-                // 快探失败才继续轮次路径（探活预算内不构成额外负担）。
+                // 快探失败 ⇒ 岛确实不通，**落到下方正常轮次路径**（不 continue——
+                // 真机验证抓出：失败也 continue 会把轮次饿死成每拍探活的活锁）。
                 if rescue.wants_round_probe_gate(now, suspend_window) {
                     drop(rescue);
-                    if l3_probe(&run, FAST_BUDGET).is_ok() {
+                    let island_alive = l3_probe(&run, FAST_BUDGET).is_ok();
+                    if island_alive {
                         if let Some(elapsed) = run
                             .tun_shared
                             .try_recover_transport_if_current(run.gen, Duration::ZERO)
@@ -2069,9 +2071,10 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
                         let mut r2 = lock_unpoison(&run.rescue);
                         r2.deactivate();
                         run.tun_shared.bump_flip(); // 翻沿（退出自救）
+                        continue;
                     }
-                    continue;
                 }
+                let mut rescue = lock_unpoison(&run.rescue);
                 let out_at = run.l3_last_outbound_at();
                 let packet_fresh = out_at
                     .map(|t| now.duration_since(t) < demand::OUTBOUND_FRESH)
