@@ -209,6 +209,7 @@ enum TermConn {
 }
 
 /// 读帧错误的三类面：IO 失败 / 远程流终结（三态）/ 预算内无应答。
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum TermReadErr {
     Io(String),
     Ended(RemoteEndError),
@@ -359,24 +360,58 @@ impl TermWriteHalf {
     }
 }
 
+/// attach 拨号错误的归因档（重连判定矩阵的输入，term-attach-resilience D2）：
+/// `Session` = 会话级（服务端 ERROR 码面：already_exists / no_session / …，不重连）；
+/// `Transport` = 链路面（拨不通/流拒绝/读超时——远程面可重连）；`Proto` = 协议代次
+/// 不齐（重试无意义）。非 attach 调用方用 [`DialErr::text`] 折回既有文案口径。
+enum DialErr {
+    Session { code: String, msg: String },
+    Transport(String),
+    Proto(String),
+}
+
+impl DialErr {
+    /// 终局打印文案（Session 走 proto_error_text 既有口径；其余原样携带）。
+    fn text(&self) -> String {
+        match self {
+            DialErr::Session { code, msg } => proto_error_text(code, msg),
+            DialErr::Transport(t) | DialErr::Proto(t) => t.clone(),
+        }
+    }
+
+    /// `already_exists` 判定（自动命名重试面）。
+    fn is_already_exists(&self) -> bool {
+        matches!(self, DialErr::Session { code, .. } if code == "already_exists")
+    }
+}
+
 /// 拨号并读 GREETING（list/new/delete/attach/explain 共用的唯一拨号缝）。
 /// 返回出口声明的 features 位（attach 的版本声明位由它决定，FIX-29）。
-fn dial_term(t: &mut TermTarget) -> Result<(TermConn, u32), String> {
+fn dial_term(t: &mut TermTarget) -> Result<(TermConn, u32), DialErr> {
     let conn = if t.remote() {
         let id = match &t.host_id {
             Some(id) => id.clone(),
             None => {
-                let id = resolve_host_ref(&t.state_dir, &t.host_ref, t.timeout)?;
+                let id = resolve_host_ref(&t.state_dir, &t.host_ref, t.timeout)
+                    .map_err(DialErr::Transport)?;
                 t.host_id = Some(id.clone());
                 id
             }
         };
-        let client = dial_control_spawn_term(&t.state_dir, t.no_spawn)?;
-        let st = client.open_stream(vocab::STREAM_KIND_TERM, &id, t.timeout).map_err(|e| crate::daemon_cli::stream_open_err_text(&e))?;
+        let client = dial_control_spawn_term(&t.state_dir, t.no_spawn).map_err(DialErr::Transport)?;
+        // 失败路径必须显式 close——ControlClient 无 Drop、reader 线程持 Arc 克隆，
+        // 不关则 fd+线程滞留（无限重连循环下累积到 EMFILE；r1 评审 3.3）。
+        let st = match client.open_stream(vocab::STREAM_KIND_TERM, &id, t.timeout) {
+            Ok(st) => st,
+            Err(e) => {
+                client.close();
+                return Err(DialErr::Transport(crate::daemon_cli::stream_open_err_text(&e)));
+            }
+        };
         TermConn::Remote { client, st, buf: Vec::new() }
     } else {
         let sock = local_term_sock(&t.state_dir);
-        let stream = UnixStream::connect(&sock).map_err(|e| local_dial_err(&sock, e))?;
+        let stream = UnixStream::connect(&sock).map_err(|e| DialErr::Transport(local_dial_err(&sock, e)))?;
         TermConn::Local(FrameIo::new(stream))
     };
     read_greeting(conn, t.timeout)
@@ -423,26 +458,27 @@ fn local_dial_err(sock: &std::path::Path, e: std::io::Error) -> String {
     }
 }
 
-/// GREETING 读取 + 版本门（CLI 侧，FIX-29：ver != 本端当场拒）。
-fn read_greeting(mut conn: TermConn, budget: Duration) -> Result<(TermConn, u32), String> {
+/// GREETING 读取 + 版本门（CLI 侧，FIX-29：ver != 本端当场拒）。读失败/超时 = 传输档
+/// （主机半死可等重连），版本与格式不符 = 协议档（重试无意义）。
+fn read_greeting(mut conn: TermConn, budget: Duration) -> Result<(TermConn, u32), DialErr> {
     let f = conn
         .read_frame_deadline(budget)
-        .map_err(|e| format!("读 GREETING：{}", e.message("?")))?;
+        .map_err(|e| DialErr::Transport(format!("读 GREETING：{}", e.message("?"))))?;
     if f.op != Op::GREETING {
         conn.close();
-        return Err(format!("首帧应为 GREETING，收到 op 0x{:02x}", f.op.0));
+        return Err(DialErr::Proto(format!("首帧应为 GREETING，收到 op 0x{:02x}", f.op.0)));
     }
     let (ver, feats) = frames::dec_greeting(&f.payload)
         .map_err(|e| {
             conn.close();
-            format!("GREETING 体非法：{e}")
+            DialErr::Proto(format!("GREETING 体非法：{e}"))
         })?;
     if ver != frames::PROTO_VER {
         conn.close();
-        return Err(format!(
+        return Err(DialErr::Proto(format!(
             "出口终端服务协议版本 {ver} 与本端 {} 不符：出口与客户端需同批升级",
             frames::PROTO_VER
-        ));
+        )));
     }
     Ok((conn, feats))
 }
@@ -709,7 +745,7 @@ fn cli_list(args: &[String]) -> Result<(), String> {
     let p = parse_term_args(args, &["--json"], &[], false)?;
     let json_out = p.flags.iter().any(|f| f == "--json");
     let mut t = p.common.into_target()?;
-    let (mut conn, _) = dial_term(&mut t)?;
+    let (mut conn, _) = dial_term(&mut t).map_err(|e| e.text())?;
     let raw = round_trip(&mut conn, Op::LIST, &[], t.timeout)?;
     conn.close();
     if json_out {
@@ -726,7 +762,7 @@ fn cli_list(args: &[String]) -> Result<(), String> {
 
 /// 取 LIST（表格与「attach 省略名字」的最近活跃解析共用）。
 fn list_fetch(t: &mut TermTarget) -> Result<Vec<SessionInfo>, String> {
-    let (mut conn, _) = dial_term(t)?;
+    let (mut conn, _) = dial_term(t).map_err(|e| e.text())?;
     let raw = round_trip(&mut conn, Op::LIST, &[], t.timeout)?;
     conn.close();
     let out: SessionsWrap =
@@ -846,7 +882,7 @@ fn cli_new(args: &[String]) -> Result<(), String> {
 /// CREATE 一锤子（already_exists 判定走码面——自动命名重试的依据）。
 /// Ok(false) = already_exists（仅 retry=true 时返回）。
 fn create_once(t: &mut TermTarget, name: &str, flags: u8, retry: bool) -> Result<bool, String> {
-    let (mut conn, _) = dial_term(t)?;
+    let (mut conn, _) = dial_term(t).map_err(|e| e.text())?;
     conn.write_frame(Op::CREATE, &frames::enc_create(flags, name))
         .map_err(|e| e.message(name))?;
     let f = conn.read_frame_deadline(t.timeout).map_err(|e| e.message(name))?;
@@ -872,7 +908,7 @@ fn cli_delete(args: &[String]) -> Result<(), String> {
     validate_name(&p.name)?;
     let name = p.name.clone();
     let mut t = p.common.into_target()?;
-    let (mut conn, _) = dial_term(&mut t)?;
+    let (mut conn, _) = dial_term(&mut t).map_err(|e| e.text())?;
     conn.write_frame(Op::KILL, &frames::enc_name(&name))
         .map_err(|e| e.message(&name))?;
     let f = conn.read_frame_deadline(t.timeout).map_err(|e| e.message(&name))?;
@@ -975,16 +1011,16 @@ fn attach_cmd(o: AttachOpts) -> Result<(), String> {
         // 自动命名在这里重试（already_exists ⇒ 换名重来，最多 8 次）。
         for _ in 0..AUTO_NAME_TRIES {
             let n = gen_auto_name();
-            match attach_dial(&mut target, &o, &tty, &n) {
-                Ok((conn, attached)) => return attach_run(conn, &tty, attached, &n, &o),
-                Err(e) if e == "already_exists" => continue,
-                Err(e) => return Err(e),
+            match attach_dial(&mut target, &o, &tty, &n, false) {
+                Ok((conn, attached)) => return attach_session(&mut target, conn, attached, tty, &n, &o),
+                Err(e) if e.is_already_exists() => continue,
+                Err(e) => return Err(e.text()),
             }
         }
         return Err("自动命名连续重名 8 次（运气太差）；请显式给名字：homeway term new <名字>".to_owned());
     }
-    let (conn, attached) = attach_dial(&mut target, &o, &tty, &name)?;
-    attach_run(conn, &tty, attached, &name, &o)
+    let (conn, attached) = attach_dial(&mut target, &o, &tty, &name, false).map_err(|e| e.text())?;
+    attach_session(&mut target, conn, attached, tty, &name, &o)
 }
 
 /// TERM_SESSION_ID 回环检测（服务端在会话 env 里置 `tailcat-<名>`）。
@@ -1002,16 +1038,20 @@ fn pick_recent_session(t: &mut TermTarget) -> Result<String, String> {
 }
 
 /// 经拨号缝接入 → GREETING → HELLO（caps=raw + 实例标识尾随 + 可选版本字节）→ ATTACHED。
+/// `reconnect = true` = 首连成功后的重拨：**降级为纯 attach 语义**（清 CREATE /
+/// ONLY_IF_ABSENT——`new` 的创建位只在首连发，重发会撞 already_exists 把创建型会话
+/// 的自愈打死；r1 评审 3.1）。
 fn attach_dial(
     t: &mut TermTarget,
     o: &AttachOpts,
     tty: &Tty,
     name: &str,
-) -> Result<(TermConn, Vec<u8>), String> {
+    reconnect: bool,
+) -> Result<(TermConn, Vec<u8>), DialErr> {
     let (mut conn, feats) = dial_term(t)?;
     let (cols, rows) = tty.size();
     let mut flags = 0u8;
-    if o.create {
+    if o.create && !reconnect {
         flags |= hello_flags::CREATE;
         if !o.reuse {
             flags |= hello_flags::ONLY_IF_ABSENT; // `new <名字>`：重名报错、不静默接入
@@ -1034,23 +1074,26 @@ fn attach_dial(
     conn.write_frame(Op::HELLO, &hello)
         .map_err(|e| {
             conn.close();
-            format!("发 HELLO：{}", e.message(name))
+            DialErr::Transport(format!("发 HELLO：{}", e.message(name)))
         })?;
     let f = conn
         .read_frame()
         .map_err(|e| {
             conn.close();
-            format!("读 ATTACHED：{}", e.message(name))
+            DialErr::Transport(format!("读 ATTACHED：{}", e.message(name)))
         })?;
     if f.op == Op::ERROR {
         conn.close();
         let (code, msg) = frames::dec_error(&f.payload).unwrap_or_default();
-        // already_exists 以码面原样上抛（自动命名重试判定）。
-        return Err(if code == "already_exists" { code } else { proto_error_text(&code, &msg) });
+        // 码面原样保留在 Session 档（自动命名重试 / 重连判定两处消费）。
+        return Err(DialErr::Session { code, msg });
     }
     if f.op != Op::ATTACHED {
         conn.close();
-        return Err(format!("首帧应为 ATTACHED，收到 op 0x{:02x}（服务端与 CLI 不是同代？）", f.op.0));
+        return Err(DialErr::Proto(format!(
+            "首帧应为 ATTACHED，收到 op 0x{:02x}（服务端与 CLI 不是同代？）",
+            f.op.0
+        )));
     }
     Ok((conn, f.payload))
 }
@@ -1103,6 +1146,27 @@ impl Tty {
 
 fn is_tty(fd: i32) -> bool {
     unsafe { libc::isatty(fd) == 1 }
+}
+
+/// 退出前有界排空（term-attach-resilience D3）：应答让位设计下查询直达本地真终端，
+/// 断链/退出竞态里终端排好的孤儿应答（DA1/kitty/像素查询回包）会在进程退出后漏给
+/// shell、被回显成数字乱码。**还原 termios（开回显）之前**调用：poll 小超时等在途
+/// 应答落队 → `tcflush(TCIFLUSH)` 丢弃全部排队输入——不区分形态（竞态击键与既有
+/// send 失败丢弃语义一致）、不读字节（无上限、无截断判定面）。非 tty 面（理论不可达：
+/// attach 有 TTY 前置）tcflush 失败静默。
+fn drain_terminal_input(fd: i32, timeout_ms: i32) {
+    let mut pfd = libc::pollfd { fd, events: libc::POLLIN, revents: 0 };
+    loop {
+        let r = unsafe { libc::poll(&mut pfd, 1, timeout_ms) };
+        if r >= 0
+            || std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted
+        {
+            break; // 有数据/超时/错误都进 flush——排空语义以 tcflush 为准
+        }
+    }
+    unsafe {
+        libc::tcflush(fd, libc::TCIFLUSH);
+    }
 }
 
 /// 查询窗口内收应答 + 剩余字节回投（OSC 21；总预算 150ms；必须在 raw 模式下调）。
@@ -1195,7 +1259,14 @@ fn osc_reply_end(b: &[u8]) -> Option<(usize, usize)> {
 
 /// 客户端实例标识：主机名 + uid + tty 设备路径的短哈希（同一终端重跑 ⇒ 同一标识
 /// ⇒ 重连替换自身旧腿、不被自己的旧腿锁在腿数上限外；无 tty 退化为每进程随机）。
+/// **进程内只算一次**（OnceLock）：无 tty 退化档是随机的，重拨重算会换 id ⇒ 旧腿
+/// 不被 self_reconnect 替换、腿数堆积（r1 评审 3.9）。
 fn client_id() -> String {
+    static ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    ID.get_or_init(client_id_compute).clone()
+}
+
+fn client_id_compute() -> String {
     let tty_path = tty_name();
     if tty_path.is_empty() {
         let mut b = [0u8; 4];
@@ -1479,62 +1550,324 @@ fn set_title(line: &str) {
     let _ = out.flush();
 }
 
-/// attach 主体：raw 模式 + 双向透传 + 分离键 + 尺寸同步 + 任何退出路径还原终端。
-fn attach_run(
-    mut conn: TermConn,
-    tty: &Tty,
-    attached: Vec<u8>,
+/// attach 一次连接的运行结局。
+enum AttachOutcome {
+    /// 终局（提示文案面）：Some = 打「homeway term: …」后正常退出。
+    Done(Option<String>),
+    /// 终局（错误面）：上抛给调用方打印。
+    Fail(String),
+    /// 链路级断（携带归因错误：远程面进重连、本地面折成终局文案）。
+    LinkLost(TermReadErr),
+}
+
+/// 重连判定矩阵的输入事件（term-attach-resilience D2；纯函数供真值表单测）。
+/// 运行路径只构造语义有歧义的档（链路面读写失败 / 拨号分档），无歧义档
+/// （ENDED/信号/分离…）在连接段内联终局；全部档位的判定语义由单测钉住——
+/// 无歧义档只在单测构造（运行路径不走过）。
+#[derive(Debug, Clone, Copy)]
+#[cfg_attr(not(test), allow(dead_code))]
+enum LinkEvent {
+    Ended,
+    ErrorFrame,
+    StdoutWriteFail,
+    StdinEof,
+    PollFail,
+    ExitSignal,
+    Detach,
+    /// 读腿/写腿失败（链路面——按面分档）。
+    LinkIo,
+    /// 拨号失败——传输档（链路面——按面分档）。
+    DialTransport,
+    /// 拨号失败——会话/协议档。
+    DialFinal,
+}
+
+/// 判定：Finish = 终局；Retry = 远程面重连。会话级/协议级/本地 I/O 面/用户动作一律
+/// 终局；链路面失败**只在远程面**可重连——本地面（term.sock 直连）的对端即出口进程
+/// 本身，其死亡意味着会话已不存在，重拨永无成功（r1 评审 3.5）。
+#[derive(Debug, PartialEq, Eq)]
+enum LinkDecision {
+    Finish,
+    Retry,
+}
+
+fn link_failure_classify(remote: bool, ev: LinkEvent) -> LinkDecision {
+    use LinkEvent::*;
+    match ev {
+        Ended | ErrorFrame | StdoutWriteFail | StdinEof | PollFail | ExitSignal | Detach
+        | DialFinal => LinkDecision::Finish,
+        LinkIo | DialTransport => {
+            if remote { LinkDecision::Retry } else { LinkDecision::Finish }
+        }
+    }
+}
+
+/// 远程面重连退避（判据登记项，term-attach-resilience D4）：0.5s 起 ×2 封顶 5s。
+/// 与既有三套退避（unified_cli ROLE_BACKOFF / host 重建 / files_server）独立——本套
+/// 服务交互重拨，恢复最多延后一个封顶值（5s）是显式取舍；起点 = 上次尝试结束
+/// （拨号自带 --timeout 预算，实际间隔 = 退避 + 拨号时长）。
+const LINK_RETRY_BASE: Duration = Duration::from_millis(500);
+const LINK_RETRY_CAP: Duration = Duration::from_secs(5);
+
+struct LinkBackoff {
+    cur: Duration,
+}
+
+impl LinkBackoff {
+    fn new() -> Self {
+        LinkBackoff { cur: LINK_RETRY_BASE }
+    }
+
+    /// 本次等待毫秒数（取当前档并升档）。
+    fn next_ms(&mut self) -> i32 {
+        let ms = self.cur.as_millis().min(i32::MAX as u128) as i32;
+        self.cur = (self.cur * 2).min(LINK_RETRY_CAP);
+        ms
+    }
+}
+
+/// 重连横幅（raw 模式 \r\n；暗色）：恢复后服务端握手自带 3J/2J/H 清屏——横幅自然
+/// 消失，无需擦除逻辑。
+fn reconnect_banner() {
+    let mut out = std::io::stdout();
+    let _ = out.write_all("\r\n\x1b[2mhomeway: 与主机的连接断开，重连中…（Ctrl-C 退出）\x1b[0m\r\n".as_bytes());
+    let _ = out.flush();
+}
+
+/// 重连等待期（退避窗）的事件。
+enum WaitEvent {
+    /// 超时/错误：进重拨。
+    Timeout,
+    /// 退出（Some = 提示文案；None = stdin 关闭的干净收尾）。
+    Quit(Option<String>),
+}
+
+/// attach 进程级资源（跨重连保持）：raw 终端、信号管道、poke 管道、分离键状态机、
+/// 标题查询结果（**只查一次**——重连段再查会把 homeway 自己设的标题当「旧标题」，
+/// 最终把用户标题还原错；r1 评审 3.7）。client_id 同理由 [`client_id`] 的 OnceLock
+/// 保证进程内稳定。
+struct AttachEnv {
+    tty: Tty,
+    pipes: SigPipe,
+    poke: [i32; 2],
+    dm: DetachMachine,
+    old_title: String,
+    title_on: bool,
+}
+
+impl AttachEnv {
+    /// raw 切换 + 信号面 + 标题查询 + poke 管道（进程一次；调用前首连已成功——拨号
+    /// 失败路径不碰终端）。返回 (env, 查询窗抢敲字节)——后者只喂首连段（首键不丢）。
+    fn new(tty: Tty, o: &AttachOpts, conn: &mut TermConn) -> Result<(Self, Vec<u8>), String> {
+        let (prefix, key_enabled) = detach_key_spec(&o.detach_key)?;
+        let title_on = !std::env::var("HOMEWAY_TERM_TITLE")
+            .unwrap_or_default()
+            .eq_ignore_ascii_case("off");
+        if let Err(e) = tty.make_raw() {
+            conn.close();
+            return Err(format!("切换 raw 模式失败：{e}"));
+        }
+        // 信号管道先装（查询窗之前——SIGTERM 落在窗内不能被 poll 吞掉）。
+        let pipes = install_signal_pipes();
+        // OSC 21 查询（150ms 预算；剩余字节回投——首键不丢）。进程级一次。
+        let (old_title, leftover) = if title_on { tty_query_title() } else { (String::new(), Vec::new()) };
+        // 数据到达管道（读腿 poke —— 主循环 poll 面的第三源）。写端非阻塞（评审
+        // r2-7/r2-12：满管 EAGAIN 丢弃无害；建立失败 = 可行动错误退出——裸 -1 会把
+        // SIG_W/poke 指到 fd 0〔stdin〕）。Q-G F1：CLOEXEC 创建即落（两端）。
+        let (poke_r, poke_w) = match homeway_core::sysfd::pipe_cloexec() {
+            Ok(v) => (
+                std::os::fd::IntoRawFd::into_raw_fd(v.0),
+                std::os::fd::IntoRawFd::into_raw_fd(v.1),
+            ),
+            Err(e) => {
+                // Q-G F1（N7）：早退路径必须补 `drop_signal_pipes`（SIG_W 留在活 fd 上
+                // + 两 fd 泄漏）。
+                drop_signal_pipes(pipes);
+                conn.close();
+                let _ = tty.restore();
+                return Err(format!("poke 管道建立失败：{e}"));
+            }
+        };
+        let poke = [poke_r, poke_w];
+        unsafe {
+            let fl = libc::fcntl(poke[1], libc::F_GETFL);
+            libc::fcntl(poke[1], libc::F_SETFL, fl | libc::O_NONBLOCK);
+        }
+        Ok((
+            AttachEnv {
+                dm: DetachMachine::new(prefix, key_enabled),
+                tty,
+                pipes,
+                poke,
+                old_title,
+                title_on,
+            },
+            leftover,
+        ))
+    }
+
+    /// 进程终局（唯一出口）：拆信号面/关 poke → 还标题 → **stdin 排空（开回显前，
+    /// term-attach-resilience D3：统一 50ms——在途查询应答不漏给 shell；应答已在
+    /// 队列时 poll 立即命中零延迟，空队列付满 50ms 有界不可感知）** → 还原终端 →
+    /// 打文案/上抛错误。
+    fn finish(self, note: Result<Option<String>, String>) -> Result<(), String> {
+        let AttachEnv { tty, pipes, poke, old_title, title_on, .. } = self;
+        drop_signal_pipes(pipes);
+        unsafe {
+            libc::close(poke[0]);
+            libc::close(poke[1]);
+        }
+        if title_on && !old_title.is_empty() {
+            set_title(&old_title);
+        }
+        drain_terminal_input(0, DRAIN_ON_EXIT_MS);
+        if let Err(rerr) = tty.restore() {
+            eprintln!("\rhomeway term: 终端还原失败（{rerr}）；画面混乱时执行 reset 修复\r");
+        }
+        match note {
+            Ok(Some(n)) => {
+                eprintln!("\rhomeway term: {n}\r");
+                Ok(())
+            }
+            Ok(None) => Ok(()),
+            Err(e) => Err(e),
+        }
+    }
+}
+
+/// 退出排空窗（判据登记项）：所有退出路径统一一档——正常退出时远端 TUI 仍在跑、
+/// 可能刚发查询，在途应答与断链同形（r1 评审 4.2）。
+const DRAIN_ON_EXIT_MS: i32 = 50;
+
+/// attach 主体（连接生命周期循环，term-attach-resilience D2）：首连 → 连接段运行 →
+/// 链路级失败（远程面）进「横幅 + 退避重拨」；会话级/协议级/用户终局面直接收尾。
+/// 重拨自动降级创建位（`new` 自愈）并复用同一 client_id（服务端 self_reconnect 替换
+/// 旧腿）；等待期读 stdin 喂分离键状态机、孤立 Ctrl-C 视为退出、其余丢弃。
+fn attach_session(
+    t: &mut TermTarget,
+    conn: TermConn,
+    mut attached: Vec<u8>,
+    tty: Tty,
     name: &str,
     o: &AttachOpts,
 ) -> Result<(), String> {
-    let (prefix, key_enabled) = detach_key_spec(&o.detach_key)?;
-    let title_on = !std::env::var("HOMEWAY_TERM_TITLE")
-        .unwrap_or_default()
-        .eq_ignore_ascii_case("off");
-
-    if let Err(e) = tty.make_raw() {
-        conn.close();
-        return Err(format!("切换 raw 模式失败：{e}"));
-    }
-    // 信号管道先装（查询窗之前——SIGTERM 落在窗内不能被 poll 吞掉）。
-    let pipes = install_signal_pipes();
-    // OSC 21 查询（150ms 预算；剩余字节回投——首键不丢）。
-    let (old_title, query_leftover) = if title_on { tty_query_title() } else { (String::new(), Vec::new()) };
-
-    // 数据到达管道（读腿 poke —— 主循环 poll 面的第三源）。写端非阻塞（评审
-    // r2-7/r2-12：满管 EAGAIN 丢弃无害；建立失败 = 可行动错误退出——裸 -1 会把
-    // SIG_W/poke 指到 fd 0〔stdin〕）。Q-G F1：CLOEXEC 创建即落（两端）。
-    let (poke_r, poke_w) = match homeway_core::sysfd::pipe_cloexec() {
-        Ok(v) => (
-            std::os::fd::IntoRawFd::into_raw_fd(v.0),
-            std::os::fd::IntoRawFd::into_raw_fd(v.1),
-        ),
-        Err(e) => {
-            // Q-G F1（N7）：早退路径必须补 `drop_signal_pipes`（SIG_W 留在活 fd 上
-            // + 两 fd 泄漏——对照下方 split 失败路径的既有收口）
-            drop_signal_pipes(pipes);
-            conn.close();
-            let _ = tty.restore();
-            return Err(format!("poke 管道建立失败：{e}"));
+    let remote = t.remote();
+    let mut conn = conn;
+    let (mut env, leftover) = AttachEnv::new(tty, o, &mut conn)?;
+    let mut leftover_opt = Some(leftover);
+    let mut backoff = LinkBackoff::new();
+    loop {
+        let outcome = attach_run_once(
+            &mut env,
+            conn,
+            attached.clone(),
+            name,
+            remote,
+            leftover_opt.take().unwrap_or_default(),
+        );
+        match outcome {
+            AttachOutcome::Done(note) => return env.finish(Ok(note)),
+            AttachOutcome::Fail(msg) => return env.finish(Err(msg)),
+            AttachOutcome::LinkLost(e) => {
+                if !remote {
+                    // 本地面：对端 = 出口进程本身，链路断即终局（既有三态文案）。
+                    return env.finish(Err(e.message(name)));
+                }
+                reconnect_banner();
+                loop {
+                    match wait_during_backoff(&mut env, backoff.next_ms(), name) {
+                        WaitEvent::Timeout => {}
+                        WaitEvent::Quit(note) => return env.finish(Ok(note)),
+                    }
+                    match attach_dial(t, o, &env.tty, name, true) {
+                        Ok((c, att)) => {
+                            conn = c;
+                            attached = att;
+                            break;
+                        }
+                        Err(e) => match link_failure_classify(
+                            remote,
+                            if matches!(e, DialErr::Transport(_)) {
+                                LinkEvent::DialTransport
+                            } else {
+                                LinkEvent::DialFinal
+                            },
+                        ) {
+                            LinkDecision::Finish => return env.finish(Err(e.text())),
+                            LinkDecision::Retry => continue,
+                        },
+                    }
+                }
+            }
         }
-    };
-    let poke_fds = [poke_r, poke_w];
-    unsafe {
-        let fl = libc::fcntl(poke_fds[1], libc::F_GETFL);
-        libc::fcntl(poke_fds[1], libc::F_SETFL, fl | libc::O_NONBLOCK);
+    }
+}
+
+/// 重连等待期（退避窗）：poll([stdin, 信号管道], ms)。Ctrl-C 字节（raw 下不是信号——
+/// cfmakeraw 关 ISIG；等待态无远端可投递，当退出安全）/分离键/退出信号 ⇒ Quit；
+/// 其余输入丢弃（含孤儿应答——不注入恢复后的会话）；超时 ⇒ Timeout（进重拨）。
+fn wait_during_backoff(env: &mut AttachEnv, ms: i32, name: &str) -> WaitEvent {
+    let mut pfds = [
+        libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 },
+        libc::pollfd { fd: env.pipes.read_fd, events: libc::POLLIN, revents: 0 },
+    ];
+    let n = unsafe { libc::poll(pfds.as_mut_ptr(), 2, ms) };
+    if n <= 0 {
+        return WaitEvent::Timeout; // 超时/错误：进重拨
+    }
+    if pfds[1].revents & libc::POLLIN != 0 {
+        let mut b = [0u8; 8];
+        let m = unsafe { libc::read(env.pipes.read_fd, b.as_mut_ptr().cast(), 8) };
+        for &c in &b[..m.max(0) as usize] {
+            if c == b'x' {
+                return WaitEvent::Quit(Some("收到信号退出（会话仍在运行）".to_owned()));
+            }
+            // 'w'（SIGWINCH）：等待期无需记忆——重拨 HELLO 自带当前 tty.size()
+        }
+    }
+    if pfds[0].revents & libc::POLLIN != 0 {
+        let mut buf = [0u8; 512];
+        let m = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
+        if m == 0 {
+            return WaitEvent::Quit(None); // stdin 关闭：干净收尾
+        }
+        let chunk = &buf[..m as usize];
+        if chunk.contains(&0x03) {
+            return WaitEvent::Quit(Some("收到 Ctrl-C 退出（会话仍在运行）".to_owned()));
+        }
+        let (_, action) = env.dm.feed(chunk);
+        if let DetachAction::Detach = action {
+            return WaitEvent::Quit(Some(format!("已分离（会话 {name} 继续在出口运行）")));
+        }
+        // 其余丢弃（Realign/None：等待态无连接可对齐）
+    }
+    WaitEvent::Timeout
+}
+
+/// attach 连接段（一次连接的完整生命周期）：reader 线程 + 主循环 poll([stdin, 信号,
+/// poke])。任何退出路径先做**连接收尾**（停 reader → close → join——close 是解阻塞
+/// 读腿的唯一可靠逃生口，r2-10 序），再返回结局；进程级终局在 [`AttachEnv::finish`]。
+/// `leftover` 仅首连接段非空（OSC 21 查询窗的抢敲字节回投——首键不丢）。
+fn attach_run_once(
+    env: &mut AttachEnv,
+    conn: TermConn,
+    attached: Vec<u8>,
+    name: &str,
+    remote: bool,
+    leftover: Vec<u8>,
+) -> AttachOutcome {
+    // 上一连接的 poke 残留清掉（新连接不复用旧唤醒）。**先 poll(0)**：空管道上裸
+    // read 会永久阻塞——连接段会卡死在主循环之前（e2e 抓出）。
+    {
+        let mut pfd = libc::pollfd { fd: env.poke[0], events: libc::POLLIN, revents: 0 };
+        if unsafe { libc::poll(&mut pfd, 1, 0) } > 0 {
+            drain_poke(env.poke[0]);
+        }
     }
     // 连接分两半：读腿线程持读半（帧 → 通道 + 数据管道 poke），主线程持写半。
     let (read_half, write_half) = match conn.split() {
         Ok(v) => v,
-        Err(e) => {
-            drop_signal_pipes(pipes);
-            unsafe {
-                libc::close(poke_fds[0]);
-                libc::close(poke_fds[1]);
-            }
-            let _ = tty.restore();
-            return Err(e);
-        }
+        Err(e) => return AttachOutcome::Fail(e),
     };
     let write_half = Mutex::new(write_half);
     struct ReaderShared {
@@ -1545,7 +1878,7 @@ fn attach_run(
     let (data_tx, data_rx) = mpsc::channel::<frames::Frame>();
     let reader = {
         let shared = Arc::clone(&shared);
-        let poke_w = poke_fds[1];
+        let poke_w = env.poke[1];
         std::thread::Builder::new()
             .name("hw-term-read".to_owned())
             .spawn(move || {
@@ -1571,57 +1904,50 @@ fn attach_run(
             })
             .expect("线程创建不可失败")
     };
-    // join 句柄交给 finish（Option 承载——join 消耗值）。
-    let mut reader = Some(reader);
-
-    // 统一收尾：停读腿 → 关连接 → 还原信号面/终端/标题。
-    let mut finish = |note: Option<String>| -> Result<(), String> {
+    // 连接收尾（幂等；任何退出路径必经）：停读腿 → 关连接 → join。
+    let teardown = || {
         shared.stop.store(true, Ordering::SeqCst);
         write_half.lock().unwrap().close(); // 连接级断开解阻塞读腿
-        if let Some(h) = reader.take() {
-            let _ = h.join();
-        }
-        drop_signal_pipes(pipes);
-        unsafe {
-            libc::close(poke_fds[0]);
-            libc::close(poke_fds[1]);
-        }
-        if title_on && !old_title.is_empty() {
-            set_title(&old_title);
-        }
-        if let Err(rerr) = tty.restore() {
-            eprintln!("\rhomeway term: 终端还原失败（{rerr}）；画面混乱时执行 reset 修复\r");
-        }
-        if let Some(n) = note {
-            eprintln!("\rhomeway term: {n}\r");
-        }
-        Ok(())
+        let _ = reader.join();
+    };
+    // 读/写失败按矩阵归因（本地面折终局文案、远程面 LinkLost 进重连）。
+    let classify = |e: &TermReadErr| match link_failure_classify(remote, LinkEvent::LinkIo) {
+        LinkDecision::Finish => AttachOutcome::Fail(e.message(name)),
+        LinkDecision::Retry => AttachOutcome::LinkLost(e.clone()),
+    };
+    // RESIZE 上报（返回值检查：写失败按链路失败归因——r1 评审 3.4）。
+    let do_resize = |env: &AttachEnv| -> Result<(), TermReadErr> {
+        let mut wh = write_half.lock().unwrap();
+        let (cols, rows) = env.tty.size();
+        wh.write_frame(Op::RESIZE, &frames::enc_resize(cols, rows))
     };
 
-    let send_resize = |wh: &mut TermWriteHalf| {
-        let (cols, rows) = tty.size();
-        let _ = wh.write_frame(Op::RESIZE, &frames::enc_resize(cols, rows));
-    };
-    if title_on {
+    if env.title_on {
         let (agent, state) = attached_agent_state(&attached);
         set_title(&title_line(name, agent, state, ""));
     }
 
-    // 输入路径状态机 + 查询窗抢敲字节回投（首键不丢）。
-    let mut dm = DetachMachine::new(prefix, key_enabled);
-    if !query_leftover.is_empty() {
-        let (pass, action) = dm.feed(&query_leftover);
+    // 输入路径状态机 + 查询窗抢敲字节回投（首键不丢；仅首连接段）。
+    if !leftover.is_empty() {
+        let (pass, action) = env.dm.feed(&leftover);
         if !pass.is_empty() {
             if let Err(e) = send_data(&write_half, &pass) {
-                let msg = e.message(name);
-                return finish(None).and(Err(msg));
+                let oc = classify(&e);
+                teardown();
+                return oc;
             }
         }
         match action {
-            DetachAction::Realign => send_resize(&mut write_half.lock().unwrap()),
+            DetachAction::Realign => {
+                if let Err(e) = do_resize(env) {
+                    let oc = classify(&e);
+                    teardown();
+                    return oc;
+                }
+            }
             DetachAction::Detach => {
-                let note = format!("已分离（会话 {name} 继续在出口运行）");
-                return finish(Some(note));
+                teardown();
+                return AttachOutcome::Done(Some(format!("已分离（会话 {name} 继续在出口运行）")));
             }
             DetachAction::None => {}
         }
@@ -1632,8 +1958,8 @@ fn attach_run(
     loop {
         let mut pfds = [
             libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: pipes.read_fd, events: libc::POLLIN, revents: 0 },
-            libc::pollfd { fd: poke_fds[0], events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: env.pipes.read_fd, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: env.poke[0], events: libc::POLLIN, revents: 0 },
         ];
         let n = unsafe { libc::poll(pfds.as_mut_ptr(), 3, -1) };
         if n < 0 {
@@ -1641,12 +1967,12 @@ fn attach_run(
             if e.kind() == std::io::ErrorKind::Interrupted {
                 continue;
             }
-            let msg = format!("poll 失败：{e}");
-            return finish(None).and(Err(msg));
+            teardown();
+            return AttachOutcome::Fail(format!("poll 失败：{e}"));
         }
         // ① term 帧（DATA → stdout；STATE → 标题；ENDED → 文案退出；ERROR → 协议错误）。
         if pfds[2].revents & libc::POLLIN != 0 {
-            drain_poke(poke_fds[0]);
+            drain_poke(env.poke[0]);
             loop {
                 match data_rx.try_recv() {
                     Ok(f) => {
@@ -1654,13 +1980,14 @@ fn attach_run(
                         match f.op {
                             Op::DATA => {
                                 if out.write_all(&f.payload).is_err() || out.flush().is_err() {
-                                    let msg = "写本地终端失败".to_owned();
-                                    return finish(None).and(Err(msg));
+                                    // 本地终端没了：重拨无意义（矩阵 StdoutWriteFail）。
+                                    teardown();
+                                    return AttachOutcome::Fail("写本地终端失败".to_owned());
                                 }
                             }
                             Op::ATTACHED | Op::REPLAY_DONE => {} // 回放/重复握手帧：不做事
                             Op::STATE => {
-                                if title_on {
+                                if env.title_on {
                                     let (agent, state, title) = frames::dec_state(&f.payload);
                                     set_title(&title_line(name, agent, state, &title));
                                 }
@@ -1668,12 +1995,14 @@ fn attach_run(
                             Op::ENDED => {
                                 let (code, reason) = frames::dec_ended(&f.payload);
                                 let msg = ended_message(name, code, &reason);
-                                return finish(Some(msg));
+                                teardown();
+                                return AttachOutcome::Done(Some(msg));
                             }
                             Op::ERROR => {
                                 let (code, msg) = frames::dec_error(&f.payload).unwrap_or_default();
                                 let text = proto_error_text(&code, &msg);
-                                return finish(None).and(Err(text));
+                                teardown();
+                                return AttachOutcome::Fail(text);
                             }
                             other => {
                                 // 防御：raw 腿只该收 DATA/STATE/ENDED/ERROR（surface 区段
@@ -1684,15 +2013,16 @@ fn attach_run(
                     }
                     Err(mpsc::TryRecvError::Empty) => break,
                     Err(mpsc::TryRecvError::Disconnected) => {
-                        // 读腿终结：远程面三态归因；本地面断链文案。
+                        // 读腿终结：链路级归因（远程面重连/本地面终局文案）。
                         let e = shared
                             .fail
                             .lock()
                             .unwrap()
                             .take()
                             .unwrap_or_else(|| TermReadErr::Io("连接已断开".to_owned()));
-                        let msg = e.message(name);
-                        return finish(None).and(Err(msg));
+                        let oc = classify(&e);
+                        teardown();
+                        return oc;
                     }
                 }
             }
@@ -1700,7 +2030,7 @@ fn attach_run(
         // ② 信号（SIGWINCH → RESIZE；退出族 → 干净退出）。
         if pfds[1].revents & libc::POLLIN != 0 {
             let mut b = [0u8; 8];
-            let m = unsafe { libc::read(pipes.read_fd, b.as_mut_ptr().cast(), 8) };
+            let m = unsafe { libc::read(env.pipes.read_fd, b.as_mut_ptr().cast(), 8) };
             let mut exit_sig = false;
             let mut resize = false;
             for &c in &b[..m.max(0) as usize] {
@@ -1711,36 +2041,47 @@ fn attach_run(
                 }
             }
             if resize {
-                send_resize(&mut write_half.lock().unwrap());
+                if let Err(e) = do_resize(env) {
+                    let oc = classify(&e);
+                    teardown();
+                    return oc;
+                }
             }
             if exit_sig {
-                let note = "收到信号退出（会话仍在运行）".to_owned();
-                return finish(Some(note));
+                teardown();
+                return AttachOutcome::Done(Some("收到信号退出（会话仍在运行）".to_owned()));
             }
         }
         // ③ stdin（分离键状态机 → DATA / 动作）。
         if pfds[0].revents & libc::POLLIN != 0 {
             let n = unsafe { libc::read(0, in_buf.as_mut_ptr().cast(), in_buf.len()) };
             if n > 0 {
-                let (pass, action) = dm.feed(&in_buf[..n as usize]);
+                let (pass, action) = env.dm.feed(&in_buf[..n as usize]);
                 if !pass.is_empty() {
                     if let Err(e) = send_data(&write_half, &pass) {
-                        // 写失败：读端也会失败并给三态文案——统一归因收尾。
-                        let msg = e.message(name);
-                        return finish(None).and(Err(msg));
+                        let oc = classify(&e);
+                        teardown();
+                        return oc;
                     }
                 }
                 match action {
-                    DetachAction::Realign => send_resize(&mut write_half.lock().unwrap()),
+                    DetachAction::Realign => {
+                        if let Err(e) = do_resize(env) {
+                            let oc = classify(&e);
+                            teardown();
+                            return oc;
+                        }
+                    }
                     DetachAction::Detach => {
-                        let note = format!("已分离（会话 {name} 继续在出口运行）");
-                        return finish(Some(note));
+                        teardown();
+                        return AttachOutcome::Done(Some(format!("已分离（会话 {name} 继续在出口运行）")));
                     }
                     DetachAction::None => {}
                 }
             } else if n == 0 {
                 // stdin 关了（tty master 被关）：干净收尾。
-                return finish(None);
+                teardown();
+                return AttachOutcome::Done(None);
             }
         }
     }
@@ -1955,7 +2296,7 @@ fn explain_file(file: &str, agent: &str, state_dir: Option<&std::path::Path>, js
 }
 
 fn explain_session(session: &str, t: &mut TermTarget, json_out: bool) -> Result<(), String> {
-    let (mut conn, _) = dial_term(t)?;
+    let (mut conn, _) = dial_term(t).map_err(|e| e.text())?;
     conn.write_frame(Op::EXPLAIN, &frames::enc_name(session))
         .map_err(|e| e.message(session))?;
     let f = conn
@@ -2077,6 +2418,148 @@ mod tests {
         assert_eq!(caret_byte(b'_'), 0x1f);
         assert_eq!(caret_byte(b'?'), 0x7f);
         assert_eq!(caret_byte(b'@'), 0);
+    }
+
+    /// 重连判定矩阵真值表（term-attach-resilience 3.2）：会话级/协议级/本地 I/O 面/
+    /// 用户动作 → 终局；链路面（读写失败/传输档拨号失败）→ 仅远程面重连；本地面
+    /// 链路断 = 出口进程死 = 会话不在 → 终局。
+    #[test]
+    fn link_failure_truth_table() {
+        use LinkDecision as D;
+        use LinkEvent as E;
+        // —— 两面同判终局的行 ——
+        for ev in [
+            E::Ended,
+            E::ErrorFrame,
+            E::StdoutWriteFail,
+            E::StdinEof,
+            E::PollFail,
+            E::ExitSignal,
+            E::Detach,
+            E::DialFinal,
+        ] {
+            assert_eq!(link_failure_classify(true, ev), D::Finish);
+            assert_eq!(link_failure_classify(false, ev), D::Finish);
+        }
+        // —— 链路面：远程可重连、本地终局 ——
+        for ev in [E::LinkIo, E::DialTransport] {
+            assert_eq!(link_failure_classify(true, ev), D::Retry, "远程面");
+            assert_eq!(link_failure_classify(false, ev), D::Finish, "本地面");
+        }
+    }
+
+    /// 重连退避档位：0.5s 起 ×2 封顶 5s（判据登记项的行为钉）。
+    #[test]
+    fn link_backoff_steps() {
+        let mut b = LinkBackoff::new();
+        assert_eq!(b.next_ms(), 500);
+        assert_eq!(b.next_ms(), 1000);
+        assert_eq!(b.next_ms(), 2000);
+        assert_eq!(b.next_ms(), 4000);
+        assert_eq!(b.next_ms(), 5000, "封顶");
+        assert_eq!(b.next_ms(), 5000, "封顶保持");
+    }
+
+    /// DialErr 的码面判定与文案折算（自动命名重试 / 终局打印两处消费）。
+    #[test]
+    fn dial_err_class_and_text() {
+        let ae = DialErr::Session { code: "already_exists".to_owned(), msg: "会话已存在".to_owned() };
+        assert!(ae.is_already_exists());
+        assert!(!DialErr::Transport("x".to_owned()).is_already_exists());
+        // Session 档文案走 proto_error_text 口径（含可行动提示）
+        let t = ae.text();
+        assert!(t.contains("already_exists") || t.contains("已存在"), "{t}");
+        assert_eq!(DialErr::Transport("连不上".to_owned()).text(), "连不上");
+        assert_eq!(DialErr::Proto("版本不符".to_owned()).text(), "版本不符");
+    }
+
+    /// openpty 伪终端对（unix 专属）：master 写 = 终端侧投递，slave 读 = 程序 stdin。
+    /// 用后关两端。
+    #[cfg(unix)]
+    struct ProbePty {
+        master: i32,
+        slave: i32,
+    }
+
+    #[cfg(unix)]
+    impl ProbePty {
+        fn new() -> Self {
+            let mut master: libc::c_int = 0;
+            let mut slave: libc::c_int = 0;
+            let r = unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                    std::ptr::null_mut(),
+                )
+            };
+            assert_eq!(r, 0, "openpty");
+            // slave 非阻塞：断言「队列已空」用 EAGAIN 判
+            unsafe {
+                let fl = libc::fcntl(slave, libc::F_GETFL);
+                libc::fcntl(slave, libc::F_SETFL, fl | libc::O_NONBLOCK);
+            }
+            ProbePty { master, slave }
+        }
+
+        /// slave 队列是否为空（EAGAIN = 空）。
+        fn slave_empty(&self) -> bool {
+            let mut b = [0u8; 64];
+            let n = unsafe { libc::read(self.slave, b.as_mut_ptr().cast(), b.len()) };
+            n == -1 && std::io::Error::last_os_error().raw_os_error() == Some(libc::EAGAIN)
+        }
+    }
+
+    #[cfg(unix)]
+    impl Drop for ProbePty {
+        fn drop(&mut self) {
+            unsafe {
+                libc::close(self.master);
+                libc::close(self.slave);
+            }
+        }
+    }
+
+    /// 排空单测 ①：排队的应答字节被清（poll 立即命中 + tcflush 丢弃，master 端无残留）。
+    #[cfg(unix)]
+    #[test]
+    fn drain_clears_queued_reply() {
+        let pty = ProbePty::new();
+        // 模拟终端排好的 DA1 应答（写 master ⇒ 进 slave 输入队列）
+        let da1 = b"\x1b[?62;1;2;6;9;15;18;21;22;28c";
+        let n = unsafe { libc::write(pty.master, da1.as_ptr().cast(), da1.len()) };
+        assert_eq!(n as usize, da1.len(), "注入应答");
+        std::thread::sleep(std::time::Duration::from_millis(20)); // 落队
+        drain_terminal_input(pty.slave, 50);
+        assert!(pty.slave_empty(), "应答被排空——不漏给后续读者");
+    }
+
+    /// 排空单测 ②：空队列时 poll 等满小超时返回（退出路径延迟有界）。
+    #[cfg(unix)]
+    #[test]
+    fn drain_bounded_wait_on_empty_queue() {
+        let pty = ProbePty::new();
+        let t0 = std::time::Instant::now();
+        drain_terminal_input(pty.slave, 60);
+        let el = t0.elapsed();
+        assert!(el >= std::time::Duration::from_millis(55), "等满超时：{el:?}");
+        assert!(el < std::time::Duration::from_secs(2), "有界：{el:?}");
+        assert!(pty.slave_empty());
+    }
+
+    /// 排空单测 ③：排队击键同被清、不回显（与既有 send 失败丢弃语义一致）。
+    #[cfg(unix)]
+    #[test]
+    fn drain_clears_queued_keystrokes_too() {
+        let pty = ProbePty::new();
+        let keys = b"abc\x03";
+        let n = unsafe { libc::write(pty.master, keys.as_ptr().cast(), keys.len()) };
+        assert_eq!(n as usize, keys.len(), "注入击键");
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        drain_terminal_input(pty.slave, 50);
+        assert!(pty.slave_empty(), "击键被丢弃（无回读通道）");
     }
 
     #[test]

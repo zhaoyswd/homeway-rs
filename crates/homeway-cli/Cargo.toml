@@ -25,6 +25,9 @@ getrandom.workspace = true
 [target.'cfg(windows)'.dependencies]
 windows-sys.workspace = true
 
+# 单测面无额外依赖：openpty 在当前 libc 版本已是主库符号（老的 libutil feature
+# 已并入——Linux/macOS 均直接可用）。此节留空作占位说明。
+
 [features]
 # 透传 homeway-core 的故障注入缝（阶梯时间窗实测用）
 test-seams = ["homeway-core/test-seams"]
