@@ -1,5 +1,28 @@
 # Changelog
 
+## v0.3.10（2026-10-16）
+
+- **term attach 三连修（term-attach-resilience，openspec 变更 + 两道评审门）**：
+- **TUI attach 后画面不完整（间隔哨兵）**：opencode 类按行差分渲染 TUI attach 后只有动画行可见、
+  手动 resize 才恢复——根因 = 尺寸哨兵两跳 SIGWINCH 背靠背被内核合并，App 读到「尺寸未变」跳过
+  重绘（真机实验：背靠背 0 字节输出 / 间隔 300ms 全屏重绘 14732B；vim 无条件重绘不受影响）。
+  修复 = 仅「attach 且几何未变」的 raw 腿走间隔形态（第一跳原位 + 第二跳 300ms 延迟线程，五重验
+  让位、panic 防护、spawn 失败锁外兜底）；几何真变路径与 surface 腿保持现状背靠背（真 SIGWINCH
+  已足够 / 快照真源是 vt 不需要逼重绘）。`HOMEWAY_TERM_SENTINEL_GAP`（毫秒）可调、0 = 退回背靠背。
+  e2e 铁证：回放窗被增量顶空后 re-attach，静态内容 **0.3s** 内重现（与 300ms 精确吻合）。
+- **断网即退出（attach 重连循环）**：远程面链路级断链不再退出进程——保持终端 raw、显示重连横幅、
+  退避重拨（0.5s×2 封顶 5s、成功即复位）；`new` 创建的会话重拨自动降级创建位（不再被
+  already_exists 打死）；ENDED/会话级错误/本地面断链照常终局。等待期分离键与孤立 Ctrl-C 仍可退出。
+  e2e 铁证：杀 daemon 后 **1s** 出横幅、**12s** 自动恢复，会话全程保活（服务端 self_reconnect 复用）。
+- **退出后 shell 留数字乱码（应答排空）**：应答让位设计下查询直达本地真终端，断链/退出竞态里孤儿
+  应答（DA1 `62;1;2;…c` 形态）漏给 shell 回显——所有退出路径在还原终端前统一 `poll(50ms)+
+  tcflush` 排空。e2e：注入在途应答后 SIGINT，退出输出零残串。
+- **评审与工程面**：r1 方案评审（1 高 2 中等十余条全采纳）+ r2 完工代码评审（H1 GREETING 档泄漏/
+  M1 拨号预算挂死窗/M2 矩阵收编等全整改）两道门记录入 `docs/reviews/`；e2e 另抓出并修复空 poke
+  管道裸 read 永久阻塞（连接段卡死主循环前）；拨号失败路径显式 close ControlClient（长重试 fd
+  稳定复测恒定）；判据变更登记 5 行（哨兵间隔/退避/排空常量、重连横幅新行为面、断链三态文案
+  产出面收窄）。规格真源 = `openspec/changes/term-attach-resilience`。
+
 ## v0.3.9（2026-10-16）
 
 - **客户端核自愈三态化（event-driven-heal，核侧主体）**：断线处置从「秒级轮询 + 无限冷却重试 +
