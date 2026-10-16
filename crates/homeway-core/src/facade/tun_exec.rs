@@ -1473,6 +1473,24 @@ impl RescueRounds {
         true
     }
 
+    /// r8-M1 的预检面（**只读，不消耗任何门**）：本拍是否会起跑一轮——pusher 在
+    /// 此刻先做 700ms 活性门快探，岛活着就不跑 Rebind+Connect（避免对已恢复隧道
+    /// 多一轮全量重绑掐在飞服务流）。与 wants_round 同判据但无副作用。
+    fn wants_round_probe_gate(&self, now: Instant, suspend_window: bool) -> bool {
+        if !self.active || self.exhausted || suspend_window {
+            return false;
+        }
+        if self.rounds_done >= 1 && !self.packet_since_round {
+            return false;
+        }
+        if let Some(due) = self.next_due {
+            if now < due {
+                return false;
+            }
+        }
+        true
+    }
+
     fn note_round_result(&mut self, now: Instant, ok: bool) {
         if ok {
             self.deactivate();
@@ -1806,6 +1824,10 @@ fn patrol_loop(run: Arc<GenRun>, ev_rx: mpsc::Receiver<GenEvent>) {
         if lock_unpoison(&run.rescue).is_active() {
             let (demand_active, demand_why) = run.demand.patrol_demand(out_pkts, Instant::now());
             run.demand.note_demand(demand_active, demand_why, now_unix_ms());
+            // r8-L9：自救中证据冻结无意义，顺手清计数——否则恢复后首次探测失败
+            // 直接触发「3 连败」兜底重入（与字面语义不符，白送一整轮预算）。
+            fail_streak = 0;
+            last_counted = None;
             continue;
         }
         // 本拍探测（10s；岛 `Cmd::Probe` = `STREAM[probe]` 回显）
@@ -1945,6 +1967,7 @@ fn evidence_gate(
 // ---------------------------------------------------------------------------
 
 fn demand_pusher_loop(run: Arc<GenRun>) {
+    use homeway_quic::tuning::probe_defaults::FAST_BUDGET;
     let mut last_push: Option<Instant> = None;
     let mut last_rx: u64 = 0;
     let mut recv_at: Option<Instant> = None;
@@ -1967,7 +1990,10 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
         // 会让 tun_stop 的 join 超预算）；首包后的第一拍最多迟 5s 才见——轮次
         // active 即回 1s 档。
         let tick = {
-            let rescue_active = lock_unpoison(&run.rescue).is_active();
+            let rescue = lock_unpoison(&run.rescue);
+            // r8-L11：耗尽挂起态并入闲置档（wants_round 恒 false——轮次已尽，只剩
+            // 包新鲜记账；首包重武装经 reset_rounds 清 exhausted 后自然回 1s 档）。
+            let rescue_active = rescue.is_active() && !rescue.is_exhausted();
             if !rescue_active && idle_ticks >= PUSHER_IDLE_AFTER {
                 PUSHER_IDLE_TICK
             } else {
@@ -2012,6 +2038,38 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
                     rescue.deactivate();
                     drop(rescue);
                     run.tun_shared.bump_flip(); // 翻沿（退出自救）
+                    continue;
+                }
+                // r8-L10：设备类判死 ⇒ 自救收线——fd 已死、岛已 detach，轮次注定
+                // 无效功（每轮 Rebind+Connect ≤3 次），不再烧。设备死由扩展观测
+                // 分支呈现、重连交用户（v4）。
+                if run.tun_shared.device_dead.load(Ordering::Acquire) {
+                    rescue.deactivate();
+                    drop(rescue);
+                    run.tun_shared.bump_flip();
+                    continue;
+                }
+                // r8-M1：岛侧自恢复活性门——自救由巡检兜底进入时岛内阶梯仍醒着，
+                // 岛可能自己把连接救活但不回告世代层（健康位保持 false）。轮次
+                // 起跑前快探一次（700ms，与岛内阶梯同判负粒度）：通过 = 岛活着，
+                // 走强证据翻回退出自救——不多跑 Rebind+Connect（会掐在飞服务流）。
+                // 快探失败才继续轮次路径（探活预算内不构成额外负担）。
+                if rescue.wants_round_probe_gate(now, suspend_window) {
+                    drop(rescue);
+                    if l3_probe(&run, FAST_BUDGET).is_ok() {
+                        if let Some(elapsed) = run
+                            .tun_shared
+                            .try_recover_transport_if_current(run.gen, Duration::ZERO)
+                        {
+                            (run.logf)(&format!(
+                                "传输恢复（patrol 清除，证据=轮次前活性门，距上次判定 {}）",
+                                crate::go_fmt::fmt_duration_go_secs(elapsed)
+                            ));
+                        }
+                        let mut r2 = lock_unpoison(&run.rescue);
+                        r2.deactivate();
+                        run.tun_shared.bump_flip(); // 翻沿（退出自救）
+                    }
                     continue;
                 }
                 let out_at = run.l3_last_outbound_at();
@@ -2081,6 +2139,8 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
         // 恒 `false`（`demand::should_push` 的入参保留：它是 Go `shouldPush` 判据链的
         // 逐条对照面；删维等于改判据语义 ⇒ 登记为观测面收窄）。
         let since = last_push.map(|t| t.elapsed());
+        // r8-L13：本判据面自 D4 退役后只节流下面这一行诊断日志，无任何动作——
+        // 保留观测价值（首包下推的日志语义仍在排障用），不是死代码。
         if demand::should_push(out_at, recv_at, Instant::now(), false, since) {
             last_push = Some(Instant::now());
             // r1-F14：本支路自 §3.1 起只承担观测（动作面在岛内快探阶梯 700ms/背靠背
