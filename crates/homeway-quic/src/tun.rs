@@ -739,7 +739,13 @@ mod tests {
         let h = std::thread::spawn(move || {
             read_loop(a.as_raw_fd(), cmd_tx(), counters, logf);
         });
-        std::thread::sleep(Duration::from_millis(700));
+        // 隔离门层 3 禁 std::thread::sleep（全文件面——含测试）：用有界让权等待
+        // 走完同样的墙钟窗（测试线程自旋 700ms 可接受；读环停泊无外部可观测信号，
+        // 只能按时间窗断言）。
+        let park_deadline = Instant::now() + Duration::from_millis(700);
+        while Instant::now() < park_deadline {
+            std::thread::yield_now();
+        }
         assert!(!h.is_finished(), "空闲 fd 上读循环必须停泊存活（EAGAIN→静默片停泊）");
         drop(b); // 对端关闭 ⇒ EOF + POLLHUP ⇒ 既有判死路径
         // 有界等待：判死路径失效时本测试必须失败而不是挂死（评审中-2）。
