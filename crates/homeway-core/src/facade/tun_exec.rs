@@ -2053,7 +2053,7 @@ fn demand_pusher_loop(run: Arc<GenRun>) {
                             if exhausted && !exhausted_reported {
                                 exhausted_reported = true;
                                 (run.logf)(
-                                    "自救轮次耗尽（3 轮失败）—— 上报宿主（熄灯门：扩展按本 episode 出站包记账处置）",
+                                    "自救轮次耗尽（3 轮失败）—— 上报宿主（扩展挂起等首包重武装）",
                                 );
                                 run.tun_shared.bump_flip(); // 翻沿（轮次耗尽）
                             } else if !exhausted {
