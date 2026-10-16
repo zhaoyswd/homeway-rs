@@ -461,9 +461,13 @@ fn local_dial_err(sock: &std::path::Path, e: std::io::Error) -> String {
 /// GREETING 读取 + 版本门（CLI 侧，FIX-29：ver != 本端当场拒）。读失败/超时 = 传输档
 /// （主机半死可等重连），版本与格式不符 = 协议档（重试无意义）。
 fn read_greeting(mut conn: TermConn, budget: Duration) -> Result<(TermConn, u32), DialErr> {
-    let f = conn
-        .read_frame_deadline(budget)
-        .map_err(|e| DialErr::Transport(format!("读 GREETING：{}", e.message("?"))))?;
+    let f = match conn.read_frame_deadline(budget) {
+        Ok(f) => f,
+        Err(e) => {
+            conn.close(); // 同函数其余 Err 面：无 Drop ⇒ 必须 close（半死主机 GREETING 超时档）
+            return Err(DialErr::Transport(format!("读 GREETING：{}", e.message("?"))));
+        }
+    };
     if f.op != Op::GREETING {
         conn.close();
         return Err(DialErr::Proto(format!("首帧应为 GREETING，收到 op 0x{:02x}", f.op.0)));
@@ -1076,8 +1080,10 @@ fn attach_dial(
             conn.close();
             DialErr::Transport(format!("发 HELLO：{}", e.message(name)))
         })?;
+    // 预算读（r2 M1）：重连段信号面已装、主线程阻塞在裸 recv_wait 时无人读信号管道
+    // ⇒ 挂死且 SIGTERM 被吞——「一次拨号 ≤ --timeout 预算」是退避模型的硬前提。
     let f = conn
-        .read_frame()
+        .read_frame_deadline(t.timeout)
         .map_err(|e| {
             conn.close();
             DialErr::Transport(format!("读 ATTACHED：{}", e.message(name)))
@@ -1561,19 +1567,16 @@ enum AttachOutcome {
 }
 
 /// 重连判定矩阵的输入事件（term-attach-resilience D2；纯函数供真值表单测）。
-/// 运行路径只构造语义有歧义的档（链路面读写失败 / 拨号分档），无歧义档
-/// （ENDED/信号/分离…）在连接段内联终局；全部档位的判定语义由单测钉住——
-/// 无歧义档只在单测构造（运行路径不走过）。
+/// 全部变体都有生产构造点（r2 M2：收编 stdout/EOF/poll 三档，删去只测不用的
+/// Ended/ErrorFrame/ExitSignal/Detach——那四类内联终局、语义无歧义）。
 #[derive(Debug, Clone, Copy)]
-#[cfg_attr(not(test), allow(dead_code))]
 enum LinkEvent {
-    Ended,
-    ErrorFrame,
+    /// 写本地 stdout 失败（本地终端没了——重拨无意义）。
     StdoutWriteFail,
+    /// stdin EOF（tty master 被关——干净收尾）。
     StdinEof,
+    /// poll 系统调用失败（本地 I/O 面）。
     PollFail,
-    ExitSignal,
-    Detach,
     /// 读腿/写腿失败（链路面——按面分档）。
     LinkIo,
     /// 拨号失败——传输档（链路面——按面分档）。
@@ -1594,8 +1597,7 @@ enum LinkDecision {
 fn link_failure_classify(remote: bool, ev: LinkEvent) -> LinkDecision {
     use LinkEvent::*;
     match ev {
-        Ended | ErrorFrame | StdoutWriteFail | StdinEof | PollFail | ExitSignal | Detach
-        | DialFinal => LinkDecision::Finish,
+        StdoutWriteFail | StdinEof | PollFail | DialFinal => LinkDecision::Finish,
         LinkIo | DialTransport => {
             if remote { LinkDecision::Retry } else { LinkDecision::Finish }
         }
@@ -1623,6 +1625,11 @@ impl LinkBackoff {
         let ms = self.cur.as_millis().min(i32::MAX as u128) as i32;
         self.cur = (self.cur * 2).min(LINK_RETRY_CAP);
         ms
+    }
+
+    /// 重连成功即复位（r2 补1）：否则一次长断网把档位推到封顶后，此后每次断链首拨都等 5s。
+    fn reset(&mut self) {
+        self.cur = LINK_RETRY_BASE;
     }
 }
 
@@ -1659,7 +1666,13 @@ impl AttachEnv {
     /// raw 切换 + 信号面 + 标题查询 + poke 管道（进程一次；调用前首连已成功——拨号
     /// 失败路径不碰终端）。返回 (env, 查询窗抢敲字节)——后者只喂首连段（首键不丢）。
     fn new(tty: Tty, o: &AttachOpts, conn: &mut TermConn) -> Result<(Self, Vec<u8>), String> {
-        let (prefix, key_enabled) = detach_key_spec(&o.detach_key)?;
+        let (prefix, key_enabled) = match detach_key_spec(&o.detach_key) {
+            Ok(v) => v,
+            Err(e) => {
+                conn.close();
+                return Err(e);
+            }
+        };
         let title_on = !std::env::var("HOMEWAY_TERM_TITLE")
             .unwrap_or_default()
             .eq_ignore_ascii_case("off");
@@ -1783,6 +1796,10 @@ fn attach_session(
                         Ok((c, att)) => {
                             conn = c;
                             attached = att;
+                            backoff.reset();
+                            // 断链期积压不注入恢复后的会话（spec MUST）：拨号窗与退避窗
+                            // 只读 512B/次——重拨成功即排空一次（poll(0) 已排队者，零延迟）。
+                            drain_terminal_input(0, 0);
                             break;
                         }
                         Err(e) => match link_failure_classify(
@@ -1807,41 +1824,56 @@ fn attach_session(
 /// cfmakeraw 关 ISIG；等待态无远端可投递，当退出安全）/分离键/退出信号 ⇒ Quit；
 /// 其余输入丢弃（含孤儿应答——不注入恢复后的会话）；超时 ⇒ Timeout（进重拨）。
 fn wait_during_backoff(env: &mut AttachEnv, ms: i32, name: &str) -> WaitEvent {
-    let mut pfds = [
-        libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 },
-        libc::pollfd { fd: env.pipes.read_fd, events: libc::POLLIN, revents: 0 },
-    ];
-    let n = unsafe { libc::poll(pfds.as_mut_ptr(), 2, ms) };
-    if n <= 0 {
-        return WaitEvent::Timeout; // 超时/错误：进重拨
-    }
-    if pfds[1].revents & libc::POLLIN != 0 {
-        let mut b = [0u8; 8];
-        let m = unsafe { libc::read(env.pipes.read_fd, b.as_mut_ptr().cast(), 8) };
-        for &c in &b[..m.max(0) as usize] {
-            if c == b'x' {
-                return WaitEvent::Quit(Some("收到信号退出（会话仍在运行）".to_owned()));
+    // 按 deadline 循环（r2 L9）：EINTR/普通击键只消费当拍，不截短整窗——否则断链期
+    // 手抖几键就能把重拨节奏从封顶档拉到 0。
+    let deadline = Instant::now() + Duration::from_millis(ms.max(0) as u64);
+    loop {
+        let left = deadline
+            .saturating_duration_since(Instant::now())
+            .as_millis()
+            .min(i32::MAX as u128) as i32;
+        let mut pfds = [
+            libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: env.pipes.read_fd, events: libc::POLLIN, revents: 0 },
+        ];
+        let n = unsafe { libc::poll(pfds.as_mut_ptr(), 2, left) };
+        if n == 0 {
+            return WaitEvent::Timeout; // 整窗到点：进重拨
+        }
+        if n < 0 {
+            let e = std::io::Error::last_os_error();
+            if e.kind() == std::io::ErrorKind::Interrupted {
+                continue;
             }
-            // 'w'（SIGWINCH）：等待期无需记忆——重拨 HELLO 自带当前 tty.size()
+            return WaitEvent::Timeout; // 错误：进重拨
+        }
+        if pfds[1].revents & libc::POLLIN != 0 {
+            let mut b = [0u8; 8];
+            let m = unsafe { libc::read(env.pipes.read_fd, b.as_mut_ptr().cast(), 8) };
+            for &c in &b[..m.max(0) as usize] {
+                if c == b'x' {
+                    return WaitEvent::Quit(Some("收到信号退出（会话仍在运行）".to_owned()));
+                }
+                // 'w'（SIGWINCH）：等待期无需记忆——重拨 HELLO 自带当前 tty.size()
+            }
+        }
+        if pfds[0].revents & libc::POLLIN != 0 {
+            let mut buf = [0u8; 512];
+            let m = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
+            if m == 0 {
+                return WaitEvent::Quit(None); // stdin 关闭：干净收尾
+            }
+            let chunk = &buf[..m as usize];
+            if chunk.contains(&0x03) {
+                return WaitEvent::Quit(Some("收到 Ctrl-C 退出（会话仍在运行）".to_owned()));
+            }
+            let (_, action) = env.dm.feed(chunk);
+            if let DetachAction::Detach = action {
+                return WaitEvent::Quit(Some(format!("已分离（会话 {name} 继续在出口运行）")));
+            }
+            // 其余丢弃（Realign/None：等待态无连接可对齐）
         }
     }
-    if pfds[0].revents & libc::POLLIN != 0 {
-        let mut buf = [0u8; 512];
-        let m = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
-        if m == 0 {
-            return WaitEvent::Quit(None); // stdin 关闭：干净收尾
-        }
-        let chunk = &buf[..m as usize];
-        if chunk.contains(&0x03) {
-            return WaitEvent::Quit(Some("收到 Ctrl-C 退出（会话仍在运行）".to_owned()));
-        }
-        let (_, action) = env.dm.feed(chunk);
-        if let DetachAction::Detach = action {
-            return WaitEvent::Quit(Some(format!("已分离（会话 {name} 继续在出口运行）")));
-        }
-        // 其余丢弃（Realign/None：等待态无连接可对齐）
-    }
-    WaitEvent::Timeout
 }
 
 /// attach 连接段（一次连接的完整生命周期）：reader 线程 + 主循环 poll([stdin, 信号,
@@ -1968,7 +2000,10 @@ fn attach_run_once(
                 continue;
             }
             teardown();
-            return AttachOutcome::Fail(format!("poll 失败：{e}"));
+            return match link_failure_classify(remote, LinkEvent::PollFail) {
+                LinkDecision::Finish => AttachOutcome::Fail(format!("poll 失败：{e}")),
+                LinkDecision::Retry => AttachOutcome::LinkLost(TermReadErr::Io(format!("poll 失败：{e}"))),
+            };
         }
         // ① term 帧（DATA → stdout；STATE → 标题；ENDED → 文案退出；ERROR → 协议错误）。
         if pfds[2].revents & libc::POLLIN != 0 {
@@ -1980,9 +2015,12 @@ fn attach_run_once(
                         match f.op {
                             Op::DATA => {
                                 if out.write_all(&f.payload).is_err() || out.flush().is_err() {
-                                    // 本地终端没了：重拨无意义（矩阵 StdoutWriteFail）。
                                     teardown();
-                                    return AttachOutcome::Fail("写本地终端失败".to_owned());
+                                    return match link_failure_classify(remote, LinkEvent::StdoutWriteFail) {
+                                        LinkDecision::Finish => AttachOutcome::Fail("写本地终端失败".to_owned()),
+                                        // StdoutWriteFail 恒终局——Retry 分支不可达，走矩阵保真值表回归力
+                                        LinkDecision::Retry => AttachOutcome::LinkLost(TermReadErr::Io("写本地终端失败".to_owned())),
+                                    };
                                 }
                             }
                             Op::ATTACHED | Op::REPLAY_DONE => {} // 回放/重复握手帧：不做事
@@ -2079,9 +2117,12 @@ fn attach_run_once(
                     DetachAction::None => {}
                 }
             } else if n == 0 {
-                // stdin 关了（tty master 被关）：干净收尾。
+                // stdin 关了（tty master 被关）：干净收尾（矩阵 StdinEof）。
                 teardown();
-                return AttachOutcome::Done(None);
+                return match link_failure_classify(remote, LinkEvent::StdinEof) {
+                    LinkDecision::Finish => AttachOutcome::Done(None),
+                    LinkDecision::Retry => AttachOutcome::LinkLost(TermReadErr::Io("stdin 已关闭".to_owned())),
+                };
             }
         }
     }
@@ -2427,17 +2468,8 @@ mod tests {
     fn link_failure_truth_table() {
         use LinkDecision as D;
         use LinkEvent as E;
-        // —— 两面同判终局的行 ——
-        for ev in [
-            E::Ended,
-            E::ErrorFrame,
-            E::StdoutWriteFail,
-            E::StdinEof,
-            E::PollFail,
-            E::ExitSignal,
-            E::Detach,
-            E::DialFinal,
-        ] {
+        // —— 两面同判终局的行（全部变体均有生产构造点）——
+        for ev in [E::StdoutWriteFail, E::StdinEof, E::PollFail, E::DialFinal] {
             assert_eq!(link_failure_classify(true, ev), D::Finish);
             assert_eq!(link_failure_classify(false, ev), D::Finish);
         }
@@ -2458,6 +2490,8 @@ mod tests {
         assert_eq!(b.next_ms(), 4000);
         assert_eq!(b.next_ms(), 5000, "封顶");
         assert_eq!(b.next_ms(), 5000, "封顶保持");
+        b.reset(); // 成功重连复位（r2 补1）
+        assert_eq!(b.next_ms(), 500, "复位回起点档");
     }
 
     /// DialErr 的码面判定与文案折算（自动命名重试 / 终局打印两处消费）。

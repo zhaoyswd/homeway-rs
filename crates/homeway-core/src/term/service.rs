@@ -1982,8 +1982,9 @@ impl TermService {
             self.sentinel_repaint_locked(rt, spaced)
         };
         if let Some(base) = base {
-            // 间隔形态：第二跳延迟执行。线程起不来 = 锁内兜底立即恢复——绝不停在
-            // sentinel 列宽上跑（后果重于 KILL_GRACE 忽略 Err 的先例）。
+            // 间隔形态：第二跳延迟执行。线程起不来 = 锁外立即兜底（释放锁后重跑
+            // 五重验恢复——比锁内裸 resize 更稳）；绝不停在 sentinel 列宽上跑
+            // （后果重于 KILL_GRACE 忽略 Err 的先例）。
             let svc = Arc::clone(self);
             let tname = name.to_string();
             let gap = self.cfg.sentinel_gap;
@@ -1991,7 +1992,18 @@ impl TermService {
                 .name("term-sentinel-restore".into())
                 .spawn(move || {
                     std::thread::sleep(gap);
-                    svc.sentinel_restore(&tname, sess_gen, base);
+                    // panic 防护（r2 补3，guard_thread 同义的最小面）：恢复线程 panic 时
+                    // 兜底再恢复一次——不留 sentinel 列宽、不静默。
+                    if std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        svc.sentinel_restore(&tname, sess_gen, base)
+                    }))
+                    .is_err()
+                    {
+                        svc.logf(&format!("term: 会话 {tname} 哨兵恢复线程 panic——兜底恢复"));
+                        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                            svc.sentinel_restore(&tname, sess_gen, base)
+                        }));
+                    }
                 });
             if let Err(e) = spawned {
                 self.logf(&format!(

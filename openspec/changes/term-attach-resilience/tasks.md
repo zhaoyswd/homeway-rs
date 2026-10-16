@@ -3,7 +3,7 @@
 ## 0. 评审门（硬规则 5）
 
 - [x] 0.1 技术评审落档：本方案 dsh r1 评审结论与整改决策整理入 `docs/reviews/term-attach-resilience-design.md`（含三条保留意见的理由：周期设施否决/哨兵令牌否决/TCSAFLUSH 否决）；验证：文件存在且覆盖 r1 全部高/中条目的归宿
-- [ ] 0.2 完工代码评审任务（占位，实现完成后执行）：checklist 含 AGENTS.md「逐行移植痕迹」项，记录入 `docs/reviews/term-attach-resilience.md`
+- [x] 0.2 完工代码评审任务（占位，实现完成后执行）：checklist 含 AGENTS.md「逐行移植痕迹」项，记录入 `docs/reviews/term-attach-resilience.md`
 
 ## 1. 哨兵间隔（服务端）
 

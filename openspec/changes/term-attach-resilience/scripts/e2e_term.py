@@ -9,7 +9,9 @@ D) 在途应答退出排空：注入 DA1 应答后立刻 SIGINT，断言退出�
 import os, pty, fcntl, termios, struct, time, threading, signal, subprocess, sys, re
 
 print("[0] module loading", flush=True)
-REPO = "/Users/zhaozhe/Documents/projects/homeway-rs"
+import subprocess as _sp
+REPO = _sp.run(["git", "-C", os.path.dirname(os.path.abspath(__file__)), "rev-parse", "--show-toplevel"],
+               capture_output=True, text=True).stdout.strip() or "/Users/zhaozhe/Documents/projects/homeway-rs"
 BIN = f"{REPO}/target/release/homeway"
 EXIT_STATE = "/tmp/homeway-rs-rustexit-1"
 CLI_STATE = "/tmp/homeway-rs-rclient-e2e"
@@ -77,7 +79,7 @@ for _ in range(10):
                        capture_output=True, timeout=20)
     lst = subprocess.run([BIN, "term", "list", "--host", HOST, "--state", CLI_STATE],
                          capture_output=True, timeout=20)
-    if b'tt1' not in lst.stdout:
+    if SESS.encode() not in lst.stdout:
         break
     time.sleep(0.5)
 time.sleep(1.5)  # 收尾摘表窗（done 未出 map：new 撞 AlreadyExists 而 LIST 已不显示）
@@ -101,7 +103,7 @@ for _attempt in range(3):
 print("[A1] spawned, pid=", pid, flush=True)
 print("[A] new 已起，敲探针命令…", flush=True)
 try:
-    os.write(fd, b"python3 /tmp/diff_probe.py\r")
+    os.write(fd, f"python3 {REPO}/openspec/changes/term-attach-resilience/scripts/diff_probe.py\r".encode())
 except OSError as e:
     print("[A] 写 master 失败（子进程已退）", e, "输出：", snapshot()[:800], flush=True)
     raise

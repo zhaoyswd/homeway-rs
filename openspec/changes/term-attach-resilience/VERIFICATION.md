@@ -22,3 +22,12 @@
 
 真机/用户触点档（5.2，不进 CI）：opencode attach 画面完整性、真网络中断
 （关 Wi-Fi/断 VPN）→ 自动恢复、退出无乱码。
+
+## r2 完工评审后的复测补充（2026-10-16）
+
+| # | 项 | 结果 | 证据 |
+|---|---|---|---|
+| fd-1 | GREETING 超时档（r2 H1 修复后）：SIGSTOP daemon——control.sock connect 成功、一字节不流，超时重拨持续 90s | PASS | CLI fd 恒 14（修前该档每次重拨泄 3fd+1 线程） |
+| fd-2 | open_stream 持续 refused 档：SIGSTOP 出口，失败重拨 80s | PASS | fd 14→11（断链收敛）后恒定不增长 |
+| vim | vim 对照例（vim -u NONE -R /etc/hosts）：同几何 re-attach 画面完整 | PASS | 6.7KB 全帧（状态栏 `/etc/hosts` + 内容 `localhost`）——无条件重绘族不回归 |
+| B→C 归因 | e2e 驱动 B→C 段「已分离」异常 | 已归因 | r2 M3：脚本预清理 `b'tt1'` 与 `SESS=f"tt{pid}"` 错配（pid 首位恰为 1 时才命中）⇒ 残留会话复用错链——脚本已修（SESS 实名判定 + 参数化） |
