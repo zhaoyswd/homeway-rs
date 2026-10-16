@@ -891,3 +891,22 @@ macOS 代码调用（非 mac 死代码挂 clippy/windows，`#[cfg(macos)]` 门�
 **过程注记**：①ci-local 门修一件——fbb149e 测试里的 `std::thread::sleep` 违反 QUIC 隔离门层 3
 （全文件面含测试），换有界让权等待（门不弱化）；②本机 push 前远端有用户的 README commit
 （9f4c5b3）——rebase 后推，无冲突。
+
+### 13.12 换装 v0.3.10（2026-10-16 22:36–22:43，term attach 三连修）
+
+**触发**：openspec 变更 `term-attach-resilience` 收口发版（间隔哨兵/断链重连/退出应答排空，
+两道评审门 r1 方案 + r2 完工代码评审全过）。清单见 `CHANGELOG.md` v0.3.10 条。
+哨兵是**出口侧**行为（新 CLI 对旧出口/旧 CLI 对新出口均退化为现状不劣化）。
+
+| 机器 | 换装 | 判据 |
+|---|---|---|
+| 发版 | tag `v0.3.10` = main 头 `0312b57`（CI 绿 2m18s）；release 五目标 6m15s + SHA256SUMS | ✓ |
+| Mac mini（= 工作机本机） | `darwin-arm64.tar.gz`（sha `6ac3b83b…` = SHA256SUMS）→ 备份 `homeway.bak-v0.3.9` → rm+cp + `xattr -c` → `launchctl kickstart -k gui/501/me.zhaozhe.homeway-exit` → pid **20323** | `version=v0.3.10`；`key=8aee740b7220` **不变**；serve 41641 running；公网端点双栈（v4 114.242.60.128 + v6 2408:8207:…）+ Relay 公布；中继腿 22:40:26 重注册成功（阿里云 22:38:41 就绪后）；零参 `term list` 通 ✓ |
+| 阿里云 | `linux-amd64.tar.gz`（sha `fabeb451…` 双侧核对；scp 上传——直连 GitHub 断流旧坑）→ 备份 `homeway.bak-v0.3.9` → SIGTERM **6s 退净** → rm+cp → `/opt/homeway` 下 `setsid` 零参起 → pid **1624575** | `version=v0.3.10`；`公钥 1020c3eae8b3` **四版不变**（0.3.7→0.3.10）；serve 41641（UDP %eth0）+ relay :41741（UDP+TCP）；`serve status` running listenPort=41641；零参 `term list` 通 ✓ |
+| MacBook Pro | **在线**（v0.3.8 起累计待办清账）：devel 旧件（10-14 岛断线自愈批）→ 备份 `homeway.bak-devel-1014` → SIGTERM 退净 → rm+cp + `xattr -c` → `--state` 形态 setsid 起（pid **61504**，host list 自动拉起兜底） | `version=v0.3.10`（serve=false relay=false 客户端形态，22:42:28 就绪）；`host list` 通 ✓ |
+
+**过程注记**：①Mac mini 的 ssh 免密通道不存在（本机 key 不在其授权表）——**mini 即工作机本机**，
+直接本地换装（hosts 里 `mac-mini` 指到代理 fake-ip 段 198.18.x 的坑一并记档）；②`launchctl
+kickstart` 需全限定域 `gui/501/<label>`（裸 label 报 target specifier）；③MBP 的 `homeway`
+不在非交互 ssh 的 PATH（`/usr/local/bin` 缺省不进），全路径操作；④SHA256SUMS 登记的是 **tarball**
+sha，解压后二进制 sha 需对照本机解压件比对（MBP 件即此口径 `c19ae5b6…` 与本机一致）。
