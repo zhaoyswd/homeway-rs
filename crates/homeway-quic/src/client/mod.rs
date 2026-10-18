@@ -77,7 +77,10 @@ const PROBE_BYTE: u8 = 0x50; // 'P'
 
 /// 岛持有的连接面（岛线程独占 ⇒ 无锁；端点用 `Arc` 只为让赛跑任务持一份）。
 pub(crate) struct Face {
-    endpoint: Arc<Endpoint>,
+    /// 每家庭一枚端点（`None` = 该族不可用/未启用）。quinn 的 `Endpoint` 只认一个
+    /// 本地地址族，所以 v4/v6 分开建；候选按家庭选端点。
+    ep4: Option<Arc<Endpoint>>,
+    ep6: Option<Arc<Endpoint>>,
     cfg: quinn::ClientConfig,
     cred: Arc<IslandCredential>,
     /// 中继候选表（发送侧包封的路由键；岛在 `SetCandidates`/`Connect`/`adopt` 时装配）。
@@ -115,14 +118,52 @@ impl Face {
         } = cfg;
         let relays = RelayTable::new();
         let stats = Arc::new(Mutex::new(SockStats::default()));
-        let (sock, local) =
-            ClientSock::open(bind, Arc::clone(&relays), Arc::clone(&stats), Arc::clone(&logf))?;
-        let endpoint = Endpoint::new_with_abstract_socket(
-            EndpointConfig::default(),
-            None,
-            sock,
-            Arc::new(quinn::TokioRuntime),
-        )?;
+        let want4 = bind.is_none_or(|b| b.is_ipv4());
+        let want6 = bind.is_none_or(|b| b.is_ipv6());
+        let mut ep4 = None;
+        let mut ep6 = None;
+        let mut local4 = None;
+        let mut local6 = None;
+        if want4 {
+            let (sock, local) = ClientSock::open(
+                Some(SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))),
+                Arc::clone(&relays),
+                Arc::clone(&stats),
+                Arc::clone(&logf),
+            )?;
+            ep4 = Some(Arc::new(Endpoint::new_with_abstract_socket(
+                EndpointConfig::default(),
+                None,
+                sock,
+                Arc::new(quinn::TokioRuntime),
+            )?));
+            local4 = Some(local);
+        }
+        if want6 {
+            match ClientSock::open(
+                Some(SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))),
+                Arc::clone(&relays),
+                Arc::clone(&stats),
+                Arc::clone(&logf),
+            ) {
+                Ok((sock, local)) => {
+                    ep6 = Some(Arc::new(Endpoint::new_with_abstract_socket(
+                        EndpointConfig::default(),
+                        None,
+                        sock,
+                        Arc::new(quinn::TokioRuntime),
+                    )?));
+                    local6 = Some(local);
+                }
+                Err(e) => (*logf)(&format!("客户端 v6 端点不可用（{e}）——本轮只走 v4")),
+            }
+        }
+        let local = local4
+            .or(local6)
+            .ok_or_else(|| io::Error::other("客户端没有任何地址族可起端点"))?;
+        if let (Some(a), Some(b)) = (local4, local6) {
+            (*logf)(&format!("客户端端点：v4={a} v6={b}"));
+        }
         let mut client_cfg = quinn::ClientConfig::new(
             crate::exit::rpk::client_pin::client_crypto_config(credential.pin())
                 .map_err(io::Error::other)?,
@@ -135,7 +176,8 @@ impl Face {
             cc,
         ));
         Ok(Face {
-            endpoint: Arc::new(endpoint),
+            ep4,
+            ep6,
             cfg: client_cfg,
             cred: Arc::new(credential),
             relays,
@@ -145,14 +187,14 @@ impl Face {
         })
     }
 
-    /// 端点（`Arc` 克隆：赛跑任务要持一份——`quinn::Endpoint` 不可 Clone）。
-    pub(crate) fn endpoint(&self) -> Arc<Endpoint> {
-        Arc::clone(&self.endpoint)
-    }
-
-    /// 客户端配置（含钉定 + §1.2 TransportConfig；`Clone` 是 quinn 侧的常态）。
-    pub(crate) fn client_config(&self) -> quinn::ClientConfig {
-        self.cfg.clone()
+    /// 赛跑任务搬运面（端点按家庭 + 配置 + 凭据；`Arc` 克隆，任务结束后无副作用）。
+    pub(crate) fn connect_kit(&self) -> ConnectKit {
+        ConnectKit {
+            ep4: self.ep4.clone(),
+            ep6: self.ep6.clone(),
+            cfg: self.cfg.clone(),
+            cred: Arc::clone(&self.cred),
+        }
     }
 
     /// 准入材料（`Arc` 克隆：赛跑/刷新任务共用一份，不复制敏感材料）。
@@ -199,21 +241,71 @@ impl Face {
     /// **不能**用 `Endpoint::rebind(stdio_socket)`（那会退回 quinn-udp 内建 socket，
     /// 中继路径当场失去信封语义）。
     pub(crate) fn rebind(&mut self, local: Option<SocketAddr>) -> Result<SocketAddr, IslandErr> {
-        let (sock, v4) = ClientSock::open(
-            local,
-            Arc::clone(&self.relays),
-            Arc::clone(&self.stats),
-            Arc::clone(&self.logf),
-        )
-        .map_err(IslandErr::Rebind)?;
-        self.endpoint
-            .rebind_abstract(sock)
-            .map_err(IslandErr::Rebind)?;
-        self.local = v4;
+        let mut new_local = None;
+        match local {
+            // 显式 v4/v6：只重绑该族（另一族保持当前 socket；本地注入/迁移用例的形态）。
+            Some(a) if a.is_ipv4() => {
+                if let Some(ep) = &self.ep4 {
+                    let (sock, l) = ClientSock::open(
+                        Some(a),
+                        Arc::clone(&self.relays),
+                        Arc::clone(&self.stats),
+                        Arc::clone(&self.logf),
+                    )
+                    .map_err(IslandErr::Rebind)?;
+                    ep.rebind_abstract(sock).map_err(IslandErr::Rebind)?;
+                    new_local = Some(l);
+                }
+            }
+            Some(a) => {
+                if let Some(ep) = &self.ep6 {
+                    let (sock, l) = ClientSock::open(
+                        Some(a),
+                        Arc::clone(&self.relays),
+                        Arc::clone(&self.stats),
+                        Arc::clone(&self.logf),
+                    )
+                    .map_err(IslandErr::Rebind)?;
+                    ep.rebind_abstract(sock).map_err(IslandErr::Rebind)?;
+                    new_local = Some(l);
+                }
+            }
+            // 通配重绑：两族都换（网络切换后两族的 socket 都可能失效）。
+            None => {
+                if let Some(ep) = &self.ep4 {
+                    let (sock, l) = ClientSock::open(
+                        Some(SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))),
+                        Arc::clone(&self.relays),
+                        Arc::clone(&self.stats),
+                        Arc::clone(&self.logf),
+                    )
+                    .map_err(IslandErr::Rebind)?;
+                    ep.rebind_abstract(sock).map_err(IslandErr::Rebind)?;
+                    new_local = Some(l);
+                }
+                if let Some(ep) = &self.ep6 {
+                    match ClientSock::open(
+                        Some(SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))),
+                        Arc::clone(&self.relays),
+                        Arc::clone(&self.stats),
+                        Arc::clone(&self.logf),
+                    ) {
+                        Ok((sock, l)) => {
+                            ep.rebind_abstract(sock).map_err(IslandErr::Rebind)?;
+                            new_local = new_local.or(Some(l));
+                        }
+                        Err(e) => (*self.logf)(&format!("客户端 v6 重绑失败（{e}）——继续 v4")),
+                    }
+                }
+            }
+        }
+        let local = new_local
+            .ok_or_else(|| IslandErr::Rebind(io::Error::other("没有可重绑的地址族")))?;
+        self.local = local;
         // §3.1-N5：**换网即清**发送面错误（`stats` 的 `Arc` 刻意跨 socket 共享——不清就会
         // 用换网前的陈旧 errno 决定下一步动作）。清零是「M/R 判别只看本网环境」的前提。
         crate::sync_util::lock_unpoison(&self.stats).clear_local_send_err();
-        Ok(v4)
+        Ok(local)
     }
 
     /// 当前本地地址（N-b 行的「旧 → 新」源）。
@@ -229,16 +321,34 @@ impl Face {
 /// 供换绑/刷新用），故只搬必需的三件（端点 `Arc` + 配置 + 凭据 `Arc`）。
 #[allow(clippy::too_many_arguments)] // 赛跑单入口（同 `race::run`：两枚时间值=整轮预算/岛级窗口）
 pub(crate) async fn connect(
-    endpoint: Arc<Endpoint>,
-    cfg: quinn::ClientConfig,
-    cred: Arc<IslandCredential>,
+    kit: ConnectKit,
     cands: &[Candidate],
     budget: Duration,
     direct_first: Duration,
     log_c4: bool,
     logf: &Logf,
 ) -> Result<(Established, RaceOutcome), IslandErr> {
-    race::run(endpoint, cfg, cred, cands, budget, direct_first, log_c4, logf).await
+    race::run(kit, cands, budget, direct_first, log_c4, logf).await
+}
+
+/// 赛跑搬运面（端点按家庭 + 配置 + 凭据）。`Face::connect_kit()` 构造。
+#[derive(Clone)]
+pub(crate) struct ConnectKit {
+    pub(crate) ep4: Option<Arc<Endpoint>>,
+    pub(crate) ep6: Option<Arc<Endpoint>>,
+    pub(crate) cfg: quinn::ClientConfig,
+    pub(crate) cred: Arc<IslandCredential>,
+}
+
+impl ConnectKit {
+    /// 候选地址对应的端点（该族不可用 ⇒ `None`）。
+    pub(crate) fn endpoint_for(&self, addr: SocketAddr) -> Option<Arc<Endpoint>> {
+        if addr.is_ipv4() {
+            self.ep4.clone()
+        } else {
+            self.ep6.clone()
+        }
+    }
 }
 
 /// 赛跑赢家的原料（准入已完成的连接 + 控制流两半边 + 连接绑定值）。

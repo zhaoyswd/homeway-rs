@@ -564,7 +564,7 @@ async fn connect_over_ipv6_loopback_registers() {
     let stub = Stub::new();
     let (logf, _logs) = sink();
     let mut cfg = island_cfg(Duration::from_secs(60), quic.rpk_public_key());
-    cfg.bind = None; // 双栈 `[::]:0`
+    cfg.bind = None; // 双族（v4 + v6）
     let island = Island::start(logf, Arc::new(|_r: &str| {}), cfg).expect("岛可起（双栈）");
     let addr = SocketAddr::from((
         std::net::Ipv6Addr::LOCALHOST,
@@ -587,6 +587,38 @@ async fn connect_over_ipv6_loopback_registers() {
     assert_eq!(outcome.winner, addr, "胜者 = v6 候选（实得 {outcome:?}）");
     assert_eq!(outcome.via, Via::Direct);
     assert!(stub.accepted() >= 1, "v6 连接必须完成四帧准入");
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+
+/// **判据（两族端点并存，v4 候选仍走 v4）**：`bind=None` 建 v4+v6 两枚端点；
+/// v4 候选必须由 v4 端点完成握手/准入（不被 v6 本地地址误路由）。
+#[tokio::test]
+async fn connect_v4_works_when_both_families_are_bound() {
+    let quic = exit_face(90);
+    let stub = Stub::new();
+    let (logf, _logs) = sink();
+    let mut cfg = island_cfg(Duration::from_secs(60), quic.rpk_public_key());
+    cfg.bind = None; // 两族
+    let island = Island::start(logf, Arc::new(|_r: &str| {}), cfg).expect("岛可起（两族）");
+    let addr = connectable(&quic);
+    let outcome = send_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::Connect {
+            cands: vec![direct(addr)],
+            budget: WAIT,
+            demote_adopted: false,
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .expect("两族端点并存时 v4 候选必须胜出");
+    assert_eq!(outcome.winner, addr);
+    assert!(stub.accepted() >= 1, "v4 连接必须完成准入");
     assert!(island.stop_within(Instant::now() + BUDGET));
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }

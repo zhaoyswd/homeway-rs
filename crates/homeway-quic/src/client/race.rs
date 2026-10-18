@@ -31,18 +31,16 @@
 //! （本切片每轮只打一行，闸由宿主持有——形态保留给 S2b/S3 的重复赛跑）。解锁行**不占**该闸：
 //! 每轮至多一条（一次性事件，不是可重复的镜像拍）。
 
-use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use quinn::{ClientConfig, Connection, Endpoint};
+use quinn::Connection;
 use tokio::task::JoinSet;
 use tokio::time::Instant as TokioInstant;
 
 use crate::cmd::{Candidate, IslandErr, Logf, RaceOutcome};
-use crate::config::IslandCredential;
 
 use super::register;
-use super::{Established, fmt_dur, server_name};
+use super::{ConnectKit, Established, fmt_dur, server_name};
 
 /// C4' 行节流常数（照 `wtransport/bind.rs` 的 MIRROR 行：每轮 ≤3 行、间隔 ≥1s）。
 const RACE_LOG_MAX: u32 = 3;
@@ -127,9 +125,7 @@ impl LogGate {
 /// `direct_first` = 直连优先窗口（[`direct_window`] 取有效值；`0` = 关）。
 #[allow(clippy::too_many_arguments)] // 赛跑单入口：句柄三件 + 候选 + 两枚时间值（整轮预算/岛级窗口）+ 行闸/记行口
 pub(crate) async fn run(
-    endpoint: Arc<Endpoint>,
-    cfg: ClientConfig,
-    cred: Arc<IslandCredential>,
+    kit: ConnectKit,
     cands: &[Candidate],
     budget: Duration,
     direct_first: Duration,
@@ -168,7 +164,11 @@ pub(crate) async fn run(
     let mut refused: Vec<usize> = Vec::new();
     let mut pending_direct: Vec<usize> = Vec::new();
     for &i in &start {
-        match endpoint.connect_with(cfg.clone(), cands[i].addr, server_name()) {
+        let Some(endpoint) = kit.endpoint_for(cands[i].addr) else {
+            refused.push(i);
+            continue;
+        };
+        match endpoint.connect_with(kit.cfg.clone(), cands[i].addr, server_name()) {
             Ok(connecting) => {
                 if !cands[i].via.is_relay() {
                     pending_direct.push(i);
@@ -196,7 +196,11 @@ pub(crate) async fn run(
             if due || pending_direct.is_empty() {
                 let n = staged_relay.len();
                 for &i in &staged_relay {
-                    match endpoint.connect_with(cfg.clone(), cands[i].addr, server_name()) {
+                    let Some(endpoint) = kit.endpoint_for(cands[i].addr) else {
+                        refused.push(i);
+                        continue;
+                    };
+                    match endpoint.connect_with(kit.cfg.clone(), cands[i].addr, server_name()) {
                         Ok(connecting) => {
                             set.spawn(async move { (i, connecting.await) });
                             // 投出即入「未完成」清单（完成/失败时再摘除）——与起跑侧同记法，
@@ -300,7 +304,7 @@ pub(crate) async fn run(
     };
     let (send, recv) = match within(
         abudget,
-        register::register_on_control_stream(&conn, &cred, &exporter, logf),
+        register::register_on_control_stream(&conn, &kit.cred, &exporter, logf),
     )
     .await
     {

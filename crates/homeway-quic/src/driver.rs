@@ -1334,15 +1334,12 @@ async fn handle_cmd(
             st.mirrors += list.len() as u64;
             // S2-7：本轮候选（含中继类）先入 socket 的中继表，再发赛跑任务
             face.relays().set(&list);
-            let endpoint = face.endpoint();
-            let ccfg = face.client_config();
-            let cred = Arc::clone(face.credential());
+            let kit = face.connect_kit();
             let direct_first = st.direct_first;
             let logf = Arc::clone(&ctx.logf);
             jobs.spawn(guard_job(PanickedJob::Race, async move {
                 let result =
-                    client::connect(endpoint, ccfg, cred, &list, budget, direct_first, log_c4, &logf)
-                        .await;
+                    client::connect(kit, &list, budget, direct_first, log_c4, &logf).await;
                 Job::Race { reply, result }
             }));
         }
@@ -1604,25 +1601,14 @@ fn ladder_step(
                     continue;
                 }
                 face.relays().set(&list);
-                let endpoint = face.endpoint();
-                let ccfg = face.client_config();
-                let cred = Arc::clone(face.credential());
+                let kit = face.connect_kit();
                 let budget = st.ladder.reconnect_budget();
                 let direct_first = st.direct_first;
                 let logf = Arc::clone(&ctx.logf);
                 jobs.spawn(guard_job(PanickedJob::LadderConnect, async move {
-                    let result = client::connect(
-                        endpoint,
-                        ccfg,
-                        cred,
-                        &list,
-                        budget,
-                        direct_first,
-                        false,
-                        &logf,
-                    )
-                    .await
-                    .map(|(est, _outcome)| est);
+                    let result = client::connect(kit, &list, budget, direct_first, false, &logf)
+                        .await
+                        .map(|(est, _outcome)| est);
                     Job::LadderConnect { why, result }
                 }));
                 return;
