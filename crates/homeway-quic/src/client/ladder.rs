@@ -424,7 +424,8 @@ impl Ladder {
             return Step::Idle; // 单飞：动作/探活在途，让它自己收线（不并发动作）
         }
         self.pending = None;
-        self.pending_fail = Some("连接已断".to_owned());
+        // 不复用 `pending_fail`：它是「首探失败 → 复探」两条腿之间的原因槽，
+        // 链路确定性死亡直接给 `fail_step` 传因，留在槽里会污染下一轮的抖动行。
         self.fail_step("连接已断".to_owned(), now, send, logf)
     }
 
@@ -1071,6 +1072,18 @@ mod tests {
         assert!(l.due(t0 + Duration::from_secs(1), true).is_none(), "在途 ⇒ 不起新轮");
         l.on_round(Round::First, ok(), t0, SendFace::default(), &lines().0);
         assert!(l.due(t0 + Duration::from_secs(2), true).is_some(), "收线后可再起");
+    }
+
+    /// 判据（原因槽不跨链泄漏）：链路确定性死亡直接进动作判别，不把「连接已断」
+    /// 写进 `pending_fail`（否则下一轮「首探失败 → 复探成功」的抖动行会报旧原因）。
+    #[test]
+    fn link_dead_reason_does_not_leak_into_next_round() {
+        let (logf, _log) = lines();
+        let mut l = Ladder::new(tuning());
+        let t0 = TokioInstant::now();
+        let s = l.on_link_dead(t0, SendFace::default(), &logf);
+        assert!(matches!(s, Step::Migrate { .. } | Step::Reconnect { .. }), "实得 {s:?}");
+        assert!(l.pending_fail.is_none(), "链路死亡的原因不得留在 pending_fail");
     }
 
     /// 判据（M 救回即断链）：R 失败 → M 确认成功 ⇒ R 失败链归零；之后任何一次
