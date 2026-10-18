@@ -17,7 +17,6 @@
 
 pub(crate) mod dataplane;
 pub(crate) mod ladder;
-mod migration;
 mod race;
 mod register;
 mod relay_sock;
@@ -39,7 +38,6 @@ use crate::config::{IslandConfig, IslandCredential};
 use crate::reg4;
 use crate::stream::StreamTag;
 
-pub(crate) use migration::{MigrationEvent, Watch};
 pub(crate) use race::LogGate;
 pub(crate) use register::session_closed;
 pub(crate) use relay_sock::{ClientSock, RelayTable, SockStats};
@@ -194,7 +192,8 @@ impl Face {
     /// 换本地 socket（迁移原语；设计 §2.3）。
     ///
     /// 返回值 = 新本地地址。**注意语义**：成功只代表 socket 换绑完成——路径是否真的
-    /// 可用要等对端回包（保持检测见 [`Watch`]；对端不可达**没有专用错误**）。
+    /// 可用由阶梯随后的确认快探判（一个快探预算内无回显 ⇒ 迁移未确认 ⇒ 转 R）；对端
+    /// 不可达**没有专用错误**。
     ///
     /// 形态：新 socket 仍是 S2-7 的包封/剥壳 socket（共享同一张中继表与读数）——
     /// **不能**用 `Endpoint::rebind(stdio_socket)`（那会退回 quinn-udp 内建 socket，
@@ -317,11 +316,6 @@ impl Live {
     /// `current_mtu` 现值（N-a 行/DPLPMTUD 观测）。
     pub(crate) fn current_mtu(&self) -> u16 {
         self.conn.stats().path.current_mtu
-    }
-
-    /// 收到的 UDP 报文计数（迁移保持判据的「对端回包」信号源；单调增）。
-    pub(crate) fn udp_rx(&self) -> u64 {
-        self.conn.stats().udp_rx.datagrams
     }
 
     /// 路径统计（设计 §6.2-3/§12-④：`lost_packets`/`congestion_events` 进状态 JSON 与

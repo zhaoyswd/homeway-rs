@@ -32,7 +32,7 @@ use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Condvar, Mutex, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::identity::{self, Identity};
@@ -181,11 +181,50 @@ fn pf_dial_via_run(
 // 世代运行态（Go tunRun）
 // ---------------------------------------------------------------------------
 
+/// 收工等待的唤醒面（2026-10-18 评审：替掉 stats 拍与世代主线程的 1s 分片轮询——
+/// 空闲期不再 1Hz 唤醒；`request_stop` 置位后 `wake()`，等待者立即返回）。
+///
+/// 丢唤醒协议：等待者**先持 `gate` 锁再复查 `stop` 位**，`wake()` 也持同一把锁再
+/// notify ⇒ 「置位发生在复查之后、notify 发生在等待之前」的窗口不存在。
+pub(crate) struct StopWake {
+    gate: Mutex<()>,
+    cv: Condvar,
+}
+
+impl StopWake {
+    fn new() -> Self {
+        Self {
+            gate: Mutex::new(()),
+            cv: Condvar::new(),
+        }
+    }
+
+    /// 唤醒全部等待者（调用方必须已置 `stop` 位）。
+    fn wake(&self) {
+        let _g = lock_unpoison(&self.gate);
+        self.cv.notify_all();
+    }
+
+    /// 等到 `stop` 置位或 `dur` 到点；返回后调用方复查 stop。
+    fn wait(&self, stop: &AtomicBool, dur: Duration) {
+        let g = lock_unpoison(&self.gate);
+        if stop.load(Ordering::Acquire) {
+            return;
+        }
+        let _ = self
+            .cv
+            .wait_timeout(g, dur)
+            .unwrap_or_else(|e| e.into_inner());
+    }
+}
+
 /// 一个世代的运行态（TunnelExec 持当前世代的 Arc；旧世代迟到收尾无害）。
 pub struct GenRun {
     pub gen: u64,
     /// 世代停止位（request_stop 置；所有线程收口判据）。
     pub stop: Arc<AtomicBool>,
+    /// 停止唤醒面（stats 拍 / 世代主线程的收工等待；见 [`StopWake`]）。
+    pub(crate) stop_wake: StopWake,
     /// QUIC 岛（世代装配期构造；`None` = 未构造/已收回）。**M5 C3 单承载**：
     /// 岛装配失败即本世代失败（无回落档，设计 §4.3③）。
     island: RwLock<Option<Arc<homeway_quic::Island>>>,
@@ -594,7 +633,7 @@ impl GenRun {
                 let saved_last = run.reconn.last_ms.swap(mono_ms(), Ordering::AcqRel);
                 let saved_yield = run.reconn.yield_until_ms.swap(0, Ordering::AcqRel);
                 // 3. spawn（初次 + 2 次重试，共 3 次）
-                match spawn_reconnect_worker(run, epoch, source) {
+                match spawn_reconnect_worker(run, epoch, source, false) {
                     Ok(()) => EntryOutcome::Spawned,
                     Err(()) => {
                         // 4. spawn 全败（r13-P2：清位在 release 前、仍持 INFLIGHT 时做
@@ -639,8 +678,12 @@ impl GenRun {
         carrier_alive
     }
 
-    /// 【worker 的一轮执行 `run_round(source)`（D1-a/b/c）】。
-    fn run_round(run: &Arc<GenRun>, source: ReconnSource) {
+    /// 【worker 的一轮执行 `run_round(source, skip_probe)`（D1-a/b/c）】。
+    ///
+    /// `skip_probe = true` 只用于 `recover` 的失败移交：同步快探刚在同一个入口里
+    /// 失败，worker 立刻再探一次是纯重复（换网/唤醒时白烧 700ms）。其余入口
+    /// （读面/服务流/B 门/承接轮）一律先快探——那是一次新的证据机会。
+    fn run_round(run: &Arc<GenRun>, source: ReconnSource, skip_probe: bool) {
         run.reconn.starts.fetch_add(1, Ordering::Relaxed); // 起跑 S（含承接轮）
         // 评审 r1 P0-1 整改：起跑判据行（worker 线程落——不在读路径；stats 的
         // 起跑=S 计数无源枚举，7.1 的「读面触发」验收判据由本行承载）。
@@ -658,76 +701,93 @@ impl GenRun {
             return;
         }
         run.reconn.hook("round_before_probe");
-        // a. 有界快探（island_cmd_until）：成功 = 强证据翻回 → 完成(已恢复)
-        match quick_probe(run) {
-            Ok(()) => {
-                // 测试缝：快探刚返回成功、halt 复查前的设备死/停止注入点（评审
-                // r2 B3——设备死在快探在飞期间发生时不落恢复行、不置 carrier true）。
-                run.reconn.hook("round_after_probe");
-                if worker_halted(run) {
+        // a. 有界快探（island_cmd_until）：成功 = 强证据翻回 → 完成(已恢复)。
+        //    Busy（probe 槽被并发占用）= 并发面而非对端证据 ⇒ 让路、不换绑不赛跑。
+        let probe_ok = if skip_probe {
+            (run.logf)(&format!(
+                "一次性重连：跳过重复快探（同步快探刚失败，源={}）",
+                source.text()
+            ));
+            false
+        } else {
+            match quick_probe(run) {
+                Ok(()) => true,
+                Err(ProbeFail::Busy(m)) => {
+                    (run.logf)(&format!(
+                        "一次性重连：让路（源={}，probe 槽被并发占用：{m}）",
+                        source.text()
+                    ));
                     return;
                 }
-                // 测试缝（评审 r5-L3）：halt 复查通过后、strong_recover 前的设备死
-                // 注入点——承载位置 true 判负（alive=false）时不得落假恢复行。
-                run.reconn.hook("round_before_strong");
-                let t0 = mono_ms();
-                // 评审 r5-L3：消费 `carrier_alive`——设备死在复查与强恢复之间到场
-                // 时不落「一次性重连：恢复」行、按 Gone/设备死静默收口（与
-                // worker_halted 同纪律；旧实现无条件打行 = 假恢复行）。
-                if !GenRun::strong_recover(run, "快探") {
-                    return;
-                }
-                (run.logf)(&format!(
-                    "一次性重连：恢复（源={}，证据=快探，耗时 {}ms）",
-                    source.text(),
-                    (mono_ms() - t0).max(0)
-                ));
+                Err(_) => false,
             }
-            Err(_probe_fail) => {
-                // 测试缝：快探刚结束、halt 复查前的设备死/停止注入点（r9-C5——
-                // 评审 r1 整改：注入后由下方复查拦截，rerace_tunnel 不进入）。
-                run.reconn.hook("round_before_rerace");
-                if worker_halted(run) {
-                    return;
+        };
+        if probe_ok {
+            // 测试缝：快探刚返回成功、halt 复查前的设备死/停止注入点（评审
+            // r2 B3——设备死在快探在飞期间发生时不落恢复行、不置 carrier true）。
+            run.reconn.hook("round_after_probe");
+            if worker_halted(run) {
+                return;
+            }
+            // 测试缝（评审 r5-L3）：halt 复查通过后、strong_recover 前的设备死
+            // 注入点——承载位置 true 判负（alive=false）时不得落假恢复行。
+            run.reconn.hook("round_before_strong");
+            let t0 = mono_ms();
+            // 评审 r5-L3：消费 `carrier_alive`——设备死在复查与强恢复之间到场
+            // 时不落「一次性重连：恢复」行、按 Gone/设备死静默收口（与
+            // worker_halted 同纪律；旧实现无条件打行 = 假恢复行）。
+            if !GenRun::strong_recover(run, "快探") {
+                return;
+            }
+            (run.logf)(&format!(
+                "一次性重连：恢复（源={}，证据=快探，耗时 {}ms）",
+                source.text(),
+                (mono_ms() - t0).max(0)
+            ));
+        } else {
+            // 测试缝：快探刚结束、halt 复查前的设备死/停止注入点（r9-C5——
+            // 评审 r1 整改：注入后由下方复查拦截，rerace_tunnel 不进入）。
+            run.reconn.hook("round_before_rerace");
+            if worker_halted(run) {
+                return;
+            }
+            // b. 复用既有重赛跑序列（换网源带 demote_adopted）
+            let demote = source == ReconnSource::NetChange;
+            match rerace_tunnel(run, demote) {
+                Ok(ReraceOutcome::Recovered) => {
+                    (run.logf)(&format!(
+                        "一次性重连：恢复（源={}，证据=重赛跑）",
+                        source.text()
+                    ));
                 }
-                // b. 复用既有重赛跑序列（换网源带 demote_adopted）
-                let demote = source == ReconnSource::NetChange;
-                match rerace_tunnel(run, demote) {
-                    Ok(ReraceOutcome::Recovered) => {
-                        (run.logf)(&format!(
-                            "一次性重连：恢复（源={}，证据=重赛跑）",
-                            source.text()
-                        ));
+                Ok(ReraceOutcome::Yielded) => {
+                    // 250ms 复读一次（快照陈旧窗），仍让路 → 完成(让路) + 5s 短窗
+                    std::thread::sleep(RERACE_REREAD_DELAY);
+                    if worker_halted(run) {
+                        return;
                     }
-                    Ok(ReraceOutcome::Yielded) => {
-                        // 250ms 复读一次（快照陈旧窗），仍让路 → 完成(让路) + 5s 短窗
-                        std::thread::sleep(RERACE_REREAD_DELAY);
-                        if worker_halted(run) {
-                            return;
+                    match rerace_tunnel(run, demote) {
+                        Ok(ReraceOutcome::Recovered) => {
+                            (run.logf)(&format!(
+                                "一次性重连：恢复（源={}，证据=重赛跑（复读））",
+                                source.text()
+                            ));
                         }
-                        match rerace_tunnel(run, demote) {
-                            Ok(ReraceOutcome::Recovered) => {
-                                (run.logf)(&format!(
-                                    "一次性重连：恢复（源={}，证据=重赛跑（复读））",
-                                    source.text()
-                                ));
-                            }
-                            Ok(ReraceOutcome::Yielded) => {
-                                run.reconn.yield_until_ms.store(
-                                    mono_ms() + RECONNECT_YIELD_GAP.as_millis() as i64,
-                                    Ordering::Release,
-                                );
-                                (run.logf)(&format!(
-                                    "一次性重连：让路（源={}，在飞赛跑持续——{} 短窗退避）",
-                                    source.text(),
-                                    crate::go_fmt::fmt_duration_go_secs(RECONNECT_YIELD_GAP)
-                                ));
-                            }
-                            Err(abort) => rerace_abort_line(run, source, abort),
+                        Ok(ReraceOutcome::Yielded) => {
+                            run.reconn.yield_until_ms.store(
+                                mono_ms() + RECONNECT_YIELD_GAP.as_millis() as i64,
+                                Ordering::Release,
+                            );
+                            (run.logf)(&format!(
+                                "一次性重连：让路（源={}，在飞赛跑持续——{} 短窗退避）",
+                                source.text(),
+                                crate::go_fmt::fmt_duration_go_secs(RECONNECT_YIELD_GAP)
+                            ));
                         }
+                        Err(abort) => rerace_abort_line(run, source, abort),
                     }
-                    Err(abort) => rerace_abort_line(run, source, abort),
                 }
+                Err(abort) => rerace_abort_line(run, source, abort),
             }
         }
     }
@@ -906,12 +966,17 @@ fn clear_pending_while_holding(run: &GenRun, epoch: u32) {
 
 /// spawn 一次性 worker（初次 + 2 次重试 = 共 3 次；全败 `Err`——**零 logf**，计数由
 /// 入口做：读线程路径禁日志）。
-fn spawn_reconnect_worker(run: &Arc<GenRun>, epoch: u32, source: ReconnSource) -> Result<(), ()> {
+fn spawn_reconnect_worker(
+    run: &Arc<GenRun>,
+    epoch: u32,
+    source: ReconnSource,
+    skip_probe: bool,
+) -> Result<(), ()> {
     let mut tries = 0;
     loop {
         let r = Arc::clone(run);
         let spawned = spawn_thread_named("homeway-reconnect", move || {
-            reconnect_worker_body(r, epoch, source);
+            reconnect_worker_body(r, epoch, source, skip_probe);
         });
         if spawned {
             return Ok(());
@@ -970,13 +1035,13 @@ fn stats_beat() {}
 
 /// worker 线程体：初次 run_round + 收尾循环 + 承接轮全部包在**单层 catch_unwind**
 /// 内（r11-C9：释放的唯一 owner 是 catch 处理器——guard 只记账不写状态字）。
-fn reconnect_worker_body(run: Arc<GenRun>, my_epoch: u32, source: ReconnSource) {
+fn reconnect_worker_body(run: Arc<GenRun>, my_epoch: u32, source: ReconnSource, skip_probe: bool) {
     let mut guard = RoundGuard {
         epoch: my_epoch,
         triggering: 0,
     };
     let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-        GenRun::run_round(&run, source);
+        GenRun::run_round(&run, source, skip_probe);
         reconnect_finalize_loop(&run, &mut guard);
     }));
     if res.is_err() {
@@ -1017,7 +1082,7 @@ fn reconnect_finalize_loop(run: &Arc<GenRun>, guard: &mut RoundGuard) {
         {
             guard.epoch = new_epoch; // 从实际态推导（r12-B2）
             let source = ReconnSource::from_pending(p2); // 优先级推导（D1-d）
-            GenRun::run_round(run, source); // panic 由外层单层 catch 处理器统一承接
+            GenRun::run_round(run, source, false); // 承接轮 = 新事件，先快探；panic 由外层单层 catch 统一承接
             continue;
         }
         continue; // 并发（新入口抢走/新 pending）：残留 pending 仍在字里（不变量）
@@ -1137,6 +1202,7 @@ impl TunExecutor for TunnelExec {
             // 落到共享面旗标中继（复核 r3-F2：M-2 的窗口在第 2+ 世代必须真正可达）
             if run.gen == run.tun_shared.gen.load(Ordering::Acquire) {
                 run.stop.store(true, Ordering::Release);
+                run.stop_wake.wake();
                 // preparing 阶段没有 fd 循环可打断，暖机探测可能挂在岛 RPC 上——
                 // 停岛是最可靠的第二条打断路径（Go tunStopWait 同义）。
                 if run.tun_shared.stage.snapshot().stage == TunStage::Preparing {
@@ -1245,7 +1311,7 @@ impl TunExecutor for TunnelExec {
                         // spawn worker 并把槽位移交（r12-B3 定稿：worker 以 Claimed 的
                         // epoch 为 my_epoch、走标准收尾——recover 立即返回 -1，不再
                         // 自行 release）。
-                        match spawn_reconnect_worker(&run, epoch, source) {
+                        match spawn_reconnect_worker(&run, epoch, source, true) {
                             Ok(()) => -1,
                             Err(()) => {
                                 // r13-P3：无人继承时的释放兜底——步骤 4 同款清理后
@@ -1323,6 +1389,7 @@ impl GenRun {
         GenRun {
             gen: 1,
             stop: Arc::clone(&stop),
+            stop_wake: StopWake::new(),
             island: RwLock::new(None),
             l3_on_island: AtomicBool::new(false),
             identity: ident.clone(),
@@ -1539,6 +1606,7 @@ fn gen_loop(
         GenRun {
             gen,
             stop: Arc::clone(&stop),
+            stop_wake: StopWake::new(),
             island: RwLock::new(None),
             l3_on_island: AtomicBool::new(false),
             identity: ident.clone(),
@@ -1905,9 +1973,9 @@ fn gen_loop(
         if run.stop.load(Ordering::Acquire) {
             break;
         }
-        // IDLE-WAKE B：分片 200ms→1s（stop 尾部 ≤1s，仍在收尾链 2s join / STOP_WAIT=3s
-        // 预算内；到点一律重新装填——本循环只认 stop 位，绝无「因超时推进收工」路径）
-        std::thread::sleep(Duration::from_millis(1000));
+        // 收工等待走 Condvar（2026-10-18：不再 1s 分片 sleep）；1h 只作防御性超时，
+        // 醒来先复查 stop 位。
+        run.stop_wake.wait(&run.stop, Duration::from_secs(3600));
     }
     (logf)("收到停止信号，正在回收（client/stack）");
     // stats 随 stop 位退出（join 有界——**总预算 2s**，与 STOP_WAIT=3s 留 1s 给桥停/
@@ -2080,7 +2148,7 @@ enum ProbeFail {
 ///
 /// 中继候选的 `label` = `sha256(peerId)[:8]`（信封帧 `[0xAA][label8]` 的来源；真源
 /// `legframe::relay_id`）——与出口侧腿表同源。
-fn quic_candidates(tok: &Token) -> Result<Vec<homeway_quic::Candidate>, QuicFail> {
+fn quic_candidates(tok: &Token, logf: &Logf) -> Result<Vec<homeway_quic::Candidate>, QuicFail> {
     let label = crate::legframe::relay_id(tok.peer_id.as_bytes());
     let mut out: Vec<homeway_quic::Candidate> = Vec::new();
     for e in &tok.endpoints {
@@ -2091,7 +2159,18 @@ fn quic_candidates(tok: &Token) -> Result<Vec<homeway_quic::Candidate>, QuicFail
             crate::token::EndpointKind::Direct => continue,
         };
         let Ok(addr) = e.addr.parse::<SocketAddrV4>() else {
-            continue; // 域名/非法形态不进岛候选（§2.7：域名解析面仍归 WG）
+            // 2026-10-18 评审：QUIC 客户端当前**只支持 IPv4**（`Candidate.addr` =
+            // `SocketAddrV4`，客户端 socket 绑 0.0.0.0）。token 里的 v6 端点会被跳过——
+            // 必须留痕，不能静默（否则「为什么没走 v6」在日志里无从判断）。
+            if e.addr.parse::<std::net::SocketAddr>().is_ok() {
+                (*logf)(&format!(
+                    "端点跳过（QUIC 客户端当前仅支持 IPv4）：{}",
+                    e.addr
+                ));
+            } else {
+                (*logf)(&format!("端点跳过（非 IP 字面量/非法地址）：{}", e.addr));
+            }
+            continue;
         };
         if out.iter().any(|c| c.addr == addr) {
             continue; // 同址去重（先到先得）
@@ -2318,7 +2397,7 @@ fn start_island(
     let Some(rpk) = cfg.token.rpk else {
         return Err(QuicFail::NoRpk);
     };
-    let cands = quic_candidates(&cfg.token)?;
+    let cands = quic_candidates(&cfg.token, logf)?;
     // C13（设计 §8.1 改写面）：候选清单一行——单承载后「标记·学习」面退役（岛候选恒来自
     // token，无学习缓存/hint），形态收窄为 `候选端点（%d 条）：%s`。
     (logf)(&format!(
@@ -2455,16 +2534,21 @@ fn stats_loop(run: Arc<GenRun>, stats_secs: i64, _diag_fd_secs: i64, obs_interva
     // 5s/300s 档下 3 连败窗口恒为 ~180s）。
     let mut obs_fail_streak: u32 = 0;
     loop {
-        // 分片等待（评审 r2-H3：整段 sleep 让收工 join 白烧满预算 ⇒ tun_stop 常态化
-        // -2 强制放锁——Go 统计 goroutine 的 select{tick, stop} 同义）
+        // 收工可打断的等待（评审 r2-H3：整段 sleep 让收工 join 白烧满预算 ⇒ tun_stop
+        // 常态化 -2 强制放锁）。2026-10-18 起走 Condvar：只有「到拍」与「收工」两种
+        // 唤醒，不再 1s 分片空转。
         let deadline = Instant::now() + tick;
-        while Instant::now() < deadline {
+        loop {
             if run.stop.load(Ordering::Acquire) {
                 return;
             }
-            let nap =
-                Duration::from_millis(1000).min(deadline.saturating_duration_since(Instant::now()));
-            std::thread::sleep(nap);
+            let left = deadline.saturating_duration_since(Instant::now());
+            if left.is_zero() {
+                break;
+            }
+            // 走收工唤醒面（2026-10-18：不再 1s 分片 sleep——空闲期 stats 线程
+            // 只按拍/收工两种事醒来）。
+            run.stop_wake.wait(&run.stop, left);
         }
         let now = Instant::now();
         // ---- stats 行（每 stats_secs 一次；重连五计数段——r3-R16）----
@@ -3695,7 +3779,7 @@ mod tests {
         {
             let (run, lines) = gen_with_lines("c5b");
             run.tun_shared.mark_unhealthy("fd");
-            GenRun::run_round(&run, ReconnSource::ReadFace);
+            GenRun::run_round(&run, ReconnSource::ReadFace, false);
             let seen = drain_lines(&lines);
             assert!(
                 seen.iter().all(|l| l == "一次性重连：起跑（源=读面）"),
@@ -5093,6 +5177,7 @@ mod tests {
         let run = Arc::new(GenRun {
             gen: 1,
             stop: Arc::clone(&stop),
+            stop_wake: StopWake::new(),
             island: RwLock::new(None),
             l3_on_island: AtomicBool::new(false),
             identity: ident.clone(),
@@ -5199,6 +5284,7 @@ mod tests {
         let run = Arc::new(GenRun {
             gen: 1,
             stop: Arc::clone(&stop),
+            stop_wake: StopWake::new(),
             island: RwLock::new(None),
             l3_on_island: AtomicBool::new(false),
             identity: ident,

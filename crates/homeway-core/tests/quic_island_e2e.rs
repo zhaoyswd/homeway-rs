@@ -12,8 +12,8 @@
 //!
 //! 断言面（每条一行 `key=value` 读数，供 `docs/reviews/M1.md` 摘抄）：
 //! ①`Connect` Ok（赛跑胜出 + 登记）；②出口日志 `peer: +`（真设备表登记）；
-//! ③`Probe` Ok（判活）；④`Rebind` Ok ⇒ 出口 `quic: 路径变更`（E-q2）+ 岛 `migrations=1`
-//! （保持窗内收到对端回包 ⇒ 迁移完成）+ 出口再收一帧刷新（表内 E8 行 ← **新源**）
+//! ③`Probe` Ok（判活）；④`Rebind` Ok ⇒ 出口 `quic: 路径变更`（E-q2）+ 岛换绑落账
+//! （换绑落地 + 本地地址更新；2026-10-18 起保持窗退役）+ 出口再收一帧刷新（表内 E8 行 ← **新源**）
 //! 证「收发继续」。
 
 use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
@@ -226,19 +226,21 @@ fn island_connects_registers_and_survives_rebind_against_local_exit() {
         .expect("出口必须观测到路径变更（E-q2：remote_address() 变化；本轮新增行）");
     println!("[e2e] exit.path_change_line={change}");
 
-    // 迁移完成（保持窗内收到对端回包 ⇒ N-b）；轮询快照
+    // 换绑落地（保持窗已退役：Cmd::Rebind 只换 socket，路径可用性由刷新帧的
+    // 「新源到达」与连接存活来证明）。
     let deadline = Instant::now() + WAIT;
-    while island.snapshot().migrations < 1 && Instant::now() < deadline {
+    while island.snapshot().rebinds < 1 && Instant::now() < deadline {
         std::thread::sleep(Duration::from_millis(50));
     }
     let snap = island.snapshot();
-    println!("[e2e] island.migrations={}", snap.migrations);
+    println!("[e2e] island.rebinds={}", snap.rebinds);
     println!("[e2e] island.migration_unconfirmed={}", snap.migration_unconfirmed);
     println!("[e2e] island.via={:?}", snap.via);
     println!("[e2e] island.mtu={:?}", snap.mtu);
     println!("[e2e] island.current_mtu={}", snap.current_mtu);
-    assert!(snap.migrations >= 1, "迁移必须确认（收到新路径回包）");
-    assert!(!snap.migration_unconfirmed, "不得判未确认");
+    assert!(snap.rebinds >= 1, "换绑命令必须落账");
+    assert!(!snap.migration_unconfirmed, "无保持窗 ⇒ 不得置未确认位");
+    assert_eq!(snap.migrations, 0, "保持窗退役：Cmd::Rebind 不再产迁移完成计数");
     assert_eq!(snap.via, Some(Via::Direct), "连接保持（via 未清）");
 
     // 「收发继续」的客户端 → 出口方向：刷新帧（节拍 2s）必须从**新源**到达出口并被采纳。

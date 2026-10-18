@@ -11,7 +11,7 @@
 //! 驱动循环（M1 S2a 起）= **三源 `select!`**（设计 §2.1 的驱动循环形态）：
 //! ① 命令通道；② 长任务（赛跑 / 探活）的 `JoinSet` 回口；③ 巡检拍（TICK）。
 //! 长任务一律进 `JoinSet`（M0 §3.5 的「禁裸 task」），收工 `drop(jobs)` = abort 全部；
-//! 拍内务（刷新/迁移保持检测/快照同步）在原地做——与长任务无共享状态。
+//! 拍内务（刷新/快探到点/快照同步）在原地做——与长任务无共享状态。
 //!
 //! 纪律：
 //! - 岛内**只做非阻塞 IO**；阻塞面（TUN 读）留在调用侧的专用 std 线程（M1 起）；
@@ -39,7 +39,7 @@ use tokio::time::Instant as TokioInstant;
 use crate::client::dataplane::{self, DropNote, DropNoteN};
 use crate::client::ladder::{self, Ladder, Round, SendFace, Step as LadderStep};
 use crate::client::streams::{self, StreamStats, Streams};
-use crate::client::{self, Face, Live, MigrationEvent, Watch};
+use crate::client::{self, Face, Live};
 use crate::cmd::{
     Candidate, CarrierFlag, Cmd, DropReason, IslandErr, IslandEvent, IslandSnapshot, Logf, OnAdopt,
     OnEvent, OnPacketDemand, OnUnhealthy, RaceOutcome, Via,
@@ -54,13 +54,13 @@ use crate::tuning::{apply_cc_env, apply_probe_env, apply_stream_env, ProbeTuning
 pub(crate) const ISLAND_THREAD: &str = "homeway-quic";
 /// 到点收割线程名（镜像 `hw-engine-reap`）。
 pub(crate) const REAP_THREAD: &str = "hw-quic-reap";
-/// 命令等待节拍上限（镜像 `wgcore` 的 `POLL_CAP = 250ms`）：无命令时周期性回看 stop 位
-/// （拍内务——刷新/迁移保持检测/快照同步——挂在这一拍上）。
+/// **在用档**的命令等待节拍（250ms）：与 `fast_gap` 对齐——只在「连接在位且 5s 内有
+/// 出站流量」（见 [`in_use_now`]）时使用；拍内务（刷新/快探到点/快照同步）挂在它上面。
 const TICK: Duration = Duration::from_millis(250);
-/// **无连接态**的拍上限（IDLE-WAKE C）：housekeeping 在无 live 时全 no-op（命令/任务
-/// 回执照常唤醒循环；赛跑/R/确认探活全走任务回执或同步链——dsh r3 逐项核实无「等
-/// 下一拍」路径）⇒ 空闲兜底拍放宽到 1s。连接在位保持 [`TICK`]——在用档快探地板与
-/// `fast_gap=250ms` 对齐是判据面（≤3.5s 恢复），不动。
+/// **待机/无连接**的拍上限（1s）：待机档快探是 60s 粒度、注册刷新也是 60s ⇒ 1s 足够
+/// 准点；命令/任务回执照常唤醒循环（赛跑/R/确认探活全走任务回执或同步链，无「等下一
+/// 拍」路径）。旧实现只要 `live.is_some()` 就保持 250ms，让整夜空闲的岛线程 4Hz
+/// 唤醒（2026-10-18 评审的资源项）。
 const TICK_IDLE: Duration = Duration::from_secs(1);
 /// 快照同步（housekeeping ④）的时间节流（2026-10-10 审查 中-3）：拍内务逐命令执行
 /// （上行热路径 = 每包一遍）而快照只需匹配同步面的轮询率 ⇒ 距上次同步 ≥ 本间隔才做；
@@ -583,11 +583,9 @@ struct DriverState {
     /// 累计换绑命令数（快照 `rebinds`——评审 r3 B3：worker「零后续命令」断言的
     /// Rebind 侧计数，与 `mirrors`〔Connect 侧〕成对）。
     rebinds: u64,
-    /// 迁移保持检测窗（重绑后起）。
-    watch: Option<Watch>,
     /// N-a 行只打一次（端点就绪 + 首个连接的实测 MTU）。
     na_logged: bool,
-    /// 巡检节拍（刷新 + 迁移保持判据；构造期定案，运行期不改）。
+    /// 巡检节拍（60s 注册刷新；构造期定案，运行期不改）。
     patrol: Duration,
     /// **直连优先窗口**（`IslandConfig::direct_first`；构造期定案）：喂 `client::connect`
     /// 的两处赛跑（`Cmd::Connect` 与阶梯 R 的全清单回落）；`0` = 关（全候选同刻投出）。
@@ -685,7 +683,6 @@ fn run_driver(
             race_gate: client::LogGate::new(),
             mirrors: 0,
             rebinds: 0,
-            watch: None,
             na_logged: false,
             patrol,
             direct_first,
@@ -863,8 +860,14 @@ fn run_driver(
                         Err(_aborted) => {}
                     }
                 }
-                // IDLE-WAKE C：无连接放宽到 1s（见 TICK_IDLE 文档；连接在位 = 判据面不动）
-                () = tokio::time::sleep(if st.live.is_some() { TICK } else { TICK_IDLE }) => {}
+                // 拍长按「是否在用」分档（2026-10-18 评审）：只在有出站流量且连接在位
+                // 的「在用档」保持 250ms（与 `fast_gap` 对齐）；待机/无连接一律 1s——
+                // 连接在位不等于在用，旧实现让岛线程整夜 4Hz 唤醒。
+                () = tokio::time::sleep(if st.live.is_some() && in_use_now(&st, ctx, &st.probe) {
+                    TICK
+                } else {
+                    TICK_IDLE
+                }) => {}
             }
             housekeeping(&mut st, &mut face, ctx, &mut jobs, seam).await;
         }
@@ -940,10 +943,6 @@ fn adopt(
     // 恢复动作判据（旧 `tun.is_some()` 在宿主会话恒假 ⇒ 阶梯被结构性关闭）。
     st.admitted = true;
     st.snap_sync_last = None; // 关键转换：快照立即到期（via/ep/connections 不滞后；节流见 housekeeping ④）
-    // 撤旧连接的迁移保持窗（2026-10-10 审查 中-4）：窗的基线（rx0 = 旧连接的累计
-    // udp_rx）对新连接无意义——保留会让它拿新连接的收包数与旧基线比，长会话下必出
-    // 假「未确认」⇒ 对健康连接发 M/R。
-    st.watch = None;
     // M6.5：丢弃上报口只在此构造一次（热路径零新分配）
     if st.drop_note.is_none() {
         st.drop_note = Some(drop_note_one(ctx));
@@ -1000,7 +999,7 @@ fn check_narrow_path(st: &mut DriverState, ctx: &IslandCtx) {
     ));
 }
 
-/// 拍内务（无命令时每 [`TICK`] 一次）：连接死 → 阶梯 → 刷新 → 迁移保持检测 → 快照同步。
+/// 拍内务（无命令时每拍一次；拍长见 [`TICK`]/[`TICK_IDLE`]）：连接死 → 阶梯 → 刷新 → 快照同步。
 ///
 /// **巡检接线（M3 S4 重写，设计 §3）**：
 /// - QUIC 连接死（`close_reason()` 非空）⇒ **不再**就地判不健康：岛内已有恢复阶梯
@@ -1018,7 +1017,6 @@ async fn housekeeping(
     jobs: &mut JoinSet<Job>,
     seam: u8,
 ) {
-    let patrol = st.patrol;
     // ① 连接死（对端关闭/空闲回收）：清面 + 记行 + **交快探阶梯**（§3.1；不再就地判不健康）
     if st.live.as_ref().is_some_and(|l| !l.alive()) {
         // M3 §4（设计门 F4）：**准入后**的会话级关闭（被替换/设备被摘除）单独归因——
@@ -1047,7 +1045,6 @@ async fn housekeeping(
             (*ctx.logf)(&format!("连接断 —— {n} 条在册服务流按 EOF 收"));
         }
         st.live = None;
-        st.watch = None;
         // 连接死 ⇒ 其回程泵随 `read_datagram` 出错自退（`Job::Return` 按身份复位）；
         // 这里同步清掉防重位只为「新连接可在同一拍内起泵」。
         st.pump_conn = None;
@@ -1069,7 +1066,6 @@ async fn housekeeping(
         if !live.refresh_if_due(face.credential(), &ctx.logf).await {
             (*ctx.logf)("注册刷新写失败 —— 判连接已断（交快探阶梯）");
             st.live = None;
-            st.watch = None;
             st.pump_conn = None;
             st.snap_sync_last = None; // 关键转换：快照立即到期（节流见 ④）
             // reconnect-oneshot D2：刷新失败判连接死 = 承载位 false 沿（housekeeping
@@ -1085,44 +1081,7 @@ async fn housekeeping(
             }
         }
     }
-    // ③ 迁移保持检测（N-b / 未确认；判据本体在 `client::migration`）
-    //    先取结论再动 `st.watch`（借用序：结论是值，窗是状态）。
-    let ev = match (st.watch.as_ref(), st.live.as_ref()) {
-        (Some(w), Some(live)) => w
-            .tick(live.udp_rx(), patrol, Instant::now())
-            .map(|e| (e, w.from(), w.to())),
-        _ => None,
-    };
-    match ev {
-        Some((MigrationEvent::Confirmed { elapsed }, from, to)) => {
-            (*ctx.logf)(&format!(
-                "迁移完成（{from} → {to}，耗时 {}）",
-                client::fmt_dur(elapsed)
-            ));
-            lock_unpoison(&ctx.snapshot).migrations += 1;
-            st.watch = None;
-        }
-        Some((MigrationEvent::Unconfirmed, from, to)) => {
-            (*ctx.logf)(&format!(
-                "迁移未确认（{from} → {to}，{} 内无对端回包 ⇒ 回落重连/重赛跑）",
-                client::fmt_dur(patrol)
-            ));
-            lock_unpoison(&ctx.snapshot).migration_unconfirmed = true;
-            st.watch = None;
-            // 未确认 = 新路径不可用（协议侧要等 `max_idle_timeout` 30s 才定音）⇒
-            // **交快探阶梯**（§3.1：位升为动作前置条件 ⇒ 允许走 R）——M1 的「即时判
-            // 不健康（世代重建）」由本重写取代（梯级动作 = M/R/B，B 才上报不健康）。
-            // **判据 = 连接在位**（M5 §2.4-A-2 ③：迁移确认的语义面是「有没有连接在保」——
-            // 此处 `live` 仍 `Some`（与 ①/② 支的「刚置 None」不同）⇒ 直接用它）。
-            if st.live.is_some() {
-                let send = send_face(face, st.ladder.tuning().send_err_fresh);
-                let step = st.ladder.on_link_dead(TokioInstant::now(), send, &ctx.logf);
-                ladder_step(st, ctx, face, jobs, step);
-            }
-        }
-        None => {}
-    }
-    // ③b **快探节拍**（§3.2：在用档背靠背 / 待机档 60s / 挂起空窗立即探——
+    // ③ **快探节拍**（§3.2：在用档背靠背 / 待机档 60s / 挂起空窗立即探——
     //     由 runtime 拍内务驱动；单飞与动作链在阶梯里）。
     //     **判据 = 连接在位**（M5 §2.4-A-2 ④：快探节拍是阶梯的唯一周期触发源——
     //     旧 `live && tun` 把无 TUN 的宿主会话整条关掉；`tun` 与「有没有连接要保」
@@ -1395,11 +1354,6 @@ async fn handle_cmd(
             let from = face.local();
             match face.rebind(local) {
                 Ok(to) => {
-                    // 保持检测窗只在有连接时起（无连接 = 只是换 socket，没有「保持」可言）
-                    st.watch = st
-                        .live
-                        .as_ref()
-                        .map(|l| Watch::start(from, to, l.udp_rx(), Instant::now()));
                     lock_unpoison(&ctx.snapshot).migration_unconfirmed = false;
                     (*ctx.logf)(&format!("本地 socket 已换绑（{from} → {to}）"));
                     let _ = reply.send(Ok(to));
@@ -1630,7 +1584,6 @@ fn ladder_step(
                         ),
                     }
                     lock_unpoison(&ctx.snapshot).migration_unconfirmed = true;
-                    st.watch = None;
                 }
                 // R 的候选 = **现任端点优先 + 名册其余**（2026-10-14 改裁）。§3.1 原文
                 // 「同端点、同本地 socket」的单候选 R 在 QUIC-ROADMAP 已登记为「窗口结构性
@@ -1742,7 +1695,6 @@ fn drop_zombie_live(st: &mut DriverState, ctx: &IslandCtx) {
     if let Some(c) = &ctx.carrier {
         c.mark_dead();
     }
-    st.watch = None;
     st.pump_conn = None;
     st.snap_sync_last = None;
 }

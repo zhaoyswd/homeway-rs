@@ -352,12 +352,19 @@ impl Ladder {
                             crate::client::fmt_dur(now.saturating_duration_since(at))
                         ));
                     }
-                    // M 的确认由宿主记 N-b 行（它持 from → to）；此处只清记账
+                    // M 确认成功 = 本失败链已恢复 ⇒ 连 R 失败链一并归零
+                    // （2026-10-18 评审：旧实现只在 R 成功时复位，M 救回后残留的
+                    // streak/since 会让久远之后的**一次** R 失败被误判成「连续 2 次」
+                    // 直接开 B 门——与「连续」语义不符）。
                     Some(Pending {
                         action: Action::Migrate,
                         ..
-                    })
-                    | None => {}
+                    }) => {
+                        self.r_fail_streak = 0;
+                        self.r_fail_since = None;
+                        self.r_attempts = 0;
+                    }
+                    None => {}
                 }
                 Step::Idle
             }
@@ -580,9 +587,6 @@ impl Ladder {
             }
             Action::Reconnect => {
                 self.r_attempts = self.r_attempts.saturating_add(1);
-                if self.r_fail_since.is_none() {
-                    self.r_fail_since = Some(now);
-                }
                 (*logf)(&format!(
                     "链路重连中（原因={why}，第 {} 次）",
                     self.r_attempts
@@ -1067,6 +1071,46 @@ mod tests {
         assert!(l.due(t0 + Duration::from_secs(1), true).is_none(), "在途 ⇒ 不起新轮");
         l.on_round(Round::First, ok(), t0, SendFace::default(), &lines().0);
         assert!(l.due(t0 + Duration::from_secs(2), true).is_some(), "收线后可再起");
+    }
+
+    /// 判据（M 救回即断链）：R 失败 → M 确认成功 ⇒ R 失败链归零；之后任何一次
+    /// R 失败都重新从 1 计数，不得凭陈旧 streak/since 直接开 B 门。
+    #[test]
+    fn migration_confirm_resets_reconnect_failure_chain() {
+        let (logf, _log) = lines();
+        let t0 = TokioInstant::now();
+        let mut l = Ladder::new(tuning());
+        // R 失败（streak=1；窗起点 = 失败时刻）
+        let s = l.on_reconnect_result(false, "对端不可达".to_owned(), t0, &logf);
+        assert!(matches!(s, Step::Migrate { .. }), "R 失败 ⇒ 另一动作（实得 {s:?}）");
+        assert_eq!(l.r_fail_streak, 1);
+        assert_eq!(l.r_fail_since, Some(t0), "窗起点 = 首次 R **失败**时刻");
+        // M 成功 → 确认探活通过
+        let s = l.on_migrate_result(true, t0, &logf);
+        assert!(matches!(s, Step::Probe { round: Round::Confirm, .. }));
+        l.note_round(Round::Confirm, t0);
+        assert_eq!(
+            l.on_round(
+                Round::Confirm,
+                ok(),
+                t0 + Duration::from_millis(10),
+                SendFace::default(),
+                &logf
+            ),
+            Step::Idle
+        );
+        assert_eq!(l.r_fail_streak, 0, "M 确认成功必须断链");
+        assert_eq!(l.r_fail_since, None);
+        assert_eq!(l.r_attempts, 0);
+        // 很久以后一次 R 失败：从 1 计数、窗重起，不得直达 B
+        let later = t0 + Duration::from_secs(3600);
+        let s = l.on_reconnect_result(false, "又一次".to_owned(), later, &logf);
+        assert!(
+            matches!(s, Step::Migrate { .. }),
+            "首次失败只能走另一动作（实得 {s:?}）"
+        );
+        assert_eq!(l.r_fail_streak, 1);
+        assert_eq!(l.r_fail_since, Some(later), "窗起点随新失败链重起");
     }
 
     /// **判据（B 之后休眠 + 重新武装，§3.1）**：B 上报后本世代不再重复上报；新连接采纳

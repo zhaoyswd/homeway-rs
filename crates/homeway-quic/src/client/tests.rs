@@ -1563,17 +1563,21 @@ async fn refresh_frames_reach_peer_and_log_c15_prime() {
 // ---------- 4. 迁移（rebind） ----------
 
 /// **判据（S2-3）**：`127.0.0.1:0` → `127.0.0.2:0` rebind 后
-/// ①连接未断 ②出口 `remote_address()` 变化（E-q2「路径变更」行）③收发继续（出口回程 ⇒
-/// 岛侧入站证据 ⇒ N-b 行）④**设备表不新增条目**（引擎桩 accepted 不增）。
+/// ①连接未断 ②出口 `remote_address()` 变化（E-q2「路径变更」行）③岛侧本地地址/换绑
+/// 计数更新 ④**设备表不新增条目**（引擎桩 accepted 不增）。
+///
+/// 2026-10-18 起**迁移保持窗退役**：`Cmd::Rebind` 只换 socket，路径可用性由随后的
+/// 阶梯确认快探/重赛跑定音（N-b 行只由阶梯 M 的确认探活产出），本用例不再等
+/// `migrations`。
 ///
 /// 源 IP 变化（不是换端口）⇒ 走协议的真迁移分支（`paths.rs` 的换 IP 分支）。
 #[tokio::test]
 async fn rebind_keeps_connection_and_peer_observes_new_path() {
     let quic = exit_face(7);
     let stub = Stub::new();
-    let (logf, logs) = sink();
+    let (logf, _logs) = sink();
     let island = island_with_log(
-        Duration::from_secs(3), // 迁移保持判据窗（够长：回环 PATH_RESPONSE 是亚秒级）
+        Duration::from_secs(3), // 巡检节拍（本用例不再依赖保持窗；保留短拍加速收工）
         quic.rpk_public_key(),
         Arc::clone(&logf),
     );
@@ -1628,20 +1632,16 @@ async fn rebind_keeps_connection_and_peer_observes_new_path() {
         crate::ExitSend::Handled,
         "出口侧出站必须已在 QUIC 面绑定（回程发往新路径）"
     );
+    // ③ 岛侧换绑落地（快照 200ms 节流内必须可见）+ 本地地址 = 新分配地址
     assert!(
-        wait_for(&stub, &quic, || island.snapshot().migrations >= 1, WAIT).await,
-        "岛必须在保持窗内确认迁移（入站证据 ⇒ N-b）"
+        wait_for(&stub, &quic, || island.snapshot().rebinds >= 1, WAIT).await,
+        "岛侧换绑命令必须落账（rebinds={}）",
+        island.snapshot().rebinds
     );
-
-    let lines = logs_until(&logs, "迁移完成（", WAIT).await;
-    let line = lines
-        .iter()
-        .find(|l| l.contains("迁移完成（"))
-        .expect("N-b 行在")
-        .clone();
     assert!(
-        line.contains(&to.to_string()) && line.contains(" → "),
-        "N-b 行含旧 → 新（新地址 = {to}）：{line}"
+        wait_for(&stub, &quic, || island.snapshot().local == Some(to), WAIT).await,
+        "岛侧本地地址必须更新为新地址（local={:?}，期望 {to}）",
+        island.snapshot().local
     );
 
     // ④ 出口设备表不新增条目 + 连接仍只有一条 + 岛侧 path 未清
@@ -1649,16 +1649,15 @@ async fn rebind_keeps_connection_and_peer_observes_new_path() {
     assert_eq!(quic.snapshot().connections, 1, "出口侧连接数不变");
     let snap = island.snapshot();
     assert_eq!(snap.via, Some(Via::Direct), "连接保持：{snap:?}");
-    assert!(!snap.migration_unconfirmed, "迁移已确认");
-    assert_eq!(snap.migrations, 1);
+    assert!(!snap.migration_unconfirmed, "无保持窗 ⇒ 不得置未确认位");
+    assert_eq!(snap.migrations, 0, "保持窗退役：Cmd::Rebind 不再产迁移完成计数");
 
     assert!(island.stop_within(Instant::now() + BUDGET));
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
 
-/// 迁移保持的**失败判据**面：无连接时 `rebind` 只是换 socket（不起保持窗），
-/// 且 `migration_unconfirmed` 保持清零——「N 拍无回包 ⇒ 未确认」的到点分支由
-/// `client::migration` 的纯逻辑用例覆盖（真路径无回包不可确定性构造）。
+/// 无连接时 `rebind` 只是换 socket：不产生迁移计数、也不置未确认位
+/// （2026-10-18 起保持窗整件退役，未确认位只由阶梯 M 的确认快探产出）。
 #[tokio::test]
 async fn rebind_without_connection_only_swaps_socket() {
     let quic = exit_face(8);
