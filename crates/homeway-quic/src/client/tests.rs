@@ -499,6 +499,7 @@ async fn connect_direct(island: &Island, stub: &Stub, quic: &ExitQuic) -> Socket
         |reply| Cmd::Connect {
             cands: vec![direct(addr)],
             budget: WAIT,
+            demote_adopted: false,
             reply,
         },
         WAIT,
@@ -572,6 +573,7 @@ async fn connect_registers_on_control_stream_and_logs_criteria_lines() {
         |reply| Cmd::Connect {
             cands: vec![direct(connectable(&quic))],
             budget: WAIT,
+            demote_adopted: false,
             reply,
         },
         WAIT,
@@ -648,6 +650,7 @@ async fn admission_rejection_carries_code_line_and_snapshot_fields() {
             |reply| Cmd::Connect {
                 cands: vec![direct(addr)],
                 budget: WAIT,
+                demote_adopted: false,
                 reply,
             },
             WAIT,
@@ -735,6 +738,7 @@ async fn race_picks_first_completer_among_dead_candidates() {
             // 死候选夹在活候选两侧：胜者必须是「活」的那条（不是位置效应）
             cands: vec![cand_a, direct(alive_addr), cand_b],
             budget,
+            demote_adopted: false,
             reply,
         },
         WAIT,
@@ -800,6 +804,7 @@ async fn relay_candidate_wins_through_envelope_and_downlink_is_stripped() {
         |reply| Cmd::Connect {
             cands: vec![dead, Candidate { addr: relay.addr, via: Via::Relay { label } }],
             budget: Duration::from_secs(5),
+            demote_adopted: false,
             reply,
         },
         WAIT,
@@ -896,6 +901,7 @@ async fn direct_first_wins_with_direct_before_unlock_and_relay_unused() {
                 },
             ],
             budget: Duration::from_secs(3),
+            demote_adopted: false,
             reply,
         },
         WAIT,
@@ -964,6 +970,7 @@ async fn direct_first_unlocks_relay_after_window_expiry() {
                 },
             ],
             budget: Duration::from_secs(3),
+            demote_adopted: false,
             reply,
         },
         WAIT,
@@ -1030,6 +1037,7 @@ async fn direct_first_unlocks_early_when_all_direct_fail() {
                 },
             ],
             budget: Duration::from_secs(3),
+            demote_adopted: false,
             reply,
         },
         WAIT,
@@ -1084,6 +1092,7 @@ async fn relay_only_candidates_are_dialed_without_window_wait() {
                 via: Via::Relay { label },
             }],
             budget: Duration::from_secs(3),
+            demote_adopted: false,
             reply,
         },
         WAIT,
@@ -1136,6 +1145,7 @@ async fn zero_window_dials_all_candidates_at_once() {
                 },
             ],
             budget: Duration::from_secs(3),
+            demote_adopted: false,
             reply,
         },
         WAIT,
@@ -1187,6 +1197,7 @@ async fn unlocked_relay_enters_unfinished_when_it_never_completes() {
         |reply| Cmd::Connect {
             cands: vec![dead, relay_cand],
             budget: Duration::from_millis(800),
+            demote_adopted: false,
             reply,
         },
         WAIT,
@@ -1249,6 +1260,7 @@ async fn race_all_dead_reports_no_candidate() {
         |reply| Cmd::Connect {
             cands: vec![c1, c2],
             budget,
+            demote_adopted: false,
             reply,
         },
         WAIT,
@@ -1274,6 +1286,7 @@ async fn race_all_dead_reports_no_candidate() {
         |reply| Cmd::Connect {
             cands: Vec::new(),
             budget,
+            demote_adopted: false,
             reply,
         },
         WAIT,
@@ -1301,6 +1314,7 @@ async fn wrong_pin_aborts_handshake_without_winner() {
         |reply| Cmd::Connect {
             cands: vec![direct(addr)],
             budget: Duration::from_millis(900),
+            demote_adopted: false,
             reply,
         },
         WAIT,
@@ -1331,6 +1345,7 @@ async fn connect_while_racing_is_rejected_and_stop_is_prompt() {
         .send(Cmd::Connect {
             cands: vec![dead],
             budget: Duration::from_secs(30), // 长预算：确保「在途」窗口足够观察
+            demote_adopted: false,
             reply: tx1,
         })
         .expect("投递第一轮赛跑");
@@ -1341,6 +1356,7 @@ async fn connect_while_racing_is_rejected_and_stop_is_prompt() {
         |reply| Cmd::Connect {
             cands: vec![dead],
             budget: Duration::from_millis(100),
+            demote_adopted: false,
             reply,
         },
         Duration::from_secs(2),
@@ -1420,6 +1436,7 @@ async fn admission_budget_floor_fails_with_explicit_close() {
         |reply| Cmd::Connect {
             cands: vec![direct(addr)],
             budget: Duration::from_millis(1500), // 赛跑吃光 ⇒ 剩余 ≪ ADMIT_MIN
+            demote_adopted: false,
             reply,
         },
         WAIT,
@@ -1512,6 +1529,7 @@ async fn refresh_frames_reach_peer_and_log_c15_prime() {
         |reply| Cmd::Connect {
             cands: vec![direct(addr)],
             budget: WAIT,
+            demote_adopted: false,
             reply,
         },
         WAIT,
@@ -1567,6 +1585,7 @@ async fn rebind_keeps_connection_and_peer_observes_new_path() {
         |reply| Cmd::Connect {
             cands: vec![direct(addr)],
             budget: WAIT,
+            demote_adopted: false,
             reply,
         },
         WAIT,
@@ -1699,6 +1718,7 @@ async fn probe_reports_alive_then_connection_lost() {
         |reply| Cmd::Connect {
             cands: vec![direct(addr)],
             budget: WAIT,
+            demote_adopted: false,
             reply,
         },
         WAIT,
@@ -1764,6 +1784,7 @@ async fn probe_fails_when_peer_silently_gone() {
         |reply| Cmd::Connect {
             cands: vec![direct(addr)],
             budget: WAIT,
+            demote_adopted: false,
             reply,
         },
         WAIT,
@@ -1793,6 +1814,75 @@ async fn probe_fails_when_peer_silently_gone() {
     assert!(
         last.is_err(),
         "对端消失后判活必须失败（不误报活）：{last:?}"
+    );
+    assert!(island.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（评审 r3 B7——真实并发探活路径）**：两路并发 `Cmd::Probe` 的槽位争用——
+/// 第一路持住 probe 槽（黑洞出口 ⇒ 无 close 帧、连接不被判死 ⇒ 回显永不到达 ⇒
+/// 持满预算），第二路在**拿锁预算内**拿不到槽 ⇒ typed `IslandErr::ProbeBusy`
+/// （facade 侧 `quick_probe_classify` 映射 `ProbeFail::Busy` ⇒ stats 不累积连败）。
+/// 持槽的第一路自身按普通失败收口（`ProbeNoResponse`/`ConnectionLost`——**非** Busy：
+/// 拿到了槽只是没证据）。此前该形态与 `ProbeNoResponse` 同串，stats 会把
+/// 「worker 刚好结束后的槽超时」计入连败。
+#[tokio::test]
+async fn probe_slot_contention_yields_typed_probe_busy() {
+    let quic = exit_face(21);
+    let stub = Stub::new();
+    let island = island_with(Duration::from_secs(60), quic.rpk_public_key());
+    let addr = connectable(&quic);
+    let _ = send_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::Connect {
+            cands: vec![direct(addr)],
+            budget: WAIT,
+            demote_adopted: false,
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .expect("登记成功");
+    // 黑洞出口（socket 消失、无 close 帧——b_gate_zombie 同款构造：连接半死，
+    // `check(conn)` 过 ⇒ 第一路能拿到槽并持满预算）。
+    quic.stop();
+
+    // 第一路：大预算探活——持住槽位（回显黑洞 ⇒ echo_once 挂满预算才放）。
+    let (tx1, rx1) = channel();
+    island
+        .tx()
+        .send(Cmd::Probe {
+            budget: Duration::from_secs(3),
+            reply: tx1,
+        })
+        .expect("命令投递（unbounded）");
+    // 让第一路先拿到槽（check + 拿锁 + open_bi 均本地完成——回环上毫秒级）。
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    // 第二路：小预算——拿锁预算（300ms）< 第一路持槽余量（~2.8s）⇒ 槽位争用。
+    let (tx2, rx2) = channel();
+    island
+        .tx()
+        .send(Cmd::Probe {
+            budget: Duration::from_millis(300),
+            reply: tx2,
+        })
+        .expect("命令投递（unbounded）");
+    let r2 = rx2.recv_timeout(Duration::from_secs(2)).expect("第二路必须回执");
+    assert!(
+        matches!(r2, Err(IslandErr::ProbeBusy)),
+        "槽位争用必须归 typed ProbeBusy（非对端证据）：{r2:?}"
+    );
+    // 持槽的第一路按普通失败收口（拿到了槽、只是无证据——不是 Busy）。
+    let r1 = rx1.recv_timeout(Duration::from_secs(6)).expect("第一路必须回执");
+    assert!(
+        matches!(
+            r1,
+            Err(IslandErr::ProbeNoResponse) | Err(IslandErr::ConnectionLost)
+        ),
+        "持槽一路归普通失败（无对端证据），不得混入 Busy：{r1:?}"
     );
     assert!(island.stop_within(Instant::now() + BUDGET));
 }
@@ -1860,6 +1950,7 @@ async fn drop_counters_events_and_nc_line() {
         |reply| Cmd::Connect {
             cands: vec![direct(addr)],
             budget: WAIT,
+            demote_adopted: false,
             reply,
         },
         WAIT,
@@ -1904,6 +1995,7 @@ async fn set_candidates_is_used_when_connect_has_none() {
         |reply| Cmd::Connect {
             cands: Vec::new(),
             budget: WAIT,
+            demote_adopted: false,
             reply,
         },
         WAIT,
@@ -1930,6 +2022,7 @@ async fn send_after_stop_is_engine_gone() {
         .send(Cmd::Connect {
             cands: Vec::new(),
             budget: Duration::from_millis(1),
+            demote_adopted: false,
             reply: tx,
         })
         .is_err()
@@ -2217,6 +2310,7 @@ async fn return_pump_restarts_after_connection_replacement() {
         |reply| Cmd::Connect {
             cands: vec![direct(addr2)],
             budget: WAIT,
+            demote_adopted: false,
             reply,
         },
         WAIT,
@@ -3251,6 +3345,7 @@ async fn ladder_exhaustion_then_connect_rebuilds_and_r_uses_roster() {
         |reply| Cmd::Connect {
             cands: vec![direct(addr), direct(dead)],
             budget: WAIT,
+            demote_adopted: false,
             reply,
         },
         WAIT,
@@ -3267,3 +3362,164 @@ async fn ladder_exhaustion_then_connect_rebuilds_and_r_uses_roster() {
     assert!(island.stop_within(Instant::now() + BUDGET));
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
+
+    // =========================================================================
+    // reconnect-oneshot 1.1（评审 r1 P1-12 整改）：driver 载面沿逐沿行为测试
+    // —— adopt / housekeeping 断开 / B 门僵尸收口 / 收工 四沿的 carrier 同步 +
+    // adopt 沿回调（P1-7 的岛侧半边；facade 半边 = tun_shared 的
+    // `on_adopt_clears_residual_patrol`）。
+    // =========================================================================
+
+    /// **判据（1.1 逐沿）**：承载位随连接生命周期同步——①采纳成功 ⇒ true +
+    /// on_adopt 回调恰一次（**置 true 沿经 on_adopt 完成**——评审 r2 B2④：driver
+    /// 不再直写 carrier，本用例的回调镜像 facade 装配 `on_adopt_if_current` 的行为：
+    /// 计数 + `mark_alive`）；②出口摘绑定（连接死，housekeeping 判定）⇒ false；
+    /// ③阶梯终局（重连成功再 adopt；B 门 rebuild 分支 `drop_zombie_live` 的
+    /// mark_dead 由 `b_gate_zombie_closure_marks_carrier_dead` **确定性**覆盖——
+    /// 评审 r2 B7：本用例③此前「二选一」接受，rebuild 赢时僵尸沿未被断言）；
+    /// ④岛收工 ⇒ false。终局窗口 25s（B 门 = 连续 2 次 R 失败 + 窗 ≥10s，与
+    /// `connection_death_goes_to_the_ladder_instead_of_unhealthy` 同口径）。
+    /// 「刷新失败」沿（housekeeping ②）与「连接死」沿共用同一 `mark_dead` 调用
+    /// 形态（driver 相邻代码位）——无独立注入缝，不在本用例单独构造（登记于
+    /// tier devlog 评审整改节）。
+    #[tokio::test]
+    async fn carrier_flag_follows_connection_lifecycle_edges() {
+        use std::sync::atomic::AtomicUsize;
+
+        let quic = exit_face(41);
+        let stub = Stub::new();
+        let (logf, logs) = sink();
+        let carrier = Arc::new(crate::cmd::CarrierFlag::new());
+        let adopts = Arc::new(AtomicUsize::new(0));
+        let mut cfg = island_cfg(Duration::from_secs(60), quic.rpk_public_key());
+        cfg.carrier = Some(Arc::clone(&carrier));
+        let adopts2 = Arc::clone(&adopts);
+        let carrier2 = Arc::clone(&carrier);
+        // 镜像 facade 装配（生产 = `TunShared::on_adopt_if_current`：锁内置
+        // carrier true + 清残留 patrol）——B2④ 后本回调是置 true 的唯一路径。
+        cfg.on_adopt = Some(Arc::new(move || {
+            adopts2.fetch_add(1, Ordering::SeqCst);
+            let _ = carrier2.mark_alive();
+        }));
+        let island = Island::start(logf, Arc::new(|_r: &str| {}), cfg).expect("岛可起");
+        // 阶梯只在 TUN 在位后跑 ⇒ 附加数据面（B 门终局需要）
+        let (tun, _peer) = tun_pair();
+        assert!(matches!(attach(&island, tun.as_raw_fd(), 1280, BUDGET), Ok(())));
+
+        // ① adopt 沿：连上真出口 ⇒ carrier true + on_adopt 恰一次
+        assert!(!carrier.alive(), "起始 false（岛未采纳）");
+        connect_direct(&island, &stub, &quic).await;
+        let deadline = Instant::now() + WAIT;
+        while !carrier.alive() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(carrier.alive(), "adopt 后承载位置 true");
+        assert_eq!(adopts.load(Ordering::SeqCst), 1, "on_adopt 回调恰一次（随采纳）");
+
+        // ② housekeeping 断开沿：出口摘绑定 ⇒ CONNECTION_CLOSE ⇒ carrier false
+        quic.unbind_pub(&PUBKEY);
+        let deadline = Instant::now() + WAIT;
+        while carrier.alive() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!carrier.alive(), "连接死（housekeeping 判定）⇒ 承载位拉 false");
+
+        // ③ 终局：重连成功（adopt 再置 true、回调再 +1）或 B 门（ladder_action
+        //    = rebuild——drop_zombie_live 前置 mark_dead，幂等保持 false）。
+        let deadline = Instant::now() + Duration::from_secs(25);
+        let mut terminal = false;
+        while Instant::now() < deadline {
+            let snap = island.snapshot();
+            if snap.connections == 1 && carrier.alive() {
+                terminal = true;
+                break;
+            }
+            if snap.ladder_action == "rebuild" && !carrier.alive() {
+                terminal = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(terminal, "阶梯必须有终局（重连或 B 门）——carrier 与之同步");
+
+        // ④ 收工沿：手工置 true（制造「收工前置 true」形态）⇒ 岛收工拉 false
+        carrier.mark_alive();
+        assert!(island.stop_within(Instant::now() + BUDGET), "预算内收工");
+        let deadline = Instant::now() + BUDGET;
+        while carrier.alive() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(!carrier.alive(), "岛收工 ⇒ 承载位 false（收工沿）");
+        assert!(quic.stop_within(Instant::now() + BUDGET));
+        drop(logs); // 日志面只作现场留痕（判据 = carrier 与连接状态同步）
+    }
+
+    /// **判据（评审 r2 B7——B 门僵尸沿确定性覆盖）**：`drop_zombie_live` 的
+    /// `mark_dead` + 僵尸收口行——**带着 live 进场**的确定性构造：采纳后**全停**
+    /// 出口（socket 消失、无 close 帧 ⇒ 连接不被 QUIC 判死——半死态：发送面黑洞），
+    /// 持续写 TUN 包保「在用档」背靠背探活 ⇒ 探活/重连必败 ⇒ 连续 2 次 R 失败且
+    /// 窗 ≥10s ⇒ B 门 `ladder_action == "rebuild"`（该状态只在 rebuild 臂写——
+    /// 到达即 `drop_zombie_live` 已执行）。此前 `carrier_flag_follows_
+    /// connection_lifecycle_edges` ③以「重连成功或 B 门」二选一收口；且以 unbind
+    /// 构造的 B 门（`ladder_exhaustion_then_connect_rebuilds_and_r_uses_roster`）
+    /// 连接先被 housekeeping 判死收走——僵尸体早退、不落行（INTEROP 2026-10-14 的
+    /// 「桩上不可复现」登记由此解除：全停出口 = 黑洞旋钮的本地等价物）。
+    #[tokio::test]
+    async fn b_gate_zombie_closure_marks_carrier_dead() {
+        let quic = exit_face(42);
+        let stub = Stub::new();
+        let (logf, logs) = sink();
+        let carrier = Arc::new(crate::cmd::CarrierFlag::new());
+        let mut cfg = island_cfg(Duration::from_millis(200), quic.rpk_public_key());
+        cfg.carrier = Some(Arc::clone(&carrier));
+        let carrier2 = Arc::clone(&carrier);
+        cfg.on_adopt = Some(Arc::new(move || {
+            let _ = carrier2.mark_alive();
+        }));
+        let island = Island::start(logf, Arc::new(|_r: &str| {}), cfg).expect("岛可起");
+        let (tun, peer) = tun_pair();
+        assert!(matches!(attach(&island, tun.as_raw_fd(), 1280, BUDGET), Ok(())));
+
+        // 前置：真采纳（carrier true——经 on_adopt 回调，B2④）
+        connect_direct(&island, &stub, &quic).await;
+        let deadline = Instant::now() + WAIT;
+        while !carrier.alive() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(carrier.alive(), "前置：采纳后承载位 true");
+
+        // 全停出口 + 持续写包（在用档背靠背探活）⇒ M/R 走完 ⇒ B 门（live 仍在场）
+        quic.stop();
+        let pkt = inner_pkt(Ipv4Addr::new(10, 1, 0, 2), Ipv4Addr::new(10, 1, 0, 1));
+        let deadline = Instant::now() + Duration::from_secs(40);
+        loop {
+            let _ = peer.send(&pkt); // 在用档（出站新鲜窗 5s）——探活背靠背
+            if island.snapshot().ladder_action == "rebuild" {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "B 门必须到达（探活/重连必败——出口已黑洞）；ladder_action={:?} carrier={}",
+                island.snapshot().ladder_action,
+                carrier.alive()
+            );
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        assert!(
+            !carrier.alive(),
+            "drop_zombie_live ⇒ mark_dead（僵尸沿——半死连接的承载位在 B 门收口拉假）"
+        );
+        // 僵尸收口行（v5 行文——评审 r2 P2 改名后的判据串）
+        let deadline = Instant::now() + BUDGET;
+        let mut saw_line = false;
+        while Instant::now() < deadline {
+            if drain_logs(&logs).iter().any(|l| l.contains("B 门僵尸收口")) {
+                saw_line = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(saw_line, "B 门僵尸收口判据行在场（live 进场形态）");
+        assert!(island.stop_within(Instant::now() + BUDGET));
+        drop(logs);
+    }

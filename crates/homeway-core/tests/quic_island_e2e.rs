@@ -181,6 +181,7 @@ fn island_connects_registers_and_survives_rebind_against_local_exit() {
         |reply| Cmd::Connect {
             cands: cands.clone(),
             budget: Duration::from_secs(5),
+            demote_adopted: false,
             reply,
         },
         Duration::from_secs(10),
@@ -428,6 +429,7 @@ fn island_uses_relay_and_pushes_traffic_through_tun() {
                 via: Via::Relay { label },
             }],
             budget: Duration::from_secs(5),
+            demote_adopted: false,
             reply,
         },
         Duration::from_secs(15),
@@ -707,6 +709,7 @@ fn connect_local_exit() -> (Island, Vec<u8>) {
         |reply| Cmd::Connect {
             cands,
             budget: Duration::from_secs(5),
+            demote_adopted: false,
             reply,
         },
         Duration::from_secs(10),

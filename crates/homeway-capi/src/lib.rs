@@ -159,7 +159,10 @@ pub extern "C" fn ClientCoreTunStop() -> std::os::raw::c_int {
     guard(|| core().tun_stop(), || -9)
 }
 
-/// ClientCoreTunRecover：恢复阶梯下推（from = 起跑档位 1..=3）。
+/// ClientCoreTunRecover：恢复下推统一入口（from = 入参留痕 1..=3：1 唤醒 / 3 换网 /
+/// 2 及其余按唤醒归并——reconnect-oneshot r8-R6）。rc：0 = 同步快探成功 /
+/// -1 = 已尝试但结果未知（受理/合并/承接/起跑失败）/ -2 = 无隧道/陈世代/设备死或
+/// 停止 / -9 = NAPI 壳异常（guard 兜底；-3/-4 = legacy 不可达）。
 #[no_mangle]
 pub extern "C" fn ClientCoreTunRecover(from: std::os::raw::c_int) -> std::os::raw::c_int {
     guard(|| core().tun_recover(from as i64), || -9)

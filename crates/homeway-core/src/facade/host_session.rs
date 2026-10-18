@@ -417,6 +417,7 @@ impl HostSession {
             |reply| Cmd::Connect {
                 cands: cands.clone(),
                 budget: CONNECT_BUDGET,
+                demote_adopted: false,
                 reply,
             },
             CONNECT_BUDGET + RPC_BUDGET,
@@ -824,7 +825,12 @@ fn rebuild_loop(inner: Arc<Inner>) {
         let cands = inner.cands.clone();
         match island_cmd(
             &island,
-            |reply| Cmd::Connect { cands, budget: CONNECT_BUDGET, reply },
+            |reply| Cmd::Connect {
+                cands,
+                budget: CONNECT_BUDGET,
+                demote_adopted: false,
+                reply,
+            },
             CONNECT_BUDGET + RPC_BUDGET,
         ) {
             Ok(o) => {

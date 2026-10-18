@@ -22,7 +22,7 @@ use std::sync::mpsc::{sync_channel, Receiver, SyncSender, TrySendError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use crate::cmd::{Cmd, Logf};
+use crate::cmd::{CarrierFlag, Cmd, Logf, OnPacketDemand};
 use crate::driver::IslandTx;
 
 /// TUN 读线程名（与 `wgcore` 的 `homeway-tun-read` 同形）。
@@ -262,11 +262,17 @@ impl ReturnPath {
 }
 
 /// 起 TUN 读线程（**分离**——不等 join；退出面见模块头）。
+///
+/// `carrier`/`on_demand`（reconnect-oneshot D2）：读线程见到出站包且承载位 false 时
+/// 就地触发统一重连入口——**只允许原子操作 + 起线程，禁日志禁锁禁阻塞**（契约严于
+/// 岛回调）。`None` = 无承载面（测试/宿主形态——读面零触发）。
 pub(crate) fn spawn_reader(
     fd: crate::sysio::RawIo,
     tx: IslandTx,
     counters: Arc<TunCounters>,
     logf: Logf,
+    carrier: Option<Arc<CarrierFlag>>,
+    on_demand: Option<OnPacketDemand>,
 ) -> io::Result<()> {
     let blocking = set_blocking_read(fd, &logf);
     (*logf)(&format!(
@@ -279,7 +285,7 @@ pub(crate) fn spawn_reader(
     ));
     std::thread::Builder::new()
         .name(READ_THREAD.into())
-        .spawn(move || read_loop(fd, tx, counters, logf))?;
+        .spawn(move || read_loop(fd, tx, counters, logf, carrier, on_demand))?;
     Ok(())
 }
 
@@ -447,6 +453,10 @@ fn poll_reports_event(r: &Ready) -> bool {
 
 /// 读循环（应用出站方向）：裸 read → 计数 → `Cmd::TunPacket` 投岛。
 ///
+/// - **读面需求触发（reconnect-oneshot D2）**：成功 read 之后、packet-info 剥离与
+///   在途闸/队满判定**之前**——承载位 false 时无论该包最终是否被丢都必须触发
+///   （队满丢弃路径不得吞掉触发，恰是 2026-10-17 事故形态；r3-R2）。先自增载位假包
+///   计数、再调回调（回调 = facade 的 `Weak<GenRun>` 升级 + 统一入口，全程原子）；
 /// - OHOS 的 VPN fd 是**非阻塞**的（`wgcore` 真机实证；`spawn_reader` 会先尝试
 ///   `set_blocking_read`，不可清时落「非阻塞读 + poll」回退形态——OHOS 即此）⇒
 ///   EAGAIN 走 poll(POLLIN, 一片)；
@@ -457,7 +467,14 @@ fn poll_reports_event(r: &Ready) -> bool {
 ///   收工——poll 对恒可读 fd 电平触发立即返回，等待不可实现（零 sleep 铁律）；
 /// - 投包失败（岛已收工/通道断）⇒ **自退**（M0 设计 §3.6-2④；不重试、不挂死）；
 /// - fd 读错 ⇒ 记行 + `TunFdDead`（岛侧打 `fd` 分类）+ 退出。
-fn read_loop(fd: crate::sysio::RawIo, tx: IslandTx, counters: Arc<TunCounters>, logf: Logf) {
+fn read_loop(
+    fd: crate::sysio::RawIo,
+    tx: IslandTx,
+    counters: Arc<TunCounters>,
+    logf: Logf,
+    carrier: Option<Arc<CarrierFlag>>,
+    on_demand: Option<OnPacketDemand>,
+) {
     let mut buf = vec![0u8; 65535];
     let mut pending_drops: u64 = 0;
     let mut stuck = StuckReadGuard::default();
@@ -550,6 +567,16 @@ fn read_loop(fd: crate::sysio::RawIo, tx: IslandTx, counters: Arc<TunCounters>, 
             continue;
         }
         stuck.note_progress(); // 取得数据：僵死链断
+        // ---- 读面需求触发（reconnect-oneshot D2：成功 read 之后、PI 剥离与在途闸/
+        // 队满判定之前——队满丢弃路径不得吞掉触发）----
+        if let Some(c) = &carrier {
+            if !c.alive() {
+                c.bump_demand_pkt(); // 载位假包 P（调入口前自增——r4-R16）
+                if let Some(cb) = &on_demand {
+                    cb(); // 契约：只允许原子操作 + 起线程（禁日志禁锁禁阻塞）
+                }
+            }
+        }
         let mut n = n;
         // packet-info 头自动探测（镜像 `wgcore` 的 r2-L4：4 字节 PI + 合法 IP 版本号才剥）
         let looks_like_pi = n >= 5
@@ -670,8 +697,10 @@ mod tests {
     use std::io::{Read as _, Write as _};
     use std::os::fd::AsRawFd;
     use std::os::unix::net::UnixStream;
+    use std::sync::atomic::AtomicUsize;
 
     use super::*;
+    use crate::cmd::OnPacketDemand;
 
     /// 测试用投递口（无接收者——写线程的 `TunFdDead` 投递恒失败，与「岛已收工」同面；
     /// `#[cfg(test)]` 缝定义在 `driver.rs`，本文件不命名异步栈类型）。
@@ -737,7 +766,7 @@ mod tests {
         let counters = TunCounters::new();
         let logf = Arc::new(|_s: &str| {}) as Logf;
         let h = std::thread::spawn(move || {
-            read_loop(a.as_raw_fd(), cmd_tx(), counters, logf);
+            read_loop(a.as_raw_fd(), cmd_tx(), counters, logf, None, None);
         });
         // 隔离门层 3 禁 std::thread::sleep（全文件面——含测试）：用有界让权等待
         // 走完同样的墙钟窗（测试线程自旋 700ms 可接受；读环停泊无外部可观测信号，
@@ -904,5 +933,228 @@ mod tests {
             PushOutcome::Gone,
             "写线程已退 ⇒ 必须归 `Gone`（不得与「队列满」混同）"
         );
+    }
+
+    // ==========================================================================
+    // reconnect-oneshot 1.2：读面需求触发（socketpair 直测——成功 read 之后、PI 剥离
+    // 与在途闸/队满判定之前）
+    // ==========================================================================
+
+    /// 触发计数面（回调 + 载位假包 P）。
+    fn demand_face() -> (Arc<CarrierFlag>, Arc<AtomicUsize>, OnPacketDemand) {
+        let carrier = CarrierFlag::new();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h2 = Arc::clone(&hits);
+        let cb: OnPacketDemand = Arc::new(move || {
+            h2.fetch_add(1, Ordering::SeqCst);
+        });
+        (carrier, hits, cb)
+    }
+
+    /// **判据（1.2）**：无承载包（carrier=true）⇒ 回调 0 次；健康突发（在途额满丢弃
+    /// 形态）⇒ 仍 0 次（判定只认承载位，不认队列丢弃）。
+    #[test]
+    fn no_trigger_while_carrier_alive_even_under_burst() {
+        let (a, b) = UnixStream::pair().expect("socketpair");
+        let (carrier, _hits, cb) = demand_face();
+        carrier.mark_alive();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h2 = Arc::clone(&hits);
+        let cb2: OnPacketDemand = Arc::new(move || {
+            h2.fetch_add(1, Ordering::SeqCst);
+        });
+        // 灌满**读线程用的**在途闸（4096）——队满丢弃形态（死通道不发包，reader 存活）
+        let counters = TunCounters::new();
+        for _ in 0..CMD_INFLIGHT_MAX {
+            assert!(counters.try_begin_send());
+        }
+        let logf = Arc::new(|_s: &str| {}) as Logf;
+        let fd = a.as_raw_fd();
+        let carrier2 = Arc::clone(&carrier);
+        let h = std::thread::spawn(move || {
+            read_loop(fd, cmd_tx(), counters, logf, Some(carrier2), Some(cb2));
+        });
+        let pkt = [0x45u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2];
+        for _ in 0..100 {
+            let _ = (&b).write_all(&pkt); // socketpair：写 b ⇒ a 端可读
+        }
+        std::thread::sleep(Duration::from_millis(300));
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "承载在位 ⇒ 零回调（含队满丢弃）");
+        assert_eq!(carrier.demand_pkts(), 0, "载位假包 P 不增");
+        // 收口：关闭对端让读循环退出
+        drop(b);
+        drop(a);
+        let _ = h.join();
+        let _ = cb;
+    }
+
+    /// **判据（1.2 / r3-R2 事故形态）**：承载 false + 队满 ⇒ **仍回调**（触发先于
+    /// 在途闸/队满判定——队满丢弃路径不得吞掉触发）。
+    #[test]
+    fn carrier_false_triggers_even_when_inflight_gate_full() {
+        let (a, b) = UnixStream::pair().expect("socketpair");
+        let (carrier, hits, cb) = demand_face();
+        // carrier 保持 false（新装配态）——灌满**读线程用的**在途闸（4096）模拟队满
+        let counters = TunCounters::new();
+        for _ in 0..CMD_INFLIGHT_MAX {
+            assert!(counters.try_begin_send());
+        }
+        let logf = Arc::new(|_s: &str| {}) as Logf;
+        let fd = a.as_raw_fd();
+        let carrier2 = Arc::clone(&carrier);
+        let h = std::thread::spawn(move || {
+            read_loop(fd, cmd_tx(), counters, logf, Some(carrier2), Some(cb));
+        });
+        let pkt = [0x45u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2];
+        for _ in 0..10 {
+            let _ = (&b).write_all(&pkt); // socketpair：写 b ⇒ a 端可读
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while hits.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(hits.load(Ordering::SeqCst) > 0, "承载 false + 队满 ⇒ 仍触发（每包）");
+        assert!(carrier.demand_pkts() > 0, "载位假包 P 计数（调入口前自增）");
+        drop(b);
+        drop(a);
+        let _ = h.join();
+    }
+
+    /// **判据（1.2）**：早于 attach 的包不丢触发（回调先于读线程装好——SetOnPacketDemand
+    /// 在 TunAttach 前发送的 FIFO 保证面；等价注入：包先入 socket 缓冲、读循环后起）。
+    #[test]
+    fn packets_queued_before_reader_start_still_trigger() {
+        let (a, b) = UnixStream::pair().expect("socketpair");
+        let (carrier, hits, cb) = demand_face();
+        // 先写包（读线程未起——「早于 attach」的等价形态）
+        let pkt = [0x45u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2];
+        (&b).write_all(&pkt).expect("先写一包（socketpair：写 b ⇒ a 端可读）");
+        let counters = TunCounters::new();
+        let logf = Arc::new(|_s: &str| {}) as Logf;
+        let fd = a.as_raw_fd();
+        let carrier2 = Arc::clone(&carrier);
+        let h = std::thread::spawn(move || {
+            read_loop(fd, cmd_tx(), counters, logf, Some(carrier2), Some(cb));
+        });
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while hits.load(Ordering::SeqCst) == 0 && Instant::now() < deadline {
+            std::thread::yield_now();
+        }
+        assert!(hits.load(Ordering::SeqCst) > 0, "早于读线程的包仍触发");
+        drop(b);
+        drop(a);
+        let _ = h.join();
+    }
+
+    /// **判据（1.2 回调契约）**：在飞期间 10k 包只计数、读路径有界完成（回调内 sleep
+    /// 判负——生产回调只做原子操作 + 起线程；本用例以时间上界钉「不因回调阻塞」）。
+    #[test]
+    fn ten_k_packets_with_stub_callback_complete_bounded() {
+        let (a, b) = UnixStream::pair().expect("socketpair");
+        let (carrier, hits, cb) = demand_face();
+        // 灌满在途闸：包走「计数丢弃」形态（死通道不发包——reader 存活吃完全量）
+        let counters = TunCounters::new();
+        for _ in 0..CMD_INFLIGHT_MAX {
+            assert!(counters.try_begin_send());
+        }
+        let logf = Arc::new(|_s: &str| {}) as Logf;
+        let fd = a.as_raw_fd();
+        let carrier2 = Arc::clone(&carrier);
+        let h = std::thread::spawn(move || {
+            read_loop(fd, cmd_tx(), counters, logf, Some(carrier2), Some(cb));
+        });
+        let pkt = [0x45u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2];
+        let t0 = Instant::now();
+        let writer = std::thread::spawn(move || {
+            for _ in 0..10_000 {
+                let _ = (&b).write_all(&pkt); // socketpair：写 b ⇒ a 端可读（缓冲小于
+                // 200KB ⇒ writer 与 reader 流水线推进）
+            }
+            b
+        });
+        let b = writer.join().expect("writer 收口");
+        // 对端关闭 ⇒ EOF——reader 排空缓冲后经判死路径退出（join 即「全量处理完」）
+        drop(b);
+        h.join().expect("reader 收口");
+        // socketpair 是**流**语义（多次 write 会并读合并）——精确包数不可断言；钉三件：
+        // ①全量字节被排空（join 完成 = EOF 前 200KB 读尽）；②每次 read 都触发且 P
+        // 与之相等；③全程有界（回调只做原子操作——读路径不因触发阻塞）。
+        assert!(hits.load(Ordering::SeqCst) >= 1, "触发发生过");
+        assert_eq!(
+            carrier.demand_pkts(),
+            hits.load(Ordering::SeqCst) as u64,
+            "P 与 read 次数一致（每次 read 都判定触发）"
+        );
+        assert!(
+            hits.load(Ordering::SeqCst) < 10_000,
+            "流合并形态：read 次数少于 write 次数（每次 read 触发恰一次——不重复）"
+        );
+        // 评审 r1 P1-12 整改：耗时上界收紧（30s → 10s——原子-only 回调的读路径在
+        // socketpair 流水线下应为秒级；30s 缓冲过大、抓不住半阻塞退化）。
+        assert!(
+            t0.elapsed() < Duration::from_secs(10),
+            "读路径有界完成（实测 {:?}）",
+            t0.elapsed()
+        );
+        drop(a);
+    }
+
+    /// **判据（1.2 负例注入，评审 r1 P1-12 整改）**：回调内 sleep 在读路径耗时上
+    /// **可观测**——「回调内阻塞判负」的等价面：生产回调若违背「只做原子操作 +
+    /// 起线程」契约，读循环耗时随之增长。socketpair 是**流**语义（快写会并读合并）
+    /// ⇒ 逐包 sleep 观测不到；本用例以「writer 与 reader 逐包握手」（写一包等
+    /// 回调计数 +1 再写下一包）消除合并，20 包 × 10ms ⇒ ≥150ms 下界钉「回调确实
+    /// 在读路径上逐次执行、无掩蔽」；上界同设防挂死。
+    #[test]
+    fn blocking_callback_slows_read_path_per_read() {
+        let (a, b) = UnixStream::pair().expect("socketpair");
+        let carrier = CarrierFlag::new();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h2 = Arc::clone(&hits);
+        let cb: OnPacketDemand = Arc::new(move || {
+            std::thread::sleep(Duration::from_millis(10)); // 违约回调（负例注入）
+            h2.fetch_add(1, Ordering::SeqCst);
+        });
+        let counters = TunCounters::new();
+        for _ in 0..CMD_INFLIGHT_MAX {
+            assert!(counters.try_begin_send());
+        }
+        let logf = Arc::new(|_s: &str| {}) as Logf;
+        let fd = a.as_raw_fd();
+        let h = std::thread::spawn(move || {
+            read_loop(fd, cmd_tx(), counters, logf, Some(carrier), Some(cb));
+        });
+        let pkt = [0x45u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2];
+        let t0 = Instant::now();
+        let hits_w = Arc::clone(&hits);
+        let writer = std::thread::spawn(move || {
+            let mut seen = 0usize;
+            for _ in 0..20 {
+                let _ = (&b).write_all(&pkt);
+                // 逐包握手：等本包的回调发生后再写下一包（消除流合并——每次 read
+                // 恰一包、阻塞回调的耗时逐次累加进读路径）
+                let deadline = Instant::now() + Duration::from_secs(2);
+                while hits_w.load(Ordering::SeqCst) <= seen && Instant::now() < deadline {
+                    std::thread::yield_now();
+                }
+                seen = hits_w.load(Ordering::SeqCst);
+            }
+            b
+        });
+        let b = writer.join().expect("writer 收口");
+        drop(b); // EOF ⇒ reader 排空后退出
+        h.join().expect("reader 收口");
+        assert_eq!(hits.load(Ordering::SeqCst), 20, "20 包各触发恰一次");
+        assert!(
+            t0.elapsed() >= Duration::from_millis(150),
+            "20 读 × 10ms 阻塞回调 ⇒ 读路径 ≥150ms（实测 {:?}，短于此 = 回调耗时被掩蔽）",
+            t0.elapsed()
+        );
+        assert!(
+            t0.elapsed() < Duration::from_secs(5),
+            "仍属有界（实测 {:?}）",
+            t0.elapsed()
+        );
+        drop(a);
     }
 }

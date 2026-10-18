@@ -4,6 +4,7 @@
 //! 无需回执）；带 `reply` 的命令由岛在事件到点时应答；状态走 `Arc<Mutex<…>>` 轮询。
 
 use std::net::SocketAddrV4;
+use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
 use std::time::Duration;
@@ -36,6 +37,11 @@ pub enum Cmd {
     /// **无 reply**：与构造期的 `on_unhealthy` 同一通话面——回调在岛线程内执行，
     /// 丢一次无害（下次信号/世代重建再装）。
     SetOnUnhealthy { h: OnUnhealthy },
+    /// 安装**读面需求触发回调**（reconnect-oneshot D2：读线程见到出站包且承载位
+    /// false 时调用——全部原子操作 + 起线程，**契约严于 [`OnUnhealthy`]**：禁日志
+    /// 禁锁禁阻塞）。**无 reply**：同 `SetOnUnhealthy`（单向安装；生产装配在
+    /// `TunAttach` 之前发送，通道 FIFO 保证读线程起跑前已装）。
+    SetOnPacketDemand { h: OnPacketDemand },
     /// 安装事件回调（岛 → 同步面的分类计数事件；M0 声明面预留的 `SetOnEvent` 位）。
     /// **无 reply**：同上（安装是单向状态；`SetOnUnhealthy` 同形）。
     SetOnEvent { h: OnEvent },
@@ -48,6 +54,11 @@ pub enum Cmd {
     Connect {
         cands: Vec<Candidate>,
         budget: Duration,
+        /// **换网源降权**（reconnect-oneshot D2-r9-N9，语义 = 降权非清除）：driver 把
+        /// 候选清单中与 `ladder_cand` **同 addr** 的旧采纳端点降权到队尾（按 addr 匹配、
+        /// 不删空——单端点 token 降权后仍在列，避免比旧端点重试更糟的 NoCandidate）。
+        /// 换网后既有采纳地址大概率已失效，快探失败即带着本位重赛跑。
+        demote_adopted: bool,
         reply: IslandReply<RaceOutcome>,
     },
     /// 换本地 socket（迁移；设计 §2.1/§2.3）。**带 reply**：迁移是用户可见事件
@@ -199,6 +210,12 @@ pub enum IslandErr {
     /// 探活在预算内未获对端证据——**不误报活**（无证据即失败）。
     #[error("探活预算内无对端证据")]
     ProbeNoResponse,
+    /// **探活槽位争用**（并发探活在途、拿锁预算内未获槽——评审 r3 B7 的 typed 面）：
+    /// 等待并发而非对端证据 ⇒ 同步面（`quick_probe` → `ProbeFail::Busy`）对这类
+    /// **不进连败**；此前该形态与 `ProbeNoResponse` 同串，stats 会把「worker 刚好
+    /// 结束后的槽超时」计入连败。
+    #[error("探活槽位争用（并发探活在途——拿锁预算内未获槽）")]
+    ProbeBusy,
     /// 重绑本地 socket 失败（绑定/非阻塞/换绑）。
     #[error("重绑本地 socket 失败（{0}）")]
     Rebind(#[source] std::io::Error),
@@ -377,6 +394,10 @@ pub struct IslandSnapshot {
     pub rtt_ms: u64,
     /// 赛跑投出的候选总数（累计；= C5' 的「候选 N 个」输入）。
     pub mirrors: u64,
+    /// **换绑命令计数**（累计；`Cmd::Rebind` 的到达面——评审 r3 B3：worker 的
+    /// 「零后续命令」断言需要 Rebind/Connect 各自的命令计数，此前只有 `mirrors`
+    /// 〔Connect 侧〕与 facade 侧的快探计数）。
+    pub rebinds: u64,
     /// 最近一次 `SetCandidates`/`Connect` 登记的候选条数。
     pub candidates: usize,
     /// `max_datagram_size()` 现值（未建连 = `None`）。
@@ -468,7 +489,162 @@ pub struct IslandSnapshot {
 /// 日志落点（与同步面同形：`Arc<dyn Fn(&str) + Send + Sync>`；域前缀由调用方自带）。
 pub type Logf = Arc<dyn Fn(&str) + Send + Sync + 'static>;
 
-/// 不健康回调（**岛线程内**执行；只允许内存操作/通道投递——M1 起 =
+/// 不健康回调（**岛线程内**执行；只允许内存操作 + 通道投递——M1 起 =
 /// `mark_unhealthy_if_current(gen, reason)`；取值集 `{patrol, fd, panic, stop}` 是判据语义）。
 pub type OnUnhealthy = Arc<dyn Fn(&str) + Send + Sync + 'static>;
 
+/// 读面需求触发回调（reconnect-oneshot D2：**读线程内**执行——契约严于
+/// [`OnUnhealthy`]：只允许原子操作与起线程，禁日志、禁锁、禁阻塞）。生产装配 =
+/// facade 的 `Weak<GenRun>` 升级后调统一重连入口。
+pub type OnPacketDemand = Arc<dyn Fn() + Send + Sync + 'static>;
+
+/// **adopt 沿回调**（评审 r1 P1-7：岛内采纳成功 ⇒ facade 清 patrol——防
+/// 「healthy=false ∧ carrier=true」黏滞）：岛线程内执行，纪律同 [`OnUnhealthy`]
+/// （只允许内存操作 + 通道投递，禁阻塞）。生产装配 = facade 注入
+/// `TunShared::on_adopt_if_current(gen)` 的 `Weak` 升级壳。
+pub type OnAdopt = Arc<dyn Fn() + Send + Sync + 'static>;
+
+/// **承载原子位**（reconnect-oneshot design D2）：连接面在位性的唯一载体——岛与
+/// facade 在装配期共握同一 `Arc`（经 [`crate::config::IslandConfig::carrier`] 注入；
+/// facade 侧 `TunShared` 持同一枚）。全部翻转语义：
+///
+/// - **置 false 沿**（仅传输类语义）：连接死亡（housekeeping 判定 / 僵尸收口
+///   `drop_zombie_live` / 世代收工）与传输不健康标记（B 门沿与观测连败标记——后者在
+///   facade 的 `mark_transport_if_current` 同一临界区内调 [`Self::mark_dead`]）；
+/// - **置 true 沿**（全部翻回成功路径，**仅 `!device_dead` 时执行**——否则读面持续
+///   误触发，r5-N1）：adopt 成功（经 `on_adopt` 回调由 facade 锁内完成——评审 r2
+///   B2④）/ 一次性重连快探成功 / 统一重赛跑成功 / 恢复下推同步快探成功；**观测快探
+///   成功不置 true**（它不是翻回证据源）；
+/// - **设备死闩**：设备类死亡（fd/panic/stop——facade 的 `mark_unhealthy` 设备类
+///   分支在同一临界区内置位）不参与承载位语义，只拦截「置 true」沿；新世代复位。
+///
+/// **alive/device_dead 合并为单原子状态字**（评审 r2 B2③：曾为两枚独立原子——
+/// `mark_alive` 的「查 device_dead → 写 alive」非原子，并发下可留
+/// `alive=true ∧ device_dead=true`；现 bit0=ALIVE、bit1=DEVICE_DEAD 同一枚
+/// `AtomicU8`，置 true 沿走 CAS——判定与写入原子，该组合不再可达）。
+///
+/// 读线程每包 [`Self::alive`] `load` 判定（false 即触发统一重连入口）——零锁、零日志，
+/// 判定不依赖任何中间线程（2026-10-17 事故的形态面由此消除）。
+#[derive(Debug, Default)]
+pub struct CarrierFlag {
+    /// 状态字：bit0 = alive、bit1 = device_dead（单原子——见类型注释 B2③）。
+    state: AtomicU8,
+    /// **载位假包 P**（r4-R16 五计数之一）：读线程在「承载位 false 的出站包」上自增
+    /// （调入口**前**）——事故复盘时「读面饿死 vs 无事件」由它与入口计数的分离可辨
+    /// （`P > 0 而入口 N 停滞` = 读线程活着而决策面不存在）。stats 行消费。
+    demand_pkts: AtomicU64,
+}
+
+/// [`CarrierFlag::state`] 的位定义。
+const CARRIER_ALIVE: u8 = 1 << 0;
+const CARRIER_DEVICE_DEAD: u8 = 1 << 1;
+
+impl CarrierFlag {
+    /// 新装配（alive=false：岛尚未采纳；adopt 置 true）。
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            state: AtomicU8::new(0),
+            demand_pkts: AtomicU64::new(0),
+        })
+    }
+
+    /// 承载在位性（读线程每包 load；触发判定的唯一输入）。
+    pub fn alive(&self) -> bool {
+        self.state.load(Ordering::Acquire) & CARRIER_ALIVE != 0
+    }
+
+    /// 置 false 沿（连接死亡/僵尸收口/世代收工/传输不健康标记）——单原子清位，
+    /// device_dead 位不受影响。
+    pub fn mark_dead(&self) {
+        self.state.fetch_and(!CARRIER_ALIVE, Ordering::AcqRel);
+    }
+
+    /// 置 true 沿（全部翻回成功路径）——**设备死在场判负**（不置位，r5-N1）。CAS 序：
+    /// 判定与写入原子（B2③——与并发 `mark_device_dead` 的任何交错都产不出
+    /// `alive=true ∧ device_dead=true`）。
+    pub fn mark_alive(&self) -> bool {
+        loop {
+            let cur = self.state.load(Ordering::Acquire);
+            if cur & CARRIER_DEVICE_DEAD != 0 {
+                return false;
+            }
+            if cur & CARRIER_ALIVE != 0 {
+                return true; // 已在位（幂等）
+            }
+            match self.state.compare_exchange(
+                cur,
+                cur | CARRIER_ALIVE,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(_) => continue, // 并发翻转——重读重试
+            }
+        }
+    }
+
+    /// 设备死闩读面（**零锁**——读线程回调路径的 step-0 检查用它，禁锁契约的承载）。
+    pub fn device_dead(&self) -> bool {
+        self.state.load(Ordering::Acquire) & CARRIER_DEVICE_DEAD != 0
+    }
+
+    /// 设备死闩置位（facade `mark_unhealthy` 的设备类分支在同一临界区内调）；
+    /// 同时把承载位拉 false——**单原子写入**（B2③），世代收工的 false 沿即经此承载。
+    pub fn mark_device_dead(&self) {
+        self.state.store(CARRIER_DEVICE_DEAD, Ordering::Release);
+    }
+
+    /// 新世代复位（facade `begin_healthy` 同一临界区内调）。**载位假包 P 一并清零**
+    /// （评审 r1 P1-14：P 是「读面活着而决策面不存在」的事故诊断面——与入口 N 同为
+    /// 世代内计数；跨世代累计会让「P>0 而 N 停滞」的复盘读数被旧世代污染）。
+    pub fn begin_generation(&self) {
+        self.state.store(0, Ordering::Release);
+        self.demand_pkts.store(0, Ordering::Release);
+    }
+
+    /// 载位假包计数（读线程；调入口前自增）。
+    pub fn bump_demand_pkt(&self) {
+        self.demand_pkts.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// 载位假包累计读数（stats 行「载位假包=P」的源）。
+    pub fn demand_pkts(&self) -> u64 {
+        self.demand_pkts.load(Ordering::Relaxed)
+    }
+
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// **判据（reconnect-oneshot 1.1 / D2）**：承载位全沿语义——新装配 false；
+    /// mark_dead（连接死亡/僵尸收口/世代收工/传输不健康标记）；mark_alive 的全部
+    /// 翻回路径**仅 !device_dead 时执行**（设备死在场置 true 判负——否则读面持续
+    /// 误触发）；设备死闩拉假承载位；新世代复位（alive=false：adopt 置 true）。
+    #[test]
+    fn carrier_flag_edge_semantics() {
+        let c = CarrierFlag::new();
+        assert!(!c.alive(), "新装配 false（岛未采纳）");
+        assert!(c.mark_alive(), "健康态置 true 成立");
+        assert!(c.alive());
+        c.mark_dead();
+        assert!(!c.alive(), "置 false 沿");
+        // 设备死闩：置位拉假 + 拦截置 true
+        c.mark_device_dead();
+        assert!(!c.alive());
+        assert!(!c.mark_alive(), "设备死在场：置 true 判负（r5-N1）");
+        assert!(!c.alive());
+        assert!(c.device_dead());
+        // 新世代复位：两态都清（alive=false——adopt 置 true）
+        c.begin_generation();
+        assert!(!c.alive());
+        assert!(!c.device_dead());
+        assert!(c.mark_alive(), "复位后可再置 true");
+        // 载位假包 P：读线程自增、累计可读
+        assert_eq!(c.demand_pkts(), 0);
+        c.bump_demand_pkt();
+        c.bump_demand_pkt();
+        assert_eq!(c.demand_pkts(), 2);
+    }
+}

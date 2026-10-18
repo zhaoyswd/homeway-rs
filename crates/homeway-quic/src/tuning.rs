@@ -311,12 +311,13 @@ pub mod probe_defaults {
     pub const FAST_GAP: Duration = Duration::from_millis(250);
     /// 复探倍数（§3.1-2：首探失败 ⇒ 本拍内用加倍预算复探一次）。
     pub const REPROBE_FACTOR: u32 = 2;
-    /// 「在用」判据的**出站新鲜窗**（§3.2-1「在用档（`demand > 0`，沿用 `demand.rs` 需求位）」）。
+    /// 「在用」判据的**出站新鲜窗**（§3.2-1「在用档（`demand > 0`，需求信号面）」）。
     ///
-    /// 岛是叶子 crate（不得依赖 `homeway-core::demand`）⇒ 本窗口照抄
-    /// `demand::OUTBOUND_FRESH`（5s）的**包面语义**：岛按自己的 `TunCounters::last_outbound_at`
-    /// 判「有包在等」。**偏离登记**：亮屏位（`demand.rs` 的 activity 位）在岛内不可达
-    /// （它由扩展经 NAPI 推给 core）⇒ 本档位对「亮屏但无包」的设备按待机走（电池面更保守）。
+    /// 岛是叶子 crate（不得依赖 `homeway-core::demand`——且该面的决策常量已随
+    /// reconnect-oneshot 退役删除）⇒ 本窗口取**包面语义**（与历史 demand 决策面的
+    /// 5s 出站新鲜窗同值）：岛按自己的 `TunCounters::last_outbound_at`
+    /// 判「有包在等」。**偏离登记**：亮屏位（扩展经 NAPI 推给 core 的 activity 位）
+    /// 在岛内不可达 ⇒ 本档位对「亮屏但无包」的设备按待机走（电池面更保守）。
     pub const IN_USE_FRESH: Duration = Duration::from_secs(5);
     /// 待机档节拍（= `PATROL_INTERVAL`，不变——保电池/CPU）。
     pub const IDLE_INTERVAL: Duration = Duration::from_secs(60);
@@ -326,7 +327,7 @@ pub mod probe_defaults {
     pub const RECONNECT_STREAK: u32 = 2;
     /// B 门：累计失败窗（同上）。
     pub const REBUILD_WINDOW: Duration = Duration::from_secs(10);
-    /// 本机发送面错误的**新鲜度窗**（§3.1-N5：照 `demand::OUTBOUND_FRESH` 先例）。
+    /// 本机发送面错误的**新鲜度窗**（§3.1-N5：与在用档出站新鲜窗同值 5s 的先例）。
     pub const SEND_ERR_FRESH: Duration = Duration::from_secs(5);
 }
 
@@ -698,7 +699,7 @@ mod tests {
         assert_eq!(d.reconnect_streak, 2, "B 门：连续 2");
         assert_eq!(d.rebuild_window, Duration::from_secs(10), "B 门：窗 ≥10s");
         assert_eq!(d.send_err_fresh, Duration::from_secs(5), "N5 新鲜度窗");
-        assert_eq!(d.in_use_fresh, Duration::from_secs(5), "= demand::OUTBOUND_FRESH");
+        assert_eq!(d.in_use_fresh, Duration::from_secs(5), "在用档出站新鲜窗 = 5s（包面语义）");
 
         let mut t = ProbeTuning::design();
         let get = table(&[

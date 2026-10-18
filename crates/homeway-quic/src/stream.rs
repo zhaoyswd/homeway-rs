@@ -219,6 +219,22 @@ impl StreamErr {
             StreamErr::NotSupported | StreamErr::Busy | StreamErr::Unbound | StreamErr::BadTag
         )
     }
+
+    /// **承载类失败判定**（reconnect-oneshot D2 的单一谓词）：服务流失败是否构成
+    /// 「连接面死了」的证据——是则触发统一重连入口（demand 源）。
+    ///
+    /// - `inflight = false`（dial/开流路径）：`{Closed, ConnectionLost}` 都算——开流期
+    ///   的 Closed 是对端拒绝建流/连接死的形态，不是 EOF；
+    /// - `inflight = true`（在飞读写半）：只认 `ConnectionLost`——`Closed` 在读半是
+    ///   正常 EOF（§1.6 的 EOF 同形性），不得当承载证据；
+    /// - `Timeout/Refused/Busy/NotSupported`（及其余服务级拒绝）恒排除。
+    pub const fn is_carrier_failure(self, inflight: bool) -> bool {
+        match self {
+            StreamErr::ConnectionLost => true,
+            StreamErr::Closed => !inflight,
+            _ => false,
+        }
+    }
 }
 
 /// 写回执（§1.4：**逐字段同形** `wgcore::WriteOut`）。
@@ -439,4 +455,33 @@ mod tests {
         assert_eq!(out.back.as_deref(), Some(data.as_slice()));
         assert_eq!(out.n, 0);
     }
+
+#[cfg(test)]
+mod carrier_failure_tests {
+    use super::*;
+
+    /// **判据（reconnect-oneshot D2 单一谓词）**：dial/开流分类 = {Closed,
+    /// ConnectionLost}；在飞读写只认 ConnectionLost（Closed 在读半是正常 EOF）；
+    /// Timeout/Refused/Busy/NotSupported（及服务级拒绝）恒排除。
+    #[test]
+    fn is_carrier_failure_matrix() {
+        // dial/开流（inflight=false）
+        assert!(StreamErr::Closed.is_carrier_failure(false));
+        assert!(StreamErr::ConnectionLost.is_carrier_failure(false));
+        for e in [
+            StreamErr::Timeout,
+            StreamErr::Refused,
+            StreamErr::Busy,
+            StreamErr::NotSupported,
+            StreamErr::Unbound,
+            StreamErr::BadTag,
+        ] {
+            assert!(!e.is_carrier_failure(false), "{e:?} 非承载类（开流）");
+            assert!(!e.is_carrier_failure(true), "{e:?} 非承载类（在飞）");
+        }
+        // 在飞读写（inflight=true）：Closed 是正常 EOF——不触发
+        assert!(!StreamErr::Closed.is_carrier_failure(true));
+        assert!(StreamErr::ConnectionLost.is_carrier_failure(true));
+    }
+}
 }

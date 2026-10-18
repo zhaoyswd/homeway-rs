@@ -177,6 +177,7 @@ impl Lab {
             .send(Cmd::Connect {
                 cands,
                 budget: Duration::from_secs(5),
+                demote_adopted: false,
                 reply: tx,
             })
             .expect("投递 Connect");

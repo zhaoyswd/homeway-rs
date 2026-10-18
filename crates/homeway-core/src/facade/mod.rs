@@ -1,12 +1,14 @@
-//! homeway-core facade：App 核门面（20 个 NAPI 导出面的 Rust API——R7-7c/7g）。
+//! homeway-core facade：App 核门面（21 个 NAPI 导出面的 Rust API——R7-7c/7g；
+//! **评审 r1 P1-11 整改**：20/8 计数订正为 21/9——`ClientCoreTunWaitFlip` 随
+//! event-driven-heal §2.4 入册后未同步本清单）。
 //!
 //! 语义真源 = `baseline:clientcore/cmd/clientcore/` 的 `//export` 族（tier:AGENTS.md
 //! 原生契约四处同步清单；7b 拍板 = C-ABI 复刻同名符号，本模块即符号面之下的纯 Rust
 //! API——extern "C" 壳在 `homeway-capi` crate）。
 //!
-//! 20 个面（tier:AGENTS.md 清单）：
-//! - tun 生命周期 8：`tun_prepare/tun_attach/tun_status/tun_stop/tun_recover/
-//!   tun_running/tun_set_foreground/tun_set_activity`；
+//! 21 个面（tier:AGENTS.md 清单）：
+//! - tun 生命周期 9：`tun_prepare/tun_attach/tun_status/tun_stop/tun_recover/
+//!   tun_running/tun_set_foreground/tun_set_activity/tun_wait_flip`；
 //! - portfwd 1：`tun_set_port_forwards`；
 //! - files/term/probe/service 面 11：`files_call/term_call/probe_addr/probe_reach/
 //!   speedtest_start/speedtest_status/speedtest_cancel/service_start/service_stop/
@@ -18,8 +20,11 @@
 //!   （世代已整体收工，原因见 tun_status）/ -5 轮询超时（5s 内没等到 attached——
 //!   只是慢，不是失败）；
 //! - `tun_stop`：0 已停 / -1 等超时 / -2 超时后强制放锁；
-//! - `tun_recover`：0 某档通过 / -1 走完未恢复 / -2 无 attached 隧道 / -3·-4 本地动作 /
-//!   -9 异步壳异常（壳面产生，本面不产）。
+//! - `tun_recover`（reconnect-oneshot r5-R6 定稿）：0 = 同步快探成功（强证据翻回）/
+//!   -1 = 已尝试但结果未知（受理〔worker 接管〕/被单飞合并/被 pending 承接/起跑失败——
+//!   边沿路径无「被节流」形态）/ -2 = 无隧道/陈世代/设备死或停止（快探之前的前置）/
+//!   -9 = 异步壳异常（壳面产生，本面不产）；-3·-4 = legacy 不可达（本地动作族随
+//!   单承载退役）。
 //!
 //! 世代生命周期（7g 工单①）：`warmup` **启动即返**（tier 壳在 JS 线程同步直调
 //! prepare——暖机 20s 窗在线程里跑会冻结事件泵）；世代线程持有 [`TunShared`] 的
@@ -165,7 +170,7 @@ impl TunError {
 ///   Go tunBegin 的 goroutine 内失败同语义）；
 /// - 世代线程**必须**在一切退出路径调 `shared.finish_generation(gen)`（终态/放锁/
 ///   done 信号——漏调 = 单飞锁永不释放）；
-/// - 世代线程从 `shared.attach_receiver()` 拿 fd 接收端：暖机完成（stage=ready）后
+/// - 世代线程从 `shared.attach_receiver(gen)` 拿 fd 接收端：暖机完成（stage=ready）后
 ///   在 `ATTACH_DEADLINE` 内等 fd，到点自行收工（`idle/"attach-timeout"` 终态）；
 /// - `request_stop` 要能打断暖机（Go：关客户端是第二条打断路径）。
 // App 核专用（世代执行体注入面——tun_exec/capi 消费；windows 不编译，评审 M3 随 imports 门控）。
@@ -288,6 +293,29 @@ impl ClientCore {
         }
     }
 
+    /// 测试缝：注入既有 TunShared（生产由 `warmup(cfg, shared, gen)` 把同一枚交给
+    /// 执行体；单测需要 ClientCore 与合成 GenRun 共握同一枚——tun_stop/request_stop
+    /// 与在飞 worker 的并发面，评审 r1 P1-12）。`#[cfg(test)]`——生产构建不存在。
+    #[cfg(test)]
+    pub(crate) fn with_tun_shared(
+        executor: Arc<dyn TunExecutor>,
+        demand: Arc<DemandSignals>,
+        tun: Arc<TunShared>,
+    ) -> Self {
+        ClientCore {
+            tun,
+            foreground: AtomicBool::new(false),
+            foreground_kick: Mutex::new(None),
+            demand,
+            files: files_op::FilesOps::new(),
+            executor: Mutex::new(executor),
+            service: Arc::new(service_op::ServiceDomain::new()),
+            service_exec: service_exec::ServiceExec::new(),
+            events: events::EventHub::new(),
+            service_bridge: Mutex::new(None),
+        }
+    }
+
     /// 装配服务桥（服务会话宿主形态——`service_start` 受理后由装配方注入；
     /// 桥状态经 `bridge_status` 并入 serviceStatusJSON 的 bridge 四键）。
     pub fn attach_service_bridge(&self, host: Option<Arc<bridge_host::BridgeHost>>) {
@@ -332,31 +360,29 @@ impl ClientCore {
     /// 调用后轮询 `tun_status` 直到 state=ready（或 failed）；就绪后必须在
     /// `ATTACH_DEADLINE` 内 attach（到点世代自行收工）。
     pub fn tun_prepare(&self, cfg_json: &str, log_path_ok: bool) -> i32 {
-        // 单飞：在世世代期间拒绝（-1 忙）
-        if self.tun.probe_running.swap(true, Ordering::AcqRel) {
-            return -1;
-        }
-        let release = |tun: &TunShared| tun.probe_running.store(false, Ordering::Release);
+        // 解析/预检在门外（评审 r4 B2-a）：失败 = 无锁可放，直接返回；门外期间
+        // 旧 finish 只会清旧槽——尚无可清的新锁。
         let cfg: TunConfigJson = match serde_json::from_str(cfg_json) {
             Ok(c) => c,
-            Err(_) => {
-                release(&self.tun);
-                return -3;
-            }
+            Err(_) => return -3,
         };
         // 参数预检（同步可判的硬失败）：空 token 是唯一能在这关同步判死的配置错
         if cfg.token.is_empty() {
-            release(&self.tun);
             return -3;
         }
         // 日志重定向面（-2）：真壳接文件；本面以标志位承载（打开失败 = -2）
         if !log_path_ok {
-            release(&self.tun);
             return -2;
         }
-        let gen = self.tun.gen.fetch_add(1, Ordering::AcqRel) + 1;
-        self.tun.begin_generation(gen); // 写入权交接 + done/attach 通道/停止位槽复位
-        self.tun.begin_healthy(); // 新世代不带上一世代的分类残留（先清——顺序即注释）
+        // 单飞 + 换代同门（评审 r4 B2-a）：`begin_prepare` 在 finish_gate 临界区内
+        // 完成「swap 获取 + gen 递增 + begin_generation 复位」——旧 finish 的尾段
+        // （同门复核 gen）不可能插进「swap 已成功、gen 未递增」的窗口把新锁清掉；
+        // 单飞在世 ⇒ -1 忙。
+        let gen = match self.tun.begin_prepare() {
+            Some(g) => g,
+            None => return -1,
+        };
+        self.tun.begin_healthy(gen); // 新世代不带上一世代的分类残留（先清——顺序即注释；带世代参数——r8-N2 陈旧 no-op）
         self.tun
             .stage
             .set_if_current(gen, TunStage::Preparing, "", "", false);
@@ -432,19 +458,23 @@ impl ClientCore {
         let exec = self.executor();
         let snap = self.tun.stage.snapshot();
         let running = self.tun_running_inner(&exec);
-        // unhealthyReason 只看分类是否非空（Go `if why != ""`——与 running 位独立）
-        let why = lock_unpoison(&self.tun.unhealthy_why).clone();
-        let transport_unhealthy = self.tun.transport_unhealthy();
+        // r8-N2：读侧统一 HealthSnapshot（同锁一次读——不再分次读出混合快照；
+        // carrier 纳入防「healthy=true 且 carrier=false」中间态可见）。
+        let hs = self.tun.health_snapshot();
+        let transport_unhealthy = hs.why == "patrol"; // 派生自同一次锁读（r1 P1-8）
         let quic = exec.quic_status();
         let input = TunStatusInput {
             stage: snap,
             running,
             demand: self.demand.last(),
             demand_fg: self.demand.fg(),
-            unhealthy_reason: (!why.is_empty()).then_some(why),
-            // tun-death-gate：显式分类键（App 只读键不比值集）
+            unhealthy_reason: (!hs.why.is_empty()).then_some(hs.why),
+            // tun-death-gate：显式分类键（App 只读键不比值集）。**评审 r1 P1-8 整改**：
+            // 派生自同一次锁读的 `hs.why`（与 `tun_wait_flip` 同款）——不在同一 JSON
+            // 组装里二次拿健康锁（标记/翻回并发时会产出 unhealthyReason 空 而
+            // transportUnhealthy 真的混合快照，正是 r8-N2 要消除的形态）。
             transport_unhealthy,
-            device_dead: self.tun.device_dead.load(Ordering::Acquire),
+            device_dead: hs.device_dead,
             service_streams_active: quic.as_ref().map(|q| q.streams_active).unwrap_or(0),
             rescue_rounds_exhausted: exec.rescue_rounds_exhausted(),
             runner: exec.runner(),
@@ -475,16 +505,15 @@ impl ClientCore {
         let timeout = Duration::from_millis(arg.timeout_ms).min(Duration::from_secs(120));
         let seq = self.tun.wait_flip(arg.last_seq, timeout);
         let exec = self.executor();
+        // r8-N2：同锁一次读（与 tun_status 同源——不分次读混合快照）。
+        let hs = self.tun.health_snapshot();
         let mut m = serde_json::Map::new();
         m.insert("seq".into(), serde_json::Value::from(seq));
         m.insert(
             "transportUnhealthy".into(),
-            serde_json::Value::from(self.tun.transport_unhealthy()),
+            serde_json::Value::from(hs.why == "patrol"),
         );
-        m.insert(
-            "deviceDead".into(),
-            serde_json::Value::from(self.tun.device_dead.load(Ordering::Acquire)),
-        );
+        m.insert("deviceDead".into(), serde_json::Value::from(hs.device_dead));
         m.insert(
             "rescueRoundsExhausted".into(),
             serde_json::Value::from(exec.rescue_rounds_exhausted()),
@@ -519,14 +548,41 @@ impl ClientCore {
             return 0;
         }
         // 超时：若期间没有新世代启动（gen 未变且锁未放出）⇒ 强制放锁（不写阶段——
-        // 工单③：终态由世代写；旧世代迟到收尾过世代守卫无害）。健康位照 Go 同分支
-        // 补写 why="stop"/healthy=false（评审 r2-L1）。
+        // 工单③：终态由世代写）。健康位照 Go 同分支补写 why="stop"/healthy=false
+        // （评审 r2-L1）。强放后旧 finish 仍会迟到执行——其尾段（signal_stop/mark
+        // + close_attach/done/probe_running，评审 r4 B2-b 起全量在门内）经
+        // `finish_gate` 复核 gen（评审 r3 B2⑥）：新 prepare 的「单飞获取 + 换代」
+        // 与旧 finish 尾段同门互斥（评审 r4 B2-a `begin_prepare`）⇒ stale
+        // `is_current` 对已起跑的新世代零写（「过世代守卫无害」不是无条件成立，
+        // 靠门户复核封窗——r3 版注记只覆盖 attach/done/probe 尾段，signal_stop 与
+        // prepare 获取窗口由 r4 补齐）。
+        // 评审 r2 B2⑥：① `mark_unhealthy` 改**带世代守卫**的 `mark_unhealthy_if_current`
+        //（旧无守卫直写——条件检查与新世代启动之间命中新世代时会把 "stop"/设备死
+        // 写进新世代）；② 释放前复查——标记与复查之间世代翻新（旧 finish 放锁、新
+        // prepare 起跑或世代已自然收尾）⇒ 不强放、按 -1 收（不动新世代的锁与状态）。
+        // 评审 r5-L1：复查本身仍在门外（早退面），但**真正的放锁收口**改走
+        // `force_release_if_current`——与 `begin_prepare` 同用 `finish_gate`，
+        // gen + 单飞锁复核与 store 在同一临界区完成：旧「门外复查 → 裸 store」
+        // 的间隙内旧 finish 收尾、新 prepare 完成换代时，裸 store 会把**新世代**
+        // 的单飞锁清掉（B2-a 同类窄窗）。门内复核失败 ⇒ 未写任何槽，按 -1 收。
         if self.tun.gen.load(Ordering::Acquire) == gen
             && self.tun.probe_running.load(Ordering::Acquire)
         {
-            self.tun.mark_unhealthy("stop");
-            self.tun.probe_running.store(false, Ordering::Release);
-            -2
+            self.tun.mark_unhealthy_if_current(gen, "stop");
+            if self.tun.gen.load(Ordering::Acquire) != gen
+                || !self.tun.probe_running.load(Ordering::Acquire)
+            {
+                return -1; // 期间世代已翻新/已自然收尾——不强放
+            }
+            // 受控交错缝（评审 r5-L1）：复核已过、放锁未落——窗口期内旧 finish
+            // 与新 prepare 可完成（确定性回归面；生产零开销）。
+            #[cfg(test)]
+            self.tun.invoke_stop_force_hook();
+            if self.tun.force_release_if_current(gen) {
+                -2
+            } else {
+                -1 // 门内复核见世代翻新/已收尾——不强放
+            }
         } else {
             -1
         }
@@ -537,14 +593,18 @@ impl ClientCore {
     /// 恢复下推入口（`from` 钳位 1..=3；rc 契约见 facade 头注释）。cause 文案带档位号
     /// （**M5 C3**：档位名「R1 重握手」一族随 WG 阶梯删除；`from` 只作入参留痕/契约面）。
     ///
-    /// **M4 §5.3（登记 §8 行 13）+ M5 C3 单承载**：执行体恒走岛档（岛快探 + 一次复探）
-    /// ⇒ **只产 `0/-1/-2`**（`-3/-4` 不可达——WG 阶梯已随 WG 面删除）。
-    /// **`-2` 的构成（r21 F1 订正 + M5 代码门 M-1 复订）**：本入口（capi 契约面）走
-    /// `tun_exec::recover` ⇒ `-2` 来自**两条前置**——「无世代」与「陈世代」；
-    /// **另有同值的第三来源在另一条路上**（不在本入口）：`host_session::recover`（宿主
-    /// 服务会话面，daemon/CLI 消费）的 `ProbeOutcome::NoFace` 也产 `-2`（语义 = 「无连接面」，
-    /// 与「无世代」同族但不等价——**两处都不得写成彼此**）。tier 侧决策（`rc===0` 跳过
-    /// 整套重建 / 其余落重建）**不变**。
+    /// **reconnect-oneshot（r5-R6 定稿）**：本入口走 `tun_exec::recover`（统一入口协议
+    /// 复用：`try_claim_edge` 在飞判定 + 同步快探 + worker 移交），产 `0/-1/-2`
+    /// （`-3/-4` legacy 不可达——本地动作族随单承载退役）。rc 全表：`0` = 同步快探
+    /// 成功；`-1` = 已尝试但结果未知（受理〔worker 接管〕/被单飞合并/被 pending 承接/
+    /// 起跑失败——边沿路径无「被节流」形态）；`-2` = 无隧道/陈世代/**设备死或停止**
+    /// （快探之前的前置——零烧探测；**另有快探成功后的复查同归 -2**：设备死/停止
+    /// 发生在快探在飞期间或复查后才到场时按同值收口、不落「通过」行——评审 r3 B3
+    /// 与 r4 B3 低项）。**另有同值的第四来源在另一条路上**（不在本
+    /// 入口）：`host_session::recover`（宿主服务会话面，daemon/CLI 消费）的
+    /// `ProbeOutcome::NoFace` 也产 `-2`（语义 = 「无连接面」，与「无世代」同族但不
+    /// 等价——**两处都不得写成彼此**）。tier 侧只按 rc 分支（-1/-2/-9——细粒度在
+    /// 核日志）。
     pub fn tun_recover(&self, from: i64) -> i32 {
         let lvl = host_session::Level::clamp(from);
         self.executor()
@@ -697,8 +757,9 @@ mod tests {
             stop.store(false, Ordering::Release);
             std::thread::spawn(move || {
                 // attach 接收端**先于 Ready 发布注册**（评审 r2-M3 的生产时序契约——
-                // 窗口内投 fd 必须可达；假件此前反序，µs 级竞态偶发 -1〔终轮 ci 实抓〕）
-                let fd_rx = shared.attach_receiver();
+                // 窗口内投 fd 必须可达；假件此前反序，µs 级竞态偶发 -1〔终轮 ci 实抓〕；
+                // 世代守卫 = 评审 r2 B2⑦——迟到注册不覆盖新世代 sender）
+                let fd_rx = shared.attach_receiver(gen);
                 if warmup_ok {
                     shared
                         .stage

@@ -12,6 +12,7 @@
 
 use std::fmt;
 use std::net::SocketAddrV4;
+use std::sync::Arc;
 use std::time::Duration;
 
 use crate::rpk::RpkPublicKey;
@@ -167,6 +168,19 @@ pub struct IslandConfig {
     /// 启动时按 `HOMEWAY_QUIC_CC` 覆盖（不设 = 缺省 ⇒ 行为零变化）。岛是**上行方向的
     /// 发送端**（本期限定「反向不开流」，但登记/控制流仍走它）；装置侧一般不动本值。
     pub cc: CcChoice,
+    /// **承载原子位**（reconnect-oneshot D2）：岛与 facade 装配期共握同一 `Arc`——
+    /// 读线程每包 load（false 即触发统一重连入口）、岛侧沿写（housekeeping 连接死/
+    /// 刷新失败/僵尸收口/adopt/收工）。`None` = 无承载面跟踪（测试/宿主会话形态——
+    /// 读面零触发、岛侧翻转跳过）。生产装配 = facade 在 `start_island` 前置入
+    /// `TunShared` 持有的同一枚。
+    pub carrier: Option<Arc<crate::cmd::CarrierFlag>>,
+    /// **adopt 沿回调**（评审 r1 P1-7）：岛内阶梯/赛跑采纳成功时调用（岛线程内——
+    /// 纪律同 [`crate::cmd::OnUnhealthy`]：只允许内存操作 + 通道投递，禁阻塞）。
+    /// 生产装配 = facade 注入「`TunShared::on_adopt_if_current(gen)`：若 facade 仍处
+    /// 传输不健康（patrol）则清 why/置 healthy」——防「healthy=false ∧ carrier=true」
+    /// 黏滞（adopt 置 carrier true 后读面/B 门/stats 三类恢复入口全部失效的形态）。
+    /// `None` = 不通知（测试/宿主会话形态）。
+    pub on_adopt: Option<crate::cmd::OnAdopt>,
 }
 
 impl IslandConfig {
@@ -181,6 +195,8 @@ impl IslandConfig {
             streams: StreamLimits::design(),
             probe: ProbeTuning::design(),
             cc: CcChoice::default(),
+            carrier: None,
+            on_adopt: None,
         }
     }
 }

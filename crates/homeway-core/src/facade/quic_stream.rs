@@ -40,7 +40,7 @@ use crate::Logf;
 #[cfg(not(windows))] // BridgeStream/WriteHalf 面 = App 桥承载（windows 不装配三桥）
 use super::bridge_io::{BridgeStream, WriteHalf};
 #[cfg(not(windows))] // GenRun 面 = App 世代执行体（tun_exec 在 windows 不编译）
-use super::tun_exec::GenRun;
+use super::tun_exec::{GenRun, ReconnSource};
 
 /// 虚拟端口 → 服务 tag（§5.1：`7802/7724/7803 → 1/2/3`；**5300 → 6**（dns-resolve，
 /// DNS-STREAM 批——宿主侧 socks 域名目标的远程解析腿）；其余端口无 tag）。
@@ -64,6 +64,22 @@ pub(crate) fn write_retry_backoff(attempt: u32) -> Duration {
 
 /// 世代/会话收工 RPC 的预算（tun_exec 原值搬入——同上跨平台化）。
 pub(crate) const EXIT_RPC_BUDGET: std::time::Duration = std::time::Duration::from_secs(2);
+
+/// **承载失败触发回调**（reconnect-oneshot D2-r4-N6）：服务流面的承载类失败
+/// （[`StreamErr::is_carrier_failure`]）触发统一重连入口。生产装配 = `Weak<GenRun>`
+/// 升级后调 `try_spawn_reconnect(ServiceStream)`；**宿主会话与 DNS 腿注入 `None`**
+/// （不接——daemon/CLI 会话与自用解析腿不当连接死亡证据）。
+pub(crate) type CarrierFailureFn = Arc<dyn Fn() + Send + Sync>;
+
+#[cfg(not(windows))] // GenRun 面（App 世代执行体）
+fn carrier_failure_fn_of(run: &Arc<GenRun>) -> CarrierFailureFn {
+    let w = Arc::downgrade(run);
+    Arc::new(move || {
+        if let Some(r) = w.upgrade() {
+            GenRun::try_spawn_reconnect(&r, ReconnSource::ServiceStream);
+        }
+    })
+}
 
 /// 拨号首试预算（tun_exec 原值搬入——同上）。
 pub(crate) const FIRST_TRY: std::time::Duration = std::time::Duration::from_secs(4);
@@ -125,16 +141,19 @@ pub(crate) fn open_stream(
 
 /// 拨号策略的**可测主体**（纯逻辑：注入 `open` 闭包）。
 ///
-/// 语义（§1.6 的三条一起）：
+/// 语义（§1.6 的三条一起 + reconnect-oneshot D2 的触发面）：
 /// - 首试成功 ⇒ 返回；
 /// - 首试是**服务级拒绝**（阶梯豁免集）⇒ **原样返回、不重试**（服务不存在/入口满/未绑定
 ///   /tag 非法都不是连接故障，重试只会把「出口没有该服务」放大成延时）；
-/// - 首试是**连接面失败** ⇒ 预算未尽则重试一次（S4 的阶梯重写接手 QUIC 档恢复动作）。
+/// - 首试是**连接面失败** ⇒ 预算未尽则重试一次（S4 的阶梯重写接手 QUIC 档恢复动作）；
+/// - **第二次失败且承载类时调 `on_carrier_failure`**（返回值不改——触发在错误映射
+///   `io::Error` 之前；首次失败不触发）。
 pub(crate) fn dial_with<F, T>(
     logf: &Logf,
     tag: StreamTag,
     budget: Duration,
     mut open: F,
+    on_carrier_failure: Option<&CarrierFailureFn>,
 ) -> Result<T, StreamErr>
 where
     F: FnMut(Duration) -> Result<T, StreamErr>,
@@ -157,7 +176,15 @@ where
     let remain = budget
         .saturating_sub(t0.elapsed())
         .max(Duration::from_millis(1));
-    open(remain)
+    let second = open(remain);
+    if let Err(e) = &second {
+        if e.is_carrier_failure(false) {
+            if let Some(cb) = on_carrier_failure {
+                cb(); // 第二次失败且承载类——触发统一重连入口（D2）
+            }
+        }
+    }
+    second
 }
 
 /// QUIC 档 portfwd 的**拨号缝**（M4 §2.2）：开 `STREAM[dial]` ⇒ 写 6B 目标 ⇒ 等 **1B 回执**
@@ -202,9 +229,16 @@ pub(crate) fn dial_target(
             "世代装配中（数据面未就绪）——QUIC 档端口转发无法拨号",
         )
     })?;
-    let (id, rest) = dial_target_raw(&island, dst, budget)?;
+    // reconnect-oneshot D2：portfwd 的**首次承载失败即触发**（单次尝试路径无重试
+    // 概念）——typed 层保留分类到触发点（不做 io::Error 映射后再分类，r5-N6）。
+    let cb = carrier_failure_fn_of(run);
+    let (id, rest) = dial_target_typed(&island, dst, budget, Some(&cb)).map_err(ack_err_to_io)?;
     // ★ RAII 守卫：构造即接管「此后任何失败路径也要关流」（见本函数 doc 的 H1 段）
-    let shared = Arc::new(StreamShared { island, id });
+    let shared = Arc::new(StreamShared {
+        island,
+        id,
+        on_carrier_failure: Some(cb),
+    });
     Ok(Box::new(QuicStream::from_shared(shared).with_pending(rest)))
 }
 
@@ -256,23 +290,103 @@ pub(crate) fn dial_target_raw(
     dst: SocketAddrV4,
     budget: Duration,
 ) -> io::Result<(StreamId, Vec<u8>)> {
+    // r5-N6 的**外层（IO 面）**：宿主会话消费——typed 层之上只做 `io::Error` 映射，
+    // 零触发（`host_session` 的 `dial_addr` 与 DNS 腿不接重连入口）。
+    dial_target_typed(island, dst, budget, None).map_err(ack_err_to_io)
+}
+
+/// **typed 层**（r5-N6）：保留 `StreamErr` 到触发点——承载类失败（dial/开流分类 =
+/// `{Closed, ConnectionLost}`）在映射 `io::Error` **之前**触发 `on_carrier_failure`
+/// （首次承载失败即触发——单次尝试路径无重试概念）。
+///
+/// **评审 r1 P0-4 整改**：ack 阶段的错误分类**全程 typed**（[`AckErr`]）——旧实现
+/// 先 `io::Error` 映射再 `io_to_stream_err` 逆映射，`Busy/Refused/NotSupported/
+/// Unbound/BadTag/InvalidData` 全部被误还原成 `ConnectionLost` ⇒ 误触发统一重连
+/// （D2/Q-F-B D11 明确排除服务级拒绝与协议面错）。fire 只对 `Closed`/
+/// `ConnectionLost` 触发（`is_carrier_failure(false)` 单一谓词）。
+pub(crate) fn dial_target_typed(
+    island: &Arc<Island>,
+    dst: SocketAddrV4,
+    budget: Duration,
+    on_carrier_failure: Option<&CarrierFailureFn>,
+) -> Result<(StreamId, Vec<u8>), AckErr> {
+    let fire = |e: &StreamErr| {
+        if e.is_carrier_failure(false) {
+            if let Some(cb) = on_carrier_failure {
+                cb();
+            }
+        }
+    };
     let deadline = Instant::now().checked_add(budget);
-    let wait = remain(deadline).map_err(stream_err_to_io)?;
-    let id = island_stream_cmd(
+    let wait = remain(deadline).map_err(AckErr::Stream)?;
+    let id = match island_stream_cmd(
         island,
         |reply| Cmd::StreamOpen {
             tag: StreamTag::Dial,
             reply,
         },
         Some(wait),
-    )
-    .map_err(stream_err_to_io)?;
+    ) {
+        Ok(id) => id,
+        Err(e) => {
+            fire(&e);
+            return Err(AckErr::Stream(e));
+        }
+    };
     // ★ RAII：开流成功即接管（写帧/回执的失败路径也要关流）
     let guard = DialCloseGuard::new(Arc::clone(island), id);
-    write_dial_frame_raw(island, id, dst)?;
-    let rest = read_dial_ack(deadline, |wait| read_block(island, id, Some(wait)))?;
+    if let Err(e) = write_dial_frame_typed(island, id, dst) {
+        fire(&e);
+        return Err(AckErr::Stream(e));
+    }
+    // ack 阶段（typed 分类直达 fire——Busy/Refused/NotSupported/InvalidData 不触发）。
+    let rest = dial_ack_stage(
+        deadline,
+        |wait| read_block(island, id, Some(wait)),
+        on_carrier_failure,
+    )?;
     guard.disarm();
     Ok((id, rest))
+}
+
+/// ack 阶段的触发判定（评审 r1 P0-4 的可测主体）：错误分类经 [`AckErr`] 全程
+/// typed（不做 io 映射往返），**承载谓词在本层**——只有 `Closed`/`ConnectionLost`
+/// （`is_carrier_failure(false)`）触发；服务级拒绝（Busy/Refused/NotSupported/…）
+/// 与协议面错（`Invalid`）零触发（D2/Q-F-B D11）。
+fn dial_ack_stage(
+    deadline: Option<Instant>,
+    read: impl FnMut(Duration) -> Result<Vec<u8>, StreamErr>,
+    on_carrier_failure: Option<&CarrierFailureFn>,
+) -> Result<Vec<u8>, AckErr> {
+    match read_dial_ack(deadline, read) {
+        Ok(r) => Ok(r),
+        Err(AckErr::Stream(se)) => {
+            if se.is_carrier_failure(false) {
+                if let Some(cb) = on_carrier_failure {
+                    cb();
+                }
+            }
+            Err(AckErr::Stream(se))
+        }
+        Err(e @ AckErr::Invalid(_)) => Err(e), // 协议面错——不是承载证据，不触发
+    }
+}
+
+/// dial 回执阶段的错误分类（评审 r1 P0-4）：`Stream` = 岛/流层面的原始分类
+/// （承载类才触发）；`Invalid` = 协议面错（非法首字节/连续空块——**不是承载证据**，
+/// 绝不触发；映射 `io::ErrorKind::InvalidData` 交消费面）。
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) enum AckErr {
+    Stream(StreamErr),
+    Invalid(String),
+}
+
+/// [`AckErr`] → `io::Error`（消费面 = `dial_target`/`dial_target_raw` 的端口转发链）。
+fn ack_err_to_io(e: AckErr) -> io::Error {
+    match e {
+        AckErr::Stream(se) => stream_err_to_io(se),
+        AckErr::Invalid(msg) => io::Error::new(io::ErrorKind::InvalidData, msg),
+    }
 }
 
 /// 服务流原始命令面（M5 S2a：宿主会话与隧道域共用的**唯一**岛命令构造点——
@@ -286,7 +400,9 @@ pub(crate) fn dial_stream_id(
     tag: StreamTag,
     budget: Duration,
 ) -> Result<StreamId, StreamErr> {
-    dial_with(logf, tag, budget, |b| open_stream(island, tag, b))
+    // 宿主会话面：**零触发**（host_session 注入 None——daemon/CLI 会话不当连接
+    // 死亡证据，D2）。
+    dial_with(logf, tag, budget, |b| open_stream(island, tag, b), None)
 }
 
 /// 读一块（无限期挂起；`Err(StreamErr::Closed)` = EOF）。`wait` = 有界面
@@ -345,18 +461,17 @@ fn remain(deadline: Option<Instant>) -> Result<Duration, StreamErr> {
     }
 }
 
-/// ③ 写 6B 目标帧（§2.2：`n == 6` 则成，否则 [`io::ErrorKind::WriteZero`]）。
-fn write_dial_frame_raw(island: &Arc<Island>, id: StreamId, dst: SocketAddrV4) -> io::Result<()> {
+/// ③ 写 6B 目标帧（§2.2：`n == 6` 则成，否则按 `WriteZero` 语义归 `Closed`）。
+/// typed 层（r5-N6）：保留 `StreamErr` 到触发点。
+fn write_dial_frame_typed(
+    island: &Arc<Island>,
+    id: StreamId,
+    dst: SocketAddrV4,
+) -> Result<(), StreamErr> {
     let frame = homeway_quic::stream::dial_target(dst);
-    let n = match write_block(island, id, frame.to_vec()) {
-        Ok(w) => w.n,
-        Err(e) => return Err(stream_err_to_io(e)),
-    };
+    let n = write_block(island, id, frame.to_vec()).map(|w| w.n)?;
     if n != frame.len() {
-        return Err(io::Error::new(
-            io::ErrorKind::WriteZero,
-            format!("QUIC 服务流：dial 目标帧只接纳 {n}/{}B", frame.len()),
-        ));
+        return Err(StreamErr::Closed); // 帧不完整 = 拨号失败（非承载类）
     }
     Ok(())
 }
@@ -370,40 +485,40 @@ pub(super) const MAX_EMPTY_ACK_CHUNKS: u32 = 32;
 ///
 /// `read` 注入成闭包（生产 = `Cmd::StreamRead` 的有界等待；单测注入假块）——值空间的每一行
 /// 都要有用例，而真块时序（空块 / 首块 > 1B / 对端 FIN）在真岛上不可控。
-fn read_dial_ack<F>(deadline: Option<Instant>, mut read: F) -> io::Result<Vec<u8>>
+/// **错误分类 typed**（评审 r1 P0-4）：岛/流错误原样带回 [`AckErr::Stream`]（承载类
+/// 判定由消费面的单一谓词做）；协议面错归 [`AckErr::Invalid`]——不做「io 映射后再
+/// 分类」的往返（那会把 Busy/Refused/InvalidData 全部误判成 ConnectionLost）。
+fn read_dial_ack<F>(deadline: Option<Instant>, mut read: F) -> Result<Vec<u8>, AckErr>
 where
     F: FnMut(Duration) -> Result<Vec<u8>, StreamErr>,
 {
     let mut empty_chunks: u32 = 0;
     loop {
-        let wait = remain(deadline).map_err(stream_err_to_io)?;
+        let wait = remain(deadline).map_err(AckErr::Stream)?;
         match read(wait) {
             // 空块（0B 的 STREAM 帧）：**不是**结束形态 ⇒ 预算内续读（不得 `[0]` 索引 ⇒ panic）；
             // 连续空块有界（[`MAX_EMPTY_ACK_CHUNKS`]）
             Ok(chunk) if chunk.is_empty() => {
                 empty_chunks += 1;
                 if empty_chunks > MAX_EMPTY_ACK_CHUNKS {
-                    return Err(io::Error::new(
-                        io::ErrorKind::InvalidData,
-                        format!(
-                            "QUIC 服务流：dial 回执连续 {MAX_EMPTY_ACK_CHUNKS} 个空块（协议面无进展）"
-                        ),
-                    ));
+                    return Err(AckErr::Invalid(format!(
+                        "QUIC 服务流：dial 回执连续 {MAX_EMPTY_ACK_CHUNKS} 个空块（协议面无进展）"
+                    )));
                 }
                 continue;
             }
             // 成功：首字节 = DIAL_OK，其后即目标侧裸字节（**余量必须带回**，§1.2 铁律）
             Ok(chunk) if chunk[0] == DIAL_OK => return Ok(chunk[1..].to_vec()),
-            // 首字节非法 = 协议面错（**不得**当 EOF/成功）
+            // 首字节非法 = 协议面错（**不得**当 EOF/成功——也不当承载证据）
             Ok(chunk) => {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("QUIC 服务流：dial 回执首字节非法（{:#04x}）", chunk[0]),
-                ))
+                return Err(AckErr::Invalid(format!(
+                    "QUIC 服务流：dial 回执首字节非法（{:#04x}）",
+                    chunk[0]
+                )))
             }
             // `Closed`（对端 FIN / 白名单外复位码 / `ConnectionLost`）**显式归拨号失败**
-            // （`stream_err_to_io(Closed)` = `Other` ⇒ pf 链 fails+1 + RST）
-            Err(e) => return Err(stream_err_to_io(e)),
+            // （消费面 io 映射 ⇒ pf 链 fails+1 + RST；承载类触发由 typed 分类判定）
+            Err(e) => return Err(AckErr::Stream(e)),
         }
     }
 }
@@ -421,9 +536,25 @@ pub(crate) fn dial(
             "QUIC 岛不在（世代装配中/已收回）——服务流无法拨号",
         )
     })?;
-    let id = dial_with(&run.logf, tag, budget, |b| open_stream(&island, tag, b))
+    // reconnect-oneshot D2：files/term/speedtest = 用户可见服务入口——开流有界重试后
+    // 仍承载类失败 ⇒ 触发统一入口（ServiceStream 源）；**DNS 腿不接**（客户端自用
+    // 解析腿：解析失败是环境噪声面，不当连接死亡证据）。
+    let trigger = !matches!(tag, StreamTag::DnsResolve);
+    let cb = carrier_failure_fn_of(run);
+    let sel: Option<&CarrierFailureFn> = trigger.then_some(&cb);
+    let id = dial_with(&run.logf, tag, budget, |b| open_stream(&island, tag, b), sel)
         .map_err(stream_err_to_io)?;
-    Ok(Box::new(QuicStream::new(island, id)))
+    // 评审 r1 2.21 整改：**流句柄的回调注入与开流触发同一门**——DNS 腿的读/写半
+    // 也不携带承载回调（旧实现 `new_with_carrier` 无条件注入 `Some(cb)`，DNS 流的
+    // ConnectionLost 会误触发 ServiceStream 源——「DNS 腿不接」在 dial() 类型面
+    // 不成立的潜在路径；生产 DNS 走 `host_session::dial_stream_id`（None），本修
+    // 补齐 dial() 面的同一策略）。
+    let shared = Arc::new(StreamShared {
+        island,
+        id,
+        on_carrier_failure: trigger.then_some(cb),
+    });
+    Ok(Box::new(QuicStream::from_shared(shared)))
 }
 
 /// `StreamErr` → `io::Error`（§1.6 的**消费点迁移表**；桥宿主的 refused 判定只认 kind）。
@@ -457,6 +588,9 @@ fn stream_err_to_io(e: StreamErr) -> io::Error {
 struct StreamShared {
     island: Arc<Island>,
     id: StreamId,
+    /// 承载失败触发回调（reconnect-oneshot D2-r4-N6）：在飞流读写半报
+    /// `ConnectionLost` 时调用；宿主会话构造的共享体为 `None`（零触发）。
+    on_carrier_failure: Option<CarrierFailureFn>,
 }
 
 impl Drop for StreamShared {
@@ -484,11 +618,8 @@ pub(crate) struct QuicStream {
 
 #[cfg(not(windows))]
 impl QuicStream {
-    fn new(island: Arc<Island>, id: StreamId) -> Self {
-        QuicStream::from_shared(Arc::new(StreamShared { island, id }))
-    }
-
-    /// 从既有共享体构造（dial 缝用它把已持的 RAII 守卫交给流本体）。
+    /// 从既有共享体构造（dial/dial_target 缝的唯一构造面——承载回调的有无在
+    /// 共享体上决定：DNS 腿注入 None，见 `dial` 的整改注记）。
     fn from_shared(shared: Arc<StreamShared>) -> Self {
         QuicStream {
             shared,
@@ -579,8 +710,16 @@ impl Read for QuicReadHalf {
                 None,
             ) {
                 Ok(data) => data,
-                // 对端 FIN / 白名单外的复位 / 本端关流 ⇒ EOF（§1.6 的 EOF 同形性）
+                // 对端 FIN / 白名单外的复位 / 本端关流 ⇒ EOF（§1.6 的 EOF 同形性；
+                // **不是**承载证据——不触发，reconnect-oneshot D2）
                 Err(StreamErr::Closed) => return Ok(0),
+                Err(StreamErr::ConnectionLost) => {
+                    // 在飞读半的承载丢失 ⇒ 触发（D2：只认 ConnectionLost）
+                    if let Some(cb) = &self.shared.on_carrier_failure {
+                        cb();
+                    }
+                    return Err(stream_err_to_io(StreamErr::ConnectionLost));
+                }
                 Err(e) => return Err(stream_err_to_io(e)),
             };
             if data.is_empty() {
@@ -646,6 +785,13 @@ impl Write for QuicWriteHalf {
                     io::ErrorKind::BrokenPipe,
                     "服务流已关闭（EOF 面）",
                 )),
+                Err(StreamErr::ConnectionLost) => {
+                    // 在飞写半的承载丢失 ⇒ 触发（D2：只认 ConnectionLost）
+                    if let Some(cb) = &self.shared.on_carrier_failure {
+                        cb();
+                    }
+                    return Err(stream_err_to_io(StreamErr::ConnectionLost));
+                }
                 Err(e) => return Err(stream_err_to_io(e)),
             }
         }
@@ -726,7 +872,7 @@ mod tests {
                 dial_with(&quiet(), StreamTag::Term, Duration::from_secs(15), |_b| {
                     n.fetch_add(1, Ordering::SeqCst);
                     Err(e)
-                });
+                }, None);
             assert_eq!(r, Err(e), "{e:?} 必须原样返回");
             assert_eq!(n.load(Ordering::SeqCst), 1, "{e:?} 不得重试（不触发恢复）");
         }
@@ -737,7 +883,7 @@ mod tests {
                 dial_with(&quiet(), StreamTag::Files, Duration::from_secs(15), |_b| {
                     n.fetch_add(1, Ordering::SeqCst);
                     Err(e)
-                });
+                }, None);
             assert_eq!(r, Err(e));
             assert_eq!(n.load(Ordering::SeqCst), 2, "{e:?} 须重试一次");
         }
@@ -747,7 +893,7 @@ mod tests {
             dial_with(&quiet(), StreamTag::Files, Duration::from_secs(15), |_b| {
                 n.fetch_add(1, Ordering::SeqCst);
                 Ok(7)
-            });
+            }, None);
         assert_eq!(r, Ok(7), "首试成功必须直接返回");
         assert_eq!(n.load(Ordering::SeqCst), 1);
         // ④ 预算已耗尽（budget=0）⇒ 连接面失败也不重试（不越界）
@@ -756,7 +902,7 @@ mod tests {
             dial_with(&quiet(), StreamTag::Files, Duration::ZERO, |_b| {
                 n.fetch_add(1, Ordering::SeqCst);
                 Err(StreamErr::Closed)
-            });
+            }, None);
         assert_eq!(r, Err(StreamErr::Closed));
         assert_eq!(n.load(Ordering::SeqCst), 1, "预算耗尽不得再试");
     }
@@ -785,10 +931,11 @@ mod tests {
         assert!(!refused_like(StreamErr::Busy), "0x23 不是 refused 面");
     }
 
-    /// **判据（dial 回执值空间穷举，§2.2 的 ④ 表逐行）**：八行各有断言——
-    /// `[0x01,rest]` / 空块续读 / 首字节非 0x01 / `Busy` / `Refused` / `Timeout` /
-    /// `Closed`（**显式归拨号失败，不得读成 EOF/成功**）/ `ConnectionLost`；另加
-    /// `NotSupported/Unbound/BadTag` 的防御面。
+    /// **判据（dial 回执值空间穷举，§2.2 的 ④ 表逐行；评审 r1 P0-4 改 typed 后同批
+    /// 迁移）**：八行各有断言——`[0x01,rest]` / 空块续读 / 首字节非 0x01 / `Busy` /
+    /// `Refused` / `Timeout` / `Closed`（**显式归拨号失败，不得读成 EOF/成功**）/
+    /// `ConnectionLost`；另加 `NotSupported/Unbound/BadTag` 的防御面。io kind 判定经
+    /// [`ack_err_to_io`]（消费面同款映射）。
     #[test]
     fn dial_ack_value_space_is_exhaustive() {
         let far = Some(Instant::now() + Duration::from_secs(5));
@@ -813,12 +960,11 @@ mod tests {
         assert_eq!(rest, vec![9]);
         assert_eq!(calls, 3, "空块不是结束形态");
 
-        // ③ 首字节非 0x01 ⇒ InvalidData（协议面错）
+        // ③ 首字节非 0x01 ⇒ Invalid（协议面错）
         let e = read_dial_ack(far, |_w| Ok(vec![0x22, 1, 2])).expect_err("非法首字节");
-        assert_eq!(e.kind(), io::ErrorKind::InvalidData, "{e:?}");
-        assert!(e.to_string().contains("dial 回执首字节非法"), "{e}");
+        assert_eq!(e, AckErr::Invalid("QUIC 服务流：dial 回执首字节非法（0x22）".to_owned()), "{e:?}");
 
-        // ④ 岛内快速失败 / 出口复位码 / 空面：逐行映射
+        // ④ 岛内快速失败 / 出口复位码 / 空面：typed 原样带回 + io kind 逐行映射
         for (se, kind) in [
             (StreamErr::Busy, io::ErrorKind::Other),
             (StreamErr::Refused, io::ErrorKind::ConnectionRefused),
@@ -829,21 +975,64 @@ mod tests {
             (StreamErr::BadTag, io::ErrorKind::Other),
         ] {
             let e = read_dial_ack(far, |_w| Err(se)).expect_err("必须归错");
-            assert_eq!(e.kind(), kind, "{se:?} 的 io kind");
+            assert_eq!(e, AckErr::Stream(se), "typed 原样带回：{se:?}");
+            assert_eq!(ack_err_to_io(e).kind(), kind, "{se:?} 的 io kind");
         }
         // ⑤ `Closed`（对端 FIN / 白名单外复位 / ConnectionLost）⇒ **显式拨号失败**
         //    （**不得**沿读半的 `Closed ⇒ Ok(0)` 读成「成功无回执」）
         let e = read_dial_ack(far, |_w| Err(StreamErr::Closed)).expect_err("Closed 必须是失败");
-        assert_eq!(e.kind(), io::ErrorKind::Other);
+        assert_eq!(e, AckErr::Stream(StreamErr::Closed));
         assert!(
-            e.to_string().contains("服务流已关闭"),
-            "Closed 的归因串：{e}"
+            ack_err_to_io(e).to_string().contains("服务流已关闭"),
+            "Closed 的归因串"
         );
 
-        // ⑥ 预算耗尽（deadline 已过）⇒ 不再调 read，直接 TimedOut
+        // ⑥ 预算耗尽（deadline 已过）⇒ 不再调 read，直接 Timeout
         let past = Some(Instant::now() - Duration::from_millis(1));
         let e = read_dial_ack(past, never).expect_err("预算耗尽");
-        assert_eq!(e.kind(), io::ErrorKind::TimedOut, "{e:?}");
+        let kind = ack_err_to_io(e).kind();
+        assert_eq!(kind, io::ErrorKind::TimedOut);
+    }
+
+    /// **判据（评审 r1 P0-4 的四 typed 负例）**：ack 阶段的服务级拒绝与协议面错
+    /// **零触发**——`Busy`/`Refused`/`NotSupported`/`InvalidData`（非法首字节与
+    /// 连续空块两形态）都不是承载证据（D2/Q-F-B D11），不得误发统一重连；
+    /// 对照组 `Closed`/`ConnectionLost` 各触发恰一次。
+    #[test]
+    fn dial_ack_stage_service_rejections_and_protocol_errors_do_not_fire() {
+        let far = Some(Instant::now() + Duration::from_secs(5));
+        // 四个 typed 负例：零触发、错误分类原样带回
+        for se in [
+            StreamErr::Busy,
+            StreamErr::Refused,
+            StreamErr::NotSupported,
+        ] {
+            let (n, cb) = counting_cb();
+            let r = dial_ack_stage(far, |_w| Err(se), Some(&cb));
+            assert_eq!(r, Err(AckErr::Stream(se)), "{se:?} typed 原样带回");
+            assert_eq!(n.load(Ordering::SeqCst), 0, "{se:?}（服务级拒绝）零触发");
+        }
+        // InvalidData 两形态（非法首字节 / 连续空块超限）：零触发 + Invalid 分类
+        for read in [
+            // 非法首字节（0x25 = 出口拒绝码——正常拒绝形态，不是连接死亡）
+            |_w: Duration| Ok(vec![0x25u8, 1, 2]),
+            // 连续空块超限（协议面无进展）
+            |_w: Duration| Ok(Vec::new()),
+        ] {
+            let (n, cb) = counting_cb();
+            let r = dial_ack_stage(far, read, Some(&cb));
+            assert!(matches!(r, Err(AckErr::Invalid(_))), "协议面错归 Invalid：{r:?}");
+            assert_eq!(n.load(Ordering::SeqCst), 0, "协议面错零触发");
+            let kind = ack_err_to_io(r.expect_err("须归错")).kind();
+            assert_eq!(kind, io::ErrorKind::InvalidData, "InvalidData 分类保真");
+        }
+        // 对照组：承载类各触发恰一次
+        for se in [StreamErr::Closed, StreamErr::ConnectionLost] {
+            let (n, cb) = counting_cb();
+            let r = dial_ack_stage(far, |_w| Err(se), Some(&cb));
+            assert_eq!(r, Err(AckErr::Stream(se)));
+            assert_eq!(n.load(Ordering::SeqCst), 1, "{se:?} 承载类触发恰一次");
+        }
     }
 
     /// **判据（`remain()` 的两形态）**：未到点 ⇒ 剩余额；到点/已过 ⇒ `Timeout`；
@@ -885,5 +1074,96 @@ mod tests {
         // 空余量（无回执余量的常规开流）⇒ 直接就 None
         let mut p = PendingBuf::new(Vec::new());
         assert_eq!(p.take(&mut out), None);
+    }
+
+    // ==========================================================================
+    // reconnect-oneshot 2.2：服务流承载失败触发面（CarrierFailureFn）
+    // ==========================================================================
+
+    /// 计数回调（触发面观测）。
+    fn counting_cb() -> (std::sync::Arc<std::sync::atomic::AtomicUsize>, CarrierFailureFn) {
+        let n = std::sync::Arc::new(AtomicUsize::new(0));
+        let n2 = std::sync::Arc::clone(&n);
+        (n, std::sync::Arc::new(move || {
+            n2.fetch_add(1, Ordering::SeqCst);
+        }))
+    }
+
+    /// **判据（2.2①）**：`dial_with` 第二次失败且承载类 ⇒ 触发恰一次（返回值不改）；
+    /// 首次失败不触发（预算耗尽形态）；Timeout/Refused/Busy（非承载类）不触发。
+    #[test]
+    fn dial_with_triggers_on_second_carrier_failure_only() {
+        // Closed/ConnectionLost：第二次失败（预算内重试后）⇒ 触发 1 次、Err 原样带回
+        for e in [StreamErr::Closed, StreamErr::ConnectionLost] {
+            let (n, cb) = counting_cb();
+            let r: Result<u8, StreamErr> = dial_with(
+                &quiet(),
+                StreamTag::Files,
+                Duration::from_secs(15),
+                |_b| Err(e),
+                Some(&cb),
+            );
+            assert_eq!(r, Err(e), "返回值不改（错误原样——触发在映射之前）");
+            assert_eq!(n.load(Ordering::SeqCst), 1, "{e:?}：第二次承载类失败触发一次");
+        }
+        // 非承载类（Timeout/Refused/Busy——目标拒绝类与超时不属承载类）：零触发
+        for e in [StreamErr::Timeout, StreamErr::Refused, StreamErr::Busy] {
+            let (n, cb) = counting_cb();
+            let _r: Result<u8, StreamErr> = dial_with(
+                &quiet(),
+                StreamTag::Files,
+                Duration::from_secs(15),
+                |_b| Err(e),
+                Some(&cb),
+            );
+            assert_eq!(n.load(Ordering::SeqCst), 0, "{e:?}：非承载类零触发");
+        }
+        // 首次承载失败（预算耗尽不重试）⇒ 零触发（只有第二次才触发）
+        let (n, cb) = counting_cb();
+        let _r: Result<u8, StreamErr> = dial_with(
+            &quiet(),
+            StreamTag::Files,
+            Duration::ZERO,
+            |_b| Err(StreamErr::ConnectionLost),
+            Some(&cb),
+        );
+        assert_eq!(n.load(Ordering::SeqCst), 0, "首次失败（未重试）零触发");
+    }
+
+    /// **判据（2.2③）**：portfwd 的 typed 层（`dial_target_typed`）——**首次承载失败
+    /// 即触发**（单次尝试路径无重试概念）；IO 层（`dial_target_raw`——宿主会话面）
+    /// 零触发。真 idle 岛：无 live 连接 ⇒ StreamOpen 立即 ConnectionLost。
+    #[test]
+    #[cfg(not(windows))]
+    fn dial_target_typed_fires_on_first_carrier_failure() {
+        let ident = crate::identity::Identity::ephemeral().expect("临时身份");
+        let cred = homeway_quic::IslandCredential::new(
+            homeway_quic::TokenSecret::from_bytes([7u8; 32]),
+            ident.public_key(),
+            *ident.dev_tag().as_bytes(),
+            homeway_quic::RpkPublicKey::from_bytes([9u8; 32]),
+        );
+        let mut icfg = homeway_quic::IslandConfig::new(cred);
+        icfg.bind = Some(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0));
+        let island = std::sync::Arc::new(
+            homeway_quic::Island::start(quiet(), std::sync::Arc::new(|_r: &str| {}), icfg)
+                .expect("idle 岛可起"),
+        );
+        let (n, cb) = counting_cb();
+        let dst: SocketAddrV4 = "127.0.0.1:8080".parse().unwrap();
+        let r = dial_target_typed(&island, dst, Duration::from_millis(200), Some(&cb));
+        assert!(r.is_err(), "idle 岛无 live 连接 ⇒ 拨号失败");
+        assert_eq!(
+            n.load(Ordering::SeqCst),
+            1,
+            "首次承载失败即触发（开流 ConnectionLost）"
+        );
+        // host_session 面（IO 层）：零触发（None 注入）
+        let (n2, cb2) = counting_cb();
+        let _ = &cb2;
+        let r2 = dial_target_typed(&island, dst, Duration::from_millis(200), None);
+        assert!(r2.is_err());
+        assert_eq!(n2.load(Ordering::SeqCst), 0, "None 注入零触发（宿主会话不接）");
+        island.stop();
     }
 }

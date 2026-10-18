@@ -1,10 +1,12 @@
-//! 需求信号与待发包下推判据（语义真源 `baseline:clientcore/cmd/clientcore/demand.go`
+//! 需求信号面（语义真源 `baseline:clientcore/cmd/clientcore/demand.go`
 //! 纯函数面；openspec demand-driven-recovery）。
 //!
 //! 背景（2026-09-23 弹窗事故）：熄屏挂起期里巡检把「本地 EPERM 禁发」与「零流量需求期
 //! 的对端无响应」当失败证据累积。本模块把「需求」变成核内一等信号：
 //! - 计证据档（每巡检拍）：本拍 App 出站包数 > 0，或新鲜的**亮屏**位（前台位仅诊断）；
-//! - 触发档（下推器）：App 出站新鲜 + 对端接收静默 → 立即下推阶梯（不等巡检拍）；
+//! - **reconnect-oneshot（2026-10-17）**：demand-push 决策面（`should_push` 族）已随
+//!   1s 拍线程退役删除——本模块只剩**诊断记账面**（`DemandSignals`：activity 位 +
+//!   最近一拍判定，stats 观测线程消费；恢复驱动 = 事件触发的一次性重连，不读本面）。
 //! - 本地发送错误（EPERM 等）恒为环境噪声：不触发换源。
 
 use std::sync::Mutex;
@@ -21,13 +23,11 @@ use std::time::{Duration, Instant};
 /// 需求门控」+ tasks 2.5）。
 pub const ACTIVITY_FRESHNESS: Duration = Duration::from_secs(600);
 
-/// App 出站包新鲜窗——「有包在等」的口径（下推器 1s 节拍检查）。
-pub const OUTBOUND_FRESH: Duration = Duration::from_secs(5);
-/// 接收静默阈值：已采纳路径上太久没收到对端任何包 = 隧道大概率死了
-/// （与旧 handshakeheal 机制的历史取值同源；健康会话 rekey 120s）。
-pub const RECV_STALE: Duration = Duration::from_secs(90);
-/// 下推限频：一轮 R1（最坏 ~13s）+ 60s 冷却内不重复。
-pub const PUSH_COOLDOWN: Duration = Duration::from_secs(60);
+// reconnect-oneshot D4（评审 r1 P0-2 整改）：决策面四件已删——
+// `OUTBOUND_FRESH`/`RECV_STALE`/`PUSH_COOLDOWN`/`should_push`（含 `should_push_matrix`
+// 单测）。它们是 demand-push 1s 拍线程的判据（下推器已随 2026-10-17 事故批整体退役）；
+// 现行需求面 = `DemandSignals` 诊断记账（`patrol_demand`/`note_demand`——stats 观测
+// 线程消费）+ `activity_signal`。
 
 /// 扩展经 NAPI（ClientCoreTunSetActivity）下发的「App 前台 / 设备亮屏」。
 /// 初始为零值（两处都按 false + 陈旧处理——prepare 早期扩展还没来得及推值，保守不算需求）。
@@ -120,61 +120,11 @@ fn patrol_demand_with(out_pkts: i64, signal: impl FnOnce() -> (bool, bool)) -> (
     (false, "熄屏（位陈旧）")
 }
 
-/// 待发包下推判据（Go shouldPush 纯函数，表驱动单测钉语义）：
-/// - 出站新鲜窗内没有出站 ⇒ 没有包在等；
-/// - 链路最近（`RECV_STALE` 内）有回包 ⇒ 不构成「过不去」；
-/// - 采纳路径本地错误新鲜（挂起禁发）⇒ 换源无效，等环境恢复；
-/// - 以上都过 ⇒ 受 `PUSH_COOLDOWN` 限频；
-/// - `recv_at = None` = 从未收到对端包，按静默的极端形态处理（软失败世代）。
-pub fn should_push(
-    out_at: Option<Instant>,
-    recv_at: Option<Instant>,
-    now: Instant,
-    has_fresh_local_err: bool,
-    since_last_push: Option<Duration>,
-) -> bool {
-    let Some(out) = out_at else { return false };
-    if now.duration_since(out) > OUTBOUND_FRESH {
-        return false; // 没有出站在等
-    }
-    if let Some(recv) = recv_at {
-        if now.duration_since(recv) < RECV_STALE {
-            return false; // 链路最近有回包：不构成「过不去」
-        }
-    }
-    if has_fresh_local_err {
-        return false; // 采纳路径本地错误（挂起禁发）：换源无效
-    }
-    match since_last_push {
-        None => true, // 从未推过
-        Some(d) => d >= PUSH_COOLDOWN,
-    }
-}
+// （决策面 `should_push` 已随 reconnect-oneshot D4 删除——见文件头常量区的整改注记。）
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    /// Go shouldPush 判据链的表驱动对照（demand.go 注释口径）。
-    #[test]
-    fn should_push_matrix() {
-        let now = Instant::now();
-        let s = Duration::from_secs(1);
-        // 没有出站在等（无出站 / 过期）
-        assert!(!should_push(None, None, now, false, None));
-        assert!(!should_push(Some(now - OUTBOUND_FRESH - s), None, now, false, None));
-        // 有出站在等 + 从未收包（静默极端）+ 无本地错 + 未推过 ⇒ 推
-        assert!(should_push(Some(now - s), None, now, false, None));
-        // 链路最近有回包：不推
-        assert!(!should_push(Some(now - s), Some(now - s), now, false, None));
-        // 回包静默超阈值：推
-        assert!(should_push(Some(now - s), Some(now - RECV_STALE - s), now, false, None));
-        // 本地错误新鲜：不推（环境噪声）
-        assert!(!should_push(Some(now - s), Some(now - RECV_STALE - s), now, true, None));
-        // 限频：冷却内不推，到点推
-        assert!(!should_push(Some(now - s), None, now, false, Some(PUSH_COOLDOWN - s)));
-        assert!(should_push(Some(now - s), None, now, false, Some(PUSH_COOLDOWN)));
-    }
 
     /// patrolDemand 合成表（出站包优先；亮屏/熄屏/位陈旧三分支）。
     #[test]

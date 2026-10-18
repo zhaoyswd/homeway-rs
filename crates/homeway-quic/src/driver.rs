@@ -41,8 +41,8 @@ use crate::client::ladder::{self, Ladder, Round, SendFace, Step as LadderStep};
 use crate::client::streams::{self, StreamStats, Streams};
 use crate::client::{self, Face, Live, MigrationEvent, Watch};
 use crate::cmd::{
-    Candidate, Cmd, DropReason, IslandErr, IslandEvent, IslandSnapshot, Logf, OnEvent, OnUnhealthy,
-    RaceOutcome, Via,
+    Candidate, CarrierFlag, Cmd, DropReason, IslandErr, IslandEvent, IslandSnapshot, Logf, OnAdopt,
+    OnEvent, OnPacketDemand, OnUnhealthy, RaceOutcome, Via,
 };
 use crate::config::IslandConfig;
 use crate::stream::{StreamErr, OPEN_BUDGET};
@@ -108,6 +108,17 @@ struct IslandCtx {
     /// 事件回调（`SetOnEvent` 安装；未装 = 只入快照 + 行）。`Arc` 形态：数据面任务
     /// （回程泵）也要经同一条计数面上报。
     on_event: Arc<Mutex<Option<OnEvent>>>,
+    /// 读面需求触发回调（`SetOnPacketDemand` 安装；未装 = 读面零触发——测试/宿主
+    /// 形态）。**TunAttach 时取出直交读线程**（读路径零锁——契约严于 `OnUnhealthy`）。
+    on_packet_demand: Mutex<Option<OnPacketDemand>>,
+    /// 承载原子位（reconnect-oneshot D2；`None` = 无承载面跟踪）。岛侧沿写：
+    /// housekeeping 连接死/刷新失败/僵尸收口 → false；adopt → true（设备死在场由
+    /// [`CarrierFlag::mark_alive`] 自拦）；收工 → false。
+    carrier: Option<Arc<CarrierFlag>>,
+    /// adopt 沿回调（评审 r1 P1-7；`None` = 不通知——测试/宿主形态）。adopt 置
+    /// carrier true 后调用——facade 侧清残留 patrol，防「healthy=false ∧ carrier=true」
+    /// 黏滞（该形态下读面/B 门/stats 三类恢复入口全部失效）。
+    on_adopt: Option<OnAdopt>,
     /// TUN 面的共享计数（读线程/写线程两写、同步面读——`wgcore::TunCounters` 语义）。
     counters: Arc<TunCounters>,
     /// **服务流面计数**（M3 S1：写者/读任务在岛线程外加，快照装配读；同一枚 `Arc`
@@ -226,6 +237,9 @@ impl Island {
             logf: Arc::clone(&logf),
             on_unhealthy: Mutex::new(Arc::clone(&on_unhealthy)),
             on_event: Arc::new(Mutex::new(None)),
+            on_packet_demand: Mutex::new(None),
+            carrier: cfg.carrier.clone(),
+            on_adopt: cfg.on_adopt.clone(),
             counters: Arc::clone(&counters),
             stream_stats: Arc::clone(&stream_stats),
             ladder_probe_ok: Arc::clone(&ladder_probe_ok),
@@ -566,6 +580,9 @@ struct DriverState {
     race_gate: client::LogGate,
     /// 累计投出的候选数（快照 `mirrors`）。
     mirrors: u64,
+    /// 累计换绑命令数（快照 `rebinds`——评审 r3 B3：worker「零后续命令」断言的
+    /// Rebind 侧计数，与 `mirrors`〔Connect 侧〕成对）。
+    rebinds: u64,
     /// 迁移保持检测窗（重绑后起）。
     watch: Option<Watch>,
     /// N-a 行只打一次（端点就绪 + 首个连接的实测 MTU）。
@@ -667,6 +684,7 @@ fn run_driver(
             racing: false,
             race_gate: client::LogGate::new(),
             mirrors: 0,
+            rebinds: 0,
             watch: None,
             na_logged: false,
             patrol,
@@ -852,6 +870,12 @@ fn run_driver(
         }
         // 收工：长任务全 abort（JoinSet drop）→ 连接面/端点随 face drop 关闭
         drop(jobs);
+        // reconnect-oneshot D2：世代收工 = 承载位「置 false」沿（facade 侧的
+        // mark_unhealthy("stop") 同批经 CarrierFlag::mark_device_dead 双写，这里兜
+        // 「收工而无 stop 分类回调」的防御面）。
+        if let Some(c) = &ctx.carrier {
+            c.mark_dead();
+        }
         (*ctx.logf)("岛收工（连接面随端点关闭）");
     });
 }
@@ -902,6 +926,15 @@ fn adopt(
         addr: est.ep,
         via: est.via,
     });
+    // reconnect-oneshot D2 + 评审 r1 P1-7 / r2 B2④：adopt = 承载位「置 true」沿 +
+    // facade 残留 patrol 的清除——**两件事都经 `on_adopt` 回调由 facade 锁内完成**
+    // （`on_adopt_if_current` 在 health 临界区内判 device_dead 后置 carrier true 并清
+    // patrol；driver 不再直接 `mark_alive`——锁外直写会与 facade 的
+    // mark_transport 交错产出 `patrol ∧ carrier=true` 黏滞：读面不再触发、stats
+    // 稳态门关闭、B 门 no-op——三类恢复入口全部失效，直到下一次外部事件）。
+    if let Some(cb) = &ctx.on_adopt {
+        cb();
+    }
     let adopted = Live::new(est, patrol);
     // M5 §2.4-A-2 ①：本世代「曾完成准入」位（`Live` 只在四帧准入之后构造）——连接死的
     // 恢复动作判据（旧 `tun.is_some()` 在宿主会话恒假 ⇒ 阶梯被结构性关闭）。
@@ -1003,6 +1036,10 @@ async fn housekeeping(
         }
         // 关键转换：快照立即到期（节流见 ④）
         st.snap_sync_last = None;
+        // reconnect-oneshot D2：连接死亡（housekeeping 判定）= 承载位「置 false」沿。
+        if let Some(c) = &ctx.carrier {
+            c.mark_dead();
+        }
         // M3：在册服务流一并作废（读回 EOF / 写快速失败；§1.6 的 EOF 同形性——
         // 与今天 `stackb` 在连接死时的表现一致，调用方按需重开）
         let n = st.streams.clear_on_connection_loss();
@@ -1035,6 +1072,11 @@ async fn housekeeping(
             st.watch = None;
             st.pump_conn = None;
             st.snap_sync_last = None; // 关键转换：快照立即到期（节流见 ④）
+            // reconnect-oneshot D2：刷新失败判连接死 = 承载位 false 沿（housekeeping
+            // 判定的同一族）。
+            if let Some(c) = &ctx.carrier {
+                c.mark_dead();
+            }
             // M5 §2.4-A-2 ①：同 ① 支——判据 = 「曾完成准入」（`live` 刚被置 None ⇒ 用它恒假）。
             if st.admitted {
                 let send = send_face(face, st.ladder.tuning().send_err_fresh);
@@ -1100,6 +1142,7 @@ async fn housekeeping(
         let mut s = lock_unpoison(&ctx.snapshot);
         s.candidates = st.cands.len();
         s.mirrors = st.mirrors;
+        s.rebinds = st.rebinds;
         s.local = Some(face.local());
         s.connections = u64::from(st.live.is_some());
         s.packets_out = ctx.counters.write_pkts();
@@ -1214,6 +1257,8 @@ async fn handle_cmd(
                 tx.clone(),
                 Arc::clone(&ctx.counters),
                 Arc::clone(&ctx.logf),
+                ctx.carrier.clone(),
+                lock_unpoison(&ctx.on_packet_demand).clone(),
             ) {
                 lock_unpoison(&ctx.snapshot).attached = false;
                 log_spawn_failed(&ctx.logf, tun::READ_THREAD, &e, "应用出站方向不可用（回程面照常）");
@@ -1278,6 +1323,10 @@ async fn handle_cmd(
         Cmd::SetOnUnhealthy { h } => {
             *lock_unpoison(&ctx.on_unhealthy) = h;
         }
+        Cmd::SetOnPacketDemand { h } => {
+            // 生产装配在 TunAttach 之前发送（通道 FIFO ⇒ 读线程起跑前已装）。
+            *lock_unpoison(&ctx.on_packet_demand) = Some(h);
+        }
         Cmd::SetOnEvent { h } => {
             *lock_unpoison(&ctx.on_event) = Some(h);
         }
@@ -1298,6 +1347,7 @@ async fn handle_cmd(
         Cmd::Connect {
             cands,
             budget,
+            demote_adopted,
             reply,
         } => {
             if st.racing {
@@ -1305,6 +1355,13 @@ async fn handle_cmd(
                 return;
             }
             let list = if cands.is_empty() { st.cands.clone() } else { cands };
+            // 换网源降权（r9-N9：按 addr 匹配 `ladder_cand`，同 addr 不同 via 也降；
+            // 降权到队尾、不删空——单端点 token 仍在列，避免比旧端点重试更糟）。
+            let list = if demote_adopted {
+                demote_adopted_tail(&list, st.ladder_cand)
+            } else {
+                list
+            };
             if list.is_empty() {
                 let _ = reply.send(Err(IslandErr::NoCandidate));
                 return;
@@ -1331,8 +1388,10 @@ async fn handle_cmd(
             }));
         }
         Cmd::Rebind { local, reply } => {
-            // 评审 r1 低-6：local/迁移位进快照不滞后（节流见 housekeeping ④）
+            // 评审 r1 低-6：local/迁移位进快照不滞后（节流见 housekeeping ④）；
+            // 评审 r3 B3：命令计数同步入快照（rebinds）。
             st.snap_sync_last = None;
+            st.rebinds += 1;
             let from = face.local();
             match face.rebind(local) {
                 Ok(to) => {
@@ -1616,7 +1675,7 @@ fn ladder_step(
             }
             LadderStep::Rebuild { why, r_fails } => {
                 (*ctx.logf)(&format!(
-                    "快探阶梯走完 M/R（连续重连失败 {r_fails}，原因={why}）—— 上报不健康（交世代重建）"
+                    "快探阶梯走完 M/R（连续重连失败 {r_fails}，原因={why}）—— 上报传输不健康（交一次性重连）"
                 ));
                 // 僵尸连接收口（2026-10-14 MacBook Pro 实测）：走到 B 的现任连接多半是
                 // 「发送面报错但 QUIC 未判死」的半死态——不关，后续 `StreamOpen` 仍会在
@@ -1646,6 +1705,26 @@ fn reconnect_candidates(roster: &[Candidate], current: Option<Candidate>) -> Vec
     list
 }
 
+/// 换网源降权（reconnect-oneshot D2-r9-N9）：把与 `ladder_cand` **同 addr** 的候选
+/// 降权到队尾（按 addr 匹配——ladder_cand 是 `{addr,via}`，同 addr 不同 via 也要降；
+/// 稳定保序）。`None`/无匹配 ⇒ 原样返回；**不删空**——单端点 token 降权后仍在列。
+fn demote_adopted_tail(list: &[Candidate], ladder_cand: Option<Candidate>) -> Vec<Candidate> {
+    let Some(adopted) = ladder_cand else {
+        return list.to_vec();
+    };
+    let mut head: Vec<Candidate> = Vec::with_capacity(list.len());
+    let mut tail: Vec<Candidate> = Vec::new();
+    for c in list {
+        if c.addr == adopted.addr {
+            tail.push(*c);
+        } else {
+            head.push(*c);
+        }
+    }
+    head.extend(tail);
+    head
+}
+
 /// B 门前的僵尸连接收口：关现任连接、在册服务流按 EOF 收、清同连接态
 /// （与 `housekeeping` 的「连接已断」分支同形，但那条只在 QUIC 自己判死时走——
 /// 半死态连接到不了那里）。
@@ -1653,9 +1732,16 @@ fn drop_zombie_live(st: &mut DriverState, ctx: &IslandCtx) {
     let Some(old) = st.live.take() else { return };
     let n = st.streams.clear_on_connection_loss();
     old.conn.close(quinn::VarInt::from_u32(0), b"island rebuild");
+    // 评审 r2 P2：行文改 v5 语义（「世代重建」已退役——B 门后交统一入口的一次性重连；
+    // 历史行文 `世代重建前收口 —— …` 见 INTEROP-CRITERIA 2026-10-14 条目）。
     (*ctx.logf)(&format!(
-        "世代重建前收口 —— 现任连接已关、{n} 条在册服务流按 EOF 收（调用方按需重开）"
+        "B 门僵尸收口 —— 现任连接已关、{n} 条在册服务流按 EOF 收（交一次性重连；调用方按需重开）"
     ));
+    // reconnect-oneshot D2：僵尸收口 = 承载位「置 false」沿（B 门标记路径的前半——
+    // 后半由 facade 的 mark_transport_if_current 在同一健康临界区内补齐）。
+    if let Some(c) = &ctx.carrier {
+        c.mark_dead();
+    }
     st.watch = None;
     st.pump_conn = None;
     st.snap_sync_last = None;
@@ -1939,4 +2025,51 @@ mod reconnect_candidates_tests {
         assert_eq!(reconnect_candidates(&[], Some(c(9, Via::Direct))), vec![c(9, Via::Direct)], "无名册 = 只有现任");
         assert!(reconnect_candidates(&[], None).is_empty());
     }
+
+#[cfg(test)]
+mod demote_tests {
+    use super::*;
+
+    fn cand(addr: [u8; 4], port: u16) -> Candidate {
+        Candidate {
+            addr: std::net::SocketAddrV4::new(addr.into(), port),
+            via: Via::Direct,
+        }
+    }
+
+    /// **判据（reconnect-oneshot D2-r9-N9 换网降权）**：与 `ladder_cand` **同 addr**
+    /// 的候选降权到队尾（同 addr 不同 via 也降——按 addr 匹配）；稳定保序；**不删空**
+    /// （单端点 token 降权后仍在列——避免比旧端点重试更糟的 NoCandidate）；无匹配/
+    /// 无采纳 ⇒ 原样。
+    #[test]
+    fn demote_adopted_moves_same_addr_to_tail_without_deleting() {
+        let a = cand([1, 1, 1, 1], 1);
+        let b = cand([2, 2, 2, 2], 2);
+        let c = cand([3, 3, 3, 3], 3);
+        // 同 addr 不同 via 的候选也要降
+        let a_relay = Candidate {
+            addr: a.addr,
+            via: Via::Relay { label: [9u8; 8] },
+        };
+        let adopted = Candidate {
+            addr: a.addr,
+            via: Via::Direct,
+        };
+        // 降权：a 与 a_relay（同 addr）沉尾，b/c 保序在前
+        let list = [b, a, c, a_relay];
+        let out = demote_adopted_tail(&list, Some(adopted));
+        assert_eq!(out, vec![b, c, a, a_relay], "同 addr 沉尾、其余稳定保序");
+        // 不删空：单端点（= 采纳端点）仍在列
+        let single = [a];
+        assert_eq!(
+            demote_adopted_tail(&single, Some(adopted)),
+            vec![a],
+            "单端点降权后仍在列（不删空）"
+        );
+        // 无采纳（None）/ 无匹配 ⇒ 原样
+        assert_eq!(demote_adopted_tail(&list, None), list.to_vec());
+        let other = cand([9, 9, 9, 9], 9);
+        assert_eq!(demote_adopted_tail(&list, Some(other)), list.to_vec());
+    }
+}
 }

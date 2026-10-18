@@ -112,6 +112,8 @@ impl Face {
             streams: stream_limits,
             probe: _,
             cc,
+            carrier: _,
+            on_adopt: _,
         } = cfg;
         let relays = RelayTable::new();
         let stats = Arc::new(Mutex::new(SockStats::default()));
@@ -388,10 +390,11 @@ pub(crate) async fn probe(
     check(conn)?;
     let deadline = TokioInstant::now() + budget;
     // 并发探活串行化（同刻只许一条在途；拿锁本身也在预算内——否则一条卡死的探活会把
-    // 后续探活拖出预算）。
+    // 后续探活拖出预算）。拿锁超时 = **槽位争用**（并发面而非对端证据）⇒ 独立 typed
+    // `ProbeBusy`（评审 r3 B7：此前与 `ProbeNoResponse` 同串，会把并发超时计入连败）。
     let mut guard = match tokio::time::timeout(budget, slot.lock()).await {
         Ok(g) => g,
-        Err(_) => return Err(IslandErr::ProbeNoResponse),
+        Err(_) => return Err(IslandErr::ProbeBusy),
     };
     if guard.is_none() {
         let left = deadline.saturating_duration_since(TokioInstant::now());

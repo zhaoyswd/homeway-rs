@@ -22,8 +22,8 @@ use crate::cmd::{
 };
 use crate::driver::seams;
 use crate::{
-    Island, IslandConfig, IslandCredential, IslandTx, Logf, OnEvent, OnUnhealthy, RpkPublicKey,
-    TokenSecret,
+    Island, IslandConfig, IslandCredential, IslandTx, Logf, OnEvent, OnPacketDemand,
+    OnUnhealthy, RpkPublicKey, TokenSecret,
 };
 
 /// 收工预算（与 `wgcore::CLIENT_CLOSE_BUDGET` 同量级 = 2s）。
@@ -448,6 +448,11 @@ fn cmd_member_field_types_are_pinned() {
             Cmd::SetOnUnhealthy { h } => {
                 let _: OnUnhealthy = h;
             }
+            // reconnect-oneshot D2：读面需求触发回调（读线程内执行——契约严于
+            // OnUnhealthy：禁日志禁锁禁阻塞）。
+            Cmd::SetOnPacketDemand { h } => {
+                let _: OnPacketDemand = h;
+            }
             Cmd::SetOnEvent { h } => {
                 let _: OnEvent = h;
             }
@@ -457,10 +462,12 @@ fn cmd_member_field_types_are_pinned() {
             Cmd::Connect {
                 cands,
                 budget,
+                demote_adopted,
                 reply,
             } => {
                 let _: Vec<Candidate> = cands;
                 let _: Duration = budget;
+                let _: bool = demote_adopted;
                 let _: IslandReply<RaceOutcome> = reply;
             }
             Cmd::Rebind { local, reply } => {
@@ -529,6 +536,8 @@ fn island_err_variants_are_pinned() {
             IslandErr::ConnectionLost => {}
             IslandErr::RegistrationFailed => {}
             IslandErr::ProbeNoResponse => {}
+            // 评审 r3 B7 增补：探活槽位争用（typed——stats 不进连败的判定源）。
+            IslandErr::ProbeBusy => {}
             IslandErr::Rebind(io_err) => {
                 // 载荷必须是 std 的 io::Error（异步栈错误无处可藏）
                 let _: std::io::Error = io_err;
