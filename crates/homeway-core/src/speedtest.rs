@@ -804,12 +804,16 @@ fn run_phases(
         // warmup+window+15s 硬期限收口（R8-8c：F8 登记的 timeout 分支极端形态）。
         c.set_deadline(Some(p.warmup + p.down + CONN_BUDGET));
     }
-    let window_start = Instant::now() + p.warmup + PHASE_SLACK;
+    let down_anchor = Instant::now();
+    let window_start = down_anchor + p.warmup + PHASE_SLACK;
     // 每流一线程并发读（Go goroutine 同构；窗口内到达才计读数）
     let mut down_bytes: i64 = 0;
     let mut down_usage: i64 = 0;
     let mut srv_bytes: i64 = 0;
     let mut srv_warm: i64 = 0;
+    // 逐流读数（窗内 / 窗后 / 服务端窗口 / 服务端预热）——真机「读数抖动」归因面：
+    // 合计值掩盖「2 流快 2 流饿死」与「客户端读取被拖慢」两种完全不同的形态。
+    let mut per_stream: Vec<(i64, i64, i64, i64)> = Vec::new();
     let down_join: Result<(), SpeedtestError> = std::thread::scope(|s| {
         let live2 = live.cloned();
         let handles: Vec<_> = down_conns
@@ -878,6 +882,7 @@ fn run_phases(
             let (g, u, sb, sw) = h
                 .join()
                 .map_err(|_| SpeedtestError::Frame("下行读线程 panic".into()))??;
+            per_stream.push((g, u, sb, sw));
             down_bytes += g;
             down_usage += g + u;
             srv_bytes += sb;
@@ -886,6 +891,26 @@ fn run_phases(
         Ok(())
     });
     down_join?;
+    // 逐流下行（判据：任何一条流窗内 ≈ 0 而服务端有量 ⇒ 客户端读取/流控问题；
+    // 四流均匀而整体低 ⇒ 链路/发送窗问题）。1 起编号 = 拨号序。
+    logf(&format!(
+        "speedtest: 逐流下行（{}）",
+        per_stream
+            .iter()
+            .enumerate()
+            .map(|(i, (g, u, sb, sw))| format!(
+                "#{} 窗内={}B 窗后={}B 服务端={}B 预热={}B",
+                i + 1,
+                g,
+                u,
+                sb,
+                sw
+            ))
+            .collect::<Vec<_>>()
+            .join("；")
+    ));
+    // 下行相位实际墙钟（≥ warmup+window+slack ≈ 12.1s；明显超出 ⇒ 写/读侧被阻塞）
+    let down_wall = down_anchor.elapsed();
     if srv_bytes > 0 {
         let dev = (srv_bytes - down_bytes) as f64 / srv_bytes as f64 * 100.0;
         logf(&format!(
@@ -897,6 +922,7 @@ fn run_phases(
     // ---- 上行：新连接（每流一角色不复用）；每流一线程泵送 ----
     // 拨号窗相位回空档（复核 r3-F13：Go 相位回「建立连接」——Status 面对应
     // connecting，不带着 down 误报）
+    let up_t0 = Instant::now();
     if let Some(l) = live {
         l.set_phase(0);
     }
@@ -922,6 +948,7 @@ fn run_phases(
     let mut up_bytes: i64 = 0;
     let mut up_usage: i64 = 0;
     let mut wall_sum: i64 = 0;
+    let mut per_stream_up: Vec<(i64, i64, i64)> = Vec::new();
     let up_join: Result<(), SpeedtestError> = std::thread::scope(|s| {
         let live2 = live.cloned();
         let handles: Vec<_> = up_conns
@@ -959,6 +986,7 @@ fn run_phases(
             let (used, bytes, wall) = h
                 .join()
                 .map_err(|_| SpeedtestError::Frame("上行泵线程 panic".into()))??;
+            per_stream_up.push((used, bytes, wall));
             up_usage += used;
             up_bytes += bytes;
             wall_sum += wall;
@@ -966,6 +994,23 @@ fn run_phases(
         Ok(())
     });
     up_join?;
+    let up_wall = up_t0.elapsed();
+    // 逐流上行（服务端报数；墙钟 = 服务端 START→FINISH 实测）
+    logf(&format!(
+        "speedtest: 逐流上行（{}）",
+        per_stream_up
+            .iter()
+            .enumerate()
+            .map(|(i, (used, bytes, wall))| format!(
+                "#{} 泵出={}B 服务端={}B 墙钟={}ms",
+                i + 1,
+                used,
+                bytes,
+                wall
+            ))
+            .collect::<Vec<_>>()
+            .join("；")
+    ));
     // 上行分母 = 服务端实测墙钟均值（名义 10s 有 ~1% 虚高，Go 同口径）
     let denom = if wall_sum > 0 {
         Duration::from_millis((wall_sum / p.streams as i64).max(1) as u64)
@@ -976,13 +1021,15 @@ fn run_phases(
 
     let wall_ms = t0.elapsed().as_millis() as u64;
     logf(&format!(
-        "speedtest: 完成（down={:.0}B/s（{:.2}Mbps） up={:.0}B/s（{:.2}Mbps） 用量={}MB 用时={}s）",
+        "speedtest: 完成（down={:.0}B/s（{:.2}Mbps） up={:.0}B/s（{:.2}Mbps） 用量={}MB 用时={}s 下行用={:.1}s 上行用={:.1}s）",
         down_bps,
         down_bps * 8.0 / 1e6,
         up_bps,
         up_bps * 8.0 / 1e6,
         (down_usage + up_usage) / (1 << 20),
-        wall_ms / 1000
+        wall_ms / 1000,
+        down_wall.as_secs_f64(),
+        up_wall.as_secs_f64()
     ));
     Ok(SpeedtestResult {
         down_bps,
@@ -1301,5 +1348,73 @@ mod tests {
         assert_eq!(split_top_level(r#""a\"b""#), vec![r#""a\"b""#]);
         // 不平衡引号 = 对抗输入：按扫描尾态整体返回（解析侧后续步骤自然报错/忽略）
         assert_eq!(split_top_level(r#""a,b"#), vec![r#""a,b"#]);
+    }
+
+    /// 逐流判据行（2026-10-18 真机「测速读数抖动」排障教训）：下行/上行各一行、
+    /// **逐流**列窗内/服务端——合计值会掩盖「2 流快 2 流饿死」与「客户端读取被
+    /// 拖慢」两种完全不同的形态；完成行带两相位墙钟（窗口越界可见）。
+    #[test]
+    fn per_stream_breakdown_logged() {
+        /// 首读即回一帧合法 REPORT（下行相位秒收场；上行 FINISH 后同款）。
+        struct ReportConn;
+        impl SpeedConn for ReportConn {
+            fn write_frame(&self, _data: &[u8]) -> Result<(), SpeedtestError> {
+                Ok(())
+            }
+            fn read_some(&self) -> Result<Vec<u8>, SpeedtestError> {
+                let mut f = Frame::new();
+                Ok(f
+                    .control(
+                        TYPE_REPORT,
+                        br#"{"bytes":1024,"warmup_bytes":0,"wall_ms":10}"#,
+                    )
+                    .to_vec())
+            }
+            fn kill(&self) {}
+        }
+        let logs = std::sync::Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let l2 = std::sync::Arc::clone(&logs);
+        let p = Params {
+            warmup: Duration::from_millis(5),
+            down: Duration::from_millis(20),
+            up: Duration::from_millis(20),
+            streams: 2,
+        };
+        let dial = || {
+            Ok::<std::sync::Arc<dyn SpeedConn>, SpeedtestError>(std::sync::Arc::new(ReportConn))
+        };
+        let r = run_dial(
+            &dial,
+            p,
+            &move |s: &str| l2.lock().unwrap().push(s.to_owned()),
+            None,
+            None,
+        );
+        assert!(r.is_ok(), "假连接应跑完整轮：{r:?}");
+        let lines = logs.lock().unwrap();
+        let down = lines
+            .iter()
+            .find(|l| l.starts_with("speedtest: 逐流下行（"))
+            .unwrap_or_else(|| panic!("缺逐流下行行：{lines:?}"));
+        assert!(
+            down.contains("#1 窗内=") && down.contains("#2 窗内=") && down.contains("服务端="),
+            "逐流下行逐流列窗内/服务端：{down}"
+        );
+        let up = lines
+            .iter()
+            .find(|l| l.starts_with("speedtest: 逐流上行（"))
+            .unwrap_or_else(|| panic!("缺逐流上行行：{lines:?}"));
+        assert!(
+            up.contains("#1 泵出=") && up.contains("#2 泵出=") && up.contains("墙钟="),
+            "逐流上行逐流列泵出/服务端/墙钟：{up}"
+        );
+        let done = lines
+            .iter()
+            .find(|l| l.starts_with("speedtest: 完成（"))
+            .unwrap_or_else(|| panic!("缺完成行：{lines:?}"));
+        assert!(
+            done.contains("下行用=") && done.contains("上行用="),
+            "完成行带两相位墙钟（窗口越界可见）：{done}"
+        );
     }
 }

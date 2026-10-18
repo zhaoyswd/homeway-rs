@@ -48,6 +48,12 @@ pub struct SpeedParams {
     pub warmup_ms: i64,
     #[serde(default)]
     pub streams: i64,
+    /// 轮内日志落盘路径（App 形态的隧道日志；空 = 不落盘——CLI/守护形态自带 stdout）。
+    /// why：App 进程核没有 stdout，`speedtest: 开跑/完成/逐流/对账` 这些判据行此前
+    /// **整段丢弃** ⇒ 真机「读数抖动」时客户端侧一行证据都没有（2026-10-18 排障教训：
+    /// 只有出口侧日志，无法区分「链路慢」与「客户端读取被拖慢/窗口越界」）。
+    #[serde(default)]
+    pub log: String,
 }
 
 /// 引擎测速回执的归一面（crate::speedtest 的 Result + 失败码 → 信封形态）。
@@ -247,6 +253,30 @@ impl crate::speedtest::SpeedConn for BridgeSpeedConn {
     }
 }
 
+/// App 形态的轮内日志落盘（`log` 参数为空 = 不落盘——CLI/守护形态自带 stdout 面）。
+///
+/// 与核的隧道日志逐字同形（`{local_ts} tier-core: {msg}\n`；O_APPEND 单次写，与
+/// 扩展进程/服务会话共写同一文件时行不粘连）。打不开就静默降级——日志不该挡测速。
+fn round_logger(path: &str) -> Box<dyn Fn(&str)> {
+    if path.is_empty() {
+        return Box::new(|_: &str| {});
+    }
+    let Ok(file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    else {
+        return Box::new(|_: &str| {});
+    };
+    let file = std::sync::Arc::new(Mutex::new(file));
+    Box::new(move |s: &str| {
+        let line = format!("{} tier-core: {s}\n", super::tun_exec::local_ts());
+        if let Ok(mut g) = file.lock() {
+            let _ = g.write_all(line.as_bytes());
+        }
+    })
+}
+
 /// App 引擎入口：拨桥 + 鉴权 → `speedtest::run_dial`（同步跑完整轮——NAPI 壳在
 /// async work 线程上跑；失败信封同 `SpeedOutcome::Fail`）。cancel 位经参数注入；
 /// `live` = 进度出口（M-7：SpeedHost 的 Status 面消费——相位 + 字节）。
@@ -441,6 +471,32 @@ mod tests {
         assert_eq!(v["downBps"], 123.5);
     }
 
+    /// App 形态轮内日志落盘：行带本地时间戳 + `tier-core:` 前缀（与核隧道日志同形），
+    /// 追加语义（跨轮不清历史）；空路径 = 不落盘（CLI/守护面）。
+    #[test]
+    fn round_logger_appends_tier_core_lines() {
+        let dir = std::env::temp_dir().join(format!("hw-speedlog-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("core-tun.log");
+        let p = path.to_str().unwrap();
+        let f = round_logger(p);
+        f("speedtest: 开跑（down 4流）");
+        let f2 = round_logger(p); // 跨轮重开：追加不截断
+        f2("speedtest: 完成（down=1B/s）");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(body.lines().count(), 2, "两轮各一行：{body}");
+        assert!(
+            body.contains("tier-core: speedtest: 开跑（down 4流）"),
+            "行形态与核隧道日志同形：{body}"
+        );
+        assert!(body.starts_with("["), "带本地时间戳：{body}");
+        assert!(body.contains("tier-core: speedtest: 完成"));
+        // 空路径 = 静默 no-op（不该 panic/不该建文件）
+        round_logger("")("x");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// Status 信封的按需键。
     #[test]
     fn status_envelope_optionals() {
@@ -577,15 +633,20 @@ impl SpeedHost {
                 return speed_fail("invalid_arg", e);
             }
         };
-        // R8-8b 临时排障面（收口前回退）：引擎轮内日志落文件（sock 同目录——上行
-        // bulk 真机排障唯一证据源，App 形态无 stdout）。
-        let logf = |s: &str| {
-            // 轮内日志经 stderr？App 形态无 stdout 消费面——丢弃（判据行在 exit 侧）
-            let _ = s;
-        };
+        // 引擎轮内日志落盘（`log` 参数 = App 形态的隧道日志；空 = CLI/守护面不落盘）。
+        // 行形态与核的隧道日志逐字同形（`[ts] tier-core: speedtest: …`），供日志页/
+        // 诊断报告/`docs/agents/log-index.md` 直接消费。
+        let logf = round_logger(&p.log);
         let cancel = std::sync::Arc::clone(&self.cancel);
         let live = std::sync::Arc::clone(&self.live);
-        let outcome = app_run(&p.auth, &p.sock, &params, &logf, Some(&cancel), Some(&live));
+        let outcome = app_run(
+            &p.auth,
+            &p.sock,
+            &params,
+            logf.as_ref(),
+            Some(&cancel),
+            Some(&live),
+        );
         let out = speed_start(params_json, |_| outcome);
         // 收尾快照（done/cancelled/failed + usage）
         {

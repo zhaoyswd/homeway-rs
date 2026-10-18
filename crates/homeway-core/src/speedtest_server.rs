@@ -352,7 +352,9 @@ impl SpeedtestServer {
             let slice = (window_deadline - now).min(Duration::from_secs(1));
             let slice_t0 = Instant::now();
             let b = pump_data(&mut bw, &block, &mut seq, slice);
-            per_sec.push((b, slice_t0.elapsed().as_secs_f64().min(1.0)));
+            // 片时长**如实记**（评审 r1-F4 的延伸：写阻塞时一片可能跨数秒——
+            // 旧实现 `.min(1.0)` 把「2s 片」显示成 `/1s`，逐秒序列与尾速率都会失真）
+            per_sec.push((b, slice_t0.elapsed().as_secs_f64()));
             // 评审 r1-F1：写错误早退——pump_data 写失败时本片快速返回，若仍剩窗口
             // 时间继续空转（64KB 分配+立即失败的写）最长 MAX_WINDOW。0 字节且未到
             // 截止 ⇒ 通道已断，跳出走 flush 的错误路径记行。
@@ -382,20 +384,30 @@ impl SpeedtestServer {
             0.0
         };
         // E13 结算行（role=recv）
+        let elapsed = t0.elapsed();
         (self.logf)(&format!(
             "speedtest: 会话 #{id} role=recv bytes={window_bytes}（含预热 {warmup_bytes}）用时={}ms",
-            t0.elapsed().as_millis()
+            elapsed.as_millis()
         ));
         // R8-2 归因行（词面与判据行区分——评审 r1-F13：`grep role=recv` 的会话计数
-        // 不受本行污染）。
+        // 不受本行污染）。`实际窗` = 预热+窗口的真实墙钟：写阻塞（对端流控/链路慢）
+        // 会把名义 12s 拖长，此时逐秒序列与尾速率**不能**按名义窗口解读。
+        let nominal = warmup + window;
+        let overrun = elapsed.saturating_sub(nominal);
         (self.logf)(&format!(
-            "speedtest: 归因 #{id} 下行逐秒MB=[{}] 尾{}片({tail_span:.1}s)={tail_mbps:.0}Mbps",
+            "speedtest: 归因 #{id} 下行逐秒MB=[{}] 尾{}片({tail_span:.1}s)={tail_mbps:.0}Mbps 实际窗={:.1}s{}",
             per_sec
                 .iter()
                 .map(|(b, d)| format!("{:.1}/{:.0}s", *b as f64 / (1024.0 * 1024.0), d))
                 .collect::<Vec<_>>()
                 .join(","),
             tail_secs,
+            elapsed.as_secs_f64(),
+            if overrun > Duration::from_millis(500) {
+                format!("（窗口越界 +{:.1}s）", overrun.as_secs_f64())
+            } else {
+                String::new()
+            }
         ));
     }
 
@@ -743,7 +755,13 @@ mod tests {
         let sock = dir.join("speedtest.sock");
         let _ = std::fs::remove_file(&sock);
         let ln = IpcListener::bind(&sock).unwrap();
-        let logf: crate::Logf = Arc::new(|_| {});
+        let lines = Arc::new(Mutex::new(Vec::<String>::new()));
+        let l2 = Arc::clone(&lines);
+        let logf: crate::Logf = Arc::new(move |s: &str| {
+            l2.lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(s.to_owned());
+        });
         let srv = Arc::new(SpeedtestServer::new(Arc::clone(&logf)));
         let srv2 = Arc::clone(&srv);
         std::thread::spawn(move || {
@@ -781,6 +799,20 @@ mod tests {
         // 窗口 300ms × ~600Mbps 量级（回环 UDS）：至少应有可观字节
         assert!(got > 1_000_000, "300ms 窗口应收可观载荷（实收 {got}B）");
         assert_eq!(srv.stats.total.load(Ordering::Relaxed), 1);
+        // 归因行带**实际窗**（片时长如实记录 ⇒ 写阻塞时不再把 2s 片标成 /1s）。
+        // report 帧先于归因行落纸（同一线程顺序写，但客户端可能先读到 report）⇒ 有界等待。
+        let want = Instant::now() + Duration::from_secs(2);
+        loop {
+            {
+                let l = lines.lock().unwrap_or_else(|e| e.into_inner());
+                if let Some(attr) = l.iter().find(|s| s.starts_with("speedtest: 归因 #1 ")) {
+                    assert!(attr.contains("实际窗="), "归因行带实际窗：{attr}");
+                    break;
+                }
+            }
+            assert!(Instant::now() < want, "缺归因行（2s 未落纸）");
+            std::thread::sleep(Duration::from_millis(10));
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 
