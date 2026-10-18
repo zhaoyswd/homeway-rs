@@ -20,8 +20,8 @@
 //!
 //! 三条语义面（§2.4-A-2 的登记面，**实现按此收口**）：
 //! ① **需求信号**：宿主会话无 TUN ⇒ `IslandSnapshot::{packets_in,packets_out,attached}`
-//! 恒 0/false（数据面事实，不动）；「在用档」由**岛内 STREAM 出站信号**补
-//! （`homeway-quic/src/driver.rs` 的 `last_stream_out_at`，同批落地）；
+//! 恒 0/false（数据面事实，不动）；「在用档」由**岛内 STREAM 动作信号**补
+//! （`homeway-quic/src/driver.rs` 的 `last_stream_use_at`：开流成功 / 写出推进，同批落地）；
 //! ② **`attached` 不得当就绪判据**（宿主会话恒 false ⇒ 用它判 = 假死）；本就绪判据 =
 //! **准入完成**（`Live` 只在 `hr-reg4` 四帧后构造）+ 暖机探活；
 //! ③ **`ladder_probe_ok` 只记阶梯探活**（显式 `Cmd::Probe` 不计）⇒ 本模块的读数行

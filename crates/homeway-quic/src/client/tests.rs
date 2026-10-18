@@ -3196,8 +3196,14 @@ async fn stream_capacity_is_max_bidi_minus_two_at_design_defaults() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     assert_eq!(island.snapshot().streams_active, cap as u64);
-    // 出口侧真受理：每条开流都发了 tag 首字节（探活流在出口的 echo 等待读）——
-    // 用「关掉一条 ⇒ 立刻能再开一条」证明额度是真回收（而非记假账）
+    // 关一条 ⇒ **自记账**槽位即时回收（不等对端）：判据 = 快照在册数回落。
+    //
+    // **不再断言「立刻能再开一条」**（2026-10-18 改）：`Cmd::StreamOpen` 起同时置「在用档」
+    // （driver 的 `last_stream_use_at`——服务多是「对端先说话」，开流后常先读后写），阶梯
+    // 因此立刻起探 ⇒ probe 流真的开出来 ⇒ `62 服务流 + probe + 控制 = 64` 枚 quinn 信用**满额**。
+    // 本桩出口不 accept 双向流（`Stub::pump` 只处理注册与内层包）⇒ 对端永不发
+    // `MAX_STREAMS`，信用不回流 ⇒ 关流后立刻重开会卡在信用上 5s（`OPEN_BUDGET`）后 `Busy`。
+    // 旧断言成立的前提是「probe 流还没开」（待机档）——那是桩面的 1 枚余量，不是自记账的回收。
     stream_wait(
         &island,
         &stub,
@@ -3210,18 +3216,15 @@ async fn stream_capacity_is_max_bidi_minus_two_at_design_defaults() {
     )
     .await
     .expect("关流");
-    let again = stream_wait(
-        &island,
-        &stub,
-        &quic,
-        |reply| Cmd::StreamOpen {
-            tag: crate::StreamTag::Probe,
-            reply,
-        },
-        WAIT,
-    )
-    .await;
-    assert!(again.is_ok(), "关一条腾一格：{again:?}");
+    let deadline = Instant::now() + WAIT;
+    while island.snapshot().streams_active != cap as u64 - 1 && Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert_eq!(
+        island.snapshot().streams_active,
+        cap as u64 - 1,
+        "关流 ⇒ 自记账槽位即时回收"
+    );
     for id in ids.iter().skip(1) {
         let _ = stream_wait(&island, &stub, &quic, |reply| Cmd::StreamClose { id: *id, reply }, WAIT).await;
     }

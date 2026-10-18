@@ -635,13 +635,19 @@ struct DriverState {
     drop_note: Option<DropNote>,
     /// 丢弃上报口（带条数；回程泵批投用）。
     drop_note_n: Option<DropNoteN>,
-    /// **服务流出站需求信号**（M5 §2.4-A-2 ⑤：宿主会话里「在用档」判据的 STREAM 面来源）。
+    /// **服务流需求信号**（M5 §2.4-A-2 ⑤：宿主会话里「在用档」判据的 STREAM 面来源）。
     ///
     /// 旧 `in_use_now` 只认 `TunCounters::last_outbound_at`（只由 TUN 数据面写）⇒ 无 TUN 的
-    /// 宿主会话恒「待机档」（60s 探活节拍）。这里给 STREAM 面记一笔**最近成功写出的时刻**
-    /// （`Cmd::StreamWrite` 回执 `n > 0`），两档合成「有出站即新鲜」——与 `tun` 档同
-    /// `ProbeTuning::in_use_fresh` 窗。
-    last_stream_out_at: Option<std::time::Instant>,
+    /// 宿主会话恒「待机档」（60s 探活节拍）。这里给 STREAM 面记一笔**最近一次用户面动作**：
+    ///
+    /// ① `Cmd::StreamOpen` 开流成功——服务多是「对端先说话」的形态（term 的 GREETING、
+    ///    files 的握手），客户端开流后先读、要等对端首块才写；只认写出会让「开了流在等
+    ///    对端」这段真实用户等待落回待机档（2026-10-18 真机：回前台后 carrier 半死，会话
+    ///    列表页 3 条 term 流开着读超时，阶梯到待机档 60s 拍才探活 ⇒ 页面 loading ~45s）；
+    /// ② `Cmd::StreamWrite` 回执 `n > 0`——写出推进（`n=0` 背压不算需求）。
+    ///
+    /// 两档合成「有用户面动作即新鲜」——与 `tun` 档同 `ProbeTuning::in_use_fresh` 窗。
+    last_stream_use_at: Option<std::time::Instant>,
     /// 快照同步（housekeeping ④）的节流基准：`Some(at)` = 上次同步时刻，`None` = 立即
     /// 到期（连接采纳/断开等关键转换置 `None`，保 via/ep/connections 不滞后）。
     snap_sync_last: Option<Instant>,
@@ -709,7 +715,7 @@ fn run_driver(
             ladder_cand: None,
             dead_logged: false,
             admitted: false,
-            last_stream_out_at: None,
+            last_stream_use_at: None,
             snap_sync_last: None,
             drop_note: None,
             drop_note_n: None,
@@ -1459,6 +1465,9 @@ async fn handle_cmd(
             }
             match tokio::time::timeout(OPEN_BUDGET, live.conn.open_bi()).await {
                 Ok(Ok((send, recv))) => {
+                    // M5 §2.4-A-2 ⑤：开流 = 用户在等（多数服务对端先说话，写出可能很晚
+                    // 才发生）⇒ 立刻置「在用档」，不必等第一块写出（见字段注释）。
+                    st.last_stream_use_at = Some(std::time::Instant::now());
                     let slot = st.streams.register(tag, recv);
                     let id = slot.id();
                     let streams = Arc::clone(&st.streams);
@@ -1494,7 +1503,7 @@ async fn handle_cmd(
             // M5 §2.4-A-2 ⑤：STREAM 面需求信号（「在用档」判据的宿主会话来源）——
             // 只在**真有字节出站**时刷新（`n=0` 背压不算需求）。
             if matches!(&r, Ok(w) if w.n > 0) {
-                st.last_stream_out_at = Some(std::time::Instant::now());
+                st.last_stream_use_at = Some(std::time::Instant::now());
             }
             let _ = reply.send(r);
         }
@@ -1540,9 +1549,10 @@ fn send_face(face: &Face, window: Duration) -> SendFace {
     }
 }
 
-/// 「在用档」判据（§3.2-1）：**有出站且新鲜**（岛侧等价面 = ①TUN 数据面 `TunCounters`
-/// ②服务流出站（M5 §2.4-A-2 ⑤：宿主会话无 TUN ⇒ 用 STREAM 面补需求信号））。
-/// 亮屏位在岛内不可达——偏离登记见 `tuning::probe_defaults::IN_USE_FRESH`。
+/// 「在用档」判据（§3.2-1）：**有用户面动作且新鲜**（岛侧等价面 = ①TUN 数据面
+/// `TunCounters` ②服务流动作（开流 / 写出推进；M5 §2.4-A-2 ⑤：宿主会话无 TUN ⇒
+/// 用 STREAM 面补需求信号））。亮屏位在岛内不可达——偏离登记见
+/// `tuning::probe_defaults::IN_USE_FRESH`。
 fn in_use_now(st: &DriverState, ctx: &IslandCtx, tuning: &ProbeTuning) -> bool {
     let tun_fresh = st.tun.is_some()
         && ctx
@@ -1550,7 +1560,7 @@ fn in_use_now(st: &DriverState, ctx: &IslandCtx, tuning: &ProbeTuning) -> bool {
             .last_outbound_at()
             .is_some_and(|t| t.elapsed() <= tuning.in_use_fresh);
     let stream_fresh = st
-        .last_stream_out_at
+        .last_stream_use_at
         .is_some_and(|t| t.elapsed() <= tuning.in_use_fresh);
     tun_fresh || stream_fresh
 }
