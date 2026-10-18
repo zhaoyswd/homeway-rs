@@ -463,8 +463,9 @@ fn pack_addr(a: std::net::SocketAddr) -> ([u8; 128], usize) {
 
 /// 发送目标归一：dual 时裸 v4 → v4-mapped（v4-mapped / 纯 v6 原样）；非 dual 原样。
 ///
-/// 语义与 `homeway-core::udpbatch::xmit_addr` 对齐（本 crate 是叶子，不得依赖 core；
-/// 出口 `exit/socket.rs` 与客户端 `client/relay_sock.rs` 共用本函数）。
+/// 语义与 `homeway-core::udpbatch::xmit_addr` 对齐（本 crate 是叶子，不得依赖 core）。
+/// 使用者 = **出口**的双栈直连 socket（`exit/socket.rs`）；客户端每个端点只装一族，
+/// 不做映射。
 pub fn xmit_addr(dst: std::net::SocketAddr, dual: bool) -> std::net::SocketAddr {
     use std::net::{SocketAddr, SocketAddrV6};
     if !dual {

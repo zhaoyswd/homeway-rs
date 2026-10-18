@@ -233,127 +233,78 @@ fn get_sockbuf(sock: &std::net::UdpSocket, opt: i32) -> Option<usize> {
 
 /// 岛侧抽象 socket（`quinn::AsyncUdpSocket`）：直连裸包 + 中继包封/剥壳。
 ///
-/// **两个物理 socket**（v4 + v6，按需建）：候选可能是任一家庭；发送按目标家庭选
-/// socket，接收两侧都 poll。为什么不用单枚双栈 `[::]`：v4-mapped 发送在部分平台
-/// （macOS 实测）的接收侧唤醒有怪癖；两个单栈 socket 让 v4 路径与旧实现完全一致，
-/// v6 走独立 socket。
+/// **一枚 socket = 一个地址族**：v4/v6 由 `Face` 各建一枚端点（quinn 的 `Endpoint`
+/// 只认一个本地地址族）；本类型不再承担双栈合体。
 pub(crate) struct ClientSock {
-    v4: Option<SockHalf>,
-    v6: Option<SockHalf>,
-    /// 快照/日志用的本地地址（优先 v4；两族端口可不同）。
-    local: SocketAddr,
-    relays: Arc<RelayTable>,
-    /// 计数（`Arc` 与岛共享；岛线程写、快照读）。
-    stats: Arc<Mutex<SockStats>>,
-    logf: Logf,
-}
-
-/// 单个家庭的 socket（v4 或 v6）。
-struct SockHalf {
     io: TokioUdp,
     local: SocketAddr,
     /// 裸句柄（unix `sendto` 用；tokio 的 `try_send_to` 在新建 v6 socket 上首次发送
     /// 会 WouldBlock 且无写就绪唤醒——见 `sysio::send_to` 的注释）。
     #[cfg(unix)]
     raw: crate::sysio::RawIo,
+    relays: Arc<RelayTable>,
+    /// 计数（`Arc` 与岛共享；岛线程写、快照读）。
+    stats: Arc<Mutex<SockStats>>,
+    logf: Logf,
 }
 
 impl std::fmt::Debug for ClientSock {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("ClientSock")
             .field("local", &self.local)
-            .field("v4", &self.v4.as_ref().map(|h| h.local))
-            .field("v6", &self.v6.as_ref().map(|h| h.local))
             .finish_non_exhaustive()
     }
 }
 
-/// 建一个单家庭 socket（缓冲定尺 + 非阻塞 + 裸句柄）。
-fn make_half(addr: SocketAddr, logf: &Logf) -> io::Result<SockHalf> {
-    let std_sock = std::net::UdpSocket::bind(addr)?;
-    // ---- M6.7：内核 socket 缓冲**显式定尺**（不靠内核缺省）----
-    //
-    // 证据（M6.7 A 真机逐环）：下行突发里岛的 `rx_queue` 峰值 ~76KB 且 `/proc/net/udp` 的
-    // `drops` 逐轮 +17…+32（与 `/proc/net/snmp` 的 `Udp: RcvbufErrors` 同源）⇒ **内核缺省
-    // 接收缓冲在突发下溢出**；丢掉的 DATAGRAM 在 QUIC 面**不重传** ⇒ 每个丢包都变成内层 TCP
-    // 的一次丢段（对端 dup ACK/RTO），内层 CUBIC cwnd 与速率档一起被压住。
-    // 定尺依据 = 发送侧 pacer 的单次突发上界（quinn `MAX_BURST_SIZE` = 256×MTU ≈ 350KB）
-    // × 岛 runtime 的调度抖动余量：**接收 2 MiB**（≈1600 包 ≈ 0.16s@20kpps）。
-    // 发送侧（上行内层 ACK 突发）同理给 **1 MiB**（与 `exit::transport::DATAGRAM_BUFFER` 同量级）。
-    // 核内会把设定值翻倍记账（Linux 口径），故内存账按 2× 记（登记面见 M6.7 记录）。
-    const RCVBUF: usize = 2 * 1024 * 1024;
-    const SNDBUF: usize = 1024 * 1024;
-    for (opt, want) in [(crate::sysio::SO_RCVBUF, RCVBUF), (crate::sysio::SO_SNDBUF, SNDBUF)] {
-        let v = i32::try_from(want).unwrap_or(i32::MAX);
-        // setsockopt 失败**不致命**（沿用内核缺省 + 记行）——sysio 同形收口（WIN 批）。
-        let r = crate::sysio::setsockopt_i32(
-            crate::sysio::udp_raw(&std_sock),
-            crate::sysio::SOL_SOCKET,
-            opt,
-            v,
-        );
-        let got = get_sockbuf(&std_sock, opt);
-        (*logf)(&format!(
-            "岛 socket 缓冲（{}）：设定 {want}B，读回 {}B{}",
-            if opt == crate::sysio::SO_RCVBUF { "SO_RCVBUF（下行接收）" } else { "SO_SNDBUF（上行发送）" },
-            got.map(|g| g.to_string()).unwrap_or_else(|| "?".into()),
-            if r.is_ok() { "" } else { "（setsockopt 失败——沿用内核缺省）" }
-        ));
-    }
-    std_sock.set_nonblocking(true)?;
-    let local = std_sock.local_addr()?;
-    #[cfg(unix)]
-    let raw = crate::sysio::udp_raw(&std_sock);
-    let io = TokioUdp::from_std(std_sock)?;
-    Ok(SockHalf {
-        io,
-        local,
-        #[cfg(unix)]
-        raw,
-    })
-}
-
 impl ClientSock {
-    /// 建 socket（非阻塞；调用方须在 runtime 上下文内——`from_std` 需要）。
-    ///
-    /// `bind = None` = 双族（v4 + v6 各一枚；缺一可用则只留另一）；`Some` = 单族。
+    /// 建一枚绑定好的 socket（非阻塞；调用方须在 runtime 上下文内——`from_std` 需要）。
     pub(crate) fn open(
-        bind: Option<SocketAddr>,
+        bind: SocketAddr,
         relays: Arc<RelayTable>,
         stats: Arc<Mutex<SockStats>>,
         logf: Logf,
     ) -> io::Result<(Arc<Self>, SocketAddr)> {
-        let mut v4 = None;
-        let mut v6 = None;
-        match bind {
-            Some(a) if a.is_ipv4() => v4 = Some(make_half(a, &logf)?),
-            Some(a) => v6 = Some(make_half(a, &logf)?),
-            None => {
-                match make_half(SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)), &logf) {
-                    Ok(h) => v4 = Some(h),
-                    Err(e) => (*logf)(&format!("客户端 socket：v4 绑定失败（{e}）——v4 候选不可用")),
-                }
-                match make_half(SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)), &logf) {
-                    Ok(h) => v6 = Some(h),
-                    Err(e) => (*logf)(&format!("客户端 socket：v6 绑定失败（{e}）——v6 候选不可用")),
-                }
-            }
+        let std_sock = std::net::UdpSocket::bind(bind)?;
+        // ---- M6.7：内核 socket 缓冲**显式定尺**（不靠内核缺省）----
+        //
+        // 证据（M6.7 A 真机逐环）：下行突发里岛的 `rx_queue` 峰值 ~76KB 且 `/proc/net/udp` 的
+        // `drops` 逐轮 +17…+32（与 `/proc/net/snmp` 的 `Udp: RcvbufErrors` 同源）⇒ **内核缺省
+        // 接收缓冲在突发下溢出**；丢掉的 DATAGRAM 在 QUIC 面**不重传** ⇒ 每个丢包都变成内层 TCP
+        // 的一次丢段（对端 dup ACK/RTO），内层 CUBIC cwnd 与速率档一起被压住。
+        // 定尺依据 = 发送侧 pacer 的单次突发上界（quinn `MAX_BURST_SIZE` = 256×MTU ≈ 350KB）
+        // × 岛 runtime 的调度抖动余量：**接收 2 MiB**（≈1600 包 ≈ 0.16s@20kpps）。
+        // 发送侧（上行内层 ACK 突发）同理给 **1 MiB**（与 `exit::transport::DATAGRAM_BUFFER` 同量级）。
+        // 核内会把设定值翻倍记账（Linux 口径），故内存账按 2× 记（登记面见 M6.7 记录）。
+        const RCVBUF: usize = 2 * 1024 * 1024;
+        const SNDBUF: usize = 1024 * 1024;
+        for (opt, want) in [(crate::sysio::SO_RCVBUF, RCVBUF), (crate::sysio::SO_SNDBUF, SNDBUF)] {
+            let v = i32::try_from(want).unwrap_or(i32::MAX);
+            // setsockopt 失败**不致命**（沿用内核缺省 + 记行）——sysio 同形收口（WIN 批）。
+            let r = crate::sysio::setsockopt_i32(
+                crate::sysio::udp_raw(&std_sock),
+                crate::sysio::SOL_SOCKET,
+                opt,
+                v,
+            );
+            let got = get_sockbuf(&std_sock, opt);
+            (*logf)(&format!(
+                "岛 socket 缓冲（{}）：设定 {want}B，读回 {}B{}",
+                if opt == crate::sysio::SO_RCVBUF { "SO_RCVBUF（下行接收）" } else { "SO_SNDBUF（上行发送）" },
+                got.map(|g| g.to_string()).unwrap_or_else(|| "?".into()),
+                if r.is_ok() { "" } else { "（setsockopt 失败——沿用内核缺省）" }
+            ));
         }
-        // quinn 只存一个 local：有 v6 时优先 v6（否则「双族端点 + v6 候选」会被
-        // 按 v4 本地地址拒绝/误路由）；v4 目标仍走 v4 半（`try_send` 按目标家庭选）。
-        let local = v6
-            .as_ref()
-            .map(|h| h.local)
-            .or_else(|| v4.as_ref().map(|h| h.local))
-            .ok_or_else(|| io::Error::other("客户端 socket 没有任何地址族可绑"))?;
-        if let (Some(a), Some(b)) = (v4.as_ref(), v6.as_ref()) {
-            (*logf)(&format!("客户端 socket：v4={} v6={}", a.local, b.local));
-        }
+        std_sock.set_nonblocking(true)?;
+        let local = std_sock.local_addr()?;
+        #[cfg(unix)]
+        let raw = crate::sysio::udp_raw(&std_sock);
+        let io = TokioUdp::from_std(std_sock)?;
         Ok((
             Arc::new(Self {
-                v4,
-                v6,
+                io,
                 local,
+                #[cfg(unix)]
+                raw,
                 relays,
                 stats,
                 logf,
@@ -362,27 +313,11 @@ impl ClientSock {
         ))
     }
 
-    /// 按目标家庭取 socket（缺失 = 该族不可用，如实报错让赛跑记失败）。
-    fn half_for(&self, dst: SocketAddr) -> io::Result<&SockHalf> {
-        let h = if dst.is_ipv4() { self.v4.as_ref() } else { self.v6.as_ref() };
-        h.ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::AddrNotAvailable,
-                format!("客户端没有 {} socket（候选 {}）", if dst.is_ipv4() { "IPv4" } else { "IPv6" }, dst),
-            )
-        })
-    }
-
     /// 单段接收（填 `meta[0]`）。
-    fn recv_one(
-        &self,
-        io: &TokioUdp,
-        bufs: &mut [IoSliceMut<'_>],
-        meta: &mut [RecvMeta],
-    ) -> io::Result<usize> {
-        let (len, addr) = io.try_recv_from(&mut bufs[0][..])?;
-        // 对端可能是双栈出口发的 v4-mapped（v4 目标只会落在 v4 socket；v6 socket 上
-        // 的 mapped 源仍还原成 V4，保持日志/归因可读）。
+    fn recv_one(&self, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> io::Result<usize> {
+        let (len, addr) = self.io.try_recv_from(&mut bufs[0][..])?;
+        // 对端可能是双栈出口发的 v4-mapped（本 socket 若非 v4 族才会遇到）；还原成 V4
+        // 保持日志/归因可读。
         let addr = crate::sysio::unmap_v4_mapped(addr);
         meta[0] = RecvMeta {
             addr,
@@ -392,94 +327,6 @@ impl ClientSock {
             dst_ip: None,
         };
         Ok(1)
-    }
-
-    /// 单族接收（剥壳 + 忽略帧；返回 `Pending` = 本族暂无包，唤醒已注册）。
-    fn poll_half(
-        &self,
-        half: &SockHalf,
-        cx: &mut Context<'_>,
-        bufs: &mut [IoSliceMut<'_>],
-        meta: &mut [RecvMeta],
-    ) -> Poll<io::Result<usize>> {
-        loop {
-            match half.io.poll_recv_ready(cx) {
-                Poll::Ready(Ok(())) => {}
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => return Poll::Pending,
-            }
-            let recvd = match self.recv_one(&half.io, bufs, meta) {
-                Ok(v) if v > 0 => v,
-                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {
-                    continue;
-                }
-                Err(e) => return Poll::Ready(Err(e)),
-                Ok(_) => continue,
-            };
-            let mut out = 0usize;
-            let mut ignored_src = None;
-            for i in 0..recvd {
-                let len = meta[i].len;
-                let src = meta[i].addr;
-                let (start, payload_len) = match strip_downlink(&bufs[i][..len]) {
-                    Downlink::Bare => (0usize, len),
-                    Downlink::Quic(p) => (ENV_LEN, p.len()),
-                    Downlink::Ignored => {
-                        ignored_src = Some(src);
-                        continue;
-                    }
-                };
-                if start > 0 {
-                    bufs[i].copy_within(start..start + payload_len, 0);
-                }
-                if out != i {
-                    let (left, right) = bufs.split_at_mut(i);
-                    left[out][..payload_len].copy_from_slice(&right[0][..payload_len]);
-                }
-                meta[out] = RecvMeta {
-                    addr: src,
-                    len: payload_len,
-                    stride: payload_len,
-                    ecn: None,
-                    dst_ip: None,
-                };
-                out += 1;
-            }
-            {
-                let mut st = lock_unpoison(&self.stats);
-                if let Some(src) = ignored_src {
-                    st.rx_ignored += 1;
-                    let n_ignored = st.rx_ignored;
-                    drop(st);
-                    if log_due(n_ignored) {
-                        (self.logf)(&format!(
-                            "忽略非 kind=5 腿帧（来自 {src}；第 {n_ignored} 次；计数行首 3 + 每 100）"
-                        ));
-                    }
-                }
-            }
-            if out > 0 {
-                return Poll::Ready(Ok(out));
-            }
-        }
-    }
-
-    /// 写就绪：任一家庭可写即可（`try_send` 再按目标家庭选 socket；另一族未就绪
-    /// 时 quinn 会在下一次 poll 重试）。
-    fn poll_send_ready(&self, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        let mut pending = false;
-        for h in [self.v4.as_ref(), self.v6.as_ref()].into_iter().flatten() {
-            match h.io.poll_send_ready(cx) {
-                Poll::Ready(Ok(())) => return Poll::Ready(Ok(())),
-                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
-                Poll::Pending => pending = true,
-            }
-        }
-        if pending {
-            Poll::Pending
-        } else {
-            Poll::Ready(Ok(())) // 无 socket（装配期不可达）
-        }
     }
 }
 
@@ -505,7 +352,6 @@ impl AsyncUdpSocket for ClientSock {
             }
             return Ok(());
         }
-        let half = self.half_for(transmit.destination)?;
         let framed = self.relays.label_of(&transmit.destination).map(|label| {
             let mut out = Vec::with_capacity(RELAY_TAG_LEN + ENV_LEN + transmit.contents.len());
             out.extend_from_slice(&wrap_uplink(label, transmit.contents));
@@ -516,9 +362,9 @@ impl AsyncUdpSocket for ClientSock {
             None => (transmit.contents, false),
         };
         #[cfg(unix)]
-        let sent = crate::sysio::send_to(half.raw, payload, transmit.destination);
+        let sent = crate::sysio::send_to(self.raw, payload, transmit.destination);
         #[cfg(windows)]
-        let sent = half.io.try_send_to(payload, transmit.destination).map(|_| ());
+        let sent = self.io.try_send_to(payload, transmit.destination).map(|_| ());
         match sent {
             Ok(_) => {
                 let mut st = lock_unpoison(&self.stats);
@@ -551,20 +397,83 @@ impl AsyncUdpSocket for ClientSock {
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
         debug_assert_eq!(bufs.len(), meta.len(), "quinn 恒成对传入 bufs/meta");
-        // 两族都 poll：先把 v4 的 waker 注册上，再看 v6；任一有包即返回。
-        if let Some(h) = &self.v4 {
-            match self.poll_half(h, cx, bufs, meta) {
-                Poll::Ready(r) => return Poll::Ready(r),
-                Poll::Pending => {}
+        loop {
+            match self.io.poll_recv_ready(cx) {
+                Poll::Ready(Ok(())) => {}
+                Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                Poll::Pending => return Poll::Pending,
             }
-        }
-        if let Some(h) = &self.v6 {
-            match self.poll_half(h, cx, bufs, meta) {
-                Poll::Ready(r) => return Poll::Ready(r),
-                Poll::Pending => {}
+            // 单段接收（**M6.5 实测结论**：`recvmmsg` 多段在本设备无增益——每包成本由
+            // 内核每包处理主导，不是系统调用进出；实测每包 22.5µs 单段 vs 28.1µs 8 段批，
+            // 故保持 QT-M1 的段能力 = 1 登记；本循环内联原 `recv_batch` 间接层）。
+            let recvd = match self.recv_one(bufs, meta) {
+                Ok(v) if v > 0 => v,
+                // 无数据（EAGAIN/WouldBlock）与瞬时中断（EINTR——定义上重试无害）⇒
+                // 回 `poll_recv_ready` 重新挂等待
+                Err(e) if matches!(e.kind(), io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted) => {
+                    continue;
+                }
+                // **持久性错误上抛**（2026-10-10 审查 低-3 + 评审 r1 中-1）：原 `Err(_) =>
+                // continue` 在就绪位因驻留错误（fd 关闭后的 EBADF 等）恒 Ready 时 = 单线程
+                // runtime 上的忙转 + 全岛饿死。上抛对齐 quinn 自带 socket 的接收错误面
+                // （其 EndpointDriver 只放过 `ConnectionReset`，其余终止驱动 ⇒ 走恢复链）；
+                // `Interrupted` 必须留在续等侧——quinn 不会替我们重试它，一次瞬时 EINTR
+                // 就足以打死端点驱动（连接不报死、探活恒超时、阶梯在死端点上打转到 B 门）。
+                // 〔登记〕`ECONNREFUSED`（Linux 对 UDP 的 ICMP 异步错误）与 quinn std socket
+                // 同面不特殊放行——本仓两侧 socket 均为未 connect 的 send_to 形态，概率极低。
+                Err(e) => return Poll::Ready(Err(e)),
+                Ok(_) => continue,
+            };
+            // 剥壳 + 跳过忽略帧（有效载荷前移到各自的 buf 头部；`meta` 按序紧凑）
+            let mut out = 0usize;
+            let mut ignored_src = None;
+            for i in 0..recvd {
+                let len = meta[i].len;
+                let src = meta[i].addr;
+                let (start, payload_len) = match strip_downlink(&bufs[i][..len]) {
+                    Downlink::Bare => (0usize, len),
+                    Downlink::Quic(p) => (ENV_LEN, p.len()),
+                    // 非 kind=5 帧：**不喂 quinn**（中继的 hint 控制帧等）；计数 + 节流记行
+                    Downlink::Ignored => {
+                        ignored_src = Some(src);
+                        continue;
+                    }
+                };
+                if start > 0 {
+                    bufs[i].copy_within(start..start + payload_len, 0);
+                }
+                if out != i {
+                    // 紧凑：把本条前移到 out（out < i；用 split_at_mut 保借用合法）
+                    let (left, right) = bufs.split_at_mut(i);
+                    left[out][..payload_len].copy_from_slice(&right[0][..payload_len]);
+                }
+                meta[out] = RecvMeta {
+                    addr: src,
+                    len: payload_len,
+                    stride: payload_len,
+                    ecn: None,
+                    dst_ip: None,
+                };
+                out += 1;
             }
+            {
+                let mut st = lock_unpoison(&self.stats);
+                if let Some(src) = ignored_src {
+                    st.rx_ignored += 1;
+                    let n_ignored = st.rx_ignored;
+                    drop(st);
+                    if log_due(n_ignored) {
+                        (self.logf)(&format!(
+                            "忽略非 kind=5 腿帧（来自 {src}；第 {n_ignored} 次；计数行首 3 + 每 100）"
+                        ));
+                    }
+                }
+            }
+            if out > 0 {
+                return Poll::Ready(Ok(out));
+            }
+            // 整批都是忽略帧：继续收（与改前的 `continue` 同义）
         }
-        Poll::Pending
     }
 
     fn local_addr(&self) -> io::Result<SocketAddr> {
@@ -601,7 +510,7 @@ impl std::fmt::Debug for SockPoller {
 
 impl UdpPoller for SockPoller {
     fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
-        self.sock.poll_send_ready(cx)
+        self.sock.io.poll_send_ready(cx)
     }
 }
 
@@ -743,7 +652,7 @@ mod tests {
         assert!(!st.local_send_err_fresh(t0, win), "清零后不得再判新鲜");
         assert_eq!(st.send_errs, 2, "总量是累计读数（不清）");
     }
-    /// 判据（双栈 socket 的 v4 往返）：默认绑定 `[::]` 时，发给 v4 回环的目标必须
+    /// 判据（v4 socket 往返）：默认绑定 `[::]` 时，发给 v4 回环的目标必须
     /// 经 v4-mapped 送达，并能从同一 socket 收到 v4 回包（`recv_one` 还原成 V4）。
     #[tokio::test]
     async fn dual_stack_round_trips_v4_loopback() {
@@ -753,13 +662,13 @@ mod tests {
             .ok();
         let dest = echo.local_addr().expect("回环地址");
         let (sock, local) = ClientSock::open(
-            None,
+            SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)),
             RelayTable::new(),
             Arc::new(Mutex::new(SockStats::default())),
             Arc::new(|_: &str| {}) as Logf,
         )
-        .expect("双栈客户端 socket 可建");
-        assert!(local.is_ipv6(), "双族绑定的快照本地地址优先 v6（实得 {local}）");
+        .expect("v4 客户端 socket 可建");
+        assert!(local.is_ipv4(), "v4 单族绑定（实得 {local}）");
         sock.try_send(&Transmit {
             destination: dest,
             ecn: None,
@@ -782,7 +691,7 @@ mod tests {
         assert!(meta[0].addr.is_ipv4(), "v4 回包须还原成 V4（实得 {}）", meta[0].addr);
     }
 
-    /// 判据（双栈 socket 的 v6 往返）：`[::1]` 目标必须同 socket 直达（不 map）。
+    /// 判据（v6 socket 往返）：`[::1]` 目标必须同 socket 直达（不 map）。
     #[tokio::test]
     async fn dual_stack_round_trips_v6_loopback() {
         let echo = std::net::UdpSocket::bind((std::net::Ipv6Addr::LOCALHOST, 0))
@@ -791,7 +700,7 @@ mod tests {
             .ok();
         let dest = echo.local_addr().expect("回环地址");
         let (sock, local) = ClientSock::open(
-            Some(SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))),
+            SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)),
             RelayTable::new(),
             Arc::new(Mutex::new(SockStats::default())),
             Arc::new(|_: &str| {}) as Logf,

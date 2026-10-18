@@ -131,7 +131,8 @@ impl fmt::Debug for IslandCredential {
 pub struct IslandConfig {
     /// 准入材料（构造期注入；见模块头）。
     pub credential: IslandCredential,
-    /// 初始本地绑定（`None` = 双栈通配 `[::]:0`，系统不支持则回退 `0.0.0.0:0`）。
+    /// 初始本地绑定：`None` = **两个地址族都建**（v4 + v6 各一枚端点，候选按家庭选）；
+    /// `Some(v4/v6)` = 只建该族。
     ///
     /// 为什么可指定：本地验证要在一个**已知源地址**上起跑，再 `Rebind` 到另一个地址
     /// 制造真迁移（§2.3 的本地注入代理形态）。

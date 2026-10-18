@@ -126,7 +126,7 @@ impl Face {
         let mut local6 = None;
         if want4 {
             let (sock, local) = ClientSock::open(
-                Some(SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))),
+                SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)),
                 Arc::clone(&relays),
                 Arc::clone(&stats),
                 Arc::clone(&logf),
@@ -141,7 +141,7 @@ impl Face {
         }
         if want6 {
             match ClientSock::open(
-                Some(SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))),
+                SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)),
                 Arc::clone(&relays),
                 Arc::clone(&stats),
                 Arc::clone(&logf),
@@ -247,7 +247,7 @@ impl Face {
             Some(a) if a.is_ipv4() => {
                 if let Some(ep) = &self.ep4 {
                     let (sock, l) = ClientSock::open(
-                        Some(a),
+                        a,
                         Arc::clone(&self.relays),
                         Arc::clone(&self.stats),
                         Arc::clone(&self.logf),
@@ -260,7 +260,7 @@ impl Face {
             Some(a) => {
                 if let Some(ep) = &self.ep6 {
                     let (sock, l) = ClientSock::open(
-                        Some(a),
+                        a,
                         Arc::clone(&self.relays),
                         Arc::clone(&self.stats),
                         Arc::clone(&self.logf),
@@ -274,7 +274,7 @@ impl Face {
             None => {
                 if let Some(ep) = &self.ep4 {
                     let (sock, l) = ClientSock::open(
-                        Some(SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0))),
+                        SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)),
                         Arc::clone(&self.relays),
                         Arc::clone(&self.stats),
                         Arc::clone(&self.logf),
@@ -285,7 +285,7 @@ impl Face {
                 }
                 if let Some(ep) = &self.ep6 {
                     match ClientSock::open(
-                        Some(SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0))),
+                        SocketAddr::from((std::net::Ipv6Addr::UNSPECIFIED, 0)),
                         Arc::clone(&self.relays),
                         Arc::clone(&self.stats),
                         Arc::clone(&self.logf),
