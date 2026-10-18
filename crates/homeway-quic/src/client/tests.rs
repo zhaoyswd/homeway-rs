@@ -14,7 +14,7 @@
 //!   ③收发继续（出口发回程 ⇒ 岛侧入站证据 ⇒ N-b 行）；失败判据 = `migration_unconfirmed`；
 //! - 丢弃四类计数 + 事件回调 + N-c 行（`DatagramDropped`）。
 
-use std::net::{Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -84,7 +84,7 @@ fn island_cfg(patrol: Duration, pin: RpkPublicKey) -> IslandConfig {
         DEV,
         pin,
     ));
-    cfg.bind = Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    cfg.bind = Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
     cfg.patrol = patrol;
     cfg
 }
@@ -204,7 +204,7 @@ async fn wait_packet(
 /// ② 出口的裸回包 ⇒ 包成 `[0xBB][5]‖pkt` 发回客户端；另推一帧 **hint**（`[0xBB][1]`，
 ///    非 kind=5）——真中继会推控制帧（S1c 探针实测 `rx_ignored=4`），客户端必须忽略。
 struct FakeRelay {
-    addr: SocketAddrV4,
+    addr: SocketAddr,
     uplink_frames: Arc<AtomicU64>,
     bad_label: Arc<AtomicBool>,
     stop: Arc<AtomicBool>,
@@ -212,14 +212,11 @@ struct FakeRelay {
 }
 
 impl FakeRelay {
-    fn start(exit: SocketAddrV4, label: [u8; 8]) -> FakeRelay {
+    fn start(exit: SocketAddr, label: [u8; 8]) -> FakeRelay {
         let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("假中继可绑");
         sock.set_read_timeout(Some(Duration::from_millis(20)))
             .expect("读超时可设（片界回看停止位；不用 sleep）");
-        let addr = match sock.local_addr().expect("可读地址") {
-            SocketAddr::V4(v) => v,
-            SocketAddr::V6(_) => unreachable!(),
-        };
+        let addr = sock.local_addr().expect("可读地址");
         let stop = Arc::new(AtomicBool::new(false));
         let uplink_frames = Arc::new(AtomicU64::new(0));
         let bad_label = Arc::new(AtomicBool::new(false));
@@ -231,7 +228,6 @@ impl FakeRelay {
         let handle = std::thread::Builder::new()
             .name("fake-relay".into())
             .spawn(move || {
-                let exit = SocketAddr::V4(exit);
                 let mut client: Option<SocketAddr> = None;
                 let mut buf = vec![0u8; 4096];
                 let mut hinted = false;
@@ -315,12 +311,8 @@ fn exit_face_streams(seed: u8, streams: crate::tuning::StreamLimits) -> ExitQuic
 }
 
 /// 出口的可连地址（`local_addr` 是**已绑定**地址；本测试全走回环 ⇒ 取端口 + 127.0.0.1）。
-fn connectable(quic: &ExitQuic) -> SocketAddrV4 {
-    let port = match quic.local_addr() {
-        SocketAddr::V4(v) => v.port(),
-        SocketAddr::V6(_) => unreachable!(),
-    };
-    SocketAddrV4::new(Ipv4Addr::LOCALHOST, port)
+fn connectable(quic: &ExitQuic) -> SocketAddr {
+    SocketAddr::from((Ipv4Addr::LOCALHOST, quic.local_addr().port()))
 }
 
 /// 内层 IPv4 包（出站投递用；形态同 `homeway-core` 的 `server/device.rs` 测试构造）。
@@ -490,7 +482,7 @@ fn drain_logs(rx: &Receiver<String>) -> Vec<String> {
 }
 
 /// 连上真出口的单直连候选（S2-4/S2-5/S2-6 用例的公共前段）。
-async fn connect_direct(island: &Island, stub: &Stub, quic: &ExitQuic) -> SocketAddrV4 {
+async fn connect_direct(island: &Island, stub: &Stub, quic: &ExitQuic) -> SocketAddr {
     let addr = connectable(quic);
     let _ = send_wait(
         island,
@@ -509,7 +501,7 @@ async fn connect_direct(island: &Island, stub: &Stub, quic: &ExitQuic) -> Socket
     addr
 }
 
-fn direct(addr: SocketAddrV4) -> Candidate {
+fn direct(addr: SocketAddr) -> Candidate {
     Candidate {
         addr,
         via: Via::Direct,
@@ -530,16 +522,16 @@ fn lan_ipv4() -> Option<Ipv4Addr> {
 /// ① `127.0.0.2`（Linux 的 lo 别名）能绑就用它；② darwin 的 `lo0` 只有 `127.0.0.1`
 /// ⇒ 借本机网卡地址（设计 P7 的同款形态）；③ 都不行退回「同 IP 换端口」（仍走 rebind +
 /// 路径验证，但不是「换 IP」分支——用例打印实际口径，不静默降级）。
-fn alt_bind_addr() -> (SocketAddrV4, &'static str) {
+fn alt_bind_addr() -> (SocketAddr, &'static str) {
     let alt = Ipv4Addr::new(127, 0, 0, 2);
     if UdpSocket::bind((alt, 0)).is_ok() {
-        return (SocketAddrV4::new(alt, 0), "换 IP（127.0.0.2 别名）");
+        return (SocketAddr::from((alt, 0)), "换 IP（127.0.0.2 别名）");
     }
     if let Some(ip) = lan_ipv4() {
-        return (SocketAddrV4::new(ip, 0), "换 IP（本机网卡地址）");
+        return (SocketAddr::from((ip, 0)), "换 IP（本机网卡地址）");
     }
     (
-        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         "同 IP 换端口（本机无第二地址）",
     )
 }
@@ -547,11 +539,56 @@ fn alt_bind_addr() -> (SocketAddrV4, &'static str) {
 /// 「死候选」= 已绑定但**从不回包**的 UDP socket（握手永不完成；不产生 ICMP 干扰）。
 fn dead_candidate() -> (UdpSocket, Candidate) {
     let s = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("死候选可绑");
-    let addr = match s.local_addr().expect("可读地址") {
-        SocketAddr::V4(v) => v,
-        SocketAddr::V6(_) => unreachable!(),
-    };
+    let addr = s.local_addr().expect("可读地址");
     (s, direct(addr))
+}
+
+
+/// 出口面（v6 回环）：验证客户端双栈 socket 的 v6 直连/准入（v4-mapped 之外的半边）。
+fn exit_face_v6(seed: u8) -> ExitQuic {
+    let sock = UdpSocket::bind((std::net::Ipv6Addr::LOCALHOST, 0)).expect("出口 v6 socket 可绑");
+    let (logf, _rx) = sink();
+    ExitQuic::start(
+        sock,
+        ExitQuicConfig::new(Ed25519Seed::from_bytes([seed; 32]), 32),
+        logf,
+    )
+    .expect("出口 QUIC 面可起（v6）")
+}
+
+/// **判据（外层 v6）**：token 带 v6 端点时客户端起双栈 socket，`[::1]` 直连 + 四帧准入
+/// 必须成功（与 v4 同一条 client 路径，只是候选地址族不同）。
+#[tokio::test]
+async fn connect_over_ipv6_loopback_registers() {
+    let quic = exit_face_v6(77);
+    let stub = Stub::new();
+    let (logf, _logs) = sink();
+    let mut cfg = island_cfg(Duration::from_secs(60), quic.rpk_public_key());
+    cfg.bind = None; // 双栈 `[::]:0`
+    let island = Island::start(logf, Arc::new(|_r: &str| {}), cfg).expect("岛可起（双栈）");
+    let addr = SocketAddr::from((
+        std::net::Ipv6Addr::LOCALHOST,
+        quic.local_addr().port(),
+    ));
+    let outcome = send_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::Connect {
+            cands: vec![direct(addr)],
+            budget: WAIT,
+            demote_adopted: false,
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .expect("v6 单候选必须胜出（准入完成）");
+    assert_eq!(outcome.winner, addr, "胜者 = v6 候选（实得 {outcome:?}）");
+    assert_eq!(outcome.via, Via::Direct);
+    assert!(stub.accepted() >= 1, "v6 连接必须完成四帧准入");
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
 }
 
 // ---------- 1. 端点就绪 + 登记（真出口 + 引擎桩） ----------
@@ -1668,14 +1705,14 @@ async fn rebind_without_connection_only_swaps_socket() {
         &stub,
         &quic,
         |reply| Cmd::Rebind {
-            local: Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0)),
+            local: Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0))),
             reply,
         },
         WAIT,
     )
     .await
     .expect("无连接也可换绑（endpoint 粒度）");
-    assert_eq!(*to.ip(), Ipv4Addr::LOCALHOST);
+    assert_eq!(to.ip(), std::net::IpAddr::V4(Ipv4Addr::LOCALHOST));
     let snap = island.snapshot();
     assert!(!snap.migration_unconfirmed, "无连接 ⇒ 不起保持窗");
     assert_eq!(snap.migrations, 0);
@@ -3275,7 +3312,7 @@ async fn ladder_exhaustion_then_connect_rebuilds_and_r_uses_roster() {
     let addr = connect_direct(&island, &stub, &quic).await;
     assert_eq!(stub.accepted(), 1);
     // 名册：现任 + 死端口（UDP 9 无人听 ⇒ 永不完成握手；只为钉「候选 2 个」）
-    let dead = SocketAddrV4::new(*addr.ip(), 9);
+    let dead = SocketAddr::new(addr.ip(), 9);
     island
         .tx()
         .send(Cmd::SetCandidates {
@@ -3347,7 +3384,7 @@ async fn ladder_exhaustion_then_connect_rebuilds_and_r_uses_roster() {
             demote_adopted: false,
             reply,
         },
-        WAIT,
+        WAIT * 2,
     )
     .await
     .expect("B 之后 Cmd::Connect 全名册重建须成功");

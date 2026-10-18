@@ -3,7 +3,7 @@
 //! 形态对齐今日 `wgcore` 的单驱动线程（设计 §3.2/§3.3）：投递不阻塞（unbounded，
 //! 无需回执）；带 `reply` 的命令由岛在事件到点时应答；状态走 `Arc<Mutex<…>>` 轮询。
 
-use std::net::SocketAddrV4;
+use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
 use std::sync::Arc;
@@ -69,8 +69,8 @@ pub enum Cmd {
     /// 续收片刻，**对端不可达没有专用错误** ⇒ 保持检测与回落判据在岛内另算
     /// （[`IslandSnapshot::migration_unconfirmed`]，节拍 = `IslandConfig::patrol`）。
     Rebind {
-        local: Option<SocketAddrV4>,
-        reply: IslandReply<SocketAddrV4>,
+        local: Option<SocketAddr>,
+        reply: IslandReply<SocketAddr>,
     },
     /// 巡检判活（替代 `path_probe` 的连接级判据；设计 §2.5）。**带 reply**：判活要结论；
     /// `budget` = 本次判活预算（由调用方给——巡检节拍/threshold 沿用既有常数）。
@@ -271,7 +271,7 @@ impl Via {
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub struct Candidate {
     /// 端点地址（QUIC 端口；中继候选 = 该中继的 QUIC 形）。
-    pub addr: SocketAddrV4,
+    pub addr: SocketAddr,
     /// 承载类别（决定上行形态，见 [`Via`]）。
     pub via: Via,
 }
@@ -286,15 +286,15 @@ pub struct Candidate {
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RaceOutcome {
     /// 胜出候选（首个完成握手者）。
-    pub winner: SocketAddrV4,
+    pub winner: SocketAddr,
     /// 胜者承载类别。
     pub via: Via,
     /// 胜者握手完成时的 RTT（ms）。
     pub rtt_ms: u64,
     /// 本轮完成握手的候选（含胜者；并行候选在胜出瞬间已完成的也会列在这里并被关闭）。
-    pub completed: Vec<SocketAddrV4>,
+    pub completed: Vec<SocketAddr>,
     /// 未完成/失败的候选（含被 drop 的在途握手；不含未投出者——见上）。
-    pub unfinished: Vec<SocketAddrV4>,
+    pub unfinished: Vec<SocketAddr>,
     /// 本轮耗时（ms）。
     pub elapsed_ms: u64,
 }
@@ -389,7 +389,7 @@ pub struct IslandSnapshot {
     /// 当前路径承载类别（`None` = 未建连）。
     pub via: Option<Via>,
     /// 当前路径端点（胜出候选）。
-    pub ep: Option<SocketAddrV4>,
+    pub ep: Option<SocketAddr>,
     /// 当前路径 RTT（ms；未建连 = 0）。
     pub rtt_ms: u64,
     /// 赛跑投出的候选总数（累计；= C5' 的「候选 N 个」输入）。
@@ -413,7 +413,7 @@ pub struct IslandSnapshot {
     pub migration_unconfirmed: bool,
     /// 当前本地地址（**UDP 源端口**；未就绪 = `None`）。detach 后仍可读 ⇒ M0 §8.1 残余项
     /// 「老世代 UDP 源端口可观测」的落点。
-    pub local: Option<SocketAddrV4>,
+    pub local: Option<SocketAddr>,
     /// 在用连接数（0/1；岛单连接结构）。detach 后仍可读 ⇒ 同上「连接数可观测」。
     pub connections: u64,
     /// 丢失包计数（`PathStats::lost_packets`；设计 §12-④ 的 A/B 判据读数）。

@@ -16,7 +16,7 @@
 //! （换绑落地 + 本地地址更新；2026-10-18 起保持窗退役）+ 出口再收一帧刷新（表内 E8 行 ← **新源**）
 //! 证「收发继续」。
 
-use std::net::{Ipv4Addr, SocketAddrV4, UdpSocket};
+use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
@@ -113,20 +113,20 @@ fn lan_ipv4() -> Option<Ipv4Addr> {
 }
 
 /// 迁移目标（同 S2a 单测的三档口径：127.0.0.2 → 本机网卡 → 同 IP 换端口）。
-fn alt_bind() -> (SocketAddrV4, &'static str) {
+fn alt_bind() -> (SocketAddr, &'static str) {
     if let Ok(v) = std::env::var("HOMEWAY_ISLAND_E2E_ALT_BIND") {
-        let a: SocketAddrV4 = v.parse().expect("HOMEWAY_ISLAND_E2E_ALT_BIND 形如 ip:port");
+        let a: SocketAddr = v.parse().expect("HOMEWAY_ISLAND_E2E_ALT_BIND 形如 ip:port");
         return (a, "环境指定");
     }
     let alt = Ipv4Addr::new(127, 0, 0, 2);
     if UdpSocket::bind((alt, 0)).is_ok() {
-        return (SocketAddrV4::new(alt, 0), "换 IP（127.0.0.2 别名）");
+        return (SocketAddr::from((alt, 0)), "换 IP（127.0.0.2 别名）");
     }
     if let Some(ip) = lan_ipv4() {
-        return (SocketAddrV4::new(ip, 0), "换 IP（本机网卡地址）");
+        return (SocketAddr::from((ip, 0)), "换 IP（本机网卡地址）");
     }
     (
-        SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, 0)),
         "同 IP 换端口（本机无第二地址）",
     )
 }
@@ -153,10 +153,10 @@ fn island_connects_registers_and_survives_rebind_against_local_exit() {
         .iter()
         .filter(|e| e.kind == EndpointKind::Quic)
         .map(|e| {
-            let raw: SocketAddrV4 = e.addr.parse().expect("QUIC 端点地址可解（ip:port）");
+            let raw: SocketAddr = e.addr.parse().expect("QUIC 端点地址可解（ip:port）");
             println!("[e2e] token.quic_endpoint={raw}（本用例改用回环同端口）");
             Candidate {
-                addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw.port()),
+                addr: SocketAddr::from((Ipv4Addr::LOCALHOST, raw.port())),
                 via: Via::Direct,
             }
         })
@@ -171,7 +171,7 @@ fn island_connects_registers_and_survives_rebind_against_local_exit() {
         RpkPublicKey::from_bytes(*rpk.as_bytes()),
     );
     let mut cfg = IslandConfig::new(cred);
-    cfg.bind = Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    cfg.bind = Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
     cfg.patrol = Duration::from_secs(2); // 刷新节拍：迁移后靠刷新帧证「新路径收发继续」
     let island = Island::start(logf(), noop_unhealthy(), cfg).expect("岛可起（含 QUIC 端点）");
 
@@ -361,7 +361,7 @@ fn island_uses_relay_and_pushes_traffic_through_tun() {
 
     // 中继候选：`label = sha256(peerId)[:8]`（真源 `legframe::relay_id`）
     let label = homeway_core::legframe::relay_id(tok.peer_id.as_bytes());
-    let relay_addr: SocketAddrV4 = match std::env::var("HOMEWAY_ISLAND_E2E_RELAY") {
+    let relay_addr: SocketAddr = match std::env::var("HOMEWAY_ISLAND_E2E_RELAY") {
         Ok(v) => v.parse().expect("HOMEWAY_ISLAND_E2E_RELAY 形如 ip:port"),
         Err(_) => tok
             .endpoints
@@ -384,7 +384,7 @@ fn island_uses_relay_and_pushes_traffic_through_tun() {
         *id.dev_tag().as_bytes(),
         RpkPublicKey::from_bytes(*rpk.as_bytes()),
     ));
-    cfg.bind = Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    cfg.bind = Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
     cfg.patrol = Duration::from_secs(2);
 
     // 本机 UDP echo（出口 intercept 的 **transit** 目标：同一台机器 ⇒ 回环可达）
@@ -688,9 +688,9 @@ fn connect_local_exit() -> (Island, Vec<u8>) {
         .iter()
         .filter(|e| e.kind == EndpointKind::Quic)
         .map(|e| {
-            let raw: SocketAddrV4 = e.addr.parse().expect("QUIC 端点地址可解");
+            let raw: SocketAddr = e.addr.parse().expect("QUIC 端点地址可解");
             Candidate {
-                addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, raw.port()),
+                addr: SocketAddr::from((Ipv4Addr::LOCALHOST, raw.port())),
                 via: Via::Direct,
             }
         })
@@ -704,7 +704,7 @@ fn connect_local_exit() -> (Island, Vec<u8>) {
         RpkPublicKey::from_bytes(*rpk.as_bytes()),
     );
     let mut cfg = IslandConfig::new(cred);
-    cfg.bind = Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+    cfg.bind = Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
     let island = Island::start(logf(), noop_unhealthy(), cfg).expect("岛可起");
     let outcome: RaceOutcome = cmd(
         &island,

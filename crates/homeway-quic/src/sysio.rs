@@ -380,6 +380,125 @@ pub fn send(raw: RawIo, buf: &[u8]) -> io::Result<usize> {
     Ok(r as usize)
 }
 
+
+
+/// 非阻塞 `sendto`（unix 裸调用；Windows 走 `tokio::net::UdpSocket::try_send_to`）。
+///
+/// 为什么不用 tokio 的 `try_send_to`：macOS 上**新建的 v6 socket 首次发送**会返回
+/// WouldBlock（route/绑定惰性完成），而 tokio 的写就绪不保证再发一次唤醒 ⇒ quinn 的
+/// 首包可能永久等不到重试。裸 `sendto` 在非阻塞 fd 上首次即可成功（实测 std 同形）。
+#[cfg(unix)]
+pub fn send_to(raw: RawIo, buf: &[u8], dst: std::net::SocketAddr) -> io::Result<usize> {
+    let (sa, len) = pack_addr(dst);
+    let r = unsafe {
+        libc::sendto(
+            raw,
+            buf.as_ptr().cast(),
+            buf.len(),
+            libc::MSG_NOSIGNAL,
+            sa.as_ptr().cast(),
+            len as libc::socklen_t,
+        )
+    };
+    if r < 0 {
+        Err(last_sock_err())
+    } else {
+        Ok(r as usize)
+    }
+}
+
+/// `SocketAddr` → wire 形态的 sockaddr（unix）。
+#[cfg(unix)]
+fn pack_addr(a: std::net::SocketAddr) -> ([u8; 128], usize) {
+    use std::net::SocketAddr;
+    let mut out = [0u8; 128];
+    let n = match a {
+        SocketAddr::V4(v4) => {
+            let s: libc::sockaddr_in = libc::sockaddr_in {
+                sin_family: libc::AF_INET as libc::sa_family_t,
+                sin_port: v4.port().to_be(),
+                sin_addr: libc::in_addr {
+                    s_addr: u32::from_ne_bytes(v4.ip().octets()),
+                },
+                sin_zero: [0; 8],
+                #[cfg(any(target_os = "macos", target_os = "ios"))]
+                sin_len: std::mem::size_of::<libc::sockaddr_in>() as u8,
+            };
+            let n = std::mem::size_of::<libc::sockaddr_in>();
+            unsafe {
+                out[..n].copy_from_slice(std::slice::from_raw_parts(
+                    (&s as *const libc::sockaddr_in).cast(),
+                    n,
+                ));
+            }
+            n
+        }
+        SocketAddr::V6(v6) => {
+            let mut s: libc::sockaddr_in6 = unsafe { std::mem::zeroed() };
+            s.sin6_family = libc::AF_INET6 as libc::sa_family_t;
+            s.sin6_port = v6.port().to_be();
+            s.sin6_addr = libc::in6_addr {
+                s6_addr: v6.ip().octets(),
+            };
+            s.sin6_flowinfo = v6.flowinfo();
+            s.sin6_scope_id = v6.scope_id();
+            #[cfg(any(target_os = "macos", target_os = "ios"))]
+            {
+                s.sin6_len = std::mem::size_of::<libc::sockaddr_in6>() as u8;
+            }
+            let n = std::mem::size_of::<libc::sockaddr_in6>();
+            unsafe {
+                out[..n].copy_from_slice(std::slice::from_raw_parts(
+                    (&s as *const libc::sockaddr_in6).cast(),
+                    n,
+                ));
+            }
+            n
+        }
+    };
+    (out, n)
+}
+
+// ---------- UDP 地址族（双栈 socket 的发送归一 / 接收还原） ----------
+
+/// 发送目标归一：dual 时裸 v4 → v4-mapped（v4-mapped / 纯 v6 原样）；非 dual 原样。
+///
+/// 语义与 `homeway-core::udpbatch::xmit_addr` 对齐（本 crate 是叶子，不得依赖 core；
+/// 出口 `exit/socket.rs` 与客户端 `client/relay_sock.rs` 共用本函数）。
+pub fn xmit_addr(dst: std::net::SocketAddr, dual: bool) -> std::net::SocketAddr {
+    use std::net::{SocketAddr, SocketAddrV6};
+    if !dual {
+        return dst;
+    }
+    match dst {
+        SocketAddr::V4(v4) => {
+            SocketAddr::V6(SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0))
+        }
+        v6 => v6,
+    }
+}
+
+/// 接收还原：v4-mapped v6 → v4（其余原样）。quinn 的路径远端 = 候选形态；v4 候选
+/// 在双栈 socket 上收到的是 v4-mapped，不还原会与候选地址对不上。
+pub fn unmap_v4_mapped(addr: std::net::SocketAddr) -> std::net::SocketAddr {
+    use std::net::{SocketAddr, SocketAddrV4};
+    match addr {
+        SocketAddr::V6(v6) => match v6.ip().to_ipv4_mapped() {
+            Some(v4) => SocketAddr::V4(SocketAddrV4::new(v4, v6.port())),
+            None => addr,
+        },
+        v4 => v4,
+    }
+}
+
+/// socket 是否 v6 双栈（AF_INET6 且 `IPV6_V6ONLY=0`；v4 socket 上 ENOPROTOOPT ⇒ false）。
+pub fn is_dual_stack(sock: &std::net::UdpSocket) -> bool {
+    matches!(
+        getsockopt_i32(udp_raw(sock), IPPROTO_IPV6, IPV6_V6ONLY),
+        Ok(0)
+    )
+}
+
 // ---------- 发送错误的「本地不可达族」errno 值（windows = WSAE* 值域） ----------
 
 /// `classify_send_err` 的本地族白名单（unix = errno；windows = WSA errno——数值上

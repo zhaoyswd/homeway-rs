@@ -168,7 +168,7 @@ pub(crate) async fn run(
     let mut refused: Vec<usize> = Vec::new();
     let mut pending_direct: Vec<usize> = Vec::new();
     for &i in &start {
-        match endpoint.connect_with(cfg.clone(), cands[i].addr.into(), server_name()) {
+        match endpoint.connect_with(cfg.clone(), cands[i].addr, server_name()) {
             Ok(connecting) => {
                 if !cands[i].via.is_relay() {
                     pending_direct.push(i);
@@ -196,7 +196,7 @@ pub(crate) async fn run(
             if due || pending_direct.is_empty() {
                 let n = staged_relay.len();
                 for &i in &staged_relay {
-                    match endpoint.connect_with(cfg.clone(), cands[i].addr.into(), server_name()) {
+                    match endpoint.connect_with(cfg.clone(), cands[i].addr, server_name()) {
                         Ok(connecting) => {
                             set.spawn(async move { (i, connecting.await) });
                             // 投出即入「未完成」清单（完成/失败时再摘除）——与起跑侧同记法，

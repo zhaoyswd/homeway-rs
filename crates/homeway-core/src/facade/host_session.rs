@@ -45,7 +45,7 @@
 //!   （`qtcp` 输入集新增 tag=6）。
 
 use std::io::{self, Read, Write};
-use std::net::SocketAddrV4;
+use std::net::{SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -665,14 +665,11 @@ fn host_candidates(tok: &Token, logf: &Logf) -> Result<Vec<homeway_quic::Candida
             EndpointKind::Relay => homeway_quic::Via::Relay { label },
             EndpointKind::Direct => continue, // WG 类端点（不喂岛）
         };
-        let addrs: Vec<SocketAddrV4> = if let Ok(a) = e.addr.parse::<SocketAddrV4>() {
+        let addrs: Vec<SocketAddr> = if let Ok(a) = e.addr.parse::<SocketAddr>() {
             vec![a]
         } else {
-            // 域名形态：解析一次（有界预算；v4 记录才进候选——岛候选面是 v4）
-            match resolve_endpoint_v4(&e.addr, logf) {
-                Some(a) => vec![a],
-                None => continue,
-            }
+            // 域名形态：解析一次（有界预算；A/AAAA 都进候选——岛 socket 双栈）
+            resolve_endpoints(&e.addr, logf)
         };
         for addr in addrs {
             if out.iter().any(|c| c.addr == addr) {
@@ -688,30 +685,30 @@ fn host_candidates(tok: &Token, logf: &Logf) -> Result<Vec<homeway_quic::Candida
     Ok(out)
 }
 
-/// 域名端点 → 首个 v4 地址（有界预算；失败/无 v4 ⇒ 记行 + `None`）。
-fn resolve_endpoint_v4(addr: &str, logf: &Logf) -> Option<SocketAddrV4> {
-    let (host, port) = crate::hostdns::split_host_port(addr)?;
+/// 域名端点 → 全部 A/AAAA 地址（有界预算；失败/无记录 ⇒ 记行 + 空列表）。
+fn resolve_endpoints(addr: &str, logf: &Logf) -> Vec<SocketAddr> {
+    let Some((host, port)) = crate::hostdns::split_host_port(addr) else {
+        return Vec::new();
+    };
     let ips = crate::hostdns::lookup_host(
         &host,
         crate::hostdns::PROBE_SYNC_BUDGET,
         crate::hostdns::ResolveLane::Critical,
     )
     .unwrap_or_default();
-    let v4 = ips
-        .iter()
-        .find_map(|ip| match ip {
-            std::net::IpAddr::V4(v4) => Some(*v4),
-            std::net::IpAddr::V6(_) => None,
-        });
-    match v4 {
-        Some(ip) => Some(SocketAddrV4::new(ip, port)),
-        None => {
-            (logf)(&format!(
-                "宿主会话：域名端点 {addr} 无可用 v4 记录（本世代跳过该端点）"
-            ));
-            None
+    let mut out: Vec<SocketAddr> = Vec::new();
+    for ip in ips {
+        let a = SocketAddr::new(ip, port);
+        if !out.contains(&a) {
+            out.push(a);
         }
     }
+    if out.is_empty() {
+        (logf)(&format!(
+            "宿主会话：域名端点 {addr} 无可用 A/AAAA 记录（本世代跳过该端点）"
+        ));
+    }
+    out
 }
 
 /// 起岛（凭据 → `IslandConfig` → 回调/候选注入）。
@@ -732,6 +729,12 @@ fn start_island(
     );
     let mut icfg = IslandConfig::new(cred);
     icfg.patrol = PATROL_INTERVAL;
+    // 绑定族按候选面选（纯 v4 = v4 socket；含 v6 = 双栈 `[::]:0`）。
+    icfg.bind = if cands.iter().any(|c| c.addr.is_ipv6()) {
+        None
+    } else {
+        Some(SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)))
+    };
     // MTU 上限：宿主会话恒用缺省（`tunConfig.quicMtuCap` 属隧道域旋钮；宿主会话无 L3）。
     let w = Arc::downgrade(inner);
     let on_unhealthy: homeway_quic::OnUnhealthy = Arc::new(move |reason: &str| {

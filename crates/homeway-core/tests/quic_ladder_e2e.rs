@@ -22,7 +22,7 @@
 //!
 //! **不做**：真机（= S8）、`quic-ab` 门槛（= S8）、判据行登记（= S7）。
 
-use std::net::{Ipv4Addr, SocketAddrV4};
+use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -130,7 +130,7 @@ fn exit_quic_port(token_str: &str) -> u16 {
         .iter()
         .find(|e| e.kind == EndpointKind::Quic)
         .map(|e| {
-            let raw: SocketAddrV4 = e.addr.parse().expect("QUIC 端点可解析");
+            let raw: SocketAddr = e.addr.parse().expect("QUIC 端点可解析");
             raw.port()
         })
         .expect("token 必带 QUIC 端点")
@@ -140,7 +140,7 @@ fn exit_quic_port(token_str: &str) -> u16 {
 struct Lab {
     island: Island,
     /// 赛跑胜出的候选地址（负向用例的「楔子真在路径上」负判据）。
-    winner: SocketAddrV4,
+    winner: SocketAddr,
     keep: Arc<AtomicBool>,
     keep_thread: Option<std::thread::JoinHandle<()>>,
 }
@@ -169,7 +169,7 @@ impl Lab {
             RpkPublicKey::from_bytes(*rpk.as_bytes()),
         );
         let mut cfg = IslandConfig::new(cred);
-        cfg.bind = Some(SocketAddrV4::new(Ipv4Addr::LOCALHOST, 0));
+        cfg.bind = Some(SocketAddr::from((Ipv4Addr::LOCALHOST, 0)));
         let island = Island::start(trace.logf(), Arc::new(|_r: &str| {}), cfg).expect("岛可起");
         let (tx, rx) = mpsc::channel();
         island
@@ -353,7 +353,7 @@ fn phase_kill9_restart(restart_delay: Duration, phase: &str) {
     let trace = Trace::new();
     let lab = Lab::start(
         vec![Candidate {
-            addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, port),
+            addr: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
             via: Via::Direct,
         }],
         trace.clone(),
@@ -449,14 +449,14 @@ fn transient_blackhole_window_only_jitters_and_takes_no_action() {
     let trace = Trace::new();
     let lab = Lab::start(
         vec![Candidate {
-            addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, pport),
+            addr: SocketAddr::from((Ipv4Addr::LOCALHOST, pport)),
             via: Via::Direct,
         }],
         trace.clone(),
     );
     assert_eq!(
         lab.winner,
-        SocketAddrV4::new(Ipv4Addr::LOCALHOST, pport),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, pport)),
         "赛跑必须胜在**楔子端口**上（否则黑洞注入落不到路径上——假绿面）"
     );
     // 基线：穿代理的成功探活（证明代理在转发）
@@ -520,14 +520,14 @@ fn wedge_without_close_must_escalate_to_an_action() {
     let trace = Trace::new();
     let lab = Lab::start(
         vec![Candidate {
-            addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, pport),
+            addr: SocketAddr::from((Ipv4Addr::LOCALHOST, pport)),
             via: Via::Direct,
         }],
         trace.clone(),
     );
     assert_eq!(
         lab.winner,
-        SocketAddrV4::new(Ipv4Addr::LOCALHOST, pport),
+        SocketAddr::from((Ipv4Addr::LOCALHOST, pport)),
         "赛跑必须胜在**楔子端口**上（否则黑洞注入落不到路径上——假绿面）"
     );
     let base = lab.probe_ok();

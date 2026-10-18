@@ -1144,7 +1144,7 @@ mod tests {
             homeway_quic::RpkPublicKey::from_bytes([9u8; 32]),
         );
         let mut icfg = homeway_quic::IslandConfig::new(cred);
-        icfg.bind = Some(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0));
+        icfg.bind = Some(std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)));
         let island = std::sync::Arc::new(
             homeway_quic::Island::start(quiet(), std::sync::Arc::new(|_r: &str| {}), icfg)
                 .expect("idle 岛可起"),

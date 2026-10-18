@@ -2158,18 +2158,9 @@ fn quic_candidates(tok: &Token, logf: &Logf) -> Result<Vec<homeway_quic::Candida
             // WG 类端点**不喂岛**（§2.1 末段「两族候选不得互相投喂」）
             crate::token::EndpointKind::Direct => continue,
         };
-        let Ok(addr) = e.addr.parse::<SocketAddrV4>() else {
-            // 2026-10-18 评审：QUIC 客户端当前**只支持 IPv4**（`Candidate.addr` =
-            // `SocketAddrV4`，客户端 socket 绑 0.0.0.0）。token 里的 v6 端点会被跳过——
-            // 必须留痕，不能静默（否则「为什么没走 v6」在日志里无从判断）。
-            if e.addr.parse::<std::net::SocketAddr>().is_ok() {
-                (*logf)(&format!(
-                    "端点跳过（QUIC 客户端当前仅支持 IPv4）：{}",
-                    e.addr
-                ));
-            } else {
-                (*logf)(&format!("端点跳过（非 IP 字面量/非法地址）：{}", e.addr));
-            }
+        let Ok(addr) = e.addr.parse::<std::net::SocketAddr>() else {
+            // 域名/非法形态不进岛候选（token 签发侧给的是 IP 字面量；v4/v6 均可）。
+            (*logf)(&format!("端点跳过（非 IP 字面量/非法地址）：{}", e.addr));
             continue;
         };
         if out.iter().any(|c| c.addr == addr) {
@@ -2418,6 +2409,17 @@ fn start_island(
     let mut icfg = homeway_quic::IslandConfig::new(cred);
     icfg.patrol = PATROL_INTERVAL; // 节拍/阈值常数不动（设计 §2.5）
     icfg.mtu_cap = cfg.mtu_cap; // §12-① 的上限旋钮（世代层已夹区间/记行）
+    // 绑定族按候选面选（2026-10-18 v6）：纯 v4 token 保持 v4 socket（与旧行为一致）；
+    // 含 v6 候选才起双栈（`None` = `[::]:0`）——v4 回环在部分平台上走 mapped 有怪癖，
+    // 不在不需要时引入。
+    icfg.bind = if cands.iter().any(|c| c.addr.is_ipv6()) {
+        None
+    } else {
+        Some(std::net::SocketAddr::from((
+            std::net::Ipv4Addr::UNSPECIFIED,
+            0,
+        )))
+    };
     // reconnect-oneshot D2：承载位装配期共握（岛侧沿写 + 读线程每包 load 同一枚）。
     icfg.carrier = Some(Arc::clone(&run.tun_shared.carrier));
     // 评审 r1 P1-7：adopt 沿通知 facade——岛内阶梯/赛跑自行恢复（置 carrier true）
@@ -2939,7 +2941,7 @@ mod tests {
             homeway_quic::RpkPublicKey::from_bytes([9u8; 32]),
         );
         let mut icfg = homeway_quic::IslandConfig::new(cred);
-        icfg.bind = Some(SocketAddrV4::new(std::net::Ipv4Addr::LOCALHOST, 0));
+        icfg.bind = Some(std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, 0)));
         Arc::new(
             homeway_quic::Island::start(Arc::clone(&run.logf), Arc::new(|_r: &str| {}), icfg)
                 .expect("岛可起（只绑回环 :0，不建连）"),
@@ -4396,7 +4398,7 @@ mod tests {
         run.set_l3_on_island(true);
         // ---- ① 起跑行 + 让路行：后台先起一轮长预算赛跑（黑洞候选 ⇒ racing 持续），
         //      worker 的 rerace 两查 racing ⇒ 真 Yielded 路径产出让路行 ----
-        let dead: SocketAddrV4 = "127.0.0.1:1".parse().unwrap();
+        let dead: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
         let island2 = Arc::clone(&island);
         let racer = std::thread::spawn(move || {
             let (tx, rx) = mpsc::channel();
@@ -4535,7 +4537,7 @@ mod tests {
         run.set_island(Arc::clone(&island));
         run.set_l3_on_island(true);
         // 名册 = 黑洞候选（127.0.0.1:1——握手必然黑洞到预算烧完 ⇒ racing 持续）
-        let dead: SocketAddrV4 = "127.0.0.1:1".parse().unwrap();
+        let dead: std::net::SocketAddr = "127.0.0.1:1".parse().unwrap();
         let _ = island.tx().send(homeway_quic::Cmd::SetCandidates {
             cands: vec![homeway_quic::Candidate {
                 addr: dead,

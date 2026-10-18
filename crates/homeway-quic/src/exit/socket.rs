@@ -51,7 +51,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, IoSliceMut};
-use std::net::{SocketAddr, SocketAddrV6, UdpSocket};
+use std::net::{SocketAddr, UdpSocket};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -166,35 +166,7 @@ impl LegTable {
     }
 }
 
-/// socket 是否为 v6 双栈（AF_INET6 且 `IPV6_V6ONLY=0`——getsockopt **运行期**检测；
-/// v4 socket 上该选项报 ENOPROTOOPT ⇒ 非 dual）。与 `homeway-core::udpbatch::is_dual_stack`
-/// 同款（本 crate 是叶子、不得依赖 core）。
-pub(super) fn is_dual_stack(sock: &UdpSocket) -> bool {
-    // WIN 批：经 sysio（unix 臂与原 libc 直调同形）。
-    matches!(
-        crate::sysio::getsockopt_i32(
-            crate::sysio::udp_raw(sock),
-            crate::sysio::IPPROTO_IPV6,
-            crate::sysio::IPV6_V6ONLY
-        ),
-        Ok(0)
-    )
-}
-
-/// 发送目标的族适配：dual 时 `V4 → V6(v4-mapped)`（v4-mapped / 纯 v6 已是 v6 形态 ⇒ 原样）；
-/// **非 dual 一律原样**（族不匹配的错误如实上报）。语义与 `homeway-core::udpbatch::xmit_addr`
-/// 对齐（本 crate 是叶子、不得依赖 core）。
-pub(super) fn xmit_addr(dst: SocketAddr, dual: bool) -> SocketAddr {
-    if !dual {
-        return dst;
-    }
-    match dst {
-        SocketAddr::V4(v4) => {
-            SocketAddr::V6(SocketAddrV6::new(v4.ip().to_ipv6_mapped(), v4.port(), 0, 0))
-        }
-        v6 => v6,
-    }
-}
+pub(super) use crate::sysio::{is_dual_stack, xmit_addr};
 
 /// 出口 QUIC 面的抽象 socket（[`quinn::AsyncUdpSocket`]）。
 pub(crate) struct ExitSock {

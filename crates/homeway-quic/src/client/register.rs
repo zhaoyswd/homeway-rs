@@ -17,7 +17,7 @@
 //! **期限在调用侧**——`race::within(admit_budget(…))` 包住整段准入，失败/到点时
 //! `close_on_failed_admission` 显式关连接（预算 = `max(剩余, ADMIT_MIN=2s)`）。
 
-use std::net::SocketAddrV4;
+use std::net::SocketAddr;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio::io::AsyncWriteExt;
@@ -76,7 +76,7 @@ pub(crate) async fn write_refresh<W: AsyncWriteExt + Unpin>(
     cred: &IslandCredential,
     exporter: &[u8; reg4::EXPORTER_LEN],
     logf: &Logf,
-    ep: SocketAddrV4,
+    ep: SocketAddr,
     relay: bool,
 ) -> Result<(), IslandErr> {
     let (secret, pubkey, dev_tag) = cred.parts();

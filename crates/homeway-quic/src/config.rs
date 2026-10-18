@@ -11,7 +11,7 @@
 //! （`facade/tun_exec.rs` 的 `PATROL_INTERVAL = 60s`），故只暴露一个旋钮。
 
 use std::fmt;
-use std::net::SocketAddrV4;
+use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -131,11 +131,11 @@ impl fmt::Debug for IslandCredential {
 pub struct IslandConfig {
     /// 准入材料（构造期注入；见模块头）。
     pub credential: IslandCredential,
-    /// 初始本地绑定（`None` = `0.0.0.0:0` 交内核挑端口）。
+    /// 初始本地绑定（`None` = 双栈通配 `[::]:0`，系统不支持则回退 `0.0.0.0:0`）。
     ///
     /// 为什么可指定：本地验证要在一个**已知源地址**上起跑，再 `Rebind` 到另一个地址
     /// 制造真迁移（§2.3 的本地注入代理形态）。
-    pub bind: Option<SocketAddrV4>,
+    pub bind: Option<SocketAddr>,
     /// 巡检节拍（刷新 + 迁移保持判据；缺省 [`DEFAULT_PATROL`]）。
     pub patrol: Duration,
     /// **直连优先窗口**（老 `DirectFirst` 语义回归；见 [`DEFAULT_DIRECT_FIRST`]）：新一轮

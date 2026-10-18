@@ -25,7 +25,7 @@ pub(crate) mod streams;
 mod tests;
 
 use std::io;
-use std::net::SocketAddrV4;
+use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -87,7 +87,7 @@ pub(crate) struct Face {
     /// 记行口（socket 层的忽略计数行用；与宿主同一个 `Logf`）。
     logf: Logf,
     /// 当前本地地址（`rebind` 后就地更新；判据行 N-b 的「旧 → 新」源）。
-    local: SocketAddrV4,
+    local: SocketAddr,
 }
 
 impl Face {
@@ -198,7 +198,7 @@ impl Face {
     /// 形态：新 socket 仍是 S2-7 的包封/剥壳 socket（共享同一张中继表与读数）——
     /// **不能**用 `Endpoint::rebind(stdio_socket)`（那会退回 quinn-udp 内建 socket，
     /// 中继路径当场失去信封语义）。
-    pub(crate) fn rebind(&mut self, local: Option<SocketAddrV4>) -> Result<SocketAddrV4, IslandErr> {
+    pub(crate) fn rebind(&mut self, local: Option<SocketAddr>) -> Result<SocketAddr, IslandErr> {
         let (sock, v4) = ClientSock::open(
             local,
             Arc::clone(&self.relays),
@@ -217,7 +217,7 @@ impl Face {
     }
 
     /// 当前本地地址（N-b 行的「旧 → 新」源）。
-    pub(crate) fn local(&self) -> SocketAddrV4 {
+    pub(crate) fn local(&self) -> SocketAddr {
         self.local
     }
 }
@@ -250,7 +250,7 @@ pub(crate) struct Established {
     pub(crate) recv: RecvStream,
     pub(crate) exporter: [u8; reg4::EXPORTER_LEN],
     pub(crate) via: Via,
-    pub(crate) ep: SocketAddrV4,
+    pub(crate) ep: SocketAddr,
 }
 
 /// 一次**已登记**的在用连接（岛线程独占）。
@@ -263,7 +263,7 @@ pub(crate) struct Live {
     _recv: RecvStream,
     exporter: [u8; reg4::EXPORTER_LEN],
     pub(crate) via: Via,
-    pub(crate) ep: SocketAddrV4,
+    pub(crate) ep: SocketAddr,
     /// 刷新节拍（巡检拍驱动；`Instant` = runtime 时钟，与 `tokio::time` 同源）。
     refresh: register::RefreshTimer,
     /// **快探持久流**（§3.2：连接建立后常驻——每次探活写 1B 等 1B 回显，不每拍开新流；

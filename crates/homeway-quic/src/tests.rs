@@ -14,7 +14,7 @@ use std::sync::mpsc::{channel, Receiver, RecvTimeoutError};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use std::net::SocketAddrV4;
+use std::net::SocketAddr;
 
 use crate::cmd::{
     Candidate, Cmd, DropReason, Drops, IslandErr, IslandEvent, IslandReply, IslandSnapshot,
@@ -471,8 +471,8 @@ fn cmd_member_field_types_are_pinned() {
                 let _: IslandReply<RaceOutcome> = reply;
             }
             Cmd::Rebind { local, reply } => {
-                let _: Option<SocketAddrV4> = local;
-                let _: IslandReply<SocketAddrV4> = reply;
+                let _: Option<SocketAddr> = local;
+                let _: IslandReply<SocketAddr> = reply;
             }
             Cmd::Probe { budget, reply } => {
                 let _: Duration = budget;
@@ -513,7 +513,7 @@ fn cmd_member_field_types_are_pinned() {
     let _: fn(Cmd) = pin;
     // 候选/承载/结算/丢弃/事件（设计 §2.1 的「类型承担不变量」）
     let _: Candidate = Candidate {
-        addr: "127.0.0.1:1".parse::<SocketAddrV4>().unwrap(),
+        addr: "127.0.0.1:1".parse::<SocketAddr>().unwrap(),
         via: Via::Relay { label: [0u8; 8] },
     };
     let _: Drops = Drops::default();
@@ -559,7 +559,7 @@ fn island_err_variants_are_pinned() {
     // 构造配置面（凭据/绑定/节拍）
     let cfg = test_config();
     let _: IslandCredential = cfg.credential;
-    let _: Option<SocketAddrV4> = cfg.bind;
+    let _: Option<SocketAddr> = cfg.bind;
     let _: Duration = cfg.patrol;
     let _: fn(TokenSecret) = |s: TokenSecret| drop(s);
 }

@@ -24,7 +24,7 @@
 use std::any::Any;
 use std::future::Future;
 use std::io;
-use std::net::SocketAddrV4;
+use std::net::SocketAddr;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -641,8 +641,8 @@ struct DriverState {
 
 /// M（换本地 socket）动作的记账（§3.1 的 `from → to` 与确认探活的耗时）。
 struct RebindNote {
-    from: SocketAddrV4,
-    to: SocketAddrV4,
+    from: SocketAddr,
+    to: SocketAddr,
     at: TokioInstant,
 }
 
@@ -1352,6 +1352,7 @@ async fn handle_cmd(
             st.snap_sync_last = None;
             st.rebinds += 1;
             let from = face.local();
+            let local = local.or_else(|| rebind_bind(st));
             match face.rebind(local) {
                 Ok(to) => {
                     lock_unpoison(&ctx.snapshot).migration_unconfirmed = false;
@@ -1543,7 +1544,7 @@ fn ladder_step(
             }
             LadderStep::Migrate { why } => {
                 let from = face.local();
-                match face.rebind(None) {
+                match face.rebind(rebind_bind(st)) {
                     Ok(to) => {
                         (*ctx.logf)(&format!(
                             "本地 socket 已换绑（{from} → {to}）—— M 动作（原因={why}）"
@@ -1640,6 +1641,20 @@ fn ladder_step(
                 return;
             }
         }
+    }
+}
+
+/// 重绑的绑定族：候选面有 v6 ⇒ 双栈（`None`）；纯 v4 ⇒ 显式 `0.0.0.0:0`。
+///
+/// 为什么不能一律 `None`：部分平台（macOS 实测）上「双栈 socket 发 v4-mapped → v4
+/// 监听 socket」的收侧唤醒有怪癖；纯 v4 token 没理由引入。v6 候选则必须双栈。
+fn rebind_bind(st: &DriverState) -> Option<SocketAddr> {
+    let has_v6 = st.cands.iter().any(|c| c.addr.is_ipv6())
+        || st.ladder_cand.is_some_and(|c| c.addr.is_ipv6());
+    if has_v6 {
+        None
+    } else {
+        Some(SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)))
     }
 }
 
@@ -1961,10 +1976,10 @@ mod guard_job_tests {
 #[cfg(test)]
 mod reconnect_candidates_tests {
     use super::*;
-    use std::net::{Ipv4Addr, SocketAddrV4};
+    use std::net::{Ipv4Addr, SocketAddr};
 
     fn c(port: u16, via: Via) -> Candidate {
-        Candidate { addr: SocketAddrV4::new(Ipv4Addr::LOCALHOST, port), via }
+        Candidate { addr: SocketAddr::from((Ipv4Addr::LOCALHOST, port)), via }
     }
 
     /// R 候选集：现任优先、名册去重跟上；无现任 = 名册；无名册 = 只有现任。
@@ -1984,7 +1999,7 @@ mod demote_tests {
 
     fn cand(addr: [u8; 4], port: u16) -> Candidate {
         Candidate {
-            addr: std::net::SocketAddrV4::new(addr.into(), port),
+            addr: SocketAddr::from((addr, port)),
             via: Via::Direct,
         }
     }

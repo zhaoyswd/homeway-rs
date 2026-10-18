@@ -32,7 +32,7 @@
 
 use std::collections::HashMap;
 use std::io::{self, IoSliceMut};
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
@@ -113,14 +113,14 @@ impl RelayTable {
         m.clear();
         for c in cands {
             if let Via::Relay { label } = c.via {
-                m.insert(SocketAddr::V4(c.addr), label);
+                m.insert(c.addr, label);
             }
         }
     }
 
     /// 钉住现任连接的条目（`set` 后仍在表里）。
-    pub(crate) fn pin(&self, addr: SocketAddrV4, label: [u8; 8]) {
-        *lock_unpoison(&self.pinned) = Some((SocketAddr::V4(addr), label));
+    pub(crate) fn pin(&self, addr: SocketAddr, label: [u8; 8]) {
+        *lock_unpoison(&self.pinned) = Some((addr, label));
     }
 
     /// 发送侧查询（`None` = 直连路径 ⇒ 裸包）。
@@ -234,7 +234,14 @@ fn get_sockbuf(sock: &std::net::UdpSocket, opt: i32) -> Option<usize> {
 /// 岛侧抽象 socket（`quinn::AsyncUdpSocket`）：直连裸包 + 中继包封/剥壳。
 pub(crate) struct ClientSock {
     io: TokioUdp,
+    /// 裸句柄（unix `sendto` 用；tokio 的 `try_send_to` 在新建 v6 socket 上首次发送
+    /// 会 WouldBlock 且无写就绪唤醒——见 `sysio::send_to` 的注释）。
+    #[cfg(unix)]
+    raw: crate::sysio::RawIo,
     local: SocketAddr,
+    /// 双栈事实（运行期 getsockopt：`[::]` + `IPV6_V6ONLY=0`）。发送侧把裸 v4 目标
+    /// 归一成 v4-mapped；非 dual 时原样（族不匹配的错误如实上报）。
+    dual: bool,
     relays: Arc<RelayTable>,
     /// 计数（`Arc` 与岛共享；岛线程写、快照读）。
     stats: Arc<Mutex<SockStats>>,
@@ -252,15 +259,32 @@ impl std::fmt::Debug for ClientSock {
 impl ClientSock {
     /// 建一枚绑定好的 socket（非阻塞；调用方须在 runtime 上下文内——`from_std` 需要）。
     pub(crate) fn open(
-        bind: Option<SocketAddrV4>,
+        bind: Option<SocketAddr>,
         relays: Arc<RelayTable>,
         stats: Arc<Mutex<SockStats>>,
         logf: Logf,
-    ) -> io::Result<(Arc<Self>, SocketAddrV4)> {
-        let addr = bind.map(SocketAddr::V4);
-        let std_sock = match addr {
-            Some(a) => std::net::UdpSocket::bind(a)?,
-            None => std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))?,
+    ) -> io::Result<(Arc<Self>, SocketAddr)> {
+        // 默认双栈通配（v4/v6 候选同一 socket）；系统把 `[::]` 建成 v6-only 或没有
+        // v6 时回退 v4-only（v6 候选会在发送面如实报族错误）。
+        let (std_sock, dual) = match bind {
+            Some(a) => {
+                let s = std::net::UdpSocket::bind(a)?;
+                let dual = crate::sysio::is_dual_stack(&s);
+                (s, dual)
+            }
+            None => match std::net::UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0)) {
+                Ok(s) if crate::sysio::is_dual_stack(&s) => (s, true),
+                Ok(_) => {
+                    (*logf)("客户端 socket：系统 v6 通配非双栈——回退 IPv4 绑定（v6 候选不可用）");
+                    (std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))?, false)
+                }
+                Err(e) => {
+                    (*logf)(&format!(
+                        "客户端 socket：v6 通配绑定失败（{e}）——回退 IPv4（v6 候选不可用）"
+                    ));
+                    (std::net::UdpSocket::bind((std::net::Ipv4Addr::UNSPECIFIED, 0))?, false)
+                }
+            },
         };
         // ---- M6.7：内核 socket 缓冲**显式定尺**（不靠内核缺省）----
         //
@@ -293,25 +317,28 @@ impl ClientSock {
         }
         std_sock.set_nonblocking(true)?;
         let local = std_sock.local_addr()?;
-        let SocketAddr::V4(v4) = local else {
-            return Err(io::Error::other("本地 socket 不是 IPv4（形态异常）"));
-        };
+        #[cfg(unix)]
+        let raw = crate::sysio::udp_raw(&std_sock);
         let io = TokioUdp::from_std(std_sock)?;
         Ok((
             Arc::new(Self {
                 io,
+                #[cfg(unix)]
+                raw,
                 local,
+                dual,
                 relays,
                 stats,
                 logf,
             }),
-            v4,
+            local,
         ))
     }
 
     /// 单段接收（回退路径；填 `meta[0]`）。
     fn recv_one(&self, bufs: &mut [IoSliceMut<'_>], meta: &mut [RecvMeta]) -> io::Result<usize> {
         let (len, addr) = self.io.try_recv_from(&mut bufs[0][..])?;
+        let addr = crate::sysio::unmap_v4_mapped(addr);
         meta[0] = RecvMeta {
             addr,
             len,
@@ -345,6 +372,7 @@ impl AsyncUdpSocket for ClientSock {
             }
             return Ok(());
         }
+        let dest = crate::sysio::xmit_addr(transmit.destination, self.dual);
         let framed = self.relays.label_of(&transmit.destination).map(|label| {
             let mut out = Vec::with_capacity(RELAY_TAG_LEN + ENV_LEN + transmit.contents.len());
             out.extend_from_slice(&wrap_uplink(label, transmit.contents));
@@ -354,7 +382,11 @@ impl AsyncUdpSocket for ClientSock {
             Some(f) => (f.as_slice(), true),
             None => (transmit.contents, false),
         };
-        match self.io.try_send_to(payload, transmit.destination) {
+        #[cfg(unix)]
+        let sent = crate::sysio::send_to(self.raw, payload, dest);
+        #[cfg(windows)]
+        let sent = self.io.try_send_to(payload, dest).map(|_| ());
+        match sent {
             Ok(_) => {
                 let mut st = lock_unpoison(&self.stats);
                 if relayed {
@@ -539,9 +571,9 @@ mod tests {
     #[test]
     fn relay_table_set_and_pin() {
         let t = RelayTable::new();
-        let a: SocketAddrV4 = "127.0.0.1:42781".parse().unwrap();
-        let b: SocketAddrV4 = "127.0.0.1:42782".parse().unwrap();
-        let c: SocketAddrV4 = "127.0.0.1:42652".parse().unwrap();
+        let a: SocketAddr = "127.0.0.1:42781".parse().unwrap();
+        let b: SocketAddr = "127.0.0.1:42782".parse().unwrap();
+        let c: SocketAddr = "127.0.0.1:42652".parse().unwrap();
         let la = [1u8; 8];
         let lb = [2u8; 8];
         t.set(&[
@@ -554,16 +586,16 @@ mod tests {
                 via: Via::Direct,
             },
         ]);
-        assert_eq!(t.label_of(&SocketAddr::V4(a)), Some(la));
-        assert_eq!(t.label_of(&SocketAddr::V4(c)), None, "直连候选不进中继表");
+        assert_eq!(t.label_of(&a), Some(la));
+        assert_eq!(t.label_of(&c), None, "直连候选不进中继表");
         // 现任钉住后重设候选清单：现任仍在
         t.pin(b, lb);
         t.set(&[Candidate {
             addr: c,
             via: Via::Direct,
         }]);
-        assert_eq!(t.label_of(&SocketAddr::V4(a)), None, "旧候选已替换");
-        assert_eq!(t.label_of(&SocketAddr::V4(b)), Some(lb), "现任条目必须留存");
+        assert_eq!(t.label_of(&a), None, "旧候选已替换");
+        assert_eq!(t.label_of(&b), Some(lb), "现任条目必须留存");
     }
 
     /// **判据（§3.1-N5 的负例；S1 完成判据点名）**：上行拥塞（`WouldBlock` 高频）下
@@ -641,4 +673,81 @@ mod tests {
         assert!(!st.local_send_err_fresh(t0, win), "清零后不得再判新鲜");
         assert_eq!(st.send_errs, 2, "总量是累计读数（不清）");
     }
+    /// 判据（双栈 socket 的 v4 往返）：默认绑定 `[::]` 时，发给 v4 回环的目标必须
+    /// 经 v4-mapped 送达，并能从同一 socket 收到 v4 回包（`recv_one` 还原成 V4）。
+    #[tokio::test]
+    async fn dual_stack_round_trips_v4_loopback() {
+        let echo = std::net::UdpSocket::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+            .expect("v4 回环可绑");
+        echo.set_read_timeout(Some(std::time::Duration::from_millis(800)))
+            .ok();
+        let dest = echo.local_addr().expect("回环地址");
+        let (sock, local) = ClientSock::open(
+            None,
+            RelayTable::new(),
+            Arc::new(Mutex::new(SockStats::default())),
+            Arc::new(|_: &str| {}) as Logf,
+        )
+        .expect("双栈客户端 socket 可建");
+        assert!(local.is_ipv6(), "默认绑定应是 [::]（实得 {local}）");
+        sock.try_send(&Transmit {
+            destination: dest,
+            ecn: None,
+            contents: b"ping",
+            segment_size: None,
+            src_ip: None,
+        })
+        .expect("发往 v4 回环");
+        let mut buf = [0u8; 64];
+        let (n, from) = echo.recv_from(&mut buf).expect("v4 回环必须收到（mapped 发送）");
+        assert_eq!(&buf[..n], b"ping");
+        echo.send_to(b"pong", from).expect("回包");
+        let mut recv_buf = [0u8; 64];
+        let mut bufs = [IoSliceMut::new(&mut recv_buf)];
+        let mut meta = [RecvMeta::default()];
+        let got = std::future::poll_fn(|cx| sock.poll_recv(cx, &mut bufs, &mut meta)).await;
+        let got = got.expect("收包");
+        assert_eq!(got, 1);
+        assert_eq!(&recv_buf[..meta[0].len], b"pong");
+        assert!(meta[0].addr.is_ipv4(), "v4 回包须还原成 V4（实得 {}）", meta[0].addr);
+    }
+
+    /// 判据（双栈 socket 的 v6 往返）：`[::1]` 目标必须同 socket 直达（不 map）。
+    #[tokio::test]
+    async fn dual_stack_round_trips_v6_loopback() {
+        let echo = std::net::UdpSocket::bind((std::net::Ipv6Addr::LOCALHOST, 0))
+            .expect("v6 回环可绑（环境无 v6 时该用例会明确失败）");
+        echo.set_read_timeout(Some(std::time::Duration::from_millis(800)))
+            .ok();
+        let dest = echo.local_addr().expect("回环地址");
+        let (sock, local) = ClientSock::open(
+            None,
+            RelayTable::new(),
+            Arc::new(Mutex::new(SockStats::default())),
+            Arc::new(|_: &str| {}) as Logf,
+        )
+        .expect("双栈客户端 socket 可建");
+        assert!(local.is_ipv6(), "默认绑定应是 [::]（实得 {local}）");
+        sock.try_send(&Transmit {
+            destination: dest,
+            ecn: None,
+            contents: b"ping6",
+            segment_size: None,
+            src_ip: None,
+        })
+        .expect("发往 v6 回环");
+        let mut buf = [0u8; 64];
+        let (n, from) = echo.recv_from(&mut buf).expect("v6 回环必须收到");
+        assert_eq!(&buf[..n], b"ping6");
+        echo.send_to(b"pong6", from).expect("回包");
+        let mut recv_buf = [0u8; 64];
+        let mut bufs = [IoSliceMut::new(&mut recv_buf)];
+        let mut meta = [RecvMeta::default()];
+        let got = std::future::poll_fn(|cx| sock.poll_recv(cx, &mut bufs, &mut meta)).await;
+        let got = got.expect("收包");
+        assert_eq!(got, 1);
+        assert_eq!(&recv_buf[..meta[0].len], b"pong6");
+        assert!(meta[0].addr.is_ipv6(), "v6 回包保持 V6（实得 {}）", meta[0].addr);
+    }
+
 }
