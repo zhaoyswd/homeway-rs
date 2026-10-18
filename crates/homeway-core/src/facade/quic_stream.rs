@@ -400,8 +400,9 @@ pub(crate) fn dial_stream_id(
     tag: StreamTag,
     budget: Duration,
 ) -> Result<StreamId, StreamErr> {
-    // 宿主会话面：**零触发**（host_session 注入 None——daemon/CLI 会话不当连接
-    // 死亡证据，D2）。
+    // 宿主会话面：dial_with 本层**零触发**（D2：不当隧道域的连接死亡证据）；
+    // 承载类失败由 `HostSession` 的 `RebuildGate`（`Dial` demand 源，30s 限频）
+    // 承接一次性重建。
     dial_with(logf, tag, budget, |b| open_stream(island, tag, b), None)
 }
 

@@ -306,9 +306,12 @@ pub mod probe_defaults {
 
     /// 在用档首探预算（§13-T2 实测：预算 700ms/间隔 0 ⇒ 706ms 定音）。
     pub const FAST_BUDGET: Duration = Duration::from_millis(700);
-    /// 在用档**拍间**（§3.2-1「背靠背（拍间 ≤300ms，由 runtime 拍内务驱动）」——
-    /// 岛内拍 = `driver::TICK`（250ms）⇒ 取 250ms 与拍同拍，恒 ≤300ms）。
-    pub const FAST_GAP: Duration = Duration::from_millis(250);
+    /// 在用档**拍间**（2026-10-18 用户裁定：250ms → **1s**）。
+    ///
+    /// 设计原值 250ms（`§3.2-1` 背靠背 ≤300ms）；改成 1s 后 `T_detect` 最坏
+    /// 0.7s + 1.4s + 1s ≈ 3.1s，仍在「≤3.5s」判据内，同时把**在用期**的探针/
+    /// 唤醒从 4Hz 降到 1Hz。岛内拍 `driver::TICK` 同步改为 1s。
+    pub const FAST_GAP: Duration = Duration::from_secs(1);
     /// 复探倍数（§3.1-2：首探失败 ⇒ 本拍内用加倍预算复探一次）。
     pub const REPROBE_FACTOR: u32 = 2;
     /// 「在用」判据的**出站新鲜窗**（§3.2-1「在用档（`demand > 0`，需求信号面）」）。
@@ -691,8 +694,7 @@ mod tests {
     fn probe_tuning_defaults_and_env_overrides() {
         let d = ProbeTuning::design();
         assert_eq!(d.fast_budget, Duration::from_millis(700), "§13-T2 的承重值");
-        assert_eq!(d.fast_gap, Duration::from_millis(250), "§3.2-1：拍间 ≤300ms");
-        assert!(d.fast_gap <= Duration::from_millis(300), "§3.2-1 的上界");
+        assert_eq!(d.fast_gap, Duration::from_secs(1), "2026-10-18：在用档拍间 1s");
         assert_eq!(d.reprobe_factor, 2);
         assert_eq!(d.idle_interval, Duration::from_secs(60));
         assert_eq!(d.jitter_streak, 3);

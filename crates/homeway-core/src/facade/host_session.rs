@@ -27,6 +27,12 @@
 //! ③ **`ladder_probe_ok` 只记阶梯探活**（显式 `Cmd::Probe` 不计）⇒ 本模块的读数行
 //! 一律取**自己发出的 `Cmd::Probe` 结论**，不读 `ladder_probe_ok`。
 //!
+//! **恢复模型（2026-10-18 重构）**：岛内阶梯（快探/复探/M/R）照旧在岛线程动作；走完
+//! B 门后由本层做**一次性**全名册重建。三个事件源经同一 `RebuildGate`（单飞 + 边沿
+//! pending + demand 30s 限频）：B 门上报（边沿）、服务拨号失败（`NoFace`/`Closed`）、
+//! 巡检观测（`NoFace` 或连续 3 拍超时）。worker 失败后**不自己重试**，等下一次事件；
+//! 旧「自驱 `rebuild_loop` + 1→30s 指数退避」已退役。
+//!
 //! 有意缺口（设计 §2.6；S2a 内逐条处置）：
 //! - **G5**（`daemon host reach` 过滤键）：本模块只提供会话；过滤键修正落在
 //!   `daemon/hosts.rs`（WG 档的 `is_wg()` 反过滤 → `Quic|Relay`）。
@@ -47,7 +53,7 @@
 use std::io::{self, Read, Write};
 use std::net::{SocketAddr, SocketAddrV4};
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -68,7 +74,7 @@ use super::quic_stream::write_retry_backoff;
 
 /// 暖机窗口：一发出口可达探活；超时 = 软失败（会话照常起，首个拨号触发注册/刷新）。
 pub const WARM_TIMEOUT: Duration = Duration::from_secs(12);
-/// 巡检间隔（保活/可达性观测 + link 快照刷新；与出口/岛的刷新节拍同值）。
+/// 巡检间隔（保活/可达性观测 + link 快照刷新；也是 `Patrol` 重建事件的采样拍）。
 pub const PATROL_INTERVAL: Duration = Duration::from_secs(60);
 /// 巡检每拍探活预算。
 pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
@@ -76,10 +82,10 @@ pub const PROBE_TIMEOUT: Duration = Duration::from_secs(10);
 pub const STOP_WAIT: Duration = Duration::from_secs(6);
 /// 岛侧赛跑预算（覆盖 LAN/中继握手 + `hr-reg4` 四帧准入；与 `tun_exec` 同值）。
 const CONNECT_BUDGET: Duration = Duration::from_secs(5);
-/// 世代重建退避：首次 1s，每败 ×2，上限 30s（2026-10-14：岛内阶梯走完 B 门后由本层
-/// 重赛跑全名册接棒——此前上报不健康只置 failed 终态、永不恢复）。
-const REBUILD_BACKOFF_MIN: Duration = Duration::from_secs(1);
-const REBUILD_BACKOFF_MAX: Duration = Duration::from_secs(30);
+/// 一次性重建的 demand 源最小间隔（边沿源绕过；与隧道域 `RECONNECT_MIN_GAP` 同值）。
+const REBUILD_MIN_GAP: Duration = Duration::from_secs(30);
+/// 重建 worker 的 spawn 重试（初次 + 2 次）。
+const REBUILD_SPAWN_TRIES: u32 = 3;
 /// 岛命令的有界等待预算（岛内短路径；超时 = 异常）。
 const RPC_BUDGET: Duration = Duration::from_secs(5);
 
@@ -304,6 +310,46 @@ pub struct HostSessionConfig {
 
 // ---------- 会话本体 ----------
 
+/// 服务会话的一次性重建门（与隧道域同一模式：单飞 + 边沿 pending + demand 30s 限频）。
+///
+/// 2026-10-18：退役「自驱 `rebuild_loop` + 指数退避」——B 门/拨号失败/巡检观测都经
+/// 本门触发**一次**短命 worker；失败后不自己重试，等下一次事件。`state` 只用两 bit
+/// （bit0 INFLIGHT / bit1 PENDING），不再有轮次/退避状态。
+struct RebuildGate {
+    state: AtomicU32,
+    /// demand 源上次起跑时刻（边沿源不读不写）。
+    last: Mutex<Option<Instant>>,
+    /// 【test-seam】实际占位/起跑次数（闸语义的单测观测面；生产零开销）。
+    #[cfg(test)]
+    spawns: AtomicU64,
+}
+
+const REBUILD_INFLIGHT: u32 = 1;
+const REBUILD_PENDING: u32 = 2;
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum RebuildSource {
+    /// B 门（岛内阶梯走完）——边沿，绕过 30s。
+    BGate,
+    /// 服务拨号失败（NoFace/Closed）——demand。
+    Dial,
+    /// 巡检观测（NoFace 或连续 3 拍超时）——demand。
+    Patrol,
+}
+
+impl RebuildSource {
+    fn is_edge(self) -> bool {
+        matches!(self, RebuildSource::BGate)
+    }
+    const fn text(self) -> &'static str {
+        match self {
+            RebuildSource::BGate => "B门",
+            RebuildSource::Dial => "拨号",
+            RebuildSource::Patrol => "巡检",
+        }
+    }
+}
+
 struct Inner {
     /// 当前岛（收工 `take`；`None` = 未建/已收回）。
     island: Mutex<Option<Arc<Island>>>,
@@ -316,9 +362,9 @@ struct Inner {
     patrol: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// 候选名册（token 端点派生；世代重建重赛跑用——与初次建连同一份）。
     cands: Vec<homeway_quic::Candidate>,
-    /// 世代重建线程在跑（单飞：岛可能连发多次不健康上报）。
-    rebuilding: AtomicBool,
-    /// 重建线程柄（收工时有界 join）。
+    /// 一次性重建门（单飞 + 边沿 pending + demand 限频）。
+    rebuild_gate: RebuildGate,
+    /// 当前重建 worker 柄（短命；收工时有界 join）。
     rebuild: Mutex<Option<std::thread::JoinHandle<()>>>,
 }
 
@@ -405,7 +451,12 @@ impl HostSession {
             logf: Arc::clone(&logf),
             patrol: Mutex::new(None),
             cands: cands.clone(),
-            rebuilding: AtomicBool::new(false),
+            rebuild_gate: RebuildGate {
+                state: AtomicU32::new(0),
+                last: Mutex::new(None),
+                #[cfg(test)]
+                spawns: AtomicU64::new(0),
+            },
             rebuild: Mutex::new(None),
         });
 
@@ -483,22 +534,36 @@ impl HostSession {
     /// 拨一条服务流（§2.7 R-1：budget = 调用方预算，首试 + 一次重试由
     /// `quic_stream::dial_with` 的策略收口——服务级拒绝不重试）。
     pub fn connect(&self, port: ServicePort, budget: Duration) -> Result<HostStream, HostErr> {
-        self.open_tag(port.tag(), budget)
+        let r = self.open_tag(port.tag(), budget);
+        self.note_dial_result(&r);
+        r
+    }
+
+    /// 拨号失败若是承载类（无面/连接死）⇒ 触发一次性重建（demand 源，30s 限频）。
+    /// 服务级拒绝（Refused/ServiceDisabled/Busy/Budget）不触发——那是对端业务面。
+    fn note_dial_result(&self, r: &Result<HostStream, HostErr>) {
+        if matches!(r, Err(HostErr::NoFace | HostErr::Closed(_))) {
+            try_rebuild(&self.inner, RebuildSource::Dial);
+        }
     }
 
     /// 拨一条**端口转发**腿（`STREAM[dial]` + 6B 目标 + 1B 回执；M4 的 pf 缝同款——
     /// 回执余量随句柄带回，由读面先出）。
     pub fn dial_addr(&self, dst: SocketAddrV4, budget: Duration) -> Result<HostStream, HostErr> {
-        let island = self.island()?;
-        let (id, rest) = super::quic_stream::dial_target_raw(&island, dst, budget)
-            .map_err(HostErr::from_io)?;
-        Ok(HostStream {
-            shared: Arc::new(StreamShared {
-                island,
-                id,
-                pending: Mutex::new(super::quic_stream::PendingBuf::new(rest)),
-            }),
-        })
+        let r = (|| {
+            let island = self.island()?;
+            let (id, rest) = super::quic_stream::dial_target_raw(&island, dst, budget)
+                .map_err(HostErr::from_io)?;
+            Ok(HostStream {
+                shared: Arc::new(StreamShared {
+                    island,
+                    id,
+                    pending: Mutex::new(super::quic_stream::PendingBuf::new(rest)),
+                }),
+            })
+        })();
+        self.note_dial_result(&r);
+        r
     }
 
     /// 探活（显式一发；结论就是本函数返回值——**不读** `ladder_probe_ok`，见模块头 ③）。
@@ -637,7 +702,12 @@ impl HostSession {
             logf,
             patrol: Mutex::new(None),
             cands: Vec::new(),
-            rebuilding: AtomicBool::new(false),
+            rebuild_gate: RebuildGate {
+                state: AtomicU32::new(0),
+                last: Mutex::new(None),
+                #[cfg(test)]
+                spawns: AtomicU64::new(0),
+            },
             rebuild: Mutex::new(None),
         });
         HostSession { inner }
@@ -759,118 +829,173 @@ fn start_island(
     Ok(island)
 }
 
-// ---------- 世代重建（B 门之后的恢复接棒） ----------
+// ---------- 一次性重建（B 门 / 拨号 / 巡检事件触发） ----------
 
-/// 岛上报不健康：如实置 failed（不谎报 ready）+ **起世代重建**（2026-10-14 起）。
-/// 此前只置 failed 终态——岛内阶梯 B 之后 `dormant`、宿主会话无人重赛跑，网络早已恢复
-/// 会话却永久 failed（MacBook Pro 实测：Wi-Fi 瞬断 10 s 后 7 分钟零重连）。
+/// 岛上报不健康：如实置 failed + 触发**一次**重建（边沿源，绕过节流）。
 fn on_island_unhealthy(inner: &Arc<Inner>, reason: &str) {
     (inner.logf)(&format!(
-        "⚠️ 宿主会话不健康（{reason}）——岛内阶梯已尽力；本会话状态置 failed，起世代重建"
+        "⚠️ 宿主会话不健康（{reason}）——岛内阶梯已尽力；置 failed 并触发一次性重建"
     ));
-    set_state(inner, SessState::Failed, &format!("岛不健康（{reason}）；自动重连中"));
-    spawn_rebuild(inner);
+    set_state(inner, SessState::Failed, &format!("岛不健康（{reason}）；一次性重连中"));
+    try_rebuild(inner, RebuildSource::BGate);
 }
 
-/// 单飞起重建线程（已在跑 / 已收工 ⇒ 不重复）。
-fn spawn_rebuild(inner: &Arc<Inner>) {
-    if inner.stop.load(Ordering::SeqCst) || inner.rebuilding.swap(true, Ordering::SeqCst) {
+/// 一次性重建的统一入口（任意线程；短命 worker）。
+///
+/// - 边沿源（B 门）绕过 30s，且在飞时用 `PENDING` 留字（worker 收尾承接）；
+/// - demand 源（拨号/巡检）受 `REBUILD_MIN_GAP=30s` 限频；
+/// - 单飞 = `REBUILD_INFLIGHT`；worker 失败后**不自己重试**，等下一次事件。
+fn try_rebuild(inner: &Arc<Inner>, source: RebuildSource) {
+    if inner.stop.load(Ordering::Acquire) {
         return;
     }
-    let sh = Arc::clone(inner);
-    match std::thread::Builder::new()
-        .name("homeway-host-rebuild".into())
-        .spawn(move || rebuild_loop(sh))
-    {
-        Ok(h) => *crate::syncutil::lock_unpoison(&inner.rebuild) = Some(h),
-        Err(e) => {
-            inner.rebuilding.store(false, Ordering::SeqCst);
-            crate::syncutil::log_spawn_failed(
-                &inner.logf,
-                "宿主会话重建线程",
-                &e,
-                "本会话停在 failed（无人重赛跑）——重启守护进程可恢复",
-            );
+    if !source.is_edge() {
+        let mut last = crate::syncutil::lock_unpoison(&inner.rebuild_gate.last);
+        if last.is_some_and(|t| t.elapsed() < REBUILD_MIN_GAP) {
+            return;
         }
+        *last = Some(Instant::now());
     }
+    let prev = inner.rebuild_gate.state.fetch_or(REBUILD_INFLIGHT, Ordering::AcqRel);
+    #[cfg(test)]
+    if prev & REBUILD_INFLIGHT == 0 {
+        inner.rebuild_gate.spawns.fetch_add(1, Ordering::Relaxed);
+    }
+    if prev & REBUILD_INFLIGHT != 0 {
+        if source.is_edge() {
+            inner.rebuild_gate.state.fetch_or(REBUILD_PENDING, Ordering::AcqRel);
+        }
+        return;
+    }
+    spawn_rebuild_worker(inner, source);
 }
 
-/// 退避序列：1s → 2s → 4s → … 封顶 30s（纯函数，单测钉）。
-fn next_backoff(cur: Duration) -> Duration {
-    (cur * 2).min(REBUILD_BACKOFF_MAX)
-}
-
-/// 重建循环：退避 → 全名册重赛跑（`Cmd::Connect`，与初次建连同一条路）→ 成功置 ready
-/// 并退出；失败退避加倍再试，直到收工或岛本体已不可用（`Gone`/`EngineGone` = 终态）。
-fn rebuild_loop(inner: Arc<Inner>) {
-    let mut attempt: u32 = 0;
-    let mut backoff = REBUILD_BACKOFF_MIN;
-    'outer: loop {
-        // 睡退避（1s 粒度，stop 可打断）
-        let deadline = Instant::now() + backoff;
-        while Instant::now() < deadline {
-            if inner.stop.load(Ordering::SeqCst) {
-                break 'outer;
-            }
-            std::thread::sleep(Duration::from_millis(1000).min(deadline.saturating_duration_since(Instant::now())));
-        }
-        if inner.stop.load(Ordering::SeqCst) {
-            break;
-        }
-        let island = crate::syncutil::lock_unpoison(&inner.island).clone();
-        let Some(island) = island else { break };
-        attempt += 1;
-        let n = inner.cands.len();
-        (inner.logf)(&format!(
-            "世代重建：重赛跑全名册（第 {attempt} 次，候选 {n} 个，退避 {}）",
-            crate::go_fmt::fmt_duration_go_secs(backoff)
-        ));
-        let cands = inner.cands.clone();
-        match island_cmd(
-            &island,
-            |reply| Cmd::Connect {
-                cands,
-                budget: CONNECT_BUDGET,
-                demote_adopted: false,
-                reply,
-            },
-            CONNECT_BUDGET + RPC_BUDGET,
-        ) {
-            Ok(o) => {
-                (inner.logf)(&format!(
-                    "世代重建成功（第 {attempt} 次，胜出 {} {}，耗时 {}ms）—— 会话回 ready",
-                    o.via.text(),
-                    o.winner,
-                    o.elapsed_ms
-                ));
-                set_state(&inner, SessState::Ready, "");
-                if let ProbeOutcome::Ok { rtt } = probe_once(&inner, PROBE_TIMEOUT) {
-                    set_link(&inner, rtt);
-                }
-                break;
-            }
-            Err(e @ IslandRpcErr::Gone(_))
-            | Err(e @ IslandRpcErr::Island(homeway_quic::IslandErr::EngineGone)) => {
-                (inner.logf)(&format!("世代重建停止：岛本体已不可用（{e}）—— 会话保持 failed"));
-                set_state(&inner, SessState::Failed, &format!("岛不可用（{e}）"));
-                break;
+/// 起短命 worker（初次 + 2 次重试；全败清单飞位并留行）。
+fn spawn_rebuild_worker(inner: &Arc<Inner>, source: RebuildSource) {
+    let mut tries = 0u32;
+    loop {
+        let sh = Arc::clone(inner);
+        match std::thread::Builder::new()
+            .name("homeway-host-rebuild".into())
+            .spawn(move || rebuild_worker(sh, source))
+        {
+            Ok(h) => {
+                *crate::syncutil::lock_unpoison(&inner.rebuild) = Some(h);
+                return;
             }
             Err(e) => {
-                let next = next_backoff(backoff);
-                (inner.logf)(&format!(
-                    "世代重建失败（第 {attempt} 次，{e}）—— {} 后再试",
-                    crate::go_fmt::fmt_duration_go_secs(next)
-                ));
-                set_state(
-                    &inner,
-                    SessState::Failed,
-                    &format!("岛不健康；自动重连中（第 {attempt} 次失败）"),
-                );
-                backoff = next;
+                tries += 1;
+                if tries >= REBUILD_SPAWN_TRIES {
+                    inner
+                        .rebuild_gate
+                        .state
+                        .fetch_and(!REBUILD_INFLIGHT, Ordering::AcqRel);
+                    crate::syncutil::log_spawn_failed(
+                        &inner.logf,
+                        "宿主会话重建线程",
+                        &e,
+                        "本会话停在 failed（无人重赛跑）——下一次拨号/巡检事件会再触发",
+                    );
+                    return;
+                }
             }
         }
     }
-    inner.rebuilding.store(false, Ordering::SeqCst);
+}
+
+/// worker：一次 `run_rebuild` + 边沿 pending 承接；panic 兜底释放单飞位（不留死锁）。
+fn rebuild_worker(inner: Arc<Inner>, source: RebuildSource) {
+    let mut source = source;
+    loop {
+        let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            run_rebuild(&inner, source);
+        }));
+        if res.is_err() {
+            (inner.logf)("一次性重建：panic（已兜住——释放单飞位，等下一次事件）");
+            inner
+                .rebuild_gate
+                .state
+                .fetch_and(!(REBUILD_INFLIGHT | REBUILD_PENDING), Ordering::AcqRel);
+            return;
+        }
+        let s = inner.rebuild_gate.state.load(Ordering::Acquire);
+        if s & REBUILD_PENDING == 0 {
+            inner
+                .rebuild_gate
+                .state
+                .fetch_and(!REBUILD_INFLIGHT, Ordering::AcqRel);
+            return;
+        }
+        // 在飞期间来过边沿：清位、保留 INFLIGHT，再跑一轮（只可能来自 B 门）。
+        inner
+            .rebuild_gate
+            .state
+            .fetch_and(!REBUILD_PENDING, Ordering::AcqRel);
+        source = RebuildSource::BGate;
+    }
+}
+
+/// 一轮重建：全名册 `Cmd::Connect`（与初次建连同一条路）。
+fn run_rebuild(inner: &Arc<Inner>, source: RebuildSource) {
+    if inner.stop.load(Ordering::Acquire) {
+        return;
+    }
+    let Some(island) = crate::syncutil::lock_unpoison(&inner.island).clone() else {
+        // 岛已收回（收工路径）：不覆盖 failed 原因（否则与「一次性重连中」竞态），静默放弃。
+        (inner.logf)(&format!("一次性重建：放弃（源={}，岛已收回）", source.text()));
+        return;
+    };
+    let n = inner.cands.len();
+    (inner.logf)(&format!(
+        "一次性重建：起跑（源={}，候选 {n} 个）",
+        source.text()
+    ));
+    let t0 = Instant::now();
+    match island_cmd(
+        &island,
+        |reply| Cmd::Connect {
+            cands: inner.cands.clone(),
+            budget: CONNECT_BUDGET,
+            demote_adopted: false,
+            reply,
+        },
+        CONNECT_BUDGET + RPC_BUDGET,
+    ) {
+        Ok(o) => {
+            if inner.stop.load(Ordering::Acquire) {
+                return;
+            }
+            (inner.logf)(&format!(
+                "一次性重建：恢复（源={}，胜出 {} {}，耗时 {}ms）—— 会话回 ready",
+                source.text(),
+                o.via.text(),
+                o.winner,
+                t0.elapsed().as_millis()
+            ));
+            set_state(inner, SessState::Ready, "");
+            if let ProbeOutcome::Ok { rtt } = probe_once(inner, PROBE_TIMEOUT) {
+                set_link(inner, rtt);
+            }
+        }
+        Err(e @ IslandRpcErr::Gone(_))
+        | Err(e @ IslandRpcErr::Island(homeway_quic::IslandErr::EngineGone)) => {
+            if inner.stop.load(Ordering::Acquire) {
+                return;
+            }
+            (inner.logf)(&format!(
+                "一次性重建：停止（源={}，岛本体已不可用：{e}）—— 会话保持 failed",
+                source.text()
+            ));
+            set_state(inner, SessState::Failed, &format!("岛不可用（{e}）"));
+        }
+        Err(e) => {
+            (inner.logf)(&format!(
+                "一次性重建：失败（源={}，原因={e}）—— 不自动重试，等下一次事件（拨号/巡检/B门）",
+                source.text()
+            ));
+            set_state(inner, SessState::Failed, "岛不健康；等待下一次事件重连");
+        }
+    }
 }
 
 // ---------- 探活 / 快照 ----------
@@ -968,10 +1093,17 @@ fn patrol_loop(inner: Arc<Inner>) {
                 (inner.logf)(&format!(
                     "巡检失败（连续 {fail_streak}）：探活预算内无对端证据（岛内阶梯按自己的节拍处置）"
                 ));
+                // 3 连败 = 观测面确认的失败（与隧道域 stats 观测同门槛）；触发一次重建后
+                // 清零——下一次要再攒 3 拍（≈3min），不是自驱重试。
+                if fail_streak >= 3 {
+                    fail_streak = 0;
+                    try_rebuild(&inner, RebuildSource::Patrol);
+                }
             }
             ProbeOutcome::NoFace => {
                 fail_streak += 1;
-                // 无面 = 连接已断：岛内阶梯据此动作（`admitted` 位保证它不被 TUN 面关掉）。
+                (inner.logf)("巡检无连接面：触发一次性重建（岛内阶梯也在动作）");
+                try_rebuild(&inner, RebuildSource::Patrol);
             }
         }
         // 快照里的 stats 每次读时现取（`snapshot()`），这里只刷新 link。
@@ -1321,37 +1453,67 @@ mod tests {
         );
     }
 
-    /// 世代重建退避序列：1 → 2 → 4 → … 封顶 30s。
+    /// 岛上报不健康 ⇒ 置 failed、触发一次性重建；无岛（合成会话）⇒ worker 即退、
+    /// 单飞位释放——不挂线程、不 panic。
     #[test]
-    fn rebuild_backoff_doubles_and_caps() {
-        let mut b = REBUILD_BACKOFF_MIN;
-        let mut seen = vec![b];
-        for _ in 0..8 {
-            b = next_backoff(b);
-            seen.push(b);
-        }
-        assert_eq!(
-            seen.iter().map(|d| d.as_secs()).collect::<Vec<_>>(),
-            vec![1, 2, 4, 8, 16, 30, 30, 30, 30]
-        );
-    }
-
-    /// 岛上报不健康 ⇒ 置 failed 且 reason 标「自动重连中」、起重建线程（单飞位置位）；
-    /// 无岛（合成会话）⇒ 循环即退、单飞位复位——不挂线程、不 panic。
-    #[test]
-    fn unhealthy_marks_failed_with_rebuilding_reason_and_spawns_once() {
+    fn unhealthy_marks_failed_and_rebuild_worker_releases() {
         let s = HostSession::synthetic_for_test(SessState::Ready, "");
         on_island_unhealthy(&s.inner, "patrol");
         let snap = s.snapshot();
         assert_eq!(snap.state, SessState::Failed);
-        assert!(snap.reason.contains("自动重连中"), "reason 须告知在自动重连：{}", snap.reason);
-        // 第二次上报不重复起线程（单飞）；等线程因无岛自退后单飞位复位
-        on_island_unhealthy(&s.inner, "patrol");
+        assert!(
+            snap.reason.contains("一次性重连中"),
+            "reason 须告知在重连：{}",
+            snap.reason
+        );
         let deadline = Instant::now() + Duration::from_secs(5);
-        while s.inner.rebuilding.load(Ordering::SeqCst) && Instant::now() < deadline {
-            std::thread::sleep(Duration::from_millis(50));
+        while s.inner.rebuild_gate.state.load(Ordering::Acquire) & REBUILD_INFLIGHT != 0
+            && Instant::now() < deadline
+        {
+            std::thread::sleep(Duration::from_millis(20));
         }
-        assert!(!s.inner.rebuilding.load(Ordering::SeqCst), "无岛时重建线程须自退并复位单飞位");
+        assert_eq!(
+            s.inner.rebuild_gate.state.load(Ordering::Acquire) & REBUILD_INFLIGHT,
+            0,
+            "无岛时 worker 须自退并释放单飞位"
+        );
+        // 第二次上报不 panic（worker 已释放，可再起一轮）
+        on_island_unhealthy(&s.inner, "patrol");
+        s.stop();
+    }
+
+    /// 闸语义：demand 源 30s 限频；边沿（B 门）绕过；单飞不重复起跑。
+    #[test]
+    fn rebuild_gate_edges_bypass_demand_throttle() {
+        let s = HostSession::synthetic_for_test(SessState::Ready, "");
+        let wait_idle = || {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while s.inner.rebuild_gate.state.load(Ordering::Acquire) & REBUILD_INFLIGHT != 0
+                && Instant::now() < deadline
+            {
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        };
+        // 第一次 demand：起跑
+        try_rebuild(&s.inner, RebuildSource::Dial);
+        wait_idle();
+        assert_eq!(s.inner.rebuild_gate.spawns.load(Ordering::Relaxed), 1);
+        // 30s 内第二次 demand：被限频，不起跑
+        try_rebuild(&s.inner, RebuildSource::Dial);
+        wait_idle();
+        assert_eq!(
+            s.inner.rebuild_gate.spawns.load(Ordering::Relaxed),
+            1,
+            "demand 源 30s 内不得再起跑"
+        );
+        // 边沿：绕过限频
+        try_rebuild(&s.inner, RebuildSource::BGate);
+        wait_idle();
+        assert_eq!(
+            s.inner.rebuild_gate.spawns.load(Ordering::Relaxed),
+            2,
+            "B 门边沿必须绕过 30s 限频"
+        );
         s.stop();
     }
 

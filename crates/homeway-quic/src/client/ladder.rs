@@ -290,6 +290,32 @@ impl Ladder {
         due.then_some((Round::First, self.tun.fast_budget))
     }
 
+    /// 下一拍「应醒」的剩余时间（driver 用它把睡眠对齐到快探到点——避免 1s 拍
+    /// 量化把拍间抬到 ~2s；`None` = 在飞/休眠，按 driver 的兜底拍走）。
+    ///
+    /// **不做状态推进**（不更新 `last_tick`）：真正的到点判定仍在 [`Self::due`]。
+    pub(crate) fn next_wait(&self, now: TokioInstant, in_use: bool) -> Option<Duration> {
+        if self.inflight || self.dormant {
+            return None;
+        }
+        if self.last_round_at.is_some() && now.saturating_duration_since(self.last_tick) > 2 * self.tun.idle_interval {
+            return Some(Duration::ZERO);
+        }
+        match self.last_round_at {
+            Some(at) => {
+                let wait = if in_use { self.tun.fast_gap } else { self.tun.idle_interval };
+                Some((at + wait).saturating_duration_since(now))
+            }
+            None => {
+                if in_use {
+                    Some(Duration::ZERO)
+                } else {
+                    Some((self.started_at + self.tun.idle_interval).saturating_duration_since(now))
+                }
+            }
+        }
+    }
+
     /// 记「本轮探活已下发」（单飞 + 节拍基准）。
     pub(crate) fn note_round(&mut self, round: Round, now: TokioInstant) {
         let _ = round;
@@ -606,7 +632,7 @@ impl Ladder {
         self.r_fail_streak = self.r_fail_streak.saturating_add(1);
         let since = *self.r_fail_since.get_or_insert(now);
         (*logf)(&format!(
-            "链路重连失败（原因={why}，第 {} 次）—— 交世代重建",
+            "链路重连失败（原因={why}，第 {} 次）—— 交一次性重连",
             self.r_fail_streak
         ));
         let window = now.saturating_duration_since(since);
@@ -616,7 +642,7 @@ impl Ladder {
             self.pending = None;
             self.last_action = "rebuild";
             (*logf)(&format!(
-                "世代重建（原因={why}；连续重连失败 {}）",
+                "B 门上报（原因={why}；连续重连失败 {}）",
                 self.r_fail_streak
             ));
             return Step::Rebuild {
@@ -743,8 +769,8 @@ mod tests {
         l.note_round(Round::First, t1);
         l.on_round(Round::First, ok(), t1, SendFace::default(), &lines().0);
         // 成功清位后：正常节拍（非空窗）内再失败——回到 R（若标志残留则会错走 M）
-        let t2 = t1 + Duration::from_millis(250);
-        assert!(l.due(t2, true).is_some(), "在用档背靠背到点");
+        let t2 = t1 + Duration::from_secs(1);
+        assert!(l.due(t2, true).is_some(), "在用档 1s 拍间到点");
         l.note_round(Round::First, t2);
         l.on_round(Round::First, failed(), t2, SendFace::default(), &lines().0);
         let step = l.on_round(Round::Reprobe, failed(), t2, SendFace::default(), &lines().0);
@@ -754,7 +780,39 @@ mod tests {
         );
     }
 
-    /// **判据（节拍三段，§3.2）**：在用档 = 背靠背（拍间 `fast_gap`，≤300ms）；待机档 = 60s；
+    /// **判据（driver 对齐）**：`next_wait` 让睡眠对齐到快探到点——在用档 1s 拍间
+    /// 不再被 1s 兜底拍量化成 ~2s；在飞/首拍/待机三态各自有确定返回值。
+    #[test]
+    fn next_wait_aligns_driver_to_gap() {
+        let mut l = Ladder::new(tuning());
+        let t0 = l.started_at;
+        assert_eq!(l.next_wait(t0, true), Some(Duration::ZERO), "首拍立即");
+        assert_eq!(
+            l.next_wait(t0, false),
+            Some(Duration::from_secs(60)),
+            "待机首拍 60s"
+        );
+        l.note_round(Round::First, t0);
+        assert_eq!(l.next_wait(t0, true), None, "在飞 ⇒ driver 走兜底拍");
+        l.on_round(Round::First, ok(), t0, SendFace::default(), &lines().0);
+        assert_eq!(
+            l.next_wait(t0 + Duration::from_millis(250), true),
+            Some(Duration::from_millis(750)),
+            "在用档：距到点还剩 750ms（不是等下一拍）"
+        );
+        assert_eq!(
+            l.next_wait(t0 + Duration::from_secs(1), true),
+            Some(Duration::ZERO),
+            "到点即醒"
+        );
+        assert_eq!(
+            l.next_wait(t0 + Duration::from_millis(250), false),
+            Some(Duration::from_millis(59_750)),
+            "待机档：距 60s 到点还剩 59.75s"
+        );
+    }
+
+    /// **判据（节拍三段，§3.2）**：在用档 = 拍间 `fast_gap`（2026-10-18 起 1s）；待机档 = 60s；
     /// 挂起空窗（> 2×待机节拍）⇒ 立即探。
     #[test]
     fn cadence_is_tiered_and_suspension_wakes_it() {
@@ -765,16 +823,17 @@ mod tests {
         l.note_round(Round::First, t0);
         l.on_round(Round::First, ok(), t0, SendFace::default(), &lines().0);
 
-        // 在用档：拍间 < fast_gap ⇒ 未到点；= fast_gap ⇒ 到点
+        // 在用档：拍间 < fast_gap（1s）⇒ 未到点；= fast_gap ⇒ 到点
         assert!(l.due(t0 + Duration::from_millis(100), true).is_none());
-        let due = l.due(t0 + Duration::from_millis(250), true).expect("到点");
+        assert!(l.due(t0 + Duration::from_millis(250), true).is_none(), "旧 250ms 不再到点");
+        let due = l.due(t0 + Duration::from_secs(1), true).expect("到点");
         assert_eq!(due.0, Round::First);
         assert_eq!(due.1, Duration::from_millis(700), "首探预算 = §13-T2 的承重值");
-        l.note_round(due.0, t0 + Duration::from_millis(250));
-        l.on_round(Round::First, ok(), t0 + Duration::from_millis(250), SendFace::default(), &lines().0);
+        l.note_round(due.0, t0 + Duration::from_secs(1));
+        l.on_round(Round::First, ok(), t0 + Duration::from_secs(1), SendFace::default(), &lines().0);
 
         // 待机档：250ms 不到点、59s 不到点、60s 到点
-        let base = t0 + Duration::from_millis(250);
+        let base = t0 + Duration::from_secs(1);
         assert!(l.due(base + Duration::from_millis(250), false).is_none(), "待机档不背靠背");
         assert!(l.due(base + Duration::from_secs(59), false).is_none(), "待机档 60s 节拍");
         assert!(l.due(base + Duration::from_secs(60), false).is_some(), "待机档到点");
@@ -1055,9 +1114,9 @@ mod tests {
             other => panic!("窗满 + 连续 ≥2 ⇒ B（实得 {other:?}）"),
         }
         let logged = log.lock().unwrap();
-        assert!(logged.iter().any(|l| l.contains("世代重建（原因=")), "{logged:?}");
+        assert!(logged.iter().any(|l| l.contains("B 门上报（原因=")), "{logged:?}");
         assert!(
-            logged.iter().any(|l| l.contains("链路重连失败（原因=对端不可达，第 3 次）—— 交世代重建")),
+            logged.iter().any(|l| l.contains("链路重连失败（原因=对端不可达，第 3 次）—— 交一次性重连")),
             "C18 行文逐字：{logged:?}"
         );
     }
@@ -1180,8 +1239,8 @@ mod tests {
             "链路探活抖动（探活无回显，已复探）",
             "链路重连中（原因=探活无回显，第 1 次）",
             "链路重连完成（原因=探活无回显，",
-            "链路重连失败（原因=对端不可达，第 1 次）—— 交世代重建",
-            "世代重建（原因=对端不可达；连续重连失败 ",
+            "链路重连失败（原因=对端不可达，第 1 次）—— 交一次性重连",
+            "B 门上报（原因=对端不可达；连续重连失败 ",
         ];
         for w in want {
             assert!(
@@ -1264,7 +1323,7 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(25)).await;
         }
         assert!(seen.len() >= 5, "探活轮次：{seen:?}");
-        // ① 节拍：在用档背靠背（相邻首探间隔 ≤ fast_gap + 一拍）
+        // ① 节拍：在用档 1s（相邻首探间隔 ≤ fast_gap + 一拍）
         let firsts: Vec<Duration> = seen
             .iter()
             .filter(|(_, r, _)| *r == Round::First)
@@ -1274,8 +1333,8 @@ mod tests {
         for w in firsts.windows(2) {
             let gap = w[1] - w[0];
             assert!(
-                gap <= Duration::from_millis(300),
-                "在用档背靠背（拍间 ≤300ms），实得 {gap:?}"
+                gap <= Duration::from_millis(1100),
+                "在用档 1s 拍间（+ 模拟拍），实得 {gap:?}"
             );
         }
         // ② 预算：首探 = 700ms；复探 = 1400ms（§3.1-1 的加倍）

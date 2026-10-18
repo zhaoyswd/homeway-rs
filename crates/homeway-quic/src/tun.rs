@@ -11,6 +11,10 @@
 //! 2. **本模块不做 fd 判死的分类**：判死（`POLLHUP/POLLERR/POLLNVAL`、`read` 返错、
 //!    写超预算）一律**记行 + 投 `Cmd::TunFdDead`**（镜像 `wgcore` 的同名命令），由岛
 //!    线程按既有取值集打 `fd` 分类（`mark_unhealthy_if_current(gen,"fd")` 的岛侧落点）。
+//! 3. **承载位已死 ⇒ 读面短路丢包**（2026-10-18）：`carrier=false` 时成功 read 的包
+//!    只做计数 + 需求回调，**不分配、不占在途名额、不投岛**；丢弃按 64 条批量上报。
+//!    避免断网期把注定失败的包继续喂给岛（每包命令/快照锁/日志），给一次性重连
+//!    让路；需求回调仍照发（恢复入口不因熔断被吞）。
 //!
 //! fd 所有权：**在扩展**（`Cmd::TunAttach` 的语义），本模块**从不 close**；线程退出靠
 //! ①岛收工（命令通道断 ⇒ `send` 返 `Err` ⇒ 读线程自退，M0 设计 §3.6-2④）或 ②fd 失效
@@ -127,20 +131,32 @@ impl TunCounters {
         }
     }
 
-    /// 交还在途名额（岛侧消费掉一条 `TunPacket`，或读线程投递失败）。
-    pub(crate) fn done_send(&self) {
+    /// 交还 `n` 个在途名额（岛侧批量消费时一次交还；下限 0）。
+    pub(crate) fn done_send_n(&self, n: u64) {
+        if n == 0 {
+            return;
+        }
         let mut cur = self.inflight.load(Ordering::Relaxed);
-        while cur > 0 {
-            match self.inflight.compare_exchange_weak(
-                cur,
-                cur - 1,
-                Ordering::Relaxed,
-                Ordering::Relaxed,
-            ) {
+        loop {
+            let next = cur.saturating_sub(n);
+            match self
+                .inflight
+                .compare_exchange_weak(cur, next, Ordering::Relaxed, Ordering::Relaxed)
+            {
                 Ok(_) => return,
-                Err(now) => cur = now,
+                Err(now) => {
+                    if now == 0 {
+                        return;
+                    }
+                    cur = now;
+                }
             }
         }
+    }
+
+    /// 交还在途名额（岛侧消费掉一条 `TunPacket`，或读线程投递失败）。
+    pub(crate) fn done_send(&self) {
+        self.done_send_n(1);
     }
 
     /// 最近出站包时刻（**单调面**换算；`None` = 本世代从未有过应用出站）——
@@ -451,7 +467,14 @@ fn poll_reports_event(r: &Ready) -> bool {
     r.readable || r.hup || r.err || r.nval
 }
 
-/// 读循环（应用出站方向）：裸 read → 计数 → `Cmd::TunPacket` 投岛。
+/// 读面熔断判据（纯函数，单测三态）：`None` = 无承载面（测试/宿主形态）⇒ 照常转发；
+/// `Some(true)` = 承载在位 ⇒ 转发；`Some(false)` = 已知死亡 ⇒ 短路丢包。
+fn carrier_dead(alive: Option<bool>) -> bool {
+    alive == Some(false)
+}
+
+/// 读循环（应用出站方向）：裸 read → 计数 → `Cmd::TunPacket` 投岛；
+/// 承载位已死时同一路径短路丢包（不分配/不投岛，批量上报）。
 ///
 /// - **读面需求触发（reconnect-oneshot D2）**：成功 read 之后、packet-info 剥离与
 ///   在途闸/队满判定**之前**——承载位 false 时无论该包最终是否被丢都必须触发
@@ -569,12 +592,15 @@ fn read_loop(
         stuck.note_progress(); // 取得数据：僵死链断
         // ---- 读面需求触发（reconnect-oneshot D2：成功 read 之后、PI 剥离与在途闸/
         // 队满判定之前——队满丢弃路径不得吞掉触发）----
-        if let Some(c) = &carrier {
-            if !c.alive() {
+        // 承载位已死 ⇒ 本拍后续**短路丢包**（不分配、不投岛、不占在途名额）；需求
+        // 回调仍照发（恢复入口不能因熔断被吞）。
+        let dead = carrier_dead(carrier.as_ref().map(|c| c.alive()));
+        if dead {
+            if let Some(c) = &carrier {
                 c.bump_demand_pkt(); // 载位假包 P（调入口前自增——r4-R16）
-                if let Some(cb) = &on_demand {
-                    cb(); // 契约：只允许原子操作 + 起线程（禁日志禁锁禁阻塞）
-                }
+            }
+            if let Some(cb) = &on_demand {
+                cb(); // 契约：只允许原子操作 + 起线程（禁日志禁锁禁阻塞）
             }
         }
         let mut n = n;
@@ -586,7 +612,6 @@ fn read_loop(
             buf.copy_within(4..n, 0);
             n -= 4;
         }
-        let pkt: Box<[u8]> = buf[..n].to_vec().into_boxed_slice();
         counters.read_bytes.fetch_add(n as u64, Ordering::Relaxed);
         // 需求信号（demand-driven-recovery D1：只计 App 源；巡检拍取走清零）
         counters.out_pkts.fetch_add(1, Ordering::Relaxed);
@@ -601,6 +626,20 @@ fn read_loop(
             process_mono_start().elapsed().as_nanos() as i64,
             Ordering::Relaxed,
         );
+        // 已知承载位死亡：不再把注定失败的包投给岛（避免每包分配 + 命令循环 +
+        // 岛侧快照锁/日志）。丢弃照常计数，按 64 条批量上报。
+        if dead {
+            pending_drops += 1;
+            if pending_drops >= DROP_REPORT_BATCH {
+                let _ = tx.send(Cmd::DatagramDropped {
+                    reason: crate::cmd::DropReason::Unregistered,
+                    n: pending_drops,
+                });
+                pending_drops = 0;
+            }
+            continue;
+        }
+        let pkt: Box<[u8]> = buf[..n].to_vec().into_boxed_slice();
         // 在途闸（设计 §6.4 的「有界通道 4096 条」等价实现）：满 ⇒ **丢新 + 计数**，
         // 读线程**不阻塞**（丢的包由端到端 TCP 重传吸收）。
         if !counters.try_begin_send() {
@@ -1156,5 +1195,126 @@ mod tests {
             t0.elapsed()
         );
         drop(a);
+    }
+
+    /// **判据（断网期短路）**：承载位 false 时读到的包**不得**变成 `TunPacket`；
+    /// 但仍计数、仍触发需求回调（恢复入口不丢）。用真实读循环 + 可观测通道验证。
+    #[test]
+    fn dead_carrier_drops_without_tun_packet_and_keeps_demand() {
+        let (a, b) = UnixStream::pair().expect("socketpair");
+        let carrier = CarrierFlag::new();
+        carrier.mark_dead();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h2 = Arc::clone(&hits);
+        let cb: OnPacketDemand = Arc::new(move || {
+            h2.fetch_add(1, Ordering::SeqCst);
+        });
+        let counters = TunCounters::new();
+        let (tx, mut rx) = crate::driver::IslandTx::test_channel();
+        let logf = Arc::new(|_s: &str| {}) as Logf;
+        let fd = a.as_raw_fd();
+        let c2 = Arc::clone(&counters);
+        let h = std::thread::spawn(move || {
+            read_loop(fd, tx, c2, logf, Some(carrier), Some(cb));
+        });
+        let pkt = [0x45u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2];
+        (&b).write_all(&pkt).expect("写一包");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while counters.read_bytes.load(Ordering::Relaxed) < pkt.len() as u64
+            && Instant::now() < deadline
+        {
+            std::thread::yield_now();
+        }
+        drop(b);
+        h.join().expect("reader 收口");
+        assert_eq!(
+            counters.read_bytes.load(Ordering::Relaxed),
+            pkt.len() as u64,
+            "熔断只影响转发，不影响读面字节计数"
+        );
+        assert_eq!(hits.load(Ordering::SeqCst), 1, "需求回调仍须逐包触发");
+        match rx.try_recv() {
+            Err(_) => {}
+            // 关闭写端后的 EOF 判死属正常收口，不是转发
+            Ok(Cmd::TunFdDead { .. }) => {}
+            Ok(Cmd::TunPacket(_)) => panic!("承载位已死：不得投 TunPacket"),
+            Ok(_) => panic!("承载位已死：除 EOF 判死外不得投岛命令（未到 64 条批量阈值）"),
+        }
+        drop(a);
+    }
+
+    /// **判据（承载在位照常转发）**：同一条读路径在 carrier 存活时必须投出
+    /// `TunPacket`，且不触发需求回调。
+    #[test]
+    fn alive_carrier_still_forwards_tun_packet() {
+        let (a, b) = UnixStream::pair().expect("socketpair");
+        let carrier = CarrierFlag::new();
+        carrier.mark_alive();
+        let hits = Arc::new(AtomicUsize::new(0));
+        let h2 = Arc::clone(&hits);
+        let cb: OnPacketDemand = Arc::new(move || {
+            h2.fetch_add(1, Ordering::SeqCst);
+        });
+        let counters = TunCounters::new();
+        let (tx, mut rx) = crate::driver::IslandTx::test_channel();
+        let logf = Arc::new(|_s: &str| {}) as Logf;
+        let fd = a.as_raw_fd();
+        let c2 = Arc::clone(&counters);
+        let h = std::thread::spawn(move || {
+            read_loop(fd, tx, c2, logf, Some(carrier), Some(cb));
+        });
+        let pkt = [0x45u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 10, 0, 0, 1, 10, 0, 0, 2];
+        (&b).write_all(&pkt).expect("写一包");
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let mut got = false;
+        while Instant::now() < deadline {
+            match rx.try_recv() {
+                Ok(Cmd::TunPacket(p)) => {
+                    assert_eq!(&p[..], &pkt, "转发内容逐字节一致");
+                    got = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(_) => std::thread::yield_now(),
+            }
+        }
+        drop(b);
+        h.join().expect("reader 收口");
+        assert!(got, "承载位存活必须投出 TunPacket");
+        assert_eq!(hits.load(Ordering::SeqCst), 0, "存活不触发需求回调");
+        drop(a);
+    }
+
+    /// **判据（承载位三态）**：`None`（测试/宿主）与 `Some(true)` 照常转发；
+    /// `Some(false)` 短路丢包。熔断只看承载位，不看日志/锁。
+    #[test]
+    fn carrier_dead_is_three_state() {
+        assert!(!carrier_dead(None), "无承载面 ⇒ 转发");
+        assert!(!carrier_dead(Some(true)), "承载在位 ⇒ 转发");
+        assert!(carrier_dead(Some(false)), "承载已死 ⇒ 短路丢包");
+    }
+
+    /// **判据（批量交还）**：`done_send_n` 一次释放 N 个在途名额；过量释放饱和到 0，
+    /// 不回绕；释放后闸门恢复可用。
+    #[test]
+    fn done_send_n_releases_exact_count_and_saturates() {
+        let c = TunCounters::new();
+        for _ in 0..3 {
+            assert!(c.try_begin_send());
+        }
+        c.done_send_n(2);
+        assert_eq!(
+            c.inflight.load(Ordering::Relaxed),
+            1,
+            "3 占 2 还 ⇒ 余 1"
+        );
+        assert!(c.try_begin_send(), "释放后闸门恢复");
+        c.done_send_n(100);
+        assert_eq!(
+            c.inflight.load(Ordering::Relaxed),
+            0,
+            "过量释放饱和到 0（不回绕）"
+        );
+        assert!(c.try_begin_send(), "饱和后仍可正常占位");
     }
 }

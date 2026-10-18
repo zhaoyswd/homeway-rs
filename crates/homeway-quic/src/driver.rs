@@ -54,14 +54,15 @@ use crate::tuning::{apply_cc_env, apply_probe_env, apply_stream_env, ProbeTuning
 pub(crate) const ISLAND_THREAD: &str = "homeway-quic";
 /// 到点收割线程名（镜像 `hw-engine-reap`）。
 pub(crate) const REAP_THREAD: &str = "hw-quic-reap";
-/// **在用档**的命令等待节拍（250ms）：与 `fast_gap` 对齐——只在「连接在位且 5s 内有
-/// 出站流量」（见 [`in_use_now`]）时使用；拍内务（刷新/快探到点/快照同步）挂在它上面。
-const TICK: Duration = Duration::from_millis(250);
-/// **待机/无连接**的拍上限（1s）：待机档快探是 60s 粒度、注册刷新也是 60s ⇒ 1s 足够
-/// 准点；命令/任务回执照常唤醒循环（赛跑/R/确认探活全走任务回执或同步链，无「等下一
-/// 拍」路径）。旧实现只要 `live.is_some()` 就保持 250ms，让整夜空闲的岛线程 4Hz
-/// 唤醒（2026-10-18 评审的资源项）。
-const TICK_IDLE: Duration = Duration::from_secs(1);
+/// 岛内统一拍长（1s；2026-10-18 用户裁定：在用档 `fast_gap` 250ms → 1s）。
+///
+/// 拍内务（刷新/快探到点/快照同步）挂在这一拍上；命令/任务回执照常唤醒循环
+/// （赛跑/R/确认探活全走任务回执或同步链，无「等下一拍」路径）。旧实现连接在位
+/// 就 250ms（整夜 4Hz），在用档再对齐 250ms——现在统一 1s。
+const TICK: Duration = Duration::from_secs(1);
+/// 上行 L3 单批上限（`Cmd::TunPacket` 的岛侧抽干）：把「每包一次命令循环 +
+/// housekeeping」摊到一批；只取**已经就绪**的包，不等、不凑批（不引入时延）。
+const TUN_BATCH_MAX: usize = 64;
 /// 快照同步（housekeeping ④）的时间节流（2026-10-10 审查 中-3）：拍内务逐命令执行
 /// （上行热路径 = 每包一遍）而快照只需匹配同步面的轮询率 ⇒ 距上次同步 ≥ 本间隔才做；
 /// 连接采纳/断开等关键转换置「立即到期」（见 [`DriverState::snap_sync_last`]）。
@@ -88,6 +89,13 @@ fn log_due(n: u64) -> bool {
 pub struct IslandTx(UnboundedSender<Cmd>);
 
 impl IslandTx {
+    /// 【test-seam】可观测通道（与生产同一 `IslandTx` 类型；`tun.rs` 的读面单测用）。
+    #[cfg(test)]
+    pub(crate) fn test_channel() -> (IslandTx, UnboundedReceiver<Cmd>) {
+        let (tx, rx) = tmpsc::unbounded_channel();
+        (IslandTx(tx), rx)
+    }
+
     /// 投递命令（**不阻塞**——unbounded）。返回 `Err(EngineGone)` = 岛已收工/线程已退出。
     ///
     /// M1 起 TUN 读线程的存活纪律（设计 §3.6-2④，镜像 `wgcore/mod.rs` 的
@@ -707,13 +715,40 @@ fn run_driver(
             drop_note_n: None,
         };
         let mut jobs: JoinSet<Job> = JoinSet::new();
+        // 批量抽干时遇到的「非 TunPacket」命令：它排在批之后，下一轮先处理它，
+        // 保证 FIFO 不被批处理打乱（只存一条——抽干在遇到它时就停）。
+        let mut pending: Option<Cmd> = None;
         loop {
             if ctx.stop.load(Ordering::SeqCst) {
                 break;
             }
+            if let Some(c) = pending.take() {
+                match c {
+                    Cmd::Stop => break,
+                    c => handle_cmd(c, &mut st, &mut face, ctx, &mut jobs, &tx, seam).await,
+                }
+                housekeeping(&mut st, &mut face, ctx, &mut jobs, seam).await;
+                continue;
+            }
+            // 睡眠对齐到「下一个快探到点」（上限 = 1s 兜底拍）：避免 1s 拍把 1s 拍间
+            // 量化成 ~2s（T_detect 判据 ≤3.5s 的余量必须留给 0.7s+1.4s 两探）。
+            let now = TokioInstant::now();
+            let in_use = st.live.is_some() && in_use_now(&st, ctx, &st.probe);
+            let tick = st
+                .ladder
+                .next_wait(now, in_use)
+                .map(|d| d.max(Duration::from_millis(10)))
+                .unwrap_or(TICK)
+                .min(TICK);
             tokio::select! {
                 cmd = rx.recv() => match cmd {
                     Some(Cmd::Stop) => break,
+                    // 上行热路径批处理：收到首包后只抽**已就绪**的 TunPacket（≤64），
+                    // 一批只做一次 housekeeping；遇到其它命令即停并留给下一轮（FIFO）。
+                    Some(Cmd::TunPacket(first)) => {
+                        let batch = drain_tun_batch(&mut rx, first, &mut pending);
+                        handle_tun_batch(batch, &mut st, ctx);
+                    }
                     Some(c) => handle_cmd(c, &mut st, &mut face, ctx, &mut jobs, &tx, seam).await,
                     // 所有投递口掉光（实践里非主退出路径——同步面的岛句柄持 sender；
                     // 主路径是 `Cmd::Stop`／stop 位，见设计 §3.2）
@@ -860,14 +895,8 @@ fn run_driver(
                         Err(_aborted) => {}
                     }
                 }
-                // 拍长按「是否在用」分档（2026-10-18 评审）：只在有出站流量且连接在位
-                // 的「在用档」保持 250ms（与 `fast_gap` 对齐）；待机/无连接一律 1s——
-                // 连接在位不等于在用，旧实现让岛线程整夜 4Hz 唤醒。
-                () = tokio::time::sleep(if st.live.is_some() && in_use_now(&st, ctx, &st.probe) {
-                    TICK
-                } else {
-                    TICK_IDLE
-                }) => {}
+                // 兜底拍 ≤1s；到点前按 `Ladder::next_wait` 对齐（见上）。
+                () = tokio::time::sleep(tick) => {}
             }
             housekeeping(&mut st, &mut face, ctx, &mut jobs, seam).await;
         }
@@ -999,7 +1028,7 @@ fn check_narrow_path(st: &mut DriverState, ctx: &IslandCtx) {
     ));
 }
 
-/// 拍内务（无命令时每拍一次；拍长见 [`TICK`]/[`TICK_IDLE`]）：连接死 → 阶梯 → 刷新 → 快照同步。
+/// 拍内务（无命令时每拍一次；拍长见 [`TICK`]）：连接死 → 阶梯 → 刷新 → 快照同步。
 ///
 /// **巡检接线（M3 S4 重写，设计 §3）**：
 /// - QUIC 连接死（`close_reason()` 非空）⇒ **不再**就地判不健康：岛内已有恢复阶梯
@@ -1164,6 +1193,64 @@ async fn housekeeping(
     let _ = seam;
 }
 
+/// 从命令通道**只抽已经就绪**的 `TunPacket`（首包已收到；最多 [`TUN_BATCH_MAX`]）。
+///
+/// 遇到非 `TunPacket` 命令立刻停并存入 `pending`（下一轮优先处理，保 FIFO）；
+/// `try_recv` 空/断即停。**不等、不 sleep、不超时凑批**——批处理不引入上行时延。
+fn drain_tun_batch(
+    rx: &mut UnboundedReceiver<Cmd>,
+    first: Box<[u8]>,
+    pending: &mut Option<Cmd>,
+) -> Vec<Box<[u8]>> {
+    let mut batch = Vec::with_capacity(TUN_BATCH_MAX);
+    batch.push(first);
+    while batch.len() < TUN_BATCH_MAX {
+        match rx.try_recv() {
+            Ok(Cmd::TunPacket(p)) => batch.push(p),
+            Ok(other) => {
+                *pending = Some(other);
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    batch
+}
+
+/// 批量上行落点：在途名额/收包计数一次交还，无连接时一次记账；
+/// 有连接时逐包走 `dataplane::send_datagram_checked`（quinn 无批量 datagram API——
+/// 每包加密/发送仍是硬成本，批处理省的是命令循环/内务/计数固定开销）。
+fn handle_tun_batch(batch: Vec<Box<[u8]>>, st: &mut DriverState, ctx: &IslandCtx) {
+    let n = batch.len() as u64;
+    // 在途名额交还（§6.4 的有界通道等价实现：读线程占名额、岛消费即还）
+    ctx.counters.done_send_n(n);
+    // 发送路径（S2-4）：①准入窗由结构保证（`Live` 只在四帧准入完成之后存在）；
+    // ②/③ 检包 + 缓冲预检 + 分类计数 = `client::dataplane::send_datagram_checked`
+    // （**唯一**的 `send_datagram` 调用点）；无连接 ⇒ 归 `未登记`（一次记整批）。
+    ctx.counters.pkts_in.fetch_add(n, Ordering::Relaxed);
+    let Some(live) = st.live.as_ref() else {
+        let bytes = batch.iter().map(|p| p.len() as u64).sum();
+        note_drop(
+            ctx,
+            DropReason::Unregistered,
+            n,
+            "无已登记连接（批）",
+            Some(bytes),
+        );
+        return;
+    };
+    let note = st.drop_note.clone().unwrap_or_else(|| drop_note_one(ctx));
+    let mut last_buf = 0;
+    for pkt in batch {
+        dataplane::send_datagram_checked(&live.conn, pkt, &note);
+        // N8①/S2-5：缓冲占用按包刷新（黑洞期读数不能等到下一拍）；批尾值足够。
+        last_buf = live.send_buffer_used();
+    }
+    ctx.counters
+        .send_buf_used
+        .store(last_buf, Ordering::Relaxed);
+}
+
 /// 单条命令处置（岛线程内；带 await 的只有赛跑/探活的任务投出与换绑）。
 #[allow(clippy::too_many_arguments)] // 宿主单入口（参数即句柄集；同 `exit::run_exit`）
 async fn handle_cmd(
@@ -1236,33 +1323,8 @@ async fn handle_cmd(
             maybe_start_pump(st, ctx, jobs);
             let _ = reply.send(Ok(()));
         }
-        Cmd::TunPacket(pkt) => {
-            // 在途名额交还（§6.4 的有界通道等价实现：读线程占名额、岛消费即还）
-            ctx.counters.done_send();
-            // 发送路径（S2-4）：①准入窗由结构保证（`Live` 只在四帧准入完成之后存在）；
-            // ②/③ 检包 + 缓冲预检 + 分类计数 = `client::dataplane::send_datagram_checked`
-            // （**唯一**的 `send_datagram` 调用点）；无连接 ⇒ 归 `未登记`（登记前丢弃）。
-            ctx.counters.pkts_in.fetch_add(1, Ordering::Relaxed);
-            match st.live.as_ref() {
-                Some(live) => {
-                    let note = st
-                        .drop_note
-                        .clone()
-                        .unwrap_or_else(|| drop_note_one(ctx));
-                    dataplane::send_datagram_checked(&live.conn, pkt, &note);
-                    // N8①/S2-5：缓冲占用**按包**刷新——`housekeeping` 的 TICK 分支在连续流量
-                    // 下不会到点（`select!` 的 `sleep(TICK)` 每轮重建 ⇒ 只在无事件的 250ms
-                    // 之后才跑），黑洞期的读数不能等到那时才可见。
-                    ctx.counters
-                        .send_buf_used
-                        .store(live.send_buffer_used(), Ordering::Relaxed);
-                }
-                None => {
-                    let n = pkt.len();
-                    note_drop(ctx, DropReason::Unregistered, 1, "无已登记连接", Some(n as u64));
-                }
-            }
-        }
+        // 单包入口（测试/遗留路径）复用批量落点：批长 1。
+        Cmd::TunPacket(pkt) => handle_tun_batch(vec![pkt], st, ctx),
         // 循环侧处置（幂等；重入无害）
         Cmd::Stop => {}
         Cmd::TunFdDead { msg } => {
@@ -2023,6 +2085,61 @@ mod demote_tests {
         assert_eq!(demote_adopted_tail(&list, None), list.to_vec());
         let other = cand([9, 9, 9, 9], 9);
         assert_eq!(demote_adopted_tail(&list, Some(other)), list.to_vec());
+    }
+}
+
+// ---------- 上行批处理单测（2026-10-18） ----------
+#[cfg(test)]
+mod tun_batch_tests {
+    use super::{drain_tun_batch, TUN_BATCH_MAX};
+    use crate::cmd::Cmd;
+    use tokio::sync::mpsc as tmpsc;
+
+    fn packet(b: u8) -> Cmd {
+        Cmd::TunPacket(vec![b; 8].into_boxed_slice())
+    }
+
+    /// **判据（FIFO 不被打乱）**：首包后只抽连续 `TunPacket`；遇到非包命令即停并
+    /// 存进 `pending`，该命令留在批之后处理；通道里它后面的命令不动。
+    #[test]
+    fn drain_stops_at_first_non_packet_and_preserves_order() {
+        let (tx, mut rx) = tmpsc::unbounded_channel();
+        tx.send(packet(1)).unwrap();
+        tx.send(packet(2)).unwrap();
+        tx.send(Cmd::SetCandidates { cands: vec![] }).unwrap();
+        tx.send(packet(3)).unwrap();
+        let first = match rx.try_recv().expect("首包") {
+            Cmd::TunPacket(p) => p,
+            _ => panic!("首条必须是 TunPacket"),
+        };
+        let mut pending = None;
+        let batch = drain_tun_batch(&mut rx, first, &mut pending);
+        assert_eq!(batch.len(), 2, "只抽到非包命令之前");
+        assert!(matches!(pending, Some(Cmd::SetCandidates { .. })), "非包命令须留给下一轮");
+        // 非包命令之后的包仍在通道里（下一轮再批）
+        assert!(matches!(rx.try_recv(), Ok(Cmd::TunPacket(_))));
+    }
+
+    /// **判据（批上限）**：超过上限时只取 64 条，剩余仍在通道里；不丢包、不越界。
+    #[test]
+    fn drain_caps_at_batch_max() {
+        let (tx, mut rx) = tmpsc::unbounded_channel();
+        for i in 0..(TUN_BATCH_MAX + 5) {
+            tx.send(packet(i as u8)).unwrap();
+        }
+        let first = match rx.try_recv().expect("首包") {
+            Cmd::TunPacket(p) => p,
+            _ => panic!("首条必须是 TunPacket"),
+        };
+        let mut pending = None;
+        let batch = drain_tun_batch(&mut rx, first, &mut pending);
+        assert_eq!(batch.len(), TUN_BATCH_MAX);
+        assert!(pending.is_none());
+        let mut rest = 0;
+        while rx.try_recv().is_ok() {
+            rest += 1;
+        }
+        assert_eq!(rest, 5, "剩余包留在通道，下一轮继续");
     }
 }
 }
