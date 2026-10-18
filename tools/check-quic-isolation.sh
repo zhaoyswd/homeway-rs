@@ -86,7 +86,7 @@ LOCK="$REPO_ROOT/Cargo.lock"
 
 # ---------- 异步面 = **显式文件清单**（相对 $SRC；新增即改门） ----------
 # 纪律（有意为之）：每一处新增的异步面都要显式过一次门——目录前缀豁免会连带免检
-# 同目录下的纯 std 文件（如 `exit/transport.rs`、`client/migration.rs`），故不用。
+# 同目录下的纯 std 文件（如 `exit/transport.rs`、`tuning.rs`），故不用。
 ASYNC_FILES=(
   "driver.rs"
   "client/mod.rs" "client/race.rs" "client/register.rs"
@@ -108,7 +108,7 @@ ASYNC_FILES=(
   "cc/bbr3.rs"
 )
 # 异步名的判定式（②条、豁免自证、扫描器自校准**共用同一串**——三处不同步 = 门自相矛盾）。
-# **代码门 r15 G1 整改**：`client/migration.rs` 原在清单里但它**零异步名**（纯逻辑小件，
+# **代码门 r15 G1 整改**：`client/migration.rs`（已于 2026-10-18 删除）原在清单里但它**零异步名**（纯逻辑小件，
 # 与 `exit/transport.rs` 不同）⇒ 移出清单，改由 ② 条真扫描（移出后 ② 仍绿 ⇒ 证明它确实纯 std）。
 ASYNC_NAME_PATTERN='tokio::|quinn|rustls|async fn|\.await'
 # 第 ⑤/⑥ 条：RPK 钉定的唯一合法文件（相对 $REPO_ROOT）、其「真做签名验证」证据，
