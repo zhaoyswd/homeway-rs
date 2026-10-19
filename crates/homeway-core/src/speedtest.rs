@@ -854,6 +854,10 @@ fn run_phases(
                                     ) | SpeedtestError::Conn(
                                         crate::facade::host_session::HostErr::NoFace
                                     )
+                                        // 首帧前桥/流复位（speedtest-uplink-resilience D3
+                                        // 把 BrokenPipe/复位归 LinkDown）仍按「出口没有
+                                        // 测速服务」分流；成功读到首帧后不再降级。
+                                        | SpeedtestError::LinkDown
                                         | SpeedtestError::Frame(_)
                                 )
                             {
@@ -1331,6 +1335,45 @@ mod tests {
             }
             other => panic!("形态二 halfhold：期望 Timeout，实得 {other:?}"),
         }
+    }
+
+    /// 首帧前桥/流复位（D3 的 LinkDown）仍按「出口没有测速服务」分流；
+    /// 成功读到首帧后不得再把数据期 LinkDown 降级成 not_supported。
+    #[test]
+    fn first_frame_bridge_reset_is_not_supported() {
+        struct ResetConn;
+        impl SpeedConn for ResetConn {
+            fn write_frame(&self, _data: &[u8]) -> Result<(), SpeedtestError> {
+                Ok(())
+            }
+            fn read_some(&self) -> Result<Vec<u8>, SpeedtestError> {
+                Err(SpeedtestError::LinkDown)
+            }
+            fn kill(&self) {}
+        }
+        let p = Params {
+            warmup: Duration::ZERO,
+            down: Duration::from_millis(50),
+            up: Duration::from_millis(50),
+            streams: 1,
+        }
+        .normalized()
+        .unwrap();
+        let r = run_dial(
+            &|| {
+                Ok::<std::sync::Arc<dyn SpeedConn>, SpeedtestError>(std::sync::Arc::new(
+                    ResetConn,
+                ))
+            },
+            p,
+            &|_| {},
+            None,
+            None,
+        );
+        assert!(
+            matches!(r, Err(SpeedtestError::NotSupported)),
+            "首帧前复位应归 not_supported，实得 {r:?}"
+        );
     }
 
     /// 泵分片上报增量（复核 r3-F4 的回归钉）：累计面不重复累加。
