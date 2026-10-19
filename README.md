@@ -7,11 +7,19 @@
 
 ## 安装
 
-一条命令（macOS / Linux）：自动识别系统、下载最新版并校验、装进 bin 目录、询问是否开机自启动：
+一条命令（macOS / Linux）：自动识别系统、下载最新版并校验、装进 bin 目录，然后交互询问：
+
+- 是否停止正在运行的旧守护进程（换二进制后必须重启才生效）；
+- 是否配置为后端：出口端口（默认 `38241`，同时作为 QUIC 公网端口）、文件根目录（默认用户目录）、可选的上游中继；
+- 是否配置为中继：监听地址（默认 `:38341`）、对外公告地址（留空自动探测）；
+- 是否添加主机、是否做 macOS 文件夹预授权、是否配置开机自启动（默认否）。
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/zhaoyswd/homeway-rs/main/install.sh | sh
 ```
+
+安装脚本会引导完成下面的后端/中继配置；也可以全部跳过，之后按「部署出口 / 部署中继」手动执行。
+脚本不接受命令行参数；配置只改 `~/.config/homeway/config.toml` 的相关键，保留其它内容。
 
 手动安装：到 [Releases](https://github.com/zhaoyswd/homeway-rs/releases) 取 `homeway-<版本>-<平台>.tar.gz`
 （平台：`darwin-arm64` / `darwin-amd64` / `linux-amd64` / `linux-arm64`；Windows 为 `.zip`），
@@ -22,71 +30,54 @@ curl -fsSL https://raw.githubusercontent.com/zhaoyswd/homeway-rs/main/install.sh
 
 ## 部署中继（可选）
 
-当无法直连成功时，可以在有公网 IP 的机器上部署中继服务。
+当无法直连成功时，可以在有公网 IP 的机器上部署中继服务。默认监听 `:38341`；对外公告地址留空会自动探测。
 
 ```bash
-homeway relay start # 启动中继，显示中继token
-homeway relay token # 获取中继token
-homeway relay stop/restart/status # 管理/获取中继状态
+homeway relay start               # 启动中继
+homeway relay token               # 获取中继 token（rl1…）
+homeway relay stop/restart/status # 管理中继
 ```
 
-## 部署主机
+## 部署出口（主机）
 
-配置中继（可选）
+在出口机上启动服务，并按需追加中继 / DDNS 配置：
 
 ```bash
-homeway serve relay set 'rl1…' # 通过中继token设置中继服务
-homeway serve relay clear # 清除中继服务配置
+homeway serve start                 # 启动出口（首次需要；配置自启动后会带起）
+homeway serve token                 # 获取主机 token（hmw2…）
+homeway serve stop/restart/status   # 管理出口
+
+# 可选：中继（直连不通时经中继转发；rl1… 来自中继机的 relay token）
+homeway serve relay set 'rl1…'
+homeway serve relay clear
+
+# 可选：DDNS
+homeway serve ddns add exit.example.com
+homeway serve ddns delete exit.example.com
 ```
 
-配置DDNS（可选）
+`serve relay` / `serve ddns` 修改后执行 `homeway serve restart` 生效。
 
-```bash
-homeway serve ddns add exit.example.com     # 为主机配置 ddns 域名
-homeway serve ddns delete exit.example.com  # 删除 ddns 域名
-```
+主机 token 是客户端连接出口的唯一凭据：在其它电脑执行 `homeway host add --name mymac '<hmw2…>'`，
+或在手机 App 的「添加主机」里粘贴同一串。注意保管，切勿泄露。
 
-启动与管理服务
-
-```bash
-homeway serve start # 启动主机端，显示主机token
-homeway serve token # 获取主机token
-homeway serve stop/restart/status # 管理/获取主机状态
-```
-
-主机token是连接的主机的唯一凭据，可以在其它电脑通过`homeway add host --name mymac '主机token'`进行注册，或者在手机 APP 填入进行注册。注意保管，切勿泄露。
-
-以上参数写在配置文件（`~/.config/homeway/config.toml`）里：
+以上配置写在 `~/.config/homeway/config.toml`；安装脚本会自动写入相关键，手动修改后重启对应角色生效：
 
 ```toml
 [serve]
 enabled = true
-listen = 38241
+listen = 38241                 # 出口端口
+quic_listen = 38241            # QUIC 公网端口；省略 = listen+1；与 listen 相同 = 单端口
 files_root = "/srv/files"      # 可选：文件服务根目录
-relay = "rl1…"                 # 可选：中继凭据
+relay = "rl1…"                 # 可选：上游中继（直连不通时）
 [[serve.ddns]]
 domain = "exit.example.com"    # 可选：DDNS 记录
 
 [relay]
 enabled = false
+listen = ":38341"              # 中继监听地址
+advertise = ""                 # 留空 = 自动探测
 ```
-
-## 使用方式
-
-### 添加主机
-
-在APP或电脑上将其它主机添加为出口。
-
-```bash
-# 出口机
-homeway serve token                     # 获取主机token，形如：hmw2…
-
-# 客户端机
-homeway host add --name home '<hmw2…>'  # App 里则是「添加主机」粘贴同一个 token
-homeway host list / status [name] / delete <name|id>
-```
-
-当只添加了一台出口主机时，以下命令不必指定主机，有多台时需要在命令后添加 `--host name`
 
 ### macOS 目录预授权
 
@@ -98,7 +89,41 @@ homeway serve grant    # 触发系统授权弹窗（最多 3 次），在屏幕�
 
 - 需要先让出口跑起来（`homeway serve start`）；
 - 误点了『不允许』：到 系统设置 → 隐私与安全性 → 文件与文件夹 里改回；或把 homeway 加进「完全磁盘访问」；
-- 升级换二进制后 需要重新授权一次。
+- 升级换二进制后需要重新授权一次。
+
+## 作为客户端使用
+
+`homeway` 同一个二进制也可以作为客户端：添加其它出口主机后，即可像 App 一样使用文件管理、端口转发、终端，以及 SOCKS5 代理；不需要单独安装客户端。
+
+常用命令：
+
+```bash
+# 添加出口主机（token 来自出口机的 homeway serve token）
+homeway host add --name home '<hmw2…>'
+homeway host list
+homeway host status home
+homeway host delete home
+
+# 文件管理
+homeway files list /remote/path
+homeway files get /remote/file -o ./local
+homeway files put ./local /remote/path
+
+# 终端
+homeway term new work
+homeway term list
+homeway term attach work
+
+# 端口转发 / SOCKS5
+homeway forward add --listen 15432 --target :5432
+homeway socks on --listen 1080
+
+# 连接状态与测速
+homeway status
+homeway speedtest
+```
+
+只有一台出口时命令可省略 `--host`；有多台时加 `--host <name>`。
 
 ### 测速
 
@@ -109,7 +134,7 @@ homeway speedtest --host home           # 只测其中一台
 
 ### 文件
 
-默认只能管理出口主机的用户目录。
+默认根目录是出口主机的用户目录（可在 `[serve] files_root` 修改）。
 
 ```bash
 homeway files list /remote/path                     # list / stat / mkdir / read 同形
