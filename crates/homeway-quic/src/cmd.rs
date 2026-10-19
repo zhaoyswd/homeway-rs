@@ -459,6 +459,14 @@ pub struct IslandSnapshot {
     /// 新鲜度窗由消费侧（S4）按 `ProbeTuning::send_err_fresh` 判——本字段只出「多久以前」，
     /// 不让快照面替阶梯做判定。
     pub sock_send_err_age_ms: Option<u64>,
+    /// 系统禁发（`EPERM`/`EACCES`）累计数。
+    pub sock_send_errs_denied: u64,
+    /// 末次系统禁发距本快照的毫秒数（`None` = 无）。
+    pub sock_send_err_denied_age_ms: Option<u64>,
+    /// 末次系统禁发的 errno。
+    pub sock_send_err_denied_last_errno: Option<i32>,
+    /// 是否新鲜的禁发（demand 源跳过赛跑的判据；岛快照同步时一并写 facade 的原子位）。
+    pub sock_send_err_denied_fresh: bool,
 
     // ---------- M3 S4：快探阶梯（§3.1/§3.2；`quic` JSON 段的四个新键） ----------
     /// 累计**成功**快探次数（含复探/动作确认；e2e 的 `T_recv` 观测位）。
@@ -473,8 +481,16 @@ pub struct IslandSnapshot {
     pub ladder_inflight: bool,
     /// 赛跑单飞位（评审 r2-N2：宿主重赛跑入口把它提到 Rebind **之前**查——
     /// `RaceInFlight` 在 Connect 才暴露，彼时 Rebind（换本地 socket，endpoint 粒度
-    /// 副作用）已经执行，让路变成每秒一次的干扰源）。
+    /// 副作用）已经执行，让路变成每秒一次的干扰源）。阶梯 R 与一次性重连共用。
     pub racing: bool,
+    /// 最近 10s 窗内良性替换 close 计数（诊断）。
+    pub replaced_recent: u32,
+    /// 替换风暴熔断触发次数（诊断）。
+    pub replaced_storm_trips: u64,
+    /// 替换风暴熔断是否生效（只拦阶梯 R）。
+    pub replaced_storm_active: bool,
+    /// 是否处于替换交接窗（旧连接 replaced close 不判死）。
+    pub handover_active: bool,
 
     // ---------- M3 S5：准入失败归因（设计 §4；`quic` JSON 段的两个新键） ----------
     /// 末次**准入被拒**的应用码（`None` = 未发生过）。

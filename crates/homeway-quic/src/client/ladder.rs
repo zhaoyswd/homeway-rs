@@ -89,6 +89,10 @@ pub(crate) struct SendFace {
     pub fresh: bool,
     /// 末次白名单错误的 errno（落纸；`None` = 无/已随 rebind 清零）。
     pub errno: Option<i32>,
+    /// 系统禁发（`EPERM`/`EACCES`）新鲜 ⇒ 不选 M/R，阶梯休眠（见 `Step::Dormant`）。
+    pub denied: bool,
+    /// 末次禁发 errno（落纸）。
+    pub denied_errno: Option<i32>,
 }
 
 /// 阶梯要宿主执行的一步。
@@ -125,6 +129,12 @@ pub(crate) enum Step {
         why: String,
         /// 连续 R 失败次数。
         r_fails: u32,
+    },
+    /// 系统禁发（`EPERM`/`EACCES`）：结构性失败，不选 M/R、不触发 B 门 one-shot；
+    /// 宿主标记传输不健康一次后休眠，等待唤醒/回前台/换网边沿。
+    Dormant {
+        /// 触发原因（探活失败面）。
+        why: String,
     },
 }
 
@@ -241,6 +251,25 @@ impl Ladder {
     /// ——预算过短会让「出口刚回来」的那次 R 在握手完成前被掐断（T_recv 相位最坏值）。
     pub(crate) fn reconnect_budget(&self) -> Duration {
         self.reprobe_budget().saturating_mul(2)
+    }
+
+    /// R 让路（全局准入单飞被一次性重连占用）：**不计 R 失败**、不推进 B 门；
+    /// 清在途/待办，下一拍或边沿复读（`last_round_at` 保持，`due` 按 fast_gap 重试）。
+    pub(crate) fn on_reconnect_yielded(&mut self, why: &str, logf: &Logf) {
+        self.inflight = false;
+        self.pending = None;
+        (*logf)(&format!("R 让路（准入单飞被一次性重连占用；原因={why}）—— 下一拍复读"));
+    }
+
+    /// 替换风暴熔断：阶梯休眠，等边沿或新连接采纳（`rearm`）复位。
+    pub(crate) fn park_storm(&mut self, why: String, logf: &Logf) {
+        self.dormant = true;
+        self.inflight = false;
+        self.pending = None;
+        self.last_action = "storm";
+        (*logf)(&format!(
+            "替换风暴熔断中 —— 阶梯休眠（原因={why}），等换网/唤醒/回前台或新连接采纳"
+        ));
     }
 
     /// B 已上报后**重新武装**（新连接采纳 ⇒ 新失败链重新计数；§3.1 的「归零」）。
@@ -556,8 +585,25 @@ impl Ladder {
         }
     }
 
-    /// 失败步（§3.1-3：复探失败 ⇒ 选 M 或 R）。
+    /// 失败步（§3.1-3：复探失败 ⇒ 选 M 或 R；系统禁发 ⇒ 休眠）。
     fn fail_step(&mut self, why: String, now: TokioInstant, send: SendFace, logf: &Logf) -> Step {
+        // 系统禁发是进程/UID 级事实：换 socket（M）与新连接（R）在同一权限面，
+        // 继续轮转只会毫秒级瞬败 + 日志风暴（2026-10-19 现场 13 轮）。直接收口。
+        if send.denied {
+            self.dormant = true;
+            self.inflight = false;
+            self.pending = None;
+            self.pending_fail = None;
+            self.last_action = "denied";
+            let errno = send
+                .denied_errno
+                .map(|e| e.to_string())
+                .unwrap_or_else(|| "?".to_owned());
+            (*logf)(&format!(
+                "链路休眠（原因=系统禁发（errno={errno}）；{why}）—— 不选 M/R，等唤醒/前台/换网边沿"
+            ));
+            return Step::Dormant { why };
+        }
         self.fail_streak = self.fail_streak.saturating_add(1);
         self.fail_gate += 1;
         if crate::client::log_due(self.fail_gate) {
@@ -893,6 +939,33 @@ mod tests {
         assert!(log.lock().unwrap().iter().any(|l| l.contains("抖动升格")), "升格须记行");
     }
 
+    /// **判据（系统禁发，2026-10-19）**：新鲜 Denied ⇒ `Dormant`，不选 M/R、不进 B 门；
+    /// `due()` 不再起探（等边沿/inflight 之外）。
+    #[test]
+    fn denied_send_face_goes_dormant_without_mr() {
+        let (logf, log) = lines();
+        let mut l = Ladder::new(tuning());
+        let t0 = TokioInstant::now();
+        l.note_round(Round::First, t0);
+        let _ = l.on_round(Round::First, failed(), t0, SendFace::default(), &logf);
+        l.note_round(Round::Reprobe, t0);
+        let s = l.on_round(
+            Round::Reprobe,
+            failed(),
+            t0,
+            SendFace { denied: true, denied_errno: Some(1), ..SendFace::default() },
+            &logf,
+        );
+        assert!(matches!(s, Step::Dormant { .. }), "Denied ⇒ Dormant（实得 {s:?}）");
+        assert!(!log.lock().unwrap().iter().any(|l| l.contains("链路动作选")), "Denied 不得选 M/R");
+        assert!(log.lock().unwrap().iter().any(|l| l.contains("系统禁发")), "须有禁发行");
+        assert!(!l.inflight(), "Dormant 后不得停在单飞态");
+        assert!(
+            l.due(t0 + Duration::from_secs(120), true).is_none(),
+            "Dormant 后周期拍不再起探"
+        );
+    }
+
     /// **判据（M/R 判别，§3.1-N5）**：发送面新鲜报错 ⇒ **M**；无错 ⇒ **R**；
     /// 动作失败后按「另一动作」翻转（M↔R）。
     #[test]
@@ -918,7 +991,7 @@ mod tests {
             Round::Reprobe,
             failed(),
             t0,
-            SendFace { fresh: true, errno: Some(51) }, // ENETUNREACH
+            SendFace { fresh: true, errno: Some(51), ..SendFace::default() }, // ENETUNREACH
             &logf2,
         );
         assert!(matches!(s, Step::Migrate { .. }), "发送面报错 ⇒ M（实得 {s:?}）");
@@ -1356,5 +1429,42 @@ mod tests {
             logged.iter().any(|l| l.contains("链路重连中（原因=")),
             "动作行须落纸：{logged:?}"
         );
+    }
+
+    /// 判据（全局准入单飞）：R 让路不计失败、不推进 B 门，也不停在单飞态。
+    #[test]
+    fn reconnect_yield_does_not_count_failure_or_stick() {
+        let (logf, log) = lines();
+        let mut l = Ladder::new(tuning());
+        let t0 = TokioInstant::now();
+        l.note_round(Round::First, t0);
+        let _ = l.on_round(Round::First, failed(), t0, SendFace::default(), &logf);
+        l.note_round(Round::Reprobe, t0);
+        let s = l.on_round(Round::Reprobe, failed(), t0, SendFace::default(), &logf);
+        assert!(matches!(s, Step::Reconnect { .. }));
+        assert!(l.inflight());
+        let before = l.r_fail_streak;
+        l.on_reconnect_yielded("探活无回显", &logf);
+        assert!(!l.inflight(), "让路后不得停在单飞态");
+        assert_eq!(l.r_fail_streak, before, "让路不计 R 失败");
+        assert!(log.lock().unwrap().iter().any(|l| l.contains("R 让路")), "{:?}", log.lock().unwrap());
+        assert!(
+            l.due(t0 + Duration::from_secs(1), true).is_some(),
+            "下一拍可复读"
+        );
+    }
+
+    /// 判据（替换风暴熔断）：park 后阶梯休眠，`due` 不再起探；`rearm` 复位。
+    #[test]
+    fn storm_park_sleeps_until_rearm() {
+        let (logf, log) = lines();
+        let mut l = Ladder::new(tuning());
+        let t0 = TokioInstant::now();
+        l.park_storm("替换风暴".to_owned(), &logf);
+        assert!(!l.inflight());
+        assert!(l.due(t0 + Duration::from_secs(120), true).is_none(), "休眠后不再起探");
+        assert!(log.lock().unwrap().iter().any(|l| l.contains("替换风暴熔断中")));
+        l.rearm();
+        assert!(l.due(t0 + Duration::from_secs(121), true).is_some(), "rearm 后恢复");
     }
 }

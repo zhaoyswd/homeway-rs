@@ -29,9 +29,9 @@ use super::stage::{StageMachine, TunStage};
 pub(crate) use crate::syncutil::lock_unpoison;
 
 /// 不健康分类的设备/传输分界（tun-death-gate）：`patrol` = 传输类（对端不可达——
-/// 不写设备死位、可翻回）；`fd`/`panic`/`stop` 与**任何未知值** = 设备类（单向，
-/// 仅新世代 begin 清——未知值保守归设备侧）。
-const DEVICE_CLASS: fn(&str) -> bool = |why| why != "patrol";
+/// 不写设备死位、可翻回）；`denied` = 系统禁发（同为传输类，等边沿恢复）；
+/// `fd`/`panic`/`stop` 与**任何未知值** = 设备类（单向，仅新世代 begin 清）。
+const DEVICE_CLASS: fn(&str) -> bool = |why| why != "patrol" && why != "denied";
 
 /// 健康态的临界区载荷（reconnect-oneshot r8-N2 终稿 + 评审 r1 P0-5 整改：
 /// `why`/`healthy`/`device_dead`/`last_patrol_at` 的写入与 **gen 检查**全部收进
@@ -85,6 +85,9 @@ pub struct TunShared {
     /// `IslandConfig::carrier` 注入）。写沿全部在 `health` 临界区内（r10-C13——
     /// alive 时锁内查 device_dead）；读面（读线程每包 load）走原子、零锁。
     pub carrier: Arc<CarrierFlag>,
+    /// **系统禁发原子位**（2026-10-19）：岛侧快照同步写、facade 的一次性重连入口
+    /// 零锁读——demand 源在禁发新鲜期跳过赛跑（`IslandConfig::denied` 共握同一枚）。
+    pub denied: Arc<AtomicBool>,
     /// attach fd 通道（缓冲 1；世代线程接收端经 [`Self::attach_receiver`] 注册——
     /// Go attachCh。投递端非阻塞：满/无接收者即 false（调用方按 -1 收）。
     attach_tx: Mutex<Option<mpsc::SyncSender<i32>>>,
@@ -157,6 +160,7 @@ impl TunShared {
                 last_patrol_at: None,
             }),
             carrier: CarrierFlag::new(),
+            denied: Arc::new(AtomicBool::new(false)),
             attach_tx: Mutex::new(None),
             done: Mutex::new(false),
             done_cv: Condvar::new(),

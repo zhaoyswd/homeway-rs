@@ -430,6 +430,8 @@ pub(crate) enum EntryOutcome {
     InFlight,
     Rejected,
     SpawnFailed,
+    /// 系统禁发新鲜期：demand 源跳过（不消耗 30s 锚；边沿源不受影响）。
+    Denied,
 }
 
 /// 测试钩子类型（受控交错缝——clippy type_complexity 的别名收口）。
@@ -623,6 +625,11 @@ impl GenRun {
         if !source.is_edge() && run.reconn.throttled_now() {
             run.reconn.throttled.fetch_add(1, Ordering::Relaxed);
             return EntryOutcome::Throttled;
+        }
+        // 1.5 系统禁发新鲜期：demand 源不起跑（换 socket/新连接同一权限面）；
+        //     边沿源（换网/唤醒/回前台/B门）是新信息，照常尝试。
+        if !source.is_edge() && run.tun_shared.denied.load(Ordering::Acquire) {
+            return EntryOutcome::Denied;
         }
         // 2. 占位（在飞判定/占位二合一原语）
         match run.reconn.try_claim_edge(source) {
@@ -1512,6 +1519,15 @@ pub(crate) fn quic_in_of(s: &homeway_quic::IslandSnapshot) -> QuicIn {
         ladder_jitter_streak: s.ladder_jitter_streak,
         ladder_action: s.ladder_action.clone(),
         streams_active: s.streams_active,
+        denied: s.sock_send_errs_denied,
+        denied_age_ms: s.sock_send_err_denied_age_ms,
+        denied_errno: s.sock_send_err_denied_last_errno,
+        denied_fresh: s.sock_send_err_denied_fresh,
+        racing: s.racing,
+        replaced_recent: s.replaced_recent,
+        replaced_storm_trips: s.replaced_storm_trips,
+        replaced_storm_active: s.replaced_storm_active,
+        handover_active: s.handover_active,
     }
 }
 
@@ -2226,6 +2242,13 @@ pub(crate) fn quic_unhealthy_signal_for_test(run: &Arc<GenRun>, reason: &str) {
 }
 
 fn quic_unhealthy_signal_body(run: &Arc<GenRun>, reason: &str) {
+    if reason == "denied" {
+        // 系统禁发：传输类标记（不写设备死位），**不触发 B 门 one-shot**——等唤醒/
+        // 前台/换网边沿再试（见 ladder::Step::Dormant）。
+        run.tun_shared.mark_unhealthy_if_current(run.gen, "denied");
+        (run.logf)("岛上报系统禁发（Denied）—— 标记传输不健康（不触发一次性重连，等边沿）");
+        return;
+    }
     if reason == "patrol" {
         // 评审 r1 P1-10 整改（回调沿顺序）：**先标记、再触发、后落日志**——
         // `run.logf` 是文件写 + Mutex（可能阻塞），岛回调纪律要求「立即」标记并置
@@ -2422,6 +2445,7 @@ fn start_island(
     };
     // reconnect-oneshot D2：承载位装配期共握（岛侧沿写 + 读线程每包 load 同一枚）。
     icfg.carrier = Some(Arc::clone(&run.tun_shared.carrier));
+    icfg.denied = Some(Arc::clone(&run.tun_shared.denied));
     // 评审 r1 P1-7：adopt 沿通知 facade——岛内阶梯/赛跑自行恢复（置 carrier true）
     // 而 facade 仍残留 patrol 时清之，防「healthy=false ∧ carrier=true」黏滞。
     {

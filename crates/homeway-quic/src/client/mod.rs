@@ -66,6 +66,14 @@ pub(crate) struct SendErrView {
     pub last_errno: Option<i32>,
     /// 是否**新鲜**（窗内命中 ⇒ M（本机发送面错误）成立的证据）。
     pub fresh: bool,
+    /// 系统禁发（`EPERM`/`EACCES`）累计数。
+    pub denied: u64,
+    /// 末次系统禁发距今（`None` = 无）。
+    pub denied_age: Option<Duration>,
+    /// 末次系统禁发的 errno。
+    pub last_denied_errno: Option<i32>,
+    /// 是否**新鲜禁发**（阶梯收口判据）。
+    pub denied_fresh: bool,
 }
 
 /// 快探的回显载荷（1B；§3.2「写 1B + 等 1B 回显」）。
@@ -114,6 +122,7 @@ impl Face {
             probe: _,
             cc,
             carrier: _,
+            denied: _,
             on_adopt: _,
         } = cfg;
         let relays = RelayTable::new();
@@ -228,6 +237,10 @@ impl Face {
             age: s.last_local_send_err_at.map(|t| now.saturating_duration_since(t)),
             last_errno: s.last_local_send_err_errno,
             fresh: s.local_send_err_fresh(now, window),
+            denied: s.send_errs_denied,
+            denied_age: s.last_denied_at.map(|t| now.saturating_duration_since(t)),
+            last_denied_errno: s.last_denied_errno,
+            denied_fresh: s.denied_fresh(now, window),
         }
     }
 

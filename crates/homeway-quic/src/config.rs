@@ -12,6 +12,7 @@
 
 use std::fmt;
 use std::net::SocketAddr;
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -175,6 +176,10 @@ pub struct IslandConfig {
     /// 读面零触发、岛侧翻转跳过）。生产装配 = facade 在 `start_island` 前置入
     /// `TunShared` 持有的同一枚。
     pub carrier: Option<Arc<crate::cmd::CarrierFlag>>,
+    /// **系统禁发原子位**（2026-10-19）：岛侧快照同步写「发送面是否新鲜 Denied」，
+    /// facade 的一次性重连入口零锁读——demand 源在禁发新鲜期跳过赛跑。
+    /// `None` = 不跟踪（测试/宿主形态）。
+    pub denied: Option<Arc<AtomicBool>>,
     /// **adopt 沿回调**（评审 r1 P1-7）：岛内阶梯/赛跑采纳成功时调用（岛线程内——
     /// 纪律同 [`crate::cmd::OnUnhealthy`]：只允许内存操作 + 通道投递，禁阻塞）。
     /// 生产装配 = facade 注入「`TunShared::on_adopt_if_current(gen)`：若 facade 仍处
@@ -197,6 +202,7 @@ impl IslandConfig {
             probe: ProbeTuning::design(),
             cc: CcChoice::default(),
             carrier: None,
+            denied: None,
             on_adopt: None,
         }
     }

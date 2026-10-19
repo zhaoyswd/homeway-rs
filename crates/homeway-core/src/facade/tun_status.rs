@@ -165,6 +165,17 @@ pub struct QuicIn {
     /// 在册服务流数（tun-death-gate：探针流不计入；顶层 `serviceStreamsActive`
     /// 的同源数据面）。
     pub streams_active: u64,
+    /// 系统禁发（`EPERM`/`EACCES`）诊断（顶层 `send` 段）。
+    pub denied: u64,
+    pub denied_age_ms: Option<u64>,
+    pub denied_errno: Option<i32>,
+    pub denied_fresh: bool,
+    /// 恢复面诊断（顶层 `recovery` 段）。
+    pub racing: bool,
+    pub replaced_recent: u32,
+    pub replaced_storm_trips: u64,
+    pub replaced_storm_active: bool,
+    pub handover_active: bool,
 }
 
 /// 快照 → tunStatusJSON（Go tunStatusJSON 逐键对齐；键序 = 字典序）。
@@ -331,6 +342,27 @@ pub fn tun_status_json(input: &TunStatusInput) -> String {
             Value::String(q.ladder_action.clone()),
         );
         m.insert("quic".into(), Value::Object(qm));
+        // 2026-10-19：Denied 与恢复面诊断（additive 平级段；只在 quic 在场时出现，
+        // 旧读者忽略未知键；键名/含义见 connection-lifecycle.md）。
+        let mut sm = Map::new();
+        sm.insert("denied".into(), Value::from(q.denied));
+        sm.insert("denied_age_ms".into(), Value::from(q.denied_age_ms.unwrap_or(0)));
+        sm.insert("denied_errno".into(), Value::from(q.denied_errno.unwrap_or(0)));
+        sm.insert("denied_fresh".into(), Value::from(q.denied_fresh));
+        m.insert("send".into(), Value::Object(sm));
+        let mut rm = Map::new();
+        rm.insert("racing".into(), Value::from(q.racing));
+        rm.insert("replaced_recent".into(), Value::from(q.replaced_recent));
+        rm.insert(
+            "replaced_storm_trips".into(),
+            Value::from(q.replaced_storm_trips),
+        );
+        rm.insert(
+            "replaced_storm_active".into(),
+            Value::from(q.replaced_storm_active),
+        );
+        rm.insert("handover_active".into(), Value::from(q.handover_active));
+        m.insert("recovery".into(), Value::Object(rm));
     }
 
     Value::Object(m).to_string()
@@ -600,6 +632,7 @@ mod tests {
                 ladder_fail_streak: 0,
                 ladder_jitter_streak: 1,
                 ladder_action: "reconnect".into(),
+                ..QuicIn::default()
             }),
             ..bare
         };

@@ -526,3 +526,23 @@ pub fn is_local_net_err(e: &io::Error) -> bool {
     };
     code.is_some_and(|c| codes.contains(&c))
 }
+
+/// `classify_send_err` 的**系统禁发族**：进程/UID 级网络拒绝（`EPERM`/`EACCES`）。
+///
+/// 与 [`is_local_net_err`] 的语义相反：本地族换 socket 可能救；禁发族换 socket/新连接
+/// 都在同一权限面，M/R 只会产生毫秒级瞬败（2026-10-19 现场：13 轮 M/R 全败）。
+pub fn is_denied_net_err(e: &io::Error) -> bool {
+    let code = e.raw_os_error();
+    let codes: &[i32] = {
+        #[cfg(unix)]
+        {
+            &[libc::EPERM, libc::EACCES]
+        }
+        #[cfg(windows)]
+        {
+            // ERROR_ACCESS_DENIED=5 / WSAEACCES=10013。
+            &[5, 10013]
+        }
+    };
+    code.is_some_and(|c| codes.contains(&c))
+}

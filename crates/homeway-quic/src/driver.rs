@@ -71,6 +71,8 @@ const SNAP_SYNC_INTERVAL: Duration = Duration::from_millis(200);
 const REASON_PANIC: &str = "panic";
 /// QUIC 承载的巡检判死分类（设计 §2.5：**归既有取值 `patrol`**，不新增枚举值）。
 const REASON_PATROL: &str = "patrol";
+/// 系统禁发分类（`EPERM`/`EACCES`；传输类、不触发 B 门 one-shot）。
+const REASON_DENIED: &str = "denied";
 /// TUN fd 面判死分类（镜像 `wgcore::TunFdDead → markUnhealthy("fd")`；既有取值集的一员）。
 const REASON_FD: &str = "fd";
 /// 无注入（**生产路径恒取此值**；注入缝只在 `#[cfg(test)]` 的 `seams` 面里活）。
@@ -123,6 +125,8 @@ struct IslandCtx {
     /// housekeeping 连接死/刷新失败/僵尸收口 → false；adopt → true（设备死在场由
     /// [`CarrierFlag::mark_alive`] 自拦）；收工 → false。
     carrier: Option<Arc<CarrierFlag>>,
+    /// 系统禁发原子位（岛侧快照同步写；facade 零锁读——demand 源跳过赛跑）。
+    denied: Option<Arc<AtomicBool>>,
     /// adopt 沿回调（评审 r1 P1-7；`None` = 不通知——测试/宿主形态）。adopt 置
     /// carrier true 后调用——facade 侧清残留 patrol，防「healthy=false ∧ carrier=true」
     /// 黏滞（该形态下读面/B 门/stats 三类恢复入口全部失效）。
@@ -247,6 +251,7 @@ impl Island {
             on_event: Arc::new(Mutex::new(None)),
             on_packet_demand: Mutex::new(None),
             carrier: cfg.carrier.clone(),
+            denied: cfg.denied.clone(),
             on_adopt: cfg.on_adopt.clone(),
             counters: Arc::clone(&counters),
             stream_stats: Arc::clone(&stream_stats),
@@ -651,7 +656,31 @@ struct DriverState {
     /// 快照同步（housekeeping ④）的节流基准：`Some(at)` = 上次同步时刻，`None` = 立即
     /// 到期（连接采纳/断开等关键转换置 `None`，保 via/ep/connections 不滞后）。
     snap_sync_last: Option<Instant>,
+    /// **替换交接窗**（2026-10-19）：新连接准入在途时，旧连接的 `replaced` close
+    /// 是正常交接，不判链路死亡；窗过期且无新连接采纳才按死亡收。
+    handover: Option<Handover>,
+    /// 最近一个替换事件窗的起点/计数（10s 窗）。
+    replaced_window_start: Option<Instant>,
+    replaced_count: u32,
+    /// 替换风暴熔断到期时刻（`Some(t)` 且 `now < t` = 熔断中；只拦阶梯 R）。
+    storm_until: Option<Instant>,
+    /// 熔断触发次数（诊断）。
+    storm_trips: u64,
 }
+
+/// 替换交接窗：记录被新连接替换的旧连接身份与截止时刻。
+#[derive(Clone, Copy, Debug)]
+struct Handover {
+    from: usize,
+    until: Instant,
+}
+
+/// 交接窗下限（实际窗 = max(2×本次赛跑预算, 本值)；R 预算缺省 2.8s ⇒ 5.6s）。
+const HANDOVER_MIN: Duration = Duration::from_secs(3);
+/// 替换风暴窗/阈值/抑制时长（设计 D5）。
+const REPLACED_STORM_WINDOW: Duration = Duration::from_secs(10);
+const REPLACED_STORM_LIMIT: u32 = 10;
+const REPLACED_STORM_COOLDOWN: Duration = Duration::from_secs(30);
 
 /// M（换本地 socket）动作的记账（§3.1 的 `from → to` 与确认探活的耗时）。
 struct RebindNote {
@@ -717,6 +746,11 @@ fn run_driver(
             admitted: false,
             last_stream_use_at: None,
             snap_sync_last: None,
+            handover: None,
+            replaced_window_start: None,
+            replaced_count: 0,
+            storm_until: None,
+            storm_trips: 0,
             drop_note: None,
             drop_note_n: None,
         };
@@ -770,6 +804,7 @@ fn run_driver(
                                     let _ = reply.send(Ok(outcome));
                                 }
                                 Err(e) => {
+                                    st.handover = None;
                                     // M3 §4：准入被拒 ⇒ 归因行（**行名前缀刻意与出口的
                                     // `quic: 准入被拒（dev=…` 区分**——设计门 P3）+ 快照两字段
                                     // （App 状态面据此回答「为什么走了 WG」）。
@@ -814,18 +849,22 @@ fn run_driver(
                             ladder_step(&mut st, ctx, &mut face, &mut jobs, step);
                         }
                         Ok(Job::LadderConnect { why, result }) => {
+                            st.racing = false;
                             let now = TokioInstant::now();
                             let step = match result {
                                 Ok(est) => {
                                     adopt(&mut st, ctx, &face, est, &mut jobs);
                                     st.ladder.on_reconnect_result(true, why, now, &ctx.logf)
                                 }
-                                Err(e) => st.ladder.on_reconnect_result(
-                                    false,
-                                    format!("{why}（{e}）"),
-                                    now,
-                                    &ctx.logf,
-                                ),
+                                Err(e) => {
+                                    st.handover = None;
+                                    st.ladder.on_reconnect_result(
+                                        false,
+                                        format!("{why}（{e}）"),
+                                        now,
+                                        &ctx.logf,
+                                    )
+                                }
                             };
                             ladder_step(&mut st, ctx, &mut face, &mut jobs, step);
                         }
@@ -870,6 +909,8 @@ fn run_driver(
                                 }
                                 // R 动作按失败回灌（阶梯自行决定退避/再试/B 门）
                                 PanickedJob::LadderConnect => {
+                                    st.racing = false;
+                                    st.handover = None;
                                     let step = st.ladder.on_reconnect_result(
                                         false,
                                         "R 动作任务 panic".to_owned(),
@@ -985,6 +1026,17 @@ fn adopt(
     }
     // M3 S4：新连接 = 新失败链 ⇒ 阶梯重新武装（B 之后休眠的阶梯在此复活）
     st.ladder.rearm();
+    // 采纳成功 = 发送面已可用：清「系统禁发」原子位（否则 demand 源会继续跳过到窗过期）。
+    if let Some(d) = &ctx.denied {
+        d.store(false, Ordering::Release);
+    }
+    // 新连接采纳 = 交接完成/风暴稳定：清交接窗与替换计数（`rearm` 已复活阶梯）。
+    if st.handover.take().is_some() {
+        (*ctx.logf)("替换交接完成（新连接已采纳）");
+    }
+    st.replaced_window_start = None;
+    st.replaced_count = 0;
+    st.storm_until = None;
     st.rebind = None;
     st.dead_logged = false;
     if let Some(old) = st.live.replace(adopted) {
@@ -1034,6 +1086,71 @@ fn check_narrow_path(st: &mut DriverState, ctx: &IslandCtx) {
     ));
 }
 
+/// 纯逻辑：一次替换事件进窗；返回**本次是否触发熔断**（便于单测）。
+fn note_replaced_at(
+    window_start: &mut Option<Instant>,
+    count: &mut u32,
+    storm_until: &mut Option<Instant>,
+    trips: &mut u64,
+    now: Instant,
+) -> bool {
+    if window_start.is_none_or(|s| now.saturating_duration_since(s) > REPLACED_STORM_WINDOW) {
+        *window_start = Some(now);
+        *count = 0;
+    }
+    *count = count.saturating_add(1);
+    if *count >= REPLACED_STORM_LIMIT && storm_until.is_none_or(|t| now >= t) {
+        *storm_until = Some(now + REPLACED_STORM_COOLDOWN);
+        *trips = trips.saturating_add(1);
+        return true;
+    }
+    false
+}
+
+/// 记录一次替换事件并维护 10s 窗；达到阈值即熔断（只拦阶梯 R）。
+fn note_replaced_event(st: &mut DriverState, ctx: &IslandCtx) {
+    let tripped = note_replaced_at(
+        &mut st.replaced_window_start,
+        &mut st.replaced_count,
+        &mut st.storm_until,
+        &mut st.storm_trips,
+        Instant::now(),
+    );
+    if tripped {
+        (*ctx.logf)(&format!(
+            "替换风暴熔断（{} 次/10s）—— 暂停阶梯 R 30s（换网/唤醒/回前台/B 门边沿不受影响）",
+            st.replaced_count
+        ));
+    }
+}
+
+/// 纯逻辑：这条 close 是否是「本端新连接替换旧连接」的正常交接。
+fn benign_handover(
+    reason: Option<&str>,
+    live_id: usize,
+    handover: Option<Handover>,
+    now: Instant,
+) -> bool {
+    reason == Some("replaced by newer registration")
+        && handover.is_some_and(|h| h.from == live_id && now <= h.until)
+}
+
+/// 替换熔断是否生效（只用于阶梯 R；边沿/一次性重连照常）。
+fn storm_active(st: &DriverState, now: Instant) -> bool {
+    st.storm_until.is_some_and(|t| now < t)
+}
+
+/// 新连接起跑时登记交接窗：旧连接在此窗内的 `replaced` close 视为正常交接。
+fn set_handover(st: &mut DriverState, budget: Duration) {
+    if let Some(live) = st.live.as_ref() {
+        let win = budget.saturating_mul(2).max(HANDOVER_MIN);
+        st.handover = Some(Handover {
+            from: live.conn.stable_id(),
+            until: Instant::now() + win,
+        });
+    }
+}
+
 /// 拍内务（无命令时每拍一次；拍长见 [`TICK`]）：连接死 → 阶梯 → 刷新 → 快照同步。
 ///
 /// **巡检接线（M3 S4 重写，设计 §3）**：
@@ -1052,16 +1169,55 @@ async fn housekeeping(
     jobs: &mut JoinSet<Job>,
     seam: u8,
 ) {
+    // ⓪ 交接窗过期：新连接没有采纳且旧连接已走 ⇒ 按死亡收。
+    if st.live.is_none() {
+        if let Some(h) = st.handover {
+            if Instant::now() >= h.until {
+                st.handover = None;
+                (*ctx.logf)("替换交接窗过期（新连接未采纳）—— 按链路死亡收");
+                st.dead_logged = true;
+                st.snap_sync_last = None;
+                if let Some(c) = &ctx.carrier {
+                    c.mark_dead();
+                }
+                if st.admitted {
+                    let send = send_face(face, st.ladder.tuning().send_err_fresh);
+                    let step = st.ladder.on_link_dead(TokioInstant::now(), send, &ctx.logf);
+                    ladder_step(st, ctx, face, jobs, step);
+                }
+            }
+        }
+    }
     // ① 连接死（对端关闭/空闲回收）：清面 + 记行 + **交快探阶梯**（§3.1；不再就地判不健康）
     if st.live.as_ref().is_some_and(|l| !l.alive()) {
         // M3 §4（设计门 F4）：**准入后**的会话级关闭（被替换/设备被摘除）单独归因——
         // 与准入窗内的 `AdmissionRejected` 严格分开，不误报成「准入被拒」。
-        if let Some(l) = st.live.as_ref() {
-            if let IslandErr::SessionClosed { reason } = client::session_closed(&l.conn) {
-                (*ctx.logf)(&format!(
-                    "会话被对端关闭（{reason}）——会话级归因（非准入面）"
-                ));
+        let reason = st.live.as_ref().and_then(|l| {
+            match client::session_closed(&l.conn) {
+                IslandErr::SessionClosed { reason } => Some(reason),
+                _ => None,
             }
+        });
+        let replaced = reason.as_deref() == Some("replaced by newer registration");
+        let handover = st.live.as_ref().is_some_and(|l| {
+            benign_handover(reason.as_deref(), l.conn.stable_id(), st.handover, Instant::now())
+        });
+        if replaced {
+            note_replaced_event(st, ctx);
+        }
+        if let Some(reason) = reason.as_deref() {
+            (*ctx.logf)(&format!(
+                "会话被对端关闭（{reason}）——会话级归因（非准入面）"
+            ));
+        }
+        if handover {
+            // 正常交接：旧连接被本端的新连接替换。不清承载位、不进阶梯，等新连接采纳。
+            (*ctx.logf)("替换交接（旧连接关闭不判死；新连接在途）");
+            st.live = None;
+            st.pump_conn = None;
+            st.snap_sync_last = None;
+            st.dead_logged = false;
+            return;
         }
         if !st.dead_logged {
             st.dead_logged = true;
@@ -1180,6 +1336,13 @@ async fn housekeeping(
         s.sock_send_err_age_ms = ev.age.map(|d| d.as_millis() as u64);
         s.sock_send_err_last_errno = ev.last_errno;
         s.sock_send_err_local_fresh = ev.fresh;
+        s.sock_send_errs_denied = ev.denied;
+        s.sock_send_err_denied_age_ms = ev.denied_age.map(|d| d.as_millis() as u64);
+        s.sock_send_err_denied_last_errno = ev.last_denied_errno;
+        s.sock_send_err_denied_fresh = ev.denied_fresh;
+        if let Some(d) = &ctx.denied {
+            d.store(ev.denied_fresh, Ordering::Release);
+        }
         // M3 S4：快探阶梯读数（§3.1/§3.2 的观测面；e2e 的 T_recv 观测位 = `ladder_probe_ok`）
         s.ladder_probe_ok = st.ladder.probe_ok;
         s.ladder_fail_streak = st.ladder.fail_streak();
@@ -1187,6 +1350,10 @@ async fn housekeeping(
         s.ladder_action = st.ladder.last_action.to_owned();
         s.ladder_inflight = st.ladder.inflight();
         s.racing = st.racing; // r2-N2：赛跑单飞位上面（宿主重赛跑入口的 Rebind 前置守卫）
+        s.replaced_recent = st.replaced_count;
+        s.replaced_storm_trips = st.storm_trips;
+        s.replaced_storm_active = storm_active(st, Instant::now());
+        s.handover_active = st.handover.is_some();
         st.snap_sync_last = Some(Instant::now());
     }
     // ⑤ 「窄路径不可用」判据（mds 变小/连接换过都要重判；S2-4）
@@ -1394,6 +1561,8 @@ async fn handle_cmd(
                 return;
             }
             st.racing = true;
+            // 一次性重连的 `Cmd::Connect` 也登记交接窗（旧连接的 replaced close 不判死）。
+            set_handover(st, budget);
             // 评审 r1 低-6：赛跑计数（mirrors）进快照不滞后（失败路径不走 adopt 的
             // 立即到期；节流见 housekeeping ④）
             st.snap_sync_last = None;
@@ -1546,6 +1715,8 @@ fn send_face(face: &Face, window: Duration) -> SendFace {
     SendFace {
         fresh: v.fresh,
         errno: v.last_errno,
+        denied: v.denied_fresh,
+        denied_errno: v.last_denied_errno,
     }
 }
 
@@ -1639,6 +1810,16 @@ fn ladder_step(
                 why,
                 after_migration_unconfirmed,
             } => {
+                // 全局准入单飞：一次性重连的赛跑在飞时 R 让路（不计失败）。
+                if st.racing {
+                    st.ladder.on_reconnect_yielded(why.as_str(), &ctx.logf);
+                    return;
+                }
+                // 替换风暴熔断只拦阶梯 R；边沿源（一次性重连）照常。
+                if storm_active(st, Instant::now()) {
+                    st.ladder.park_storm(why, &ctx.logf);
+                    return;
+                }
                 if after_migration_unconfirmed {
                     // §3.1 末段：M 之后**一个快探预算内**无回显 ⇒ 置位（N-b 行文不变，
                     // 窗口 60s → ≤1 快探预算 = 语义登记项 S7）
@@ -1675,6 +1856,10 @@ fn ladder_step(
                 face.relays().set(&list);
                 let kit = face.connect_kit();
                 let budget = st.ladder.reconnect_budget();
+                // 阶梯 R 也走全局准入单飞（与一次性重连的 `Cmd::Connect` 共用一个
+                // `st.racing` 位）；同时登记交接窗（旧连接的 replaced close 不判死）。
+                st.racing = true;
+                set_handover(st, budget);
                 let direct_first = st.direct_first;
                 let logf = Arc::clone(&ctx.logf);
                 jobs.spawn(guard_job(PanickedJob::LadderConnect, async move {
@@ -1696,6 +1881,15 @@ fn ladder_step(
                 // 重建（上层重赛跑 `Cmd::Connect`）成功后 `adopt` 复活阶梯。
                 drop_zombie_live(st, ctx);
                 ctx.unhealthy(REASON_PATROL);
+                return;
+            }
+            LadderStep::Dormant { why } => {
+                // 系统禁发：结构性失败，不触发 B 门 one-shot（见 ladder::Step::Dormant）。
+                (*ctx.logf)(&format!(
+                    "链路休眠（系统禁发；{why}）—— 交一次性重连的边沿源，等唤醒/前台/换网"
+                ));
+                drop_zombie_live(st, ctx);
+                ctx.unhealthy(REASON_DENIED);
                 return;
             }
         }
@@ -2152,4 +2346,92 @@ mod tun_batch_tests {
         assert_eq!(rest, 5, "剩余包留在通道，下一轮继续");
     }
 }
+}
+
+#[cfg(test)]
+mod handover_storm_tests {
+    use super::*;
+
+    /// 判据：只有「replaced」+ 同一旧连接 id + 窗内 才算正常交接。
+    #[test]
+    fn benign_handover_requires_reason_id_and_window() {
+        let now = Instant::now();
+        let h = Some(Handover { from: 7, until: now + Duration::from_secs(3) });
+        assert!(benign_handover(
+            Some("replaced by newer registration"),
+            7,
+            h,
+            now
+        ));
+        assert!(!benign_handover(
+            Some("replaced by newer registration"),
+            8,
+            h,
+            now
+        ));
+        assert!(!benign_handover(Some("device removed"), 7, h, now));
+        assert!(!benign_handover(
+            Some("replaced by newer registration"),
+            7,
+            h,
+            now + Duration::from_secs(4)
+        ));
+        assert!(!benign_handover(Some("replaced by newer registration"), 7, None, now));
+    }
+
+    /// 判据：10 次/10s 触发熔断；冷却期内不重复触发；窗滑过后重新计数。
+    #[test]
+    fn replaced_storm_trips_at_limit_and_cools_down() {
+        let t0 = Instant::now();
+        let mut window = None;
+        let mut count = 0u32;
+        let mut until = None;
+        let mut trips = 0u64;
+        for i in 0..9 {
+            assert!(!note_replaced_at(
+                &mut window,
+                &mut count,
+                &mut until,
+                &mut trips,
+                t0 + Duration::from_millis(i * 100)
+            ), "第 {i} 次不应触发");
+        }
+        assert_eq!(count, 9);
+        assert!(note_replaced_at(
+            &mut window,
+            &mut count,
+            &mut until,
+            &mut trips,
+            t0 + Duration::from_millis(900)
+        ), "第 10 次触发");
+        assert_eq!(trips, 1);
+        assert!(until.is_some());
+        assert!(!note_replaced_at(
+            &mut window,
+            &mut count,
+            &mut until,
+            &mut trips,
+            t0 + Duration::from_millis(1000)
+        ), "冷却期内不重复触发");
+        // 冷却期（30s）过后重新计数
+        count = 0;
+        window = Some(t0);
+        for i in 0..9 {
+            assert!(!note_replaced_at(
+                &mut window,
+                &mut count,
+                &mut until,
+                &mut trips,
+                t0 + Duration::from_secs(32) + Duration::from_millis(i * 100)
+            ));
+        }
+        assert!(note_replaced_at(
+            &mut window,
+            &mut count,
+            &mut until,
+            &mut trips,
+            t0 + Duration::from_secs(32) + Duration::from_millis(900)
+        ));
+        assert_eq!(trips, 2);
+    }
 }

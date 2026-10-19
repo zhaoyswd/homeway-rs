@@ -154,6 +154,13 @@ pub(crate) struct SockStats {
     /// 末次**白名单**错误的 **errno**（`kind` 的落纸形态：N5 要求「末次错误 kind/时刻」
     /// 可读——判据行/快照都能说清是 `ENETUNREACH` 还是 `EADDRNOTAVAIL`；`rebind` 清零）。
     pub(crate) last_local_send_err_errno: Option<i32>,
+    /// 系统禁发（`EPERM`/`EACCES`）总数。**进程/UID 级事实**：不随 `rebind` 清零，
+    /// 只按新鲜度窗自然过期（`denied_fresh`）。
+    pub(crate) send_errs_denied: u64,
+    /// 末次系统禁发的时刻（新鲜度窗的源）。
+    pub(crate) last_denied_at: Option<std::time::Instant>,
+    /// 末次系统禁发的 errno（判据行/快照用）。
+    pub(crate) last_denied_errno: Option<i32>,
 }
 
 impl SockStats {
@@ -178,6 +185,14 @@ impl SockStats {
             None => false,
         }
     }
+
+    /// 系统禁发是否**新鲜**（阶梯收口判据；进程级事实，不随 rebind 清零）。
+    pub(crate) fn denied_fresh(&self, now: std::time::Instant, window: std::time::Duration) -> bool {
+        match self.last_denied_at {
+            Some(t) => now.saturating_duration_since(t) <= window,
+            None => false,
+        }
+    }
 }
 
 /// 发送面错误的归类（§3.1-N5 的**纯分类**；计数与判别的单源）。
@@ -190,6 +205,9 @@ pub(crate) enum SendErrClass {
     /// errno 白名单命中：`{ENETUNREACH, EHOSTUNREACH, EADDRNOTAVAIL, ENETDOWN, EINVAL}`
     /// ⇒ 判 M（本机发送面错误；换本地 socket 可能救）。
     Local,
+    /// 系统禁发（`EPERM`/`EACCES`）：进程/UID 级网络拒绝 ⇒ 不选 M/R，阶梯收口休眠；
+    /// 详见 `ladder::Step::Dormant`。
+    Denied,
     /// 其余错误（含 `ECONNREFUSED`/`EMSGSIZE` 等）：只计数 + 节流记行，**不进 M/R 判别**。
     Other,
 }
@@ -198,6 +216,10 @@ pub(crate) enum SendErrClass {
 pub(crate) fn classify_send_err(e: &std::io::Error) -> SendErrClass {
     if e.kind() == std::io::ErrorKind::WouldBlock {
         return SendErrClass::WouldBlock;
+    }
+    // 系统禁发先判：`EPERM`/`EACCES` 不属于本地族（换 socket 无用）。
+    if crate::sysio::is_denied_net_err(e) {
+        return SendErrClass::Denied;
     }
     // WIN 批：本地族白名单经 sysio（windows = WSAE* 值域）。
     if crate::sysio::is_local_net_err(e) {
@@ -217,6 +239,12 @@ pub(crate) fn note_send_err(st: &mut SockStats, e: &std::io::Error, now: std::ti
             st.send_errs_local += 1;
             st.last_local_send_err_at = Some(now);
             st.last_local_send_err_errno = e.raw_os_error();
+        }
+        SendErrClass::Denied => {
+            st.send_errs += 1;
+            st.send_errs_denied += 1;
+            st.last_denied_at = Some(now);
+            st.last_denied_errno = e.raw_os_error();
         }
         SendErrClass::Other => st.send_errs += 1,
     }
@@ -381,8 +409,18 @@ impl AsyncUdpSocket for ClientSock {
                     (class, st.send_errs)
                 };
                 if class != SendErrClass::WouldBlock && log_due(n) {
+                    let head = if class == SendErrClass::Denied {
+                        "上行发送面被系统禁发（Denied"
+                    } else {
+                        "上行发送面错误（"
+                    };
+                    let tail = if class == SendErrClass::Denied {
+                        "）—— 后台网络受限/长时任务可能失效；不选 M/R，等唤醒/前台/换网边沿"
+                    } else {
+                        "）"
+                    };
                     (self.logf)(&format!(
-                        "上行发送面错误（{class:?}；{e}；第 {n} 次；计数行首 3 + 每 100）"
+                        "{head}；{e}；第 {n} 次；计数行首 3 + 每 100{tail}"
                     ));
                 }
                 Err(e)
@@ -595,8 +633,38 @@ mod tests {
         }
         assert_eq!(st.send_errs, 0, "WouldBlock 绝不进任何计数");
         assert_eq!(st.send_errs_local, 0);
+        assert_eq!(st.send_errs_denied, 0);
         assert!(st.last_local_send_err_at.is_none(), "不得留新鲜度位");
+        assert!(st.last_denied_at.is_none(), "不得留禁发新鲜度位");
         assert!(!st.local_send_err_fresh(now, std::time::Duration::from_secs(5)));
+    }
+
+    /// **判据（系统禁发）**：`EPERM`/`EACCES` ⇒ `Denied`（不是 `Local`/`Other`）；
+    /// 计数与新鲜度独立；`rebind` 不清（进程级事实），按窗自然过期。
+    #[test]
+    fn denied_send_err_is_distinct_and_fresh() {
+        let mut st = SockStats::default();
+        let t0 = Instant::now();
+        for errno in [libc::EPERM, libc::EACCES] {
+            assert_eq!(
+                classify_send_err(&io::Error::from_raw_os_error(errno)),
+                SendErrClass::Denied,
+                "errno {errno} 必须归 Denied"
+            );
+        }
+        let class = note_send_err(&mut st, &io::Error::from_raw_os_error(libc::EPERM), t0);
+        assert_eq!(class, SendErrClass::Denied);
+        assert_eq!(st.send_errs, 1);
+        assert_eq!(st.send_errs_denied, 1);
+        assert_eq!(st.send_errs_local, 0, "Denied 不进 M 白名单计数");
+        assert_eq!(st.last_denied_errno, Some(libc::EPERM));
+        let win = std::time::Duration::from_secs(5);
+        assert!(st.denied_fresh(t0 + std::time::Duration::from_secs(4), win));
+        assert!(!st.denied_fresh(t0 + std::time::Duration::from_secs(6), win));
+        // rebind 只清白名单面；denied 事实保留（由窗过期）
+        st.clear_local_send_err();
+        assert_eq!(st.send_errs_denied, 1);
+        assert!(st.denied_fresh(t0 + std::time::Duration::from_secs(1), win));
     }
 
     /// **判据（§3.1-N5 的正例与判别面）**：errno 白名单 ⇒ `Local`（M 判据）；
