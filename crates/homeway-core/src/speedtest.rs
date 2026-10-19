@@ -1154,6 +1154,38 @@ mod tests {
         assert!(f.data(UP_BLOCK).is_ok(), "上行常量块必须可发");
     }
 
+    /// 上行泵实际发出的 data 载荷必须都是 `UP_BLOCK`（不是仅常量声明）。
+    #[test]
+    fn uplink_pump_emits_up_block_frames() {
+        struct RecordConn {
+            sizes: std::sync::Mutex<Vec<usize>>,
+        }
+        impl SpeedConn for RecordConn {
+            fn write_frame(&self, data: &[u8]) -> Result<(), SpeedtestError> {
+                assert!(data.len() >= HEADER, "帧头必须完整");
+                self.sizes.lock().unwrap().push(data.len() - HEADER);
+                Ok(())
+            }
+            fn read_some(&self) -> Result<Vec<u8>, SpeedtestError> {
+                Ok(Vec::new())
+            }
+            fn kill(&self) {}
+        }
+
+        let c = RecordConn {
+            sizes: std::sync::Mutex::new(Vec::new()),
+        };
+        let mut f = Frame::new();
+        let total = pump(&c, &mut f, Duration::from_millis(5), None).expect("泵送");
+        let sizes = c.sizes.lock().unwrap();
+        assert!(!sizes.is_empty(), "5ms 内应至少发一帧");
+        assert!(
+            sizes.iter().all(|&n| n == UP_BLOCK),
+            "上行 data 载荷必须统一为 UP_BLOCK：{sizes:?}"
+        );
+        assert_eq!(total as usize, sizes.len() * UP_BLOCK);
+    }
+
     #[test]
     fn params_validation_matches_go_bounds() {
         assert!(Params::default().normalized().is_ok());
