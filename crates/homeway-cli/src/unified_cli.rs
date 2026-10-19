@@ -145,6 +145,10 @@ pub(crate) fn config_serve_ddns(state_dir: &std::path::Path) -> Result<Vec<Strin
 }
 
 fn write_config_file(state_dir: &std::path::Path, cfg: &FileConfig) -> Result<(), String> {
+    // 纯配置写命令（serve relay set / ddns add 等）可能先于首次 serve 运行：
+    // 目录不存在时自动创建，避免用户为了写一个键先手动 mkdir。
+    std::fs::create_dir_all(state_dir)
+        .map_err(|e| format!("建目录 {}：{e}", state_dir.display()))?;
     let path = state_dir.join("config.toml");
     let body = toml::to_string_pretty(cfg).map_err(|e| e.to_string())?;
     #[cfg(unix)]
@@ -1485,6 +1489,29 @@ mod tests {
                 UnifiedInvocation::Help => panic!("不应是 help：{args:?}"),
             }
         }
+    }
+
+    /// 纯配置写命令先于首次 `serve` 运行：state 目录不存在时必须自动创建，
+    /// 否则 `serve relay set` / `serve ddns add` 会在 tmp 写入处报 ENOENT。
+    #[test]
+    fn update_config_creates_missing_state_dir() {
+        let dir = std::env::temp_dir().join(format!(
+            "hw-config-mkdir-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        assert!(!dir.exists(), "前置：目录不应存在");
+        match update_config(&dir, ConfigEdit::RelaySet("127.0.0.1:41741".to_owned())) {
+            Ok(DdnsWrite::Written) => {}
+            Ok(_) => panic!("应写入 config"),
+            Err(e) => panic!("写 config 失败：{e}"),
+        }
+        let body = std::fs::read_to_string(dir.join("config.toml")).expect("config 应已生成");
+        assert!(body.contains("relay = \"127.0.0.1:41741\""), "{body}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// F7b：`--verbose=false` 真生效（此前显式值被忽略、恒 true）。

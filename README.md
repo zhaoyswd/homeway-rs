@@ -55,9 +55,8 @@ homeway serve stop/restart/status   # 管理出口
 ```
 
 `serve relay` / `serve ddns` 只写 `~/.config/homeway/config.toml`，不需要出口先运行；
-如果该目录还不存在（全新手动安装），先 `mkdir -p ~/.config/homeway`（安装脚本会自动创建）。
-启动后再改则执行 `homeway serve restart` 并重新 `homeway serve token`——中继/DDNS 端点是 token
-的一部分，App 里要重新添加主机。
+目录不存在时会自动创建，不需要手动 `mkdir`。启动后再改则执行 `homeway serve restart` 并重新
+`homeway serve token`——中继/DDNS 端点是 token 的一部分，App 里要重新添加主机。
 
 主机 token 是客户端连接出口的唯一凭据：在其它电脑执行 `homeway host add --name mymac '<hmw2…>'`，
 或在手机 App 的「添加主机」里粘贴同一串。注意保管，切勿泄露。

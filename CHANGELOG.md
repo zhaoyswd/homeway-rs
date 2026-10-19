@@ -12,8 +12,11 @@
   新增「作为客户端使用」章节（同一二进制支持主机管理/文件/终端/端口转发/SOCKS5）。
 - **README 出口启动顺序**：把可选中继/DDNS 配置移到 `serve start` 之前（首次 `serve token`
   即包含它们）；注明启动后再改需 `serve restart` + 重新取 token 并在 App 重新添加主机。
-  `serve relay set` / `serve ddns add` 是纯配置写入，不要求出口已运行；全新手动安装若
-  `~/.config/homeway` 尚不存在，需先创建（安装脚本会自动创建）。
+  `serve relay set` / `serve ddns add` 是纯配置写入，不要求出口已运行；目录不存在时会自动创建。
+- **配置写命令自动建 state 目录**：`serve relay set` / `serve ddns add` 等纯配置写入在
+  `~/.config/homeway` 不存在时自动创建目录，不再要求用户先手动 `mkdir` 或先跑一次 serve；
+  新增单测覆盖。README / App 教程同步去掉“先建目录”的手工步骤，并把 macOS 预授权作为
+  手动安装代码块最后的可选命令；App 教程「配置 App」卡片上移到「部署中继」之前。
 
 ## v0.3.10（2026-10-16）
 
