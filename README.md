@@ -43,20 +43,21 @@ homeway relay stop/restart/status # 管理中继
 在出口机上启动服务，并按需追加中继 / DDNS 配置：
 
 ```bash
+# 可选：先配置中继 / DDNS，再启动出口（首次 token 就包含它们）
+homeway serve relay set 'rl1…'      # 直连不通时经中继转发；rl1… 来自中继机的 relay token
+homeway serve relay clear
+homeway serve ddns add exit.example.com
+homeway serve ddns delete exit.example.com
+
 homeway serve start                 # 启动出口（首次需要；配置自启动后会带起）
 homeway serve token                 # 获取主机 token（hmw2…）
 homeway serve stop/restart/status   # 管理出口
-
-# 可选：中继（直连不通时经中继转发；rl1… 来自中继机的 relay token）
-homeway serve relay set 'rl1…'
-homeway serve relay clear
-
-# 可选：DDNS
-homeway serve ddns add exit.example.com
-homeway serve ddns delete exit.example.com
 ```
 
-`serve relay` / `serve ddns` 修改后执行 `homeway serve restart` 生效。
+`serve relay` / `serve ddns` 只写 `~/.config/homeway/config.toml`，不需要出口先运行；
+如果该目录还不存在（全新手动安装），先 `mkdir -p ~/.config/homeway`（安装脚本会自动创建）。
+启动后再改则执行 `homeway serve restart` 并重新 `homeway serve token`——中继/DDNS 端点是 token
+的一部分，App 里要重新添加主机。
 
 主机 token 是客户端连接出口的唯一凭据：在其它电脑执行 `homeway host add --name mymac '<hmw2…>'`，
 或在手机 App 的「添加主机」里粘贴同一串。注意保管，切勿泄露。

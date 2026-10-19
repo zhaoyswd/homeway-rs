@@ -10,6 +10,10 @@
   launchd/systemd 重启守护进程，确保新二进制与新配置立即生效。README 使用教程同步了端口
   默认值（出口 `38241` / 中继 `:38341`）、`quic_listen` 语义与可选中继/DDNS 命令；
   新增「作为客户端使用」章节（同一二进制支持主机管理/文件/终端/端口转发/SOCKS5）。
+- **README 出口启动顺序**：把可选中继/DDNS 配置移到 `serve start` 之前（首次 `serve token`
+  即包含它们）；注明启动后再改需 `serve restart` + 重新取 token 并在 App 重新添加主机。
+  `serve relay set` / `serve ddns add` 是纯配置写入，不要求出口已运行；全新手动安装若
+  `~/.config/homeway` 尚不存在，需先创建（安装脚本会自动创建）。
 
 ## v0.3.10（2026-10-16）
 
