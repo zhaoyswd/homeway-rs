@@ -1154,6 +1154,29 @@ fn is_tty(fd: i32) -> bool {
     unsafe { libc::isatty(fd) == 1 }
 }
 
+/// 退出时归还本地终端的**输入类模式**重置串（2026-10-19 用户实测：出口服务退出、attach
+/// 收尾后移动鼠标仍往 shell 刷 `\x1b[<…M` 乱码——远端程序经 raw 腿直接开了鼠标上报等
+/// 模式，而 raw 腿只还原 termios、不会关模式位）。
+///
+/// 覆盖：X10/按钮/拖动/任意移动/UTF-8/SGR/urxvt 鼠标（9/1000/1001/1002/1003/1005/1006/
+/// 1007/1015）、焦点上报 1004、括号粘贴 2004、同步输出 2026、DECCKM ?1、application
+/// keypad（?66 + `ESC >`）、kitty 键盘（`CSI = 0 u`）、modifyOtherKeys（`CSI > 4 ; 0 m`）、
+/// 备用屏（47/1047/1049）、光标可见 ?25h，最后 SGR 归零。未知序列对不支持的终端是 no-op；
+/// 顺序 = 先关上报，再离备用屏，最后清样式。
+const LOCAL_TERM_RESET: &[u8] = b"\x1b[?9l\x1b[?1000l\x1b[?1001l\x1b[?1002l\x1b[?1003l\
+\x1b[?1005l\x1b[?1006l\x1b[?1007l\x1b[?1015l\x1b[?1004l\x1b[?2004l\x1b[?2026l\
+\x1b[?1l\x1b[?66l\x1b[?47l\x1b[?1047l\x1b[?1049l\x1b[?25h\x1b[>4;0m\x1b[=0u\x1b>\x1b[0m";
+
+/// 把重置串写给本地终端。stdout 非 tty 时不写（避免把转义字节灌进重定向文件）。
+fn reset_local_terminal() {
+    if !is_tty(1) {
+        return;
+    }
+    let mut out = std::io::stdout();
+    let _ = out.write_all(LOCAL_TERM_RESET);
+    let _ = out.flush();
+}
+
 /// 退出前有界排空（term-attach-resilience D3）：应答让位设计下查询直达本地真终端，
 /// 断链/退出竞态里终端排好的孤儿应答（DA1/kitty/像素查询回包）会在进程退出后漏给
 /// shell、被回显成数字乱码。**还原 termios（开回显）之前**调用：poll 小超时等在途
@@ -1465,7 +1488,7 @@ impl Clone for SigPipe {
     }
 }
 
-fn install_signal_pipes() -> SigPipe {
+fn install_signal_pipes() -> Result<SigPipe, String> {
     // Q-G F1：管道经 `sysfd` 建（两端 CLOEXEC——term 会真 exec 用户 shell；虽
     // portable-pty 的 `close_random_fds()` 会净化，但本仓不依赖第三方库行为）→
     // 立即 `into_raw_fd()` 交既有 i32 字段（生命周期由 `drop_signal_pipes` 收口）。
@@ -1474,10 +1497,7 @@ fn install_signal_pipes() -> SigPipe {
             std::os::fd::IntoRawFd::into_raw_fd(v.0),
             std::os::fd::IntoRawFd::into_raw_fd(v.1),
         ),
-        Err(e) => {
-            eprintln!("homeway term: 信号管道建立失败（{e}）——退出");
-            std::process::exit(1);
-        }
+        Err(e) => return Err(format!("信号管道建立失败（{e}）")),
     };
     let fds = [r, w];
     SIG_W.store(fds[1], Ordering::SeqCst);
@@ -1490,7 +1510,7 @@ fn install_signal_pipes() -> SigPipe {
         libc::signal(libc::SIGHUP, h_exit);
         libc::signal(libc::SIGQUIT, h_exit);
     }
-    SigPipe { read_fd: fds[0], write_fd: fds[1] }
+    Ok(SigPipe { read_fd: fds[0], write_fd: fds[1] })
 }
 
 fn drop_signal_pipes(p: SigPipe) {
@@ -1681,7 +1701,16 @@ impl AttachEnv {
             return Err(format!("切换 raw 模式失败：{e}"));
         }
         // 信号管道先装（查询窗之前——SIGTERM 落在窗内不能被 poll 吞掉）。
-        let pipes = install_signal_pipes();
+        let pipes = match install_signal_pipes() {
+            Ok(p) => p,
+            Err(e) => {
+                // raw 已开：任何退出路径都要归还终端（termios + 输入类模式）。
+                reset_local_terminal();
+                conn.close();
+                let _ = tty.restore();
+                return Err(e);
+            }
+        };
         // OSC 21 查询（150ms 预算；剩余字节回投——首键不丢）。进程级一次。
         let (old_title, leftover) = if title_on { tty_query_title() } else { (String::new(), Vec::new()) };
         // 数据到达管道（读腿 poke —— 主循环 poll 面的第三源）。写端非阻塞（评审
@@ -1694,8 +1723,9 @@ impl AttachEnv {
             ),
             Err(e) => {
                 // Q-G F1（N7）：早退路径必须补 `drop_signal_pipes`（SIG_W 留在活 fd 上
-                // + 两 fd 泄漏）。
+                // + 两 fd 泄漏）；raw 面同样要归还（含输入类模式重置）。
                 drop_signal_pipes(pipes);
+                reset_local_terminal();
                 conn.close();
                 let _ = tty.restore();
                 return Err(format!("poke 管道建立失败：{e}"));
@@ -1719,10 +1749,11 @@ impl AttachEnv {
         ))
     }
 
-    /// 进程终局（唯一出口）：拆信号面/关 poke → 还标题 → **stdin 排空（开回显前，
-    /// term-attach-resilience D3：统一 50ms——在途查询应答不漏给 shell；应答已在
-    /// 队列时 poll 立即命中零延迟，空队列付满 50ms 有界不可感知）** → 还原终端 →
-    /// 打文案/上抛错误。
+    /// 进程终局（唯一出口）：拆信号面/关 poke → 还标题 → **关远端开过的输入类模式
+    /// （鼠标/焦点/括号粘贴/kitty 键盘/备用屏…，否则退出后鼠标移动刷乱码）** →
+    /// **stdin 排空（开回显前，term-attach-resilience D3：统一 50ms——在途查询应答不漏给
+    /// shell；应答已在队列时 poll 立即命中零延迟，空队列付满 50ms 有界不可感知）** →
+    /// 还原终端 → 打文案/上抛错误。
     fn finish(self, note: Result<Option<String>, String>) -> Result<(), String> {
         let AttachEnv { tty, pipes, poke, old_title, title_on, .. } = self;
         drop_signal_pipes(pipes);
@@ -1733,6 +1764,10 @@ impl AttachEnv {
         if title_on && !old_title.is_empty() {
             set_title(&old_title);
         }
+        // 远端程序开过的输入类模式先关（否则进程结束后鼠标移动/焦点变化继续被本地终端
+        // 编码成 `ESC[<…M`/`ESC[I` 落给 shell，回显成大量乱码）→ 再排空窗口内已排队的
+        // 上报/应答 → 最后还原 termios（开回显）。
+        reset_local_terminal();
         drain_terminal_input(0, DRAIN_ON_EXIT_MS);
         if let Err(rerr) = tty.restore() {
             eprintln!("\rhomeway term: 终端还原失败（{rerr}）；画面混乱时执行 reset 修复\r");
@@ -2554,6 +2589,21 @@ mod tests {
                 libc::close(self.slave);
             }
         }
+    }
+
+    /// 退出重置串覆盖所有输入类模式（2026-10-19：出口服务退出后移动鼠标往 shell 刷乱码
+    /// = 远端程序开过的鼠标上报模式没人关）。
+    #[test]
+    fn local_term_reset_covers_input_modes() {
+        let s = std::str::from_utf8(LOCAL_TERM_RESET).expect("重置串必须是 ASCII 转义");
+        for m in [
+            "?9l", "?1000l", "?1001l", "?1002l", "?1003l", "?1005l", "?1006l", "?1007l",
+            "?1015l", "?1004l", "?2004l", "?2026l", "?1l", "?66l", "?47l", "?1047l",
+            "?1049l", "?25h", ">4;0m", "=0u", ">",
+        ] {
+            assert!(s.contains(m), "重置串缺 {m}：{s:?}");
+        }
+        assert!(s.ends_with("\u{1b}[0m"), "末尾必须清样式/颜色");
     }
 
     /// 排空单测 ①：排队的应答字节被清（poll 立即命中 + tcflush 丢弃，master 端无残留）。
