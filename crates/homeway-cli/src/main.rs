@@ -771,6 +771,7 @@ fn cmd_files(args: &[String]) {
     // Q-H F8/CA13：`--help`/`-h` 短路（用法 + exit 0；任意位置）。
     if wants_help(args) {
         eprintln!("用法：homeway files list|stat|mkdir|read <远端路径>        出口机上的文件");
+        eprintln!("      homeway files remove <远端路径>                     删除文件或目录（目录连同内容）");
         eprintln!("      homeway files get <远端> [-o 本地] [--force]        下载（已存在加 --force 覆盖）");
         eprintln!("      homeway files put <本地> <远端>                     上传");
         eprintln!("  只有一台主机时不必 --host；多台用 --host <name|id>。");
@@ -994,11 +995,11 @@ fn cmd_files(args: &[String]) {
             }
             (p_remote, p_local)
         }
-        "list" | "stat" | "mkdir" | "read" | "download" | "upload" => {
+        "list" | "stat" | "mkdir" | "read" | "remove" | "rm" | "download" | "upload" => {
             let p = rest.get(1).cloned().unwrap_or_default();
             let l = rest.get(2).cloned().unwrap_or_default();
             if p.is_empty() {
-                eprintln!("用法：homeway files <list|stat|mkdir|read|get|put|download|upload> <远端路径> [<本地路径>]");
+                eprintln!("用法：homeway files <list|stat|mkdir|read|remove|get|put|download|upload> <远端路径> [<本地路径>]");
                 std::process::exit(2);
             }
             (p, l)
@@ -1066,6 +1067,7 @@ fn cmd_files(args: &[String]) {
             println!("{} {} size={} mtimeMs={} mode={}", if e.is_dir { "dir" } else { "file" }, e.name, e.size, e.mtime_ms, e.mode);
         }),
         "mkdir" => homeway_core::files::mkdir(&session, budget, &path).map(|_| println!("已建目录 {path}")),
+        "remove" | "rm" => homeway_core::files::remove(&session, budget, &path).map(|_| println!("已删除 {path}")),
         "read" => homeway_core::files::read(&session, budget, &path, "", 1 << 20).map(|r| {
             print!("{}", r.text);
         }),
@@ -1182,6 +1184,7 @@ fn cmd_files_remote(host_ref: &str, a: FilesRemoteArgs) {
             println!("{} {} size={} mtimeMs={} mode={}", if e.is_dir { "dir" } else { "file" }, e.name, e.size, e.mtime_ms, e.mode);
         }),
         "mkdir" => homeway_core::files::mkdir_remote(c.clone(), st.clone(), timeout, &path).map(|_| println!("已建目录 {path}")),
+        "remove" | "rm" => homeway_core::files::remove_remote(c.clone(), st.clone(), timeout, &path).map(|_| println!("已删除 {path}")),
         "read" => homeway_core::files::read_remote(c.clone(), st.clone(), timeout, &path, "", 1 << 20).map(|r| {
             print!("{}", r.text);
         }),

@@ -506,6 +506,12 @@ pub fn mkdir(sess: &HostSession, budget: Duration, path: &str) -> Result<(), Fil
     mkdir_at(&mut s, path)
 }
 
+/// 删除（文件/符号链接删条目本身；目录连同内容——与 App 文件管理同一动词）。
+pub fn remove(sess: &HostSession, budget: Duration, path: &str) -> Result<(), FilesError> {
+    let mut s = Stream::open(sess, budget)?;
+    remove_at(&mut s, path)
+}
+
 // ——`--host` 远程形态（Go internal/daemon/files_remote.go 的 DialFiles 缝：控制面
 // stream.open{kind:files} 透传腿上跑同一套动词，零 wire 改动）——
 
@@ -537,6 +543,16 @@ pub fn mkdir_remote(
 ) -> Result<(), FilesError> {
     let mut s = Stream::open_remote(client, st, greet_budget)?;
     mkdir_at(&mut s, path)
+}
+
+pub fn remove_remote(
+    client: std::sync::Arc<crate::daemon::client::ControlClient>,
+    st: std::sync::Arc<crate::daemon::client::ClientStream>,
+    greet_budget: Duration,
+    path: &str,
+) -> Result<(), FilesError> {
+    let mut s = Stream::open_remote(client, st, greet_budget)?;
+    remove_at(&mut s, path)
 }
 
 pub fn read_remote(
@@ -603,6 +619,11 @@ pub(crate) fn stat_at(s: &mut Stream, path: &str) -> Result<Entry, FilesError> {
 
 pub(crate) fn mkdir_at(s: &mut Stream, path: &str) -> Result<(), FilesError> {
     s.call(&Request { op: "mkdir", path, max_bytes: 0, mode: None, size: 0 })?;
+    Ok(())
+}
+
+pub(crate) fn remove_at(s: &mut Stream, path: &str) -> Result<(), FilesError> {
+    s.call(&Request { op: "remove", path, max_bytes: 0, mode: None, size: 0 })?;
     Ok(())
 }
 

@@ -137,7 +137,8 @@ homeway speedtest --host home           # 只测其中一台
 默认根目录是出口主机的用户目录（可在 `[serve] files_root` 修改）。
 
 ```bash
-homeway files list /remote/path                     # list / stat / mkdir / read 同形
+homeway files list /remote/path                     # list / stat / mkdir / read / remove 同形
+homeway files remove /remote/path                   # 删除文件，或目录（连同内容）
 homeway files download /remote/file ./local         # upload 反向（本地在前）
 homeway files get /remote/file -o ./local           # 已存在时加 --force 覆盖
 ```
