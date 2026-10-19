@@ -692,6 +692,16 @@ impl GenRun {
     /// （读面/服务流/B 门/承接轮）一律先快探——那是一次新的证据机会。
     fn run_round(run: &Arc<GenRun>, source: ReconnSource, skip_probe: bool) {
         run.reconn.starts.fetch_add(1, Ordering::Relaxed); // 起跑 S（含承接轮）
+        let worker_start = mono_ms();
+        // 事件起点 = 占位成功时写的 last_ms（`try_spawn_reconnect` / `recover` 同源）。
+        // 直接调用 run_round 的单测没有占位锚，回落到 worker 起点，避免出现负值/天文数。
+        let claimed_at = run.reconn.last_ms.load(Ordering::Acquire);
+        let event_start = if claimed_at <= 0 || claimed_at > worker_start {
+            worker_start
+        } else {
+            claimed_at
+        };
+        let queued_ms = (worker_start - event_start).max(0);
         // 评审 r1 P0-1 整改：起跑判据行（worker 线程落——不在读路径；stats 的
         // 起跑=S 计数无源枚举，7.1 的「读面触发」验收判据由本行承载）。
         (run.logf)(&format!("一次性重连：起跑（源={}）", source.text()));
@@ -705,11 +715,24 @@ impl GenRun {
         }
         // c. 检查点：在飞遇设备死/停止/换代即退出、不置 carrier true、不继续 Rebind/Connect
         if worker_halted(run) {
+            log_event_recovery(
+                run,
+                source,
+                "放弃",
+                "未起跑",
+                event_start,
+                queued_ms,
+                None,
+                0,
+                0,
+                "设备死/停止/换代",
+            );
             return;
         }
         run.reconn.hook("round_before_probe");
         // a. 有界快探（island_cmd_until）：成功 = 强证据翻回 → 完成(已恢复)。
         //    Busy（probe 槽被并发占用）= 并发面而非对端证据 ⇒ 让路、不换绑不赛跑。
+        let mut probe_ms: Option<i64> = None;
         let probe_ok = if skip_probe {
             (run.logf)(&format!(
                 "一次性重连：跳过重复快探（同步快探刚失败，源={}）",
@@ -717,13 +740,28 @@ impl GenRun {
             ));
             false
         } else {
-            match quick_probe(run) {
+            let p0 = mono_ms();
+            let outcome = quick_probe(run);
+            probe_ms = Some((mono_ms() - p0).max(0));
+            match outcome {
                 Ok(()) => true,
                 Err(ProbeFail::Busy(m)) => {
                     (run.logf)(&format!(
                         "一次性重连：让路（源={}，probe 槽被并发占用：{m}）",
                         source.text()
                     ));
+                    log_event_recovery(
+                        run,
+                        source,
+                        "让路",
+                        "快探",
+                        event_start,
+                        queued_ms,
+                        probe_ms,
+                        0,
+                        0,
+                        &format!("probe 槽被并发占用：{m}"),
+                    );
                     return;
                 }
                 Err(_) => false,
@@ -734,6 +772,18 @@ impl GenRun {
             // r2 B3——设备死在快探在飞期间发生时不落恢复行、不置 carrier true）。
             run.reconn.hook("round_after_probe");
             if worker_halted(run) {
+                log_event_recovery(
+                    run,
+                    source,
+                    "放弃",
+                    "快探",
+                    event_start,
+                    queued_ms,
+                    probe_ms,
+                    0,
+                    0,
+                    "设备死/停止/换代",
+                );
                 return;
             }
             // 测试缝（评审 r5-L3）：halt 复查通过后、strong_recover 前的设备死
@@ -744,41 +794,121 @@ impl GenRun {
             // 时不落「一次性重连：恢复」行、按 Gone/设备死静默收口（与
             // worker_halted 同纪律；旧实现无条件打行 = 假恢复行）。
             if !GenRun::strong_recover(run, "快探") {
+                log_event_recovery(
+                    run,
+                    source,
+                    "放弃",
+                    "快探",
+                    event_start,
+                    queued_ms,
+                    probe_ms,
+                    0,
+                    (mono_ms() - t0).max(0),
+                    "强恢复时设备死/换代",
+                );
                 return;
             }
+            let recover_ms = (mono_ms() - t0).max(0);
             (run.logf)(&format!(
                 "一次性重连：恢复（源={}，证据=快探，耗时 {}ms）",
                 source.text(),
-                (mono_ms() - t0).max(0)
+                recover_ms
             ));
+            log_event_recovery(
+                run,
+                source,
+                "成功",
+                "快探",
+                event_start,
+                queued_ms,
+                probe_ms,
+                0,
+                recover_ms,
+                "",
+            );
         } else {
             // 测试缝：快探刚结束、halt 复查前的设备死/停止注入点（r9-C5——
             // 评审 r1 整改：注入后由下方复查拦截，rerace_tunnel 不进入）。
             run.reconn.hook("round_before_rerace");
             if worker_halted(run) {
+                log_event_recovery(
+                    run,
+                    source,
+                    "放弃",
+                    "未起跑",
+                    event_start,
+                    queued_ms,
+                    probe_ms,
+                    0,
+                    0,
+                    "设备死/停止/换代",
+                );
                 return;
             }
             // b. 复用既有重赛跑序列（换网源带 demote_adopted）
             let demote = source == ReconnSource::NetChange;
-            match rerace_tunnel(run, demote) {
+            let mut race_ms = 0i64;
+            let r0 = mono_ms();
+            let first = rerace_tunnel(run, demote);
+            race_ms += (mono_ms() - r0).max(0);
+            match first {
                 Ok(ReraceOutcome::Recovered) => {
                     (run.logf)(&format!(
                         "一次性重连：恢复（源={}，证据=重赛跑）",
                         source.text()
                     ));
+                    log_event_recovery(
+                        run,
+                        source,
+                        "成功",
+                        "重赛跑",
+                        event_start,
+                        queued_ms,
+                        probe_ms,
+                        race_ms,
+                        0,
+                        "",
+                    );
                 }
                 Ok(ReraceOutcome::Yielded) => {
                     // 250ms 复读一次（快照陈旧窗），仍让路 → 完成(让路) + 5s 短窗
                     std::thread::sleep(RERACE_REREAD_DELAY);
                     if worker_halted(run) {
+                        log_event_recovery(
+                            run,
+                            source,
+                            "放弃",
+                            "重赛跑",
+                            event_start,
+                            queued_ms,
+                            probe_ms,
+                            race_ms,
+                            0,
+                            "设备死/停止/换代",
+                        );
                         return;
                     }
-                    match rerace_tunnel(run, demote) {
+                    let r1 = mono_ms();
+                    let second = rerace_tunnel(run, demote);
+                    race_ms += (mono_ms() - r1).max(0);
+                    match second {
                         Ok(ReraceOutcome::Recovered) => {
                             (run.logf)(&format!(
                                 "一次性重连：恢复（源={}，证据=重赛跑（复读））",
                                 source.text()
                             ));
+                            log_event_recovery(
+                                run,
+                                source,
+                                "成功",
+                                "重赛跑",
+                                event_start,
+                                queued_ms,
+                                probe_ms,
+                                race_ms,
+                                0,
+                                "",
+                            );
                         }
                         Ok(ReraceOutcome::Yielded) => {
                             run.reconn.yield_until_ms.store(
@@ -790,23 +920,137 @@ impl GenRun {
                                 source.text(),
                                 crate::go_fmt::fmt_duration_go_secs(RECONNECT_YIELD_GAP)
                             ));
+                            log_event_recovery(
+                                run,
+                                source,
+                                "让路",
+                                "重赛跑",
+                                event_start,
+                                queued_ms,
+                                probe_ms,
+                                race_ms,
+                                0,
+                                "在飞赛跑持续",
+                            );
                         }
-                        Err(abort) => rerace_abort_line(run, source, abort),
+                        Err(abort) => match rerace_abort_line(run, source, abort) {
+                            Some(why) => log_event_recovery(
+                                run,
+                                source,
+                                "失败",
+                                "重赛跑",
+                                event_start,
+                                queued_ms,
+                                probe_ms,
+                                race_ms,
+                                0,
+                                &why,
+                            ),
+                            None => log_event_recovery(
+                                run,
+                                source,
+                                "放弃",
+                                "重赛跑",
+                                event_start,
+                                queued_ms,
+                                probe_ms,
+                                race_ms,
+                                0,
+                                "设备死/停止/换代",
+                            ),
+                        },
                     }
                 }
-                Err(abort) => rerace_abort_line(run, source, abort),
+                Err(abort) => match rerace_abort_line(run, source, abort) {
+                    Some(why) => log_event_recovery(
+                        run,
+                        source,
+                        "失败",
+                        "重赛跑",
+                        event_start,
+                        queued_ms,
+                        probe_ms,
+                        race_ms,
+                        0,
+                        &why,
+                    ),
+                    None => log_event_recovery(
+                        run,
+                        source,
+                        "放弃",
+                        "重赛跑",
+                        event_start,
+                        queued_ms,
+                        probe_ms,
+                        race_ms,
+                        0,
+                        "设备死/停止/换代",
+                    ),
+                },
             }
         }
     }
 }
 
 /// rerace 中止的落行分流（评审 r1 P0-6：Gone 静默退出——不落「对端失败」行；
-/// Fail 照常落失败行）。
-fn rerace_abort_line(run: &Arc<GenRun>, source: ReconnSource, abort: ReraceAbort) {
+/// Fail 照常落失败行；返回值给事件用时汇总行带原因）。
+fn rerace_abort_line(run: &Arc<GenRun>, source: ReconnSource, abort: ReraceAbort) -> Option<String> {
     match abort {
-        ReraceAbort::Gone => {} // 停止/世代变化/设备死：静默退出（对端失败行禁落）
-        ReraceAbort::Fail(why) => round_fail_line(run, source, &why),
+        ReraceAbort::Gone => None, // 停止/世代变化/设备死：静默退出（对端失败行禁落）
+        ReraceAbort::Fail(why) => {
+            round_fail_line(run, source, &why);
+            Some(why)
+        }
     }
+}
+
+/// **事件恢复用时汇总**（便捷判据）：一次事件从占位到收口的总耗时 + 排队/快探/
+/// 重赛跑/强恢复分项。保留既有逐行判据不变，本行只做跨阶段对账——排查「用户感知
+/// 十几秒」时先 grep 这一行，再按源名回看完整日志。
+///
+/// 口径：
+/// - `start_ms` = `ReconnGate::last_ms`（占位成功时刻；非 worker 起跑时刻）；
+/// - `排队` = 占位 → worker 起跑；
+/// - `快探` = 本轮 worker 快探耗时（`跳过` = recover 移交的重复快探）；
+/// - `重赛跑` = `rerace_tunnel` 调用耗时（含复读一次）；
+/// - `恢复` = `strong_recover` 耗时（快探成功路径；重赛跑内部包含在重赛跑）。
+// 一行汇总要同时带源/结果/路径/总耗时/四个分项/原因；拆结构只会把同一组字段
+// 在十余个调用点重复一遍，这里保留平铺参数并把复杂度留在唯一落行处。
+#[allow(clippy::too_many_arguments)]
+fn log_event_recovery(
+    run: &Arc<GenRun>,
+    source: ReconnSource,
+    result: &str,
+    path: &str,
+    start_ms: i64,
+    queued_ms: i64,
+    probe_ms: Option<i64>,
+    race_ms: i64,
+    recover_ms: i64,
+    detail: &str,
+) {
+    let total_ms = (mono_ms() - start_ms).max(0);
+    let probe = match probe_ms {
+        Some(v) => format!("{v}ms"),
+        None => "跳过".to_owned(),
+    };
+    let detail = if detail.is_empty() {
+        String::new()
+    } else {
+        format!("；{detail}")
+    };
+    (run.logf)(&format!(
+        "事件恢复用时：源={}，结果={}，路径={}，总耗时={}ms（排队={}ms，快探={}，赛跑={}ms，恢复={}ms）{}",
+        source.text(),
+        result,
+        path,
+        total_ms,
+        queued_ms,
+        probe,
+        race_ms,
+        recover_ms,
+        detail
+    ));
 }
 
 /// 失败行（含原因与下次最早触发时刻——demand 源受 MIN_GAP 限频；边沿源随时）。
@@ -1269,7 +1513,11 @@ impl TunExecutor for TunnelExec {
                 // 测试缝：占位后的同步快探前挂点（受控交错——两并发 recover 的
                 // 「第二发在第一发持位时进入」确定性构造面，评审 r1 P2）。
                 run.reconn.hook("recover_claimed");
-                match quick_probe(&run) {
+                let event_start = run.reconn.last_ms.load(Ordering::Acquire);
+                let probe_t0 = mono_ms();
+                let probe = quick_probe(&run);
+                let probe_ms = (mono_ms() - probe_t0).max(0);
+                match probe {
                     Ok(()) => {
                         // 测试缝：快探刚返回成功、halt 复查前的注入点（评审 r3 B3——
                         // 与 run_round 的 round_after_probe 同一纪律：设备死/停止/换代
@@ -1284,20 +1532,59 @@ impl TunExecutor for TunnelExec {
                             let _snap = run.reconn.release_if_owner(epoch);
                         };
                         if worker_halted(&run) {
+                            log_event_recovery(
+                                &run,
+                                source,
+                                "放弃",
+                                "同步快探",
+                                event_start,
+                                0,
+                                Some(probe_ms),
+                                0,
+                                0,
+                                "设备死/停止/换代",
+                            );
                             release_claimed();
                             return -2; // 与前置判定同值（「设备死或停止」契约）
                         }
                         // 测试缝：halt 复查通过后、strong_recover 前的注入点（评审
                         // r4 B3 低项——设备死落在复查与强恢复之间的理论窗口）。
                         run.reconn.hook("recover_before_strong");
+                        let r0 = mono_ms();
                         // r4 B3 低项：快探成功但设备死在复查后到场（承载位置 true
                         // 判负——alive=false）同归 -2 释放路径，不落「通过」行
                         // （该形态下 patrol 已被设备类改写 ⇒ 恢复行为零日志零刷新）。
                         if !GenRun::strong_recover(&run, "恢复下推同步快探") {
+                            let recover_ms = (mono_ms() - r0).max(0);
+                            log_event_recovery(
+                                &run,
+                                source,
+                                "放弃",
+                                "同步快探",
+                                event_start,
+                                0,
+                                Some(probe_ms),
+                                0,
+                                recover_ms,
+                                "强恢复时设备死/换代",
+                            );
                             release_claimed();
                             return -2;
                         }
+                        let recover_ms = (mono_ms() - r0).max(0);
                         (run.logf)(&format!("恢复下推（{cause}）——同步快探：通过"));
+                        log_event_recovery(
+                            &run,
+                            source,
+                            "成功",
+                            "同步快探",
+                            event_start,
+                            0,
+                            Some(probe_ms),
+                            0,
+                            recover_ms,
+                            "",
+                        );
                         // release_if_owner 收尾（含承接）后返回 0——绝不裸返回留位。
                         let mut guard = RoundGuard {
                             epoch,
@@ -1315,6 +1602,18 @@ impl TunExecutor for TunnelExec {
                         (run.logf)(&format!(
                             "恢复下推（{cause}）——同步快探：失败（{e}）——移交一次性重连 worker"
                         ));
+                        log_event_recovery(
+                            &run,
+                            source,
+                            "移交",
+                            "同步快探",
+                            event_start,
+                            0,
+                            Some(probe_ms),
+                            0,
+                            0,
+                            "同步快探失败，交一次性重连 worker",
+                        );
                         // spawn worker 并把槽位移交（r12-B3 定稿：worker 以 Claimed 的
                         // epoch 为 my_epoch、走标准收尾——recover 立即返回 -1，不再
                         // 自行 release）。
@@ -1324,6 +1623,18 @@ impl TunExecutor for TunnelExec {
                                 // r13-P3：无人继承时的释放兜底——步骤 4 同款清理后
                                 // 返回 -1（绝不裸留位；后续可再 Claimed）。
                                 run.reconn.spawn_fails.fetch_add(1, Ordering::Relaxed);
+                                log_event_recovery(
+                                    &run,
+                                    source,
+                                    "失败",
+                                    "同步快探",
+                                    event_start,
+                                    0,
+                                    Some(probe_ms),
+                                    0,
+                                    0,
+                                    "一次性重连 worker 起跑失败",
+                                );
                                 run.reconn.last_ms.store(saved_last, Ordering::Release);
                                 run.reconn.yield_until_ms.store(saved_yield, Ordering::Release);
                                 clear_pending_while_holding(&run, epoch);
@@ -3107,6 +3418,36 @@ mod tests {
         island.stop();
     }
 
+    /// 同步快探成功也必须落「事件恢复用时」汇总行（App 回前台/换网走的快路径）。
+    #[test]
+    fn recover_sync_probe_logs_event_duration_summary() {
+        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let (run, lines) = gen_with_lines("recover-sync-summary");
+        let island = idle_island(&run);
+        run.set_island(Arc::clone(&island));
+        run.set_l3_on_island(true);
+        let demand = Arc::new(DemandSignals::new());
+        let exec = TunnelExec::new(Arc::clone(&demand));
+        *lock_unpoison(&exec.state) = Some(Arc::clone(&run));
+        PROBE_RESULT_GATE.store(1, Ordering::Relaxed);
+        let rc = exec.recover(1, "扩展下推(档位 1)");
+        PROBE_RESULT_GATE.store(0, Ordering::Relaxed);
+        assert_eq!(rc, 0, "同步快探成功 ⇒ rc=0");
+        let seen = drain_lines(&lines);
+        let summary = seen
+            .iter()
+            .find(|l| l.starts_with("事件恢复用时：源=唤醒，结果=成功，路径=同步快探，总耗时="))
+            .unwrap_or_else(|| panic!("缺同步快探汇总行：{seen:?}"));
+        assert!(
+            summary.contains("快探=") && summary.contains("恢复="),
+            "汇总行须带快探/恢复分项：{summary}"
+        );
+        *lock_unpoison(&exec.state) = None;
+        run.set_l3_on_island(false);
+        run.take_island();
+        island.stop();
+    }
+
     /// **判据（2.3）**：在飞预检走 `try_claim_edge`（r10-C11）——owner 在飞时第二发
     /// recover 归 `InFlight` ⇒ `-1` 且**零快探**（防换网/唤醒并发各自烧探测占满命令槽）；
     /// 边沿位留字由 owner 收尾承接（r8-a1-2）。
@@ -3808,8 +4149,9 @@ mod tests {
             GenRun::run_round(&run, ReconnSource::ReadFace, false);
             let seen = drain_lines(&lines);
             assert!(
-                seen.iter().all(|l| l == "一次性重连：起跑（源=读面）"),
-                "入口前设备死：仅起跑行（零动作行）：{seen:?}"
+                seen.iter().all(|l| l == "一次性重连：起跑（源=读面）"
+                    || l.starts_with("事件恢复用时：源=读面，结果=放弃，路径=未起跑")),
+                "入口前设备死：仅起跑行 + 用时汇总（零动作行）：{seen:?}"
             );
             assert!(!run.tun_shared.carrier.alive(), "承载位保持 false");
             assert_eq!(run.reconn.probes.load(Ordering::Relaxed), 0, "零快探");
@@ -4540,6 +4882,17 @@ mod tests {
             seen.iter()
                 .any(|l| l.contains("传输恢复（patrol 清除，证据=快探")),
             "strong_recover 的翻回判据行在场：{seen:?}"
+        );
+        let summary = seen
+            .iter()
+            .find(|l| l.starts_with("事件恢复用时：源=读面，结果=成功，路径=快探，总耗时="))
+            .unwrap_or_else(|| panic!("缺事件恢复用时汇总行：{seen:?}"));
+        assert!(
+            summary.contains("排队=")
+                && summary.contains("快探=")
+                && summary.contains("赛跑=0ms")
+                && summary.contains("恢复="),
+            "汇总行须带排队/快探/重赛跑/恢复分项：{summary}"
         );
         assert!(!run.tun_shared.transport_unhealthy(), "patrol 已清");
         assert!(run.tun_shared.carrier.alive(), "承载位置 true");
