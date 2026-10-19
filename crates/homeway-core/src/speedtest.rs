@@ -29,8 +29,15 @@ pub(crate) const TYPE_START: u8 = 2;
 pub(crate) const TYPE_FINISH: u8 = 3;
 pub(crate) const TYPE_DATA: u8 = 4;
 pub(crate) const TYPE_REPORT: u8 = 5;
-/// 发送块（= Go blockBytes：u16 长度场硬顶 64KB-1）。
+/// 帧容量/下行发送块（= Go blockBytes：u16 长度场硬顶 64KB-1）。
 const BLOCK: usize = 64 * 1024 - 1;
+/// **上行**发送块（2026-10-19 speedtest-uplink-resilience）：
+///
+/// 每流 `STREAM_PENDING` = 64KiB，而旧上行块也是 64KiB-1 ⇒ 慢上行时一整帧就填满
+/// 待发队列，桥泵在 `write_with_backoff` 里连续 `n=0`，10s 无进展保护把「慢」误收成
+/// 「死」。16KiB-1 给队列留 4 帧余量：2.7Mbps 下一帧约 47ms，远小于保护窗；帧头
+/// 15B/16KiB 的开销 <0.1%，对快链路可忽略。下行仍用 `BLOCK`（接收端不写队列）。
+const UP_BLOCK: usize = 16 * 1024 - 1;
 /// 客户端窗口起点对服务端的滞后余量（phaseSlack）。
 const PHASE_SLACK: Duration = Duration::from_millis(100);
 
@@ -286,7 +293,9 @@ impl SpeedConn for HostConn {
                 .write_chunk(&data[off..])
                 .map_err(io_to_speedtest)?;
             if n == 0 {
-                return Err(SpeedtestError::Frame("写通道长时间无进展".into()));
+                // `write_chunk` 的 `n=0` 只在自循环无进展上界到点后出现（保护已收口），
+                // 按超时归因，不再包成帧协议错误（speedtest-uplink-resilience D3）。
+                return Err(SpeedtestError::Timeout);
             }
             off += n;
         }
@@ -307,8 +316,14 @@ impl SpeedConn for HostConn {
 /// 映射的产物）⇒ 本层只做类型搬运，不再嗅探文案。
 fn io_to_speedtest(e: std::io::Error) -> SpeedtestError {
     match e.kind() {
-        std::io::ErrorKind::TimedOut => SpeedtestError::Timeout,
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => SpeedtestError::Timeout,
         std::io::ErrorKind::ConnectionRefused => SpeedtestError::NotSupported,
+        // speedtest-uplink-resilience D3：数据期桥/流关闭不是帧协议错误——归
+        // `link_down`（App 短因「链路中断」）。取消优先级仍由 `run_dial` 尾部裁决。
+        std::io::ErrorKind::BrokenPipe
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::NotConnected => SpeedtestError::LinkDown,
         _ => SpeedtestError::Frame(format!("宿主会话流：{e}")),
     }
 }
@@ -1042,6 +1057,9 @@ fn run_phases(
 
 /// 泵一段 data（250ms 分片节奏——Go PumpDataChunk 形态：分片边界 = live 字节更新点
 /// 与取消检查点；整帧单次写全；返回本段 payload 字节数）。
+///
+/// 帧载荷用 `UP_BLOCK`（16KiB-1）而非 `BLOCK`：上行受每流 64KiB 待发队列与慢链路
+/// 共同约束，见 `UP_BLOCK` 的注释。
 fn pump(
     conn: &dyn SpeedConn,
     f: &mut Frame,
@@ -1056,8 +1074,8 @@ fn pump(
         let slice_end =
             Instant::now() + SLICE.min(deadline.saturating_duration_since(Instant::now()));
         while Instant::now() < slice_end {
-            conn.write_frame(f.data(BLOCK)?)?;
-            total += BLOCK as i64;
+            conn.write_frame(f.data(UP_BLOCK)?)?;
+            total += UP_BLOCK as i64;
         }
         // 分片边界：live 字节上报**本片增量**（复核 r3-F4：此前每片加运行累计 ⇒
         // n 片后 ≈ 真值 ×(n+1)/2 虚高；Go engine.go「字节数必须用分片泵的返回值」）
@@ -1120,6 +1138,20 @@ mod tests {
         let mut f = Frame::new();
         assert!(f.data(70_000).is_err(), "超 u16 上限必须报错（低-12）");
         assert!(f.data(BLOCK).is_ok(), "常量块（64KB-1）必须可发");
+    }
+
+    /// speedtest-uplink-resilience D1：上行单帧必须给每流待发队列留余量，不能
+    /// 一整帧就填满 64KiB；下行 `BLOCK` 仍保持 64KB-1。
+    #[test]
+    fn uplink_block_leaves_pending_headroom() {
+        const { assert!(UP_BLOCK < BLOCK, "上行块必须小于下行/帧容量") };
+        let pending = homeway_quic::tuning::StreamLimits::design().pending_bytes;
+        assert!(
+            UP_BLOCK * 4 <= pending,
+            "16KiB-1 上行块应能在一流待发队列里留 4 帧余量：UP_BLOCK={UP_BLOCK} pending={pending}"
+        );
+        let mut f = Frame::new();
+        assert!(f.data(UP_BLOCK).is_ok(), "上行常量块必须可发");
     }
 
     #[test]
@@ -1415,6 +1447,32 @@ mod tests {
         assert!(
             done.contains("下行用=") && done.contains("上行用="),
             "完成行带两相位墙钟（窗口越界可见）：{done}"
+        );
+    }
+
+    /// speedtest-uplink-resilience D3：数据期桥/流关闭必须归 `link_down`，
+    /// 无进展/期限到点归 `timeout`，只有真正的帧协议面错误才保留 `interrupted`。
+    #[test]
+    fn session_write_errors_are_not_frame_errors() {
+        use std::io::{Error, ErrorKind};
+        let link = io_to_speedtest(Error::new(ErrorKind::BrokenPipe, "桥关"));
+        assert_eq!(link.reason(), REASON_LINK_DOWN);
+        assert!(matches!(link, SpeedtestError::LinkDown));
+        for kind in [
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::NotConnected,
+        ] {
+            let e = io_to_speedtest(Error::new(kind, "关"));
+            assert_eq!(e.reason(), REASON_LINK_DOWN, "{kind:?}");
+        }
+        assert_eq!(
+            io_to_speedtest(Error::new(ErrorKind::TimedOut, "超时")).reason(),
+            REASON_TIMEOUT
+        );
+        assert_eq!(
+            io_to_speedtest(Error::new(ErrorKind::InvalidData, "真帧错")).reason(),
+            REASON_INTERRUPTED
         );
     }
 }

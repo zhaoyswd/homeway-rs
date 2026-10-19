@@ -559,6 +559,7 @@ impl HostSession {
                     island,
                     id,
                     pending: Mutex::new(super::quic_stream::PendingBuf::new(rest)),
+                    no_progress: super::quic_stream::WRITE_NO_PROGRESS,
                 }),
             })
         })();
@@ -671,6 +672,7 @@ impl HostSession {
                 island,
                 id,
                 pending: Mutex::new(super::quic_stream::PendingBuf::default()),
+                no_progress: super::quic_stream::write_no_progress(tag),
             }),
         })
     }
@@ -1163,6 +1165,8 @@ pub(crate) struct StreamShared {
     /// 交付前**已在手**的余量（`STREAM[dial]` 的 1B 回执之后可能立刻跟目标字节——
     /// 余量丢失 = **应用层帧错位**；与 `quic_stream::PendingBuf` 同一不变量）。
     pending: Mutex<super::quic_stream::PendingBuf>,
+    /// 写无进展上界（speedtest-uplink-resilience D2）：默认 10s，测速 30s。
+    no_progress: Duration,
 }
 
 impl StreamShared {
@@ -1309,14 +1313,15 @@ impl WriteHalf for HostWriteHalf {
     }
 }
 
-/// 写主体（`n=0` 分级退避环；10s 无进展上界——与 `quic_stream::QuicWriteHalf` 同款）。
+/// 写主体（`n=0` 分级退避环；无进展上界按流类别取——默认 10s / 测速 30s，
+/// 与 `quic_stream::QuicWriteHalf` 同源）。
 fn write_with_backoff(shared: &Arc<StreamShared>, data: &[u8]) -> io::Result<usize> {
     let no_progress = Instant::now();
     let mut attempt: u32 = 0;
     loop {
         match super::quic_stream::write_block(&shared.island, shared.id, data.to_vec()) {
             Ok(w) if w.n == 0 => {
-                if no_progress.elapsed() > Duration::from_secs(10) {
+                if no_progress.elapsed() > shared.no_progress {
                     return Err(io::Error::new(
                         io::ErrorKind::TimedOut,
                         "写通道长时间无进展（服务流待发队列不排空）",

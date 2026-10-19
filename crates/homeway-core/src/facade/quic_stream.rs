@@ -49,7 +49,8 @@ use super::tun_exec::{GenRun, ReconnSource};
 /// term 走 `term_port()`（`HOMEWAY_TERM_PORT` 可改——A13 登记的可配面，本函数是它的唯一
 /// 消费判据：改端口不破 tag 映射）。
 /// 背压重试节拍（F8a 纯函数）：前 50 拍 2ms、51–100 拍 10ms、其后 20ms 封顶。
-/// 10s 无进展上界与「空写短路」语义不随本表变化。**WIN 批**：从 `tun_exec` 搬入
+/// 无进展上界按流类别取（默认 10s / 测速 30s，见 [`write_no_progress`]），
+/// 「空写短路」语义不随本表变化。**WIN 批**：从 `tun_exec` 搬入
 /// （`tun_exec` 是 App 面〔windows 不编译〕，而本表被本模块写半与 `host_session`
 /// 的写主体共用——跨平台件随跨平台模块落地；节拍语义不变）。
 pub(crate) fn write_retry_backoff(attempt: u32) -> Duration {
@@ -59,6 +60,23 @@ pub(crate) fn write_retry_backoff(attempt: u32) -> Duration {
         std::time::Duration::from_millis(10)
     } else {
         std::time::Duration::from_millis(20)
+    }
+}
+
+/// 服务流写无进展上界（默认 10s）。
+///
+/// speedtest-uplink-resilience D2：测速整轮期限 = warmup+window+15s（默认 27s），
+/// 10s 保护会比上行 10s 窗口还短；测速流单独放宽到 30s。其它服务流保持 10s，
+/// 避免把 files/term 的死链检测拖慢。
+pub(crate) const WRITE_NO_PROGRESS: Duration = Duration::from_secs(10);
+pub(crate) const SPEEDTEST_WRITE_NO_PROGRESS: Duration = Duration::from_secs(30);
+
+/// 按流类别取写无进展上界。
+pub(crate) fn write_no_progress(tag: StreamTag) -> Duration {
+    if matches!(tag, StreamTag::Speedtest) {
+        SPEEDTEST_WRITE_NO_PROGRESS
+    } else {
+        WRITE_NO_PROGRESS
     }
 }
 
@@ -238,6 +256,7 @@ pub(crate) fn dial_target(
         island,
         id,
         on_carrier_failure: Some(cb),
+        no_progress: WRITE_NO_PROGRESS,
     });
     Ok(Box::new(QuicStream::from_shared(shared).with_pending(rest)))
 }
@@ -554,6 +573,7 @@ pub(crate) fn dial(
         island,
         id,
         on_carrier_failure: trigger.then_some(cb),
+        no_progress: write_no_progress(tag),
     });
     Ok(Box::new(QuicStream::from_shared(shared)))
 }
@@ -592,6 +612,8 @@ struct StreamShared {
     /// 承载失败触发回调（reconnect-oneshot D2-r4-N6）：在飞流读写半报
     /// `ConnectionLost` 时调用；宿主会话构造的共享体为 `None`（零触发）。
     on_carrier_failure: Option<CarrierFailureFn>,
+    /// 写无进展上界（speedtest-uplink-resilience D2）：默认 10s，测速 30s。
+    no_progress: Duration,
 }
 
 impl Drop for StreamShared {
@@ -772,7 +794,7 @@ impl Write for QuicWriteHalf {
             ) {
                 Ok(w) if w.n == 0 => {
                     pending = w.back;
-                    if no_progress.elapsed() > Duration::from_secs(10) {
+                    if no_progress.elapsed() > self.shared.no_progress {
                         return Err(io::Error::new(
                             io::ErrorKind::TimedOut,
                             "写通道长时间无进展（服务流待发队列不排空）",
@@ -855,6 +877,24 @@ mod tests {
             bport::DNS_RESOLVE,
             "SOCKS_DNS_PORT 必须引用 bridge_host::port::DNS_RESOLVE"
         );
+    }
+
+    /// speedtest-uplink-resilience D2：只有测速流放宽到 30s，其它流仍是 10s。
+    #[test]
+    fn speedtest_stream_gets_longer_write_no_progress_budget() {
+        assert_eq!(
+            write_no_progress(StreamTag::Speedtest),
+            Duration::from_secs(30)
+        );
+        for tag in [
+            StreamTag::Files,
+            StreamTag::Term,
+            StreamTag::Dial,
+            StreamTag::Probe,
+            StreamTag::DnsResolve,
+        ] {
+            assert_eq!(write_no_progress(tag), Duration::from_secs(10), "{tag:?}");
+        }
     }
 
     /// **判据（阶梯豁免集，§1.6 设计门 3-3；S3 完成判据点名）**：服务级拒绝

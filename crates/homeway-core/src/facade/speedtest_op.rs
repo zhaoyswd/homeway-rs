@@ -168,6 +168,23 @@ pub struct BridgeSpeedConn {
     deadline: Mutex<Option<Instant>>,
 }
 
+/// 桥 IO 错误 → 测速归因（speedtest-uplink-resilience D3）。
+///
+/// 数据期桥/流关闭（`BrokenPipe` 等）不是帧协议错误：归 `LinkDown`（App 短因
+/// 「链路中断」）；`WouldBlock`/`TimedOut` 归 `Timeout`；其余未知 IO 仍按帧面
+/// 错误透传，便于保留真正的协议/实现异常。
+fn map_bridge_io_error(e: std::io::Error, dir: &str) -> crate::speedtest::SpeedtestError {
+    use crate::speedtest::SpeedtestError;
+    match e.kind() {
+        std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => SpeedtestError::Timeout,
+        std::io::ErrorKind::BrokenPipe
+        | std::io::ErrorKind::ConnectionReset
+        | std::io::ErrorKind::ConnectionAborted
+        | std::io::ErrorKind::NotConnected => SpeedtestError::LinkDown,
+        _ => SpeedtestError::Frame(format!("测速桥{dir}失败：{e}")),
+    }
+}
+
 impl BridgeSpeedConn {
     /// per-op 超时收敛（绝对期限的执行半边）。
     fn op_timeout(&self) -> std::io::Result<Option<std::time::Duration>> {
@@ -210,19 +227,10 @@ impl crate::speedtest::SpeedConn for BridgeSpeedConn {
             }
             self.raw.set_write_timeout(remain.unwrap()).ok();
             match w.write(&data[off..]) {
-                Ok(0) => {
-                    return Err(SpeedtestError::Frame(
-                        "测速桥写通道返回 0（对端已关）".into(),
-                    ))
-                }
+                // 写通道返回 0 = 对端已关（不是帧协议错误）；与 EPIPE 同归链路中断。
+                Ok(0) => return Err(SpeedtestError::LinkDown),
                 Ok(n) => off += n,
-                Err(e)
-                    if e.kind() == std::io::ErrorKind::WouldBlock
-                        || e.kind() == std::io::ErrorKind::TimedOut =>
-                {
-                    return Err(SpeedtestError::Timeout);
-                }
-                Err(e) => return Err(SpeedtestError::Frame(format!("测速桥写失败：{e}"))),
+                Err(e) => return Err(map_bridge_io_error(e, "写")),
             }
         }
         Ok(())
@@ -237,15 +245,9 @@ impl crate::speedtest::SpeedConn for BridgeSpeedConn {
         }
         self.raw.set_read_timeout(remain.unwrap()).ok();
         match r.read(&mut buf) {
-            Ok(0) => Ok(Vec::new()), // EOF
+            Ok(0) => Ok(Vec::new()), // EOF——首帧前 EOF 的 not_supported 分流仍由引擎判
             Ok(n) => Ok(buf[..n].to_vec()),
-            Err(e)
-                if e.kind() == std::io::ErrorKind::WouldBlock
-                    || e.kind() == std::io::ErrorKind::TimedOut =>
-            {
-                Err(SpeedtestError::Timeout)
-            }
-            Err(e) => Err(SpeedtestError::Frame(format!("测速桥读失败：{e}"))),
+            Err(e) => Err(map_bridge_io_error(e, "读")),
         }
     }
     fn kill(&self) {
@@ -537,6 +539,31 @@ mod tests {
     #[test]
     fn cancel_envelope() {
         assert_eq!(speed_cancel_json(), r#"{"ok":true}"#);
+    }
+
+    /// speedtest-uplink-resilience D3：桥关闭/期限不再落成 `Frame`（interrupted）。
+    #[test]
+    fn bridge_io_errors_are_mapped_to_timeout_or_link_down() {
+        use crate::speedtest::REASON_INTERRUPTED;
+        use crate::speedtest::REASON_LINK_DOWN;
+        use crate::speedtest::REASON_TIMEOUT;
+        use std::io::{Error, ErrorKind};
+
+        for kind in [
+            ErrorKind::BrokenPipe,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::NotConnected,
+        ] {
+            let e = map_bridge_io_error(Error::new(kind, "桥关"), "写");
+            assert_eq!(e.reason(), REASON_LINK_DOWN, "{kind:?}");
+        }
+        for kind in [ErrorKind::WouldBlock, ErrorKind::TimedOut] {
+            let e = map_bridge_io_error(Error::new(kind, "超时"), "写");
+            assert_eq!(e.reason(), REASON_TIMEOUT, "{kind:?}");
+        }
+        let e = map_bridge_io_error(Error::new(ErrorKind::InvalidData, "真帧错"), "读");
+        assert_eq!(e.reason(), REASON_INTERRUPTED);
     }
 }
 
