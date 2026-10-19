@@ -2435,3 +2435,49 @@ mod handover_storm_tests {
         assert_eq!(trips, 2);
     }
 }
+
+#[cfg(test)]
+mod storm_replay_tests {
+    use super::*;
+    use crate::client::ladder::Ladder;
+    use crate::tuning::ProbeTuning;
+
+    /// 09:16 形态回放（纯逻辑）：交接窗内旧 close 不判死；按现场 ~70ms 节奏的
+    /// 连续 replaced 在 10 次触发熔断；阶梯 park 后不再起探。
+    #[test]
+    fn replay_0916_two_races_and_replaced_closes() {
+        let t0 = Instant::now();
+        let h = Some(Handover { from: 11, until: t0 + Duration::from_millis(5600) });
+        // 两条赛跑后的第一条旧 close：交接窗内、同 id → 正常交接。
+        assert!(benign_handover(
+            Some("replaced by newer registration"),
+            11,
+            h,
+            t0 + Duration::from_millis(40)
+        ));
+        // 连续替换（现场 ~70ms/次）：第 10 次触发熔断，且只触发一次。
+        let mut window = None;
+        let mut count = 0u32;
+        let mut until = None;
+        let mut trips = 0u64;
+        let mut tripped_at = None;
+        for i in 0..12 {
+            let now = t0 + Duration::from_millis(40 + i * 70);
+            if note_replaced_at(&mut window, &mut count, &mut until, &mut trips, now) {
+                tripped_at = Some(i);
+            }
+        }
+        assert_eq!(tripped_at, Some(9), "第 10 次（i=9）触发");
+        assert_eq!(trips, 1, "同一冷却期内只触发一次");
+        assert!(until.is_some());
+        // 阶梯被 park 后不再起探（等边沿/新连接采纳）。
+        let logf: Logf = Arc::new(|_l: &str| {});
+        let mut l = Ladder::new(ProbeTuning::design());
+        let lt = TokioInstant::now();
+        l.park_storm("替换风暴".to_owned(), &logf);
+        assert!(l.due(lt + Duration::from_secs(120), true).is_none());
+        // 新连接采纳 = rearm 复位（与 driver::adopt 的调用同义）。
+        l.rearm();
+        assert!(l.due(lt + Duration::from_secs(121), true).is_some());
+    }
+}
