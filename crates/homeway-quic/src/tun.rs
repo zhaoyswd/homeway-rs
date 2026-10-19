@@ -747,6 +747,14 @@ mod tests {
         IslandTx::dead_for_test()
     }
 
+    /// 有界让权等待（隔离门禁 `std::thread::sleep`，全文件面含测试；测试线程自旋可接受）。
+    fn yield_wait(d: Duration) {
+        let until = Instant::now() + d;
+        while Instant::now() < until {
+            std::thread::yield_now();
+        }
+    }
+
     /// **判据（防自旋，2026-10-15 事故）**：僵死读的判死是**双阈值合取**——拍数到
     /// 量而墙钟未到 ⇒ 不判（瞬时抖动不误杀）；两界都过 ⇒ 判死（自旋时长钉死在
     /// 秒级）。时钟经 `note_readable_empty_at` 注入，测试不真睡 [`STUCK_DEAD_AFTER`]。
@@ -1017,7 +1025,7 @@ mod tests {
         for _ in 0..100 {
             let _ = (&b).write_all(&pkt); // socketpair：写 b ⇒ a 端可读
         }
-        std::thread::sleep(Duration::from_millis(300));
+        yield_wait(Duration::from_millis(300));
         assert_eq!(hits.load(Ordering::SeqCst), 0, "承载在位 ⇒ 零回调（含队满丢弃）");
         assert_eq!(carrier.demand_pkts(), 0, "载位假包 P 不增");
         // 收口：关闭对端让读循环退出
@@ -1138,10 +1146,10 @@ mod tests {
         drop(a);
     }
 
-    /// **判据（1.2 负例注入，评审 r1 P1-12 整改）**：回调内 sleep 在读路径耗时上
+    /// **判据（1.2 负例注入，评审 r1 P1-12 整改）**：回调内阻塞在读路径耗时上
     /// **可观测**——「回调内阻塞判负」的等价面：生产回调若违背「只做原子操作 +
     /// 起线程」契约，读循环耗时随之增长。socketpair 是**流**语义（快写会并读合并）
-    /// ⇒ 逐包 sleep 观测不到；本用例以「writer 与 reader 逐包握手」（写一包等
+    /// ⇒ 逐包阻塞观测不到；本用例以「writer 与 reader 逐包握手」（写一包等
     /// 回调计数 +1 再写下一包）消除合并，20 包 × 10ms ⇒ ≥150ms 下界钉「回调确实
     /// 在读路径上逐次执行、无掩蔽」；上界同设防挂死。
     #[test]
@@ -1151,7 +1159,7 @@ mod tests {
         let hits = Arc::new(AtomicUsize::new(0));
         let h2 = Arc::clone(&hits);
         let cb: OnPacketDemand = Arc::new(move || {
-            std::thread::sleep(Duration::from_millis(10)); // 违约回调（负例注入）
+            yield_wait(Duration::from_millis(10)); // 违约回调（负例注入：忙等，不触发隔离门禁）
             h2.fetch_add(1, Ordering::SeqCst);
         });
         let counters = TunCounters::new();
