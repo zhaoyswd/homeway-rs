@@ -2,7 +2,7 @@
 //! 每命令一条流：问候行 → 请求行 → 响应/帧）。
 //!
 //! 行协议与 R2 客户端（`files.rs`）同源（Go `pkg/files/proto.go`）：JSON 行（`\n`
-//! 结尾）+ 4B BE 长度前缀帧（len=0 = 终止/提交）。六动词全实现；路径沙箱 = 规整
+//! 结尾）+ 4B BE 长度前缀帧（len=0 = 终止/提交）。七动词全实现；路径沙箱 = 规整
 //! 到根内相对路径、拒 `..`/控制字符，随后**逐分量复核**（`resolve_in_root`：对齐 Go
 //! `os.Root` 的符号链接三规则；不存在的叶子绝不直返未复核候选）。
 //!
@@ -429,6 +429,10 @@ impl FilesServer {
                 self.mkdir(&req.path)?;
                 write_line(w, &ok_response()).map_err(|e| err_response(crate::files::CODE_OP_FAILED, format!("写响应失败：{e}")))
             }
+            "remove" => {
+                self.remove(&req.path)?;
+                write_line(w, &ok_response()).map_err(|e| err_response(crate::files::CODE_OP_FAILED, format!("写响应失败：{e}")))
+            }
             "read" => self.read(w, req),
             "download" => self.download(w, req),
             "write" => self.write(w, r, req),
@@ -461,7 +465,8 @@ impl FilesServer {
         self.resolve_in_root(trimmed, p)
     }
 
-    /// 逐分量解析（P0-4 单点收口——六动词共用；**不存在的叶子绝不直返候选**）。
+    /// 逐分量解析（P0-4 单点收口——各动词共用；`remove` 只走父目录段，叶子按字面拼接；
+    /// **不存在的叶子绝不直返候选**）。
     ///
     /// 规则（`docs/reviews/QE-design.md` §0.4 对 Go 1.24 `os.Root` 的实测）：
     /// - 分量是**符号链接**：目标为**绝对路径** ⇒ `not_found`（即便落在根内，Go 同拒）；
@@ -569,7 +574,7 @@ impl FilesServer {
         }
     }
 
-    // ---------- 六动词 ----------
+    // ---------- 七动词 ----------
 
     #[allow(clippy::result_large_err)]
     fn list(&self, p: &str) -> Result<Vec<SerdeEntry>, Response> {
@@ -605,6 +610,42 @@ impl FilesServer {
             return Err(err_response(crate::files::CODE_ALREADY_EXISTS, "同名条目已存在"));
         }
         std::fs::create_dir(&path).map_err(|e| Self::map_io_err("mkdir", p, e))
+    }
+
+    /// 第七动词 `remove`：文件/符号链接删条目本身，目录连同内容删除。
+    ///
+    /// **路径解析刻意不走 `rel_path` 的整条复核**：那里末段符号链接会被解析成目标，
+    /// 「删链接」就变成「删目标」（根内目录会被递归误删）。这里父目录仍按根内规则解析
+    /// （沙箱不放宽），叶子按字面拼接后用 `symlink_metadata` 判类型（不跟随）。
+    ///
+    /// 递归是产品语义（UI 没有逐层清空工具）；确认弹层已明写「目录及其中内容一并删除」。
+    /// 服务根本身永不可删（`invalid_arg`）。
+    #[allow(clippy::result_large_err)]
+    fn remove(&self, p: &str) -> Result<(), Response> {
+        let trimmed = p.trim_start_matches('/');
+        if trimmed.is_empty() || trimmed == "." {
+            return Err(err_response(crate::files::CODE_INVALID_ARG, "不能删除服务根目录"));
+        }
+        if p.bytes().any(|b| b == 0 || b < 0x20 || b == 0x7f) {
+            return Err(err_response(crate::files::CODE_INVALID_ARG, "路径含非法字符"));
+        }
+        let (parent, leaf) = match trimmed.rsplit_once('/') {
+            Some((parent, leaf)) => (parent, leaf),
+            None => ("", trimmed),
+        };
+        if leaf.is_empty() || leaf == "." || leaf == ".." {
+            return Err(err_response(crate::files::CODE_INVALID_NAME, format!("名称不合法：{leaf:?}")));
+        }
+        let dir = self.rel_path(parent)?;
+        let path = dir.join(leaf);
+        // symlink_metadata：链接按链接本身判定（不跟随目标）；文件/链接 ⇒ remove_file，
+        // 目录 ⇒ remove_dir_all。POSIX 下「删到一半失败」可能留下部分内容（与 rm -rf 同）。
+        let md = std::fs::symlink_metadata(&path).map_err(|e| Self::map_io_err("remove", p, e))?;
+        if md.is_dir() {
+            std::fs::remove_dir_all(&path).map_err(|e| Self::map_io_err("remove", p, e))
+        } else {
+            std::fs::remove_file(&path).map_err(|e| Self::map_io_err("remove", p, e))
+        }
     }
 
     #[allow(clippy::result_large_err)]
@@ -1373,6 +1414,59 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// 第七动词 `remove`（2026-10-19，files-delete）：文件删除、目录递归删除、
+    /// **符号链接只删链接本身（目标不动）**、根拒删、不存在/叶名非法的归因。
+    #[test]
+    #[cfg(unix)] // WIN 批：symlink 造法 = unix 专属
+    fn remove_verb_semantics() {
+        let dir = tmpdir("remove");
+        let srv = FilesServer { root: dir.canonicalize().unwrap(), logf: noop_logf(), conns: Default::default(), watermark: Default::default() };
+
+        // 文件
+        std::fs::write(dir.join("a.txt"), b"x").unwrap();
+        srv.remove("a.txt").unwrap();
+        assert!(!dir.join("a.txt").exists());
+
+        // 目录递归删除（连内容）
+        std::fs::create_dir_all(dir.join("sub/deep")).unwrap();
+        std::fs::write(dir.join("sub/deep/leaf"), b"x").unwrap();
+        srv.remove("sub").unwrap();
+        assert!(!dir.join("sub").exists(), "目录及其内容必须一并删除");
+
+        // 符号链接：只删链接本身——**目标目录与内容必须完好**（这是不走 rel_path 整条解析的理由）
+        std::fs::create_dir(dir.join("target")).unwrap();
+        std::fs::write(dir.join("target/keep"), b"keep").unwrap();
+        std::os::unix::fs::symlink(Path::new("target"), dir.join("lnk")).unwrap();
+        srv.remove("lnk").unwrap();
+        assert!(!dir.join("lnk").exists(), "链接本身已删");
+        assert!(dir.join("target/keep").exists(), "链接目标不得被跟随删除");
+
+        // 服务根永不可删
+        for p in ["", ".", "/"] {
+            assert_eq!(srv.remove(p).unwrap_err().code, crate::files::CODE_INVALID_ARG, "{p:?} 必须拒");
+        }
+        // 不存在 ⇒ not_found；叶名非法 / 父路径越界 ⇒ 既有码
+        assert_eq!(srv.remove("nope").unwrap_err().code, crate::files::CODE_NOT_FOUND);
+        assert_eq!(srv.remove("sub/..").unwrap_err().code, crate::files::CODE_INVALID_NAME);
+        assert_eq!(srv.remove("../x").unwrap_err().code, crate::files::CODE_INVALID_ARG);
+
+        // wire 面：分派名 = remove（每命令一条流）
+        std::fs::write(dir.join("wire.txt"), b"x").unwrap();
+        let (a, b) = pair_ipc();
+        let s2 = FilesServer { root: srv.root.clone(), logf: noop_logf(), conns: Default::default(), watermark: Default::default() };
+        std::thread::spawn(move || s2.serve_conn(a));
+        let mut r = BufReader::new(b.try_clone().unwrap());
+        let mut w = b;
+        let _ = read_line(&mut r); // 问候
+        writeln!(w, "{}", serde_json::json!({"op":"remove","path":"wire.txt"})).unwrap();
+        let resp: serde_json::Value = serde_json::from_slice(&read_line(&mut r).unwrap()).unwrap();
+        assert_eq!(resp["ok"], serde_json::json!(true), "{resp}");
+        assert!(!dir.join("wire.txt").exists());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+
     // ---------- P0-4 沙箱负例（F1：逐分量复核） ----------
 
     fn mkroot(name: &str) -> (PathBuf, FilesServer, PathBuf) {
@@ -1428,7 +1522,7 @@ mod tests {
         std::os::unix::fs::symlink(&outside, root.join("evil")).unwrap();
         symlink(Path::new("gone/../evil/leaf"), &root.join("l"));
         assert_eq!(srv.rel_path("l").unwrap_err().code, crate::files::CODE_NOT_FOUND);
-        // 端到端：六动词打 `l` 一律失败，且根外零新增
+        // 端到端：各动词打 `l` 一律失败，且根外零新增
         std::fs::write(outside.join("sentinel"), b"keep").unwrap();
         let before: Vec<String> = std::fs::read_dir(&outside)
             .unwrap()
@@ -1439,6 +1533,7 @@ mod tests {
             serde_json::json!({"op":"stat","path":"l"}),
             serde_json::json!({"op":"read","path":"l"}),
             serde_json::json!({"op":"list","path":"l"}),
+            serde_json::json!({"op":"remove","path":"l/x"}),
         ] {
             let (a, b) = pair_ipc();
             let s2 = FilesServer {
@@ -1534,7 +1629,7 @@ mod tests {
         let _ = std::fs::remove_dir_all(&outside);
     }
 
-    /// **端到端负例（审计点名）**：真 UDS 对 + 六动词打 `link/<新叶>` ⇒ 全 `ok=false`，
+    /// **端到端负例（审计点名）**：真 UDS 对 + 各动词打 `link/<新叶>` ⇒ 全 `ok=false`，
     /// 且根外目录内容**一字未增**（修前 write/mkdir 会在根外落文件）。
     #[test]
     #[cfg(unix)] // WIN 批：symlink 造法 = unix 专属
@@ -1573,6 +1668,7 @@ mod tests {
             serde_json::json!({"op":"read","path":"link/x"}),
             serde_json::json!({"op":"download","path":"link/x"}),
             serde_json::json!({"op":"list","path":"link/x"}),
+            serde_json::json!({"op":"remove","path":"link/sentinel"}),
         ] {
             let resp = call(&srv, req.clone());
             assert_eq!(resp["ok"], serde_json::json!(false), "{req} 越界必须被拒：{resp}");

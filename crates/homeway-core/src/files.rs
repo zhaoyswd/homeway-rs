@@ -17,7 +17,8 @@
 //!   （服务端删 .tierpart，目标不变）。
 //! ```
 //!
-//! 动词六枚：list / stat / mkdir / read / download / write。错误码词表 9 枚
+//! 动词七枚：list / stat / mkdir / read / download / write / remove（remove 为 2026-10-19
+//! 增项：文件/符号链接删条目本身、目录递归删；App 长按菜单消费）。错误码词表 9 枚
 //! （7 稳定码 + canceled + server_busy）+ stream_open（流开场失败——**唯一可安全
 //! 重放的阶段**：请求未送达）。
 

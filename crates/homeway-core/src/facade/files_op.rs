@@ -337,6 +337,7 @@ impl FilesOps {
             "list" => Self::op_list(&sess, &strv("path")),
             "stat" => Self::op_stat(&sess, &strv("path")),
             "mkdir" => Self::op_mkdir(&sess, &strv("path")),
+            "remove" => Self::op_remove(&sess, &strv("path")),
             "readText" => Self::op_read(&sess, &strv("path"), "", intv("maxBytes", DEFAULT_TEXT_MAX_BYTES)),
             "readImage" => Self::op_read(&sess, &strv("path"), "image", intv("maxBytes", DEFAULT_IMAGE_MAX_BYTES)),
             "download" => Self::op_transfer(&sess, "download", &strv("remotePath"), &strv("localPath")),
@@ -461,6 +462,15 @@ impl FilesOps {
     fn op_mkdir(sess: &Arc<FilesSession>, path: &str) -> Result<Value, FilesOpError> {
         let mut s = Self::op_stream(sess)?;
         check_ok(&s.call(&request_line("mkdir", path, 0, None, 0))?)?;
+        let mut m = Map::new();
+        m.insert("ok".into(), Value::from(true));
+        Ok(Value::Object(m))
+    }
+
+    /// 第七动词 `remove`（文件/符号链接删条目、目录递归删；出口侧实现见 `files_server`）。
+    fn op_remove(sess: &Arc<FilesSession>, path: &str) -> Result<Value, FilesOpError> {
+        let mut s = Self::op_stream(sess)?;
+        check_ok(&s.call(&request_line("remove", path, 0, None, 0))?)?;
         let mut m = Map::new();
         m.insert("ok".into(), Value::from(true));
         Ok(Value::Object(m))
