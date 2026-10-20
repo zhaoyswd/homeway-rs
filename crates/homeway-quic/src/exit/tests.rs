@@ -892,7 +892,8 @@ async fn reg4_admission_binds_and_datagram_round_trip() {
 }
 
 /// **判据（2026-10-20 serve restart 端口退让 bug）**：面收工后监听端口必须**立即可重绑**。
-/// 此前绑定表持 `Connection` → 反持 endpoint → `ExitSock` → `bridge`（自环），收工只
+/// 此前绑定表持 `Connection` → 反持 quinn socket（`Arc<dyn AsyncUdpSocket>`；endpoint
+/// 也持同一 `ExitSock`）→ `bridge`（自环），收工只
 /// `drop(conns)` 不清表 ⇒ 监听 socket 与 PubFace 的 dup 随环永不释放（生产 lsof 实见
 /// 旧端口 fd 留存 9+ 分钟），`serve restart` 的新面只能退让到 +1 端口——token 与客户端
 /// 端点缓存里的旧端口全部失联，外网手机直连候选打空、只剩中继。修法 = 收尾

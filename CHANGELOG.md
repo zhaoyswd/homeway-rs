@@ -13,7 +13,7 @@
   read_http_response<R: Read> + Reader 级单测、CL 精确读 + 截断、chunked 显式拒绝、
   DohError 分类、域名合法性显式拒绝）；panic 路径断环（catch_unwind 后 bridge.clear，
   回归测试等「出口 QUIC 面 panic」判据行再断言——8 次稳定 + 反向红）；Windows 钉卡
-  （TCP 同钉 + IPV6_UNICAST_IF 主机序修正，运行面证据见 INTEROP 登记项）；clippy
+  （TCP 同钉 + IPV6_UNICAST_IF 主机序修正；运行面证据**待补**——INTEROP 登记项已注明无真机证据）；clippy
   门禁归零（含存量两条）；`DEFAULT_STUN` 常量补 cloudflare 兜底（r1 曾漏改常量本体，
   镜像测试补 stun 断言）；pubep 停止位扩到 manual 配置路径与 print/append 前。
 

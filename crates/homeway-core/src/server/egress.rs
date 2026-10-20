@@ -375,8 +375,8 @@ pub fn pin_socket_to_iface(fd: crate::sysock::RawSock, index: u32, name: &str) -
     // - linux：**按名钉卡**（`SO_BINDTODEVICE`，index 不参与）⇒ 不按 index 拒；
     //   index 仅诊断值（`if_nametoindex` 失败不影响按名绑定）。
     // - windows：**按 index 钉卡**（`IP_UNICAST_IF` = index 网络字节序；
-    //   `IPV6_UNICAST_IF` = **主机序**——两族字节序不同，WireGuard windows 参考口径，
-    //   r3 修正）；index=0 同样按 InvalidInput 拒（值 0 = 未指定接口，同「解绑」形态）。
+    //   `IPV6_UNICAST_IF` = **主机序**——两族字节序不同，WireGuard windows 参考口径；
+    //   字节序修正在 r2#2、r3 仅订正本注释）；index=0 同样按 InvalidInput 拒。
     #[cfg(any(target_os = "macos", windows))]
     if index == 0 {
         return Err(io::Error::new(
