@@ -319,13 +319,20 @@ impl Ladder {
             return None;
         }
         if self.dormant {
-            // 风暴冷却到期 ⇒ 自行复位（见 park_storm）；其它休眠（B 门/Denied）无期限。
+            // 风暴冷却到期 ⇒ **就地立即探一次**（复核 R2：不能按在用/待机节拍判定——
+            // 熔断常发生在 `live=None`，而 driver 的门（`live ∨ storm_parked`）只在
+            // dormant 在位时放行 `due`；清位后再按节拍判 None（如待机档「距上轮探活
+            // 不足 60s」）⇒ storm_parked 已 false、门从此关闭，到期那拍没产出的恢复
+            // 步骤再无下一拍可补。立即探对两种形态都正确：有连接 ⇒ 30s 未探，该探；
+            // 无连接 ⇒ 探活不可执行，经 `on_confirm_unavailable` 收线进失败链
+            //（M/R 恢复动作因此下发）。其它休眠（B 门/Denied）无期限，照旧 None。
             let until = self.storm_until?;
             if now < until {
                 return None;
             }
             self.dormant = false;
             self.storm_until = None;
+            return Some((Round::First, self.tun.fast_budget));
         }
         if self.last_round_at.is_some() && gap > 2 * self.tun.idle_interval {
             // tun-death-gate §2.3：空窗检出（主信号 = 核内 gap 判据）——置一拍性标志，
@@ -1547,5 +1554,33 @@ mod tests {
         assert!(l.storm_parked(), "冷却期内 = 风暴休眠（driver 无 live 也要驱动 due）");
         assert!(l.due(t0 + Duration::from_secs(31), true).is_some(), "到期复位");
         assert!(!l.storm_parked(), "复位后不再是风暴休眠（B 门/禁发形态不该被周期探活唤醒）");
+    }
+
+    /// 判据（复核 2026-10-20 R2）：**无 live + 待机档**的冷却到期形态——上一轮成功
+    /// 探活在 t0、park 到 t30、t31 驱动（in_use=false，距上轮 31s < 待机 60s）。旧实现
+    /// 清位后按节拍判 None ⇒ `storm_parked` 已 false、driver 的门（live ∨ storm_parked）
+    /// 从此关闭，到期那拍没产出的恢复步骤**再无下一拍可补**；修复后清位即产出探活。
+    #[test]
+    fn storm_cooldown_expiry_emits_probe_before_idle_interval() {
+        let (logf, _log) = lines();
+        let mut l = Ladder::new(tuning());
+        let t0 = TokioInstant::now();
+        assert!(l.due(t0, true).is_some());
+        l.note_round(Round::First, t0);
+        l.on_round(Round::First, ok(), t0, SendFace::default(), &logf);
+        l.park_storm("替换风暴".to_owned(), t0 + Duration::from_secs(30), &logf);
+        assert!(l.due(t0 + Duration::from_secs(10), false).is_none(), "冷却期内不起探");
+        let step = l.due(t0 + Duration::from_secs(31), false);
+        assert!(
+            step.is_some(),
+            "冷却到期必须立即产出探活——不等 60s 待机节拍（无 live 时门已关，没有下一拍）"
+        );
+        assert!(!l.storm_parked(), "到期清位（门放行的这拍把恢复步骤给出去）");
+        // 到期那拍之后恢复正常节拍——不因清位额外自旋（无 live 空拍也是复核点名的形态）。
+        l.note_round(Round::First, t0 + Duration::from_secs(31));
+        assert!(
+            l.due(t0 + Duration::from_secs(32), false).is_none(),
+            "到期那拍之后恢复正常节拍（32s 距上轮不足 60s 不再探）"
+        );
     }
 }
