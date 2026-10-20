@@ -14,7 +14,7 @@ members = ["crates/homeway-core", "crates/homeway-cli", "crates/homeway-capi", "
 exclude = ["fuzz", "tools/quic-ab", "tools/quic-probe", "tools/m1-ab"]
 
 [workspace.package]
-version = "0.3.11"
+version = "0.3.12"
 edition = "2021"
 license = "MIT"
 
