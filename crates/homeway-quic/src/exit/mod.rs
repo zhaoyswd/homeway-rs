@@ -201,6 +201,10 @@ pub struct ExitQuicConfig {
     /// 直连端口上的非 QUIC 报文先经它判定（见 [`PlainDatagramHook`]）。协议真源留在
     /// `homeway-core`（参照点探测 / STUN 观测 / 中继注册腿帧），本岛只做「认领与否 + 原样收发」。
     pub plain_hook: Option<PlainDatagramHook>,
+    /// **实例级** panic 注入位（r3#8：全局静态 gate 在高并行测试下误伤其它 ExitQuic
+    /// 实例——16/32/64 线程实测误伤；实例位只影响传入它的那个面）。仅测试用。
+    #[cfg(test)]
+    pub(crate) panic_gate: Option<std::sync::Arc<std::sync::atomic::AtomicBool>>,
     /// **probe 黑洞**（测试缝，缺省 `false`）：`true` = probe 流收下上行但不回显——
     /// 用于在真实 driver/出口面构造「注册成功 + probe 无回显」形态（B 门可达性的
     /// 回归判据，评审 2026-10-20 P1-2）。生产恒 false。
@@ -227,6 +231,8 @@ impl ExitQuicConfig {
             cc: CcChoice::default(),
             intakes: ServiceIntakes::default(),
             plain_hook: None,
+            #[cfg(test)]
+            panic_gate: None,
             probe_blackhole: false,
         }
     }
@@ -234,6 +240,16 @@ impl ExitQuicConfig {
     /// 装配公共端点明文钩子（M5 S3a；`homeway-core` 的装配点在起本面之前挂进来）。
     pub fn with_plain_hook(mut self, hook: PlainDatagramHook) -> Self {
         self.plain_hook = Some(hook);
+        self
+    }
+
+    /// 测试缝：装实例级 panic 注入位（见字段注释；`#[cfg(test)]`）。
+    #[cfg(test)]
+    pub(crate) fn with_panic_gate(
+        mut self,
+        gate: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    ) -> Self {
+        self.panic_gate = Some(gate);
         self
     }
 
@@ -698,14 +714,6 @@ fn join_and_log(h: JoinHandle<()>, logf: &Logf) {
     }
 }
 
-/// 测试缝：主循环 panic 注入（仅 `#[cfg(test)]`；开闸后下一轮循环必 panic——
-/// `stop_rx.recv()` 唤醒即触发）。见 `stop_releases_listen_port_after_panic`。
-#[cfg(test)]
-pub(crate) mod tests_support {
-    pub(crate) static EXIT_PANIC_GATE: std::sync::atomic::AtomicBool =
-        std::sync::atomic::AtomicBool::new(false);
-}
-
 /// QUIC 面线程体：`catch_unwind` ⇒ 记行 ⇒ 置退出位（不复用该线程）。
 #[allow(clippy::too_many_arguments)] // 线程起点一次性移交全部状态（同 `driver_loop` 的口径）
 fn thread_body(
@@ -734,8 +742,9 @@ fn thread_body(
             "出口 QUIC 面 panic（{msg}）—— 判不健康，线程退出（不复用该线程）"
         ));
         // panic 路径**同样断引用环**（评审 r1#8）：正常收尾在 `run_exit` 尾部 clear，
-        // panic 展开跳过它 ⇒ 绑定表仍持 `Connection → quinn socket → ExitSock → bridge`
-        // 的环，监听 socket 不释放、下次 restart 继续端口退让——与修复目标同型洞。
+        // panic 展开跳过它 ⇒ 绑定表仍持 `Connection → quinn socket（Arc<dyn
+        // AsyncUdpSocket>；endpoint 也持同一 ExitSock）→ bridge` 的环，监听 socket
+        // 不释放、下次 restart 继续端口退让——与修复目标同型洞。
         // `lock_unpoison` 容忍持环线程 panic 留下的中毒锁。
         bridge.clear();
     }
@@ -935,8 +944,8 @@ fn run_exit(
         let mut last_sweep = Instant::now();
         loop {
             #[cfg(test)]
-            if tests_support::EXIT_PANIC_GATE.load(Ordering::Relaxed) {
-                panic!("EXIT_PANIC_GATE 注入（r1#8：panic 路径断环回归）");
+            if cfg.panic_gate.as_ref().is_some_and(|g| g.load(Ordering::Relaxed)) {
+                panic!("实例 panic_gate 注入（r1#8：panic 路径断环回归）");
             }
             tokio::select! {
                 _ = stop_rx.recv() => break,

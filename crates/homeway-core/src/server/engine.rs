@@ -2098,6 +2098,11 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
     if !manual.is_empty() {
         // 配置覆盖：推断在「不能枚举/不能观测」的环境里无解（macOS SSDP 被本地网络
         // 隐私拒即一例）——照常写文件 + 打 token。
+        if ctx.pubep_stopped.load(Ordering::SeqCst) {
+            // r3#10：写盘**前**查（修前检查在 print 前——写盘/打行/probe/last_published
+            // 都在它之前，UPnP 预算 40s 的窗口内收工仍会写旧 state）
+            return false;
+        }
         let lines: Vec<String> = manual.split(',').map(|s| s.trim().to_owned()).collect();
         write_public_endpoint_file(&endpoint_file, &lines, &ctx.logf);
         (ctx.logf)(&format!(

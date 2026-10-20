@@ -940,16 +940,11 @@ async fn stop_releases_listen_port_after_admission() {
 /// 未注入）。修法：**等「出口 QUIC 面 panic」判据行出现**再断言端口；plain 唤醒（stop
 /// 分支会直接 break，测不到 panic）。全局 gate 用串行锁围住（并行 ExitQuic 测试的
 /// 主循环顶同受 gate 影响——不串行会误伤）。
-/// 跨 await 持 std 串行锁在**本用例安全**：不重入该锁、其它用例拿不到锁只会阻塞
-/// 等待本用例收尾（无死锁面）；await 期间持锁正是「串行窗口」的本意——gate 开闸
-/// 期间并行 ExitQuic 用例的主循环顶会被误伤，必须锁到 panic 判据行出现为止。
+/// **实例级** panic gate（r3#8：全局静态 + 函数局部串行锁在高并行下无效——其它
+/// 用例不加该锁，16/32/64 线程实测被全局 gate 误伤；实例位只影响传入它的面，无需
+/// 任何串行化）。
 #[tokio::test]
-#[allow(clippy::await_holding_lock)]
 async fn stop_releases_listen_port_after_panic() {
-    static PANIC_GATE_SER: std::sync::Mutex<()> = std::sync::Mutex::new(());
-    // clippy（await 跨锁）：gate 只在「开闸 → 等 panic 判据行」窗口内需要串行——
-    // 用作用域块收窄 guard，之后的 client_conn/admit 不持锁（并行 ExitQuic 用例
-    // 只在该窗口内会撞 gate）。
     let (logf, rx) = sink();
     let sock = loopback_socket();
     let port = sock.local_addr().expect("已绑定").port();
@@ -960,28 +955,29 @@ async fn stop_releases_listen_port_after_panic() {
             let _still_alive = &dup;
             None
         });
-    let quic = ExitQuic::start(sock, ExitQuicConfig::new(seed(0x5F), 32).with_plain_hook(hook), logf)
-        .expect("端点可起");
+    let gate = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let quic = ExitQuic::start(
+        sock,
+        ExitQuicConfig::new(seed(0x5F), 32)
+            .with_plain_hook(hook)
+            .with_panic_gate(std::sync::Arc::clone(&gate)),
+        logf,
+    )
+    .expect("端点可起");
     let stub = Stub::new(SECRET);
     let (_client, conn, _sock) = client_conn(&quic).await;
     let (_send, _recv) = admit(&stub, &quic, &conn, &SECRET, &[0x36u8; 32], &[0x47u8; 8]).await;
     pump_until_line(&stub, &quic, &rx, "连接采纳 dev=47474747", WAIT).await;
 
-    // 开闸（持串行锁：并行的 ExitQuic 用例主循环顶同受 gate 影响）+ plain 唤醒。
-    // 跨 await 持 std 锁在此**安全**（见函数级 allow 注释）。
-    {
-        let _ser = PANIC_GATE_SER.lock().unwrap_or_else(|e| e.into_inner());
-        crate::exit::tests_support::EXIT_PANIC_GATE.store(true, std::sync::atomic::Ordering::Relaxed);
-        let _ = quic.plain_tx.try_send((
-            SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 9),
-            vec![0u8; 8],
-        ));
-        // **先等 panic 判据行**（不等到就断言失败——不允许「没注入也算过」）
-        pump_until_line(&stub, &quic, &rx, "出口 QUIC 面 panic", WAIT).await;
-        let _ = crate::exit::tests_support::EXIT_PANIC_GATE.swap(false, std::sync::atomic::Ordering::Relaxed);
-    }
+    // 开闸（实例位——不影响并行用例）+ plain 唤醒；**先等 panic 判据行**（不等到
+    // 就断言失败——不允许「没注入也算过」）再断言端口
+    gate.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = quic.plain_tx.try_send((
+        SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 9),
+        vec![0u8; 8],
+    ));
+    pump_until_line(&stub, &quic, &rx, "出口 QUIC 面 panic", WAIT).await;
     drop(quic);
-    let _ = crate::exit::tests_support::EXIT_PANIC_GATE.swap(false, std::sync::atomic::Ordering::Relaxed);
 
     // 轮询等 panic 线程退出 + clear 生效（端口可重绑即环已断）
     let deadline = Instant::now() + BUDGET;

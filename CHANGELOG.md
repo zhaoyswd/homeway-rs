@@ -1,6 +1,13 @@
 # Changelog
 
-## 未发布（v0.3.13 tag 后的评审整改，r1 + r2）
+## 未发布（v0.3.13 tag 后的评审整改，r1–r3）
+
+- r3 收敛批：**实例级 panic gate**（r3#8：全局静态 gate 在 16/32/64 线程下误伤并行
+  ExitQuic 用例——`ExitQuicConfig::with_panic_gate` 实例位取代全局静态与串行锁；
+  8/16/32/64 线程各多轮全绿）；DoH 读后越界检查（r3#3：单次阻塞读拖过 deadline 后
+  的完整响应一律按超时收，BlockingReader 用例钉死）；manual public_endpoint 路径的
+  停止位前移到写盘前（r3#10）；域名编码 255B 边界 off-by-one（r3#12：检查移到终止 0
+  后，256B 拒）；CL:0 按 NODATA 语义上交（r3#4）；CHANGELOG v0.3.13 段归因净化。
 
 - 评审整改 r1（ee4a42d，17 项）与 r2 收敛批：DoH 腿健壮化（真·总期限
   read_http_response<R: Read> + Reader 级单测、CL 精确读 + 截断、chunked 显式拒绝、
@@ -13,21 +20,21 @@
 ## v0.3.13（2026-10-20，tag fbfd421）
 
 - **公网观测腿抗代理污染**（外网手机落中继排障）：
-  - STUN 默认换**国内多候选**（v4 = miwifi/hitv/bilibili + cloudflare 兜底；v6 = hitv/cloudflare；
-    候选逗号分隔、惰性逐个试、首个可信应答者胜）；域名经 **DoH** 解析（新模块
-    `server/doh.rs`：`[serve].doh` 可配，默认阿里双 IP 直连 + TCP 钉物理网卡 + rustls/webpki-roots），
-    **不再走系统解析器**——fake-IP 污染环境下整条观测腿不再作废；解析与观测结果一律过污染闸
-    （单源复用 `egress::is_fake_ip`/`is_public_addr`，v4-mapped 在闸层 unmap）。
+  - STUN 默认换**国内多候选**（v4 = miwifi/hitv/bilibili；v6 = hitv/cloudflare；候选逗号
+    分隔逐个试、首个可信应答者胜）；域名经 **DoH** 解析（新模块 `server/doh.rs`：
+    `[serve].doh` 可配，默认阿里双 IP 直连 + TCP 钉物理网卡 + rustls/webpki-roots），
+    **不再走系统解析器**——fake-IP 污染环境下整条观测腿不再作废；解析与观测结果一律过
+    污染闸。*（v4 的 cloudflare 国际兜底是 tag 后整改加入 DEFAULT_STUN，见「未发布」节。）*
   - 判据行变更：`STUN：监听 socket（本地 …）在 %s 眼里是 …` 的 `%s` 从「整串候选」改为
     「胜出的单个候选」；新增 `DoH：…` 族与 `STUN：… 无应答——换下一个候选` 族诊断行。
-- **serve restart 端口退让修复**：QUIC 面收工（含 panic 路径）清绑定表，断
+- **serve restart 端口退让修复**：QUIC 面正常收工清绑定表，断
   `bindings → Connection → quinn socket(ExitSock) → bridge` 的 Arc 自环——旧监听 socket
   （与 PubFace dup）此前永不释放，restart 只能 EADDRINUSE 退让 +1，token/端点缓存里的
-  旧端口全部失联。pubep 加停止位（防跨 restart 写旧 `public_endpoint.txt`）。
-- 依赖面：+`webpki-roots`（DoH 根束）+`socket2`（钉卡 TCP；均为既有传递依赖或纯数据，
-  `libclientcore.so` 实测与上版一致（v0.3.12 = 3,081,184 B；r1 整改后重建 = 3,081,312 B，
-  差 128 B 为 doh 模段本身）——server 面被链接期裁掉，不进手机核；测量 = tier
-  `tools/core/build-core.sh` 产物 `core/libs/arm64-v8a/libclientcore.so`）。
+  旧端口全部失联。*（panic 路径 clear 与 pubep 停止位是 tag 后整改，见「未发布」节。）*
+- 依赖面：+`webpki-roots`（DoH 根束）+`socket2`（钉卡 TCP；均为既有传递依赖或纯数据）。
+  `libclientcore.so` 与上版同量级（server 面被链接期裁掉，不进手机核；tag 时点
+  3,081,184 B，r1 后重建 3,081,312 B——差量未细分归因；测量 = tier
+  `tools/core/build-core.sh` 产物 `core/libs/arm64-v8a/libclientcore.so`，release）。
 
 ## v0.3.12（2026-10-20）
 

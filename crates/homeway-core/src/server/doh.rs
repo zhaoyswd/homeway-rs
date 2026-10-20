@@ -255,6 +255,11 @@ impl DohResolver {
             .map_err(|e| DohError::Tls(e.to_string()))?;
 
         let body = read_http_response(&mut stream, deadline)?;
+        if body.is_empty() {
+            // CL:0（或无记录）：按 NODATA 语义交给上层（「无 A/AAAA 记录」分支）——
+            // 不进 parse_answers 的「短包」拒绝（r3#4：修前 CL:0 被报成 wire 短包）
+            return Ok(Vec::new());
+        }
         parse_answers(&body).map_err(DohError::Wire)
     }
 
@@ -309,6 +314,11 @@ fn read_http_response<R: Read>(r: &mut R, deadline: std::time::Instant) -> Resul
         match r.read(&mut buf) {
             Ok(0) => return Err(DohError::Http("响应头不完整（EOF 先于头部结束）".into())),
             Ok(n) => {
+                // r3#3：读**后**也查——单次阻塞读可拖过 deadline（socket 超时只作单次
+                // 上界），拖过后拿到的数据一律按超时收（不允许 deadline 后返回成功）
+                if std::time::Instant::now() >= deadline {
+                    return Err(expired());
+                }
                 raw.extend_from_slice(&buf[..n]);
                 if raw.len() > 64 * 1024 {
                     return Err(DohError::Http("响应超限".into()));
@@ -336,11 +346,19 @@ fn read_http_response<R: Read>(r: &mut R, deadline: std::time::Instant) -> Resul
         }
         match r.read(&mut buf) {
             Ok(0) => return Err(DohError::Http("响应体不完整（EOF 先于 Content-Length）".into())),
-            Ok(n) => body.extend_from_slice(&buf[..n]),
+            Ok(n) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err(expired()); // 同头读：拖过 deadline 的数据不作数
+                }
+                body.extend_from_slice(&buf[..n]);
+            }
             Err(e) => return Err(DohError::Http(e.to_string())),
         }
     }
     body.truncate(want); // CL 之外的多发字节一律截掉（r2#4）
+    if std::time::Instant::now() >= deadline {
+        return Err(expired()); // 返回 Ok 前的最终检查（r3#3）
+    }
     Ok(body)
 }
 
@@ -395,11 +413,12 @@ fn build_query(name: &str, qtype: u16) -> Result<Vec<u8>, String> {
         m.push(label.len() as u8);
         m.extend_from_slice(label.as_bytes());
     }
-    // RFC 1035：编码 qname（labels + 首长字节 + 终止 0）≤ 255B
+    m.push(0);
+    // RFC 1035：编码 qname（首长字节 + labels + 终止 0）全长 ≤ 255B——检查在 push(0)
+    // **之后**（r3#12：修前在终止 0 前判，允许 256B 编码）
     if m.len() - 12 > 255 {
         return Err(format!("{name}: 域名编码超 255B"));
     }
-    m.push(0);
     m.extend_from_slice(&qtype.to_be_bytes());
     m.extend_from_slice(&[0, 1]); // IN
     Ok(m)
@@ -567,10 +586,21 @@ mod tests {
         assert!(build_query("a..b", 1).is_err(), "空 label 拒绝");
         assert!(build_query(&"x".repeat(64), 1).is_err(), ">63 label 拒绝");
         assert!(build_query("a..", 1).is_err(), "双尾点 = 空 label，拒绝（不再静默剥）");
-        // RFC 上限：编码 qname 恰 255B 的合法名不误拒
-        let max_name = format!("{}.", vec!["a".repeat(61); 4].join("."));
-        assert_eq!(max_name.len(), 61 * 4 + 3 + 1);
-        assert!(build_query(&max_name, 1).is_ok(), "合法 255B 名不误拒");
+        // RFC 边界（r3#12）：labels [63,63,63,61] ⇒ 编码 (63+1)*3+(61+1)+终止0 = 255B 接受；
+        // [63,63,63,62] ⇒ 256B 拒绝
+        let exact255 = [vec!["a"; 63], vec!["a"; 63], vec!["a"; 63], vec!["a"; 61]]
+            .iter()
+            .map(|l| l.concat())
+            .collect::<Vec<_>>()
+            .join(".");
+        let q = build_query(&exact255, 1).expect("255B 编码应接受");
+        assert_eq!(q.len() - 16, 255, "编码全长（含终止 0）恰 255B（q.len 另含头 12 + qtype/class 4）");
+        let over256 = [vec!["a"; 63], vec!["a"; 63], vec!["a"; 63], vec!["a"; 62]]
+            .iter()
+            .map(|l| l.concat())
+            .collect::<Vec<_>>()
+            .join(".");
+        assert!(build_query(&over256, 1).is_err(), "256B 编码拒绝");
         assert!(build_query(&vec!["a".repeat(63); 5].join("."), 1).is_err(), "总长超限拒绝");
         assert!(build_query("stun.miwifi.com", 1).is_ok());
         assert!(build_query("stun.miwifi.com.", 28).is_ok(), "尾点剥除");
@@ -610,11 +640,31 @@ mod tests {
         assert!(read_http_response(&mut c5, far).is_err());
         let mut c6 = Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nabc".to_vec());
         assert!(read_http_response(&mut c6, far).is_err());
+        // ⑥' r3#3：阻塞读拖过 deadline 后的一次性完整响应必须拒（修前会 Ok）
+        struct BlockingThenFull(Vec<u8>, bool);
+        impl Read for BlockingThenFull {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if !self.1 {
+                    self.1 = true;
+                    std::thread::sleep(Duration::from_millis(80)); // 跨过 deadline
+                }
+                let n = self.0.len().min(buf.len());
+                buf[..n].copy_from_slice(&self.0);
+                self.0.clear();
+                Ok(n)
+            }
+        }
+        let mut b = BlockingThenFull(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcd".to_vec(),
+            false,
+        );
+        let soon = std::time::Instant::now() + Duration::from_millis(20);
+        assert!(read_http_response(&mut b, soon).is_err(), "拖过 deadline 的完整响应不得 Ok");
         // ⑥ chunked 显式拒绝；CL:0 与缺 CL 区分；非 2xx 拒
         let mut c7 = Cursor::new(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc".to_vec());
         assert!(read_http_response(&mut c7, far).is_err());
         let mut c8 = Cursor::new(b"HTTP/1.1 204\r\nContent-Length: 0\r\n\r\n".to_vec());
-        assert!(read_http_response(&mut c8, far).unwrap().is_empty(), "CL:0 = 空体（由上层按 NODATA 收）");
+        assert!(read_http_response(&mut c8, far).unwrap().is_empty(), "CL:0 = 空体（query_one 按 NODATA 语义上交，r3#4）");
         let mut c9 = Cursor::new(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nzz".to_vec());
         assert!(read_http_response(&mut c9, far).is_err(), "缺 CL 拒绝");
         let mut c10 = Cursor::new(b"HTTP/1.1 503 x\r\nContent-Length: 2\r\n\r\nno".to_vec());
