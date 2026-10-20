@@ -891,6 +891,36 @@ async fn reg4_admission_binds_and_datagram_round_trip() {
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
 
+/// **判据（2026-10-20 serve restart 端口退让 bug）**：面收工后监听端口必须**立即可重绑**。
+/// 此前绑定表持 `Connection` → 反持 endpoint → `ExitSock` → `bridge`（自环），收工只
+/// `drop(conns)` 不清表 ⇒ 监听 socket 与 PubFace 的 dup 随环永不释放（生产 lsof 实见
+/// 旧端口 fd 留存 9+ 分钟），`serve restart` 的新面只能退让到 +1 端口——token 与客户端
+/// 端点缓存里的旧端口全部失联，外网手机直连候选打空、只剩中继。修法 = 收尾
+/// `bridge.clear()` 断环；本用例在修前红（重绑 EADDRINUSE）。
+#[tokio::test]
+async fn stop_releases_listen_port_after_admission() {
+    let (logf, rx) = sink();
+    let sock = loopback_socket();
+    let port = sock.local_addr().expect("已绑定").port();
+    let quic = ExitQuic::start(sock, ExitQuicConfig::new(seed(0x5D), 32), logf).expect("端点可起");
+    let stub = Stub::new(SECRET);
+    let (_client, conn, _sock) = client_conn(&quic).await;
+    let pubkey = [0x35u8; 32];
+    let dev = [0x46u8; 8];
+    let (_send, _recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
+    pump_until_line(&stub, &quic, &rx, "连接采纳 dev=46464646", WAIT).await;
+    assert!(quic.snapshot().regs_accepted >= 1, "须有一条已绑定的连接（绑定表非空才会成环）");
+
+    assert!(quic.stop_within(Instant::now() + BUDGET), "面应能收工");
+    drop(quic);
+    let rebind = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port));
+    assert!(
+        rebind.is_ok(),
+        "收工后监听端口 {port} 必须立即可重绑（绑定表环未断 ⇒ socket 泄漏）：{:?}",
+        rebind.err()
+    );
+}
+
 /// **判据（S1-2 的 nonce 一次性/跨连接面）**：把 A 连接上的 `P4` 原文搬到 B 连接上
 /// ⇒ B 的 nonce 不同 ⇒ 出口面在**投引擎之前**就拒（`nonce 缺失/过期/已消费`）；
 /// 原连接的绑定不受影响（回程仍发往 A）。

@@ -91,11 +91,15 @@ pub struct PubFace {
     /// 公共端口 socket 的 **dup fd**（重钉用：`setsockopt` 作用于同一 socket 对象，
     /// QUIC 面侧无需知情）。轮询期无锁（一次性装配后只读）。
     pin_sock: Mutex<Option<UdpSocket>>,
+    /// 当前钉卡目标（index, name）——与 DoH 解析腿共享（`server::doh::DohResolver`
+    /// 读它钉 TCP）：装配期钉卡成功由 engine 写入，看护重钉成功在 `repin_to` 内更新，
+    /// 解析腿因此始终与数据面同卡（2026-10-20 排障：解析面是钉卡策略的漏网层）。
+    pin_iface: Arc<Mutex<Option<(u32, String)>>>,
     logf: Logf,
 }
 
 impl PubFace {
-    pub fn new(build: &str, logf: Logf) -> Self {
+    pub fn new(build: &str, logf: Logf, pin_iface: Arc<Mutex<Option<(u32, String)>>>) -> Self {
         Self {
             build: build.to_string(),
             caps: AtomicU8::new(0),
@@ -104,6 +108,7 @@ impl PubFace {
             on_leg_frame: Mutex::new(None),
             src_seen: SrcSeen::new(),
             pin_sock: Mutex::new(None),
+            pin_iface,
             logf,
         }
     }
@@ -127,10 +132,17 @@ impl PubFace {
     /// 两族都设、单栈容错）。socket 由 QUIC 面独占 ⇒ 本函数只做 `setsockopt`。
     pub fn repin_to(&self, index: u32, name: &str) -> std::io::Result<()> {
         let g = self.pin_sock.lock().expect("pin_sock 锁中毒");
-        match g.as_ref() {
+        let r = match g.as_ref() {
             Some(s) => super::egress::pin_socket_to_iface(crate::sysock::udp_raw(s), index, name),
             None => Err(std::io::Error::other("公共端口 socket 未挂（QUIC 面未起）")),
+        };
+        if r.is_ok() {
+            // 重钉成功 ⇒ 解析腿同步换卡（DoH 的 TCP 下次按新卡钉）
+            if let Ok(mut cell) = self.pin_iface.lock() {
+                *cell = Some((index, name.to_owned()));
+            }
         }
+        r
     }
 
     /// udpcap 能力位（③）。

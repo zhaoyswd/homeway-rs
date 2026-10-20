@@ -467,6 +467,19 @@ impl ExitBridge {
         debug_assert!(b.is_consistent(), "绑定表三索引不一致（unbind_conn 后）");
     }
 
+    /// 清空全部绑定（**QUIC 面收工路径专用**，2026-10-20 端口退让 bug 的修复）。
+    ///
+    /// 绑定表持 `Connection`，而 `Connection` 反持 endpoint → `ExitSock` → 回到本
+    /// bridge 的 `Arc`——**自环**：收工时若不清表，整条环（含监听 socket 的 fd 与
+    /// `PubFace` 的 dup）永不释放，`serve restart` 的新面只能端口退让（+1 漂移，
+    /// token/客户端端点缓存里的旧端口全部失联——外网手机直连候选打空的直接成因）。
+    pub(crate) fn clear(&self) {
+        let mut b = lock_unpoison(&self.bindings);
+        b.by_conn.clear();
+        b.by_pub.clear();
+        b.by_dev.clear();
+    }
+
     /// 按公钥摘绑定并**关闭连接**（设备被摘除/身份轮换的 WG 侧路径，§1.3 撤销/轮换的
     /// 最小对齐）。
     pub(crate) fn unbind_pub(&self, pubkey: &[u8; 32]) {

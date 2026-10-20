@@ -10,6 +10,7 @@ pub mod bind;
 pub mod bindwatch;
 pub mod ddnscheck;
 pub mod dnsproxy;
+pub mod doh;
 pub mod dns_stream;
 pub mod engine;
 pub mod egress;

@@ -1155,6 +1155,10 @@ fn run_exit(
         drop(handshakes);
         endpoint.close(0u32.into(), b"exit stopping");
         drop(conns);
+        // **断引用环**（2026-10-20 serve restart 端口退让 bug）：绑定表里的 `Connection`
+        // 反持 endpoint → `ExitSock` → `bridge`——不清表则监听 socket（与 PubFace 的
+        // dup）随环永不释放，后继面只能端口退让。连接已 close，摘绑定无副作用。
+        bridge.clear();
         stats.connections.store(0, Ordering::SeqCst);
         (*logf)(&format!(
             "出口收线（连接数 {was_conns} → 0，用时 {:?}）",

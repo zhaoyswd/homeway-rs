@@ -89,6 +89,13 @@ quinn = { version = "0.11", default-features = false, features = ["rustls-ring",
 #        aws-lc-sys = BoringSSL 派生 + cmake，OHOS 不可行）；tls12/logging 不需要
 #        （QUIC 恒 TLS1.3）。
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
+# webpki-roots：DoH（server/doh.rs）的根证书束（rustls 0.23 配套 0.26；纯 Rust 内置
+# Mozilla 根——不碰系统钥匙串，OHOS/交叉构建同样可用）。只为出口侧 STUN 域名解析
+# 的国内 DoH 腿（钉物理网卡 TCP，绕开被 fake-IP 污染的系统解析器）。
+webpki-roots = "0.26"
+# socket2：DoH 腿的 TCP socket 需要「钉卡 setsockopt 在 connect 之前」——std 的
+# TcpStream::connect_timeout 没有这个口子；socket2 已是 quinn 的传递依赖（零新增编译）。
+socket2 = "0.6"
 # tokio：rt = current_thread 宿主；time = 预算/节拍；sync = 命令通道；macros = select!
 #        （**只为 select!**——仍不用 #[tokio::main]，单线程不变量不受影响）。
 #        不启 rt-multi-thread（单线程是结构不变量，不启用即编译期约束）。

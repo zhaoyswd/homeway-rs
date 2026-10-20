@@ -79,9 +79,18 @@ pub struct ServeConfig {
     pub public_endpoint: String,
     pub bind_iface: BindMode,
     pub upnp: bool,
+    /// v4 STUN 候选（逗号分隔，首个解析成功且有应答者胜；空 = 不做 STUN 观测）。
+    /// 2026-10-20 起默认**国内**服务器（小米/芒果 TV/B 站——阿里云与本机实测 5–22ms，
+    /// RFC 5389 XOR-MAPPED 正确），域名经 `doh` 解析、不经系统解析器。IP 字面量直收。
     pub stun: String,
-    /// v6 路径校验 STUN（Go `STUN6`；空 = 跳过 v6 公布。默认同 Go = cloudflare）。
+    /// v6 路径校验 STUN（空 = 跳过 v6 公布）。默认国内 hitv（实测有 AAAA 且 v6 应答）
+    /// + cloudflare 兜底（国内可达 ~190ms）。候选语义同 `stun`。
     pub stun6: String,
+    /// DoH 解析候选（`host@ip[,host@ip]`；host = SNI/证书主体，ip = **钉卡 TCP 直连**
+    /// 目标——本身绕开系统解析）。公网观测腿的域名全部经它解析，不吃 fake-IP、不进
+    /// TUN。空 = 退回系统解析器（仍过污染闸，但 fake-IP 环境下等于观测腿作废）。
+    /// 默认阿里 + 腾讯 DNSPod。见 `server::doh`。
+    pub doh: String,
     pub files_root: Option<PathBuf>,
     pub verbose: bool,
     pub build: String,
@@ -113,6 +122,11 @@ pub struct ServeConfig {
     pub quic_admit: Option<crate::server::quic_admit::AdmitLimits>,
 }
 
+/// 公网观测腿缺省（2026-10-20 排障后换国内；选型实测见 tier docs/reviews 当日记录）。
+pub const DEFAULT_STUN: &str = "stun.miwifi.com:3478,stun.hitv.com:3478,stun.chat.bilibili.com:3478";
+pub const DEFAULT_STUN6: &str = "stun.hitv.com:3478,stun.cloudflare.com:3478";
+pub const DEFAULT_DOH: &str = "dns.alidns.com@223.5.5.5,dns.alidns.com@223.6.6.6";
+
 impl Default for ServeConfig {
     fn default() -> Self {
         Self {
@@ -129,8 +143,9 @@ impl Default for ServeConfig {
             public_endpoint: String::new(),
             bind_iface: BindMode::Auto,
             upnp: true,
-            stun: "stun.cloudflare.com:3478".to_owned(),
-            stun6: "stun.cloudflare.com:3478".to_owned(),
+            stun: DEFAULT_STUN.to_owned(),
+            stun6: DEFAULT_STUN6.to_owned(),
+            doh: DEFAULT_DOH.to_owned(),
             files_root: None,
             verbose: false,
             build: "homeway-rs-dev".to_owned(),
@@ -446,7 +461,9 @@ impl ServeEngine {
         // 腿面不再自有 socket（唯一公共端口 = QUIC 面的直连 socket，见 `server::bind` 模块头）；
         // 公共端点面（探测应答 / STUN 观测 / 绑卡重钉 / 注册腿帧）见 `server::pubface`。
         let mut bind = ServerBind::new(Arc::clone(&logf));
-        let pubface = Arc::new(PubFace::new(&cfg.build, Arc::clone(&logf)));
+        // 钉卡目标 cell（公共端口 socket 与 DoH 解析腿共享；见 PubFace::pin_iface）
+        let pin_iface: Arc<Mutex<Option<(u32, String)>>> = Arc::new(Mutex::new(None));
+        let pubface = Arc::new(PubFace::new(&cfg.build, Arc::clone(&logf), Arc::clone(&pin_iface)));
 
         // ---- files / speedtest / term 服务（E14/E15/E16/E17）+ 服务入口（M3 S2）----
         // 服务入口形态（设计 §2.2 方案 B′）：每个服务一枚 `ServiceIntake` = **两源**
@@ -707,7 +724,12 @@ impl ServeEngine {
                     // 运行期重钉（setsockopt 作用于同一 socket 对象）。
                     if let Some((index, name)) = resolved.as_ref().map(|i| (i.index, i.name.clone())) {
                         match egress::pin_socket_to_iface(crate::sysock::udp_raw(&sock), index, &name) {
-                            Ok(()) => pinned_pin_ok = true,
+                            Ok(()) => {
+                                pinned_pin_ok = true;
+                                if let Ok(mut cell) = pin_iface.lock() {
+                                    *cell = Some((index, name.clone()));
+                                }
+                            }
                             Err(e) => {
                                 (logf)(&format!(
                                     "⚠️ 钉网卡 {name} 失败（{e}）—— 继续以未绑卡运行：STUN 观测可能被 TUN 型代理污染，公网端点公布会因此变保守"
@@ -939,6 +961,11 @@ impl ServeEngine {
             tokf,
             log_paths,
             pinned_flag: Arc::clone(&pinned_flag),
+            resolver: super::doh::DohResolver::new(
+                super::doh::parse_list(&cfg.doh),
+                Arc::clone(&pin_iface),
+                Arc::clone(&logf),
+            ),
             ddns_checks: Arc::clone(&ddns_checks),
             ddns_resolvers: cfg.ddns_resolver.iter().copied().map(SocketAddr::V4).collect(),
             quic_ep: quic_brief.as_ref().map(|(a, _)| *a),
@@ -1861,6 +1888,9 @@ struct TokenCtx {
     /// 「socket 已钉卡/绑地址」的运行期事实（Go `pinnedNow`——钉卡失败自动降级、
     /// 看护循环重钉成功后置回；公网端点公布的保守判据读这里）。
     pinned_flag: Arc<AtomicBool>,
+    /// 公网观测腿的域名解析器（国内 DoH + 钉卡 TCP + 污染闸；见 `server::doh`）——
+    /// STUN 候选的域名**不再**经系统解析器（2026-10-20：fake-IP 污染让 STUN 全程失败）。
+    resolver: super::doh::DohResolver,
     /// DDNS 自检的滚动状态（按域名一域一份；探测线程写 / status 快照读——P0-4）。
     ddns_checks: super::ddnscheck::DdnsChecks,
     /// DDNS 自检直查解析器（F2：`serve.ddns_resolver` 装配期为 `SocketAddr` 形态）。
@@ -2070,20 +2100,28 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
 
     let mut observed: Option<SocketAddr> = None;
     if !ctx.cfg.stun.is_empty() {
-        let server = resolve_stun(&ctx.cfg.stun);
-        match server
-            .and_then(|s| stun_query_sync(cmd_tx, s, Duration::from_secs(8)))
-        {
-            None => {
-                (ctx.logf)(&format!("STUN：从监听 socket 问 {} 失败（解析失败或无应答）", ctx.cfg.stun));
+        // 候选逐个试（2026-10-20：国内多候选 + DoH 解析 + 污染闸；单候选单解析的旧
+        // 形态在 fake-IP 环境下整条腿作废）。首个有**可信**应答者胜。
+        for (label, server) in resolve_stun_candidates(ctx, &ctx.cfg.stun, false) {
+            match stun_query_sync(cmd_tx, server, STUN_PER_CANDIDATE_BUDGET) {
+                None => (ctx.logf)(&format!("STUN：{label}（{server}）无应答——换下一个候选")),
+                Some(ap) if super::doh::poisoned_ip(&ap.ip()) => {
+                    // 观测结果落污染段 = 本机代理/TUN 的投影（发包虽钉卡，中间层仍可能
+                    // 改写）——不可作公网证据，换候选
+                    (ctx.logf)(&format!("STUN：{label} 观测到 {ap} 落污染段（fake-IP/私网）——丢弃"));
+                }
+                Some(ap) => {
+                    observed = Some(ap);
+                    (ctx.logf)(&format!(
+                        "STUN：监听 socket（本地 {}）在 {label} 眼里是 {ap}",
+                        ctx.local_port
+                    ));
+                    break;
+                }
             }
-            Some(ap) => {
-                observed = Some(ap);
-                (ctx.logf)(&format!(
-                    "STUN：监听 socket（本地 {}）在 {} 眼里是 {ap}",
-                    ctx.local_port, ctx.cfg.stun
-                ));
-            }
+        }
+        if observed.is_none() {
+            (ctx.logf)(&format!("STUN：从监听 socket 问 {} 失败（解析失败或无应答）", ctx.cfg.stun));
         }
     }
 
@@ -2134,10 +2172,21 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
     if ctx.cfg.stun6.is_empty() {
         (ctx.logf)("公网端点：未配置 --stun6（需要有 AAAA 的 STUN 服务器），跳过 IPv6 公布");
     } else {
-        let v6 = match resolve_stun6(&ctx.cfg.stun6) {
-            None => None,
-            Some(server) => stun_query_sync(cmd_tx, server, Duration::from_secs(8)),
-        };
+        let cands6 = resolve_stun_candidates(ctx, &ctx.cfg.stun6, true);
+        let resolved_any6 = !cands6.is_empty();
+        let mut v6: Option<SocketAddr> = None;
+        for (label, server) in cands6 {
+            match stun_query_sync(cmd_tx, server, STUN_PER_CANDIDATE_BUDGET) {
+                None => (ctx.logf)(&format!("STUN6：{label}（{server}）无应答——换下一个候选")),
+                Some(ap) if super::doh::poisoned_ip(&ap.ip()) => {
+                    (ctx.logf)(&format!("STUN6：{label} 观测到 {ap} 落污染段——丢弃"));
+                }
+                Some(ap) => {
+                    v6 = Some(ap);
+                    break;
+                }
+            }
+        }
         match v6 {
             Some(ap6) => {
                 let ip = ap6.ip();
@@ -2162,7 +2211,7 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
             }
             None => {
                 // Go 的 %v 带具体原因——这里按断点分两类（解析失败 / 无应答）
-                let why = if resolve_stun6(&ctx.cfg.stun6).is_none() {
+                let why = if !resolved_any6 {
                     format!("{} 解析失败（无 AAAA？）", ctx.cfg.stun6)
                 } else {
                     "无应答".to_owned()
@@ -2209,21 +2258,43 @@ fn public_v4(ap: SocketAddr) -> bool {
     }
 }
 
-fn resolve_stun(server: &str) -> Option<SocketAddr> {
-    use std::net::ToSocketAddrs as _;
-    // 只取 v4（Go `network="ip4"` 同义——评审 M22：AAAA 优先的主机名会让 v4 socket
-    // 恒发送失败，把可公布的判成不可用）
-    server.to_socket_addrs().ok()?.find(|a| a.is_ipv4())
-}
+/// 单候选 STUN 查询预算（候选逐个试；旧单候选 8s ⇒ 三候选最坏 12s，仍远小于节拍）。
+const STUN_PER_CANDIDATE_BUDGET: Duration = Duration::from_secs(4);
 
-/// 解析 v6 STUN 目标（Go `LookupNetIP("ip6")` 同义）：取**非 v4-mapped 的 v6**
-/// 地址（stun.cloudflare.com 同名双栈；观测 v6 路径必须真走 v6）。
-fn resolve_stun6(server: &str) -> Option<SocketAddr> {
-    use std::net::ToSocketAddrs as _;
-    server.to_socket_addrs().ok()?.find(|a| match a {
-        SocketAddr::V6(v6) => v6.ip().to_ipv4_mapped().is_none(),
-        SocketAddr::V4(_) => false,
-    })
+/// STUN 候选解析（2026-10-20）：`spec` 逗号分隔 `host:port`；IP 字面量直收、域名经
+/// `TokenCtx::resolver`（国内 DoH + 钉卡 TCP，**不经系统解析器**——fake-IP 环境下
+/// getaddrinfo 把任何域名都答成 198.18.x，钉卡的 UDP 发包再准也发向虚拟地址）；
+/// 解析结果一律过污染闸。`want_v6` 选族：v4 候选取 A、v6 候选取非 v4-mapped 的 AAAA
+/// （观测 v6 路径必须真走 v6——评审 M22 口径不变）。返回 (候选原文, 地址) 序。
+fn resolve_stun_candidates(ctx: &TokenCtx, spec: &str, want_v6: bool) -> Vec<(String, SocketAddr)> {
+    let mut out = Vec::new();
+    for cand in spec.split(',').map(str::trim).filter(|c| !c.is_empty()) {
+        let Some((host, port)) = cand.rsplit_once(':').and_then(|(h, p)| p.parse::<u16>().ok().map(|p| (h, p)))
+        else {
+            (ctx.logf)(&format!("STUN：候选 {cand} 形态非法（应为 host:port）——跳过"));
+            continue;
+        };
+        let host = host.trim_matches(|c| c == '[' || c == ']');
+        if let Ok(ip) = host.parse::<IpAddr>() {
+            if ip.is_ipv6() == want_v6 && !super::doh::poisoned_ip(&ip) {
+                out.push((cand.to_owned(), SocketAddr::new(ip, port)));
+            }
+            continue;
+        }
+        let ip = if want_v6 {
+            ctx.resolver.resolve6(host).map(IpAddr::V6)
+        } else {
+            ctx.resolver.resolve4(host).map(IpAddr::V4)
+        };
+        match ip {
+            Some(ip) => out.push((cand.to_owned(), SocketAddr::new(ip, port))),
+            None => (ctx.logf)(&format!(
+                "STUN：{cand} 解析失败（{}）——跳过",
+                if want_v6 { "无可用 AAAA / DoH 候选已尽 / 应答落污染段" } else { "无可用 A / DoH 候选已尽 / 应答落污染段" }
+            )),
+        }
+    }
+    out
 }
 
 fn stun_query_sync(cmd_tx: &Sender<EngineCmd>, server: SocketAddr, timeout: Duration) -> Option<SocketAddr> {
@@ -2678,6 +2749,11 @@ mod tests {
             tokf: Arc::new(|_: &str| {}),
             log_paths: None,
             pinned_flag: Arc::new(AtomicBool::new(false)),
+            resolver: crate::server::doh::DohResolver::new(
+                Vec::new(),
+                Arc::new(Mutex::new(None)),
+                Arc::new(|_: &str| {}),
+            ),
             ddns_checks: Arc::new(std::collections::HashMap::new().into()),
             ddns_resolvers: Vec::new(),
             quic_ep,

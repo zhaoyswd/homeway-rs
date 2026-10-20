@@ -323,8 +323,11 @@ enabled = false
 listen = 38241
 bind_interface = "auto"
 upnp = true
-stun = "stun.cloudflare.com:3478"
-stun6 = "stun.cloudflare.com:3478"
+stun = "stun.miwifi.com:3478,stun.hitv.com:3478,stun.chat.bilibili.com:3478"
+stun6 = "stun.hitv.com:3478,stun.cloudflare.com:3478"
+# 公网观测腿的域名解析（国内 DoH，host@ip 直连+钉物理网卡——不经系统解析器；
+# 逗号分隔候选。空 = 退回系统解析器并保留污染闸）
+doh = "dns.alidns.com@223.5.5.5,dns.alidns.com@223.6.6.6"
 relay = ""
 max_peers = 32
 peer_ttl = "168h0m0s"
@@ -510,6 +513,7 @@ mod tests {
             #[serde(default)] upnp: Option<bool>,
             #[serde(default)] stun: Option<String>,
             #[serde(default)] stun6: Option<String>,
+            #[serde(default)] doh: Option<String>,
             #[serde(default)] relay: Option<String>,
             #[serde(default)] max_peers: Option<usize>,
             #[serde(default)] peer_ttl: Option<String>,
@@ -539,7 +543,11 @@ mod tests {
         let fc: FileConfig = toml::from_str(DEFAULT_CONFIG_TOML).expect("默认模板必须可解析");
         assert!(!fc.serve.enabled, "新 state 缺省不启用出口（2026-10-14：须 `serve start` 显式开）");
         assert_eq!(fc.serve.listen, Some(38241));
-        assert_eq!(fc.serve.stun6.as_deref(), Some("stun.cloudflare.com:3478"));
+        assert_eq!(fc.serve.stun6.as_deref(), Some("stun.hitv.com:3478,stun.cloudflare.com:3478"));
+        assert_eq!(
+            fc.serve.doh.as_deref(),
+            Some("dns.alidns.com@223.5.5.5,dns.alidns.com@223.6.6.6")
+        );
         assert!(!fc.relay.enabled);
         assert_eq!(fc.relay.listen.as_deref(), Some(":38341"));
     }

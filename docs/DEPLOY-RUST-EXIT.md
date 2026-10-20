@@ -45,7 +45,7 @@
   改 plist → `launchctl bootstrap`。
 - **新 state** `~/.config/homeway-rs/config.toml`：`[serve] enabled=true
   listen=41641 relay="rl133ZkG…（阿里云 Rust 中继，§2 配好后补）"`；其余走默认
-  （bind_interface=auto / upnp=true / stun=stun6=stun.cloudflare.com:3478 /
+  （bind_interface=auto / upnp=true / stun=stun.miwifi.com:3478,stun.hitv.com:3478,stun.chat.bilibili.com:3478 / stun6=stun.hitv.com:3478,stun.cloudflare.com:3478 / doh=dns.alidns.com@223.5.5.5,dns.alidns.com@223.6.6.6（2026-10-20 起国内多候选 + DoH 钉卡解析）/
   files_root=$HOME / max_peers=32 / dns_port=5300）。
 
 **启动判据**（12:40:14–12:40:22，`cache/exit.log` = `cache/events.log` 同串）：
@@ -54,7 +54,7 @@
 - `绑卡：自动挑到 en0（index=6 up addrs=[192.168.3.12/24]）` → `绑卡看护：WG socket 钉在 en0（index=6 …）`
 - `dns 代答就绪` / `files 就绪：root=/Users/zhaozhe (rw) sock=…files.sock…` / `speedtest 就绪` / `# Serving terminal sessions on …term.sock (shell=/bin/zsh …)`
 - `后端身份：标签 d07c57dd5bde1fa7 ｜公钥 8aee740b7220…`（新身份）→ **`serve 就绪：wg=:41641（配置端口…）… key=8aee740b7220…`（端口沿用 41641）**
-- **v4/v6 双公布**：`STUN：监听 socket（本地 41641）在 stun.cloudflare.com:3478 眼里是 114.242.60.128:41641` + `公网端点：IPv6 路径可用（STUN 看到 [2408:…deb7:9c81]:41641），公布 …` + `公网端点：已公布 [114.242.60.128:41641 [2408:8207:2518:2550:383e:8734:deb7:9c81]:41641]（写进 public_endpoint.txt…）`
+- **v4/v6 双公布**：`STUN：监听 socket（本地 41641）在 stun.miwifi.com:3478 眼里是 114.242.60.128:41641`（候选首个胜出者） + `公网端点：IPv6 路径可用（STUN 看到 [2408:…deb7:9c81]:41641），公布 …` + `公网端点：已公布 [114.242.60.128:41641 [2408:8207:2518:2550:383e:8734:deb7:9c81]:41641]（写进 public_endpoint.txt…）`
 - `homeway: 统一进程就绪（state=…，serve=true relay=false，…，version=v0.2.0）`
 - **单实例锁**：手动二次启动被拒（逐字）`homeway 已在运行（pid 18245，形态 unified，state=/Users/zhaozhe/.config/homeway-rs）——拒绝二次启动`
 - ⚠️ `UPnP：未取得端口映射（…M-SEARCH: No route to host (os error 65)）`——launchd×新签名二进制被 macOS 本地网络隐私静默拒（与 Go v0.14.0 迁移日事件同环境问题，tier exits.md 在册）；STUN 双公布不受影响，修复 = 用户在场系统设置授权一次。

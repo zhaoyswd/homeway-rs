@@ -53,6 +53,9 @@ pub(crate) struct FileServe {
     pub(crate) stun: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) stun6: Option<String>,
+    /// 公网观测腿的 DoH 候选（`host@ip,…`；2026-10-20：STUN 域名不再经系统解析器）。
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) doh: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) relay: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -189,6 +192,7 @@ impl FileServe {
             upnp: None,
             stun: None,
             stun6: None,
+            doh: None,
             relay: None,
             max_peers: None,
             peer_ttl: None,
@@ -486,6 +490,7 @@ struct ServeFlags {
     upnp: Option<bool>,
     stun: Option<String>,
     stun6: Option<String>,
+    doh: Option<String>,
     peer_ttl: Option<Duration>,
     max_peers: Option<usize>,
     public_endpoint: Option<String>,
@@ -508,7 +513,8 @@ fn serve_usage() {
     eprintln!("  --listen P                   端口（默认 38241）");
     eprintln!("  --bind-interface M           绑定网卡：auto | none | 网卡名 | IP（空值 = auto）");
     eprintln!("  --upnp[=bool]                UPnP 自动端口映射");
-    eprintln!("  --stun H:P / --stun6 H:P     公网地址探测服务器（空值 = 关）");
+    eprintln!("  --stun H:P[,H:P] / --stun6 … 公网地址探测服务器（逗号分隔候选；空值 = 关；默认国内）");
+    eprintln!("  --doh host@ip[,host@ip]      探测腿域名解析用的 DoH（钉物理网卡直连；空值 = 系统解析器）");
     eprintln!("  --relay rl1…|ip:port         中继凭证，直连不通时经它中转（空值 = 不用）");
     eprintln!("  --public-endpoint ip:port,…  手工指定公网端点");
     eprintln!("  --dns-port P / --files-root DIR / --ddns 域名 / --peer-ttl 168h / --max-peers N / --verbose");
@@ -571,6 +577,9 @@ fn parse_serve_flags(args: &[String]) -> Result<ServeFlags, CliErr> {
                 // `bin/homeway-go serve --stun=` 正常起服）。缺值仍 fail-fast。
                 f.stun = Some(cli_flags::take_value_empty_ok_or_exit("stun", inline, next));
                 take_next(&mut adv);
+            }
+            "doh" => {
+                f.doh = Some(cli_flags::take_value_empty_ok_or_exit("doh", inline, next));
             }
             "stun6" => {
                 f.stun6 = Some(cli_flags::take_value_empty_ok_or_exit("stun6", inline, next));
@@ -679,6 +688,9 @@ pub(crate) fn serve_config_of(fc: &FileConfig, state_dir: &Path) -> Result<Serve
     }
     if let Some(v) = &fc.serve.stun6 {
         cfg.stun6 = v.clone(); // 空串 = 显式关 v6 校验（config 显式写 "" 才覆盖默认）
+    }
+    if let Some(v) = &fc.serve.doh {
+        cfg.doh = v.clone(); // 空串 = 退回系统解析器（仍过污染闸）
     }
     if let Some(v) = fc.serve.max_peers {
         cfg.max_devices = v;
@@ -797,6 +809,9 @@ pub(crate) fn assemble_result(args: &[String]) -> Result<ServeConfig, CliErr> {
     }
     if let Some(v) = f.stun6 {
         cfg.stun6 = v; // --stun6 '' = 关 v6 校验（Go flag 空串同义）
+    }
+    if let Some(v) = f.doh {
+        cfg.doh = v; // --doh '' = 退回系统解析器（仍过污染闸）
     }
     if let Some(v) = f.peer_ttl {
         cfg.peer_ttl = v;
