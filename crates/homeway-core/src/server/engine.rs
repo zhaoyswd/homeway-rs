@@ -123,7 +123,7 @@ pub struct ServeConfig {
 }
 
 /// 公网观测腿缺省（2026-10-20 排障后换国内；选型实测见 tier docs/reviews 当日记录）。
-pub const DEFAULT_STUN: &str = "stun.miwifi.com:3478,stun.hitv.com:3478,stun.chat.bilibili.com:3478";
+pub const DEFAULT_STUN: &str = "stun.miwifi.com:3478,stun.hitv.com:3478,stun.chat.bilibili.com:3478,stun.cloudflare.com:3478";
 pub const DEFAULT_STUN6: &str = "stun.hitv.com:3478,stun.cloudflare.com:3478";
 pub const DEFAULT_DOH: &str = "dns.alidns.com@223.5.5.5,dns.alidns.com@223.6.6.6";
 
@@ -2084,6 +2084,11 @@ fn normalize_public_endpoint(cfg: &mut ServeConfig, logf: &Logf) {
 }
 
 fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> bool {
+    // r2#10：入口先查停止位——引擎收工/替换后旧 pubep 线程不得再写任何面（manual
+    // 配置路径与推断路径共用本入口）。
+    if ctx.pubep_stopped.load(Ordering::SeqCst) {
+        return false;
+    }
     // 公共端口（= QUIC 端口；M5 后 WG 端口不存在）的公网映射（M1 S1c / S1-7：**E-q4 行
     // 成/败都打**，且 `--upnp=false` 形态也打失败行 = fail-visible）。放在本轮最前：
     // 既要给 token 填 `quic_pub`，也要把外口喂给下文的证据合流。
@@ -2104,6 +2109,9 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
             let mut inner = ctx.inner.lock().expect("token 状态锁中毒");
             inner.last_published = lines.clone();
         }
+        if ctx.pubep_stopped.load(Ordering::SeqCst) {
+            return false; // 写盘与打 token 之间被收工：不再发布/打印
+        }
         print_client_token(ctx, &lines);
         return true;
     }
@@ -2118,8 +2126,7 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
     if !ctx.cfg.stun.is_empty() {
         // 候选**惰性**逐个试（r1#3：解析一个 → 查一个 → 成功即停——预解析全部候选在
         // DoH 慢/黑洞时会把整轮拖到几十秒；2026-10-20：国内多候选 + DoH 解析 + 污染闸）。
-        let mut stun = StunCandidates::new(ctx, &ctx.cfg.stun, false);
-        while let Some((label, server)) = stun.next() {
+        for (label, server) in StunCandidates::new(ctx, &ctx.cfg.stun, false) {
             match stun_query_sync(cmd_tx, server, STUN_PER_CANDIDATE_BUDGET) {
                 None => (ctx.logf)(&format!("STUN：{label}（{server}）无应答——换下一个候选")),
                 Some(ap) if super::doh::poisoned_ip(&ap.ip()) => {
@@ -2189,10 +2196,9 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
     if ctx.cfg.stun6.is_empty() {
         (ctx.logf)("公网端点：未配置 --stun6（需要有 AAAA 的 STUN 服务器），跳过 IPv6 公布");
     } else {
-        let mut stun6 = StunCandidates::new(ctx, &ctx.cfg.stun6, true);
         let mut resolved_any6 = false;
         let mut v6: Option<SocketAddr> = None;
-        while let Some((label, server)) = stun6.next() {
+        for (label, server) in StunCandidates::new(ctx, &ctx.cfg.stun6, true) {
             resolved_any6 = true;
             match stun_query_sync(cmd_tx, server, STUN_PER_CANDIDATE_BUDGET) {
                 None => (ctx.logf)(&format!("STUN6：{label}（{server}）无应答——换下一个候选")),
@@ -2250,6 +2256,9 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
     {
         let mut inner = ctx.inner.lock().expect("token 状态锁中毒");
         inner.last_published = lines.clone();
+    }
+    if ctx.pubep_stopped.load(Ordering::SeqCst) {
+        return false; // r2#10：公布与打 token 之间的窗口
     }
     print_client_token(ctx, &lines);
     true

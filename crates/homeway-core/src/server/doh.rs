@@ -131,7 +131,7 @@ impl DohResolver {
             ));
             if servers.is_empty() {
                 (*logf)(
-                    "⚠️ DoH：全部候选无效——退回系统解析器（fake-IP 环境下公网观测腿将作废），请检查 serve.doh 配置",
+                    "⚠️ DoH：全部候选无效——例外回退系统解析器（仍过污染闸；至少一个候选有效时为 fail-closed 不回退），请检查 serve.doh 配置",
                 );
             }
         }
@@ -221,13 +221,25 @@ impl DohResolver {
     fn query_one(&self, srv: &DohServer, q: &[u8]) -> Result<Vec<IpAddr>, DohError> {
         let deadline = std::time::Instant::now() + QUERY_BUDGET;
         let tcp = self.connect_pinned(srv.addr, deadline)?;
+        // r2#3/r2#15：socket 超时 = **单次** syscall 的上界（connect 后按剩余量设一次）；
+        // **总期限**由 read_http_response 内的 Instant 检查承载（慢速滴流不能续命）。
+        let remain = |tcp: &TcpStream| {
+            let r = deadline.saturating_duration_since(std::time::Instant::now());
+            if r.is_zero() {
+                Err(DohError::Http("总预算耗尽".into()))
+            } else {
+                tcp.set_read_timeout(Some(r))
+                    .and_then(|()| tcp.set_write_timeout(Some(r)))
+                    .map_err(|e| DohError::Http(e.to_string()))
+            }
+        };
         let tls = ClientConnection::new(
             Arc::new(doh_client_config()),
             ServerName::try_from(srv.host.clone()).map_err(|e| DohError::Tls(e.to_string()))?,
         )
         .map_err(|e| DohError::Tls(e.to_string()))?;
-        // TLS 握手与 HTTP 读写都发生在同一 TcpStream 上——其读写超时已按剩余预算
-        // 设置（connect 之后一次性设好；deadline 由 connect 分掉的部分自然收紧）。
+        // TLS 握手与请求写发生在同一 TcpStream 上——单次 syscall 上界由 connect 后
+        // 设置的 socket 超时承载（见 remain 注释）。
         let mut stream = StreamOwned::new(tls, tcp);
 
         let req = format!(
@@ -235,56 +247,14 @@ impl DohResolver {
             srv.host,
             q.len()
         );
+        remain(stream.get_ref())?;
         stream
             .write_all(req.as_bytes())
             .and_then(|()| stream.write_all(q))
             .and_then(|()| stream.flush())
             .map_err(|e| DohError::Tls(e.to_string()))?;
 
-        // r1#4：先读满响应头（\r\n\r\n），再按 Content-Length **精确**读体——旧实现
-        // 读到 EOF 才解析，keep-alive 服务端（合法）会白等一个读超时；chunked 明确拒绝
-        // （国内主流 DoH 都是 Content-Length + close，真遇到 chunked 再解不迟，先显式失败）。
-        let mut raw = Vec::with_capacity(1024);
-        let mut buf = [0u8; 4096];
-        let head_end = loop {
-            if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
-                break pos;
-            }
-            match stream.read(&mut buf) {
-                Ok(0) => return Err(DohError::Http("响应头不完整（EOF 先于头部结束）".into())),
-                Ok(n) => {
-                    raw.extend_from_slice(&buf[..n]);
-                    if raw.len() > 64 * 1024 {
-                        return Err(DohError::Http("响应超限".into()));
-                    }
-                }
-                Err(e) => return Err(DohError::Http(e.to_string())),
-            }
-        };
-        // 头部三元事实走纯函数（`http_head_facts`——单测面）；`raw[..head_end]` 已含完整头。
-        let (status, clen, chunked) =
-            http_head_facts(&raw[..head_end + 4]).ok_or(DohError::Http("响应头解析失败".into()))?;
-        if !(200..300).contains(&status) {
-            return Err(DohError::Http(format!("状态 {status} 非 2xx")));
-        }
-        if chunked {
-            return Err(DohError::Http("Transfer-Encoding: chunked 不受支持（显式失败——见上游形态）".into()));
-        }
-        let want = clen.unwrap_or(0);
-        let mut body = raw[head_end + 4..].to_vec();
-        if want > 64 * 1024 {
-            return Err(DohError::Http("Content-Length 超限".into()));
-        }
-        while body.len() < want {
-            match stream.read(&mut buf) {
-                Ok(0) => return Err(DohError::Http("响应体不完整（EOF 先于 Content-Length）".into())),
-                Ok(n) => body.extend_from_slice(&buf[..n]),
-                Err(e) => return Err(DohError::Http(e.to_string())),
-            }
-        }
-        if want == 0 {
-            return Err(DohError::Http("无 Content-Length 且非 chunked（应答形态不支持）".into()));
-        }
+        let body = read_http_response(&mut stream, deadline)?;
         parse_answers(&body).map_err(DohError::Wire)
     }
 
@@ -322,7 +292,59 @@ impl DohResolver {
     }
 }
 
-/// 响应头三元事实（状态码 / Content-Length / chunked）——`query_one` 内联解析的
+/// HTTP/1.1 应答读取（r2#15：`Read` 泛型 + 函数内 Instant 总期限——Cursor/滴流
+/// Read 均可单测；socket 超时只作单次 syscall 上界）。头读满 `\r\n\r\n` 后按
+/// Content-Length 精确读体并截断；chunked 显式拒绝；状态码按字段。
+fn read_http_response<R: Read>(r: &mut R, deadline: std::time::Instant) -> Result<Vec<u8>, DohError> {
+    let expired = || DohError::Http("总预算耗尽（慢速滴流被总期限截断）".into());
+    let mut raw = Vec::with_capacity(1024);
+    let mut buf = [0u8; 4096];
+    let head_end = loop {
+        if let Some(pos) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+            break pos;
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(expired());
+        }
+        match r.read(&mut buf) {
+            Ok(0) => return Err(DohError::Http("响应头不完整（EOF 先于头部结束）".into())),
+            Ok(n) => {
+                raw.extend_from_slice(&buf[..n]);
+                if raw.len() > 64 * 1024 {
+                    return Err(DohError::Http("响应超限".into()));
+                }
+            }
+            Err(e) => return Err(DohError::Http(e.to_string())),
+        }
+    };
+    let (status, clen, chunked) =
+        http_head_facts(&raw[..head_end + 4]).ok_or(DohError::Http("响应头解析失败".into()))?;
+    if !(200..300).contains(&status) {
+        return Err(DohError::Http(format!("状态 {status} 非 2xx")));
+    }
+    if chunked {
+        return Err(DohError::Http("Transfer-Encoding: chunked 不受支持（显式失败——见上游形态）".into()));
+    }
+    let want = clen.ok_or(DohError::Http("无 Content-Length 且非 chunked（应答形态不支持）".into()))?;
+    if want > 64 * 1024 {
+        return Err(DohError::Http("Content-Length 超限".into()));
+    }
+    let mut body = raw[head_end + 4..].to_vec();
+    while body.len() < want {
+        if std::time::Instant::now() >= deadline {
+            return Err(expired());
+        }
+        match r.read(&mut buf) {
+            Ok(0) => return Err(DohError::Http("响应体不完整（EOF 先于 Content-Length）".into())),
+            Ok(n) => body.extend_from_slice(&buf[..n]),
+            Err(e) => return Err(DohError::Http(e.to_string())),
+        }
+    }
+    body.truncate(want); // CL 之外的多发字节一律截掉（r2#4）
+    Ok(body)
+}
+
+/// 响应头三元事实（状态码 / Content-Length / chunked）——`read_http_response` 的
 /// 纯函数面（单测见 `http_head_parse_forms`）。头不完整返回 None。
 fn http_head_facts(raw: &[u8]) -> Option<(u16, Option<usize>, bool)> {
     let pos = raw.windows(4).position(|w| w == b"\r\n\r\n")?;
@@ -364,10 +386,8 @@ fn build_query(name: &str, qtype: u16) -> Result<Vec<u8>, String> {
     let mut m = Vec::with_capacity(17 + name.len());
     m.extend_from_slice(&[0x00, 0x00, 0x01, 0x00]); // id=0, RD=1（无 DNSSEC）
     m.extend_from_slice(&[0, 1, 0, 0, 0, 0, 0, 0]); // qd=1
-    let host = name.trim_end_matches('.');
-    if host.split('.').count() > 128 {
-        return Err(format!("{name}: label 层数超限"));
-    }
+    // 尾点只剥一个（r2#12：`a..` 的第二个点是空 label，须显式拒绝而非静默吃掉）
+    let host = name.strip_suffix('.').unwrap_or(name);
     for label in host.split('.') {
         if label.is_empty() || label.len() > 63 {
             return Err(format!("{name}: label 空/超 63（{label:?}）"));
@@ -375,8 +395,9 @@ fn build_query(name: &str, qtype: u16) -> Result<Vec<u8>, String> {
         m.push(label.len() as u8);
         m.extend_from_slice(label.as_bytes());
     }
-    if m.len() + 5 > 255 + 12 {
-        return Err(format!("{name}: 域名总长超限"));
+    // RFC 1035：编码 qname（labels + 首长字节 + 终止 0）≤ 255B
+    if m.len() - 12 > 255 {
+        return Err(format!("{name}: 域名编码超 255B"));
     }
     m.push(0);
     m.extend_from_slice(&qtype.to_be_bytes());
@@ -531,7 +552,7 @@ mod tests {
         let addrs6 = parse_answers(&r6).expect("应可解析 v6");
         assert_eq!(
             addrs6,
-            vec![IpAddr::V6("240e::16".parse::<Ipv6Addr>().unwrap().into())]
+            vec![IpAddr::V6("240e::16".parse::<Ipv6Addr>().unwrap())]
         );
 
         // rcode 面
@@ -545,9 +566,75 @@ mod tests {
         // r1#12：空 label / >63 label / 层数超限显式拒绝（修前 clamp 会造出错位报文）
         assert!(build_query("a..b", 1).is_err(), "空 label 拒绝");
         assert!(build_query(&"x".repeat(64), 1).is_err(), ">63 label 拒绝");
+        assert!(build_query("a..", 1).is_err(), "双尾点 = 空 label，拒绝（不再静默剥）");
+        // RFC 上限：编码 qname 恰 255B 的合法名不误拒
+        let max_name = format!("{}.", vec!["a".repeat(61); 4].join("."));
+        assert_eq!(max_name.len(), 61 * 4 + 3 + 1);
+        assert!(build_query(&max_name, 1).is_ok(), "合法 255B 名不误拒");
         assert!(build_query(&vec!["a".repeat(63); 5].join("."), 1).is_err(), "总长超限拒绝");
         assert!(build_query("stun.miwifi.com", 1).is_ok());
         assert!(build_query("stun.miwifi.com.", 28).is_ok(), "尾点剥除");
+    }
+
+    /// r2#15：read_http_response 的 Reader 级单测（无需 TLS/443——Cursor 与受控 Read）。
+    #[test]
+    fn read_http_response_reader_forms() {
+        use std::io::Cursor;
+        let far = std::time::Instant::now() + Duration::from_secs(30);
+        // ① 正常：头 + CL 精确体 + 超发字节截断
+        let mut c = Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Length: 4\r\n\r\nabcdEXTRA".to_vec());
+        assert_eq!(read_http_response(&mut c, far).unwrap(), b"abcd".to_vec());
+        // ② 无 reason phrase
+        let mut c2 = Cursor::new(b"HTTP/1.1 200\r\nContent-Length: 1\r\n\r\nx".to_vec());
+        assert_eq!(read_http_response(&mut c2, far).unwrap(), b"x".to_vec());
+        // ③ 头/体分读（一次只给 1 字节的滴流 Read——头读满 + 体读满都走多轮）
+        struct Trickle(Vec<u8>, usize);
+        impl Read for Trickle {
+            fn read(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
+                if self.1 >= self.0.len() || buf.is_empty() {
+                    return Ok(0);
+                }
+                buf[0] = self.0[self.1];
+                self.1 += 1;
+                Ok(1)
+            }
+        }
+        let mut t = Trickle(b"HTTP/1.1 200 OK\r\nContent-Length: 3\r\n\r\nabc".to_vec(), 0);
+        assert_eq!(read_http_response(&mut t, far).unwrap(), b"abc".to_vec());
+        // ④ 慢滴流 + 已过期 deadline ⇒ 总期限截断（不无限续命——r2#3 回归）
+        let mut t2 = Trickle(b"HTTP/1.1 200 OK\r\nContent-Length: 99\r\n\r\naaaa".to_vec(), 0);
+        let past = std::time::Instant::now() - Duration::from_secs(1);
+        assert!(read_http_response(&mut t2, past).is_err(), "过期 deadline 必须截断滴流");
+        // ⑤ EOF 先于头结束 / 先于体
+        let mut c5 = Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Len".to_vec());
+        assert!(read_http_response(&mut c5, far).is_err());
+        let mut c6 = Cursor::new(b"HTTP/1.1 200 OK\r\nContent-Length: 8\r\n\r\nabc".to_vec());
+        assert!(read_http_response(&mut c6, far).is_err());
+        // ⑥ chunked 显式拒绝；CL:0 与缺 CL 区分；非 2xx 拒
+        let mut c7 = Cursor::new(b"HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n3\r\nabc".to_vec());
+        assert!(read_http_response(&mut c7, far).is_err());
+        let mut c8 = Cursor::new(b"HTTP/1.1 204\r\nContent-Length: 0\r\n\r\n".to_vec());
+        assert!(read_http_response(&mut c8, far).unwrap().is_empty(), "CL:0 = 空体（由上层按 NODATA 收）");
+        let mut c9 = Cursor::new(b"HTTP/1.1 200 OK\r\nConnection: close\r\n\r\nzz".to_vec());
+        assert!(read_http_response(&mut c9, far).is_err(), "缺 CL 拒绝");
+        let mut c10 = Cursor::new(b"HTTP/1.1 503 x\r\nContent-Length: 2\r\n\r\nno".to_vec());
+        assert!(read_http_response(&mut c10, far).is_err());
+    }
+
+    /// r2#16/#13/#6：构造期坏项记行 + NODATA 文案（logf 收集断言）。
+    #[test]
+    fn from_list_and_nodata_log_lines() {
+        let (tx, rx) = std::sync::mpsc::channel::<String>();
+        let logf: crate::Logf = Arc::new(move |l: &str| {
+            let _ = tx.send(l.to_owned());
+        });
+        let _r = DohResolver::from_list(parse_list("good@1.1.1.1, 坏项"), Arc::new(Mutex::new(None)), Arc::clone(&logf));
+        let lines: Vec<String> = rx.try_iter().collect();
+        assert!(lines.iter().any(|l| l.contains("1 项无法解析") && l.contains("坏项")), "{lines:?}");
+        // 全无效 ⇒ ⚠️ 例外回退行
+        let _r2 = DohResolver::from_list(parse_list("坏A, 坏B"), Arc::new(Mutex::new(None)), logf);
+        let lines2: Vec<String> = rx.try_iter().collect();
+        assert!(lines2.iter().any(|l| l.starts_with("⚠️ DoH：全部候选无效")), "{lines2:?}");
     }
 
     /// 真网链路验证（`cargo test -p homeway-core --lib doh -- --ignored` 手动跑；

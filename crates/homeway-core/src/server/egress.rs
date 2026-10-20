@@ -355,9 +355,12 @@ pub(crate) fn iface_same(a: &IfaceInfo, b: &IfaceInfo) -> bool {
     a.index != 0 && b.index != 0 && a.index == b.index
 }
 
-/// 把 UDP socket 钉在网卡上（darwin IP_BOUND_IF+IPV6_BOUND_IF 两族 / linux
-/// SO_BINDTODEVICE / windows IP_UNICAST_IF+IPV6_UNICAST_IF 两族——ifacebind_*.go 同义
-/// 的平台分派；unix 面由本仓仅服务 macOS/linux，windows 面 = WIN 批 §D7）。
+/// 把 socket（UDP 与 TCP 均适用——DoH 解析腿的 TCP 连接同走本函数；r2#2）钉在网卡上
+/// （darwin IP_BOUND_IF+IPV6_BOUND_IF 两族 / linux SO_BINDTODEVICE / windows
+/// IP_UNICAST_IF+IPV6_UNICAST_IF 两族——ifacebind_*.go 同义的平台分派；unix 面由本仓
+/// 仅服务 macOS/linux，windows 面 = WIN 批 §D7）。**Windows 的 TCP 钉卡与 v6 字节序
+/// 修正尚无真机运行面证据（CI 只 check）**——见 docs/INTEROP-CRITERIA 判据变更记录
+/// 的登记项。
 ///
 /// darwin/windows **两族都设、各自单栈容错**（Go `pinToFD` 语义）：v4-only socket 上
 /// v6 族报错、v6-only socket 上 v4 族报错——都属预期，另一族成立即算钉上；**两族都
@@ -442,10 +445,11 @@ pub fn pin_socket_to_iface(fd: crate::sysock::RawSock, index: u32, name: &str) -
     #[cfg(windows)]
     {
         use crate::sysock::{setsockopt_u32, IP_UNICAST_IF, IPV6_UNICAST_IF, IPPROTO_IP, IPPROTO_IPV6};
-        // 值 = 接口 index 的**网络字节序**（winsock 特有口径——按 u32 重解释）。
-        let v = index.to_be();
-        let e4 = setsockopt_u32(fd, IPPROTO_IP, IP_UNICAST_IF, v).err();
-        let e6 = setsockopt_u32(fd, IPPROTO_IPV6, IPV6_UNICAST_IF, v).err();
+        // 值的字节序两族**不同**（r2#2 修正，WireGuard windows 参考口径）：
+        // IP_UNICAST_IF = 网络序；IPV6_UNICAST_IF = 主机序（修前统一 to_be，v6 会
+        // 绑到错误接口且 setsockopt 仍成功——静默错卡）。
+        let e4 = setsockopt_u32(fd, IPPROTO_IP, IP_UNICAST_IF, index.to_be()).err();
+        let e6 = setsockopt_u32(fd, IPPROTO_IPV6, IPV6_UNICAST_IF, index).err();
         match (e4, e6) {
             (Some(e4), Some(e6)) => Err(io::Error::other(format!(
                 "IP_UNICAST_IF/IPV6_UNICAST_IF: {e4} / {e6}"

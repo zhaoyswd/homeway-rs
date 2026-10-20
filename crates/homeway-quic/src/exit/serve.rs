@@ -186,12 +186,7 @@ async fn echo(mut send: SendStream, mut recv: RecvStream, conn_id: u64, ctx: &Ar
         // probe 预算内无回声 ⇒ ProbeNoResponse，且连接/准入面一切正常（B 门可达性
         // 回归的形态源，评审 2026-10-20 P1-2）。生产恒 false，不走本分支。
         let mut sink = [0u8; 4096];
-        loop {
-            match recv.read(&mut sink).await {
-                Ok(Some(_)) => continue,
-                _ => break,
-            }
-        }
+        while let Ok(Some(_)) = recv.read(&mut sink).await {}
         let _ = send.finish();
         ctx.stats
             .streams_closed

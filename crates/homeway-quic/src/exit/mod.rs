@@ -41,8 +41,6 @@ use std::net::{SocketAddr, UdpSocket};
 use crate::sysio;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
-#[cfg(test)]
-use std::sync::atomic::AtomicBool as _;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -704,8 +702,8 @@ fn join_and_log(h: JoinHandle<()>, logf: &Logf) {
 /// `stop_rx.recv()` 唤醒即触发）。见 `stop_releases_listen_port_after_panic`。
 #[cfg(test)]
 pub(crate) mod tests_support {
-    use std::sync::atomic::AtomicBool;
-    pub(crate) static EXIT_PANIC_GATE: AtomicBool = AtomicBool::new(false);
+    pub(crate) static EXIT_PANIC_GATE: std::sync::atomic::AtomicBool =
+        std::sync::atomic::AtomicBool::new(false);
 }
 
 /// QUIC 面线程体：`catch_unwind` ⇒ 记行 ⇒ 置退出位（不复用该线程）。
@@ -1175,8 +1173,9 @@ fn run_exit(
         endpoint.close(0u32.into(), b"exit stopping");
         drop(conns);
         // **断引用环**（2026-10-20 serve restart 端口退让 bug）：绑定表里的 `Connection`
-        // 反持 endpoint → `ExitSock` → `bridge`——不清表则监听 socket（与 PubFace 的
-        // dup）随环永不释放，后继面只能端口退让。连接已 close，摘绑定无副作用。
+        // 反持 quinn socket（`Arc<dyn AsyncUdpSocket>`；endpoint 也持同一 `ExitSock`）
+        // → `ExitSock` → `bridge`——不清表则监听 socket（与 PubFace 的 dup）随环永不
+        // 释放，后继面只能端口退让。连接已 close，摘绑定无副作用。
         bridge.clear();
         stats.connections.store(0, Ordering::SeqCst);
         (*logf)(&format!(

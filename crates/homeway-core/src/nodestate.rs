@@ -543,6 +543,10 @@ mod tests {
         let fc: FileConfig = toml::from_str(DEFAULT_CONFIG_TOML).expect("默认模板必须可解析");
         assert!(!fc.serve.enabled, "新 state 缺省不启用出口（2026-10-14：须 `serve start` 显式开）");
         assert_eq!(fc.serve.listen, Some(38241));
+        assert_eq!(
+            fc.serve.stun.as_deref(),
+            Some("stun.miwifi.com:3478,stun.hitv.com:3478,stun.chat.bilibili.com:3478,stun.cloudflare.com:3478")
+        );
         assert_eq!(fc.serve.stun6.as_deref(), Some("stun.hitv.com:3478,stun.cloudflare.com:3478"));
         assert_eq!(
             fc.serve.doh.as_deref(),

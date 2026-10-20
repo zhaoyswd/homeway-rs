@@ -1,6 +1,16 @@
 # Changelog
 
-## v0.3.13（2026-10-20）
+## 未发布（v0.3.13 tag 后的评审整改，r1 + r2）
+
+- 评审整改 r1（ee4a42d，17 项）与 r2 收敛批：DoH 腿健壮化（真·总期限
+  read_http_response<R: Read> + Reader 级单测、CL 精确读 + 截断、chunked 显式拒绝、
+  DohError 分类、域名合法性显式拒绝）；panic 路径断环（catch_unwind 后 bridge.clear，
+  回归测试等「出口 QUIC 面 panic」判据行再断言——8 次稳定 + 反向红）；Windows 钉卡
+  （TCP 同钉 + IPV6_UNICAST_IF 主机序修正，运行面证据见 INTEROP 登记项）；clippy
+  门禁归零（含存量两条）；`DEFAULT_STUN` 常量补 cloudflare 兜底（r1 曾漏改常量本体，
+  镜像测试补 stun 断言）；pubep 停止位扩到 manual 配置路径与 print/append 前。
+
+## v0.3.13（2026-10-20，tag fbfd421）
 
 - **公网观测腿抗代理污染**（外网手机落中继排障）：
   - STUN 默认换**国内多候选**（v4 = miwifi/hitv/bilibili + cloudflare 兜底；v6 = hitv/cloudflare；
@@ -15,7 +25,9 @@
   （与 PubFace dup）此前永不释放，restart 只能 EADDRINUSE 退让 +1，token/端点缓存里的
   旧端口全部失联。pubep 加停止位（防跨 restart 写旧 `public_endpoint.txt`）。
 - 依赖面：+`webpki-roots`（DoH 根束）+`socket2`（钉卡 TCP；均为既有传递依赖或纯数据，
-  `libclientcore.so` 实测 3,081,184 B 与上版一致——server 面被链接期裁掉，不进手机核）。
+  `libclientcore.so` 实测与上版一致（v0.3.12 = 3,081,184 B；r1 整改后重建 = 3,081,312 B，
+  差 128 B 为 doh 模段本身）——server 面被链接期裁掉，不进手机核；测量 = tier
+  `tools/core/build-core.sh` 产物 `core/libs/arm64-v8a/libclientcore.so`）。
 
 ## v0.3.12（2026-10-20）
 
