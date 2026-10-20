@@ -48,6 +48,7 @@ pub mod events;
 pub mod files_op;
 /// **宿主会话（M5 S2a）**：岛承接的「无 TUN 服务会话」——CLI host 面 / daemon 承载面 /
 /// App 服务会话三者共用的唯一会话抽象（真源 `docs/reviews/M5-design.md` §2 + §2.7）。
+pub(crate) mod endpoint_candidates;
 pub mod host_session;
 pub mod portfwd;
 pub mod probe_json;

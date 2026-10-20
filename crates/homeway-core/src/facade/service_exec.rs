@@ -447,15 +447,15 @@ fn session_thread_body(
     run_slot: Arc<Mutex<Option<Arc<ServiceRun>>>>,
     tk: crate::token::Token,
     identity_dir: Option<PathBuf>,
-    _endpoint_cache_dir: Option<PathBuf>,
+    endpoint_cache_dir: Option<PathBuf>,
     logf: Logf,
     factory: Option<SessionFactory>,
 ) {
-    // M5 C2 换源：宿主会话配置（端点缓存面随 WG 档退役——§1.6-G-1；`ServiceConfigJson`
-    // 的 `endpointCacheDir` 键面保留但不再被消费）。
+    // VPN与服务会话消费同一个端点学习目录。
     let sess_cfg = HostSessionConfig {
         token: tk,
         identity_dir,
+        endpoint_cache_dir,
         logf: Arc::clone(&logf),
     };
     // 生产 = 真 HostSession::start；测试可注入合成会话（cfg(test) 工厂）

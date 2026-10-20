@@ -206,21 +206,33 @@ fn decode_4in6(b: &[u8]) -> std::net::IpAddr {
 /// 一问一答（独立 socket；3s 缺省预算）。**旁路观测纪律**：死候选失败是预期，
 /// 调用方不得把结果计入健康判定。
 pub fn ping_ex(target: SocketAddr, pad: usize, budget: Duration) -> io::Result<PingResult> {
+    let target = crate::udpbatch::unmap_v4_in6(target);
     let local = if target.is_ipv4() { "0.0.0.0:0" } else { "[::]:0" };
     let sock = UdpSocket::bind(local)?;
-    sock.set_read_timeout(Some(budget))?;
     let mut nonce = [0u8; 8];
-    getrandom::getrandom(&mut nonce).expect("系统随机源不可用");
+    getrandom::getrandom(&mut nonce).map_err(io::Error::other)?;
     let req = encode_request(TYPE_PING, &nonce, pad);
     let start = Instant::now();
+    let deadline = start + budget;
+    if budget.is_zero() { return Err(io::ErrorKind::TimedOut.into()); }
+    sock.set_write_timeout(Some(budget))?;
     sock.send_to(&req, target)?;
     let mut buf = [0u8; 1500];
     loop {
-        let (n, _) = sock.recv_from(&mut buf)?;
+        // 无关包/慢滴不得刷新总预算；宿主学习线程依赖此绝对期限保证短命。
+        let left = deadline.saturating_duration_since(Instant::now());
+        if left.is_zero() { return Err(io::ErrorKind::TimedOut.into()); }
+        sock.set_read_timeout(Some(left))?;
+        let (n, src) = match sock.recv_from(&mut buf) {
+            Ok(packet) => packet,
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(e),
+        };
+        if Instant::now() >= deadline { return Err(io::ErrorKind::TimedOut.into()); }
+        if crate::udpbatch::unmap_v4_in6(src) != target { continue; }
         if let Ok(r) = decode_response(&buf[..n], &nonce) {
             return Ok(PingResult { rtt: start.elapsed(), ..r });
         }
-        // 非法/无关包：继续等到预算耗尽
     }
 }
 
@@ -243,11 +255,11 @@ pub fn probe_addr_acceptable(addr: &SocketAddr) -> bool {
             let is_link_local = o[0] == 169 && o[1] == 254;
             let is_fake_ip = o[0] == 198 && (18..=19).contains(&o[1]); // 198.18.0.0/15
             let is_cgnat = o[0] == 100 && (64..=127).contains(&o[1]); // 100.64.0.0/10
-            let is_multicast = v4.is_multicast();
-            !(is_private || is_loopback || is_link_local || is_fake_ip || is_cgnat || is_multicast)
+            let is_reserved = o[0] == 0 || o[0] >= 224 || v4.is_broadcast();
+            !(is_private || is_loopback || is_link_local || is_fake_ip || is_cgnat || is_reserved)
         }
         std::net::IpAddr::V6(v6) => {
-            !(v6.is_loopback() || v6.is_multicast() || (v6.segments()[0] & 0xfe00) == 0xfc00 /* ULA */
+            !(v6.is_unspecified() || v6.is_loopback() || v6.is_multicast() || (v6.segments()[0] & 0xfe00) == 0xfc00 /* ULA */
                 || (v6.segments()[0] & 0xffc0) == 0xfe80 /* link-local */)
         }
     }
@@ -361,7 +373,7 @@ mod tests {
     /// 消费卫兵：私网/回环/fake-IP/CGNAT 拒；全球单播 v4/v6 收。
     #[test]
     fn addr_acceptance_guard() {
-        let bad = ["10.0.0.1:1", "192.168.1.1:1", "127.0.0.1:1", "169.254.1.1:1", "198.18.0.1:1", "100.64.0.1:1"];
+        let bad = ["10.0.0.1:1", "192.168.1.1:1", "127.0.0.1:1", "169.254.1.1:1", "198.18.0.1:1", "100.64.0.1:1", "0.1.2.3:1", "240.1.2.3:1", "255.255.255.255:1", "0.0.0.0:1", "[::]:1"];
         for b in bad {
             assert!(!probe_addr_acceptable(&b.parse().unwrap()), "{b} 应拒");
         }
@@ -384,6 +396,10 @@ mod tests {
             "198.18.0.1",
             "100.64.0.1",
             "224.0.0.1",
+            "0.1.2.3",
+            "240.1.2.3",
+            "255.255.255.255",
+            "0.0.0.0",
             "203.0.113.9",
             "8.8.8.8",
         ] {
@@ -417,4 +433,37 @@ mod tests {
         assert!(!probe_addr_acceptable(&"[ff02::1]:1".parse().unwrap()));
         assert!(probe_addr_acceptable(&"[2001:db8::1]:41641".parse().unwrap()));
     }
+    #[test]
+    fn continuous_junk_never_extends_probe_absolute_budget() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = server.local_addr().unwrap();
+        let flood = std::thread::spawn(move || {
+            let mut buf = [0; 512]; let (_, peer) = server.recv_from(&mut buf).unwrap();
+            for _ in 0..40 { let _ = server.send_to(b"junk", peer); std::thread::sleep(Duration::from_millis(10)); }
+        });
+        let start = Instant::now();
+        assert!(ping_ex(addr, PROBE_PAD, Duration::from_millis(60)).is_err());
+        let elapsed = start.elapsed(); flood.join().unwrap();
+        assert!(elapsed < Duration::from_millis(200), "junk扩展预算至{elapsed:?}");
+    }
+
+    #[test]
+    fn probe_rejects_forged_source_and_normalizes_mapped_target() {
+        let server = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let port = server.local_addr().unwrap().port();
+        let mapped = format!("[::ffff:127.0.0.1]:{port}").parse().unwrap();
+        let responder = std::thread::spawn(move || {
+            let mut buf = [0; 512]; let (n, peer) = server.recv_from(&mut buf).unwrap();
+            let forged = respond_ex(&buf[..n], "forged", 0, &[]).unwrap();
+            let intruder = UdpSocket::bind("127.0.0.1:0").unwrap();
+            intruder.send_to(&forged, peer).unwrap();
+            std::thread::sleep(Duration::from_millis(20));
+            let real = respond_ex(&buf[..n], "real", 0, &[]).unwrap();
+            server.send_to(&real, peer).unwrap();
+        });
+        let result = ping_ex(mapped, PROBE_PAD, Duration::from_secs(1)).unwrap();
+        responder.join().unwrap();
+        assert_eq!(result.build, "real");
+    }
+
 }

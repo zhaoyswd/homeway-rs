@@ -1428,6 +1428,7 @@ impl TunExecutor for TunnelExec {
                 DIAL_MS_DEFAULT
             },
             identity_dir: (!cfg.identity_dir.is_empty()).then(|| PathBuf::from(&cfg.identity_dir)),
+            endpoint_cache_dir: (!cfg.endpoint_cache_dir.is_empty()).then(|| PathBuf::from(&cfg.endpoint_cache_dir)),
             port_forwards: cfg.port_forwards.clone(),
             // MTU 上限（**世代级读一次**；非法值在这里记行、行随本世代日志）
             mtu_cap: resolve_mtu_cap(cfg.quic_mtu_cap, &raw_logf),
@@ -1856,6 +1857,7 @@ struct GenCfg {
     /// 评审 r2-L5：此前是死字段）
     dial_ms: i64,
     identity_dir: Option<PathBuf>,
+    endpoint_cache_dir: Option<PathBuf>,
     port_forwards: Vec<PortForwardRule>,
     /// QUIC MTU 上限（M1 §12-①：`HOMEWAY_QUIC_MTU` > `tunConfig.quicMtuCap` > 1400；
     /// 有效区间 [1320,1400]，非法 ⇒ 记行 + 缺省）。
@@ -2470,37 +2472,6 @@ enum ProbeFail {
     Detail(String),
 }
 
-/// 岛侧候选装配（设计 §2.7 的**候选来源收窄**：只吃 token 的 QUIC 类端点 + 中继端点；
-/// 学习缓存/hint 在 M1 只服务 WG 面）。
-///
-/// 中继候选的 `label` = `sha256(peerId)[:8]`（信封帧 `[0xAA][label8]` 的来源；真源
-/// `legframe::relay_id`）——与出口侧腿表同源。
-fn quic_candidates(tok: &Token, logf: &Logf) -> Result<Vec<homeway_quic::Candidate>, QuicFail> {
-    let label = crate::legframe::relay_id(tok.peer_id.as_bytes());
-    let mut out: Vec<homeway_quic::Candidate> = Vec::new();
-    for e in &tok.endpoints {
-        let via = match e.kind {
-            crate::token::EndpointKind::Quic => homeway_quic::Via::Direct,
-            crate::token::EndpointKind::Relay => homeway_quic::Via::Relay { label },
-            // WG 类端点**不喂岛**（§2.1 末段「两族候选不得互相投喂」）
-            crate::token::EndpointKind::Direct => continue,
-        };
-        let Ok(addr) = e.addr.parse::<std::net::SocketAddr>() else {
-            // 域名/非法形态不进岛候选（token 签发侧给的是 IP 字面量；v4/v6 均可）。
-            (*logf)(&format!("端点跳过（非 IP 字面量/非法地址）：{}", e.addr));
-            continue;
-        };
-        if out.iter().any(|c| c.addr == addr) {
-            continue; // 同址去重（先到先得）
-        }
-        out.push(homeway_quic::Candidate { addr, via });
-    }
-    if out.is_empty() {
-        return Err(QuicFail::NoCandidate);
-    }
-    Ok(out)
-}
-
 /// 岛命令（带 reply）的有界执行（岛死 ⇒ 立刻归错，不挂死）。
 fn island_cmd<T>(
     island: &homeway_quic::Island,
@@ -2722,9 +2693,15 @@ fn start_island(
     let Some(rpk) = cfg.token.rpk else {
         return Err(QuicFail::NoRpk);
     };
-    let cands = quic_candidates(&cfg.token, logf)?;
-    // C13（设计 §8.1 改写面）：候选清单一行——单承载后「标记·学习」面退役（岛候选恒来自
-    // token，无学习缓存/hint），形态收窄为 `候选端点（%d 条）：%s`。
+    let candidates = super::endpoint_candidates::EndpointCandidates::open(
+        &cfg.token,
+        cfg.endpoint_cache_dir.as_deref(),
+    );
+    let cands = candidates.initial();
+    if cands.is_empty() {
+        return Err(QuicFail::NoCandidate);
+    }
+    // C13：候选清单包含token、有效学习与已返回的DNS结果，仍逐一真实认证。
     (logf)(&format!(
         "候选端点（{} 条）：{}",
         cands.len(),
@@ -2742,18 +2719,10 @@ fn start_island(
     );
     let mut icfg = homeway_quic::IslandConfig::new(cred);
     icfg.patrol = PATROL_INTERVAL; // 节拍/阈值常数不动（设计 §2.5）
+    icfg.candidates = Some(candidates.hooks());
     icfg.mtu_cap = cfg.mtu_cap; // §12-① 的上限旋钮（世代层已夹区间/记行）
-    // 绑定族按候选面选（2026-10-18 v6）：纯 v4 token 保持 v4 socket（与旧行为一致）；
-    // 含 v6 候选才起双栈（`None` = `[::]:0`）——v4 回环在部分平台上走 mapped 有怪癖，
-    // 不在不需要时引入。
-    icfg.bind = if cands.iter().any(|c| c.addr.is_ipv6()) {
-        None
-    } else {
-        Some(std::net::SocketAddr::from((
-            std::net::Ipv4Addr::UNSPECIFIED,
-            0,
-        )))
-    };
+    // DDNS/hint 可在恢复轮引入另一族，预备两族端点。
+    icfg.bind = None;
     // reconnect-oneshot D2：承载位装配期共握（岛侧沿写 + 读线程每包 load 同一枚）。
     icfg.carrier = Some(Arc::clone(&run.tun_shared.carrier));
     icfg.denied = Some(Arc::clone(&run.tun_shared.denied));
@@ -2771,6 +2740,7 @@ fn start_island(
         homeway_quic::Island::start(Arc::clone(logf), island_unhealthy(run), icfg)
             .map_err(|e| QuicFail::Startup(e.to_string()))?,
     );
+    candidates.bind(&island);
     run.set_island(Arc::clone(&island));
     // 「立即 SetOnUnhealthy」（S2b 接线清单）：构造期回调已是同一份，这一发是**显式面**
     // （运行期可替换、此处即刻装定）。

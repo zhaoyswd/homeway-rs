@@ -4,10 +4,8 @@
 //! 1. **注册腿与数据面同一本地端口**：注册腿的出站 socket = 公共端口（M5 起 =
 //!    QUIC 面那一个 UDP socket）的 `try_clone` fd 副本——NAT 映射一致，打洞才打得开；
 //! 2. 注册必须证明持有 peerId 私钥（X25519 挑战响应）；
-//! 3. **M5 S4**：hint 盲打面（`LegEvent::Hint`/`parse_hint_addr`/`run_punch_worker`）随
-//!    WG 面退役整体删除——hint 的消费者是 WG 打洞（`bind.set_on_hint` 删于 S3b ⇒ 本面
-//!    自那时起**零构造点** = 不可达代码）；单承载下「中继 → 直连升级」由岛的迁移/重赛跑
-//!    承接（`G8` 登记）。
+//! 3. hint 只从配置中继主端口接受，按目标限频的三个极小盲打包复用公共 socket
+//!    打开 NAT 映射；客户端随后以真正 QUIC 认证验证直连路径。
 //!
 //! 失败语义：控制面全链路「尽力而为」——连不上/断了就退避重连；一切错误只记日志，
 //! 绝不影响出口主服务。收工上界：stop 打断 tick/dial/sleep（≤ 一轮 tick + dial 5s）。
@@ -102,13 +100,26 @@ pub fn parse_relay_arg(v: &str) -> Result<RelayArg, String> {
     Ok(RelayArg { addr: crate::udpbatch::unmap_v4_in6(addr), secret: None })
 }
 
+/// 仅向公网观察地址盲打；归一与旁路探测共用卫兵，不能把中继线索变成内网扫描。
+fn hint_target(payload: &[u8]) -> Option<SocketAddr> {
+    let dst = legframe::decode_hint_payload(payload)?
+        .parse::<SocketAddr>().ok().map(crate::udpbatch::unmap_v4_in6)?;
+    let reserved = match dst.ip() {
+        std::net::IpAddr::V4(ip) => ip.octets()[0] == 0 || ip.octets()[0] >= 224,
+        std::net::IpAddr::V6(_) => false,
+    };
+    (dst.port() != 0 && !dst.ip().is_unspecified() && !reserved
+        && crate::probe::probe_addr_acceptable(&dst)).then_some(dst)
+}
+
 // ---------- UDP 注册腿（relayclient.go） ----------
 
-/// 驱动线程 → relay-leg 线程的事件（bind 钩子投递）。M5 S4 起只剩控制帧一档
-/// （hint 面已删——见模块头第 3 条）。
+/// 驱动线程 → relay-leg 线程的事件（公共面钩子投递；源在消费者侧再次校验）。
 pub enum LegEvent {
     /// 中继控制帧（type=3 载荷 + 源）。
     Frame(Vec<u8>, SocketAddr),
+    /// 仅从配置中继主端口接受的直连打洞线索。
+    Hint(Vec<u8>, SocketAddr),
     /// 收工唤醒（停止位先置位；满队列已有帧也会唤醒消费者）。
     Stop,
 }
@@ -149,11 +160,13 @@ impl Drop for RelayWorker {
 /// 返回 `Err` = 线程没起来（F7 + 评审 r1 低-1：调用方〔engine〕据此把中继端点从
 /// token 发布面摘除——否则出口不向中继注册而 token 照带中继端点，客户端拿到一条
 /// 静默失效的路径）。
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn spawn_relay_leg(
     sock: UdpSocket,
     relay: SocketAddr,
     priv_key: StaticSecret,
     secret: Option<[u8; 32]>,
+    cmd_tx: Sender<EngineCmd>,
     events: (SyncSender<LegEvent>, Receiver<LegEvent>),
     stop: Arc<AtomicBool>,
     logf: Logf,
@@ -166,7 +179,7 @@ pub(crate) fn spawn_relay_leg(
         .spawn({
             let logf = Arc::clone(&logf);
             move || {
-                run_relay_leg(sock, relay, priv_key, secret, events, &thread_stop, &logf);
+                run_relay_leg(sock, relay, priv_key, secret, cmd_tx, events, &thread_stop, &logf);
             }
         });
     match spawned {
@@ -183,11 +196,13 @@ pub(crate) fn spawn_relay_leg(
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_relay_leg(
     sock: UdpSocket,
     relay: SocketAddr,
     priv_key: StaticSecret,
     secret: Option<[u8; 32]>,
+    cmd_tx: Sender<EngineCmd>,
     events: Receiver<LegEvent>,
     stop: &AtomicBool,
     logf: &Logf,
@@ -198,6 +213,7 @@ fn run_relay_leg(
     let mut last_keepalive = Instant::now();
     let started = Instant::now();
     let mut warned = false;
+    let mut hints = std::collections::HashMap::<SocketAddr, Instant>::new();
 
     if stop.load(Ordering::SeqCst) {
         return;
@@ -213,9 +229,35 @@ fn run_relay_leg(
         // 5s 节拍（事件驱动的睡法：事件随时唤醒本线程）
         match events.recv_timeout(RETRY_EVERY) {
             Ok(LegEvent::Stop) => return,
+            Ok(LegEvent::Hint(payload, src)) => {
+                if src != relay { continue; }
+                let Some(dst) = hint_target(&payload) else { continue };
+                let now = Instant::now();
+                hints.retain(|_, at| now.duration_since(*at) < Duration::from_secs(30));
+                if hints.contains_key(&dst) || hints.len() >= 64 { continue; }
+                hints.insert(dst, now);
+                // 与注册共用公共 socket，3 个极小包只为打开 NAT 映射，不参与 QUIC 认证。
+                for _ in 0..3 { let _ = send_to_ep(&sock, b"HWPUNCH1", dst); }
+            }
             Ok(LegEvent::Frame(payload, src)) => {
                 if stop.load(Ordering::SeqCst) {
                     return;
+                }
+                if src == relay && payload.first() == Some(&rw::sub::UDP_SESSION) {
+                    if payload.len() != 43 { continue; }
+                    let cookie: [u8; 16] = payload[11..27].try_into().expect("SESSION长度已判");
+                    if let Some(sess) = rw::decode_udp_session(&payload, &legup_key_for(secret, &cookie)) {
+                        if sess.data_port >= 1024 {
+                            let remote = SocketAddr::new(relay.ip(), sess.data_port);
+                            let key = legup_key_for(secret, &sess.cookie);
+                            let _ = cmd_tx.send(EngineCmd::LegRegister {
+                                id: sess.id, remote,
+                                marker: rw::legup_payload(sess.id, &sess.cookie, &key),
+                                admission_marker: rw::admitted_payload(sess.id, &sess.cookie, &key),
+                            });
+                        }
+                    }
+                    continue;
                 }
                 handle_control(&sock, relay, &priv_key, &pub_key, secret, label, &payload, src, &mut verified, logf);
             }
@@ -293,6 +335,7 @@ fn handle_control(
         let Some((eph_pub, nonce)) = rw::decode_challenge(whole) else { return };
         // Proof 的 DH = 本端静态私钥 × 中继临时公钥（与中继侧校验式配对）
         let dh = priv_key.diffie_hellman(&PublicKey::from(eph_pub));
+        if !dh.was_contributory() { return; }
         let psk = secret.map(|s| rw::auth_mac(&s, &nonce, pub_key.as_bytes()));
         let proof = rw::encode_proof(&nonce, dh.as_bytes(), pub_key.as_bytes(), psk.as_ref());
         let pf = legframe::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &proof);
@@ -460,6 +503,7 @@ fn run_control_conn(
     };
     // ③ PROOF（v2 自报版本；token 模式带 PSK）
     let dh = priv_key.diffie_hellman(&PublicKey::from(eph_pub));
+    if !dh.was_contributory() { return (false, Some("中继挑战密钥无贡献".to_owned())); }
     let mac_psk = secret.map(|s| rw::auth_mac(&s, &nonce, pub_key.as_bytes()));
     let proof = rw::encode_proof(&nonce, dh.as_bytes(), pub_key.as_bytes(), mac_psk.as_ref());
     if let Err(e) = write_ctl(&mut conn, &proof) {
@@ -572,7 +616,8 @@ fn run_control_conn(
                                 &sess.cookie,
                                 &legup_key_for(secret, &sess.cookie),
                             );
-                            let _ = cmd_tx.send(EngineCmd::LegRegister { id: sess.id, remote, marker });
+                            let admission_marker = rw::admitted_payload(sess.id, &sess.cookie, &legup_key_for(secret, &sess.cookie));
+                            let _ = cmd_tx.send(EngineCmd::LegRegister { id: sess.id, remote, marker, admission_marker });
                             (logf)(&format!("中继控制面：会话 #{} 已拨腿 → {remote}（认证腿）", sess.id));
                         }
                         None => {
@@ -672,6 +717,7 @@ mod tests {
             relay.local_addr().unwrap(),
             StaticSecret::from([11; 32]),
             None,
+            std::sync::mpsc::channel().0,
             (events_tx, events_rx),
             Arc::new(AtomicBool::new(false)),
             Arc::new(|_| {}),
@@ -707,6 +753,7 @@ mod tests {
         });
         let worker = spawn_relay_leg(
             public, relay.local_addr().unwrap(), StaticSecret::from([12; 32]), None,
+            std::sync::mpsc::channel().0,
             (events_tx, events_rx), Arc::clone(&stop), logf,
         ).unwrap();
         // 注册腿停在启动日志处，不能消费预填事件；Drop 必须先置 stop 再无阻塞唤醒。
@@ -797,6 +844,27 @@ mod tests {
         let r = parse_relay_arg(&tok).unwrap();
         assert_eq!(r.addr, "127.0.0.1:42742".parse().unwrap());
         assert_eq!(r.secret, Some(secret));
+    }
+
+    #[test]
+    fn punch_hint_targets_reject_non_public_and_mapped_ranges() {
+        for addr in [
+            "127.0.0.1:99", "0.0.0.0:99", "0.1.2.3:99", "10.0.0.1:99",
+            "172.16.0.1:99", "192.168.1.1:99", "169.254.1.1:99",
+            "100.64.0.1:99", "100.127.255.254:99", "198.18.0.1:99", "198.19.255.254:99",
+            "224.0.0.1:99", "240.0.0.1:99", "255.255.255.255:99", "203.0.113.1:0",
+            "[::]:99", "[::1]:99", "[fc00::1]:99", "[fe80::1]:99", "[ff02::1]:99",
+            "[::ffff:127.0.0.1]:99", "[::ffff:10.0.0.1]:99", "[::ffff:100.64.0.1]:99",
+            "[::ffff:198.18.0.1]:99", "[::ffff:224.0.0.1]:99",
+        ] {
+            assert_eq!(hint_target(&legframe::hint_bytes(addr)[2..]), None, "{addr}");
+        }
+        for addr in ["203.0.113.1:99", "100.63.255.254:99", "100.128.0.1:99",
+            "198.17.255.254:99", "198.20.0.1:99", "[2001:db8::1]:99"] {
+            assert_eq!(hint_target(&legframe::hint_bytes(addr)[2..]), Some(addr.parse().unwrap()), "{addr}");
+        }
+        assert_eq!(hint_target(&legframe::hint_bytes("[::ffff:203.0.113.1]:99")[2..]),
+            Some("203.0.113.1:99".parse().unwrap()));
     }
 
 }

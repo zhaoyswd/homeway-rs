@@ -129,12 +129,12 @@ struct Pending {
 ///
 /// 帧是**定长**的（`reg4` 的长度常量）：按「读 2B 魔数 → 定长收全帧」切分；任何一帧被拒
 /// ⇒ 关连接（准入是连接级的，拒绝后不给「同连接再试」的口子）。
-pub(crate) async fn control(conn: Connection, conn_id: u64, ctx: Arc<FaceCtx>) {
+pub(crate) async fn control(conn: Connection, conn_id: u64, ctx: Arc<FaceCtx>, generation: Option<super::RelayGeneration>) {
     // 阶段 ①：准入（有界）——`ADMIT_DEADLINE` **包住「等首帧」（`accept_bi`）+ 整段状态机**。
     // 控制流两半边的存放：`admit` 拿到后填进 `streams`，超时被 drop 时只是没人取（无害）。
     let deadline = ctx.admit_deadline;
     let mut streams: Option<(quinn::SendStream, quinn::RecvStream)> = None;
-    match bounded_by(deadline, admit(&conn, conn_id, &ctx, &mut streams)).await {
+    match bounded_by(deadline, admit(&conn, conn_id, &ctx, &mut streams, generation)).await {
         Some(Admitted::Bound) => {}
         Some(Admitted::Rejected) => return, // 已拒 + 已关连接
         None => {
@@ -156,7 +156,7 @@ pub(crate) async fn control(conn: Connection, conn_id: u64, ctx: Arc<FaceCtx>) {
     // （受理赢了就把控制流吃掉 ⇒ 准入永久卡住）。`join!` 的形态同时保证：连接结束
     // （刷新循环 `read_head` 出错返回）时受理循环随 accept 失败退出，两个都收。
     let serve = super::serve::serve_streams(conn.clone(), conn_id, Arc::clone(&ctx));
-    tokio::join!(refresh_loop(&conn, conn_id, &ctx, &mut recv), serve);
+    tokio::join!(refresh_loop(&conn, conn_id, &ctx, &mut recv, generation), serve);
 }
 
 /// 准入阶段的期限包装（设计 §1.3 的 `ADMIT_DEADLINE`）：**包住「等首帧（`accept_bi`）+
@@ -184,6 +184,7 @@ async fn admit(
     conn_id: u64,
     ctx: &FaceCtx,
     streams: &mut Option<(quinn::SendStream, quinn::RecvStream)>,
+    generation: Option<super::RelayGeneration>,
 ) -> Admitted {
     // 等首帧（开控制流）也在期限内：不开流 = 本期限到点被回收（r14 F3）
     let Ok(pair) = conn.accept_bi().await else {
@@ -376,7 +377,7 @@ async fn admit(
         );
         return Admitted::Rejected;
     };
-    let Some(verdict) = ask_engine(ctx, conn, Reg4Frame::Proof(proof), exporter).await else {
+    let Some(verdict) = ask_engine(ctx, conn, Reg4Frame::Proof(proof), exporter, generation).await else {
         return Admitted::Rejected; // 引擎侧未回执（收工）：连接留给收工链
     };
     match verdict {
@@ -436,7 +437,7 @@ fn note_proof_fail(ctx: &FaceCtx, dev: &[u8; 8]) {
 /// **前置两道（零设备表查询）**：①连接已在本连接号上绑定 ②帧内 `pub/devTag` == 绑定。
 /// 第三道「表内仍在册」（设计 §1.4 步骤 6 ② / r14 F25）需要设备表 ⇒ 在**引擎裁决**里判
 /// （`admit_reg4` 的 `Refresh` 分支，MAC 试秘之前），本条只负责把拒绝的 `why` 打出来 + 关连接。
-async fn refresh_loop(conn: &Connection, conn_id: u64, ctx: &FaceCtx, recv: &mut quinn::RecvStream) {
+async fn refresh_loop(conn: &Connection, conn_id: u64, ctx: &FaceCtx, recv: &mut quinn::RecvStream, generation: Option<super::RelayGeneration>) {
     let mut buf = [0u8; reg4::REFRESH_LEN];
     loop {
         let Some((hbytes, head)) = read_head(recv).await else {
@@ -506,7 +507,7 @@ async fn refresh_loop(conn: &Connection, conn_id: u64, ctx: &FaceCtx, recv: &mut
                     );
                     return;
                 };
-                let Some(verdict) = ask_engine(ctx, conn, Reg4Frame::Refresh(frame), exporter).await
+                let Some(verdict) = ask_engine(ctx, conn, Reg4Frame::Refresh(frame), exporter, generation).await
                 else {
                     return; // 引擎未回执（收工）
                 };
@@ -584,11 +585,12 @@ async fn ask_engine(
     conn: &Connection,
     frame: Reg4Frame,
     exporter: [u8; reg4::EXPORTER_LEN],
+    generation: Option<super::RelayGeneration>,
 ) -> Option<Reg4Verdict> {
     let (reply_tx, reply_rx) = oneshot::channel();
     if !ctx
         .bridge
-        .push_inbound(ExitInbound::Reg(Reg4Request::new(frame, exporter, reply_tx)))
+        .push_inbound(ExitInbound::Reg(Reg4Request::new(frame, exporter, reply_tx).with_origin(conn.remote_address(), generation)))
     {
         ctx.bridge
             .note_drop(DropKind::Unregistered, "准入请求（入境队列满 8192 条）");

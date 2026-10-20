@@ -1,6 +1,7 @@
-439e130c8d046e036aba0c9d921995f6bae0c5741380140df6c1ac6ba1d3755e  ./MANIFEST.md
+cee2dccb0cc63f2ef0f82b891e112f4e6b631e3c1d0bc32ab9ea031e547c7036  ./MANIFEST.md
 664e1bacccf0fc0ce05655e53c1efac0f2e74492584121b354b3f20b395ab54c  ./control-cp-v1/decode_check.py
 d1acf3b973ff9e89a5a85922dfee54f587b9c2c845705ae25d44f1e3753817e3  ./control-cp-v1/frames.jsonl
+268df555ac19b37233ba00383a792f9cfe4ebcd343bcedc4b653f28e932921b9  ./relay-admission.json
 6ec8e50a7926bec06b28033e4385b192d31f4f954af47e9d6a827c97b87278fc  ./surface-golden/manifest.tsv
 4279fc1c9c94577963b1e8648bf84dccb67731b24b1cae9b912b99489c48fd46  ./surface-golden/session-cjk-diff.bin
 e6af9617a25ca866f71ea5602752f23a59cd1f749b26438b51a61938a5f43bda  ./surface-golden/session-cjk.bin
@@ -11,7 +12,6 @@ ddc4c098dacd159273cdcdac86bc40c0a75bd9fefb1000a5325dee4cdd2c6745  ./surface-gold
 3a1b9938073bab46044e0299757413a54d882416d2f59753fb4b9d67fc334510  ./surface-golden/session-styles-diff.bin
 e2378260132a886f510aca9d6902246775edf2ba5e351294d60cbbb727c029ad  ./surface-golden/session-styles.bin
 4a50078f74dd98fb159c6ac537b3254c7b3ee927c6e7010e4593a79c8f964f3b  ./surface-golden/surface_input_cases.tsv
-558cc64a0fdc23dde0f8b7c01a306e904e3631e96d8e4cb7691cd1bc947ba662  ./term/frames.v1.jsonl
 0ca1ff83a06dac22167f05f3ee43443d2c4c3ac2f5fe8ecb071fe5c52d4a31f0  ./term-manifest/codex-startup.txt
 7199a7e94161b4f0e5aa4e1469b29605637778617c85a468947c8b1c15fc61bf  ./term-manifest/opencode-startup.txt
 adc08927d3d44d1348c2ebc1a7a93515542814b4052fc4ae0536e2ffbabca108  ./term-manifests/README.md
@@ -41,6 +41,7 @@ b27aa456af228e8a4ceac74f0dd431c33b21473b69314fc672a7fba474e2a7fe  ./term-manifes
 5a60ceb2cfaafc566efd595f2835aa772159503364c692e3e179bb9a7e3d6ff8  ./term-vt/session-cjk.bin
 688c69bafbbfb4eba14f46da4ef8c22fbc93f77318e95b4ce5449723c32a59b3  ./term-vt/session-git-log.bin
 c60ffb2e49a6cd09ca565e0de14817ad963801975fb9ca603c51b640fb12d07e  ./term-vt/session-hexdump.bin
+558cc64a0fdc23dde0f8b7c01a306e904e3631e96d8e4cb7691cd1bc947ba662  ./term/frames.v1.jsonl
 2284c25083c2d23bc2f6fa17d33718e9439643577c39b928472cde833bb6bed2  ./vectors/files_frames.json
 0e65b56d3c92672456d74bd9e761c420b11e5e896b3f2c4df43e16bb64fdc1e3  ./vectors/identity.json
 48928dd4256c3f8cfcfffac66e01fd7161c5b0de0c7d11d2ea5f1f31ff052edf  ./vectors/psk.json

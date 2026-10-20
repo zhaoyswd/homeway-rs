@@ -25,9 +25,9 @@ use std::any::Any;
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
-use std::panic::{catch_unwind, AssertUnwindSafe};
+use std::panic::{AssertUnwindSafe, catch_unwind};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
@@ -45,10 +45,10 @@ use crate::cmd::{
     OnEvent, OnPacketDemand, OnUnhealthy, RaceOutcome, Via,
 };
 use crate::config::IslandConfig;
-use crate::stream::{StreamErr, OPEN_BUDGET};
-use crate::sync_util::{lock_unpoison, log_spawn_failed, ExitSignal};
+use crate::stream::{OPEN_BUDGET, StreamErr};
+use crate::sync_util::{ExitSignal, lock_unpoison, log_spawn_failed};
 use crate::tun::{self, ReturnPath, TunCounters};
-use crate::tuning::{apply_cc_env, apply_probe_env, apply_stream_env, ProbeTuning, StreamLimits};
+use crate::tuning::{ProbeTuning, StreamLimits, apply_cc_env, apply_probe_env, apply_stream_env};
 
 /// 驱动线程名（镜像 `homeway-wg`）。
 pub(crate) const ISLAND_THREAD: &str = "homeway-quic";
@@ -260,9 +260,7 @@ impl Island {
         let tier_tx = IslandTx(tx.clone()); // 岛线程侧的命令口（TUN 线程也各持一份）
         let handle = thread::Builder::new()
             .name(ISLAND_THREAD.into())
-            .spawn(move || {
-                thread_body(rt, rx, tier_tx, ctx, cfg, patrol, ready_tx, seam)
-            })?;
+            .spawn(move || thread_body(rt, rx, tier_tx, ctx, cfg, patrol, ready_tx, seam))?;
 
         // 端点/身份的就绪握手（失败 → join 取回证据 → 报错，不留半起态）
         match ready_rx.recv() {
@@ -514,6 +512,10 @@ enum Job {
     /// 服务流任务结束（写者任务 / 读任务；**记账已在任务内落**——见
     /// `client::streams::{writer_task,read_task}`，本变体只让 `JoinSet` 的收割口有名字）。
     StreamDone,
+    DirectUpgrade {
+        conn_id: usize,
+        winner: Option<Candidate>,
+    },
     /// 长任务 panic（2026-10-10 审查 中-2）：[`guard_job`] 壳捕获后按「任务种类 + 复位
     /// 所需最小上下文」上抛。不隔这一层时 panic 会落进 `join_next` 的 `Err`（与收工
     /// abort 同形、任务种类丢失）⇒ 单飞位（`racing` / 阶梯 `inflight` / 泵防重位）
@@ -535,6 +537,7 @@ enum PanickedJob {
     LadderConnect,
     Return(usize),
     Stream,
+    DirectUpgrade,
 }
 
 /// 长任务 spawn 的统一壳：panic 捕获后转 [`Job::Panicked`]（驱动按 [`PanickedJob`]
@@ -558,7 +561,10 @@ struct Guarded<F> {
 
 impl<F: Future<Output = Job>> Future for Guarded<F> {
     type Output = Job;
-    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Job> {
+    fn poll(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Job> {
         let this = self.get_mut();
         match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| this.fut.as_mut().poll(cx))) {
             Ok(poll) => poll,
@@ -589,6 +595,10 @@ struct DriverState {
     cands: Vec<Candidate>,
     /// 赛跑在途（同刻只允许一轮：赛跑结论是一次性的）。
     racing: bool,
+    upgrading: bool,
+    upgrade_due: TokioInstant,
+    upgrade_cursor: usize,
+    hint_cands: Vec<Candidate>,
     /// C4' 行节流器（跨轮复用）。
     race_gate: client::LogGate,
     /// 累计投出的候选数（快照 `mirrors`）。
@@ -600,6 +610,8 @@ struct DriverState {
     na_logged: bool,
     /// 巡检节拍（60s 注册刷新；构造期定案，运行期不改）。
     patrol: Duration,
+    /// 候选学习巡检与注册巡检同节拍；其它刷新沿也推迟本期限，避免同拍重复解析。
+    candidate_refresh_due: TokioInstant,
     /// **直连优先窗口**（`IslandConfig::direct_first`；构造期定案）：喂 `client::connect`
     /// 的两处赛跑（`Cmd::Connect` 与阶梯 R 的全清单回落）；`0` = 关（全候选同刻投出）。
     direct_first: Duration,
@@ -723,11 +735,16 @@ fn run_driver(
             live: None,
             cands: Vec::new(),
             racing: false,
+            upgrading: false,
+            upgrade_due: TokioInstant::now(),
+            upgrade_cursor: 0,
+            hint_cands: Vec::new(),
             race_gate: client::LogGate::new(),
             mirrors: 0,
             rebinds: 0,
             na_logged: false,
             patrol,
+            candidate_refresh_due: TokioInstant::now() + patrol,
             direct_first,
             tun: None,
             pump_conn: None,
@@ -889,6 +906,21 @@ fn run_driver(
                         // 服务流任务结束：槽侧记账已在任务内落（`writer_finished` /
                         // 读任务回执），这里无需动作——变体存在的意义是让 abort/panic
                         // 与正常结束在同一处可见（排障时 `JoinSet` 的收割口有名字）。
+                        Ok(Job::DirectUpgrade { conn_id, winner }) => {
+                            st.upgrading = false;
+                            if let Some(c) = winner {
+                                if let Some(live) = st.live.as_mut().filter(|l| l.conn.stable_id() == conn_id) {
+                                    live.via = Via::Direct;
+                                    live.ep = c.addr;
+                                    st.ladder_cand = Some(c);
+                                    st.snap_sync_last = None;
+                                    st.ladder.rearm();
+                                    (*ctx.logf)(&format!("中继升级直连：已确认 {}（同连接，服务流保持）", c.addr));
+                                }
+                            } else {
+                                (*ctx.logf)("中继升级直连：本轮未确认，保留中继");
+                            }
+                        }
                         Ok(Job::StreamDone) => {}
                         // 长任务 panic（2026-10-10 审查 中-2）：复位单飞位 + 走对应失败
                         // 路径——否则 `racing`/阶梯 `inflight`/泵防重位永久停在「在途」，
@@ -900,6 +932,7 @@ fn run_driver(
                             match recover {
                                 // 回执口随任务 drop ⇒ 调用侧已归 EngineGone；这里只复位单飞位
                                 PanickedJob::Race => st.racing = false,
+                                PanickedJob::DirectUpgrade => { st.upgrading = false; face.relays().clear_direct(); }
                                 PanickedJob::Probe => {}
                                 // 视为该轮探活失败：走阶梯正常失败路径（保 r18 ②-1 的 B 门
                                 // 可达；`ProbeNoResponse` 语义 = 无对端证据，与 panic 等价）
@@ -1003,6 +1036,8 @@ fn adopt(
     est: client::Established,
     jobs: &mut JoinSet<Job>,
 ) {
+    face.relays().clear_direct();
+    st.upgrade_due = TokioInstant::now();
     let patrol = st.patrol;
     let local = face.local();
     // S2-7：中继候选的（地址 → label）在采纳时**钉住**（后续 `SetCandidates` 不该把
@@ -1204,15 +1239,21 @@ async fn housekeeping(
     if st.live.as_ref().is_some_and(|l| !l.alive()) {
         // M3 §4（设计门 F4）：**准入后**的会话级关闭（被替换/设备被摘除）单独归因——
         // 与准入窗内的 `AdmissionRejected` 严格分开，不误报成「准入被拒」。
-        let reason = st.live.as_ref().and_then(|l| {
-            match client::session_closed(&l.conn) {
+        let reason = st
+            .live
+            .as_ref()
+            .and_then(|l| match client::session_closed(&l.conn) {
                 IslandErr::SessionClosed { reason } => Some(reason),
                 _ => None,
-            }
         });
         let replaced = reason.as_deref() == Some("replaced by newer registration");
         let handover = st.live.as_ref().is_some_and(|l| {
-            benign_handover(reason.as_deref(), l.conn.stable_id(), st.handover, Instant::now())
+            benign_handover(
+                reason.as_deref(),
+                l.conn.stable_id(),
+                st.handover,
+                Instant::now(),
+            )
         });
         if replaced {
             note_replaced_event(st, ctx);
@@ -1297,6 +1338,54 @@ async fn housekeeping(
             }
         }
     }
+    // 健康直连也要按巡检拍更新旁路线索；回调只触发有界后台任务并取内存快照。
+    let refreshed = st.live.as_ref().is_some_and(|l| l.alive())
+        && TokioInstant::now() >= st.candidate_refresh_due;
+    if refreshed {
+        let _ = refresh_candidates(st, face);
+    }
+    // 不可信 hint 只入候选池；每个中继连接仍最多每 30s 发一轮（最多 3×700ms）。
+    for hint in face.relays().take_hints() {
+        if let Some(h) = face.candidate_hooks() {
+            (h.learn)(hint, crate::CandidateSource::Hint);
+        }
+        if st.hint_cands.len() < 8 && !st.hint_cands.contains(&hint) {
+            st.hint_cands.push(hint);
+        }
+    }
+    if !st.upgrading
+        && !st.racing
+        && !st.ladder.inflight()
+        && TokioInstant::now() >= st.upgrade_due
+        && st
+            .live
+            .as_ref()
+            .is_some_and(|l| l.alive() && l.via.is_relay())
+    {
+        let mut roster = if refreshed { st.cands.clone() } else { refresh_candidates(st, face) };
+        for c in &st.hint_cands {
+            if !roster.contains(c) {
+                roster.push(*c);
+            }
+        }
+        roster.retain(|c| !c.via.is_relay());
+        if !roster.is_empty() {
+            st.upgrade_due = TokioInstant::now() + Duration::from_secs(30);
+            let n = roster.len();
+            roster.rotate_left(st.upgrade_cursor % n);
+            st.upgrade_cursor = (st.upgrade_cursor + 3) % n;
+            roster.truncate(3);
+            st.upgrading = true;
+            let conn = st.live.as_ref().expect("上方已检查现任").conn.clone();
+            let conn_id = conn.stable_id();
+            let kit = face.connect_kit();
+            let hooks = face.candidate_hooks().cloned();
+            jobs.spawn(guard_job(PanickedJob::DirectUpgrade, async move {
+                let winner = client::upgrade_direct(&conn, kit, roster, hooks).await;
+                Job::DirectUpgrade { conn_id, winner }
+            }));
+        }
+    }
     // ③ **快探节拍**（§3.2：在用档背靠背 / 待机档 60s / 挂起空窗立即探——
     //     由 runtime 拍内务驱动；单飞与动作链在阶梯里）。
     //     **判据 = 连接在位，或风暴冷却休眠中**（M5 §2.4-A-2 ④：快探节拍是阶梯的唯一
@@ -1304,7 +1393,7 @@ async fn housekeeping(
     //     连接要保」无关，故去掉。风暴休眠例外：熔断后 `live` 常已清空，而到期复位
     //     是熔断的唯一自动出口——不驱动 `due` = 冷却后周期探活永久停摆，只能等
     //     外部边沿；无连接时到期的探活会经 `on_confirm_unavailable` 收线进失败链）。
-    if st.live.is_some() || st.ladder.storm_parked() {
+    if !st.upgrading && (st.live.is_some() || st.ladder.storm_parked()) {
         let in_use = in_use_now(st, ctx, &st.probe);
         if let Some((round, budget)) = st.ladder.due(TokioInstant::now(), in_use) {
             ladder_step(st, ctx, face, jobs, LadderStep::Probe { round, budget });
@@ -1322,6 +1411,10 @@ async fn housekeeping(
         s.rebinds = st.rebinds;
         s.local = Some(face.local());
         s.connections = u64::from(st.live.is_some());
+        #[cfg(test)]
+        {
+            s.stable_id = st.live.as_ref().map(|l| l.conn.stable_id());
+        }
         s.packets_out = ctx.counters.write_pkts();
         match st.live.as_ref() {
             Some(l) => {
@@ -1507,7 +1600,12 @@ async fn handle_cmd(
                 lock_unpoison(&ctx.on_packet_demand).clone(),
             ) {
                 lock_unpoison(&ctx.snapshot).attached = false;
-                log_spawn_failed(&ctx.logf, tun::READ_THREAD, &e, "应用出站方向不可用（回程面照常）");
+                log_spawn_failed(
+                    &ctx.logf,
+                    tun::READ_THREAD,
+                    &e,
+                    "应用出站方向不可用（回程面照常）",
+                );
                 let _ = reply.send(Err(IslandErr::TunAttach(e)));
                 return;
             }
@@ -1515,10 +1613,7 @@ async fn handle_cmd(
                 "隧道面已附加（fd={fd}, mtu={mtu}；数据面已接线：读线程 + 回程队列 {} 条 + 写线程；fd 所有权在扩展，岛从不 close）",
                 tun::RETURN_QUEUE_MAX
             ));
-            st.tun = Some(TunPlane {
-                mtu,
-                ret,
-            });
+            st.tun = Some(TunPlane { mtu, ret });
             check_narrow_path(st, ctx);
             maybe_start_pump(st, ctx, jobs);
             let _ = reply.send(Ok(()));
@@ -1571,11 +1666,23 @@ async fn handle_cmd(
             demote_adopted,
             reply,
         } => {
-            if st.racing {
+            if st.racing || st.upgrading {
                 let _ = reply.send(Err(IslandErr::RaceInFlight));
                 return;
             }
-            let list = if cands.is_empty() { st.cands.clone() } else { cands };
+            let list = if cands.is_empty() {
+                refresh_candidates(st, face)
+            } else {
+                let mut list = cands;
+                if face.candidate_hooks().is_some() {
+                    for c in refresh_candidates(st, face) {
+                        if !list.contains(&c) {
+                            list.push(c);
+                        }
+                    }
+                }
+                list
+            };
             // 换网源降权（r9-N9：按 addr 匹配 `ladder_cand`，同 addr 不同 via 也降；
             // 降权到队尾、不删空——单端点 token 仍在列，避免比旧端点重试更糟）。
             let list = if demote_adopted {
@@ -1583,7 +1690,7 @@ async fn handle_cmd(
             } else {
                 list
             };
-            if list.is_empty() {
+            if list.is_empty() && face.candidate_hooks().is_none() {
                 let _ = reply.send(Err(IslandErr::NoCandidate));
                 return;
             }
@@ -1596,6 +1703,7 @@ async fn handle_cmd(
             st.race_gate.reset();
             let log_c4 = st.race_gate.due(Instant::now());
             st.mirrors += list.len() as u64;
+            restore_relay_before_race(st, face);
             // S2-7：本轮候选（含中继类）先入 socket 的中继表，再发赛跑任务
             face.relays().set(&list);
             let kit = face.connect_kit();
@@ -1608,6 +1716,10 @@ async fn handle_cmd(
             }));
         }
         Cmd::Rebind { local, reply } => {
+            if st.upgrading {
+                let _ = reply.send(Err(IslandErr::RaceInFlight));
+                return;
+            }
             // 评审 r1 低-6：local/迁移位进快照不滞后（节流见 housekeeping ④）；
             // 评审 r3 B3：命令计数同步入快照（rebinds）。
             st.snap_sync_last = None;
@@ -1864,9 +1976,9 @@ fn ladder_step(
                             note.to,
                             client::fmt_dur(st.ladder.tuning().fast_budget)
                         )),
-                        None => (*ctx.logf)(
-                            "迁移未确认（一个快探预算内无对端回包 ⇒ 回落重连/重赛跑）",
-                        ),
+                        None => {
+                            (*ctx.logf)("迁移未确认（一个快探预算内无对端回包 ⇒ 回落重连/重赛跑）")
+                        }
                     }
                     lock_unpoison(&ctx.snapshot).migration_unconfirmed = true;
                 }
@@ -1876,7 +1988,8 @@ fn ladder_step(
                 // 局域网路径瞬断（发送面 EHOSTUNREACH）时公网直连 / 中继仍可用，单候选 R
                 // 连败 16 次直到 B 门（MacBook Pro 实测）。全名册 + 直连优先窗口照旧：
                 // 现任端点仍是首个直连候选，健康场景的行为不变。
-                let list: Vec<Candidate> = reconnect_candidates(&st.cands, st.ladder_cand);
+                let roster = refresh_candidates(st, face);
+                let list: Vec<Candidate> = reconnect_candidates(&roster, st.ladder_cand);
                 if list.is_empty() {
                     // 无候选可拨（未采纳过连接且未 SetCandidates）：按 R 失败回灌 ⇒ B 门照走
                     step = st.ladder.on_reconnect_result(
@@ -1887,6 +2000,7 @@ fn ladder_step(
                     );
                     continue;
                 }
+                restore_relay_before_race(st, face);
                 face.relays().set(&list);
                 let kit = face.connect_kit();
                 let budget = st.ladder.reconnect_budget();
@@ -1936,7 +2050,11 @@ fn ladder_step(
 /// 监听 socket」的收侧唤醒有怪癖；纯 v4 token 没理由引入。v6 候选则必须双栈。
 fn rebind_bind(st: &DriverState) -> Option<SocketAddr> {
     let has_v6 = st.cands.iter().any(|c| c.addr.is_ipv6())
-        || st.ladder_cand.is_some_and(|c| c.addr.is_ipv6());
+        || st.ladder_cand.is_some_and(|c| c.addr.is_ipv6())
+        || st
+            .live
+            .as_ref()
+            .is_some_and(|l| l.conn.remote_address().is_ipv6());
     if has_v6 {
         None
     } else {
@@ -1946,6 +2064,28 @@ fn rebind_bind(st: &DriverState) -> Option<SocketAddr> {
 
 /// R（重连）的候选集：现任端点优先，名册其余去重后跟上（2026-10-14 改裁，见
 /// `ladder_step` 的 Reconnect 臂注释）。无名册 ⇒ 只有现任；无现任 ⇒ 名册原样。
+/// override 以逻辑 peer 为键；新连接赛跑前撤回，避免同地址的新 TLS 借用旧物理路由。
+/// 现任连接仍可沿原 relay 继续，直到新准入成功后正常交接。
+fn restore_relay_before_race(st: &mut DriverState, face: &Face) {
+    face.relays().clear_direct();
+    if let Some(live) = st.live.as_mut() {
+        let peer = live.conn.remote_address();
+        if let Some(label) = face.relays().label_of(&peer) {
+            live.via = Via::Relay { label };
+            live.ep = peer;
+        }
+    }
+}
+
+fn refresh_candidates(st: &mut DriverState, face: &Face) -> Vec<Candidate> {
+    st.candidate_refresh_due = TokioInstant::now() + st.patrol;
+    if let Some(h) = face.candidate_hooks() {
+        st.cands = (h.refresh)();
+        face.relays().set(&st.cands);
+    }
+    st.cands.clone()
+}
+
 fn reconnect_candidates(roster: &[Candidate], current: Option<Candidate>) -> Vec<Candidate> {
     let mut list: Vec<Candidate> = Vec::with_capacity(roster.len() + 1);
     if let Some(c) = current {
@@ -2002,7 +2142,15 @@ fn drop_zombie_live(st: &mut DriverState, ctx: &IslandCtx) {
 
 /// 记一次丢弃（四类计数 + N-c 行 + 事件回调；`ext` = 本次明细里的包长/条数补充）。
 fn note_drop(ctx: &IslandCtx, reason: DropReason, n: u64, detail: &str, ext: Option<u64>) {
-    note_drop_shared(&ctx.snapshot, &ctx.logf, &ctx.on_event, reason, n, detail, ext);
+    note_drop_shared(
+        &ctx.snapshot,
+        &ctx.logf,
+        &ctx.on_event,
+        reason,
+        n,
+        detail,
+        ext,
+    );
 }
 
 /// 计数上报的**共享件**（岛线程与数据面任务走同一份：一处字段序、一处节流口径）。
@@ -2210,7 +2358,7 @@ pub(crate) mod seams {
 // ---------- guard_job 单测（2026-10-10 审查 中-2 的回归钉） ----------
 #[cfg(test)]
 mod guard_job_tests {
-    use super::{guard_job, Job, PanickedJob};
+    use super::{Job, PanickedJob, guard_job};
 
     fn rt() -> tokio::runtime::Runtime {
         tokio::runtime::Builder::new_current_thread()
@@ -2265,13 +2413,20 @@ mod reconnect_candidates_tests {
     use std::net::{Ipv4Addr, SocketAddr};
 
     fn c(port: u16, via: Via) -> Candidate {
-        Candidate { addr: SocketAddr::from((Ipv4Addr::LOCALHOST, port)), via }
+        Candidate {
+            addr: SocketAddr::from((Ipv4Addr::LOCALHOST, port)),
+            via,
+        }
     }
 
     /// R 候选集：现任优先、名册去重跟上；无现任 = 名册；无名册 = 只有现任。
     #[test]
     fn current_first_then_roster_deduped() {
-        let roster = vec![c(1, Via::Direct), c(2, Via::Direct), c(3, Via::Relay { label: [0; 8] })];
+        let roster = vec![
+            c(1, Via::Direct),
+            c(2, Via::Direct),
+            c(3, Via::Relay { label: [0; 8] }),
+        ];
         let got = reconnect_candidates(&roster, Some(c(2, Via::Direct)));
         assert_eq!(got, vec![c(2, Via::Direct), c(1, Via::Direct), c(3, Via::Relay { label: [0; 8] })]);
         assert_eq!(reconnect_candidates(&roster, None), roster, "无现任 = 名册原样");
@@ -2329,7 +2484,7 @@ mod demote_tests {
 // ---------- 上行批处理单测（2026-10-18） ----------
 #[cfg(test)]
 mod tun_batch_tests {
-    use super::{drain_tun_batch, TUN_BATCH_MAX};
+        use super::{TUN_BATCH_MAX, drain_tun_batch};
     use crate::cmd::Cmd;
     use tokio::sync::mpsc as tmpsc;
 
@@ -2390,7 +2545,10 @@ mod handover_storm_tests {
     #[test]
     fn benign_handover_requires_reason_id_and_window() {
         let now = Instant::now();
-        let h = Some(Handover { from: 7, until: now + Duration::from_secs(3) });
+        let h = Some(Handover {
+            from: 7,
+            until: now + Duration::from_secs(3),
+        });
         assert!(benign_handover(
             Some("replaced by newer registration"),
             7,
@@ -2481,7 +2639,10 @@ mod storm_replay_tests {
     #[test]
     fn replay_0916_two_races_and_replaced_closes() {
         let t0 = Instant::now();
-        let h = Some(Handover { from: 11, until: t0 + Duration::from_millis(5600) });
+        let h = Some(Handover {
+            from: 11,
+            until: t0 + Duration::from_millis(5600),
+        });
         // 两条赛跑后的第一条旧 close：交接窗内、同 id → 正常交接。
         assert!(benign_handover(
             Some("replaced by newer registration"),

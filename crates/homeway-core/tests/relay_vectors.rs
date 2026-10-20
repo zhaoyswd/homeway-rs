@@ -150,3 +150,19 @@ fn relay_reg_frame_decode_shape() {
     // 非 type=3 帧不认
     assert!(rw::decode_relay_reg_frame(&wf::frame_bytes(wf::FrameKind::Data, b"x")).is_none());
 }
+
+
+#[test]
+fn relay_client_admission_matches_independent_hmac_wire_fixture() {
+    let fixture: serde_json::Value = serde_json::from_str(include_str!("../../../fixtures/relay-admission.json")).unwrap();
+    let key = h32(&fixture, "key");
+    let cookie = h16(&fixture, "cookie");
+    let sid = fixture["sid"].as_u64().unwrap();
+    let admitted = unhex(fixture["admitted_hex"].as_str().unwrap());
+    assert_eq!(rw::admitted_payload(sid, &cookie, &key), admitted);
+    assert!(rw::verify_admitted(&admitted, sid, &cookie, &key));
+    let session = rw::CtlSession { id: sid, data_port: fixture["data_port"].as_u64().unwrap() as u16, cookie };
+    let udp = unhex(fixture["udp_session_hex"].as_str().unwrap());
+    assert_eq!(rw::encode_udp_session(&session, &key), udp);
+    assert_eq!(rw::decode_udp_session(&udp, &key), Some(session));
+}

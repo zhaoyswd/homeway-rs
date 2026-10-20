@@ -4,9 +4,9 @@
 //! 无需回执）；带 `reply` 的命令由岛在事件到点时应答；状态走 `Arc<Mutex<…>>` 轮询。
 
 use std::net::SocketAddr;
+use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, AtomicU64, Ordering};
 use std::sync::mpsc::Sender;
-use std::sync::Arc;
 use std::time::Duration;
 
 use crate::stream::{StreamErr, StreamId, StreamTag, StreamWriteOut};
@@ -285,7 +285,7 @@ pub struct Candidate {
 /// 两行，见 `client/race.rs` 模块头第 4 条）。
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct RaceOutcome {
-    /// 胜出候选（首个完成握手者）。
+    /// 胜出候选（首个完成认证准入者）。
     pub winner: SocketAddr,
     /// 胜者承载类别。
     pub via: Via,
@@ -380,6 +380,9 @@ pub type OnEvent = Arc<dyn Fn(IslandEvent) + Send + Sync + 'static>;
 /// 「非 kind=5 帧忽略」与中继包封读数）。
 #[derive(Clone, Debug, Default)]
 pub struct IslandSnapshot {
+    /// 测试缝：验证物理路径切换保持同一连接；正式快照不扩键。
+    #[cfg(test)]
+    pub(crate) stable_id: Option<usize>,
     /// 隧道面是否已 attach。
     pub attached: bool,
     /// `TunPacket` 投递计数（**收到的**包数；是否发送/丢弃见 `drops`）。
@@ -627,7 +630,6 @@ impl CarrierFlag {
     pub fn demand_pkts(&self) -> u64 {
         self.demand_pkts.load(Ordering::Relaxed)
     }
-
 }
 
 #[cfg(test)]

@@ -70,9 +70,9 @@ pub mod stream;
 mod sysio;
 pub use sysio::SvcStream; // 跨 crate 消费面只有承载流类型（core::files_server::intake_conn）——评审 L4
 mod sync_util;
+mod tun;
 /// **可配常量面**（M3 §15-2/§15-3：流窗口/并发/待发队列 + 快探参数；纯 std）。
 pub mod tuning;
-mod tun;
 
 #[cfg(test)]
 mod tests;
@@ -83,17 +83,18 @@ pub use cmd::{
     Via,
 };
 pub use config::{
-    IslandConfig, IslandCredential, TokenSecret, DEFAULT_PATROL, QUIC_MTU_CAP_DEFAULT,
-    QUIC_MTU_CAP_MAX, QUIC_MTU_CAP_MIN,
+    CandidateHooks, CandidateSource, DEFAULT_PATROL, IslandConfig, IslandCredential,
+    QUIC_MTU_CAP_DEFAULT, QUIC_MTU_CAP_MAX, QUIC_MTU_CAP_MIN, TokenSecret,
 };
 pub use driver::{Island, IslandTx};
 /// `serve.quic_admit` 段的已解析形态（M2 §3.2 六行七键；**纯 std**——同步面（`homeway-core`
 /// 的配置层与装配点）直接读它，值域校验只有 [`AdmitLimits::validate`] 一处真源）。
 pub use exit::admit::AdmitLimits;
 pub use exit::{
-    EngineRejectClass, ExitInbound, ExitQuic, ExitQuicConfig, ExitQuicErr, ExitQuicSnapshot,
-    ExitSend, ExitStatsHandle, IntakeFull, PlainDatagramHook, PlainOutcome, Reg4Request, Reg4Verdict,
-    RejectWhy, RetryPolicy, ServiceIntake, ServiceIntakeTx, ServiceIntakes, FRAME_KIND_QUIC,
+    is_initial_datagram, EngineRejectClass, ExitInbound, ExitQuic, ExitQuicConfig, ExitQuicErr, ExitQuicSnapshot,
+    ExitSend, ExitStatsHandle, FRAME_KIND_QUIC, IntakeFull, PlainDatagramHook, PlainOutcome,
+    RelayGeneration, Reg4Request, Reg4Verdict, RejectWhy, RetryPolicy, ServiceIntake, ServiceIntakeTx,
+    ServiceIntakes,
 };
 /// STREAM 协议类型（M3 S1）：tag / 复位码 / 流错误 / 写回执——`homeway-core` 的换轨面
 /// （S3）用同一份类型，不另写 tag 字面量。

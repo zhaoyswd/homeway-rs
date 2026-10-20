@@ -14,7 +14,7 @@
 
 use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
-use std::net::Ipv4Addr;
+use std::net::{Ipv4Addr, SocketAddr};
 use crate::sysio::{self, SvcStream};
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
@@ -51,8 +51,15 @@ pub enum ExitInbound {
     },
 }
 
+/// 中继分配的代际身份：同远端端口重用时必须重新认证，不能复用旧连接的准入沿。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RelayGeneration { pub sid: u64, pub cookie: [u8; 16] }
+
 /// 一条 `hr-reg4` 准入/刷新请求（帧 + 本连接的 TLS exporter + 回执口）。
 pub struct Reg4Request {
+    /// 产生本次认证请求的实际 QUIC 路径；仅服务端连接对象可填入。
+    pub remote: Option<SocketAddr>,
+    pub relay_generation: Option<RelayGeneration>,
     /// 已解出的帧（MAC **未**验——secret 在引擎侧）。
     pub frame: Reg4Frame,
     /// 本帧所属连接上现算的 TLS exporter（32B）——MAC 的连接绑定值。
@@ -71,7 +78,13 @@ impl Reg4Request {
         exporter: [u8; EXPORTER_LEN],
         reply: oneshot::Sender<Reg4Verdict>,
     ) -> Self {
-        Self { frame, exporter, reply }
+        Self { remote: None, relay_generation: None, frame, exporter, reply }
+    }
+
+    pub(crate) fn with_origin(mut self, remote: SocketAddr, generation: Option<RelayGeneration>) -> Self {
+        self.remote = Some(crate::sysio::unmap_v4_mapped(remote));
+        self.relay_generation = generation;
+        self
     }
 
     /// 回执（非阻塞；接收端已放弃时静默——连接多半已死）。

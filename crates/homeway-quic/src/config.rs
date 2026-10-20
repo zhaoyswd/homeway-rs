@@ -12,8 +12,8 @@
 
 use std::fmt;
 use std::net::SocketAddr;
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
+use std::sync::atomic::AtomicBool;
 use std::time::Duration;
 
 use crate::rpk::RpkPublicKey;
@@ -128,8 +128,27 @@ impl fmt::Debug for IslandCredential {
     }
 }
 
+/// 候选来源；线索仅入候选池，认证成功才记为已验证。
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CandidateSource {
+    Hint,
+    Probe,
+    Inband,
+}
+
+/// 宿主候选池接口。回调只做内存/通道操作，不阻塞岛线程。
+#[derive(Clone)]
+pub struct CandidateHooks {
+    pub refresh: Arc<dyn Fn() -> Vec<crate::Candidate> + Send + Sync>,
+    pub snapshot: Arc<dyn Fn() -> Vec<crate::Candidate> + Send + Sync>,
+    pub learn: Arc<dyn Fn(crate::Candidate, CandidateSource) + Send + Sync>,
+    pub outcome: Arc<dyn Fn(crate::Candidate, bool) + Send + Sync>,
+}
+
 /// 岛构造配置。
 pub struct IslandConfig {
+    /// 动态候选与学习口（无宿主池时为 None）。
+    pub candidates: Option<CandidateHooks>,
     /// 准入材料（构造期注入；见模块头）。
     pub credential: IslandCredential,
     /// 初始本地绑定：`None` = **两个地址族都建**（v4 + v6 各一枚端点，候选按家庭选）；
@@ -204,6 +223,7 @@ impl IslandConfig {
             carrier: None,
             denied: None,
             on_adopt: None,
+            candidates: None,
         }
     }
 }

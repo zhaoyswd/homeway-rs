@@ -86,6 +86,8 @@ pub struct PubFace {
     stun: Mutex<Option<StunWait>>,
     /// 中继控制帧回调（注册腿线程接；未装 = 照旧忽略）。
     on_leg_frame: Mutex<Option<OnLegFrame>>,
+    /// 配置中继送来的地址线索；线程内只投递，信任校验归注册腿。
+    on_hint: Mutex<Option<OnLegFrame>>,
     /// 入站新源首包去重表（E23 判据行；与腿面共用 [`SrcSeen`]）。
     src_seen: SrcSeen,
     /// 公共端口 socket 的 **dup fd**（重钉用：`setsockopt` 作用于同一 socket 对象，
@@ -106,6 +108,7 @@ impl PubFace {
             probe_endpoints: Mutex::new(Vec::new()),
             stun: Mutex::new(None),
             on_leg_frame: Mutex::new(None),
+            on_hint: Mutex::new(None),
             src_seen: SrcSeen::new(),
             pin_sock: Mutex::new(None),
             pin_iface,
@@ -158,6 +161,10 @@ impl PubFace {
     /// 中继控制帧回调（注册腿线程接）。
     pub fn set_on_leg_frame(&self, f: OnLegFrame) {
         *self.on_leg_frame.lock().expect("on_leg_frame 锁中毒") = Some(f);
+    }
+
+    pub fn set_on_hint(&self, f: OnLegFrame) {
+        *self.on_hint.lock().expect("on_hint 锁中毒") = Some(f);
     }
 
     /// 起一次 STUN 观测：占位并给出事务 ID（调用方随即用 `ExitQuic::send_plain` 把
@@ -234,6 +241,12 @@ impl PubFace {
                 self.note_new_src(src, "畸形腿帧", buf.len());
                 return Some(PlainOutcome::Consumed);
             };
+            if kind == legframe::FrameKind::Control.to_wire() {
+                if let Some(f) = self.on_hint.lock().expect("on_hint 锁中毒").as_mut() {
+                    f(payload, src);
+                }
+                return Some(PlainOutcome::Consumed);
+            }
             if kind == crate::relaywire::FRAME_TYPE_RELAY_REG {
                 self.note_new_src(src, "腿帧type=3", buf.len());
                 let mut g = self.on_leg_frame.lock().expect("on_leg_frame 锁中毒");
@@ -266,4 +279,23 @@ fn stun_looks_like_response(b: &[u8]) -> bool {
     b.len() >= 20
         && u16::from_be_bytes([b[0], b[1]]) == 0x0101
         && u32::from_be_bytes([b[4], b[5], b[6], b[7]]) == 0x2112_A442
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hint_is_dispatched_on_public_port_without_feeding_quic() {
+        let face = PubFace::new("test", Arc::new(|_| {}), Arc::new(Mutex::new(None)));
+        let (tx, rx) = std::sync::mpsc::channel();
+        face.set_on_hint(Box::new(move |payload, src| { tx.send((payload.to_vec(), src)).unwrap(); }));
+        let source: SocketAddr = "[::ffff:127.0.0.1]:41741".parse().unwrap();
+        let hint = legframe::hint_bytes("8.8.8.8:41641");
+        assert!(matches!(face.handle(&hint, source), Some(homeway_quic::PlainOutcome::Consumed)));
+        let (payload, source) = rx.recv_timeout(std::time::Duration::from_secs(1)).unwrap();
+        assert_eq!(payload, hint[2..]);
+        assert_eq!(source, "127.0.0.1:41741".parse().unwrap());
+        assert!(face.handle(&[0x40, 0], source).is_none(), "裸QUIC继续由原收面消费");
+    }
 }

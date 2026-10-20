@@ -74,6 +74,24 @@ pub struct Handover {
     pub stream: TcpStream,
     pub label: [u8; 8],
     pub remote: SocketAddr,
+    permit: EstablishedPermit,
+}
+
+/// 长连名额随交接物/连接所有权移动；所有失败路径和停机消息丢弃均自动归还。
+struct EstablishedPermit(Arc<AtomicI32>);
+
+impl EstablishedPermit {
+    fn acquire(counter: &Arc<AtomicI32>, max: u16) -> Result<Self, HsError> {
+        if counter.fetch_add(1, Ordering::SeqCst) + 1 > i32::from(max) {
+            counter.fetch_sub(1, Ordering::SeqCst);
+            return Err(HsError::EstablishedFull(max));
+        }
+        Ok(Self(Arc::clone(counter)))
+    }
+}
+
+impl Drop for EstablishedPermit {
+    fn drop(&mut self) { self.0.fetch_sub(1, Ordering::SeqCst); }
 }
 
 /// 握手失败分类（驱动线程打哪行判据/是否计数用）。
@@ -91,30 +109,67 @@ pub enum HsError {
     EstablishedFull(u16),
 }
 
-/// 阻塞读一条控制消息（`[2B BE len][msg]`；超时/EOF/畸形 = Err）。
-fn read_msg(s: &mut TcpStream) -> std::io::Result<Vec<u8>> {
-    let mut hdr = [0u8; 2];
-    s.read_exact(&mut hdr)?;
-    let n = usize::from(u16::from_be_bytes(hdr));
-    if n == 0 || n > rw::CTL_MAX {
-        return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, "长度行非法"));
+/// 每次系统调用均重算剩余预算，read_exact/write_all 不能承载绝对期限。
+fn remaining(deadline: Instant) -> std::io::Result<Duration> {
+    deadline.checked_duration_since(Instant::now()).filter(|d| !d.is_zero())
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::TimedOut, "握手绝对期限"))
+}
+
+fn read_exact_until(s: &mut TcpStream, mut dst: &mut [u8], deadline: Instant) -> std::io::Result<()> {
+    while !dst.is_empty() {
+        s.set_read_timeout(Some(remaining(deadline)?))?;
+        match s.read(dst) {
+            Ok(0) => return Err(std::io::ErrorKind::UnexpectedEof.into()),
+            Ok(n) => dst = &mut dst[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {},
+            Err(e) => return Err(e),
+        }
     }
+    remaining(deadline)?;
+    Ok(())
+}
+
+fn read_msg_until(s: &mut TcpStream, deadline: Instant) -> std::io::Result<Vec<u8>> {
+    let mut hdr = [0u8; 2];
+    read_exact_until(s, &mut hdr, deadline)?;
+    let n = usize::from(u16::from_be_bytes(hdr));
+    if n == 0 || n > rw::CTL_MAX { return Err(std::io::ErrorKind::InvalidData.into()); }
     let mut msg = vec![0u8; n];
-    s.read_exact(&mut msg)?;
+    read_exact_until(s, &mut msg, deadline)?;
     Ok(msg)
 }
 
-fn write_msg(s: &mut TcpStream, msg: &[u8]) -> std::io::Result<()> {
+fn write_msg_until(s: &mut TcpStream, msg: &[u8], deadline: Instant) -> std::io::Result<()> {
     let mut wire = Vec::with_capacity(2 + msg.len());
     rw::ctl_frame_into(msg, &mut wire);
-    s.write_all(&wire)
+    let mut src = wire.as_slice();
+    while !src.is_empty() {
+        s.set_write_timeout(Some(remaining(deadline)?))?;
+        match s.write(src) {
+            Ok(0) => return Err(std::io::ErrorKind::WriteZero.into()),
+            Ok(n) => src = &src[n..],
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {},
+            Err(e) => return Err(e),
+        }
+    }
+    remaining(deadline)?;
+    Ok(())
+}
+
+#[cfg(test)]
+fn read_msg(s: &mut TcpStream) -> std::io::Result<Vec<u8>> {
+    read_msg_until(s, Instant::now() + HANDSHAKE_DEADLINE)
+}
+#[cfg(test)]
+fn write_msg(s: &mut TcpStream, msg: &[u8]) -> std::io::Result<()> {
+    write_msg_until(s, msg, Instant::now() + HANDSHAKE_DEADLINE)
 }
 
 /// 一条控制连接的完整握手（阻塞 + 10s 期限）。返回 established 流（非阻塞形态）。
 ///
 /// `slot` 由调用方（spawn 的线程）持有；**成功路径在返回前 `slot.release()`**
 /// （认证后长连不再占握手并发位）。`established` 是已建立连接的总闸（成功后由
-/// 调用方在连接关闭时回退——Go estab/defer 同义）。
+/// Handover/CtlConn 的 RAII 令牌在连接关闭时回退）。
 #[allow(clippy::too_many_arguments)]
 pub fn run_handshake(
     mut stream: TcpStream,
@@ -128,32 +183,18 @@ pub fn run_handshake(
         Ok(a) => a,
         Err(_) => return Err(HsError::Io),
     };
-    let _ = stream.set_nonblocking(false);
+    stream.set_nonblocking(false).map_err(|_| HsError::Io)?;
     // 绝对期限（Go SetDeadline 同义）：socket 级超时是**每次 read** 的超时——
     // 慢滴对端每 9s 滴 1 字节可无限续命；此处每次读前收紧剩余量（评审 高-1）
     let deadline = Instant::now() + HANDSHAKE_DEADLINE;
-    let tighten = |s: &mut TcpStream| -> bool {
-        let remain = deadline.saturating_duration_since(Instant::now());
-        if remain.is_zero() {
-            return false;
-        }
-        s.set_read_timeout(Some(remain)).is_ok() && s.set_write_timeout(Some(remain)).is_ok()
-    };
-    if !tighten(&mut stream) {
-        return Err(HsError::Io);
-    }
-
     // ① HELLO（版本不在 HELLO 自报——CHALLENGE 形状对老解码器必须不变）
-    let hello = read_msg(&mut stream).map_err(|_| HsError::Io)?;
+    let hello = read_msg_until(&mut stream, deadline).map_err(|_| HsError::Io)?;
     if hello.first() != Some(&rw::sub::HELLO) {
         return Err(HsError::Io);
     }
     let pub_: [u8; 32] = rw::decode_hello(&hello).ok_or(HsError::Io)?;
     let label = relay_id(&pub_);
 
-    if !tighten(&mut stream) {
-        return Err(HsError::Io);
-    }
     // ② CHALLENGE（临时密钥 + nonce；与 UDP 注册同款）
     let mut eph_bytes = [0u8; 32];
     getrandom::getrandom(&mut eph_bytes).map_err(|_| HsError::Io)?;
@@ -161,13 +202,10 @@ pub fn run_handshake(
     let eph_pub = PublicKey::from(&eph);
     let mut nonce = [0u8; 16];
     getrandom::getrandom(&mut nonce).map_err(|_| HsError::Io)?;
-    write_msg(&mut stream, &rw::encode_challenge(eph_pub.as_bytes(), &nonce)).map_err(|_| HsError::Io)?;
+    write_msg_until(&mut stream, &rw::encode_challenge(eph_pub.as_bytes(), &nonce), deadline).map_err(|_| HsError::Io)?;
 
-    if !tighten(&mut stream) {
-        return Err(HsError::Io);
-    }
     // ③ PROOF（**DH 恒校** + token 模式叠加 PSK；版本自报必须 =2）
-    let proof = read_msg(&mut stream).map_err(|_| HsError::Io)?;
+    let proof = read_msg_until(&mut stream, deadline).map_err(|_| HsError::Io)?;
     if proof.first() != Some(&rw::sub::PROOF) {
         return Err(HsError::Io);
     }
@@ -179,7 +217,7 @@ pub fn run_handshake(
         return Err(HsError::Version(parts.ver));
     }
     let dh = eph.diffie_hellman(&PublicKey::from(pub_));
-    if !rw::ct_eq_16(&rw::proof_mac(dh.as_bytes(), &nonce, &pub_), parts.mac_dh) {
+    if !dh.was_contributory() || !rw::ct_eq_16(&rw::proof_mac(dh.as_bytes(), &nonce, &pub_), parts.mac_dh) {
         return Err(HsError::DhRejected);
     }
     if let Some(sec) = secret {
@@ -190,27 +228,18 @@ pub fn run_handshake(
     }
 
     // ④ 已建立总数闸（认证后才占长连位；满则拒——先加后判，撤销回退）
-    if established.fetch_add(1, Ordering::SeqCst) + 1 > i32::from(max_established) {
-        established.fetch_sub(1, Ordering::SeqCst);
-        return Err(HsError::EstablishedFull(max_established));
-    }
+    let permit = EstablishedPermit::acquire(established, max_established)?;
 
     // ⑤ OK（恒 v2 形状：token 模式带中继身份 MAC；开放模式零 MAC 占位）
-    if !tighten(&mut stream) {
-        return Err(HsError::Io);
-    }
     let ok_mac = secret.map_or(vec![0u8; 16], |sec| rw::ok_auth_mac(&sec, &nonce).to_vec());
-    write_msg(&mut stream, &rw::encode_ok_auth(&ok_mac)).map_err(|_| {
-        established.fetch_sub(1, Ordering::SeqCst);
-        HsError::Io
-    })?;
+    write_msg_until(&mut stream, &rw::encode_ok_auth(&ok_mac), deadline).map_err(|_| HsError::Io)?;
 
     // 交接：非阻塞 + 清期限（驱动线程 poll；90s 读超时改由 last_read 判死）
     slot.release();
-    let _ = stream.set_read_timeout(None);
-    let _ = stream.set_write_timeout(None);
-    let _ = stream.set_nonblocking(true);
-    Ok(Handover { stream, label, remote })
+    stream.set_read_timeout(None).map_err(|_| HsError::Io)?;
+    stream.set_write_timeout(None).map_err(|_| HsError::Io)?;
+    stream.set_nonblocking(true).map_err(|_| HsError::Io)?;
+    Ok(Handover { stream, label, remote, permit })
 }
 
 /// 已建立控制连接（驱动线程独占）。
@@ -220,6 +249,7 @@ pub struct CtlConn {
     pub remote: SocketAddr,
     pub decoder: rw::CtlDecoder,
     pub last_read: std::time::Instant,
+    _permit: Option<EstablishedPermit>,
 }
 
 impl CtlConn {
@@ -230,6 +260,7 @@ impl CtlConn {
             remote: h.remote,
             decoder: rw::CtlDecoder::new(),
             last_read: std::time::Instant::now(),
+            _permit: Some(h.permit),
         }
     }
 
@@ -426,6 +457,30 @@ mod tests {
         assert_eq!(established.load(Ordering::SeqCst), 0);
     }
 
+    #[test]
+    fn valid_frame_slow_drip_obeys_absolute_deadline_inside_body() {
+        let ln = TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut c = TcpStream::connect(ln.local_addr().unwrap()).unwrap();
+        let (mut server, _) = ln.accept().unwrap();
+        let producer = std::thread::spawn(move || {
+            let mut wire = vec![0, 33, rw::sub::HELLO]; wire.extend_from_slice(&[8; 32]);
+            for b in wire { if c.write_all(&[b]).is_err() { break; } std::thread::sleep(Duration::from_millis(20)); }
+        });
+        let start = Instant::now();
+        assert!(read_msg_until(&mut server, start + Duration::from_millis(180)).is_err());
+        assert!(start.elapsed() < Duration::from_millis(500));
+        drop(server); producer.join().unwrap();
+    }
+
+    #[test]
+    fn established_permit_returns_on_every_abandoned_handover() {
+        let counter = Arc::new(AtomicI32::new(0));
+        { let _permit = EstablishedPermit::acquire(&counter, 1).unwrap(); assert_eq!(counter.load(Ordering::SeqCst), 1); }
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+        { let _permit = EstablishedPermit::acquire(&counter, 1).unwrap(); assert!(remaining(Instant::now() - Duration::from_secs(1)).is_err()); }
+        assert_eq!(counter.load(Ordering::SeqCst), 0);
+    }
+
     /// 已建立连接的非阻塞读写往返（read_available/write_msg_nonblocking）。
     #[test]
     fn ctl_conn_nonblocking_rw() {
@@ -445,6 +500,7 @@ mod tests {
             remote: "127.0.0.1:1".parse().unwrap(),
             decoder: rw::CtlDecoder::new(),
             last_read: std::time::Instant::now(),
+            _permit: None,
         };
         // 读两次（分帧可能一次不到齐——半帧状态机保证最终弹出）
         let mut msgs = Vec::new();

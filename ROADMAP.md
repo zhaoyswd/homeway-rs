@@ -71,6 +71,16 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-10-21 中继/赛跑/学习整改批**：已在 `708c95b` 最新基线重新复现原九组缺陷，
+> 保留公网观测 r5 改动，实施中继认证/配额/期限/绑定、候选持久化与动态 DNS、串行准入
+> 后备及同连接跨族直连升级。专项技术/代码评审与交叉复核见
+> `docs/reviews/2026-10-21-{relay-security,quic-selection,endpoint-learning,relay-cross-review,endpoint-cross-review}.md`。
+> 标准全仓 1216/0（37 ignored 未计通过）、clippy、OHOS/Linux check、向量/种子/词表/
+> 隔离/残留门已过，OHOS 真链接 3,217,016B；私有矩阵与修正注入相位后的恢复 e2e、tier
+> clean-core 双落盘/HSP 构建正在收口。额外 core32 压力跑有一个既有 PTY attach 超时，
+> 单独复验 1/0，未扩大修改到终端模块。最终证据补记；生产未部署、未推送/tag。
+
+
 > **2026-10-21 接续注**：公网观测 r5 全项整改已实施（TLS 绝对期限、发布与停机、relay fd
 > owner、STUN6 与 IPv6 端口及相邻观察项），两道结构化评审及独立交叉复核记录见
 > `docs/reviews/2026-10-21-公网观测腿整改.md`；原始评审与复现另见同日评审记录。全仓

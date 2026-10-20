@@ -1,5 +1,12 @@
 # homeway-rs 传输层换代 Roadmap（WG → QUIC · 跨期进度真源）
 
+> **2026-10-21 现行覆盖注**：M5 G8 的「中继升直连退役」及端点学习退役为历史记录。
+> 本批已恢复 QUIC 同连接的持续直连优先、双族/后学跨族升级、候选持久化与恢复时
+> 异步 DNS。现行代码见 `client/mod.rs::upgrade_direct` 与
+> `homeway-core/src/facade/endpoint_candidates.rs`；评审见同日三份专项与交叉记录，
+> 生命周期与常量真源仍为 tier `docs/agents/connection-lifecycle.md`。
+
+
 > **新会话续接协议（三步）**：①读本文件；②按「状态总览」找到第一个未完成期，读该期小节
 > （目标/范围/判据/评审门/退出口）；③按「每期执行协议」派发子 agent 执行，主会话只做调度
 > （读指针→派发→收摘要→更新本表→本地 commit）。用户说「继续 QUIC 换代 / 接着干」即指此协议。

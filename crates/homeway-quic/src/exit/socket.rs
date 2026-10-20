@@ -65,7 +65,7 @@ use tokio::sync::mpsc::{self, Receiver, Sender};
 use crate::sync_util::lock_unpoison;
 
 use super::bridge::{DropKind, ExitBridge};
-use super::{PlainDatagramHook, PlainOutcome};
+use super::{PlainDatagramHook, PlainOutcome, RelayGeneration};
 
 /// 腿帧魔数（与 `legframe::FRAME_MAGIC` 同值）。
 const FRAME_MAGIC: u8 = 0xBB;
@@ -84,6 +84,7 @@ const LEG_SWEEP_INTERVAL: Duration = Duration::from_secs(1);
 pub(crate) struct InjPkt {
     pub(crate) src: SocketAddr,
     pub(crate) payload: Vec<u8>,
+    pub(crate) generation: Option<RelayGeneration>,
 }
 
 /// 注入队列的两端别名（有界通道；上限由 [`super::bridge::INBOUND_QUEUE_MAX`] 给）。
@@ -114,10 +115,15 @@ impl Default for RecentLegs {
 ///   发送**丢**而不回落直连（#17 同义）。
 /// - 两条 map 都由 `ExitQuic` 的同步面方法（引擎线程）写、QUIC 线程读；持锁时间只覆盖
 ///   一次 `send` / 一次查表（微秒级；腿表 ≤ `RELAY_LEG_MAX`=64 条）。
+type InitialOrigins = HashMap<(SocketAddr, Vec<u8>), (RelayGeneration, Instant)>;
+
 #[derive(Default)]
 pub(crate) struct LegTable {
     live: Mutex<HashMap<SocketAddr, UdpSocket>>,
     recent: Mutex<RecentLegs>,
+    generations: Mutex<HashMap<SocketAddr, RelayGeneration>>,
+    /// 只记最早Initial的代际，限制数量与驻留时间，不能被后来的同DCID新cookie覆盖。
+    origins: Mutex<InitialOrigins>,
 }
 
 impl LegTable {
@@ -125,11 +131,36 @@ impl LegTable {
     pub(crate) fn open(&self, remote: SocketAddr, sock: UdpSocket) {
         lock_unpoison(&self.recent).map.remove(&remote);
         lock_unpoison(&self.live).insert(remote, sock);
+        lock_unpoison(&self.generations).remove(&remote);
+    }
+
+    pub(crate) fn open_generation(&self, remote: SocketAddr, sock: UdpSocket, generation: RelayGeneration) {
+        self.open(remote, sock);
+        lock_unpoison(&self.generations).insert(remote, generation);
+    }
+    pub(crate) fn matches(&self, remote: SocketAddr, local: SocketAddr, generation: RelayGeneration) -> bool {
+        lock_unpoison(&self.generations).get(&remote) == Some(&generation)
+            && lock_unpoison(&self.live).get(&remote).and_then(|s| s.local_addr().ok()) == Some(local)
+    }
+    fn note_initial(&self, remote: SocketAddr, payload: &[u8], generation: RelayGeneration) {
+        // QUIC长头DCID长度在固定位置，v1/v2均相同；只关联实际注入的合法Initial。
+        let Some(dcid) = initial_dcid(payload) else { return };
+        let mut origins = lock_unpoison(&self.origins);
+        origins.retain(|_, (_, at)| at.elapsed() <= Duration::from_secs(20));
+        let key = (crate::sysio::unmap_v4_mapped(remote), dcid.to_vec());
+        if origins.contains_key(&key) { return; }
+        if origins.len() >= 1024 { return; } // 失去证据时不提升配额，不能淘汰在途证明。
+        origins.insert(key, (generation, Instant::now()));
+    }
+    pub(crate) fn initial_origin(&self, remote: SocketAddr, dcid: &[u8]) -> Option<RelayGeneration> {
+        lock_unpoison(&self.origins).get(&(remote, dcid.to_vec()))
+            .filter(|(_, at)| at.elapsed() <= Duration::from_secs(20)).map(|(g, _)| *g)
     }
 
     /// 摘除一条腿（保留「最近摘除」窗；发送句柄随 drop 关闭该 fd 副本）。
     pub(crate) fn close(&self, remote: SocketAddr) {
         lock_unpoison(&self.live).remove(&remote);
+        lock_unpoison(&self.generations).remove(&remote);
         let mut recent = lock_unpoison(&self.recent);
         if recent.map.len() >= LEG_RECENT_MAX {
             recent.map.clear(); // 满表清空（排障级记忆，丢了只影响归因）
@@ -164,6 +195,18 @@ impl LegTable {
             .get(remote)
             .is_some_and(|at| now.duration_since(*at) <= LEG_RECENT_TTL)
     }
+}
+
+pub(super) fn initial_dcid(payload: &[u8]) -> Option<&[u8]> {
+    if payload.len() < 1200 || payload[0] & 0xc0 != 0xc0 { return None; }
+    let version = u32::from_be_bytes(payload[1..5].try_into().ok()?);
+    let initial = match version { 1 => payload[0] & 0x30 == 0, 0x6b3343cf => payload[0] & 0x30 == 0x10, _ => false };
+    if !initial { return None; }
+    let n = usize::from(payload[5]);
+    if !(1..=20).contains(&n) || payload.len() < 7+n { return None; }
+    let scid_len = usize::from(payload[6+n]);
+    if scid_len > 20 || payload.len() < 7+n+scid_len { return None; }
+    Some(&payload[6..6+n])
 }
 
 pub(super) use crate::sysio::{is_dual_stack, xmit_addr};
@@ -233,7 +276,11 @@ impl ExitSock {
     /// 注入一条腿上的 QUIC 报文（引擎线程；`false` = 面已收工 ⇒ 调用方停止注入）。
     /// 队列满 ⇒ 丢 + 计数（`未登记`；§6.4 的「不许静默」纪律），**不阻塞引擎**。
     pub(crate) fn inject(tx: &InjectTx, bridge: &ExitBridge, src: SocketAddr, payload: Vec<u8>) -> bool {
-        match tx.try_send(InjPkt { src, payload }) {
+        Self::inject_generation(tx, bridge, src, payload, None)
+    }
+
+    pub(crate) fn inject_generation(tx: &InjectTx, bridge: &ExitBridge, src: SocketAddr, payload: Vec<u8>, generation: Option<RelayGeneration>) -> bool {
+        match tx.try_send(InjPkt { src, payload, generation }) {
             Ok(()) => true,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 bridge.note_drop(DropKind::Unregistered, "QUIC 注入队列满（8192 条）");
@@ -341,6 +388,7 @@ impl AsyncUdpSocket for ExitSock {
                     return Poll::Ready(Ok(0)); // 本轮无包（quinn 会立刻再 poll）
                 }
                 let n = p.payload.len();
+                if let Some(generation) = p.generation { self.legs.note_initial(p.src, &p.payload, generation); }
                 buf[..n].copy_from_slice(&p.payload);
                 meta[0] = RecvMeta { addr: p.src, len: n, stride: n, ecn: None, dst_ip: None };
                 return Poll::Ready(Ok(1));
@@ -427,5 +475,33 @@ impl std::fmt::Debug for SockPoller {
 impl UdpPoller for SockPoller {
     fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
         self.sock.direct.poll_send_ready(cx)
+    }
+}
+
+#[cfg(test)]
+mod relay_generation_regression {
+    use super::*;
+    fn initial(id: u64) -> Vec<u8> { let mut p=vec![0;1200]; p[0]=0xc0; p[4]=1; p[5]=8; p[6..14].copy_from_slice(&id.to_be_bytes()); p }
+    #[test]
+    fn initial_origin_is_first_seen_bounded_and_expires() {
+        let table=LegTable::default(); let remote="127.0.0.1:41641".parse().unwrap();
+        let old=RelayGeneration{sid:1,cookie:[1;16]}; let new=RelayGeneration{sid:2,cookie:[2;16]};
+        table.note_initial(remote,&initial(1),old); table.note_initial(remote,&initial(1),new);
+        assert_eq!(table.initial_origin(remote,&1u64.to_be_bytes()),Some(old));
+        for n in 2..1100 { table.note_initial(remote,&initial(n),new); }
+        assert_eq!(lock_unpoison(&table.origins).len(),1024);
+        for (_, at) in lock_unpoison(&table.origins).values_mut() { *at -= Duration::from_secs(21); }
+        assert!(table.initial_origin(remote,&1u64.to_be_bytes()).is_none());
+        assert!(initial_dcid(&[0;1200]).is_none());
+    }
+    #[test]
+    fn same_generation_new_socket_requires_send_handle_replacement() {
+        let table=LegTable::default(); let remote="127.0.0.1:41641".parse().unwrap(); let generation=RelayGeneration{sid:3,cookie:[3;16]};
+        let old=UdpSocket::bind("127.0.0.1:0").unwrap(); let old_local=old.local_addr().unwrap();
+        table.open_generation(remote,old,generation); assert!(table.matches(remote,old_local,generation));
+        let new=UdpSocket::bind("127.0.0.1:0").unwrap(); let new_local=new.local_addr().unwrap();
+        assert!(!table.matches(remote,new_local,generation));
+        table.open_generation(remote,new,generation);
+        assert!(!table.matches(remote,old_local,generation)); assert!(table.matches(remote,new_local,generation));
     }
 }

@@ -1,7 +1,7 @@
 //! relay —— Homeway 中继角色（R4-4a）。
 //!
 //! 语义真源 `baseline:internal/relay/`（relay/leg/assoc/reap/control/status 共 9 文件）。
-//! 定位：中继是**路径而不是参与方**——只见密文、零 WG 感知、零落盘运行态（重启即清）。
+//! 定位：中继是**路径而不是参与方**——只见密文、零 QUIC 解密、零落盘运行态（重启即清）。
 //! 两条腿：
 //!
 //! ```text
@@ -9,7 +9,7 @@
 //! 客户端       ──标签帧──────► 中继 ──per-client socket──► 后端注册腿源地址
 //! ```
 //!
-//! **per-client 分配 socket 是正确性要求**：后端 WG 靠源地址区分客户端 endpoint。
+//! **per-client 分配 socket 是正确性要求**：出口 QUIC 靠源地址区分客户端连接。
 //!
 //! 线程模型（R4-design §4.1，R1 决议「自管线程 + poll(2)」）：**单驱动线程独占全部
 //! 可变状态**（legs/assocs/rates/stats/next_sid）+ 短命握手线程（≤16，RAII 槽位，
@@ -25,7 +25,7 @@ use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
 use crate::sysock::{self, PollEnt, RawSock, SysSock};
 use crate::sysock::{POLLERR, POLLHUP, POLLIN, POLLNVAL};
-use std::sync::atomic::{AtomicI32, Ordering};
+use std::sync::atomic::AtomicI32;
 use std::sync::{mpsc, Arc};
 use std::time::{Duration, Instant};
 
@@ -62,12 +62,18 @@ const RATE_BUCKET_TTL: Duration = Duration::from_secs(2); // 限流桶清理窗
 /// **未验证挑战**表上限（F5：HELLO 不占 `legs`，只占本表；满按最旧淘汰**而非拒绝**——
 /// 拒绝会让合法后端在洪水下也进不来）。Q17 语义之一。
 const PENDING_MAX: usize = 64;
-/// 全局分配腿（assoc socket）总数上限（F7.3）：`max_per_peer` 是**每腿**上限，
+/// 全局正式分配腿上限（未准入池另设独立上限）：`max_per_peer` 是**每腿**上限，
 /// 全局最坏 `32 × 256 = 8192` socket（每枚 4MB+4MB 内核缓冲）⇒ fd/内存双耗尽面。
 const MAX_ASSOCS_TOTAL: usize = 1024;
 /// 单会话下行字节桶（F7.2）：目标吞吐 ≥100Mbit/s（16MiB/s ≈ 128Mbit/s 留余量；
 /// **禁止**照抄 `leg_rate_ok` 的 2000pps——那是 ~22Mbit/s 硬顶的静默下载回归）。
 const ASSOC_DOWN_BYTES_PER_SEC: u64 = 16 * 1024 * 1024;
+const PRE_ASSOC_TOTAL: usize = 256;
+const PRE_ASSOC_PER_IP: usize = 4;
+/// 已收到出口LEGUP的在途会话单独保护，匿名池不能挤它；仍只驻留绝对10s。
+const INFLIGHT_TOTAL: usize = 64;
+const INFLIGHT_PER_IP: usize = 2;
+const PRE_ASSOC_TTL: Duration = Duration::from_secs(10);
 
 // 拒绝类日志的节流原因（F6：首 3 条 + 每 100 条一条）。enum 代 int 常量
 // （AGENTS 工程原则 1：类型承担不变量；饱和面仅是节流桶键，不做线上编码）。
@@ -75,16 +81,12 @@ const ASSOC_DOWN_BYTES_PER_SEC: u64 = 16 * 1024 * 1024;
 enum RejectLog {
     /// 注册腿总数达上限（PROOF 提升 / 控制面新腿）
     LegCap,
-    /// 每腿分配上限
-    PerPeer,
     /// PROOF 协议版本不符
     ProofVer,
     /// token 校验不过
     Token,
     /// 并发握手上限
     CtlFull,
-    /// 全局分配腿总数上限（F7.3）
-    AssocTotal,
     /// 下行字节桶超限（F7.2）
     DownLimit,
     /// 转发发送失败（F8）
@@ -199,6 +201,13 @@ impl Leg {
 
 /// 一条客户端分配（per-client socket 两形态状态机，R4-design §2.2）。
 struct Assoc {
+    /// 客户端已通过出口 QUIC 准入；与出口 LEGUP 身份证明严格分离。
+    client_admitted: bool,
+    inflight_protected: bool,
+    created: Instant,
+    udp_session_sent: Instant,
+    up_win: Instant,
+    up_bytes: u64,
     key: AssocKey,
     backend: Option<SocketAddr>,
     sock: UdpSocket,
@@ -212,8 +221,6 @@ struct Assoc {
     last: Instant,
     last_down: Instant,
     sid: u64,
-    /// 持久标志：本会话由拨腿承载（backend=腿源地址；地址漂移检查豁免）。
-    dialed: bool,
     /// 等待 LEGUP 中（等腿窗）。
     dial_up: bool,
     dial_up_at: Instant,
@@ -235,7 +242,7 @@ enum PollSource {
     Stop,
     Wakeup,
     Udp,
-    TcpListener,
+    TcpListener(usize),
     Assoc(AssocKey),
     Ctl(u64),
 }
@@ -414,6 +421,27 @@ impl Relay {
         bind_want(want.ip(), 0)
     }
 
+    /// 与 UDP 相同的绑定范围：显式 IP 不扩散；通配双栈，系统无 IPv6 时回落 IPv4。
+    fn listen_tcp(want: SocketAddr) -> io::Result<Vec<TcpListener>> {
+        let bind = |addr: SocketAddr| -> io::Result<TcpListener> {
+            let sock = socket2::Socket::new(socket2::Domain::for_address(addr), socket2::Type::STREAM, None)?;
+            if addr.is_ipv6() { sock.set_only_v6(true)?; }
+            sock.bind(&addr.into())?;
+            sock.listen(128)?;
+            Ok(sock.into())
+        };
+        if !want.ip().is_unspecified() { return bind(want).map(|ln| vec![ln]); }
+        // macOS 允许 dual socket 与既有 v4 listener 同号共存，不能据 bind 成功宣称
+        // v4 已覆盖；显式两族 listener 使两族覆盖与端口冲突均可确定。
+        let v4 = bind(SocketAddr::new(Ipv4Addr::UNSPECIFIED.into(), want.port()))?;
+        let port = v4.local_addr()?.port();
+        match bind(SocketAddr::new(std::net::Ipv6Addr::UNSPECIFIED.into(), port)) {
+            Ok(v6) => Ok(vec![v4, v6]),
+            Err(err) if matches!(err.kind(), io::ErrorKind::AddrNotAvailable | io::ErrorKind::Unsupported) => Ok(vec![v4]),
+            Err(err) => Err(err),
+        }
+    }
+
     /// 驱动线程本体：监听并服务直到 stop 信号（stop_fd 上可读字节）。
     /// `on_ready(实际端口)` 在 UDP 绑定成功后回调一次（token 必须在**实际端口**
     /// 确定后生成——Go RunWithReady 同义）。
@@ -433,23 +461,17 @@ impl Relay {
 
         // TCP 控制监听与 UDP 实际端口同号（两个独立端口空间——部署零新增、token 不变）。
         // 起不来不致命：退回纯 UDP 中继（拨腿特性缺席）。
-        let ctl_ln: Option<TcpListener> = match TcpListener::bind(SocketAddr::new(
-            IpAddr::V4(Ipv4Addr::UNSPECIFIED),
-            actual_port,
-        )) {
+        let ctl_addr = SocketAddr::new(self.cfg.listen.ip(), actual_port);
+        let ctl_ln: Option<Vec<TcpListener>> = match Self::listen_tcp(ctl_addr) {
             Ok(ln) => {
-                ln.set_nonblocking(true)?;
+                for listener in &ln { listener.set_nonblocking(true)?; }
                 self.ctl_ok = true;
-                self.logf(&format!(
-                    "中继控制面：TCP 0.0.0.0:{actual_port} 就绪（后端拨腿模式可用）"
-                ));
+                self.logf(&format!("中继控制面：TCP {ctl_addr} 就绪（后端拨腿模式可用）"));
                 Some(ln)
             }
             Err(e) => {
                 self.ctl_ok = false;
-                self.logf(&format!(
-                    "⚠️ 控制面 TCP 0.0.0.0:{actual_port} 监听失败（{e}）—— 退回纯 UDP 中继（拨腿特性缺席；探针 flags 报降级位）"
-                ));
+                self.logf(&format!("⚠️ 控制面 TCP {ctl_addr} 监听失败（{e}）—— 退回纯 UDP 中继（拨腿特性缺席；探针 flags 报降级位）"));
                 None
             }
         };
@@ -463,7 +485,7 @@ impl Relay {
             None => "⚠️ 开放注册（测试开关 Open）：任何知道本地址的后端都能用它中转".to_owned(),
         };
         self.logf(&format!(
-            "中继就绪：{}（{}；分配回收 {}，注册腿过期 {}，每源限速 {} pps，每后端最多 {} 条分配，腿总数上限 {}）",
+            "中继就绪：{}（{}；分配回收 {}，注册腿过期 {}，每源准入限速 {} pps，每后端最多 {} 条分配，腿总数上限 {}）",
             udp.local_addr()?,
             who,
             fmt_duration_go_secs(self.cfg.idle_timeout),
@@ -513,8 +535,8 @@ impl Relay {
                 push(stop_fd, PollSource::Stop);
                 push(sysock::sock_raw(&wake_r), PollSource::Wakeup);
                 push(sysock::udp_raw(&udp), PollSource::Udp);
-                if let Some(ln) = &ctl_ln {
-                    push(sysock::tcp_listener_raw(ln), PollSource::TcpListener);
+                if let Some(listeners) = &ctl_ln {
+                    for (index, ln) in listeners.iter().enumerate() { push(sysock::tcp_listener_raw(ln), PollSource::TcpListener(index)); }
                 }
                 for (k, a) in &self.assocs {
                     push(sysock::udp_raw(&a.sock), PollSource::Assoc(*k));
@@ -578,8 +600,8 @@ impl Relay {
                             }
                         }
                     }
-                    PollSource::TcpListener => {
-                        if let Some(ln) = &ctl_ln {
+                    PollSource::TcpListener(index) => {
+                        if let Some(ln) = ctl_ln.as_ref().and_then(|listeners| listeners.get(index)) {
                             while let Ok((s, remote)) = ln.accept() {
                                 self.accept_ctl(s, remote, &wake);
                             }
@@ -633,6 +655,7 @@ impl Relay {
             }
 
             // ---- 定时面 ----
+            self.retry_udp_sessions(&udp);
             let now = Instant::now();
             if now >= next_reap {
                 self.reap_round();
@@ -680,10 +703,11 @@ impl Relay {
 
     /// 一个入站 UDP 包的分派（限流 → probe → tagged → 腿控制/转发）。
     fn handle_udp_packet(&mut self, udp: &UdpSocket, src: SocketAddr, pkt: &[u8]) {
-        if !self.rate_ok(src.ip()) {
-            self.stats.dropped += 1;
-            return;
-        }
+        // 正式数据会话不经过源 IP 的准入 pps 桶（共享 NAT 也不能互相争抢数据额度）。
+        let known = legframe::decode_tagged(pkt).is_some_and(|(label, kind, _)| {
+            kind != rw::FRAME_TYPE_RELAY_REG && self.assocs.get(&AssocKey { label: *label, client: src }).is_some_and(|a| a.client_admitted || a.inflight_protected)
+        });
+        if !known && !self.rate_ok(src.ip()) { self.stats.dropped += 1; return; }
         // 参照点探测（无状态一问一答；防放大 ≤ req+45B；合法探测不进任何计数）。
         // F10：flags 报「控制面降级」位（serve 侧 flags=caps 不动；中继 flags 命名空间）。
         if let Some(resp) = crate::probe::respond_ex(pkt, self.build_str(), self.relay_flags(), &[]) {
@@ -703,6 +727,11 @@ impl Relay {
         if !admitted {
             self.stats.dropped += 1;
             return;
+        }
+        // 新匿名分配必须从QUIC Initial起跑；已有会话不依靠明文形状认证。
+        if !self.assocs.contains_key(&AssocKey { label: *label, client: src })
+            && (kind != homeway_quic::FRAME_KIND_QUIC || !homeway_quic::is_initial_datagram(payload)) {
+            self.stats.dropped += 1; return;
         }
         self.forward_up(udp, src, *label, kind, payload);
     }
@@ -799,18 +828,13 @@ impl Relay {
             // 快照挑战材料（避免跨借用；用完即弃）
             let pubkey = p.pubkey;
             let eph_priv = p.eph_priv.clone();
-            // 校验：开放模式只看 DH；token 模式只看 PSK（DH 谁都算得出，不当准入）
-            let pass = match &self.cfg.secret {
-                Some(sec) => {
-                    let want = rw::auth_mac(sec, &parts.nonce, &pubkey);
-                    rw::ct_eq_16(&want, parts.mac_psk)
-                }
-                None => {
-                    let dh = eph_priv.diffie_hellman(&PublicKey::from(pubkey));
-                    let want = rw::proof_mac(dh.as_bytes(), &parts.nonce, &pubkey);
-                    rw::ct_eq_16(&want, parts.mac_dh)
-                }
-            };
+            // 身份私钥证明恒校；共享中继凭证仅授权使用，不能代替出口身份。
+            let dh = eph_priv.diffie_hellman(&PublicKey::from(pubkey));
+            let dh_ok = dh.was_contributory()
+                && rw::ct_eq_16(&rw::proof_mac(dh.as_bytes(), &parts.nonce, &pubkey), parts.mac_dh);
+            let pass = dh_ok && self.cfg.secret.as_ref().is_none_or(|sec| {
+                rw::ct_eq_16(&rw::auth_mac(sec, &parts.nonce, &pubkey), parts.mac_psk)
+            });
             if !pass {
                 if self.cfg.secret.is_some() && self.reject_log_due(RejectLog::Token) {
                     self.logf(&format!(
@@ -924,14 +948,6 @@ impl Relay {
     /// 客户端 → 后端（必要时新建分配 socket），按需递送 hint。
     fn forward_up(&mut self, udp: &UdpSocket, client: SocketAddr, label: [u8; 8], kind: u8, payload: &[u8]) {
         let key = AssocKey { label, client };
-        // 后端注册腿换了地址（重映射）：老分配作废重建（拨腿会话豁免）
-        if let Some(a) = self.assocs.get(&key) {
-            let leg_addr = self.legs.get(&label).and_then(|l| l.addr);
-            if !a.dialed && a.backend != leg_addr {
-                self.assocs.remove(&key);
-                self.poll_dirty = true;
-            }
-        }
         if !self.assocs.contains_key(&key) {
             let (leg_addr, has_ctl) = {
                 let lg = self.legs.get(&label).expect("准入闸已判在");
@@ -942,28 +958,18 @@ impl Relay {
                 self.stats.dropped += 1;
                 return;
             }
-            let per_peer = self.assocs.keys().filter(|k| k.label == label).count();
-            if per_peer >= self.cfg.max_per_peer {
-                self.stats.dropped += 1;
-                if self.reject_log_due(RejectLog::PerPeer) {
-                    self.logf(&format!(
-                        "中继：后端 {} 的分配腿已达上限 {}，丢弃新客户端 {}",
-                        hex(&label), self.cfg.max_per_peer, client
-                    ));
-                }
-                return;
-            }
-            // F7.3 全局闸（每腿上限之外的第二道：fd/内存双耗尽面）
-            if self.assocs.len() >= MAX_ASSOCS_TOTAL {
-                self.stats.dropped += 1;
-                if self.reject_log_due(RejectLog::AssocTotal) {
-                    self.logf(&format!(
-                        "中继：分配腿总数已达全局上限 {}，丢弃新客户端 {}（后端 {}）",
-                        MAX_ASSOCS_TOTAL, client, hex(&label)
-                    ));
-                }
-                return;
-            }
+            // 未准入会话只占独立短命池。洪水永远不能消耗或驱逐正式配额。
+            let same_ip: Vec<AssocKey> = self.assocs.iter()
+                .filter(|(_, a)| !a.client_admitted && !a.inflight_protected && a.key.client.ip() == client.ip())
+                .map(|(k, _)| *k).collect();
+            let pre_count = self.assocs.values().filter(|a| !a.client_admitted && !a.inflight_protected).count();
+            let evict = if same_ip.len() >= PRE_ASSOC_PER_IP {
+                same_ip.into_iter().min_by_key(|k| self.assocs[k].created)
+            } else if pre_count >= PRE_ASSOC_TOTAL {
+                self.assocs.iter().filter(|(_, a)| !a.client_admitted && !a.inflight_protected)
+                    .min_by_key(|(_, a)| a.created).map(|(k, _)| *k)
+            } else { None };
+            if let Some(k) = evict { self.reap_assoc(&k, "预准入池轮换"); self.poll_dirty = true; }
             // F8：双栈 assoc socket（对齐 Go `net.ListenUDP("udp", nil)`——v4/v6 后端都可发）。
             let (sock, dual) = match crate::udpbatch::open_client_socket() {
                 Ok(v) => v,
@@ -982,7 +988,14 @@ impl Relay {
                 self.logf("⚠️ 中继：会话随机数不可用 ——已放弃本次会话，客户端重试即可");
                 return;
             }
+            self.next_sid += 1;
             let mut a = Assoc {
+                client_admitted: false,
+                inflight_protected: false,
+                created: Instant::now(),
+                udp_session_sent: Instant::now(),
+                up_win: Instant::now(),
+                up_bytes: 0,
                 key,
                 backend: leg_addr,
                 sock,
@@ -992,9 +1005,8 @@ impl Relay {
                 down_bytes: 0,
                 last: Instant::now(),
                 last_down: Instant::now(),
-                sid: 0,
-                dialed: false,
-                dial_up: false,
+                sid: self.next_sid,
+                dial_up: true,
                 dial_up_at: Instant::now(),
                 cookie,
                 auth_ok: false,
@@ -1003,11 +1015,8 @@ impl Relay {
             };
             // 有控制连接 → 拨腿模式（sid 分配 + 等腿窗；dialed 建会话即置位）
             if has_ctl {
-                self.next_sid += 1;
-                a.sid = self.next_sid;
                 a.dial_up = true;
                 a.dial_up_at = Instant::now();
-                a.dialed = true;
                 a.auth_ok = false;
             }
             self.assocs.insert(key, a);
@@ -1019,10 +1028,7 @@ impl Relay {
                     let _ = self.send_peer(udp, &legframe::hint_bytes(&addr.to_string()), client);
                 }
                 if let Some(b) = self.assocs.get(&key).and_then(|a| a.backend) {
-                    let a = self.assocs.get(&key).expect("已判在");
-                    let _ = a
-                        .sock
-                        .send_to(&legframe::hint_bytes(&client.to_string()), crate::udpbatch::xmit_addr(b, a.dual));
+                    let _ = self.send_peer(udp, &legframe::hint_bytes(&client.to_string()), b);
                 }
             }
             if has_ctl {
@@ -1044,6 +1050,12 @@ impl Relay {
                     return;
                 }
             } else {
+                if let Some(dst) = leg_addr {
+                    let a = &self.assocs[&key];
+                    let sess = rw::CtlSession { id: a.sid, data_port: a.sock.local_addr().map(|x| x.port()).unwrap_or(0), cookie: a.cookie };
+                    let key = self.cfg.secret.unwrap_or_else(|| { let mut k = [0; 32]; k[..16].copy_from_slice(&a.cookie); k });
+                    let _ = self.send_peer(udp, &rw::relay_reg_frame(&rw::encode_udp_session(&sess, &key)), dst);
+                }
                 let local = self.assocs.get(&key).and_then(|a| a.sock.local_addr().ok()).map(|l| l.to_string()).unwrap_or_default();
                 self.logf(&format!(
                     "中继：客户端 {} 起一条分配腿 → 后端 {}（中继侧出口 {}）",
@@ -1055,6 +1067,9 @@ impl Relay {
         }
         // 投递（等腿窗缓冲 / 直发）
         let a = self.assocs.get_mut(&key).expect("已判在");
+        if a.up_win.elapsed() >= Duration::from_secs(1) { a.up_win = Instant::now(); a.up_bytes = 0; }
+        a.up_bytes = a.up_bytes.saturating_add(payload.len() as u64);
+        if a.up_bytes > ASSOC_DOWN_BYTES_PER_SEC { self.stats.dropped += 1; return; }
         if a.dial_up {
             if a.pend.len() < CTL_PEND_MAX {
                 // 等腿窗：帧跨拍持有 ⇒ owned（慢路径，非热面）
@@ -1090,7 +1105,8 @@ impl Relay {
         let now = Instant::now();
         // 腿认证密钥预取（token 模式 = 中继密钥；开放模式 = cookie 低半字——
         // 后续 block 持有 assocs 借用，方法调用进不去）
-        let mac_key_for = |cookie: [u8; 16]| match self.cfg.secret {
+        let relay_secret = self.cfg.secret;
+        let mac_key_for = |cookie: [u8; 16]| match relay_secret {
             Some(s) => s,
             None => {
                 let mut k = [0u8; 32];
@@ -1101,56 +1117,43 @@ impl Relay {
         let mut flush: Option<Vec<Vec<u8>>> = None;
         let mut moved_log: Option<(u64, SocketAddr)> = None;
         let mut rejected = false;
+        let protected = self.assocs.values().filter(|a| !a.client_admitted && a.inflight_protected).count();
+        let source_protected = self.assocs.values().filter(|a| !a.client_admitted && a.inflight_protected && a.key.client.ip() == key.client.ip()).count();
         {
             let Some(a) = self.assocs.get_mut(&key) else { return };
-            if a.sid != 0 {
-                if a.auth_ok && a.auth_src == Some(from) {
-                    // 常态：已认证源的下行（数据腿帧或重发的 LEGUP 标记都算）
-                    a.last = now;
-                    a.last_down = now;
-                } else {
-                    let (sid, cookie) = (a.sid, a.cookie);
-                    let authed = rw::legup_cookie(pkt) == Some(cookie) && {
-                        let k = mac_key_for(cookie);
-                        rw::verify_legup(pkt, sid, &cookie, &k)
-                    };
-                    if authed {
-                        // 合法认证：首拨（放行 pend）或已认证腿的重拨/换源
-                        let first = !a.auth_ok;
-                        let moved = a.auth_ok && a.auth_src != Some(from);
-                        a.auth_ok = true;
-                        a.auth_src = Some(from);
-                        a.backend = Some(from);
-                        a.last = now;
-                        a.last_down = now;
-                        if first {
-                            a.dial_up = false;
-                            flush = Some(std::mem::take(&mut a.pend));
-                        }
-                        // F7.3：认证成功（真实后端在）才抬缓冲
-                        if !a.bufs_bumped {
-                            a.bufs_bumped = true;
-                            bump_sock_bufs(&a.sock);
-                        }
-                        if moved {
-                            moved_log = Some((sid, from));
-                        }
-                    } else {
-                        rejected = true;
-                    }
-                }
+            if a.auth_ok && a.auth_src == Some(from) {
+                // 常态：已认证源的下行（数据腿帧或重发的 LEGUP 标记都算）
+                a.last = now;
+                a.last_down = now;
             } else {
-                // v1 fallback 会话（sid==0）：**只认注册腿源 `a.backend`**。replay 回滚
-                // 会把 a.sid=0/dial_up=false/dialed=false 而**保留 a.backend**（故取
-                // a.backend 而非 lg.addr——纯控制腿的 lg.addr=None，用它会当场丢光下行）。
-                // 其它来源**显式丢弃 + 计数、不续命**（此前是排他 if/else、无第三出口，
-                // 会穿透到原样回投 ⇒ 任意源可续命并借中继回投）。
-                if a.backend == Some(from) {
+                let (sid, cookie) = (a.sid, a.cookie);
+                let authed = rw::legup_cookie(pkt) == Some(cookie) && {
+                    let k = mac_key_for(cookie);
+                    rw::verify_legup(pkt, sid, &cookie, &k)
+                };
+                if authed {
+                    // 合法认证：首拨（放行 pend）或已认证腿的重拨/换源
+                    let first = !a.auth_ok;
+                    let moved = a.auth_ok && a.auth_src != Some(from);
+                    a.auth_ok = true;
+                    if first && protected < INFLIGHT_TOTAL && source_protected < INFLIGHT_PER_IP {
+                        a.inflight_protected = true;
+                    }
+                    a.auth_src = Some(from);
+                    a.backend = Some(from);
                     a.last = now;
                     a.last_down = now;
-                    if !a.bufs_bumped {
+                    if first {
+                        a.dial_up = false;
+                        flush = Some(std::mem::take(&mut a.pend));
+                    }
+                    // 缓冲只随真实客户端准入提升，出口拨腿本身不提升。
+                    if a.client_admitted && !a.bufs_bumped {
                         a.bufs_bumped = true;
                         bump_sock_bufs(&a.sock);
+                    }
+                    if moved {
+                        moved_log = Some((sid, from));
                     }
                 } else {
                     rejected = true;
@@ -1191,6 +1194,28 @@ impl Relay {
         if let Some((sid, from)) = moved_log {
             self.logf(&format!("中继：会话 #{sid} 的后端腿重拨 → {from}（cookie 认证通过，跟随）"));
         }
+        // 只有出口完成客户端准入才会发此标记，出口拨腿证明不计客户端配额。
+        let is_admission = {
+            let a = &self.assocs[&key];
+            rw::verify_admitted(pkt, a.sid, &a.cookie, &mac_key_for(a.cookie))
+        };
+        if is_admission {
+            let already = self.assocs[&key].client_admitted;
+            let peer_count = self.assocs.values().filter(|a| a.client_admitted && a.key.label == key.label).count();
+            let total = self.assocs.values().filter(|a| a.client_admitted).count();
+            if !already && (peer_count >= self.cfg.max_per_peer || total >= MAX_ASSOCS_TOTAL) {
+                self.stats.dropped += 1;
+                return;
+            }
+            let a = self.assocs.get_mut(&key).expect("已判在");
+            a.client_admitted = true;
+            if !a.bufs_bumped { bump_sock_bufs(&a.sock); a.bufs_bumped = true; }
+            // 回显 ACK；出口在 ACK 前有界重发，首包丢失不能误收健康连接。
+            let _ = a.sock.send_to(pkt, crate::udpbatch::xmit_addr(from, a.dual));
+            let sid = a.sid;
+            if !already { self.logf(&format!("中继：会话 #{sid} 客户端准入已确认（正式配额 {}/{}）", peer_count + 1, self.cfg.max_per_peer)); }
+            return;
+        }
         // LEGUP 认证标记吞包（5B/37B 两形态；判定在分支外——首腿/重拨/重复标记都不外泄）
         if rw::legup_cookie(pkt).is_some() || pkt == b"LEGUP" {
             return;
@@ -1226,6 +1251,23 @@ impl Relay {
                 }
             }
         }
+    }
+
+    /// UDP-only 出口的会话挑战可靠性：LEGUP 前每秒重发一次；仅持续预准入短窗口。
+    fn retry_udp_sessions(&mut self, udp: &UdpSocket) {
+        let now = Instant::now();
+        let mut pending = Vec::new();
+        for a in self.assocs.values_mut() {
+            if a.auth_ok || a.client_admitted || now.duration_since(a.created) > PRE_ASSOC_TTL
+                || now.duration_since(a.udp_session_sent) < Duration::from_secs(1) { continue; }
+            if let Some(dst) = a.backend {
+                a.udp_session_sent = now;
+                let sess = rw::CtlSession { id: a.sid, data_port: a.sock.local_addr().map(|x| x.port()).unwrap_or(0), cookie: a.cookie };
+                let key = self.cfg.secret.unwrap_or_else(|| { let mut k = [0; 32]; k[..16].copy_from_slice(&a.cookie); k });
+                pending.push((dst, rw::relay_reg_frame(&rw::encode_udp_session(&sess, &key))));
+            }
+        }
+        for (dst, msg) in pending { let _ = self.send_peer(udp, &msg, dst); }
     }
 
     // ---------- 控制面 ----------
@@ -1280,8 +1322,7 @@ impl Relay {
                             self.cfg.max_legs, hex(&label)
                         ));
                     }
-                    drop(h.stream); // 连接关闭（established 计数回退见下）
-                    self.established.fetch_sub(1, Ordering::SeqCst);
+                    drop(h); // 长连名额由 RAII 自动归还
                     return;
                 }
                 let id = self.next_conn_id;
@@ -1358,9 +1399,7 @@ impl Relay {
     }
 
     fn close_ctl_quiet(&mut self, id: u64) {
-        if self.ctl_conns.remove(&id).is_some() {
-            self.established.fetch_sub(1, Ordering::SeqCst);
-        }
+        self.ctl_conns.remove(&id);
         for lg in self.legs.values_mut() {
             if lg.ctl == Some(id) {
                 lg.ctl = None;
@@ -1381,68 +1420,19 @@ impl Relay {
         }
     }
 
-    /// 向（新建立的）控制连接重放该后端的全部活跃会话（sid==0 提升为拨腿）。
+    /// 控制重连重放同代 sid/cookie，不降级为未经认证的旧式转发。
     fn replay_sessions(&mut self, label: [u8; 8], conn_id: u64) {
-        struct Pending {
-            key: AssocKey,
-            msg: Vec<u8>,
-            /// 提升过（本轮从 sid==0 拨上来）——回滚判据按 Go dialUp && sid!=0
-            /// （失败点之后**原本就在拨腿态**的会话也一并降级回 fallback）。
-            promoted: bool,
-        }
-        let mut out: Vec<Pending> = Vec::new();
-        for (k, a) in self.assocs.iter_mut() {
-            if k.label != label {
-                continue;
-            }
-            let mut promoted = false;
-            if a.sid == 0 {
-                // 提升：全新 sid + 切拨腿模式 + 换新 cookie（重放 = 后端已 ClearLegs）
-                self.next_sid += 1;
-                a.sid = self.next_sid;
-                a.dial_up = true;
-                a.dialed = true;
-                a.dial_up_at = Instant::now();
-                let mut ck = [0u8; 16];
-                if getrandom::getrandom(&mut ck).is_ok() {
-                    a.cookie = ck;
-                    a.auth_ok = false;
-                }
-                promoted = true;
-            }
-            let port = a.sock.local_addr().map(|l| l.port()).unwrap_or(0);
-            out.push(Pending {
-                key: *k,
-                msg: rw::encode_session(&rw::CtlSession { id: a.sid, data_port: port, cookie: a.cookie }),
-                promoted,
-            });
-        }
-        let mut sent = 0usize;
-        for (i, p) in out.iter().enumerate() {
-            let ok = self
-                .ctl_conns
-                .get_mut(&conn_id)
-                .map(|c| c.write_msg_nonblocking(&p.msg))
-                .unwrap_or(false);
-            if !ok {
-                // 通告失败：从失败这条起回滚提升（已发出的算数）
-                for q in &out[sent..] {
-                    let _ = i;
-                    if q.promoted {
-                        if let Some(a) = self.assocs.get_mut(&q.key) {
-                            a.sid = 0;
-                            a.dial_up = false;
-                            a.dialed = false;
-                        }
-                    }
-                }
+        let sessions: Vec<rw::CtlSession> = self.assocs.values().filter(|a| a.key.label == label)
+            .map(|a| rw::CtlSession { id: a.sid, data_port: a.sock.local_addr().map(|l| l.port()).unwrap_or(0), cookie: a.cookie })
+            .collect();
+        for sess in &sessions {
+            if !self.ctl_conns.get_mut(&conn_id).is_some_and(|c| c.write_msg_nonblocking(&rw::encode_session(sess))) {
                 self.close_ctl(conn_id);
                 return;
             }
-            sent = i + 1;
         }
-        if !out.is_empty() {
-            self.logf(&format!("中继：后端 {} 控制面重放 {} 条活跃会话", hex(&label), out.len()));
+        if !sessions.is_empty() {
+            self.logf(&format!("中继：后端 {} 控制面重放 {} 条活跃会话", hex(&label), sessions.len()));
         }
     }
 
@@ -1496,6 +1486,7 @@ impl Relay {
     /// 摘一条分配（带原因行；空串 = 普通空闲走聚合计数）。
     fn reap_assoc(&mut self, key: &AssocKey, why: &str) {
         let Some(a) = self.assocs.remove(key) else { return };
+        self.poll_dirty = true;
         if !why.is_empty() {
             self.logf(&format!("中继：会话 #{} 回收：{why}", a.sid));
         }
@@ -1514,7 +1505,9 @@ impl Relay {
         for k in keys {
             let Some(a) = self.assocs.get(&k) else { continue };
             // 判定顺序（Go reap.go 同序）：Idle → DialWait → DownSilent；命中 Idle 不打逐条日志
-            let why: Option<String> = if now.duration_since(a.last) > self.cfg.idle_timeout {
+            let why: Option<String> = if !a.client_admitted && now.duration_since(a.created) > PRE_ASSOC_TTL {
+                Some("客户端预准入期限已到".to_owned())
+            } else if now.duration_since(a.last) > self.cfg.idle_timeout {
                 None
             } else if a.dial_up && now.duration_since(a.dial_up_at) > self.cfg.dial_wait {
                 Some(format!(
@@ -1807,7 +1800,23 @@ mod tests {
     }
 
     impl TestRelay {
-        fn start(cfg: Config) -> Self {
+        fn start(mut cfg: Config) -> Self {
+            // UDP :0 与 TCP 的临时端口空间独立。UDP随机口可能已有TCP监听/TIME_WAIT，
+            // 此时产品正确降为UDP-only，依赖TCP的测试却会永久连不上，重试不能修复。
+            // 仅自动选口的fixture先选确实可监听的TCP两族口，再探同号UDP；固定端口
+            // 留给控制面降级/端口退让等故障用例，不替这些用例改环境。
+            let reservation = (cfg.listen.port() == 0).then(|| {
+                for _ in 0..64 {
+                    let Ok(listeners) = Relay::listen_tcp(SocketAddr::new(cfg.listen.ip(), 0)) else { continue };
+                    let port = listeners[0].local_addr().expect("TCP测试地址").port();
+                    let want = SocketAddr::new(cfg.listen.ip(), port);
+                    let Ok(udp) = Relay::listen_with_fallback(want, &noop_logf()) else { continue };
+                    if udp.local_addr().expect("UDP测试地址").port() != port { continue; }
+                    cfg.listen = want;
+                    return (listeners, udp);
+                }
+                panic!("未找到可同时绑定TCP/UDP的私有中继端口");
+            });
             let (ready_tx, ready_rx) = mpsc::channel();
             let stop = StopPipe::new().expect("stop 管道");
             let stop_r = stop.read_fd();
@@ -1815,6 +1824,8 @@ mod tests {
             let join = std::thread::Builder::new()
                 .name("relay-test".into())
                 .spawn(move || {
+                    // 保留到线程真正起跑，缩小释放探空socket与产品接管之间的窗口。
+                    drop(reservation);
                     let _ = relay.run(stop_r, |p| {
                         let _ = ready_tx.send(p);
                     });
@@ -1906,6 +1917,34 @@ mod tests {
         assert!(be.recv_from(&mut buf).is_err(), "同源保活静默续命");
     }
 
+    fn initial_payload() -> Vec<u8> {
+        let mut p = vec![0; 1200]; p[0] = 0xc0; p[4] = 1; p[5] = 8;
+        p[6..14].copy_from_slice(b"test-cid"); p[14] = 0; p
+    }
+    fn seed_initial(cl: &UdpSocket, relay: SocketAddr, label: &[u8; 8]) {
+        let mut tagged = Vec::new();
+        legframe::encode_tagged_frame(label, &legframe::frame_bytes(5u8, &initial_payload()), &mut tagged);
+        cl.send_to(&tagged, relay).unwrap();
+    }
+
+    fn complete_udp_session(be: &UdpSocket, relay: SocketAddr) -> SocketAddr {
+        let mut buf = [0; 256];
+        be.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        for _ in 0..5 {
+            let (n, src) = be.recv_from(&mut buf).unwrap();
+            let Some((kind, msg)) = legframe::decode_frame(&buf[..n]) else { continue };
+            if kind != rw::FRAME_TYPE_RELAY_REG || msg.first() != Some(&rw::sub::UDP_SESSION) { continue; }
+            assert_eq!(unmap(src), relay);
+            let cookie: [u8; 16] = msg[11..27].try_into().unwrap();
+            let mut key = [0; 32]; key[..16].copy_from_slice(&cookie);
+            let session = rw::decode_udp_session(msg, &key).unwrap();
+            let dst = SocketAddr::new(relay.ip(), session.data_port);
+            be.send_to(&rw::legup_payload(session.id, &cookie, &key), dst).unwrap();
+            return dst;
+        }
+        panic!("UDP_SESSION missing");
+    }
+
     /// 转发闭环（fallback 会话）：客户端标签帧 → 分配 socket → 后端；后端回程 → 客户端。
     #[test]
     fn forward_fallback_session_end_to_end() {
@@ -1929,7 +1968,9 @@ mod tests {
         let data = legframe::frame_bytes(legframe::FrameKind::Data, b"wg-payload");
         let mut tagged = Vec::new();
         legframe::encode_tagged_frame(&label, &data, &mut tagged);
+        seed_initial(&cl, relay_addr, &label);
         cl.send_to(&tagged, relay_addr).unwrap();
+        complete_udp_session(&be, relay_addr);
 
         // 后端收到：hint 帧（control）+ 转发帧——逐包按长度解码直到见数据
         let mut buf = [0u8; 256];
@@ -1999,7 +2040,9 @@ mod tests {
         let data = legframe::frame_bytes(legframe::FrameKind::Data, b"wg-payload-v6");
         let mut tagged = Vec::new();
         legframe::encode_tagged_frame(&label, &data, &mut tagged);
+        seed_initial(&cl, relay_addr, &label);
         cl.send_to(&tagged, relay_addr).unwrap();
+        complete_udp_session(&be, relay_addr);
         let mut buf = [0u8; 256];
         be.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut got_data = false;
@@ -2119,6 +2162,7 @@ mod tests {
         let data = legframe::frame_bytes(legframe::FrameKind::Data, b"hello-dialup");
         let mut tagged = Vec::new();
         legframe::encode_tagged_frame(&label, &data, &mut tagged);
+        seed_initial(&cl, relay_addr, &label);
         cl.send_to(&tagged, relay_addr).unwrap();
 
         // 后端控制面收 SESSION
@@ -2137,7 +2181,10 @@ mod tests {
         // pend 放行：后端在腿 socket 上收到缓冲的客户端帧
         let mut buf = [0u8; 256];
         let (n, _) = leg_sock.recv_from(&mut buf).unwrap();
-        assert_eq!(&buf[..n], &data[..], "等腿缓冲应放行首包");
+        assert_eq!(buf[1], homeway_quic::FRAME_KIND_QUIC, "首个缓冲包是准入Initial");
+        assert!(n > 0);
+        let (n, _) = leg_sock.recv_from(&mut buf).unwrap();
+        assert_eq!(&buf[..n], &data[..], "等腿缓冲应放行首包后的应用帧");
 
         // 下行：腿 socket → 客户端原样
         let down = legframe::frame_bytes(legframe::FrameKind::Data, b"down-via-leg");
@@ -2197,42 +2244,18 @@ mod tests {
     /// 空闲回收（注入短窗）：会话被摘 + 聚合计数。
     #[test]
     fn reap_idle_sessions() {
-        let mut cfg = Config::new(
-            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 0),
-            None,
-            noop_logf(),
-        );
-        cfg.idle_timeout = Duration::from_millis(150);
-        let tr = TestRelay::start(cfg);
-        let relay_addr = SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), tr.port);
-        let be = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let cl = UdpSocket::bind("127.0.0.1:0").unwrap();
-        let priv_ = rand_secret();
-        let pub_ = PublicKey::from(&priv_);
-        let label = relay_id(pub_.as_bytes());
-        register_open(&be, relay_addr, &priv_, &pub_, &label);
-        let data = legframe::frame_bytes(legframe::FrameKind::Data, b"x");
-        let mut tagged = Vec::new();
-        legframe::encode_tagged_frame(&label, &data, &mut tagged);
-        cl.send_to(&tagged, relay_addr).unwrap();
-        std::thread::sleep(Duration::from_millis(600));
-        // 后端观察：再发包不再有转发（会话已回收 → 新会话重建——仍能通，收到的源端口变了）
-        cl.send_to(&tagged, relay_addr).unwrap();
-        be.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
-        let mut buf = [0u8; 128];
-        let mut last_src = None;
-        for _ in 0..4 {
-            if let Ok((n, src)) = be.recv_from(&mut buf) {
-                if legframe::decode_frame(&buf[..n]).is_some_and(|(k, p)| {
-                    k == legframe::FrameKind::Data.to_wire() && p == b"x"
-                }) {
-                    last_src = Some(src);
-                }
-            } else {
-                break;
-            }
-        }
-        assert!(last_src.is_some(), "回收后重发包应重建会话并转发");
+        let (mut relay, udp, _backend, label) = local_model(None);
+        let client: SocketAddr = "127.0.0.1:34567".parse().unwrap();
+        relay.forward_up(&udp, client, label, 5, b"x");
+        let key = AssocKey { label, client };
+        let old_sid = relay.assocs[&key].sid;
+        relay.assocs.get_mut(&key).unwrap().last -= relay.cfg.idle_timeout + Duration::from_secs(1);
+        relay.poll_dirty = false;
+        relay.reap_round();
+        assert!(relay.assocs.is_empty());
+        assert!(relay.poll_dirty, "删除socket后必须重建poll集，避免POLLNVAL忙转");
+        relay.forward_up(&udp, client, label, 5, b"x");
+        assert_ne!(relay.assocs[&key].sid, old_sid);
     }
 
     /// F5：未认证 HELLO 不占 `legs`——伪造 label 洪水灌不满真腿表，合法后端仍可注册。
@@ -2339,7 +2362,9 @@ mod tests {
         let data = legframe::frame_bytes(legframe::FrameKind::Data, b"up");
         let mut tagged = Vec::new();
         legframe::encode_tagged_frame(&label, &data, &mut tagged);
+        seed_initial(&cl, relay_addr, &label);
         cl.send_to(&tagged, relay_addr).unwrap();
+        complete_udp_session(&be, relay_addr);
         be.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
         let mut buf = [0u8; 256];
         let assoc_src = {
@@ -2393,16 +2418,22 @@ mod tests {
         );
         // 客户端地址用广播地址：下行 sendto 在本机必失败（无 SO_BROADCAST）
         let client: SocketAddr = "255.255.255.255:9".parse().unwrap();
-        let data = legframe::frame_bytes(legframe::FrameKind::Data, b"x");
+        let data = legframe::frame_bytes(5u8, &initial_payload());
         let mut tagged = Vec::new();
         legframe::encode_tagged_frame(&label, &data, &mut tagged);
         relay.handle_udp_packet(&udp, client, &tagged);
         assert_eq!(relay.assocs.len(), 1, "应建一条 assoc");
         let key = AssocKey { label, client };
         assert!(!relay.assocs[&key].bufs_bumped, "未认证不得抬缓冲（F7.3）");
-        // 合法后端下行 ⇒ 抬缓冲（v1 合法源首包）；但客户端发送失败 ⇒ 只计 send_fail_down
-        relay.assoc_read(&udp, key, "127.0.0.1:9999".parse().unwrap(), b"down");
-        assert!(relay.assocs[&key].bufs_bumped, "v1 合法源首包后抬缓冲");
+        // 出口认证腿仍不抬缓冲；只有客户端准入确认可提升。
+        let a = &relay.assocs[&key]; let (sid, cookie) = (a.sid, a.cookie);
+        let mut secret = [0; 32]; secret[..16].copy_from_slice(&cookie);
+        let src = "127.0.0.1:9999".parse().unwrap();
+        relay.assoc_read(&udp, key, src, &rw::legup_payload(sid, &cookie, &secret));
+        assert!(!relay.assocs[&key].bufs_bumped);
+        relay.assoc_read(&udp, key, src, &rw::admitted_payload(sid, &cookie, &secret));
+        assert!(relay.assocs[&key].bufs_bumped);
+        relay.assoc_read(&udp, key, src, b"down");
         assert_eq!(relay.stats.forwarded_down, 0, "失败不计成功（F8）");
         assert_eq!(relay.stats.send_fail_down, 1, "失败进 send_fail_down（F8）");
     }
@@ -2512,6 +2543,106 @@ mod tests {
         );
     }
 
+    fn local_model(secret: Option<[u8; 32]>) -> (Relay, UdpSocket, UdpSocket, [u8; 8]) {
+        let mut cfg = Config::new("127.0.0.1:0".parse().unwrap(), secret, noop_logf());
+        cfg.no_hints = true;
+        let mut relay = Relay::new(cfg);
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let backend = UdpSocket::bind("127.0.0.1:0").unwrap();
+        backend.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let label = [9; 8];
+        relay.legs.insert(label, Leg { pubkey: [4; 32], addr: Some(backend.local_addr().unwrap()),
+            last: Instant::now(), verified: true, ctl_verified: false, ctl: None });
+        (relay, udp, backend, label)
+    }
+
+    #[test]
+    fn anonymous_pool_never_uses_formal_quota_and_only_real_admission_promotes() {
+        let (mut relay, udp, backend, label) = local_model(Some([7; 32]));
+        for i in 1..400u16 {
+            let ip = Ipv4Addr::new(192, 0, (i / 250) as u8, (i % 250 + 1) as u8);
+            relay.forward_up(&udp, (ip, 2000 + i).into(), label, 5, b"anonymous");
+        }
+        assert_eq!(relay.assocs.len(), PRE_ASSOC_TOTAL);
+        assert_eq!(relay.assocs.values().filter(|a| a.client_admitted).count(), 0);
+        let client: SocketAddr = "127.0.0.1:12345".parse().unwrap();
+        relay.forward_up(&udp, client, label, 5, b"legitimate");
+        let key = AssocKey { label, client };
+        let a = &relay.assocs[&key];
+        let sid = a.sid; let cookie = a.cookie;
+        let legup = rw::legup_payload(sid, &cookie, &[7; 32]);
+        let from = backend.local_addr().unwrap();
+        relay.assoc_read(&udp, key, from, &legup);
+        assert!(!relay.assocs[&key].client_admitted, "出口证明不能代替客户端证明");
+        let bad = rw::admitted_payload(sid, &cookie, &[8; 32]);
+        relay.assoc_read(&udp, key, from, &bad);
+        assert!(!relay.assocs[&key].client_admitted);
+        let admitted = rw::admitted_payload(sid, &cookie, &[7; 32]);
+        relay.assoc_read(&udp, key, from, &admitted);
+        assert!(relay.assocs[&key].client_admitted);
+        for i in 0..20 { relay.forward_up(&udp, (Ipv4Addr::LOCALHOST, 30000 + i).into(), label, 5, b"same NAT flood"); }
+        assert!(relay.assocs[&key].client_admitted, "预池淘汰绝不能驱逐正式会话");
+        assert!(relay.assocs.values().filter(|a| !a.client_admitted && a.key.client.ip().is_loopback()).count() <= PRE_ASSOC_PER_IP);
+        // 匿名连续发包不延长预准入绝对寿命。
+        for a in relay.assocs.values_mut().filter(|a| !a.client_admitted) { a.created -= PRE_ASSOC_TTL + Duration::from_secs(1); }
+        relay.reap_round();
+        assert_eq!(relay.assocs.len(), 1);
+    }
+
+    #[test]
+    fn established_upload_exceeds_two_hundred_packets_without_source_limit() {
+        let (mut relay, udp, backend, label) = local_model(None);
+        let client: SocketAddr = "127.0.0.1:23333".parse().unwrap();
+        let frame = legframe::frame_bytes(5u8, &initial_payload());
+        let mut tagged = Vec::new();
+        legframe::encode_tagged_frame(&label, &frame, &mut tagged);
+        relay.handle_udp_packet(&udp, client, &tagged);
+        // Drain UDP_SESSION+data; first session is explicitly confirmed below.
+        let mut buf = [0; 2048];
+        backend.recv_from(&mut buf).unwrap();
+        let key = AssocKey { label, client };
+        let a = &relay.assocs[&key]; let (sid, cookie) = (a.sid, a.cookie);
+        let mut k = [0; 32]; k[..16].copy_from_slice(&cookie);
+        relay.assoc_read(&udp, key, backend.local_addr().unwrap(), &rw::legup_payload(sid, &cookie, &k));
+        backend.recv_from(&mut buf).unwrap();
+        let admitted = rw::admitted_payload(sid, &cookie, &k);
+        relay.assoc_read(&udp, key, backend.local_addr().unwrap(), &admitted);
+        backend.recv_from(&mut buf).unwrap(); // ACK
+        let before = relay.stats.forwarded_up;
+        for _ in 0..500 { relay.handle_udp_packet(&udp, client, &tagged); backend.recv_from(&mut buf).unwrap(); }
+        assert_eq!(relay.stats.forwarded_up - before, 500);
+        assert_eq!(relay.stats.dropped, 0);
+    }
+
+    #[test]
+    fn udp_registration_requires_private_key_even_with_valid_shared_token() {
+        let mut relay = Relay::new(Config::new("127.0.0.1:0".parse().unwrap(), Some([8; 32]), noop_logf()));
+        let udp = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let src: SocketAddr = "127.0.0.1:54321".parse().unwrap();
+        for public in [*PublicKey::from(&rand_secret()).as_bytes(), [0; 32]] {
+            let label = relay_id(&public);
+            relay.handle_control(&udp, src, label, &rw::encode_hello(&public));
+            let p = &relay.pending[&label]; let nonce = p.nonce;
+            let proof = rw::encode_proof(&nonce, &[0; 32], &public, Some(&rw::auth_mac(&[8; 32], &nonce, &public)));
+            relay.handle_control(&udp, src, label, &proof);
+            assert!(!relay.legs.contains_key(&label));
+        }
+        assert_eq!(relay.stats.forged, 2);
+    }
+
+    #[test]
+    fn tcp_listener_respects_explicit_address_and_supports_both_wildcard_families() {
+        let explicit = Relay::listen_tcp("127.0.0.1:0".parse().unwrap()).unwrap();
+        assert_eq!(explicit[0].local_addr().unwrap().ip(), Ipv4Addr::LOCALHOST);
+        let Ok(v6) = Relay::listen_tcp("[::1]:0".parse().unwrap()) else { return };
+        assert_eq!(v6[0].local_addr().unwrap().ip(), std::net::Ipv6Addr::LOCALHOST);
+        std::net::TcpStream::connect(v6[0].local_addr().unwrap()).unwrap();
+        let dual = Relay::listen_tcp("0.0.0.0:0".parse().unwrap()).unwrap();
+        let port = dual[0].local_addr().unwrap().port();
+        std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
+        if dual.len() == 2 { std::net::TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port)).unwrap(); }
+    }
+
     fn register_open(be: &UdpSocket, relay_addr: SocketAddr, priv_: &x25519_dalek::StaticSecret, pub_: &PublicKey, label: &[u8; 8]) {
         let hello = legframe::frame_bytes(rw::FRAME_TYPE_RELAY_REG, &rw::encode_hello(pub_.as_bytes()));
         let mut tagged = Vec::new();
@@ -2530,5 +2661,36 @@ mod tests {
         let (n, _) = be.recv_from(&mut buf).unwrap();
         let (_, payload) = legframe::decode_frame(&buf[..n]).unwrap();
         assert_eq!(payload, &rw::ok_bytes()[..]);
+    }
+}
+
+#[cfg(test)]
+mod inflight_protection_regression {
+    use super::*;
+    #[test]
+    fn four_anonymous_packets_cannot_evict_legup_authenticated_inflight_client() {
+        let udp=UdpSocket::bind("127.0.0.1:0").unwrap(); let backend=UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut cfg=Config::new("127.0.0.1:0".parse().unwrap(),Some([9;32]),Arc::new(|_|{})); cfg.no_hints=true;
+        let mut relay=Relay::new(cfg); let label=[7;8];
+        relay.legs.insert(label,Leg{pubkey:[0;32],addr:Some(backend.local_addr().unwrap()),last:Instant::now(),verified:true,ctl_verified:false,ctl:None});
+        let good=AssocKey{label,client:"127.0.0.1:51001".parse().unwrap()};
+        relay.forward_up(&udp,good.client,label,5,b"QUIC Initial");
+        let a=&relay.assocs[&good]; let proof=rw::legup_payload(a.sid,&a.cookie,&[9;32]);
+        relay.assoc_read(&udp,good,backend.local_addr().unwrap(),&proof);
+        for port in 51002..51102 { relay.forward_up(&udp,SocketAddr::from(([127,0,0,1],port)),label,5,b"garbage"); }
+        assert!(relay.assocs[&good].inflight_protected); assert!(!relay.assocs[&good].client_admitted);
+        assert!(relay.assocs.len()<=PRE_ASSOC_PER_IP+1);
+        let other=AssocKey{label,client:"127.0.0.2:52000".parse().unwrap()};
+        relay.forward_up(&udp,other.client,label,5,b"new source"); assert!(relay.assocs.contains_key(&other),"匿名与在途池仍给新来源机会");
+    }
+    #[test]
+    fn malformed_new_client_does_not_allocate_or_instruct_exit() {
+        let udp=UdpSocket::bind("127.0.0.1:0").unwrap(); let backend=UdpSocket::bind("127.0.0.1:0").unwrap();
+        let mut cfg=Config::new("127.0.0.1:0".parse().unwrap(),None,Arc::new(|_|{})); cfg.no_hints=true;
+        let mut relay=Relay::new(cfg); let label=[8;8];
+        relay.legs.insert(label,Leg{pubkey:[0;32],addr:Some(backend.local_addr().unwrap()),last:Instant::now(),verified:true,ctl_verified:false,ctl:None});
+        let mut frame=Vec::new(); legframe::encode_tagged_frame(&label,&legframe::frame_bytes(5u8,b"fake QUIC"),&mut frame);
+        relay.handle_udp_packet(&udp,"127.0.0.1:50000".parse().unwrap(),&frame);
+        assert!(relay.assocs.is_empty()); assert_eq!(relay.stats.assigned,0);
     }
 }

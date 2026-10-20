@@ -1097,3 +1097,39 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 | 同上 | **观测停止/缩租/中继端口 owner** | 停止位调用前采样、detached 观测及 relay 线程 → 发布门保护 cache/token 提交，停止观察后等待线程退出，再缩租；UDP/TCP relay 线程由 owned worker 回收，所有外部 shutdown 调用等待同一完成结果 | F2/F4：防旧世代覆盖 token、独立 UDP dup 引发重启退让；调用方从观察日志回调重入仅请求停止，不能等待自己 | 正常注册/重试/保活节拍不变；不新增生产正常日志。UPnP SSDP 与 HTTP 每 50ms 可轮询取消；TCP connect 最长本次剩余预算且不超过 3s；DDNS 整拍共享 15s 并可取消 |
 | 同上 | **DoH HTTP framing / 配置错误 / 系统 DNS 与 UPnP hostname** | chunked/无 CL 一律拒绝 → 支持 chunked（含 trailer）与 EOF 定界，头+编码体+trailer 合计≤64KiB，拒 framing 歧义；全坏显式配置回退系统 → 明确 fail-closed；显式空仍用系统解析，但调用方经唯一进程 worker + 队列容量1有界等待；UPnP getaddrinfo 同步无界 → 同 LOCATION hostname 可复用 SSDP 来源，其它 hostname 用有界共享解析 | 消除协议兼容与取消缺口，保留 TLS 根校验和空配置原语义；默认 DoH 运营方不变，未改为隐式系统回退 | 新增可见 `DoH 未配置，系统解析 %s 失败（%v）——无可用结果` / `DoH：%s 查询候选耗尽或总预算/停止门触发——无可用结果` / `⚠️ DoH：全部候选无效——不回退系统解析器（显式配置 fail-closed），请检查 serve.doh 配置`；底层 getaddrinfo 不可取消但进程最多一个解析 worker、一个排队请求，不持出口/发布权。Windows 真实钉卡证据仍按前项登记待补 |
 | 同上 | **同步 TLS 与 QUIC 隔离源码门（非运行判据行）** | 三个同步 manifest 一律禁 rustls（前批同步 DoH 已使门失败）→ 唯一例外为 core 精确 `rustls.workspace=true` 与 `server/doh.rs` 消费；新增所有同步 Rust 文件的反向扫描，禁止例外扩散/async 关键字块/await/quinn/tokio；异步 panic 测试 std sleep → tokio sleep | 使门禁匹配已引入的同步 DoH 能力，保持 runtime 与 QUIC 状态在岛内；不是全 crate 豁免、不是跳过证书验证 | 其它十条门不放宽；同步 TLS 例外自校准覆盖异文件 rustls 拒绝、DoH 同步 TLS 放行、async fn/块拒绝及 await_quota 普通方法放行；原 M0 文件为历史设计，当前例外以本登记及 r5 整改记录为准 |
+
+
+### 2026-10-21：中继准入、持续直连与候选学习整改
+
+- 路径首胜判据由 `路径确立：…（首个完成握手）` 改为
+  `路径确立：…（首个完成准入）`；增加 `赛跑：候选准入未成 → 保留后备继续尝试`。
+  原因：TLS 首胜不代表可用路径；注册准入串行，每项至多 2s，整轮硬上限为原赛跑预算 +2s。
+- 新增 `中继升级直连：已确认 …（同连接，服务流保持）` / `中继升级直连：本轮未确认，保留中继`。
+  每 30s 最多 3 个候选，每项 700ms 共享 TLS-only 预筛与旧连接随机 nonce 验证期限；
+  不触发新设备准入，支持跨族和初始单族。中继 hint 仅接受配置中继源及公网单播目标。
+- `中继就绪` 的 `每源限速 … pps` 改为 `每源准入限速 … pps`：200pps 仅针对新建/控制，
+  正式数据按每会话 16MiB/s 字节桶计；避免共享 NAT 与大包吞吐被控制面阈值误限。
+- 新增 `中继：会话 #… 客户端准入已确认（正式配额 …/…）`，仅真实出口客户端准入后首次提升打印。
+  新 UDP wire：`CLADM` 45B（sid+cookie+域分离 HMAC），`UDP_SESSION` 0x12/43B
+  （SESSION 内容加域分离 HMAC）；独立 HMAC golden 见 `fixtures/relay-admission.json`。
+  确认 ACK/通告丢包有界重发；LEGUP 仅证明出口，不占客户端正式额度。
+  新中继要求新出口发 CLADM；部署顺序必须先出口后中继，旧出口配新中继仅有临时窗口。
+- TCP 就绪行的 `0.0.0.0` 改为实际配置监听地址；显式地址不扩大监听，通配分别建 v4/v6-only，
+  任一族冲突则整体 TCP 降级，握手全读写共享绝对期限。
+- 候选表最多 64 项，文件 64KiB；hint/探测列表 300s、DNS 600s、已验证 7d，失败冷却
+  2–64s。启动/巡检/恢复 DNS 异步解析，赛跑每 100ms 读取新候选；成功验证后才落已验证缓存。
+  token 更新替换目录；认证带内广播生产者未实现。tier 连接生命周期文档同步为现行口径。
+
+- 交叉复核收口：客户端准入证据额外绑定该 QUIC 连接首个 Initial 的 sid/cookie 代际，
+  不按处理请求时的 remote 当前值推断。代际表最多 1024 项/20s，失去证据不提升正式额度。
+  同代控制重放需同步替换发送 socket；首次 LEGUP 具绝对窗口内的有界重发。
+- 首次纯域名解析继续走 Critical 配额，恢复走 Background；全局工作额度短暂占满时，
+  首次解析在原固定预算内争取额度，不能把瞬时繁忙直接等同 token 没有端点。
+  明文参照点探测每次 recv 重算剩余期限并核验实际目标源，垃圾应答不能延长 worker 寿命。
+
+- 旁路地址列表采样与既有 patrol 同源，健康直连也触发；每轮最多 2 个有效直连候选公平轮转，
+  共 250ms、按剩余目标分配期限，失败不计健康/恢复证据。Probe/Hint 学习统一拒绝私网、
+  CGNAT、fake-IP、保留及 mapped 绕过，显式 token/DNS 内网候选不受此线索卫兵限制。
+- 中继预池 256/每源 IP 4；LEGUP 后独立在途保护池 64/每 IP 2、仍受原 10s 绝对准入窗。
+  新分配首包须有 QUIC v1/v2 Initial 形状；形状不代表认证，不可直接提升正式额度。
+  有限资源池不承诺在饱和的有效 Initial 攻击下无限接入；正式会话隔离和资源上界始终保留。

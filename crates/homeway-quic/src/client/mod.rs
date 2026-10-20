@@ -93,6 +93,7 @@ pub(crate) struct Face {
     cred: Arc<IslandCredential>,
     /// 中继候选表（发送侧包封的路由键；岛在 `SetCandidates`/`Connect`/`adopt` 时装配）。
     relays: Arc<RelayTable>,
+    candidates: Option<crate::CandidateHooks>,
     /// socket 读数（非 kind=5 帧忽略计数等；快照面读）。
     stats: Arc<Mutex<SockStats>>,
     /// 记行口（socket 层的忽略计数行用；与宿主同一个 `Logf`）。
@@ -124,6 +125,7 @@ impl Face {
             carrier: _,
             denied: _,
             on_adopt: _,
+            candidates,
         } = cfg;
         let relays = RelayTable::new();
         let stats = Arc::new(Mutex::new(SockStats::default()));
@@ -190,6 +192,7 @@ impl Face {
             cfg: client_cfg,
             cred: Arc::new(credential),
             relays,
+            candidates,
             stats,
             logf,
             local,
@@ -203,7 +206,13 @@ impl Face {
             ep6: self.ep6.clone(),
             cfg: self.cfg.clone(),
             cred: Arc::clone(&self.cred),
+            candidates: self.candidates.clone(),
+            relays: Arc::clone(&self.relays),
         }
+    }
+
+    pub(crate) fn candidate_hooks(&self) -> Option<&crate::CandidateHooks> {
+        self.candidates.as_ref()
     }
 
     /// 准入材料（`Arc` 克隆：赛跑/刷新任务共用一份，不复制敏感材料）。
@@ -312,8 +321,9 @@ impl Face {
                 }
             }
         }
-        let local = new_local
-            .ok_or_else(|| IslandErr::Rebind(io::Error::other("没有可重绑的地址族")))?;
+        let local =
+            new_local.ok_or_else(|| IslandErr::Rebind(io::Error::other("没有可重绑的地址族")))?;
+        self.relays.rebind_direct().map_err(IslandErr::Rebind)?;
         self.local = local;
         // §3.1-N5：**换网即清**发送面错误（`stats` 的 `Arc` 刻意跨 socket 共享——不清就会
         // 用换网前的陈旧 errno 决定下一步动作）。清零是「M/R 判别只看本网环境」的前提。
@@ -328,7 +338,7 @@ impl Face {
 }
 
 /// 赛跑 + 准入（设计 §2.2/§1.7 + 直连优先改裁）：**窗口内只投直连**（中继是纯后备），
-/// 首个完成握手者胜 ⇒ 走首条 bidi 控制流四帧准入（等 `A4` 确定性回执）⇒ 交回可用连接。
+/// 握手完成后串行四帧准入，首个拿到 `A4` 确定性回执者胜；路径失败保留后备。
 ///
 /// 自由函数而不是 `Face` 的方法：宿主把它搬进 `JoinSet` 任务（`Face` 本体留在宿主里
 /// 供换绑/刷新用），故只搬必需的三件（端点 `Arc` + 配置 + 凭据 `Arc`）。
@@ -351,6 +361,8 @@ pub(crate) struct ConnectKit {
     pub(crate) ep6: Option<Arc<Endpoint>>,
     pub(crate) cfg: quinn::ClientConfig,
     pub(crate) cred: Arc<IslandCredential>,
+    pub(crate) candidates: Option<crate::CandidateHooks>,
+    pub(crate) relays: Arc<RelayTable>,
 }
 
 impl ConnectKit {
@@ -566,6 +578,94 @@ async fn echo_once(ps: &mut ProbeStream, conn: &Connection) -> Result<Duration, 
             }
         }
     }
+}
+
+/// 健康中继按原连接迁移到直连：不注册、不替换设备、不关闭已有服务流。
+/// 失败/取消时 RAII 撤销临时物理路由，现任中继可继续工作。
+pub(crate) async fn upgrade_direct(
+    conn: &Connection,
+    kit: ConnectKit,
+    choices: Vec<Candidate>,
+    hooks: Option<crate::CandidateHooks>,
+) -> Option<Candidate> {
+    struct Rollback {
+        table: Arc<RelayTable>,
+        keep: bool,
+    }
+    impl Drop for Rollback {
+        fn drop(&mut self) {
+            if !self.keep {
+                self.table.clear_direct();
+            }
+        }
+    }
+    let relays = Arc::clone(&kit.relays);
+    let mut route = Rollback {
+        table: Arc::clone(&relays),
+        keep: false,
+    };
+    for c in choices.into_iter().take(3) {
+        let deadline = TokioInstant::now() + Duration::from_millis(700);
+        // 只做 RPK TLS 握手预筛：不注册、不改变现任路径，黑洞候选不暂停应用流。
+        let preflight = async {
+            let ep = match kit.endpoint_for(c.addr) {
+                Some(ep) => ep,
+                None => {
+                    // 初始 token 只有单族时，后学到的另一族仍可预筛；临时端点不准入。
+                    let bind = if c.addr.is_ipv4() {
+                        "0.0.0.0:0"
+                    } else {
+                        "[::]:0"
+                    };
+                    Arc::new(Endpoint::client(bind.parse().map_err(|_| ())?).map_err(|_| ())?)
+                }
+            };
+            let fresh = ep
+                .connect_with(kit.cfg.clone(), c.addr, server_name())
+                .map_err(|_| ())?
+                .await
+                .map_err(|_| ())?;
+            fresh.close(quinn::VarInt::from_u32(0), b"direct preflight complete");
+            Ok::<_, ()>(())
+        };
+        if !matches!(
+            tokio::time::timeout_at(deadline, preflight).await,
+            Ok(Ok(()))
+        ) {
+            if let Some(h) = &hooks {
+                (h.outcome)(c, false);
+            }
+            continue;
+        }
+        if relays.begin_direct(conn.remote_address(), c.addr).is_err() {
+            continue;
+        }
+        let probe = async {
+            let mut nonce = [0u8; 32];
+            getrandom::getrandom(&mut nonce).map_err(|_| ())?;
+            let mut ps = open_probe(conn).await.map_err(|_| ())?;
+            ps.send.write_all(&nonce).await.map_err(|_| ())?;
+            let mut echoed = [0u8; 32];
+            ps.recv.read_exact(&mut echoed).await.map_err(|_| ())?;
+            if nonce != echoed {
+                return Err(());
+            }
+            Ok(())
+        };
+        if matches!(tokio::time::timeout_at(deadline, probe).await, Ok(Ok(()))) {
+            route.keep = true;
+            if let Some(h) = &hooks {
+                (h.learn)(c, crate::CandidateSource::Probe);
+                (h.outcome)(c, true);
+            }
+            return Some(c);
+        }
+        relays.clear_direct();
+        if let Some(h) = &hooks {
+            (h.outcome)(c, false);
+        }
+    }
+    None
 }
 
 /// 时长文案（判据行的 `%v`）：与既有 C 系列的 Go `%v`（ms 取整、去尾零）同口径。

@@ -51,7 +51,7 @@
 //!   （`qtcp` 输入集新增 tag=6）。
 
 use std::io::{self, Read, Write};
-use std::net::{SocketAddr, SocketAddrV4};
+use std::net::SocketAddrV4;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::mpsc;
@@ -302,6 +302,8 @@ pub struct HostSessionConfig {
     pub token: Token,
     /// 身份目录（`None` = 临时身份）。
     pub identity_dir: Option<PathBuf>,
+    /// 与VPN共用的按peerID学习目录。
+    pub endpoint_cache_dir: Option<PathBuf>,
     /// 原始日志面。**本模块在其上加 `服务会话: ` 前缀**——与 WG 档
     /// `session::Session::start` 的前缀口径**逐字相同**（R2 前缀硬规则；daemon 的
     /// `hosts: <id> ` 等外层前缀由调用方自带，本层不吞不改）。
@@ -361,7 +363,7 @@ struct Inner {
     /// 巡检线程柄（有界 join）。
     patrol: Mutex<Option<std::thread::JoinHandle<()>>>,
     /// 候选名册（token 端点派生；世代重建重赛跑用——与初次建连同一份）。
-    cands: Vec<homeway_quic::Candidate>,
+    candidates: Option<Arc<super::endpoint_candidates::EndpointCandidates>>,
     /// 一次性重建门（单飞 + 边沿 pending + demand 限频）。
     rebuild_gate: RebuildGate,
     /// 当前重建 worker 柄（短命；收工时有界 join）。
@@ -389,8 +391,15 @@ impl HostSession {
         };
         (logf)("启动（无 TUN 服务会话）"); // C12（M3 起岛化，行文不变）
 
-        // 候选（QUIC 类 + 中继类端点；域名端点解析一次——设计 §2.4-A5 的承接面）。
-        let cands = host_candidates(&cfg.token, &logf)?;
+        // VPN/服务共用候选学习；DDNS在装配与每轮恢复异步刷新。
+        let candidates = super::endpoint_candidates::EndpointCandidates::open(
+            &cfg.token,
+            cfg.endpoint_cache_dir.as_deref(),
+        );
+        let cands = candidates.initial();
+        if cands.is_empty() {
+            return Err(HostErr::Start("token 里没有任何可用端点".to_owned()));
+        }
         let (ident, src, warn) = identity::load_or_create(cfg.identity_dir.as_deref(), &cfg.token.peer_id)
             .map_err(|e| HostErr::Start(format!("身份装配失败：{e}")))?;
         let dir_text = cfg
@@ -450,7 +459,7 @@ impl HostSession {
             }),
             logf: Arc::clone(&logf),
             patrol: Mutex::new(None),
-            cands: cands.clone(),
+            candidates: Some(Arc::clone(&candidates)),
             rebuild_gate: RebuildGate {
                 state: AtomicU32::new(0),
                 last: Mutex::new(None),
@@ -709,7 +718,7 @@ impl HostSession {
             }),
             logf,
             patrol: Mutex::new(None),
-            cands: Vec::new(),
+            candidates: None,
             rebuild_gate: RebuildGate {
                 state: AtomicU32::new(0),
                 last: Mutex::new(None),
@@ -730,65 +739,6 @@ impl Drop for HostSession {
 
 // ---------- 岛装配 ----------
 
-/// token 端点 → 岛候选（**只吃 QUIC 类**：`Quic` ⇒ 直连、`Relay` ⇒ 中继；WG 类端点
-/// 不喂岛）。域名形态端点**在本模块解析一次**（设计 §2.4-A5 的承接：`--ddns` 发布的
-/// 域名端点在宿主会话里仍可用）；解析失败/无 v4 记录 ⇒ 记行跳过（不静默）。
-fn host_candidates(tok: &Token, logf: &Logf) -> Result<Vec<homeway_quic::Candidate>, HostErr> {
-    use crate::token::EndpointKind;
-    let label = crate::legframe::relay_id(tok.peer_id.as_bytes());
-    let mut out: Vec<homeway_quic::Candidate> = Vec::new();
-    for e in &tok.endpoints {
-        let via = match e.kind {
-            EndpointKind::Quic => homeway_quic::Via::Direct,
-            EndpointKind::Relay => homeway_quic::Via::Relay { label },
-            EndpointKind::Direct => continue, // WG 类端点（不喂岛）
-        };
-        let addrs: Vec<SocketAddr> = if let Ok(a) = e.addr.parse::<SocketAddr>() {
-            vec![a]
-        } else {
-            // 域名形态：解析一次（有界预算；A/AAAA 都进候选——岛 socket 双栈）
-            resolve_endpoints(&e.addr, logf)
-        };
-        for addr in addrs {
-            if out.iter().any(|c| c.addr == addr) {
-                continue; // 同址去重（先到先得）
-            }
-            out.push(homeway_quic::Candidate { addr, via });
-        }
-    }
-    if out.is_empty() {
-        // 与 WG 档同串（`SessionErr::NoCandidates` 的 rc/失败面语义等价）。
-        return Err(HostErr::Start("token 里没有任何可用端点".to_owned()));
-    }
-    Ok(out)
-}
-
-/// 域名端点 → 全部 A/AAAA 地址（有界预算；失败/无记录 ⇒ 记行 + 空列表）。
-fn resolve_endpoints(addr: &str, logf: &Logf) -> Vec<SocketAddr> {
-    let Some((host, port)) = crate::hostdns::split_host_port(addr) else {
-        return Vec::new();
-    };
-    let ips = crate::hostdns::lookup_host(
-        &host,
-        crate::hostdns::PROBE_SYNC_BUDGET,
-        crate::hostdns::ResolveLane::Critical,
-    )
-    .unwrap_or_default();
-    let mut out: Vec<SocketAddr> = Vec::new();
-    for ip in ips {
-        let a = SocketAddr::new(ip, port);
-        if !out.contains(&a) {
-            out.push(a);
-        }
-    }
-    if out.is_empty() {
-        (logf)(&format!(
-            "宿主会话：域名端点 {addr} 无可用 A/AAAA 记录（本世代跳过该端点）"
-        ));
-    }
-    out
-}
-
 /// 起岛（凭据 → `IslandConfig` → 回调/候选注入）。
 fn start_island(
     tok: &Token,
@@ -807,6 +757,9 @@ fn start_island(
     );
     let mut icfg = IslandConfig::new(cred);
     icfg.patrol = PATROL_INTERVAL;
+    if let Some(candidates) = &inner.candidates {
+        icfg.candidates = Some(candidates.hooks());
+    }
     // 岛内阶梯 R 成功采纳 = 连接已恢复的**权威沿**（评审 2026-10-20 A12）：没有这个回调时，
     // 岛自己恢复了、facade 却可能永远停在 failed（run_rebuild 被 RaceInFlight 让路/巡检只刷
     // link 的路径都会留下状态差）。回调只把 failed 拉回 ready，不覆盖 stopping/idle。
@@ -818,12 +771,8 @@ fn start_island(
             }
         }));
     }
-    // 绑定族按候选面选（纯 v4 = v4 socket；含 v6 = 双栈 `[::]:0`）。
-    icfg.bind = if cands.iter().any(|c| c.addr.is_ipv6()) {
-        None
-    } else {
-        Some(SocketAddr::from((std::net::Ipv4Addr::UNSPECIFIED, 0)))
-    };
+    // 域名/动态线索可在恢复轮引入另一地址族，始终建两族socket。
+    icfg.bind = None;
     // MTU 上限：宿主会话恒用缺省（`tunConfig.quicMtuCap` 属隧道域旋钮；宿主会话无 L3）。
     let w = Arc::downgrade(inner);
     let on_unhealthy: homeway_quic::OnUnhealthy = Arc::new(move |reason: &str| {
@@ -834,6 +783,9 @@ fn start_island(
     let island = Island::start(Arc::clone(&inner.logf), on_unhealthy, icfg)
         .map_err(|e| HostErr::Start(format!("岛启动失败：{e}")))?;
     let island = Arc::new(island);
+    if let Some(candidates) = &inner.candidates {
+        candidates.bind(&island);
+    }
     // 「立即装定」显式面（与 tun_exec 同款：构造期回调已是同一份，这一发是显式面）。
     let w2 = Arc::downgrade(inner);
     let h: homeway_quic::OnUnhealthy = Arc::new(move |reason: &str| {
@@ -1028,7 +980,8 @@ fn run_rebuild(inner: &Arc<Inner>, source: RebuildSource) {
         (inner.logf)(&format!("一次性重建：放弃（源={}，岛已收回）", source.text()));
         return;
     };
-    let n = inner.cands.len();
+    let n = inner.candidates.as_ref()
+        .map(|c| c.candidates().len()).unwrap_or_default();
     (inner.logf)(&format!(
         "一次性重建：起跑（源={}，候选 {n} 个）",
         source.text()
@@ -1037,7 +990,7 @@ fn run_rebuild(inner: &Arc<Inner>, source: RebuildSource) {
     match island_cmd(
         &island,
         |reply| Cmd::Connect {
-            cands: inner.cands.clone(),
+            cands: Vec::new(),
             budget: CONNECT_BUDGET,
             demote_adopted: false,
             reply,
@@ -1558,7 +1511,12 @@ mod tests {
             rpk: None,
         };
         let logf: Logf = Arc::new(|_s: &str| {});
-        let e = host_candidates(&tok, &logf).expect_err("WG-only token 在宿主会话无候选");
+        let e = match HostSession::start(HostSessionConfig {
+            token: tok, identity_dir: None, endpoint_cache_dir: None, logf,
+        }) {
+            Err(e) => e,
+            Ok(_) => panic!("WG-only token在宿主会话必须无候选"),
+        };
         assert!(
             matches!(&e, HostErr::Start(m) if m.contains("没有任何可用端点")),
             "{e}"

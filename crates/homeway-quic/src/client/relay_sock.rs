@@ -16,8 +16,7 @@
 //!    `{addr, via}`，中继候选的 addr 就是中继端点 ⇒ 查 [`RelayTable`] 命中即包封。
 //!    表由岛在 `SetCandidates`/`Connect` 时装配（`set` 整体替换 + 现任 `pin`）。
 //! 3. **接收侧按首字节分流**：`0xBB` 开头的报文是腿帧（中继下行恒 `[0xBB][kind]`），
-//!    `kind=5` 剥壳喂 quinn、**其余 kind 忽略**（中继会推 hint 控制帧——S1c 探针实测
-//!    `rx_ignored=4`）；非 `0xBB` 开头 = 裸 QUIC 包（`0xAA`/`0xBB` 都不是合法的 QUIC v1
+//!    `kind=5` 剥壳喂 quinn；hint 仅从配置中继收取为未验证候选，其余控制帧忽略；非 `0xBB` 开头 = 裸 QUIC 包（`0xAA`/`0xBB` 都不是合法的 QUIC v1
 //!    首字节：长头保留位/固定位约束，短头首字节 ∈ [0x40,0x7F]）。
 //!
 //! 段能力 = 1（与出口侧同款，Q-K 登记）：`max_transmit_segments/max_receive_segments`
@@ -100,11 +99,114 @@ pub(crate) fn wrap_uplink(label: [u8; 8], pkt: &[u8]) -> Vec<u8> {
 pub(crate) struct RelayTable {
     cands: Mutex<HashMap<SocketAddr, [u8; 8]>>,
     pinned: Mutex<Option<(SocketAddr, [u8; 8])>>,
+    route: Mutex<Option<DirectRoute>>,
+    hints: Mutex<Vec<Candidate>>,
+    recv_wakers: Mutex<[Option<std::task::Waker>; 2]>,
+}
+
+/// QUIC 保留逻辑 peer/CID；仅改变该 peer 的物理投递路径。
+#[derive(Clone)]
+struct DirectRoute {
+    peer: SocketAddr,
+    target: SocketAddr,
+    aux: Option<Arc<TokioUdp>>,
 }
 
 impl RelayTable {
     pub(crate) fn new() -> Arc<Self> {
         Arc::new(Self::default())
+    }
+
+    pub(crate) fn take_hints(&self) -> Vec<Candidate> {
+        std::mem::take(&mut *lock_unpoison(&self.hints))
+    }
+
+    /// 仅采用已配置中继的公网单播线索；本地地址必须由 token/宿主候选明确提供。
+    fn note_hint(&self, source: SocketAddr, frame: &[u8]) {
+        if self.label_of(&source).is_none() || frame.len() < 5 || frame[..2] != [FRAME_MAGIC, 1] {
+            return;
+        }
+        let n = u16::from_be_bytes([frame[2], frame[3]]) as usize;
+        if n == 0 || n > 128 || frame.len() != 4 + n {
+            return;
+        }
+        let Some(addr) = std::str::from_utf8(&frame[4..])
+            .ok()
+            .and_then(|s| s.parse::<SocketAddr>().ok())
+        else {
+            return;
+        };
+        let addr = crate::sysio::unmap_v4_mapped(addr);
+        let public = match addr.ip() {
+            std::net::IpAddr::V4(ip) => {
+                !ip.is_private()
+                    && !ip.is_loopback()
+                    && !ip.is_unspecified()
+                    && !ip.is_multicast()
+                    && !ip.is_link_local()
+                    && !ip.is_broadcast()
+                    && !(ip.octets()[0] == 100 && (64..=127).contains(&ip.octets()[1]))
+                    && !(ip.octets()[0] == 198 && (18..=19).contains(&ip.octets()[1]))
+                    && ip.octets()[0] != 0
+                    && ip.octets()[0] < 224
+            }
+            std::net::IpAddr::V6(ip) => {
+                !ip.is_loopback()
+                    && !ip.is_unspecified()
+                    && !ip.is_multicast()
+                    && ip.segments()[0] & 0xfe00 != 0xfc00
+                    && ip.segments()[0] & 0xffc0 != 0xfe80
+            }
+        };
+        if !public || addr.port() == 0 {
+            return;
+        }
+        let cand = Candidate {
+            addr,
+            via: Via::Direct,
+        };
+        let mut hints = lock_unpoison(&self.hints);
+        if hints.len() < 8 && !hints.contains(&cand) {
+            hints.push(cand);
+        }
+    }
+
+    pub(crate) fn begin_direct(&self, peer: SocketAddr, target: SocketAddr) -> io::Result<()> {
+        let aux = if peer.is_ipv4() != target.is_ipv4() {
+            let bind = if target.is_ipv4() {
+                "0.0.0.0:0"
+            } else {
+                "[::]:0"
+            };
+            let udp = std::net::UdpSocket::bind(bind)?;
+            udp.set_nonblocking(true)?;
+            Some(Arc::new(TokioUdp::from_std(udp)?))
+        } else {
+            None
+        };
+        *lock_unpoison(&self.route) = Some(DirectRoute { peer, target, aux });
+        if let Some(w) = &lock_unpoison(&self.recv_wakers)[usize::from(peer.is_ipv6())] {
+            w.wake_by_ref();
+        }
+        Ok(())
+    }
+
+    pub(crate) fn clear_direct(&self) {
+        let old = lock_unpoison(&self.route).take();
+        if let Some(r) = old {
+            if let Some(w) = &lock_unpoison(&self.recv_wakers)[usize::from(r.peer.is_ipv6())] {
+                w.wake_by_ref();
+            }
+        }
+    }
+
+    /// 换网重建跨族辅助 socket；同族路径自然随 endpoint 换绑。
+    pub(crate) fn rebind_direct(&self) -> io::Result<()> {
+        let old = lock_unpoison(&self.route).clone();
+        if let Some(r) = old {
+            self.begin_direct(r.peer, r.target)?;
+        }
+        Ok(())
     }
 
     /// 装配本轮候选清单（只收 `Via::Relay` 的条目；整体替换）。
@@ -187,7 +289,11 @@ impl SockStats {
     }
 
     /// 系统禁发是否**新鲜**（阶梯收口判据；进程级事实，不随 rebind 清零）。
-    pub(crate) fn denied_fresh(&self, now: std::time::Instant, window: std::time::Duration) -> bool {
+    pub(crate) fn denied_fresh(
+        &self,
+        now: std::time::Instant,
+        window: std::time::Duration,
+    ) -> bool {
         match self.last_denied_at {
             Some(t) => now.saturating_duration_since(t) <= window,
             None => false,
@@ -230,7 +336,11 @@ pub(crate) fn classify_send_err(e: &std::io::Error) -> SendErrClass {
 }
 
 /// 计数落点（`try_send` 的**唯一**错误入口；返回本次归类供节流记行判定）。
-pub(crate) fn note_send_err(st: &mut SockStats, e: &std::io::Error, now: std::time::Instant) -> SendErrClass {
+pub(crate) fn note_send_err(
+    st: &mut SockStats,
+    e: &std::io::Error,
+    now: std::time::Instant,
+) -> SendErrClass {
     let class = classify_send_err(e);
     match class {
         SendErrClass::WouldBlock => {} // 正常回执：零计数（N5 的负例判据就是这条）
@@ -305,7 +415,10 @@ impl ClientSock {
         // 核内会把设定值翻倍记账（Linux 口径），故内存账按 2× 记（登记面见 M6.7 记录）。
         const RCVBUF: usize = 2 * 1024 * 1024;
         const SNDBUF: usize = 1024 * 1024;
-        for (opt, want) in [(crate::sysio::SO_RCVBUF, RCVBUF), (crate::sysio::SO_SNDBUF, SNDBUF)] {
+        for (opt, want) in [
+            (crate::sysio::SO_RCVBUF, RCVBUF),
+            (crate::sysio::SO_SNDBUF, SNDBUF),
+        ] {
             let v = i32::try_from(want).unwrap_or(i32::MAX);
             // setsockopt 失败**不致命**（沿用内核缺省 + 记行）——sysio 同形收口（WIN 批）。
             let r = crate::sysio::setsockopt_i32(
@@ -380,19 +493,32 @@ impl AsyncUdpSocket for ClientSock {
             }
             return Ok(());
         }
-        let framed = self.relays.label_of(&transmit.destination).map(|label| {
-            let mut out = Vec::with_capacity(RELAY_TAG_LEN + ENV_LEN + transmit.contents.len());
-            out.extend_from_slice(&wrap_uplink(label, transmit.contents));
-            out
-        });
+        let route = lock_unpoison(&self.relays.route).clone();
+        let route = route.filter(|r| r.peer == transmit.destination);
+        let destination = route.as_ref().map_or(transmit.destination, |r| r.target);
+        let framed = if route.is_some() {
+            None
+        } else {
+            self.relays
+                .label_of(&transmit.destination)
+                .map(|label| wrap_uplink(label, transmit.contents))
+        };
         let (payload, relayed): (&[u8], bool) = match &framed {
             Some(f) => (f.as_slice(), true),
             None => (transmit.contents, false),
         };
+        let sent = if let Some(aux) = route.as_ref().and_then(|r| r.aux.as_ref()) {
+            aux.try_send_to(payload, destination).map(|_| ())
+        } else {
         #[cfg(unix)]
-        let sent = crate::sysio::send_to(self.raw, payload, transmit.destination);
+            {
+                crate::sysio::send_to(self.raw, payload, destination).map(|_| ())
+            }
         #[cfg(windows)]
-        let sent = self.io.try_send_to(payload, transmit.destination).map(|_| ());
+            {
+                self.io.try_send_to(payload, destination).map(|_| ())
+            }
+        };
         match sent {
             Ok(_) => {
                 let mut st = lock_unpoison(&self.stats);
@@ -435,7 +561,45 @@ impl AsyncUdpSocket for ClientSock {
         meta: &mut [RecvMeta],
     ) -> Poll<io::Result<usize>> {
         debug_assert_eq!(bufs.len(), meta.len(), "quinn 恒成对传入 bufs/meta");
+        lock_unpoison(&self.relays.recv_wakers)[usize::from(self.local.is_ipv6())] =
+            Some(cx.waker().clone());
         loop {
+            // 跨家庭升级的辅助 socket 仍归原 endpoint 驱动；aux 源精确匹配后映回虚拟 peer。
+            let route = lock_unpoison(&self.relays.route)
+                .clone()
+                .filter(|r| r.peer.is_ipv4() == self.local.is_ipv4());
+            if let Some(r) = &route {
+                if let Some(aux) = &r.aux {
+                    match aux.poll_recv_ready(cx) {
+                        Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
+                        Poll::Pending => {}
+                        Poll::Ready(Ok(())) => match aux.try_recv_from(&mut bufs[0]) {
+                            Ok((n, source))
+                                if crate::sysio::unmap_v4_mapped(source) == r.target =>
+                            {
+                                meta[0] = RecvMeta {
+                                    addr: r.peer,
+                                    len: n,
+                                    stride: n,
+                                    ecn: None,
+                                    dst_ip: None,
+                                };
+                                return Poll::Ready(Ok(1));
+                            }
+                            Ok(_) => continue,
+                            Err(e)
+                                if matches!(
+                                    e.kind(),
+                                    io::ErrorKind::WouldBlock | io::ErrorKind::Interrupted
+                                ) =>
+                            {
+                                continue;
+                            }
+                            Err(e) => return Poll::Ready(Err(e)),
+                        },
+                    }
+                }
+            }
             match self.io.poll_recv_ready(cx) {
                 Poll::Ready(Ok(())) => {}
                 Poll::Ready(Err(e)) => return Poll::Ready(Err(e)),
@@ -468,11 +632,20 @@ impl AsyncUdpSocket for ClientSock {
             for i in 0..recvd {
                 let len = meta[i].len;
                 let src = meta[i].addr;
+                // 升级探测期间与成功后均拒旧中继回包，防旧路径回显误确认直连。
+                if route.as_ref().is_some_and(|r| src == r.peer) {
+                    continue;
+                }
+                let logical_src = route
+                    .as_ref()
+                    .filter(|r| r.aux.is_none() && src == r.target)
+                    .map_or(src, |r| r.peer);
                 let (start, payload_len) = match strip_downlink(&bufs[i][..len]) {
                     Downlink::Bare => (0usize, len),
                     Downlink::Quic(p) => (ENV_LEN, p.len()),
                     // 非 kind=5 帧：**不喂 quinn**（中继的 hint 控制帧等）；计数 + 节流记行
                     Downlink::Ignored => {
+                        self.relays.note_hint(src, &bufs[i][..len]);
                         ignored_src = Some(src);
                         continue;
                     }
@@ -486,7 +659,7 @@ impl AsyncUdpSocket for ClientSock {
                     left[out][..payload_len].copy_from_slice(&right[0][..payload_len]);
                 }
                 meta[out] = RecvMeta {
-                    addr: src,
+                    addr: logical_src,
                     len: payload_len,
                     stride: payload_len,
                     ecn: None,
@@ -548,6 +721,12 @@ impl std::fmt::Debug for SockPoller {
 
 impl UdpPoller for SockPoller {
     fn poll_writable(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<io::Result<()>> {
+        let route = lock_unpoison(&self.sock.relays.route)
+            .clone()
+            .filter(|r| r.peer.is_ipv4() == self.sock.local.is_ipv4());
+        if let Some(aux) = route.and_then(|r| r.aux) {
+            return aux.poll_send_ready(cx);
+        }
         self.sock.io.poll_send_ready(cx)
     }
 }
@@ -624,11 +803,7 @@ mod tests {
         let mut st = SockStats::default();
         let now = Instant::now();
         for _ in 0..10_000 {
-            let class = note_send_err(
-                &mut st,
-                &io::Error::from(io::ErrorKind::WouldBlock),
-                now,
-            );
+            let class = note_send_err(&mut st, &io::Error::from(io::ErrorKind::WouldBlock), now);
             assert_eq!(class, SendErrClass::WouldBlock);
         }
         assert_eq!(st.send_errs, 0, "WouldBlock 绝不进任何计数");
@@ -698,7 +873,11 @@ mod tests {
         );
 
         // 计数 + 新鲜度：t0 命中 ⇒ 5s 窗内新鲜；6s 后不新鲜
-        let class = note_send_err(&mut st, &io::Error::from_raw_os_error(libc::ENETUNREACH), t0);
+        let class = note_send_err(
+            &mut st,
+            &io::Error::from_raw_os_error(libc::ENETUNREACH),
+            t0,
+        );
         assert_eq!(class, SendErrClass::Local);
         assert_eq!(st.send_errs, 1);
         assert_eq!(st.send_errs_local, 1);
@@ -707,7 +886,11 @@ mod tests {
         assert!(!st.local_send_err_fresh(t0 + std::time::Duration::from_secs(6), win));
 
         // Other 只涨总量（不进 M 判据）
-        note_send_err(&mut st, &io::Error::from_raw_os_error(libc::ECONNREFUSED), t0);
+        note_send_err(
+            &mut st,
+            &io::Error::from_raw_os_error(libc::ECONNREFUSED),
+            t0,
+        );
         assert_eq!(st.send_errs, 2);
         assert_eq!(st.send_errs_local, 1, "Other 不进白名单计数");
 
@@ -794,7 +977,64 @@ mod tests {
         let got = got.expect("收包");
         assert_eq!(got, 1);
         assert_eq!(&recv_buf[..meta[0].len], b"pong6");
-        assert!(meta[0].addr.is_ipv6(), "v6 回包保持 V6（实得 {}）", meta[0].addr);
+        assert!(
+            meta[0].addr.is_ipv6(),
+            "v6 回包保持 V6（实得 {}）",
+            meta[0].addr
+        );
+    }
     }
 
+#[cfg(test)]
+mod hint_tests {
+    use super::*;
+
+    fn hint(addr: &str) -> Vec<u8> {
+        let mut raw = vec![FRAME_MAGIC, 1];
+        raw.extend_from_slice(&(addr.len() as u16).to_be_bytes());
+        raw.extend_from_slice(addr.as_bytes());
+        raw
+}
+    #[test]
+    fn hint_requires_configured_source_and_public_canonical_address() {
+        let t = RelayTable::new();
+        let source: SocketAddr = "198.51.100.10:41741".parse().unwrap();
+        t.set(&[Candidate {
+            addr: source,
+            via: Via::Relay { label: [1; 8] },
+        }]);
+        for addr in [
+            "127.0.0.1:99",
+            "10.0.0.1:99",
+            "[::1]:99",
+            "[fc00::1]:99",
+            "[fe80::1]:99",
+            "224.0.0.1:99",
+            "0.0.0.0:99",
+            "203.0.113.1:0",
+            "[::ffff:127.0.0.1]:99",
+            "[::ffff:10.0.0.1]:99",
+            "[::ffff:224.0.0.1]:99",
+            "100.64.0.1:99",
+            "100.127.255.254:99",
+            "198.18.0.1:99",
+            "198.19.255.254:99",
+            "[::ffff:100.64.0.1]:99",
+            "[::ffff:100.127.255.254]:99",
+            "[::ffff:198.18.0.1]:99",
+            "[::ffff:198.19.255.254]:99",
+        ] {
+            t.note_hint(source, &hint(addr));
+        }
+        t.note_hint(
+            "198.51.100.11:41741".parse().unwrap(),
+            &hint("203.0.113.1:99"),
+        );
+        assert!(t.take_hints().is_empty());
+        t.note_hint(source, &hint("203.0.113.1:99"));
+        t.note_hint(source, &hint("[::ffff:203.0.113.1]:99"));
+        let hints = t.take_hints();
+        assert_eq!(hints.len(), 1, "mapped 归一去重");
+        assert_eq!(hints[0].addr, "203.0.113.1:99".parse().unwrap());
+    }
 }

@@ -197,7 +197,7 @@ pub enum EngineCmd {
     /// 必须经驱动线程取；拦截计数是共享原子、不经此路）。
     StatusQuery { reply: Sender<Vec<EnginePeerBrief>> },
     /// 控制面 SESSION 通告 → 向中继数据口拨腿（R4）。
-    LegRegister { id: u64, remote: SocketAddr, marker: Vec<u8> },
+    LegRegister { id: u64, remote: SocketAddr, marker: Vec<u8>, admission_marker: Vec<u8> },
     /// 控制面 RELEASE → 拆腿。
     LegRemove { id: u64 },
     /// 控制面重连对账 → 拆全部腿（等重放重建）。
@@ -859,14 +859,22 @@ impl ServeEngine {
                     // 发出 ⇒ 回执回到公共端口，由 `pubface` 的钩子分派）。
                     let (leg_tx, leg_rx) = mpsc::sync_channel::<super::relayleg::LegEvent>(64);
                     let leg_tx_frame = leg_tx.clone();
+                    let configured_relay = arg.addr;
                     bind.set_on_leg_frame(Box::new(move |payload, src| {
+                        if src != configured_relay { return; }
                         let _ =
                             leg_tx_frame.try_send(super::relayleg::LegEvent::Frame(payload.to_vec(), src));
                     }));
                     let leg_tx_frame2 = leg_tx.clone();
                     pubface.set_on_leg_frame(Box::new(move |payload, src| {
+                        if src != configured_relay { return; }
                         let _ =
                             leg_tx_frame2.try_send(super::relayleg::LegEvent::Frame(payload.to_vec(), src));
+                    }));
+                    let hint_tx = leg_tx.clone();
+                    pubface.set_on_hint(Box::new(move |payload, src| {
+                        if src != configured_relay { return; }
+                        let _ = hint_tx.try_send(super::relayleg::LegEvent::Hint(payload.to_vec(), src));
                     }));
                     let stop = spawn_service_stop_flag(&mut stop_flags);
                     let leg = super::relayleg::spawn_relay_leg(
@@ -874,6 +882,7 @@ impl ServeEngine {
                         arg.addr,
                         priv_key.clone(),
                         arg.secret,
+                        cmd_tx.clone(),
                         (leg_tx, leg_rx),
                         Arc::clone(&stop),
                         Arc::clone(&logf),
@@ -1551,9 +1560,9 @@ fn driver_loop(
                     // 看护循环重钉（公共端口 socket——dup fd 上 setsockopt；两族都设、单栈容错）
                     let _ = reply.send(pubface.repin_to(index, &name));
                 }
-                EngineCmd::LegRegister { id, remote, marker } => {
+                EngineCmd::LegRegister { id, remote, marker, admission_marker } => {
                     // SESSION 通告 → 拨腿（连接 socket + LEGUP 标记 + 入表）
-                    if let Err(e) = bind.register_leg(id, remote, &marker) {
+                    if let Err(e) = bind.register_leg_with_admission(id, remote, &marker, &admission_marker) {
                         (dlogf)(&format!("中继控制面：会话 #{id} 拨腿失败（→ {remote}）：{e}"));
                     }
                 }
@@ -1612,7 +1621,10 @@ fn driver_loop(
                 let pkt = inbound.quic;
                 let n = pkt.payload.len();
                 match quic_face.as_ref() {
-                    Some(q) if q.inject_leg(pkt.src, pkt.payload) => {}
+                    Some(q) if match pkt.generation {
+                        Some(generation) => q.inject_leg_generation(pkt.src, pkt.payload, generation),
+                        None => q.inject_leg(pkt.src, pkt.payload),
+                    } => {}
                     _ => bind.note_quic_leg_undelivered(n),
                 }
             }
@@ -1624,7 +1636,9 @@ fn driver_loop(
         if let Some(q) = quic_face.as_ref() {
             if quic_poll_idx.is_some_and(|i| pollfds[i].revents & crate::sysock::POLLIN != 0) {
                 q.drain_inbound(|item| {
-                    on_quic_inbound(item, table, intercept, Some(q), &mut pub_by_tun, dlogf)
+                    if let Some((remote, generation)) = on_quic_inbound(item, table, intercept, Some(q), &mut pub_by_tun, dlogf) {
+                        bind.confirm_client(remote, generation);
+                    }
                 });
             }
             // 出口面线程死（panic/异常退出）= 引擎侧可观测的「不健康」：**记一次行**
@@ -1641,6 +1655,8 @@ fn driver_loop(
         // ④ 出站分流（M5 §3.2-bis：dst == 设备 tun_ip ⇒ QUIC DATAGRAM；无绑定 ⇒ 丢 +
         //    计数 + 节流记行——原「WG 兜底」面无替代、不静默）
         route_out(&tx, &pub_by_tun, quic_face.as_ref(), &mut unbound_dropped, dlogf);
+        // 真准入确认走可靠有界重发；LEGUP 只认证出口，不能提升匿名客户端。
+        bind.retry_client_admissions();
         // ⑤ 周期任务
         let now = Instant::now();
         if now >= next_gc {
@@ -1728,10 +1744,12 @@ fn sync_quic_legs(bind: &mut ServerBind, quic: Option<&homeway_quic::ExitQuic>) 
         }
     }
     for remote in cur {
-        if !q.has_leg(&remote) {
-            if let Some(sock) = bind.leg_send_handle(&remote) {
-                q.leg_open(remote, sock);
+        if let Some((generation, local)) = bind.leg_generation(remote) {
+            if !q.leg_matches(remote, local, generation) {
+                if let Some(sock) = bind.leg_send_handle(&remote) { q.leg_open_generation(remote, sock, generation); }
             }
+        } else if !q.has_leg(&remote) {
+            if let Some(sock) = bind.leg_send_handle(&remote) { q.leg_open(remote, sock); }
         }
     }
 }
@@ -1749,16 +1767,20 @@ fn on_quic_inbound(
     quic: Option<&homeway_quic::ExitQuic>,
     tun_owner: &mut std::collections::HashMap<Ipv4Addr, [u8; 32]>,
     dlogf: &Logf,
-) {
+) -> Option<(SocketAddr, homeway_quic::RelayGeneration)> {
     match item {
         homeway_quic::ExitInbound::Reg(req) => {
             let verdict = admit_reg4(&req.frame, &req.exporter, table, quic, tun_owner, dlogf);
+            let accepted = matches!(verdict, homeway_quic::Reg4Verdict::Accepted { .. });
+            let origin = req.remote.zip(req.relay_generation);
             req.reply(verdict);
+            if accepted { return origin; }
         }
         homeway_quic::ExitInbound::Packet { pkt, .. } => intercept.on_plain(pkt),
         // 前向兼容（`ExitInbound` 是 `#[non_exhaustive]` 的跨 crate 消费面）
         _ => {}
     }
+    None
 }
 
 /// 准入裁决（M2 设计 §1.4 步骤 4.2）：`hr-reg4` 两帧（Proof / 刷新帧）的 MAC（连接绑定）
@@ -3887,7 +3909,7 @@ mod tests {
             53,
             &dns_query(),
         );
-        on_quic_inbound(
+        let _ = on_quic_inbound(
             homeway_quic::ExitInbound::Packet { dev: [0x01; 8], pkt },
             &mut table,
             &mut itc,
@@ -4048,5 +4070,26 @@ mod tests {
         assert!(matches!(ops[0], DevOp::Remove { pubkey } if pubkey == [9; 32]));
         apply_dev_ops(ops, &mut tun_owner, None);
         assert!(!tun_owner.values().any(|p| p == &[9; 32]), "该 pubkey 的键全摘（弱不变量）");
+    }
+}
+
+#[cfg(test)]
+mod relay_send_handle_regression {
+    use super::*;
+    #[test]
+    fn sync_replaces_send_fd_when_control_replay_reopens_same_remote_and_cookie() {
+        let logf: crate::Logf=Arc::new(|_|{});
+        let q=homeway_quic::ExitQuic::start(std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),homeway_quic::ExitQuicConfig::new(homeway_quic::Ed25519Seed::from_bytes([46;32]),4),Arc::clone(&logf)).unwrap();
+        let sink=std::net::UdpSocket::bind("127.0.0.1:0").unwrap(); let remote=sink.local_addr().unwrap();
+        let mut bind=ServerBind::new(logf); let admitted=crate::relaywire::admitted_payload(9,&[6;16],&[7;32]);
+        bind.register_leg_with_admission(9,remote,b"LEGUP",&admitted).unwrap();
+        let (generation,old_local)=bind.leg_generation(remote).unwrap();
+        sync_quic_legs(&mut bind,Some(&q)); assert!(q.leg_matches(remote,old_local,generation));
+        bind.register_leg_with_admission(9,remote,b"LEGUP",&admitted).unwrap();
+        let (_,new_local)=bind.leg_generation(remote).unwrap(); assert_ne!(old_local,new_local);
+        sync_quic_legs(&mut bind,Some(&q));
+        assert!(q.leg_matches(remote,new_local,generation),"同remote重拨必须替换发送fd");
+        assert!(!q.leg_matches(remote,old_local,generation));
+        assert!(q.stop_within(Instant::now()+Duration::from_secs(2)));
     }
 }

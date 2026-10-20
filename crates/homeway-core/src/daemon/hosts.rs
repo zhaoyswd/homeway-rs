@@ -66,6 +66,7 @@ type LastSeen = (String, Option<(String, String, i64, i64)>);
 pub struct HostTable {
     client_dir: PathBuf,
     identity_dir: PathBuf,
+    endpoint_cache_dir: PathBuf,
     logf: Arc<dyn Fn(&str) + Send + Sync>,
     bus: Arc<Bus>,
     /// 表变更（Add/Remove/Close）的串行化（Go opMu）：临界区覆盖锁外的会话停止。
@@ -78,18 +79,18 @@ pub struct HostTable {
 impl HostTable {
     /// 打开主机表（读 hosts.json——缺失 = 空表；损坏 = 备份后空表 + 告警）并按表
     /// 逐后端拉会话（「重启按表恢复」）。半途失败返回错误（表不挂载）。
-    /// `endpoint_cache_dir`：**WG 档装配参数，M5 C2 起本模块零消费**（设计
-    /// §1.6-G-1：岛候选来自 token，无学习缓存面）——保留形参只为零改装配面。
+    /// `endpoint_cache_dir` 与App VPN/服务模式同形：按peerID保存已认证线索。
     pub fn open(
         client_dir: &Path,
         identity_dir: &Path,
-        _endpoint_cache_dir: &Path,
+        endpoint_cache_dir: &Path,
         logf: Arc<dyn Fn(&str) + Send + Sync>,
         bus: Arc<Bus>,
     ) -> Result<Arc<HostTable>, String> {
         let table = HostTable {
             client_dir: client_dir.to_owned(),
             identity_dir: identity_dir.to_owned(),
+            endpoint_cache_dir: endpoint_cache_dir.to_owned(),
             logf,
             bus,
             change_mu: Mutex::new(()),
@@ -439,11 +440,11 @@ impl HostTable {
             let base = Arc::clone(&self.logf);
             Arc::new(move |s: &str| base(&format!("hosts: {host} {s}"))) as Arc<dyn Fn(&str) + Send + Sync>
         };
-        // M5 C2 换源：宿主会话（QUIC 岛）。端点缓存目录（装配参数）随 WG 档退役
-        // （设计 §1.6-G-1：岛候选来自 token，无学习缓存）——本模块不再消费它。
+        // QUIC宿主会话共用端点学习。
         match HostSession::start(HostSessionConfig {
             token: tok,
             identity_dir: Some(self.identity_dir.clone()),
+            endpoint_cache_dir: Some(self.endpoint_cache_dir.clone()),
             logf,
         }) {
             Ok(sess) => {

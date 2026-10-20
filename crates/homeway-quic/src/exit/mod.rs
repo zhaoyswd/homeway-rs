@@ -61,7 +61,7 @@ use socket::{ExitSock, LegTable};
 /// 两向边界的公面（引擎消费面）：入站事件 + 准入请求/裁决 + 出站投递结果。
 pub use admit::RetryPolicy;
 pub use bridge::{
-    EngineRejectClass, ExitInbound, ExitSend, Reg4Request, Reg4Verdict, RejectWhy,
+    EngineRejectClass, ExitInbound, ExitSend, RelayGeneration, Reg4Request, Reg4Verdict, RejectWhy,
 };
 /// 服务入口（M3 S2，§2.2 方案 B′）：服务侧受理面 `ServiceIntake`（**纯 std**，`homeway-core`
 /// 的三服务 accept 循环直接吃它）+ 出口侧入队句柄 `ServiceIntakeTx`。
@@ -70,6 +70,8 @@ pub use intake::{IntakeFull, ServiceIntake, ServiceIntakeTx, ServiceIntakes};
 /// `legframe::FrameKind::Quic`；本 crate 是叶子、按字节复刻，跨 crate 一致性由
 /// `homeway-core` 侧的断言钉住（见 `socket` 模块头）。
 pub use socket::FRAME_KIND_QUIC;
+/// 仅供无状态资源闸检查首包形状；这不是QUIC认证或身份凭据。
+pub fn is_initial_datagram(payload: &[u8]) -> bool { socket::initial_dcid(payload).is_some() }
 
 /// 出口面线程内共享上下文（端点主循环 + 每连接任务）。
 pub(crate) struct FaceCtx {
@@ -632,6 +634,20 @@ impl ExitQuic {
         self.legs.open(remote, sock);
     }
 
+    pub fn leg_open_generation(&self, remote: SocketAddr, sock: UdpSocket, generation: RelayGeneration) {
+        self.legs.open_generation(remote, sock, generation);
+    }
+
+    pub fn leg_matches(&self, remote: SocketAddr, local: SocketAddr, generation: RelayGeneration) -> bool {
+        self.legs.matches(remote, local, generation)
+    }
+
+    pub fn inject_leg_generation(&self, src: SocketAddr, payload: Vec<u8>, generation: RelayGeneration) -> bool {
+        if self.exit.is_exited() { return false; }
+        ExitSock::inject_generation(&self.inject_tx, &self.bridge, src, payload, Some(generation))
+    }
+
+
     /// 摘除一条腿（保留「最近摘除」窗：窗内对该远端的发送**丢**而不回落直连）。
     pub fn leg_close(&self, remote: SocketAddr) {
         self.legs.close(remote);
@@ -763,7 +779,7 @@ struct LiveConn {
 /// `Failed` 携带**归因位**（M2 §14-1④）：对端在握手期是否**主动关闭**（收到了关闭帧）。
 /// 该位只进 [`ExitQuicSnapshot::handshake_peer_closed`]（归因面），**不改**任何闸的输入集。
 enum HandshakeOutcome {
-    Accepted(SocketAddr, Connection),
+    Accepted(SocketAddr, Connection, Option<RelayGeneration>),
     Failed(SocketAddr, FailureKind),
     Deadline(SocketAddr),
 }
@@ -952,6 +968,8 @@ fn run_exit(
                 inc = endpoint.accept() => match inc {
                     Some(incoming) => {
                         let peer = incoming.remote_address();
+                        // 从首次注入Initial的不可覆盖DCID记录取代际，必须在异步握手开始前固定。
+                        let generation = legs.initial_origin(crate::sysio::unmap_v4_mapped(peer), incoming.orig_dst_cid().as_ref());
                         let now = Instant::now();
                         // ============== 抗放大（M2 §3.1/§3.2）：先闸后 Retry ==============
                         // ① 每源滑动窗闸（§3.2-④；键 = v4 /32、v6 /64 前缀）。顺序裁决
@@ -1034,7 +1052,7 @@ fn run_exit(
                                     handshakes.spawn(async move {
                                         match incoming.accept() {
                                             Ok(connecting) => match tokio::time::timeout(deadline, connecting).await {
-                                                Ok(Ok(conn)) => HandshakeOutcome::Accepted(peer, conn),
+                                                Ok(Ok(conn)) => HandshakeOutcome::Accepted(peer, conn, generation),
                                                 Ok(Err(e)) => HandshakeOutcome::Failed(peer, failure_kind(&e)),
                                                 Err(_) => HandshakeOutcome::Deadline(peer),
                                             },
@@ -1050,7 +1068,7 @@ fn run_exit(
                 Some(joined) = handshakes.join_next(), if !handshakes.is_empty() => {
                     stats.handshakes_in_flight.fetch_sub(1, Ordering::SeqCst);
                     match joined {
-                        Ok(HandshakeOutcome::Accepted(peer, conn)) => {
+                        Ok(HandshakeOutcome::Accepted(peer, conn, generation)) => {
                             // 闸④ 销账（§3.1-② / r14 F10）：**握手被采纳的尝试不计数** ⇒
                             // 多候选正常赛跑（其余候选完成/被关闭）不会攒满每源闸。
                             src_gate.completed(peer);
@@ -1062,7 +1080,7 @@ fn run_exit(
                             // （`conn::admit` 的 `accept_bi`）⇒ 两个 `accept_bi` 并发会抢流；
                             // 受理循环由控制流任务在**准入通过之后**随刷新循环一起跑
                             // （`conn::control` 的 `join!`，见该函数注释）。
-                            tasks.spawn(conn::control(conn.clone(), conn_id, Arc::clone(&ctx)));
+                            tasks.spawn(conn::control(conn.clone(), conn_id, Arc::clone(&ctx), generation));
                             tasks.spawn(conn::datagrams(conn.clone(), conn_id, Arc::clone(&ctx)));
                             conns.push(LiveConn { remote: conn.remote_address(), conn, conn_id });
                             stats.connections.store(conns.len() as u64, Ordering::SeqCst);

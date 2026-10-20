@@ -469,7 +469,12 @@ fn transient_blackhole_window_only_jitters_and_takes_no_action() {
         t_base.duration_since(trace.t0).as_secs_f64(),
         lab.winner
     );
-    // 投放黑洞窗口 1.5s（§3.3 的设计值；< 复探总窗 2.1s）
+    // 黑洞仍为1.5s，但须对齐下一次First的起跑前沿。当前在用拍间为1s：若紧接上次
+    // 成功就丢1.5s，下一First只会丢约0.5s，可能在700ms内正常回显，根本没有复探。
+    // 在预计下一First前200ms投窗，确保覆盖完整首探，且在复探1.4s预算内撤障。
+    let gap = lab.island.probe_tuning().fast_gap;
+    let arm_at = t_base + gap.saturating_sub(Duration::from_millis(200));
+    std::thread::sleep(arm_at.saturating_duration_since(Instant::now()));
     let t_drop = Instant::now();
     std::fs::write(&ctrl, b"drop").expect("控制文件可写");
     println!("[e2e-ladder] 负向①：黑洞窗口起（1.5s）");

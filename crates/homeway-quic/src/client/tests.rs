@@ -18,7 +18,7 @@ use std::net::{Ipv4Addr, SocketAddr, UdpSocket};
 use std::os::fd::AsRawFd;
 use std::os::unix::net::{UnixDatagram, UnixStream};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::mpsc::{channel, Receiver, TryRecvError};
+use std::sync::mpsc::{Receiver, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
@@ -30,7 +30,9 @@ use crate::cmd::{
 };
 use crate::config::{IslandConfig, IslandCredential, TokenSecret};
 use crate::driver::seams;
-use crate::exit::{EngineRejectClass, ExitInbound, ExitQuic, ExitQuicConfig, Reg4Verdict, RejectWhy};
+use crate::exit::{
+    EngineRejectClass, ExitInbound, ExitQuic, ExitQuicConfig, Reg4Verdict, RejectWhy,
+};
 use crate::reg4::{EXPORTER_LABEL, EXPORTER_LEN, ProofFrame, RefreshFrame};
 use crate::rpk::{Ed25519Seed, RpkPublicKey};
 use crate::{Island, IslandTx};
@@ -120,7 +122,11 @@ fn island_with_log_df(
     logf: Logf,
     direct_first: Duration,
 ) -> Island {
-    Island::start(logf, Arc::new(|_r: &str| {}), island_cfg_df(patrol, pin, direct_first))
+    Island::start(
+        logf,
+        Arc::new(|_r: &str| {}),
+        island_cfg_df(patrol, pin, direct_first),
+    )
         .expect("岛可起（含 QUIC 端点）")
 }
 
@@ -176,12 +182,7 @@ async fn wait_reason(rx: &Receiver<String>, wait: Duration) -> Option<String> {
 }
 
 /// 有界等引擎桩收到一份长度 `len` 的包（每轮 pump；返回包体）。
-async fn wait_packet(
-    stub: &Stub,
-    quic: &ExitQuic,
-    len: usize,
-    wait: Duration,
-) -> Option<Vec<u8>> {
+async fn wait_packet(stub: &Stub, quic: &ExitQuic, len: usize, wait: Duration) -> Option<Vec<u8>> {
     let deadline = Instant::now() + wait;
     loop {
         stub.pump(quic);
@@ -213,10 +214,24 @@ struct FakeRelay {
 
 impl FakeRelay {
     fn start(exit: SocketAddr, label: [u8; 8]) -> FakeRelay {
-        let sock = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("假中继可绑");
+        Self::start_family(exit, label, false, false)
+    }
+
+    fn start_family(exit: SocketAddr, label: [u8; 8], relay_v6: bool, dual: bool) -> FakeRelay {
+        let sock = if dual {
+            UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0)).expect("双栈假中继")
+        } else {
+            UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).expect("假中继可绑")
+        };
+        assert!(!dual || crate::sysio::is_dual_stack(&sock));
         sock.set_read_timeout(Some(Duration::from_millis(20)))
-            .expect("读超时可设（片界回看停止位；不用 sleep）");
-        let addr = sock.local_addr().expect("可读地址");
+            .expect("读超时");
+        let port = sock.local_addr().unwrap().port();
+        let addr = if relay_v6 {
+            SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port))
+        } else {
+            SocketAddr::from((Ipv4Addr::LOCALHOST, port))
+        };
         let stop = Arc::new(AtomicBool::new(false));
         let uplink_frames = Arc::new(AtomicU64::new(0));
         let bad_label = Arc::new(AtomicBool::new(false));
@@ -236,6 +251,7 @@ impl FakeRelay {
                         Ok(v) => v,
                         Err(_) => continue, // 片到：回看停止位
                     };
+                    let src = crate::sysio::unmap_v4_mapped(src);
                     if src == exit {
                         // 下行：裸 QUIC 包 ⇒ 包帧 `[0xBB][5]` 发回客户端
                         if let Some(c) = client {
@@ -243,7 +259,7 @@ impl FakeRelay {
                             f.push(0xBB);
                             f.push(5);
                             f.extend_from_slice(&buf[..n]);
-                            let _ = sock.send_to(&f, c);
+                            let _ = sock.send_to(&f, crate::sysio::xmit_addr(c, dual));
                         }
                         continue;
                     }
@@ -254,14 +270,15 @@ impl FakeRelay {
                         if buf[1..9] != label {
                             bad2.store(true, Ordering::SeqCst);
                         }
-                        let _ = sock.send_to(&buf[11..n], exit);
+                        let _ = sock.send_to(&buf[11..n], crate::sysio::xmit_addr(exit, dual));
                     } else {
                         bad2.store(true, Ordering::SeqCst); // 非信封形态（上行必须封）
                     }
                     if !hinted {
                         hinted = true;
                         // hint 控制帧（kind=1，非 kind=5）：客户端必须忽略且不喂 quinn
-                        let _ = sock.send_to(&[0xBB, 1, b'h', b'i'], src);
+                        let _ = sock
+                            .send_to(&[0xBB, 1, b'h', b'i'], crate::sysio::xmit_addr(src, dual));
                     }
                 }
             })
@@ -296,7 +313,11 @@ impl FakeRelay {
 fn exit_face(seed: u8) -> ExitQuic {
     let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("出口 socket 可绑");
     let (logf, _rx) = sink();
-    ExitQuic::start(sock, ExitQuicConfig::new(Ed25519Seed::from_bytes([seed; 32]), 32), logf)
+    ExitQuic::start(
+        sock,
+        ExitQuicConfig::new(Ed25519Seed::from_bytes([seed; 32]), 32),
+        logf,
+    )
         .expect("出口 QUIC 面可起")
 }
 
@@ -363,7 +384,9 @@ impl Stub {
                     });
                 } else {
                     self.rejected.fetch_add(1, Ordering::SeqCst);
-                    req.reply(Reg4Verdict::Rejected { why: RejectWhy::MacMismatch });
+                    req.reply(Reg4Verdict::Rejected {
+                        why: RejectWhy::MacMismatch,
+                    });
                 }
             }
             ExitInbound::Packet { pkt, .. } => self.packets.lock().unwrap().push(pkt),
@@ -543,7 +566,6 @@ fn dead_candidate() -> (UdpSocket, Candidate) {
     (s, direct(addr))
 }
 
-
 /// 出口面（v6 回环）：验证客户端双栈 socket 的 v6 直连/准入（v4-mapped 之外的半边）。
 fn exit_face_v6(seed: u8) -> ExitQuic {
     let sock = UdpSocket::bind((std::net::Ipv6Addr::LOCALHOST, 0)).expect("出口 v6 socket 可绑");
@@ -566,10 +588,7 @@ async fn connect_over_ipv6_loopback_registers() {
     let mut cfg = island_cfg(Duration::from_secs(60), quic.rpk_public_key());
     cfg.bind = None; // 双族（v4 + v6）
     let island = Island::start(logf, Arc::new(|_r: &str| {}), cfg).expect("岛可起（双栈）");
-    let addr = SocketAddr::from((
-        std::net::Ipv6Addr::LOCALHOST,
-        quic.local_addr().port(),
-    ));
+    let addr = SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, quic.local_addr().port()));
     let outcome = send_wait(
         &island,
         &stub,
@@ -590,7 +609,6 @@ async fn connect_over_ipv6_loopback_registers() {
     assert!(island.stop_within(Instant::now() + BUDGET));
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
-
 
 /// **判据（两族端点并存，v4 候选仍走 v4）**：`bind=None` 建 v4+v6 两枚端点；
 /// v4 候选必须由 v4 端点完成握手/准入（不被 v6 本地地址误路由）。
@@ -633,7 +651,11 @@ async fn connect_registers_on_control_stream_and_logs_criteria_lines() {
     let quic = exit_face(1);
     let stub = Stub::new();
     let (logf, logs) = sink();
-    let island = island_with_log(Duration::from_secs(60), quic.rpk_public_key(), Arc::clone(&logf));
+    let island = island_with_log(
+        Duration::from_secs(60),
+        quic.rpk_public_key(),
+        Arc::clone(&logf),
+    );
 
     let outcome = send_wait(
         &island,
@@ -674,7 +696,7 @@ async fn connect_registers_on_control_stream_and_logs_criteria_lines() {
         "赛跑投出 1 个候选（直连 1 / 中继 0；本行每轮限 3 条）",
         "赛跑结算：胜出 直连 ",
         "路径确立：直连 ",
-        "（首个完成握手）",
+        "（首个完成准入）",
         "准入已发起（dev=22222222，Hello 50B；等挑战/回执）",
         "准入完成（dev=22222222，耗时 ",
     ] {
@@ -702,14 +724,21 @@ async fn connect_registers_on_control_stream_and_logs_criteria_lines() {
 async fn admission_rejection_carries_code_line_and_snapshot_fields() {
     for (class, want, text) in [
         (EngineRejectClass::Credential, 0x11u64, "凭证不被接受"),
-        (EngineRejectClass::Resource, 0x12u64, "资源暂不可用（稍后重试）"),
+        (
+            EngineRejectClass::Resource,
+            0x12u64,
+            "资源暂不可用（稍后重试）",
+        ),
     ] {
         let quic = exit_face(9);
         let stub = Stub::new();
         *stub.reject_class.lock().unwrap() = Some(class);
         let (logf, logs) = sink();
-        let island =
-            island_with_log(Duration::from_secs(60), quic.rpk_public_key(), Arc::clone(&logf));
+        let island = island_with_log(
+            Duration::from_secs(60),
+            quic.rpk_public_key(),
+            Arc::clone(&logf),
+        );
         let addr = connectable(&quic);
 
         let res = send_wait(
@@ -727,7 +756,9 @@ async fn admission_rejection_carries_code_line_and_snapshot_fields() {
         .await;
         match res {
             Err(IslandErr::AdmissionRejected { code }) if code == want => {}
-            other => panic!("{class:?} 必须带码 {want:#x} 回传（不再是 RegistrationFailed）：{other:?}"),
+            other => {
+                panic!("{class:?} 必须带码 {want:#x} 回传（不再是 RegistrationFailed）：{other:?}")
+            }
         }
 
         // ② 客户端归因行（前缀与出口行区分 + 短语逐字 + 末句）
@@ -761,7 +792,11 @@ async fn post_admission_session_close_is_not_reported_as_admission() {
     let quic = exit_face(10);
     let stub = Stub::new();
     let (logf, logs) = sink();
-    let island = island_with_log(Duration::from_secs(60), quic.rpk_public_key(), Arc::clone(&logf));
+    let island = island_with_log(
+        Duration::from_secs(60),
+        quic.rpk_public_key(),
+        Arc::clone(&logf),
+    );
     let addr = connect_direct(&island, &stub, &quic).await;
     let _ = addr;
 
@@ -871,7 +906,13 @@ async fn relay_candidate_wins_through_envelope_and_downlink_is_stripped() {
         &stub,
         &quic,
         |reply| Cmd::Connect {
-            cands: vec![dead, Candidate { addr: relay.addr, via: Via::Relay { label } }],
+            cands: vec![
+                dead,
+                Candidate {
+                    addr: relay.addr,
+                    via: Via::Relay { label },
+                },
+            ],
             budget: Duration::from_secs(5),
             demote_adopted: false,
             reply,
@@ -1452,13 +1493,17 @@ async fn connect_while_racing_is_rejected_and_stop_is_prompt() {
 
 // ---------- 2b. 准入预算（S2-3） ----------
 
-/// **判据（S2-3 的纯定时语义，设计 §1.7 / r14 F8）**：准入预算 = `max(剩余, ADMIT_MIN)`
+/// **判据（S2-3 的纯定时语义，设计 §1.7 / r14 F8）**：准入预算 = `max(剩余, ADMIT_LIMIT)`
 /// 的**值语义**（纯函数）+ **虚拟时钟**下「到点恰在预算处」——`start_paused` ⇒ 断言确定，
 /// 不等墙钟（M0 flake 口径②）。
 #[tokio::test(start_paused = true)]
 async fn admit_budget_value_and_virtual_clock_expiry() {
     let total = Duration::from_secs(5);
-    assert_eq!(super::race::admit_budget(total, Duration::ZERO), total, "未消耗 ⇒ 全量");
+    assert_eq!(
+        super::race::admit_budget(total, Duration::ZERO),
+        Duration::from_secs(2),
+        "每候选至多2s"
+    );
     assert_eq!(
         super::race::admit_budget(total, Duration::from_millis(3000)),
         Duration::from_secs(2),
@@ -1466,37 +1511,45 @@ async fn admit_budget_value_and_virtual_clock_expiry() {
     );
     assert_eq!(
         super::race::admit_budget(total, Duration::from_millis(4900)),
-        super::race::ADMIT_MIN,
+        super::race::ADMIT_LIMIT,
         "剩 100ms < 下界 ⇒ 取下界（晚胜形态：不「必然失败但不说清」）"
     );
     assert_eq!(
         super::race::admit_budget(total, Duration::from_secs(9)),
-        super::race::ADMIT_MIN,
-        "超支（saturating）⇒ 仍取下界，不是零/负"
+        Duration::ZERO,
+        "超出全轮7s硬界后不得再给准入预算"
     );
 
+    assert_eq!(
+        super::race::admit_budget(total, Duration::from_millis(6500)),
+        Duration::from_millis(500)
+    );
     // 虚拟时钟复算同一规则 + 包装到点语义：恰在下界处返回 `None`（不是立刻、也不是无限等）
     let t0 = TokioInstant::now();
     tokio::time::sleep(Duration::from_millis(4900)).await;
     let b = super::race::admit_budget(total, t0.elapsed());
-    assert_eq!(b, super::race::ADMIT_MIN);
+    assert_eq!(b, super::race::ADMIT_LIMIT);
     let t1 = TokioInstant::now();
     let got = super::race::within(b, std::future::pending::<()>()).await;
     assert!(got.is_none(), "到点必须返回 None（= RegistrationFailed 路径）");
     assert_eq!(TokioInstant::now() - t1, b, "恰在预算到点");
 }
 
-/// **判据（S2-3 / 设计 §1.7 / r14 F8）**：`ADMIT_MIN` 形态——赛跑预算压到 1.5s、出口侧
-/// **从不回执**（引擎桩不 pump ⇒ 裁决永不到达）⇒ 岛侧准入按 `max(剩余, ADMIT_MIN)` 到点：
+/// **判据（S2-3 / 设计 §1.7 / r14 F8）**：`ADMIT_LIMIT` 形态——赛跑预算压到 1.5s、出口侧
+/// **从不回执**（引擎桩不 pump ⇒ 裁决永不到达）⇒ 岛侧准入按 `max(剩余, ADMIT_LIMIT)` 到点：
 /// ①归因 `IslandErr::RegistrationFailed`；②归因行写明**实际预算 = 下界 2s**（证明走了
-/// `ADMIT_MIN` 而不是剩余量）；③**连接被显式 close**（出口面连接数回落 0——不是等 30s
+/// `ADMIT_LIMIT` 而不是剩余量）；③**连接被显式 close**（出口面连接数回落 0——不是等 30s
 /// idle）；④耗时落 [下界, 出口侧 `ADMIT_DEADLINE` 10s) 区间内。
 #[tokio::test]
 async fn admission_budget_floor_fails_with_explicit_close() {
     let quic = exit_face(8);
     let stub = Stub::new();
     let (logf, logs) = sink();
-    let island = island_with_log(Duration::from_secs(60), quic.rpk_public_key(), Arc::clone(&logf));
+    let island = island_with_log(
+        Duration::from_secs(60),
+        quic.rpk_public_key(),
+        Arc::clone(&logf),
+    );
     let addr = connectable(&quic);
 
     let t0 = Instant::now();
@@ -1504,7 +1557,7 @@ async fn admission_budget_floor_fails_with_explicit_close() {
         &island,
         |reply| Cmd::Connect {
             cands: vec![direct(addr)],
-            budget: Duration::from_millis(1500), // 赛跑吃光 ⇒ 剩余 ≪ ADMIT_MIN
+            budget: Duration::from_millis(1500), // 赛跑吃光 ⇒ 剩余 ≪ ADMIT_LIMIT
             demote_adopted: false,
             reply,
         },
@@ -1517,8 +1570,8 @@ async fn admission_budget_floor_fails_with_explicit_close() {
         "准入到点必须归 RegistrationFailed：{res:?}"
     );
     assert!(
-        elapsed >= super::race::ADMIT_MIN,
-        "必须跑满下界（ADMIT_MIN=2s）才收口（剩余量会在毫秒级就失败）：{elapsed:?}"
+        elapsed >= super::race::ADMIT_LIMIT,
+        "必须跑满下界（ADMIT_LIMIT=2s）才收口（剩余量会在毫秒级就失败）：{elapsed:?}"
     );
     assert!(
         elapsed < Duration::from_secs(8),
@@ -1674,7 +1727,10 @@ async fn rebind_keeps_connection_and_peer_observes_new_path() {
         &island,
         &stub,
         &quic,
-        |reply| Cmd::Rebind { local: Some(alt), reply },
+        |reply| Cmd::Rebind {
+            local: Some(alt),
+            reply,
+        },
         WAIT,
     )
     .await
@@ -1962,7 +2018,11 @@ async fn drop_counters_events_and_nc_line() {
     let quic = exit_face(10);
     let stub = Stub::new();
     let (logf, logs) = sink();
-    let island = island_with_log(Duration::from_secs(60), quic.rpk_public_key(), Arc::clone(&logf));
+    let island = island_with_log(
+        Duration::from_secs(60),
+        quic.rpk_public_key(),
+        Arc::clone(&logf),
+    );
     let (ev_tx, ev_rx) = channel();
     island
         .tx()
@@ -2135,8 +2195,22 @@ fn snapshot_default_is_empty_path() {
 #[test]
 fn reg4_frames_bind_to_exporter_and_are_domain_separated() {
     let nonce = crate::reg4::Nonce::from_bytes([0x77; 16]);
-    let proof_a = ProofFrame::encode(&SECRET, &PUBKEY, &DEV, 1_800_000_000, &nonce, &[0xA1; EXPORTER_LEN]);
-    let proof_b = ProofFrame::encode(&SECRET, &PUBKEY, &DEV, 1_800_000_000, &nonce, &[0xB2; EXPORTER_LEN]);
+    let proof_a = ProofFrame::encode(
+        &SECRET,
+        &PUBKEY,
+        &DEV,
+        1_800_000_000,
+        &nonce,
+        &[0xA1; EXPORTER_LEN],
+    );
+    let proof_b = ProofFrame::encode(
+        &SECRET,
+        &PUBKEY,
+        &DEV,
+        1_800_000_000,
+        &nonce,
+        &[0xB2; EXPORTER_LEN],
+    );
     assert_ne!(proof_a, proof_b, "exporter 不同 ⇒ Proof 不同");
     assert_eq!(&proof_a[..2], b"P4", "魔数 = P4");
     assert_eq!(proof_a.len(), crate::reg4::PROOF_LEN);
@@ -2279,7 +2353,11 @@ async fn send_buffer_used_grows_under_load() {
     let quic = exit_face(27);
     let stub = Stub::new();
     let (logf, _logs) = sink();
-    let island = island_with_log(Duration::from_secs(60), quic.rpk_public_key(), Arc::clone(&logf));
+    let island = island_with_log(
+        Duration::from_secs(60),
+        quic.rpk_public_key(),
+        Arc::clone(&logf),
+    );
     let (tun, _peer) = tun_pair();
     assert!(matches!(attach(&island, tun.as_raw_fd(), 1280, BUDGET), Ok(())));
 
@@ -2552,7 +2630,11 @@ async fn tun_read_thread_exits_when_island_stops() {
     let quic = exit_face(23);
     let stub = Stub::new();
     let (logf, logs) = sink();
-    let island = island_with_log(Duration::from_secs(60), quic.rpk_public_key(), Arc::clone(&logf));
+    let island = island_with_log(
+        Duration::from_secs(60),
+        quic.rpk_public_key(),
+        Arc::clone(&logf),
+    );
     let (tun, peer) = tun_pair();
     assert!(matches!(attach(&island, tun.as_raw_fd(), 1280, BUDGET), Ok(())));
     connect_direct(&island, &stub, &quic).await;
@@ -2824,7 +2906,11 @@ async fn stream_open_write_read_echo_half_close_and_close() {
     let quic = exit_face(0x31);
     let stub = Stub::new();
     let (logf, logs) = sink();
-    let island = island_with_log(Duration::from_secs(60), quic.rpk_public_key(), Arc::clone(&logf));
+    let island = island_with_log(
+        Duration::from_secs(60),
+        quic.rpk_public_key(),
+        Arc::clone(&logf),
+    );
     let (ev_tx, ev_rx) = channel();
     island
         .tx()
@@ -2872,7 +2958,13 @@ async fn stream_open_write_read_echo_half_close_and_close() {
     .expect("写回执");
     assert_eq!(out.n, 5, "全额接纳");
     assert!(out.back.is_none(), "全额接纳不回带");
-    let got = stream_wait(&island, &stub, &quic, |reply| Cmd::StreamRead { id, reply }, WAIT)
+    let got = stream_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::StreamRead { id, reply },
+        WAIT,
+    )
         .await
         .expect("读回显");
     assert_eq!(got, b"hello", "出口逐字节回显（§1.2 的 probe 契约）");
@@ -2891,24 +2983,54 @@ async fn stream_open_write_read_echo_half_close_and_close() {
     )
     .await
     .expect("二次写");
-    let got2 = stream_wait(&island, &stub, &quic, |reply| Cmd::StreamRead { id, reply }, WAIT)
+    let got2 = stream_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::StreamRead { id, reply },
+        WAIT,
+    )
         .await
         .expect("二次读");
     assert_eq!(got2, b"again");
 
     // ④ 半关（FIN）：出口读到 EOF ⇒ `finish()` ⇒ 我方读回 EOF（`Closed` = 今天的 EOF 语义）
-    stream_wait(&island, &stub, &quic, |reply| Cmd::StreamShutdown { id, reply }, WAIT)
+    stream_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::StreamShutdown { id, reply },
+        WAIT,
+    )
         .await
         .expect("半关入队即答");
-    let eof = stream_wait(&island, &stub, &quic, |reply| Cmd::StreamRead { id, reply }, WAIT)
+    let eof = stream_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::StreamRead { id, reply },
+        WAIT,
+    )
         .await;
     assert_eq!(eof, Err(crate::stream::StreamErr::Closed), "对端 FIN ⇒ 读回 EOF");
 
     // ⑤ 关流（复位 + 摘表）：重复关 ⇒ `Closed`（未知/已关 id）
-    stream_wait(&island, &stub, &quic, |reply| Cmd::StreamClose { id, reply }, WAIT)
+    stream_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::StreamClose { id, reply },
+        WAIT,
+    )
         .await
         .expect("关流即答");
-    let again = stream_wait(&island, &stub, &quic, |reply| Cmd::StreamClose { id, reply }, WAIT)
+    let again = stream_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::StreamClose { id, reply },
+        WAIT,
+    )
         .await;
     assert_eq!(again, Err(crate::stream::StreamErr::Closed), "重入关流必须快速失败");
     let w = stream_wait(
@@ -2990,7 +3112,13 @@ async fn stream_read_hangs_until_close_cancels_it() {
     );
 
     // ② 关流 ⇒ 在途读被取消（回 `Closed`）
-    stream_wait(&island, &stub, &quic, |reply| Cmd::StreamClose { id, reply }, WAIT)
+    stream_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::StreamClose { id, reply },
+        WAIT,
+    )
         .await
         .expect("关流即答");
     let cancelled = rx.recv_timeout(WAIT).expect("取消必须唤醒在途读");
@@ -3001,7 +3129,13 @@ async fn stream_read_hangs_until_close_cancels_it() {
     );
 
     // ③ 关闭后的读：未知 id ⇒ 立即 `Closed`（不等、不挂）
-    let after = stream_wait(&island, &stub, &quic, |reply| Cmd::StreamRead { id, reply }, WAIT)
+    let after = stream_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::StreamRead { id, reply },
+        WAIT,
+    )
         .await;
     assert_eq!(after, Err(crate::stream::StreamErr::Closed));
     assert!(island.stop_within(Instant::now() + BUDGET));
@@ -3140,7 +3274,13 @@ async fn stream_write_reports_backpressure_with_original_buffer() {
         island.snapshot().stream_backpressure_events
     );
     // 关流收口（写者任务随之退；不判定它何时退——只要求命令面立即应答）
-    stream_wait(&island, &stub, &quic, |reply| Cmd::StreamClose { id, reply }, WAIT)
+    stream_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::StreamClose { id, reply },
+        WAIT,
+    )
         .await
         .expect("关流即答");
     assert!(island.stop_within(Instant::now() + BUDGET));
@@ -3208,10 +3348,7 @@ async fn stream_capacity_is_max_bidi_minus_two_at_design_defaults() {
         &island,
         &stub,
         &quic,
-        |reply| Cmd::StreamClose {
-            id: ids[0],
-            reply,
-        },
+        |reply| Cmd::StreamClose { id: ids[0], reply },
         WAIT,
     )
     .await
@@ -3226,7 +3363,14 @@ async fn stream_capacity_is_max_bidi_minus_two_at_design_defaults() {
         "关流 ⇒ 自记账槽位即时回收"
     );
     for id in ids.iter().skip(1) {
-        let _ = stream_wait(&island, &stub, &quic, |reply| Cmd::StreamClose { id: *id, reply }, WAIT).await;
+        let _ = stream_wait(
+            &island,
+            &stub,
+            &quic,
+            |reply| Cmd::StreamClose { id: *id, reply },
+            WAIT,
+        )
+        .await;
     }
     assert!(island.stop_within(Instant::now() + BUDGET));
     assert!(quic.stop_within(Instant::now() + BUDGET));
@@ -3296,7 +3440,13 @@ async fn stream_bulk_echo_throughput_is_calibration_evidence() {
         let mut got = vec![0u8; payload.len()];
         let mut filled = 0usize;
         while filled < got.len() {
-            let part = stream_wait(&island, &stub, &quic, |reply| Cmd::StreamRead { id, reply }, WAIT)
+            let part = stream_wait(
+                &island,
+                &stub,
+                &quic,
+                |reply| Cmd::StreamRead { id, reply },
+                WAIT,
+            )
                 .await
                 .expect("读回显");
             assert!(!part.is_empty(), "回显不得空块（EOF 会回 Closed）");
@@ -3317,7 +3467,14 @@ async fn stream_bulk_echo_throughput_is_calibration_evidence() {
         elapsed < Duration::from_secs(30),
         "上界：1 MiB 逐块往返必须在 30s 内跑完（flake 口径：只判上界）"
     );
-    let _ = stream_wait(&island, &stub, &quic, |reply| Cmd::StreamClose { id, reply }, WAIT).await;
+    let _ = stream_wait(
+        &island,
+        &stub,
+        &quic,
+        |reply| Cmd::StreamClose { id, reply },
+        WAIT,
+    )
+    .await;
     assert!(island.stop_within(Instant::now() + BUDGET));
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
@@ -3425,9 +3582,14 @@ async fn ladder_exhaustion_then_connect_rebuilds_and_r_uses_roster() {
     .expect("B 之后 Cmd::Connect 全名册重建须成功");
     assert_eq!(o.winner, addr, "胜出者 = 活着的那个候选");
     assert_eq!(island.snapshot().connections, 1, "重建后持有 1 条连接");
-    assert!(stub.accepted() >= 2, "重建 = 新连接新准入（桩受理至少 +1；R 期间的握手也会计入）");
     assert!(
-        wait_reason(&reasons, Duration::from_millis(300)).await.is_none(),
+        stub.accepted() >= 2,
+        "重建 = 新连接新准入（桩受理至少 +1；R 期间的握手也会计入）"
+    );
+    assert!(
+        wait_reason(&reasons, Duration::from_millis(300))
+            .await
+            .is_none(),
         "重建成功后不得再报不健康"
     );
     assert!(island.stop_within(Instant::now() + BUDGET));
@@ -3722,3 +3884,645 @@ async fn replaced_storm_count_survives_re_adoption() {
         assert!(island.stop_within(Instant::now() + BUDGET));
         drop(logs);
     }
+
+/// TLS 胜者准入超时后仍能采用中继后备；只有真正准入胜者能登记。
+#[tokio::test]
+async fn admission_timeout_keeps_relay_backup() {
+    let stalled = exit_face(109);
+    let good = exit_face(109); // 同一出口身份，两条物理路径的测试形态
+    let stub = Stub::new();
+    let island = island_with(Duration::from_secs(60), good.rpk_public_key());
+    let mut relay = FakeRelay::start(connectable(&good), [4; 8]);
+    let result = send_wait(
+        &island,
+        &stub,
+        &good,
+        |reply| Cmd::Connect {
+            cands: vec![
+                direct(connectable(&stalled)),
+                Candidate {
+                    addr: relay.addr,
+                    via: Via::Relay { label: [4; 8] },
+                },
+            ],
+            budget: Duration::from_secs(5),
+            demote_adopted: false,
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .expect("首个 TLS 路径不回答准入时后备仍可成功");
+    assert!(result.via.is_relay());
+    assert_eq!(stub.accepted(), 1, "准入串行，只接受最终胜者");
+    island.stop();
+    good.stop();
+    stalled.stop();
+    relay.stop();
+}
+
+/// 凭证拒绝是全局结论，不用中继重试掩盖或绕过。
+#[tokio::test]
+async fn credential_rejection_does_not_try_relay_backup() {
+    let exit = exit_face(110);
+    let stub = Stub::new();
+    *stub.reject_class.lock().unwrap() = Some(EngineRejectClass::Credential);
+    let island = island_with(Duration::from_secs(60), exit.rpk_public_key());
+    let mut relay = FakeRelay::start(connectable(&exit), [5; 8]);
+    let result = send_wait(
+        &island,
+        &stub,
+        &exit,
+        |reply| Cmd::Connect {
+            cands: vec![
+                direct(connectable(&exit)),
+                Candidate {
+                    addr: relay.addr,
+                    via: Via::Relay { label: [5; 8] },
+                },
+            ],
+            budget: Duration::from_secs(5),
+            demote_adopted: false,
+            reply,
+        },
+        WAIT,
+    )
+    .await;
+    assert!(matches!(
+        result,
+        Err(IslandErr::AdmissionRejected {
+            code: crate::admit_close::code::CREDENTIAL
+        })
+    ));
+    assert_eq!(relay.uplink_frames(), 0);
+    island.stop();
+    exit.stop();
+    relay.stop();
+}
+
+async fn relay_upgrade_preserves_stream(
+    relay_v6: bool,
+    direct_v6: bool,
+    fail_first: bool,
+    single_family: bool,
+) {
+    let sock = UdpSocket::bind((std::net::Ipv6Addr::UNSPECIFIED, 0)).unwrap();
+    assert!(crate::sysio::is_dual_stack(&sock));
+    let (logf, logs) = sink();
+    let exit = ExitQuic::start(
+        sock,
+        ExitQuicConfig::new(Ed25519Seed::from_bytes([111; 32]), 32),
+        Arc::clone(&logf),
+    )
+    .unwrap();
+    let port = exit.local_addr().port();
+    let direct_addr = if direct_v6 {
+        SocketAddr::from((std::net::Ipv6Addr::LOCALHOST, port))
+    } else {
+        SocketAddr::from((Ipv4Addr::LOCALHOST, port))
+    };
+    let stub = Stub::new();
+    let mut cfg = island_cfg(Duration::from_secs(60), exit.rpk_public_key());
+    cfg.bind = if single_family {
+        Some(if relay_v6 {
+            "[::]:0".parse().unwrap()
+        } else {
+            "0.0.0.0:0".parse().unwrap()
+        })
+    } else {
+        None
+    };
+    let island = Island::start(logf, Arc::new(|_| {}), cfg).unwrap();
+    let mut relay = FakeRelay::start_family(direct_addr, [6; 8], relay_v6, true);
+    let out = send_wait(
+        &island,
+        &stub,
+        &exit,
+        |reply| Cmd::Connect {
+            cands: vec![Candidate {
+                addr: relay.addr,
+                via: Via::Relay { label: [6; 8] },
+            }],
+            budget: WAIT,
+            demote_adopted: false,
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .unwrap();
+    assert!(out.via.is_relay());
+    let stable_id = island.snapshot().stable_id.expect("初始连接身份");
+    let id = stream_wait(
+        &island,
+        &stub,
+        &exit,
+        |reply| Cmd::StreamOpen {
+            tag: crate::StreamTag::Probe,
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .unwrap();
+    let (_dead_socket, dead) = dead_candidate();
+    let cands = if fail_first {
+        vec![dead, direct(direct_addr)]
+    } else {
+        vec![direct(direct_addr)]
+    };
+    island.tx().send(Cmd::SetCandidates { cands }).unwrap();
+    assert!(
+        wait_for(
+            &stub,
+            &exit,
+            || island.snapshot().via == Some(Via::Direct),
+            WAIT
+        )
+        .await,
+        "同连接升级应成功；日志={:?}",
+        logs.try_iter().collect::<Vec<_>>()
+    );
+    assert_eq!(island.snapshot().ep, Some(direct_addr));
+    assert_eq!(
+        island.snapshot().stable_id,
+        Some(stable_id),
+        "物理升级不换连接"
+    );
+    assert_eq!(stub.accepted(), 1, "升级无需第二次准入");
+    let out = stream_wait(
+        &island,
+        &stub,
+        &exit,
+        |reply| Cmd::StreamWrite {
+            id,
+            data: b"same-stream-after-upgrade".to_vec(),
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .unwrap();
+    assert_eq!(out.n, 25);
+    let echoed = stream_wait(
+        &island,
+        &stub,
+        &exit,
+        |reply| Cmd::StreamRead { id, reply },
+        WAIT,
+    )
+    .await
+    .unwrap_or_else(|e| panic!("read {e:?}; logs={:?}", logs.try_iter().collect::<Vec<_>>()));
+    assert_eq!(echoed, b"same-stream-after-upgrade");
+    // 换绑仍保留物理直连路由（跨家庭时重建 aux）。
+    send_wait(
+        &island,
+        &stub,
+        &exit,
+        |reply| Cmd::Rebind { local: None, reply },
+        WAIT,
+    )
+    .await
+    .unwrap();
+    stream_wait(
+        &island,
+        &stub,
+        &exit,
+        |reply| Cmd::StreamWrite {
+            id,
+            data: b"rebound".to_vec(),
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        stream_wait(
+            &island,
+            &stub,
+            &exit,
+            |reply| Cmd::StreamRead { id, reply },
+            WAIT
+        )
+        .await
+        .unwrap_or_else(|e| panic!(
+            "rebind {e:?}; logs={:?}",
+            logs.try_iter().collect::<Vec<_>>()
+        )),
+        b"rebound"
+    );
+    assert_eq!(stub.accepted(), 1);
+    assert_eq!(island.snapshot().stable_id, Some(stable_id), "换绑保连接");
+    if fail_first {
+        // 新赛跑前撤 override；赛跑失败时现任仍沿原 relay，旧流可继续。
+        let result = send_wait(
+            &island,
+            &stub,
+            &exit,
+            |reply| Cmd::Connect {
+                cands: vec![dead],
+                budget: Duration::from_millis(300),
+                demote_adopted: false,
+                reply,
+            },
+            WAIT,
+        )
+        .await;
+        assert!(matches!(result, Err(IslandErr::NoCandidate)));
+        assert!(island.snapshot().via.unwrap().is_relay());
+        stream_wait(
+            &island,
+            &stub,
+            &exit,
+            |reply| Cmd::StreamWrite {
+                id,
+                data: b"after-failed-race".to_vec(),
+                reply,
+            },
+            WAIT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stream_wait(
+                &island,
+                &stub,
+                &exit,
+                |reply| Cmd::StreamRead { id, reply },
+                WAIT
+            )
+            .await
+            .unwrap(),
+            b"after-failed-race"
+        );
+        assert_eq!(stub.accepted(), 1);
+        // 与老连接相同 logical peer 的新 TLS 必须走真正的 relay 信封路径。
+        let out = send_wait(
+            &island,
+            &stub,
+            &exit,
+            |reply| Cmd::Connect {
+                cands: vec![Candidate {
+                    addr: relay.addr,
+                    via: Via::Relay { label: [6; 8] },
+                }],
+                budget: WAIT,
+                demote_adopted: false,
+                reply,
+            },
+            WAIT,
+        )
+        .await
+        .unwrap();
+        assert!(out.via.is_relay());
+        assert_eq!(out.winner, relay.addr);
+        assert!(relay.clean());
+        assert_eq!(stub.accepted(), 2);
+    }
+    island.stop();
+    exit.stop();
+    relay.stop();
+}
+
+#[tokio::test]
+async fn healthy_relay_upgrades_same_family_and_keeps_stream() {
+    relay_upgrade_preserves_stream(false, false, true, false).await;
+}
+#[tokio::test]
+async fn healthy_v4_relay_upgrades_v6_direct_and_keeps_stream() {
+    relay_upgrade_preserves_stream(false, true, false, false).await;
+}
+#[tokio::test]
+async fn healthy_v6_relay_upgrades_v4_direct_and_keeps_stream() {
+    relay_upgrade_preserves_stream(true, false, false, false).await;
+}
+
+/// 正在赛跑时后台 DNS/候选刷新产出的新地址必须进入本轮，不能等下一次恢复事件。
+#[tokio::test]
+async fn in_flight_race_picks_up_dynamic_candidate_snapshot() {
+    let exit = exit_face(113);
+    let stub = Stub::new();
+    let (_dead_sock, dead) = dead_candidate();
+    let candidates = Arc::new(Mutex::new(vec![dead]));
+    let a = Arc::clone(&candidates);
+    let b = Arc::clone(&candidates);
+    let mut cfg = island_cfg(Duration::from_secs(60), exit.rpk_public_key());
+    cfg.candidates = Some(crate::CandidateHooks {
+        refresh: Arc::new(move || a.lock().unwrap().clone()),
+        snapshot: Arc::new(move || b.lock().unwrap().clone()),
+        learn: Arc::new(|_, _| {}),
+        outcome: Arc::new(|_, _| {}),
+    });
+    let island = Island::start(Arc::new(|_| {}), Arc::new(|_| {}), cfg).unwrap();
+    let target = direct(connectable(&exit));
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        candidates.lock().unwrap().push(target);
+    });
+    let result = send_wait(
+        &island,
+        &stub,
+        &exit,
+        |reply| Cmd::Connect {
+            cands: vec![dead],
+            budget: Duration::from_secs(2),
+            demote_adopted: false,
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .unwrap();
+    assert_eq!(result.winner, target.addr);
+    assert_eq!(stub.accepted(), 1);
+    island.stop();
+    exit.stop();
+}
+
+/// 来自候选地址的 UDP 字节也不是直连证据；缺认证回显时回退 relay，旧服务流继续。
+#[tokio::test]
+async fn forged_udp_cannot_confirm_upgrade_and_relay_stream_survives() {
+    let exit = exit_face(114);
+    let stub = Stub::new();
+    let (logf, logs) = sink();
+    let island = island_with_log(Duration::from_secs(60), exit.rpk_public_key(), logf);
+    let mut relay = FakeRelay::start(connectable(&exit), [7; 8]);
+    send_wait(
+        &island,
+        &stub,
+        &exit,
+        |reply| Cmd::Connect {
+            cands: vec![Candidate {
+                addr: relay.addr,
+                via: Via::Relay { label: [7; 8] },
+            }],
+            budget: WAIT,
+            demote_adopted: false,
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .unwrap();
+    let id = stream_wait(
+        &island,
+        &stub,
+        &exit,
+        |reply| Cmd::StreamOpen {
+            tag: crate::StreamTag::Probe,
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .unwrap();
+    let spoof = UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+    spoof
+        .set_read_timeout(Some(Duration::from_millis(50)))
+        .unwrap();
+    let addr = spoof.local_addr().unwrap();
+    let done = Arc::new(AtomicBool::new(false));
+    let done2 = Arc::clone(&done);
+    let worker = std::thread::spawn(move || {
+        let mut buf = [0u8; 2048];
+        while !done2.load(Ordering::Relaxed) {
+            if let Ok((n, source)) = spoof.recv_from(&mut buf) {
+                let _ = spoof.send_to(&buf[..n], source);
+            }
+        }
+    });
+    island
+        .tx()
+        .send(Cmd::SetCandidates {
+            cands: vec![direct(addr)],
+        })
+        .unwrap();
+    let lines = logs_until(&logs, "中继升级直连：本轮未确认", WAIT).await;
+    assert!(lines.iter().any(|l| l.contains("中继升级直连：本轮未确认")));
+    assert!(
+        island.snapshot().via.unwrap().is_relay(),
+        "无法认证的 UDP 不得切换路径"
+    );
+    stream_wait(
+        &island,
+        &stub,
+        &exit,
+        |reply| Cmd::StreamWrite {
+            id,
+            data: b"still-relayed".to_vec(),
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        stream_wait(
+            &island,
+            &stub,
+            &exit,
+            |reply| Cmd::StreamRead { id, reply },
+            WAIT
+        )
+        .await
+        .unwrap(),
+        b"still-relayed"
+    );
+    assert_eq!(stub.accepted(), 1);
+    done.store(true, Ordering::Relaxed);
+    worker.join().unwrap();
+    island.stop();
+    exit.stop();
+    relay.stop();
+}
+
+/// 三个黑洞候选的 TLS 预筛期间，健康 relay 的原服务流持续往返，不出现 2.1s 路径中断。
+#[tokio::test]
+async fn blackhole_direct_preflights_do_not_pause_healthy_relay_stream() {
+    let exit = exit_face(115);
+    let stub = Stub::new();
+    let (logf, logs) = sink();
+    let island = island_with_log(Duration::from_secs(60), exit.rpk_public_key(), logf);
+    let mut relay = FakeRelay::start(connectable(&exit), [8; 8]);
+    send_wait(
+        &island,
+        &stub,
+        &exit,
+        |reply| Cmd::Connect {
+            cands: vec![Candidate {
+                addr: relay.addr,
+                via: Via::Relay { label: [8; 8] },
+            }],
+            budget: WAIT,
+            demote_adopted: false,
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .unwrap();
+    let id = stream_wait(
+        &island,
+        &stub,
+        &exit,
+        |reply| Cmd::StreamOpen {
+            tag: crate::StreamTag::Probe,
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .unwrap();
+    let a = dead_candidate();
+    let b = dead_candidate();
+    let c = dead_candidate();
+    island
+        .tx()
+        .send(Cmd::SetCandidates {
+            cands: vec![a.1, b.1, c.1],
+        })
+        .unwrap();
+    let started = Instant::now();
+    let mut rounds = 0;
+    while started.elapsed() < Duration::from_millis(2400) {
+        let tick = Instant::now();
+        stream_wait(
+            &island,
+            &stub,
+            &exit,
+            |reply| Cmd::StreamWrite {
+                id,
+                data: b"uninterrupted".to_vec(),
+                reply,
+            },
+            WAIT,
+        )
+        .await
+        .unwrap();
+        let got = stream_wait(
+            &island,
+            &stub,
+            &exit,
+            |reply| Cmd::StreamRead { id, reply },
+            WAIT,
+        )
+        .await
+        .unwrap();
+        assert_eq!(got, b"uninterrupted");
+        assert!(
+            tick.elapsed() < Duration::from_millis(750),
+            "预筛不能暂停原服务流：{:?}",
+            tick.elapsed()
+        );
+        rounds += 1;
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    assert!(rounds >= 10);
+    assert!(
+        logs.try_iter()
+            .any(|l| l.contains("中继升级直连：本轮未确认")),
+        "三候选预算耗尽"
+    );
+    assert_eq!(stub.accepted(), 1, "预筛从不注册");
+    assert!(island.snapshot().via.unwrap().is_relay());
+    island.stop();
+    exit.stop();
+    relay.stop();
+}
+
+#[tokio::test]
+async fn healthy_single_v4_endpoint_learns_v6_direct_and_keeps_stream() {
+    relay_upgrade_preserves_stream(false, true, false, true).await;
+}
+#[tokio::test]
+async fn healthy_single_v6_endpoint_learns_v4_direct_and_keeps_stream() {
+    relay_upgrade_preserves_stream(true, false, false, true).await;
+}
+
+/// 预算到点的黑洞地址降权；成功胜出时被取消的后备不应记为路径失败。
+#[tokio::test]
+async fn race_outcomes_demote_timeouts_but_not_cancelled_backups() {
+    let exit = exit_face(116);
+    let stub = Stub::new();
+    let (_dead_sock, dead) = dead_candidate();
+    let outcomes = Arc::new(Mutex::new(Vec::new()));
+    let sink = Arc::clone(&outcomes);
+    let mut cfg = island_cfg(Duration::from_secs(60), exit.rpk_public_key());
+    cfg.candidates = Some(crate::CandidateHooks {
+        refresh: Arc::new(move || vec![dead]),
+        snapshot: Arc::new(move || vec![dead]),
+        learn: Arc::new(|_, _| {}),
+        outcome: Arc::new(move |c, ok| sink.lock().unwrap().push((c, ok))),
+    });
+    let island = Island::start(Arc::new(|_| {}), Arc::new(|_| {}), cfg).unwrap();
+    let result = send_wait(
+        &island,
+        &stub,
+        &exit,
+        |reply| Cmd::Connect {
+            cands: vec![dead],
+            budget: Duration::from_millis(250),
+            demote_adopted: false,
+            reply,
+        },
+        WAIT,
+    )
+    .await;
+    assert!(matches!(result, Err(IslandErr::NoCandidate)));
+    assert_eq!(*outcomes.lock().unwrap(), vec![(dead, false)]);
+    let good = direct(connectable(&exit));
+    send_wait(
+        &island,
+        &stub,
+        &exit,
+        |reply| Cmd::Connect {
+            cands: vec![good, dead],
+            budget: WAIT,
+            demote_adopted: false,
+            reply,
+        },
+        WAIT,
+    )
+    .await
+    .unwrap();
+    assert_eq!(*outcomes.lock().unwrap(), vec![(dead, false), (good, true)]);
+    island.stop();
+    exit.stop();
+}
+
+
+/// 健康直连无需重连也按patrol刷新旁路线索；只更新候选，连接身份与赛跑计数保持。
+#[tokio::test]
+async fn healthy_direct_refreshes_candidates_on_patrol_without_reconnect() {
+    let exit = exit_face(117);
+    let stub = Stub::new();
+    let good = direct(connectable(&exit));
+    let (_dead_sock, learned) = dead_candidate();
+    let refreshes = Arc::new(AtomicU64::new(0));
+    let count = Arc::clone(&refreshes);
+    let mut cfg = island_cfg(Duration::from_millis(100), exit.rpk_public_key());
+    cfg.candidates = Some(crate::CandidateHooks {
+        refresh: Arc::new(move || {
+            let n = count.fetch_add(1, Ordering::SeqCst);
+            if n == 0 { vec![good] } else { vec![good, learned] }
+        }),
+        snapshot: Arc::new(move || vec![good]),
+        learn: Arc::new(|_, _| {}),
+        outcome: Arc::new(|_, _| {}),
+    });
+    let island = Island::start(Arc::new(|_| {}), Arc::new(|_| {}), cfg).unwrap();
+    send_wait(&island, &stub, &exit, |reply| Cmd::Connect {
+        cands: vec![good], budget: WAIT, demote_adopted: false, reply,
+    }, WAIT).await.unwrap();
+    let before = island.snapshot();
+    let count_before = refreshes.load(Ordering::SeqCst);
+    assert!(wait_for(&stub, &exit, || refreshes.load(Ordering::SeqCst) >= count_before + 2,
+        Duration::from_secs(4)).await, "健康DIRECT至少两次周期学习，无需新事件/重连");
+    assert!(wait_for(&stub, &exit, || island.snapshot().candidates == 2, WAIT).await);
+    let after = island.snapshot();
+    assert_eq!(after.via, Some(Via::Direct));
+    assert_eq!(after.stable_id, before.stable_id);
+    assert_eq!(after.mirrors, before.mirrors, "没有重新赛跑");
+    island.stop(); exit.stop();
+}

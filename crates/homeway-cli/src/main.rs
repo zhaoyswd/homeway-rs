@@ -474,6 +474,7 @@ fn cmd_connect(args: &[String]) {
 
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
     let session = match HostSession::start(HostSessionConfig {
+        endpoint_cache_dir: None,
         token: t,
         identity_dir: a.identity_dir.clone().or_else(|| Some(PathBuf::from("identity"))),
         logf: Arc::clone(&logf),
@@ -722,6 +723,7 @@ fn cmd_speedtest(args: &[String]) {
     let _session_lock = (!no_session_lock).then(|| session_lock_or_exit(&identity_dir, "speedtest"));
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
     let session = match HostSession::start(HostSessionConfig {
+        endpoint_cache_dir: None,
         token: t,
         identity_dir: identity_dir.or_else(|| Some(PathBuf::from("identity"))),
         logf: Arc::clone(&logf),
@@ -1040,6 +1042,7 @@ fn cmd_files(args: &[String]) {
     }
     let logf: Arc<dyn Fn(&str) + Send + Sync> = Arc::new(|s: &str| println!("{s}"));
     let session = match HostSession::start(HostSessionConfig {
+        endpoint_cache_dir: None,
         token: t,
         identity_dir: identity_dir.or_else(|| Some(PathBuf::from("identity"))),
         logf: Arc::clone(&logf),

@@ -80,3 +80,9 @@ libghostty-vt 自身的快照格式测试数据，Rust 侧走 alacritty_terminal
 测试非字节 golden，同样无拷贝物。
 
 **采集日期**：2026-10-02（R0.4）。
+
+## 中继客户端准入扩展（2026-10-21）
+
+`relay-admission.json`：独立 Python stdlib HMAC-SHA256 编码的定值参照，覆盖
+`CLADM`（45B，sid/cookie/域分隔MAC）及 `UDP_SESSION`（43B，会话字段/MAC）。
+不改冻结的 `rl1`/旧中继消息向量；真实客户端准入提升和UDP控制降级另由生产组件E2E验证。

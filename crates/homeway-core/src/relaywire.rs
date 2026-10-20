@@ -30,6 +30,7 @@ pub mod sub {
     pub const KEEPALIVE: u8 = 0x05; // 后端→中继：保活（无 payload）
     pub const AGAIN: u8 = 0x06; // 中继→后端：腿不在了，请重新注册
     pub const SESSION: u8 = 0x10; // 中继→后端：sid(8BE) ‖ dataPort(2BE) ‖ cookie(16)
+    pub const UDP_SESSION: u8 = 0x12; // 中继→UDP注册出口：SESSION字段 + 16B MAC
     pub const RELEASE: u8 = 0x11; // 中继→后端：sid(8BE)
 }
 
@@ -263,6 +264,49 @@ pub fn verify_legup(pkt: &[u8], sid: u64, cookie: &[u8; 16], key: &[u8; 32]) -> 
     ct_eq_16(&legup_mac(sid, cookie, key), &pkt[21..37])
 }
 
+// ---------- 客户端准入确认（与出口拨腿证明严格分域） ----------
+
+const ADMITTED_MAGIC: &[u8; 5] = b"CLADM";
+pub const ADMITTED_LEN: usize = 45;
+
+fn admission_mac(sid: u64, cookie: &[u8; 16], key: &[u8; 32]) -> [u8; 16] {
+    hmac_sha256_trunc16(key, &[b"client-admitted-v1", &sid.to_be_bytes(), cookie])
+}
+
+/// 仅在出口完成 QUIC 客户端准入后发送，LEGUP 不能替代本标记。
+pub fn admitted_payload(sid: u64, cookie: &[u8; 16], key: &[u8; 32]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(ADMITTED_LEN);
+    out.extend_from_slice(ADMITTED_MAGIC);
+    out.extend_from_slice(&sid.to_be_bytes());
+    out.extend_from_slice(cookie);
+    out.extend_from_slice(&admission_mac(sid, cookie, key));
+    out
+}
+
+pub fn verify_admitted(pkt: &[u8], sid: u64, cookie: &[u8; 16], key: &[u8; 32]) -> bool {
+    pkt.len() == ADMITTED_LEN && &pkt[..5] == ADMITTED_MAGIC
+        && pkt[5..13] == sid.to_be_bytes() && pkt[13..29] == cookie[..]
+        && ct_eq_16(&pkt[29..], &admission_mac(sid, cookie, key))
+}
+
+/// UDP 注册腿使用的 SESSION 通告：绑定会话字段的 MAC，避免借匿名包指挥出口拨号。
+pub fn encode_udp_session(s: &CtlSession, key: &[u8; 32]) -> Vec<u8> {
+    let mut msg = encode_session(s);
+    msg[0] = sub::UDP_SESSION;
+    let mac = hmac_sha256_trunc16(key, &[b"udp-session-v1", &msg]);
+    msg.extend_from_slice(&mac);
+    msg
+}
+
+pub fn decode_udp_session(p: &[u8], key: &[u8; 32]) -> Option<CtlSession> {
+    if p.len() != 43 || p[0] != sub::UDP_SESSION { return None; }
+    let want = hmac_sha256_trunc16(key, &[b"udp-session-v1", &p[..27]]);
+    if !ct_eq_16(&p[27..], &want) { return None; }
+    let mut session = p[..27].to_vec();
+    session[0] = sub::SESSION;
+    decode_session(&session)
+}
+
 // ---------- TCP 流分帧 + 腿帧封装 ----------
 
 /// 把一条控制消息（子类型 + 体）封成腿上帧（UDP 注册腿路径用）。
@@ -459,6 +503,22 @@ mod tests {
         assert!(legup_cookie(b"LEGUP").is_none());
         // 畸形
         assert!(legup_cookie(b"LEGUX00").is_none());
+    }
+
+    #[test]
+    fn admission_markers_are_cookie_generation_bound_and_domain_separated() {
+        let s = CtlSession { id: 7, data_port: 40000, cookie: [3; 16] };
+        let marker = admitted_payload(s.id, &s.cookie, &SECRET);
+        assert!(verify_admitted(&marker, s.id, &s.cookie, &SECRET));
+        assert!(!verify_admitted(&marker, s.id + 1, &s.cookie, &SECRET));
+        assert!(!verify_admitted(&marker, s.id, &[4; 16], &SECRET));
+        assert!(!verify_admitted(&marker, s.id, &s.cookie, &[5; 32]));
+        assert!(!verify_admitted(&legup_payload(s.id, &s.cookie, &SECRET), s.id, &s.cookie, &SECRET));
+        let challenge = encode_udp_session(&s, &SECRET);
+        assert_eq!(decode_udp_session(&challenge, &SECRET), Some(s));
+        assert!(decode_udp_session(&challenge, &[5; 32]).is_none());
+        let mut tampered = challenge; tampered[10] ^= 1;
+        assert!(decode_udp_session(&tampered, &SECRET).is_none());
     }
 
     #[test]
