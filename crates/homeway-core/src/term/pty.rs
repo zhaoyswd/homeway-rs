@@ -197,16 +197,27 @@ fn home_dir() -> Option<String> {
     None
 }
 
-/// 一条起好的 PTY 会话（master 读写面 + 子进程句柄）。
-pub struct PtySession {
+/// PTY **控制面**（master + 子进程句柄 + 记账字段）：resize / 前台组 / 信号 / 收尸
+/// 全在这里——都是 ioctl、信号与轮询级的快操作。
+///
+/// 与输入写面**结构性分开**（评审 2026-10-20 P1-1）：`write_all` 在 PTY 输入缓冲满时
+/// 可无限阻塞，控制面若与它共享一把锁，大粘贴就能拖住 KILL、采样与 resize——
+/// 而 SIGHUP 恰是解除写阻塞的钥匙（子进程退出 ⇒ master 写端报错 ⇒ 写返回）。
+pub struct PtyCore {
     pub master: Box<dyn MasterPty + Send>,
     pub child: Box<dyn Child + Send + Sync>,
-    writer: Box<dyn std::io::Write + Send>,
-    pub reader: Box<dyn std::io::Read + Send>,
     pub shell: String,
     pub pid: i32,
     pub cols: u16,
     pub rows: u16,
+}
+
+/// 一条起好的 PTY 会话（spawn 的产物包：控制面 + 输入写面 + 输出读面）。
+/// 服务侧拆成 `service::PtyShared`（控制/写分锁）并把 reader 移交 pump 线程独占。
+pub struct PtySession {
+    pub core: PtyCore,
+    writer: Box<dyn std::io::Write + Send>,
+    pub reader: Box<dyn std::io::Read + Send>,
 }
 
 /// 起一个 PTY 会话。`shell_cmd` = `HOMEWAY_TERM_SHELL` 的命令（None = 登录 shell 模式）。
@@ -256,18 +267,13 @@ pub fn spawn(
     let reader = pair.master.try_clone_reader().map_err(|e| format!("try_clone_reader: {e}"))?;
     let pid = child.process_id().unwrap_or(u32::MAX) as i32;
     Ok(PtySession {
-        master: pair.master,
-        child,
+        core: PtyCore { master: pair.master, child, shell, pid, cols, rows },
         writer,
         reader,
-        shell,
-        pid,
-        cols,
-        rows,
     })
 }
 
-impl PtySession {
+impl PtyCore {
     /// 应用新尺寸（幂等）。
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
         self.master
@@ -282,25 +288,6 @@ impl PtySession {
             Ok(s) => (s.cols, s.rows),
             Err(_) => (self.cols, self.rows),
         }
-    }
-
-    /// 写 PTY（输入面：客户端按键 / 哨兵后的重绘 / focus nudge）。
-    pub fn write_input(&mut self, p: &[u8]) -> Result<(), String> {
-        self.writer.write_all(p).map_err(|e| e.to_string())?;
-        self.writer.flush().map_err(|e| e.to_string())
-    }
-
-    /// 尺寸哨兵：sentinel → 真实尺寸，两次 SIGWINCH 逼 TUI 重绘当前屏。
-    /// 返回哨兵列值（低 7 判据：一次 attach 只应 +1 次）。
-    ///
-    /// **仅测试夹具**——生产语义在 `term/service.rs`（`sentinel_repaint_locked`，
-    /// term-attach-resilience 起分「背靠背/间隔」两形态）；勿在生产代码上引用本方法。
-    pub fn sentinel_repaint(&self) -> u16 {
-        let (cols, rows) = (self.cols, self.rows);
-        let sentinel = if cols > 1 { cols - 1 } else { cols + 1 };
-        let _ = self.resize(sentinel, rows);
-        let _ = self.resize(cols, rows);
-        sentinel
     }
 
     /// 前台进程组（检测身份腿输入；拿不到 = 0）。
@@ -355,6 +342,36 @@ impl PtySession {
         }
         self.wait()
     }
+}
+
+impl PtySession {
+    /// 拆产物包：控制面 / 写面 / 读面各归其主（服务侧分锁装配，reader 归 pump）。
+    pub fn into_parts(
+        self,
+    ) -> (PtyCore, Box<dyn std::io::Write + Send>, Box<dyn std::io::Read + Send>) {
+        (self.core, self.writer, self.reader)
+    }
+
+    /// 写 PTY（输入面：客户端按键 / 哨兵后的重绘 / focus nudge）。
+    /// **独占形态**（`&mut self`，测试/单 owner 用）；服务侧的共享形态在
+    /// `service::PtyShared::write_input`（writer 独立锁）。
+    pub fn write_input(&mut self, p: &[u8]) -> Result<(), String> {
+        self.writer.write_all(p).map_err(|e| e.to_string())?;
+        self.writer.flush().map_err(|e| e.to_string())
+    }
+
+    /// 尺寸哨兵：sentinel → 真实尺寸，两次 SIGWINCH 逼 TUI 重绘当前屏。
+    /// 返回哨兵列值（低 7 判据：一次 attach 只应 +1 次）。
+    ///
+    /// **仅测试夹具**——生产语义在 `term/service.rs`（`sentinel_repaint_locked`，
+    /// term-attach-resilience 起分「背靠背/间隔」两形态）；勿在生产代码上引用本方法。
+    pub fn sentinel_repaint(&self) -> u16 {
+        let (cols, rows) = (self.core.cols, self.core.rows);
+        let sentinel = if cols > 1 { cols - 1 } else { cols + 1 };
+        let _ = self.core.resize(sentinel, rows);
+        let _ = self.core.resize(cols, rows);
+        sentinel
+    }
 
     /// 读一批 PTY 输出（阻塞语义由调用方的 fd 超时/线程模型决定）。
     pub fn read_output(&mut self, buf: &mut [u8]) -> std::io::Result<usize> {
@@ -407,7 +424,7 @@ mod tests {
     fn spawn_pty_roundtrip_and_exit_code() {
         let mut pty = spawn("selftest", 40, 10, Some("printf hello-pty; exit 7"))
             .expect("spawn PTY");
-        assert_eq!((pty.cols, pty.rows), (40, 10));
+        assert_eq!((pty.core.cols, pty.core.rows), (40, 10));
         let mut out = Vec::new();
         let mut buf = [0u8; 1024];
         let mut got_eof = false;
@@ -430,7 +447,7 @@ mod tests {
             String::from_utf8_lossy(&out[..out.len().min(120)])
         );
         let _ = got_eof;
-        let code = pty.wait();
+        let code = pty.core.wait();
         assert_eq!(code, 7, "子进程退出码");
     }
 
@@ -439,6 +456,6 @@ mod tests {
         // cols=1 的边界形态：sentinel = cols+1（防 0 列）
         let pty = spawn("sentinel1", 1, 3, Some("sleep 5")).expect("spawn");
         assert_eq!(pty.sentinel_repaint(), 2);
-        pty.kill_force();
+        pty.core.kill_force();
     }
 }

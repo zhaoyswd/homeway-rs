@@ -801,6 +801,10 @@ fn run_driver(
                             match result {
                                 Ok((est, outcome)) => {
                                     adopt(&mut st, ctx, &face, est, &mut jobs);
+                                    // 赛跑/一次性重连的采纳 = 新失败链：阶梯重新武装
+                                    //（B 之后休眠的阶梯在此复活）。阶梯 R 的采纳不 rearm
+                                    //——失败链由确认探活收线，见 `Job::LadderConnect`。
+                                    st.ladder.rearm();
                                     let _ = reply.send(Ok(outcome));
                                 }
                                 Err(e) => {
@@ -854,6 +858,12 @@ fn run_driver(
                             let step = match result {
                                 Ok(est) => {
                                     adopt(&mut st, ctx, &face, est, &mut jobs);
+                                    // **不 rearm**（评审 2026-10-20 P1-2）：R 的采纳只安装
+                                    // 新连接——失败链（r_fail_streak/since、pending.at = R 的
+                                    // 发起时刻）要等**确认探活**收线：确认成功在
+                                    // `on_round` 归零并打「链路重连完成（全周期耗时）」；
+                                    // 确认失败记 `r_failed`（B 门因此可达）。rearm 放这里 =
+                                    // 「注册成功 + probe 黑洞」形态每次都从第 1 次重数。
                                     st.ladder.on_reconnect_result(true, why, now, &ctx.logf)
                                 }
                                 Err(e) => {
@@ -1024,19 +1034,21 @@ fn adopt(
         st.drop_note = Some(drop_note_one(ctx));
         st.drop_note_n = Some(drop_note_with_count(ctx));
     }
-    // M3 S4：新连接 = 新失败链 ⇒ 阶梯重新武装（B 之后休眠的阶梯在此复活）
-    st.ladder.rearm();
+    // M3 S4：阶梯的重武装不在 adopt 内——由**调用方按连接来源**决定（见两处调用点）：
+    // 赛跑/一次性重连的采纳 = 新失败链 ⇒ rearm；阶梯 R 自己的采纳只安装连接，
+    // 失败链由确认探活收线（`Job::LadderConnect` 分支注释）。
     // 采纳成功 = 发送面已可用：清「系统禁发」原子位（否则 demand 源会继续跳过到窗过期）。
     if let Some(d) = &ctx.denied {
         d.store(false, Ordering::Release);
     }
-    // 新连接采纳 = 交接完成/风暴稳定：清交接窗与替换计数（`rearm` 已复活阶梯）。
+    // 新连接采纳 = 交接完成（清交接窗）。**替换风暴计数与熔断跨采纳保留**（评审
+    // 2026-10-20 P2-4）：风暴的形态恰是「采纳 → 被替换 → 再采纳」，采纳即清零 =
+    // 计数永远停在 1，10 次/10s 的熔断在正常路径结构性不可达。窗口由 `note_replaced_at`
+    // 按 10s 时间窗自行过期；熔断由冷却到期解除（`Ladder::due` 的到期复位——无连接时
+    // 也被驱动，见 housekeeping ③ 的门）。
     if st.handover.take().is_some() {
         (*ctx.logf)("替换交接完成（新连接已采纳）");
     }
-    st.replaced_window_start = None;
-    st.replaced_count = 0;
-    st.storm_until = None;
     st.rebind = None;
     st.dead_logged = false;
     if let Some(old) = st.live.replace(adopted) {
@@ -1287,10 +1299,12 @@ async fn housekeeping(
     }
     // ③ **快探节拍**（§3.2：在用档背靠背 / 待机档 60s / 挂起空窗立即探——
     //     由 runtime 拍内务驱动；单飞与动作链在阶梯里）。
-    //     **判据 = 连接在位**（M5 §2.4-A-2 ④：快探节拍是阶梯的唯一周期触发源——
-    //     旧 `live && tun` 把无 TUN 的宿主会话整条关掉；`tun` 与「有没有连接要保」
-    //     无关，故去掉）。
-    if st.live.is_some() {
+    //     **判据 = 连接在位，或风暴冷却休眠中**（M5 §2.4-A-2 ④：快探节拍是阶梯的唯一
+    //     周期触发源——旧 `live && tun` 把无 TUN 的宿主会话整条关掉；`tun` 与「有没有
+    //     连接要保」无关，故去掉。风暴休眠例外：熔断后 `live` 常已清空，而到期复位
+    //     是熔断的唯一自动出口——不驱动 `due` = 冷却后周期探活永久停摆，只能等
+    //     外部边沿；无连接时到期的探活会经 `on_confirm_unavailable` 收线进失败链）。
+    if st.live.is_some() || st.ladder.storm_parked() {
         let in_use = in_use_now(st, ctx, &st.probe);
         if let Some((round, budget)) = st.ladder.due(TokioInstant::now(), in_use) {
             ladder_step(st, ctx, face, jobs, LadderStep::Probe { round, budget });

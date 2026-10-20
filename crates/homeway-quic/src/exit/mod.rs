@@ -87,6 +87,8 @@ pub(crate) struct FaceCtx {
     pub(crate) proof_gate: Arc<Mutex<admit::ProofGate>>,
     /// 每 tag 的服务入口入队句柄（M3 S2；`None` = 该服务本期不可用 ⇒ 0x22）。
     pub(crate) intakes: Arc<ServiceIntakes>,
+    /// probe 黑洞（测试缝；见 `ExitQuicConfig::probe_blackhole`）。
+    pub(crate) probe_blackhole: bool,
 }
 
 /// QUIC 面线程名（与岛 `homeway-quic` 区分：这是**出口侧**的那一枚）。
@@ -199,6 +201,10 @@ pub struct ExitQuicConfig {
     /// 直连端口上的非 QUIC 报文先经它判定（见 [`PlainDatagramHook`]）。协议真源留在
     /// `homeway-core`（参照点探测 / STUN 观测 / 中继注册腿帧），本岛只做「认领与否 + 原样收发」。
     pub plain_hook: Option<PlainDatagramHook>,
+    /// **probe 黑洞**（测试缝，缺省 `false`）：`true` = probe 流收下上行但不回显——
+    /// 用于在真实 driver/出口面构造「注册成功 + probe 无回显」形态（B 门可达性的
+    /// 回归判据，评审 2026-10-20 P1-2）。生产恒 false。
+    pub probe_blackhole: bool,
 }
 
 impl ExitQuicConfig {
@@ -221,6 +227,7 @@ impl ExitQuicConfig {
             cc: CcChoice::default(),
             intakes: ServiceIntakes::default(),
             plain_hook: None,
+            probe_blackhole: false,
         }
     }
 
@@ -909,6 +916,7 @@ fn run_exit(
             conn_cap,
             proof_gate: Arc::clone(&proof_gate),
             intakes: Arc::new(cfg.intakes.clone()),
+            probe_blackhole: cfg.probe_blackhole,
         });
         // 巡检节流基准（见循环尾「时间节流」注释）
         let mut last_sweep = Instant::now();

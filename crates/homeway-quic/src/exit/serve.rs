@@ -181,6 +181,23 @@ async fn echo(mut send: SendStream, mut recv: RecvStream, conn_id: u64, ctx: &Ar
             dev_of(ctx, conn_id)
         ));
     }
+    if ctx.probe_blackhole {
+        // 测试缝（`ExitQuicConfig::probe_blackhole`）：收下上行但不回显——客户端的
+        // probe 预算内无回声 ⇒ ProbeNoResponse，且连接/准入面一切正常（B 门可达性
+        // 回归的形态源，评审 2026-10-20 P1-2）。生产恒 false，不走本分支。
+        let mut sink = [0u8; 4096];
+        loop {
+            match recv.read(&mut sink).await {
+                Ok(Some(_)) => continue,
+                _ => break,
+            }
+        }
+        let _ = send.finish();
+        ctx.stats
+            .streams_closed
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        return;
+    }
     let bytes = tokio::io::copy(&mut recv, &mut send).await.unwrap_or(0);
     let _ = send.finish(); // 客户端半关 ⇒ 我方 FIN（正常收工，**不用 reset**，§1.3）
     ctx.stats

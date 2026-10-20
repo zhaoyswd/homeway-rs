@@ -3434,6 +3434,134 @@ async fn ladder_exhaustion_then_connect_rebuilds_and_r_uses_roster() {
     assert!(quic.stop_within(Instant::now() + BUDGET));
 }
 
+/// **判据（评审 2026-10-20 P1-2）**：「注册成功 + probe 黑洞」形态下 B 门可达。
+/// 出口全程活着（握手 / 四帧准入成功），probe 流收下不回显（`probe_blackhole` 缝）⇒
+/// 每轮「R 采纳 → 确认探活失败」必须累计 R 失败链——连续 ≥2 次且窗 ≥10s ⇒ B 门上报。
+/// 修复前：driver 在阶梯 R 的采纳里调 `ladder.rearm()`（清 `r_fail_*`/`pending`）⇒ 每次
+/// 确认失败都只记成「第 1 次」，B 门结构性不可达（本用例超时红）；`pending.at` 被清还
+/// 让「链路重连完成（耗时 …）」只计确认段——修复后保留 R 发起时刻，报全周期。
+#[tokio::test]
+async fn r_adoption_keeps_fail_chain_probe_blackhole_reaches_b_gate() {
+    let sock = UdpSocket::bind((Ipv4Addr::UNSPECIFIED, 0)).expect("出口 socket 可绑");
+    let (exit_logf, _exit_logs) = sink();
+    let mut cfg = ExitQuicConfig::new(Ed25519Seed::from_bytes([0x5B; 32]), 32);
+    cfg.probe_blackhole = true;
+    let quic = ExitQuic::start(sock, cfg, exit_logf).expect("出口 QUIC 面可起");
+    let stub = Stub::new();
+    let (on_unhealthy, reasons) = unhealthy_sink();
+    let (logf, logs) = sink();
+    let island = Island::start(
+        logf,
+        on_unhealthy,
+        island_cfg(Duration::from_secs(60), quic.rpk_public_key()),
+    )
+    .expect("岛可起");
+    let (tun, peer) = tun_pair();
+    assert!(matches!(attach(&island, tun.as_raw_fd(), 1280, BUDGET), Ok(())));
+    connect_direct(&island, &stub, &quic).await;
+    assert_eq!(stub.accepted(), 1, "初始登记成功（黑洞只作用于 probe 回显）");
+
+    // 黑洞形态：连接在、准入过、probe 永无回显 ⇒ 失败链 M↔R 轮转；R 的每次
+    // 「采纳后确认失败」都要累计（第 2 次且窗 ≥10s ⇒ B 上报 patrol）。
+    // 等待循环里经 TUN 对端持续灌包：真实读线程路径刷新 `last_outbound_at` ⇒
+    // 快探钉在「在用档」（fast_gap 1s）——黑洞形态连接不死，没有事件沿可搭，
+    // 周期探活是唯一的失败链入口（经 Cmd 投包不写 last_outbound，必须走 fd）。
+    let deadline = Instant::now() + Duration::from_secs(45);
+    let mut reason = None;
+    while Instant::now() < deadline {
+        stub.pump(&quic);
+        let _ = peer.send(&inner_pkt(TUN_IP, TUNNEL_IP));
+        match reasons.try_recv() {
+            Ok(r) => {
+                reason = Some(r);
+                break;
+            }
+            Err(std::sync::mpsc::TryRecvError::Disconnected) => panic!("岛已退出"),
+            Err(std::sync::mpsc::TryRecvError::Empty) => {}
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    if reason.as_deref() != Some("patrol") {
+        let mut all = Vec::new();
+        while let Ok(l) = logs.try_recv() {
+            all.push(l);
+        }
+        panic!(
+            "注册成功 + probe 黑洞必须经 B 门上报（patrol）——got {:?}；岛日志尾部：{:?}",
+            reason,
+            all.iter().rev().take(30).collect::<Vec<_>>()
+        );
+    }
+    let lines = logs_until(&logs, "链路重连失败", Duration::from_millis(500)).await;
+    assert!(
+        lines.iter().any(|l| l.contains("第 2 次")),
+        "R 失败链须累计到第 2 次及以上（实得：{:?}）",
+        lines.iter().take(6).collect::<Vec<_>>()
+    );
+    assert!(
+        stub.accepted() >= 3,
+        "黑洞形态下 M↔R 轮转须多次准入（实得 {}）",
+        stub.accepted()
+    );
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
+/// **判据（评审 2026-10-20 P2-4）**：替换风暴计数跨「再采纳」保留。风暴的形态恰是
+/// 「采纳 → 被替换 → 再采纳」——修复前 `adopt` 清零 `replaced_count` ⇒ 计数在正常路径
+/// 永远停在 1，10 次/10s 的熔断不可达。两岛（**同设备凭证**）交替注册 ⇒ 出口按 devTag
+/// 互相替换 ⇒ A 侧计数必须累计（断言 ≥2；修复前恒 ≤1，本用例超时红）。
+#[tokio::test]
+async fn replaced_storm_count_survives_re_adoption() {
+    let quic = exit_face(0x5C);
+    let stub = Stub::new();
+    let (logf, _logs) = sink();
+    let island = Island::start(
+        Arc::clone(&logf),
+        Arc::new(|_r: &str| {}),
+        island_cfg(Duration::from_secs(60), quic.rpk_public_key()),
+    )
+    .expect("岛 A 可起");
+    let island_b = Island::start(
+        Arc::clone(&logf),
+        Arc::new(|_r: &str| {}),
+        island_cfg(Duration::from_secs(60), quic.rpk_public_key()),
+    )
+    .expect("岛 B 可起（同设备凭证：注册即替换 A 的现任）");
+    let (tun, _peer) = tun_pair();
+    assert!(matches!(attach(&island, tun.as_raw_fd(), 1280, BUDGET), Ok(())));
+    connect_direct(&island, &stub, &quic).await;
+    assert_eq!(island.snapshot().replaced_recent, 0, "初始无替换");
+
+    // 两岛交替注册（每次 Cmd::Connect = 同 devTag 的新注册 ⇒ 出口替换现任）。
+    // 每轮等待「计数达标 **且** A 已恢复持有连接」——A 的恢复链（阶梯 R 重连）中间
+    // 必经一次 adopt；修复前这次 adopt 会清零计数 ⇒ 第二轮计数停在 1（本用例红）。
+    for round in 1u32..=2 {
+        connect_direct(&island_b, &stub, &quic).await;
+        assert!(
+            wait_for(
+                &stub,
+                &quic,
+                || {
+                    let s = island.snapshot();
+                    s.replaced_recent >= round && s.connections == 1
+                },
+                WAIT * 3,
+            )
+            .await,
+            "第 {round} 轮替换后：replaced_recent ≥ {round} 且 A 恢复持有连接\
+             （修复前 A 的恢复采纳清零计数，恒卡在 1）"
+        );
+    }
+    assert!(
+        island.snapshot().replaced_recent >= 2,
+        "两轮替换后计数 ≥2（跨采纳保留）"
+    );
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(island_b.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+}
+
     // =========================================================================
     // reconnect-oneshot 1.1（评审 r1 P1-12 整改）：driver 载面沿逐沿行为测试
     // —— adopt / housekeeping 断开 / B 门僵尸收口 / 收工 四沿的 carrier 同步 +

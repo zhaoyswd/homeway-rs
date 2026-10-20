@@ -1937,6 +1937,7 @@ fn test_face_ctx(logf: Logf) -> Arc<FaceCtx> {
         nonce_ttl: crate::exit::DEFAULT_NONCE_TTL,
         conn_cap: 64,
         intakes: Arc::new(crate::ServiceIntakes::default()),
+        probe_blackhole: false,
     })
 }
 

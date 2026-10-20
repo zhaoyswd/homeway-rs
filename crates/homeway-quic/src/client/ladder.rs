@@ -266,11 +266,18 @@ impl Ladder {
         (*logf)(&format!("R 让路（准入单飞被一次性重连占用；原因={why}）—— 下一拍复读"));
     }
 
+    /// 是否处于风暴冷却休眠（driver 据此在**无连接**时也驱动 `due`：到期复位是熔断的
+    /// 唯一自动出口——熔断后最后一轮替换常已把 `live` 清空，此时若仍以 `live.is_some()`
+    /// 为门，冷却到期后的周期恢复不可达，休眠会一直拖到外部边沿。其它休眠形态
+    /// （B 门/系统禁发）无期限、不该被周期探活唤醒，所以只认 `storm_until` 在位）。
+    pub(crate) fn storm_parked(&self) -> bool {
+        self.dormant && self.storm_until.is_some()
+    }
+
     /// 替换风暴熔断：阶梯休眠到 `until`（**冷却到期自动复位**，不再只等采纳/边沿——
     /// 否则风暴后若迟迟没有新连接被 adopt，周期快探会永久停摆：UI 仍显示已连接，
     /// 链路死了也没有任何探活能发现）。
-    pub(crate) fn park_storm(&mut self, why: String, until: TokioInstant, logf: &Logf) {
-        self.dormant = true;
+    pub(crate) fn park_storm(&mut self, why: String, until: TokioInstant, logf: &Logf) {        self.dormant = true;
         self.storm_until = Some(until);
         self.inflight = false;
         self.pending = None;
@@ -1497,5 +1504,48 @@ mod tests {
         l.park_storm("替换风暴".to_owned(), t0 + Duration::from_secs(120), &logf);
         l.rearm();
         assert!(l.due(t0 + Duration::from_secs(121), true).is_some(), "rearm 后恢复");
+    }
+
+    /// 判据（评审 2026-10-20 P1-2，driver 接线语义在 `client/tests.rs` 的
+    /// `r_adoption_keeps_fail_chain_probe_blackhole_reaches_b_gate`）：R 的采纳**不 rearm**
+    /// 时，确认成功报的耗时从 **R 的发起时刻**起算（全周期 = 握手 + 四帧准入 + 确认），
+    /// 而不是被清后用准入完成时刻重建 `pending` ⇒ 只剩确认段。
+    #[test]
+    fn reconnect_elapsed_covers_full_cycle_when_adoption_skips_rearm() {
+        let mut l = Ladder::new(tuning());
+        let t0 = TokioInstant::now();
+        assert!(l.due(t0, true).is_some());
+        l.note_round(Round::First, t0);
+        l.on_round(Round::First, failed(), t0, SendFace::default(), &lines().0);
+        let step = l.on_round(Round::Reprobe, failed(), t0, SendFace::default(), &lines().0);
+        assert!(matches!(step, Step::Reconnect { .. }));
+        // R 起跑 = go_action 那拍（pending.at = t0）；握手+准入耗时 1s，采纳**不 rearm**；
+        // 确认探活在 t0+2s 成功 ⇒ 耗时必须报 2s（全周期），不是 1s（仅确认段——
+        // rearm 会清 pending、用准入完成时刻 t0+1s 重建）。
+        let step = l.on_reconnect_result(true, "链路快探失败".to_owned(), t0 + Duration::from_secs(1), &lines().0);
+        assert!(matches!(step, Step::Probe { round: Round::Confirm, .. }));
+        let (f, v) = lines();
+        l.on_round(Round::Confirm, ok(), t0 + Duration::from_secs(2), SendFace::default(), &f);
+        let done = v.lock().unwrap().iter().find(|l| l.contains("链路重连完成")).cloned();
+        let line = done.expect("确认成功必须报「链路重连完成」");
+        assert!(
+            line.contains("耗时 2s"),
+            "耗时从 R 发起时刻起算（全周期；实得 {line:?}）"
+        );
+    }
+
+    /// 判据（评审 2026-10-20 P2-4 配套）：`storm_parked` 是 driver 在**无连接**时仍驱动
+    /// `due` 的门条件（熔断后 `live` 常已清空，到期复位是熔断的唯一自动出口）；
+    /// park 中为 true，到期复位 / rearm 后为 false。
+    #[test]
+    fn storm_parked_gates_driver_due_without_live() {
+        let (logf, _log) = lines();
+        let mut l = Ladder::new(tuning());
+        let t0 = TokioInstant::now();
+        assert!(!l.storm_parked(), "常态非风暴休眠");
+        l.park_storm("替换风暴".to_owned(), t0 + Duration::from_secs(30), &logf);
+        assert!(l.storm_parked(), "冷却期内 = 风暴休眠（driver 无 live 也要驱动 due）");
+        assert!(l.due(t0 + Duration::from_secs(31), true).is_some(), "到期复位");
+        assert!(!l.storm_parked(), "复位后不再是风暴休眠（B 门/禁发形态不该被周期探活唤醒）");
     }
 }
