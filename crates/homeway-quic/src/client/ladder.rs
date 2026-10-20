@@ -181,8 +181,12 @@ pub(crate) struct Ladder {
     r_fail_since: Option<TokioInstant>,
     /// 本轮 R 尝试次数（判据行的「第 %d 次」）。
     r_attempts: u32,
-    /// B 已上报（阶梯休眠：同一世代不重复上报；新连接采纳时 `rearm`）。
+    /// B 已上报 / 风暴熔断等「阶梯休眠」标记（新连接采纳时 `rearm`）。
+    /// `storm_until` 只给**替换风暴**用：冷却到期后 `due` 自行复位（与
+    /// `connection-lifecycle.md`「暂停 R 30s……冷却到期复位」的契约一致）；
+    /// B 门/Denied 的休眠没有期限，仍等边沿/采纳。
     dormant: bool,
+    storm_until: Option<TokioInstant>,
     /// 累计成功快探次数（快照读数；e2e 的 T_recv 观测位）。
     pub(crate) probe_ok: u64,
     /// 最近一次动作（`""` = 未发生；快照读数）。
@@ -212,6 +216,7 @@ impl Ladder {
             r_fail_since: None,
             r_attempts: 0,
             dormant: false,
+            storm_until: None,
             probe_ok: 0,
             last_action: "",
             fail_gate: 0,
@@ -261,20 +266,25 @@ impl Ladder {
         (*logf)(&format!("R 让路（准入单飞被一次性重连占用；原因={why}）—— 下一拍复读"));
     }
 
-    /// 替换风暴熔断：阶梯休眠，等边沿或新连接采纳（`rearm`）复位。
-    pub(crate) fn park_storm(&mut self, why: String, logf: &Logf) {
+    /// 替换风暴熔断：阶梯休眠到 `until`（**冷却到期自动复位**，不再只等采纳/边沿——
+    /// 否则风暴后若迟迟没有新连接被 adopt，周期快探会永久停摆：UI 仍显示已连接，
+    /// 链路死了也没有任何探活能发现）。
+    pub(crate) fn park_storm(&mut self, why: String, until: TokioInstant, logf: &Logf) {
         self.dormant = true;
+        self.storm_until = Some(until);
         self.inflight = false;
         self.pending = None;
         self.last_action = "storm";
         (*logf)(&format!(
-            "替换风暴熔断中 —— 阶梯休眠（原因={why}），等换网/唤醒/回前台或新连接采纳"
+            "替换风暴熔断中 —— 阶梯休眠（原因={why}），{} 后自动恢复周期探活（或新连接采纳）",
+            crate::client::fmt_dur(until.saturating_duration_since(TokioInstant::now()))
         ));
     }
 
     /// B 已上报后**重新武装**（新连接采纳 ⇒ 新失败链重新计数；§3.1 的「归零」）。
     pub(crate) fn rearm(&mut self) {
         self.dormant = false;
+        self.storm_until = None;
         self.pending = None;
         self.inflight = false;
         self.suspend_gap_pending = false;
@@ -298,8 +308,17 @@ impl Ladder {
     pub(crate) fn due(&mut self, now: TokioInstant, in_use: bool) -> Option<(Round, Duration)> {
         let gap = now.saturating_duration_since(self.last_tick);
         self.last_tick = now;
-        if self.inflight || self.dormant {
+        if self.inflight {
             return None;
+        }
+        if self.dormant {
+            // 风暴冷却到期 ⇒ 自行复位（见 park_storm）；其它休眠（B 门/Denied）无期限。
+            let until = self.storm_until?;
+            if now < until {
+                return None;
+            }
+            self.dormant = false;
+            self.storm_until = None;
         }
         if self.last_round_at.is_some() && gap > 2 * self.tun.idle_interval {
             // tun-death-gate §2.3：空窗检出（主信号 = 核内 gap 判据）——置一拍性标志，
@@ -324,7 +343,11 @@ impl Ladder {
     ///
     /// **不做状态推进**（不更新 `last_tick`）：真正的到点判定仍在 [`Self::due`]。
     pub(crate) fn next_wait(&self, now: TokioInstant, in_use: bool) -> Option<Duration> {
-        if self.inflight || self.dormant {
+        if self.dormant {
+            // 风暴休眠：把睡眠对齐到冷却截止，到期后 due 会自行复位并起探。
+            return self.storm_until.map(|u| u.saturating_duration_since(now));
+        }
+        if self.inflight {
             return None;
         }
         if self.last_round_at.is_some() && now.saturating_duration_since(self.last_tick) > 2 * self.tun.idle_interval {
@@ -1454,16 +1477,24 @@ mod tests {
         );
     }
 
-    /// 判据（替换风暴熔断）：park 后阶梯休眠，`due` 不再起探；`rearm` 复位。
+    /// 判据（替换风暴熔断）：park 后阶梯休眠到冷却截止；到期**自行恢复**周期探活
+    ///（文档契约「暂停 R 30s……冷却到期复位」），`rearm` 仍是提前复位的快路径。
     #[test]
-    fn storm_park_sleeps_until_rearm() {
+    fn storm_park_rearms_after_cooldown() {
         let (logf, log) = lines();
         let mut l = Ladder::new(tuning());
         let t0 = TokioInstant::now();
-        l.park_storm("替换风暴".to_owned(), &logf);
+        let until = t0 + Duration::from_secs(30);
+        l.park_storm("替换风暴".to_owned(), until, &logf);
         assert!(!l.inflight());
-        assert!(l.due(t0 + Duration::from_secs(120), true).is_none(), "休眠后不再起探");
+        assert!(l.due(t0 + Duration::from_secs(10), true).is_none(), "冷却期内不起探");
+        assert!(
+            l.due(t0 + Duration::from_secs(31), true).is_some(),
+            "冷却到期后必须恢复周期探活（不能永久休眠）"
+        );
         assert!(log.lock().unwrap().iter().any(|l| l.contains("替换风暴熔断中")));
+        // rearm 仍是提前复位路径
+        l.park_storm("替换风暴".to_owned(), t0 + Duration::from_secs(120), &logf);
         l.rearm();
         assert!(l.due(t0 + Duration::from_secs(121), true).is_some(), "rearm 后恢复");
     }

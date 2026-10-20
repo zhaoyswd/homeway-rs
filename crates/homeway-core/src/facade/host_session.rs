@@ -490,6 +490,7 @@ impl HostSession {
 
         // ---- 暖机：一发出口可达探活（WARM_TIMEOUT；超时 = 软失败）----
         let started = Instant::now();
+        let mut warm_failed = false;
         match probe_once(&inner, WARM_TIMEOUT) {
             ProbeOutcome::Ok { rtt } => {
                 set_link(&inner, rtt);
@@ -500,13 +501,18 @@ impl HostSession {
                 crate::go_fmt::fmt_duration_go_ms(WARM_TIMEOUT)
             )),
             ProbeOutcome::NoFace => {
+                // 不在这里 `return Ok(...)`（评审 2026-10-20 A12）：那条路径会返回一个
+                // **没有巡检线程**的 failed 会话，之后只能等外部事件救——现在照常起
+                // patrol，巡检的 NoFace 分支会触发一次性重建。
+                warm_failed = true;
                 set_state(&inner, SessState::Failed, "出口不可达：无连接面");
-                (logf)("暖机硬失败：无连接面（出口不可达）");
-                return Ok(HostSession { inner });
+                (logf)("暖机硬失败：无连接面（出口不可达）——仍启动巡检，由巡检事件重连");
             }
         }
-        set_state(&inner, SessState::Ready, "");
-        (logf)("就绪（会话在位，无桥直通）"); // C16
+        if !warm_failed {
+            set_state(&inner, SessState::Ready, "");
+            (logf)("就绪（会话在位，无桥直通）"); // C16
+        }
         let _ = started;
 
         // ---- 巡检线程（link 快照刷新 + 失败留痕；**恢复动作在岛内阶梯**）----
@@ -801,6 +807,17 @@ fn start_island(
     );
     let mut icfg = IslandConfig::new(cred);
     icfg.patrol = PATROL_INTERVAL;
+    // 岛内阶梯 R 成功采纳 = 连接已恢复的**权威沿**（评审 2026-10-20 A12）：没有这个回调时，
+    // 岛自己恢复了、facade 却可能永远停在 failed（run_rebuild 被 RaceInFlight 让路/巡检只刷
+    // link 的路径都会留下状态差）。回调只把 failed 拉回 ready，不覆盖 stopping/idle。
+    {
+        let w = Arc::downgrade(inner);
+        icfg.on_adopt = Some(Arc::new(move || {
+            if let Some(i) = w.upgrade() {
+                on_island_adopted(&i);
+            }
+        }));
+    }
     // 绑定族按候选面选（纯 v4 = v4 socket；含 v6 = 双栈 `[::]:0`）。
     icfg.bind = if cands.iter().any(|c| c.addr.is_ipv6()) {
         None
@@ -833,6 +850,27 @@ fn start_island(
 
 // ---------- 一次性重建（B 门 / 拨号 / 巡检事件触发） ----------
 
+/// 岛内阶梯/赛跑采纳了新连接：**连接已恢复的权威证据**。
+///
+/// 只把 `failed` 拉回 `ready`（评审 2026-10-20 A12）：`run_rebuild` 因 `RaceInFlight`
+/// 让路、或巡检只刷 link 的路径，都可能留下「岛已经恢复、facade 仍报 failed」的状态差；
+/// 上层据 failed 报 `service/failed`，用户看到列表/终端不可用。`starting/stopping/idle`
+/// 不动（装配与收工有各自的写手，旧岛不得把新状态翻回去）。
+fn on_island_adopted(inner: &Arc<Inner>) {
+    if inner.stop.load(Ordering::Acquire) {
+        return;
+    }
+    let mut s = crate::syncutil::lock_unpoison(&inner.snapshot);
+    if s.state != SessState::Failed {
+        return;
+    }
+    s.state = SessState::Ready;
+    s.reason.clear();
+    s.since = Instant::now();
+    drop(s);
+    (inner.logf)("宿主会话：岛内阶梯采纳新连接 —— 状态由 failed 回 ready");
+}
+
 /// 岛上报不健康：如实置 failed + 触发**一次**重建（边沿源，绕过节流）。
 fn on_island_unhealthy(inner: &Arc<Inner>, reason: &str) {
     (inner.logf)(&format!(
@@ -858,16 +896,37 @@ fn try_rebuild(inner: &Arc<Inner>, source: RebuildSource) {
         }
         *last = Some(Instant::now());
     }
-    let prev = inner.rebuild_gate.state.fetch_or(REBUILD_INFLIGHT, Ordering::AcqRel);
-    #[cfg(test)]
-    if prev & REBUILD_INFLIGHT == 0 {
-        inner.rebuild_gate.spawns.fetch_add(1, Ordering::Relaxed);
-    }
-    if prev & REBUILD_INFLIGHT != 0 {
-        if source.is_edge() {
-            inner.rebuild_gate.state.fetch_or(REBUILD_PENDING, Ordering::AcqRel);
+    loop {
+        // **CAS 协议**（评审 2026-10-20 A1）：两处窗口（worker 判定无 pending 后新事件才置位；
+        // 入口确认在飞后被切走、worker 已释放）都会留下 `PENDING && !INFLIGHT` 的孤儿边沿。
+        // 入口用 CAS 保证「要么真的取得 owner，要么把 pending 留给一个仍然在飞的 worker」。
+        let s = inner.rebuild_gate.state.load(Ordering::Acquire);
+        if s & REBUILD_INFLIGHT == 0 {
+            // 空闲：尝试取得 owner（抢不到就重读——状态只会因 worker 收尾/新事件变化）。
+            if inner
+                .rebuild_gate
+                .state
+                .compare_exchange(s, s | REBUILD_INFLIGHT, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                #[cfg(test)]
+                inner.rebuild_gate.spawns.fetch_add(1, Ordering::Relaxed);
+                break;
+            }
+            continue;
         }
-        return;
+        if !source.is_edge() {
+            return; // demand 源：在飞就让路（不排队）
+        }
+        // 边沿源：在飞则留 pending。若期间 worker 已释放，CAS 失败 ⇒ 重试并取得 owner。
+        if inner
+            .rebuild_gate
+            .state
+            .compare_exchange(s, s | REBUILD_PENDING, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            return;
+        }
     }
     spawn_rebuild_worker(inner, source);
 }
@@ -891,7 +950,7 @@ fn spawn_rebuild_worker(inner: &Arc<Inner>, source: RebuildSource) {
                     inner
                         .rebuild_gate
                         .state
-                        .fetch_and(!REBUILD_INFLIGHT, Ordering::AcqRel);
+                        .fetch_and(!(REBUILD_INFLIGHT | REBUILD_PENDING), Ordering::AcqRel);
                     crate::syncutil::log_spawn_failed(
                         &inner.logf,
                         "宿主会话重建线程",
@@ -908,7 +967,7 @@ fn spawn_rebuild_worker(inner: &Arc<Inner>, source: RebuildSource) {
 /// worker：一次 `run_rebuild` + 边沿 pending 承接；panic 兜底释放单飞位（不留死锁）。
 fn rebuild_worker(inner: Arc<Inner>, source: RebuildSource) {
     let mut source = source;
-    loop {
+    'round: loop {
         let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             run_rebuild(&inner, source);
         }));
@@ -920,20 +979,42 @@ fn rebuild_worker(inner: Arc<Inner>, source: RebuildSource) {
                 .fetch_and(!(REBUILD_INFLIGHT | REBUILD_PENDING), Ordering::AcqRel);
             return;
         }
-        let s = inner.rebuild_gate.state.load(Ordering::Acquire);
-        if s & REBUILD_PENDING == 0 {
-            inner
+        // 收尾也走 CAS（评审 2026-10-20 A1）：先看 pending 再释放 INFLIGHT 有两个窗口，
+        // 会把「入口已置 pending」的边沿丢掉。这里 CAS 承接 pending；若期间状态变化
+        // （新事件/入口取得 owner 的极端交错）就重读，绝不留下 `PENDING && !INFLIGHT`。
+        loop {
+            let s = inner.rebuild_gate.state.load(Ordering::Acquire);
+            if s & REBUILD_PENDING != 0 {
+                if inner
+                    .rebuild_gate
+                    .state
+                    .compare_exchange(
+                        s,
+                        (s & !REBUILD_PENDING) | REBUILD_INFLIGHT,
+                        Ordering::AcqRel,
+                        Ordering::Acquire,
+                    )
+                    .is_ok()
+                {
+                    source = RebuildSource::BGate;
+                    continue 'round;
+                }
+                continue;
+            }
+            if inner
                 .rebuild_gate
                 .state
-                .fetch_and(!REBUILD_INFLIGHT, Ordering::AcqRel);
-            return;
+                .compare_exchange(
+                    s,
+                    s & !REBUILD_INFLIGHT,
+                    Ordering::AcqRel,
+                    Ordering::Acquire,
+                )
+                .is_ok()
+            {
+                return;
+            }
         }
-        // 在飞期间来过边沿：清位、保留 INFLIGHT，再跑一轮（只可能来自 B 门）。
-        inner
-            .rebuild_gate
-            .state
-            .fetch_and(!REBUILD_PENDING, Ordering::AcqRel);
-        source = RebuildSource::BGate;
     }
 }
 
@@ -978,6 +1059,16 @@ fn run_rebuild(inner: &Arc<Inner>, source: RebuildSource) {
             if let ProbeOutcome::Ok { rtt } = probe_once(inner, PROBE_TIMEOUT) {
                 set_link(inner, rtt);
             }
+        }
+        Err(IslandRpcErr::Island(homeway_quic::IslandErr::RaceInFlight)) => {
+            // 岛内阶梯 R 正在赛中：**让路，不是失败**（评审 2026-10-20 A12）。保留当前
+            // Starting/Ready/Failed 面，等岛内 R 的结论（成功 ⇒ on_adopt 回 ready；失败
+            // ⇒ 岛上报 unhealthy 走 B 门）或下一次事件。把它写成 failed 会让「实际已恢复」
+            // 的会话长期报错。
+            (inner.logf)(&format!(
+                "一次性重建：让路（源={}，岛内阶梯 R 在赛中）—— 等岛内结果/下一次事件",
+                source.text()
+            ));
         }
         Err(e @ IslandRpcErr::Gone(_))
         | Err(e @ IslandRpcErr::Island(homeway_quic::IslandErr::EngineGone)) => {
@@ -1065,6 +1156,18 @@ fn set_state_unless_failed(inner: &Arc<Inner>, state: SessState, reason: &str) -
     true
 }
 
+/// 只把 failed 拉回 ready（探活成功/adopt 的恢复沿；其它状态不动）。
+fn set_state_if_failed_ready(inner: &Arc<Inner>) -> bool {
+    let mut s = crate::syncutil::lock_unpoison(&inner.snapshot);
+    if s.state != SessState::Failed {
+        return false;
+    }
+    s.state = SessState::Ready;
+    s.reason.clear();
+    s.since = Instant::now();
+    true
+}
+
 /// 巡检（link 快照刷新 + 失败留痕；**恢复动作在岛内阶梯**——本线程不发起 WG 式动作）。
 fn patrol_loop(inner: Arc<Inner>) {
     let mut fail_streak: u32 = 0;
@@ -1089,6 +1192,10 @@ fn patrol_loop(inner: Arc<Inner>) {
             ProbeOutcome::Ok { rtt } => {
                 fail_streak = 0;
                 set_link(&inner, rtt);
+                // 探活成功 = 连接在的**独立证据**：顺手把 failed 拉回 ready（评审
+                // 2026-10-20 A12）。否则「岛已恢复、状态仍 failed」会一直把上层挡在
+                // service/failed 上。stopping/idle 不动。
+                set_state_if_failed_ready(&inner);
             }
             ProbeOutcome::Timeout => {
                 fail_streak += 1;

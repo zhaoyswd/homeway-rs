@@ -1217,6 +1217,13 @@ async fn housekeeping(
             st.pump_conn = None;
             st.snap_sync_last = None;
             st.dead_logged = false;
+            // 旧连接上的服务流随它一起死：不清就会留在册里虚占 capacity（`has_capacity`
+            // 按 map.len() 计），且调用方会一直等不到回显。交接是**良性**的 ⇒ 只作废
+            // 流、不 mark_dead（承载位继续等新连接采纳）。
+            let n = st.streams.clear_on_connection_loss();
+            if n > 0 {
+                (*ctx.logf)(&format!("替换交接 —— 旧连接上的 {n} 条服务流按 EOF 收"));
+            }
             return;
         }
         if !st.dead_logged {
@@ -1259,6 +1266,12 @@ async fn housekeeping(
             st.live = None;
             st.pump_conn = None;
             st.snap_sync_last = None; // 关键转换：快照立即到期（节流见 ④）
+            // 旧连接已判死：在册服务流一并作废（否则它们留在 map 里虚占 capacity，
+            // 新流会被 Busy 挡掉；调用方也等不到 EOF）。
+            let n = st.streams.clear_on_connection_loss();
+            if n > 0 {
+                (*ctx.logf)(&format!("注册刷新失败 —— {n} 条在册服务流按 EOF 收"));
+            }
             // reconnect-oneshot D2：刷新失败判连接死 = 承载位 false 沿（housekeeping
             // 判定的同一族）。
             if let Some(c) = &ctx.carrier {
@@ -1817,7 +1830,14 @@ fn ladder_step(
                 }
                 // 替换风暴熔断只拦阶梯 R；边沿源（一次性重连）照常。
                 if storm_active(st, Instant::now()) {
-                    st.ladder.park_storm(why, &ctx.logf);
+                    // 冷却截止时刻转成阶梯自己的时钟：到期由 due 自行复位（文档契约：
+                    // 「暂停阶梯 R 30s……冷却到期复位」），不再依赖必有新连接被采纳。
+                    let now_std = Instant::now();
+                    let until = st
+                        .storm_until
+                        .map(|t| TokioInstant::now() + t.saturating_duration_since(now_std))
+                        .unwrap_or_else(TokioInstant::now);
+                    st.ladder.park_storm(why, until, &ctx.logf);
                     return;
                 }
                 if after_migration_unconfirmed {
@@ -2470,13 +2490,18 @@ mod storm_replay_tests {
         assert_eq!(tripped_at, Some(9), "第 10 次（i=9）触发");
         assert_eq!(trips, 1, "同一冷却期内只触发一次");
         assert!(until.is_some());
-        // 阶梯被 park 后不再起探（等边沿/新连接采纳）。
+        // 阶梯被 park 后休眠到冷却截止，到期自行恢复周期探活。
         let logf: Logf = Arc::new(|_l: &str| {});
         let mut l = Ladder::new(ProbeTuning::design());
         let lt = TokioInstant::now();
-        l.park_storm("替换风暴".to_owned(), &logf);
-        assert!(l.due(lt + Duration::from_secs(120), true).is_none());
-        // 新连接采纳 = rearm 复位（与 driver::adopt 的调用同义）。
+        l.park_storm("替换风暴".to_owned(), lt + Duration::from_secs(30), &logf);
+        assert!(l.due(lt + Duration::from_secs(10), true).is_none());
+        assert!(
+            l.due(lt + Duration::from_secs(31), true).is_some(),
+            "冷却到期必须恢复探活"
+        );
+        // 新连接采纳 = rearm 提前复位（与 driver::adopt 的调用同义）。
+        l.park_storm("替换风暴".to_owned(), lt + Duration::from_secs(120), &logf);
         l.rearm();
         assert!(l.due(lt + Duration::from_secs(121), true).is_some());
     }
