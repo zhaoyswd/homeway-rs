@@ -62,3 +62,11 @@ quinn-proto 0.11 的 migration 接收条件。两项发现仍成立：TLS 握手
 必须回报失败并进入宿主退避；认证成功后取消的后备不得被误记路径失败。定向 0.30s 全过。
 `cargo clippy -p homeway-quic --all-targets -- -D warnings` 通过；`tools/check-quic-isolation.sh`
 十一条断言全绿。
+
+
+## 整批收口补记（主任务）
+
+实现提交a7faa5ef88a8。统一workspace1216/0、QUIC289/0、core840/0；ci-local quick
+通过（矩阵既有WARN/SKIP各1）。定向真实中继4/0、私有恢复4/0，Linux/OHOS check与
+真核/HSP完成；最终源码的core32压力轮中继/学习均通过，有一个既有PTY超时，单独
+复验通过，未声称压力全绿。见tier同日整改总记录。无生产部署或真机安装。

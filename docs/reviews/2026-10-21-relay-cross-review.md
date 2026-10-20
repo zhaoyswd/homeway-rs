@@ -78,3 +78,11 @@
 验证：`ctl_keepalive_echo` 定向通过；真实 e2e 4/0（13.62s）；32 线程 core 全量中 relay 全部通过，但另暴露候选 Probe 单次刷新被全局 worker quota 合法拒绝导致测试 responder 超时的独立 fixture 问题（839/1），已提交给该模块 owner，整批全门再验。
 
 Probe fixture 按后续观测事件语义修正后，再跑最终源码 `cargo test -p homeway-core --lib -- --test-threads=32`：relay 与 Probe 均通过；全量 839/1、5 ignored（67.19s），唯一失败为既有 `term::service::tests::attach_size_applies_to_pty` 的环境性 PTY 挂死 60s 硬期限，原文已上报主任务，未改该能力范围。`cargo clippy -p homeway-core --all-targets -- -D warnings` 与 diff 检查通过。本次 relay 测试选口补修已冻结。
+
+
+## 整批收口补记（主任务）
+
+实现提交a7faa5ef88a8。统一workspace1216/0、QUIC289/0、core840/0；ci-local quick
+通过（矩阵既有WARN/SKIP各1）。定向真实中继4/0、私有恢复4/0，Linux/OHOS check与
+真核/HSP完成；最终源码的core32压力轮中继/学习均通过，有一个既有PTY超时，单独
+复验通过，未声称压力全绿。见tier同日整改总记录。无生产部署或真机安装。

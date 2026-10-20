@@ -75,10 +75,13 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 > 保留公网观测 r5 改动，实施中继认证/配额/期限/绑定、候选持久化与动态 DNS、串行准入
 > 后备及同连接跨族直连升级。专项技术/代码评审与交叉复核见
 > `docs/reviews/2026-10-21-{relay-security,quic-selection,endpoint-learning,relay-cross-review,endpoint-cross-review}.md`。
-> 标准全仓 1216/0（37 ignored 未计通过）、clippy、OHOS/Linux check、向量/种子/词表/
-> 隔离/残留门已过，OHOS 真链接 3,217,016B；私有矩阵与修正注入相位后的恢复 e2e、tier
-> clean-core 双落盘/HSP 构建正在收口。额外 core32 压力跑有一个既有 PTY attach 超时，
-> 单独复验 1/0，未扩大修改到终端模块。最终证据补记；生产未部署、未推送/tag。
+> **本批收官**：实现 `a7faa5ef88a8`；标准全仓 1216/0（37 ignored 未计通过），ci-local
+> quick 全门通过（RRR 保留既有 WARN/SKIP 各1），OHOS/Linux check、真 NDK链接与
+> tier clean-core 双落盘/签名 debug HSP 通过，核3,217,016B、版本a7faa5ef88a8-rust。
+> 私有恢复e2e4/0，立即/停机5秒重启 T_recv=3058/2538ms。额外core32有一项既有
+> PTY attach 60s超时，单独复验1/0，未把压力轮写成全绿。完整验证、兼容升级顺序与
+> 未跑的设备/生产范围见 tier `docs/reviews/2026-10-21-中继赛跑与地址学习整改.md`。
+> 生产未部署，未推送/tag；本提交仅补收口证据与矩阵表，核pin仍指实现提交。
 
 
 > **2026-10-21 接续注**：公网观测 r5 全项整改已实施（TLS 绝对期限、发布与停机、relay fd
