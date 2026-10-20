@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::io;
 use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4, UdpSocket};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{Duration, Instant};
 
 use crate::server::egress;
@@ -87,6 +88,7 @@ const QUERY_TIMEOUT: Duration = Duration::from_secs(2);
 const CHECK_BUDGET: Duration = Duration::from_secs(15);
 /// 单次收集的地址上限（防畸形应答灌爆；正常 DDNS 1-2 条）。
 const MAX_ANSWERS: usize = 16;
+static NEVER_STOP: AtomicBool = AtomicBool::new(false);
 
 // fake-IP 卫兵段：**单一实现位于 `egress::is_fake_ip`**（Q-J F3 迁入，dnsproxy 的
 // 交付应答计数共用）——本模块只调用，不再自带实现（两处各有一条「单一实现」断言）。
@@ -94,6 +96,8 @@ const MAX_ANSWERS: usize = 16;
 /// 卫兵两档错误（自检按档分文案）。
 #[derive(Debug, thiserror::Error)]
 pub enum DdnsErr {
+    #[error("ddns: 自检已停止")]
+    Cancelled,
     #[error("ddns: 解析结果落在 fake-IP 段（代理环境污染，检查绑卡/代理）")]
     Poisoned,
     #[error("ddns: 解析结果非全球单播（DDNS 记录本身不可路由，检查记录值）")]
@@ -117,7 +121,25 @@ pub fn run_ddns_self_check(
         return;
     }
     for domain in domains {
-        check_one(checks, domain, published, resolvers, logf);
+        check_one(checks, domain, published, resolvers, logf, Instant::now() + CHECK_BUDGET, &NEVER_STOP);
+    }
+}
+
+/// 观测线程使用：整拍 DDNS 共用 15s 期限，socket 每 50ms 检查停止，避免 join
+/// 退化成「配置域名数 × 15s」。独立 resolve_ddns 调用仍保留自己的预算语义。
+pub(crate) fn run_ddns_self_check_cancellable(
+    checks: &Mutex<HashMap<String, DdnsCheckState>>,
+    domains: &[String],
+    published: &[String],
+    resolvers: &[SocketAddr],
+    logf: &dyn Fn(&str),
+    stop: &AtomicBool,
+) {
+    if published.is_empty() { return; }
+    let deadline = Instant::now() + CHECK_BUDGET;
+    for domain in domains {
+        if stop.load(Ordering::SeqCst) || Instant::now() >= deadline { return; }
+        check_one(checks, domain, published, resolvers, logf, deadline, stop);
     }
 }
 
@@ -127,8 +149,12 @@ fn check_one(
     published: &[String],
     resolvers: &[SocketAddr],
     logf: &dyn Fn(&str),
+    deadline: Instant,
+    stop: &AtomicBool,
 ) {
-    let addrs = match resolve_ddns(domain, CHECK_BUDGET, resolvers) {
+    let result = resolve_ddns_before(domain, deadline, resolvers, stop);
+    if stop.load(Ordering::SeqCst) { return; }
+    let addrs = match result {
         Ok(a) => a,
         Err(e) => {
             let mut m = checks.lock().expect("ddns 状态锁中毒");
@@ -222,18 +248,22 @@ fn check_one(
 /// 解析器按序回退；单查询失败不拖垮另一族；全部失败返回错误（调用方跳过本轮自检）。
 /// `resolvers` = 直查解析器列表（F2：`serve.ddns_resolver`；空 = 默认常量表）。
 pub fn resolve_ddns(host: &str, budget: Duration, resolvers: &[SocketAddr]) -> Result<Vec<IpAddr>, DdnsErr> {
+    resolve_ddns_before(host, Instant::now() + budget, resolvers, &NEVER_STOP)
+}
+
+fn resolve_ddns_before(host: &str, deadline: Instant, resolvers: &[SocketAddr], stop: &AtomicBool) -> Result<Vec<IpAddr>, DdnsErr> {
     let resolvers: &[SocketAddr] = if resolvers.is_empty() { &DDNS_RESOLVERS } else { resolvers };
-    let deadline = Instant::now() + budget;
     let sock = UdpSocket::bind("0.0.0.0:0").map_err(|e| DdnsErr::Io(format!("解析 socket 建立失败：{e}")))?;
     for sv in resolvers.iter().copied() {
         let mut got: Vec<IpAddr> = Vec::new();
         let mut poisoned = false;
         for qtype in [QTYPE_A, QTYPE_AAAA] {
+            if stop.load(Ordering::SeqCst) { return Err(DdnsErr::Cancelled); }
             if Instant::now() >= deadline {
                 break;
             }
             let per = QUERY_TIMEOUT.min(deadline.saturating_duration_since(Instant::now()));
-            if let Ok(addrs) = ddns_query(&sock, sv, host, qtype, per) {
+            if let Ok(addrs) = ddns_query(&sock, sv, host, qtype, Instant::now() + per, stop) {
                 got.extend(addrs);
             } // 单查询失败不拖垮另一族
         }
@@ -271,26 +301,27 @@ fn ddns_query(
     sv: SocketAddr,
     host: &str,
     qtype: u16,
-    budget: Duration,
+    deadline: Instant,
+    stop: &AtomicBool,
 ) -> io::Result<Vec<IpAddr>> {
     let (req, id) = build_query(host, qtype)?;
-    sock.set_read_timeout(Some(budget))?;
+    if stop.load(Ordering::SeqCst) { return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "自检停止")); }
     sock.send_to(&req, sv)?;
     let mut buf = [0u8; 1500];
-    let deadline = Instant::now() + budget;
     loop {
+        if stop.load(Ordering::SeqCst) { return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "自检停止")); }
         let remain = deadline.saturating_duration_since(Instant::now());
         if remain.is_zero() {
             return Err(io::Error::new(io::ErrorKind::TimedOut, "查询超时"));
         }
-        sock.set_read_timeout(Some(remain))?;
+        sock.set_read_timeout(Some(remain.min(Duration::from_millis(50))))?;
         let (n, from) = match sock.recv_from(&mut buf) {
             Ok(v) => v,
             Err(e)
                 if e.kind() == io::ErrorKind::WouldBlock
                     || e.kind() == io::ErrorKind::TimedOut =>
             {
-                return Err(io::Error::new(io::ErrorKind::TimedOut, "查询超时"))
+                continue;
             }
             Err(e) => return Err(e),
         };
@@ -601,5 +632,25 @@ mod tests {
         let j = serde_json::to_value(&b[0]).unwrap();
         assert_eq!(j["lagStreak"], 2);
         assert!(j.get("warnedLag").is_none(), "false 位省略（omitempty 同义）");
+    }
+
+    #[test]
+    fn stop_interrupts_ddns_socket_and_does_not_update_check_state() {
+        let listener = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let resolver = listener.local_addr().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            let mut query = [0; 512];
+            listener.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            listener.recv_from(&mut query).unwrap();
+            signal.store(true, Ordering::SeqCst);
+        });
+        let checks = Mutex::new(HashMap::new());
+        let started = Instant::now();
+        run_ddns_self_check_cancellable(&checks, &["stop.example".to_owned()], &["8.8.8.8:41641".to_owned()], &[resolver], &|_| {}, &stop);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        assert!(checks.lock().unwrap().is_empty());
+        server.join().unwrap();
     }
 }

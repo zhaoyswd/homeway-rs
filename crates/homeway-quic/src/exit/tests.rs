@@ -987,7 +987,7 @@ async fn stop_releases_listen_port_after_panic() {
             break;
         }
         assert!(Instant::now() < deadline, "panic 后监听端口 {port} 仍不可重绑（panic 路径未断环）");
-        std::thread::sleep(Duration::from_millis(20));
+        tokio::time::sleep(Duration::from_millis(20)).await;
     }
 }
 

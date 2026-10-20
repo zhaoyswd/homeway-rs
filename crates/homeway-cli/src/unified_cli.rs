@@ -862,6 +862,7 @@ impl RoleHost for UnifiedRoles {
                     inner.serve_stop_join = Some(std::thread::Builder::new()
                         .name("hw-serve-stop".to_owned())
                         .spawn(move || {
+                            engine.stop_public_observation();
                             if upnp {
                                 shrink_upnp_lease(&engine, &logf);
                             }
@@ -895,6 +896,7 @@ impl RoleHost for UnifiedRoles {
                     let h = std::thread::Builder::new()
                         .name("hw-serve-rst".to_owned())
                         .spawn(move || {
+                            engine.stop_public_observation();
                             if upnp {
                                 shrink_upnp_lease(&engine, &logf);
                             }
@@ -1455,6 +1457,7 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
             let _ = h.join();
         }
         if let Some(engine) = inner.serve.take() {
+            engine.stop_public_observation();
             if inner.serve_upnp {
                 shrink_upnp_lease(&engine, &logf);
             }

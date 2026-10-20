@@ -38,3 +38,5 @@ pub fn quic_rpk_seed(backend_priv: &x25519_dalek::StaticSecret) -> homeway_quic:
         RPK_LABEL,
     ))
 }
+
+pub(crate) mod deadline_io;

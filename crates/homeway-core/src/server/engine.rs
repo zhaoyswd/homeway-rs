@@ -246,10 +246,16 @@ pub struct EngineInterceptBits {
 pub struct ServeEngine {
     cmd_tx: Sender<EngineCmd>,
     driver: Mutex<Option<std::thread::JoinHandle<()>>>,
+    shutdown_completion: Mutex<()>,
     /// 驱动线程在世位（线程出口清零——panic 也清：supervisor 的存活判据）。
     driver_alive: Arc<AtomicBool>,
-    /// pubep 停止位（shutdown 置位：观测线程的写盘前检查——r1#10 防跨 restart 写旧 state）。
+    /// 观测与兜底取消位；停止后等待两个线程退出，再允许缩租与替换。
     pubep_stop: Arc<AtomicBool>,
+    publication: Arc<Mutex<()>>,
+    observers: Mutex<Vec<std::thread::JoinHandle<()>>>,
+    observer_threads: Vec<std::thread::ThreadId>,
+    pub_kick: mpsc::SyncSender<()>,
+    relay_workers: Mutex<Vec<super::relayleg::RelayWorker>>,
     /// 拦截计数共享原子（status 观测面直读——不占驱动线程）。
     itc_stats: Arc<super::intercept::Stats>,
     /// 出口**公共端口**（M5 起 = QUIC 面的直连端口；`None` = 本世代无公共端口——
@@ -809,6 +815,9 @@ impl ServeEngine {
         // 看护循环重钉后更新（Go `pinnedNow`/`PinnedIface` 同义）。
         let pinned_flag = Arc::new(AtomicBool::new(pinned_pin_ok || bind_addr.is_some()));
         let pubep_stop = Arc::new(AtomicBool::new(false));
+        let publication = Arc::new(Mutex::new(()));
+        let mut observers = Vec::new();
+        let mut relay_workers = Vec::new();
 
         // ---- 命令通道（驱动线程收；观测/udpcap/中继控制面都经它交互） ----
         let (cmd_tx, cmd_rx) = mpsc::channel::<EngineCmd>();
@@ -854,7 +863,7 @@ impl ServeEngine {
                         let _ =
                             leg_tx_frame.try_send(super::relayleg::LegEvent::Frame(payload.to_vec(), src));
                     }));
-                    let leg_tx_frame2 = leg_tx;
+                    let leg_tx_frame2 = leg_tx.clone();
                     pubface.set_on_leg_frame(Box::new(move |payload, src| {
                         let _ =
                             leg_tx_frame2.try_send(super::relayleg::LegEvent::Frame(payload.to_vec(), src));
@@ -865,7 +874,7 @@ impl ServeEngine {
                         arg.addr,
                         priv_key.clone(),
                         arg.secret,
-                        leg_rx,
+                        (leg_tx, leg_rx),
                         Arc::clone(&stop),
                         Arc::clone(&logf),
                     );
@@ -882,12 +891,21 @@ impl ServeEngine {
                     // 带中继端点——否则客户端拿到一条静默失效的中继路径；明细行已在
                     // spawn 内部落，这里只摘发布面）。控制面单独失败时注册腿会周期
                     // Hello 但 SESSION 无法建立 ⇒ 中继路径同样不可用，一并摘。
-                    if leg.is_err() || ctl.is_err() {
+                    let incomplete = leg.is_err() || ctl.is_err();
+                    if incomplete {
+                        stop.store(true, Ordering::SeqCst);
                         (logf)(
                             "⚠️ --relay 线程起不全（注册腿/控制面 spawn 失败，见上行明细）—— 中继端点不并入 token，出口仅直连形态运行",
                         );
                         relay_ep = None;
                         relay_wanted = false;
+                    }
+                    for worker in leg.into_iter().chain(ctl) {
+                        if incomplete {
+                            worker.stop_and_join();
+                        } else {
+                            relay_workers.push(worker);
+                        }
                     }
                 }
                 None => {
@@ -965,6 +983,7 @@ impl ServeEngine {
             log_paths,
             pinned_flag: Arc::clone(&pinned_flag),
             pubep_stopped: Arc::clone(&pubep_stop),
+            publication: Arc::clone(&publication),
             resolver: super::doh::DohResolver::from_list(
                 super::doh::parse_list(&cfg.doh),
                 Arc::clone(&pin_iface),
@@ -980,15 +999,16 @@ impl ServeEngine {
             let cmd_tx2 = cmd_tx.clone();
             let shared = Arc::clone(&shared);
             let kick_rx = pub_kick_rx;
-            std::thread::Builder::new()
+            if let Ok(handle) = std::thread::Builder::new()
                 .name("homeway-pubep".into())
                 .spawn(move || {
                     public_endpoint_loop(shared, cmd_tx2, kick_rx, first_probe_tx);
                 })
-                .ok();
+            {
+                observers.push(handle);
+            }
         } else {
-            // 探测全关：观测线程不起、first_probe_tx 在此 drop（兜底线 pub_enabled
-            // 分支不会执行 recv——它走自己的 15s 档；tx drop 只是让通道不悬空）。
+            // 探测全关：发送端关闭，兜底线继续按15s总期限等候（可取消）。
             drop(first_probe_tx);
             drop(pub_kick_rx);
             if !cfg.ddns.is_empty() {
@@ -1017,21 +1037,17 @@ impl ServeEngine {
         // 12:40 的无中继版本）。
         {
             let shared = Arc::clone(&shared);
-            std::thread::Builder::new()
+            if let Ok(handle) = std::thread::Builder::new()
                 .name("homeway-tokfb".into())
                 .spawn(move || {
-                    if pub_enabled {
-                        // 等首轮探测信号；观测线程早夭（发送端全部 drop）= 兜底档
-                        if first_probe_rx.recv().is_err() {
-                            std::thread::sleep(fallback_wait);
-                        }
-                    } else {
-                        // 探测全关（Go firstProbe==nil）：tokenFallbackWait 兜底档
-                        std::thread::sleep(fallback_wait);
+                    if !wait_first_probe(&first_probe_rx, fallback_wait, &shared.pubep_stopped, &driver_alive_tokfb) {
+                        return;
                     }
                     for _ in 0..10 {
-                        if !driver_alive_tokfb.load(Ordering::SeqCst) {
-                            return; // 低-6：驱动已收工，不再重试铸打
+                        if shared.pubep_stopped.load(Ordering::SeqCst)
+                            || !driver_alive_tokfb.load(Ordering::SeqCst)
+                        {
+                            return;
                         }
                         let (printed, published) = match shared.inner.lock() {
                             Ok(i) => (!i.last_token.is_empty(), i.last_published.clone()),
@@ -1041,18 +1057,22 @@ impl ServeEngine {
                             return;
                         }
                         print_client_token(&shared, &published);
-                        let printed = shared
+                        if shared
                             .inner
                             .lock()
                             .map(|i| !i.last_token.is_empty())
-                            .unwrap_or(false);
-                        if printed {
+                            .unwrap_or(false)
+                        {
                             return;
                         }
-                        std::thread::sleep(Duration::from_secs(1));
+                        if !wait_observer(&shared.pubep_stopped, Duration::from_secs(1)) {
+                            return;
+                        }
                     }
                 })
-                .ok();
+            {
+                observers.push(handle);
+            }
         }
 
         // ---- udpcap 探测线程（kick = 换网卡后立即重探——绑卡看护 onChange） ----
@@ -1118,8 +1138,14 @@ impl ServeEngine {
         Ok(Arc::new(Self {
             cmd_tx,
             driver: Mutex::new(Some(driver)),
+            shutdown_completion: Mutex::new(()),
             driver_alive: driver_alive_ctor,
             pubep_stop,
+            publication,
+            observer_threads: observers.iter().map(|handle| handle.thread().id()).collect(),
+            observers: Mutex::new(observers),
+            pub_kick: pub_kick_tx,
+            relay_workers: Mutex::new(relay_workers),
             itc_stats: Arc::clone(&itc_stats),
             local_port,
             quic_local_addr: quic_brief.as_ref().map(|(a, _)| *a),
@@ -1136,9 +1162,18 @@ impl ServeEngine {
         }))
     }
 
-    /// 有序收工（D5 序）。grace = 过境 TCP 存量连接的有界宽限。
+    /// 有序收工。观察线程内日志回调只能请求停止；外部调用返回才确认所有资源已释放。
     pub fn shutdown(&self, grace: Duration) {
-        self.pubep_stop.store(true, Ordering::SeqCst); // pubep 写盘前检查（r1#10）
+        if self.on_observer_thread() {
+            self.pubep_stop.store(true, Ordering::SeqCst);
+            for flag in &self.stop_flags {
+                flag.store(true, Ordering::SeqCst);
+            }
+            let _ = self.cmd_tx.send(EngineCmd::Stop { grace });
+            return;
+        }
+        let _completion = self.shutdown_completion.lock().expect("收工锁中毒");
+        self.stop_public_observation();
         for f in &self.stop_flags {
             f.store(true, Ordering::SeqCst); // ② UDS listeners（accept 循环下一拍退出）
         }
@@ -1148,13 +1183,37 @@ impl ServeEngine {
             t.close();
         }
         let _ = self.cmd_tx.send(EngineCmd::Stop { grace }); // ①③④ 驱动线程内按序执行
-        // ⑤ sock 文件清理（身份比对——只删自己 bind 出来的那个）
+                                                             // ⑤ sock 文件清理（身份比对——只删自己 bind 出来的那个）
         let handle = self.driver.lock().expect("驱动句柄锁中毒").take();
         if let Some(h) = handle {
             let _ = h.join();
         }
+        for worker in std::mem::take(&mut *self.relay_workers.lock().expect("中继句柄锁中毒")) {
+            worker.stop_and_join();
+        }
         for (path, own) in &self.socks {
             remove_sock_own(path, *own);
+        }
+    }
+
+    fn on_observer_thread(&self) -> bool {
+        self.observer_threads.contains(&std::thread::current().id())
+    }
+
+    /// 外部调用：停止并等待观测/兜底退出，缩租前必须完成；观察回调重入时仅请求停止。
+    pub fn stop_public_observation(&self) {
+        self.pubep_stop.store(true, Ordering::SeqCst);
+        // 外部调用可能正持有句柄锁等待本线程，观察回调不得等该锁或join自己。
+        if self.on_observer_thread() {
+            return;
+        }
+        // 与发布提交线性化；日志回调始终在门锁外，允许回调触发 shutdown。
+        drop(self.publication.lock().expect("发布门锁中毒"));
+        let _ = self.pub_kick.try_send(());
+        let mut observers = self.observers.lock().expect("观测句柄锁中毒");
+        // 串行调用必须等到上一位完成join，不能把“句柄已取走”误作“线程已退出”。
+        for handle in observers.drain(..) {
+            let _ = handle.join();
         }
     }
 
@@ -1897,10 +1956,9 @@ struct TokenCtx {
     /// 公网观测腿的域名解析器（国内 DoH + 钉卡 TCP + 污染闸；见 `server::doh`）——
     /// STUN 候选的域名**不再**经系统解析器（2026-10-20：fake-IP 污染让 STUN 全程失败）。
     resolver: super::doh::DohResolver,
-    /// pubep 线程停止位（r1#10：shutdown 置位——DoH 最长可阻塞十几秒，期间旧引擎
-    /// 可能已被替换，写 `public_endpoint.txt`/`last_published` 前必须检查，防跨
-    /// restart 写旧 state）。
+    /// 观测/兜底共享取消位；发布门内检查，shutdown与发布事务串行。
     pubep_stopped: Arc<AtomicBool>,
+    publication: Arc<Mutex<()>>,
     /// DDNS 自检的滚动状态（按域名一域一份；探测线程写 / status 快照读——P0-4）。
     ddns_checks: super::ddnscheck::DdnsChecks,
     /// DDNS 自检直查解析器（F2：`serve.ddns_resolver` 装配期为 `SocketAddr` 形态）。
@@ -1926,25 +1984,31 @@ fn public_endpoint_loop(
             return; // r1#10：引擎已收工（restart 替换在途）——不再探测/写盘
         }
         let ok = refresh_public_endpoint(&ctx, &cmd_tx);
-        // DDNS 自检与探测同拍（换网 kick 轮也会跑到——published 取最近一轮观测；
-        // Go publicendpoint.go:83 同义）。published 为空时自检内部自跳。
+        if first {
+            first = false;
+            let _ = first_probe_tx.try_send(());
+        }
+        if ctx.pubep_stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        // DDNS 自检可能独立等解析器，不能拖延首轮完成信号。
         {
             let published = ctx
                 .inner
                 .lock()
                 .map(|i| i.last_published.clone())
                 .unwrap_or_default();
-            super::ddnscheck::run_ddns_self_check(
+            super::ddnscheck::run_ddns_self_check_cancellable(
                 &ctx.ddns_checks,
                 &ctx.cfg.ddns,
                 &published,
                 &ctx.ddns_resolvers,
                 &*ctx.logf,
+                &ctx.pubep_stopped,
             );
         }
-        if first {
-            first = false;
-            let _ = first_probe_tx.try_send(()); // cap=1 非阻塞（Go select-default 同义）
+        if ctx.pubep_stopped.load(Ordering::SeqCst) {
+            return;
         }
         let wait = if ok { PUBLIC_REFRESH_OK } else { PUBLIC_REFRESH_FAIL };
         match kick_rx.recv_timeout(wait) {
@@ -1972,8 +2036,9 @@ fn public_endpoint_loop(
 /// 映射，不假装）。
 ///
 /// `--upnp=false`：明文打失败行（设计 §10 S1-7 的判据形态）——「失败可见」而不是静默缺席。
-fn refresh_quic_public(ctx: &Arc<TokenCtx>) -> (u16, Option<Ipv4Addr>) {
-    let Some(q) = ctx.quic_ep else { return (0, None) };
+fn refresh_quic_public(ctx: &Arc<TokenCtx>, round_deadline: Instant) -> (u16, Option<Ipv4Addr>) {
+    let Some(q) = ctx.quic_ep else { return (0, None);
+    };
     let port = q.port();
     let set_pub = |v: Option<SocketAddr>| {
         if let Ok(mut inner) = ctx.inner.lock() {
@@ -1994,8 +2059,15 @@ fn refresh_quic_public(ctx: &Arc<TokenCtx>) -> (u16, Option<Ipv4Addr>) {
         return (0, None);
     }
     let logf2: Logf = Arc::clone(&ctx.logf);
-    let deadline = std::time::Instant::now() + crate::server::upnp::UPNP_TOTAL_BUDGET;
-    match crate::server::upnp::ensure_port_mapping(&cands, port, &*logf2, &*logf2, deadline) {
+    let deadline = round_deadline.min(Instant::now() + crate::server::upnp::UPNP_TOTAL_BUDGET);
+    match crate::server::upnp::ensure_port_mapping_cancellable(
+        &cands,
+        port,
+        &*logf2,
+        &*logf2,
+        deadline,
+        Arc::clone(&ctx.pubep_stopped),
+    ) {
         Err(e) => {
             set_pub(None);
             (ctx.logf)(&format!(
@@ -2006,7 +2078,11 @@ fn refresh_quic_public(ctx: &Arc<TokenCtx>) -> (u16, Option<Ipv4Addr>) {
         }
         Ok((ext, used)) => {
             // 外网 IP（IGD 的 ExternalIPAddress；非公网地址不公布）——同一轮已查到就复用
-            let wan = crate::server::upnp::discover_igd(used, deadline)
+            let wan = crate::server::upnp::discover_igd_cancellable(
+                used,
+                deadline,
+                Arc::clone(&ctx.pubep_stopped),
+            )
                 .ok()
                 .and_then(|g| g.external_ip().ok())
                 .filter(|ip| egress::is_public_addr(IpAddr::V4(*ip)));
@@ -2056,7 +2132,8 @@ fn write_listen_port_file(path: &std::path::Path, port: u16, logf: &Logf) {
 /// `return false`（本轮不公布、不打 token）；本实现取「告警 + 本轮照常公布」——
 /// 理由 = 出口启停/公告语义不应因 L3 缓存写不进去而变（token 是终端一辈子只打一轮的
 /// 产品面）；两处调用点（显式端点路径 / 推断路径）共用本函数。
-fn write_public_endpoint_file(path: &std::path::Path, lines: &[String], logf: &Logf) {
+fn write_public_endpoint_file(path: &std::path::Path, lines: &[String], logf: &mut dyn FnMut(&str),
+) {
     if let Err(e) = std::fs::write(path, format!("{}\n", lines.join("\n"))) {
         logf(&format!("⚠️ 公网端点写盘失败（{}）：{e}", path.display()));
     }
@@ -2092,35 +2169,26 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
     // 公共端口（= QUIC 端口；M5 后 WG 端口不存在）的公网映射（M1 S1c / S1-7：**E-q4 行
     // 成/败都打**，且 `--upnp=false` 形态也打失败行 = fail-visible）。放在本轮最前：
     // 既要给 token 填 `quic_pub`，也要把外口喂给下文的证据合流。
-    let (upnp_ext, upnp_wan) = refresh_quic_public(ctx);
-    let endpoint_file = ctx.cfg.state_dir.join("cache").join("public_endpoint.txt");
+    let deadline = Instant::now() + PUBLIC_ROUND_BUDGET;
+    let (upnp_ext, upnp_wan) = refresh_quic_public(ctx, deadline);
     let manual = ctx.cfg.public_endpoint.trim().to_owned();
     if !manual.is_empty() {
         // 配置覆盖：推断在「不能枚举/不能观测」的环境里无解（macOS SSDP 被本地网络
         // 隐私拒即一例）——照常写文件 + 打 token。
-        if ctx.pubep_stopped.load(Ordering::SeqCst) {
-            // r3#10：写盘**前**查（修前检查在 print 前——写盘/打行/probe/last_published
-            // 都在它之前，UPnP 预算 40s 的窗口内收工仍会写旧 state）
-            return false;
-        }
         let lines: Vec<String> = manual.split(',').map(|s| s.trim().to_owned()).collect();
-        write_public_endpoint_file(&endpoint_file, &lines, &ctx.logf);
-        (ctx.logf)(&format!(
-            "公网端点：已按 **--public-endpoint 配置**公布 {}（跳过 UPnP/STUN 推断；写进 public_endpoint.txt）",
-            format_lines(&lines)
-        ));
-        set_probe_endpoints_cmd(cmd_tx, &lines);
-        {
-            let mut inner = ctx.inner.lock().expect("token 状态锁中毒");
-            inner.last_published = lines.clone();
-        }
-        if ctx.pubep_stopped.load(Ordering::SeqCst) {
-            return false; // 写盘与打 token 之间被收工：不再发布/打印
-        }
-        print_client_token(ctx, &lines);
-        return true;
+        return publish_endpoints(ctx, cmd_tx, lines, true);
     }
 
+    refresh_inferred_public_endpoint(ctx, cmd_tx, deadline, upnp_ext, upnp_wan)
+}
+
+fn refresh_inferred_public_endpoint(
+    ctx: &Arc<TokenCtx>,
+    cmd_tx: &Sender<EngineCmd>,
+    deadline: Instant,
+    upnp_ext: u16,
+    upnp_wan: Option<Ipv4Addr>,
+) -> bool {
     // ---- 推断路径：UPnP 映射（= 上面公共端口那条）+ 同端口 STUN 观测（两条证据合流才公布）----
     // **M5 起只有一条映射**：公共端口就是 QUIC 端口（`refresh_quic_public` 已映射并打
     // E-q4 行）——这里直接取它的产物，不再重复映射一次（WG 端口不存在了）。
@@ -2131,9 +2199,17 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
     if !ctx.cfg.stun.is_empty() {
         // 候选**惰性**逐个试（r1#3：解析一个 → 查一个 → 成功即停——预解析全部候选在
         // DoH 慢/黑洞时会把整轮拖到几十秒；2026-10-20：国内多候选 + DoH 解析 + 污染闸）。
-        for (label, server) in StunCandidates::new(ctx, &ctx.cfg.stun, false) {
-            match stun_query_sync(cmd_tx, server, STUN_PER_CANDIDATE_BUDGET) {
+        for (label, server) in StunCandidates::new(ctx, &ctx.cfg.stun, false, deadline) {
+            match stun_query_sync(
+                cmd_tx,
+                server,
+                deadline.min(Instant::now() + STUN_PER_CANDIDATE_BUDGET),
+                &ctx.pubep_stopped,
+            ) {
                 None => (ctx.logf)(&format!("STUN：{label}（{server}）无应答——换下一个候选")),
+                Some(ap) if !stun_family_matches(ap.ip(), false) => {
+                    (ctx.logf)(&format!("STUN：{label} 观测到 {ap} 地址族不符——换下一个候选"));
+                }
                 Some(ap) if super::doh::poisoned_ip(&ap.ip()) => {
                     // 观测结果落污染段 = 本机代理/TUN 的投影（发包虽钉卡，中间层仍可能
                     // 改写）——不可作公网证据，换候选
@@ -2196,17 +2272,25 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
     // v4 主体公布 + v6 路径校验（Go publicendpoint.go:205-223）：v6 无 NAT，
     // 「公网地址」= 本机在该网卡上的全局地址 + 监听端口——用**同一个监听 socket**
     // 做一次 v6 STUN 验证路径真的可用，失败就不公布 v6（宁可不给，也不给一个发
-    // 不出去的候选）；v6 条目端口 = v4 公布端点的端口。
+    // 不出去的候选）；v6 条目端口 = 实际监听口（v4 UPnP 外口不适用于 IPv6）。
     let mut lines = vec![pub_ap.to_string()];
     if ctx.cfg.stun6.is_empty() {
         (ctx.logf)("公网端点：未配置 --stun6（需要有 AAAA 的 STUN 服务器），跳过 IPv6 公布");
     } else {
         let mut resolved_any6 = false;
         let mut v6: Option<SocketAddr> = None;
-        for (label, server) in StunCandidates::new(ctx, &ctx.cfg.stun6, true) {
+        for (label, server) in StunCandidates::new(ctx, &ctx.cfg.stun6, true, deadline) {
             resolved_any6 = true;
-            match stun_query_sync(cmd_tx, server, STUN_PER_CANDIDATE_BUDGET) {
+            match stun_query_sync(
+                cmd_tx,
+                server,
+                deadline.min(Instant::now() + STUN_PER_CANDIDATE_BUDGET),
+                &ctx.pubep_stopped,
+            ) {
                 None => (ctx.logf)(&format!("STUN6：{label}（{server}）无应答——换下一个候选")),
+                Some(ap) if !stun_family_matches(ap.ip(), true) => {
+                    (ctx.logf)(&format!("STUN6：{label} 观测到 {ap} 地址族不符——换下一个候选"));
+                }
                 Some(ap) if super::doh::poisoned_ip(&ap.ip()) => {
                     (ctx.logf)(&format!("STUN6：{label} 观测到 {ap} 落污染段——丢弃"));
                 }
@@ -2219,24 +2303,11 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
         match v6 {
             Some(ap6) => {
                 let ip = ap6.ip();
-                // Go `ap6.Addr().Is6() && !Is4In6 && !IsLinkLocalUnicast`：非 v4-mapped
-                // 且非链路本地的 v6 才算 v6 公布证据（ULA 不在此滤——与 Go 主路径
-                // 同口径；probe 应答侧的 IsPublicAddr 过滤是另一层）
-                let global_v6 = match ip {
-                    IpAddr::V6(v6) => {
-                        v6.to_ipv4_mapped().is_none() && (v6.segments()[0] & 0xffc0) != 0xfe80
-                    }
-                    IpAddr::V4(_) => false,
-                };
-                if global_v6 {
-                    // Go 逐字同串：`公布 [%v]:%d`（v6 方括号形态）
-                    lines.push(format!("[{ip}]:{}", pub_ap.port()));
-                    (ctx.logf)(&format!(
-                        "公网端点：IPv6 路径可用（STUN 看到 {ap6}），公布 [{ip}]:{}",
-                        pub_ap.port()
-                    ));
-                }
-                // 成功但非全局 v6（v4-mapped/链路本地）：静默不加条目（Go 同义）
+                lines.push(format!("[{ip}]:{}", ctx.local_port));
+                (ctx.logf)(&format!(
+                    "公网端点：IPv6 路径可用（STUN 看到 {ap6}），公布 [{ip}]:{}",
+                    ctx.local_port
+                ));
             }
             None => {
                 // Go 的 %v 带具体原因——这里按断点分两类（解析失败 / 无应答）
@@ -2249,24 +2320,92 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
             }
         }
     }
-    if ctx.pubep_stopped.load(Ordering::SeqCst) {
-        return false; // 探测期间引擎已被收工/替换——结论作废，不写盘不发布（r1#10）
-    }
-    write_public_endpoint_file(&endpoint_file, &lines, &ctx.logf);
-    (ctx.logf)(&format!(
-        "公网端点：已公布 {}（写进 public_endpoint.txt；下次签发 token 会带上它）",
-        format_lines(&lines)
-    ));
-    set_probe_endpoints_cmd(cmd_tx, &lines);
+    publish_endpoints(ctx, cmd_tx, lines, false)
+}
+
+/// cache、探测列表、内存快照、token 台账作为同一世代的发布事务提交。
+fn publish_endpoints(
+    ctx: &Arc<TokenCtx>,
+    cmd_tx: &Sender<EngineCmd>,
+    lines: Vec<String>,
+    manual: bool,
+) -> bool {
+    let mut logs = DeferredLogs::default();
     {
-        let mut inner = ctx.inner.lock().expect("token 状态锁中毒");
-        inner.last_published = lines.clone();
+        let _publication = ctx.publication.lock().expect("发布门锁中毒");
+        if ctx.pubep_stopped.load(Ordering::SeqCst) {
+            return false;
+        }
+        let endpoint_file = ctx.cfg.state_dir.join("cache").join("public_endpoint.txt");
+        write_public_endpoint_file(&endpoint_file, &lines, &mut |line| {
+            logs.push(&ctx.logf, line)
+        });
+        let msg = if manual {
+            format!("公网端点：已按 **--public-endpoint 配置**公布 {}（跳过 UPnP/STUN 推断；写进 public_endpoint.txt）", format_lines(&lines))
+        } else {
+            format!(
+                "公网端点：已公布 {}（写进 public_endpoint.txt；下次签发 token 会带上它）",
+                format_lines(&lines)
+            )
+        };
+        logs.push(&ctx.logf, msg);
+        set_probe_endpoints_cmd(cmd_tx, &lines);
+        ctx.inner.lock().expect("token 状态锁中毒").last_published = lines.clone();
+        print_client_token_locked(ctx, &lines, &mut logs);
     }
-    if ctx.pubep_stopped.load(Ordering::SeqCst) {
-        return false; // r2#10：公布与打 token 之间的窗口
-    }
-    print_client_token(ctx, &lines);
+    logs.emit(&ctx.pubep_stopped);
     true
+}
+
+#[derive(Default)]
+struct DeferredLogs(Vec<(Logf, String)>);
+impl DeferredLogs {
+    fn push(&mut self, log: &Logf, line: impl Into<String>) {
+        self.0.push((Arc::clone(log), line.into()));
+    }
+    fn emit(self, stop: &AtomicBool) {
+        for (log, line) in self.0 {
+            if stop.load(Ordering::SeqCst) {
+                break;
+            }
+            log(&line);
+        }
+    }
+}
+
+/// 首轮信号或15s兜底任一到达即起跑；失联通道、探测黑洞、驱动退出均有界。
+fn wait_first_probe(
+    rx: &mpsc::Receiver<()>,
+    wait: Duration,
+    stop: &AtomicBool,
+    driver_alive: &AtomicBool,
+) -> bool {
+    let deadline = Instant::now() + wait;
+    while !stop.load(Ordering::SeqCst) && driver_alive.load(Ordering::SeqCst) {
+        let remain = deadline.saturating_duration_since(Instant::now());
+        if remain.is_zero() {
+            return true;
+        }
+        let slice = remain.min(Duration::from_millis(50));
+        match rx.recv_timeout(slice) {
+            Ok(()) => return true,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
+            Err(mpsc::RecvTimeoutError::Disconnected) => std::thread::sleep(slice),
+        }
+    }
+    false
+}
+
+fn wait_observer(stop: &AtomicBool, duration: Duration) -> bool {
+    let deadline = Instant::now() + duration;
+    while !stop.load(Ordering::SeqCst) {
+        let remain = deadline.saturating_duration_since(Instant::now());
+        if remain.is_zero() {
+            return true;
+        }
+        std::thread::sleep(remain.min(Duration::from_millis(50)));
+    }
+    false
 }
 
 fn format_lines(lines: &[String]) -> String {
@@ -2293,7 +2432,9 @@ fn public_v4(ap: SocketAddr) -> bool {
     }
 }
 
-/// 单候选 STUN 查询预算（候选逐个试；旧单候选 8s ⇒ 三候选最坏 12s，仍远小于节拍）。
+/// 单轮网络探测总预算（UPnP、DoH、两族STUN共享）。
+const PUBLIC_ROUND_BUDGET: Duration = Duration::from_secs(60);
+/// 单候选STUN最多4s，同时受整轮剩余时间约束。
 const STUN_PER_CANDIDATE_BUDGET: Duration = Duration::from_secs(4);
 
 /// STUN 候选解析（2026-10-20）：`spec` 逗号分隔 `host:port`；IP 字面量直收、域名经
@@ -2305,11 +2446,17 @@ struct StunCandidates<'a> {
     ctx: &'a TokenCtx,
     specs: std::str::Split<'a, char>,
     want_v6: bool,
+    deadline: Instant,
 }
 
 impl<'a> StunCandidates<'a> {
-    fn new(ctx: &'a TokenCtx, spec: &'a str, want_v6: bool) -> Self {
-        Self { ctx, specs: spec.split(','), want_v6 }
+    fn new(ctx: &'a TokenCtx, spec: &'a str, want_v6: bool, deadline: Instant) -> Self {
+        Self {
+            ctx,
+            specs: spec.split(','),
+            want_v6,
+            deadline,
+        }
     }
 }
 
@@ -2320,6 +2467,9 @@ impl Iterator for StunCandidates<'_> {
         let ctx = self.ctx;
         let want_v6 = self.want_v6;
         for cand in self.specs.by_ref().map(str::trim).filter(|c| !c.is_empty()) {
+            if ctx.pubep_stopped.load(Ordering::SeqCst) || Instant::now() >= self.deadline {
+                return None;
+            }
             let Some((host, port)) =
                 cand.rsplit_once(':').and_then(|(h, p)| p.parse::<u16>().ok().map(|p| (h, p)))
             else {
@@ -2328,15 +2478,17 @@ impl Iterator for StunCandidates<'_> {
             };
             let host = host.trim_matches(|c| c == '[' || c == ']');
             if let Ok(ip) = host.parse::<IpAddr>() {
-                if ip.is_ipv6() == want_v6 && !super::doh::poisoned_ip(&ip) {
+                if stun_family_matches(ip, want_v6) && !super::doh::poisoned_ip(&ip) {
                     return Some((cand.to_owned(), SocketAddr::new(ip, port)));
                 }
                 continue;
             }
             let ip = if want_v6 {
-                ctx.resolver.resolve6(host).map(IpAddr::V6)
+                ctx.resolver.resolve6_before(host, self.deadline, &ctx.pubep_stopped)
+                    .map(IpAddr::V6)
             } else {
-                ctx.resolver.resolve4(host).map(IpAddr::V4)
+                ctx.resolver
+                    .resolve4_before(host, self.deadline, &ctx.pubep_stopped).map(IpAddr::V4)
             };
             match ip {
                 Some(ip) => return Some((cand.to_owned(), SocketAddr::new(ip, port))),
@@ -2350,16 +2502,39 @@ impl Iterator for StunCandidates<'_> {
     }
 }
 
-fn stun_query_sync(cmd_tx: &Sender<EngineCmd>, server: SocketAddr, timeout: Duration) -> Option<SocketAddr> {
+fn stun_family_matches(ip: IpAddr, want_v6: bool) -> bool {
+    match ip {
+        IpAddr::V4(_) => !want_v6,
+        IpAddr::V6(ip) => want_v6 && ip.to_ipv4_mapped().is_none() && (ip.segments()[0] & 0xffc0) != 0xfe80,
+    }
+}
+
+fn stun_query_sync(
+    cmd_tx: &Sender<EngineCmd>,
+    server: SocketAddr,
+    deadline: Instant,
+    stop: &AtomicBool,
+) -> Option<SocketAddr> {
+    if stop.load(Ordering::SeqCst) || Instant::now() >= deadline {
+        return None;
+    }
     let (tx, rx) = mpsc::channel();
-    cmd_tx.send(EngineCmd::StunQuery { server, reply: tx }).ok()?;
-    match rx.recv_timeout(timeout) {
-        Ok(v) => v,
-        Err(_) => {
-            let _ = cmd_tx.send(EngineCmd::StunAbort);
-            None
+    cmd_tx
+        .send(EngineCmd::StunQuery { server, reply: tx })
+        .ok()?;
+    while !stop.load(Ordering::SeqCst) {
+        let remain = deadline.saturating_duration_since(Instant::now());
+        if remain.is_zero() {
+            break;
+        }
+        match rx.recv_timeout(remain.min(Duration::from_millis(50))) {
+            Ok(v) => return v,
+            Err(mpsc::RecvTimeoutError::Disconnected) => return None,
+            Err(mpsc::RecvTimeoutError::Timeout) => {}
         }
     }
+    let _ = cmd_tx.send(EngineCmd::StunAbort);
+    None
 }
 
 fn set_probe_endpoints_cmd(cmd_tx: &Sender<EngineCmd>, lines: &[String]) {
@@ -2375,9 +2550,33 @@ fn set_probe_endpoints_cmd(cmd_tx: &Sender<EngineCmd>, lines: &[String]) {
 /// 打客户端 token（E3）：终端只打第一轮（进程生命周期内不再重打——端点变化冒出
 /// 第二串 token 只会让人拿错）；台账追加纪律 = 每次铸出与末行不同即追加。
 fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
+    let mut logs = DeferredLogs::default();
+    {
+        let _publication = ctx.publication.lock().expect("发布门锁中毒");
+        if ctx.pubep_stopped.load(Ordering::SeqCst) {
+            return;
+        }
+        // 兜底拿到的快照可能已过时；在门内重读，以免回写上一轮公网端点。
+        let current = ctx
+            .inner
+            .lock()
+            .expect("token 状态锁中毒")
+            .last_published
+            .clone();
+        let published = if current.is_empty() {
+            published
+        } else {
+            &current
+        };
+        print_client_token_locked(ctx, published, &mut logs);
+    }
+    logs.emit(&ctx.pubep_stopped);
+}
+
+fn print_client_token_locked(ctx: &Arc<TokenCtx>, published: &[String], logs: &mut DeferredLogs) {
     // 低-7（B0-2a 登记→D-1 收口）：inner 锁只护 revoked_logged/last_token 的读写
-    // 小临界区——网卡枚举/token 编码/台账追加在锁外（Go tokMu 同款小临界区语义；
-    // 台账幂等由 append_token 的末行比对自带，并发轮至多同条目双追加——无害）。
+    // 小临界区——网卡枚举/token 编码/台账追加由调用者的发布门串行化，
+    // 防止兜底旧快照在新一轮公布之后重新成为台账末行。
     {
         let mut inner = ctx.inner.lock().expect("token 状态锁中毒");
         // 在用凭证已被吊销：只大声一次并停打
@@ -2385,7 +2584,7 @@ fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
             if !inner.revoked_logged {
                 inner.revoked_logged = true;
                 drop(inner);
-                (ctx.logf)(
+                logs.push(&ctx.logf,
                     "⚠️ 在用凭证已被吊销——**不再打印 token**（旧 token 已作废）；执行 `homeway serve restart`（重启）铸出新凭证，客户端需重新粘贴",
                 );
             }
@@ -2401,12 +2600,15 @@ fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
     let mut labels: Vec<String> = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let dlogf = &ctx.dlogf;
+    let mut endpoint_logs = DeferredLogs::default();
     let mut add = |e: Endpoint, kind: &str| {
         if e.addr.is_empty() || seen.contains(&e.addr) {
             // 中继地址与已有直连端点相同（--relay 指向出口自己地址的退化形态）：
             // 按先到的直连形态保留——那个地址物理上就是出口的 WG socket，标 relay 反而必坏
             if e.kind == EndpointKind::Relay && seen.contains(&e.addr) {
-                (dlogf)(&format!("中继端点 {} 与已有直连端点相同，按直连处理（中继腿不生效）", e.addr));
+                endpoint_logs.push(
+                    dlogf,
+                    format!("中继端点 {} 与已有直连端点相同，按直连处理（中继腿不生效）", e.addr));
             }
             return;
         }
@@ -2450,12 +2652,15 @@ fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
             }
         } else {
             // listenPort=0 的调用形态（探测应答的即时快照）：域名条目这轮缺席，下一轮补上。
-            (dlogf)("域名条目：本轮拿不到端口（socket 未开？），token/列表暂不带 ddns 条目");
+            logs.push(
+                dlogf,
+                "域名条目：本轮拿不到端口（socket 未开？），token/列表暂不带 ddns 条目");
         }
     }
     if let Some(r) = &ctx.relay_ep {
         add(r.clone(), "中继");
     }
+    logs.0.extend(endpoint_logs.0);
     if eps.is_empty() {
         return;
     }
@@ -2482,7 +2687,7 @@ fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
     }) {
         Ok(s) => s,
         Err(e) => {
-            (ctx.logf)(&format!("客户端 token 生成失败（{e}）"));
+            logs.push(&ctx.logf, format!("客户端 token 生成失败（{e}）"));
             return;
         }
     };
@@ -2495,12 +2700,14 @@ fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
     {
         match e {
             crate::server::state::StateError::SecretRevoked => {
-                (ctx.logf)(&format!(
+                logs.push(&ctx.logf, format!(
                     "⚠️ 在用凭证已被吊销（{e}）——本轮 token 未入台账；执行 `homeway serve restart`（重启）铸出新凭证"
                 ));
             }
             other => {
-                (ctx.logf)(&format!("⚠️ token 台账追加失败（{other}）——台账末行可能与在用 token 短暂不一致"));
+                logs.push(
+                    &ctx.logf,
+                    format!("⚠️ token 台账追加失败（{other}）——台账末行可能与在用 token 短暂不一致"));
             }
         }
     }
@@ -2520,16 +2727,19 @@ fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
     if first {
         // 首轮（进程内仅此一次）= Go ulogf 形态：带一行日志落点提示，终端 + 摘要文件。
         if let Some((ev_p, dbg_p)) = &ctx.log_paths {
-            (ctx.logf)(&format!("日志：{ev_p}（摘要）｜ {dbg_p}（细节）"));
+            logs.push(&ctx.logf, format!("日志：{ev_p}（摘要）｜ {dbg_p}（细节）"));
         }
-        (ctx.logf)(&format!("客户端 token（粘进 App 的「添加主机」即可；{eps_count} 个端点）：{tok_str}"));
-        (ctx.logf)(&format!("端点：{}", labels.join("、")));
+        logs.push(
+            &ctx.logf,
+            format!("客户端 token（粘进 App 的「添加主机」即可；{eps_count} 个端点）：{tok_str}"),
+        );
+        logs.push(&ctx.logf, format!("端点：{}", labels.join("、")));
     } else {
         // 端点变化轮 = Go tokenToFile 形态：只进摘要文件（--verbose 才回显终端）——
         // 终端冒出第二串 token 只会让人拿错（2026-09-21 用户口径；取最新 =
         // grep 客户端 token events.log | tail -1）。
-        (ctx.tokf)(&format!("客户端 token（端点已变化；粘进 App 的「添加主机」即可；{eps_count} 个端点）：{tok_str}"));
-        (ctx.tokf)(&format!("端点：{}", labels.join("、")));
+        logs.push(&ctx.tokf, format!("客户端 token（端点已变化；粘进 App 的「添加主机」即可；{eps_count} 个端点）：{tok_str}"));
+        logs.push(&ctx.tokf, format!("端点：{}", labels.join("、")));
     }
 }
 
@@ -2674,7 +2884,9 @@ mod tests {
         // 让写入必失败：目标路径占据成**目录**（EISDIR）
         let path = dir.join("public_endpoint.txt");
         std::fs::create_dir_all(&path).unwrap();
-        write_public_endpoint_file(&path, &["203.0.113.7:42650".to_owned()], &logf);
+        write_public_endpoint_file(&path, &["203.0.113.7:42650".to_owned()], &mut |line| {
+            logf(line)
+        });
         let lines: Vec<String> = rx.try_iter().collect();
         assert_eq!(lines.len(), 1, "写失败必须告警（且只一行）：{lines:?}");
         assert!(
@@ -2684,11 +2896,15 @@ mod tests {
         );
         // 子用例二：目标路径是普通目录下的文件（父目录不存在 ⇒ ENOENT）
         let path2 = dir.join("no-such-dir").join("public_endpoint.txt");
-        write_public_endpoint_file(&path2, &["203.0.113.7:42650".to_owned()], &logf);
+        write_public_endpoint_file(&path2, &["203.0.113.7:42650".to_owned()], &mut |line| {
+            logf(line)
+        });
         assert_eq!(rx.try_iter().count(), 1, "父目录缺失同样告警");
         // 成功路径：文件内容 = 每条一行 + 尾换行；零新增行
         let ok = dir.join("ok.txt");
-        write_public_endpoint_file(&ok, &["a:1".to_owned(), "b:2".to_owned()], &logf);
+        write_public_endpoint_file(&ok, &["a:1".to_owned(), "b:2".to_owned()], &mut |line| {
+            logf(line)
+        });
         assert_eq!(std::fs::read_to_string(&ok).unwrap(), "a:1\nb:2\n");
         assert_eq!(rx.try_iter().count(), 0, "成功路径不打行（既有行文不变）");
         let _ = std::fs::remove_dir_all(&dir);
@@ -2803,6 +3019,7 @@ mod tests {
             log_paths: None,
             pinned_flag: Arc::new(AtomicBool::new(false)),
             pubep_stopped: Arc::new(AtomicBool::new(false)),
+            publication: Arc::new(Mutex::new(())),
             resolver: crate::server::doh::DohResolver::new(
                 Vec::new(),
                 Arc::new(Mutex::new(None)),
@@ -2815,6 +3032,255 @@ mod tests {
         });
         let _ = rx;
         (ctx, dir)
+    }
+
+    #[test]
+    fn stopped_refresh_cannot_append_after_replacement_from_logger_callback() {
+        let (arrived_tx, arrived_rx) = mpsc::channel();
+        let (resume_tx, resume_rx) = mpsc::channel();
+        let resume_rx = Mutex::new(resume_rx);
+        let logf: Logf = Arc::new(move |line| {
+            if line.starts_with("⚠️ 公网端点写盘失败") {
+                arrived_tx.send(()).unwrap();
+                resume_rx.lock().unwrap().recv().unwrap();
+            }
+        });
+        let (_sink, rx) = log_sink();
+        let (mut old, dir) = token_ctx(false, None, None, logf, &rx);
+        Arc::get_mut(&mut old).unwrap().cfg.public_endpoint = "8.8.8.8:42650".into();
+        let endpoint_path = dir.join("cache/public_endpoint.txt");
+        std::fs::create_dir_all(&endpoint_path).unwrap(); // 强制进入历史可重入日志缝。
+        let (cmd_tx, _cmd_rx) = mpsc::channel();
+        let old_thread = {
+            let old = Arc::clone(&old);
+            let cmd_tx = cmd_tx.clone();
+            std::thread::spawn(move || refresh_public_endpoint(&old, &cmd_tx))
+        };
+        arrived_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        old.pubep_stopped.store(true, Ordering::SeqCst);
+        // 日志发生于发布门外：停止与替换可完成，避免logger重入锁死。
+        drop(old.publication.try_lock().expect("logger持有发布门"));
+        let (new_log, new_rx) = log_sink();
+        let (mut new, new_dir) = token_ctx(false, None, None, new_log, &new_rx);
+        {
+            let ctx = Arc::get_mut(&mut new).unwrap();
+            ctx.cfg.state_dir = dir.clone();
+            ctx.st = Arc::clone(&old.st);
+            ctx.cfg.public_endpoint = "9.9.9.9:42650".into();
+        }
+        std::fs::remove_dir(&endpoint_path).unwrap();
+        assert!(refresh_public_endpoint(&new, &cmd_tx));
+        resume_tx.send(()).unwrap();
+        assert!(old_thread.join().unwrap());
+        assert_eq!(
+            std::fs::read_to_string(&endpoint_path).unwrap(),
+            "9.9.9.9:42650\n"
+        );
+        let latest = old.st.last_token().unwrap().unwrap();
+        assert!(latest.endpoints.iter().any(|e| e.addr == "9.9.9.9:42650"));
+        assert!(!latest.endpoints.iter().any(|e| e.addr == "8.8.8.8:42650"));
+        // 停用后直接helper/fallback调用同样不能改台账。
+        print_client_token(&old, &["8.8.4.4:42650".into()]);
+        assert_eq!(
+            old.st.last_token().unwrap().unwrap().endpoints,
+            latest.endpoints
+        );
+        let _ = std::fs::remove_dir_all(dir);
+        let _ = std::fs::remove_dir_all(new_dir);
+    }
+
+    #[test]
+    fn inferred_refresh_skips_mapped_v6_and_wrong_family_reply_and_uses_listen_port() {
+        let (logf, rx) = log_sink();
+        let (mut ctx, dir) = token_ctx(false, None, None, logf, &rx);
+        {
+            let ctx = Arc::get_mut(&mut ctx).unwrap();
+            ctx.cfg.stun = "1.1.1.1:3478".into();
+            ctx.cfg.stun6 =
+                "[::ffff:8.8.8.8]:3478,[2001:4860::8888]:3478,[2606:4700::1111]:3478".into();
+            ctx.pinned_flag.store(true, Ordering::SeqCst);
+        }
+        std::fs::create_dir_all(dir.join("cache")).unwrap();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let mut queried = Vec::new();
+            while let Ok(cmd) = cmd_rx.recv_timeout(Duration::from_secs(2)) {
+                match cmd {
+                    EngineCmd::StunQuery { server, reply } => {
+                        queried.push(server);
+                        let answer = match queried.len() {
+                            1 => "8.8.8.8:42650", // v4已钉卡，UPnP外口可独立改写。
+                            2 => "8.8.4.4:42650", // v6响应错族，不得阻断后续候选。
+                            3 => "[2001:4860::7777]:42650",
+                            _ => panic!("多余STUN查询"),
+                        };
+                        reply.send(Some(answer.parse().unwrap())).unwrap();
+                    }
+                    EngineCmd::SetProbeEndpoints(_) => break,
+                    _ => {}
+                }
+            }
+            queried
+        });
+        assert!(refresh_inferred_public_endpoint(
+            &ctx,
+            &cmd_tx,
+            Instant::now() + Duration::from_secs(2),
+            49999,
+            None
+        ));
+        let queries = worker.join().unwrap();
+        assert!(rx.try_iter().any(|line| line.contains("地址族不符——换下一个候选")));
+        assert_eq!(queries.len(), 3);
+        assert_eq!(queries[1], "[2001:4860::8888]:3478".parse().unwrap());
+        assert_eq!(
+            ctx.inner.lock().unwrap().last_published,
+            vec!["8.8.8.8:49999", "[2001:4860::7777]:42650"]
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn stun_wait_respects_cancel_and_round_deadline() {
+        let (tx, rx) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let stop2 = Arc::clone(&stop);
+        let worker = std::thread::spawn(move || {
+            stun_query_sync(
+                &tx,
+                "1.1.1.1:3478".parse().unwrap(),
+                Instant::now() + Duration::from_secs(30),
+                &stop2,
+            )
+        });
+        let _pending = rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        stop.store(true, Ordering::SeqCst);
+        let start = Instant::now();
+        assert!(worker.join().unwrap().is_none());
+        assert!(start.elapsed() < Duration::from_secs(1));
+        assert!(matches!(
+            rx.recv_timeout(Duration::from_secs(1)).unwrap(),
+            EngineCmd::StunAbort
+        ));
+        let (tx, rx) = mpsc::channel();
+        assert!(stun_query_sync(
+            &tx,
+            "1.1.1.1:3478".parse().unwrap(),
+            Instant::now(),
+            &AtomicBool::new(false)
+        )
+        .is_none());
+        assert!(rx.try_recv().is_err(), "已过整轮期限不得发新探测");
+    }
+
+    #[test]
+    fn first_probe_blackhole_is_bounded_and_cancellable() {
+        let (_tx, rx) = mpsc::channel();
+        let stopped = AtomicBool::new(false);
+        let alive = AtomicBool::new(true);
+        let start = Instant::now();
+        assert!(wait_first_probe(
+            &rx,
+            Duration::from_millis(80),
+            &stopped,
+            &alive
+        ));
+        assert!(start.elapsed() < Duration::from_secs(1));
+        stopped.store(true, Ordering::SeqCst);
+        assert!(!wait_first_probe(
+            &rx,
+            Duration::from_secs(30),
+            &stopped,
+            &alive
+        ));
+        stopped.store(false, Ordering::SeqCst);
+        alive.store(false, Ordering::SeqCst);
+        assert!(!wait_first_probe(
+            &rx,
+            Duration::from_secs(30),
+            &stopped,
+            &alive
+        ));
+    }
+
+    #[test]
+    fn shutdown_with_relay_releases_public_udp_port() {
+        let dir = tmp_dir("relay-shutdown");
+        let relay = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let relay_addr = relay.local_addr().unwrap();
+        let owner: Arc<Mutex<Option<std::sync::Weak<ServeEngine>>>> = Arc::new(Mutex::new(None));
+        let owner2 = Arc::clone(&owner);
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let release_rx = Mutex::new(release_rx);
+        let callback_done = Arc::new(AtomicBool::new(false));
+        let callback_done2 = Arc::clone(&callback_done);
+        let armed = Arc::new(AtomicBool::new(false));
+        let armed2 = Arc::clone(&armed);
+        let log: Logf = Arc::new(move |line| {
+            if line.starts_with("公网端点：已按") && armed2.swap(false, Ordering::SeqCst) {
+                started_tx.send(()).unwrap();
+                release_rx.lock().unwrap().recv().unwrap();
+                let engine = owner2.lock().unwrap().as_ref().unwrap().upgrade().unwrap();
+                engine.stop_public_observation();
+                engine.shutdown(Duration::ZERO);
+                callback_done2.store(true, Ordering::SeqCst);
+            }
+        });
+        let cfg = ServeConfig {
+            state_dir: dir.clone(),
+            listen_port: 0,
+            quic_listen_port: Some(0),
+            bind_iface: BindMode::Addr("127.0.0.1".parse().unwrap()),
+            upnp: false,
+            public_endpoint: "8.8.8.8:42650".into(),
+            stun: String::new(),
+            stun6: String::new(),
+            files_port: 0,
+            term_port: 0,
+            speedtest_port: 0,
+            dns_port: 0,
+            relay: Some(relay_addr.to_string()),
+            dns_probe_target: Vec::new(),
+            stun_probe_target: Vec::new(),
+            ..ServeConfig::default()
+        };
+        let engine = ServeEngine::start(cfg, Arc::clone(&log), Arc::clone(&log), log, None).unwrap();
+        let addr = engine.quic_local_addr.expect("公共QUIC监听成功");
+        assert_eq!(engine.relay_workers.lock().unwrap().len(), 2);
+        *owner.lock().unwrap() = Some(Arc::downgrade(&engine));
+        armed.store(true, Ordering::SeqCst);
+        engine.kick_public_endpoint();
+        started_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let (done_tx, done_rx) = mpsc::channel();
+        let mut stoppers = Vec::new();
+        for index in 0..2 {
+            let engine = Arc::clone(&engine);
+            let done_tx = done_tx.clone();
+            let done = Arc::clone(&callback_done);
+            stoppers.push(std::thread::spawn(move || {
+                if index == 0 {
+                    engine.shutdown(Duration::ZERO);
+                } else {
+                    engine.stop_public_observation();
+                }
+                assert!(done.load(Ordering::SeqCst), "并发收工不得提前返回");
+                engine.shutdown(Duration::ZERO);
+                done_tx.send(()).unwrap();
+            }));
+        }
+        assert!(done_rx.recv_timeout(Duration::from_millis(80)).is_err());
+        release_tx.send(()).unwrap();
+        for stopper in stoppers {
+            stopper.join().unwrap();
+        }
+        let rebound = std::net::UdpSocket::bind(addr).expect("shutdown返回必须释放所有socket副本");
+        assert_eq!(rebound.local_addr().unwrap(), addr);
+        assert!(engine.observers.lock().unwrap().is_empty());
+        assert!(engine.relay_workers.lock().unwrap().is_empty());
+        drop(rebound);
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     fn log_sink() -> (Logf, std::sync::mpsc::Receiver<String>) {
@@ -2865,7 +3331,7 @@ mod tests {
         let (ctx, dir) = token_ctx(false, Some(qep), None, logf, &rx);
         // 先塞一个「上一轮的公网端点」——本函数必须把它清掉（映射未启用 = 不公布）
         ctx.inner.lock().unwrap().quic_pub = Some("203.0.113.7:42652".parse().unwrap());
-        refresh_quic_public(&ctx);
+        refresh_quic_public(&ctx, Instant::now() + PUBLIC_ROUND_BUDGET);
         let lines: Vec<String> = rx.try_iter().collect();
         assert_eq!(lines.len(), 1, "失败行必须打（且只此一行）：{lines:?}");
         assert!(
@@ -2877,7 +3343,7 @@ mod tests {
         // 无 QUIC 面（quic_ep=None）⇒ 不打行（没有端口可映射，不假装）
         let (logf2, rx2) = log_sink();
         let (ctx2, dir2) = token_ctx(false, None, None, logf2, &rx2);
-        refresh_quic_public(&ctx2);
+        refresh_quic_public(&ctx2, Instant::now() + PUBLIC_ROUND_BUDGET);
         assert_eq!(rx2.try_iter().count(), 0, "无 QUIC 面时不打 E-q4 行");
         let _ = std::fs::remove_dir_all(&dir);
         let _ = std::fs::remove_dir_all(&dir2);
@@ -3006,7 +3472,8 @@ mod tests {
         std::thread::spawn(move || {
             let mut buf = [0u8; 1500];
             loop {
-                let Ok((n, from)) = stub.recv_from(&mut buf) else { return };
+                let Ok((n, from)) = stub.recv_from(&mut buf) else { return;
+                };
                 let req = &buf[..n];
                 if n >= 20 && u16::from_be_bytes([req[0], req[1]]) == 0x0001 {
                     // STUN Binding Request → Success Response + XOR-MAPPED-ADDRESS(v4 127.0.0.1)

@@ -15,7 +15,7 @@
 use std::io::{Read as _, Write as _};
 use std::net::{SocketAddr, TcpStream, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::mpsc::Sender;
+use std::sync::mpsc::{Receiver, Sender, SyncSender};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -109,6 +109,39 @@ pub fn parse_relay_arg(v: &str) -> Result<RelayArg, String> {
 pub enum LegEvent {
     /// 中继控制帧（type=3 载荷 + 源）。
     Frame(Vec<u8>, SocketAddr),
+    /// 收工唤醒（停止位先置位；满队列已有帧也会唤醒消费者）。
+    Stop,
+}
+
+/// 引擎持有的中继后台线程；收工必须 join，保证 socket/命令发送端不跨实例存活。
+pub(crate) struct RelayWorker {
+    handle: Option<std::thread::JoinHandle<()>>,
+    stop: Arc<AtomicBool>,
+    wake: Option<SyncSender<LegEvent>>,
+}
+
+impl RelayWorker {
+    pub(crate) fn stop_and_join(mut self) {
+        self.join();
+    }
+
+    fn join(&mut self) {
+        self.stop.store(true, Ordering::SeqCst);
+        if let Some(wake) = &self.wake {
+            // 满队列无需再投：recv 随即返回，停止位阻止其处理旧帧。
+            let _ = wake.try_send(LegEvent::Stop);
+        }
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for RelayWorker {
+    fn drop(&mut self) {
+        // 构造后续步骤失败或调用方忘记显式收工，也不能 detach 持端口的线程。
+        self.join();
+    }
 }
 
 /// 起 UDP 注册腿线程（非阻塞；随 stop 收工）。
@@ -116,26 +149,28 @@ pub enum LegEvent {
 /// 返回 `Err` = 线程没起来（F7 + 评审 r1 低-1：调用方〔engine〕据此把中继端点从
 /// token 发布面摘除——否则出口不向中继注册而 token 照带中继端点，客户端拿到一条
 /// 静默失效的路径）。
-pub fn spawn_relay_leg(
+pub(crate) fn spawn_relay_leg(
     sock: UdpSocket,
     relay: SocketAddr,
     priv_key: StaticSecret,
     secret: Option<[u8; 32]>,
-    events: std::sync::mpsc::Receiver<LegEvent>,
+    events: (SyncSender<LegEvent>, Receiver<LegEvent>),
     stop: Arc<AtomicBool>,
     logf: Logf,
-) -> std::io::Result<()> {
+) -> std::io::Result<RelayWorker> {
+    let (wake, events) = events;
+    let thread_stop = Arc::clone(&stop);
     let spawned = std::thread::Builder::new()
         .name("homeway-relayleg".into())
         .stack_size(512 * 1024)
         .spawn({
             let logf = Arc::clone(&logf);
             move || {
-                run_relay_leg(sock, relay, priv_key, secret, events, &stop, &logf);
+                run_relay_leg(sock, relay, priv_key, secret, events, &thread_stop, &logf);
             }
         });
     match spawned {
-        Ok(_) => Ok(()),
+        Ok(handle) => Ok(RelayWorker { handle: Some(handle), stop, wake: Some(wake) }),
         Err(e) => {
             crate::syncutil::log_spawn_failed(
                 &logf,
@@ -153,7 +188,7 @@ fn run_relay_leg(
     relay: SocketAddr,
     priv_key: StaticSecret,
     secret: Option<[u8; 32]>,
-    events: std::sync::mpsc::Receiver<LegEvent>,
+    events: Receiver<LegEvent>,
     stop: &AtomicBool,
     logf: &Logf,
 ) {
@@ -164,6 +199,9 @@ fn run_relay_leg(
     let started = Instant::now();
     let mut warned = false;
 
+    if stop.load(Ordering::SeqCst) {
+        return;
+    }
     send_hello(&sock, relay, label, pub_key.as_bytes(), logf);
     let mode = if secret.is_some() { "token 模式（rl1 凭据）" } else { "开放模式（无 token）" };
     (logf)(&format!("中继：注册腿开跑（中继 {relay}，{mode}）"));
@@ -174,13 +212,20 @@ fn run_relay_leg(
         }
         // 5s 节拍（事件驱动的睡法：事件随时唤醒本线程）
         match events.recv_timeout(RETRY_EVERY) {
+            Ok(LegEvent::Stop) => return,
             Ok(LegEvent::Frame(payload, src)) => {
+                if stop.load(Ordering::SeqCst) {
+                    return;
+                }
                 handle_control(&sock, relay, &priv_key, &pub_key, secret, label, &payload, src, &mut verified, logf);
             }
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
             Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
                 return;
             }
+        }
+        if stop.load(Ordering::SeqCst) {
+            return;
         }
         if !verified {
             send_hello(&sock, relay, label, pub_key.as_bytes(), logf);
@@ -284,27 +329,28 @@ fn handle_control(
 // ---------- TCP 控制面客户端（relayctl.go） ----------
 
 /// 起控制面线程（非阻塞；随 stop 收工；SESSION/RELEASE 经 EngineCmd 交驱动线程）。
-pub fn spawn_relay_ctl(
+pub(crate) fn spawn_relay_ctl(
     relay: SocketAddr,
     priv_key: StaticSecret,
     secret: Option<[u8; 32]>,
     cmd_tx: Sender<EngineCmd>,
     stop: Arc<AtomicBool>,
     logf: Logf,
-) -> std::io::Result<()> {
+) -> std::io::Result<RelayWorker> {
     // F7 纪律 + 评审 r1 低-1：同 spawn_relay_leg——控制面起不来 ⇒ SESSION/RELEASE
     // 无法下发（中继数据面注定闲置），Err 上抛供调用方摘 token 中继端点。
+    let thread_stop = Arc::clone(&stop);
     let spawned = std::thread::Builder::new()
         .name("homeway-relayctl".into())
         .stack_size(512 * 1024)
         .spawn({
             let logf = Arc::clone(&logf);
             move || {
-                run_control_loop(relay, priv_key, secret, cmd_tx, &stop, &logf);
+                run_control_loop(relay, priv_key, secret, cmd_tx, &thread_stop, &logf);
             }
         });
     match spawned {
-        Ok(_) => Ok(()),
+        Ok(handle) => Ok(RelayWorker { handle: Some(handle), stop, wake: None }),
         Err(e) => {
             crate::syncutil::log_spawn_failed(
                 &logf,
@@ -462,6 +508,9 @@ fn run_control_conn(
             Auth::TokenVerified
         }
     };
+    if stop.load(Ordering::SeqCst) {
+        return (false, None);
+    }
     // 重连对账（B1）：旧腿全部作废——中继会立刻重放活跃会话，按重放重建
     let _ = cmd_tx.send(EngineCmd::LegsClear);
     (logf)(&format!("中继控制面已连（{relay}）—— 已清腿表，等待会话重放"));
@@ -489,6 +538,9 @@ fn run_control_conn(
             }
             Err(e) => return (true, Some(format!("控制面读: {e}"))),
             Ok(ReadOutcome::Msg(msg)) => {
+                if stop.load(Ordering::SeqCst) {
+                    return (true, None);
+                }
                 last_msg = Instant::now();
                 let sub = msg.first().copied().unwrap_or(0);
                 if sub == rw::sub::SESSION {
@@ -604,6 +656,96 @@ fn legup_key_for(secret: Option<[u8; 32]>, cookie: &[u8; 16]) -> [u8; 32] {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 驱动的钩子 sender 仍活着时也必须能打断 5s 等待，并释放公共端口的 dup。
+    #[test]
+    fn relay_leg_stop_joins_and_releases_udp_duplicate() {
+        let relay = UdpSocket::bind("127.0.0.1:0").unwrap();
+        relay.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let public = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = public.local_addr().unwrap();
+        let dup = public.try_clone().unwrap();
+        let (events_tx, events_rx) = std::sync::mpsc::sync_channel(64);
+        let hook_sender = events_tx.clone();
+        let worker = spawn_relay_leg(
+            dup,
+            relay.local_addr().unwrap(),
+            StaticSecret::from([11; 32]),
+            None,
+            (events_tx, events_rx),
+            Arc::new(AtomicBool::new(false)),
+            Arc::new(|_| {}),
+        ).unwrap();
+        let mut packet = [0; 256];
+        // Hello 是真实的线程启动凭据；中继保持静默，注册腿随后等事件。
+        relay.recv_from(&mut packet).unwrap();
+        drop(public);
+        assert!(UdpSocket::bind(addr).is_err(), "dup 活着时必须仍占用公共端口");
+        let started = Instant::now();
+        worker.stop_and_join();
+        assert!(started.elapsed() < Duration::from_secs(2), "不能等满 5s 注册重试拍");
+        let rebound = UdpSocket::bind(addr).expect("join 返回必须已经关闭 UDP dup");
+        assert!(hook_sender.try_send(LegEvent::Stop).is_err(), "join 后消费者已销毁");
+        drop(rebound);
+    }
+
+    /// 收工时事件队列满也不能阻塞唤醒，构造失败的 Drop 路径同样必须收回线程。
+    #[test]
+    fn relay_leg_stop_handles_full_event_queue() {
+        let relay = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let public = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let addr = public.local_addr().unwrap();
+        let (events_tx, events_rx) = std::sync::mpsc::sync_channel(1);
+        events_tx.try_send(LegEvent::Frame(vec![rw::sub::AGAIN], relay.local_addr().unwrap())).unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel();
+        let release_rx = std::sync::Mutex::new(release_rx);
+        let logf: Logf = Arc::new(move |_| {
+            ready_tx.send(()).unwrap();
+            release_rx.lock().unwrap().recv().unwrap();
+        });
+        let worker = spawn_relay_leg(
+            public, relay.local_addr().unwrap(), StaticSecret::from([12; 32]), None,
+            (events_tx, events_rx), Arc::clone(&stop), logf,
+        ).unwrap();
+        // 注册腿停在启动日志处，不能消费预填事件；Drop 必须先置 stop 再无阻塞唤醒。
+        ready_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let stopper = std::thread::spawn(move || drop(worker));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while !stop.load(Ordering::SeqCst) && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let stopped = stop.load(Ordering::SeqCst);
+        release_tx.send(()).unwrap();
+        stopper.join().unwrap();
+        assert!(stopped, "Drop 必须发出停止请求");
+        UdpSocket::bind(addr).expect("满队列也不能遗留 UDP dup");
+    }
+
+    /// 控制面静默读时 join 确实等待线程退出，而非只置 stop 后 detach。
+    #[test]
+    fn relay_ctl_stop_joins_silent_connection() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel();
+        let worker = spawn_relay_ctl(
+            listener.local_addr().unwrap(), StaticSecret::from([13; 32]), None,
+            cmd_tx, Arc::new(AtomicBool::new(false)), Arc::new(|_| {}),
+        ).unwrap();
+        let (mut conn, _) = listener.accept().unwrap();
+        conn.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut dec = rw::CtlDecoder::new();
+        let mut pending = Vec::new();
+        assert!(matches!(read_ctl_once(&mut dec, &mut conn, &mut pending).unwrap(), ReadOutcome::Msg(_)));
+        write_ctl(&mut conn, &rw::encode_challenge(&[14; 32], &[15; 16])).unwrap();
+        assert!(matches!(read_ctl_once(&mut dec, &mut conn, &mut pending).unwrap(), ReadOutcome::Msg(_)));
+        write_ctl(&mut conn, &rw::encode_ok_auth(&[0; 16])).unwrap();
+        assert!(matches!(cmd_rx.recv_timeout(Duration::from_secs(2)).unwrap(), EngineCmd::LegsClear));
+        worker.stop_and_join();
+        assert!(matches!(cmd_rx.try_recv(), Err(std::sync::mpsc::TryRecvError::Disconnected)));
+        let mut byte = [0];
+        assert_eq!(conn.read(&mut byte).unwrap(), 0, "join 后控制连接已关闭");
+    }
 
     #[test]
     fn parse_relay_arg_forms() {

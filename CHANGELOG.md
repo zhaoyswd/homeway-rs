@@ -1,6 +1,17 @@
 # Changelog
 
-## 未发布（v0.3.13 tag 后的评审整改，r1–r3）
+## 未发布（v0.3.13 tag 后的评审整改，r1–r5）
+
+- r5 全项整改（2026-10-21）：TLS 下层共享绝对期限/取消 IO，慢握手与记录不再延长
+  DoH 的 3s 预算；首轮 token 独立 15s 兜底，公网推断整轮 60s；发布事务与停机串行，
+  观测/兜底/中继 UDP+TCP 线程有明确收工等待，缩租前先停止观测。修复 STUN6 字面量
+  mapped 与错误族回包阻断后备、IPv6 误用 IPv4 UPnP 外口；Linux DoH 按名钉卡不因
+  index=0 跳过。HTTP 增加有界 chunked/EOF 定界，查询类型在 DoH 候选内过滤；显式
+  错误配置 fail-closed。系统解析后备通过唯一进程 worker、有界队列保护调用方期限；
+  UPnP/DDNS 在途读写支持取消，UPnP 主机名保留 Host 与异主机控制 URL 语义。详情与
+  验证见 `docs/reviews/2026-10-21-公网观测腿整改.md`。
+
+- r4 收尾补记：引用环说明、panic 回归实例 gate 注释和历史发布归因统一；不改运行行为。
 
 - r3 收敛批：**实例级 panic gate**（r3#8：全局静态 gate 在 16/32/64 线程下误伤并行
   ExitQuic 用例——`ExitQuicConfig::with_panic_gate` 实例位取代全局静态与串行锁；

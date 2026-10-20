@@ -980,6 +980,7 @@ pub fn cmd_serve(args: &[String]) {
         StopWait::Signaled => {}
         StopWait::PipeErr(e) => eprintln!("homeway: {e}——按收到停止处理（收工）"),
     }
+    engine.stop_public_observation();
     if upnp_used {
         homeway_core::server::engine::shrink_upnp_lease(&engine, &logf);
     }

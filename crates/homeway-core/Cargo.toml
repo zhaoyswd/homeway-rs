@@ -26,8 +26,8 @@ toml.workspace = true
 flate2.workspace = true
 fnv.workspace = true
 regex.workspace = true
-# M0 传输层换代：QUIC 岛（异步栈自持在岛内；本 crate **不声明**它，故同步面写不出
-# 异步代码——源码零引用，M1 才接线。见 docs/reviews/M0-design.md §3.4 层 0/层 1）
+# QUIC 的 quinn/tokio runtime 由岛自持，本 crate 不声明异步运行时。
+# r5：下方同步 DoH 的 rustls 例外由 check-quic-isolation 单文件门约束，不开放 async。
 homeway-quic = { path = "../homeway-quic" }
 # DoH 解析腿（server/doh.rs）：rustls TLS + Mozilla 根束（workspace 单源）
 rustls.workspace = true

@@ -1,0 +1,15 @@
+[package]
+name = "homeway-review-doh-deadline"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# 独立复现工程，不纳入生产 workspace。
+[workspace]
+
+[[bin]]
+name = "doh-deadline"
+path = "main.rs"
+
+[dependencies]
+rustls = { version = "=0.23.45", default-features = false, features = ["ring", "std"] }

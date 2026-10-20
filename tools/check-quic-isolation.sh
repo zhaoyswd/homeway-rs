@@ -3,8 +3,9 @@
 # （M0 设计 §3.4 层 3；M1 S6-2 扩第 ⑥–⑩ 条；M3 S6 扩第 ⑪ 条）。
 #
 # **十一条断言**（fail-closed；任一击红即退出非 0）：
-#   ① 异步栈名字只出现在 crates/homeway-quic/Cargo.toml —— homeway-core / homeway-cli /
-#      homeway-capi 的 manifest 零命中（防同步面拿到异步依赖 ⇒ 层 0 的 E0433 保证失效）；
+#   ① quinn/tokio 只出现在岛 manifest；同步 DoH 的 rustls 唯一例外是 core 的
+#      rustls.workspace=true，源码只许 server/doh.rs 使用且仍禁 async/await/tokio/quinn。
+#      cli/capi 仍不得声明三者；新增源码反向门防例外扩散（r5 同步 TLS 契约登记）。
 #   ② crates/homeway-quic/src/** 里 `tokio::|quinn|rustls|async fn|.await` **只在异步面**
 #      （**显式文件清单**，M1 S6-2 由目录前缀收窄而来：整棵子树豁免会把「exit/transport.rs
 #      这类本可零异步名的文件」一起免检，且新文件静默落在豁免面内）；
@@ -219,12 +220,42 @@ BAD_MANIFEST=""
 for m in "$CRATES/homeway-core/Cargo.toml" "$CRATES/homeway-cli/Cargo.toml" "$CRATES/homeway-capi/Cargo.toml"; do
   [[ -f "$m" ]] || fail "manifest 缺失：$m"
   h="$(hits_toml "$m" '(^|[^A-Za-z0-9_-])(quinn|rustls|tokio)([^A-Za-z0-9_-]|$)')"
+  if [[ "$m" == "$CRATES/homeway-core/Cargo.toml" ]]; then
+    # 仅豁免这一条精确声明，不放行 renamed 依赖/另一个版本/额外 features。
+    h="$(print -r -- "$h" | grep -vE '^[0-9]+:rustls\.workspace[[:space:]]*=[[:space:]]*true[[:space:]]*$' || true)"
+    n="$(strip_toml "$m" | grep -cE '^rustls\.workspace[[:space:]]*=[[:space:]]*true[[:space:]]*$' || true)"
+    (( n == 1 )) || fail "同步 DoH rustls 精确声明必须有且仅有一条"
+  fi
   [[ -n "$h" ]] && BAD_MANIFEST+="${m}:"$'\n'"${h}"$'\n'
 done
 [[ -z "$BAD_MANIFEST" ]] || fail $'同步面 manifest 出现异步栈依赖（层 0 保证失效）：\n'"$BAD_MANIFEST"
+# rustls 是同步 TLS 状态机；例外只给 DoH 一文件，并不允许同步面拿到 runtime。
+SYNC_BAD=""
+SYNC_ASYNC_PATTERN='tokio::|quinn::|(^|[^A-Za-z0-9_])async([^A-Za-z0-9_]|$)|\.await([^A-Za-z0-9_]|$)'
+for face in homeway-core homeway-cli homeway-capi; do
+  while IFS= read -r f; do
+    pattern="$SYNC_ASYNC_PATTERN|rustls"
+    [[ "$f" == "$CRATES/homeway-core/src/server/doh.rs" ]] && pattern="$SYNC_ASYNC_PATTERN"
+    h="$(hits_rs "$f" "$pattern")"
+    [[ -n "$h" ]] && SYNC_BAD+="${f}:"$'\n'"${h}"$'\n'
+  done < <(find "$CRATES/$face" -name '*.rs' -not -path '*/target/*' | sort)
+done
+[[ -z "$SYNC_BAD" ]] || fail $'同步源码越过 DoH 的 rustls 单文件例外或引用异步栈：\n'"$SYNC_BAD"
+(( $(hits_rs "$CRATES/homeway-core/src/server/doh.rs" 'rustls::|StreamOwned::new' | wc -l) >= 2 )) || fail "同步 DoH 例外缺少实际 TLS 消费者"
+SYNC_SAMPLE="$(mktemp -t hw-iso-sync.XXXXXX)" || fail "同步例外自校准 mktemp 失败"
+printf 'use rustls::ClientConnection;\n' > "$SYNC_SAMPLE"
+[[ -n "$(hits_rs "$SYNC_SAMPLE" "$SYNC_ASYNC_PATTERN|rustls")" ]] || fail "同步门漏掉异文件 rustls"
+[[ -z "$(hits_rs "$SYNC_SAMPLE" "$SYNC_ASYNC_PATTERN")" ]] || fail "DoH 同步 TLS 例外不成立"
+printf 'async fn bad() { tokio::task::yield_now().await; }\n' > "$SYNC_SAMPLE"
+[[ -n "$(hits_rs "$SYNC_SAMPLE" "$SYNC_ASYNC_PATTERN")" ]] || fail "DoH 例外误放 async/runtime"
+printf 'fn bad() { let _f = async{ 1 }; let _g = async move { 2 }; }\n' > "$SYNC_SAMPLE"
+[[ -n "$(hits_rs "$SYNC_SAMPLE" "$SYNC_ASYNC_PATTERN")" ]] || fail "DoH 例外误放 async 块"
+printf 'fn sync_wait() { limiter.await_quota(1); }\n' > "$SYNC_SAMPLE"
+[[ -z "$(hits_rs "$SYNC_SAMPLE" "$SYNC_ASYNC_PATTERN")" ]] || fail "同步方法名被误判 await"
+rm -f "$SYNC_SAMPLE"
 ISLAND_MANIFEST_HITS="$(hits_toml "$ISLAND/Cargo.toml" '(^|[^A-Za-z0-9_-])(quinn|rustls|tokio)([^A-Za-z0-9_-]|$)' | wc -l | tr -d ' ')"
 (( ISLAND_MANIFEST_HITS >= 3 )) || fail "岛的 manifest 未声明全三条异步依赖（仅 ${ISLAND_MANIFEST_HITS} 条命中）"
-echo "  ① 通过：异步栈依赖只在 crates/homeway-quic/Cargo.toml（其余三个 manifest 零命中）"
+echo "  ① 通过：quinn/tokio 只在岛 manifest；同步 rustls 仅 core 精确依赖与 server/doh.rs 消费，其余同步源码零异步栈"
 
 # ---------- ② 异步名字只在异步面（**显式文件清单**） ----------
 is_async_face() {

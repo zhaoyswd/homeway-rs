@@ -1,0 +1,94 @@
+--- a/crates/homeway-core/src/server/engine.rs
++++ b/crates/homeway-core/src/server/engine.rs
+@@ -63,0 +64,52 @@
++#[cfg(test)]
++mod review_relay_lifecycle {
++    use super::*;
++
++    #[test]
++    fn review_shutdown_does_not_wait_for_relay_socket_dup() {
++        let dir = std::env::temp_dir().join(format!("homeway-review-relay-{}", std::process::id()));
++        std::fs::create_dir_all(&dir).unwrap();
++        let relay = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
++        let (entered_tx, entered_rx) = mpsc::channel();
++        let gate = Arc::new(std::sync::Barrier::new(2));
++        let gate2 = Arc::clone(&gate);
++        let logf: Logf = Arc::new(move |s: &str| {
++            if s.starts_with("中继：注册腿开跑") {
++                entered_tx.send(()).unwrap();
++                gate2.wait();
++            }
++        });
++        let cfg = ServeConfig {
++            state_dir: dir.clone(),
++            listen_port: 0,
++            quic_listen_port: Some(0),
++            bind_iface: BindMode::Off,
++            upnp: false,
++            stun: String::new(),
++            stun6: String::new(),
++            dns_port: 0,
++            dns_probe_target: Vec::new(),
++            stun_probe_target: Vec::new(),
++            files_root: Some(dir.clone()),
++            relay: Some(relay.local_addr().unwrap().to_string()),
++            ..ServeConfig::default()
++        };
++        let engine = ServeEngine::start(cfg, Arc::clone(&logf), Arc::clone(&logf), logf, None).unwrap();
++        entered_rx.recv_timeout(Duration::from_secs(3)).unwrap();
++        let port = engine.local_port;
++        engine.shutdown(Duration::ZERO);
++        let before = std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port));
++        gate.wait();
++        assert_eq!(before.unwrap_err().kind(), std::io::ErrorKind::AddrInUse,
++            "shutdown returned while relay thread still owned its public socket dup");
++        let deadline = Instant::now() + Duration::from_secs(3);
++        loop {
++            if std::net::UdpSocket::bind((Ipv4Addr::UNSPECIFIED, port)).is_ok() { break; }
++            assert!(Instant::now() < deadline);
++            std::thread::sleep(Duration::from_millis(10));
++        }
++        println!("PoC confirmed: shutdown returned before relay socket dup closed; releasing relay worker freed port");
++        let _ = std::fs::remove_dir_all(dir);
++    }
++}
++
+@@ -3583,0 +3636,36 @@
++    }
++    #[test]
++    fn review_old_print_can_append_after_pubep_stopped() {
++        let (logf, rx) = log_sink();
++        let (mut ctx, dir) = token_ctx(false, None, None, logf, &rx);
++        let (entered_tx, entered_rx) = mpsc::channel();
++        let gate = Arc::new(std::sync::Barrier::new(2));
++        let gate2 = Arc::clone(&gate);
++        let old_ep = "203.0.113.7:42650";
++        {
++            let c = Arc::get_mut(&mut ctx).unwrap();
++            c.cfg.public_endpoint = old_ep.to_owned();
++            c.relay_ep = Some(Endpoint { addr: old_ep.to_owned(), kind: EndpointKind::Relay });
++            c.dlogf = Arc::new(move |_| {
++                entered_tx.send(()).unwrap();
++                gate2.wait();
++            });
++        }
++        let old = Arc::clone(&ctx);
++        let (cmd_tx, _cmd_rx) = mpsc::channel();
++        let h = std::thread::spawn(move || refresh_public_endpoint(&old, &cmd_tx));
++        entered_rx.recv_timeout(Duration::from_secs(3)).expect("print reached pre-append barrier");
++        // Same stop bit as shutdown; no observer join or publication lock exists.
++        ctx.pubep_stopped.store(true, Ordering::SeqCst);
++        let new_secret = ctx.secret; // ordinary restart retains the credential
++        ctx.st.append_token(&new_secret, &[Endpoint {
++            addr: "203.0.113.8:42651".to_owned(), kind: EndpointKind::Quic,
++        }], None).unwrap();
++        assert_eq!(ctx.st.last_token().unwrap().unwrap().endpoints[0].addr, "203.0.113.8:42651");
++        gate.wait();
++        assert!(h.join().unwrap(), "stopped refresh still reports success");
++        let after = ctx.st.last_token().unwrap().unwrap();
++        assert_eq!(after.secret.as_bytes(), &ctx.secret, "credential stays valid across ordinary restart");
++        assert_eq!(after.endpoints[0].addr, old_ep);
++        println!("PoC confirmed: stopped old generation became last_token after new generation appended");
++        let _ = std::fs::remove_dir_all(dir);
+@@ -3584,0 +3673 @@
++

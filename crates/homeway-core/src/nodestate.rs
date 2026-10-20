@@ -546,10 +546,10 @@ mod tests {
         // r3#14：直接引用常量（硬编码期望锁不住「常量/模板漂移」——r1 正是模板改了
         // 常量没改而镜像测试没抓到）
         assert_eq!(fc.serve.stun.as_deref(), Some(crate::server::engine::DEFAULT_STUN));
-        assert_eq!(fc.serve.stun6.as_deref(), Some("stun.hitv.com:3478,stun.cloudflare.com:3478"));
+        assert_eq!(fc.serve.stun6.as_deref(), Some(crate::server::engine::DEFAULT_STUN6));
         assert_eq!(
             fc.serve.doh.as_deref(),
-            Some("dns.alidns.com@223.5.5.5,dns.alidns.com@223.6.6.6")
+            Some(crate::server::engine::DEFAULT_DOH)
         );
         assert!(!fc.relay.enabled);
         assert_eq!(fc.relay.listen.as_deref(), Some(":38341"));

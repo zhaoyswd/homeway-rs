@@ -14,7 +14,8 @@
 //! （本地 mock IGD——HTTP 面）、所有权分类与端口选择（内存面）。
 
 use std::io::{Read, Write};
-use std::net::{Ipv4Addr, SocketAddrV4, TcpStream, ToSocketAddrs as _, UdpSocket};
+use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, TcpStream, UdpSocket};
+use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
 use std::time::Duration;
 
 use super::egress::{interfaces, is_virtual_iface};
@@ -43,6 +44,45 @@ const HTTP_MAX_DESC: usize = 1 << 20;
 const HTTP_MAX_SOAP: usize = 1 << 16;
 /// 响应头段上限（无 `\r\n\r\n` 时的独立界——家用路由器头段极小，防头段灌爆内存）。
 const HTTP_MAX_HEADER: usize = 64 << 10;
+const CANCEL_POLL: Duration = Duration::from_millis(50);
+static NEVER_STOP: AtomicBool = AtomicBool::new(false);
+
+/// 同一次发现、描述文件与 SOAP 共用期限/取消；主机名按已验证 SSDP 来源直连，
+/// 保留 HTTP Host，避免不可取消的系统 DNS 把停机等待拖成无界。
+#[derive(Clone)]
+struct UpnpContext {
+    deadline: std::time::Instant,
+    cancelled: Option<Arc<AtomicBool>>,
+    hostname_addr: Option<Ipv4Addr>,
+    hostname: Option<String>,
+}
+
+impl UpnpContext {
+    fn new(deadline: std::time::Instant) -> Self {
+        Self { deadline, cancelled: None, hostname_addr: None, hostname: None }
+    }
+
+    fn stop(&self) -> &AtomicBool { self.cancelled.as_deref().unwrap_or(&NEVER_STOP) }
+
+    fn check_cancelled(&self) -> Result<(), UpnpError> {
+        if self.stop().load(Ordering::SeqCst) { Err(UpnpError::Cancelled) } else { Ok(()) }
+    }
+
+    fn check(&self) -> Result<(), UpnpError> {
+        self.check_cancelled()?;
+        if std::time::Instant::now() >= self.deadline { Err(UpnpError::BudgetExhausted) } else { Ok(()) }
+    }
+
+    fn pause(&self, duration: Duration) -> Result<(), UpnpError> {
+        let until = (std::time::Instant::now() + duration).min(self.deadline);
+        loop {
+            self.check_cancelled()?;
+            let left = until.saturating_duration_since(std::time::Instant::now());
+            if left.is_zero() { return Ok(()); }
+            std::thread::sleep(left.min(CANCEL_POLL));
+        }
+    }
+}
 
 /// upnp 错误面（R3-M23 类型化）：Display 文案与既有日志行**同串**（消费面 `{e}`
 /// 透传；soap 错误串保留 body——list_mappings 的 713 表尾判定靠它）。
@@ -87,6 +127,10 @@ pub enum UpnpError {
     /// UPnP 调用总预算耗尽（F7/F10：绝对期限——滴流/黑洞对端不能永久挂住）。
     #[error("UPnP 调用预算耗尽（超时）")]
     BudgetExhausted,
+    #[error("UPnP 操作已取消")]
+    Cancelled,
+    #[error("UPnP 主机名 {0:?} 没有可用地址")]
+    UnresolvedHost(String),
 }
 
 /// M-SEARCH 报文（形状真源——ssdpLocation；`MX: 2` 不变——设备允许 2s 内随机延迟
@@ -100,7 +144,7 @@ pub fn msearch_message(st: &str) -> String {
 pub struct Igd {
     /// 本实例的操作截止（M11：soap/描述文件的 http_call 以剩余量收紧读/写超时；
     /// 缩租路径构造时传 8s，推断路径 40s——对齐 Go 两类 ctx）。
-    deadline: std::time::Instant,
+    context: UpnpContext,
     control_url: String,
     service_type: String,
 }
@@ -292,6 +336,15 @@ pub fn ssdp_location_with(
     deadline: std::time::Instant,
     logf: Option<&dyn Fn(&str)>,
 ) -> Result<String, UpnpError> {
+    ssdp_location_context(local_ip, &UpnpContext::new(deadline), logf).map(|(url, _)| url)
+}
+
+fn ssdp_location_context(
+    local_ip: Option<Ipv4Addr>,
+    context: &UpnpContext,
+    logf: Option<&dyn Fn(&str)>,
+) -> Result<(String, Ipv4Addr), UpnpError> {
+    context.check()?;
     let bind: std::net::SocketAddr = match local_ip {
         Some(ip) => SocketAddrV4::new(ip, 0).into(),
         None => "0.0.0.0:0".parse().expect("合法字面量"),
@@ -316,13 +369,14 @@ pub fn ssdp_location_with(
         msearch_message(SSDP_ST_IGD2),
         msearch_message(SSDP_ST_ROOT),
     ];
-    let deadline = deadline.min(std::time::Instant::now() + UPNP_TIMEOUT);
+    let deadline = context.deadline.min(std::time::Instant::now() + UPNP_TIMEOUT);
     let mut last_err = String::new();
     let mut buf = [0u8; 4096];
     let mut attempt = 0;
     // F4-2 待定：三条件满足但非 IGD 型的首个 LOCATION——腿期限到点才回退采信
-    let mut pending: Option<String> = None;
+    let mut pending: Option<(String, Ipv4Addr)> = None;
     while attempt < 3 && std::time::Instant::now() < deadline {
+        context.check_cancelled()?;
         attempt += 1;
         let mut sent = false;
         let mut send_err = String::new();
@@ -337,40 +391,47 @@ pub fn ssdp_location_with(
         if !sent {
             last_err = send_err;
             let remain = deadline.saturating_duration_since(std::time::Instant::now());
-            std::thread::sleep(remain.min(Duration::from_millis(500)));
+            context.pause(remain.min(Duration::from_millis(500)))?;
             continue;
         }
+        let receive_until = deadline.min(std::time::Instant::now() + Duration::from_millis(1200));
         loop {
-            let remain = deadline.saturating_duration_since(std::time::Instant::now());
+            context.check_cancelled()?;
+            let remain = receive_until.saturating_duration_since(std::time::Instant::now());
             if remain.is_zero() {
                 break;
             }
             // 每轮按剩余夹取（修前只设一次 1200ms ⇒ 到点后仍可再阻塞一整份）
-            let _ = conn.set_read_timeout(Some(remain.min(Duration::from_millis(1200))));
+            conn.set_read_timeout(Some(remain.min(CANCEL_POLL)))?;
             match conn.recv_from(&mut buf) {
                 Ok((n, from)) => {
                     let text = String::from_utf8_lossy(&buf[..n]).into_owned();
                     // F8 三条件（不满足继续读）+ F4-2 判定表
                     if ssdp_response_ok(&from, &text) {
+                        let IpAddr::V4(source) = from.ip() else { continue };
                         if let Some(loc) = header_value(&text, "LOCATION") {
                             if ssdp_is_igd_type(&text) {
-                                return Ok(loc); // IGD 型：快路径立即采信
+                                return Ok((loc, source)); // IGD 型：快路径立即采信
                             }
                             if pending.is_none() {
-                                pending = Some(loc); // 待定：继续读（不提前返回）
+                                pending = Some((loc, source)); // 待定：继续读（不提前返回）
                             }
                         }
                     }
                 }
                 Err(e) => {
+                    if matches!(e.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted) {
+                        continue;
+                    }
                     last_err = e.to_string();
                     break; // 等下一次重试
                 }
             }
         }
         let remain = deadline.saturating_duration_since(std::time::Instant::now());
-        std::thread::sleep(remain.min(Duration::from_millis(500)));
+        context.pause(remain.min(Duration::from_millis(500)))?;
     }
+    context.check_cancelled()?;
     // 腿期限到点（或三重试耗尽，已无更晚窗口）：待定者此时才回退采信
     if let Some(loc) = pending {
         return Ok(loc);
@@ -407,6 +468,7 @@ pub fn header_value(resp: &str, key: &str) -> Option<String> {
 /// ②`Content-Length` 一致校验（声明 > 上限立即拒，读完实收 ≠ 声明报错）；③读/写**绝对
 /// 期限**（成环读 + 每轮按剩余重设 ⇒ 滴流对端不能永久挂——缩租跑在停机主线程）；
 /// ④拨号期限（`to_socket_addrs` + 逐地址 `connect_timeout`）。
+#[cfg(test)]
 fn http_call(
     url: &str,
     method: &str,
@@ -416,16 +478,30 @@ fn http_call(
     deadline: Option<std::time::Instant>,
     max_resp: usize,
 ) -> Result<String, UpnpError> {
+    let context = UpnpContext::new(deadline.unwrap_or_else(|| std::time::Instant::now() + UPNP_TOTAL_BUDGET));
+    http_call_context(url, method, content_type, soap_action, body, &context, max_resp)
+}
+
+fn http_call_context(
+    url: &str,
+    method: &str,
+    content_type: Option<&str>,
+    soap_action: Option<&str>,
+    body: Option<&str>,
+    context: &UpnpContext,
+    max_resp: usize,
+) -> Result<String, UpnpError> {
     let (host, port, path) = parse_http_url(url)?;
     // M11：读/写超时 = 剩余预算（Go 无 per-SOAP 超时、只受 ctx deadline——SOAP/描述
     // 文件给足 40s；M-SEARCH 的 5s 在 ssdp_location 自己的 deadline 里）。
-    let deadline = deadline.unwrap_or_else(|| std::time::Instant::now() + UPNP_TOTAL_BUDGET);
+    let deadline = context.deadline;
     let remain = deadline.saturating_duration_since(std::time::Instant::now());
     if remain.is_zero() {
         return Err(UpnpError::BudgetExhausted);
     }
-    let mut stream = connect_within(&host, port, deadline)?;
-    stream.set_write_timeout(Some(remain))?;
+    context.check()?;
+    let tcp = connect_within(&host, port, context)?;
+    let mut stream = super::deadline_io::DeadlineStream::new(tcp, deadline, context.stop());
     let mut req = format!("{method} {path} HTTP/1.1\r\nHOST: {host}:{port}\r\n");
     req.push_str("Connection: close\r\nUser-Agent: homeway/upnp\r\nAccept-Encoding: identity\r\n");
     if let Some(ct) = content_type {
@@ -448,7 +524,6 @@ fn http_call(
         if remain.is_zero() {
             return Err(UpnpError::BudgetExhausted);
         }
-        stream.set_read_timeout(Some(remain))?;
         match stream.read(&mut buf) {
             Ok(0) => break,
             Ok(n) => {
@@ -510,32 +585,31 @@ fn http_call(
     })
 }
 
-/// 带期限拨号（F7/N8）：`to_socket_addrs` + 逐地址 `connect_timeout(剩余)`；剩余为零
-/// 即报预算耗尽（修前 `TcpStream::connect` 无超时 = OS 默认，黑洞网关可挂很久）。
-fn connect_within(host: &str, port: u16, deadline: std::time::Instant) -> Result<TcpStream, UpnpError> {
-    // 字面 IP 快路径（IGD 的 LOCATION 主机基本是字面 IP）：跳过 `to_socket_addrs`
-    // 的系统解析——**域名解析本身没有可取消面**（残余登记：挂死的 LAN 主机名解析
-    // 不受 deadline 约束；Go 的 ctx 下解析可取消）。
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+/// 同主机的发现 URL 使用 SSDP 来源直连并保留 Host；其它主机名复用唯一有界系统
+/// 解析 worker，不在本线程调用 getaddrinfo。解析与各地址拨号共用最多 3s 期限。
+fn connect_within(host: &str, port: u16, context: &UpnpContext) -> Result<TcpStream, UpnpError> {
+    context.check()?;
+    let deadline = context.deadline.min(std::time::Instant::now() + Duration::from_secs(3));
+    let same_host = context.hostname.as_deref().is_some_and(|name| name.eq_ignore_ascii_case(host));
+    let fixed = host.parse::<IpAddr>().ok().or_else(|| {
+        if same_host { context.hostname_addr.map(IpAddr::V4) } else { None }
+    });
+    let addresses = match fixed {
+        Some(ip) => vec![ip],
+        None => super::doh::resolve_system(host, deadline, context.stop())
+            .map_err(|error| UpnpError::Io(std::io::Error::other(error)))?,
+    };
+    let mut last = None;
+    for ip in addresses {
+        context.check()?;
         let remain = deadline.saturating_duration_since(std::time::Instant::now());
-        if remain.is_zero() {
-            return Err(UpnpError::BudgetExhausted);
-        }
-        return TcpStream::connect_timeout(&std::net::SocketAddr::new(ip, port), remain).map_err(UpnpError::Io);
-    }
-    let addrs = (host, port).to_socket_addrs().map_err(UpnpError::Io)?;
-    let mut last: Option<std::io::Error> = None;
-    for a in addrs {
-        let remain = deadline.saturating_duration_since(std::time::Instant::now());
-        if remain.is_zero() {
-            return Err(UpnpError::BudgetExhausted);
-        }
-        match TcpStream::connect_timeout(&a, remain) {
-            Ok(c) => return Ok(c),
-            Err(e) => last = Some(e),
+        if remain.is_zero() { return Err(UpnpError::BudgetExhausted); }
+        match TcpStream::connect_timeout(&std::net::SocketAddr::new(ip, port), remain) {
+            Ok(tcp) => { context.check()?; return Ok(tcp); }
+            Err(error) => last = Some(error),
         }
     }
-    Err(UpnpError::Io(last.unwrap_or_else(|| std::io::Error::new(std::io::ErrorKind::AddrNotAvailable, "无可用地址"))))
+    match last { Some(error) => Err(UpnpError::Io(error)), None => Err(UpnpError::UnresolvedHost(host.to_owned())) }
 }
 
 /// `http://host[:port]/path` 解析（pub = fuzz 可达面——LOCATION 头的自由文本面）。
@@ -565,7 +639,7 @@ pub fn find_wan_service(desc: &str, base_url: &str, deadline: std::time::Instant
         if let (Some(st), Some(cu)) = (xml_tag(block, "serviceType"), xml_tag(block, "controlURL")) {
             if st.contains("WANIPConnection") || st.contains("WANPPPConnection") {
                 let control_url = join_url(base_url, &cu);
-                return Some(Igd { deadline, control_url, service_type: st });
+                return Some(Igd { context: UpnpContext::new(deadline), control_url, service_type: st });
             }
         }
         off = end;
@@ -613,8 +687,24 @@ pub(crate) fn discover_igd_with(
     deadline: std::time::Instant,
     logf: Option<&dyn Fn(&str)>,
 ) -> Result<Igd, UpnpError> {
-    let loc = ssdp_location_with(Some(local_ip), deadline, logf)?;
-    igd_from_location_deadline(&loc, deadline)
+    discover_igd_context(local_ip, UpnpContext::new(deadline), logf)
+}
+
+pub(crate) fn discover_igd_cancellable(
+    local_ip: Ipv4Addr,
+    deadline: std::time::Instant,
+    cancelled: Arc<AtomicBool>,
+) -> Result<Igd, UpnpError> {
+    let mut context = UpnpContext::new(deadline);
+    context.cancelled = Some(cancelled);
+    discover_igd_context(local_ip, context, None)
+}
+
+fn discover_igd_context(local_ip: Ipv4Addr, mut context: UpnpContext, logf: Option<&dyn Fn(&str)>) -> Result<Igd, UpnpError> {
+    let (loc, source) = ssdp_location_context(Some(local_ip), &context, logf)?;
+    context.hostname_addr = Some(source);
+    context.hostname = Some(parse_http_url(&loc)?.0);
+    igd_from_location_context(&loc, context)
 }
 
 /// 已知 LOCATION 直取（mock 测试与 discover 共用）。
@@ -623,9 +713,15 @@ pub fn igd_from_location(loc: &str, budget: Duration) -> Result<Igd, UpnpError> 
 }
 
 fn igd_from_location_deadline(loc: &str, deadline: std::time::Instant) -> Result<Igd, UpnpError> {
-    let body = http_call(loc, "GET", None, None, None, Some(deadline), HTTP_MAX_DESC)
+    igd_from_location_context(loc, UpnpContext::new(deadline))
+}
+
+fn igd_from_location_context(loc: &str, context: UpnpContext) -> Result<Igd, UpnpError> {
+    let body = http_call_context(loc, "GET", None, None, None, &context, HTTP_MAX_DESC)
         .map_err(|e| UpnpError::DescFetch(e.to_string()))?;
-    find_wan_service(&body, loc, deadline).ok_or(UpnpError::NoWanService)
+    let mut gateway = find_wan_service(&body, loc, context.deadline).ok_or(UpnpError::NoWanService)?;
+    gateway.context = context;
+    Ok(gateway)
 }
 
 impl Igd {
@@ -647,13 +743,13 @@ impl Igd {
         }
         b.push_str(&format!("</u:{action}></s:Body></s:Envelope>"));
         let sa = format!("{}#{}", self.service_type, action);
-        http_call(
+        http_call_context(
             &self.control_url,
             "POST",
             Some(r#"text/xml; charset="utf-8""#),
             Some(&sa),
             Some(&b),
-            Some(self.deadline),
+            &self.context,
             HTTP_MAX_SOAP, // F7：Go `io.LimitReader` 同值（SOAP 64KiB）
         )
         .map_err(|e| {
@@ -1030,6 +1126,27 @@ pub fn ensure_port_mapping(
     let disc = |ip: Ipv4Addr, dl: std::time::Instant| discover_igd_with(ip, dl, Some(logf));
     let (g, local_ip) = pick_igd_before(candidates, deadline, disc)?;
     let ext = mapping_round(&g, internal_port, local_ip, logf, dlogf)?;
+    Ok((ext, local_ip))
+}
+
+/// 出口观测专用：发现、描述、SOAP 全程共享取消位；不改变公开非取消入口。
+pub(crate) fn ensure_port_mapping_cancellable(
+    candidates: &[Ipv4Addr],
+    internal_port: u16,
+    logf: &dyn Fn(&str),
+    dlogf: &dyn Fn(&str),
+    deadline: std::time::Instant,
+    cancelled: Arc<AtomicBool>,
+) -> Result<(u16, Ipv4Addr), UpnpError> {
+    let mut context = UpnpContext::new(deadline);
+    context.cancelled = Some(cancelled);
+    let disc = |ip, _| {
+        context.check()?;
+        discover_igd_context(ip, context.clone(), Some(logf))
+    };
+    let (gateway, local_ip) = pick_igd_before(candidates, deadline, disc)?;
+    context.check()?;
+    let ext = mapping_round(&gateway, internal_port, local_ip, logf, dlogf)?;
     Ok((ext, local_ip))
 }
 
@@ -1570,6 +1687,73 @@ mod tests {
         let dt = t0.elapsed();
         assert_eq!(body, "hello-keepalive");
         assert!(dt < Duration::from_millis(500), "不得等到期限（实 {dt:?}）");
+    }
+
+    #[test]
+    fn cancelled_discovery_returns_before_network_work() {
+        let stop = Arc::new(AtomicBool::new(true));
+        let started = std::time::Instant::now();
+        let result = discover_igd_cancellable(Ipv4Addr::LOCALHOST, started + UPNP_TOTAL_BUDGET, stop);
+        assert!(matches!(result, Err(UpnpError::Cancelled)));
+        assert!(started.elapsed() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn cancellation_interrupts_gateway_http_read() {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let stop = Arc::new(AtomicBool::new(false));
+        let signal = Arc::clone(&stop);
+        let server = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            let mut request = [0; 512];
+            assert!(connection.read(&mut request).unwrap() > 0);
+            signal.store(true, Ordering::SeqCst);
+            // 不回应、不关闭：客户端必须靠停止位退出，不能等到 EOF。
+            std::thread::sleep(Duration::from_millis(300));
+        });
+        let mut context = UpnpContext::new(std::time::Instant::now() + UPNP_TOTAL_BUDGET);
+        context.cancelled = Some(stop);
+        let started = std::time::Instant::now();
+        let result = http_call_context(&format!("http://127.0.0.1:{port}/"), "GET", None, None, None, &context, HTTP_MAX_DESC);
+        assert!(matches!(result, Err(UpnpError::Io(ref e)) if e.kind() == std::io::ErrorKind::ConnectionAborted));
+        assert!(started.elapsed() < Duration::from_millis(250));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn discovered_hostname_uses_source_address_and_keeps_host() {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            let mut request = [0; 512];
+            let n = connection.read(&mut request).unwrap();
+            assert!(String::from_utf8_lossy(&request[..n]).contains(&format!("HOST: gateway.invalid:{port}\r\n")));
+            connection.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").unwrap();
+        });
+        let mut context = UpnpContext::new(std::time::Instant::now() + Duration::from_secs(2));
+        context.hostname_addr = Some(Ipv4Addr::LOCALHOST);
+        context.hostname = Some("gateway.invalid".to_owned());
+        assert_eq!(http_call_context(&format!("http://gateway.invalid:{port}/"), "GET", None, None, None, &context, HTTP_MAX_DESC).unwrap(), "ok");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn unrelated_control_hostname_does_not_reuse_ssdp_source() {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            let mut request = [0; 512];
+            assert!(connection.read(&mut request).unwrap() > 0);
+            connection.write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok").unwrap();
+        });
+        let mut context = UpnpContext::new(std::time::Instant::now() + Duration::from_secs(2));
+        context.hostname = Some("router.invalid".to_owned());
+        context.hostname_addr = Some(Ipv4Addr::new(192, 0, 2, 1));
+        assert_eq!(http_call_context(&format!("http://localhost:{port}/"), "GET", None, None, None, &context, HTTP_MAX_DESC).unwrap(), "ok");
+        server.join().unwrap();
     }
 
     // ---------- F8 SSDP 来源过滤 / 非空 LOCATION ----------
