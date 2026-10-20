@@ -3290,7 +3290,7 @@ mod tests {
     #[test]
     fn pf_dial_requires_island() {
         // 持串行锁：②段的承载失败触发面会起真 worker（吃全局 gate——防跨测试注入）。
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (logf, _lines) = line_logf();
         let run = Arc::new(GenRun::synthetic_for_test(logf));
         let w = Arc::downgrade(&run);
@@ -3352,7 +3352,7 @@ mod tests {
     /// `-2` = 无隧道/陈世代/设备死/停止（快探之前的前置）；`-9` = NAPI 壳异常（capi 面）。
     #[test]
     fn recover_downpush_single_leg_rc_contract() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let demand = Arc::new(DemandSignals::new());
         let exec = TunnelExec::new(Arc::clone(&demand));
         // ① 无世代（executor 无 run）⇒ -2
@@ -3421,7 +3421,7 @@ mod tests {
     /// 同步快探成功也必须落「事件恢复用时」汇总行（App 回前台/换网走的快路径）。
     #[test]
     fn recover_sync_probe_logs_event_duration_summary() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, lines) = gen_with_lines("recover-sync-summary");
         let island = idle_island(&run);
         run.set_island(Arc::clone(&island));
@@ -3453,7 +3453,7 @@ mod tests {
     /// 边沿位留字由 owner 收尾承接（r8-a1-2）。
     #[test]
     fn recover_second_call_merges_into_inflight_owner() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, _lines) = gen_with_lines("inflight");
         // 手工占位（模拟在飞 owner——不真跑 worker）
         match run.reconn.try_claim_edge(ReconnSource::Wake) {
@@ -3496,7 +3496,7 @@ mod tests {
     /// 构造——翻回三件套的组合面在此注入式验证，link.at 经 idle 岛快照前进）。
     #[test]
     fn strong_recover_clears_patrol_sets_carrier_and_advances_link_at() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, lines) = gen_with_lines("strong");
         let island = idle_island(&run);
         run.set_island(Arc::clone(&island));
@@ -3841,6 +3841,9 @@ mod tests {
     /// 重连协议测试的**串行锁**：`SPAWN_FAIL_GATE`/`PANIC_ROUNDS_GATE` 是全局态，
     /// 且真 worker（entry/recover 起的线程）会跨测试吃到别测试的 gate——凡触 gate
     /// 或起真 worker 的用例都持本锁（并行测试默认 4 线程，不串行会互相注入）。
+    /// 获取一律**容忍中毒**（`unwrap_or_else(into_inner)`，2026-10-20 第三轮复核后）：
+    /// 一个用例断言失败 panic 会毒化本锁，`unwrap()` 会把同族后续用例全部连锁成
+    /// 失败（复核实测 1 → 22）——串行化语义不依赖锁的健康态，失败不该放大。
     static RECONN_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// 装测试钩子（受控交错缝）——RAII 守卫（Drop 拆钩：阻塞型钩子不拆除会把
@@ -3867,7 +3870,7 @@ mod tests {
     /// owner 释放后 Wake 入口抢占**保留**该位（自消费只清自己的位）。
     #[test]
     fn entry_cas_preserves_pending_from_previous_owner() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, _l) = gen_with_lines("a12");
         // owner A（Wake）占位
         match run.reconn.try_claim_edge(ReconnSource::Wake) {
@@ -3910,7 +3913,7 @@ mod tests {
     /// armed 直接退出（不把刚被消费的位重新置上）。
     #[test]
     fn armed_path_release_race_and_double_run_guard() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, _l) = gen_with_lines("a13");
         // --- ① armed 恰逢释放：B 的 fetch_or 返回值里 INFLIGHT 已不在 ---
         {
@@ -4027,7 +4030,7 @@ mod tests {
     /// 验证单调性而非回绕）。
     #[test]
     fn epoch_monotonic_across_many_claims() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, _l) = gen_with_lines("c1");
         let mut last_epoch = 0u32;
         for i in 0..66 {
@@ -4051,7 +4054,7 @@ mod tests {
     /// 交错**（第二发在第一发持位期间进入）⇒ `==1` 确定性成立。
     #[test]
     fn two_concurrent_recovers_share_one_sync_probe() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let demand = Arc::new(DemandSignals::new());
         let exec = TunnelExec::new(Arc::clone(&demand));
         let (run, _l) = gen_with_lines("c4");
@@ -4102,7 +4105,7 @@ mod tests {
     /// 对照段保留旧「入口前设备死」形态（round 入口拦截——零起跑动作）。
     #[test]
     fn worker_halts_on_device_dead_without_rerace_or_carrier() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // ---- ① 快探在飞中途置 device_dead（r9-C5 的意图形态）----
         {
             let (run, lines) = gen_with_lines("c5");
@@ -4164,7 +4167,7 @@ mod tests {
     /// 「新位保留」）。
     #[test]
     fn spawn_all_fail_clears_snapshot_bits_preserves_new_ones() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, _l) = gen_with_lines("c6");
         SPAWN_FAIL_GATE.store(true, Ordering::Relaxed);
         // ---- ① 清位窗口前的快照位：入口占位后（钩子挂点）注入 NetChange|Foreground
@@ -4341,13 +4344,26 @@ mod tests {
     /// snap ∥ triggering（含承接前 p2 新到位，r13-P4）。
     #[test]
     fn panic_handler_releases_once_and_restores_pending() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, lines) = gen_with_lines("c7");
         // 初次轮 panic（无 pending）→ 释放恰一次、无留字、无再 spawn（restore=0）
         PANIC_ROUNDS_GATE.store(1, Ordering::Relaxed);
         let out = GenRun::try_spawn_reconnect(&run, ReconnSource::ReadFace);
         assert_eq!(out, EntryOutcome::Spawned);
         wait_reconn_quiescent(&run);
+        // 等待式抽行（同第二段的根因：静止判定与 panic 行 send 之间有小窗）。
+        let mut seen1 = Vec::new();
+        let line_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            seen1.extend(drain_lines(&lines));
+            let got = seen1
+                .iter()
+                .any(|l| l.starts_with("一次性重连：panic（已兜住——pending 留字 0x0"));
+            if got || Instant::now() > line_deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert_eq!(run.reconn.panics.load(Ordering::Relaxed), 1, "panic 计数 1");
         assert_eq!(
             run.reconn.state.load(Ordering::Acquire) & RECONN_PENDING_MASK,
@@ -4355,7 +4371,7 @@ mod tests {
             "无 pending ⇒ 无留字"
         );
         assert!(
-            drain_lines(&lines)
+            seen1
                 .iter()
                 .any(|l| l.starts_with("一次性重连：panic（已兜住——pending 留字 0x0，释放恰一次")),
             "panic 行在场且无 pending（restore=0——首轮无快照位）"
@@ -4402,7 +4418,24 @@ mod tests {
         wait_reconn_quiescent(&run);
         // 首轮成功 + 承接轮 panic：panic 恢复把 p2 位 fetch_or 回字里；再 spawn 的
         // worker 承接消费 ⇒ 最终静止。
-        let seen2 = drain_lines(&lines);
+        //
+        // **等待式抽行**（2026-10-20 第三轮复核定位的偶发根因）：catch 处理器是
+        // 「fetch_or 留字 → 再 spawn 恢复轮 → 记 panic 行」的顺序——恢复轮全链静止
+        // 可先于记行 send 完成（慢机上 catch 线程在 spawn 后被抢占）⇒ 静止即 drain
+        // 会拿到空（复核首轮全量实测）。轮询等目标行出现再断言；行 send 位于
+        // panics++ 之后 ⇒ 行到达时计数已就位，无需单独等待。
+        let mut seen2 = Vec::new();
+        let line_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            seen2.extend(drain_lines(&lines));
+            let got = seen2
+                .iter()
+                .any(|l| l.starts_with("一次性重连：panic") && l.contains("pending 留字 0x12"));
+            if got || Instant::now() > line_deadline {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
         let panic_lines: Vec<&String> = seen2
             .iter()
             .filter(|l| l.starts_with("一次性重连：panic"))
@@ -4421,6 +4454,13 @@ mod tests {
         // + 承接轮〔恰承接一次——p2=0x12 全部消费〕（3）+ panic 恢复再 spawn 轮〔自
         // 消费 BGate 位〕（4）+ NetChange 留字被再 spawn 轮的收尾二次承接（5）——
         // 每个 pending 位恰被一轮消费（不吞、不重复）。
+        // 等待式断言（2026-10-20 第三轮复核的偶发形态修复）：轮 4/5 是 panic 恢复
+        // 异步再 spawn 的，上一轮 inflight 释放与下一轮占位之间有间隙——直接读
+        // `starts` 会在负载下读到中间值（实测 3）；轮询等它涨满再断言恰 5。
+        let starts_deadline = Instant::now() + Duration::from_secs(5);
+        while run.reconn.starts.load(Ordering::Relaxed) < 5 && Instant::now() < starts_deadline {
+            std::thread::sleep(Duration::from_millis(5));
+        }
         assert_eq!(
             run.reconn.starts.load(Ordering::Relaxed),
             5,
@@ -4433,7 +4473,7 @@ mod tests {
     /// （无裸留位）。
     #[test]
     fn recover_claimed_with_spawn_failure_releases_slot() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let demand = Arc::new(DemandSignals::new());
         let exec = TunnelExec::new(Arc::clone(&demand));
         let (run, _l) = gen_with_lines("p3");
@@ -4457,7 +4497,7 @@ mod tests {
     /// 其余位由承接消费不吞。
     #[test]
     fn finalize_merges_multisource_pending_by_priority() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, lines) = gen_with_lines("b2");
         let island = idle_island(&run);
         run.set_island(Arc::clone(&island));
@@ -4517,7 +4557,7 @@ mod tests {
     /// 同拍释放只一人成功。
     #[test]
     fn release_cas_retries_against_concurrent_fetch_or() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, _l) = gen_with_lines("c8");
         let epoch = match run.reconn.try_claim_edge(ReconnSource::ReadFace) {
             Claim::Claimed { epoch } => epoch,
@@ -4577,7 +4617,7 @@ mod tests {
     /// owner 只清自己位（demand 源不置 pending ⇒ 不吞边沿位）。
     #[test]
     fn concurrent_claim_one_winner_loser_edge_taken_over() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, _l) = gen_with_lines("tail1");
         let barrier = Arc::new(std::sync::Barrier::new(2));
         let run2 = Arc::clone(&run);
@@ -4623,7 +4663,7 @@ mod tests {
     /// **表尾**：边沿绕节流 / demand 节流 / yield 哨兵（清 0 后仍 30s、有窗 5s）。
     #[test]
     fn edge_bypasses_gap_demand_throttles_yield_sentinel() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, _l) = gen_with_lines("throttle");
         SPAWN_FAIL_GATE.store(true, Ordering::Relaxed); // 不起真线程——纯计数面
         // 起跑锚直接拨到「刚失败」（T+8s 失败语义：last_ms = now）
@@ -4660,7 +4700,7 @@ mod tests {
     /// 失败 ⇒ T+31s 才放行——锚记**起跑时刻**，执行时长不叠加进间隔）。
     #[test]
     fn initial_anchor_allows_first_demand_and_start_anchor_semantics() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, _l) = gen_with_lines("anchor");
         SPAWN_FAIL_GATE.store(true, Ordering::Relaxed);
         // 初值 = 装配时刻 − MIN_GAP ⇒ 首个 demand 立即起跑（非 Throttled）
@@ -4691,7 +4731,7 @@ mod tests {
     /// 旧名/注释声称「pending_taken_exactly_once」名不副实——改名对齐实际断言）。
     #[test]
     fn takeover_panic_restarts_without_latch_exact_two_rounds_no_pending() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, _l) = gen_with_lines("panic2");
         // 初次轮 panic（restore=0——无再 spawn）→ 静止后**仍可再起跑**（无闩锁）
         PANIC_ROUNDS_GATE.store(1, Ordering::Relaxed);
@@ -4726,7 +4766,7 @@ mod tests {
     /// 设备死下不产生任何重连）。
     #[test]
     fn device_dead_blocks_all_entry_starts() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, _l) = gen_with_lines("n1");
         run.tun_shared.mark_unhealthy("fd");
         assert_eq!(
@@ -4757,7 +4797,7 @@ mod tests {
     /// （「传输恢复（patrol 清除…」证据面）承接。
     #[test]
     fn criteria_lines_verbatim() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, lines) = gen_with_lines("lines");
         let island = idle_island(&run);
         run.set_island(Arc::clone(&island));
@@ -4846,7 +4886,7 @@ mod tests {
     /// carrier true）与「让路/失败行不落」。
     #[test]
     fn criteria_recovery_line_verbatim() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, lines) = gen_with_lines("recover-line");
         let island = idle_island(&run);
         run.set_island(Arc::clone(&island));
@@ -4908,7 +4948,7 @@ mod tests {
     /// 名册）在飞整个预算；racing 位置位后注入 fd 类设备死。
     #[test]
     fn rerace_connect_inflight_device_dead_yields_zero_recovery_lines_and_no_further_cmds() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, lines) = gen_with_lines("b3-connect");
         let island = idle_island(&run);
         run.set_island(Arc::clone(&island));
@@ -4989,7 +5029,7 @@ mod tests {
     /// ——零恢复行、carrier 不翻真（`round_after_probe` 挂点的受控交错）。
     #[test]
     fn probe_success_then_device_dead_skips_recovery_line_and_carrier() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, lines) = gen_with_lines("b3-after-probe");
         let island = idle_island(&run);
         run.set_island(Arc::clone(&island));
@@ -5043,7 +5083,7 @@ mod tests {
     /// （B3 覆盖复查前，本用例覆盖复查后的最后窗口）。
     #[test]
     fn round_device_dead_between_halt_recheck_and_strong_recover_skips_recovery_line() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, lines) = gen_with_lines("r5-l3-round-strong");
         let island = idle_island(&run);
         run.set_island(Arc::clone(&island));
@@ -5093,7 +5133,7 @@ mod tests {
     /// 胜出…传输恢复」假恢复行、按 `Gone` 收口（旧实现先打行、返回值未消费）。
     #[test]
     fn rerace_finish_skips_win_line_when_device_dead_before_strong_recover() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, lines) = gen_with_lines("r5-l3-rerace-finish");
         run.tun_shared.mark_unhealthy("fd"); // 复查后、强恢复前到场
         let outcome = homeway_quic::RaceOutcome {
@@ -5130,7 +5170,7 @@ mod tests {
     /// `round_after_probe` 同一纪律（B3 的另一条同步快探路径）。
     #[test]
     fn recover_after_probe_halt_releases_claimed_epoch_without_recovery() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // ① 设备死形态（快探在飞期间发生）
         {
             let (run, lines) = gen_with_lines("b3-recover-dd");
@@ -5263,7 +5303,7 @@ mod tests {
     /// PI 剥离后无条件自增）；观测节拍经 `obs_interval` 参数压缩（生产 = OBS_INTERVAL 60s）。
     #[test]
     fn stats_loop_busy_timeout_do_not_accumulate_fail_streak() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, lines) = gen_with_lines("b7-stats");
         let island = idle_island(&run);
         run.set_island(Arc::clone(&island));
@@ -5392,7 +5432,7 @@ mod tests {
     /// ②读线程路径零 logf（spawn 失败注入亦零 logf）。
     #[test]
     fn five_counters_anchor_points_and_read_path_zero_logf() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         // ① P/N 分离：直接模拟读线程的判定序列（carrier false + 计数 + 桩回调不调入口）
         let (run, lines) = gen_with_lines("c21");
         for _ in 0..5 {
@@ -5424,7 +5464,7 @@ mod tests {
     /// （恰一次）——kick 直连统一入口（事件通道已随删除批退役）。
     #[test]
     fn foreground_kick_triggers_entry_once() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let demand = Arc::new(DemandSignals::new());
         let exec = TunnelExec::new(Arc::clone(&demand));
         let (run, _l) = gen_with_lines("kick");
@@ -5445,7 +5485,7 @@ mod tests {
     /// 仍为 fd、无重复翻沿；一次失败只增一个 flip 序号。
     #[test]
     fn bgate_marks_and_triggers_unified_entry() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, lines) = gen_with_lines("bg");
         // B 门沿（quic_unhealthy_signal 的 patrol 分支等价直调——岛回调零阻塞面）
         super::super::tun_exec::quic_unhealthy_signal_for_test(&run, "patrol");
@@ -5489,7 +5529,7 @@ mod tests {
     /// 旧版第二次直调发生在 `wait_reconn_quiescent` 之后（非在飞），未覆盖本交错。
     #[test]
     fn bgate_during_inflight_owner_marks_first_and_takeover_runs() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, lines) = gen_with_lines("bginflight");
         // 手工占位 = 在飞 owner（等价 worker 已抢到槽位、run_round 在跑的窗口）
         let epoch = match run.reconn.try_claim_edge(ReconnSource::ReadFace) {
@@ -5542,7 +5582,7 @@ mod tests {
     /// 的「等 stop → finish_generation」）。
     #[test]
     fn tun_stop_with_inflight_worker_returns_zero_and_worker_exits_silently() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tx, rx) = mpsc::channel::<String>();
         let logf: Logf = Arc::new(move |s: &str| {
             let _ = tx.send(s.to_owned());
@@ -5651,7 +5691,7 @@ mod tests {
     /// 的 4/5 概率），旧实现必红于「新世代单飞锁不被旧 finish 清」。
     #[test]
     fn tun_stop_forced_release_with_late_finish_does_not_clobber_new_generation() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (tx, rx) = mpsc::channel::<String>();
         let logf: Logf = Arc::new(move |s: &str| {
             let _ = tx.send(s.to_owned());
@@ -5797,7 +5837,7 @@ mod tests {
     /// 「新世代单飞锁不被清」（同一受控钩子窗口，确定性）。
     #[test]
     fn tun_stop_force_release_rechecks_under_gate_and_preserves_new_generation() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let sh = Arc::new(TunShared::new());
         sh.begin_generation(1);
         sh.probe_running.store(true, Ordering::Release);
@@ -6023,7 +6063,7 @@ mod tests {
     /// Gone（不落「对端失败」行）；deadline 已过立即 Timeout。
     #[test]
     fn island_cmd_until_is_stop_aware() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, _l) = gen_with_lines("until");
         let island = idle_island(&run);
         run.set_island(Arc::clone(&island));
@@ -6078,7 +6118,7 @@ mod tests {
     /// 类型面的同一策略）。
     #[test]
     fn dns_dial_does_not_fire_carrier_entry() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let (run, _lines) = gen_with_lines("dnscb");
         let island = idle_island(&run);
         run.set_island(Arc::clone(&island));
@@ -6108,7 +6148,7 @@ mod tests {
     /// **3.4**：`rescueRoundsExhausted` 生产面恒 false（契约键保留——台账只增不减）。
     #[test]
     fn rescue_rounds_exhausted_is_const_false() {
-        let _ser = RECONN_TEST_LOCK.lock().unwrap();
+        let _ser = RECONN_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let demand = Arc::new(DemandSignals::new());
         let exec = TunnelExec::new(Arc::clone(&demand));
         let (run, _l) = gen_with_lines("rex");
