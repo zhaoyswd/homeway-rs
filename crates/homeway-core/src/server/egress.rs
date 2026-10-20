@@ -103,6 +103,8 @@ pub(crate) fn is_fake_ip(ip: IpAddr) -> bool {
             let o = v4.octets();
             o[0] == 198 && (o[1] & 0xFE) == 18
         }
+        // 窄契约（F3 钉住，ddnscheck 消费面依赖）：v6 恒假——v4-mapped 的 unmap 判
+        // 在消费方（`doh::poisoned_ip`）做，不动本函数契约。
         IpAddr::V6(_) => false,
     }
 }

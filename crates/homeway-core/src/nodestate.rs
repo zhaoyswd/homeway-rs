@@ -323,7 +323,7 @@ enabled = false
 listen = 38241
 bind_interface = "auto"
 upnp = true
-stun = "stun.miwifi.com:3478,stun.hitv.com:3478,stun.chat.bilibili.com:3478"
+stun = "stun.miwifi.com:3478,stun.hitv.com:3478,stun.chat.bilibili.com:3478,stun.cloudflare.com:3478"
 stun6 = "stun.hitv.com:3478,stun.cloudflare.com:3478"
 # 公网观测腿的域名解析（国内 DoH，host@ip 直连+钉物理网卡——不经系统解析器；
 # 逗号分隔候选。空 = 退回系统解析器并保留污染闸）

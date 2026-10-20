@@ -41,6 +41,8 @@ use std::net::{SocketAddr, UdpSocket};
 use crate::sysio;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicU64, Ordering};
+#[cfg(test)]
+use std::sync::atomic::AtomicBool as _;
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::thread::{self, JoinHandle};
@@ -698,6 +700,14 @@ fn join_and_log(h: JoinHandle<()>, logf: &Logf) {
     }
 }
 
+/// 测试缝：主循环 panic 注入（仅 `#[cfg(test)]`；开闸后下一轮循环必 panic——
+/// `stop_rx.recv()` 唤醒即触发）。见 `stop_releases_listen_port_after_panic`。
+#[cfg(test)]
+pub(crate) mod tests_support {
+    use std::sync::atomic::AtomicBool;
+    pub(crate) static EXIT_PANIC_GATE: AtomicBool = AtomicBool::new(false);
+}
+
 /// QUIC 面线程体：`catch_unwind` ⇒ 记行 ⇒ 置退出位（不复用该线程）。
 #[allow(clippy::too_many_arguments)] // 线程起点一次性移交全部状态（同 `driver_loop` 的口径）
 fn thread_body(
@@ -725,6 +735,11 @@ fn thread_body(
         (*logf)(&format!(
             "出口 QUIC 面 panic（{msg}）—— 判不健康，线程退出（不复用该线程）"
         ));
+        // panic 路径**同样断引用环**（评审 r1#8）：正常收尾在 `run_exit` 尾部 clear，
+        // panic 展开跳过它 ⇒ 绑定表仍持 `Connection → quinn socket → ExitSock → bridge`
+        // 的环，监听 socket 不释放、下次 restart 继续端口退让——与修复目标同型洞。
+        // `lock_unpoison` 容忍持环线程 panic 留下的中毒锁。
+        bridge.clear();
     }
     exit.mark_exited();
 }
@@ -921,6 +936,10 @@ fn run_exit(
         // 巡检节流基准（见循环尾「时间节流」注释）
         let mut last_sweep = Instant::now();
         loop {
+            #[cfg(test)]
+            if tests_support::EXIT_PANIC_GATE.load(Ordering::Relaxed) {
+                panic!("EXIT_PANIC_GATE 注入（r1#8：panic 路径断环回归）");
+            }
             tokio::select! {
                 _ = stop_rx.recv() => break,
                 inc = endpoint.accept() => match inc {

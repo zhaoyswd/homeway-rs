@@ -1,5 +1,29 @@
 # Changelog
 
+## v0.3.13（2026-10-20）
+
+- **公网观测腿抗代理污染**（外网手机落中继排障）：
+  - STUN 默认换**国内多候选**（v4 = miwifi/hitv/bilibili + cloudflare 兜底；v6 = hitv/cloudflare；
+    候选逗号分隔、惰性逐个试、首个可信应答者胜）；域名经 **DoH** 解析（新模块
+    `server/doh.rs`：`[serve].doh` 可配，默认阿里双 IP 直连 + TCP 钉物理网卡 + rustls/webpki-roots），
+    **不再走系统解析器**——fake-IP 污染环境下整条观测腿不再作废；解析与观测结果一律过污染闸
+    （单源复用 `egress::is_fake_ip`/`is_public_addr`，v4-mapped 在闸层 unmap）。
+  - 判据行变更：`STUN：监听 socket（本地 …）在 %s 眼里是 …` 的 `%s` 从「整串候选」改为
+    「胜出的单个候选」；新增 `DoH：…` 族与 `STUN：… 无应答——换下一个候选` 族诊断行。
+- **serve restart 端口退让修复**：QUIC 面收工（含 panic 路径）清绑定表，断
+  `bindings → Connection → quinn socket(ExitSock) → bridge` 的 Arc 自环——旧监听 socket
+  （与 PubFace dup）此前永不释放，restart 只能 EADDRINUSE 退让 +1，token/端点缓存里的
+  旧端口全部失联。pubep 加停止位（防跨 restart 写旧 `public_endpoint.txt`）。
+- 依赖面：+`webpki-roots`（DoH 根束）+`socket2`（钉卡 TCP；均为既有传递依赖或纯数据，
+  `libclientcore.so` 实测 3,081,184 B 与上版一致——server 面被链接期裁掉，不进手机核）。
+
+## v0.3.12（2026-10-20）
+
+- 连接与终端评审整改（tier docs/reviews 8 项中的核侧 3 项）：PTY 控制面分锁（`PtyCore`
+  + writer 独立锁、`kill_start` 无锁化）；R 采纳保留失败链（`rearm` 挪到赛跑/一次性重连
+  采纳点，B 门可达 + 重连耗时全周期）；替换风暴计数跨采纳保留 + `storm_parked` 门。
+- 复核整改 R2：风暴冷却到期清位即产出一次探活（不等在用/待机节拍）。
+
 ## v0.3.11（2026-10-20）
 
 - **恢复面三修（2026-10-20 评审整改）**：

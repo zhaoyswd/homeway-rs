@@ -579,7 +579,9 @@ fn parse_serve_flags(args: &[String]) -> Result<ServeFlags, CliErr> {
                 take_next(&mut adv);
             }
             "doh" => {
+                // F0 carve-out 同族：--doh '' = 显式退回系统解析器（仍过污染闸）。
                 f.doh = Some(cli_flags::take_value_empty_ok_or_exit("doh", inline, next));
+                take_next(&mut adv);
             }
             "stun6" => {
                 f.stun6 = Some(cli_flags::take_value_empty_ok_or_exit("stun6", inline, next));
@@ -1585,6 +1587,39 @@ mod tests {
         assert_eq!(cfg.relay, None, "显式空 relay = 关注册腿（覆盖 config）");
         assert_eq!(cfg.stun, "", "显式空 stun = 关");
         assert!(cfg.ddns.is_empty(), "显式空 ddns = 清空 config 全部条目（Go 同义）");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// 评审 r1#1：`--doh` 空格形必须消费值（修前缺 `take_next`，值被当位置参数 ⇒
+    /// `serve 不接受位置参数` 直接 exit）。同测 `=` 内联 / 空串 carve-out / 多 flag 连排。
+    #[test]
+    fn doh_flag_space_inline_empty_forms() {
+        let f = parse_serve_flags(&[
+            "--doh".to_owned(),
+            "dns.alidns.com@223.5.5.5".to_owned(),
+            "--stun=".to_owned(),
+        ])
+        .expect("空格形不得把值误判成位置参数");
+        assert_eq!(f.doh.as_deref(), Some("dns.alidns.com@223.5.5.5"));
+        assert!(f.extra.is_empty(), "值已消费，不得进 extra");
+        let g = parse_serve_flags(&["--doh=".to_owned()]).unwrap();
+        assert_eq!(g.doh.as_deref(), Some(""), "--doh= 空串 = 显式退回系统解析器");
+        let h = parse_serve_flags(&["--doh".to_owned(), "".to_owned(), "--stun6=".to_owned()])
+            .unwrap();
+        assert_eq!(h.doh.as_deref(), Some(""), "空格形空值同 carve-out");
+        assert_eq!(h.stun6.as_deref(), Some(""));
+        // E2E：空格形一路到 config 生效
+        let d = tmp_state("dohflag");
+        write_cfg(&d, "[serve]\nrelay = \"127.0.0.1:41741\"\nstun = \"stun.example:3478\"\n");
+        let state = d.display().to_string();
+        let cfg = assemble_result(&[
+            "--state".to_owned(),
+            state,
+            "--doh".to_owned(),
+            "doh.pub@1.12.12.12".to_owned(),
+        ])
+        .expect("空格形 --doh 不得在 assemble 层报位置参数");
+        assert_eq!(cfg.doh, "doh.pub@1.12.12.12");
         let _ = std::fs::remove_dir_all(&d);
     }
 

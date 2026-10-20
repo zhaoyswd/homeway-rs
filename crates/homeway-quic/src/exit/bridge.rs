@@ -469,8 +469,9 @@ impl ExitBridge {
 
     /// 清空全部绑定（**QUIC 面收工路径专用**，2026-10-20 端口退让 bug 的修复）。
     ///
-    /// 绑定表持 `Connection`，而 `Connection` 反持 endpoint → `ExitSock` → 回到本
-    /// bridge 的 `Arc`——**自环**：收工时若不清表，整条环（含监听 socket 的 fd 与
+    /// 绑定表持 `Connection`，而 `Connection` 反持 quinn socket（`Arc<dyn
+    /// AsyncUdpSocket>`；endpoint 也持同一 `ExitSock`）→ `ExitSock` → 回到本 bridge
+    /// 的 `Arc`——**自环**：收工时若不清表，整条环（含监听 socket 的 fd 与
     /// `PubFace` 的 dup）永不释放，`serve restart` 的新面只能端口退让（+1 漂移，
     /// token/客户端端点缓存里的旧端口全部失联——外网手机直连候选打空的直接成因）。
     pub(crate) fn clear(&self) {

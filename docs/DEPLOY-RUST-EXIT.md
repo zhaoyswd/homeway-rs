@@ -45,7 +45,7 @@
   改 plist → `launchctl bootstrap`。
 - **新 state** `~/.config/homeway-rs/config.toml`：`[serve] enabled=true
   listen=41641 relay="rl133ZkG…（阿里云 Rust 中继，§2 配好后补）"`；其余走默认
-  （bind_interface=auto / upnp=true / stun=stun.miwifi.com:3478,stun.hitv.com:3478,stun.chat.bilibili.com:3478 / stun6=stun.hitv.com:3478,stun.cloudflare.com:3478 / doh=dns.alidns.com@223.5.5.5,dns.alidns.com@223.6.6.6（2026-10-20 起国内多候选 + DoH 钉卡解析）/
+  （bind_interface=auto / upnp=true / stun=stun.miwifi.com:3478,stun.hitv.com:3478,stun.chat.bilibili.com:3478,stun.cloudflare.com:3478 / stun6=stun.hitv.com:3478,stun.cloudflare.com:3478 / doh=dns.alidns.com@223.5.5.5,dns.alidns.com@223.6.6.6（2026-10-20 起国内多候选 + DoH 钉卡解析）/
   files_root=$HOME / max_peers=32 / dns_port=5300）。
 
 **启动判据**（12:40:14–12:40:22，`cache/exit.log` = `cache/events.log` 同串）：

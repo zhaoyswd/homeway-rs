@@ -902,7 +902,16 @@ async fn stop_releases_listen_port_after_admission() {
     let (logf, rx) = sink();
     let sock = loopback_socket();
     let port = sock.local_addr().expect("已绑定").port();
-    let quic = ExitQuic::start(sock, ExitQuicConfig::new(seed(0x5D), 32), logf).expect("端点可起");
+    // r1#15：复现生产泄漏链的 hook/dup 边——`with_plain_hook` 的闭包持一份监听
+    // socket 的 try_clone（PubFace::attach_socket 同构）。环 = bindings → Connection
+    // → quinn socket（ExitSock）→ plain_hook → dup；只断「可重绑」即整条链已释放。
+    let dup = sock.try_clone().expect("try_clone");
+    let hook: crate::PlainDatagramHook = std::sync::Arc::new(move |_d: &[u8], _a: SocketAddr| {
+        let _still_alive = &dup;
+        None
+    });
+    let quic = ExitQuic::start(sock, ExitQuicConfig::new(seed(0x5D), 32).with_plain_hook(hook), logf)
+        .expect("端点可起");
     let stub = Stub::new(SECRET);
     let (_client, conn, _sock) = client_conn(&quic).await;
     let pubkey = [0x35u8; 32];
@@ -916,9 +925,45 @@ async fn stop_releases_listen_port_after_admission() {
     let rebind = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port));
     assert!(
         rebind.is_ok(),
-        "收工后监听端口 {port} 必须立即可重绑（绑定表环未断 ⇒ socket 泄漏）：{:?}",
+        "收工后监听端口 {port} 必须立即可重绑（绑定表环未断 ⇒ socket/hook dup 泄漏）：{:?}",
         rebind.err()
     );
+}
+
+/// **判据（评审 r1#8）**：主循环 panic 后监听端口同样必须可重绑——panic 展开跳过
+/// `run_exit` 尾部的 `bridge.clear()`，若 `thread_body` 的 catch_unwind 不补一刀，
+/// 绑定表的 `Connection → quinn socket → ExitSock → bridge` 自环让监听 socket
+/// （与 PubFace 的 dup）在 panic 形态下继续泄漏。gate 开闸后由 stop 唤醒主循环触发。
+#[tokio::test]
+async fn stop_releases_listen_port_after_panic() {
+    let (logf, rx) = sink();
+    let sock = loopback_socket();
+    let port = sock.local_addr().expect("已绑定").port();
+    let quic = ExitQuic::start(sock, ExitQuicConfig::new(seed(0x5F), 32), logf).expect("端点可起");
+    let stub = Stub::new(SECRET);
+    let (_client, conn, _sock) = client_conn(&quic).await;
+    let (_send, _recv) = admit(&stub, &quic, &conn, &SECRET, &[0x36u8; 32], &[0x47u8; 8]).await;
+    pump_until_line(&stub, &quic, &rx, "连接采纳 dev=47474747", WAIT).await;
+
+    // 开闸 + plain 出站消息唤醒主循环（该臂处理完继续下一轮 ⇒ 循环顶 gate panic；
+    // 不能用 stop 唤醒——stop 分支直接 break 走正常收尾，测不到 panic 路径）
+    crate::exit::tests_support::EXIT_PANIC_GATE.store(true, std::sync::atomic::Ordering::Relaxed);
+    let _ = quic.plain_tx.try_send((
+        SocketAddr::new(std::net::IpAddr::V4(Ipv4Addr::LOCALHOST), 9),
+        vec![0u8; 8],
+    ));
+    drop(quic);
+    let _ = crate::exit::tests_support::EXIT_PANIC_GATE.swap(false, std::sync::atomic::Ordering::Relaxed);
+
+    // 轮询等 panic 线程退出 + clear 生效（端口可重绑即环已断）
+    let deadline = Instant::now() + BUDGET;
+    loop {
+        if std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, port)).is_ok() {
+            break;
+        }
+        assert!(Instant::now() < deadline, "panic 后监听端口 {port} 仍不可重绑（panic 路径未断环）");
+        std::thread::sleep(Duration::from_millis(20));
+    }
 }
 
 /// **判据（S1-2 的 nonce 一次性/跨连接面）**：把 A 连接上的 `P4` 原文搬到 B 连接上
