@@ -74,4 +74,17 @@ Linux 全仓第一轮 core **843/1** 的唯一失败为既有 `speedtest_server:
 `/tmp/pty-linux-after-term.log`、`/tmp/pty-{linux,macos}-workspace-final.log`、
 `/tmp/pty-{linux,macos}-clippy-final.log`、`/tmp/pty-{ohos,windows}-check.log`。
 
-构建产物与核pin在正常干净检出构建完成后补记。当前没有推送、打tag、发Release或部署。
+## 应用核与交付核对
+
+- 实现提交 `e407bdf199ff0c9c29ccab6646aee949bd529323`，tier 核 pin 同步到此提交。
+- 干净核检出运行 tier `tools/core/build-core.sh`，未使用 dirty/unpinned 逃生口；
+  真 NDK release 链接、21 导出面、版本注入和 NAPI/log-index 门均通过。
+- `libclientcore.so` 两处落盘均为 **3,217,016 B**，版本 `e407bdf199ff-rust`；
+  SHA256 `c8999725087d7d51a221b2782034db7a17f39442d5ef1a1ba07415c56ca39b15`。
+- core `assembleHsp --no-daemon` 成功，生成签名 debug HSP **2,311,761 B**；
+  逐字节核对包内唯一 `libclientcore.so` 与两处核完全一致。
+  HSP SHA256 `5baad982b5ead3eb000d31225584b35eb2520a9159a9ee591e85e204dec34a52`。
+- tier code-map/NAPI/vocab/log-index 校验及两仓 diff 空白检查通过。
+  打包日志 `/tmp/pty-core-build.log`、`/tmp/pty-core-hsp.log`。
+- 私有 Linux 验证容器已移除，原始日志留存于本机 `/tmp`。未运行真机或生产验收，
+  当前没有推送、打 tag、发 Release 或部署；因此未宣称新的 GitHub CI 已通过。

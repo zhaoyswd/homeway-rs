@@ -75,7 +75,9 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 > `pty_control_ops_survive_input_backpressure` 失败。Linux 实例原代码精确复现0/1，
 > 修复取消写路径后全终端177/0，最终Linux/macOS各1220/0、各37 ignored；两平台
 > clippy、OHOS/Windows check通过。顺带修正测速单测REPORT与结算日志的完成同步，
-> 不改测速实现；应用核正常构建/pin收口后补记。
+> 不改测速实现。实现 `e407bdf199ff` 已干净构建核并同步tier pin，核3,217,016B、
+> 版本e407bdf199ff-rust；签名debug HSP打包与包内核逐字节核对通过。
+> 私有Linux容器已清理；未推送/tag/部署，未宣称远端新CI绿灯。
 > 技术/代码两道评审 = `docs/reviews/2026-10-21-linux-pty-write.md`。
 
 
