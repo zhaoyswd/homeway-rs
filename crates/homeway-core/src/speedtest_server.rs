@@ -893,8 +893,12 @@ mod tests {
         let ln = IpcListener::bind(&sock).unwrap();
         let lines = Arc::new(Mutex::new(Vec::<String>::new()));
         let l2 = Arc::clone(&lines);
+        let (settled_tx, settled_rx) = std::sync::mpsc::channel();
         let logf: crate::Logf = Arc::new(move |s: &str| {
             l2.lock().unwrap().push(s.to_owned());
+            if s.starts_with("speedtest: 会话 #") && s.contains(" role=send bytes=") {
+                let _ = settled_tx.send(());
+            }
         });
         let srv = Arc::new(SpeedtestServer::new(Arc::clone(&logf)));
         let srv2 = Arc::clone(&srv);
@@ -904,11 +908,20 @@ mod tests {
         // 两轮 role=send（收口即退——每轮一个号）
         for _ in 0..2 {
             let mut c = IpcStream::connect(&sock).unwrap();
+            c.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             write_control(&mut c, TYPE_REQUEST, br#"{"role":"send","warmup_ms":10,"window_ms":100}"#).unwrap();
             write_control(&mut c, TYPE_START, &[]).unwrap();
             write_control(&mut c, TYPE_FINISH, &[]).unwrap();
             let mut r = BufReader::new(c);
-            let _ = read_frame(&mut r);
+            let (typ, _) = read_frame(&mut r).expect("本轮 REPORT 必须到达");
+            assert_eq!(typ, TYPE_REPORT);
+        }
+        // REPORT 先写到连接，结算行随后才落日志；必须显式等两轮结算完成，
+        // 不能用读到第二轮 REPORT 推断四条日志已齐（Linux 并发 CI 可只见三行）。
+        let deadline = Instant::now() + Duration::from_secs(2);
+        for _ in 0..2 {
+            settled_rx.recv_timeout(deadline.saturating_duration_since(Instant::now()))
+                .expect("两轮结算日志须在 2s 内完成");
         }
         let lines = lines.lock().unwrap();
         let ids: Vec<u64> = lines

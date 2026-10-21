@@ -1133,3 +1133,14 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 - 中继预池 256/每源 IP 4；LEGUP 后独立在途保护池 64/每 IP 2、仍受原 10s 绝对准入窗。
   新分配首包须有 QUIC v1/v2 Initial 形状；形状不代表认证，不可直接提升正式额度。
   有限资源池不承诺在饱和的有效 Initial 攻击下无限接入；正式会话隔离和资源上界始终保留。
+
+
+### 2026-10-21：Linux PTY 背压写入取消
+
+- 原实现把 SIGHUP 杀死子进程等同于解除 PTY master 的阻塞 `write_all`；Linux 实跑不成立。
+  改为 master `O_NONBLOCK` + 短写/POLLOUT，新增输入取消检查粒度 50ms；正常输入不设总超时，
+  不丢弃未结束会话的背压数据。kill/finish/收尸先取消输入，不依赖进程退出或跨线程 close fd。
+- dup 共享 O_NONBLOCK，输出端同步以 POLLIN 等待保证原阻塞读取语义，HUP 时继续排空输出，
+  Linux EIO 映射 EOF，空读不当 EOF；写端 HUP/ERR 立即返回失败，不空转。
+- wire 字节、日志判据、ENDED 退出码（信号死=-1）、KILL_GRACE=500ms、NAPI 导出均不变。
+  新回归是真 PTY 下取消背压写/正常退出/输出延迟与逐字节顺序，不修改原失败用例的通过判据。

@@ -424,16 +424,12 @@ fn maybe_inject_panic(_role: ThreadRole, _name: &str) {}
 /// 处置保守——上层把「写失败/尺寸应用失败」按既有失败路径处理（断腿/重试），
 /// 而不是让整个 term 面级联崩溃。
 ///
-/// **控制面与输入写面分锁**（评审 2026-10-20 P1-1）：`write_all` 在 PTY 输入缓冲满时
-/// 可无限阻塞——一把 `Mutex<PtySession>` 会让 KILL（kill_start）、采样（foreground_pgid）
-/// 与 resize 全部排在写后面，而采样还持着服务全局 `State` 锁 ⇒ 整个终端服务停摆。
-/// 现在的分工：
-/// - `writer` 锁只包写本身：阻塞只拖住「这一条输入」；
-/// - `core` 锁只包 ioctl/信号/收尸级快操作（收尸 `wait_bounded` 例外，≤2s 有界）；
-/// - `pid` 无锁：`kill_start` 的 SIGHUP 在写背压下仍能立即发出——子进程退出正是
-///   解除写阻塞的出口（master 写端报错 ⇒ `write_all` 返回）。
+/// 控制面与输入写面分锁：写锁保证输入顺序，core 锁只包控制操作。
+/// 输入由 PTY 非阻塞短写 + poll 保持背压；收工先设独立取消标志，写者最多在
+/// 一拍 poll 后醒来，不依赖 SIGHUP/子进程退出解除内核 write 阻塞。
 struct PtyShared {
     pid: i32,
+    input_stopped: Arc<AtomicBool>,
     writer: Mutex<Box<dyn std::io::Write + Send>>,
     core: Mutex<super::pty::PtyCore>,
 }
@@ -443,9 +439,11 @@ impl PtyShared {
     fn new(s: super::pty::PtySession) -> (Self, Box<dyn std::io::Read + Send>) {
         let (core, writer, reader) = s.into_parts();
         let pid = core.pid;
+        let input_stopped = core.input_stop_flag();
         (
             Self {
                 pid,
+                input_stopped,
                 writer: Mutex::new(writer),
                 core: Mutex::new(core),
             },
@@ -477,20 +475,27 @@ impl PtyShared {
         self.pid
     }
 
+    fn cancel_input(&self) {
+        self.input_stopped.store(true, Ordering::Release);
+    }
+
     /// SIGHUP **不取任何锁**（见结构体注释：写背压下仍必须能立即发出）。
     fn kill_start(&self) {
+        self.cancel_input();
         super::agent::signal_pgid(self.pid, libc::SIGHUP);
     }
 
     /// SIGKILL 先行（无锁、组信号）；child 单进程回退面走 core 锁（最坏等到收尸的
     /// 有界窗口，可接受——主要杀伤力已发出）。
     fn kill_force(&self) {
+        self.cancel_input();
         super::agent::signal_pgid(self.pid, libc::SIGKILL);
         let mut killer = self.core.lock().unwrap_or_else(|e| e.into_inner()).child.clone_killer();
         let _ = killer.kill();
     }
 
     fn wait_bounded(&self, grace: Duration) -> i32 {
+        self.cancel_input();
         self.core.lock().unwrap_or_else(|e| e.into_inner()).wait_bounded(grace)
     }
 }
@@ -2201,12 +2206,14 @@ impl TermService {
                 // 幂等守卫之外的形态：已收尾过——只确保唤醒，不动回收面
                 if let Some(rt) = st.sessions.get_mut(name) {
                     rt.stopped.store(true, Ordering::Relaxed);
+                    rt.pty.cancel_input();
                     rt.wake_surface();
                 }
                 return;
             }
             let Some(rt) = st.sessions.get_mut(name) else { return };
             rt.stopped.store(true, Ordering::Relaxed);
+            rt.pty.cancel_input();
             rt.wake_surface();
             for e in &ends {
                 apply_end_to_leg_rt(&self.logf, rt, e);
@@ -4359,7 +4366,7 @@ mod tests {
     /// 评审 2026-10-20 P1-1 判据：输入写背压（子进程不读、大粘贴填满 PTY 输入缓冲）
     /// **不得拖住控制面**——`kill_start`（SIGHUP）与 `resize`/`foreground_pgid` 在写
     /// 阻塞期间仍须即时完成。修复前它们与 `write_input` 共享一把 `Mutex<PtySession>`：
-    /// 阻塞写会把 KILL（正是解除阻塞的出口）与采样/resize 全部拖住。
+    /// 阻塞写曾把 KILL 与采样/resize 全部拖住；现显式取消写，不借助子进程退出。
     #[test]
     fn pty_control_ops_survive_input_backpressure() {
         use std::sync::atomic::{AtomicBool, Ordering as AtomOrd};
@@ -4411,7 +4418,7 @@ mod tests {
         pty.resize(100, 30);
         let _ = pty.foreground_pgid();
         assert!(t.elapsed() < Duration::from_millis(500), "控制面不得等 writer 锁");
-        // 收尾：子进程被 SIGHUP 杀死 ⇒ master 写端报错 ⇒ 写线程解除阻塞
+        // 收尾：输入已被显式取消；不能依赖 Linux 上 SIGHUP 自动解除 master 写阻塞。
         let code = pty.wait_bounded(Duration::from_secs(5));
         assert_eq!(code, -1, "SIGHUP 信号死（D-19 映射）");
         let deadline = Instant::now() + Duration::from_secs(2);
@@ -4419,6 +4426,64 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         assert!(done.load(AtomOrd::SeqCst), "子进程死后写线程必须解除阻塞退出");
+    }
+
+    /// 写取消必须在子进程仍存活且不消费输入时生效，不借助 SIGHUP/关闭 fd。
+    #[test]
+    fn pty_input_cancel_releases_backpressure_with_live_child() {
+        let (shared, mut reader) = PtyShared::new(
+            super::super::pty::spawn("bp-cancel", 80, 24,
+                Some("stty raw -echo; printf ready; exec /bin/sleep 30")).unwrap(),
+        );
+        let mut ready = [0u8; 5];
+        reader.read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"ready");
+        let pty = Arc::new(shared);
+        let writer = Arc::clone(&pty);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writing = std::thread::spawn(move || {
+            tx.send(writer.write_input(&vec![b'x'; 4 * 1024 * 1024])).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(rx.try_recv().is_err(), "写入应处于真实 PTY 背压");
+        pty.cancel_input();
+        let completed = rx.recv_timeout(Duration::from_secs(2));
+        let alive = pty.core.lock().unwrap().try_wait().is_none();
+        pty.kill_start();
+        pty.wait_bounded(Duration::from_secs(1));
+        assert!(!completed.expect("取消必须唤醒背压写者"));
+        assert!(alive, "取消输入不应终止子进程");
+        writing.join().unwrap();
+        assert!(!pty.write_input(b"after cancel"), "后续输入也须立即失败");
+    }
+
+    /// 自然退出时，即使 pump 尚未读到 EOF，写者也通过 HUP/EIO 有界收工。
+    #[test]
+    fn pty_natural_exit_releases_backpressured_input() {
+        let (shared, mut reader) = PtyShared::new(
+            super::super::pty::spawn("bp-exit", 80, 24,
+                Some("trap 'exit 7' USR1; stty raw -echo; printf ready; while :; do sleep 0.05; done")).unwrap(),
+        );
+        let mut ready = [0u8; 5];
+        reader.read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"ready");
+        let pty = Arc::new(shared);
+        let writer = Arc::clone(&pty);
+        let (tx, rx) = std::sync::mpsc::channel();
+        let writing = std::thread::spawn(move || {
+            tx.send(writer.write_input(&vec![b'x'; 4 * 1024 * 1024])).unwrap();
+        });
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(rx.try_recv().is_err(), "写入应在子进程退出前进入背压");
+        assert!(pty.core.lock().unwrap().try_wait().is_none());
+        // ready 已证明 trap/raw 就绪；受控触发正常 exit 7，不依赖机器调度窗口。
+        // SAFETY: pid 来自本测试仍存活的子进程；不访问任何裸 fd。
+        assert_eq!(unsafe { libc::kill(pty.pid(), libc::SIGUSR1) }, 0);
+        let completed = rx.recv_timeout(Duration::from_secs(3));
+        let code = pty.wait_bounded(Duration::from_secs(1));
+        assert!(!completed.expect("子进程自然退出必须解除写等待"));
+        assert_eq!(code, 7);
+        writing.join().unwrap();
     }
 
     /// RESIZE 帧路径 + EXPLAIN 的错误面（无检测/无 agent）。

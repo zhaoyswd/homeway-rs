@@ -71,6 +71,14 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-10-21 Linux PTY CI 修复**：GitHub `39527041058`/基线 `2dd95fd` 仅 Ubuntu
+> `pty_control_ops_survive_input_backpressure` 失败。Linux 实例原代码精确复现0/1，
+> 修复取消写路径后全终端177/0，最终Linux/macOS各1220/0、各37 ignored；两平台
+> clippy、OHOS/Windows check通过。顺带修正测速单测REPORT与结算日志的完成同步，
+> 不改测速实现；应用核正常构建/pin收口后补记。
+> 技术/代码两道评审 = `docs/reviews/2026-10-21-linux-pty-write.md`。
+
+
 > **2026-10-21 中继/赛跑/学习整改批**：已在 `708c95b` 最新基线重新复现原九组缺陷，
 > 保留公网观测 r5 改动，实施中继认证/配额/期限/绑定、候选持久化与动态 DNS、串行准入
 > 后备及同连接跨族直连升级。专项技术/代码评审与交叉复核见

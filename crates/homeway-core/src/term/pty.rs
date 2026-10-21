@@ -10,8 +10,11 @@
 //! 加强制终端标记（TERM=xterm-256color、COLORTERM=truecolor、TERM_PROGRAM=Tailcat、
 //! TERM_SESSION_ID=tailcat-会话名）。cwd=$HOME。
 
-use std::io::Read as _;
-use std::io::Write as _;
+use std::fs::File;
+use std::io::{self, Read as _, Write as _};
+use std::os::fd::{AsRawFd, BorrowedFd};
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::path::Path;
 use std::process::Command;
 use std::time::Duration;
@@ -202,7 +205,7 @@ fn home_dir() -> Option<String> {
 ///
 /// 与输入写面**结构性分开**（评审 2026-10-20 P1-1）：`write_all` 在 PTY 输入缓冲满时
 /// 可无限阻塞，控制面若与它共享一把锁，大粘贴就能拖住 KILL、采样与 resize——
-/// 而 SIGHUP 恰是解除写阻塞的钥匙（子进程退出 ⇒ master 写端报错 ⇒ 写返回）。
+/// 写面通过非阻塞短写 + poll 保持背压；收工先取消输入，不依赖子进程退出唤醒 write。
 pub struct PtyCore {
     pub master: Box<dyn MasterPty + Send>,
     pub child: Box<dyn Child + Send + Sync>,
@@ -210,6 +213,7 @@ pub struct PtyCore {
     pub pid: i32,
     pub cols: u16,
     pub rows: u16,
+    input_stopped: Arc<AtomicBool>,
 }
 
 /// 一条起好的 PTY 会话（spawn 的产物包：控制面 + 输入写面 + 输出读面）。
@@ -258,22 +262,165 @@ pub fn spawn(
     let pair = pty_system
         .openpty(PtySize { rows, cols, pixel_width: 0, pixel_height: 0 })
         .map_err(|e| format!("openpty: {e}"))?;
+    // dup 与 master 共享 O_NONBLOCK；读/写都由下面的包装器恢复阻塞语义。
+    // 在 spawn 前完成所有可失败的 fd 配置，失败时不会遗留已启动的子进程。
+    let raw = pair.master.as_raw_fd().ok_or("PTY master 没有 Unix fd")?;
+    // SAFETY: master 在本作用域持有 raw，clone 得到独立拥有的 CLOEXEC fd。
+    let fd = unsafe { BorrowedFd::borrow_raw(raw) };
+    let input_fd = fd
+        .try_clone_to_owned()
+        .map_err(|e| format!("clone input: {e}"))?;
+    let output_fd = fd
+        .try_clone_to_owned()
+        .map_err(|e| format!("clone output: {e}"))?;
+    // SAFETY: raw 仍由 master 持有；fcntl 不转移所有权。
+    let flags = unsafe { libc::fcntl(raw, libc::F_GETFL) };
+    if flags == -1 || unsafe { libc::fcntl(raw, libc::F_SETFL, flags | libc::O_NONBLOCK) } == -1 {
+        return Err(format!("PTY nonblocking: {}", io::Error::last_os_error()));
+    }
+    let input_stopped = Arc::new(AtomicBool::new(false));
+    let writer = Box::new(PtyInput {
+        fd: File::from(input_fd),
+        stopped: Arc::clone(&input_stopped),
+    });
+    let reader = Box::new(PtyOutput {
+        fd: File::from(output_fd),
+        stopped: Arc::clone(&input_stopped),
+    });
     let child = pair
         .slave
         .spawn_command(cmd)
         .map_err(|e| format!("spawn {shell}: {e}"))?;
     drop(pair.slave); // 丢从端引用：子进程退出后读端能见 EOF（收尸路径依赖此语义）
-    let writer = pair.master.take_writer().map_err(|e| format!("take_writer: {e}"))?;
-    let reader = pair.master.try_clone_reader().map_err(|e| format!("try_clone_reader: {e}"))?;
     let pid = child.process_id().unwrap_or(u32::MAX) as i32;
     Ok(PtySession {
-        core: PtyCore { master: pair.master, child, shell, pid, cols, rows },
+        core: PtyCore { master: pair.master, child, shell, pid, cols, rows, input_stopped },
         writer,
         reader,
     })
 }
 
+/// 写等待的取消检查粒度；正常输入没有总超时，背压持续到可写或显式收工。
+const INPUT_CANCEL_POLL_MS: libc::c_int = 50;
+
+/// 每个方向独占其 fd；不使用 portable-pty writer（其 Drop 会额外写 VEOF）。
+struct PtyInput {
+    fd: File,
+    stopped: Arc<AtomicBool>,
+}
+
+impl io::Write for PtyInput {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            if self.stopped.load(Ordering::Acquire) {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "PTY input stopped",
+                ));
+            }
+            match self.fd.write(buf) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    // poll 只是就绪提示；醒后仍用非阻塞 write，应对并发关闭/伪就绪。
+                    match poll_fd(&self.fd, libc::POLLOUT, INPUT_CANCEL_POLL_MS) {
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Ok(events) if events & (libc::POLLHUP | libc::POLLERR) != 0 => {
+                            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "PTY input closed"));
+                        }
+                        result => {
+                            result?;
+                        }
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                result => return result,
+            }
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        // File 没有用户态缓冲，不能用 tcdrain（同样可能无限等待子进程）。
+        Ok(())
+    }
+}
+
+struct PtyOutput {
+    fd: File,
+    stopped: Arc<AtomicBool>,
+}
+
+impl io::Read for PtyOutput {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        if buf.is_empty() {
+            return Ok(0);
+        }
+        loop {
+            match self.fd.read(buf) {
+                Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                    match poll_fd(&self.fd, libc::POLLIN, -1) {
+                        Ok(_) => continue,
+                        Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                        Err(e) => return Err(e),
+                    }
+                }
+                Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+                // 与 portable-pty 一致：Linux slave 全关闭时 master read 回 EIO。
+                Err(e) if e.raw_os_error() == Some(libc::EIO) => {
+                    self.stopped.store(true, Ordering::Release);
+                    return Ok(0);
+                }
+                result => {
+                    if !matches!(result, Ok(n) if n > 0) {
+                        self.stopped.store(true, Ordering::Release);
+                    }
+                    return result;
+                }
+            }
+        }
+    }
+}
+
+impl Drop for PtyOutput {
+    fn drop(&mut self) {
+        self.stopped.store(true, Ordering::Release);
+    }
+}
+
+fn poll_fd(fd: &File, events: libc::c_short, timeout: libc::c_int) -> io::Result<libc::c_short> {
+    let mut pfd = libc::pollfd {
+        fd: fd.as_raw_fd(),
+        events,
+        revents: 0,
+    };
+    // SAFETY: pfd 有效，File 在整个 poll 调用期间持有 fd。
+    if unsafe { libc::poll(&mut pfd, 1, timeout) } == -1 {
+        return Err(io::Error::last_os_error());
+    }
+    if pfd.revents & libc::POLLNVAL != 0 {
+        return Err(io::Error::from_raw_os_error(libc::EBADF));
+    }
+    // 调用方分方向解释 HUP/ERR：输入报错，输出仍先 read 排空尾部。
+    Ok(pfd.revents)
+}
+
+impl Drop for PtyCore {
+    fn drop(&mut self) {
+        self.cancel_input();
+    }
+}
+
 impl PtyCore {
+    pub(super) fn input_stop_flag(&self) -> Arc<AtomicBool> {
+        Arc::clone(&self.input_stopped)
+    }
+
+    /// 独立于子进程信号/退出的输入取消；不取写锁。
+    pub fn cancel_input(&self) {
+        self.input_stopped.store(true, Ordering::Release);
+    }
+
     /// 应用新尺寸（幂等）。
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), String> {
         self.master
@@ -298,10 +445,12 @@ impl PtyCore {
     /// 主动结束：SIGHUP → 宽限 → SIGKILL（ENDED 由会话收尸路径发）。
     /// `grace_deadline` 由调用方驱动（会话层有自己的时间源/退出条件）。
     pub fn kill_start(&self) {
+        self.cancel_input();
         super::agent::signal_pgid(self.pid, libc::SIGHUP);
     }
 
     pub fn kill_force(&self) {
+        self.cancel_input();
         super::agent::signal_pgid(self.pid, libc::SIGKILL);
         // 组信号失败退化单进程（Go kill 的回退面）
         let _ = self.child.clone_killer().kill();
@@ -309,7 +458,11 @@ impl PtyCore {
 
     /// 是否仍在跑（非阻塞探测）。
     pub fn try_wait(&mut self) -> Option<portable_pty::ExitStatus> {
-        self.child.try_wait().ok().flatten()
+        let status = self.child.try_wait().ok().flatten();
+        if status.is_some() {
+            self.cancel_input();
+        }
+        status
     }
 
     /// 阻塞收尸（pump 退出路径用），返回退出码。
@@ -320,6 +473,7 @@ impl PtyCore {
     /// 正常退出码（0..255）两侧本就一致。差异注记：portable-pty 不暴露具体信号值
     /// 的数值面（只给词面），而 EXIT 面只需要数值——Go 也只给数值。
     pub fn wait(&mut self) -> i32 {
+        self.cancel_input();
         match self.child.wait() {
             Ok(status) if status.signal().is_some() => -1,
             Ok(status) => status.exit_code() as i32,
@@ -330,6 +484,7 @@ impl PtyCore {
     /// 有界收尸（Go `finish` 的 2s 宽限同义）：宽限内 `try_wait` 轮询，超时
     /// SIGKILL 兜底再阻塞收尸。返回退出码（信号死 ⇒ -1，D-19 映射同 [`Self::wait`]）。
     pub fn wait_bounded(&mut self, grace: std::time::Duration) -> i32 {
+        self.cancel_input();
         let deadline = std::time::Instant::now() + grace;
         while std::time::Instant::now() < deadline {
             if let Some(st) = self.try_wait() {
@@ -449,6 +604,42 @@ mod tests {
         let _ = got_eof;
         let code = pty.core.wait();
         assert_eq!(code, 7, "子进程退出码");
+    }
+
+    /// O_NONBLOCK 是共享状态：读端须等待新输出，不得把 WouldBlock 当 EOF。
+    /// HUP 到达后仍读尽子进程退出前的全部尾部字节。
+    #[test]
+    fn nonblocking_master_reader_waits_and_drains_tail() {
+        let mut pty = spawn("poll-read", 80, 24,
+            Some("stty raw -echo; printf first; sleep 0.2; printf second; exit 7"))
+            .expect("spawn");
+        let mut bytes = Vec::new();
+        pty.reader.read_to_end(&mut bytes).expect("blocking reader wrapper");
+        assert_eq!(bytes, b"firstsecond");
+        assert_eq!(pty.core.wait(), 7);
+    }
+
+    /// 正常输入没有任意超时；满队列等待子进程恢复读取，再完整按序送达。
+    #[test]
+    fn input_backpressure_preserves_bytes_and_order() {
+        let mut pty = spawn("poll-order", 80, 24,
+            Some("stty raw -echo; printf ready; sleep 0.3; exec cat"))
+            .expect("spawn");
+        assert_eq!(pty.reader.read(&mut []).unwrap(), 0);
+        assert!(!pty.core.input_stopped.load(Ordering::Acquire), "空读不代表 EOF");
+        let mut ready = [0u8; 5];
+        pty.reader.read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"ready");
+        let expected: Vec<u8> = (0..256 * 1024).map(|i| (i % 251) as u8).collect();
+        let data = expected.clone();
+        let (mut core, mut writer, mut reader) = pty.into_parts();
+        let writing = std::thread::spawn(move || writer.write_all(&data));
+        let mut got = vec![0u8; expected.len()];
+        reader.read_exact(&mut got).unwrap();
+        assert_eq!(got, expected);
+        writing.join().unwrap().unwrap();
+        core.kill_start();
+        core.wait_bounded(Duration::from_secs(1));
     }
 
     #[test]
