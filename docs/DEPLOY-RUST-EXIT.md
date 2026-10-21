@@ -936,3 +936,33 @@ v0.3.15恢复Unix地址复用，不启用SO_REUSEPORT；代码/回归见同日re
 `~/homeway-rollback/v0.3.13-before-v0.3.14-20261021T041307Z/`，阿里云
 `/opt/homeway/backups/v0.3.13-before-v0.3.14-20261021T041309Z/`，各有homeway与state.tgz。
 本次没有安装手机应用或更换其它客户端。
+
+
+### 13.14 换装 v0.3.15 与重复PTY回收验收（2026-10-21）
+
+main/tag `a2576d0e97bc`；[CI 39544607934](https://github.com/zhaoyswd/homeway-rs/actions/runs/39544607934)
+八项全过，Ubuntu/macOS各1221/0、各37 ignored；真实主动关闭后立即重绑回归在两平台均过。
+[Release 39545014604](https://github.com/zhaoyswd/homeway-rs/actions/runs/39545014604)五目标与发布全通过。
+本机额外并发全仓首轮clear_screen_skips_backlog收尸卡在wait4，留存sample后终止；该用例单独复验
+1/0（3.53s）、同配置默认并发全仓复验1221/0，未改断言/超时、未把卡住轮计绿。
+
+| 机器 | 产物与启动 | 判据 |
+|---|---|---|
+| Mac | tar SHA256 `7803651a9e697c81fd0fda0910141a78e704455909854dcf0739ac76df7eea91`；binary SHA256 `3ad88601320d0c6accfdc5871bd31ae30854acd81823a4ea48526fc09896a55d`。原子换名，launchd零参，pid61094，12:43:42起 | v0.3.15，41641不漂移；公网双公布；身份/config不变；PTY背压控制KILL应答0.8ms |
+| 阿里云 | tar SHA256 `d21c5a2c114a15fcff98623e2cda71a0bf80c69ead1b8a87881c5ec0eb0edb45`；binary SHA256 `a8e723d1d1d725124de12aa597859e8c556e9a676b13bd545ae5d542a6ef8819`。旧进程退净后等待旧版TCP状态自然回收62s，再零参起，pid1654207，12:45:05 | v0.3.15，41641/udp、41741/udp+tcp双族；身份/relay key/config不变；PTY背压KILL应答0.9ms；12:45:35 Mac控制面OK-MAC恢复 |
+
+**TCP快速重启实证**：存在1条真实已认证后端控制连接时，12:46:19调用零参 `homeway relay restart`，
+61.0ms内TCP41741双族监听恢复，统一进程pid与serve41641不变，12:46:20 Mac重认证；本轮关闭连接
+未留下TIME_WAIT（记0，未冒充生产TIME_WAIT重绑证据；该形态由上方真实FIN/EOF单测覆盖）。
+首次从未设复用的旧监听器升级仍应等待其旧连接状态过期，不修改系统TCP参数。
+
+**重复PTY验收发现**：会话出表并不等于资源回收。重复背压KILL两轮后，Linux无PTY子进程、
+无pump/resp/writer线程，但残留4枚master（tty-index0/2各2枚，core+writer）超过60秒不退。
+定位为无活动腿首次finish的空ENDED集被误判为幂等收工；需要v0.3.16补齐运行态回收。
+本轮fd计数断言失败如实保留，未将仅LIST空写成无泄漏通过。
+
+核/App：pin `a2576d0e97bc`，干净正常构建3,217,016B、a2576d0e97bc-rust，NAPI/log-index/
+vocab/code-map门通过；签名debug HSP内核与两处落盘逐字节一致，未装手机。
+核SHA256 `2d4c4cb5895810ce6680510e71f771775a95eda1e369bf7a918d9ba9bb1a09c1`。
+回退目录：Mac `~/homeway-rollback/v0.3.14-before-v0.3.15-20261021T043311Z/`；
+阿里云 `/opt/homeway/backups/v0.3.14-before-v0.3.15-20261021T043311Z/`。

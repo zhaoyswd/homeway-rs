@@ -71,6 +71,13 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-10-21 PTY无腿收尾回收**：v0.3.15已完成双出口换装与中继快速重启（61ms，
+> Mac控制面重新认证），CI双平台各1221/0、Release五目标绿；重复PTY验收发现空ENDED集
+> 被误作幂等、运行态持有master，Linux残留4枚fd。v0.3.16修复首次无腿finish与写者退出
+> 的清理所有权；两道门见 `docs/reviews/2026-10-21-pty-finish-race.md`，待CI/发版/部署收口。
+> 现场与证据见 `docs/DEPLOY-RUST-EXIT.md` §13.14。
+
+
 > **2026-10-21 推送部署与TCP快速重启补丁**：v0.3.14 已完成双出口换装，PTY真实背压
 > 与Linux master fd回收通过；GitHub CI八项、Release五目标均绿。验收发现TCP监听
 > 缺Unix地址复用，旧连接状态使启动落UDP-only；已恢复生产TCP并补v0.3.15最小修复，

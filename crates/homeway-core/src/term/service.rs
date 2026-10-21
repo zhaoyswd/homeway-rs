@@ -498,6 +498,16 @@ impl PtyShared {
         self.cancel_input();
         self.core.lock().unwrap_or_else(|e| e.into_inner()).wait_bounded(grace)
     }
+
+    /// 收尾拥有者统一终止/收尸；已收尸的自然退出不再向可复用的 PID 发信号。
+    fn stop_and_wait(&self, grace: Duration) {
+        self.cancel_input();
+        let mut core = self.core.lock().unwrap_or_else(|e| e.into_inner());
+        if core.try_wait().is_none() {
+            core.kill_start();
+        }
+        let _ = core.wait_bounded(grace);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1021,15 +1031,17 @@ impl TermService {
     /// 关停服务：全部会话 ENDED(service_stopped) + 收尸（不影响其它服务）。
     pub fn close(&self) {
         self.stop.store(true, Ordering::Relaxed);
-        let names: Vec<String> = {
+        let sessions: Vec<(String, u64)> = {
             let st = self.lock_state();
-            st.registry.session_names().into_iter().map(String::from).collect()
+            st.registry.session_names().into_iter().filter_map(|name| {
+                st.sessions.get(name).map(|rt| (name.to_string(), rt.gen))
+            }).collect()
         };
         // 并发收工（Go FIX-33：finish 每条会话最多等子进程 2s，串行收 16 条最坏 32s——
         // 关停路径不该被线性放大）
         std::thread::scope(|scope| {
-            for name in &names {
-                scope.spawn(|| self.finish_session(name, FinishReason::ServiceStopped));
+            for (name, sess_gen) in &sessions {
+                scope.spawn(|| self.finish_session(name, *sess_gen, FinishReason::ServiceStopped));
             }
         });
     }
@@ -1355,12 +1367,8 @@ impl TermService {
         };
         if let Err(e) = spawned {
             self.logf(&format!("term: 会话 {name} 写者线程起不来（{e}）——腿收线"));
-            {
-                let mut st = self.lock_state();
-                if let Some(rt) = rt_of_mut(&mut st, &name, sess_gen) {
-                    rt.writers = rt.writers.saturating_sub(1);
-                }
-            }
+            // 与已启动写者共用减计数/回收：spawn 失败也可能晚于会话收尸。
+            self.writer_exited(&name, sess_gen);
             self.end_leg(&name, reg.key, i32::MIN, "", "client_closed");
             return;
         }
@@ -2198,51 +2206,50 @@ impl TermService {
     }
 
     /// 会话收尾（ENDED 送达 + 资源回收四步：等子进程 → 关 master → 删注册表 → 释放历史）。
-    fn finish_session(&self, name: &str, reason: FinishReason) {
-        let (pty, remove_now) = {
+    fn finish_session(&self, name: &str, sess_gen: u64, reason: FinishReason) {
+        let pty = {
             let mut st = self.lock_state();
-            let ends = st.registry.finish(name, reason);
-            if ends.is_empty() {
-                // 幂等守卫之外的形态：已收尾过——只确保唤醒，不动回收面
-                if let Some(rt) = st.sessions.get_mut(name) {
-                    rt.stopped.store(true, Ordering::Relaxed);
-                    rt.pty.cancel_input();
-                    rt.wake_surface();
-                }
+            let Some(rt) = rt_of_mut(&mut st, name, sess_gen) else { return };
+            // 收尾所有权与 ENDED 接收者个数无关：CREATE(-d)/末腿先退也必须收尸。
+            // 锁内领取所有权，重复调用只退出，不重复发信号/等待子进程。
+            if rt.stopped.swap(true, Ordering::Relaxed) {
                 return;
             }
-            let Some(rt) = st.sessions.get_mut(name) else { return };
-            rt.stopped.store(true, Ordering::Relaxed);
             rt.pty.cancel_input();
             rt.wake_surface();
+            let pty = Arc::clone(&rt.pty);
+            let ends = st.registry.finish(name, reason);
+            let rt = rt_of_mut(&mut st, name, sess_gen).expect("持锁期间运行态不会换代");
             for e in &ends {
                 apply_end_to_leg_rt(&self.logf, rt, e);
             }
-            (Some(Arc::clone(&rt.pty)), rt.writers == 0)
+            pty
         };
         // 子进程收尸（有界 + SIGKILL 兜底）——锁外；master 随 PtyShared 释放。
-        // wait_bounded 内部只在超时才 kill_force——成功收尸后**不再补发**
-        //（pid/pgid 可能已被系统回收，组信号会误伤无关进程——评审 D1）
-        if let Some(pty) = pty {
-            pty.kill_start();
-            let _ = pty.wait_bounded(Duration::from_secs(2));
-        }
-        // 注册面回收；运行态在最后一个写者退出时移除（无写者则即刻——r5 M1）
+        // 已收尸时不补发组信号（pid/pgid 可能已回收，见评审 D1）。
+        pty.stop_and_wait(Duration::from_secs(2));
+        // 注册表保留到收尸结束；写者在此之前归零也不能提前删运行态。
+        // 不用收尸前的 writers 快照：最后写者可能已在锁外等待期间退出。
         let mut st = self.lock_state();
+        let Some(rt) = rt_of(&st, name, sess_gen) else { return };
+        let remove_now = rt.writers == 0;
         st.registry.remove_session(name);
-        if remove_now && st.sessions.get(name).is_none_or(|rt| rt.writers == 0) {
+        if remove_now {
             st.sessions.remove(name);
         }
     }
 
     /// pump 的自然退出收尾（子进程已死）：ENDED = 退出码 / killed ⇒ -2。
-    fn finalize_exit(self: &Arc<Self>, name: &str, code: i32) {
+    fn finalize_exit(self: &Arc<Self>, name: &str, sess_gen: u64, code: i32) {
         let killed = {
             let st = self.lock_state();
+            if rt_of(&st, name, sess_gen).is_none() {
+                return;
+            }
             st.registry.session(name).is_some_and(|s| s.killed)
         };
         let reason = if killed { FinishReason::Killed } else { FinishReason::Exit(code) };
-        self.finish_session(name, reason);
+        self.finish_session(name, sess_gen, reason);
     }
 
     /// pump 线程 panic 后的主动收尾（F7 处置表）：无 reader 的会话必死——有界收尸
@@ -2254,7 +2261,7 @@ impl TermService {
         };
         let Some(pty) = pty else { return };
         let code = pty.wait_bounded(Duration::from_secs(2));
-        self.finalize_exit(name, code);
+        self.finalize_exit(name, sess_gen, code);
     }
 
     /// surface 投递线程 panic 后的收尾（F7 处置表）：surface 唯一投递面已死 ⇒
@@ -2275,10 +2282,11 @@ impl TermService {
     /// 窗口里环还在）。
     fn writer_exited(&self, name: &str, sess_gen: u64) {
         let mut st = self.lock_state();
-        let stopped = rt_of(&st, name, sess_gen).is_some_and(|rt| rt.stopped.load(Ordering::Relaxed));
+        // 注册表仍在表示收尾拥有者尚未完成收尸；此时只减计数，让它最终复核。
+        let reaped = st.registry.session(name).is_none();
         if let Some(rt) = rt_of_mut(&mut st, name, sess_gen) {
             rt.writers = rt.writers.saturating_sub(1);
-            if stopped && rt.writers == 0 {
+            if reaped && rt.stopped.load(Ordering::Relaxed) && rt.writers == 0 {
                 st.sessions.remove(name);
             }
         }
@@ -2413,7 +2421,7 @@ impl TermService {
             }
         };
         let code = code.wait_bounded(Duration::from_secs(2));
-        self.finalize_exit(name, code);
+        self.finalize_exit(name, sess_gen, code);
     }
 
     /// 应答写者（FIX-25）：独占消费每会话 PTY 注入队列（查询应答 + 焦点 nudge，F3）。
@@ -4361,6 +4369,154 @@ mod tests {
         // 正常退出码不受影响
         let mut ps2 = super::super::pty::spawn("d19b", 80, 24, Some("exit 3")).unwrap();
         assert_eq!(ps2.core.wait(), 3);
+    }
+
+    /// CREATE 不接入时没有 ENDED 接收者，但仍须收尸并释放运行态。
+    #[test]
+    fn finish_session_without_legs_reclaims_runtime() {
+        let svc = svc_with(
+            TermConfig { shell: Some("exec cat".into()), ..TermConfig::default() },
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        svc.create_only("no-legs", false).unwrap();
+        let pty = Arc::clone(&svc.lock_state().sessions["no-legs"].pty);
+        let sess_gen = svc.lock_state().sessions["no-legs"].gen;
+        svc.finish_session("no-legs", sess_gen, FinishReason::ServiceStopped);
+        let (registered, retained) = {
+            let st = svc.lock_state();
+            (st.registry.session("no-legs").is_some(), st.sessions.contains_key("no-legs"))
+        };
+        svc.close();
+        pty.stop_and_wait(Duration::from_secs(1));
+        assert!(!registered, "无腿收尾也必须回收注册表");
+        assert!(!retained, "无腿收尾不得遗留持有 PTY 的运行态");
+    }
+
+    /// 最后一腿先离开、写者先退出：不能把空 ENDED 列表当成已收尾。
+    #[test]
+    fn finish_session_after_last_writer_exited_reclaims_runtime() {
+        let svc = svc_with(
+            TermConfig { shell: Some("exec cat".into()), ..TermConfig::default() },
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        svc.create_only("last-writer-first", false).unwrap();
+        let (sess_gen, pty, key) = {
+            let mut st = svc.lock_state();
+            let reg = st.registry.register_leg(
+                "last-writer-first",
+                LegDescriptor {
+                    client_id: "last-leg".into(),
+                    surface: false,
+                    raw_capable: true,
+                    size: Size::DEFAULT,
+                },
+                false,
+                now_ms(),
+                &[],
+            ).unwrap();
+            let rt = st.sessions.get_mut("last-writer-first").unwrap();
+            rt.writers = 1;
+            (rt.gen, Arc::clone(&rt.pty), reg.key)
+        };
+        svc.end_leg("last-writer-first", key, i32::MIN, "", "client_closed");
+        svc.writer_exited("last-writer-first", sess_gen);
+        assert_eq!(svc.lock_state().sessions["last-writer-first"].writers, 0);
+        svc.finish_session("last-writer-first", sess_gen, FinishReason::Killed);
+        let retained = svc.lock_state().sessions.contains_key("last-writer-first");
+        svc.close();
+        pty.stop_and_wait(Duration::from_secs(1));
+        assert!(!retained, "最后写者先退时仍必须回收 PTY 运行态");
+    }
+
+    /// 用 core 锁确定性暂停收尸，不靠 sleep 构造最后写者与重复 finish 的次序。
+    #[test]
+    fn finish_session_last_writer_during_reap_and_duplicate_finish() {
+        let svc = svc_with(
+            TermConfig { shell: Some("exec cat".into()), ..TermConfig::default() },
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        svc.create_only("writer-during-finish", false).unwrap();
+        let (sess_gen, pty, stopped) = {
+            let mut st = svc.lock_state();
+            let rt = st.sessions.get_mut("writer-during-finish").unwrap();
+            rt.writers = 1;
+            (rt.gen, Arc::clone(&rt.pty), Arc::clone(&rt.stopped))
+        };
+        let core = pty.core.lock().unwrap();
+        let finishing = {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || {
+                svc.finish_session("writer-during-finish", sess_gen, FinishReason::Killed);
+            })
+        };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !stopped.load(Ordering::Relaxed) {
+            assert!(Instant::now() < deadline, "收尾应先领取所有权再等待 core 锁");
+            std::thread::yield_now();
+        }
+        svc.writer_exited("writer-during-finish", sess_gen);
+        let retained_during_reap = svc.lock_state().sessions.contains_key("writer-during-finish");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let duplicate = {
+            let svc = Arc::clone(&svc);
+            std::thread::spawn(move || {
+                svc.finish_session("writer-during-finish", sess_gen, FinishReason::ServiceStopped);
+                tx.send(()).unwrap();
+            })
+        };
+        let duplicate_returned = rx.recv_timeout(Duration::from_secs(2)).is_ok();
+        drop(core);
+        finishing.join().unwrap();
+        duplicate.join().unwrap();
+        let retained_after_reap = svc.lock_state().sessions.contains_key("writer-during-finish");
+        svc.close();
+        pty.wait_bounded(Duration::from_secs(1));
+        assert!(duplicate_returned, "重复收尾不得再次等待被占用的 core 锁");
+        assert!(retained_during_reap, "最后写者退出不得提前移除正在收尸的运行态");
+        assert!(!retained_after_reap, "收尸结束须按当前写者数释放运行态");
+    }
+
+    /// ENDED 排干期间保留环；收尸已完成后由最后写者释放运行态。
+    #[test]
+    fn finish_session_last_writer_after_reap_and_stale_generation() {
+        let svc = svc_with(
+            TermConfig { shell: Some("exec cat".into()), ..TermConfig::default() },
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        svc.create_only("writer-after-finish", false).unwrap();
+        let sess_gen = {
+            let mut st = svc.lock_state();
+            let rt = st.sessions.get_mut("writer-after-finish").unwrap();
+            rt.writers = 1;
+            rt.gen
+        };
+        svc.finish_session("writer-after-finish", sess_gen, FinishReason::Killed);
+        {
+            let st = svc.lock_state();
+            assert!(st.registry.session("writer-after-finish").is_none());
+            let rt = &st.sessions["writer-after-finish"];
+            assert_eq!(rt.writers, 1, "尚有写者排干时必须保留历史");
+            assert!(rt.stopped.load(Ordering::Relaxed));
+        }
+        // 同代幂等：不再次收尸，也不提前释放尚有写者的运行态。
+        svc.finish_session("writer-after-finish", sess_gen, FinishReason::ServiceStopped);
+        svc.writer_exited("writer-after-finish", sess_gen);
+        assert!(!svc.lock_state().sessions.contains_key("writer-after-finish"));
+        svc.create_only("writer-after-finish", false).unwrap();
+        let new_gen = svc.lock_state().sessions["writer-after-finish"].gen;
+        assert_ne!(new_gen, sess_gen);
+        // 旧 pump、旧收尾、旧写者均不能触碰同名新代。
+        svc.finalize_exit("writer-after-finish", sess_gen, 0);
+        svc.finish_session("writer-after-finish", sess_gen, FinishReason::Killed);
+        svc.writer_exited("writer-after-finish", sess_gen);
+        {
+            let st = svc.lock_state();
+            assert!(!st.registry.session("writer-after-finish").unwrap().done);
+            assert!(!st.sessions["writer-after-finish"].stopped.load(Ordering::Relaxed));
+        }
+        svc.finish_session("writer-after-finish", new_gen, FinishReason::ServiceStopped);
+        assert!(!svc.lock_state().sessions.contains_key("writer-after-finish"));
+        svc.close();
     }
 
     /// 评审 2026-10-20 P1-1 判据：输入写背压（子进程不读、大粘贴填满 PTY 输入缓冲）
