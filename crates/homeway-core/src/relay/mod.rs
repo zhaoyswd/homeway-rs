@@ -425,6 +425,10 @@ impl Relay {
     fn listen_tcp(want: SocketAddr) -> io::Result<Vec<TcpListener>> {
         let bind = |addr: SocketAddr| -> io::Result<TcpListener> {
             let sock = socket2::Socket::new(socket2::Domain::for_address(addr), socket2::Type::STREAM, None)?;
+            // Unix 重启时允许复用旧连接的 TIME_WAIT；不启用并发 listener 复用。
+            // Windows 的 SO_REUSEADDR 可抢占在用端口，保持该平台既有默认值。
+            #[cfg(unix)]
+            sock.set_reuse_address(true)?;
             if addr.is_ipv6() { sock.set_only_v6(true)?; }
             sock.bind(&addr.into())?;
             sock.listen(128)?;
@@ -2634,6 +2638,8 @@ mod tests {
     fn tcp_listener_respects_explicit_address_and_supports_both_wildcard_families() {
         let explicit = Relay::listen_tcp("127.0.0.1:0".parse().unwrap()).unwrap();
         assert_eq!(explicit[0].local_addr().unwrap().ip(), Ipv4Addr::LOCALHOST);
+        let conflict = Relay::listen_tcp(explicit[0].local_addr().unwrap()).unwrap_err();
+        assert_eq!(conflict.kind(), io::ErrorKind::AddrInUse);
         let Ok(v6) = Relay::listen_tcp("[::1]:0".parse().unwrap()) else { return };
         assert_eq!(v6[0].local_addr().unwrap().ip(), std::net::Ipv6Addr::LOCALHOST);
         std::net::TcpStream::connect(v6[0].local_addr().unwrap()).unwrap();
@@ -2641,6 +2647,32 @@ mod tests {
         let port = dual[0].local_addr().unwrap().port();
         std::net::TcpStream::connect((Ipv4Addr::LOCALHOST, port)).unwrap();
         if dual.len() == 2 { std::net::TcpStream::connect((std::net::Ipv6Addr::LOCALHOST, port)).unwrap(); }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn tcp_listener_rebinds_immediately_after_active_close() {
+        use std::io::Read as _;
+        use std::net::{Shutdown, TcpStream};
+
+        let listeners = Relay::listen_tcp("127.0.0.1:0".parse().unwrap()).unwrap();
+        let addr = listeners[0].local_addr().unwrap();
+        let mut client = TcpStream::connect(addr).unwrap();
+        let (mut server, _) = listeners[0].accept().unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        server.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut byte = [0];
+        // 服务端先发 FIN；对端见到 EOF 后才发 FIN，使服务端持有 TIME_WAIT。
+        server.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(client.read(&mut byte).unwrap(), 0);
+        client.shutdown(Shutdown::Write).unwrap();
+        assert_eq!(server.read(&mut byte).unwrap(), 0);
+        drop(client);
+        drop(server);
+        drop(listeners);
+
+        let rebound = Relay::listen_tcp(addr).expect("TIME_WAIT 不应阻止中继立即重启");
+        assert_eq!(rebound[0].local_addr().unwrap(), addr);
     }
 
     fn register_open(be: &UdpSocket, relay_addr: SocketAddr, priv_: &x25519_dalek::StaticSecret, pub_: &PublicKey, label: &[u8; 8]) {

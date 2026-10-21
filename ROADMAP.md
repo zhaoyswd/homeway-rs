@@ -71,6 +71,13 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-10-21 推送部署与TCP快速重启补丁**：v0.3.14 已完成双出口换装，PTY真实背压
+> 与Linux master fd回收通过；GitHub CI八项、Release五目标均绿。验收发现TCP监听
+> 缺Unix地址复用，旧连接状态使启动落UDP-only；已恢复生产TCP并补v0.3.15最小修复，
+> 技术/代码门见 `docs/reviews/2026-10-21-relay-tcp-restart.md`。待新补丁CI/发版/部署收口。
+> v0.3.14现场、回退件与证据见 `docs/DEPLOY-RUST-EXIT.md` §13.13。
+
+
 > **2026-10-21 Linux PTY CI 修复**：GitHub `39527041058`/基线 `2dd95fd` 仅 Ubuntu
 > `pty_control_ops_survive_input_backpressure` 失败。Linux 实例原代码精确复现0/1，
 > 修复取消写路径后全终端177/0，最终Linux/macOS各1220/0、各37 ignored；两平台

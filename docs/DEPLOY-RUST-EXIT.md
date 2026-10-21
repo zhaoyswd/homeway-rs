@@ -910,3 +910,29 @@ macOS 代码调用（非 mac 死代码挂 clippy/windows，`#[cfg(macos)]` 门�
 kickstart` 需全限定域 `gui/501/<label>`（裸 label 报 target specifier）；③MBP 的 `homeway`
 不在非交互 ssh 的 PATH（`/usr/local/bin` 缺省不进），全路径操作；④SHA256SUMS 登记的是 **tarball**
 sha，解压后二进制 sha 需对照本机解压件比对（MBP 件即此口径 `c19ae5b6…` 与本机一致）。
+
+
+### 13.13 换装 v0.3.14 与快速重启现场（2026-10-21）
+
+用户明确授权「推送+部署」。两台实读旧版均为 v0.3.13；v0.3.14 原先没有 tag/Release，
+本批 PTY 修复随 v0.3.14 一并发布。main/tag = `1fca5e9935b1`，
+[CI 39542506433](https://github.com/zhaoyswd/homeway-rs/actions/runs/39542506433) 八 job 全通过；
+[Release 39543501804](https://github.com/zhaoyswd/homeway-rs/actions/runs/39543501804) 五目标与发布全通过。
+本地 ci-local quick 通过（RRR 317s，既有 WARN 1 / SKIP 1；二者未计为通过）。
+
+| 机器 | 产物与操作 | 现场判据 |
+|---|---|---|
+| Mac | darwin-arm64 tar SHA256 `b2411f84e59236a7eca2b54ba1763675f1cc89068574cb83240ce5e712c458ae`；二进制 SHA256 `8decdc663b638ad0db6b85d9f6f0d5daf9a70ec4cf63dcff767639548ba18a4c`。临时件+原子换名，launchd 重启，12:27:00 pid53578 | v0.3.14，41641未漂移；公网v4/v6已公布；身份/config hash不变。真实PTY背压下独立控制连接KILL应答0.5ms，临时会话出表 |
+| 阿里云 | linux-amd64 tar SHA256 `468283d7aa07b50d364209cf16c42c409d835d574787e2f6eaefffd7692d4f3e`；二进制 SHA256 `f7b71d69d3e8f0d39d068cb40d275f289f08fa613547d8e081f398746a451d49`。scp后比对，SIGTERM退净并确认端口释放，原子换名，12:27:32零参起pid1650833 | v0.3.14，serve41641；身份/relay key/config hash不变。真实PTY背压KILL应答0.7ms，临时会话出表，master fd 0→0 |
+
+**验收发现并处置**：阿里云首轮 TCP41741 `Address in use`，UDP41741可用但控制面降级。
+当时没有 live listener，旧TCP连接状态在端口上仍可阻止不带地址复用的新 bind。
+`Relay::listen_tcp` 此前从std迁到socket2时漏了Unix SO_REUSEADDR；原生Linux私有容器中
+主动关闭已接入连接后，false重绑必报Errno98、true成功。12:29:13再次重启后TCP v4/v6均
+恢复（pid1652831），12:29:33 Mac OK-MAC认证与控制面恢复。为避免未来升级复发，补丁
+v0.3.15恢复Unix地址复用，不启用SO_REUSEPORT；代码/回归见同日relay-tcp-restart评审。
+
+**回退件**（目录0700，state归档0600；不改身份与token）：Mac
+`~/homeway-rollback/v0.3.13-before-v0.3.14-20261021T041307Z/`，阿里云
+`/opt/homeway/backups/v0.3.13-before-v0.3.14-20261021T041309Z/`，各有homeway与state.tgz。
+本次没有安装手机应用或更换其它客户端。
