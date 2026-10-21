@@ -35,10 +35,20 @@
 - Linux 修后用同一 `wire.rs` 源文件与现有 core 的 sysock/frames 编译轻量测试 harness，
   wire全部5通过，含默认SIGPIPE子进程，日志 `sigpipe-after-harness.log`；这是专项，
   不冒称全仓/完整core测试通过。Mac仍为标准cargo wire专项5通过。
-- 私有GNU CLI增量重建与零参unified整体验证进行中；尚未声称1000次立即断开与完整
-  PTY冒烟通过。源码/两道门在此冻结，后续结果由主会话统一登记。
+- 私有GNU CLI增量重建与无子命令unified整体验证完成：1000次立即断开与完整PTY冒烟通过。
+  源码/两道门冻结后，官方产物与生产结果由主会话统一登记在下节。
 
 代码门：通过；默认SIGPIPE回归已前红后绿，现有wire短写/断尾/期限专项无退化。
 
 发布限制：本地/临时 GNU 只作私有诊断，绝不部署；主会话另升 v0.3.18，按 main/tag/
 GitHub Release 下载校验流程发布，并对官方 musl 重跑私有与正式验收。
+
+## 最终收口（主会话）
+
+- v0.3.18 tag/source=e87ab1a3aa5a；CI39633996843双平台workspace各1252通过、0失败、37忽略，
+  core lib各868通过，默认SIGPIPE独立子进程回归在两平台均过；不重复计子进程内同一用例。
+- 临时GNU私有unified1000次断开与完整四轮smoke通过，只作诊断，不曾部署。
+- GitHub Release39634013938五目标与发布全通过。官方Mac/Linux产物私有unified各1000次断开
+  与完整四轮smoke通过，正式各32次立即断开与四轮背压回收也通过；均无进程退出或master残留。
+- 两端最终官方v0.3.18；没有放宽期限、全局忽略信号或以本机cargo产物替代Release。
+  详细二进制/备份/控制面判据见部署手册§13.16。本次CI通过不等于先前PTY wait4波动根因已解决。

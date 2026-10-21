@@ -1026,3 +1026,64 @@ OK-MAC认证恢复，阿里云13:12:25.117后端控制面就绪。换装自v0.3.
 
 证据：`/tmp/pty-finish-{mac,aliyun}-repeat.log`、`/tmp/pty-finish-github-ci.log`、
 `/tmp/pty-finish-final-core-{build,hsp}.log`与本机artifact-hashes/core-artifacts JSON。
+
+### 13.16 终端单版本与SIGPIPE修复：最终v0.3.18（2026-10-21/22）
+
+用户授权两仓全部改动提交推送、debug出包、双出口部署，不安装手机；追加约定「部署」
+必须版本提交→main→tag→GitHub CI/Release→本机下载校验→scp阿里云→滚动换装。
+该规则已写入两仓AGENTS与本手册顶部，后续不再以本地cargo产物替代正式Release。
+
+**发布与回退经过**：功能提交0ef14e5e7227；按新约定发布v0.3.17（ed420d30e751）。
+v0.3.17私有单角色验收通过，但Linux正式unified的surface KILL后两次静默退出。
+先回退两端原官方v0.3.16保可用，未重建身份/config；官方v17私有unified第三次UDS立即
+断开复现-13，确认SIGPIPE。term wire裸write改用已有sysock::send(MSG_NOSIGNAL)，
+不改CLI全局信号策略、帧/期限/短写/断尾；默认信号子进程回归前红后绿。
+GNU临时构建只供私有诊断，从未换入阿里云生产。临时Mac提交构建与v17不是最终交付。
+
+**最终tag/source**：`v0.3.18` = `e87ab1a3aa5ac1c6c9624ed0f0eb00f1f79fe19f`。
+[CI39633996843](https://github.com/zhaoyswd/homeway-rs/actions/runs/39633996843)八门全过，
+Ubuntu/macOS各1252个顶层workspace用例通过、0失败、37 ignored（子进程同例不重复计）；
+core lib各868通过，默认SIGPIPE回归均通过。
+[Release39634013938](https://github.com/zhaoyswd/homeway-rs/actions/runs/39634013938)五目标及发布全过。
+
+| 平台 | 官方归档SHA256 | 官方binary SHA256 |
+|---|---|---|
+| darwin-arm64 | 6b54fa63f60348eb6d8e663436dddac742077c6a4d405809092c1da4c0883072 | 04a347473327df98fc63ae8e87c779d2741cd793e8762c2d2a7b7085e71fd8db |
+| linux-amd64-musl | f727c745f0b982c9846fc0390e4ff73e689d414aa83cc72f74d28c3259bbcf70 | c864bdce5fcc9a193d2d44a4a7f2edd50bfc81a464a4b5006d45beff1b762c08 |
+
+本机下载两归档及SHA256SUMS并核对，Mac核对Mach-O arm64/codesign；Linux件由本机scp到
+独立stage后再核对归档/binary哈希、static-pie x86-64与版本，不依赖阿里云直连GitHub。
+两端官方产物先跑私有unified（隔离HOME且显式/tmp state、独立serve/relay端口），各1000次
+UDS立即断开+surface5/cell2/宽字/100×30 resize/FETCH3/KILL与4轮输入背压全部通过。
+私有进程均finally正常退出0，不遗留测试会话/master。
+
+| 正式在役 | 换装与验收 |
+|---|---|
+| Mac | 00:28:02 launchd零参pid47350，`/opt/homebrew/bin/homeway`；41641不漂移。32次突然断开存活，surface/resize/FETCH与4轮16384B真实背压全部通过，KILL0.17–1.15ms；每轮LIST/master归零。binary与官方件一致 |
+| 阿里云 | 00:28:44左右零参nohup pid1688508，`/usr/local/bin/homeway`、cwd=/opt/homeway、HOME=/root；41641/udp、41741/udp/tcp双栈。32次突然断开存活，surface/resize/FETCH与4轮81920B背压全部通过，KILL0.20–0.83ms；每轮LIST/master归零，binary与官方件一致 |
+
+两端writer均自然BrokenPipe释放，不用客户端主动close或5秒socket超时冒充服务取消；保留3秒
+取消门。Mac00:28:45.146重新OK-MAC认证，阿里云00:28:45.255后端控制面就绪；最终进程已跨
+原SSH会话继续运行，未创建第二套自启动项。无新手机/L3/视觉性能结论。
+
+**身份与凭证**：两端serve/key/config、阿里云relay.key均与换装前哈希一致；阿里云token台账
+哈希不变。Mac换装前130条，之后131条，完整前缀逐字节一致，只追加1条；不能声称整个台账
+哈希未变。初次严格全文件哈希断言因此报红，已核对追加而不是放过身份变化；未手动删/吊销
+旧记录或重建密钥。原始失败轮日志均保留。
+
+**App debug**：tier pin=e87ab1a3aa5a，清洁正常核3,217,272B，e87ab1a3aa5a-rust，
+SHA256 `6a999832efd34e612b28cd304a63fcfce9e0d67521089a2687e3a780a1c083a1`。
+core/terminal HSP与entry HAP均成功、debug=true，包内核与libs/prebuilt一致；交付
+`tier:build/debug-v0.3.18/`（manifest/SHA256SUMS齐），未装手机。现行term1/surface5/cell2，
+旧App/CLI终端需更新，不为其回退协议。ArkTS311/0；三组C++专项证据见tier终端硬化报告。
+
+**新回退件**（目录0700/文件0600，state归档排除cache日志）：
+Mac `~/homeway-rollback/v0.3.16-before-v0.3.18-20261021T162800Z/`；阿里云
+`/opt/homeway/backups/v0.3.16-before-v0.3.18-20261021T162802Z/`。
+保留原稳定v16 binary、state、哈希清单以及v17失败轮证据。回退只换binary并按原监督形态重启，
+非必要不覆盖在用凭证台账。
+
+证据：本机`/tmp/homeway-v0.3.18-{mac-private,mac-production,ci-full,release-watch}.log`、
+`tier:build/releases/v0.3.18/verified.json`；阿里云stage
+`/tmp/homeway-terminal-0ef14e5e7227.9tSHtI/{official18-private-unified,official18-production-smoke}.log`。
+两道门与根因证据在`docs/reviews/2026-10-22-terminal-sigpipe.md`，最终交付清单在tier部署报告。
