@@ -9,8 +9,8 @@
 //!   fixtures/vectors/term_{keyenc,mouseenc}.json）；
 //! - [`frames`]：term 帧协议编解码（op 表/词表面/HELLO 尾随块/INPUT 上行；
 //!   判据 = fixtures/term/frames.v1.jsonl 冻结契约）；
-//! - [`codec`]：surface v4 体编码（cell 三标记流/SNAPSHOT/DIFF/FETCH-ROWS/分片/gzip；
-//!   判据 = fixtures/vectors/surface_codec.json + fixtures/surface-golden/ 夹具）；
+//! - [`codec`]：surface v5 / cell v2 体编码（cell 三标记流/SNAPSHOT/DIFF/FETCH-ROWS/分片/gzip；
+//!   判据 = fixtures/surface-current/codec.json + fixtures/surface-current/ 夹具）；
 //! - [`manifest`]：agent 状态识别规则的数据驱动引擎（region 切片/谓词求值/优先级
 //!   仲裁 + 内嵌 23 文件与本地覆盖；判据 = fixtures/vectors/term_manifest_eval.json）；
 //! - [`scan`]：旁路扫描器（只读不消费字节）——标题单一来源/OSC 9 双语义/OSC 21337
@@ -25,7 +25,7 @@
 //!   纯状态机——PTY/泵/写者接线在 6f）；
 //! - 其余模块（service/leg/surface——会话装配与投递编排）按拆步 6f-3b 陆续就位。
 //!
-//! 行为对齐基线 = baseline 克隆 `pkg/term/`（wire 字节与判据行逐一对齐）。
+//! 终端 wire 仅支持当前版本；冻结 baseline 只作历史资料，不参与旧协议解码。
 
 pub mod agent;
 pub mod codec;
@@ -45,51 +45,34 @@ pub mod wire;
 
 /// 跨模块共享的测试件：golden 夹具读取与 digest 口径（只在测试构建编译）。
 ///
-/// golden 消费口径是**两端契约**（Go golden_test 与客户端 C++ 各自实现同一算法），
-/// 集中一处避免 vt/codec 两份实现漂移。
+/// 当前 golden 摘要集中一处，避免 vt/codec 两份实现漂移。
 #[cfg(test)]
 pub(crate) mod testutil {
     use crate::term::vt::{Cell, Color, Row};
 
-    /// surface 体编码向量（6e 产，Go 真源逐字节）。
+    /// 当前 surface v5 / cell v2 定值向量。
     pub const VECTOR_SURFACE_CODEC: &str =
-        include_str!("../../../../fixtures/vectors/surface_codec.json");
+        include_str!("../../../../fixtures/surface-current/codec.json");
 
     fn fixtures_dir() -> String {
         format!("{}/../../fixtures", env!("CARGO_MANIFEST_DIR"))
     }
 
-    /// 读 `surface-golden/<key>.bin`：`[u32 帧数]{op:1 + [u32 片数]{[u32 len][字节]}}`。
-    /// 返回 `(op, 帧载荷)` 序列（帧载荷 = 分片层 `[flags][gzip]` 原样字节）。
-    pub fn read_golden_bin(key: &str) -> Vec<(u8, Vec<u8>)> {
-        let raw = std::fs::read(format!("{}/surface-golden/{key}.bin", fixtures_dir()))
-            .unwrap_or_else(|e| panic!("golden {key}.bin: {e}"));
-        let u32le = |off: usize| u32::from_le_bytes(raw[off..off + 4].try_into().expect("4B"));
-        let mut out = Vec::new();
-        let mut off = 0usize;
-        let frames = u32le(off) as usize;
-        off += 4;
-        for _ in 0..frames {
-            let op = raw[off];
-            off += 1;
-            let chunks = u32le(off) as usize;
-            off += 4;
-            // 样例里每帧的分片按序拼接 = 一条帧载荷流（分片头在各片首字节）
-            for _ in 0..chunks {
-                let len = u32le(off) as usize;
-                off += 4;
-                out.push((op, raw[off..off + len].to_vec()));
-                off += len;
-            }
-        }
-        assert_eq!(off, raw.len(), "golden {key}: 块尾对齐");
-        out
+    pub fn read_current_frames(key: &str) -> Vec<(u8, Vec<u8>)> {
+        let frames: serde_json::Value = serde_json::from_str(include_str!(
+            "../../../../fixtures/surface-current/frames.json"
+        )).expect("current surface frames");
+        frames[key].as_array().expect("current frame case").iter().map(|frame| {
+            let op = frame["op"].as_u64().expect("frame op") as u8;
+            let payload = hex::decode(frame["hex"].as_str().expect("frame hex")).expect("frame bytes");
+            (op, payload)
+        }).collect()
     }
 
     /// 读 golden manifest（name → 各列）。
     pub fn golden_manifest() -> Vec<Vec<String>> {
         let raw =
-            std::fs::read_to_string(format!("{}/surface-golden/manifest.tsv", fixtures_dir()))
+            std::fs::read_to_string(format!("{}/surface-current/manifest.tsv", fixtures_dir()))
                 .expect("golden manifest");
         raw.lines()
             .filter(|l| !l.is_empty())
@@ -97,12 +80,12 @@ pub(crate) mod testutil {
             .collect()
     }
 
-    /// 读上行字节表 `surface-golden/surface_input_cases.tsv`（19 案）：
+    /// 读上行字节表 `surface-current/input.tsv`（theme/clipboard 四案）：
     /// `name <TAB> kind <TAB> fields(逗号分隔) <TAB> hex`。
     #[allow(clippy::type_complexity)]
     pub fn read_input_cases() -> Vec<(String, String, Vec<String>, String)> {
         let raw = std::fs::read_to_string(format!(
-            "{}/surface-golden/surface_input_cases.tsv",
+            "{}/surface-current/input.tsv",
             fixtures_dir()
         ))
         .expect("surface_input_cases.tsv");
@@ -161,8 +144,8 @@ pub(crate) mod testutil {
             .join("\n")
     }
 
-    /// Go goldenStyleText 口径：逐行逐格 26 个 hex（fg 5B · bg 5B · attr 2B · flags 1B）。
-    /// 缺格按空白格（Width=1）；flags = skip(bit0) | width<<1。
+    /// 当前样式摘要口径：逐行逐格 26 个 hex（fg 5B · bg 5B · attr 2B · flags 1B）。
+    /// 缺格按空白格（Width=1），显式记录真实 0/1/2 宽度。
     pub fn style_of(rows: &[Row], cols: usize) -> String {
         fn color_hex(c: Color) -> [u8; 5] {
             match c {

@@ -1,8 +1,8 @@
 # fixtures — golden 夹具与对照向量清单（R0.4）
 
-> **来源纪律**：一切 golden 拷自 baseline 克隆（基线 `d4148f6`，见 `docs/BASELINE.md`；
-> **基线已冻结不再前移**）。将来若重拷/重跑 `tools/gen-vectors.sh`，diff 非空即语义漂移，
-> 必须复核 Rust 侧与判据文档。
+> **来源纪律**：历史 golden 拷自 baseline 克隆（基线 `d4148f6`，见 `docs/BASELINE.md`；
+> **基线已冻结不再前移**）。当前协议另建独立定值夹具，不能靠解码旧 wire 再升级来保持测试。
+> 重拷/重生成导致 diff 非空时，必须复核 Rust 侧与判据文档。
 
 ## vectors/（生成物，确定性——重跑 diff 应为空）
 
@@ -34,7 +34,7 @@ daemon 控制面帧向量 + `decode_check.py`（**语言无关**的解码对拍�
 
 ## 机器校验
 
-`SHA256SUMS` **覆盖本目录全部文件（59 项，含本清单 `MANIFEST.md`；`SHA256SUMS` 自身除外）**；
+`SHA256SUMS` **覆盖本目录全部文件（含本清单 `MANIFEST.md`；`SHA256SUMS` 自身除外）**；
 `shasum -c SHA256SUMS`（在 `fixtures/` 下执行）应全 OK——重拷/重生成后必须重跑并重写
 （R5 本地 CI 第 4 步挂门）。生成口径 = 遍历 `fixtures/` 下全部文件、排除 `SHA256SUMS` 自身，
 行格式 `<sha256>  ./<相对 fixtures 的路径>`（与 `shasum -c` 兼容）。
@@ -50,7 +50,7 @@ daemon 控制面帧向量 + `decode_check.py`（**语言无关**的解码对拍�
 
 | 本仓路径 | 来源（baseline 克隆内） | 用途（R6） | sha256 |
 |---|---|---|---|
-| `term/frames.v1.jsonl` | `pkg/term/testdata/frames.v1.jsonl` | term 协议帧解析 golden（13 案：greeting/hello/…） | `558cc64a0fdc23dde0f8b7c01a306e904e3631e96d8e4cb7691cd1bc947ba662` |
+| `term/frames.v1.jsonl` | 历史帧案例；2026-10-21 HELLO 更新为当前必需完整尾 | term 协议帧解析 golden（13 案：greeting/hello/…；不再接受无版本/无ID HELLO） | `be9e9f0190a3c77e63822c365f4a2d752a884b43bf98549b5e5eca4ade23b6ea` |
 | `term-vt/session-cjk.bin` | `pkg/term/vt/testdata/session-cjk.bin` | vt 会话回放（CJK） | `5a60ceb2cfaafc566efd595f2835aa772159503364c692e3e179bb9a7e3d6ff8` |
 | `term-vt/session-git-log.bin` | `pkg/term/vt/testdata/session-git-log.bin` | vt 会话回放（git log） | `688c69bafbbfb4eba14f46da4ef8c22fbc93f77318e95b4ce5449723c32a59b3` |
 | `term-vt/session-hexdump.bin` | `pkg/term/vt/testdata/session-hexdump.bin` | vt 会话回放（hexdump） | `c60ffb2e49a6cd09ca565e0de14817ad963801975fb9ca603c51b640fb12d07e` |
@@ -86,3 +86,28 @@ libghostty-vt 自身的快照格式测试数据，Rust 侧走 alacritty_terminal
 `relay-admission.json`：独立 Python stdlib HMAC-SHA256 编码的定值参照，覆盖
 `CLADM`（45B，sid/cookie/域分隔MAC）及 `UDP_SESSION`（43B，会话字段/MAC）。
 不改冻结的 `rl1`/旧中继消息向量；真实客户端准入提升和UDP控制降级另由生产组件E2E验证。
+
+## 终端 surface v5 扩展（2026-10-21）
+
+`vectors/surface_v5.json`：固定十六进制向量，覆盖 SNAPSHOT、DIFF 与 FETCH 请求；
+公共头明确携带逐帧 seq、historyEpoch 与 historyBase，cell v2 明确携带软换行和 0/1/2 列宽。
+样例以 seq 17→18、epoch 4、base 100、2 列中日韩宽字符与尾格验证跨端字节口径。
+冻结的 `surface_codec.json`、`surface-golden/` 和 baseline 均不改，作为历史归档，不再由
+当前终端 codec/VT 测试解码。新 v5 向量钉住身份、序号、wraps 与真实宽度。
+
+## 当前单版本终端定值夹具（2026-10-21）
+
+`surface-current/` 是独立当前夹具，不由 `tools/gen-vectors.sh` 的冻结 Go 基线生成，
+当前生产/CI 中不保留旧 v4→v5 或 cell1→cell2 适配器：
+
+| 文件 | 当前用途与来源 |
+|---|---|
+| `surface-current/codec.json` | 保留有价值的 cell/RLE/颜色/属性/体字段/分片案例语义，字节固定为 v5/cell2；负例直接针对当前头/尺寸/预算/游程构造，不转换旧字节 |
+| `surface-current/frames.json` | 四段 ANSI 会话（CJK/git-log/hexdump/styles）由当前 VT 与编码器一次性采集，固定快照及快照+差分的 gzip/分片字节；当前测试直接消费 |
+| `surface-current/manifest.tsv` | 上述八种当前最终画面的文本/样式/真实宽度/光标/回滚/模式摘要；宽头保留2，非skip样式空白保持1，不再迁就旧摘要 |
+| `surface-current/input.tsv` | 当前 THEME/CLIPBOARD 四项定值；未消费的旧 HELLO/caps-only 行不进入当前测试 |
+
+上述夹具在采集后固定入库并计入 SHA256SUMS；编码变化需显式审核/更新，不能让测试边读
+旧 wire 边转换。标准 ANSI/DEC/kitty 的 VT 行为测试、键鼠编码、真实 ANSI 回放继续保留，
+它们是终端标准语义，不是旧 App/出口兼容。跨端独立 v5 向量仍由 Rust 与 tier 共同消费。
+当前cell2严格要求 `skip iff width==0`，非skip仅1或2；组合字符在VT内并入基格，不另造零宽格。

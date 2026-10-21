@@ -102,11 +102,7 @@ fn term_dial(auth_hex: &str, sock: &str) -> Result<UnixStream, TermOpError> {
         // endpoint）。先重连 VPN（② 的标准恢复动作）。
         TermOpError::new(
             code::TERM_UNREACHABLE,
-            format!(
-                "终端服务没有应答：可能是该出口未启用终端（官方版/旧版 tailcat），\
-                 也可能是本机隧道的回程地址已失效（出口日志会看到 no candidates available for endpoint）。\
-                 先重连一次 VPN；若仍不行，请把出口升级到增强版 tailcat。详情：{e}"
-            ),
+            format!("终端服务没有应答，请确认出口终端服务已启用并检查隧道连接。详情：{e}"),
         )
     })?;
     if frame.op != Op::GREETING {
@@ -123,7 +119,9 @@ fn term_dial(auth_hex: &str, sock: &str) -> Result<UnixStream, TermOpError> {
         ));
     }
     match frames::dec_greeting(&frame.payload) {
-        Ok((ver, _)) if ver == PROTO_VER => Ok(conn),
+        Ok((ver, features)) if ver == PROTO_VER
+            && features & (frames::features::LIST | frames::features::PROTO_VER)
+                == frames::features::LIST | frames::features::PROTO_VER => Ok(conn),
         _ => Err(TermOpError::new(
             code::TERM_VERSION,
             format!("出口终端服务协议版本不匹配（本端 {PROTO_VER}）"),
@@ -298,7 +296,7 @@ mod tests {
             let (mut c, _) = ln.accept().unwrap();
             let mut buf = [0u8; BRIDGE_AUTH_LEN];
             c.read_exact(&mut buf).unwrap();
-            c.write_all(&frames::encode_frame(Op::GREETING, &[PROTO_VER, 0x01, 0x00, 0x00, 0x00]))
+            c.write_all(&frames::encode_frame(Op::GREETING, &frames::enc_greeting()))
                 .unwrap();
             let f = frames::read_frame(&mut c).unwrap();
             assert_eq!(f.op, Op::LIST);
@@ -309,6 +307,24 @@ mod tests {
         let v: Value = serde_json::from_str(&out).unwrap();
         assert_eq!(v["ok"], true);
         assert_eq!(v["sessions"][0]["name"], "s1");
+    }
+
+    #[test]
+    fn old_or_incomplete_greeting_is_rejected() {
+        for payload in [vec![PROTO_VER, 1, 0, 0, 0], vec![PROTO_VER, 0x41, 0, 0, 0, 0], vec![2, 0x41, 0, 0, 0]] {
+            let (listener, path) = tmp_sock("version");
+            let auth = auth_hex_valid();
+            let path_str = path.to_str().unwrap().to_owned();
+            let server = std::thread::spawn(move || {
+                let (mut stream, _) = listener.accept().unwrap();
+                let mut auth = [0u8; BRIDGE_AUTH_LEN];
+                stream.read_exact(&mut auth).unwrap();
+                stream.write_all(&frames::encode_frame(Op::GREETING, &payload)).unwrap();
+            });
+            let error = term_dial(&auth, &path_str).unwrap_err();
+            assert_eq!(error.code, code::TERM_VERSION);
+            server.join().unwrap();
+        }
     }
 
     /// 错误信封：bad_json / 未知操作 / kill 缺 name / 空 sock（bridge_down）。

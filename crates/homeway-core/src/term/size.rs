@@ -13,7 +13,7 @@
 
 /// 网格尺寸（宽 × 高，单位 = 字符格）。
 ///
-/// 不变量：`1 ≤ cols ≤ MAX_COLS`、`1 ≤ rows ≤ MAX_ROWS`。字段私有——构造器是唯一入口。
+/// 不变量：列/行分别在上限内，且乘积 ≤ MAX_VIEWPORT_CELLS。字段私有——构造器是唯一入口。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct Size {
     cols: u16,
@@ -23,14 +23,12 @@ pub struct Size {
 impl Size {
     /// 列上限。
     ///
-    /// 依据（F1a 上限论证）：两屏即时分配 `2 × 1000 × 500 × 24B ≈ 24 MiB`；
-    /// 客户端余量——手机 surface 网格 ≈100×40（≥10×）、桌面 CLI 可读字号下
-    /// 8K 全屏 ≈850-960 列 × 250-270 行在限内。只有不可读的极小字号（≤6 px）
-    /// 才越过限值，这类形态会被夹取且**无 env 逃逸口**（安全边界不由环境放大，
-    /// 残余登记见 `docs/reviews/QD.md`）。
+    /// 列/行分量保留 F1a 上限；总格数另受 MAX_VIEWPORT_CELLS 约束，
+    /// 保证含长字素的一个可见窗口仍能进入客户端 32MiB 材质预算。
     pub const MAX_COLS: u16 = 1000;
-    /// 行上限（同上）。
+    /// 行分量上限。
     pub const MAX_ROWS: u16 = 500;
+    pub const MAX_VIEWPORT_CELLS: usize = 128 * 1024;
     /// 缺省几何（Go `spawnLocked` 的 80×24）。
     pub const DEFAULT: Size = Size { cols: 80, rows: 24 };
 
@@ -44,10 +42,15 @@ impl Size {
 
     /// HELLO/建会话面归一：`0 → 缺省`、超限 → 夹取（幂等）。
     pub fn normalized(cols: u16, rows: u16) -> Size {
-        Size {
-            cols: if cols == 0 { Self::DEFAULT.cols } else { cols.min(Self::MAX_COLS) },
-            rows: if rows == 0 { Self::DEFAULT.rows } else { rows.min(Self::MAX_ROWS) },
-        }
+        let cols = if cols == 0 { Self::DEFAULT.cols } else { cols.min(Self::MAX_COLS) };
+        let rows = if rows == 0 { Self::DEFAULT.rows } else { rows.min(Self::MAX_ROWS) };
+        Size { cols, rows: (rows as usize).min(Self::MAX_VIEWPORT_CELLS / cols as usize) as u16 }
+    }
+
+    pub fn exceeds_cell_budget(cols: u16, rows: u16) -> bool {
+        let cols = if cols == 0 { Self::DEFAULT.cols } else { cols.min(Self::MAX_COLS) };
+        let rows = if rows == 0 { Self::DEFAULT.rows } else { rows.min(Self::MAX_ROWS) };
+        cols as usize * rows as usize > Self::MAX_VIEWPORT_CELLS
     }
 
     /// RESIZE 上报面归一：`0 → None`（忽略本次上报——对齐 Go 在 0 门后写会话尺寸）；
@@ -86,13 +89,13 @@ mod tests {
         assert_eq!(Size::normalized(120, 40), Size { cols: 120, rows: 40 }, "常见值原样");
         assert_eq!(
             Size::normalized(Size::MAX_COLS, Size::MAX_ROWS),
-            Size { cols: 1000, rows: 500 },
-            "等于上限原样"
+            Size { cols: 1000, rows: 131 },
+            "分量上限仍受总格数预算约束"
         );
-        assert_eq!(Size::normalized(1001, 501), Size { cols: 1000, rows: 500 }, "越界夹到上限");
+        assert_eq!(Size::normalized(1001, 501), Size { cols: 1000, rows: 131 }, "越界夹到上限");
         assert_eq!(
             Size::normalized(u16::MAX, u16::MAX),
-            Size { cols: 1000, rows: 500 },
+            Size { cols: 1000, rows: 131 },
             "u16::MAX 夹到上限（绝不发起巨型分配）"
         );
         // 幂等
@@ -109,7 +112,7 @@ mod tests {
         assert_eq!(Size::from_report(80, 24), Some(Size::DEFAULT));
         assert_eq!(
             Size::from_report(u16::MAX, u16::MAX),
-            Some(Size { cols: 1000, rows: 500 }),
+            Some(Size { cols: 1000, rows: 131 }),
             "极端值夹取而非忽略"
         );
     }
@@ -118,7 +121,9 @@ mod tests {
     #[test]
     fn exact_gate() {
         assert!(Size::is_exact(80, 24));
-        assert!(Size::is_exact(1000, 500));
+        assert!(Size::is_exact(1000, 131));
+        assert!(!Size::is_exact(1000, 132));
+        assert!(Size::exceeds_cell_budget(1000, 500));
         assert!(!Size::is_exact(0, 24), "0 会被替换成缺省 ⇒ 非恰归一");
         assert!(!Size::is_exact(1001, 24));
         assert!(!Size::is_exact(80, 501));

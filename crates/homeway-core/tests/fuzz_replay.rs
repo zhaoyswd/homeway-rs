@@ -521,13 +521,21 @@ fn term_seeds() -> Vec<Vec<u8>> {
             v.push(b);
         }
     }
-    for name in ["session-cjk.bin", "session-styles.bin"] {
-        if let Ok(b) = std::fs::read(format!("{base}/surface-golden/{name}")) {
-            v.push(b);
+    let current: serde_json::Value = serde_json::from_str(include_str!("../../../fixtures/surface-current/frames.json"))
+        .expect("current surface frames");
+    for frames in current.as_object().expect("frame cases").values() {
+        for frame in frames.as_array().expect("case frames") {
+            let payload = hex::decode(frame["hex"].as_str().expect("fragment hex")).expect("current fragment bytes");
+            v.push(frames::encode_frame(frames::Op(frame["op"].as_u64().expect("fragment op") as u8), &payload));
+            let fragment = homeway_core::term::codec::dec_fragment(&payload).expect("current fragment");
+            if fragment.0 == 0 {
+                let body = homeway_core::term::codec::gunzip_bytes(fragment.1).expect("current gzip");
+                v.push(body);
+            }
         }
     }
     // 帧骨架（真形：HELLO 尾随块 / ATTACHED / STATE / ENDED / RESIZE / INPUT）
-    let tail = frames::enc_hello_tail(frames::caps::SURFACE | frames::caps::RAW_TERMINAL, true, "fuzz-1");
+    let tail = frames::enc_hello_tail(frames::caps::SURFACE | frames::caps::KEY_ALT_ESC_PREFIX, "fuzz-1");
     v.push(frames::encode_frame(frames::Op::HELLO, &frames::enc_hello(80, 24, 3, "s", &tail)));
     v.push(frames::encode_frame(frames::Op::ATTACHED, &frames::enc_attached(100, 32, 0x41, 1, 2, "s")));
     v.push(frames::encode_frame(frames::Op::STATE, &frames::enc_state(1, 2, "标题")));
@@ -605,7 +613,7 @@ fn fuzz_term_vt() {
                 text: "",
                 composing: g(5) & 1 != 0,
             },
-            keyenc::KeyFlavor::host_default(),
+            if cfg!(target_os = "macos") { keyenc::KeyFlavor::AltNoEscPrefix } else { keyenc::KeyFlavor::AltEscPrefix },
         );
         let _ = vt.encode_mouse(&keyenc::MouseEvent {
             action: keyenc::MouseAction::from_wire(g(6) % 3).unwrap_or_default(),
@@ -619,7 +627,7 @@ fn fuzz_term_vt() {
 
 // ---------- ⑭ term surface 体编解码（fuzz_term_codec） ----------
 
-/// ⑭ surface v4 体（fuzz_term_codec）：不 panic + decode→再 encode 字节相等
+/// ⑭ 当前 surface v5/cell2 体（fuzz_term_codec）：不 panic + decode→再 encode 字节相等
 /// （harness 预检 ≠ 库守卫；库守卫 = F10 的 `guard_dims`/`MAX_GUNZIP_OUT`，由单测钉住）。
 #[test]
 #[ignore = "fuzz 全量档"]
@@ -651,7 +659,7 @@ fn fuzz_term_codec() {
                             .collect();
                         vt::Cell {
                             symbol: if sym.is_empty() { "x".to_string() } else { sym },
-                            width: 1,
+                            width: u8::from((x + y) % 5 != 0),
                             skip: (x + y) % 5 == 0,
                             fg: vt::Color::Palette((x % 256) as u8),
                             bg: vt::Color::None,

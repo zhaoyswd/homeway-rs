@@ -13,9 +13,8 @@
 //!
 //! **平台口径（Q-J F1）**：ghostty 的四处编译期 darwin 门（alt 前缀/super 抑制文本/
 //! mok2 alt 位/kitty 关联文本）改为由 [`KeyFlavor`] 承载——出口侧按**客户端 HELLO
-//! 声明**选口径（`caps::KEY_ALT_ESC_PREFIX`/`KEY_ALT_NO_ESC_PREFIX`），未声明/歧义
-//! ⇒ [`KeyFlavor::host_default`] 宿主推断（唯一 `cfg!(target_os)` 残留点 = 缺省兼容
-//! 推断，取代 D-10 的「按出口编译宿主恒选」）。**向量由 darwin 宿主产出**——parity
+//! 声明**选口径（`caps::KEY_ALT_ESC_PREFIX`/`KEY_ALT_NO_ESC_PREFIX`），不按出口宿主推断。
+//! **向量由 darwin 宿主产出**——parity
 //! 对拍显式用 `AltNoEscPrefix`（全平台可跑）；非 darwin 口径无夹具，真源 = vendored
 //! ghostty 源码行级 + 本文件 `non_darwin_flavor_expectations` 期望表（显式登记）。
 //!
@@ -141,8 +140,7 @@ impl KeyOptions {
 /// - [`KeyFlavor::AltEscPrefix`]：等价 libghostty **非 darwin 编译分支**——alt 产 ESC
 ///   前缀、mok2 保留 alt 位、kitty 关联文本被 alt 抑制、super 不抑制文本。
 ///
-/// 由客户端 HELLO caps 声明（`frames::caps::KEY_ALT_*`）；未声明/歧义 =
-/// [`KeyFlavor::host_default`]（缺省兼容既有部署）。
+/// 由客户端当前HELLO caps明确声明（`frames::caps::KEY_ALT_*`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum KeyFlavor {
     AltEscPrefix,
@@ -150,16 +148,6 @@ pub enum KeyFlavor {
 }
 
 impl KeyFlavor {
-    /// 宿主推断（**唯一** `cfg!(target_os)` 残留点）：darwin ⇒ `AltNoEscPrefix`，
-    /// 其余 ⇒ `AltEscPrefix`（与今日 `IS_DARWIN` 逐字节同值——缺省兼容）。
-    pub const fn host_default() -> KeyFlavor {
-        if cfg!(target_os = "macos") {
-            KeyFlavor::AltNoEscPrefix
-        } else {
-            KeyFlavor::AltEscPrefix
-        }
-    }
-
     /// 本口径下 alt 是否不产 ESC 前缀（darwin 分支语义）。
     pub const fn alt_no_esc_prefix(self) -> bool {
         matches!(self, KeyFlavor::AltNoEscPrefix)
@@ -1471,7 +1459,7 @@ mod tests {
     /// DECBKM 翻转（backspace 的 sequence_decbkm）。
     #[test]
     fn backarrow_mode_flips_backspace() {
-        let hd = KeyFlavor::host_default();
+        let hd = KeyFlavor::AltEscPrefix;
         let off = KeyOptions::DEFAULT;
         let on = KeyOptions { backarrow_key_mode: true, ..KeyOptions::DEFAULT };
         let ev = KeyEvent { key: Key(53), action: KeyAction::Press, mods: Mods::NONE, text: "\x7f", composing: false };
@@ -1486,7 +1474,7 @@ mod tests {
     /// keypad 恒数值模式。
     #[test]
     fn keypad_1035_gates_application_mode() {
-        let hd = KeyFlavor::host_default();
+        let hd = KeyFlavor::AltEscPrefix;
         let deckpam = KeyOptions { keypad_key_application: true, ..KeyOptions::DEFAULT };
         let deckpam_1035_off = KeyOptions {
             keypad_key_application: true,
@@ -1507,7 +1495,7 @@ mod tests {
     /// kitty 的 `:1` 规则：字母终止符族 press 带 `:1`、u/~ 族不带（实测形态）。
     #[test]
     fn kitty_press_event_colon_one_rules() {
-        let hd = KeyFlavor::host_default();
+        let hd = KeyFlavor::AltEscPrefix;
         let opts = KeyOptions { kitty_flags: KF_DISAMBIGUATE | KF_REPORT_EVENTS, ..KeyOptions::DEFAULT };
         let arrow = KeyEvent { key: Key(76), action: KeyAction::Press, mods: Mods::NONE, text: "", composing: false };
         assert_eq!(encode_key(&arrow, &opts, hd), b"\x1b[1;1:1D");
@@ -1569,16 +1557,11 @@ mod tests {
         assert_eq!(encode_key(&ks, &kitty_assoc, other), b"\x1b[57399;9u");
     }
 
-    /// F1：`host_default()` 为缺省口径——与今日 `IS_DARWIN` 逐字节同值（编译期二分）。
+    /// 两种明确平台声明不依赖出口编译宿主。
     #[test]
-    fn host_default_matches_legacy_is_darwin() {
-        let expect = if cfg!(target_os = "macos") {
-            KeyFlavor::AltNoEscPrefix
-        } else {
-            KeyFlavor::AltEscPrefix
-        };
-        assert_eq!(KeyFlavor::host_default(), expect);
-        assert_eq!(KeyFlavor::host_default().alt_no_esc_prefix(), cfg!(target_os = "macos"));
+    fn explicit_key_platform_flavors() {
+        assert!(!KeyFlavor::AltEscPrefix.alt_no_esc_prefix());
+        assert!(KeyFlavor::AltNoEscPrefix.alt_no_esc_prefix());
     }
 
     /// 焦点/粘贴编码面。

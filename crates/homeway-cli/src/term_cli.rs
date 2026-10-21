@@ -19,11 +19,12 @@
 //! 与 Go 的形态差异（登记 B0-2b.md）：Go 侧 dialControlSpawn 的「按需拉起统一进程」
 //! （role-management 4.1）不在本实现——守护不在跑 = 可行动错误（先起统一进程）。
 
+use std::collections::VecDeque;
 use std::io::Write as IoWrite;
 use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicI32, Ordering};
-use std::sync::{mpsc, Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use homeway_core::daemon::client::{ClientErr, ClientStream, ControlClient};
@@ -246,6 +247,20 @@ enum TermWriteHalf {
     Remote { client: Arc<ControlClient>, st: Arc<ClientStream> },
 }
 
+enum TermCloseHandle {
+    Local(UnixStream),
+    Remote(Arc<ControlClient>),
+}
+
+impl TermCloseHandle {
+    fn close(&self) {
+        match self {
+            Self::Local(stream) => { let _ = stream.shutdown(std::net::Shutdown::Both); }
+            Self::Remote(client) => client.close(),
+        }
+    }
+}
+
 impl TermConn {
     /// 终结哨兵（写侧 stream_send 的 StreamEnded 折入读侧同款归因）。
     fn ended_err(reason: String) -> TermReadErr {
@@ -331,6 +346,13 @@ impl TermReadHalf {
 }
 
 impl TermWriteHalf {
+    fn close_handle(&self) -> Result<TermCloseHandle, String> {
+        match self {
+            Self::Local(io) => io.try_clone_stream().map(TermCloseHandle::Local).map_err(|error| error.to_string()),
+            Self::Remote { client, .. } => Ok(TermCloseHandle::Remote(Arc::clone(client))),
+        }
+    }
+
     fn write_frame(&mut self, op: Op, payload: &[u8]) -> Result<(), TermReadErr> {
         match self {
             TermWriteHalf::Local(io) => io
@@ -347,16 +369,133 @@ impl TermWriteHalf {
         }
     }
 
-    /// 关连接（幂等；远程 = Client.Close 逃生口）。
-    fn close(&self) {
-        match self {
-            TermWriteHalf::Local(io) => {
-                if let Ok(clone) = io.try_clone_stream() {
-                    let _ = clone.shutdown(std::net::Shutdown::Both);
-                }
-            }
-            TermWriteHalf::Remote { client, .. } => client.close(),
+}
+
+const ATTACH_QUEUE_BYTES: usize = 1 << 20;
+const ATTACH_QUEUE_ITEMS: usize = 256;
+const OUTPUT_FRAME_BUDGET: usize = 32;
+const OUTPUT_BYTE_BUDGET: usize = 64 << 10;
+const OUTPUT_WRITE_SLICE: usize = 16 << 10;
+
+#[derive(Default)]
+struct AttachQueueState {
+    frames: VecDeque<frames::Frame>,
+    bytes: usize,
+    closed: bool,
+    finished: bool,
+}
+
+struct AttachQueue {
+    state: Mutex<AttachQueueState>,
+    space: Condvar,
+}
+
+impl AttachQueue {
+    fn new() -> Self {
+        Self { state: Mutex::new(AttachQueueState::default()), space: Condvar::new() }
+    }
+
+    fn fits(state: &AttachQueueState, frame: &frames::Frame) -> bool {
+        state.frames.len() < ATTACH_QUEUE_ITEMS && state.bytes + frame.payload.len() <= ATTACH_QUEUE_BYTES
+    }
+
+    fn push(&self, frame: frames::Frame) -> bool {
+        if frame.payload.len() > ATTACH_QUEUE_BYTES { return false; }
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        while !state.closed && !Self::fits(&state, &frame) {
+            state = self.space.wait(state).unwrap_or_else(|error| error.into_inner());
         }
+        if state.closed { return false; }
+        state.bytes += frame.payload.len();
+        state.frames.push_back(frame);
+        self.space.notify_all();
+        true
+    }
+
+    fn try_push(&self, frame: frames::Frame) -> bool {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        if state.closed || !Self::fits(&state, &frame) { return false; }
+        state.bytes += frame.payload.len();
+        state.frames.push_back(frame);
+        self.space.notify_all();
+        true
+    }
+
+    fn pop(&self) -> Option<frames::Frame> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        let frame = state.frames.pop_front()?;
+        state.bytes -= frame.payload.len();
+        self.space.notify_all();
+        Some(frame)
+    }
+
+    fn wait_pop(&self) -> Option<frames::Frame> {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        while state.frames.is_empty() && !state.closed {
+            state = self.space.wait(state).unwrap_or_else(|error| error.into_inner());
+        }
+        if state.closed { return None; }
+        let frame = state.frames.pop_front()?;
+        state.bytes -= frame.payload.len();
+        self.space.notify_all();
+        Some(frame)
+    }
+
+    fn ready(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        !state.frames.is_empty() || state.finished
+    }
+
+    fn finished_and_empty(&self) -> bool {
+        let state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.finished && state.frames.is_empty()
+    }
+
+    fn finish(&self) {
+        self.state.lock().unwrap_or_else(|error| error.into_inner()).finished = true;
+        self.space.notify_all();
+    }
+
+    fn close(&self) {
+        let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+        state.closed = true;
+        state.frames.clear();
+        state.bytes = 0;
+        self.space.notify_all();
+    }
+}
+
+struct NonblockingFd {
+    fd: i32,
+    flags: i32,
+}
+
+impl NonblockingFd {
+    fn new(fd: i32) -> std::io::Result<Self> {
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        Ok(Self { fd, flags })
+    }
+}
+
+impl Drop for NonblockingFd {
+    fn drop(&mut self) {
+        unsafe { libc::fcntl(self.fd, libc::F_SETFL, self.flags); }
+    }
+}
+
+fn write_output_slice(fd: i32, bytes: &[u8]) -> std::io::Result<usize> {
+    let count = bytes.len().min(OUTPUT_WRITE_SLICE);
+    if count == 0 { return Ok(0); }
+    let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), count) };
+    if written > 0 { return Ok(written as usize); }
+    if written == 0 { return Err(std::io::ErrorKind::WriteZero.into()); }
+    let error = std::io::Error::last_os_error();
+    match error.kind() {
+        std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock => Ok(0),
+        _ => Err(error),
     }
 }
 
@@ -386,7 +525,6 @@ impl DialErr {
 }
 
 /// 拨号并读 GREETING（list/new/delete/attach/explain 共用的唯一拨号缝）。
-/// 返回出口声明的 features 位（attach 的版本声明位由它决定，FIX-29）。
 fn dial_term(t: &mut TermTarget) -> Result<(TermConn, u32), DialErr> {
     let conn = if t.remote() {
         let id = match &t.host_id {
@@ -482,6 +620,14 @@ fn read_greeting(mut conn: TermConn, budget: Duration) -> Result<(TermConn, u32)
         return Err(DialErr::Proto(format!(
             "出口终端服务协议版本 {ver} 与本端 {} 不符：出口与客户端需同批升级",
             frames::PROTO_VER
+        )));
+    }
+    let required = frames::features::REPLAY | frames::features::MODES | frames::features::PROTO_VER;
+    if feats & required != required {
+        conn.close();
+        return Err(DialErr::Proto(format!(
+            "出口终端服务能力 0x{feats:08x} 缺少本端必需位 0x{:08x}：仅支持当前完整协议",
+            required & !feats
         )));
     }
     Ok((conn, feats))
@@ -1041,7 +1187,6 @@ fn pick_recent_session(t: &mut TermTarget) -> Result<String, String> {
     Ok(best.name.clone())
 }
 
-/// 经拨号缝接入 → GREETING → HELLO（caps=raw + 实例标识尾随 + 可选版本字节）→ ATTACHED。
 /// `reconnect = true` = 首连成功后的重拨：**降级为纯 attach 语义**（清 CREATE /
 /// ONLY_IF_ABSENT——`new` 的创建位只在首连发，重发会撞 already_exists 把创建型会话
 /// 的自愈打死；r1 评审 3.1）。
@@ -1052,7 +1197,7 @@ fn attach_dial(
     name: &str,
     reconnect: bool,
 ) -> Result<(TermConn, Vec<u8>), DialErr> {
-    let (mut conn, feats) = dial_term(t)?;
+    let (mut conn, _) = dial_term(t)?;
     let (cols, rows) = tty.size();
     let mut flags = 0u8;
     if o.create && !reconnect {
@@ -1064,16 +1209,12 @@ fn attach_dial(
     if o.takeover {
         flags |= hello_flags::TAKEOVER;
     }
-    let mut cap_bits = caps::RAW_TERMINAL;
-    if feats & frames::features::PROTO_VER != 0 {
-        cap_bits |= caps::PROTO_VER;
-    }
     let hello = frames::enc_hello(
         cols,
         rows,
         flags,
         name,
-        &frames::enc_hello_tail(cap_bits, true, &client_id()),
+        &frames::enc_hello_tail(cli_capabilities(), &client_id()),
     );
     conn.write_frame(Op::HELLO, &hello)
         .map_err(|e| {
@@ -1102,6 +1243,15 @@ fn attach_dial(
         )));
     }
     Ok((conn, f.payload))
+}
+
+fn cli_capabilities() -> u8 {
+    let key_platform = if cfg!(target_os = "macos") {
+        caps::KEY_ALT_NO_ESC_PREFIX
+    } else {
+        caps::KEY_ALT_ESC_PREFIX
+    };
+    caps::RAW_TERMINAL | caps::PROTO_VER | key_platform
 }
 
 // ---------------------------------------------------------------------------
@@ -1147,6 +1297,12 @@ impl Tty {
         } else {
             (ws.ws_col, ws.ws_row)
         }
+    }
+}
+
+impl Drop for Tty {
+    fn drop(&mut self) {
+        let _ = self.restore();
     }
 }
 
@@ -1458,8 +1614,11 @@ impl DetachMachine {
 // ---------------------------------------------------------------------------
 
 static SIG_W: AtomicI32 = AtomicI32::new(-1);
+static SIG_EXIT_PENDING: AtomicBool = AtomicBool::new(false);
+static SIG_RESIZE_PENDING: AtomicBool = AtomicBool::new(false);
 
 extern "C" fn on_sigwinch(_sig: i32) {
+    SIG_RESIZE_PENDING.store(true, Ordering::SeqCst);
     let fd = SIG_W.load(Ordering::SeqCst);
     if fd >= 0 {
         let b = b"w";
@@ -1468,6 +1627,7 @@ extern "C" fn on_sigwinch(_sig: i32) {
 }
 
 extern "C" fn on_sig_exit(_sig: i32) {
+    SIG_EXIT_PENDING.store(true, Ordering::SeqCst);
     let fd = SIG_W.load(Ordering::SeqCst);
     if fd >= 0 {
         let b = b"x";
@@ -1500,6 +1660,14 @@ fn install_signal_pipes() -> Result<SigPipe, String> {
         Err(e) => return Err(format!("信号管道建立失败（{e}）")),
     };
     let fds = [r, w];
+    let flags = unsafe { libc::fcntl(w, libc::F_GETFL) };
+    if flags < 0 || unsafe { libc::fcntl(w, libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+        let error = std::io::Error::last_os_error();
+        unsafe { libc::close(r); libc::close(w); }
+        return Err(format!("信号管道非阻塞设置失败：{error}"));
+    }
+    SIG_EXIT_PENDING.store(false, Ordering::SeqCst);
+    SIG_RESIZE_PENDING.store(false, Ordering::SeqCst);
     SIG_W.store(fds[1], Ordering::SeqCst);
     unsafe {
         let h_winch = on_sigwinch as extern "C" fn(i32) as libc::sighandler_t;
@@ -1680,6 +1848,7 @@ struct AttachEnv {
     dm: DetachMachine,
     old_title: String,
     title_on: bool,
+    output_mode: NonblockingFd,
 }
 
 impl AttachEnv {
@@ -1700,6 +1869,14 @@ impl AttachEnv {
             conn.close();
             return Err(format!("切换 raw 模式失败：{e}"));
         }
+        let output_mode = match NonblockingFd::new(1) {
+            Ok(mode) => mode,
+            Err(error) => {
+                conn.close();
+                let _ = tty.restore();
+                return Err(format!("切换终端输出为非阻塞模式失败：{error}"));
+            }
+        };
         // 信号管道先装（查询窗之前——SIGTERM 落在窗内不能被 poll 吞掉）。
         let pipes = match install_signal_pipes() {
             Ok(p) => p,
@@ -1732,9 +1909,15 @@ impl AttachEnv {
             }
         };
         let poke = [poke_r, poke_w];
-        unsafe {
-            let fl = libc::fcntl(poke[1], libc::F_GETFL);
-            libc::fcntl(poke[1], libc::F_SETFL, fl | libc::O_NONBLOCK);
+        let flags = unsafe { libc::fcntl(poke[1], libc::F_GETFL) };
+        if flags < 0 || unsafe { libc::fcntl(poke[1], libc::F_SETFL, flags | libc::O_NONBLOCK) } < 0 {
+            let error = std::io::Error::last_os_error();
+            unsafe { libc::close(poke[0]); libc::close(poke[1]); }
+            drop_signal_pipes(pipes);
+            reset_local_terminal();
+            conn.close();
+            let _ = tty.restore();
+            return Err(format!("终端唤醒管道非阻塞设置失败：{error}"));
         }
         Ok((
             AttachEnv {
@@ -1744,6 +1927,7 @@ impl AttachEnv {
                 poke,
                 old_title,
                 title_on,
+                output_mode,
             },
             leftover,
         ))
@@ -1755,7 +1939,7 @@ impl AttachEnv {
     /// shell；应答已在队列时 poll 立即命中零延迟，空队列付满 50ms 有界不可感知）** →
     /// 还原终端 → 打文案/上抛错误。
     fn finish(self, note: Result<Option<String>, String>) -> Result<(), String> {
-        let AttachEnv { tty, pipes, poke, old_title, title_on, .. } = self;
+        let AttachEnv { tty, pipes, poke, old_title, title_on, output_mode, .. } = self;
         drop_signal_pipes(pipes);
         unsafe {
             libc::close(poke[0]);
@@ -1770,16 +1954,18 @@ impl AttachEnv {
         reset_local_terminal();
         drain_terminal_input(0, DRAIN_ON_EXIT_MS);
         if let Err(rerr) = tty.restore() {
-            eprintln!("\rhomeway term: 终端还原失败（{rerr}）；画面混乱时执行 reset 修复\r");
+            let _ = writeln!(std::io::stderr(), "\rhomeway term: 终端还原失败（{rerr}）；画面混乱时执行 reset 修复\r");
         }
-        match note {
+        let result = match note {
             Ok(Some(n)) => {
-                eprintln!("\rhomeway term: {n}\r");
+                let _ = writeln!(std::io::stderr(), "\rhomeway term: {n}\r");
                 Ok(())
             }
             Ok(None) => Ok(()),
             Err(e) => Err(e),
-        }
+        };
+        drop(output_mode);
+        result
     }
 }
 
@@ -1863,6 +2049,9 @@ fn wait_during_backoff(env: &mut AttachEnv, ms: i32, name: &str) -> WaitEvent {
     // 手抖几键就能把重拨节奏从封顶档拉到 0。
     let deadline = Instant::now() + Duration::from_millis(ms.max(0) as u64);
     loop {
+        if SIG_EXIT_PENDING.swap(false, Ordering::SeqCst) {
+            return WaitEvent::Quit(Some("收到信号退出（会话仍在运行）".to_owned()));
+        }
         let left = deadline
             .saturating_duration_since(Instant::now())
             .as_millis()
@@ -1891,12 +2080,24 @@ fn wait_during_backoff(env: &mut AttachEnv, ms: i32, name: &str) -> WaitEvent {
                 }
                 // 'w'（SIGWINCH）：等待期无需记忆——重拨 HELLO 自带当前 tty.size()
             }
+            if SIG_EXIT_PENDING.swap(false, Ordering::SeqCst) {
+                return WaitEvent::Quit(Some("收到信号退出（会话仍在运行）".to_owned()));
+            }
+        }
+        if pfds.iter().any(|descriptor| descriptor.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0) {
+            return WaitEvent::Quit(None);
         }
         if pfds[0].revents & libc::POLLIN != 0 {
             let mut buf = [0u8; 512];
             let m = unsafe { libc::read(0, buf.as_mut_ptr().cast(), buf.len()) };
             if m == 0 {
                 return WaitEvent::Quit(None); // stdin 关闭：干净收尾
+            }
+            if m < 0 {
+                if matches!(std::io::Error::last_os_error().kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock) {
+                    continue;
+                }
+                return WaitEvent::Quit(None);
             }
             let chunk = &buf[..m as usize];
             if chunk.contains(&0x03) {
@@ -1936,15 +2137,20 @@ fn attach_run_once(
         Ok(v) => v,
         Err(e) => return AttachOutcome::Fail(e),
     };
-    let write_half = Mutex::new(write_half);
+    let close_handle = match write_half.close_handle() {
+        Ok(handle) => Arc::new(handle),
+        Err(error) => return AttachOutcome::Fail(format!("创建终端连接取消句柄失败：{error}")),
+    };
     struct ReaderShared {
         stop: AtomicBool,
         fail: Mutex<Option<TermReadErr>>,
     }
     let shared = Arc::new(ReaderShared { stop: AtomicBool::new(false), fail: Mutex::new(None) });
-    let (data_tx, data_rx) = mpsc::channel::<frames::Frame>();
+    let incoming = Arc::new(AttachQueue::new());
+    let write_half_queue = Arc::new(AttachQueue::new());
     let reader = {
         let shared = Arc::clone(&shared);
+        let incoming = Arc::clone(&incoming);
         let poke_w = env.poke[1];
         std::thread::Builder::new()
             .name("hw-term-read".to_owned())
@@ -1956,26 +2162,67 @@ fn attach_run_once(
                     }
                     match rh.read_frame() {
                         Ok(f) => {
-                            if data_tx.send(f).is_err() {
+                            if !incoming.push(f) {
                                 return;
                             }
                             poke(poke_w); // 非阻塞唤醒主循环
                         }
                         Err(e) => {
-                            *shared.fail.lock().unwrap() = Some(e);
+                            shared.fail.lock().unwrap().get_or_insert(e);
+                            incoming.finish();
                             poke(poke_w);
                             return;
                         }
                     }
                 }
             })
-            .expect("线程创建不可失败")
+            .inspect_err(|_| {
+                close_handle.close();
+            })
+    };
+    let reader = match reader {
+        Ok(reader) => reader,
+        Err(error) => return AttachOutcome::Fail(format!("创建终端读取线程失败：{error}")),
+    };
+    let writer = {
+        let shared = Arc::clone(&shared);
+        let incoming = Arc::clone(&incoming);
+        let outgoing = Arc::clone(&write_half_queue);
+        let close_handle = Arc::clone(&close_handle);
+        let poke_w = env.poke[1];
+        std::thread::Builder::new().name("hw-term-write".to_owned()).spawn(move || {
+            let mut write_half = write_half;
+            while let Some(frame) = outgoing.wait_pop() {
+                if let Err(error) = write_half.write_frame(frame.op, &frame.payload) {
+                    shared.fail.lock().unwrap().get_or_insert(error);
+                    shared.stop.store(true, Ordering::SeqCst);
+                    incoming.finish();
+                    poke(poke_w);
+                    close_handle.close();
+                    return;
+                }
+            }
+        })
+    };
+    let writer = match writer {
+        Ok(writer) => writer,
+        Err(error) => {
+            shared.stop.store(true, Ordering::SeqCst);
+            incoming.close();
+            write_half_queue.close();
+            close_handle.close();
+            let _ = reader.join();
+            return AttachOutcome::Fail(format!("创建终端写入线程失败：{error}"));
+        }
     };
     // 连接收尾（幂等；任何退出路径必经）：停读腿 → 关连接 → join。
     let teardown = || {
         shared.stop.store(true, Ordering::SeqCst);
-        write_half.lock().unwrap().close(); // 连接级断开解阻塞读腿
+        incoming.close();
+        write_half_queue.close();
+        close_handle.close();
         let _ = reader.join();
+        let _ = writer.join();
     };
     // 读/写失败按矩阵归因（本地面折终局文案、远程面 LinkLost 进重连）。
     let classify = |e: &TermReadErr| match link_failure_classify(remote, LinkEvent::LinkIo) {
@@ -1984,21 +2231,21 @@ fn attach_run_once(
     };
     // RESIZE 上报（返回值检查：写失败按链路失败归因——r1 评审 3.4）。
     let do_resize = |env: &AttachEnv| -> Result<(), TermReadErr> {
-        let mut wh = write_half.lock().unwrap();
         let (cols, rows) = env.tty.size();
-        wh.write_frame(Op::RESIZE, &frames::enc_resize(cols, rows))
+        queue_input(&write_half_queue, Op::RESIZE, frames::enc_resize(cols, rows))
     };
 
+    let mut output = Vec::new();
     if env.title_on {
         let (agent, state) = attached_agent_state(&attached);
-        set_title(&title_line(name, agent, state, ""));
+        output = format!("\x1b]2;{}\x07", title_line(name, agent, state, "")).into_bytes();
     }
 
     // 输入路径状态机 + 查询窗抢敲字节回投（首键不丢；仅首连接段）。
     if !leftover.is_empty() {
         let (pass, action) = env.dm.feed(&leftover);
         if !pass.is_empty() {
-            if let Err(e) = send_data(&write_half, &pass) {
+            if let Err(e) = send_data(&write_half_queue, &pass) {
                 let oc = classify(&e);
                 teardown();
                 return oc;
@@ -2022,13 +2269,20 @@ fn attach_run_once(
 
     // 主循环：poll([stdin, 信号管道, 数据管道]) —— 输入/输出/尺寸三源低延迟。
     let mut in_buf = [0u8; 8192];
+    let mut output_offset = 0usize;
     loop {
+        if SIG_EXIT_PENDING.swap(false, Ordering::SeqCst) {
+            teardown();
+            return AttachOutcome::Done(Some("收到信号退出（会话仍在运行）".to_owned()));
+        }
         let mut pfds = [
             libc::pollfd { fd: 0, events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: env.pipes.read_fd, events: libc::POLLIN, revents: 0 },
             libc::pollfd { fd: env.poke[0], events: libc::POLLIN, revents: 0 },
+            libc::pollfd { fd: 1, events: if output.is_empty() { 0 } else { libc::POLLOUT }, revents: 0 },
         ];
-        let n = unsafe { libc::poll(pfds.as_mut_ptr(), 3, -1) };
+        let timeout = if output.is_empty() && incoming.ready() { 0 } else { -1 };
+        let n = unsafe { libc::poll(pfds.as_mut_ptr(), pfds.len() as _, timeout) };
         if n < 0 {
             let e = std::io::Error::last_os_error();
             if e.kind() == std::io::ErrorKind::Interrupted {
@@ -2043,26 +2297,41 @@ fn attach_run_once(
         // ① term 帧（DATA → stdout；STATE → 标题；ENDED → 文案退出；ERROR → 协议错误）。
         if pfds[2].revents & libc::POLLIN != 0 {
             drain_poke(env.poke[0]);
-            loop {
-                match data_rx.try_recv() {
-                    Ok(f) => {
-                        let mut out = std::io::stdout();
+        }
+        let mut frame_count = 0usize;
+        let mut byte_count = 0usize;
+        while frame_count < OUTPUT_FRAME_BUDGET && byte_count < OUTPUT_BYTE_BUDGET {
+            if !output.is_empty() {
+                match write_output_slice(1, &output[output_offset..]) {
+                    Ok(0) => break,
+                    Ok(written) => {
+                        output_offset += written;
+                        byte_count += written;
+                        if output_offset < output.len() { continue; }
+                        output.clear();
+                        output_offset = 0;
+                    }
+                    Err(_) => {
+                        teardown();
+                        return match link_failure_classify(remote, LinkEvent::StdoutWriteFail) {
+                            LinkDecision::Finish => AttachOutcome::Fail("写本地终端失败".to_owned()),
+                            LinkDecision::Retry => AttachOutcome::LinkLost(TermReadErr::Io("写本地终端失败".to_owned())),
+                        };
+                    }
+                }
+            }
+            match incoming.pop() {
+                    Some(f) => {
+                        frame_count += 1;
                         match f.op {
                             Op::DATA => {
-                                if out.write_all(&f.payload).is_err() || out.flush().is_err() {
-                                    teardown();
-                                    return match link_failure_classify(remote, LinkEvent::StdoutWriteFail) {
-                                        LinkDecision::Finish => AttachOutcome::Fail("写本地终端失败".to_owned()),
-                                        // StdoutWriteFail 恒终局——Retry 分支不可达，走矩阵保真值表回归力
-                                        LinkDecision::Retry => AttachOutcome::LinkLost(TermReadErr::Io("写本地终端失败".to_owned())),
-                                    };
-                                }
+                                output = f.payload;
                             }
                             Op::ATTACHED | Op::REPLAY_DONE => {} // 回放/重复握手帧：不做事
                             Op::STATE => {
                                 if env.title_on {
                                     let (agent, state, title) = frames::dec_state(&f.payload);
-                                    set_title(&title_line(name, agent, state, &title));
+                                    output = format!("\x1b]2;{}\x07", title_line(name, agent, state, &title)).into_bytes();
                                 }
                             }
                             Op::ENDED => {
@@ -2080,12 +2349,12 @@ fn attach_run_once(
                             other => {
                                 // 防御：raw 腿只该收 DATA/STATE/ENDED/ERROR（surface 区段
                                 // 帧绝不发给 raw 腿）。
-                                eprintln!("\rhomeway term: 忽略未知帧 op 0x{:02x}（{}B）\r", other.0, f.payload.len());
+                                output = format!("\r\nhomeway term: 忽略未知帧 op 0x{:02x}（{}B）\r\n", other.0, f.payload.len()).into_bytes();
                             }
                         }
                     }
-                    Err(mpsc::TryRecvError::Empty) => break,
-                    Err(mpsc::TryRecvError::Disconnected) => {
+                    None if !incoming.finished_and_empty() => break,
+                    None => {
                         // 读腿终结：链路级归因（远程面重连/本地面终局文案）。
                         let e = shared
                             .fail
@@ -2097,15 +2366,18 @@ fn attach_run_once(
                         teardown();
                         return oc;
                     }
-                }
             }
+        }
+        if pfds[1..].iter().any(|descriptor| descriptor.revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0) {
+            teardown();
+            return AttachOutcome::Fail("本地终端或事件通道已关闭".to_owned());
         }
         // ② 信号（SIGWINCH → RESIZE；退出族 → 干净退出）。
         if pfds[1].revents & libc::POLLIN != 0 {
             let mut b = [0u8; 8];
             let m = unsafe { libc::read(env.pipes.read_fd, b.as_mut_ptr().cast(), 8) };
-            let mut exit_sig = false;
-            let mut resize = false;
+            let mut exit_sig = SIG_EXIT_PENDING.swap(false, Ordering::SeqCst);
+            let mut resize = SIG_RESIZE_PENDING.swap(false, Ordering::SeqCst);
             for &c in &b[..m.max(0) as usize] {
                 if c == b'x' {
                     exit_sig = true;
@@ -2131,7 +2403,7 @@ fn attach_run_once(
             if n > 0 {
                 let (pass, action) = env.dm.feed(&in_buf[..n as usize]);
                 if !pass.is_empty() {
-                    if let Err(e) = send_data(&write_half, &pass) {
+                    if let Err(e) = send_data(&write_half_queue, &pass) {
                         let oc = classify(&e);
                         teardown();
                         return oc;
@@ -2158,7 +2430,14 @@ fn attach_run_once(
                     LinkDecision::Finish => AttachOutcome::Done(None),
                     LinkDecision::Retry => AttachOutcome::LinkLost(TermReadErr::Io("stdin 已关闭".to_owned())),
                 };
+            } else if !matches!(std::io::Error::last_os_error().kind(), std::io::ErrorKind::Interrupted | std::io::ErrorKind::WouldBlock) {
+                teardown();
+                return AttachOutcome::Fail("读取本地终端失败".to_owned());
             }
+        }
+        if pfds[0].revents & (libc::POLLHUP | libc::POLLERR | libc::POLLNVAL) != 0 {
+            teardown();
+            return AttachOutcome::Done(None);
         }
     }
 }
@@ -2183,10 +2462,17 @@ fn drain_poke(fd: i32) {
 
 /// 终端输入按 ≤16KiB 分片发 DATA（与 App 侧契约一致；远程腿经 stream_send 逐帧查
 /// 流终结——死流在首个失败帧返回，余量不推进）。
-fn send_data(wh: &Mutex<TermWriteHalf>, p: &[u8]) -> Result<(), TermReadErr> {
-    let mut wh = wh.lock().unwrap();
+fn queue_input(queue: &AttachQueue, op: Op, payload: Vec<u8>) -> Result<(), TermReadErr> {
+    if queue.try_push(frames::Frame { op, payload }) {
+        Ok(())
+    } else {
+        Err(TermReadErr::Io("终端输入队列已满或已关闭，输入未完整发送".to_owned()))
+    }
+}
+
+fn send_data(queue: &AttachQueue, p: &[u8]) -> Result<(), TermReadErr> {
     for chunk in p.chunks(frames::DATA_CHUNK) {
-        wh.write_frame(Op::DATA, chunk)?;
+        queue_input(queue, Op::DATA, chunk.to_vec())?;
     }
     Ok(())
 }
@@ -2404,6 +2690,250 @@ fn explain_session(session: &str, t: &mut TermTarget, json_out: bool) -> Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn greeting_requires_current_protocol_and_raw_features() {
+        let required = frames::features::REPLAY | frames::features::MODES | frames::features::PROTO_VER;
+        let check_greeting = |version: u8, features: u32, valid: bool| {
+            let (reader, mut writer) = UnixStream::pair().unwrap();
+            writer.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+            let mut payload = vec![version];
+            payload.extend_from_slice(&features.to_le_bytes());
+            writer.write_all(&frames::encode_frame(Op::GREETING, &payload)).unwrap();
+            let result = read_greeting(TermConn::Local(FrameIo::new(reader)), Duration::from_secs(1));
+            match result {
+                Ok((mut connection, accepted)) => {
+                    assert!(valid, "不应接受version={version} features=0x{features:x}");
+                    assert_eq!(accepted, features);
+                    connection.close();
+                }
+                Err(error) => {
+                    assert!(!valid, "应接受当前raw能力：{}", error.text());
+                    assert!(matches!(error, DialErr::Proto(_)));
+                    let mut byte = [0];
+                    assert_eq!(std::io::Read::read(&mut writer, &mut byte).unwrap(), 0);
+                }
+            }
+        };
+        check_greeting(frames::PROTO_VER, frames::features::ALL, true);
+        check_greeting(frames::PROTO_VER, required, true);
+        check_greeting(frames::PROTO_VER, required | (1 << 31), true);
+        for missing in [frames::features::REPLAY, frames::features::MODES, frames::features::PROTO_VER] {
+            check_greeting(frames::PROTO_VER, frames::features::ALL & !missing, false);
+        }
+        check_greeting(frames::PROTO_VER.wrapping_add(1), frames::features::ALL, false);
+    }
+
+    #[test]
+    fn raw_hello_always_declares_version_platform_and_client_id() {
+        let capabilities = cli_capabilities();
+        assert_ne!(capabilities & caps::RAW_TERMINAL, 0);
+        assert_eq!(capabilities & caps::SURFACE, 0);
+        assert_ne!(capabilities & caps::PROTO_VER, 0);
+        let key_platform = capabilities & (caps::KEY_ALT_NO_ESC_PREFIX | caps::KEY_ALT_ESC_PREFIX);
+        assert_eq!(key_platform, if cfg!(target_os = "macos") {
+            caps::KEY_ALT_NO_ESC_PREFIX
+        } else {
+            caps::KEY_ALT_ESC_PREFIX
+        });
+        let identifier = client_id();
+        assert!(!identifier.is_empty());
+        let tail = frames::enc_hello_tail(capabilities, &identifier);
+        assert_eq!(&tail[..3], &[1, capabilities, frames::PROTO_VER]);
+        assert_eq!(tail[3] as usize, identifier.len());
+        assert_eq!(&tail[4..], identifier.as_bytes());
+        let decoded = frames::dec_hello_tail(&tail).unwrap();
+        assert_eq!(decoded.caps, capabilities);
+        assert_eq!(decoded.ver, frames::PROTO_VER);
+        assert_eq!(decoded.client_id, identifier);
+    }
+
+    #[test]
+    fn output_queue_byte_bound_and_cancel_wakes_reader() {
+        let queue = Arc::new(AttachQueue::new());
+        for _ in 0..16 {
+            assert!(queue.try_push(frames::Frame { op: Op::DATA, payload: vec![0; 65535] }));
+        }
+        assert!(!queue.try_push(frames::Frame { op: Op::DATA, payload: vec![0; 65535] }));
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let writer_queue = Arc::clone(&queue);
+        let producer = std::thread::spawn(move || {
+            done_tx.send(writer_queue.push(frames::Frame { op: Op::DATA, payload: vec![1; 65535] })).unwrap();
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(50)).is_err());
+        queue.close();
+        assert!(!done_rx.recv_timeout(Duration::from_secs(1)).unwrap());
+        producer.join().unwrap();
+        assert_eq!(queue.state.lock().unwrap().bytes, 0);
+    }
+
+    #[test]
+    fn output_queue_zero_payload_bound_and_order() {
+        let queue = AttachQueue::new();
+        for index in 0..ATTACH_QUEUE_ITEMS {
+            assert!(queue.try_push(frames::Frame { op: Op(index as u8), payload: Vec::new() }));
+        }
+        assert!(!queue.try_push(frames::Frame { op: Op::STATE, payload: Vec::new() }));
+        for index in 0..ATTACH_QUEUE_ITEMS {
+            assert_eq!(queue.pop().unwrap().op, Op(index as u8));
+        }
+        queue.finish();
+        assert!(queue.ready());
+        assert!(queue.pop().is_none());
+    }
+
+    #[test]
+    fn nonblocking_output_preserves_partial_tail_and_restores_flags() {
+        use std::os::fd::AsRawFd;
+        let (sender, mut receiver) = UnixStream::pair().unwrap();
+        let fd = sender.as_raw_fd();
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        let mode = NonblockingFd::new(fd).unwrap();
+        let data = vec![b'x'; OUTPUT_WRITE_SLICE];
+        let start = Instant::now();
+        loop {
+            if write_output_slice(fd, &data).unwrap() == 0 { break; }
+            assert!(start.elapsed() < Duration::from_secs(1));
+        }
+        assert_eq!(write_output_slice(fd, &data).unwrap(), 0);
+        receiver.set_nonblocking(true).unwrap();
+        let mut received = vec![0; 1 << 20];
+        let count = std::io::Read::read(&mut receiver, &mut received).unwrap();
+        assert!(count > 0);
+        assert!(write_output_slice(fd, &data).unwrap() > 0);
+        drop(mode);
+        assert_eq!(unsafe { libc::fcntl(fd, libc::F_GETFL) } & libc::O_NONBLOCK, flags & libc::O_NONBLOCK);
+    }
+
+    #[test]
+    fn attach_pressure_child() {
+        use std::os::fd::AsRawFd;
+        let Ok(socket) = std::env::var("HOMEWAY_TERM_PRESSURE_TEST_SOCKET") else { return };
+        let stream = UnixStream::connect(socket).unwrap();
+        let send_buffer: libc::c_int = 4096;
+        assert_eq!(unsafe { libc::setsockopt(stream.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF,
+            (&send_buffer as *const libc::c_int).cast(), std::mem::size_of_val(&send_buffer) as _) }, 0);
+        let conn = TermConn::Local(FrameIo::new(stream));
+        let tty = Tty::open().unwrap();
+        let opts = AttachOpts {
+            name: "pressure".to_owned(),
+            state_dir: PathBuf::new(),
+            host_ref: String::new(),
+            timeout: Duration::from_secs(1),
+            timeout_given: false,
+            no_spawn: true,
+            create: false,
+            takeover: false,
+            reuse: false,
+            auto_named: false,
+            detach_key: "^b".to_owned(),
+        };
+        let mut target = TermTarget {
+            state_dir: PathBuf::new(), host_ref: String::new(), host_id: None,
+            timeout: Duration::from_secs(1), no_spawn: true,
+        };
+        let result = attach_session(&mut target, conn, Vec::new(), tty, "pressure", &opts);
+        if let Err(error) = result {
+            let _ = writeln!(std::io::stderr(), "背压接入失败：{error}");
+            std::process::exit(1);
+        }
+        std::process::exit(0);
+    }
+
+    fn pressure_child_exits(signal: bool) {
+        use std::os::fd::FromRawFd;
+        use std::process::{Command, Stdio};
+        let suffix = if signal { "signal" } else { "detach" };
+        let socket = std::env::temp_dir().join(format!("hw-term-pressure-{}-{suffix}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&socket);
+        let listener = std::os::unix::net::UnixListener::bind(&socket).unwrap();
+        let error_path = socket.with_extension("stderr");
+        let terminal = ProbePty::new();
+        let slave = unsafe { std::fs::File::from_raw_fd(libc::dup(terminal.slave)) };
+        let mut child = Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "term_cli::tests::attach_pressure_child", "--nocapture"])
+            .env("HOMEWAY_TERM_PRESSURE_TEST_SOCKET", &socket)
+            .env("HOMEWAY_TERM_TITLE", "off")
+            .stdin(Stdio::from(slave.try_clone().unwrap()))
+            .stdout(Stdio::from(slave))
+            .stderr(Stdio::from(std::fs::File::create(&error_path).unwrap()))
+            .spawn().unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let connect_deadline = Instant::now() + Duration::from_secs(3);
+        let stream = loop {
+            match listener.accept() {
+                Ok((stream, _)) => break stream,
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                    assert!(child.try_wait().unwrap().is_none(), "背压子进程在连接前退出");
+                    if Instant::now() >= connect_deadline {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("背压子进程未连接测试 socket");
+                    }
+                    std::thread::sleep(Duration::from_millis(10));
+                }
+                Err(error) => panic!("测试 socket 接入失败：{error}"),
+            }
+        };
+        let closer = stream.try_clone().unwrap();
+        let stop = Arc::new(AtomicBool::new(false));
+        let feeder_stop = Arc::clone(&stop);
+        let feeder = std::thread::spawn(move || {
+            let mut io = FrameIo::new(stream);
+            let bytes = vec![b'x'; 16384];
+            while !feeder_stop.load(Ordering::SeqCst) {
+                if io.write_frame(Op::DATA, &bytes, Duration::from_millis(100)).is_err() { break; }
+            }
+        });
+        std::thread::sleep(Duration::from_millis(250));
+        assert!(child.try_wait().unwrap().is_none());
+        let input_mode = NonblockingFd::new(terminal.master).unwrap();
+        if signal {
+            let input = vec![b'a'; 8192];
+            let deadline = Instant::now() + Duration::from_secs(2);
+            let mut sent = 0usize;
+            while sent < 32 << 10 && Instant::now() < deadline {
+                sent += write_output_slice(terminal.master, &input).unwrap();
+                std::thread::yield_now();
+            }
+            assert!(sent >= 32 << 10);
+            assert!(child.try_wait().unwrap().is_none());
+            unsafe { libc::kill(child.id() as _, libc::SIGTERM); }
+        } else {
+            let deadline = Instant::now() + Duration::from_secs(1);
+            while write_output_slice(terminal.master, b"\x02d").unwrap() == 0 {
+                assert!(Instant::now() < deadline);
+            }
+        }
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let status = loop {
+            if let Some(status) = child.try_wait().unwrap() { break status; }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!("输出或上行背压时退出未在两秒内完成（{suffix}）");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        stop.store(true, Ordering::SeqCst);
+        let _ = closer.shutdown(std::net::Shutdown::Both);
+        feeder.join().unwrap();
+        drop(input_mode);
+        let errors = std::fs::read_to_string(&error_path).unwrap_or_default();
+        assert!(status.success(), "背压子进程退出失败：{status}；{errors}");
+        let _ = std::fs::remove_file(socket);
+        let _ = std::fs::remove_file(error_path);
+    }
+
+    #[test]
+    fn attach_detach_survives_full_output() {
+        pressure_child_exits(false);
+    }
+
+    #[test]
+    fn attach_signal_cancels_output_and_upstream_backpressure() {
+        pressure_child_exits(true);
+    }
 
     /// 本地面 socket 解析三态：统一根回退 serve 子目录 / 扁平优先 / 都不在 ⇒ 扁平路径
     /// （错误文案口径不变）。2026-10-13 用户实测缺口（`homeway term list` 零参拨不通）。

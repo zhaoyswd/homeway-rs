@@ -492,7 +492,7 @@ cp -a ~/.config/homeway-rs/serve /tmp/rollback-probe/     # ⇒ /tmp/rollback-pr
 
 | 形态 | stdout | stderr |
 |---|---|---|
-| **守护/统一进程在跑**（控制面可达：Mac 生产态、阿里云统一进程） | **裸 token 一行**（**无** `serve token：` 前缀） | `（已连 control.sock：serverVersion=… generation=… seq=…）` + `（端点：…；来源=ledger）` |
+| **守护/统一进程在跑**（控制面可达：Mac 生产态、阿里云统一进程） | **裸 token 一行**（**无** `serve token：` 前缀） | `（端点：…；来源=ledger）`（2026-10-21 前另有一行 `（已连 control.sock：serverVersion=…）` 拨号诊断，已去掉） |
 | 守护不在跑（回落台账直读） | `serve token：<token>` + 来源 + 端点（三行中文） | — |
 
 ⇒ 设计里的 `sed -n 's/^serve token：//p'` 在**运行态取空串**；配合设计的 `case "$TOK" in hmw2*)`

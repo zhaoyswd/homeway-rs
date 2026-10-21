@@ -1,5 +1,5 @@
 #![no_main]
-//! fuzz_term_codec — surface v4 体解码族 + 往返字节相等（Q-D F11 深挖轨）。
+//! fuzz_term_codec — 当前 surface v5/cell2 体解码族 + 往返字节相等（Q-D F11 深挖轨）。
 //!
 //! harness 预检（评审 6.2）：**按目标分别从输入派生维度**再限 `cols×rows ≤ 2e5` 才调用
 //! 解码——`decode_grid` 读头 1+2+2；`decode_rows` 的 cols/count 由前 4B 派生；
@@ -7,11 +7,10 @@
 //! **预检 ≠ 库守卫**：库侧守卫（F10 的 `guard_dims` + `MAX_GUNZIP_OUT`）由
 //! `codec.rs` 单测钉住；这里只是让 fuzz 迭代在合理内存/时间预算内跑。
 //!
-//! oracle：① 不 panic；② **decode → 再 encode 字节相等**（decode 派生 `width`/`wraps`，
-//! 结构体相等会假红——评审 6.5）。
+//! oracle：① 不 panic；② **decode → 再 encode 字节相等**，覆盖显式 `width`/`wraps`。
 //! `-max_len=8192`（与 files 目标的 262160 不同）：term 面最大合法形态 = 小网格 + 帧载荷，
 //! 无需 70KB 跨 u16 样本；深挖档命令见 `tools/ci-local.sh` 注释。
-//! 种子：`fixtures/surface-golden/*.bin` + `fixtures/vectors/surface_codec.json`。
+//! 种子：`fixtures/surface-current/frames.json` 与 `fixtures/surface-current/codec.json`。
 //! 回归轨：`crates/homeway-core/tests/fuzz_replay.rs::fuzz_term_codec`。
 
 use homeway_core::term::codec;
@@ -42,7 +41,7 @@ fn synth_rows(data: &[u8], cols: usize, rows: usize) -> Vec<vt::Row> {
             };
             cells.push(vt::Cell {
                 symbol: if sym.is_empty() { "x".to_string() } else { sym },
-                width: 1,
+                width: u8::from((x + y) % 5 != 0),
                 skip: (x + y) % 5 == 0,
                 fg,
                 bg,

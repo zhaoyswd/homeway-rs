@@ -77,28 +77,17 @@ impl TermError {
 /// 腿的呈现分类（LIST clients 的 kind 词面；caps 推导，service.go `legKindOf`）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LegKind {
-    /// surface 腿（新 App）。
+    /// surface 腿（App）。
     App,
     /// 声明 capsRawTerminal 的 raw 腿（CLI）。
     Host,
-    /// 未声明的 raw 腿（旧 App）。
-    Legacy,
 }
 
 impl LegKind {
-    pub const fn of(surface: bool, raw_capable: bool) -> LegKind {
-        match (surface, raw_capable) {
-            (true, _) => LegKind::App,
-            (false, true) => LegKind::Host,
-            (false, false) => LegKind::Legacy,
-        }
-    }
-
     pub const fn as_str(self) -> &'static str {
         match self {
             LegKind::App => "app",
             LegKind::Host => "host",
-            LegKind::Legacy => "legacy",
         }
     }
 }
@@ -110,10 +99,9 @@ pub struct LegKey(pub u64);
 /// 接入一刻的腿描述（HELLO/尾随块解析出的字段）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LegDescriptor {
-    /// 实例标识（HELLO 尾随 ID 块；空 = 旧客户端）。
+    /// 实例标识（当前HELLO要求非空）。
     pub client_id: String,
-    pub surface: bool,
-    pub raw_capable: bool,
+    pub kind: LegKind,
     /// 本腿声明的网格尺寸（已归一——类型保证非 0 且在限内）。
     pub size: Size,
 }
@@ -354,7 +342,7 @@ impl SessionRegistry {
             log: String::new(),
         };
         // ① 同实例替换（先于接管——同 ID 的旧腿总是先走）
-        if !desc.client_id.is_empty() {
+        {
             let olds: Vec<LegKey> = s
                 .legs
                 .iter()
@@ -394,7 +382,7 @@ impl SessionRegistry {
         out.first = s.leg_count() == 0;
         s.legs.push(LegState {
             key: next_key,
-            kind: LegKind::of(desc.surface, desc.raw_capable),
+            kind: desc.kind,
             client_id: desc.client_id.clone(),
             size: desc.size,
             attach_seq: {
@@ -409,9 +397,9 @@ impl SessionRegistry {
         out.size_applied = note_activity_internal(s, next_key, now_ms);
         out.log = format!(
             "term: 会话 {name} 腿接入（kind={} {} id={} 首腿={}）n={}/{}",
-            LegKind::of(desc.surface, desc.raw_capable).as_str(),
+            desc.kind.as_str(),
             desc.size,
-            if desc.client_id.is_empty() { "-" } else { &desc.client_id },
+            desc.client_id,
             out.first,
             s.leg_count(),
             max_clients,
@@ -620,8 +608,7 @@ mod tests {
     fn desc(id: &str, cols: u16, rows: u16) -> LegDescriptor {
         LegDescriptor {
             client_id: id.to_string(),
-            surface: true,
-            raw_capable: false,
+            kind: LegKind::App,
             size: sz(cols, rows),
         }
     }
@@ -799,9 +786,7 @@ mod tests {
     /// 腿分类词面（caps 推导）。
     #[test]
     fn leg_kind_vocab() {
-        assert_eq!(LegKind::of(true, false).as_str(), "app");
-        assert_eq!(LegKind::of(true, true).as_str(), "app");
-        assert_eq!(LegKind::of(false, true).as_str(), "host");
-        assert_eq!(LegKind::of(false, false).as_str(), "legacy");
+        assert_eq!(LegKind::App.as_str(), "app");
+        assert_eq!(LegKind::Host.as_str(), "host");
     }
 }

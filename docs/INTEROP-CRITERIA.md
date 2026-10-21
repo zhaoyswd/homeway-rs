@@ -598,6 +598,70 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 
 ## 判据变更记录（政策 + 登记表）
 
+### 2026-10-21 终端仅保留当前版本
+
+- 用户确认本批尚未发布，不保留旧APP/旧出口兼容。协议版本数值不变，GREETING必须
+  恰5B且当前版本，各模式要求自身必需features（额外位允许，不强求raw具备surface）。
+- HELLO由可选caps/版本/ID、宿主平台推断 → 必须capLen=1，SURFACE/RAW_TERMINAL恰一位，
+  PROTO_VER声明及当前版本字节必有，KEY_ALT平台恰一位，ID为1..64B合法UTF-8。
+  旧空/缺cap、多字节OR块、裸ID、缺版本/ID及歧义平台均bad_capability；完整结构错版仍
+  term_version。删除原歧义“按未声明处理、不拒腿”告警与计数，不新增错误码。
+- Legacy旧APP腿与JSON kind=legacy删除，仅App/Host；注册表持明确类型，不按缺位猜raw。
+  LIST clients始终数组（含空数组）、stateV2始终存在；App/CLI端按当前必需字段严格消费。
+- keyenc宿主默认helper删除，按客户端明确平台编码；ANSI/DEC标准终端模式不删。
+  HOMEWAY_TERM_VT=off的合法raw-only故障路径保留，日志“仅legacy原始字节模式”改为
+  “仅raw原始字节模式”；不存在的日志腿分类改detached，不伪装旧APP。
+- core一次性LIST/KILL客户端不发HELLO；它要求当前GREETING与LIST|PROTO_VER，不再接受
+  缺位旧出口。无应答诊断去“官方版/旧版tailcat、升级增强版tailcat”历史文案，归因码不变。
+- 当前HELLO与surface夹具显式迁移，禁止以运行期/测试前偷偷补字段保留旧wire。影响面与
+  两道门见 `docs/reviews/terminal-current-only-2026-10-21.md`；不发版/装机/部署。
+- 删除旧Go样式摘要的空白宽度归零：样式空格仍占1列，cell2两端均要求skip当且仅当width=0，
+  非skip仅1/2；当前夹具、样式/行首组合簇回归同步，不保留v4/cell1自动升级。
+
+### 2026-10-21 终端 APP/CLI 整改
+
+- surface 体 v4 / cell v1 → **v5 / v2**：公共头在 cols/rows 后新增
+  `seq:u64/historyEpoch:u64/historyBase:u64`；行头增加 wraps:u8，完整格 symbol 后增加
+  width:u8。FETCH 请求由 from/count → epoch/from/count（18B）。旧版 surface 客户端
+  不可与新版服务混用，须协调升级；raw CLI 帧族不变。冻结 v4 夹具与 baseline 不改，
+  新字节基准见 `fixtures/vectors/surface_v5.json` 与 MANIFEST。
+- 历史身份：容量满后固定物理下标 → epoch 内单调绝对行号，historyBase 随真实裁剪推进；
+  resize/reflow、ED3、RIS、DECCOLM 等破坏性变化换 epoch，备用屏使用独立 epoch。
+  不按旧存活区猜测退出行，FETCH 仅从当前 VT 历史取材；epoch 失配要求新快照。
+- 帧连续性：仅 revision 基线 → 成功入队的 SNAP/DIFF 才推进 seq，FETCH 不消耗 seq；
+  安全淘汰完整待发 surface 组后用快照恢复，不将缺失差分视为连续。
+- 响应归属：只要存在 raw 腿即禁用服务应答 → 仅 active 的纯 raw 腿拥有应答权；
+  active 为 surface 时服务端应答，旁观 raw 的自动应答被丢弃。OSC52 load 同遵归属，
+  surface focus-out、无按钮 motion、key release 不抢 active/尺寸。
+- 同步输出：等待后续 PTY 字节才结束超时事务 → 宿主定时驱动 VTE 的 **150ms**
+  同步更新超时，空闲也提交；150ms 为既有 VTE 常量，不另造第二套超时。
+- 分片粘贴：每片直接写 PTY → **1MiB** 有界、单腿所有、末片一次提交；首片捕获 bracketed
+  模式，**10s** 未完成、超限或断腿取消未提交数据，多腿输入不能交错进入事务。
+- 下发预算：FETCH 按最多512行但材质无字节约束 → 同受 pending_cap/queue_bytes 预算；
+  镜像按实际编码大小从近到远缩窗，单行过大缩至0。视口本身或单份压缩快照仍超预算时
+  明确 `ERROR(surface_unavailable)` + ENDED，不无限重试。慢写不再放大全量；surface
+  writer 使用 HOMEWAY_TERM_WRITE_TIMEOUT_MS 配置，与 raw 一致。
+- 几何/解码材质：1000×500 单轴上限 → 保留列/行上限，新增 **128×1024 格**乘积硬门；
+  HELLO 乘积超限明确 bad_hello、RESIZE 明确 bad_resize，不改当前会话尺寸。
+  视口+快照镜像合计、单次 FETCH 展开分别最多128Ki格，防空白RLE字节虽小而解码膨胀；
+  VT 组件 new/resize 同门，内部 Size 归一也保证乘积不变量。客户端缓存32MiB/10000行，
+  可见窗口保留，不用缓存不住的大窗口触发淘汰/重取循环。
+- APP上行预算按 `sizeof(PtyItem)+payload` 及重复键实际展开量记账（每次20B），而非只数
+  payload；重复次数限1..1024，整批受理或整批拒绝，失败走type3本地toast，不伪装成功。
+  本地错误合并最新值，App toast 至多1秒一次，避免背压下重复按键反过来挤爆UI反馈。
+- 渲染语义：宽度靠客户端猜测、调色板动态变化不传 → 明确列宽/wraps，OSC颜色覆盖转换
+  为 RGB 后随 damage 下发，复位恢复符号颜色；宿主主题不覆盖程序 OSC10/11 设置。
+- 动态颜色的深历史材质：只刷新当前视口 → 实际OSC override变化或复位同时推进材质epoch，
+  保留historyBase与绝对行号，令旧历史缓存失效。备用屏改共享调色板也使主屏历史epoch换代；
+  重复同值设置/重复无override复位不换代。OSC110/111恢复宿主主题查询值与符号默认色，
+  OSC104恢复符号palette；不因颜色变化重用或回退已裁剪的绝对行号。
+- CLI：无界 channel/阻塞 stdout/无限排空 → 上下行均 **1MiB / 256帧** 有界；输出不丢
+  raw 字节，满队列向上游背压；主循环每拍最多 **32帧/64KiB**、单次 stdout 写最多
+  **16KiB**、poll **50ms**，非阻塞 stdout 保留部分写，输入/信号/退出可并行推进。
+  取消先关队列再关流并 join，管道满不能丢退出；满 stdout/上行背压退出测试门槛 **2s**。
+- 影响面：服务端、APP surface 解码/历史缓存/渲染、raw CLI 调度与专项测试；连接策略、
+  token、QUIC 承载、终端外帧族与生产部署均不变。本批只改本地源码，不发版/推送/装机。
+
 ### 2026-10-21 终端无腿收尾回收
 
 - 无活跃腿的首次 finish：误按空 ENDED 集提前返回、保留 PTY runtime →

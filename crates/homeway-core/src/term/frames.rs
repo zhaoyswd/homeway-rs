@@ -66,9 +66,9 @@ pub mod features {
     pub const MODES: u32 = 1 << 2;
     pub const AGENT: u32 = 1 << 3;
     pub const TITLE: u32 = 1 << 4;
-    /// surface 能力位：客户端见位才在 HELLO 尾随 capability 块。
+    /// 当前surface客户端要求此能力位。
     pub const SURFACE: u32 = 1 << 5;
-    /// 「HELLO 版本声明可协商」位（FIX-29 服务端版本门的混合部署开关）。
+    /// 当前HELLO必须携带版本声明，客户端要求此能力位。
     pub const PROTO_VER: u32 = 1 << 6;
     /// 本出口的全开位集（= 0x7F）。
     pub const ALL: u32 =
@@ -95,12 +95,9 @@ pub mod caps {
     pub const KEY_ALT_NO_ESC_PREFIX: u8 = 1 << 2;
     /// Q-J F1：客户端声明「本端 alt 产 ESC 前缀」= libghostty **非 darwin 编译分支**语义
     /// （附随：mok2 保留 alt 位、kitty alt 阻文本）。与 [`KEY_ALT_NO_ESC_PREFIX`] **互斥**。
-    /// **两位全不置 = 未声明 ⇒ 宿主推断**（缺省兼容，逐字节同今日）。
-    /// **两位同置 = 歧义 ⇒ 按未声明处理（fail-soft）+ 计数 + 一次性告警，绝不拒腿**——
-    /// 「裸 ID 尾随块」按 caps 解析出 `caps=0x7F`（恰含 bit2|bit3），拒绝面会把今天
-    /// 可服务的腿变成 `bad_capability`（格式固有属性，见 `dec_hello_tail` 既有测试）。
+    /// 当前客户端必须在两个平台位中明确选择一个；缺省与歧义声明均拒收。
     pub const KEY_ALT_ESC_PREFIX: u8 = 1 << 3;
-    /// FIX-29：caps 带此位 ⇒ caps 块后跟 1 字节协议版本。
+    /// 当前HELLO必置此位，caps块后固定跟1字节协议版本。
     pub const PROTO_VER: u8 = 1 << 7;
 }
 
@@ -215,8 +212,18 @@ pub enum FrameError {
     HelloNameLen { want: usize, have: usize },
     #[error("term: bad frame: capability 块声明 {want} 字节，实际只有 {have}")]
     CapsLen { want: usize, have: usize },
-    #[error("term: bad frame: capability 声明了协议版本但版本字节缺失")]
+    #[error("term: bad frame: 当前 capability 块必须恰为1字节，收到 {len}")]
+    CapsShape { len: usize },
+    #[error("term: bad frame: capability 必须明确声明且仅声明一种终端类型")]
+    TerminalCapability,
+    #[error("term: bad frame: capability 必须明确声明且仅声明一种按键平台")]
+    KeyFlavor,
+    #[error("term: bad frame: 缺少当前协议版本声明或版本字节")]
     VerMissing,
+    #[error("term: bad frame: 缺少非空实例标识")]
+    ClientIdMissing,
+    #[error("term: bad frame: 实例标识不是合法UTF-8")]
+    ClientIdEncoding,
     #[error("term: bad frame: 实例标识块声明 {want} 字节，实际只有 {have}")]
     ClientIdLen { want: usize, have: usize },
     #[error("term: bad frame: 实例标识 {len} 字节超过上限 {MAX_CLIENT_ID_LEN}")]
@@ -294,9 +301,9 @@ pub fn enc_greeting() -> Vec<u8> {
     p
 }
 
-/// GREETING 解码（≥5B；多余字节忽略——同 Go 只读前 5 字节）。
+/// GREETING 解码（当前布局恰为5B）。
 pub fn dec_greeting(p: &[u8]) -> Result<(u8, u32), FrameError> {
-    if p.len() < 5 {
+    if p.len() != 5 {
         return Err(FrameError::GreetingLen { len: p.len() });
     }
     Ok((p[0], u32::from_le_bytes([p[1], p[2], p[3], p[4]])))
@@ -321,7 +328,7 @@ pub fn enc_hello(cols: u16, rows: u16, flags: u8, name: &str, tail: &[u8]) -> Ve
 }
 
 /// HELLO 解码。返回 (cols, rows, flags, name, tail)——tail = name 之后的尾随字节
-/// （旧客户端不发 ⇒ 空）。
+/// 返回尾随借用供当前字段校验，缺少尾随由dec_hello_tail拒绝。
 pub fn dec_hello(p: &[u8]) -> Result<(u16, u16, u8, String, &[u8]), FrameError> {
     if p.len() < 6 {
         return Err(FrameError::HelloLen { len: p.len() });
@@ -337,77 +344,50 @@ pub fn dec_hello(p: &[u8]) -> Result<(u16, u16, u8, String, &[u8]), FrameError> 
     Ok((cols, rows, flags, name, &p[6 + n..]))
 }
 
-/// HELLO 尾随块（caps + 可选版本字节 + 可选实例标识）。
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+/// 当前 HELLO 尾随块（单字节caps + 版本字节 + 非空实例标识）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HelloTail {
     pub caps: u8,
-    pub caps_present: bool,
     pub client_id: String,
     pub ver: u8,
-    pub ver_present: bool,
 }
 
-/// 组尾随块。**编码侧约束（同形不可判别的配套）**：带 ID 必带 caps 块——
-/// 未声明能力时静默丢弃 ID；caps 带 [`caps::PROTO_VER`] 位时插 1 字节版本。
-pub fn enc_hello_tail(caps_bits: u8, caps_present: bool, id: &str) -> Vec<u8> {
-    let mut out = Vec::new();
-    if caps_present {
-        // encCapability = [capLen:1][flags:capLen]（长度 + 位图，加能力只加位）
-        out.push(1);
-        out.push(caps_bits);
-        if caps_bits & caps::PROTO_VER != 0 {
-            out.push(PROTO_VER);
-        }
-        if !id.is_empty() {
-            out.push(id.len() as u8);
-            out.extend_from_slice(id.as_bytes());
-        }
-    }
+/// 组当前尾随块；调用方明确提供终端类型、按键平台与实例标识。
+pub fn enc_hello_tail(caps_bits: u8, id: &str) -> Vec<u8> {
+    assert!(!id.is_empty() && id.len() <= MAX_CLIENT_ID_LEN, "终端实例标识须为1..64字节");
+    let mut out = Vec::with_capacity(4 + id.len());
+    out.extend_from_slice(&[1, caps_bits | caps::PROTO_VER, PROTO_VER, id.len() as u8]);
+    out.extend_from_slice(id.as_bytes());
     out
 }
 
-/// 解尾随块：形状校验（**恰好耗尽**；畸形一律拒收 = bad_capability 面）。
-/// 空 caps 块（capLen=0）消费 1 字节且 caps_present=false（形状合法）；
-/// 声明 protoVer 位而版本字节缺失 = 畸形。
+/// 解当前尾随块：所有字段必需且恰好耗尽；畸形一律归bad_capability。
 pub fn dec_hello_tail(tail: &[u8]) -> Result<HelloTail, FrameError> {
-    let mut t = HelloTail::default();
-    let mut off = 0usize;
-    if tail.len() > off {
-        let n = tail[off] as usize;
-        if n > 0 {
-            if tail.len() < off + 1 + n {
-                return Err(FrameError::CapsLen { want: n, have: tail.len() - off - 1 });
-            }
-            for i in 0..n {
-                t.caps |= tail[off + 1 + i];
-            }
-            t.caps_present = true;
-        }
-        off += 1 + n;
+    let n = tail.first().copied().unwrap_or(0) as usize;
+    if n != 1 {
+        return Err(FrameError::CapsShape { len: n });
     }
-    if t.caps_present && t.caps & caps::PROTO_VER != 0 {
-        if tail.len() <= off {
-            return Err(FrameError::VerMissing);
-        }
-        t.ver = tail[off];
-        t.ver_present = true;
-        off += 1;
+    let bits = *tail.get(1).ok_or(FrameError::CapsLen { want: 1, have: 0 })?;
+    if bits & caps::PROTO_VER == 0 {
+        return Err(FrameError::VerMissing);
     }
-    if tail.len() > off {
-        let n = tail[off] as usize;
-        if tail.len() < off + 1 + n {
-            return Err(FrameError::ClientIdLen { want: n, have: tail.len() - off - 1 });
-        }
-        if n > MAX_CLIENT_ID_LEN {
-            return Err(FrameError::ClientIdOver { len: n });
-        }
-        t.client_id = String::from_utf8_lossy(&tail[off + 1..off + 1 + n]).into_owned();
-        off += 1 + n;
+    let ver = *tail.get(2).ok_or(FrameError::VerMissing)?;
+    let terminal = bits & (caps::SURFACE | caps::RAW_TERMINAL);
+    if terminal != caps::SURFACE && terminal != caps::RAW_TERMINAL {
+        return Err(FrameError::TerminalCapability);
     }
-    if tail.len() > off {
-        return Err(FrameError::TailResidue { len: tail.len() - off });
+    let platform = bits & (caps::KEY_ALT_NO_ESC_PREFIX | caps::KEY_ALT_ESC_PREFIX);
+    if platform != caps::KEY_ALT_NO_ESC_PREFIX && platform != caps::KEY_ALT_ESC_PREFIX {
+        return Err(FrameError::KeyFlavor);
     }
-    Ok(t)
+    let id_len = *tail.get(3).ok_or(FrameError::ClientIdMissing)? as usize;
+    if id_len == 0 { return Err(FrameError::ClientIdMissing); }
+    if id_len > MAX_CLIENT_ID_LEN { return Err(FrameError::ClientIdOver { len: id_len }); }
+    let remaining = tail.len() - 4;
+    if remaining < id_len { return Err(FrameError::ClientIdLen { want: id_len, have: remaining }); }
+    if remaining > id_len { return Err(FrameError::TailResidue { len: remaining - id_len }); }
+    let client_id = std::str::from_utf8(&tail[4..]).map_err(|_| FrameError::ClientIdEncoding)?.to_owned();
+    Ok(HelloTail { caps: bits, ver, client_id })
 }
 
 /// CREATE：`[flags:1][nameLen:1][name]`（bit0 = reuse-if-exists，极性与 HELLO bit1 相反）。
@@ -764,7 +744,10 @@ mod tests {
                 assert_eq!(rows as u64, h["rows"].as_u64().unwrap(), "{name}");
                 assert_eq!(flags as u64, h["flags"].as_u64().unwrap(), "{name}");
                 assert_eq!(name_out, h["name"].as_str().unwrap(), "{name}");
-                assert!(tail.is_empty(), "{name}: 本 fixture 无尾随");
+                let current = dec_hello_tail(tail).expect("fixture须为当前完整HELLO");
+                assert_eq!(current.caps, caps::SURFACE | caps::KEY_ALT_ESC_PREFIX | caps::PROTO_VER);
+                assert_eq!(current.ver, PROTO_VER);
+                assert_eq!(current.client_id, "app-1");
             }
             if let Some(r) = expect.get("resize") {
                 let (cols, rows) = dec_resize(&payload).unwrap();
@@ -851,48 +834,43 @@ mod tests {
         assert_eq!(u16::from_le_bytes([f[1], f[2]]) as usize, MAX_PAYLOAD);
     }
 
-    /// HELLO 尾随块形状族（FIX-29 版本门 + 同形不可判别的编码侧约束）。
+    /// 当前HELLO必需字段与精确尾结构。
     #[test]
     fn hello_tail_shapes() {
-        // 全形态：caps(surface|protoVer) + ver + id
-        let tail = enc_hello_tail(caps::SURFACE | caps::PROTO_VER, true, "host1");
-        assert_eq!(hex(&tail), "01810105686f737431"); // [1][81][ver=01][5]"host1"
+        let bits = caps::SURFACE | caps::KEY_ALT_ESC_PREFIX | caps::PROTO_VER;
+        let tail = enc_hello_tail(bits, "host1");
+        assert_eq!(hex(&tail), "01890105686f737431");
         let t = dec_hello_tail(&tail).unwrap();
-        assert_eq!(t.caps, caps::SURFACE | caps::PROTO_VER);
-        assert!(t.caps_present && t.ver_present);
+        assert_eq!(t.caps, bits);
         assert_eq!(t.ver, PROTO_VER);
         assert_eq!(t.client_id, "host1");
-        // caps 无 protoVer 位 ⇒ 无版本字节
-        let tail = enc_hello_tail(caps::RAW_TERMINAL, true, "h");
+        let tail = enc_hello_tail(caps::RAW_TERMINAL | caps::KEY_ALT_NO_ESC_PREFIX, "h");
         let t = dec_hello_tail(&tail).unwrap();
-        assert!(!t.ver_present);
+        assert_eq!(t.ver, PROTO_VER);
         assert_eq!(t.client_id, "h");
-        // 未声明能力 ⇒ ID 被静默丢弃（编码侧约束）
-        let tail = enc_hello_tail(0, false, "dropped");
-        assert!(tail.is_empty());
-        // 空 caps 块（capLen=0）：形状合法、caps_present=false
-        let t = dec_hello_tail(&[0]).unwrap();
-        assert!(!t.caps_present);
-        // 裸 ID 形状（无 caps 块头）按 caps 解析——同形不可判别，解码侧不特判
-        let t = dec_hello_tail(&[4, b'h', b'o', b's', b't']).unwrap();
-        assert!(t.caps_present && t.caps == (b'h' | b'o' | b's' | b't') && t.client_id.is_empty());
-        // 残留字节拒绝
-        assert!(matches!(dec_hello_tail(&[1, 2, 1, b'x', 9]), Err(FrameError::TailResidue { len: 1 })));
-        // 声明 protoVer 位而版本字节缺失 = 畸形
-        assert!(matches!(dec_hello_tail(&[1, caps::PROTO_VER]), Err(FrameError::VerMissing)));
-        // caps 块声明超长拒绝
-        assert!(matches!(dec_hello_tail(&[9, 1, 2]), Err(FrameError::CapsLen { .. })));
-        // ID 超 64 字节拒绝
-        let mut over = vec![1u8, caps::SURFACE];
-        over.push(65);
+        for old in [vec![], vec![0], vec![4, b'h', b'o', b's', b't'],
+            vec![1, caps::SURFACE, 1, b'x'], vec![1, bits], vec![1, bits, PROTO_VER],
+            vec![1, bits, PROTO_VER, 0], vec![1, caps::SURFACE | caps::PROTO_VER, PROTO_VER, 1, b'x'],
+            vec![1, bits | caps::KEY_ALT_NO_ESC_PREFIX, PROTO_VER, 1, b'x'],
+            vec![1, bits | caps::RAW_TERMINAL, PROTO_VER, 1, b'x'],
+            vec![1, caps::PROTO_VER | caps::KEY_ALT_ESC_PREFIX, PROTO_VER, 1, b'x'],
+            vec![1, bits, PROTO_VER, 1, 0xff], vec![9, 1, 2]] {
+            assert!(dec_hello_tail(&old).is_err(), "拒绝旧或不完整HELLO: {}", hex(&old));
+        }
+        let mut residue = enc_hello_tail(bits, "x");
+        residue.push(9);
+        assert!(matches!(dec_hello_tail(&residue), Err(FrameError::TailResidue { len: 1 })));
+        let mut over = vec![1u8, bits, PROTO_VER, 65];
         over.extend_from_slice(&[b'x'; 65]);
         assert!(matches!(dec_hello_tail(&over), Err(FrameError::ClientIdOver { len: 65 })));
+        assert!(dec_greeting(&[PROTO_VER; 4]).is_err());
+        assert!(dec_greeting(&[PROTO_VER; 6]).is_err());
     }
 
     /// HELLO 全载往返（含尾随）+ 畸形 name 长度。
     #[test]
     fn hello_payload_roundtrip_and_errors() {
-        let tail = enc_hello_tail(caps::SURFACE | caps::PROTO_VER, true, "cid");
+        let tail = enc_hello_tail(caps::SURFACE | caps::KEY_ALT_ESC_PREFIX, "cid");
         let p = enc_hello(120, 40, hello_flags::CREATE | hello_flags::TAKEOVER, "dev-abc123", &tail);
         let (cols, rows, flags, name, t) = dec_hello(&p).unwrap();
         assert_eq!((cols, rows, flags, name.as_str()), (120, 40, hello_flags::CREATE | hello_flags::TAKEOVER, "dev-abc123"));

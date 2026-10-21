@@ -1,14 +1,12 @@
-//! codec — surface v4 体编码（R6 6e）。行为真源 = baseline 克隆
-//! `pkg/term/term_surface.go` 与 `pkg/term/vt/cellcodec.go`；判据 =
-//! `fixtures/vectors/surface_codec.json` 逐字节 + `fixtures/surface-golden/` 夹具两向对拍。
+//! codec — 当前 surface v5 / cell v2 体编码。
+//! 判据 = `fixtures/surface-current/codec.json` 逐字节 + 当前 ANSI 会话的快照/差分夹具两向对拍。
 //!
 //! 分层：帧（`[op][len:2LE]`）在 [`super::frames`]，本文件管 surface 大帧**解压后的体**：
 //!
-//! - **cell 行编码**（cellcodec）：`[ver:1][cols:2][rows:2]` + 每行 `[y:2][格流]`；
+//! - **cell 行编码**（cellcodec）：`[ver:1][cols:2][rows:2]` + 每行 `[y:2][wraps:1][格流]`；
 //!   格流三标记 `0x00 空白游程+varint / 0x01 完整格 / 0x02 重复游程+varint`。
-//!   宽度不编（Go appendCell 同款）——「解码语义宽度」由 symbol 是否为空派生
-//!   （空 ⇒ 0，客户端不画字形）。
-//! - **SNAPSHOT / DIFF / FETCH-ROWS 体**（v4）：光标块 6B（x,y,flags,shape）与回滚条
+//!   完整格的 symbol 后显式编码 width:u8（0/1/2），宽字符尾格不再靠字体推断。
+//! - **SNAPSHOT / DIFF / FETCH-ROWS 体**（v5）：公共头新增 seq/historyEpoch/historyBase；光标块 6B（x,y,flags,shape）与回滚条
 //!   （total u64 + offset u64 + len u16）两处同形；DIFF 的 rowCount=0 是合法帧。
 //! - **分片层**：payload = `[flags:1][gzip]`，片 ≤ 60KiB，bit0 = more；空数据也发一片。
 //!   gzip 字节与 Go 不必逐位同（deflate 实现差异，设计 D-12）——契约 = 解压后字节。
@@ -24,7 +22,7 @@ use super::frames;
 use super::vt;
 
 /// surface 载荷版本（体头一字节；布局变了就必须升版本——Go surfaceVer 同款纪律）。
-pub const SURFACE_VER: u8 = 4;
+pub const SURFACE_VER: u8 = 5;
 /// 单个分片里 gzip 数据的字节上限（+1 分片头 < 65535 帧长上限）。
 pub const FRAG_CHUNK: usize = 60 << 10;
 /// 分片头「还有后续片」标志。
@@ -193,7 +191,7 @@ mod color_kind {
 }
 
 /// cellcodec 版本（载荷头一字节）。
-pub const CELL_CODEC_VERSION: u8 = 1;
+pub const CELL_CODEC_VERSION: u8 = 2;
 
 /// 把视口行编成整块字节（`[ver][cols:2LE][rows:2LE]` + 逐行 `[y:2LE][格流]`）。
 pub fn encode_grid(cols: u16, rows: u16, rs: &[vt::Row]) -> Vec<u8> {
@@ -203,6 +201,7 @@ pub fn encode_grid(cols: u16, rows: u16, rs: &[vt::Row]) -> Vec<u8> {
     out.extend_from_slice(&rows.to_le_bytes());
     for r in rs {
         out.extend_from_slice(&r.y.to_le_bytes());
+        out.push(u8::from(r.wraps));
         append_row_cells(&mut out, &r.cells);
     }
     out
@@ -213,6 +212,7 @@ pub fn encode_rows(rows: &[vt::Row]) -> Vec<u8> {
     let mut out = Vec::with_capacity(rows.len() * 8);
     for r in rows {
         out.extend_from_slice(&r.y.to_le_bytes());
+        out.push(u8::from(r.wraps));
         append_row_cells(&mut out, &r.cells);
     }
     out
@@ -265,7 +265,7 @@ fn append_row_cells(out: &mut Vec<u8>, cells: &[vt::Cell]) {
     flush_repeat(out, &mut repeat_run);
 }
 
-/// 编一格（`[hdr][symbol][fg][bg][attr]`；hdr 低 7 位 = symbol 字节长，bit7 = skip）。
+/// 编一格（`[hdr][symbol][width][fg][bg][attr]`；hdr 低 7 位 = symbol 字节长，bit7 = skip）。
 ///
 /// **副门（F5）**：symbol 超 `SYM_LEN_MASK`（=127 B）时按 UTF-8 边界截断 + debug 期
 /// `debug_assert!(false)` 可闻（上游 `vt::cell_of` 已截断，走到这里说明不变量破了）。
@@ -295,6 +295,7 @@ fn append_cell_exact(out: &mut Vec<u8>, c: &vt::Cell, sym: &[u8]) {
     }
     out.push(hdr);
     out.extend_from_slice(sym);
+    out.push(c.width);
     append_color(out, c.fg);
     append_color(out, c.bg);
     out.extend_from_slice(&c.attr.to_le_bytes());
@@ -336,15 +337,17 @@ pub fn decode_grid(b: &[u8]) -> Result<(u16, u16, Vec<vt::Row>), CodecError> {
     let mut off = 5usize;
     let mut out = Vec::with_capacity(rows as usize);
     for _ in 0..rows {
-        if off + 2 > b.len() {
+        if off + 3 > b.len() {
             return Err(CodecError::BadGrid("行号截断"));
         }
         let y = u16::from_le_bytes([b[off], b[off + 1]]);
-        off += 2;
+        let wraps = b[off + 2] & 1 != 0;
+        off += 3;
         let (cells, n) = decode_row_cells(&b[off..], cols as usize)?;
         off += n;
-        out.push(vt::Row { y, dirty: false, wraps: false, cells });
+        out.push(vt::Row { y, dirty: false, wraps, cells });
     }
+    if off != b.len() { return Err(CodecError::BadGrid("网格尾随字节")); }
     Ok((cols, rows, out))
 }
 
@@ -354,27 +357,29 @@ pub fn decode_rows(b: &[u8], count: usize, cols: usize) -> Result<Vec<vt::Row>, 
     let mut out = Vec::with_capacity(count);
     let mut off = 0usize;
     for _ in 0..count {
-        if off + 2 > b.len() {
+        if off + 3 > b.len() {
             return Err(CodecError::BadGrid("行号截断"));
         }
         let y = u16::from_le_bytes([b[off], b[off + 1]]);
-        off += 2;
+        let wraps = b[off + 2] & 1 != 0;
+        off += 3;
         let (cells, n) = decode_row_cells(&b[off..], cols)?;
         off += n;
-        out.push(vt::Row { y, dirty: false, wraps: false, cells });
+        out.push(vt::Row { y, dirty: false, wraps, cells });
     }
+    if off != b.len() { return Err(CodecError::BadGrid("行序列尾随字节")); }
     Ok(out)
 }
 
-/// 解码维度守卫（F10）：`cols ≤ Size::MAX_COLS` 且 `rows/count ≤ Size::MAX_ROWS ×
-/// (1 + MIRROR_VIEWPORTS)`。
+/// 解码维度守卫：列/行分量有界，单份格材质不超过128Ki格。
 ///
 /// 为什么必须有：`BLANK_RUN`/`REPEAT` 的 `min(n, cols-len)` 只挡「单行内跑长」，
 /// 挡不住「5 字节头 + 极短体 ⇒ 4.29e9 格」的放大（每个空行仍会 `Vec::with_capacity(cols)`
 /// 分配）——合法帧上界 = 编码侧上限 × 镜像倍数，本守卫只拒非法放大。
 fn guard_dims(cols: u64, rows: u64) -> Result<(), CodecError> {
     let max_rows = (super::size::Size::MAX_ROWS as u64) * (1 + MIRROR_VIEWPORTS as u64);
-    if cols > super::size::Size::MAX_COLS as u64 || rows > max_rows {
+    if cols > super::size::Size::MAX_COLS as u64 || rows > max_rows
+        || cols.saturating_mul(rows) > super::size::Size::MAX_VIEWPORT_CELLS as u64 {
         return Err(CodecError::BadGrid("解码维度超上限"));
     }
     Ok(())
@@ -393,6 +398,7 @@ fn decode_row_cells(b: &[u8], cols: usize) -> Result<(Vec<vt::Cell>, usize), Cod
                 off += 1;
                 let (n, adv) = read_varint(&b[off..])?;
                 off += adv;
+                if n == 0 || n > (cols - cells.len()) as u64 { return Err(CodecError::BadGrid("blank run 非法")); }
                 for _ in 0..n.min((cols - cells.len()) as u64) {
                     cells.push(vt::Cell { width: 1, ..vt::Cell::default() });
                 }
@@ -401,6 +407,7 @@ fn decode_row_cells(b: &[u8], cols: usize) -> Result<(Vec<vt::Cell>, usize), Cod
                 off += 1;
                 let (n, adv) = read_varint(&b[off..])?;
                 off += adv;
+                if n == 0 || n > (cols - cells.len()) as u64 { return Err(CodecError::BadGrid("repeat run 非法")); }
                 let last = cells.last().cloned().ok_or(CodecError::BadGrid("行首 repeat"))?;
                 for _ in 0..n.min((cols - cells.len()) as u64) {
                     cells.push(last.clone());
@@ -430,6 +437,11 @@ fn decode_cell(b: &[u8]) -> Result<(vt::Cell, usize), CodecError> {
     }
     let symbol = String::from_utf8_lossy(&b[off..off + n]).into_owned();
     off += n;
+    let width = *b.get(off).ok_or(CodecError::BadGrid("width 缺失"))?;
+    if width > 2 || skip != (width == 0) {
+        return Err(CodecError::BadGrid("width 非法"));
+    }
+    off += 1;
     let (fg, adv) = decode_color(&b[off..])?;
     off += adv;
     let (bg, adv) = decode_color(&b[off..])?;
@@ -439,8 +451,6 @@ fn decode_cell(b: &[u8]) -> Result<(vt::Cell, usize), CodecError> {
     }
     let attr = u16::from_le_bytes([b[off], b[off + 1]]);
     off += 2;
-    // 无字素的格宽度记 0（客户端据此不画字形；宽度不编——解码侧派生）。
-    let width = if symbol.is_empty() { 0 } else { 1 };
     Ok((vt::Cell { symbol, width, skip, fg, bg, attr }, off))
 }
 
@@ -482,6 +492,9 @@ pub struct SnapshotBody {
     pub revision: u32,
     pub cols: u16,
     pub rows: u16,
+    pub seq: u64,
+    pub history_epoch: u64,
+    pub history_base: u64,
     pub cursor: SurfaceCursor,
     pub modes: u32,
     pub kitty: u8,
@@ -496,11 +509,18 @@ pub struct SnapshotBody {
 
 /// 组 SNAPSHOT 体。
 pub fn enc_snapshot_body(s: &SnapshotBody) -> Vec<u8> {
-    let mut out = Vec::with_capacity(32 + s.title.len() + s.grid.len() + s.mirror.len());
+    enc_snapshot_material(s, &s.grid, &s.mirror)
+}
+
+pub(crate) fn enc_snapshot_material(s: &SnapshotBody, grid: &[u8], mirror: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(73 + s.title.len() + grid.len() + mirror.len());
     out.push(SURFACE_VER);
     out.extend_from_slice(&s.revision.to_le_bytes());
     out.extend_from_slice(&s.cols.to_le_bytes());
     out.extend_from_slice(&s.rows.to_le_bytes());
+    out.extend_from_slice(&s.seq.to_le_bytes());
+    out.extend_from_slice(&s.history_epoch.to_le_bytes());
+    out.extend_from_slice(&s.history_base.to_le_bytes());
     out.extend_from_slice(&s.cursor.x.to_le_bytes());
     out.extend_from_slice(&s.cursor.y.to_le_bytes());
     out.push(s.cursor.flags);
@@ -513,10 +533,10 @@ pub fn enc_snapshot_body(s: &SnapshotBody) -> Vec<u8> {
     out.extend_from_slice(&s.scroll.len.to_le_bytes());
     out.extend_from_slice(&(s.title.len() as u16).to_le_bytes());
     out.extend_from_slice(s.title.as_bytes());
-    out.extend_from_slice(&(s.grid.len() as u32).to_le_bytes());
-    out.extend_from_slice(&s.grid);
-    out.extend_from_slice(&(s.mirror.len() as u32).to_le_bytes());
-    out.extend_from_slice(&s.mirror);
+    out.extend_from_slice(&(grid.len() as u32).to_le_bytes());
+    out.extend_from_slice(grid);
+    out.extend_from_slice(&(mirror.len() as u32).to_le_bytes());
+    out.extend_from_slice(mirror);
     out
 }
 
@@ -530,6 +550,9 @@ pub fn dec_snapshot_body(p: &[u8]) -> Result<SnapshotBody, CodecError> {
     let revision = r.u32()?;
     let cols = r.u16()?;
     let rows = r.u16()?;
+    let seq = r.u64()?;
+    let history_epoch = r.u64()?;
+    let history_base = r.u64()?;
     let cursor = read_cursor(&mut r)?;
     let modes = r.u32()?;
     let kitty = r.u8()?;
@@ -548,6 +571,9 @@ pub fn dec_snapshot_body(p: &[u8]) -> Result<SnapshotBody, CodecError> {
         revision,
         cols,
         rows,
+        seq,
+        history_epoch,
+        history_base,
         cursor,
         modes,
         kitty,
@@ -566,6 +592,9 @@ pub struct DiffBody {
     pub revision: u32,
     pub cols: u16,
     pub rows: u16,
+    pub seq: u64,
+    pub history_epoch: u64,
+    pub history_base: u64,
     pub cursor: SurfaceCursor,
     pub modes: u32,
     pub scroll: ScrollbarWire,
@@ -576,11 +605,18 @@ pub struct DiffBody {
 
 /// 组 DIFF 体。
 pub fn enc_diff_body(d: &DiffBody) -> Vec<u8> {
-    let mut out = Vec::with_capacity(44 + d.row_bytes.len());
+    enc_diff_material(d, &d.row_bytes)
+}
+
+pub(crate) fn enc_diff_material(d: &DiffBody, row_bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(63 + row_bytes.len());
     out.push(SURFACE_VER);
     out.extend_from_slice(&d.revision.to_le_bytes());
     out.extend_from_slice(&d.cols.to_le_bytes());
     out.extend_from_slice(&d.rows.to_le_bytes());
+    out.extend_from_slice(&d.seq.to_le_bytes());
+    out.extend_from_slice(&d.history_epoch.to_le_bytes());
+    out.extend_from_slice(&d.history_base.to_le_bytes());
     out.extend_from_slice(&d.row_count.to_le_bytes());
     // 光标块与快照同位序（x,y,flags,shape）
     out.extend_from_slice(&d.cursor.x.to_le_bytes());
@@ -591,7 +627,7 @@ pub fn enc_diff_body(d: &DiffBody) -> Vec<u8> {
     out.extend_from_slice(&d.scroll.total.to_le_bytes());
     out.extend_from_slice(&d.scroll.offset.to_le_bytes());
     out.extend_from_slice(&d.scroll.len.to_le_bytes());
-    out.extend_from_slice(&d.row_bytes);
+    out.extend_from_slice(row_bytes);
     out
 }
 
@@ -605,6 +641,9 @@ pub fn dec_diff_body(p: &[u8]) -> Result<DiffBody, CodecError> {
     let revision = r.u32()?;
     let cols = r.u16()?;
     let rows = r.u16()?;
+    let seq = r.u64()?;
+    let history_epoch = r.u64()?;
+    let history_base = r.u64()?;
     let row_count = r.u16()?;
     let cursor = read_cursor(&mut r)?;
     let modes = r.u32()?;
@@ -616,6 +655,9 @@ pub fn dec_diff_body(p: &[u8]) -> Result<DiffBody, CodecError> {
         revision,
         cols,
         rows,
+        seq,
+        history_epoch,
+        history_base,
         cursor,
         modes,
         scroll: ScrollbarWire { total, offset, len },
@@ -627,6 +669,7 @@ pub fn dec_diff_body(p: &[u8]) -> Result<DiffBody, CodecError> {
 /// FETCH-ROWS 请求（绝对行号区间，与回滚条同一套行号空间）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub struct FetchRowsReq {
+    pub history_epoch: u64,
     pub from: u64,
     pub count: u16,
 }
@@ -635,19 +678,21 @@ pub struct FetchRowsReq {
 pub const FETCH_ROWS_MAX: u16 = 512;
 
 pub fn enc_fetch_rows_req(r: FetchRowsReq) -> Vec<u8> {
-    let mut out = Vec::with_capacity(10);
+    let mut out = Vec::with_capacity(18);
+    out.extend_from_slice(&r.history_epoch.to_le_bytes());
     out.extend_from_slice(&r.from.to_le_bytes());
     out.extend_from_slice(&r.count.to_le_bytes());
     out
 }
 
 pub fn dec_fetch_rows_req(p: &[u8]) -> Result<FetchRowsReq, CodecError> {
-    if p.len() < 10 {
-        return Err(CodecError::Truncated { need: 10, left: p.len() });
+    if p.len() != 18 {
+        return Err(CodecError::Truncated { need: 18, left: p.len() });
     }
     Ok(FetchRowsReq {
-        from: u64::from_le_bytes(p[0..8].try_into().expect("8B")),
-        count: u16::from_le_bytes(p[8..10].try_into().expect("2B")),
+        history_epoch: u64::from_le_bytes(p[0..8].try_into().expect("8B")),
+        from: u64::from_le_bytes(p[8..16].try_into().expect("8B")),
+        count: u16::from_le_bytes(p[16..18].try_into().expect("2B")),
     })
 }
 
@@ -657,6 +702,9 @@ pub struct FetchRowsReply {
     pub revision: u32,
     pub cols: u16,
     pub rows: u16,
+    pub seq: u64,
+    pub history_epoch: u64,
+    pub history_base: u64,
     pub from: u64,
     pub count: u16,
     pub row_bytes: Vec<u8>,
@@ -668,6 +716,9 @@ pub fn enc_fetch_rows_reply(r: &FetchRowsReply) -> Vec<u8> {
     out.extend_from_slice(&r.revision.to_le_bytes());
     out.extend_from_slice(&r.cols.to_le_bytes());
     out.extend_from_slice(&r.rows.to_le_bytes());
+    out.extend_from_slice(&r.seq.to_le_bytes());
+    out.extend_from_slice(&r.history_epoch.to_le_bytes());
+    out.extend_from_slice(&r.history_base.to_le_bytes());
     out.extend_from_slice(&r.from.to_le_bytes());
     out.extend_from_slice(&r.count.to_le_bytes());
     out.extend_from_slice(&r.row_bytes);
@@ -683,10 +734,13 @@ pub fn dec_fetch_rows_reply(p: &[u8]) -> Result<FetchRowsReply, CodecError> {
     let revision = r.u32()?;
     let cols = r.u16()?;
     let rows = r.u16()?;
+    let seq = r.u64()?;
+    let history_epoch = r.u64()?;
+    let history_base = r.u64()?;
     let from = r.u64()?;
     let count = r.u16()?;
     let row_bytes = r.rest().to_vec();
-    Ok(FetchRowsReply { revision, cols, rows, from, count, row_bytes })
+    Ok(FetchRowsReply { revision, cols, rows, seq, history_epoch, history_base, from, count, row_bytes })
 }
 
 /// 光标块 6B（快照与差分同形）。
@@ -966,6 +1020,48 @@ mod tests {
     use crate::term::vt::{Row, SessionVt};
     use serde_json::Value;
 
+    #[test]
+    fn surface_v5_preserves_identity_sequence_wrap_and_width() {
+        let rows = vec![Row { y: 0, dirty: false, wraps: true, cells: vec![
+            vt::Cell { symbol: "中".into(), width: 2, ..Default::default() },
+            vt::Cell { width: 0, skip: true, ..Default::default() },
+        ] }];
+        let grid = encode_grid(2, 1, &rows);
+        assert_eq!(decode_grid(&grid).unwrap().2, rows);
+        let snapshot = SnapshotBody {
+            revision: 3, cols: 2, rows: 1, seq: 17, history_epoch: 4, history_base: 100,
+            grid, scroll: ScrollbarWire { total: 102, offset: 101, len: 1 }, ..Default::default()
+        };
+        assert_eq!(dec_snapshot_body(&enc_snapshot_body(&snapshot)).unwrap(), snapshot);
+        let diff = DiffBody { revision: 3, cols: 2, rows: 1, seq: 18,
+            history_epoch: 4, history_base: 100, row_count: 1, row_bytes: encode_rows(&rows),
+            scroll: snapshot.scroll, ..Default::default() };
+        assert_eq!(dec_diff_body(&enc_diff_body(&diff)).unwrap(), diff);
+        assert_ne!(snapshot.seq, diff.seq);
+        let request = FetchRowsReq { history_epoch: 4, from: 100, count: 1 };
+        assert_eq!(dec_fetch_rows_req(&enc_fetch_rows_req(request)).unwrap(), request);
+        let fixture: Value = serde_json::from_str(include_str!("../../../../fixtures/vectors/surface_v5.json")).unwrap();
+        assert_eq!(hex::encode(enc_snapshot_body(&snapshot)), fixture["snapshot"].as_str().unwrap());
+        assert_eq!(hex::encode(enc_diff_body(&diff)), fixture["diff"].as_str().unwrap());
+        assert_eq!(hex::encode(enc_fetch_rows_req(request)), fixture["fetch_req"].as_str().unwrap());
+    }
+
+    #[test]
+    fn surface_accepts_only_current_layout_versions() {
+        let mut grid = encode_grid(1, 1, &[Row { y: 0, cells: vec![vt::Cell { width: 1, ..Default::default() }], ..Default::default() }]);
+        grid[0] = 1;
+        assert!(decode_grid(&grid).is_err());
+        let mut snapshot = enc_snapshot_body(&SnapshotBody { cols: 1, rows: 1, ..Default::default() });
+        snapshot[0] = 4;
+        assert!(matches!(dec_snapshot_body(&snapshot), Err(CodecError::BadVersion(4, 5))));
+        let mut diff = enc_diff_body(&DiffBody { cols: 1, rows: 1, ..Default::default() });
+        diff[0] = 4;
+        assert!(matches!(dec_diff_body(&diff), Err(CodecError::BadVersion(4, 5))));
+        let mut reply = enc_fetch_rows_reply(&FetchRowsReply { cols: 1, rows: 1, ..Default::default() });
+        reply[0] = 4;
+        assert!(matches!(dec_fetch_rows_reply(&reply), Err(CodecError::BadVersion(4, 5))));
+    }
+
     fn vtcell(v: &Value) -> vt::Cell {
         // 颜色 JSON 形态：[]/缺 = none；[1, idx] = palette；[2, r, g, b] = rgb（kind 值同 wire）
         let color = |v: &Value| -> vt::Color {
@@ -996,11 +1092,11 @@ mod tests {
     }
 
     /// 6e 判据①：cellcodec 向量逐字节对拍（encode_grid/encode_rows）+ 解码往返 +
-    /// 解码格值（除 width——解码语义宽度由 symbol 派生，不参与往返）。
+    /// 解码格值（包括显式 width）。
     #[test]
-    fn surface_cellcodec_parity_with_go_vectors() {
+    fn surface_cellcodec_current_vectors() {
         let v: Value = serde_json::from_str(testutil::VECTOR_SURFACE_CODEC)
-            .expect("surface_codec.json invalid");
+            .expect("current codec.json invalid");
         let cases = v.get("cells").and_then(Value::as_array).expect("cells array");
         assert!(cases.len() >= 15, "cellcodec 案数 {}", cases.len());
         for c in cases {
@@ -1027,12 +1123,12 @@ mod tests {
             assert_eq!(
                 hex::encode(&grid),
                 c.get("grid_hex").and_then(Value::as_str).expect("grid_hex"),
-                "{name}: encode_grid 与 Go 不一致"
+                "{name}: encode_grid 与当前定值夹具不一致"
             );
             assert_eq!(
                 hex::encode(&rows_enc),
                 c.get("rows_hex").and_then(Value::as_str).expect("rows_hex"),
-                "{name}: encode_rows 与 Go 不一致"
+                "{name}: encode_rows 与当前定值夹具不一致"
             );
             // 解码往返：格值逐字段（除 width 派生语义）+ 重编字节恒等
             let (dcols, drows_n, decoded) = decode_grid(&grid).expect("decode_grid");
@@ -1046,7 +1142,7 @@ mod tests {
                     assert_eq!(wc.fg, gc.fg, "{name}: fg");
                     assert_eq!(wc.bg, gc.bg, "{name}: bg");
                     assert_eq!(wc.attr, gc.attr, "{name}: attr");
-                    // width 不编（解码侧派生），不参与往返对拍
+                    assert_eq!(wc.width, gc.width, "{name}: width");
                 }
             }
             assert_eq!(
@@ -1065,7 +1161,7 @@ mod tests {
     #[test]
     fn surface_cellcodec_negative_cases() {
         let v: Value = serde_json::from_str(testutil::VECTOR_SURFACE_CODEC)
-            .expect("surface_codec.json invalid");
+            .expect("current codec.json invalid");
         let cases = v.get("cells_bad").and_then(Value::as_array).expect("cells_bad");
         assert!(cases.len() >= 7, "负例案数 {}", cases.len());
         for c in cases {
@@ -1083,26 +1179,26 @@ mod tests {
 
     /// 6e 判据③：SNAPSHOT/DIFF/FETCH-ROWS 体向量逐字节对拍 + 解码往返字段一致。
     #[test]
-    fn surface_bodies_parity_with_go_vectors() {
+    fn surface_bodies_current_vectors() {
         let v: Value = serde_json::from_str(testutil::VECTOR_SURFACE_CODEC)
-            .expect("surface_codec.json invalid");
-        // SNAPSHOT：解码 → 重编 == Go 字节（位序/字段序的往返锚；手工重排体只会造
+            .expect("current codec.json invalid");
+        // SNAPSHOT：解码 → 重编 == 当前字节（位序/字段序的往返锚；手工重排体只会造
         // 出第二份会漂移的「真源」，这里按向量本身对拍）
         for c in v.get("snapshot").and_then(Value::as_array).expect("snapshot") {
             let name = c.get("name").and_then(Value::as_str).expect("name");
             let want = c.get("body_hex").and_then(Value::as_str).expect("body_hex");
             let bytes = hex(want);
             let body = dec_snapshot_body(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!(hex::encode(enc_snapshot_body(&body)), want, "{name}: 往返");
+            assert_eq!(enc_snapshot_body(&body), bytes, "{name}: 往返");
             if name == "full" {
                 // 体头字段序抽查：ver / rev u32 / cols / rows / 光标块 6B（x,y,flags,shape）
                 assert_eq!(bytes[0], SURFACE_VER);
                 assert_eq!(bytes[1..5], 0x01020304u32.to_le_bytes());
                 assert_eq!(bytes[5..7], 100u16.to_le_bytes());
                 assert_eq!(bytes[7..9], 32u16.to_le_bytes());
-                assert_eq!(bytes[9..11], 9u16.to_le_bytes());
-                assert_eq!(bytes[11..13], 30u16.to_le_bytes());
-                assert_eq!((bytes[13], bytes[14], bytes[15]), (0x0f, 3, 0xff));
+                assert_eq!(bytes[33..35], 9u16.to_le_bytes());
+                assert_eq!(bytes[35..37], 30u16.to_le_bytes());
+                assert_eq!((bytes[37], bytes[38], bytes[39]), (0x0f, 3, 0xff));
                 assert_eq!(body.revision, 0x01020304);
                 assert_eq!(
                     body.cursor,
@@ -1121,21 +1217,21 @@ mod tests {
             let want = c.get("body_hex").and_then(Value::as_str).expect("body_hex");
             let bytes = hex(want);
             let body = dec_diff_body(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!(hex::encode(enc_diff_body(&body)), want, "{name}: 往返");
+            assert_eq!(enc_diff_body(&body), bytes, "{name}: 往返");
         }
         for c in v.get("fetch_req").and_then(Value::as_array).expect("fetch_req") {
             let name = c.get("name").and_then(Value::as_str).expect("name");
             let want = c.get("body_hex").and_then(Value::as_str).expect("body_hex");
             let bytes = hex(want);
             let req = dec_fetch_rows_req(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!(hex::encode(enc_fetch_rows_req(req)), want, "{name}: 往返");
+            assert_eq!(enc_fetch_rows_req(req), bytes, "{name}: 往返");
         }
         for c in v.get("fetch_reply").and_then(Value::as_array).expect("fetch_reply") {
             let name = c.get("name").and_then(Value::as_str).expect("name");
             let want = c.get("body_hex").and_then(Value::as_str).expect("body_hex");
             let bytes = hex(want);
             let rep = dec_fetch_rows_reply(&bytes).unwrap_or_else(|e| panic!("{name}: {e}"));
-            assert_eq!(hex::encode(enc_fetch_rows_reply(&rep)), want, "{name}: 往返");
+            assert_eq!(enc_fetch_rows_reply(&rep), bytes, "{name}: 往返");
         }
     }
 
@@ -1143,7 +1239,7 @@ mod tests {
     #[test]
     fn surface_fragment_and_assembler() {
         let v: Value = serde_json::from_str(testutil::VECTOR_SURFACE_CODEC)
-            .expect("surface_codec.json invalid");
+            .expect("current codec.json invalid");
         for c in v.get("fragment").and_then(Value::as_array).expect("fragment") {
             let name = c.get("name").and_then(Value::as_str).expect("name");
             let data = hex(c.get("in_hex").and_then(Value::as_str).expect("in_hex"));
@@ -1194,7 +1290,7 @@ mod tests {
         assert_eq!(asm.push(&[0]).unwrap().unwrap(), Vec::<u8>::new(), "复位后可用");
     }
 
-    /// gzip 往返 + 头域口径（mtime=0、OS=255）+ 能解 Go 的 gzip（golden .bin 里的真分片）。
+    /// gzip 往返、确定性头域与当前 v5 定值分片。
     #[test]
     fn surface_gzip_roundtrip_and_header() {
         let body = b"surface-gzip-\xe4\xbd\xa0\xe5\xa5\xbd".repeat(100);
@@ -1204,9 +1300,9 @@ mod tests {
         assert_eq!(&gz[4..8], &[0, 0, 0, 0], "mtime=0");
         assert_eq!(gz[9], 255, "OS=255");
         assert_eq!(gunzip_bytes(&gz).unwrap(), body);
-        // Go 产的 gzip（golden 样例 = fragmentPayload(gzipBytes(body)) 的真分片）
+        // 当前夹具中的 gzip（golden 样例 = fragmentPayload(gzipBytes(body)) 的真分片）
         for key in ["session-cjk", "session-git-log", "session-styles"] {
-            let frames = testutil::read_golden_bin(key);
+            let frames = testutil::read_current_frames(key);
             let mut asm = FragAssembler::default();
             let mut done = None;
             for (_, payload) in &frames {
@@ -1215,7 +1311,7 @@ mod tests {
                 }
             }
             let gz = done.expect("golden 集齐");
-            assert!(gunzip_bytes(&gz).is_ok(), "{key}: 解 Go gzip");
+            assert!(gunzip_bytes(&gz).is_ok(), "{key}: 解当前 gzip");
         }
     }
 
@@ -1223,7 +1319,7 @@ mod tests {
     #[test]
     fn surface_uplink_payloads_parity() {
         let cases = testutil::read_input_cases();
-        assert!(cases.len() >= 19, "input cases {}", cases.len());
+        assert_eq!(cases.len(), 4, "当前 theme/clipboard 定值案例完整");
         let mut seen_theme = false;
         let mut seen_clip = false;
         for (name, kind, fields, want_hex) in &cases {
@@ -1296,15 +1392,15 @@ mod tests {
         }
     }
 
-    /// 6e 判据⑤（消费向）：Rust 的攒片器 + gzip 解压 + 体解码吃得了 **Go 产的** golden 字节，
+    /// 6e 判据⑤（消费向）：攒片器 + gzip 解压 + 体解码消费当前 v5 golden 字节，
     /// 帧序应用（快照 → 差分）后的网格 digest 与 manifest.tsv 逐行一致。
     #[test]
-    fn surface_golden_consume_go_bins() {
+    fn surface_golden_consume_current_frames() {
         let manifest = testutil::golden_manifest();
         assert!(manifest.len() >= 8, "golden manifest 行数 {}", manifest.len());
         for row in &manifest {
             let name = &row[0];
-            let frames = testutil::read_golden_bin(name);
+            let frames = testutil::read_current_frames(name);
             assert!(!frames.is_empty(), "{name}: golden 帧序列空");
             let mut grid: Option<ClientGrid> = None;
             let mut cursor = SurfaceCursor::default();
@@ -1338,8 +1434,8 @@ mod tests {
             let g = grid.expect("{name}: 无快照帧");
             let text = testutil::fnv_hex(testutil::text_of(&g.rows).as_bytes());
             let style = testutil::fnv_hex(testutil::style_of(&g.rows, g.cols as usize).as_bytes());
-            assert_eq!(text, row[5], "{name}: 文本 digest（消费 Go 字节）");
-            assert_eq!(style, row[15], "{name}: 样式向量 digest（消费 Go 字节）");
+            assert_eq!(text, row[5], "{name}: 文本 digest（消费当前字节）");
+            assert_eq!(style, row[15], "{name}: 样式向量 digest（消费当前字节）");
             // 光标 4 列 / 回滚条 3 列 / 模式位列
             let want_cursor =
                 format!("{},{},{},{}", cursor.x, cursor.y, cursor.flags, cursor.shape);
@@ -1392,6 +1488,9 @@ mod tests {
             };
             let body = SnapshotBody {
                 revision: 1,
+                seq: 1,
+                history_epoch: vt.history_epoch(),
+                history_base: vt.history_base(),
                 cols: 100,
                 rows: 32,
                 cursor: snap_cursor,
@@ -1420,6 +1519,9 @@ mod tests {
                     let (modes, _, _) = surface_modes_of(&vt.modes());
                     let d = DiffBody {
                         revision: 1,
+                        seq: 2,
+                        history_epoch: vt.history_epoch(),
+                        history_base: vt.history_base(),
                         cols: 100,
                         rows: 32,
                         cursor: c,
@@ -1494,7 +1596,7 @@ mod tests {
     }
 
     /// F5②：含超长字素簇格的网格 encode → decode → 再 encode **字节相等**
-    /// （decode 会派生 width/wraps，结构体相等不可用作断言——评审 7.2）。
+    /// （dirty 不在线上传输，以字节相等钉住截断后的显式 width/wraps）。
     #[test]
     fn surface_symbol_truncation_roundtrip() {
         let mut vt = SessionVt::new(10, 3, 100).unwrap();
@@ -1526,7 +1628,7 @@ mod tests {
         let mut out = Vec::new();
         append_cell_truncated(&mut out, &c);
         // hdr 1 + sym 127 + fg 2（kind+idx）+ bg 1（kind）+ attr 2
-        assert_eq!(out.len(), 1 + 127 + 2 + 1 + 2, "截断写入长度");
+        assert_eq!(out.len(), 1 + 127 + 1 + 2 + 1 + 2, "截断写入长度");
         let (dec, n) = decode_cell(&out).expect("解码截断格");
         assert_eq!(n, out.len(), "解码恰好耗尽（字段对齐）");
         assert_eq!(dec.symbol.len(), 127);
@@ -1552,6 +1654,7 @@ mod tests {
     /// F10：解码维度守卫——伪造头（超大 cols/rows）返回 Err（形状断言，不只「不 OOM」）。
     #[test]
     fn decode_dims_guard_rejects_oversize() {
+        assert!(decode_grid(&[CELL_CODEC_VERSION, 232, 3, 132, 0]).is_err());
         // cols = 0xffff（5 字节头 + 空体 ⇒ 旧实现会按 4.29e9 格放大）
         let head = [CELL_CODEC_VERSION, 0xff, 0xff, 0x01, 0x00];
         match decode_grid(&head) {

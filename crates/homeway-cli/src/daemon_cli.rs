@@ -479,26 +479,11 @@ fn try_dial_control_named(state_dir: &std::path::Path, name: &str) -> Option<Arc
     }
 }
 
-/// 控制面连通则 Some，否则 None（reveal 族回落台账直读用）。
-fn try_dial_control(state_dir: &std::path::Path) -> Option<Arc<ControlClient>> {
-    let sock = state_dir.join("control.sock");
-    match ControlClient::dial(&sock, "cli", "homeway") {
-        Ok((c, w)) => {
-            eprintln!(
-                "（已连 control.sock：serverVersion={} generation={} seq={}）",
-                w.server_version, w.generation, w.server_seq
-            );
-            Some(c)
-        }
-        Err(_) => None,
-    }
-}
-
 /// serve/relay token 的 reveal：控制面运行态优先，**守护不在跑回落台账直读**
 /// （Go CLI 无此回落〔报可行动错误〕；保留是 local-rust-exit.sh 等脚本契约——
 /// 前台单角色形态无 control.sock，token 直读是该形态的唯一取法；登记 B0-2b.md）。
 fn token_reveal_with_fallback(state: &std::path::Path, op: vocab::OpName) {
-    if let Some(c) = try_dial_control(state) {
+    if let Some(c) = try_dial_control_named(state, "homeway") {
         match c.request(op.as_str(), Some(serde_json::json!({})), TIMEOUT) {
             Ok(v) => {
                 println!("{}", v["token"].as_str().unwrap_or("?"));

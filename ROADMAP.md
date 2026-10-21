@@ -68,8 +68,35 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 | **R7** | APP 接入（C-ABI 胶水 + OHOS 交叉 + 20 导出面 + HSP 集成 + 真机判据） | **完成**（2026-10-04 三棒收官：第 1 棒 7a–7f + 第 2 棒 7g–7k〔真机两轮全量判据 + P0 整改〕+ 第 3 棒 7l–7n〔P1/P2 29 项全处置 + 两条拍板落地 + 7m 补验四项收口 + dsh r3 复核〔F1 回归修复 + F2-F16 处置〕；真机三轮判据总表 + ci-local 全绿 21:06〕） | 9/9 步 |
 | **R8** | 终测收官（包体/性能终测 + 共存定案 + 文档指针补录） | **R8-1/8-2/8-3 完成**（2026-10-05：8a-8d + 8e-8h 归因收口；8i-8l 整形批 = 冷悬崖消除 + 批分布修复验证 + 消融重归因 + 尾账五项清 + 看门狗 60s bug 顺带修） | 8a-8l ✅（技术项全清，剩收官触点批） |
 | **B0/D/P/reactor（R8 后批次）** | 部署修复 B0-1/B0-2a/B0-2b、D-1/D-2 承载体、P1/P2 性能批、reactor 简化批 | **完成**（各自 reviews 在 docs/reviews/） | 见各批记录 |
+| **终端硬化（2026-10-21）** | surface v5/历史身份、VT语义/事件归属/粘贴事务、预算背压、CLI公平调度 | **源码与跨仓宿主/构建验收完成；未提交/推送/部署，真机另验** | 现行term196项；全仓串行1244/0，末轮core864/0；两道门见专项review |
 
 ## 下一步（当前指针）
+
+> **2026-10-21 终端当前单版本收口**：用户明确尚未发布，删除旧APP/旧出口握手与材质适配。
+> Rust严格当前HELLO字段、GREETING结构/版本、显式App/Host类型与按键平台；删除Legacy腿
+> 与宿主默认推断，保留raw-only故障路径和ANSI/DEC标准模式。CLI/APP与当前夹具同步执行。
+> 两道门记录 `docs/reviews/terminal-current-only-2026-10-21.md`；Rust功能已冻结，最终frames10/0、
+> session8/0、keyenc10/0、严格HELLO与混合应答各1/0、facade6/0及all-targets clippy通过。
+> 全term遇既有PTY收尸挂例，排除该例196/0并非全门通过；最终codec16/0、VT39/0、codec
+> fuzz100000轮与clippy、64项SHA/当前种子摘要通过；去旧Go样式空白归零，skip iff width0。
+> 跨仓当前C++三组回归、ArkTS311/0、terminal HSP/entry HAP、OHOS实验核交叉构建通过。
+> tier规格已归档2026-10-21-terminal-current-only。2026-10-21用户已授权两仓全部现有改动
+> 提交、推送、打debug包并部署双出口；不安装真机。当前执行清洁核构建/pin与配套滚动部署，
+> 结果追加部署实录；不声称PTY完整门或真机已过。
+
+> **2026-10-21 终端APP/CLI硬化**：按用户前轮评审完成本地源码修复，禁止使用review skill，
+> 技术/代码两道门采用结构化自评。服务端surface v5/cell v2显式升级，历史epoch/base/seq、
+> wraps/列宽/OSC色、混合腿应答归属、空闲150ms同步输出、1MiB/10s粘贴事务、快照/FETCH
+> 字节+128Ki格双预算及明确失败终局已落实；raw CLI有界队列/非阻塞stdout/公平调度完成。
+> 服务专项194/0及all-targets clippy、CLI专项27/0及clippy通过；夹具新向量入册，冻结baseline
+> 与原v4夹具不改。两道门见 `docs/reviews/terminal-hardening-server-2026-10-21.md`、
+> `docs/reviews/terminal-hardening-cli-2026-10-21.md`。**跨仓收口：全仓串行1244通过/37忽略，
+> 最后颜色材质补正后core串行864通过/5忽略，workspace all-targets clippy通过；App三组C++
+> 回归、terminal HSP/entry HAP构建、OHOS实验核交叉构建通过。真机未验、正式核pin未推进。
+> 下一步须用户授权协调出包/部署与设备验收；v5客户端/服务须同步升级；未提交/推送/装机，
+> 未将脏核打入包，未碰生产实例。tier规格已归档为2026-10-21-terminal-hardening。**
+> 最终复核追加：实际OSC颜色变更换材质epoch但保留绝对行base，主/备用屏共享失效、同值幂等；
+> 新增2例后VT全38/0、codec15/0及clippy通过，全仓结果由主会话汇总。
 
 > **2026-10-21 PTY无腿收尾回收**：v0.3.15已完成双出口换装与中继快速重启（61ms，
 > Mac控制面重新认证），CI双平台各1221/0、Release五目标绿；重复PTY验收发现空ENDED集

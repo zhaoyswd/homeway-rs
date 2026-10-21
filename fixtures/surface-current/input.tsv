@@ -1,0 +1,4 @@
+theme.light	theme	0,1a1a1a,ffffff	001a1a1affffff
+theme.dark	theme	1,1a1a1a,ffffff	011a1a1affffff
+clipboard.answer	clipboard	abc	020300616263
+clipboard.answer-empty	clipboard		020000

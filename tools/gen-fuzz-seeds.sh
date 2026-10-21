@@ -16,8 +16,7 @@
 #   - fuzz_probe 吃真探测响应（HWR 头 + nonce + build + flags + 端点列表段）。
 # 手工合成样本（设计 §2.3；第二道门 低-21 整改）：UPnP 713 body / M-SEARCH /
 # DNS 查询应答 / 内层 IPv4 头——三个原零种子目标补齐。
-# term 区（Q-D F11）：frames.v1.jsonl payloadHex / term-vt 真会话流 / surface-golden
-# 分片帧 / surface_codec.json 体向量——供 fuzz_term_{frames,vt,codec} 三目标。
+# term 区：当前 frames.v1.jsonl / term-vt ANSI流 / surface-current 的v5/cell2分片与体向量。
 # 注意：files 的 70KB 跨 u16 样本会展开（>4096）——libFuzzer 需 `-max_len=262160`
 # 才吃得到（默认 4096 会拒收长种子）。
 set -euo pipefail
@@ -30,7 +29,7 @@ OUT="$REPO_ROOT/fuzz/corpus.seeds"
 rm -rf "$OUT"
 
 python3 - "$REPO_ROOT" "$OUT" <<'PY'
-import json, os, sys, hashlib, struct
+import json, os, sys, hashlib, struct, gzip
 
 root, out = sys.argv[1], sys.argv[2]
 vec = os.path.join(root, "fixtures/vectors")
@@ -197,17 +196,28 @@ for i, name in enumerate(["session-cjk.bin", "session-git-log.bin", "session-hex
         write("fuzz_term_frames", f"session{i}", b)
         n += 2
 
-# golden 分片帧（surface 体：攒片 → gunzip → 体解码；整文件 = 真分片序列）
-for name in ["session-cjk.bin", "session-git-log.bin", "session-styles.bin"]:
-    p2 = os.path.join(root, "fixtures/surface-golden", name)
-    if os.path.exists(p2):
-        write("fuzz_term_codec", name.replace(".bin", ""), open(p2, "rb").read())
+current_frames = json.load(open(os.path.join(root, "fixtures/surface-current/frames.json")))
+for name, frames in current_frames.items():
+    compressed = bytearray()
+    for index, frame in enumerate(frames):
+        payload = unhex(frame["hex"])
+        write("fuzz_term_codec", f"{name}-fragment-{index}", payload)
         n += 1
+        compressed.extend(payload[1:])
+        if payload[0] == 0:
+            write("fuzz_term_codec", f"{name}-gzip-{index}", compressed)
+            write("fuzz_term_codec", f"{name}-body-{index}", gzip.decompress(compressed))
+            n += 2
+            compressed.clear()
+    assert not compressed, f"incomplete current fixture: {name}"
 
-# surface 体向量（快照/差分/分片正例字节）
-sc = os.path.join(vec, "surface_codec.json")
+sc = os.path.join(root, "fixtures/surface-current/codec.json")
 if os.path.exists(sc):
     v = json.load(open(sc))
+    for i, c in enumerate(v.get("cells", [])):
+        write("fuzz_term_codec", f"grid{i}", unhex(c["grid_hex"]))
+        write("fuzz_term_codec", f"rows{i}", int(c["cols"]).to_bytes(2,"little") + len(c["rows_in"]).to_bytes(2,"little") + unhex(c["rows_hex"]))
+        n += 2
     for i, c in enumerate(v.get("snapshot", [])):
         b = unhex(c.get("body_hex", ""))
         if b:

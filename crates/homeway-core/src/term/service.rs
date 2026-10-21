@@ -132,7 +132,7 @@ fn valid_name(name: &str) -> bool {
         && name.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'.' || b == b'_' || b == b'-')
 }
 
-/// 服务端 vt 逃生口（HOMEWAY_TERM_VT=off：本会话全部退化为 legacy-only——
+/// 服务端 vt 逃生口（HOMEWAY_TERM_VT=off：本会话全部退化为 raw-only——
 /// surface 腿得 surface_unavailable；Go `vtGloballyDisabled` 同款）。
 pub fn vt_disabled_by_env() -> bool {
     std::env::var("HOMEWAY_TERM_VT")
@@ -523,6 +523,8 @@ struct SurfState {
     offset: u64,
     len: u16,
     alt: bool,
+    history_epoch: u64,
+    history_base: u64,
 }
 
 /// surface 腿观测计数器（断开日志用；Go surfaceStats 同面，writeTimeout 计数合入
@@ -548,6 +550,7 @@ struct SurfStats {
 #[derive(Debug, Default)]
 struct SurfaceLeg {
     revision: u32,
+    seq: u64,
     need_snapshot: bool,
     has_base: bool,
     base: SurfState,
@@ -583,10 +586,6 @@ impl SurfaceLeg {
         self.revision
     }
 
-    fn under_pressure(&self) -> bool {
-        self.last_write_cost > MERGE_WINDOW_MAX
-    }
-
     fn state_unchanged(&self, st: &SurfState) -> bool {
         self.has_base
             && st.cursor == self.base.cursor
@@ -594,6 +593,8 @@ impl SurfaceLeg {
             && st.total == self.base.total
             && st.offset == self.base.offset
             && st.len == self.base.len
+            && st.history_epoch == self.base.history_epoch
+            && st.history_base == self.base.history_base
     }
 
     /// 回滚回落检测（基线 8167cb7 平移判据）：total 回落分两类——
@@ -638,11 +639,7 @@ struct RawHandshake {
 struct LegRt {
     key: LegKey,
     kind: LegKind,
-    /// HELLO 尾随声明了 capsRawTerminal（应答让位判据——与 surface 位无关，
-    /// surface+rawCapable 组合同样让位；Go rawTermLegs 计数器同义，评审 M4）。
-    raw_capable: bool,
-    /// **本腿**键编码平台口径（Q-J F1）：由 HELLO caps 声明（`KEY_ALT_*`），未声明/
-    /// 歧义 = 宿主推断。按腿存放——同会话两条不同声明的腿各按各自口径编码。
+    /// 本腿键编码平台口径由当前HELLO明确声明，不按出口宿主推断。
     key_flavor: super::keyenc::KeyFlavor,
     /// 本腿最近上报的网格尺寸（HELLO / RESIZE；registry `LegState.size` 的运行态
     /// 镜像——会话几何真变时据此判「本腿本地网格 ≠ 会话网格」的 raw 腿需要清屏）。
@@ -675,6 +672,13 @@ enum PtyInject {
     Nudge(&'static [u8]),
 }
 
+struct PasteTransaction {
+    owner: LegKey,
+    bracketed: bool,
+    updated: Instant,
+    bytes: Vec<u8>,
+}
+
 /// 会话运行态。
 struct SessRt {
     name: String,
@@ -684,7 +688,7 @@ struct SessRt {
     pty: Arc<PtyShared>,
     ring: OutputRing,
     scan: TermScan,
-    /// None = 本会话无服务端 vt（legacy-only；surface attach 得明确错误）。
+    /// None = 本会话无服务端 vt（raw-only；surface attach 得明确错误）。
     vt: Option<SessionVt>,
     legs: Vec<LegRt>,
     writers: usize,
@@ -703,6 +707,7 @@ struct SessRt {
     last_notified: String,
     /// active 腿上报的剪贴板读缓存（OSC 52 读请求的应答源）。
     clip_cache: Option<String>,
+    paste: Option<PasteTransaction>,
     resp_tx: SyncSender<PtyInject>,
     /// 观测面（F6）：查询应答/剪贴板写/PTY 注入（nudge）的丢弃计数（队列满）。
     resp_dropped: Arc<AtomicU64>,
@@ -794,10 +799,6 @@ pub struct TermService {
     logf: Logf,
     state: Mutex<State>,
     stop: Arc<AtomicBool>,
-    /// F1 观测面：HELLO caps 两位同置（歧义，含「裸 ID 尾随块」既有形态）的计数与
-    /// 一次性告警位——语义按「未声明（宿主推断）」处理，绝不拒腿。
-    key_flavor_ambiguous: AtomicU64,
-    key_flavor_ambiguous_warned: AtomicBool,
     /// F1 观测面：`handle_input` 查不到腿（`end_leg` 竞态）而丢弃输入的计数。
     leg_missing_input_drops: AtomicU64,
     /// **连接级在册计数**（M3 §1.7 设计门 2-4 的闸；容量见 [`Self::conn_capacity`]）——
@@ -860,8 +861,6 @@ impl TermService {
             next_sess_gen: 1,
             }),
             stop: Arc::new(AtomicBool::new(false)),
-            key_flavor_ambiguous: AtomicU64::new(0),
-            key_flavor_ambiguous_warned: AtomicBool::new(false),
             leg_missing_input_drops: AtomicU64::new(0),
             active_conns: Arc::new(AtomicUsize::new(0)),
             conn_over_cap: AtomicU64::new(0),
@@ -1154,7 +1153,7 @@ impl TermService {
             }
         };
         // 服务端版本门（FIX-29）：声明版本 ≠ 本出口 ⇒ 拒腿 + 可行动文案
-        if ht.ver_present && ht.ver != frames::PROTO_VER {
+        if ht.ver != frames::PROTO_VER {
             let _ = io.write_frame(
                 Op::ERROR,
                 &frames::enc_error(
@@ -1169,10 +1168,17 @@ impl TermService {
             );
             return;
         }
-        let surface = ht.caps_present && ht.caps & frames::caps::SURFACE != 0;
-        let raw_capable = ht.caps_present && ht.caps & frames::caps::RAW_TERMINAL != 0;
-        // F1：键编码平台口径（与本块 surface/raw 判定同域——`dec_hello_tail` 只做形状）
-        let key_flavor = self.key_flavor_from_caps(ht.caps, ht.caps_present);
+        let kind = match ht.caps & (frames::caps::SURFACE | frames::caps::RAW_TERMINAL) {
+            frames::caps::SURFACE => LegKind::App,
+            frames::caps::RAW_TERMINAL => LegKind::Host,
+            _ => unreachable!("当前HELLO已校验终端类型"),
+        };
+        let surface = kind == LegKind::App;
+        let key_flavor = if ht.caps & frames::caps::KEY_ALT_NO_ESC_PREFIX != 0 {
+            super::keyenc::KeyFlavor::AltNoEscPrefix
+        } else {
+            super::keyenc::KeyFlavor::AltEscPrefix
+        };
         if !valid_name(&name) {
             let _ = io.write_frame(
                 Op::ERROR,
@@ -1184,6 +1190,10 @@ impl TermService {
         let create = flags & hello_flags::CREATE != 0;
         let only_if_absent = flags & hello_flags::ONLY_IF_ABSENT != 0;
         let takeover = flags & hello_flags::TAKEOVER != 0;
+        if Size::exceeds_cell_budget(cols, rows) {
+            let _ = io.write_frame(Op::ERROR, &frames::enc_error("bad_hello", "终端视口超过 131072 格上限，请缩小网格"), self.cfg.write_timeout);
+            return;
+        }
         if let Err(e) = self.attach_or_create(&name, cols, rows, create, only_if_absent) {
             let _ = io.write_frame(Op::ERROR, &frames::enc_error(e.code.as_str(), &e.msg), WRITE_TIMEOUT);
             return;
@@ -1214,8 +1224,7 @@ impl TermService {
         // 注册腿（全序：同实例替换 → 接管 → 腾位 → 入表即活动）
         let desc = LegDescriptor {
             client_id: ht.client_id.clone(),
-            surface,
-            raw_capable,
+            kind,
             size,
         };
         let (out, hs, reg, sess_gen) = {
@@ -1259,8 +1268,7 @@ impl TermService {
             let out = Arc::new(LegOut::new());
             rt.legs.push(LegRt {
                 key: reg.key,
-                kind: LegKind::of(surface, raw_capable),
-                raw_capable,
+                kind,
                 key_flavor,
                 size,
                 skip_to: 0,
@@ -1409,6 +1417,10 @@ impl TermService {
                 Op::DATA => {
                     let (pty, discard_reply) = {
                         let mut st = self.lock_state();
+                        if rt_of(&st, name, sess_gen).is_some_and(|rt| rt.paste.is_some()) {
+                            out.enqueue(WriteItem::new(Op::ERROR, frames::enc_error("bad_input", "另一个客户端正在粘贴，请稍后重试")), self.cfg.queue_bytes);
+                            continue;
+                        }
                         // 非用户操作的自动上行不记活动：① `?1003` hover 流（鼠标划过
                         // 窗口不点击）；② 终端应答（本地终端对程序查询的自动回投——
                         // 双 raw 腿下应答在两腿间搬几何成反馈环）；③ 焦点**失去**
@@ -1438,7 +1450,7 @@ impl TermService {
                         // 帧丢弃**（不写 PTY），active 腿照常透传；hover/focus-out
                         // 不丢（程序需要焦点/悬停事件，丢弃破坏其状态）。已知代价：
                         // 查询与应答间 active 切换时该轮查询程序侧超时（TUI 有降级）。
-                        let discard_reply = is_reply && active != Some(key);
+                        let discard_reply = is_reply && response_owner(rt, active) != Some(key);
                         if discard_reply {
                             rt.replies_dropped += 1;
                             let n = rt.replies_dropped;
@@ -1478,6 +1490,10 @@ impl TermService {
                             continue;
                         }
                     };
+                    if cols != 0 && rows != 0 && Size::exceeds_cell_budget(cols, rows) {
+                        out.enqueue(WriteItem::new(Op::ERROR, frames::enc_error("bad_resize", "终端视口超过 131072 格上限，请缩小网格")), 0);
+                        continue;
+                    }
                     // F1b：`RESIZE 0×0` 忽略本次上报（Go 的会话尺寸写点在 0 门**之后**；
                     // 旧实现先写会话几何再被 apply 的 0 门放空 ⇒ 几何被污染成 0×0，
                     // LIST/ATTACHED/surface 体全 0 而格流仍按 vt 宽编 = 客户端错位）。
@@ -1603,7 +1619,16 @@ impl TermService {
         };
         let (pty, encoded) = {
             let mut st = self.lock_state();
-            let sz = st.registry.note_activity(name, key, now_ms());
+            if rt_of(&st, name, sess_gen).and_then(|rt| rt.paste.as_ref()).is_some_and(|paste| paste.owner != key) {
+                out.enqueue(WriteItem::new(Op::ERROR, frames::enc_error("bad_input", "另一个客户端正在粘贴，请稍后重试")), self.cfg.queue_bytes);
+                return;
+            }
+            if rt_of(&st, name, sess_gen).is_some_and(|rt| rt.paste.is_some())
+                && !matches!(ev, frames::InputEvent::Text { .. }) { return; }
+            let passive = matches!(ev, frames::InputEvent::Focus { gained: false }
+                | frames::InputEvent::Mouse { action: 2, button: 0, .. }
+                | frames::InputEvent::Key { action: 0, .. });
+            let sz = if passive { None } else { st.registry.note_activity(name, key, now_ms()) };
             let active = st.registry.session(name).and_then(|s| s.active);
             let Some(rt) = rt_of_mut(&mut st, name, sess_gen) else { return };
             apply_active_theme_locked(rt, active);
@@ -1615,7 +1640,7 @@ impl TermService {
                 return;
             }
             // F1：按腿取本腿键编码口径（与 `leg_is_surface` 同形态）。查不到腿 =
-            // `end_leg` 竞态 ⇒ 丢弃该输入 + 计数；**任何路径不得回落 `host_default()`**
+            // `end_leg` 竞态 ⇒ 丢弃该输入 + 计数；任何路径不得推断出口宿主平台
             //（防「默认宿主隐式回潮」——纪律见设计 F1-③）。
             let leg_flavor = rt.legs.iter().find(|l| l.key == key).map(|l| l.key_flavor);
             let Some(leg_flavor) = leg_flavor else {
@@ -1649,11 +1674,32 @@ impl TermService {
                     let paste = flags & frames::text_bits::PASTE != 0;
                     let more = flags & frames::text_bits::MORE != 0;
                     let cont = flags & frames::text_bits::CONT != 0;
-                    let bracketed = vt.modes().bracketed_paste;
-                    if !paste || !bracketed {
+                    let bracketed = rt.paste.as_ref().map(|paste| paste.bracketed).unwrap_or(paste && vt.modes().bracketed_paste);
+                    if cont != rt.paste.as_ref().is_some_and(|pending| pending.owner == key) {
+                        out.enqueue(WriteItem::new(Op::ERROR, frames::enc_error("bad_input", "粘贴分片顺序错误")), self.cfg.queue_bytes);
+                        return;
+                    }
+                    if more || cont {
+                        let pending = rt.paste.get_or_insert_with(|| PasteTransaction {
+                            owner: key, bracketed, updated: Instant::now(), bytes: Vec::new(),
+                        });
+                        if pending.bytes.len().saturating_add(text.len()) > 1 << 20 {
+                            rt.paste = None;
+                            out.enqueue(WriteItem::new(Op::ERROR, frames::enc_error("bad_input", "粘贴超过 1MiB 上限")), self.cfg.queue_bytes);
+                            return;
+                        }
+                        pending.bytes.extend_from_slice(text.as_bytes());
+                        pending.updated = Instant::now();
+                        if more {
+                            Vec::new()
+                        } else {
+                            let complete = rt.paste.take().expect("paste transaction");
+                            super::keyenc::encode_paste_part(&complete.bytes, complete.bracketed, true, true).unwrap_or_default()
+                        }
+                    } else if !bracketed {
                         text.clone().into_bytes()
                     } else {
-                        super::keyenc::encode_paste_part(text.as_bytes(), true, !cont, !more)
+                        super::keyenc::encode_paste_part(text.as_bytes(), true, true, true)
                             .unwrap_or_default()
                     }
                 }
@@ -1740,20 +1786,31 @@ impl TermService {
                 None
             } else if let Some(vt) = rt.vt.as_mut() {
                 let geom = st.registry.session(name).map(|s| s.size).unwrap_or(Size::DEFAULT);
-                let rev = rt
+                let surface = rt
                     .legs
                     .iter()
                     .find(|l| l.key == key)
                     .and_then(|l| l.surface.as_ref())
-                    .map(|s| s.revision)
-                    .unwrap_or(0);
-                let rows_enc = super::codec::encode_rows(&vt.rows_at(req.from, req.count as usize));
-                Some((geom, rev, rows_enc))
+                    .map(|s| (s.revision, s.seq))
+                    .unwrap_or_default();
+                let epoch = vt.history_epoch();
+                if epoch != req.history_epoch {
+                    if let Some(leg) = rt.legs.iter_mut().find(|leg| leg.key == key) {
+                        if let Some(surface) = leg.surface.as_mut() { surface.mark_need_snapshot("client"); }
+                    }
+                    rt.wake_surface();
+                    return;
+                }
+                let wire_budget = if self.cfg.queue_bytes == 0 { self.cfg.pending_cap } else {
+                    self.cfg.pending_cap.min(self.cfg.queue_bytes.saturating_sub(self.cfg.queue_bytes / 1000 + 128))
+                };
+                let (rows_enc, count) = bounded_history_rows(vt, req.from, req.count as usize, wire_budget.saturating_sub(64));
+                Some((geom, surface, epoch, vt.history_base(), rows_enc, count))
             } else {
                 None
             }
         };
-        let Some((geom, rev, rows_enc)) = built else {
+        let Some((geom, (revision, seq), history_epoch, history_base, rows_enc, count)) = built else {
             out.enqueue(
                 WriteItem::new(Op::ERROR, frames::enc_error("surface_unavailable", "本会话没有服务端 vt")),
                 0,
@@ -1761,11 +1818,14 @@ impl TermService {
             return;
         };
         let reply = super::codec::FetchRowsReply {
-            revision: rev,
+            revision,
             cols: geom.cols(),
             rows: geom.rows(),
+            seq,
+            history_epoch,
+            history_base,
             from: req.from,
-            count: req.count,
+            count,
             row_bytes: rows_enc,
         };
         let gz = super::codec::gzip_bytes(&super::codec::enc_fetch_rows_reply(&reply));
@@ -1878,16 +1938,16 @@ impl TermService {
         let (resp_tx, resp_rx) = std::sync::mpsc::sync_channel::<PtyInject>(RESP_QUEUE_LEN);
         let (clip_tx, clip_rx) = std::sync::mpsc::sync_channel::<String>(8);
         let vt = if vt_disabled_by_env() {
-            self.logf(&format!("term: 会话 {name} 无服务端 vt（HOMEWAY_TERM_VT=off）→ 该会话仅 legacy 原始字节模式"));
+            self.logf(&format!("term: 会话 {name} 无服务端 vt（HOMEWAY_TERM_VT=off）→ 该会话仅 raw 原始字节模式"));
             None
         } else {
             match SessionVt::new(cols, rows, self.cfg.scrollback_lines) {
                 Ok(v) => Some(v),
                 // 归一后本分支**不可达**（`Size::normalized` 入径 + `pty::spawn` 的 0→80/24
-                // 归一回填）：设计 §2 F1a（评审 1.7）的 legacy-only 退化只对**未来直连
+                // 归一回填）：设计 §2 F1a（评审 1.7）的 raw-only 退化只对**未来直连
                 // 调用点**是活路径；组件层硬拒由 vt.rs 单测直接覆盖（代码门 M1）。
                 Err(e) => {
-                    self.logf(&format!("term: 会话 {name} 无服务端 vt（{e}）→ 该会话仅 legacy 原始字节模式"));
+                    self.logf(&format!("term: 会话 {name} 无服务端 vt（{e}）→ 该会话仅 raw 原始字节模式"));
                     None
                 }
             }
@@ -1917,6 +1977,7 @@ impl TermService {
             sentinel_count: 0,
             last_notified: String::new(),
             clip_cache: None,
+            paste: None,
             resp_tx,
             resp_dropped: Arc::new(AtomicU64::new(0)),
             clip_dropped: Arc::new(AtomicU64::new(0)),
@@ -2104,6 +2165,7 @@ impl TermService {
             return;
         };
         let Some(rt) = st.sessions.get_mut(name) else { return };
+        if rt.paste.as_ref().is_some_and(|paste| paste.owner == key) { rt.paste = None; }
         let idx = rt.legs.iter().position(|l| l.key == key);
         let mut leg_kind = outcome.end.kind;
         let mut surf_stats: Option<SurfStats> = None;
@@ -2320,6 +2382,7 @@ impl TermService {
             ) = {
                 let mut guard = self.lock_state();
                 let st = &mut *guard;
+                let active = st.registry.session(name).and_then(|session| session.active);
                 let Some(rt) = rt_of_mut(st, name, sess_gen) else { break };
                 if rt.stopped.load(Ordering::Relaxed) {
                     break;
@@ -2329,7 +2392,7 @@ impl TermService {
                 // 应答让位（任务 5.1 窄规则）：capsRawTerminal 腿在场 ⇒ 服务端不代答
                 //（按腿上的 caps 位计数——surface+rawCapable 组合同样让位，Go
                 // rawTermLegs 计数器同义；评审 M4）
-                let suppress = rt.legs.iter().any(|l| l.raw_capable);
+                let suppress = response_owner(rt, active).is_some();
                 if let Some(vt) = rt.vt.as_mut() {
                     let mut resp: Vec<Vec<u8>> = Vec::new();
                     vt.write_collecting(&buf[..n], &mut |r| {
@@ -2341,7 +2404,8 @@ impl TermService {
                     for ev in vt.take_clip_events() {
                         match ev {
                             ClipEvt::Store(t) => clip_store = Some(t),
-                            ClipEvt::Load(f) => clip_loads.push(f),
+                            ClipEvt::Load(f) if !suppress => clip_loads.push(f),
+                            ClipEvt::Load(_) => {},
                         }
                     }
                 }
@@ -2485,6 +2549,7 @@ impl TermService {
                 if stopped.load(Ordering::Relaxed) {
                     return;
                 }
+                let wait_budget = self.sync_wait_budget(name, sess_gen);
                 let woke = {
                     let (m, cv) = &*surf_wake;
                     let g = m.lock().unwrap_or_else(|e| e.into_inner());
@@ -2492,7 +2557,7 @@ impl TermService {
                         true
                     } else {
                         let (g2, _) = cv
-                            .wait_timeout(g, Duration::from_millis(500))
+                            .wait_timeout(g, wait_budget)
                             .unwrap_or_else(|e| e.into_inner());
                         *g2 != seen
                     }
@@ -2500,7 +2565,8 @@ impl TermService {
                 while let Ok(text) = clip_rx.try_recv() {
                     self.forward_clipboard(name, sess_gen, &text);
                 }
-                if woke {
+                let flushed = self.flush_sync_pending(name, sess_gen);
+                if woke || flushed {
                     break;
                 }
             }
@@ -2539,6 +2605,52 @@ impl TermService {
         }
     }
 
+    fn sync_wait_budget(&self, name: &str, sess_gen: u64) -> Duration {
+        let state = self.lock_state();
+        rt_of(&state, name, sess_gen).and_then(|rt| rt.vt.as_ref())
+            .and_then(SessionVt::sync_deadline)
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()).max(Duration::from_millis(1)))
+            .unwrap_or(Duration::from_millis(500))
+            .min(Duration::from_millis(500))
+    }
+
+    fn flush_sync_pending(&self, name: &str, sess_gen: u64) -> bool {
+        let mut state = self.lock_state();
+        let active = state.registry.session(name).and_then(|session| session.active);
+        let Some(rt) = rt_of_mut(&mut state, name, sess_gen) else { return false };
+        if rt.paste.as_ref().is_some_and(|paste| paste.updated.elapsed() >= Duration::from_secs(10)) {
+            let owner = rt.paste.take().expect("paste transaction").owner;
+            if let Some(leg) = rt.legs.iter().find(|leg| leg.key == owner) {
+                leg.out.enqueue(WriteItem::new(Op::ERROR, frames::enc_error("bad_input", "粘贴分片超时，已取消")), self.cfg.queue_bytes);
+            }
+        }
+        let suppress = response_owner(rt, active).is_some();
+        let Some(vt) = rt.vt.as_mut() else { return false };
+        let mut responses = Vec::new();
+        if !vt.flush_sync_timeout(&mut |bytes| { if !suppress { responses.push(bytes.to_vec()); } }) {
+            return false;
+        }
+        for event in vt.take_clip_events() {
+            match event {
+                ClipEvt::Store(text) => {
+                    let _ = rt.clip_tx.try_send(text);
+                }
+                ClipEvt::Load(answer) => {
+                    if !suppress {
+                        if let Some(cache) = &rt.clip_cache { responses.push(answer(cache).into_bytes()); }
+                    }
+                }
+            }
+        }
+        let sender = rt.resp_tx.clone();
+        let dropped = Arc::clone(&rt.resp_dropped);
+        drop(state);
+        for bytes in responses {
+            try_send_or_count(&sender, PtyInject::Resp(bytes), &dropped, &self.logf, name, "查询应答", "（队列满）");
+        }
+        true
+    }
+
     /// 剪贴板写（OSC 52）：立即下发，只发 surface 腿（raw 腿字节流自带该序列）。
     fn forward_clipboard(&self, name: &str, sess_gen: u64, text: &str) {
         let mut st = self.lock_state();
@@ -2554,7 +2666,7 @@ impl TermService {
         }
     }
 
-    /// surface 一拍（Go flushSurface）：锁内取快照/建体、锁外压缩入队。
+    /// surface 一拍：锁内取一致性材质，锁外建体/压缩/入队。
     fn flush_surface(self: &Arc<Self>, name: &str, sess_gen: u64) {
         let pendings: Vec<Pending> = {
             let mut guard = self.lock_state();
@@ -2584,9 +2696,8 @@ impl TermService {
             }
             // 每拍取一次脏行（所有 surface 腿共享；count 可为 0——光标/模式位走腿基线判定）
             let _ = vt.update();
-            let dirty = vt.dirty_rows();
+            let dirty = Arc::new(vt.dirty_rows());
             let count = dirty.len();
-            let enc = if count > 0 { super::codec::encode_rows(&dirty) } else { Vec::new() };
             let sb = vt.scrollbar();
             let (modes, kitty, misc) = super::codec::surface_modes_of(&vt.modes());
             let st_tick = SurfState {
@@ -2596,13 +2707,15 @@ impl TermService {
                 offset: sb.offset,
                 len: sb.len as u16,
                 alt: modes & super::codec::mode_bits::ALT_SCREEN != 0,
+                history_epoch: vt.history_epoch(),
+                history_base: vt.history_base(),
             };
-            let mut snapshot_mat: Option<(Vec<u8>, Vec<u8>)> = None; // (grid, mirror)
+            let mut snapshot_mat: Option<Arc<(Vec<u8>, Vec<u8>)>> = None;
             let mut out: Vec<Pending> = Vec::new();
             for l in rt.legs.iter_mut() {
                 let Some(s) = l.surface.as_mut() else { continue };
-                let mut force = s.take_snapshot_flag() || s.under_pressure();
-                if !force && (!s.has_base || st_tick.alt != s.base.alt) {
+                let mut force = s.take_snapshot_flag();
+                if !force && (!s.has_base || st_tick.alt != s.base.alt || st_tick.history_epoch != s.base.history_epoch) {
                     s.stats.degrades += 1; // 首次基线缺失 / 备用屏进出 ⇒ 该腿全量
                     force = true;
                 }
@@ -2611,21 +2724,32 @@ impl TermService {
                         // F2：快照材质提交全屏指纹（下发成功后增量不再重复带已发过的行）
                         let grid = super::codec::encode_grid(cols, rows, &vt.rows_and_commit());
                         // F1c：镜像窗口 = min(rows × MIRROR_VIEWPORTS, 字节预算反推的行数)
-                        let mirror_rows = vt.mirror_rows(mirror_window_rows(cols, rows));
+                        let cell_rows = Size::MAX_VIEWPORT_CELLS.saturating_sub(cols as usize * rows as usize) / cols as usize;
+                        let count = mirror_window_rows(cols, rows).min(cell_rows).min(sb.offset.saturating_sub(vt.history_base()) as usize);
+                        let budget = self.cfg.pending_cap.saturating_sub(grid.len() + title.len() + 96);
+                        let (mut mirror_rows, mirror_count) = bounded_mirror_rows(vt, count, budget);
                         let mirror = if mirror_rows.is_empty() {
                             Vec::new()
                         } else {
-                            super::codec::encode_grid(cols, mirror_rows.len() as u16, &mirror_rows)
+                            let mut block = Vec::with_capacity(mirror_rows.len() + 5);
+                            block.push(super::codec::CELL_CODEC_VERSION);
+                            block.extend_from_slice(&cols.to_le_bytes());
+                            block.extend_from_slice(&mirror_count.to_le_bytes());
+                            block.append(&mut mirror_rows);
+                            block
                         };
-                        (grid, mirror)
+                        Arc::new((grid, mirror))
                     });
                     let rev = s.next_revision();
                     // 回滚条基线不在这里记（基线 8167cb7 起）：noteSentScrollbar 在入队
                     // 成功后统一推进（本函数只建体；入队失败时基线不能前移，否则回落检测漏判）。
-                    let body = super::codec::enc_snapshot_body(&SnapshotBody {
+                    let body = SnapshotBody {
                         revision: rev,
                         cols,
                         rows,
+                        seq: s.seq.saturating_add(1),
+                        history_epoch: st_tick.history_epoch,
+                        history_base: st_tick.history_base,
                         cursor: st_tick.cursor,
                         modes: st_tick.modes,
                         kitty,
@@ -2636,18 +2760,21 @@ impl TermService {
                             offset: st_tick.offset,
                             len: st_tick.len,
                         },
-                        grid: mat.0.clone(),
-                        mirror: mat.1.clone(),
-                    });
-                    out.push(Pending { key: l.key, op: Op::SNAPSHOT, body, st: st_tick });
+                        grid: Vec::new(),
+                        mirror: Vec::new(),
+                    };
+                    out.push(Pending { key: l.key, op: Op::SNAPSHOT, body: PendingBody::Snapshot(body, Arc::clone(mat)), st: st_tick, seq: s.seq.saturating_add(1) });
                 } else {
                     if count == 0 && s.state_unchanged(&st_tick) {
                         continue; // 无脏行且该腿基线无差异 ⇒ 整拍跳过
                     }
-                    let body = super::codec::enc_diff_body(&DiffBody {
+                    let body = DiffBody {
                         revision: s.revision,
                         cols,
                         rows,
+                        seq: s.seq.saturating_add(1),
+                        history_epoch: st_tick.history_epoch,
+                        history_base: st_tick.history_base,
                         cursor: st_tick.cursor,
                         modes: st_tick.modes,
                         scroll: ScrollbarWire {
@@ -2655,10 +2782,10 @@ impl TermService {
                             offset: st_tick.offset,
                             len: st_tick.len,
                         },
-                        row_bytes: enc.clone(),
+                        row_bytes: Vec::new(),
                         row_count: count as u16,
-                    });
-                    out.push(Pending { key: l.key, op: Op::SURFACE_DIFF, body, st: st_tick });
+                    };
+                    out.push(Pending { key: l.key, op: Op::SURFACE_DIFF, body: PendingBody::Diff(body, Arc::clone(&dirty)), st: st_tick, seq: s.seq.saturating_add(1) });
                 }
             }
             if !out.is_empty() {
@@ -2667,27 +2794,55 @@ impl TermService {
             out
         };
         // 锁外：gzip/分片/入队（两种失败模式分开：单帧超上限 vs 队列积压超上限）
+        let mut encoded_dirty: Option<Vec<u8>> = None;
         for p in pendings {
-            if p.body.len() > self.cfg.pending_cap {
-                // 失败模式一（单帧超上限）：标记需全量、下一拍重试
-                self.mark_leg_surface(name, p.key, |s| s.mark_need_snapshot("backpressure"));
+            let body = match p.body {
+                PendingBody::Snapshot(body, material) => {
+                    super::codec::enc_snapshot_material(&body, &material.0, &material.1)
+                }
+                PendingBody::Diff(body, rows) => {
+                    super::codec::enc_diff_material(&body, encoded_dirty.get_or_insert_with(|| super::codec::encode_rows(&rows)))
+                }
+            };
+            if body.len() > self.cfg.pending_cap {
+                if p.op == Op::SNAPSHOT {
+                    self.with_leg_out(name, p.key, |out| {
+                        out.enqueue(WriteItem::new(Op::ERROR, frames::enc_error("surface_unavailable", "终端视口超过内存预算，请缩小网格")), 0);
+                        out.finish_ended(WriteItem::new(Op::ENDED, frames::enc_ended(-1, "")));
+                        true
+                    });
+                } else {
+                    self.mark_leg_surface(name, p.key, |s| s.mark_need_snapshot("backpressure"));
+                }
                 continue;
             }
-            let gz = super::codec::gzip_bytes(&p.body);
+            let gz = super::codec::gzip_bytes(&body);
             let mut items: Vec<WriteItem> = super::codec::fragment_payload(&gz)
                 .into_iter()
                 .map(|frag| WriteItem::new(p.op, frag))
                 .collect();
             if p.op == Op::SNAPSHOT {
                 // 完成标志与分片同组入队（快照语义上是一段连续字节）
-                items.push(WriteItem::new(Op::SNAPSHOT_DONE, frames::enc_replay_done(p.body.len() as u32, 0)));
+                items.push(WriteItem::new(Op::SNAPSHOT_DONE, frames::enc_replay_done(body.len() as u32, 0)));
             }
             let bytes: usize = items.iter().map(|i| i.payload.len()).sum();
             let frag_count = items.len() as u64;
+            if bytes > self.cfg.queue_bytes && self.cfg.queue_bytes != 0 && p.op == Op::SNAPSHOT {
+                self.with_leg_out(name, p.key, |out| {
+                    out.discard_surface_updates();
+                    out.enqueue(WriteItem::new(Op::ERROR, frames::enc_error("surface_unavailable", "终端快照超过发送预算，请缩小网格")), 0);
+                    out.finish_ended(WriteItem::new(Op::ENDED, frames::enc_ended(-1, "")));
+                    true
+                });
+                continue;
+            }
             let queue_ok = self.with_leg_out(name, p.key, |out| out.enqueue_group(items, self.cfg.queue_bytes));
             if !queue_ok {
                 // 失败模式二（队列积压超上限）：丢弃待发 + 标记需全量
                 self.mark_leg_surface(name, p.key, |s| s.mark_need_snapshot("queue_overflow"));
+                self.with_leg_out(name, p.key, |out| { out.discard_surface_updates(); true });
+                let st = self.lock_state();
+                if let Some(rt) = rt_of(&st, name, sess_gen) { rt.wake_surface(); }
                 continue;
             }
             // 观测计数 + 基线提交（入队成功后）
@@ -2703,6 +2858,7 @@ impl TermService {
                         s.stats.fragments += frag_count;
                         s.stats.bytes_out += bytes as u64;
                         s.base = p.st;
+                        s.seq = p.seq;
                         s.has_base = true;
                         // 回滚条基线随**成功入队的帧**推进（快照与差分都算）——noteScrollbar
                         // 的回落判据与客户端「上一帧已知的回滚条」对齐（基线 8167cb7）。
@@ -3078,9 +3234,9 @@ impl TermService {
             let (items, ended, quit) = out.take();
             for it in &items {
                 let started = Instant::now();
-                match io.write_frame(it.op, &it.payload, WRITE_TIMEOUT) {
+                match io.write_frame(it.op, &it.payload, self.cfg.write_timeout) {
                     Ok(()) => {
-                        // 写耗时上报（FIX-28）：超过合并窗 ⇒ underPressure ⇒ 下一拍走全量
+                        // 写耗时仅作观测，不将慢写升级成更大的全量帧。
                         let cost = started.elapsed();
                         self.mark_leg_surface(name, key, |s| s.last_write_cost = cost);
                     }
@@ -3105,7 +3261,7 @@ impl TermService {
                 }
             }
             if let Some(ended_payload) = ended {
-                let _ = io.write_frame(Op::ENDED, &ended_payload, WRITE_TIMEOUT);
+                let _ = io.write_frame(Op::ENDED, &ended_payload, self.cfg.write_timeout);
                 drop_stream(io);
                 self.writer_exited(name, sess_gen);
                 return;
@@ -3147,7 +3303,7 @@ impl TermService {
                     active: reg.active == Some(l.key),
                 })
                 .collect();
-            // legacy-only 会话（无服务端 vt）恒无 cwd——Go cwdLocked 同款（评审 L9）
+            // raw-only 会话（无服务端 vt）恒无 cwd——Go cwdLocked 同款（评审 L9）
             let cwd = rt
                 .vt
                 .is_some()
@@ -3199,7 +3355,7 @@ impl TermService {
             if rt.vt.is_none() {
                 return Err(TermError::new(
                     super::session::TermErrorCode::NoVt,
-                    format!("会话 {name} 没有服务端 vt（legacy-only），没有屏幕证据可判"),
+                    format!("会话 {name} 没有服务端 vt（raw-only），没有屏幕证据可判"),
                 ));
             }
             Arc::clone(&rt.pty)
@@ -3255,7 +3411,7 @@ impl TermService {
             .get(name)
             .and_then(|rt| rt.legs.iter().find(|l| l.key == key))
             .map(|l| l.kind.as_str())
-            .unwrap_or("legacy")
+            .unwrap_or("detached")
     }
 
     /// 腿是否声明了 surface 能力（上行帧的门面）。
@@ -3265,35 +3421,6 @@ impl TermService {
             .get(name)
             .and_then(|rt| rt.legs.iter().find(|l| l.key == key))
             .is_some_and(|l| l.surface.is_some())
-    }
-
-    /// HELLO caps → 本腿键编码平台口径（Q-J F1）：`KEY_ALT_*` 两位互斥声明；
-    /// 未声明（两位全不置）= 宿主推断（缺省兼容，逐字节同今日）。
-    /// **两位同置 = 歧义 ⇒ 按未声明处理（fail-soft）+ 计数 + 一次性告警，绝不拒腿**——
-    /// 「裸 ID 尾随块」按 caps 解析出 `caps=0x7F` 恰含 bit2|bit3（`frames::dec_hello_tail`
-    /// 既有测试钉死），任何拒绝面都会把今天可服务的腿变成 `bad_capability`。
-    fn key_flavor_from_caps(&self, caps: u8, caps_present: bool) -> super::keyenc::KeyFlavor {
-        use super::keyenc::KeyFlavor;
-        if !caps_present {
-            return KeyFlavor::host_default();
-        }
-        let no_esc = caps & frames::caps::KEY_ALT_NO_ESC_PREFIX != 0;
-        let esc = caps & frames::caps::KEY_ALT_ESC_PREFIX != 0;
-        match (no_esc, esc) {
-            (true, false) => KeyFlavor::AltNoEscPrefix,
-            (false, true) => KeyFlavor::AltEscPrefix,
-            (false, false) => KeyFlavor::host_default(),
-            (true, true) => {
-                self.key_flavor_ambiguous.fetch_add(1, Ordering::Relaxed);
-                if !self.key_flavor_ambiguous_warned.swap(true, Ordering::Relaxed) {
-                    self.logf(
-                        "⚠️ term: 客户端 caps 同时声明 KEY_ALT_ESC_PREFIX 与 KEY_ALT_NO_ESC_PREFIX\
-（歧义——含「裸 ID 尾随块」既有形态）—— 按未声明处理（宿主推断），不拒腿；本形态计数已开启",
-                    );
-                }
-                KeyFlavor::host_default()
-            }
-        }
     }
 
     fn logf(&self, msg: &str) {
@@ -3502,6 +3629,45 @@ fn apply_active_theme_locked(rt: &mut SessRt, active: Option<LegKey>) {
         }
     }
     rt.clip_cache = clip;
+}
+
+fn response_owner(rt: &SessRt, active: Option<LegKey>) -> Option<LegKey> {
+    active.filter(|key| rt.legs.iter().any(|leg| leg.key == *key && leg.kind == LegKind::Host))
+}
+
+fn bounded_history_rows(vt: &SessionVt, from: u64, count: usize, budget: usize) -> (Vec<u8>, u16) {
+    let mut encoded = Vec::new();
+    let mut accepted = 0;
+    let cell_rows = Size::MAX_VIEWPORT_CELLS / vt.size().0 as usize;
+    for index in 0..count.min(FETCH_ROWS_MAX as usize).min(cell_rows) {
+        let rows = vt.rows_at(from.saturating_add(index as u64), 1);
+        if rows.is_empty() { break; }
+        let bytes = super::codec::encode_rows(&rows);
+        if encoded.len().saturating_add(bytes.len()) > budget { break; }
+        encoded.extend(bytes);
+        accepted += 1;
+    }
+    (encoded, accepted)
+}
+
+fn bounded_mirror_rows(vt: &SessionVt, count: usize, budget: usize) -> (Vec<u8>, u16) {
+    let mut encoded = Vec::new();
+    let mut length = 0usize;
+    let top = vt.scrollbar().offset;
+    let cell_rows = Size::MAX_VIEWPORT_CELLS / vt.size().0 as usize;
+    for index in 0..count.min(cell_rows) {
+        let Some(from) = top.checked_sub(index as u64 + 1) else { break };
+        let rows = vt.rows_at(from, 1);
+        if rows.is_empty() { break; }
+        let bytes = super::codec::encode_rows(&rows);
+        if length.saturating_add(bytes.len()) > budget { break; }
+        length += bytes.len();
+        encoded.push(bytes);
+    }
+    let count = encoded.len() as u16;
+    let mut out = Vec::with_capacity(length);
+    for row in encoded.into_iter().rev() { out.extend(row); }
+    (out, count)
 }
 
 /// 尺寸应用（applySizeLocked）：PTY setsize + epoch + vt 重排 + 全 surface 腿标记全量
@@ -3828,8 +3994,14 @@ fn drop_stream(io: FrameIo) {
 struct Pending {
     key: LegKey,
     op: Op,
-    body: Vec<u8>,
+    body: PendingBody,
     st: SurfState,
+    seq: u64,
+}
+
+enum PendingBody {
+    Snapshot(SnapshotBody, Arc<(Vec<u8>, Vec<u8>)>),
+    Diff(DiffBody, Arc<Vec<super::vt::Row>>),
 }
 
 enum NextChunk {
@@ -3859,7 +4031,7 @@ mod list_json_shape {
     /// 在场腿信息（term-host-cli 任务 2.5，design D8：字段只增不改）。
     #[derive(Serialize)]
     pub struct ClientEntryJson {
-        pub kind: &'static str, // app / host / legacy
+        pub kind: &'static str,
         pub cols: u16,
         pub rows: u16,
         #[serde(rename = "sinceMs")]
@@ -4046,8 +4218,6 @@ mod tests {
                 next_sess_gen: 1,
             }),
             stop: Arc::new(AtomicBool::new(false)),
-            key_flavor_ambiguous: AtomicU64::new(0),
-            key_flavor_ambiguous_warned: AtomicBool::new(false),
             leg_missing_input_drops: AtomicU64::new(0),
             active_conns: Arc::new(AtomicUsize::new(0)),
             conn_over_cap: AtomicU64::new(0),
@@ -4157,6 +4327,171 @@ mod tests {
         frames::enc_hello(80, 24, 0, name, tail)
     }
 
+    #[test]
+    fn history_and_mirror_material_respect_actual_byte_budget() {
+        let mut vt = SessionVt::new(80, 3, 100).unwrap();
+        for index in 0..30 { vt.write(format!("row-{index:02} {}\r\n", "中".repeat(20)).as_bytes()); }
+        let from = vt.history_base();
+        let first = super::super::codec::encode_rows(&vt.rows_at(from, 1));
+        let (rows, count) = bounded_history_rows(&vt, from, 512, first.len());
+        assert_eq!(count, 1);
+        assert_eq!(rows, first);
+        let (rows, count) = bounded_history_rows(&vt, from, 512, first.len() - 1);
+        assert!(rows.is_empty());
+        assert_eq!(count, 0);
+        let top = vt.scrollbar().offset;
+        let latest = super::super::codec::encode_rows(&vt.rows_at(top - 1, 1));
+        let (rows, count) = bounded_mirror_rows(&vt, 100, latest.len());
+        assert_eq!(rows, latest);
+        assert_eq!(count, 1);
+        assert_eq!(bounded_mirror_rows(&vt, 100, latest.len() - 1), (Vec::new(), 0));
+        assert_eq!(bounded_mirror_rows(&vt, 100, 0), (Vec::new(), 0));
+        let mut wide = SessionVt::new(1000, 1, 200).unwrap();
+        wide.write(&[b'\n'; 200]);
+        assert_eq!(bounded_history_rows(&wide, 0, 512, usize::MAX).1, 131);
+        assert_eq!(bounded_mirror_rows(&wide, 1000, usize::MAX).1, 131);
+    }
+
+    #[test]
+    fn oversized_viewport_reports_terminal_failure_instead_of_retrying_snapshot() {
+        let cfg = TermConfig { shell: Some("cat".into()), pending_cap: 1, ..Default::default() };
+        let svc = svc_with(cfg, Arc::new(Mutex::new(Vec::new())));
+        let (listener, path) = start_listener();
+        let running = Arc::clone(&svc);
+        std::thread::spawn(move || running.serve(listener));
+        let mut client = Client::connect(&path);
+        client.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, &tmp_name("too-large"),
+            &frames::enc_hello_tail(frames::caps::SURFACE | frames::caps::KEY_ALT_NO_ESC_PREFIX, "app")));
+        client.expect(Op::ATTACHED, 5);
+        let error = client.expect(Op::ERROR, 5);
+        assert_eq!(frames::dec_error(&error.payload).unwrap().0, "surface_unavailable");
+        client.expect(Op::ENDED, 5);
+        svc.close();
+    }
+
+    #[test]
+    fn mixed_surface_active_answers_queries_and_passive_events_keep_owner() {
+        let cfg = TermConfig { shell: Some("stty raw -echo; printf READY; cat".into()), ..Default::default() };
+        let svc = svc_with(cfg, Arc::new(Mutex::new(Vec::new())));
+        let (listener, path) = start_listener();
+        let running = Arc::clone(&svc);
+        std::thread::spawn(move || running.serve(listener));
+        let name = tmp_name("mixed-owner");
+        let mut observer = Client::connect(&path);
+        observer.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, &name,
+            &frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "raw")));
+        observer.expect(Op::ATTACHED, 5);
+        observer.expect(Op::REPLAY_DONE, 5);
+        observer.drain_data_until(|bytes| has_bytes(bytes, b"READY"), 5);
+        let mut first = Client::connect(&path);
+        first.send(Op::HELLO, &hello(&name, &frames::enc_hello_tail(frames::caps::SURFACE | frames::caps::KEY_ALT_NO_ESC_PREFIX, "surface-a")));
+        first.expect(Op::ATTACHED, 5);
+        let first_key = {
+            let state = svc.lock_state();
+            state.registry.session(&name).unwrap().active.unwrap()
+        };
+        let mut second = Client::connect(&path);
+        second.send(Op::HELLO, &hello(&name, &frames::enc_hello_tail(frames::caps::SURFACE | frames::caps::KEY_ALT_NO_ESC_PREFIX, "surface-b")));
+        second.expect(Op::ATTACHED, 5);
+        let (generation, active) = {
+            let state = svc.lock_state();
+            (state.sessions[&name].gen, state.registry.session(&name).unwrap().active)
+        };
+        svc.handle_input(&name, generation, first_key, &frames::enc_input(&frames::InputEvent::Focus { gained: false }), &Arc::new(LegOut::new()));
+        assert_eq!(svc.lock_state().registry.session(&name).unwrap().active, active);
+        second.send(Op::INPUT, &frames::enc_input(&frames::InputEvent::Text { flags: 0, text: "\x1b[5n".into() }));
+        observer.drain_data_until(|bytes| has_bytes(bytes, b"\x1b[0n"), 5);
+        second.send(Op::INPUT, &frames::enc_input(&frames::InputEvent::Text { flags: 0, text: "\x1b[?2026hTIMEOUT".into() }));
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let text = svc.lock_state().sessions.get_mut(&name).unwrap().vt.as_mut().unwrap().screen_text();
+            if text.contains("TIMEOUT") { break; }
+            assert!(Instant::now() < deadline, "空闲同步更新未按超时应用");
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        svc.close();
+    }
+
+    #[test]
+    fn fragmented_paste_commits_once_and_disconnect_discards_uncommitted_bytes() {
+        let cfg = TermConfig { shell: Some("stty raw -echo; printf READY; cat".into()), ..Default::default() };
+        let svc = svc_with(cfg, Arc::new(Mutex::new(Vec::new())));
+        let (listener, path) = start_listener();
+        let running = Arc::clone(&svc);
+        std::thread::spawn(move || running.serve(listener));
+        let name = tmp_name("paste-atomic");
+        let mut observer = Client::connect(&path);
+        observer.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, &name,
+            &frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "observer")));
+        observer.expect(Op::ATTACHED, 5);
+        observer.expect(Op::REPLAY_DONE, 5);
+        observer.drain_data_until(|bytes| has_bytes(bytes, b"READY"), 5);
+        let mut surface = Client::connect(&path);
+        surface.send(Op::HELLO, &hello(&name, &frames::enc_hello_tail(frames::caps::SURFACE | frames::caps::KEY_ALT_NO_ESC_PREFIX, "paster")));
+        surface.expect(Op::ATTACHED, 5);
+        let (generation, key) = {
+            let mut state = svc.lock_state();
+            let rt = state.sessions.get_mut(&name).unwrap();
+            rt.vt.as_mut().unwrap().write(b"\x1b[?2004h");
+            (rt.gen, state.registry.session(&name).unwrap().active.unwrap())
+        };
+        let out = Arc::new(LegOut::new());
+        svc.handle_input(&name, generation, key, &frames::enc_input(&frames::InputEvent::Text {
+            flags: frames::text_bits::PASTE | frames::text_bits::MORE, text: "AA".into(),
+        }), &out);
+        assert_eq!(svc.lock_state().sessions[&name].paste.as_ref().unwrap().bytes, b"AA");
+        svc.handle_input(&name, generation, key, &frames::enc_input(&frames::InputEvent::Text {
+            flags: frames::text_bits::PASTE | frames::text_bits::CONT, text: "BB".into(),
+        }), &out);
+        observer.drain_data_until(|bytes| has_bytes(bytes, b"\x1b[200~AABB\x1b[201~"), 5);
+        svc.handle_input(&name, generation, key, &frames::enc_input(&frames::InputEvent::Text {
+            flags: frames::text_bits::PASTE | frames::text_bits::MORE, text: "DISCARD".into(),
+        }), &out);
+        svc.end_leg(&name, key, i32::MIN, "", "test_disconnect");
+        assert!(svc.lock_state().sessions[&name].paste.is_none());
+        svc.close();
+    }
+
+    #[test]
+    fn paste_timeout_is_not_starved_by_continuous_surface_wakes() {
+        let svc = svc_with(TermConfig { shell: Some("cat".into()), ..Default::default() }, Arc::new(Mutex::new(Vec::new())));
+        let (listener, path) = start_listener();
+        let running = Arc::clone(&svc);
+        std::thread::spawn(move || running.serve(listener));
+        let name = tmp_name("paste-timeout");
+        let mut client = Client::connect(&path);
+        client.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, &name,
+            &frames::enc_hello_tail(frames::caps::SURFACE | frames::caps::KEY_ALT_NO_ESC_PREFIX, "app")));
+        client.expect(Op::ATTACHED, 5);
+        {
+            let mut state = svc.lock_state();
+            let rt = state.sessions.get_mut(&name).unwrap();
+            rt.paste = Some(PasteTransaction { owner: rt.legs[0].key, bracketed: true,
+                updated: Instant::now() - Duration::from_secs(11), bytes: b"uncommitted".to_vec() });
+            rt.wake_surface();
+        }
+        let stop = Arc::new(AtomicBool::new(false));
+        let wake_stop = Arc::clone(&stop);
+        let waking = Arc::clone(&svc);
+        let wake_name = name.clone();
+        let worker = std::thread::spawn(move || {
+            while !wake_stop.load(Ordering::Relaxed) {
+                if let Some(rt) = waking.lock_state().sessions.get(&wake_name) { rt.wake_surface(); }
+                std::thread::sleep(Duration::from_millis(3));
+            }
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        let expired = loop {
+            if svc.lock_state().sessions[&name].paste.is_none() { break true; }
+            if Instant::now() >= deadline { break false; }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        stop.store(true, Ordering::Relaxed);
+        worker.join().unwrap();
+        svc.close();
+        assert!(expired, "持续唤醒不能让已超时粘贴一直占用输入所有权");
+    }
+
     /// 全流程：CREATE(-d) → LIST → attach（raw）回放/回显 → KILL → ENDED(-2)。
     #[test]
     fn raw_attach_replay_echo_kill_ended() {
@@ -4195,7 +4530,7 @@ mod tests {
         // attach（caps rawTerminal）：ATTACHED → 回放含 TERMTEST-READY → REPLAY-DONE
         std::thread::sleep(Duration::from_millis(700)); // 等 shell 吐完 READY 进环
         let mut c2 = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "host-1");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "host-1");
         c2.send(Op::HELLO, &hello("t1", &tail));
         let f = c2.expect(Op::ATTACHED, 5);
         let (_cols, _rows, _modes, agent, state, name) = frames::dec_attached(&f.payload).unwrap();
@@ -4265,13 +4600,13 @@ mod tests {
         }
         // 腿 A（id=dev-1）
         let mut a = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "dev-1");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "dev-1");
         a.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, "tx", &tail));
         a.expect(Op::ATTACHED, 5);
         a.expect(Op::REPLAY_DONE, 5);
         // 腿 B（attach -d 接管）⇒ A 收 ENDED(-1, replaced)
         let mut b = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "dev-2");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "dev-2");
         b.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::TAKEOVER, "tx", &tail));
         b.expect(Op::ATTACHED, 5);
         let f = a.expect(Op::ENDED, 5);
@@ -4310,7 +4645,8 @@ mod tests {
         }
         let mut c = Client::connect(&path);
         // 版本门：caps 带 protoVer 位 + 版本 9 → ERROR(term_version)
-        let bad: Vec<u8> = vec![1u8, frames::caps::PROTO_VER | frames::caps::SURFACE, 9];
+        let mut bad = frames::enc_hello_tail(frames::caps::SURFACE | frames::caps::KEY_ALT_ESC_PREFIX, "bad-version");
+        bad[2] = 9;
         c.send(Op::HELLO, &frames::enc_hello(80, 24, 0, "tv", &bad));
         let f = c.expect(Op::ERROR, 5);
         let (code, msg) = frames::dec_error(&f.payload).unwrap();
@@ -4319,7 +4655,7 @@ mod tests {
         drop(c);
         // surface 腿：ATTACHED → SNAPSHOT 分片 + SNAPSHOT-DONE
         let mut c = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::SURFACE, true, "app-1");
+        let tail = frames::enc_hello_tail(frames::caps::SURFACE | frames::caps::KEY_ALT_NO_ESC_PREFIX, "app-1");
         c.send(Op::HELLO, &frames::enc_hello(100, 30, hello_flags::CREATE, "ts", &tail));
         let f = c.expect(Op::ATTACHED, 5);
         let (cols, rows, _m, _a, _s, name) = frames::dec_attached(&f.payload).unwrap();
@@ -4406,8 +4742,7 @@ mod tests {
                 "last-writer-first",
                 LegDescriptor {
                     client_id: "last-leg".into(),
-                    surface: false,
-                    raw_capable: true,
+                    kind: LegKind::Host,
                     size: Size::DEFAULT,
                 },
                 false,
@@ -4654,7 +4989,7 @@ mod tests {
             std::thread::spawn(move || svc.serve(ln));
         }
         let mut c = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "h");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "h");
         c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, "tr", &tail));
         c.expect(Op::ATTACHED, 5);
         c.expect(Op::REPLAY_DONE, 5);
@@ -4725,7 +5060,7 @@ mod tests {
             drop(c0);
             std::thread::sleep(Duration::from_millis(800)); // 等 shell 就绪
             let mut c = Client::connect(&path);
-            let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "h2");
+            let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "h2");
             c.send(Op::HELLO, &frames::enc_hello(100, 30, 0, "t-h2", &tail));
             c.expect(Op::ATTACHED, 5);
             c.expect(Op::REPLAY_DONE, 5);
@@ -4757,13 +5092,13 @@ mod tests {
         }
         // 宽腿 A（120x30）attach：回放前序（3J+2J+H）与 ATTACHED/REPLAY_DONE 走完
         let mut a = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "clr-a");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "clr-a");
         a.send(Op::HELLO, &frames::enc_hello(120, 30, hello_flags::CREATE, "t-clr", &tail));
         a.expect(Op::ATTACHED, 5);
         a.expect(Op::REPLAY_DONE, 5);
         // 窄腿 B（80x24）attach ⇒ 会话 120x30 → 80x24，A（≠80x24）收清屏序
         let mut b = Client::connect(&path);
-        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "clr-b");
+        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "clr-b");
         b.send(Op::HELLO, &frames::enc_hello(80, 24, 0, "t-clr", &tail_b));
         b.expect(Op::ATTACHED, 5);
         let got = a.drain_data_until(|d| has_bytes(d, RESIZE_CLEAR_SEQ), 10);
@@ -4791,7 +5126,7 @@ mod tests {
             std::thread::spawn(move || svc.serve(ln));
         }
         let mut a = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "clr-solo");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "clr-solo");
         a.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, "t-clr-solo", &tail));
         a.expect(Op::ATTACHED, 5);
         a.expect(Op::REPLAY_DONE, 5);
@@ -4834,7 +5169,7 @@ mod tests {
         let mut first: Option<Client> = None;
         for i in 0..8 {
             let mut c = Client::connect(&path);
-            let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, &format!("ev-{i}"));
+            let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, &format!("ev-{i}"));
             c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, "t-h3", &tail));
             c.expect(Op::ATTACHED, 5);
             c.expect(Op::REPLAY_DONE, 5);
@@ -4847,7 +5182,7 @@ mod tests {
         let mut first = first.expect("首腿在");
         // 第 9 条 ⇒ 腾位（最久空闲 = 首腿，裸断无 ENDED）
         let mut c9 = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "ev-9");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "ev-9");
         c9.send(Op::HELLO, &frames::enc_hello(80, 24, 0, "t-h3", &tail));
         c9.expect(Op::ATTACHED, 5);
         // 被腾位的首腿必须见 **FIN**（Err::Hard(UnexpectedEof)）——读超时不算数
@@ -4877,7 +5212,7 @@ mod tests {
             std::thread::spawn(move || svc.serve(ln));
         }
         let mut c = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "nx");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "nx");
         c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, "t-nx", &tail));
         c.expect(Op::ATTACHED, 5);
         let got = c.drain_data_until(|d| has_bytes(d, b"BYE"), 8);
@@ -4900,7 +5235,7 @@ mod tests {
             std::thread::spawn(move || svc.serve(ln));
         }
         let mut c = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "ord");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "ord");
         c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, "t-ord", &tail));
         c.expect(Op::ATTACHED, 5);
         drop(c);
@@ -4943,7 +5278,7 @@ mod tests {
             std::thread::spawn(move || svc.serve(ln));
         }
         let mut c = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "ex");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "ex");
         c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, "t-ex", &tail));
         c.expect(Op::ATTACHED, 5);
         c.drain_data_until(|d| has_bytes(d, b"EXPL-READY"), 8);
@@ -5100,7 +5435,7 @@ mod tests {
             std::thread::spawn(move || svc.serve(ln));
         }
         let mut c = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "sc");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "sc");
         c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, "t-sc", &tail));
         c.expect(Op::ATTACHED, 5);
         c.send(Op::DATA, b"x"); // 同尺寸腿活动——不注入哨兵
@@ -5138,7 +5473,7 @@ mod tests {
             std::thread::spawn(move || svc.serve(ln));
         }
         let mut c = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "sp");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "sp");
         c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, "t-sp", &tail));
         c.expect(Op::ATTACHED, 5);
         // 第一跳：间隔窗内 PTY = 79；记账/epoch 不动（重验④的前提）
@@ -5185,7 +5520,7 @@ mod tests {
             std::thread::spawn(move || svc.serve(ln));
         }
         let mut c = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "yd");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "yd");
         c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, "t-yd", &tail));
         c.expect(Op::ATTACHED, 5);
         std::thread::sleep(Duration::from_millis(60)); // 仍在间隔窗内
@@ -5221,7 +5556,7 @@ mod tests {
             std::thread::spawn(move || svc.serve(ln));
         }
         let mut c = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "gn");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "gn");
         c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, "t-gn", &tail));
         c.expect(Op::ATTACHED, 5);
         std::thread::sleep(Duration::from_millis(50)); // 仍在间隔窗内
@@ -5271,7 +5606,7 @@ mod tests {
             std::thread::spawn(move || svc.serve(ln));
         }
         let mut c = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "id");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "id");
         c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, "t-id", &tail));
         c.expect(Op::ATTACHED, 5);
         std::thread::sleep(Duration::from_millis(250)); // 第二跳已恢复
@@ -5513,7 +5848,7 @@ mod tests {
             }
         }
         let mut a = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "skp-a");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "skp-a");
         a.send(Op::HELLO, &frames::enc_hello(120, 30, hello_flags::CREATE, "t-skip", &tail));
         a.expect(Op::ATTACHED, 5);
         a.expect(Op::REPLAY_DONE, 5);
@@ -5522,7 +5857,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(3000));
         // B 接入 ⇒ 几何切换（SIGWINCH×2 ⇒ `(W)` 标记）⇒ A 清屏 + 跳环尾
         let mut b = Client::connect(&path);
-        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "skp-b");
+        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "skp-b");
         b.send(Op::HELLO, &frames::enc_hello(80, 24, 0, "t-skip", &tail_b));
         b.expect(Op::ATTACHED, 5);
         // A 恢复读：清屏帧（REPLAY_DONE 前的换屏前序已被 expect 消费，此后出现的
@@ -5615,12 +5950,12 @@ mod tests {
             }
         }
         let mut a = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "ra-a");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "ra-a");
         a.send(Op::HELLO, &frames::enc_hello(120, 30, hello_flags::CREATE, "t-ractive", &tail));
         a.expect(Op::ATTACHED, 5);
         a.expect(Op::REPLAY_DONE, 5);
         let mut b = Client::connect(&path);
-        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "ra-b");
+        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "ra-b");
         b.send(Op::HELLO, &frames::enc_hello(80, 24, 0, "t-ractive", &tail_b));
         b.expect(Op::ATTACHED, 5);
         // B 接入即活动 ⇒ active=B；两轮查询-应答，A、B 都应答。
@@ -5680,12 +6015,12 @@ mod tests {
             (s["cols"].as_u64().unwrap() as u16, s["rows"].as_u64().unwrap() as u16)
         };
         let mut a = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "foc-a");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "foc-a");
         a.send(Op::HELLO, &frames::enc_hello(120, 30, hello_flags::CREATE, "t-foc", &tail));
         a.expect(Op::ATTACHED, 5);
         a.expect(Op::REPLAY_DONE, 5);
         let mut b = Client::connect(&path);
-        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "foc-b");
+        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "foc-b");
         b.send(Op::HELLO, &frames::enc_hello(80, 24, 0, "t-foc", &tail_b));
         b.expect(Op::ATTACHED, 5);
         assert_eq!(session_size(&mut a), (80, 24), "B 接入后会话几何=B");
@@ -5729,12 +6064,12 @@ mod tests {
             (s["cols"].as_u64().unwrap() as u16, s["rows"].as_u64().unwrap() as u16)
         };
         let mut a = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "hov-a");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "hov-a");
         a.send(Op::HELLO, &frames::enc_hello(120, 30, hello_flags::CREATE, "t-hover", &tail));
         a.expect(Op::ATTACHED, 5);
         a.expect(Op::REPLAY_DONE, 5);
         let mut b = Client::connect(&path);
-        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "hov-b");
+        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "hov-b");
         b.send(Op::HELLO, &frames::enc_hello(80, 24, 0, "t-hover", &tail_b));
         b.expect(Op::ATTACHED, 5);
         assert_eq!(session_size(&mut a), (80, 24), "B 接入后会话几何=B");
@@ -5797,12 +6132,12 @@ mod tests {
             }
         }
         let mut a = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "rep-a");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "rep-a");
         a.send(Op::HELLO, &frames::enc_hello(120, 30, hello_flags::CREATE, "t-reply", &tail));
         a.expect(Op::ATTACHED, 5);
         a.expect(Op::REPLAY_DONE, 5);
         let mut b = Client::connect(&path);
-        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "rep-b");
+        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "rep-b");
         b.send(Op::HELLO, &frames::enc_hello(80, 24, 0, "t-reply", &tail_b));
         b.expect(Op::ATTACHED, 5);
         // 三轮「输入触发查询 → 双腿应答」：几何必须停在 B（80x24）不动。
@@ -5924,7 +6259,7 @@ mod tests {
         }
         let name = tmp_name("t-clamp");
         let mut c = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "cl");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "cl");
         c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, &name, &tail));
         c.expect(Op::ATTACHED, 5);
         c.expect(Op::REPLAY_DONE, 5);
@@ -5952,33 +6287,38 @@ mod tests {
             (Some(120), Some(40)),
             "0×0 不得改会话几何（F1b）"
         );
-        // F1a：极端 RESIZE ⇒ 夹取 1000×500（修复前会原样进 alacritty ⇒ 96 GiB 起分配）
+        // 面积超限明确拒绝；单轴超限仍夹取，兼容原有有界形态。
         c.send(Op::RESIZE, &frames::enc_resize(u16::MAX, u16::MAX));
+        assert_eq!(frames::dec_error(&c.expect(Op::ERROR, 5).payload).unwrap().0, "bad_resize");
+        c.send(Op::RESIZE, &frames::enc_resize(u16::MAX, 100));
         let v = poll_list_until(&path, |v| v["sessions"][0]["cols"].as_u64() == Some(1000), 5);
         assert_eq!(
             (v["sessions"][0]["cols"].as_u64(), v["sessions"][0]["rows"].as_u64()),
-            (Some(1000), Some(500))
+            (Some(1000), Some(100))
         );
         {
             let st = svc.lock_state();
             let rt = st.sessions.get(&name).expect("会话在");
-            assert_eq!(rt.vt.as_ref().unwrap().size(), (1000, 500), "vt 几何跟随夹取");
-            assert_eq!((rt.size().cols(), rt.size().rows()), (1000, 500), "环 epoch 跟随");
+            assert_eq!(rt.vt.as_ref().unwrap().size(), (1000, 100), "vt 几何跟随夹取");
+            assert_eq!((rt.size().cols(), rt.size().rows()), (1000, 100), "环 epoch 跟随");
         }
         c.send(Op::DATA, b"CLAMP-OK");
         let got = c.drain_data_until(|d| has_bytes(&window_bytes(d), b"CLAMP-OK"), 8);
         assert!(has_bytes(&window_bytes(&got), b"CLAMP-OK"), "夹取后会话仍可用");
         // 夹取日志（只在真夹取时打——重复上报不刷屏）
         let logs = lines.lock().unwrap().join("\n");
-        assert!(logs.contains("尺寸夹取 65535x65535 → 1000x500"), "夹取日志：{logs}");
+        assert!(logs.contains("尺寸夹取 65535x100 → 1000x100"), "夹取日志：{logs}");
         // F1a：HELLO 极端尺寸同样夹取（ATTACHED 即报夹取后的几何）
         let name2 = tmp_name("t-clamp2");
         let mut c2 = Client::connect(&path);
-        let tail2 = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "cl2");
+        let tail2 = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "cl2");
         c2.send(Op::HELLO, &frames::enc_hello(u16::MAX, u16::MAX, hello_flags::CREATE, &name2, &tail2));
+        assert_eq!(frames::dec_error(&c2.expect(Op::ERROR, 5).payload).unwrap().0, "bad_hello");
+        let mut c2 = Client::connect(&path);
+        c2.send(Op::HELLO, &frames::enc_hello(u16::MAX, 100, hello_flags::CREATE, &name2, &tail2));
         let f = c2.expect(Op::ATTACHED, 5);
         let (cols, rows, _m, _a, _s, _n) = frames::dec_attached(&f.payload).unwrap();
-        assert_eq!((cols, rows), (1000, 500), "HELLO 极端尺寸夹取（F1a）");
+        assert_eq!((cols, rows), (1000, 100), "HELLO 单轴尺寸夹取（F1a）");
         drop(c2);
         svc.close();
     }
@@ -6021,7 +6361,7 @@ mod tests {
             assert!(Instant::now() < deadline, "?1004 未被扫描器识别");
             std::thread::sleep(Duration::from_millis(20));
         }
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "n1");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "n1");
         let mut a = Client::connect(&path);
         a.send(Op::HELLO, &frames::enc_hello(80, 24, 0, &name, &tail));
         a.expect(Op::ATTACHED, 5);
@@ -6038,7 +6378,7 @@ mod tests {
         }
         // 第二条腿（非首腿 ⇒ 无 focus-in）→ 摘 A（非末腿 ⇒ 无 focus-out）→ 摘 B（末腿 ⇒ focus-out）
         let mut b = Client::connect(&path);
-        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "n2");
+        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "n2");
         b.send(Op::HELLO, &frames::enc_hello(80, 24, 0, &name, &tail_b));
         b.expect(Op::ATTACHED, 5);
         b.expect(Op::REPLAY_DONE, 5);
@@ -6077,7 +6417,7 @@ mod tests {
         let name = tmp_name("t-ppanic");
         panic_inject::arm(ThreadRole::Pump, &name);
         let mut c = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "pp");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "pp");
         c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, &name, &tail));
         c.expect(Op::ATTACHED, 5);
         c.expect(Op::REPLAY_DONE, 5);
@@ -6107,7 +6447,7 @@ mod tests {
             std::thread::spawn(move || svc.serve(ln));
         }
         let name = tmp_name("t-lw");
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "lw1");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "lw1");
         let mut a = Client::connect(&path);
         a.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, &name, &tail));
         a.expect(Op::ATTACHED, 5);
@@ -6115,7 +6455,7 @@ mod tests {
         // 给 B 的写者线程入口埋雷（A 的写者已过入口）
         panic_inject::arm(ThreadRole::LegWriter, &name);
         let mut b = Client::connect(&path);
-        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "lw2");
+        let tail_b = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "lw2");
         b.send(Op::HELLO, &frames::enc_hello(80, 24, 0, &name, &tail_b));
         // B 不会收到 ATTACHED（写者入口即 panic ⇒ 裸断）；等兜住日志 + 腿数回落
         let deadline = Instant::now() + Duration::from_secs(5);
@@ -6136,7 +6476,7 @@ mod tests {
         );
         // 会话仍可接入新腿（写者计数回收正确——否则收尾时运行态永驻）
         let mut c = Client::connect(&path);
-        let tail_c = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "lw3");
+        let tail_c = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "lw3");
         c.send(Op::HELLO, &frames::enc_hello(80, 24, 0, &name, &tail_c));
         c.expect(Op::ATTACHED, 5);
         c.expect(Op::REPLAY_DONE, 5);
@@ -6250,13 +6590,13 @@ mod tests {
         // 单会话两轮：raw 腿（观察面）+ surface 腿（输入面，带待测声明）
         let run = |name: &str, surf_caps: u8| -> Vec<u8> {
             let mut observer = Client::connect(&path);
-            let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "obs");
+            let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "obs");
             observer.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, name, &tail));
             observer.expect(Op::ATTACHED, 5);
             observer.expect(Op::REPLAY_DONE, 5);
             observer.drain_data_until(|d| has_bytes(d, b"READY"), 8); // raw 已生效
             let mut inputter = Client::connect(&path);
-            let tail = frames::enc_hello_tail(surf_caps, true, "app");
+            let tail = frames::enc_hello_tail(surf_caps, "app");
             inputter.send(Op::HELLO, &frames::enc_hello(80, 24, 0, name, &tail));
             inputter.expect(Op::ATTACHED, 5);
             inputter.send(Op::INPUT, &alt_z);
@@ -6280,10 +6620,9 @@ mod tests {
         svc.close();
     }
 
-    /// F1：HELLO 声明五态（未声明 / 两种单声明 / 两位同置 / 裸 ID 形态）——**都不拒腿**；
-    /// 歧义（含裸 ID 形态的 `caps=0x7F`）按未声明处理 + 计数 + 一次性告警（B1 回归钉）。
+    /// 当前完整HELLO可接入；缺字段与歧义平台在建立会话前拒绝。
     #[test]
-    fn hello_caps_flavor_ambiguity_is_fail_soft() {
+    fn hello_requires_current_capabilities_and_explicit_key_flavor() {
         let lines = Arc::new(Mutex::new(Vec::new()));
         let cfg = TermConfig { shell: Some("cat".into()), ..TermConfig::default() };
         let svc = svc_with(cfg, Arc::clone(&lines));
@@ -6295,39 +6634,28 @@ mod tests {
         let attach = |path: &std::path::Path, name: &str, tail: &[u8]| {
             let mut c = Client::connect(path);
             c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, name, tail));
-            c.expect(Op::ATTACHED, 5); // ATTACHED = 腿已入表的证明（不拒腿）
-            c // 保持连接（腿在位）
+            c.expect(Op::ATTACHED, 5);
+            c
         };
-        // 未声明（caps 块无新位）：合法
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL, true, "a");
-        let c1 = attach(&path, "f1-none", &tail);
-        assert_eq!(svc.key_flavor_ambiguous.load(Ordering::Relaxed), 0, "未声明不算歧义");
-        // 单声明两位：合法、不计数
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, true, "b");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "b");
         let c2 = attach(&path, "f1-noesc", &tail);
-        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_ESC_PREFIX, true, "c");
+        let tail = frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_ESC_PREFIX, "c");
         let c3 = attach(&path, "f1-esc", &tail);
-        assert_eq!(svc.key_flavor_ambiguous.load(Ordering::Relaxed), 0, "单声明不算歧义");
-        // 两位同置：不拒腿（能拿到 ATTACHED）+ 计数
-        let tail = frames::enc_hello_tail(
-            frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_ESC_PREFIX | frames::caps::KEY_ALT_NO_ESC_PREFIX,
-            true,
-            "d",
-        );
-        let c4 = attach(&path, "f1-amb", &tail);
-        assert_eq!(svc.key_flavor_ambiguous.load(Ordering::Relaxed), 1, "同置计一次");
-        // 裸 ID 尾随块形态 `[4,'h','o','s','t']` ⇒ caps=0x7F（恰含 bit2|bit3）——既有
-        // 容忍形态，**绝不拒腿**（修前若按「同置 ⇒ 拒」实现，此腿会变 bad_capability）
-        let c5 = attach(&path, "f1-bare", &[4, b'h', b'o', b's', b't']);
-        assert_eq!(svc.key_flavor_ambiguous.load(Ordering::Relaxed), 2, "裸 ID 形态同样按歧义计数");
-        // 一次性告警：恰一行（第二次歧义不重复）
-        let logs = lines.lock().unwrap().join("\n");
-        assert_eq!(
-            logs.matches("KEY_ALT_ESC_PREFIX 与 KEY_ALT_NO_ESC_PREFIX").count(),
-            1,
-            "歧义告警应恰一次：{logs}"
-        );
-        drop((c1, c2, c3, c4, c5));
+        let bits = frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_ESC_PREFIX | frames::caps::PROTO_VER;
+        for tail in [vec![], vec![0], vec![4, b'h', b'o', b's', b't'],
+            vec![1, bits & !frames::caps::PROTO_VER, 1, b'x'], vec![1, bits], vec![1, bits, frames::PROTO_VER],
+            vec![1, bits, frames::PROTO_VER, 0],
+            vec![1, frames::caps::RAW_TERMINAL | frames::caps::PROTO_VER, frames::PROTO_VER, 1, b'x'],
+            vec![1, bits | frames::caps::SURFACE, frames::PROTO_VER, 1, b'x'],
+            vec![1, bits & !frames::caps::RAW_TERMINAL, frames::PROTO_VER, 1, b'x'],
+            vec![1, bits | frames::caps::KEY_ALT_NO_ESC_PREFIX, frames::PROTO_VER, 1, b'x']] {
+            let mut client = Client::connect(&path);
+            client.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, "rejected", &tail));
+            let error = client.expect(Op::ERROR, 5);
+            assert_eq!(frames::dec_error(&error.payload).unwrap().0, "bad_capability");
+            assert!(svc.lock_state().registry.session("rejected").is_none());
+        }
+        drop((c2, c3));
         svc.close();
     }
 
@@ -6344,7 +6672,7 @@ mod tests {
             std::thread::spawn(move || svc.serve(ln));
         }
         let mut c = Client::connect(&path);
-        let tail = frames::enc_hello_tail(frames::caps::SURFACE, true, "x");
+        let tail = frames::enc_hello_tail(frames::caps::SURFACE | frames::caps::KEY_ALT_NO_ESC_PREFIX, "x");
         c.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, "f1-drop", &tail));
         c.expect(Op::ATTACHED, 5); // surface 腿无 REPLAY_DONE（快照族另路）
         let (name, gen, key) = {

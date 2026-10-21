@@ -132,6 +132,12 @@ impl LegOut {
         true
     }
 
+    pub fn discard_surface_updates(&self) {
+        let mut state = self.lock();
+        state.queue.retain(|item| !matches!(item.op, Op::SNAPSHOT | Op::SURFACE_DIFF | Op::SNAPSHOT_DONE | Op::FETCH_ROWS));
+        state.qbytes = state.queue.iter().map(|item| item.payload.len()).sum();
+    }
+
     /// 入队 STATE 帧（latest-wins：丢掉还在排队的旧 STATE——状态只有最新值有意义）。
     pub fn enqueue_state(&self, it: WriteItem) {
         let mut st = self.lock();
@@ -269,6 +275,20 @@ mod tests {
         assert!(ended.is_none() && !quit);
         // cap=0 = 不封顶（raw 控制帧）
         assert!(out.enqueue(item(Op::STATE, 100_000), 0));
+    }
+
+    #[test]
+    fn discard_surface_groups_preserves_controls_and_reclaims_capacity() {
+        let out = LegOut::new();
+        out.enqueue_state(item(Op::STATE, 10));
+        assert!(out.enqueue_group(vec![item(Op::SNAPSHOT, 40), item(Op::SNAPSHOT_DONE, 8)], 100));
+        assert!(!out.enqueue_group(vec![item(Op::SURFACE_DIFF, 50)], 100));
+        assert!(out.enqueue(item(Op::CLIPBOARD, 10), 100));
+        out.discard_surface_updates();
+        assert!(out.enqueue_group(vec![item(Op::SNAPSHOT, 70), item(Op::SNAPSHOT_DONE, 8)], 100));
+        let (items, ended, quit) = out.take();
+        assert_eq!(items.iter().map(|item| item.op).collect::<Vec<_>>(), vec![Op::STATE, Op::CLIPBOARD, Op::SNAPSHOT, Op::SNAPSHOT_DONE]);
+        assert!(ended.is_none() && !quit);
     }
 
     /// 收尾语义：ENDED 排空后交出；quit 立即；收尾后生产者入队被拒。

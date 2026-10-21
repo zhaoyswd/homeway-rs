@@ -246,6 +246,9 @@ pub struct SessionVt {
     /// hook/put/unhook ⇒ 这两族在解析器里被静默丢弃；扫描器在喂入前按字节流识别，
     /// 尾巴 = 上一批结尾处「可能是模式前缀」的未决字节）。
     scan_tail: Vec<u8>,
+    history: HistoryIdentity,
+    color_overrides: [Option<[u8; 3]>; 259],
+    theme_colors: [Option<[u8; 3]>; 2],
     /// 47/1047 进入备用屏前捕获的**主屏 DECSC 槽**（Q-L L2）：alacritty 的公开
     /// `Term::swap_alt()` 在进入时会把主屏 `grid.saved_cursor` 覆盖成当前光标（那是
     /// 1049 的实现痕迹），而 ghostty 的 47/1047 从不 `saveCursor`（`Terminal.zig:4800-4869`）。
@@ -254,6 +257,27 @@ pub struct SessionVt {
     alt47_saved_decsc: Option<AlacGridCursor<AlacCell>>,
     /// OSC 52 事件积压（`write_collecting` 内同步产生；会话层在喂入后取走处理）。
     clip_events: Arc<std::sync::Mutex<Vec<ClipEvt>>>,
+}
+
+#[derive(Default)]
+struct HistoryIdentity {
+    epoch: u64,
+    base: u64,
+}
+
+impl HistoryIdentity {
+    fn invalidate(&mut self) {
+        self.invalidate_material();
+        self.base = 0;
+    }
+
+    fn invalidate_material(&mut self) {
+        self.epoch = self.epoch.wrapping_add(2);
+    }
+
+    fn scroll(&mut self, before: usize, after: usize, lines: usize) {
+        self.base = self.base.saturating_add(lines.saturating_sub(after.saturating_sub(before)) as u64);
+    }
 }
 
 /// OSC 52 双向事件（alacritty 经 EventListener 上抛；Go 侧 = ghostty 的
@@ -347,6 +371,9 @@ impl SessionVt {
             scroll_top: 0,
             scroll_bottom: rows as i32 - 1,
             scan_tail: Vec::new(),
+            history: HistoryIdentity { epoch: 2, base: 0 },
+            color_overrides: [None; 259],
+            theme_colors: [None; 2],
             alt47_saved_decsc: None,
             clip_events,
         })
@@ -361,8 +388,9 @@ impl SessionVt {
     /// 设置客户端上报的主题色（Go `SetDefaultColors` 面；THEME 帧后由会话层调）。
     /// 设置后 OSC 10/11 查询按上报值应答（未设置 ⇒ 不答，V-2 定案）。
     pub fn set_default_colors(&mut self, fg: [u8; 3], bg: [u8; 3]) {
-        self.colors.fg = Some(fg);
-        self.colors.bg = Some(bg);
+        self.theme_colors = [Some(fg), Some(bg)];
+        if self.color_overrides[256].is_none() { self.colors.fg = Some(fg); }
+        if self.color_overrides[257].is_none() { self.colors.bg = Some(bg); }
     }
 
     /// 喂入并收集应答分片（`write_pty` 面）：每个应答一片、顺序与流中触发一致。
@@ -373,6 +401,7 @@ impl SessionVt {
     /// 扫描器按字节流在喂入前识别，命中段的应答按流内位置与解析器应答交错；
     /// 未决尾巴（跨块的模式前缀）存 `scan_tail` 续接到下一批。
     pub fn write_collecting(&mut self, p: &[u8], sink: &mut impl FnMut(&[u8])) {
+        self.flush_sync_timeout(sink);
         if p.is_empty() {
             return;
         }
@@ -433,6 +462,9 @@ impl SessionVt {
             scroll_bottom: &mut self.scroll_bottom,
             alt47_saved_decsc: &mut self.alt47_saved_decsc,
             responses,
+            history: &mut self.history,
+            color_overrides: &mut self.color_overrides,
+            theme_colors: &self.theme_colors,
         };
         self.processor.advance(&mut probe, bytes);
     }
@@ -456,6 +488,7 @@ impl SessionVt {
             return Ok(());
         }
         self.term.resize(SimpleDims { cols, rows });
+        self.history.invalidate();
         self.cols = cols;
         self.rows = rows;
         self.flushed = vec![u64::MAX; rows];
@@ -468,6 +501,46 @@ impl SessionVt {
     /// 当前网格尺寸。
     pub fn size(&self) -> (u16, u16) {
         (self.cols as u16, self.rows as u16)
+    }
+
+    pub fn history_epoch(&self) -> u64 {
+        self.history.epoch + u64::from(self.term.mode().contains(TermMode::ALT_SCREEN))
+    }
+
+    pub fn history_base(&self) -> u64 {
+        if self.term.mode().contains(TermMode::ALT_SCREEN) { 0 } else { self.history.base }
+    }
+
+    pub fn sync_deadline(&self) -> Option<std::time::Instant> {
+        self.processor.sync_timeout().sync_timeout()
+    }
+
+    pub fn flush_sync_timeout(&mut self, sink: &mut impl FnMut(&[u8])) -> bool {
+        if self.sync_deadline().is_none_or(|deadline| std::time::Instant::now() < deadline) {
+            return false;
+        }
+        let mut responses = Vec::new();
+        let mut probe = TermProbe {
+            term: &mut self.term,
+            modify_other_keys: &mut self.modify_other_keys,
+            mouse_flags: &mut self.mouse_flags,
+            force_full: &mut self.force_full,
+            dec_modes: &mut self.dec_modes,
+            colors: &mut self.colors,
+            palette_mirror: &mut self.palette_mirror,
+            mouse_tracking: &mut self.mouse_tracking,
+            mouse_format: &mut self.mouse_format,
+            scroll_top: &mut self.scroll_top,
+            scroll_bottom: &mut self.scroll_bottom,
+            alt47_saved_decsc: &mut self.alt47_saved_decsc,
+            responses: &mut responses,
+            history: &mut self.history,
+            color_overrides: &mut self.color_overrides,
+            theme_colors: &self.theme_colors,
+        };
+        self.processor.stop_sync(&mut probe);
+        for response in responses { sink(&response); }
+        true
     }
 
     /// 应答器侧的 modifyOtherKeys 记账回填（`CSI > 4;N m` 的解析在 6c 接线）。
@@ -707,7 +780,7 @@ impl SessionVt {
         let row = &grid[line];
         let mut cells = Vec::with_capacity(self.cols);
         for x in 0..self.cols {
-            cells.push(cell_of(&row[Column(x)]));
+            cells.push(self.cell_of(&row[Column(x)]));
         }
         Row { y: y as u16, dirty: false, wraps: line_wraps(row, self.cols), cells }
     }
@@ -715,6 +788,22 @@ impl SessionVt {
     fn row_at(&self, y: usize) -> Row {
         let grid = self.term.grid();
         self.read_row(grid, y)
+    }
+
+    fn cell_of(&self, cell: &AlacCell) -> Cell {
+        let mut result = cell_of(cell);
+        let resolve = |color: &AlacColor, fallback: Color| {
+            let index = match color {
+                AlacColor::Named(value) => Some(*value as usize),
+                AlacColor::Indexed(value) => Some(*value as usize),
+                AlacColor::Spec(_) => None,
+            };
+            index.and_then(|index| self.color_overrides.get(index).copied().flatten())
+                .map(|rgb| Color::Rgb(rgb[0], rgb[1], rgb[2])).unwrap_or(fallback)
+        };
+        result.fg = resolve(&cell.fg, result.fg);
+        result.bg = resolve(&cell.bg, result.bg);
+        result
     }
 
     /// 光标快照（视口坐标）。
@@ -743,9 +832,9 @@ impl SessionVt {
         }
     }
 
-    /// 回滚条状态（服务端不滚视口 ⇒ 恒贴底；offset/total 语义同 Go）。
+    /// 回滚条状态（服务端恒贴底，v5 offset/total 为 epoch 内绝对行号）。
     pub fn scrollbar(&self) -> Scrollbar {
-        let total = self.term.total_lines() as u64;
+        let total = self.history_base() + self.term.total_lines() as u64;
         let len = self.term.screen_lines() as u64;
         Scrollbar { total, offset: total.saturating_sub(len), len }
     }
@@ -759,8 +848,8 @@ impl SessionVt {
         if sb.offset == 0 {
             return Vec::new();
         }
-        let start = sb.offset.saturating_sub(above as u64);
-        self.abs_rows(start as usize, (sb.offset - start) as usize)
+        let start = sb.offset.saturating_sub(above as u64).max(self.history_base());
+        self.abs_rows((start - self.history_base()) as usize, (sb.offset - start) as usize)
     }
 
     /// 绝对行号区间 [from, from+count) 的行（FETCH-ROWS 应答；越界自动截断）。
@@ -769,11 +858,11 @@ impl SessionVt {
             return Vec::new();
         }
         let total = self.scrollbar().total;
-        if from >= total {
+        if from < self.history_base() || from >= total {
             return Vec::new();
         }
-        let end = (from + count as u64).min(total);
-        self.abs_rows(from as usize, (end - from) as usize)
+        let end = from.saturating_add(count as u64).min(total);
+        self.abs_rows((from - self.history_base()) as usize, (end - from) as usize)
     }
 
     fn modes_static(&self) -> Modes {
@@ -806,12 +895,12 @@ impl SessionVt {
             let row = &grid[line];
             let mut cells = Vec::with_capacity(cols);
             for x in 0..cols {
-                cells.push(cell_of(&row[Column(x)]));
+                cells.push(self.cell_of(&row[Column(x)]));
             }
             // 镜像/拉取行的 y 是**视口相对值**（服务端发的镜像 y 从视口顶起算——与 Go
             // 一致：客户端按返回顺序重排，不拿 y 当绝对行号）。wraps 按行读 WRAPLINE
             // （F8②：原实现回滚行恒 false ⇒ plain_text 的折行合并在回滚段断裂；
-            // wire 不编 wraps——codec 无字节影响）。
+            // v5 cell 行头显式携带 wraps）。
             out.push(Row { y: 0, dirty: false, wraps: line_wraps(row, cols), cells });
         }
         out
@@ -1111,9 +1200,9 @@ fn row_fingerprint(row: &Row) -> u64 {
 /// alacritty cell → wire cell（归一化见模块头）。
 fn cell_of(c: &AlacCell) -> Cell {
     let mut symbol = String::new();
-    // width = **解码语义宽度**（Go goldenStyleText 的消费口径）：占位格/带样式空格 → 0
-    // （客户端不画字形），其余 → 1（wire 不编宽度——宽字符的显示宽度由 skip 尾格表达）。
+    // v5显式列宽：占位格为0，普通字素/空格1，宽字符头2。
     let mut width = 1u8;
+    if c.flags.contains(AlacFlags::WIDE_CHAR) { width = 2; }
     let mut skip = false;
     if c.flags.contains(AlacFlags::WIDE_CHAR_SPACER)
         || c.flags.contains(AlacFlags::LEADING_WIDE_CHAR_SPACER)
@@ -1128,18 +1217,8 @@ fn cell_of(c: &AlacCell) -> Cell {
     //     无法区分显式空格与未写格——两者渲染/样式完全一致，编码侧统一走空白格，
     //     登记 D-13）；
     //   - 非空格字符 ⇒ symbol = 字符 + zerowidth 组合字符。
-    // wire 的宽度不编（Go appendCell 同款），「解码语义宽度」由消费方从 symbol 推。
     let is_space = c.c == ' ' && c.zerowidth().is_none_or(|z| z.is_empty());
-    if is_space {
-        // 空格（显式或未写）一律无字素；**带样式的空格**宽度记 0（Go codecCell+decodeCell
-        // 口径），无样式空格（= blankRun 族）宽度 1。
-        let styled = !c.flags.is_empty()
-            || c.fg != AlacColor::Named(NamedColor::Foreground)
-            || c.bg != AlacColor::Named(NamedColor::Background);
-        if styled && !skip {
-            width = 0;
-        }
-    } else {
+    if !is_space {
         symbol.push(c.c);
         if let Some(zw) = c.zerowidth() {
             for ch in zw {
@@ -1253,9 +1332,33 @@ struct TermProbe<'a, T> {
     alt47_saved_decsc: &'a mut Option<AlacGridCursor<AlacCell>>,
     /// 本次 write 的应答分片（流中收集、批末由 [`SessionVt::write_collecting`] 投递）。
     responses: &'a mut Vec<Vec<u8>>,
+    history: &'a mut HistoryIdentity,
+    color_overrides: &'a mut [Option<[u8; 3]>; 259],
+    theme_colors: &'a [Option<[u8; 3]>; 2],
 }
 
 impl<T: EventListener> TermProbe<'_, T> {
+    fn scroll_origin(&self) -> Option<(usize, usize)> {
+        if self.term.mode().contains(TermMode::ALT_SCREEN) || *self.scroll_top != 0 {
+            return None;
+        }
+        Some((self.term.total_lines() - self.term.screen_lines(),
+            std::ptr::from_ref(&self.term.grid()[Line(0)][Column(0)]) as usize))
+    }
+
+    fn finish_scroll(&mut self, before: Option<(usize, usize)>, lines: usize) {
+        if let Some((history, _)) = before {
+            let after = self.term.total_lines() - self.term.screen_lines();
+            self.history.scroll(history, after, lines);
+        }
+    }
+
+    fn finish_implicit_scroll(&mut self, before: Option<(usize, usize)>, forced: bool) {
+        if let Some((_, top)) = before {
+            let after = std::ptr::from_ref(&self.term.grid()[Line(0)][Column(0)]) as usize;
+            if after != top || forced { self.finish_scroll(before, 1); }
+        }
+    }
     /// Q-L L2（代码门 高1）：还原捕获的主屏 DECSC 槽——**先按当前尺寸钳制**。捕获是跨
     /// resize 的克隆（alacritty 的 `Grid::resize` 只钳制 grid 内的 `cursor`/`saved_cursor`），
     /// 缩小后把未钳制的点写回会让后续 `ESC 8`（`restore_cursor_position` → `damage_cursor`）
@@ -1283,7 +1386,19 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
     #[inline]
     fn set_cursor_shape(&mut self, _shape: AlacCursorShape) { self.term.set_cursor_shape(_shape) }
     #[inline]
-    fn input(&mut self, _c: char) { self.term.input(_c) }
+    fn input(&mut self, character: char) {
+        let before = self.scroll_origin();
+        let forced = character.is_ascii() && !character.is_control()
+            && self.term.grid().cursor.input_needs_wrap
+            && self.term.mode().contains(TermMode::LINE_WRAP)
+            && self.term.grid().cursor.point.line.0 == *self.scroll_bottom;
+        self.term.input(character);
+        if (self.term.columns() == 1 || *self.scroll_bottom == 0) && !character.is_ascii() {
+            self.history.invalidate();
+        } else {
+            self.finish_implicit_scroll(before, forced);
+        }
+    }
     #[inline]
     fn goto(&mut self, _line: i32, _col: usize) { self.term.goto(_line, _col) }
     #[inline]
@@ -1329,23 +1444,43 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
     #[inline]
     fn carriage_return(&mut self) { self.term.carriage_return() }
     #[inline]
-    fn linefeed(&mut self) { self.term.linefeed() }
+    fn linefeed(&mut self) {
+        let before = self.scroll_origin();
+        let forced = self.term.grid().cursor.point.line.0 == *self.scroll_bottom;
+        self.term.linefeed();
+        self.finish_implicit_scroll(before, forced);
+    }
     #[inline]
     fn bell(&mut self) { self.term.bell() }
     #[inline]
     fn substitute(&mut self) { self.term.substitute() }
     #[inline]
-    fn newline(&mut self) { self.term.newline() }
+    fn newline(&mut self) {
+        let before = self.scroll_origin();
+        let forced = self.term.grid().cursor.point.line.0 == *self.scroll_bottom;
+        self.term.newline();
+        self.finish_implicit_scroll(before, forced);
+    }
     #[inline]
     fn set_horizontal_tabstop(&mut self) { self.term.set_horizontal_tabstop() }
     #[inline]
-    fn scroll_up(&mut self, _p0: usize) { self.term.scroll_up(_p0) }
+    fn scroll_up(&mut self, lines: usize) {
+        let before = self.scroll_origin();
+        let count = lines.min((*self.scroll_bottom - *self.scroll_top + 1).max(0) as usize);
+        self.term.scroll_up(lines);
+        self.finish_scroll(before, count);
+    }
     #[inline]
     fn scroll_down(&mut self, _p0: usize) { self.term.scroll_down(_p0) }
     #[inline]
     fn insert_blank_lines(&mut self, _p0: usize) { self.term.insert_blank_lines(_p0) }
     #[inline]
-    fn delete_lines(&mut self, _p0: usize) { self.term.delete_lines(_p0) }
+    fn delete_lines(&mut self, lines: usize) {
+        let before = if self.term.grid().cursor.point.line == Line(0) { self.scroll_origin() } else { None };
+        let count = lines.min((*self.scroll_bottom - *self.scroll_top + 1).max(0) as usize);
+        self.term.delete_lines(lines);
+        self.finish_scroll(before, count);
+    }
     #[inline]
     fn erase_chars(&mut self, _p0: usize) { self.term.erase_chars(_p0) }
     #[inline]
@@ -1378,6 +1513,11 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
         *self.scroll_bottom = self.term.screen_lines() as i32 - 1;
         // RIS 全复位（含 alacritty 的 `grid.reset()` 清 DECSC 槽）⇒ 47/1047 的捕获作废
         *self.alt47_saved_decsc = None;
+        self.history.invalidate();
+        *self.color_overrides = [None; 259];
+        self.colors.fg = self.theme_colors[0];
+        self.colors.bg = self.theme_colors[1];
+        self.colors.cursor = None;
         self.term.reset_state();
     }
     #[inline]
@@ -1396,6 +1536,7 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
     /// X10（9）/URXVT（1015）/1016/47/1047 走 `PrivateMode::Unknown`（vte 表外，D-18）。
     fn set_private_mode(&mut self, mode: alac_ansi::PrivateMode) {
         use alac_ansi::{NamedPrivateMode, PrivateMode};
+        if matches!(mode, PrivateMode::Named(NamedPrivateMode::ColumnMode)) { self.history.invalidate(); }
         if let PrivateMode::Named(m) = mode {
             match m {
                 NamedPrivateMode::ReportMouseClicks => {
@@ -1456,6 +1597,7 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
     /// charset G0/G1 与 protected аттр 的复位无公开 API，残余差异登记（门一评审 B4）。
     fn unset_private_mode(&mut self, mode: alac_ansi::PrivateMode) {
         use alac_ansi::{Attr, NamedPrivateMode, PrivateMode};
+        if matches!(mode, PrivateMode::Named(NamedPrivateMode::ColumnMode)) { self.history.invalidate(); }
         if let PrivateMode::Named(m) = mode {
             match m {
                 NamedPrivateMode::ReportMouseClicks => {
@@ -1576,6 +1718,13 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
     /// OSC 颜色 set：委托（alacritty 自身色面）+ 记账（调色板镜像 / 动态色分量）。
     fn set_color(&mut self, _p0: usize, _p1: alac_ansi::Rgb) {
         let rgb = [_p1.r, _p1.g, _p1.b];
+        if let Some(slot) = self.color_overrides.get_mut(_p0) {
+            if *slot != Some(rgb) {
+                *slot = Some(rgb);
+                self.history.invalidate_material();
+                *self.force_full = true;
+            }
+        }
         if let Some(i) = _p0.checked_sub(256) {
             // NamedColor::Foreground=256 / Background=257 / Cursor=258
             self.colors.set(10 + i as u16, rgb);
@@ -1588,10 +1737,16 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
     /// OSC 104/110-119 颜色复位：委托 + 清镜像/分量（theme 由 SetDefaultColors 设定的
     /// 分量随 RIS 保留——客户端上报主题是会话属性，非终端态；OSC 104 复位只清程序 set 面）。
     fn reset_color(&mut self, _p0: usize) {
+        if let Some(slot) = self.color_overrides.get_mut(_p0) {
+            if slot.take().is_some() {
+                self.history.invalidate_material();
+                *self.force_full = true;
+            }
+        }
         if let Some(i) = _p0.checked_sub(256) {
             match 10 + i as u16 {
-                10 => self.colors.fg = None,
-                11 => self.colors.bg = None,
+                10 => self.colors.fg = self.theme_colors[0],
+                11 => self.colors.bg = self.theme_colors[1],
                 12 => self.colors.cursor = None,
                 _ => {}
             }
@@ -1642,6 +1797,7 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
     /// 服务端屏已清空而差分只送一行。
     fn clear_screen(&mut self, mode: alac_ansi::ClearMode) {
         use alac_ansi::ClearMode;
+        if matches!(mode, ClearMode::Saved) { self.history.invalidate(); }
         if matches!(mode, ClearMode::All) && !self.term.mode().contains(TermMode::ALT_SCREEN) {
             self.term.grid_mut().reset_region(..);
             *self.force_full = true;
@@ -1661,6 +1817,172 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
 mod tests {
     use super::*;
     use crate::term::testutil::{fnv_hex, golden_manifest, style_of, text_of};
+
+    #[test]
+    fn history_identity_survives_capacity_and_real_exit_row_rewrite() {
+        let mut vt = SessionVt::new(12, 2, 3).unwrap();
+        for line in 0..12 { vt.write(format!("L{line}\r\n").as_bytes()); }
+        let base = vt.history_base();
+        let epoch = vt.history_epoch();
+        let stable = vt.scrollbar().offset - 1;
+        let before = vt.rows_at(stable, 1);
+        vt.write(b"NEW\r\n");
+        assert_eq!(vt.history_epoch(), epoch);
+        assert_eq!(vt.history_base(), base + 1);
+        assert_eq!(vt.rows_at(stable, 1), before);
+        assert!(vt.rows_at(base, 1).is_empty());
+
+        let mut vt = SessionVt::new(2, 3, 10).unwrap();
+        vt.write(b"A\r\nB\r\nC");
+        vt.write(b"\x1b[1;1HX\x1b[3;1H\n");
+        assert_eq!(vt.rows_at(0, 1)[0].cells[0].symbol, "X");
+        assert_eq!(vt.scrollbar().offset, 1);
+    }
+
+    #[test]
+    fn history_epoch_invalidates_reflow_and_separates_alternate_screen() {
+        let mut vt = SessionVt::new(6, 3, 10).unwrap();
+        vt.write(b"abcdefghi\r\njkl\r\nmno");
+        let epoch = vt.history_epoch();
+        vt.write(b"\x1b[?1049h");
+        assert_ne!(vt.history_epoch(), epoch);
+        assert_eq!(vt.history_base(), 0);
+        vt.write(b"\x1b[?1049l");
+        assert_eq!(vt.history_epoch(), epoch);
+        vt.resize(4, 3).unwrap();
+        vt.resize(6, 3).unwrap();
+        assert_ne!(vt.history_epoch(), epoch);
+        let resized = vt.history_epoch();
+        vt.write(b"\x1b[3J");
+        assert_ne!(vt.history_epoch(), resized);
+    }
+
+    #[test]
+    fn synchronized_update_timeout_applies_pending_output_without_new_pty_bytes() {
+        let mut vt = SessionVt::new(20, 2, 3).unwrap();
+        vt.write(b"OLD\r\x1b[?2026hNEW");
+        assert_eq!(vt.rows()[0].cells[0].symbol, "O");
+        std::thread::sleep(std::time::Duration::from_millis(180));
+        assert!(vt.flush_sync_timeout(&mut |_| {}));
+        assert_eq!(vt.rows()[0].cells[0].symbol, "N");
+        assert!(vt.sync_deadline().is_none());
+    }
+
+    #[test]
+    fn single_row_without_history_tracks_scroll_even_when_storage_does_not_rotate() {
+        let mut vt = SessionVt::new(2, 1, 0).unwrap();
+        vt.term.grid_mut().update_history(0);
+        vt.write(b"abc");
+        assert_eq!(vt.history_base(), 1);
+        vt.write(b"\r\n");
+        assert_eq!(vt.history_base(), 2);
+        assert_eq!(vt.scrollbar().offset, 2);
+    }
+
+    #[test]
+    fn program_default_color_override_survives_host_theme_until_reset() {
+        let mut vt = SessionVt::new(4, 2, 0).unwrap();
+        vt.set_default_colors([1, 2, 3], [4, 5, 6]);
+        vt.write(b"\x1b]10;rgb:12/34/56\x07X");
+        vt.set_default_colors([7, 8, 9], [10, 11, 12]);
+        let mut answer = Vec::new();
+        vt.write_collecting(b"\x1b]10;?\x07", &mut |bytes| answer.extend_from_slice(bytes));
+        assert_eq!(vt.rows()[0].cells[0].fg, Color::Rgb(0x12, 0x34, 0x56));
+        assert!(String::from_utf8(answer).unwrap().contains("1212/3434/5656"));
+        vt.write(b"\x1b]110\x07");
+        let mut answer = Vec::new();
+        vt.write_collecting(b"\x1b]10;?\x07", &mut |bytes| answer.extend_from_slice(bytes));
+        assert!(String::from_utf8(answer).unwrap().contains("0707/0808/0909"));
+    }
+
+    #[test]
+    fn cell_width_wrap_and_osc_palette_are_expressed_in_surface_cells() {
+        let mut vt = SessionVt::new(4, 3, 10).unwrap();
+        vt.write("中abc".as_bytes());
+        let rows = vt.rows();
+        assert_eq!((rows[0].cells[0].width, rows[0].cells[1].width), (2, 0));
+        assert!(rows[0].wraps);
+        vt.write(b"\x1b[31mR\x1b]4;1;rgb:12/34/56\x07");
+        assert!(vt.rows().iter().flat_map(|row| &row.cells).any(|cell| cell.fg == Color::Rgb(0x12, 0x34, 0x56)));
+        vt.write(b"\x1b]104;1\x07");
+        assert!(vt.rows().iter().flat_map(|row| &row.cells).any(|cell| cell.fg == Color::Palette(1)));
+    }
+
+    #[test]
+    fn history_palette_material_epoch_changes_preserve_absolute_row_identity() {
+        let mut vt = SessionVt::new(4, 2, 2).unwrap();
+        vt.write(b"\x1b[31mA\r\nB\r\nC\r\nD\r\nE\r\nF");
+        let base = vt.history_base();
+        let scroll = vt.scrollbar();
+        assert!(base > 0);
+        let original = vt.rows_at(base, 1);
+        assert_eq!(original[0].cells[0].fg, Color::Palette(1));
+        let epoch = vt.history_epoch();
+        vt.write(b"\x1b]4;1;rgb:12/34/56\x07");
+        let primary_epoch = vt.history_epoch();
+        assert_ne!(primary_epoch, epoch);
+        assert_eq!(vt.history_base(), base);
+        assert_eq!(vt.scrollbar(), scroll);
+        let recolored = vt.rows_at(base, 1);
+        assert_eq!(recolored[0].cells[0].symbol, original[0].cells[0].symbol);
+        assert_eq!(recolored[0].cells[0].fg, Color::Rgb(0x12, 0x34, 0x56));
+        vt.write(b"\x1b]4;1;rgb:12/34/56\x07");
+        assert_eq!(vt.history_epoch(), primary_epoch, "重复同值不使缓存换代");
+        vt.write(b"\x1b[?1049h");
+        let alternate_epoch = vt.history_epoch();
+        vt.write(b"\x1b]4;1;rgb:65/43/21\x07");
+        assert_ne!(vt.history_epoch(), alternate_epoch);
+        vt.write(b"\x1b[?1049l");
+        assert_ne!(vt.history_epoch(), primary_epoch, "备用屏改共享调色板也令主屏历史失效");
+        assert_eq!(vt.history_base(), base);
+        assert_eq!(vt.rows_at(base, 1)[0].cells[0].fg, Color::Rgb(0x65, 0x43, 0x21));
+        let changed_epoch = vt.history_epoch();
+        vt.write(b"\x1b]104;1\x07");
+        let reset_epoch = vt.history_epoch();
+        assert_ne!(reset_epoch, changed_epoch);
+        assert_eq!(vt.history_base(), base);
+        assert_eq!(vt.rows_at(base, 1)[0].cells[0].fg, Color::Palette(1));
+        vt.write(b"\x1b]104;1\x07");
+        assert_eq!(vt.history_epoch(), reset_epoch);
+    }
+
+    #[test]
+    fn history_default_color_reset_changes_material_epoch_but_restores_theme_query() {
+        let mut vt = SessionVt::new(4, 2, 2).unwrap();
+        vt.set_default_colors([1, 2, 3], [4, 5, 6]);
+        vt.write(b"A\r\nB\r\nC\r\nD\r\nE\r\nF");
+        let base = vt.history_base();
+        let epoch = vt.history_epoch();
+        vt.write(b"\x1b]10;rgb:12/34/56\x07");
+        let override_epoch = vt.history_epoch();
+        assert_ne!(override_epoch, epoch);
+        assert_eq!(vt.history_base(), base);
+        assert_eq!(vt.rows_at(base, 1)[0].cells[0].fg, Color::Rgb(0x12, 0x34, 0x56));
+        vt.write(b"\x1b]10;rgb:12/34/56\x07");
+        assert_eq!(vt.history_epoch(), override_epoch);
+        vt.write(b"\x1b]110\x07");
+        let reset_epoch = vt.history_epoch();
+        assert_ne!(reset_epoch, override_epoch);
+        assert_eq!(vt.history_base(), base);
+        assert_eq!(vt.rows_at(base, 1)[0].cells[0].fg, Color::None);
+        let mut answer = Vec::new();
+        vt.write_collecting(b"\x1b]10;?\x07", &mut |bytes| answer.extend_from_slice(bytes));
+        assert!(String::from_utf8(answer).unwrap().contains("0101/0202/0303"));
+        vt.write(b"\x1b]110\x07");
+        assert_eq!(vt.history_epoch(), reset_epoch);
+        vt.write(b"\x1b]11;rgb:65/43/21\x07");
+        assert_ne!(vt.history_epoch(), reset_epoch);
+        assert_eq!(vt.rows_at(base, 1)[0].cells[0].bg, Color::Rgb(0x65, 0x43, 0x21));
+        vt.write(b"\x1b]111\x07");
+        let background_reset_epoch = vt.history_epoch();
+        assert_eq!(vt.history_base(), base);
+        assert_eq!(vt.rows_at(base, 1)[0].cells[0].bg, Color::None);
+        let mut answer = Vec::new();
+        vt.write_collecting(b"\x1b]11;?\x07", &mut |bytes| answer.extend_from_slice(bytes));
+        assert!(String::from_utf8(answer).unwrap().contains("0404/0505/0606"));
+        vt.write(b"\x1b]111\x07");
+        assert_eq!(vt.history_epoch(), background_reset_epoch);
+    }
 
     fn fixture(p: &str) -> Vec<u8> {
         let base = concat!(env!("CARGO_MANIFEST_DIR"), "/../../fixtures");
@@ -1686,10 +2008,29 @@ mod tests {
         }
     }
 
-    /// 6b 自检②（V-1 裁决）：golden 文本/样式向量 digest 对拍 manifest.tsv。
-    /// 仿真等价（alacritty vs ghostty）与 cell 归一化（空白格/带样式空格）在此定调。
     #[test]
-    fn vt_golden_digest_parity() {
+    fn current_width_identity_includes_styled_spaces_and_combining_clusters() {
+        let mut vt = SessionVt::new(8, 3, 10).unwrap();
+        vt.write("\u{1b}[31;44m \u{1b}[0m\u{301}中".as_bytes());
+        let rows = vt.rows();
+        assert_eq!(rows[0].cells[0].width, 1);
+        assert!(!rows[0].cells[0].skip);
+        assert!(rows[0].cells[0].symbol.contains('\u{301}'));
+        assert_ne!(rows[0].cells[0].bg, Color::None);
+        assert_eq!((rows[0].cells[1].width, rows[0].cells[2].width), (2, 0));
+        for cell in rows.iter().flat_map(|row| &row.cells) {
+            assert_eq!(cell.skip, cell.width == 0);
+            assert!(cell.width <= 2);
+        }
+        let mut leading = SessionVt::new(4, 1, 10).unwrap();
+        leading.write("\u{301}".as_bytes());
+        assert_eq!(leading.rows()[0].cells[0].width, 1);
+        assert!(leading.rows()[0].cells[0].symbol.contains('\u{301}'));
+    }
+
+    /// 当前 ANSI 会话的文本、真实列宽与样式摘要对拍 surface-current/manifest.tsv。
+    #[test]
+    fn vt_current_fixture_digest() {
         let manifest = golden_manifest();
         assert!(manifest.len() >= 8, "golden manifest 行数 {}", manifest.len());
         let cases = [
@@ -1949,19 +2290,19 @@ mod tests {
     /// 本测试只用受控尺寸，不构造真实巨型分配。
     #[test]
     fn vt_size_gate_rejects_oversize_and_zero() {
-        for (c, r) in [(0u16, 24u16), (80, 0), (0, 0), (1001, 24), (80, 501), (u16::MAX, u16::MAX)] {
+        for (c, r) in [(0u16, 24u16), (80, 0), (0, 0), (1001, 24), (80, 501), (1000, 132), (u16::MAX, u16::MAX)] {
             let err = SessionVt::new(c, r, 100).err().unwrap_or_else(|| panic!("{c}x{r} 应被拒"));
             assert!(err.to_string().contains("尺寸非法"), "{c}x{r}: 错误文案：{err}");
         }
         // 边界合法值原样接受（上限内不夹取）
-        let mut vt = SessionVt::new(1000, 500, 100).expect("上限值合法");
-        assert_eq!(vt.size(), (1000, 500));
+        let mut vt = SessionVt::new(1000, 131, 100).expect("上限值合法");
+        assert_eq!(vt.size(), (1000, 131));
         // resize 同门：被拒后尺寸不变（不发起分配）
         assert!(vt.resize(u16::MAX, 8).is_err());
         assert!(vt.resize(0, 0).is_err());
-        assert_eq!(vt.size(), (1000, 500), "被拒的 resize 不得改尺寸");
-        assert!(vt.resize(999, 499).is_ok());
-        assert_eq!(vt.size(), (999, 499));
+        assert_eq!(vt.size(), (1000, 131), "被拒的 resize 不得改尺寸");
+        assert!(vt.resize(999, 130).is_ok());
+        assert_eq!(vt.size(), (999, 130));
     }
 
     /// Q-L L1：`VtError` 的 Display 文本与 thiserror 收敛前**逐字相同**——`service.rs`
@@ -2311,7 +2652,7 @@ mod tests {
 
     /// 光标/回滚条/模式位列对拍（快照语义的另一半）。
     #[test]
-    fn vt_golden_cursor_scroll_modes_parity() {
+    fn vt_current_fixture_cursor_scroll_modes() {
         let manifest = golden_manifest();
         for key in ["session-cjk", "session-git-log", "session-hexdump", "session-styles"] {
             let row = manifest.iter().find(|r| r[0] == key).unwrap();
