@@ -598,6 +598,15 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 
 ## 判据变更记录（政策 + 登记表）
 
+### 2026-10-22 终端断腿 SIGPIPE 隔离
+
+- term 帧发送由裸 `libc::write` → 复用 `sysock::send` 的 MSG_NOSIGNAL 单次发送；
+  保持 poll 绝对期限、短写进度、断尾续写及 Timeout/Hard 分派。对端退出只能终结该腿，
+  不能因主函数的默认 SIGPIPE 处置杀死统一进程；CLI stdout 管道原有 SIGPIPE 语义不改。
+- wire 帧/版本/错误码/常量与日志模板不变。新增默认 SIGPIPE 子进程关闭对端回归，
+  私有 Linux 零参双角色实例执行立即断开压力与当前协议完整 PTY 冒烟。
+- 根因、前红后绿及两道门见 `docs/reviews/2026-10-22-terminal-sigpipe.md`。
+
 ### 2026-10-21 终端仅保留当前版本
 
 - 用户确认本批尚未发布，不保留旧APP/旧出口兼容。协议版本数值不变，GREETING必须

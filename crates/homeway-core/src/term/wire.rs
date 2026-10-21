@@ -11,7 +11,8 @@
 //!
 //! 实现面：std 的 `Write` 在超时错误里**不带回写字节数**（Go `(n, err)` 有），
 //! 断尾进度只能靠自管——置非阻塞 + poll(2)（仓 AGENTS「自管线程 + poll(2) 不引 tokio」
-//! 的既定路线），每次 `write(2)` 的返回值即真实进度。
+//! 的既定路线），每次 socket send 的返回值即真实进度。发送复用 `sysock::send`
+//! 的 MSG_NOSIGNAL 保护；CLI 保持默认 SIGPIPE，断开的终端腿只能返回硬错误，不能杀死宿主。
 
 use std::io;
 use std::io::Read as _;
@@ -173,7 +174,7 @@ enum PollWrite<'a> {
     Partial(&'a [u8]),
 }
 
-/// poll(2) POLLOUT + write(2) 循环（deadline 到点且仍有剩余 ⇒ Partial）。
+/// poll(2) POLLOUT + socket send 循环（deadline 到点且仍有剩余 ⇒ Partial）。
 fn poll_write<'a>(stream: &UnixStream, mut buf: &'a [u8], deadline: Instant) -> Result<PollWrite<'a>, WriteFail> {
     let fd = stream.as_raw_fd();
     while !buf.is_empty() {
@@ -200,11 +201,10 @@ fn poll_write<'a>(stream: &UnixStream, mut buf: &'a [u8], deadline: Instant) -> 
                 return Err(WriteFail::Hard(io::ErrorKind::NotConnected));
             }
         }
-        match unsafe { libc::write(fd, buf.as_ptr() as *const libc::c_void, buf.len()) } {
-            n if n > 0 => buf = &buf[n as usize..],
-            0 => return Err(WriteFail::Hard(io::ErrorKind::WriteZero)),
-            _ => {
-                let err = io::Error::last_os_error();
+        match crate::sysock::send(fd, buf) {
+            Ok(0) => return Err(WriteFail::Hard(io::ErrorKind::WriteZero)),
+            Ok(written) => buf = &buf[written..],
+            Err(err) => {
                 if err.kind() == io::ErrorKind::WouldBlock {
                     continue; // 竞态：重 poll
                 }
@@ -240,6 +240,27 @@ fn poll_read(stream: &UnixStream, deadline: Instant) -> Result<i32, ReadFail> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn closed_peer_with_default_sigpipe_returns_hard_error() {
+        const CHILD_ENV: &str = "HOMEWAY_TERM_WIRE_SIGPIPE_CHILD";
+        if std::env::var_os(CHILD_ENV).is_some() {
+            unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+            let (mut writer, reader) = pair();
+            drop(reader);
+            assert_eq!(
+                writer.write_frame(Op::DATA, b"closed peer", Duration::from_secs(1)),
+                Err(WriteFail::Hard(io::ErrorKind::BrokenPipe)),
+            );
+            return;
+        }
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "term::wire::tests::closed_peer_with_default_sigpipe_returns_hard_error", "--nocapture"])
+            .env(CHILD_ENV, "1")
+            .status()
+            .unwrap();
+        assert!(status.success(), "default-SIGPIPE child failed: {status}");
+    }
 
     fn pair() -> (FrameIo, FrameIo) {
         let (a, b) = UnixStream::pair().unwrap();

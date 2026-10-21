@@ -72,6 +72,12 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-10-22 终端 SIGPIPE 紧急整改**：官方 v0.3.17 Linux 私有零参 unified 在第三次
+> UDS 立即断开时捕获退出码-13，确认 term wire 裸write与主函数默认SIGPIPE冲突。
+> 最小改为复用sysock::send的MSG_NOSIGNAL；帧字节/期限/短写/断尾语义不变，stdout信号
+> 策略不改。两道门与验证见 `docs/reviews/2026-10-22-terminal-sigpipe.md`；生产由主会话
+> 回退v0.3.16保可用，待v0.3.18官方Release与两端完整验收，不部署临时GNU产物。
+
 > **2026-10-21 终端当前单版本收口**：用户明确尚未发布，删除旧APP/旧出口握手与材质适配。
 > Rust严格当前HELLO字段、GREETING结构/版本、显式App/Host类型与按键平台；删除Legacy腿
 > 与宿主默认推断，保留raw-only故障路径和ANSI/DEC标准模式。CLI/APP与当前夹具同步执行。
