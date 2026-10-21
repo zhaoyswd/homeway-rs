@@ -15,12 +15,19 @@
    （push/PR：test 双 runner + clippy + OHOS/musl 交叉 check）；发版 = 推 `v*` tag 触发
    `release.yml`（五目标产物〔darwin-arm64/amd64、linux-amd64/arm64-musl、windows-amd64=zip〕
    + **tag 纪律门**〔tag 必须打在 `origin/main` 头上〕+ `SHA256SUMS`）；发版流程 =
-   **改版本 → commit → 推 main → 打 tag 在 main 头上 → 推 tag**。**推 tag / 发 Release / 建 PR
-   仍需用户明确指令**；日常 main 直推照旧。本地-only 门（测试/向量/词表/残留门/矩阵冒烟）
+   **改版本 → commit → 推 main → 打 tag 在 main 头上 → 推 tag → 等 GitHub Release 构建通过**。
+   **用户明确说「部署」即授权这条完整链路**（含版本提交、推 main/tag、Release 产物下载校验
+   与部署），不必拆项重复确认；仅评审/修代码不自动获得部署授权，建 PR 仍需明确指令。
+   本地-only 门（测试/向量/词表/残留门/矩阵冒烟）
    走 `tools/ci-local.sh`，不在公开 CI 复刻。
 2. **部署纪律（2026-10-13 起）**：**正式部署 = 系统 PATH 内的 `homeway`、参数最简**——
    零参 / 子命令直接跑，**不带 `--state`**（state 走缺省 `$HOME/.config/homeway`）。
    `--state <dir>` **只用于测试、多实例、临时验证**（私有实例一律显式 `--state /tmp/…`）。
+   **产物纪律（2026-10-21 起）**：Mac/阿里云正式二进制一律用对应 tag 的 **GitHub Release**
+   产物，禁止以本机 cargo、远端临时 GNU 构建或其他未发布件替代。先在本机下载并核对
+   `SHA256SUMS`，阿里云件由本机 **scp 上传**后复核哈希，不能依赖阿里云直连 GitHub 下载。
+   换装前备份现役二进制与 state，保留身份/config/凭证，走现行部署手册；私有测试构建不等于
+   正式发布，不能因测试通过越过 tag/Release 门。
 3. **生产实例不碰**：本地联调 / 互操作测试一律用 `tools/local-rust-exit.sh`（Rust 出口）与
    `tools/local-rust-relay.sh`（Rust 中继）起的**私有实例**（`/tmp` state + 独立端口）；
    矩阵/性能 A/B 同纪律（`tools/matrix.sh`、`tools/perf-ab.sh`）。

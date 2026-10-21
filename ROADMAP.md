@@ -82,7 +82,9 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 > 跨仓当前C++三组回归、ArkTS311/0、terminal HSP/entry HAP、OHOS实验核交叉构建通过。
 > tier规格已归档2026-10-21-terminal-current-only。2026-10-21用户已授权两仓全部现有改动
 > 提交、推送、打debug包并部署双出口；不安装真机。当前执行清洁核构建/pin与配套滚动部署，
-> 结果追加部署实录；不声称PTY完整门或真机已过。
+> 用户随后明确「部署」必须打tag、使用GitHub Release并由本机转传阿里云，本次改走v0.3.17
+> Release收口，Mac已换上的临时提交构建亦须替换。源码CI双平台各1251/0（37 ignored），
+> Mac私有与生产真实surface/PTY四轮验证通过；完整部署与新核pin待Release完成补录，真机未装。
 
 > **2026-10-21 终端APP/CLI硬化**：按用户前轮评审完成本地源码修复，禁止使用review skill，
 > 技术/代码两道门采用结构化自评。服务端surface v5/cell v2显式升级，历史epoch/base/seq、
