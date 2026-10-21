@@ -1,16 +1,16 @@
 # Changelog
 
-## 未发布（v0.3.13 tag 后的评审整改）
+## v0.3.14（2026-10-21，中继准入/持续直连 + 公网观测腿整改）
 
-- 中继、候选赛跑与地址学习整改（2026-10-21）：中继私钥证明、TCP 绝对期限与监听范围、
+- **中继、候选赛跑与地址学习整改**：中继私钥证明、TCP 绝对期限与监听范围、
   预准入及正式额度隔离、数据字节限速；以出口真实客户端准入的会话认证标记确认额度。
   恢复 token/学习候选缓存与异步 A/AAAA 重解析；TLS 首胜后保留准入后备；健康中继
   可验证后切回直连并保留连接/服务流，支持后学跨地址族。协议新增 CLADM 与 UDP_SESSION，
-  滚动升级须先升级出口再升级中继；没有部署生产。两道评审见同日 relay-security、
-  quic-selection、endpoint-learning 及交叉复核记录。
+  **滚动升级顺序：先出口、后中继**（旧出口配新中继仅有临时窗口）。判据行变更见
+  `docs/INTEROP-CRITERIA.md` 同日条。两道评审见同日 relay-security、quic-selection、
+  endpoint-learning 及交叉复核记录。
 
-
-- r5 全项整改（2026-10-21）：TLS 下层共享绝对期限/取消 IO，慢握手与记录不再延长
+- **公网观测腿 r5 全项整改**：TLS 下层共享绝对期限/取消 IO，慢握手与记录不再延长
   DoH 的 3s 预算；首轮 token 独立 15s 兜底，公网推断整轮 60s；发布事务与停机串行，
   观测/兜底/中继 UDP+TCP 线程有明确收工等待，缩租前先停止观测。修复 STUN6 字面量
   mapped 与错误族回包阻断后备、IPv6 误用 IPv4 UPnP 外口；Linux DoH 按名钉卡不因
@@ -19,22 +19,12 @@
   UPnP/DDNS 在途读写支持取消，UPnP 主机名保留 Host 与异主机控制 URL 语义。详情与
   验证见 `docs/reviews/2026-10-21-公网观测腿整改.md`。
 
-- r4 收尾补记：引用环说明、panic 回归实例 gate 注释和历史发布归因统一；不改运行行为。
+- v0.3.13 tag 后的其余评审收尾（不改运行行为）：r4 的引用环说明、panic 回归实例
+  gate 注释与历史发布归因统一；r3 收敛批（实例级 panic gate / DoH 读后越界 /
+  manual pubep 停止位 / 域名 255B 边界 / CL:0 按 NODATA）；r1(`ee4a42d`)/r2 收敛批
+  （DoH 腿健壮化、panic 路径断环、Windows 钉卡、clippy 归零、`DEFAULT_STUN` 兜底、
+  pubep 停止位扩到 manual 路径）。
 
-- r3 收敛批：**实例级 panic gate**（r3#8：全局静态 gate 在 16/32/64 线程下误伤并行
-  ExitQuic 用例——`ExitQuicConfig::with_panic_gate` 实例位取代全局静态与串行锁；
-  8/16/32/64 线程各多轮全绿）；DoH 读后越界检查（r3#3：单次阻塞读拖过 deadline 后
-  的完整响应一律按超时收，BlockingReader 用例钉死）；manual public_endpoint 路径的
-  停止位前移到写盘前（r3#10）；域名编码 255B 边界 off-by-one（r3#12：检查移到终止 0
-  后，256B 拒）；CL:0 按 NODATA 语义上交（r3#4）；CHANGELOG v0.3.13 段归因净化。
-
-- 评审整改 r1（ee4a42d，17 项）与 r2 收敛批：DoH 腿健壮化（真·总期限
-  read_http_response<R: Read> + Reader 级单测、CL 精确读 + 截断、chunked 显式拒绝、
-  DohError 分类、域名合法性显式拒绝）；panic 路径断环（catch_unwind 后 bridge.clear，
-  回归测试等「出口 QUIC 面 panic」判据行再断言——8 次稳定 + 反向红）；Windows 钉卡
-  （TCP 同钉 + IPV6_UNICAST_IF 主机序修正；运行面证据**待补**——INTEROP 登记项已注明无真机证据）；clippy
-  门禁归零（含存量两条）；`DEFAULT_STUN` 常量补 cloudflare 兜底（r1 曾漏改常量本体，
-  镜像测试补 stun 断言）；pubep 停止位扩到 manual 配置路径与 print/append 前。
 
 ## v0.3.13（2026-10-20，tag fbfd421）
 
