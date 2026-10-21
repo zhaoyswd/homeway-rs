@@ -25,3 +25,11 @@ Microsoft [SO_REUSEADDR 官方说明](https://learn.microsoft.com/en-us/windows/
 生产现场由主会话读取：v0.3.14 在 Linux TCP 41741 绑定失败后仅 UDP 运行；等待历史 TIME_WAIT 到期并二次重启后，IPv4/IPv6 TCP 41741 均恢复监听，Mac 12:29:33 收到 OK-MAC，印证该根因。此子任务没有连接或变更生产实例。
 
 代码门结论：通过，无高危未处理项。首次换装仍可能遇到修复前未设置地址复用的旧 TIME_WAIT，需等待它自然过期；本补丁保证由新 listener 接受的连接关闭后可立即重启，不强行清理系统 TCP 状态。Linux 原生源码回归、全仓测试、交叉检查与发版部署由主会话继续记录。
+
+
+## 主任务最终验收
+
+补丁已随v0.3.15发布，并由v0.3.16两台最终换装承接；最终CI双平台1225/0、Release五目标全绿。
+v0.3.16在已认证控制连接存在时真实relay restart 52ms恢复TCP v4/v6，统一pid/serve41641不变，
+Mac重认证成功。首次从无地址复用旧版升级曾等旧TCP状态62s；后续新版本之间无需该等待。
+完整SHA、进程、回退与范围见 `docs/DEPLOY-RUST-EXIT.md` §13.15。

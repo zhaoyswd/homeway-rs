@@ -88,3 +88,11 @@ Linux 全仓第一轮 core **843/1** 的唯一失败为既有 `speedtest_server:
   打包日志 `/tmp/pty-core-build.log`、`/tmp/pty-core-hsp.log`。
 - 私有 Linux 验证容器已移除，原始日志留存于本机 `/tmp`。未运行真机或生产验收，
   当前没有推送、打 tag、发 Release 或部署；因此未宣称新的 GitHub CI 已通过。
+
+
+## 后续用户授权推送部署
+
+用户随后明确授权「推送+部署」。原PTY修复已随v0.3.14上线；部署验收再修复Unix中继TCP
+重绑与PTY无腿收尾竞态，最终两台为v0.3.16，CI双平台各1225/0、Release五目标通过；
+每台4轮真实背压KILL及master逐轮归零通过。完整收口见 `docs/DEPLOY-RUST-EXIT.md` §13.15。
+上方「未推送/未部署」描述的是初次本地交付时点，现由此次授权执行记录承接。

@@ -74,14 +74,17 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 > **2026-10-21 PTY无腿收尾回收**：v0.3.15已完成双出口换装与中继快速重启（61ms，
 > Mac控制面重新认证），CI双平台各1221/0、Release五目标绿；重复PTY验收发现空ENDED集
 > 被误作幂等、运行态持有master，Linux残留4枚fd。v0.3.16修复首次无腿finish与写者退出
-> 的清理所有权；两道门见 `docs/reviews/2026-10-21-pty-finish-race.md`，待CI/发版/部署收口。
-> 现场与证据见 `docs/DEPLOY-RUST-EXIT.md` §13.14。
+> 的清理所有权，**已完成**：最终tag/pin `ccda247059c3`，GitHub八门全过、双平台各1225/0，
+> Release五目标通过；两台最终v0.3.16，各4轮真实背压KILL/master归零通过，中继重启52ms
+> TCP双栈恢复并重认证。正常核3,217,464B与签名debug HSP一致，未装手机。
+> 两道门/证据见 `docs/reviews/2026-10-21-pty-finish-race.md`。
+> 现场与最终证据见 `docs/DEPLOY-RUST-EXIT.md` §13.14–13.15。
 
 
 > **2026-10-21 推送部署与TCP快速重启补丁**：v0.3.14 已完成双出口换装，PTY真实背压
 > 与Linux master fd回收通过；GitHub CI八项、Release五目标均绿。验收发现TCP监听
 > 缺Unix地址复用，旧连接状态使启动落UDP-only；已恢复生产TCP并补v0.3.15最小修复，
-> 技术/代码门见 `docs/reviews/2026-10-21-relay-tcp-restart.md`。待新补丁CI/发版/部署收口。
+> 技术/代码门见 `docs/reviews/2026-10-21-relay-tcp-restart.md`。后续已由v0.3.16完成收口，见最新指针。
 > v0.3.14现场、回退件与证据见 `docs/DEPLOY-RUST-EXIT.md` §13.13。
 
 
@@ -91,7 +94,7 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 > clippy、OHOS/Windows check通过。顺带修正测速单测REPORT与结算日志的完成同步，
 > 不改测速实现。实现 `e407bdf199ff` 已干净构建核并同步tier pin，核3,217,016B、
 > 版本e407bdf199ff-rust；签名debug HSP打包与包内核逐字节核对通过。
-> 私有Linux容器已清理；未推送/tag/部署，未宣称远端新CI绿灯。
+> 私有Linux容器已清理；初验后按用户授权完成推送/发版/部署，最终v0.3.16见最新指针。
 > 技术/代码两道评审 = `docs/reviews/2026-10-21-linux-pty-write.md`。
 
 
@@ -105,7 +108,7 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 > 私有恢复e2e4/0，立即/停机5秒重启 T_recv=3058/2538ms。额外core32有一项既有
 > PTY attach 60s超时，单独复验1/0，未把压力轮写成全绿。完整验证、兼容升级顺序与
 > 未跑的设备/生产范围见 tier `docs/reviews/2026-10-21-中继赛跑与地址学习整改.md`。
-> 生产未部署，未推送/tag；本提交仅补收口证据与矩阵表，核pin仍指实现提交。
+> 该次初验未部署；后续按用户授权最终部署v0.3.16，核pin与收口见最新指针。
 
 
 > **2026-10-21 接续注**：公网观测 r5 全项整改已实施（TLS 绝对期限、发布与停机、relay fd

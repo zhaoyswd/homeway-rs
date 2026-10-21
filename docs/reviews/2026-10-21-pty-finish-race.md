@@ -42,3 +42,36 @@
 代码门结论：通过，无遗留高危项。生产重复背压与 fd 验证由主会话在用户授权的正式部署流程执行；本子任务未接触生产实例。
 
 最终补丁验证：macOS `cargo test --locked -p homeway-core --lib term:: -- --nocapture` **181 通过/0 失败**（13.80 秒）；`cargo clippy --locked -p homeway-core --all-targets -- -D warnings` 通过；`git diff --check` 通过。日志分别为 `/tmp/pty-finish-macos-term.log`、`/tmp/pty-finish-macos-clippy.log`。按主会话安排，Linux 完整回归交给推送后的 GitHub 双平台 CI；本子任务创建的 `homeway-pty-finish-20261021` 私有 Docker 容器已删除，未宣称本轮 Linux 本地测试通过。
+
+
+## 主会话发版前验证
+
+- 生产复核确认 v0.3.15 的 Linux 已无子进程及pump/resp/writer线程，但两个已结束会话
+  各保留core+writer两枚master（合计4枚），超过60s仍在；Mac亦残留2枚master。
+  不能将LIST为空写成无资源泄漏。现场见 `docs/DEPLOY-RUST-EXIT.md` §13.14。
+- 生产修复提交 `0524cb027d97` 的本机默认并发全仓 **1225/0**（37 ignored），
+  全workspace/all-targets clippy通过。
+- 首次CI `39546563479` 的Ubuntu通过，macOS唯一失败为既有DeadlineStream取消测试：
+  取消线程尚未设置停止位时90ms期限先到，实际TimedOut而测试要求ConnectionAborted。
+  四个新收尾回归均通过；随后只修测试夹具，生产DeadlineStream逻辑与预算未改变。
+- 最终发版提交/tag源码 `ccda247059c3`：
+  [CI 39547125580](https://github.com/zhaoyswd/homeway-rs/actions/runs/39547125580)
+  八job全通过，Ubuntu/macOS各 **1225/0**、各37 ignored。取消测试修正的技术/代码门见
+  `docs/reviews/2026-10-21-deadline-cancel-test.md`，保留90ms期限臂与两臂350ms断言。
+- App核pin同步到ccda247；干净检出正常构建，未用dirty/unpinned。核 **3,217,464 B**、
+  `ccda247059c3-rust`，SHA256 `ce8954cb2e35cee48a0aac4c5dd30bb6f16ffbdc632264b1cbbb0cfb631b46e1`。
+  21导出、NAPI/vocab/code-map/log-index门通过，重新assembleHsp，包内核与两处落盘
+  逐字节一致。HSP SHA256 `cd46367b5c5aee3b7683c3e3a787ddde5a115dae3ccd1c0c5c864f1db8953b41`。
+
+证据日志：`/tmp/pty-finish-{before,after,macos-term,macos-clippy,workspace,workspace-clippy}.log`、
+`/tmp/pty-finish-ci-failed.log`、`/tmp/pty-finish-github-ci.log`、
+`/tmp/pty-finish-final-core-{build,hsp}.log`。正式换装与重复master归零验收见下方收口记录。
+
+
+## 部署收口
+
+v0.3.16两台换装完成，Mac pid70081、Linux pid1657944；各4轮真实背压KILL后，
+会话出表且master每轮归零。原Linux4枚/Mac2枚遗留均不再复现。中继带已认证控制连接
+快速重启52ms，TCP双栈恢复、统一pid保持、Mac重新OK-MAC认证。身份/config哈希不变，
+旧二进制与state备份保留。最终CI/Release全过、产物校验、正常核/HSP及未装手机的范围
+见 `docs/DEPLOY-RUST-EXIT.md` §13.15；私有验证容器均已清理。

@@ -966,3 +966,41 @@ vocab/code-map门通过；签名debug HSP内核与两处落盘逐字节一致，
 核SHA256 `2d4c4cb5895810ce6680510e71f771775a95eda1e369bf7a918d9ba9bb1a09c1`。
 回退目录：Mac `~/homeway-rollback/v0.3.14-before-v0.3.15-20261021T043311Z/`；
 阿里云 `/opt/homeway/backups/v0.3.14-before-v0.3.15-20261021T043311Z/`。
+
+
+### 13.15 最终换装 v0.3.16（2026-10-21）
+
+用户授权链同§13.13。最终main/tag `ccda247059c3cc1ee6ffe3107072f451cef74724`。
+[CI 39547125580](https://github.com/zhaoyswd/homeway-rs/actions/runs/39547125580)八项通过，
+Ubuntu/macOS各1225/0、各37 ignored；
+[Release 39547545534](https://github.com/zhaoyswd/homeway-rs/actions/runs/39547545534)
+五目标与发布全通过。此前0524cb0轮的macOS取消测试失败已仅以独立测试安全期限修正，
+生产代码/90ms期限臂/两臂350ms断言未放宽；完整记录见同日deadline-cancel-test评审。
+
+| 机器 | 已核验产物 | 最终在役与验收 |
+|---|---|---|
+| Mac | tar SHA256 `9b70a555048f9e42f1a4371539ea793b3281ca3aa4a9c9250e6c474f52dde37b`；binary SHA256 `089c88af47ed80b33336029b4946149cd21fcc20e5924e36fc1557a9eb3428b0` | launchd零参 `/opt/homebrew/bin/homeway`，pid70081，v0.3.16，41641未漂移。连续4轮真实输入背压+独立KILL，控制应答0.7–0.9ms，每轮LIST出表且lsof master归零；最终公开候选含LAN/公网v4/Relay，IPv6按观测动态公布 |
+| 阿里云 | tar SHA256 `f77664089f9f940dba1bfc1227b02841606aca4db5335a1d55b97c517354d622`；binary SHA256 `0a82c5cd12aa52010490222c41052327bda6095d198d0e6657cf51e797935d2f` | 13:11:36零参 `/usr/local/bin/homeway` 起，pid1657944；v0.3.16，41641/udp、41741/udp+tcp双栈正常。连续4轮背压KILL，控制应答0.7–1.2ms，每轮LIST出表且/proc master归零 |
+
+**重复回收判据**：每轮发送4MiB数据到不读输入的 `exec sleep 30` 会话，先确认客户端发送仍在
+真实背压，再由另一条控制连接KILL；Linux实际接受81920B、Mac16384B即进入背压。原raw腿可因
+取消写而先EOF，不把它误当ENDED必达；控制OK、写者收工、会话出表和master归零分别验证。
+每轮独立名，不改用户文件；4轮结束后两台均没有测试会话和PTY master残留。
+
+**中继快速重启**：13:12:24有1条真实已认证后端控制连接时调用 `homeway relay restart`，
+52.0ms内TCP41741 v4/v6恢复监听；统一pid1657944与serve41641保持，Mac13:12:24.993
+OK-MAC认证恢复，阿里云13:12:25.117后端控制面就绪。换装自v0.3.15无需额外等待旧状态，
+本轮停旧进程后TIME_WAIT记0；不把这个0写成TIME_WAIT覆盖，FIN/EOF重绑由CI回归验证。
+
+**身份/配置**：Mac serve/key.bin与config、阿里云serve/key.bin/relay.key/config哈希均与升级前
+一致；保留凭证台账，不重建身份。Mac已有2枚peer自动恢复注册（未据此冒充手机L3流量验收）。
+**App核**：最终pin ccda247059c3，干净正常构建3,217,464B，ccda247059c3-rust；NAPI21导出/
+词表/代码地图/日志索引门通过；签名debug HSP内核与两处落盘一致。未安装手机或其它客户端。
+
+**回退件**：Mac `~/homeway-rollback/v0.3.15-before-v0.3.16-20261021T045020Z/`；
+阿里云 `/opt/homeway/backups/v0.3.15-before-v0.3.16-20261021T045020Z/`，各有旧homeway与state.tgz，
+保留之前v0.3.13/v0.3.14备份。Mac回退走临时件+原子换名+kickstart；阿里云先SIGTERM退净、
+确认监听释放再换旧件，沿用既有零参nohup形态。此次未增加或更换系统自启动项。
+
+证据：`/tmp/pty-finish-{mac,aliyun}-repeat.log`、`/tmp/pty-finish-github-ci.log`、
+`/tmp/pty-finish-final-core-{build,hsp}.log`与本机artifact-hashes/core-artifacts JSON。
