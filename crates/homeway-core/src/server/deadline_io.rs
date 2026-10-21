@@ -106,7 +106,14 @@ mod tests {
                 }
             });
             let start = Instant::now();
-            let mut io = DeadlineStream::new(client, start + Duration::from_millis(90), &stop);
+            // 取消分支验证取消本身，避免线程调度与 90ms 期限竞争；
+            // 下方 350ms 断言仍约束取消速度，非取消分支仍验证 90ms 总预算。
+            let budget = if cancel {
+                Duration::from_secs(5)
+            } else {
+                Duration::from_millis(90)
+            };
+            let mut io = DeadlineStream::new(client, start + budget, &stop);
             let error = io.read(&mut [0]).unwrap_err();
             assert_eq!(
                 error.kind(),
