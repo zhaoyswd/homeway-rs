@@ -1380,13 +1380,12 @@ impl TermService {
             self.end_leg(&name, reg.key, i32::MIN, "", "client_closed");
             return;
         }
-        // 尺寸哨兵：raw 腿在回放之后（写者按握手计划执行）；surface 腿在快照下发前
-        // （投递循环还在合并窗里，快照取到的已是按最终尺寸重绘过的屏）。
-        // 分档（term-attach-resilience）：本次 attach 几何未变（size_applied=None）⇒
-        // 间隔形态（背靠背双 SIGWINCH 被内核合并、App 读到尺寸未变会跳过重绘）；
-        // 几何真变 ⇒ 现状背靠背（真实 SIGWINCH 已足够，且避免 apply+第一跳合并落中间值）。
-        let spaced_sentinel = reg.size_applied.is_none();
-        self.sentinel_repaint(&name, sess_gen, spaced_sentinel);
+        // surface 从权威 VT 快照接入，无需让程序重画。人工中间列宽会令
+        // shell/TUI 输出按与 VT 不同的几何解释，永久污染主屏历史。
+        // raw 字节回放仍需要原有重画哨兵（同尺寸间隔、真实尺寸变化背靠背）。
+        if !surface {
+            self.sentinel_repaint(&name, sess_gen, reg.size_applied.is_none());
+        }
         if surface {
             let st = self.lock_state();
             if let Some(rt) = rt_of(&st, &name, sess_gen) {
@@ -1471,7 +1470,9 @@ impl TermService {
                                 f.payload.len()
                             ));
                             apply_size_locked(rt, sz);
-                            self.sentinel_repaint_locked(rt, false); // 几何真变路径：保持背靠背现状
+                            if rt.legs.iter().any(|l| l.key == key && l.surface.is_none()) {
+                                self.sentinel_repaint_locked(rt, false);
+                            }
                         }
                         (Arc::clone(&rt.pty), discard_reply)
                     };
@@ -1528,7 +1529,9 @@ impl TermService {
                                 "term: 会话 {name} 几何切换 → {sz}（腿 {key:?} RESIZE 上报）"
                             ));
                             apply_size_locked(rt, sz);
-                            self.sentinel_repaint_locked(rt, false); // 几何真变路径：保持背靠背现状
+                            if rt.legs.iter().any(|l| l.key == key && l.surface.is_none()) {
+                                self.sentinel_repaint_locked(rt, false);
+                            }
                             if clamped {
                                 self.logf(&format!(
                                     "term: 会话 {name} 尺寸夹取 {cols}x{rows} → {sz}（上限 {}x{}）",
@@ -1785,7 +1788,8 @@ impl TermService {
             if rt.stopped.load(Ordering::Relaxed) {
                 None
             } else if let Some(vt) = rt.vt.as_mut() {
-                let geom = st.registry.session(name).map(|s| s.size).unwrap_or(Size::DEFAULT);
+                let (cols, rows) = vt.size();
+                let geom = Size::normalized(cols, rows);
                 let surface = rt
                     .legs
                     .iter()
@@ -2134,12 +2138,12 @@ impl TermService {
         if rt.size() != base {
             return; // ④ 间隔期间真实 resize 已让位——不覆盖新尺寸
         }
-        rt.pty.resize(base.cols(), base.rows()); // ⑤ 恢复（同值幂等：TIOCSWINSZ 不产生信号）
+        resize_pty_vt_locked(rt, base); // ⑤ 两者同几何恢复；同值 TIOCSWINSZ 不产生信号
     }
 
     /// 同上（调用方持锁 + rt 在手）。间隔形态返回 `Some(base)`（第二跳由延迟线程执行）。
     ///
-    /// 不变量（恢复重验④的前提）：第一跳只动 PTY——**不写 ring epoch、不改 `rt.size()`**；
+    /// 不变量（恢复重验④的前提）：第一跳同步 PTY/VT——**不写 ring epoch、不改 `rt.size()`**；
     /// 若改用 `apply_size_locked` 做第一跳，重验会恒让位 ⇒ PTY 永远停在 sentinel 列宽。
     fn sentinel_repaint_locked(&self, rt: &mut SessRt, spaced: bool) -> Option<Size> {
         if rt.stopped.load(Ordering::Relaxed) {
@@ -2149,11 +2153,11 @@ impl TermService {
         let size = rt.size();
         let (cols, rows) = (size.cols(), size.rows());
         let sentinel = if cols > 1 { cols - 1 } else { cols + 1 };
-        rt.pty.resize(sentinel, rows);
+        resize_pty_vt_locked(rt, Size::normalized(sentinel, rows));
         if spaced {
             return Some(size);
         }
-        rt.pty.resize(cols, rows);
+        resize_pty_vt_locked(rt, size);
         None
     }
 
@@ -2211,7 +2215,9 @@ impl TermService {
         }
         if let Some(sz) = outcome.size_applied {
             apply_size_locked(rt, sz);
-            self.sentinel_repaint_locked(rt, false); // 几何真变路径：保持背靠背现状
+            if rt.legs.iter().any(|l| Some(l.key) == outcome.re_elected && l.surface.is_none()) {
+                self.sentinel_repaint_locked(rt, false);
+            }
         }
     }
 
@@ -2674,13 +2680,12 @@ impl TermService {
             if st.registry.session(name).is_none_or(|s| s.done) {
                 return;
             }
-            let geom = st.registry.session(name).map(|s| s.size).unwrap_or(Size::DEFAULT);
             let Some(rt) = rt_of_mut(st, name, sess_gen) else { return };
             if !rt.any_surface() {
                 return;
             }
             let Some(vt) = rt.vt.as_mut() else { return };
-            let (cols, rows) = (geom.cols(), geom.rows());
+            let (cols, rows) = vt.size();
             let title = rt.scan.title().to_string();
             // 回滚回落检测（noteScrollbar 在 takeSnapshotFlag 之前——本拍消费）
             let cur_sb = ScrollbarWire::from(vt.scrollbar());
@@ -3670,6 +3675,21 @@ fn bounded_mirror_rows(vt: &SessionVt, count: usize, budget: usize) -> (Vec<u8>,
     (out, count)
 }
 
+/// 调用方持服务锁：真实与哨兵尺寸都必须让 PTY、共享 VT 同步；pump 只会看到
+/// 完整尺寸状态。哨兵不改变注册表/ring 的基准尺寸，恢复世代守卫仍按基准重验。
+fn resize_pty_vt_locked(rt: &mut SessRt, size: Size) {
+    rt.pty.resize(size.cols(), size.rows());
+    if let Some(vt) = rt.vt.as_mut() {
+        let _ = vt.resize(size.cols(), size.rows());
+    }
+    for leg in &mut rt.legs {
+        if let Some(surface) = leg.surface.as_mut() {
+            surface.mark_need_snapshot("resize");
+        }
+    }
+    if rt.any_surface() { rt.wake_surface(); }
+}
+
 /// 尺寸应用（applySizeLocked）：PTY setsize + epoch + vt 重排 + 全 surface 腿标记全量
 /// （被动腿会拒收几何不符的差分，任务 3.1 的连带义务）+ **异几何 raw 腿注入清屏序**。
 ///
@@ -3687,15 +3707,10 @@ fn apply_size_locked(rt: &mut SessRt, size: Size) {
     if rt.size() == size {
         return;
     }
-    rt.pty.resize(size.cols(), size.rows());
+    resize_pty_vt_locked(rt, size);
     rt.ring.note_size(size);
-    if let Some(vt) = rt.vt.as_mut() {
-        let _ = vt.resize(size.cols(), size.rows());
-    }
     for l in &mut rt.legs {
-        if let Some(s) = l.surface.as_mut() {
-            s.mark_need_snapshot("resize");
-        } else if l.size != size {
+        if l.surface.is_none() && l.size != size {
             // 清屏 + 跳环尾（同一锁内，写者的 peek 线性化在后）：清屏帧只清屏幕，
             // 环里积压的旧几何画面会在清屏后涌出把残留重新画上——跳到环尾，
             // 清屏后直接接 resize 之后的新输出（TUI 的重画帧由哨兵保证到达）。
@@ -5420,6 +5435,177 @@ mod tests {
         let t0 = Instant::now();
         h.join().expect("监听线程干净退出");
         assert!(t0.elapsed() < Duration::from_secs(1), "停止位后 ≤1s 退出");
+    }
+
+    /// surface 已有权威 VT，不得为接入临时改变 PTY 列宽污染主屏历史。
+    #[test]
+    fn surface_attach_preserves_shell_history_without_temporary_resize() {
+        let cfg = TermConfig {
+            shell: Some(concat!(
+                "trap 'printf \"\\r\\nWINCH:%s\\r\\n\" \"$(stty size)\"' WINCH; ",
+                "printf 'BEFORE\\r\\n$ codex\\r\\n\\033[?1049h\\033[HOLD-TUI\\033[?1049l$ READY'; ",
+                "while :; do sleep 0.02; done"
+            ).into()),
+            sentinel_gap: Duration::from_millis(150),
+            ..TermConfig::default()
+        };
+        let svc = svc_with(cfg, Arc::new(Mutex::new(Vec::new())));
+        struct CloseOnDrop(Arc<TermService>);
+        impl Drop for CloseOnDrop { fn drop(&mut self) { self.0.close(); } }
+        let _close = CloseOnDrop(Arc::clone(&svc));
+        let (listener, path) = start_listener();
+        let serving = Arc::clone(&svc);
+        std::thread::spawn(move || serving.serve(listener));
+        let name = tmp_name("surface-history");
+        svc.create_only(&name, false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let before = loop {
+            let mut state = svc.lock_state();
+            let vt = state.sessions.get_mut(&name).unwrap().vt.as_mut().unwrap();
+            let text = vt.plain_text();
+            if text.contains("$ READY") { break text; }
+            drop(state);
+            assert!(Instant::now() < deadline, "shell 未就绪");
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(!before.contains("OLD-TUI"), "退出备用屏后的历史不含 TUI");
+        let mut client = Client::connect(&path);
+        client.send(Op::HELLO, &hello(&name, &frames::enc_hello_tail(
+            frames::caps::SURFACE | frames::caps::KEY_ALT_NO_ESC_PREFIX, "surface-history",
+        )));
+        client.expect(Op::ATTACHED, 5);
+        client.expect(Op::SNAPSHOT_DONE, 5);
+        // 跨过完整哨兵窗口，捕获第一次和恢复第二次 WINCH 对主屏的实际写入。
+        std::thread::sleep(Duration::from_millis(350));
+        {
+            let mut state = svc.lock_state();
+            let rt = state.sessions.get_mut(&name).unwrap();
+            assert_eq!(rt.vt.as_mut().unwrap().plain_text(), before,
+                "仅接入 surface 不应触发 shell 重画或追加主屏历史");
+            assert_eq!(rt.pty.tty_size(), (80, 24));
+        }
+        let mut narrow = Client::connect(&path);
+        narrow.send(Op::HELLO, &frames::enc_hello(38, 24, 0, &name, &frames::enc_hello_tail(
+            frames::caps::SURFACE | frames::caps::KEY_ALT_NO_ESC_PREFIX, "narrow-surface",
+        )));
+        narrow.expect(Op::ATTACHED, 5);
+        narrow.expect(Op::SNAPSHOT_DONE, 5);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut state = svc.lock_state();
+            let rt = state.sessions.get_mut(&name).unwrap();
+            let text = rt.vt.as_mut().unwrap().plain_text();
+            if text.contains("WINCH:24 38") {
+                assert!(!text.contains("WINCH:24 37"), "shell 不应观察人工中间列宽");
+                assert!(!text.contains("OLD-TUI"));
+                assert!(text.contains("BEFORE\n$ codex\n$ READY"));
+                assert_eq!(rt.pty.tty_size(), (38, 24));
+                break;
+            }
+            drop(state);
+            assert!(Instant::now() < deadline, "shell 未收到真实尺寸变化：{text:?}");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn raw_sentinel_keeps_shared_vt_geometry_and_yields_to_surface_resize() {
+        let cfg = TermConfig {
+            shell: Some("stty raw -echo; printf READY; cat".into()),
+            sentinel_gap: Duration::from_millis(500),
+            ..TermConfig::default()
+        };
+        let svc = svc_with(cfg, Arc::new(Mutex::new(Vec::new())));
+        struct CloseOnDrop(Arc<TermService>);
+        impl Drop for CloseOnDrop { fn drop(&mut self) { self.0.close(); } }
+        let _close = CloseOnDrop(Arc::clone(&svc));
+        let (listener, path) = start_listener();
+        let serving = Arc::clone(&svc);
+        std::thread::spawn(move || serving.serve(listener));
+        let name = tmp_name("mixed-geometry");
+        svc.create_only(&name, false).unwrap();
+        let mut surface = Client::connect(&path);
+        surface.send(Op::HELLO, &hello(&name, &frames::enc_hello_tail(
+            frames::caps::SURFACE | frames::caps::KEY_ALT_NO_ESC_PREFIX, "mixed-app",
+        )));
+        surface.expect(Op::ATTACHED, 5);
+        surface.expect(Op::SNAPSHOT_DONE, 5);
+        let mut raw = Client::connect(&path);
+        raw.send(Op::HELLO, &hello(&name, &frames::enc_hello_tail(
+            frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "mixed-host",
+        )));
+        raw.expect(Op::ATTACHED, 5);
+        raw.expect(Op::REPLAY_DONE, 5);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let state = svc.lock_state();
+            let rt = &state.sessions[&name];
+            if rt.pty.tty_size() == (79, 24) {
+                assert_eq!(rt.vt.as_ref().unwrap().size(), (79, 24), "pump 必须按 PTY 实际列宽解析");
+                break;
+            }
+            drop(state);
+            assert!(Instant::now() < deadline, "raw 哨兵未起跑");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // 混合腿的临时快照也必须按 VT 实际79列编码，不能把79格行标成80列。
+        loop {
+            let mut encoded = Vec::new();
+            loop {
+                let frame = surface.expect(Op::SNAPSHOT, 5);
+                let (flags, chunk) = super::super::codec::dec_fragment(&frame.payload).unwrap();
+                encoded.extend_from_slice(chunk);
+                if flags & super::super::codec::FRAG_MORE_BIT == 0 { break; }
+            }
+            surface.expect(Op::SNAPSHOT_DONE, 5);
+            let body = super::super::codec::gunzip_bytes(&encoded).unwrap();
+            let snapshot = super::super::codec::dec_snapshot_body(&body).unwrap();
+            if snapshot.cols == 79 {
+                assert_eq!(snapshot.rows, 24);
+                break;
+            }
+            assert_eq!(snapshot.cols, 80);
+        }
+        let long = "X".repeat(80);
+        raw.send(Op::DATA, format!("\r\n{long}\r\n").as_bytes());
+        let deadline = Instant::now() + Duration::from_secs(3);
+        loop {
+            let mut state = svc.lock_state();
+            let vt = state.sessions.get_mut(&name).unwrap().vt.as_mut().unwrap();
+            let text = vt.plain_text();
+            if text.contains(&long) {
+                let rows = vt.rows_at(vt.history_base(), vt.scrollbar().total as usize);
+                assert!(rows.iter().any(|row| row.wraps && row.cells.len() == 79), "实际输出必须按临时79列折行");
+                break;
+            }
+            drop(state);
+            assert!(Instant::now() < deadline, "未收到 PTY 回显");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        // 等第二跳恢复，再让真实 raw RESIZE 与 surface 夺回几何逐路经过共享 VT。
+        std::thread::sleep(Duration::from_millis(550));
+        {
+            let mut state = svc.lock_state();
+            let rt = state.sessions.get_mut(&name).unwrap();
+            assert_eq!((rt.pty.tty_size(), rt.vt.as_ref().unwrap().size()), ((80, 24), (80, 24)));
+            assert!(rt.vt.as_mut().unwrap().plain_text().contains(&long));
+        }
+        raw.send(Op::RESIZE, &frames::enc_resize(38, 24));
+        std::thread::sleep(Duration::from_millis(50));
+        let generation = {
+            let state = svc.lock_state();
+            let rt = &state.sessions[&name];
+            assert_eq!((rt.pty.tty_size(), rt.vt.as_ref().unwrap().size()), ((38, 24), (38, 24)));
+            rt.gen
+        };
+        // 手动起一个未完成的间隔哨兵，再由 surface 真尺寸覆盖；延迟恢复不得踩回旧值。
+        svc.sentinel_repaint(&name, generation, true);
+        surface.send(Op::RESIZE, &frames::enc_resize(50, 24));
+        std::thread::sleep(Duration::from_millis(600));
+        let mut state = svc.lock_state();
+        let rt = state.sessions.get_mut(&name).unwrap();
+        assert_eq!((rt.pty.tty_size(), rt.vt.as_ref().unwrap().size()), ((50, 24), (50, 24)));
+        assert!(rt.vt.as_mut().unwrap().plain_text().contains(&long));
     }
 
     /// 一次 attach 恰一次尺寸哨兵（低 7 判据计数器——P10：计数器有了断言；

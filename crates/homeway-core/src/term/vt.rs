@@ -1819,6 +1819,25 @@ mod tests {
     use crate::term::testutil::{fnv_hex, golden_manifest, style_of, text_of};
 
     #[test]
+    fn shell_history_reflows_without_resurrecting_exited_tui() {
+        let mut vt = SessionVt::new(80, 24, 100).unwrap();
+        let long = "shell-output-".repeat(9);
+        vt.write(format!("BEFORE\r\n{long}\r\n$ codex\r\n").as_bytes());
+        vt.write(b"\x1b[?1049h\x1b[HOLD-TUI\r\nOLD-TUI-2");
+        vt.resize(38, 34).unwrap(); // 改尺寸时主屏在后台，也必须正确重排。
+        vt.write(b"\x1b[?1049l$ READY");
+        for (cols, rows) in [(38, 34), (100, 20), (23, 12), (80, 24)] {
+            vt.resize(cols, rows).unwrap();
+            let text = vt.plain_text();
+            let lines: Vec<_> = text.lines().filter(|line| !line.is_empty()).collect();
+            assert_eq!(lines, ["BEFORE", &long, "$ codex", "$ READY"], "{cols}x{rows}");
+            assert!(!text.contains("OLD-TUI"));
+            assert!(vt.rows_at(vt.history_base(), vt.scrollbar().total as usize)
+                .iter().all(|row| row.cells.len() <= cols as usize));
+        }
+    }
+
+    #[test]
     fn history_identity_survives_capacity_and_real_exit_row_rewrite() {
         let mut vt = SessionVt::new(12, 2, 3).unwrap();
         for line in 0..12 { vt.write(format!("L{line}\r\n").as_bytes()); }

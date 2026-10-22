@@ -1231,3 +1231,14 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
   Linux EIO 映射 EOF，空读不当 EOF；写端 HUP/ERR 立即返回失败，不空转。
 - wire 字节、日志判据、ENDED 退出码（信号死=-1）、KILL_GRACE=500ms、NAPI 导出均不变。
   新回归是真 PTY 下取消背压写/正常退出/输出延迟与逐字节顺序，不修改原失败用例的通过判据。
+
+### 2026-10-22：surface 接入与共享 VT 尺寸一致性
+
+- 从「surface 接入/活动几何切换/RESIZE/退出重选举均额外注入尺寸哨兵」改为直接下发权威
+  VT 快照、真实尺寸只应用目标值。旧要求使 shell 经人工中间列宽重画，并把历史按错误几何写坏。
+- raw 催重绘哨兵保留，但每一跳都在服务锁内同步 PTY 与共享 VT，标记全部 surface 腿全量；
+  快照与 FETCH-ROWS 几何取 VT 实际尺寸。注册表/ring 的基准不跟临时尺寸走，恢复仍按会话
+  世代/存活/基准尺寸重验，真实 resize 优先；混合腿允许看到临时尺寸快照及历史 epoch 换代。
+- 不按 Codex 名字删除正常主屏/inline 历史；旧会话已经写坏的历史不能据此逆向恢复。
+  wire/surface/NAPI 与日志判据串不变。两道门与真实 PTY 红→绿证据见
+  `docs/reviews/2026-10-22-term-surface-attach.md`；尚未发布/部署或在用户终端现场验收。
