@@ -1087,3 +1087,54 @@ Mac `~/homeway-rollback/v0.3.16-before-v0.3.18-20261021T162800Z/`；阿里云
 `tier:build/releases/v0.3.18/verified.json`；阿里云stage
 `/tmp/homeway-terminal-0ef14e5e7227.9tSHtI/{official18-private-unified,official18-production-smoke}.log`。
 两道门与根因证据在`docs/reviews/2026-10-22-terminal-sigpipe.md`，最终交付清单在tier部署报告。
+
+### 13.17 滚动升级 v0.3.19（2026-10-22 19:40–19:58，raw 终端回放备用屏修复）
+
+用户指令四连：两仓提交推送、发版、APP debug 出包、部署（不装手机）。全部按 2026-10-21
+固化的 main→tag→GitHub Release→本机校验→scp→滚动换装纪律执行。
+
+**发布链路**：功能+发版单提交 `b447b4c276f7`（修复 raw 回放丢备用屏 + 版本 0.3.19，
+CHANGELOG/评审文档同批）；tier 同批 `bea2a3ca`（终端入场状态/文件通道归一/pin f883d7a）。
+CI39633996843 之后 CI39771306140 首跑 macOS 两例 dnsproxy（`answer_stream_counts_qtcp_before_gate_and_gates`/
+`self_check_passes_with_upstream_and_fails_when_dead`）环境抖动红——本批 diff 未触碰
+dnsproxy、本地复跑 22/0 绿，`gh run rerun --failed` 后 8/8 全过、双平台合计 2524/0
+（每平台 ~1252，ignored 与 v0.3.18 同规模）。Release39772476580 五目标全过。
+
+**官方产物核验**（本机 `/tmp/homeway-v0.3.19-official/`）：
+
+| 平台 | 归档SHA256 | binary SHA256 |
+|---|---|---|
+| darwin-arm64 | SHA256SUMS `OK` | `e1548347ecfd1fae4b920368bd3058d9315ce6bbfeb6562c41cfefb7b5bff7a1`（Mach-O arm64，codesign 通过，`--version` = v0.3.19） |
+| linux-amd64-musl | SHA256SUMS `OK`（scp 后阿里云复验同哈希） | `eee877dfeb70e588aa57aa8ffc63605aae47a30d21a8b9da3c3ad1fdb2a4e9d5`（static-pie x86-64） |
+
+**验收脚本**（`/tmp/homeway-v0.3.19-private-acceptance.py`，18 例，本册首次把验收固化为
+可重跑脚本）：① 1000 次立即断开（SIGPIPE 哨兵）②完整历史回放=主屏前序+首行/进入序列保留
++replayed 计数 ③1.2MiB 裁剪回放=备用屏前序 `ESC[?47h`+进入序列已裁+行边界对齐+尾部标记+
+计数≤256KiB ④主屏起点前序 `ESC[?47l` ⑤surface 快照+resize 100x30→100x32 ⑥4×64KiB 行式
+输入背压（cat 消费+EOF；无换行块会被 canonical 单行上限 ~1024B 拒收吃 BEL，不是背压）
+⑦KILL/LIST 归零。**红对照**：v0.3.18 旧核 ②③④ 前序断言全红（无 47h/l、完整历史丢首行），
+证明用例确能检出本批缺陷；官方 v0.3.19 两平台私有（Mac 实例76 / 阿里云 42741 私实例）
+各 1000 断开 + 18/18 全过，进程均存活。
+
+| 正式在役 | 换装与验收 |
+|---|---|
+| Mac | 备份后 `launchctl kickstart -k`，pid78967，`/opt/homebrew/bin/homeway` sha=`e1548347…`（=官方件）；41641 UDP 在听、公网 v4/中继端点照常公布；正式 term.sock 32 次断开 + 18/18 全过 |
+| 阿里云 | 停进程→换件→nohup 原形态重启（cwd=/opt/homeway、HOME=/root、零参），pid1697748，sha=`eee877df…`；41641/udp + 41741/udp/tcp 双栈在听、公网端点已公布（IPv6 无路由，与换装前一致）；正式 term.sock 32 次断开 + 18/18 全过 |
+
+阿里云首次 cp 撞 `Text file busy`（运行中二进制不可原位覆写），kill 分离后成功；防双启
+门在误启动时正确拒绝（"已在运行——拒绝二次启动"），生产无损。两端 serve/key、阿里云
+relay.key、tokens 台账哈希换装前后一致；无身份重建、无凭证吊销。
+
+**App debug**：tier pin=b447b4c276f7，清洁正常核 3,217,720B（sha `50237c55…`，版本标记
+`b447b4c276f7-rust` 双落盘一致）；core/terminal HSP + entry HAP debug 三包成功，交付
+`tier:build/debug-v0.3.19/`（manifest/SHA256SUMS 齐），用户要求不装手机。
+
+**新回退件**（目录0700/文件0600，state 排除 cache 日志与 socket）：
+Mac `~/homeway-rollback/v0.3.18-before-v0.3.19-20261022T115331Z/`；
+阿里云 `/opt/homeway/backups/v0.3.18-before-v0.3.19-20261022T115449Z/`
+（内含 v0.3.18 binary——哈希与 §13.16 官方件一致——及 config/relay.key/serve 全量哈希清单）。
+回退 = 换回 binary + 原监督形态重启，不动在用凭证。
+
+证据：本机 `/tmp/homeway-v0.3.19-{official/,mac-private.log,mac-production.log,local-green.log,
+ci-watch*.log,release-watch.log,core-build.log}`；阿里云 `/tmp/homeway-v0.3.19-stage/
+{aliyun-private.log,aliyun-production.log}`。两道门在 `docs/reviews/2026-10-22-term-replay-screen.md`。

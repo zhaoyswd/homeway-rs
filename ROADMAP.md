@@ -108,6 +108,18 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 > 策略不改。两道门与验证见 `docs/reviews/2026-10-22-terminal-sigpipe.md`；生产由主会话
 > 曾回退v0.3.16保可用，现已按上方v0.3.18官方Release完成两端验收，不部署临时GNU产物。
 
+> **2026-10-22 v0.3.19 部署收口**：最终tag/source `b447b4c276f7`（v0.3.19，raw 回放备用屏
+> 修复 + surface 人工尺寸哨兵退役随版）。CI39771306140 首跑 macOS 两例 dnsproxy 环境抖动
+> 红（本批 diff 未触碰该模块，本地复跑 22/0 绿），重跑后 8/8 全过、双平台合计 2524/0；
+> Release39772476580 五目标全过。两出口均换官方产物：Mac pid78967、阿里云pid1697748；
+> 归档本机校验（darwin Mach-O/codesign、linux static-pie、双端 sha256 一致）后 scp。
+> 验收脚本（/tmp/homeway-v0.3.19-private-acceptance.py 形态）18 例：旧核红对照证实
+> 截断回放前序缺陷可检，官方件两平台私有各 1000 次断开 + 完整/截断回放选屏 + surface
+> resize/FETCH + 4×64KiB 行式背压 + KILL/LIST 归零全过；正式 term.sock 各 32 次断开同套
+> 18/18 全过。身份/config/relay key 哈希换装前后一致。tier pin=b447b4c276f7、清洁核
+> 3,217,720B（50237c55…）/debug 三包通过，用户要求不装手机。部署与回退证据见
+> `docs/DEPLOY-RUST-EXIT.md` §13.17；本批无剩余发布操作。
+
 > **2026-10-21 终端当前单版本收口**：用户明确尚未发布，删除旧APP/旧出口握手与材质适配。
 > Rust严格当前HELLO字段、GREETING结构/版本、显式App/Host类型与按键平台；删除Legacy腿
 > 与宿主默认推断，保留raw-only故障路径和ANSI/DEC标准模式。CLI/APP与当前夹具同步执行。
