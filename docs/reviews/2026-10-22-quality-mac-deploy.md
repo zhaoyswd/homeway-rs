@@ -37,3 +37,59 @@
 ### 发版代码门结果
 
 已独立检查工作区实际 diff：`Cargo.toml` workspace version 从 0.3.19 → 0.3.20；`Cargo.lock` 的 homeway-capi / cli / core / quic 四个本仓 package 同步，未发生第三方依赖变化；CHANGELOG 仅追加本批质量功能、不可用字段、测量边界及仅 Mac 部署范围。无临时路径、凭证、binary 产物、服务配置或 wire / NAPI 改动。**代码门通过，无阻碍发版的发现。** 官方产物验收与正式换装属于后续执行证据，由根会话入部署记录，不混同代码审查结论。
+
+### v0.3.20 CI 首轮 Ubuntu 失败分析（2026-10-23，只读诊断）
+
+证据：tag `v0.3.20` / `36bf2aa` 的 Ubuntu `homeway-core` 首轮为 901 通过、1 失败、
+5 ignored；唯一失败是 `facade::tun_exec::tests::request_port_forwards_rc_zero_with_live_gen_stale_minus_one`
+在 `tun_exec.rs:3513` 的「热替换后监听口真可连」。前面 `request_port_forwards == 0`、
+状态 `listening` 断言均已通过，原断言只记录 `connect().is_ok()`，没有保留失败 errno。
+原始日志为执行机私有 `/tmp/homeway-v0.3.20-ci-linux.log`。根会话本机同例复跑 1/0。
+
+已核实的排除证据：
+
+- `v0.3.19..v0.3.20` 的 `facade/tun_exec.rs`、`facade/portfwd.rs` 无 diff；该合成世代
+  无岛、不装出口 engine/collector，新增出口质量采样不在此例的直接调用路径。
+- `sysock.rs` 此批只新增 `tcp_quality`（借用 raw fd 调 `getsockopt`，不 close/dup/
+  构造 fd 所有者）和两例测试；既有 socket/send/recv/RST 语义不变。新流仪表测试无
+  `unsafe`、`from_raw_fd`、裸 `close`、全局环境或跨测试静态状态；UnixStream → OwnedFd
+  由消费式 `into()` 移动，再由 ReactorIo 单一持有，移除流后只释放一次。未发现新代码双关 fd 的路径。
+- CI 中失败输出时刻为 16:02:26.938 UTC；新 flow quality 用例完成于 16:02:42.017–42.081，
+  sysock quality 于 16:02:45.377–45.378。时间先后本身不是线程起跑证明，但与上述直接
+  调用路径/所有权检查一起，没有形成新测试提前破坏该监听器的证据。
+- `free_port()` 是释放探测监听器再重绑，有通用 TOCTOU 窗口；但若端口被其他 listener
+  抢占，本例通常会先失败于 bind 后的 `state == listening` 断言，不能仅凭 free_port
+  的存在解释已经通过 listening、随后 connect 失败的本次记录。运行时 stop Arc、状态表
+  与监听器属各合成世代，不与其他测试共享。
+
+待证实的推断：`synthetic_for_test` 的 `PfSetup.dial` 恒同步返回 ConnectionRefused；
+监听口 accept 后，`pf_conn_thread` 的旧失败路径随即设置 `SO_LINGER(1,0)` 并 drop 本地连接，
+主动发送 RST。因此「监听成功」与「连接立刻被上游失败桩复位」并存是代码的真实行为；
+若复位在 connect 系统调用返回前可见，单次 `connect().is_ok()` 可能与线程调度竞态。
+此链路与现象相容，但原日志无 errno，不能宣布它就是这次 CI 的已证实根因。
+
+有限负复现：在独立 `docker run --rm --network none python:3-slim` 的 Linux namespace 中，
+仅新建回环 listener，accept 后立即 `SO_LINGER(1,0)` + close，调用方使用阻塞 connect，
+每轮 yield，5.602 秒完成 15,802 次 connect/accept，connect 错误为 0。**本实验没有复现
+connect 失败，不能用它证明 RST 竞态成立，也不能据此排除低概率/平台调度差异。** 初版
+无 yield 的固定轮数实验因 backlog 进度缓慢提前终止，仅其新建容器被清理，未访问其他
+既有容器或生产实例。
+
+执行决定：保留首轮红证据，可对原失败 Ubuntu job 在同一 tag 上诊断性 rerun 一次，
+等待完整 CI 八门通过后才进入生产流程；不把一次通过冒充根因确认。若同点再次失败，
+须补 connect 原始错误与桩时序证据，按新版本修复测试/实现，不能挪动已发布 tag。
+此前另一提交的 stats_loop 时窗失败是独立事项，不作为本例的归因依据。
+
+### 脚本复核与实际执行（2026-10-23）
+
+独立只读复核 `/tmp/homeway-v0.3.20-official/deploy_mac.py` 与原生验收脚本通过：官方件
+hash和private-result一致；CI/Release硬门、现役官方hash、受限备份及归档读回、原子换件与
+失败恢复旧件成立。原生CREATE使用ONLY_IF_ABSENT，KILL限本次唯一命名空间，LIST只输出
+他人会话数量，不接管或杀他人会话。AST解析通过，未发现阻碍执行的问题。
+
+原失败Ubuntu job `119939459440` 诊断复验通过，整个CI八门绿，双平台各1295/0、38 ignored；
+原tag保留，根因仍未确认。Release五目标与发布绿后，官方件私有质量真实流量、零参unified
+1000断连与17条PASS通过；正式Mac备份后单次kickstart，pid73548，官方hash一致、41641 UDP及
+files/term就绪，32断连和17条PASS通过、中继恢复、config/key不变、tokens前缀保全。
+首拍00:13:37 +08:00，验收5拍无存储错误/丢样，1设备路径、0目标样本；不作为真机L3判据。
+回退件及完整hash见部署手册§13.18。阿里云与手机未操作，本轮部署完成。

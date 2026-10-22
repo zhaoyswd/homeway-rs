@@ -72,7 +72,7 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
-> **2026-10-23 v0.3.20 本机部署执行中**：用户明确「部署在这台电脑」，授权按main/tag/GitHub Release链发布并只换装Mac launchd出口；阿里云与手机不操作。版本/lock/CHANGELOG同步，功能基线3ed7ff9，两道部署评审见 `docs/reviews/2026-10-22-quality-mac-deploy.md`。官方darwin-arm64归档校验后，先私有真实过境质量与零参unified终端验收，再备份身份/config/凭证、原子换件并单次kickstart。成功后的版本/哈希/覆盖与回退凭据记入部署手册，未有结果前不宣称已上线。
+> **2026-10-23 v0.3.20 本机部署完成**：用户明确「部署在这台电脑」，功能3ed7ff9、发版36bf2aa已推main/tag；CI39810271242八门通过（Ubuntu旧端口转发测试首红、诊断复验通过，根因未确认；双平台各1295/0、38 ignored），Release39810312104五目标与发布成功。官方darwin-arm64经SHA256SUMS/架构/签名核验，私有两设备真实过境质量、零参unified的1000次断连与17项PASS通过；备份后原子换件、单次kickstart，Mac pid73548，正式32次断连与17项PASS、身份/config/凭证保全、中继恢复及质量采集通过。首拍00:13:37 +08:00，验收时1台设备路径、0目标样本，不冒充真机L3流量验收。阿里云保留v0.3.19，未安装手机；tier pin=36bf2aa清洁核与core HSP已同步。两道门见 `docs/reviews/2026-10-22-quality-mac-deploy.md`，完整哈希/备份/边界见 `docs/DEPLOY-RUST-EXIT.md` §13.18；本轮无剩余部署操作。
 
 > **2026-10-22 出口质量历史（源码与验证完成，未部署）**：按用户要求完成认证设备QUIC路径、目标流与出口转发观测、有界异步历史、`serve quality` 时间段/设备文本和JSON报告。每5秒采样，4×8MiB轮转；未知TCP字段为null，缺测/边界/重启/轮转/慢盘收尾均明示，无wire/NAPI/连接策略变更。`ci-local.sh` quick全绿（23:28；全仓1294/0、38 ignored，SIGPIPE子进程同例去重；矩阵100MB SHA一致，既有E11 WARN和DNS SKIP在册），最终质量25/0、CLI4/0、workspace clippy与Linux musl/Windows/OHOS check通过，真实两设备同目标过境TCP字节对账1/0。两道门与独立复核 = `docs/reviews/2026-10-22-quality-*.md`；规格与核pin/清洁核HSP凭据 = tier `exit-quality-history` 规格及 `docs/reviews/exit-quality-history-2026-10-22.md`。两仓本地分别提交；未推送、未发布、未部署、未安装真机，旧出口无此历史，下一步如需上线须走正式Release链路。
 

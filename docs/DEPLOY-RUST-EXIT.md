@@ -1138,3 +1138,53 @@ Mac `~/homeway-rollback/v0.3.18-before-v0.3.19-20261022T115331Z/`；
 证据：本机 `/tmp/homeway-v0.3.19-{official/,mac-private.log,mac-production.log,local-green.log,
 ci-watch*.log,release-watch.log,core-build.log}`；阿里云 `/tmp/homeway-v0.3.19-stage/
 {aliyun-private.log,aliyun-production.log}`。两道门在 `docs/reviews/2026-10-22-term-replay-screen.md`。
+
+### 13.18 本机升级 v0.3.20（2026-10-23 00:13–00:14，出口质量历史）
+
+用户明确「部署在这台电脑」，范围仅本机 Mac。功能提交 `3ed7ff92b252`，版本提交
+`36bf2aaca1d7dd6f5ac4f4914a8446f0a31d699e` 已推 main，并在该头打 `v0.3.20`。
+[CI39810271242](https://github.com/zhaoyswd/homeway-rs/actions/runs/39810271242) 八门通过，
+Ubuntu/macOS 各1295/0、38 ignored（不含SIGPIPE嵌套子进程重复打印）。首轮 Ubuntu 旧端口转发
+测试 `request_port_forwards_rc_zero_with_live_gen_stale_minus_one` 的 connect 断言失败，
+该实现与测试本批无改动、本机单例通过；检查无新增质量代码直接调用/共享fd破坏证据，
+同一 job 诊断复验通过。未确认根因，不将复验成功写成已经修复竞态；详见部署评审。
+[Release39810312104](https://github.com/zhaoyswd/homeway-rs/actions/runs/39810312104)
+五目标及发布成功，tag 未移动。
+
+**官方件核验**（`/tmp/homeway-v0.3.20-official/`）：
+
+| 件 | SHA256 / 验证 |
+|---|---|
+| darwin-arm64 归档 | `14fe5add167d7cc31578a55fb8bab70f0094e8c864e1dc5f97d555f28c8bb343`，与同Release SHA256SUMS一致 |
+| 解包及正式 binary | `3067efbe9e64cd37015e8d0f1868ced7283c6cb976e61cb5c98f1cadf605de8b`，Mach-O arm64、codesign strict、`homeway v0.3.20`通过 |
+
+**私有验收**：明确 `HOMEWAY_BIN` 指向官方件，独立实例95、独立state/端口，核对进程真实
+执行路径；两设备经QUIC DATAGRAM/TUN socketpair/出口TCP拦截到本机echo，长短流18/18和25/25
+字节分别对账、同目标设备过滤无串账，官方quality JSON读回成功。测试客户端从源码编译，
+出口端为官方件。另起隔离HOME的零参unified，1000次断开和原生脚本**17条PASS**、质量心跳
+通过，正常退出；私有实例均已停止。沿用§13.17脚本实际输出17条PASS，旧记录称18例，本轮
+按实际输出计数。不能直接拿会强制覆盖debug binary的 `tools/quality-e2e.sh` 当官方件验收。
+
+**正式换装**：先核对现役v0.3.19官方hash，备份binary、launchd plist、state归档与私有
+哈希清单；state排除cache、socket和runtime lock。目录0700、敏感文件0600，旧binary0700。
+同目录暂存、fsync/签名与hash复核后原子换名，单次 `launchctl kickstart -k`，pid78967→73548。
+仍为 `/opt/homebrew/bin/homeway` 零参、原launchd及缺省state；41641/UDP与files/term socket
+就绪，正式term.sock 32次断开、17条PASS、背压/resize/KILL清理通过，进程稳定。
+中继注册与认证控制面恢复；只读取Mac侧证据，未操作阿里云。
+
+**身份与采集**：config与serve/key逐字节不变，token台账原字节前缀完整保留，无重建/吊销。
+quality目录0700、文件0600。首个心跳 `2026-10-23T00:13:37.971+08:00`；验收至00:13:57共5拍，
+坏行/丢样/写盘错误为0，延迟峰值4ms。自然观测1台设备路径、0目标样本；只证明采集已运行，
+不冒充手机应用双向L3实测，不将无目标流量解释为健康。历史只从部署后开始，不能补采旧卡顿。
+
+**关联App核**：tier pin=`36bf2aaca1d7`，清洁标记 `36bf2aaca1d7-rust`，核3,217,656B；
+libs/prebuilt/core签名debug HSP内三份核sha均为
+`3e6bbc20c55f98ca4531d34321ecc3f7452a8152e255a36316c9c8cda04382aa`。
+core HSP构建成功（2.780s）；未安装手机。阿里云未升级，保留§13.17的v0.3.19。
+
+**回退件**：`~/homeway-rollback/v0.3.19-before-v0.3.20-20261022T161330Z/`，内含官方旧binary
+（sha=`e1548347ecfd1fae4b920368bd3058d9315ce6bbfeb6562c41cfefb7b5bff7a1`）和state归档。
+失败用旧binary同目录原子恢复再kickstart，保留当前state；本轮成功未触发回退。
+证据为 `/tmp/homeway-v0.3.20-official/{verification,private-result,deployment-result}.json`、
+`{quality-e2e,private-native,production-native}.log` 与私有quality JSON；不得提交其中的凭证/state。
+两道门及部署脚本复核见 `docs/reviews/2026-10-22-quality-mac-deploy.md`。
