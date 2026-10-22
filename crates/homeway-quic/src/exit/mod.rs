@@ -28,6 +28,7 @@ mod conn;
 mod dial;
 mod intake;
 mod pump;
+mod quality;
 pub(crate) mod rpk;
 mod serve;
 mod socket;
@@ -70,6 +71,7 @@ pub use intake::{IntakeFull, ServiceIntake, ServiceIntakeTx, ServiceIntakes};
 /// `legframe::FrameKind::Quic`；本 crate 是叶子、按字节复刻，跨 crate 一致性由
 /// `homeway-core` 侧的断言钉住（见 `socket` 模块头）。
 pub use socket::FRAME_KIND_QUIC;
+pub use quality::{ExitPathQuality, ExitPathVia};
 /// 仅供无状态资源闸检查首包形状；这不是QUIC认证或身份凭据。
 pub fn is_initial_datagram(payload: &[u8]) -> bool { socket::initial_dcid(payload).is_some() }
 
@@ -499,16 +501,17 @@ impl ExitQuic {
         wake_tx.set_nonblocking(true).map_err(ExitQuicErr::Endpoint)?;
         wake_rx.set_nonblocking(true).map_err(ExitQuicErr::Endpoint)?;
         let (out_tx, out_rx) = tmpsc::channel::<Outbound>(OUTBOUND_QUEUE_MAX);
+        let legs = Arc::new(LegTable::default());
         let bridge = Arc::new(ExitBridge::new(
             Arc::clone(&stats),
             Arc::clone(&logf),
             wake_tx,
             wake_rx,
             out_tx,
+            Arc::clone(&legs),
         ));
         // ---- 中继承载（M1 §1.6）：腿表 + 引擎注入队列 ----
         // 注入队列与「面 → 引擎」的入站队列同上限（8192 条，§6.4）：满 ⇒ 丢 + 计数。
-        let legs = Arc::new(LegTable::default());
         let (inject_tx, inject_rx) = tmpsc::channel::<socket::InjPkt>(bridge::INBOUND_QUEUE_MAX);
         // ---- 公共端口的明文出站（M5 S3a）：STUN 观测请求等；容量小（低频观测面）----
         let (plain_tx, plain_rx) = tmpsc::channel::<(SocketAddr, Vec<u8>)>(PLAIN_QUEUE_MAX);
@@ -583,6 +586,21 @@ impl ExitQuic {
     /// 运行读数（轮询；无阻塞——原子直读，不含锁等待）。
     pub fn snapshot(&self) -> ExitQuicSnapshot {
         self.stats.snapshot()
+    }
+
+    /// 按已认证设备采样；不含未绑定连接。锁外读取连接指标，不做 IO。
+    pub fn quality_snapshot(&self) -> Vec<ExitPathQuality> {
+        self.bridge.quality_snapshot()
+    }
+
+    /// 排空已摘绑连接的最终样本（最多保留最近 256 条）。
+    pub fn drain_finished_quality(&self) -> Vec<ExitPathQuality> {
+        self.bridge.drain_finished_quality()
+    }
+
+    /// 最终样本队列溢出丢最旧的累计条数；报告须声明此覆盖缺口。
+    pub fn quality_finished_overflow(&self) -> u64 {
+        self.bridge.quality_finished_overflow()
     }
 
     /// 只读计数句柄（M3 S2：`serve status --json` 的 `quic` 段在**装配点**留一份，
@@ -1178,6 +1196,7 @@ fn run_exit(
                     if now != c.remote {
                         let from = c.remote;
                         c.remote = now;
+                        bridge.observe_quality_path(c.conn_id);
                         stats.path_changes.fetch_add(1, Ordering::SeqCst);
                         match bridge.dev_of_conn(c.conn_id) {
                             Some(dev) => (*logf)(&format!(

@@ -92,7 +92,7 @@ pub use driver::{Island, IslandTx};
 pub use exit::admit::AdmitLimits;
 pub use exit::{
     is_initial_datagram, EngineRejectClass, ExitInbound, ExitQuic, ExitQuicConfig, ExitQuicErr, ExitQuicSnapshot,
-    ExitSend, ExitStatsHandle, FRAME_KIND_QUIC, IntakeFull, PlainDatagramHook, PlainOutcome,
+    ExitPathQuality, ExitPathVia, ExitSend, ExitStatsHandle, FRAME_KIND_QUIC, IntakeFull, PlainDatagramHook, PlainOutcome,
     RelayGeneration, Reg4Request, Reg4Verdict, RejectWhy, RetryPolicy, ServiceIntake, ServiceIntakeTx,
     ServiceIntakes,
 };

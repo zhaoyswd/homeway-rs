@@ -95,6 +95,7 @@ pub(crate) fn send_datagram_checked(conn: &Connection, pkt: Vec<u8>, ctx: &FaceC
     let space = conn.datagram_send_buffer_space();
     if space < pkt.len() {
         // 裸 `send_datagram` 在这个点会静默淘汰最旧并返 Ok（P4）——这里丢 + 计数（不静默）
+        ctx.bridge.note_conn_send_buffer_drop(conn);
         ctx.bridge.note_drop(
             DropKind::SendBufferFull,
             &format!("缓冲空余 {space}B < 包 {}B（不静默：丢 + 计数）", pkt.len()),

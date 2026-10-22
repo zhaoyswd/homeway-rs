@@ -26,6 +26,9 @@
 
 pub mod dnsface;
 pub mod nat;
+pub mod quality;
+#[cfg(test)]
+mod quality_tests;
 pub mod reasm;
 
 use std::collections::{HashMap, VecDeque};
@@ -47,6 +50,7 @@ use crate::Logf;
 
 use self::dnsface::{DnsFaces, DnsRoute};
 use self::nat::Ipv4View;
+use self::quality::{CloseReason, ConnectState, FlowError, FlowMeter, FlowProtocol, FlowScope, InterceptorQuality, CLOSED_CAPACITY};
 use self::reasm::{DropReason, Dropped, Reassembler};
 use crate::server::dnsproxy::{DnsProxy, DnsReply, SubmitOutcome};
 
@@ -677,6 +681,7 @@ impl TcpObs {
 }
 
 struct Flow {
+    quality: FlowMeter,
     kind: Kind,
     proto: Proto,
     /// 客户端侧端点（栈内 socket 的对端 / 反重写时的目的）。
@@ -717,6 +722,15 @@ struct Flow {
     obs: TcpObs,
 }
 
+impl Flow {
+    fn refresh_quality_sizes(&mut self) {
+        let up = self.io.as_ref().map(|io| {
+            io.out_tcp.remaining().len() + io.out_udp.iter().map(Vec::len).sum::<usize>()
+        }).unwrap_or(0);
+        self.quality.queue_sizes(up, self.tx_backlog.remaining().len());
+    }
+}
+
 /// cc_stats_line 观测行的上一窗快照（差分用；字段 = TcpObs 的累计子集）。
 #[derive(Clone, Copy)]
 struct TcpObsSnap {
@@ -742,6 +756,12 @@ impl From<&TcpObs> for TcpObsSnap {
 /// 拦截层本体（**驱动线程独占**——RX/TX/流表/栈全在一条线程）。
 pub struct Interceptor {
     cfg: Config,
+    quality_closed: VecDeque<quality::FlowQuality>,
+    quality_overflow: u64,
+    quality_pumps: u64,
+    quality_peak_wall: Duration,
+    quality_shape_peak: usize,
+    current_device: Option<[u8; 8]>,
     stats: Arc<Stats>,
     iface: Interface,
     sockets: SocketSet<'static>,
@@ -858,6 +878,12 @@ impl Interceptor {
         let tx_credit0 = cfg.tx_shape.map(|s| s.burst as f64).unwrap_or(0.0);
         Self {
             cfg,
+            quality_closed: VecDeque::new(),
+            quality_overflow: 0,
+            quality_pumps: 0,
+            quality_peak_wall: Duration::ZERO,
+            quality_shape_peak: 0,
+            current_device: None,
             stats,
             iface,
             sockets: SocketSet::new(vec![]),
@@ -1019,6 +1045,13 @@ impl Interceptor {
     ///
     /// Q-B F7 的性质在此**保持**：分片自身绝不进入 demux / `by_five` / 建流——建流
     /// 唯一入口仍是 `route_plain` 的 `tcp_new`/`udp_new`。
+    /// 认证入口：设备身份固定在流创建时，不能由结束时的 IP 关联反推。
+    pub fn on_plain_for_device(&mut self, pkt: Vec<u8>, device: [u8; 8]) {
+        self.current_device = Some(device);
+        self.on_plain(pkt);
+        self.current_device = None;
+    }
+
     pub fn on_plain(&mut self, pkt: Vec<u8>) {
         let Some(frag) = nat::Ipv4FragHdr::parse(&pkt) else {
             return; // 畸形：静默丢（IP 层）
@@ -1197,6 +1230,7 @@ impl Interceptor {
         )));
         if let Err(e) = sock.listen(IpEndpoint::new(self.cfg.tunnel_ip.into(), rw)) {
             (self.cfg.logf)(&format!("intercept: tcp listen rw_port {rw} 失败：{e:?}"));
+            self.note_quality_error(flow, FlowError::Internal, None);
             self.teardown_flow(flow);
             return;
         }
@@ -1294,6 +1328,36 @@ impl Interceptor {
         }
     }
 
+    fn note_quality_error(&mut self, flow: u64, kind: FlowError, os_error: Option<i32>) {
+        if let Some(f) = self.flows.get_mut(&flow) { f.quality.error(kind, os_error); }
+    }
+
+    fn observe_up_queue(&mut self, flow: u64, blocked: bool) {
+        let bytes = self.pending_out(flow);
+        if let Some(f) = self.flows.get_mut(&flow) { f.quality.up_queue(bytes, blocked, Instant::now()); }
+    }
+
+    /// 每 5 秒由出口调度：活跃流增量 + 有界结束摘要，绝不在转发拍内落盘。
+    /// DNS scope 是进程内代答；up/down 字节仅代表真实 upstream OS I/O，因此为 0。
+    /// 隧道 IP 的 :53/:5300 真 listener 不进入流表，由 DNS 自己的计数覆盖。
+    pub fn drain_quality(&mut self) -> InterceptorQuality {
+        let now = Instant::now();
+        let mut records = Vec::with_capacity(self.quality_closed.len() + self.flows.len());
+        records.extend(self.quality_closed.drain(..));
+        for f in self.flows.values_mut() {
+            f.refresh_quality_sizes();
+            if f.proto == Proto::Tcp && f.kind == Kind::Transit {
+                if let Some(io) = &f.io { f.quality.record.tcp_metrics = Some(sysock::tcp_quality(sysock::sock_raw(&io.fd))); }
+            }
+            records.push(f.quality.take(false, now));
+        }
+        InterceptorQuality { records, closed_overflow: std::mem::take(&mut self.quality_overflow),
+            active_flows: self.flows.len(), shape_backlog_bytes: self.tx_deferred_bytes,
+            shape_backlog_peak_bytes: std::mem::take(&mut self.quality_shape_peak).max(self.tx_deferred_bytes),
+            reactor_pumps: std::mem::take(&mut self.quality_pumps),
+            reactor_peak_wall_us: std::mem::take(&mut self.quality_peak_wall).as_micros().min(u64::MAX as u128) as u64 }
+    }
+
     fn alloc_flow(&mut self, v: &View5, kind: Kind, proto: Proto, cache: Vec<Vec<u8>>) -> u64 {
         let flow = self.next_flow;
         self.next_flow += 1;
@@ -1304,6 +1368,10 @@ impl Interceptor {
         self.flows.insert(
             flow,
             Flow {
+                quality: FlowMeter::new(flow, self.current_device,
+                    SocketAddrV4::new(v.src, v.src_port), SocketAddrV4::new(v.dst, v.dst_port),
+                    if proto == Proto::Tcp { FlowProtocol::Tcp } else { FlowProtocol::Udp },
+                    if kind == Kind::Dns { FlowScope::Dns } else { FlowScope::Transit }),
                 kind,
                 proto,
                 client: (v.src, v.src_port),
@@ -1354,7 +1422,8 @@ impl Interceptor {
             }
             Ok(DialOutcome::InProgress(fd)) => (fd, ConnState::InProgress),
             Ok(DialOutcome::Retry(fd)) => (fd, ConnState::Retry),
-            Err(_) => {
+            Err(e) => {
+                self.note_quality_error(flow, FlowError::Connect, e.raw_os_error());
                 self.on_dial_failed(flow);
                 return;
             }
@@ -1402,8 +1471,14 @@ impl Interceptor {
                     io.conn = None;
                     true
                 }
-                Ok(_) => false, // SO_ERROR≠0 = 拨号失败（ECONNREFUSED 等）
-                Err(_) => false,
+                Ok(code) => {
+                    f.quality.error(FlowError::Connect, Some(code));
+                    false
+                }
+                Err(e) => {
+                    f.quality.error(FlowError::Connect, e.raw_os_error());
+                    false
+                }
             }
         };
         if fd_ok {
@@ -1447,7 +1522,10 @@ impl Interceptor {
                 Ok(sysock::ConnectOutcome::InProgress) => Step::Still, // 仍在队列外——下拍再试
                 Ok(sysock::ConnectOutcome::Retry) => Step::Still, // EAGAIN 同形（windows 不可达）
                 Err(e) if sysock::is_eisconn(&e) => Step::Accepted,
-                Err(_) => Step::Failed,
+                Err(e) => {
+                    f.quality.error(FlowError::Connect, e.raw_os_error());
+                    Step::Failed
+                }
             };
             if matches!(step, Step::Accepted) {
                 io.conn = None;
@@ -1595,6 +1673,7 @@ impl Interceptor {
         if sock.send_slice(data, ep).is_err() {
             // F3：栈 tx 满（应答/回投写不进）不再静默——计数（丢新）。
             self.stats.incr_udp_drop();
+            if let Some(f) = self.flows.get_mut(&flow) { f.quality.record.udp_queue_drops += 1; }
         }
         if let Some(f) = self.flows.get_mut(&flow) {
             f.last_active = Instant::now();
@@ -1681,6 +1760,7 @@ impl Interceptor {
                 }
                 let n = produce.len();
                 let b = produce.iter().map(|p| p.len()).sum::<usize>();
+                self.quality_shape_peak = self.quality_shape_peak.max(self.tx_deferred_bytes + b);
                 self.tx_win_defer_peak = (
                     self.tx_win_defer_peak.0.max(self.tx_deferred.len() + n),
                     self.tx_win_defer_peak.1.max(self.tx_deferred_bytes + b),
@@ -1733,6 +1813,7 @@ impl Interceptor {
                     let n_defer = self.tx_deferred.len() + produce.len();
                     let b_defer = self.tx_deferred_bytes
                         + produce.iter().map(|p| p.len()).sum::<usize>();
+                    self.quality_shape_peak = self.quality_shape_peak.max(b_defer);
                     self.tx_win_defer_peak = (
                         self.tx_win_defer_peak.0.max(n_defer),
                         self.tx_win_defer_peak.1.max(b_defer),
@@ -1753,6 +1834,7 @@ impl Interceptor {
                     let n_defer = self.tx_deferred.len() + produce.len();
                     let b_defer = self.tx_deferred_bytes
                         + produce.iter().map(|p| p.len()).sum::<usize>();
+                    self.quality_shape_peak = self.quality_shape_peak.max(b_defer);
                     self.tx_win_defer_peak = (
                         self.tx_win_defer_peak.0.max(n_defer),
                         self.tx_win_defer_peak.1.max(b_defer),
@@ -2126,6 +2208,7 @@ impl Interceptor {
                         if revents & POLLNVAL != 0 {
                             // 所有权模型下不可达（fd 命 = io 在）——防御：宁可泄漏不误关
                             if let Some(f) = self.flows.get_mut(&flow) {
+                                f.quality.error(FlowError::InvalidFd, None);
                                 if let Some(io) = f.io.take() {
                                     std::mem::forget(io.fd);
                                     (self.cfg.logf)(&format!(
@@ -2144,6 +2227,8 @@ impl Interceptor {
             }
         }
         // 剂量面（5s 窗——评审 R-6/R-9：每拍 O(N) 扫描成本与整循环停顿的观测窗）
+        self.quality_pumps += 1;
+        self.quality_peak_wall = self.quality_peak_wall.max(t0.elapsed());
         self.reactor_win_pumps += 1;
         self.reactor_win_peak_fds = self.reactor_win_peak_fds.max(n_fds);
         self.reactor_win_peak_wall = self.reactor_win_peak_wall.max(t0.elapsed());
@@ -2191,6 +2276,7 @@ impl Interceptor {
                     Err(e) => {
                         if e.kind() != std::io::ErrorKind::WouldBlock {
                             // 读错误 = 拆（macOS connected UDP ECONNREFUSED 的发现路径之二）
+                            self.note_quality_error(flow, FlowError::Read, e.raw_os_error());
                             self.on_upstream_eof(flow);
                         }
                         break;
@@ -2198,6 +2284,7 @@ impl Interceptor {
                 };
                 if n > 0 {
                     if let Some(f) = self.flows.get_mut(&flow) {
+                        f.quality.received(n, Instant::now());
                         if f.kind == Kind::Transit {
                             f.udp_replied = true;
                         }
@@ -2227,6 +2314,7 @@ impl Interceptor {
                 Ok(n) => n,
                 Err(e) => {
                     if e.kind() != std::io::ErrorKind::WouldBlock {
+                        self.note_quality_error(flow, FlowError::Read, e.raw_os_error());
                         self.on_upstream_eof(flow);
                     }
                     break;
@@ -2234,8 +2322,11 @@ impl Interceptor {
             };
             if n > 0 {
                 let Some(f) = self.flows.get_mut(&flow) else { return };
+                let now = Instant::now();
+                f.quality.received(n, now);
                 f.tx_backlog.push(&buf[..n]);
-                f.last_active = Instant::now();
+                f.quality.down_queue(f.tx_backlog.remaining().len(), false, now);
+                f.last_active = now;
             } else {
                 // n == 0：EOF（流读尽）
                 self.on_upstream_eof(flow);
@@ -2255,6 +2346,7 @@ impl Interceptor {
     /// 旧 worker「EOF 后不再写」口径；不清则 `dead ∧ 排空` 永不成立，fd 挂到 5min
     /// idle + 每拍注定失败的 send + wait_hint 恒 1ms 空转）。
     fn flush_out(&mut self, flow: u64) {
+        self.observe_up_queue(flow, false);
         enum Step {
             Wrote,
             Full,
@@ -2274,13 +2366,18 @@ impl Interceptor {
                     let Some(dg) = io.out_udp.front() else { break };
                     // MSG_NOSIGNAL 语义在 sysock 内（unix 带 flag；windows 无 SIGPIPE）。
                     match sysock::send(sysock::sock_raw(&io.fd), dg) {
-                        Ok(_) => {
+                        Ok(n) => {
+                            let now = Instant::now();
+                            f.quality.sent(n, now);
                             io.out_udp.pop_front();
-                            f.last_active = Instant::now();
+                            f.last_active = now;
                             Step::Wrote
                         }
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Step::Full,
-                        Err(_) => Step::Dead,
+                        Err(e) => {
+                            f.quality.error(FlowError::Write, e.raw_os_error());
+                            Step::Dead
+                        },
                     }
                 };
                 match step {
@@ -2304,13 +2401,21 @@ impl Interceptor {
                     }
                     match sysock::send(sysock::sock_raw(&io.fd), rem) {
                         Ok(n) if n > 0 => {
+                            let now = Instant::now();
+                            f.quality.sent(n, now);
                             io.out_tcp.consume(n);
-                            f.last_active = Instant::now();
+                            f.last_active = now;
                             Step::Wrote
                         }
-                        Ok(_) => Step::Dead, // send 返 0（流语义下不应发生）——按错误处置
+                        Ok(_) => {
+                            f.quality.error(FlowError::Write, None);
+                            Step::Dead
+                        }, // send 返 0（流语义下不应发生）——按错误处置
                         Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => Step::Full,
-                        Err(_) => Step::Dead,
+                        Err(e) => {
+                            f.quality.error(FlowError::Write, e.raw_os_error());
+                            Step::Dead
+                        },
                     }
                 };
                 match step {
@@ -2324,6 +2429,7 @@ impl Interceptor {
                 }
             }
         }
+        self.observe_up_queue(flow, self.pending_out(flow) > 0);
         self.maybe_close_dead_io(flow);
     }
 
@@ -2336,6 +2442,7 @@ impl Interceptor {
             io.out_tcp.consume(rem);
             io.out_udp.clear();
         }
+        self.observe_up_queue(flow, false);
     }
 
     /// `dead ∧ 待写排空` → 立即关 fd、io=None（Flow 保留——栈侧 FIN/idle 收尾照旧，
@@ -2352,6 +2459,9 @@ impl Interceptor {
             .unwrap_or(false);
         if drain {
             if let Some(f) = self.flows.get_mut(&flow) {
+                if f.proto == Proto::Tcp {
+                    if let Some(io) = &f.io { f.quality.record.tcp_metrics = Some(sysock::tcp_quality(sysock::sock_raw(&io.fd))); }
+                }
                 f.io = None; // OwnedFd drop = close(2)
             }
         }
@@ -2370,12 +2480,13 @@ impl Interceptor {
     /// 拨号验收收口（即时成功与 POLLOUT 验收两路统一——R-1）：建栈内 socket +
     /// 注入缓存（SYN-ACK 由此产生）+ E10 判据行；UDP = 建栈内 socket + 会话就绪。
     fn dial_accept(&mut self, flow: u64) {
-        let Some(f) = self.flows.get(&flow) else {
+        let Some(f) = self.flows.get_mut(&flow) else {
             return;
         };
         let Phase::Dialing { .. } = f.phase else {
             return; // 非 Dialing（竞态）：流已被收口路径清，无事可做
         };
+        f.quality.connected();
         match f.proto {
             Proto::Udp => {
                 // UDP：fd 已就位（同步拨号）——建栈内 socket + 会话就绪（重放/判据行）
@@ -2385,7 +2496,7 @@ impl Interceptor {
             Proto::Tcp => {
                 // TCP_NODELAY（Go SetDelayOption(false) 同口径——连接完成后设，两路
                 // 验收的唯一会合点）
-                if let Some(io) = self.flows.get(&flow).and_then(|f| f.io.as_ref()) {
+                if let Some(io) = f.io.as_ref() {
                     let _ = sysock::setsockopt_i32(
                         sysock::sock_raw(&io.fd),
                         sysock::IPPROTO_TCP,
@@ -2404,6 +2515,7 @@ impl Interceptor {
                 sock.set_timeout(Some(smoltcp::time::Duration::from_secs(TCP_IDLE.as_secs()))); // R2 低-10：精确 idle 回收
                 if let Err(e) = sock.listen(IpEndpoint::new(self.cfg.tunnel_ip.into(), rw)) {
                     (self.cfg.logf)(&format!("intercept: tcp listen rw_port {rw} 失败：{e:?}"));
+                    self.note_quality_error(flow, FlowError::Internal, None);
                     self.teardown_flow(flow);
                     return;
                 }
@@ -2456,6 +2568,7 @@ impl Interceptor {
         );
         if let Err(e) = sock.bind(IpEndpoint::new(self.cfg.tunnel_ip.into(), rw)) {
             (self.cfg.logf)(&format!("intercept: udp bind rw_port {rw} 失败：{e:?}"));
+            self.note_quality_error(flow, FlowError::Internal, None);
             return;
         }
         let h = self.sockets.add(sock);
@@ -2463,6 +2576,15 @@ impl Interceptor {
     }
 
     fn on_dial_failed(&mut self, flow: u64) {
+        if let Some(f) = self.flows.get_mut(&flow) {
+            f.quality.record.connect_state = ConnectState::Failed;
+            let elapsed = f.quality.elapsed_ms();
+            f.quality.record.connect_ms = Some(elapsed);
+            f.quality.record.connect_ended_unix_ms = Some(f.quality.record.started_unix_ms.saturating_add(elapsed));
+            f.quality.record.close_reason = Some(CloseReason::DialFailed);
+            if f.quality.record.error_kind.is_none() { f.quality.error(FlowError::Connect, None); }
+            f.quality.record.close_reason = Some(CloseReason::DialFailed);
+        }
         let Some(f) = self.flows.get(&flow) else {
             return;
         };
@@ -2528,6 +2650,7 @@ impl Interceptor {
         };
         let Some(h) = f.sock else { return };
         if f.tx_backlog.is_empty() {
+            f.quality.down_queue(0, false, Instant::now());
             return;
         }
         let w = self
@@ -2538,6 +2661,7 @@ impl Interceptor {
         if w > 0 {
             f.tx_backlog.consume(w);
         }
+        f.quality.down_queue(f.tx_backlog.remaining().len(), !f.tx_backlog.is_empty(), Instant::now());
         if f.tx_backlog.is_empty() && f.fin_pending {
             self.sockets.get_mut::<TcpSocket>(h).close();
         }
@@ -2555,6 +2679,7 @@ impl Interceptor {
             return;
         }
         if let Some(f) = self.flows.get_mut(&flow) {
+            f.quality.record.close_reason.get_or_insert(CloseReason::UpstreamEof);
             if let Some(io) = f.io.as_mut() {
                 io.dead = true;
             }
@@ -2786,6 +2911,7 @@ impl Interceptor {
                         // out_udp 上限（F3：条数 MAX_OUT_UDP_PKTS + 字节 WATERMARK——
                         // 超限丢新+计数，不阻塞不排队）。
                         if self.udp_out_full(flow, n) {
+                            if let Some(f) = self.flows.get_mut(&flow) { f.quality.record.udp_queue_drops += 1; }
                             self.stats.incr_udp_drop();
                             continue;
                         }
@@ -2851,6 +2977,7 @@ impl Interceptor {
             .map(|(k, _)| *k)
             .collect();
         for flow in expired {
+            self.note_quality_error(flow, FlowError::Timeout, None);
             self.on_dial_failed(flow);
         }
         let victims: Vec<u64> = self
@@ -2868,6 +2995,9 @@ impl Interceptor {
             .map(|(k, _)| *k)
             .collect();
         for flow in victims {
+            if let Some(f) = self.flows.get_mut(&flow) {
+                f.quality.record.close_reason.get_or_insert(CloseReason::Idle);
+            }
             let is_udp = self
                 .flows
                 .get(&flow)
@@ -2914,7 +3044,17 @@ impl Interceptor {
         // 评审 2.1：观测快照随流回收（键单调不复用 ⇒ 不清 = 长跑出口每天 ~1.5MB
         // 的无界累积）。
         self.obs_snaps.remove(&flow);
-        if let Some(f) = self.flows.remove(&flow) {
+        if let Some(mut f) = self.flows.remove(&flow) {
+            f.refresh_quality_sizes();
+            if f.proto == Proto::Tcp && f.kind == Kind::Transit {
+                if let Some(io) = &f.io { f.quality.record.tcp_metrics = Some(sysock::tcp_quality(sysock::sock_raw(&io.fd))); }
+            }
+            let record = f.quality.take(true, Instant::now());
+            if self.quality_closed.len() < CLOSED_CAPACITY {
+                self.quality_closed.push_back(record);
+            } else {
+                self.quality_overflow = self.quality_overflow.saturating_add(1);
+            }
             if let Some(h) = f.sock {
                 self.sockets.remove(h);
                 // smoltcp 0.11 的 remove 即 prune——TIME_WAIT 期保留语义由「Closed 才移除」
@@ -3009,6 +3149,9 @@ impl Interceptor {
         self.halt_new();
         let flows: Vec<u64> = self.flows.keys().copied().collect();
         for flow in flows {
+            if let Some(f) = self.flows.get_mut(&flow) {
+                f.quality.record.close_reason.get_or_insert(CloseReason::Shutdown);
+            }
             self.teardown_flow(flow);
         }
         // Q-K F1.5：重组上下文与 TX 分片表整体清空（**静默**——收工面不发 ICMP、
@@ -4826,6 +4969,8 @@ mod tests {
         itc.flows.insert(
             flow,
             Flow {
+                quality: FlowMeter::new(flow, None, "10.0.0.2:40000".parse().unwrap(),
+                    "93.184.216.34:80".parse().unwrap(), FlowProtocol::Tcp, FlowScope::Transit),
                 kind: Kind::Transit,
                 proto: Proto::Tcp,
                 client: (Ipv4Addr::new(10, 0, 0, 2), 40000),

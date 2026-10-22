@@ -177,6 +177,12 @@ impl LegTable {
         lock_unpoison(&self.live).contains_key(remote)
     }
 
+    /// 与发送路由一致：在役腿以及摘腿保护窗内均属 relay，后者不得回落直连。
+    pub(crate) fn is_relay_path(&self, remote: SocketAddr) -> bool {
+        let remote = crate::sysio::unmap_v4_mapped(remote);
+        self.has(&remote) || self.is_recent(&remote)
+    }
+
     /// 该远端是否落在「最近摘除」窗内（窗内发送 = 丢）。
     ///
     /// 2026-10-10 审查 中-3：本函数挂在**直连发送热路径**（live 表未命中的每个 Transmit

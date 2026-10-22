@@ -16,7 +16,8 @@ use std::collections::{HashMap, VecDeque};
 use std::io::{Read, Write};
 use std::net::{Ipv4Addr, SocketAddr};
 use crate::sysio::{self, SvcStream};
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 use std::sync::{Arc, Mutex};
 
 use quinn::{Connection, VarInt};
@@ -27,7 +28,8 @@ use crate::cmd::Logf;
 use crate::reg4::{EXPORTER_LEN, Reg4Frame};
 use crate::sync_util::lock_unpoison;
 
-use super::{ExitStats, log_due};
+use super::{ExitPathQuality, ExitPathVia, ExitStats, log_due};
+use super::socket::LegTable;
 
 /// 入站队列上限（§6.4：出口 · QUIC 面 → 引擎入站队列 = **8192 条**，多设备共享）。
 pub(crate) const INBOUND_QUEUE_MAX: usize = 8192;
@@ -214,6 +216,7 @@ impl DropKind {
 }
 
 /// 一条已建连绑定的设备（§1.3 的 `devKey ↔ ConnectionHandle`）。
+#[derive(Clone)]
 struct Binding {
     dev: [u8; 8],
     pubkey: [u8; 32],
@@ -221,6 +224,19 @@ struct Binding {
     conn: Connection,
     tunnel_ip: Ipv4Addr,
     tun_ip: Ipv4Addr,
+    quality: Arc<BindingQuality>,
+}
+
+struct BindingQuality {
+    bound_at: Instant,
+    send_buffer_drops: AtomicU64,
+    path: Mutex<QualityPath>,
+}
+
+struct QualityPath {
+    remote: SocketAddr,
+    via: ExitPathVia,
+    epoch: u64,
 }
 
 /// 绑定的只读快照（数据报源校验面 / 刷新帧的身份比对面）。
@@ -275,6 +291,9 @@ pub(crate) struct ExitBridge {
     /// 出站队列（引擎 → 出口面；`try_send` 非阻塞）。
     out_tx: mpsc::Sender<Outbound>,
     bindings: Mutex<Bindings>,
+    legs: Arc<LegTable>,
+    finished_quality: Mutex<VecDeque<ExitPathQuality>>,
+    finished_overflow: AtomicU64,
 }
 
 impl ExitBridge {
@@ -284,6 +303,7 @@ impl ExitBridge {
         wake_tx: SvcStream,
         wake_rx: SvcStream,
         out_tx: mpsc::Sender<Outbound>,
+        legs: Arc<LegTable>,
     ) -> Self {
         Self {
             stats,
@@ -293,6 +313,9 @@ impl ExitBridge {
             wake_tx,
             out_tx,
             bindings: Mutex::new(Bindings::default()),
+            legs,
+            finished_quality: Mutex::new(VecDeque::new()),
+            finished_overflow: AtomicU64::new(0),
         }
     }
 
@@ -346,10 +369,19 @@ impl ExitBridge {
 
     /// 出站投递（引擎线程调用；**非阻塞**）。
     pub(crate) fn send_to_pub(&self, pubkey: &[u8; 32], pkt: &[u8]) -> ExitSend {
-        if !self.is_bound(pubkey) {
-            return ExitSend::Unbound;
-        }
-        match self.out_tx.try_send(Outbound { pubkey: *pubkey, pkt: pkt.to_vec() }) {
+        // 队列投递与该绑定的满队列计数同在绑定锁内完成；摘绑的最终样本不会漏掉
+        // 已经开始投递的满队列失败。这里只做有界包拷贝/非阻塞 try_send，不读连接锁。
+        let sent = {
+            let b = lock_unpoison(&self.bindings);
+            let binding = b.by_pub.get(pubkey).and_then(|dev| b.by_dev.get(dev));
+            let Some(binding) = binding else { return ExitSend::Unbound };
+            let sent = self.out_tx.try_send(Outbound { pubkey: *pubkey, pkt: pkt.to_vec() });
+            if matches!(sent, Err(mpsc::error::TrySendError::Full(_))) {
+                binding.quality.send_buffer_drops.fetch_add(1, Ordering::Relaxed);
+            }
+            sent
+        };
+        match sent {
             Ok(()) => ExitSend::Handled,
             Err(mpsc::error::TrySendError::Full(_)) => {
                 self.note_drop(DropKind::SendBufferFull, "出站队列满（8192 条）");
@@ -376,12 +408,20 @@ impl ExitBridge {
         tunnel_ip: Ipv4Addr,
         tun_ip: Ipv4Addr,
     ) {
+        let remote = conn.remote_address();
+        let via = self.path_via(remote);
+        let quality = Arc::new(BindingQuality {
+            bound_at: Instant::now(), send_buffer_drops: AtomicU64::new(0),
+            path: Mutex::new(QualityPath { remote, via, epoch: 0 }),
+        });
+        let mut retired = Vec::new();
         let mut b = lock_unpoison(&self.bindings);
         let mut replaced = false;
         // ① 同连接号旧绑定：整条摘（防 by_conn 覆盖 + 旧 dev 索引残留）
         if let Some(prev_dev) = b.by_conn.remove(&conn_id) {
             if let Some(prev) = b.by_dev.remove(&prev_dev) {
                 b.by_pub.remove(&prev.pubkey);
+                retired.push(prev);
             }
         }
         // ② 同 devTag 后到者替换；同公钥换 devTag（克隆场景）也替换——防同键两连接并存
@@ -399,16 +439,17 @@ impl ExitBridge {
                 old.conn.close(VarInt::from_u32(0), b"replaced by newer registration");
                 replaced = true;
             }
+            retired.push(old);
         }
         b.by_pub.insert(pubkey, dev);
         b.by_conn.insert(conn_id, dev);
-        let remote = conn.remote_address();
         b.by_dev.insert(
             dev,
-            Binding { dev, pubkey, conn_id, conn, tunnel_ip, tun_ip },
+            Binding { dev, pubkey, conn_id, conn, tunnel_ip, tun_ip, quality },
         );
         debug_assert!(b.is_consistent(), "绑定表三索引不一致（bind 后）");
         drop(b);
+        for old in retired { self.finish_quality(old); }
         if replaced {
             (self.logf)(&format!("替换旧连接（dev={}；旧连接已 CONNECTION_CLOSE）", dev_short(&dev)));
         }
@@ -457,11 +498,6 @@ impl ExitBridge {
         lock_unpoison(&self.bindings).by_conn.get(&conn_id).copied()
     }
 
-    /// 是否已有该公钥的绑定（出站分流键：无 ⇒ 调用方丢包 + 计数——引擎侧 `route_out` 的丢弃归因行）。
-    pub(crate) fn is_bound(&self, pubkey: &[u8; 32]) -> bool {
-        lock_unpoison(&self.bindings).by_pub.contains_key(pubkey)
-    }
-
     /// 按公钥取连接句柄（出口面发 DATAGRAM 用）。
     pub(crate) fn conn_of_pub(&self, pubkey: &[u8; 32]) -> Option<Connection> {
         let b = lock_unpoison(&self.bindings);
@@ -473,11 +509,14 @@ impl ExitBridge {
     pub(crate) fn unbind_conn(&self, conn_id: u64) {
         let mut b = lock_unpoison(&self.bindings);
         let Some(dev) = b.by_conn.remove(&conn_id) else { return };
-        if b.by_dev.get(&dev).map(|x| x.conn_id) == Some(conn_id) {
-            let Some(old) = b.by_dev.remove(&dev) else { return };
-            b.by_pub.remove(&old.pubkey);
-        }
+        let old = if b.by_dev.get(&dev).map(|x| x.conn_id) == Some(conn_id) {
+            let old = b.by_dev.remove(&dev);
+            if let Some(ref old) = old { b.by_pub.remove(&old.pubkey); }
+            old
+        } else { None };
         debug_assert!(b.is_consistent(), "绑定表三索引不一致（unbind_conn 后）");
+        drop(b);
+        if let Some(old) = old { self.finish_quality(old); }
     }
 
     /// 清空全部绑定（**QUIC 面收工路径专用**，2026-10-20 端口退让 bug 的修复）。
@@ -491,7 +530,9 @@ impl ExitBridge {
         let mut b = lock_unpoison(&self.bindings);
         b.by_conn.clear();
         b.by_pub.clear();
-        b.by_dev.clear();
+        let retired: Vec<_> = b.by_dev.drain().map(|(_, binding)| binding).collect();
+        drop(b);
+        for old in retired { self.finish_quality(old); }
     }
 
     /// 按公钥摘绑定并**关闭连接**（设备被摘除/身份轮换的 WG 侧路径，§1.3 撤销/轮换的
@@ -504,7 +545,100 @@ impl ExitBridge {
             old.conn.close(VarInt::from_u32(0), b"device removed");
             debug_assert!(b.is_consistent(), "绑定表三索引不一致（unbind_pub 后）");
             drop(b);
+            self.finish_quality(old);
             (self.logf)(&format!("拆连接（dev={} 已从设备表摘除/轮换）", dev_short(&dev)));
+        }
+    }
+
+    fn path_via(&self, remote: SocketAddr) -> ExitPathVia {
+        if self.legs.is_relay_path(remote) { ExitPathVia::Relay } else { ExitPathVia::Direct }
+    }
+
+    fn sample_quality(&self, binding: &Binding, finished: bool) -> ExitPathQuality {
+        // 只锁本绑定的观测状态，不持全局绑定表锁。对同连接的采样/摘绑观察串行。
+        let mut path = lock_unpoison(&binding.quality.path);
+        let mut remote = binding.conn.remote_address();
+        let mut via = self.path_via(remote);
+        let mut stats = binding.conn.stats();
+        let mut stable = false;
+        for _ in 0..3 {
+            remote = binding.conn.remote_address();
+            via = self.path_via(remote);
+            stats = binding.conn.stats();
+            if remote == binding.conn.remote_address() && via == self.path_via(remote) {
+                stable = true;
+                break;
+            }
+        }
+        if path.remote != remote || path.via != via {
+            path.epoch = path.epoch.saturating_add(1);
+            path.remote = remote;
+            path.via = via;
+        }
+        let space = binding.conn.datagram_send_buffer_space() as u64;
+        ExitPathQuality {
+            dev: binding.dev, tunnel_ip: binding.tunnel_ip, tun_ip: binding.tun_ip,
+            connection_id: binding.conn_id, path_epoch: path.epoch, path_stable: stable,
+            remote: crate::sysio::unmap_v4_mapped(remote), via,
+            observed_at_ms: SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default()
+                .as_millis().min(u128::from(u64::MAX)) as u64,
+            bound_for_ms: binding.quality.bound_at.elapsed().as_millis().min(u128::from(u64::MAX)) as u64,
+            rtt_us: stats.path.rtt.as_micros().min(u128::from(u64::MAX)) as u64,
+            udp_tx_bytes: stats.udp_tx.bytes, udp_rx_bytes: stats.udp_rx.bytes,
+            udp_tx_datagrams: stats.udp_tx.datagrams, udp_rx_datagrams: stats.udp_rx.datagrams,
+            sent_packets: stats.path.sent_packets, lost_packets: stats.path.lost_packets,
+            congestion_events: stats.path.congestion_events, cwnd: stats.path.cwnd,
+            datagram_send_buffer_space: space,
+            datagram_send_buffer_used: (super::transport::DATAGRAM_BUFFER as u64).saturating_sub(space),
+            send_buffer_drops: binding.quality.send_buffer_drops.load(Ordering::Relaxed), finished,
+        }
+    }
+
+    pub(crate) fn quality_snapshot(&self) -> Vec<ExitPathQuality> {
+        let bindings: Vec<_> = lock_unpoison(&self.bindings).by_dev.values().cloned().collect();
+        bindings.iter().map(|b| self.sample_quality(b, false)).collect()
+    }
+
+    pub(crate) fn observe_quality_path(&self, conn_id: u64) {
+        let binding = {
+            let b = lock_unpoison(&self.bindings);
+            b.by_conn.get(&conn_id).and_then(|dev| b.by_dev.get(dev)).cloned()
+        };
+        if let Some(b) = binding {
+            let mut path = lock_unpoison(&b.quality.path);
+            let remote = b.conn.remote_address();
+            let via = self.path_via(remote);
+            if path.remote != remote || path.via != via {
+                path.epoch = path.epoch.saturating_add(1);
+                path.remote = remote;
+                path.via = via;
+            }
+        }
+    }
+
+    fn finish_quality(&self, binding: Binding) {
+        let sample = self.sample_quality(&binding, true);
+        let mut finished = lock_unpoison(&self.finished_quality);
+        if finished.len() >= 256 {
+            finished.pop_front();
+            self.finished_overflow.fetch_add(1, Ordering::Relaxed);
+        }
+        finished.push_back(sample);
+    }
+
+    pub(crate) fn drain_finished_quality(&self) -> Vec<ExitPathQuality> {
+        lock_unpoison(&self.finished_quality).drain(..).collect()
+    }
+
+    pub(crate) fn quality_finished_overflow(&self) -> u64 {
+        self.finished_overflow.load(Ordering::Relaxed)
+    }
+
+    /// 只在已知连接上计 DATAGRAM 预检满；共享 socket/注入队列失败不冒充连接丢弃。
+    pub(crate) fn note_conn_send_buffer_drop(&self, conn: &Connection) {
+        let b = lock_unpoison(&self.bindings);
+        if let Some(binding) = b.by_dev.values().find(|b| b.conn.stable_id() == conn.stable_id()) {
+            binding.quality.send_buffer_drops.fetch_add(1, Ordering::Relaxed);
         }
     }
 

@@ -1502,6 +1502,8 @@ fn driver_loop(
     let revoked_path = cfg.state_dir.join("serve").join("revoked.jsonl");
     let mut revoked_mtime = std::fs::metadata(&revoked_path).and_then(|m| m.modified()).ok();
     let mut last_dns_stats = Instant::now();
+    let quality = super::quality::Collector::start(&cfg.state_dir, Arc::clone(dlogf));
+    let mut last_quality = Instant::now();
     // tun_ip → pubkey 映射（M5 §3.2-bis 方案 (a)）：**出口出站分流键**。数据源 = 设备表
     // 的 `DevOp`（Add 带 `tun_ip`/pubkey；Remove 带 pubkey）——原 WG 面 `device.tun_ip_owner`
     // 的等价物，**不动岛公面**。dst == 某设备 tun_ip ⇒ QUIC DATAGRAM；否则丢 + 计数 + 记行。
@@ -1659,6 +1661,13 @@ fn driver_loop(
         bind.retry_client_admissions();
         // ⑤ 周期任务
         let now = Instant::now();
+        if now.duration_since(last_quality) >= Duration::from_millis(super::quality::SAMPLE_MS) {
+            let sampling_delay_ms = now.duration_since(last_quality).as_millis()
+                .saturating_sub(super::quality::SAMPLE_MS as u128)
+                .min(u64::MAX as u128) as u64;
+            last_quality = now;
+            collect_quality(quality.as_ref(), quic_face.as_ref(), intercept, sampling_delay_ms);
+        }
         if now >= next_gc {
             let sys_now = SystemTime::now();
             for (_a, ops) in table.gc(sys_now) {
@@ -1718,7 +1727,8 @@ fn driver_loop(
     // → **QUIC 面 stop_within(CLOSE_BUDGET)** → `intercept.close()`）。位置：宽限循环
     // 之后（尾包该投的已投）、intercept teardown 之前；到点 detach 由收割线程接手
     // （不阻塞收工链）。
-    if let Some(q) = quic_face {
+    collect_quality(quality.as_ref(), quic_face.as_ref(), intercept, 0);
+    if let Some(q) = quic_face.as_ref() {
         const QUIC_CLOSE_BUDGET: Duration = Duration::from_secs(2);
         if !q.stop_within(Instant::now() + QUIC_CLOSE_BUDGET) {
             (dlogf)("出口 QUIC 面未在收工预算内退出 —— 已 detach（收割线程接手）");
@@ -1726,6 +1736,27 @@ fn driver_loop(
     }
     // 到期：teardown（在途 TCP 立即拆——close 内逐条 teardown + 判据行）
     intercept.close();
+    collect_quality(quality.as_ref(), quic_face.as_ref(), intercept, 0);
+    if let Some(quality) = quality {
+        quality.finish(Duration::from_millis(200), dlogf);
+    }
+}
+
+fn collect_quality(
+    collector: Option<&super::quality::Collector>,
+    quic: Option<&homeway_quic::ExitQuic>,
+    intercept: &mut Interceptor,
+    sampling_delay_ms: u64,
+) {
+    let Some(collector) = collector else { return };
+    let mut paths = Vec::new();
+    let mut overflow = 0;
+    if let Some(q) = quic {
+        paths = q.drain_finished_quality();
+        paths.extend(q.quality_snapshot());
+        overflow = q.quality_finished_overflow();
+    }
+    collector.sample(paths, intercept.drain_quality(), overflow, sampling_delay_ms);
 }
 
 /// 腿表 → QUIC 面腿表的**差分同步**（M1 §1.6 发送侧路由）：新腿登记发送句柄（该腿
@@ -1776,7 +1807,7 @@ fn on_quic_inbound(
             req.reply(verdict);
             if accepted { return origin; }
         }
-        homeway_quic::ExitInbound::Packet { pkt, .. } => intercept.on_plain(pkt),
+        homeway_quic::ExitInbound::Packet { dev, pkt, .. } => intercept.on_plain_for_device(pkt, dev),
         // 前向兼容（`ExitInbound` 是 `#[non_exhaustive]` 的跨 crate 消费面）
         _ => {}
     }

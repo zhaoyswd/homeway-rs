@@ -2026,7 +2026,7 @@ fn test_face_ctx(logf: Logf) -> Arc<FaceCtx> {
     wake_tx.set_nonblocking(true).unwrap();
     wake_rx.set_nonblocking(true).unwrap();
     let (out_tx, _out_rx) = tokio::sync::mpsc::channel(1);
-    let bridge = Arc::new(ExitBridge::new(Arc::clone(&stats), logf, wake_tx, wake_rx, out_tx));
+    let bridge = Arc::new(ExitBridge::new(Arc::clone(&stats), logf, wake_tx, wake_rx, out_tx, Arc::new(super::socket::LegTable::default())));
     Arc::new(FaceCtx { proof_gate: std::sync::Arc::new(std::sync::Mutex::new(
         crate::exit::admit::ProofGate::new(crate::exit::admit::PROOF_FAIL_THRESHOLD_DEFAULT),
     )),
@@ -2174,6 +2174,11 @@ async fn relay_leg_carries_quic_handshake_and_datagrams() {
     let (_send, _recv) = admit(&stub, &quic, &conn, &SECRET, &pubkey, &dev).await;
     pump_until_line(&stub, &quic, &rx, "连接采纳 dev=d2d2d2d2", WAIT).await;
     assert!(quic.snapshot().regs_accepted >= 1, "腿路径准入应通过：{:?}", quic.snapshot());
+    let quality = quic.quality_snapshot();
+    assert_eq!(quality.len(), 1);
+    assert_eq!(quality[0].dev, dev);
+    assert_eq!(quality[0].via, crate::ExitPathVia::Relay, "由真实腿表认定承载，不猜远端地址");
+    assert!(quality[0].path_stable);
 
     // ③ 入站：客户端数据报 → 中继包壳 → 注入 → 源校验 → 引擎桩（字节级一致）
     let pkt = inner_pkt(TUN_IP, Ipv4Addr::new(8, 8, 8, 8));
@@ -2228,6 +2233,7 @@ async fn removed_leg_does_not_fall_back_to_direct_socket() {
         wake_tx,
         wake_rx,
         out_tx,
+        Arc::new(super::socket::LegTable::default()),
     ));
     // 直连面：本 socket 的「直连端口」+ 观察者（收它发出的裸包）
     let observer = loopback_socket();
@@ -2387,6 +2393,7 @@ fn exit_sock_dual_direct(
         wake_tx,
         wake_rx,
         out_tx,
+        Arc::new(super::socket::LegTable::default()),
     ));
     let direct = dual_stack_socket();
     let local = direct.local_addr().expect("本地地址可读");
@@ -4063,4 +4070,144 @@ async fn dns_stream_tag6_rides_intake_and_refuses_when_unassembled() {
         "拒绝行带 tag=dns：{lines2:?}"
     );
     assert!(quic2.stop_within(Instant::now() + BUDGET));
+}
+
+// ---------- 出口质量采样：身份隔离、生命周期、路径与覆盖缺口 ----------
+
+#[tokio::test]
+async fn quality_only_samples_authenticated_bindings_and_isolates_devices() {
+    let (logf, _rx) = sink();
+    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(91), 32), logf).unwrap();
+    assert!(quic.quality_snapshot().is_empty());
+    let (_ca, a, _sa) = client_conn(&quic).await;
+    assert!(quic.quality_snapshot().is_empty(), "完成握手仍未认证，不入设备样本");
+    let stub = Stub::new(SECRET);
+    let (_as, _ar) = admit(&stub, &quic, &a, &SECRET, &[91; 32], &[91; 8]).await;
+    let (_cb, b, _sb) = client_conn(&quic).await;
+    let (_bs, _br) = admit(&stub, &quic, &b, &SECRET, &[92; 32], &[92; 8]).await;
+    let before = quic.quality_snapshot();
+    assert_eq!(before.len(), 2);
+    let sample_a = before.iter().find(|s| s.dev == [91; 8]).unwrap();
+    let sample_b = before.iter().find(|s| s.dev == [92; 8]).unwrap();
+    assert_ne!(sample_a.connection_id, sample_b.connection_id);
+    assert_ne!(sample_a.remote, sample_b.remote);
+    assert_eq!(sample_a.tun_ip, TUN_IP);
+    assert_eq!(sample_a.tunnel_ip, TUNNEL_IP);
+    assert_eq!(sample_a.via, crate::ExitPathVia::Direct);
+    assert!(sample_a.path_stable && !sample_a.finished && sample_a.observed_at_ms > 0);
+    // 预检满归属按真实 Connection handle，而不是全局计数摊到每台设备。
+    let server_b = quic.bridge.conn_of_pub(&[92; 32]).unwrap();
+    quic.bridge.note_conn_send_buffer_drop(&server_b);
+    let pkt = inner_pkt(TUN_IP, Ipv4Addr::new(8, 8, 8, 8));
+    b.send_datagram(bytes::Bytes::from(pkt)).unwrap();
+    assert!(pump_until(&stub, &quic, || {
+        quic.quality_snapshot().iter().any(|s| s.dev == [92; 8] && s.udp_rx_bytes > sample_b.udp_rx_bytes)
+    }, WAIT).await);
+    let after = quic.quality_snapshot();
+    let a_after = after.iter().find(|s| s.dev == [91; 8]).unwrap();
+    let b_after = after.iter().find(|s| s.dev == [92; 8]).unwrap();
+    assert_eq!(a_after.send_buffer_drops, 0);
+    assert_eq!(b_after.send_buffer_drops, 1);
+    assert!(b_after.udp_rx_datagrams > sample_b.udp_rx_datagrams);
+    assert!(b_after.sent_packets > 0 && b_after.cwnd > 0);
+    assert_eq!(b_after.datagram_send_buffer_used + b_after.datagram_send_buffer_space, 1 << 20);
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+    assert!(quic.quality_snapshot().is_empty());
+    let finals = quic.drain_finished_quality();
+    assert_eq!(finals.len(), 2, "stop保留两个绑定的最终DTO");
+    assert!(finals.iter().all(|s| s.finished));
+    assert!(quic.drain_finished_quality().is_empty());
+}
+
+#[tokio::test]
+async fn quality_reconnection_and_revocation_preserve_distinct_final_samples() {
+    let (logf, _rx) = sink();
+    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(93), 32), logf).unwrap();
+    let stub = Stub::new(SECRET);
+    let (_ca, a, _sa) = client_conn(&quic).await;
+    let (_as, _ar) = admit(&stub, &quic, &a, &SECRET, &[93; 32], &[93; 8]).await;
+    let first = quic.quality_snapshot().pop().unwrap();
+    let (_cb, b, _sb) = client_conn(&quic).await;
+    let (_bs, _br) = admit(&stub, &quic, &b, &SECRET, &[93; 32], &[93; 8]).await;
+    let current = quic.quality_snapshot();
+    assert_eq!(current.len(), 1);
+    assert_ne!(current[0].connection_id, first.connection_id, "重连不复用累计计数身份");
+    assert_eq!(current[0].path_epoch, 0);
+    let retired = quic.drain_finished_quality();
+    assert_eq!(retired.len(), 1);
+    assert_eq!(retired[0].connection_id, first.connection_id);
+    assert!(retired[0].finished);
+    quic.unbind_pub(&[93; 32]);
+    assert!(quic.quality_snapshot().is_empty());
+    let revoked = quic.drain_finished_quality();
+    assert_eq!(revoked.len(), 1);
+    assert_eq!(revoked[0].connection_id, current[0].connection_id);
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+    assert!(quic.drain_finished_quality().is_empty(), "后续巡检/stop不得重复final");
+    assert_eq!(quic.quality_finished_overflow(), 0);
+}
+
+#[tokio::test]
+async fn quality_path_epoch_tracks_real_quic_rebinding_without_resetting_connection_counters() {
+    let (logf, _rx) = sink();
+    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(94), 32), logf).unwrap();
+    let stub = Stub::new(SECRET);
+    let (client, conn, _sock) = client_conn(&quic).await;
+    let (_s, _r) = admit(&stub, &quic, &conn, &SECRET, &[94; 32], &[94; 8]).await;
+    let before = quic.quality_snapshot().pop().unwrap();
+    let replacement = loopback_socket();
+    let remote = replacement.local_addr().unwrap();
+    client.rebind(replacement).unwrap();
+    conn.send_datagram(bytes::Bytes::from(inner_pkt(TUN_IP, Ipv4Addr::new(8, 8, 8, 8)))).unwrap();
+    assert!(pump_until(&stub, &quic, || {
+        quic.quality_snapshot().iter().any(|s| s.remote == remote && s.path_epoch > before.path_epoch)
+    }, WAIT).await);
+    let after = quic.quality_snapshot().pop().unwrap();
+    assert_eq!(before.connection_id, after.connection_id);
+    assert_ne!(before.remote, after.remote);
+    assert_eq!(after.via, crate::ExitPathVia::Direct);
+    assert!(after.udp_rx_bytes >= before.udp_rx_bytes);
+    assert!(after.sent_packets >= before.sent_packets, "锁定Quinn的path命名计数仍是连接累计");
+    assert!(after.path_stable);
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+    let final_sample = quic.drain_finished_quality().pop().unwrap();
+    assert_eq!(final_sample.path_epoch, after.path_epoch);
+}
+
+#[tokio::test]
+async fn quality_final_queue_is_bounded_and_reports_coverage_loss() {
+    let (logf, _rx) = sink();
+    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(95), 32), logf).unwrap();
+    let stub = Stub::new(SECRET);
+    let (_client, conn, _sock) = client_conn(&quic).await;
+    let (_s, _r) = admit(&stub, &quic, &conn, &SECRET, &[95; 32], &[95; 8]).await;
+    let sample = quic.quality_snapshot().pop().unwrap();
+    let server = quic.bridge.conn_of_pub(&[95; 32]).unwrap();
+    // 直接重复同连接内部绑定，覆盖最终队列边界；不额外跑256次握手，不改变连接策略。
+    for _ in 0..260 {
+        quic.bridge.bind([95; 8], [95; 32], sample.connection_id, server.clone(), TUNNEL_IP, TUN_IP);
+    }
+    assert_eq!(quic.quality_finished_overflow(), 4);
+    assert_eq!(quic.drain_finished_quality().len(), 256);
+    assert!(quic.drain_finished_quality().is_empty());
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+    assert_eq!(quic.drain_finished_quality().len(), 1);
+}
+
+#[tokio::test]
+async fn quality_peer_close_emits_one_final_without_periodic_sample() {
+    let (logf, _rx) = sink();
+    let quic = ExitQuic::start(loopback_socket(), ExitQuicConfig::new(seed(96), 32), logf).unwrap();
+    let stub = Stub::new(SECRET);
+    let (_client, conn, _sock) = client_conn(&quic).await;
+    let (_s, _r) = admit(&stub, &quic, &conn, &SECRET, &[96; 32], &[96; 8]).await;
+    // 尚未调用周期采样就断开，仍须留出短连接摘要。
+    conn.close(0u32.into(), b"done before first quality tick");
+    assert!(pump_until(&stub, &quic, || quic.bridge.bound_count() == 0, WAIT).await);
+    let finals = quic.drain_finished_quality();
+    assert_eq!(finals.len(), 1);
+    assert_eq!(finals[0].dev, [96; 8]);
+    assert!(finals[0].finished && finals[0].udp_rx_bytes > 0);
+    assert!(quic.stop_within(Instant::now() + BUDGET));
+    assert!(quic.drain_finished_quality().is_empty());
 }

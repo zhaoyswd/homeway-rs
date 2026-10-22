@@ -21,6 +21,100 @@
 use std::io;
 use std::net::{SocketAddr, UdpSocket};
 
+/// 原生 TCP 指标能力；Unavailable 表示平台支持但本次 getsockopt/字段不可用。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TcpQualityAvailability {
+    Available,
+    Unsupported,
+    Unavailable,
+}
+
+/// OS socket 的累计重传，不与 QUIC 丢包混合。None = 未知/未实现；0 仅用于真实计数。
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct TcpQuality {
+    pub availability: TcpQualityAvailability,
+    pub rtt_us: Option<u64>,
+    pub retransmitted_packets: Option<u64>,
+    pub retransmitted_bytes: Option<u64>,
+}
+
+impl TcpQuality {
+    fn empty(availability: TcpQualityAvailability) -> Self {
+        Self {
+            availability,
+            rtt_us: None,
+            retransmitted_packets: None,
+            retransmitted_bytes: None,
+        }
+    }
+}
+
+/// 稳定 ABI 前缀读取。Linux 的 TCP_INFO 的 RTT 是 us；Darwin 的 srtt 是 ms。
+/// 只在定期采样/关 fd 时调用，无逐包 syscall。
+pub fn tcp_quality(raw: RawSock) -> TcpQuality {
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    {
+        // 原生 ABI 的字节前缀避免依赖 GNU/musl/OHOS 不同的 libc tcp_info 声明。
+        // Linux include/uapi/linux/tcp.h: RTT@68、total_retrans@100。
+        // Darwin SDK netinet/tcp.h tcp_connection_info: srtt@44；
+        // aligned(8) 的 txretransmitbytes@72，txretransmitpackets@104。
+        let mut buf = [0u8; 112];
+        let mut len = buf.len() as libc::socklen_t;
+        #[cfg(target_os = "linux")]
+        let option = libc::TCP_INFO;
+        #[cfg(target_os = "macos")]
+        let option = libc::TCP_CONNECTION_INFO;
+        let result = unsafe {
+            libc::getsockopt(
+                raw,
+                libc::IPPROTO_TCP,
+                option,
+                buf.as_mut_ptr().cast(),
+                &mut len,
+            )
+        };
+        if result != 0 {
+            return TcpQuality::empty(TcpQualityAvailability::Unavailable);
+        }
+        let word = |offset: usize| -> Option<u64> {
+            (offset + 4 <= len as usize).then(|| {
+                u32::from_ne_bytes(buf[offset..offset + 4].try_into().expect("4-byte prefix"))
+                    as u64
+            })
+        };
+        #[cfg(target_os = "linux")]
+        {
+            let rtt = word(68).filter(|v| *v != 0);
+            TcpQuality {
+                availability: TcpQualityAvailability::Available,
+                rtt_us: rtt,
+                retransmitted_packets: word(100),
+                retransmitted_bytes: None,
+            }
+        }
+        #[cfg(target_os = "macos")]
+        {
+            let wide = |offset: usize| -> Option<u64> {
+                (offset + 8 <= len as usize).then(|| {
+                    u64::from_ne_bytes(buf[offset..offset + 8].try_into().expect("8-byte prefix"))
+                })
+            };
+            TcpQuality {
+                availability: TcpQualityAvailability::Available,
+                rtt_us: word(44).filter(|v| *v != 0).map(|ms| ms * 1000),
+                retransmitted_packets: wide(104),
+                retransmitted_bytes: wide(72),
+            }
+        }
+    }
+    #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+    {
+        let _ = raw;
+        TcpQuality::empty(TcpQualityAvailability::Unsupported)
+    }
+}
+
 // ---------- 句柄类型（unix = fd / windows = SOCKET） ----------
 
 #[cfg(unix)]
@@ -907,5 +1001,42 @@ pub fn into_udp_socket(s: SysSock) -> UdpSocket {
     #[cfg(windows)]
     {
         UdpSocket::from(s)
+    }
+}
+
+#[cfg(test)]
+mod quality_tests {
+    use super::*;
+
+    #[test]
+    fn native_tcp_quality_is_measured_or_explicitly_unsupported() {
+        use std::io::{Read, Write};
+        let listener = std::net::TcpListener::bind(("127.0.0.1", 0)).unwrap();
+        let mut client = std::net::TcpStream::connect(listener.local_addr().unwrap()).unwrap();
+        let (mut server, _) = listener.accept().unwrap();
+        client.write_all(b"sample").unwrap();
+        let mut buf = [0u8; 6];
+        server.read_exact(&mut buf).unwrap();
+        let q = tcp_quality(tcp_stream_raw(&client));
+        #[cfg(any(target_os = "linux", target_os = "macos"))]
+        {
+            assert_eq!(q.availability, TcpQualityAvailability::Available);
+            assert_eq!(q.retransmitted_packets, Some(0));
+            // Darwin reports milliseconds; sub-millisecond loopback RTT legitimately has no value.
+            assert!(q.rtt_us.is_none_or(|v| v > 0));
+            #[cfg(target_os = "macos")]
+            assert_eq!(q.retransmitted_bytes, Some(0));
+        }
+        #[cfg(not(any(target_os = "linux", target_os = "macos")))]
+        assert_eq!(q.availability, TcpQualityAvailability::Unsupported);
+    }
+
+    #[cfg(any(target_os = "linux", target_os = "macos"))]
+    #[test]
+    fn non_tcp_socket_metrics_are_unavailable_not_zero_measurements() {
+        let udp = socket(libc::AF_INET, SOCK_DGRAM).unwrap();
+        let q = tcp_quality(sock_raw(&udp));
+        assert_eq!(q.availability, TcpQualityAvailability::Unavailable);
+        assert_eq!((q.rtt_us, q.retransmitted_packets, q.retransmitted_bytes), (None, None, None));
     }
 }

@@ -13,6 +13,7 @@ pub mod dnsproxy;
 pub mod doh;
 pub mod dns_stream;
 pub mod engine;
+pub mod quality;
 pub mod egress;
 pub mod quic_admit;
 pub mod upnp;

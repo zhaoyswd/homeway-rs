@@ -26,6 +26,7 @@ mod cli_flags;
 mod daemon_cli;
 mod relay_cli;
 mod serve_cli;
+mod quality_cli;
 #[cfg(not(windows))] // term 在 windows 不支持（用户指令豁免——WIN 批）
 mod term_cli;
 mod stopsig;
@@ -62,6 +63,7 @@ fn main() {
         // serve 命令组（start/stop/restart/status/token）= 控制面往返；动词之外的
         // 形态 = 前台单角色（`serve token [list|revoke]` 纯读命令保留直连 state 形态）。
         Some("serve") => match args.get(2).map(String::as_str) {
+            Some("quality") => quality_cli::cmd_quality(&args[3..]),
             Some("start") | Some("stop") | Some("restart") | Some("status") | Some("grant") => {
                 daemon_cli::cmd_serve_group(&args[2..])
             }
@@ -117,6 +119,7 @@ fn main() {
             }
             eprintln!("可用命令：");
             eprintln!("  serve start|stop|status|token    出口     relay start|stop|status|token    中继");
+            eprintln!("  serve quality [--since 10m] [--json]    查询本机出口质量历史");
             eprintln!("  host add|list|status|delete      主机     status                           连接与流量");
             // term 行平台分档（windows 不支持——帮助不列不可用面）。
             #[cfg(not(windows))]
