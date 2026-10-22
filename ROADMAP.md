@@ -79,6 +79,14 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 > 真实 PTY 红→绿与两道门见 `docs/reviews/2026-10-22-term-surface-attach.md`。
 > 正常 inline transcript 保留，旧损坏历史不逆向还原；未改 wire/NAPI，尚未发布或部署。
 
+> **2026-10-22 本整改追加验收完成**：清洁 `f883d7a` 的 Codex 默认/inline、opencode 宿主矩阵与
+> `FMR0224116011480` 正常 debug 三包复验通过；同尺寸重进、49→45 列跨尺寸及退出 shell 验收完成。
+> 默认 Codex 退出后 45 条长逻辑行逐字保留，退出→重进 FETCH 100 个物理行逐格相等。
+> 新版私有 73/官方旧版私有 74 对照、双腿与实际 C++ 解码链通过；图片漏画疑点经原图 0 差异像素证伪。
+> 临时插桩/主机已清理，正常包重装、原主机 VPN 直连恢复，私有实例已停，生产出口未换装。
+> 两道门与证据见 `docs/reviews/2026-10-22-term-attach-reverify.md`；App 总报告 =
+> `tier:docs/reviews/terminal-attach-reverify-2026-10-22.md`。下一步仅待明确部署后走 Release 链路，未推送。
+
 
 > **2026-10-22 本批部署收口**：最终tag/source `e87ab1a3aa5a`（v0.3.18），CI39633996843
 > 双平台各1252/0（37 ignored；子进程同例输出不重复计），Release39634013938五目标全过。
