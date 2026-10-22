@@ -624,6 +624,7 @@ impl SurfaceLeg {
 struct RawHandshake {
     attached: Vec<u8>,
     start: u64,
+    starts_in_alt_screen: bool,
     end: u64,
     truncated: bool,
     epochs: Vec<u64>,
@@ -1317,6 +1318,7 @@ impl TermService {
                 Some(RawHandshake {
                     attached,
                     start,
+                    starts_in_alt_screen: rt.ring.replay_modes(start) & super::codec::mode_bits::ALT_SCREEN != 0,
                     end: rt.ring.written(),
                     truncated,
                     epochs: rt.ring.epochs.iter().map(|e| e.off).collect(),
@@ -2920,9 +2922,17 @@ impl TermService {
             self.writer_exited(name, sess_gen);
             return;
         }
-        if !self.raw_write_frame(name, key, &mut io, &out, Op::DATA, b"\x1b[3J\x1b[2J\x1b[H") {
+        // 屏幕选择是回放起点的状态；ATTACHED 的期末模式不能代替它。
+        // 47 只选择屏幕，不像 1049 重入时可能覆盖本地主屏保存槽。
+        // 先切屏再清屏，进入备用屏时不清掉本地主屏历史。前序不入环/不计 replayed。
+        let prelude: &[u8] = if hs.starts_in_alt_screen {
+            b"\x1b[?47h\x1b[3J\x1b[2J\x1b[H"
+        } else {
+            b"\x1b[?47l\x1b[3J\x1b[2J\x1b[H"
+        };
+        if !self.raw_write_frame(name, key, &mut io, &out, Op::DATA, prelude) {
             self.writer_exited(name, sess_gen);
-            return; // 换屏前序：客户端 vt 是新建的，回放起点要确定
+            return; // raw 终端可能仍在上次连接的屏幕上，回放起点必须确定
         }
         // 回放：锁内读环、锁外写；时间预算用尽就跳到实时（丢头部保尾部）。
         // cut_by_done：回放途中会话收尾时，实时起点留在断点——不跳过未送出的窗口。
@@ -4340,6 +4350,106 @@ mod tests {
 
     fn hello(name: &str, tail: &[u8]) -> Vec<u8> {
         frames::enc_hello(80, 24, 0, name, tail)
+    }
+
+    #[test]
+    fn raw_replay_restores_screen_after_complete_and_truncated_history_without_vt() {
+        use super::super::vt::Screen;
+        for (history, replay, raw_only) in [(1024, 0, false), (64, 32, false), (64, 32, true)] {
+            let cfg = TermConfig {
+                shell: Some("stty raw -echo; printf '\\033[?1049hFIRST\\n'; printf '%080dTUI' 0; cat".into()),
+                history,
+                replay,
+                ..Default::default()
+            };
+            let svc = svc_with(cfg, Arc::new(Mutex::new(Vec::new())));
+            let (listener, path) = start_listener();
+            let running = Arc::clone(&svc);
+            std::thread::spawn(move || running.serve(listener));
+            let name = tmp_name("replay-screen");
+            svc.create_only(&name, false).unwrap();
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let expected_replayed = loop {
+                let mut state = svc.lock_state();
+                let rt = state.sessions.get_mut(&name).unwrap();
+                if rt.ring.read(rt.ring.start(), history).ends_with(b"TUI") {
+                    if raw_only { rt.vt = None; } // 与 HOMEWAY_TERM_VT=off 相同运行态，不污染并行 env
+                    let (start, _) = rt.ring.replay_start(replay, ReplayEpoch::Whole);
+                    break rt.ring.written() - start;
+                }
+                drop(state);
+                assert!(Instant::now() < deadline, "PTY未输出TUI");
+                std::thread::sleep(Duration::from_millis(10));
+            };
+            let mut client = Client::connect(&path);
+            client.send(Op::HELLO, &hello(&name, &frames::enc_hello_tail(
+                frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "raw-replay",
+            )));
+            client.expect(Op::ATTACHED, 5);
+            let mut output = Vec::new();
+            loop {
+                let frame = client.io.read_frame_deadline(Duration::from_secs(5)).unwrap();
+                match frame.op {
+                    Op::DATA => output.extend_from_slice(&frame.payload),
+                    Op::REPLAY_DONE => {
+                        assert_eq!(frames::dec_replay_done(&frame.payload).unwrap().0 as u64, expected_replayed,
+                            "前序不进入replayed字节数");
+                        break;
+                    }
+                    Op::STATE => {}
+                    op => panic!("意外帧 {op:?}"),
+                }
+            }
+            svc.close();
+            let mut local = SessionVt::new(80, 24, 100).unwrap();
+            local.write(b"BEFORE_TUI");
+            local.write(&output);
+            assert_eq!(local.modes().screen, Screen::Alternate, "history={history}, raw_only={raw_only}");
+            assert!(local.screen_text().contains("TUI"));
+            assert!(!local.screen_text().contains("BEFORE_TUI"));
+            local.write(b"\x1b[?1049l");
+            if history == 64 {
+                assert!(local.screen_text().contains("BEFORE_TUI"), "备用屏前序不清本地主屏");
+                assert!(output.starts_with(b"\x1b[?47h\x1b[3J"), "初始化只选屏，不重复1049保存光标");
+                local.write(b"\x1b[4;7H\x1b7\x1b[?1049h");
+                local.write(&output); // 模拟自动重连：本地在断链前已进入备用屏
+                local.write(b"\x1b[?1049l\x1b8");
+                assert_eq!((local.cursor().x, local.cursor().y), (6, 3), "重连不覆盖主屏保存槽");
+                assert!(local.screen_text().contains("BEFORE_TUI"));
+            }
+        }
+    }
+
+    #[test]
+    fn raw_live_screen_switches_are_transmitted_unchanged() {
+        use super::super::vt::Screen;
+        let svc = svc_with(TermConfig {
+            shell: Some("stty raw -echo; printf READY; cat".into()), ..Default::default()
+        }, Arc::new(Mutex::new(Vec::new())));
+        let (listener, path) = start_listener();
+        let running = Arc::clone(&svc);
+        std::thread::spawn(move || running.serve(listener));
+        let name = tmp_name("live-screen");
+        let mut client = Client::connect(&path);
+        client.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::CREATE, &name,
+            &frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_NO_ESC_PREFIX, "raw-live")));
+        client.expect(Op::ATTACHED, 5);
+        client.expect(Op::REPLAY_DONE, 5);
+        client.drain_data_until(|bytes| has_bytes(bytes, b"READY"), 5);
+        let mut local = SessionVt::new(80, 24, 100).unwrap();
+        local.write(b"SHELL");
+        for (bytes, expected) in [
+            (b"\x1b[?1049hTUI".as_slice(), Screen::Alternate),
+            (b"\x1b[?1049l".as_slice(), Screen::Primary),
+        ] {
+            client.send(Op::DATA, bytes);
+            let received = client.drain_data_until(|output| output.len() >= bytes.len(), 5);
+            assert_eq!(received, bytes, "实时控制字节原样透传");
+            local.write(&received);
+            assert_eq!(local.modes().screen, expected);
+        }
+        assert!(local.screen_text().contains("SHELL"));
+        svc.close();
     }
 
     #[test]

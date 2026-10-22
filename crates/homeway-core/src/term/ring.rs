@@ -3,8 +3,10 @@
 //!
 //! 定长环：容量即历史上限（默认 1MiB）；`written` 是累计字节（绝对偏移），
 //! `start = written - min(written, cap)` 是最旧可用字节。回放起点选择：
-//! 尾部优先（回放上限）→ 行边界 → ESC 起点 → 原样；epoch 表（≤64）记尺寸变化点。
+//! 尾部优先（回放上限）→ 截断窗口对齐行边界/ESC 起点；完整历史原样保留。
+//! epoch 表（≤64）记尺寸变化点；裁剪前缀的扫描检查点记回放起点模式。
 
+use super::scan::TermScan;
 use super::size::Size;
 
 /// 起点对齐时最多前看的字节数。
@@ -34,13 +36,15 @@ pub struct OutputRing {
     written: u64,
     /// 最旧可用字节的绝对偏移。
     start: u64,
+    /// 恰好扫描过 [0, start) 的检查点；保留 parser 状态以跨越被覆盖的半截 CSI/OSC。
+    head_scan: TermScan,
     /// 尺寸变化点表（≤64）。
     pub epochs: Vec<Epoch>,
 }
 
 impl OutputRing {
     pub fn new(cap: usize) -> Self {
-        OutputRing { buf: vec![0; cap], written: 0, start: 0, epochs: Vec::new() }
+        OutputRing { buf: vec![0; cap], written: 0, start: 0, head_scan: TermScan::new(), epochs: Vec::new() }
     }
 
     pub fn cap(&self) -> usize {
@@ -60,6 +64,14 @@ impl OutputRing {
         let cap = self.buf.len();
         if cap == 0 {
             return;
+        }
+        // 覆盖前推进检查点：旧环前缀与本批直接被挤掉的前缀各扫描一次。
+        let next_start = (self.written + p.len() as u64).saturating_sub(cap as u64);
+        if next_start > self.start {
+            scan_range(&self.buf, self.start, next_start.min(self.written), &mut self.head_scan);
+            if next_start > self.written {
+                self.head_scan.write(&p[..(next_start - self.written) as usize]);
+            }
         }
         while !p.is_empty() {
             let pos = (self.written % cap as u64) as usize;
@@ -130,6 +142,10 @@ impl OutputRing {
             start = self.written - replay_max as u64;
             truncated = true;
         }
+        // 全历史没有残行：不能因首换行删掉开头的切屏/模式初始化序列。
+        if start == 0 {
+            return (start, truncated);
+        }
         let head = self.read(start, REPLAY_TRIM);
         if head.is_empty() {
             return (start, truncated);
@@ -143,6 +159,23 @@ impl OutputRing {
             }
         }
         (start, truncated)
+    }
+
+    /// 选定回放起点之前的模式，不是当前（回放末尾）的模式。
+    pub fn replay_modes(&self, start: u64) -> u32 {
+        let mut scan = self.head_scan.clone();
+        scan_range(&self.buf, self.start, start.clamp(self.start, self.written), &mut scan);
+        scan.modes()
+    }
+}
+
+/// 借用环的至多两段保留字节，不为每次 PTY 覆盖/握手扫描另分配历史副本。
+fn scan_range(buf: &[u8], mut start: u64, end: u64, scan: &mut TermScan) {
+    while start < end {
+        let pos = (start % buf.len() as u64) as usize;
+        let len = (buf.len() - pos).min((end - start) as usize);
+        scan.write(&buf[pos..pos + len]);
+        start += len as u64;
     }
 }
 
@@ -185,15 +218,17 @@ mod tests {
 
     #[test]
     fn replay_start_line_then_esc_then_raw() {
-        // 行边界优先：起点前看窗内首个 \n 之后
-        let mut r = OutputRing::new(1024);
-        r.append(b"partial-line\x1b[2Kthen more\nsecond\n");
+        // 真截断才去残行；完整历史不能删掉首行中的初始化序列。
+        let bytes = b"xpartial-line\x1b[2Kthen more\nsecond\n";
+        let mut r = OutputRing::new(bytes.len() - 1);
+        r.append(bytes);
         let (start, trunc) = r.replay_start(0, ReplayEpoch::Whole);
         assert!(!trunc);
         assert_eq!(r.read(start, 1024), b"second\n", "首 \\n 之后");
         // 无 \\n 有 ESC：从 ESC 起（i > 0）
-        let mut r2 = OutputRing::new(1024);
-        r2.append(b"plain\x1b[31mred");
+        let bytes = b"xplain\x1b[31mred";
+        let mut r2 = OutputRing::new(bytes.len() - 1);
+        r2.append(bytes);
         let (start2, _) = r2.replay_start(0, ReplayEpoch::Whole);
         assert_eq!(r2.read(start2, 1024), b"\x1b[31mred");
         // ESC 在首位（i == 0）不算：原样
@@ -205,6 +240,64 @@ mod tests {
         let mut r4 = OutputRing::new(1024);
         r4.append(b"no markers at all");
         assert_eq!(r4.replay_start(0, ReplayEpoch::Whole).0, 0);
+    }
+
+    #[test]
+    fn replay_keeps_complete_first_line_and_initial_screen_sequence() {
+        let mut ring = OutputRing::new(1024);
+        let bytes = b"\x1b[?1049hFIRST\r\nSECOND";
+        ring.append(bytes);
+        let (start, truncated) = ring.replay_start(0, ReplayEpoch::Whole);
+        assert_eq!(start, 0);
+        assert!(!truncated);
+        assert_eq!(ring.read(start, 1024), bytes);
+        assert_eq!(ring.replay_modes(start), 0, "起点仍是主屏，进入序列在回放里");
+    }
+
+    #[test]
+    fn replay_modes_follow_discarded_bytes_and_window_start_not_tail() {
+        use super::super::codec::mode_bits::ALT_SCREEN;
+        let mut ring = OutputRing::new(32);
+        ring.append(b"\x1b[?1049h");
+        ring.append(&[b'a'; 80]); // 单批超过环容量，进入序列与部分新字节均被覆盖
+        assert_eq!(ring.replay_modes(ring.start()), ALT_SCREEN);
+        let end_of_alt = ring.written();
+        ring.append(b"\x1b[?1049lMAIN");
+        assert_eq!(ring.replay_modes(end_of_alt), ALT_SCREEN);
+        assert_eq!(ring.replay_modes(ring.written()), 0, "不能用期末主屏反推起点");
+
+        let mut ring = OutputRing::new(128);
+        ring.append(b"\x1b[?1049hbefore\n");
+        ring.note_size(sz(100, 32));
+        ring.append(b"partial\nafter");
+        let (start, _) = ring.replay_start(0, ReplayEpoch::Last);
+        assert_eq!(ring.read(start, 128), b"after");
+        assert_eq!(ring.replay_modes(start), ALT_SCREEN, "epoch+行边界跳过的进入序列仍有效");
+        let (start, _) = ring.replay_start(5, ReplayEpoch::Whole);
+        assert_eq!(ring.replay_modes(start), ALT_SCREEN, "replay上限裁剪也继承起点模式");
+    }
+
+    #[test]
+    fn replay_checkpoint_carries_split_control_sequences_and_ignores_strings() {
+        use super::super::codec::mode_bits::ALT_SCREEN;
+        for cut in 1..8 {
+            let mut ring = OutputRing::new(8);
+            ring.append(b"\x1b[?1049h");
+            ring.append(&vec![b'x'; cut]); // 环头逐字切断 CSI
+            assert_eq!(ring.replay_modes(ring.written()), ALT_SCREEN, "CSI切在{cut}");
+        }
+        for introducer in *b"]PX^_" {
+            let mut ring = OutputRing::new(8);
+            ring.append(&[0x1b, introducer]);
+            ring.append(b"payload");
+            ring.append(b"\x1b[?1049h"); // 跨环头的字符串载荷不得当作真实切屏
+            ring.append(b"\x1b\\");
+            assert_eq!(ring.replay_modes(ring.written()), 0, "字符串{introducer}");
+            ring.append(b"\x1b[?1049h");
+            assert_eq!(ring.replay_modes(ring.written()), ALT_SCREEN);
+            ring.append(b"\x1bc");
+            assert_eq!(ring.replay_modes(ring.written()), 0, "RIS回主屏");
+        }
     }
 
     #[test]

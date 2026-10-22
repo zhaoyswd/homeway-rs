@@ -39,7 +39,7 @@ pub struct Progress {
 }
 
 /// 一次扫描（每会话一个，由会话锁保护，与 pump 同线程喂）。
-#[derive(Default)]
+#[derive(Clone, Default)]
 pub struct TermScan {
     st: ScanState,
     buf: Vec<u8>,
@@ -67,6 +67,9 @@ enum ScanState {
     Csi,
     Osc,
     OscEsc,
+    /// DCS / SOS / PM / APC 的载荷不属于终端控制序列。
+    String,
+    StringEsc,
 }
 
 impl TermScan {
@@ -107,6 +110,12 @@ impl TermScan {
                     self.buf.clear();
                     self.too_long = false;
                 }
+                b'P' | b'X' | b'^' | b'_' => self.st = ScanState::String,
+                b'c' => {
+                    self.changed |= self.modes != 0;
+                    self.modes = 0;
+                    self.st = ScanState::None;
+                }
                 _ => self.st = ScanState::None,
             },
             ScanState::Csi => {
@@ -137,6 +146,20 @@ impl TermScan {
                     self.finish_osc();
                 }
                 self.st = ScanState::None;
+            }
+            ScanState::String => {
+                if b == 0x1b {
+                    self.st = ScanState::StringEsc;
+                } else if b == 0x18 || b == 0x1a {
+                    self.st = ScanState::None;
+                }
+            }
+            ScanState::StringEsc => {
+                self.st = match b {
+                    b'\\' | 0x18 | 0x1a => ScanState::None,
+                    0x1b => ScanState::StringEsc,
+                    _ => ScanState::String,
+                };
             }
         }
     }
@@ -522,6 +545,27 @@ mod tests {
         s2.write(long.as_bytes());
         // ESC 后的 [1h 是新序列：无 ? 前缀 → 不动模式位
         assert_eq!(s2.modes(), 0);
+    }
+
+    #[test]
+    fn scan_control_strings_and_ris_do_not_leave_stale_modes() {
+        let mut scan = TermScan::new();
+        scan.write(b"\x1b[?1000;2004;1049h");
+        assert!(scan.take_changed());
+        for introducer in *b"PX^_" {
+            scan.write(&[0x1b, introducer]);
+            scan.write(b"\x1b[?1049l\x1b[?1004h");
+            scan.write(b"\x1b");
+            scan.write(b"\\");
+            assert_eq!(scan.modes(), mode_bits::MOUSE_1000 | mode_bits::BRACKETED | mode_bits::ALT_SCREEN);
+            assert!(!scan.take_changed());
+        }
+        scan.write(b"\x1b");
+        scan.write(b"c");
+        assert_eq!(scan.modes(), 0, "RIS同步清所有扫描模式");
+        assert!(scan.take_changed());
+        scan.write(b"\x1b[?1004h");
+        assert_eq!(scan.modes(), mode_bits::FOCUS, "字符串结束后的真实模式仍生效");
     }
 
     #[test]

@@ -87,6 +87,12 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 > 两道门与证据见 `docs/reviews/2026-10-22-term-attach-reverify.md`；App 总报告 =
 > `tier:docs/reviews/terminal-attach-reverify-2026-10-22.md`。下一步仅待明确部署后走 Release 链路，未推送。
 
+> **2026-10-22 raw 终端回放屏幕状态整改（本地源码，未发布/部署）**：修复有界输出历史
+> 裁掉备用屏进入指令后，attach/重连将全屏 TUI 画到主屏的缺陷；输出环保留裁剪边界的模式
+> 检查点，raw 握手按回放起点选择屏幕后再回放。完整历史不再丢首行，实时数据继续原样透传。
+> 两道门与测试边界见 `docs/reviews/2026-10-22-term-replay-screen.md`，行为登记已同步
+> `docs/INTEROP-CRITERIA.md` 与 tier 终端分册。未改 wire/surface/NAPI、版本或 tier 核 pin；
+> 现役仍为下方已部署的 v0.3.18，不把源码回归作为用户终端窗口的现场验收。
 
 > **2026-10-22 本批部署收口**：最终tag/source `e87ab1a3aa5a`（v0.3.18），CI39633996843
 > 双平台各1252/0（37 ignored；子进程同例输出不重复计），Release39634013938五目标全过。
