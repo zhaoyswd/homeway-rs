@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "homeway-capi"
-version = "0.3.20"
+version = "0.3.21"
 dependencies = [
  "homeway-core",
  "libc",
@@ -483,7 +483,7 @@ dependencies = [
 
 [[package]]
 name = "homeway-cli"
-version = "0.3.20"
+version = "0.3.21"
 dependencies = [
  "base64",
  "flate2",
@@ -499,7 +499,7 @@ dependencies = [
 
 [[package]]
 name = "homeway-core"
-version = "0.3.20"
+version = "0.3.21"
 dependencies = [
  "alacritty_terminal",
  "base64",
@@ -528,7 +528,7 @@ dependencies = [
 
 [[package]]
 name = "homeway-quic"
-version = "0.3.20"
+version = "0.3.21"
 dependencies = [
  "bytes",
  "getrandom 0.2.17",

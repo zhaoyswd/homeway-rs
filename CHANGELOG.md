@@ -1,5 +1,19 @@
 # Changelog
 
+## v0.3.21（2026-10-23，homeway update 自更新）
+
+- 新增 `homeway update`：查询 GitHub 最新 Release tag（与当前相同 = 提示「没有更新」），
+  自动下载本平台官方产物并按 SHA256SUMS 校验、解包、`--version` 烟囱、备份现役到
+  `<state>/cache/homeway.prev` 后同目录 rename 原子替换，再按托管形态重启统一进程
+  （launchd 主机由 KeepAlive 拉起；裸进程主机 3s 宽限后自动脱离会话自拉起；守护未
+  运行只换文件），以 control.sock 就绪收工。角色与配置不受影响（config 期望态即模式
+  真源），回退 = 备份文件放回原路径后重启。
+- 出口内部新增极小同步 HTTPS GET 件（minhttp：rustls + Mozilla 根束、仅 https 重定向
+  ≤5 跳、Content-Length/chunked/EOF 三种分帧、绝对截止）；不新增外部依赖。GitHub
+  不可达的主机（如阿里云）在查询阶段如实报错，仍按既有部署纪律由本机下载校验后上传
+  换装；Windows 不支持（运行中的 exe 无法原位替换）。
+- 本命令自 v0.3.21 起可用（旧版无此命令）；无 wire/NAPI/连接策略变更。
+
 ## v0.3.20（2026-10-23，出口质量历史）
 
 - 出口每5秒采集认证设备的QUIC路径、过境目标连接和转发背压，短连接结束留摘要、长连接按窗增量；有界异步通道与4×8MiB本机轮转，不记录正文、URL或凭证。
