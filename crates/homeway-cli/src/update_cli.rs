@@ -18,20 +18,15 @@
 //!
 //! HTTPS 面在 `homeway_core::minhttp`（同步 rustls 白名单件；本模块不碰 TLS）。
 
-// extract_homeway 跨平台（含 windows 的测试面）——Read 全平台引入；
-// 其余实现面 imports 收敛在 not(windows)。
+// update 面 windows 不支持（运行中的 exe 无法原位替换）——整个模块只在非 windows
+// 编译（main.rs 分派层收口，windows 臂给明确报错）；模块内零 cfg 碎片。
 use std::io::Read as _;
-#[cfg(not(windows))]
 use std::path::Path;
-#[cfg(not(windows))]
 use std::time::{Duration, Instant};
 
-#[cfg(not(windows))]
 use homeway_core::minhttp;
-#[cfg(not(windows))]
 use homeway_core::nodestate::probe_lock_holder;
 
-#[cfg(not(windows))]
 use crate::cli_flags;
 
 /// GitHub 仓库坐标（公开仓）。
@@ -53,44 +48,34 @@ pub fn cmd_update(args: &[String]) {
         std::process::exit(0);
     }
     // windows：运行中的 exe 被内核锁住，rename 盖写不可行（MoveFileEx 延迟替换是
-    // 另一套形态）——明确报不支持而非半途而废。
-    #[cfg(windows)]
-    {
-        let _ = args;
-        eprintln!("homeway: update 在 Windows 上不支持（运行中的 exe 无法原位替换）——请手动换装");
-        std::process::exit(2);
-    }
-    #[cfg(not(windows))]
-    {
-        let mut state = crate::unified_cli::default_state_dir();
-        let mut i = 0;
-        while i < args.len() {
-            let raw = args[i].as_str();
-            let Some((name, inline)) = cli_flags::split_flag(raw) else {
-                eprintln!("未知参数：{raw}");
-                std::process::exit(2);
-            };
-            let next = args.get(i + 1).map(String::as_str);
-            let mut adv = 1usize;
-            match name {
-                "state" => {
-                    state = cli_flags::take_state_or_exit("state", inline, next);
-                    if inline.is_none() {
-                        adv = 2;
-                    }
-                }
-                other => {
-                    eprintln!("未知参数：--{other}（update 只认 --state）");
-                    std::process::exit(2);
+    // 另一套形态）——分派层（main.rs）已给明确报错，本模块只在非 windows 编译。
+    let mut state = crate::unified_cli::default_state_dir();
+    let mut i = 0;
+    while i < args.len() {
+        let raw = args[i].as_str();
+        let Some((name, inline)) = cli_flags::split_flag(raw) else {
+            eprintln!("未知参数：{raw}");
+            std::process::exit(2);
+        };
+        let next = args.get(i + 1).map(String::as_str);
+        let mut adv = 1usize;
+        match name {
+            "state" => {
+                state = cli_flags::take_state_or_exit("state", inline, next);
+                if inline.is_none() {
+                    adv = 2;
                 }
             }
-            i += adv;
+            other => {
+                eprintln!("未知参数：--{other}（update 只认 --state）");
+                std::process::exit(2);
+            }
         }
-        run(&state);
+        i += adv;
     }
+    run(&state);
 }
 
-#[cfg(not(windows))]
 fn run(state: &Path) {
     let current = crate::cli_version();
 
@@ -278,7 +263,6 @@ fn run(state: &Path) {
 
 /// 守护重启：SIGTERM 旧 pid → 等「新 pid 持锁」（托管拉起）或「锁空 + 进程已退」
 /// （3s 宽限后自拉起）；最后等 control.sock 就绪作收工判据。
-#[cfg(not(windows))]
 fn restart_unified(state: &Path) {
     let (held, pid, form) = probe_lock_holder(state);
     if !held {
@@ -347,7 +331,6 @@ fn restart_unified(state: &Path) {
 }
 
 /// pid 是否已不存在（unix `kill(pid,0)` 的 ESRCH 语义；EPERM = 在但非我们进程）。
-#[cfg(not(windows))]
 fn process_gone(pid: i32) -> bool {
     if unsafe { libc::kill(pid, 0) } != 0 {
         matches!(std::io::Error::last_os_error().raw_os_error(), Some(libc::ESRCH))
@@ -390,7 +373,6 @@ fn hex_lower(bytes: &[u8]) -> String {
 }
 
 /// 暂存新二进制（同目录 = 与目标同文件系统，rename 原子性前提）+ 0755 + 落盘。
-#[cfg(not(windows))]
 fn write_staged(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
     use std::io::Write as _;
     use std::os::unix::fs::PermissionsExt as _;

@@ -31,6 +31,9 @@ mod quality_cli;
 mod term_cli;
 mod stopsig;
 mod unified_cli;
+// update 面 windows 不支持（运行中的 exe 无法原位替换）——模块整体只在非 windows
+// 编译；分派臂在 main 里给 windows 明确报错（不留静默缺命令面）。
+#[cfg(not(windows))]
 mod update_cli;
 
 /// 版本串（构建方注入：release 流水线 `HOMEWAY_CLI_VERSION=<tag>`——与核面
@@ -114,7 +117,13 @@ fn main() {
         Some("socks") => carriers_cli::cmd_socks(&args[2..]),
         Some("speedtest") => cmd_speedtest_dispatch(&args[2..]),
         Some("files") => cmd_files(&args[2..]),
+        #[cfg(not(windows))]
         Some("update") => update_cli::cmd_update(&args[2..]),
+        #[cfg(windows)]
+        Some("update") => {
+            eprintln!("homeway: update 在 Windows 上不支持（运行中的 exe 无法原位替换）——请手动换装");
+            std::process::exit(2);
+        }
         _ => {
             if let Some(c) = args.get(1) {
                 eprintln!("homeway：不认识的命令 {c:?}");
