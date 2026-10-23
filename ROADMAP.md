@@ -72,6 +72,21 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-10-23 v0.3.21 双出口部署完成（homeway update 自更新）**：用户明确「提交推送发版部署」，
+> 功能 `f7c47ed`、发版 `f150f95`、windows 两修 `2f4dabc`/`898943e`（tag 三打 v0.3.21 于
+> main 头；首两跑的 release/ci windows 面红——Read trait 收错 cfg 臂、dead_code，根治 =
+> update 模块整体 not(windows) 编译）。CI 39964973140 rerun 全绿（ubuntu relay_admission_e2e
+> 一次 flake 首红，本地 3 连绿 + rerun 绿，按 §13.18 同例登记），Release 39964993174 五目标
+> 成功。双件 SHA256SUMS 校验、版本/架构/哈希核验（mac `007abf0a…`、linux `65a4fe3a…`）。
+> 私有验收（官方产物 /tmp state：warmup 判据=quic/probe/transit + update「没有更新」真网
+> 实证）后滚动换装：Mac pid 73548→97917（手工原子换件 + kickstart——现役无 update 命令的
+> 引导边界，本次为最后一次手工换装；peers: 2 手机已重连、config/台账逐字节保全、生产 update
+> 实证没有更新）；阿里云 v0.3.19→v0.3.21 pid 1703776（scp 复核 + 退净换件 + 零参重启，
+> serve=true relay=true 双角色按期望态恢复、双端口监听、身份/台账/relay key 保全）。
+> 完整实录与回退 = `docs/DEPLOY-RUST-EXIT.md` §13.19；两道门 = `docs/reviews/2026-10-23-update.md`。
+> **此后两台的后续升级可 `homeway update` 自完成**（阿里云 GitHub 不可达仍走 scp 手册路径）。
+> tier pin 同步见 tier 仓；本轮无剩余部署操作。
+
 > **2026-10-23 `homeway update` 自更新批（源码与验证完成，未发布/未部署）**：按用户要求
 > 实现 `homeway update [--state D]`——查 GitHub 最新 tag（同 tag = 「已是最新——没有
 > 更新」）→ 下载本平台官方产物并按 SHA256SUMS 校验 → ustar 解包单文件 → `--version`

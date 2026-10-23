@@ -1196,3 +1196,43 @@ core HSP构建成功（2.780s）；未安装手机。阿里云未升级，保留
 证据为 `/tmp/homeway-v0.3.20-official/{verification,private-result,deployment-result}.json`、
 `{quality-e2e,private-native,production-native}.log` 与私有quality JSON；不得提交其中的凭证/state。
 两道门及部署脚本复核见 `docs/reviews/2026-10-22-quality-mac-deploy.md`。
+
+### 13.19 发版与换装 v0.3.21（2026-10-23 22:00–22:10，homeway update 自更新批）
+
+**发版**：功能 `f7c47ed`、发版 `f150f95`、两轮 windows 修复 `2f4dabc`/`898943e`（tag 纪律
+三打 v0.3.21，前两轮 tag 随修复删除重打）。首跑 release 的 windows build 红（Read trait
+收错 cfg 臂——E0599 单错）；二跑 release 绿但 ci 的 windows check 红（-D warnings 下
+update 面 dead_code）→ 根治为模块整体 `#[cfg(not(windows))]`（分派臂给 windows 明确报
+「不支持」）。第三跑 release 五目标 + ci 全绿（ubuntu `relay_admission_e2e` 一次 flake
+首红——本地 3 连绿 + CI rerun 绿，按 §13.18 同例登记复验通过、根因未确认；该面与本批
+零交集）。CI 39964973140（rerun 绿）、Release 39964993174。
+
+**产物核验**：darwin-arm64/linux-amd64 双件 SHA256SUMS `--check` OK；二进制
+`--version` = `homeway v0.3.21`；mac `007abf0a5464b77f…`、linux `65a4fe3a6848d9cd…`。
+
+**私有验收（官方 v0.3.21 产物，/tmp 独立 state）**：serve 就绪（quic 随机端口）、
+token reveal、connect `warmup pong: 就绪（判据=quic）`、probe ok、transit 出口行产出；
+`update` 真网实证「已是最新（v0.3.21）——没有更新」exit 0。
+
+**Mac 换装（22:05–22:06）**：快照（v0.3.20 `3067efbe…`、pid 73548、41641 监听、
+config/台账哈希、state tar 备份 0600）→ 手工 staged+rename 原子换件（现役无 update
+命令——引导边界，本次为最后一次手工换装）→ 单次 kickstart。验收：新 pid 97917、
+launchd running、41641 UDP 恢复、`统一进程就绪 … serve=true … version=v0.3.21`、
+config `af2e66b5…`/台账 `bade743e…` 哈希与换装前逐字节一致（159 行）、serve status
+running + **peers: 2**（手机已重连）；生产 `homeway update` 实证「没有更新」且守护
+不受扰（97917 不变）。
+
+**阿里云换装（22:06–22:08）**：归档 scp 上传后远端复核（sha 与本机一致、ELF、
+v0.3.21）→ 备份现役（/tmp/homeway-v0.3.19.prev + state tar 0600）→ kill 1697748 等
+退净 → 换件 → 零参 nohup 重启（HOME=/root、cwd /opt/homeway 同既有形态）。验收：
+新 pid 1703776、`统一进程就绪 … serve=true **relay=true** … version=v0.3.21`（config
+期望态双角色自动恢复——「模式恢复零额外状态」的换向实证）、41641（钉 eth0）+41741
+双监听、config/tokens/relay.key/key.bin 哈希不变。中继无在途连接（手机直连 Mac，中继
+为后备，正常态）。
+
+**回退**：Mac = /tmp/homeway-v0320.prev 放回 + kickstart；阿里云 =
+/tmp/homeway-v0.3.19.prev 放回 + 重启。此后新版本可 `homeway update` 自更新（备份自动
+落 `<state>/cache/homeway.prev`）。
+
+**遗留**：tier 侧 pin 同步与 App 核构建见 tier 仓记录；无手机 App 侧改动需求（无
+wire/NAPI 变更）。
