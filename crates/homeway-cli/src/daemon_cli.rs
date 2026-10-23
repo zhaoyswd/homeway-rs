@@ -301,7 +301,7 @@ fn decode_xml_text(raw: &str) -> Result<String, ()> {
 }
 
 /// 拉起子进程 stdio 落点（`<state>/cache/spawn.log`，追加 + 0600）。
-fn spawn_log_path(state_dir: &std::path::Path) -> std::path::PathBuf {
+pub(crate) fn spawn_log_path(state_dir: &std::path::Path) -> std::path::PathBuf {
     state_dir.join("cache/spawn.log")
 }
 
@@ -320,7 +320,11 @@ fn spawn_log_tail(state_dir: &std::path::Path) -> String {
 /// 不带走它）+ stdio → `<state>/cache/spawn.log`（子进程失败原因发生在启动早期，
 /// 接 /dev/null 会让「就绪超时」拿不到失败原因）。返回子进程 pid（不 wait——
 /// setsid 后由 init 收养）。
-fn start_spawned_process(state_dir: &std::path::Path) -> Result<u32, String> {
+///
+/// 消费面：按需拉起（dial_control_spawn）+ `update` 换装后的自拉起（无托管形态
+/// 主机——2026-10-23 批）。路径解析发生在调用时刻 ⇒ 调用前刚替换过的二进制路径
+/// 拉起的即新版本。
+pub(crate) fn start_spawned_process(state_dir: &std::path::Path) -> Result<u32, String> {
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let log = spawn_log_path(state_dir);
     if let Some(dir) = log.parent() {

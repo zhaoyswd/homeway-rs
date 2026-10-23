@@ -29,6 +29,9 @@ pub mod files;
 pub mod files_server;
 pub mod go_fmt;
 pub mod identity;
+/// 极小同步 HTTPS GET（`homeway update` 频道：GitHub API / Release 产物下载）。
+/// 与 `server::doh` 并行的另一条同步 TLS 腿（check-quic-isolation ① 白名单件）。
+pub mod minhttp;
 /// 宿主面域名解析（分档令牌池 + 有界解析 + `host:port` 切分）。
 ///
 /// M5 C3 迁址（设计 §1.1-D4 的保留面）：原 `wtransport::domain_eps` 的**与承载无关**

@@ -72,6 +72,22 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-10-23 `homeway update` 自更新批（源码与验证完成，未发布/未部署）**：按用户要求
+> 实现 `homeway update [--state D]`——查 GitHub 最新 tag（同 tag = 「已是最新——没有
+> 更新」）→ 下载本平台官方产物并按 SHA256SUMS 校验 → ustar 解包单文件 → `--version`
+> 烟囱 → 备份现役到 `<state>/cache/homeway.prev` → 同目录 rename 原子替换 → 重启统一
+> 进程（launchd 主机 KeepAlive 拉起；裸进程主机 3s 宽限后复用按需拉起件 setsid 自拉起；
+> 守护未跑只换文件）→ control.sock 就绪收工。模式恢复零额外状态（config 期望态即真源）。
+> 新增 core `minhttp`（同步 HTTPS GET：rustls+webpki-roots、重定向≤5 跳仅 https、
+> CL/chunked/EOF 三 framing、绝对截止）——隔离门 ① 同步 rustls 白名单扩为 doh+minhttp
+> 两件（含在盘/真消费自校准）；CLI 侧 flate2 解 tar.gz，零新外部 crate。验证：单测
+> 10+8 全绿；真网 API 冒烟过；/tmp 三场景端到端（完整替换+未跑守护、没有更新、守护在跑
+> 自拉起 pid 41966→42018）全过；ci-local quick 全档绿（含隔离门与 RRR 矩阵）。阿里云
+> 仍走本机下载校验后 scp（GitHub 不可达，fetch 即报错不绕纪律）。两道门 =
+> `docs/reviews/2026-10-23-update.md`；部署面注记 = `docs/DEPLOY-RUST-EXIT.md` 纪律第 6 条。
+> **引导边界：能力随下一版 Release 生效**（≤v0.3.20 无 update 命令）——下一步如需上线
+> 须走完整发版链（改版本/CHANGELOG → 推 main → tag），未推送、未部署、生产未动。
+
 > **2026-10-23 v0.3.20 本机部署完成**：用户明确「部署在这台电脑」，功能3ed7ff9、发版36bf2aa已推main/tag；CI39810271242八门通过（Ubuntu旧端口转发测试首红、诊断复验通过，根因未确认；双平台各1295/0、38 ignored），Release39810312104五目标与发布成功。官方darwin-arm64经SHA256SUMS/架构/签名核验，私有两设备真实过境质量、零参unified的1000次断连与17项PASS通过；备份后原子换件、单次kickstart，Mac pid73548，正式32次断连与17项PASS、身份/config/凭证保全、中继恢复及质量采集通过。首拍00:13:37 +08:00，验收时1台设备路径、0目标样本，不冒充真机L3流量验收。阿里云保留v0.3.19，未安装手机；tier pin=36bf2aa清洁核与core HSP已同步。两道门见 `docs/reviews/2026-10-22-quality-mac-deploy.md`，完整哈希/备份/边界见 `docs/DEPLOY-RUST-EXIT.md` §13.18；本轮无剩余部署操作。
 
 > **2026-10-22 出口质量历史（源码与验证完成，未部署）**：按用户要求完成认证设备QUIC路径、目标流与出口转发观测、有界异步历史、`serve quality` 时间段/设备文本和JSON报告。每5秒采样，4×8MiB轮转；未知TCP字段为null，缺测/边界/重启/轮转/慢盘收尾均明示，无wire/NAPI/连接策略变更。`ci-local.sh` quick全绿（23:28；全仓1294/0、38 ignored，SIGPIPE子进程同例去重；矩阵100MB SHA一致，既有E11 WARN和DNS SKIP在册），最终质量25/0、CLI4/0、workspace clippy与Linux musl/Windows/OHOS check通过，真实两设备同目标过境TCP字节对账1/0。两道门与独立复核 = `docs/reviews/2026-10-22-quality-*.md`；规格与核pin/清洁核HSP凭据 = tier `exit-quality-history` 规格及 `docs/reviews/exit-quality-history-2026-10-22.md`。两仓本地分别提交；未推送、未发布、未部署、未安装真机，旧出口无此历史，下一步如需上线须走正式Release链路。

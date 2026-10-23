@@ -27,9 +27,10 @@ flate2.workspace = true
 fnv.workspace = true
 regex.workspace = true
 # QUIC 的 quinn/tokio runtime 由岛自持，本 crate 不声明异步运行时。
-# r5：下方同步 DoH 的 rustls 例外由 check-quic-isolation 单文件门约束，不开放 async。
+# r5：下方同步 DoH 的 rustls 例外由 check-quic-isolation 的白名单门约束，不开放 async。
 homeway-quic = { path = "../homeway-quic" }
-# DoH 解析腿（server/doh.rs）：rustls TLS + Mozilla 根束（workspace 单源）
+# 同步 TLS 两条腿（白名单两文件）：DoH 解析腿（server/doh.rs）+ update 频道 HTTPS
+# GET（minhttp.rs，2026-10-23 批）——rustls TLS + Mozilla 根束（workspace 单源）
 rustls.workspace = true
 webpki-roots.workspace = true
 socket2.workspace = true

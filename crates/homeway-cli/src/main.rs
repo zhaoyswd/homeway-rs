@@ -31,6 +31,7 @@ mod quality_cli;
 mod term_cli;
 mod stopsig;
 mod unified_cli;
+mod update_cli;
 
 /// 版本串（构建方注入：release 流水线 `HOMEWAY_CLI_VERSION=<tag>`——与核面
 /// `HOMEWAY_CORE_VERSION`（facade::ClientCore::version）同机制；本地直构建回落
@@ -113,6 +114,7 @@ fn main() {
         Some("socks") => carriers_cli::cmd_socks(&args[2..]),
         Some("speedtest") => cmd_speedtest_dispatch(&args[2..]),
         Some("files") => cmd_files(&args[2..]),
+        Some("update") => update_cli::cmd_update(&args[2..]),
         _ => {
             if let Some(c) = args.get(1) {
                 eprintln!("homeway：不认识的命令 {c:?}");
@@ -128,6 +130,7 @@ fn main() {
             eprintln!("  files list|get|put|…             文件");
             eprintln!("  forward add|list|delete          端口转发  socks on|off|status              SOCKS5");
             eprintln!("  speedtest                        测速     export / import / reset cache    状态备份与清理");
+            eprintln!("  update                           自更新（GitHub Release 最新 tag；同 tag = 无更新）");
             eprintln!("  每个命令 --help 看细节；homeway --help 看总览。");
             std::process::exit(2);
         }

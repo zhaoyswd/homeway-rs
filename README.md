@@ -124,6 +124,11 @@ homeway socks on --listen 1080
 # 连接状态与测速
 homeway status
 homeway speedtest
+
+# 自更新（GitHub Release 最新 tag；同 tag = 提示没有更新）
+# 下载官方产物并按 SHA256SUMS 校验 → 烟囱 --version → 备份 → 原子替换 → 重启守护
+# （launchd 主机由 KeepAlive 拉起；裸进程主机自动 setsid 自拉起；守护没跑则只换文件）
+homeway update
 ```
 
 只有一台出口时命令可省略 `--host`；有多台时加 `--host <name>`。
