@@ -18,8 +18,8 @@
 //!
 //! HTTPS 面在 `homeway_core::minhttp`（同步 rustls 白名单件；本模块不碰 TLS）。
 
-// windows 臂只做 fail-fast——全部实现面（含 imports）收敛在 not(windows)。
-#[cfg(not(windows))]
+// extract_homeway 跨平台（含 windows 的测试面）——Read 全平台引入；
+// 其余实现面 imports 收敛在 not(windows)。
 use std::io::Read as _;
 #[cfg(not(windows))]
 use std::path::Path;
