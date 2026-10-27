@@ -469,6 +469,13 @@ def main():
                 first.wait("主机")
                 first.wait("会话")
                 first.wait("想在这台主机上做些什么？")
+                first.drain(0.1)
+                assert "[ X ]" not in first.screen_lines()[0], "initial empty view must hide X"
+                column = first.screen.columns - 3
+                first.send(f"\x1b[<0;{column};1M\x1b[<0;{column};1m")
+                first.drain(0.2)
+                assert sessions(binary, state) == [] and first.process.poll() is None
+                print("PASS: initial empty header hides X and its former position does not create/close a session")
                 snapshot(first, args.snapshot_dir, "empty-dark")
                 first.send(b"\x02n")
                 first.wait("已接入")
@@ -571,10 +578,13 @@ def main():
 
                 wait_until(second_shell_closed, "header X closes only current second shell")
                 wait_until(lambda: (second.drain() or "想在这台主机上做些什么？" in second.screen_text()), "closed selection clears to the current empty view")
-                wait_until(lambda: (second.drain() or second.screen.buffer[0][second.screen.columns-6].fg == "627083"), "empty close button becomes disabled")
+                assert "[ X ]" not in second.screen_lines()[0], "closed empty view must hide X"
+                second.send(f"\x1b[<0;{column};1M\x1b[<0;{column};1m")
+                second.drain(0.2)
+                assert [entry["name"] for entry in sessions(binary, state)] == [name], "former X position must not close the remaining shell"
                 snapshot(second, args.snapshot_dir, "terminal-close-empty-light", light=True)
                 assert second.process.poll() is None, "X exited the TUI"
-                print("PASS: real header X press/release closes only selected shell; original remains and empty X is disabled")
+                print("PASS: real X closes only selected shell; empty header hides X and old hit position preserves original")
                 second.send(b"\x02s\x1b[B\r")
                 def original_reattached():
                     second.drain()

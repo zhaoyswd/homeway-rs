@@ -1,5 +1,8 @@
 # TUI 终端标题栏关闭按钮（2026-10-28）
 
+> 首版空态显示灰色X；用户随后要求空态完全隐藏，已按文末追加调整实现。首版验证/
+> 部署事实保留，当前行为以追加调整为准。
+
 右侧终端标题栏增加 `[ X ]`，关闭当前展示的所选会话，不退出 TUI。仅修改 CLI 前端
 mod/view/backend模块与验收工具；core/wire/服务端不变，后台无需重启。
 
@@ -102,3 +105,56 @@ backend技术与UI代码增量双门均通过：逐字节核对相对4b6仅上�
 本轮仅原子更新前端文件，没有重启后台、访问state或终止生产会话；实际点击/关闭
 证明来自上述私有实例，不宣称生产交互验收。最后仅补报告，未再改源码/工具/脚本或
 重复测试。主会话负责ROADMAP及本地中文提交。
+
+## 用户追加：终端空态完全隐藏按钮
+
+无右侧展示目标时不画X、不保留标题专用空隙，也没有关闭热区；这与“有会话但暂时
+不可关闭”的灰显独立。Model仅增加一个显示派生字段，由App每次绘制前从
+`active_session.is_some()`取得；不拿connected/surface.ready判断是否展示。空态关闭
+Rect保持零尺寸，绘制/命中均无效，标题宽度从panel-8收回panel-2；即使残留旧payload
+也不能重新建立热区。有目标但创建/关闭在途或自身不可关仍保留灰显，原目标/epoch/
+单飞及后端关闭流程一字不改。仅mod/view与烟囱变化，无core/wire/后台改动。
+
+**backend技术、UI代码简短增量双门均通过，无阻塞。** 扩展已有按钮测试，覆盖暗/亮、
+40/100列下无X字符/空热区/旧坐标点击无动作、长标题回收空间，同时保留有目标灰显与
+原有效按钮测试；没有新增测试框架或测试数量。
+
+主会话实际分别执行：TUI专项**81通过、0失败、1 ignored，exit0**；debug build与CLI
+all-targets clippy `-D warnings`均**exit0**。新SHA256：
+`31b3a879b857635ca299116df86c3583eaefa37dc02f31023a2059b894b106e3`。
+
+原真实烟囱同步将empty灰色断言改为hidden：初始空态当前header无X，点击原按钮坐标
+后仍零会话/TUI活；有A/B时正常X关闭B，等待当前空态后无X，再点旧坐标A仍唯一存活，
+随后仍可重新接入A输入marker，另建C保留菜单回归。预览沿原工具生成，子任务未执行
+测试或连接生产state，实际命令由主会话执行：
+
+```sh
+python3 tools/tui-smoke.py --bin target/debug/homeway --snapshot-dir /tmp/homeway-tui-close-hidden-previews
+```
+
+主会话实际执行上述同SHA烟囱，**21项PASS、exit0**：初始空header隐藏及旧坐标无动作，
+关B后当前空态隐藏及旧坐标保A、A重新接入输入、C菜单及原ls/TTY恢复均通过，私有
+资源清理。实际预览在命令所列目录；与首版两轮20PASS分列，不合并累加计数。
+
+仅换前端安装器 `/tmp/tui-terminal-close-hidden-install.py`，SHA256
+`17d90ff0b4bbd807a3f651f378132d21aec5cde6c0b47579660b96eae104d1a9`，相对已审1bb版
+严格只有OLD_SHA→完整6d3a、backup前缀→terminal-close-hidden两处参数变更。backend与
+UI均只读核定最终SHA/diff/新工件哈希通过，原受限备份/锁/fsync/原子换退/PID一致与
+无state无重启门继承。
+
+精确命令由主会话在验收后执行：
+
+```sh
+/opt/homebrew/opt/python@3.13/bin/python3.13 /tmp/tui-terminal-close-hidden-install.py --expected-sha 31b3a879b857635ca299116df86c3583eaefa37dc02f31023a2059b894b106e3
+```
+
+主会话已唯一执行micro前端更新，**exit0、receipt SUCCESS**。子任务只读核验
+`~/homeway-rollback/tui-terminal-close-hidden-20261028-396876cec358/receipt.json`：old完整
+6d3a、新件/installed完整31b3，正式PATH与target/debug完整SHA一致；前后守护PID均为
+**55632**，frontend_only=true、service_restart_requested=false、rollback_performed=false。
+目录0700、旧件`old`0700、回执0600，旧件保留。主会话已查看实际empty-dark与
+terminal-close-empty-light均无X，ready-light仍有X，预览来自本次私有21PASS烟囱。
+
+本次micro完成证据为81/0（1 ignored）、build/clippy、同件21PASS及上述仅文件更新，
+不与首版累计计数。不重启后台、不访问state、不终止生产会话；已运行TUI退出重进
+即可使用空态隐藏行为。最后只补文档，未改源码/工具或重测。

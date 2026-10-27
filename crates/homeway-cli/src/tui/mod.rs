@@ -113,6 +113,7 @@ fn run(options: Options) -> Result<(), Error> {
             app.render_dirty = true;
         }
         if app.render_dirty {
+            app.model.terminal_present = app.active_session.is_some();
             app.model.terminal_close = app.terminal_close_target();
             if let Some(surface) = &mut app.surface {
                 surface.prepare(app.size.1);

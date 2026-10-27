@@ -157,6 +157,7 @@ pub(super) struct Model {
     pub notice: String,
     pub focus: Focus,
     pub terminal_title: String,
+    pub terminal_present: bool,
     pub terminal_close: Option<TerminalClose>,
     prefix: bool,
     hosts_offset: usize,
@@ -192,9 +193,13 @@ impl Model {
         self.mouse_reporting = false;
         self.history_behind = 0;
         self.terminal_close = None;
+        self.terminal_present = false;
     }
 
     fn close_target(&self) -> Option<&TerminalClose> {
+        if !self.terminal_present {
+            return None;
+        }
         let session = self
             .selected_session
             .and_then(|index| self.sessions.get(index))?;
@@ -383,7 +388,9 @@ pub(super) fn draw(
     geometry.terminal = inner(terminal_panel);
     geometry.host_add = Rect::new(host_panel.right() - 6, host_panel.y, 5, 1);
     geometry.session_add = Rect::new(session_panel.right() - 6, session_panel.y, 5, 1);
-    geometry.terminal_close = Rect::new(terminal_panel.right() - 6, terminal_panel.y, 5, 1);
+    if model.terminal_present {
+        geometry.terminal_close = Rect::new(terminal_panel.right() - 6, terminal_panel.y, 5, 1);
+    }
     panel(
         frame,
         host_panel,
@@ -410,7 +417,9 @@ pub(super) fn draw(
         Rect::new(
             terminal_panel.x + 1,
             terminal_panel.y,
-            terminal_panel.width.saturating_sub(8),
+            terminal_panel
+                .width
+                .saturating_sub(if model.terminal_present { 8 } else { 2 }),
             1,
         ),
         format!(
@@ -1756,6 +1765,7 @@ mod tests {
                     }],
                     selected_session: Some(0),
                     terminal_title: "中文title".repeat(40),
+                    terminal_present: true,
                     terminal_close: Some(target.clone()),
                     theme,
                     ..Default::default()
@@ -1837,6 +1847,27 @@ mod tests {
                         Action::None
                     ));
                 }
+                model.sessions[0].self_session = false;
+                model.terminal_present = false;
+                model.terminal_close = Some(target.clone()); // A stale payload cannot restore a hidden hitbox.
+                terminal
+                    .draw(|frame| geometry = draw(frame, &mut model, None))
+                    .unwrap();
+                assert!(geometry.terminal_close.is_empty());
+                assert!(!buffer_line(terminal.backend().buffer(), 0).contains("[ X ]"));
+                assert_ne!(
+                    terminal.backend().buffer()[(close.x - 1, close.y)].symbol(),
+                    "─",
+                    "empty view returns the reserved header space to the title"
+                );
+                assert!(matches!(
+                    handle_event(
+                        &mut model,
+                        mouse(close.x + 2, close.y, MouseButton::Left),
+                        &geometry
+                    ),
+                    Action::None
+                ));
             }
         }
     }
@@ -2017,6 +2048,7 @@ mod tests {
                 })
                 .collect(),
                 selected_session: Some(1),
+                terminal_present: true,
                 terminal_close: Some(TerminalClose {
                     name: "session-1".into(),
                     navigation_epoch: 0,
