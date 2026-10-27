@@ -422,21 +422,24 @@ pub(super) fn draw(
                 .saturating_sub(if model.terminal_present { 8 } else { 2 }),
             1,
         ),
-        format!(
-            " {} ",
-            if model.terminal_title.is_empty() {
-                "终端".to_owned()
-            } else {
-                clean(&model.terminal_title)
-            }
-        ),
-        Style::default()
-            .fg(if model.focus == Focus::Terminal {
-                p.accent
-            } else {
-                p.fg
-            })
-            .add_modifier(Modifier::BOLD),
+        Line::from(Span::styled(
+            format!(
+                " {} ",
+                if model.terminal_title.is_empty() {
+                    "终端".to_owned()
+                } else {
+                    clean(&model.terminal_title)
+                }
+            ),
+            Style::default()
+                .fg(if model.focus == Focus::Terminal {
+                    p.accent
+                } else {
+                    p.fg
+                })
+                .add_modifier(Modifier::BOLD),
+        )),
+        Style::default(),
     );
     text(
         frame,
@@ -1741,6 +1744,42 @@ mod tests {
             assert!(!line(0).contains("homeway") && !line(0).contains("主题"));
             assert!(line(height - 1).contains("READY"));
             assert!(line(height - 2).contains('┘'));
+            for theme in [Theme::Dark, Theme::Light] {
+                for focus in [Focus::Hosts, Focus::Terminal] {
+                    for present in [false, true] {
+                        model.theme = theme;
+                        model.focus = focus;
+                        model.terminal_present = present;
+                        terminal
+                            .draw(|frame| geometry = super::draw(frame, &mut model, None))
+                            .unwrap();
+                        let buffer = terminal.backend().buffer();
+                        let mut compared = 0;
+                        for x in geometry.terminal.x..geometry.terminal.right() {
+                            let top = &buffer[(x, geometry.terminal.y - 1)];
+                            if top.symbol() != "─" {
+                                continue;
+                            }
+                            let bottom = &buffer[(x, geometry.terminal.bottom())];
+                            assert_eq!(top.symbol(), bottom.symbol());
+                            assert_eq!(
+                                top.style(),
+                                bottom.style(),
+                                "{theme:?} {focus:?} present={present} x={x}"
+                            );
+                            assert!(!top.modifier.intersects(Modifier::BOLD | Modifier::DIM));
+                            compared += 1;
+                        }
+                        assert!(compared > 0, "must compare non-title border cells");
+                        assert!(
+                            buffer[(geometry.terminal.x + 1, 0)]
+                                .modifier
+                                .contains(Modifier::BOLD),
+                            "title itself remains bold"
+                        );
+                    }
+                }
+            }
         }
     }
 

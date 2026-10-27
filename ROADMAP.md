@@ -72,6 +72,16 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-10-28 TUI 终端上下边线一致（完成并更新）**：右侧标题的Paragraph容器样式把
+> BOLD及文字fg扩散到未覆盖的顶边线，导致比底边粗且非聚焦颜色不同。仅将右侧标题
+> fg/BOLD限定到Span文字，非标题边线保留Block原字符/完整Style，全局text helper、
+> 布局/关闭按钮/PTY不变。两道独立门通过，既有渲染回归扩至暗亮/聚焦与否/空与有/
+> 三宽度，TUI **81/0、1 ignored**、build/clippy通过，真实私有原烟囱 **21 PASS**。
+> 主会话已核empty-dark与shell-light截图，细节追加terminal-close review。PATH已更新
+> 为SHA256 `c373f951…bb5b8442`（与target/debug同件），回执SUCCESS，后台PID **55632**
+> 前后不变；备份 `~/homeway-rollback/tui-terminal-border-20261028-cd5a3e3001f7/`，旧31b3
+> 保留，未回滚/重启/访问正式state。重新进入TUI生效；未推送/发布，阿里云未动。
+
 > **2026-10-28 TUI 空态隐藏关闭按钮（完成并更新）**：用户要求空态不显示 `[ X ]`。
 > 将右侧真实会话presence与关闭eligibility分开：无展示会话时不绘制、不分配热区，标题
 > 回收完整宽度；有会话时原灰显/epoch/自身/单飞保护不变。仅mod/view及既有smoke断言

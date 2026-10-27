@@ -158,3 +158,50 @@ terminal-close-empty-light均无X，ready-light仍有X，预览来自本次私�
 本次micro完成证据为81/0（1 ignored）、build/clippy、同件21PASS及上述仅文件更新，
 不与首版累计计数。不重启后台、不访问state、不终止生产会话；已运行TUI退出重进
 即可使用空态隐藏行为。最后只补文档，未改源码/工具或重测。
+
+## 后续微调：终端上下边线统一
+
+用户指出右侧上边线比下边线粗。事实是手绘标题把fg与BOLD作为Paragraph容器style；
+ratatui Paragraph在整个标题矩形调用`buf.set_style`，不仅标题文字，上边线剩余的`─`
+也被加粗。inactive时它们还变成正文fg，较底边的border色更亮；上下原始线字符本来
+相同，未使用双线边框。
+
+最小修复仅将该终端标题调用的fg+BOLD放入文字Span，容器Style为default；其余上边线
+保留原Block边框style，标题本身仍加粗。全局text helper未改，布局/标题裁剪/X点击及
+关闭保护/PTY均不变。backend技术与UI代码增量双门均通过，无阻塞。
+
+扩展既有layout渲染用例：三种尺寸、暗/亮、active/inactive、空/有目标下，逐格比较
+非标题top `─`与同列bottom的symbol及完整Style（含fg/bg/modifier），确认无BOLD/DIM，
+并确认标题文字仍为BOLD。未新建框架或新增测试数量。
+
+主会话实际执行原三条独立命令：TUI专项**81通过、0失败、1 ignored，exit0**，debug
+build与CLI all-targets clippy `-D warnings`均**exit0**。新debug SHA256为
+`c373f951a4fd15dfb2c706b494263ea176b9bd9ffc9876f0948091dfbb5b8442`。
+原local烟囱工具不改，由主会话运行产图 `/tmp/homeway-tui-border-previews/`，结果在
+取得真实exit后补充；不重复测试或把启动命令当成通过。
+
+该同c373件unchanged local烟囱已实际**21项PASS、exit0**，终端输入/关闭、空态隐藏、
+原菜单、真实ls与TTY恢复/私有清理全部完成。主会话已查看同目录`empty-dark.png`与
+`shell-light.png`，核对暗空态/浅有会话上下边线及标题、布局、X状态正常；完整Style
+逐格一致的事实另由上述TestBackend回归证明，未修改烟囱工具或重复运行新用例。
+
+仅换前端安装器 `/tmp/tui-terminal-border-install.py` 复用已审17d90版，严格只改
+OLD_SHA→完整31b3、backup前缀→terminal-border两处参数，仍要求完整新SHA参数。
+原受限备份、目标锁、codesign/fsync/原子换退、PID一致及不访问state/不重启逻辑保留。
+执行器完整SHA256为
+`43933082053464ba560c5c54bc771fe37d022437bc731256cca2cf34b0af6504`，backend技术与
+UI代码均只读终签通过，逐字差异/AST/新工件c373完整hash已核对。
+
+```sh
+/opt/homebrew/opt/python@3.13/bin/python3.13 /tmp/tui-terminal-border-install.py --expected-sha c373f951a4fd15dfb2c706b494263ea176b9bd9ffc9876f0948091dfbb5b8442
+```
+
+主会话已唯一执行上述边线修复前端更新，**exit0、receipt SUCCESS**。子任务只读核验
+`~/homeway-rollback/tui-terminal-border-20261028-cd5a3e3001f7/receipt.json`：old为完整31b3，
+new/installed为上述完整c373，正式PATH与target/debug完整SHA一致；守护PID前后均
+**55632**，frontend_only=true、service_restart_requested=false、rollback_performed=false。
+回退目录0700、旧件`old`0700、receipt0600，旧件保留。
+
+本次仅更新前端文件，不重启后台、不读写state或终止生产会话。81/0、build/clippy与
+同件21PASS分列保留，不与此前微调累计；用户重新进入TUI使用统一边线。最后仅补报告，
+未改源码/工具、重测或再次执行生产操作，主会话负责ROADMAP和本地提交。
