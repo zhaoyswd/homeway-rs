@@ -222,6 +222,7 @@ def main():
     instance, exit_state = claim_exit()
     exit_env = os.environ.copy()
     exit_env["HOMEWAY_BIN"] = str(binary)
+    exit_env.pop("HOMEWAY_TERM_SHELL", None)
     daemon = tui = None
     client_workspace = None
     try:
@@ -274,6 +275,33 @@ def main():
                     assert len(remote_sessions) == 1
                     session_name = remote_sessions[0]["name"]
                     print("PASS: TUI add-host dialog, select remote host, create shell and execute marker")
+
+                    # Observe a default remote shell without installing a prompt
+                    # hook or typing OSC7. The server owns its process cwd; the
+                    # TUI must receive that value through the remote LIST path.
+                    report = directory / "remote-shell-pwd"
+
+                    def remote_cwd(command=""):
+                        report.unlink(missing_ok=True)
+                        tui.send(command + f"printf '%s' \"$PWD\" > {shlex.quote(str(report))}\r")
+                        def listed():
+                            tui.drain()
+                            if not report.exists() or not report.stat().st_size:
+                                return None
+                            actual = report.read_text()
+                            entry = next(entry for entry in sessions(binary, exit_state) if entry["name"] == session_name)
+                            return actual if entry.get("cwd") == str(Path(actual).resolve()) else None
+                        actual = wait_until(listed, "remote default shell cwd in authoritative LIST", 12)
+                        project = Path(actual).name or "/"
+                        wait_until(lambda: (tui.drain() or any(project in line[:helpers["sidebar_width"](tui.screen.columns)]
+                                                               for line in tui.screen_lines())), "remote real cwd basename in sidebar", 12)
+                        return actual
+
+                    remote_cwd()
+                    project = directory / "remote cwd"
+                    project.mkdir()
+                    assert remote_cwd("cd " + shlex.quote(str(project)) + "; ") == str(project)
+                    print("PASS: remote default-shell initial cwd and cd reach LIST/TUI without injected OSC7; basename spaces preserved")
 
                     tui.send(b"\x02h\x02m")
                     screen_wait(tui, "启动代理")

@@ -72,6 +72,24 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-10-28 TUI 主机留白与目录补齐（验证/备份完成、待部署）**：用户澄清额外两行为列表内容留白，
+> 边框另算；未触半屏上限时总高 `主机数*2+4`，1台6行/2台8行。会话次行严格为状态、
+> 类型、当前目录名，字段间一个空格，目录无法取得时明确“—”。原LIST仅取OSC7目录，
+> 普通默认shell无上报即空；本轮按最小服务端OS cwd采样+现有LIST字段补齐，锁外读取/
+> generation缓存，OSC7优先，不向PTY注入pwd；检测关闭/raw-only同样可用，LIST只读缓存。
+> wire字段/版本不变，来源变化已登记判据。技术/代码双门通过，核心cwd **2/0**、TUI
+> **76/0、1 ignored**、term全量 **219/0**，build及core/cli all-targets clippy通过。
+> 同fbc件真实普通/检测关闭/raw-only各 **4 PASS**、本地 **18 PASS**、远端 **8 PASS**；
+> Linux/Windows按仓内配方check-only通过（非链接/运行）。旧659f无OSC7缺cwd的红证据、
+> detect-off长名超宽裁切断言红及可容纳名绿色重验均保留，不抹去失败轮。主会话已核真实
+> 默认shell/cd截图与额外两行空白。完整证据见 `docs/reviews/2026-10-28-tui-host-padding-cwd.md`。
+> 部署前已先交付恢复命令；00:54 prepare成功，固定回执
+> `~/homeway-rollback/tui-host-padding-cwd-20261028-r1/receipt.json` 为 `PREPARED`，
+> activation_started=false；binary/plist/state与私人恢复资料备份，目录0700、敏感工件0600，
+> binary0700。持久执行器SHA `ac96917d…ccd50cfd` 与双门签核副本相同，现役仍659f/PID26227，
+> 候选新件 `fbc2419f…b0a4a025`。提交checkpoint后仅一次bootstrap同目录once.plist，独立
+> worker换件+重启/验收，失败自动退旧binary并保留当前state；恢复后先查回执，不重复激活。
+
 > **2026-10-28 TUI 左侧布局与条目调整（完成）**：主机/会话标题去计数，本地改“我的电脑”；
 > 左宽改30%且clamp18..34，主机面板含边框严格为 `min((主机数+1)*2, 可用高度/2)`，
 > 主机数含本地，剩余高度给会话。两行条目紧排，dot与标题首字同列，绘制/滚动/鼠标命中

@@ -347,6 +347,8 @@ pub(super) fn draw(
         .len()
         .saturating_add(1)
         .saturating_mul(usize::from(ITEM_HEIGHT))
+        // One additional two-line item is blank content; the frame is separate.
+        .saturating_add(2)
         .min(usize::from(body.height / 2)) as u16;
     let split = host_height.saturating_sub(1);
     let host_panel = Rect::new(body.x, body.y, sidebar, host_height);
@@ -548,14 +550,17 @@ pub(super) fn draw(
             }),
         );
         if row.height > 1 {
+            let agent = clean(&session.agent);
+            let project = clean(&session.project);
+            let detail = format!(
+                "{label} {} {}",
+                if agent.is_empty() { "unknown" } else { &agent },
+                if project.is_empty() { "—" } else { &project }
+            );
             text(
                 frame,
                 Rect::new(row.x + 1, y + 1, row.width.saturating_sub(1), 1),
-                format!(
-                    "  {label}  {}  {}",
-                    clean(&session.agent),
-                    clean(&session.project)
-                ),
+                format!("  {detail}"),
                 Style::default().fg(color).bg(bg),
             );
         }
@@ -1674,7 +1679,7 @@ mod tests {
 
     #[test]
     fn sidebar_fits_host_rows_and_aligns_dots_with_panel_titles() {
-        for (count, height) in [(1, 4), (2, 6), (20, 14)] {
+        for (count, height) in [(1, 6), (2, 8), (20, 14)] {
             let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
             let mut model = Model {
                 hosts: std::iter::once(host("我的电脑", HostState::Local))
@@ -1700,6 +1705,21 @@ mod tests {
             assert!(!first.contains("【本地】"));
             if count == 2 {
                 assert!(buffer_line(buffer, 3).contains("【直连】remote"));
+            }
+            if count <= 2 {
+                for y in count * 2 + 1..count * 2 + 3 {
+                    for x in geometry.hosts.x..geometry.hosts.right() {
+                        assert_eq!(buffer[(x, y)].symbol(), " ");
+                    }
+                }
+                assert!(matches!(
+                    handle_event(
+                        &mut model,
+                        mouse(2, height - 2, MouseButton::Left),
+                        &geometry
+                    ),
+                    Action::None
+                ));
             }
         }
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
@@ -1750,7 +1770,8 @@ mod tests {
                 assert!(first.contains("● [my title]"));
                 assert!(!first.contains(label) && !first.contains('【'));
                 let detail = buffer_line(buffer, geometry.sessions.y + 1);
-                assert!(detail.contains(&format!("{label}  codex  project")));
+                assert!(detail.contains(&format!("{label} codex project")));
+                assert!(!detail.contains(&format!("{label}  codex")));
                 let dot = &buffer[(2, geometry.sessions.y)];
                 assert_eq!(dot.symbol(), "●");
                 for x in geometry.sessions.x..geometry.sessions.right() {
@@ -1759,6 +1780,36 @@ mod tests {
                     assert_eq!(cell.bg, theme.palette().selected);
                 }
             }
+        }
+    }
+
+    #[test]
+    fn session_detail_keeps_three_fields_and_legal_directory_spaces() {
+        let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        let mut model = Model {
+            hosts: vec![host("我的电脑", HostState::Local)],
+            sessions: vec![SessionItem {
+                name: "session".into(),
+                title: "terminal".into(),
+                agent: "codex".into(),
+                project: String::new(),
+                state: SessionState::Idle,
+                self_session: false,
+            }],
+            ..Default::default()
+        };
+        for (project, expected) in [
+            ("", "idle codex —"),
+            ("my project", "idle codex my project"),
+        ] {
+            model.sessions[0].project = project.into();
+            let mut geometry = Geometry::default();
+            terminal
+                .draw(|frame| geometry = draw(frame, &mut model, None))
+                .unwrap();
+            let line = buffer_line(terminal.backend().buffer(), geometry.sessions.y + 1);
+            assert!(line.contains(expected));
+            assert!(!line.contains("idle  codex") && !line.contains("codex  "));
         }
     }
 

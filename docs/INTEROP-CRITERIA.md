@@ -598,6 +598,13 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 
 ## 判据变更记录（政策 + 登记表）
 
+### 2026-10-28：默认 shell 的真实工作目录
+
+- LIST 可选 `cwd` 从「仅有服务端 VT 且收到有效 OSC 7 才返回」改为「有效 OSC 7 优先，否则使用当前会话 PTY shell PID 最近成功采样的真实 OS 工作目录」。覆盖初始默认 shell 以及普通 `cd`，不要求用户安装 shell hook；raw-only 无 VT 会话也能返回该真实目录。没有保存过的 launch cwd hint，不把服务进程的目录、标题、命令行或固定 HOME 猜成当前目录。
+- macOS 使用已有 libc 的 `proc_pidinfo(PROC_PIDVNODEPATHINFO)` 中 `pvi_cdir.vip_path`，验证完整结构长度与有界 NUL；Linux 使用 `/proc/<pid>/cwd`。保留 OS 返回的物理路径（含合法非 UTF-8 路径的展示转换），不注入 OSC 7、不发 `pwd` 命令、不新增依赖。其它平台原生查询不可用时保留原 OSC 7 路径。
+- 复用既有 `SAMPLE_PERIOD=1s` 线程，先取 `(name, session generation, PTY PID)` 快照、锁外查询 OS，再在锁内核验同名同代同 PID 且存活后更新缓存。元数据采样不受 `HOMEWAY_TERM_DETECT` 开关影响；agent 检测仍遵守该开关，状态检测冻结不冻结目录元数据。LIST 只读缓存，不做 OS I/O；查询失败保留本代上次成功的真实目录，不把缺测伪装成新目录。初始目录在首个成功采样后出现，再由客户端原有刷新读取。
+- 影响面为已有 LIST `cwd` 值及展示：raw-only 的旧恒空行为在本条明确变更；可选字段名/类型、JSON 声明顺序、帧封装与版本、surface/agent 枚举和网络准入不变，固定 wire 夹具无新字节。真实默认 shell 的初始目录/带空格 `cd`、检测关闭、raw-only 与 OSC 7 优先验证使用私有实例；本条是源码判据，不授权重启现役服务。
+
 ### 2026-10-27 TUI 权威 surface 与观察接入
 
 - **显式可协商扩展**：GREETING features 新增 `OBSERVER=1<<7`（全开位集从 `0x7f`→`0xff`），HELLO flags 新增 `OBSERVER=1<<3`，仅允许 SURFACE 且不得同时 TAKEOVER。协议版本、帧格式、已有能力位不变。旧 Rust 与 App 只按所需位掩码判断，忽略新 feature；新 TUI 遇缺能力的旧出口明确要求升级，在发送 HELLO 前退出，禁止 raw 降级造成隐式抢占。同步 greeting golden、MANIFEST/SHA256SUMS 与派生 fuzz 种子摘要。

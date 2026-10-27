@@ -1161,7 +1161,8 @@ fn session_item(session: backend::Session) -> view::SessionItem {
     let project = session
         .cwd
         .as_deref()
-        .and_then(|cwd| Path::new(cwd).file_name())
+        .map(Path::new)
+        .map(|cwd| cwd.file_name().unwrap_or(cwd.as_os_str()))
         .map(|name| name.to_string_lossy().into_owned())
         .unwrap_or_default();
     view::SessionItem {
@@ -1741,6 +1742,13 @@ mod tests {
         let item = session_item(session);
         assert_eq!(item.agent, "pi");
         assert_eq!(item.project, "project");
+        for (cwd, project) in [("/", "/"), ("/tmp/my project", "my project")] {
+            let item = session_item(backend::Session {
+                cwd: Some(cwd.into()),
+                ..Default::default()
+            });
+            assert_eq!(item.project, project);
+        }
     }
 
     #[test]

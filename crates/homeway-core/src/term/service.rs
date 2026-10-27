@@ -698,6 +698,8 @@ struct SessRt {
     agent: u8,
     /// 本拍前台manifest身份原文；兼容LIST标签，固定wire枚举不变。
     agent_label: String,
+    /// Latest successful native cwd probe of this generation's PTY shell PID.
+    observed_cwd: Option<std::path::PathBuf>,
     state_v2: u8,
     hygiene: agent::Hygiene,
     prev_cpu: Option<i64>,
@@ -2002,6 +2004,7 @@ impl TermService {
             writers: 0,
             agent: frames::agent::UNKNOWN,
             agent_label: String::new(),
+            observed_cwd: None,
             state_v2: frames::state_v2::UNKNOWN,
             hygiene: agent::Hygiene::default(),
             prev_cpu: None,
@@ -3355,12 +3358,7 @@ impl TermService {
                     active: reg.active == Some(l.key),
                 })
                 .collect();
-            // raw-only 会话（无服务端 vt）恒无 cwd——Go cwdLocked 同款（评审 L9）
-            let cwd = rt
-                .vt
-                .is_some()
-                .then(|| rt.scan.pwd_path())
-                .filter(|c| !c.is_empty());
+            let cwd = session_cwd(rt);
             out.push(SessionEntryJson {
                 name: rt.name.clone(),
                 created_ms: rt.created_ms as i64,
@@ -3505,9 +3503,6 @@ impl TermService {
             if self.stop.load(Ordering::Relaxed) {
                 return;
             }
-            if !self.cfg.detect {
-                continue;
-            }
             // F7（代码门 A2）：一拍**整体**兜底——`read_procs`（/proc 或 ps）与会话名快照
             // 记账 panic 不得让**服务级**检测线程停摆（按会话的 catch 只保「单会话不停摆」，
             // 设计 §2 F7 给 sample 的理由正是「不能全线停摆」——整拍门在此补齐）
@@ -3519,18 +3514,29 @@ impl TermService {
     fn sample_tick(&self) {
         #[cfg(test)]
         maybe_inject_panic(ThreadRole::Sample, &self.tick_inject_key());
-        let procs = agent::read_procs();
-        // 快照（名字, 代）：同名重建的瞬间不用旧 procs 刷新会话（评审 P8——
-        // Go sampleOnce 持的是会话指针快照）
-        let named: Vec<(String, u64)> = {
+        // 快照（名字, 代, PTY PID）：所有锁外采样回写前都必须重新核验会话身份。
+        let named: Vec<(String, u64, i32)> = {
             let st = self.lock_state();
             st.registry
                 .session_names()
                 .into_iter()
-                .filter_map(|n| st.sessions.get(n).map(|rt| (n.to_string(), rt.gen)))
+                .filter_map(|n| st.sessions.get(n).filter(|rt| !rt.stopped.load(Ordering::Relaxed))
+                    .map(|rt| (n.to_string(), rt.gen, rt.pty.pid())))
                 .collect()
         };
-        for (name, gen) in named {
+        // Native metadata calls never run under the service lock or in LIST.
+        // Keep cwd sampling independent from the optional agent detector.
+        for (name, gen, pid) in &named {
+            let ctx = format!("会话 {name} cwd ");
+            let _ = guard_thread(ThreadRole::Sample, &ctx, &self.logf, || {
+                if let Ok(cwd) = super::cwd::process_cwd(*pid) {
+                    self.store_cwd(name, *gen, *pid, cwd);
+                }
+            });
+        }
+        if !self.cfg.detect || named.is_empty() { return; }
+        let procs = agent::read_procs();
+        for (name, gen, _) in named {
             // F7：采样是服务级线程——按会话 catch，单会话 panic 只跳本拍
             let ctx = format!("会话 {name} ");
             if let Some(action) =
@@ -3538,6 +3544,15 @@ impl TermService {
             {
                 debug_assert_eq!(action, PanicAction::SkipSession);
             }
+        }
+    }
+
+    fn store_cwd(&self, name: &str, gen: u64, pid: i32, cwd: std::path::PathBuf) {
+        let mut st = self.lock_state();
+        if st.registry.session(name).is_none_or(|session| session.done) { return; }
+        if let Some(rt) = rt_of_mut(&mut st, name, gen)
+            .filter(|rt| rt.pty.pid() == pid && !rt.stopped.load(Ordering::Relaxed)) {
+            rt.observed_cwd = Some(cwd);
         }
     }
 
@@ -3636,6 +3651,12 @@ impl TermService {
 // ---------------------------------------------------------------------------
 // 锁内助手（自由函数——避开 &self 与 &mut State 的借用交叠）
 // ---------------------------------------------------------------------------
+
+fn session_cwd(rt: &SessRt) -> Option<String> {
+    let reported = rt.scan.pwd_path();
+    if !reported.is_empty() { return Some(reported); }
+    rt.observed_cwd.as_ref().map(|path| path.to_string_lossy().into_owned())
+}
 
 /// STATE 帧投递到所有腿（latest-wins；状态单轨化——surface 与 raw 腿同一枚举）。
 fn push_state_to_legs(rt: &SessRt) {
@@ -4136,7 +4157,7 @@ mod list_json_shape {
         #[serde(rename = "stateV2")]
         pub state_v2: &'static str,
         pub title: String,
-        /// OSC 7 上报的工作目录（缺省不显示）。
+        /// OSC 7 优先，否则为本会话 shell PID 最近成功采样的真实工作目录。
         #[serde(skip_serializing_if = "Option::is_none")]
         pub cwd: Option<String>,
         pub cols: u16,
@@ -4275,6 +4296,54 @@ fn run_explain(
 mod tests {
     use super::*;
     use crate::term::wire::ReadFail;
+
+    #[cfg(any(target_os = "macos", target_os = "linux"))]
+    #[test]
+    fn cwd_sampling_works_without_detection_or_vt_and_preserves_osc7_priority() {
+        let service = svc_with(TermConfig { detect: false,
+            shell: Some("printf CWD_SAMPLE_READY; cat".into()), ..Default::default() }, Arc::new(Mutex::new(Vec::new())));
+        struct CloseOnDrop(Arc<TermService>);
+        impl Drop for CloseOnDrop { fn drop(&mut self) { self.0.close(); } }
+        let _close = CloseOnDrop(Arc::clone(&service));
+        let name = tmp_name("cwd-sample");
+        service.create_only(&name, false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = service.lock_state();
+            let rt = &state.sessions[&name];
+            if has_bytes(&rt.ring.read(rt.ring.start(), rt.ring.written() as usize), b"CWD_SAMPLE_READY") { break; }
+            drop(state);
+            assert!(Instant::now() < deadline, "private PTY shell did not become ready");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (gen, pid) = {
+            let mut state = service.lock_state();
+            let rt = state.sessions.get_mut(&name).unwrap();
+            rt.vt = None; // raw-only fixture, without changing process-global env.
+            rt.scan = TermScan::new();
+            rt.observed_cwd = None;
+            (rt.gen, rt.pty.pid())
+        };
+        service.sample_tick();
+        let expected = super::super::cwd::process_cwd(pid).unwrap();
+        let expected_text = expected.to_string_lossy();
+        let list: serde_json::Value = serde_json::from_str(&service.list_json()).unwrap();
+        assert_eq!(list["sessions"][0]["cwd"].as_str(), Some(expected_text.as_ref()));
+        assert_eq!(service.lock_state().sessions[&name].agent, frames::agent::UNKNOWN,
+            "disabling agent detection must not disable native cwd metadata");
+        service.store_cwd(&name, gen.wrapping_add(1), pid, "/wrong-generation".into());
+        service.store_cwd(&name, gen, pid.wrapping_add(1), "/wrong-process".into());
+        assert_eq!(service.lock_state().sessions[&name].observed_cwd.as_ref(), Some(&expected));
+        {
+            let mut state = service.lock_state();
+            state.sessions.get_mut(&name).unwrap().scan.write(b"\x1b]7;file://localhost/reported%20project\x07");
+        }
+        let list: serde_json::Value = serde_json::from_str(&service.list_json()).unwrap();
+        assert_eq!(list["sessions"][0]["cwd"], "/reported project", "valid OSC7 remains authoritative");
+        service.lock_state().sessions.get_mut(&name).unwrap().scan.write(b"\x1b]7;not-a-file-url\x07");
+        let list: serde_json::Value = serde_json::from_str(&service.list_json()).unwrap();
+        assert_eq!(list["sessions"][0]["cwd"].as_str(), Some(expected_text.as_ref()));
+    }
 
     #[test]
     fn observer_requires_surface_without_explicit_takeover_before_create() {

@@ -499,10 +499,10 @@ def main():
                 first.wait("HW_SIZE:27 69")
                 snapshot(first, args.snapshot_dir, "shell-dark")
                 print("PASS: create shell, execute command, viewport matches PTY 69x27")
-                # One local host has a four-line panel. Click each item's
-                # second line: local y=2, first session y=5 (SGR is 1-based).
+                # One local host has a six-line panel, including two blank
+                # content lines. Click second lines: local y=2, session y=7.
                 mouse_name = sessions(binary, state)[0]["name"]
-                first.send(b"\x1b[<0;5;3M\x1b[<0;5;3m\x1b[<0;5;6M\x1b[<0;5;6m")
+                first.send(b"\x1b[<0;5;3M\x1b[<0;5;3m\x1b[<0;5;8M\x1b[<0;5;8m")
                 first.send("printf 'HW_SIDEBAR_%s\\n' MOUSE\r")
                 first.wait("HW_SIDEBAR_MOUSE")
                 assert any(entry["name"] == mouse_name and entry.get("attached")
