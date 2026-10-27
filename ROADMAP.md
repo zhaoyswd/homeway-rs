@@ -72,6 +72,23 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-10-28 当前 debug 部署LAN71（备份完成、待切换）**：用户明确要求也部署到
+> `192.168.3.71`，本次该IP的debug指令覆盖正式Release产物纪律，不推送/发版、不动
+> 本机现役或阿里云。只读SSH确认MacBook-Pro-2/Darwin arm64/macOS26.6.2、UID501，
+> `/usr/local/bin/homeway`旧官方.21 SHA `007abf0a…c0ff3813`，裸按需守护PID53015，
+> serve/relay均false、无永久launchd；旧argv显式默认--state，新件规范为零参同state。
+> 同源已测c373件直接上传，无重构建；远端SHA/Mach-O/签名/--version(devel)/help含tui
+> 均核验。Python3.9最小适配执行器及裸守护/信号交接已通过技术和代码门，完整SHA
+> `aaf632a8…f956bb99`。远端prepare exit0，回执PREPARED/未激活；目录0700，binary0700，
+> state/plist/manifest/receipt等0600，旧/新备份完整SHA及目录gid0权限probe已核验。
+> 固定回执 **71上的** `~/homeway-rollback/debug-tui-lan71-20261028-r1/receipt.json`，
+> 日志worker.log、RECOVERY/RESUME仅含远端运维恢复；不把本地Codex会话复制到71。
+> 提交checkpoint后仅一次bootstrap同目录once.plist，独立worker原子换件、停止旧裸进程，
+> start_new_session零参拉起并验收同state/客户端四关键文件/禁用角色/控制面/new term；
+> 无永久keeper。成功后须从另一SSH核worker退出且新守护PPID1；失败按旧客户端能力
+> 回退，保留当前state。恢复后先查回执，勿重复激活。双门与事实见
+> `docs/reviews/2026-10-28-tui-debug-lan71-deploy.md`。
+
 > **2026-10-28 TUI 终端上下边线一致（完成并更新）**：右侧标题的Paragraph容器样式把
 > BOLD及文字fg扩散到未覆盖的顶边线，导致比底边粗且非聚焦颜色不同。仅将右侧标题
 > fg/BOLD限定到Span文字，非标题边线保留Block原字符/完整Style，全局text helper、
