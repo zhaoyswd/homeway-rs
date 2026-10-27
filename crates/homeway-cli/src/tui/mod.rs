@@ -1088,13 +1088,18 @@ impl App {
                             }
                         }
                     }
-                } else {
-                    self.model.notice = "正在浏览历史；Shift+End 返回实时画面".into();
                 }
             }
             Action::Scroll(action) => {
-                if let Some(surface) = &mut self.surface {
-                    surface.scroll(action, self.size.1);
+                if self
+                    .selected_name()
+                    .is_some_and(|name| self.active_session.as_ref() == Some(&name))
+                {
+                    if let Some(surface) = &mut self.surface {
+                        if surface.ready {
+                            surface.scroll(action, self.size.1);
+                        }
+                    }
                 }
                 self.render_dirty = true;
             }
@@ -1166,6 +1171,173 @@ fn session_item(session: backend::Session) -> view::SessionItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn screen(
+        app: &mut App,
+        terminal: &mut Terminal<ratatui::backend::TestBackend>,
+    ) -> (view::Geometry, String) {
+        if let Some(surface) = &mut app.surface {
+            surface.prepare(app.size.1);
+        }
+        let mut geometry = view::Geometry::default();
+        terminal
+            .draw(|frame| {
+                geometry = view::draw(
+                    frame,
+                    &mut app.model,
+                    app.surface.as_ref().map(surface::Surface::view),
+                )
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        let footer = (0..buffer.area.width)
+            .map(|x| buffer[(x, buffer.area.height - 1)].symbol())
+            .collect();
+        (geometry, footer)
+    }
+
+    fn history_app() -> App {
+        let mut vt = homeway_core::term::vt::SessionVt::new(66, 27, 100).unwrap();
+        for line in 0..80 {
+            vt.write(format!("LINE_{line:03}\r\n").as_bytes());
+        }
+        let mirror = vt.mirror_rows(100);
+        let mut surface = surface::Surface::default();
+        surface
+            .snapshot(codec::SnapshotBody {
+                cols: 66,
+                rows: 27,
+                seq: 1,
+                revision: 1,
+                cursor: codec::surface_cursor_of(&vt.cursor()),
+                scroll: vt.scrollbar().into(),
+                history_epoch: vt.history_epoch(),
+                history_base: vt.history_base(),
+                grid: codec::encode_grid(66, 27, &vt.rows()),
+                mirror: codec::encode_grid(66, mirror.len() as u16, &mirror),
+                ..Default::default()
+            })
+            .unwrap();
+        let mut app = app();
+        app.surface = Some(surface);
+        app.size = (66, 27);
+        app.active_session = Some("history".into());
+        app.model.sessions.push(view::SessionItem {
+            name: "history".into(),
+            title: "history".into(),
+            agent: "shell".into(),
+            project: String::new(),
+            state: view::SessionState::Idle,
+            self_session: false,
+        });
+        app.model.selected_session = Some(0);
+        app.model.focus = view::Focus::Terminal;
+        app.model.notice = "已接入".into();
+        app
+    }
+
+    #[test]
+    fn empty_terminal_mouse_and_history_keys_preserve_notice_and_empty_footer() {
+        use crossterm::event::{
+            KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+        };
+        let mut app = app();
+        app.model.notice = "暂无会话，请创建 shell".into();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        let (geometry, _) = screen(&mut app, &mut terminal);
+        for kind in [
+            MouseEventKind::Moved,
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+        ] {
+            let action = view::handle_event(
+                &mut app.model,
+                Event::Mouse(MouseEvent {
+                    kind,
+                    column: geometry.terminal.x + 2,
+                    row: geometry.terminal.y + 2,
+                    modifiers: KeyModifiers::NONE,
+                }),
+                &geometry,
+            );
+            app.action(action).unwrap();
+        }
+        // Even a queued historical shortcut from a formerly focused pane is harmless.
+        app.model.focus = view::Focus::Terminal;
+        for key in [
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+            KeyCode::Home,
+            KeyCode::End,
+        ] {
+            let action = view::handle_event(
+                &mut app.model,
+                Event::Key(KeyEvent::new(key, KeyModifiers::SHIFT)),
+                &geometry,
+            );
+            app.action(action).unwrap();
+        }
+        let (_, footer) = screen(&mut app, &mut terminal);
+        assert_eq!(app.model.notice, "暂无会话，请创建 shell");
+        assert!(!footer.contains('↑') && !footer.contains("⇧End"));
+        assert!(app.surface.is_none() && app.active_session.is_none());
+    }
+
+    #[test]
+    fn real_history_footer_returns_to_live_and_disappears_when_sessions_are_cleared() {
+        let mut app = history_app();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        assert!(!screen(&mut app, &mut terminal).1.contains('↑'));
+        app.action(Action::Scroll(view::HistoryAction::Start))
+            .unwrap();
+        assert!(screen(&mut app, &mut terminal).1.contains('↑'));
+        app.action(Action::TerminalMouse(crossterm::event::MouseEvent {
+            kind: crossterm::event::MouseEventKind::Moved,
+            column: 2,
+            row: 2,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }))
+        .unwrap();
+        assert_eq!(
+            app.model.notice, "已接入",
+            "history guidance is derived, not a persistent error notice"
+        );
+        app.action(Action::Scroll(view::HistoryAction::End))
+            .unwrap();
+        let footer = screen(&mut app, &mut terminal).1;
+        assert!(!footer.contains('↑') && !footer.contains("⇧End"));
+        app.action(Action::Scroll(view::HistoryAction::Start))
+            .unwrap();
+        assert!(screen(&mut app, &mut terminal).1.contains('↑'));
+        app.backend_event(backend::Event::Sessions {
+            target: Target::Local,
+            epoch: app.sessions_epoch,
+            result: Ok(vec![]),
+        });
+        assert!(app.surface.is_none() && app.model.selected_session.is_none());
+        let footer = screen(&mut app, &mut terminal).1;
+        assert!(!footer.contains('↑') && !footer.contains("⇧End"));
+    }
+
+    #[test]
+    fn history_shortcuts_ignore_missing_selection_and_pending_surface() {
+        let mut app = history_app();
+        app.surface.as_mut().unwrap().prepare(27);
+        let live_top = app.surface.as_ref().unwrap().view().top;
+        app.model.selected_session = None;
+        app.action(Action::Scroll(view::HistoryAction::Start))
+            .unwrap();
+        app.surface.as_mut().unwrap().prepare(27);
+        assert_eq!(app.surface.as_ref().unwrap().view().top, live_top);
+        app.model.selected_session = Some(0);
+        app.surface.as_mut().unwrap().ready = false;
+        app.action(Action::Scroll(view::HistoryAction::Start))
+            .unwrap();
+        app.surface.as_mut().unwrap().prepare(27);
+        assert_eq!(app.surface.as_ref().unwrap().view().top, live_top);
+        assert_eq!(app.model.notice, "已接入");
+    }
 
     fn app() -> App {
         App::new(Options {

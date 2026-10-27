@@ -72,6 +72,18 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-10-27 TUI 空会话历史误提示（完成）**：空右侧 MouseMoved/点击进入通用失败分支，
+> 被误写为持久“正在浏览历史”。删除该误提示，历史状态继续取真实 surface 位置；无选择/
+> 未 ready 的历史操作无效，清空会话同步清理派生状态，断线 ready 缓存仍允许回看。
+> 仅 TUI 两文件，无 core/wire/服务端变化。子任务合并命令审批等待 1401.4 秒后中止，
+> 未启动测试；主会话接管单独执行，TUI **69/0**、debug build、CLI all-targets clippy 全过。
+> 技术/代码双门及交互渲染回归见 `docs/reviews/2026-10-27-tui-empty-history.md`。
+> 延续本机 debug 调试，原子更新 `/opt/homebrew/bin/homeway` 为新件
+> SHA256 `b3c104f5…fe1a8d4f`（与 target/debug 同件），只换文件、不访问 state/重启后台；
+> 前后 daemon PID **17589** 不变，已运行的 TUI 需退出重进。回执 `SUCCESS`，回退目录
+> `~/homeway-rollback/tui-empty-history-20261027-3b5cd87d9e7d/`，旧 e19 件保留，未触发回滚。
+> 本轮未推送/发布，阿里云未动。
+
 > **2026-10-27 本机 TUI debug 部署（完成）**：用户本轮明确要求把当前 debug 件部署到
 > 这台电脑，并先交付当前 Codex 会话恢复命令；恢复命令已交付且 UUID/保存记录已核验。
 > 本轮用户指定 debug 为 AGENTS 正式 Release 产物纪律的明确单次覆盖，仅限本机；不推送/

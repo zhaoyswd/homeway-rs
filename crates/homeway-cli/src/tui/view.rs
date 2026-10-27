@@ -162,6 +162,7 @@ pub(super) struct Model {
 
 impl Model {
     pub(super) fn reset_sessions(&mut self) {
+        self.reset_terminal_input();
         self.sessions.clear();
         self.selected_session = None;
         self.sessions_offset = 0;
@@ -179,6 +180,8 @@ impl Model {
         self.clear_prefix();
         self.forwarded_keys.clear();
         self.suppressed_releases.clear();
+        self.mouse_reporting = false;
+        self.history_behind = 0;
     }
 
     fn next_focus(&mut self) {
@@ -1863,6 +1866,12 @@ mod tests {
         let footer = buffer_line(terminal.backend().buffer(), 29);
         assert!(footer.contains("↑30行") && footer.contains("回底"));
         assert!(model.mouse_reporting);
+        model.reset_sessions();
+        assert!(!model.mouse_reporting);
+        assert!(
+            !super::footer(&model, 100).contains('↑'),
+            "reset clears the derived history hint before the next render"
+        );
     }
 
     #[test]
