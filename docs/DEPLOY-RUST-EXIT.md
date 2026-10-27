@@ -1236,3 +1236,23 @@ v0.3.21）→ 备份现役（/tmp/homeway-v0.3.19.prev + state tar 0600）→ ki
 
 **遗留**：tier 侧 pin 同步与 App 核构建见 tier 仓记录；无手机 App 侧改动需求（无
 wire/NAPI 变更）。
+
+### 13.20 本机 TUI debug 特例（2026-10-27，准备）
+
+用户明确指定当前 debug 部署本机，并要求切换前先交付当前会话恢复指令。这是单次特例，
+不改变平时正式部署必须使用官方 Release 的纪律；不推送/打tag/发布，不操作阿里云。
+新件 SHA256 为 `e19c014d5c986ed9c653631e0e9e3764d2c393e338d5c1ffa4111bb44fa259ea`，
+版本文本仍为 v0.3.21，因此以完整 SHA、实际 PID 和 observer 能力判断换装结果。
+
+沿用 `/opt/homebrew/bin/homeway`、零参、默认 state 与现有
+`gui/501/me.zhaozhe.homeway-exit`。prepare 先备份 binary/plist/全部非cache普通state文件、
+台账原始前缀和私人会话恢复资料，目录0700、敏感归档/文本0600；runtime lock保留副本但
+不作不变判据。切换由独立 launchd 一次性 job 执行，同目录暂存+签名/hash/fsync+原子rename，
+一次kickstart；失败仅原子退回旧件并重启，保留当前state，不自动覆盖归档。
+
+持久结果指针：`~/homeway-rollback/debug-tui-e19c014d-20261027-ikze83u6/receipt.json`；
+执行日志 `worker.log`，私人恢复命令 `RESUME.txt`，不把会话标识提交到公开仓。
+恢复后先看回执/once job/正式件 hash与PID，禁止盲目重复激活。主会话已正常提权执行
+prepare，exit0，持久receipt为PREPARED且activation_started=false，备份权限与脚本SHA复核
+通过；尚未激活。激活与实际验收结果待完成后补录。计划/双门/精确命令见
+[`2026-10-27-tui-debug-local-deploy.md`](reviews/2026-10-27-tui-debug-local-deploy.md)。
