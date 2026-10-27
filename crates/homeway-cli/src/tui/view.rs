@@ -1,5 +1,7 @@
 //! TUI 的纯显示与交互状态；网络与 PTY 生命周期由主循环管理。
 
+use std::borrow::Cow;
+
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
@@ -607,6 +609,22 @@ fn terminal_color(color: vt::Color, default: Color) -> Color {
     }
 }
 
+/// VT格的TAB是文本/复制标记，跳格已体现在绝对列中；Ratatui低层symbol只接受可绘制字符。
+/// 仅投影显示：控制符基格画空白、保留其组合附标，正常Unicode不复制也不改写源VT。
+fn terminal_symbol(symbol: &str) -> Cow<'_, str> {
+    if symbol.is_empty() || symbol.chars().all(char::is_control) {
+        return Cow::Borrowed(" ");
+    }
+    if !symbol.chars().any(char::is_control) {
+        return Cow::Borrowed(symbol);
+    }
+    let mut visible: String = symbol.chars().filter(|c| !c.is_control()).collect();
+    if symbol.chars().next().is_some_and(char::is_control) {
+        visible.insert(0, ' ');
+    }
+    Cow::Owned(visible)
+}
+
 fn draw_terminal(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -647,13 +665,8 @@ fn draw_terminal(
             let x = area.x + x as u16;
             let y = area.y + row.y;
             if let Some(target) = frame.buffer_mut().cell_mut((x, y)) {
-                target
-                    .set_symbol(if cell.symbol.is_empty() {
-                        " "
-                    } else {
-                        &cell.symbol
-                    })
-                    .set_style(style);
+                let symbol = terminal_symbol(&cell.symbol);
+                target.set_symbol(symbol.as_ref()).set_style(style);
             }
             if cell.width == 2 {
                 if let Some(target) = frame.buffer_mut().cell_mut((x + 1, y)) {
@@ -1342,6 +1355,66 @@ fn handle_dialog(model: &mut Model, event: Event, geometry: &Geometry) -> Action
 mod tests {
     use super::*;
     use ratatui::{backend::TestBackend, Terminal};
+
+    #[test]
+    fn terminal_tabs_keep_grid_columns_and_style_across_real_draw_diffs() {
+        let mut vt = SessionVt::new(20, 4, 10).unwrap();
+        vt.write(b"\x1b[44m\x1b[2J\x1b[H\x1b[31mA\tB\x1b[0m");
+        assert_eq!(vt.rows()[0].cells[1].symbol, "\t", "VT保留TAB复制语义");
+        let mut terminal = Terminal::new(TestBackend::new(20, 4)).unwrap();
+        terminal
+            .draw(|frame| draw_terminal(frame, frame.area(), &mut vt, Theme::Dark.palette(), false))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), "A");
+        assert_eq!(buffer[(1, 0)].symbol(), " ");
+        assert_eq!(buffer[(0, 0)].fg, Color::Indexed(1));
+        assert_eq!(buffer[(1, 0)].fg, Theme::Dark.palette().fg, "TAB仅写格符号，不继承当前SGR前景");
+        assert_eq!(buffer[(1, 0)].bg, Color::Indexed(4), "原网格背景色必须保留");
+        assert_eq!(
+            buffer[(8, 0)].symbol(),
+            "B",
+            "TAB已由VT网格推进到第9列，不能二次展开"
+        );
+        vt.write(b"\x1b[1;1H\x1b[32mC\tD\x1b[0m");
+        terminal
+            .draw(|frame| {
+                draw_terminal(frame, frame.area(), &mut vt, Theme::Light.palette(), false)
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), "C");
+        assert_eq!(buffer[(1, 0)].bg, Color::Indexed(4), "未覆盖的原TAB格背景保留");
+        assert_eq!(buffer[(0, 0)].fg, Color::Indexed(2));
+        assert_eq!(buffer[(8, 0)].symbol(), "D");
+        assert_eq!(vt.rows()[0].cells[1].symbol, "\t");
+    }
+
+    #[test]
+    fn terminal_control_projection_preserves_unicode_and_never_emits_controls() {
+        for code in (0u8..=31).chain(127u8..=159) {
+            let symbol = char::from(code).to_string();
+            assert_eq!(terminal_symbol(&symbol), " ");
+        }
+        assert_eq!(
+            terminal_symbol("\t\u{301}"),
+            " \u{301}",
+            "控制符基格的组合附标仍保留"
+        );
+        assert_eq!(terminal_symbol("e\u{301}\u{7f}"), "e\u{301}");
+        for symbol in ["中", "e\u{301}", "👩\u{200d}💻", "✈\u{fe0f}", "ｶﾞ"] {
+            assert!(matches!(terminal_symbol(symbol), Cow::Borrowed(value) if value == symbol));
+        }
+        // 经过真实diff/后端flush，不能只检查set_symbol后的buffer而漏掉cell_width断言。
+        let mut terminal = Terminal::new(TestBackend::new(4, 1)).unwrap();
+        for symbol in ["\0", "\t", "\r", "\x1b", "\u{7f}", "\u{85}", "\t\u{301}"] {
+            terminal
+                .draw(|frame| {
+                    frame.buffer_mut()[(0, 0)].set_symbol(terminal_symbol(symbol).as_ref());
+                })
+                .unwrap();
+        }
+    }
 
     fn host(name: &str, state: HostState) -> HostItem {
         HostItem {

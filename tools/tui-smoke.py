@@ -17,6 +17,7 @@ from pathlib import Path
 import pty
 import re
 import select
+import shlex
 import signal
 import struct
 import subprocess
@@ -24,6 +25,7 @@ import sys
 import tempfile
 import termios
 import time
+import unicodedata
 
 try:
     import pyte
@@ -305,6 +307,122 @@ def idle_cpu(tui, seconds=4):
     print(f"INFO: idle TUI CPU={used/elapsed*100:.2f}% over {elapsed:.2f}s; 100x30 window / 66x25 shell; one logical CPU=100%")
 
 
+def terminal_rows(tui):
+    """Read terminal contents by physical cell coordinates, excluding the sidebar."""
+    sidebar = min(max(tui.screen.columns // 3, 26), 38)
+    rows = []
+    for y in range(2, tui.screen.lines - 3):
+        pieces = []
+        x = sidebar
+        while x < tui.screen.columns - 1:
+            data = tui.screen.buffer[y][x].data or " "
+            pieces.append(data)
+            x += 2 if wcwidth(data[0]) == 2 else 1
+        rows.append("".join(pieces))
+    return rows
+
+
+def exercise_ls(tui, binary, state, snapshot_dir):
+    """Run real ls variants; verify rendered names, colors, and live session state."""
+    fixture = state / "ls-fixtures"
+    short = fixture / "short"
+    styled = fixture / "styled"
+    scroll = fixture / "scroll"
+    for directory in (short, styled, scroll):
+        directory.mkdir(parents=True)
+    short_names = [f"a{index:02}" for index in range(48)]
+    for name in short_names:
+        (short / name).touch()
+    long_name = "long-" + "x" * 128 + ".txt"
+    styled_names = ["cafe\u0301.txt", "终端-🦀.txt", long_name, "run-me", "色彩目录"]
+    for name in styled_names[:-1]:
+        (styled / name).touch()
+    (styled / "run-me").chmod(0o700)
+    (styled / "色彩目录").mkdir()
+    for index in range(180):
+        (scroll / f"scroll_{index:03}").touch()
+    entries = sessions(binary, state)
+    assert len(entries) == 1
+    name = entries[0]["name"]
+    locale = "en_US.UTF-8" if sys.platform == "darwin" else "C.UTF-8"
+    ls = Path("/bin/ls")
+    assert ls.is_file(), "real /bin/ls is required by this regression"
+    home = Path.home()
+    project = Path(__file__).resolve().parent.parent
+
+    def listed_names(directory):
+        result = subprocess.run([str(ls), "-1", str(directory)], capture_output=True,
+                                text=True, timeout=5, check=True,
+                                env={**os.environ, "LC_ALL": locale})
+        return [line for line in result.stdout.splitlines() if line]
+
+    def run_case(tag, command, expected, require_all=False, color=False):
+        # %s keeps the completion marker out of the echoed command itself.
+        marker = "HW_LS_" + tag
+        tui.send(command + "; printf 'HW_LS_%s\\n' " + shlex.quote(tag) + "\r")
+
+        def completed():
+            tui.drain()
+            if tui.process.poll() is not None:
+                raw = ANSI.sub(b"", tui.output[-16000:]).decode(errors="replace")
+                raise AssertionError(f"real ls case {tag} crashed TUI ({tui.process.returncode}):\n{raw}")
+            return marker in "\n".join(terminal_rows(tui))
+
+        wait_until(completed, f"real ls case {tag}", 20)
+        tui.drain(0.15)
+        assert tui.process.poll() is None, f"TUI exited after rendering ls case {tag}"
+        rows = terminal_rows(tui)
+        text = unicodedata.normalize("NFC", "\n".join(rows))
+        # A long ls filename can wrap across physical rows; do not insert a
+        # logical newline into that name when checking the visible terminal grid.
+        joined = unicodedata.normalize("NFC", "".join(rows))
+        seen = [item for item in expected
+                if unicodedata.normalize("NFC", item) in text
+                or unicodedata.normalize("NFC", item) in joined]
+        if require_all:
+            assert len(seen) == len(expected), f"{tag}: missing real ls names {set(expected)-set(seen)!r}\n{text}"
+        else:
+            assert len(seen) >= min(2, len(expected)), f"{tag}: real ls filenames absent from screen\n{text}"
+        live = sessions(binary, state)
+        assert any(entry["name"] == name and entry.get("attached") for entry in live), f"{tag}: session/attach lost"
+        if color:
+            sidebar = min(max(tui.screen.columns // 3, 26), 38)
+            colored = [cell for y in range(2, tui.screen.lines-3)
+                       for x in range(sidebar, tui.screen.columns-1)
+                       if (cell := tui.screen.buffer[y][x]).data == "色"]
+            assert colored and all(cell.fg not in ("default", "dde2ea") for cell in colored), f"{tag}: ls directory color lost"
+        print(f"PASS: real ls {tag}; filenames rendered and original session/attach alive")
+
+    for cols, rows, inner_cols, inner_rows in ((100, 30, 66, 25), (160, 40, 121, 35)):
+        tui.set_size(cols, rows)
+        tui.signal(signal.SIGWINCH)
+        tui.drain(0.2)
+        tui.send(f"printf 'HW_LS_SIZE_{cols}:%s\\n' \"$(stty size)\"\r")
+        tui.wait(f"HW_LS_SIZE_{cols}:{inner_rows} {inner_cols}")
+        control = subprocess.run([str(ls), "-C", str(short)], capture_output=True,
+                                 timeout=5, check=True,
+                                 env={**os.environ, "COLUMNS": str(inner_cols), "LC_ALL": locale})
+        assert b"\t" in control.stdout, f"short-name ls fixture at {cols} columns did not produce TAB"
+        run_case(f"{cols}_HOME", f"command ls -C {shlex.quote(str(home))}", listed_names(home))
+        run_case(f"{cols}_PROJECT", f"{ls} -C {shlex.quote(str(project))}", listed_names(project))
+        run_case(f"{cols}_SHORT_TAB", f"{ls} -C {shlex.quote(str(short))}", short_names, require_all=True)
+        if sys.platform == "darwin":
+            colored_command = f"LC_ALL={locale} CLICOLOR_FORCE=1 LSCOLORS=exfxcxdxbxegedabagacad {ls} -G -C"
+        else:
+            colored_command = f"LC_ALL={locale} LS_COLORS=di=34:ex=32 {ls} --color=always -C"
+        run_case(f"{cols}_COLOR_UNICODE_LONG", colored_command + " " + shlex.quote(str(styled)),
+                 styled_names, require_all=True, color=True)
+        if cols == 160:
+            snapshot(tui, snapshot_dir, "ls-wide-color")
+        run_case(f"{cols}_SCROLL", f"{ls} -1 {shlex.quote(str(scroll))}",
+                 ["scroll_178", "scroll_179"], require_all=True)
+        if cols == 160:
+            snapshot(tui, snapshot_dir, "ls-wide-scroll")
+    tui.set_size(100, 30)
+    tui.signal(signal.SIGWINCH)
+    tui.drain(0.2)
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin", type=Path, default=Path(__file__).resolve().parent.parent / "target/debug/homeway")
@@ -368,6 +486,7 @@ def main():
                 snapshot(first, args.snapshot_dir, "shell-dark")
                 print("PASS: create shell, execute command, viewport matches PTY 66x25")
                 idle_cpu(first)
+                exercise_ls(first, binary, state, args.snapshot_dir)
 
                 first.set_size(120, 36)
                 first.signal(signal.SIGWINCH)
