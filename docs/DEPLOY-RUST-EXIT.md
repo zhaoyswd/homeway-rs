@@ -1279,3 +1279,18 @@ GREETING version1/features0xff（hello_sent=false）；config/key/theme不变，
 回执为 `~/homeway-rollback/tui-b3c-restart-20261027-r1/receipt.json`，日志once.log；与此前
 仅换文件的回执分开保留。双门、准备/恢复边界及实际结果见
 [`2026-10-27-tui-empty-history.md`](reviews/2026-10-27-tui-empty-history.md)。
+
+**次日主机留白与普通shell目录修复（2026-10-28）**：主机内容额外留两行、三字段单空格，
+目录由有效OSC7或服务端原生shell PID采样取得，因此本轮同时更新后台。源码及部署前
+checkpoint `980c4ac` 后唯一激活已审独立任务，01:03:52（+08:00）持久receipt SUCCESS，
+25.326秒，PID **26227→55632**，未回滚；正式路径与target/debug同为完整SHA256
+`fbc2419f81daaec041cc336b7c338090ba2fcfdea8ec448f0fe16a21b0a4a025`。零参/default state、
+新generation、serve running/relay stopped、UDP41641与稳定10秒复验通过，config/key/theme
+及tokens原73355B逐字节保全（追加0）。一次性job随后not running/runs1/exit0。
+
+固定回执 `~/homeway-rollback/tui-host-padding-cwd-20261028-r1/receipt.json`，日志
+`worker.log`，私人恢复命令 `RESUME.txt`；旧件/完整state备份保留，不自动覆盖当前state。
+GREETING version1/features0xff、hello_sent=false仅为协议能力检查；普通shell初始/cd、
+检测关闭/raw-only及远端cwd由同SHA私有实例验证，未生产新建PTY或测试cwd/TUI交互。
+原环境cross首红、测试长目录裁切控制与最终双门/验收边界见
+[`2026-10-28-tui-host-padding-cwd.md`](reviews/2026-10-28-tui-host-padding-cwd.md)。

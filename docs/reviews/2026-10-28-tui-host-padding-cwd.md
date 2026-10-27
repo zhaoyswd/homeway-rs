@@ -151,3 +151,22 @@ TUI/cwd交互实测。
 state-files逐文件大小/摘要与manifest一致，原plist摘要也一致；lock纳入备份而不作为
 不变关键文件，config/key/token旧前缀等保全证据已写manifest。此时尚未activation，
 未替换正式文件或重启；主会话将先提交产品与部署前checkpoint，再唯一激活。
+
+## 部署完成
+
+源码修复与部署前checkpoint由主会话提交为 `980c4ac`，先交付私人恢复命令后，唯一
+activation 独立任务在 **2026-10-28 01:03:52 +08:00**（17:03:52Z）完成，持久
+receipt **SUCCESS**，用时25.326秒，`rollback_performed=false`。子任务随后只读复核
+该回执、正式路径及target/debug完整SHA均为上述fbc。服务PID **26227→55632**，仍为
+`/opt/homebrew/bin/homeway` 零参/default state，新控制面generation
+`27560270b787f91464bc917ea94cd5b1`；serve running、relay stopped、UDP41641属新PID，
+稳定10秒后完整复验通过。
+
+config/key/theme逐字节不变，tokens原73,355字节前缀完整且追加0字节；旧659f、新fbc与
+state备份保留在固定回退目录，不自动恢复覆盖当前state。TERM被动GREETING仍为
+version1/features0xff、`hello_sent=false`；这只验证已有协议/observer就绪，与私有同SHA
+真实cwd证据分开，未在生产创建PTY、输入命令或做TUI/cwd交互测试。
+
+一次性job已只读核验 `not running / runs=1 / last exit code=0`，保留记录、未bootout。
+子任务没有重复prepare/激活/重启或修改脚本、源码、工具、state；最终仅补文档。无
+发布/推送或阿里云变更。
