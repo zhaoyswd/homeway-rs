@@ -76,7 +76,7 @@ SHA和调用方指定的新SHA，目标级flock串行，0700唯一回退目录�
 attach/resize/TUI交互验收。交互证据为上述69项私有状态/渲染测试；用户重新进入TUI后
 使用新前端。未发布、推送或操作远端。
 
-## 用户随后要求后台重启（独立步骤，准备）
+## 用户随后要求后台重启（独立步骤，完成）
 
 用户随后明确“部署 debug 版本并重启”。此时 PATH 与 target/debug 已同为上述 b3c
 完整 SHA，因此不重复换文件；需要让原 launchd 后台从PID17589重新加载已安装b3c。
@@ -115,7 +115,21 @@ observer能力、critical原字节及tokens前缀；PID稳定10秒后再次完�
 
 主会话已按正常提权单独执行 prepare：**exit0，receipt=PREPARED，activation_started=false**。
 子任务只读复核持久脚本/helper完整SHA、目录0700、binary0700，manifest/receipt/state归档/
-plist/恢复文本/日志0600均匹配；后台尚未由本轮worker重启。恢复文本中“Only after FAILED”
+plist/恢复文本/日志0600均匹配；该准备时点后台尚未由本轮worker重启。恢复文本中“Only after FAILED”
 是较窄说明，实际受审代码也允许确认normal worker已死、once job不运行的非终态进行显式
 恢复；必须先读取回执和job，不得把文案理解为重复正常activation。
-主会话将在提交checkpoint后执行唯一activation，实际结果完成后再补录。
+主会话提交checkpoint后唯一执行activation，持久receipt在 **2026-10-27 23:21:43 +08:00**
+（15:21:43Z）进入 **SUCCESS**，耗时 **23.874秒**。子任务随后只读复核回执、正式SHA
+及once job：`not running`、`runs=1`、`last exit code=0`。
+
+- 后台PID **17589→26227**，`kickstart_count=1`、`recovery=false`；此步骤没有再换binary，
+  正式路径和target/debug均保持完整b3c SHA，零参/default state保持。
+- 控制面PID/new generation对应，serve=running、relay=stopped，UDP41641归新PID。
+  新PID持有local-term.sock，GREETING `version=1, features=0xff, hello_sent=false`。
+- config/key/旧theme的字节与长度均不变；tokens.jsonl原**72498B**前缀完整，验收时仅
+  追加**386B**。未解包state归档覆盖现态，也没有触发独立恢复job。
+
+这次重启是用户在前一次“仅换前端、PID不变”成功后另行明确授权的步骤；两次记录不可
+合并成同一次安装。检查范围为进程身份、角色/端口、被动TERM能力、关键字节保全与稳定
+就绪，没有新增生产shell、attach/resize现有会话或完整生产TUI交互测试。私人恢复指令与
+备份保留；未修改产品源码或再次构建，未发布/推送/操作阿里云。

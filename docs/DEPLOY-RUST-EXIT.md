@@ -1265,3 +1265,17 @@ prepare，exit0，持久receipt为PREPARED且activation_started=false，备份�
 写成完整生产TUI交互或真机网络验收。一次性job随后`not running/runs=1/last exit code=0`，
 保留审计记录未bootout。旧件与恢复资料保留，阿里云未动。计划/双门/精确命令与结果见
 [`2026-10-27-tui-debug-local-deploy.md`](reviews/2026-10-27-tui-debug-local-deploy.md)。
+
+**同日后续空态历史提示修复与明确重启**：修复件b3c
+`b3c104f5f045a58bdb202b452ad37e59c24fcc65f89bc217e8a6ff18fe1a8d4f`先仅原子更新PATH
+前端，后台PID17589保持。用户随后另行明确要求“部署 debug 版本并重启”，因此不重复
+换文件，先交恢复指令、prepare受限备份，再唯一激活独立restart-only job。23:21:43
+（+08:00）持久receipt SUCCESS，23.874秒，PID **17589→26227**，kickstart_count=1、
+recovery=false；零参/defaultstate、b3c SHA、serve running/relay stopped与UDP41641通过，
+GREETING version1/features0xff（hello_sent=false）；config/key/theme不变，tokens原72498B
+前缀保全，仅追加386B。一次性job随后not running/runs1/exit0。没有创建/attach/resize生产
+会话，不把被动GREETING写为完整生产TUI验收。
+
+回执为 `~/homeway-rollback/tui-b3c-restart-20261027-r1/receipt.json`，日志once.log；与此前
+仅换文件的回执分开保留。双门、准备/恢复边界及实际结果见
+[`2026-10-27-tui-empty-history.md`](reviews/2026-10-27-tui-empty-history.md)。

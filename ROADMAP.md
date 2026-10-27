@@ -72,17 +72,22 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
-> **2026-10-27 当前 debug 后台重启（备份完成、待激活）**：用户明确要求“部署 debug 版本并重启”，
+> **2026-10-27 当前 debug 后台重启（完成）**：用户明确要求“部署 debug 版本并重启”，
 > 会话恢复命令已先交付。`target/debug/homeway` 与 PATH 正式文件已同为
 > SHA256 `b3c104f5…fe1a8d4f`，无需重复换文件；独立一次性 launchd 任务备份后仅重启原
 > 零参服务，保持默认 state/配置/身份/凭证。准备与激活分离，持久回执/双门记录补在
 > `docs/reviews/2026-10-27-tui-empty-history.md`；恢复后先查回执和真实 PID，不重复重启。
 > 本轮固定回执 `~/homeway-rollback/tui-b3c-restart-20261027-r1/receipt.json`，日志
-> `once.log`，恢复说明在同目录；常规执行不换文件，只一次重启，失败记 `FAILED`。
+> `once.log`，恢复说明在同目录。23:21 回执 `SUCCESS`，只一次 kickstart，PID
+> **17589→26227**，23.874 秒完成，未换文件或启用故障恢复。新进程 B3 哈希、零参默认
+> state、serve running/relay stopped、UDP41641、被动 TERM `features=0xff` 与稳定10秒后
+> 完整复验均通过；config/身份 key 不变，台账原72,498B前缀保全，验收时追加386B。
 > 23:20 准备器成功、回执 `PREPARED/activation_started=false`，旧后台 PID17589；目录0700，
 > 敏感工件0600，b3c及故障恢复e19备份0700。两道独立门通过 restart 执行器完整 SHA
 > `c6afc611…c1899a0f`，持久副本相同；只读helpers固定为已审 `6a4c0ccc…79ed1041`。
-> 激活仅一次加载同目录 `once.plist`；恢复后先核回执，不重复 bootstrap/kickstart。
+> 部署前 checkpoint `d3bc432` 已提交，激活仅一次加载同目录 `once.plist`；恢复后先核回执，
+> 不重复 bootstrap/kickstart。未在生产 state 新建shell/attach或做完整TUI交互；未推送/
+> 发布，阿里云未动。
 
 > **2026-10-27 TUI 空会话历史误提示（完成）**：空右侧 MouseMoved/点击进入通用失败分支，
 > 被误写为持久“正在浏览历史”。删除该误提示，历史状态继续取真实 surface 位置；无选择/
