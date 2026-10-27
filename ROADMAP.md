@@ -72,22 +72,27 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
-> **2026-10-27 本机 TUI debug 部署（备份完成、待激活）**：用户本轮明确要求把当前 debug 件部署到
+> **2026-10-27 本机 TUI debug 部署（完成）**：用户本轮明确要求把当前 debug 件部署到
 > 这台电脑，并先交付当前 Codex 会话恢复命令；恢复命令已交付且 UUID/保存记录已核验。
 > 本轮用户指定 debug 为 AGENTS 正式 Release 产物纪律的明确单次覆盖，仅限本机；不推送/
 > 打 tag/发版，不操作阿里云。目标为 `target/debug/homeway` SHA256 `e19c014d…4fa259ea`，
-> 现役 `/opt/homebrew/bin/homeway` 官方 v0.3.21 SHA256 `007abf0a…c0ff3813`。
+> 换装前在役 `/opt/homebrew/bin/homeway` 官方 v0.3.21 SHA256 `007abf0a…c0ff3813`。
 > 换装前备份 binary/plist/state 与恢复文本，独立 launchd 一次性任务原子替换并重启原零参
-> 服务，保留身份/config/凭证，失败自动回退。执行器/双门与状态指针见
+> 服务；22:16 回执 `SUCCESS`，PID **2084→17589**，PATH 仍为 `/opt/homebrew/bin/homeway`，
+> 在役完整哈希与指定 debug 件相同，serve running/relay stopped、UDP41641 及默认 state
+> 均核验，TERM 被动 GREETING `features=0xff` 含 observer。config/身份 key 逐字节不变，
+> token 台账原 70,313 字节前缀完整保留，验收时追加 857 字节；未回滚。仅检查服务/能力，
+> 未在正式 state 新建 shell 或做完整 TUI 交互测试。执行器/双门与状态指针见
 > `docs/reviews/2026-10-27-tui-debug-local-deploy.md`；恢复后先查该文所列 receipt 和真实服务状态，
 > 不盲目重复换装。Codex UUID/对话备份仅留本机受限目录，不写公开文档。
 > 本次持久回执固定为
 > `~/homeway-rollback/debug-tui-e19c014d-20261027-ikze83u6/receipt.json`，同目录保留
 > `worker.log`、`RESUME.txt`、旧件与 state 备份。准备器于 22:13 成功，回执 `PREPARED`，
 > 目录 0700、敏感文件 0600、两份 binary 0700；两道独立门通过最终执行器 SHA256
-> `6a4c0ccc…79ed1041`，备份副本与已审脚本哈希一致，现役仍为旧件 PID 2084。
-> 激活仅一次 `launchctl bootstrap gui/501` 加载同目录 `once.plist`；恢复后先查回执，
-> `SUCCESS` 才表示换装验收完成，非终态按 `RECOVERY.txt` 处理，不盲目重复执行。
+> `6a4c0ccc…79ed1041`，备份副本与已审脚本哈希一致，准备时在役仍为旧件 PID 2084。
+> 部署前 checkpoint `a077ba9` 已提交，激活仅一次 `launchctl bootstrap gui/501` 加载同目录
+> `once.plist`，27.36 秒完成并写终态。恢复后先查回执，勿重复激活；如需回退按
+> `RECOVERY.txt` 处理，保留当前 state，不自动覆盖旧归档。本批未推送/发布，阿里云未动。
 
 > **2026-10-27 TUI 历史/布局/多端整改（`tui` 分支，完成）**：五项均落地。去掉品牌首行、
 > 手动主题按钮/参数/旧持久偏好，随终端背景自动识别；底栏固定一行。TUI 改用权威 surface

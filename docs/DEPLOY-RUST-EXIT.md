@@ -1237,7 +1237,7 @@ v0.3.21）→ 备份现役（/tmp/homeway-v0.3.19.prev + state tar 0600）→ ki
 **遗留**：tier 侧 pin 同步与 App 核构建见 tier 仓记录；无手机 App 侧改动需求（无
 wire/NAPI 变更）。
 
-### 13.20 本机 TUI debug 特例（2026-10-27，准备）
+### 13.20 本机 TUI debug 特例（2026-10-27，完成）
 
 用户明确指定当前 debug 部署本机，并要求切换前先交付当前会话恢复指令。这是单次特例，
 不改变平时正式部署必须使用官方 Release 的纪律；不推送/打tag/发布，不操作阿里云。
@@ -1254,5 +1254,14 @@ wire/NAPI 变更）。
 执行日志 `worker.log`，私人恢复命令 `RESUME.txt`，不把会话标识提交到公开仓。
 恢复后先看回执/once job/正式件 hash与PID，禁止盲目重复激活。主会话已正常提权执行
 prepare，exit0，持久receipt为PREPARED且activation_started=false，备份权限与脚本SHA复核
-通过；尚未激活。激活与实际验收结果待完成后补录。计划/双门/精确命令见
+通过。部署前checkpoint `a077ba9`提交后，主会话唯一一次bootstrap独立job，22:16:10
+（+08:00）持久receipt **SUCCESS**，27.36秒，未触发回滚。正式PID **2084→17589**，
+正式路径SHA与上述e19c调试件完整一致；仍零参、默认state、原主launchd plist。控制面PID/
+新generation对应，serve=running、relay=stopped，UDP41641属新PID；稳定10秒后完整就绪
+复核通过。config/key/旧theme逐字节不变，tokens原70313B前缀完整，仅追加857B。
+
+新PID拥有local-term.sock，验收只读GREETING `version=1, features=0xff, hello_sent=false`，
+证明observer能力已提供；未在正式state新建shell、attach/resize现有会话，不把该能力探测
+写成完整生产TUI交互或真机网络验收。一次性job随后`not running/runs=1/last exit code=0`，
+保留审计记录未bootout。旧件与恢复资料保留，阿里云未动。计划/双门/精确命令与结果见
 [`2026-10-27-tui-debug-local-deploy.md`](reviews/2026-10-27-tui-debug-local-deploy.md)。

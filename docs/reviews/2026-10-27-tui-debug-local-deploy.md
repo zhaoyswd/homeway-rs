@@ -1,4 +1,4 @@
-# 本机 TUI debug 部署准备与双门（2026-10-27）
+# 本机 TUI debug 部署与双门（2026-10-27）
 
 用户明确要求把当前 debug 部署到本机，并先交付会话恢复指令。这是本次对 AGENTS 官方
 Release 产物纪律的特定覆盖：仅本机 PATH `/opt/homebrew/bin/homeway`，不推送、打 tag、
@@ -77,4 +77,24 @@ kickstart。终态包括 SUCCESS、FAILED_BEFORE_SWITCH、ROLLED_BACK、ROLLBACK
 随后只读复核持久脚本 SHA 与上述最终签门值相同，目录0700；state归档、plist、manifest、
 receipt、rollout、恢复文本、once.plist与worker.log均0600。备份覆盖 config.toml、runtime
 lock、serve/key.bin、serve/tokens.jsonl及旧tui-theme，未排除非cache普通文件。
-主会话将在提交部署前 checkpoint 后单独激活；**此记录尚不声称换装/重启已发生**。
+部署前 checkpoint 已由主会话提交为 `a077ba9`，随后主会话唯一一次执行 activation。
+
+## 实际完成记录
+
+持久 receipt 在 **2026-10-27 22:16:10 +08:00**（14:16:10Z）进入 **SUCCESS**，
+总耗时 **27.36秒**，`rollback_performed=false`。子任务随后只读复核回执、正式文件 SHA
+及一次性 job：job `state=not running`、`runs=1`、`last exit code=0`，未再次激活或重启。
+
+| 检查项 | 实际结果 |
+|---|---|
+| 正式进程 | PID **2084→17589**，`/opt/homebrew/bin/homeway` 零参、默认 `~/.config/homeway`，10秒窗口PID稳定，末次完整就绪检查仍为同PID。 |
+| 正式 binary | SHA256 与冻结 debug **e19c014d…fa259ea** 完整相同；实际复核完整值见本报告上方。版本文本仍为 v0.3.21，不用版本号冒充产物身份。 |
+| 控制面/角色/端口 | welcome generation更新，daemon.status.pid=17589；serve=running、relay=stopped；UDP41641由新PID持有。 |
+| 本地终端能力 | 新PID持有local-term.sock，被动GREETING `version=1, features=0xff`，包含surface/protocol/observer；`hello_sent=false`。 |
+| 关键文件 | config473B、serve/key32B、旧tui-theme5B逐字节与长度均保全；tokens.jsonl原**70313B**前缀SHA不变，验收时只追加**857B**，未覆盖/恢复state。runtime lock不作不变判据。 |
+| 回退/恢复 | 未触发回滚；旧官方binary、plist、state.tar.gz、manifest及私人rollout/恢复文本保留在0700回退目录，敏感工件0600。 |
+
+验收范围是正式路径身份、零参同state、控制面/角色/端口、被动本地终端能力与关键文件
+保全，**没有在生产state新建shell、attach/resize现有会话或执行完整TUI交互/网络矩阵**。
+TUI交互证据仍为上一批同debug件的私有state测试，不能将GREETING检查改称生产交互验收。
+只部署本机，未发布/推送/tag，阿里云未操作。一次性job保留已退出记录供审计，没有bootout。
