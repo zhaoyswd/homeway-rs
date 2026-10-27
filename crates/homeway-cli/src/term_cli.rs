@@ -549,32 +549,24 @@ fn dial_term(t: &mut TermTarget) -> Result<(TermConn, u32), DialErr> {
         TermConn::Remote { client, st, buf: Vec::new() }
     } else {
         let sock = local_term_sock(&t.state_dir);
-        let stream = UnixStream::connect(&sock).map_err(|e| DialErr::Transport(local_dial_err(&sock, e)))?;
+        let stream = crate::local_term::connect_local_terminal(&t.state_dir).map_err(|e| DialErr::Transport(local_dial_err(&sock, e)))?;
         TermConn::Local(FrameIo::new(stream))
     };
     read_greeting(conn, t.timeout)
 }
 
-/// 本地面 socket 解析：**扁平优先、serve 子目录回退**（2026-10-13 用户实测缺口修复）。
+/// 本地面 socket 解析：进程级 local-term 优先，旧扁平/serve 子目录回退。
 ///
 /// 出口角色的本地服务 socket 建在 **`<state>/serve/`** 子目录（`serve/files.sock` /
 /// `serve/term.sock` / `serve/speedtest.sock`——`server/engine.rs` 的 `listen_local_service`），
 /// 而本命令面的历史口径（早期平坦 state 布局）是 `<state>/term.sock` ⇒ 默认 / 统一根形态
 /// 在出口机上零参拨不通。两档解析：
 ///
-/// 1. `<state>/term.sock` 存在 ⇒ 用它（`--state` 直指 serve 目录的老用法照旧）；
-/// 2. 否则 `<state>/serve/term.sock` 存在 ⇒ 用它（统一根 / 零参形态）；
+/// 1. `<state>/local-term.sock` 存在 ⇒ 统一进程本地注册表（不依赖出口角色）；
+/// 2. 否则 `<state>/term.sock` / `<state>/serve/term.sock`（兼容既有单角色）；
 /// 3. 都不在 ⇒ 返回扁平路径（错误文案仍如实指向用户给的那个 state）。
 fn local_term_sock(state_dir: &std::path::Path) -> std::path::PathBuf {
-    let flat = state_dir.join("term.sock");
-    if flat.exists() {
-        return flat;
-    }
-    let nested = state_dir.join("serve").join("term.sock");
-    if nested.exists() {
-        return nested;
-    }
-    flat
+    crate::local_term::local_terminal_path(state_dir)
 }
 
 /// 本地面连接层错误 → 可行动文案（Go dialErrText 同义：两态 + 合并提示）。
@@ -699,12 +691,13 @@ impl TermCommon {
         let timeout = self.timeout.unwrap_or(DEFAULT_REMOTE_TIMEOUT);
         let mut host_ref = self.host_ref;
         if host_ref.is_empty() {
-            // 本机面 = 本机 term.sock 在 **且** config 的 serve 角色启用（2026-10-14）：只看
+            // 进程级local-term恒开；旧本机面 = term.sock在且config的serve角色启用：只看
             // sock 文件会被「serve stop 后残留的 sock」或「曾意外起过出口」的机器遮蔽远端
             // 主机（用户实测：加了主机后 `term new` 建在了本地）——出口意图以 config
             // enabled 为准；config 缺失 / 坏 ⇒ 不走本机面（守护侧会如实报 config 错）。
-            let local_exit = local_term_sock(&state_dir).exists()
-                && crate::unified_cli::config_role_enabled(&state_dir, "serve").unwrap_or(false);
+            let local_exit = crate::local_term::local_terminal_alive(&state_dir)
+                || (local_term_sock(&state_dir).exists()
+                    && crate::unified_cli::config_role_enabled(&state_dir, "serve").unwrap_or(false));
             if local_exit {
                 if self.timeout.is_some() {
                     return Err(
@@ -2939,7 +2932,7 @@ mod tests {
     /// （错误文案口径不变）。2026-10-13 用户实测缺口（`homeway term list` 零参拨不通）。
     #[test]
     fn local_term_sock_flat_then_serve_fallback() {
-        let d = std::env::temp_dir().join(format!(
+        let d = std::path::PathBuf::from("/tmp").join(format!(
             "hw-term-sock-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -2954,6 +2947,10 @@ mod tests {
         // ② 扁平形态：<state>/term.sock 也在 ⇒ 优先扁平（--state 直指 serve 目录的老用法）
         std::fs::write(d.join("term.sock"), b"").expect("占位可写");
         assert_eq!(local_term_sock(&d), d.join("term.sock"));
+        let local_listener = std::os::unix::net::UnixListener::bind(d.join("local-term.sock")).unwrap();
+        assert_eq!(local_term_sock(&d), d.join("local-term.sock"));
+        drop(local_listener);
+        std::fs::remove_file(d.join("local-term.sock")).unwrap();
         // ③ 都不在 ⇒ 返回扁平路径（错误文案仍指向用户给的那个 state）
         std::fs::remove_file(d.join("term.sock")).expect("可删");
         std::fs::remove_file(d.join("serve").join("term.sock")).expect("可删");
@@ -3255,7 +3252,7 @@ mod tests {
         // 环境受控：本地面的成立条件 = `<state>/term.sock` 在 **且** config serve.enabled
         //（2026-10-14 加的第二维——只看 sock 曾让意外起过出口的客户端机遮蔽远端主机）；
         // 用临时 state 显式造/不造两者——不依赖跑测试那台机器有没有出口在跑。
-        let dir = std::env::temp_dir().join(format!(
+        let dir = std::path::PathBuf::from("/tmp").join(format!(
             "hw-term-local-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
@@ -3294,6 +3291,9 @@ mod tests {
         assert!(e.contains("还没有添加主机"), "无 sock 时须走主机规则：{e}");
         // 显式 --host 带 --timeout 合法（远程面）
         assert!(common(Some(Duration::from_secs(5)), "exit1").into_target().is_ok());
+        cfg(false);
+        let _local_listener = std::os::unix::net::UnixListener::bind(dir.join("local-term.sock")).unwrap();
+        assert!(common(None, "").into_target().unwrap().host_ref.is_empty(), "进程级本地终端不依赖出口启用");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

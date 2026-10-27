@@ -598,6 +598,16 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 
 ## 判据变更记录（政策 + 登记表）
 
+### 2026-10-27 TUI 与统一进程本地终端
+
+- **raw接入输入模式（评审r2高1）**：从「ATTACHED仅含8个legacy位，raw回放只恢复屏幕，启用序列若已离环则新客户端丢失编码模式」改为「同一锁内捕获replay_end与服务端VT输入模式检查点，回放完成、REPLAY_DONE之前用已有DATA帧补发标准ANSI输入模式恢复序列」。覆盖DECCKM/DECKPAM/DECBKM/1035/1036、bracketed paste、focus、鼠标tracking/format（保留last-set权威值）、modifyOtherKeys与kitty当前flags；**不含切屏/清屏/光标/历史/尺寸指令**，不入输出环、不计replayed，live字节在后。原因：长会话重进不能把本应受保护的粘贴按裸文本执行。影响TUI与原raw CLI消费者，op/封装/版本/PTY实时输出原样不变；无服务端VT的raw-only保持原形。回归=`raw_truncated_replay_restores_input_modes_for_existing_raw_consumers`、`input_checkpoint_restores_encoding_without_touching_screen_or_cursor`。
+- **预算入口（评审r3中1）**：新增仅显式调用的`IpcStream::connect_timeout`、`ControlClient::dial_with_timeout/request_deadline`供TUI贯穿连接/HELLO/WELCOME/写锁/帧写/应答总截止，旧`connect/dial/request`默认不变。AF_UNIX EAGAIN表示未排队，丢弃socket并在同截止内每至多2ms重建重试；EINPROGRESS以poll+SO_ERROR+peer_addr确认，不以未连接socket的SO_ERROR=0冒充成功。原因：满backlog时本机连接也不能无限阻塞刷新lane；影响新TUI deadline API及本地实际连接回退，不改线上帧/服务端节拍。
+
+- 本地终端从「仅出口角色持有 `<state>/serve/term.sock`，停出口同时结束会话」改为「非 Windows 统一进程持有一份 TermService，0600 的 `<state>/local-term.sock` 恒开；出口运行时借用同一注册表提供已有 UDS/QUIC 入口」。`serve stop/restart` 撤出口网络入口并保留会话，本地与远端同名会话完全互见；统一进程收工才结束全部会话。前台单角色 `homeway serve` 仍独占并在出口停机时收工。`HOMEWAY_TERM=off` 仍禁用终端；不因建立本地会话打开网络角色。本地 UDS 装配失败发 `local-term: 本地终端监听失败` 告警后降级，其余角色继续运行，出口仍可按既有方式独占终端服务。
+- `homeway term` 本地寻址从「term.sock / serve/term.sock 且出口 enabled」增加优先存活的 `local-term.sock`（无需出口启用），实际连接失败按local→flat→serve回退。TUI 不会自动重启旧守护，缺少本地服务时给出启动新版统一进程的提示。
+- LIST JSON 增加可选 `agentLabel` 字符串，来自本拍前台进程命中的现有 manifest 名称，用于保留 pi 等固定枚举之外的身份。每拍独立更新，退出进程不沿用上次扫屏缓存；既有 `agent` 字段、`STATE/ATTACHED` 的 u8 枚举、帧封装与协议版本均不变（LIST体因可选字段而扩展）。旧消费者忽略新增字段，新 TUI 在缺少字段时回退既有 `agent`。
+- TUI 控制面继续使用既有角色/host/SOCKS/term 操作与帧；刷新整轮/列表查询各3s、角色操作与终端接入/创建/关闭10s、添加主机20s预算对齐既有CLI，终端一次请求的open/GREETING/应答共享绝对截止。刷新和列表各用独立单槽队列，刷新不占修改worker，快照由mutation epoch在完成和消费两侧过滤；列表携带query epoch，连续切换只保留最新待查询目标。提交成功、后续取值/复制、刷新错误分别提示，不因后续失败抹掉已成功事实。修改命令队列16槽/事件32槽、attach输入64槽×16KiB和下行128槽×64KiB为本地界面资源策略，不改现有服务端节拍、恢复阶梯或 wire 判据。验证与两道门见 `docs/reviews/2026-10-27-tui.md`。本条登记源码行为，不代表发布或部署。
+
 ### 2026-10-22 出口质量历史（本地源码）
 
 - 从「累计计数/分散日志，无法指定时间回看」新增为「认证设备路径 + 过境目标流按窗观测，异步有界历史 + `homeway serve quality` 本机查询」。默认每5秒采集，结束流队列4096、结束连接队列256、落盘通道4槽、磁盘4×8MiB；均有显式缺测口径。

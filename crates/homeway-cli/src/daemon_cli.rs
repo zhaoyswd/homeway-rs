@@ -402,6 +402,24 @@ pub fn dial_control_spawn(
     name: &str,
     no_spawn: bool,
 ) -> Result<Arc<ControlClient>, String> {
+    dial_control_spawn_inner(state_dir, name, no_spawn, false)
+}
+
+/// 交互界面的启动提示由UI承担，不能从后台线程写入当前终端。
+#[cfg(not(windows))]
+pub(crate) fn dial_control_spawn_quiet(
+    state_dir: &std::path::Path,
+    name: &str,
+) -> Result<Arc<ControlClient>, String> {
+    dial_control_spawn_inner(state_dir, name, false, true)
+}
+
+fn dial_control_spawn_inner(
+    state_dir: &std::path::Path,
+    name: &str,
+    no_spawn: bool,
+    quiet: bool,
+) -> Result<Arc<ControlClient>, String> {
     let sock = state_dir.join("control.sock");
     let first = ControlClient::dial(&sock, "cli", name);
     if let Ok((c, _)) = first {
@@ -443,20 +461,20 @@ pub fn dial_control_spawn(
             // 轮询等 KeepAlive 重拉（CLI 自 exec 出的进程不归 launchd 管，KeepAlive 会
             // 反复重拉自己的实例撞锁）；不相关（含未在册/提及别的 state）= 直接自拉起。
             if let Some(label) = detect_launchd_agent_for_state(state_dir) {
-                eprintln!("守护进程未运行（launchd 代理 {label} 在册）——等 KeepAlive 重拉…");
+                if !quiet { eprintln!("守护进程未运行（launchd 代理 {label} 在册）——等 KeepAlive 重拉…"); }
                 if wait_control_ready(state_dir, SPAWN_KEEPALIVE_WAIT) {
                     if let Ok((c, _)) = ControlClient::dial(&sock, "cli", name) {
                         return Ok(c);
                     }
                 }
-                eprintln!("KeepAlive {}s 内未重拉——改为自行拉起", SPAWN_KEEPALIVE_WAIT.as_secs());
+                if !quiet { eprintln!("KeepAlive {}s 内未重拉——改为自行拉起", SPAWN_KEEPALIVE_WAIT.as_secs()); }
             } else if cfg!(target_os = "macos") {
                 // darwin-only 注记（Linux 无 launchd，该情形本就无输出）。
-                eprintln!("（无相关自启动项——直接拉起守护）");
+                if !quiet { eprintln!("（无相关自启动项——直接拉起守护）"); }
             }
             let pid = start_spawned_process(state_dir)
                 .map_err(|e| format!("拉起统一进程失败：{e}"))?;
-            eprintln!("守护进程未运行，已启动 pid={pid}（state={}）", state_dir.display());
+            if !quiet { eprintln!("守护进程未运行，已启动 pid={pid}（state={}）", state_dir.display()); }
             if !wait_control_ready(state_dir, SPAWN_READY_TIMEOUT) {
                 return Err(format!(
                     "拉起的统一进程 {}s 内未就绪（control.sock 未出现/未可连）\n{} 尾部：\n{}\n完整日志：{}",

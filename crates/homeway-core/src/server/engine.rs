@@ -287,11 +287,35 @@ impl ServeEngine {
     /// 口径〕；`dlogf` = 细节流〔debug 文件恒写，verbose 回显〕；`tokf` = token 端点
     /// 变化轮流〔events 文件只写，verbose 回显〕；`log_paths` = 首轮「日志：」提示行。
     pub fn start(
+        cfg: ServeConfig,
+        logf: Logf,
+        dlogf: Logf,
+        tokf: Logf,
+        log_paths: Option<(String, String)>,
+    ) -> std::io::Result<Arc<Self>> {
+        Self::start_inner(cfg, logf, dlogf, tokf, log_paths, #[cfg(not(windows))] None)
+    }
+
+    /// 统一进程借用进程级终端注册表。出口关停只撤网络入口，会话由统一进程收工。
+    #[cfg(not(windows))]
+    pub fn start_with_term_service(
+        cfg: ServeConfig,
+        logf: Logf,
+        dlogf: Logf,
+        tokf: Logf,
+        log_paths: Option<(String, String)>,
+        terminal: Option<Arc<crate::term::service::TermService>>,
+    ) -> std::io::Result<Arc<Self>> {
+        Self::start_inner(cfg, logf, dlogf, tokf, log_paths, terminal)
+    }
+
+    fn start_inner(
         mut cfg: ServeConfig,
         logf: Logf,
         dlogf: Logf,
         tokf: Logf,
         log_paths: Option<(String, String)>,
+        #[cfg(not(windows))] shared_terminal: Option<Arc<crate::term::service::TermService>>,
     ) -> std::io::Result<Arc<Self>> {
         // Q5/S7b：公网端点非法 ⇒ 告警 + 按未配置处理（Go `serve.go:113-121` 的 `fill()` 同形）。
         normalize_public_endpoint(&mut cfg, &logf);
@@ -655,7 +679,8 @@ impl ServeEngine {
                 (logf)("term 服务被 HOMEWAY_TERM=off 关闭");
             } else {
                 // stateDir 参数 = manifest 覆盖目录基（<dir>/agent-detection/）
-                let tsrv = crate::term::service::TermService::new(Arc::clone(&dlogf), Some(&serve_dir));
+                let owns_terminal = shared_terminal.is_none();
+                let tsrv = shared_terminal.unwrap_or_else(|| crate::term::service::TermService::new(Arc::clone(&dlogf), Some(&serve_dir)));
                 match crate::files_server::listen_local_service(&serve_dir, "term.sock", &dlogf) {
                     Ok(ln) => {
                         // （整块在 not(windows) 门内——r2-P3：windows 死臂已清。）
@@ -684,9 +709,9 @@ impl ServeEngine {
                                     .name("homeway-term".into())
                                     .spawn(move || t.serve_stoppable(intake, stop))
                                     .ok();
-                                term_srv = Some(tsrv);
+                                if owns_terminal { term_srv = Some(tsrv); }
                             }
-                            None => tsrv.close(),
+                            None => if owns_terminal { tsrv.close(); },
                         }
                     }
                     Err(e) => {
@@ -695,7 +720,7 @@ impl ServeEngine {
                             "⚠️ term 监听 {} 失败（{e}）—— 终端功能会报错（state 目录异常/被其它实例占用），其余功能不受影响",
                             serve_dir.join("term.sock").display()
                         ));
-                        tsrv.close();
+                        if owns_terminal { tsrv.close(); }
                     }
                 }
             }

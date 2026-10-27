@@ -623,6 +623,7 @@ impl SurfaceLeg {
 /// raw 腿的握手计划（写者执行；锁内构建）。
 struct RawHandshake {
     attached: Vec<u8>,
+    input_modes: Vec<u8>,
     start: u64,
     starts_in_alt_screen: bool,
     end: u64,
@@ -695,6 +696,8 @@ struct SessRt {
     writers: usize,
     // 采样/检测态
     agent: u8,
+    /// 本拍前台manifest身份原文；兼容LIST标签，固定wire枚举不变。
+    agent_label: String,
     state_v2: u8,
     hygiene: agent::Hygiene,
     prev_cpu: Option<i64>,
@@ -1317,6 +1320,7 @@ impl TermService {
                 let (start, truncated) = rt.ring.replay_start(self.cfg.replay, self.cfg.replay_epoch);
                 Some(RawHandshake {
                     attached,
+                    input_modes: rt.vt.as_ref().map(SessionVt::input_mode_checkpoint).unwrap_or_default(),
                     start,
                     starts_in_alt_screen: rt.ring.replay_modes(start) & super::codec::mode_bits::ALT_SCREEN != 0,
                     end: rt.ring.written(),
@@ -1971,6 +1975,7 @@ impl TermService {
             legs: Vec::new(),
             writers: 0,
             agent: frames::agent::UNKNOWN,
+            agent_label: String::new(),
             state_v2: frames::state_v2::UNKNOWN,
             hygiene: agent::Hygiene::default(),
             prev_cpu: None,
@@ -2970,6 +2975,12 @@ impl TermService {
         if hs.epochs.iter().any(|e| *e > hs.start && *e < sent) {
             flags |= frames::replay_flags::SIZE_CHANGE;
         }
+        // 与hs.end同一锁内捕获；先回放历史，再恢复当时输入模式，live输出随后继续。
+        // 不入输出环/不计replayed，且不触screen/cursor/history，兼容既有raw终端。
+        if !hs.input_modes.is_empty() && !self.raw_write_frame(name, key, &mut io, &out, Op::DATA, &hs.input_modes) {
+            self.writer_exited(name, sess_gen);
+            return;
+        }
         if !self.raw_write_frame(
             name,
             key,
@@ -3330,6 +3341,7 @@ impl TermService {
                 last_active_ms: rt.last_active_ms as i64,
                 attached: !clients.is_empty(),
                 agent: agent::agent_name(rt.agent),
+                agent_label: (!rt.agent_label.is_empty()).then(|| rt.agent_label.clone()),
                 state_v2: frames::state_v2::name(rt.state_v2),
                 title: rt.scan.title().to_string(),
                 cwd,
@@ -3534,6 +3546,8 @@ impl TermService {
             osc_status: rt.scan.osc_status(),
         };
         let v = agent::classify_agent(&probe);
+        // 每拍从当前前台进程重取，不读last_scan_proc（它在无变化短路后可滞留旧身份）。
+        rt.agent_label = current_agent_label(st.manifests.as_ref(), procs, fg, v.agent);
         if v.cpu >= 0 {
             rt.prev_cpu = Some(v.cpu);
         }
@@ -4003,6 +4017,11 @@ fn state_v2_from_manifest(s: manifest::State) -> u8 {
     }
 }
 
+fn current_agent_label(manifests: Option<&manifest::Loader>, procs: &[ProcInfo], fg_pgid: i32, fallback: u8) -> String {
+    let label = manifests.map(|loader| agent::foreground_agent_name(procs, fg_pgid, |name| loader.for_process(name).is_some())).unwrap_or_default();
+    if label.is_empty() { agent::agent_name(fallback).to_owned() } else { label }
+}
+
 fn dec_name_or(f: &Frame) -> Result<String, Vec<u8>> {
     frames::dec_name(&f.payload).map_err(|e| frames::enc_error("bad_name", &e.to_string()))
 }
@@ -4073,6 +4092,8 @@ mod list_json_shape {
         pub last_active_ms: i64,
         pub attached: bool,
         pub agent: &'static str,
+        #[serde(rename = "agentLabel", skip_serializing_if = "Option::is_none")]
+        pub agent_label: Option<String>,
         /// 状态唯一字段（旧 `state` 键已随状态单轨化退役，term-remote 3.3）。
         #[serde(rename = "stateV2")]
         pub state_v2: &'static str,
@@ -4216,6 +4237,51 @@ fn run_explain(
 mod tests {
     use super::*;
     use crate::term::wire::ReadFail;
+
+    #[test]
+    fn raw_truncated_replay_restores_input_modes_for_existing_raw_consumers() {
+        let cfg = TermConfig { shell: Some("stty raw -echo; printf '\\033[?1049h\\033[?1h\\033[?2004h\\033[?1004h\\033[?1003h\\033[?1006h\\033[>15u'; printf '%0200dKEEP-TUI' 0; cat".into()), history: 64, replay: 32, ..Default::default() };
+        let service = svc_with(cfg, Arc::new(Mutex::new(Vec::new())));
+        let (listener, path) = start_listener();
+        let running = Arc::clone(&service);
+        std::thread::spawn(move || running.serve(listener));
+        let name = tmp_name("replay-input");
+        service.create_only(&name, false).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = service.lock_state();
+            let rt = state.sessions.get(&name).unwrap();
+            if rt.ring.read(rt.ring.start(), 64).ends_with(b"KEEP-TUI") { break; }
+            drop(state);
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let mut client = Client::connect(&path);
+        client.send(Op::HELLO, &hello(&name, &frames::enc_hello_tail(frames::caps::RAW_TERMINAL | frames::caps::KEY_ALT_ESC_PREFIX, "old-raw")));
+        let attached = client.expect(Op::ATTACHED, 5);
+        assert_ne!(frames::dec_attached(&attached.payload).unwrap().2 & super::super::codec::mode_bits::BRACKETED, 0);
+        let mut vt = SessionVt::new(80, 24, 10).unwrap();
+        let mut payloads = Vec::new();
+        loop {
+            let frame = client.io.read_frame_deadline(Duration::from_secs(5)).unwrap();
+            match frame.op {
+                Op::DATA => { vt.write(&frame.payload); payloads.push(frame.payload); }
+                Op::REPLAY_DONE => break,
+                Op::STATE => {},
+                op => panic!("unexpected {op:?}"),
+            }
+        }
+        let checkpoint = payloads.last().unwrap();
+        let history = payloads[1..payloads.len()-1].concat();
+        assert!(!history.windows(8).any(|bytes| bytes == b"\x1b[?2004h"), "启用序列确实已裁出历史");
+        assert!(checkpoint.windows(8).any(|bytes| bytes == b"\x1b[?2004h"));
+        assert!(vt.modes().bracketed_paste && vt.modes().focus_events);
+        assert_eq!(vt.modes().kitty_flags, 15);
+        assert!(vt.modes().cursor_keys_app && vt.modes().mouse_any && vt.modes().mouse_sgr);
+        assert_eq!(vt.modes().screen, super::super::vt::Screen::Alternate);
+        assert!(vt.screen_text().contains("KEEP-TUI"));
+        service.close();
+    }
 
     /// 测试面构造：注入配置与 manifest（env 面在进程级——并行测试会互踩）。
     fn svc_with(cfg: TermConfig, lines: Arc<Mutex<Vec<String>>>) -> Arc<TermService> {
@@ -5948,6 +6014,17 @@ mod tests {
             "explain 首键序（agent→session→manifestSource→…）：{json}"
         );
         assert!(json.contains("\"screenBytes\":11"), "screenBytes= 屏幕字节数");
+    }
+
+    #[test]
+    fn manifest_label_tracks_pi_exit_without_changing_wire_agent() {
+        let loader = manifest::Loader::new(None);
+        let pi = [ProcInfo { pid: 12, ppid: 1, pgid: 12, cpu: 0, args: "node /usr/bin/pi.js".into() }];
+        assert_eq!(current_agent_label(Some(&loader), &pi, 12, frames::agent::OTHER), "pi");
+        // 无论上拍是否真正扫屏，这一拍回shell就必须清除pi身份。
+        let shell = [ProcInfo { pid: 10, ppid: 1, pgid: 10, cpu: 0, args: "/bin/zsh".into() }];
+        assert_eq!(current_agent_label(Some(&loader), &shell, 10, frames::agent::SHELL), "shell");
+        assert_eq!(frames::dec_state(&frames::enc_state(frames::agent::OTHER, frames::state_v2::IDLE, "")).0, frames::agent::OTHER);
     }
 
     fn ended_code_killed() -> i32 {

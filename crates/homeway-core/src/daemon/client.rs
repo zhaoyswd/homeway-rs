@@ -45,6 +45,66 @@ pub enum ClientErr {
     Io(String),
 }
 
+#[cfg(all(test, unix))]
+mod dial_budget_tests {
+    use super::*;
+    use std::io::Read;
+    use std::os::unix::net::UnixListener;
+
+    #[test]
+    fn caller_budget_limits_welcome_handshake_and_closes_socket() {
+        let path = std::env::temp_dir().join(format!("homeway-ctl-budget-{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let mut bytes = [0u8; 4096];
+            assert!(socket.read(&mut bytes).unwrap() > 0, "客户端发送HELLO");
+            // 不发送WELCOME；若客户端仍固定等5秒，服务端2秒先超时，此断言会红。
+            assert_eq!(socket.read(&mut bytes).unwrap(), 0, "预算到期必须主动关闭连接");
+        });
+        let result = ControlClient::dial_with_timeout(&path, "cli", "budget-test", Duration::from_millis(200));
+        assert!(matches!(result, Err(ClientErr::Timeout)));
+        server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+
+    #[test]
+    fn zero_budget_does_not_attempt_a_connection() {
+        assert!(matches!(ControlClient::dial_with_timeout(Path::new("/tmp/homeway-no-dial"), "cli", "budget-test", Duration::ZERO), Err(ClientErr::Timeout)));
+    }
+
+    #[test]
+    fn absolute_request_budget_covers_write_lock_and_restores_socket_timeout() {
+        let path = PathBuf::from("/tmp").join(format!("hw-request-budget-{}.sock", std::process::id()));
+        let listener = UnixListener::bind(&path).unwrap();
+        let server = std::thread::spawn(move || {
+            let (mut socket, _) = listener.accept().unwrap();
+            socket.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+            let head = frame::read_header(&mut socket).unwrap();
+            frame::read_body(&mut socket, head).unwrap();
+            frame::write_frame(&mut socket, Op::Welcome, &serde_json::to_vec(&WelcomeBody { server_version: "test".into(), generation: "g".into(), server_seq: 0 }).unwrap()).unwrap();
+            let head = frame::read_header(&mut socket).unwrap();
+            let request: RequestBody = serde_json::from_slice(&frame::read_body(&mut socket, head).unwrap()).unwrap();
+            frame::write_frame(&mut socket, Op::Rsp, &serde_json::to_vec(&ResponseBody { corr: request.corr, ok: true, error: None, detail: None, result: Some(serde_json::json!({"ok":true})) }).unwrap()).unwrap();
+            let mut byte = [0];
+            assert_eq!(socket.read(&mut byte).unwrap(), 0);
+        });
+        let (client, _) = ControlClient::dial(&path, "cli", "budget-test").unwrap();
+        assert_eq!(client.request_deadline("test", None, Instant::now() + Duration::from_secs(1)).unwrap()["ok"], true);
+        let write_guard = client.write_sock.lock().unwrap();
+        let previous = match &*write_guard { IpcStream::Unix(socket) => socket.write_timeout().unwrap() };
+        assert_eq!(previous, Some(Duration::from_secs(30)), "短请求不能改变后续旧request缺省超时");
+        let error = client.request_deadline("must-not-send", None, Instant::now() + Duration::from_millis(50)).unwrap_err();
+        assert_eq!(error.code, "timeout", "写锁等待也必须受调用方预算限制");
+        assert!(client.pending.lock().unwrap().is_empty(), "超时不能留下pending关联");
+        drop(write_guard);
+        client.close();
+        server.join().unwrap();
+        std::fs::remove_file(path).unwrap();
+    }
+}
+
 struct RecvQueue {
     items: VecDeque<Vec<u8>>,
     closed: bool,
@@ -186,9 +246,42 @@ impl ControlClient {
         frontend_kind: &str,
         frontend_name: &str,
     ) -> Result<(Arc<ControlClient>, WelcomeBody), ClientErr> {
-        let stream = IpcStream::connect(sock).map_err(|e| ClientErr::Dial(e.to_string()))?;
+        Self::dial_with_budget(sock, frontend_kind, frontend_name, Duration::from_secs(5), Duration::from_secs(30), false)
+    }
+
+    /// 调用方已有绝对预算时，欢迎握手不能另开固定5秒窗口；旧dial缺省保持不变。
+    pub fn dial_with_timeout(
+        sock: &Path,
+        frontend_kind: &str,
+        frontend_name: &str,
+        timeout: Duration,
+    ) -> Result<(Arc<ControlClient>, WelcomeBody), ClientErr> {
+        Self::dial_with_budget(sock, frontend_kind, frontend_name, timeout, timeout.min(Duration::from_secs(30)), true)
+    }
+
+    fn dial_with_budget(
+        sock: &Path,
+        frontend_kind: &str,
+        frontend_name: &str,
+        timeout: Duration,
+        write_timeout: Duration,
+        absolute: bool,
+    ) -> Result<(Arc<ControlClient>, WelcomeBody), ClientErr> {
+        if timeout.is_zero() { return Err(ClientErr::Timeout); }
+        let deadline = Instant::now() + timeout;
+        let stream = if absolute {
+            IpcStream::connect_timeout(sock, deadline.saturating_duration_since(Instant::now()))
+        } else {
+            IpcStream::connect(sock)
+        }.map_err(|error| if absolute && error.kind() == std::io::ErrorKind::TimedOut { ClientErr::Timeout } else { ClientErr::Dial(error.to_string()) })?;
         let _ = stream.set_read_timeout(Some(Duration::from_millis(500)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+        if absolute {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() { return Err(ClientErr::Timeout); }
+            stream.set_write_timeout(Some(write_timeout.min(remaining))).map_err(|error| ClientErr::Io(error.to_string()))?;
+        } else {
+            let _ = stream.set_write_timeout(Some(write_timeout));
+        }
         let writer = stream.try_clone().map_err(|e| ClientErr::Io(e.to_string()))?;
         let ctl = stream.try_clone().map_err(|e| ClientErr::Io(e.to_string()))?;
         let (notify_tx, notify_rx) = std::sync::mpsc::channel();
@@ -224,9 +317,13 @@ impl ControlClient {
                 version: format!("homeway-rs/{}", env!("CARGO_PKG_VERSION")),
             },
         };
-        c.write_frame(encode_json_frame(Op::Hello, &hello)).map_err(ClientErr::Io)?;
+        if let Err(error) = c.write_frame(encode_json_frame(Op::Hello, &hello)) {
+            c.close();
+            return Err(if absolute && Instant::now() >= deadline { ClientErr::Timeout } else { ClientErr::Io(error) });
+        }
         // 等 welcome（或 reload——版本不匹配时服务端回 reload 后关闭连接）。
-        match welcome_rx.recv_timeout(Duration::from_secs(5)) {
+        let welcome_timeout = if absolute { deadline.saturating_duration_since(Instant::now()) } else { timeout };
+        match welcome_rx.recv_timeout(welcome_timeout) {
             Ok(w) => Ok((c, w)),
             Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                 c.close();
@@ -281,6 +378,73 @@ impl ControlClient {
         let corr = self.corr.fetch_add(1, Ordering::SeqCst) + 1;
         let req = RequestBody { corr, op: op.to_owned(), args };
         self.roundtrip(corr, req, timeout)
+    }
+
+    /// 写锁等待、帧写入和应答共享调用方绝对截止；既有request的缺省预算不变。
+    pub fn request_deadline(
+        &self,
+        op: &str,
+        args: Option<serde_json::Value>,
+        deadline: Instant,
+    ) -> Result<serde_json::Value, OpError> {
+        if Instant::now() >= deadline { return Err(OpError::code("timeout")); }
+        let corr = self.corr.fetch_add(1, Ordering::SeqCst) + 1;
+        let req = RequestBody { corr, op: op.to_owned(), args };
+        let (tx, rx) = std::sync::mpsc::channel();
+        self.pending.lock().unwrap_or_else(|error| error.into_inner()).insert(corr, tx);
+        let result = (|| {
+            self.write_frame_deadline(&encode_json_frame(Op::Req, &req), deadline)?;
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if remaining.is_zero() { return Err(OpError::code("timeout")); }
+            match rx.recv_timeout(remaining) {
+                Ok(response) if response.ok => Ok(response.result.unwrap_or(serde_json::Value::Null)),
+                Ok(response) => {
+                    let code = response.error.unwrap_or_else(|| "bad_request".into());
+                    Err(match response.detail { Some(detail) => OpError::with_detail(&code, detail), None => OpError::code(&code) })
+                }
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(OpError::with_detail("timeout", "等待应答超时")),
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(OpError::with_detail("conn_closed", "控制面连接已关闭")),
+            }
+        })();
+        self.pending.lock().unwrap_or_else(|error| error.into_inner()).remove(&corr);
+        result
+    }
+
+    fn write_frame_deadline(&self, frame: &[u8], deadline: Instant) -> Result<(), OpError> {
+        let mut writer = loop {
+            if Instant::now() >= deadline { return Err(OpError::code("timeout")); }
+            match self.write_sock.try_lock() {
+                Ok(writer) => break writer,
+                Err(std::sync::TryLockError::Poisoned(error)) => break error.into_inner(),
+                Err(std::sync::TryLockError::WouldBlock) => std::thread::sleep(Duration::from_millis(1)),
+            }
+        };
+        let previous = match &*writer {
+            #[cfg(unix)] IpcStream::Unix(stream) => stream.write_timeout(),
+            #[cfg(windows)] IpcStream::Tcp(stream) => stream.write_timeout(),
+        }.map_err(|error| OpError::with_detail("io_error", error.to_string()))?;
+        let result = (|| {
+            let mut remaining_frame = frame;
+            while !remaining_frame.is_empty() {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() { return Err(OpError::code("timeout")); }
+                writer.set_write_timeout(Some(remaining)).map_err(|error| OpError::with_detail("io_error", error.to_string()))?;
+                match writer.write(remaining_frame) {
+                    Ok(0) => return Err(OpError::code("conn_closed")),
+                    Ok(written) => remaining_frame = &remaining_frame[written..],
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(error) => return Err(OpError::with_detail(if matches!(error.kind(), std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock) { "timeout" } else { "io_error" }, error.to_string())),
+                }
+            }
+            Ok(())
+        })();
+        let restored = writer.set_write_timeout(previous).map_err(|error| OpError::with_detail("io_error", error.to_string()));
+        drop(writer);
+        if result.is_err() || restored.is_err() {
+            // 半帧不允许被下一请求接着解释；关本连接，亦撤掉有界写预算的临时设置。
+            self.close();
+        }
+        result.and(restored)
     }
 
     fn roundtrip(&self, corr: u64, req: RequestBody, timeout: Duration) -> Result<serde_json::Value, OpError> {

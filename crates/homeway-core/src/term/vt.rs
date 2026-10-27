@@ -565,6 +565,37 @@ impl SessionVt {
         }
     }
 
+    /// raw回放尾的输入模式检查点。只设置编码所需模式，不选择/清除屏幕、移动光标或改尺寸。
+    /// 终端程序的启用序列可能早已离开输出环；新接入的raw终端仍须正确编码粘贴/按键。
+    pub fn input_mode_checkpoint(&self) -> Vec<u8> {
+        use std::fmt::Write as _;
+        let keys = self.key_options();
+        let modes = self.modes();
+        let mut sequence = String::new();
+        for (number, enabled) in [
+            (1, keys.cursor_key_application), (66, keys.keypad_key_application),
+            (67, keys.backarrow_key_mode), (1035, keys.ignore_keypad_with_numlock),
+            (1036, keys.alt_esc_prefix), (1004, modes.focus_events),
+            (2004, modes.bracketed_paste),
+        ] {
+            let _ = write!(sequence, "\x1b[?{number}{}", if enabled { 'h' } else { 'l' });
+        }
+        // last-set tracking/format不能按独立位的固定顺序重播：先清，再设置唯一权威值。
+        sequence.push_str("\x1b[?9l\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1005l\x1b[?1006l\x1b[?1015l");
+        let tracking = match self.mouse_tracking {
+            MouseTracking::None => None, MouseTracking::X10 => Some(9),
+            MouseTracking::Clicks => Some(1000), MouseTracking::CellMotion => Some(1002),
+            MouseTracking::AllMotion => Some(1003),
+        };
+        let format = match self.mouse_format {
+            MouseFormat::Default => None, MouseFormat::Utf8 => Some(1005),
+            MouseFormat::Sgr => Some(1006), MouseFormat::Urxvt => Some(1015),
+        };
+        for number in [tracking, format].into_iter().flatten() { let _ = write!(sequence, "\x1b[?{number}h"); }
+        let _ = write!(sequence, "\x1b[>4;{}m\x1b[={}u", if keys.modify_other_keys_state_2 { 2 } else { 0 }, keys.kitty_flags);
+        sequence.into_bytes()
+    }
+
     /// 键编码（Go `Terminal.EncodeKey` 等价：选项按当前模式态现取现用）。
     /// `flavor` = 本腿平台口径（Q-J F1：由客户端 HELLO caps 声明，未声明 = 宿主推断；
     /// 必收参——无默认值，防「默认宿主隐式回潮」）。
@@ -1817,6 +1848,24 @@ impl<T: EventListener> alacritty_terminal::vte::ansi::Handler for TermProbe<'_, 
 mod tests {
     use super::*;
     use crate::term::testutil::{fnv_hex, golden_manifest, style_of, text_of};
+
+    #[test]
+    fn input_checkpoint_restores_encoding_without_touching_screen_or_cursor() {
+        let mut source = SessionVt::new(80, 24, 10).unwrap();
+        source.write(b"\x1b[?1h\x1b[?2004h\x1b[?1004h\x1b[?1003h\x1b[?1000h\x1b[?1006h\x1b[>15u\x1b[>4;2m");
+        let checkpoint = source.input_mode_checkpoint();
+        assert!(!checkpoint.windows(4).any(|bytes| bytes == b"?47h"));
+        let mut target = SessionVt::new(80, 24, 10).unwrap();
+        target.write(b"MAIN\x1b[?1049hKEEP-ALT\x1b[5;9H");
+        let before = (target.rows(), target.cursor(), target.scrollbar(), target.size(), target.history_epoch());
+        target.write(&checkpoint);
+        assert_eq!(target.key_options(), source.key_options());
+        assert_eq!(target.mouse_tracking, source.mouse_tracking);
+        assert_eq!(target.mouse_format, source.mouse_format);
+        assert!(target.modes().bracketed_paste && target.modes().focus_events);
+        assert_eq!(target.modes().screen, Screen::Alternate);
+        assert_eq!((target.rows(), target.cursor(), target.scrollbar(), target.size(), target.history_epoch()), before);
+    }
 
     #[test]
     fn shell_history_reflows_without_resurrecting_exited_tui() {

@@ -29,6 +29,10 @@ mod serve_cli;
 mod quality_cli;
 #[cfg(not(windows))] // term 在 windows 不支持（用户指令豁免——WIN 批）
 mod term_cli;
+#[cfg(not(windows))]
+mod tui;
+#[cfg(not(windows))]
+mod local_term;
 mod stopsig;
 mod unified_cli;
 // update 面 windows 不支持（运行中的 exe 无法原位替换）——模块整体只在非 windows
@@ -104,6 +108,13 @@ fn main() {
         // 而非静默缺命令（调用方可行动）。
         #[cfg(not(windows))]
         Some("term") => term_cli::cmd_term(&args[2..]),
+        #[cfg(not(windows))]
+        Some("tui") => tui::cmd_tui(&args[2..]),
+        #[cfg(windows)]
+        Some("tui") => {
+            eprintln!("homeway: tui 在 Windows 上暂不支持（依赖 Unix 终端会话服务）");
+            std::process::exit(2);
+        }
         #[cfg(windows)]
         Some("term") => {
             eprintln!("homeway: term（终端）在 Windows 上不支持（WIN 批豁免面——docs/reviews/WIN-design.md §0）");
@@ -135,6 +146,8 @@ fn main() {
             // term 行平台分档（windows 不支持——帮助不列不可用面）。
             #[cfg(not(windows))]
             eprintln!("  term new|list|attach|delete      终端     files list|get|put|…             文件");
+            #[cfg(not(windows))]
+            eprintln!("  tui                             交互式主机与终端会话界面");
             #[cfg(windows)]
             eprintln!("  files list|get|put|…             文件");
             eprintln!("  forward add|list|delete          端口转发  socks on|off|status              SOCKS5");

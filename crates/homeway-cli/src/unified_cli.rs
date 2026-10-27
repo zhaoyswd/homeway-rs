@@ -210,6 +210,8 @@ pub(crate) fn parse_unified_args(args: &[String]) -> UnifiedInvocation {
                 println!("  homeway relay start|stop|status|token    中继：公网机器，直连不通时中转");
                 println!("  homeway host add|list|status|delete      主机：客户端加出口凭证");
                 println!("  homeway term new|list|attach|delete      出口机上的终端");
+                #[cfg(not(windows))]
+                println!("  homeway tui                             交互式主机与终端会话界面");
                 println!("  homeway files list|get|put|…             出口机上的文件");
                 println!("  homeway forward add|list|delete          端口转发");
                 println!("  homeway speedtest                        测速");
@@ -263,6 +265,8 @@ struct RolesInner {
 
 struct UnifiedRoles {
     state_dir: PathBuf,
+    #[cfg(not(windows))]
+    terminal: Option<Arc<homeway_core::term::service::TermService>>,
     /// 自引用（构造后注入 Weak；supervisor 线程 spawn 需要 Arc 而 RoleHost::role_op
     /// 只拿得到 &self——经此升级）。
     me: Mutex<Option<std::sync::Weak<UnifiedRoles>>>,
@@ -302,14 +306,18 @@ impl UnifiedRoles {
         let fc = load_config_strict(&self.state_dir)?;
         let cfg = serve_config_of(&fc, &self.state_dir)?;
         let upnp = cfg.upnp;
-        let engine = ServeEngine::start(
+        #[cfg(not(windows))]
+        let engine = ServeEngine::start_with_term_service(
             cfg,
             Arc::clone(&self.logf),
             Arc::clone(&self.dlogf),
             Arc::clone(&self.tokf),
             self.log_paths.clone(),
+            self.terminal.clone(),
         )
         .map_err(|e| e.to_string())?;
+        #[cfg(windows)]
+        let engine = ServeEngine::start(cfg, Arc::clone(&self.logf), Arc::clone(&self.dlogf), Arc::clone(&self.tokf), self.log_paths.clone()).map_err(|e| e.to_string())?;
         Ok((engine, upnp))
     }
 
@@ -1269,8 +1277,15 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
     };
 
     // ⑤ serve/relay 角色管理面（控制面 serve.*/relay.* 的宿主；config 即期望态）。
+    #[cfg(not(windows))]
+    let local_terminal = crate::local_term::LocalTerm::start(&state_dir, Arc::clone(&daemon_dlogf)).unwrap_or_else(|error| {
+        daemon_logf(&format!("local-term: 本地终端监听失败（{error}）——本地终端降级，其余角色继续；修复state后重启可恢复"));
+        None
+    });
     let roles = Arc::new(UnifiedRoles {
         state_dir: state_dir.clone(),
+        #[cfg(not(windows))]
+        terminal: local_terminal.as_ref().map(crate::local_term::LocalTerm::service),
         me: Mutex::new(None),
         logf: Arc::clone(&logf),
         eventf: Arc::clone(&daemon_logf),
@@ -1467,6 +1482,8 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
             proc.stop();
         }
     }
+    #[cfg(not(windows))]
+    drop(local_terminal); // 本地会话/UDS必须在state锁释放前收工，避免碰到下一代socket。
     lock.release();
 }
 
@@ -1544,6 +1561,8 @@ mod tests {
         std::fs::write(dir.join("config.toml"), good).unwrap();
         let cfg = load_config_strict(&dir).unwrap();
         let roles = Arc::new(UnifiedRoles {
+            #[cfg(not(windows))]
+            terminal: None,
             state_dir: dir.clone(),
             me: Mutex::new(None),
             logf: Arc::new(|_| {}),
