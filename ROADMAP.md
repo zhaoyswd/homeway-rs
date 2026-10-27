@@ -72,6 +72,18 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-10-27 TUI 启动进度提示（完成）**：初始“正在连接本机服务”及选主机“正在读取
+> 主机会话”在成功响应后未结束。仅精确完成对应进度；Sessions 仍先校验当前目标/query
+> epoch，周期成功不覆盖错误、创建/接入在途或已确认操作结果。仅 TUI 前端改动，无
+> core/wire 变化。TUI **72/0**、debug build、CLI all-targets clippy 通过，真实私有启动
+> **3 PASS**：空LIST/真实PTY、跨两轮刷新后显示“已就绪 · 选择会话，或点击 + 创建 shell”，
+> 正常分离恢复TTY、仍零会话并清理自有资源；主会话已查看空态截图。双门与完整证据见
+> `docs/reviews/2026-10-27-tui-startup-status.md`，回归工具 `tools/tui-startup-smoke.py`。
+> 已原子更新本机 PATH 前端为 SHA256 `d627cbb4…804415dd`（与 target/debug 同件），
+> 回执 `SUCCESS`，后台 PID **26227** 前后不变，不访问正式state/重启/杀会话；旧TUI需
+> 退出重进。回退目录 `~/homeway-rollback/tui-empty-history-20261027-850a9df4a8ce/`，
+> 旧B3件保留，未回滚。本轮未发布/推送，阿里云未动。
+
 > **2026-10-27 当前 debug 后台重启（完成）**：用户明确要求“部署 debug 版本并重启”，
 > 会话恢复命令已先交付。`target/debug/homeway` 与 PATH 正式文件已同为
 > SHA256 `b3c104f5…fe1a8d4f`，无需重复换文件；独立一次性 launchd 任务备份后仅重启原

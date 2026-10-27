@@ -23,6 +23,11 @@ use ratatui::{backend::CrosstermBackend, Terminal};
 use backend::{Backend, Command, Target};
 use view::{Action, Model};
 
+const CONNECTING_NOTICE: &str = "正在连接本机服务…";
+const READING_SESSIONS_NOTICE: &str = "正在读取主机会话…";
+const CONTROL_READY_NOTICE: &str = "本机服务已连接 · 可选择或创建会话";
+const SESSIONS_READY_NOTICE: &str = "已就绪 · 选择会话，或点击 + 创建 shell";
+
 #[derive(Debug, thiserror::Error)]
 enum Error {
     #[error("{0}")]
@@ -209,7 +214,7 @@ impl App {
     fn new(options: Options) -> Self {
         let mut model = Model::default();
         model.hosts.push(local_host(false, false));
-        model.notice = "正在连接本机服务…".into();
+        model.notice = CONNECTING_NOTICE.into();
         Self {
             render_dirty: true,
             model,
@@ -328,6 +333,14 @@ impl App {
         self.operation_warning = None;
     }
 
+    fn complete_progress(&mut self, expected: &[&str], ready: &str) {
+        // Complete only a progress message still on screen. A concurrent action,
+        // error or confirmed operation owns any other notice.
+        if expected.contains(&self.model.notice.as_str()) {
+            self.model.notice = ready.into();
+        }
+    }
+
     fn select_session(&mut self, index: usize) -> Result<(), Error> {
         let Some(session) = self.model.sessions.get(index) else {
             return Ok(());
@@ -423,6 +436,7 @@ impl App {
                 {
                     self.operation_fact = None;
                 }
+                self.complete_progress(&[CONNECTING_NOTICE], CONTROL_READY_NOTICE);
             }
             backend::Event::Sessions {
                 target,
@@ -462,6 +476,10 @@ impl App {
                         }) {
                             self.operation_fact = None;
                         }
+                        self.complete_progress(
+                            &[CONNECTING_NOTICE, READING_SESSIONS_NOTICE],
+                            SESSIONS_READY_NOTICE,
+                        );
                     }
                     Err(error) => {
                         let fact = self
@@ -957,7 +975,7 @@ impl App {
                 self.model.selected_host = index;
                 self.model.reset_sessions();
                 self.sessions_pending = false;
-                self.model.notice = "正在读取主机会话…".into();
+                self.model.notice = READING_SESSIONS_NOTICE.into();
                 self.refresh_sessions();
             }
             Action::SelectSession(index) => {
@@ -1343,6 +1361,101 @@ mod tests {
         App::new(Options {
             state: std::env::temp_dir().join(format!("homeway-tui-events-{}", std::process::id())),
         })
+    }
+
+    #[test]
+    fn initial_successful_snapshot_finishes_real_startup_notice_in_empty_view() {
+        let mut app = app();
+        assert_eq!(app.model.notice, CONNECTING_NOTICE);
+        assert!(app.model.sessions.is_empty());
+        app.backend_event(backend::Event::Snapshot(backend::Snapshot::default()));
+        assert_eq!(app.model.notice, CONTROL_READY_NOTICE);
+        app.backend_event(backend::Event::Sessions {
+            target: Target::Local,
+            epoch: app.sessions_epoch,
+            result: Ok(vec![]),
+        });
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        let (_, footer) = screen(&mut app, &mut terminal);
+        assert!(!footer.contains('…'));
+        assert!(app.model.sessions.is_empty() && app.surface.is_none());
+        assert!(
+            terminal
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .any(|cell| cell.symbol() == "创"),
+            "empty view still guides shell creation"
+        );
+        // The independent session lane can also finish first.
+        let mut app = self::app();
+        app.backend_event(backend::Event::Sessions {
+            target: Target::Local,
+            epoch: app.sessions_epoch,
+            result: Ok(vec![]),
+        });
+        assert_eq!(app.model.notice, SESSIONS_READY_NOTICE);
+        app.backend_event(backend::Event::Snapshot(backend::Snapshot::default()));
+        assert_eq!(app.model.notice, SESSIONS_READY_NOTICE);
+    }
+
+    #[test]
+    fn host_reading_progress_finishes_only_for_current_host_and_query() {
+        let mut app = app();
+        app.current_target = Target::Remote("previous".into());
+        app.action(Action::SelectHost(0)).unwrap();
+        let epoch = app.sessions_epoch;
+        assert_eq!(app.model.notice, READING_SESSIONS_NOTICE);
+        app.backend_event(backend::Event::Snapshot(backend::Snapshot::default()));
+        assert_eq!(app.model.notice, READING_SESSIONS_NOTICE);
+        for (target, response_epoch) in [
+            (Target::Remote("previous".into()), epoch),
+            (Target::Local, epoch.wrapping_sub(1)),
+        ] {
+            app.backend_event(backend::Event::Sessions {
+                target,
+                epoch: response_epoch,
+                result: Ok(vec![]),
+            });
+            assert_eq!(app.model.notice, READING_SESSIONS_NOTICE);
+        }
+        app.backend_event(backend::Event::Sessions {
+            target: Target::Local,
+            epoch,
+            result: Ok(vec![]),
+        });
+        assert_eq!(app.model.notice, SESSIONS_READY_NOTICE);
+    }
+
+    #[test]
+    fn successful_background_refresh_preserves_errors_pending_creation_and_confirmed_results() {
+        let complete = |app: &mut App| {
+            app.backend_event(backend::Event::Snapshot(backend::Snapshot::default()));
+            app.backend_event(backend::Event::Sessions {
+                target: Target::Local,
+                epoch: app.sessions_epoch,
+                result: Ok(vec![]),
+            });
+        };
+        let mut app = app();
+        app.backend_event(backend::Event::Failed(backend::Error::Busy));
+        let error = app.model.notice.clone();
+        complete(&mut app);
+        assert_eq!(app.model.notice, error);
+        app.create_pending = true;
+        app.action(Action::CreateSession).unwrap();
+        let creating = app.model.notice.clone();
+        assert!(creating.contains("正在创建"));
+        complete(&mut app);
+        assert_eq!(app.model.notice, creating);
+        app.backend_event(backend::Event::Notice {
+            message: "主机已添加".into(),
+            clipboard: None,
+            confirmation: backend::Confirmation::Snapshot,
+        });
+        complete(&mut app);
+        assert_eq!(app.model.notice, "主机已添加");
     }
 
     #[test]
