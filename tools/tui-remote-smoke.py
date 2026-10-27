@@ -307,7 +307,7 @@ def main():
                         tui.drain()
                         return json.loads(cli(binary, state, "host", "list", "--json"))["hosts"] == []
                     wait_until(host_removed, "TUI deletes private remote host")
-                    screen_wait(tui, "主机 1")
+                    screen_wait(tui, "我的电脑")
                     screen_wait(tui, "想在这台主机上做些什么？")
                     assert [entry["name"] for entry in sessions(binary, exit_state)] == [session_name], "deleting a host killed its remote terminal"
                     print("PASS: TUI stops proxy/deletes host, exit CLI LIST confirms remote shell survives")

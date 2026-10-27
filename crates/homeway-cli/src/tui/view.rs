@@ -65,6 +65,8 @@ struct Palette {
     red: Color,
 }
 
+const ITEM_HEIGHT: u16 = 2;
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum Focus {
     #[default]
@@ -291,6 +293,11 @@ fn ensure_visible(selected: usize, len: usize, offset: &mut usize, slots: usize)
     }
 }
 
+fn item_index(area: Rect, y: u16, offset: usize) -> Option<usize> {
+    let slot = y.checked_sub(area.y)? / ITEM_HEIGHT;
+    (slot < area.height / ITEM_HEIGHT).then_some(offset + usize::from(slot))
+}
+
 fn panel(frame: &mut Frame<'_>, rect: Rect, title: String, active: bool, p: Palette) {
     frame.render_widget(
         Block::default()
@@ -331,12 +338,18 @@ pub(super) fn draw(
         );
         return geometry;
     }
-    let sidebar = (area.width / 3)
-        .clamp(20, 38)
+    let sidebar = ((u32::from(area.width) * 3 / 10) as u16)
+        .clamp(18, 34)
         .min(area.width.saturating_sub(18));
     let body = Rect::new(area.x, area.y, area.width, area.height - 1);
-    let split = body.height / 2;
-    let host_panel = Rect::new(body.x, body.y, sidebar, split + 1);
+    let host_height = model
+        .hosts
+        .len()
+        .saturating_add(1)
+        .saturating_mul(usize::from(ITEM_HEIGHT))
+        .min(usize::from(body.height / 2)) as u16;
+    let split = host_height.saturating_sub(1);
+    let host_panel = Rect::new(body.x, body.y, sidebar, host_height);
     let session_panel = Rect::new(body.x, body.y + split, sidebar, body.height - split);
     let terminal_panel = Rect::new(
         body.x + sidebar - 1,
@@ -352,14 +365,14 @@ pub(super) fn draw(
     panel(
         frame,
         host_panel,
-        format!(" 主机 {} ", model.hosts.len()),
+        " 主机 ".into(),
         model.focus == Focus::Hosts,
         p,
     );
     panel(
         frame,
         session_panel,
-        format!(" 会话 {} ", model.sessions.len()),
+        " 会话 ".into(),
         model.focus == Focus::Sessions,
         p,
     );
@@ -396,7 +409,7 @@ pub(super) fn draw(
         "┤",
         Style::default().fg(p.border),
     );
-    let host_slots = usize::from(geometry.hosts.height.div_ceil(3));
+    let host_slots = usize::from(geometry.hosts.height / ITEM_HEIGHT);
     ensure_visible(
         model.selected_host,
         model.hosts.len(),
@@ -411,7 +424,7 @@ pub(super) fn draw(
         .take(host_slots)
         .enumerate()
     {
-        let y = geometry.hosts.y + slot as u16 * 3;
+        let y = geometry.hosts.y + slot as u16 * ITEM_HEIGHT;
         if y >= geometry.hosts.bottom() {
             break;
         }
@@ -432,10 +445,14 @@ pub(super) fn draw(
         };
         text(
             frame,
-            Rect::new(row.x, y, row.width, 1),
+            Rect::new(row.x + 1, y, row.width.saturating_sub(1), 1),
             Line::from(vec![
                 Span::styled("● ", Style::default().fg(color)),
-                Span::raw(format!("【{label}】{}", clean(&host.name))),
+                Span::raw(if host.state == HostState::Local {
+                    clean(&host.name)
+                } else {
+                    format!("【{label}】{}", clean(&host.name))
+                }),
             ]),
             Style::default().fg(p.fg).bg(bg).add_modifier(if selected {
                 Modifier::BOLD
@@ -446,8 +463,10 @@ pub(super) fn draw(
         if row.height > 1 {
             let detail = if host.state == HostState::Local {
                 format!(
-                    "  出口：{}  中继：{}",
+                    "  出口{}{} 中继{}{}",
+                    if row.width < 21 { "" } else { "：" },
                     if host.exit_on { "开" } else { "关" },
+                    if row.width < 21 { "" } else { "：" },
                     if host.relay_on { "开" } else { "关" }
                 )
             } else {
@@ -459,13 +478,13 @@ pub(super) fn draw(
             };
             text(
                 frame,
-                Rect::new(row.x, y + 1, row.width, 1),
+                Rect::new(row.x + 1, y + 1, row.width.saturating_sub(1), 1),
                 detail,
                 Style::default().fg(p.muted).bg(bg),
             );
         }
     }
-    let session_slots = usize::from(geometry.sessions.height.div_ceil(3));
+    let session_slots = usize::from(geometry.sessions.height / ITEM_HEIGHT);
     ensure_visible(
         model.selected_session.unwrap_or(0),
         model.sessions.len(),
@@ -480,7 +499,7 @@ pub(super) fn draw(
         .take(session_slots)
         .enumerate()
     {
-        let y = geometry.sessions.y + slot as u16 * 3;
+        let y = geometry.sessions.y + slot as u16 * ITEM_HEIGHT;
         if y >= geometry.sessions.bottom() {
             break;
         }
@@ -492,13 +511,16 @@ pub(super) fn draw(
             geometry.sessions.width,
             (geometry.sessions.bottom() - y).min(2),
         );
-        frame.render_widget(Block::default().style(Style::default().bg(bg)), row);
         let (label, color) = match session.state {
-            SessionState::Working => ("运行中", p.green),
-            SessionState::Idle => ("空闲", p.muted),
-            SessionState::Blocked => ("待操作", p.amber),
-            SessionState::Unknown => ("未知", p.muted),
+            SessionState::Working => ("working", p.green),
+            SessionState::Idle => ("idle", p.muted),
+            SessionState::Blocked => ("blocking", p.amber),
+            SessionState::Unknown => ("unknown", p.muted),
         };
+        frame.render_widget(
+            Block::default().style(Style::default().fg(color).bg(bg)),
+            row,
+        );
         let title = if session.title.is_empty() {
             &session.name
         } else {
@@ -506,13 +528,17 @@ pub(super) fn draw(
         };
         text(
             frame,
-            Rect::new(row.x, y, row.width, 1),
+            Rect::new(row.x + 1, y, row.width.saturating_sub(1), 1),
             Line::from(vec![
                 Span::styled("● ", Style::default().fg(color)),
                 Span::raw(format!(
-                    "【{label}{}】{}",
-                    if session.self_session { "·自身" } else { "" },
-                    clean(title)
+                    "{}{}",
+                    if session.self_session {
+                        "·自身 "
+                    } else {
+                        ""
+                    },
+                    clean(title),
                 )),
             ]),
             Style::default().fg(p.fg).bg(bg).add_modifier(if selected {
@@ -524,9 +550,13 @@ pub(super) fn draw(
         if row.height > 1 {
             text(
                 frame,
-                Rect::new(row.x, y + 1, row.width, 1),
-                format!("  {} {}", clean(&session.agent), clean(&session.project)),
-                Style::default().fg(p.muted).bg(bg),
+                Rect::new(row.x + 1, y + 1, row.width.saturating_sub(1), 1),
+                format!(
+                    "  {label}  {}  {}",
+                    clean(&session.agent),
+                    clean(&session.project)
+                ),
+                Style::default().fg(color).bg(bg),
             );
         }
     }
@@ -1254,7 +1284,9 @@ fn handle_mouse(model: &mut Model, mouse: MouseEvent, geometry: &Geometry) -> Ac
             mouse.kind,
             MouseEventKind::Down(MouseButton::Left | MouseButton::Right)
         ) {
-            let index = model.hosts_offset + usize::from((y - geometry.hosts.y) / 3);
+            let Some(index) = item_index(geometry.hosts, y, model.hosts_offset) else {
+                return Action::None;
+            };
             if let Some(host) = model.hosts.get(index) {
                 model.selected_host = index;
                 if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
@@ -1299,7 +1331,9 @@ fn handle_mouse(model: &mut Model, mouse: MouseEvent, geometry: &Geometry) -> Ac
             mouse.kind,
             MouseEventKind::Down(MouseButton::Left | MouseButton::Right)
         ) {
-            let index = model.sessions_offset + usize::from((y - geometry.sessions.y) / 3);
+            let Some(index) = item_index(geometry.sessions, y, model.sessions_offset) else {
+                return Action::None;
+            };
             if index < model.sessions.len() {
                 if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
                     model.menu = Some(Menu {
@@ -1635,6 +1669,169 @@ mod tests {
             assert!(!line(0).contains("homeway") && !line(0).contains("主题"));
             assert!(line(height - 1).contains("READY"));
             assert!(line(height - 2).contains('┘'));
+        }
+    }
+
+    #[test]
+    fn sidebar_fits_host_rows_and_aligns_dots_with_panel_titles() {
+        for (count, height) in [(1, 4), (2, 6), (20, 14)] {
+            let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+            let mut model = Model {
+                hosts: std::iter::once(host("我的电脑", HostState::Local))
+                    .chain((1..count).map(|_| host("remote", HostState::Direct)))
+                    .collect(),
+                ..Default::default()
+            };
+            let mut geometry = Geometry::default();
+            terminal
+                .draw(|frame| geometry = draw(frame, &mut model, None))
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(geometry.hosts.height + 2, height);
+            assert_eq!(geometry.sessions.y - 1, geometry.hosts.bottom());
+            assert_eq!(geometry.sessions.bottom(), 28);
+            assert_eq!(geometry.terminal.x, 30);
+            assert_eq!(buffer[(2, 0)].symbol(), "主");
+            assert_eq!(buffer[(2, 1)].symbol(), "●");
+            assert_eq!(buffer[(2, height - 1)].symbol(), "会");
+            assert!(!buffer_line(buffer, 0).contains(&format!("主机 {count}")));
+            let first = buffer_line(buffer, 1);
+            assert!(first.contains("● 我的电脑"));
+            assert!(!first.contains("【本地】"));
+            if count == 2 {
+                assert!(buffer_line(buffer, 3).contains("【直连】remote"));
+            }
+        }
+        let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
+        let mut model = Model {
+            hosts: (0..20).map(|_| host("remote", HostState::Relay)).collect(),
+            ..Default::default()
+        };
+        let mut geometry = Geometry::default();
+        terminal
+            .draw(|frame| geometry = draw(frame, &mut model, None))
+            .unwrap();
+        assert_eq!(geometry.hosts.height + 2, 4);
+        assert_eq!(geometry.sessions.height, 4);
+        assert_eq!(geometry.terminal.x, 18);
+        assert!(geometry.host_add.right() < geometry.terminal.x);
+    }
+
+    #[test]
+    fn session_status_moves_to_colored_detail_without_changing_selected_background() {
+        for theme in [Theme::Dark, Theme::Light] {
+            for (state, label) in [
+                (SessionState::Working, "working"),
+                (SessionState::Idle, "idle"),
+                (SessionState::Blocked, "blocking"),
+                (SessionState::Unknown, "unknown"),
+            ] {
+                let mut terminal = Terminal::new(TestBackend::new(120, 30)).unwrap();
+                let mut model = Model {
+                    hosts: vec![host("我的电脑", HostState::Local)],
+                    sessions: vec![SessionItem {
+                        name: "session".into(),
+                        title: "[my title]".into(),
+                        agent: "codex".into(),
+                        project: "project".into(),
+                        state,
+                        self_session: false,
+                    }],
+                    selected_session: Some(0),
+                    theme,
+                    ..Default::default()
+                };
+                let mut geometry = Geometry::default();
+                terminal
+                    .draw(|frame| geometry = draw(frame, &mut model, None))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let first = buffer_line(buffer, geometry.sessions.y);
+                assert!(first.contains("● [my title]"));
+                assert!(!first.contains(label) && !first.contains('【'));
+                let detail = buffer_line(buffer, geometry.sessions.y + 1);
+                assert!(detail.contains(&format!("{label}  codex  project")));
+                let dot = &buffer[(2, geometry.sessions.y)];
+                assert_eq!(dot.symbol(), "●");
+                for x in geometry.sessions.x..geometry.sessions.right() {
+                    let cell = &buffer[(x, geometry.sessions.y + 1)];
+                    assert_eq!(cell.fg, dot.fg, "{theme:?} {label} column {x}");
+                    assert_eq!(cell.bg, theme.palette().selected);
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "writes sidebar preview fixtures under /tmp"]
+    fn sidebar_layout_preview_artifacts() {
+        let directory = std::path::Path::new("/tmp/homeway-tui-sidebar-previews");
+        std::fs::create_dir_all(directory).unwrap();
+        for (name, theme, many, width, height) in [
+            ("one-dark", Theme::Dark, false, 100, 30),
+            ("one-light", Theme::Light, false, 100, 30),
+            ("many-dark", Theme::Dark, true, 100, 30),
+            ("many-light", Theme::Light, true, 100, 30),
+            ("small-light", Theme::Light, true, 40, 10),
+        ] {
+            let mut hosts = vec![host("我的电脑", HostState::Local)];
+            if many {
+                hosts.extend([
+                    host("办公室", HostState::Direct),
+                    host("家里", HostState::Relay),
+                    host("笔记本", HostState::Offline),
+                ]);
+            }
+            let mut model = Model {
+                hosts,
+                sessions: [
+                    ("修改界面", SessionState::Working, "codex"),
+                    ("开发终端", SessionState::Idle, "shell"),
+                    ("等待确认", SessionState::Blocked, "pi"),
+                    ("当前终端", SessionState::Working, "opencode"),
+                ]
+                .into_iter()
+                .enumerate()
+                .map(|(index, (title, state, agent))| SessionItem {
+                    name: format!("session-{index}"),
+                    title: title.into(),
+                    agent: agent.into(),
+                    project: "homeway".into(),
+                    state,
+                    self_session: index == 3,
+                })
+                .collect(),
+                selected_session: Some(1),
+                focus: Focus::Sessions,
+                theme,
+                notice: "已就绪 · 选择会话，或点击 + 创建 shell".into(),
+                ..Default::default()
+            };
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            terminal
+                .draw(|frame| {
+                    draw(frame, &mut model, None);
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            let color = |value| match value {
+                Color::Rgb(r, g, b) => format!("{r:02x}{g:02x}{b:02x}"),
+                _ => "default".into(),
+            };
+            let rows: Vec<Vec<_>> = (0..height).map(|y| (0..width).map(|x| {
+                let cell = &buffer[(x, y)];
+                serde_json::json!({"data": cell.symbol(), "fg": color(cell.fg), "bg": color(cell.bg)})
+            }).collect()).collect();
+            std::fs::write(directory.join(format!("{name}.json")),
+                serde_json::to_vec(&serde_json::json!({"width":width,"height":height,"light":theme==Theme::Light,"rows":rows})).unwrap()).unwrap();
+            std::fs::write(
+                directory.join(format!("{name}.txt")),
+                (0..height)
+                    .map(|y| buffer_line(buffer, y))
+                    .collect::<Vec<_>>()
+                    .join("\n"),
+            )
+            .unwrap();
         }
     }
 
@@ -2337,6 +2534,13 @@ mod tests {
         assert!(
             matches!(handle_event(&mut model,mouse(geometry.hosts.x,geometry.hosts.y,MouseButton::Left),&geometry),Action::SelectHost(n) if n==expected)
         );
+        assert!(
+            matches!(handle_event(&mut model,mouse(geometry.hosts.x+1,geometry.hosts.y+1,MouseButton::Left),&geometry),Action::SelectHost(n) if n==expected)
+        );
+        assert!(
+            matches!(handle_event(&mut model,mouse(geometry.hosts.x+1,geometry.hosts.y+2,MouseButton::Right),&geometry),Action::SelectHost(n) if n==expected+1)
+        );
+        assert!(matches!(model.menu.as_ref().unwrap().kind, MenuKind::Host));
         model.menu = Some(Menu {
             kind: MenuKind::Host,
             x: 99,
@@ -2356,6 +2560,86 @@ mod tests {
             Action::None
         ));
         assert!(!model.modal_open());
+    }
+
+    #[test]
+    fn two_line_session_hits_follow_wheel_offset_and_ignore_partial_bottom_slot() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
+        let mut model = Model {
+            hosts: vec![host("local", HostState::Local)],
+            sessions: (0..20)
+                .map(|n| SessionItem {
+                    name: format!("session-{n}"),
+                    title: format!("title-{n}"),
+                    agent: "shell".into(),
+                    project: "project".into(),
+                    state: SessionState::Idle,
+                    self_session: false,
+                })
+                .collect(),
+            selected_session: Some(18),
+            ..Default::default()
+        };
+        let mut geometry = Geometry::default();
+        terminal
+            .draw(|frame| geometry = draw(frame, &mut model, None))
+            .unwrap();
+        let wheel = Event::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: geometry.sessions.x + 1,
+            row: geometry.sessions.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(
+            handle_event(&mut model, wheel, &geometry),
+            Action::SelectSession(19)
+        ));
+        terminal
+            .draw(|frame| geometry = draw(frame, &mut model, None))
+            .unwrap();
+        let first = model.sessions_offset;
+        assert!(first > 0);
+        assert!(
+            buffer_line(terminal.backend().buffer(), geometry.sessions.y)
+                .contains(&format!("title-{first}"))
+        );
+        assert!(matches!(handle_event(&mut model,
+            mouse(geometry.sessions.x+1, geometry.sessions.y+3, MouseButton::Right), &geometry),
+            Action::SelectSession(index) if index==first+1));
+        assert_eq!(model.selected_session, Some(first + 1));
+        terminal
+            .draw(|frame| geometry = draw(frame, &mut model, None))
+            .unwrap();
+        let menu = inner(geometry.menu);
+        assert!(matches!(
+            handle_event(
+                &mut model,
+                mouse(menu.x, menu.y, MouseButton::Left),
+                &geometry
+            ),
+            Action::CloseSession
+        ));
+
+        // An odd maximum host height leaves one spare physical line. It is not
+        // an extra half item, and clicking it must not select an invisible host.
+        let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
+        model.hosts = (0..20).map(|_| host("remote", HostState::Direct)).collect();
+        terminal
+            .draw(|frame| geometry = draw(frame, &mut model, None))
+            .unwrap();
+        assert_eq!(geometry.hosts.height, 13);
+        assert!(matches!(
+            handle_event(
+                &mut model,
+                mouse(
+                    geometry.hosts.x + 1,
+                    geometry.hosts.bottom() - 1,
+                    MouseButton::Left
+                ),
+                &geometry
+            ),
+            Action::None
+        ));
     }
 
     #[test]
@@ -2410,7 +2694,7 @@ mod tests {
         terminal
             .draw(|frame| geometry = draw(frame, &mut model, None))
             .unwrap();
-        let selected_position = (geometry.hosts.x, geometry.hosts.y + 3);
+        let selected_position = (geometry.hosts.x, geometry.hosts.y + 2);
         let dark = terminal.backend().buffer()[selected_position].bg;
         model.theme = Theme::Light;
         terminal

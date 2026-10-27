@@ -70,6 +70,10 @@ def stop_process(process):
         process.wait(timeout=3)
 
 
+def sidebar_width(columns):
+    return min(max(columns * 3 // 10, 18), 34)
+
+
 class Tui:
     def __init__(self, binary, state, background="rgb:0000/0000/0000"):
         self.master, self.slave = pty.openpty()
@@ -314,12 +318,12 @@ def idle_cpu(tui, seconds=4):
     tui.drain(seconds)
     elapsed = time.monotonic()-started
     used = cumulative()-before
-    print(f"INFO: idle TUI CPU={used/elapsed*100:.2f}% over {elapsed:.2f}s; 100x30 window / 66x27 shell; one logical CPU=100%")
+    print(f"INFO: idle TUI CPU={used/elapsed*100:.2f}% over {elapsed:.2f}s; 100x30 window / 69x27 shell; one logical CPU=100%")
 
 
 def terminal_rows(tui):
     """Read terminal contents by physical cell coordinates, excluding the sidebar."""
-    sidebar = min(max(tui.screen.columns // 3, 26), 38)
+    sidebar = sidebar_width(tui.screen.columns)
     rows = []
     for y in range(2, tui.screen.lines - 3):
         pieces = []
@@ -396,14 +400,14 @@ def exercise_ls(tui, binary, state, snapshot_dir):
         live = sessions(binary, state)
         assert any(entry["name"] == name and entry.get("attached") for entry in live), f"{tag}: session/attach lost"
         if color:
-            sidebar = min(max(tui.screen.columns // 3, 26), 38)
+            sidebar = sidebar_width(tui.screen.columns)
             colored = [cell for y in range(2, tui.screen.lines-3)
                        for x in range(sidebar, tui.screen.columns-1)
                        if (cell := tui.screen.buffer[y][x]).data == "色"]
             assert colored and all(cell.fg not in ("default", "dde2ea") for cell in colored), f"{tag}: ls directory color lost"
         print(f"PASS: real ls {tag}; filenames rendered and original session/attach alive")
 
-    for cols, rows, inner_cols, inner_rows in ((100, 30, 66, 27), (160, 40, 121, 37)):
+    for cols, rows, inner_cols, inner_rows in ((100, 30, 69, 27), (160, 40, 125, 37)):
         tui.set_size(cols, rows)
         tui.signal(signal.SIGWINCH)
         tui.drain(0.2)
@@ -487,14 +491,23 @@ def main():
 
                 def project_visible():
                     first.drain()
-                    return any(project in line[:33] for line in first.screen_lines())
+                    return any(project in line[:sidebar_width(first.screen.columns)] for line in first.screen_lines())
 
                 wait_until(project_visible, "OSC7 project name in session sidebar")
                 print("PASS: OSC7 current directory reaches LIST and session project label")
                 first.send("printf 'HW_SIZE:%s\\n' \"$(stty size)\"\r")
-                first.wait("HW_SIZE:27 66")
+                first.wait("HW_SIZE:27 69")
                 snapshot(first, args.snapshot_dir, "shell-dark")
-                print("PASS: create shell, execute command, viewport matches PTY 66x27")
+                print("PASS: create shell, execute command, viewport matches PTY 69x27")
+                # One local host has a four-line panel. Click each item's
+                # second line: local y=2, first session y=5 (SGR is 1-based).
+                mouse_name = sessions(binary, state)[0]["name"]
+                first.send(b"\x1b[<0;5;3M\x1b[<0;5;3m\x1b[<0;5;6M\x1b[<0;5;6m")
+                first.send("printf 'HW_SIDEBAR_%s\\n' MOUSE\r")
+                first.wait("HW_SIDEBAR_MOUSE")
+                assert any(entry["name"] == mouse_name and entry.get("attached")
+                           for entry in sessions(binary, state))
+                print("PASS: mouse hits compact local/session second lines and returns input to the same shell")
                 idle_cpu(first)
                 exercise_ls(first, binary, state, args.snapshot_dir)
 
@@ -502,8 +515,8 @@ def main():
                 first.signal(signal.SIGWINCH)
                 first.drain(0.5)
                 first.send("printf 'HW_RESIZE:%s\\n' \"$(stty size)\"\r")
-                first.wait("HW_RESIZE:33 81")
-                print("PASS: resize propagates to PTY 81x33")
+                first.wait("HW_RESIZE:33 85")
+                print("PASS: resize propagates to PTY 85x33")
 
                 # Emulate the outer terminal changing its background, then focus-in.
                 first.background = "rgb:ffff/ffff/ffff"

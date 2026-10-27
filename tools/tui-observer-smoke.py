@@ -151,7 +151,7 @@ def main():
                     session = entry(binary, state, "wide")
                     assert (session["cols"], session["rows"]) == (140, 40), "observer resize stole shared geometry"
                     return next(((client["cols"], client["rows"]) for client in session["clients"]
-                                 if client["kind"] == "app" and client["cols"] < 66), None)
+                                 if client["kind"] == "app" and client["cols"] == tui.screen.columns-helpers["sidebar_width"](tui.screen.columns)-1), None)
 
                 cols, rows = wait_until(observer_size, "observer pane preference after terminal resize")
                 tui.send("printf 'OBSERVER_SIZE:%s\\n' \"$(stty size)\"\r")
@@ -176,7 +176,7 @@ def main():
                 tui.wait("MOUSE_WAIT")
                 tui.drain(0.2)
                 assert (entry(binary, state, "wide")["cols"], entry(binary, state, "wide")["rows"]) == (140, 40)
-                sidebar = min(max(tui.screen.columns // 3, 20), 38)
+                sidebar = helpers["sidebar_width"](tui.screen.columns)
                 # panel inner origin=(sidebar,1), click local (2,3), SGR is 1-based.
                 tui.send(f"\x1b[<0;{sidebar + 3};5M\x1b[<0;{sidebar + 3};5m")
                 tui.wait("MOUSE_HEX:1b5b3c303b333b344d1b5b3c303b333b346d")  # Both SGR M/m use local row 4.

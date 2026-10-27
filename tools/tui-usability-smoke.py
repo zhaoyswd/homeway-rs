@@ -67,7 +67,7 @@ class ProbeTui(BaseTui):
 
 
 def sidebar(tui):
-    return min(max(tui.screen.columns//3, 20), 38)
+    return HELPERS["sidebar_width"](tui.screen.columns)
 
 
 def body_rows(tui):
