@@ -598,6 +598,13 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 
 ## 判据变更记录（政策 + 登记表）
 
+### 2026-10-27 TUI 权威 surface 与观察接入
+
+- **显式可协商扩展**：GREETING features 新增 `OBSERVER=1<<7`（全开位集从 `0x7f`→`0xff`），HELLO flags 新增 `OBSERVER=1<<3`，仅允许 SURFACE 且不得同时 TAKEOVER。协议版本、帧格式、已有能力位不变。旧 Rust 与 App 只按所需位掩码判断，忽略新 feature；新 TUI 遇缺能力的旧出口明确要求升级，在发送 HELLO 前退出，禁止 raw 降级造成隐式抢占。同步 greeting golden、MANIFEST/SHA256SUMS 与派生 fuzz 种子摘要。
+- **活动与尺寸**：从所有接入/RESIZE 均成为活动腿，增加显式 observer 的例外：接入只观察，未活动 RESIZE 只记该腿偏好；活动 observer 的真实窗口变化照常应用。首次真实按键 press/repeat、非空文本/粘贴、鼠标按钮按下（含应用上行滚轮）沿原活动策略接管，先应用该腿尺寸再用共享 VT 模式编码 INPUT。focus、keyup、motion、纯终端应答与 THEME 不选举；非活动 observer 的非粘贴纯应答 Text 与 DATA 均丢弃，避免污染活动程序；本地历史滚轮由客户端处理，不发 INPUT。未使用 observer 在活动腿退出时也不自动接管。已摘腿在途输入在记活动前拒绝，不得更改 owner/几何或活动序号；其余未置 flag 的 CLI/App 正常路径保持原行为。
+- **权威内容与历史**：TUI 从 raw 回放后重新解析 ANSI 改为消费已有 SURFACE SNAPSHOT/DIFF/FETCH-ROWS 的网格、真实 cols/rows、revision/seq/history epoch，面板只裁剪而不重新折行；STATE 不增加尺寸。观察接入的 ATTACHED 尺寸取当前共享 VT，首个完整快照才可交互，客户端不向 PTY 回答历史查询。LIST 的既有 pid 用于本机真实祖先链识别承载当前 TUI 的会话，远端同名或同号 PID 不据此禁选；不新增身份协议字段。
+- 原因：窄面板查看另一客户端会话不应改变它的 PTY 几何，回滚应包含接入前服务端历史；防止远程 shell 内 TUI 自嵌套到承载自身的终端。影响新协商 observer、TUI 及已摘腿在途活动拒绝；有效旧默认接入/应答路由及已有 surface 编码保持不变。验证与评审见 `docs/reviews/2026-10-27-tui-usability.md`。
+
 ### 2026-10-27 TUI 与统一进程本地终端
 
 - **raw接入输入模式（评审r2高1）**：从「ATTACHED仅含8个legacy位，raw回放只恢复屏幕，启用序列若已离环则新客户端丢失编码模式」改为「同一锁内捕获replay_end与服务端VT输入模式检查点，回放完成、REPLAY_DONE之前用已有DATA帧补发标准ANSI输入模式恢复序列」。覆盖DECCKM/DECKPAM/DECBKM/1035/1036、bracketed paste、focus、鼠标tracking/format（保留last-set权威值）、modifyOtherKeys与kitty当前flags；**不含切屏/清屏/光标/历史/尺寸指令**，不入输出环、不计replayed，live字节在后。原因：长会话重进不能把本应受保护的粘贴按裸文本执行。影响TUI与原raw CLI消费者，op/封装/版本/PTY实时输出原样不变；无服务端VT的raw-only保持原形。回归=`raw_truncated_replay_restores_input_modes_for_existing_raw_consumers`、`input_checkpoint_restores_encoding_without_touching_screen_or_cursor`。

@@ -1,7 +1,9 @@
 //! `homeway tui`：既有 daemon/term 的交互客户端。
+mod appearance;
 mod backend;
 mod clipboard;
 mod input;
+mod surface;
 mod terminal;
 mod transport;
 mod view;
@@ -13,21 +15,18 @@ use std::time::{Duration, Instant};
 
 use crossterm::event::{self, Event};
 use homeway_core::term::{
+    codec,
     frames::{self, Op},
-    keyenc,
-    vt::SessionVt,
 };
 use ratatui::{backend::CrosstermBackend, Terminal};
 
 use backend::{Backend, Command, Target};
-use view::{Action, Model, Theme};
+use view::{Action, Model};
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
     #[error("{0}")]
     Io(#[from] io::Error),
-    #[error("{0}")]
-    Vt(#[from] homeway_core::term::vt::VtError),
     #[error("{0}")]
     Backend(#[from] backend::Error),
     #[error("tui 需要交互式终端（stdin/stdout 均须为 TTY）")]
@@ -36,13 +35,10 @@ enum Error {
     Argument(String),
     #[error("{0} 后缺少参数")]
     MissingArgument(String),
-    #[error("主题应为 dark 或 light")]
-    Theme,
 }
 
 struct Options {
     state: PathBuf,
-    theme: Option<Theme>,
 }
 
 fn options(args: &[String]) -> Result<Option<Options>, Error> {
@@ -50,12 +46,11 @@ fn options(args: &[String]) -> Result<Option<Options>, Error> {
         .iter()
         .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
     {
-        println!("用法：homeway tui [--theme dark|light] [--state DIR]\n\n鼠标：左键选择；右键管理主机/会话；标题栏 + 添加。\n键盘：Ctrl+B 后 h/s/Enter 选主机/会话/终端；\n      Ctrl+B 后 a/n 添加主机/创建会话；m 操作菜单；t 切主题；q 分离退出。\n      侧栏中 F6 切焦点、F10 退出；Ctrl+B Ctrl+B 发送 Ctrl+B。\n会话中的普通按键（包括 Ctrl+C、Tab、q、功能键）交给终端。退出后会话继续运行。");
+        println!("用法：homeway tui [--state DIR]\n\n鼠标：左键选择；右键管理主机/会话；标题栏 + 添加。\n键盘：Ctrl+B 后 h/s/Enter 选主机/会话/终端；\n      Ctrl+B 后 a/n 添加主机/创建会话；m 操作菜单；q 分离退出。\n      侧栏中 F6 切焦点、F10 退出；Ctrl+B Ctrl+B 发送 Ctrl+B。\n历史：滚轮浏览；应用捕获鼠标时用 Shift+滚轮；Shift+PageUp/PageDown/Home/End。\n主题随终端背景自动识别。会话中的普通按键交给终端；退出后会话继续运行。");
         return Ok(None);
     }
     let mut parsed = Options {
         state: crate::unified_cli::default_state_dir(),
-        theme: None,
     };
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -64,19 +59,6 @@ fn options(args: &[String]) -> Result<Option<Options>, Error> {
                 parsed.state = PathBuf::from(
                     iter.next()
                         .ok_or_else(|| Error::MissingArgument(arg.clone()))?,
-                )
-            }
-            "--theme" => {
-                parsed.theme = Some(
-                    match iter
-                        .next()
-                        .ok_or_else(|| Error::MissingArgument(arg.clone()))?
-                        .as_str()
-                    {
-                        "dark" => Theme::Dark,
-                        "light" => Theme::Light,
-                        _ => return Err(Error::Theme),
-                    },
                 )
             }
             _ => return Err(Error::Argument(arg.clone())),
@@ -96,26 +78,6 @@ pub(crate) fn cmd_tui(args: &[String]) {
     }
 }
 
-fn load_theme(state: &Path) -> Theme {
-    match std::fs::read_to_string(state.join("tui-theme")) {
-        Ok(value) if value.trim() == "light" => Theme::Light,
-        _ => Theme::Dark,
-    }
-}
-
-fn save_theme(state: &Path, theme: Theme) -> io::Result<()> {
-    std::fs::create_dir_all(state)?;
-    let temporary = state.join(format!(".tui-theme-{}", std::process::id()));
-    std::fs::write(
-        &temporary,
-        match theme {
-            Theme::Dark => "dark\n",
-            Theme::Light => "light\n",
-        },
-    )?;
-    std::fs::rename(temporary, state.join("tui-theme"))
-}
-
 fn run(options: Options) -> Result<(), Error> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(Error::NotTerminal);
@@ -124,6 +86,10 @@ fn run(options: Options) -> Result<(), Error> {
     let _guard = terminal::TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
     let mut app = App::new(options);
+    let mut appearance =
+        appearance::Appearance::new(Instant::now(), std::env::var("COLORFGBG").ok().as_deref());
+    app.model.theme = appearance.theme();
+    let mut pending_events = VecDeque::new();
     let mut geometry = view::Geometry::default();
     while !terminal::stopping() {
         app.process_backend();
@@ -131,21 +97,50 @@ fn run(options: Options) -> Result<(), Error> {
         app.flush_input();
         app.process_clipboard()?;
         app.poll_refresh();
+        let now = Instant::now();
+        if appearance.query_due(now) {
+            io::stdout().write_all(appearance::QUERY)?;
+            io::stdout().flush()?;
+        }
+        pending_events.extend(appearance.expire(now));
+        if app.model.theme != appearance.theme() {
+            app.model.theme = appearance.theme();
+            app.render_dirty = true;
+        }
         if app.render_dirty {
+            if let Some(surface) = &mut app.surface {
+                surface.prepare(app.size.1);
+            }
             terminal.draw(|frame| {
-                geometry = view::draw(frame, &mut app.model, app.vt.as_mut());
+                geometry = view::draw(
+                    frame,
+                    &mut app.model,
+                    app.surface.as_ref().map(surface::Surface::view),
+                );
             })?;
             app.render_dirty = false;
         }
         app.resize(geometry.terminal.width, geometry.terminal.height);
+        app.poll_surface();
         // 输出每拍有预算；无论远端持续输出还是失联，输入/退出每 25ms 都有机会处理。
-        if event::poll(Duration::from_millis(25))? {
-            let event = event::read()?;
+        if pending_events.is_empty() && event::poll(Duration::from_millis(25))? {
+            pending_events.extend(appearance.filter(event::read()?, Instant::now()));
+        }
+        if let Some(event) = pending_events.pop_front() {
+            if matches!(event, Event::FocusGained) {
+                appearance.focus_gained(Instant::now());
+            }
             app.render_dirty = true;
             let focused = app.model.focus == view::Focus::Terminal && !app.model.modal_open();
             if let Event::FocusGained | Event::FocusLost = event {
-                if app.vt.as_ref().is_some_and(|vt| vt.modes().focus_events) {
-                    app.send_input(keyenc::encode_focus(matches!(event, Event::FocusGained)));
+                if app
+                    .surface
+                    .as_ref()
+                    .is_some_and(surface::Surface::focus_events)
+                {
+                    app.send_input(frames::InputEvent::Focus {
+                        gained: matches!(event, Event::FocusGained),
+                    });
                 }
             }
             let action = view::handle_event(&mut app.model, event, &geometry);
@@ -153,8 +148,13 @@ fn run(options: Options) -> Result<(), Error> {
                 break;
             }
             let focus_now = app.model.focus == view::Focus::Terminal && !app.model.modal_open();
-            if focused != focus_now && app.vt.as_ref().is_some_and(|vt| vt.modes().focus_events) {
-                app.send_input(keyenc::encode_focus(focus_now));
+            if focused != focus_now
+                && app
+                    .surface
+                    .as_ref()
+                    .is_some_and(surface::Surface::focus_events)
+            {
+                app.send_input(frames::InputEvent::Focus { gained: focus_now });
             }
         }
     }
@@ -176,14 +176,18 @@ struct App {
     operation_id: u64,
     operation_warning: Option<(backend::Confirmation, String)>,
     attach: Option<backend::Attach>,
-    vt: Option<SessionVt>,
+    surface: Option<surface::Surface>,
+    fragments: [codec::FragAssembler; 3],
+    snapshot_request: Option<Instant>,
     generation: u64,
     connected: bool,
-    replaying: bool,
     input_queue: VecDeque<Vec<u8>>,
     input_bytes: usize,
+    mouse_pressed: Vec<crossterm::event::MouseButton>,
+    input_geometry: Option<InputGeometry>,
     size: (u16, u16),
     sent_size: Option<(u16, u16)>,
+    sent_theme: Option<view::Theme>,
     refresh_pending: bool,
     sessions_pending: bool,
     sessions_epoch: u64,
@@ -196,10 +200,14 @@ struct OperationFact {
     confirmation: backend::Confirmation,
 }
 
+struct InputGeometry {
+    size: (u16, u16),
+    requested: Option<Instant>,
+}
+
 impl App {
     fn new(options: Options) -> Self {
         let mut model = Model::default();
-        model.theme = options.theme.unwrap_or_else(|| load_theme(&options.state));
         model.hosts.push(local_host(false, false));
         model.notice = "正在连接本机服务…".into();
         Self {
@@ -216,14 +224,18 @@ impl App {
             operation_id: 0,
             operation_warning: None,
             attach: None,
-            vt: None,
+            surface: None,
+            fragments: std::array::from_fn(|_| codec::FragAssembler::default()),
+            snapshot_request: None,
             generation: 0,
             connected: false,
             size: (80, 24),
-            replaying: true,
             input_queue: VecDeque::new(),
             input_bytes: 0,
+            mouse_pressed: Vec::new(),
+            input_geometry: None,
             sent_size: None,
+            sent_theme: None,
             refresh_pending: false,
             sessions_pending: false,
             sessions_epoch: 0,
@@ -276,13 +288,19 @@ impl App {
     }
 
     fn detach(&mut self) {
+        self.input_geometry = None;
+        self.sent_theme = None;
+        self.mouse_pressed.clear();
         self.operation_id = self.operation_id.wrapping_add(1);
         self.model.reset_terminal_input();
         self.generation = self.generation.wrapping_add(1);
         self.attach = None;
-        self.vt = None;
+        self.surface = None;
+        for assembler in &mut self.fragments {
+            assembler.reset();
+        }
+        self.snapshot_request = None;
         self.connected = false;
-        self.replaying = true;
         self.input_queue.clear();
         self.input_bytes = 0;
         self.sent_size = None;
@@ -291,6 +309,9 @@ impl App {
     }
 
     fn disconnect(&mut self) {
+        self.input_geometry = None;
+        self.sent_theme = None;
+        self.mouse_pressed.clear();
         self.operation_id = self.operation_id.wrapping_add(1);
         self.model.reset_terminal_input();
         self.generation = self.generation.wrapping_add(1);
@@ -311,6 +332,10 @@ impl App {
         let Some(session) = self.model.sessions.get(index) else {
             return Ok(());
         };
+        if session.self_session {
+            self.model.notice = "这是承载当前 TUI 的会话，请选择其它会话或新建".into();
+            return Ok(());
+        }
         let name = session.name.clone();
         let title = session.title.clone();
         if self.active_session.as_deref() == Some(name.as_str()) && self.attach.is_some() {
@@ -321,12 +346,7 @@ impl App {
         self.model.selected_session = Some(index);
         self.model.terminal_title = title;
         self.active_session = Some(name.clone());
-        self.vt = Some(SessionVt::new(
-            self.size.0.max(1),
-            self.size.1.max(1),
-            10_000,
-        )?);
-        self.apply_theme();
+        self.surface = Some(surface::Surface::default());
         self.attach = Some(backend::Attach::start(
             self.state_dir.clone(),
             self.target(),
@@ -479,6 +499,7 @@ impl App {
                         name,
                         agent: "shell".into(),
                         project: String::new(),
+                        self_session: false,
                         state: view::SessionState::Unknown,
                     });
                     self.model.sessions.len() - 1
@@ -595,48 +616,18 @@ impl App {
             };
             match frame.op {
                 Op::ATTACHED => match frames::dec_attached(&frame.payload) {
-                    Ok((_, _, modes, _, _, _)) => {
-                        if let Some(vt) = &mut self.vt {
-                            input::attached_modes(vt, modes);
-                        }
-                        self.model.notice = "已连接，正在回放会话…".into();
-                    }
+                    Ok(_) => self.model.notice = "已连接，正在读取会话画面…".into(),
                     Err(error) => {
                         self.model.notice = error.to_string();
                         self.disconnect();
                         break;
                     }
                 },
-                Op::REPLAY_DONE => {
-                    self.replaying = false;
-                    self.connected = true;
-                    self.model.notice = match frames::dec_replay_done(&frame.payload) {
-                        Ok((_, flags)) if flags & frames::replay_flags::TRUNCATED != 0 => {
-                            "已接入（早期回放已裁剪） · Ctrl+B q 分离".into()
-                        }
-                        Ok((_, flags)) if flags & frames::replay_flags::SIZE_CHANGE != 0 => {
-                            "已接入（历史包含尺寸变化） · Ctrl+B q 分离".into()
-                        }
-                        _ => "已接入 · Ctrl+B q 分离退出；右键管理会话".into(),
-                    };
-                    if self.model.focus == view::Focus::Terminal
-                        && self.vt.as_ref().is_some_and(|vt| vt.modes().focus_events)
-                    {
-                        self.send_input(keyenc::encode_focus(true));
-                    }
-                }
-                Op::DATA => {
-                    let mut replies = Vec::new();
-                    if let Some(vt) = &mut self.vt {
-                        vt.write_collecting(&frame.payload, &mut |reply| {
-                            replies.push(reply.to_vec())
-                        });
-                    }
-                    // 历史查询只恢复屏态，不把过期应答重新注入正在运行的程序。
-                    if !self.replaying {
-                        for reply in replies {
-                            self.send_input(reply);
-                        }
+                Op::SNAPSHOT | Op::SURFACE_DIFF | Op::FETCH_ROWS => {
+                    if let Err(error) = self.surface_frame(frame.op, &frame.payload) {
+                        self.model.notice = error.to_string();
+                        self.disconnect();
+                        break;
                     }
                 }
                 Op::ENDED => {
@@ -658,18 +649,138 @@ impl App {
                 _ => {}
             }
         }
-        let mut replies = Vec::new();
-        if let Some(vt) = &mut self.vt {
-            self.render_dirty |= vt.flush_sync_timeout(&mut |reply| replies.push(reply.to_vec()));
+    }
+
+    fn surface_frame(&mut self, op: Op, payload: &[u8]) -> Result<(), surface::Error> {
+        let slot = if op == Op::SNAPSHOT {
+            0
+        } else if op == Op::SURFACE_DIFF {
+            1
+        } else {
+            2
+        };
+        let Some(compressed) = self.fragments[slot].push(payload)? else {
+            return Ok(());
+        };
+        let body = codec::gunzip_bytes(&compressed)?;
+        let Some(surface) = &mut self.surface else {
+            return Ok(());
+        };
+        let mut focus = false;
+        if op == Op::SNAPSHOT {
+            let body = codec::dec_snapshot_body(&body)?;
+            let title = body.title.clone();
+            if surface.snapshot(body)? {
+                self.snapshot_request = None;
+                let initial = !self.connected;
+                self.connected = true;
+                if !title.is_empty() {
+                    self.model.terminal_title = title;
+                }
+                if initial {
+                    self.model.notice = "已接入 · 滚轮浏览历史".into();
+                    if self.model.focus == view::Focus::Terminal && surface.focus_events() {
+                        focus = true;
+                    }
+                }
+            }
+        } else if op == Op::SURFACE_DIFF {
+            if !surface.diff(codec::dec_diff_body(&body)?)? {
+                self.connected = false;
+                self.input_queue.clear();
+                self.input_bytes = 0;
+                self.model.reset_terminal_input();
+                self.mouse_pressed.clear();
+                self.input_geometry = None;
+                self.snapshot_request = None;
+                self.model.notice = "正在同步终端画面…".into();
+            }
+        } else {
+            surface.fetch_reply(codec::dec_fetch_rows_reply(&body)?)?;
         }
-        if !self.replaying {
-            for reply in replies {
-                self.send_input(reply);
+        if self
+            .input_geometry
+            .as_ref()
+            .is_some_and(|pending| surface.ready && pending.size == surface.geometry())
+        {
+            self.input_geometry = None;
+        }
+        if focus {
+            self.send_input(frames::InputEvent::Focus { gained: true });
+        }
+        Ok(())
+    }
+
+    fn poll_surface(&mut self) {
+        let Some(surface) = &mut self.surface else {
+            return;
+        };
+        let Some(attach) = &self.attach else { return };
+        let now = Instant::now();
+        if !surface.ready {
+            if self
+                .snapshot_request
+                .is_none_or(|sent| now.duration_since(sent) >= Duration::from_secs(2))
+            {
+                match attach.fetch_snapshot() {
+                    Ok(()) => self.snapshot_request = Some(now),
+                    Err(backend::Error::Busy) => {}
+                    Err(error) => {
+                        self.model.notice = error.to_string();
+                        self.disconnect();
+                        return;
+                    }
+                }
+            }
+        } else if let Some(request) = surface.fetch_request(self.size.1, now) {
+            if let Err(error) = attach.fetch_rows(request) {
+                surface.fetch_failed();
+                if !matches!(error, backend::Error::Busy) {
+                    self.model.notice = error.to_string();
+                }
+            }
+        }
+        if let Some(pending) = &mut self.input_geometry {
+            if pending
+                .requested
+                .is_none_or(|sent| now.duration_since(sent) >= Duration::from_secs(2))
+            {
+                match attach.fetch_snapshot() {
+                    Ok(()) => pending.requested = Some(now),
+                    Err(backend::Error::Busy) => {}
+                    Err(error) => {
+                        self.model.notice = error.to_string();
+                        self.disconnect();
+                    }
+                }
+            }
+        }
+        self.sync_theme();
+    }
+
+    fn sync_theme(&mut self) {
+        if !self.connected || self.sent_theme == Some(self.model.theme) {
+            return;
+        }
+        let Some(attach) = &self.attach else { return };
+        let (fg, bg, dark) = match self.model.theme {
+            view::Theme::Dark => ([221, 226, 234], [18, 22, 29], true),
+            view::Theme::Light => ([32, 43, 59], [248, 250, 253], false),
+        };
+        match attach.send_frame(Op::THEME, codec::enc_theme(fg, bg, dark)) {
+            Ok(()) => self.sent_theme = Some(self.model.theme),
+            Err(backend::Error::Busy) => {}
+            Err(error) => {
+                self.model.notice = error.to_string();
+                self.disconnect();
             }
         }
     }
 
     fn term_error(&mut self, payload: &[u8]) {
+        if let Some(surface) = &mut self.surface {
+            surface.fetch_failed();
+        }
         self.clear_operation();
         self.model.notice = match frames::dec_error(payload) {
             Ok((code, message)) => {
@@ -711,22 +822,52 @@ impl App {
         Ok(())
     }
 
-    fn send_input(&mut self, bytes: Vec<u8>) {
-        if bytes.is_empty() || !self.connected || !self.online() {
+    fn send_input(&mut self, event: frames::InputEvent) {
+        let release = matches!(event, frames::InputEvent::Key { action: 0, .. });
+        if !self.connected || !self.online() || (self.size == (0, 0) && !release) {
             return;
         }
+        let bytes = frames::enc_input(&event);
         if self.input_bytes + bytes.len() > 2 << 20 {
             self.model.notice = "输入队列已满，请等待远端接收后重试".into();
             return;
         }
-        for chunk in bytes.chunks(frames::DATA_CHUNK) {
-            self.input_bytes += chunk.len();
-            self.input_queue.push_back(chunk.to_vec());
+        if matches!(
+            event,
+            frames::InputEvent::Key { action: 1 | 2, .. } | frames::InputEvent::Text { .. }
+        ) {
+            if let Some(surface) = &mut self.surface {
+                surface.follow();
+            }
+        }
+        self.input_bytes += bytes.len();
+        self.input_queue.push_back(bytes);
+        let activity = matches!(
+            &event,
+            frames::InputEvent::Key { action: 1 | 2, .. }
+                | frames::InputEvent::Mouse {
+                    action: 0,
+                    button: 1..=11,
+                    ..
+                }
+        ) || matches!(&event, frames::InputEvent::Text { text, .. } if !text.is_empty());
+        if activity
+            && self
+                .surface
+                .as_ref()
+                .is_some_and(|surface| surface.geometry() != self.size)
+        {
+            self.input_geometry = Some(InputGeometry {
+                size: self.size,
+                requested: None,
+            });
         }
     }
 
     fn flush_input(&mut self) {
-        if self.sent_size != Some(self.size) || !self.online() {
+        // A previously forwarded kitty press still needs its release when the pane
+        // becomes hidden; fresh presses are rejected by send_input in that state.
+        if !self.online() || (self.size != (0, 0) && self.sent_size != Some(self.size)) {
             return;
         }
         for _ in 0..16 {
@@ -738,7 +879,7 @@ impl App {
                 self.input_bytes = 0;
                 break;
             };
-            match attach.send_data(bytes.clone()) {
+            match attach.send_frame(Op::INPUT, bytes.clone()) {
                 Ok(()) => self.input_bytes -= bytes.len(),
                 Err(backend::Error::Busy) => {
                     self.input_queue.push_front(bytes);
@@ -764,6 +905,10 @@ impl App {
 
     fn resize(&mut self, cols: u16, rows: u16) {
         if cols == 0 || rows == 0 {
+            self.input_geometry = None;
+            self.size = (0, 0);
+            self.input_queue.clear();
+            self.input_bytes = 0;
             return;
         }
         let size = homeway_core::term::size::Size::normalized(cols, rows);
@@ -771,12 +916,9 @@ impl App {
         if self.size != (cols, rows) {
             self.size = (cols, rows);
             self.render_dirty = true;
-            if let Some(vt) = &mut self.vt {
-                if let Err(error) = vt.resize(cols, rows) {
-                    self.model.notice = error.to_string();
-                    self.connected = false;
-                    return;
-                }
+            if let Some(pending) = &mut self.input_geometry {
+                pending.size = self.size;
+                pending.requested = None;
             }
         }
         if self.sent_size == Some((cols, rows)) {
@@ -791,16 +933,6 @@ impl App {
                     self.connected = false;
                 }
             }
-        }
-    }
-
-    fn apply_theme(&mut self) {
-        if let Some(vt) = &mut self.vt {
-            let (fg, bg) = match self.model.theme {
-                Theme::Dark => ([221, 226, 234], [18, 22, 29]),
-                Theme::Light => ([32, 43, 59], [248, 250, 253]),
-            };
-            vt.set_default_colors(fg, bg);
         }
     }
 
@@ -876,6 +1008,15 @@ impl App {
                 }
             }
             Action::CloseSession => {
+                if self
+                    .model
+                    .selected_session
+                    .and_then(|index| self.model.sessions.get(index))
+                    .is_some_and(|session| session.self_session)
+                {
+                    self.model.notice = "承载当前 TUI 的会话不能在此关闭；退出 TUI 后再关闭".into();
+                    return Ok(false);
+                }
                 self.clear_operation();
                 if let Some(name) = self.selected_name() {
                     self.navigation_epoch = self.navigation_epoch.wrapping_add(1);
@@ -887,41 +1028,75 @@ impl App {
                 }
             }
             Action::SendKey(event) => {
-                if let Some(vt) = &self.vt {
-                    self.send_input(input::key(vt, event));
+                if let Some(event) = input::key(event) {
+                    self.send_input(event);
                 }
             }
             Action::Paste(text) => {
-                // 单个事务≤1MiB，与既有服务端粘贴事务上界一致。
+                // A transaction is at most 1 MiB, as in the existing service.
                 if text.len() > 1 << 20 {
                     self.model.notice = "粘贴超过 1 MiB，请分批粘贴".into();
-                } else if self.input_bytes + text.len() + 12 > 2 << 20 {
-                    self.model.notice = "输入队列忙，请稍后粘贴".into();
-                } else if let Some(vt) = &self.vt {
-                    let bracketed = vt.modes().bracketed_paste;
-                    let chunks = text.as_bytes().chunks(8 << 10);
-                    let count = chunks.len();
-                    for (i, bytes) in chunks.enumerate() {
-                        if let Some(bytes) =
-                            keyenc::encode_paste_part(bytes, bracketed, i == 0, i + 1 == count)
-                        {
-                            self.send_input(bytes);
+                } else {
+                    let chunks = input::paste(&text);
+                    let bytes = text.len() + chunks.len() * 4;
+                    if self.input_bytes + bytes > 2 << 20 {
+                        self.model.notice = "输入队列忙，请稍后粘贴".into();
+                    } else {
+                        for event in chunks {
+                            self.send_input(event);
                         }
                     }
                 }
             }
-            Action::TerminalMouse(event) => {
-                if let Some(vt) = &self.vt {
-                    self.send_input(input::mouse(vt, event));
+            Action::TerminalMouse(mut event) => {
+                use crossterm::event::MouseEventKind;
+                let paired = match event.kind {
+                    MouseEventKind::Up(button) | MouseEventKind::Drag(button) => {
+                        self.mouse_pressed.contains(&button)
+                    }
+                    _ => false,
+                };
+                let activating = matches!(
+                    event.kind,
+                    MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                );
+                // A key, paste or wheel may already have taken pane geometry on the
+                // server while the old wide snapshot is still visible. Unpaired
+                // passive events wait for an authoritative matching baseline.
+                if self.input_geometry.is_some() && !activating && !paired {
+                    return Ok(false);
+                }
+                if let Some((column, row)) = self.surface.as_ref().and_then(|surface| {
+                    surface.mouse_position(event.column, event.row, activating || paired)
+                }) {
+                    event.column = column;
+                    event.row = row;
+                    if let Some(input) = input::mouse(event) {
+                        let queued = self.input_queue.len();
+                        self.send_input(input);
+                        if self.input_queue.len() > queued {
+                            match event.kind {
+                                MouseEventKind::Down(button)
+                                    if !self.mouse_pressed.contains(&button) =>
+                                {
+                                    self.mouse_pressed.push(button)
+                                }
+                                MouseEventKind::Up(button) => {
+                                    self.mouse_pressed.retain(|pressed| *pressed != button)
+                                }
+                                _ => {}
+                            }
+                        }
+                    }
+                } else {
+                    self.model.notice = "正在浏览历史；Shift+End 返回实时画面".into();
                 }
             }
-            Action::ThemeChanged => {
-                self.clear_operation();
-                self.apply_theme();
-                self.model.notice = match save_theme(&self.state_dir, self.model.theme) {
-                    Ok(()) => "主题已保存".into(),
-                    Err(error) => format!("主题已切换，保存失败：{error}"),
-                };
+            Action::Scroll(action) => {
+                if let Some(surface) = &mut self.surface {
+                    surface.scroll(action, self.size.1);
+                }
+                self.render_dirty = true;
             }
         }
         Ok(false)
@@ -978,6 +1153,7 @@ fn session_item(session: backend::Session) -> view::SessionItem {
             .filter(|label| !label.is_empty())
             .unwrap_or(session.agent),
         project,
+        self_session: session.self_session,
         state: match session.state {
             backend::SessionState::Working => view::SessionState::Working,
             backend::SessionState::Idle => view::SessionState::Idle,
@@ -994,7 +1170,6 @@ mod tests {
     fn app() -> App {
         App::new(Options {
             state: std::env::temp_dir().join(format!("homeway-tui-events-{}", std::process::id())),
-            theme: None,
         })
     }
 
@@ -1233,8 +1408,25 @@ mod tests {
             Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
             &geometry,
         );
-        app.vt = Some(SessionVt::new(80, 24, 0).unwrap());
-        app.vt.as_mut().unwrap().write(b"KEEP");
+        let mut vt = homeway_core::term::vt::SessionVt::new(80, 24, 0).unwrap();
+        vt.write(b"KEEP");
+        let mut surface = surface::Surface::default();
+        surface
+            .snapshot(codec::SnapshotBody {
+                seq: 1,
+                cols: 80,
+                rows: 24,
+                grid: codec::encode_grid(80, 24, &vt.rows()),
+                scroll: codec::ScrollbarWire {
+                    total: 24,
+                    offset: 0,
+                    len: 24,
+                },
+                ..Default::default()
+            })
+            .unwrap();
+        surface.prepare(24);
+        app.surface = Some(surface);
         app.input_queue.push_back(b"old-input".to_vec());
         app.disconnect();
         assert!(matches!(
@@ -1246,7 +1438,10 @@ mod tests {
             Action::SendKey(_)
         ));
         assert!(app.input_queue.is_empty());
-        assert!(app.vt.as_mut().unwrap().screen_text().contains("KEEP"));
+        assert_eq!(
+            app.surface.as_ref().unwrap().view().rows[0].cells[0].symbol,
+            "K"
+        );
     }
 
     #[test]
@@ -1261,5 +1456,192 @@ mod tests {
         let item = session_item(session);
         assert_eq!(item.agent, "pi");
         assert_eq!(item.project, "project");
+    }
+
+    #[test]
+    fn hidden_pane_rejects_new_input_but_keeps_a_previously_forwarded_release() {
+        let mut app = app();
+        app.connected = true;
+        app.resize(0, 0);
+        app.send_input(frames::InputEvent::Key {
+            key: 20,
+            mods: 0,
+            action: 1,
+            text: "a".into(),
+        });
+        assert!(app.input_queue.is_empty());
+        app.send_input(frames::InputEvent::Key {
+            key: 20,
+            mods: 0,
+            action: 0,
+            text: "a".into(),
+        });
+        assert_eq!(app.input_queue.len(), 1);
+        assert!(matches!(
+            frames::dec_input(app.input_queue.front().unwrap()).unwrap(),
+            frames::InputEvent::Key { action: 0, .. }
+        ));
+    }
+
+    #[test]
+    fn self_session_is_rejected_before_detaching_the_existing_screen() {
+        let mut app = app();
+        app.model.sessions.push(view::SessionItem {
+            name: "carrier".into(),
+            title: "carrier".into(),
+            agent: "shell".into(),
+            project: String::new(),
+            self_session: true,
+            state: view::SessionState::Idle,
+        });
+        app.surface = Some(surface::Surface::default());
+        app.active_session = Some("other".into());
+        let generation = app.generation;
+        app.select_session(0).unwrap();
+        assert_eq!(app.generation, generation);
+        assert_eq!(app.active_session.as_deref(), Some("other"));
+        assert!(app.surface.is_some());
+        assert!(app.model.notice.contains("承载当前"));
+        app.model.selected_session = Some(0); // Defense even if a caller bypasses view selection.
+        let navigation = app.navigation_epoch;
+        app.action(Action::CloseSession).unwrap();
+        assert_eq!(app.navigation_epoch, navigation);
+        assert!(app.model.notice.contains("退出 TUI 后再关闭"));
+    }
+
+    #[test]
+    fn mouse_press_release_pair_uses_new_pane_coordinates_before_snapshot_arrives() {
+        use crossterm::event::{KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+        let mut vt = homeway_core::term::vt::SessionVt::new(120, 40, 0).unwrap();
+        vt.write(b"\x1b[35;1HLOW_CURSOR");
+        let mut surface = surface::Surface::default();
+        surface
+            .snapshot(codec::SnapshotBody {
+                cols: 120,
+                rows: 40,
+                seq: 1,
+                cursor: codec::surface_cursor_of(&vt.cursor()),
+                scroll: vt.scrollbar().into(),
+                grid: codec::encode_grid(120, 40, &vt.rows()),
+                ..Default::default()
+            })
+            .unwrap();
+        surface.prepare(25);
+        let mut app = app();
+        app.surface = Some(surface);
+        app.connected = true;
+        app.size = (60, 25);
+        for kind in [
+            MouseEventKind::Down(MouseButton::Left),
+            MouseEventKind::Up(MouseButton::Left),
+        ] {
+            app.action(Action::TerminalMouse(MouseEvent {
+                kind,
+                column: 2,
+                row: 3,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .unwrap();
+        }
+        assert_eq!(app.input_queue.len(), 2);
+        for bytes in &app.input_queue {
+            assert!(matches!(
+                frames::dec_input(bytes).unwrap(),
+                frames::InputEvent::Mouse { x: 2, y: 3, .. }
+            ));
+        }
+        assert!(app.mouse_pressed.is_empty());
+        app.action(Action::TerminalMouse(MouseEvent {
+            kind: MouseEventKind::Up(MouseButton::Left),
+            column: 2,
+            row: 3,
+            modifiers: KeyModifiers::NONE,
+        }))
+        .unwrap();
+        assert_eq!(
+            app.input_queue.len(),
+            2,
+            "unpaired release waits for the new pane baseline instead of using the old crop offset"
+        );
+        app.detach();
+        assert!(app.mouse_pressed.is_empty());
+    }
+
+    #[test]
+    fn keys_paste_and_wheel_hold_passive_mouse_until_pane_baseline_arrives() {
+        use crossterm::event::{KeyModifiers, MouseEvent, MouseEventKind};
+        for input in [
+            frames::InputEvent::Key {
+                key: 20,
+                mods: 0,
+                action: 1,
+                text: "a".into(),
+            },
+            frames::InputEvent::Text {
+                flags: frames::text_bits::PASTE,
+                text: "paste".into(),
+            },
+            frames::InputEvent::Mouse {
+                action: 0,
+                button: 4,
+                mods: 0,
+                x: 2,
+                y: 3,
+            },
+        ] {
+            let mut vt = homeway_core::term::vt::SessionVt::new(120, 40, 0).unwrap();
+            vt.write(b"\x1b[35;1HLOW");
+            let mut surface = surface::Surface::default();
+            surface
+                .snapshot(codec::SnapshotBody {
+                    cols: 120,
+                    rows: 40,
+                    seq: 1,
+                    cursor: codec::surface_cursor_of(&vt.cursor()),
+                    scroll: vt.scrollbar().into(),
+                    grid: codec::encode_grid(120, 40, &vt.rows()),
+                    ..Default::default()
+                })
+                .unwrap();
+            surface.prepare(25);
+            let mut app = app();
+            app.surface = Some(surface);
+            app.connected = true;
+            app.size = (60, 25);
+            app.send_input(input);
+            assert_eq!(app.input_geometry.as_ref().unwrap().size, (60, 25));
+            let queued = app.input_queue.len();
+            app.action(Action::TerminalMouse(MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: 2,
+                row: 3,
+                modifiers: KeyModifiers::NONE,
+            }))
+            .unwrap();
+            assert_eq!(
+                app.input_queue.len(),
+                queued,
+                "passive mouse cannot address old wide geometry after real input"
+            );
+            vt.resize(60, 25).unwrap();
+            let body = codec::SnapshotBody {
+                cols: 60,
+                rows: 25,
+                seq: 2,
+                revision: 2,
+                history_epoch: vt.history_epoch(),
+                history_base: vt.history_base(),
+                cursor: codec::surface_cursor_of(&vt.cursor()),
+                scroll: vt.scrollbar().into(),
+                grid: codec::encode_grid(60, 25, &vt.rows()),
+                ..Default::default()
+            };
+            for fragment in
+                codec::fragment_payload(&codec::gzip_bytes(&codec::enc_snapshot_body(&body)))
+            {
+                app.surface_frame(Op::SNAPSHOT, &fragment).unwrap();
+            }
+            assert!(app.input_geometry.is_none());
+        }
     }
 }

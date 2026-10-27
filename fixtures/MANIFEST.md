@@ -50,7 +50,7 @@ daemon 控制面帧向量 + `decode_check.py`（**语言无关**的解码对拍�
 
 | 本仓路径 | 来源（baseline 克隆内） | 用途（R6） | sha256 |
 |---|---|---|---|
-| `term/frames.v1.jsonl` | 历史帧案例；2026-10-21 HELLO 更新为当前必需完整尾 | term 协议帧解析 golden（13 案：greeting/hello/…；不再接受无版本/无ID HELLO） | `be9e9f0190a3c77e63822c365f4a2d752a884b43bf98549b5e5eca4ade23b6ea` |
+| `term/frames.v1.jsonl` | 历史帧案例；2026-10-21 HELLO 完整尾；2026-10-27 GREETING/HELLO 新增 observer 能力 | term 协议帧解析 golden（14 案：greeting/hello/…；不再接受无版本/无ID HELLO） | `0da6ab734cbb920faab8ec0eaeaf84aa958392b7053ff67555fd53c509f4f038` |
 | `term-vt/session-cjk.bin` | `pkg/term/vt/testdata/session-cjk.bin` | vt 会话回放（CJK） | `5a60ceb2cfaafc566efd595f2835aa772159503364c692e3e179bb9a7e3d6ff8` |
 | `term-vt/session-git-log.bin` | `pkg/term/vt/testdata/session-git-log.bin` | vt 会话回放（git log） | `688c69bafbbfb4eba14f46da4ef8c22fbc93f77318e95b4ce5449723c32a59b3` |
 | `term-vt/session-hexdump.bin` | `pkg/term/vt/testdata/session-hexdump.bin` | vt 会话回放（hexdump） | `c60ffb2e49a6cd09ca565e0de14817ad963801975fb9ca603c51b640fb12d07e` |

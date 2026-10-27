@@ -1,4 +1,4 @@
-//! TUI raw 终端腿：有界下行队列、可取消连接与独立写线程。
+//! TUI surface 观察腿：有界下行队列、可取消连接与独立写线程。
 use std::net::Shutdown;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
@@ -26,6 +26,7 @@ enum Connection {
 pub(super) struct TermConnection {
     inner: Connection,
     deadline: Instant,
+    features: u32,
 }
 
 impl Drop for TermConnection {
@@ -95,12 +96,20 @@ impl TermConnection {
                 }
             }
         };
-        let mut connection = Self { inner, deadline };
+        let mut connection = Self {
+            inner,
+            deadline,
+            features: 0,
+        };
         let greeting = connection.read(Some(IO_BUDGET))?;
         if greeting.op != Op::GREETING {
             return Err(Error::Unexpected(greeting.op.0));
         }
-        frames::dec_greeting(&greeting.payload)?;
+        let (version, features) = frames::dec_greeting(&greeting.payload)?;
+        if version != frames::PROTO_VER {
+            return Err(Error::ObserverUnavailable);
+        }
+        connection.features = features;
         Ok(connection)
     }
 
@@ -291,12 +300,13 @@ impl Attach {
         let running = Arc::clone(&cancel);
         std::thread::spawn(move || {
             let run = || -> Result<(), Error> {
-                if std::env::var("TERM_SESSION_ID").as_deref()
-                    == Ok(format!("tailcat-{name}").as_str())
-                {
-                    return Err(Error::SelfAttach);
-                }
                 let mut connection = TermConnection::connect(&state, &target)?;
+                let required = frames::features::SURFACE
+                    | frames::features::PROTO_VER
+                    | frames::features::OBSERVER;
+                if connection.features & required != required {
+                    return Err(Error::ObserverUnavailable);
+                }
                 *running
                     .closer
                     .lock()
@@ -309,10 +319,10 @@ impl Attach {
                 let hello = frames::enc_hello(
                     cols.max(1),
                     rows.max(1),
-                    0,
+                    frames::hello_flags::OBSERVER,
                     &name,
                     &frames::enc_hello_tail(
-                        caps::RAW_TERMINAL | caps::PROTO_VER | platform,
+                        caps::SURFACE | caps::PROTO_VER | platform,
                         &identifier,
                     ),
                 );
@@ -406,12 +416,23 @@ impl Attach {
             })
     }
 
-    pub fn send_data(&self, data: Vec<u8>) -> Result<(), Error> {
-        // 一个 DATA 帧绝不超过服务协议的长度边界。大粘贴由调用方分块投递。
+    pub fn send_frame(&self, op: Op, data: Vec<u8>) -> Result<(), Error> {
         if data.len() > frames::DATA_CHUNK {
             return Err(Error::Busy);
         }
-        self.send(Op::DATA, data)
+        self.send(op, data)
+    }
+    pub fn fetch_rows(
+        &self,
+        request: homeway_core::term::codec::FetchRowsReq,
+    ) -> Result<(), Error> {
+        self.send_frame(
+            Op::FETCH_ROWS,
+            homeway_core::term::codec::enc_fetch_rows_req(request),
+        )
+    }
+    pub fn fetch_snapshot(&self) -> Result<(), Error> {
+        self.send_frame(Op::FETCH_SNAPSHOT, Vec::new())
     }
     pub fn resize(&self, cols: u16, rows: u16) -> Result<(), Error> {
         self.send(Op::RESIZE, frames::enc_resize(cols.max(1), rows.max(1)))
@@ -451,7 +472,6 @@ mod tests {
         };
         let mut app = super::super::App::new(super::super::Options {
             state: PathBuf::from("/tmp/hw-tui-resize-queue-test"),
-            theme: None,
         });
         app.attach = Some(attach);
         app.resize(90, 25);
@@ -466,9 +486,10 @@ mod tests {
     }
 
     #[test]
-    fn replay_queries_do_not_reply_but_live_queries_do() {
+    fn observer_handshake_preserves_surface_and_only_writes_explicit_input() {
+        use homeway_core::term::codec;
         let root = PathBuf::from("/tmp").join(format!(
-            "hw-tui-replay-{}-{}",
+            "hw-tui-surface-{}-{}",
             std::process::id(),
             std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
@@ -477,59 +498,120 @@ mod tests {
         ));
         std::fs::create_dir_all(&root).unwrap();
         let listener = UnixListener::bind(root.join("term.sock")).unwrap();
+        let (idle_tx, idle) = mpsc::channel();
         let (observed_tx, observed) = mpsc::channel();
+        let payload = codec::fragment_payload(&codec::gzip_bytes(&codec::enc_snapshot_body(
+            &codec::SnapshotBody {
+                cols: 120,
+                rows: 30,
+                seq: 7,
+                grid: codec::encode_grid(120, 30, &[]),
+                ..Default::default()
+            },
+        )))
+        .remove(0);
+        let expected = payload.clone();
         let server = std::thread::spawn(move || {
             let (socket, _) = listener.accept().unwrap();
             let mut io = FrameIo::new(socket);
             io.write_frame(Op::GREETING, &frames::enc_greeting(), IO_BUDGET)
                 .unwrap();
-            assert_eq!(io.read_frame_deadline(IO_BUDGET).unwrap().op, Op::HELLO);
+            let hello = io.read_frame_deadline(IO_BUDGET).unwrap();
+            assert_eq!(hello.op, Op::HELLO);
+            let (cols, rows, flags, name, tail) = frames::dec_hello(&hello.payload).unwrap();
+            assert_eq!(
+                (cols, rows, flags, name.as_str()),
+                (80, 24, frames::hello_flags::OBSERVER, "session")
+            );
+            assert_ne!(
+                frames::dec_hello_tail(tail).unwrap().caps & caps::SURFACE,
+                0
+            );
             io.write_frame(
                 Op::ATTACHED,
-                &frames::enc_attached(80, 24, 0, 0, 3, "session"),
+                &frames::enc_attached(120, 30, 0, 0, 3, "session"),
                 IO_BUDGET,
             )
             .unwrap();
-            io.write_frame(Op::DATA, b"\x1b[c\x1b[5n", IO_BUDGET)
-                .unwrap();
-            io.write_frame(Op::REPLAY_DONE, &frames::enc_replay_done(7, 0), IO_BUDGET)
-                .unwrap();
-            io.write_frame(Op::DATA, b"\x1b[5n", IO_BUDGET).unwrap();
+            io.write_frame(Op::SNAPSHOT, &payload, IO_BUDGET).unwrap();
+            io.write_frame(Op::SNAPSHOT_DONE, &[], IO_BUDGET).unwrap();
+            assert!(
+                io.read_frame_deadline(Duration::from_millis(50)).is_err(),
+                "surface只观察不自动答复或抢几何"
+            );
+            idle_tx.send(()).unwrap();
             observed_tx
                 .send(io.read_frame_deadline(IO_BUDGET).unwrap())
                 .unwrap();
         });
-        let mut app = super::super::App::new(super::super::Options {
-            state: root.clone(),
-            theme: None,
-        });
-        app.generation = 27;
-        app.vt = Some(homeway_core::term::vt::SessionVt::new(80, 24, 0).unwrap());
-        app.attach = Some(Attach::start(
-            root.clone(),
-            Target::Local,
-            "session".into(),
-            80,
-            24,
-            27,
-        ));
-        app.sent_size = Some((80, 24));
+        let attach = Attach::start(root.clone(), Target::Local, "session".into(), 80, 24, 27);
         let deadline = Instant::now() + IO_BUDGET;
-        let reply = loop {
-            app.process_attach();
-            app.flush_input();
-            if let Ok(frame) = observed.try_recv() {
-                break frame;
+        let mut saw_snapshot = false;
+        loop {
+            if let Some(event) = attach.try_event() {
+                assert_eq!(event.generation, 27);
+                let frame = event.frame.unwrap();
+                if frame.op == Op::SNAPSHOT {
+                    assert_eq!(frame.payload, expected);
+                    saw_snapshot = true;
+                }
+                if frame.op == Op::SNAPSHOT_DONE {
+                    break;
+                }
             }
             assert!(Instant::now() < deadline);
             std::thread::sleep(Duration::from_millis(2));
+        }
+        assert!(saw_snapshot);
+        idle.recv_timeout(IO_BUDGET).unwrap();
+        let input = frames::InputEvent::Text {
+            flags: 0,
+            text: "input".into(),
         };
-        assert_eq!(reply.op, Op::DATA);
-        assert_eq!(
-            reply.payload, b"\x1b[0n",
-            "只能回答实时DSR，不能先回历史DA或历史DSR"
-        );
-        drop(app);
+        attach
+            .send_frame(Op::INPUT, frames::enc_input(&input))
+            .unwrap();
+        let frame = observed.recv_timeout(IO_BUDGET).unwrap();
+        assert_eq!(frame.op, Op::INPUT);
+        assert_eq!(frames::dec_input(&frame.payload).unwrap(), input);
+        drop(attach);
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn old_server_is_rejected_before_sending_observer_hello() {
+        let root = PathBuf::from("/tmp").join(format!(
+            "hw-tui-old-surface-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let listener = UnixListener::bind(root.join("term.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut io = FrameIo::new(socket);
+            io.write_frame(Op::GREETING, &[1, 0x7f, 0, 0, 0], IO_BUDGET)
+                .unwrap();
+            assert!(
+                io.read_frame_deadline(IO_BUDGET).is_err(),
+                "旧服务不能收到有副作用的HELLO"
+            );
+        });
+        let attach = Attach::start(root.clone(), Target::Local, "session".into(), 80, 24, 28);
+        let deadline = Instant::now() + IO_BUDGET;
+        loop {
+            if let Some(event) = attach.try_event() {
+                assert!(matches!(event.frame, Err(Error::ObserverUnavailable)));
+                break;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        drop(attach);
         server.join().unwrap();
         std::fs::remove_dir_all(root).unwrap();
     }

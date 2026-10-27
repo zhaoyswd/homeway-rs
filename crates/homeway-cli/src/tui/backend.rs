@@ -45,8 +45,8 @@ pub(super) enum Error {
     StreamEnded(String),
     #[error("远端在预算内未应答，请稍后重试")]
     Timeout,
-    #[error("当前会话不能接入自身，请选择另一个会话")]
-    SelfAttach,
+    #[error("目标终端不支持观察接入；请升级目标主机的 homeway 后重试")]
+    ObserverUnavailable,
     #[error("本地终端未就绪；请用包含 tui 的版本启动 homeway 统一进程（不会自动重启现有守护）")]
     LocalUnavailable,
 }
@@ -131,6 +131,47 @@ pub(super) struct Session {
     pub cwd: Option<String>,
     #[serde(rename = "lastActiveMs")]
     pub last_active_ms: i64,
+    pub pid: i32,
+    /// 仅由本机真实进程祖先链判定，永不相信远端同号 PID 或会话名字。
+    #[serde(skip)]
+    pub self_session: bool,
+}
+
+fn mark_self_sessions(
+    target: &Target,
+    sessions: &mut [Session],
+    pid: i32,
+    procs: &[homeway_core::term::agent::ProcInfo],
+    confirmed: &mut std::collections::BTreeMap<String, i32>,
+) {
+    if *target != Target::Local {
+        for session in sessions {
+            session.self_session = false;
+        }
+        return;
+    }
+    // 只有仍然存在的同名同PID可保留已确证身份；采样缺口不撤销真实祖先证据。
+    confirmed.retain(|name, pid| {
+        sessions
+            .iter()
+            .any(|session| session.name == *name && session.pid == *pid)
+    });
+    let mut ancestors = std::collections::HashSet::new();
+    let mut current = pid;
+    while current > 0 && ancestors.insert(current) {
+        let Some(process) = procs.iter().find(|process| process.pid == current) else {
+            break;
+        };
+        current = process.ppid;
+    }
+    for session in sessions {
+        session.self_session = session.pid > 0
+            && (ancestors.contains(&session.pid)
+                || confirmed.get(&session.name) == Some(&session.pid));
+        if session.self_session {
+            confirmed.insert(session.name.clone(), session.pid);
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -222,6 +263,7 @@ impl Backend {
             let mut worker = Worker {
                 state_dir: refresh_state,
                 control: None,
+                self_sessions: Default::default(),
             };
             while refreshing.load(Ordering::Acquire) {
                 match refresh_requests.recv_timeout(Duration::from_millis(100)) {
@@ -261,6 +303,7 @@ impl Backend {
             let mut worker = Worker {
                 state_dir: query_state,
                 control: None,
+                self_sessions: Default::default(),
             };
             while query_alive.load(Ordering::Acquire) {
                 let target = {
@@ -305,6 +348,7 @@ impl Backend {
             let mut worker = Worker {
                 state_dir: mutation_state,
                 control: None,
+                self_sessions: Default::default(),
             };
             while running.load(Ordering::Acquire) {
                 let command = match rx.recv_timeout(Duration::from_millis(100)) {
@@ -455,6 +499,7 @@ pub(super) fn deliver<T>(tx: &mpsc::SyncSender<T>, mut value: T, alive: &AtomicB
 struct Worker {
     state_dir: PathBuf,
     control: Option<Arc<ControlClient>>,
+    self_sessions: std::collections::BTreeMap<String, i32>,
 }
 
 impl Drop for Worker {
@@ -586,6 +631,17 @@ impl Worker {
             TermConnection::connect_with_budget(&self.state_dir, target, REQUEST_BUDGET)?;
         let frame = connection.round_trip(homeway_core::term::frames::Op::LIST, &[])?;
         let mut sessions: Sessions = serde_json::from_slice(&frame.payload)?;
+        if *target == Target::Local && !sessions.sessions.is_empty() {
+            mark_self_sessions(
+                target,
+                &mut sessions.sessions,
+                std::process::id() as i32,
+                &homeway_core::term::agent::read_procs(),
+                &mut self.self_sessions,
+            );
+        } else if *target == Target::Local {
+            self.self_sessions.clear();
+        }
         sessions
             .sessions
             .sort_by_key(|s| std::cmp::Reverse(s.last_active_ms));
@@ -724,6 +780,96 @@ impl Worker {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn self_session_requires_local_ancestor_pid_not_name_or_remote_pid() {
+        use homeway_core::term::agent::ProcInfo;
+        let procs = vec![
+            ProcInfo {
+                pid: 30,
+                ppid: 20,
+                ..Default::default()
+            },
+            ProcInfo {
+                pid: 20,
+                ppid: 10,
+                ..Default::default()
+            },
+            ProcInfo {
+                pid: 10,
+                ppid: 1,
+                ..Default::default()
+            },
+        ];
+        let mut confirmed = Default::default();
+        let mut sessions = vec![
+            Session {
+                name: "carrier".into(),
+                pid: 10,
+                ..Default::default()
+            },
+            Session {
+                name: "same-name".into(),
+                pid: 999,
+                ..Default::default()
+            },
+            Session {
+                pid: 0,
+                ..Default::default()
+            },
+        ];
+        mark_self_sessions(
+            &Target::Remote("other-machine".into()),
+            &mut sessions,
+            30,
+            &procs,
+            &mut confirmed,
+        );
+        assert!(sessions.iter().all(|s| !s.self_session));
+        mark_self_sessions(&Target::Local, &mut sessions, 30, &procs, &mut confirmed);
+        assert!(sessions[0].self_session);
+        assert!(!sessions[1].self_session && !sessions[2].self_session);
+        let cycle = vec![
+            ProcInfo {
+                pid: 30,
+                ppid: 20,
+                ..Default::default()
+            },
+            ProcInfo {
+                pid: 20,
+                ppid: 30,
+                ..Default::default()
+            },
+        ];
+        mark_self_sessions(&Target::Local, &mut sessions, 30, &cycle, &mut confirmed);
+        assert!(
+            sessions[0].self_session,
+            "采样缺失仍保留已经确证的同名同PID祖先"
+        );
+        mark_self_sessions(
+            &Target::Remote("alias".into()),
+            &mut sessions,
+            30,
+            &[],
+            &mut confirmed,
+        );
+        assert!(
+            sessions.iter().all(|session| !session.self_session),
+            "远端不得沿用本机祖先证据"
+        );
+        sessions[0].pid = 11;
+        mark_self_sessions(&Target::Local, &mut sessions, 30, &[], &mut confirmed);
+        assert!(
+            !sessions[0].self_session && confirmed.is_empty(),
+            "PID变化清理旧证据"
+        );
+        sessions[0].pid = 10;
+        mark_self_sessions(&Target::Local, &mut sessions, 30, &procs, &mut confirmed);
+        assert!(sessions[0].self_session);
+        sessions.clear();
+        mark_self_sessions(&Target::Local, &mut sessions, 30, &[], &mut confirmed);
+        assert!(confirmed.is_empty(), "会话消失清理旧证据");
+    }
     use homeway_core::daemon::{
         frame as control_frame,
         proto::{HelloBody, RequestBody, ResponseBody, WelcomeBody},
@@ -872,6 +1018,7 @@ mod tests {
         let mut worker = Worker {
             state_dir: root.clone(),
             control: None,
+            self_sessions: Default::default(),
         };
         let result = worker.snapshot_with_budget(Duration::from_millis(120));
         assert!(matches!(result, Err(Error::Control(ref error)) if error.code == "timeout"));
@@ -940,6 +1087,7 @@ mod tests {
         let mut worker = Worker {
             state_dir: root.clone(),
             control: Some(client),
+            self_sessions: Default::default(),
         };
         let events = worker
             .execute(Command::SetRole {
@@ -975,6 +1123,7 @@ mod tests {
         let mut worker = Worker {
             state_dir: root.clone(),
             control: None,
+            self_sessions: Default::default(),
         };
         let events = worker
             .execute(Command::KillSession {

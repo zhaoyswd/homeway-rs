@@ -71,10 +71,12 @@ def stop_process(process):
 
 
 class Tui:
-    def __init__(self, binary, state):
+    def __init__(self, binary, state, background="rgb:0000/0000/0000"):
         self.master, self.slave = pty.openpty()
         self.before = termios.tcgetattr(self.slave)
         self.output = bytearray()
+        self.background = background
+        self._probe_buffer = b""
         self._stub_diagnostics = set()
         self.screen = pyte.Screen(100, 30)
         self.stream = pyte.ByteStream(self.screen)
@@ -84,6 +86,7 @@ class Tui:
         env = os.environ.copy()
         env["TERM"] = "xterm-256color"
         env["COLORTERM"] = "truecolor"
+        env["COLORFGBG"] = "15;0"
         env.pop("NO_COLOR", None)  # The automation shell sets this; emulate a color-capable terminal.
         env.pop("HOMEWAY_TERM", None)
 
@@ -174,6 +177,13 @@ class Tui:
                 break
             self.output.extend(chunk)
             self.stream.feed(chunk)
+            query = b"\x1b]11;?\x1b\\"
+            probes = self._probe_buffer + chunk
+            while query in probes:
+                _, probes = probes.split(query, 1)
+                if self.background is not None:
+                    os.write(self.master, b"\x1b]11;" + self.background.encode("ascii") + b"\x1b\\")
+            self._probe_buffer = probes[-(len(query)-1):]
             # A real terminal answers these crossterm capability/cursor probes.
             if b"\x1b[6n" in chunk:
                 os.write(self.master, b"\x1b[1;1R")
@@ -304,7 +314,7 @@ def idle_cpu(tui, seconds=4):
     tui.drain(seconds)
     elapsed = time.monotonic()-started
     used = cumulative()-before
-    print(f"INFO: idle TUI CPU={used/elapsed*100:.2f}% over {elapsed:.2f}s; 100x30 window / 66x25 shell; one logical CPU=100%")
+    print(f"INFO: idle TUI CPU={used/elapsed*100:.2f}% over {elapsed:.2f}s; 100x30 window / 66x27 shell; one logical CPU=100%")
 
 
 def terminal_rows(tui):
@@ -393,7 +403,7 @@ def exercise_ls(tui, binary, state, snapshot_dir):
             assert colored and all(cell.fg not in ("default", "dde2ea") for cell in colored), f"{tag}: ls directory color lost"
         print(f"PASS: real ls {tag}; filenames rendered and original session/attach alive")
 
-    for cols, rows, inner_cols, inner_rows in ((100, 30, 66, 25), (160, 40, 121, 35)):
+    for cols, rows, inner_cols, inner_rows in ((100, 30, 66, 27), (160, 40, 121, 37)):
         tui.set_size(cols, rows)
         tui.signal(signal.SIGWINCH)
         tui.drain(0.2)
@@ -477,14 +487,14 @@ def main():
 
                 def project_visible():
                     first.drain()
-                    return project in first.screen_lines()[16][:33]
+                    return any(project in line[:33] for line in first.screen_lines())
 
                 wait_until(project_visible, "OSC7 project name in session sidebar")
                 print("PASS: OSC7 current directory reaches LIST and session project label")
                 first.send("printf 'HW_SIZE:%s\\n' \"$(stty size)\"\r")
-                first.wait("HW_SIZE:25 66")
+                first.wait("HW_SIZE:27 66")
                 snapshot(first, args.snapshot_dir, "shell-dark")
-                print("PASS: create shell, execute command, viewport matches PTY 66x25")
+                print("PASS: create shell, execute command, viewport matches PTY 66x27")
                 idle_cpu(first)
                 exercise_ls(first, binary, state, args.snapshot_dir)
 
@@ -492,13 +502,13 @@ def main():
                 first.signal(signal.SIGWINCH)
                 first.drain(0.5)
                 first.send("printf 'HW_RESIZE:%s\\n' \"$(stty size)\"\r")
-                first.wait("HW_RESIZE:31 81")
-                print("PASS: resize propagates to PTY 81x31")
+                first.wait("HW_RESIZE:33 81")
+                print("PASS: resize propagates to PTY 81x33")
 
-                # Switch theme through the TUI; this is private state only.
-                first.send(b"\x02t")
-                wait_until(lambda: (state / "tui-theme").exists(), "theme saved")
-                assert (state / "tui-theme").read_text().strip() == "light"
+                # Emulate the outer terminal changing its background, then focus-in.
+                first.background = "rgb:ffff/ffff/ffff"
+                first.send(b"\x1b[I")
+                wait_until(lambda: (first.drain() or first.screen.buffer[29][0].bg == "f8fafd"), "automatic light theme")
                 first.drain(0.15)
                 snapshot(first, args.snapshot_dir, "shell-light", light=True)
                 first.send(b"\x02q")
@@ -509,10 +519,10 @@ def main():
                 entries = sessions(binary, state)
                 assert len(entries) == 1, f"detaching lost session: {entries!r}"
                 name = entries[0]["name"]
-                print("PASS: theme persists, detach restores terminal and preserves shell")
+                print("PASS: automatic theme follows terminal, detach restores terminal and preserves shell")
 
-                second = Tui(binary, state)
-                second.wait("主题：浅色")
+                (state / "tui-theme").write_text("dark\n")  # Obsolete preference cannot override terminal background.
+                second = Tui(binary, state, background="rgb:ffff/ffff/ffff")
                 second.wait(name)
                 # Sidebar session focus, move to the first existing session, then attach.
                 second.send(b"\x02s\x1b[B\r")
@@ -532,7 +542,7 @@ def main():
                 def second_shell_attached():
                     second.drain()
                     lines = second.screen_lines()
-                    return closing_name in lines[1] and "已接入" in lines[-2]
+                    return closing_name in lines[0] and "已接入" in lines[-1]
 
                 wait_until(second_shell_attached, "second shell attached in TUI")
                 second.send(b"\x02s\x1bOQ")  # Session sidebar, F2 context menu.

@@ -1,7 +1,10 @@
 use crossterm::event::{
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use homeway_core::term::{keyenc, vt::SessionVt};
+use homeway_core::term::{
+    frames::{self, InputEvent},
+    keyenc,
+};
 
 fn modifiers(mods: KeyModifiers) -> keyenc::Mods {
     keyenc::Mods(
@@ -12,35 +15,7 @@ fn modifiers(mods: KeyModifiers) -> keyenc::Mods {
     )
 }
 
-/// 兼容只有ATTACHED legacy位的服务。先应用于空VT，回放与新服务权威检查点随后覆盖。
-/// ALT_SCREEN由原raw回放的屏幕前序与历史负责，此处绝不重开/清屏。
-pub(super) fn attached_modes(vt: &mut SessionVt, bits: u32) {
-    use homeway_core::term::codec::mode_bits as m;
-    use std::fmt::Write as _;
-    let mut sequence = String::new();
-    for (number, flag) in [(1, m::DECCKM), (1004, m::FOCUS), (2004, m::BRACKETED)] {
-        let _ = write!(
-            sequence,
-            "\x1b[?{number}{}",
-            if bits & flag != 0 { 'h' } else { 'l' }
-        );
-    }
-    // reset其它mouse模式也会清last-set值，所以必须先全部reset，再只重放启用项。
-    sequence.push_str("\x1b[?1000l\x1b[?1002l\x1b[?1003l\x1b[?1006l");
-    for (number, flag) in [
-        (1000, m::MOUSE_1000),
-        (1002, m::MOUSE_1002),
-        (1003, m::MOUSE_1003),
-        (1006, m::MOUSE_1006),
-    ] {
-        if bits & flag != 0 {
-            let _ = write!(sequence, "\x1b[?{number}h");
-        }
-    }
-    vt.write(sequence.as_bytes());
-}
-
-pub(super) fn key(vt: &SessionVt, event: KeyEvent) -> Vec<u8> {
+pub(super) fn key(event: KeyEvent) -> Option<InputEvent> {
     let mut text = String::new();
     let code = match event.code {
         KeyCode::Char(c) => {
@@ -78,7 +53,7 @@ pub(super) fn key(vt: &SessionVt, event: KeyEvent) -> Vec<u8> {
         KeyCode::Insert => 72,
         KeyCode::Delete => 68,
         KeyCode::F(n @ 1..=25) => 120 + u16::from(n),
-        _ => return Vec::new(),
+        _ => return None,
     };
     let mut mods = modifiers(event.modifiers);
     if event.code == KeyCode::BackTab {
@@ -89,20 +64,15 @@ pub(super) fn key(vt: &SessionVt, event: KeyEvent) -> Vec<u8> {
         KeyEventKind::Repeat => keyenc::KeyAction::Repeat,
         KeyEventKind::Release => keyenc::KeyAction::Release,
     };
-    // 外层终端已把 Option/Alt 组合解释成字符；ASCII Alt 前缀须显式保留。
-    vt.encode_key(
-        &keyenc::KeyEvent {
-            key: keyenc::Key(code),
-            action,
-            mods,
-            text: &text,
-            composing: false,
-        },
-        keyenc::KeyFlavor::AltEscPrefix,
-    )
+    Some(InputEvent::Key {
+        key: code,
+        action: action as u8,
+        mods: mods.0,
+        text,
+    })
 }
 
-pub(super) fn mouse(vt: &SessionVt, event: MouseEvent) -> Vec<u8> {
+pub(super) fn mouse(event: MouseEvent) -> Option<InputEvent> {
     let button = |b| match b {
         MouseButton::Left => keyenc::MouseButton::LEFT,
         MouseButton::Right => keyenc::MouseButton::RIGHT,
@@ -115,15 +85,47 @@ pub(super) fn mouse(vt: &SessionVt, event: MouseEvent) -> Vec<u8> {
         MouseEventKind::Moved => (keyenc::MouseAction::Motion, keyenc::MouseButton::UNKNOWN),
         MouseEventKind::ScrollUp => (keyenc::MouseAction::Press, keyenc::MouseButton::FOUR),
         MouseEventKind::ScrollDown => (keyenc::MouseAction::Press, keyenc::MouseButton::FIVE),
-        _ => return Vec::new(),
+        _ => return None,
     };
-    vt.encode_mouse(&keyenc::MouseEvent {
-        action,
-        button,
-        mods: modifiers(event.modifiers),
+    Some(InputEvent::Mouse {
+        action: action as u8,
+        button: button.0,
+        mods: modifiers(event.modifiers).0,
         x: event.column,
         y: event.row,
     })
+}
+
+/// Keep paste transaction boundaries while splitting only at valid UTF-8 boundaries.
+pub(super) fn paste(text: &str) -> Vec<InputEvent> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let mut chunks = Vec::new();
+    let mut remaining = text;
+    while !remaining.is_empty() {
+        let mut end = remaining.len().min(8 << 10);
+        while !remaining.is_char_boundary(end) {
+            end -= 1;
+        }
+        chunks.push(&remaining[..end]);
+        remaining = &remaining[end..];
+    }
+    let count = chunks.len();
+    chunks
+        .into_iter()
+        .enumerate()
+        .map(|(i, text)| InputEvent::Text {
+            flags: frames::text_bits::PASTE
+                | if i > 0 { frames::text_bits::CONT } else { 0 }
+                | if i + 1 < count {
+                    frames::text_bits::MORE
+                } else {
+                    0
+                },
+            text: text.into(),
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -131,54 +133,52 @@ mod tests {
     use super::*;
 
     #[test]
-    fn legacy_attached_modes_restore_mouse_and_paste_without_switching_screen() {
-        use homeway_core::term::codec::mode_bits as m;
-        let mut vt = SessionVt::new(80, 24, 0).unwrap();
-        vt.write(b"\x1b[?1049hKEEP");
-        attached_modes(
-            &mut vt,
-            m::MOUSE_1000 | m::MOUSE_1006 | m::BRACKETED | m::DECCKM,
-        );
-        assert!(vt.modes().bracketed_paste && vt.modes().cursor_keys_app);
-        assert_eq!(vt.modes().screen, homeway_core::term::vt::Screen::Alternate);
-        assert!(vt.screen_text().contains("KEEP"));
-        assert!(!mouse(
-            &vt,
-            MouseEvent {
-                kind: MouseEventKind::Down(MouseButton::Left),
-                column: 0,
-                row: 0,
-                modifiers: KeyModifiers::NONE
-            }
-        )
-        .is_empty());
+    fn abstract_keys_preserve_controls_unicode_and_event_kinds() {
+        for (code, modifiers, want_key, want_text) in [
+            (KeyCode::Char('c'), KeyModifiers::CONTROL, 22, "c"),
+            (KeyCode::Tab, KeyModifiers::NONE, 64, ""),
+            (KeyCode::Char('中'), KeyModifiers::NONE, 0, "中"),
+            (KeyCode::Up, KeyModifiers::NONE, 78, ""),
+        ] {
+            let event = key(KeyEvent::new(code, modifiers)).unwrap();
+            assert_eq!(
+                event,
+                InputEvent::Key {
+                    key: want_key,
+                    mods: self::modifiers(modifiers).0,
+                    action: 1,
+                    text: want_text.into()
+                }
+            );
+            assert_eq!(
+                frames::dec_input(&frames::enc_input(&event)).unwrap(),
+                event
+            );
+        }
+        assert!(matches!(
+            key(KeyEvent::new_with_kind(
+                KeyCode::Char('a'),
+                KeyModifiers::NONE,
+                KeyEventKind::Release
+            )),
+            Some(InputEvent::Key { action: 0, .. })
+        ));
     }
+
     #[test]
-    fn keys_use_session_modes_and_preserve_controls_and_unicode() {
-        let mut vt = SessionVt::new(80, 24, 0).unwrap();
-        assert_eq!(
-            key(
-                &vt,
-                KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL)
-            ),
-            b"\x03"
-        );
-        assert_eq!(
-            key(&vt, KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE)),
-            b"\t"
-        );
-        assert_eq!(
-            key(&vt, KeyEvent::new(KeyCode::Char('中'), KeyModifiers::NONE)),
-            "中".as_bytes()
-        );
-        assert_eq!(
-            key(&vt, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
-            b"\x1b[A"
-        );
-        vt.write(b"\x1b[?1h");
-        assert_eq!(
-            key(&vt, KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
-            b"\x1bOA"
-        );
+    fn paste_chunks_are_utf8_and_form_one_transaction() {
+        let text = "中🦀e\u{301}".repeat(4096);
+        let chunks = paste(&text);
+        let mut actual = String::new();
+        for (i, event) in chunks.iter().enumerate() {
+            let InputEvent::Text { flags, text } = event else {
+                panic!("text")
+            };
+            assert_eq!(flags & frames::text_bits::CONT != 0, i > 0);
+            assert_eq!(flags & frames::text_bits::MORE != 0, i + 1 < chunks.len());
+            assert!(frames::enc_input(event).len() <= frames::DATA_CHUNK);
+            actual.push_str(text);
+        }
+        assert_eq!(actual, text);
     }
 }

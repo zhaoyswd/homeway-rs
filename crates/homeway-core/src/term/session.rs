@@ -104,6 +104,8 @@ pub struct LegDescriptor {
     pub kind: LegKind,
     /// 本腿声明的网格尺寸（已归一——类型保证非 0 且在限内）。
     pub size: Size,
+    /// 显式协商的 surface 观察腿；未输入前不参与活动选举。
+    pub observer: bool,
 }
 
 /// 一条腿的注册态（排序与淘汰所需的全部字段）。
@@ -118,6 +120,7 @@ struct LegState {
     since_ms: u64,
     last_touch_ms: u64,
     removed: bool,
+    observer: bool,
 }
 
 /// 被断腿的可见副作用：`ended = None` ⇒ 裸关（不发 ENDED，客户端见裸 EOF）。
@@ -139,7 +142,8 @@ pub struct RegisterOutcome {
     pub first: bool,
     /// 被替换/接管/腾位断掉的腿（按触发序）。
     pub ended: Vec<LegEnd>,
-    /// 接入即活动 ⇒ 会话尺寸对齐本腿（Some = 尺寸真变，调用方做 PTY setsize + 哨兵）。
+    /// 普通接入即活动；观察接入只在原活动腿被替换/淘汰后重选已有使用者。
+    /// Some = 尺寸真变，调用方做 PTY setsize。
     pub size_applied: Option<Size>,
     /// 判据行（腿接入日志，调用方直接打）。
     pub log: String,
@@ -312,7 +316,7 @@ impl SessionRegistry {
     }
 
     /// 注册腿（`registerLegLocked` 全序）。会话已结束 ⇒ no_session；上限满且腾不出位 ⇒
-    /// too_many_clients。成功 ⇒ 入表 + 接入即活动（尺寸对齐本腿）。
+    /// too_many_clients。普通腿入表即活动；显式 observer 等待真实用户输入。
     ///
     /// `stalled` = 调用方在**同一把服务锁内**从各腿 [`super::legout::LegOut`] 取的实时停滞
     /// 快照（只含停滞腿；本表是淘汰排序的唯一真源——`term_leg.go:927-948` 读实时
@@ -378,7 +382,7 @@ impl SessionRegistry {
                 format!("会话 {name} 的客户端腿数已达上限 {max_clients}；可用 -d 显式接管，或先分离其它客户端"),
             ));
         }
-        // ④ 入表 + 接入即活动
+        // ④ 入表；普通腿立即活动，观察腿保留当前 owner/几何。
         out.first = s.leg_count() == 0;
         s.legs.push(LegState {
             key: next_key,
@@ -393,8 +397,14 @@ impl SessionRegistry {
             since_ms: now_ms,
             last_touch_ms: now_ms,
             removed: false,
+            observer: desc.observer,
         });
-        out.size_applied = note_activity_internal(s, next_key, now_ms);
+        if !desc.observer {
+            out.size_applied = note_activity_internal(s, next_key, now_ms);
+        } else if s.active.is_some_and(|key| !s.legs.iter().any(|leg| leg.key == key && !leg.removed)) {
+            // 同实例替换或容量淘汰可能摘掉原活动腿；观察接入也不能遗留悬空 owner。
+            out.size_applied = elect_active(s).1;
+        }
         out.log = format!(
             "term: 会话 {name} 腿接入（kind={} {} id={} 首腿={}）n={}/{}",
             desc.kind.as_str(),
@@ -445,6 +455,18 @@ impl SessionRegistry {
         let l = s.legs.iter_mut().find(|l| l.key == key)?;
         l.size = size;
         None // 尺寸应用归 note_activity（活动选举）——本调用方随后必调 note_activity
+    }
+
+    /// 观察腿只更新自己的偏好；活动腿仍即时应用终端窗口变化。
+    pub(crate) fn note_resize_activity(&mut self, name: &str, key: LegKey, now_ms: u64) -> Option<Size> {
+        let s = self.sessions.get_mut(name)?;
+        let leg = s.legs.iter().find(|leg| leg.key == key && !leg.removed)?;
+        if leg.observer && s.active != Some(key) { return None; }
+        note_activity_internal(s, key, now_ms)
+    }
+
+    pub(crate) fn leg_is_observer(&self, name: &str, key: LegKey) -> bool {
+        self.sessions.get(name).is_some_and(|s| s.legs.iter().any(|leg| leg.key == key && !leg.removed && leg.observer))
     }
 
     /// 会话收尾（service.go `finish`）：幂等；killed ⇒ code=-2、service_stop ⇒ -3 +
@@ -535,7 +557,7 @@ fn elect_active(s: &mut Session) -> (Option<LegKey>, Option<Size>) {
     let best = s
         .legs
         .iter()
-        .filter(|l| !l.removed)
+        .filter(|l| !l.removed && (!l.observer || l.last_activity_seq != 0))
         .max_by(|a, b| (a.last_activity_seq, a.attach_seq).cmp(&(b.last_activity_seq, b.attach_seq)));
     let Some(b) = best else {
         s.active = None;
@@ -556,9 +578,9 @@ fn elect_active(s: &mut Session) -> (Option<LegKey>, Option<Size>) {
 /// 腿上的 [`Size`] 写入——`RESIZE 0×0` 在入径已被 [`Size::from_report`] 拦下
 /// （Go 的会话尺寸写点同样在 0 门之后，F1b）。
 fn note_activity_internal(s: &mut Session, key: LegKey, now_ms: u64) -> Option<Size> {
+    let l = s.legs.iter_mut().find(|l| l.key == key && !l.removed)?;
     s.activity_seq += 1;
     let seq = s.activity_seq;
-    let l = s.legs.iter_mut().find(|l| l.key == key)?;
     l.last_activity_seq = seq;
     l.last_touch_ms = now_ms;
     let size = l.size;
@@ -597,6 +619,45 @@ fn evict_victim(s: &Session, stalled: &[(LegKey, Duration)]) -> Option<LegKey> {
 mod tests {
     use super::*;
 
+    #[test]
+    fn removed_leg_input_cannot_change_owner_geometry_or_activity_counter() {
+        let mut registry = reg();
+        registry.attach_or_create("shared", sz(120, 40), true, false).unwrap();
+        let old = registry.register_leg("shared", desc("old", 60, 20), false, 1, &[]).unwrap().key;
+        let active = registry.register_leg("shared", desc("active", 120, 40), false, 2, &[]).unwrap().key;
+        registry.end_leg("shared", old, i32::MIN, "", "client_closed", 3).unwrap();
+        let seq = registry.session("shared").unwrap().activity_seq;
+        assert_eq!(registry.note_activity("shared", old, 4), None);
+        let session = registry.session("shared").unwrap();
+        assert_eq!(session.active, Some(active));
+        assert_eq!(session.size, sz(120, 40));
+        assert_eq!(session.activity_seq, seq);
+    }
+
+    #[test]
+    fn observer_registration_resize_and_exit_do_not_elect_untouched_leg() {
+        let mut registry = reg();
+        registry.attach_or_create("shared", sz(120, 30), true, false).unwrap();
+        let active = registry.register_leg("shared", desc("active", 120, 30), false, 1, &[]).unwrap().key;
+        let observer = registry.register_leg("shared", LegDescriptor { observer: true, ..desc("observer", 70, 20) }, false, 2, &[]).unwrap();
+        assert_eq!(observer.size_applied, None);
+        assert_eq!(registry.session("shared").unwrap().active, Some(active));
+        registry.leg_resize("shared", observer.key, sz(60, 18));
+        assert_eq!(registry.note_resize_activity("shared", observer.key, 3), None);
+        assert_eq!(registry.session("shared").unwrap().size, sz(120, 30));
+        let ended = registry.end_leg("shared", active, i32::MIN, "", "client_closed", 4).unwrap();
+        assert_eq!(ended.re_elected, None);
+        assert_eq!(ended.size_applied, None);
+        assert_eq!(registry.session("shared").unwrap().active, None);
+        assert_eq!(registry.note_activity("shared", observer.key, 5), Some(sz(60, 18)));
+        registry.leg_resize("shared", observer.key, sz(65, 19));
+        assert_eq!(registry.note_resize_activity("shared", observer.key, 6), Some(sz(65, 19)));
+        let reconnect = registry.register_leg("shared", LegDescriptor { observer: true, ..desc("observer", 70, 20) }, false, 7, &[]).unwrap();
+        assert_eq!(reconnect.size_applied, None);
+        assert_eq!(registry.session("shared").unwrap().active, None, "替换活动observer后不能保留旧key或自动激活新腿");
+        assert_eq!(registry.session("shared").unwrap().size, sz(65, 19));
+    }
+
     fn reg() -> SessionRegistry {
         SessionRegistry::new(0, 0) // 默认上限 16/8
     }
@@ -610,6 +671,7 @@ mod tests {
             client_id: id.to_string(),
             kind: LegKind::App,
             size: sz(cols, rows),
+            observer: false,
         }
     }
 

@@ -1194,6 +1194,11 @@ impl TermService {
         let create = flags & hello_flags::CREATE != 0;
         let only_if_absent = flags & hello_flags::ONLY_IF_ABSENT != 0;
         let takeover = flags & hello_flags::TAKEOVER != 0;
+        let observer = flags & hello_flags::OBSERVER != 0;
+        if observer && (!surface || takeover) {
+            let _ = io.write_frame(Op::ERROR, &frames::enc_error("bad_hello", "观察接入只支持 surface，且不能同时显式接管"), WRITE_TIMEOUT);
+            return;
+        }
         if Size::exceeds_cell_budget(cols, rows) {
             let _ = io.write_frame(Op::ERROR, &frames::enc_error("bad_hello", "终端视口超过 131072 格上限，请缩小网格"), self.cfg.write_timeout);
             return;
@@ -1230,6 +1235,7 @@ impl TermService {
             client_id: ht.client_id.clone(),
             kind,
             size,
+            observer,
         };
         let (out, hs, reg, sess_gen) = {
             let mut guard = self.lock_state();
@@ -1302,9 +1308,11 @@ impl TermService {
             // 内建；新腿无上报时把会话缓存清成它的（空）值）
             apply_active_theme_locked(rt, st.registry.session(&name).and_then(|sm| sm.active));
             // ATTACHED/握手计划（锁内构建；ATTACHED 先入队——此刻腿已在表内且锁在手）
+            let attached_size = if observer { rt.vt.as_ref().map(SessionVt::size).unwrap_or((prev_size.cols(), prev_size.rows())) }
+                else { (prev_size.cols(), prev_size.rows()) };
             let attached = frames::enc_attached(
-                prev_size.cols(),
-                prev_size.rows(),
+                attached_size.0,
+                attached_size.1,
                 rt.scan.modes(),
                 rt.agent,
                 rt.state_v2,
@@ -1437,6 +1445,7 @@ impl TermService {
                         let sz = if pure_mouse_motion(&f.payload)
                             || is_reply
                             || pure_focus_out(&f.payload)
+                            || (st.registry.leg_is_observer(name, key) && f.payload == b"\x1b[I")
                         {
                             None
                         } else {
@@ -1521,7 +1530,7 @@ impl TermService {
                     let clamped = !Size::is_exact(cols, rows);
                     let mut st = self.lock_state();
                     let _ = st.registry.leg_resize(name, key, size);
-                    let sz = st.registry.note_activity(name, key, now_ms());
+                    let sz = st.registry.note_resize_activity(name, key, now_ms());
                     let active = st.registry.session(name).and_then(|s| s.active);
                     if let Some(rt) = rt_of_mut(&mut st, name, sess_gen) {
                         // 腿尺寸镜像（LegRt.size）无条件跟进——会话尺寸不变时也要记，
@@ -1628,15 +1637,32 @@ impl TermService {
         };
         let (pty, encoded) = {
             let mut st = self.lock_state();
+            let observer = st.registry.leg_is_observer(name, key);
+            let inactive = st.registry.session(name).is_none_or(|session| session.active != Some(key));
+            if observer && inactive && matches!(&ev, frames::InputEvent::Text { flags, text }
+                if flags & frames::text_bits::PASTE == 0 && pure_terminal_reply(text.as_bytes())) {
+                if let Some(rt) = rt_of_mut(&mut st, name, sess_gen) {
+                    rt.replies_dropped += 1;
+                    let n = rt.replies_dropped;
+                    if n <= 3 || n.is_multiple_of(100) {
+                        self.logf(&format!("term: 会话 {name} 丢弃非活动腿应答 {n} 次（多腿应答竞态防护）"));
+                    }
+                }
+                return;
+            }
             if rt_of(&st, name, sess_gen).and_then(|rt| rt.paste.as_ref()).is_some_and(|paste| paste.owner != key) {
                 out.enqueue(WriteItem::new(Op::ERROR, frames::enc_error("bad_input", "另一个客户端正在粘贴，请稍后重试")), self.cfg.queue_bytes);
                 return;
             }
             if rt_of(&st, name, sess_gen).is_some_and(|rt| rt.paste.is_some())
                 && !matches!(ev, frames::InputEvent::Text { .. }) { return; }
-            let passive = matches!(ev, frames::InputEvent::Focus { gained: false }
-                | frames::InputEvent::Mouse { action: 2, button: 0, .. }
-                | frames::InputEvent::Key { action: 0, .. });
+            let passive = if observer {
+                !observer_input_is_activity(&ev)
+            } else {
+                matches!(ev, frames::InputEvent::Focus { gained: false }
+                    | frames::InputEvent::Mouse { action: 2, button: 0, .. }
+                    | frames::InputEvent::Key { action: 0, .. })
+            };
             let sz = if passive { None } else { st.registry.note_activity(name, key, now_ms()) };
             let active = st.registry.session(name).and_then(|s| s.active);
             let Some(rt) = rt_of_mut(&mut st, name, sess_gen) else { return };
@@ -3794,6 +3820,18 @@ fn pure_mouse_motion(payload: &[u8]) -> bool {
     }
 }
 
+/// 观察接入只在明确的用户操作时接管。焦点、放键与悬停不会改变共享几何。
+fn observer_input_is_activity(event: &frames::InputEvent) -> bool {
+    match event {
+        frames::InputEvent::Key { action: 1 | 2, .. } => true,
+        frames::InputEvent::Text { flags, text } => !text.is_empty()
+            && (flags & frames::text_bits::PASTE != 0 || !pure_terminal_reply(text.as_bytes())),
+        frames::InputEvent::Mouse { action: 0, button: 1..=11, .. } => true,
+        _ => false,
+    }
+}
+
+
 /// 整帧是否只含**终端应答**序列——本地终端对程序查询（DA/OSC/DCS/CPR/kitty 探测）
 /// 的自动回投。与 hover 同理摘出输入活动：应答不是用户操作。
 ///
@@ -4237,6 +4275,127 @@ fn run_explain(
 mod tests {
     use super::*;
     use crate::term::wire::ReadFail;
+
+    #[test]
+    fn observer_requires_surface_without_explicit_takeover_before_create() {
+        let svc = svc_with(TermConfig { shell: Some("cat".into()), ..Default::default() }, Arc::new(Mutex::new(Vec::new())));
+        let (listener, path) = start_listener();
+        let serving = Arc::clone(&svc);
+        std::thread::spawn(move || serving.serve(listener));
+        for (capability, flags) in [(frames::caps::RAW_TERMINAL, hello_flags::OBSERVER | hello_flags::CREATE),
+            (frames::caps::SURFACE, hello_flags::OBSERVER | hello_flags::TAKEOVER | hello_flags::CREATE)] {
+            let name = tmp_name("bad-observer");
+            let mut client = Client::connect(&path);
+            client.send(Op::HELLO, &frames::enc_hello(80, 24, flags, &name,
+                &frames::enc_hello_tail(capability | frames::caps::KEY_ALT_ESC_PREFIX, "observer")));
+            assert_eq!(frames::dec_error(&client.expect(Op::ERROR, 5).payload).unwrap().0, "bad_hello");
+            assert!(svc.lock_state().registry.session(&name).is_none(), "无效观察flag不得创建或接管会话");
+        }
+        svc.close();
+    }
+
+    #[test]
+    fn observer_surface_keeps_authoritative_grid_and_takes_geometry_only_on_input() {
+        use crate::term::codec;
+        let cfg = TermConfig { shell: Some(format!(concat!(
+            "stty raw -echo; printf '\\033[?1h{}\\r\\nREADY'; ",
+            "dd bs=1 count=3 2>/dev/null | od -An -tx1; printf 'SIZE:%s' \"$(stty size)\"; cat"
+        ), "W".repeat(110))), ..Default::default() };
+        let svc = svc_with(cfg, Arc::new(Mutex::new(Vec::new())));
+        struct CloseOnDrop(Arc<TermService>);
+        impl Drop for CloseOnDrop { fn drop(&mut self) { self.0.close(); } }
+        let _close = CloseOnDrop(Arc::clone(&svc));
+        let (listener, path) = start_listener();
+        let serving = Arc::clone(&svc);
+        std::thread::spawn(move || serving.serve(listener));
+        let name = tmp_name("observer");
+        let mut active = Client::connect(&path);
+        active.send(Op::HELLO, &frames::enc_hello(120, 30, hello_flags::CREATE, &name,
+            &frames::enc_hello_tail(frames::caps::SURFACE | frames::caps::KEY_ALT_ESC_PREFIX, "active")));
+        active.expect(Op::ATTACHED, 5);
+        active.expect(Op::SNAPSHOT_DONE, 5);
+        active.send(Op::THEME, &codec::enc_theme([10, 11, 12], [16, 17, 18], true));
+        active.send(Op::LIST, &[]);
+        active.expect(Op::LIST, 5);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut state = svc.lock_state();
+            if state.sessions.get_mut(&name).unwrap().vt.as_mut().unwrap().plain_text().contains("READY") { break; }
+            drop(state);
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let active_key = svc.lock_state().registry.session(&name).unwrap().active;
+        let mut observer = Client::connect(&path);
+        observer.send(Op::HELLO, &frames::enc_hello(80, 24, hello_flags::OBSERVER, &name,
+            &frames::enc_hello_tail(frames::caps::SURFACE | frames::caps::KEY_ALT_ESC_PREFIX, "observer")));
+        let attached = observer.expect(Op::ATTACHED, 5);
+        let (cols, rows, ..) = frames::dec_attached(&attached.payload).unwrap();
+        assert_eq!((cols, rows), (120, 30));
+        let mut assembly = codec::FragAssembler::default();
+        let compressed = loop {
+            let frame = observer.expect(Op::SNAPSHOT, 5);
+            if let Some(body) = assembly.push(&frame.payload).unwrap() { break body; }
+        };
+        let snapshot = codec::dec_snapshot_body(&codec::gunzip_bytes(&compressed).unwrap()).unwrap();
+        let (cols, rows, grid) = codec::decode_grid(&snapshot.grid).unwrap();
+        assert_eq!((snapshot.cols, snapshot.rows, cols, rows), (120, 30, 120, 30));
+        assert!(grid.iter().any(|row| row.cells.iter().map(|cell| cell.symbol.as_str()).collect::<String>().contains(&"W".repeat(110))));
+        observer.expect(Op::SNAPSHOT_DONE, 5);
+        observer.send(Op::RESIZE, &frames::enc_resize(60, 20));
+        for event in [frames::InputEvent::Focus { gained: true },
+            frames::InputEvent::Focus { gained: false },
+            frames::InputEvent::Key { key: 76, mods: 0, action: 0, text: String::new() },
+            frames::InputEvent::Mouse { action: 2, button: 1, mods: 0, x: 2, y: 2 }] {
+            observer.send(Op::INPUT, &frames::enc_input(&event));
+        }
+        observer.send(Op::THEME, &codec::enc_theme([1, 2, 3], [4, 5, 6], true));
+        observer.send(Op::INPUT, &frames::enc_input(&frames::InputEvent::Text { flags: 0, text: "\x1b[0n".into() }));
+        observer.send(Op::LIST, &[]); // 同读循环屏障，前序帧均已处理。
+        observer.expect(Op::LIST, 5);
+        {
+            let mut state = svc.lock_state();
+            assert_eq!(state.registry.session(&name).unwrap().active, active_key);
+            let rt = state.sessions.get_mut(&name).unwrap();
+            assert_eq!(rt.replies_dropped, 1, "非活动观察腿的INPUT纯应答必须在写PTY前丢弃");
+            assert_eq!(rt.pty.tty_size(), (120, 30));
+            assert_eq!(rt.vt.as_ref().unwrap().size(), (120, 30));
+            let mut reply = Vec::new();
+            rt.vt.as_mut().unwrap().write_collecting(b"\x1b]11;?\x1b\\", &mut |bytes| reply.extend_from_slice(bytes));
+            assert!(has_bytes(&reply, b"1010/1111/1212"), "观察腿THEME仅缓存，不改活动程序的颜色");
+        }
+        observer.send(Op::INPUT, &frames::enc_input(&frames::InputEvent::Key { key: 76, mods: 0, action: 1, text: String::new() }));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut state = svc.lock_state();
+            let rt = state.sessions.get_mut(&name).unwrap();
+            let text = rt.vt.as_mut().unwrap().plain_text();
+            if text.contains("SIZE:20 60") {
+                assert!(text.split_whitespace().collect::<Vec<_>>().join(" ").contains("1b 4f 44"), "编码使用共享VT的DECCKM：{text:?}");
+                assert_eq!(rt.pty.tty_size(), (60, 20));
+                assert_eq!(rt.vt.as_ref().unwrap().size(), (60, 20));
+                break;
+            }
+            drop(state);
+            assert!(Instant::now() < deadline, "输入未按活动pane尺寸处理：{text:?}");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert_ne!(svc.lock_state().registry.session(&name).unwrap().active, active_key);
+        let mut reply = Vec::new();
+        svc.lock_state().sessions.get_mut(&name).unwrap().vt.as_mut().unwrap()
+            .write_collecting(b"\x1b]11;?\x1b\\", &mut |bytes| reply.extend_from_slice(bytes));
+        assert!(has_bytes(&reply, b"0404/0505/0606"), "真实输入接管后使用该观察腿缓存主题");
+    }
+
+    #[test]
+    fn observer_activity_excludes_automatic_events_and_replies() {
+        assert!(!observer_input_is_activity(&frames::InputEvent::Text { flags: 0, text: "\x1b[0n".into() }));
+        assert!(observer_input_is_activity(&frames::InputEvent::Text { flags: frames::text_bits::PASTE, text: "\x1b[0n".into() }));
+        assert!(observer_input_is_activity(&frames::InputEvent::Key { key: 20, mods: 0, action: 2, text: "a".into() }));
+        assert!(!observer_input_is_activity(&frames::InputEvent::Mouse { action: 1, button: 1, mods: 0, x: 1, y: 1 }));
+        assert!(observer_input_is_activity(&frames::InputEvent::Mouse { action: 0, button: 1, mods: 0, x: 1, y: 1 }));
+        assert!(observer_input_is_activity(&frames::InputEvent::Mouse { action: 0, button: 4, mods: 0, x: 1, y: 1 }), "真实上行应用滚轮输入应接管；本地历史滚动不发INPUT");
+    }
 
     #[test]
     fn raw_truncated_replay_restores_input_modes_for_existing_raw_consumers() {
@@ -4935,6 +5094,7 @@ mod tests {
                     client_id: "last-leg".into(),
                     kind: LegKind::Host,
                     size: Size::DEFAULT,
+                    observer: false,
                 },
                 false,
                 now_ms(),

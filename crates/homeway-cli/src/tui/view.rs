@@ -5,7 +5,9 @@ use std::borrow::Cow;
 use crossterm::event::{
     Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
 };
-use homeway_core::term::vt::{self, SessionVt};
+use homeway_core::term::vt;
+#[cfg(test)]
+use homeway_core::term::vt::SessionVt;
 use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
@@ -22,13 +24,6 @@ pub(super) enum Theme {
 }
 
 impl Theme {
-    pub(super) fn toggle(&mut self) {
-        *self = match self {
-            Self::Dark => Self::Light,
-            Self::Light => Self::Dark,
-        };
-    }
-
     fn palette(self) -> Palette {
         match self {
             Self::Dark => Palette {
@@ -121,6 +116,27 @@ pub(super) struct SessionItem {
     pub agent: String,
     pub project: String,
     pub state: SessionState,
+    pub self_session: bool,
+}
+
+/// The caller supplies an authoritative, ordered window of physical terminal rows.
+/// FETCH row.y is local to the payload, so display positions use slice order.
+#[derive(Clone, Copy)]
+pub(super) struct TerminalView<'a> {
+    pub rows: &'a [vt::Row],
+    pub cursor: Option<vt::Cursor>,
+    pub mouse_reporting: bool,
+    pub scrollbar: vt::Scrollbar,
+    pub top: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum HistoryAction {
+    Lines(i32),
+    PageUp,
+    PageDown,
+    Start,
+    End,
 }
 
 #[derive(Default)]
@@ -138,6 +154,8 @@ pub(super) struct Model {
     sessions_offset: usize,
     suppressed_releases: Vec<KeyCode>,
     forwarded_keys: Vec<KeyCode>,
+    mouse_reporting: bool,
+    history_behind: u64,
     menu: Option<Menu>,
     add_host: Option<AddHost>,
 }
@@ -187,7 +205,7 @@ pub(super) enum Action {
     SendKey(KeyEvent),
     Paste(String),
     TerminalMouse(MouseEvent),
-    ThemeChanged,
+    Scroll(HistoryAction),
 }
 
 #[derive(Default, Debug, Clone, Copy)]
@@ -198,7 +216,6 @@ pub(super) struct Geometry {
     host_add: Rect,
     session_add: Rect,
     create: Rect,
-    theme: Rect,
     menu: Rect,
     dialog: Rect,
     name_input: Rect,
@@ -211,6 +228,7 @@ enum MenuKind {
     Local,
     Host,
     Session,
+    SelfInfo,
 }
 
 struct Menu {
@@ -289,7 +307,7 @@ fn panel(frame: &mut Frame<'_>, rect: Rect, title: String, active: bool, p: Pale
 pub(super) fn draw(
     frame: &mut Frame<'_>,
     model: &mut Model,
-    vt: Option<&mut SessionVt>,
+    terminal: Option<TerminalView<'_>>,
 ) -> Geometry {
     let area = frame.area();
     let p = model.theme.palette();
@@ -298,9 +316,12 @@ pub(super) fn draw(
         area,
     );
     let mut geometry = Geometry::default();
-    if area.width < 48 || area.height < 12 {
+    model.mouse_reporting = terminal.is_some_and(|view| view.mouse_reporting);
+    model.history_behind =
+        terminal.map_or(0, |view| view.scrollbar.offset.saturating_sub(view.top));
+    if area.width < 40 || area.height < 10 {
         frame.render_widget(
-            Paragraph::new("窗口太小，请调整到至少 48 列 × 12 行\nCtrl+B q 退出")
+            Paragraph::new("窗口太小，至少 40×10 · Ctrl+B q 退出")
                 .alignment(Alignment::Center)
                 .style(Style::default().fg(p.muted)),
             area,
@@ -308,9 +329,9 @@ pub(super) fn draw(
         return geometry;
     }
     let sidebar = (area.width / 3)
-        .clamp(26, 38)
-        .min(area.width.saturating_sub(20));
-    let body = Rect::new(area.x, area.y + 1, area.width, area.height - 3);
+        .clamp(20, 38)
+        .min(area.width.saturating_sub(18));
+    let body = Rect::new(area.x, area.y, area.width, area.height - 1);
     let split = body.height / 2;
     let host_panel = Rect::new(body.x, body.y, sidebar, split + 1);
     let session_panel = Rect::new(body.x, body.y + split, sidebar, body.height - split);
@@ -325,22 +346,6 @@ pub(super) fn draw(
     geometry.terminal = inner(terminal_panel);
     geometry.host_add = Rect::new(host_panel.right() - 6, host_panel.y, 5, 1);
     geometry.session_add = Rect::new(session_panel.right() - 6, session_panel.y, 5, 1);
-    geometry.theme = Rect::new(area.right() - 15, area.y, 14, 1);
-    text(
-        frame,
-        Rect::new(area.x + 1, area.y, 20, 1),
-        "homeway",
-        Style::default().fg(p.accent).add_modifier(Modifier::BOLD),
-    );
-    text(
-        frame,
-        geometry.theme,
-        match model.theme {
-            Theme::Dark => "[主题：深色]",
-            Theme::Light => "[主题：浅色]",
-        },
-        Style::default().fg(p.muted),
-    );
     panel(
         frame,
         host_panel,
@@ -501,7 +506,11 @@ pub(super) fn draw(
             Rect::new(row.x, y, row.width, 1),
             Line::from(vec![
                 Span::styled("● ", Style::default().fg(color)),
-                Span::raw(format!("【{label}】{}", clean(title))),
+                Span::raw(format!(
+                    "【{label}{}】{}",
+                    if session.self_session { "·自身" } else { "" },
+                    clean(title)
+                )),
             ]),
             Style::default().fg(p.fg).bg(bg).add_modifier(if selected {
                 Modifier::BOLD
@@ -526,27 +535,49 @@ pub(super) fn draw(
             Style::default().fg(p.muted),
         );
     }
-    if let Some(vt) = vt {
+    if let Some(terminal) = terminal {
         draw_terminal(
             frame,
             geometry.terminal,
-            vt,
+            terminal,
             p,
             model.focus == Focus::Terminal && !model.modal_open(),
         );
-    } else if model.selected_session.is_none() {
+    } else if model.selected_session.is_none()
+        || model
+            .selected_session
+            .and_then(|index| model.sessions.get(index))
+            .is_some_and(|session| session.self_session)
+    {
+        let selected_self = (model.selected_session.is_none()
+            && model.sessions.len() == 1
+            && model.sessions[0].self_session)
+            || model
+                .selected_session
+                .and_then(|index| model.sessions.get(index))
+                .is_some_and(|session| session.self_session);
         let terminal = geometry.terminal;
         let center_y = terminal.y + terminal.height.saturating_sub(5) / 2;
         text(
             frame,
             Rect::new(terminal.x, center_y, terminal.width, 1),
-            Line::from("想在这台主机上做些什么？").alignment(Alignment::Center),
+            Line::from(if selected_self {
+                "当前界面运行在该会话中"
+            } else {
+                "想在这台主机上做些什么？"
+            })
+            .alignment(Alignment::Center),
             Style::default().fg(p.fg),
         );
         text(
             frame,
             Rect::new(terminal.x, center_y + 2, terminal.width, 1),
-            Line::from("创建 shell 会话，开始工作").alignment(Alignment::Center),
+            Line::from(if selected_self {
+                "请选择其它会话，或创建 shell"
+            } else {
+                "创建 shell 会话，开始工作"
+            })
+            .alignment(Alignment::Center),
             Style::default().fg(p.muted),
         );
         geometry.create = Rect::new(
@@ -575,22 +606,15 @@ pub(super) fn draw(
             Style::default().fg(p.muted),
         );
     }
-    let status = if model.prefix {
-        "h 主机 · s 会话 · n 新建 · a 添加主机 · m 操作 · t 主题 · q 退出".to_owned()
-    } else {
-        clean(&model.notice)
-    };
-    text(
-        frame,
-        Rect::new(area.x + 1, area.bottom() - 2, area.width - 2, 1),
-        status,
-        Style::default().fg(p.amber),
-    );
     text(
         frame,
         Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1),
-        "Ctrl+B h/s 焦点 · F2 / 右键 操作 · Ctrl+B q 退出",
-        Style::default().fg(p.muted),
+        footer(model, area.width),
+        Style::default().fg(if model.notice.is_empty() && !model.prefix {
+            p.muted
+        } else {
+            p.amber
+        }),
     );
     if model.menu.is_some() {
         draw_menu(frame, model, &mut geometry, p);
@@ -606,6 +630,28 @@ fn terminal_color(color: vt::Color, default: Color) -> Color {
         vt::Color::None => default,
         vt::Color::Palette(index) => Color::Indexed(index),
         vt::Color::Rgb(r, g, b) => Color::Rgb(r, g, b),
+    }
+}
+
+fn footer(model: &Model, width: u16) -> String {
+    if model.prefix {
+        return if width >= 70 {
+            "^B: h主机 s会话 Enter终端 n新建 a添加 m操作 q退出".into()
+        } else {
+            "^B: h主机 s会话 n新建 a添加 q退出".into()
+        };
+    }
+    let history = if model.history_behind > 0 {
+        format!("↑{}行 · ⇧End回底 · ", model.history_behind)
+    } else {
+        String::new()
+    };
+    if model.notice.is_empty() {
+        format!("{history}^B 菜单 · ⇧PgUp 历史 · ^B q退出")
+    } else if width >= 90 {
+        format!("{history}{} · ^B q退出", clean(&model.notice))
+    } else {
+        format!("{history}{}", clean(&model.notice))
     }
 }
 
@@ -628,21 +674,21 @@ fn terminal_symbol(symbol: &str) -> Cow<'_, str> {
 fn draw_terminal(
     frame: &mut Frame<'_>,
     area: Rect,
-    vt: &mut SessionVt,
+    terminal: TerminalView<'_>,
     p: Palette,
     show_cursor: bool,
 ) {
-    for row in vt.rows() {
-        if row.y >= area.height {
-            continue;
-        }
+    for (row_index, row) in terminal
+        .rows
+        .iter()
+        .take(usize::from(area.height))
+        .enumerate()
+    {
         for (x, cell) in row.cells.iter().enumerate().take(usize::from(area.width)) {
             if cell.skip || cell.width == 0 {
                 continue;
             }
-            if cell.width == 2 && x + 1 >= usize::from(area.width) {
-                continue;
-            }
+            let clipped_wide = cell.width == 2 && x + 1 >= usize::from(area.width);
             let mut style = Style::default()
                 .fg(terminal_color(cell.fg, p.fg))
                 .bg(terminal_color(cell.bg, p.bg));
@@ -663,21 +709,26 @@ fn draw_terminal(
                 style = style.add_modifier(Modifier::UNDERLINED);
             }
             let x = area.x + x as u16;
-            let y = area.y + row.y;
+            let y = area.y + row_index as u16;
             if let Some(target) = frame.buffer_mut().cell_mut((x, y)) {
-                let symbol = terminal_symbol(&cell.symbol);
+                let symbol = if clipped_wide {
+                    Cow::Borrowed(" ")
+                } else {
+                    terminal_symbol(&cell.symbol)
+                };
                 target.set_symbol(symbol.as_ref()).set_style(style);
             }
-            if cell.width == 2 {
+            if cell.width == 2 && !clipped_wide {
                 if let Some(target) = frame.buffer_mut().cell_mut((x + 1, y)) {
                     target.set_symbol(" ").set_style(style);
                 }
             }
         }
     }
-    let cursor = vt.cursor();
-    if show_cursor && cursor.visible && cursor.x < area.width && cursor.y < area.height {
-        frame.set_cursor_position((area.x + cursor.x, area.y + cursor.y));
+    if let Some(cursor) = terminal.cursor {
+        if show_cursor && cursor.visible && cursor.x < area.width && cursor.y < area.height {
+            frame.set_cursor_position((area.x + cursor.x, area.y + cursor.y));
+        }
     }
 }
 
@@ -711,6 +762,7 @@ fn menu_labels(model: &Model, kind: MenuKind) -> Vec<&'static str> {
             "删除主机",
         ],
         MenuKind::Session => vec!["关闭会话"],
+        MenuKind::SelfInfo => vec!["承载当前TUI，退出后再关闭"],
     }
 }
 
@@ -892,6 +944,7 @@ fn activate_menu(model: &mut Model) -> Action {
         (MenuKind::Host, 0) => Action::ToggleProxy,
         (MenuKind::Host, _) => Action::DeleteHost,
         (MenuKind::Session, _) => Action::CloseSession,
+        (MenuKind::SelfInfo, _) => Action::None,
     }
 }
 
@@ -906,9 +959,18 @@ fn menu_for_focus(model: &mut Model, geometry: &Geometry) {
             (MenuKind::Local, geometry.hosts)
         }
         Focus::Hosts if !model.hosts.is_empty() => (MenuKind::Host, geometry.hosts),
-        Focus::Sessions if model.selected_session.is_some() => {
-            (MenuKind::Session, geometry.sessions)
-        }
+        Focus::Sessions if model.selected_session.is_some() => (
+            if model
+                .selected_session
+                .and_then(|index| model.sessions.get(index))
+                .is_some_and(|session| session.self_session)
+            {
+                MenuKind::SelfInfo
+            } else {
+                MenuKind::Session
+            },
+            geometry.sessions,
+        ),
         _ => return,
     };
     model.menu = Some(Menu {
@@ -992,10 +1054,6 @@ fn handle_event_inner(model: &mut Model, event: Event, geometry: &Geometry) -> A
                 model.prefix = false;
                 return match key.code {
                     KeyCode::Char('q') => Action::Quit,
-                    KeyCode::Char('t') => {
-                        model.theme.toggle();
-                        Action::ThemeChanged
-                    }
                     KeyCode::Char('h') => {
                         model.focus = Focus::Hosts;
                         Action::None
@@ -1005,7 +1063,15 @@ fn handle_event_inner(model: &mut Model, event: Event, geometry: &Geometry) -> A
                         Action::None
                     }
                     KeyCode::Enter if model.selected_session.is_some() => {
-                        model.focus = Focus::Terminal;
+                        if model
+                            .selected_session
+                            .and_then(|index| model.sessions.get(index))
+                            .is_some_and(|session| session.self_session)
+                        {
+                            explain_self(model);
+                        } else {
+                            model.focus = Focus::Terminal;
+                        }
                         Action::None
                     }
                     KeyCode::Char('n') => Action::CreateSession,
@@ -1033,7 +1099,13 @@ fn handle_event_inner(model: &mut Model, event: Event, geometry: &Geometry) -> A
             }
             if model.focus == Focus::Terminal {
                 return if geometry.terminal.width > 0 && geometry.terminal.height > 0 {
-                    Action::SendKey(key)
+                    match (key.modifiers.contains(KeyModifiers::SHIFT), key.code) {
+                        (true, KeyCode::PageUp) => Action::Scroll(HistoryAction::PageUp),
+                        (true, KeyCode::PageDown) => Action::Scroll(HistoryAction::PageDown),
+                        (true, KeyCode::Home) => Action::Scroll(HistoryAction::Start),
+                        (true, KeyCode::End) => Action::Scroll(HistoryAction::End),
+                        _ => Action::SendKey(key),
+                    }
                 } else {
                     Action::None
                 };
@@ -1063,8 +1135,10 @@ fn handle_event_inner(model: &mut Model, event: Event, geometry: &Geometry) -> A
                 KeyCode::Down | KeyCode::Char('j') => move_selection(model, 1),
                 KeyCode::Enter if model.focus == Focus::Sessions => {
                     if let Some(index) = model.selected_session {
-                        model.focus = Focus::Terminal;
-                        Action::SelectSession(index)
+                        select_session_row(model, index, true)
+                    } else if model.sessions.iter().any(|session| session.self_session) {
+                        explain_self(model);
+                        Action::None
                     } else {
                         Action::CreateSession
                     }
@@ -1095,24 +1169,54 @@ fn move_selection(model: &mut Model, delta: isize) -> Action {
             Action::SelectHost(index)
         }
         Focus::Sessions if !model.sessions.is_empty() => {
-            let index = model
+            let mut index = model
                 .selected_session
                 .map_or(0, |selected| selected.saturating_add_signed(delta))
                 .min(model.sessions.len() - 1);
-            model.selected_session = Some(index);
-            Action::SelectSession(index)
+            loop {
+                if !model.sessions[index].self_session {
+                    return select_session_row(model, index, false);
+                }
+                let Some(next) = index
+                    .checked_add_signed(if delta < 0 { -1 } else { 1 })
+                    .filter(|next| *next < model.sessions.len())
+                else {
+                    break;
+                };
+                index = next;
+            }
+            explain_self(model);
+            Action::None
         }
         _ => Action::None,
+    }
+}
+
+fn explain_self(model: &mut Model) {
+    model.focus = Focus::Sessions;
+    model.notice = "承载当前TUI，不能重复接入；退出后再关闭".into();
+}
+
+fn select_session_row(model: &mut Model, index: usize, enter_terminal: bool) -> Action {
+    if model
+        .sessions
+        .get(index)
+        .is_some_and(|session| session.self_session)
+    {
+        explain_self(model);
+        Action::None
+    } else {
+        model.selected_session = Some(index);
+        if enter_terminal {
+            model.focus = Focus::Terminal;
+        }
+        Action::SelectSession(index)
     }
 }
 
 fn handle_mouse(model: &mut Model, mouse: MouseEvent, geometry: &Geometry) -> Action {
     let (x, y) = (mouse.column, mouse.row);
     if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
-        if contains(geometry.theme, x, y) {
-            model.theme.toggle();
-            return Action::ThemeChanged;
-        }
         if contains(geometry.host_add, x, y) {
             model.add_host = Some(AddHost::default());
             return Action::None;
@@ -1194,18 +1298,23 @@ fn handle_mouse(model: &mut Model, mouse: MouseEvent, geometry: &Geometry) -> Ac
         ) {
             let index = model.sessions_offset + usize::from((y - geometry.sessions.y) / 3);
             if index < model.sessions.len() {
-                model.selected_session = Some(index);
                 if mouse.kind == MouseEventKind::Down(MouseButton::Right) {
                     model.menu = Some(Menu {
-                        kind: MenuKind::Session,
+                        kind: if model.sessions[index].self_session {
+                            MenuKind::SelfInfo
+                        } else {
+                            MenuKind::Session
+                        },
                         x,
                         y,
                         selected: 0,
                     });
-                } else {
-                    model.focus = Focus::Terminal;
                 }
-                return Action::SelectSession(index);
+                return select_session_row(
+                    model,
+                    index,
+                    mouse.kind == MouseEventKind::Down(MouseButton::Left),
+                );
             }
         }
     }
@@ -1216,6 +1325,19 @@ fn handle_mouse(model: &mut Model, mouse: MouseEvent, geometry: &Geometry) -> Ac
         let mut relative = mouse;
         relative.column -= geometry.terminal.x;
         relative.row -= geometry.terminal.y;
+        if matches!(
+            mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+        ) && (mouse.modifiers.contains(KeyModifiers::SHIFT) || !model.mouse_reporting)
+        {
+            return Action::Scroll(HistoryAction::Lines(
+                if mouse.kind == MouseEventKind::ScrollUp {
+                    -3
+                } else {
+                    3
+                },
+            ));
+        }
         return Action::TerminalMouse(relative);
     }
     Action::None
@@ -1354,7 +1476,394 @@ fn handle_dialog(model: &mut Model, event: Event, geometry: &Geometry) -> Action
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ratatui::{backend::TestBackend, Terminal};
+    use ratatui::{
+        backend::TestBackend,
+        buffer::{Buffer, CellWidth},
+        Terminal,
+    };
+
+    fn buffer_line(buffer: &Buffer, y: u16) -> String {
+        let mut text = String::new();
+        let mut x = buffer.area.x;
+        while x < buffer.area.right() {
+            let cell = &buffer[(x, y)];
+            text.push_str(cell.symbol());
+            x += cell.cell_width().max(1);
+        }
+        text
+    }
+
+    fn draw(
+        frame: &mut Frame<'_>,
+        model: &mut Model,
+        terminal: Option<&mut SessionVt>,
+    ) -> Geometry {
+        if let Some(vt) = terminal {
+            let rows = vt.rows();
+            let cursor = vt.cursor();
+            let scrollbar = vt.scrollbar();
+            super::draw(
+                frame,
+                model,
+                Some(TerminalView {
+                    rows: &rows,
+                    cursor: Some(cursor),
+                    mouse_reporting: vt.modes().mouse_tracking(),
+                    scrollbar,
+                    top: scrollbar.offset,
+                }),
+            )
+        } else {
+            super::draw(frame, model, None)
+        }
+    }
+
+    fn draw_vt_terminal(
+        frame: &mut Frame<'_>,
+        area: Rect,
+        vt: &mut SessionVt,
+        palette: Palette,
+        cursor: bool,
+    ) {
+        let rows = vt.rows();
+        let scrollbar = vt.scrollbar();
+        super::draw_terminal(
+            frame,
+            area,
+            TerminalView {
+                rows: &rows,
+                cursor: Some(vt.cursor()),
+                mouse_reporting: vt.modes().mouse_tracking(),
+                scrollbar,
+                top: scrollbar.offset,
+            },
+            palette,
+            cursor,
+        );
+    }
+
+    #[test]
+    fn authoritative_rows_use_window_order_and_clip_wide_right_edge_without_reflow() {
+        let mut terminal = Terminal::new(TestBackend::new(4, 2)).unwrap();
+        let wide = |symbol: &str| vt::Cell {
+            symbol: symbol.into(),
+            width: 2,
+            bg: vt::Color::Palette(4),
+            ..Default::default()
+        };
+        let ascii = |symbol: &str| vt::Cell {
+            symbol: symbol.into(),
+            width: 1,
+            ..Default::default()
+        };
+        let rows = vec![
+            vt::Row {
+                y: 0,
+                cells: vec![
+                    wide("中"),
+                    vt::Cell {
+                        width: 0,
+                        skip: true,
+                        ..Default::default()
+                    },
+                    ascii("X"),
+                    wide("文"),
+                ],
+                ..Default::default()
+            },
+            // FETCH windows may report local y=0 for every materialized row.
+            vt::Row {
+                y: 0,
+                cells: vec![ascii("B")],
+                ..Default::default()
+            },
+        ];
+        terminal
+            .draw(|frame| {
+                let area = frame.area();
+                super::draw_terminal(
+                    frame,
+                    area,
+                    TerminalView {
+                        rows: &rows,
+                        cursor: None,
+                        mouse_reporting: false,
+                        scrollbar: vt::Scrollbar {
+                            total: 20,
+                            offset: 18,
+                            len: 2,
+                        },
+                        top: 5,
+                    },
+                    Theme::Dark.palette(),
+                    true,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(0, 0)].symbol(), "中");
+        assert_eq!(buffer[(2, 0)].symbol(), "X");
+        assert_eq!(buffer[(3, 0)].symbol(), " ");
+        assert_eq!(buffer[(3, 0)].bg, Color::Indexed(4));
+        assert_eq!(
+            buffer[(0, 1)].symbol(),
+            "B",
+            "history rows must not overwrite row zero or reflow"
+        );
+    }
+
+    #[test]
+    fn layout_starts_with_panels_and_has_one_footer_even_in_small_windows() {
+        for (width, height) in [(40, 10), (48, 12), (100, 30)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut model = Model {
+                notice: "READY".into(),
+                ..Default::default()
+            };
+            let mut geometry = Geometry::default();
+            terminal
+                .draw(|frame| geometry = super::draw(frame, &mut model, None))
+                .unwrap();
+            assert_eq!(geometry.terminal.y, 1);
+            assert_eq!(geometry.terminal.height, height - 3);
+            let buffer = terminal.backend().buffer();
+            let line = |y| buffer_line(buffer, y);
+            assert!(line(0).contains("主机") && line(0).contains("终端"));
+            assert!(!line(0).contains("homeway") && !line(0).contains("主题"));
+            assert!(line(height - 1).contains("READY"));
+            assert!(line(height - 2).contains('┘'));
+        }
+    }
+
+    #[test]
+    fn history_routing_respects_application_mouse_reporting_and_shift_override() {
+        let mut model = Model {
+            focus: Focus::Terminal,
+            ..Model::default()
+        };
+        let geometry = Geometry {
+            terminal: Rect::new(30, 1, 66, 27),
+            ..Geometry::default()
+        };
+        let wheel = |mods| {
+            Event::Mouse(MouseEvent {
+                kind: MouseEventKind::ScrollUp,
+                column: 34,
+                row: 4,
+                modifiers: mods,
+            })
+        };
+        assert!(matches!(
+            handle_event(&mut model, wheel(KeyModifiers::NONE), &geometry),
+            Action::Scroll(HistoryAction::Lines(-3))
+        ));
+        model.mouse_reporting = true;
+        assert!(
+            matches!(handle_event(&mut model,wheel(KeyModifiers::NONE),&geometry),Action::TerminalMouse(event) if event.column==4 && event.row==3)
+        );
+        assert!(matches!(
+            handle_event(&mut model, wheel(KeyModifiers::SHIFT), &geometry),
+            Action::Scroll(HistoryAction::Lines(-3))
+        ));
+        for (key, history) in [
+            (KeyCode::PageUp, HistoryAction::PageUp),
+            (KeyCode::PageDown, HistoryAction::PageDown),
+            (KeyCode::Home, HistoryAction::Start),
+            (KeyCode::End, HistoryAction::End),
+        ] {
+            assert!(matches!(
+                handle_event(
+                    &mut model,
+                    Event::Key(KeyEvent::new(key, KeyModifiers::NONE)),
+                    &geometry
+                ),
+                Action::SendKey(_)
+            ));
+            handle_event(
+                &mut model,
+                Event::Key(KeyEvent::new_with_kind(
+                    key,
+                    KeyModifiers::NONE,
+                    KeyEventKind::Release,
+                )),
+                &geometry,
+            );
+            assert!(
+                matches!(handle_event(&mut model,Event::Key(KeyEvent::new(key,KeyModifiers::SHIFT)),&geometry),Action::Scroll(value) if value==history)
+            );
+            assert!(matches!(
+                handle_event(
+                    &mut model,
+                    Event::Key(KeyEvent::new_with_kind(
+                        key,
+                        KeyModifiers::SHIFT,
+                        KeyEventKind::Release
+                    )),
+                    &geometry
+                ),
+                Action::None
+            ));
+        }
+    }
+
+    #[test]
+    fn self_session_is_marked_and_cannot_attach_or_close() {
+        let mut model = Model {
+            terminal_title: "previous active".into(),
+            ..Model::default()
+        };
+        model.sessions = vec![SessionItem {
+            name: "self".into(),
+            title: "own shell".into(),
+            agent: "shell".into(),
+            project: String::new(),
+            state: SessionState::Working,
+            self_session: true,
+        }];
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut geometry = Geometry::default();
+        terminal
+            .draw(|frame| geometry = super::draw(frame, &mut model, None))
+            .unwrap();
+        let body = (0..30)
+            .map(|y| buffer_line(terminal.backend().buffer(), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("自身"));
+        assert!(matches!(
+            handle_event(
+                &mut model,
+                mouse(geometry.sessions.x, geometry.sessions.y, MouseButton::Left),
+                &geometry
+            ),
+            Action::None
+        ));
+        assert!(model.notice.contains("不能重复接入"));
+        assert!(model.selected_session.is_none());
+        assert_eq!(model.terminal_title, "previous active");
+        terminal
+            .draw(|frame| {
+                super::draw(frame, &mut model, None);
+            })
+            .unwrap();
+        let body = (0..30)
+            .map(|y| buffer_line(terminal.backend().buffer(), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(body.contains("当前界面运行在该会话中"));
+        assert!(!body.contains("正在接入会话"));
+        assert!(matches!(
+            handle_event(
+                &mut model,
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &geometry
+            ),
+            Action::None
+        ));
+        handle_event(
+            &mut model,
+            mouse(geometry.sessions.x, geometry.sessions.y, MouseButton::Right),
+            &geometry,
+        );
+        assert_eq!(
+            menu_labels(&model, MenuKind::SelfInfo),
+            vec!["承载当前TUI，退出后再关闭"]
+        );
+        assert!(matches!(
+            handle_event(
+                &mut model,
+                Event::Key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE)),
+                &geometry
+            ),
+            Action::None
+        ));
+    }
+
+    #[test]
+    fn self_row_preserves_existing_target_and_navigation_skips_it() {
+        let normal = SessionItem {
+            name: "active".into(),
+            title: "active".into(),
+            agent: "shell".into(),
+            project: String::new(),
+            state: SessionState::Idle,
+            self_session: false,
+        };
+        let mut carrier = normal.clone();
+        carrier.name = "carrier".into();
+        carrier.self_session = true;
+        let mut other = normal.clone();
+        other.name = "other".into();
+        let mut model = Model {
+            sessions: vec![normal, carrier, other],
+            selected_session: Some(0),
+            focus: Focus::Sessions,
+            ..Default::default()
+        };
+        assert!(matches!(
+            select_session_row(&mut model, 1, true),
+            Action::None
+        ));
+        assert_eq!(model.selected_session, Some(0));
+        assert!(matches!(
+            move_selection(&mut model, 1),
+            Action::SelectSession(2)
+        ));
+        assert_eq!(model.selected_session, Some(2));
+        assert!(matches!(
+            move_selection(&mut model, -1),
+            Action::SelectSession(0)
+        ));
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut geometry = Geometry::default();
+        terminal
+            .draw(|frame| geometry = super::draw(frame, &mut model, None))
+            .unwrap();
+        handle_event(
+            &mut model,
+            mouse(
+                geometry.sessions.x,
+                geometry.sessions.y + 3,
+                MouseButton::Right,
+            ),
+            &geometry,
+        );
+        assert_eq!(model.selected_session, Some(0));
+        assert!(matches!(
+            model.menu.as_ref().unwrap().kind,
+            MenuKind::SelfInfo
+        ));
+        assert!(matches!(activate_menu(&mut model), Action::None));
+        assert_eq!(model.selected_session, Some(0));
+    }
+
+    #[test]
+    fn footer_reports_authoritative_history_distance_without_reparsing_output() {
+        let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+        let mut model = Model::default();
+        terminal
+            .draw(|frame| {
+                super::draw(
+                    frame,
+                    &mut model,
+                    Some(TerminalView {
+                        rows: &[],
+                        cursor: None,
+                        mouse_reporting: true,
+                        scrollbar: vt::Scrollbar {
+                            total: 127,
+                            offset: 100,
+                            len: 27,
+                        },
+                        top: 70,
+                    }),
+                );
+            })
+            .unwrap();
+        let footer = buffer_line(terminal.backend().buffer(), 29);
+        assert!(footer.contains("↑30行") && footer.contains("回底"));
+        assert!(model.mouse_reporting);
+    }
 
     #[test]
     fn terminal_tabs_keep_grid_columns_and_style_across_real_draw_diffs() {
@@ -1363,13 +1872,19 @@ mod tests {
         assert_eq!(vt.rows()[0].cells[1].symbol, "\t", "VT保留TAB复制语义");
         let mut terminal = Terminal::new(TestBackend::new(20, 4)).unwrap();
         terminal
-            .draw(|frame| draw_terminal(frame, frame.area(), &mut vt, Theme::Dark.palette(), false))
+            .draw(|frame| {
+                draw_vt_terminal(frame, frame.area(), &mut vt, Theme::Dark.palette(), false)
+            })
             .unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(0, 0)].symbol(), "A");
         assert_eq!(buffer[(1, 0)].symbol(), " ");
         assert_eq!(buffer[(0, 0)].fg, Color::Indexed(1));
-        assert_eq!(buffer[(1, 0)].fg, Theme::Dark.palette().fg, "TAB仅写格符号，不继承当前SGR前景");
+        assert_eq!(
+            buffer[(1, 0)].fg,
+            Theme::Dark.palette().fg,
+            "TAB仅写格符号，不继承当前SGR前景"
+        );
         assert_eq!(buffer[(1, 0)].bg, Color::Indexed(4), "原网格背景色必须保留");
         assert_eq!(
             buffer[(8, 0)].symbol(),
@@ -1379,12 +1894,16 @@ mod tests {
         vt.write(b"\x1b[1;1H\x1b[32mC\tD\x1b[0m");
         terminal
             .draw(|frame| {
-                draw_terminal(frame, frame.area(), &mut vt, Theme::Light.palette(), false)
+                draw_vt_terminal(frame, frame.area(), &mut vt, Theme::Light.palette(), false)
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
         assert_eq!(buffer[(0, 0)].symbol(), "C");
-        assert_eq!(buffer[(1, 0)].bg, Color::Indexed(4), "未覆盖的原TAB格背景保留");
+        assert_eq!(
+            buffer[(1, 0)].bg,
+            Color::Indexed(4),
+            "未覆盖的原TAB格背景保留"
+        );
         assert_eq!(buffer[(0, 0)].fg, Color::Indexed(2));
         assert_eq!(buffer[(8, 0)].symbol(), "D");
         assert_eq!(vt.rows()[0].cells[1].symbol, "\t");
@@ -1538,6 +2057,7 @@ mod tests {
                 agent: "shell".into(),
                 project: String::new(),
                 state: SessionState::Idle,
+                self_session: false,
             })
             .collect();
         assert!(matches!(
@@ -1582,7 +2102,7 @@ mod tests {
                 press(KeyCode::Char('t'), KeyModifiers::NONE),
                 &geometry
             ),
-            Action::ThemeChanged
+            Action::None
         ));
         assert!(matches!(
             handle_event(
@@ -1699,7 +2219,7 @@ mod tests {
                 Event::Key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE)),
                 &geometry
             ),
-            Action::ThemeChanged
+            Action::None
         ));
     }
 
@@ -1871,7 +2391,7 @@ mod tests {
     }
 
     #[test]
-    fn theme_changes_panel_colors_and_preserves_selection() {
+    fn external_theme_changes_panel_colors_and_preserves_selection() {
         let mut terminal = Terminal::new(TestBackend::new(100, 24)).unwrap();
         let mut model = Model::default();
         model.hosts.push(host("我的电脑", HostState::Local));
@@ -1883,14 +2403,7 @@ mod tests {
             .unwrap();
         let selected_position = (geometry.hosts.x, geometry.hosts.y + 3);
         let dark = terminal.backend().buffer()[selected_position].bg;
-        assert!(matches!(
-            handle_event(
-                &mut model,
-                mouse(geometry.theme.x, geometry.theme.y, MouseButton::Left),
-                &geometry
-            ),
-            Action::ThemeChanged
-        ));
+        model.theme = Theme::Light;
         terminal
             .draw(|frame| geometry = draw(frame, &mut model, None))
             .unwrap();

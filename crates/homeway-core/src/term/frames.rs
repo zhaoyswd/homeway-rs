@@ -7,7 +7,7 @@
 //!
 //! 词表面（ENDED code/reason、stateV2、agent、hello flags、caps 位、features 位）
 //! 是**冻结枚举**（只增不改）；`[#[non_exhaustive]]` 的错误类型对齐仓内 thiserror
-//! 纪律。判据 = `fixtures/term/frames.v1.jsonl`（13 案冻结契约）+ 本文件单测的
+//! 纪律。判据 = `fixtures/term/frames.v1.jsonl`（14 案冻结契约）+ 本文件单测的
 //! 往返/截断/尾随块形状族。
 
 use std::io::Read;
@@ -70,9 +70,11 @@ pub mod features {
     pub const SURFACE: u32 = 1 << 5;
     /// 当前HELLO必须携带版本声明，客户端要求此能力位。
     pub const PROTO_VER: u32 = 1 << 6;
-    /// 本出口的全开位集（= 0x7F）。
+    /// 支持不抢占活动腿与几何的 surface 观察接入（HELLO OBSERVER）。
+    pub const OBSERVER: u32 = 1 << 7;
+    /// 本出口的全开位集（= 0xFF）；旧客户端忽略不认识的位。
     pub const ALL: u32 =
-        LIST | REPLAY | MODES | AGENT | TITLE | SURFACE | PROTO_VER;
+        LIST | REPLAY | MODES | AGENT | TITLE | SURFACE | PROTO_VER | OBSERVER;
 }
 
 /// HELLO flags（term-host-cli 协议增量 D8）。
@@ -83,6 +85,8 @@ pub mod hello_flags {
     pub const ONLY_IF_ABSENT: u8 = 1 << 1;
     /// 显式接管：踢掉其它腿（`attach -d`；ENDED reason=replaced）。
     pub const TAKEOVER: u8 = 1 << 2;
+    /// 仅 SURFACE：接入与非活动 RESIZE 只观察，真实输入时才成为活动腿。
+    pub const OBSERVER: u8 = 1 << 3;
 }
 
 /// HELLO 尾随 capability 块的 caps 位（只增不改；位 7 起刻意与被广泛解析的低位隔开）。
@@ -673,6 +677,11 @@ pub fn dec_input(p: &[u8]) -> Result<InputEvent, FrameError> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn greeting_ignores_unknown_feature_bits() {
+        assert_eq!(super::dec_greeting(&[1, 0xff, 0, 0, 0x80]).unwrap(), (1, 0x8000_00ff));
+        assert_eq!(super::dec_greeting(&[1, 0x7f, 0, 0, 0]).unwrap(), (1, 0x7f));
+    }
     use super::*;
 
     fn unhex(s: &str) -> Vec<u8> {
@@ -683,7 +692,7 @@ mod tests {
         b.iter().map(|x| format!("{x:02x}")).collect()
     }
 
-    /// 6d 判据①：fixtures/term/frames.v1.jsonl 冻结契约逐案对拍（13 案）。
+    /// 6d 判据①：fixtures/term/frames.v1.jsonl 冻结契约逐案对拍（14 案）。
     /// （该 fixture 无 0x09 ATTACHED 案——门一评审 A5 登记，由下方 attached 测试补。）
     #[test]
     fn frames_fixture_parity() {
@@ -747,7 +756,7 @@ mod tests {
                 let current = dec_hello_tail(tail).expect("fixture须为当前完整HELLO");
                 assert_eq!(current.caps, caps::SURFACE | caps::KEY_ALT_ESC_PREFIX | caps::PROTO_VER);
                 assert_eq!(current.ver, PROTO_VER);
-                assert_eq!(current.client_id, "app-1");
+                assert_eq!(current.client_id, h.get("clientId").and_then(|id| id.as_str()).unwrap_or("app-1"));
             }
             if let Some(r) = expect.get("resize") {
                 let (cols, rows) = dec_resize(&payload).unwrap();
@@ -781,7 +790,7 @@ mod tests {
                 assert_eq!(dec_name(&payload).unwrap(), k["name"].as_str().unwrap(), "{name}");
             }
         }
-        assert_eq!((count, negatives), (10, 3), "fixture 正例 10 + 负例 3 全数消费");
+        assert_eq!((count, negatives), (11, 3), "fixture 正例 11 + 负例 3 全数消费");
     }
 
     /// 帧读写：滴流读不丢帧不串帧（FrameReader 教训——read_exact 的续读语义）。
