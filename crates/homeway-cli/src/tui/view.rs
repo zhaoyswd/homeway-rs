@@ -121,6 +121,12 @@ pub(super) struct SessionItem {
     pub self_session: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TerminalClose {
+    pub name: String,
+    pub navigation_epoch: u64,
+}
+
 /// The caller supplies an authoritative, ordered window of physical terminal rows.
 /// FETCH row.y is local to the payload, so display positions use slice order.
 #[derive(Clone, Copy)]
@@ -151,6 +157,7 @@ pub(super) struct Model {
     pub notice: String,
     pub focus: Focus,
     pub terminal_title: String,
+    pub terminal_close: Option<TerminalClose>,
     prefix: bool,
     hosts_offset: usize,
     sessions_offset: usize,
@@ -184,6 +191,16 @@ impl Model {
         self.suppressed_releases.clear();
         self.mouse_reporting = false;
         self.history_behind = 0;
+        self.terminal_close = None;
+    }
+
+    fn close_target(&self) -> Option<&TerminalClose> {
+        let session = self
+            .selected_session
+            .and_then(|index| self.sessions.get(index))?;
+        self.terminal_close
+            .as_ref()
+            .filter(|target| !session.self_session && target.name == session.name)
     }
 
     fn next_focus(&mut self) {
@@ -207,6 +224,7 @@ pub(super) enum Action {
     ToggleProxy,
     DeleteHost,
     CloseSession,
+    CloseTerminalSession(TerminalClose),
     SendKey(KeyEvent),
     Paste(String),
     TerminalMouse(MouseEvent),
@@ -220,6 +238,7 @@ pub(super) struct Geometry {
     sessions: Rect,
     host_add: Rect,
     session_add: Rect,
+    terminal_close: Rect,
     create: Rect,
     menu: Rect,
     dialog: Rect,
@@ -364,6 +383,7 @@ pub(super) fn draw(
     geometry.terminal = inner(terminal_panel);
     geometry.host_add = Rect::new(host_panel.right() - 6, host_panel.y, 5, 1);
     geometry.session_add = Rect::new(session_panel.right() - 6, session_panel.y, 5, 1);
+    geometry.terminal_close = Rect::new(terminal_panel.right() - 6, terminal_panel.y, 5, 1);
     panel(
         frame,
         host_panel,
@@ -381,6 +401,18 @@ pub(super) fn draw(
     panel(
         frame,
         terminal_panel,
+        String::new(),
+        model.focus == Focus::Terminal,
+        p,
+    );
+    text(
+        frame,
+        Rect::new(
+            terminal_panel.x + 1,
+            terminal_panel.y,
+            terminal_panel.width.saturating_sub(8),
+            1,
+        ),
         format!(
             " {} ",
             if model.terminal_title.is_empty() {
@@ -389,8 +421,13 @@ pub(super) fn draw(
                 clean(&model.terminal_title)
             }
         ),
-        model.focus == Focus::Terminal,
-        p,
+        Style::default()
+            .fg(if model.focus == Focus::Terminal {
+                p.accent
+            } else {
+                p.fg
+            })
+            .add_modifier(Modifier::BOLD),
     );
     text(
         frame,
@@ -403,6 +440,16 @@ pub(super) fn draw(
         geometry.session_add,
         "[ + ]",
         Style::default().fg(p.accent),
+    );
+    text(
+        frame,
+        geometry.terminal_close,
+        "[ X ]",
+        Style::default().fg(if model.close_target().is_some() {
+            p.accent
+        } else {
+            p.muted
+        }),
     );
     // 三个面板共用一条竖线和一条左侧横线。
     text(
@@ -1254,6 +1301,17 @@ fn select_session_row(model: &mut Model, index: usize, enter_terminal: bool) -> 
 
 fn handle_mouse(model: &mut Model, mouse: MouseEvent, geometry: &Geometry) -> Action {
     let (x, y) = (mouse.column, mouse.row);
+    if contains(geometry.terminal_close, x, y) {
+        return if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
+            model
+                .close_target()
+                .cloned()
+                .map(Action::CloseTerminalSession)
+                .unwrap_or(Action::None)
+        } else {
+            Action::None
+        };
+    }
     if mouse.kind == MouseEventKind::Down(MouseButton::Left) {
         if contains(geometry.host_add, x, y) {
             model.add_host = Some(AddHost::default());
@@ -1678,6 +1736,112 @@ mod tests {
     }
 
     #[test]
+    fn terminal_close_button_reserves_header_space_and_only_handles_left_press() {
+        for theme in [Theme::Dark, Theme::Light] {
+            for (width, height) in [(40, 10), (100, 30)] {
+                let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+                let target = TerminalClose {
+                    name: "session".into(),
+                    navigation_epoch: 7,
+                };
+                let mut model = Model {
+                    hosts: vec![host("我的电脑", HostState::Local)],
+                    sessions: vec![SessionItem {
+                        name: target.name.clone(),
+                        title: "session".into(),
+                        agent: "shell".into(),
+                        project: "project".into(),
+                        state: SessionState::Idle,
+                        self_session: false,
+                    }],
+                    selected_session: Some(0),
+                    terminal_title: "中文title".repeat(40),
+                    terminal_close: Some(target.clone()),
+                    theme,
+                    ..Default::default()
+                };
+                let mut geometry = Geometry::default();
+                terminal
+                    .draw(|frame| geometry = draw(frame, &mut model, None))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let close = geometry.terminal_close;
+                assert_eq!(close.width, geometry.host_add.width);
+                assert_eq!(
+                    (close.x..close.right())
+                        .map(|x| buffer[(x, close.y)].symbol())
+                        .collect::<String>(),
+                    "[ X ]"
+                );
+                assert_eq!(
+                    buffer[(close.x, close.y)].fg,
+                    buffer[(geometry.host_add.x, geometry.host_add.y)].fg
+                );
+                assert_eq!(
+                    buffer[(close.x - 1, close.y)].symbol(),
+                    "─",
+                    "title must leave a gap before X"
+                );
+                assert_eq!(buffer[(close.right(), close.y)].symbol(), "┐");
+                assert!(close.bottom() <= geometry.terminal.y);
+                assert!(
+                    matches!(handle_event(&mut model,mouse(close.x+2,close.y,MouseButton::Left),&geometry),
+                    Action::CloseTerminalSession(value) if value==target)
+                );
+                for kind in [
+                    MouseEventKind::Up(MouseButton::Left),
+                    MouseEventKind::Down(MouseButton::Right),
+                    MouseEventKind::Moved,
+                ] {
+                    assert!(matches!(
+                        handle_event(
+                            &mut model,
+                            Event::Mouse(MouseEvent {
+                                kind,
+                                column: close.x + 2,
+                                row: close.y,
+                                modifiers: KeyModifiers::NONE
+                            }),
+                            &geometry
+                        ),
+                        Action::None
+                    ));
+                }
+                for invalid in ["self", "missing", "no target"] {
+                    model.sessions[0].self_session = invalid == "self";
+                    model.terminal_close = if invalid == "no target" {
+                        None
+                    } else {
+                        Some(TerminalClose {
+                            name: if invalid == "self" {
+                                target.name.clone()
+                            } else {
+                                invalid.into()
+                            },
+                            navigation_epoch: 7,
+                        })
+                    };
+                    terminal
+                        .draw(|frame| geometry = draw(frame, &mut model, None))
+                        .unwrap();
+                    assert_eq!(
+                        terminal.backend().buffer()[(close.x, close.y)].fg,
+                        theme.palette().muted
+                    );
+                    assert!(matches!(
+                        handle_event(
+                            &mut model,
+                            mouse(close.x + 2, close.y, MouseButton::Left),
+                            &geometry
+                        ),
+                        Action::None
+                    ));
+                }
+            }
+        }
+    }
+
+    #[test]
     fn sidebar_fits_host_rows_and_aligns_dots_with_panel_titles() {
         for (count, height) in [(1, 6), (2, 8), (20, 14)] {
             let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
@@ -1853,6 +2017,10 @@ mod tests {
                 })
                 .collect(),
                 selected_session: Some(1),
+                terminal_close: Some(TerminalClose {
+                    name: "session-1".into(),
+                    navigation_epoch: 0,
+                }),
                 focus: Focus::Sessions,
                 theme,
                 notice: "已就绪 · 选择会话，或点击 + 创建 shell".into(),

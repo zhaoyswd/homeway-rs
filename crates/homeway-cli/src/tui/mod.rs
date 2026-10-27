@@ -113,6 +113,7 @@ fn run(options: Options) -> Result<(), Error> {
             app.render_dirty = true;
         }
         if app.render_dirty {
+            app.model.terminal_close = app.terminal_close_target();
             if let Some(surface) = &mut app.surface {
                 surface.prepare(app.size.1);
             }
@@ -177,6 +178,7 @@ struct App {
     current_target: Target,
     active_session: Option<String>,
     create_pending: bool,
+    close_pending: Option<ClosingSession>,
     operation_fact: Option<OperationFact>,
     operation_id: u64,
     operation_warning: Option<(backend::Confirmation, String)>,
@@ -205,6 +207,12 @@ struct OperationFact {
     confirmation: backend::Confirmation,
 }
 
+#[derive(PartialEq, Eq)]
+struct ClosingSession {
+    target: Target,
+    name: String,
+}
+
 struct InputGeometry {
     size: (u16, u16),
     requested: Option<Instant>,
@@ -225,6 +233,7 @@ impl App {
             current_target: Target::Local,
             active_session: None,
             create_pending: false,
+            close_pending: None,
             operation_fact: None,
             operation_id: 0,
             operation_warning: None,
@@ -258,6 +267,21 @@ impl App {
             .selected_session
             .and_then(|i| self.model.sessions.get(i))
             .map(|session| session.name.clone())
+    }
+
+    fn terminal_close_target(&self) -> Option<view::TerminalClose> {
+        if self.create_pending || self.close_pending.is_some() {
+            return None;
+        }
+        let session = self
+            .model
+            .selected_session
+            .and_then(|index| self.model.sessions.get(index))?;
+        (!session.self_session && self.active_session.as_deref() == Some(session.name.as_str()))
+            .then(|| view::TerminalClose {
+                name: session.name.clone(),
+                navigation_epoch: self.navigation_epoch,
+            })
     }
 
     fn command(&mut self, command: Command) -> bool {
@@ -385,6 +409,31 @@ impl App {
     fn backend_event(&mut self, event: backend::Event) {
         self.render_dirty = true;
         match event {
+            backend::Event::SessionClosed {
+                target,
+                name,
+                result,
+            } => {
+                let closed = ClosingSession {
+                    target: target.clone(),
+                    name: name.clone(),
+                };
+                if self.close_pending.as_ref() != Some(&closed) {
+                    return;
+                }
+                self.close_pending = None;
+                match result {
+                    Ok(()) => self.backend_event(backend::Event::Notice {
+                        message: format!("会话 {name} 已关闭"),
+                        clipboard: None,
+                        confirmation: backend::Confirmation::Sessions(target),
+                    }),
+                    Err(error) if target == self.target() => {
+                        self.backend_event(backend::Event::Failed(error))
+                    }
+                    Err(error) => self.model.notice = format!("原主机会话关闭失败：{error}"),
+                }
+            }
             backend::Event::Snapshot(snapshot) => {
                 self.refresh_pending = false;
                 let selected = self.target();
@@ -1026,6 +1075,10 @@ impl App {
                 }
             }
             Action::CloseSession => {
+                if self.close_pending.is_some() {
+                    self.model.notice = "正在关闭会话，请稍候…".into();
+                    return Ok(false);
+                }
                 if self
                     .model
                     .selected_session
@@ -1039,10 +1092,19 @@ impl App {
                 if let Some(name) = self.selected_name() {
                     self.navigation_epoch = self.navigation_epoch.wrapping_add(1);
                     self.sessions_epoch = self.sessions_epoch.wrapping_add(1);
+                    let target = self.target();
                     self.sessions_pending = self.command(Command::KillSession {
-                        target: self.target(),
-                        name,
+                        target: target.clone(),
+                        name: name.clone(),
                     });
+                    if self.sessions_pending {
+                        self.close_pending = Some(ClosingSession { target, name });
+                    }
+                }
+            }
+            Action::CloseTerminalSession(target) => {
+                if self.terminal_close_target().as_ref() == Some(&target) {
+                    return self.action(Action::CloseSession);
                 }
             }
             Action::SendKey(event) => {
@@ -1362,6 +1424,83 @@ mod tests {
         App::new(Options {
             state: std::env::temp_dir().join(format!("homeway-tui-events-{}", std::process::id())),
         })
+    }
+
+    #[test]
+    fn terminal_close_rechecks_displayed_context_and_matching_completion() {
+        let mut app = app();
+        app.model.sessions = vec![session_item(backend::Session {
+            name: "a".into(),
+            ..Default::default()
+        })];
+        app.model.selected_session = Some(0);
+        app.active_session = Some("a".into());
+        let displayed = app.terminal_close_target().unwrap();
+        app.create_pending = true;
+        assert!(app.terminal_close_target().is_none());
+        app.create_pending = false;
+        app.action(Action::CloseTerminalSession(displayed.clone()))
+            .unwrap();
+        assert_eq!(app.close_pending.as_ref().unwrap().name, "a");
+        let epoch = app.navigation_epoch;
+        app.action(Action::CloseTerminalSession(displayed.clone()))
+            .unwrap();
+        assert_eq!(
+            app.navigation_epoch, epoch,
+            "duplicate press cannot enqueue a second close"
+        );
+        app.backend_event(backend::Event::Failed(backend::Error::Busy));
+        assert!(
+            app.close_pending.is_some(),
+            "unrelated failure cannot complete close"
+        );
+        app.backend_event(backend::Event::SessionClosed {
+            target: Target::Local,
+            name: "different".into(),
+            result: Ok(()),
+        });
+        assert!(app.close_pending.is_some());
+        app.current_target = Target::Remote("other-host".into());
+        app.model.sessions[0].name = "new".into();
+        app.active_session = Some("new".into());
+        app.backend_event(backend::Event::SessionClosed {
+            target: Target::Local,
+            name: "a".into(),
+            result: Err(backend::Error::Busy),
+        });
+        assert!(app.close_pending.is_none());
+        assert_eq!(app.selected_name().as_deref(), Some("new"));
+        assert_eq!(app.active_session.as_deref(), Some("new"));
+        assert!(app.model.notice.contains("原主机"));
+        app.navigation_epoch = app.navigation_epoch.wrapping_add(1);
+        app.model.sessions[0].name = "a".into();
+        app.active_session = Some("a".into());
+        app.action(Action::CloseTerminalSession(displayed)).unwrap();
+        assert!(
+            app.close_pending.is_none(),
+            "old same-name target cannot close a new host context"
+        );
+        let current = app.terminal_close_target().unwrap();
+        app.action(Action::CloseTerminalSession(current)).unwrap();
+        assert_eq!(
+            app.close_pending.as_ref().unwrap().target,
+            Target::Remote("other-host".into())
+        );
+    }
+
+    #[test]
+    fn context_menu_close_still_accepts_an_unshown_selection() {
+        let mut app = app();
+        app.model.sessions = vec![session_item(backend::Session {
+            name: "unshown".into(),
+            ..Default::default()
+        })];
+        app.model.selected_session = Some(0);
+        app.active_session = Some("shown".into());
+        assert!(app.terminal_close_target().is_none());
+        app.action(Action::CloseSession).unwrap();
+        assert_eq!(app.close_pending.as_ref().unwrap().name, "unshown");
+        assert_eq!(app.active_session.as_deref(), Some("shown"));
     }
 
     #[test]

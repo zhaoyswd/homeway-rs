@@ -558,14 +558,41 @@ def main():
                     return closing_name in lines[0] and "已接入" in lines[-1]
 
                 wait_until(second_shell_attached, "second shell attached in TUI")
-                second.send(b"\x02s\x1bOQ")  # Session sidebar, F2 context menu.
-                second.wait("关闭会话")
-                second.send(b"\r")
+                snapshot(second, args.snapshot_dir, "terminal-close-ready-light", light=True)
+                # The close button is five cells on the top border; its X is at
+                # zero-based columns-4, independently of the sidebar split.
+                column = second.screen.columns - 3  # SGR uses one-based coordinates.
+                second.send(f"\x1b[<0;{column};1M\x1b[<0;{column};1m")
 
                 def second_shell_closed():
                     second.drain()
-                    entries = sessions(binary,state)
+                    entries = sessions(binary, state)
                     return len(entries) == 1 and entries[0]["name"] == name
+
+                wait_until(second_shell_closed, "header X closes only current second shell")
+                wait_until(lambda: (second.drain() or "想在这台主机上做些什么？" in second.screen_text()), "closed selection clears to the current empty view")
+                wait_until(lambda: (second.drain() or second.screen.buffer[0][second.screen.columns-6].fg == "627083"), "empty close button becomes disabled")
+                snapshot(second, args.snapshot_dir, "terminal-close-empty-light", light=True)
+                assert second.process.poll() is None, "X exited the TUI"
+                print("PASS: real header X press/release closes only selected shell; original remains and empty X is disabled")
+                second.send(b"\x02s\x1b[B\r")
+                def original_reattached():
+                    second.drain()
+                    lines = second.screen_lines()
+                    return name in lines[0] and "已接入" in lines[-1]
+                wait_until(original_reattached, "original shell reattached after header close")
+                second.send("printf 'HW_AFTER_%s\\n' CLOSE\r")
+                second.wait("HW_AFTER_CLOSE")
+                print("PASS: TUI remains usable after X; original shell reattaches and executes input")
+
+                # Retain the existing context-menu regression using a fresh
+                # disposable shell, so the header path cannot mask menu issues.
+                second.send(b"\x02n")
+                closing_name = wait_until(second_shell_created, "disposable menu shell created by TUI")
+                wait_until(second_shell_attached, "disposable menu shell attached in TUI")
+                second.send(b"\x02s\x1bOQ")  # Session sidebar, F2 context menu.
+                second.wait("关闭会话")
+                second.send(b"\r")
 
                 wait_until(second_shell_closed, "context menu closed only second shell")
                 print("PASS: TUI session context menu closes second shell and preserves original")

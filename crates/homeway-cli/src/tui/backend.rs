@@ -210,6 +210,11 @@ pub(super) enum Event {
         name: String,
         epoch: u64,
     },
+    SessionClosed {
+        target: Target,
+        name: String,
+        result: Result<(), Error>,
+    },
     Notice {
         message: String,
         clipboard: Option<String>,
@@ -360,6 +365,10 @@ impl Backend {
                     Command::NewSession { target, epoch } => Some((target.clone(), *epoch)),
                     _ => None,
                 };
+                let closing = match &command {
+                    Command::KillSession { target, name } => Some((target.clone(), name.clone())),
+                    _ => None,
+                };
                 let result = worker.execute(command);
                 match result {
                     Ok(events) => {
@@ -377,13 +386,18 @@ impl Backend {
                         if let Some(client) = worker.control.take() {
                             client.close();
                         }
-                        let event = match creating {
-                            Some((target, epoch)) => Event::CreateFailed {
+                        let event = match (creating, closing) {
+                            (Some((target, epoch)), _) => Event::CreateFailed {
                                 target,
                                 epoch,
                                 error,
                             },
-                            None => Event::Failed(error),
+                            (_, Some((target, name))) => Event::SessionClosed {
+                                target,
+                                name,
+                                result: Err(error),
+                            },
+                            _ => Event::Failed(error),
                         };
                         let _ = deliver(&tx, event, &running);
                     }
@@ -770,8 +784,12 @@ impl Worker {
                 if frame.op != Op::OK {
                     return Err(Error::Unexpected(frame.op.0));
                 }
-                // UI接到成功Notice后走latest-only会话查询，KILL不等待后续LIST。
-                Ok(vec![notice("会话已关闭", Confirmation::Sessions(target))])
+                // 结果携带原始目标，UI只完成匹配的关闭操作；KILL不等待后续LIST。
+                Ok(vec![Event::SessionClosed {
+                    target,
+                    name,
+                    result: Ok(()),
+                }])
             }
         }
     }
@@ -1104,7 +1122,7 @@ mod tests {
     }
 
     #[test]
-    fn successful_kill_returns_notice_without_waiting_for_list() {
+    fn successful_kill_returns_targeted_result_without_waiting_for_list() {
         use homeway_core::term::{
             frames::{self, Op},
             wire::FrameIo,
@@ -1132,9 +1150,92 @@ mod tests {
             })
             .unwrap();
         assert!(
-            matches!(events.as_slice(), [Event::Notice { message, clipboard: None, .. }] if message == "会话已关闭")
+            matches!(events.as_slice(), [Event::SessionClosed { target: Target::Local, name, result: Ok(()) }] if name == "s")
         );
         server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn failed_kill_keeps_original_target_and_name() {
+        use homeway_core::term::{
+            frames::{self, Op},
+            wire::FrameIo,
+        };
+        let root = temporary("kill-error");
+        let listener = UnixListener::bind(root.join("term.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut io = FrameIo::new(socket);
+            io.write_frame(Op::GREETING, &frames::enc_greeting(), REQUEST_BUDGET)
+                .unwrap();
+            let request = io.read_frame_deadline(REQUEST_BUDGET).unwrap();
+            assert_eq!(request.op, Op::KILL);
+            assert_eq!(request.payload, frames::enc_name("original-session"));
+            io.write_frame(
+                Op::ERROR,
+                &frames::enc_error("not_found", "session is gone"),
+                REQUEST_BUDGET,
+            )
+            .unwrap();
+        });
+        let backend = Backend::start(root.clone());
+        backend
+            .send(Command::KillSession {
+                target: Target::Local,
+                name: "original-session".into(),
+            })
+            .unwrap();
+        let deadline = Instant::now() + REQUEST_BUDGET;
+        loop {
+            if let Some(event) = backend.try_event() {
+                assert!(matches!(
+                    event,
+                    Event::SessionClosed {
+                        target: Target::Local,
+                        name,
+                        result: Err(Error::Session { code, .. }),
+                    } if name == "original-session" && code == "not_found"
+                ));
+                assert_eq!(backend.mutation_epoch.load(Ordering::Acquire), 0);
+                break;
+            }
+            assert!(Instant::now() < deadline, "未收到关闭操作的定向失败结果");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        drop(backend);
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn kill_connection_failure_keeps_original_target_and_name() {
+        let root = temporary("kill-connect-error");
+        let backend = Backend::start(root.clone());
+        backend
+            .send(Command::KillSession {
+                target: Target::Local,
+                name: "not-yet-connected".into(),
+            })
+            .unwrap();
+        let deadline = Instant::now() + REQUEST_BUDGET;
+        loop {
+            if let Some(event) = backend.try_event() {
+                assert!(matches!(
+                    event,
+                    Event::SessionClosed {
+                        target: Target::Local,
+                        name,
+                        result: Err(Error::LocalUnavailable),
+                    } if name == "not-yet-connected"
+                ));
+                assert_eq!(backend.mutation_epoch.load(Ordering::Acquire), 0);
+                break;
+            }
+            assert!(Instant::now() < deadline, "未收到建连前失败的定向关闭结果");
+            std::thread::sleep(Duration::from_millis(2));
+        }
+        drop(backend);
         std::fs::remove_dir_all(root).unwrap();
     }
     #[test]
