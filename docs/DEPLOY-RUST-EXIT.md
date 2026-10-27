@@ -1294,3 +1294,30 @@ GREETING version1/features0xff、hello_sent=false仅为协议能力检查；普�
 检测关闭/raw-only及远端cwd由同SHA私有实例验证，未生产新建PTY或测试cwd/TUI交互。
 原环境cross首红、测试长目录裁切控制与最终双门/验收边界见
 [`2026-10-28-tui-host-padding-cwd.md`](reviews/2026-10-28-tui-host-padding-cwd.md)。
+
+### 13.21 LAN71 当前 debug 特例（2026-10-28，完成）
+
+用户明确要求把当前debug也部署到 `192.168.3.71`，本次仅该目标覆盖Release产物纪律；
+不推main/tag/Release，不换装本机或阿里云。远端实测为MacBook Pro、Darwin arm64 /
+macOS26.6.2，UID501，正式路径`/usr/local/bin/homeway`。直接复用本机已测调试件，
+完整SHA256 `c373f951a4fd15dfb2c706b494263ea176b9bd9ffc9876f0948091dfbb5b8442`；
+远端payload的架构、SHA、codesign、`--version`（真实为`homeway (devel)`）和`--help`
+先通过，不用版本文案替代工件身份，不重编或使用check-only产物。
+
+旧官方v0.3.21 SHA007abf0a…c0ff3813、裸进程PID53015，无homeway永久launchd。prepare
+备份旧/新件、全部非cache普通state与启动baseline，保留4客户端关键文件，不造出口身份；
+Python3.9只作必要兼容。checkpoint `0c981af` 后唯一激活独立一次性任务，同目录原子
+换件、TERM旧进程并裸进程零参拉起，仍用默认state，未安装永久自启或启用出口/中继。
+
+02:06:07.882（+08:00）回执 **SUCCESS**，20.358秒，PID **53015→83724**，未回滚。
+正式SHA为上述c373，serve/relay stopped，只有客户端UDP本地64274/64624；config3036B/
+hosts398B/devtag8B/master32B均原SHA逐字节保全。新local-term被动GREETING version1/
+features0xff、hello_sent=false。第二个独立SSH确认PID83724仍活、PPID1、UID501、
+零参，目标mode755/gid0；一次性job not running/runs1/exit0，永久LaunchAgents无homeway。
+
+远端固定回执 `~/homeway-rollback/debug-tui-lan71-20261028-r1/receipt.json`，日志
+`worker.log`，恢复说明`RECOVERY.txt/RESUME.txt`；断线先查回执，禁止重复激活，不自动
+解压state覆盖。本机private TUI81/0与21PASS不冒称远端完整交互；本轮远端仅做工件/
+进程/角色/控制面/被动能力与字节保全验收，未新建生产PTY。本机现役/阿里云未动。
+双门、信号继承整改及完整证据见
+[`2026-10-28-tui-debug-lan71-deploy.md`](reviews/2026-10-28-tui-debug-lan71-deploy.md)。

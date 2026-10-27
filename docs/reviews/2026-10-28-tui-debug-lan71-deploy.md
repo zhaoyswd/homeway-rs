@@ -1,4 +1,7 @@
-# 当前 debug 部署到 LAN71（2026-10-28）
+# 当前 debug 部署到 LAN71（2026-10-28，完成）
+
+已部署同一c373调试件，PID53015→83724；独立SSH终验确认零参/default state、PPID1
+及客户端身份/配置保全。一次性任务exit0，不留永久自启动。下文保留准备、双门与验收边界。
 
 用户明确要求把当前 debug 也部署到 `192.168.3.71`，本次仅该目标覆盖常规 Release
 产物纪律；不推main/tag/Release，不操作阿里云或本机现役。主会话负责远端只读预检、
@@ -39,7 +42,7 @@ client/hosts.json、client/identity/devtag、client/identity/master.key。四个
 本轮因此直接复用同一c373 arm64件，不重构建。采用已确认`/usr/bin/python3`3.9.6，
 仅将已审执行器摘要函数改逐块SHA兼容，不依赖另一个版本未核的/usr/local/bin/python3。
 
-## 技术分支与待收敛参数
+## 技术分支与参数约束
 
 backend独立仓内调查确认以下分支，实际采用哪条以主会话的只读远端预检为准：
 
@@ -73,11 +76,11 @@ owner/权限、当前binary SHA/版本、运行PID/argv与控制面generation、
 5. 失败仅原子退旧件及按原形态恢复，不自动解压state覆盖当前资料。保留持久receipt/log/
    manifest/恢复说明；不新建生产PTY或把被动能力检查写成完整生产TUI交互。
 
-当前远端身份/启动方式已收敛，backend正在本地/tmp按已审6a4结构制作最小差异执行器，
-尚未上传或执行prepare/activation。裸守护按一次TERM有界退出、start_new_session零参
+远端身份/启动方式收敛后，backend在本地/tmp按已审6a4结构制作最小差异执行器，
+制作阶段没有上传或执行prepare/activation。裸守护按一次TERM有界退出、start_new_session零参
 拉起，stdio写0600持久日志；一次性job非keeper、不留永久自启，正常退出后由主会话核
 新PID的PPID1。新件才要求local-term/observer，旧件回退不强求原本不存在的能力。
-技术/代码最终门与真实执行证据在具体脚本核定后如实补充。
+技术/代码最终门与真实执行证据如下记录。
 
 ## 冻结执行器与双门
 
@@ -116,7 +119,7 @@ daemon仍活且PPID1，不能把“start_new_session”配置当成已验证结�
 结果、`worker.log`为日志，`manifest.json`记录baseline，`RESUME.txt/RECOVERY.txt`给
 操作恢复说明；原state归档不自动解压覆盖。
 
-主会话已在远端独占创建0700暂存目录并开始上传已核payload，尚未切换现役；子任务
+主会话先在远端独占创建0700暂存目录并上传已核payload，该阶段未切换现役；子任务
 所有行为仍仅本地只读调查/脚本制作/静态评审，无SSH/SCP或生产动作。最终脚本通过
 双门后才由主会话上传，核SHA后单独执行远端prepare：
 
@@ -136,7 +139,7 @@ PREPARED工件/权限/哈希复核并提交checkpoint后，主会话唯一activa
 `codesign --verify --strict` **exit0**；payload `--version` **exit0**，真实文案为
 `homeway (devel)`，`--help` **exit0**且含tui。新件不是按v0.3.21文案识别，冻结执行器
 无CLI版本字符串断言，严格按完整SHA；GREETING的version1仅指协议。此时正式PATH仍为
-旧007，root开始上传已签脚本/执行prepare，尚未取得prepare结果，不提前登记成功。
+旧007，主会话随后才上传已签脚本/执行prepare，阶段记录不提前登记成功。
 
 主会话随后已唯一上传最终签核脚本，远端先核完整SHA=aaf632，再设0600并用
 `/usr/bin/python3`执行prepare，实际 **exit0、receipt PREPARED**。目标父目录本轮
@@ -144,3 +147,29 @@ PREPARED工件/权限/哈希复核并提交checkpoint后，主会话唯一activa
 `receipt.json`，激活仍为同目录`once.plist`；此阶段不重复prepare或提前激活。
 远端备份工件/manifest的后续只读复核、ROADMAP与checkpoint由主会话完成；子任务只
 追加报告，不访问71、不再改脚本/版本或运行测试。
+
+## 唯一激活与远端实际完成结果
+
+准备与部署前checkpoint由主会话提交为 `0c981af`，随后唯一activation实际完成。
+持久回执 **SUCCESS**，时间为2026-10-28 **02:06:07.882 +08:00**
+（2026-10-27T18:06:07.882Z），耗时20.358秒，`rollback_performed=false`。
+正式 `/usr/local/bin/homeway` 完整SHA与本机target同为上述c373，旧PID **53015→83724**。
+新进程零参、默认state不变，控制面generation为
+`e3a15a171124e7b931ff5bc7a1cebed8`，serve/relay均stopped；仅见客户端UDP本地端口
+64274/64624，未启用38241/38341出口/中继监听。新local-term被动GREETING为version1/
+features0xff、hello_sent=false。
+
+四个客户端关键文件config3036B、hosts398B、devtag8B、master32B均与原SHA逐字节一致，
+原本缺席的出口身份没有创建。旧件/完整非cache state及操作恢复资料留在固定受限回退
+目录，不自动解压覆盖当前state。
+
+主会话随后用**第二个独立SSH**作最终验收：PID83724仍活、UID501、**PPID1**、正式
+零参argv；目标mode755/gid0保持。一次性job `not running / runs=1 / last exit code=0`，
+用户永久LaunchAgents仍无homeway项。由此实际验证新裸守护已脱离SSH与部署worker，
+不是仅凭setsid参数推断；未增加常驻keeper。
+
+证据范围严格分列：本机同SHA私有TUI81/0与local21PASS是本机功能证据；远端完成的是
+payload完整SHA/架构/签名、`--version`（devel）/`--help`、正式进程/角色/端口/控制面/
+被动term能力及字节保全/独立SSH存活验证，**没有在71做完整TUI交互或生产新建PTY**。
+没有改产品源码、再构建、发布/推送，也未操作本机现役或阿里云。远端执行均由主会话
+完成，子任务最后仅按所提供的真实结果补文档，没有再连接71或运行部署脚本。
