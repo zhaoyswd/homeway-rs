@@ -75,3 +75,47 @@ SHA和调用方指定的新SHA，目标级flock串行，0700唯一回退目录�
 本次仅原子替换PATH文件；后台没有重启或杀会话，安装器不访问state或迁移/恢复配置身份，不做额外生产
 attach/resize/TUI交互验收。交互证据为上述69项私有状态/渲染测试；用户重新进入TUI后
 使用新前端。未发布、推送或操作远端。
+
+## 用户随后要求后台重启（独立步骤，准备）
+
+用户随后明确“部署 debug 版本并重启”。此时 PATH 与 target/debug 已同为上述 b3c
+完整 SHA，因此不重复换文件；需要让原 launchd 后台从PID17589重新加载已安装b3c。
+恢复当前会话命令已由主会话先交付，私人内容只保存在回退目录，不写入公开仓。
+
+采用短编排复用已签 `6a4c0ccc…79ed1041` helper 的备份/控制面/角色/端口/TERM/前缀
+核验，不调用其旧 prepare/worker，不沿用旧PID或manifest。脚本位于
+`/tmp/homeway-b3c-restart-20261027/restart.py`；持久目录固定为
+`~/homeway-rollback/tui-b3c-restart-20261027-r1/`，其中 `receipt.json` 为结果，`once.log`
+为日志，`RESUME.txt`为私人恢复文字。prepare备份当前b3c、plist、全部非cache普通state
+文件，并保留已验证e19作为显式故障恢复件；目录0700、敏感工件0600、binary0700。
+
+正常worker由独立一次性launchd job执行，启动即持久RUNNING，目标级flock与唯一阶段
+防止重复操作；**只一次kickstart原服务，无binary替换**。验收新PID、正式零参路径、
+默认state、b3c SHA、控制面PID/generation、serve/relay与UDP41641归属、被动GREETING
+observer能力、critical原字节及tokens前缀；PID稳定10秒后再次完整核验。每job150秒限时。
+不建生产shell或attach/resize现有会话，不把被动能力检查写成完整生产TUI交互。
+
+失败只记FAILED且不盲目重试；独立recovery job须确认normal worker已死/once job不运行、
+全局锁内receipt未变且仍为本轮b3c后，才可原子退e19并单次重启，不覆盖当前state。
+正常worker强杀留下非终态也有受限显式恢复入口；若原PID仍在且未发重启请求，则恢复
+只说明无需回退，不额外启停。
+
+主会话先执行prepare，再提交checkpoint，最后单独activation；子任务不会自行执行：
+
+```sh
+/opt/homebrew/opt/python@3.13/bin/python3.13 /tmp/homeway-b3c-restart-20261027/restart.py prepare
+/bin/launchctl bootstrap gui/501 /Users/zhaozhe/homeway-rollback/tui-b3c-restart-20261027-r1/once.plist
+```
+
+两条是**分开的受审步骤**，不得合并运行。backend技术增量门与UI代码门均完整只读核对
+178行 wrapper，通过最终 SHA256
+`c6afc611aa8c866162a82074e87280debefea79f6ed1aa78a48b4892c1899a0f`，无阻塞项。
+已签helper的复制值仍为 `6a4c0cccdcf9f31a8c6830d7a84089d51646d49975b0671f39258b5979ed1041`；
+只做AST检查，不重复构建或产品测试。
+
+主会话已按正常提权单独执行 prepare：**exit0，receipt=PREPARED，activation_started=false**。
+子任务只读复核持久脚本/helper完整SHA、目录0700、binary0700，manifest/receipt/state归档/
+plist/恢复文本/日志0600均匹配；后台尚未由本轮worker重启。恢复文本中“Only after FAILED”
+是较窄说明，实际受审代码也允许确认normal worker已死、once job不运行的非终态进行显式
+恢复；必须先读取回执和job，不得把文案理解为重复正常activation。
+主会话将在提交checkpoint后执行唯一activation，实际结果完成后再补录。
