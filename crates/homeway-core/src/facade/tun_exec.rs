@@ -3496,7 +3496,7 @@ mod tests {
     /// （gen 不符）/ 收口（stop 位）⇒ `-1` 且**无孤儿监听器**。
     #[test]
     fn request_port_forwards_rc_zero_with_live_gen_stale_minus_one() {
-        let (logf, _lines) = line_logf();
+        let (logf, lines) = line_logf();
         let demand = Arc::new(DemandSignals::new());
         let exec = TunnelExec::new(Arc::clone(&demand));
         let port = free_port();
@@ -3510,10 +3510,17 @@ mod tests {
         let st = runner_of(&run).port_forwards;
         assert_eq!(st.len(), 1);
         assert_eq!(st[0].state, "listening");
+        let connected = std::net::TcpStream::connect(("127.0.0.1", port));
+        let error = connected.as_ref().err();
         assert!(
-            std::net::TcpStream::connect(("127.0.0.1", port)).is_ok(),
-            "热替换后监听口真可连"
+            connected.is_ok(),
+            "热替换后监听口真可连：port={port}，error={error:?}，kind={:?}，errno={:?}，before={st:?}，after={:?}，logs={:?}",
+            error.map(std::io::Error::kind),
+            error.and_then(std::io::Error::raw_os_error),
+            runner_of(&run).port_forwards,
+            drain_lines(&lines),
         );
+        drop(connected);
         // 收口（stop 位）⇒ -1 且撤回监听器（不留孤儿）
         run.stop.store(true, Ordering::Release);
         assert_eq!(exec.request_port_forwards(rules.clone()), -1);

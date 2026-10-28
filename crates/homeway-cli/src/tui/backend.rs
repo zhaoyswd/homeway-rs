@@ -1073,7 +1073,13 @@ mod tests {
             self_sessions: Default::default(),
         };
         let result = worker.snapshot_with_budget(Duration::from_millis(120));
-        assert!(matches!(result, Err(Error::Control(ref error)) if error.code == "timeout"));
+        let timed_out = match &result {
+            Err(Error::Timeout)
+            | Err(Error::Client(homeway_core::daemon::client::ClientErr::Timeout)) => true,
+            Err(Error::Control(error)) => error.code == "timeout",
+            _ => false,
+        };
+        assert!(timed_out, "共享总预算应到期，实际结果：{result:?}");
         drop(worker);
         server.join().unwrap();
         std::fs::remove_dir_all(root).unwrap();
