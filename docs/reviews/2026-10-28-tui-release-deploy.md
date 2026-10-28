@@ -395,3 +395,48 @@ worker完成10秒稳定窗和最终完整就绪验证后，root另起独立SSH�
 serve/relay均running，UDP41641及UDP/TCP41741齐全。config322B、serve key32B、
 relay key32B、tokens990B与原摘要完整一致且追加0B，未恢复覆盖state。此时Mac仍PREPARED、
 尚未bootstrap；云端完成不能写成双端均完成。
+
+### Mac r1 的 launchd 拒绝与旧服务恢复
+
+root在推送云部署记录 `940aeb4` 后唯一 bootstrap r1 once.plist，worker44682独立运行。
+官方 dfe0b99a 件原子换入成功、直接 `--version` 为v0.3.22，但原主job的 kickstart
+被系统拒绝；Apple统一日志09:34:09UTC明确
+`OS_REASON_CODESIGNING | Launch Constraint Violation`，随后
+`Unable to get updated LWCR ... No such process`。原job spawn failed/exit78，没有新PID，
+并非把官方件直接运行/签名校验失败。root未在worker运行时干扰其回退。
+
+r1最终持久回执 **ROLLBACK_FAILED**，09:36:39.894 UTC、151.963秒：新旧就绪验证均
+`service job is not running`。磁盘实际已恢复原1390完整SHA，回执字段 installed_sha仍
+保留前阶段dfe值，不能拿该陈旧字段冒充磁盘事实。root核worker44682已退出，one-shot
+not running/runs1/exit1，原plist完整SHA未改。此时Mac服务确实停止，不能报部署成功。
+
+deployment_plan与version独立实读本机Apple launchctl(1)手册，两步最小恢复技术/精确
+命令代码门通过。root随后执行单一原job bootout（exit0），print确认不存在（exit113），
+再用未改原plist bootstrap（exit0），未修改任何plist/state/系统安全设置，也未重签二进制。
+旧服务恢复 **PID45369**、generation `9ec3a14eaa58479c7db3ecddfde85307`；root调用原
+已审verify_running(False)核零参/defaultstate/1390 SHA/serve41641/relaystopped/身份，
+观察10秒稳定后再完整复核通过。恢复回执
+`r1/manual-registration-recovery.json` 为 OLD_SERVICE_RESTORED，09:41:25.186 UTC。
+tokens本轮prepare实际快照为75,926B、SHA
+`edc25e6366444da6c22913ef4f1333b96a7ca196bc010cbdc022785b8b025d0d`，较早预检台账已有
+合法追加；恢复时该快照原字节完整保全，config/serve key/tui-theme亦保持原摘要。
+
+重新注册后的主job print无原BTMUUID/LWCR字段，实际旧件能够稳定运行；这只证明该次
+标准恢复成功，不把缓存机制推断写成Apple通用修复保证。后续官方件重装使用全新r2
+独立工件，保留r1失败证据和恢复回执，不重跑或改写旧worker。
+
+### Mac r2 工件与切换检查点
+
+deployment_plan制作独立r2，version完成技术门及完整diff代码门，最终工件
+`/tmp/homeway-v0.3.22-release-deploy-20261028-r2/deploy.py` SHA256
+`99864503c73f6d6b0b1b172bcb52d11e98966ab8e01907e079d69262ea8d43e6`，0700目录/0600脚本。
+相对r1仅新run/label/备份目录、30秒单job标准刷新helper、前向及回退两处重载替换，
+以及manual回退中同次严格print辨认原PID正常运行的guard。job明确缺失或已注册但
+spawn_failed均可继续已授权回退，未知print错误拒绝。独立8项纯mock及AST通过；
+作者和评审者没有执行launchctl或生产。原180/100秒预算、官方件及SHA、原plist/state、
+r1失败工件均不变，不重签或改变系统安全设置。
+
+root填新旧PID基线45369，prepare实际exit0，持久回执
+`~/homeway-rollback/release-v0.3.22-20261028-r2/receipt.json` 为 PREPARED，
+activation_started=false；本次再采当前state原字节并备份，不复用旧manifest的运行基线。
+激活为该r2目录once.plist唯一bootstrap，不能重跑r1或因断线重复启动r2。

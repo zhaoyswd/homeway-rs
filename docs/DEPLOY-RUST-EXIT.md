@@ -1335,6 +1335,10 @@ receipt **SUCCESS**，17.013秒、未回退，PID1703776→1723928，零参正�
 `/usr/local/bin/homeway`、默认state，官方Linuxamd64完整SHA256
 `4416735b71700d3af25662dc847cdba19053f721d244de21559acc49f9f220b5`。
 独立SSH再核版本v0.3.22、serve/relay运行、UDP41641和UDP/TCP41741，config/出口及
-中继身份/凭证原字节保全。Mac备份已PREPARED，尚未激活独立launchd任务；LAN71 SSH22
+中继身份/凭证原字节保全。Mac r1换入后被原launchd job的Launch Constraint Violation/
+LWCR拒绝，自动回退恢复了旧磁盘件但同job仍无法启动，receipt ROLLBACK_FAILED。
+确认worker退出后，经独立两门，root仅bootout该单job、确认不存在并用未改原plist
+bootstrap，旧1390服务PID45369恢复并通过身份/角色/端口及10秒稳定复核；未重签、
+改state或安全策略。后续使用全新r2工件重装官方件，r1失败证据保留。LAN71 SSH22
 本轮超时未写。完整门、官方归档SHA、两道评审与恢复指针见
 [`2026-10-28-tui-release-deploy.md`](reviews/2026-10-28-tui-release-deploy.md)。

@@ -94,8 +94,11 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 > 私有进程全清、正式PID和4项身份/配置原字节保全。检查点865a7ed推送后云activate唯一
 > 执行，持久receipt SUCCESS/17.013秒/未回退，PID1703776→1723928，官方v0.3.22/
 > 4416735b件；另起SSH复核版本/映像/角色/UDP41641及UDP-TCP41741与关键字节保全。
-> Macprepare已完成备份、receipt PREPARED尚未bootstrap，现役仍PID55632/1390件。
-> 会话恢复命令已私下交付，独立worker/持久receipt确保可续接。LAN71本次仍SSH22超时，未写
+> Macr1唯一bootstrap后系统Launch Constraint Violation/LWCR错误，原job无法启动新旧件，
+> 151.963秒终态ROLLBACK_FAILED；磁盘已恢复1390但服务曾停。独立两门后root仅对原job
+> bootout→确认不存在→未改原plistbootstrap，旧服务PID45369恢复，原已审只读验收与10秒
+> 稳定通过；未重签/修改state或安全策略。r1失败与恢复证据保留，现准备独立r2官方重装，
+> 未将旧件恢复写成v0.3.22部署完成。会话恢复命令已私下交付。LAN71本次仍SSH22超时，未写
 > 远端，待可达再更新。工件两道门由release子任务准备，实际执行/验证由主会话负责；
 > 状态/实证见`docs/reviews/2026-10-28-tui-release-deploy.md`，不得提前写完成。
 
