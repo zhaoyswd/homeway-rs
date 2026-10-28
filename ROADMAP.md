@@ -84,14 +84,19 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 > workspace check0。修后完整门目录`/tmp/homeway-v0.3.22-ci-local-probe-i2w6xovd/`，
 > workspace **1447/0、40 ignored**（原失败用例通过），clippy/OHOS真link及各源码/向量门
 > 已过，RRR矩阵316秒通过（既有E11 WARN/DNS SKIP按规则登记），完整quick门实际exit0。
-> 收尸修复已提交`960a3d8`，v0.3.22版本/CHANGELOG与本轮矩阵结果另作发布提交，再快进main。
-> 尚未push/tag/生产写入；后续GitHub门与官方件验证不能用本地构建代替。
-> 后续通过完整门后推main→tag在main头→GitHub CI/Release成功→
-> 本机下载校验→官方件私有冒烟→先阿里云再本机滚动换装；切本机前先交付会话恢复指令，
-> 独立worker/持久receipt确保可续接。现役本机PID55632/1390件，阿里云PID1703776/
-> 官方v0.3.21/65a4件已只读复核；关键配置/身份仅记摘要，不输出凭证。LAN71本次仍SSH22
-> 超时，未写远端，待可达再更新。部署工件与两道门由release子任务准备，实际执行/验证由
-> 主会话负责；状态/实证见`docs/reviews/2026-10-28-tui-release-deploy.md`，不得提前写完成。
+> 收尸修复`960a3d8`、发布提交`36d7ec8`已快进main并推送；主分支GitHub CI40659058316
+> 全绿后，tag v0.3.22在origin/main头创建推送，Release40660481250五平台与发布job全绿，
+> 已公开。Mac下载并核验官方件：darwin-arm64二进制dfe0b99a…f9b90795，Linuxamd64
+> 4416735b…f9f220b5；Mac官方同件私有交互23PASS、远程8PASS、复制7PASS均exit0。
+> Linux官方件由本机scp上传并复算一致；私有门先发现模板密钥路径误记，随后发现ss的
+> %lo显示导致断言误拒，均按真实证据最小修正并独立两门，未改产品或放宽绑定。最终云
+> 官方私有门exit0/4PASS：QUIC准入及3轮真实INPUT/surface/resize/KILL(-2)/PTY回收，
+> 私有进程全清、正式PID和4项身份/配置原字节保全。云和Mac prepare均已完成备份，
+> 持久receipt均PREPARED、尚未activate/bootstrap；先云再本机切换。会话恢复命令已私下
+> 交付，独立worker/持久receipt确保可续接。现役本机PID55632/1390件、阿里云PID1703776/
+> 官方v0.3.21/65a4件未切换。LAN71本次仍SSH22超时，未写
+> 远端，待可达再更新。工件两道门由release子任务准备，实际执行/验证由主会话负责；
+> 状态/实证见`docs/reviews/2026-10-28-tui-release-deploy.md`，不得提前写完成。
 
 > **2026-10-28 本项目Codex权限对齐tier（完成，重开项目会话后加载）**：按用户明确要求
 > 新建`.codex/config.toml`，sandbox_mode=danger-full-access、approval_policy=on-request、

@@ -122,7 +122,7 @@ detached 子进程身份持久化及精准回退、可变runtime排除。首个�
 之间的竞态，要求精确目标已消失且无其它正式daemon时幂等成功，防止尚未恢复旧件就早退。
 这些未过门候选均未执行。
 
-**最终独立代码门通过**（version 非作者）：私有脚本
+**首轮独立代码门通过**（version 非作者；实际路径更正后的最终 SHA 见末节）：私有脚本
 `/tmp/homeway-v0.3.22-release-deploy-20261028/ali-deploy.py`，完整 SHA256 为
 `f622e789cb63fb13a720e122f055dc1a61f524ad7830b3bb7f39d65f759ddaa2`，
 脚本0600、父目录0700。上述三项已闭合：pidfd 钉内核进程，核对 starttime/运行映像
@@ -292,5 +292,92 @@ still_running=false、samples=1，总690.111秒；日志明确
 取得真实wait4栈、源修复独立两门、PTY **8/0**、workspace **1447/0**、完整quick门
 **exit0**；不将历史失败改写为一次全绿。
 
-合并与提交、GitHub CI/Release、官方产物 SHA 和换装结果由主会话执行后填写。本记录
-当前为发布准备，不声明发版或部署已完成。
+## 主分支、GitHub 门与官方产物
+
+主会话提交收尸修复 `960a3d8`，版本与发布准备提交
+`36d7ec8aee2a61179a8b960131022cc394688146`，随后从 `tui` 快进 `main` 并推送成功。
+工作区干净、HEAD 与 origin/main 同值后才创建并推送 annotated tag `v0.3.22`。
+
+[主分支 CI 40659058316](https://github.com/zhaoyswd/homeway-rs/actions/runs/40659058316)
+实际 success，包含 macOS/Linux 测试、clippy、OHOS/双musl/Windows check 与隔离门。
+[Release 40660481250](https://github.com/zhaoyswd/homeway-rs/actions/runs/40660481250)
+五平台 build 和最终 release job 全部 success。期间未推进 main，以免影响 tag==origin/main
+门。公开 [v0.3.22](https://github.com/zhaoyswd/homeway-rs/releases/tag/v0.3.22) 发布时间为
+2026-10-28 09:01:47 UTC，非 draft、非 prerelease，五平台归档及 SHA256SUMS 全部齐全。
+
+主会话在 Mac 下载官方 darwin-arm64/linux-amd64 两归档与原始 SHA256SUMS，逐一绑定校验，
+再只提取唯一普通文件 `homeway`；Mac 架构、strict codesign、准确版本和 Linux x86_64
+static-pie 属性均通过。原始校验表 SHA256 为
+`f8e5b75734fa8c06e31abccd8bfbed71d648b264a0a3de3dad8c18d493af11cf`。
+
+| 官方目标 | 归档 SHA256 | 二进制 SHA256 | 二进制大小 |
+|---|---|---|---|
+| darwin-arm64 | `88d620601def233c79b250b8e815e303e0e47d952f72a9e76f1cf56c0ee96223` | `dfe0b99ad21639f95851120644f95d7f85a0f08b70049ec4cf37d02cf9b90795` | 8,996,744B |
+| linux-amd64 | `43005d22cc1e8ec9c782d9f76a001154422aa5897329b737f7ee07d2386e240c` | `4416735b71700d3af25662dc847cdba19053f721d244de21559acc49f9f220b5` | 10,909,856B |
+
+本机官方件实际私有测试全部 exit0：`tools/tui-smoke.py` **23 PASS**、
+`tools/tui-remote-smoke.py` **8 PASS**、`tools/tui-selection-smoke.py` **7 PASS**。
+日志和截图位于 `/tmp/homeway-v0.3.22-official/`，模拟剪贴板/OSC52仅验证请求字节，
+不声明桌面实际接收。各脚本清理自有进程，不访问正式 state。
+
+Linux件由本机 scp 上传阿里云，远端复算归档、二进制、校验表与已审脚本 SHA 均一致。
+首次官方私有 smoke 在 production baseline 前置即失败，尚未创建私有实例、prepare 或
+换装：原部署模板误记中继密钥为 `relay/key.bin`。随后主会话只读核实真实普通文件为
+`relay/relay.key`，root:root、0600、32B，其 SHA256 与原记录
+`df7664188129463c820b0852666b6c90967df2f531af24aa374f88fd0b447d5a` 一致；
+没有软链或身份变化，不应放宽原软链拒绝策略。路径修正和重跑结果后续据实记录。
+
+deployment_plan 仅修正云部署必选路径、云模板键和 smoke 固定 helper SHA，version
+非作者增量技术门/代码门均通过；独立逐字节比较确认恰好三处字面替换，AST/JSON/0600
+检查通过，软链拒绝及其余生命周期逻辑未改。最终执行件 SHA256：
+
+| 私有执行工件 | SHA256 |
+|---|---|
+| `ali-deploy.py` | `3c99ba6a9996db9d7fa4d0f7bc11109de4d1b448fa4566632f723cae5595271b` |
+| `cloud-smoke.py`（包含后续ss后缀最小修正） | `a701a3a38e9b8414db5182992a65b7050743c42e7661df2cdf0c87df7cbb66d8` |
+| `deployment.cloud.template.json` | `d7d12d41250366cf6a7fa5319f7e6d7705313fb6617c4f8cd12ea39188a8281b` |
+
+Linux 私有验收设计单独通过非作者技术/代码门，除 AST 外独立执行14个 golden grid、
+14个合成 v5 snapshot 与3个坏/超限拒绝纯函数检查。实际网络验收仍须 root 实跑，不能
+把静态门写成官方产物行为已过。脚本核验生产旧 PID/starttime/关键摘要，私有 HOME、
+state、身份与 loopback 高端口；QUIC probe 和共享 LIST 走实际网络，INPUT/surface/
+resize/KILL(-2)走同进程共享终端服务，observer仅检查能力，不冒称完整被动行为实测。
+
+修正密钥路径后的云 smoke 实际 exit1，回执
+`/tmp/hw22-linux-smoke-hed_2btd/receipt.json`：passes=0，错误为
+`private QUIC listener is not exact loopback/high port`；自有 daemon1721666 已清理，
+private_processes_exited=true，正式旧进程身份与4项关键原字节均保全，无追加。
+产品源码与该官方件日志证实配置 `bind_interface="127.0.0.1"` 按地址绑定并钉lo，
+不能误改成仅钉卡的 `"lo"`，后者会采用 wildcard 地址。
+
+原私有进程已退出，未保留其当时 ss 行；root另用同机临时 Python UDP socket 实际核实
+相同 `bind(127.0.0.1,随机端口)`+`SO_BINDTODEVICE(lo)` 的 ss 显示为
+`127.0.0.1%lo:36015`，随后 socket 自动关闭。由此定位验收脚本的字符串全等前提错误，
+并不宣称原私有 PID 的 ss 原行已被保存。修正方案仅接受精确127.0.0.1、可选空/lo接口、
+精确已分配高端口，继续拒绝其它地址/设备/wildcard；自有 PID 的 ss 行须落入回执后断言。
+
+上述 ss 后缀修正再次通过 version 非作者增量技术/代码门，独立10例解析、Python3.11
+AST/0600检查通过；私有配置和产品不变，ali helper 末段端口解析原本兼容接口后缀，无需
+修改。只替换 cloud-smoke.py 后主会话实际重跑，**exit0、PASS、4项**，回执
+`/tmp/hw22-linux-smoke-jgmaq4ef/receipt.json`。QUIC准入/path probe通过，随后3轮实际
+QUIC共享LIST、shell INPUT/权威surface、91×31 resize/stty、显式KILL既有码-2、进程
+退出与PTY master fd归基线均通过；private_processes_exited=true，正式旧PID/starttime/
+4项关键原字节前后完全一致。回执保存该官方件自有PID1723179的真实ss监听行，包含
+`127.0.0.1%lo:46184`；另有注册腿的临时UDP出站口，不将其称作额外公共服务监听。
+
+官方件私有验证通过后，root实际执行云 prepare，exit0，持久回执
+`/root/homeway-rollback/release-v0.3.22-20261028-r1/receipt.json` 为 PREPARED；旧二进制、
+state关键常规文件与私有部署资料已持久备份。切换由备份目录中的已审独立worker执行，
+激活不重复；先读取该回执再决定恢复动作，不解压state覆盖当前运行态。
+
+本机已审 worker 的 prepare 实际 exit0，持久回执
+`~/homeway-rollback/release-v0.3.22-20261028-r1/receipt.json` 为 PREPARED，
+activation_started=false；旧件/state/plist/私有恢复资料已备份。此时正式服务仍未切换，
+不将备份准备写成部署完成。
+
+## 生产切换续接点
+
+切换前主会话已向用户交付当前Codex会话恢复命令，具体私有会话ID仅保存在用户可见
+消息与本机0700备份目录的0600 RESUME.txt，不进入本公开记录或上传云端。
+本检查点的云和Mac均为 PREPARED，尚未激活。先云、后Mac，实际结果以各持久receipt
+和运行进程/角色/端口/身份校验为准；不得因SSH或当前会话断开而盲目重复activate/bootstrap。
