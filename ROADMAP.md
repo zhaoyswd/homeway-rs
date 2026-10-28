@@ -72,6 +72,20 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-10-28 v0.3.23 提交/发版/部署（进行中）**：用户明确授权本轮完整链路，发布
+> 14cf217的左侧对齐、Ctrl+B主提示与居中指令弹窗。版本/Cargo锁定四自有包及新CHANGELOG
+> 已独立两门冻结，core/wire/NAPI产品行为不变。完整本地quick门实际exit0：顶层1447/0、
+> 40ignored，clippy/OHOScheck/真link及全部源码/向量等门通过，私有RRR316秒、100MB
+> SHA一致、E10往返与FB-files通过（既有E11 WARN/DNS SKIP保留，未跑--full）。接着推main→CI→main头tag
+> v0.3.23→五平台Release→本机下载校验→官方同件私有验证→备份滚动部署。
+> 本轮已实核Mac46739/dfe0件、云1723928/start3483165197/4416件均v0.3.22；LAN71 SSH
+> 恢复可达，83724/c373旧debug、Python3.9.6、bare client/两角色停用，4客户端关键文件
+> 摘要保全基线与local-term600/ff能力已只读核实，故列第三目标。先云和71，最后本机；
+> Mac继续标准单job bootout/bootstrap，71保留bare形态与默认state/身份，不加永久服务。
+> 版本/部署工件与两门由release子任务完成，root负责全部实际命令、恢复指令和持久回执。
+> Mac/云与LAN独立工件两门均完成；尚未推送本轮提交/tag、无生产写入，证据见
+> `docs/reviews/2026-10-28-tui-command-dialog-release.md`。
+
 > **2026-10-28 TUI 空态/底栏对齐与快捷指令居中（完成，本地调试件）**：会话空态描述及
 > 左底栏与标题同列；全平台主提示/help/README统一Ctrl+B，保留双按透传及能收到的
 > SUPER兼容入口。指令弹窗改为居中最大64×16，40×10时36×8，四周可见背景；模态隔离/
