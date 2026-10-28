@@ -516,6 +516,12 @@ def main():
                 first.wait("想在这台主机上做些什么？")
                 first.drain(0.1)
                 assert "[ X ]" not in first.screen_lines()[0], "initial empty view must hide X"
+                session_title_y = next(y for y, line in enumerate(first.screen_lines()) if " 会话 " in line)
+                title_x = next(x for x in range(first.screen.columns)
+                               if first.screen.buffer[session_title_y][x].data == "会")
+                assert first.screen.buffer[session_title_y + 1][title_x].data == "暂", "empty description must align with title"
+                assert first.screen.buffer[first.screen.lines - 2][title_x].data == "C", "footer must align with title"
+                assert "Ctrl+B 快捷指令" in first.screen_lines()[-2]
                 column = first.screen.columns - 3
                 first.send(f"\x1b[<0;{column};1M\x1b[<0;{column};1m")
                 first.drain(0.2)
@@ -525,13 +531,26 @@ def main():
                 first.send(b"\x02n")
                 first.wait_terminal()
                 for shortcut, label in [(b"\x02", "Ctrl+B"), (b"\x1b[98;9u", "Command+B CSI-u")]:
+                    before = first.screen_lines()
                     first.send(shortcut)
-                    wait_until(lambda: (first.drain() or "快捷指令" in first.screen_lines()[0]), "fullscreen command popup")
+                    popup_title = "快捷指令 · Ctrl+B"
+                    wait_until(lambda: (first.drain() or popup_title in first.screen_text()), "centered command popup")
                     assert "q 分离退出" in first.screen_text() and "h 主机" in first.screen_text()
+                    title_y = next(y for y, line in enumerate(first.screen_lines()) if popup_title in line)
+                    left = next(x for x in range(first.screen.columns) if first.screen.buffer[title_y][x].data == "┌")
+                    right = next(x for x in range(left, first.screen.columns) if first.screen.buffer[title_y][x].data == "┐")
+                    bottom = next(y for y in range(title_y, first.screen.lines) if first.screen.buffer[y][left].data == "└")
+                    assert 0 < left < right < first.screen.columns - 1 and 0 < title_y < bottom < first.screen.lines - 1
+                    assert abs(left - (first.screen.columns - right - 1)) <= 1
+                    assert abs(title_y - (first.screen.lines - bottom - 1)) <= 1
+                    assert first.screen_lines()[0] == before[0] and first.screen_lines()[-2] == before[-2], "popup must preserve surrounding panels"
+                    first.send(b"\x1b[200~must-not-reach-pty\x1b[201~\x1b[<0;3;2M\x1b[<0;3;2m")
+                    first.drain(0.1)
+                    assert popup_title in first.screen_text() and "must-not-reach-pty" not in first.screen_text(), "outside mouse and paste must stay modal"
                     snapshot(first, args.snapshot_dir, "commands-dark")
                     first.send(b"x")  # Unknown command closes once and must never reach the shell.
-                    wait_until(lambda: (first.drain() or "快捷指令" not in first.screen_lines()[0]), "command popup closes after consumed key")
-                    print(f"PASS: {label} opens full-screen commands; consumed key closes without PTY input")
+                    wait_until(lambda: (first.drain() or popup_title not in first.screen_text()), "command popup closes after consumed key")
+                    print(f"PASS: {label} opens centered commands; outside mouse/paste stay modal; consumed key closes without PTY input")
                 first.send("printf 'HW_TUI_%s\\n' FIRST\r")
                 first.wait("HW_TUI_FIRST")
                 # Report the actual current directory through the existing OSC7

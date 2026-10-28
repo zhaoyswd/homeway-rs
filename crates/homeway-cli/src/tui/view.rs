@@ -21,11 +21,7 @@ use super::{
     selection::{self, projected_symbol as terminal_symbol},
 };
 
-pub(super) const COMMAND_SHORTCUT: &str = if cfg!(target_os = "macos") {
-    "⌘+B"
-} else {
-    "Ctrl+B"
-};
+pub(super) const COMMAND_SHORTCUT: &str = "Ctrl+B";
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum Theme {
@@ -432,9 +428,9 @@ pub(super) fn draw(
     geometry.hosts = inner(host_panel);
     geometry.sessions = inner(session_panel);
     let footer_area = Rect::new(
-        geometry.sessions.x,
+        geometry.sessions.x + 1,
         geometry.sessions.bottom().saturating_sub(1),
-        geometry.sessions.width,
+        geometry.sessions.width.saturating_sub(1),
         1,
     );
     geometry.footer = footer_area;
@@ -698,7 +694,12 @@ pub(super) fn draw(
     if model.sessions.is_empty() {
         text(
             frame,
-            geometry.sessions,
+            Rect::new(
+                geometry.sessions.x + 1,
+                geometry.sessions.y,
+                geometry.sessions.width.saturating_sub(1),
+                geometry.sessions.height,
+            ),
             "暂无会话 · 点击 + 创建",
             Style::default().fg(p.muted),
         );
@@ -868,16 +869,24 @@ fn host_notice<'a>(model: &'a Model, host: &HostItem) -> Option<&'a ItemNotice> 
 
 fn draw_commands(frame: &mut Frame<'_>, model: &mut Model, p: Palette) {
     let area = frame.area();
-    frame.render_widget(Clear, area);
+    let width = area.width.saturating_sub(4).min(64);
+    let height = area.height.saturating_sub(2).min(16);
+    let rect = Rect::new(
+        area.x + (area.width - width) / 2,
+        area.y + (area.height - height) / 2,
+        width,
+        height,
+    );
+    frame.render_widget(Clear, rect);
     frame.render_widget(
         Block::default()
             .style(Style::default().bg(p.bg).fg(p.fg))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(p.accent))
             .title(format!(" 快捷指令 · {COMMAND_SHORTCUT} ")),
-        area,
+        rect,
     );
-    let content = inner(area);
+    let content = inner(rect);
     let commands = [
         "h 主机  s 会话  Enter 终端",
         "n 新建会话  a 添加主机",
@@ -1966,6 +1975,16 @@ mod tests {
             assert!(!line(height - 2).contains("READY"));
             assert!(line(height - 1).contains('┘'));
             assert!(!line(height - 1).contains("快捷指令"));
+            let title_x = (0..width)
+                .find(|&x| buffer[(x, geometry.sessions.y - 1)].symbol() == "会")
+                .unwrap();
+            assert_eq!(buffer[(title_x, geometry.sessions.y)].symbol(), "暂");
+            assert_eq!(buffer[(title_x, geometry.footer.y)].symbol(), "C");
+            assert_eq!(geometry.footer.x, title_x);
+            assert!(
+                Line::from(footer(&model, geometry.footer.width)).width()
+                    <= usize::from(geometry.footer.width)
+            );
             for theme in [Theme::Dark, Theme::Light] {
                 for focus in [Focus::Hosts, Focus::Terminal] {
                     for present in [false, true] {
@@ -2281,7 +2300,9 @@ mod tests {
             ("many-light", Theme::Light, true, 100, 30),
             ("small-light", Theme::Light, true, 40, 10),
             ("commands-dark", Theme::Dark, false, 100, 30),
+            ("commands-light", Theme::Light, false, 100, 30),
             ("commands-small-light", Theme::Light, false, 40, 10),
+            ("empty-light", Theme::Light, false, 100, 30),
             ("status-light", Theme::Light, false, 100, 30),
         ] {
             let mut hosts = vec![host("我的电脑", HostState::Local)];
@@ -2322,6 +2343,11 @@ mod tests {
                 notice: "已就绪 · 选择会话，或点击 + 创建 shell".into(),
                 ..Default::default()
             };
+            if name.starts_with("empty") {
+                model.sessions.clear();
+                model.selected_session = None;
+                model.terminal_present = false;
+            }
             if name.starts_with("commands") || name == "status-light" {
                 model.item_notice = Some(ItemNotice {
                     target: NoticeTarget::Session {
@@ -2591,6 +2617,11 @@ mod tests {
         assert_eq!(super::footer(&model, 12), "30行⇧End回底");
         model.history_behind = u64::MAX;
         assert!(Line::from(super::footer(&model, 12)).width() <= 12);
+        model.item_notice = Some(ItemNotice {
+            target: NoticeTarget::Host(Target::Local),
+            summary: "详情".into(),
+            detail: (0..40).map(|index| format!("详情{index:02} ")).collect(),
+        });
         model.prefix = true;
         terminal
             .draw(|frame| {
@@ -2602,6 +2633,36 @@ mod tests {
             .collect::<Vec<_>>()
             .join("\n");
         assert!(popup.contains(&u64::MAX.to_string()) && popup.contains("Shift+End 回到底部"));
+        let detail = |terminal: &Terminal<TestBackend>| {
+            let buffer = terminal.backend().buffer();
+            let y = (0..30)
+                .find(|&y| buffer_line(buffer, y).contains("详情 · ↑↓滚动"))
+                .unwrap();
+            buffer_line(buffer, y + 1)
+        };
+        let first_detail_line = detail(&terminal);
+        assert!(matches!(
+            handle_event(
+                &mut model,
+                Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE)),
+                &Geometry::default(),
+            ),
+            Action::None
+        ));
+        terminal
+            .draw(|frame| draw_commands(frame, &mut model, Theme::Dark.palette()))
+            .unwrap();
+        assert_ne!(detail(&terminal), first_detail_line);
+        assert!(model.commands_open());
+        handle_event(
+            &mut model,
+            Event::Key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE)),
+            &Geometry::default(),
+        );
+        terminal
+            .draw(|frame| draw_commands(frame, &mut model, Theme::Dark.palette()))
+            .unwrap();
+        assert_eq!(detail(&terminal), first_detail_line);
         assert!(model.mouse_reporting);
         model.reset_sessions();
         assert!(!model.mouse_reporting);
@@ -2919,7 +2980,7 @@ mod tests {
     }
 
     #[test]
-    fn command_popup_covers_terminal_and_consumes_mouse_paste_and_unknown_keys() {
+    fn command_popup_is_centered_and_consumes_mouse_paste_and_unknown_keys() {
         for (width, height, shortcut_modifiers) in [
             (40, 10, KeyModifiers::CONTROL),
             (40, 10, KeyModifiers::SUPER),
@@ -2953,6 +3014,7 @@ mod tests {
                 .unwrap();
             assert!(terminal.backend().cursor_visible());
             let original_pane = geometry.terminal;
+            let original_buffer = terminal.backend().buffer().clone();
             assert!(matches!(
                 handle_event(
                     &mut model,
@@ -2984,10 +3046,35 @@ mod tests {
                         .all(|char| !char.is_control()));
                 }
             }
-            assert!(buffer_line(buffer, 0).contains("快捷指令"));
-            assert!(buffer_line(buffer, 1).contains("h 主机"));
-            assert!(buffer_line(buffer, 3).contains("q 分离退出"));
-            assert!(!(0..height).any(|y| buffer_line(buffer, y).contains("创建 shell 会话")));
+            let title_y = (0..height)
+                .find(|&y| buffer_line(buffer, y).contains("快捷指令 · Ctrl+B"))
+                .unwrap();
+            let left = (0..width)
+                .find(|&x| buffer[(x, title_y)].symbol() == "┌")
+                .unwrap();
+            let right = (left..width)
+                .find(|&x| buffer[(x, title_y)].symbol() == "┐")
+                .unwrap();
+            let bottom = (title_y..height)
+                .find(|&y| buffer[(left, y)].symbol() == "└")
+                .unwrap();
+            assert!(left > 0 && title_y > 0 && right < width - 1 && bottom < height - 1);
+            assert!(left.abs_diff(width - right - 1) <= 1);
+            assert!(title_y.abs_diff(height - bottom - 1) <= 1);
+            assert!(right - left < 64 && bottom - title_y < 16);
+            assert!(buffer_line(buffer, title_y + 1).contains("h 主机  s 会话  Enter 终端"));
+            assert!(buffer_line(buffer, title_y + 2).contains("n 新建会话  a 添加主机"));
+            assert!(buffer_line(buffer, title_y + 3).contains("m 操作菜单  q 分离退出"));
+            assert!(buffer_line(buffer, title_y + 4).contains("Ctrl+B 连按发送 Ctrl+B  Esc 取消"));
+            assert!(buffer_line(buffer, title_y + 5).contains("详情 · ↑↓滚动"));
+            assert!(buffer_line(buffer, title_y + 6).contains("错误"));
+            for y in 0..height {
+                for x in 0..width {
+                    if x < left || x > right || y < title_y || y > bottom {
+                        assert_eq!(buffer[(x, y)], original_buffer[(x, y)]);
+                    }
+                }
+            }
             for event in [
                 mouse(geometry.terminal.x, geometry.terminal.y, MouseButton::Left),
                 Event::Paste("must-not-reach-pty".into()),
@@ -3542,12 +3629,26 @@ mod tests {
 
     #[test]
     fn small_windows_and_wide_terminal_cells() {
-        for (width, height) in [(1, 1), (20, 5), (48, 12), (120, 32)] {
+        for (width, height) in [
+            (1, 1),
+            (2, 2),
+            (4, 2),
+            (20, 5),
+            (39, 9),
+            (48, 12),
+            (120, 32),
+        ] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             let mut model = Model {
                 hosts: vec![host("我的电脑", HostState::Local)],
                 ..Model::default()
             };
+            terminal
+                .draw(|frame| {
+                    draw(frame, &mut model, None);
+                })
+                .unwrap();
+            model.prefix = true;
             terminal
                 .draw(|frame| {
                     draw(frame, &mut model, None);

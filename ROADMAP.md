@@ -72,6 +72,16 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-10-28 TUI 空态/底栏对齐与快捷指令居中（完成，本地调试件）**：会话空态描述及
+> 左底栏与标题同列；全平台主提示/help/README统一Ctrl+B，保留双按透传及能收到的
+> SUPER兼容入口。指令弹窗改为居中最大64×16，40×10时36×8，四周可见背景；模态隔离/
+> 执行关闭/详情滚动/PTY geometry保留。dsh外评因profile写EPERM不可用，按协议独立
+> 子agent技术/代码两门通过。原沙箱完整TUI105/9IPC权限失败留证，root授权IPC环境复验
+> **114/0、1 ignored**；显示层30/0、预览1/0与10图，root核暗/浅/窄/真实私有截图。
+> build/clippy通过，最终同件私有PTY **23 PASS**，含Ctrl/SUPER开关、外侧mouse/paste
+> 隔离及对齐。`target/debug/homeway` SHA2280d20e…ba48b610；未推送/发版/部署，正式
+> v0.3.22双端不动。双门和实际验证见`docs/reviews/2026-10-28-tui-command-dialog.md`。
+
 > **2026-10-28 TUI 合入main/发版/正式部署v0.3.22（完成）**：用户明确授权合入主分支、
 > 提交/推送/发版/部署，覆盖本轮相应生产切换授权；仍严格用GitHub tag Release产物。
 > fetch确认origin/main=deaabd5、最新Release=v0.3.21，tui可快进；版本/CHANGELOG已由子任务

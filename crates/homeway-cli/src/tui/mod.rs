@@ -56,7 +56,7 @@ fn options(args: &[String]) -> Result<Option<Options>, Error> {
         .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
     {
         let shortcut = view::COMMAND_SHORTCUT;
-        println!("用法：homeway tui [--state DIR]\n\n鼠标：左键选择；右键管理主机/会话；标题栏 + 添加。\n键盘：{shortcut} 后 h/s/Enter 选主机/会话/终端；\n      {shortcut} 后 a/n 添加主机/创建会话；m 操作菜单；q 分离退出。\n      侧栏中 F6 切焦点、F10 退出；Ctrl+B 保留兼容；Ctrl+B Ctrl+B 发送 Ctrl+B。\n历史：滚轮浏览；应用捕获鼠标时用 Shift+滚轮；Shift+PageUp/PageDown/Home/End。\n主题随终端背景自动识别。会话中的普通按键交给终端；退出后会话继续运行。");
+        println!("用法：homeway tui [--state DIR]\n\n鼠标：左键选择；右键管理主机/会话；标题栏 + 添加。\n键盘：{shortcut} 打开快捷指令弹窗，后按 h/s/Enter 选主机/会话/终端；\n      {shortcut} 后 a/n 添加主机/创建会话；m 操作菜单；q 分离退出。\n      侧栏中 F6 切焦点、F10 退出；Ctrl+B Ctrl+B 发送 Ctrl+B。\n历史：滚轮浏览；应用捕获鼠标时用 Shift+滚轮；Shift+PageUp/PageDown/Home/End。\n主题随终端背景自动识别。会话中的普通按键交给终端；退出后会话继续运行。");
         return Ok(None);
     }
     let mut parsed = Options {
