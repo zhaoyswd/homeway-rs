@@ -244,3 +244,20 @@ RRR smoke **TOTAL316秒**，F 的100MB传输 SHA 双侧一致，E10往返58B，F
 
 GitHub CI/Release、官方下载校验、官方同件私有烟囱及三个目标的真实 prepare/activation/
 独立验收结果由主会话实际完成后追加。当前不代表已推送、发布或部署成功。
+
+## 主分支CI阻塞与测试夹具修正
+
+root实际提交并推送发布准备`19876125ee02a6d5dd61e21026d5d72f11955399`。
+[CI40696331454](https://github.com/zhaoyswd/homeway-rs/actions/runs/40696331454)首轮Ubuntu
+完整测试及全部check/clippy/隔离门成功，Mac CLI190/0，但core未改sentinel用例在KILL
+后等OK时UnexpectedEof；保存日志后仅重跑失败Mac job一次，第二轮CLI快照预算夹具
+对合法关闭的第二请求unwrap(None)而panic，尚未跑core，不能把它记作sentinel复验绿。
+两轮原始日志分别保留，不归因环境，不盲目第三次重跑同提交，也未在红门上打tag。
+
+独立两门后最小修改仅cfg(test)：快照夹具预握手并严格验证两个请求共用总截止时间，
+用timeout与服务端真正EOF双判据区分错误逐请求重置；旧KILL失败只加有界opcode诊断，
+不猜改产品。根因候选/完整边界及两轮原红/探针首批目录创建失败均据实记录在
+[`2026-10-28-tui-snapshot-budget-fixture.md`](2026-10-28-tui-snapshot-budget-fixture.md)。
+root实际重新运行workspace **1447/0、40 ignored，exit0**，workspace全targets clippy
+exit0；旧关闭用例独立串行16/16通过，仅作该批未复现证据，不宣称KILL候选已修。
+版本与部署工件保持冻结，随后另提交test-only修正，重新运行GitHub完整门后才能打tag。

@@ -4626,18 +4626,27 @@ mod tests {
         /// STATE 族都合法交错；ERROR 帧早退带细节）。
         fn expect(&mut self, op: Op, secs: u64) -> Frame {
             let deadline = Instant::now() + Duration::from_secs(secs);
+            let mut recent = std::collections::VecDeque::with_capacity(16);
+            let mut truncated = false;
+            let mut saw_ended = false;
             loop {
                 let left = deadline.saturating_duration_since(Instant::now());
                 let f = self
                     .io
                     .read_frame_deadline(left.max(Duration::from_millis(10)))
-                    .unwrap_or_else(|e| panic!("等 op 0x{:02x} 超时：{e}", op.0));
+                    .unwrap_or_else(|e| panic!("等 op 0x{:02x} 超时：{e}；最近opcode={recent:02x?}，截断={truncated}，曾见ENDED={saw_ended}", op.0));
+                if recent.len() == 16 {
+                    recent.pop_front();
+                    truncated = true;
+                }
+                recent.push_back(f.op.0);
+                saw_ended |= f.op == Op::ENDED;
                 if f.op == op {
                     return f;
                 }
                 if f.op == Op::ERROR {
                     let (code, msg) = frames::dec_error(&f.payload).unwrap_or_default();
-                    panic!("期望 op 0x{:02x}，收到 ERROR({code}: {msg})", op.0);
+                    panic!("期望 op 0x{:02x}，收到 ERROR({code}: {msg})；最近opcode={recent:02x?}，截断={truncated}，曾见ENDED={saw_ended}", op.0);
                 }
             }
         }

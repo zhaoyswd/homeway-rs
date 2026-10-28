@@ -1049,40 +1049,96 @@ mod tests {
 
     #[test]
     fn snapshot_uses_one_total_deadline_for_multiple_requests() {
+        use std::io::Read;
+
+        fn read_request(socket: &mut UnixStream) -> RequestBody {
+            let head = control_frame::read_header(socket).expect("预算夹具必须收到完整请求头");
+            assert_eq!(head.op, control_frame::Op::Req.code());
+            let body = control_frame::read_body(socket, head).expect("预算夹具必须收到完整请求体");
+            serde_json::from_slice(&body).expect("预算夹具请求必须是 RequestBody")
+        }
+
         let root = temporary("snapshot-budget");
         let listener = UnixListener::bind(root.join("control.sock")).unwrap();
+        listener.set_nonblocking(true).unwrap();
         let server = std::thread::spawn(move || {
-            let (mut socket, _) = listener.accept().unwrap();
+            let accept_deadline = Instant::now() + Duration::from_secs(5);
+            let (mut socket, _) = loop {
+                match listener.accept() {
+                    Ok(connection) => break connection,
+                    Err(error)
+                        if matches!(
+                            error.kind(),
+                            std::io::ErrorKind::WouldBlock | std::io::ErrorKind::Interrupted
+                        ) =>
+                    {
+                        assert!(Instant::now() < accept_deadline, "预算夹具接受连接超时");
+                        std::thread::sleep(Duration::from_millis(5));
+                    }
+                    Err(error) => panic!("预算夹具接受连接失败：{error}"),
+                }
+            };
+            socket.set_nonblocking(false).unwrap();
             socket
-                .set_read_timeout(Some(Duration::from_millis(500)))
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            socket
+                .set_write_timeout(Some(Duration::from_secs(5)))
                 .unwrap();
             control_welcome(&mut socket);
-            let request: RequestBody =
-                serde_json::from_value(control_read(&mut socket).unwrap()).unwrap();
-            std::thread::sleep(Duration::from_millis(50));
+            let request = read_request(&mut socket);
+            assert_eq!(request.op, "host.list");
+            std::thread::sleep(Duration::from_secs(1));
             control_response(&mut socket, &request, json!({"hosts":[]}));
-            let request: RequestBody =
-                serde_json::from_value(control_read(&mut socket).unwrap()).unwrap();
+            let request = read_request(&mut socket);
             assert_eq!(request.op, "snapshot.get");
-            // 不再回答：正确预算到点由调用方close，旧分步3s预算会等到服务端500ms断链。
-            assert!(control_read(&mut socket).is_none());
+            // 总预算2s已消耗至少1s；余预算先到期后客户端close，必须读到真正EOF。
+            // 若每步重置2s预算，服务端1.5s先到期并断链，调用方只能得到conn_closed/IO。
+            socket
+                .set_read_timeout(Some(Duration::from_millis(1500)))
+                .unwrap();
+            socket.read(&mut [0])
         });
+        // 握手与reader线程启动不属于本例的跨请求预算，先建立连接再开始计时。
+        let client = ControlClient::dial_with_timeout(
+            &root.join("control.sock"),
+            "cli",
+            "snapshot-budget-test",
+            Duration::from_secs(5),
+        )
+        .unwrap()
+        .0;
         let mut worker = Worker {
             state_dir: root.clone(),
-            control: None,
+            control: Some(client),
             self_sessions: Default::default(),
         };
-        let result = worker.snapshot_with_budget(Duration::from_millis(120));
+        let result = worker.snapshot_with_budget(Duration::from_secs(2));
         let timed_out = match &result {
             Err(Error::Timeout)
             | Err(Error::Client(homeway_core::daemon::client::ClientErr::Timeout)) => true,
             Err(Error::Control(error)) => error.code == "timeout",
             _ => false,
         };
-        assert!(timed_out, "共享总预算应到期，实际结果：{result:?}");
         drop(worker);
-        server.join().unwrap();
+        let server_deadline = Instant::now() + Duration::from_secs(10);
+        while !server.is_finished() {
+            assert!(
+                Instant::now() < server_deadline,
+                "预算夹具服务线程未在收尾期限内结束"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        let peer_read = server.join().unwrap();
         std::fs::remove_dir_all(root).unwrap();
+        assert!(
+            timed_out,
+            "跨两次请求的共享总预算应到期，实际结果：{result:?}，服务端读结果：{peer_read:?}"
+        );
+        assert!(
+            matches!(&peer_read, Ok(0)),
+            "共享预算到期应由客户端先关闭，不能把服务端超时当作EOF：{peer_read:?}"
+        );
     }
 
     #[test]

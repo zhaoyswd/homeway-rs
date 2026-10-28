@@ -83,7 +83,12 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 > 摘要保全基线与local-term600/ff能力已只读核实，故列第三目标。先云和71，最后本机；
 > Mac继续标准单job bootout/bootstrap，71保留bare形态与默认state/身份，不加永久服务。
 > 版本/部署工件与两门由release子任务完成，root负责全部实际命令、恢复指令和持久回执。
-> Mac/云与LAN独立工件两门均完成；尚未推送本轮提交/tag、无生产写入，证据见
+> Mac/云与LAN独立工件两门均完成。发布提交1987612已推main，但CI40696331454首红
+> Mac旧sentinel等OK见EOF；同提交仅重跑一次后CLI预算fixture unwrap(None)红且未跑core。
+> 已留证并停止盲目重跑；独立两门仅修cfgtest预算夹具并补帧序列诊断，产品不变。
+> root新workspace1447/0、40ignored与全targetsclippy通过，sentinel串行16/16未复现；
+> 首并行探针3/1目录创建失败留证，不误记KILL复现。接着推test-only修正再跑CI，未打tag、
+> 无生产写入，证据见
 > `docs/reviews/2026-10-28-tui-command-dialog-release.md`。
 
 > **2026-10-28 TUI 空态/底栏对齐与快捷指令居中（完成，本地调试件）**：会话空态描述及
