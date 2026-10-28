@@ -12,11 +12,14 @@ use ratatui::{
     layout::{Alignment, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, Paragraph},
+    widgets::{Block, Borders, Clear, Paragraph, Wrap},
     Frame,
 };
 
-use super::selection::{self, projected_symbol as terminal_symbol};
+use super::{
+    backend::Target,
+    selection::{self, projected_symbol as terminal_symbol},
+};
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum Theme {
@@ -97,6 +100,7 @@ pub(super) enum HostState {
 
 #[derive(Debug, Clone)]
 pub(super) struct HostItem {
+    pub target: Target,
     pub name: String,
     pub detail: String,
     pub state: HostState,
@@ -121,6 +125,19 @@ pub(super) struct SessionItem {
     pub project: String,
     pub state: SessionState,
     pub self_session: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum NoticeTarget {
+    Host(Target),
+    Session { target: Target, name: String },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ItemNotice {
+    pub target: NoticeTarget,
+    pub summary: String,
+    pub detail: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -157,6 +174,7 @@ pub(super) struct Model {
     pub selected_session: Option<usize>,
     pub theme: Theme,
     pub notice: String,
+    pub item_notice: Option<ItemNotice>,
     pub focus: Focus,
     pub terminal_title: String,
     pub terminal_present: bool,
@@ -164,6 +182,7 @@ pub(super) struct Model {
     pub selection_spans: Vec<selection::Span>,
     pub selecting: bool,
     prefix: bool,
+    command_detail_offset: u16,
     hosts_offset: usize,
     sessions_offset: usize,
     suppressed_releases: Vec<KeyCode>,
@@ -183,11 +202,16 @@ impl Model {
     }
 
     pub(super) fn modal_open(&self) -> bool {
-        self.menu.is_some() || self.add_host.is_some()
+        self.prefix || self.menu.is_some() || self.add_host.is_some()
+    }
+
+    pub(super) fn commands_open(&self) -> bool {
+        self.prefix
     }
 
     pub(super) fn clear_prefix(&mut self) {
         self.prefix = false;
+        self.command_detail_offset = 0;
     }
 
     pub(super) fn reset_terminal_input(&mut self) {
@@ -245,6 +269,7 @@ pub(super) enum Action {
 #[derive(Default, Debug, Clone, Copy)]
 pub(super) struct Geometry {
     pub terminal: Rect,
+    footer: Rect,
     hosts: Rect,
     sessions: Rect,
     host_add: Rect,
@@ -256,6 +281,13 @@ pub(super) struct Geometry {
     name_input: Rect,
     token_input: Rect,
     submit: Rect,
+}
+
+#[cfg(test)]
+impl Geometry {
+    pub(super) fn footer_area(&self) -> Rect {
+        self.footer
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -366,11 +398,14 @@ pub(super) fn draw(
                 .style(Style::default().fg(p.muted)),
             area,
         );
+        if model.prefix {
+            draw_commands(frame, model, p);
+        }
         return geometry;
     }
     let sidebar = ((u32::from(area.width) * 3 / 10) as u16).clamp(18, 34) * 4 / 5;
     let sidebar = sidebar.min(area.width.saturating_sub(18));
-    let body = Rect::new(area.x, area.y, area.width, area.height - 1);
+    let body = area;
     let host_height = model
         .hosts
         .len()
@@ -390,6 +425,14 @@ pub(super) fn draw(
     );
     geometry.hosts = inner(host_panel);
     geometry.sessions = inner(session_panel);
+    let footer_area = Rect::new(
+        geometry.sessions.x,
+        geometry.sessions.bottom().saturating_sub(1),
+        geometry.sessions.width,
+        1,
+    );
+    geometry.footer = footer_area;
+    geometry.sessions.height = geometry.sessions.height.saturating_sub(1);
     geometry.terminal = inner(terminal_panel);
     geometry.host_add = Rect::new(host_panel.right() - 6, host_panel.y, 5, 1);
     geometry.session_add = Rect::new(session_panel.right() - 6, session_panel.y, 5, 1);
@@ -527,7 +570,10 @@ pub(super) fn draw(
             }),
         );
         if row.height > 1 {
-            let detail = if host.state == HostState::Local {
+            let notice = host_notice(model, host);
+            let detail = if let Some(notice) = notice {
+                format!("  {}", clean(&notice.summary))
+            } else if host.state == HostState::Local {
                 format!(
                     "  出口{}{} 中继{}{}",
                     if row.width < 21 { "" } else { "：" },
@@ -546,7 +592,9 @@ pub(super) fn draw(
                 frame,
                 Rect::new(row.x + 1, y + 1, row.width.saturating_sub(1), 1),
                 detail,
-                Style::default().fg(p.muted).bg(bg),
+                Style::default()
+                    .fg(if notice.is_some() { p.amber } else { p.muted })
+                    .bg(bg),
             );
         }
     }
@@ -616,16 +664,28 @@ pub(super) fn draw(
         if row.height > 1 {
             let agent = clean(&session.agent);
             let project = clean(&session.project);
-            let detail = format!(
+            let normal = format!(
                 "{label} {} {}",
                 if agent.is_empty() { "unknown" } else { &agent },
                 if project.is_empty() { "—" } else { &project }
             );
+            let notice = session_notice(model, session);
+            let detail = if model.selecting && selected {
+                "拖选中，松开复制".to_owned()
+            } else {
+                notice.map_or(normal, |notice| clean(&notice.summary))
+            };
             text(
                 frame,
                 Rect::new(row.x + 1, y + 1, row.width.saturating_sub(1), 1),
                 format!("  {detail}"),
-                Style::default().fg(color).bg(bg),
+                Style::default()
+                    .fg(if notice.is_some() || (model.selecting && selected) {
+                        p.amber
+                    } else {
+                        color
+                    })
+                    .bg(bg),
             );
         }
     }
@@ -711,19 +771,18 @@ pub(super) fn draw(
     }
     text(
         frame,
-        Rect::new(area.x + 1, area.bottom() - 1, area.width - 2, 1),
-        footer(model, area.width),
-        Style::default().fg(if model.notice.is_empty() && !model.prefix {
-            p.muted
-        } else {
-            p.amber
-        }),
+        footer_area,
+        footer(model, footer_area.width),
+        Style::default().fg(p.muted),
     );
     if model.menu.is_some() {
         draw_menu(frame, model, &mut geometry, p);
     }
     if model.add_host.is_some() {
         draw_add_host(frame, model, &mut geometry, p);
+    }
+    if model.prefix {
+        draw_commands(frame, model, p);
     }
     geometry
 }
@@ -737,36 +796,127 @@ fn terminal_color(color: vt::Color, default: Color) -> Color {
 }
 
 fn footer(model: &Model, width: u16) -> String {
-    if model.prefix {
-        return if width >= 70 {
-            "^B: h主机 s会话 Enter终端 n新建 a添加 m操作 q退出".into()
+    if model.history_behind > 0 {
+        let count = model.history_behind.to_string();
+        if count.len() + 11 <= usize::from(width) {
+            format!("{count}行 ⇧End回底")
+        } else if count.len() + 10 <= usize::from(width) {
+            format!("{count}行⇧End回底")
+        } else if count.len() + 7 <= usize::from(width) {
+            format!("{count}行 ⇧End")
         } else {
-            "^B: h主机 s会话 n新建 a添加 q退出".into()
-        };
+            let (scale, unit) = [
+                (1_000_000_000_000_000_000u64, "E"),
+                (1_000_000_000_000_000, "P"),
+                (1_000_000_000_000, "T"),
+                (1_000_000_000, "G"),
+                (1_000_000, "M"),
+                (1_000, "k"),
+            ]
+            .into_iter()
+            .find(|(scale, _)| model.history_behind >= *scale)
+            .unwrap_or((1, ""));
+            format!("~{}{unit}行 ⇧End", model.history_behind / scale)
+        }
+    } else {
+        "^B 快捷指令".into()
     }
-    let selection = if model.selecting {
-        "拖选中，松开复制 · "
-    } else if model.mouse_reporting {
-        "Shift拖选 · "
-    } else {
-        ""
-    };
-    let history = if model.history_behind > 0 {
-        format!("↑{}行 · ⇧End回底 · ", model.history_behind)
-    } else {
-        String::new()
-    };
-    if model.notice.is_empty() {
-        let hint = if model.selecting || model.mouse_reporting {
-            ""
+}
+
+fn session_notice<'a>(model: &'a Model, session: &SessionItem) -> Option<&'a ItemNotice> {
+    let notice = model.item_notice.as_ref()?;
+    match &notice.target {
+        NoticeTarget::Session { target, name }
+            if name == &session.name
+                && model
+                    .hosts
+                    .get(model.selected_host)
+                    .is_some_and(|host| &host.target == target) =>
+        {
+            Some(notice)
+        }
+        _ => None,
+    }
+}
+
+fn host_notice<'a>(model: &'a Model, host: &HostItem) -> Option<&'a ItemNotice> {
+    let notice = model.item_notice.as_ref()?;
+    match &notice.target {
+        NoticeTarget::Host(target) if target == &host.target => Some(notice),
+        NoticeTarget::Session { target, name } if target == &host.target => {
+            let current = model
+                .hosts
+                .get(model.selected_host)
+                .is_some_and(|selected| &selected.target == target);
+            (!current || !model.sessions.iter().any(|session| &session.name == name))
+                .then_some(notice)
+        }
+        _ => None,
+    }
+}
+
+fn draw_commands(frame: &mut Frame<'_>, model: &mut Model, p: Palette) {
+    let area = frame.area();
+    frame.render_widget(Clear, area);
+    frame.render_widget(
+        Block::default()
+            .style(Style::default().bg(p.bg).fg(p.fg))
+            .borders(Borders::ALL)
+            .border_style(Style::default().fg(p.accent))
+            .title(" 快捷指令 "),
+        area,
+    );
+    let content = inner(area);
+    let commands = [
+        "h 主机  s 会话  Enter 终端",
+        "n 新建会话  a 添加主机",
+        "m 操作菜单  q 分离退出",
+        "^B 发送 Ctrl+B  Esc 取消",
+    ];
+    for (index, command) in commands.into_iter().enumerate() {
+        if index as u16 >= content.height {
+            break;
+        }
+        text(
+            frame,
+            Rect::new(content.x, content.y + index as u16, content.width, 1),
+            command,
+            Style::default().fg(p.fg).bg(p.bg),
+        );
+    }
+    if content.height > 5 {
+        let history = if model.history_behind > 0 {
+            format!("历史：{}行；Shift+End 回到底部。", model.history_behind)
         } else {
-            " · Shift拖选"
+            String::new()
         };
-        format!("{selection}{history}^B 菜单 · ⇧PgUp 历史{hint} · ^B q退出")
-    } else if width >= 90 {
-        format!("{selection}{history}{} · ^B q退出", clean(&model.notice))
-    } else {
-        format!("{selection}{history}{}", clean(&model.notice))
+        let notice = model
+            .item_notice
+            .as_ref()
+            .map_or(String::new(), |notice| clean(&notice.detail));
+        let detail = match (history.is_empty(), notice.is_empty()) {
+            (false, false) => format!("{history}\n{notice}"),
+            (false, true) => history,
+            (_, _) => notice,
+        };
+        if !detail.is_empty() {
+            text(
+                frame,
+                Rect::new(content.x, content.y + 4, content.width, 1),
+                "详情 · ↑↓滚动",
+                Style::default().fg(p.muted).bg(p.bg),
+            );
+            model.command_detail_offset = model
+                .command_detail_offset
+                .min(u16::try_from(detail.chars().count()).unwrap_or(u16::MAX));
+            frame.render_widget(
+                Paragraph::new(detail)
+                    .style(Style::default().fg(p.amber).bg(p.bg))
+                    .wrap(Wrap { trim: false })
+                    .scroll((model.command_detail_offset, 0)),
+                Rect::new(content.x, content.y + 5, content.width, content.height - 5),
+            );
+        }
     }
 }
 
@@ -1124,7 +1274,7 @@ pub(super) fn handle_event(model: &mut Model, event: Event, geometry: &Geometry)
             };
         }
     }
-    if !matches!(event, Event::Key(_)) || model.modal_open() {
+    if model.menu.is_some() || model.add_host.is_some() {
         model.clear_prefix();
     }
     let action = handle_event_inner(model, event, geometry);
@@ -1158,6 +1308,9 @@ fn remember_key(keys: &mut Vec<KeyCode>, key: KeyCode) {
 }
 
 fn handle_event_inner(model: &mut Model, event: Event, geometry: &Geometry) -> Action {
+    if model.prefix && !matches!(event, Event::Key(_)) {
+        return Action::None;
+    }
     if let Event::Key(key) = &event {
         if key.code == KeyCode::F(10) && model.focus != Focus::Terminal && !model.modal_open() {
             return Action::Quit;
@@ -1172,7 +1325,15 @@ fn handle_event_inner(model: &mut Model, event: Event, geometry: &Geometry) -> A
     match event {
         Event::Key(key) => {
             if model.prefix {
-                model.prefix = false;
+                if key.code == KeyCode::Up {
+                    model.command_detail_offset = model.command_detail_offset.saturating_sub(1);
+                    return Action::None;
+                }
+                if key.code == KeyCode::Down {
+                    model.command_detail_offset = model.command_detail_offset.saturating_add(1);
+                    return Action::None;
+                }
+                model.clear_prefix();
                 return match key.code {
                     KeyCode::Char('q') => Action::Quit,
                     KeyCode::Char('h') => {
@@ -1189,7 +1350,7 @@ fn handle_event_inner(model: &mut Model, event: Event, geometry: &Geometry) -> A
                             .and_then(|index| model.sessions.get(index))
                             .is_some_and(|session| session.self_session)
                         {
-                            explain_self(model);
+                            explain_self(model, None);
                         } else {
                             model.focus = Focus::Terminal;
                         }
@@ -1216,6 +1377,7 @@ fn handle_event_inner(model: &mut Model, event: Event, geometry: &Geometry) -> A
             }
             if key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL) {
                 model.prefix = true;
+                model.command_detail_offset = 0;
                 return Action::None;
             }
             if model.focus == Focus::Terminal {
@@ -1258,7 +1420,7 @@ fn handle_event_inner(model: &mut Model, event: Event, geometry: &Geometry) -> A
                     if let Some(index) = model.selected_session {
                         select_session_row(model, index, true)
                     } else if model.sessions.iter().any(|session| session.self_session) {
-                        explain_self(model);
+                        explain_self(model, None);
                         Action::None
                     } else {
                         Action::CreateSession
@@ -1306,16 +1468,33 @@ fn move_selection(model: &mut Model, delta: isize) -> Action {
                 };
                 index = next;
             }
-            explain_self(model);
+            explain_self(model, Some(index));
             Action::None
         }
         _ => Action::None,
     }
 }
 
-fn explain_self(model: &mut Model) {
+fn explain_self(model: &mut Model, index: Option<usize>) {
     model.focus = Focus::Sessions;
     model.notice = "承载当前TUI，不能重复接入；退出后再关闭".into();
+    if let (Some(host), Some(session)) = (
+        model.hosts.get(model.selected_host),
+        index
+            .or(model.selected_session)
+            .and_then(|index| model.sessions.get(index))
+            .filter(|session| session.self_session)
+            .or_else(|| model.sessions.iter().find(|session| session.self_session)),
+    ) {
+        model.item_notice = Some(ItemNotice {
+            target: NoticeTarget::Session {
+                target: host.target.clone(),
+                name: session.name.clone(),
+            },
+            summary: "当前界面承载会话".into(),
+            detail: model.notice.clone(),
+        });
+    }
 }
 
 fn select_session_row(model: &mut Model, index: usize, enter_terminal: bool) -> Action {
@@ -1324,7 +1503,7 @@ fn select_session_row(model: &mut Model, index: usize, enter_terminal: bool) -> 
         .get(index)
         .is_some_and(|session| session.self_session)
     {
-        explain_self(model);
+        explain_self(model, Some(index));
         Action::None
     } else {
         model.selected_session = Some(index);
@@ -1749,7 +1928,7 @@ mod tests {
     }
 
     #[test]
-    fn layout_starts_with_panels_and_has_one_footer_even_in_small_windows() {
+    fn layout_reserves_only_sidebar_footer_and_uses_full_terminal_height() {
         for (width, height) in [(40, 10), (48, 12), (100, 30)] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             let mut model = Model {
@@ -1761,13 +1940,15 @@ mod tests {
                 .draw(|frame| geometry = super::draw(frame, &mut model, None))
                 .unwrap();
             assert_eq!(geometry.terminal.y, 1);
-            assert_eq!(geometry.terminal.height, height - 3);
+            assert_eq!(geometry.terminal.height, height - 2);
             let buffer = terminal.backend().buffer();
             let line = |y| buffer_line(buffer, y);
             assert!(line(0).contains("主机") && line(0).contains("终端"));
             assert!(!line(0).contains("homeway") && !line(0).contains("主题"));
-            assert!(line(height - 1).contains("READY"));
-            assert!(line(height - 2).contains('┘'));
+            assert!(line(height - 2).contains("^B 快捷指令"));
+            assert!(!line(height - 2).contains("READY"));
+            assert!(line(height - 1).contains('┘'));
+            assert!(!line(height - 1).contains("快捷指令"));
             for theme in [Theme::Dark, Theme::Light] {
                 for focus in [Focus::Hosts, Focus::Terminal] {
                     for present in [false, true] {
@@ -1937,7 +2118,7 @@ mod tests {
 
     #[test]
     fn sidebar_fits_host_rows_and_aligns_dots_with_panel_titles() {
-        for (count, height) in [(1, 6), (2, 8), (20, 14)] {
+        for (count, height) in [(1, 6), (2, 8), (20, 15)] {
             let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
             let mut model = Model {
                 hosts: std::iter::once(host("我的电脑", HostState::Local))
@@ -1989,8 +2170,8 @@ mod tests {
         terminal
             .draw(|frame| geometry = draw(frame, &mut model, None))
             .unwrap();
-        assert_eq!(geometry.hosts.height + 2, 4);
-        assert_eq!(geometry.sessions.height, 4);
+        assert_eq!(geometry.hosts.height + 2, 5);
+        assert_eq!(geometry.sessions.height, 3);
         assert_eq!(geometry.terminal.x, 14);
         assert!(geometry.host_add.right() < geometry.terminal.x);
     }
@@ -2082,6 +2263,9 @@ mod tests {
             ("many-dark", Theme::Dark, true, 100, 30),
             ("many-light", Theme::Light, true, 100, 30),
             ("small-light", Theme::Light, true, 40, 10),
+            ("commands-dark", Theme::Dark, false, 100, 30),
+            ("commands-small-light", Theme::Light, false, 40, 10),
+            ("status-light", Theme::Light, false, 100, 30),
         ] {
             let mut hosts = vec![host("我的电脑", HostState::Local)];
             if many {
@@ -2121,6 +2305,17 @@ mod tests {
                 notice: "已就绪 · 选择会话，或点击 + 创建 shell".into(),
                 ..Default::default()
             };
+            if name.starts_with("commands") || name == "status-light" {
+                model.item_notice = Some(ItemNotice {
+                    target: NoticeTarget::Session {
+                        target: Target::Local,
+                        name: "session-1".into(),
+                    },
+                    summary: "已发复制请求".into(),
+                    detail: "选中内容已提交终端剪贴板请求；请在承载终端中允许写入剪贴板。".into(),
+                });
+                model.prefix = name.starts_with("commands");
+            }
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             terminal
                 .draw(|frame| {
@@ -2374,13 +2569,27 @@ mod tests {
                 );
             })
             .unwrap();
-        let footer = buffer_line(terminal.backend().buffer(), 29);
-        assert!(footer.contains("↑30行") && footer.contains("回底"));
+        let footer = buffer_line(terminal.backend().buffer(), 28);
+        assert!(footer.contains("30行 ⇧End回底"));
+        assert_eq!(super::footer(&model, 12), "30行⇧End回底");
+        model.history_behind = u64::MAX;
+        assert!(Line::from(super::footer(&model, 12)).width() <= 12);
+        model.prefix = true;
+        terminal
+            .draw(|frame| {
+                draw_commands(frame, &mut model, Theme::Dark.palette());
+            })
+            .unwrap();
+        let popup = (0..30)
+            .map(|y| buffer_line(terminal.backend().buffer(), y))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(popup.contains(&u64::MAX.to_string()) && popup.contains("Shift+End 回到底部"));
         assert!(model.mouse_reporting);
         model.reset_sessions();
         assert!(!model.mouse_reporting);
         assert!(
-            !super::footer(&model, 100).contains('↑'),
+            super::footer(&model, 100) == "^B 快捷指令",
             "reset clears the derived history hint before the next render"
         );
     }
@@ -2556,26 +2765,194 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert!(footer(&model, 100).contains("拖选中，松开复制"));
-        assert!(footer(&model, 100).contains("已有错误提示"));
+        assert_eq!(footer(&model, 100), "^B 快捷指令");
         assert_eq!(model.notice, "已有错误提示");
         model.reset_terminal_input();
         assert!(!model.selecting && model.selection_spans.is_empty());
         model.mouse_reporting = true;
-        assert!(footer(&model, 100).contains("Shift拖选"));
-        assert!(footer(&model, 100).contains("已有错误提示"));
+        assert_eq!(footer(&model, 100), "^B 快捷指令");
         model.notice.clear();
-        assert!(footer(&model, 100).contains("Shift拖选"));
+        assert_eq!(footer(&model, 100), "^B 快捷指令");
     }
 
     fn host(name: &str, state: HostState) -> HostItem {
         HostItem {
+            target: if state == HostState::Local {
+                Target::Local
+            } else {
+                Target::Remote(name.into())
+            },
             name: name.into(),
             detail: "127.0.0.1  2ms".into(),
             state,
             exit_on: false,
             relay_on: false,
             proxy_on: false,
+        }
+    }
+
+    #[test]
+    fn item_notices_follow_stable_host_and_session_identity() {
+        let session = SessionItem {
+            name: "same-name".into(),
+            title: "shell".into(),
+            agent: "shell".into(),
+            project: "project".into(),
+            state: SessionState::Idle,
+            self_session: false,
+        };
+        let mut model = Model {
+            hosts: vec![
+                host("我的电脑", HostState::Local),
+                host("remote", HostState::Direct),
+            ],
+            sessions: vec![session.clone()],
+            selected_host: 1,
+            selected_session: Some(0),
+            item_notice: Some(ItemNotice {
+                target: NoticeTarget::Session {
+                    target: Target::Local,
+                    name: "same-name".into(),
+                },
+                summary: "复制失败".into(),
+                detail: "原主机会话复制失败，请重新拖选".into(),
+            }),
+            ..Default::default()
+        };
+        assert!(
+            session_notice(&model, &session).is_none(),
+            "same name on another host cannot receive a notice"
+        );
+        assert!(host_notice(&model, &model.hosts[0]).is_some());
+        assert!(host_notice(&model, &model.hosts[1]).is_none());
+        model.selected_host = 0;
+        assert!(session_notice(&model, &session).is_some());
+        assert!(host_notice(&model, &model.hosts[0]).is_none());
+        model.sessions.clear();
+        assert!(
+            host_notice(&model, &model.hosts[0]).is_some(),
+            "deleted session falls back to its own host"
+        );
+        model.sessions = vec![session.clone(), session];
+        model.sessions[0].name = "outer".into();
+        model.sessions[1].name = "inner".into();
+        model
+            .sessions
+            .iter_mut()
+            .for_each(|session| session.self_session = true);
+        model.selected_session = None;
+        assert!(matches!(
+            select_session_row(&mut model, 1, true),
+            Action::None
+        ));
+        assert!(
+            matches!(&model.item_notice.as_ref().unwrap().target,
+            NoticeTarget::Session { name, .. } if name == "inner"),
+            "self explanation belongs to the clicked ancestor session"
+        );
+    }
+
+    #[test]
+    fn command_popup_covers_terminal_and_consumes_mouse_paste_and_unknown_keys() {
+        for (width, height) in [(40, 10), (100, 30)] {
+            let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+            let mut model = Model {
+                hosts: vec![host("我的电脑", HostState::Local)],
+                item_notice: Some(ItemNotice {
+                    target: NoticeTarget::Host(Target::Local),
+                    summary: "失败\0\u{1b}[31m".into(),
+                    detail: "错误\u{1b}[31m\n说明\t\u{85}结束".into(),
+                }),
+                focus: Focus::Terminal,
+                ..Default::default()
+            };
+            let mut geometry = Geometry::default();
+            let displayed = TerminalView {
+                rows: &[],
+                cursor: Some(vt::Cursor {
+                    visible: true,
+                    ..Default::default()
+                }),
+                mouse_reporting: false,
+                scrollbar: vt::Scrollbar::default(),
+                top: 0,
+            };
+            terminal
+                .draw(|frame| geometry = super::draw(frame, &mut model, Some(displayed)))
+                .unwrap();
+            assert!(terminal.backend().cursor_visible());
+            let original_pane = geometry.terminal;
+            assert!(matches!(
+                handle_event(
+                    &mut model,
+                    Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+                    &geometry
+                ),
+                Action::None
+            ));
+            assert!(model.modal_open());
+            terminal
+                .draw(|frame| {
+                    geometry = super::draw(frame, &mut model, Some(displayed));
+                })
+                .unwrap();
+            assert_eq!(
+                geometry.terminal, original_pane,
+                "command overlay cannot resize the session"
+            );
+            assert!(
+                !terminal.backend().cursor_visible(),
+                "modal hides the terminal cursor"
+            );
+            let buffer = terminal.backend().buffer();
+            for y in 0..height {
+                for x in 0..width {
+                    assert!(buffer[(x, y)]
+                        .symbol()
+                        .chars()
+                        .all(|char| !char.is_control()));
+                }
+            }
+            assert!(buffer_line(buffer, 0).contains("快捷指令"));
+            assert!(buffer_line(buffer, 1).contains("h 主机"));
+            assert!(buffer_line(buffer, 3).contains("q 分离退出"));
+            assert!(!(0..height).any(|y| buffer_line(buffer, y).contains("创建 shell 会话")));
+            for event in [
+                mouse(geometry.terminal.x, geometry.terminal.y, MouseButton::Left),
+                Event::Paste("must-not-reach-pty".into()),
+            ] {
+                assert!(matches!(
+                    handle_event(&mut model, event, &geometry),
+                    Action::None
+                ));
+                assert!(model.modal_open());
+            }
+            assert!(matches!(
+                handle_event(
+                    &mut model,
+                    Event::Key(KeyEvent::new(KeyCode::Char('x'), KeyModifiers::NONE)),
+                    &geometry
+                ),
+                Action::None
+            ));
+            assert!(!model.modal_open());
+            handle_event(
+                &mut model,
+                Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+                &geometry,
+            );
+            assert!(matches!(
+                handle_event(
+                    &mut model,
+                    Event::Key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE)),
+                    &geometry
+                ),
+                Action::None
+            ));
+            assert!(
+                !model.prefix && model.add_host.is_some(),
+                "a replaces command popup with add dialog"
+            );
         }
     }
 
@@ -2895,7 +3272,7 @@ mod tests {
     }
 
     #[test]
-    fn prefix_is_cancelled_by_non_key_events_and_modal_or_selection_reset() {
+    fn command_popup_consumes_non_key_events_and_closes_after_a_command_or_reset() {
         let geometry = Geometry {
             terminal: Rect::new(30, 1, 80, 24),
             ..Geometry::default()
@@ -2914,15 +3291,20 @@ mod tests {
                 Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
                 &geometry,
             );
-            handle_event(&mut model, event, &geometry);
+            assert!(matches!(
+                handle_event(&mut model, event, &geometry),
+                Action::None
+            ));
+            assert!(model.modal_open());
             assert!(matches!(
                 handle_event(
                     &mut model,
                     Event::Key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)),
                     &geometry
                 ),
-                Action::SendKey(_)
+                Action::Quit
             ));
+            assert!(!model.modal_open());
         }
         let mut model = Model {
             focus: Focus::Terminal,
@@ -3047,26 +3429,44 @@ mod tests {
             Action::CloseSession
         ));
 
-        // An odd maximum host height leaves one spare physical line. It is not
-        // an extra half item, and clicking it must not select an invisible host.
-        let mut terminal = Terminal::new(TestBackend::new(100, 32)).unwrap();
-        model.hosts = (0..20).map(|_| host("remote", HostState::Direct)).collect();
-        terminal
-            .draw(|frame| geometry = draw(frame, &mut model, None))
-            .unwrap();
-        assert_eq!(geometry.hosts.height, 13);
-        assert!(matches!(
-            handle_event(
+        // With the whole frame available, 32 rows allow seven complete host
+        // items (14 content rows); 31 rows leave an odd spare physical row.
+        // Only that spare row is inert. Neither case may let the footer select
+        // a host or session beneath it.
+        for (window_height, content_height, spare) in [(31, 13, true), (32, 14, false)] {
+            let mut terminal = Terminal::new(TestBackend::new(100, window_height)).unwrap();
+            model.hosts = (0..20).map(|_| host("remote", HostState::Direct)).collect();
+            terminal
+                .draw(|frame| geometry = draw(frame, &mut model, None))
+                .unwrap();
+            assert_eq!(geometry.hosts.height, content_height);
+            let last_visible = model.hosts_offset + usize::from(content_height / ITEM_HEIGHT) - 1;
+            let action = handle_event(
                 &mut model,
                 mouse(
                     geometry.hosts.x + 1,
                     geometry.hosts.bottom() - 1,
-                    MouseButton::Left
+                    MouseButton::Left,
                 ),
-                &geometry
-            ),
-            Action::None
-        ));
+                &geometry,
+            );
+            if spare {
+                assert!(matches!(action, Action::None));
+            } else {
+                assert!(matches!(action, Action::SelectHost(index) if index == last_visible));
+            }
+            let selected = (model.selected_host, model.selected_session);
+            let footer = geometry.footer_area();
+            assert!(matches!(
+                handle_event(
+                    &mut model,
+                    mouse(footer.x + 1, footer.y, MouseButton::Left),
+                    &geometry
+                ),
+                Action::None
+            ));
+            assert_eq!((model.selected_host, model.selected_session), selected);
+        }
     }
 
     #[test]

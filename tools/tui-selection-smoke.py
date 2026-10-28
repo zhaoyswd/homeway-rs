@@ -49,7 +49,7 @@ def grid_row(tui, row):
 
 def locate(tui, needle):
     needle = unicodedata.normalize('NFC', needle)
-    for row in range(1, tui.screen.lines - 2):
+    for row in range(1, tui.screen.lines - 1):
         text, starts, ends = grid_row(tui, row)
         index = text.find(needle)
         if index >= 0:
@@ -77,7 +77,7 @@ def begin_drag(tui, start, end, color):
         tui.drain()
         return tui.screen.buffer[start[1]][start[0]].bg == color
     wait_until(highlighted, 'physical selected cell highlight')
-    assert '拖选中，松开复制' in tui.screen_lines()[-1], 'selection footer absent'
+    assert '拖选中' in tui.screen_text(), 'selection item feedback absent'
 
 
 def clipboard_count(path):
@@ -91,7 +91,7 @@ def release_copy(tui, end, count_path, copy_path, previous, expected):
         return clipboard_count(count_path) == previous + 1
     wait_until(copied, 'one private clipboard write after release')
     assert copy_path.read_bytes() == expected.encode(), 'clipboard bytes differ from the selected visible text'
-    tui.wait('已复制到系统剪贴板')
+    wait_until(lambda: (tui.drain() or '已复制' in tui.screen_text()), 'native copy item feedback')
     assert tui.process.poll() is None
 
 
@@ -156,7 +156,7 @@ def private_tui(binary, state, directory, copy_path, count_path, term_session_id
 def history_pair(tui):
     tui.drain()
     found = []
-    for row in range(1, tui.screen.lines - 2):
+    for row in range(1, tui.screen.lines - 1):
         text, starts, ends = grid_row(tui, row)
         match = re.search(r'HIST_(\d{3})_中é', text)
         if match:
@@ -197,7 +197,7 @@ def main():
                 tui = private_tui(binary, state, directory, copy_path, count_path)
                 tui.wait('会话')
                 tui.send(b'\x02s\x1b[B\r')
-                tui.wait('已接入')
+                tui.wait_terminal('selection')
                 start, end = visible(tui, 'SEL_CJK:中é     Z_END')
                 baseline = assert_passive(binary, state, 'selection')
                 mouse(tui, start, 'M')
@@ -230,7 +230,7 @@ def main():
                 wide.wait('HIST_READY')
                 visible(tui, 'HIST_119_中é')
                 tui.send(b'\x1b[5;2~')  # Shift+PageUp: use the existing FETCH history path.
-                wait_until(lambda: (tui.drain() or '↑' in tui.screen_lines()[-1]), 'history anchor')
+                wait_until(lambda: (tui.drain() or '回底' in tui.screen_lines()[-2]), 'history anchor')
                 first, second = wait_until(lambda: history_pair(tui), 'two loaded adjacent history rows')
                 tui.background = 'rgb:ffff/ffff/ffff'
                 tui.send(b'\x1b[I')
@@ -257,7 +257,7 @@ def main():
                                      term_session_id='tailcat-selection-smoke')
                 remote.wait('会话')
                 remote.send(b'\x02s\x1b[B\r')
-                remote.wait('已接入')
+                remote.wait_terminal('selection')
                 expected = 'TERM_COPY:中é'
                 wide.send("printf 'TERM_COPY:中é\\r\\n'\r")
                 remote_start, remote_end = visible(remote, 'TERM_COPY:中é')
@@ -267,13 +267,13 @@ def main():
                 begin_drag(remote, remote_start, remote_end, '6db9ff')
                 output_start = len(remote.output)
                 mouse(remote, remote_end, 'm')
-                remote.wait('已提交终端剪贴板请求')
+                wait_until(lambda: (remote.drain() or '已发复制请求' in remote.screen_text()), 'terminal copy request item feedback')
                 remote.drain(0.3)
                 requests = re.findall(rb'\x1b]52;c;([A-Za-z0-9+/=]*)\x07',
                                       bytes(remote.output[output_start:]))
                 assert requests == [base64.b64encode(expected.encode())], 'terminal clipboard request payload differs'
                 assert clipboard_count(count_path) == native_count and copy_path.read_bytes() == native_bytes, 'homeway term route called a native clipboard helper'
-                assert '已复制到系统剪贴板' not in remote.screen_text(), 'terminal request falsely claims confirmed system copy'
+                assert '已复制' not in remote.screen_text(), 'terminal request falsely claims confirmed system copy'
                 assert_passive(binary, state, 'selection', remote_baseline)
                 remote.send(b'\x02q')
                 remote.wait_exit()

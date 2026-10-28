@@ -102,6 +102,7 @@ fn run(options: Options) -> Result<(), Error> {
         app.process_attach();
         app.flush_input();
         app.process_clipboard()?;
+        app.expire_notice(Instant::now());
         app.poll_refresh();
         let now = Instant::now();
         if appearance.query_due(now) {
@@ -149,12 +150,14 @@ fn run(options: Options) -> Result<(), Error> {
             if app.selection_event(&event, &geometry)? {
                 continue;
             }
+            let commands_before = app.model.commands_open();
             let focused = app.model.focus == view::Focus::Terminal && !app.model.modal_open();
             if let Event::FocusGained | Event::FocusLost = event {
-                if app
-                    .surface
-                    .as_ref()
-                    .is_some_and(surface::Surface::focus_events)
+                if !app.model.modal_open()
+                    && app
+                        .surface
+                        .as_ref()
+                        .is_some_and(surface::Surface::focus_events)
                 {
                     app.send_input(frames::InputEvent::Focus {
                         gained: matches!(event, Event::FocusGained),
@@ -167,6 +170,8 @@ fn run(options: Options) -> Result<(), Error> {
             }
             let focus_now = app.model.focus == view::Focus::Terminal && !app.model.modal_open();
             if focused != focus_now
+                && !commands_before
+                && !app.model.commands_open()
                 && app
                     .surface
                     .as_ref()
@@ -190,14 +195,19 @@ struct App {
     current_target: Target,
     active_session: Option<String>,
     create_pending: bool,
+    create_target: Option<Target>,
     close_pending: Option<ClosingSession>,
     selection: Option<DragSelection>,
     local_left: bool,
     selection_copy: Option<SelectionCopy>,
     selection_copy_ticket: u64,
     operation_fact: Option<OperationFact>,
+    operation_target: Option<view::NoticeTarget>,
+    operation_copy: Option<OperationCopy>,
+    notice_life: NoticeLife,
     operation_id: u64,
     operation_warning: Option<(backend::Confirmation, String)>,
+    warning_notice: Option<view::ItemNotice>,
     attach: Option<backend::Attach>,
     surface: Option<surface::Surface>,
     fragments: [codec::FragAssembler; 3],
@@ -221,6 +231,20 @@ struct App {
 struct OperationFact {
     text: String,
     confirmation: backend::Confirmation,
+}
+
+struct OperationCopy {
+    operation: u64,
+    notice: view::ItemNotice,
+}
+
+enum NoticeLife {
+    Persistent,
+    Progress,
+    Brief {
+        until: Instant,
+        owner: view::ItemNotice,
+    },
 }
 
 #[derive(PartialEq, Eq)]
@@ -259,6 +283,11 @@ impl App {
         let mut model = Model::default();
         model.hosts.push(local_host(false, false));
         model.notice = CONNECTING_NOTICE.into();
+        model.item_notice = Some(view::ItemNotice {
+            target: view::NoticeTarget::Host(Target::Local),
+            summary: "正在连接…".into(),
+            detail: CONNECTING_NOTICE.into(),
+        });
         Self {
             render_dirty: true,
             model,
@@ -269,14 +298,19 @@ impl App {
             current_target: Target::Local,
             active_session: None,
             create_pending: false,
+            create_target: None,
             close_pending: None,
             selection: None,
             local_left: false,
             selection_copy: None,
             selection_copy_ticket: 0,
             operation_fact: None,
+            operation_target: None,
+            operation_copy: None,
+            notice_life: NoticeLife::Progress,
             operation_id: 0,
             operation_warning: None,
+            warning_notice: None,
             attach: None,
             surface: None,
             fragments: std::array::from_fn(|_| codec::FragAssembler::default()),
@@ -300,6 +334,147 @@ impl App {
 
     fn target(&self) -> Target {
         self.current_target.clone()
+    }
+
+    fn session_notice_target(&self) -> view::NoticeTarget {
+        self.active_session
+            .as_ref()
+            .or_else(|| {
+                self.model
+                    .selected_session
+                    .and_then(|index| self.model.sessions.get(index))
+                    .map(|session| &session.name)
+            })
+            .map_or_else(
+                || view::NoticeTarget::Host(self.target()),
+                |name| view::NoticeTarget::Session {
+                    target: self.target(),
+                    name: name.clone(),
+                },
+            )
+    }
+
+    fn show_notice(
+        &mut self,
+        target: view::NoticeTarget,
+        summary: impl Into<String>,
+        detail: impl Into<String>,
+        life: NoticeLife,
+    ) {
+        self.selection_copy = None;
+        self.operation_copy = None;
+        self.warning_notice = None;
+        let detail = detail.into();
+        self.model.notice = detail.clone();
+        self.model.item_notice = Some(view::ItemNotice {
+            target,
+            summary: summary.into(),
+            detail,
+        });
+        self.notice_life = life;
+        self.render_dirty = true;
+    }
+
+    fn show_error(&mut self, target: view::NoticeTarget, summary: &str, detail: impl Into<String>) {
+        self.show_notice(target, summary, detail, NoticeLife::Persistent);
+    }
+
+    fn show_progress(
+        &mut self,
+        target: view::NoticeTarget,
+        summary: &str,
+        detail: impl Into<String>,
+    ) {
+        self.show_notice(target, summary, detail, NoticeLife::Progress);
+    }
+
+    fn show_success(
+        &mut self,
+        target: view::NoticeTarget,
+        summary: impl Into<String>,
+        detail: impl Into<String>,
+    ) {
+        let summary = summary.into();
+        let detail = detail.into();
+        let owner = view::ItemNotice {
+            target: target.clone(),
+            summary: summary.clone(),
+            detail: detail.clone(),
+        };
+        self.show_notice(
+            target,
+            summary,
+            detail,
+            NoticeLife::Brief {
+                until: Instant::now() + Duration::from_secs(3),
+                owner,
+            },
+        );
+    }
+
+    fn expire_notice(&mut self, now: Instant) {
+        if self.model.commands_open() {
+            return;
+        }
+        if let NoticeLife::Brief { until, owner } = &self.notice_life {
+            if now < *until {
+                return;
+            }
+            if self.model.item_notice.as_ref() == Some(owner) {
+                self.model.item_notice = None;
+                self.render_dirty = true;
+            }
+            self.notice_life = NoticeLife::Persistent;
+        }
+    }
+
+    fn complete_session_progress(&mut self) {
+        if matches!(self.notice_life, NoticeLife::Progress)
+            && self
+                .model
+                .item_notice
+                .as_ref()
+                .is_some_and(|notice| notice.target == self.session_notice_target())
+        {
+            self.model.item_notice = None;
+            self.notice_life = NoticeLife::Persistent;
+        }
+    }
+
+    fn operation_host_matches(&self, host: &Target) -> bool {
+        self.operation_target
+            .as_ref()
+            .is_some_and(|target| match target {
+                view::NoticeTarget::Host(target) | view::NoticeTarget::Session { target, .. } => {
+                    target == host
+                }
+            })
+    }
+
+    fn show_operation_update(
+        &mut self,
+        target: view::NoticeTarget,
+        summary: &str,
+        detail: String,
+        success: bool,
+    ) {
+        let waiting = self.operation_copy.take().filter(|copy| {
+            copy.operation == self.operation_id
+                && self.model.item_notice.as_ref() == Some(&copy.notice)
+        });
+        if success && waiting.is_some() {
+            self.show_progress(target, "正在复制…", format!("{detail}，正在复制到剪贴板…"));
+        } else if success {
+            self.show_success(target, summary, detail);
+        } else {
+            self.show_error(target, summary, detail);
+        }
+        if let Some(copy) = waiting {
+            self.operation_copy = self.model.item_notice.clone().map(|notice| OperationCopy {
+                operation: copy.operation,
+                notice,
+            });
+        }
     }
 
     fn selected_name(&self) -> Option<String> {
@@ -424,12 +599,19 @@ impl App {
                                             self.clipboard.copy_selection(value, ticket)
                                         {
                                             self.selection_copy = None;
-                                            self.model.notice =
-                                                format!("复制失败：{error}，请重新拖选");
+                                            self.show_error(
+                                                self.session_notice_target(),
+                                                "复制失败",
+                                                format!("复制失败：{error}，请重新拖选"),
+                                            );
                                         }
                                     }
                                     Ok(None) => {}
-                                    Err(error) => self.model.notice = error.to_string(),
+                                    Err(error) => self.show_error(
+                                        self.session_notice_target(),
+                                        "复制失败",
+                                        error.to_string(),
+                                    ),
                                 }
                             }
                         }
@@ -447,6 +629,9 @@ impl App {
         }
         if let MouseEventKind::Drag(button) | MouseEventKind::Up(button) = mouse.kind {
             if self.mouse_pressed.contains(&button) {
+                if self.model.modal_open() && matches!(mouse.kind, MouseEventKind::Drag(_)) {
+                    return Ok(true);
+                }
                 let pane = geometry.terminal;
                 if pane.width > 0 && pane.height > 0 {
                     let point = Self::selection_point(*mouse, pane);
@@ -509,11 +694,18 @@ impl App {
     }
 
     fn command(&mut self, command: Command) -> bool {
+        let target = match &command {
+            Command::KillSession { target, name } => view::NoticeTarget::Session {
+                target: target.clone(),
+                name: name.clone(),
+            },
+            _ => view::NoticeTarget::Host(command.target()),
+        };
         match self.backend.send(command) {
             Ok(()) => true,
             Err(error) => {
                 self.selection_copy = None;
-                self.model.notice = error.to_string();
+                self.show_error(target, "请求失败", error.to_string());
                 self.render_dirty = true;
                 false
             }
@@ -582,7 +774,10 @@ impl App {
         self.selection_copy = None;
         self.operation_id = self.operation_id.wrapping_add(1);
         self.operation_fact = None;
+        self.operation_target = None;
+        self.operation_copy = None;
         self.operation_warning = None;
+        self.warning_notice = None;
     }
 
     fn complete_progress(&mut self, expected: &[&str], ready: &str) {
@@ -590,6 +785,10 @@ impl App {
         // error or confirmed operation owns any other notice.
         if expected.contains(&self.model.notice.as_str()) {
             self.model.notice = ready.into();
+            if matches!(self.notice_life, NoticeLife::Progress) {
+                self.model.item_notice = None;
+                self.notice_life = NoticeLife::Persistent;
+            }
         }
     }
 
@@ -598,7 +797,14 @@ impl App {
             return Ok(());
         };
         if session.self_session {
-            self.model.notice = "这是承载当前 TUI 的会话，请选择其它会话或新建".into();
+            self.show_error(
+                view::NoticeTarget::Session {
+                    target: self.target(),
+                    name: session.name.clone(),
+                },
+                "当前承载会话",
+                "这是承载当前 TUI 的会话，请选择其它会话或新建",
+            );
             return Ok(());
         }
         let name = session.name.clone();
@@ -621,7 +827,7 @@ impl App {
             self.generation,
         ));
         self.sent_size = Some(self.size);
-        self.model.notice = "正在接入会话…".into();
+        self.show_progress(self.session_notice_target(), "正在接入…", "正在接入会话…");
         Ok(())
     }
 
@@ -658,17 +864,35 @@ impl App {
                     return;
                 }
                 self.close_pending = None;
+                let succeeded = result.is_ok();
                 match result {
                     Ok(()) => self.backend_event(backend::Event::Notice {
+                        target: target.clone(),
                         message: format!("会话 {name} 已关闭"),
                         clipboard: None,
-                        confirmation: backend::Confirmation::Sessions(target),
+                        confirmation: backend::Confirmation::Sessions(target.clone()),
                     }),
-                    Err(error) if target == self.target() => {
-                        self.backend_event(backend::Event::Failed(error))
+                    Err(error) => {
+                        let context = if target == self.target() {
+                            "会话关闭失败"
+                        } else {
+                            "原主机会话关闭失败"
+                        };
+                        self.show_error(
+                            view::NoticeTarget::Session {
+                                target: target.clone(),
+                                name: name.clone(),
+                            },
+                            "关闭失败",
+                            format!("{context}：{error}"),
+                        );
                     }
-                    Err(error) => self.model.notice = format!("原主机会话关闭失败：{error}"),
                 }
+                let target = view::NoticeTarget::Session { target, name };
+                if succeeded {
+                    self.show_success(target.clone(), "会话已关闭", self.model.notice.clone());
+                }
+                self.operation_target = Some(target);
             }
             backend::Event::Snapshot(snapshot) => {
                 self.refresh_pending = false;
@@ -707,13 +931,25 @@ impl App {
                         *confirmation == backend::Confirmation::Snapshot
                     })
                 {
+                    let owned = self
+                        .warning_notice
+                        .as_ref()
+                        .is_some_and(|owner| self.model.item_notice.as_ref() == Some(owner));
                     self.selection_copy = None;
                     self.operation_warning = None;
-                    self.model.notice = self
+                    self.warning_notice = None;
+                    let detail = self
                         .operation_fact
                         .as_ref()
                         .map(|fact| fact.text.clone())
                         .unwrap_or_else(|| "主机状态已恢复".into());
+                    let target = self
+                        .operation_target
+                        .clone()
+                        .unwrap_or(view::NoticeTarget::Host(Target::Local));
+                    if owned {
+                        self.show_operation_update(target, "状态已恢复", detail, true);
+                    }
                 }
                 if self
                     .operation_fact
@@ -750,13 +986,27 @@ impl App {
                                 *confirmation == backend::Confirmation::Sessions(target.clone())
                             })
                         {
+                            let owned = self.warning_notice.as_ref().is_some_and(|owner| {
+                                self.model.item_notice.as_ref() == Some(owner)
+                            });
                             self.selection_copy = None;
                             self.operation_warning = None;
-                            self.model.notice = self
+                            self.warning_notice = None;
+                            let related = self.operation_host_matches(&target);
+                            let detail = self
                                 .operation_fact
                                 .as_ref()
+                                .filter(|_| related)
                                 .map(|fact| fact.text.clone())
                                 .unwrap_or_else(|| "会话列表已恢复".into());
+                            let owner = self
+                                .operation_target
+                                .clone()
+                                .filter(|_| related)
+                                .unwrap_or_else(|| view::NoticeTarget::Host(target.clone()));
+                            if owned {
+                                self.show_operation_update(owner, "状态已恢复", detail, true);
+                            }
                         }
                         if self.operation_fact.as_ref().is_some_and(|fact| {
                             fact.confirmation == backend::Confirmation::Sessions(target.clone())
@@ -769,15 +1019,32 @@ impl App {
                         );
                     }
                     Err(error) => {
+                        let related = self.operation_host_matches(&target);
                         let fact = self
                             .operation_fact
                             .as_ref()
+                            .filter(|_| related)
                             .map(|fact| fact.text.as_str())
                             .unwrap_or("当前主机会话");
                         let warning = format!("会话列表刷新失败：{error}");
-                        self.model.notice = format!("{fact}；{warning}");
+                        let detail = format!("{fact}；{warning}");
+                        if related {
+                            self.show_operation_update(
+                                view::NoticeTarget::Host(target.clone()),
+                                "会话读取失败",
+                                detail,
+                                false,
+                            );
+                        } else {
+                            self.show_error(
+                                view::NoticeTarget::Host(target.clone()),
+                                "会话读取失败",
+                                detail,
+                            );
+                        }
                         self.operation_warning =
                             Some((backend::Confirmation::Sessions(target), warning));
+                        self.warning_notice = self.model.item_notice.clone();
                     }
                 }
             }
@@ -787,8 +1054,16 @@ impl App {
                 epoch,
             } => {
                 self.create_pending = false;
+                self.create_target = None;
                 if target != self.target() || epoch != self.navigation_epoch {
-                    self.model.notice = format!("会话 {name} 已在原主机创建，选择该主机即可接入");
+                    self.show_success(
+                        view::NoticeTarget::Session {
+                            target,
+                            name: name.clone(),
+                        },
+                        "会话已创建",
+                        format!("会话 {name} 已在原主机创建，选择该主机即可接入"),
+                    );
                     return;
                 }
                 let index = if let Some(index) = self
@@ -811,46 +1086,74 @@ impl App {
                 };
                 self.model.focus = view::Focus::Terminal;
                 if let Err(error) = self.select_session(index) {
-                    self.model.notice = error.to_string();
+                    self.show_error(self.session_notice_target(), "接入失败", error.to_string());
                 }
                 self.sessions_pending = false;
                 self.refresh_sessions();
             }
             backend::Event::Notice {
+                target,
                 message,
                 clipboard,
                 confirmation,
             } => {
                 if matches!(&confirmation, backend::Confirmation::Sessions(target) if target != &self.target())
                 {
-                    self.model.notice = format!("原主机：{message}");
+                    self.show_success(
+                        view::NoticeTarget::Host(target),
+                        message.clone(),
+                        format!("原主机：{message}"),
+                    );
                     return;
                 }
                 self.operation_id = self.operation_id.wrapping_add(1);
                 self.operation_warning = None;
+                self.operation_target = Some(view::NoticeTarget::Host(target.clone()));
                 self.operation_fact = Some(OperationFact {
                     text: message.clone(),
                     confirmation,
                 });
-                self.model.notice = message.clone();
+                self.show_success(
+                    view::NoticeTarget::Host(target.clone()),
+                    message.clone(),
+                    message.clone(),
+                );
                 if let Some(value) = clipboard {
-                    self.model.notice =
-                        match self
-                            .clipboard
-                            .copy(value, self.operation_id, message.clone())
-                        {
-                            Ok(()) => format!("{message}，正在复制到剪贴板…"),
-                            Err(error) => format!("{message}；{error}"),
-                        };
+                    match self
+                        .clipboard
+                        .copy(value, self.operation_id, message.clone())
+                    {
+                        Ok(()) => {
+                            self.show_progress(
+                                view::NoticeTarget::Host(target),
+                                "正在复制…",
+                                format!("{message}，正在复制到剪贴板…"),
+                            );
+                            self.operation_copy =
+                                self.model.item_notice.clone().map(|notice| OperationCopy {
+                                    operation: self.operation_id,
+                                    notice,
+                                });
+                        }
+                        Err(error) => self.show_error(
+                            view::NoticeTarget::Host(target),
+                            "复制失败",
+                            format!("{message}；{error}"),
+                        ),
+                    }
                 }
                 self.sessions_pending = false;
                 self.refresh_sessions();
             }
-            backend::Event::Failed(error) => {
+            backend::Event::Failed { target, error } => {
                 self.clear_operation();
                 self.refresh_pending = false;
                 self.sessions_pending = false;
-                self.model.notice = error.to_string();
+                self.show_error(
+                    view::NoticeTarget::Host(target),
+                    "操作失败",
+                    error.to_string(),
+                );
             }
             backend::Event::CreateFailed {
                 target,
@@ -859,26 +1162,42 @@ impl App {
             } => {
                 self.clear_operation();
                 self.create_pending = false;
+                self.create_target = None;
                 let current = target == self.target() && epoch == self.navigation_epoch;
                 let context = if current {
                     "创建会话未确认（若已生效，会在列表中保留）"
                 } else {
                     "原主机创建会话未确认，请查看该主机会话列表"
                 };
-                self.model.notice = format!("{context}：{error}");
+                self.show_error(
+                    view::NoticeTarget::Host(target),
+                    "创建未确认",
+                    format!("{context}：{error}"),
+                );
                 if current {
                     self.sessions_pending = false;
                     self.refresh_sessions();
                 }
             }
             backend::Event::Warning {
+                target,
                 message,
                 error,
                 confirmation,
             } => {
                 self.operation_id = self.operation_id.wrapping_add(1);
                 self.operation_warning = None;
-                self.model.notice = format!("{message}：{error}");
+                self.operation_target = Some(view::NoticeTarget::Host(target.clone()));
+                let summary = if confirmation == backend::Confirmation::None {
+                    "服务未就绪"
+                } else {
+                    "操作部分完成"
+                };
+                self.show_error(
+                    view::NoticeTarget::Host(target),
+                    summary,
+                    format!("{message}：{error}"),
+                );
                 self.operation_fact = if confirmation == backend::Confirmation::None {
                     None
                 } else {
@@ -896,8 +1215,14 @@ impl App {
                     .map(|fact| fact.text.as_str())
                     .unwrap_or("主机状态");
                 let warning = format!("状态刷新失败：{error}");
-                self.model.notice = format!("{fact}；{warning}");
+                let detail = format!("{fact}；{warning}");
+                let target = self
+                    .operation_target
+                    .clone()
+                    .unwrap_or(view::NoticeTarget::Host(Target::Local));
+                self.show_operation_update(target, "状态刷新失败", detail, false);
                 self.operation_warning = Some((backend::Confirmation::Snapshot, warning));
+                self.warning_notice = self.model.item_notice.clone();
             }
         }
     }
@@ -914,31 +1239,56 @@ impl App {
             let frame = match event.frame {
                 Ok(frame) => frame,
                 Err(error) => {
-                    self.model.notice = error.to_string();
+                    self.show_error(self.session_notice_target(), "终端错误", error.to_string());
                     self.disconnect();
                     break;
                 }
             };
             match frame.op {
-                Op::ATTACHED => match frames::dec_attached(&frame.payload) {
-                    Ok(_) => self.model.notice = "已连接，正在读取会话画面…".into(),
-                    Err(error) => {
-                        self.model.notice = error.to_string();
-                        self.disconnect();
-                        break;
+                Op::ATTACHED => {
+                    match frames::dec_attached(&frame.payload) {
+                        Ok(_) => {
+                            if matches!(self.notice_life, NoticeLife::Progress)
+                                && self.model.item_notice.as_ref().is_some_and(|notice| {
+                                    notice.target == self.session_notice_target()
+                                })
+                            {
+                                self.show_progress(
+                                    self.session_notice_target(),
+                                    "正在读取画面…",
+                                    "已连接，正在读取会话画面…",
+                                );
+                            }
+                        }
+                        Err(error) => {
+                            self.show_error(
+                                self.session_notice_target(),
+                                "终端错误",
+                                error.to_string(),
+                            );
+                            self.disconnect();
+                            break;
+                        }
                     }
-                },
+                }
                 Op::SNAPSHOT | Op::SURFACE_DIFF | Op::FETCH_ROWS => {
                     if let Err(error) = self.surface_frame(frame.op, &frame.payload) {
-                        self.model.notice = error.to_string();
+                        self.show_error(
+                            self.session_notice_target(),
+                            "终端错误",
+                            error.to_string(),
+                        );
                         self.disconnect();
                         break;
                     }
                 }
                 Op::ENDED => {
                     let (code, reason) = frames::dec_ended(&frame.payload);
-                    self.model.notice =
-                        format!("会话已结束（{code}，{reason}），可选择其它会话或创建新会话");
+                    self.show_error(
+                        self.session_notice_target(),
+                        "会话已结束",
+                        format!("会话已结束（{code}，{reason}），可选择其它会话或创建新会话"),
+                    );
                     self.disconnect();
                     self.sessions_pending = false;
                     self.refresh_sessions();
@@ -972,6 +1322,8 @@ impl App {
             return Ok(());
         };
         let mut focus = false;
+        let mut initial_ready = false;
+        let mut resync = false;
         if op == Op::SNAPSHOT {
             let body = codec::dec_snapshot_body(&body)?;
             let title = body.title.clone();
@@ -984,8 +1336,11 @@ impl App {
                 }
                 if initial {
                     self.selection_copy = None;
-                    self.model.notice = "已接入 · 滚轮浏览历史".into();
-                    if self.model.focus == view::Focus::Terminal && surface.focus_events() {
+                    initial_ready = true;
+                    if self.model.focus == view::Focus::Terminal
+                        && !self.model.modal_open()
+                        && surface.focus_events()
+                    {
                         focus = true;
                     }
                 }
@@ -1000,7 +1355,7 @@ impl App {
                 self.input_geometry = None;
                 self.snapshot_request = None;
                 self.selection_copy = None;
-                self.model.notice = "正在同步终端画面…".into();
+                resync = true;
             }
         } else {
             surface.fetch_reply(codec::dec_fetch_rows_reply(&body)?)?;
@@ -1011,6 +1366,20 @@ impl App {
             .is_some_and(|pending| surface.ready && pending.size == surface.geometry())
         {
             self.input_geometry = None;
+        }
+        if initial_ready {
+            self.complete_session_progress();
+            // Kept internally for request ownership; healthy attachment has no row notice.
+            if self.model.item_notice.is_none() {
+                self.model.notice = "已接入 · 滚轮浏览历史".into();
+            }
+        }
+        if resync {
+            self.show_progress(
+                self.session_notice_target(),
+                "正在同步…",
+                "正在同步终端画面…",
+            );
         }
         if focus {
             self.send_input(frames::InputEvent::Focus { gained: true });
@@ -1023,6 +1392,7 @@ impl App {
             return;
         };
         let Some(attach) = &self.attach else { return };
+        let mut fetch_error = None;
         let now = Instant::now();
         if !surface.ready {
             if self
@@ -1033,7 +1403,11 @@ impl App {
                     Ok(()) => self.snapshot_request = Some(now),
                     Err(backend::Error::Busy) => {}
                     Err(error) => {
-                        self.model.notice = error.to_string();
+                        self.show_error(
+                            self.session_notice_target(),
+                            "终端错误",
+                            error.to_string(),
+                        );
                         self.disconnect();
                         return;
                     }
@@ -1044,7 +1418,7 @@ impl App {
                 surface.fetch_failed();
                 if !matches!(error, backend::Error::Busy) {
                     self.selection_copy = None;
-                    self.model.notice = error.to_string();
+                    fetch_error = Some(error.to_string());
                 }
             }
         }
@@ -1057,11 +1431,18 @@ impl App {
                     Ok(()) => pending.requested = Some(now),
                     Err(backend::Error::Busy) => {}
                     Err(error) => {
-                        self.model.notice = error.to_string();
+                        self.show_error(
+                            self.session_notice_target(),
+                            "终端错误",
+                            error.to_string(),
+                        );
                         self.disconnect();
                     }
                 }
             }
+        }
+        if let Some(error) = fetch_error {
+            self.show_error(self.session_notice_target(), "历史读取失败", error);
         }
         self.sync_theme();
     }
@@ -1079,7 +1460,7 @@ impl App {
             Ok(()) => self.sent_theme = Some(self.model.theme),
             Err(backend::Error::Busy) => {}
             Err(error) => {
-                self.model.notice = error.to_string();
+                self.show_error(self.session_notice_target(), "终端错误", error.to_string());
                 self.disconnect();
             }
         }
@@ -1090,7 +1471,7 @@ impl App {
             surface.fetch_failed();
         }
         self.clear_operation();
-        self.model.notice = match frames::dec_error(payload) {
+        let detail = match frames::dec_error(payload) {
             Ok((code, message)) => {
                 if code == "bad_resize" {
                     self.sent_size = None;
@@ -1101,6 +1482,7 @@ impl App {
             }
             Err(error) => error.to_string(),
         };
+        self.show_error(self.session_notice_target(), "终端操作失败", detail);
     }
 
     fn process_clipboard(&mut self) -> Result<(), Error> {
@@ -1123,34 +1505,66 @@ impl App {
             let owned = copy.operation == self.operation_id
                 && copy.notice == self.model.notice
                 && self.selection_context_matches(&copy.context);
+            let target = view::NoticeTarget::Session {
+                target: copy.context.target.clone(),
+                name: copy.context.name.clone(),
+            };
             self.selection_copy = None;
             if owned {
-                self.model.notice = match result.status {
-                    clipboard::Copied::System => "选中内容已复制到系统剪贴板".into(),
+                match result.status {
+                    clipboard::Copied::System => {
+                        self.show_success(target, "已复制", "选中内容已复制到系统剪贴板")
+                    }
                     clipboard::Copied::Terminal(sequence) => {
                         io::stdout().write_all(sequence.as_bytes())?;
                         io::stdout().flush()?;
-                        "已提交终端剪贴板请求".into()
+                        self.show_success(target, "已发复制请求", "已提交终端剪贴板请求");
                     }
-                    clipboard::Copied::Failed(error) => format!("复制失败：{error}，请重新拖选"),
-                };
+                    clipboard::Copied::Failed(error) => self.show_error(
+                        target,
+                        "复制失败",
+                        format!("复制失败：{error}，请重新拖选"),
+                    ),
+                }
             }
             return Ok(());
         }
-        let status = match result.status {
-            clipboard::Copied::System => "已复制到系统剪贴板".into(),
+        // Reject stale operation output before emitting an OSC52 sequence, too.
+        let Some(copy) = self.operation_copy.as_ref().filter(|copy| {
+            result.operation == self.operation_id
+                && copy.operation == result.operation
+                && self.model.item_notice.as_ref() == Some(&copy.notice)
+        }) else {
+            return Ok(());
+        };
+        let target = copy.notice.target.clone();
+        self.operation_copy = None;
+        let (summary, status, failed) = match result.status {
+            clipboard::Copied::System => ("已复制", "已复制到系统剪贴板".into(), false),
             clipboard::Copied::Terminal(sequence) => {
                 io::stdout().write_all(sequence.as_bytes())?;
                 io::stdout().flush()?;
-                "已发送剪贴板请求（终端需允许 OSC52）".into()
+                (
+                    "已发复制请求",
+                    "已发送剪贴板请求（终端需允许 OSC52）".into(),
+                    false,
+                )
             }
-            clipboard::Copied::Failed(error) => format!("操作完成，复制失败：{error}"),
+            clipboard::Copied::Failed(error) => {
+                ("复制失败", format!("操作完成，复制失败：{error}"), true)
+            }
         };
-        if result.operation == self.operation_id {
-            self.model.notice = format!("{}；{status}", result.fact);
-            if let Some((_, warning)) = &self.operation_warning {
-                self.model.notice.push_str(&format!("；{warning}"));
+        let mut detail = format!("{}；{status}", result.fact);
+        if let Some((_, warning)) = &self.operation_warning {
+            detail.push_str(&format!("；{warning}"));
+        }
+        if failed || self.operation_warning.is_some() {
+            self.show_error(target, summary, detail);
+            if self.operation_warning.is_some() {
+                self.warning_notice = self.model.item_notice.clone();
             }
+        } else {
+            self.show_success(target, summary, detail);
         }
         Ok(())
     }
@@ -1163,7 +1577,11 @@ impl App {
         let bytes = frames::enc_input(&event);
         if self.input_bytes + bytes.len() > 2 << 20 {
             self.selection_copy = None;
-            self.model.notice = "输入队列已满，请等待远端接收后重试".into();
+            self.show_error(
+                self.session_notice_target(),
+                "输入队列已满",
+                "输入队列已满，请等待远端接收后重试",
+            );
             return;
         }
         if matches!(
@@ -1220,7 +1638,7 @@ impl App {
                     break;
                 }
                 Err(error) => {
-                    self.model.notice = error.to_string();
+                    self.show_error(self.session_notice_target(), "终端错误", error.to_string());
                     self.disconnect();
                     break;
                 }
@@ -1267,7 +1685,7 @@ impl App {
                 Err(backend::Error::Busy) => {} // 同尺寸下一拍重试，不能把队列满当成已同步。
                 Err(error) => {
                     self.selection_copy = None;
-                    self.model.notice = error.to_string();
+                    self.show_error(self.session_notice_target(), "终端错误", error.to_string());
                     self.connected = false;
                 }
             }
@@ -1295,7 +1713,11 @@ impl App {
                 self.model.selected_host = index;
                 self.model.reset_sessions();
                 self.sessions_pending = false;
-                self.model.notice = READING_SESSIONS_NOTICE.into();
+                self.show_progress(
+                    view::NoticeTarget::Host(self.target()),
+                    "正在读取会话…",
+                    READING_SESSIONS_NOTICE,
+                );
                 self.refresh_sessions();
             }
             Action::SelectSession(index) => {
@@ -1304,21 +1726,44 @@ impl App {
             }
             Action::AddHost { name, token } => {
                 self.clear_operation();
+                self.show_progress(
+                    view::NoticeTarget::Host(Target::Local),
+                    "正在添加…",
+                    "正在添加主机…",
+                );
                 self.command(Command::AddHost { name, token });
             }
             Action::CreateSession => {
                 if self.create_pending {
-                    self.model.notice = "正在创建会话，请稍候…".into();
+                    self.show_progress(
+                        view::NoticeTarget::Host(
+                            self.create_target.clone().unwrap_or_else(|| self.target()),
+                        ),
+                        "正在创建…",
+                        "正在创建会话，请稍候…",
+                    );
                     return Ok(false);
                 }
                 self.clear_operation();
+                let target = self.target();
+                self.show_progress(
+                    view::NoticeTarget::Host(target.clone()),
+                    "正在创建…",
+                    "正在创建会话，请稍候…",
+                );
                 self.create_pending = self.command(Command::NewSession {
-                    target: self.target(),
+                    target: target.clone(),
                     epoch: self.navigation_epoch,
                 });
+                self.create_target = self.create_pending.then_some(target);
             }
             Action::ToggleExit => {
                 self.clear_operation();
+                self.show_progress(
+                    view::NoticeTarget::Host(Target::Local),
+                    "正在更新出口…",
+                    "正在更新出口状态…",
+                );
                 self.command(Command::SetRole {
                     role: backend::Role::Exit,
                     on: !self.snapshot.serve_on,
@@ -1326,6 +1771,11 @@ impl App {
             }
             Action::ToggleRelay => {
                 self.clear_operation();
+                self.show_progress(
+                    view::NoticeTarget::Host(Target::Local),
+                    "正在更新中继…",
+                    "正在更新中继状态…",
+                );
                 self.command(Command::SetRole {
                     role: backend::Role::Relay,
                     on: !self.snapshot.relay_on,
@@ -1335,6 +1785,11 @@ impl App {
                 self.clear_operation();
                 if let Target::Remote(id) = self.target() {
                     let on = !self.model.hosts[self.model.selected_host].proxy_on;
+                    self.show_progress(
+                        view::NoticeTarget::Host(Target::Remote(id.clone())),
+                        "正在更新代理…",
+                        "正在更新代理状态…",
+                    );
                     self.command(Command::SetProxy { id, on });
                 }
             }
@@ -1342,12 +1797,25 @@ impl App {
                 self.clear_operation();
                 if let Target::Remote(id) = self.target() {
                     self.navigation_epoch = self.navigation_epoch.wrapping_add(1);
+                    self.show_progress(
+                        view::NoticeTarget::Host(Target::Remote(id.clone())),
+                        "正在删除…",
+                        "正在删除主机…",
+                    );
                     self.command(Command::RemoveHost { id });
                 }
             }
             Action::CloseSession => {
                 if self.close_pending.is_some() {
-                    self.model.notice = "正在关闭会话，请稍候…".into();
+                    let target = self
+                        .close_pending
+                        .as_ref()
+                        .map(|closing| view::NoticeTarget::Session {
+                            target: closing.target.clone(),
+                            name: closing.name.clone(),
+                        })
+                        .unwrap_or_else(|| self.session_notice_target());
+                    self.show_progress(target, "正在关闭…", "正在关闭会话，请稍候…");
                     return Ok(false);
                 }
                 if self
@@ -1356,7 +1824,11 @@ impl App {
                     .and_then(|index| self.model.sessions.get(index))
                     .is_some_and(|session| session.self_session)
                 {
-                    self.model.notice = "承载当前 TUI 的会话不能在此关闭；退出 TUI 后再关闭".into();
+                    self.show_error(
+                        self.session_notice_target(),
+                        "当前承载会话",
+                        "承载当前 TUI 的会话不能在此关闭；退出 TUI 后再关闭",
+                    );
                     return Ok(false);
                 }
                 self.clear_operation();
@@ -1364,6 +1836,14 @@ impl App {
                     self.navigation_epoch = self.navigation_epoch.wrapping_add(1);
                     self.sessions_epoch = self.sessions_epoch.wrapping_add(1);
                     let target = self.target();
+                    self.show_progress(
+                        view::NoticeTarget::Session {
+                            target: target.clone(),
+                            name: name.clone(),
+                        },
+                        "正在关闭…",
+                        "正在关闭会话，请稍候…",
+                    );
                     self.sessions_pending = self.command(Command::KillSession {
                         target: target.clone(),
                         name: name.clone(),
@@ -1386,12 +1866,20 @@ impl App {
             Action::Paste(text) => {
                 // A transaction is at most 1 MiB, as in the existing service.
                 if text.len() > 1 << 20 {
-                    self.model.notice = "粘贴超过 1 MiB，请分批粘贴".into();
+                    self.show_error(
+                        self.session_notice_target(),
+                        "粘贴内容过长",
+                        "粘贴超过 1 MiB，请分批粘贴",
+                    );
                 } else {
                     let chunks = input::paste(&text);
                     let bytes = text.len() + chunks.len() * 4;
                     if self.input_bytes + bytes > 2 << 20 {
-                        self.model.notice = "输入队列忙，请稍后粘贴".into();
+                        self.show_error(
+                            self.session_notice_target(),
+                            "输入队列忙",
+                            "输入队列忙，请稍后粘贴",
+                        );
                     } else {
                         for event in chunks {
                             self.send_input(event);
@@ -1465,6 +1953,7 @@ impl App {
 
 fn local_host(exit_on: bool, relay_on: bool) -> view::HostItem {
     view::HostItem {
+        target: Target::Local,
         name: "我的电脑".into(),
         detail: String::new(),
         state: view::HostState::Local,
@@ -1481,6 +1970,7 @@ fn host_item(host: &backend::Host) -> view::HostItem {
         .map(|ms| format!("{ms} ms"))
         .unwrap_or_else(|| "-- ms".into());
     view::HostItem {
+        target: Target::Remote(host.id.clone()),
         name: host.name.clone(),
         detail: format!("{endpoint}  {delay}"),
         state: match host.state {
@@ -1527,6 +2017,7 @@ fn session_item(session: backend::Session) -> view::SessionItem {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ratatui::buffer::CellWidth;
 
     fn screen(
         app: &mut App,
@@ -1546,9 +2037,14 @@ mod tests {
             })
             .unwrap();
         let buffer = terminal.backend().buffer();
-        let footer = (0..buffer.area.width)
-            .map(|x| buffer[(x, buffer.area.height - 1)].symbol())
-            .collect();
+        let footer_area = geometry.footer_area();
+        let mut footer = String::new();
+        let mut column = footer_area.x;
+        while column < footer_area.right() {
+            let cell = &buffer[(column, footer_area.y)];
+            footer.push_str(cell.symbol());
+            column += cell.cell_width().max(1);
+        }
         (geometry, footer)
     }
 
@@ -1790,6 +2286,7 @@ mod tests {
         assert_eq!(app.model.notice, "选中内容已复制到系统剪贴板");
         pending_selection_copy(&mut app, &geometry, 2);
         app.backend_event(backend::Event::Notice {
+            target: Target::Local,
             message: app.model.notice.clone(),
             clipboard: None,
             confirmation: backend::Confirmation::None,
@@ -1824,7 +2321,10 @@ mod tests {
         let (mut app, geometry) = selection_app();
         app.model.notice = backend::Error::Busy.to_string();
         pending_selection_copy(&mut app, &geometry, 1);
-        app.backend_event(backend::Event::Failed(backend::Error::Busy));
+        app.backend_event(backend::Event::Failed {
+            target: Target::Local,
+            error: backend::Error::Busy,
+        });
         let notice = app.model.notice.clone();
         app.clipboard_result(clipboard::CopyResult {
             operation: 1,
@@ -1904,10 +2404,14 @@ mod tests {
     fn real_history_footer_returns_to_live_and_disappears_when_sessions_are_cleared() {
         let mut app = history_app();
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
-        assert!(!screen(&mut app, &mut terminal).1.contains('↑'));
+        assert_eq!(screen(&mut app, &mut terminal).1.trim(), "^B 快捷指令");
         app.action(Action::Scroll(view::HistoryAction::Start))
             .unwrap();
-        assert!(screen(&mut app, &mut terminal).1.contains('↑'));
+        let footer = screen(&mut app, &mut terminal).1;
+        let view = app.surface.as_ref().unwrap().view();
+        let distance = view.scrollbar.offset.saturating_sub(view.top);
+        assert!(distance > 0);
+        assert_eq!(footer.trim(), format!("{distance}行 ⇧End回底"));
         app.action(Action::TerminalMouse(crossterm::event::MouseEvent {
             kind: crossterm::event::MouseEventKind::Moved,
             column: 2,
@@ -1922,10 +2426,14 @@ mod tests {
         app.action(Action::Scroll(view::HistoryAction::End))
             .unwrap();
         let footer = screen(&mut app, &mut terminal).1;
-        assert!(!footer.contains('↑') && !footer.contains("⇧End"));
+        assert_eq!(footer.trim(), "^B 快捷指令");
         app.action(Action::Scroll(view::HistoryAction::Start))
             .unwrap();
-        assert!(screen(&mut app, &mut terminal).1.contains('↑'));
+        let footer = screen(&mut app, &mut terminal).1;
+        let view = app.surface.as_ref().unwrap().view();
+        let distance = view.scrollbar.offset.saturating_sub(view.top);
+        assert!(distance > 0);
+        assert_eq!(footer.trim(), format!("{distance}行 ⇧End回底"));
         app.backend_event(backend::Event::Sessions {
             target: Target::Local,
             epoch: app.sessions_epoch,
@@ -1933,7 +2441,7 @@ mod tests {
         });
         assert!(app.surface.is_none() && app.model.selected_session.is_none());
         let footer = screen(&mut app, &mut terminal).1;
-        assert!(!footer.contains('↑') && !footer.contains("⇧End"));
+        assert_eq!(footer.trim(), "^B 快捷指令");
     }
 
     #[test]
@@ -1962,6 +2470,218 @@ mod tests {
     }
 
     #[test]
+    fn status_rows_keep_original_host_and_do_not_merge_a_different_hosts_fact() {
+        let mut app = app();
+        let remote = Target::Remote("remote".into());
+        app.current_target = remote.clone();
+        app.backend_event(backend::Event::Notice {
+            target: Target::Local,
+            message: "出口已启动".into(),
+            clipboard: None,
+            confirmation: backend::Confirmation::Snapshot,
+        });
+        assert_eq!(
+            app.model.item_notice.as_ref().unwrap().target,
+            view::NoticeTarget::Host(Target::Local)
+        );
+        app.backend_event(backend::Event::Sessions {
+            target: remote.clone(),
+            epoch: app.sessions_epoch,
+            result: Err(backend::Error::Timeout),
+        });
+        let notice = app.model.item_notice.as_ref().unwrap();
+        assert_eq!(notice.target, view::NoticeTarget::Host(remote));
+        assert!(!notice.detail.contains("出口已启动"));
+    }
+
+    #[test]
+    fn brief_notice_waits_for_popup_and_expires_only_its_owned_row() {
+        use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+        let mut app = app();
+        let owner = view::NoticeTarget::Host(Target::Local);
+        app.show_success(owner.clone(), "已复制", "已复制到系统剪贴板");
+        let later = Instant::now() + Duration::from_secs(4);
+        let geometry = view::Geometry::default();
+        view::handle_event(
+            &mut app.model,
+            Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+            &geometry,
+        );
+        app.expire_notice(later);
+        assert!(
+            app.model.item_notice.is_some(),
+            "reading full details must not expire the row"
+        );
+        view::handle_event(
+            &mut app.model,
+            Event::Key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE)),
+            &geometry,
+        );
+        app.expire_notice(later);
+        assert!(
+            app.model.item_notice.is_none(),
+            "metadata returns after the brief result"
+        );
+        app.show_success(owner.clone(), "已复制", "已复制到系统剪贴板");
+        app.model.item_notice = Some(view::ItemNotice {
+            target: owner,
+            summary: "当前承载会话".into(),
+            detail: "新说明".into(),
+        });
+        app.expire_notice(Instant::now() + Duration::from_secs(4));
+        assert_eq!(app.model.item_notice.as_ref().unwrap().detail, "新说明");
+    }
+
+    #[test]
+    fn operation_copy_cannot_overwrite_a_new_same_text_error_or_emit_stale_osc52() {
+        let mut app = app();
+        let (clipboard, _recorded) = clipboard::Clipboard::recording();
+        app.clipboard = clipboard;
+        app.backend_event(backend::Event::Notice {
+            target: Target::Local,
+            message: "出口已启动".into(),
+            clipboard: Some("token".into()),
+            confirmation: backend::Confirmation::Snapshot,
+        });
+        let operation = app.operation_id;
+        let detail = app.model.notice.clone();
+        app.show_error(
+            view::NoticeTarget::Host(Target::Local),
+            "新错误",
+            detail.clone(),
+        );
+        app.clipboard_result(clipboard::CopyResult {
+            purpose: clipboard::Purpose::Operation,
+            operation,
+            fact: "出口已启动".into(),
+            status: clipboard::Copied::Terminal("MUST_NOT_WRITE".into()),
+        })
+        .unwrap();
+        assert_eq!(app.model.notice, detail);
+        assert_eq!(app.model.item_notice.as_ref().unwrap().summary, "新错误");
+    }
+
+    #[test]
+    fn older_operation_copy_result_keeps_the_newer_pending_copy() {
+        let mut app = app();
+        let (clipboard, _recorded) = clipboard::Clipboard::recording();
+        app.clipboard = clipboard;
+        let notice = |message: &str| backend::Event::Notice {
+            target: Target::Local,
+            message: message.into(),
+            clipboard: Some("token".into()),
+            confirmation: backend::Confirmation::Snapshot,
+        };
+        app.backend_event(notice("出口已启动"));
+        let old = app.operation_id;
+        app.backend_event(notice("中继已启动"));
+        let new = app.operation_id;
+        app.clipboard_result(clipboard::CopyResult {
+            purpose: clipboard::Purpose::Operation,
+            operation: old,
+            fact: "出口已启动".into(),
+            status: clipboard::Copied::System,
+        })
+        .unwrap();
+        assert_eq!(app.operation_copy.as_ref().unwrap().operation, new);
+        app.clipboard_result(clipboard::CopyResult {
+            purpose: clipboard::Purpose::Operation,
+            operation: new,
+            fact: "中继已启动".into(),
+            status: clipboard::Copied::System,
+        })
+        .unwrap();
+        assert!(app.operation_copy.is_none());
+        assert_eq!(app.model.item_notice.as_ref().unwrap().summary, "已复制");
+        assert!(app.model.notice.contains("中继已启动") && app.model.notice.contains("已复制"));
+    }
+
+    #[test]
+    fn successful_poll_does_not_replace_a_newer_view_explanation() {
+        let mut app = app();
+        app.backend_event(backend::Event::RefreshFailed(backend::Error::Timeout));
+        let newer = view::ItemNotice {
+            target: view::NoticeTarget::Session {
+                target: Target::Local,
+                name: "self".into(),
+            },
+            summary: "当前承载会话".into(),
+            detail: "请使用其它会话".into(),
+        };
+        app.model.notice = newer.detail.clone();
+        app.model.item_notice = Some(newer.clone());
+        app.backend_event(backend::Event::Snapshot(backend::Snapshot::default()));
+        assert_eq!(app.model.item_notice, Some(newer));
+        assert!(app.operation_warning.is_none());
+    }
+
+    #[test]
+    fn refresh_recovery_keeps_a_pending_copy_until_its_real_result() {
+        let mut app = app();
+        let (clipboard, _recorded) = clipboard::Clipboard::recording();
+        app.clipboard = clipboard;
+        app.backend_event(backend::Event::Notice {
+            target: Target::Local,
+            message: "出口已启动".into(),
+            clipboard: Some("token".into()),
+            confirmation: backend::Confirmation::Snapshot,
+        });
+        let operation = app.operation_id;
+        app.backend_event(backend::Event::RefreshFailed(backend::Error::Timeout));
+        app.backend_event(backend::Event::Snapshot(backend::Snapshot::default()));
+        assert!(matches!(app.notice_life, NoticeLife::Progress));
+        app.expire_notice(Instant::now() + Duration::from_secs(30));
+        assert!(app.model.item_notice.is_some() && app.operation_copy.is_some());
+        app.clipboard_result(clipboard::CopyResult {
+            purpose: clipboard::Purpose::Operation,
+            operation,
+            fact: "出口已启动".into(),
+            status: clipboard::Copied::System,
+        })
+        .unwrap();
+        assert_eq!(app.model.item_notice.as_ref().unwrap().summary, "已复制");
+    }
+
+    #[test]
+    fn closed_session_brief_uses_its_final_target_and_expires() {
+        let mut app = app();
+        app.close_pending = Some(ClosingSession {
+            target: Target::Local,
+            name: "gone".into(),
+        });
+        app.backend_event(backend::Event::SessionClosed {
+            target: Target::Local,
+            name: "gone".into(),
+            result: Ok(()),
+        });
+        assert_eq!(
+            app.model.item_notice.as_ref().unwrap().target,
+            view::NoticeTarget::Session {
+                target: Target::Local,
+                name: "gone".into()
+            }
+        );
+        app.expire_notice(Instant::now() + Duration::from_secs(4));
+        assert!(
+            app.model.item_notice.is_none(),
+            "closed-row fallback must restore host metadata too"
+        );
+    }
+
+    #[test]
+    fn duplicate_creation_status_stays_on_its_original_host() {
+        let mut app = app();
+        app.create_pending = true;
+        app.create_target = Some(Target::Local);
+        app.current_target = Target::Remote("new-host".into());
+        app.action(Action::CreateSession).unwrap();
+        assert_eq!(
+            app.model.item_notice.as_ref().unwrap().target,
+            view::NoticeTarget::Host(Target::Local)
+        );
+    }
+
+    #[test]
     fn terminal_close_rechecks_displayed_context_and_matching_completion() {
         let mut app = app();
         app.model.sessions = vec![session_item(backend::Session {
@@ -1984,7 +2704,10 @@ mod tests {
             app.navigation_epoch, epoch,
             "duplicate press cannot enqueue a second close"
         );
-        app.backend_event(backend::Event::Failed(backend::Error::Busy));
+        app.backend_event(backend::Event::Failed {
+            target: Target::Local,
+            error: backend::Error::Busy,
+        });
         assert!(
             app.close_pending.is_some(),
             "unrelated failure cannot complete close"
@@ -2045,6 +2768,10 @@ mod tests {
         assert!(app.model.sessions.is_empty());
         app.backend_event(backend::Event::Snapshot(backend::Snapshot::default()));
         assert_eq!(app.model.notice, CONTROL_READY_NOTICE);
+        assert!(
+            app.model.item_notice.is_none(),
+            "healthy control status has no row notification"
+        );
         app.backend_event(backend::Event::Sessions {
             target: Target::Local,
             epoch: app.sessions_epoch,
@@ -2114,7 +2841,10 @@ mod tests {
             });
         };
         let mut app = app();
-        app.backend_event(backend::Event::Failed(backend::Error::Busy));
+        app.backend_event(backend::Event::Failed {
+            target: Target::Local,
+            error: backend::Error::Busy,
+        });
         let error = app.model.notice.clone();
         complete(&mut app);
         assert_eq!(app.model.notice, error);
@@ -2125,6 +2855,7 @@ mod tests {
         complete(&mut app);
         assert_eq!(app.model.notice, creating);
         app.backend_event(backend::Event::Notice {
+            target: Target::Local,
             message: "主机已添加".into(),
             clipboard: None,
             confirmation: backend::Confirmation::Snapshot,
@@ -2186,6 +2917,7 @@ mod tests {
     fn refresh_warning_keeps_the_success_fact_and_does_not_grow_unbounded() {
         let mut app = app();
         app.backend_event(backend::Event::Notice {
+            target: Target::Local,
             message: "出口已启动".into(),
             clipboard: None,
             confirmation: backend::Confirmation::Snapshot,
@@ -2212,6 +2944,7 @@ mod tests {
     fn success_fact_expires_only_after_its_own_confirmation() {
         let mut app = app();
         app.backend_event(backend::Event::Notice {
+            target: Target::Local,
             message: "会话已关闭".into(),
             clipboard: None,
             confirmation: backend::Confirmation::Sessions(Target::Local),
@@ -2241,13 +2974,17 @@ mod tests {
     #[test]
     fn late_clipboard_result_keeps_its_original_operation_context() {
         let mut app = app();
+        let (clipboard, _recorded) = clipboard::Clipboard::recording();
+        app.clipboard = clipboard;
         app.backend_event(backend::Event::Notice {
+            target: Target::Local,
             message: "出口已启动".into(),
-            clipboard: None,
+            clipboard: Some("token".into()),
             confirmation: backend::Confirmation::Snapshot,
         });
         let previous = app.operation_id;
         app.backend_event(backend::Event::Notice {
+            target: Target::Local,
             message: "会话已关闭".into(),
             clipboard: None,
             confirmation: backend::Confirmation::Sessions(Target::Local),
@@ -2265,9 +3002,12 @@ mod tests {
     #[test]
     fn clipboard_success_does_not_hide_a_warning_from_the_same_operation() {
         let mut app = app();
+        let (clipboard, _recorded) = clipboard::Clipboard::recording();
+        app.clipboard = clipboard;
         app.backend_event(backend::Event::Notice {
+            target: Target::Local,
             message: "出口已启动".into(),
-            clipboard: None,
+            clipboard: Some("token".into()),
             confirmation: backend::Confirmation::Snapshot,
         });
         app.backend_event(backend::Event::RefreshFailed(backend::Error::Timeout));
@@ -2288,9 +3028,12 @@ mod tests {
     #[test]
     fn live_error_is_not_overwritten_by_an_older_clipboard_result() {
         let mut app = app();
+        let (clipboard, _recorded) = clipboard::Clipboard::recording();
+        app.clipboard = clipboard;
         app.backend_event(backend::Event::Notice {
+            target: Target::Local,
             message: "出口已启动".into(),
-            clipboard: None,
+            clipboard: Some("token".into()),
             confirmation: backend::Confirmation::Snapshot,
         });
         let previous = app.operation_id;
@@ -2310,6 +3053,7 @@ mod tests {
         let mut app = app();
         app.backend_event(backend::Event::RefreshFailed(backend::Error::Timeout));
         app.backend_event(backend::Event::Notice {
+            target: Target::Local,
             message: "主机已添加".into(),
             clipboard: None,
             confirmation: backend::Confirmation::Snapshot,
@@ -2322,6 +3066,7 @@ mod tests {
     fn session_completion_on_another_host_is_not_a_current_host_fact() {
         let mut app = app();
         app.backend_event(backend::Event::Notice {
+            target: Target::Remote("old-host".into()),
             message: "会话已关闭".into(),
             clipboard: None,
             confirmation: backend::Confirmation::Sessions(Target::Remote("old-host".into())),
@@ -2339,9 +3084,12 @@ mod tests {
     #[test]
     fn create_failure_invalidates_feedback_from_a_previous_clipboard_operation() {
         let mut app = app();
+        let (clipboard, _recorded) = clipboard::Clipboard::recording();
+        app.clipboard = clipboard;
         app.backend_event(backend::Event::Notice {
+            target: Target::Local,
             message: "出口已启动".into(),
-            clipboard: None,
+            clipboard: Some("token".into()),
             confirmation: backend::Confirmation::Snapshot,
         });
         let previous = app.operation_id;

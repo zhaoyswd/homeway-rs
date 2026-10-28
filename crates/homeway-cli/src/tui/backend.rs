@@ -191,6 +191,18 @@ pub(super) enum Command {
     KillSession { target: Target, name: String },
 }
 
+impl Command {
+    pub(super) fn target(&self) -> Target {
+        match self {
+            Self::Sessions { target, .. }
+            | Self::NewSession { target, .. }
+            | Self::KillSession { target, .. } => target.clone(),
+            Self::RemoveHost { id } | Self::SetProxy { id, .. } => Target::Remote(id.clone()),
+            Self::Refresh | Self::AddHost { .. } | Self::SetRole { .. } => Target::Local,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Confirmation {
     Snapshot,
@@ -216,11 +228,13 @@ pub(super) enum Event {
         result: Result<(), Error>,
     },
     Notice {
+        target: Target,
         message: String,
         clipboard: Option<String>,
         confirmation: Confirmation,
     },
     Warning {
+        target: Target,
         message: String,
         error: Error,
         confirmation: Confirmation,
@@ -231,7 +245,10 @@ pub(super) enum Event {
         epoch: u64,
         error: Error,
     },
-    Failed(Error),
+    Failed {
+        target: Target,
+        error: Error,
+    },
 }
 
 pub(super) struct Backend {
@@ -369,6 +386,7 @@ impl Backend {
                     Command::KillSession { target, name } => Some((target.clone(), name.clone())),
                     _ => None,
                 };
+                let target = command.target();
                 let result = worker.execute(command);
                 match result {
                     Ok(events) => {
@@ -397,7 +415,7 @@ impl Backend {
                                 name,
                                 result: Err(error),
                             },
-                            _ => Event::Failed(error),
+                            _ => Event::Failed { target, error },
                         };
                         let _ = deliver(&tx, event, &running);
                     }
@@ -444,6 +462,7 @@ impl Backend {
                             let _ = deliver(
                                 &events,
                                 Event::Warning {
+                                    target: Target::Local,
                                     message: "本机服务未就绪".into(),
                                     error: Error::Bootstrap(error),
                                     confirmation: Confirmation::None,
@@ -664,7 +683,8 @@ impl Worker {
 
     fn execute(&mut self, command: Command) -> Result<Vec<Event>, Error> {
         use homeway_core::term::frames::{self, Op};
-        let notice = |message: &str, confirmation: Confirmation| Event::Notice {
+        let notice = |target: Target, message: &str, confirmation: Confirmation| Event::Notice {
+            target,
             message: message.to_owned(),
             clipboard: None,
             confirmation,
@@ -680,12 +700,22 @@ impl Worker {
                 }])
             }
             Command::AddHost { name, token } => {
-                self.request(OpName::HostAdd, Some(json!({"name":name,"token":token})))?;
-                Ok(vec![notice("主机已添加", Confirmation::Snapshot)])
+                let added =
+                    self.request(OpName::HostAdd, Some(json!({"name":name,"token":token})))?;
+                let target = added["id"]
+                    .as_str()
+                    .filter(|id| !id.is_empty())
+                    .map(|id| Target::Remote(id.into()))
+                    .unwrap_or(Target::Local);
+                Ok(vec![notice(target, "主机已添加", Confirmation::Snapshot)])
             }
             Command::RemoveHost { id } => {
                 self.request(OpName::HostRemove, Some(json!({"host":id})))?;
-                Ok(vec![notice("主机已删除", Confirmation::Snapshot)])
+                Ok(vec![notice(
+                    Target::Remote(id),
+                    "主机已删除",
+                    Confirmation::Snapshot,
+                )])
             }
             Command::SetRole { role, on } => {
                 let label = match role {
@@ -720,11 +750,13 @@ impl Worker {
                 };
                 let events = match token {
                     Ok(clipboard) => vec![Event::Notice {
+                        target: Target::Local,
                         message: format!("{label}已{}", if on { "启动" } else { "关闭" }),
                         clipboard,
                         confirmation: Confirmation::Snapshot,
                     }],
                     Err(error) => vec![Event::Warning {
+                        target: Target::Local,
                         message: format!("{label}已启动，但未能取得 token"),
                         error,
                         confirmation: Confirmation::Snapshot,
@@ -747,6 +779,7 @@ impl Worker {
                         .filter(|p| *p > 0 && *p <= u16::MAX as u64);
                     let Some(port) = port else {
                         return Ok(vec![Event::Warning {
+                            target: Target::Remote(id),
                             message: "代理已启动，但未能取得监听地址".into(),
                             error: Error::Unexpected(0),
                             confirmation: Confirmation::Snapshot,
@@ -757,6 +790,7 @@ impl Worker {
                     None
                 };
                 Ok(vec![Event::Notice {
+                    target: Target::Remote(id),
                     message: format!("代理已{}", if on { "启动" } else { "关闭" }),
                     clipboard,
                     confirmation: Confirmation::Snapshot,
@@ -1058,6 +1092,7 @@ mod tests {
         backend
             .bootstrap_events
             .try_send(Event::Notice {
+                target: Target::Local,
                 message: "主机已添加".into(),
                 clipboard: None,
                 confirmation: Confirmation::Snapshot,

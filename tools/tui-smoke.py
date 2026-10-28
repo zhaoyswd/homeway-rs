@@ -71,7 +71,35 @@ def stop_process(process):
 
 
 def sidebar_width(columns):
-    return min(max(columns * 3 // 10, 18), 34)
+    return min(min(max(columns * 3 // 10, 18), 34) * 4 // 5, max(0, columns - 18))
+
+
+def session_metadata_visible(tui, entry, project):
+    """Check the exact visible state/type/directory row, including narrow cropping."""
+    state = entry.get("stateV2", "unknown")
+    state = {"working": "working", "idle": "idle", "blocked": "blocking"}.get(state, "unknown")
+    agent = entry.get("agentLabel") or entry.get("agent") or "unknown"
+    expected = unicodedata.normalize("NFC", f"  {state} {agent} {project}")
+    width = sidebar_width(tui.screen.columns) - 3
+    clipped, used = "", 0
+    for char in expected:
+        cells = max(0, wcwidth(char))
+        if used + cells > width:
+            break
+        clipped += char
+        used += cells
+    # At least one real directory character must survive the visible crop.
+    prefix_width = sum(max(0, wcwidth(char)) for char in f"  {state} {agent} ")
+    assert width > prefix_width, "sidebar too narrow to verify any directory character"
+    for y in range(1, tui.screen.lines - 2):
+        text, x = "", 2
+        while x < sidebar_width(tui.screen.columns) - 1:
+            data = tui.screen.buffer[y][x].data or " "
+            text += data
+            x += max(1, wcwidth(data[0]))
+        if unicodedata.normalize("NFC", text).rstrip() == clipped.rstrip():
+            return True
+    return False
 
 
 class Tui:
@@ -212,6 +240,23 @@ class Tui:
         except AssertionError as error:
             raise AssertionError(f"{error}; screen:\n" + self.screen_text()) from error
 
+    def terminal_ready(self, title=None):
+        """Require a rendered session grid, rather than a transient notice."""
+        self.drain()
+        if self.process.poll() is not None:
+            raise AssertionError(f"TUI exited {self.process.returncode}")
+        header = self.screen_lines()[0]
+        if "[ X ]" not in header or (title is not None and title not in header):
+            return False
+        sidebar = sidebar_width(self.screen.columns)
+        rows = ["".join(self.screen.buffer[y][x].data or " "
+                        for x in range(sidebar, self.screen.columns - 1))
+                for y in range(1, self.screen.lines - 1)]
+        return "正在接入会话" not in "\n".join(rows) and any(row.strip() for row in rows)
+
+    def wait_terminal(self, title=None):
+        wait_until(lambda: self.terminal_ready(title), "rendered selected session grid")
+
     def send(self, value):
         os.write(self.master, value.encode() if isinstance(value, str) else value)
 
@@ -318,14 +363,14 @@ def idle_cpu(tui, seconds=4):
     tui.drain(seconds)
     elapsed = time.monotonic()-started
     used = cumulative()-before
-    print(f"INFO: idle TUI CPU={used/elapsed*100:.2f}% over {elapsed:.2f}s; 100x30 window / 69x27 shell; one logical CPU=100%")
+    print(f"INFO: idle TUI CPU={used/elapsed*100:.2f}% over {elapsed:.2f}s; 100x30 window / 75x28 shell; one logical CPU=100%")
 
 
 def terminal_rows(tui):
     """Read terminal contents by physical cell coordinates, excluding the sidebar."""
     sidebar = sidebar_width(tui.screen.columns)
     rows = []
-    for y in range(2, tui.screen.lines - 3):
+    for y in range(1, tui.screen.lines - 1):
         pieces = []
         x = sidebar
         while x < tui.screen.columns - 1:
@@ -401,13 +446,13 @@ def exercise_ls(tui, binary, state, snapshot_dir):
         assert any(entry["name"] == name and entry.get("attached") for entry in live), f"{tag}: session/attach lost"
         if color:
             sidebar = sidebar_width(tui.screen.columns)
-            colored = [cell for y in range(2, tui.screen.lines-3)
+            colored = [cell for y in range(1, tui.screen.lines-1)
                        for x in range(sidebar, tui.screen.columns-1)
                        if (cell := tui.screen.buffer[y][x]).data == "色"]
             assert colored and all(cell.fg not in ("default", "dde2ea") for cell in colored), f"{tag}: ls directory color lost"
         print(f"PASS: real ls {tag}; filenames rendered and original session/attach alive")
 
-    for cols, rows, inner_cols, inner_rows in ((100, 30, 69, 27), (160, 40, 125, 37)):
+    for cols, rows, inner_cols, inner_rows in ((100, 30, 75, 28), (160, 40, 132, 38)):
         tui.set_size(cols, rows)
         tui.signal(signal.SIGWINCH)
         tui.drain(0.2)
@@ -478,7 +523,14 @@ def main():
                 print("PASS: initial empty header hides X and its former position does not create/close a session")
                 snapshot(first, args.snapshot_dir, "empty-dark")
                 first.send(b"\x02n")
-                first.wait("已接入")
+                first.wait_terminal()
+                first.send(b"\x02")
+                wait_until(lambda: (first.drain() or "快捷指令" in first.screen_lines()[0]), "fullscreen command popup")
+                assert "q 分离退出" in first.screen_text() and "h 主机" in first.screen_text()
+                snapshot(first, args.snapshot_dir, "commands-dark")
+                first.send(b"x")  # Unknown command closes once and must never reach the shell.
+                wait_until(lambda: (first.drain() or "快捷指令" not in first.screen_lines()[0]), "command popup closes after consumed key")
+                print("PASS: Ctrl+B opens full-screen commands; consumed key closes without PTY input")
                 first.send("printf 'HW_TUI_%s\\n' FIRST\r")
                 first.wait("HW_TUI_FIRST")
                 # Report the actual current directory through the existing OSC7
@@ -498,14 +550,15 @@ def main():
 
                 def project_visible():
                     first.drain()
-                    return any(project in line[:sidebar_width(first.screen.columns)] for line in first.screen_lines())
+                    entry = next((entry for entry in sessions(binary, state) if entry.get("cwd") == cwd), None)
+                    return entry is not None and session_metadata_visible(first, entry, project)
 
                 wait_until(project_visible, "OSC7 project name in session sidebar")
                 print("PASS: OSC7 current directory reaches LIST and session project label")
                 first.send("printf 'HW_SIZE:%s\\n' \"$(stty size)\"\r")
-                first.wait("HW_SIZE:27 69")
+                first.wait("HW_SIZE:28 75")
                 snapshot(first, args.snapshot_dir, "shell-dark")
-                print("PASS: create shell, execute command, viewport matches PTY 69x27")
+                print("PASS: create shell, execute command, viewport matches PTY 75x28")
                 # One local host has a six-line panel, including two blank
                 # content lines. Click second lines: local y=2, session y=7.
                 mouse_name = sessions(binary, state)[0]["name"]
@@ -522,8 +575,8 @@ def main():
                 first.signal(signal.SIGWINCH)
                 first.drain(0.5)
                 first.send("printf 'HW_RESIZE:%s\\n' \"$(stty size)\"\r")
-                first.wait("HW_RESIZE:33 85")
-                print("PASS: resize propagates to PTY 85x33")
+                first.wait("HW_RESIZE:34 92")
+                print("PASS: resize propagates to PTY 92x34")
 
                 # Emulate the outer terminal changing its background, then focus-in.
                 first.background = "rgb:ffff/ffff/ffff"
@@ -546,7 +599,7 @@ def main():
                 second.wait(name)
                 # Sidebar session focus, move to the first existing session, then attach.
                 second.send(b"\x02s\x1b[B\r")
-                second.wait("已接入")
+                second.wait_terminal(name)
                 second.send("printf 'HW_TUI_%s\\n' SECOND\r")
                 second.wait("HW_TUI_SECOND")
                 # Close a disposable second shell through the actual TUI menu;
@@ -562,7 +615,7 @@ def main():
                 def second_shell_attached():
                     second.drain()
                     lines = second.screen_lines()
-                    return closing_name in lines[0] and "已接入" in lines[-1]
+                    return second.terminal_ready(closing_name)
 
                 wait_until(second_shell_attached, "second shell attached in TUI")
                 snapshot(second, args.snapshot_dir, "terminal-close-ready-light", light=True)
@@ -589,7 +642,7 @@ def main():
                 def original_reattached():
                     second.drain()
                     lines = second.screen_lines()
-                    return name in lines[0] and "已接入" in lines[-1]
+                    return second.terminal_ready(name)
                 wait_until(original_reattached, "original shell reattached after header close")
                 second.send("printf 'HW_AFTER_%s\\n' CLOSE\r")
                 second.wait("HW_AFTER_CLOSE")

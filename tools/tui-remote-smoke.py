@@ -132,7 +132,7 @@ def role_state(binary, state, role):
 
 def local_roles(tui, binary, state, clipboard):
     tui.send(b"\x02n")
-    screen_wait(tui, "已接入")
+    tui.wait_terminal()
     tui.send("printf 'HW_LOCAL_%s\\n' ROLES\r")
     screen_wait(tui, "HW_LOCAL_ROLES")
     local_name = sessions(binary, state)[0]["name"]
@@ -268,7 +268,7 @@ def main():
                     tui.send(b"\x02h\x1b[B")
                     tui.drain(0.2)
                     tui.send(b"\x02n")
-                    screen_wait(tui, "已接入")
+                    tui.wait_terminal()
                     tui.send("printf 'HW_REMOTE_%s\\n' SHELL\r")
                     screen_wait(tui, "HW_REMOTE_SHELL")
                     remote_sessions = sessions(binary, exit_state)
@@ -293,8 +293,11 @@ def main():
                             return actual if entry.get("cwd") == str(Path(actual).resolve()) else None
                         actual = wait_until(listed, "remote default shell cwd in authoritative LIST", 12)
                         project = Path(actual).name or "/"
-                        wait_until(lambda: (tui.drain() or any(project in line[:helpers["sidebar_width"](tui.screen.columns)]
-                                                               for line in tui.screen_lines())), "remote real cwd basename in sidebar", 12)
+                        def metadata_visible():
+                            tui.drain()
+                            entry = next(entry for entry in sessions(binary, exit_state) if entry["name"] == session_name)
+                            return helpers["session_metadata_visible"](tui, entry, project)
+                        wait_until(metadata_visible, "remote exact visible state/type/cwd row", 12)
                         return actual
 
                     remote_cwd()
