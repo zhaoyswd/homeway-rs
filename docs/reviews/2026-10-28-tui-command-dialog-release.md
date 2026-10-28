@@ -347,3 +347,29 @@ worker检查时ppid仍为30492，这不能冒充已脱离；root随后第二独�
 文件完整SHA/大小不变，正确3项出口/中继身份继续缺席，local-term600归30500所有，
 被动GREETING v1/featuresff/hello_sent=false。未在正式state创建shell或做完整TUI交互。
 此时本机Mac仍PREPARED，旧46739/v0.3.22未切换；两远端成功不能提前写成三目标完成。
+
+## 本机正式切换与三目标收口
+
+两个远端独立验收后，root提交/推送检查点`71d3b73`，再次交付会话恢复命令，确认本机
+receipt仍PREPARED/activation_started=false后唯一bootstrap本轮once.plist。
+本机独立worker96109实际回执 **SUCCESS**，2026-10-28 15:10:30.297 UTC，15.233秒，
+未回退；PID46739→**96125**、generation `933455963cbb39325976a81cb1aee51e`。
+正式PATH `/opt/homebrew/bin/homeway` 为同一官方arm64完整SHA
+`66831ecc79c93723846eb6e9b693129a06d2c4380d0ee3516614b4233c11c929`，版本v0.3.23。
+
+root在worker稳定窗/最终就绪后另开只读验收：同PID/generation、零参/defaultstate、
+serve running/UDP41641、relay stopped，原plist/配置/serve key/theme不变；被动term
+v1/features0xff/hello_sent=false，one-shot not running/runs1/exit0。原始预检的
+75,926B凭证前缀SHA `edc25e6366444da6c22913ef4f1333b96a7ca196bc010cbdc022785b8b025d0d`
+另作只读校验仍一致；prepare时实际快照已为77,253B，前缀SHA
+`f183e974a4cd84ad79baa2698cee5bac766b8c2c244e29fe336f881530e307ab`，切换后该完整准备
+前缀保全并新增469B，符合台账仅允许追加的验收规则，不误写凭证文件全长完全不变。
+
+新exit.log实际记录23:10:18.304(+08:00)统一进程v0.3.23就绪，.336中继OK-MAC认证
+通过并连上123.56.218.212:41741。未创建生产PTY或自动发送实际桌面通知/复制，不将
+私有交互验证写成在生产做过完整交互。
+
+至此本机、阿里云、LAN71三个目标均已换装同tag官方v0.3.23，三个成功回执与各自独立
+验收均实际取得，无回退。备份/恢复资料保留，所有正式守护仍为PATH零参/defaultstate，
+71保留原裸客户端形态。最终收口只更新记录；旧TUI进程需退出后重进`homeway tui`加载
+新界面。原CI两红、探针目录失败、远程冒烟首红与根因未证边界均保留，不改写为一次全绿。

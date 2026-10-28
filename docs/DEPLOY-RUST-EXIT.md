@@ -1349,7 +1349,7 @@ local-term GREETING v1/features0xff/hello_sent=false，one-shot not running/runs
 双端最终成功不覆盖先前故障。LAN71 SSH22本轮超时未写。完整门、官方归档SHA、两道评审与恢复指针见
 [`2026-10-28-tui-release-deploy.md`](reviews/2026-10-28-tui-release-deploy.md)。
 
-### 13.23 v0.3.23 对齐与居中快捷指令正式更新（2026-10-28，进行中）
+### 13.23 v0.3.23 对齐与居中快捷指令正式更新（2026-10-28，完成）
 
 用户授权提交/发版/部署，沿用官方Release纪律。14cf217 UI工作单元、1987612版本提交
 和必要test-only修正bc57b2d已推main；本地完整quick1447/0/40ignored与316秒RRR通过，
@@ -1368,5 +1368,10 @@ v0.3.23/映像/角色/UDP41641与UDP-TCP41741/4关键字节/被动term v1/ff通�
 独立SSH确认PPID1/UID501/零参/defaultstate/版本v0.3.23，4项客户端config/hosts/身份
 原字节保全，3项出口身份继续缺席、serve/relay停用、被动term v1/ff，one-shot退出0且
 无永久LaunchAgent。回执`~/homeway-rollback/release-v0.3.23-lan71-20261028-r1/receipt.json`。
-本机Mac仍PREPARED待最后切换，恢复指令已私下交付；全流程和准确恢复边界见
+本机最后切换亦已 **SUCCESS**，15.233秒/未回退，46739→96125，官方arm64同SHA，
+版本v0.3.23。回执`~/homeway-rollback/release-v0.3.23-20261028-r1/receipt.json`；独立
+复核零参/defaultstate/serve41641/relaystopped/原plist和身份、被动term v1/ff、once
+退出0。准备时凭证77253B原前缀保全另追加469B，初始75926B前缀亦另核一致。新日志
+确认v0.3.23就绪及中继OK-MAC认证重连成功，未创建生产PTY。三个目标的成功回执与
+独立验收均取得，恢复资料保留，旧TUI需退出后重进。全流程和准确恢复边界见
 [`2026-10-28-tui-command-dialog-release.md`](reviews/2026-10-28-tui-command-dialog-release.md)。
