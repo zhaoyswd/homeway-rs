@@ -72,6 +72,20 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-10-28 TUI 拖拽选区复制（完成，本机debug已更新）**：终端内容按住左键拖选高亮，
+> 松开自动复制；单击不复制，应用鼠标模式用Shift强制本地选择。Down锁定手势路由与
+> 有界可见快照，宽字/组合符/TAB、软硬换行与历史按显示文本复制，不带出右侧裁尾；
+> 滚动/输入/切换/窗口或历史失效取消，不发PTY输入或抢observer尺寸。复用异步剪贴板，
+> System成功提示与SSH/homeway term终端请求提交分列，旧回调先核归属再发OSC52/通知。
+> 仅CLI前端，无core/wire变更，技术/代码独立门通过；最终TUI **94/0、1 ignored**、
+> build/clippy通过，私有真实PTY+mock剪贴板 **7 PASS**（含tailcat精确OSC52/native零新增、
+> raw140×40活动腿不变），深浅/历史选区截图已核。SHA256 `6d8b05b3…3aaf647`
+> 与本机PATH同件，file-only回执SUCCESS、PID **55632→55632**，不重启/不访问正式state；
+> 备份 `~/homeway-rollback/tui-selection-copy-20261028-8930929df71a/`，未回滚。
+> LAN71两次只读SSH均port22超时exit255，未上传/创建stage/换装，待连接恢复后更新；
+> 本次未实核远端当前SHA，不把此前c373验收冒充新件部署。未推送/发布，阿里云未动。
+> 失败与修正、双门/实际证据见 `docs/reviews/2026-10-28-tui-selection-copy.md`。
+
 > **2026-10-28 当前 debug 部署LAN71（完成）**：用户明确要求也部署到
 > `192.168.3.71`，本次该IP的debug指令覆盖正式Release产物纪律，不推送/发版、不动
 > 本机现役或阿里云。只读SSH确认MacBook-Pro-2/Darwin arm64/macOS26.6.2、UID501，

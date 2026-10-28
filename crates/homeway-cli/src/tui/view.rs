@@ -16,6 +16,8 @@ use ratatui::{
     Frame,
 };
 
+use super::selection::{self, projected_symbol as terminal_symbol};
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum Theme {
     #[default]
@@ -159,6 +161,8 @@ pub(super) struct Model {
     pub terminal_title: String,
     pub terminal_present: bool,
     pub terminal_close: Option<TerminalClose>,
+    pub selection_spans: Vec<selection::Span>,
+    pub selecting: bool,
     prefix: bool,
     hosts_offset: usize,
     sessions_offset: usize,
@@ -194,6 +198,8 @@ impl Model {
         self.history_behind = 0;
         self.terminal_close = None;
         self.terminal_present = false;
+        self.selection_spans.clear();
+        self.selecting = false;
     }
 
     fn close_target(&self) -> Option<&TerminalClose> {
@@ -640,6 +646,7 @@ pub(super) fn draw(
             p,
             model.focus == Focus::Terminal && !model.modal_open(),
         );
+        highlight_selection(frame, geometry.terminal, &model.selection_spans, p);
     } else if model.selected_session.is_none()
         || model
             .selected_session
@@ -738,34 +745,52 @@ fn footer(model: &Model, width: u16) -> String {
             "^B: h主机 s会话 n新建 a添加 q退出".into()
         };
     }
+    let selection = if model.selecting {
+        "拖选中，松开复制 · "
+    } else if model.mouse_reporting {
+        "Shift拖选 · "
+    } else {
+        ""
+    };
     let history = if model.history_behind > 0 {
         format!("↑{}行 · ⇧End回底 · ", model.history_behind)
     } else {
         String::new()
     };
     if model.notice.is_empty() {
-        format!("{history}^B 菜单 · ⇧PgUp 历史 · ^B q退出")
+        let hint = if model.selecting || model.mouse_reporting {
+            ""
+        } else {
+            " · Shift拖选"
+        };
+        format!("{selection}{history}^B 菜单 · ⇧PgUp 历史{hint} · ^B q退出")
     } else if width >= 90 {
-        format!("{history}{} · ^B q退出", clean(&model.notice))
+        format!("{selection}{history}{} · ^B q退出", clean(&model.notice))
     } else {
-        format!("{history}{}", clean(&model.notice))
+        format!("{selection}{history}{}", clean(&model.notice))
     }
 }
 
-/// VT格的TAB是文本/复制标记，跳格已体现在绝对列中；Ratatui低层symbol只接受可绘制字符。
-/// 仅投影显示：控制符基格画空白、保留其组合附标，正常Unicode不复制也不改写源VT。
-fn terminal_symbol(symbol: &str) -> Cow<'_, str> {
-    if symbol.is_empty() || symbol.chars().all(char::is_control) {
-        return Cow::Borrowed(" ");
+fn highlight_selection(frame: &mut Frame<'_>, area: Rect, spans: &[selection::Span], p: Palette) {
+    let style = Style::default()
+        .fg(p.bg)
+        .bg(p.accent)
+        .remove_modifier(Modifier::REVERSED);
+    for span in spans {
+        if span.row >= area.height {
+            continue;
+        }
+        for column in span.start.min(area.width)..span.end.min(area.width) {
+            if let Some(cell) = frame
+                .buffer_mut()
+                .cell_mut((area.x + column, area.y + span.row))
+            {
+                // Keep HIDDEN and other application attributes intact. Selection
+                // changes presentation colors, never the underlying cell text.
+                cell.set_style(style);
+            }
+        }
     }
-    if !symbol.chars().any(char::is_control) {
-        return Cow::Borrowed(symbol);
-    }
-    let mut visible: String = symbol.chars().filter(|c| !c.is_control()).collect();
-    if symbol.chars().next().is_some_and(char::is_control) {
-        visible.insert(0, ' ');
-    }
-    Cow::Owned(visible)
 }
 
 fn draw_terminal(
@@ -2429,6 +2454,119 @@ mod tests {
                 })
                 .unwrap();
         }
+    }
+
+    #[test]
+    fn selection_highlight_keeps_wide_cells_and_hidden_text_attributes() {
+        let mut vt = SessionVt::new(6, 1, 0).unwrap();
+        vt.write("中\x1b[7;8mA\x1b[0mB".as_bytes());
+        for theme in [Theme::Dark, Theme::Light] {
+            let palette = theme.palette();
+            let mut terminal = Terminal::new(TestBackend::new(8, 3)).unwrap();
+            let area = Rect::new(1, 1, 4, 1);
+            terminal
+                .draw(|frame| {
+                    draw_vt_terminal(frame, area, &mut vt, palette, false);
+                    highlight_selection(
+                        frame,
+                        area,
+                        &[
+                            selection::Span {
+                                row: 0,
+                                start: 0,
+                                end: 3,
+                            },
+                            selection::Span {
+                                row: 1,
+                                start: 0,
+                                end: u16::MAX,
+                            },
+                        ],
+                        palette,
+                    );
+                    // Ratatui emits a CJK head once and skips its physical tail
+                    // in the backend diff. Check both cells in the full frame,
+                    // where the overlay must still cover the whole wide glyph.
+                    for column in 1..4 {
+                        let cell = &frame.buffer_mut()[(column, 1)];
+                        assert_eq!(cell.fg, palette.bg);
+                        assert_eq!(cell.bg, palette.accent);
+                        assert!(!cell.modifier.contains(Modifier::REVERSED));
+                    }
+                    assert!(frame.buffer_mut()[(3, 1)]
+                        .modifier
+                        .contains(Modifier::HIDDEN));
+                })
+                .unwrap();
+            let buffer = terminal.backend().buffer();
+            assert_eq!(buffer[(1, 1)].symbol(), "中");
+            assert_eq!(buffer[(2, 1)].symbol(), " ");
+            for column in [1, 3] {
+                let cell = &buffer[(column, 1)];
+                assert_eq!(cell.fg, palette.bg);
+                assert_eq!(cell.bg, palette.accent);
+                assert!(!cell.modifier.contains(Modifier::REVERSED));
+            }
+            assert!(buffer[(3, 1)].modifier.contains(Modifier::HIDDEN));
+            assert_eq!(buffer[(4, 1)].symbol(), "B");
+            assert_eq!(buffer[(4, 1)].bg, palette.bg);
+            assert_eq!(buffer[(1, 2)].bg, Color::Reset);
+            assert_eq!(vt.rows()[0].cells[2].symbol, "A");
+            assert_ne!(vt.rows()[0].cells[2].attr & vt::attr::INVISIBLE, 0);
+            assert_ne!(vt.rows()[0].cells[2].attr & vt::attr::INVERSE, 0);
+        }
+    }
+
+    #[test]
+    fn selection_highlight_clamps_to_pane_and_footer_does_not_replace_notice() {
+        let mut terminal = Terminal::new(TestBackend::new(6, 3)).unwrap();
+        let palette = Theme::Dark.palette();
+        terminal
+            .draw(|frame| {
+                highlight_selection(
+                    frame,
+                    Rect::new(1, 1, 3, 1),
+                    &[
+                        selection::Span {
+                            row: 0,
+                            start: 1,
+                            end: u16::MAX,
+                        },
+                        selection::Span {
+                            row: 0,
+                            start: 3,
+                            end: 0,
+                        },
+                    ],
+                    palette,
+                );
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        assert_eq!(buffer[(1, 1)].bg, Color::Reset);
+        assert_eq!(buffer[(2, 1)].bg, palette.accent);
+        assert_eq!(buffer[(3, 1)].bg, palette.accent);
+        assert_eq!(buffer[(4, 1)].bg, Color::Reset);
+        let mut model = Model {
+            selecting: true,
+            notice: "已有错误提示".into(),
+            selection_spans: vec![selection::Span {
+                row: 0,
+                start: 1,
+                end: 2,
+            }],
+            ..Default::default()
+        };
+        assert!(footer(&model, 100).contains("拖选中，松开复制"));
+        assert!(footer(&model, 100).contains("已有错误提示"));
+        assert_eq!(model.notice, "已有错误提示");
+        model.reset_terminal_input();
+        assert!(!model.selecting && model.selection_spans.is_empty());
+        model.mouse_reporting = true;
+        assert!(footer(&model, 100).contains("Shift拖选"));
+        assert!(footer(&model, 100).contains("已有错误提示"));
+        model.notice.clear();
+        assert!(footer(&model, 100).contains("Shift拖选"));
     }
 
     fn host(name: &str, state: HostState) -> HostItem {

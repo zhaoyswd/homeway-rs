@@ -4,6 +4,7 @@ use std::time::{Duration, Instant};
 
 use homeway_core::term::{codec, size::Size, vt};
 
+use super::selection::{Identity, Snapshot};
 use super::view::{HistoryAction, TerminalView};
 
 const CACHE_CELLS: usize = 128 * 1024;
@@ -46,6 +47,21 @@ pub(super) struct Surface {
 }
 
 impl Surface {
+    pub(super) fn selection_identity(&self) -> Option<Identity> {
+        self.ready.then_some(Identity {
+            revision: self.revision,
+            epoch: self.epoch,
+            base: self.base,
+            cols: self.cols,
+            rows: self.rows,
+            alternate: self.alternate(),
+        })
+    }
+
+    pub(super) fn selection_snapshot(&self, width: u16, height: u16) -> Option<Snapshot> {
+        Snapshot::capture(self.selection_identity()?, self.view(), width, height)
+    }
+
     pub(super) fn geometry(&self) -> (u16, u16) {
         (self.cols, self.rows)
     }
@@ -458,6 +474,39 @@ mod tests {
 
     fn text(row: &vt::Row) -> String {
         row.cells.iter().map(|cell| cell.symbol.as_str()).collect()
+    }
+
+    #[test]
+    fn selection_snapshot_freezes_only_the_displayed_pane_and_exposes_identity() {
+        let mut surface = Surface::default();
+        assert!(surface.selection_identity().is_none());
+        assert!(surface.selection_snapshot(3, 2).is_none());
+        let mut vt = vt::SessionVt::new(6, 3, 20).unwrap();
+        vt.write(b"abcdef");
+        surface.snapshot(snapshot(&mut vt, 1, 1)).unwrap();
+        surface.prepare(2);
+        let captured = surface.selection_snapshot(3, 2).unwrap();
+        let identity = captured.identity();
+        assert_eq!(captured.view().rows.len(), 2);
+        assert_eq!(captured.view().rows[0].cells.len(), 3);
+        assert_eq!(text(&captured.view().rows[0]), "abc");
+        assert!(captured.view().cursor.is_none());
+        vt.write(b"\rXYZ");
+        assert!(surface.diff(diff(&mut vt, 2, 1)).unwrap());
+        surface.prepare(2);
+        assert_eq!(surface.selection_identity(), Some(identity));
+        assert_eq!(text(&captured.view().rows[0]), "abc");
+        assert!(text(&surface.view().rows[0]).starts_with("XYZ"));
+        vt.resize(8, 3).unwrap();
+        surface.snapshot(snapshot(&mut vt, 3, 2)).unwrap();
+        assert_ne!(surface.selection_identity(), Some(identity));
+        let primary = surface.selection_identity().unwrap();
+        vt.write(b"\x1b[?1049h");
+        surface.snapshot(snapshot(&mut vt, 4, 2)).unwrap();
+        assert!(surface.selection_identity().unwrap().alternate);
+        assert_ne!(surface.selection_identity(), Some(primary));
+        assert!(!surface.diff(diff(&mut vt, 6, 2)).unwrap());
+        assert!(surface.selection_identity().is_none());
     }
 
     #[test]

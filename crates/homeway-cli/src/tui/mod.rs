@@ -3,6 +3,7 @@ mod appearance;
 mod backend;
 mod clipboard;
 mod input;
+mod selection;
 mod surface;
 mod terminal;
 mod transport;
@@ -18,7 +19,7 @@ use homeway_core::term::{
     codec,
     frames::{self, Op},
 };
-use ratatui::{backend::CrosstermBackend, Terminal};
+use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
 
 use backend::{Backend, Command, Target};
 use view::{Action, Model};
@@ -113,17 +114,24 @@ fn run(options: Options) -> Result<(), Error> {
             app.render_dirty = true;
         }
         if app.render_dirty {
+            app.validate_selection(geometry.terminal);
             app.model.terminal_present = app.active_session.is_some();
             app.model.terminal_close = app.terminal_close_target();
             if let Some(surface) = &mut app.surface {
                 surface.prepare(app.size.1);
             }
             terminal.draw(|frame| {
-                geometry = view::draw(
-                    frame,
-                    &mut app.model,
-                    app.surface.as_ref().map(surface::Surface::view),
-                );
+                app.model.selecting = app.selection.is_some();
+                app.model.selection_spans = app
+                    .selection
+                    .as_ref()
+                    .map_or_else(Vec::new, |drag| drag.value.spans());
+                let displayed = app
+                    .selection
+                    .as_ref()
+                    .map(|drag| drag.value.snapshot().view())
+                    .or_else(|| app.surface.as_ref().map(surface::Surface::view));
+                geometry = view::draw(frame, &mut app.model, displayed);
             })?;
             app.render_dirty = false;
         }
@@ -138,6 +146,9 @@ fn run(options: Options) -> Result<(), Error> {
                 appearance.focus_gained(Instant::now());
             }
             app.render_dirty = true;
+            if app.selection_event(&event, &geometry)? {
+                continue;
+            }
             let focused = app.model.focus == view::Focus::Terminal && !app.model.modal_open();
             if let Event::FocusGained | Event::FocusLost = event {
                 if app
@@ -180,6 +191,10 @@ struct App {
     active_session: Option<String>,
     create_pending: bool,
     close_pending: Option<ClosingSession>,
+    selection: Option<DragSelection>,
+    local_left: bool,
+    selection_copy: Option<SelectionCopy>,
+    selection_copy_ticket: u64,
     operation_fact: Option<OperationFact>,
     operation_id: u64,
     operation_warning: Option<(backend::Confirmation, String)>,
@@ -214,6 +229,26 @@ struct ClosingSession {
     name: String,
 }
 
+struct SelectionContext {
+    generation: u64,
+    target: Target,
+    name: String,
+    identity: selection::Identity,
+    pane: Rect,
+}
+
+struct DragSelection {
+    value: selection::Selection,
+    context: SelectionContext,
+}
+
+struct SelectionCopy {
+    ticket: u64,
+    operation: u64,
+    notice: String,
+    context: SelectionContext,
+}
+
 struct InputGeometry {
     size: (u16, u16),
     requested: Option<Instant>,
@@ -235,6 +270,10 @@ impl App {
             active_session: None,
             create_pending: false,
             close_pending: None,
+            selection: None,
+            local_left: false,
+            selection_copy: None,
+            selection_copy_ticket: 0,
             operation_fact: None,
             operation_id: 0,
             operation_warning: None,
@@ -285,10 +324,195 @@ impl App {
             })
     }
 
+    fn selection_context_matches(&self, context: &SelectionContext) -> bool {
+        self.generation == context.generation
+            && self.target() == context.target
+            && self.active_session.as_deref() == Some(context.name.as_str())
+            && self.selected_name().as_deref() == Some(context.name.as_str())
+            && self
+                .surface
+                .as_ref()
+                .and_then(surface::Surface::selection_identity)
+                == Some(context.identity)
+            && self.size == (context.pane.width, context.pane.height)
+    }
+
+    fn cancel_selection(&mut self) {
+        self.selection_copy = None;
+        if self.selection.take().is_some() {
+            self.render_dirty = true;
+        }
+        self.model.selecting = false;
+        self.model.selection_spans.clear();
+        // Keep local_left until its release; cancellation must not leak an Up.
+    }
+
+    fn validate_selection(&mut self, pane: Rect) {
+        if self.selection.as_ref().is_some_and(|drag| {
+            drag.context.pane != pane || !self.selection_context_matches(&drag.context)
+        }) {
+            self.cancel_selection();
+        }
+    }
+
+    fn selection_point(mouse: crossterm::event::MouseEvent, pane: Rect) -> selection::Point {
+        selection::Point {
+            column: mouse
+                .column
+                .saturating_sub(pane.x)
+                .min(pane.width.saturating_sub(1)),
+            row: mouse
+                .row
+                .saturating_sub(pane.y)
+                .min(pane.height.saturating_sub(1)),
+        }
+    }
+
+    fn selection_event(&mut self, event: &Event, geometry: &view::Geometry) -> Result<bool, Error> {
+        use crossterm::event::{KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind};
+        match event {
+            Event::Resize(_, _) | Event::FocusLost => self.cancel_selection(),
+            Event::Paste(_) => self.cancel_selection(),
+            Event::Key(key)
+                if key.kind != KeyEventKind::Release
+                    && !matches!(key.code, KeyCode::Modifier(_)) =>
+            {
+                let selecting = self.selection.is_some();
+                self.cancel_selection();
+                if selecting && key.code == KeyCode::Esc {
+                    return Ok(true);
+                }
+            }
+            _ => {}
+        }
+        let Event::Mouse(mouse) = event else {
+            return Ok(false);
+        };
+        if matches!(mouse.kind, MouseEventKind::Down(_)) {
+            self.selection_copy = None;
+        }
+        self.validate_selection(geometry.terminal);
+        if self.local_left {
+            match mouse.kind {
+                MouseEventKind::Drag(MouseButton::Left) | MouseEventKind::Up(MouseButton::Left) => {
+                    let point = Self::selection_point(*mouse, geometry.terminal);
+                    if self
+                        .selection
+                        .as_mut()
+                        .is_some_and(|drag| drag.value.update(point).is_err())
+                    {
+                        self.cancel_selection();
+                    }
+                    if matches!(mouse.kind, MouseEventKind::Up(_)) {
+                        self.local_left = false;
+                        if let Some(drag) = self.selection.take() {
+                            self.model.selecting = false;
+                            self.model.selection_spans.clear();
+                            if self.selection_context_matches(&drag.context) {
+                                match drag.value.text(clipboard::MAX_BYTES) {
+                                    Ok(Some(value)) => {
+                                        self.selection_copy_ticket =
+                                            self.selection_copy_ticket.wrapping_add(1);
+                                        let ticket = self.selection_copy_ticket;
+                                        self.selection_copy = Some(SelectionCopy {
+                                            ticket,
+                                            operation: self.operation_id,
+                                            notice: self.model.notice.clone(),
+                                            context: drag.context,
+                                        });
+                                        if let Err(error) =
+                                            self.clipboard.copy_selection(value, ticket)
+                                        {
+                                            self.selection_copy = None;
+                                            self.model.notice =
+                                                format!("复制失败：{error}，请重新拖选");
+                                        }
+                                    }
+                                    Ok(None) => {}
+                                    Err(error) => self.model.notice = error.to_string(),
+                                }
+                            }
+                        }
+                    }
+                    self.render_dirty = true;
+                    return Ok(true);
+                }
+                MouseEventKind::Down(MouseButton::Left) => {
+                    self.cancel_selection();
+                    self.local_left = false;
+                }
+                MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => self.cancel_selection(),
+                _ => return Ok(true),
+            }
+        }
+        if let MouseEventKind::Drag(button) | MouseEventKind::Up(button) = mouse.kind {
+            if self.mouse_pressed.contains(&button) {
+                let pane = geometry.terminal;
+                if pane.width > 0 && pane.height > 0 {
+                    let point = Self::selection_point(*mouse, pane);
+                    let mut relative = *mouse;
+                    relative.column = point.column;
+                    relative.row = point.row;
+                    self.action(Action::TerminalMouse(relative))?;
+                }
+                return Ok(true);
+            }
+        }
+        let pane = geometry.terminal;
+        let inside = pane.width > 0
+            && pane.height > 0
+            && mouse.column >= pane.x
+            && mouse.column < pane.right()
+            && mouse.row >= pane.y
+            && mouse.row < pane.bottom();
+        if mouse.kind == MouseEventKind::Down(MouseButton::Left)
+            && inside
+            && !self.model.modal_open()
+            && !self.mouse_pressed.contains(&MouseButton::Left)
+        {
+            if let Some(surface) = self.surface.as_ref().filter(|surface| surface.ready) {
+                if let Some(name) = self.selected_name().filter(|name| {
+                    Some(name) == self.active_session.as_ref()
+                        && (!surface.view().mouse_reporting
+                            || mouse.modifiers.contains(KeyModifiers::SHIFT))
+                }) {
+                    self.selection_copy = None;
+                    self.model.focus = view::Focus::Terminal;
+                    self.local_left = true;
+                    let point = Self::selection_point(*mouse, pane);
+                    if point.column < surface.geometry().0
+                        && usize::from(point.row) < surface.view().rows.len()
+                    {
+                        if let Some(snapshot) = surface.selection_snapshot(pane.width, pane.height)
+                        {
+                            let identity = snapshot.identity();
+                            if let Ok(value) = selection::Selection::begin(snapshot, point) {
+                                self.selection = Some(DragSelection {
+                                    value,
+                                    context: SelectionContext {
+                                        generation: self.generation,
+                                        target: self.target(),
+                                        name,
+                                        identity,
+                                        pane,
+                                    },
+                                });
+                            }
+                        }
+                    }
+                    self.render_dirty = true;
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     fn command(&mut self, command: Command) -> bool {
         match self.backend.send(command) {
             Ok(()) => true,
             Err(error) => {
+                self.selection_copy = None;
                 self.model.notice = error.to_string();
                 self.render_dirty = true;
                 false
@@ -318,6 +542,7 @@ impl App {
     }
 
     fn detach(&mut self) {
+        self.cancel_selection();
         self.input_geometry = None;
         self.sent_theme = None;
         self.mouse_pressed.clear();
@@ -339,6 +564,7 @@ impl App {
     }
 
     fn disconnect(&mut self) {
+        self.cancel_selection();
         self.input_geometry = None;
         self.sent_theme = None;
         self.mouse_pressed.clear();
@@ -353,6 +579,7 @@ impl App {
     }
 
     fn clear_operation(&mut self) {
+        self.selection_copy = None;
         self.operation_id = self.operation_id.wrapping_add(1);
         self.operation_fact = None;
         self.operation_warning = None;
@@ -408,6 +635,14 @@ impl App {
     }
 
     fn backend_event(&mut self, event: backend::Event) {
+        // Passive successful polls keep a copy's ownership. Any new result or
+        // error invalidates it even when the replacement notice has equal text.
+        if !matches!(
+            &event,
+            backend::Event::Snapshot(_) | backend::Event::Sessions { result: Ok(_), .. }
+        ) {
+            self.selection_copy = None;
+        }
         self.render_dirty = true;
         match event {
             backend::Event::SessionClosed {
@@ -472,6 +707,7 @@ impl App {
                         *confirmation == backend::Confirmation::Snapshot
                     })
                 {
+                    self.selection_copy = None;
                     self.operation_warning = None;
                     self.model.notice = self
                         .operation_fact
@@ -514,6 +750,7 @@ impl App {
                                 *confirmation == backend::Confirmation::Sessions(target.clone())
                             })
                         {
+                            self.selection_copy = None;
                             self.operation_warning = None;
                             self.model.notice = self
                                 .operation_fact
@@ -746,6 +983,7 @@ impl App {
                     self.model.terminal_title = title;
                 }
                 if initial {
+                    self.selection_copy = None;
                     self.model.notice = "已接入 · 滚轮浏览历史".into();
                     if self.model.focus == view::Focus::Terminal && surface.focus_events() {
                         focus = true;
@@ -761,6 +999,7 @@ impl App {
                 self.mouse_pressed.clear();
                 self.input_geometry = None;
                 self.snapshot_request = None;
+                self.selection_copy = None;
                 self.model.notice = "正在同步终端画面…".into();
             }
         } else {
@@ -804,6 +1043,7 @@ impl App {
             if let Err(error) = attach.fetch_rows(request) {
                 surface.fetch_failed();
                 if !matches!(error, backend::Error::Busy) {
+                    self.selection_copy = None;
                     self.model.notice = error.to_string();
                 }
             }
@@ -872,6 +1112,31 @@ impl App {
 
     fn clipboard_result(&mut self, result: clipboard::CopyResult) -> Result<(), Error> {
         self.render_dirty = true;
+        if result.purpose == clipboard::Purpose::Selection {
+            let Some(copy) = self
+                .selection_copy
+                .as_ref()
+                .filter(|copy| copy.ticket == result.operation)
+            else {
+                return Ok(());
+            };
+            let owned = copy.operation == self.operation_id
+                && copy.notice == self.model.notice
+                && self.selection_context_matches(&copy.context);
+            self.selection_copy = None;
+            if owned {
+                self.model.notice = match result.status {
+                    clipboard::Copied::System => "选中内容已复制到系统剪贴板".into(),
+                    clipboard::Copied::Terminal(sequence) => {
+                        io::stdout().write_all(sequence.as_bytes())?;
+                        io::stdout().flush()?;
+                        "已提交终端剪贴板请求".into()
+                    }
+                    clipboard::Copied::Failed(error) => format!("复制失败：{error}，请重新拖选"),
+                };
+            }
+            return Ok(());
+        }
         let status = match result.status {
             clipboard::Copied::System => "已复制到系统剪贴板".into(),
             clipboard::Copied::Terminal(sequence) => {
@@ -897,6 +1162,7 @@ impl App {
         }
         let bytes = frames::enc_input(&event);
         if self.input_bytes + bytes.len() > 2 << 20 {
+            self.selection_copy = None;
             self.model.notice = "输入队列已满，请等待远端接收后重试".into();
             return;
         }
@@ -972,6 +1238,9 @@ impl App {
     }
 
     fn resize(&mut self, cols: u16, rows: u16) {
+        if self.size != (cols, rows) {
+            self.cancel_selection();
+        }
         if cols == 0 || rows == 0 {
             self.input_geometry = None;
             self.size = (0, 0);
@@ -997,6 +1266,7 @@ impl App {
                 Ok(()) => self.sent_size = Some((cols, rows)),
                 Err(backend::Error::Busy) => {} // 同尺寸下一拍重试，不能把队列满当成已同步。
                 Err(error) => {
+                    self.selection_copy = None;
                     self.model.notice = error.to_string();
                     self.connected = false;
                 }
@@ -1137,6 +1407,10 @@ impl App {
                     }
                     _ => false,
                 };
+                if matches!(event.kind, MouseEventKind::Up(_) | MouseEventKind::Drag(_)) && !paired
+                {
+                    return Ok(false);
+                }
                 let activating = matches!(
                     event.kind,
                     MouseEventKind::Down(_) | MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
@@ -1316,6 +1590,266 @@ mod tests {
         app.model.focus = view::Focus::Terminal;
         app.model.notice = "已接入".into();
         app
+    }
+
+    fn selection_app() -> (App, view::Geometry) {
+        let mut app = history_app();
+        app.connected = true;
+        app.surface.as_mut().unwrap().prepare(app.size.1);
+        let mut geometry = view::Geometry::default();
+        geometry.terminal = Rect::new(30, 1, 66, 27);
+        (app, geometry)
+    }
+
+    fn left(kind: crossterm::event::MouseEventKind, x: u16, y: u16, shift: bool) -> Event {
+        Event::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: if shift {
+                crossterm::event::KeyModifiers::SHIFT
+            } else {
+                crossterm::event::KeyModifiers::NONE
+            },
+        })
+    }
+
+    #[test]
+    fn local_selection_click_freeze_and_cancellation_never_send_input() {
+        use crossterm::event::{
+            MouseButton::Left,
+            MouseEventKind::{Down, Drag, Up},
+        };
+        let (mut app, geometry) = selection_app();
+        let notice = app.model.notice.clone();
+        app.model.focus = view::Focus::Sessions;
+        assert!(app
+            .selection_event(&left(Down(Left), 30, 1, false), &geometry)
+            .unwrap());
+        assert!(app
+            .selection_event(&left(Up(Left), 30, 1, false), &geometry)
+            .unwrap());
+        assert_eq!(app.model.focus, view::Focus::Terminal);
+        assert!(
+            app.selection_copy.is_none(),
+            "a click must not request a clipboard write"
+        );
+        assert!(app
+            .selection_event(&left(Down(Left), 30, 1, false), &geometry)
+            .unwrap());
+        app.selection_event(&left(Drag(Left), 37, 1, true), &geometry)
+            .unwrap();
+        let text = app
+            .selection
+            .as_ref()
+            .unwrap()
+            .value
+            .text(clipboard::MAX_BYTES)
+            .unwrap();
+        assert!(text.as_ref().is_some_and(|text| text.starts_with("LINE_")));
+        // Passive output can move the live viewport without changing the frozen rows.
+        app.surface
+            .as_mut()
+            .unwrap()
+            .scroll(view::HistoryAction::Start, 27);
+        app.surface.as_mut().unwrap().prepare(27);
+        assert_eq!(
+            app.selection
+                .as_ref()
+                .unwrap()
+                .value
+                .text(clipboard::MAX_BYTES)
+                .unwrap()
+                .as_deref(),
+            text.as_deref()
+        );
+        app.selection_event(&Event::Resize(80, 24), &geometry)
+            .unwrap();
+        assert!(app.selection.is_none());
+        assert!(
+            app.selection_event(&left(Up(Left), 200, 200, false), &geometry)
+                .unwrap(),
+            "cancelled local release stays local outside the pane"
+        );
+        assert!(!app.local_left);
+        assert!(app.input_queue.is_empty());
+        assert!(app.input_geometry.is_none());
+        assert_eq!(app.model.notice, notice);
+    }
+
+    #[test]
+    fn local_release_copies_exact_frozen_text_without_activating_observer() {
+        use crossterm::event::{
+            MouseButton::Left,
+            MouseEventKind::{Down, Drag, Up},
+        };
+        let (mut app, geometry) = selection_app();
+        let (clipboard, recorded) = clipboard::Clipboard::recording();
+        app.clipboard = clipboard;
+        let notice = app.model.notice.clone();
+        app.selection_event(&left(Down(Left), 30, 1, false), &geometry)
+            .unwrap();
+        app.selection_event(&left(Drag(Left), 37, 1, false), &geometry)
+            .unwrap();
+        let expected = app
+            .selection
+            .as_ref()
+            .unwrap()
+            .value
+            .text(clipboard::MAX_BYTES)
+            .unwrap()
+            .unwrap();
+        app.selection_event(&left(Up(Left), 37, 1, false), &geometry)
+            .unwrap();
+        let (actual, ticket) = recorded.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(actual, expected);
+        assert_eq!(ticket, app.selection_copy.as_ref().unwrap().ticket);
+        assert!(app.selection.is_none());
+        assert!(!app.local_left);
+        assert!(app.input_queue.is_empty());
+        assert!(
+            app.input_geometry.is_none(),
+            "copy never activates an observer's pane geometry"
+        );
+        assert_eq!(
+            app.model.notice, notice,
+            "requesting a copy does not create a sticky progress notice"
+        );
+    }
+
+    #[test]
+    fn application_mouse_route_is_locked_at_press_and_shift_can_start_local() {
+        use crossterm::event::{
+            MouseButton::Left,
+            MouseEventKind::{Down, Drag, Up},
+        };
+        let (mut app, geometry) = selection_app();
+        let mut vt = homeway_core::term::vt::SessionVt::new(66, 27, 0).unwrap();
+        vt.write(b"\x1b[?1000h\x1b[?1006h");
+        app.surface.as_mut().unwrap().modes = codec::surface_modes_of(&vt.modes()).0;
+        let down = left(Down(Left), 32, 4, false);
+        assert!(!app.selection_event(&down, &geometry).unwrap());
+        let Event::Mouse(mut mouse) = down else {
+            unreachable!()
+        };
+        mouse.column -= geometry.terminal.x;
+        mouse.row -= geometry.terminal.y;
+        app.action(Action::TerminalMouse(mouse)).unwrap();
+        assert!(app
+            .selection_event(&left(Drag(Left), 200, 100, true), &geometry)
+            .unwrap());
+        assert!(app
+            .selection_event(&left(Up(Left), 200, 100, true), &geometry)
+            .unwrap());
+        assert_eq!(app.input_queue.len(), 3);
+        assert!(app.mouse_pressed.is_empty());
+        assert!(app.selection.is_none());
+        let queued = app.input_queue.len();
+        assert!(app
+            .selection_event(&left(Down(Left), 32, 4, true), &geometry)
+            .unwrap());
+        app.selection_event(&left(Drag(Left), 36, 4, false), &geometry)
+            .unwrap();
+        assert!(
+            app.selection.is_some(),
+            "modifier changes cannot transfer a local gesture to the application"
+        );
+        app.cancel_selection();
+        assert!(app
+            .selection_event(&left(Up(Left), 200, 100, false), &geometry)
+            .unwrap());
+        assert_eq!(app.input_queue.len(), queued);
+    }
+
+    fn pending_selection_copy(app: &mut App, geometry: &view::Geometry, ticket: u64) {
+        app.selection_copy = Some(SelectionCopy {
+            ticket,
+            operation: app.operation_id,
+            notice: app.model.notice.clone(),
+            context: SelectionContext {
+                generation: app.generation,
+                target: app.target(),
+                name: app.active_session.clone().unwrap(),
+                identity: app.surface.as_ref().unwrap().selection_identity().unwrap(),
+                pane: geometry.terminal,
+            },
+        });
+    }
+
+    #[test]
+    fn selection_clipboard_result_requires_current_context_and_notice_owner() {
+        let (mut app, geometry) = selection_app();
+        pending_selection_copy(&mut app, &geometry, 1);
+        app.clipboard_result(clipboard::CopyResult {
+            operation: 1,
+            purpose: clipboard::Purpose::Selection,
+            fact: "unused".into(),
+            status: clipboard::Copied::System,
+        })
+        .unwrap();
+        assert_eq!(app.model.notice, "选中内容已复制到系统剪贴板");
+        pending_selection_copy(&mut app, &geometry, 2);
+        app.backend_event(backend::Event::Notice {
+            message: app.model.notice.clone(),
+            clipboard: None,
+            confirmation: backend::Confirmation::None,
+        });
+        assert!(
+            app.selection_copy.is_none(),
+            "a new same-text notice still owns a new result"
+        );
+        app.clipboard_result(clipboard::CopyResult {
+            operation: 2,
+            purpose: clipboard::Purpose::Selection,
+            fact: "unused".into(),
+            status: clipboard::Copied::Terminal("MUST_NOT_WRITE".into()),
+        })
+        .unwrap();
+        assert_eq!(app.model.notice, "选中内容已复制到系统剪贴板");
+        pending_selection_copy(&mut app, &geometry, 3);
+        app.detach();
+        let notice = app.model.notice.clone();
+        app.clipboard_result(clipboard::CopyResult {
+            operation: 3,
+            purpose: clipboard::Purpose::Selection,
+            fact: "unused".into(),
+            status: clipboard::Copied::System,
+        })
+        .unwrap();
+        assert_eq!(app.model.notice, notice);
+    }
+
+    #[test]
+    fn same_text_error_and_new_mouse_down_invalidate_pending_selection_copy() {
+        let (mut app, geometry) = selection_app();
+        app.model.notice = backend::Error::Busy.to_string();
+        pending_selection_copy(&mut app, &geometry, 1);
+        app.backend_event(backend::Event::Failed(backend::Error::Busy));
+        let notice = app.model.notice.clone();
+        app.clipboard_result(clipboard::CopyResult {
+            operation: 1,
+            purpose: clipboard::Purpose::Selection,
+            fact: String::new(),
+            status: clipboard::Copied::System,
+        })
+        .unwrap();
+        assert_eq!(app.model.notice, notice);
+        pending_selection_copy(&mut app, &geometry, 2);
+        assert!(!app
+            .selection_event(
+                &left(
+                    crossterm::event::MouseEventKind::Down(crossterm::event::MouseButton::Left),
+                    1,
+                    1,
+                    false
+                ),
+                &geometry
+            )
+            .unwrap());
+        assert!(
+            app.selection_copy.is_none(),
+            "even a non-terminal click owns a newer interaction"
+        );
     }
 
     #[test]
@@ -1719,6 +2253,7 @@ mod tests {
             confirmation: backend::Confirmation::Sessions(Target::Local),
         });
         app.clipboard_result(clipboard::CopyResult {
+            purpose: clipboard::Purpose::Operation,
             operation: previous,
             fact: "出口已启动".into(),
             status: clipboard::Copied::System,
@@ -1737,6 +2272,7 @@ mod tests {
         });
         app.backend_event(backend::Event::RefreshFailed(backend::Error::Timeout));
         app.clipboard_result(clipboard::CopyResult {
+            purpose: clipboard::Purpose::Operation,
             operation: app.operation_id,
             fact: "出口已启动".into(),
             status: clipboard::Copied::System,
@@ -1760,6 +2296,7 @@ mod tests {
         let previous = app.operation_id;
         app.term_error(&frames::enc_error("bad_input", "另一个客户端正在粘贴"));
         app.clipboard_result(clipboard::CopyResult {
+            purpose: clipboard::Purpose::Operation,
             operation: previous,
             fact: "出口已启动".into(),
             status: clipboard::Copied::System,
@@ -1814,6 +2351,7 @@ mod tests {
             error: backend::Error::Timeout,
         });
         app.clipboard_result(clipboard::CopyResult {
+            purpose: clipboard::Purpose::Operation,
             operation: previous,
             fact: "出口已启动".into(),
             status: clipboard::Copied::System,
