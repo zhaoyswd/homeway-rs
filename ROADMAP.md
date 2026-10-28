@@ -72,6 +72,14 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-10-28 本项目Codex权限对齐tier（完成，重开项目会话后加载）**：按用户明确要求
+> 新建`.codex/config.toml`，sandbox_mode=danger-full-access、approval_policy=on-request、
+> approvals_reviewer=auto_review三项与tier一致；workspace-write fallback反向指向同级tier。
+> 两项目既有trusted已核，无全局或tier配置改动。独立技术/代码门通过，实际落盘SHA
+> `6aec281c…82647a35`与审定件一致，tomllib比对/相对路径/CLI0.164.0解析检查通过。
+> 当前线程仍受原启动权限约束，不声称热切生效；不涉及homeway编译、部署或服务重启。
+> 生效范围及验证见`docs/reviews/2026-10-28-codex-project-permissions.md`。
+
 > **2026-10-28 TUI blocking 主动通知（完成，本机debug已更新）**：当前主机会话进入
 > blocked时通知原主机/会话名称，首次成功列表建基线不补历史；持续不重复，恢复再入可重报。
 > 稳定Target/session/PID比较，成功列表/主机快照回收缺失项，错误/陈旧包不清基线。

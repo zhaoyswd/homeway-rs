@@ -1,0 +1,8 @@
+# 本项目的 Codex 权限配置；仅在项目受信任时加载，重新开启会话后生效。
+sandbox_mode = "danger-full-access"
+approval_policy = "on-request"
+approvals_reviewer = "auto_review"
+
+# 若显式切换为 workspace-write，允许关联仓库写入；相对路径以本文件所在 .codex/ 为基准。
+[sandbox_workspace_write]
+writable_roots = ["../../tier"]
