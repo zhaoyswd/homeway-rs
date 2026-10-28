@@ -261,3 +261,64 @@ root实际提交并推送发布准备`19876125ee02a6d5dd61e21026d5d72f11955399`�
 root实际重新运行workspace **1447/0、40 ignored，exit0**，workspace全targets clippy
 exit0；旧关闭用例独立串行16/16通过，仅作该批未复现证据，不宣称KILL候选已修。
 版本与部署工件保持冻结，随后另提交test-only修正，重新运行GitHub完整门后才能打tag。
+
+## GitHub通过、公开Release与官方件
+
+root提交并推送test-only修正`bc57b2de607d89903ac5da0e82d722de96c35c2d`。
+[CI40702069099](https://github.com/zhaoyswd/homeway-rs/actions/runs/40702069099)实际全success，
+含macOS/Ubuntu完整测试、clippy、OHOS/双musl/Windows check与隔离门；未删改原首红记录。
+工作区干净、HEAD=origin/main=bc57b2d后唯一创建并推送annotated tag v0.3.23。
+[Release40702917361](https://github.com/zhaoyswd/homeway-rs/actions/runs/40702917361)五平台
+build及最终release全success，期间未推进main。
+
+公开[v0.3.23](https://github.com/zhaoyswd/homeway-rs/releases/tag/v0.3.23)发布时间
+2026-10-28 14:13:37 UTC，非draft/非prerelease，五平台归档及SHA256SUMS附件齐全。
+root在Mac下载两实际部署架构的原始归档和SUMS，逐一核SHA、唯一常规homeway成员后
+提取；Mac arm64/codesign strict/准确版本、Linux x86_64 static-pie属性均通过。
+校验表SHA256为`c6e3218611255c3a64cd6566237aeec0d0e5390ef757f2734146c4fd5a7802b5`。
+
+| 官方目标 | 归档SHA256 | 二进制SHA256 | 大小 |
+|---|---|---|---|
+| darwin-arm64 | `c97a2cbd7d7ad4dc21b697c86a7ddf55d629780aa6a10d2f6d7772d68c2a86bb` | `66831ecc79c93723846eb6e9b693129a06d2c4380d0ee3516614b4233c11c929` | 8,996,744B |
+| linux-amd64 | `9d291282d88799b352c74487f3f2b3e4a26f99225ab5f25d57bb793bb0d8ca0a` | `126cbbddd4d1ff0ceb76c7920685d83d03ca6de254f3d03bbf8670564816b1e9` | 10,909,856B |
+
+同一官方Mac件实际本地TUI **23PASS/exit0**、选区复制 **7PASS/exit0**，原日志与截图在
+`/tmp/homeway-v0.3.23-official/`。远程TUI首轮 **0PASS/exit1**，等待HW_REMOTE_SHELL
+超时、截图仅有prompt，原remote-smoke.log保留；不能因其它烟囱通过而省略这项失败。
+只读/purefake调查证实工具的泛化terminal_ready可把居中弹窗文字或旧prompt误当就绪，
+原host阶段也可命中dialog输入文字且依赖固定0.2秒。此为已证谓词漏洞，本轮到底在哪个
+节点早判尚无原始逐帧证据；仅修工具同步后再实跑，不猜改或重签已发布产品。
+
+Linux件和Mac件分别由本机scp到云/71私有stage，远端逐一复算二进制/归档/SUMS/已审
+脚本SHA一致，71额外strict签名和v0.3.23准确版本通过，私有配置均0600，不传本机
+私有RESUME。云官方件真实私有smoke **PASS/exit0、4项**，回执
+`/tmp/hw23-linux-smoke-vkodvwgx/receipt.json`；准入/path probe和3轮QUIC共享LIST、
+INPUT/surface/resize/KILL(-2)/进程与PTY回收均过。root随后独立读回执确认自有进程全部
+退出，正式4项critical前后摘要/大小完整一致且追加0B。此阶段尚未prepare/activation。
+
+## 官方远程复验完成与切换检查点
+
+工具的同步漏洞按独立两门仅修`tools/tui-remote-smoke.py`，最终SHA
+`cab07f0578e74a556f60055566bfe4ccaec85b4b49a58f918dede037113cd506`。只用当前frame的
+精确目标host/selected/online、权威新session与精确title/输入cursor作屏障，原15/25秒
+窗口不增加、首marker只输入一次，并查精确文件字节与当前screen双证据。产品、版本与
+共享helper不变，作者pure42+2与非作者pure29例分列，不混作实际运行。
+
+root使用原66831官方件单次实际复验 **8PASS/exit0**，日志
+`/tmp/homeway-v0.3.23-official/remote-smoke-sync-r1.log`。原0PASS日志保留，未宣称
+原始具体早判节点已因果证明。完整两门与运行证据见
+[`2026-10-28-tui-remote-smoke-sync.md`](2026-10-28-tui-remote-smoke-sync.md)。至此同件
+私有门为Mac本地23/远程8/选区7 PASS、Linux4 PASS，全部实际exit0。
+
+验证完成后，root实际执行三目标prepare均exit0，并另读持久receipt确认PREPARED、
+activation_started=false。二进制与state/身份已备份，三目标均尚未信号/换件：
+
+| 目标 | 持久receipt | 原PID | 官方新SHA前缀 |
+|---|---|---|---|
+| 本机Mac | `~/homeway-rollback/release-v0.3.23-20261028-r1/receipt.json` | 46739 | 66831ecc |
+| 阿里云 | `/root/homeway-rollback/release-v0.3.23-20261028-r1/receipt.json` | 1723928 | 126cbbdd |
+| LAN71 | `~/homeway-rollback/release-v0.3.23-lan71-20261028-r1/receipt.json` | 83724 | 66831ecc |
+
+当前Codex恢复命令已向用户交付，本机私有RESUME另存Mac持久备份0600，不进入公开仓
+或上传云/71。先阿里云、再71、最后本机；每目标唯一激活，断线先读对应receipt，不盲目
+重启或解压state覆盖当前资料。后续真实切换/独立验收结果据实追加。

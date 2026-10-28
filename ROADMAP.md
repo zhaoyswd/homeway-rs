@@ -72,7 +72,7 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
-> **2026-10-28 v0.3.23 提交/发版/部署（进行中）**：用户明确授权本轮完整链路，发布
+> **2026-10-28 v0.3.23 提交/发版/部署（已发布，三目标已备份待切换）**：用户明确授权本轮完整链路，发布
 > 14cf217的左侧对齐、Ctrl+B主提示与居中指令弹窗。版本/Cargo锁定四自有包及新CHANGELOG
 > 已独立两门冻结，core/wire/NAPI产品行为不变。完整本地quick门实际exit0：顶层1447/0、
 > 40ignored，clippy/OHOScheck/真link及全部源码/向量等门通过，私有RRR316秒、100MB
@@ -88,7 +88,14 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 > 已留证并停止盲目重跑；独立两门仅修cfgtest预算夹具并补帧序列诊断，产品不变。
 > root新workspace1447/0、40ignored与全targetsclippy通过，sentinel串行16/16未复现；
 > 首并行探针3/1目录创建失败留证，不误记KILL复现。接着推test-only修正再跑CI，未打tag、
-> 无生产写入，证据见
+> 无生产写入。test-only bc57b2d新CI40702069099全success后在main头创建tag，五平台
+> Release40702917361全success，v0.3.23已公开。官方下载/SUMS/架构/签名/版本核验过；
+> Mac官方66831ecc件本地23PASS/选区7PASS，Linux126cbbdd件私有4PASS。Mac远程烟囱
+> 首轮0PASS等待marker超时留证；已证泛化就绪谓词可被居中弹窗/旧prompt误触发，正按
+> 工具独立两门补目标/当前frame同步后，同官方件单次实际8PASS/exit0；原0PASS保留且
+> 未归因具体历史节点、未动已发产品。三个目标官方件及配置已传stage且摘要一致，
+> prepare均实际exit0、持久receipt均PREPARED/activation_started=false，已备份旧件与
+> 身份。当前恢复命令已私下交付，先云再71最后本机，唯一激活/先查receipt再恢复。证据见
 > `docs/reviews/2026-10-28-tui-command-dialog-release.md`。
 
 > **2026-10-28 TUI 空态/底栏对齐与快捷指令居中（完成，本地调试件）**：会话空态描述及
