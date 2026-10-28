@@ -1321,3 +1321,20 @@ features0xff、hello_sent=false。第二个独立SSH确认PID83724仍活、PPID1
 进程/角色/控制面/被动能力与字节保全验收，未新建生产PTY。本机现役/阿里云未动。
 双门、信号继承整改及完整证据见
 [`2026-10-28-tui-debug-lan71-deploy.md`](reviews/2026-10-28-tui-debug-lan71-deploy.md)。
+
+### 13.22 v0.3.22 官方 TUI 发布与双出口更新（2026-10-28，进行中）
+
+用户授权合入main、提交/推送/发版/部署。发布提交36d7ec8先快进并推main，主分支
+CI40659058316全绿，再在origin/main头打tag v0.3.22；Release40660481250五目标及发布
+job全绿，官方附件齐全。本机下载SHA256SUMS校验后，Mac官方件私有TUI23PASS/远程
+8PASS/复制7PASS，Linux官方件由本机scp后复核，私有QUIC与3轮终端生命周期4PASS。
+前置失败与最小测试脚本修正均保留在发布记录，不将静态门替代实际官方同件验证。
+
+阿里云已完成：持久备份`/root/homeway-rollback/release-v0.3.22-20261028-r1/`，
+receipt **SUCCESS**，17.013秒、未回退，PID1703776→1723928，零参正式路径
+`/usr/local/bin/homeway`、默认state，官方Linuxamd64完整SHA256
+`4416735b71700d3af25662dc847cdba19053f721d244de21559acc49f9f220b5`。
+独立SSH再核版本v0.3.22、serve/relay运行、UDP41641和UDP/TCP41741，config/出口及
+中继身份/凭证原字节保全。Mac备份已PREPARED，尚未激活独立launchd任务；LAN71 SSH22
+本轮超时未写。完整门、官方归档SHA、两道评审与恢复指针见
+[`2026-10-28-tui-release-deploy.md`](reviews/2026-10-28-tui-release-deploy.md)。

@@ -381,3 +381,17 @@ activation_started=false；旧件/state/plist/私有恢复资料已备份。此�
 消息与本机0700备份目录的0600 RESUME.txt，不进入本公开记录或上传云端。
 本检查点的云和Mac均为 PREPARED，尚未激活。先云、后Mac，实际结果以各持久receipt
 和运行进程/角色/端口/身份校验为准；不得因SSH或当前会话断开而盲目重复activate/bootstrap。
+
+### 阿里云正式切换完成
+
+root在推送检查点 `865a7ed` 后唯一执行云 activate，返回独立worker1723921。
+固定持久回执实际 **SUCCESS**，2026-10-28 09:31:34.856 UTC、17.013秒，
+rollback_performed=false；PID1703776→**1723928**，starttime3483165197，generation
+`7f72768754c6793935c7ba46cfa356ae`。正式二进制与运行映像为官方Linux SHA
+`4416735b71700d3af25662dc847cdba19053f721d244de21559acc49f9f220b5`。
+
+worker完成10秒稳定窗和最终完整就绪验证后，root另起独立SSH只读复核：磁盘版本
+`homeway v0.3.22`、运行映像/唯一零参PID/starttime、control版本及generation一致，
+serve/relay均running，UDP41641及UDP/TCP41741齐全。config322B、serve key32B、
+relay key32B、tokens990B与原摘要完整一致且追加0B，未恢复覆盖state。此时Mac仍PREPARED、
+尚未bootstrap；云端完成不能写成双端均完成。

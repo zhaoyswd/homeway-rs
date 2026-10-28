@@ -91,10 +91,11 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 > Linux官方件由本机scp上传并复算一致；私有门先发现模板密钥路径误记，随后发现ss的
 > %lo显示导致断言误拒，均按真实证据最小修正并独立两门，未改产品或放宽绑定。最终云
 > 官方私有门exit0/4PASS：QUIC准入及3轮真实INPUT/surface/resize/KILL(-2)/PTY回收，
-> 私有进程全清、正式PID和4项身份/配置原字节保全。云和Mac prepare均已完成备份，
-> 持久receipt均PREPARED、尚未activate/bootstrap；先云再本机切换。会话恢复命令已私下
-> 交付，独立worker/持久receipt确保可续接。现役本机PID55632/1390件、阿里云PID1703776/
-> 官方v0.3.21/65a4件未切换。LAN71本次仍SSH22超时，未写
+> 私有进程全清、正式PID和4项身份/配置原字节保全。检查点865a7ed推送后云activate唯一
+> 执行，持久receipt SUCCESS/17.013秒/未回退，PID1703776→1723928，官方v0.3.22/
+> 4416735b件；另起SSH复核版本/映像/角色/UDP41641及UDP-TCP41741与关键字节保全。
+> Macprepare已完成备份、receipt PREPARED尚未bootstrap，现役仍PID55632/1390件。
+> 会话恢复命令已私下交付，独立worker/持久receipt确保可续接。LAN71本次仍SSH22超时，未写
 > 远端，待可达再更新。工件两道门由release子任务准备，实际执行/验证由主会话负责；
 > 状态/实证见`docs/reviews/2026-10-28-tui-release-deploy.md`，不得提前写完成。
 
