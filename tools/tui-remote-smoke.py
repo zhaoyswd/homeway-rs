@@ -43,16 +43,77 @@ def cli(binary, state, *args):
     return result.stdout
 
 
-def screen_wait(tui, text, timeout=25):
+def current_frame_wait(tui, predicate, description, timeout=25):
     def seen():
         tui.drain()
         if tui.process.poll() is not None:
             raise AssertionError(f"private TUI exited: {tui.process.returncode}")
-        return text in tui.screen_text()
+        return predicate()
     try:
-        wait_until(seen, f"current TUI screen {text!r}", timeout)
+        return wait_until(seen, description, timeout)
     except AssertionError as error:
         raise AssertionError(f"{error}\n" + tui.screen_text()) from error
+
+
+def screen_wait(tui, text, timeout=25):
+    return current_frame_wait(tui, lambda: text in tui.screen_text(),
+                              f"current TUI screen {text!r}", timeout)
+
+
+def overlay_visible(tui):
+    return any("┌ 添加主机 " in line or "┌ 快捷指令 · Ctrl+B " in line
+               for line in tui.screen_lines())
+
+
+def host_ready(tui, name, *, selected=False, local=False, online=False):
+    """Require the actual host row, not the name typed in an open dialog."""
+    if overlay_visible(tui):
+        return False
+    states = ("直连", "中继") if online else ("直连", "中继", "离线")
+    labels = {f"● {name}"} if local else {f"● 【{state}】{name}" for state in states}
+    for row, line in enumerate(tui.screen_lines()):
+        if line.startswith("┌ 会话 "):
+            break
+        if line.startswith("│") and line[1:].split("│", 1)[0].strip() in labels:
+            # view.rs renders the host label at physical column 2; only the
+            # selected host row is bold, independently of the terminal theme.
+            return not selected or tui.screen.buffer[row][2].bold
+    return False
+
+
+def shell_ready(tui, title):
+    """A default shell is input-ready only after its focused surface arrives."""
+    if not tui.terminal_ready(title) or overlay_visible(tui):
+        return False
+    if not tui.screen_lines()[0].split("┌")[-1].startswith(f" {title} "):
+        return False
+    cursor = tui.screen.cursor
+    return (not cursor.hidden
+            and helpers["sidebar_width"](tui.screen.columns) <= cursor.x < tui.screen.columns - 1
+            and 1 <= cursor.y < tui.screen.lines - 1)
+
+
+def new_session_name(binary, state, previous):
+    created = [entry["name"] for entry in sessions(binary, state)
+               if entry["name"] not in previous]
+    assert len(created) <= 1, f"TUI created multiple sessions: {created!r}"
+    return created[0] if created else None
+
+
+def wait_new_shell(tui, binary, state, previous, *, host_name, local=False):
+    name = None
+    def ready():
+        nonlocal name
+        if name is None:
+            name = new_session_name(binary, state, previous)
+        # shell_ready drains the latest frame; inspect its selected host next
+        # without another drain, matching send_input's connected/online gates.
+        return name if (name is not None and shell_ready(tui, name)
+                        and host_ready(tui, host_name, selected=True, local=local,
+                                       online=not local)) else None
+    return current_frame_wait(tui, ready,
+                              "new target session with a focused input-ready shell",
+                              helpers["TIMEOUT"])
 
 
 def claim_exit():
@@ -131,11 +192,11 @@ def role_state(binary, state, role):
 
 
 def local_roles(tui, binary, state, clipboard):
+    previous = {entry["name"] for entry in sessions(binary, state)}
     tui.send(b"\x02n")
-    tui.wait_terminal()
+    local_name = wait_new_shell(tui, binary, state, previous, host_name="我的电脑", local=True)
     tui.send("printf 'HW_LOCAL_%s\\n' ROLES\r")
     screen_wait(tui, "HW_LOCAL_ROLES")
-    local_name = sessions(binary, state)[0]["name"]
     tui.send(b"\x02h\x02m")
     screen_wait(tui, "启动出口")
     clipboard.unlink(missing_ok=True)
@@ -261,19 +322,28 @@ def main():
                     tui.send("tui-remote\t")
                     tui.send(b"\x1b[200~" + token.encode() + b"\x1b[201~")
                     tui.send(b"\r")
-                    screen_wait(tui, "tui-remote")
+                    current_frame_wait(tui, lambda: host_ready(tui, "tui-remote"),
+                                       "added remote host row after the dialog closes")
                     hosts = json.loads(cli(binary, state, "host", "list", "--json"))["hosts"]
                     assert len(hosts) == 1
                     assert token.encode() not in tui.output, "add-host dialog exposed its token"
                     tui.send(b"\x02h\x1b[B")
-                    tui.drain(0.2)
+                    current_frame_wait(tui, lambda: host_ready(tui, "tui-remote", selected=True, online=True),
+                                       "selected remote host row")
+                    previous = {entry["name"] for entry in sessions(binary, exit_state)}
                     tui.send(b"\x02n")
-                    tui.wait_terminal()
-                    tui.send("printf 'HW_REMOTE_%s\\n' SHELL\r")
-                    screen_wait(tui, "HW_REMOTE_SHELL")
+                    session_name = wait_new_shell(tui, binary, exit_state, previous, host_name="tui-remote")
+                    assert sessions(binary, state) == [], "remote create unexpectedly created a local shell"
+                    marker = directory / "remote-input-marker"
+                    tui.send("printf 'HW_REMOTE_%s\\n' SHELL > " + shlex.quote(str(marker))
+                             + "; printf 'HW_REMOTE_%s\\n' SHELL\r")
+                    current_frame_wait(tui,
+                                       lambda: (marker.exists() and marker.read_bytes() == b"HW_REMOTE_SHELL\n"
+                                                and "HW_REMOTE_SHELL" in tui.screen_text()),
+                                       "remote shell executed and displayed the single input marker")
                     remote_sessions = sessions(binary, exit_state)
                     assert len(remote_sessions) == 1
-                    session_name = remote_sessions[0]["name"]
+                    assert remote_sessions[0]["name"] == session_name
                     print("PASS: TUI add-host dialog, select remote host, create shell and execute marker")
 
                     # Observe a default remote shell without installing a prompt
@@ -338,7 +408,8 @@ def main():
                         tui.drain()
                         return json.loads(cli(binary, state, "host", "list", "--json"))["hosts"] == []
                     wait_until(host_removed, "TUI deletes private remote host")
-                    screen_wait(tui, "我的电脑")
+                    current_frame_wait(tui, lambda: host_ready(tui, "我的电脑", selected=True, local=True),
+                                       "selected local host row after remote host deletion")
                     screen_wait(tui, "想在这台主机上做些什么？")
                     assert [entry["name"] for entry in sessions(binary, exit_state)] == [session_name], "deleting a host killed its remote terminal"
                     print("PASS: TUI stops proxy/deletes host, exit CLI LIST confirms remote shell survives")
