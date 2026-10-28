@@ -475,3 +475,15 @@ CLI编译16.79秒/测试0.13秒，core编译6.77秒/测试0.01秒。cfg(test)之
 root额外尝试全仓cargo fmt --check，exit1，首先命中未改carriers_cli.rs等既有格式差异；
 该check未写文件，未进行全仓格式改写，本次diff--check通过。后续GitHub完整门据实际结果
 补录，不以本机targeted替代Ubuntu新证据。
+
+测试收尾提交`10779536b1d67d8f2405b9fd249e17b8045c4ef9`已推main，
+[完整CI40670930060](https://github.com/zhaoyswd/homeway-rs/actions/runs/40670930060)
+最终 **success、attempt2**。首轮Ubuntu及全部check/clippy/隔离成功、Mac CLI190/0；
+Mac core另一未改旧测试`stats_loop_busy_timeout_do_not_accumulate_fail_streak`失败，
+该次日志完整保留，root仅对同提交失败Mac job单次重跑后成功。旧测试调度前提只读分析与
+未归因边界见上述独立记录，不将重跑绿改写成一次全绿，也没有借此改生产或弱化门。
+最终双平台完整测试及各跨平台检查均成功。
+
+本轮合入/提交/推送/公开Release和Mac、阿里云正式官方件部署完成；收口记录只更新文档，
+不会更改已验收的生产/测试源码或已发布tag。两端持久备份与成功回执保留，LAN71在收尾
+再次SSH22超时（exit255），本轮未写远端，离线更新仍待可达。

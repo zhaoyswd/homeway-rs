@@ -56,3 +56,21 @@ root实际运行两个`--locked --offline --exact --nocapture` targeted：CLI **
 root额外全仓`cargo fmt --all -- --check` exit1，首先报告未改carriers_cli.rs等既有
 格式差异，该check未改文件；本次`git diff --check`通过，未扩大为全仓格式重写。
 实现者与评审者均未执行cargo、网络或生产动作，以上动态结果由root实际执行。
+
+## GitHub 完整门实测
+
+root提交并推送`10779536b1d67d8f2405b9fd249e17b8045c4ef9`，
+[CI40670930060](https://github.com/zhaoyswd/homeway-rs/actions/runs/40670930060)首轮Ubuntu
+完整测试及全部check/clippy/隔离门成功，Mac CLI190/0成功，两处本次targeted均在完整门
+通过。Mac core另一个未改测试`stats_loop_busy_timeout_do_not_accumulate_fail_streak`
+失败于原5389行，日志保留在`/tmp/homeway-v0.3.22-final-ci-failed.log`；不能省略该首红。
+
+其现有失败序列含2/3→1/3重置。只读复核确认Busy/Timeout本身直接continue、不会改连败，
+而无出站包/非稳态等其它路径本就允许清零。测试15ms发包与压缩80ms观测拍未逐拍同步
+出站计数，存在调度敏感前提；现象与此相容，未采逐拍数据，不将它写为已证根因或产品
+缺陷，也未改代码、阈值、ignore或成功判据。
+
+保存首红后，root仅对同一提交失败Mac job执行一次`--failed`重跑，attempt2实际
+**success**；最终Mac/Ubuntu完整测试、clippy、OHOS/双musl/Windows check与隔离门
+全部成功。该单次观察没有改变旧测试未归因事实；若后续再现，应采逐拍out_pkts、steady、
+gate和前后streak继续定位。正式产物仍为原tag官方件，未因test-only收尾重签/重发。
