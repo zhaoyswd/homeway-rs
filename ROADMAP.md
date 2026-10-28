@@ -84,7 +84,8 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 > workspace check0。修后完整门目录`/tmp/homeway-v0.3.22-ci-local-probe-i2w6xovd/`，
 > workspace **1447/0、40 ignored**（原失败用例通过），clippy/OHOS真link及各源码/向量门
 > 已过，RRR矩阵316秒通过（既有E11 WARN/DNS SKIP按规则登记），完整quick门实际exit0。
-> 修复与版本即将分工作单元提交后快进main，尚未push/tag/生产写入。
+> 收尸修复已提交`960a3d8`，v0.3.22版本/CHANGELOG与本轮矩阵结果另作发布提交，再快进main。
+> 尚未push/tag/生产写入；后续GitHub门与官方件验证不能用本地构建代替。
 > 后续通过完整门后推main→tag在main头→GitHub CI/Release成功→
 > 本机下载校验→官方件私有冒烟→先阿里云再本机滚动换装；切本机前先交付会话恢复指令，
 > 独立worker/持久receipt确保可续接。现役本机PID55632/1390件，阿里云PID1703776/
