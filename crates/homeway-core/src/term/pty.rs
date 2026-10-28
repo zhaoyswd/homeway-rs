@@ -27,6 +27,38 @@ use portable_pty::native_pty_system;
 
 /// KILL 宽限：SIGHUP → 500ms → SIGKILL。
 pub const KILL_GRACE: Duration = Duration::from_millis(500);
+/// 真 SIGKILL 后仍只轮询此预算；失败保留 Child，由既有收尸拥有者重试。
+const FORCE_REAP_WAIT: Duration = Duration::from_secs(2);
+
+#[derive(Debug, thiserror::Error)]
+pub enum ReapError {
+    #[error("PTY child wait: {0}")]
+    Io(#[from] io::Error),
+    #[error("invalid PTY child PID {0}")]
+    InvalidPid(i32),
+    #[error("PTY child {pid} did not exit within the SIGKILL reap budget")]
+    Deadline { pid: i32 },
+}
+
+fn exit_code(status: portable_pty::ExitStatus) -> i32 {
+    if status.signal().is_some() { -1 } else { status.exit_code() as i32 }
+}
+
+fn poll_child(child: &mut dyn Child, budget: Duration) -> Result<Option<i32>, ReapError> {
+    let deadline = std::time::Instant::now() + budget;
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok(Some(exit_code(status)));
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() { return Ok(None); }
+        std::thread::sleep(remaining.min(Duration::from_millis(20)));
+    }
+}
+
+fn reap_after_force(child: &mut dyn Child, pid: i32, budget: Duration) -> Result<i32, ReapError> {
+    poll_child(child, budget)?.ok_or(ReapError::Deadline { pid })
+}
 /// 构建标记（TERM_PROGRAM_VERSION 用；与 Go buildTag 注入同义，默认 "dev"）。
 pub const BUILD_TAG: &str = match option_env!("HOMEWAY_BUILD_TAG") {
     Some(tag) => tag,
@@ -449,23 +481,39 @@ impl PtyCore {
         super::agent::signal_pgid(self.pid, libc::SIGHUP);
     }
 
-    pub fn kill_force(&self) {
+    pub fn kill_force(&mut self) {
         self.cancel_input();
+        let _ = self.force_running_child();
+    }
+
+    fn force_running_child(&mut self) -> Result<(), ReapError> {
+        // Child 仍归本句柄且未被收尸，PID 此时不能被复用；不得对已缓存退出的 PID 发信号。
+        if self.child.try_wait()?.is_some() { return Ok(()); }
+        if self.pid <= 0 { return Err(ReapError::InvalidPid(self.pid)); }
         super::agent::signal_pgid(self.pid, libc::SIGKILL);
-        // 组信号失败退化单进程（Go kill 的回退面）
-        let _ = self.child.clone_killer().kill();
+        // portable-pty 的 Unix clone_killer().kill() 仅发 SIGHUP，不能用作强杀回退。
+        // SAFETY: 正 PID 属于上面确认尚未收尸的自有 Child；本调用持有其独占控制面。
+        if unsafe { libc::kill(self.pid, libc::SIGKILL) } == -1 {
+            let error = io::Error::last_os_error();
+            if error.raw_os_error() != Some(libc::ESRCH) { return Err(error.into()); }
+        }
+        Ok(())
     }
 
     /// 是否仍在跑（非阻塞探测）。
     pub fn try_wait(&mut self) -> Option<portable_pty::ExitStatus> {
-        let status = self.child.try_wait().ok().flatten();
+        self.try_wait_result().ok().flatten()
+    }
+
+    pub(crate) fn try_wait_result(&mut self) -> io::Result<Option<portable_pty::ExitStatus>> {
+        let status = self.child.try_wait()?;
         if status.is_some() {
             self.cancel_input();
         }
-        status
+        Ok(status)
     }
 
-    /// 阻塞收尸（pump 退出路径用），返回退出码。
+    /// 显式阻塞收尸（直接调用方已知子进程会退出时使用）；业务收尾使用 wait_bounded。
     ///
     /// D-19 处置（2026-10-04 收口）：Go 对**信号致死**回 -1（`ProcessState.ExitCode()`），
     /// portable-pty 的 `exit_code()` 对信号形态固定 1——这里按 Go -1 语义映射
@@ -481,21 +529,12 @@ impl PtyCore {
         }
     }
 
-    /// 有界收尸（Go `finish` 的 2s 宽限同义）：宽限内 `try_wait` 轮询，超时
-    /// SIGKILL 兜底再阻塞收尸。返回退出码（信号死 ⇒ -1，D-19 映射同 [`Self::wait`]）。
-    pub fn wait_bounded(&mut self, grace: std::time::Duration) -> i32 {
+    /// 宽限与强杀后的等待均只做有界 try_wait；错误不伪造退出码，也不丢弃 Child。
+    pub fn wait_bounded(&mut self, grace: std::time::Duration) -> Result<i32, ReapError> {
         self.cancel_input();
-        let deadline = std::time::Instant::now() + grace;
-        while std::time::Instant::now() < deadline {
-            if let Some(st) = self.try_wait() {
-                return if st.signal().is_some() { -1 } else { st.exit_code() as i32 };
-            }
-            std::thread::sleep(std::time::Duration::from_millis(20));
-        }
-        if self.try_wait().is_none() {
-            self.kill_force();
-        }
-        self.wait()
+        if let Some(code) = poll_child(self.child.as_mut(), grace)? { return Ok(code); }
+        self.force_running_child()?;
+        reap_after_force(self.child.as_mut(), self.pid, FORCE_REAP_WAIT)
     }
 }
 
@@ -537,6 +576,63 @@ impl PtySession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct PendingChild;
+
+    impl portable_pty::ChildKiller for PendingChild {
+        fn kill(&mut self) -> io::Result<()> { panic!("polling must not signal a mock child") }
+        fn clone_killer(&self) -> Box<dyn portable_pty::ChildKiller + Send + Sync> {
+            panic!("polling must not clone a killer")
+        }
+    }
+
+    impl Child for PendingChild {
+        fn try_wait(&mut self) -> io::Result<Option<portable_pty::ExitStatus>> { Ok(None) }
+        fn wait(&mut self) -> io::Result<portable_pty::ExitStatus> {
+            panic!("a bounded reap must never call blocking wait")
+        }
+        fn process_id(&self) -> Option<u32> { None }
+    }
+
+    #[test]
+    fn post_force_reap_deadline_preserves_pending_child() {
+        let mut child = PendingChild;
+        assert!(matches!(reap_after_force(&mut child, 123, Duration::from_millis(2)),
+            Err(ReapError::Deadline { pid: 123 })));
+        assert!(child.try_wait().unwrap().is_none(), "超时仍保留同一Child，可继续收尸");
+    }
+
+    #[test]
+    fn force_reap_kills_hup_ignoring_child_outside_its_pid_group() {
+        use std::process::Stdio;
+        let mut child = Command::new("/bin/sh")
+            .args(["-c", "trap '' HUP; printf ready; while IFS= read -r line; do :; done"])
+            .stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::null())
+            .spawn().unwrap();
+        let _input = child.stdin.take().unwrap(); // 不以 EOF 让自有子进程自然退出。
+        let mut output = child.stdout.take().unwrap();
+        let mut ready = [0u8; 5];
+        output.read_exact(&mut ready).unwrap();
+        assert_eq!(&ready, b"ready");
+        let pid = child.id() as i32;
+        // SAFETY: 只查询本测试刚启动、仍由Child句柄拥有的进程。
+        assert_ne!(unsafe { libc::getpgid(pid) }, pid);
+        let pair = native_pty_system().openpty(PtySize { rows: 24, cols: 80, pixel_width: 0, pixel_height: 0 }).unwrap();
+        let mut core = PtyCore { master: pair.master, child: Box::new(child), shell: "/bin/sh".into(),
+            pid, cols: 80, rows: 24, input_stopped: Arc::new(AtomicBool::new(false)) };
+        core.kill_force();
+        let result = reap_after_force(core.child.as_mut(), pid, Duration::from_secs(1));
+        if result.is_err() {
+            // 旧实现只发被忽略的HUP；同一拥有者重新确认Child尚活后再清理，不跨线程猜PID。
+            if core.try_wait_result().unwrap().is_none() {
+                // SAFETY: 本线程独占仍未收尸的Child，其PID尚不能被复用。
+                unsafe { libc::kill(pid, libc::SIGKILL); }
+            }
+            reap_after_force(core.child.as_mut(), pid, Duration::from_secs(1)).unwrap();
+        }
+        assert_eq!(result.expect("单进程强杀必须在预算内收尸"), -1);
+    }
 
     #[test]
     fn login_shell_resolves_nonempty_executable() {
@@ -639,13 +735,13 @@ mod tests {
         assert_eq!(got, expected);
         writing.join().unwrap().unwrap();
         core.kill_start();
-        core.wait_bounded(Duration::from_secs(1));
+        core.wait_bounded(Duration::from_secs(1)).unwrap();
     }
 
     #[test]
     fn sentinel_wraps_at_one_col() {
         // cols=1 的边界形态：sentinel = cols+1（防 0 列）
-        let pty = spawn("sentinel1", 1, 3, Some("sleep 5")).expect("spawn");
+        let mut pty = spawn("sentinel1", 1, 3, Some("sleep 5")).expect("spawn");
         assert_eq!(pty.sentinel_repaint(), 2);
         pty.core.kill_force();
     }

@@ -485,28 +485,42 @@ impl PtyShared {
         super::agent::signal_pgid(self.pid, libc::SIGHUP);
     }
 
-    /// SIGKILL 先行（无锁、组信号）；child 单进程回退面走 core 锁（最坏等到收尸的
-    /// 有界窗口，可接受——主要杀伤力已发出）。
+    /// 在控制面锁内确认 Child 尚未收尸，再升级组与单进程信号，避免复用 PID。
     fn kill_force(&self) {
         self.cancel_input();
-        super::agent::signal_pgid(self.pid, libc::SIGKILL);
-        let mut killer = self.core.lock().unwrap_or_else(|e| e.into_inner()).child.clone_killer();
-        let _ = killer.kill();
+        self.core.lock().unwrap_or_else(|e| e.into_inner()).kill_force();
     }
 
-    fn wait_bounded(&self, grace: Duration) -> i32 {
+    fn wait_bounded(&self, grace: Duration) -> Result<i32, super::pty::ReapError> {
         self.cancel_input();
         self.core.lock().unwrap_or_else(|e| e.into_inner()).wait_bounded(grace)
     }
 
+    /// 只由既有 pump/失败清理拥有者调用；每轮释放 core 锁，不新增脱离的 wait 线程。
+    fn reap_until_done(&self, logf: &(dyn Fn(&str) + Send + Sync), name: &str) -> i32 {
+        let mut attempts = 0u64;
+        loop {
+            match self.wait_bounded(Duration::from_secs(2)) {
+                Ok(code) => return code,
+                Err(error) => {
+                    attempts = attempts.saturating_add(1);
+                    if attempts == 1 || attempts.is_multiple_of(16) {
+                        logf(&format!("term: 会话 {name} 收尸未完成（{error}）——保留子进程句柄并重试"));
+                    }
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+            }
+        }
+    }
+
     /// 收尾拥有者统一终止/收尸；已收尸的自然退出不再向可复用的 PID 发信号。
-    fn stop_and_wait(&self, grace: Duration) {
+    fn stop_and_wait(&self, grace: Duration) -> Result<i32, super::pty::ReapError> {
         self.cancel_input();
         let mut core = self.core.lock().unwrap_or_else(|e| e.into_inner());
-        if core.try_wait().is_none() {
+        if core.try_wait_result()?.is_none() {
             core.kill_start();
         }
-        let _ = core.wait_bounded(grace);
+        core.wait_bounded(grace)
     }
 }
 
@@ -2056,9 +2070,11 @@ impl TermService {
             self.logf(&format!("term: 会话 {name} pump 线程起不来——立即回收"));
             st.sessions.remove(name);
             // 收尸挪出锁（调用方持服务锁——锁内不做 2s 阻塞等待；评审 P4b）
+            let cleanup_logf = Arc::clone(&self.logf);
+            let cleanup_name = name.to_owned();
             std::thread::spawn(move || {
                 pty.kill_start();
-                let _ = pty.wait_bounded(Duration::from_secs(2));
+                pty.reap_until_done(cleanup_logf.as_ref(), &cleanup_name);
             });
             return Err(TermError::new(
                 super::session::TermErrorCode::SpawnFailed,
@@ -2331,11 +2347,20 @@ impl TermService {
         };
         // 子进程收尸（有界 + SIGKILL 兜底）——锁外；master 随 PtyShared 释放。
         // 已收尸时不补发组信号（pid/pgid 可能已回收，见评审 D1）。
-        pty.stop_and_wait(Duration::from_secs(2));
+        if let Err(error) = pty.stop_and_wait(Duration::from_secs(2)) {
+            self.logf(&format!("term: 会话 {name} 收尸未完成（{error}）——保留运行态，由既有读泵继续回收"));
+            return;
+        }
+        self.complete_reap(name, sess_gen);
+    }
+
+    /// 只有已取得真实退出状态才可卸载；与最后写者并发、重复调用和换代均幂等。
+    fn complete_reap(&self, name: &str, sess_gen: u64) {
         // 注册表保留到收尸结束；写者在此之前归零也不能提前删运行态。
         // 不用收尸前的 writers 快照：最后写者可能已在锁外等待期间退出。
         let mut st = self.lock_state();
         let Some(rt) = rt_of(&st, name, sess_gen) else { return };
+        if !rt.stopped.load(Ordering::Relaxed) { return; }
         let remove_now = rt.writers == 0;
         st.registry.remove_session(name);
         if remove_now {
@@ -2345,13 +2370,15 @@ impl TermService {
 
     /// pump 的自然退出收尾（子进程已死）：ENDED = 退出码 / killed ⇒ -2。
     fn finalize_exit(self: &Arc<Self>, name: &str, sess_gen: u64, code: i32) {
-        let killed = {
+        let (killed, stopped) = {
             let st = self.lock_state();
-            if rt_of(&st, name, sess_gen).is_none() {
-                return;
-            }
-            st.registry.session(name).is_some_and(|s| s.killed)
+            let Some(rt) = rt_of(&st, name, sess_gen) else { return };
+            (st.registry.session(name).is_some_and(|s| s.killed), rt.stopped.load(Ordering::Relaxed))
         };
+        if stopped {
+            self.complete_reap(name, sess_gen);
+            return;
+        }
         let reason = if killed { FinishReason::Killed } else { FinishReason::Exit(code) };
         self.finish_session(name, sess_gen, reason);
     }
@@ -2364,7 +2391,7 @@ impl TermService {
             rt_of(&st, name, sess_gen).map(|rt| Arc::clone(&rt.pty))
         };
         let Some(pty) = pty else { return };
-        let code = pty.wait_bounded(Duration::from_secs(2));
+        let code = pty.reap_until_done(self.logf.as_ref(), name);
         self.finalize_exit(name, sess_gen, code);
     }
 
@@ -2526,7 +2553,7 @@ impl TermService {
                 None => return, // 会话已被服务关停路径收走（或同名重建——身份不符）
             }
         };
-        let code = code.wait_bounded(Duration::from_secs(2));
+        let code = code.reap_until_done(self.logf.as_ref(), name);
         self.finalize_exit(name, sess_gen, code);
     }
 
@@ -5142,7 +5169,7 @@ mod tests {
             (st.registry.session("no-legs").is_some(), st.sessions.contains_key("no-legs"))
         };
         svc.close();
-        pty.stop_and_wait(Duration::from_secs(1));
+        pty.stop_and_wait(Duration::from_secs(1)).unwrap();
         assert!(!registered, "无腿收尾也必须回收注册表");
         assert!(!retained, "无腿收尾不得遗留持有 PTY 的运行态");
     }
@@ -5179,7 +5206,7 @@ mod tests {
         svc.finish_session("last-writer-first", sess_gen, FinishReason::Killed);
         let retained = svc.lock_state().sessions.contains_key("last-writer-first");
         svc.close();
-        pty.stop_and_wait(Duration::from_secs(1));
+        pty.stop_and_wait(Duration::from_secs(1)).unwrap();
         assert!(!retained, "最后写者先退时仍必须回收 PTY 运行态");
     }
 
@@ -5225,7 +5252,7 @@ mod tests {
         duplicate.join().unwrap();
         let retained_after_reap = svc.lock_state().sessions.contains_key("writer-during-finish");
         svc.close();
-        pty.wait_bounded(Duration::from_secs(1));
+        pty.wait_bounded(Duration::from_secs(1)).unwrap();
         assert!(duplicate_returned, "重复收尾不得再次等待被占用的 core 锁");
         assert!(retained_during_reap, "最后写者退出不得提前移除正在收尸的运行态");
         assert!(!retained_after_reap, "收尸结束须按当前写者数释放运行态");
@@ -5330,7 +5357,7 @@ mod tests {
         let _ = pty.foreground_pgid();
         assert!(t.elapsed() < Duration::from_millis(500), "控制面不得等 writer 锁");
         // 收尾：输入已被显式取消；不能依赖 Linux 上 SIGHUP 自动解除 master 写阻塞。
-        let code = pty.wait_bounded(Duration::from_secs(5));
+        let code = pty.wait_bounded(Duration::from_secs(5)).unwrap();
         assert_eq!(code, -1, "SIGHUP 信号死（D-19 映射）");
         let deadline = Instant::now() + Duration::from_secs(2);
         while !done.load(AtomOrd::SeqCst) && Instant::now() < deadline {
@@ -5361,7 +5388,7 @@ mod tests {
         let completed = rx.recv_timeout(Duration::from_secs(2));
         let alive = pty.core.lock().unwrap().try_wait().is_none();
         pty.kill_start();
-        pty.wait_bounded(Duration::from_secs(1));
+        pty.wait_bounded(Duration::from_secs(1)).unwrap();
         assert!(!completed.expect("取消必须唤醒背压写者"));
         assert!(alive, "取消输入不应终止子进程");
         writing.join().unwrap();
@@ -5391,7 +5418,7 @@ mod tests {
         // SAFETY: pid 来自本测试仍存活的子进程；不访问任何裸 fd。
         assert_eq!(unsafe { libc::kill(pty.pid(), libc::SIGUSR1) }, 0);
         let completed = rx.recv_timeout(Duration::from_secs(3));
-        let code = pty.wait_bounded(Duration::from_secs(1));
+        let code = pty.wait_bounded(Duration::from_secs(1)).unwrap();
         assert!(!completed.expect("子进程自然退出必须解除写等待"));
         assert_eq!(code, 7);
         writing.join().unwrap();

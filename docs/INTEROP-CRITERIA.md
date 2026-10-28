@@ -598,6 +598,13 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 
 ## 判据变更记录（政策 + 登记表）
 
+### 2026-10-28：PTY 强杀与收尸期限
+
+- 从「宽限内轮询后调用组 SIGKILL、以 portable-pty 的 cloned killer 作单进程回退，再无期限 wait」改为「控制面锁内确认 `Child::try_wait() == Ok(None)` 后发组 SIGKILL 与真实单进程 SIGKILL；原宽限后最多再轮询 2 秒，返回真实退出状态或类型化收尸错误」。cloned killer 在 Unix 仅发 SIGHUP，不再把它当作 SIGKILL 回退。IO/ECHILD 不视作仍活进程，非正 PID 拒绝发信号；已收尸 PID 不再补发信号。
+- 新增预算真源为 `term/pty.rs::FORCE_REAP_WAIT=2s`；原调用方宽限、`KILL_GRACE=500ms` 与测试硬期限 60 秒不变。争用控制面锁的强杀须等待当前有界收尸轮释放锁，不再锁外向可能复用的组 PID 发信号。业务收尸不调用无期限 `Child::wait`，不创建脱离的 wait 线程。
+- 未取得真实退出状态时保留 Child 和运行态；正常 EOF、pump panic 与原 spawn 失败清理拥有者在既有线程内释放 core 锁后每 20ms 重试有界收尸，诊断首轮及每 16 轮节流。服务关停一次有界尝试失败会记「收尸未完成……保留运行态，由既有读泵继续回收」；只有真实收尸后才移除注册表，最后写者不能提前释放历史。D-19 的信号死 `-1`、KILL 的 `-2` 与既有 ENDED 词面/帧格式不变。
+- 依据为本轮私有 workspace 测试采样：`attach_size_applies_to_pty` 已通过尺寸断言，在 `svc.close → stop_and_wait → wait_bounded → wait → wait4` 挂起，pump 等待同一 core 锁；该次没有取得 shell PGID 或信号返回码，故不把组信号失效写成该轮已实测事实。新增自有 HUP 忽略且 PGID 与 PID 不同的进程回归验证单 PID 升级，另以 pending Child 验证强杀后期限错误与句柄保留；既有收尾/信号码回归继续适用。无 wire/NAPI 变更。
+
 ### 2026-10-28：默认 shell 的真实工作目录
 
 - LIST 可选 `cwd` 从「仅有服务端 VT 且收到有效 OSC 7 才返回」改为「有效 OSC 7 优先，否则使用当前会话 PTY shell PID 最近成功采样的真实 OS 工作目录」。覆盖初始默认 shell 以及普通 `cd`，不要求用户安装 shell hook；raw-only 无 VT 会话也能返回该真实目录。没有保存过的 launch cwd hint，不把服务进程的目录、标题、命令行或固定 HOME 猜成当前目录。

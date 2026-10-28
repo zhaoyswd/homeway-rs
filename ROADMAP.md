@@ -72,6 +72,26 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-10-28 TUI 合入main/发版/正式部署v0.3.22（进行中）**：用户明确授权合入主分支、
+> 提交/推送/发版/部署，覆盖本轮相应生产切换授权；仍严格用GitHub tag Release产物。
+> fetch确认origin/main=deaabd5、最新Release=v0.3.21，tui可快进；版本/CHANGELOG已由子任务
+> 准备v0.3.22并通过独立门；本地CI首轮core **927/1 failed、6 ignored**，旧有
+> `attach_size_applies_to_pty`硬60秒超时，隔离exact亦 **0/1 failed**，未归因，不能放行。
+> exact采栈probe自然1/0、0.85秒未留栈；完整CI retry仍927/1/6并成功采到自有测试栈，
+> 目录`/tmp/homeway-v0.3.22-ci-local-probe-z2qzwff9/`。现已定位`svc.close`→收尸→
+> `wait_bounded`→`wait`→`__wait4`，pump等待PTY锁。最小修复已双门通过：真实SIGKILL、
+> 有界try_wait、保留未回收句柄/runtime、原owner重试，不弱化期限/ignore；PTY模块8/0，
+> workspace check0。修后完整门目录`/tmp/homeway-v0.3.22-ci-local-probe-i2w6xovd/`，
+> workspace **1447/0、40 ignored**（原失败用例通过），clippy/OHOS真link及各源码/向量门
+> 已过，RRR矩阵316秒通过（既有E11 WARN/DNS SKIP按规则登记），完整quick门实际exit0。
+> 修复与版本即将分工作单元提交后快进main，尚未push/tag/生产写入。
+> 后续通过完整门后推main→tag在main头→GitHub CI/Release成功→
+> 本机下载校验→官方件私有冒烟→先阿里云再本机滚动换装；切本机前先交付会话恢复指令，
+> 独立worker/持久receipt确保可续接。现役本机PID55632/1390件，阿里云PID1703776/
+> 官方v0.3.21/65a4件已只读复核；关键配置/身份仅记摘要，不输出凭证。LAN71本次仍SSH22
+> 超时，未写远端，待可达再更新。部署工件与两道门由release子任务准备，实际执行/验证由
+> 主会话负责；状态/实证见`docs/reviews/2026-10-28-tui-release-deploy.md`，不得提前写完成。
+
 > **2026-10-28 本项目Codex权限对齐tier（完成，重开项目会话后加载）**：按用户明确要求
 > 新建`.codex/config.toml`，sandbox_mode=danger-full-access、approval_policy=on-request、
 > approvals_reviewer=auto_review三项与tier一致；workspace-write fallback反向指向同级tier。
