@@ -1348,3 +1348,25 @@ local-term GREETING v1/features0xff/hello_sent=false，one-shot not running/runs
 新日志确认Mac出口向阿里云中继OK-MAC认证并重连成功，未新建正式PTY。r1失败证据保留，
 双端最终成功不覆盖先前故障。LAN71 SSH22本轮超时未写。完整门、官方归档SHA、两道评审与恢复指针见
 [`2026-10-28-tui-release-deploy.md`](reviews/2026-10-28-tui-release-deploy.md)。
+
+### 13.23 v0.3.23 对齐与居中快捷指令正式更新（2026-10-28，进行中）
+
+用户授权提交/发版/部署，沿用官方Release纪律。14cf217 UI工作单元、1987612版本提交
+和必要test-only修正bc57b2d已推main；本地完整quick1447/0/40ignored与316秒RRR通过，
+首轮CI两红及测试夹具最小修正保留，修正后CI40702069099全绿；main头创建v0.3.23 tag，
+Release40702917361五目标及发布job全绿。Mac官方下载/SUMS核验后再scp云和71。
+官方同件私有Mac23/远程8/选区7与Linux4 PASS，远程首红及工具同步修正单独留证。
+
+三目标先prepare持久备份。阿里云现已 **SUCCESS**，16.962秒/未回退，PID1723928→
+1736221，正式/usr/local/bin/homeway、零参/defaultstate，官方LinuxSHA
+`126cbbddd4d1ff0ceb76c7920685d83d03ca6de254f3d03bbf8670564816b1e9`；独立SSH验版本
+v0.3.23/映像/角色/UDP41641与UDP-TCP41741/4关键字节/被动term v1/ff通过。回执
+`/root/homeway-rollback/release-v0.3.23-20261028-r1/receipt.json`。
+
+71本轮恢复可达并已 **SUCCESS**，17.576秒/未回退，PID83724→30500；旧c373调试件换为
+同tag官方arm64 SHA `66831ecc79c93723846eb6e9b693129a06d2c4380d0ee3516614b4233c11c929`。
+独立SSH确认PPID1/UID501/零参/defaultstate/版本v0.3.23，4项客户端config/hosts/身份
+原字节保全，3项出口身份继续缺席、serve/relay停用、被动term v1/ff，one-shot退出0且
+无永久LaunchAgent。回执`~/homeway-rollback/release-v0.3.23-lan71-20261028-r1/receipt.json`。
+本机Mac仍PREPARED待最后切换，恢复指令已私下交付；全流程和准确恢复边界见
+[`2026-10-28-tui-command-dialog-release.md`](reviews/2026-10-28-tui-command-dialog-release.md)。

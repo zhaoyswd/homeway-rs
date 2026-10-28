@@ -322,3 +322,28 @@ activation_started=false。二进制与state/身份已备份，三目标均尚�
 当前Codex恢复命令已向用户交付，本机私有RESUME另存Mac持久备份0600，不进入公开仓
 或上传云/71。先阿里云、再71、最后本机；每目标唯一激活，断线先读对应receipt，不盲目
 重启或解压state覆盖当前资料。后续真实切换/独立验收结果据实追加。
+
+## 阿里云与LAN71正式切换完成
+
+root推送检查点`e908236`后唯一激活云独立worker1736214。云持久回执实际
+**SUCCESS**，2026-10-28 14:54:55.491 UTC、16.962秒，未回退；PID1723928→**1736221**，
+starttime3485105265，generation `c7eaefcaba67a3ea14acfcf557ea9321`，正式磁盘及运行映像
+为官方Linux完整SHA `126cbbddd4d1ff0ceb76c7920685d83d03ca6de254f3d03bbf8670564816b1e9`。
+
+worker稳定窗/最终就绪后，root另起独立SSH再核准确版本v0.3.23、唯一零参进程及映像/
+starttime/cwd/HOME、control PID/generation，serve/relay均running，UDP41641及
+UDP/TCP41741齐全。4项critical原字节完整一致、追加0B；local-term.sock root/0600、
+ss归新PID所有，被动GREETING v1/features0xff/hello_sent=false，不创建正式PTY。
+
+云独立复核通过后，root唯一bootstrap71持久once.plist，worker30492。71回执实际
+**SUCCESS**，14:59:17.399 UTC、17.576秒，未回退；PID83724→**30500**，generation
+`41b36f3faa24a55d0dcfe1a5f6ddb0e0`，正式PATH官方arm64完整SHA
+`66831ecc79c93723846eb6e9b693129a06d2c4380d0ee3516614b4233c11c929`，版本v0.3.23。
+worker检查时ppid仍为30492，这不能冒充已脱离；root随后第二独立SSH实际确认同一PID
+**PPID1/UID501**，零参/defaultstate、文件gid0/mode755，control版本及generation一致。
+一次性job not running/runs1/exit0、永久LaunchAgents仍无homeway项。
+
+71仅客户端形态保持，serve/relay disabled/stopped；4项config/hosts/devtag/master关键
+文件完整SHA/大小不变，正确3项出口/中继身份继续缺席，local-term600归30500所有，
+被动GREETING v1/featuresff/hello_sent=false。未在正式state创建shell或做完整TUI交互。
+此时本机Mac仍PREPARED，旧46739/v0.3.22未切换；两远端成功不能提前写成三目标完成。
