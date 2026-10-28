@@ -368,9 +368,8 @@ pub(super) fn draw(
         );
         return geometry;
     }
-    let sidebar = ((u32::from(area.width) * 3 / 10) as u16)
-        .clamp(18, 34)
-        .min(area.width.saturating_sub(18));
+    let sidebar = ((u32::from(area.width) * 3 / 10) as u16).clamp(18, 34) * 4 / 5;
+    let sidebar = sidebar.min(area.width.saturating_sub(18));
     let body = Rect::new(area.x, area.y, area.width, area.height - 1);
     let host_height = model
         .hosts
@@ -1954,7 +1953,7 @@ mod tests {
             assert_eq!(geometry.hosts.height + 2, height);
             assert_eq!(geometry.sessions.y - 1, geometry.hosts.bottom());
             assert_eq!(geometry.sessions.bottom(), 28);
-            assert_eq!(geometry.terminal.x, 30);
+            assert_eq!(geometry.terminal.x, 24);
             assert_eq!(buffer[(2, 0)].symbol(), "主");
             assert_eq!(buffer[(2, 1)].symbol(), "●");
             assert_eq!(buffer[(2, height - 1)].symbol(), "会");
@@ -1992,7 +1991,7 @@ mod tests {
             .unwrap();
         assert_eq!(geometry.hosts.height + 2, 4);
         assert_eq!(geometry.sessions.height, 4);
-        assert_eq!(geometry.terminal.x, 18);
+        assert_eq!(geometry.terminal.x, 14);
         assert!(geometry.host_add.right() < geometry.terminal.x);
     }
 
