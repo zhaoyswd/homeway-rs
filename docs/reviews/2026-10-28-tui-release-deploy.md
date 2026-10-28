@@ -440,3 +440,38 @@ root填新旧PID基线45369，prepare实际exit0，持久回执
 `~/homeway-rollback/release-v0.3.22-20261028-r2/receipt.json` 为 PREPARED，
 activation_started=false；本次再采当前state原字节并备份，不复用旧manifest的运行基线。
 激活为该r2目录once.plist唯一bootstrap，不能重跑r1或因断线重复启动r2。
+
+### Mac 官方切换完成及双端结果
+
+root推送检查点 `ba0a980` 后唯一bootstrap r2，worker46723独立运行，持久回执实际
+**SUCCESS**：2026-10-28 10:08:05.051 UTC、14.951秒，rollback_performed=false。
+PID45369→**46739**，generation `e294c42de3720da451540768380ae624`，正式PATH
+`/opt/homebrew/bin/homeway` 为官方darwin-arm64完整SHA
+`dfe0b99ad21639f95851120644f95d7f85a0f08b70049ec4cf37d02cf9b90795`，版本v0.3.22。
+
+worker10秒稳定及最终就绪通过后，root另开只读验收再次确认同一PID/generation，
+零参/defaultstate、serve running/UDP41641、relay stopped、原plist与关键字节全部保全。
+local-term.sock归新PID所有，被动GREETING version1/features0xff/hello_sent=false，
+未新建正式PTY或冒称生产完整TUI交互。一次性任务not running/runs1/exit0，未重复激活。
+新日志18:07:53(+08:00)实际记录v0.3.22统一进程就绪、阿里云中继OK-MAC认证通过并连上
+123.56.218.212:41741。恢复/回退资料在r2持久0700目录，私有RESUME不公开。
+
+至此本机Mac与阿里云均已部署并运行同tag官方v0.3.22；LAN71本轮SSH22超时未写入，
+离线更新另待可达，不能将历史debug部署写成本轮官方部署成功。r1失败、自动回退失败及
+标准恢复完整保留，最终完成依据为云r1 SUCCESS与Macr2 SUCCESS的实际回执/独立验收。
+
+## 发布后 CI 测试诊断收尾
+
+纯文档提交940aeb4的CI40665157450出现Mac超时断言和Ubuntu合成转发TCP connect失败，
+此前发布源36d7ec8和文档865a7ed相同源码CI均成功。未据此冒称环境偶发或生产缺陷：
+Mac原测试只接收Control(timeout)，却遗漏生产已有的直接总预算Timeout与Client(Timeout)
+分支；最小test-only修正保留原预算/server检查且只接受三种超时。Ubuntu仅补原始错误/
+errno/状态/本测日志，保留一次connect.is_ok、不重试不放宽；历史同点根因仍未证实。
+
+作者和非作者独立两门通过，root实际两个targeted均 **1 passed、0 failed、exit0**：
+CLI编译16.79秒/测试0.13秒，core编译6.77秒/测试0.01秒。cfg(test)之外生产无diff，
+不改已发布tag/官方件或重部署。独立记录为
+[`2026-10-28-ci-test-diagnostics.md`](2026-10-28-ci-test-diagnostics.md)。
+root额外尝试全仓cargo fmt --check，exit1，首先命中未改carriers_cli.rs等既有格式差异；
+该check未写文件，未进行全仓格式改写，本次diff--check通过。后续GitHub完整门据实际结果
+补录，不以本机targeted替代Ubuntu新证据。

@@ -72,7 +72,7 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
-> **2026-10-28 TUI 合入main/发版/正式部署v0.3.22（进行中）**：用户明确授权合入主分支、
+> **2026-10-28 TUI 合入main/发版/正式部署v0.3.22（双端完成，CI诊断收尾）**：用户明确授权合入主分支、
 > 提交/推送/发版/部署，覆盖本轮相应生产切换授权；仍严格用GitHub tag Release产物。
 > fetch确认origin/main=deaabd5、最新Release=v0.3.21，tui可快进；版本/CHANGELOG已由子任务
 > 准备v0.3.22并通过独立门；本地CI首轮core **927/1 failed、6 ignored**，旧有
@@ -97,8 +97,13 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 > Macr1唯一bootstrap后系统Launch Constraint Violation/LWCR错误，原job无法启动新旧件，
 > 151.963秒终态ROLLBACK_FAILED；磁盘已恢复1390但服务曾停。独立两门后root仅对原job
 > bootout→确认不存在→未改原plistbootstrap，旧服务PID45369恢复，原已审只读验收与10秒
-> 稳定通过；未重签/修改state或安全策略。r1失败与恢复证据保留，现准备独立r2官方重装，
-> 未将旧件恢复写成v0.3.22部署完成。会话恢复命令已私下交付。LAN71本次仍SSH22超时，未写
+> 稳定通过；未重签/修改state或安全策略。独立r2两门后重新prepare，检查点ba0a980推送
+> 后唯一bootstrap，Macr2实际SUCCESS/14.951秒/未回退，PID45369→46739，官方dfe0b99a
+> 件v0.3.22，另开只读验收版本/角色/端口/身份与被动term能力通过；新日志中继认证重连
+> 成功。双端均已完成，r1故障证据保留。纯文档940aeb4 CI后续两项测试断言失败，Mac只
+> 接受单一超时变体的测试已最小补齐三种真实timeout；Ubuntu仅补errno等诊断，不放宽
+> 单次connect判据、根因未证实。独立两门、root targeted各1/0通过，后续GitHub完整门
+> 待实测；生产和已发官方件不变。会话恢复命令已私下交付。LAN71本次仍SSH22超时，未写
 > 远端，待可达再更新。工件两道门由release子任务准备，实际执行/验证由主会话负责；
 > 状态/实证见`docs/reviews/2026-10-28-tui-release-deploy.md`，不得提前写完成。
 

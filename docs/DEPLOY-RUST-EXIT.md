@@ -1322,7 +1322,7 @@ features0xff、hello_sent=false。第二个独立SSH确认PID83724仍活、PPID1
 双门、信号继承整改及完整证据见
 [`2026-10-28-tui-debug-lan71-deploy.md`](reviews/2026-10-28-tui-debug-lan71-deploy.md)。
 
-### 13.22 v0.3.22 官方 TUI 发布与双出口更新（2026-10-28，进行中）
+### 13.22 v0.3.22 官方 TUI 发布与双出口更新（2026-10-28，完成）
 
 用户授权合入main、提交/推送/发版/部署。发布提交36d7ec8先快进并推main，主分支
 CI40659058316全绿，再在origin/main头打tag v0.3.22；Release40660481250五目标及发布
@@ -1339,6 +1339,12 @@ receipt **SUCCESS**，17.013秒、未回退，PID1703776→1723928，零参正�
 LWCR拒绝，自动回退恢复了旧磁盘件但同job仍无法启动，receipt ROLLBACK_FAILED。
 确认worker退出后，经独立两门，root仅bootout该单job、确认不存在并用未改原plist
 bootstrap，旧1390服务PID45369恢复并通过身份/角色/端口及10秒稳定复核；未重签、
-改state或安全策略。后续使用全新r2工件重装官方件，r1失败证据保留。LAN71 SSH22
-本轮超时未写。完整门、官方归档SHA、两道评审与恢复指针见
+改state或安全策略。全新r2在前向/回退均标准重载原job，独立两门后实际换装成功：
+`~/homeway-rollback/release-v0.3.22-20261028-r2/receipt.json` **SUCCESS**，
+14.951秒、未回退，PID45369→46739，官方darwin-arm64完整SHA256
+`dfe0b99ad21639f95851120644f95d7f85a0f08b70049ec4cf37d02cf9b90795`。
+另开只读验收版本/零参/defaultstate/serve41641/relaystopped与关键原字节保全；被动
+local-term GREETING v1/features0xff/hello_sent=false，one-shot not running/runs1/exit0。
+新日志确认Mac出口向阿里云中继OK-MAC认证并重连成功，未新建正式PTY。r1失败证据保留，
+双端最终成功不覆盖先前故障。LAN71 SSH22本轮超时未写。完整门、官方归档SHA、两道评审与恢复指针见
 [`2026-10-28-tui-release-deploy.md`](reviews/2026-10-28-tui-release-deploy.md)。
