@@ -3,13 +3,14 @@ mod appearance;
 mod backend;
 mod clipboard;
 mod input;
+mod notifications;
 mod selection;
 mod surface;
 mod terminal;
 mod transport;
 mod view;
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, VecDeque};
 use std::io::{self, IsTerminal, Write};
 use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
@@ -28,6 +29,8 @@ const CONNECTING_NOTICE: &str = "正在连接本机服务…";
 const READING_SESSIONS_NOTICE: &str = "正在读取主机会话…";
 const CONTROL_READY_NOTICE: &str = "本机服务已连接 · 可选择或创建会话";
 const SESSIONS_READY_NOTICE: &str = "已就绪 · 选择会话，或点击 + 创建 shell";
+// Per-tick terminal fallback budget. A burst beyond this becomes one summary.
+const NOTIFICATION_FALLBACK_LIMIT: usize = 16;
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
@@ -103,6 +106,7 @@ fn run(options: Options) -> Result<(), Error> {
         app.process_attach();
         app.flush_input();
         app.process_clipboard()?;
+        app.process_notifications(&mut io::stdout())?;
         app.expire_notice(Instant::now());
         app.poll_refresh();
         let now = Instant::now();
@@ -192,6 +196,10 @@ struct App {
     state_dir: PathBuf,
     backend: Backend,
     clipboard: clipboard::Clipboard,
+    notifications: notifications::Notifications,
+    blocking: BlockingStates,
+    notification_fallbacks: VecDeque<String>,
+    notification_overflow: usize,
     snapshot: backend::Snapshot,
     current_target: Target,
     active_session: Option<String>,
@@ -232,6 +240,59 @@ struct App {
 struct OperationFact {
     text: String,
     confirmation: backend::Confirmation,
+}
+
+#[derive(Default)]
+struct BlockingStates {
+    hosts: HashMap<Target, HashMap<String, ObservedSession>>,
+}
+
+struct ObservedSession {
+    state: backend::SessionState,
+    pid: i32,
+}
+
+impl BlockingStates {
+    fn observe<'a>(
+        &mut self,
+        target: &Target,
+        sessions: &'a [backend::Session],
+    ) -> Vec<&'a backend::Session> {
+        let previous = self.hosts.get(target);
+        let mut current = HashMap::with_capacity(sessions.len());
+        let mut entered = Vec::new();
+        for session in sessions {
+            let std::collections::hash_map::Entry::Vacant(entry) =
+                current.entry(session.name.clone())
+            else {
+                continue;
+            };
+            if session.state == backend::SessionState::Blocked
+                && previous.is_some_and(|previous| {
+                    previous.get(&session.name).is_none_or(|known| {
+                        known.state != backend::SessionState::Blocked
+                            || (known.pid > 0 && session.pid > 0 && known.pid != session.pid)
+                    })
+                })
+            {
+                entered.push(session);
+            }
+            entry.insert(ObservedSession {
+                state: session.state,
+                pid: session.pid,
+            });
+        }
+        // Even an empty first success is a baseline. Failed/stale replies never call this.
+        self.hosts.insert(target.clone(), current);
+        entered
+    }
+
+    fn retain_hosts(&mut self, hosts: &[backend::Host]) {
+        self.hosts.retain(|target, _| match target {
+            Target::Local => true,
+            Target::Remote(id) => hosts.iter().any(|host| &host.id == id),
+        });
+    }
 }
 
 struct OperationCopy {
@@ -295,6 +356,10 @@ impl App {
             backend: Backend::start(options.state.clone()),
             state_dir: options.state,
             clipboard: clipboard::Clipboard::start(),
+            notifications: notifications::Notifications::start(),
+            blocking: BlockingStates::default(),
+            notification_fallbacks: VecDeque::new(),
+            notification_overflow: 0,
             snapshot: backend::Snapshot::default(),
             current_target: Target::Local,
             active_session: None,
@@ -897,6 +962,7 @@ impl App {
             }
             backend::Event::Snapshot(snapshot) => {
                 self.refresh_pending = false;
+                self.blocking.retain_hosts(&snapshot.hosts);
                 let selected = self.target();
                 self.model.hosts =
                     std::iter::once(local_host(snapshot.serve_on, snapshot.relay_on))
@@ -972,6 +1038,7 @@ impl App {
                 self.sessions_pending = false;
                 match result {
                     Ok(sessions) => {
+                        self.observe_blocking(&target, &sessions);
                         let selected = self.selected_name();
                         self.model.sessions = sessions.into_iter().map(session_item).collect();
                         self.model.selected_session = selected.as_ref().and_then(|name| {
@@ -1489,6 +1556,70 @@ impl App {
     fn process_clipboard(&mut self) -> Result<(), Error> {
         while let Some(result) = self.clipboard.try_result() {
             self.clipboard_result(result)?;
+        }
+        Ok(())
+    }
+
+    fn observe_blocking(&mut self, target: &Target, sessions: &[backend::Session]) {
+        let host = self
+            .model
+            .hosts
+            .iter()
+            .find(|host| &host.target == target)
+            .map(|host| host.name.as_str())
+            .unwrap_or_else(|| match target {
+                Target::Local => "我的电脑",
+                Target::Remote(id) => id,
+            })
+            .to_owned();
+        for session in self.blocking.observe(target, sessions) {
+            let name = if session.title.is_empty() {
+                &session.name
+            } else {
+                &session.title
+            };
+            let body = format!("{host} · {name}");
+            if self.notifications.notify("会话需要操作", &body).is_err() {
+                self.queue_notification_fallback(notifications::terminal_request(
+                    "会话需要操作",
+                    &body,
+                ));
+            }
+        }
+    }
+
+    fn queue_notification_fallback(&mut self, sequence: String) {
+        if self.notification_fallbacks.len() < NOTIFICATION_FALLBACK_LIMIT {
+            self.notification_fallbacks.push_back(sequence);
+        } else {
+            self.notification_overflow = self.notification_overflow.saturating_add(1);
+        }
+    }
+
+    fn process_notifications(&mut self, output: &mut impl Write) -> io::Result<()> {
+        let mut wrote = false;
+        while let Some(sequence) = self.notification_fallbacks.pop_front() {
+            output.write_all(sequence.as_bytes())?;
+            wrote = true;
+        }
+        if self.notification_overflow > 0 {
+            let body = format!(
+                "另有 {} 个会话需要操作，请查看会话列表",
+                self.notification_overflow
+            );
+            output.write_all(notifications::terminal_request("homeway", &body).as_bytes())?;
+            self.notification_overflow = 0;
+            wrote = true;
+        }
+        for _ in 0..NOTIFICATION_FALLBACK_LIMIT {
+            let Some(sequence) = self.notifications.try_terminal() else {
+                break;
+            };
+            output.write_all(sequence.as_bytes())?;
+            wrote = true;
+        }
+        if wrote {
+            output.flush()?;
         }
         Ok(())
     }
@@ -2474,9 +2605,193 @@ mod tests {
     }
 
     fn app() -> App {
-        App::new(Options {
+        let mut app = App::new(Options {
             state: std::env::temp_dir().join(format!("homeway-tui-events-{}", std::process::id())),
-        })
+        });
+        app.notifications = notifications::Notifications::recording().0;
+        app
+    }
+
+    fn blocking_session(name: &str, state: backend::SessionState, pid: i32) -> backend::Session {
+        backend::Session {
+            name: name.into(),
+            title: format!("title-{name}"),
+            state,
+            pid,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn blocking_baselines_only_emit_new_edges_and_track_session_incarnations() {
+        use backend::SessionState::{Blocked, Idle, Working};
+        let mut states = BlockingStates::default();
+        let local = Target::Local;
+        let remote = Target::Remote("remote".into());
+        let already_blocked = blocking_session("old", Blocked, 1);
+        assert!(states
+            .observe(&local, std::slice::from_ref(&already_blocked))
+            .is_empty());
+        assert!(states
+            .observe(&local, std::slice::from_ref(&already_blocked))
+            .is_empty());
+
+        assert!(states
+            .observe(&local, &[blocking_session("old", Idle, 1)])
+            .is_empty());
+        let updated = [already_blocked.clone(), blocking_session("new", Blocked, 2)];
+        assert_eq!(
+            states
+                .observe(&local, &updated)
+                .iter()
+                .map(|s| s.name.as_str())
+                .collect::<Vec<_>>(),
+            ["old", "new"]
+        );
+        assert!(states.observe(&local, &updated).is_empty());
+        assert!(states.observe(&local, &[]).is_empty());
+        assert_eq!(
+            states
+                .observe(&local, std::slice::from_ref(&already_blocked))
+                .len(),
+            1
+        );
+        // Replaced between polls under the same name, without an observed empty list.
+        assert_eq!(
+            states
+                .observe(&local, &[blocking_session("old", Blocked, 3)])
+                .len(),
+            1
+        );
+        assert!(states
+            .observe(&local, &[blocking_session("old", Working, 3)])
+            .is_empty());
+        assert_eq!(
+            states
+                .observe(&local, &[blocking_session("old", Blocked, 3)])
+                .len(),
+            1
+        );
+
+        // Each host has its own first-success baseline, including an empty baseline.
+        assert!(states.observe(&remote, &[]).is_empty());
+        assert_eq!(
+            states
+                .observe(&remote, std::slice::from_ref(&already_blocked))
+                .len(),
+            1
+        );
+        assert!(states
+            .observe(&local, &[blocking_session("old", Blocked, 3)])
+            .is_empty());
+        states.retain_hosts(&[]);
+        assert!(!states.hosts.contains_key(&remote));
+        assert!(states.hosts.contains_key(&local));
+        assert!(states.observe(&remote, &[already_blocked]).is_empty());
+    }
+
+    #[test]
+    fn blocking_notifications_use_only_current_success_and_keep_operation_notices() {
+        use backend::SessionState::{Blocked, Working};
+        let mut app = app();
+        let (notifier, recorded) = notifications::Notifications::recording();
+        app.notifications = notifier;
+        app.sessions_epoch = 7;
+        app.show_error(
+            view::NoticeTarget::Host(Target::Local),
+            "原操作失败",
+            "保留原错误详情",
+        );
+        let original_notice = app.model.item_notice.clone();
+        let original_operation = app.operation_id;
+
+        for (target, epoch) in [(Target::Local, 6), (Target::Remote("other".into()), 7)] {
+            app.backend_event(backend::Event::Sessions {
+                target,
+                epoch,
+                result: Ok(vec![blocking_session("s", Blocked, 1)]),
+            });
+        }
+        assert!(app.blocking.hosts.is_empty());
+        app.backend_event(backend::Event::Sessions {
+            target: Target::Local,
+            epoch: 7,
+            result: Ok(vec![blocking_session("s", Working, 1)]),
+        });
+        assert!(recorded.try_recv().is_err());
+        app.backend_event(backend::Event::Sessions {
+            target: Target::Local,
+            epoch: 7,
+            result: Ok(vec![blocking_session("s", Blocked, 1)]),
+        });
+        assert_eq!(
+            recorded.try_recv().unwrap(),
+            ("会话需要操作".into(), "我的电脑 · title-s".into())
+        );
+        assert_eq!(app.model.item_notice, original_notice);
+        assert_eq!(app.operation_id, original_operation);
+
+        // Failures must not reset a baseline or cause the same blocked state to alert again.
+        app.backend_event(backend::Event::Sessions {
+            target: Target::Local,
+            epoch: 7,
+            result: Err(backend::Error::Busy),
+        });
+        app.backend_event(backend::Event::Sessions {
+            target: Target::Local,
+            epoch: 7,
+            result: Ok(vec![blocking_session("s", Blocked, 1)]),
+        });
+        assert!(recorded.try_recv().is_err());
+
+        // A rejected old-host reply cannot alter the remembered local blocked state.
+        app.current_target = Target::Remote("other".into());
+        app.backend_event(backend::Event::Sessions {
+            target: Target::Local,
+            epoch: 7,
+            result: Ok(vec![blocking_session("s", Working, 1)]),
+        });
+        app.current_target = Target::Local;
+        app.backend_event(backend::Event::Sessions {
+            target: Target::Local,
+            epoch: 7,
+            result: Ok(vec![blocking_session("s", Blocked, 1)]),
+        });
+        assert!(recorded.try_recv().is_err());
+    }
+
+    #[test]
+    fn full_notification_queue_falls_back_without_losing_or_repeating_edges() {
+        use backend::SessionState::{Blocked, Working};
+        let mut app = app();
+        let (notifier, recorded) = notifications::Notifications::recording();
+        app.notifications = notifier;
+        // Dropping the mock receiver deterministically rejects new submissions.
+        drop(recorded);
+        let mut sessions = (0..20)
+            .map(|i| blocking_session(&format!("s-{i}"), Working, i + 1))
+            .collect::<Vec<_>>();
+        app.observe_blocking(&Target::Local, &sessions);
+        for session in &mut sessions {
+            session.state = Blocked;
+        }
+        app.observe_blocking(&Target::Local, &sessions);
+        assert_eq!(
+            app.notification_fallbacks.len(),
+            NOTIFICATION_FALLBACK_LIMIT
+        );
+        assert_eq!(app.notification_overflow, 4);
+        let mut output = Vec::new();
+        app.process_notifications(&mut output).unwrap();
+        let output = String::from_utf8(output).unwrap();
+        assert_eq!(output.matches("\x1b]9;").count(), 17);
+        assert!(
+            output.contains("我的电脑 · title-s-0") && output.contains("另有 4 个会话需要操作")
+        );
+        app.observe_blocking(&Target::Local, &sessions);
+        let mut repeated = Vec::new();
+        app.process_notifications(&mut repeated).unwrap();
+        assert!(repeated.is_empty());
     }
 
     #[test]

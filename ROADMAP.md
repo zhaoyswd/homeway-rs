@@ -72,6 +72,20 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-10-28 TUI blocking 主动通知（完成，本机debug已更新）**：当前主机会话进入
+> blocked时通知原主机/会话名称，首次成功列表建基线不补历史；持续不重复，恢复再入可重报。
+> 稳定Target/session/PID比较，成功列表/主机快照回收缺失项，错误/陈旧包不清基线。
+> 本机异步系统helper，SSH/Tailcat或helper失败只提交OSC9；请求/结果各16、helper2秒
+> 超时/20ms取消、退出kill/wait，不阻塞UI。有界回退16条+超额计数摘要，不覆盖行内/
+> copy提示；不改core/RPC/wire、全host监看或系统设置。独立技术/代码门通过，最终
+> TUI **114/0、1 ignored**、check/build/clippy通过，原私有交互 **23 PASS**；新增App3与
+> sender6回归用mock/private child，未冒称真实桌面通知送达。固定AppleScript原文在沙箱内
+> 因系统接口受限编译1、同件外沙箱osacompile **0**，只编译不执行；实际显示依赖系统/终端。
+> PATH与target同SHA `1390e0ae…fc4dd59b`，严格签名通过，换件SUCCESS，PID **55632→55632**，
+> 无重启/回滚/state访问；备份`~/homeway-rollback/tui-blocking-notifications-20261028-ae00ba040f78/`。
+> 重新进入TUI生效，LAN71本轮未试/未部署、未推送/发布。双门与实证见
+> `docs/reviews/2026-10-28-tui-blocking-notifications.md`。
+
 > **2026-10-28 TUI Command+B 清晰快捷标注（完成，本机debug已更新）**：实际支持
 > `SUPER+B`，macOS标注`⌘+B`，其它系统为Ctrl+B，并保留原Ctrl+B兼容入口。沿用现有
 > 增强键盘协议，宿主须上报该组合键；不改终端设置，不承诺传统会话完整接收Command。

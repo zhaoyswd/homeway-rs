@@ -132,12 +132,7 @@ fn route(ssh: bool, term_session_id: Option<&str>) -> Route {
     }
 }
 
-fn copy(value: &str) -> Copied {
-    // token/代理 URL 均远小于此上限；界面不能让恶意大载荷阻塞外部剪贴板进程。
-    if value.len() > MAX_BYTES {
-        return Copied::Failed("剪贴板内容超过 32 KiB".into());
-    }
-    // SSH 中的系统工具属于远端主机；应把请求发到用户所见终端。
+pub(super) fn remote_terminal() -> bool {
     let ssh = std::env::var_os("SSH_CONNECTION").is_some()
         || std::env::var_os("SSH_TTY").is_some()
         || std::env::var_os("SSH_CLIENT").is_some();
@@ -145,7 +140,16 @@ fn copy(value: &str) -> Copied {
     let term_session_id = term_session_id
         .as_ref()
         .map(|value| value.to_string_lossy());
-    if route(ssh, term_session_id.as_deref()) == Route::Terminal {
+    route(ssh, term_session_id.as_deref()) == Route::Terminal
+}
+
+fn copy(value: &str) -> Copied {
+    // token/代理 URL 均远小于此上限；界面不能让恶意大载荷阻塞外部剪贴板进程。
+    if value.len() > MAX_BYTES {
+        return Copied::Failed("剪贴板内容超过 32 KiB".into());
+    }
+    // SSH 中的系统工具属于远端主机；应把请求发到用户所见终端。
+    if remote_terminal() {
         return Copied::Terminal(osc52(value));
     }
     #[cfg(target_os = "macos")]
