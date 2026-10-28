@@ -524,13 +524,14 @@ def main():
                 snapshot(first, args.snapshot_dir, "empty-dark")
                 first.send(b"\x02n")
                 first.wait_terminal()
-                first.send(b"\x02")
-                wait_until(lambda: (first.drain() or "快捷指令" in first.screen_lines()[0]), "fullscreen command popup")
-                assert "q 分离退出" in first.screen_text() and "h 主机" in first.screen_text()
-                snapshot(first, args.snapshot_dir, "commands-dark")
-                first.send(b"x")  # Unknown command closes once and must never reach the shell.
-                wait_until(lambda: (first.drain() or "快捷指令" not in first.screen_lines()[0]), "command popup closes after consumed key")
-                print("PASS: Ctrl+B opens full-screen commands; consumed key closes without PTY input")
+                for shortcut, label in [(b"\x02", "Ctrl+B"), (b"\x1b[98;9u", "Command+B CSI-u")]:
+                    first.send(shortcut)
+                    wait_until(lambda: (first.drain() or "快捷指令" in first.screen_lines()[0]), "fullscreen command popup")
+                    assert "q 分离退出" in first.screen_text() and "h 主机" in first.screen_text()
+                    snapshot(first, args.snapshot_dir, "commands-dark")
+                    first.send(b"x")  # Unknown command closes once and must never reach the shell.
+                    wait_until(lambda: (first.drain() or "快捷指令" not in first.screen_lines()[0]), "command popup closes after consumed key")
+                    print(f"PASS: {label} opens full-screen commands; consumed key closes without PTY input")
                 first.send("printf 'HW_TUI_%s\\n' FIRST\r")
                 first.wait("HW_TUI_FIRST")
                 # Report the actual current directory through the existing OSC7

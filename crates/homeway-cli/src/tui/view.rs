@@ -21,6 +21,12 @@ use super::{
     selection::{self, projected_symbol as terminal_symbol},
 };
 
+pub(super) const COMMAND_SHORTCUT: &str = if cfg!(target_os = "macos") {
+    "⌘+B"
+} else {
+    "Ctrl+B"
+};
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum Theme {
     #[default]
@@ -393,7 +399,7 @@ pub(super) fn draw(
         terminal.map_or(0, |view| view.scrollbar.offset.saturating_sub(view.top));
     if area.width < 40 || area.height < 10 {
         frame.render_widget(
-            Paragraph::new("窗口太小，至少 40×10 · Ctrl+B q 退出")
+            Paragraph::new(format!("窗口太小，至少 40×10 · {COMMAND_SHORTCUT} q 退出"))
                 .alignment(Alignment::Center)
                 .style(Style::default().fg(p.muted)),
             area,
@@ -819,7 +825,12 @@ fn footer(model: &Model, width: u16) -> String {
             format!("~{}{unit}行 ⇧End", model.history_behind / scale)
         }
     } else {
-        "^B 快捷指令".into()
+        let hint = format!("{COMMAND_SHORTCUT} 快捷指令");
+        if Line::from(hint.as_str()).width() <= usize::from(width) {
+            hint
+        } else {
+            format!("{COMMAND_SHORTCUT} 指令")
+        }
     }
 }
 
@@ -863,7 +874,7 @@ fn draw_commands(frame: &mut Frame<'_>, model: &mut Model, p: Palette) {
             .style(Style::default().bg(p.bg).fg(p.fg))
             .borders(Borders::ALL)
             .border_style(Style::default().fg(p.accent))
-            .title(" 快捷指令 "),
+            .title(format!(" 快捷指令 · {COMMAND_SHORTCUT} ")),
         area,
     );
     let content = inner(area);
@@ -871,7 +882,7 @@ fn draw_commands(frame: &mut Frame<'_>, model: &mut Model, p: Palette) {
         "h 主机  s 会话  Enter 终端",
         "n 新建会话  a 添加主机",
         "m 操作菜单  q 分离退出",
-        "^B 发送 Ctrl+B  Esc 取消",
+        "Ctrl+B 连按发送 Ctrl+B  Esc 取消",
     ];
     for (index, command) in commands.into_iter().enumerate() {
         if index as u16 >= content.height {
@@ -1252,7 +1263,12 @@ fn menu_for_focus(model: &mut Model, geometry: &Geometry) {
     });
 }
 
-/// 终端内只保留 Ctrl+B 前缀；功能键仍交给被管理的程序。
+fn is_command_shortcut(key: KeyEvent) -> bool {
+    key.code == KeyCode::Char('b')
+        && (key.modifiers.contains(KeyModifiers::CONTROL) || key.modifiers == KeyModifiers::SUPER)
+}
+
+/// 终端内只保留快捷指令前缀；功能键仍交给被管理的程序。
 pub(super) fn handle_event(model: &mut Model, event: Event, geometry: &Geometry) -> Action {
     let key = match &event {
         Event::Key(key) => Some(*key),
@@ -1366,7 +1382,7 @@ fn handle_event_inner(model: &mut Model, event: Event, geometry: &Geometry) -> A
                         Action::None
                     }
                     KeyCode::Char('b')
-                        if key.modifiers.contains(KeyModifiers::CONTROL)
+                        if is_command_shortcut(key)
                             && geometry.terminal.width > 0
                             && geometry.terminal.height > 0 =>
                     {
@@ -1375,7 +1391,7 @@ fn handle_event_inner(model: &mut Model, event: Event, geometry: &Geometry) -> A
                     _ => Action::None,
                 };
             }
-            if key.code == KeyCode::Char('b') && key.modifiers.contains(KeyModifiers::CONTROL) {
+            if is_command_shortcut(key) {
                 model.prefix = true;
                 model.command_detail_offset = 0;
                 return Action::None;
@@ -1945,7 +1961,8 @@ mod tests {
             let line = |y| buffer_line(buffer, y);
             assert!(line(0).contains("主机") && line(0).contains("终端"));
             assert!(!line(0).contains("homeway") && !line(0).contains("主题"));
-            assert!(line(height - 2).contains("^B 快捷指令"));
+            assert!(line(height - 2).contains(COMMAND_SHORTCUT));
+            assert!(line(height - 2).contains("指令"));
             assert!(!line(height - 2).contains("READY"));
             assert!(line(height - 1).contains('┘'));
             assert!(!line(height - 1).contains("快捷指令"));
@@ -2589,7 +2606,7 @@ mod tests {
         model.reset_sessions();
         assert!(!model.mouse_reporting);
         assert!(
-            super::footer(&model, 100) == "^B 快捷指令",
+            super::footer(&model, 100) == format!("{COMMAND_SHORTCUT} 快捷指令"),
             "reset clears the derived history hint before the next render"
         );
     }
@@ -2765,14 +2782,14 @@ mod tests {
             }],
             ..Default::default()
         };
-        assert_eq!(footer(&model, 100), "^B 快捷指令");
+        assert_eq!(footer(&model, 100), format!("{COMMAND_SHORTCUT} 快捷指令"));
         assert_eq!(model.notice, "已有错误提示");
         model.reset_terminal_input();
         assert!(!model.selecting && model.selection_spans.is_empty());
         model.mouse_reporting = true;
-        assert_eq!(footer(&model, 100), "^B 快捷指令");
+        assert_eq!(footer(&model, 100), format!("{COMMAND_SHORTCUT} 快捷指令"));
         model.notice.clear();
-        assert_eq!(footer(&model, 100), "^B 快捷指令");
+        assert_eq!(footer(&model, 100), format!("{COMMAND_SHORTCUT} 快捷指令"));
     }
 
     fn host(name: &str, state: HostState) -> HostItem {
@@ -2853,8 +2870,62 @@ mod tests {
     }
 
     #[test]
+    fn command_shortcut_repeat_preserves_modifiers_and_release_pairing() {
+        let geometry = Geometry {
+            terminal: Rect::new(24, 1, 74, 28),
+            ..Geometry::default()
+        };
+        for modifiers in [KeyModifiers::SUPER, KeyModifiers::CONTROL] {
+            let mut model = Model {
+                focus: Focus::Terminal,
+                ..Model::default()
+            };
+            let press = KeyEvent::new(KeyCode::Char('b'), modifiers);
+            let release =
+                KeyEvent::new_with_kind(KeyCode::Char('b'), modifiers, KeyEventKind::Release);
+            assert!(matches!(
+                handle_event(&mut model, Event::Key(press), &geometry),
+                Action::None
+            ));
+            assert!(model.commands_open());
+            assert!(matches!(
+                handle_event(&mut model, Event::Key(release), &geometry),
+                Action::None
+            ));
+            assert!(
+                model.commands_open(),
+                "consumed shortcut release keeps the guide open"
+            );
+            assert!(
+                matches!(handle_event(&mut model, Event::Key(press), &geometry), Action::SendKey(key) if key == press)
+            );
+            assert!(!model.commands_open());
+            assert!(
+                matches!(handle_event(&mut model, Event::Key(release), &geometry), Action::SendKey(key) if key == release)
+            );
+        }
+        let mut model = Model {
+            focus: Focus::Terminal,
+            ..Model::default()
+        };
+        let modified = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::SUPER | KeyModifiers::ALT);
+        assert!(
+            matches!(handle_event(&mut model, Event::Key(modified), &geometry), Action::SendKey(key) if key == modified)
+        );
+        assert!(
+            !model.commands_open(),
+            "unrelated Super combinations stay with the application"
+        );
+    }
+
+    #[test]
     fn command_popup_covers_terminal_and_consumes_mouse_paste_and_unknown_keys() {
-        for (width, height) in [(40, 10), (100, 30)] {
+        for (width, height, shortcut_modifiers) in [
+            (40, 10, KeyModifiers::CONTROL),
+            (40, 10, KeyModifiers::SUPER),
+            (100, 30, KeyModifiers::CONTROL),
+            (100, 30, KeyModifiers::SUPER),
+        ] {
             let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
             let mut model = Model {
                 hosts: vec![host("我的电脑", HostState::Local)],
@@ -2885,7 +2956,7 @@ mod tests {
             assert!(matches!(
                 handle_event(
                     &mut model,
-                    Event::Key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL)),
+                    Event::Key(KeyEvent::new(KeyCode::Char('b'), shortcut_modifiers)),
                     &geometry
                 ),
                 Action::None

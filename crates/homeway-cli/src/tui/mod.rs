@@ -52,7 +52,8 @@ fn options(args: &[String]) -> Result<Option<Options>, Error> {
         .iter()
         .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
     {
-        println!("用法：homeway tui [--state DIR]\n\n鼠标：左键选择；右键管理主机/会话；标题栏 + 添加。\n键盘：Ctrl+B 后 h/s/Enter 选主机/会话/终端；\n      Ctrl+B 后 a/n 添加主机/创建会话；m 操作菜单；q 分离退出。\n      侧栏中 F6 切焦点、F10 退出；Ctrl+B Ctrl+B 发送 Ctrl+B。\n历史：滚轮浏览；应用捕获鼠标时用 Shift+滚轮；Shift+PageUp/PageDown/Home/End。\n主题随终端背景自动识别。会话中的普通按键交给终端；退出后会话继续运行。");
+        let shortcut = view::COMMAND_SHORTCUT;
+        println!("用法：homeway tui [--state DIR]\n\n鼠标：左键选择；右键管理主机/会话；标题栏 + 添加。\n键盘：{shortcut} 后 h/s/Enter 选主机/会话/终端；\n      {shortcut} 后 a/n 添加主机/创建会话；m 操作菜单；q 分离退出。\n      侧栏中 F6 切焦点、F10 退出；Ctrl+B 保留兼容；Ctrl+B Ctrl+B 发送 Ctrl+B。\n历史：滚轮浏览；应用捕获鼠标时用 Shift+滚轮；Shift+PageUp/PageDown/Home/End。\n主题随终端背景自动识别。会话中的普通按键交给终端；退出后会话继续运行。");
         return Ok(None);
     }
     let mut parsed = Options {
@@ -2404,7 +2405,10 @@ mod tests {
     fn real_history_footer_returns_to_live_and_disappears_when_sessions_are_cleared() {
         let mut app = history_app();
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
-        assert_eq!(screen(&mut app, &mut terminal).1.trim(), "^B 快捷指令");
+        assert_eq!(
+            screen(&mut app, &mut terminal).1.trim(),
+            format!("{} 快捷指令", view::COMMAND_SHORTCUT)
+        );
         app.action(Action::Scroll(view::HistoryAction::Start))
             .unwrap();
         let footer = screen(&mut app, &mut terminal).1;
@@ -2426,7 +2430,10 @@ mod tests {
         app.action(Action::Scroll(view::HistoryAction::End))
             .unwrap();
         let footer = screen(&mut app, &mut terminal).1;
-        assert_eq!(footer.trim(), "^B 快捷指令");
+        assert_eq!(
+            footer.trim(),
+            format!("{} 快捷指令", view::COMMAND_SHORTCUT)
+        );
         app.action(Action::Scroll(view::HistoryAction::Start))
             .unwrap();
         let footer = screen(&mut app, &mut terminal).1;
@@ -2441,7 +2448,10 @@ mod tests {
         });
         assert!(app.surface.is_none() && app.model.selected_session.is_none());
         let footer = screen(&mut app, &mut terminal).1;
-        assert_eq!(footer.trim(), "^B 快捷指令");
+        assert_eq!(
+            footer.trim(),
+            format!("{} 快捷指令", view::COMMAND_SHORTCUT)
+        );
     }
 
     #[test]
