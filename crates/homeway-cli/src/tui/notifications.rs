@@ -14,7 +14,6 @@ const TITLE_BYTES: usize = 128;
 const BODY_BYTES: usize = 512;
 const HELPER_TIMEOUT: Duration = Duration::from_secs(2);
 const POLL_INTERVAL: Duration = Duration::from_millis(20);
-const APPLESCRIPT: &str = "on run argv\n display notification (item 3 of argv) with title (item 1 of argv) subtitle (item 2 of argv)\nend run";
 
 #[derive(Debug, thiserror::Error)]
 pub(super) enum Error {
@@ -55,7 +54,18 @@ impl Request {
 impl Notifications {
     pub(super) fn start() -> Self {
         Self::spawn(|request, stopping| {
-            deliver(request, clipboard::remote_terminal(), stopping, native)
+            let platform = if cfg!(target_os = "macos") {
+                Platform::Mac
+            } else {
+                Platform::Unix
+            };
+            deliver(
+                request,
+                platform,
+                clipboard::remote_terminal(),
+                stopping,
+                native,
+            )
         })
     }
 
@@ -174,14 +184,22 @@ fn send_terminal(sender: &SyncSender<String>, mut sequence: String, stopping: &A
     false
 }
 
-fn deliver<F>(request: Request, remote: bool, stopping: &AtomicBool, native: F) -> Option<String>
+fn deliver<F>(
+    request: Request,
+    platform: Platform,
+    remote: bool,
+    stopping: &AtomicBool,
+    native: F,
+) -> Option<String>
 where
     F: FnOnce(&Request, &AtomicBool) -> bool,
 {
     if stopping.load(Ordering::Acquire) {
         return None;
     }
-    if remote || !native(&request, stopping) {
+    // The host terminal owns the source session and any notification click.
+    // Never submit macOS notifications under an unrelated script/app identity.
+    if matches!(platform, Platform::Mac) || remote || !native(&request, stopping) {
         return (!stopping.load(Ordering::Acquire)).then(|| request.terminal());
     }
     None
@@ -193,32 +211,17 @@ enum Platform {
     Unix,
 }
 
-fn helper(request: &Request, platform: Platform) -> Command {
-    match platform {
-        Platform::Mac => {
-            let mut command = Command::new("osascript");
-            // 固定首个非option实参；其余用户文本仅作为 run argv，永不拼入脚本。
-            command.args(["-e", APPLESCRIPT, "homeway", &request.title, &request.body]);
-            command
-        }
-        Platform::Unix => {
-            let mut command = Command::new("notify-send");
-            command.args(["--app-name=homeway", "--", &request.title, &request.body]);
-            command
-        }
-    }
+fn helper(request: &Request) -> Command {
+    let mut command = Command::new("notify-send");
+    command.args(["--app-name=homeway", "--", &request.title, &request.body]);
+    command
 }
 
 fn native(request: &Request, stopping: &AtomicBool) -> bool {
     if stopping.load(Ordering::Acquire) {
         return false;
     }
-    let platform = if cfg!(target_os = "macos") {
-        Platform::Mac
-    } else {
-        Platform::Unix
-    };
-    let mut command = helper(request, platform);
+    let mut command = helper(request);
     command
         .stdin(Stdio::null())
         .stdout(Stdio::null())
@@ -264,6 +267,7 @@ mod tests {
         assert_eq!(
             deliver(
                 Request::new("需要操作", "主机 · 会话"),
+                Platform::Unix,
                 true,
                 &stopping,
                 |_, _| { panic!("remote notifications must not use the remote desktop") }
@@ -273,6 +277,7 @@ mod tests {
         assert_eq!(
             deliver(
                 Request::new("需要操作", "主机 · 会话"),
+                Platform::Unix,
                 false,
                 &stopping,
                 |_, _| false
@@ -281,11 +286,38 @@ mod tests {
         );
         assert!(deliver(
             Request::new("需要操作", "主机"),
+            Platform::Unix,
             false,
             &stopping,
             |_, _| true
         )
         .is_none());
+    }
+
+    #[test]
+    fn mac_notifications_always_belong_to_the_host_terminal_without_a_native_helper() {
+        for remote in [false, true] {
+            let stopping = AtomicBool::new(false);
+            assert_eq!(
+                deliver(
+                    Request::new("title", "原主机 · 原会话"),
+                    Platform::Mac,
+                    remote,
+                    &stopping,
+                    |_, _| panic!("macOS must not launch a script or native notification helper")
+                ),
+                Some("\x1b]9;homeway · title — 原主机 · 原会话\x1b\\".into())
+            );
+            stopping.store(true, Ordering::Release);
+            assert!(deliver(
+                Request::new("title", "body"),
+                Platform::Mac,
+                remote,
+                &stopping,
+                |_, _| panic!("cancelled macOS request must not launch a helper")
+            )
+            .is_none());
+        }
     }
 
     #[test]
@@ -301,20 +333,9 @@ mod tests {
     }
 
     #[test]
-    fn native_arguments_keep_untrusted_text_outside_scripts_and_options() {
+    fn native_arguments_keep_untrusted_text_outside_options() {
         let request = Request::new("-e do shell script \"bad\"", "--evil $(command)\n会话");
-        let mac = helper(&request, Platform::Mac);
-        let mac_args: Vec<_> = mac
-            .get_args()
-            .map(|value| value.to_str().unwrap())
-            .collect();
-        assert_eq!(mac.get_program(), "osascript");
-        assert_eq!(
-            mac_args,
-            ["-e", APPLESCRIPT, "homeway", &request.title, &request.body]
-        );
-        assert!(!APPLESCRIPT.contains("do shell script"));
-        let unix = helper(&request, Platform::Unix);
+        let unix = helper(&request);
         let unix_args: Vec<_> = unix
             .get_args()
             .map(|value| value.to_str().unwrap())
@@ -371,12 +392,14 @@ mod tests {
     #[test]
     fn cancelled_delivery_does_not_submit_or_emit_a_fallback() {
         let stopping = AtomicBool::new(true);
-        assert!(
-            deliver(Request::new("title", "body"), false, &stopping, |_, _| {
-                panic!("cancelled notification must not launch a helper")
-            })
-            .is_none()
-        );
+        assert!(deliver(
+            Request::new("title", "body"),
+            Platform::Unix,
+            false,
+            &stopping,
+            |_, _| { panic!("cancelled notification must not launch a helper") }
+        )
+        .is_none());
         let (sender, _receiver) = mpsc::sync_channel(1);
         assert!(!send_terminal(&sender, "not sent".into(), &stopping));
 

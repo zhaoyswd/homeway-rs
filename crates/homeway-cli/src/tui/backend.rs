@@ -125,8 +125,8 @@ pub(super) struct Session {
     #[serde(rename = "stateV2")]
     pub state: SessionState,
     pub cwd: Option<String>,
-    #[serde(rename = "lastActiveMs")]
-    pub last_active_ms: i64,
+    #[serde(rename = "createdMs")]
+    pub created_ms: i64,
     pub pid: i32,
     /// 仅由本机真实进程祖先链判定，永不相信远端同号 PID 或会话名字。
     #[serde(skip)]
@@ -671,9 +671,11 @@ impl Worker {
         } else if *target == Target::Local {
             self.self_sessions.clear();
         }
-        sessions
-            .sessions
-            .sort_by_key(|s| std::cmp::Reverse(s.last_active_ms));
+        sessions.sessions.sort_by(|left, right| {
+            left.created_ms
+                .cmp(&right.created_ms)
+                .then_with(|| left.name.cmp(&right.name))
+        });
         Ok(sessions.sessions)
     }
 
@@ -1377,6 +1379,65 @@ mod tests {
         tx.send(1).unwrap();
         let alive = AtomicBool::new(false);
         assert!(!deliver(&tx, 2, &alive));
+    }
+
+    #[test]
+    fn session_order_survives_output_activity_and_unordered_list_replies() {
+        use homeway_core::term::{
+            frames::{self, Op},
+            wire::FrameIo,
+        };
+        let root = temporary("stable-session-order");
+        let listener = UnixListener::bind(root.join("term.sock")).unwrap();
+        let server = std::thread::spawn(move || {
+            for reversed in [false, true] {
+                let (socket, _) = listener.accept().unwrap();
+                let mut io = FrameIo::new(socket);
+                io.write_frame(Op::GREETING, &frames::enc_greeting(), REQUEST_BUDGET)
+                    .unwrap();
+                assert_eq!(io.read_frame_deadline(REQUEST_BUDGET).unwrap().op, Op::LIST);
+                let mut sessions = vec![
+                    json!({"name":"new", "createdMs":200, "lastActiveMs":if reversed { 1 } else { 9999 }, "stateV2":"working"}),
+                    json!({"name":"b", "createdMs":100, "lastActiveMs":if reversed { 9999 } else { 1 }, "stateV2":"blocked"}),
+                    json!({"name":"a", "createdMs":100, "lastActiveMs":500}),
+                    json!({"name":"legacy-z", "lastActiveMs":800}),
+                    json!({"name":"legacy-a", "lastActiveMs":700}),
+                ];
+                if reversed {
+                    sessions.reverse();
+                }
+                io.write_frame(
+                    Op::LIST,
+                    &serde_json::to_vec(&json!({"sessions":sessions})).unwrap(),
+                    REQUEST_BUDGET,
+                )
+                .unwrap();
+            }
+        });
+        let mut worker = Worker {
+            state_dir: root.clone(),
+            control: None,
+            self_sessions: Default::default(),
+        };
+        for _ in 0..2 {
+            let sessions = worker.sessions(&Target::Local).unwrap();
+            assert_eq!(
+                sessions
+                    .iter()
+                    .map(|session| session.name.as_str())
+                    .collect::<Vec<_>>(),
+                ["legacy-a", "legacy-z", "a", "b", "new"]
+            );
+            assert_eq!(
+                sessions
+                    .iter()
+                    .map(|session| session.created_ms)
+                    .collect::<Vec<_>>(),
+                [0, 0, 100, 100, 200]
+            );
+        }
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
     }
 
     #[test]
