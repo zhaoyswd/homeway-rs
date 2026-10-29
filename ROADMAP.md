@@ -72,6 +72,14 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-10-29 v0.3.24 提交/推送/发版（进行中，不部署）**：用户明确授权该链路，覆盖
+> 本轮五个TUI提交。workspace及锁定四自有包版本0.3.24、CHANGELOG与Release正文已准备，
+> 独立技术/代码两门通过，第三方锁依赖不变。root接续完整ci-local→push main→主分支CI→
+> main头tag→五平台Release→下载校验；尚未推送/tag/发布，不提前记成功。
+> 旧README提交7f42818的CI40719491410曾Mac core 929/1/6 ignored，pf_dial_requires_island
+> 断言失败已留证，未归因且未改core，本轮真实检查待验证。
+> 发布工件与后续实证见 `docs/reviews/2026-10-29-tui-v0.3.24-release.md`。
+
 > **2026-10-29 TUI 稳定会话排序与通知点击归属（完成，本地源码）**：会话列表不再按随
 > PTY输出改变的lastActiveMs排序，改createdMs升序/name并列补齐，新会话后排、选中按name
 > 保持。macOS移除osascript通知来源，统一OSC9交承载终端绑定会话/点击；不猜终端应用或
