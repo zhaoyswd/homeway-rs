@@ -573,24 +573,20 @@ pub(super) fn draw(
                 format!("  {}", clean(&notice.summary))
             } else if host.state == HostState::Local {
                 format!(
-                    "exit:{} relay:{}",
+                    "  exit:{} relay:{}",
                     if host.exit_on { "on" } else { "off" },
                     if host.relay_on { "on" } else { "off" }
                 )
             } else {
                 format!(
-                    "{label} {} proxy:{}",
+                    "  {label} {} proxy:{}",
                     host.rtt_ms
                         .map(|ms| format!("{ms}ms"))
                         .unwrap_or_else(|| "--ms".into()),
                     if host.proxy_on { "on" } else { "off" }
                 )
             };
-            let detail_area = if notice.is_some() {
-                Rect::new(row.x + 1, y + 1, row.width.saturating_sub(1), 1)
-            } else {
-                Rect::new(row.x, y + 1, row.width, 1)
-            };
+            let detail_area = Rect::new(row.x + 1, y + 1, row.width.saturating_sub(1), 1);
             text(
                 frame,
                 detail_area,
@@ -2231,8 +2227,8 @@ mod tests {
                 ));
             }
         }
-        // Normal details use the full content row, including the former left
-        // padding cell: the longest unknown/offline label is exactly 22 columns.
+        // Host details align with the title text and session details; long
+        // fields are clipped at the existing sidebar boundary.
         for theme in [Theme::Dark, Theme::Light] {
             for (state, rtt_ms, proxy_on, exit_on, relay_on, expected) in [
                 (
@@ -2291,6 +2287,14 @@ mod tests {
                 item.relay_on = relay_on;
                 let mut model = Model {
                     hosts: vec![item],
+                    sessions: vec![SessionItem {
+                        name: "session".into(),
+                        title: "会话".into(),
+                        agent: "shell".into(),
+                        project: "project".into(),
+                        state: SessionState::Idle,
+                        self_session: false,
+                    }],
                     theme,
                     ..Default::default()
                 };
@@ -2304,7 +2308,23 @@ mod tests {
                 let detail = (row.x..row.right())
                     .map(|x| buffer[(x, row.y + 1)].symbol())
                     .collect::<String>();
-                assert_eq!(detail.trim_end(), expected);
+                let visible = expected
+                    .chars()
+                    .take(usize::from(row.width.saturating_sub(3)))
+                    .collect::<String>();
+                assert_eq!(detail.trim_end(), format!("   {visible}"));
+                let title_x = (row.x..row.right())
+                    .find(|&x| buffer[(x, row.y)].symbol() == "主")
+                    .unwrap();
+                let detail_x = (row.x..row.right())
+                    .find(|&x| buffer[(x, row.y + 1)].symbol() != " ")
+                    .unwrap();
+                let session_x = (geometry.sessions.x..geometry.sessions.right())
+                    .find(|&x| buffer[(x, geometry.sessions.y + 1)].symbol() != " ")
+                    .unwrap();
+                assert_eq!(detail_x, title_x);
+                assert_eq!(detail_x, session_x);
+                assert_eq!(detail_x, row.x + 3);
                 assert!(buffer_line(buffer, row.y).contains("● 主机"));
                 assert!(!buffer_line(buffer, row.y).contains("【"));
                 assert_eq!(buffer[(row.x - 1, row.y + 1)].symbol(), "│");
