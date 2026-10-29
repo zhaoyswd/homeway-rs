@@ -79,6 +79,10 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 > 旧README提交7f42818的CI40719491410曾Mac core 929/1/6 ignored，pf_dial_requires_island
 > 断言失败已留证，未归因且未改core，本轮真实检查待验证。
 > 发布工件与后续实证见 `docs/reviews/2026-10-29-tui-v0.3.24-release.md`。
+> root本地完整quick门已实际exit0（2026-10-29 15:46:20）：workspace1461/0、40 ignored，
+> clippy/OHOScheck/真link2943728B/符号版本/隔离/向量/种子/词表/残留全过；私有RRR316秒，
+> 100MB哈希一致、E10/FB-files通过，原E11 WARN/DNS SKIP保留，未跑--full。旧失败用例本轮
+> 通过但旧失败根因仍未证。版本提交523bd35与检查证据待推main；未打tag或发布。
 
 > **2026-10-29 TUI 稳定会话排序与通知点击归属（完成，本地源码）**：会话列表不再按随
 > PTY输出改变的lastActiveMs排序，改createdMs升序/name并列补齐，新会话后排、选中按name
