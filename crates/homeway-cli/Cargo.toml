@@ -26,7 +26,7 @@ thiserror.workspace = true
 
 # TUI 仅在支持 term 服务的 Unix CLI 编译，不进入 core/capi 的依赖图。
 [target.'cfg(not(windows))'.dependencies]
-ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29"] }
+ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "unstable-rendered-line-info"] }
 crossterm = "0.29"
 
 # WIN 批（2026-10-13）：windows 系统面（控制台事件——stopsig；spawn flags）。

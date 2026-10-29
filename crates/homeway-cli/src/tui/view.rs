@@ -888,56 +888,88 @@ fn draw_commands(frame: &mut Frame<'_>, model: &mut Model, p: Palette) {
         rect,
     );
     let content = inner(rect);
+    if content.is_empty() {
+        model.command_detail_offset = 0;
+        return;
+    }
     let commands = [
         "h 主机  s 会话  Enter 终端",
         "n 新建会话  a 添加主机",
         "m 操作菜单  q 分离退出",
         "Ctrl+B 连按发送 Ctrl+B  Esc 取消",
     ];
-    for (index, command) in commands.into_iter().enumerate() {
-        if index as u16 >= content.height {
-            break;
-        }
+    let history = if model.history_behind > 0 {
+        format!("历史：{}行；Shift+End 回到底部。", model.history_behind)
+    } else {
+        String::new()
+    };
+    let notice = model
+        .item_notice
+        .as_ref()
+        .map_or(String::new(), |notice| clean(&notice.detail));
+    let detail = match (history.is_empty(), notice.is_empty()) {
+        (false, false) => format!("{history}\n{notice}"),
+        (false, true) => history,
+        (_, _) => notice,
+    };
+    let show_detail = content.height > 5 && !detail.is_empty();
+    let detail_heading = "详情 · ↑↓滚动";
+    let width = commands
+        .iter()
+        .map(|line| Line::from(*line).width())
+        .chain(show_detail.then(|| Line::from(detail_heading).width()))
+        .chain(
+            detail
+                .lines()
+                .filter(|_| show_detail)
+                .map(|line| Line::from(line).width()),
+        )
+        .max()
+        .unwrap_or(0)
+        .min(usize::from(content.width)) as u16;
+    let paragraph = Paragraph::new(detail).wrap(Wrap { trim: false });
+    let detail_lines = if show_detail {
+        paragraph.line_count(width)
+    } else {
+        0
+    };
+    let detail_height = detail_lines.min(usize::from(content.height.saturating_sub(5))) as u16;
+    let height =
+        content.height.min(commands.len() as u16) + if show_detail { 1 + detail_height } else { 0 };
+    let group = Rect::new(
+        content.x + (content.width - width) / 2,
+        content.y + (content.height - height) / 2,
+        width,
+        height,
+    );
+    for (index, command) in commands
+        .into_iter()
+        .enumerate()
+        .take(usize::from(group.height))
+    {
         text(
             frame,
-            Rect::new(content.x, content.y + index as u16, content.width, 1),
+            Rect::new(group.x, group.y + index as u16, group.width, 1),
             command,
             Style::default().fg(p.fg).bg(p.bg),
         );
     }
-    if content.height > 5 {
-        let history = if model.history_behind > 0 {
-            format!("历史：{}行；Shift+End 回到底部。", model.history_behind)
-        } else {
-            String::new()
-        };
-        let notice = model
-            .item_notice
-            .as_ref()
-            .map_or(String::new(), |notice| clean(&notice.detail));
-        let detail = match (history.is_empty(), notice.is_empty()) {
-            (false, false) => format!("{history}\n{notice}"),
-            (false, true) => history,
-            (_, _) => notice,
-        };
-        if !detail.is_empty() {
-            text(
-                frame,
-                Rect::new(content.x, content.y + 4, content.width, 1),
-                "详情 · ↑↓滚动",
-                Style::default().fg(p.muted).bg(p.bg),
-            );
-            model.command_detail_offset = model
-                .command_detail_offset
-                .min(u16::try_from(detail.chars().count()).unwrap_or(u16::MAX));
-            frame.render_widget(
-                Paragraph::new(detail)
-                    .style(Style::default().fg(p.amber).bg(p.bg))
-                    .wrap(Wrap { trim: false })
-                    .scroll((model.command_detail_offset, 0)),
-                Rect::new(content.x, content.y + 5, content.width, content.height - 5),
-            );
-        }
+    model.command_detail_offset = model.command_detail_offset.min(
+        u16::try_from(detail_lines.saturating_sub(usize::from(detail_height))).unwrap_or(u16::MAX),
+    );
+    if show_detail {
+        text(
+            frame,
+            Rect::new(group.x, group.y + 4, group.width, 1),
+            detail_heading,
+            Style::default().fg(p.muted).bg(p.bg),
+        );
+        frame.render_widget(
+            paragraph
+                .style(Style::default().fg(p.amber).bg(p.bg))
+                .scroll((model.command_detail_offset, 0)),
+            Rect::new(group.x, group.y + 5, group.width, detail_height),
+        );
     }
 }
 
@@ -2411,6 +2443,7 @@ mod tests {
             ("small-light", Theme::Light, true, 40, 10),
             ("commands-dark", Theme::Dark, false, 100, 30),
             ("commands-light", Theme::Light, false, 100, 30),
+            ("commands-long-light", Theme::Light, false, 100, 30),
             ("commands-small-light", Theme::Light, false, 40, 10),
             ("empty-light", Theme::Light, false, 100, 30),
             ("status-light", Theme::Light, false, 100, 30),
@@ -2470,7 +2503,13 @@ mod tests {
                         name: "session-1".into(),
                     },
                     summary: "已发复制请求".into(),
-                    detail: "选中内容已提交终端剪贴板请求；请在承载终端中允许写入剪贴板。".into(),
+                    detail: if name == "commands-long-light" {
+                        (0..160).map(|index| format!("详情{index:03} ")).collect()
+                    } else if name.starts_with("commands") {
+                        "已提交终端剪贴板请求。".into()
+                    } else {
+                        "选中内容已提交终端剪贴板请求；请在承载终端中允许写入剪贴板。".into()
+                    },
                 });
                 model.prefix = name.starts_with("commands");
             }
@@ -2735,7 +2774,10 @@ mod tests {
         model.item_notice = Some(ItemNotice {
             target: NoticeTarget::Host(Target::Local),
             summary: "详情".into(),
-            detail: (0..40).map(|index| format!("详情{index:02} ")).collect(),
+            detail: (0..160)
+                .map(|index| format!("详情{index:03} "))
+                .collect::<String>()
+                + "END_OF_DETAIL",
         });
         model.prefix = true;
         terminal
@@ -2778,6 +2820,15 @@ mod tests {
             .draw(|frame| draw_commands(frame, &mut model, Theme::Dark.palette()))
             .unwrap();
         assert_eq!(detail(&terminal), first_detail_line);
+        model.command_detail_offset = u16::MAX;
+        terminal
+            .draw(|frame| draw_commands(frame, &mut model, Theme::Dark.palette()))
+            .unwrap();
+        assert!(model.command_detail_offset > 0 && model.command_detail_offset < u16::MAX);
+        assert!(
+            (0..30).any(|y| buffer_line(terminal.backend().buffer(), y).contains("END_OF_DETAIL")),
+            "the last scroll position shows real detail instead of blank rows"
+        );
         assert!(model.mouse_reporting);
         model.reset_sessions();
         assert!(!model.mouse_reporting);
@@ -3177,12 +3228,30 @@ mod tests {
             assert!(left.abs_diff(width - right - 1) <= 1);
             assert!(title_y.abs_diff(height - bottom - 1) <= 1);
             assert!(right - left < 64 && bottom - title_y < 16);
-            assert!(buffer_line(buffer, title_y + 1).contains("h 主机  s 会话  Enter 终端"));
-            assert!(buffer_line(buffer, title_y + 2).contains("n 新建会话  a 添加主机"));
-            assert!(buffer_line(buffer, title_y + 3).contains("m 操作菜单  q 分离退出"));
-            assert!(buffer_line(buffer, title_y + 4).contains("Ctrl+B 连按发送 Ctrl+B  Esc 取消"));
-            assert!(buffer_line(buffer, title_y + 5).contains("详情 · ↑↓滚动"));
-            assert!(buffer_line(buffer, title_y + 6).contains("错误"));
+            let first_y = (title_y + 1..bottom)
+                .find(|&y| buffer_line(buffer, y).contains("h 主机  s 会话  Enter 终端"))
+                .unwrap();
+            assert!(buffer_line(buffer, first_y + 1).contains("n 新建会话  a 添加主机"));
+            assert!(buffer_line(buffer, first_y + 2).contains("m 操作菜单  q 分离退出"));
+            assert!(buffer_line(buffer, first_y + 3).contains("Ctrl+B 连按发送 Ctrl+B  Esc 取消"));
+            assert!(buffer_line(buffer, first_y + 4).contains("详情 · ↑↓滚动"));
+            assert!(buffer_line(buffer, first_y + 5).contains("错误"));
+            assert!(
+                (first_y - title_y - 1).abs_diff(bottom - first_y - 6) <= 1,
+                "six visible content rows are vertically centered"
+            );
+            let first_x = (left + 1..right)
+                .find(|&x| buffer[(x, first_y)].symbol() == "h")
+                .unwrap();
+            let group_width = Line::from("Ctrl+B 连按发送 Ctrl+B  Esc 取消").width() as u16;
+            assert!(
+                (first_x - left - 1).abs_diff(right - first_x - group_width) <= 1,
+                "shared content block is centered using display columns"
+            );
+            for (offset, symbol) in [(0, "h"), (1, "n"), (2, "m"), (3, "C"), (4, "详"), (5, "错")]
+            {
+                assert_eq!(buffer[(first_x, first_y + offset)].symbol(), symbol);
+            }
             for y in 0..height {
                 for x in 0..width {
                     if x < left || x > right || y < title_y || y > bottom {
