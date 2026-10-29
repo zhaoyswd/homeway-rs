@@ -72,17 +72,21 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
-> **2026-10-29 v0.3.24 提交/推送/发版（进行中，不部署）**：用户明确授权该链路，覆盖
+> **2026-10-29 v0.3.24 提交/推送/发版（完成，不部署）**：用户明确授权该链路，覆盖
 > 本轮五个TUI提交。workspace及锁定四自有包版本0.3.24、CHANGELOG与Release正文已准备，
 > 独立技术/代码两门通过，第三方锁依赖不变。root接续完整ci-local→push main→主分支CI→
-> main头tag→五平台Release→下载校验；尚未推送/tag/发布，不提前记成功。
+> main头tag→五平台Release→下载校验均完成。
 > 旧README提交7f42818的CI40719491410曾Mac core 929/1/6 ignored，pf_dial_requires_island
 > 断言失败已留证，未归因且未改core，本轮真实检查待验证。
 > 发布工件与后续实证见 `docs/reviews/2026-10-29-tui-v0.3.24-release.md`。
 > root本地完整quick门已实际exit0（2026-10-29 15:46:20）：workspace1461/0、40 ignored，
 > clippy/OHOScheck/真link2943728B/符号版本/隔离/向量/种子/词表/残留全过；私有RRR316秒，
 > 100MB哈希一致、E10/FB-files通过，原E11 WARN/DNS SKIP保留，未跑--full。旧失败用例本轮
-> 通过但旧失败根因仍未证。版本提交523bd35与检查证据待推main；未打tag或发布。
+> 通过但旧失败根因仍未证。版本523bd35及检查点a5fcc9d已推main，新CI40837697385全部
+> success后在main头a5fcc9d创建并推送v0.3.24；Release40838113675五平台及发布job全部success，
+> 已公开为latest。五个官方压缩包及SHA256SUMS本机下载全部校验通过，解包文件名/架构核验
+> 通过、两Linux为静态，Mac arm64官方件版本v0.3.24且严格签名通过；Release正文与新CHANGELOG
+> 一致。未安装、未重启服务、未访问生产state；实际发布/产物校验见该review末节。
 
 > **2026-10-29 TUI 稳定会话排序与通知点击归属（完成，本地源码）**：会话列表不再按随
 > PTY输出改变的lastActiveMs排序，改createdMs升序/name并列补齐，新会话后排、选中按name
