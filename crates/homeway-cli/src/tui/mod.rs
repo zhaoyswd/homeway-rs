@@ -2087,7 +2087,7 @@ fn local_host(exit_on: bool, relay_on: bool) -> view::HostItem {
     view::HostItem {
         target: Target::Local,
         name: "我的电脑".into(),
-        detail: String::new(),
+        rtt_ms: None,
         state: view::HostState::Local,
         exit_on,
         relay_on,
@@ -2096,15 +2096,10 @@ fn local_host(exit_on: bool, relay_on: bool) -> view::HostItem {
 }
 
 fn host_item(host: &backend::Host) -> view::HostItem {
-    let endpoint = host.endpoint.as_deref().unwrap_or("IP 未知");
-    let delay = host
-        .rtt_ms
-        .map(|ms| format!("{ms} ms"))
-        .unwrap_or_else(|| "-- ms".into());
     view::HostItem {
         target: Target::Remote(host.id.clone()),
         name: host.name.clone(),
-        detail: format!("{endpoint}  {delay}"),
+        rtt_ms: host.rtt_ms,
         state: match host.state {
             backend::LinkState::Direct => view::HostState::Direct,
             backend::LinkState::Relay => view::HostState::Relay,

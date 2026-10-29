@@ -69,7 +69,6 @@ pub(super) struct Host {
     pub id: String,
     pub name: String,
     pub state: LinkState,
-    pub endpoint: Option<String>,
     pub rtt_ms: Option<i64>,
     pub proxy: Option<u16>,
 }
@@ -90,9 +89,6 @@ fn host_from_snapshot(brief: HostBrief, state: Option<&HostState>, proxy: Option
             Some(_) => LinkState::Direct,
             None => LinkState::Offline,
         },
-        endpoint: link
-            .filter(|link| !link.ep.is_empty())
-            .map(|link| link.ep.clone()),
         rtt_ms: link.filter(|link| link.rtt_ms >= 0).map(|link| link.rtt_ms),
         id: brief.id,
         proxy,
@@ -1345,7 +1341,6 @@ mod tests {
         let mut state: HostState = serde_json::from_value(json!({"id":brief.id,"state":"ready","link":{"via":"direct","ep":"127.0.0.1:42651","rttMs":3,"at":42}})).unwrap();
         let direct = host_from_snapshot(brief.clone(), Some(&state), Some(1080));
         assert_eq!(direct.state, LinkState::Direct);
-        assert_eq!(direct.endpoint.as_deref(), Some("127.0.0.1:42651"));
         assert_eq!(direct.rtt_ms, Some(3));
         state.link.as_mut().unwrap().via = "relay".into();
         assert_eq!(
@@ -1355,11 +1350,11 @@ mod tests {
         state.link.as_mut().unwrap().rtt_ms = -1;
         state.link.as_mut().unwrap().ep.clear();
         let missing = host_from_snapshot(brief.clone(), Some(&state), None);
-        assert_eq!((missing.endpoint, missing.rtt_ms), (None, None));
+        assert_eq!(missing.rtt_ms, None);
         state.state = "failed".into();
         let stale = host_from_snapshot(brief.clone(), Some(&state), None);
         assert_eq!(stale.state, LinkState::Offline);
-        assert_eq!((stale.endpoint, stale.rtt_ms), (None, None));
+        assert_eq!(stale.rtt_ms, None);
         state.state = "ready".into();
         state.link.as_mut().unwrap().via = "none".into();
         assert_eq!(

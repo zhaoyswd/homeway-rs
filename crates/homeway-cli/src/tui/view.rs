@@ -104,7 +104,7 @@ pub(super) enum HostState {
 pub(super) struct HostItem {
     pub target: Target,
     pub name: String,
-    pub detail: String,
+    pub rtt_ms: Option<i64>,
     pub state: HostState,
     pub exit_on: bool,
     pub relay_on: bool,
@@ -549,21 +549,17 @@ pub(super) fn draw(
         );
         frame.render_widget(Block::default().style(Style::default().bg(bg)), row);
         let (label, color) = match host.state {
-            HostState::Local => ("本地", p.accent),
-            HostState::Direct => ("直连", p.green),
-            HostState::Relay => ("中继", p.amber),
-            HostState::Offline => ("离线", p.muted),
+            HostState::Local => ("local", p.accent),
+            HostState::Direct => ("direct", p.green),
+            HostState::Relay => ("relay", p.amber),
+            HostState::Offline => ("offline", p.muted),
         };
         text(
             frame,
             Rect::new(row.x + 1, y, row.width.saturating_sub(1), 1),
             Line::from(vec![
                 Span::styled("● ", Style::default().fg(color)),
-                Span::raw(if host.state == HostState::Local {
-                    clean(&host.name)
-                } else {
-                    format!("【{label}】{}", clean(&host.name))
-                }),
+                Span::raw(clean(&host.name)),
             ]),
             Style::default().fg(p.fg).bg(bg).add_modifier(if selected {
                 Modifier::BOLD
@@ -577,22 +573,27 @@ pub(super) fn draw(
                 format!("  {}", clean(&notice.summary))
             } else if host.state == HostState::Local {
                 format!(
-                    "  出口{}{} 中继{}{}",
-                    if row.width < 21 { "" } else { "：" },
-                    if host.exit_on { "开" } else { "关" },
-                    if row.width < 21 { "" } else { "：" },
-                    if host.relay_on { "开" } else { "关" }
+                    "exit:{} relay:{}",
+                    if host.exit_on { "on" } else { "off" },
+                    if host.relay_on { "on" } else { "off" }
                 )
             } else {
                 format!(
-                    "  {}{}",
-                    clean(&host.detail),
-                    if host.proxy_on { " · 代理开" } else { "" }
+                    "{label} {} proxy:{}",
+                    host.rtt_ms
+                        .map(|ms| format!("{ms}ms"))
+                        .unwrap_or_else(|| "--ms".into()),
+                    if host.proxy_on { "on" } else { "off" }
                 )
+            };
+            let detail_area = if notice.is_some() {
+                Rect::new(row.x + 1, y + 1, row.width.saturating_sub(1), 1)
+            } else {
+                Rect::new(row.x, y + 1, row.width, 1)
             };
             text(
                 frame,
-                Rect::new(row.x + 1, y + 1, row.width.saturating_sub(1), 1),
+                detail_area,
                 detail,
                 Style::default()
                     .fg(if notice.is_some() { p.amber } else { p.muted })
@@ -2179,7 +2180,8 @@ mod tests {
             assert!(first.contains("● 我的电脑"));
             assert!(!first.contains("【本地】"));
             if count == 2 {
-                assert!(buffer_line(buffer, 3).contains("【直连】remote"));
+                assert!(buffer_line(buffer, 3).contains("● remote"));
+                assert!(!buffer_line(buffer, 3).contains("【"));
             }
             if count <= 2 {
                 for y in count * 2 + 1..count * 2 + 3 {
@@ -2195,6 +2197,114 @@ mod tests {
                     ),
                     Action::None
                 ));
+            }
+        }
+        // Normal details use the full content row, including the former left
+        // padding cell: the longest unknown/offline label is exactly 22 columns.
+        for theme in [Theme::Dark, Theme::Light] {
+            for (state, rtt_ms, proxy_on, exit_on, relay_on, expected) in [
+                (
+                    HostState::Local,
+                    None,
+                    false,
+                    true,
+                    false,
+                    "exit:on relay:off",
+                ),
+                (
+                    HostState::Local,
+                    None,
+                    false,
+                    false,
+                    true,
+                    "exit:off relay:on",
+                ),
+                (
+                    HostState::Direct,
+                    Some(12),
+                    true,
+                    false,
+                    false,
+                    "direct 12ms proxy:on",
+                ),
+                (
+                    HostState::Direct,
+                    Some(0),
+                    false,
+                    false,
+                    false,
+                    "direct 0ms proxy:off",
+                ),
+                (
+                    HostState::Relay,
+                    None,
+                    false,
+                    false,
+                    false,
+                    "relay --ms proxy:off",
+                ),
+                (
+                    HostState::Offline,
+                    None,
+                    false,
+                    false,
+                    false,
+                    "offline --ms proxy:off",
+                ),
+            ] {
+                let mut item = host("主机", state);
+                item.rtt_ms = rtt_ms;
+                item.proxy_on = proxy_on;
+                item.exit_on = exit_on;
+                item.relay_on = relay_on;
+                let mut model = Model {
+                    hosts: vec![item],
+                    theme,
+                    ..Default::default()
+                };
+                let mut terminal = Terminal::new(TestBackend::new(100, 30)).unwrap();
+                let mut geometry = Geometry::default();
+                terminal
+                    .draw(|frame| geometry = draw(frame, &mut model, None))
+                    .unwrap();
+                let buffer = terminal.backend().buffer();
+                let row = geometry.hosts;
+                let detail = (row.x..row.right())
+                    .map(|x| buffer[(x, row.y + 1)].symbol())
+                    .collect::<String>();
+                assert_eq!(detail.trim_end(), expected);
+                assert!(buffer_line(buffer, row.y).contains("● 主机"));
+                assert!(!buffer_line(buffer, row.y).contains("【"));
+                assert_eq!(buffer[(row.x - 1, row.y + 1)].symbol(), "│");
+                assert_eq!(buffer[(row.right(), row.y + 1)].symbol(), "│");
+                assert_eq!(buffer[(row.x, row.y + 1)].bg, theme.palette().selected);
+                assert_eq!(
+                    buffer[(row.x + 1, row.y)].fg,
+                    match state {
+                        HostState::Local => theme.palette().accent,
+                        HostState::Direct => theme.palette().green,
+                        HostState::Relay => theme.palette().amber,
+                        HostState::Offline => theme.palette().muted,
+                    }
+                );
+                model.item_notice = Some(ItemNotice {
+                    target: NoticeTarget::Host(model.hosts[0].target.clone()),
+                    summary: "提示".into(),
+                    detail: "完整提示".into(),
+                });
+                terminal
+                    .draw(|frame| {
+                        draw(frame, &mut model, None);
+                    })
+                    .unwrap();
+                assert_eq!(
+                    terminal.backend().buffer()[(row.x + 3, row.y + 1)].symbol(),
+                    "提"
+                );
+                assert_eq!(
+                    terminal.backend().buffer()[(row.x + 3, row.y + 1)].fg,
+                    theme.palette().amber
+                );
             }
         }
         let mut terminal = Terminal::new(TestBackend::new(40, 10)).unwrap();
@@ -2312,6 +2422,11 @@ mod tests {
                     host("家里", HostState::Relay),
                     host("笔记本", HostState::Offline),
                 ]);
+            }
+            hosts[0].exit_on = true;
+            if many {
+                hosts[1].proxy_on = true;
+                hosts[2].rtt_ms = Some(48);
             }
             let mut model = Model {
                 hosts,
@@ -2861,7 +2976,7 @@ mod tests {
                 Target::Remote(name.into())
             },
             name: name.into(),
-            detail: "127.0.0.1  2ms".into(),
+            rtt_ms: (state != HostState::Offline).then_some(12),
             state,
             exit_on: false,
             relay_on: false,
