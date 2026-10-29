@@ -196,6 +196,8 @@ struct App {
     state_dir: PathBuf,
     backend: Backend,
     clipboard: clipboard::Clipboard,
+    application_copies: VecDeque<ApplicationCopy>,
+    application_copy_ticket: u64,
     notifications: notifications::Notifications,
     blocking: BlockingStates,
     notification_fallbacks: VecDeque<String>,
@@ -335,9 +337,26 @@ struct SelectionCopy {
     context: SelectionContext,
 }
 
+struct ApplicationCopy {
+    ticket: u64,
+    generation: u64,
+    target: Target,
+    name: String,
+    operation: u64,
+    notice: Option<view::ItemNotice>,
+    notice_text: String,
+    _pending: clipboard::PendingWrite,
+}
+
 struct InputGeometry {
     size: (u16, u16),
     requested: Option<Instant>,
+}
+
+impl Drop for App {
+    fn drop(&mut self) {
+        self.application_copies.clear();
+    }
 }
 
 impl App {
@@ -356,6 +375,8 @@ impl App {
             backend: Backend::start(options.state.clone()),
             state_dir: options.state,
             clipboard: clipboard::Clipboard::start(),
+            application_copies: VecDeque::new(),
+            application_copy_ticket: 0,
             notifications: notifications::Notifications::start(),
             blocking: BlockingStates::default(),
             notification_fallbacks: VecDeque::new(),
@@ -800,6 +821,7 @@ impl App {
     }
 
     fn detach(&mut self) {
+        self.application_copies.clear();
         self.cancel_selection();
         self.input_geometry = None;
         self.sent_theme = None;
@@ -822,6 +844,7 @@ impl App {
     }
 
     fn disconnect(&mut self) {
+        self.application_copies.clear();
         self.cancel_selection();
         self.input_geometry = None;
         self.sent_theme = None;
@@ -1369,6 +1392,7 @@ impl App {
                     }
                 }
                 Op::ERROR => self.term_error(&frame.payload),
+                Op::CLIPBOARD => self.application_clipboard(&frame.payload),
                 _ => {}
             }
         }
@@ -1553,6 +1577,105 @@ impl App {
         self.show_error(self.session_notice_target(), "终端操作失败", detail);
     }
 
+    fn application_clipboard(&mut self, payload: &[u8]) {
+        let Some(name) = self.active_session.clone() else {
+            return;
+        };
+        let target = self.target();
+        let notice_target = view::NoticeTarget::Session {
+            target: target.clone(),
+            name: name.clone(),
+        };
+        let value = match clipboard::application_write(payload) {
+            Ok(Some(value)) => value.to_owned(),
+            Ok(None) => return,
+            Err(error) => {
+                self.show_error(
+                    notice_target,
+                    "应用复制失败",
+                    format!("应用复制失败：{error}"),
+                );
+                return;
+            }
+        };
+        self.application_copy_ticket = self.application_copy_ticket.wrapping_add(1);
+        let ticket = self.application_copy_ticket;
+        match self.clipboard.copy_application(value, ticket) {
+            Ok(pending) => self.application_copies.push_back(ApplicationCopy {
+                ticket,
+                generation: self.generation,
+                target,
+                name,
+                operation: self.operation_id,
+                notice: self.model.item_notice.clone(),
+                notice_text: self.model.notice.clone(),
+                _pending: pending,
+            }),
+            Err(error) => self.show_error(
+                notice_target,
+                "应用复制失败",
+                format!("应用复制失败：{error}"),
+            ),
+        }
+    }
+
+    fn application_clipboard_result(
+        &mut self,
+        result: clipboard::CopyResult,
+        output: &mut impl Write,
+    ) -> Result<(), Error> {
+        let Some(index) = self
+            .application_copies
+            .iter()
+            .position(|copy| copy.ticket == result.operation)
+        else {
+            return Ok(());
+        };
+        let copy = self
+            .application_copies
+            .remove(index)
+            .expect("pending application copy");
+        if copy.generation != self.generation
+            || copy.target != self.target()
+            || self.active_session.as_deref() != Some(copy.name.as_str())
+        {
+            return Ok(());
+        }
+        // A new notice can suppress feedback, never a current application's write.
+        let feedback = copy.operation == self.operation_id
+            && copy.notice == self.model.item_notice
+            && copy.notice_text == self.model.notice
+            && self.selection_copy.is_none()
+            && self.operation_copy.is_none();
+        let target = view::NoticeTarget::Session {
+            target: copy.target,
+            name: copy.name,
+        };
+        let (summary, detail, failed) = match result.status {
+            clipboard::Copied::System => ("已复制", "应用内容已复制到系统剪贴板".to_owned(), false),
+            clipboard::Copied::Terminal(sequence) => {
+                output.write_all(sequence.as_bytes())?;
+                output.flush()?;
+                (
+                    "已发复制请求",
+                    "应用内容已提交终端剪贴板请求（终端需允许 OSC52）".to_owned(),
+                    false,
+                )
+            }
+            clipboard::Copied::Failed(error) => {
+                ("应用复制失败", format!("应用复制失败：{error}"), true)
+            }
+        };
+        if feedback {
+            if failed {
+                self.show_error(target, summary, detail);
+            } else {
+                self.show_success(target, summary, detail);
+            }
+        }
+        Ok(())
+    }
+
     fn process_clipboard(&mut self) -> Result<(), Error> {
         while let Some(result) = self.clipboard.try_result() {
             self.clipboard_result(result)?;
@@ -1626,6 +1749,9 @@ impl App {
 
     fn clipboard_result(&mut self, result: clipboard::CopyResult) -> Result<(), Error> {
         self.render_dirty = true;
+        if result.purpose == clipboard::Purpose::Application {
+            return self.application_clipboard_result(result, &mut io::stdout());
+        }
         if result.purpose == clipboard::Purpose::Selection {
             let Some(copy) = self
                 .selection_copy
@@ -2615,6 +2741,145 @@ mod tests {
             pid,
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn application_copies_repeat_identical_text_without_activating_the_observer() {
+        let mut app = app();
+        app.active_session = Some("app-copy".into());
+        let (clipboard, recorded) = clipboard::Clipboard::recording();
+        app.clipboard = clipboard;
+        let payload =
+            codec::enc_clipboard(codec::clip_kind::WRITE, "中e\u{301}\n\0\x1b".as_bytes());
+        app.application_clipboard(&payload);
+        app.application_clipboard(&payload);
+        let first = recorded.recv_timeout(Duration::from_secs(1)).unwrap();
+        let second = recorded.recv_timeout(Duration::from_secs(1)).unwrap();
+        assert_eq!(first.0, "中e\u{301}\n\0\x1b");
+        assert_eq!(second.0, first.0);
+        assert_ne!(first.1, second.1);
+        assert_eq!(app.application_copies.len(), 2);
+        for ticket in [first.1, second.1] {
+            app.application_clipboard_result(
+                clipboard::CopyResult {
+                    operation: ticket,
+                    purpose: clipboard::Purpose::Application,
+                    fact: String::new(),
+                    status: clipboard::Copied::System,
+                },
+                &mut Vec::new(),
+            )
+            .unwrap();
+        }
+        assert!(app.application_copies.is_empty());
+        assert!(app.input_queue.is_empty());
+        assert!(app.input_geometry.is_none());
+    }
+
+    #[test]
+    fn application_terminal_write_survives_new_notice_but_never_a_stale_attachment() {
+        let mut app = app();
+        app.active_session = Some("app-copy".into());
+        let (clipboard, _blocked) = clipboard::Clipboard::blocked();
+        app.clipboard = clipboard;
+        let payload = codec::enc_clipboard(codec::clip_kind::WRITE, b"value");
+        app.application_clipboard(&payload);
+        let ticket = app.application_copy_ticket;
+        app.show_error(
+            view::NoticeTarget::Host(Target::Local),
+            "new error",
+            "new error detail",
+        );
+        let notice = app.model.item_notice.clone();
+        let mut output = Vec::new();
+        app.application_clipboard_result(
+            clipboard::CopyResult {
+                operation: ticket,
+                purpose: clipboard::Purpose::Application,
+                fact: String::new(),
+                status: clipboard::Copied::Terminal("exact terminal request".into()),
+            },
+            &mut output,
+        )
+        .unwrap();
+        assert_eq!(output, b"exact terminal request");
+        assert_eq!(app.model.item_notice, notice);
+        app.application_clipboard(&payload);
+        let stale = app.application_copy_ticket;
+        app.detach();
+        assert!(app.application_copies.is_empty());
+        output.clear();
+        app.application_clipboard_result(
+            clipboard::CopyResult {
+                operation: stale,
+                purpose: clipboard::Purpose::Application,
+                fact: String::new(),
+                status: clipboard::Copied::Terminal("MUST_NOT_WRITE".into()),
+            },
+            &mut output,
+        )
+        .unwrap();
+        assert!(output.is_empty());
+        app.active_session = Some("app-copy".into());
+        app.application_clipboard(&payload);
+        let stale = app.application_copy_ticket;
+        app.current_target = Target::Remote("different-host".into());
+        app.application_clipboard_result(
+            clipboard::CopyResult {
+                operation: stale,
+                purpose: clipboard::Purpose::Application,
+                fact: String::new(),
+                status: clipboard::Copied::Terminal("MUST_NOT_WRITE".into()),
+            },
+            &mut output,
+        )
+        .unwrap();
+        assert!(output.is_empty());
+    }
+
+    #[test]
+    fn application_clipboard_errors_and_full_queue_never_claim_success() {
+        let mut app = app();
+        app.active_session = Some("app-copy".into());
+        let (clipboard, _blocked) = clipboard::Clipboard::blocked();
+        app.clipboard = clipboard;
+        let payload = codec::enc_clipboard(codec::clip_kind::WRITE, b"value");
+        for _ in 0..4 {
+            app.application_clipboard(&payload);
+        }
+        app.application_clipboard(&payload);
+        assert_eq!(app.application_copies.len(), 4);
+        assert!(app.model.notice.contains("剪贴板忙"));
+        assert_eq!(
+            app.model.item_notice.as_ref().unwrap().summary,
+            "应用复制失败"
+        );
+        app.application_clipboard(&[codec::clip_kind::READ_REQ]);
+        app.application_clipboard(&[255]);
+        assert_eq!(app.application_copies.len(), 4);
+        app.application_clipboard(&[0, 1, 0, 0xff]);
+        assert!(app.model.notice.contains("UTF-8"));
+        app.disconnect();
+        assert!(app.application_copies.is_empty());
+        let (clipboard, _blocked) = clipboard::Clipboard::blocked();
+        app.clipboard = clipboard;
+        app.application_clipboard(&payload);
+        let ticket = app.application_copy_ticket;
+        app.application_clipboard_result(
+            clipboard::CopyResult {
+                operation: ticket,
+                purpose: clipboard::Purpose::Application,
+                fact: String::new(),
+                status: clipboard::Copied::Failed("private mock failure".into()),
+            },
+            &mut Vec::new(),
+        )
+        .unwrap();
+        assert!(app.model.notice.contains("private mock failure"));
+        assert_eq!(
+            app.model.item_notice.as_ref().unwrap().summary,
+            "应用复制失败"
+        );
     }
 
     #[test]
