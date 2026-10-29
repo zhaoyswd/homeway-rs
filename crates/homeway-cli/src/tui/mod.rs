@@ -4,6 +4,7 @@ mod backend;
 mod clipboard;
 mod input;
 mod notifications;
+mod recovery;
 mod selection;
 mod surface;
 mod terminal;
@@ -104,6 +105,7 @@ fn run(options: Options) -> Result<(), Error> {
     while !terminal::stopping() {
         app.process_backend();
         app.process_attach();
+        app.poll_connection(Instant::now());
         app.flush_input();
         app.process_clipboard()?;
         app.process_notifications(&mut io::stdout())?;
@@ -205,6 +207,10 @@ struct App {
     snapshot: backend::Snapshot,
     current_target: Target,
     active_session: Option<String>,
+    active_pid: Option<i32>,
+    session_pids: HashMap<String, i32>,
+    recovery: Option<recovery::Recovery>,
+    attach_verified: bool,
     create_pending: bool,
     create_target: Option<Target>,
     close_pending: Option<ClosingSession>,
@@ -348,6 +354,17 @@ struct ApplicationCopy {
     _pending: clipboard::PendingWrite,
 }
 
+#[derive(serde::Deserialize)]
+struct ProbeList {
+    sessions: Vec<ProbeSession>,
+}
+
+#[derive(serde::Deserialize)]
+struct ProbeSession {
+    name: String,
+    pid: i32,
+}
+
 struct InputGeometry {
     size: (u16, u16),
     requested: Option<Instant>,
@@ -384,6 +401,10 @@ impl App {
             snapshot: backend::Snapshot::default(),
             current_target: Target::Local,
             active_session: None,
+            active_pid: None,
+            session_pids: HashMap::new(),
+            recovery: None,
+            attach_verified: false,
             create_pending: false,
             create_target: None,
             close_pending: None,
@@ -821,6 +842,9 @@ impl App {
     }
 
     fn detach(&mut self) {
+        self.recovery = None;
+        self.active_pid = None;
+        self.attach_verified = false;
         self.application_copies.clear();
         self.cancel_selection();
         self.input_geometry = None;
@@ -857,6 +881,26 @@ impl App {
         self.input_queue.clear();
         self.input_bytes = 0;
         self.sent_size = None;
+        self.attach_verified = false;
+        if let Some(surface) = &mut self.surface {
+            surface.reconnect();
+        }
+        for assembler in &mut self.fragments {
+            assembler.reset();
+        }
+        self.snapshot_request = None;
+        if let Some(recovery) = &mut self.recovery {
+            let delay = recovery.fail(Instant::now());
+            let reason = self.model.notice.clone();
+            self.show_progress(
+                self.session_notice_target(),
+                "连接中断，自动重连…",
+                format!(
+                    "{reason}；{:.1}秒后自动重新接入原会话（未确认输入不会重放）",
+                    delay.as_secs_f32()
+                ),
+            );
+        }
     }
 
     fn clear_operation(&mut self) {
@@ -905,17 +949,11 @@ impl App {
         self.detach();
         self.model.selected_session = Some(index);
         self.model.terminal_title = title;
-        self.active_session = Some(name.clone());
+        self.active_pid = self.session_pids.get(&name).copied().filter(|pid| *pid > 0);
+        self.active_session = Some(name);
         self.surface = Some(surface::Surface::default());
-        self.attach = Some(backend::Attach::start(
-            self.state_dir.clone(),
-            self.target(),
-            name,
-            self.size.0.max(1),
-            self.size.1.max(1),
-            self.generation,
-        ));
-        self.sent_size = Some(self.size);
+        self.recovery = Some(recovery::Recovery::new(Instant::now()));
+        self.begin_attach(Instant::now());
         self.show_progress(self.session_notice_target(), "正在接入…", "正在接入会话…");
         Ok(())
     }
@@ -1062,12 +1100,21 @@ impl App {
                 match result {
                     Ok(sessions) => {
                         self.observe_blocking(&target, &sessions);
-                        let selected = self.selected_name();
+                        let selected = self.active_session.clone().or_else(|| self.selected_name());
+                        self.session_pids = sessions
+                            .iter()
+                            .map(|session| (session.name.clone(), session.pid))
+                            .collect();
                         self.model.sessions = sessions.into_iter().map(session_item).collect();
                         self.model.selected_session = selected.as_ref().and_then(|name| {
                             self.model.sessions.iter().position(|s| &s.name == name)
                         });
-                        if selected.is_some() && self.model.selected_session.is_none() {
+                        // A background LIST may predate this attachment. Only
+                        // same-leg probes/ENDED establish that its session ended.
+                        if selected.is_some()
+                            && self.model.selected_session.is_none()
+                            && self.recovery.is_none()
+                        {
                             self.detach();
                         }
                         if self
@@ -1318,6 +1365,183 @@ impl App {
         }
     }
 
+    fn begin_attach(&mut self, now: Instant) {
+        let Some(name) = self.active_session.clone() else {
+            self.recovery = None;
+            return;
+        };
+        if let Some(recovery) = &mut self.recovery {
+            recovery.begin(now);
+        }
+        self.attach_verified = false;
+        self.connected = false;
+        if let Some(surface) = &mut self.surface {
+            surface.reconnect();
+        }
+        for assembler in &mut self.fragments {
+            assembler.reset();
+        }
+        self.snapshot_request = None;
+        self.attach = Some(backend::Attach::start(
+            self.state_dir.clone(),
+            self.target(),
+            name,
+            self.size.0.max(1),
+            self.size.1.max(1),
+            self.generation,
+        ));
+        self.sent_size = Some(self.size);
+    }
+
+    fn poll_connection(&mut self, now: Instant) {
+        let action = self.recovery.as_mut().map(|recovery| recovery.poll(now));
+        match action {
+            Some(recovery::Action::Reconnect) => {
+                self.begin_attach(now);
+                self.show_progress(
+                    self.session_notice_target(),
+                    "正在重连…",
+                    "正在自动重新接入原会话…",
+                );
+            }
+            Some(recovery::Action::Probe) => {
+                let result = self
+                    .attach
+                    .as_ref()
+                    .map(|attach| attach.send_frame(Op::LIST, Vec::new()));
+                match result {
+                    Some(Ok(())) => {
+                        if let Some(recovery) = &mut self.recovery {
+                            recovery.queued();
+                        }
+                    }
+                    Some(Err(backend::Error::Busy)) => {}
+                    Some(Err(error)) => {
+                        self.show_error(
+                            self.session_notice_target(),
+                            "终端错误",
+                            error.to_string(),
+                        );
+                        self.disconnect();
+                    }
+                    None => {}
+                }
+            }
+            Some(recovery::Action::TimedOut) => {
+                self.show_error(
+                    self.session_notice_target(),
+                    "连接无响应",
+                    "终端连接未在预算内响应探活或完整接入",
+                );
+                self.disconnect();
+            }
+            _ => {}
+        }
+    }
+
+    fn connection_ready(&mut self, now: Instant) {
+        if self
+            .recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.expired(now))
+        {
+            self.show_error(
+                self.session_notice_target(),
+                "连接无响应",
+                "终端连接未在预算内完成接入",
+            );
+            self.disconnect();
+            return;
+        }
+        if !self.attach_verified || !self.surface.as_ref().is_some_and(|surface| surface.ready) {
+            return;
+        }
+        self.connected = true;
+        let retrying = self
+            .recovery
+            .as_ref()
+            .is_some_and(recovery::Recovery::retrying);
+        if let Some(recovery) = &mut self.recovery {
+            recovery.ready();
+        }
+        if retrying {
+            self.show_success(
+                self.session_notice_target(),
+                "连接已恢复",
+                "已自动接回原会话；断开期间输入未重放",
+            );
+        } else {
+            self.complete_session_progress();
+            if self.model.item_notice.is_none() {
+                self.model.notice = "已接入 · 滚轮浏览历史".into();
+            }
+        }
+    }
+
+    fn probe_reply(&mut self, payload: &[u8]) {
+        if !self
+            .recovery
+            .as_ref()
+            .is_some_and(|recovery| recovery.expects_reply(Instant::now()))
+        {
+            return;
+        }
+        let list = match serde_json::from_slice::<ProbeList>(payload) {
+            Ok(list) => list,
+            Err(error) => {
+                self.show_error(
+                    self.session_notice_target(),
+                    "探活应答无效",
+                    error.to_string(),
+                );
+                self.disconnect();
+                return;
+            }
+        };
+        let session = list
+            .sessions
+            .iter()
+            .find(|session| self.active_session.as_ref() == Some(&session.name));
+        let Some(session) = session.filter(|session| session.pid > 0) else {
+            self.recovery = None;
+            self.show_error(
+                self.session_notice_target(),
+                "会话已结束",
+                "原会话已不存在，自动重连已停止",
+            );
+            self.disconnect();
+            return;
+        };
+        if self.active_pid.is_some_and(|pid| pid != session.pid) {
+            self.recovery = None;
+            self.show_error(
+                self.session_notice_target(),
+                "会话已结束",
+                "同名会话 PID 已变化，自动重连已停止",
+            );
+            self.disconnect();
+            return;
+        }
+        self.active_pid = Some(session.pid);
+        self.attach_verified = true;
+        if let Some(recovery) = &mut self.recovery {
+            recovery.replied(Instant::now());
+        }
+        if !self.connected {
+            self.connection_ready(Instant::now());
+            if self.connected
+                && self.model.focus == view::Focus::Terminal
+                && !self.model.modal_open()
+                && self
+                    .surface
+                    .as_ref()
+                    .is_some_and(surface::Surface::focus_events)
+            {
+                self.send_input(frames::InputEvent::Focus { gained: true });
+            }
+        }
+    }
+
     fn process_attach(&mut self) {
         for _ in 0..32 {
             let Some(event) = self.attach.as_ref().and_then(|attach| attach.try_event()) else {
@@ -1326,10 +1550,27 @@ impl App {
             if event.generation != self.generation {
                 continue;
             }
+            if self
+                .recovery
+                .as_ref()
+                .is_some_and(|recovery| recovery.expired(Instant::now()))
+            {
+                self.show_error(
+                    self.session_notice_target(),
+                    "连接无响应",
+                    "终端连接未在预算内响应",
+                );
+                self.disconnect();
+                break;
+            }
             self.render_dirty = true;
             let frame = match event.frame {
                 Ok(frame) => frame,
                 Err(error) => {
+                    if matches!(&error, backend::Error::Session { code, .. } if code == "not_found")
+                    {
+                        self.recovery = None;
+                    }
                     self.show_error(self.session_notice_target(), "终端错误", error.to_string());
                     self.disconnect();
                     break;
@@ -1375,6 +1616,9 @@ impl App {
                 }
                 Op::ENDED => {
                     let (code, reason) = frames::dec_ended(&frame.payload);
+                    if code != frames::ended_code::REPLACED {
+                        self.recovery = None;
+                    }
                     self.show_error(
                         self.session_notice_target(),
                         "会话已结束",
@@ -1392,7 +1636,8 @@ impl App {
                     }
                 }
                 Op::ERROR => self.term_error(&frame.payload),
-                Op::CLIPBOARD => self.application_clipboard(&frame.payload),
+                Op::CLIPBOARD if self.attach_verified => self.application_clipboard(&frame.payload),
+                Op::LIST => self.probe_reply(&frame.payload),
                 _ => {}
             }
         }
@@ -1422,11 +1667,11 @@ impl App {
             if surface.snapshot(body)? {
                 self.snapshot_request = None;
                 let initial = !self.connected;
-                self.connected = true;
+                self.connected = self.recovery.is_none() || self.attach_verified;
                 if !title.is_empty() {
                     self.model.terminal_title = title;
                 }
-                if initial {
+                if initial && self.connected {
                     self.selection_copy = None;
                     initial_ready = true;
                     if self.model.focus == view::Focus::Terminal
@@ -1460,11 +1705,7 @@ impl App {
             self.input_geometry = None;
         }
         if initial_ready {
-            self.complete_session_progress();
-            // Kept internally for request ownership; healthy attachment has no row notice.
-            if self.model.item_notice.is_none() {
-                self.model.notice = "已接入 · 滚轮浏览历史".into();
-            }
+            self.connection_ready(Instant::now());
         }
         if resync {
             self.show_progress(
@@ -1877,7 +2118,10 @@ impl App {
     fn flush_input(&mut self) {
         // A previously forwarded kitty press still needs its release when the pane
         // becomes hidden; fresh presses are rejected by send_input in that state.
-        if !self.online() || (self.size != (0, 0) && self.sent_size != Some(self.size)) {
+        if !self.connected
+            || !self.online()
+            || (self.size != (0, 0) && self.sent_size != Some(self.size))
+        {
             return;
         }
         for _ in 0..16 {
@@ -1905,7 +2149,8 @@ impl App {
     }
 
     fn online(&self) -> bool {
-        self.model.selected_host == 0
+        self.connected
+            || self.model.selected_host == 0
             || self
                 .snapshot
                 .hosts
@@ -1944,7 +2189,7 @@ impl App {
                 Err(error) => {
                     self.selection_copy = None;
                     self.show_error(self.session_notice_target(), "终端错误", error.to_string());
-                    self.connected = false;
+                    self.disconnect();
                 }
             }
         }
@@ -2740,6 +2985,97 @@ mod tests {
             state,
             pid,
             ..Default::default()
+        }
+    }
+
+    #[test]
+    fn late_snapshot_cannot_clear_the_initial_attach_deadline() {
+        let now = Instant::now();
+        let mut app = history_app();
+        app.recovery = Some(recovery::Recovery::new(now));
+        app.attach_verified = true;
+        app.connected = false;
+        app.connection_ready(now + Duration::from_secs(15));
+        assert!(!app.connected);
+        assert!(app.recovery.as_ref().unwrap().retrying());
+        assert!(!app.surface.as_ref().unwrap().ready);
+        assert!(app.model.notice.contains("预算"));
+        assert!(matches!(app.notice_life, NoticeLife::Progress));
+    }
+
+    #[test]
+    fn recovery_requires_identity_and_fresh_snapshot_and_ignores_stale_summaries() {
+        let now = Instant::now();
+        let mut app = history_app();
+        app.active_pid = Some(321);
+        app.current_target = Target::Remote("remote".into());
+        app.model.selected_host = 1; // No ready host summary exists.
+        app.recovery = Some(recovery::Recovery::new(now));
+        assert_eq!(
+            app.recovery.as_mut().unwrap().poll(now),
+            recovery::Action::Probe
+        );
+        app.recovery.as_mut().unwrap().queued();
+        app.surface.as_mut().unwrap().reconnect();
+        app.connected = false;
+        app.probe_reply(br#"{"sessions":[{"name":"history","pid":321}]}"#);
+        assert!(app.attach_verified);
+        assert!(!app.connected);
+        app.send_input(frames::InputEvent::Text {
+            flags: 0,
+            text: "NOT_SENT".into(),
+        });
+        assert!(app.input_queue.is_empty());
+        let mut vt = homeway_core::term::vt::SessionVt::new(66, 27, 0).unwrap();
+        vt.write(b"RESTORED");
+        let body = codec::SnapshotBody {
+            cols: 66,
+            rows: 27,
+            seq: 1,
+            revision: 1,
+            history_epoch: vt.history_epoch(),
+            history_base: vt.history_base(),
+            scroll: vt.scrollbar().into(),
+            grid: codec::encode_grid(66, 27, &vt.rows()),
+            ..Default::default()
+        };
+        for fragment in
+            codec::fragment_payload(&codec::gzip_bytes(&codec::enc_snapshot_body(&body)))
+        {
+            app.surface_frame(Op::SNAPSHOT, &fragment).unwrap();
+        }
+        assert!(app.connected && app.online());
+        app.backend_event(backend::Event::Sessions {
+            target: app.target(),
+            epoch: app.sessions_epoch,
+            result: Ok(Vec::new()),
+        });
+        assert!(app.connected);
+        assert_eq!(app.active_session.as_deref(), Some("history"));
+        assert!(app.recovery.is_some());
+        app.detach();
+        assert!(app.recovery.is_none());
+        assert!(app.active_pid.is_none());
+    }
+
+    #[test]
+    fn same_leg_missing_or_replaced_pid_stops_recovery_without_creating_a_session() {
+        for payload in [
+            br#"{"sessions":[]}"#.as_slice(),
+            br#"{"sessions":[{"name":"history","pid":322}]}"#.as_slice(),
+        ] {
+            let now = Instant::now();
+            let mut app = history_app();
+            app.active_pid = Some(321);
+            app.recovery = Some(recovery::Recovery::new(now));
+            app.recovery.as_mut().unwrap().poll(now);
+            app.recovery.as_mut().unwrap().queued();
+            app.probe_reply(payload);
+            assert!(!app.connected);
+            assert!(app.recovery.is_none());
+            assert_eq!(app.active_pid, Some(321));
+            assert!(app.input_queue.is_empty());
+            assert!(app.model.notice.contains("已停止"));
         }
     }
 

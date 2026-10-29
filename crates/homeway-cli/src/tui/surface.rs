@@ -65,6 +65,14 @@ impl Surface {
     pub(super) fn geometry(&self) -> (u16, u16) {
         (self.cols, self.rows)
     }
+    /// Keep display material while accepting a new leg's sequence from one.
+    pub(super) fn reconnect(&mut self) {
+        self.ready = false;
+        self.seq = 0;
+        self.pending = None;
+        self.fetch_retry = None;
+    }
+
     pub(super) fn snapshot(&mut self, body: codec::SnapshotBody) -> Result<bool, Error> {
         if self.seq != 0 && body.seq <= self.seq {
             return Ok(false);
@@ -410,6 +418,23 @@ fn validate(cols: u16, rows: u16, scroll: codec::ScrollbarWire, base: u64) -> Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconnect_preserves_display_and_accepts_new_leg_sequence_one() {
+        let mut vt = vt::SessionVt::new(30, 5, 10).unwrap();
+        vt.write(b"PRESERVED_SCREEN");
+        let mut surface = Surface::default();
+        surface.snapshot(snapshot(&mut vt, 100, 2)).unwrap();
+        surface.prepare(5);
+        let before = surface.view().rows.to_vec();
+        surface.reconnect();
+        surface.prepare(5);
+        assert_eq!(surface.view().rows, before);
+        assert!(!surface.ready);
+        assert!(surface.selection_identity().is_none());
+        assert!(surface.snapshot(snapshot(&mut vt, 1, 2)).unwrap());
+        assert!(surface.ready);
+    }
 
     fn snapshot(vt: &mut vt::SessionVt, seq: u64, revision: u32) -> codec::SnapshotBody {
         let (cols, rows) = vt.size();
