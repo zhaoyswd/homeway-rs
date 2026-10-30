@@ -72,6 +72,15 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-10-30 v0.3.25 本机部署恢复（进行中，已prepare）**：用户最新明确“完成本机部署”，
+> 覆盖此前本机暂缓。重新fresh核96125/66831ecc旧件、原plist/config/身份与87687B台账，
+> 官方v0.3.25归档/二进制/SUMS/签名/版本重新核验通过，独立技术/代码两门通过。
+> root已实际prepare exit0（07:31:43Z），持久receipt PREPARED/activation_started=false；
+> 备份目录~/homeway-rollback/release-v0.3.25-20261030-r1/，持久输入/RESUME在
+> ~/homeway-deploy-inputs/release-v0.3.25-20261030-r1/。独立once launchd worker可在当前
+> homeway会话断开后继续。接续唯一bootstrap该备份目录once.plist，然后先读receipt并独立
+> 验收，切勿重复激活。详情见docs/reviews/2026-10-30-v0.3.25-mac-deploy.md。
+
 > **2026-10-30 v0.3.25 发布及云部署（完成；本机按用户指令暂缓）**：用户授权完整链路，
 > 随后明确本会话经本机homeway运行，待其再次要求本机部署才换装/重启。本版发布去API
 > 更新检查和主机第二行对齐；元数据/部署工件及工具修正均通过独立技术/代码两门。
