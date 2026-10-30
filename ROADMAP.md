@@ -72,14 +72,18 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
-> **2026-10-30 v0.3.25 本机部署恢复（进行中，已prepare）**：用户最新明确“完成本机部署”，
-> 覆盖此前本机暂缓。重新fresh核96125/66831ecc旧件、原plist/config/身份与87687B台账，
-> 官方v0.3.25归档/二进制/SUMS/签名/版本重新核验通过，独立技术/代码两门通过。
-> root已实际prepare exit0（07:31:43Z），持久receipt PREPARED/activation_started=false；
-> 备份目录~/homeway-rollback/release-v0.3.25-20261030-r1/，持久输入/RESUME在
-> ~/homeway-deploy-inputs/release-v0.3.25-20261030-r1/。独立once launchd worker可在当前
-> homeway会话断开后继续。接续唯一bootstrap该备份目录once.plist，然后先读receipt并独立
-> 验收，切勿重复激活。详情见docs/reviews/2026-10-30-v0.3.25-mac-deploy.md。
+> **2026-10-30 v0.3.25 本机部署恢复（完成）**：用户最新明确“完成本机部署”，覆盖暂缓。
+> 重新fresh核96125/66831ecc旧件、原plist/config/身份及87687B台账，官方v0.3.25归档/
+> 二进制/SUMS/签名/准确版本重核通过；本机工件独立技术/代码两门通过。root实际prepare
+> exit0并确认PREPARED，15344fc检查点推main后唯一bootstrap独立once worker23912，
+> 持久receipt SUCCESS/15.151秒、未回退，96125→23925，generation05253e1f…4f6db。
+> 独立核官方d1431158件/v0.3.25/严格签名/零参UID501-PPID1/原job及映像/41641/
+> serve running-relay stopped/daemon持有term socket/被动term查询全过。原plist/config/
+> key与87687B台账前缀完整，正常追加471B；15:32:31原中继OK-MAC认证重连。系统PATH
+> 实际homeway update同版exit0且PID/SHA不变，once已退出/exit0。恢复资料保留
+> ~/homeway-rollback/release-v0.3.25-20261030-r1/，输入与独立验收日志在
+> ~/homeway-deploy-inputs/release-v0.3.25-20261030-r1/，任何续接先读receipt/RECOVERY，
+> 不重复激活。本机和云均v0.3.25；本轮未动云/LAN71。详见同日v0.3.25-mac-deploy记录。
 
 > **2026-10-30 v0.3.25 发布及云部署（完成；本机按用户指令暂缓）**：用户授权完整链路，
 > 随后明确本会话经本机homeway运行，待其再次要求本机部署才换装/重启。本版发布去API

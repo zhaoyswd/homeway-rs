@@ -1400,3 +1400,22 @@ v0.3.25、唯一零参映像、41641/udp与41741/udp+tcp、serve/relay running�
 本机仍原正式PID96125/66831ecc件/v0.3.23，未prepare/换装/重启，身份/config/plist及
 台账前缀保全；官方v0.3.25文件仅在/tmp校验及私有测试。后续用户要求本机部署时重新
 fresh核前提，不盲用本轮候选配置。LAN71两次SSH超时未部署，候选NOT-APPROVED。
+
+
+### 13.25 v0.3.25 本机部署恢复完成（2026-10-30）
+
+用户后续明确“完成本机部署”，覆盖§13.24当时暂缓。fresh重新核旧PID96125/原官方
+66831ecc件、plist/身份/config/87,687B台账，重新校验同tag官方包/签名/版本，两道门
+通过；仅本机备份、独立once任务唯一切换，未再动云或LAN71。
+
+15:32:29启动worker23912，持久receipt SUCCESS/15.151秒、未回退；正式PID23925、
+官方SHA `d1431158902a15e0283295c16b6860e9926d57fefed3b3a6d8d51aa82eb2c3f9`、v0.3.25。
+独立验收PATH零参/原job/签名/41641/serve running与relay stopped/被动term均过，
+原plist/config/key及台账前缀保全，台账正常追加471B；15:32:31原中继OK-MAC重认证。
+系统PATH实际 `homeway update` 返回已是最新，exit0，PID与二进制不变；once已退出/exit0。
+
+恢复目录 `~/homeway-rollback/release-v0.3.25-20261030-r1/` 含旧件、state、manifest、
+receipt/RECOVERY/RESUME；持久输入及独立验证日志在
+`~/homeway-deploy-inputs/release-v0.3.25-20261030-r1/`。恢复先读receipt/RECOVERY并
+确认worker状态，不能重复activation或自动覆盖state。完整两门、实际执行与独立验收见
+`docs/reviews/2026-10-30-v0.3.25-mac-deploy.md`。本机与云现均v0.3.25，LAN71仍未部署。
