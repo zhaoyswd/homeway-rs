@@ -1376,3 +1376,27 @@ v0.3.23/映像/角色/UDP41641与UDP-TCP41741/4关键字节/被动term v1/ff通�
 确认v0.3.23就绪及中继OK-MAC认证重连成功，未创建生产PTY。三个目标的成功回执与
 独立验收均取得，恢复资料保留，旧TUI需退出后重进。全流程和准确恢复边界见
 [`2026-10-28-tui-command-dialog-release.md`](reviews/2026-10-28-tui-command-dialog-release.md)。
+
+
+### 13.24 v0.3.25 官方发布与云更新（2026-10-30；本机暂缓）
+
+用户明确授权提交/推送/发版/部署，随后明确本会话运行于本机homeway，本机须等待后续
+指令再部署。公开CI41016840292与五平台Release41017219413全部success；tag v0.3.25在
+当时origin/main头e7d2df7创建，五官方归档本机下载/SHA256/架构校验通过，详情见
+`docs/reviews/2026-10-30-v0.3.25-release.md`。
+
+阿里云只用本机下载、校验并scp的官方Linux amd64件，原身份/config/台账备份后唯一激活
+SUCCESS/17.104秒，1736221→1744087，start3499622840；新二进制SHA256
+`a3b9221dc856de8e25321e7cf64f1db780ef1f3289b13ff9d71d2ee80a1a7126`。独立SSH核
+v0.3.25、唯一零参映像、41641/udp与41741/udp+tcp、serve/relay running、原四项关键
+文件前缀完整且追加0B、被动term通过；Mac15:14:20 OK-MAC认证自然重连。正式切换前，
+官方同件Mac私有23/7/8 PASS、Linux私有4 PASS均完成；旧工具状态谓词失配的首轮0PASS
+及仅工具整改已留证，未改发布二进制。
+
+持久恢复资料 `/root/homeway-rollback/release-v0.3.25-20261030-r1/`，receipt=SUCCESS、
+未回退。恢复先读receipt/RECOVERY并确认worker状态，不重复activation或自动覆盖state。
+完整实际执行见`docs/reviews/2026-10-30-v0.3.25-deploy.md`。
+
+本机仍原正式PID96125/66831ecc件/v0.3.23，未prepare/换装/重启，身份/config/plist及
+台账前缀保全；官方v0.3.25文件仅在/tmp校验及私有测试。后续用户要求本机部署时重新
+fresh核前提，不盲用本轮候选配置。LAN71两次SSH超时未部署，候选NOT-APPROVED。

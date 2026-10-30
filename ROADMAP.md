@@ -72,25 +72,23 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
-> **2026-10-30 v0.3.25 提交/推送/发版/部署（进行中）**：用户明确授权完整链路。
-> 发布去 API 自更新及主机第二行缩进两个单元，workspace/四自有包锁版本0.3.25，
-> CHANGELOG与Release正文一致，元数据独立技术/代码两门通过。root完整ci-local已启动，
-> 通过后推main→主分支CI→main头tag→五平台Release→本机官方下载校验→私有验证→
-> 备份滚动部署。只读确认本机Mac96125和云1736221均v0.3.23，身份/config/台账摘要
-> 已留基线；LAN71首次SSH超时，后续重试，尚无生产写入。实际发布与部署结果分别见
-> `docs/reviews/2026-10-30-v0.3.25-release.md`、后续同日deploy记录。
-> **本机部署暂缓（用户本轮明确覆盖）**：当前会话经本机homeway运行，待用户再次明确要求
-> 在本机部署后才换装/重启；本轮只做本机产物验证与/tmp私有测试，继续发布和阿里云部署。
-> root完整quick门已实际exit0（14:51:55）：日志测试合计1468/0、41ignored，
-> clippy/OHOScheck/真link2943728B/导出版本/隔离/向量/种子/词表/残留全过；私有RRR
-> 316秒、100MB哈希一致、E10/FB-files通过，既有E11 WARN/DNS SKIP保留，未跑--full。
-> 元数据与部署工件两门已过，接续推main和公开CI；LAN71第二次SSH仍超时。
-> e7d2df7已推main，CI41016840292八项全success后在main头打v0.3.25；Release41017219413
-> 五平台与发布job全success，五归档本机SHA/架构/两Linux静态/Mac签名版本全过，正文
-> 与CHANGELOG一致。官方件私有Mac23/7/远程8和Linux4均过；远程首轮0PASS因旧工具
-> 中文状态谓词失配，工具已独立两门修正并同件实际8PASS，原失败留证。云prepare
-> 已exit0，持久receipt PREPARED/activation_started=false；接续仅云唯一activate，
-> 本机不prepare/换装/重启，LAN71未部署。
+> **2026-10-30 v0.3.25 发布及云部署（完成；本机按用户指令暂缓）**：用户授权完整链路，
+> 随后明确本会话经本机homeway运行，待其再次要求本机部署才换装/重启。本版发布去API
+> 更新检查和主机第二行对齐；元数据/部署工件及工具修正均通过独立技术/代码两门。
+> 版本10b425b、完整quick门实际exit0（14:51:55）：日志1468/0、41ignored，clippy/
+> OHOScheck/真link2943728B/导出版本/隔离/向量/种子/词表/残留全过；私有RRR316秒、
+> 100MB哈希一致、E10/FB-files通过，既有E11 WARN/DNS SKIP保留，未跑--full。
+> 检查点e7d2df7已推main，CI41016840292八项全success后在main头打v0.3.25；Release
+> 41017219413五平台与发布job全success，五归档本机SHA/架构/两Linux静态/Mac签名版本
+> 全过、正文与CHANGELOG一致。官方件私有Mac本地23/选区7/远程8、Linux4均过，隔离
+> update同版正确返回；远程首轮0PASS为旧工具中文状态谓词失配，独立两门仅修工具，
+> 同件重跑实际8PASS，保留原失败。工具与切换检查点19b0f72已推main。
+> 云官方件由本机scp复核，prepare备份后唯一激活SUCCESS/17.104秒，PID1736221→1744087，
+> start3499622840；独立SSH核v0.3.25/a3b9221d件/零参映像/端口/身份与配置/被动term全过，
+> 15:14:20本机中继OK-MAC自然重连。恢复目录/root/homeway-rollback/release-v0.3.25-20261030-r1/
+> 保留，未回退。本机仍原96125/66831ecc件/v0.3.23，身份/config/plist保全，未prepare/
+> 换装/重启；LAN71两次SSH超时未部署。详见同日v0.3.25-release/deploy与
+> tui-remote-smoke-status三份review；后续本机部署须重新fresh核验并等待用户明确指令。
 
 > **2026-10-30 update 去 GitHub REST API 依赖（完成，本地源码）**：按用户要求，改从
 > 官方 latest/download/SHA256SUMS 识别唯一版本，使用首次清单哈希及固定 tag 下载本平台
