@@ -66,19 +66,51 @@ def overlay_visible(tui):
 
 
 def host_ready(tui, name, *, selected=False, local=False, online=False):
-    """Require the actual host row, not the name typed in an open dialog."""
+    """Require one exact host and its adjacent status in the current host panel."""
     if overlay_visible(tui):
         return False
-    states = ("直连", "中继") if online else ("直连", "中继", "离线")
-    labels = {f"● {name}"} if local else {f"● 【{state}】{name}" for state in states}
-    for row, line in enumerate(tui.screen_lines()):
-        if line.startswith("┌ 会话 "):
-            break
-        if line.startswith("│") and line[1:].split("│", 1)[0].strip() in labels:
+    lines = tui.screen_lines()
+    if not lines or not lines[0].startswith("┌ 主机 "):
+        return False
+    bottom = next((row for row, line in enumerate(lines) if line.startswith("┌ 会话 ")), None)
+    if bottom is None:
+        return False
+    sidebar = helpers["sidebar_width"](tui.screen.columns)
+    width = sidebar - 3  # Same physical text area as view.rs and session metadata.
+
+    def text_at(row):
+        cells = tui.screen.buffer[row]
+        if cells[0].data != "│" or cells[sidebar - 1].data != "│":
+            return None
+        return "".join(cells[column].data for column in range(2, sidebar - 1)).rstrip()
+
+    for row in range(1, bottom - 1):
+        if text_at(row) == f"● {name}" and host_status_visible(
+                text_at(row + 1), width, local=local, online=online):
             # view.rs renders the host label at physical column 2; only the
             # selected host row is bold, independently of the terminal theme.
             return not selected or tui.screen.buffer[row][2].bold
     return False
+
+
+def host_status_visible(detail, width, *, local=False, online=False):
+    """Match the exact status grammar, permitting only its physical right crop."""
+    if detail is None or width <= 2:
+        return False
+    if local:
+        return any(detail == f"  exit:{exit_state} relay:{relay_state}"[:width].rstrip()
+                   for exit_state in ("on", "off") for relay_state in ("on", "off"))
+    status = re.match(r"  (direct|relay|offline) (.*)\Z", detail)
+    if status is None or (online and status[1] == "offline"):
+        return False
+    rtt = status[2].split(" ", 1)[0]
+    if re.fullmatch(r"(?:-?[0-9]+|--)ms", rtt):
+        return any(detail == f"  {status[1]} {rtt} proxy:{proxy}"[:width].rstrip()
+                   for proxy in ("on", "off"))
+    # A narrow panel may end inside the RTT token. It must fill the whole text
+    # area; shorter arbitrary text must not masquerade as a legitimate crop.
+    return (len(detail) == width and status[2] == rtt
+            and re.fullmatch(r"(?:-?[0-9]+m?|-|--m?)", rtt) is not None)
 
 
 def shell_ready(tui, title):

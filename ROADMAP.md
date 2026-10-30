@@ -85,6 +85,12 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 > clippy/OHOScheck/真link2943728B/导出版本/隔离/向量/种子/词表/残留全过；私有RRR
 > 316秒、100MB哈希一致、E10/FB-files通过，既有E11 WARN/DNS SKIP保留，未跑--full。
 > 元数据与部署工件两门已过，接续推main和公开CI；LAN71第二次SSH仍超时。
+> e7d2df7已推main，CI41016840292八项全success后在main头打v0.3.25；Release41017219413
+> 五平台与发布job全success，五归档本机SHA/架构/两Linux静态/Mac签名版本全过，正文
+> 与CHANGELOG一致。官方件私有Mac23/7/远程8和Linux4均过；远程首轮0PASS因旧工具
+> 中文状态谓词失配，工具已独立两门修正并同件实际8PASS，原失败留证。云prepare
+> 已exit0，持久receipt PREPARED/activation_started=false；接续仅云唯一activate，
+> 本机不prepare/换装/重启，LAN71未部署。
 
 > **2026-10-30 update 去 GitHub REST API 依赖（完成，本地源码）**：按用户要求，改从
 > 官方 latest/download/SHA256SUMS 识别唯一版本，使用首次清单哈希及固定 tag 下载本平台
