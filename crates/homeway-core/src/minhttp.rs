@@ -1,6 +1,6 @@
 //! 极小同步 HTTPS GET 客户端（`homeway update` 频道专用，2026-10-23 批）。
 //!
-//! 服务对象 = update 的两条腿：GitHub API 查询（小 JSON）与 Release 产物下载
+//! 服务对象 = update 的两条腿：最新 Release 校验清单与固定 tag 的产物下载
 //! （tar.gz / SHA256SUMS，数 MiB 量级**进内存**——CLI 一次性流程，不做流式落盘）。
 //! 与 DoH（`server/doh.rs`）是**并行的两条独立同步 TLS 腿**，有意不复用也不改动它：
 //! DoH 是钉卡 + POST + 64KiB 上限的生产 DNS 纪律件（r5 契约），本件是系统 DNS +
@@ -20,7 +20,7 @@ use std::time::Instant;
 use rustls::pki_types::ServerName;
 use rustls::{ClientConfig, ClientConnection, RootCertStore, StreamOwned};
 
-/// 固定 UA（GitHub 的 API 与下载端都强制要求 User-Agent）。
+/// 固定 UA（标识更新频道的 HTTPS 请求）。
 const UA: &str = "homeway-update";
 /// 重定向跳数上限（github.com → objects.githubusercontent.com 等签名跳转链）。
 const HOP_MAX: usize = 5;
@@ -79,7 +79,7 @@ pub fn https_parts(url: &str) -> Option<(String, String)> {
     Some((host.to_owned(), path))
 }
 
-/// 单次 GET（含 ≤5 跳重定向跟随）。`cap` = 体上限（API JSON 用小值、产物用大值）。
+/// 单次 GET（含 ≤5 跳重定向跟随）。`cap` = 体上限（校验清单用小值、产物用大值）。
 pub fn get(
     host: &str,
     path: &str,
@@ -545,20 +545,20 @@ mod tests {
     }
 
     /// 真网冒烟（默认忽略；`cargo test -p homeway-core -- --ignored` 手动跑）：
-    /// 拉 GitHub API 的最新 release 元数据——CI 无外网/限流环境下不作为门。
+    /// 拉最新 Release 的 SHA256SUMS——CI 无外网/限流环境下不作为门。
     #[test]
     #[ignore = "真网依赖：手动跑"]
     fn github_latest_release_over_real_tls() {
         let resp = get(
-            "api.github.com",
-            "/repos/zhaoyswd/homeway-rs/releases/latest",
-            Some("application/vnd.github+json"),
+            "github.com",
+            "/zhaoyswd/homeway-rs/releases/latest/download/SHA256SUMS",
+            None,
             Instant::now() + std::time::Duration::from_secs(30),
-            2 << 20,
+            64 << 10,
         )
         .unwrap();
         assert_eq!(resp.status, 200);
-        let v: serde_json::Value = serde_json::from_slice(&resp.body).unwrap();
-        assert!(v["tag_name"].as_str().unwrap().starts_with('v'));
+        let sums = std::str::from_utf8(&resp.body).unwrap();
+        assert!(sums.lines().any(|line| line.contains("homeway-v") && line.ends_with(".tar.gz")));
     }
 }

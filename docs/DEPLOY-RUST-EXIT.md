@@ -28,8 +28,9 @@
    resize/KILL、重复PTY回收与中继控制恢复通过；失败保留证据并用备份回退，不把私有测试
    或临时构建成功当成正式部署完成。
 6. **`homeway update` 自更新（2026-10-23 源码批，随下一版 Release 生效）**：GitHub 可达
-   主机（如 Mac）可用 `homeway update` 自动完成链条尾部——查最新 tag（同 tag = 提示
-   「没有更新」）→ 下载本平台官方产物并按 SHA256SUMS 校验 → 新二进制 `--version` 烟囱 →
+   主机（如 Mac）可用 `homeway update` 自动完成链条尾部——从最新 Release 的
+   `SHA256SUMS` 识别 tag（同 tag = 提示「没有更新」），不调用 GitHub REST API → 固定
+   该 tag 下载本平台官方产物并按首次清单校验 → 新二进制 `--version` 烟囱 →
    备份现役到 `<state>/cache/homeway.prev` → 同目录 rename 原子替换 → 重启统一进程
    （launchd 主机由 KeepAlive 拉起新 pid；裸进程主机 3s 宽限后 setsid 自拉起；守护未跑
    只换文件）→ control.sock 就绪为收工判据。产物与哈希仍是官方 Release 件（纪律 2/3 的

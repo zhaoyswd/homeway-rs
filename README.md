@@ -125,7 +125,7 @@ homeway socks on --listen 1080
 homeway status
 homeway speedtest
 
-# 自更新（GitHub Release 最新 tag；同 tag = 提示没有更新）
+# 自更新（从官方 Release 的 SHA256SUMS 查版本，不调用 GitHub REST API；同 tag = 提示没有更新）
 # 下载官方产物并按 SHA256SUMS 校验 → 烟囱 --version → 备份 → 原子替换 → 重启守护
 # （launchd 主机由 KeepAlive 拉起；裸进程主机自动 setsid 自拉起；守护没跑则只换文件）
 homeway update

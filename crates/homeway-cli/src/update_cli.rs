@@ -1,7 +1,7 @@
 //! `homeway update` —— 从 GitHub Release 自更新（2026-10-23 批）。
 //!
-//! 流程：查最新 tag →（**同 tag = 没有更新，收工**）→ 下载本平台 tar.gz + SHA256SUMS
-//! → 哈希校验 → 解包单文件 `homeway` → 烟囱 `--version`（不过 = 中止，不动现役）→
+//! 流程：读取最新 Release 的 SHA256SUMS 确定 tag →（**同 tag = 没有更新，收工**）
+//! → 固定 tag 下载本平台 tar.gz → 按首次清单哈希校验 → 解包单文件 `homeway` → 烟囱 `--version`（不过 = 中止，不动现役）→
 //! 备份现役 → 同目录 rename 原子替换 → 按托管形态重启统一进程：
 //! - 守护在跑：SIGTERM 优雅收工（unified 的按序收工路径）；launchd/KeepAlive 主机
 //!   由系统拉起新二进制（锁被新 pid 持有即证）；裸进程主机给 3s 宽限确认无人拉起后
@@ -30,12 +30,10 @@ use homeway_core::nodestate::probe_lock_holder;
 use crate::cli_flags;
 
 /// GitHub 仓库坐标（公开仓）。
-const API_HOST: &str = "api.github.com";
+const RELEASE_HOST: &str = "github.com";
 const REPO_SLUG: &str = "zhaoyswd/homeway-rs";
 /// 产物体上限（64 MiB——现役出口二进制 ≈9 MiB，gzip 后 ≈4 MiB，双倍余量防坏包）。
 const ARTIFACT_CAP: usize = 64 << 20;
-/// API JSON 上限（2 MiB——releases/latest 的 assets 清单远小于此）。
-const JSON_CAP: usize = 2 << 20;
 /// SHA256SUMS 上限（纯文本几十行）。
 const SUMS_CAP: usize = 64 << 10;
 
@@ -43,7 +41,9 @@ pub fn cmd_update(args: &[String]) {
     if args.iter().any(|a| a == "--help" || a == "-h") {
         eprintln!("用法：homeway update [--state DIR]     从 GitHub Release 自更新（查最新 tag → 下载校验 → 替换 → 重启守护）");
         eprintln!("  最新 tag 与当前版本相同 = 打印「没有更新」直接收工；");
-        eprintln!("  替换前备份现役到 <state>/cache/homeway.prev，并先跑新二进制的 --version 烟囱；");
+        eprintln!(
+            "  替换前备份现役到 <state>/cache/homeway.prev，并先跑新二进制的 --version 烟囱；"
+        );
         eprintln!("  守护进程按托管形态重启（launchd 主机由 KeepAlive 拉起；裸进程主机自拉起）。");
         std::process::exit(0);
     }
@@ -79,60 +79,8 @@ pub fn cmd_update(args: &[String]) {
 fn run(state: &Path) {
     let current = crate::cli_version();
 
-    // ---- ① 查最新 release ----
+    // ---- ①–③ 最新清单 → 固定 tag 下载 → 首次清单哈希校验 ----
     println!("update: 查询 GitHub 最新 release（{REPO_SLUG}）…");
-    let dl = Instant::now() + Duration::from_secs(30);
-    let resp = match minhttp::get(
-        API_HOST,
-        &format!("/repos/{REPO_SLUG}/releases/latest"),
-        Some("application/vnd.github+json"),
-        dl,
-        JSON_CAP,
-    ) {
-        Ok(r) => r,
-        Err(e) => {
-            eprintln!("update: 失败：查最新 release 不通（{e}）");
-            eprintln!("  GitHub 不可达的主机（如阿里云）不走本命令——按部署纪律由本机下载校验后 scp 换装。");
-            std::process::exit(1);
-        }
-    };
-    match resp.status {
-        200 => {}
-        404 => {
-            eprintln!("update: 失败：仓库还没有 Release（404）");
-            std::process::exit(1);
-        }
-        403 => {
-            eprintln!("update: 失败：API 拒绝（403——未认证限流 60 次/小时/IP，稍后再试）");
-            std::process::exit(1);
-        }
-        other => {
-            eprintln!("update: 失败：API 状态 {other}");
-            std::process::exit(1);
-        }
-    }
-    let meta: serde_json::Value = match serde_json::from_slice(&resp.body) {
-        Ok(v) => v,
-        Err(e) => {
-            eprintln!("update: 失败：release 元数据解析不了（{e}）");
-            std::process::exit(1);
-        }
-    };
-    let Some(tag) = meta["tag_name"].as_str().map(str::to_owned) else {
-        eprintln!("update: 失败：release 元数据缺 tag_name");
-        std::process::exit(1);
-    };
-    if tag == current {
-        println!("update: 已是最新（{tag}）——没有更新");
-        return;
-    }
-    if current == "(devel)" {
-        println!("update: 当前是本地 devel 构建（无版本号）——按最新 Release {tag} 继续");
-    } else {
-        println!("update: 有新版本：{current} → {tag}");
-    }
-
-    // ---- ② 选本平台产物 ----
     let platform = match asset_name_for(std::env::consts::OS, std::env::consts::ARCH) {
         Ok(p) => p,
         Err(e) => {
@@ -140,70 +88,23 @@ fn run(state: &Path) {
             std::process::exit(1);
         }
     };
-    let asset_tar = format!("homeway-{tag}-{platform}.tar.gz");
-    let mut tar_url = None;
-    let mut sums_url = None;
-    if let Some(assets) = meta["assets"].as_array() {
-        for a in assets {
-            let name = a["name"].as_str().unwrap_or("");
-            let url = a["browser_download_url"].as_str().unwrap_or("");
-            if name == asset_tar {
-                tar_url = Some(url.to_owned());
-            } else if name == "SHA256SUMS" {
-                sums_url = Some(url.to_owned());
+    let release = match prepare_release(current, platform, |host, path, cap, budget| {
+        minhttp::get(host, path, None, Instant::now() + budget, cap)
+    }) {
+        Ok(Some(release)) => release,
+        Ok(None) => return,
+        Err(e) => {
+            eprintln!("update: 失败：{e}");
+            if matches!(e, UpdateError::Fetch { .. }) {
+                eprintln!("  GitHub 不可达的主机（如阿里云）不走本命令——按部署纪律由本机下载校验后 scp 换装。");
             }
-        }
-    }
-    let (Some(tar_url), Some(sums_url)) = (tar_url, sums_url) else {
-        eprintln!("update: 失败：最新 release 缺产物（要 {asset_tar} 与 SHA256SUMS）");
-        eprintln!("  本机平台产物名 = {asset_tar}");
-        std::process::exit(1);
-    };
-
-    // ---- ③ 下载 + 哈希校验 ----
-    let fetch = |url: &str, cap: usize, budget: Duration| -> minhttp::Response {
-        let (host, path) = minhttp::https_parts(url).unwrap_or_else(|| {
-            eprintln!("update: 失败：下载地址不是 https：{url}");
             std::process::exit(1);
-        });
-        match minhttp::get(&host, &path, None, Instant::now() + budget, cap) {
-            Ok(r) => r,
-            Err(e) => {
-                eprintln!("update: 失败：下载 {url} 不通（{e}）");
-                std::process::exit(1);
-            }
         }
     };
-    println!("update: 下载 {asset_tar} …");
-    let dl_tar = fetch(&tar_url, ARTIFACT_CAP, Duration::from_secs(180));
-    if dl_tar.status != 200 {
-        eprintln!("update: 失败：产物下载状态 {}", dl_tar.status);
-        std::process::exit(1);
-    }
-    let dl_sums = fetch(&sums_url, SUMS_CAP, Duration::from_secs(30));
-    if dl_sums.status != 200 {
-        eprintln!("update: 失败：SHA256SUMS 下载状态 {}", dl_sums.status);
-        std::process::exit(1);
-    }
-    let sums = String::from_utf8_lossy(&dl_sums.body).into_owned();
-    let Some(want) = sha256_for(&sums, &asset_tar) else {
-        eprintln!("update: 失败：SHA256SUMS 里找不到 {asset_tar} 的行");
-        std::process::exit(1);
-    };
-    let got = {
-        use sha2::{Digest as _, Sha256};
-        let mut h = Sha256::new();
-        h.update(&dl_tar.body);
-        hex_lower(&h.finalize())
-    };
-    if got != want {
-        eprintln!("update: 失败：哈希不齐（sha256 期望 {want}，实得 {got}）——中止，现役未动");
-        std::process::exit(1);
-    }
-    println!("update: sha256 校验通过（{}…，{} 字节）", &want[..12], dl_tar.body.len());
+    let tag = release.tag;
 
     // ---- ④ 解包 + 烟囱（不过 = 中止，不动现役）----
-    let bin = match extract_homeway(&dl_tar.body) {
+    let bin = match extract_homeway(&release.archive) {
         Ok(b) => b,
         Err(e) => {
             eprintln!("update: 失败：解包不了（{e}）——中止，现役未动");
@@ -350,16 +251,206 @@ fn asset_name_for(os: &str, arch: &str) -> Result<&'static str, String> {
     }
 }
 
-/// SHA256SUMS 里找 `<asset>` 行的哈希（shasum 形态：`<hex>  <name>` / `<hex> *<name>`）。
-fn sha256_for(sums: &str, asset: &str) -> Option<String> {
-    for line in sums.lines() {
-        let mut it = line.split_whitespace();
-        let (Some(h), Some(n)) = (it.next(), it.next()) else { continue };
-        if h.len() == 64 && n.trim_start_matches('*') == asset {
-            return Some(h.to_ascii_lowercase());
+/// 清单中的目标产物；字段借用首次清单，不重新查询 latest。
+#[derive(Debug)]
+struct Artifact<'a> {
+    name: &'a str,
+    sha256: [u8; 32],
+}
+
+#[derive(Debug)]
+struct Manifest<'a> {
+    tag: &'a str,
+    artifact: Option<Artifact<'a>>,
+}
+
+#[derive(Debug, thiserror::Error)]
+enum ManifestError {
+    #[error("SHA256SUMS 不是 UTF-8：{0}")]
+    Utf8(#[from] std::str::Utf8Error),
+    #[error("SHA256SUMS 第 {0} 行格式非法（应为 64 位十六进制哈希及官方产物名）")]
+    InvalidLine(usize),
+    #[error("SHA256SUMS 第 {0} 行产物名或 tag 非法")]
+    InvalidAsset(usize),
+    #[error("SHA256SUMS 包含重复产物：{0}")]
+    DuplicateAsset(String),
+    #[error("SHA256SUMS 包含多个版本")]
+    MixedVersions,
+    #[error("SHA256SUMS 没有产物")]
+    Empty,
+}
+
+impl<'a> Manifest<'a> {
+    fn parse(bytes: &'a [u8], platform: &str) -> Result<Self, ManifestError> {
+        let sums = std::str::from_utf8(bytes)?;
+        let mut tag = None;
+        let mut artifact = None;
+        let mut names = std::collections::HashSet::new();
+        for (index, line) in sums.lines().enumerate() {
+            let line_number = index + 1;
+            if line.trim().is_empty() {
+                continue;
+            }
+            let mut fields = line.split_whitespace();
+            let (Some(hash), Some(name)) = (fields.next(), fields.next()) else {
+                return Err(ManifestError::InvalidLine(line_number));
+            };
+            if fields.next().is_some()
+                || hash.len() != 64
+                || !hash.bytes().all(|b| b.is_ascii_hexdigit())
+            {
+                return Err(ManifestError::InvalidLine(line_number));
+            }
+            let name = name.strip_prefix('*').unwrap_or(name);
+            let (version, asset_platform) =
+                release_asset_parts(name).ok_or(ManifestError::InvalidAsset(line_number))?;
+            if tag.is_some_and(|prior| prior != version) {
+                return Err(ManifestError::MixedVersions);
+            }
+            tag = Some(version);
+            if !names.insert(name) {
+                return Err(ManifestError::DuplicateAsset(name.to_owned()));
+            }
+            if asset_platform == platform {
+                let mut sha256 = [0; 32];
+                for (byte, pair) in sha256.iter_mut().zip(hash.as_bytes().as_chunks::<2>().0) {
+                    // 上面的 ASCII hex 检查已保证两位均可转换。
+                    *byte = ((pair[0] as char).to_digit(16).unwrap() * 16
+                        + (pair[1] as char).to_digit(16).unwrap())
+                        as u8;
+                }
+                artifact = Some(Artifact { name, sha256 });
+            }
         }
+        Ok(Self {
+            tag: tag.ok_or(ManifestError::Empty)?,
+            artifact,
+        })
     }
-    None
+}
+
+/// release.yml 的五种归档名。tag 是单个安全 URL 路径段，不接受转义/路径/查询片段。
+fn release_asset_parts(name: &str) -> Option<(&str, &str)> {
+    let name = name.strip_prefix("homeway-")?;
+    let (tag, platform) = [
+        ("-darwin-arm64.tar.gz", "darwin-arm64"),
+        ("-darwin-amd64.tar.gz", "darwin-amd64"),
+        ("-linux-amd64.tar.gz", "linux-amd64"),
+        ("-linux-arm64.tar.gz", "linux-arm64"),
+        ("-windows-amd64.zip", "windows-amd64"),
+    ]
+    .into_iter()
+    .find_map(|(suffix, platform)| name.strip_suffix(suffix).map(|tag| (tag, platform)))?;
+    let version = tag.strip_prefix('v')?;
+    if tag.len() > 128
+        || !version.as_bytes().first()?.is_ascii_digit()
+        || !version
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'-' | b'_' | b'+'))
+    {
+        return None;
+    }
+    Some((tag, platform))
+}
+
+#[derive(Debug, thiserror::Error)]
+enum UpdateError {
+    #[error("{stage}不通（{source}）")]
+    Fetch {
+        stage: &'static str,
+        source: minhttp::HttpError,
+    },
+    #[error("{stage} HTTP 状态 {status}（{detail}）")]
+    Status {
+        stage: &'static str,
+        status: u16,
+        detail: &'static str,
+    },
+    #[error(transparent)]
+    Manifest(#[from] ManifestError),
+    #[error("最新 Release {tag} 的 SHA256SUMS 缺本平台产物（{platform}）")]
+    MissingArtifact { tag: String, platform: String },
+    #[error("哈希不齐（sha256 期望 {expected}，实得 {actual}）——中止，现役未动")]
+    HashMismatch { expected: String, actual: String },
+}
+
+struct PreparedRelease {
+    tag: String,
+    archive: Vec<u8>,
+}
+
+/// 下载准备阶段不读写本机文件/进程；GET 注入缝用于离线验证路径、次序和失败边界。
+fn prepare_release(
+    current: &str,
+    platform: &str,
+    mut get: impl FnMut(&str, &str, usize, Duration) -> Result<minhttp::Response, minhttp::HttpError>,
+) -> Result<Option<PreparedRelease>, UpdateError> {
+    let mut fetch = |path: &str, cap, budget, stage| {
+        let response = get(RELEASE_HOST, path, cap, budget)
+            .map_err(|source| UpdateError::Fetch { stage, source })?;
+        if response.status != 200 {
+            let detail = match response.status {
+                403 => "GitHub 拒绝访问；仅凭状态码不能确定原因",
+                404 => "未找到对应的 Release 文件",
+                429 => "GitHub 请求过多，请稍后重试",
+                _ => "下载未成功",
+            };
+            return Err(UpdateError::Status {
+                stage,
+                status: response.status,
+                detail,
+            });
+        }
+        Ok(response)
+    };
+    let sums = fetch(
+        &format!("/{REPO_SLUG}/releases/latest/download/SHA256SUMS"),
+        SUMS_CAP,
+        Duration::from_secs(30),
+        "读取最新 Release 的 SHA256SUMS",
+    )?;
+    let manifest = Manifest::parse(&sums.body, platform)?;
+    let tag = manifest.tag;
+    if tag == current {
+        println!("update: 已是最新（{tag}）——没有更新");
+        return Ok(None);
+    }
+    let artifact = manifest
+        .artifact
+        .ok_or_else(|| UpdateError::MissingArtifact {
+            tag: tag.to_owned(),
+            platform: platform.to_owned(),
+        })?;
+    if current == "(devel)" {
+        println!("update: 当前是本地 devel 构建（无版本号）——按最新 Release {tag} 继续");
+    } else {
+        println!("update: 有新版本：{current} → {tag}");
+    }
+    println!("update: 下载 {} …", artifact.name);
+    let archive = fetch(
+        &format!("/{REPO_SLUG}/releases/download/{tag}/{}", artifact.name),
+        ARTIFACT_CAP,
+        Duration::from_secs(180),
+        "下载产物",
+    )?
+    .body;
+    use sha2::{Digest as _, Sha256};
+    let actual: [u8; 32] = Sha256::digest(&archive).into();
+    if actual != artifact.sha256 {
+        return Err(UpdateError::HashMismatch {
+            expected: hex_lower(&artifact.sha256),
+            actual: hex_lower(&actual),
+        });
+    }
+    println!(
+        "update: sha256 校验通过（{}…，{} 字节）",
+        &hex_lower(&actual)[..12],
+        archive.len()
+    );
+    Ok(Some(PreparedRelease {
+        tag: tag.to_owned(),
+        archive,
+    }))
 }
 
 fn hex_lower(bytes: &[u8]) -> String {
@@ -468,20 +559,268 @@ mod tests {
         assert!(asset_name_for("freebsd", "x86_64").is_err());
     }
 
+    const HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    fn manifest(tag: &str) -> Vec<u8> {
+        [
+            "darwin-arm64.tar.gz",
+            "darwin-amd64.tar.gz",
+            "linux-amd64.tar.gz",
+            "linux-arm64.tar.gz",
+            "windows-amd64.zip",
+        ]
+        .map(|suffix| format!("{HASH}  homeway-{tag}-{suffix}\n"))
+        .concat()
+        .into_bytes()
+    }
+
     #[test]
-    fn sha256sums_parsing_forms() {
-        let sums = "abc0000000000000000000000000000000000000000000000000000000000def  homeway-v0.3.21-linux-amd64.tar.gz\n\
-                    1111111111111111111111111111111111111111111111111111111111111111 *homeway-v0.3.21-darwin-arm64.tar.gz\n\
-                    短行\n";
+    fn manifest_accepts_five_official_assets_and_checksum_forms() {
+        for platform in [
+            "darwin-arm64",
+            "darwin-amd64",
+            "linux-amd64",
+            "linux-arm64",
+            "windows-amd64",
+        ] {
+            let bytes = manifest("v0.3.24");
+            let parsed = Manifest::parse(&bytes, platform).unwrap();
+            assert_eq!(parsed.tag, "v0.3.24");
+            assert_eq!(hex_lower(&parsed.artifact.unwrap().sha256), HASH);
+        }
+        let sums = format!(
+            "\r\n{} *homeway-v0.3.25-rc.1+build-linux-amd64.tar.gz\r\n\r\n",
+            HASH.to_uppercase()
+        );
+        let parsed = Manifest::parse(sums.as_bytes(), "linux-amd64").unwrap();
+        assert_eq!(parsed.tag, "v0.3.25-rc.1+build");
+        assert_eq!(hex_lower(&parsed.artifact.unwrap().sha256), HASH);
+    }
+
+    #[test]
+    fn manifest_rejects_ambiguous_or_malformed_input() {
+        assert!(matches!(
+            Manifest::parse(b"\xff", "linux-amd64"),
+            Err(ManifestError::Utf8(_))
+        ));
+        assert!(matches!(
+            Manifest::parse(b"\n", "linux-amd64"),
+            Err(ManifestError::Empty)
+        ));
+        for line in [
+            format!("{}g  homeway-v0.3.24-linux-amd64.tar.gz", &HASH[..63]),
+            format!("{}  homeway-v0.3.24-linux-amd64.tar.gz", &HASH[..63]),
+            format!("{HASH}  homeway-v0.3.24-linux-amd64.tar.gz extra"),
+            "missing-name".to_owned(),
+        ] {
+            assert!(
+                matches!(
+                    Manifest::parse(line.as_bytes(), "linux-amd64"),
+                    Err(ManifestError::InvalidLine(_))
+                ),
+                "{line}"
+            );
+        }
+        for name in [
+            "../homeway-v0.3.24-linux-amd64.tar.gz",
+            "homeway-v1/../../evil-linux-amd64.tar.gz",
+            "homeway-v1%2fescape-linux-amd64.tar.gz",
+            "homeway-v1?query-linux-amd64.tar.gz",
+            "homeway-v1#fragment-linux-amd64.tar.gz",
+            "homeway-v1\\escape-linux-amd64.tar.gz",
+            "homeway-v-linux-amd64.tar.gz",
+            "homeway-main-linux-amd64.tar.gz",
+            "homeway-v0.3.24-windows-amd64.tar.gz",
+            "homeway-v0.3.24-linux-amd64.zip",
+            "homeway-v0.3.24-unknown.tar.gz",
+        ] {
+            let sums = format!("{HASH} {name}");
+            assert!(
+                matches!(
+                    Manifest::parse(sums.as_bytes(), "linux-amd64"),
+                    Err(ManifestError::InvalidAsset(_))
+                ),
+                "{name}"
+            );
+        }
+        let duplicate = format!(
+            "{HASH} homeway-v0.3.24-linux-amd64.tar.gz\n{HASH} *homeway-v0.3.24-linux-amd64.tar.gz"
+        );
+        assert!(matches!(
+            Manifest::parse(duplicate.as_bytes(), "linux-amd64"),
+            Err(ManifestError::DuplicateAsset(_))
+        ));
+        let conflict = format!(
+            "{HASH} homeway-v0.3.24-linux-amd64.tar.gz\n{} homeway-v0.3.24-linux-amd64.tar.gz",
+            "0".repeat(64)
+        );
+        assert!(matches!(
+            Manifest::parse(conflict.as_bytes(), "linux-amd64"),
+            Err(ManifestError::DuplicateAsset(_))
+        ));
+        let mixed = format!(
+            "{HASH} homeway-v0.3.24-darwin-arm64.tar.gz\n{HASH} homeway-v0.3.25-linux-amd64.tar.gz"
+        );
+        assert!(matches!(
+            Manifest::parse(mixed.as_bytes(), "linux-amd64"),
+            Err(ManifestError::MixedVersions)
+        ));
+    }
+
+    fn response(status: u16, body: Vec<u8>) -> minhttp::Response {
+        minhttp::Response { status, body }
+    }
+
+    #[test]
+    fn update_pins_download_to_first_manifest_without_api_or_second_latest_request() {
+        use sha2::{Digest as _, Sha256};
+        let archive = b"verified-release-archive";
+        let sums = format!(
+            "{} homeway-v0.3.24-linux-amd64.tar.gz",
+            hex_lower(&Sha256::digest(archive))
+        );
+        let mut requests = Vec::new();
+        let release = prepare_release("v0.3.23", "linux-amd64", |host, path, cap, budget| {
+            requests.push((host.to_owned(), path.to_owned(), cap, budget));
+            // 若 latest 此时前移，第二次 latest 请求应直接失败；只允许固定原 tag。
+            match requests.len() {
+                1 => Ok(response(200, sums.as_bytes().to_vec())),
+                2 if path == "/zhaoyswd/homeway-rs/releases/download/v0.3.24/homeway-v0.3.24-linux-amd64.tar.gz" => Ok(response(200, archive.to_vec())),
+                _ => panic!("意外请求 {host}{path}"),
+            }
+        }).unwrap().unwrap();
+        assert_eq!(release.tag, "v0.3.24");
+        assert_eq!(release.archive, archive);
+        assert_eq!(requests.len(), 2);
+        assert!(requests.iter().all(|(host, _, _, _)| host == "github.com"));
         assert_eq!(
-            sha256_for(sums, "homeway-v0.3.21-darwin-arm64.tar.gz").as_deref(),
-            Some("1111111111111111111111111111111111111111111111111111111111111111")
+            requests[0].1,
+            "/zhaoyswd/homeway-rs/releases/latest/download/SHA256SUMS"
         );
         assert_eq!(
-            sha256_for(sums, "homeway-v0.3.21-linux-amd64.tar.gz").as_deref(),
-            Some("abc0000000000000000000000000000000000000000000000000000000000def")
+            (requests[0].2, requests[0].3),
+            (SUMS_CAP, Duration::from_secs(30))
         );
-        assert_eq!(sha256_for(sums, "不存在.tar.gz"), None);
+        assert_eq!(
+            (requests[1].2, requests[1].3),
+            (ARTIFACT_CAP, Duration::from_secs(180))
+        );
+    }
+
+    #[test]
+    fn update_current_version_stops_after_validating_entire_manifest() {
+        let mut requests = 0;
+        // 当前平台缺包但 tag 相同：保持既有“没有更新”语义。
+        assert!(prepare_release("v0.3.24", "linux-amd64", |_, _, _, _| {
+            requests += 1;
+            Ok(response(
+                200,
+                format!("{HASH} homeway-v0.3.24-darwin-arm64.tar.gz").into_bytes(),
+            ))
+        })
+        .unwrap()
+        .is_none());
+        assert_eq!(requests, 1);
+        let mixed = format!(
+            "{HASH} homeway-v0.3.24-darwin-arm64.tar.gz\n{HASH} homeway-v0.3.25-linux-amd64.tar.gz"
+        );
+        assert!(matches!(
+            prepare_release("v0.3.24", "linux-amd64", |_, _, _, _| Ok(response(
+                200,
+                mixed.as_bytes().to_vec()
+            ))),
+            Err(UpdateError::Manifest(ManifestError::MixedVersions))
+        ));
+    }
+
+    #[test]
+    fn update_rejects_missing_platform_and_bad_manifest_before_archive_request() {
+        for sums in [
+            b"broken".to_vec(),
+            format!("{HASH} homeway-v0.3.24-darwin-arm64.tar.gz").into_bytes(),
+        ] {
+            let mut requests = 0;
+            let result = prepare_release("v0.3.23", "linux-amd64", |_, _, _, _| {
+                requests += 1;
+                Ok(response(200, sums.clone()))
+            });
+            assert!(matches!(
+                result,
+                Err(UpdateError::Manifest(_)) | Err(UpdateError::MissingArtifact { .. })
+            ));
+            assert_eq!(requests, 1);
+        }
+    }
+
+    #[test]
+    fn update_reports_http_and_transport_errors_in_both_stages() {
+        for status in [403, 404, 429, 500] {
+            for failed_request in [1, 2] {
+                let mut requests = 0;
+                let result = prepare_release("v0.3.23", "linux-amd64", |_, _, _, _| {
+                    requests += 1;
+                    Ok(if requests == failed_request {
+                        response(status, vec![])
+                    } else {
+                        response(200, manifest("v0.3.24"))
+                    })
+                });
+                assert!(
+                    matches!(result, Err(UpdateError::Status { status: actual, .. }) if actual == status)
+                );
+                assert_eq!(requests, failed_request);
+            }
+        }
+        for failed_request in [1, 2] {
+            let mut requests = 0;
+            let result = prepare_release("v0.3.23", "linux-amd64", |_, _, _, _| {
+                requests += 1;
+                if requests == failed_request {
+                    Err(minhttp::HttpError::Deadline)
+                } else {
+                    Ok(response(200, manifest("v0.3.24")))
+                }
+            });
+            assert!(matches!(
+                result,
+                Err(UpdateError::Fetch {
+                    source: minhttp::HttpError::Deadline,
+                    ..
+                })
+            ));
+            assert_eq!(requests, failed_request);
+        }
+    }
+
+    #[test]
+    fn update_hash_mismatch_returns_no_prepared_archive() {
+        let mut requests = 0;
+        let result = prepare_release("(devel)", "linux-amd64", |_, _, _, _| {
+            requests += 1;
+            Ok(response(
+                200,
+                if requests == 1 {
+                    manifest("v0.3.24")
+                } else {
+                    b"corrupt".to_vec()
+                },
+            ))
+        });
+        assert!(matches!(result, Err(UpdateError::HashMismatch { .. })));
+        assert_eq!(requests, 2);
+    }
+
+    /// 只下载与校验，不暂存/换装/重启；真网不纳入默认测试门。
+    #[test]
+    #[ignore = "真网依赖：手动跑，官方清单及本平台归档只读校验"]
+    fn github_release_preparation_over_real_tls() {
+        let platform = asset_name_for(std::env::consts::OS, std::env::consts::ARCH).unwrap();
+        let get = |host: &str, path: &str, cap, budget| {
+            minhttp::get(host, path, None, Instant::now() + budget, cap)
+        };
+        let release = prepare_release("(devel)", platform, get).unwrap().unwrap();
+        assert!(!release.archive.is_empty());
+        assert!(prepare_release(&release.tag, platform, get).unwrap().is_none());
     }
 
     #[test]
