@@ -1,22 +1,22 @@
-# 互操作矩阵最近一次运行（生成：2026-11-03 00:51:17；工具 tools/matrix.sh）
+# 互操作矩阵最近一次运行（生成：2026-11-03 01:09:55；工具 tools/matrix.sh）
 
 | 链路 | 判据 | 结果 | 摘录/耗时 | 备注 |
 |---|---|---|---|---|
-| RRR | R-ready | PASS | /tmp/homeway-rs-matrix/RRR/relay/cache/relay.log:2026-11-03 00:45:57.500 [relay] 中继控制面：TCP 127.0.0.1 |  |
-| RRR | E1 | PASS | 2026-11-03 00:45:58.173 [homeway] serve 就绪：quic=:42668（配置端口；被占用会自动退让）tunnel=100.64.255.1 files=7802  |  |
-| RRR | X1-reg | PASS | 2026-11-03 00:45:58.173 [homeway] 中继：注册成功（腿 42668 → 127.0.0.1:42757）—— 客户端可经它到达本机 |  |
-| RRR | R3-backend | PASS | 2026-11-03 00:45:58.173 [relay] 中继：后端 8b2ee186b7390635 注册成功（腿 127.0.0.1:42668） |  |
+| RRR | R-ready | PASS | /tmp/homeway-rs-matrix/RRR/relay/cache/relay.log:2026-11-03 01:04:34.733 [relay] 中继控制面：TCP 127.0.0.1 |  |
+| RRR | E1 | PASS | 2026-11-03 01:04:35.243 [homeway] serve 就绪：quic=:42668（配置端口；被占用会自动退让）tunnel=100.64.255.1 files=7802  |  |
+| RRR | X1-reg | PASS | 2026-11-03 01:04:35.244 [homeway] 中继：注册成功（腿 42668 → 127.0.0.1:42757）—— 客户端可经它到达本机 |  |
+| RRR | R3-backend | PASS | 2026-11-03 01:04:35.244 [relay] 中继：后端 ec1b4da07d1e97bd 注册成功（腿 127.0.0.1:42668） |  |
 | RRR | C-ready | PASS | warmup pong: 就绪（判据=quic） |  |
 | RRR | C-via | PASS | 服务会话: 路径确立：直连 192.168.3.12:42668（首个完成准入） | （胜者耗时 0s） |
 | RRR | C-direct-usable | PASS | 赛跑胜者本身即直连（无需打死中继对照） |  |
-| RRR | E7 | PASS | 2026-11-03 00:45:59.700 [homeway] peer: + dev=3deb5122 pub=e364b64a ip=100.64.99.184 n=1/32 |  |
-| RRR | E13-speedtest | PASS | speedtest: 摘要 down=829Mbps up=884Mbps； | （复核第 0 轮命中） |
-| RRR | F-100MB | PASS | sha256 双侧一致（eb69075d515544cd…） |  |
+| RRR | E7 | PASS | 2026-11-03 01:04:36.772 [homeway] peer: + dev=005cf1b6 pub=a27b6c06 ip=100.64.222.0 n=1/32 |  |
+| RRR | E13-speedtest | PASS | speedtest: 摘要 down=723Mbps up=779Mbps； | （复核第 0 轮命中） |
+| RRR | F-100MB | PASS | sha256 双侧一致（bb4d1826e81b261c…） |  |
 | RRR | E10 | PASS | transit: 经隧道拨 192.168.3.12:42807 成功（收 58 字节） | （QUIC dial 腿：客户端往返行；出口 intercept transit 行随 S4 收窄） |
 | RRR | E11 | WARN | （QUIC dial 腿收口行受出口 #17 节流——证据 = M4 quic-pf-e2e 流收口/泄漏判据 + E10 客户端往返行） | E11-QUIC-DIAL |
 | RRR | FB-files | PASS | list 1 行（并发闸不误伤；满员拒绝面见单测） |  |
 | RRR | DNS | SKIP | （dnstest 已退役——M5 §2.6-G6：岛无 UDP socket 服务面；无判据面可采） |  |
-| RRR | DBG-log | PASS | 2026-11-03 00:45:59.700 [homeway] peer: + dev=3deb5122 pub=e364b64a ip=100.64.99.184 n=1/3 |  |
+| RRR | DBG-log | PASS | 2026-11-03 01:04:36.772 [homeway] peer: + dev=005cf1b6 pub=a27b6c06 ip=100.64.222.0 n=1/32 |  |
 | RRR | TOTAL | PASS | 316s |  |
 
 **结论：全绿**（豁免：WARN 1 / SKIP 1——各降档的独立证据绑定见备注列）
