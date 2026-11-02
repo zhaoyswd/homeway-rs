@@ -32,6 +32,11 @@ const CONTROL_READY_NOTICE: &str = "本机服务已连接 · 可选择或创建�
 const SESSIONS_READY_NOTICE: &str = "已就绪 · 选择会话，或点击 + 创建 shell";
 // Per-tick terminal fallback budget. A burst beyond this becomes one summary.
 const NOTIFICATION_FALLBACK_LIMIT: usize = 16;
+// TUI refresh policy: session metadata is cheap and independent of host probes.
+// A failed automatic LIST backs off; explicit navigation/mutations still refresh immediately.
+const HOST_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
+const SESSION_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
+const SESSION_REFRESH_RETRY: Duration = Duration::from_secs(2);
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
@@ -241,8 +246,18 @@ struct App {
     refresh_pending: bool,
     sessions_pending: bool,
     sessions_epoch: u64,
+    sessions_live_revision: u64,
+    live_revision: u64,
+    live_metadata: LiveMetadata,
     navigation_epoch: u64,
     next_refresh: Instant,
+    next_sessions_refresh: Instant,
+}
+
+#[derive(Default)]
+struct LiveMetadata {
+    title: Option<(u64, String)>,
+    state: Option<(u64, backend::SessionState)>,
 }
 
 struct OperationFact {
@@ -435,8 +450,12 @@ impl App {
             refresh_pending: false,
             sessions_pending: false,
             sessions_epoch: 0,
+            sessions_live_revision: 0,
+            live_revision: 0,
+            live_metadata: LiveMetadata::default(),
             navigation_epoch: 0,
             next_refresh: Instant::now(),
+            next_sessions_refresh: Instant::now(),
         }
     }
 
@@ -821,23 +840,34 @@ impl App {
     }
 
     fn poll_refresh(&mut self) {
-        if Instant::now() < self.next_refresh {
-            return;
+        self.poll_refresh_at(Instant::now());
+    }
+
+    fn poll_refresh_at(&mut self, now: Instant) {
+        if now >= self.next_refresh {
+            self.next_refresh = now + HOST_REFRESH_INTERVAL;
+            if !self.refresh_pending {
+                self.refresh_pending = self.command(Command::Refresh);
+            }
         }
-        self.next_refresh = Instant::now() + Duration::from_secs(2);
-        if !self.refresh_pending {
-            self.refresh_pending = self.command(Command::Refresh);
+        if now >= self.next_sessions_refresh && !self.sessions_pending {
+            self.refresh_sessions_at(now);
         }
-        self.refresh_sessions();
     }
 
     fn refresh_sessions(&mut self) {
+        self.refresh_sessions_at(Instant::now());
+    }
+
+    fn refresh_sessions_at(&mut self, now: Instant) {
         if !self.sessions_pending {
             self.sessions_epoch = self.sessions_epoch.wrapping_add(1);
+            self.sessions_live_revision = self.live_revision;
             self.sessions_pending = self.command(Command::Sessions {
                 target: self.target(),
                 epoch: self.sessions_epoch,
             });
+            self.next_sessions_refresh = now + SESSION_REFRESH_INTERVAL;
         }
     }
 
@@ -845,6 +875,7 @@ impl App {
         self.recovery = None;
         self.active_pid = None;
         self.attach_verified = false;
+        self.live_metadata = LiveMetadata::default();
         self.application_copies.clear();
         self.cancel_selection();
         self.input_geometry = None;
@@ -868,6 +899,7 @@ impl App {
     }
 
     fn disconnect(&mut self) {
+        self.live_metadata = LiveMetadata::default();
         self.application_copies.clear();
         self.cancel_selection();
         self.input_geometry = None;
@@ -1098,7 +1130,8 @@ impl App {
                 }
                 self.sessions_pending = false;
                 match result {
-                    Ok(sessions) => {
+                    Ok(mut sessions) => {
+                        self.merge_live_metadata(&mut sessions);
                         self.observe_blocking(&target, &sessions);
                         let selected = self.active_session.clone().or_else(|| self.selected_name());
                         self.session_pids = sessions
@@ -1157,6 +1190,7 @@ impl App {
                         );
                     }
                     Err(error) => {
+                        self.next_sessions_refresh = Instant::now() + SESSION_REFRESH_RETRY;
                         let related = self.operation_host_matches(&target);
                         let fact = self
                             .operation_fact
@@ -1366,6 +1400,7 @@ impl App {
     }
 
     fn begin_attach(&mut self, now: Instant) {
+        self.live_metadata = LiveMetadata::default();
         let Some(name) = self.active_session.clone() else {
             self.recovery = None;
             return;
@@ -1524,6 +1559,7 @@ impl App {
         }
         self.active_pid = Some(session.pid);
         self.attach_verified = true;
+        self.sync_live_metadata();
         if let Some(recovery) = &mut self.recovery {
             recovery.replied(Instant::now());
         }
@@ -1630,15 +1666,93 @@ impl App {
                     break;
                 }
                 Op::STATE => {
-                    let (_, _, title) = frames::dec_state(&frame.payload);
-                    if !title.is_empty() {
-                        self.model.terminal_title = title;
-                    }
+                    self.session_state(&frame.payload);
                 }
                 Op::ERROR => self.term_error(&frame.payload),
                 Op::CLIPBOARD if self.attach_verified => self.application_clipboard(&frame.payload),
                 Op::LIST => self.probe_reply(&frame.payload),
                 _ => {}
+            }
+        }
+    }
+
+    fn session_state(&mut self, payload: &[u8]) {
+        if payload.len() < 4
+            || usize::from(u16::from_le_bytes([payload[2], payload[3]])) > payload.len() - 4
+        {
+            return;
+        }
+        let (_, state, title) = frames::dec_state(payload);
+        self.live_revision = self.live_revision.wrapping_add(1);
+        self.live_metadata.state = Some((
+            self.live_revision,
+            match state {
+                frames::state_v2::WORKING => backend::SessionState::Working,
+                frames::state_v2::BLOCKED => backend::SessionState::Blocked,
+                frames::state_v2::IDLE => backend::SessionState::Idle,
+                _ => backend::SessionState::Unknown,
+            },
+        ));
+        if !title.is_empty() {
+            self.live_metadata.title = Some((self.live_revision, title.clone()));
+            self.model.terminal_title = title;
+        }
+        self.sync_live_metadata();
+    }
+
+    fn live_session_name(&self) -> Option<&str> {
+        let name = self.active_session.as_deref()?;
+        let pid = self.active_pid.filter(|pid| *pid > 0)?;
+        (self.attach_verified && self.session_pids.get(name) == Some(&pid)).then_some(name)
+    }
+
+    fn sync_live_metadata(&mut self) {
+        let Some(name) = self.live_session_name() else {
+            return;
+        };
+        let Some(index) = self
+            .model
+            .sessions
+            .iter()
+            .position(|session| session.name == name)
+        else {
+            return;
+        };
+        let session = &mut self.model.sessions[index];
+        if let Some((_, title)) = &self.live_metadata.title {
+            session.title.clone_from(title);
+        }
+        if let Some((_, state)) = self.live_metadata.state {
+            session.state = session_view_state(state);
+        }
+        self.render_dirty = true;
+    }
+
+    fn merge_live_metadata(&mut self, sessions: &mut [backend::Session]) {
+        if !self.attach_verified {
+            return;
+        }
+        let Some(session) = sessions.iter_mut().find(|session| {
+            Some(&session.name) == self.active_session.as_ref()
+                && session.pid > 0
+                && Some(session.pid) == self.active_pid
+        }) else {
+            return;
+        };
+        // LIST may have been sampled before this leg's latest event. Compare each
+        // field separately: a later title-only snapshot must not revive old state.
+        if let Some((revision, title)) = &self.live_metadata.title {
+            if *revision > self.sessions_live_revision {
+                session.title.clone_from(title);
+            } else {
+                self.live_metadata.title = None;
+            }
+        }
+        if let Some((revision, state)) = self.live_metadata.state {
+            if revision > self.sessions_live_revision {
+                session.state = state;
+            } else {
+                self.live_metadata.state = None;
             }
         }
     }
@@ -1669,6 +1783,8 @@ impl App {
                 let initial = !self.connected;
                 self.connected = self.recovery.is_none() || self.attach_verified;
                 if !title.is_empty() {
+                    self.live_revision = self.live_revision.wrapping_add(1);
+                    self.live_metadata.title = Some((self.live_revision, title.clone()));
                     self.model.terminal_title = title;
                 }
                 if initial && self.connected {
@@ -1717,6 +1833,7 @@ impl App {
         if focus {
             self.send_input(frames::InputEvent::Focus { gained: true });
         }
+        self.sync_live_metadata();
         Ok(())
     }
 
@@ -2503,12 +2620,16 @@ fn session_item(session: backend::Session) -> view::SessionItem {
             .unwrap_or(session.agent),
         project,
         self_session: session.self_session,
-        state: match session.state {
-            backend::SessionState::Working => view::SessionState::Working,
-            backend::SessionState::Idle => view::SessionState::Idle,
-            backend::SessionState::Blocked => view::SessionState::Blocked,
-            backend::SessionState::Unknown => view::SessionState::Unknown,
-        },
+        state: session_view_state(session.state),
+    }
+}
+
+fn session_view_state(state: backend::SessionState) -> view::SessionState {
+    match state {
+        backend::SessionState::Working => view::SessionState::Working,
+        backend::SessionState::Idle => view::SessionState::Idle,
+        backend::SessionState::Blocked => view::SessionState::Blocked,
+        backend::SessionState::Unknown => view::SessionState::Unknown,
     }
 }
 
@@ -2986,6 +3107,234 @@ mod tests {
             pid,
             ..Default::default()
         }
+    }
+
+    fn live_app() -> App {
+        let mut app = history_app();
+        app.active_pid = Some(321);
+        app.attach_verified = true;
+        app.session_pids.insert("history".into(), 321);
+        app
+    }
+
+    #[test]
+    fn session_refresh_has_its_own_cadence_one_request_and_failure_backoff() {
+        let mut app = app();
+        let now = Instant::now();
+        app.next_refresh = now;
+        app.next_sessions_refresh = now;
+        app.poll_refresh_at(now);
+        assert!(app.refresh_pending && app.sessions_pending);
+        let first = app.sessions_epoch;
+        let host_due = app.next_refresh;
+        app.poll_refresh_at(now + SESSION_REFRESH_INTERVAL);
+        assert_eq!(app.sessions_epoch, first, "one LIST remains in flight");
+        app.sessions_pending = false;
+        app.poll_refresh_at(now + SESSION_REFRESH_INTERVAL);
+        assert_eq!(app.sessions_epoch, first + 1);
+        assert_eq!(
+            app.next_refresh, host_due,
+            "LIST must not accelerate host probes"
+        );
+        app.backend_event(backend::Event::Sessions {
+            target: Target::Local,
+            epoch: app.sessions_epoch,
+            result: Err(backend::Error::Busy),
+        });
+        let retry = app.next_sessions_refresh;
+        let failed = app.sessions_epoch;
+        app.poll_refresh_at(retry - Duration::from_millis(1));
+        assert_eq!(app.sessions_epoch, failed);
+        assert_eq!(
+            app.next_sessions_refresh, retry,
+            "host refresh cannot cancel backoff"
+        );
+        app.refresh_sessions_at(now);
+        assert_eq!(
+            app.sessions_epoch,
+            failed + 1,
+            "explicit refresh bypasses backoff"
+        );
+        app.sessions_pending = false;
+        app.next_sessions_refresh = retry;
+        app.poll_refresh_at(retry);
+        assert_eq!(app.sessions_epoch, failed + 2);
+    }
+
+    #[test]
+    fn live_state_updates_both_titles_and_status_without_replacing_custom_label_or_notice() {
+        let mut app = live_app();
+        app.model.sessions[0].agent = "custom agent".into();
+        let notice = app.model.notice.clone();
+        app.session_state(&frames::enc_state(
+            frames::agent::CODEX,
+            frames::state_v2::BLOCKED,
+            "live",
+        ));
+        assert_eq!(app.model.terminal_title, "live");
+        assert_eq!(app.model.sessions[0].title, "live");
+        assert_eq!(app.model.sessions[0].state, view::SessionState::Blocked);
+        assert_eq!(app.model.sessions[0].agent, "custom agent");
+        assert_eq!(app.model.notice, notice);
+        for payload in [&[0, 0][..], &[0, 0, 9, 0, b'x'][..]] {
+            app.session_state(payload);
+            assert_eq!(app.model.sessions[0].state, view::SessionState::Blocked);
+            assert_eq!(app.model.terminal_title, "live");
+        }
+    }
+
+    #[test]
+    fn live_metadata_merges_per_field_and_never_overwrites_a_replacement_pid() {
+        let mut app = live_app();
+        app.sessions_live_revision = app.live_revision;
+        app.session_state(&frames::enc_state(
+            frames::agent::SHELL,
+            frames::state_v2::BLOCKED,
+            "new",
+        ));
+        let mut old = vec![blocking_session(
+            "history",
+            backend::SessionState::Idle,
+            321,
+        )];
+        app.merge_live_metadata(&mut old);
+        assert_eq!(old[0].title, "new");
+        assert_eq!(old[0].state, backend::SessionState::Blocked);
+        app.sessions_live_revision = app.live_revision;
+        // A title-only snapshot after this request cannot make the earlier state newer.
+        app.live_revision += 1;
+        app.live_metadata.title = Some((app.live_revision, "snapshot".into()));
+        let mut newer = vec![blocking_session(
+            "history",
+            backend::SessionState::Working,
+            321,
+        )];
+        app.merge_live_metadata(&mut newer);
+        assert_eq!(newer[0].title, "snapshot");
+        assert_eq!(newer[0].state, backend::SessionState::Working);
+        assert!(app.live_metadata.state.is_none());
+        let mut replacement = vec![blocking_session(
+            "history",
+            backend::SessionState::Idle,
+            322,
+        )];
+        app.merge_live_metadata(&mut replacement);
+        assert_eq!(replacement[0].title, "title-history");
+        assert_eq!(replacement[0].state, backend::SessionState::Idle);
+    }
+
+    #[test]
+    fn snapshot_title_syncs_sidebar_without_reviving_state_older_than_list() {
+        let mut app = live_app();
+        app.session_state(&frames::enc_state(
+            frames::agent::SHELL,
+            frames::state_v2::IDLE,
+            "before",
+        ));
+        app.sessions_live_revision = app.live_revision;
+        let mut vt = homeway_core::term::vt::SessionVt::new(66, 27, 100).unwrap();
+        let body = codec::SnapshotBody {
+            cols: 66,
+            rows: 27,
+            seq: 2,
+            revision: 2,
+            title: "snapshot-title".into(),
+            cursor: codec::surface_cursor_of(&vt.cursor()),
+            scroll: vt.scrollbar().into(),
+            history_epoch: vt.history_epoch(),
+            history_base: vt.history_base(),
+            grid: codec::encode_grid(66, 27, &vt.rows()),
+            ..Default::default()
+        };
+        for fragment in
+            codec::fragment_payload(&codec::gzip_bytes(&codec::enc_snapshot_body(&body)))
+        {
+            app.surface_frame(Op::SNAPSHOT, &fragment).unwrap();
+        }
+        assert_eq!(app.model.terminal_title, "snapshot-title");
+        assert_eq!(app.model.sessions[0].title, "snapshot-title");
+        app.backend_event(backend::Event::Sessions {
+            target: Target::Local,
+            epoch: app.sessions_epoch,
+            result: Ok(vec![blocking_session(
+                "history",
+                backend::SessionState::Working,
+                321,
+            )]),
+        });
+        assert_eq!(app.model.sessions[0].title, "snapshot-title");
+        assert_eq!(app.model.sessions[0].state, view::SessionState::Working);
+    }
+
+    #[test]
+    fn unverified_live_events_wait_for_pid_and_are_cleared_across_disconnect_and_navigation() {
+        let mut app = live_app();
+        app.attach_verified = false;
+        app.session_state(&frames::enc_state(
+            frames::agent::SHELL,
+            frames::state_v2::WORKING,
+            "pending",
+        ));
+        assert_eq!(app.model.sessions[0].title, "history");
+        app.attach_verified = true;
+        app.sync_live_metadata();
+        assert_eq!(app.model.sessions[0].title, "pending");
+        app.disconnect();
+        assert!(app.live_metadata.title.is_none() && app.live_metadata.state.is_none());
+        app.attach_verified = true;
+        app.session_pids.insert("history".into(), 322);
+        app.session_state(&frames::enc_state(
+            frames::agent::SHELL,
+            frames::state_v2::BLOCKED,
+            "old-pid",
+        ));
+        assert_eq!(app.model.sessions[0].title, "pending");
+        app.detach();
+        assert!(app.live_metadata.title.is_none() && app.live_metadata.state.is_none());
+    }
+
+    #[test]
+    fn merged_live_blocking_state_notifies_once_then_new_list_can_advance() {
+        let mut app = live_app();
+        let (notifications, recorded) = notifications::Notifications::recording();
+        app.notifications = notifications;
+        app.observe_blocking(
+            &Target::Local,
+            &[blocking_session(
+                "history",
+                backend::SessionState::Idle,
+                321,
+            )],
+        );
+        app.session_state(&frames::enc_state(
+            frames::agent::SHELL,
+            frames::state_v2::BLOCKED,
+            "needs input",
+        ));
+        let old = || {
+            vec![blocking_session(
+                "history",
+                backend::SessionState::Idle,
+                321,
+            )]
+        };
+        for _ in 0..2 {
+            app.backend_event(backend::Event::Sessions {
+                target: Target::Local,
+                epoch: app.sessions_epoch,
+                result: Ok(old()),
+            });
+        }
+        assert_eq!(recorded.try_iter().count(), 1);
+        assert_eq!(app.model.sessions[0].state, view::SessionState::Blocked);
+        app.sessions_live_revision = app.live_revision;
+        app.backend_event(backend::Event::Sessions {
+            target: Target::Local,
+            epoch: app.sessions_epoch,
+            result: Ok(old()),
+        });
+        assert_eq!(app.model.sessions[0].state, view::SessionState::Idle);
+        assert_eq!(recorded.try_iter().count(), 0);
     }
 
     #[test]
