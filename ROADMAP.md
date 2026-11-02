@@ -72,23 +72,23 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
-> **2026-11-03 v0.3.26 发布与云部署（进行中，本机禁止部署）**：用户明确授权发布部署，
-> 本机留待其后续手动换装，本轮不prepare、不更新PATH件、不重启。版本覆盖8c59804与
-> 416dd4d；workspace/Cargo.lock四自有包0.3.26、CHANGELOG及精确Release正文准备完成，
-> 独立技术/代码两门通过，第三方依赖和产品行为不变。root接续最终版本完整quick、推main、
-> CI、main头tag、五平台官方Release与本机下载校验，再scp云私有验证/备份/唯一切换。
-> fresh核本机PID23925/d1431158件、云PID1744087/start3499622840/a3b9221d件均v0.3.25，
-> 本机只读基线保留；云执行器另走两门。详见同日v0.3.26-release/deploy记录；
-> 版本48f3a64最终quick实际exit0（01:09:55）：workspace1492/0、41ignored，clippy/
-> OHOScheck/真link2943728B/全部静态门全过，RRR316秒/100MB哈希/E10/FB-files通过，
-> 既有E11 WARN/DNS SKIP保留。云两执行器与只读订阅probe两门全过，尚未推送、发布或换装。
-> 更新：20d055c已推main，CI41488647332首Mac既有relay单项红，同树独立12/12及并发
-> 3×23/0后仅重跑失败job一次，最终八项success；原失败保留、机制未证、未改测试/产品。
-> main头tag v0.3.26与Release41491350987六job全success，官方五归档本机SUMS/架构/
-> 版本签名通过，正文与CHANGELOG一致。同官方Mac件私有23/8/5 PASS、云4 PASS均exit0。
-> 云scp复核、prepare实际exit0，持久receipt PREPARED/未激活，七state文件与归档/旧新件
-> 独立hash核验通过；下一步只执行/root/homeway-rollback/release-v0.3.26-20261103-r1/
-> ali-deploy.py唯一activate并独立验收。本机仍原23925/d1431158件/v0.3.25，不换装/重启。
+> **2026-11-03 v0.3.26 发布与云部署（完成；本机留用户手动部署）**：用户明确授权
+> 完整发布/云部署并排除本机。版本48f3a64覆盖两会话刷新单元，元数据及云工件独立两门
+> 全过。最终quick实际exit0（01:09:55）：workspace1492/0、41ignored，clippy/OHOScheck/
+> 真link2943728B/全部静态门全过，私有RRR316秒、100MB哈希/E10/FB-files通过，既有E11
+> WARN/DNS SKIP保持。20d055c已推main，CI41488647332首Mac既有relay单项红，同树独立
+> 12/12及并发3×23/0后只重跑失败job一次，最终八项success；原失败保留、机制未证。
+> main头tag v0.3.26与Release41491350987六job全success，五归档本机SUMS/架构/版本/
+> Mac签名通过、正文与CHANGELOG一致；同官方件私有Mac23/8/5 PASS、云4 PASS均exit0。
+> 云官方739a3bee件由本机scp并复核，prepare备份独立核验后9e0f535检查点推main，唯一
+> 激活SUCCESS/16.984秒、未回退，1744087→1755672/start3529321579。独立SSH核正式
+> v0.3.26/零参映像/端口/serve与relay running/身份配置台账原前缀完整且追加0B全过；
+> 显式serve与local-term socket订阅probe均exit0/features511，首默认路径错误保留。
+> 本机01:44:08 OK-MAC自然认证恢复，仍原PID23925/d1431158件/v0.3.25；原配置/身份/
+> plist与102140B台账前缀保全、正常追加856B，未prepare/换装/重启或update，留用户手动。
+> 云worker已退出，恢复资料保留/root/homeway-rollback/release-v0.3.26-20261103-r1/；
+> 恢复先读receipt/RECOVERY，不重复激活、不自动覆盖state；LAN71未动。详见同日
+> v0.3.26-release/deploy记录和DEPLOY-RUST-EXIT §13.26。
 
 > **2026-11-03 TUI 全会话元数据订阅（完成，本地源码）**：当前主机单独一条元数据
 > 订阅，初始全量后由创建/退出、标题、state/agentLabel、有效cwd变化唤醒推送；无后台

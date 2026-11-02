@@ -1419,3 +1419,26 @@ receipt/RECOVERY/RESUME；持久输入及独立验证日志在
 `~/homeway-deploy-inputs/release-v0.3.25-20261030-r1/`。恢复先读receipt/RECOVERY并
 确认worker状态，不能重复activation或自动覆盖state。完整两门、实际执行与独立验收见
 `docs/reviews/2026-10-30-v0.3.25-mac-deploy.md`。本机与云现均v0.3.25，LAN71仍未部署。
+
+### 13.26 v0.3.26 会话列表订阅发布与云更新（2026-11-03，完成；本机不部署）
+
+用户明确发布部署，并要求本机先别部署、后续由其手动处理。版本48f3a64与检查点
+20d055c经过完整quick（1492/0、41ignored、RRR316秒）及独立两门；公开CI首轮Mac
+既有relay单项红，本地单项12/12及并发3×23/0后同树只重跑失败job一次，最终八项全过，
+机制未证、原失败保留。main头tag v0.3.26、Release41491350987五平台及发布job全过。
+本机下载五归档/SUMS全部校验，Mac准确版本/严格签名和Linux静态核验通过。
+
+同官方Mac件私有本地23/远程8/订阅5PASS；官方Linux件本机scp后复核，云私有4PASS。
+受审云执行器持久prepare、备份独立校验后，9e0f535检查点推main，唯一activate得到
+**SUCCESS/16.984秒、未回退**，PID1744087→**1755672**、start3529321579。独立SSH
+核正式/usr/local/bin/homeway、零参/defaultstate、准确v0.3.26、官方SHA
+`739a3bee94e13cb3aff237defd01a35490d0157faf2d57949449bccce9516f3a`、运行映像/端口/
+serve及relay running、原四项身份配置台账前缀完整且追加0B均通过。被动订阅探针显式
+指定serve/term.sock及local-term.sock，两处features511/完整baseline通过；首轮默认
+term.sock路径错误仅为探针执行参数问题，原失败保留。Mac01:44:08中继OK-MAC自然恢复。
+
+持久恢复目录 `/root/homeway-rollback/release-v0.3.26-20261103-r1/` 保留旧件/state/
+manifest/receipt/RECOVERY，worker已退出；断线先查回执、不重复activate、不自动覆盖state。
+本机仍原PID23925、d1431158官方v0.3.25，原配置/身份/plist与台账前缀保全，未prepare/
+换装/重启或update，留用户手动部署；LAN71未动。完整证据与边界见同日
+`v0.3.26-release.md` 和 `v0.3.26-deploy.md` 两份review。
