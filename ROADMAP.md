@@ -82,6 +82,13 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 > 版本48f3a64最终quick实际exit0（01:09:55）：workspace1492/0、41ignored，clippy/
 > OHOScheck/真link2943728B/全部静态门全过，RRR316秒/100MB哈希/E10/FB-files通过，
 > 既有E11 WARN/DNS SKIP保留。云两执行器与只读订阅probe两门全过，尚未推送、发布或换装。
+> 更新：20d055c已推main，CI41488647332首Mac既有relay单项红，同树独立12/12及并发
+> 3×23/0后仅重跑失败job一次，最终八项success；原失败保留、机制未证、未改测试/产品。
+> main头tag v0.3.26与Release41491350987六job全success，官方五归档本机SUMS/架构/
+> 版本签名通过，正文与CHANGELOG一致。同官方Mac件私有23/8/5 PASS、云4 PASS均exit0。
+> 云scp复核、prepare实际exit0，持久receipt PREPARED/未激活，七state文件与归档/旧新件
+> 独立hash核验通过；下一步只执行/root/homeway-rollback/release-v0.3.26-20261103-r1/
+> ali-deploy.py唯一activate并独立验收。本机仍原23925/d1431158件/v0.3.25，不换装/重启。
 
 > **2026-11-03 TUI 全会话元数据订阅（完成，本地源码）**：当前主机单独一条元数据
 > 订阅，初始全量后由创建/退出、标题、state/agentLabel、有效cwd变化唤醒推送；无后台
