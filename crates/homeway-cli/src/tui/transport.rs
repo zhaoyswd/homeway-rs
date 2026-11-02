@@ -10,6 +10,7 @@ use homeway_core::daemon::client::{ClientStream, ControlClient};
 use homeway_core::term::frames::{self, caps, Frame, Op};
 use homeway_core::term::wire::FrameIo;
 
+use super::backend::SessionSnapshot;
 use super::backend::{deliver, Error, Target};
 
 const IO_BUDGET: Duration = Duration::from_secs(10);
@@ -447,10 +448,228 @@ impl Drop for Attach {
     }
 }
 
+pub(super) enum SubscriptionEvent {
+    Snapshot(SessionSnapshot),
+    Unsupported,
+    Failed(Error),
+}
+
+/// One target-wide metadata connection. A slow UI retains only the newest full
+/// snapshot; this connection never sends HELLO or receives terminal surfaces.
+pub(super) struct SessionSubscription {
+    latest: Arc<Mutex<Option<SubscriptionEvent>>>,
+    cancel: Arc<Cancellation>,
+}
+
+impl SessionSubscription {
+    pub fn start(state: PathBuf, target: Target) -> Self {
+        Self::start_with_timeout(
+            state,
+            target,
+            homeway_core::term::session_watch::STALE_TIMEOUT,
+        )
+    }
+
+    fn start_with_timeout(state: PathBuf, target: Target, stale_timeout: Duration) -> Self {
+        let latest = Arc::new(Mutex::new(None));
+        let cancel = Arc::new(Cancellation {
+            alive: AtomicBool::new(true),
+            closer: Mutex::new(None),
+        });
+        let output = Arc::clone(&latest);
+        let running = Arc::clone(&cancel);
+        std::thread::spawn(move || {
+            let publish = |event| {
+                if running.alive.load(Ordering::Acquire) {
+                    *output.lock().unwrap_or_else(|error| error.into_inner()) = Some(event);
+                }
+            };
+            let run = || -> Result<(), Error> {
+                let mut connection =
+                    TermConnection::connect_with_budget(&state, &target, Duration::from_secs(3))?;
+                *running
+                    .closer
+                    .lock()
+                    .unwrap_or_else(|error| error.into_inner()) = Some(connection.closer()?);
+                if !running.alive.load(Ordering::Acquire) {
+                    return Ok(());
+                }
+                if connection.features & frames::features::SESSION_SUBSCRIPTION == 0 {
+                    publish(SubscriptionEvent::Unsupported);
+                    return Ok(());
+                }
+                connection.write(Op::SUBSCRIBE, &[])?;
+                let mut assembler = homeway_core::term::session_watch::Assembler::default();
+                let mut confirmed = Default::default();
+                let mut deadline = Instant::now() + stale_timeout;
+                while running.alive.load(Ordering::Acquire) {
+                    // One absolute deadline for a complete message: fragments do
+                    // not renew the budget and cannot keep stale metadata alive.
+                    connection.deadline = deadline;
+                    let frame = connection
+                        .read(Some(deadline.saturating_duration_since(Instant::now())))?;
+                    check_error(&frame)?;
+                    if frame.op != Op::SESSION_LIST {
+                        return Err(Error::Unexpected(frame.op.0));
+                    }
+                    if let Some((revision, json)) = assembler.push(&frame.payload)? {
+                        let mut snapshot: SessionSnapshot = serde_json::from_slice(&json)?;
+                        if snapshot.revision != Some(revision) {
+                            return Err(Error::MetadataRevision {
+                                frame: revision,
+                                json: snapshot.revision,
+                            });
+                        }
+                        snapshot.normalize(&target, &mut confirmed);
+                        deadline = Instant::now() + stale_timeout;
+                        publish(SubscriptionEvent::Snapshot(snapshot));
+                    }
+                }
+                Ok(())
+            };
+            if let Err(error) = run() {
+                publish(SubscriptionEvent::Failed(error));
+            }
+            running.close();
+        });
+        Self { latest, cancel }
+    }
+
+    pub fn try_event(&self) -> Option<SubscriptionEvent> {
+        self.latest
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .take()
+    }
+}
+
+impl Drop for SessionSubscription {
+    fn drop(&mut self) {
+        self.cancel.close();
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::os::unix::net::UnixListener;
+
+    fn subscription_socket(tag: &str) -> (PathBuf, UnixListener) {
+        let root = PathBuf::from("/tmp").join(format!(
+            "hw-watch-{tag}-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&root).unwrap();
+        let listener = UnixListener::bind(root.join("term.sock")).unwrap();
+        (root, listener)
+    }
+
+    fn watch_event(subscription: &SessionSubscription) -> SubscriptionEvent {
+        let deadline = Instant::now() + IO_BUDGET;
+        loop {
+            if let Some(event) = subscription.try_event() {
+                return event;
+            }
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(2));
+        }
+    }
+
+    #[test]
+    fn subscription_receives_large_full_lists_without_hello_and_drop_cancels_read() {
+        use homeway_core::term::session_watch;
+        let (root, listener) = subscription_socket("large");
+        let (closed_tx, closed) = mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut io = FrameIo::new(socket);
+            io.write_frame(Op::GREETING, &frames::enc_greeting(), IO_BUDGET)
+                .unwrap();
+            let first = io.read_frame_deadline(IO_BUDGET).unwrap();
+            assert_eq!(first.op, Op::SUBSCRIBE);
+            assert!(first.payload.is_empty());
+            let title = "x".repeat(80_000);
+            let json = serde_json::to_vec(&serde_json::json!({"metadataRevision":7,"sessions":[{"name":"background","title":title,"pid":123}]})).unwrap();
+            assert!(json.len() > frames::MAX_PAYLOAD);
+            for part in session_watch::encode(7, &json).unwrap() {
+                io.write_frame(Op::SESSION_LIST, &part, IO_BUDGET).unwrap();
+            }
+            closed_tx
+                .send(io.read_frame_deadline(IO_BUDGET).is_err())
+                .unwrap();
+        });
+        let subscription = SessionSubscription::start(root.clone(), Target::Local);
+        let SubscriptionEvent::Snapshot(snapshot) = watch_event(&subscription) else {
+            panic!("expected snapshot")
+        };
+        assert_eq!(snapshot.revision, Some(7));
+        assert_eq!(snapshot.sessions[0].title.len(), 80_000);
+        let started = Instant::now();
+        drop(subscription);
+        assert!(closed.recv_timeout(Duration::from_secs(1)).unwrap());
+        assert!(started.elapsed() < Duration::from_secs(1));
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn subscription_old_feature_falls_back_without_sending_a_command() {
+        let (root, listener) = subscription_socket("legacy");
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut io = FrameIo::new(socket);
+            io.write_frame(Op::GREETING, &[1, 255, 0, 0, 0], IO_BUDGET)
+                .unwrap();
+            assert!(io.read_frame_deadline(IO_BUDGET).is_err());
+        });
+        let subscription = SessionSubscription::start(root.clone(), Target::Local);
+        assert!(matches!(
+            watch_event(&subscription),
+            SubscriptionEvent::Unsupported
+        ));
+        drop(subscription);
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn partial_metadata_fragments_do_not_renew_the_complete_message_deadline() {
+        use homeway_core::term::session_watch;
+        let (root, listener) = subscription_socket("partial");
+        let server = std::thread::spawn(move || {
+            let (socket, _) = listener.accept().unwrap();
+            let mut io = FrameIo::new(socket);
+            io.write_frame(Op::GREETING, &frames::enc_greeting(), IO_BUDGET)
+                .unwrap();
+            assert_eq!(io.read_frame_deadline(IO_BUDGET).unwrap().op, Op::SUBSCRIBE);
+            let mut part = session_watch::encode(1, b"x").unwrap().remove(0);
+            part[8] = 1;
+            for _ in 0..20 {
+                if io.write_frame(Op::SESSION_LIST, &part, IO_BUDGET).is_err() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+        });
+        let started = Instant::now();
+        let subscription = SessionSubscription::start_with_timeout(
+            root.clone(),
+            Target::Local,
+            Duration::from_millis(100),
+        );
+        assert!(matches!(
+            watch_event(&subscription),
+            SubscriptionEvent::Failed(_)
+        ));
+        assert!(started.elapsed() < Duration::from_secs(1));
+        drop(subscription);
+        server.join().unwrap();
+        std::fs::remove_dir_all(root).unwrap();
+    }
 
     #[test]
     fn resize_queue_full_retries_the_same_geometry() {

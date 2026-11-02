@@ -57,6 +57,10 @@ impl Op {
     pub const FETCH_SNAPSHOT: Op = Op(0x15);
     pub const EXPLAIN: Op = Op(0x16);
     pub const CREATE: Op = Op(0x17);
+    /// C→S empty first frame: watch all session metadata, without attaching a PTY.
+    pub const SUBSCRIBE: Op = Op(0x18);
+    /// S→C bounded metadata snapshot fragments; see session_watch.
+    pub const SESSION_LIST: Op = Op(0x19);
 }
 
 /// GREETING 的 features 位（客户端不认识的位忽略）。
@@ -72,9 +76,10 @@ pub mod features {
     pub const PROTO_VER: u32 = 1 << 6;
     /// 支持不抢占活动腿与几何的 surface 观察接入（HELLO OBSERVER）。
     pub const OBSERVER: u32 = 1 << 7;
-    /// 本出口的全开位集（= 0xFF）；旧客户端忽略不认识的位。
+    pub const SESSION_SUBSCRIPTION: u32 = 1 << 8;
+    /// 本出口的全开位集（= 0x1FF）；旧客户端忽略不认识的位。
     pub const ALL: u32 =
-        LIST | REPLAY | MODES | AGENT | TITLE | SURFACE | PROTO_VER | OBSERVER;
+        LIST | REPLAY | MODES | AGENT | TITLE | SURFACE | PROTO_VER | OBSERVER | SESSION_SUBSCRIPTION;
 }
 
 /// HELLO flags（term-host-cli 协议增量 D8）。

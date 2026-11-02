@@ -34,6 +34,7 @@ pub mod frames;
 pub mod legout;
 pub mod manifest;
 pub mod session;
+pub mod session_watch;
 pub mod keyenc;
 pub mod pty;
 pub mod responder;

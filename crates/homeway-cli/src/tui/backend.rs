@@ -33,6 +33,10 @@ pub(super) enum Error {
     Frame(#[from] homeway_core::term::frames::FrameError),
     #[error("服务数据无效：{0}")]
     Json(#[from] serde_json::Error),
+    #[error("会话订阅无效：{0}")]
+    Subscription(#[from] homeway_core::term::session_watch::Error),
+    #[error("会话元数据版本不匹配（帧 {frame}，JSON {json:?}）")]
+    MetadataRevision { frame: u64, json: Option<u64> },
     #[error("请求队列已满，请稍后重试")]
     Busy,
     #[error("后台连接已关闭")]
@@ -133,6 +137,40 @@ pub(super) struct Session {
     pub self_session: bool,
 }
 
+#[derive(Debug, Deserialize)]
+pub(super) struct SessionSnapshot {
+    pub sessions: Vec<Session>,
+    #[serde(rename = "metadataRevision")]
+    pub revision: Option<u64>,
+}
+
+impl SessionSnapshot {
+    pub fn normalize(
+        &mut self,
+        target: &Target,
+        confirmed: &mut std::collections::BTreeMap<String, i32>,
+    ) {
+        if *target == Target::Local {
+            if self.sessions.is_empty() {
+                confirmed.clear();
+            } else {
+                mark_self_sessions(
+                    target,
+                    &mut self.sessions,
+                    std::process::id() as i32,
+                    &homeway_core::term::agent::read_procs(),
+                    confirmed,
+                );
+            }
+        }
+        self.sessions.sort_by(|left, right| {
+            left.created_ms
+                .cmp(&right.created_ms)
+                .then_with(|| left.name.cmp(&right.name))
+        });
+    }
+}
+
 fn mark_self_sessions(
     target: &Target,
     sessions: &mut [Session],
@@ -208,6 +246,11 @@ pub(super) enum Confirmation {
 
 pub(super) enum Event {
     Snapshot(Snapshot),
+    VersionedSessions {
+        target: Target,
+        epoch: u64,
+        result: Result<SessionSnapshot, Error>,
+    },
     Sessions {
         target: Target,
         epoch: u64,
@@ -343,10 +386,10 @@ impl Backend {
                 if !query_alive.load(Ordering::Acquire) {
                     break;
                 }
-                let result = worker.sessions(&target);
+                let result = worker.sessions_snapshot(&target);
                 if !deliver(
                     &query_events,
-                    Event::Sessions {
+                    Event::VersionedSessions {
                         target,
                         epoch,
                         result,
@@ -651,32 +694,18 @@ impl Worker {
         })
     }
 
+    #[cfg(test)]
     fn sessions(&mut self, target: &Target) -> Result<Vec<Session>, Error> {
-        #[derive(Deserialize)]
-        struct Sessions {
-            sessions: Vec<Session>,
-        }
+        Ok(self.sessions_snapshot(target)?.sessions)
+    }
+
+    fn sessions_snapshot(&mut self, target: &Target) -> Result<SessionSnapshot, Error> {
         let mut connection =
             TermConnection::connect_with_budget(&self.state_dir, target, REQUEST_BUDGET)?;
         let frame = connection.round_trip(homeway_core::term::frames::Op::LIST, &[])?;
-        let mut sessions: Sessions = serde_json::from_slice(&frame.payload)?;
-        if *target == Target::Local && !sessions.sessions.is_empty() {
-            mark_self_sessions(
-                target,
-                &mut sessions.sessions,
-                std::process::id() as i32,
-                &homeway_core::term::agent::read_procs(),
-                &mut self.self_sessions,
-            );
-        } else if *target == Target::Local {
-            self.self_sessions.clear();
-        }
-        sessions.sessions.sort_by(|left, right| {
-            left.created_ms
-                .cmp(&right.created_ms)
-                .then_with(|| left.name.cmp(&right.name))
-        });
-        Ok(sessions.sessions)
+        let mut snapshot: SessionSnapshot = serde_json::from_slice(&frame.payload)?;
+        snapshot.normalize(target, &mut self.self_sessions);
+        Ok(snapshot)
     }
 
     fn execute(&mut self, command: Command) -> Result<Vec<Event>, Error> {
@@ -690,8 +719,8 @@ impl Worker {
         match command {
             Command::Refresh => Err(Error::Closed), // send已分流到独立刷新lane。
             Command::Sessions { target, epoch } => {
-                let result = self.sessions(&target);
-                Ok(vec![Event::Sessions {
+                let result = self.sessions_snapshot(&target);
+                Ok(vec![Event::VersionedSessions {
                     target,
                     epoch,
                     result,
@@ -1494,7 +1523,7 @@ mod tests {
         let deadline = std::time::Instant::now() + REQUEST_BUDGET;
         let mut epochs = Vec::new();
         while epochs.len() < 2 {
-            if let Some(Event::Sessions { epoch, result, .. }) = backend.try_event() {
+            if let Some(Event::VersionedSessions { epoch, result, .. }) = backend.try_event() {
                 assert!(result.is_ok());
                 epochs.push(epoch);
             }

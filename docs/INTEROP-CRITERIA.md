@@ -598,6 +598,42 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 
 ## 判据变更记录（政策 + 登记表）
 
+### 2026-11-03：会话元数据订阅与 LIST revision
+
+- 从「TUI 会话元数据每 500ms 独立 LIST」增为「具备 SESSION_SUBSCRIPTION 的服务端使用
+  每当前目标主机一条专用订阅，初始全量及元数据变化推送，旧端仍回退原 500ms LIST」。
+  原因是未选中会话的 title/state/cwd/agentLabel/create/exit 也须及时更新；订阅不 HELLO、
+  不注册任何 PTY 腿、不拉屏幕，不改变 active/几何，也不充当当前 surface 腿的探活应答。
+- GREETING features 只增 SESSION_SUBSCRIPTION=1<<8（ALL 0xff→0x1ff）；只增
+  SUBSCRIBE=0x18（C→S 空首帧）和 SESSION_LIST=0x19（S→C 完整快照分片）。每片载荷为
+  `[revision:u64LE][flags:u8][JSON chunk]`，仅 bit0=MORE；JSON chunk≤32KiB，整组原始
+  JSON≤1MiB，不 gzip、不依赖帧超限截断。未知 flags、零/回退 revision、组中换 revision、
+  超过 32 片/1MiB、非法帧拒绝并重连；同 revision 的完整组可作心跳。重连重新取得全量，
+  revision 仅在服务生命周期内单调，客户端每次新连接重新建立基线并作旧来源隔离。
+- LIST 顶层从仅 sessions 追加 metadataRevision:u64；与订阅组 header/JSON 的同名值
+  以同一 State 锁捕获。revision 仅跟踪 sidebar 的 name/title/agent/agentLabel/stateV2/
+  cwd/createdMs/pid 及创建/结束，不随 lastActiveMs、普通 PTY 输出、clients、几何改变；
+  完整 LIST 原字段/顺序语义保留。订阅 JSON 只含上述精简 sessions 字段及顶层 revision，
+  无 clients/lastActiveMs/附着信息。兼容旧解码器忽略顶层未知键及未知 features；新端只在
+  能力协商通过后使用新 op，旧端缺能力时继续 LIST，不发送未知 op。
+- 服务端参数真源 session_watch.rs：最多 16 个订阅（仍另受既有总连接额度约束）、每组
+  clone/编码分别限 1MiB、无待发送组队列，慢写期间多次变更仅保留最新 revision；服务锁内
+  只捕材质，锁外 JSON/分片/socket 写。沿 service.rs 既有 WRITE_TIMEOUT=10s 作为整组
+  共享绝对写预算，任何片失败收线；未预期上行、EOF/错误立即退出，空闲最多 200ms 检查
+  取消/stop。超大快照 ERROR(marshal) 后断开，不截断为不完整列表；订阅满用既有
+  too_many_clients，非空 SUBSCRIBE 用既有 bad_op，不扩冻结错误词表。
+- 元数据变化由 create/finish、scan 真实 title/OSC7 变化、真实 OS cwd 缓存变化及
+  agent/state/agentLabel 更新触发 Condvar；不新增全表高频比较。agent/cwd 原生产采样
+  SAMPLE_PERIOD=1s 不变。每 5 秒发送同 revision 完整心跳；客户端仅完整合法组延续
+  15 秒下行静默预算，单个分片不续命；该预算不宣称双向探活。健康订阅下保留 30 秒独立
+  LIST 校验，并按服务端 revision 合并两来源，防晚到旧组或旧 LIST 回滚较新元数据。
+  单帧旧 LIST 无法承载的大列表不会覆盖健康分片订阅或操作提示。订阅拒绝/失败后进入
+  独立的 500ms LIST 降级域，订阅重试等待该域在途查询完成；新连接首全量再失效此前
+  LIST 请求并重建 revision 基线，避免跨服务生命周期混用。
+- 同步新定值 fixtures/term/session-subscription.json、GREETING golden、MANIFEST、
+  SHA256SUMS 与派生 fuzz 种子摘要；不是部署授权。实现/评审/实际验证记录见
+  docs/reviews/2026-11-03-tui-session-subscription.md。
+
 ### 2026-10-28：PTY 强杀与收尸期限
 
 - 从「宽限内轮询后调用组 SIGKILL、以 portable-pty 的 cloned killer 作单进程回退，再无期限 wait」改为「控制面锁内确认 `Child::try_wait() == Ok(None)` 后发组 SIGKILL 与真实单进程 SIGKILL；原宽限后最多再轮询 2 秒，返回真实退出状态或类型化收尸错误」。cloned killer 在 Unix 仅发 SIGHUP，不再把它当作 SIGKILL 回退。IO/ECHILD 不视作仍活进程，非正 PID 拒绝发信号；已收尸 PID 不再补发信号。

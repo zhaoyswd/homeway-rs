@@ -187,6 +187,16 @@ if os.path.exists(frames_jsonl):
             write("fuzz_term_frames", f"vec{i}-payload", payload)
             n += 2
 
+# Current session subscription fragments and their complete frame envelopes.
+watch = json.load(open(os.path.join(root, "fixtures/term/session-subscription.json")))
+for i, case in enumerate(watch["cases"]):
+    payload = unhex(case["payloadHex"])
+    write("fuzz_term_frames", f"watch{i}", bytes([watch["sessionListOp"]]) + len(payload).to_bytes(2, "little") + payload)
+    write("fuzz_term_frames", f"watch{i}-payload", payload)
+    n += 2
+write("fuzz_term_frames", "watch-subscribe", bytes([watch["subscribeOp"], 0, 0]))
+n += 1
+
 # 真会话字节流（vt 目标 + 帧目标共用底座）
 for i, name in enumerate(["session-cjk.bin", "session-git-log.bin", "session-hexdump.bin"]):
     p2 = os.path.join(root, "fixtures/term-vt", name)

@@ -50,7 +50,7 @@ daemon 控制面帧向量 + `decode_check.py`（**语言无关**的解码对拍�
 
 | 本仓路径 | 来源（baseline 克隆内） | 用途（R6） | sha256 |
 |---|---|---|---|
-| `term/frames.v1.jsonl` | 历史帧案例；2026-10-21 HELLO 完整尾；2026-10-27 GREETING/HELLO 新增 observer 能力 | term 协议帧解析 golden（14 案：greeting/hello/…；不再接受无版本/无ID HELLO） | `0da6ab734cbb920faab8ec0eaeaf84aa958392b7053ff67555fd53c509f4f038` |
+| `term/frames.v1.jsonl` | 历史帧案例；2026-10-21 HELLO 完整尾；2026-10-27 observer；2026-11-03 GREETING 增订阅能力 0x1ff | term 协议帧解析 golden（14 案：greeting/hello/…；不再接受无版本/无ID HELLO） | `a4ebf09da5659693cdf7263adb5c6f3cb67ee8cd1c1243a3b0d29dcea70e0dc3` |
 | `term-vt/session-cjk.bin` | `pkg/term/vt/testdata/session-cjk.bin` | vt 会话回放（CJK） | `5a60ceb2cfaafc566efd595f2835aa772159503364c692e3e179bb9a7e3d6ff8` |
 | `term-vt/session-git-log.bin` | `pkg/term/vt/testdata/session-git-log.bin` | vt 会话回放（git log） | `688c69bafbbfb4eba14f46da4ef8c22fbc93f77318e95b4ce5449723c32a59b3` |
 | `term-vt/session-hexdump.bin` | `pkg/term/vt/testdata/session-hexdump.bin` | vt 会话回放（hexdump） | `c60ffb2e49a6cd09ca565e0de14817ad963801975fb9ca603c51b640fb12d07e` |
@@ -111,3 +111,15 @@ libghostty-vt 自身的快照格式测试数据，Rust 侧走 alacritty_terminal
 旧 wire 边转换。标准 ANSI/DEC/kitty 的 VT 行为测试、键鼠编码、真实 ANSI 回放继续保留，
 它们是终端标准语义，不是旧 App/出口兼容。跨端独立 v5 向量仍由 Rust 与 tier 共同消费。
 当前cell2严格要求 `skip iff width==0`，非skip仅1或2；组合字符在VT内并入基格，不另造零宽格。
+
+## 会话元数据订阅（2026-11-03）
+
+`term/session-subscription.json` 为当前 Rust 增量 wire 定值夹具：GREETING 新增
+SESSION_SUBSCRIPTION=1<<8，SUBSCRIBE=0x18（空首帧），SESSION_LIST=0x19。每个
+SESSION_LIST 载荷 `[revision:u64LE][flags:u8][JSON chunk]`，仅 flags bit0=MORE；
+每片 JSON≤32KiB，整组原始 JSON≤1MiB，不 gzip。完整组的 JSON 顶层含 sessions
+及 metadataRevision，涵盖 sidebar 字段，不包含 PTY 屏幕或 lastActiveMs。固定两例
+（初始空列表、Unicode 标题会话）；测试直接消费字节，完整 1MiB/多片/非法片另由
+codec 单元回归覆盖。旧 LIST 顶层只增 metadataRevision；旧客户端忽略未知键与新
+feature，新客户端遇旧服务端缺 feature 回退既有 LIST。该向量非冻结 Go 基线生成物，
+同批更新 SHA256SUMS、gen-fuzz-seeds 展开与摘要，详见 INTEROP-CRITERIA 同日登记。

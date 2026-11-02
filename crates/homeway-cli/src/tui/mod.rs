@@ -37,6 +37,9 @@ const NOTIFICATION_FALLBACK_LIMIT: usize = 16;
 const HOST_REFRESH_INTERVAL: Duration = Duration::from_secs(2);
 const SESSION_REFRESH_INTERVAL: Duration = Duration::from_millis(500);
 const SESSION_REFRESH_RETRY: Duration = Duration::from_secs(2);
+// Subscription reconnect and low-frequency legacy LIST reconciliation policy.
+const SESSION_RECONCILE_INTERVAL: Duration = Duration::from_secs(30);
+const SUBSCRIPTION_RETRY: Duration = Duration::from_secs(1);
 
 #[derive(Debug, thiserror::Error)]
 enum Error {
@@ -108,6 +111,7 @@ fn run(options: Options) -> Result<(), Error> {
     let mut pending_events = VecDeque::new();
     let mut geometry = view::Geometry::default();
     while !terminal::stopping() {
+        app.poll_subscription(Instant::now());
         app.process_backend();
         app.process_attach();
         app.poll_connection(Instant::now());
@@ -252,6 +256,11 @@ struct App {
     navigation_epoch: u64,
     next_refresh: Instant,
     next_sessions_refresh: Instant,
+    subscription: Option<transport::SessionSubscription>,
+    subscription_target: Option<Target>,
+    subscription_supported: bool,
+    subscription_revision: Option<u64>,
+    next_subscription: Instant,
 }
 
 #[derive(Default)]
@@ -456,6 +465,11 @@ impl App {
             navigation_epoch: 0,
             next_refresh: Instant::now(),
             next_sessions_refresh: Instant::now(),
+            subscription: None,
+            subscription_target: None,
+            subscription_supported: false,
+            subscription_revision: None,
+            next_subscription: Instant::now(),
         }
     }
 
@@ -850,7 +864,15 @@ impl App {
                 self.refresh_pending = self.command(Command::Refresh);
             }
         }
-        if now >= self.next_sessions_refresh && !self.sessions_pending {
+        if now >= self.next_sessions_refresh
+            && !self.sessions_pending
+            && !(self.subscription.is_none()
+                && self.subscription_target.is_some()
+                && now >= self.next_subscription)
+            && (!self.subscription_supported
+                || self.subscription_revision.is_some()
+                || self.subscription.is_none())
+        {
             self.refresh_sessions_at(now);
         }
     }
@@ -867,8 +889,129 @@ impl App {
                 target: self.target(),
                 epoch: self.sessions_epoch,
             });
-            self.next_sessions_refresh = now + SESSION_REFRESH_INTERVAL;
+            self.next_sessions_refresh = now
+                + if self.subscription_revision.is_some() && self.subscription.is_some() {
+                    SESSION_RECONCILE_INTERVAL
+                } else {
+                    SESSION_REFRESH_INTERVAL
+                };
         }
+    }
+
+    fn poll_subscription(&mut self, now: Instant) {
+        let target = self.target();
+        if self.subscription_target.as_ref() != Some(&target) {
+            self.subscription = None;
+            self.subscription_target = Some(target.clone());
+            self.subscription_supported = false;
+            self.subscription_revision = None;
+            self.next_subscription = now;
+        }
+        if self.subscription.is_none() && now >= self.next_subscription && !self.sessions_pending {
+            // A new service may restart its metadata revision at 1. Invalidate
+            // queries from the prior connection before accepting a fresh baseline.
+            self.sessions_epoch = self.sessions_epoch.wrapping_add(1);
+            self.sessions_pending = false;
+            self.subscription_revision = None;
+            self.subscription = Some(transport::SessionSubscription::start(
+                self.state_dir.clone(),
+                target,
+            ));
+        }
+        let event = self
+            .subscription
+            .as_ref()
+            .and_then(transport::SessionSubscription::try_event);
+        match event {
+            Some(transport::SubscriptionEvent::Snapshot(snapshot)) => {
+                self.subscription_supported = true;
+                self.accept_versioned_sessions(snapshot, true);
+            }
+            Some(transport::SubscriptionEvent::Unsupported) => {
+                self.subscription = None;
+                self.subscription_supported = false;
+                self.subscription_revision = None;
+                self.live_metadata = LiveMetadata::default();
+                self.next_subscription = now + SESSION_RECONCILE_INTERVAL;
+                self.next_sessions_refresh = now;
+            }
+            Some(transport::SubscriptionEvent::Failed(_error)) => {
+                self.subscription = None;
+                self.next_subscription = now + SUBSCRIPTION_RETRY;
+                // A failed/rejected watch falls back to a fresh LIST-only domain;
+                // the next subscription attempt invalidates it again. Never mix
+                // replies from before a failed service or a replacement baseline.
+                self.sessions_epoch = self.sessions_epoch.wrapping_add(1);
+                self.sessions_pending = false;
+                self.subscription_revision = None;
+                self.next_sessions_refresh = now;
+            }
+            None => {}
+        }
+    }
+
+    fn accept_versioned_sessions(
+        &mut self,
+        snapshot: backend::SessionSnapshot,
+        subscription: bool,
+    ) {
+        if let Some(revision) = snapshot.revision {
+            // A LIST during a reconnect cannot establish the new revision domain.
+            // Only this subscription connection's initial full snapshot can do so.
+            if !subscription && self.subscription_revision.is_none() && self.subscription.is_some()
+            {
+                return;
+            }
+            let baseline = subscription && self.subscription_revision.is_none();
+            if baseline {
+                // Also invalidate LISTs issued while this connection was waiting
+                // for its first full snapshot (possibly against the old service).
+                self.sessions_epoch = self.sessions_epoch.wrapping_add(1);
+                self.sessions_pending = false;
+            }
+            if self.subscription_revision == Some(revision) {
+                // Local ancestry evidence is derived on this machine, outside
+                // the server's revision domain. Preserve newly confirmed carrier
+                // protection without replaying metadata or notifications.
+                for session in snapshot
+                    .sessions
+                    .iter()
+                    .filter(|session| session.self_session)
+                {
+                    if self.session_pids.get(&session.name) == Some(&session.pid) {
+                        if let Some(item) = self
+                            .model
+                            .sessions
+                            .iter_mut()
+                            .find(|item| item.name == session.name && !item.self_session)
+                        {
+                            item.self_session = true;
+                            self.render_dirty = true;
+                        }
+                    }
+                }
+                return;
+            }
+            if self
+                .subscription_revision
+                .is_some_and(|known| revision < known)
+            {
+                return;
+            }
+            self.subscription_revision = Some(revision);
+            self.subscription_supported = true;
+            self.live_metadata = LiveMetadata::default();
+            if baseline {
+                self.next_sessions_refresh = Instant::now() + SESSION_RECONCILE_INTERVAL;
+            }
+        } else if self.subscription_supported {
+            return;
+        }
+        self.backend_event(backend::Event::Sessions {
+            target: self.target(),
+            epoch: self.sessions_epoch,
+            result: Ok(snapshot.sessions),
+        });
     }
 
     fn detach(&mut self) {
@@ -1000,6 +1143,34 @@ impl App {
     }
 
     fn backend_event(&mut self, event: backend::Event) {
+        if let backend::Event::VersionedSessions {
+            target,
+            epoch,
+            result,
+        } = event
+        {
+            if target != self.target() || epoch != self.sessions_epoch {
+                return;
+            }
+            self.sessions_pending = false;
+            match result {
+                Ok(snapshot) => self.accept_versioned_sessions(snapshot, false),
+                Err(error) => {
+                    // Legacy LIST is a single frame and can truncate lists that
+                    // the bounded subscription correctly delivers in fragments.
+                    // A healthy watch owns the view; failed reconciliation must
+                    // not replace its data or an unrelated operation notice.
+                    if self.subscription.is_none() || self.subscription_revision.is_none() {
+                        self.backend_event(backend::Event::Sessions {
+                            target,
+                            epoch,
+                            result: Err(error),
+                        });
+                    }
+                }
+            }
+            return;
+        }
         // Passive successful polls keep a copy's ownership. Any new result or
         // error invalidates it even when the replacement notice has equal text.
         if !matches!(
@@ -1010,6 +1181,7 @@ impl App {
         }
         self.render_dirty = true;
         match event {
+            backend::Event::VersionedSessions { .. } => {}
             backend::Event::SessionClosed {
                 target,
                 name,
@@ -1707,6 +1879,9 @@ impl App {
     }
 
     fn sync_live_metadata(&mut self) {
+        if self.subscription_supported || self.subscription_revision.is_some() {
+            return;
+        }
         let Some(name) = self.live_session_name() else {
             return;
         };
@@ -1729,7 +1904,10 @@ impl App {
     }
 
     fn merge_live_metadata(&mut self, sessions: &mut [backend::Session]) {
-        if !self.attach_verified {
+        if !self.attach_verified
+            || self.subscription_supported
+            || self.subscription_revision.is_some()
+        {
             return;
         }
         let Some(session) = sessions.iter_mut().find(|session| {
@@ -3115,6 +3293,250 @@ mod tests {
         app.attach_verified = true;
         app.session_pids.insert("history".into(), 321);
         app
+    }
+
+    fn metadata_snapshot(
+        revision: u64,
+        title: &str,
+        state: backend::SessionState,
+    ) -> backend::SessionSnapshot {
+        let mut session = blocking_session("history", state, 321);
+        session.title = title.into();
+        backend::SessionSnapshot {
+            sessions: vec![session],
+            revision: Some(revision),
+        }
+    }
+
+    #[test]
+    fn subscription_and_list_use_server_revision_and_state_stream_cannot_roll_back_sidebar() {
+        let mut app = live_app();
+        app.subscription_supported = true;
+        app.accept_versioned_sessions(
+            metadata_snapshot(10, "watch", backend::SessionState::Idle),
+            true,
+        );
+        app.backend_event(backend::Event::VersionedSessions {
+            target: Target::Local,
+            epoch: app.sessions_epoch,
+            result: Ok(metadata_snapshot(
+                12,
+                "new-list",
+                backend::SessionState::Working,
+            )),
+        });
+        app.accept_versioned_sessions(
+            metadata_snapshot(11, "late-watch", backend::SessionState::Idle),
+            true,
+        );
+        assert_eq!(app.model.sessions[0].title, "new-list");
+        app.session_state(&frames::enc_state(
+            frames::agent::SHELL,
+            frames::state_v2::IDLE,
+            "surface",
+        ));
+        assert_eq!(app.model.terminal_title, "surface");
+        assert_eq!(app.model.sessions[0].title, "new-list");
+        assert_eq!(app.model.sessions[0].state, view::SessionState::Working);
+        app.accept_versioned_sessions(
+            metadata_snapshot(12, "duplicate", backend::SessionState::Blocked),
+            true,
+        );
+        assert_eq!(app.model.sessions[0].title, "new-list");
+    }
+
+    #[test]
+    fn subscription_restart_accepts_low_revision_only_from_new_connection_baseline() {
+        let mut app = live_app();
+        app.subscription_supported = true;
+        app.subscription_revision = Some(100);
+        app.subscription_target = Some(Target::Local);
+        let old_epoch = app.sessions_epoch;
+        app.poll_subscription(Instant::now());
+        assert!(app.sessions_epoch > old_epoch);
+        assert!(app.subscription_revision.is_none());
+        for epoch in [old_epoch, app.sessions_epoch] {
+            app.backend_event(backend::Event::VersionedSessions {
+                target: Target::Local,
+                epoch,
+                result: Ok(metadata_snapshot(
+                    99,
+                    "old-service",
+                    backend::SessionState::Blocked,
+                )),
+            });
+        }
+        assert_eq!(app.model.sessions[0].title, "history");
+        app.accept_versioned_sessions(
+            metadata_snapshot(1, "restarted", backend::SessionState::Idle),
+            true,
+        );
+        assert_eq!(app.model.sessions[0].title, "restarted");
+        assert_eq!(app.subscription_revision, Some(1));
+        let baseline_epoch = app.sessions_epoch;
+        app.backend_event(backend::Event::VersionedSessions {
+            target: Target::Local,
+            epoch: baseline_epoch - 1,
+            result: Ok(metadata_snapshot(
+                99,
+                "pre-baseline-list",
+                backend::SessionState::Blocked,
+            )),
+        });
+        assert_eq!(app.model.sessions[0].title, "restarted");
+        assert_eq!(app.subscription_revision, Some(1));
+        app.backend_event(backend::Event::VersionedSessions {
+            target: Target::Remote("old-target".into()),
+            epoch: app.sessions_epoch,
+            result: Ok(metadata_snapshot(
+                200,
+                "wrong-target",
+                backend::SessionState::Blocked,
+            )),
+        });
+        assert_eq!(app.model.sessions[0].title, "restarted");
+    }
+
+    #[test]
+    fn healthy_subscription_uses_low_frequency_list_and_duplicate_heartbeats_do_not_renotify() {
+        let mut app = live_app();
+        app.subscription = Some(transport::SessionSubscription::start(
+            app.state_dir.clone(),
+            Target::Local,
+        ));
+        let (notifications, recorded) = notifications::Notifications::recording();
+        app.notifications = notifications;
+        app.subscription_supported = true;
+        app.accept_versioned_sessions(
+            metadata_snapshot(1, "idle", backend::SessionState::Idle),
+            true,
+        );
+        app.accept_versioned_sessions(
+            metadata_snapshot(2, "blocked", backend::SessionState::Blocked),
+            true,
+        );
+        app.accept_versioned_sessions(
+            metadata_snapshot(2, "blocked", backend::SessionState::Blocked),
+            true,
+        );
+        assert_eq!(recorded.try_iter().count(), 1);
+        let now = Instant::now();
+        app.refresh_sessions_at(now);
+        assert_eq!(app.next_sessions_refresh, now + SESSION_RECONCILE_INTERVAL);
+        let epoch = app.sessions_epoch;
+        app.sessions_pending = false;
+        app.poll_refresh_at(now + SESSION_REFRESH_INTERVAL);
+        assert_eq!(app.sessions_epoch, epoch);
+        let reconcile_due = app.next_sessions_refresh;
+        for revision in 3..35 {
+            app.accept_versioned_sessions(
+                metadata_snapshot(revision, "busy", backend::SessionState::Working),
+                true,
+            );
+        }
+        assert_eq!(
+            app.next_sessions_refresh, reconcile_due,
+            "continuous events cannot postpone LIST reconciliation"
+        );
+        app.poll_refresh_at(reconcile_due);
+        assert_eq!(app.sessions_epoch, epoch + 1);
+    }
+
+    #[test]
+    fn unavailable_subscription_can_establish_a_fresh_list_only_domain() {
+        let mut app = live_app();
+        app.subscription_supported = true;
+        app.subscription_revision = None;
+        app.subscription = None;
+        app.backend_event(backend::Event::VersionedSessions {
+            target: Target::Local,
+            epoch: app.sessions_epoch,
+            result: Ok(metadata_snapshot(
+                1,
+                "fallback",
+                backend::SessionState::Idle,
+            )),
+        });
+        assert_eq!(app.model.sessions[0].title, "fallback");
+        let now = Instant::now();
+        app.refresh_sessions_at(now);
+        assert_eq!(app.next_sessions_refresh, now + SESSION_REFRESH_INTERVAL);
+    }
+
+    #[test]
+    fn subscription_retry_waits_for_inflight_fallback_list_without_losing_its_result() {
+        let mut app = live_app();
+        let now = Instant::now();
+        app.subscription_supported = true;
+        app.subscription_target = Some(Target::Local);
+        app.next_subscription = now;
+        app.sessions_pending = true;
+        let epoch = app.sessions_epoch;
+        app.poll_subscription(now);
+        assert_eq!(app.sessions_epoch, epoch);
+        assert!(app.subscription.is_none());
+        app.backend_event(backend::Event::VersionedSessions {
+            target: Target::Local,
+            epoch,
+            result: Ok(metadata_snapshot(
+                1,
+                "slow-list",
+                backend::SessionState::Idle,
+            )),
+        });
+        assert_eq!(app.model.sessions[0].title, "slow-list");
+        app.next_sessions_refresh = now;
+        app.poll_refresh_at(now);
+        assert!(
+            !app.sessions_pending,
+            "a due subscription retry gets a turn before another LIST"
+        );
+        app.poll_subscription(now);
+        assert!(app.subscription.is_some());
+        assert!(app.sessions_epoch > epoch);
+    }
+
+    #[test]
+    fn failed_legacy_reconciliation_cannot_hide_a_healthy_fragmented_subscription() {
+        let mut app = live_app();
+        app.subscription = Some(transport::SessionSubscription::start(
+            app.state_dir.clone(),
+            Target::Local,
+        ));
+        app.subscription_supported = true;
+        app.accept_versioned_sessions(
+            metadata_snapshot(1, "healthy", backend::SessionState::Idle),
+            true,
+        );
+        let notice = app.model.notice.clone();
+        app.backend_event(backend::Event::VersionedSessions {
+            target: Target::Local,
+            epoch: app.sessions_epoch,
+            result: Err(backend::Error::Timeout),
+        });
+        app.accept_versioned_sessions(
+            metadata_snapshot(1, "healthy", backend::SessionState::Idle),
+            true,
+        );
+        assert_eq!(app.model.notice, notice);
+        assert_eq!(app.model.sessions[0].title, "healthy");
+        assert!(app.operation_warning.is_none());
+    }
+
+    #[test]
+    fn same_revision_heartbeat_can_confirm_local_carrier_protection_without_metadata_replay() {
+        let mut app = live_app();
+        app.subscription_supported = true;
+        app.accept_versioned_sessions(
+            metadata_snapshot(1, "known", backend::SessionState::Idle),
+            true,
+        );
+        let mut heartbeat = metadata_snapshot(1, "must-not-replay", backend::SessionState::Blocked);
+        heartbeat.sessions[0].self_session = true;
+        app.accept_versioned_sessions(heartbeat, true);
+        assert!(app.model.sessions[0].self_session);
+        assert_eq!(app.model.sessions[0].title, "known");
+        assert_eq!(app.model.sessions[0].state, view::SessionState::Idle);
     }
 
     #[test]

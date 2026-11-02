@@ -1,0 +1,17 @@
+{
+  "subscribeOp": 24,
+  "sessionListOp": 25,
+  "feature": 256,
+  "cases": [
+    {
+      "revision": 1,
+      "json": "{\"sessions\":[],\"metadataRevision\":1}",
+      "payloadHex": "0100000000000000007b2273657373696f6e73223a5b5d2c226d657461646174615265766973696f6e223a317d"
+    },
+    {
+      "revision": 2,
+      "json": "{\"sessions\":[{\"name\":\"a\",\"title\":\"标题\",\"agent\":\"shell\",\"stateV2\":\"idle\",\"createdMs\":1,\"pid\":7}],\"metadataRevision\":2}",
+      "payloadHex": "0200000000000000007b2273657373696f6e73223a5b7b226e616d65223a2261222c227469746c65223a22e6a087e9a298222c226167656e74223a227368656c6c222c2273746174655632223a2269646c65222c22637265617465644d73223a312c22706964223a377d5d2c226d657461646174615265766973696f6e223a327d"
+    }
+  ]
+}

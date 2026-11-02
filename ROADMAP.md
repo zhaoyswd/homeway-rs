@@ -72,6 +72,23 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-11-03 TUI 全会话元数据订阅（完成，本地源码）**：当前主机单独一条元数据
+> 订阅，初始全量后由创建/退出、标题、state/agentLabel、有效cwd变化唤醒推送；无后台
+> PTY attach、屏幕消费或高频LIST。只增协商feature与SUBSCRIBE/SESSION_LIST帧，分片
+> 总量1MiB；metadataRevision统一watch/LIST因果，重连全量及epoch失效保护低rev重启。
+> 有界最新快照、16订阅限额、取消与慢读隔离；健康30秒LIST校验、旧端500ms查询回退。
+> 原surface探活与通知去重保持，cwd/state既有1秒生产采样不变。协议判据变更、夹具全量
+> SUMS及fuzz种子同批登记。独立技术/最终代码两门通过，core term **229/0**、TUI
+> **144/0、1 ignored**；最终完整quick实际exit0（00:51:17）：workspace **1491/0、
+> 41 ignored**、clippy/OHOScheck/真link2943792B/符号版本/隔离/向量/种子/词表/残留
+> 全过，私有RRR316秒、100MB哈希一致、E10/FB-files通过，既有E11 WARN/DNS SKIP保留，
+> 未跑--full。另test-only 600KiB慢读补证 **1/0**，快端不阻塞且慢端跳至最新版本。
+> 最终产品同件私有烟囱 **5 PASS**：背景标题0.071–0.178秒、健康LIST计数1→1且只有
+> 当前会话HELLO；订阅断线补齐title/create/exit、模拟旧feature与旧LIST形状回退、TTY/
+> PTY保留及自有资源回收通过。首轮clippy测试写法及烟囱误用动词失败均保留。未推送、
+> 发版或部署；客户端与出口需后续发布换装启用订阅。证据见
+> `docs/reviews/2026-11-03-tui-session-subscription.md`。
+
 > **2026-11-03 TUI 会话列表实时刷新（完成，本地源码）**：当前会话标题/状态随已验证
 > surface 事件同拍同步左侧，快照同步标题；其他会话 LIST 独立500ms调度、单在途，失败
 > 自动轮询回退2秒，主机探测仍2秒。逐字段revision防旧LIST覆盖较新事件，target/epoch/

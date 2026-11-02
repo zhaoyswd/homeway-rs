@@ -26,6 +26,7 @@
 
 use std::collections::HashMap;
 use std::io::Read;
+use std::os::fd::AsRawFd;
 use std::os::unix::net::UnixListener;
 
 use homeway_quic::ServiceIntake;
@@ -67,6 +68,7 @@ use super::session::LegKind;
 use super::session::LegView;
 use super::session::SessionRegistry;
 use super::session::TermError;
+use super::session_watch;
 use super::size::Size;
 use super::vt::ClipEvt;
 use super::vt::SessionVt;
@@ -797,6 +799,8 @@ struct State {
     /// 会话代数发号器：同名会话重建后旧线程（pump/写者/投递）按（名字, 代）回查，
     /// 代不符即视为 Gone——等价 Go `remove(name, who)` 的身份比对（评审 N1）。
     next_sess_gen: u64,
+    /// Only sidebar metadata changes advance this service-local revision.
+    metadata_revision: u64,
 }
 
 /// 按身份（名字 + 代数）取会话运行态；代不符 = 已被同名重建顶掉（None）。
@@ -826,6 +830,8 @@ pub struct TermService {
     active_conns: Arc<AtomicUsize>,
     /// 连接级超限被收线的累计（观测面；行文节流首 3 + 每 100）。
     conn_over_cap: AtomicU64,
+    metadata_changed: Condvar,
+    subscriptions: Arc<AtomicUsize>,
     /// 测试身份（panic 注入表按服务唯一化——并发测试的其它服务 tick 不会误消费；
     /// 生产构建无此字段）。
     #[cfg(test)]
@@ -879,11 +885,14 @@ impl TermService {
                 sessions: HashMap::new(),
                 manifests,
             next_sess_gen: 1,
+                metadata_revision: 1,
             }),
             stop: Arc::new(AtomicBool::new(false)),
             leg_missing_input_drops: AtomicU64::new(0),
             active_conns: Arc::new(AtomicUsize::new(0)),
             conn_over_cap: AtomicU64::new(0),
+            metadata_changed: Condvar::new(),
+            subscriptions: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             svc_id: next_svc_id(),
         });
@@ -1050,6 +1059,7 @@ impl TermService {
     /// 关停服务：全部会话 ENDED(service_stopped) + 收尸（不影响其它服务）。
     pub fn close(&self) {
         self.stop.store(true, Ordering::Relaxed);
+        self.metadata_changed.notify_all();
         let sessions: Vec<(String, u64)> = {
             let st = self.lock_state();
             st.registry.session_names().into_iter().filter_map(|name| {
@@ -1077,6 +1087,7 @@ impl TermService {
             Err(_) => return,
         };
         match first.op {
+            Op::SUBSCRIBE => self.serve_subscription(first, io),
             Op::LIST => {
                 let json = self.list_json();
                 let _ = io.write_frame(Op::LIST, json.as_bytes(), WRITE_TIMEOUT);
@@ -1947,7 +1958,9 @@ impl TermService {
             }
             self.spawn_session_locked(&mut st, name, size)?;
             // 注册表建立（80x24 归一——Go spawnLocked 同款；此后腿接入尺寸归选举）
-            return st.registry.attach_or_create(name, size, true, false).map(|_| ());
+            let result = st.registry.attach_or_create(name, size, true, false).map(|_| ());
+            if result.is_ok() { self.publish_metadata(&mut st); }
+            return result;
         }
         st.registry.attach_or_create(name, size, create, only_if_absent).map(|_| ())
     }
@@ -1965,6 +1978,7 @@ impl TermService {
         let r = st.registry.attach_or_create(name, Size::DEFAULT, true, false).map(|_| ());
         if r.is_ok() {
             self.logf(&format!("term: 创建会话 {name}（不接入，默认尺寸）"));
+            self.publish_metadata(&mut st);
         }
         r
     }
@@ -2343,6 +2357,7 @@ impl TermService {
             for e in &ends {
                 apply_end_to_leg_rt(&self.logf, rt, e);
             }
+            self.publish_metadata(&mut st);
             pty
         };
         // 子进程收尸（有界 + SIGKILL 兜底）——锁外；master 随 PtyShared 释放。
@@ -2514,6 +2529,9 @@ impl TermService {
                     if l.surface.is_none() {
                         l.out.wake_writer();
                     }
+                }
+                if rt.scan.take_metadata_changed() {
+                    self.publish_metadata(st);
                 }
                 txs
             };
@@ -3362,6 +3380,74 @@ impl TermService {
 
     // ---- LIST / EXPLAIN ----
 
+    fn publish_metadata(&self, state: &mut State) {
+        state.metadata_revision = state.metadata_revision.saturating_add(1);
+        self.metadata_changed.notify_all();
+    }
+
+    fn serve_subscription(&self, first: Frame, mut io: FrameIo) {
+        if !first.payload.is_empty() {
+            let _ = io.write_frame(Op::ERROR, &frames::enc_error("bad_op", "SUBSCRIBE 载荷必须为空"), WRITE_TIMEOUT);
+            return;
+        }
+        if self.subscriptions.try_update(Ordering::Relaxed, Ordering::Relaxed, |n| {
+            (n < session_watch::MAX_SUBSCRIPTIONS).then_some(n + 1)
+        }).is_err() {
+            let _ = io.write_frame(Op::ERROR, &frames::enc_error("too_many_clients", "会话元数据订阅已达上限"), WRITE_TIMEOUT);
+            return;
+        }
+        let _guard = ConnGuard { n: Arc::clone(&self.subscriptions) };
+        let Ok(peer) = io.try_clone_stream() else { return };
+        let mut seen = 0;
+        let mut next_heartbeat = Instant::now();
+        loop {
+            // This is a receive-only subscription. EOF or any unexpected input
+            // cancels it; do not leave an unread, unbounded upstream queue.
+            let mut pfd = libc::pollfd { fd: peer.as_raw_fd(), events: libc::POLLIN, revents: 0 };
+            let ready = unsafe { libc::poll(&mut pfd, 1, 0) };
+            if ready > 0 || (ready < 0 && std::io::Error::last_os_error().kind() != std::io::ErrorKind::Interrupted) {
+                return;
+            }
+            let mut state = self.lock_state();
+            if self.stop.load(Ordering::Relaxed) { return; }
+            if state.metadata_revision == seen && Instant::now() < next_heartbeat {
+                let wait = next_heartbeat.saturating_duration_since(Instant::now()).min(Duration::from_millis(200));
+                let (guard, _) = self.metadata_changed.wait_timeout(state, wait).unwrap_or_else(|e| e.into_inner());
+                state = guard;
+                if self.stop.load(Ordering::Relaxed) { return; }
+                if state.metadata_revision == seen && Instant::now() < next_heartbeat { continue; }
+            }
+            let revision = state.metadata_revision;
+            let snapshot = subscription_entries(&state);
+            drop(state);
+            let result = snapshot.and_then(|sessions| {
+                #[derive(serde::Serialize)]
+                struct Reply {
+                    sessions: Vec<SubscriptionEntry>,
+                    #[serde(rename = "metadataRevision")]
+                    revision: u64,
+                }
+                let json = session_watch::json_bytes(&Reply { sessions, revision })?;
+                session_watch::encode(revision, &json)
+            });
+            let fragments = match result {
+                Ok(fragments) => fragments,
+                Err(error) => {
+                    let _ = io.write_frame(Op::ERROR, &frames::enc_error("marshal", &error.to_string()), WRITE_TIMEOUT);
+                    return;
+                }
+            };
+            // One absolute budget for the complete group, including all pieces.
+            let deadline = Instant::now() + WRITE_TIMEOUT;
+            for payload in fragments {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                if remaining.is_zero() || io.write_frame(Op::SESSION_LIST, &payload, remaining).is_err() { return; }
+            }
+            seen = revision;
+            next_heartbeat = Instant::now() + session_watch::HEARTBEAT;
+        }
+    }
+
     /// LIST-REPLY 的 JSON（Go listJSON；derive 结构体的**声明序** = Go struct 序——
     /// `serde_json::Map` 默认 BTreeMap 会把键排成字典序，对象字面量手插也不行，
     /// 评审 M3）。
@@ -3405,8 +3491,10 @@ impl TermService {
         #[derive(serde::Serialize)]
         struct Reply<'a> {
             sessions: &'a [SessionEntryJson],
+            #[serde(rename = "metadataRevision")]
+            revision: u64,
         }
-        match serde_json::to_string(&Reply { sessions: &out }) {
+        match serde_json::to_string(&Reply { sessions: &out, revision: st.metadata_revision }) {
             Ok(json) => json,
             Err(_) => "{\"sessions\":[]}".to_string(),
         }
@@ -3579,7 +3667,9 @@ impl TermService {
         if st.registry.session(name).is_none_or(|session| session.done) { return; }
         if let Some(rt) = rt_of_mut(&mut st, name, gen)
             .filter(|rt| rt.pty.pid() == pid && !rt.stopped.load(Ordering::Relaxed)) {
+            let changed = rt.observed_cwd.as_ref() != Some(&cwd) && rt.scan.pwd_path().is_empty();
             rt.observed_cwd = Some(cwd);
+            if changed { self.publish_metadata(&mut st); }
         }
     }
 
@@ -3615,7 +3705,9 @@ impl TermService {
         };
         let v = agent::classify_agent(&probe);
         // 每拍从当前前台进程重取，不读last_scan_proc（它在无变化短路后可滞留旧身份）。
-        rt.agent_label = current_agent_label(st.manifests.as_ref(), procs, fg, v.agent);
+        let label = current_agent_label(st.manifests.as_ref(), procs, fg, v.agent);
+        let label_changed = rt.agent_label != label;
+        rt.agent_label = label;
         if v.cpu >= 0 {
             rt.prev_cpu = Some(v.cpu);
         }
@@ -3635,6 +3727,7 @@ impl TermService {
         let visible_blocker = ev.as_ref().is_some_and(|e| e.visible_blocker);
         let freeze = ev.as_ref().is_some_and(|e| e.skip_update);
         if freeze && v.agent == prev_agent {
+            if label_changed { self.publish_metadata(st); }
             return; // 覆盖屏 + 身份未变：整拍不发布（状态冻结，列表停在上一状态）
         }
         let next_state = if freeze { rt.state_v2 } else { v.state_v2 };
@@ -3649,13 +3742,16 @@ impl TermService {
                 Instant::now(),
             )
         {
+            if label_changed { self.publish_metadata(st); }
             return; // 本拍按住不发（暂态空屏被确认窗吸收）
         }
+        let metadata_changed = next_state != rt.state_v2 || v.agent != prev_agent || label_changed;
         let mut publish = next_state != rt.state_v2 || v.agent != prev_agent;
         if !publish && rt.hygiene.should_republish_blocked(rt.state_v2, Instant::now()) {
             publish = true; // blocked 持续期间定期重发，保持消费方新鲜
         }
         if !publish {
+            if label_changed { self.publish_metadata(st); }
             return;
         }
         rt.agent = v.agent;
@@ -3672,6 +3768,7 @@ impl TermService {
             suffix
         ));
         push_state_to_legs(rt);
+        if metadata_changed { self.publish_metadata(st); }
     }
 }
 
@@ -3683,6 +3780,47 @@ fn session_cwd(rt: &SessRt) -> Option<String> {
     let reported = rt.scan.pwd_path();
     if !reported.is_empty() { return Some(reported); }
     rt.observed_cwd.as_ref().map(|path| path.to_string_lossy().into_owned())
+}
+
+#[derive(serde::Serialize)]
+struct SubscriptionEntry {
+    name: String,
+    title: String,
+    agent: &'static str,
+    #[serde(rename = "agentLabel", skip_serializing_if = "Option::is_none")]
+    agent_label: Option<String>,
+    #[serde(rename = "stateV2")]
+    state: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cwd: Option<String>,
+    #[serde(rename = "createdMs")]
+    created_ms: u64,
+    pid: i32,
+}
+
+fn subscription_entries(state: &State) -> Result<Vec<SubscriptionEntry>, session_watch::Error> {
+    let mut out = Vec::new();
+    let mut bytes = 0;
+    for name in state.registry.session_names() {
+        if state.registry.session(name).is_none_or(|session| session.done) { continue; }
+        let Some(rt) = state.sessions.get(name) else { continue };
+        let cwd = session_cwd(rt);
+        // Bound cloned material as well as encoded JSON (escaping can expand it).
+        bytes += 256 + rt.name.len() + rt.scan.title().len() + rt.agent_label.len()
+            + cwd.as_ref().map_or(0, String::len);
+        if bytes > session_watch::MAX_JSON_BYTES { return Err(session_watch::Error::Limit); }
+        out.push(SubscriptionEntry {
+            name: rt.name.clone(),
+            title: rt.scan.title().to_owned(),
+            agent: agent::agent_name(rt.agent),
+            agent_label: (!rt.agent_label.is_empty()).then(|| rt.agent_label.clone()),
+            state: frames::state_v2::name(rt.state_v2),
+            cwd,
+            created_ms: rt.created_ms,
+            pid: rt.pty.pid(),
+        });
+    }
+    Ok(out)
 }
 
 /// STATE 帧投递到所有腿（latest-wins；状态单轨化——surface 与 raw 腿同一枚举）。
@@ -4324,6 +4462,172 @@ mod tests {
     use super::*;
     use crate::term::wire::ReadFail;
 
+    fn subscription_client(service: &Arc<TermService>) -> Client {
+        let (server, client) = UnixStream::pair().unwrap();
+        service.serve_one(server);
+        let mut client = Client::from_stream(client);
+        client.send(Op::SUBSCRIBE, &[]);
+        client
+    }
+
+    fn watch_until(client: &mut Client, predicate: impl Fn(&serde_json::Value) -> bool, seconds: u64) -> (u64, serde_json::Value) {
+        let deadline = Instant::now() + Duration::from_secs(seconds);
+        let mut assembler = session_watch::Assembler::default();
+        loop {
+            let frame = client.io.read_frame_deadline(deadline.saturating_duration_since(Instant::now())).unwrap();
+            assert_eq!(frame.op, Op::SESSION_LIST, "subscription must never emit surface or raw frames");
+            if let Some((revision, json)) = assembler.push(&frame.payload).unwrap() {
+                let value: serde_json::Value = serde_json::from_slice(&json).unwrap();
+                assert_eq!(value["metadataRevision"].as_u64(), Some(revision));
+                if predicate(&value) { return (revision, value); }
+            }
+        }
+    }
+
+    #[test]
+    fn subscription_pushes_unattached_create_title_cwd_state_label_and_exit() {
+        let service = svc_with_manifests(TermConfig { detect: false,
+            shell: Some("read line; printf '\\033]0;watched\\007\\033]7;file://localhost/watch-cwd\\007\\033]21337;status=blocked\\007'; cat".into()),
+            ..Default::default() }, Arc::new(Mutex::new(Vec::new())), true);
+        struct Close(Arc<TermService>);
+        impl Drop for Close { fn drop(&mut self) { self.0.close(); } }
+        let _close = Close(Arc::clone(&service));
+        let mut client = subscription_client(&service);
+        let (initial, _) = watch_until(&mut client, |_| true, 3);
+        assert_eq!(initial, 1);
+        service.create_only("watched-session", false).unwrap();
+        let (created, value) = watch_until(&mut client, |v| v["sessions"].as_array().is_some_and(|s| s.len() == 1), 3);
+        assert!(created > initial);
+        assert!(value["sessions"][0].get("clients").is_none());
+        assert!(value["sessions"][0].get("lastActiveMs").is_none());
+        let (pty, generation, fg) = {
+            let state = service.lock_state();
+            let rt = &state.sessions["watched-session"];
+            assert!(rt.legs.is_empty());
+            (Arc::clone(&rt.pty), rt.gen, rt.pty.foreground_pgid())
+        };
+        assert!(pty.write_input(b"go\n"));
+        let (titled, _) = watch_until(&mut client, |v| v["sessions"][0]["title"] == "watched" && v["sessions"][0]["cwd"] == "/watch-cwd", 3);
+        assert!(titled > created);
+        let pi = [ProcInfo { pid: pty.pid() + 1, ppid: pty.pid(), pgid: fg,
+            cpu: 0, args: "node /usr/bin/pi.js".into() }];
+        service.sample_once("watched-session", generation, &pi);
+        let (sampled, _) = watch_until(&mut client, |v| v["sessions"][0]["agentLabel"] == "pi" && v["sessions"][0]["stateV2"] == "blocked", 3);
+        assert!(sampled > titled);
+        let listed: serde_json::Value = serde_json::from_str(&service.list_json()).unwrap();
+        assert_eq!(listed["metadataRevision"].as_u64(), Some(sampled));
+        assert_eq!(listed["sessions"][0]["clients"].as_array().unwrap().len(), 0);
+        service.kill("watched-session").unwrap();
+        let (ended, _) = watch_until(&mut client, |v| v["sessions"].as_array().is_some_and(Vec::is_empty), 5);
+        assert!(ended > sampled);
+    }
+
+    #[test]
+    fn subscription_heartbeat_and_peer_cancellation_release_capacity() {
+        let service = svc_with(TermConfig { detect: false, ..Default::default() }, Arc::new(Mutex::new(Vec::new())));
+        let mut client = subscription_client(&service);
+        let (first, _) = watch_until(&mut client, |_| true, 3);
+        let (heartbeat, _) = watch_until(&mut client, |_| true, 7);
+        assert_eq!(heartbeat, first, "idle heartbeat is a complete same-revision snapshot");
+        drop(client);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while service.active_conns() != 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert_eq!(service.subscriptions.load(Ordering::Relaxed), 0);
+        service.close();
+    }
+
+    #[test]
+    fn subscription_slow_large_group_keeps_state_and_fast_peer_live_then_coalesces() {
+        let service = svc_with(TermConfig { detect: false, shell: Some("cat".into()),
+            ..Default::default() }, Arc::new(Mutex::new(Vec::new())));
+        struct Close(Arc<TermService>);
+        impl Drop for Close { fn drop(&mut self) { self.0.close(); } }
+        let _close = Close(Arc::clone(&service));
+        service.create_only("large-watch", false).unwrap();
+        let first_revision = {
+            let mut state = service.lock_state();
+            let rt = state.sessions.get_mut("large-watch").unwrap();
+            rt.agent_label = "x".repeat(600 << 10);
+            rt.scan.write(b"\x1b]0;before\x07\x1b]7;file://localhost/fixed\x07");
+            rt.scan.take_metadata_changed();
+            service.publish_metadata(&mut state);
+            state.metadata_revision
+        };
+        let (server, socket) = UnixStream::pair().unwrap();
+        let small: libc::c_int = 4096;
+        assert_eq!(unsafe { libc::setsockopt(server.as_raw_fd(), libc::SOL_SOCKET, libc::SO_SNDBUF,
+            (&small as *const libc::c_int).cast(), std::mem::size_of_val(&small) as libc::socklen_t) }, 0);
+        service.serve_one(server);
+        let mut slow = Client::from_stream(socket);
+        slow.send(Op::SUBSCRIBE, &[]);
+        let first = slow.io.read_frame_deadline(Duration::from_secs(3)).unwrap();
+        assert_eq!(first.op, Op::SESSION_LIST);
+        assert_eq!(first.payload[8], 1, "large JSON must be a fragmented group");
+        let mut assembler = session_watch::Assembler::default();
+        assert!(assembler.push(&first.payload).unwrap().is_none());
+        // Keep the large first group blocked in its tiny send buffer. A producer
+        // and a separate fast subscriber must not wait for this consumer.
+        let started = Instant::now();
+        let latest = {
+            let mut state = service.lock_state();
+            for title in [b"\x1b]0;middle-1\x07".as_slice(), b"\x1b]0;middle-2\x07", b"\x1b]0;latest\x07"] {
+                state.sessions.get_mut("large-watch").unwrap().scan.write(title);
+                service.publish_metadata(&mut state);
+            }
+            state.metadata_revision
+        };
+        assert!(started.elapsed() < Duration::from_secs(2), "slow socket write held the metadata lock");
+        let mut fast = subscription_client(&service);
+        let (revision, value) = watch_until(&mut fast, |_| true, 3);
+        assert_eq!(revision, latest);
+        assert_eq!(value["sessions"][0]["title"], "latest");
+        assert_eq!(latest, first_revision + 3);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        let original = loop {
+            let frame = slow.io.read_frame_deadline(deadline.saturating_duration_since(Instant::now())).unwrap();
+            assert_eq!(frame.op, Op::SESSION_LIST);
+            if let Some(snapshot) = assembler.push(&frame.payload).unwrap() { break snapshot; }
+        };
+        assert_eq!(original.0, first_revision);
+        assert_eq!(serde_json::from_slice::<serde_json::Value>(&original.1).unwrap()["sessions"][0]["title"], "before");
+        let (resumed, snapshot) = watch_until(&mut slow, |_| true, 3);
+        assert_eq!(resumed, latest, "intermediate changes must coalesce instead of queueing snapshots");
+        assert_eq!(snapshot["sessions"][0]["title"], "latest");
+    }
+
+    #[test]
+    fn subscription_caps_and_rejects_payload_or_unexpected_upstream() {
+        let service = svc_with(TermConfig { detect: false, ..Default::default() }, Arc::new(Mutex::new(Vec::new())));
+        let mut clients = Vec::new();
+        for _ in 0..session_watch::MAX_SUBSCRIPTIONS {
+            let mut client = subscription_client(&service);
+            watch_until(&mut client, |_| true, 3);
+            clients.push(client);
+        }
+        let mut excess = subscription_client(&service);
+        let error = excess.expect(Op::ERROR, 3);
+        assert_eq!(frames::dec_error(&error.payload).unwrap().0, "too_many_clients");
+        clients.clear();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while service.subscriptions.load(Ordering::Relaxed) != 0 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        let (server, client) = UnixStream::pair().unwrap();
+        service.serve_one(server);
+        let mut bad = Client::from_stream(client);
+        bad.send(Op::SUBSCRIBE, &[1]);
+        assert_eq!(frames::dec_error(&bad.expect(Op::ERROR, 3).payload).unwrap().0, "bad_op");
+        let mut upstream = subscription_client(&service);
+        watch_until(&mut upstream, |_| true, 3);
+        upstream.send(Op::LIST, &[]);
+        assert!(upstream.io.read_frame_deadline(Duration::from_secs(2)).is_err());
+        service.close();
+    }
+
     #[cfg(any(target_os = "macos", target_os = "linux"))]
     #[test]
     fn cwd_sampling_works_without_detection_or_vt_and_preserves_osc7_priority() {
@@ -4562,11 +4866,14 @@ mod tests {
                 sessions: HashMap::new(),
                 manifests: with_manifests.then(|| manifest::Loader::new(None)),
                 next_sess_gen: 1,
+                metadata_revision: 1,
             }),
             stop: Arc::new(AtomicBool::new(false)),
             leg_missing_input_drops: AtomicU64::new(0),
             active_conns: Arc::new(AtomicUsize::new(0)),
             conn_over_cap: AtomicU64::new(0),
+            metadata_changed: Condvar::new(),
+            subscriptions: Arc::new(AtomicUsize::new(0)),
             #[cfg(test)]
             svc_id: next_svc_id(),
         });

@@ -24,6 +24,7 @@ fuzz_target!(|data: &[u8]| {
     let _ = frames::dec_error(data);
     let _ = frames::dec_name(data);
     let _ = frames::dec_input(data);
+    let _ = homeway_core::term::session_watch::Assembler::default().push(data);
     // 编码面往返（合法输入手搓帧 → 读回；长度域截断语义同 Go）
     let _ = frames::encode_frame(frames::Op(0x01), data);
 });

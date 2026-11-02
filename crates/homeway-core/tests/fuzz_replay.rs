@@ -516,6 +516,10 @@ fn term_seeds() -> Vec<Vec<u8>> {
     use homeway_core::term::frames;
     let base = format!("{}/../../fixtures", env!("CARGO_MANIFEST_DIR"));
     let mut v: Vec<Vec<u8>> = Vec::new();
+    let watch: serde_json::Value = serde_json::from_str(include_str!("../../../fixtures/term/session-subscription.json")).unwrap();
+    for case in watch["cases"].as_array().unwrap() {
+        v.push(hex::decode(case["payloadHex"].as_str().unwrap()).unwrap());
+    }
     for name in ["session-cjk.bin", "session-git-log.bin", "session-hexdump.bin"] {
         if let Ok(b) = std::fs::read(format!("{base}/term-vt/{name}")) {
             v.push(b);
@@ -571,6 +575,7 @@ fn fuzz_term_frames() {
         let _ = frames::dec_error(&b);
         let _ = frames::dec_name(&b);
         let _ = frames::dec_input(&b);
+        let _ = homeway_core::term::session_watch::Assembler::default().push(&b);
     }
 }
 

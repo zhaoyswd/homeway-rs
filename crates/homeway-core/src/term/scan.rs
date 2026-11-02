@@ -57,6 +57,8 @@ pub struct TermScan {
     title_stale: bool,
     /// 本批字节里模式位/标题/证据有变化（调用方读后清零）。
     changed: bool,
+    /// Sidebar-only title/cwd changes, independent from STATE/mode evidence.
+    metadata_changed: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -223,6 +225,7 @@ impl TermScan {
         let v = sanitize_value(raw, 4096);
         if v != self.pwd {
             self.pwd = v;
+            self.metadata_changed = true;
         }
     }
 
@@ -283,6 +286,7 @@ impl TermScan {
         if title == self.title && !self.title_stale {
             return;
         }
+        self.metadata_changed |= self.title != title;
         self.title = title;
         self.title_stale = false;
         self.changed = true;
@@ -363,6 +367,10 @@ impl TermScan {
     /// 本批是否有变化；读后清零。
     pub fn take_changed(&mut self) -> bool {
         std::mem::take(&mut self.changed)
+    }
+
+    pub(crate) fn take_metadata_changed(&mut self) -> bool {
+        std::mem::take(&mut self.metadata_changed)
     }
 }
 
@@ -588,5 +596,22 @@ mod tests {
         let long = "x".repeat(400);
         s2.write(osc(&format!("2;{long}")).as_bytes());
         assert_eq!(s2.title().len(), 256);
+    }
+
+    #[test]
+    fn metadata_changes_ignore_plain_output_modes_and_repeated_values() {
+        let mut scan = TermScan::new();
+        scan.write(b"plain output\x1b[?2004h\x1b]21337;status=blocked\x07");
+        assert!(!scan.take_metadata_changed());
+        scan.write(b"\x1b]0;title\x07");
+        assert!(scan.take_metadata_changed());
+        scan.write(b"\x1b]0;title\x07");
+        assert!(!scan.take_metadata_changed());
+        scan.take_changed();
+        scan.write(b"\x1b]7;file://localhost/work\x07");
+        assert!(scan.take_metadata_changed());
+        assert!(!scan.take_changed(), "subscription hook must not change legacy STATE publication");
+        scan.write(b"\x1b]7;file://localhost/work\x07");
+        assert!(!scan.take_metadata_changed());
     }
 }
