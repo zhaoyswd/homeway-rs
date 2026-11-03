@@ -1196,6 +1196,16 @@ impl App {
                 }
                 self.close_pending = None;
                 let succeeded = result.is_ok();
+                if succeeded
+                    && target == self.target()
+                    && self.active_session.as_deref() == Some(name.as_str())
+                {
+                    // An explicit close is authoritative even if its list
+                    // update arrives before ENDED or the attach is reconnecting.
+                    self.detach();
+                    self.model.selected_session = None;
+                    self.model.focus = view::Focus::Hosts;
+                }
                 match result {
                     Ok(()) => self.backend_event(backend::Event::Notice {
                         target: target.clone(),
@@ -1315,7 +1325,8 @@ impl App {
                             self.model.sessions.iter().position(|s| &s.name == name)
                         });
                         // A background LIST may predate this attachment. Only
-                        // same-leg probes/ENDED establish that its session ended.
+                        // same-leg probes/ENDED or an explicit close establish
+                        // that its session ended.
                         if selected.is_some()
                             && self.model.selected_session.is_none()
                             && self.recovery.is_none()
@@ -4436,6 +4447,116 @@ mod tests {
             app.close_pending.as_ref().unwrap().target,
             Target::Remote("other-host".into())
         );
+    }
+
+    #[test]
+    fn successful_close_clears_terminal_with_either_session_list_order() {
+        for list_first in [false, true] {
+            let mut app = history_app();
+            app.recovery = Some(recovery::Recovery::new(Instant::now()));
+            app.model.terminal_present = true;
+            app.model.terminal_title = "closed terminal".into();
+            app.close_pending = Some(ClosingSession {
+                target: Target::Local,
+                name: "history".into(),
+            });
+            let missing = |app: &mut App| {
+                app.backend_event(backend::Event::Sessions {
+                    target: Target::Local,
+                    epoch: app.sessions_epoch,
+                    result: Ok(Vec::new()),
+                });
+            };
+            if list_first {
+                missing(&mut app);
+                assert!(app.surface.is_some() && app.recovery.is_some());
+                assert!(app.model.selected_session.is_none());
+            }
+            let generation = app.generation;
+            app.backend_event(backend::Event::SessionClosed {
+                target: Target::Local,
+                name: "history".into(),
+                result: Ok(()),
+            });
+            assert!(app.surface.is_none() && app.active_session.is_none());
+            assert!(app.recovery.is_none() && app.attach.is_none());
+            assert_ne!(app.generation, generation);
+            assert!(app.model.selected_session.is_none());
+            assert!(app.model.terminal_title.is_empty() && !app.model.terminal_present);
+            assert_eq!(app.model.focus, view::Focus::Hosts);
+            if !list_first {
+                missing(&mut app);
+            }
+            // An old same-epoch list can restore a row, but cannot reattach it.
+            app.backend_event(backend::Event::Sessions {
+                target: Target::Local,
+                epoch: app.sessions_epoch,
+                result: Ok(vec![blocking_session(
+                    "history",
+                    backend::SessionState::Idle,
+                    321,
+                )]),
+            });
+            for fragment in codec::fragment_payload(&codec::gzip_bytes(&codec::enc_snapshot_body(
+                &codec::SnapshotBody {
+                    title: "closed terminal".into(),
+                    ..Default::default()
+                },
+            ))) {
+                app.surface_frame(Op::SNAPSHOT, &fragment).unwrap();
+            }
+            app.poll_connection(Instant::now() + Duration::from_secs(30));
+            assert!(app.surface.is_none() && app.active_session.is_none());
+            assert!(app.recovery.is_none() && app.attach.is_none());
+            assert!(app.model.selected_session.is_none());
+            let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+            let (geometry, _) = screen(&mut app, &mut terminal);
+            let buffer = terminal.backend().buffer();
+            let mut text = String::new();
+            for y in geometry.terminal.y..geometry.terminal.bottom() {
+                let mut x = geometry.terminal.x;
+                while x < geometry.terminal.right() {
+                    let cell = &buffer[(x, y)];
+                    text.push_str(cell.symbol());
+                    x += cell.cell_width().max(1);
+                }
+                text.push('\n');
+            }
+            assert!(text.contains("想在这台主机上做些什么？"));
+            assert!(!text.contains("LINE_") && !text.contains("closed terminal"));
+        }
+    }
+
+    #[test]
+    fn close_failure_or_completion_after_navigation_keeps_current_terminal() {
+        for (target, name, succeeded) in [
+            (Target::Local, "history", false),
+            (Target::Local, "unshown", true),
+            (Target::Remote("previous".into()), "history", true),
+        ] {
+            let mut app = history_app();
+            app.recovery = Some(recovery::Recovery::new(Instant::now()));
+            app.close_pending = Some(ClosingSession {
+                target: target.clone(),
+                name: name.into(),
+            });
+            let generation = app.generation;
+            app.backend_event(backend::Event::SessionClosed {
+                target,
+                name: name.into(),
+                result: if succeeded {
+                    Ok(())
+                } else {
+                    Err(backend::Error::Busy)
+                },
+            });
+            assert!(app.close_pending.is_none());
+            assert!(app.surface.is_some() && app.recovery.is_some());
+            assert_eq!(app.active_session.as_deref(), Some("history"));
+            assert_eq!(app.model.selected_session, Some(0));
+            assert_eq!(app.model.focus, view::Focus::Terminal);
+            assert_eq!(app.generation, generation);
+        }
     }
 
     #[test]
