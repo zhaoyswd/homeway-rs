@@ -1056,7 +1056,7 @@ pub fn wait_stop_pipe() -> StopWait {
 
 fn token_usage() {
     eprintln!("用法：homeway serve token [list | revoke <id>] [--state DIR] [--reason S]");
-    eprintln!("  无动词 = reveal（完整凭证只经本命令族；来源 = 台账末行）");
+    eprintln!("  无动词 = 查看完整凭证（来源 = 台账末行）");
 }
 
 /// token 族的状态目录（`--state` 全形态；缺省 = 统一进程默认 state——Q-H F15）。
@@ -1120,7 +1120,7 @@ pub fn cmd_serve_token(args: &[String]) {
     }
 }
 
-/// reveal：完整凭证只经本命令族（来源注记 = 台账末行——写入纪律下末行 = 最近在用）。
+/// reveal：查看完整凭证（来源注记 = 台账末行——写入纪律下末行 = 最近在用）。
 fn token_reveal(args: &[String]) {
     let state = token_state_dir(args);
     let st = match homeway_core::server::state::State::open(&state.join("serve")) {

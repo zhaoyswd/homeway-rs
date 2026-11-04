@@ -20,6 +20,10 @@ use crate::unified_cli::default_state_dir;
 
 const TIMEOUT: Duration = Duration::from_secs(10);
 
+// start 取 token 的 CLI 等待预算：覆盖引擎既有首轮探测/15s 兜底，不改变签发时序。
+const START_TOKEN_WAIT: Duration = Duration::from_secs(20);
+const START_TOKEN_POLL: Duration = Duration::from_millis(100);
+
 /// host.add 的请求预算（Go 缺省 10s；Rust 侧同键刷新的会话停止有界 6s〔patrol
 /// 阻塞探针不可中断——join 烧满 STOP_WAIT〕+ 探测 3.5s + 余量 ⇒ 放宽到 20s。
 /// spec 的 ≤3.5s MUST 约束的是服务端**探测**预算，不是 CLI 请求预算）。
@@ -507,15 +511,7 @@ fn try_dial_control_named(state_dir: &std::path::Path, name: &str) -> Option<Arc
 fn token_reveal_with_fallback(state: &std::path::Path, op: vocab::OpName) {
     if let Some(c) = try_dial_control_named(state, "homeway") {
         match c.request(op.as_str(), Some(serde_json::json!({})), TIMEOUT) {
-            Ok(v) => {
-                println!("{}", v["token"].as_str().unwrap_or("?"));
-                if let Some(eps) = v["endpoints"].as_array() {
-                    let eps: Vec<_> = eps.iter().filter_map(|e| e.as_str()).collect();
-                    if !eps.is_empty() {
-                        eprintln!("（端点：{}；来源={}）", eps.join("、"), v["source"].as_str().unwrap_or("?"));
-                    }
-                }
-            }
+            Ok(v) => render_token(&v),
             Err(e) => exit_op_err(&e),
         }
         return;
@@ -532,6 +528,45 @@ fn token_reveal_with_fallback(state: &std::path::Path, op: vocab::OpName) {
             eprintln!("homeway: 守护进程未运行——relay token 的离线推算请用 `homeway relay` 前台形态日志");
             std::process::exit(1);
         }
+    }
+}
+
+fn render_token(v: &serde_json::Value) {
+    println!("{}", v["token"].as_str().unwrap_or("?"));
+    if let Some(eps) = v["endpoints"].as_array() {
+        let eps: Vec<_> = eps.iter().filter_map(|e| e.as_str()).collect();
+        if !eps.is_empty() {
+            eprintln!("（端点：{}；来源={}）", eps.join("、"), v["source"].as_str().unwrap_or("?"));
+        }
+    }
+}
+
+/// start 已成功；获取凭据失败只给提示，不把成功启用角色改成失败退出。
+fn token_after_start(c: &ControlClient, op: vocab::OpName) {
+    let serve = op == vocab::OpName::ServeToken;
+    let role = if serve { "serve" } else { "relay" };
+    let deadline = std::time::Instant::now() + START_TOKEN_WAIT;
+    loop {
+        match c.request_deadline(op.as_str(), Some(serde_json::json!({})), deadline) {
+            // 首启先落一条空端点占位 token；等探测/兜底发布可用端点后再显示。
+            Ok(v) if serve && v["endpoints"].as_array().is_none_or(Vec::is_empty) => {}
+            Ok(v) => {
+                render_token(&v);
+                return;
+            }
+            Err(e) if serve && e.code == vocab::CODE_BAD_REQUEST
+                && e.detail() == "台账为空（出口从未铸出 token）" => {}
+            Err(e) => {
+                eprintln!("homeway: {role} 已启动，但暂未取得 token（{}）。稍后执行 `homeway {role} token` 查看。", op_err_text(&e));
+                return;
+            }
+        }
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        if remaining.is_zero() {
+            eprintln!("homeway: {role} 已启动，token 仍在准备中。稍后执行 `homeway {role} token` 查看。");
+            return;
+        }
+        std::thread::sleep(START_TOKEN_POLL.min(remaining));
     }
 }
 
@@ -1115,6 +1150,9 @@ pub fn cmd_serve_group(args: &[String]) {
     let v = c.request(op.as_str(), Some(serde_json::json!({})), TIMEOUT).unwrap_or_else(|e| exit_op_err(&e));
     // （start/restart 的应答面；status/stop 已在纯读/直改分支提前返回。）
     println!("serve：{}", v["action"].as_str().unwrap_or("?"));
+    if op == vocab::OpName::ServeStart {
+        token_after_start(&c, vocab::OpName::ServeToken);
+    }
     grant_hint_once(&state);
 }
 
@@ -1317,6 +1355,9 @@ pub fn cmd_relay_group(args: &[String]) {
     let v = c.request(op.as_str(), Some(serde_json::json!({})), TIMEOUT).unwrap_or_else(|e| exit_op_err(&e));
     // （start/restart 的应答面；status/stop 已在纯读/直改分支提前返回。）
     println!("relay：{}", v["action"].as_str().unwrap_or("?"));
+    if op == vocab::OpName::RelayStart {
+        token_after_start(&c, vocab::OpName::RelayToken);
+    }
 }
 
 /// relay.status 的渲染单实现（中-5 收敛）。

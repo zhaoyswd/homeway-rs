@@ -598,6 +598,18 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 
 ## 判据变更记录（政策 + 登记表）
 
+### 2026-11-04：serve / relay start 显示 token
+
+- 条目 **DC8 / DC10**（追加）：从成功 `start` 仅显示原 action 行，增为在原行之后
+  显示对应 token，包含 `already`；使用与独立 token 命令相同的完整串及端点/来源格式。
+  原因：用户要求省去启动后再次执行 token 命令。DC9 的状态掩码与独立 token 输出保持。
+- 首启 serve 的空端点占位结果、精确空台账错误会等待端点发布，最多共 20 秒，轮询间隔
+  100ms。此为 CLI 等待预算，**不改变引擎既有 15 秒兜底或线协议时间窗**。取 token
+  失败给出角色已启动与稍后查看命令的提示，保留 start 成功退出；start 失败不取 token。
+- 影响面：`homeway-cli/src/daemon_cli.rs` 的 start 输出；README 与 token 帮助同步。
+  start 与 token 是独立请求，沿用 serve 台账末行 / relay 运行态优先来源，不保证并发
+  stop/restart 或端点更新时的原子快照；restart / stop / status / wire 载荷均保持。
+
 ### 2026-11-03：会话元数据订阅与 LIST revision
 
 - 从「TUI 会话元数据每 500ms 独立 LIST」增为「具备 SESSION_SUBSCRIPTION 的服务端使用

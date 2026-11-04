@@ -33,8 +33,8 @@ curl -fsSL https://raw.githubusercontent.com/zhaoyswd/homeway-rs/main/install.sh
 当无法直连成功时，可以在有公网 IP 的机器上部署中继服务。默认监听 `:38341`；对外公告地址留空会自动探测。
 
 ```bash
-homeway relay start               # 启动中继
-homeway relay token               # 获取中继 token（rl1…）
+homeway relay start               # 启动中继并显示 token（rl1…）
+homeway relay token               # 日后重新查看中继 token
 homeway relay stop/restart/status # 管理中继
 ```
 
@@ -49,8 +49,8 @@ homeway serve relay clear
 homeway serve ddns add exit.example.com
 homeway serve ddns delete exit.example.com
 
-homeway serve start                 # 启动出口（首次需要；配置自启动后会带起）
-homeway serve token                 # 获取主机 token（hmw2…）
+homeway serve start                 # 启动出口并显示 token（hmw2…；配置自启动后会带起）
+homeway serve token                 # 日后重新查看主机 token
 homeway serve stop/restart/status   # 管理出口
 homeway serve quality --since 10m   # 回看本机出口近期网络质量（可加 --json）
 ```
