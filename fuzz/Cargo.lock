@@ -477,7 +477,7 @@ dependencies = [
 
 [[package]]
 name = "homeway-core"
-version = "0.2.3"
+version = "0.3.27"
 dependencies = [
  "alacritty_terminal",
  "base64",
@@ -501,7 +501,7 @@ dependencies = [
 
 [[package]]
 name = "homeway-quic"
-version = "0.2.3"
+version = "0.3.27"
 dependencies = [
  "bytes",
  "getrandom 0.2.17",
