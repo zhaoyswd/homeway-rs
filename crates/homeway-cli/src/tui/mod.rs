@@ -2250,10 +2250,9 @@ impl App {
             };
             let body = format!("{host} · {name}");
             if self.notifications.notify("会话需要操作", &body).is_err() {
-                self.queue_notification_fallback(notifications::terminal_request(
-                    "会话需要操作",
-                    &body,
-                ));
+                self.queue_notification_fallback(
+                    self.notifications.terminal_request("会话需要操作", &body),
+                );
             }
         }
     }
@@ -2277,7 +2276,11 @@ impl App {
                 "另有 {} 个会话需要操作，请查看会话列表",
                 self.notification_overflow
             );
-            output.write_all(notifications::terminal_request("homeway", &body).as_bytes())?;
+            output.write_all(
+                self.notifications
+                    .terminal_request("homeway", &body)
+                    .as_bytes(),
+            )?;
             self.notification_overflow = 0;
             wrote = true;
         }
@@ -4141,35 +4144,46 @@ mod tests {
     #[test]
     fn full_notification_queue_falls_back_without_losing_or_repeating_edges() {
         use backend::SessionState::{Blocked, Working};
-        let mut app = app();
-        let (notifier, recorded) = notifications::Notifications::recording();
-        app.notifications = notifier;
-        // Dropping the mock receiver deterministically rejects new submissions.
-        drop(recorded);
-        let mut sessions = (0..20)
-            .map(|i| blocking_session(&format!("s-{i}"), Working, i + 1))
-            .collect::<Vec<_>>();
-        app.observe_blocking(&Target::Local, &sessions);
-        for session in &mut sessions {
-            session.state = Blocked;
+        for bell in [false, true] {
+            let mut app = app();
+            let (notifier, recorded) = if bell {
+                notifications::Notifications::recording_bell()
+            } else {
+                notifications::Notifications::recording()
+            };
+            app.notifications = notifier;
+            // Dropping the mock receiver deterministically rejects new submissions.
+            drop(recorded);
+            let mut sessions = (0..20)
+                .map(|i| blocking_session(&format!("s-{i}"), Working, i + 1))
+                .collect::<Vec<_>>();
+            app.observe_blocking(&Target::Local, &sessions);
+            for session in &mut sessions {
+                session.state = Blocked;
+            }
+            app.observe_blocking(&Target::Local, &sessions);
+            assert_eq!(
+                app.notification_fallbacks.len(),
+                NOTIFICATION_FALLBACK_LIMIT
+            );
+            assert_eq!(app.notification_overflow, 4);
+            let mut output = Vec::new();
+            app.process_notifications(&mut output).unwrap();
+            let output = String::from_utf8(output).unwrap();
+            if bell {
+                assert_eq!(output, "\x07".repeat(17));
+            } else {
+                assert_eq!(output.matches("\x1b]9;").count(), 17);
+                assert!(
+                    output.contains("我的电脑 · title-s-0")
+                        && output.contains("另有 4 个会话需要操作")
+                );
+            }
+            app.observe_blocking(&Target::Local, &sessions);
+            let mut repeated = Vec::new();
+            app.process_notifications(&mut repeated).unwrap();
+            assert!(repeated.is_empty());
         }
-        app.observe_blocking(&Target::Local, &sessions);
-        assert_eq!(
-            app.notification_fallbacks.len(),
-            NOTIFICATION_FALLBACK_LIMIT
-        );
-        assert_eq!(app.notification_overflow, 4);
-        let mut output = Vec::new();
-        app.process_notifications(&mut output).unwrap();
-        let output = String::from_utf8(output).unwrap();
-        assert_eq!(output.matches("\x1b]9;").count(), 17);
-        assert!(
-            output.contains("我的电脑 · title-s-0") && output.contains("另有 4 个会话需要操作")
-        );
-        app.observe_blocking(&Target::Local, &sessions);
-        let mut repeated = Vec::new();
-        app.process_notifications(&mut repeated).unwrap();
-        assert!(repeated.is_empty());
     }
 
     #[test]

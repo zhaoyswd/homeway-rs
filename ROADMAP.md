@@ -72,6 +72,16 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-11-06 TUI 自带 Mac 终端 blocking 提醒（完成，本地源码）**：修复 macOS
+> 无条件 OSC9 导致 Terminal.app 无提醒的兼容缺口。本机精确 Apple_Terminal 且非
+> SSH/tailcat 时使用单 BEL，声音/闪烁/后台 Dock 提醒由终端描述文件决定；其它宿主
+> 保持原路线，不增加 helper 或不确定点击动作。启动捕获路由供 worker、队列拒绝与
+> 溢出摘要共用，原边沿去重/取消/归属不变。独立技术及最终代码两门通过，修前回归
+> 真实失败；最终 TUI **149/0、1 ignored**，CLI **231/0、2 ignored**、集成 **5/0**，
+> build/clippy 通过。未实测 GUI 声音/Dock，不承诺通知中心横幅；未跑完整 ci-local/RRR，
+> 未安装、推送、发布或部署，现役需后续发布换装。记录见
+> `docs/reviews/2026-11-06-tui-mac-notifications.md`。
+
 > **2026-11-04 start 显示 token（完成，本地源码）**：`serve start`、`relay start`
 > 成功或 already 后复用既有 token 读取与渲染，直接显示完整凭据；serve 首启等待非空
 > 端点，避免打印占位 token，CLI 最多等20秒。取凭据失败提示稍后查看、保留启动成功

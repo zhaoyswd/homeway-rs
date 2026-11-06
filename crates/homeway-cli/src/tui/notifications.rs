@@ -28,6 +28,7 @@ pub(super) struct Notifications {
     terminal: Receiver<String>,
     stopping: Arc<AtomicBool>,
     worker: Option<JoinHandle<()>>,
+    route: Route,
     #[cfg(test)]
     recorded: Option<SyncSender<(String, String)>>,
 }
@@ -45,7 +46,10 @@ impl Request {
         }
     }
 
-    fn terminal(&self) -> String {
+    fn terminal(&self, route: Route) -> String {
+        if matches!(route, Route::Bell) {
+            return "\x07".into();
+        }
         // OSC 9 的 ST 使用 ESC\\，不再额外叠加 BEL 或其它通知协议。
         format!("\x1b]9;homeway · {} — {}\x1b\\", self.title, self.body)
     }
@@ -53,19 +57,20 @@ impl Request {
 
 impl Notifications {
     pub(super) fn start() -> Self {
-        Self::spawn(|request, stopping| {
-            let platform = if cfg!(target_os = "macos") {
-                Platform::Mac
-            } else {
-                Platform::Unix
-            };
-            deliver(
-                request,
-                platform,
-                clipboard::remote_terminal(),
-                stopping,
-                native,
-            )
+        let platform = if cfg!(target_os = "macos") {
+            Platform::Mac
+        } else {
+            Platform::Unix
+        };
+        let remote = clipboard::remote_terminal();
+        let program = std::env::var_os("TERM_PROGRAM");
+        let route = route(
+            platform,
+            remote,
+            program.as_deref().and_then(|value| value.to_str()),
+        );
+        Self::spawn(route, move |request, stopping| {
+            deliver(request, route, stopping, native)
         })
     }
 
@@ -84,7 +89,7 @@ impl Notifications {
         self.terminal.try_recv().ok()
     }
 
-    fn spawn<F>(mut submit: F) -> Self
+    fn spawn<F>(route: Route, mut submit: F) -> Self
     where
         F: FnMut(Request, &AtomicBool) -> Option<String> + Send + 'static,
     {
@@ -114,6 +119,7 @@ impl Notifications {
             terminal,
             stopping,
             worker: Some(worker),
+            route,
             #[cfg(test)]
             recorded: None,
         }
@@ -121,6 +127,16 @@ impl Notifications {
 
     #[cfg(test)]
     pub(super) fn recording() -> (Self, Receiver<(String, String)>) {
+        Self::recording_route(Route::Osc9)
+    }
+
+    #[cfg(test)]
+    pub(super) fn recording_bell() -> (Self, Receiver<(String, String)>) {
+        Self::recording_route(Route::Bell)
+    }
+
+    #[cfg(test)]
+    fn recording_route(route: Route) -> (Self, Receiver<(String, String)>) {
         let (tx, recorded) = mpsc::sync_channel(QUEUE_CAPACITY);
         let (requests, _receiver) = mpsc::sync_channel(1);
         let (_terminal_tx, terminal) = mpsc::sync_channel(1);
@@ -129,6 +145,7 @@ impl Notifications {
             terminal,
             stopping: Arc::new(AtomicBool::new(false)),
             worker: None,
+            route,
             recorded: Some(tx),
         };
         (notifications, recorded)
@@ -152,8 +169,10 @@ impl Drop for Notifications {
     }
 }
 
-pub(super) fn terminal_request(title: &str, body: &str) -> String {
-    Request::new(title, body).terminal()
+impl Notifications {
+    pub(super) fn terminal_request(&self, title: &str, body: &str) -> String {
+        Request::new(title, body).terminal(self.route)
+    }
 }
 
 fn clean(value: &str, max_bytes: usize) -> String {
@@ -184,13 +203,7 @@ fn send_terminal(sender: &SyncSender<String>, mut sequence: String, stopping: &A
     false
 }
 
-fn deliver<F>(
-    request: Request,
-    platform: Platform,
-    remote: bool,
-    stopping: &AtomicBool,
-    native: F,
-) -> Option<String>
+fn deliver<F>(request: Request, route: Route, stopping: &AtomicBool, native: F) -> Option<String>
 where
     F: FnOnce(&Request, &AtomicBool) -> bool,
 {
@@ -199,8 +212,8 @@ where
     }
     // The host terminal owns the source session and any notification click.
     // Never submit macOS notifications under an unrelated script/app identity.
-    if matches!(platform, Platform::Mac) || remote || !native(&request, stopping) {
-        return (!stopping.load(Ordering::Acquire)).then(|| request.terminal());
+    if !matches!(route, Route::Native) || !native(&request, stopping) {
+        return (!stopping.load(Ordering::Acquire)).then(|| request.terminal(route));
     }
     None
 }
@@ -209,6 +222,28 @@ where
 enum Platform {
     Mac,
     Unix,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Route {
+    Native,
+    Osc9,
+    Bell,
+}
+
+fn route(platform: Platform, remote: bool, term_program: Option<&str>) -> Route {
+    if remote {
+        Route::Osc9
+    } else if matches!(platform, Platform::Mac) {
+        if term_program == Some("Apple_Terminal") {
+            // Terminal.app owns bell sound/visual/Dock alerts for the source window.
+            Route::Bell
+        } else {
+            Route::Osc9
+        }
+    } else {
+        Route::Native
+    }
 }
 
 fn helper(request: &Request) -> Command {
@@ -261,14 +296,76 @@ mod tests {
     use super::*;
 
     #[test]
+    fn apple_terminal_receives_one_native_bell_instead_of_osc9() {
+        let stopping = AtomicBool::new(false);
+        assert_eq!(
+            deliver(
+                Request::new("title", "body"),
+                route(Platform::Mac, false, Some("Apple_Terminal")),
+                &stopping,
+                |_, _| panic!("Apple Terminal must own the alert"),
+            ),
+            Some("\x07".into()),
+        );
+    }
+
+    #[test]
+    fn terminal_detection_is_local_exact_and_keeps_remote_desktops_out() {
+        assert_eq!(
+            route(Platform::Mac, false, Some("Apple_Terminal")),
+            Route::Bell
+        );
+        for program in [
+            None,
+            Some(""),
+            Some("iTerm.app"),
+            Some("ghostty"),
+            Some("apple_terminal"),
+        ] {
+            assert_eq!(route(Platform::Mac, false, program), Route::Osc9);
+        }
+        for platform in [Platform::Mac, Platform::Unix] {
+            assert_eq!(route(platform, true, Some("Apple_Terminal")), Route::Osc9);
+            assert_eq!(route(platform, true, None), Route::Osc9);
+        }
+        assert_eq!(
+            route(Platform::Unix, false, Some("Apple_Terminal")),
+            Route::Native
+        );
+    }
+
+    #[test]
+    fn apple_bell_worker_and_rejected_request_use_the_same_captured_route() {
+        let notifications = Notifications::spawn(Route::Bell, |request, stopping| {
+            deliver(request, Route::Bell, stopping, |_, _| panic!("no helper"))
+        });
+        notifications.notify("title", "body").unwrap();
+        assert_eq!(
+            notifications
+                .terminal
+                .recv_timeout(Duration::from_secs(1))
+                .unwrap(),
+            "\x07"
+        );
+        assert_eq!(notifications.terminal_request("title", "body"), "\x07");
+        let stopping = AtomicBool::new(true);
+        assert!(deliver(
+            Request::new("title", "body"),
+            Route::Bell,
+            &stopping,
+            |_, _| panic!("cancelled bell must not call helper")
+        )
+        .is_none());
+    }
+
+    #[test]
     fn remote_route_never_calls_native_and_fallback_is_one_safe_osc() {
         let stopping = AtomicBool::new(false);
         let expected = "\x1b]9;homeway · 需要操作 — 主机 · 会话\x1b\\";
         assert_eq!(
             deliver(
                 Request::new("需要操作", "主机 · 会话"),
-                Platform::Unix,
-                true,
+                route(Platform::Unix, true, None),
                 &stopping,
                 |_, _| { panic!("remote notifications must not use the remote desktop") }
             ),
@@ -277,8 +374,7 @@ mod tests {
         assert_eq!(
             deliver(
                 Request::new("需要操作", "主机 · 会话"),
-                Platform::Unix,
-                false,
+                route(Platform::Unix, false, None),
                 &stopping,
                 |_, _| false
             ),
@@ -286,8 +382,7 @@ mod tests {
         );
         assert!(deliver(
             Request::new("需要操作", "主机"),
-            Platform::Unix,
-            false,
+            route(Platform::Unix, false, None),
             &stopping,
             |_, _| true
         )
@@ -301,8 +396,7 @@ mod tests {
             assert_eq!(
                 deliver(
                     Request::new("title", "原主机 · 原会话"),
-                    Platform::Mac,
-                    remote,
+                    route(Platform::Mac, remote, None),
                     &stopping,
                     |_, _| panic!("macOS must not launch a script or native notification helper")
                 ),
@@ -311,8 +405,7 @@ mod tests {
             stopping.store(true, Ordering::Release);
             assert!(deliver(
                 Request::new("title", "body"),
-                Platform::Mac,
-                remote,
+                route(Platform::Mac, remote, None),
                 &stopping,
                 |_, _| panic!("cancelled macOS request must not launch a helper")
             )
@@ -326,7 +419,7 @@ mod tests {
         assert!(request.title.len() <= TITLE_BYTES && request.body.len() <= BODY_BYTES);
         assert!(!request.title.chars().any(char::is_control));
         assert!(!request.body.chars().any(char::is_control));
-        let sequence = request.terminal();
+        let sequence = request.terminal(Route::Osc9);
         assert_eq!(sequence.matches('\x1b').count(), 2);
         assert_eq!(sequence.matches('\x07').count(), 0);
         assert!(sequence.starts_with("\x1b]9;") && sequence.ends_with("\x1b\\"));
@@ -350,7 +443,7 @@ mod tests {
     #[test]
     fn slow_submission_has_nonblocking_backpressure_and_drop_cancels_it() {
         let (started_tx, started) = mpsc::channel();
-        let notifications = Notifications::spawn(move |_, stopping| {
+        let notifications = Notifications::spawn(Route::Osc9, move |_, stopping| {
             let _ = started_tx.send(());
             while !stopping.load(Ordering::Acquire) {
                 std::thread::sleep(POLL_INTERVAL);
@@ -394,8 +487,7 @@ mod tests {
         let stopping = AtomicBool::new(true);
         assert!(deliver(
             Request::new("title", "body"),
-            Platform::Unix,
-            false,
+            route(Platform::Unix, false, None),
             &stopping,
             |_, _| { panic!("cancelled notification must not launch a helper") }
         )
