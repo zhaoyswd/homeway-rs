@@ -1442,3 +1442,40 @@ manifest/receipt/RECOVERY，worker已退出；断线先查回执、不重复acti
 本机仍原PID23925、d1431158官方v0.3.25，原配置/身份/plist与台账前缀保全，未prepare/
 换装/重启或update，留用户手动部署；LAN71未动。完整证据与边界见同日
 `v0.3.26-release.md` 和 `v0.3.26-deploy.md` 两份review。
+
+### 13.27 v0.3.27 发布与三机滚动部署（2026-11-07，执行中）
+
+用户明确授权提交/发版/部署，且要求当前工作Mac最后切换，避免承载会话提前中断。
+版本提交`8e46324`推main，annotated tag v0.3.27在当时main头；公开CI42248799453
+最终8项通过，Mac既有同名负载敏感QUIC测试首轮红，调查与12单项/3组针对复验后仅
+重跑失败job一次通过，原失败保留。Release42248824303五平台及发布job全成功。
+本机下载五归档/SUMS全部校验，Mac准确版本/签名完整性和Linux静态核验通过；官方
+Mac私有23+8+5 PASS、官方Linux云私有4 PASS，均非正式换装的替代证据。
+
+阿里云fresh原本没有正式进程，但现有config启用双角色且显式QUIC41641；不把历史PID
+当现役，不启用遗留disabled systemd。完整备份和独立核验后，唯一activate得到
+**SUCCESS/11.889秒、未回退**，原停止基线恢复PID31292。正式PATH/defaultstate/
+零参、官方LinuxSHA `dbf3ae0cdbf9488a5eff1ddbff36ca04fda5e1f7e31cea9d50a197337c9829c3`、
+磁盘与运行映像、UDP41641/UDP+TCP41741、双角色与原关键字节/台账前缀均独立通过；
+正式两term入口被动订阅及LAN84→云唯一公网v4完整QUIC/3probe通过。恢复目录
+`/root/homeway-rollback/release-v0.3.27-20261107-idh9ux_k/`，先读receipt/RECOVERY，
+不得重复激活或自动用归档覆盖state。
+
+LAN84使用受审f930独立once，**SUCCESS/35.574秒、稳定30.715秒、未回退**，
+7025→19355，官方MacSHA `88670b9e75db6106debc5b8a44432d5fd2248650f42ab900b599f4f127540834`，
+UID501/GID0/755、原plist/默认state/身份配置保全，台账前缀保留正常追加426B。
+实际auto en0/.71与正式UPnP UDP38242→.71:38242一致，云唯一公网v4完整QUIC与
+3probe通过；激活前fresh14条其它映射完整保留，新增正式规则留生产使用。独立机器/
+IGD/公网三门全过，once已not running/runs1/exit0。持久恢复目录
+`/Users/zhaozhe/homeway-rollback/release-v0.3.27-lan84-20261107-r1/`。
+
+当前Mac最后，仍原17126/PATH `/opt/homebrew/bin/homeway`、官方v0.3.26 ace3ea…，
+actual prepare已exit0/PREPARED未激活，双真实stage保持gid80；完整备份及独立门已过。
+持久目录`~/homeway-rollback/release-v0.3.27-20261107-r1/`，root检查点提交后唯一
+bootstrap其once.plist。此步可能结束当前会话，先读receipt.json/RECOVERY.txt/worker.log
+及`gui/501/me.zhaozhe.homeway-release-v0327-20261107-r1`状态，不重复激活，不回填state。
+实际成功仍须持久SUCCESS与独立只读验收，不能以当前会话存活判定结果。
+
+完整官方哈希、首轮失败/复验、两门与逐端实际证据见
+`docs/reviews/2026-11-07-v0.3.27-release-deploy.md`。本机最后切换的实际回执续补该记录，
+此检查点不把PREPARED写作本机已经部署成功。
