@@ -17,7 +17,7 @@ use std::net::{IpAddr, Ipv4Addr, SocketAddr, SocketAddrV4};
 #[cfg(unix)]
 use std::os::unix::fs::MetadataExt as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::mpsc::{self, Sender};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime};
@@ -183,7 +183,7 @@ pub enum EngineCmd {
     /// 探测应答的能力位（udpcap 结论）。
     SetCaps(u8),
     /// 探测应答的端点列表段（已公布公网端点）。
-    SetProbeEndpoints(Vec<SocketAddr>),
+    SetProbeEndpoints { generation: u64, endpoints: Vec<SocketAddr> },
     /// 公网端点立即重测（换网事件——绑卡看护的 onChange）。
     KickPublicEndpoint,
     /// 把**公共端口**（QUIC 面直连 socket）重钉到指定网卡（绑卡看护换卡/重挑；
@@ -251,7 +251,7 @@ pub struct ServeEngine {
     driver_alive: Arc<AtomicBool>,
     /// 观测与兜底取消位；停止后等待两个线程退出，再允许缩租与替换。
     pubep_stop: Arc<AtomicBool>,
-    publication: Arc<Mutex<()>>,
+    publication: Arc<Mutex<PublicationState>>,
     observers: Mutex<Vec<std::thread::JoinHandle<()>>>,
     observer_threads: Vec<std::thread::ThreadId>,
     pub_kick: mpsc::SyncSender<()>,
@@ -840,7 +840,13 @@ impl ServeEngine {
         // 看护循环重钉后更新（Go `pinnedNow`/`PinnedIface` 同义）。
         let pinned_flag = Arc::new(AtomicBool::new(pinned_pin_ok || bind_addr.is_some()));
         let pubep_stop = Arc::new(AtomicBool::new(false));
-        let publication = Arc::new(Mutex::new(()));
+        let publication = Arc::new(Mutex::new(PublicationState {
+            binding: QuicBinding {
+                addr: quic_brief.as_ref().and_then(|(addr, _)| (!addr.ip().is_unspecified()).then_some(addr.ip())),
+                iface: if pinned_pin_ok { resolved.as_ref().map(|iface| (iface.index, iface.name.clone())) } else { None },
+            },
+            ..PublicationState::default()
+        }));
         let mut observers = Vec::new();
         let mut relay_workers = Vec::new();
 
@@ -970,6 +976,9 @@ impl ServeEngine {
                 let dlogf = Arc::clone(&dlogf);
                 let itc_stats = Arc::clone(&itc_stats);
                 let pub_kick_tx = pub_kick_tx.clone();
+                let publication = Arc::clone(&publication);
+                let pinned_flag = Arc::clone(&pinned_flag);
+                let pubep_stop = Arc::clone(&pubep_stop);
                 let driver_alive_t = Arc::clone(&driver_alive); // move 闭包独占一份（外层留给兜底线/构造面）
                 move || {
                     // 在世守卫：线程体任何出口（含 panic 展开）都清零——supervisor 据此
@@ -984,7 +993,7 @@ impl ServeEngine {
                     let _alive_guard = AliveGuard(driver_alive_t);
                     driver_loop(
                         cfg, bind, pubface, &mut table, &mut intercept, dns.as_ref(), &st,
-                        &revoked_set, cmd_rx, &dlogf, &itc_stats, pub_kick_tx, quic_face,
+                        &revoked_set, cmd_rx, &dlogf, &itc_stats, pub_kick_tx, quic_face, publication, pinned_flag, pubep_stop,
                     );
                 }
             })
@@ -1139,11 +1148,11 @@ impl ServeEngine {
             };
             let stop = spawn_service_stop_flag(&mut stop_flags);
             super::bindwatch::spawn_watcher(super::bindwatch::WatcherArgs {
+                initial: if pinned_pin_ok { resolved.clone() } else { None },
                 explicit_name,
                 probe_targets: super::bindwatch::health_probe_targets_from_env(&cfg.dns_probe_target),
                 pick_targets: super::bindwatch::pick_targets(&cfg.dns_probe_target),
                 cmd_tx: cmd_tx.clone(),
-                pinned_flag: Arc::clone(&pinned_flag),
                 pub_kick: pub_kick_tx.clone(),
                 udpcap_kick: udpcap_kick_tx,
                 logf: Arc::clone(&logf),
@@ -1336,28 +1345,33 @@ impl Drop for ServeEngine {
 
 /// UPnP 退出缩租（shrinkUPnPClease：把映射租期缩到 5 分钟——快速重启沿用同一外口，
 /// 出口真退休了映射自动过期；装配早失败时没有要缩租的映射）。
-/// F10：**全局 8s 预算**（Go serve.go:728 单 ctx）——期限穿透到 SSDP/描述腿，候选循环
-/// 共享同一 deadline（修前每候选 5s(SSDP) + 8s(SOAP) ⇒ 停机最坏 N×13s）；结果显式
-/// 归因（静默跳过变可见）。
+/// 所有已记录的来源/IGD共享8s，锁外执行网络操作；不重新枚举其它网卡或认领其它实例。
 pub fn shrink_upnp_lease(engine: &ServeEngine, logf: &Logf) {
-    let port = engine.local_port;
-    let cands = crate::server::upnp::local_ipv4_candidates();
+    let mappings = engine.publication.lock().expect("发布门锁中毒").mappings.clone();
+    if mappings.is_empty() {
+        (logf)("UPnP：缩租跳过——本实例没有建映射收据，不认领其它接口/实例的映射");
+        return;
+    }
     let deadline = std::time::Instant::now() + crate::server::upnp::UPNP_SHRINK_TOTAL_BUDGET;
-    match crate::server::upnp::shrink_lease_before(&cands, port, deadline, &**logf) {
-        crate::server::upnp::ShrinkOutcome::Shrunk { ext } => {
-            (logf)(&format!("UPnP：退出前把映射 外部 {ext} 的租期缩到 5 分钟（快速重启仍会沿用这个端口）"));
-        }
-        crate::server::upnp::ShrinkOutcome::NoIgd => {
-            (logf)("UPnP：缩租跳过——8s 预算内没找到可用 IGD（映射保持原租期，自动过期）");
-        }
-        crate::server::upnp::ShrinkOutcome::TableIncomplete => {
-            (logf)("UPnP：缩租跳过——映射表枚举残缺（清单不可信，不当作「没有映射」；映射保持原租期）");
-        }
-        crate::server::upnp::ShrinkOutcome::NoMapping => {
-            (logf)("UPnP：缩租跳过——路由器表里没有我们的映射");
-        }
-        crate::server::upnp::ShrinkOutcome::Failed { ext, err } => {
-            (logf)(&format!("UPnP：缩租失败（外部 {ext}：{err}）——原映射仍在，租期到期自动过期"));
+    for mapping in mappings {
+        for outcome in mapping.shrink_before(deadline) {
+            match outcome {
+                crate::server::upnp::ShrinkOutcome::Shrunk { ext } => {
+                    (logf)(&format!("UPnP：退出前把映射 外部 {ext} 的租期缩到 5 分钟（快速重启仍会沿用这个端口）"));
+                }
+                crate::server::upnp::ShrinkOutcome::NoIgd => {
+                    (logf)("UPnP：缩租跳过——8s 预算内没找到可用 IGD（映射保持原租期，自动过期）");
+                }
+                crate::server::upnp::ShrinkOutcome::TableIncomplete => {
+                    (logf)("UPnP：缩租跳过——映射表枚举残缺（清单不可信，不当作「没有映射」；映射保持原租期）");
+                }
+                crate::server::upnp::ShrinkOutcome::NoMapping => {
+                    (logf)("UPnP：缩租跳过——路由器表里没有我们的映射");
+                }
+                crate::server::upnp::ShrinkOutcome::Failed { ext, err } => {
+                    (logf)(&format!("UPnP：缩租失败（外部 {ext}：{err}）——未删除原映射，原租期保持（永久规则仍需人工清理）"));
+                }
+            }
         }
     }
 }
@@ -1513,6 +1527,9 @@ fn driver_loop(
     // 出口 QUIC 面句柄（`None` = 未起）：**收工链在驱动线程手里**（M1 §1.7——关闭前
     // 还要把尾包投给 intercept，故必须停在 `intercept.close()` **之前**）。
     quic_face: Option<homeway_quic::ExitQuic>,
+    publication: Arc<Mutex<PublicationState>>,
+    pinned_flag: Arc<AtomicBool>,
+    pubep_stop: Arc<AtomicBool>,
 ) {
     // GC 节拍（10min ±10% 抖动）与吊销跟随（1s mtime）/DNS 统计（60s）
     let mut rng = [0u8; 8];
@@ -1579,13 +1596,21 @@ fn driver_loop(
                 }
                 EngineCmd::StunAbort => pubface.stun_abort(),
                 EngineCmd::SetCaps(c) => pubface.set_caps(c),
-                EngineCmd::SetProbeEndpoints(eps) => pubface.set_probe_endpoints(eps),
+                EngineCmd::SetProbeEndpoints { generation, endpoints } => {
+                    let state = publication.lock().expect("发布门锁中毒");
+                    if !pubep_stop.load(Ordering::SeqCst) && state.generation.load(Ordering::SeqCst) == generation {
+                        pubface.set_probe_endpoints(endpoints);
+                    }
+                }
                 EngineCmd::KickPublicEndpoint => {
                     let _ = pub_kick_tx.try_send(()); // 转发到观测线程（满=已有待处理 kick）
                 }
                 EngineCmd::Repin { index, name, reply } => {
                     // 看护循环重钉（公共端口 socket——dup fd 上 setsockopt；两族都设、单栈容错）
-                    let _ = reply.send(pubface.repin_to(index, &name));
+                    let mut state = publication.lock().expect("发布门锁中毒");
+                    let result = state.repin(index, &name, &pubep_stop, &pinned_flag, || pubface.repin_to(index, &name));
+                    if result.is_ok() { pubface.set_probe_endpoints(Vec::new()); }
+                    let _ = reply.send(result);
                 }
                 EngineCmd::LegRegister { id, remote, marker, admission_marker } => {
                     // SESSION 通告 → 拨腿（连接 socket + LEGUP 标记 + 入表）
@@ -1992,14 +2017,91 @@ fn route_out(
 
 // ---------- 公网端点观测 + token 打印 ----------
 
+#[derive(Clone, Default)]
+struct QuicBinding {
+    addr: Option<IpAddr>,
+    iface: Option<(u32, String)>,
+}
+
+impl QuicBinding {
+    fn upnp_sources(&self, live: &[IfaceInfo]) -> Vec<super::upnp::LocalSource> {
+        let iface = self.iface.as_ref().and_then(|(index, name)| {
+            live.iter().find(|iface| iface.name == *name && iface.index == *index
+                && iface.up && !iface.loopback && !egress::is_virtual_iface(&iface.name))
+        });
+        let mut ips = match self.addr {
+            Some(IpAddr::V4(ip)) if ip.is_private() => {
+                if self.iface.is_some() && !iface.is_some_and(|iface| iface.addrs.contains(&ip)) { return Vec::new(); }
+                vec![ip]
+            }
+            Some(_) => return Vec::new(),
+            None => match iface { Some(iface) => iface.addrs.iter().copied().filter(Ipv4Addr::is_private).collect(), None => return Vec::new() },
+        };
+        ips.sort_unstable();
+        ips.dedup();
+        ips.into_iter().map(|ip| super::upnp::LocalSource { ip, iface: self.iface.clone() }).collect()
+    }
+}
+
+#[derive(Default)]
+struct PublicationState {
+    generation: Arc<AtomicU64>,
+    binding: QuicBinding,
+    mappings: Vec<super::upnp::MappingLease>,
+}
+
+impl PublicationState {
+    fn repin(
+        &mut self,
+        index: u32,
+        name: &str,
+        stopped: &AtomicBool,
+        pinned: &AtomicBool,
+        apply: impl FnOnce() -> std::io::Result<()>,
+    ) -> std::io::Result<()> {
+        if stopped.load(Ordering::SeqCst) {
+            return Err(std::io::Error::new(std::io::ErrorKind::Interrupted, "公网观测已停止，不再重钉"));
+        }
+        apply()?;
+        self.binding.iface = Some((index, name.to_owned()));
+        self.generation.fetch_add(1, Ordering::SeqCst);
+        pinned.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+struct ObservationRound {
+    generation: Arc<AtomicU64>,
+    expected: u64,
+    sources: Vec<super::upnp::LocalSource>,
+}
+
+impl ObservationRound {
+    fn snapshot(ctx: &TokenCtx) -> Self {
+        let state = ctx.publication.lock().expect("发布门锁中毒");
+        Self {
+            generation: Arc::clone(&state.generation),
+            expected: state.generation.load(Ordering::SeqCst),
+            sources: state.binding.upnp_sources(&egress::interfaces()),
+        }
+    }
+
+    fn current(&self, state: &PublicationState) -> bool {
+        self.expected == state.generation.load(Ordering::SeqCst)
+            && self.sources == state.binding.upnp_sources(&egress::interfaces())
+    }
+}
+
 #[derive(Default)]
 struct TokenPrintState {
     last_token: String,
     revoked_logged: bool,
     last_published: Vec<String>,
-    /// QUIC 端口的公网端点（M1 S1c / E-q4：UPnP 映射成功后由 `refresh_quic_public` 写入；
+    published_generation: u64,
+    /// QUIC 端口的公网端点（E-q4：证据合流成功后与published同门写入；
     /// `None` = 未映射/未启用/无 QUIC 面 ⇒ token 只出 LAN 与中继 QUIC 端点）。
     quic_pub: Option<SocketAddr>,
+    quic_generation: u64,
 }
 
 
@@ -2036,7 +2138,7 @@ struct TokenCtx {
     resolver: super::doh::DohResolver,
     /// 观测/兜底共享取消位；发布门内检查，shutdown与发布事务串行。
     pubep_stopped: Arc<AtomicBool>,
-    publication: Arc<Mutex<()>>,
+    publication: Arc<Mutex<PublicationState>>,
     /// DDNS 自检的滚动状态（按域名一域一份；探测线程写 / status 快照读——P0-4）。
     ddns_checks: super::ddnscheck::DdnsChecks,
     /// DDNS 自检直查解析器（F2：`serve.ddns_resolver` 装配期为 `SocketAddr` 形态）。
@@ -2114,73 +2216,69 @@ fn public_endpoint_loop(
 /// 映射，不假装）。
 ///
 /// `--upnp=false`：明文打失败行（设计 §10 S1-7 的判据形态）——「失败可见」而不是静默缺席。
+#[cfg(test)]
 fn refresh_quic_public(ctx: &Arc<TokenCtx>, round_deadline: Instant) -> (u16, Option<Ipv4Addr>) {
-    let Some(q) = ctx.quic_ep else { return (0, None);
-    };
+    let round = ObservationRound::snapshot(ctx);
+    refresh_quic_public_round(ctx, round_deadline, &round)
+}
+
+fn refresh_quic_public_round(ctx: &Arc<TokenCtx>, round_deadline: Instant, round: &ObservationRound) -> (u16, Option<Ipv4Addr>) {
+    let Some(q) = ctx.quic_ep else { return (0, None); };
     let port = q.port();
-    let set_pub = |v: Option<SocketAddr>| {
-        if let Ok(mut inner) = ctx.inner.lock() {
-            inner.quic_pub = v;
-        }
-    };
+    // 本轮只产证据；旧 UPnP 内存端点也要在同一个发布门内失效，不能让兜底 token 偷发。
+    {
+        let state = ctx.publication.lock().expect("发布门锁中毒");
+        if ctx.pubep_stopped.load(Ordering::SeqCst) || !round.current(&state) { return (0, None); }
+        ctx.inner.lock().expect("token 状态锁中毒").quic_pub = None;
+    }
     if !ctx.cfg.upnp {
-        set_pub(None);
         (ctx.logf)(&format!(
             "UPnP：QUIC 端口 {port} 映射 未启用（--upnp=false）——公网 QUIC 端点不公布（LAN/中继 QUIC 端点照常）"
         ));
         return (0, None);
     }
-    let cands = crate::server::upnp::local_ipv4_candidates();
-    if cands.is_empty() {
-        set_pub(None);
-        (ctx.logf)(&format!("UPnP：QUIC 端口 {port} 映射 失败（找不到内网 IPv4 候选）"));
+    if round.sources.is_empty() {
+        (ctx.logf)(&format!("UPnP：QUIC 端口 {port} 映射 失败（QUIC 未绑定可用物理 IPv4 来源：none/未钉卡/纯 IPv6/接口地址不可用；不枚举其它网卡）"));
         return (0, None);
     }
-    let logf2: Logf = Arc::clone(&ctx.logf);
     let deadline = round_deadline.min(Instant::now() + crate::server::upnp::UPNP_TOTAL_BUDGET);
+    let record = |gateway: &super::upnp::Igd, attempt: super::upnp::MappingAttempt| {
+        // 收据在建规则请求之前写入；即使换卡/停止，也要保留用于精确退租。
+        let mut state = ctx.publication.lock().expect("发布门锁中毒");
+        if let Some(lease) = state.mappings.iter_mut().find(|lease| lease.matches(gateway, port)) {
+            lease.record(attempt);
+        } else {
+            let mut lease = super::upnp::MappingLease::empty(gateway, port);
+            lease.record(attempt);
+            state.mappings.push(lease);
+        }
+    };
     match crate::server::upnp::ensure_port_mapping_cancellable(
-        &cands,
-        port,
-        &*logf2,
-        &*logf2,
-        deadline,
-        Arc::clone(&ctx.pubep_stopped),
+        &round.sources, port, &*ctx.logf, &*ctx.dlogf, deadline,
+        Arc::clone(&ctx.pubep_stopped), (Arc::clone(&round.generation), round.expected), &record,
     ) {
-        Err(e) => {
-            set_pub(None);
+        Err(error) => {
             (ctx.logf)(&format!(
-                "UPnP：QUIC 端口 {port} 映射 失败（{e}）——出口在 NAT 后时可在路由器上手动把 UDP {port} 转发到本机（候选 {:?}）；公网 QUIC 端点不公布",
-                cands
+                "UPnP：QUIC 端口 {port} 映射 失败（{error}）——出口在 NAT 后时可在路由器上手动把 UDP {port} 转发到本机（候选 {:?}）；公网 QUIC 端点不公布",
+                round.sources
             ));
             (0, None)
         }
-        Ok((ext, used)) => {
-            // 外网 IP（IGD 的 ExternalIPAddress；非公网地址不公布）——同一轮已查到就复用
-            let wan = crate::server::upnp::discover_igd_cancellable(
-                used,
-                deadline,
-                Arc::clone(&ctx.pubep_stopped),
-            )
-                .ok()
-                .and_then(|g| g.external_ip().ok())
-                .filter(|ip| egress::is_public_addr(IpAddr::V4(*ip)));
+        Ok((ext, used, gateway)) => {
+            // 同一 IGD、同一控制 URL、同一来源和剩余预算；不再重新 SSDP。
+            let wan = gateway.external_ip().ok().filter(|ip| egress::is_public_addr(IpAddr::V4(*ip)));
+            let state = ctx.publication.lock().expect("发布门锁中毒");
+            if ctx.pubep_stopped.load(Ordering::SeqCst) || !round.current(&state) { return (0, None); }
+            drop(state);
             match wan {
-                Some(ip) => {
-                    let pub_ep = SocketAddr::new(IpAddr::V4(ip), ext);
-                    set_pub(Some(pub_ep));
-                    (ctx.logf)(&format!(
-                        "UPnP：QUIC 端口 {port} 映射 外部 UDP {ext} → {used}:{port}（公布 {pub_ep}；重启时从路由器表认领）"
-                    ));
-                    (ext, Some(ip))
-                }
-                None => {
-                    set_pub(None);
-                    (ctx.logf)(&format!(
-                        "UPnP：QUIC 端口 {port} 映射 已建立（外部 UDP {ext}）但外网 IP 不可得/非公网——公网 QUIC 端点不公布"
-                    ));
-                    (ext, None)
-                }
+                Some(ip) => (ctx.logf)(&format!(
+                    "UPnP：QUIC 端口 {port} 映射 外部 UDP {ext} → {used}:{port}（公网地址 {ip}；待同轮证据合流公布）"
+                )),
+                None => (ctx.logf)(&format!(
+                    "UPnP：QUIC 端口 {port} 映射 已建立（外部 UDP {ext}）但外网 IP 不可得/非公网——公网 QUIC 端点不公布"
+                )),
             }
+            (ext, wan)
         }
     }
 }
@@ -2248,16 +2346,17 @@ fn refresh_public_endpoint(ctx: &Arc<TokenCtx>, cmd_tx: &Sender<EngineCmd>) -> b
     // 成/败都打**，且 `--upnp=false` 形态也打失败行 = fail-visible）。放在本轮最前：
     // 既要给 token 填 `quic_pub`，也要把外口喂给下文的证据合流。
     let deadline = Instant::now() + PUBLIC_ROUND_BUDGET;
-    let (upnp_ext, upnp_wan) = refresh_quic_public(ctx, deadline);
+    let round = ObservationRound::snapshot(ctx);
+    let (upnp_ext, upnp_wan) = refresh_quic_public_round(ctx, deadline, &round);
     let manual = ctx.cfg.public_endpoint.trim().to_owned();
     if !manual.is_empty() {
         // 配置覆盖：推断在「不能枚举/不能观测」的环境里无解（macOS SSDP 被本地网络
         // 隐私拒即一例）——照常写文件 + 打 token。
         let lines: Vec<String> = manual.split(',').map(|s| s.trim().to_owned()).collect();
-        return publish_endpoints(ctx, cmd_tx, lines, true);
+        return publish_endpoints(ctx, cmd_tx, lines, true, &round);
     }
 
-    refresh_inferred_public_endpoint(ctx, cmd_tx, deadline, upnp_ext, upnp_wan)
+    refresh_inferred_public_endpoint(ctx, cmd_tx, deadline, upnp_ext, upnp_wan, &round)
 }
 
 fn refresh_inferred_public_endpoint(
@@ -2266,6 +2365,7 @@ fn refresh_inferred_public_endpoint(
     deadline: Instant,
     upnp_ext: u16,
     upnp_wan: Option<Ipv4Addr>,
+    round: &ObservationRound,
 ) -> bool {
     // ---- 推断路径：UPnP 映射（= 上面公共端口那条）+ 同端口 STUN 观测（两条证据合流才公布）----
     // **M5 起只有一条映射**：公共端口就是 QUIC 端口（`refresh_quic_public` 已映射并打
@@ -2317,8 +2417,8 @@ fn refresh_inferred_public_endpoint(
         (Some(ap), ext, _) if ext != 0 && pinned && public_v4(ap) => {
             let built = SocketAddr::new(ap.ip(), ext);
             (ctx.logf)(&format!(
-                "公网端点：外口 {ext} ≠ 监听口 {}（沿用历史端口/回退），用 STUN 的 IP + UPnP 的外口公布",
-                ctx.local_port
+                "公网端点：STUN 外口 {} ≠ UPnP 外口 {ext}（监听口 {}），用 STUN 的 IP + UPnP 的外口公布",
+                ap.port(), ctx.local_port
             ));
             Some(built)
         }
@@ -2398,7 +2498,7 @@ fn refresh_inferred_public_endpoint(
             }
         }
     }
-    publish_endpoints(ctx, cmd_tx, lines, false)
+    publish_endpoints(ctx, cmd_tx, lines, false, round)
 }
 
 /// cache、探测列表、内存快照、token 台账作为同一世代的发布事务提交。
@@ -2407,11 +2507,12 @@ fn publish_endpoints(
     cmd_tx: &Sender<EngineCmd>,
     lines: Vec<String>,
     manual: bool,
+    round: &ObservationRound,
 ) -> bool {
     let mut logs = DeferredLogs::default();
     {
-        let _publication = ctx.publication.lock().expect("发布门锁中毒");
-        if ctx.pubep_stopped.load(Ordering::SeqCst) {
+        let publication = ctx.publication.lock().expect("发布门锁中毒");
+        if ctx.pubep_stopped.load(Ordering::SeqCst) || !round.current(&publication) {
             return false;
         }
         let endpoint_file = ctx.cfg.state_dir.join("cache").join("public_endpoint.txt");
@@ -2427,9 +2528,15 @@ fn publish_endpoints(
             )
         };
         logs.push(&ctx.logf, msg);
-        set_probe_endpoints_cmd(cmd_tx, &lines);
-        ctx.inner.lock().expect("token 状态锁中毒").last_published = lines.clone();
-        print_client_token_locked(ctx, &lines, &mut logs);
+        set_probe_endpoints_cmd(cmd_tx, &lines, round.expected);
+        {
+            let mut inner = ctx.inner.lock().expect("token 状态锁中毒");
+            inner.last_published = lines.clone();
+            inner.published_generation = round.expected;
+            inner.quic_pub = lines.iter().find_map(|line| line.parse::<SocketAddr>().ok());
+            inner.quic_generation = round.expected;
+        }
+        print_client_token_locked(ctx, &lines, &mut logs, round.expected);
     }
     logs.emit(&ctx.pubep_stopped);
     true
@@ -2615,14 +2722,14 @@ fn stun_query_sync(
     None
 }
 
-fn set_probe_endpoints_cmd(cmd_tx: &Sender<EngineCmd>, lines: &[String]) {
+fn set_probe_endpoints_cmd(cmd_tx: &Sender<EngineCmd>, lines: &[String], generation: u64) {
     let eps: Vec<SocketAddr> = lines
         .iter()
         .filter_map(|l| l.parse().ok())
         .filter(|ap: &SocketAddr| ap.port() != 0 && egress::is_public_addr(ap.ip()))
         .take(crate::probe::MAX_ENDPOINTS)
         .collect();
-    let _ = cmd_tx.send(EngineCmd::SetProbeEndpoints(eps));
+    let _ = cmd_tx.send(EngineCmd::SetProbeEndpoints { generation, endpoints: eps });
 }
 
 /// 打客户端 token（E3）：终端只打第一轮（进程生命周期内不再重打——端点变化冒出
@@ -2630,28 +2737,23 @@ fn set_probe_endpoints_cmd(cmd_tx: &Sender<EngineCmd>, lines: &[String]) {
 fn print_client_token(ctx: &Arc<TokenCtx>, published: &[String]) {
     let mut logs = DeferredLogs::default();
     {
-        let _publication = ctx.publication.lock().expect("发布门锁中毒");
+        let publication = ctx.publication.lock().expect("发布门锁中毒");
         if ctx.pubep_stopped.load(Ordering::SeqCst) {
             return;
         }
         // 兜底拿到的快照可能已过时；在门内重读，以免回写上一轮公网端点。
-        let current = ctx
-            .inner
-            .lock()
-            .expect("token 状态锁中毒")
-            .last_published
-            .clone();
-        let published = if current.is_empty() {
-            published
-        } else {
-            &current
-        };
-        print_client_token_locked(ctx, published, &mut logs);
+        let generation = publication.generation.load(Ordering::SeqCst);
+        let inner = ctx.inner.lock().expect("token 状态锁中毒");
+        let current = if inner.published_generation == generation { inner.last_published.clone() } else { Vec::new() };
+        let valid_fallback = inner.published_generation == generation;
+        drop(inner);
+        let published = if !current.is_empty() { &current } else if valid_fallback { published } else { &[] };
+        print_client_token_locked(ctx, published, &mut logs, generation);
     }
     logs.emit(&ctx.pubep_stopped);
 }
 
-fn print_client_token_locked(ctx: &Arc<TokenCtx>, published: &[String], logs: &mut DeferredLogs) {
+fn print_client_token_locked(ctx: &Arc<TokenCtx>, published: &[String], logs: &mut DeferredLogs, generation: u64) {
     // 低-7（B0-2a 登记→D-1 收口）：inner 锁只护 revoked_logged/last_token 的读写
     // 小临界区——网卡枚举/token 编码/台账追加由调用者的发布门串行化，
     // 防止兜底旧快照在新一轮公布之后重新成为台账末行。
@@ -2714,7 +2816,7 @@ fn print_client_token_locked(ctx: &Arc<TokenCtx>, published: &[String], logs: &m
     }
     // QUIC 公网端点（E-q4 的 UPnP 映射产物；未映射/未启用 ⇒ 缺席 = fail-visible，
     // 与 E-q4 行同步）。与上一块的地址通常相同（去重键 = addr 串 ⇒ 只留一条）。
-    if let Some(qp) = ctx.inner.lock().map(|i| i.quic_pub).unwrap_or(None) {
+    if let Some(qp) = ctx.inner.lock().ok().and_then(|i| (i.quic_generation == generation).then_some(i.quic_pub).flatten()) {
         add(Endpoint { addr: qp.to_string(), kind: EndpointKind::Quic }, "QUIC 公网");
     }
     // DDNS 域名条目（多条，叠加不踢除——B-1 拍板）：端口口径 = 已公布公网 v4 端点的
@@ -3097,7 +3199,7 @@ mod tests {
             log_paths: None,
             pinned_flag: Arc::new(AtomicBool::new(false)),
             pubep_stopped: Arc::new(AtomicBool::new(false)),
-            publication: Arc::new(Mutex::new(())),
+            publication: Arc::new(Mutex::new(PublicationState::default())),
             resolver: crate::server::doh::DohResolver::new(
                 Vec::new(),
                 Arc::new(Mutex::new(None)),
@@ -3110,6 +3212,91 @@ mod tests {
         });
         let _ = rx;
         (ctx, dir)
+    }
+
+    #[test]
+    fn upnp_candidates_follow_actual_quic_binding_instead_of_interface_order() {
+        let iface = |index, name: &str, ips: &[&str]| IfaceInfo {
+            name: name.into(), index, index_ok: true, addrs: ips.iter().map(|ip| ip.parse().unwrap()).collect(),
+            cidrs: Vec::new(), up: true, loopback: false,
+        };
+        let wifi = iface(6, "en0", &["192.168.3.71"]);
+        let wired = iface(7, "en7", &["192.168.3.85", "192.168.3.84", "192.168.3.84"]);
+        let live = [wifi, wired];
+        let mut binding = QuicBinding { addr: None, iface: Some((7, "en7".into())) };
+        let ips = |binding: &QuicBinding| binding.upnp_sources(&live).into_iter().map(|source| source.ip).collect::<Vec<_>>();
+        assert_eq!(ips(&binding), ["192.168.3.84".parse::<Ipv4Addr>().unwrap(), "192.168.3.85".parse().unwrap()]);
+        binding.iface = Some((6, "en0".into()));
+        assert_eq!(ips(&binding), ["192.168.3.71".parse::<Ipv4Addr>().unwrap()]);
+        binding.addr = Some("192.168.3.71".parse().unwrap());
+        assert_eq!(ips(&binding).len(), 1, "显式IP只允许自身");
+        binding.iface = Some((7, "en7".into()));
+        assert!(ips(&binding).is_empty(), "IP与实际接口不符不能混用");
+        assert!(ips(&QuicBinding::default()).is_empty(), "none和pin失败不猜首项");
+        for addr in ["0.0.0.0", "224.0.0.1", "255.255.255.255", "8.8.8.8", "::1"] {
+            assert!(ips(&QuicBinding { addr: Some(addr.parse().unwrap()), iface: None }).is_empty(), "{addr}");
+        }
+        binding.addr = None;
+        binding.iface = Some((99, "en0".into()));
+        assert!(ips(&binding).is_empty(), "同名换index不能沿用旧绑定");
+    }
+
+    #[test]
+    fn runtime_repin_commits_only_real_success_and_refuses_after_stop() {
+        let mut state = PublicationState::default();
+        let stopped = AtomicBool::new(false);
+        let pinned = AtomicBool::new(false);
+        state.repin(6, "en0", &stopped, &pinned, || Ok(())).unwrap();
+        assert_eq!(state.generation.load(Ordering::SeqCst), 1);
+        assert!(pinned.load(Ordering::SeqCst));
+        assert!(state.repin(7, "en7", &stopped, &pinned, || Err(std::io::ErrorKind::PermissionDenied.into())).is_err());
+        assert_eq!(state.binding.iface, Some((6, "en0".into())));
+        assert_eq!(state.generation.load(Ordering::SeqCst), 1);
+        state.repin(7, "en7", &stopped, &pinned, || Ok(())).unwrap();
+        assert_eq!(state.binding.iface, Some((7, "en7".into())));
+        assert_eq!(state.generation.load(Ordering::SeqCst), 2);
+        // 同卡地址漂移会触发一次真实repin，同样使旧轮失效；稳定卡根本不发命令。
+        state.repin(7, "en7", &stopped, &pinned, || Ok(())).unwrap();
+        assert_eq!(state.generation.load(Ordering::SeqCst), 3);
+        stopped.store(true, Ordering::SeqCst);
+        assert!(state.repin(6, "en0", &stopped, &pinned, || panic!("停止后不能再碰socket")).is_err());
+        assert_eq!(state.generation.load(Ordering::SeqCst), 3);
+    }
+
+    #[test]
+    fn old_binding_round_cannot_publish_or_leak_through_fallback_token() {
+        let (log, rx) = log_sink();
+        let (ctx, dir) = token_ctx(false, Some("0.0.0.0:42650".parse().unwrap()), Some([7; 32]), log, &rx);
+        let round = ObservationRound::snapshot(&ctx);
+        let old = "8.8.8.8:49999".to_owned();
+        {
+            let mut inner = ctx.inner.lock().unwrap();
+            inner.quic_pub = Some(old.parse().unwrap());
+            inner.last_published = vec![old.clone()];
+        }
+        ctx.publication.lock().unwrap().generation.fetch_add(1, Ordering::SeqCst);
+        let (sender, receiver) = mpsc::channel();
+        assert!(!publish_endpoints(&ctx, &sender, vec![old.clone()], false, &round));
+        assert!(!dir.join("cache/public_endpoint.txt").exists());
+        assert!(receiver.try_recv().is_err());
+        assert!(ctx.st.last_token().unwrap().is_none());
+        print_client_token(&ctx, std::slice::from_ref(&old));
+        let token = ctx.st.last_token().unwrap().unwrap();
+        assert!(!token.endpoints.iter().any(|endpoint| endpoint.addr == old));
+        assert!(token.rpk.is_some(), "换卡不能让其余token结构消失");
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn none_binding_still_publishes_explicit_public_endpoint() {
+        let (log, rx) = log_sink();
+        let (mut ctx, dir) = token_ctx(true, Some("0.0.0.0:42650".parse().unwrap()), Some([7; 32]), log, &rx);
+        Arc::get_mut(&mut ctx).unwrap().cfg.public_endpoint = "8.8.4.4:42650".into();
+        let (sender, _receiver) = mpsc::channel();
+        assert!(refresh_public_endpoint(&ctx, &sender));
+        assert!(rx.try_iter().any(|line| line.contains("不枚举其它网卡")));
+        assert!(ctx.st.last_token().unwrap().unwrap().endpoints.iter().any(|endpoint| endpoint.addr == "8.8.4.4:42650"));
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
@@ -3194,7 +3381,7 @@ mod tests {
                         };
                         reply.send(Some(answer.parse().unwrap())).unwrap();
                     }
-                    EngineCmd::SetProbeEndpoints(_) => break,
+                    EngineCmd::SetProbeEndpoints { .. } => break,
                     _ => {}
                 }
             }
@@ -3205,7 +3392,8 @@ mod tests {
             &cmd_tx,
             Instant::now() + Duration::from_secs(2),
             49999,
-            None
+            None,
+            &ObservationRound::snapshot(&ctx),
         ));
         let queries = worker.join().unwrap();
         assert!(rx.try_iter().any(|line| line.contains("地址族不符——换下一个候选")));

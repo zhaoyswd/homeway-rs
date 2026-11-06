@@ -288,7 +288,7 @@ v6 路径）+ Rust 统一进程出口 42680（upnp=true 同号映射成立 ⇒ v
   ②仅当「枚举完整且快照明确属于我们」才允许 718 时先删后加（幂等重建）；fail-open 与「表说空闲
   但路由器报 718」改为**让位下一候选、不删既有映射**（Go 会强删）⇒ fail-open 轮里 `prefer` 端口
   续不上时会**换外部端口**（登记为已知漂移，Go 是"删了再加回同一口"）；③缩租改「先 add(300) →
-  718 才 delete + add(300)」（加不回去时原映射仍在）；④候选去重（Go `tried` 同义）。**残余**：
+  718 才 delete + add(300)」（此历史缩租口径已由2026-11-06条的“只Add300、不删除原规则”取代）；④候选去重（Go `tried` 同义）。**残余**：
   路由器若**静默覆盖**同名映射（不回 718），"先加"仍会顶掉别人的（Go 先删同样如此）。
 - **【Q-E 批，2026-10-08】UPnP 期限穿透与全局预算（F10，行为差异）**：`ssdp_location`/`discover_igd`
   收 `deadline`（内部取 `min(deadline, 5s)`；每轮 recv 超时与 sleep 均按剩余夹取）；公网端点路径的
@@ -597,6 +597,43 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
   `docs/DEPLOY-RUST-EXIT.md` 同理：§0–§11 不动，**新增 §12**（v0.3.0 切换手册/实录位）为现行口径面。
 
 ## 判据变更记录（政策 + 登记表）
+
+### 2026-11-06：UPnP 控制来源与运行期 QUIC 绑定一致
+
+- 条目 **E-q4 / E20 / UPnP 来源**：从独立枚举所有物理 IPv4、HTTP 默认选源，改为
+  仅取 QUIC 实际成功绑定接口的实时 RFC1918 IPv4（排序去重），显式 IPv4 只取自身；
+  SSDP、描述 GET、查询、Add/Delete、WAN 查询及退租共用所选本地源/接口。
+  HTTP `Host` 与 SSDP 来源钉定主机名边界保持；IPv4 来源不回退 AAAA/未绑定连接。
+  原因：双网卡时 HTTP 源与 InternalClient 不一致可触发 Q7 402，映射目标与 QUIC
+  实际绑卡不一致也不能据 nonce 应答宣称 QUIC 成功。影响面仅出口自动公网映射/发布。
+- 从 none/unbound/QUIC pin 失败仍枚举其它卡，收紧为不自动映射，新增失败原因
+  `QUIC 未绑定可用物理 IPv4 来源：none/未钉卡/纯 IPv6/接口地址不可用；不枚举其它网卡`。
+  本地源 bind 与接口 pin 分别类型化报错；TCP pin 失败明确不按默认路由重试。
+  Linux 无权限 pin 时自动映射不可用；显式 public-endpoint、LAN、relay/token 格式保持。
+- E-q4 成功行从映射建立后立即宣称“公布”改为
+  `UPnP：QUIC 端口 %d 映射 外部 UDP %d → %s:%d（公网地址 %s；待同轮证据合流公布）`。
+  WAN 查询复用原 IGD；`quic_pub`、cache、probe 与 token 在融合成功后同门提交，
+  换卡世代/实时来源已变化的旧轮不得发布，停止隔离保持。
+- 条目 **UPnP 缩租**：从退出重新枚举候选并按前缀认领，改为保存建规则请求的原 IGD/
+  来源/内口/已知外口收据；迟到响应、旧接口及永久租期记录不被新卡覆盖。完整表中仅
+  精确 UDP/client/internal/description/已知 external 匹配才缩租；AddAny 外口回应未知时
+  仍必须精确同 client/internal/description。无收据新增
+  `UPnP：缩租跳过——本实例没有建映射收据，不认领其它接口/实例的映射`。
+- 缩租从 `Add300 → 718 时 Delete+Add300` 改为只尝试 `Add300`；冲突保持原规则，
+  避免删掉唯一映射后加不回来。失败行更正为
+  `UPnP：缩租失败（外部 %d：%v）——未删除原映射，原租期保持（永久规则仍需人工清理）`。
+  所有收据共享原 **8s** 总预算；发现/映射/WAN 仍共享 **40s**，connect 仍最多 **3s**，
+  HTTP 读写取消轮询/体积限制、wire/token 字节与其他行为常量均不变。
+- 同批代码门整改：AddAny每次SOAP请求分别Pending，成功ReservedPort收窄该请求到Known，
+  明确SOAP Fault移除Pending；无回应/缺外口仅保留该未解决请求为Unknown，不能因一次正常
+  AddAny成功永远放宽已知外口核验。分类/缩租共用IPv4与v4-mapped客户端归一化。
+- 初始QUIC pin成功时看护带初始卡/指纹，稳定首拍不重复重钉、不无故增代或清probe；
+  初始pin失败仍首拍重试。HTTP写前复核世代，读写沿原50ms取消轮询同时观察世代，换卡
+  不再等待旧SOAP耗尽40s。GET/SOAP/发现错误保留typed source链，预算常量不变。
+- E20融合日志从把UPnP外口与监听口相比较，改为打印实际参与分支比较的STUN外口与
+  UPnP外口（附监听口），形态 `公网端点：STUN 外口 %d ≠ UPnP 外口 %d（监听口 %d），
+  用 STUN 的 IP + UPnP 的外口公布`；原因是私有auto真机观测24584/43553时旧句误打印
+  `43553 ≠ 43553`，实际融合及QUIC建连正确。本项仅纠正日志，融合逻辑/常量保持。
 
 ### 2026-11-04：serve / relay start 显示 token
 

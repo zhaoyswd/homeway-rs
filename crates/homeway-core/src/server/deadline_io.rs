@@ -1,6 +1,6 @@
 use std::io::{Read, Write};
 use std::net::TcpStream;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 /// rustls 会在一次 complete_io 内部多次读写；期限必须放在 TCP 这一层。
@@ -9,6 +9,7 @@ pub(crate) struct DeadlineStream<'a> {
     tcp: TcpStream,
     deadline: Instant,
     stop: &'a AtomicBool,
+    generation: Option<(&'a AtomicU64, u64)>,
 }
 
 impl<'a> DeadlineStream<'a> {
@@ -17,11 +18,19 @@ impl<'a> DeadlineStream<'a> {
             tcp,
             deadline,
             stop,
+            generation: None,
         }
     }
 
+    pub(crate) fn with_generation(mut self, current: &'a AtomicU64, expected: u64) -> Self {
+        self.generation = Some((current, expected));
+        self
+    }
+
     fn remaining(&self) -> std::io::Result<Duration> {
-        if self.stop.load(Ordering::Acquire) {
+        if self.stop.load(Ordering::Acquire)
+            || self.generation.is_some_and(|(current, expected)| current.load(Ordering::Acquire) != expected)
+        {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::ConnectionAborted,
                 "网络观察查询已停止",

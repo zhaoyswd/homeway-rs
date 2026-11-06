@@ -7,15 +7,13 @@
 //! 需要的只有两件事：SSDP 找到 IGD、AddPortMapping 把 UDP 端口映射出去；失败要明确
 //! 打日志让人知道该去路由器上手动转发。
 //!
-//! ⚠️ **不可本地测登记（R3）**：SSDP 组播（M-SEARCH → 239.255.255.250:1900）在本地
-//! 测试机上被 macOS 本地网络隐私静默拒（与现役出口 launchd 形态同款已知问题——
-//! tier AGENTS「三台出口」节登记的 M-SEARCH no route to host）⇒ **真实网关判据不可
-//! 本地采**。本模块的单测覆盖：SSDP 报文形状（字符串断言）、SOAP 生命周期
-//! （本地 mock IGD——HTTP 面）、所有权分类与端口选择（内存面）。
+//! 回环 mock 只验证HTTP/SOAP来源和生命周期；真实SSDP/IGD与完整QUIC仍需私有实例
+//! 验收。2026-11-06同件LaunchAgent已澄清权限归属，不能把历史SSH裸进程的组播失败
+//! 泛化为所有macOS正式启动都不可用；证据见 docs/reviews/2026-11-06-lan84-upnp.md。
 
 use std::io::{Read, Write};
 use std::net::{IpAddr, Ipv4Addr, SocketAddrV4, TcpStream, UdpSocket};
-use std::sync::{Arc, atomic::{AtomicBool, Ordering}};
+use std::sync::{Arc, atomic::{AtomicBool, AtomicU64, Ordering}};
 use std::time::Duration;
 
 use super::egress::{interfaces, is_virtual_iface};
@@ -47,6 +45,19 @@ const HTTP_MAX_HEADER: usize = 64 << 10;
 const CANCEL_POLL: Duration = Duration::from_millis(50);
 static NEVER_STOP: AtomicBool = AtomicBool::new(false);
 
+/// 本地控制连接的来源；与远端 SSDP hostname_addr 分开，不能让默认路由重选。
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct LocalSource {
+    pub(crate) ip: Ipv4Addr,
+    pub(crate) iface: Option<(u32, String)>,
+}
+
+impl LocalSource {
+    fn for_ip(ip: Ipv4Addr) -> Self {
+        Self { ip, iface: interfaces().into_iter().find(|i| i.addrs.contains(&ip)).map(|i| (i.index, i.name)) }
+    }
+}
+
 /// 同一次发现、描述文件与 SOAP 共用期限/取消；主机名按已验证 SSDP 来源直连，
 /// 保留 HTTP Host，避免不可取消的系统 DNS 把停机等待拖成无界。
 #[derive(Clone)]
@@ -55,22 +66,32 @@ struct UpnpContext {
     cancelled: Option<Arc<AtomicBool>>,
     hostname_addr: Option<Ipv4Addr>,
     hostname: Option<String>,
+    local_source: Option<LocalSource>,
+    generation: Option<(Arc<AtomicU64>, u64)>,
 }
 
 impl UpnpContext {
     fn new(deadline: std::time::Instant) -> Self {
-        Self { deadline, cancelled: None, hostname_addr: None, hostname: None }
+        Self { deadline, cancelled: None, hostname_addr: None, hostname: None, local_source: None, generation: None }
     }
 
     fn stop(&self) -> &AtomicBool { self.cancelled.as_deref().unwrap_or(&NEVER_STOP) }
 
     fn check_cancelled(&self) -> Result<(), UpnpError> {
-        if self.stop().load(Ordering::SeqCst) { Err(UpnpError::Cancelled) } else { Ok(()) }
+        if self.stop().load(Ordering::SeqCst) { return Err(UpnpError::Cancelled); }
+        if self.generation.as_ref().is_some_and(|(current, expected)| current.load(Ordering::SeqCst) != *expected) {
+            return Err(UpnpError::BindingChanged);
+        }
+        Ok(())
     }
 
     fn check(&self) -> Result<(), UpnpError> {
         self.check_cancelled()?;
         if std::time::Instant::now() >= self.deadline { Err(UpnpError::BudgetExhausted) } else { Ok(()) }
+    }
+
+    fn io_error(&self, error: std::io::Error) -> UpnpError {
+        self.check_cancelled().err().unwrap_or(UpnpError::Io(error))
     }
 
     fn pause(&self, duration: Duration) -> Result<(), UpnpError> {
@@ -99,16 +120,16 @@ pub enum UpnpError {
     NoIgdResponse(String),
     /// 描述文件拉取失败（附底层错误串）。
     #[error("取描述文件: {0}")]
-    DescFetch(String),
+    DescFetch(#[source] Box<UpnpError>),
     /// 描述文件里没有 WAN 连接服务。
     #[error("描述文件里没有 WANIPConnection/WANPPPConnection 服务")]
     NoWanService,
     /// SOAP 调用失败（action + 底层错误串——保留 body 上下文）。
-    #[error("{action}: {msg}")]
-    Soap { action: String, msg: String },
+    #[error("{action}: {source}")]
+    Soap { action: String, #[source] source: Box<UpnpError> },
     /// 候选本机地址全都没找到 IGD。
     #[error("没有可用的 IGD（候选 {candidates:?}）：{last}")]
-    NoIgd { candidates: String, last: String },
+    NoIgd { candidates: String, #[source] last: Box<UpnpError> },
     /// 路由器返回空的外部地址。
     #[error("路由器返回空的外部地址")]
     EmptyExternalIp,
@@ -131,6 +152,16 @@ pub enum UpnpError {
     Cancelled,
     #[error("UPnP 主机名 {0:?} 没有可用地址")]
     UnresolvedHost(String),
+    #[error("QUIC 绑定已变化，本轮 UPnP 结果作废")]
+    BindingChanged,
+    #[error("UPnP 本地源 {ip} 绑定失败: {source}")]
+    SourceBind { ip: Ipv4Addr, #[source] source: std::io::Error },
+    #[error("UPnP 接口 {name} 钉卡失败（不按默认路由重试）: {source}")]
+    IfacePin { name: String, #[source] source: std::io::Error },
+    #[error("UPnP InternalClient {client} 与本地源 {source_ip} 不一致")]
+    SourceMismatch { client: Ipv4Addr, source_ip: Ipv4Addr },
+    #[error("应答缺 NewReservedPort（或为 0）—— 按失败处理（假成功判定）")]
+    MissingReservedPort,
 }
 
 /// M-SEARCH 报文（形状真源——ssdpLocation；`MX: 2` 不变——设备允许 2s 内随机延迟
@@ -183,11 +214,7 @@ pub fn classify_mapping(m: &UpnpMapping, desc_prefix: &str, client: Ipv4Addr, li
     // 有些路由器把 NewInternalClient 报成主机名/空/带端口：归属不明——调用方不得
     // 当 foreign 让位（否则自己的映射每轮 +1 漂移到让尽），也不得当 ours 误删别人的。
     // ::ffff:a.b.c.d 的 v4-mapped 形态按其 v4 本值判（Go `Unmap()` 同义，评审 M10）。
-    let parsed: Option<Ipv4Addr> = m
-        .internal_client
-        .parse::<Ipv4Addr>()
-        .ok()
-        .or_else(|| m.internal_client.parse::<std::net::Ipv6Addr>().ok().and_then(|v6| v6.to_ipv4_mapped()));
+    let parsed = parse_internal_client(&m.internal_client);
     let Some(c) = parsed else {
         return MappingOwner::Unknown;
     };
@@ -198,6 +225,10 @@ pub fn classify_mapping(m: &UpnpMapping, desc_prefix: &str, client: Ipv4Addr, li
         return MappingOwner::LiveSibling;
     }
     MappingOwner::Ours
+}
+
+fn parse_internal_client(value: &str) -> Option<Ipv4Addr> {
+    value.parse().ok().or_else(|| value.parse::<std::net::Ipv6Addr>().ok().and_then(|v6| v6.to_ipv4_mapped()))
 }
 
 /// 这台机器的这个 UDP 端口现在有人监听吗（区分「自己的陈旧映射」与「同机另一活
@@ -236,9 +267,17 @@ fn pin_multicast_with(
     logf: Option<&dyn Fn(&str)>,
     pin: &dyn Fn(crate::sysock::RawSock, u32, &str) -> std::io::Result<()>,
 ) -> Result<(), UpnpError> {
-    let ifi = crate::server::egress::interfaces()
-        .into_iter()
-        .find(|i| i.addrs.contains(&local_ip));
+    let source = LocalSource::for_ip(local_ip);
+    pin_multicast_on(conn, &source, logf, pin)
+}
+
+fn pin_multicast_on(
+    conn: &UdpSocket,
+    source: &LocalSource,
+    logf: Option<&dyn Fn(&str)>,
+    pin: &dyn Fn(crate::sysock::RawSock, u32, &str) -> std::io::Result<()>,
+) -> Result<(), UpnpError> {
+    let local_ip = source.ip;
     let fd = crate::sysock::udp_raw(conn);
     // ① IP_MULTICAST_IF：值 = 本地接口地址（struct in_addr，网络序）
     crate::sysock::setsockopt_u32(
@@ -257,12 +296,12 @@ fn pin_multicast_with(
     )
     .map_err(UpnpError::Io)?;
     // ③ 钉卡（网卡在系统表里找得到才钉——Go ifaceForIP 同义找不到就跳过；F4-4 降级）
-    if let Some(ifi) = ifi {
-        if let Err(e) = pin(fd, ifi.index, &ifi.name) {
+    if let Some((index, name)) = &source.iface {
+        if let Err(e) = pin(fd, *index, name) {
             if let Some(l) = logf {
                 l(&format!(
                     "UPnP：SSDP socket 钉卡 {} 失败（{e}）—— 发送已由 IP_MULTICAST_IF 钉在 {}，但接收可能被默认路由/TUN 抢走（组播应答收不到），继续尝试",
-                    ifi.name, ifi.name
+                    name, name
                 ));
             }
         }
@@ -360,7 +399,10 @@ fn ssdp_location_context(
     // 同款已知问题）：单测只证 setsockopt 调用成功，真机判据留 R7（登记进
     // INTEROP-CRITERIA）。
     if let Some(ip) = local_ip {
-        pin_multicast(&conn, ip, logf)?;
+        match &context.local_source {
+            Some(source) => pin_multicast_on(&conn, source, logf, &super::egress::pin_socket_to_iface)?,
+            None => pin_multicast(&conn, ip, logf)?,
+        }
     }
     conn.set_read_timeout(Some(Duration::from_millis(1200)))?;
     // F4-1：每轮固定三发（IGD:1 → IGD:2 → rootdevice），同一 socket
@@ -502,6 +544,9 @@ fn http_call_context(
     context.check()?;
     let tcp = connect_within(&host, port, context)?;
     let mut stream = super::deadline_io::DeadlineStream::new(tcp, deadline, context.stop());
+    if let Some((current, expected)) = &context.generation {
+        stream = stream.with_generation(current, *expected);
+    }
     let mut req = format!("{method} {path} HTTP/1.1\r\nHOST: {host}:{port}\r\n");
     req.push_str("Connection: close\r\nUser-Agent: homeway/upnp\r\nAccept-Encoding: identity\r\n");
     if let Some(ct) = content_type {
@@ -513,7 +558,8 @@ fn http_call_context(
     let body_bytes = body.unwrap_or("");
     req.push_str(&format!("Content-Length: {}\r\n\r\n", body_bytes.len()));
     req.push_str(body_bytes);
-    stream.write_all(req.as_bytes())?;
+    context.check()?;
+    stream.write_all(req.as_bytes()).map_err(|error| context.io_error(error))?;
     // 成环读（8KB 复用缓冲）：每轮按剩余重设读超时 + 体积闸（滴流防护 + 有界内存）
     let mut resp: Vec<u8> = Vec::new();
     let mut hdr_end: Option<usize> = None;
@@ -558,9 +604,10 @@ fn http_call_context(
                     }
                 }
             }
-            Err(e) => return Err(UpnpError::Io(e)),
+            Err(error) => return Err(context.io_error(error)),
         }
     }
+    context.check()?;
     let text = String::from_utf8_lossy(&resp).into_owned();
     if let (Some(he), Some(d)) = (hdr_end, declared) {
         let got = resp.len().saturating_sub(he);
@@ -601,15 +648,40 @@ fn connect_within(host: &str, port: u16, context: &UpnpContext) -> Result<TcpStr
     };
     let mut last = None;
     for ip in addresses {
+        if context.local_source.is_some() && !ip.is_ipv4() { continue; }
         context.check()?;
         let remain = deadline.saturating_duration_since(std::time::Instant::now());
         if remain.is_zero() { return Err(UpnpError::BudgetExhausted); }
-        match TcpStream::connect_timeout(&std::net::SocketAddr::new(ip, port), remain) {
+        match connect_from_source(ip, port, remain, context.local_source.as_ref(), &super::egress::pin_socket_to_iface) {
             Ok(tcp) => { context.check()?; return Ok(tcp); }
             Err(error) => last = Some(error),
         }
     }
-    match last { Some(error) => Err(UpnpError::Io(error)), None => Err(UpnpError::UnresolvedHost(host.to_owned())) }
+    match last { Some(error) => Err(error), None => Err(UpnpError::UnresolvedHost(host.to_owned())) }
+}
+
+fn connect_from_source(
+    remote: IpAddr,
+    port: u16,
+    timeout: Duration,
+    source: Option<&LocalSource>,
+    pin: &dyn Fn(crate::sysock::RawSock, u32, &str) -> std::io::Result<()>,
+) -> Result<TcpStream, UpnpError> {
+    let domain = if remote.is_ipv4() { socket2::Domain::IPV4 } else { socket2::Domain::IPV6 };
+    let socket = socket2::Socket::new(domain, socket2::Type::STREAM, Some(socket2::Protocol::TCP))?;
+    if let Some(source) = source {
+        socket.bind(&std::net::SocketAddr::from((source.ip, 0)).into())
+            .map_err(|error| UpnpError::SourceBind { ip: source.ip, source: error })?;
+        if let Some((index, name)) = &source.iface {
+            #[cfg(unix)]
+            let raw = std::os::fd::AsRawFd::as_raw_fd(&socket);
+            #[cfg(windows)]
+            let raw = std::os::windows::io::AsRawSocket::as_raw_socket(&socket);
+            pin(raw, *index, name).map_err(|error| UpnpError::IfacePin { name: name.clone(), source: error })?;
+        }
+    }
+    socket.connect_timeout(&std::net::SocketAddr::new(remote, port).into(), timeout)?;
+    Ok(socket.into())
 }
 
 /// `http://host[:port]/path` 解析（pub = fuzz 可达面——LOCATION 头的自由文本面）。
@@ -690,7 +762,8 @@ pub(crate) fn discover_igd_with(
     discover_igd_context(local_ip, UpnpContext::new(deadline), logf)
 }
 
-pub(crate) fn discover_igd_cancellable(
+#[cfg(test)]
+fn discover_igd_cancellable(
     local_ip: Ipv4Addr,
     deadline: std::time::Instant,
     cancelled: Arc<AtomicBool>,
@@ -701,6 +774,7 @@ pub(crate) fn discover_igd_cancellable(
 }
 
 fn discover_igd_context(local_ip: Ipv4Addr, mut context: UpnpContext, logf: Option<&dyn Fn(&str)>) -> Result<Igd, UpnpError> {
+    if context.local_source.is_none() { context.local_source = Some(LocalSource::for_ip(local_ip)); }
     let (loc, source) = ssdp_location_context(Some(local_ip), &context, logf)?;
     context.hostname_addr = Some(source);
     context.hostname = Some(parse_http_url(&loc)?.0);
@@ -718,7 +792,7 @@ fn igd_from_location_deadline(loc: &str, deadline: std::time::Instant) -> Result
 
 fn igd_from_location_context(loc: &str, context: UpnpContext) -> Result<Igd, UpnpError> {
     let body = http_call_context(loc, "GET", None, None, None, &context, HTTP_MAX_DESC)
-        .map_err(|e| UpnpError::DescFetch(e.to_string()))?;
+        .map_err(|error| UpnpError::DescFetch(Box::new(error)))?;
     let mut gateway = find_wan_service(&body, loc, context.deadline).ok_or(UpnpError::NoWanService)?;
     gateway.context = context;
     Ok(gateway)
@@ -755,7 +829,7 @@ impl Igd {
         .map_err(|e| {
             // 保留 body 上下文（list_mappings 的「到表尾」判定要读 713 形态——Display
             // 链 "{action}: {source}" 与原 format! 同串）
-            UpnpError::Soap { action: action.to_owned(), msg: e.to_string() }
+            UpnpError::Soap { action: action.to_owned(), source: Box::new(e) }
         })
     }
 
@@ -808,6 +882,7 @@ impl Igd {
     }
 
     fn add_with_lease(&self, external_port: u16, internal_ip: Ipv4Addr, internal_port: u16, lease: u32) -> Result<(), UpnpError> {
+        self.check_internal_client(internal_ip)?;
         self.soap(
             "AddPortMapping",
             &[
@@ -831,6 +906,7 @@ impl Igd {
     /// 才不形同虚设）。SOAP 形态与 `add_with_lease` 同序同 case，发往同一个已发现的
     /// WAN 控制 URL、service_type 取自**发现结果**（若发现的是 `WANIPConnection:1`
     /// 而设备不支持本动作，路由器回 401/500 ⇒ 判失败）。
+    #[cfg(test)]
     fn add_any_port_mapping(
         &self,
         want: u16,
@@ -838,9 +914,20 @@ impl Igd {
         internal_port: u16,
         logf: &dyn Fn(&str),
     ) -> Result<u16, UpnpError> {
-        match self.try_add_any_port_mapping(want, internal_ip, internal_port, 3600) {
+        self.add_any_port_mapping_recorded(want, internal_ip, internal_port, logf, &|_| {})
+    }
+
+    fn add_any_port_mapping_recorded(
+        &self,
+        want: u16,
+        internal_ip: Ipv4Addr,
+        internal_port: u16,
+        logf: &dyn Fn(&str),
+        record: &dyn Fn(MappingAttempt),
+    ) -> Result<u16, UpnpError> {
+        match self.try_add_any_port_mapping(want, internal_ip, internal_port, 3600, record) {
             Ok(ext) => Ok(ext),
-            Err(first) => match self.try_add_any_port_mapping(want, internal_ip, internal_port, 0) {
+            Err(first) => match self.try_add_any_port_mapping(want, internal_ip, internal_port, 0, record) {
                 Ok(ext) => {
                     logf(&format!(
                         "UPnP：路由器不接受 AddAnyPortMapping 的 1 小时租期（{first}），已按**永久（0）**重试并成功"
@@ -858,7 +945,11 @@ impl Igd {
         internal_ip: Ipv4Addr,
         internal_port: u16,
         lease: u32,
+        record: &dyn Fn(MappingAttempt),
     ) -> Result<u16, UpnpError> {
+        self.check_internal_client(internal_ip)?;
+        self.context.check()?;
+        record(MappingAttempt::AnyPending);
         let body = self.soap(
             "AddAnyPortMapping",
             &[
@@ -871,13 +962,13 @@ impl Igd {
                 ("NewPortMappingDescription", UPNP_MAP_DESC.to_owned()),
                 ("NewLeaseDuration", lease.to_string()),
             ],
-        )?;
+        ).inspect_err(|error| {
+            // 明确SOAP Fault表示路由器拒绝；超时/取消/200缺外口仍可能已建规则。
+            if xml_tag(&error.to_string(), "errorCode").is_some() { record(MappingAttempt::AnyRejected); }
+        })?;
         match xml_tag(&body, "NewReservedPort").and_then(|v| v.trim().parse::<u16>().ok()) {
-            Some(p) if p != 0 => Ok(p),
-            _ => Err(UpnpError::Soap {
-                action: "AddAnyPortMapping".to_owned(),
-                msg: "应答缺 NewReservedPort（或为 0）—— 按失败处理（假成功判定）".to_owned(),
-            }),
+            Some(port) if port != 0 => { record(MappingAttempt::AnyKnown(port)); Ok(port) }
+            _ => Err(UpnpError::Soap { action: "AddAnyPortMapping".to_owned(), source: Box::new(UpnpError::MissingReservedPort) }),
         }
     }
 
@@ -1003,17 +1094,96 @@ impl Igd {
     }
 
     /// 用很短的租期重建同一条映射（退出时缩租——快速重启能沿用同一个公网端口，
-    /// 出口真退休了映射自动过期）。F9：**先 add(lease) → 718 才 delete + add(lease)**
-    /// ——调用方已核验该映射属于我们（`allow_evict = true`）；加不回去时原映射仍在。
+    /// 出口真退休了映射自动过期）。只尝试 add；冲突时保留原规则，不能为缩租删掉
+    /// 唯一可用映射后又加不回来。
     pub fn re_add_short_lease(&self, ext_port: u16, internal_ip: Ipv4Addr, internal_port: u16, lease: u32) -> Result<(), UpnpError> {
-        match self.add_with_lease(ext_port, internal_ip, internal_port, lease) {
-            Ok(()) => Ok(()),
-            Err(e) if is_conflict(&e) => {
-                let _ = self.delete_mapping(ext_port, "UDP");
-                self.add_with_lease(ext_port, internal_ip, internal_port, lease)
-            }
-            Err(e) => Err(e),
+        self.add_with_lease(ext_port, internal_ip, internal_port, lease)
+    }
+
+    fn check_internal_client(&self, client: Ipv4Addr) -> Result<(), UpnpError> {
+        if let Some(source) = &self.context.local_source {
+            if client != source.ip { return Err(UpnpError::SourceMismatch { client, source_ip: source.ip }); }
         }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) enum MappingAttempt {
+    Requested(u16),
+    AnyPending,
+    AnyKnown(u16),
+    AnyRejected,
+}
+
+/// 发出建映射请求前即保存；AddAny每次请求分别Pending，已知回应收窄该请求，
+/// 明确Fault移除Pending；未解决请求在收工时为Unknown，不丢早先未知的永久规则。
+#[derive(Clone)]
+pub(crate) struct MappingLease {
+    gateway: Igd,
+    external_ports: Vec<u16>,
+    pending_any: usize,
+    internal_port: u16,
+}
+
+impl MappingLease {
+    pub(crate) fn empty(gateway: &Igd, internal_port: u16) -> Self {
+        Self { gateway: gateway.clone(), external_ports: Vec::new(), pending_any: 0, internal_port }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn new(gateway: &Igd, external_port: Option<u16>, internal_port: u16) -> Self {
+        let mut lease = Self::empty(gateway, internal_port);
+        lease.record(external_port.map_or(MappingAttempt::AnyPending, MappingAttempt::Requested));
+        lease
+    }
+
+    #[cfg(test)]
+    pub(crate) fn same_scope(&self, other: &Self) -> bool {
+        self.matches(&other.gateway, other.internal_port)
+    }
+
+    pub(crate) fn matches(&self, gateway: &Igd, internal_port: u16) -> bool {
+        self.internal_port == internal_port && self.gateway.control_url == gateway.control_url
+            && self.gateway.service_type == gateway.service_type
+            && self.gateway.context.local_source == gateway.context.local_source
+            && self.gateway.context.hostname_addr == gateway.context.hostname_addr
+    }
+
+    pub(crate) fn record(&mut self, attempt: MappingAttempt) {
+        let known = match attempt {
+            MappingAttempt::Requested(port) => Some(port),
+            MappingAttempt::AnyPending => { self.pending_any += 1; None }
+            MappingAttempt::AnyKnown(port) => { self.pending_any = self.pending_any.saturating_sub(1); Some(port) }
+            MappingAttempt::AnyRejected => { self.pending_any = self.pending_any.saturating_sub(1); None }
+        };
+        if let Some(port) = known {
+            if !self.external_ports.contains(&port) { self.external_ports.push(port); }
+        }
+    }
+
+    pub(crate) fn shrink_before(&self, deadline: std::time::Instant) -> Vec<ShrinkOutcome> {
+        let mut gateway = self.gateway.clone();
+        gateway.context.deadline = deadline;
+        gateway.context.cancelled = None;
+        gateway.context.generation = None;
+        let Some(source) = &gateway.context.local_source else { return vec![ShrinkOutcome::NoMapping]; };
+        let table = gateway.list_mappings();
+        if !table.complete { return vec![ShrinkOutcome::TableIncomplete]; }
+        let mut outcomes = Vec::new();
+        for mapping in table.list {
+            if (self.pending_any == 0 && !self.external_ports.contains(&mapping.external_port))
+                || mapping.protocol != "UDP" || mapping.internal_port != self.internal_port
+                || parse_internal_client(&mapping.internal_client) != Some(source.ip)
+                || mapping.description != UPNP_MAP_DESC { continue; }
+            let ext = mapping.external_port;
+            outcomes.push(match gateway.re_add_short_lease(ext, source.ip, self.internal_port, 300) {
+                Ok(()) => ShrinkOutcome::Shrunk { ext },
+                Err(err) => ShrinkOutcome::Failed { ext, err },
+            });
+        }
+        if outcomes.is_empty() { outcomes.push(ShrinkOutcome::NoMapping); }
+        outcomes
     }
 }
 
@@ -1061,18 +1231,15 @@ pub(crate) fn pick_igd_before<F>(cands: &[Ipv4Addr], deadline: std::time::Instan
 where
     F: Fn(Ipv4Addr, std::time::Instant) -> Result<Igd, UpnpError>,
 {
-    let mut last_err = String::new();
+    let mut last = UpnpError::NoIgdResponse(String::new());
     for cand in cands {
-        if std::time::Instant::now() >= deadline {
-            last_err = "总预算耗尽".to_owned();
-            break;
-        }
+        if std::time::Instant::now() >= deadline { last = UpnpError::BudgetExhausted; break; }
         match discover(*cand, deadline) {
-            Ok(g) => return Ok((g, *cand)),
-            Err(e) => last_err = e.to_string(),
+            Ok(gateway) => return Ok((gateway, *cand)),
+            Err(error) => last = error,
         }
     }
-    Err(UpnpError::NoIgd { candidates: format!("{cands:?}"), last: last_err })
+    Err(UpnpError::NoIgd { candidates: format!("{cands:?}"), last: Box::new(last) })
 }
 
 /// 退出缩租的结果（F10：显式返回 ⇒ engine 侧按结果打 additive 日志，静默跳过变可见）。
@@ -1130,24 +1297,33 @@ pub fn ensure_port_mapping(
 }
 
 /// 出口观测专用：发现、描述、SOAP 全程共享取消位；不改变公开非取消入口。
+#[allow(clippy::too_many_arguments)] // 一轮观测的日志/期限/取消/世代/收据，均为显式借用依赖。
 pub(crate) fn ensure_port_mapping_cancellable(
-    candidates: &[Ipv4Addr],
+    candidates: &[LocalSource],
     internal_port: u16,
     logf: &dyn Fn(&str),
     dlogf: &dyn Fn(&str),
     deadline: std::time::Instant,
     cancelled: Arc<AtomicBool>,
-) -> Result<(u16, Ipv4Addr), UpnpError> {
+    generation: (Arc<AtomicU64>, u64),
+    record: &dyn Fn(&Igd, MappingAttempt),
+) -> Result<(u16, Ipv4Addr, Igd), UpnpError> {
     let mut context = UpnpContext::new(deadline);
     context.cancelled = Some(cancelled);
+    context.generation = Some(generation);
     let disc = |ip, _| {
         context.check()?;
-        discover_igd_context(ip, context.clone(), Some(logf))
+        let mut selected = context.clone();
+        selected.local_source = candidates.iter().find(|source| source.ip == ip).cloned();
+        discover_igd_context(ip, selected, Some(logf))
     };
-    let (gateway, local_ip) = pick_igd_before(candidates, deadline, disc)?;
+    let ips: Vec<_> = candidates.iter().map(|source| source.ip).collect();
+    let (gateway, local_ip) = pick_igd_before(&ips, deadline, disc)?;
     context.check()?;
-    let ext = mapping_round(&gateway, internal_port, local_ip, logf, dlogf)?;
-    Ok((ext, local_ip))
+    let ext = mapping_round_recorded(&gateway, internal_port, local_ip, logf, dlogf, &|external| {
+        record(&gateway, external);
+    })?;
+    Ok((ext, local_ip, gateway))
 }
 
 /// 一轮的完整动作（F9a：**单一枚举**——快照 → 找我们的（prefer）→ 清旧（跳过 prefer）
@@ -1159,6 +1335,17 @@ fn mapping_round(
     local_ip: Ipv4Addr,
     logf: &dyn Fn(&str),
     dlogf: &dyn Fn(&str),
+) -> Result<u16, UpnpError> {
+    mapping_round_recorded(g, internal_port, local_ip, logf, dlogf, &|_| {})
+}
+
+fn mapping_round_recorded(
+    g: &Igd,
+    internal_port: u16,
+    local_ip: Ipv4Addr,
+    logf: &dyn Fn(&str),
+    dlogf: &dyn Fn(&str),
+    record: &dyn Fn(MappingAttempt),
 ) -> Result<u16, UpnpError> {
     // F9a：一轮只枚举一次（快照）；verify 计算一次并传给 select（fail-open 归因行只打一次）
     let mut table = g.list_mappings();
@@ -1180,7 +1367,7 @@ fn mapping_round(
     if n > 0 {
         dlogf(&format!("UPnP：清掉 {n} 条本机同前缀的旧映射（换端口或上次退出的遗留）"));
     }
-    select_external_port(g, &table, internal_port, prefer, local_ip, verify, logf, dlogf)
+    select_external_port_recorded(g, &table, internal_port, prefer, local_ip, verify, logf, dlogf, record)
 }
 
 /// 候选端口逐个申请（**先加后删** + 所有权门 `allow_evict`；映射表枚举失败/残缺/含
@@ -1200,6 +1387,21 @@ pub fn select_external_port(
     verify: bool,
     logf: &dyn Fn(&str),
     dlogf: &dyn Fn(&str),
+) -> Result<u16, UpnpError> {
+    select_external_port_recorded(g, table, internal_port, prefer, local_ip, verify, logf, dlogf, &|_| {})
+}
+
+#[allow(clippy::too_many_arguments)] // 同上；record 是建映射前的所有权收据，不增加共享锁。
+fn select_external_port_recorded(
+    g: &Igd,
+    table: &MappingTable,
+    internal_port: u16,
+    prefer: u16,
+    local_ip: Ipv4Addr,
+    verify: bool,
+    logf: &dyn Fn(&str),
+    dlogf: &dyn Fn(&str),
+    record: &dyn Fn(MappingAttempt),
 ) -> Result<u16, UpnpError> {
     let taken: std::collections::HashMap<u16, &UpnpMapping> = table
         .list
@@ -1254,6 +1456,8 @@ pub fn select_external_port(
                 }
             }
         }
+        g.context.check()?;
+        record(MappingAttempt::Requested(ext));
         match g.add_port_mapping(ext, local_ip, internal_port, allow_evict, logf) {
             Ok(()) => {
                 if ext == prefer && prefer != internal_port {
@@ -1277,7 +1481,8 @@ pub fn select_external_port(
     }
     // ---- F4-3 末位兜底：显式候选全失败才轮到 AddAnyPortMapping ----
     let want = if prefer != 0 { prefer } else { internal_port };
-    match g.add_any_port_mapping(want, local_ip, internal_port, logf) {
+    g.context.check()?;
+    match g.add_any_port_mapping_recorded(want, local_ip, internal_port, logf, record) {
         Ok(ext) => {
             logf(&format!(
                 "UPnP：显式候选全失败，改用 AddAnyPortMapping 由路由器选端口 {ext} → 内网 {internal_port}"
@@ -1314,6 +1519,94 @@ mod tests {
     use super::*;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    fn read_request(connection: &mut TcpStream) -> String {
+        connection.set_read_timeout(Some(Duration::from_secs(2))).unwrap();
+        let mut bytes = Vec::new();
+        let mut byte = [0];
+        while !bytes.ends_with(b"\r\n\r\n") {
+            connection.read_exact(&mut byte).unwrap();
+            bytes.push(byte[0]);
+        }
+        let head = String::from_utf8(bytes).unwrap();
+        let size = header_value(&head, "Content-Length").unwrap().parse().unwrap();
+        let mut body = vec![0; size];
+        connection.read_exact(&mut body).unwrap();
+        head + std::str::from_utf8(&body).unwrap()
+    }
+
+    fn reply(connection: &mut TcpStream, status: u16, body: &str) {
+        write!(connection, "HTTP/1.1 {status} OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len()).unwrap();
+    }
+
+    /// 默认连回环会选127.0.0.1；明确选另一已分配地址，删掉bind即必然失败。
+    #[test]
+    fn http_and_every_soap_stage_use_selected_source() {
+        let source_ip = if cfg!(target_os = "linux") { Ipv4Addr::new(127, 0, 0, 2) } else {
+            interfaces().into_iter().flat_map(|iface| iface.addrs).find(|ip| ip.is_private())
+                .expect("真实源地址回归需要一个已分配的非环回IPv4；缺失不能记作通过")
+        };
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let server = std::thread::spawn(move || {
+            let actions = ["GET /root.xml", "#AddPortMapping", "#AddPortMapping", "#GetGenericPortMappingEntry", "#GetGenericPortMappingEntry", "#GetExternalIPAddress", "#DeletePortMapping", "#AddPortMapping", "#AddAnyPortMapping"];
+            let mut leases = Vec::new();
+            for (step, action) in actions.iter().enumerate() {
+                let (mut connection, peer) = listener.accept().unwrap();
+                let request = read_request(&mut connection);
+                assert_eq!(peer.ip(), IpAddr::V4(source_ip), "步骤{step}来源错误：{request}");
+                assert!(request.contains(action), "步骤{step}动作错误：{request}");
+                assert!(request.contains(&format!("HOST: gateway.invalid:{port}\r\n")));
+                if let Some(client) = xml_tag(&request, "NewInternalClient") { assert_eq!(client, source_ip.to_string()); }
+                if let Some(lease) = xml_tag(&request, "NewLeaseDuration") { leases.push(lease); }
+                match step {
+                    0 => reply(&mut connection, 200, "<root><service><serviceType>urn:schemas-upnp-org:service:WANIPConnection:1</serviceType><controlURL>/control</controlURL></service></root>"),
+                    1 => reply(&mut connection, 500, "<errorCode>725</errorCode>"),
+                    3 => reply(&mut connection, 200, &format!("<NewExternalPort>42641</NewExternalPort><NewProtocol>UDP</NewProtocol><NewInternalPort>42641</NewInternalPort><NewInternalClient>{source_ip}</NewInternalClient><NewEnabled>1</NewEnabled><NewPortMappingDescription>homeway-exit</NewPortMappingDescription><NewLeaseDuration>0</NewLeaseDuration>")),
+                    4 => reply(&mut connection, 500, "<errorCode>713</errorCode>"),
+                    5 => reply(&mut connection, 200, "<NewExternalIPAddress>8.8.8.8</NewExternalIPAddress>"),
+                    8 => reply(&mut connection, 200, "<NewReservedPort>42642</NewReservedPort>"),
+                    _ => reply(&mut connection, 200, ""),
+                }
+            }
+            assert_eq!(leases, ["3600", "0", "300", "3600"]);
+        });
+        let mut context = UpnpContext::new(std::time::Instant::now() + Duration::from_secs(5));
+        // 真实socket测试源bind，pin的成功/失败契约独立测试，避免要求测试机增加网卡地址。
+        context.local_source = Some(LocalSource { ip: source_ip, iface: None });
+        context.hostname_addr = Some(Ipv4Addr::LOCALHOST);
+        context.hostname = Some("gateway.invalid".to_owned());
+        let gateway = igd_from_location_context(&format!("http://gateway.invalid:{port}/root.xml"), context).unwrap();
+        gateway.add_port_mapping(42641, source_ip, 42641, false, &|_| {}).unwrap();
+        assert!(gateway.list_mappings().complete);
+        assert_eq!(gateway.external_ip().unwrap(), Ipv4Addr::new(8, 8, 8, 8));
+        gateway.delete_mapping(42641, "UDP").unwrap();
+        gateway.re_add_short_lease(42641, source_ip, 42641, 300).unwrap();
+        assert_eq!(gateway.add_any_port_mapping(42641, source_ip, 42641, &|_| {}).unwrap(), 42642);
+        assert!(matches!(gateway.add_with_lease(42641, Ipv4Addr::LOCALHOST, 42641, 300), Err(UpnpError::SourceMismatch { .. })));
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn tcp_source_is_bound_before_pin_and_pin_failure_never_connects() {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let source = LocalSource { ip: Ipv4Addr::LOCALHOST, iface: Some((41, "selected-card".to_owned())) };
+        let called = std::cell::Cell::new(false);
+        let result = connect_from_source(IpAddr::V4(Ipv4Addr::LOCALHOST), listener.local_addr().unwrap().port(), Duration::from_secs(1), Some(&source), &|raw, index, name| {
+            assert_eq!((index, name), (41, "selected-card"));
+            #[cfg(unix)]
+            let borrowed = unsafe { std::os::fd::BorrowedFd::borrow_raw(raw) };
+            #[cfg(windows)]
+            let borrowed = unsafe { std::os::windows::io::BorrowedSocket::borrow_raw(raw) };
+            assert_eq!(socket2::SockRef::from(&borrowed).local_addr().unwrap().as_socket().unwrap().ip(), IpAddr::V4(Ipv4Addr::LOCALHOST));
+            called.set(true);
+            Err(std::io::Error::from(std::io::ErrorKind::PermissionDenied))
+        });
+        assert!(called.get());
+        assert!(matches!(result, Err(UpnpError::IfacePin { .. })));
+        assert_eq!(listener.accept().unwrap_err().kind(), std::io::ErrorKind::WouldBlock);
+    }
 
     /// M-SEARCH 报文形状（SSDP 真网关判据不可本地测——形状钉死 + mock HTTP 生命周期）。
     /// F4-1：每轮三态（IGD:1 / IGD:2 / rootdevice），MX 保持 2。
@@ -1716,7 +2009,7 @@ mod tests {
         context.cancelled = Some(stop);
         let started = std::time::Instant::now();
         let result = http_call_context(&format!("http://127.0.0.1:{port}/"), "GET", None, None, None, &context, HTTP_MAX_DESC);
-        assert!(matches!(result, Err(UpnpError::Io(ref e)) if e.kind() == std::io::ErrorKind::ConnectionAborted));
+        assert!(matches!(result, Err(UpnpError::Cancelled)));
         assert!(started.elapsed() < Duration::from_millis(250));
         server.join().unwrap();
     }
@@ -1806,6 +2099,7 @@ mod tests {
         any_mode: AnyMode,
         any_calls: usize,
         any_leases: Vec<u32>,
+        delay_add: Option<(std::sync::mpsc::SyncSender<()>, std::sync::mpsc::Receiver<()>)>,
     }
 
     /// F4-3 mock：AddAnyPortMapping 四态。
@@ -1837,6 +2131,7 @@ mod tests {
             any_mode: AnyMode::Unsupported,
             any_calls: 0,
             any_leases: Vec::new(),
+            delay_add: None,
         }));
         let st2 = Arc::clone(&st);
         std::thread::spawn(move || {
@@ -1970,7 +2265,12 @@ mod tests {
                     }
                     _ => "HTTP/1.1 200 OK\r\nConnection: close\r\nContent-Length: 0\r\n\r\n".to_owned(),
                 };
+                let delay = if action == "AddPortMapping" { s.delay_add.take() } else { None };
                 drop(s);
+                if let Some((arrived, resume)) = delay {
+                    arrived.send(()).unwrap();
+                    resume.recv_timeout(Duration::from_secs(2)).unwrap();
+                }
                 let _ = c.write_all(resp.as_bytes());
             }
         });
@@ -1991,6 +2291,174 @@ mod tests {
             description: UPNP_MAP_DESC.to_owned(),
             lease_duration: 3600,
         }
+    }
+
+    #[test]
+    fn delayed_add_after_repin_is_rejected_but_original_source_receipt_survives() {
+        let (port, state) = start_mock();
+        let mut gateway = mock_igd(port);
+        let generation = Arc::new(AtomicU64::new(0));
+        gateway.context.local_source = Some(LocalSource { ip: Ipv4Addr::LOCALHOST, iface: None });
+        gateway.context.generation = Some((Arc::clone(&generation), 0));
+        let (arrived, arrived_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume, resume_rx) = std::sync::mpsc::channel();
+        state.lock().unwrap().delay_add = Some((arrived, resume_rx));
+        let (receipt_tx, receipt_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            mapping_round_recorded(&gateway, 42641, Ipv4Addr::LOCALHOST, &|_| {}, &|_| {}, &|external| {
+                let mut receipt = MappingLease::empty(&gateway, 42641);
+                receipt.record(external);
+                receipt_tx.send(receipt).unwrap();
+            })
+        });
+        arrived_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        let receipt = receipt_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        generation.store(1, Ordering::SeqCst);
+        resume.send(()).unwrap();
+        assert!(worker.join().unwrap().is_err(), "旧轮响应不能变成新卡结果");
+        assert_eq!(state.lock().unwrap().entries[0].lease_duration, 3600);
+        let outcomes = receipt.shrink_before(std::time::Instant::now() + Duration::from_secs(2));
+        assert!(matches!(outcomes.as_slice(), [ShrinkOutcome::Shrunk { ext: 42641 }]));
+        assert_eq!(state.lock().unwrap().entries[0].lease_duration, 300);
+    }
+
+    #[test]
+    fn shrink_receipts_require_exact_tuple_and_preserve_other_interfaces_and_instances() {
+        let (port, state) = start_mock();
+        let mut gateway = mock_igd(port);
+        gateway.context.local_source = Some(LocalSource { ip: Ipv4Addr::LOCALHOST, iface: None });
+        let mut prefix_collision = ours(42645, Ipv4Addr::LOCALHOST, 42641);
+        prefix_collision.description.push_str("-other");
+        let other_ip = Ipv4Addr::new(127, 0, 0, 2);
+        state.lock().unwrap().entries = vec![
+            ours(42641, Ipv4Addr::LOCALHOST, 42641),
+            ours(42642, Ipv4Addr::LOCALHOST, 42641),
+            ours(42643, other_ip, 42641),
+            ours(42644, Ipv4Addr::LOCALHOST, 42642),
+            prefix_collision,
+        ];
+        let receipt = MappingLease::new(&gateway, Some(42641), 42641);
+        assert!(matches!(receipt.shrink_before(std::time::Instant::now() + Duration::from_secs(2)).as_slice(), [ShrinkOutcome::Shrunk { ext: 42641 }]));
+        let entries = state.lock().unwrap().entries.clone();
+        assert_eq!(entries.iter().find(|mapping| mapping.external_port == 42641).unwrap().lease_duration, 300);
+        assert!(entries.iter().filter(|mapping| mapping.external_port != 42641).all(|mapping| mapping.lease_duration == 3600));
+        // AddAny 回应未知时可以认领确切client/int/desc，仍不碰另一接口/实例/前缀碰撞。
+        let unknown = MappingLease::new(&gateway, None, 42641);
+        assert_eq!(unknown.shrink_before(std::time::Instant::now() + Duration::from_secs(2)).len(), 2);
+        let mut guard = state.lock().unwrap();
+        assert!(guard.entries.iter().filter(|mapping| mapping.external_port >= 42643).all(|mapping| mapping.lease_duration == 3600));
+        guard.no_tail = true;
+        let adds = guard.add_calls;
+        drop(guard);
+        assert!(matches!(receipt.shrink_before(std::time::Instant::now() + Duration::from_secs(2)).as_slice(), [ShrinkOutcome::TableIncomplete]));
+        assert_eq!(state.lock().unwrap().add_calls, adds);
+    }
+
+    #[test]
+    fn receipt_merge_retains_old_ports_and_never_merges_another_source() {
+        let (port, _) = start_mock();
+        let mut gateway = mock_igd(port);
+        gateway.context.local_source = Some(LocalSource { ip: Ipv4Addr::LOCALHOST, iface: None });
+        let mut old = MappingLease::new(&gateway, Some(42641), 42641);
+        let next = MappingLease::new(&gateway, Some(42642), 42641);
+        assert!(old.same_scope(&next));
+        old.record(MappingAttempt::Requested(42642));
+        assert_eq!(old.external_ports, [42641, 42642]);
+        gateway.context.local_source.as_mut().unwrap().ip = Ipv4Addr::new(127, 0, 0, 2);
+        assert!(!old.same_scope(&MappingLease::new(&gateway, Some(42641), 42641)));
+        assert_eq!(old.gateway.context.local_source.as_ref().unwrap().ip, Ipv4Addr::LOCALHOST);
+        gateway.context.local_source.as_mut().unwrap().ip = Ipv4Addr::LOCALHOST;
+        gateway.context.hostname_addr = Some(Ipv4Addr::new(192, 168, 3, 1));
+        assert!(!old.same_scope(&MappingLease::new(&gateway, Some(42641), 42641)), "同hostname换IGD来源不能合并旧上下文");
+    }
+
+    #[test]
+    fn selected_ipv4_source_rejects_ipv6_control_target_without_default_fallback() {
+        let mut context = UpnpContext::new(std::time::Instant::now() + Duration::from_secs(1));
+        context.local_source = Some(LocalSource { ip: Ipv4Addr::LOCALHOST, iface: None });
+        assert!(matches!(connect_within("::1", 1, &context), Err(UpnpError::UnresolvedHost(_))));
+    }
+
+    #[test]
+    fn add_any_receipt_resolves_success_but_keeps_earlier_unknown_request() {
+        let (port, state) = start_mock();
+        let mut gateway = mock_igd(port);
+        gateway.context.local_source = Some(LocalSource { ip: Ipv4Addr::LOCALHOST, iface: None });
+        state.lock().unwrap().any_mode = AnyMode::Ok(51000);
+        state.lock().unwrap().entries = vec![ours(51001, Ipv4Addr::LOCALHOST, 42641)];
+        let receipt = std::cell::RefCell::new(MappingLease::empty(&gateway, 42641));
+        let record = |attempt| receipt.borrow_mut().record(attempt);
+        assert_eq!(gateway.add_any_port_mapping_recorded(42641, Ipv4Addr::LOCALHOST, 42641, &|_| {}, &record).unwrap(), 51000);
+        assert_eq!(receipt.borrow().pending_any, 0);
+        let result = receipt.borrow().shrink_before(std::time::Instant::now() + Duration::from_secs(2));
+        assert!(matches!(result.as_slice(), [ShrinkOutcome::Shrunk { ext: 51000 }]));
+        assert_eq!(state.lock().unwrap().entries.iter().find(|mapping| mapping.external_port == 51001).unwrap().lease_duration, 3600);
+        // 明确Fault回退到0租期后成功，也不能留下unknown宽收据。
+        state.lock().unwrap().any_mode = AnyMode::LeaseZeroOnly(52000);
+        assert!(gateway.add_any_port_mapping_recorded(42641, Ipv4Addr::LOCALHOST, 42641, &|_| {}, &record).is_ok());
+        assert_eq!(receipt.borrow().pending_any, 0);
+        // 200但没有ReservedPort可能已经创建规则；后续成功不能抹掉这次未知回应。
+        state.lock().unwrap().any_mode = AnyMode::MissingReserved;
+        assert!(gateway.add_any_port_mapping_recorded(42641, Ipv4Addr::LOCALHOST, 42641, &|_| {}, &record).is_err());
+        assert_eq!(receipt.borrow().pending_any, 2);
+        state.lock().unwrap().any_mode = AnyMode::Ok(53000);
+        assert!(gateway.add_any_port_mapping_recorded(42641, Ipv4Addr::LOCALHOST, 42641, &|_| {}, &record).is_ok());
+        assert_eq!(receipt.borrow().pending_any, 2);
+    }
+
+    #[test]
+    fn shrink_recognizes_v4_mapped_permanent_mapping() {
+        let (port, state) = start_mock();
+        let mut gateway = mock_igd(port);
+        gateway.context.local_source = Some(LocalSource { ip: Ipv4Addr::LOCALHOST, iface: None });
+        let mut mapping = ours(42641, Ipv4Addr::LOCALHOST, 42641);
+        mapping.internal_client = "::ffff:127.0.0.1".into();
+        mapping.lease_duration = 0;
+        state.lock().unwrap().entries.push(mapping);
+        let lease = MappingLease::new(&gateway, Some(42641), 42641);
+        assert!(matches!(lease.shrink_before(std::time::Instant::now() + Duration::from_secs(2)).as_slice(), [ShrinkOutcome::Shrunk { ext: 42641 }]));
+        assert_eq!(state.lock().unwrap().entries[0].lease_duration, 300);
+    }
+
+    #[test]
+    fn repin_interrupts_silent_http_without_waiting_for_server_or_total_budget() {
+        let listener = std::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0)).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (arrived, arrived_rx) = std::sync::mpsc::channel();
+        let (resume, resume_rx) = std::sync::mpsc::channel();
+        let server = std::thread::spawn(move || {
+            let (mut connection, _) = listener.accept().unwrap();
+            read_request(&mut connection);
+            arrived.send(()).unwrap();
+            resume_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        });
+        let generation = Arc::new(AtomicU64::new(0));
+        let mut context = UpnpContext::new(std::time::Instant::now() + UPNP_TOTAL_BUDGET);
+        context.generation = Some((Arc::clone(&generation), 0));
+        let (result_tx, result_rx) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            result_tx.send(http_call_context(&format!("http://127.0.0.1:{port}/"), "GET", None, None, None, &context, HTTP_MAX_DESC)).unwrap();
+        });
+        arrived_rx.recv_timeout(Duration::from_secs(1)).unwrap();
+        generation.store(1, Ordering::SeqCst);
+        let result = result_rx.recv_timeout(Duration::from_millis(350));
+        resume.send(()).unwrap();
+        worker.join().unwrap();
+        server.join().unwrap();
+        assert!(matches!(result.unwrap(), Err(UpnpError::BindingChanged)));
+    }
+
+    #[test]
+    fn description_soap_and_discovery_preserve_typed_causes() {
+        let source = LocalSource { ip: Ipv4Addr::LOCALHOST, iface: Some((0, String::new())) };
+        let mut context = UpnpContext::new(std::time::Instant::now() + Duration::from_secs(1));
+        context.local_source = Some(source);
+        let error = igd_from_location_context("http://127.0.0.1:1/", context.clone()).err().unwrap();
+        assert!(matches!(error, UpnpError::DescFetch(source) if matches!(*source, UpnpError::IfacePin { .. })));
+        let mut gateway = find_wan_service("<service><serviceType>WANIPConnection</serviceType><controlURL>/control</controlURL></service>", "http://127.0.0.1:1/", context.deadline).unwrap();
+        gateway.context = context;
+        assert!(matches!(gateway.add_with_lease(42641, Ipv4Addr::LOCALHOST, 42641, 300), Err(UpnpError::Soap { source, .. }) if matches!(*source, UpnpError::IfacePin { .. })));
+        assert!(matches!(pick_igd_before(&[Ipv4Addr::LOCALHOST], std::time::Instant::now() + Duration::from_secs(1), |_, _| Err(UpnpError::BindingChanged)), Err(UpnpError::NoIgd { last, .. }) if matches!(*last, UpnpError::BindingChanged)));
     }
 
     /// F9a：表长 N ⇒ 一轮 `GetGenericPortMappingEntry` 计数 == **N+1**（第 N+1 次取
@@ -2203,41 +2671,24 @@ mod tests {
         assert_eq!(s.entries[0].lease_duration, 300);
     }
 
-    /// F9：缩租「先 add(300) → 718 才 delete + add(300)」；加不回去时原映射仍在。
+    /// 缩租即使遇718也不删除原规则；mock允许Delete成功，能捕获删后加失败的回归。
     #[test]
-    fn shrink_lease_add_before_delete() {
-        let (port, st) = start_mock();
-        let g = mock_igd(port);
-        let client: Ipv4Addr = "192.168.3.12".parse().unwrap();
+    fn shrink_conflict_preserves_original_mapping_without_delete() {
+        let (port, state) = start_mock();
+        let gateway = mock_igd(port);
+        let client = Ipv4Addr::new(192, 168, 3, 12);
         {
-            let mut s = st.lock().unwrap();
-            s.entries = vec![ours(42641, client, 42641)];
-            s.conflict_718 = true;
+            let mut state = state.lock().unwrap();
+            state.entries = vec![ours(42641, client, 42641)];
+            state.conflict_718 = true;
+            state.refuse_ext = Some(42641);
+            assert!(!state.delete_noop);
         }
-        g.re_add_short_lease(42641, client, 42641, 300).expect("缩租应成功");
-        {
-            let s = st.lock().unwrap();
-            let ops: Vec<&String> = s.actions.iter().filter(|a| a.ends_with(":42641")).collect();
-            assert_eq!(ops.len(), 3, "add → delete → add：{ops:?}");
-            assert!(ops[0].starts_with("AddPortMapping"));
-            assert!(ops[1].starts_with("DeletePortMapping"));
-            assert!(ops[2].starts_with("AddPortMapping"));
-            assert_eq!(s.entries[0].lease_duration, 300, "缩租后租期 300");
-        }
-        // 「加不回去」形态：Delete 无效 + 全部 add 被拒 ⇒ Err 且原映射仍在（原租期）
-        let (port2, st2) = start_mock();
-        let g2 = mock_igd(port2);
-        {
-            let mut s = st2.lock().unwrap();
-            s.entries = vec![ours(42641, client, 42641)];
-            s.conflict_718 = true;
-            s.refuse_ext = Some(42641);
-            s.delete_noop = true;
-        }
-        assert!(g2.re_add_short_lease(42641, client, 42641, 300).is_err(), "加不回去应报错");
-        let s2 = st2.lock().unwrap();
-        assert_eq!(s2.entries.len(), 1, "原映射仍在");
-        assert_eq!(s2.entries[0].lease_duration, 3600, "原租期保持");
+        assert!(gateway.re_add_short_lease(42641, client, 42641, 300).is_err());
+        let state = state.lock().unwrap();
+        assert_eq!(state.actions, ["AddPortMapping:42641"]);
+        assert_eq!(state.entries.len(), 1);
+        assert_eq!(state.entries[0].lease_duration, 3600);
     }
 
     // ---------- F10 全局期限（候选循环 + SSDP 穿透） ----------

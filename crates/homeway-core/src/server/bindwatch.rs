@@ -94,6 +94,12 @@ pub(crate) struct WatchState {
     tick: u32,
 }
 
+impl WatchState {
+    fn from_bound(initial: Option<IfaceInfo>) -> Self {
+        Self { cur_fp: initial.as_ref().map(fingerprint_of).unwrap_or_default(), cur: initial, ..Self::default() }
+    }
+}
+
 /// 一拍看护（Go watchBind 循环体的单拍化——语义逐分支对齐）：
 /// 1. 当前卡在、指纹没变且 up：低频健康探针（60s）；成功清 fails；失败计数，
 ///    连续 2 次打「连续探不通，重新挑卡」落入挑卡；
@@ -173,7 +179,6 @@ struct RealDeps {
     /// 「挑卡恒用真目标」不变量逐字一致；env 只模拟健康探针退化）。
     pick_targets: Vec<SocketAddrV4>,
     cmd_tx: Sender<EngineCmd>,
-    pinned_flag: Arc<AtomicBool>,
     pub_kick: std::sync::mpsc::SyncSender<()>,
     udpcap_kick: std::sync::mpsc::SyncSender<()>,
     logf: Logf,
@@ -215,7 +220,6 @@ impl WatchDeps for RealDeps {
             .map_err(|e| e.to_string())?;
         match rx.recv_timeout(Duration::from_secs(10)) {
             Ok(Ok(())) => {
-                self.pinned_flag.store(true, Ordering::SeqCst);
                 Ok(())
             }
             Ok(Err(e)) => Err(e.to_string()),
@@ -237,6 +241,8 @@ impl WatchDeps for RealDeps {
 
 /// 看护线程装配参数（engine::start 组装）。
 pub struct WatcherArgs {
+    /// 只有QUIC初始pin已成功才传Some；失败保持空状态，首拍重试。
+    pub initial: Option<IfaceInfo>,
     /// 显式网卡名（--bind-interface <网卡名>）：只按名重解析；None = auto（每轮重挑）。
     pub explicit_name: Option<String>,
     /// 健康探针目标（诊断缝 HOMEWAY_BINDWATCH_PROBE 注入死地址 = 真机采
@@ -245,7 +251,6 @@ pub struct WatcherArgs {
     /// 挑卡目标（F2：恒 = config `serve.dns_probe_target`，**不吃 env**）。
     pub pick_targets: Vec<SocketAddrV4>,
     pub cmd_tx: Sender<EngineCmd>,
-    pub pinned_flag: Arc<AtomicBool>,
     pub pub_kick: std::sync::mpsc::SyncSender<()>,
     pub udpcap_kick: std::sync::mpsc::SyncSender<()>,
     pub logf: Logf,
@@ -255,11 +260,11 @@ pub struct WatcherArgs {
 /// 起后台看护（非阻塞；stop 置位即退出）。
 pub fn spawn_watcher(args: WatcherArgs) {
     let WatcherArgs {
+        initial,
         explicit_name,
         probe_targets,
         pick_targets,
         cmd_tx,
-        pinned_flag,
         pub_kick,
         udpcap_kick,
         logf,
@@ -268,13 +273,12 @@ pub fn spawn_watcher(args: WatcherArgs) {
     std::thread::Builder::new()
         .name("homeway-bindwatch".into())
         .spawn(move || {
-            let mut st = WatchState::default();
+            let mut st = WatchState::from_bound(initial);
             let mut d = RealDeps {
                 explicit_name,
                 probe_targets,
                 pick_targets,
                 cmd_tx,
-                pinned_flag,
                 pub_kick,
                 udpcap_kick,
                 logf,
@@ -411,6 +415,22 @@ mod tests {
         assert_eq!(d.repins, vec![(6, "en0".to_owned())]);
         assert_eq!(d.changes, 1);
         assert!(joined(&d.logs).contains("绑卡看护：QUIC 端口 socket 钉在 en0（index=6 up addrs=[192.0.2.6/24]）"));
+    }
+
+    #[test]
+    fn initial_success_seeds_watch_state_but_failed_pin_retries_first_tick() {
+        let initial = Script::iface(6, "en0");
+        let mut state = WatchState::from_bound(Some(initial.clone()));
+        let mut script = Script::new();
+        watch_tick(&mut state, &mut script);
+        assert!(script.repins.is_empty(), "真实初始绑定稳定，首拍不能重钉或使发布世代失效");
+        assert_eq!(script.changes, 0);
+        assert!(script.logs.is_empty());
+        let mut state = WatchState::from_bound(None);
+        script.resolves.push(Ok(initial));
+        watch_tick(&mut state, &mut script);
+        assert_eq!(script.repins, [(6, "en0".into())]);
+        assert_eq!(script.changes, 1, "初始pin失败保持首拍恢复能力");
     }
 
     /// 无当前卡 + 挑不到：`本轮不绑` 行、不重钉；有当前卡 + 挑不到（指纹先变触发

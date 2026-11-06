@@ -72,6 +72,20 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-11-06 双网卡 UPnP 来源修复（完成，本地源码与私有真网关验收）**：
+> SSDP/描述GET/全部SOAP固定同一源IPv4/接口，InternalClient与QUIC实际绑定一致；
+> none/未绑卡/无IPv4/钉卡失败不再猜枚举首项。绑定世代隔离旧观测、probe和token，
+> 首拍看护保留初始绑定事实；保存各代原IGD映射收据，AddAny成功收窄外口，退出
+> 完整表精确核验、全部记录共享8s且只Add300，不先删映射。typed错误链、换卡读写
+> 取消与STUN端口诊断同步修正；wire/token与总预算不变，判据变更已登记。
+> 两门意见全处置；最终core **954/0、6 ignored**、CLI **231/0、2 ignored**、
+> QUIC **294/0**、CAPI **4/0**及集成/doc tests、clippy、OHOS/musl check通过。
+> 整改前完整ci-local quick全绿（含真实OHOS链接/RRR316s）；最终私有件
+> `0e7cd0c0…b11c44f` 的 `.84` 显式en7/auto真IGD与云端唯一公网v4 QUIC补验
+> 结果见 `docs/reviews/2026-11-06-upnp-interface-fix.md`，正式官方件/身份/state保全。
+> 未发布或正式部署；现役升级仍须GitHub Release链。旧卡下线时退租可能失败，
+> 为可见best effort而非保证永久规则消失。
+
 > **2026-11-06 LAN84 双网卡 UPnP 排查（诊断及启动修复完成；代码缺陷待修）**：
 > 用户授权该机启停。同官方 v0.3.26 同件实测纠正临时 helper 的过宽归纳：正式程序
 > 普通用户 LaunchAgent 可恢复自身权限归属和 IGD 发现；已持久安装标准 job，最终
