@@ -1443,7 +1443,7 @@ manifest/receipt/RECOVERY，worker已退出；断线先查回执、不重复acti
 换装/重启或update，留用户手动部署；LAN71未动。完整证据与边界见同日
 `v0.3.26-release.md` 和 `v0.3.26-deploy.md` 两份review。
 
-### 13.27 v0.3.27 发布与三机滚动部署（2026-11-07，执行中）
+### 13.27 v0.3.27 发布与三机滚动部署（2026-11-07，完成）
 
 用户明确授权提交/发版/部署，且要求当前工作Mac最后切换，避免承载会话提前中断。
 版本提交`8e46324`推main，annotated tag v0.3.27在当时main头；公开CI42248799453
@@ -1469,13 +1469,15 @@ UID501/GID0/755、原plist/默认state/身份配置保全，台账前缀保留�
 IGD/公网三门全过，once已not running/runs1/exit0。持久恢复目录
 `/Users/zhaozhe/homeway-rollback/release-v0.3.27-lan84-20261107-r1/`。
 
-当前Mac最后，仍原17126/PATH `/opt/homebrew/bin/homeway`、官方v0.3.26 ace3ea…，
-actual prepare已exit0/PREPARED未激活，双真实stage保持gid80；完整备份及独立门已过。
-持久目录`~/homeway-rollback/release-v0.3.27-20261107-r1/`，root检查点提交后唯一
-bootstrap其once.plist。此步可能结束当前会话，先读receipt.json/RECOVERY.txt/worker.log
-及`gui/501/me.zhaozhe.homeway-release-v0327-20261107-r1`状态，不重复激活，不回填state。
-实际成功仍须持久SUCCESS与独立只读验收，不能以当前会话存活判定结果。
+当前Mac最后，在独立完整备份门和e1a9aa9检查点推送后唯一bootstrap once。实际
+**SUCCESS/34.072秒、稳定30.708秒、未回退**，17126→21921，正式PATH仍
+`/opt/homebrew/bin/homeway`、官方v0.3.27同88670b…，UID501/GID80/755。独立实际
+验收磁盘/运行映像、原job新PID/generation、默认state/角色/41641/term511及原
+plist/config/key/台账前缀通过，正常追加471B；once单次exit0、双隐藏stage已清理。
+持久目录`~/homeway-rollback/release-v0.3.27-20261107-r1/`。恢复先读receipt.json/
+RECOVERY.txt/worker.log及`gui/501/me.zhaozhe.homeway-release-v0327-20261107-r1`，
+不重复激活，不回填state。会话本轮仍可继续，但不以会话是否中断判定部署结果。
 
 完整官方哈希、首轮失败/复验、两门与逐端实际证据见
-`docs/reviews/2026-11-07-v0.3.27-release-deploy.md`。本机最后切换的实际回执续补该记录，
-此检查点不把PREPARED写作本机已经部署成功。
+`docs/reviews/2026-11-07-v0.3.27-release-deploy.md`。三机实际回执与独立验收均已完成，
+原PREPARED检查点与失败/整改历史保留，不把计划替代实际结果。
