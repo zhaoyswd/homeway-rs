@@ -72,6 +72,19 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-11-07/08 独立 WebServe（技术门通过，准备实现）**：用户授权按本轮对齐需求
+> 生成最终方案、完成技术 review，过门后开发。变更入口为
+> `openspec/changes/independent-webserve/`：独立 loopback HTTP/WS、网页终端复用 TUI、
+> 独立 webtoken、出口不开 HTTP 仍可经本机中继管理。首轮外评 B1–B8 已全部修订；
+> 第二轮 dsh exit0 明确技术门通过，11-08 独立补充复核管理 lease 精确销账与40轮验收
+> 后最终放行。完整原文与处置入口见 `docs/reviews/2026-11-07-webserve-design-review.md`、
+> `2026-11-07-webserve-design-r2.md`、`2026-11-07-webserve-design.md`；OpenSpec strict通过。
+> 下一步按任务实施、私有验收及代码门；不把方案过门记作产品完成。基线 `9a844f8`
+> workspace test/clippy 全绿（CLI231/core954/QUIC294/CAPI4及集成/doc；日志
+> `/tmp/homeway-webserve-baseline.YitVDe/`）。当前未改产品代码、未推送/发布/部署，
+> 生产实例与其他仓库不动。默认配置实际 serve/relay=false，旧统一进程事件串的
+> “默认true”是陈旧日志，方案已要求订正，不据此新增启动分叉。
+
 > **2026-11-07 v0.3.27 发版部署（完成）**：用户明确授权提交/发版/部署，并要求
 > 当前Mac最后切换，防止承载会话提前中断。`8e46324`推main并在头上打v0.3.27，
 > CI42248799453最终8项通过（Mac既有同名负载敏感测试首红，调查/针对复验后仅重跑
