@@ -71,7 +71,7 @@ Host 只允许 `127.0.0.1:P`、`localhost:P` 以及配置的公开 origin author
 
 腿所有权由固定(remote,RelayGeneration)下的network_owned与管理conn_id owner集合共同承担。普通reg4认证只置network_owned；管理认证仅加入自己的lease。管理结束只移除该conn_id；只有同代际已无其他管理owner且network_owned=false时，才拆腿和清理该代际admitted_generations记忆。网络连接先取得腿、多个管理连接共腿、同代重登移交owner、跨代晚到清理均不得误删仍有效拥有者；旧lease不能通过重取当前generation清掉新腿。
 
-gateway的远程会话guard同时持有本机relay epoch、完整目标label、WebClient实际local_addr和连接。WebClient显式绑定归一后的本机relay目的IP:0（v4/v6 loopback或明确本机unicast），不以wildcard源地址作为销账键。guard在关闭时（不是login开始时）捕获close_cutoff=Instant::now，先经本机RegistryHandle的有界队列提交release_association(epoch,label,client_local_addr,close_cutoff)，再Drop WebClient。relay只清理相同epoch/精确AssocKey且association.created<=close_cutoff的对象，沿用原有relay→exit的RELEASE方向通知出口；迟到的旧清理不得命中新端口复用association。队列容量与总管理8名额相匹配，失败有可见记录并由现有有界TTL兜底，不能将丢弃清理假报成已回收；独立lease活位使出口资源不受队列成功与否影响。
+gateway的远程会话guard同时持有本机relay epoch、完整目标label、WebClient实际local_addr和连接。WebClient显式绑定归一后的本机relay目的IP:0（v4/v6 loopback或明确本机unicast），不以wildcard源地址作为销账键。guard在关闭时（不是login开始时）捕获close_cutoff=Instant::now，将client和该关闭快照一并转入独立有界reaper（活动+待回收连接总8）；reaper先Drop WebClient完成有界QUIC Close刷出，保留旧assoc路径，随后再经本机RegistryHandle的有界队列提交release_association(epoch,label,client_local_addr,close_cutoff)。这由真实40轮第25轮失败纠正原先“先拆assoc再发Close”的竞态；不改变cutoff、epoch或created门。目标侧实际拆腿同时撤销相应lease，叶子观察失活关闭pump/socket，作为Close丢失/路径已撤的必要兜底。relay只清理相同epoch/精确AssocKey且association.created<=close_cutoff的对象，沿用原有relay→exit的RELEASE方向通知出口；迟到的旧清理不得命中新端口复用association。队列容量与总管理8名额相匹配，失败有可见记录并由现有有界TTL兜底，不能将丢弃清理假报成已回收；独立lease活位使出口资源不受队列成功与否影响。
 
 必验：连续超过32轮（取40轮）登录、OPEN、关闭，观察管理活位、PTY、assoc及正式腿恢复基线，不出现第33轮容量失败；另覆盖已有普通network_owned腿和另一个管理owner共存、同代移交、错代清理、延迟旧命令遇端口复用、满队列/目标或relay退出，不误拆普通联网路径。
 
@@ -112,3 +112,13 @@ relay Config新增可选共享注册句柄；TCP握手已经验证完整pubkey�
 - 平台矩阵：Mac/Linux（含musl）全部命令与浏览器TUI支持；OHOS维持core/capi交叉check，不新增CLI Web运行承诺；Windows全部webserve命令明确unsupported且不写state、不启动服务，原Windows CLI仍check通过。旧daemon返回unknown_op映射为“请升级正在运行的homeway”，不auto-spawn第二进程。
 - 状态划分使用窄句柄Auth/TicketStore/RelaySnapshot/HTTP controller，不把HTTP/PTY/票据塞进RolesInner巨锁。bind、文件、拨号、PTY、线程join均不在RolesInner锁内执行；新错误用thiserror，协议帧non_exhaustive，代码门包含逐行移植痕迹检查。
 - 在产品实现前登记新增W-web判据与行为常量；具体wire见protocol.md，实施生成fixtures/webserve向量并覆盖全目录SHA256SUMS，不把规划向量当成已实测。
+
+
+实施兼容澄清：未知首流仍保留原reg4的10秒等待上界；识别W1后按连接采纳时刻计算绝对5秒管理认证期限，late W1立即0x72。不得为管理分支无条件收紧旧联网首流窗口。
+
+关闭边界实核：原RELEASE仅走TCP控制面，UDP-only没有独立可靠拆腿通知。先flush QUIC Close再reap是UDP-only稳定网络正常关闭的主要机制；目标lease撤销覆盖实际收到TCP RELEASE、腿读错、过期和clear。任意UDP关包丢失或分区仍依赖既有QUIC idle兜底，不宣称远端瞬时销账；40轮稳定网络原验收期限保持。
+
+
+实施发现的普通准入取消补充：ci-local旧ladder首失败为RegistrationFailed；当前树与独立基线exact首跑通过。另一个私有基线受控实验确认超时旧Proof晚到会把新连接替换为replaced by newer registration，二者签名不混同。经独立技术核，只补std活性查询、core触表前已失活拒绝、leaf等待同时监听关闭，以及Bridge持锁替换前最后检查；不改wire/期限/正常有效准入，不回滚检查后已开始同步事务，不宣称全局原子。判据先登记，再实施并重验。
+
+浏览器大粘贴实施澄清：此前onData直接单frame发送整次paste，会触64KiB线级上限；修为整次UTF-8输入与bufferedAmount先核≤2MiB，超额发送前明确拒绝，合格后按≤64KiB顺序分帧。不改变INPUT wire、服务端上限或PTY预算；以真实80KiB browser clipboard/paste字节哈希及超2MiB零发送拒绝验证。

@@ -105,6 +105,47 @@ mod dial_budget_tests {
     }
 }
 
+fn scrub_undelivered_web_token(response: &mut ResponseBody) {
+    use zeroize::Zeroize;
+    if let Some(serde_json::Value::String(token)) = response.result.as_mut().and_then(|r| r.get_mut("token")) {
+        if token.starts_with("hww1") { token.zeroize(); }
+    }
+}
+
+/// 应答在调用方超时后可能已成功入队；队列释放仍负责擦除Web token。
+struct RawRsp {
+    response: ResponseBody,
+    #[cfg(test)]
+    erased: Option<Arc<AtomicBool>>,
+}
+impl RawRsp {
+    fn new(response: ResponseBody) -> Self {
+        Self { response, #[cfg(test)] erased: None }
+    }
+    fn take_response(&mut self) -> ResponseBody {
+        std::mem::replace(&mut self.response, response_body(0, None, None))
+    }
+    fn take_result(&mut self) -> Result<serde_json::Value, OpError> {
+        if self.response.ok {
+            Ok(self.response.result.take().unwrap_or(serde_json::Value::Null))
+        } else {
+            let code = self.response.error.take().unwrap_or_else(|| "bad_request".into());
+            Err(match self.response.detail.take() {
+                Some(detail) => OpError::with_detail(&code, detail), None => OpError::code(&code),
+            })
+        }
+    }
+}
+impl Drop for RawRsp {
+    fn drop(&mut self) {
+        scrub_undelivered_web_token(&mut self.response);
+        #[cfg(test)]
+        if let Some(erased) = &self.erased {
+            erased.store(self.response.result.as_ref().and_then(|r| r.get("token")).and_then(serde_json::Value::as_str) == Some(""), Ordering::Release);
+        }
+    }
+}
+
 struct RecvQueue {
     items: VecDeque<Vec<u8>>,
     closed: bool,
@@ -226,15 +267,15 @@ pub struct ControlClient {
     sock: PathBuf,
     write_sock: Mutex<IpcStream>,
     corr: AtomicU64,
-    pending: Mutex<HashMap<u64, std::sync::mpsc::Sender<ResponseBody>>>,
+    pending: Mutex<HashMap<u64, std::sync::mpsc::Sender<RawRsp>>>,
     streams: Mutex<HashMap<u32, Arc<ClientStream>>>,
     pending_streams: Mutex<HashMap<u64, Arc<ClientStream>>>,
     closed: AtomicBool,
     goodbye: Mutex<Option<GoodbyeBody>>,
     reload: Mutex<Option<ReloadBody>>,
-    notify_rx: Mutex<Option<std::sync::mpsc::Receiver<ResponseBody>>>,
+    notify_rx: Mutex<Option<std::sync::mpsc::Receiver<RawRsp>>>,
     events_rx: Mutex<Option<std::sync::mpsc::Receiver<EventBody>>>,
-    notify_tx: std::sync::mpsc::Sender<ResponseBody>,
+    notify_tx: std::sync::mpsc::Sender<RawRsp>,
     events_tx: std::sync::mpsc::SyncSender<EventBody>,
     ctl_sock: Mutex<IpcStream>,
 }
@@ -351,6 +392,7 @@ impl ControlClient {
             .unwrap_or_else(|e| e.into_inner())
             .as_ref()
             .and_then(|rx| rx.try_recv().ok())
+            .map(|mut response| response.take_response())
     }
 
     /// 服务端告别（overrun/bad_frame/bad_json/shutting_down…；None = 未见）。
@@ -397,11 +439,7 @@ impl ControlClient {
             let remaining = deadline.saturating_duration_since(Instant::now());
             if remaining.is_zero() { return Err(OpError::code("timeout")); }
             match rx.recv_timeout(remaining) {
-                Ok(response) if response.ok => Ok(response.result.unwrap_or(serde_json::Value::Null)),
-                Ok(response) => {
-                    let code = response.error.unwrap_or_else(|| "bad_request".into());
-                    Err(match response.detail { Some(detail) => OpError::with_detail(&code, detail), None => OpError::code(&code) })
-                }
+                Ok(mut response) => response.take_result(),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => Err(OpError::with_detail("timeout", "等待应答超时")),
                 Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => Err(OpError::with_detail("conn_closed", "控制面连接已关闭")),
             }
@@ -454,17 +492,7 @@ impl ControlClient {
             self.write_frame(encode_json_frame(Op::Req, &req))
                 .map_err(|e| OpError::with_detail("io_error", e))?;
             match rx.recv_timeout(timeout) {
-                Ok(rsp) => {
-                    if rsp.ok {
-                        Ok(rsp.result.unwrap_or(serde_json::Value::Null))
-                    } else {
-                        let code = rsp.error.unwrap_or_else(|| "bad_request".to_owned());
-                        Err(match rsp.detail {
-                            Some(d) => OpError::with_detail(&code, d),
-                            None => OpError::code(&code),
-                        })
-                    }
-                }
+                Ok(mut response) => response.take_result(),
                 Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
                     Err(OpError::with_detail("timeout", "等待应答超时"))
                 }
@@ -607,7 +635,7 @@ impl ControlClient {
     }
 
     fn reader_main(&self, mut sock: IpcStream, welcome_tx: std::sync::mpsc::Sender<WelcomeBody>) {
-        let mut buf: Vec<u8> = Vec::new();
+        let mut buf = zeroize::Zeroizing::new(Vec::new());
         loop {
             let head = match read_head(&mut sock, &mut buf) {
                 Ok(Some(h)) => h,
@@ -631,9 +659,10 @@ impl ControlClient {
                     }
                 }
                 Op::Rsp => {
+                    let body = zeroize::Zeroizing::new(body);
                     let Ok(rsp) = serde_json::from_slice::<ResponseBody>(&body) else { continue };
                     if rsp.corr == 0 {
-                        let _ = self.notify_tx.send(rsp);
+                        let _ = self.notify_tx.send(RawRsp::new(rsp));
                         continue;
                     }
                     // stream.open 响应：先于调用方注册流（首帧数据可能紧随本帧到达）。
@@ -658,8 +687,9 @@ impl ControlClient {
                             }
                         }
                     }
-                    if let Some(tx) = self.pending.lock().unwrap_or_else(|e| e.into_inner()).get(&rsp.corr) {
-                        let _ = tx.send(rsp);
+                    let response = RawRsp::new(rsp);
+                    if let Some(tx) = self.pending.lock().unwrap_or_else(|e| e.into_inner()).get(&response.response.corr) {
+                        let _ = tx.send(response);
                     }
                 }
                 Op::Evt => {
@@ -707,3 +737,30 @@ impl ControlClient {
     }
 }
 
+
+#[cfg(test)]
+mod web_secret_response_tests {
+    use super::*;
+
+    #[test]
+    fn queued_response_is_scrubbed_when_receiver_times_out_after_send_succeeds() {
+        let erased = Arc::new(AtomicBool::new(false));
+        let response = ResponseBody { corr: 18, ok: true, error: None, detail: None, result: Some(serde_json::json!({"token":"hww1-private"})) };
+        let mut raw = RawRsp::new(response); raw.erased = Some(erased.clone());
+        let (tx, rx) = std::sync::mpsc::channel();
+        assert!(tx.send(raw).is_ok(), "先成功入队，再模拟调用方超时抛弃receiver");
+        drop(rx);
+        assert!(erased.load(Ordering::Acquire), "不能只处理SendError；队列drop也必须擦");
+    }
+
+    #[test]
+    fn unclaimed_web_token_response_is_scrubbed_without_changing_other_results() {
+        let mut response = ResponseBody { corr: 17, ok: true, error: None, detail: None, result: Some(serde_json::json!({"token":"hww1-sensitive","state":"ready"})) };
+        scrub_undelivered_web_token(&mut response);
+        assert_eq!(response.result.as_ref().unwrap()["token"], "");
+        assert_eq!(response.result.as_ref().unwrap()["state"], "ready");
+        response.result = Some(serde_json::json!({"token":"hmw2-network-token"}));
+        scrub_undelivered_web_token(&mut response);
+        assert_eq!(response.result.as_ref().unwrap()["token"], "hmw2-network-token");
+    }
+}

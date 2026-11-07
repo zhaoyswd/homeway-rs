@@ -19,11 +19,30 @@
 set -uo pipefail
 
 REPO_ROOT="${0:h:A:h}"
-BIN="$REPO_ROOT/target/release/homeway"
+BIN="${HOMEWAY_BIN:-$REPO_ROOT/target/release/homeway}"
 
 cmd="${1:-help}"; n="${2:-1}"
 RELAY_STATE="/tmp/homeway-rs-rustrelay-$n"
 RELAY_PORT=$((42780 + n))
+# 独立Web验收 opt-in：默认legacy行为不变；仅显式UNIFIED模式使用私有覆盖。
+UNIFIED="${HOMEWAY_UNIFIED:-0}"
+if [[ "$UNIFIED" == 1 ]]; then
+  if [[ -n "${HOMEWAY_TEST_STATE:-}" ]]; then
+    private_state=$(python3 - "$HOMEWAY_TEST_STATE" <<'PYSTATE'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]).resolve()
+root=Path('/tmp').resolve()
+if root not in p.parents:
+    raise SystemExit('HOMEWAY_TEST_STATE 必须是 /tmp 下的私有子目录')
+print(p)
+PYSTATE
+    ) || exit 1
+    RELAY_STATE="$private_state"
+  fi
+  [[ -z "${HOMEWAY_TEST_PORT:-}" ]] || RELAY_PORT="$HOMEWAY_TEST_PORT"
+  [[ "$RELAY_PORT" == <1-65534> ]] || { echo "私有端口非法" >&2; exit 1; }
+fi
 RELAY_LOG="$RELAY_STATE/cache/relay.log"
 RELAY_PIDFILE="$RELAY_STATE/pid"
 
@@ -68,10 +87,34 @@ start)
   local listen_spec="${RELAY_LISTEN:-127.0.0.1:$RELAY_PORT}"
   local advertise_spec="${RELAY_ADVERTISE:-127.0.0.1:$RELAY_PORT}"
   echo "==> 起 Rust 中继 #$n：state=$RELAY_STATE udp=$listen_spec（公布 $advertise_spec）"
-  nohup "$BIN" relay --state "$RELAY_STATE" \
-    --listen "$listen_spec" --advertise "$advertise_spec" \
-    >> "$RELAY_STATE/stdout.log" 2>&1 &
-  echo $! > "$RELAY_PIDFILE"
+  if [[ "$UNIFIED" == 1 ]]; then
+    if [[ ! -f "$RELAY_STATE/config.toml" ]]; then
+      ( umask 077; cat > "$RELAY_STATE/config.toml" <<EOF
+[serve]
+enabled = false
+[relay]
+enabled = true
+listen = "$listen_spec"
+advertise = "$advertise_spec"
+EOF
+      ) || exit 1
+    fi
+    nohup "$BIN" --state "$RELAY_STATE" >> "$RELAY_STATE/stdout.log" 2>&1 &
+    echo $! > "$RELAY_PIDFILE"
+    for i in {1..100}; do
+      [[ -S "$RELAY_STATE/control.sock" && -S "$RELAY_STATE/local-term.sock" ]] && break
+      kill -0 "$(cat "$RELAY_PIDFILE")" 2>/dev/null || break
+      sleep 0.1
+    done
+    [[ -S "$RELAY_STATE/control.sock" && -S "$RELAY_STATE/local-term.sock" ]] || {
+      echo "!! 私有统一中继控制/终端未就绪" >&2; "$0" stop "$n" >/dev/null 2>&1; exit 1
+    }
+  else
+    nohup "$BIN" relay --state "$RELAY_STATE" \
+      --listen "$listen_spec" --advertise "$advertise_spec" \
+      >> "$RELAY_STATE/stdout.log" 2>&1 &
+    echo $! > "$RELAY_PIDFILE"
+  fi
   sleep 1
   our_pid "$RELAY_PIDFILE" || { echo "!! 中继启动即退出，看 $RELAY_STATE/stdout.log" 2>&1; tail -5 "$RELAY_STATE/stdout.log" >&2; exit 1; }
   if wait_line "$RELAY_LOG" '中继就绪' 10; then :; fi
@@ -89,6 +132,10 @@ stop)
   rm -f "$RELAY_PIDFILE"
   ;;
 token)
+  if [[ "$UNIFIED" == 1 ]]; then
+    "$BIN" relay token --state "$RELAY_STATE"
+    exit $?
+  fi
   # rl1 只在启动时打一轮；stdout.log 与 relay.log 都可能承载
   tok=$(grep -o 'rl1[A-Za-z0-9+/=_-]*' "$RELAY_STATE/stdout.log" "$RELAY_LOG" 2>/dev/null | head -1 | grep -o 'rl1[A-Za-z0-9+/=_-]*')
   [[ -n "$tok" ]] || { echo "!! 取不到 rl1 token（先 start）" 2>&1; exit 1; }

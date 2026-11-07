@@ -690,6 +690,7 @@ mod tests {
             }),
         };
         let mut app = super::super::App::new(super::super::Options {
+            no_spawn: false,
             state: PathBuf::from("/tmp/hw-tui-resize-queue-test"),
         });
         app.attach = Some(attach);

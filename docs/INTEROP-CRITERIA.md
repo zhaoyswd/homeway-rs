@@ -598,6 +598,32 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 
 ## 判据变更记录（政策 + 登记表）
 
+### 2026-11-08：WebServe r3代码门整改（实施前登记）
+
+- B1：TUI冷启动首次Refresh及全部worker统一遵从no_spawn；control已关闭/父管理宿主退出只能使界面退出，不启动新统一进程或监听。B2由固定remote+完整generation保护对账，拆暂存socket与撤销活位分离，绝不借同代跨remote继承授权。
+- B1追加真实父死亡发现：crossterm在PTY EOF内部可能忙环，使原主loop无法复查control/STOP；仅no_spawn+HOMEWAY_WEB_TUI=1的独立CLI进程隔离单一输入worker（poll/read同worker、有界4事件顺序不丢），主loop按≤25ms收事件并复查取消。正常Drop关receiver/置stop、75ms有界join；库内部不可取消EOF时不无限join，主路径仍析构TerminalGuard并结束该独立CLI进程，OS终止其输入worker，不能作为常驻库后台模型。普通TUI原同步入口不变。
+- M4追加最小所有权闭环：RawRsp无Debug/Clone，pending/notify/未知corr的未交付应答均持Drop guard，覆盖send成功后调用方超时丢queue；codec擦消费前缀及移位尾区并保持coalesced下一帧，16KiB临时读块使用Zeroizing。RecoveryRequired固定控制面文案明确认证已暂停，不吞作单纯耐久不确定；不新增wire值域，仍如实不承诺内核/serde历史分配物理全擦。
+- M1/M2/M3/L1/L2/L3/L5：stop清历史失败reason；HTTP远端Authentication/Revoked→401、Capacity→429、Deadline→504、Unavailable/Relay/Transport/Closed→503，非法协议→400；PTY ERROR固定分类为protocol_error/terminal_unavailable/busy/terminal_io/control_unavailable/revoked，关闭码沿用1002/1008/1011/1013。不透出目标自带文本；所有响应统一no-store/CSP/nosniff。首帧只有完整可解析且可识别ticket时才discard，坏JSON/未知票据不猜归属，由30s/8总预算回收。token错误类型分UnsupportedVersion/Malformed。ctl-only注册仅当前control活着才发布新路由，UDP已验证腿保持。
+- M4/L6/L7/L8：Web token新路径消除可控JSON clone，专用敏感应答序列化/队列帧和CLI owned token擦除，通用控制解析/serde/内核缓冲残余如实限定；父目录rename后fsync，读key要求普通文件0600及私有目录；core BackendErr保固定类别而非字符串化内部错误。agent accept本有poll期限（外评永久阻塞前提不成立），补持handle并join的宿主收尾证明。
+- L4：普通CLI同步源码禁用精确axum::/hyper::/hyper_util::/tungstenite::命名空间并各有负例自校准，仅http.rs仍允许Web依赖，禁止QUIC/TLS/多线程不变。新增zeroize通用内存擦除依赖仅复用既有版本，不新增HTTP/WS/async到core/CAPI。
+- wire/secret授权/已有网络期限/64KiB与2MiB资源上限不改；整改须定向测试、固定新件完整QA、CI与跨检及独立增量复核后才能重记代码门通过。
+
+### 2026-11-08：准入等待取消保护（同批实施前补登）
+
+- 条目W-web6/既有hr-reg4内部取消：从超时连接的裁决等待仍可能继续到设备表/绑定，改为窄std `Reg4Request::is_active`在core触表前拒绝已经关闭的连接、leaf等待裁决同时监听连接关闭并丢弃回执接收端、Bridge在bindings锁内且任何替换/关闭旧连接前再次检查新连接活性；无效连接不发Accepted、不替换当前健康绑定。所有wire、有效准入行为、原期限及原回归assert保持。
+- 原因/证据边界：本轮ci-local首次旧ladder用例为`RegistrationFailed`，current和独立基线exact首跑均通过；私有基线受控延迟旧Proof实测可在新连接成功后把新连接踢为`replaced by newer registration`，最小保护消除此受控观察。两者签名不同，不宣称受控实验复现CI唯一根因，不以重复重跑洗绿。
+- 影响面仅已知inactive的普通准入取消路径；检查后已开始的同步设备表事务不回滚，不宣称设备表与QUIC关闭全局原子。由独立技术核批准后实施，并以取消/晚裁决单测、原ladder与全QUIC回归、最终ci-local验证。
+
+### 2026-11-08：独立 WebServe 与管理准入（实施前登记）
+
+- 从无Web入口/无独立管理凭证，增加仅`127.0.0.1`固定端口HTTP/WS、独立`webserve.toml`与`hww1`凭证；不改旧config.toml、hmw2/rl1、TLS/RPK、ALPN、hr-reg4、中继信封/控制帧或普通服务tag字节。协议规格见`openspec/changes/independent-webserve/protocol.md`，wire字节真源为本批实现生成的`fixtures/webserve/`及全目录SHA256SUMS。
+- 新增W-web1本机Web-only/固定loopback及端口冲突；W-web2离线稳定凭证/热安装/轮换撤销；W-web3只有运行中本机中继的有效完整身份可路由、由目标最终认证且出口无HTTP也可用；W-web4独立TUI/no-spawn/断连保留工作会话；W-web5Host/Origin/一次票据和请求资源界限；W-web6管理与联网准入隔离/原网络回归；W-web7固定代际腿确认、conn_id活位/owner销账及40轮连续关闭；W-web8原严格配置回退、CAPI依赖和跨平台编译边界。以上是新增验收要求，尚未运行不记实测通过。
+- 行为常量：默认Web TCP18080且仅127.0.0.1、不退让；在途登录+票据+活跃界面总8，未认证WS另8，TCP连接32，登录60次/分钟；票据30s且每250ms回收；头16KiB/32字段/5s、登录体4KiB/5s、请求总15s、HTTP不保活；WS线级frame/message64KiB、首帧2KiB/5s、ping20s/活性60s、背压10s；PTY每向积压2MiB、尺寸1..1000×1..500、取消后SIGHUP500ms再SIGKILL及500ms收尸。常量以新webserve协议/实现单源落点为准，偏离须同批登记。
+- QUIC独立W1/WC/WP/WA管理握手，不进设备表、不授权DATAGRAM或普通服务；识别W1前保留原reg4首流10s上界，W1分流后认证(含固定代际腿确认)按连接采纳起绝对5s、客户端总10s，LegMissing20ms有界重试；CapacityFull/腿失败0x75，worker/入口满0x73。管理退出活位RAII、≤200ms owner清理，不误拆network_owned/其它管理owner；gateway在独立有界reaper先完成QUIC Close刷出再提交本机release（真实40轮第25轮失败驱动修正关闭次序），仍绑定relay epoch、精确AssocKey、原关闭时cutoff与created门；目标实际拆腿同时撤lease并关闭管理pump，覆盖实际收到TCP RELEASE、腿读错、过期和clear；UDP-only没有独立可靠RELEASE，正常关闭依赖先flush QUIC Close，任意关包丢失/分区仍以原QUIC idle兜底，不宣称瞬时远端销账。握手前仍共享已有TLS资源上界，不宣称匿名洪泛完全隔离。
+- W-web4/5浏览器大粘贴补充：整次输入先按UTF-8字节数加当前WebSocket bufferedAmount核≤2MiB，超额在发第一帧前明确拒绝；合格输入顺序切成每帧≤64KiB后按现有INPUT承载，不改服务器线级上限或PTY预算。实测必须80KiB浏览器粘贴完整字节/哈希对账及>2MiB零输入拒绝，不能以短粘贴或PTY排空代替。常量源为CLI assets/app.js的sendInput。
+- 隔离门从“CLI全同步”扩为仅`crates/homeway-cli/src/webserve/http.rs`精确异步控制面（单线程runtime，禁rt-multi-thread）；CLI Unix仅精确tokio声明放行并增正反自校准。core/capi仍同步，QUIC数据岛原隔离/单线程/真RPK验签门保持。新HTTP/WS/静态资源依赖不得进入CAPI闭包。
+- 影响：CLI Web管理用户、出口QUIC管理分支、relay本机注册快照/实际地址与回收。既有判据行和网络字节不静默改写；真实验收和代码门证据在本轮review记录回填。
+
 ### 2026-11-06：UPnP 控制来源与运行期 QUIC 绑定一致
 
 - 条目 **E-q4 / E20 / UPnP 来源**：从独立枚举所有物理 IPv4、HTTP 默认选源，改为

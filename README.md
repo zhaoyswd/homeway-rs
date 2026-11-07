@@ -299,6 +299,25 @@ homeway socks status               # 开关态 / 端口 / 连接数
 homeway socks off                  # 关掉
 ```
 
+## 浏览器终端（WebUI）
+
+在包含 WebServe 功能的版本中，可以在浏览器里操作本机或中继注册主机的完整 TUI。
+Web 入口只监听 `127.0.0.1`，使用自己的反代提供 HTTPS/WSS；不需要开启出口或中继。
+
+```sh
+homeway webserve token                                      # 获取本机管理凭证，不启动任何服务
+homeway webserve start --port 18080 --origin https://home.example.com
+homeway webserve status
+homeway webserve stop
+```
+
+浏览器打开配置的域名，输入目标主机的 `hww1…` webtoken。中继入口可以访问本机及当前有效
+注册目标；出口只需运行出口并获取 webtoken，**无需启动自己的 Web 入口或配置反代**。
+未运行中继的入口只接受本机 webtoken。关闭网页保留真实工作会话。
+
+webtoken 是完整实例管理凭证，与 `hmw2…` 联网 token 分开；请妥善保管。
+反代模板、凭证轮换、生命周期和平台范围见 [WebUI 使用说明](docs/WEBSERVE.md)。
+
 ## 构建与自检
 
 ```bash

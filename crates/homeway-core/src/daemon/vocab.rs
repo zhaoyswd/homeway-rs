@@ -58,6 +58,12 @@ pub enum OpName {
     RelayRestart,
     RelayStatus,
     RelayToken,
+    WebserveStart,
+    WebserveStop,
+    WebserveRestart,
+    WebserveStatus,
+    WebserveToken,
+    WebserveRotate,
 }
 
 impl OpName {
@@ -92,6 +98,13 @@ impl OpName {
             OpName::RelayRestart => "relay.restart",
             OpName::RelayStatus => "relay.status",
             OpName::RelayToken => "relay.token",
+            OpName::WebserveStart => "webserve.start",
+            OpName::WebserveStop => "webserve.stop",
+            OpName::WebserveRestart => "webserve.restart",
+            OpName::WebserveStatus => "webserve.status",
+            OpName::WebserveToken => "webserve.token",
+            OpName::WebserveRotate => "webserve.token.rotate",
+
         }
     }
 
@@ -127,6 +140,13 @@ impl OpName {
             "relay.restart" => OpName::RelayRestart,
             "relay.status" => OpName::RelayStatus,
             "relay.token" => OpName::RelayToken,
+            "webserve.start" => OpName::WebserveStart,
+            "webserve.stop" => OpName::WebserveStop,
+            "webserve.restart" => OpName::WebserveRestart,
+            "webserve.status" => OpName::WebserveStatus,
+            "webserve.token" => OpName::WebserveToken,
+            "webserve.token.rotate" => OpName::WebserveRotate,
+
             _ => return None,
         })
     }

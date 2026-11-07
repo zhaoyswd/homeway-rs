@@ -65,8 +65,11 @@ ERROR code：1=协议非法，2=终端禁用/不支持，3=资源忙，4=PTY或I
 
 ## 4. HTTP 与 WebSocket 消息
 
-- `POST /api/login`：JSON对象 `{ "token": "hww1..." }`，body≤4096B；成功200返回 `{ "ticket": "<base64url-no-pad 32B>", "expires_in": 30 }`。票据43字符、随机32B、一次消费，与目标/epoch/grant绑定；在途登录+票据+活跃界面统一≤8。认证失败401，非法请求400，容量/限流429，目标暂不可用503；错误正文仅固定code/message。
+- `POST /api/login`：JSON对象 `{ "token": "hww1..." }`，body≤4096B；成功200返回 `{ "ticket": "<base64url-no-pad 32B>", "expires_in": 30 }`。票据43字符、随机32B、一次消费，与目标/epoch/grant绑定；在途登录+票据+活跃界面统一≤8。认证失败401，非法请求400，容量/限流429，目标暂不可用503、目标认证/拨号超预算504；错误正文仅固定code/message。
 - `GET /ws`：HTTP/1.1升级，线级frame/message均≤65536B。首帧必须为≤2048B文本JSON `{ "type":"auth", "ticket":"...", "cols":80, "rows":24 }`，5秒绝对期限；尺寸按上述范围，消费票据成功再发送OPEN/创建本地PTY。服务端成功文本 `{ "type":"ready" }`。
 - 已认证binary消息为原始INPUT，服务端binary为OUTPUT；文本仅 `{ "type":"resize", "cols":N, "rows":N }` 或 `{ "type":"close" }`。服务端错误文本 `{ "type":"error", "code":"固定码", "message":"脱敏文案" }`；退出文本 `{ "type":"exit", "status":N }`。
 - WS关闭码：1000正常、1002协议非法、1008认证/Origin策略失败、1009超限、1011内部IO/目标失联、1013资源忙。未经认证不回显票据或目标身份。标准Ping/Pong仅用于活性，不视为认证或终端输入。
 - HTTP头≤16KiB/32字段且绝对5秒，body绝对5秒，每请求总15秒；HTTP禁keep-alive，WS升级后由WS期限接管。Host/Origin按design解析归一和allowlist处理；所有响应含no-store，静态页CSP只加载自身打包资源。
+
+
+实施兼容澄清：未知首流仍保留原reg4的10秒等待上界；识别W1后按连接采纳时刻计算绝对5秒管理认证期限，late W1立即0x72。不得为管理分支无条件收紧旧联网首流窗口。

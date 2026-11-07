@@ -22,16 +22,17 @@
 //! 的白名单与 `driver.rs` 同款（其余 `src/` 文件零异步栈名字）。
 
 pub(crate) mod admit;
-mod bridge;
+pub(crate) mod bridge;
 mod conn;
 // M4 S1：dial 腿（tag=4 的真拨号；M4-design §1/§3）。**同批入隔离门 `ASYNC_FILES`**。
 mod dial;
 mod intake;
-mod pump;
+pub(crate) mod pump;
 mod quality;
 pub(crate) mod rpk;
 mod serve;
 mod socket;
+mod web;
 pub(crate) mod transport;
 
 #[cfg(test)]
@@ -93,6 +94,7 @@ pub(crate) struct FaceCtx {
     pub(crate) intakes: Arc<ServiceIntakes>,
     /// probe 黑洞（测试缝；见 `ExitQuicConfig::probe_blackhole`）。
     pub(crate) probe_blackhole: bool,
+    pub(crate) web_management: Option<crate::WebManagementConfig>,
 }
 
 /// QUIC 面线程名（与岛 `homeway-quic` 区分：这是**出口侧**的那一枚）。
@@ -213,6 +215,8 @@ pub struct ExitQuicConfig {
     /// 用于在真实 driver/出口面构造「注册成功 + probe 无回显」形态（B 门可达性的
     /// 回归判据，评审 2026-10-20 P1-2）。生产恒 false。
     pub probe_blackhole: bool,
+    /// 管理宿主独立于 HTTP；空凭证的可变活句柄仍需装配。
+    pub web_management: Option<crate::WebManagementConfig>,
 }
 
 impl ExitQuicConfig {
@@ -238,6 +242,7 @@ impl ExitQuicConfig {
             #[cfg(test)]
             panic_gate: None,
             probe_blackhole: false,
+            web_management: None,
         }
     }
 
@@ -261,6 +266,11 @@ impl ExitQuicConfig {
     /// 入队句柄挂进来——服务侧 intake 同时交给各服务的 `serve_stoppable`）。
     pub fn with_intakes(mut self, intakes: ServiceIntakes) -> Self {
         self.intakes = intakes;
+        self
+    }
+
+    pub fn with_web_management(mut self, config: crate::WebManagementConfig) -> Self {
+        self.web_management = Some(config);
         self
     }
 
@@ -797,7 +807,7 @@ struct LiveConn {
 /// `Failed` 携带**归因位**（M2 §14-1④）：对端在握手期是否**主动关闭**（收到了关闭帧）。
 /// 该位只进 [`ExitQuicSnapshot::handshake_peer_closed`]（归因面），**不改**任何闸的输入集。
 enum HandshakeOutcome {
-    Accepted(SocketAddr, Connection, Option<RelayGeneration>),
+    Accepted(SocketAddr, Connection, Option<RelayGeneration>, bool),
     Failed(SocketAddr, FailureKind),
     Deadline(SocketAddr),
 }
@@ -973,6 +983,7 @@ fn run_exit(
             proof_gate: Arc::clone(&proof_gate),
             intakes: Arc::new(cfg.intakes.clone()),
             probe_blackhole: cfg.probe_blackhole,
+            web_management: cfg.web_management.clone(),
         });
         // 巡检节流基准（见循环尾「时间节流」注释）
         let mut last_sweep = Instant::now();
@@ -988,6 +999,7 @@ fn run_exit(
                         let peer = incoming.remote_address();
                         // 从首次注入Initial的不可覆盖DCID记录取代际，必须在异步握手开始前固定。
                         let generation = legs.initial_origin(crate::sysio::unmap_v4_mapped(peer), incoming.orig_dst_cid().as_ref());
+                        let relay_origin = generation.is_some() || legs.is_relay_path(peer);
                         let now = Instant::now();
                         // ============== 抗放大（M2 §3.1/§3.2）：先闸后 Retry ==============
                         // ① 每源滑动窗闸（§3.2-④；键 = v4 /32、v6 /64 前缀）。顺序裁决
@@ -1070,7 +1082,7 @@ fn run_exit(
                                     handshakes.spawn(async move {
                                         match incoming.accept() {
                                             Ok(connecting) => match tokio::time::timeout(deadline, connecting).await {
-                                                Ok(Ok(conn)) => HandshakeOutcome::Accepted(peer, conn, generation),
+                                                Ok(Ok(conn)) => HandshakeOutcome::Accepted(peer, conn, generation, relay_origin),
                                                 Ok(Err(e)) => HandshakeOutcome::Failed(peer, failure_kind(&e)),
                                                 Err(_) => HandshakeOutcome::Deadline(peer),
                                             },
@@ -1086,7 +1098,7 @@ fn run_exit(
                 Some(joined) = handshakes.join_next(), if !handshakes.is_empty() => {
                     stats.handshakes_in_flight.fetch_sub(1, Ordering::SeqCst);
                     match joined {
-                        Ok(HandshakeOutcome::Accepted(peer, conn, generation)) => {
+                        Ok(HandshakeOutcome::Accepted(peer, conn, generation, relay_origin)) => {
                             // 闸④ 销账（§3.1-② / r14 F10）：**握手被采纳的尝试不计数** ⇒
                             // 多候选正常赛跑（其余候选完成/被关闭）不会攒满每源闸。
                             src_gate.completed(peer);
@@ -1098,7 +1110,7 @@ fn run_exit(
                             // （`conn::admit` 的 `accept_bi`）⇒ 两个 `accept_bi` 并发会抢流；
                             // 受理循环由控制流任务在**准入通过之后**随刷新循环一起跑
                             // （`conn::control` 的 `join!`，见该函数注释）。
-                            tasks.spawn(conn::control(conn.clone(), conn_id, Arc::clone(&ctx), generation));
+                            tasks.spawn(conn::control(conn.clone(), conn_id, Arc::clone(&ctx), generation, relay_origin, peer));
                             tasks.spawn(conn::datagrams(conn.clone(), conn_id, Arc::clone(&ctx)));
                             conns.push(LiveConn { remote: conn.remote_address(), conn, conn_id });
                             stats.connections.store(conns.len() as u64, Ordering::SeqCst);

@@ -102,6 +102,20 @@ impl OpError {
     }
 }
 
+/// Web管理控制操作的类型化类别；线上仍使用既有控制面错误词表。
+#[derive(Debug, Clone, Copy, thiserror::Error)]
+#[non_exhaustive]
+pub enum WebFailure {
+    #[error("Web凭证认证失败或已撤销，请重新获取凭证")] Unauthorized,
+    #[error("Web管理资源忙，请稍后重试")] Busy,
+    #[error("Web管理请求超时，请重试")] Timeout,
+    #[error("Web管理能力不可用，请检查统一进程和终端设置")] Unavailable,
+    #[error("Web配置或请求无效，请检查webserve.toml和命令参数")] Invalid,
+    #[error("Web管理IO失败，请检查端口占用和state目录权限")] Io,
+    #[error("Web文件已替换但耐久性未确认，请重新获取凭证或查看状态并检查磁盘")] DurabilityUncertain,
+    #[error("新凭证重读失败，管理认证已暂停；请修复state目录IO或权限后重新获取token")] RecoveryRequired,
+}
+
 /// 后端哨兵错误族（server 层映射到错误码表；Go control.Backend 哨兵的 Rust 面）。
 #[derive(Debug, thiserror::Error)]
 #[non_exhaustive]
@@ -120,6 +134,12 @@ pub enum BackendErr {
     RoleStopped,
     #[error("流 kind 值域外：{0}")]
     BadStreamKind(String),
+    #[error("{category}")]
+    Web {
+        category: WebFailure,
+        #[source]
+        source: Option<Box<dyn std::error::Error + Send + Sync>>,
+    },
     /// 其余错误（值域外/冲突/监听失败/落盘失败等）→ bad_request + 归因。
     #[error("{0}")]
     Other(String),

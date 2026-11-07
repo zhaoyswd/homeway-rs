@@ -31,6 +31,25 @@ cmd="${1:-help}"; n="${2:-1}"
 EXIT_STATE="/tmp/homeway-rs-rustexit-$n"
 CLIENT_STATE="/tmp/homeway-rs-rustgo-client-$n"
 EXIT_PORT=$((42650 + n))
+# 独立Web验收 opt-in：默认legacy行为不变；仅显式UNIFIED模式使用私有覆盖。
+UNIFIED="${HOMEWAY_UNIFIED:-0}"
+if [[ "$UNIFIED" == 1 ]]; then
+  if [[ -n "${HOMEWAY_TEST_STATE:-}" ]]; then
+    private_state=$(python3 - "$HOMEWAY_TEST_STATE" <<'PYSTATE'
+from pathlib import Path
+import sys
+p=Path(sys.argv[1]).resolve()
+root=Path('/tmp').resolve()
+if root not in p.parents:
+    raise SystemExit('HOMEWAY_TEST_STATE 必须是 /tmp 下的私有子目录')
+print(p)
+PYSTATE
+    ) || exit 1
+    EXIT_STATE="$private_state"
+  fi
+  [[ -z "${HOMEWAY_TEST_PORT:-}" ]] || EXIT_PORT="$HOMEWAY_TEST_PORT"
+  [[ "$EXIT_PORT" == <1-65534> ]] || { echo "私有端口非法" >&2; exit 1; }
+fi
 # 公共端口 = QUIC 端口（缺省 = --listen + 1；M5 起它才是被公布/被观测的那个口）
 EXIT_QUIC_PORT=$((EXIT_PORT + 1))
 EXIT_LOG="$EXIT_STATE/stdout.log"
@@ -76,6 +95,38 @@ start)
   mkdir -p "$EXIT_STATE" || exit 1
   LOG0=$(log_lines "$EXIT_LOG")
   echo "==> 起 Rust 出口 #$n：state=$EXIT_STATE quic=127.0.0.1:$EXIT_QUIC_PORT（--listen $EXIT_PORT；本轮日志从第 $((LOG0 + 1)) 行起）"
+  if [[ "$UNIFIED" == 1 ]]; then
+    if [[ ! -f "$EXIT_STATE/config.toml" ]]; then
+      ( umask 077; cat > "$EXIT_STATE/config.toml" <<EOF
+[serve]
+enabled = true
+listen = $EXIT_PORT
+quic_listen = $EXIT_QUIC_PORT
+bind_interface = "none"
+upnp = false
+stun = ""
+stun6 = ""
+public_endpoint = "127.0.0.1:$EXIT_QUIC_PORT"
+[relay]
+enabled = false
+EOF
+      ) || exit 1
+    fi
+    nohup "$BIN" --state "$EXIT_STATE" >> "$EXIT_LOG" 2>&1 &
+    echo $! > "$EXIT_PIDFILE"
+    for i in {1..100}; do
+      [[ -S "$EXIT_STATE/control.sock" && -S "$EXIT_STATE/local-term.sock" ]] && break
+      kill -0 "$(cat "$EXIT_PIDFILE")" 2>/dev/null || break
+      sleep 0.1
+    done
+    if [[ -S "$EXIT_STATE/control.sock" && -S "$EXIT_STATE/local-term.sock" ]]; then
+      echo "==> 私有统一进程控制/终端就绪（角色由私有config决定）"
+      exit 0
+    fi
+    echo "!! 私有统一进程控制/终端未就绪" >&2
+    "$0" stop "$n" >/dev/null 2>&1
+    exit 1
+  fi
   nohup "$BIN" serve --state "$EXIT_STATE" --listen "$EXIT_PORT" --bind-interface none \
     --upnp=false --stun= --public-endpoint "127.0.0.1:$EXIT_QUIC_PORT" --verbose \
     ${=EXIT_EXTRA_FLAGS:-} \

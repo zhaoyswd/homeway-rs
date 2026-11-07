@@ -20,6 +20,7 @@ pub(crate) mod ladder;
 mod race;
 mod register;
 mod relay_sock;
+pub(crate) mod web;
 pub(crate) mod streams;
 #[cfg(test)]
 mod tests;

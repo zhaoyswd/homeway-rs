@@ -64,6 +64,7 @@ struct RelayLeg {
     last: Instant,
     created: Instant,
     client_admitted: bool,
+    owners: LegOwners,
     admission_marker: Vec<u8>,
     admission_ack: bool,
     admission_retry: u8,
@@ -73,6 +74,307 @@ struct RelayLeg {
     legup_started: Instant,
     legup_sent: Instant,
     legup_ack: bool,
+}
+
+#[derive(Clone, Default)]
+struct LegOwners {
+    network: bool,
+    management: HashMap<u64, homeway_quic::ManagementLease>,
+}
+
+struct AdmissionMemory {
+    id: u64,
+    marker: Vec<u8>,
+    at: Instant,
+    owners: LegOwners,
+}
+
+#[cfg(test)]
+mod web_management_ownership_tests {
+    use super::*;
+    use homeway_quic::{ClientConfirmation::*, ManagementLease, RelayGeneration};
+
+    fn register(bind: &mut ServerBind, remote: SocketAddr, id: u64, cookie: u8) -> RelayGeneration {
+        let marker = crate::relaywire::admitted_payload(id, &[cookie; 16], &[9; 32]);
+        bind.register_leg_with_admission(id, remote, b"LEGUP", &marker).unwrap();
+        RelayGeneration { sid: id, cookie: [cookie; 16] }
+    }
+
+    #[test]
+    fn web_lease_40_refreshes_return_formal_legs_and_memory_to_baseline() {
+        let mut bind = ServerBind::new(Arc::new(|_| {}));
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote = sink.local_addr().unwrap();
+        for i in 1..=40 {
+            let generation = register(&mut bind, remote, i, i as u8);
+            let lease = ManagementLease::new(i);
+            assert_eq!(bind.confirm_management_client(remote, generation, lease.clone()), Confirmed);
+            assert_eq!(bind.leg_by_id.len(), 1);
+            lease.cancel();
+            bind.sweep_management_leases();
+            assert!(bind.leg_by_id.is_empty());
+            assert!(bind.admitted_generations.is_empty());
+        }
+    }
+
+    #[test]
+    fn web_lease_shared_owners_and_network_owner_are_preserved() {
+        let mut bind = ServerBind::new(Arc::new(|_| {}));
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote = sink.local_addr().unwrap();
+        let generation = register(&mut bind, remote, 1, 1);
+        let first = ManagementLease::new(1);
+        let second = ManagementLease::new(2);
+        assert_eq!(bind.confirm_management_client(remote, generation, first.clone()), Confirmed);
+        assert_eq!(bind.confirm_management_client(remote, generation, second.clone()), Confirmed);
+        first.cancel();
+        bind.sweep_management_leases();
+        assert_eq!(bind.leg_by_id[&1].owners.management.len(), 1);
+        assert_eq!(bind.confirm_client(remote, generation), Confirmed);
+        second.cancel();
+        bind.sweep_management_leases();
+        assert!(bind.leg_by_id[&1].owners.network);
+        assert!(bind.leg_by_id[&1].owners.management.is_empty());
+    }
+
+    #[test]
+    fn web_lease_same_generation_transfers_and_old_generation_cannot_reap_new() {
+        let mut bind = ServerBind::new(Arc::new(|_| {}));
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote = sink.local_addr().unwrap();
+        let old_generation = register(&mut bind, remote, 1, 1);
+        let old = ManagementLease::new(10);
+        assert_eq!(bind.confirm_management_client(remote, old_generation, old.clone()), Confirmed);
+        register(&mut bind, remote, 1, 1);
+        assert!(bind.leg_by_id[&1].owners.management.contains_key(&10));
+        assert!(old.is_alive(), "same generation transfer is not a RELEASE");
+        let new_generation = register(&mut bind, remote, 1, 2);
+        let new = ManagementLease::new(11);
+        assert_eq!(bind.confirm_management_client(remote, new_generation, new.clone()), Confirmed);
+        old.cancel();
+        bind.sweep_management_leases();
+        assert!(bind.leg_by_id[&1].owners.management.contains_key(&11));
+        assert_eq!(bind.confirm_management_client(remote, old_generation, new), GenerationMismatch);
+    }
+
+    #[test]
+    fn web_lease_clear_replay_preserves_fixed_generation_shared_owners_and_data() {
+        let mut bind = ServerBind::new(Arc::new(|_| {}));
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        sink.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let remote = sink.local_addr().unwrap();
+        let generation = register(&mut bind, remote, 1, 1);
+        let first = ManagementLease::new(1);
+        let second = ManagementLease::new(2);
+        assert_eq!(bind.confirm_client(remote, generation), Confirmed);
+        assert_eq!(bind.confirm_management_client(remote, generation, first.clone()), Confirmed);
+        assert_eq!(bind.confirm_management_client(remote, generation, second.clone()), Confirmed);
+        bind.clear_legs();
+        bind.clear_legs();
+        bind.sweep_management_leases();
+        assert!(bind.leg_fds().is_empty());
+        assert!(first.is_alive() && second.is_alive());
+        assert_eq!(bind.admitted_generations[&remote].owners.management.len(), 2);
+        let mut packet = [0; 256];
+        sink.set_nonblocking(true).unwrap();
+        while sink.recv(&mut packet).is_ok() {} // Drain old LEGUP/CLADM before replay.
+        sink.set_nonblocking(false).unwrap();
+        register(&mut bind, remote, 1, 1);
+        assert!(bind.leg_by_id[&1].owners.network);
+        assert_eq!(bind.leg_by_id[&1].owners.management.len(), 2);
+        assert!(first.is_alive() && second.is_alive());
+        let source = bind.leg_by_id[&1].sock.local_addr().unwrap();
+        // Old socket datagrams may still be in-flight after clear; identify the actual replay socket.
+        let deadline = Instant::now() + Duration::from_secs(1);
+        loop {
+            let (n, from) = sink.recv_from(&mut packet).unwrap();
+            if from.port() == source.port() && &packet[..n] == b"LEGUP" { break; }
+            assert!(Instant::now() < deadline);
+        }
+        let source = SocketAddr::new(remote.ip(), source.port());
+        let mut frame = Vec::new();
+        crate::legframe::encode_frame(crate::legframe::FrameKind::Quic.to_wire(), b"same generation data", &mut frame);
+        sink.send_to(&frame, source).unwrap();
+        // Blocking recv waits for this actual UDP datagram, without an artificial timing sleep.
+        let leg = &bind.leg_by_id[&1];
+        leg.sock.set_nonblocking(false).unwrap();
+        leg.sock.set_read_timeout(Some(Duration::from_secs(1))).unwrap();
+        let fd = crate::sysock::udp_raw(&leg.sock);
+        assert_eq!(bind.leg_readable(fd).1.unwrap().quic.payload, b"same generation data");
+        bind.leg_by_id[&1].sock.set_nonblocking(true).unwrap();
+        first.cancel();
+        bind.sweep_management_leases();
+        assert!(second.is_alive());
+        second.cancel();
+        bind.sweep_management_leases();
+        assert!(bind.leg_by_id[&1].owners.network);
+        bind.remove_leg(1);
+        assert!(bind.leg_fds().is_empty() && bind.admitted_generations.is_empty());
+    }
+
+    #[test]
+    fn web_lease_clear_restores_live_snapshot_and_detached_memory_eviction_revokes() {
+        let mut bind = ServerBind::new(Arc::new(|_| {}));
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote = sink.local_addr().unwrap();
+        let generation = register(&mut bind, remote, 1, 1);
+        let lease = ManagementLease::new(1);
+        assert_eq!(bind.confirm_management_client(remote, generation, lease.clone()), Confirmed);
+        bind.admitted_generations.clear(); // A live leg remains owner source if its redundant snapshot was evicted.
+        bind.clear_legs();
+        assert!(lease.is_alive());
+        assert!(bind.admitted_generations[&remote].owners.management.contains_key(&1));
+        let mut sinks = Vec::new();
+        for id in 2..=33 {
+            let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let remote = sink.local_addr().unwrap();
+            let generation = register(&mut bind, remote, id, id as u8);
+            assert_eq!(bind.confirm_client(remote, generation), Confirmed);
+            sinks.push(sink);
+        }
+        assert!(!lease.is_alive(), "bounded detached snapshot eviction must revoke its unreachable owner");
+        assert_eq!(bind.admitted_generations.len(), 32);
+    }
+
+    #[test]
+    fn web_lease_live_leg_outlives_redundant_memory_ttl_but_detached_memory_expires() {
+        let mut bind = ServerBind::new(Arc::new(|_| {}));
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote = sink.local_addr().unwrap();
+        let generation = register(&mut bind, remote, 1, 1);
+        let lease = ManagementLease::new(1);
+        assert_eq!(bind.confirm_management_client(remote, generation, lease.clone()), Confirmed);
+        bind.admitted_generations.get_mut(&remote).unwrap().at -= RELAY_LEG_IDLE + Duration::from_secs(1);
+        bind.leg_by_id.get_mut(&1).unwrap().last = Instant::now();
+        bind.sweep_legs();
+        assert!(lease.is_alive(), "active transport outlives its redundant admission cache");
+        assert!(bind.admitted_generations.is_empty());
+        assert!(bind.leg_by_id[&1].owners.management.contains_key(&1));
+        bind.clear_legs();
+        assert!(lease.is_alive(), "clear reconstructs live owner snapshot even after cache eviction");
+        register(&mut bind, remote, 1, 1);
+        assert!(bind.leg_by_id[&1].client_admitted && lease.is_alive());
+        bind.clear_legs();
+        bind.admitted_generations.get_mut(&remote).unwrap().at -= RELAY_LEG_IDLE + Duration::from_secs(1);
+        bind.sweep_legs();
+        assert!(!lease.is_alive(), "detached owner has only a bounded replay window");
+        assert!(bind.admitted_generations.is_empty());
+    }
+
+    #[test]
+    fn web_lease_reconnect_gap_release_cancel_expiry_and_drop_revoke() {
+        let mut bind = ServerBind::new(Arc::new(|_| {}));
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote = sink.local_addr().unwrap();
+        for case in 0..4 {
+            let generation = register(&mut bind, remote, 1, 1);
+            let lease = ManagementLease::new(case);
+            assert_eq!(bind.confirm_management_client(remote, generation, lease.clone()), Confirmed);
+            bind.clear_legs();
+            match case {
+                0 => bind.remove_leg(1),
+                1 => { lease.cancel(); bind.sweep_management_leases(); }
+                2 => {
+                    bind.admitted_generations.get_mut(&remote).unwrap().at -= RELAY_LEG_IDLE + Duration::from_secs(1);
+                    bind.sweep_legs();
+                }
+                _ => { drop(bind); assert!(!lease.is_alive()); return; }
+            }
+            assert!(!lease.is_alive());
+            assert!(bind.admitted_generations.is_empty());
+            register(&mut bind, remote, 1, 1);
+            assert!(!bind.leg_by_id[&1].client_admitted, "released owner cannot be resurrected by replay");
+            bind.remove_leg(1);
+        }
+    }
+
+    #[test]
+    fn web_lease_replay_marker_cannot_be_reused_with_a_different_session_id() {
+        let mut bind = ServerBind::new(Arc::new(|_| {}));
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote = sink.local_addr().unwrap();
+        let generation = register(&mut bind, remote, 1, 1);
+        let old = ManagementLease::new(1);
+        assert_eq!(bind.confirm_management_client(remote, generation, old.clone()), Confirmed);
+        let marker = bind.leg_by_id[&1].admission_marker.clone();
+        bind.clear_legs();
+        bind.register_leg_with_admission(2, remote, b"LEGUP", &marker).unwrap();
+        assert!(!old.is_alive());
+        assert!(!bind.leg_by_id[&2].client_admitted);
+        assert!(bind.leg_by_id[&2].owners.management.is_empty());
+        assert!(bind.admitted_generations.is_empty());
+    }
+
+    #[test]
+    fn web_lease_same_id_new_remote_or_cookie_never_inherits_first_remote_owner() {
+        for clear in [false, true] {
+            for change_remote in [false, true] {
+                let mut bind = ServerBind::new(Arc::new(|_| {}));
+                let old_sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+                let new_sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+                let old_remote = old_sink.local_addr().unwrap();
+                let new_remote = if change_remote { new_sink.local_addr().unwrap() } else { old_remote };
+                let old_generation = register(&mut bind, old_remote, 1, 1);
+                let old = ManagementLease::new(1);
+                assert_eq!(bind.confirm_client(old_remote, old_generation), Confirmed);
+                assert_eq!(bind.confirm_management_client(old_remote, old_generation, old.clone()), Confirmed);
+                if clear { bind.clear_legs(); }
+                let new_generation = register(&mut bind, new_remote, 1, if change_remote { 1 } else { 2 });
+                assert!(!old.is_alive());
+                assert!(!bind.leg_by_id[&1].client_admitted);
+                assert!(!bind.leg_by_id[&1].owners.network);
+                assert!(bind.leg_by_id[&1].owners.management.is_empty());
+                let fresh = ManagementLease::new(2);
+                assert_eq!(bind.confirm_management_client(new_remote, new_generation, fresh.clone()), Confirmed);
+                old.cancel();
+                bind.sweep_management_leases();
+                assert!(fresh.is_alive());
+                assert_eq!(bind.leg_by_id[&1].owners.management.len(), 1);
+                drop(bind);
+                assert!(!fresh.is_alive());
+            }
+        }
+    }
+
+    #[test]
+    fn web_lease_release_before_quic_close_invalidates_only_owned_generation() {
+        let mut bind = ServerBind::new(Arc::new(|_| {}));
+        let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let remote = sink.local_addr().unwrap();
+        let generation = register(&mut bind, remote, 1, 1);
+        let first = ManagementLease::new(1);
+        let second = ManagementLease::new(2);
+        assert_eq!(bind.confirm_management_client(remote, generation, first.clone()), Confirmed);
+        assert_eq!(bind.confirm_management_client(remote, generation, second.clone()), Confirmed);
+        bind.remove_leg(1); // relay→exit RELEASE先于任何QUIC关闭报文。
+        assert!(!first.is_alive());
+        assert!(!second.is_alive());
+        assert!(bind.leg_by_id.is_empty());
+        assert!(bind.admitted_generations.is_empty());
+    }
+
+    #[test]
+    fn web_lease_missing_cancelled_full_and_duplicate_results_are_explicit() {
+        let mut bind = ServerBind::new(Arc::new(|_| {}));
+        let mut sinks = Vec::new();
+        let absent: SocketAddr = "127.0.0.1:1".parse().unwrap();
+        let generation = RelayGeneration { sid: 1, cookie: [1; 16] };
+        assert_eq!(bind.confirm_management_client(absent, generation, ManagementLease::new(1)), LegMissing);
+        for i in 1..=33 {
+            let sink = UdpSocket::bind("127.0.0.1:0").unwrap();
+            let remote = sink.local_addr().unwrap();
+            let generation = register(&mut bind, remote, i, i as u8);
+            if i <= 32 { assert_eq!(bind.confirm_client(remote, generation), Confirmed); }
+            else {
+                assert_eq!(bind.confirm_management_client(remote, generation, ManagementLease::new(99)), CapacityFull);
+                let cancelled = ManagementLease::new(100);
+                cancelled.cancel();
+                assert_eq!(bind.confirm_management_client(remote, generation, cancelled), GenerationMismatch);
+                assert!(!bind.leg_by_id[&i].client_admitted);
+            }
+            sinks.push(sink);
+        }
+    }
 }
 
 /// 腿 fd 可读的产出（`leg_readable` 的返回契约）：`Some` = 一条 kind=5 载荷待注入
@@ -94,11 +396,22 @@ pub struct ServerBind {
     /// 曾当过一次腿的远端地址（Send 兜底丢弃判据；不受 5min 窗限制——#17）。
     leg_ports: HashSet<SocketAddr>,
     /// 控制重连重放同代 cookie 时保留真实准入事实；新 cookie/remote 绝不复用。
-    admitted_generations: HashMap<SocketAddr, (Vec<u8>, Instant)>,
+    admitted_generations: HashMap<SocketAddr, AdmissionMemory>,
     /// 腿面上收到的 kind=5（QUIC 载荷）报文数（M1 S1c §1.6）。
     quic_leg_pkts: u64,
     /// 因 QUIC 面不可用而丢掉的 kind=5 报文数（丢可见面）。
     quic_leg_undelivered: u64,
+}
+
+impl Drop for ServerBind {
+    fn drop(&mut self) {
+        for leg in self.leg_by_id.values() {
+            for lease in leg.owners.management.values() { lease.cancel(); }
+        }
+        for memory in self.admitted_generations.values() {
+            for lease in memory.owners.management.values() { lease.cancel(); }
+        }
+    }
 }
 
 impl ServerBind {
@@ -192,16 +505,33 @@ impl ServerBind {
             .map(|lg| lg.legup_started).unwrap_or_else(Instant::now);
         let was_admitted = !admission_marker.is_empty() && (
             self.leg_by_id.get(&id).is_some_and(|lg| lg.remote == remote && lg.client_admitted && lg.admission_marker == admission_marker)
-            || self.admitted_generations.get(&remote).is_some_and(|(marker, at)| marker == admission_marker && at.elapsed() < RELAY_LEG_IDLE)
+            || self.admitted_generations.get(&remote).is_some_and(|memory| memory.id == id && memory.marker == admission_marker && memory.at.elapsed() < RELAY_LEG_IDLE)
         );
+        let owners = if was_admitted {
+            self.leg_by_id.get(&id).filter(|lg| lg.remote == remote && lg.generation == generation)
+                .map(|lg| lg.owners.clone())
+                .or_else(|| self.admitted_generations.get(&remote).map(|memory| memory.owners.clone()))
+                .unwrap_or_default()
+        } else { LegOwners::default() };
+        // 管理连接认证钉定首次remote与代际。缺腿期间的memory也不能跨地址/新cookie继承。
+        let stale: Vec<_> = self.admitted_generations.iter()
+            .filter(|(address, memory)| (memory.id == id || **address == remote)
+                && !(was_admitted && **address == remote && memory.marker == admission_marker))
+            .map(|(address, _)| *address).collect();
+        for address in stale { self.revoke_admission_memory(&address); }
         let pre_count = self.leg_by_id.values().filter(|lg| !lg.client_admitted).count();
         if !was_admitted && pre_count >= RELAY_LEG_MAX {
             let oldest = self.leg_by_id.values().filter(|lg| !lg.client_admitted)
                 .min_by_key(|lg| lg.created).map(|lg| lg.id);
             if let Some(oldest) = oldest { self.remove_leg(oldest); }
         }
-        if let Some(old) = self.leg_by_id.get(&id) {
+        if let Some(old) = self.leg_by_id.get_mut(&id) {
             let old_remote = old.remote;
+            // 相同认证代际重登只是换发送socket，活位由上方owners移交，不能撤销。
+            if was_admitted && old.remote == remote && old.generation == generation {
+                old.owners.management.clear();
+                self.admitted_generations.remove(&old_remote);
+            }
             self.remove_leg_by(&id, &old_remote);
         }
         if let Some(old_id) = self.leg_by_r.get(&remote).copied() {
@@ -222,6 +552,7 @@ impl ServerBind {
                 last: Instant::now(),
                 created: Instant::now(),
                 client_admitted: was_admitted,
+                owners,
                 admission_marker: admission_marker.to_vec(),
                 admission_ack: false,
                 admission_retry: 0,
@@ -234,13 +565,31 @@ impl ServerBind {
         Ok(())
     }
 
-    /// QUIC RREG/token 准入成功后调用；不能由 LEGUP/包头/首个回包触发。
-    pub fn confirm_client(&mut self, remote: SocketAddr, generation: homeway_quic::RelayGeneration) {
-        let Some(id) = self.leg_by_r.get(&remote).copied() else { return };
+    /// 普通设备准入保持原行为，另记录网络所有权，管理关闭不能拆此腿。
+    pub fn confirm_client(&mut self, remote: SocketAddr, generation: homeway_quic::RelayGeneration) -> homeway_quic::ClientConfirmation {
+        self.confirm_owner(remote, generation, None)
+    }
+
+    pub fn confirm_management_client(&mut self, remote: SocketAddr, generation: homeway_quic::RelayGeneration, lease: homeway_quic::ManagementLease) -> homeway_quic::ClientConfirmation {
+        if !lease.is_alive() { return homeway_quic::ClientConfirmation::GenerationMismatch; }
+        self.confirm_owner(remote, generation, Some(lease))
+    }
+
+    fn confirm_owner(&mut self, remote: SocketAddr, generation: homeway_quic::RelayGeneration, lease: Option<homeway_quic::ManagementLease>) -> homeway_quic::ClientConfirmation {
+        use homeway_quic::ClientConfirmation::*;
+        self.sweep_management_leases();
+        let Some(id) = self.leg_by_r.get(&remote).copied() else { return LegMissing; };
         let formal = self.leg_by_id.values().filter(|lg| lg.client_admitted).count();
-        let Some(lg) = self.leg_by_id.get_mut(&id) else { return };
-        if lg.generation != Some(generation) { return; }
-        if !lg.client_admitted && formal >= 32 { return; }
+        let managed: usize = self.leg_by_id.values().map(|lg| lg.owners.management.len()).sum();
+        let Some(lg) = self.leg_by_id.get_mut(&id) else { return LegMissing; };
+        if lg.generation != Some(generation) { return GenerationMismatch; }
+        if !lg.client_admitted && formal >= 32 { return CapacityFull; }
+        if let Some(lease) = lease {
+            if !lg.owners.management.contains_key(&lease.conn_id()) && managed >= homeway_quic::web::MAX_SESSIONS { return CapacityFull; }
+            lg.owners.management.insert(lease.conn_id(), lease);
+        } else {
+            lg.owners.network = true;
+        }
         lg.client_admitted = true;
         lg.admission_ack = false;
         lg.admission_retry = 0;
@@ -248,14 +597,43 @@ impl ServerBind {
         let marker = lg.admission_marker.clone();
         if !marker.is_empty() { self.remember_admitted_generation(remote, marker); }
         self.retry_client_admissions();
+        Confirmed
+    }
+
+    /// 每轮调用；关闭活位不能丢失，且只销本代最后一个纯管理所有者。
+    pub fn sweep_management_leases(&mut self) {
+        let mut remove = Vec::new();
+        for lg in self.leg_by_id.values_mut() {
+            let had = !lg.owners.management.is_empty();
+            lg.owners.management.retain(|_, lease| lease.is_alive());
+            if had && lg.owners.management.is_empty() && !lg.owners.network {
+                remove.push((lg.id, lg.remote));
+            }
+        }
+        for (id, remote) in remove { self.remove_leg_by(&id, &remote); }
+        self.admitted_generations.retain(|_, memory| {
+            let had = !memory.owners.management.is_empty();
+            memory.owners.management.retain(|_, lease| lease.is_alive());
+            !had || memory.owners.network || !memory.owners.management.is_empty()
+        });
     }
 
     fn remember_admitted_generation(&mut self, remote: SocketAddr, marker: Vec<u8>) {
         if !self.admitted_generations.contains_key(&remote) && self.admitted_generations.len() >= 32 {
-            let oldest = self.admitted_generations.iter().min_by_key(|(_, (_, at))| *at).map(|(remote, _)| *remote);
-            if let Some(oldest) = oldest { self.admitted_generations.remove(&oldest); }
+            let oldest = self.admitted_generations.iter().min_by_key(|(_, memory)| memory.at).map(|(remote, _)| *remote);
+            if let Some(oldest) = oldest {
+                if self.leg_by_r.contains_key(&oldest) {
+                    // 活腿自己仍持有owner；这里只淘汰冗余replay记忆。
+                    self.admitted_generations.remove(&oldest);
+                } else {
+                    self.revoke_admission_memory(&oldest);
+                }
+            }
         }
-        self.admitted_generations.insert(remote, (marker, Instant::now()));
+        let Some(leg) = self.leg_by_r.get(&remote).and_then(|id| self.leg_by_id.get(id)) else { return; };
+        self.admitted_generations.insert(remote, AdmissionMemory {
+            id: leg.id, marker, at: Instant::now(), owners: leg.owners.clone(),
+        });
     }
 
     /// Engine tick 调用，ACK 前每秒最多一次，最多十次；不阻塞主循环。
@@ -282,21 +660,42 @@ impl ServerBind {
             let remote = lg.remote;
             self.remove_leg_by(&id, &remote);
         }
+        // RELEASE也可能夹在控制重连clear与SESSION replay之间。
+        let memories: Vec<_> = self.admitted_generations.iter()
+            .filter(|(_, memory)| memory.id == id).map(|(remote, _)| *remote).collect();
+        for remote in memories { self.revoke_admission_memory(&remote); }
     }
 
     /// 拆全部腿（控制面重连对账——中继在 OK 后会重放全量 SESSION）。
     pub fn clear_legs(&mut self) {
-        let generations = std::mem::take(&mut self.admitted_generations);
-        let ids: Vec<u64> = self.leg_by_id.keys().copied().collect();
-        for id in ids { self.remove_leg(id); }
-        self.admitted_generations = generations;
+        // 已认证控制面重连只重建传输socket；同remote/完整marker的准入owner留待replay。
+        // 明确RELEASE、换代、换remote仍走下面的撤销路径。
+        // 活腿是owner真源，先补齐可能被32条记忆上限淘汰的冗余快照。
+        let admitted: Vec<_> = self.leg_by_id.values().filter(|leg| leg.client_admitted)
+            .map(|leg| (leg.remote, leg.admission_marker.clone())).collect();
+        for (remote, marker) in admitted { self.remember_admitted_generation(remote, marker); }
+        let legs: Vec<_> = self.leg_by_id.values().map(|leg| (leg.id, leg.remote)).collect();
+        for (id, remote) in legs { self.detach_leg_by(&id, &remote); }
     }
 
-    /// 摘一条腿（双表摘除 + socket 随 drop 关闭 + 摘除地址进 leg_recent）。
+    fn revoke_admission_memory(&mut self, remote: &SocketAddr) {
+        if let Some(memory) = self.admitted_generations.remove(remote) {
+            for lease in memory.owners.management.values() { lease.cancel(); }
+        }
+    }
+
+    /// 明确拆腿撤销owner；与控制重连暂拆socket不同。
     fn remove_leg_by(&mut self, id: &u64, remote: &SocketAddr) {
-        self.admitted_generations.remove(remote);
-        if let Some(lg) = self.leg_by_id.remove(id) {
-            let _ = lg; // socket 关闭
+        if let Some(leg) = self.leg_by_id.get(id) {
+            for lease in leg.owners.management.values() { lease.cancel(); }
+        }
+        self.revoke_admission_memory(remote);
+        self.detach_leg_by(id, remote);
+    }
+
+    /// 只摘socket/双表，准入memory与lease活位不变。
+    fn detach_leg_by(&mut self, id: &u64, remote: &SocketAddr) {
+        if self.leg_by_id.remove(id).is_some() {
             self.leg_recent.insert(*remote, Instant::now());
         }
         if self.leg_by_r.get(remote) == Some(id) {
@@ -373,7 +772,15 @@ impl ServerBind {
         }
         self.leg_recent
             .retain(|_, at| now.duration_since(*at) <= LEG_RECENT_TTL);
-        self.admitted_generations.retain(|_, (_, at)| now.duration_since(*at) <= RELAY_LEG_IDLE);
+        let live_remotes = &self.leg_by_r;
+        self.admitted_generations.retain(|remote, memory| {
+            let keep = now.duration_since(memory.at) <= RELAY_LEG_IDLE;
+            // 活腿上的owner不受冗余cache TTL影响；缺腿后仅存的memory过期则撤销。
+            if !keep && !live_remotes.contains_key(remote) {
+                for lease in memory.owners.management.values() { lease.cancel(); }
+            }
+            keep
+        });
     }
 
     /// 腿表当前 fd 集（驱动线程 poll 用）。

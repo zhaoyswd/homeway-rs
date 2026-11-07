@@ -90,6 +90,7 @@ echo "  -- QUIC 岛隔离源码门（五条断言）"
 
 echo "==> [4/7] 向量确定性门（gen-vectors + SUMS + git diff）"
 "$REPO_ROOT/tools/gen-vectors.sh" >/dev/null || fail 4 "向量生成"
+python3 "$REPO_ROOT/tools/gen-webserve-vectors.py" --check || fail 4 "WebServe 独立向量确定性"
 (cd "$REPO_ROOT/fixtures" && shasum -c SHA256SUMS >/dev/null) || fail 4 "SHA256SUMS 校验"
 git -C "$REPO_ROOT" diff --quiet -- fixtures/vectors/ || fail 4 "向量 diff 非空（语义漂移）"
 

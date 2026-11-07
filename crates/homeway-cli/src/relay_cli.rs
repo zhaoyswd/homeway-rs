@@ -124,6 +124,7 @@ pub fn parse_listen(v: &str) -> Option<SocketAddr> {
 /// `shutdown` 幂等（`stop()`/`Drop` 共用，`Option::take` 保证不可重入 ⇒ 结构上
 /// 消除「写已复用 fd 号」与「double-close」）。
 pub struct RelayProc {
+    pub(crate) registry: homeway_core::relay::registry::RegistryHandle,
     stop: Option<homeway_core::relay::StopPipe>,
     join: Option<std::thread::JoinHandle<()>>,
     /// run 线程在世位（线程出口清零——panic 也清；统一进程 supervisor 的运行期
@@ -155,6 +156,7 @@ impl RelayProc {
     /// 注：SIG_DFL 防的是**后续**信号；in-flight handler 的窗口由「`swap(-1)` 先于
     /// close + `join` 先于 close」兜住（N9 的原归因在此订正——见 QG.md §4）。
     fn shutdown(&mut self) {
+        self.registry.clear();
         let Some(stop) = self.stop.take() else {
             return; // 已收口（幂等）
         };
@@ -245,11 +247,16 @@ pub fn assemble_relay(
     let auth = if a.open { None } else { Some(secret) };
     let mut cfg = Config::new(a.listen, auth, log2.logf_fn());
     cfg.no_hints = a.no_hints;
+    let registry = homeway_core::relay::registry::RegistryHandle::new();
+    cfg.registry = Some(registry.clone());
+    let (ready_tx, ready_rx) = std::sync::mpsc::sync_channel(1);
     // F9：探针应答上报真实构建（此前 `Config.build` 全仓无赋值 ⇒ 恒 "relay-dev"）
     cfg.build = homeway_core::BUILD_STR.to_owned();
     let relay = Relay::new(cfg);
     let adv = a.advertise;
-    let on_ready = move |port: u16| match rltoken::build_token(
+    let on_ready = move |port: u16| {
+        let _ = ready_tx.send(());
+        match rltoken::build_token(
         &secret,
         &adv,
         port,
@@ -267,7 +274,7 @@ pub fn assemble_relay(
         Err(e) => {
             log2.logf(&format!("⚠️ token 生成失败（{e}）—— 后端可用裸地址走开放模式"));
         }
-    };
+    }};
     // 只建 pipe、不装信号 handler（统一进程形态：信号 handler 由宿主统一安装——
     // 装配期覆盖宿主 handler 会造成「relay 收工、主线程挂等」的半死窗口，评审 r1-Z5）。
     // Q-G F3：管道**每次装配新建**（去单例）；读端裸值交 run（借用契约），
@@ -295,7 +302,12 @@ pub fn assemble_relay(
             }
         })
         .expect("spawn relay");
-    Ok(RelayProc { stop: Some(stop), join: Some(join), exited, armed_here: false })
+    let mut proc = RelayProc { registry, stop: Some(stop), join: Some(join), exited, armed_here: false };
+    if ready_rx.recv_timeout(std::time::Duration::from_secs(5)).is_err() {
+        proc.shutdown();
+        return Err("中继未在5秒内完成真实UDP监听".to_owned());
+    }
+    Ok(proc)
 }
 
 /// `homeway relay [...]`：前台中继（Ctrl-C / SIGTERM 收工——确定性 closeAll）。
@@ -421,6 +433,7 @@ mod tests {
         let stop = homeway_core::relay::StopPipe::new().unwrap();
         let w_fd = stop.write_fd();
         let mut proc = RelayProc {
+            registry: homeway_core::relay::registry::RegistryHandle::new(),
             stop: Some(stop),
             join: None, // 无 run 线程：只测 arm/shutdown 结构面
             exited: Arc::new(std::sync::atomic::AtomicBool::new(true)),

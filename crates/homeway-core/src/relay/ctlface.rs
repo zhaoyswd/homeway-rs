@@ -73,6 +73,7 @@ impl Drop for HandshakeSlot {
 pub struct Handover {
     pub stream: TcpStream,
     pub label: [u8; 8],
+    pub public_key: [u8; 32],
     pub remote: SocketAddr,
     permit: EstablishedPermit,
 }
@@ -239,13 +240,14 @@ pub fn run_handshake(
     stream.set_read_timeout(None).map_err(|_| HsError::Io)?;
     stream.set_write_timeout(None).map_err(|_| HsError::Io)?;
     stream.set_nonblocking(true).map_err(|_| HsError::Io)?;
-    Ok(Handover { stream, label, remote, permit })
+    Ok(Handover { stream, label, public_key: pub_, remote, permit })
 }
 
 /// 已建立控制连接（驱动线程独占）。
 pub struct CtlConn {
     pub stream: TcpStream,
     pub label: [u8; 8],
+    pub public_key: [u8; 32],
     pub remote: SocketAddr,
     pub decoder: rw::CtlDecoder,
     pub last_read: std::time::Instant,
@@ -257,6 +259,7 @@ impl CtlConn {
         Self {
             stream: h.stream,
             label: h.label,
+            public_key: h.public_key,
             remote: h.remote,
             decoder: rw::CtlDecoder::new(),
             last_read: std::time::Instant::now(),
@@ -497,6 +500,7 @@ mod tests {
         let mut conn = CtlConn {
             stream: b,
             label: [0; 8],
+            public_key: [0; 32],
             remote: "127.0.0.1:1".parse().unwrap(),
             decoder: rw::CtlDecoder::new(),
             last_read: std::time::Instant::now(),

@@ -19,6 +19,7 @@
 pub mod ctlface;
 pub mod logfile;
 pub mod rltoken;
+pub mod registry;
 
 use std::collections::{HashMap, HashSet};
 use std::io;
@@ -98,6 +99,7 @@ enum RejectLog {
 pub struct Config {
     /// 监听地址（如 `0.0.0.0:41741`；端口被占退让 +1…+9 → 随机）。
     pub listen: SocketAddr,
+    pub registry: Option<registry::RegistryHandle>,
     pub idle_timeout: Duration,
     pub leg_timeout: Duration,
     pub dial_wait: Duration,
@@ -122,6 +124,7 @@ impl Config {
     pub fn new(listen: SocketAddr, secret: Option<[u8; 32]>, logf: Logf) -> Self {
         Self {
             listen,
+            registry: None,
             idle_timeout: DEFAULT_IDLE_TIMEOUT,
             leg_timeout: DEFAULT_LEG_TIMEOUT,
             dial_wait: DEFAULT_DIAL_WAIT,
@@ -461,7 +464,13 @@ impl Relay {
         bump_sock_bufs(&udp);
         udp.set_nonblocking(true)?;
         let actual_port = udp.local_addr()?.port();
+        let actual_address = udp.local_addr()?;
+        if let Some(registry) = &self.cfg.registry { registry.publish(actual_address, std::iter::empty(), 0); }
         on_ready(actual_port);
+        struct RegistryGuard(Option<registry::RegistryHandle>);
+        impl Drop for RegistryGuard { fn drop(&mut self) { if let Some(r) = &self.0 { r.clear(); } } }
+        let _registry_guard = RegistryGuard(self.cfg.registry.clone());
+        let mut next_registry = Instant::now();
 
         // TCP 控制监听与 UDP 实际端口同号（两个独立端口空间——部署零新增、token 不变）。
         // 起不来不致命：退回纯 UDP 中继（拨腿特性缺席）。
@@ -527,6 +536,16 @@ impl Relay {
         let mut assoc_buf = vec![0u8; 65535];
 
         loop {
+            if let Some(registry) = self.cfg.registry.clone() {
+                for release in registry.take_releases() {
+                    let key = AssocKey { label: release.label, client: release.client };
+                    if self.assocs.get(&key).is_some_and(|a| a.created <= release.cutoff) { self.reap_assoc(&key, "Web管理连接关闭"); }
+                }
+                if Instant::now() >= next_registry {
+                    registry.publish(actual_address, self.legs.iter().filter(|(_,leg)| leg.verified || (leg.ctl_verified && leg.ctl.is_some())).map(|(label,leg)| (leg.pubkey,*label)), self.assocs.len());
+                    next_registry = Instant::now() + Duration::from_millis(100);
+                }
+            }
             // ---- poll 集重建（成员变化时） ----
             let dirty = self.poll_dirty;
             if dirty {
@@ -552,7 +571,7 @@ impl Relay {
             }
 
             let now = Instant::now();
-            let mut timeout = 500i32;
+            let mut timeout = if self.cfg.registry.is_some() { 100i32 } else { 500i32 };
             if next_reap > now {
                 timeout = timeout.min(next_reap.duration_since(now).as_millis() as i32);
             }
@@ -1333,16 +1352,17 @@ impl Relay {
                 self.next_conn_id += 1;
                 let conn = ctlface::CtlConn::from_handover(h);
                 let remote = conn.remote;
+                let public_key = conn.public_key;
                 self.ctl_conns.insert(id, conn);
                 let leg = self.legs.entry(label).or_insert_with(|| Leg {
-                    pubkey: [0; 32], // 控制面建腿拿不到 pubkey——保留占位（准入靠 ctl_verified；
-                    // UDP PROOF 提升时会补上真 pubkey）
+                    pubkey: public_key, // TCP握手已验证完整身份
                     addr: None,
                     last: Instant::now(),
                     verified: false,
                     ctl_verified: false,
                     ctl: None,
                 });
+                leg.pubkey = public_key;
                 leg.ctl_verified = true;
                 leg.last = Instant::now();
                 // 顶掉旧连接（重连语义）：旧连的读事件随 fd 关闭消失
@@ -2195,6 +2215,94 @@ mod tests {
         leg_sock.send_to(&down, data_port_addr).unwrap();
         let (n, _) = cl.recv_from(&mut buf).unwrap();
         assert_eq!(&buf[..n], &down[..]);
+    }
+
+    fn wait_web_registry(mut predicate: impl FnMut() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while !predicate() {
+            assert!(Instant::now() < deadline, "Web管理注册快照未在期限内收敛");
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
+    #[test]
+    fn web_registry_publishes_authenticated_ctl_only_full_identity_and_clears_on_stop() {
+        use std::io::Read as _;
+        let registry = registry::RegistryHandle::new();
+        let secret = [0x44; 32];
+        let mut cfg = Config::new("127.0.0.1:0".parse().unwrap(), Some(secret), noop_logf());
+        cfg.registry = Some(registry.clone());
+        let mut relay = TestRelay::start(cfg);
+        let address = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), relay.port);
+        let private = rand_secret();
+        let public = PublicKey::from(&private);
+        let label = relay_id(public.as_bytes());
+        let mut ctl = ctl_connect(address);
+        ctl.set_read_timeout(Some(Duration::from_secs(3))).unwrap();
+        let mut frame = Vec::new();
+        rw::ctl_frame_into(&rw::encode_hello(public.as_bytes()), &mut frame);
+        ctl.write_all(&frame).unwrap();
+        let mut head = [0; 2];
+        ctl.read_exact(&mut head).unwrap();
+        let mut challenge = vec![0; u16::from_be_bytes(head) as usize];
+        ctl.read_exact(&mut challenge).unwrap();
+        let (ephemeral, nonce) = rw::decode_challenge(&challenge).unwrap();
+        // 已收到challenge仍只是pending；完整身份不应公开给gateway。
+        wait_web_registry(|| registry.address().is_some());
+        assert!(registry.lookup(public.as_bytes()).is_none());
+        assert_eq!(registry.counts().0, 0);
+        let dh = private.diffie_hellman(&PublicKey::from(ephemeral));
+        let mac = rw::auth_mac(&secret, &nonce, public.as_bytes());
+        frame.clear();
+        rw::ctl_frame_into(&rw::encode_proof(&nonce, dh.as_bytes(), public.as_bytes(), Some(&mac)), &mut frame);
+        ctl.write_all(&frame).unwrap();
+        ctl.read_exact(&mut head).unwrap();
+        let mut accepted = vec![0; u16::from_be_bytes(head) as usize];
+        ctl.read_exact(&mut accepted).unwrap();
+        assert!(rw::decode_ok_auth(&accepted).is_some());
+        wait_web_registry(|| registry.lookup(public.as_bytes()).is_some());
+        assert_eq!(registry.lookup(public.as_bytes()), Some((address, label)));
+        assert!(registry.lookup(&[0; 32]).is_none(), "ctl-only不能以占位公钥发布");
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        seed_initial(&client, address, &label);
+        wait_web_registry(|| registry.counts().1 == 1);
+        drop(ctl);
+        wait_web_registry(|| registry.lookup(public.as_bytes()).is_none());
+        assert_eq!(registry.counts().1, 1, "保留已有assoc不能使死ctl重新暴露新登录路由");
+        relay.stop();
+        assert!(registry.address().is_none());
+        assert_eq!(registry.counts(), (0, 0));
+    }
+
+    #[test]
+    fn web_registry_delayed_release_cannot_remove_reused_client_source() {
+        let registry = registry::RegistryHandle::new();
+        let mut cfg = Config::new("127.0.0.1:0".parse().unwrap(), None, noop_logf());
+        cfg.registry = Some(registry.clone());
+        let relay = TestRelay::start(cfg);
+        let address = SocketAddr::new(Ipv4Addr::LOCALHOST.into(), relay.port);
+        let backend = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let client = UdpSocket::bind("127.0.0.1:0").unwrap();
+        let private = rand_secret();
+        let public = PublicKey::from(&private);
+        let label = relay_id(public.as_bytes());
+        register_open(&backend, address, &private, &public, &label);
+        wait_web_registry(|| registry.lookup(public.as_bytes()).is_some());
+        seed_initial(&client, address, &label);
+        complete_udp_session(&backend, address);
+        wait_web_registry(|| registry.counts().1 == 1);
+        let old_cutoff = Instant::now();
+        assert!(registry.release_association(registry.epoch(), label, client.local_addr().unwrap(), old_cutoff));
+        wait_web_registry(|| registry.counts().1 == 0);
+        // 同一label+源IP:port创建新assoc后，排队晚到的旧关闭不能误删它。
+        seed_initial(&client, address, &label);
+        complete_udp_session(&backend, address);
+        wait_web_registry(|| registry.counts().1 == 1);
+        assert!(registry.release_association(registry.epoch(), label, client.local_addr().unwrap(), old_cutoff));
+        std::thread::sleep(Duration::from_millis(250));
+        assert_eq!(registry.counts().1, 1);
+        assert!(registry.release_association(registry.epoch(), label, client.local_addr().unwrap(), Instant::now()));
+        wait_web_registry(|| registry.counts().1 == 0);
     }
 
     /// 控制面保活回显：后端 KEEPALIVE → 中继必答（B3）——90s 读超时靠它续命。

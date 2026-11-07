@@ -72,18 +72,26 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
-> **2026-11-07/08 独立 WebServe（技术门通过，准备实现）**：用户授权按本轮对齐需求
-> 生成最终方案、完成技术 review，过门后开发。变更入口为
-> `openspec/changes/independent-webserve/`：独立 loopback HTTP/WS、网页终端复用 TUI、
-> 独立 webtoken、出口不开 HTTP 仍可经本机中继管理。首轮外评 B1–B8 已全部修订；
-> 第二轮 dsh exit0 明确技术门通过，11-08 独立补充复核管理 lease 精确销账与40轮验收
-> 后最终放行。完整原文与处置入口见 `docs/reviews/2026-11-07-webserve-design-review.md`、
-> `2026-11-07-webserve-design-r2.md`、`2026-11-07-webserve-design.md`；OpenSpec strict通过。
-> 下一步按任务实施、私有验收及代码门；不把方案过门记作产品完成。基线 `9a844f8`
-> workspace test/clippy 全绿（CLI231/core954/QUIC294/CAPI4及集成/doc；日志
-> `/tmp/homeway-webserve-baseline.YitVDe/`）。当前未改产品代码、未推送/发布/部署，
-> 生产实例与其他仓库不动。默认配置实际 serve/relay=false，旧统一进程事件串的
-> “默认true”是陈旧日志，方案已要求订正，不据此新增启动分叉。
+> **2026-11-07/08 独立 WebServe（完成，本地源码与私有验收）**：按用户授权完成最终方案、
+> 技术评审、开发及代码评审。变更入口 `openspec/changes/independent-webserve/`；规划提交
+> `bd00c0c`，实现/验收/本指针同批提交。独立`webserve`命令与`webserve.toml`，HTTP/WS只绑
+> `127.0.0.1`；独立稳定webtoken/轮换与热安装；仅Web主机可用本机TUI，本机中继可访问当前
+> 注册目标，出口不开HTTP仍可受控管理；浏览器运行独立PTY中的既有TUI，关闭不KILL工作会话。
+> 使用/反代手册为`docs/WEBSERVE.md`，旧config、网络token与正常准入wire保持。
+> 技术门及管理销账补核通过；r3/r4阻塞与M/L/F逐项整改，r5静态通过后独立补核CI/cross/新件
+> 条件，最终总代码门**通过，保留已披露非阻塞边界**。完整原文、处置与最终结论见
+> `docs/reviews/2026-11-08-webserve-code-review-r5.md`，QA与实现证据分别见同目录
+> `2026-11-08-webserve-qa.md`、`2026-11-08-webserve-implementation.md`。
+> 最终私有件`1c955a41…9085`完整`--browser --extended`实际exit0：40轮资源回基线、无HTTP
+> 双目标、凭证/票据/重启、真实Chrome中文/宽字符/剪贴板/两页面/80KiB跨UTF8与SHA、超2MiB
+> 零载荷拒绝、父进程突失无孤儿/替代均有receipt；候选后仅已登记并由CI执行的测试增量。
+> 最终ci-local quick实际exit0（837.12s、RRR317s，CAPI4、CLI256+5集成、core976、QUIC314），
+> clippy/隔离11/向量SUMS/词表/release通过；OHOS真链接20/20导出、`.so`2,943,760B，OHOS、
+> musl双架构、Windows编译检查均exit0，不扩大为跨平台运行验收。E11既有豁免/DNS不适用保留。
+> 首轮CI与所有私有失败均留证；基线旧Proof晚裁决取消缺陷经独立核准最小修复，未混同失败签名。
+> 保留边界：Unicode11与Rust宽表差异、精确2MiB/+1未实测、条件性浏览器错误文案优先级、
+> 未注入control-only TCP/WSS全链故障，以及非本地运行平台，详见r5；不冒充已测或无任何限制。
+> 现役进程/系统PATH/state/身份与其他仓均未改，未推送、发版或部署；后续上线仍走正式Release链。
 
 > **2026-11-07 v0.3.27 发版部署（完成）**：用户明确授权提交/发版/部署，并要求
 > 当前Mac最后切换，防止承载会话提前中断。`8e46324`推main并在头上打v0.3.27，

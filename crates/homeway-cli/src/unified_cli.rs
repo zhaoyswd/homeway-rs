@@ -211,6 +211,7 @@ pub(crate) fn parse_unified_args(args: &[String]) -> UnifiedInvocation {
                 println!("  homeway host add|list|status|delete      主机：客户端加出口凭证");
                 println!("  homeway term new|list|attach|delete      出口机上的终端");
                 #[cfg(not(windows))]
+                println!("  homeway webserve                        本机Web终端入口与管理凭证");
                 println!("  homeway tui                             交互式主机与终端会话界面");
                 println!("  homeway files list|get|put|…             出口机上的文件");
                 println!("  homeway forward add|list|delete          端口转发");
@@ -264,6 +265,8 @@ struct RolesInner {
 }
 
 struct UnifiedRoles {
+    #[cfg(not(windows))]
+    web: Option<Arc<crate::webserve::Host>>,
     state_dir: PathBuf,
     #[cfg(not(windows))]
     terminal: Option<Arc<homeway_core::term::service::TermService>>,
@@ -305,6 +308,12 @@ impl UnifiedRoles {
     fn assemble_serve(&self) -> Result<(Arc<ServeEngine>, bool), String> {
         let fc = load_config_strict(&self.state_dir)?;
         let cfg = serve_config_of(&fc, &self.state_dir)?;
+        #[cfg(not(windows))]
+        let cfg = {
+            let mut cfg=cfg;
+            if let Some(web)=&self.web {if web.terminal_available {cfg.web_management=Some(web.management_config());}}
+            cfg
+        };
         let upnp = cfg.upnp;
         #[cfg(not(windows))]
         let engine = ServeEngine::start_with_term_service(
@@ -790,6 +799,17 @@ impl UnifiedRoles {
 }
 
 impl RoleHost for UnifiedRoles {
+    fn webserve_op(&self, op: homeway_core::daemon::vocab::OpName, args: serde_json::Value) -> Result<serde_json::Value, BackendErr> {
+        #[cfg(not(windows))]
+        {
+            self.web.as_ref().ok_or(BackendErr::Web {
+                category: homeway_core::daemon::proto::WebFailure::Unavailable, source: None,
+            })?.operation(op.as_str(),args).map_err(crate::webserve::Error::into_backend)
+        }
+        #[cfg(windows)]
+        { let _=(op,args); Err(BackendErr::Web { category: homeway_core::daemon::proto::WebFailure::Unavailable, source: None }) }
+    }
+
     fn role_op(&self, op: RoleOp) -> Result<RoleOpOut, BackendErr> {
         let mut inner = self.inner.lock().unwrap_or_else(|e| e.into_inner());
         use RoleOp as R;
@@ -1113,7 +1133,7 @@ impl RoleHost for UnifiedRoles {
                         enabled: inner.cfg.relay.enabled,
                         state: if running { "running" } else { "stopped" }.to_owned(),
                         reason: (!inner.relay_reason.is_empty()).then(|| inner.relay_reason.clone()),
-                        listen: inner.relay_listen.clone(),
+                        listen: inner.relay.as_ref().and_then(|proc|proc.registry.address()).map(|address|address.to_string()).or_else(||inner.relay_listen.clone()),
                         advertise: inner.cfg.relay.advertise.clone().filter(|s| !s.is_empty()),
                         token_mask,
                         open: false,
@@ -1214,7 +1234,7 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
         }
     };
     if ns.config_generated {
-        ns.events.eventf("config.toml 缺失——已生成默认（serve.enabled=true）");
+        ns.events.eventf("config.toml 缺失——已生成默认（serve.enabled=false，relay.enabled=false）");
     }
 
     // ③ 读 config（fail-fast：非法 = 可行动错误**拒启**——Go `nodeconfig.Load` 同形，
@@ -1282,7 +1302,13 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
         daemon_logf(&format!("local-term: 本地终端监听失败（{error}）——本地终端降级，其余角色继续；修复state后重启可恢复"));
         None
     });
+    #[cfg(not(windows))]
+    let web = match crate::webserve::Host::new(state_dir.clone(),local_terminal.is_some()) {
+        Ok(web)=>Some(web), Err(error)=>{daemon_logf(&format!("Web管理初始化失败：{error}"));None}
+    };
     let roles = Arc::new(UnifiedRoles {
+        #[cfg(not(windows))]
+        web: web.clone(),
         state_dir: state_dir.clone(),
         #[cfg(not(windows))]
         terminal: local_terminal.as_ref().map(crate::local_term::LocalTerm::service),
@@ -1310,6 +1336,14 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
     });
 
     roles.set_self_ref(Arc::downgrade(&roles));
+    #[cfg(not(windows))]
+    if let Some(web)=&web {
+        let weak=Arc::downgrade(&roles);
+        web.set_runtime(Arc::new(move||weak.upgrade().map_or_else(crate::webserve::RuntimeInfo::default,|roles|{
+            let inner=roles.inner.lock().unwrap_or_else(|e|e.into_inner());
+            crate::webserve::RuntimeInfo{serve_on:inner.serve.is_some(),registry:inner.relay.as_ref().map(|r|r.registry.clone())}
+        })));
+    }
 
     // ⑥ client 角色恒开（hosts.json 表 + 每主机常驻会话；事件总线进程级唯一；
     // 承载面随表同生命周期——forwards.json/socks.json 重建监听 + speedtest 运行面）。
@@ -1439,6 +1473,8 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
             .expect("线程创建不可失败");
     }
     daemon_logf(&format!("control: 控制面就绪（sock={}，0600）", sock.display()));
+    #[cfg(not(windows))]
+    if let Some(web)=&web {if let Err(error)=web.bootstrap(){daemon_logf(&format!("Web入口启动失败：{error}"));}}
 
     // ⑨ 就绪（Go 同串形态——client/control 恒开已实装）。
     let (serve_on, relay_on) = {
@@ -1464,6 +1500,8 @@ fn run_unified_state(state_dir: PathBuf, verbose: bool) {
 
     // 按序停：control（断连接 goodbye）→ client（停全部会话）→ serve（D5 有序收工 +
     // UPnP 退出缩租）→ relay（确定性 closeAll）→ 锁释放。
+    #[cfg(not(windows))]
+    if let Some(web)=&web {web.shutdown();}
     srv.shutdown();
     core.close();
     {
@@ -1561,6 +1599,8 @@ mod tests {
         std::fs::write(dir.join("config.toml"), good).unwrap();
         let cfg = load_config_strict(&dir).unwrap();
         let roles = Arc::new(UnifiedRoles {
+            #[cfg(not(windows))]
+            web: None,
             #[cfg(not(windows))]
             terminal: None,
             state_dir: dir.clone(),

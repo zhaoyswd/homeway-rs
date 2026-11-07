@@ -120,6 +120,8 @@ pub struct ServeConfig {
     /// 值域已由 `homeway` 的严格读层校验（非法 ⇒ 拒启）；env
     /// `HOMEWAY_QUIC_ADMIT_RETRY` 的叠加在 [`crate::server::quic_admit::resolve_retry_policy`]。
     pub quic_admit: Option<crate::server::quic_admit::AdmitLimits>,
+    /// 统一进程恒装配管理宿主；HTTP入口开关不控制此字段。
+    pub web_management: Option<homeway_quic::WebManagementConfig>,
 }
 
 /// 公网观测腿缺省（2026-10-20 排障后换国内；选型实测见 tier docs/reviews 当日记录）。
@@ -159,6 +161,7 @@ impl Default for ServeConfig {
             stun_probe_target: egress::default_stun_targets(),
             tx_shape_cfg: None,
             quic_admit: None,
+            web_management: None,
         }
     }
 }
@@ -788,12 +791,14 @@ impl ServeEngine {
                         crate::envflag::quic_admit_retry_raw(),
                         &logf,
                     );
+                    let mut quic_config = homeway_quic::ExitQuicConfig::new(seed, cfg.max_devices)
+                        .with_admit(admit)
+                        .with_intakes(service_intakes.clone())
+                        .with_plain_hook(pubface.hook());
+                    if let Some(web) = cfg.web_management.clone() { quic_config = quic_config.with_web_management(web); }
                     match homeway_quic::ExitQuic::start(
                         sock,
-                        homeway_quic::ExitQuicConfig::new(seed, cfg.max_devices)
-                            .with_admit(admit)
-                            .with_intakes(service_intakes.clone())
-                            .with_plain_hook(pubface.hook()),
+                        quic_config,
                         Arc::clone(&logf),
                     ) {
                         Ok(q) => {
@@ -1681,6 +1686,7 @@ fn driver_loop(
                 }
             }
         }
+        bind.sweep_management_leases();
         // 腿读错误会摘腿 ⇒ 同拍把摘除同步给 QUIC 面（面侧保留「最近摘除」窗）
         sync_quic_legs(&mut bind, quic_face.as_ref());
         // QUIC 入站（M1 §1.3/§1.4）：poll 唤醒后 drain（唤醒字节 + 入站队列）——
@@ -1688,6 +1694,15 @@ fn driver_loop(
         if let Some(q) = quic_face.as_ref() {
             if quic_poll_idx.is_some_and(|i| pollfds[i].revents & crate::sysock::POLLIN != 0) {
                 q.drain_inbound(|item| {
+                    if let homeway_quic::ExitInbound::Management(request) = item {
+                        let confirmed = if !request.lease.is_alive() {
+                            homeway_quic::ClientConfirmation::GenerationMismatch
+                        } else if let Some(generation) = request.relay_generation {
+                            bind.confirm_management_client(request.remote, generation, request.lease.clone())
+                        } else { homeway_quic::ClientConfirmation::Confirmed };
+                        request.reply(confirmed);
+                        return;
+                    }
                     if let Some((remote, generation)) = on_quic_inbound(item, table, intercept, Some(q), &mut pub_by_tun, dlogf) {
                         bind.confirm_client(remote, generation);
                     }
@@ -1851,6 +1866,9 @@ fn on_quic_inbound(
 ) -> Option<(SocketAddr, homeway_quic::RelayGeneration)> {
     match item {
         homeway_quic::ExitInbound::Reg(req) => {
+            // 队列中已经取消的合法Proof/Refresh也不能更新表、执行DevOps或提升腿。
+            // 本检查不承诺回滚检查之后已开始的同步裁决。
+            if !req.is_active() { return None; }
             let verdict = admit_reg4(&req.frame, &req.exporter, table, quic, tun_owner, dlogf);
             let accepted = matches!(verdict, homeway_quic::Reg4Verdict::Accepted { .. });
             let origin = req.remote.zip(req.relay_generation);
@@ -4122,6 +4140,152 @@ mod tests {
             !ls.iter().any(|l| l.contains("hr-reg4 MAC 不符")),
             "超窗不是 MAC 类拒绝（归因必须可分辨）：{ls:?}"
         );
+    }
+
+    #[test]
+    fn cancelled_valid_proof_and_refresh_do_not_touch_table_or_device_ops() {
+        use homeway_quic::{
+            Cmd, Ed25519Seed, ExitInbound, ExitQuic, ExitQuicConfig, Island, IslandConfig,
+            IslandCredential, TokenSecret,
+        };
+        fn take_request(quic: &ExitQuic) -> homeway_quic::Reg4Request {
+            let deadline = Instant::now() + Duration::from_secs(3);
+            loop {
+                let mut request = None;
+                quic.drain_inbound(|item| match item {
+                    ExitInbound::Reg(found) => {
+                        assert!(request.is_none());
+                        request = Some(found);
+                    }
+                    _ => panic!("unexpected registration event"),
+                });
+                if let Some(request) = request {
+                    return request;
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "registration request did not arrive"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        }
+        for refresh in [false, true] {
+            let (lines, logf) = line_sink();
+            let mut table = reg4_table(&logf);
+            let mut owner = std::collections::HashMap::new();
+            let mut intercept = Interceptor::attach(
+                ItcConfig {
+                    tunnel_ip: DEFAULT_TUNNEL_IP,
+                    dns: None,
+                    dns_events: None,
+                    dns_resolve_port: 0,
+                    tx_shape: None,
+                    logf: logf.clone(),
+                },
+                Arc::new(ItcStats::default()),
+            );
+            let quic = ExitQuic::start(
+                std::net::UdpSocket::bind("127.0.0.1:0").unwrap(),
+                ExitQuicConfig::new(Ed25519Seed::from_bytes([71; 32]), 4),
+                logf.clone(),
+            )
+            .unwrap();
+            let mut config = IslandConfig::new(IslandCredential::new(
+                TokenSecret::from_bytes(REG3_SECRET),
+                [72; 32],
+                [73; 8],
+                quic.rpk_public_key(),
+            ));
+            config.patrol = Duration::from_millis(40);
+            let island = Island::start(logf.clone(), Arc::new(|_| {}), config).unwrap();
+            let (reply, receive) = mpsc::channel();
+            island
+                .tx()
+                .send(Cmd::Connect {
+                    cands: vec![homeway_quic::Candidate {
+                        addr: quic.local_addr(),
+                        via: homeway_quic::Via::Direct,
+                    }],
+                    budget: Duration::from_secs(3),
+                    demote_adopted: false,
+                    reply,
+                })
+                .unwrap();
+            let proof = take_request(&quic);
+            assert!(proof.is_active());
+            assert!(proof.frame.mac_matches(&REG3_SECRET, &proof.exporter));
+            let request = if refresh {
+                let _ = on_quic_inbound(
+                    ExitInbound::Reg(proof),
+                    &mut table,
+                    &mut intercept,
+                    Some(&quic),
+                    &mut owner,
+                    &logf,
+                );
+                assert!(receive
+                    .recv_timeout(Duration::from_secs(2))
+                    .unwrap()
+                    .is_ok());
+                assert_eq!(table.len(), 1);
+                let request = take_request(&quic);
+                assert!(matches!(request.frame, homeway_quic::Reg4Frame::Refresh(_)));
+                request
+            } else {
+                proof
+            };
+            assert!(request.frame.mac_matches(&REG3_SECRET, &request.exporter));
+            // 直接关闭请求所属出口，确定性取消该Connection及回执接收者；
+            // 不把客户端runtime立即销毁的UDP关闭包当作已送达证据。
+            assert!(quic.stop_within(Instant::now() + Duration::from_secs(2)));
+            assert!(island.stop_within(Instant::now() + Duration::from_secs(2)));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while request.is_active() {
+                assert!(
+                    Instant::now() < deadline,
+                    "closed connection did not cancel request"
+                );
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            let before: Vec<_> = table
+                .briefs()
+                .into_iter()
+                .map(|(dev, ip, last, _)| (dev, ip, last))
+                .collect();
+            let before_owner = owner.clone();
+            let before_rejected = table.reject_counts();
+            let before_lines = lines_of(&lines).len();
+            assert!(on_quic_inbound(
+                ExitInbound::Reg(request),
+                &mut table,
+                &mut intercept,
+                Some(&quic),
+                &mut owner,
+                &logf
+            )
+            .is_none());
+            let after: Vec<_> = table
+                .briefs()
+                .into_iter()
+                .map(|(dev, ip, last, _)| (dev, ip, last))
+                .collect();
+            assert_eq!(
+                after, before,
+                "cancelled request must not add/refresh/rotate table"
+            );
+            assert_eq!(owner, before_owner, "no Add/Remove device ops");
+            assert_eq!(
+                table.reject_counts(),
+                before_rejected,
+                "cancelled is not rejected credential"
+            );
+            assert_eq!(
+                lines_of(&lines).len(),
+                before_lines,
+                "no stale peer/reject criteria line"
+            );
+            assert!(quic.stop_within(Instant::now() + Duration::from_secs(2)));
+        }
     }
 
     /// **判据（S1-4 的引擎半边）**：`ExitInbound::Packet` 直投 `intercept.on_plain`——

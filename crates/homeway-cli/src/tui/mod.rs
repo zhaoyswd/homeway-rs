@@ -1,6 +1,7 @@
 //! `homeway tui`：既有 daemon/term 的交互客户端。
 mod appearance;
 mod backend;
+mod process_input;
 mod clipboard;
 mod input;
 mod notifications;
@@ -57,6 +58,7 @@ enum Error {
 
 struct Options {
     state: PathBuf,
+    no_spawn: bool,
 }
 
 fn options(args: &[String]) -> Result<Option<Options>, Error> {
@@ -65,15 +67,17 @@ fn options(args: &[String]) -> Result<Option<Options>, Error> {
         .any(|arg| matches!(arg.as_str(), "--help" | "-h"))
     {
         let shortcut = view::COMMAND_SHORTCUT;
-        println!("用法：homeway tui [--state DIR]\n\n鼠标：左键选择；右键管理主机/会话；标题栏 + 添加。\n键盘：{shortcut} 打开快捷指令弹窗，后按 h/s/Enter 选主机/会话/终端；\n      {shortcut} 后 a/n 添加主机/创建会话；m 操作菜单；q 分离退出。\n      侧栏中 F6 切焦点、F10 退出；Ctrl+B Ctrl+B 发送 Ctrl+B。\n历史：滚轮浏览；应用捕获鼠标时用 Shift+滚轮；Shift+PageUp/PageDown/Home/End。\n主题随终端背景自动识别。会话中的普通按键交给终端；退出后会话继续运行。");
+        println!("用法：homeway tui [--state DIR] [--no-spawn]\n\n鼠标：左键选择；右键管理主机/会话；标题栏 + 添加。\n键盘：{shortcut} 打开快捷指令弹窗，后按 h/s/Enter 选主机/会话/终端；\n      {shortcut} 后 a/n 添加主机/创建会话；m 操作菜单；q 分离退出。\n      侧栏中 F6 切焦点、F10 退出；Ctrl+B Ctrl+B 发送 Ctrl+B。\n历史：滚轮浏览；应用捕获鼠标时用 Shift+滚轮；Shift+PageUp/PageDown/Home/End。\n主题随终端背景自动识别。会话中的普通按键交给终端；退出后会话继续运行。");
         return Ok(None);
     }
     let mut parsed = Options {
         state: crate::unified_cli::default_state_dir(),
+        no_spawn: false,
     };
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         match arg.as_str() {
+            "--no-spawn" => parsed.no_spawn = true,
             "--state" => {
                 parsed.state = PathBuf::from(
                     iter.next()
@@ -101,9 +105,15 @@ fn run(options: Options) -> Result<(), Error> {
     if !io::stdin().is_terminal() || !io::stdout().is_terminal() {
         return Err(Error::NotTerminal);
     }
+    let control_guard = if options.no_spawn {
+        Some(homeway_core::daemon::client::ControlClient::dial_with_timeout(&options.state.join("control.sock"), "cli", "homeway-web-tui", Duration::from_secs(3)).map_err(backend::Error::Client)?.0)
+    } else { None };
     terminal::install_panic_hook();
     let _guard = terminal::TerminalGuard::enter()?;
     let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let input_source = if options.no_spawn && std::env::var_os("HOMEWAY_WEB_TUI").as_deref() == Some(std::ffi::OsStr::new("1")) {
+        Some(process_input::ProcessInput::start()?)
+    } else { None };
     let mut app = App::new(options);
     let mut appearance =
         appearance::Appearance::new(Instant::now(), std::env::var("COLORFGBG").ok().as_deref());
@@ -111,6 +121,7 @@ fn run(options: Options) -> Result<(), Error> {
     let mut pending_events = VecDeque::new();
     let mut geometry = view::Geometry::default();
     while !terminal::stopping() {
+        if control_guard.as_ref().is_some_and(|client| client.is_closed()) { return Err(io::Error::new(io::ErrorKind::ConnectionAborted, "本机控制面已关闭").into()); }
         app.poll_subscription(Instant::now());
         app.process_backend();
         app.process_attach();
@@ -155,8 +166,12 @@ fn run(options: Options) -> Result<(), Error> {
         app.resize(geometry.terminal.width, geometry.terminal.height);
         app.poll_surface();
         // 输出每拍有预算；无论远端持续输出还是失联，输入/退出每 25ms 都有机会处理。
-        if pending_events.is_empty() && event::poll(Duration::from_millis(25))? {
-            pending_events.extend(appearance.filter(event::read()?, Instant::now()));
+        if pending_events.is_empty() {
+            let event = match &input_source {
+                Some(input) => input.recv(Duration::from_millis(25))?,
+                None => if event::poll(Duration::from_millis(25))? { Some(event::read()?) } else { None },
+            };
+            if let Some(event) = event { pending_events.extend(appearance.filter(event, Instant::now())); }
         }
         if let Some(event) = pending_events.pop_front() {
             if matches!(event, Event::FocusGained) {
@@ -413,7 +428,7 @@ impl App {
         Self {
             render_dirty: true,
             model,
-            backend: Backend::start(options.state.clone()),
+            backend: Backend::start_with_no_spawn(options.state.clone(), options.no_spawn),
             state_dir: options.state,
             clipboard: clipboard::Clipboard::start(),
             application_copies: VecDeque::new(),
@@ -3285,6 +3300,7 @@ mod tests {
 
     fn app() -> App {
         let mut app = App::new(Options {
+            no_spawn: false,
             state: std::env::temp_dir().join(format!("homeway-tui-events-{}", std::process::id())),
         });
         app.notifications = notifications::Notifications::recording().0;

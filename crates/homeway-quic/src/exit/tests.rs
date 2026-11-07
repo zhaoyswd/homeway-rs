@@ -609,6 +609,7 @@ impl Stub {
 
     fn pump(&self, quic: &ExitQuic) {
         quic.drain_inbound(|item| match item {
+            ExitInbound::Management(_) => panic!("unexpected management in network harness"),
             ExitInbound::Reg(req) => {
                 let is_refresh = match req.frame {
                     crate::Reg4Frame::Proof(_) => false,
@@ -2027,7 +2028,7 @@ fn test_face_ctx(logf: Logf) -> Arc<FaceCtx> {
     wake_rx.set_nonblocking(true).unwrap();
     let (out_tx, _out_rx) = tokio::sync::mpsc::channel(1);
     let bridge = Arc::new(ExitBridge::new(Arc::clone(&stats), logf, wake_tx, wake_rx, out_tx, Arc::new(super::socket::LegTable::default())));
-    Arc::new(FaceCtx { proof_gate: std::sync::Arc::new(std::sync::Mutex::new(
+    Arc::new(FaceCtx { web_management: None, proof_gate: std::sync::Arc::new(std::sync::Mutex::new(
         crate::exit::admit::ProofGate::new(crate::exit::admit::PROOF_FAIL_THRESHOLD_DEFAULT),
     )),
         stats,

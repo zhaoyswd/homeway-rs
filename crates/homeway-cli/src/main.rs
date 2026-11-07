@@ -33,6 +33,8 @@ mod term_cli;
 mod tui;
 #[cfg(not(windows))]
 mod local_term;
+#[cfg(not(windows))]
+mod webserve;
 mod stopsig;
 mod unified_cli;
 // update 面 windows 不支持（运行中的 exe 无法原位替换）——模块整体只在非 windows
@@ -68,6 +70,11 @@ fn main() {
             println!("homeway {}", cli_version());
         }
         Some("token") => cmd_token(&args[2..]),
+        #[cfg(not(windows))]
+        Some("webserve") => webserve::cmd(&args[2..]),
+        #[cfg(windows)]
+        Some("webserve") => { eprintln!("homeway: webserve在Windows上暂不支持"); std::process::exit(1); }
+
         // serve 命令组（start/stop/restart/status/token）= 控制面往返；动词之外的
         // 形态 = 前台单角色（`serve token [list|revoke]` 纯读命令保留直连 state 形态）。
         Some("serve") => match args.get(2).map(String::as_str) {
@@ -147,6 +154,7 @@ fn main() {
             #[cfg(not(windows))]
             eprintln!("  term new|list|attach|delete      终端     files list|get|put|…             文件");
             #[cfg(not(windows))]
+            eprintln!("  webserve                        本机Web终端入口与管理凭证");
             eprintln!("  tui                             交互式主机与终端会话界面");
             #[cfg(windows)]
             eprintln!("  files list|get|put|…             文件");

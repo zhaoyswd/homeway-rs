@@ -114,6 +114,11 @@ pub enum RoleOpOut {
 /// 形态）：状态面给 absent 空形状、启停走 RoleStopped。
 pub trait RoleHost: Send + Sync {
     fn role_op(&self, op: RoleOp) -> Result<RoleOpOut, BackendErr>;
+    /// Web控制面仅透传给CLI宿主；core不引入HTTP依赖。
+    fn webserve_op(&self, _op: vocab::OpName, _args: serde_json::Value) -> Result<serde_json::Value, BackendErr> {
+        Err(BackendErr::Other("Web管理宿主未装配".into()))
+    }
+
     /// 角色状态摘要（daemon.status 的 roles 段）。
     fn statuses(&self) -> Vec<RoleBrief>;
 }
@@ -145,6 +150,11 @@ pub trait Backend: Send + Sync {
     fn not_ready(&self) -> bool;
     /// serve/relay 角色管理（宿主面注入）。
     fn role_op(&self, op: RoleOp) -> Result<RoleOpOut, BackendErr>;
+    /// Web控制面仅透传给CLI宿主；core不引入HTTP依赖。
+    fn webserve_op(&self, _op: vocab::OpName, _args: serde_json::Value) -> Result<serde_json::Value, BackendErr> {
+        Err(BackendErr::Other("Web管理宿主未装配".into()))
+    }
+
     // ---------- 承载面（forward/socks/speedtest 托管——D-1） ----------
     /// forward.add（全局端口检查 + 成员检查 + 当场监听；失败不入表）。缺省实现 =
     /// 未装配（测试形态；生产宿主 DaemonCore 必实装）。
@@ -399,6 +409,10 @@ impl Backend for DaemonCore {
 
     fn not_ready(&self) -> bool {
         false // 统一进程形态：hosts 表恒挂（DaemonCore::new 成功即在）
+    }
+
+    fn webserve_op(&self, op: vocab::OpName, args: serde_json::Value) -> Result<serde_json::Value, BackendErr> {
+        self.roles.as_ref().ok_or_else(|| BackendErr::Other("Web管理宿主未装配".into()))?.webserve_op(op,args)
     }
 
     fn role_op(&self, op: RoleOp) -> Result<RoleOpOut, BackendErr> {

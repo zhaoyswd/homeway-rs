@@ -339,11 +339,29 @@ fn fd_shortage_errno(_e: &std::io::Error) -> bool {
 enum HighItem {
     /// 普通控制帧（welcome/rsp/goodbye/reload）。
     Frame(Vec<u8>),
+    /// Web凭证应答：队列丢弃与写出后都擦除自身分配。
+    SecretFrame(zeroize::Zeroizing<Vec<u8>>),
     /// 订阅确认（成功或错误应答）：写出确认帧后清门闩 + 先写回放段（B3 三段次序
     /// 的单 writer 落点）。
     SubConfirm { frame: Vec<u8>, sub: Arc<Subscriber> },
     /// 告别/重载帧（带「真写出」回执——close 路径有界等待用，FIX-97 同义）。
     Bye { frame: Vec<u8>, ack: std::sync::mpsc::Sender<()> },
+}
+
+fn encode_web_token_response(corr: u64, token: &str) -> zeroize::Zeroizing<Vec<u8>> {
+    #[derive(serde::Serialize)]
+    struct ResultBody<'a> { token: &'a str }
+    #[derive(serde::Serialize)]
+    struct Response<'a> { corr: u64, ok: bool, result: ResultBody<'a> }
+    // hww1固定159B；一次分配直接序列化到最终帧，不生成普通Vec的body副本。
+    let mut frame = zeroize::Zeroizing::new(Vec::with_capacity(token.len() + 96));
+    frame.resize(5, 0);
+    frame[0] = Op::Rsp.code();
+    serde_json::to_writer(&mut *frame, &Response { corr, ok: true, result: ResultBody { token } })
+        .expect("借用字符串控制应答序列化不可失败");
+    let len = (frame.len() - 5) as u32;
+    frame[1..5].copy_from_slice(&len.to_be_bytes());
+    frame
 }
 
 struct OutQueue {
@@ -737,6 +755,14 @@ impl ConnShared {
             O::RelayRestart => self.role_op(req.corr, RoleOp::RelayRestart),
             O::RelayStatus => self.role_op(req.corr, RoleOp::RelayStatus),
             O::RelayToken => self.role_op(req.corr, RoleOp::RelayToken),
+            O::WebserveStart|O::WebserveStop|O::WebserveRestart|O::WebserveStatus|O::WebserveToken|O::WebserveRotate => {
+                match self.srv.backend.webserve_op(op,args) {
+                    Ok(out) if matches!(op, O::WebserveToken | O::WebserveRotate) => self.reply_web_token(req.corr, out),
+                    Ok(out)=>self.reply_json(req.corr,Some(out),None),
+                    Err(e)=>self.reply_err(req.corr,map_backend_err(e)),
+                }
+            }
+
         }
     }
 
@@ -1255,6 +1281,15 @@ impl ConnShared {
         self.push_high(HighItem::Frame(encode_json_frame(Op::Rsp, &body)));
     }
 
+    fn reply_web_token(&self, corr: u64, mut result: serde_json::Value) {
+        let Some(serde_json::Value::String(token)) = result.get_mut("token").map(serde_json::Value::take) else {
+            self.reply_err(corr, OpError::code(vocab::CODE_BAD_REQUEST));
+            return;
+        };
+        let token = zeroize::Zeroizing::new(token);
+        self.push_high(HighItem::SecretFrame(encode_web_token_response(corr, &token)));
+    }
+
     fn reply_err(&self, corr: u64, e: OpError) {
         self.reply_json(corr, None, Some(&e));
     }
@@ -1348,6 +1383,9 @@ impl ConnShared {
                     if !self.write_bytes(sock, &f) {
                         return false;
                     }
+                }
+                HighItem::SecretFrame(frame) => {
+                    if !self.write_bytes(sock, &frame) { return false; }
                 }
                 HighItem::SubConfirm { frame, sub } => {
                     // 「确认 → 回放 → 在线」三段次序（单 writer 天然保序）：写确认 →
@@ -1704,6 +1742,15 @@ fn map_backend_err(e: super::proto::BackendErr) -> OpError {
         super::proto::BackendErr::NoSession => OpError::code(vocab::CODE_STREAM_REFUSED),
         super::proto::BackendErr::RoleStopped => OpError::code(vocab::CODE_BAD_REQUEST),
         super::proto::BackendErr::BadStreamKind(_) => OpError::code(vocab::CODE_BAD_REQUEST),
+        super::proto::BackendErr::Web { category, .. } => {
+            use super::proto::WebFailure;
+            let code = match category {
+                WebFailure::Unauthorized => vocab::CODE_BAD_TOKEN,
+                WebFailure::Busy | WebFailure::Timeout | WebFailure::Unavailable => vocab::CODE_NOT_READY,
+                _ => vocab::CODE_BAD_REQUEST,
+            };
+            OpError::with_detail(code, category.to_string())
+        }
         super::proto::BackendErr::Other(d) => OpError::with_detail(vocab::CODE_BAD_REQUEST, d),
     }
 }
@@ -1725,7 +1772,8 @@ pub(super) fn read_head_deadline(
             return Ok(None);
         }
     }
-    let head_bytes: [u8; 5] = buf.drain(..5).collect::<Vec<u8>>().try_into().unwrap();
+    let head_bytes: [u8; 5] = buf[..5].try_into().expect("固定帧头");
+    consume_prefix(buf, 5);
     let fh = frame::FrameHead {
         op: head_bytes[0],
         n: u32::from_be_bytes([head_bytes[1], head_bytes[2], head_bytes[3], head_bytes[4]]),
@@ -1769,7 +1817,24 @@ pub(super) fn read_body_buf_deadline(
             // 读超时不算断流（等下一拍）；EOF（真断）在 fill 里报错。
         }
     }
-    Ok(Some(buf.drain(..head.n as usize).collect()))
+    let body = buf[..head.n as usize].to_vec();
+    consume_prefix(buf, head.n as usize);
+    Ok(Some(body))
+}
+
+/// 保留coalesced下一帧，擦已消费区域及移位后尾部；truncate前不留下旧secret尾副本。
+fn erase_consumed_prefix(buf: &mut [u8], count: usize) -> usize {
+    use zeroize::Zeroize;
+    let remaining = buf.len() - count;
+    buf[..count].zeroize();
+    buf.copy_within(count.., 0);
+    buf[remaining..].zeroize();
+    remaining
+}
+
+fn consume_prefix(buf: &mut Vec<u8>, count: usize) {
+    let remaining = erase_consumed_prefix(buf, count);
+    buf.truncate(remaining);
 }
 
 /// 填一块；false = 本拍无数据（读超时节拍——10ms 缓冲后返回，防忙等）。
@@ -1777,9 +1842,9 @@ pub(super) fn fill(
     sock: &mut IpcStream,
     buf: &mut Vec<u8>,
 ) -> Result<bool, FrameError> {
-    let mut tmp = [0u8; 16 * 1024];
+    let mut tmp = zeroize::Zeroizing::new([0u8; 16 * 1024]);
     loop {
-        match sock.read(&mut tmp) {
+        match sock.read(&mut *tmp) {
             Ok(0) => {
                 return Err(FrameError::Io(std::io::Error::new(
                     ErrorKind::UnexpectedEof,
@@ -1796,6 +1861,54 @@ pub(super) fn fill(
             }
             Err(e) if e.kind() == ErrorKind::Interrupted => continue,
             Err(e) => return Err(FrameError::Io(e)),
+        }
+    }
+}
+
+#[cfg(test)]
+mod web_secret_response_tests {
+    use super::*;
+
+    #[test]
+    fn consumed_secret_is_erased_without_touching_coalesced_next_frame() {
+        let secret = b"hww1-private-secret";
+        let next = frame::encode_frame(Op::Rsp, br#"{"corr":2,"ok":true}"#);
+        let mut buffer = [secret.as_slice(), next.as_slice()].concat();
+        let remaining = erase_consumed_prefix(&mut buffer, secret.len());
+        assert_eq!(&buffer[..remaining], &next, "下一普通帧的每个字节必须保全");
+        assert!(buffer[remaining..].iter().all(|byte| *byte == 0));
+        buffer.truncate(remaining);
+        assert_eq!(buffer, next);
+
+    }
+
+    #[test]
+    fn secret_token_frame_preserves_existing_control_json_without_a_body_copy() {
+        let token = format!("hww1{}", "x".repeat(155));
+        let frame = encode_web_token_response(42, &token);
+        let mut reader = std::io::Cursor::new(&*frame);
+        let head = frame::read_header(&mut reader).unwrap();
+        assert_eq!(head.op, Op::Rsp.code());
+        let body: serde_json::Value = serde_json::from_slice(&frame::read_body(&mut reader, head).unwrap()).unwrap();
+        assert_eq!(body, serde_json::json!({"corr":42,"ok":true,"result":{"token":token}}));
+        assert!(matches!(HighItem::SecretFrame(frame), HighItem::SecretFrame(_)));
+    }
+
+    #[test]
+    fn web_backend_categories_keep_source_and_wire_errors_are_fixed() {
+        use std::error::Error as _;
+        for (category, code) in [
+            (WebFailure::Unauthorized, vocab::CODE_BAD_TOKEN),
+            (WebFailure::Busy, vocab::CODE_NOT_READY),
+            (WebFailure::Timeout, vocab::CODE_NOT_READY),
+            (WebFailure::Unavailable, vocab::CODE_NOT_READY),
+            (WebFailure::DurabilityUncertain, vocab::CODE_BAD_REQUEST),
+        ] {
+            let error = BackendErr::Web { category, source: Some(Box::new(std::io::Error::other("hww1-secret-not-for-wire"))) };
+            assert!(error.source().is_some());
+            let response = map_backend_err(error);
+            assert_eq!(response.code, code);
+            assert!(!response.detail().contains("hww1"));
         }
     }
 }

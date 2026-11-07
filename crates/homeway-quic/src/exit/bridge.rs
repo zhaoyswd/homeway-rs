@@ -41,6 +41,8 @@ pub(crate) const OUTBOUND_QUEUE_MAX: usize = 8192;
 /// `#[non_exhaustive]`（跨 crate 消费面，M1 起会随观测面生长）：消费侧必须留通配臂。
 #[non_exhaustive]
 pub enum ExitInbound {
+    /// Web 已独立认证，仅请求确认中继腿与配额，不能创建设备绑定。
+    Management(ManagementRequest),
     /// 准入/刷新请求：首条 bidi 控制流上的 `hr-reg4` Proof 帧或 60s 刷新帧（`R4`）。
     /// **引擎必须回执**（[`Reg4Request::reply`]）——不回执 = 该连接卡在准入门外。
     Reg(Reg4Request),
@@ -51,6 +53,20 @@ pub enum ExitInbound {
         /// 内层明文包（与今日 `device.rs` 的 `StepOut::PlainV4` 同形态）。
         pkt: Vec<u8>,
     },
+}
+
+pub struct ManagementRequest {
+    pub remote: SocketAddr,
+    pub relay_generation: Option<RelayGeneration>,
+    pub lease: crate::ManagementLease,
+    reply: oneshot::Sender<crate::ClientConfirmation>,
+}
+
+impl ManagementRequest {
+    pub(crate) fn new(remote: SocketAddr, relay_generation: Option<RelayGeneration>, lease: crate::ManagementLease, reply: oneshot::Sender<crate::ClientConfirmation>) -> Self {
+        Self { remote: crate::sysio::unmap_v4_mapped(remote), relay_generation, lease, reply }
+    }
+    pub fn reply(self, confirmation: crate::ClientConfirmation) { let _ = self.reply.send(confirmation); }
 }
 
 /// 中继分配的代际身份：同远端端口重用时必须重新认证，不能复用旧连接的准入沿。
@@ -66,6 +82,8 @@ pub struct Reg4Request {
     pub frame: Reg4Frame,
     /// 本帧所属连接上现算的 TLS exporter（32B）——MAC 的连接绑定值。
     pub exporter: [u8; EXPORTER_LEN],
+    /// 私有承载活性证据；同步宿主只读is_active，不持异步类型或新增锁。
+    connection: Connection,
     /// 回执口（引擎 → 出口面；**消费 self** ⇒ 类型上保证一次裁决一次回执）。
     ///
     /// `oneshot::Sender::send` 是**非阻塞**的（可在同步线程调用，不需要 runtime 上下文）
@@ -78,15 +96,21 @@ impl Reg4Request {
     pub(crate) fn new(
         frame: Reg4Frame,
         exporter: [u8; EXPORTER_LEN],
+        connection: Connection,
         reply: oneshot::Sender<Reg4Verdict>,
     ) -> Self {
-        Self { remote: None, relay_generation: None, frame, exporter, reply }
+        Self { remote: None, relay_generation: None, frame, exporter, connection, reply }
     }
 
     pub(crate) fn with_origin(mut self, remote: SocketAddr, generation: Option<RelayGeneration>) -> Self {
         self.remote = Some(crate::sysio::unmap_v4_mapped(remote));
         self.relay_generation = generation;
         self
+    }
+
+    /// 已关闭连接或已取消接收端的队列请求不得进入设备表裁决。
+    pub fn is_active(&self) -> bool {
+        !self.reply.is_closed() && self.connection.close_reason().is_none()
     }
 
     /// 回执（非阻塞；接收端已放弃时静默——连接多半已死）。
@@ -407,7 +431,7 @@ impl ExitBridge {
         conn: Connection,
         tunnel_ip: Ipv4Addr,
         tun_ip: Ipv4Addr,
-    ) {
+    ) -> bool {
         let remote = conn.remote_address();
         let via = self.path_via(remote);
         let quality = Arc::new(BindingQuality {
@@ -416,6 +440,9 @@ impl ExitBridge {
         });
         let mut retired = Vec::new();
         let mut b = lock_unpoison(&self.bindings);
+        // 必须在取得绑定锁后、改任何索引或关闭现任之前检查。
+        // 这不是quinn与设备表的全局事务，但已关闭旧连接不能复活并顶掉新连接。
+        if conn.close_reason().is_some() { return false; }
         let mut replaced = false;
         // ① 同连接号旧绑定：整条摘（防 by_conn 覆盖 + 旧 dev 索引残留）
         if let Some(prev_dev) = b.by_conn.remove(&conn_id) {
@@ -459,6 +486,7 @@ impl ExitBridge {
             tun_ip,
             remote
         ));
+        true
     }
 
     /// 按连接号查绑定（数据报任务的源校验面 + 刷新帧的身份比对面）。已被替换的旧连接

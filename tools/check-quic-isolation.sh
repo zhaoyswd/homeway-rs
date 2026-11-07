@@ -6,7 +6,7 @@
 #   ① quinn/tokio 只出现在岛 manifest；同步 rustls 的例外是 core 的
 #      rustls.workspace=true（精确一条），源码只许白名单两文件使用且仍禁
 #      async/await/tokio/quinn：server/doh.rs（DoH 解析腿，r5 契约）+
-#      minhttp.rs（update 频道 HTTPS GET，2026-10-23 批）。cli/capi 仍不得声明
+#      minhttp.rs（update 频道 HTTPS GET，2026-10-23 批）。capi仍不得声明；CLI仅精确Web控制面tokio声明可用，
 #      三者；新增源码反向门防例外扩散。
 #   ② crates/homeway-quic/src/** 里 `tokio::|quinn|rustls|async fn|.await` **只在异步面**
 #      （**显式文件清单**，M1 S6-2 由目录前缀收窄而来：整棵子树豁免会把「exit/transport.rs
@@ -94,7 +94,8 @@ ASYNC_FILES=(
   "driver.rs"
   "client/mod.rs" "client/race.rs" "client/register.rs"
   "client/dataplane.rs" "client/relay_sock.rs" "client/tests.rs"
-  "client/streams.rs"
+  "client/streams.rs" "client/web.rs"
+  "exit/web.rs" "exit/tests/web.rs"
   "exit/mod.rs" "exit/conn.rs" "exit/socket.rs" "exit/bridge.rs"
   "exit/rpk.rs" "exit/transport.rs" "exit/serve.rs" "exit/tests.rs"
   # M3 S2：服务流的 socketpair 适配器 + 异步泵（**本清单双向 fail-closed**——
@@ -219,14 +220,29 @@ in_list() { local x; for x in ${=2}; do [[ "$x" == "$1" ]] && return 0; done; re
 
 # ---------- ① 异步栈名字只许出现在岛的 manifest ----------
 BAD_MANIFEST=""
+MANIFEST_ASYNC_PATTERN='(^|[^A-Za-z0-9_-])(quinn|rustls|tokio|axum|hyper|hyper-util|hyper_util|tungstenite|tokio-tungstenite)([^A-Za-z0-9_-]|$)'
+for dependency in axum hyper hyper-util hyper_util tungstenite tokio-tungstenite; do
+  print -r -- "alias = { package = \"$dependency\", version = \"1\" }" | grep -Eq "$MANIFEST_ASYNC_PATTERN" || fail "同步manifest Web别名负例校准失效：$dependency"
+done
 for m in "$CRATES/homeway-core/Cargo.toml" "$CRATES/homeway-cli/Cargo.toml" "$CRATES/homeway-capi/Cargo.toml"; do
   [[ -f "$m" ]] || fail "manifest 缺失：$m"
-  h="$(hits_toml "$m" '(^|[^A-Za-z0-9_-])(quinn|rustls|tokio)([^A-Za-z0-9_-]|$)')"
+  h="$(hits_toml "$m" "$MANIFEST_ASYNC_PATTERN")"
   if [[ "$m" == "$CRATES/homeway-core/Cargo.toml" ]]; then
     # 仅豁免这一条精确声明，不放行 renamed 依赖/另一个版本/额外 features。
     h="$(print -r -- "$h" | grep -vE '^[0-9]+:rustls\.workspace[[:space:]]*=[[:space:]]*true[[:space:]]*$' || true)"
     n="$(strip_toml "$m" | grep -cE '^rustls\.workspace[[:space:]]*=[[:space:]]*true[[:space:]]*$' || true)"
     (( n == 1 )) || fail "同步 TLS rustls 精确声明必须有且仅有一条"
+  elif [[ "$m" == "$CRATES/homeway-cli/Cargo.toml" ]]; then
+    for declaration in \
+      'tokio = { workspace = true, features = ["net", "io-util"] }' \
+      'axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio", "ws", "json"] }' \
+      'hyper = { version = "1", default-features = false, features = ["server", "http1"] }' \
+      'tungstenite = { version = "0.29", default-features = false }' \
+      'hyper-util = { version = "0.1", default-features = false, features = ["tokio", "service"] }'; do
+      n="$(strip_toml "$m" | grep -Fxc "$declaration" || true)"
+      (( n == 1 )) || fail "CLI Web精确声明必须有且仅有一条：$declaration"
+      h="$(print -r -- "$h" | awk -v want="$declaration" '{ s=$0; sub(/^[0-9]+:/,"",s); if(s!=want) print }')"
+    done
   fi
   [[ -n "$h" ]] && BAD_MANIFEST+="${m}:"$'\n'"${h}"$'\n'
 done
@@ -237,17 +253,31 @@ SYNC_RUSTLS_FILES=(
   "crates/homeway-core/src/server/doh.rs"
   "crates/homeway-core/src/minhttp.rs"
 )
+CLI_WEB_ASYNC="crates/homeway-cli/src/webserve/http.rs"
+[[ -f "$REPO_ROOT/$CLI_WEB_ASYNC" ]] || fail "CLI Web精确异步文件缺失"
+(( $(hits_rs "$REPO_ROOT/$CLI_WEB_ASYNC" 'tokio::runtime::Builder::new_current_thread|tokio::time::timeout' | wc -l) >= 2 )) || fail "CLI Web精确异步文件缺实际单线程/期限消费者"
 SYNC_BAD=""
-SYNC_ASYNC_PATTERN='tokio::|quinn::|(^|[^A-Za-z0-9_])async([^A-Za-z0-9_]|$)|\.await([^A-Za-z0-9_]|$)'
+SYNC_ASYNC_PATTERN='axum::|hyper::|hyper_util::|tungstenite::|tokio::|quinn::|(^|[^A-Za-z0-9_])async([^A-Za-z0-9_]|$)|\.await([^A-Za-z0-9_]|$)'
 for face in homeway-core homeway-cli homeway-capi; do
   while IFS= read -r f; do
     pattern="$SYNC_ASYNC_PATTERN|rustls"
     in_list "${f#$REPO_ROOT/}" "${SYNC_RUSTLS_FILES[*]}" && pattern="$SYNC_ASYNC_PATTERN"
+    [[ "${f#$REPO_ROOT/}" == "$CLI_WEB_ASYNC" ]] && pattern='quinn::|rustls|new_multi_thread|rt-multi-thread'
     h="$(hits_rs "$f" "$pattern")"
     [[ -n "$h" ]] && SYNC_BAD+="${f}:"$'\n'"${h}"$'\n'
   done < <(find "$CRATES/$face" -name '*.rs' -not -path '*/target/*' | sort)
 done
 [[ -z "$SYNC_BAD" ]] || fail $'同步源码越过 rustls 白名单（doh/minhttp 两件）或引用异步栈：\n'"$SYNC_BAD"
+# Web控制面例外的正反自校准：普通同步面仍拒绝runtime，Web仍拒绝QUIC/TLS/多线程。
+print -r -- 'tokio::runtime::Builder::new_current_thread()' | grep -Eq "$SYNC_ASYNC_PATTERN" || fail "同步面负例校准失效"
+for namespace in axum hyper hyper_util tungstenite; do
+  print -r -- "$namespace::ForbiddenSyncImport" | grep -Eq "$SYNC_ASYNC_PATTERN" || fail "同步Web命名空间负例校准失效：$namespace"
+done
+print -r -- 'quinn::Endpoint' | grep -Eq 'quinn::|rustls|new_multi_thread|rt-multi-thread' || fail "Web QUIC负例校准失效"
+cli_features="$(cargo tree -p homeway-cli -e features --locked 2>/dev/null)" || fail "CLI feature闭包读取失败"
+[[ "$cli_features" != *'feature "rt-multi-thread"'* ]] || fail "CLI Web禁止rt-multi-thread"
+capi_dependencies="$(cargo tree -p homeway-capi --locked 2>/dev/null)" || fail "CAPI依赖闭包读取失败"
+print -r -- "$capi_dependencies" | grep -Eq '(^|[^A-Za-z])(axum|hyper|hyper-util|tower-http) v' && fail "CAPI引入Web依赖"
 # 白名单自校准（fail-closed）：文件必须在盘上（改名/删除即红），且真有 TLS 消费。
 for rf in "${SYNC_RUSTLS_FILES[@]}"; do
   [[ -f "$REPO_ROOT/$rf" ]] || fail "同步 rustls 白名单文件不在盘上：$rf"
@@ -266,7 +296,7 @@ printf 'fn sync_wait() { limiter.await_quota(1); }\n' > "$SYNC_SAMPLE"
 rm -f "$SYNC_SAMPLE"
 ISLAND_MANIFEST_HITS="$(hits_toml "$ISLAND/Cargo.toml" '(^|[^A-Za-z0-9_-])(quinn|rustls|tokio)([^A-Za-z0-9_-]|$)' | wc -l | tr -d ' ')"
 (( ISLAND_MANIFEST_HITS >= 3 )) || fail "岛的 manifest 未声明全三条异步依赖（仅 ${ISLAND_MANIFEST_HITS} 条命中）"
-echo "  ① 通过：quinn/tokio 只在岛 manifest；同步 rustls 仅 core 精确依赖与白名单两文件（doh/minhttp）消费，其余同步源码零异步栈"
+echo "  ① 通过：QUIC岛与CLI精确Web控制面隔离；同步rustls仅core两文件，CAPI无Web依赖，全部runtime禁多线程"
 
 # ---------- ② 异步名字只在异步面（**显式文件清单**） ----------
 is_async_face() {

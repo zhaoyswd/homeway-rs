@@ -328,7 +328,18 @@ fn spawn_log_tail(state_dir: &std::path::Path) -> String {
 /// 消费面：按需拉起（dial_control_spawn）+ `update` 换装后的自拉起（无托管形态
 /// 主机——2026-10-23 批）。路径解析发生在调用时刻 ⇒ 调用前刚替换过的二进制路径
 /// 拉起的即新版本。
+#[cfg(test)]
+static SPAWN_ATTEMPTS: std::sync::Mutex<Vec<std::path::PathBuf>> = std::sync::Mutex::new(Vec::new());
+
+#[cfg(test)]
+pub(crate) fn spawn_attempts_for_state(state: &std::path::Path) -> usize {
+    SPAWN_ATTEMPTS.lock().unwrap_or_else(|e| e.into_inner()).iter().filter(|p| p.as_path() == state).count()
+}
+
 pub(crate) fn start_spawned_process(state_dir: &std::path::Path) -> Result<u32, String> {
+    #[cfg(test)]
+    SPAWN_ATTEMPTS.lock().unwrap_or_else(|e| e.into_inner()).push(state_dir.to_owned());
+
     let exe = std::env::current_exe().map_err(|e| e.to_string())?;
     let log = spawn_log_path(state_dir);
     if let Some(dir) = log.parent() {

@@ -71,6 +71,7 @@ mod sysio;
 pub use sysio::SvcStream; // 跨 crate 消费面只有承载流类型（core::files_server::intake_conn）——评审 L4
 mod sync_util;
 mod tun;
+pub mod web;
 /// **可配常量面**（M3 §15-2/§15-3：流窗口/并发/待发队列 + 快探参数；纯 std）。
 pub mod tuning;
 
@@ -103,3 +104,11 @@ pub use stream::{StreamErr, StreamId, StreamTag, StreamWriteOut};
 // 的引擎与其测试）也用它——**不得**在消费侧另写一份标签顺序。
 pub use reg4::{Nonce, ProofFrame, RefreshFrame, Reg4Frame};
 pub use rpk::{Ed25519Seed, RpkErr, RpkPublicKey};
+pub use web::{ClientConfirmation, ManagementLease, WebAuth, WebClose, WebCredential, WebGrant, WebManagementConfig, WebSecret};
+pub use client::web::{WebClient, WebClientError, WebDial};
+pub use exit::bridge::ManagementRequest;
+
+/// 与出口 TLS 身份共用同一派生/密钥提供者，不启动网络端点。
+pub fn rpk_public_key(seed: &Ed25519Seed) -> Result<RpkPublicKey, RpkErr> {
+    exit::rpk::public_key(seed)
+}

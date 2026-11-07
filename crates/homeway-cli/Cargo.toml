@@ -28,6 +28,16 @@ thiserror.workspace = true
 [target.'cfg(not(windows))'.dependencies]
 ratatui = { version = "0.30.2", default-features = false, features = ["crossterm_0_29", "unstable-rendered-line-info"] }
 crossterm = "0.29"
+homeway-quic = { path = "../homeway-quic" }
+x25519-dalek.workspace = true
+tokio = { workspace = true, features = ["net", "io-util"] }
+axum = { version = "=0.8.9", default-features = false, features = ["http1", "tokio", "ws", "json"] }
+hyper = { version = "1", default-features = false, features = ["server", "http1"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio", "service"] }
+futures-util = { version = "0.3", default-features = false, features = ["std", "sink"] }
+url = "2"
+zeroize.workspace = true
+tungstenite = { version = "0.29", default-features = false }
 
 # WIN 批（2026-10-13）：windows 系统面（控制台事件——stopsig；spawn flags）。
 [target.'cfg(windows)'.dependencies]

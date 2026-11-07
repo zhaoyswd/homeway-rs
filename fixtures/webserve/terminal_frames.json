@@ -1,0 +1,129 @@
+{
+  "schema": "homeway-web-terminal-v1",
+  "source": "protocol.md §3; independent Python stdlib oracle",
+  "valid": [
+    {
+      "name": "open_100x30",
+      "op": 1,
+      "direction": "client",
+      "payload_hex": "010064001e",
+      "wire_hex": "0100000005010064001e"
+    },
+    {
+      "name": "input_utf8",
+      "op": 2,
+      "direction": "client",
+      "payload_hex": "7072696e74662027e59b9ee5aeb6f09f9982270d",
+      "wire_hex": "02000000147072696e74662027e59b9ee5aeb6f09f9982270d"
+    },
+    {
+      "name": "resize_max",
+      "op": 3,
+      "direction": "client",
+      "payload_hex": "03e801f4",
+      "wire_hex": "030000000403e801f4"
+    },
+    {
+      "name": "output_ansi_utf8",
+      "op": 4,
+      "direction": "server",
+      "payload_hex": "1b5b33326de59b9ee5aeb6f09f99821b5b306d0d0a",
+      "wire_hex": "04000000151b5b33326de59b9ee5aeb6f09f99821b5b306d0d0a"
+    },
+    {
+      "name": "close",
+      "op": 5,
+      "direction": "both",
+      "payload_hex": "",
+      "wire_hex": "0500000000"
+    },
+    {
+      "name": "error",
+      "op": 6,
+      "direction": "server",
+      "payload_hex": "05e69cace69cbae68ea7e588b6e99da2e4b88de58fafe794a8",
+      "wire_hex": "060000001905e69cace69cbae68ea7e588b6e99da2e4b88de58fafe794a8"
+    },
+    {
+      "name": "exit_unknown",
+      "op": 7,
+      "direction": "server",
+      "payload_hex": "ffffffff",
+      "wire_hex": "0700000004ffffffff"
+    }
+  ],
+  "invalid": [
+    {
+      "name": "oversize_declared_length",
+      "wire_hex": "0200010001",
+      "reason": "length_before_allocation"
+    },
+    {
+      "name": "truncated_header",
+      "wire_hex": "020000",
+      "reason": "unexpected_eof"
+    },
+    {
+      "name": "truncated_payload",
+      "wire_hex": "020000000278",
+      "reason": "unexpected_eof"
+    },
+    {
+      "name": "unknown_opcode",
+      "wire_hex": "ff00000000",
+      "reason": "unknown_opcode"
+    },
+    {
+      "name": "open_zero_columns",
+      "wire_hex": "0100000005010000001e",
+      "reason": "dimensions"
+    },
+    {
+      "name": "open_wrong_version",
+      "wire_hex": "0100000005020064001e",
+      "reason": "version"
+    },
+    {
+      "name": "resize_too_tall",
+      "wire_hex": "0300000004006401f5",
+      "reason": "dimensions"
+    },
+    {
+      "name": "empty_input",
+      "wire_hex": "0200000000",
+      "reason": "empty_input"
+    },
+    {
+      "name": "close_with_body",
+      "wire_hex": "050000000178",
+      "reason": "payload_length"
+    },
+    {
+      "name": "exit_short",
+      "wire_hex": "070000000178",
+      "reason": "payload_length"
+    }
+  ],
+  "invalid_states": [
+    {
+      "name": "input_before_open",
+      "sequence": [
+        "input_utf8"
+      ]
+    },
+    {
+      "name": "duplicate_open",
+      "sequence": [
+        "open_100x30",
+        "open_100x30"
+      ]
+    },
+    {
+      "name": "client_output",
+      "direction": "client",
+      "sequence": [
+        "output_ansi_utf8"
+      ]
+    }
+  ]
+}

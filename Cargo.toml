@@ -29,6 +29,7 @@ homeway-core = { path = "crates/homeway-core" }
 thiserror = "2"
 base64 = "0.22"
 sha2 = "0.10"
+zeroize = "1"
 hmac = "0.12"
 hkdf = "0.12"
 # `static_secrets` = `StaticSecret`（+ `PublicKey::from(&StaticSecret)`）的**隐藏依赖**：

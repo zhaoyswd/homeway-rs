@@ -298,6 +298,9 @@ pub(super) struct Backend {
     refresh: mpsc::SyncSender<()>,
     state_dir: PathBuf,
     bootstrap_started: AtomicBool,
+    no_spawn: bool,
+    #[cfg(test)]
+    bootstrap_done: Arc<AtomicBool>,
     bootstrap_events: mpsc::SyncSender<Event>,
     mutation_epoch: Arc<AtomicU64>,
 }
@@ -309,7 +312,10 @@ struct SessionQueries {
 }
 
 impl Backend {
-    pub fn start(state_dir: PathBuf) -> Self {
+    #[cfg(test)]
+    pub fn start(state_dir: PathBuf) -> Self { Self::start_with_no_spawn(state_dir, false) }
+
+    pub fn start_with_no_spawn(state_dir: PathBuf, no_spawn: bool) -> Self {
         let (commands, rx) = mpsc::sync_channel(16);
         let (tx, events) = mpsc::sync_channel(32);
         let alive = Arc::new(AtomicBool::new(true));
@@ -322,6 +328,7 @@ impl Backend {
         let refresh_dirty = refresh.clone();
         std::thread::spawn(move || {
             let mut worker = Worker {
+                no_spawn,
                 state_dir: refresh_state,
                 control: None,
                 self_sessions: Default::default(),
@@ -362,6 +369,7 @@ impl Backend {
         // 选主机查询独立于修改操作，只保留最新一次待查询目标；不排16次旧离线请求。
         std::thread::spawn(move || {
             let mut worker = Worker {
+                no_spawn,
                 state_dir: query_state,
                 control: None,
                 self_sessions: Default::default(),
@@ -407,6 +415,7 @@ impl Backend {
         let committed_epoch = Arc::clone(&mutation_epoch);
         std::thread::spawn(move || {
             let mut worker = Worker {
+                no_spawn,
                 state_dir: mutation_state,
                 control: None,
                 self_sessions: Default::default(),
@@ -469,6 +478,9 @@ impl Backend {
             refresh,
             state_dir,
             bootstrap_started: AtomicBool::new(false),
+            no_spawn,
+            #[cfg(test)]
+            bootstrap_done: Arc::new(AtomicBool::new(false)),
             bootstrap_events,
             mutation_epoch,
         }
@@ -485,14 +497,20 @@ impl Backend {
                 let alive = Arc::clone(&self.alive);
                 let events = self.bootstrap_events.clone();
                 let refresh = self.refresh.clone();
+                let no_spawn = self.no_spawn;
+                #[cfg(test)]
+                let completed = self.bootstrap_done.clone();
                 std::thread::spawn(move || {
+                    #[cfg(test)]
+                    struct Completed(Arc<AtomicBool>);
+                    #[cfg(test)]
+                    impl Drop for Completed { fn drop(&mut self) { self.0.store(true, Ordering::Release); } }
+                    #[cfg(test)]
+                    let _completed = Completed(completed);
                     if !alive.load(Ordering::Acquire) {
                         return;
                     }
-                    match crate::daemon_cli::dial_control_spawn_quiet(
-                        &state,
-                        "homeway-tui-bootstrap",
-                    ) {
+                    match dial_control(&state, no_spawn, "homeway-tui-bootstrap") {
                         Ok(client) => {
                             client.close();
                             let _ = refresh.try_send(());
@@ -503,7 +521,7 @@ impl Backend {
                                 Event::Warning {
                                     target: Target::Local,
                                     message: "本机服务未就绪".into(),
-                                    error: Error::Bootstrap(error),
+                                    error,
                                     confirmation: Confirmation::None,
                                 },
                                 &alive,
@@ -569,6 +587,7 @@ pub(super) fn deliver<T>(tx: &mpsc::SyncSender<T>, mut value: T, alive: &AtomicB
 }
 
 struct Worker {
+    no_spawn: bool,
     state_dir: PathBuf,
     control: Option<Arc<ControlClient>>,
     self_sessions: std::collections::BTreeMap<String, i32>,
@@ -582,13 +601,18 @@ impl Drop for Worker {
     }
 }
 
+fn dial_control(state: &std::path::Path, no_spawn: bool, name: &str) -> Result<Arc<ControlClient>, Error> {
+    if no_spawn {
+        Ok(ControlClient::dial_with_timeout(&state.join("control.sock"), "cli", name, REQUEST_BUDGET)?.0)
+    } else {
+        crate::daemon_cli::dial_control_spawn_quiet(state, name).map_err(Error::Bootstrap)
+    }
+}
+
 impl Worker {
     fn client(&mut self) -> Result<&Arc<ControlClient>, Error> {
         if self.control.is_none() {
-            self.control = Some(
-                crate::daemon_cli::dial_control_spawn_quiet(&self.state_dir, "homeway-tui")
-                    .map_err(Error::Bootstrap)?,
-            );
+            self.control = Some(dial_control(&self.state_dir, self.no_spawn, "homeway-tui")?);
         }
         Ok(self.control.as_ref().expect("刚设置控制面连接"))
     }
@@ -1006,6 +1030,34 @@ mod tests {
     }
 
     #[test]
+    fn no_spawn_first_refresh_after_control_closes_never_bootstraps_a_daemon() {
+        use std::os::unix::net::UnixListener;
+        let state = temporary("web-bootstrap-closed");
+        std::fs::create_dir_all(&state).unwrap();
+        let socket = state.join("control.sock");
+        let listener = UnixListener::bind(&socket).unwrap();
+        // 控制监听曾经真实存在；在首次Refresh前关闭，不能走自动拉起分支。
+        drop(listener);
+        std::fs::remove_file(&socket).unwrap();
+        let backend = Backend::start_with_no_spawn(state.clone(), true);
+        backend.send(Command::Refresh).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(4);
+        loop {
+            let _ = backend.try_event();
+            if backend.bootstrap_done.load(Ordering::Acquire) { break; }
+            assert!(Instant::now() < deadline, "no-spawn首次Refresh未快速返回失败");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        drop(backend);
+        assert_eq!(crate::daemon_cli::spawn_attempts_for_state(&state), 0, "首次Refresh及worker都不能尝试spawn，不能以testexe起不成守护冒充通过");
+        assert!(!socket.exists());
+        assert!(!state.join("config.toml").exists());
+        assert!(!state.join("lock").exists());
+        assert!(!state.join("cache/spawn.log").exists());
+        std::fs::remove_dir_all(state).unwrap();
+    }
+
+    #[test]
     fn blocked_refresh_does_not_block_mutation_or_hide_successful_proxy_phase() {
         let root = temporary("refresh-lanes");
         let listener = UnixListener::bind(root.join("control.sock")).unwrap();
@@ -1136,6 +1188,7 @@ mod tests {
         .unwrap()
         .0;
         let mut worker = Worker {
+            no_spawn: false,
             state_dir: root.clone(),
             control: Some(client),
             self_sessions: Default::default(),
@@ -1227,6 +1280,7 @@ mod tests {
         let (client, _) =
             ControlClient::dial(&root.join("control.sock"), "cli", "phase-test").unwrap();
         let mut worker = Worker {
+            no_spawn: false,
             state_dir: root.clone(),
             control: Some(client),
             self_sessions: Default::default(),
@@ -1263,6 +1317,7 @@ mod tests {
             assert!(io.read_frame_deadline(REQUEST_BUDGET).is_err());
         });
         let mut worker = Worker {
+            no_spawn: false,
             state_dir: root.clone(),
             control: None,
             self_sessions: Default::default(),
@@ -1444,6 +1499,7 @@ mod tests {
             }
         });
         let mut worker = Worker {
+            no_spawn: false,
             state_dir: root.clone(),
             control: None,
             self_sessions: Default::default(),

@@ -32,6 +32,21 @@ daemon 控制面帧向量 + `decode_check.py`（**语言无关**的解码对拍�
 `README.md`）——E15 判据「检测规则已加载 22 份」的**计数与内容真源**（Go 侧 `go:embed`
 内嵌随二进制分发）；R6 检测引擎必须吃同一份规则数据。`index.toml` 的 id 集合 = 22 份计数真源。
 
+## WebServe v1 定值夹具（2026-11-08）
+
+`webserve/` 由 `python3 tools/gen-webserve-vectors.py --write` 按
+`openspec/changes/independent-webserve/protocol.md` 独立生成；生成器只使用 Python 标准库，
+不调用 Rust 编解码器，不读取实例 state。所有密钥均为公开递增测试字节，不能用于部署。
+`python3 tools/gen-webserve-vectors.py --check` 只读逐字节核对，不通过 roundtrip 自证。
+
+| 文件 | 固定内容 |
+|---|---|
+| `webserve/token_hww1.json` | token、磁盘凭证与路由标签正向量；版本、长度、校验、字母表、内部空白和非规范尾位负向量 |
+| `webserve/management_auth.json` | 固定 key id/nonce/exporter 的域隔离 HMAC、四帧握手；错误秘密、跨 TLS exporter 与坏帧负向量 |
+| `webserve/terminal_frames.json` | OPEN/INPUT/RESIZE/OUTPUT/CLOSE/ERROR/EXIT 字节，中文及 emoji；长度、方向、版本、尺寸及状态负例 |
+
+以下全目录 `SHA256SUMS` 规则同样覆盖此目录；定值夹具通过不等于真实 QUIC、PTY 或浏览器验收通过。
+
 ## 机器校验
 
 `SHA256SUMS` **覆盖本目录全部文件（含本清单 `MANIFEST.md`；`SHA256SUMS` 自身除外）**；

@@ -217,6 +217,16 @@ impl MockBackend {
 }
 
 impl Backend for MockBackend {
+    fn webserve_op(&self, op: vocab::OpName, args: serde_json::Value) -> Result<serde_json::Value, BackendErr> {
+        if matches!(op, vocab::OpName::WebserveToken) {
+            let mut object = serde_json::Map::new();
+            object.insert("token".into(), serde_json::Value::String(format!("hww1{}", "x".repeat(155))));
+            return Ok(serde_json::Value::Object(object));
+        }
+        let category = if args["readback_failed"].as_bool() == Some(true) { WebFailure::RecoveryRequired } else { WebFailure::DurabilityUncertain };
+        Err(BackendErr::Web { category, source: Some(Box::new(std::io::Error::other("hww1-do-not-expose-source"))) })
+    }
+
     fn server_version(&self) -> String {
         "test-0.1".to_owned()
     }
@@ -490,6 +500,37 @@ fn start_server(tag: &str, backend: Arc<dyn Backend>) -> (Arc<ControlServer>, Pa
 
 fn short() -> Duration {
     Duration::from_secs(5)
+}
+
+#[test]
+fn web_token_secret_and_recovery_categories_roundtrip_over_real_control_socket() {
+    let dir = PathBuf::from("/tmp").join(format!("hw-web-secret-wire-{}", std::process::id()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let (socket, listener) = super::listen::listen_control(&dir).unwrap();
+    let backend = MockBackend::new();
+    let server = ControlServer::new(ServerConfig {
+        server_version: "web-test".into(), bus: Arc::new(super::bus::Bus::new()), backend,
+        logf: Arc::new(|_| {}), max_conns: super::server::DEFAULT_MAX_CONTROL_CONNS,
+        handshake_deadline: super::server::DEFAULT_HANDSHAKE_DEADLINE,
+    });
+    let running = server.clone();
+    let worker = std::thread::spawn(move || running.serve(listener));
+    let (client, _) = ControlClient::dial(&socket, "cli", "web-secret-wire-test").unwrap();
+    let mut response = client.request("webserve.token", None, short()).unwrap();
+    let value = response.get_mut("token").map(serde_json::Value::take).unwrap();
+    let serde_json::Value::String(value) = value else { panic!("应答必须有token"); };
+    let token = zeroize::Zeroizing::new(value);
+    assert_eq!(token.len(), 159);
+    assert!(token.starts_with("hww1"));
+    for (failed, expected) in [(false,"耐久性未确认"),(true,"管理认证已暂停")] {
+        let error = client.request("webserve.token.rotate", Some(json!({"readback_failed":failed})), short()).unwrap_err();
+        assert_eq!(error.code, vocab::CODE_BAD_REQUEST);
+        assert!(error.detail().contains(expected));
+        assert!(!error.detail().contains("hww1"));
+    }
+    client.close(); server.shutdown();
+    let _ = worker.join();
+    std::fs::remove_dir_all(dir).unwrap();
 }
 
 #[test]

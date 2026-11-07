@@ -369,6 +369,7 @@ impl Stub {
 
     fn pump(&self, quic: &ExitQuic) {
         quic.drain_inbound(|item| match item {
+            ExitInbound::Management(_) => panic!("unexpected management in network harness"),
             ExitInbound::Reg(req) => {
                 // M3 S5 注入面（优先于 MAC 判定：真引擎里 MAC 过了才谈裁决）
                 if let Some(class) = *self.reject_class.lock().unwrap() {
@@ -4525,4 +4526,107 @@ async fn healthy_direct_refreshes_candidates_on_patrol_without_reconnect() {
     assert_eq!(after.stable_id, before.stable_id);
     assert_eq!(after.mirrors, before.mirrors, "没有重新赛跑");
     island.stop(); exit.stop();
+}
+
+/// 已取消的旧Proof不能在引擎晚回执后重新绑定并关闭新连接。
+/// 与CI旧阶梯例相邻，但不声称复现其RegistrationFailed的唯一根因。
+#[tokio::test]
+async fn cancelled_old_proof_does_not_replace_new_live_registration() {
+    async fn take_proof(quic: &ExitQuic) -> crate::Reg4Request {
+        let deadline = Instant::now() + BUDGET;
+        loop {
+            let mut found = None;
+            quic.drain_inbound(|item| match item {
+                ExitInbound::Reg(request) => {
+                    assert!(found.is_none());
+                    found = Some(request);
+                }
+                _ => panic!("unexpected inbound event"),
+            });
+            if let Some(request) = found {
+                assert!(request.frame.mac_matches(&SECRET, &request.exporter));
+                return request;
+            }
+            assert!(Instant::now() < deadline, "Proof request did not arrive");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+    async fn result<T>(receive: &Receiver<Result<T, IslandErr>>) -> Result<T, IslandErr> {
+        let deadline = Instant::now() + WAIT;
+        loop {
+            match receive.try_recv() {
+                Ok(result) => return result,
+                Err(TryRecvError::Disconnected) => panic!("island stopped"),
+                Err(TryRecvError::Empty) => {}
+            }
+            assert!(Instant::now() < deadline, "Connect reply did not arrive");
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+    let quic = exit_face(26);
+    let (logf, logs) = sink();
+    let island = Island::start(
+        logf,
+        Arc::new(|_| {}),
+        island_cfg(Duration::from_secs(60), quic.rpk_public_key()),
+    )
+    .unwrap();
+    let (tun, _peer) = tun_pair();
+    attach(&island, tun.as_raw_fd(), 1280, BUDGET).unwrap();
+    let addr = connectable(&quic);
+    let (first_tx, first_rx) = channel();
+    island
+        .tx()
+        .send(Cmd::Connect {
+            cands: vec![direct(addr)],
+            budget: WAIT,
+            demote_adopted: false,
+            reply: first_tx,
+        })
+        .unwrap();
+    let old = take_proof(&quic).await;
+    assert!(old.is_active());
+    assert!(matches!(
+        result(&first_rx).await,
+        Err(IslandErr::RegistrationFailed)
+    ));
+    let deadline = Instant::now() + BUDGET;
+    while old.is_active() {
+        assert!(
+            Instant::now() < deadline,
+            "closed peer must invalidate pending verdict"
+        );
+        tokio::time::sleep(Duration::from_millis(1)).await;
+    }
+    let (second_tx, second_rx) = channel();
+    island
+        .tx()
+        .send(Cmd::Connect {
+            cands: vec![direct(addr)],
+            budget: WAIT,
+            demote_adopted: false,
+            reply: second_tx,
+        })
+        .unwrap();
+    let new = take_proof(&quic).await;
+    assert!(new.is_active());
+    new.reply(Reg4Verdict::Accepted {
+        tunnel_ip: TUNNEL_IP,
+        tun_ip: TUN_IP,
+    });
+    old.reply(Reg4Verdict::Accepted {
+        tunnel_ip: TUNNEL_IP,
+        tun_ip: TUN_IP,
+    });
+    assert!(result(&second_rx).await.is_ok());
+    let lines = logs_until(&logs, "会话被对端关闭", Duration::from_millis(300)).await;
+    assert!(
+        !lines
+            .iter()
+            .any(|line| line.contains("replaced by newer registration")),
+        "late old verdict must not evict the fresh connection: {lines:?}"
+    );
+    assert_eq!(island.snapshot().connections, 1);
+    assert!(island.stop_within(Instant::now() + BUDGET));
+    assert!(quic.stop_within(Instant::now() + BUDGET));
 }

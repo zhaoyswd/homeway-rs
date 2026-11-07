@@ -130,7 +130,8 @@ struct Pending {
 ///
 /// 帧是**定长**的（`reg4` 的长度常量）：按「读 2B 魔数 → 定长收全帧」切分；任何一帧被拒
 /// ⇒ 关连接（准入是连接级的，拒绝后不给「同连接再试」的口子）。
-pub(crate) async fn control(conn: Connection, conn_id: u64, ctx: Arc<FaceCtx>, generation: Option<super::RelayGeneration>) {
+pub(crate) async fn control(conn: Connection, conn_id: u64, ctx: Arc<FaceCtx>, generation: Option<super::RelayGeneration>, relay_origin: bool, origin_remote: std::net::SocketAddr) {
+    let web_deadline = tokio::time::Instant::now() + crate::web::AUTH_BUDGET;
     // 阶段 ①：准入（有界）——`ADMIT_DEADLINE` **包住「等首帧」（`accept_bi`）+ 整段状态机**。
     // 控制流两半边的存放：`admit` 拿到后填进 `streams`，超时被 drop 时只是没人取（无害）。
     let deadline = ctx.admit_deadline;
@@ -138,6 +139,12 @@ pub(crate) async fn control(conn: Connection, conn_id: u64, ctx: Arc<FaceCtx>, g
     match bounded_by(deadline, admit(&conn, conn_id, &ctx, &mut streams, generation)).await {
         Some(Admitted::Bound) => {}
         Some(Admitted::Rejected) => return, // 已拒 + 已关连接
+        Some(Admitted::Management) => {
+            if let Some((send, recv)) = streams {
+                super::web::run(conn, conn_id, ctx, generation, relay_origin, origin_remote, send, recv, web_deadline).await;
+            }
+            return;
+        }
         None => {
             // 「握手完成但不发 Hello」（连控制流都不开）与「Hello 之后不发 Proof」到点 ⇒
             // 本期限收口（r14 F3：`max_idle_timeout` + `keep_alive` 组合下这类连接**不会
@@ -177,6 +184,7 @@ pub(super) async fn bounded_by<F: std::future::Future>(
 enum Admitted {
     Bound,
     Rejected,
+    Management,
 }
 
 /// 阶段 ①：四帧准入（**已被 `ADMIT_DEADLINE` 包住**，含等首帧的 `accept_bi`）。
@@ -199,6 +207,9 @@ async fn admit(
     let Some((hbytes, head)) = read_head(recv).await else {
         return Admitted::Rejected; // 对端关流/连接死（无「拒绝」语义，不计拒绝）
     };
+    if hbytes == crate::web::HELLO_MAGIC {
+        return Admitted::Management;
+    }
     if let Some(why) = head.legacy_why() {
         reject(ctx, conn, &[0u8; 8], why, Counter::BeforeChallenge, CloseCode::BadData);
         return Admitted::Rejected;
@@ -384,9 +395,10 @@ async fn admit(
     match verdict {
         Reg4Verdict::Accepted { tunnel_ip, tun_ip } => {
             // 绑定（E-q2 采纳行在 bind 内）⇒ **绑定建立之后立刻**写 A4（设计 §1.2）
+            if !ctx.bridge.bind(proof.dev_tag, proof.pubkey, conn_id, conn.clone(), tunnel_ip, tun_ip) {
+                return Admitted::Rejected;
+            }
             ctx.stats.regs_accepted.fetch_add(1, Ordering::SeqCst);
-            ctx.bridge
-                .bind(proof.dev_tag, proof.pubkey, conn_id, conn.clone(), tunnel_ip, tun_ip);
             if send.write_all(&AcceptFrame::encode()).await.is_err() {
                 // 回执写不出去 = 客户端会超时重连（绑定仍在，由其重登记覆盖）
                 return Admitted::Rejected;
@@ -591,7 +603,7 @@ async fn ask_engine(
     let (reply_tx, reply_rx) = oneshot::channel();
     if !ctx
         .bridge
-        .push_inbound(ExitInbound::Reg(Reg4Request::new(frame, exporter, reply_tx).with_origin(conn.remote_address(), generation)))
+        .push_inbound(ExitInbound::Reg(Reg4Request::new(frame, exporter, conn.clone(), reply_tx).with_origin(conn.remote_address(), generation)))
     {
         ctx.bridge
             .note_drop(DropKind::Unregistered, "准入请求（入境队列满 8192 条）");
@@ -602,7 +614,17 @@ async fn ask_engine(
         );
         return None;
     }
-    reply_rx.await.ok()
+    wait_engine_reply(conn, reply_rx).await
+}
+
+pub(super) async fn wait_engine_reply(conn: &Connection, reply: oneshot::Receiver<Reg4Verdict>) -> Option<Reg4Verdict> {
+    tokio::select! {
+        biased;
+        _ = conn.closed() => None,
+        result = reply => {
+            if conn.close_reason().is_some() { None } else { result.ok() }
+        }
+    }
 }
 
 /// 「在途未认证」= 存活连接数 − 已绑定设备数（设计 §1.6 挑战行的计数面）。

@@ -1,4 +1,4 @@
-c264f0a46bca8e9d169aaa0b9d99d3b996b28aa6d184324ca60a0cac22aad7d8  ./MANIFEST.md
+8bb34e5b9446a6a3b98f112c3bd32c8dfa382a4f4b22569d3bbb8a04c7b130ec  ./MANIFEST.md
 664e1bacccf0fc0ce05655e53c1efac0f2e74492584121b354b3f20b395ab54c  ./control-cp-v1/decode_check.py
 d1acf3b973ff9e89a5a85922dfee54f587b9c2c845705ae25d44f1e3753817e3  ./control-cp-v1/frames.jsonl
 268df555ac19b37233ba00383a792f9cfe4ebcd343bcedc4b653f28e932921b9  ./relay-admission.json
@@ -63,3 +63,6 @@ b2b82aa263572ea1a44303ea4306020010cfe89c2be789c862d738a8be8e05d9  ./vectors/term
 cd0a0767b9947274b8115bb8195028202d23c0d3ea682b80ac0f06887a925348  ./vectors/token_hmw2.json
 4521f0ea623bf234bf19f4b11492c4d4a0dc4311723a9ce332aa6f0e2aef9b5f  ./vectors/tun_status.jsonl
 d065823d92a23c917b7afbe76623a1f196eb72a81e610c7943b09d77dfed049b  ./vectors/tunnel_addr.json
+f7154d2f01fcd1633e67ca813fa330a30d08a9f7df656c8ece50bcd44af15559  ./webserve/management_auth.json
+2b643a4fb4f2b7748f41f108011ef024f080e365cb5e7b455ec1bf1bda5fa84f  ./webserve/terminal_frames.json
+f12b43b4d6709a0f30a8137f85ffb34450885377fbea2c64e69e804aa91860c9  ./webserve/token_hww1.json

@@ -51,6 +51,10 @@ fn certified_key(seed: &Ed25519Seed) -> Result<(CertifiedKey, RpkPublicKey), Rpk
     Ok((certified, pubkey))
 }
 
+pub(crate) fn public_key(seed: &Ed25519Seed) -> Result<RpkPublicKey, RpkErr> {
+    certified_key(seed).map(|(_, public)| public)
+}
+
 /// 出口服务端配置 + **公钥**（公钥 = 进 token 的那 32B，见 M1 设计 §12-②）。
 ///
 /// 私钥只活在 `CertifiedKey` 内（quinn/rustls 仅在握手签名时用它）；本函数返回的

@@ -1,0 +1,49 @@
+{
+  "schema": "homeway-web-auth-v1",
+  "source": "protocol.md §2; independent Python stdlib oracle",
+  "public_test_material": true,
+  "version": 1,
+  "key_id_hex": "404142434445464748494a4b4c4d4e4f",
+  "secret_hex": "505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f",
+  "nonce_hex": "707172737475767778797a7b7c7d7e7f",
+  "exporter_hex": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+  "exporter_label": "homeway-web-exporter-v1",
+  "exporter_context_hex": "",
+  "mac_input_hex": "686f6d657761792d7765622d617574682d763101404142434445464748494a4b4c4d4e4f707172737475767778797a7b7c7d7e7f808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+  "mac_hex": "95f0092601287774a34be62c13a9032e4c7d03f85b7a86f245ce9a5e3d587a98",
+  "hello_hex": "573101404142434445464748494a4b4c4d4e4f",
+  "challenge_hex": "574301707172737475767778797a7b7c7d7e7f",
+  "proof_hex": "575001404142434445464748494a4b4c4d4e4f95f0092601287774a34be62c13a9032e4c7d03f85b7a86f245ce9a5e3d587a98",
+  "accept_hex": "574101",
+  "negative_mac": [
+    {
+      "name": "wrong_secret",
+      "secret_hex": "a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5",
+      "exporter_hex": "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f",
+      "mac_hex": "c2907ea9ef8868eeb1106b6962a7603138e38182ba3c87701303419c8aa770b8"
+    },
+    {
+      "name": "other_tls_connection",
+      "secret_hex": "505152535455565758595a5b5c5d5e5f606162636465666768696a6b6c6d6e6f",
+      "exporter_hex": "5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a5a",
+      "mac_hex": "7da99b74dffea696f87ae22b1e31c6b00f8897bb691a334f056df1710fba7276"
+    }
+  ],
+  "invalid_frames": [
+    {
+      "name": "hello_wrong_version",
+      "wire_hex": "573102404142434445464748494a4b4c4d4e4f",
+      "close_code": 113
+    },
+    {
+      "name": "proof_wrong_magic",
+      "wire_hex": "585801404142434445464748494a4b4c4d4e4f95f0092601287774a34be62c13a9032e4c7d03f85b7a86f245ce9a5e3d587a98",
+      "close_code": 113
+    },
+    {
+      "name": "proof_wrong_key_id",
+      "wire_hex": "5750010000000000000000000000000000000095f0092601287774a34be62c13a9032e4c7d03f85b7a86f245ce9a5e3d587a98",
+      "close_code": 112
+    }
+  ]
+}

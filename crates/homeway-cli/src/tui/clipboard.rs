@@ -221,6 +221,8 @@ fn route(ssh: bool, term_session_id: Option<&str>) -> Route {
 }
 
 pub(super) fn remote_terminal() -> bool {
+    // Web PTY的可见终端是浏览器；绝不能调用宿主物理剪贴板helper。
+    if std::env::var_os("HOMEWAY_WEB_TUI").as_deref()==Some(std::ffi::OsStr::new("1")){return true;}
     let ssh = std::env::var_os("SSH_CONNECTION").is_some()
         || std::env::var_os("SSH_TTY").is_some()
         || std::env::var_os("SSH_CLIENT").is_some();
