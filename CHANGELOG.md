@@ -1,5 +1,30 @@
 # Changelog
 
+## v0.3.28（2026-11-08，独立 WebServe 与浏览器 TUI）
+
+- 新增独立的 `homeway webserve start/stop/restart/status` 和 `homeway webserve token [rotate]`。
+  HTTP/WS 固定只监听 `127.0.0.1`，端口可配置；通过用户自建的 HTTPS/WSS 反代打开网页，
+  输入目标主机的独立 webtoken，在浏览器中操作该主机现有 TUI。令牌授予完整实例管理权限，
+  包括终端和它保存的其它主机，应只在可信入口使用。
+- WebServe 与出口、中继独立：没有配置网络角色的主机也能只提供本机网页入口；中继主机
+  的入口还可连接当前有效注册的出口，由目标主机最终认证。出口只需运行新版统一进程及
+  出口服务、提供 webtoken，无需启动 WebServe HTTP；令牌不包含任意目标地址或联网密钥。
+- Web 凭证可离线稳定获取，不启动任何服务；首次获取可热安装到已经运行的出口。
+  `token rotate` 撤销旧凭证、票据及管理界面，不改变联网 token。配置保存在独立
+  `webserve.toml`，旧 `config.toml` 和既有角色期望态保持。
+- 浏览器终端支持中文、鼠标、显式复制粘贴和 resize；大输入按总 2MiB 预算预检并顺序分帧，
+  超限发送前拒绝，异常断链提示检查可能已送达的内容。每个界面独立运行禁止自动拉起守护
+  的 TUI/PTY，断开或关闭网页回收该界面，不结束原工作会话；父进程意外退出时也不会
+  留下替代守护或孤儿 TUI。
+- 管理会话拥有独立认证、限额及取消路径；修复控制重连对账误撤管理 owner，以及已知失活
+  普通连接的迟到准入裁决可能替换健康连接的问题。新增管理握手保持与原联网准入隔离，
+  既有联网 wire/token、ALPN、服务 tag 和 C-ABI/NAPI 导出保持。
+- WebServe/TUI 支持 macOS、Linux；Windows 的 `webserve` 命令明确暂不支持，原有 Windows
+  功能保持。入口和目标须更新并重启支持管理能力的统一进程；旧前台单角色进程不自动
+  拉起第二守护。浏览器采用 Unicode11 宽表，不承诺所有新 emoji/组合字符与 Rust 同宽。
+
+使用、权限边界与 NGINX 反代示例见[WebServe 手册](https://github.com/zhaoyswd/homeway-rs/blob/v0.3.28/docs/WEBSERVE.md)。
+
 ## v0.3.27（2026-11-07，双网卡 UPnP 与终端体验修复）
 
 - 修复双网卡出口的自动 UPnP 来源错配：SSDP、描述读取、全部 SOAP 与映射目标使用

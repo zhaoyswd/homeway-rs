@@ -72,6 +72,17 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-11-08 v0.3.28 发布与部署（已授权，元数据准备/评审中，尚未执行）**：用户已授权
+> 推送/发布/部署，并要求当前 Mac 最后切换；本轮先配置并验证
+> `https://homeway.catzhao.com:8443` 的 NGINX/证书与本机 WebServe 回源，再由主会话完成
+> 中文版本提交→推 main→fresh 核 tag 在 origin/main 头→推 v0.3.28→等待公开 CI/官方 Release。
+> 版本准备基线 `51d032f`，远端/本地 v0.3.28 tag 与同名 Release 均未占用；只提升产品版本和
+> 锁文件受管 path 包，不刷新第三方依赖。版本正文与验收/执行指针见
+> `docs/reviews/2026-11-08-v0.3.28-release-deploy.md`。
+> 正式二进制只用官方 Release，本机先核五归档/SUMS，云件本机 scp 后再核；备份原身份/
+> config/state，按阿里云→LAN84→当前 Mac（最后）的顺序唯一激活并逐机验收。NGINX与部署
+> 由主会话执行，本准备子任务不操作生产；未执行项不能记作成功，所有凭证与备份留受限目录。
+
 > **2026-11-07/08 独立 WebServe（完成，本地源码与私有验收）**：按用户授权完成最终方案、
 > 技术评审、开发及代码评审。变更入口 `openspec/changes/independent-webserve/`；规划提交
 > `bd00c0c`，实现/验收/本指针同批提交。独立`webserve`命令与`webserve.toml`，HTTP/WS只绑
