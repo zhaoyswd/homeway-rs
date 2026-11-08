@@ -1488,37 +1488,42 @@ RECOVERY.txt/worker.log及`gui/501/me.zhaozhe.homeway-release-v0327-20261107-r1`
 原tag保留，不重指。Linux PTY openpty签名clippy与Mac relay集成CI失败后取消Release，
 未安装该版；记录完整保留，转v0.3.29继续。见同日v0.3.28/v0.3.29 release-deploy评审。
 
-### 13.29 v0.3.29 发布与滚动部署（2026-11-08，云/LAN完成，本机PREPARED待最后切换）
+### 13.29 v0.3.29 发布与三机滚动部署（2026-11-08，完成）
 
-版本/tag提交f1e4423，CI42442615758最终attempt2八job通过（首轮旧stats/DNS两失败与定向
-复验保留，只重跑一次失败Mac job），Release42442630178五平台及发布通过。本机下载五件
-严格核SUMS/成员/架构，Mac正式件4cf895…、Linux正式件a9513b…，不使用私有cargo件。
-原冻结ReleaseREST D2b19曾因校验器命名冲突被workflowJSON覆盖，LAN首preflight安全拒绝，
-无backup/stage/进程变动；已保存原错误/误报、修正禁覆写门并原锚恢复、独立验证及重新备份。
+用户授权推送/发布/部署，并要求先配置本机NGINX、当前承载会话Mac最后。版本/tag提交
+f1e4423，CI42442615758最终attempt2八job通过（首轮旧stats/DNS失败与定向复验保留，
+只重跑失败Mac job一次），Release42442630178五平台及发布通过。五官方归档本机严格
+SUMS/成员/架构核验；Mac正式4cf895…、Linux正式a9513b…，云件由本机SCP后再核，
+没有以私有cargo件替代。v28失败tag/取消Release未部署；REST命名冲突导致LAN首preflight
+安全拒绝，无backup/stage/进程变动；保错误与原误报，恢复原D2b19锚而非改锚，独立复验。
 
-先行NGINX已配置https://homeway.catzhao.com:8443→127.0.0.1:18080，原wildcard证书有效，
-原域名保持；当前Mac Web尚未启动，不能把预置502当上线。用户要求当前承载会话Mac最后。
-云、LAN均先备份/独立门再唯一激活，系统PATH零参/defaultstate、原身份config保全。
+三机均系统PATH零参/defaultstate、原角色/身份/config/凭证前缀保全，先完整备份/独立门，
+再唯一激活/独立最终验收，均未回退：
 
-云：SUCCESS/12.269s，31292→62701，官方a9513b、root:root0755、双角色/端口/旧台账前缀
-独立通过，公网单端点warmup+3probe通过；恢复目录
-/root/homeway-rollback/release-v0.3.29-20261108-r1/。
-LAN：SUCCESS/34.094s，19355→96586，官方4cf/501:wheel0/0755、原job/内部38242/身份
-及台账前缀通过，正常追加425B；auto现选en7=.84，IGD外38243→.84:38242与status一致，
-云官方客户端对唯一公网38243探测3/3通过。原外38242假设checker失败与模板未执行保留，
-无人工映射写。恢复目录~/homeway-rollback/release-v0.3.29-lan84-20261108-r1/（LAN机）。
+- 云：SUCCESS/12.269s，31292→62701，官方a9513b/root:root0755，serve41641+relay41741；
+  原台账前缀追加0，公网单端点warmup+3probe通过。恢复目录
+  /root/homeway-rollback/release-v0.3.29-20261108-r1/。
+- LAN：SUCCESS/34.094s，19355→96586，官方4cf/501:wheel0/0755、原job/内部38242；
+  auto现选en7=.84，IGD外38243→.84:38242与status一致，云官方客户端对公网38243探针
+  3/3通过。旧外38242假设checker失败及未执行模板保留，未人工改映射；台账合法追加425B。
+  恢复目录~/homeway-rollback/release-v0.3.29-lan84-20261108-r1/（LAN机）。
+- 当前Mac最后：独立备份门后检查点4e7c6c5先推送，再唯一once；SUCCESS/35.983s，
+  21921→21440，官方4cf/501:admin80/0755、原job/41641/term511；身份/config/台账前缀
+  追加0，公网单端点3/3通过。恢复目录~/homeway-rollback/release-v0.3.29-20261108-r1/。
 
-当前Mac仅官方payload受限暂存，仍旧PID21921/PATH88670b…；执行器r6问题整改已67/0、
-真实TLS/WSS10/0及真实Homeway私有验证通过，r7完整外评尚待，未prepare/activate。
-后续先读各receipt/RECOVERY，不能重复bootstrap/activate或盲回填整个state。
-完整原始评审、失败及实际回执索引见docs/reviews/2026-11-08-v0.3.29-release-deploy.md与
-2026-11-08-v0.3.29-controller-review.md；本节待本机最后切换及独立验收后更新。
+NGINX最先配置https://homeway.catzhao.com:8443→127.0.0.1:18080，复用原wildcard证书；
+当前Mac WebServe已持久enabled，仅loopback监听。生产8443现存0600token实际HTTPS200/
+WSS101、systemCA/publicSNI/Host/Origin、TUI首屏/重绘/close1000/UI归0独立通过；无INPUT
+或用户工作session操作。云外部公开DNS/NAT/TLS1.3/HTTPS200/无凭证WSS101+5s超时1008
+也通过，组合证明整个域名入口。新NGINX3087与旧十文件SHA保持、code域名200/TLS0。
+用系统PATH `homeway webserve token` 获取稳定凭证；不将token入仓/服务日志或复制至云。
+云/LAN未开启HTTP。三once均单次exit0、旧PID/worker退出、隐藏stage清理，受限备份保留。
 
-
-本机追加检查点：r7唯一P2/N0与checked-key snapshot已最小整改，最终独立技术/代码两门及
-全74/0通过（原r7不通过保留）；Macdeploy c0cddc…、helpere44536…，尚未activate。
-Mac唯一prepare2.013s/PREPARED，独立完整备份门通过，目录
-~/homeway-rollback/release-v0.3.29-20261108-r1/，manifest ee0fcf30…；旧PID21921/PATH886与
-原身份config/台账前缀0追加、webcfg/key缺失、18080空闲，原NGINX/旧域名正常。主会话先
-推送当前检查点，再唯一bootstrap目录once.plist；后续读receipt/RECOVERY，不重复激活或回填state。
-云与LAN公网均已完成warmup+3probe/direct精确单端点验收；Mac最后机器/域名验收仍待执行。
+产品与执行器最终两门通过；r6/r7原不通过、P2/checked-key最小修、全74/0与真实TLS及
+真实Homeway验收、所有原失败均保留，不把未证实根因说成已修复。官方Mac完整Web105.249s/
+40轮/真实浏览器、TUI23/remote8/subscription5通过；原remote一次输入超时留证。
+最终总门通过且无剩余部署项。恢复先读每机receipt.json/RECOVERY/实际owner及SHA，
+不重复bootstrap/activate，不盲恢复整个state.tar。完整原文/处置与实际回执索引见
+[本次部署记录](reviews/2026-11-08-v0.3.29-release-deploy.md)、
+[执行器评审](reviews/2026-11-08-v0.3.29-controller-review.md)与
+[r7原文及最终增量](reviews/2026-11-08-v0.3.29-controller-review-r7.md)。

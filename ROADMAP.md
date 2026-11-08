@@ -72,32 +72,28 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
-> **2026-11-08 v0.3.29 发布与部署（官方已发布、云/LAN全验收通过；本机PREPARED待最后切换）**：公开CI暴露
-> Linux `openpty` 窗口尺寸参数`unnecessary_mut_passed`，采用显式raw mutable pointer兼容
-> Mac/Linux声明，不屏蔽lint，不改变PTY/协议行为。另有Mac `relay_admission_e2e` 的
-> `udp_only_relay_session_is_authenticated_by_real_engine` 返回NoCandidate，单独调查，不混作
-> FFI警告或已知其它flaky。Mac时钟实测微秒重复，fixture仅pid+时间戳有共享state风险；
-> 测试改为AtomicU64+原子mkdir0700，1025并发reserve/既有目录保全及四用例固定三轮全过，
-> 不改产品State/网络预算/断言；原CI唯一根因仍未获现场trace证明。主会话保留v0.3.28 tag，
-> 取消其Release且未正式部署该版。
-> v0.3.29版本提交/tag `f1e4423` 已推，CI42442615758 attempt2全通过（首轮旧stats/DNS
-> 两失败与定向复验均留证，只重跑一次失败Mac job），Release42442630178五平台及发布通过；
-> NGINX `https://homeway.catzhao.com:8443` 已由主会话先配置，官方件按阿里云→LAN84→
-> 当前Mac（最后）切换；五官方件SUMS/成员/架构已核，Mac官方件完整Web105.249s/40轮/
-> 真实浏览器及TUI23/remote8/subscription5通过，原remote首红未归因及复验均保留。云已
-> SUCCESS/12.269s、31292→62701、官方a9513b…、双角色/原身份配置台账保全独立通过；
-> 云公网单端点3/3 probe通过；LAN已SUCCESS/34.094s、19355→96586、官方4cf/原job/
-> 身份config/台账旧前缀保全，新增425B；auto现选en7=.84，UPnP外38243→.84:38242
-> 只读表与status一致（旧外38242假设检查失败保留，未改规则）；云官方客户端对新38243
-> warmup/3probe/ready/direct精确端点全部通过，私有身份/客户端清理与cloud默认state保全。
-> Mac执行器r7唯一P2及checked-key快照最小整改，最终独立两门/全74/0通过，原两轮不通过
-> 原文保留。Mac已PREPARED/2.013s，完整备份独立通过，仍旧PID21921/官方886/原state与
-> 身份0改动，18080空闲；尚未activate。最后仅执行一次 gui/501 的
-> `~/homeway-rollback/release-v0.3.29-20261108-r1/once.plist`，独立worker负责新件/原job/
-> WebServe18080+origin8443/0600token/真HTTPS-WSS与回收/最终状态、失败回退及持久回执。
-> 中断恢复先读同目录receipt.json/RECOVERY.txt，不重复bootstrap、不回填整个state；
-> 本机切换前本检查点需commit/push，再唯一激活及独立机器/域名验收。准备/执行指针见
-> `docs/reviews/2026-11-08-v0.3.29-release-deploy.md`，v28原失败/取消记录单独保留。
+> **2026-11-08 v0.3.29 发布与三机部署（完成，生产WebUI验收通过）**：用户授权推送/部署，
+> 按要求先配置NGINX，再云→LAN→当前Mac最后切换。版本/tag提交`f1e4423`，
+> CI42442615758最终attempt2八job通过（首轮旧stats/DNS失败及定向复验留证，仅重跑失败
+> Mac job一次），Release42442630178五平台及发布通过；五官方件本机严格SUMS/成员/架构
+> 核验，云件本机SCP后再核。正式均系统PATH、零参/defaultstate、官方Release，无私有件。
+> 云SUCCESS/12.269s、31292→62701，官方a9513b…；LAN SUCCESS/34.094s、19355→96586，
+> 官方4cf/501:wheel0，auto实际en7=.84、UPnP外38243→.84:38242，内部38242；当前Mac在
+> 检查点`4e7c6c5`推送后唯一once最后切换，SUCCESS/35.983s、21921→21440，官方4cf/
+> 501:admin80、原job/41641/角色/term511，均未回退。所有原身份/config/凭证旧前缀独立保全；
+> LAN正常追加425B，cloud/Mac0追加；once单次exit0、临时stage清理，三机公网单端点各
+> warmup+3probe/direct全部通过，私有client/HOME/XDG/identity清理，不操作用户工作会话。
+> 本机WebServe持久enabled且仅127.0.0.1:18080；NGINX `https://homeway.catzhao.com:8443`
+> 真正回源本机出口，systemCA认证HTTPS200/WSS101、首屏/重绘/close1000/UI归0独立通过；
+> 云公网DNS/NAT/TLS1.3/HTTPS200/无凭证WSS101及5s后1008拒绝亦通过，旧NGINX十文件及
+> code域名200保持。稳定webtoken由`homeway webserve token`获取；token/新auth.key0600，
+> 不入日志，不复制至云。云/LAN未开启HTTP。
+> 全部产品/执行器两门最终通过，r6/r7原不通过、P2/checked-key最小修和最终74/0及非阻塞
+> 边界保留；正式Mac完整Web105.249s/40循环/浏览器与TUI23/remote8/subscription5通过。
+> v28失败tag不移动/Release取消未部署；原CI、TUI交互首红及错误REST preflight均留证，
+> 不将未归因失败宣称修好，未放宽测试/锚/门。完整记录见同日v0.3.29 release-deploy及
+> controller-review/r7。恢复先读各`homeway-rollback/release-v0.3.29…/receipt.json`与
+> RECOVERY；不重复bootstrap/activate、不盲回填state。当前无剩余必改/必验/部署事项。
 
 > **2026-11-08 v0.3.28 发布验证（失败保留tag，未部署）**：版本提交`5867127`与tag已推，
 > CI42440944607的Linux clippy及Mac UDP-only准入集成测试失败，Release42440960102已取消，
