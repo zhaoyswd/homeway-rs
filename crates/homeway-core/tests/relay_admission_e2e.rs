@@ -2,7 +2,7 @@
 use std::net::{Ipv4Addr, SocketAddr, TcpListener, UdpSocket};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex, mpsc};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use homeway_core::legframe;
 use homeway_core::relay::{self, Config as RelayConfig, Relay, StopPipe};
@@ -60,8 +60,31 @@ fn echo(island: &Island, id: StreamId, bytes: &[u8]) {
     assert_eq!(received, bytes);
 }
 
+fn fixture_dir() -> PathBuf {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static NEXT: AtomicU64 = AtomicU64::new(0);
+    loop {
+        let sequence = NEXT.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!("homeway-relay-admission-e2e-{}-{sequence}", std::process::id()));
+        // SystemTime在Darwin只有微秒精度，不能担任并发fixture的唯一性来源。
+        // 先原子占有目录，遇已有目录只换名字，绝不复用其他实例的state。
+        #[cfg(unix)]
+        let created = {
+            use std::os::unix::fs::DirBuilderExt;
+            std::fs::DirBuilder::new().mode(0o700).create(&dir)
+        };
+        #[cfg(not(unix))]
+        let created = std::fs::create_dir(&dir);
+        match created {
+            Ok(()) => return dir,
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+            Err(error) => panic!("私有fixture目录创建失败（{}）：{error}", dir.display()),
+        }
+    }
+}
+
 fn fixture(udp_only: bool) -> Fixture {
-    let dir = std::env::temp_dir().join(format!("homeway-relay-admission-e2e-{}-{}", std::process::id(), SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos()));
+    let dir = fixture_dir();
     let lines = Arc::new(Mutex::new(Vec::new()));
     let log_lines = Arc::clone(&lines);
     let logf: homeway_core::Logf = Arc::new(move |line| log_lines.lock().unwrap().push(line.to_owned()));

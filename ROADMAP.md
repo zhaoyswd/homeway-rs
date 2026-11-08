@@ -72,16 +72,23 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
-> **2026-11-08 v0.3.28 发布与部署（已授权，元数据准备/评审中，尚未执行）**：用户已授权
-> 推送/发布/部署，并要求当前 Mac 最后切换；本轮先配置并验证
-> `https://homeway.catzhao.com:8443` 的 NGINX/证书与本机 WebServe 回源，再由主会话完成
-> 中文版本提交→推 main→fresh 核 tag 在 origin/main 头→推 v0.3.28→等待公开 CI/官方 Release。
-> 版本准备基线 `51d032f`，远端/本地 v0.3.28 tag 与同名 Release 均未占用；只提升产品版本和
-> 锁文件受管 path 包，不刷新第三方依赖。版本正文与验收/执行指针见
-> `docs/reviews/2026-11-08-v0.3.28-release-deploy.md`。
-> 正式二进制只用官方 Release，本机先核五归档/SUMS，云件本机 scp 后再核；备份原身份/
-> config/state，按阿里云→LAN84→当前 Mac（最后）的顺序唯一激活并逐机验收。NGINX与部署
-> 由主会话执行，本准备子任务不操作生产；未执行项不能记作成功，所有凭证与备份留受限目录。
+> **2026-11-08 v0.3.29 发布与部署（v0.3.28失败后继续，准备/评审中）**：公开CI暴露
+> Linux `openpty` 窗口尺寸参数`unnecessary_mut_passed`，采用显式raw mutable pointer兼容
+> Mac/Linux声明，不屏蔽lint，不改变PTY/协议行为。另有Mac `relay_admission_e2e` 的
+> `udp_only_relay_session_is_authenticated_by_real_engine` 返回NoCandidate，单独调查，不混作
+> FFI警告或已知其它flaky。Mac时钟实测微秒重复，fixture仅pid+时间戳有共享state风险；
+> 测试改为AtomicU64+原子mkdir0700，1025并发reserve/既有目录保全及四用例固定三轮全过，
+> 不改产品State/网络预算/断言；原CI唯一根因仍未获现场trace证明。主会话保留v0.3.28 tag，
+> 取消其Release且未正式部署该版。
+> v0.3.29在独立复核/必要验证通过后由主会话commit/push/main头tag/官方五平台发布；
+> NGINX `https://homeway.catzhao.com:8443` 已由主会话先配置，官方件按阿里云→LAN84→
+> 当前Mac（最后）切换；现役本机仍未变。准备/执行指针见
+> `docs/reviews/2026-11-08-v0.3.29-release-deploy.md`，v28原失败/取消记录单独保留。
+
+> **2026-11-08 v0.3.28 发布验证（失败保留tag，未部署）**：版本提交`5867127`与tag已推，
+> CI42440944607的Linux clippy及Mac UDP-only准入集成测试失败，Release42440960102已取消，
+> GitHub同名Release不存在；不移动tag、不用该版换装。原始日志与元数据记录见
+> `docs/reviews/2026-11-08-v0.3.28-release-deploy.md`，后续改发v0.3.29。
 
 > **2026-11-07/08 独立 WebServe（完成，本地源码与私有验收）**：按用户授权完成最终方案、
 > 技术评审、开发及代码评审。变更入口 `openspec/changes/independent-webserve/`；规划提交
