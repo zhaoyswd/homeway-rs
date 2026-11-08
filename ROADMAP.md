@@ -72,12 +72,22 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
-> **2026-11-08 v0.3.30 发布与三机部署（进行中）**：用户已明确授权完整发版部署链，
-> 承接`c41414b`的WebUI三项优化，元数据独立技术/代码两门通过；本地ci-local quick执行中。
-> 先推main供公开CI并行，待发布前门通过后在origin/main头创建新tag；官方五平台Release、
-> 本机SUMS/成员/架构/版本及私有验收、逐机备份/独立门齐备后依次云→LAN→当前Mac最后。
-> 现有NGINX/Web配置和凭证保留，不轮换token；未完成项不记为已部署。
-> 执行真源：`docs/reviews/2026-11-08-v0.3.30-release-deploy.md`；恢复先查本轮受限inputs与receipt。
+> **2026-11-08 v0.3.30 发布与三机部署（云/LAN完成，当前Mac最后PREPARED）**：
+> 用户明确授权完整链，release/tag=`3321e6c`，CI42465257424首轮8项及Release42466214561
+> 五平台+发布首轮通过；本地ci-local quick实际exit0/880.199s、RRR317s，原豁免保留。
+> 官方五件SUMS/成员/架构/版本/来源独立门通过，Mac官方a32f35…/Linux005eea…；
+> Mac Web恢复/40循环/TUI23/subscription5与云私有4项通过。remote marker两次首红保留，
+> 旧/新原driver各8PASS、限定UDS观察同111B与marker通过；独立判既有未归因时序为
+> 非阻塞边界，不冒称已修。控制器/官方验证器两门通过，NGINX/Web配置与token保持。
+> 云SUCCESS/12.302s、62701→76103；LAN SUCCESS/34.44s、96586→25414；均官方件、
+> PATH零参/defaultstate、身份/config/凭证旧前缀保全，机器及唯一公网端点各3probe通过。
+> LAN私有输入权限两次预检拒绝、只读checker路径误判及纠正均留证，未放宽锚。
+> 当前Mac唯一prepare与独立完整backup门通过，原21440/v29/Web18080仍在位；
+> 持久`~/homeway-rollback/release-v0.3.30-20261108-r1/`，manifest7612bb…/plan8b11f7…/
+> once0b2690…/RECOVERY71201f…、source901a…/helper9c1…固定，PREPARED/activationfalse。
+> **本检查点先提交并推送，再唯一bootstrap该目录once.plist**；若承载会话中断，先查
+> receipt/RECOVERY/worker/once，不重复激活或盲回填state。Mac最终机器/生产Web/新资产/
+> 真实浏览器及公网QUIC仍待执行。完整证据与边界见同日v0.3.30 release-deploy及各review。
 
 > **2026-11-08 WebUI 易用性优化（完成，本地源码与私有验收）**：URL 支持
 > `#webtoken=…` 自动登录，手动成功亦保存、刷新沿用，主动断开清除；hww1 格式与
