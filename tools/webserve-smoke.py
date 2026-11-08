@@ -43,6 +43,7 @@ def check_assets():
         catch(e){console.error(name+': '+e.name+': '+e.message);process.exit(1);}}
     """
     subprocess.run(["node", "-e", code, str(ASSETS)], check=True)
+    subprocess.run(["node", str(ROOT / "tools/webserve-ui-check.cjs")], check=True)
     print("PASS: pinned npm asset SHA256 and JavaScript parser checks", flush=True)
 
 
@@ -790,8 +791,8 @@ const W=window.WebSocket;window.WebSocket=class extends W{constructor(...a){supe
             assert first_size != second_size
             # A fixed error/exit event on a real old socket must survive its close.
             first.evaluate("""() => {const w=window.__failureQA.sockets.at(-1);
-              w.dispatchEvent(new MessageEvent('message',{data:JSON.stringify({type:'error',code:'busy',message:'QA_TARGET_BUSY'})}));w.close();}""")
-            wait_until(lambda: "重新连接" in first.locator("#disconnect").inner_text(), "error followed by close")
+              w.dispatchEvent(new MessageEvent('message',{data:JSON.stringify({type:'error',code:'busy',message:'QA_TARGET_BUSY'})}));w.close(4000);}""")
+            wait_until(lambda: "自动重连" in first.locator("#status").inner_text(), "error followed by automatic retry")
             assert "QA_TARGET_BUSY" in first.locator("#status").inner_text()
             assert first.locator("#paste").is_disabled()
             assert first.evaluate("() => window.__failureQA.terminal.options.disableStdin")
@@ -800,12 +801,12 @@ const W=window.WebSocket;window.WebSocket=class extends W{constructor(...a){supe
             connect(exited)
             exited.evaluate("""() => {const w=window.__failureQA.sockets.at(-1);
               w.dispatchEvent(new MessageEvent('message',{data:JSON.stringify({type:'exit',status:7})}));w.close();}""")
-            wait_until(lambda: "重新连接" in exited.locator("#disconnect").inner_text(), "exit followed by close")
+            wait_until(lambda: exited.locator("#reconnect").is_visible(), "exit followed by manual reconnect")
             assert "TUI 已退出（7）" in exited.locator("#status").inner_text()
             second.locator(".xterm-helper-textarea").focus()
             second.keyboard.press("Escape")
-            # Actual gateway restart aborts the transport after nonempty input.
-            lab.cli(gateway, "webserve", "restart")
+            # Real downtime keeps the page read-only until automatic recovery.
+            lab.cli(gateway, "webserve", "stop")
             wait_until(lambda: second.locator("#paste").is_disabled()
                        and "部分内容" in second.locator("#status").inner_text(), "asynchronous close partial-input warning")
             before = second.evaluate("() => window.__failureQA.binary.length")
@@ -813,6 +814,10 @@ const W=window.WebSocket;window.WebSocket=class extends W{constructor(...a){supe
             second.wait_for_timeout(100)
             assert second.evaluate("() => window.__failureQA.binary.length") == before
             second.screenshot(path=str(artifact / "browser-readonly-failure.png"))
+            lab.cli(gateway, "webserve", "start")
+            wait_until(lambda: not second.locator("#paste").is_disabled(), "actual entry restart automatic recovery", 25)
+            assert "部分内容" in second.locator("#status").inner_text()
+            assert second.locator(".xterm").count() == 1
             interrupted = context.new_page()
             connect(interrupted)
             interrupted.evaluate("""() => {const w=window.__failureQA.sockets.at(-1),send=w.send.bind(w);
@@ -842,9 +847,107 @@ const W=window.WebSocket;window.WebSocket=class extends W{constructor(...a){supe
                 "controlled_error_preserved": "QA_TARGET_BUSY", "actual_restart_partial_warning": True,
                 "controlled_exit_preserved": 7, "controlled_send_exception": True,
                 "closed_stdin_emitted_bytes": 0, "actual_invalid_ticket_close": 1008,
-                "controlled_empty_http_status": 503}, indent=2))
+                "controlled_empty_http_status": 503, "actual_entry_auto_recovered": True}, indent=2))
             context.close()
             print("PASS: two real browser pages isolate sizes; failure/read-only/relogin/partial-input states", flush=True)
+        finally:
+            browser.close()
+
+
+
+def browser_usability_checks(lab, base, token, gateway, target, artifact, chrome):
+    """Real URL/refresh, native-menu cancellation, idle keepalive and recovery."""
+    from playwright.sync_api import sync_playwright
+    with sync_playwright() as playwright:
+        browser = playwright.chromium.launch(executable_path=chrome, headless=True)
+        try:
+            context = browser.new_context(ignore_https_errors=True, viewport={"width": 1280, "height": 900})
+            context.add_init_script('''window.__recoveryQA={sockets:[],contextMenus:[]};let T;
+Object.defineProperty(window,'Terminal',{configurable:true,get(){return T;},set(V){T=class extends V{constructor(...a){super(...a);window.__recoveryQA.terminal=this;}};}});
+const W=window.WebSocket;window.WebSocket=class extends W{constructor(...a){super(...a);window.__recoveryQA.sockets.push(this);}};
+window.addEventListener('contextmenu',e=>window.__recoveryQA.contextMenus.push(e.defaultPrevented));''')
+            page = context.new_page()
+            errors, unsafe_request_urls = [], []
+            page.on("pageerror", lambda error: errors.append(str(error)))
+            page.on("request", lambda request: unsafe_request_urls.append(token in request.url))
+            try:
+                page.goto(base + "/#webtoken=" + token)
+            except Exception:
+                raise AssertionError("fragment URL navigation failed (credential URL redacted)") from None
+            ready = lambda: not page.locator("#paste").is_disabled()
+            wait_until(ready, "fragment auto login")
+            assert page.evaluate("expected => new URLSearchParams(location.hash.slice(1)).get('webtoken')===expected", token)
+            page.reload()
+            wait_until(ready, "refresh retained URL credential")
+            assert page.locator("#token").input_value() == ""
+            screen = """() => {const t=window.__recoveryQA.terminal;let s='';
+              for(let y=0;y<t.rows;y++)s+=t.buffer.active.getLine(t.buffer.active.viewportY+y)?.translateToString(false)+'\\n';return s;}"""
+            wait_until(lambda: "qa-target-one" in page.evaluate(screen), "sessions rendered for right click")
+            def right_click(needle, menu):
+                point = page.evaluate("""needle => {const t=window.__recoveryQA.terminal,r=document.querySelector('.xterm-screen').getBoundingClientRect();
+                  for(let y=0;y<t.rows;y++){const text=t.buffer.active.getLine(t.buffer.active.viewportY+y)?.translateToString(false)||'';
+                    if(text.includes(needle))return {x:r.x+5*r.width/t.cols,y:r.y+(y+.5)*r.height/t.rows};}
+                  throw new Error('right-click row not rendered');}""", needle)
+                page.mouse.click(point["x"], point["y"], button="right")
+                wait_until(lambda: menu in page.evaluate(screen), "right-click TUI menu: " + menu)
+                assert page.evaluate("() => window.__recoveryQA.contextMenus.at(-1)===true")
+                page.keyboard.press("Escape")
+                wait_until(lambda: menu not in page.evaluate(screen), "dismiss TUI menu")
+            right_click("exit:on", "关闭出口")
+            right_click("qa-target-one", "关闭会话")
+            assert not page.evaluate("() => document.querySelector('#token').dispatchEvent(new MouseEvent('contextmenu',{bubbles:true,cancelable:true}))===false")
+            sockets = page.evaluate("() => window.__recoveryQA.sockets.length")
+            idle_started = time.monotonic()
+            # Keep Python responsive while crossing both the real 60s liveness and 75s proxy idle limits.
+            for _ in range(9):
+                page.wait_for_timeout(10000)
+                assert ready(), "idle connection became read-only"
+            assert page.evaluate("() => window.__recoveryQA.sockets.length") == sockets, "idle Ping/Pong should retain the same socket"
+            idle_elapsed = time.monotonic() - idle_started
+            print("PASS: fragment URL/refresh, host+session TUI right-click, real HTTPS/WSS idle >90s", flush=True)
+            # Browser transport loss, then same-page recovery without entering a token.
+            context.set_offline(True)
+            page.evaluate("() => window.__recoveryQA.sockets.at(-1).close(4000,'controlled browser transport loss')")
+            wait_until(lambda: "自动重连" in page.locator("#status").inner_text(), "offline retry scheduled")
+            context.set_offline(False)
+            wait_until(ready, "browser online auto recovery", 25)
+            assert page.locator(".xterm").count() == 1
+            # Repeated real entry restart exercises both generations and resource reclamation.
+            for _ in range(3):
+                before = page.evaluate("() => window.__recoveryQA.sockets.length")
+                lab.cli(gateway, "webserve", "restart")
+                wait_until(lambda: page.evaluate("() => window.__recoveryQA.sockets.length") > before and ready(), "repeated entry restart recovery", 25)
+                assert page.locator(".xterm").count() == 1
+                wait_until(lambda: len(lab.tui_pids(target)) == 1, "old TUI reaped after recovery")
+            # Missing relay registration returns 401 today; recovery must wait for it to return.
+            before = page.evaluate("() => window.__recoveryQA.sockets.length")
+            lab.cli(gateway, "relay", "stop")
+            wait_until(lambda: "自动重连" in page.locator("#status").inner_text(), "relay outage retry scheduled")
+            lab.cli(gateway, "relay", "start")
+            wait_until(lambda: page.evaluate("() => window.__recoveryQA.sockets.length") > before and ready(), "target re-register auto recovery", 85)
+            # Explicit cancellation must stop a pending retry and clear only this page's URL token.
+            page.evaluate("() => window.__recoveryQA.sockets.at(-1).close(4000,'controlled cancellation test')")
+            wait_until(lambda: "自动重连" in page.locator("#status").inner_text(), "cancel retry pending")
+            page.locator("#disconnect").click()
+            count = page.evaluate("() => window.__recoveryQA.sockets.length")
+            page.wait_for_timeout(1800)
+            assert page.evaluate("() => window.__recoveryQA.sockets.length") == count
+            assert page.evaluate("() => !new URLSearchParams(location.hash.slice(1)).has('webtoken')")
+            page.reload()
+            page.wait_for_timeout(300)
+            assert page.locator("#login").is_visible() and page.locator("#paste").is_disabled()
+            assert not any(unsafe_request_urls), "URL credential reached an HTTP request URL"
+            assert not errors, errors
+            context.close()
+            wait_until(lambda: not lab.tui_pids(target), "all recovered TUI processes reaped")
+            wait_until(lambda: lab.status(gateway)["ui_count"] == 0, "recovery UI permits returned")
+            (artifact / "browser-usability.json").write_text(json.dumps({
+                "fragment_auto_login": True, "refresh_auto_login": True, "native_contextmenu_cancelled": True,
+                "host_and_session_tui_menus": True, "same_socket_idle_seconds": idle_elapsed,
+                "offline_recovered": True, "entry_restarts_recovered": 3, "relay_reregister_recovered": True,
+                "explicit_disconnect_cancels": True, "credential_in_request_url": False,
+                "remaining_tui_processes": 0, "ui_count": 0, "page_errors": errors}, indent=2))
+            print("PASS: offline/3 entry restarts/relay re-registration auto recover; explicit disconnect cancels; resources return", flush=True)
         finally:
             browser.close()
 
@@ -930,6 +1033,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--bin", type=Path, default=Path("target/debug/homeway"))
     parser.add_argument("--browser", action="store_true")
+    parser.add_argument("--browser-recovery", action="store_true", help="browser failure/recovery checks without host clipboard access")
     parser.add_argument("--extended", action="store_true")
     parser.add_argument("--chrome", default="/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
     args = parser.parse_args()
@@ -1102,17 +1206,19 @@ def main():
         assert len(set(tickets)) == 8 and request(gateway_base, "/api/login", token=target_token)[0] == 429
         lab.cli(gateway, "webserve", "restart")
         print("PASS: shared login/ticket/session quota rejects ninth reservation", flush=True)
-        if args.browser:
+        if args.browser or args.browser_recovery:
             lab.cli(target, "term", "new", "qa-target-one", "-d")
             lab.cli(target2, "term", "new", "qa-target-two", "-d")
-            previous_sessions = {entry["name"] for entry in lab.sessions(target)}
-            browser_check(gateway_base, target_token, target, lab.path, args.chrome, target_token2, "qa-target-two")
-            wait_until(lambda: not lab.tui_pids(target), "browser TUI reap")
-            wait_until(lambda: not lab.tui_pids(target2), "second target browser TUI reap")
-            after_sessions = {entry["name"] for entry in lab.sessions(target)}
-            assert previous_sessions < after_sessions, "browser must create and preserve a real new working session"
-            print("PASS: browser close keeps real working session", flush=True)
+            if args.browser:
+                previous_sessions = {entry["name"] for entry in lab.sessions(target)}
+                browser_check(gateway_base, target_token, target, lab.path, args.chrome, target_token2, "qa-target-two")
+                wait_until(lambda: not lab.tui_pids(target), "browser TUI reap")
+                wait_until(lambda: not lab.tui_pids(target2), "second target browser TUI reap")
+                after_sessions = {entry["name"] for entry in lab.sessions(target)}
+                assert previous_sessions < after_sessions, "browser must create and preserve a real new working session"
+                print("PASS: browser close keeps real working session", flush=True)
             browser_failure_checks(lab, gateway_base, target_token, gateway, lab.path, args.chrome)
+            browser_usability_checks(lab, gateway_base, target_token, gateway, target, lab.path, args.chrome)
         parent_loss_check(lab)
         for path in lab.path.rglob("*.log"):
             content = path.read_bytes()

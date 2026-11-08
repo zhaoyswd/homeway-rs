@@ -598,6 +598,23 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 
 ## 判据变更记录（政策 + 登记表）
 
+### 2026-11-08：WebUI URL 凭据与自动恢复
+
+- W-web4/5 浏览器从仅手动输入、断线只读等待重新输入，改为支持 `#webtoken=…` 自动登录；
+  手动成功ready后 `history.replaceState` 保存fragment，刷新复用，主动断开清除。HTTP/WS URL
+  不带凭据，不使用localStorage；含凭据的完整URL本身仍是敏感信息。hww1格式与管理wire不变。
+- 前端恢复策略真源 `crates/homeway-cli/src/webserve/assets/app.js`：每次重连重新取一次票据，
+  登录/WS ready各20s期限；指数等待1/2/4/8/16/30s加0..250ms抖动，连续ready至少30s才重置
+  退避。网络/408/429/5xx/1011/1013重试；明确revoked/terminal_unavailable/protocol_error、
+  正常1000/TUI exit、1002/1009及初次认证错误停止。曾ready后因旧入口停止或中继目标重注册
+  产生的401及恢复期pre-ready1008，共享最多6次失败/90s恢复窗；失败不续窗，真正ready后
+  下一次断连才开放新窗。手动断开、页面卸载取消请求/期限/退避；旧代事件无权污染新连接。
+- 恢复重建独立TUI，真实工作会话保留但主机/会话选择不恢复；断线输入不缓存/不重放，部分
+  输入风险提示跨尝试保留到恢复成功并明确展示。服务端20sPing/60s活性及QUIC心跳保持，
+  不新增应用心跳；不承诺浏览器静默半开的故障检测有限上界，也不认定用户现场自动断连根因。
+- 终端容器统一取消contextmenu默认行为，不阻断鼠标事件；主机/会话TUI右键继续工作，终端
+  输出区域仍按TUI/应用原鼠标语义。影响面仅浏览器资源及私有验收；既有Rust生命周期不改。
+
 ### 2026-11-08：WebServe r3代码门整改（实施前登记）
 
 - B1：TUI冷启动首次Refresh及全部worker统一遵从no_spawn；control已关闭/父管理宿主退出只能使界面退出，不启动新统一进程或监听。B2由固定remote+完整generation保护对账，拆暂存socket与撤销活位分离，绝不借同代跨remote继承授权。
