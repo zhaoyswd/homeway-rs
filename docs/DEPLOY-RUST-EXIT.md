@@ -1481,3 +1481,44 @@ RECOVERY.txt/worker.log及`gui/501/me.zhaozhe.homeway-release-v0327-20261107-r1`
 完整官方哈希、首轮失败/复验、两门与逐端实际证据见
 `docs/reviews/2026-11-07-v0.3.27-release-deploy.md`。三机实际回执与独立验收均已完成，
 原PREPARED检查点与失败/整改历史保留，不把计划替代实际结果。
+
+
+### 13.28 v0.3.28 发布验证失败（2026-11-08，未部署）
+
+原tag保留，不重指。Linux PTY openpty签名clippy与Mac relay集成CI失败后取消Release，
+未安装该版；记录完整保留，转v0.3.29继续。见同日v0.3.28/v0.3.29 release-deploy评审。
+
+### 13.29 v0.3.29 发布与滚动部署（2026-11-08，云/LAN完成，本机PREPARED待最后切换）
+
+版本/tag提交f1e4423，CI42442615758最终attempt2八job通过（首轮旧stats/DNS两失败与定向
+复验保留，只重跑一次失败Mac job），Release42442630178五平台及发布通过。本机下载五件
+严格核SUMS/成员/架构，Mac正式件4cf895…、Linux正式件a9513b…，不使用私有cargo件。
+原冻结ReleaseREST D2b19曾因校验器命名冲突被workflowJSON覆盖，LAN首preflight安全拒绝，
+无backup/stage/进程变动；已保存原错误/误报、修正禁覆写门并原锚恢复、独立验证及重新备份。
+
+先行NGINX已配置https://homeway.catzhao.com:8443→127.0.0.1:18080，原wildcard证书有效，
+原域名保持；当前Mac Web尚未启动，不能把预置502当上线。用户要求当前承载会话Mac最后。
+云、LAN均先备份/独立门再唯一激活，系统PATH零参/defaultstate、原身份config保全。
+
+云：SUCCESS/12.269s，31292→62701，官方a9513b、root:root0755、双角色/端口/旧台账前缀
+独立通过，公网单端点warmup+3probe通过；恢复目录
+/root/homeway-rollback/release-v0.3.29-20261108-r1/。
+LAN：SUCCESS/34.094s，19355→96586，官方4cf/501:wheel0/0755、原job/内部38242/身份
+及台账前缀通过，正常追加425B；auto现选en7=.84，IGD外38243→.84:38242与status一致，
+云官方客户端对唯一公网38243探测3/3通过。原外38242假设checker失败与模板未执行保留，
+无人工映射写。恢复目录~/homeway-rollback/release-v0.3.29-lan84-20261108-r1/（LAN机）。
+
+当前Mac仅官方payload受限暂存，仍旧PID21921/PATH88670b…；执行器r6问题整改已67/0、
+真实TLS/WSS10/0及真实Homeway私有验证通过，r7完整外评尚待，未prepare/activate。
+后续先读各receipt/RECOVERY，不能重复bootstrap/activate或盲回填整个state。
+完整原始评审、失败及实际回执索引见docs/reviews/2026-11-08-v0.3.29-release-deploy.md与
+2026-11-08-v0.3.29-controller-review.md；本节待本机最后切换及独立验收后更新。
+
+
+本机追加检查点：r7唯一P2/N0与checked-key snapshot已最小整改，最终独立技术/代码两门及
+全74/0通过（原r7不通过保留）；Macdeploy c0cddc…、helpere44536…，尚未activate。
+Mac唯一prepare2.013s/PREPARED，独立完整备份门通过，目录
+~/homeway-rollback/release-v0.3.29-20261108-r1/，manifest ee0fcf30…；旧PID21921/PATH886与
+原身份config/台账前缀0追加、webcfg/key缺失、18080空闲，原NGINX/旧域名正常。主会话先
+推送当前检查点，再唯一bootstrap目录once.plist；后续读receipt/RECOVERY，不重复激活或回填state。
+云与LAN公网均已完成warmup+3probe/direct精确单端点验收；Mac最后机器/域名验收仍待执行。
