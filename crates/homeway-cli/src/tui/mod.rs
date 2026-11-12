@@ -1093,6 +1093,12 @@ impl App {
         }
     }
 
+    fn finish_terminal(&mut self) {
+        self.detach();
+        self.model.selected_session = None;
+        self.model.focus = view::Focus::Hosts;
+    }
+
     fn clear_operation(&mut self) {
         self.selection_copy = None;
         self.operation_id = self.operation_id.wrapping_add(1);
@@ -1217,9 +1223,7 @@ impl App {
                 {
                     // An explicit close is authoritative even if its list
                     // update arrives before ENDED or the attach is reconnecting.
-                    self.detach();
-                    self.model.selected_session = None;
-                    self.model.focus = view::Focus::Hosts;
+                    self.finish_terminal();
                 }
                 match result {
                     Ok(()) => self.backend_event(backend::Event::Notice {
@@ -1736,23 +1740,21 @@ impl App {
             .iter()
             .find(|session| self.active_session.as_ref() == Some(&session.name));
         let Some(session) = session.filter(|session| session.pid > 0) else {
-            self.recovery = None;
             self.show_error(
                 self.session_notice_target(),
                 "会话已结束",
                 "原会话已不存在，自动重连已停止",
             );
-            self.disconnect();
+            self.finish_terminal();
             return;
         };
         if self.active_pid.is_some_and(|pid| pid != session.pid) {
-            self.recovery = None;
             self.show_error(
                 self.session_notice_target(),
                 "会话已结束",
                 "同名会话 PID 已变化，自动重连已停止",
             );
-            self.disconnect();
+            self.finish_terminal();
             return;
         }
         self.active_pid = Some(session.pid);
@@ -1801,12 +1803,13 @@ impl App {
             let frame = match event.frame {
                 Ok(frame) => frame,
                 Err(error) => {
-                    if matches!(&error, backend::Error::Session { code, .. } if code == "not_found")
-                    {
-                        self.recovery = None;
-                    }
+                    let finished = matches!(&error, backend::Error::Session { code, .. } if code == "not_found");
                     self.show_error(self.session_notice_target(), "终端错误", error.to_string());
-                    self.disconnect();
+                    if finished {
+                        self.finish_terminal();
+                    } else {
+                        self.disconnect();
+                    }
                     break;
                 }
             };
@@ -1850,15 +1853,18 @@ impl App {
                 }
                 Op::ENDED => {
                     let (code, reason) = frames::dec_ended(&frame.payload);
-                    if code != frames::ended_code::REPLACED {
-                        self.recovery = None;
-                    }
                     self.show_error(
                         self.session_notice_target(),
                         "会话已结束",
                         format!("会话已结束（{code}，{reason}），可选择其它会话或创建新会话"),
                     );
-                    self.disconnect();
+                    if code == frames::ended_code::REPLACED {
+                        self.disconnect();
+                    } else {
+                        // The current leg confirmed termination. A list update
+                        // may already have removed it, so clear the screen now.
+                        self.finish_terminal();
+                    }
                     self.sessions_pending = false;
                     self.refresh_sessions();
                     break;
@@ -3874,10 +3880,162 @@ mod tests {
             app.probe_reply(payload);
             assert!(!app.connected);
             assert!(app.recovery.is_none());
-            assert_eq!(app.active_pid, Some(321));
+            assert!(app.active_pid.is_none());
+            assert!(app.active_session.is_none() && app.surface.is_none());
+            assert_eq!(app.model.focus, view::Focus::Hosts);
             assert!(app.input_queue.is_empty());
             assert!(app.model.notice.contains("已停止"));
         }
+    }
+
+    #[test]
+    fn ended_clears_terminal_with_either_session_list_order() {
+        for code in [
+            0,
+            7,
+            frames::ended_code::KILLED,
+            frames::ended_code::SERVICE_STOPPED,
+        ] {
+            for list_first in [false, true] {
+                let mut app = history_app();
+                app.recovery = Some(recovery::Recovery::new(Instant::now()));
+                app.active_pid = Some(321);
+                app.model.terminal_present = true;
+                app.model.terminal_title = "old terminal".into();
+                let generation = app.generation;
+                app.attach = Some(backend::Attach::scripted(vec![transport::AttachEvent {
+                    generation,
+                    frame: Ok(frames::Frame {
+                        op: Op::ENDED,
+                        payload: frames::enc_ended(code, ""),
+                    }),
+                }]));
+                let missing = |app: &mut App| {
+                    app.backend_event(backend::Event::Sessions {
+                        target: Target::Local,
+                        epoch: app.sessions_epoch,
+                        result: Ok(Vec::new()),
+                    });
+                };
+                if list_first {
+                    missing(&mut app);
+                    assert!(app.surface.is_some() && app.recovery.is_some());
+                }
+                app.process_attach();
+                assert!(app.surface.is_none() && app.active_session.is_none());
+                assert!(app.recovery.is_none() && app.attach.is_none() && app.active_pid.is_none());
+                assert_ne!(app.generation, generation);
+                assert!(app.model.selected_session.is_none());
+                assert_eq!(app.model.focus, view::Focus::Hosts);
+                assert!(app.model.terminal_title.is_empty() && !app.model.terminal_present);
+                assert!(app.model.notice.contains(&format!("会话已结束（{code}，")));
+                assert_eq!(
+                    app.model.item_notice.as_ref().unwrap().target,
+                    view::NoticeTarget::Session {
+                        target: Target::Local,
+                        name: "history".into(),
+                    }
+                );
+                if !list_first {
+                    missing(&mut app);
+                }
+                app.backend_event(backend::Event::Sessions {
+                    target: Target::Local,
+                    epoch: app.sessions_epoch,
+                    result: Ok(vec![blocking_session(
+                        "history",
+                        backend::SessionState::Idle,
+                        321,
+                    )]),
+                });
+                for fragment in codec::fragment_payload(&codec::gzip_bytes(
+                    &codec::enc_snapshot_body(&codec::SnapshotBody {
+                        title: "old terminal".into(),
+                        ..Default::default()
+                    }),
+                )) {
+                    app.surface_frame(Op::SNAPSHOT, &fragment).unwrap();
+                }
+                app.poll_connection(Instant::now() + Duration::from_secs(30));
+                assert!(app.surface.is_none() && app.active_session.is_none());
+                assert!(app.recovery.is_none() && app.attach.is_none());
+                assert!(app.model.selected_session.is_none());
+                let mut terminal =
+                    Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+                let (geometry, _) = screen(&mut app, &mut terminal);
+                let buffer = terminal.backend().buffer();
+                let mut text = String::new();
+                for y in geometry.terminal.y..geometry.terminal.bottom() {
+                    let mut x = geometry.terminal.x;
+                    while x < geometry.terminal.right() {
+                        let cell = &buffer[(x, y)];
+                        text.push_str(cell.symbol());
+                        x += cell.cell_width().max(1);
+                    }
+                    text.push('\n');
+                }
+                assert!(text.contains("想在这台主机上做些什么？"));
+                assert!(!text.contains("LINE_") && !text.contains("old terminal"));
+            }
+        }
+    }
+
+    #[test]
+    fn attach_not_found_clears_terminal_but_transport_failure_and_replacement_recover() {
+        for result in [
+            Err(backend::Error::Session {
+                code: "not_found".into(),
+                message: "gone".into(),
+            }),
+            Err(backend::Error::Closed),
+            Ok(frames::Frame {
+                op: Op::ENDED,
+                payload: frames::enc_ended(
+                    frames::ended_code::REPLACED,
+                    frames::ended_reason::REPLACED,
+                ),
+            }),
+        ] {
+            let finished = matches!(&result, Err(backend::Error::Session { .. }));
+            let mut app = history_app();
+            app.recovery = Some(recovery::Recovery::new(Instant::now()));
+            app.active_pid = Some(321);
+            app.connected = true;
+            app.attach = Some(backend::Attach::scripted(vec![transport::AttachEvent {
+                generation: app.generation,
+                frame: result,
+            }]));
+            app.process_attach();
+            assert!(!app.connected && app.attach.is_none());
+            assert_eq!(app.surface.is_none(), finished);
+            assert_eq!(app.active_session.is_none(), finished);
+            assert_eq!(app.active_pid.is_none(), finished);
+            assert_eq!(app.recovery.is_none(), finished);
+            if finished {
+                assert!(app.model.selected_session.is_none());
+                assert_eq!(app.model.focus, view::Focus::Hosts);
+            } else {
+                assert!(app.recovery.as_ref().unwrap().retrying());
+                assert_eq!(app.active_session.as_deref(), Some("history"));
+            }
+        }
+    }
+
+    #[test]
+    fn stale_ended_cannot_clear_current_terminal() {
+        let mut app = history_app();
+        app.recovery = Some(recovery::Recovery::new(Instant::now()));
+        app.connected = true;
+        app.attach = Some(backend::Attach::scripted(vec![transport::AttachEvent {
+            generation: app.generation.wrapping_sub(1),
+            frame: Ok(frames::Frame {
+                op: Op::ENDED,
+                payload: frames::enc_ended(0, ""),
+            }),
+        }]));
+        app.process_attach();
+        assert!(app.connected && app.surface.is_some() && app.recovery.is_some());
+        assert_eq!(app.active_session.as_deref(), Some("history"));
     }
 
     #[test]

@@ -284,6 +284,23 @@ pub(super) struct Attach {
 }
 
 impl Attach {
+    #[cfg(test)]
+    pub(super) fn scripted(events: Vec<AttachEvent>) -> Self {
+        let (commands, _) = mpsc::sync_channel(1);
+        let (sender, receiver) = mpsc::sync_channel(events.len());
+        for event in events {
+            sender.send(event).unwrap();
+        }
+        Self {
+            commands,
+            events: receiver,
+            cancel: Arc::new(Cancellation {
+                alive: AtomicBool::new(true),
+                closer: Mutex::new(None),
+            }),
+        }
+    }
+
     pub fn start(
         state: PathBuf,
         target: Target,
