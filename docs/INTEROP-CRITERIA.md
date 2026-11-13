@@ -598,6 +598,20 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 
 ## 判据变更记录（政策 + 登记表）
 
+### 2026-11-13/14：TUI 失效终端输入结束（根因修复）
+
+- 从：普通 TUI 在 crossterm Unix 输入 EOF/EIO 后可能卡于内部读取循环、占满单核，外层
+  25ms poll 预算及 STOP 标记不可达；Web worker 只依赖既有独立进程退出兜底。
+- 到：固定 crossterm 0.29.0 的仓内受控补丁，EOF 返回 UnexpectedEof，异常读取错误向上
+  传播；mio 仅锁存明确 read-closed 状态，完整 parser/关闭前残留输入先交付再报错；备用
+  tty 后端区分 WouldBlock/EOF 并终止 HUP/ERR/无效 readiness。普通同步 TUI 与 Web worker
+  都消费同一修复，不改 wire、键鼠/Paste 编码、poll 时间窗或 Interrupted 重试策略。
+- 原因：私有旧测试 TUI 可复现 PTY 撤销后约 100% CPU，SIGTERM 仍不退。影响面仅 Unix
+  CLI 终端输入与销毁时 best-effort 输出；退出查看界面不结束工作会话。Web 既有单 worker/
+  控制父死亡/限时回收机制保持。持续 EINTR、任意外部 VMIN/VTIME 模式与上游其他粘贴
+  边沿问题不扩大为本次已修范围。源码、回归与评审见同批专项 review。
+
+
 ### 2026-11-08：WebUI URL 凭据与自动恢复
 
 - W-web4/5 浏览器从仅手动输入、断线只读等待重新输入，改为支持 `#webtoken=…` 自动登录；

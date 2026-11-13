@@ -5,6 +5,68 @@ use crossterm::{cursor, event, execute, terminal};
 
 static STOP: AtomicBool = AtomicBool::new(false);
 
+/// Keep Ratatui's destructor from panicking while reporting a revoked terminal.
+/// The normal writer always propagates errors; only final cursor cleanup may
+/// replace an unusable output with a sink, after rendering has ended.
+pub(super) struct RenderTerminal(
+    ratatui::Terminal<ratatui::backend::CrosstermBackend<Output>>,
+);
+
+pub(super) enum Output {
+    Active(io::Stdout),
+    Closed,
+}
+
+impl Write for Output {
+    fn write(&mut self, bytes: &[u8]) -> io::Result<usize> {
+        match self {
+            Self::Active(output) => output.write(bytes),
+            Self::Closed => Ok(bytes.len()),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        match self {
+            Self::Active(output) => output.flush(),
+            Self::Closed => Ok(()),
+        }
+    }
+}
+
+impl RenderTerminal {
+    pub(super) fn new(output: io::Stdout) -> io::Result<Self> {
+        ratatui::Terminal::new(ratatui::backend::CrosstermBackend::new(Output::Active(output)))
+            .map(Self)
+    }
+}
+
+impl std::ops::Deref for RenderTerminal {
+    type Target = ratatui::Terminal<ratatui::backend::CrosstermBackend<Output>>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+impl std::ops::DerefMut for RenderTerminal {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.0
+    }
+}
+
+impl Drop for RenderTerminal {
+    fn drop(&mut self) {
+        if self.0.show_cursor().is_err() {
+            // Ratatui 0.30 reports cursor restoration failure with eprintln! in
+            // Drop. If stderr was revoked too, that diagnostic itself panics.
+            // Clear its hidden-cursor state through the normal API against a
+            // destruction-only sink; TerminalGuard still restores raw/alt mode.
+            *self.0.backend_mut() = ratatui::backend::CrosstermBackend::new(Output::Closed);
+            let _ = self.0.show_cursor();
+        }
+    }
+}
+
 pub(super) struct TerminalGuard {
     previous: Vec<(i32, libc::sigaction)>,
 }

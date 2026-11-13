@@ -22,7 +22,9 @@ use homeway_core::term::{
     codec,
     frames::{self, Op},
 };
-use ratatui::{backend::CrosstermBackend, layout::Rect, Terminal};
+use ratatui::layout::Rect;
+#[cfg(test)]
+use ratatui::Terminal;
 
 use backend::{Backend, Command, Target};
 use view::{Action, Model};
@@ -96,7 +98,9 @@ pub(crate) fn cmd_tui(args: &[String]) {
         None => Ok(()),
     });
     if let Err(error) = result {
-        eprintln!("homeway tui：{error}");
+        // Terminal loss can revoke stderr as well as stdin. A failed diagnostic
+        // must not turn the expected input error into a printing panic.
+        let _ = writeln!(io::stderr(), "homeway tui：{error}");
         std::process::exit(1);
     }
 }
@@ -110,7 +114,7 @@ fn run(options: Options) -> Result<(), Error> {
     } else { None };
     terminal::install_panic_hook();
     let _guard = terminal::TerminalGuard::enter()?;
-    let mut terminal = Terminal::new(CrosstermBackend::new(io::stdout()))?;
+    let mut terminal = terminal::RenderTerminal::new(io::stdout())?;
     let input_source = if options.no_spawn && std::env::var_os("HOMEWAY_WEB_TUI").as_deref() == Some(std::ffi::OsStr::new("1")) {
         Some(process_input::ProcessInput::start()?)
     } else { None };
