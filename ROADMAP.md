@@ -72,6 +72,20 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
+> **2026-11-14 v0.3.31 发布与三机部署（检查点：云/LAN完成，当前Mac最后PREPARED）**：
+> 用户授权完整发布部署链；tag=`e84a404`，公开CI43570271833八项及Release43571315613
+> 五平台+发布六项全部首轮通过。完整ci-local quick-r2 exit0/709.309s、RRR317s；旧WG
+> 检查首红及精确允许修订保留。官方五件本机SUMS/成员/架构/版本/来源独立门通过，Mac
+> `ada7a868…966942e0`、Linux`21de4b24…c2cf5cb`；Mac官方私有输入5/5与shell退出4PASS，
+> 云SCP后私有4PASS+Linux真实TUI EOF31.773ms/rc1。云SUCCESS/12.296s、76103→179258；
+> LAN SUCCESS/33.718s、25414→26017，均未回退，独立机器及唯一公网3probe/ready/direct
+> 通过，原身份/config/凭证前缀与启动形态保全，私有secret/进程已清。当前Mac完整备份门
+> 通过，旧PID90715/Web/auth/token/NGINX保持，**尚未激活**；恢复目录
+> `~/homeway-rollback/release-v0.3.31-20261114-r1/`，manifest77994670/once51400919。
+> root先提交推送本检查点，再明确唯一bootstrap独立once，不能重复激活或盲回填state。
+> 若断线先读receipt/RECOVERY/worker.log/once实际状态；切后仍须独立机器/Web和公网验收。
+> 完整证据与唯一入口见`docs/reviews/2026-11-14-v0.3.31-release-deploy.md`及同日各review。
+
 > **2026-11-14 v0.3.31 发布前 WG 残留门适配（完成；发布部署继续）**：
 > 首轮本地quick在步骤5因旧门禁止全部`[patch.crates-io]`拒绝受控crossterm补丁，
 > 实际exit1/360.738s保留；原发布候选92989b9公开CI43569311724八项通过不替代新头验证。
