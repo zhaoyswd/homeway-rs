@@ -598,6 +598,19 @@ supervisor 退避重建（角色失败 = 进程退出靠 launchd/nohup 拉回）
 
 ## 判据变更记录（政策 + 登记表）
 
+### 2026-11-14：WG 残留门允许唯一受控终端补丁
+
+- 从：`tools/check-wg-removed.sh` ④以文本grep禁止根manifest任何 `[patch.crates-io]` 节。
+- 到：`tools/check-cargo-patches.py` 用Python3.11+标准库tomllib解析完整manifest，patch map
+  只允许空，或精确 `{'crates-io': {'crossterm': {'path': 'vendor/crossterm'}}}`。ring/WG、
+  未知包/别名、其他registry、额外字段、git、路径漂移或不可解析TOML均拒绝；缺tomllib显式
+  fail-closed，不能回退为正则。原boringtun依赖拒绝、所有tracked锁ring0.16拒绝与根锁
+  ring0.17仍在的正向断言，以及其他九条残留门不变。
+- 原因：v0.3.31首轮ci-local quick步骤5真实首红，旧“无任何patch”约束撞到已评审的TUI
+  EOF/error根因修复；不是跳过或豁免门。影响面仅本地CI依赖审计：精确允许该受控映射，
+  其余patch保持拒绝；内置3正/16反TOML自校准，完整WG门仍执行。独立门见同日wg-gate-review。
+
+
 ### 2026-11-13/14：TUI 失效终端输入结束（根因修复）
 
 - 从：普通 TUI 在 crossterm Unix 输入 EOF/EIO 后可能卡于内部读取循环、占满单核，外层

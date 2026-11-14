@@ -7,7 +7,7 @@
 #      / `peer_index`（**收窄**：`TunFdDead`/`PathProbe` 移出——前者是岛活代码、后者全仓仅注释；
 #      `RELAY_LEG_MAX` 移出——它是**保留面**腿表的上限常量，不是 WG 语义）
 #   ③ 行文面零 WG 冒充（字符串字面量；剥注释后字符串**保留** ⇒ 本条的命中面即字符串）
-#   ④ Cargo 依赖面：根 manifest 无 `boringtun` 依赖行、无 `[patch.crates-io]` 节；
+#   ④ Cargo 依赖面：根 manifest 无 `boringtun` 依赖行；patch 仅允许已审 crossterm/path 精确映射；
 #      `Cargo.lock` 无 `ring 0.16`（计数 = 0）且 `ring 0.17` **仍在**（反向断言）
 #   ④-bis **tracked 锁文件全扫**（E 棒门整改）：全仓 tracked `Cargo.lock`（含 tools/**、fuzz/**
 #      独立 workspace）零 `boringtun` / 零 `ring 0.16` / 零 `quic-ab-wg*` 包条目
@@ -30,6 +30,7 @@
 # 抽取失败即红——两门口径不得分叉；六态 = 代码/行注释/块注释/字符串/字符/原始串）。
 #
 # 用法：tools/check-wg-removed.sh [--fast]   （--fast = 跳过 ⑧ 的 cargo test --list）
+# 本地工具依赖：Python 3.11+（tomllib）；缺失即 fail-closed，不以正则替代 TOML 语义。
 set -uo pipefail
 
 REPO_ROOT="${0:h:A:h}"
@@ -134,12 +135,13 @@ ROOT_TOML="$REPO_ROOT/Cargo.toml"
 LOCK="$REPO_ROOT/Cargo.lock"
 sed -e 's:#.*::' "$ROOT_TOML" > "$TMP/root.toml"
 grep -qE '^[[:space:]]*boringtun[[:space:]]*=' "$TMP/root.toml" && fail "④ 根 manifest 仍有 boringtun 依赖行"
-grep -qE '^\[patch\.crates-io\]' "$TMP/root.toml" && fail "④ 根 manifest 仍有 [patch.crates-io] 节"
+python3 "$REPO_ROOT/tools/check-cargo-patches.py" --self-test "$ROOT_TOML" \
+  || fail "④ 根 manifest 有未批准的 Cargo patch（仅允许受控 crossterm/path，或 TOML/工具依赖失效）"
 ring16=$(awk '/^name = "ring"/{getline; print}' "$LOCK" | grep -c '^version = "0\.16' || true)
 ring17=$(awk '/^name = "ring"/{getline; print}' "$LOCK" | grep -c '^version = "0\.17' || true)
 [[ "$ring16" == "0" ]] || fail "④ Cargo.lock 仍含 ring 0.16（$ring16 处）"
 [[ "$ring17" != "0" ]] || fail "④ 反向断言失败：Cargo.lock 无 ring 0.17（QUIC 用）"
-info "④ manifest 无 boringtun/无 [patch]；lock ring 0.16 = 0 / ring 0.17 = $ring17"
+info "④ manifest 无 boringtun/patch 仅允许受控 crossterm/path；lock ring 0.16 = 0 / ring 0.17 = $ring17"
 
 # ④-bis **tracked 锁文件全扫**（M5 E 棒门整改：S1b 删 WG 实验臂时漏了
 # `tools/quic-ab/arms/Cargo.lock` 的依赖条目——它仍带 `boringtun` / `ring 0.16.20` /
