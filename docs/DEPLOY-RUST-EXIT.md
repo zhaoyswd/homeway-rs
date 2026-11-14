@@ -1527,3 +1527,33 @@ WSS101、systemCA/publicSNI/Host/Origin、TUI首屏/重绘/close1000/UI归0独�
 [本次部署记录](reviews/2026-11-08-v0.3.29-release-deploy.md)、
 [执行器评审](reviews/2026-11-08-v0.3.29-controller-review.md)与
 [r7原文及最终增量](reviews/2026-11-08-v0.3.29-controller-review-r7.md)。
+
+### 13.30 v0.3.31 官方发布与三机滚动部署（2026-11-14，完成）
+
+用户明确授权发布并部署，包含TUI失效终端输入忙循环/退出清理与shell自然退出清屏修复。
+tag `v0.3.31` = `e84a4048270f43e9f63a19baf8b81d525029366f`；公开CI43570271833八项及
+Release43571315613五平台+发布六项全部首轮成功。完整本地quick-r2 exit0/709.309s，
+RRR317s；首轮旧WG补丁禁整节检查误拒绝受控crossterm已精确修正并独立两门通过，首红保留。
+五官方归档和SHA256SUMS本机下载与独立来源门通过，云件SCP后复核。Mac官方SHA
+`ada7a8682d5d1fe1f4caed748a2b476bee4854b5ae9a48903ac0cf50966942e0`，Linux amd64
+`21de4b24795e8f54e4148162fc9f4251a4229cbcb80ca46fccad0087ec2cf5cb`。
+
+顺序云→LAN84→当前Mac最后；每机完整备份、独立输入/备份门后唯一激活，全部SUCCESS且
+未回退：云12.296s/76103→179258，LAN33.718s/25414→26017，本机38.383s/90715→4696。
+正式均系统PATH、零参/defaultstate和原启动形态，原身份/config/凭证前缀及权限保持。
+云官方私有服务4PASS与Linux真实TUI EOF31.773ms/rc1通过；Mac官方根因5/5和shell退出
+4PASS。三机独立最终机器及唯一实际公网端点warmup+3probe/ready/direct全部通过，所有
+私有进程/身份和中转secret清理。其他架构为构建/来源验证，不扩大为全部平台运行验收。
+
+本机先推恢复检查点`8d32672`才执行独立once。只读preactivate checker的module访问首红
+发生在任何bootstrap之前；单行修正经独立复核后仅执行一次bootstrap，未重复激活。
+本机原Web/auth/稳定token与NGINX保持，实际仅127.0.0.1:18080；正常CA公共SNI生产
+HTTPS200/WSS101/首屏/重绘/close1000/UI归0独立通过，app.js逐字等tag，不发终端INPUT
+或操作用户工作会话。云/LAN未开启HTTP；本次不把本机回源门冒作新测外部DNS/NAT。
+
+持久恢复目录：云`/root/homeway-rollback/release-v0.3.31-20261114-r1/`；LAN主机
+`~/homeway-rollback/release-v0.3.31-lan84-20261114-r1/`；当前Mac
+`~/homeway-rollback/release-v0.3.31-20261114-r1/`。恢复先读receipt/RECOVERY/worker/once
+与实际owner，不重复bootstrap或盲回填整个state.tar。完整实际回执和全部首红/评审索引见
+[发布部署记录](reviews/2026-11-14-v0.3.31-release-deploy.md)、
+[执行器记录](reviews/2026-11-14-v0.3.31-controller-review.md)及同日三机独立review。

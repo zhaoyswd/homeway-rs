@@ -72,18 +72,20 @@ Go 版**共存不替换**——Rust 版是平行实现，对齐验收全靠与 G
 
 ## 下一步（当前指针）
 
-> **2026-11-14 v0.3.31 发布与三机部署（检查点：云/LAN完成，当前Mac最后PREPARED）**：
+> **2026-11-14 v0.3.31 发布与三机部署（完成，独立最终总门通过）**：
 > 用户授权完整发布部署链；tag=`e84a404`，公开CI43570271833八项及Release43571315613
 > 五平台+发布六项全部首轮通过。完整ci-local quick-r2 exit0/709.309s、RRR317s；旧WG
 > 检查首红及精确允许修订保留。官方五件本机SUMS/成员/架构/版本/来源独立门通过，Mac
 > `ada7a868…966942e0`、Linux`21de4b24…c2cf5cb`；Mac官方私有输入5/5与shell退出4PASS，
 > 云SCP后私有4PASS+Linux真实TUI EOF31.773ms/rc1。云SUCCESS/12.296s、76103→179258；
-> LAN SUCCESS/33.718s、25414→26017，均未回退，独立机器及唯一公网3probe/ready/direct
-> 通过，原身份/config/凭证前缀与启动形态保全，私有secret/进程已清。当前Mac完整备份门
-> 通过，旧PID90715/Web/auth/token/NGINX保持，**尚未激活**；恢复目录
-> `~/homeway-rollback/release-v0.3.31-20261114-r1/`，manifest77994670/once51400919。
-> root先提交推送本检查点，再明确唯一bootstrap独立once，不能重复激活或盲回填state。
-> 若断线先读receipt/RECOVERY/worker.log/once实际状态；切后仍须独立机器/Web和公网验收。
+> LAN SUCCESS/33.718s、25414→26017；本机最后在8d32672检查点推送后唯一once切换，
+> SUCCESS/38.383s、90715→4696，三机均未回退。独立机器及唯一公网3probe/ready/direct
+> 全过，原身份/config/凭证前缀与启动形态保全；本机Web/auth/token/NGINX保持，正常CA
+> HTTPS200/WSS101/首屏/重绘/close1000/UI归0及app.js逐字等tag通过。所有私有secret/
+> 身份/进程已清，本机只剩正式4696，空闲CPU观察0.4%。旧WG门、工具检查首红及单行
+> preactivate checker整改如实保留，实际bootstrap均一次；无剩余必改/必验或部署事项。
+> 恢复先读各机本轮receipt/RECOVERY/worker.log/once实际状态，不能重复激活或盲回填state；
+> 当前Mac恢复目录`~/homeway-rollback/release-v0.3.31-20261114-r1/`。
 > 完整证据与唯一入口见`docs/reviews/2026-11-14-v0.3.31-release-deploy.md`及同日各review。
 
 > **2026-11-14 v0.3.31 发布前 WG 残留门适配（完成；发布部署继续）**：
